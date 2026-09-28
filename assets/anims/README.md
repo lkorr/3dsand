@@ -8,6 +8,15 @@ One keyframed clip per `<name>.json`, in the same schema as a mob sidecar's
   `clip` field use it (default: the file stem — keep them equal).
 - `sidecarVoxelsPerMetre` — the world-length stamp a sidecar carries, so a
   clip's position keys (world voxels) scale with the voxel size.
+- `quietAdditive` — override clips only, `{ "<part>": 0..1 }`: how much of
+  every additive layer (walk/run/idle swing) on that part this clip silences
+  at full weight. Additives land after the override blend, so without it a
+  held pose takes the walk's arm swing on top of itself.
+- `pitchFollow` — override clips only, `{ "<part>": -1..1 }`: the share of the
+  eased look pitch the part turns through about its own X (pose.cpp).
+
+Both mirror with the clip (`<name>.mirror` swaps the part names). The tuner's
+clip lane does not edit them; hand-edit the file.
 
 Written by the tuner's clip lane ("→ library"), read back by "← library"
 (which copies a file into the open sidecar for editing). `LoadMobDefs`

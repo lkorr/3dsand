@@ -12520,6 +12520,7 @@ int main(int argc, char** argv) {
       ui.spellPriceUnknown = caster.compiled.priceUnknown;
       ui.spellLastBillAge += dt;
       ui.spellText = caster.readout.text;
+      ui.armedPage = caster.armedPage;
       ui.spellVerdict = caster.readout.verdict;
       ui.spellOutcome = (int)caster.lastOutcome;
       ui.liveProjectiles = spells.LiveCount();
@@ -12700,10 +12701,12 @@ int main(int argc, char** argv) {
         if (!hd || !hd->IsContainer()) ui.activeVessel = KitRef{};
         ui.applyText.clear();
         ui.applyColor = 0;
+        ui.applyStoppered = false;
         const uint16_t topMat = hp ? ContainerTopMat(*hp, &mats) : 0;
         if (hd && hd->IsContainer() && hp->Filled() && topMat < mats.size()) {
           const ItemStack& hs = *hp;
           ui.applyText = ContainerFillText(*hd, hs, mats);
+          ui.applyStoppered = hs.stoppered;
           ui.pourDrainPerSec = PourBrushCellsPerSec(*hd, ui.pourRadius);
           // The brush paints with what comes out: the top layer.
           const uint32_t c = mats[topMat].gpu.color0;
@@ -13614,6 +13617,16 @@ int main(int argc, char** argv) {
           put(a, gb, pb);
         }
       }
+      // READY A PAGE (UIState::armPage): the spellbook's click. An empty name
+      // is the blank leaf, which puts the readied spell away.
+      if (ui.armPage.pending) {
+        ui.armPage.pending = false;
+        if (ui.armPage.name.empty()) caster.Clear(glyphs);
+        else caster.ArmPage(glyphs, ui.armPage.name);
+      }
+      // A save or delete can change what the readied page says: speak it again
+      // from the grimoire afterwards (ArmPage clears it if the page is gone).
+      const bool rearmAfterOp = ui.grimoireOp.pending && !caster.armedPage.empty();
       if (ui.grimoireOp.pending) {
         ui.grimoireOp.pending = false;
         const UIState::GrimoireIntent& op = ui.grimoireOp;
@@ -13716,6 +13729,10 @@ int main(int argc, char** argv) {
       //
       // The tree is built from the EXPANSION, so a nested page is edited as its
       // words. That is the v1 compromise §5 names, and the composer says so.
+      if (rearmAfterOp) {
+        const std::string page = caster.armedPage;
+        caster.ArmPage(glyphs, page);
+      }
       if (ui.graphEdit.pending) {
         ui.graphEdit.pending = false;
         const UIState::GraphEditIntent op = ui.graphEdit;

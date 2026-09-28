@@ -207,9 +207,14 @@ struct PlayerCaster {
   // `selected` is the slot the stack came from, for the HUD strip's highlight;
   // -1 when the stack was built some other way.
   int selected = -1;
+  // The grimoire page READIED from the spellbook (ArmPage), "" when the stack
+  // came from anywhere else. The character screen marks that page and casts it
+  // on the limb you click (session.cpp, the inspector's cast).
+  std::string armedPage;
   bool SelectSlot(const GlyphLibrary& lib, int slot) {
     stack.Clear();
     selected = -1;
+    armedPage.clear();
     if (!SpeakSlot(lib, slot)) {
       Recompile(lib);
       return false;
@@ -278,7 +283,20 @@ struct PlayerCaster {
   void Clear(const GlyphLibrary& lib) {
     stack.Clear();
     selected = -1;
+    armedPage.clear();
     Recompile(lib);
+  }
+  // Click a page in the spellbook: the stack becomes that page, ready to be
+  // cast on a limb from the portrait. False (and nothing readied) when the
+  // page says nothing castable.
+  bool ArmPage(const GlyphLibrary& lib, const std::string& name) {
+    Clear(lib);
+    if (!SpeakPage(lib, name) || compiled.Empty()) {
+      Clear(lib);
+      return false;
+    }
+    armedPage = name;
+    return true;
   }
 
   // ---- SPELLS IN HAND (dual wielding, 2026-09-27) ---------------------------

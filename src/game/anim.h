@@ -84,6 +84,14 @@ struct AnimClip {
   int32_t blendInMs = 0, blendOutMs = 0;
   std::vector<uint8_t> mask;     // per-part 0/1; empty = affects all parts
   std::vector<AnimTrack> tracks;
+  // OVERRIDE clips only; per part, empty = none. `quietAdditive` (0..1) is how
+  // much of every ADDITIVE layer on that part this clip silences at full
+  // weight: a held pose (spell_ready) must not take the walk's arm swing on
+  // top of itself, since additives land after the override blend (anim.cpp
+  // stage 3). `pitchFollow` is the share of the eased look pitch the part
+  // turns through about its own X (pose.cpp, after the head look).
+  std::vector<float> quietAdditive;
+  std::vector<float> pitchFollow;
 };
 
 // Holden's closed-form spring (unconditionally stable at any dt). One per
@@ -462,6 +470,9 @@ struct AnimState {
   std::vector<uint8_t> partAlive; // 0 = severed; IK weight and gait skip it
   std::vector<FootState> feet;    // parallel to skeleton.chains
   std::vector<SpringState> springs;  // parallel to skeleton.parts
+  // Stage 1-3 output, parallel to skeleton.parts: the largest weighted
+  // AnimClip::pitchFollow of the live clips (0 = the part ignores the look).
+  std::vector<float> pitchFollow;
   FlipbookState flipbook;
   int locoState = -1;             // index into skeleton.states, -1 = normal
   float gaitPhase = 0;

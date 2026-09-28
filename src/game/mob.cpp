@@ -315,6 +315,19 @@ static void ParseClipJson(const AnimSkeleton& sk, const std::string& where,
       if (pi >= 0) clip.mask[pi] = 1;
     }
   }
+  // { "<part>": factor } -> a per-part table (AnimClip::quietAdditive /
+  // pitchFollow). A part this rig lacks is skipped, like a track.
+  auto partTable = [&](const char* key, float lo, float hi, std::vector<float>& out) {
+    if (!c.contains(key) || !c[key].is_object()) return;
+    out.assign(sk.parts.size(), 0.0f);
+    for (auto e = c[key].begin(); e != c[key].end(); ++e) {
+      const int pi = sk.FindPart(e.key());
+      if (pi >= 0 && e.value().is_number())
+        out[pi] = std::clamp(e.value().get<float>(), lo, hi);
+    }
+  };
+  partTable("quietAdditive", 0.0f, 1.0f, clip.quietAdditive);
+  partTable("pitchFollow", -1.0f, 1.0f, clip.pitchFollow);
   if (!c.contains("tracks") || !c["tracks"].is_object()) return;
   for (auto t = c["tracks"].begin(); t != c["tracks"].end(); ++t) {
     int pi = sk.FindPart(t.key());
@@ -397,6 +410,13 @@ static bool MirrorClipDoc(const json& in, json& out) {
       mask.push_back(nm.is_string() ? json(swapName(nm.get<std::string>())) : nm);
     out["mask"] = std::move(mask);
   }
+  for (const char* key : {"quietAdditive", "pitchFollow"})
+    if (in.contains(key) && in[key].is_object()) {
+      json table = json::object();
+      for (auto e = in[key].begin(); e != in[key].end(); ++e)
+        table[swapName(e.key())] = e.value();
+      out[key] = std::move(table);
+    }
   if (in.contains("tracks") && in["tracks"].is_object()) {
     json tracks = json::object();
     for (auto t = in["tracks"].begin(); t != in["tracks"].end(); ++t) {

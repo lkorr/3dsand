@@ -1203,6 +1203,14 @@ struct UIState {
     std::string name;
     std::vector<std::string> words;
   } grimoireOp;
+  // READY A PAGE: a click on a spellbook page makes it the spell the portrait
+  // casts on the limb you click (PlayerCaster::ArmPage). An empty name clears
+  // it (the blank leaf). `armedPage` is main.cpp's mirror of what is readied.
+  struct ArmPageIntent {
+    bool pending = false;
+    std::string name;
+  } armPage;
+  std::string armedPage;
   // A GESTURE ON THE CANVAS (PLAN_spell_graph §5). The page never edits words:
   // it names a TREE OP and main.cpp applies it to the tree of the current edit
   // words, linearizes the result back and writes it into `grimoireEditWords`.
@@ -1262,6 +1270,9 @@ struct UIState {
   // row's button. The panel owns the choice; main.cpp clears it when the slot
   // it names stops holding a vessel (moved, dropped, swapped for a sword).
   KitRef activeVessel{};
+  // The chosen flask is stoppered: the brush is up but pours nothing (the
+  // pour refuses a stoppered vessel, session.cpp), so the portrait says why.
+  bool applyStoppered = false;
   // ---- THE ALCHEMY BENCH (game/alchemy_bench.h) ----------------------------
   // A 2D cross-section of one vessel with its contents simulated; another
   // vessel can be brought in and tilted to pour, and a stick stirs. It takes

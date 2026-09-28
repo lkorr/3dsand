@@ -293,6 +293,9 @@ class PlayerAvatar : public Mob {
   // Model-space pose of a part, or identity when the part is gone. The camera
   // uses this to ride the head.
   bool PartWorldTransform(int part, Vec3& outPos, Quat& outRot) const;
+  // The part's collider CENTRE in world voxels (PartWorldTransform's position
+  // is the lattice corner): where a spell cast "on the hand" resolves.
+  bool PartCentreWorld(int part, Vec3& out) const;
   // Where the ANIMATION puts a part this tick, in the same frame and form as
   // PartWorldTransform (lattice corner + rotation) — answered for a severed or
   // dead part too, because the pose is flattened over the whole skeleton. The

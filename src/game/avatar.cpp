@@ -1139,6 +1139,18 @@ bool PlayerAvatar::PartWorldTransform(int part, Vec3& outPos,
   return true;
 }
 
+bool PlayerAvatar::PartCentreWorld(int part, Vec3& out) const {
+  if (part < 0 || part >= (int)limbs_.size() || !limbs_[part].body) return false;
+  const MobLimb& p = limbs_[part];
+  // `size` is in collider units (Mob::CarveRadialAll).
+  const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(p));
+  const Vec3 half{(float)p.size.x * 0.5f * inv, (float)p.size.y * 0.5f * inv,
+                  (float)p.size.z * 0.5f * inv};
+  const Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
+  out = p.xf.pos + Rotate(q, half);
+  return true;
+}
+
 bool PlayerAvatar::PartPosedWorld(int part, Vec3& outPos, Quat& outRot) const {
   if (def_ == nullptr || part < 0 || part >= (int)limbs_.size() ||
       part >= (int)anim_.model.size())

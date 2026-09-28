@@ -3493,8 +3493,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 part = i;
           }
           Vec3 at;
-          Quat rot;
-          if (part >= 0 && avatar.PartWorldTransform(part, at, rot)) {
+          if (part >= 0 && avatar.PartCentreWorld(part, at)) {
             const SpellFxVec selfAt{SpellFxFromFloat(at.x), SpellFxFromFloat(at.y),
                                     SpellFxFromFloat(at.z)};
             const Vec3 body = player.pos;
@@ -3505,8 +3504,10 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             CastResult res = spells.Cast(caster.compiled, caster.mana, playerHealth,
                                          kPlayerCasterId, originFx, dirFx, tick, emit, &probe,
                                          &selfAt, &bodyProbe);
+            // The spell STAYS readied: a page clicked in the spellbook casts on
+            // every limb you click after it, as a spell in the hand does. The
+            // blank leaf, Backspace or another selection puts it away.
             caster.lastOutcome = res.outcome;
-            if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
           }
         }
         // THE POUR BRUSH (game/container.h): with a filled vessel chosen on

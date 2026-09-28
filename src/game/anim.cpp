@@ -287,7 +287,11 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   st.local.resize(n);
   // rest pose is the baseline for everything below
   for (size_t i = 0; i < n; i++) st.local[i] = sk.parts[i].rest;
+  st.pitchFollow.assign(n, 0.0f);
   if (st.clips.empty()) return;
+  // Per part: the most any live override clip silences the additives there.
+  static thread_local std::vector<float> quiet;
+  quiet.assign(n, 0.0f);
 
   // Per-part accumulators for the OVERRIDE pass.
   //
@@ -340,6 +344,14 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
     }
     ci++;
     if (w <= 0.0f) continue;
+    if (c.mode == ClipMode::Override) {
+      const float wc = std::min(w, 1.0f);
+      for (size_t p = 0; p < c.quietAdditive.size() && p < n; p++)
+        quiet[p] = std::max(quiet[p], wc * c.quietAdditive[p]);
+      for (size_t p = 0; p < c.pitchFollow.size() && p < n; p++)
+        if (std::fabs(wc * c.pitchFollow[p]) > std::fabs(st.pitchFollow[p]))
+          st.pitchFollow[p] = wc * c.pitchFollow[p];
+    }
 
     for (const AnimTrack& tr : c.tracks) {
       if (tr.part < 0 || tr.part >= (int)n) continue;
@@ -413,7 +425,9 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   // q_out = q_base * nlerp(identity, dq, w). Applying additives before the
   // normalize would let the weight-division scale the delta away.
   for (const Additive& a : additives) {
-    Quat scaled = QuatNlerp(Quat{}, a.dq, std::clamp(a.w, 0.0f, 1.0f));
+    const float aw = std::clamp(a.w, 0.0f, 1.0f) * (1.0f - quiet[a.part]);
+    if (aw <= 0.0f) continue;
+    Quat scaled = QuatNlerp(Quat{}, a.dq, aw);
     st.local[a.part].rot = QuatNormalize(QuatMul(st.local[a.part].rot, scaled));
   }
 }

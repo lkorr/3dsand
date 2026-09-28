@@ -516,6 +516,16 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
                      std::fabs(pose_.lookPitch) > 1e-4f))
       ApplyAimPart(sk, st, head, pose_.lookYaw, pose_.lookPitch, 1.0f,
                    in.lookSpineShare);
+    // A held pose that follows the look up and down (AnimClip::pitchFollow,
+    // e.g. spell_ready's arms): a share of the same eased pitch, about the
+    // part's own X, sign as ApplyAimPart's (pitch positive UP).
+    if (std::fabs(pose_.lookPitch) > 1e-4f)
+      for (size_t i = 0; i < st.pitchFollow.size() && i < st.local.size(); i++) {
+        const float f = st.pitchFollow[i];
+        if (f == 0.0f || (i < st.partAlive.size() && !st.partAlive[i])) continue;
+        st.local[i].rot = QuatNormalize(
+            Mul(st.local[i].rot, AxisAngle({1, 0, 0}, -pose_.lookPitch * f)));
+      }
   }
 
   // ---- stage 3.5: the torso serves a live swing (anim.h) ----

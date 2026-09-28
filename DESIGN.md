@@ -8471,13 +8471,19 @@ body that is gone before its fuse (something blew it up) resolves where it
 was last seen; a request the owner never adopted resolves at the hard tick
 bound. Bombs share `maxLiveProjectiles`.
 
-**`self` from the character screen resolves at the clicked part.** The health
-inspector's limb rectangles become targets while a sentence is on the stack
-(`InspectCastPicks`); the click latches only a body slot (`castAtPart`), and
-`main.cpp` turns the slot into the limb's world transform and calls the same
-`Cast()` with `selfAt` — the effect radii clamped to the delivery's impact
-radius so `fire self` on a stump chars the stump and not the torso beside it.
-Nothing in the VM knows what a part is.
+**`self` from the character screen resolves at the clicked part.** Clicking a
+spellbook page opens it AND readies it (`PlayerCaster::ArmPage`, marked in the
+page list); while a sentence is on the stack and no flask is chosen, the
+portrait's limbs are targets, health column open or not (`InspectCastPicks`).
+The click latches only a body slot (`castAtPart`); the tick turns the slot into
+the limb's collider CENTRE (`PlayerAvatar::PartCentreWorld` -- the transform's
+position is the lattice corner) and calls the same `Cast()` with `selfAt`, the
+effect radii clamped to the delivery's impact radius so `fire self` on a stump
+chars the stump and not the torso beside it. The Explode verb honours that
+clamp (it used to take max(glyph radius, effect radius), so a blast "on the
+hand" was the glyph's 6-voxel sphere and took the torso). The spell stays
+readied after a cast; the blank leaf, Backspace or another selection clears
+it. Nothing in the VM knows what a part is.
 
 **Cost: you pay for voxels, not for words (plan §4; `EffectTariff`,
 `PriceCast`).** Every glyph has a small fixed `word` cost. The real price is
@@ -16754,10 +16760,12 @@ MutationQueue:
   coated where it is hit. That IS "pour blood on somebody and they are stained".
 
 **The portrait pour brush** (2026-09-23; `Portrait` in inventory_ui.cpp, the
-`pourStroke` in session.cpp): with a filled vessel chosen and no spell
-spoken, the character screen's portrait is a BRUSH. The vessel is CHOSEN, not
+`pourStroke` in session.cpp): with a filled vessel chosen, the character
+screen's portrait is a BRUSH -- a chosen flask wins over a readied spell, since
+choosing it is the explicit act and the spell selection persists. A stoppered
+flask keeps the brush up but pours nothing, and the portrait says so. The vessel is CHOSEN, not
 held: the screen's FLASKS row (where "on your person" -- sheath + quick slots
--- used to be) lists every vessel in the pack and hotbar; clicking one sets
+-- used to be) lists every vessel in the hands, pack and hotbar; clicking one sets
 `UIState::activeVessel` (a `KitRef`), "put away" clears it, and
 `PourStroke::vessel` tells the tick which stack pays. main.cpp drops the choice
 when its slot stops holding a vessel. Left button held pours

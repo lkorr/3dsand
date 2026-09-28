@@ -2957,8 +2957,12 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         // Repeating `explosive` scales POWER ×N; the engine's falloff law turns
         // that into reach. The op's radius bound grows as the cube root so the
         // bound does not clip what the power would have reached.
-        const int32_t r0 = g ? g->radius : e.radius;
-        const int32_t r = ClampI(scaled(ScaleRadiusCbrtMille(std::max(r0, e.radius), e.Scale())), 1,
+        // The EFFECT's radius, which lowering copied from the glyph and `wide`
+        // widened. It used to be max(glyph, effect), which let the glyph's 6
+        // override the character screen's clamp to the part (Cast's `selfAt`):
+        // a blast "on the hand" was a 1.2 m sphere and took the torso with it.
+        const int32_t r0 = e.radius > 0 ? e.radius : (g ? g->radius : 1);
+        const int32_t r = ClampI(scaled(ScaleRadiusCbrtMille(r0, e.Scale())), 1,
                                  kMaxExplosionRadius);
         const int32_t power =
             (int32_t)((int64_t)(g ? g->power : 220) * e.Scale() / 1000 * strengthMille / 1000);

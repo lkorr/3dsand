@@ -536,12 +536,13 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // as it does on a living body. The one exception is the head look at the
   // bottom: there is no rig left to turn a head.
   const bool dead = s.deathScreen;
-  // POUR MODE: a filled vessel in hand (and no sentence spoken, which would
-  // own the click) turns the left button into the brush. The camera moves to
-  // the other two buttons, the way a modelling tool keeps its paint button
-  // free: right-drag orbits, middle-drag pans.
-  const bool pourMode = s.bodyValid && !dead && !s.applyText.empty() &&
-                        s.spellText.empty();
+  // POUR MODE: a filled flask chosen on the FLASKS row turns the left button
+  // into the brush. The camera moves to the other two buttons, the way a
+  // modelling tool keeps its paint button free: right-drag orbits, middle-drag
+  // pans. Choosing the flask is the explicit act, so it wins over a selected
+  // spell: the spell bar's selection PERSISTS across casts (caster.h), and
+  // gating on it left the brush dead for anyone who had ever picked a spell.
+  const bool pourMode = s.bodyValid && !dead && !s.applyText.empty();
   const bool active = ImGui::IsItemActive();
   const bool dragL = active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f);
   const bool dragR = active && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f);
@@ -611,19 +612,21 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // (release) so drags do not fire it. The distance gate separates a click
   // from an orbit that barely moved, and the click-count gate lets double-
   // click-to-frame through without also selecting.
-  if (s.inspectMode && s.bodyValid &&
+  // A readied spell makes the click a cast with the health column shut too.
+  const bool castReady = !s.spellText.empty() && !pourMode;
+  if ((s.inspectMode || castReady) && s.bodyValid &&
       ImGui::IsItemDeactivated() &&
       ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
       ImGui::GetIO().MouseDragMaxDistanceSqr[0] < 9.0f &&
       ImGui::GetIO().MouseClickedCount[0] < 2) {
     const int best = LimbAtPoint(s, at, size, ImGui::GetMousePos());
-    s.inspectSelected = best;
+    if (s.inspectMode) s.inspectSelected = best;
     // The same click CASTS when there is a sentence to cast (InspectCastPicks).
     // Latched here and not by a button of its own: that would sit on top of
     // this one, and ImGui gives an overlapped click to whichever item was
     // submitted first, so it never saw it. A flask pours through the brush
     // below instead, not through a click on a part.
-    if (best >= 0 && !s.spellText.empty()) {
+    if (best >= 0 && castReady) {
       s.castAtPart.pending = true;
       s.castAtPart.slot = best;
     }
@@ -681,8 +684,11 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // the button goes down, not discovered from the fill text afterwards.
   if (pourMode && hovered) {
     char line[64];
-    std::snprintf(line, sizeof line, "brush %.2f  .  %.1f cells/s",
-                  s.pourRadius, s.pourDrainPerSec);
+    if (s.applyStoppered)
+      std::snprintf(line, sizeof line, "stoppered  .  unstop it on the bench");
+    else
+      std::snprintf(line, sizeof line, "brush %.2f  .  %.1f cells/s",
+                    s.pourRadius, s.pourDrainPerSec);
     ImGui::PushFont(ui::FontSmall());
     ui::ShadowText(dl, ImVec2(at.x + 8, at.y + 8),
                    Fade(s.applyColor ? ui::Mix(s.applyColor, IM_COL32_WHITE, 0.4f)
@@ -1336,6 +1342,10 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
                      hov || sel ? ui::ColRubric() : Fade(ui::ColIronSoft(), 0.8f),
                      4.0f, 2.0f);
       if (ImGui::IsItemClicked()) {
+        if (!s.armedPage.empty()) {
+          s.armPage.pending = true;
+          s.armPage.name.clear();
+        }
         s.grimoireSelected.clear();
         s.grimoireEditName.clear();
         s.grimoireEditWords.clear();
@@ -1377,7 +1387,16 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
       cd->PopClipRect();
       if (p.dropped > 0)
         cd->AddText(ImVec2(base.x + rowW - 12, py + 4), ui::ColBlood(), "?");
+      // READIED: the portrait casts this page on the limb you click. The
+      // portrait's cast frame is the same blue.
+      if (p.name == s.armedPage)
+        cd->AddRectFilled(ImVec2(base.x + 1, py + 3), ImVec2(base.x + 4, py + kRow - 3),
+                          IM_COL32(150, 200, 255, 255));
       if (ImGui::IsItemClicked()) {
+        // Opening a page also READIES it: click a limb on the portrait and
+        // it is cast there (Portrait, session.cpp).
+        s.armPage.pending = true;
+        s.armPage.name = p.name;
         s.grimoireSelected = p.name;
         s.grimoireEditName = p.name;
         s.grimoireEditWords = p.words;
@@ -1407,7 +1426,8 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         ImGui::TextDisabled("%s", p.readout.c_str());
         if (p.priceUnknown) ImGui::TextDisabled("price %d + ?", p.price);
         else ImGui::TextDisabled("price %d", p.price);
-        ImGui::TextDisabled("click to open  .  right-click to nest it in the open page  .  drag onto a key to bind it");
+        ImGui::TextDisabled("click to open and ready it (then click a limb on your portrait to cast it there)");
+        ImGui::TextDisabled("right-click to nest it in the open page  .  drag onto a key to bind it");
         EndTip();
       }
       ImGui::PopID();
@@ -3386,10 +3406,12 @@ void DrawInventoryScreen(UIState& s) {
 
     ImGui::SetCursorScreenPos(ImVec2(portX, portY));
     Portrait(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
-    if (s.inspectMode) {
+    if (s.inspectMode)
       InspectOverlay(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
+    // The cast frame whenever a spell is readied (and no flask owns the
+    // click), health column open or not: the click casts either way.
+    if (s.applyText.empty())
       InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
-    }
     // A hovered armour slot shades the limbs it is standing in front of. This
     // is the other half of the COVER section in the health column and the same
     // fact from the other end: "what does this piece protect" answered by
@@ -3449,7 +3471,7 @@ void DrawInventoryScreen(UIState& s) {
     }
     y = portY + kPortraitH + 16;
 
-    // FLASKS: every vessel you carry, pack first, then hotbar - the same
+    // FLASKS: every vessel you carry, hands first, then pack, then hotbar - the same
     // stacks, not copies, so a drag from here is a drag from where it lives.
     // CLICK ONE TO USE IT on yourself: the portrait turns into the pour brush
     // for that flask (Portrait's pourMode), whether or not it is in your hand.
@@ -3460,6 +3482,11 @@ void DrawInventoryScreen(UIState& s) {
     y += 2;
     {
       std::vector<KitRef> flasks;
+      // A flask in a hand is a kit hand slot (dual wielding); the pour
+      // (session.cpp) already resolves and splits one there.
+      for (int i = 0; i < (int)s.equipSlots.size(); i++)
+        if (s.equipSlots[i].kind == "container")
+          flasks.push_back(KitRef{KitSpace::Equip, i});
       for (int i = 0; i < (int)s.bagSlots.size(); i++)
         if (s.bagSlots[i].kind == "container")
           flasks.push_back(KitRef{KitSpace::Bag, i});
@@ -3482,7 +3509,9 @@ void DrawInventoryScreen(UIState& s) {
       for (int k = 0; k < shown; k++) {
         const KitRef r = flasks[k];
         const UIState::KitSlotUI& it =
-            r.space == KitSpace::Bag ? s.bagSlots[r.index] : s.hotbarSlots[r.index];
+            r.space == KitSpace::Equip ? s.equipSlots[r.index]
+            : r.space == KitSpace::Bag ? s.bagSlots[r.index]
+                                       : s.hotbarSlots[r.index];
         char id[32];
         std::snprintf(id, sizeof id, "flask%d_%d", (int)r.space, r.index);
         const ImVec2 at(wp.x + kPad + k * (kSlot + kSlotGap), y);
