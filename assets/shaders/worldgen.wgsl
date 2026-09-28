@@ -5478,6 +5478,17 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
 // Separate entry point for the compile-time reason `farpatch` is (its own
 // genColumn + genCellIn copies); same dispatch extent, and an entry without the
 // flag returns at once.
+// THE COVER BIT (LOD-seam package E, 2026-09-28). A column plant (grass, a
+// flower, moss: any MATF_MICRO material) standing on the sub-column's top is
+// dropped by every far writer (farCellIsSolid), so past the handoff a meadow
+// was its bare skin. The map records it: bit 30 set = a plant stands on this
+// sample column, and bits 23..29 then hold the PLANT's far palette slot in
+// place of the sub-skin (the renderer takes the sub-skin from a sibling
+// sub-column of the same cell — raymarch.wgsl farMapSubOf). raymarch.wgsl's
+// FAR_MAP_COVER_BIT is the same bit; declared in both rather than in
+// common.wgsl because a common.wgsl edit recompiles every shader.
+const FAR_MAP_COVER_BIT : u32 = 0x40000000u;
+
 @compute @workgroup_size(64)
 fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
           @builtin(local_invocation_index) li : u32) {
@@ -5510,9 +5521,12 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     // should cost the driver one of them (see unrollFence()).
     var skin = MAT_AIR;
     var under = MAT_AIR;
-    for (var q = unrollFenceU(); q < 2u; q++) {
-      let mq = genCellCol(&col, &ponds, vec3<i32>(fx, top - i32(q), fz), T.seed) & 0xFFFu;
-      if (q == 0u) { skin = mq; } else { under = mq; }
+    var cover = MAT_AIR;
+    // q = 0 the voxel over the top (the cover plant, if any), 1 the skin, 2
+    // the sub-skin.
+    for (var q = unrollFenceU(); q < 3u; q++) {
+      let mq = genCellCol(&col, &ponds, vec3<i32>(fx, top + 1 - i32(q), fz), T.seed) & 0xFFFu;
+      if (q == 0u) { cover = mq; } else if (q == 1u) { skin = mq; } else { under = mq; }
     }
     if (!farCellIsSolid(skin)) {
       // Something non-far-solid ON the surface voxel (a lily pad over a pond):
@@ -5532,6 +5546,14 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
     var e = u32(clamp(top + FAR_MAP_H_BIAS, 0, 0xFFFF)) |
             (matFarPal(&materials, skin) << 16u) |
             (matFarPal(&materials, under) << 23u);
+    // A plant on the ground (not on a fluid surface: a lily pad keeps the
+    // fluid look) with a far slot of its own: the cover bit + its slot.
+    if (cover != MAT_AIR && top == col.h && (materials[cover].flags & MATF_MICRO) != 0u) {
+      let cs = matFarPal(&materials, cover);
+      if (cs != 0u) {
+        e = (e & ~(0x7Fu << 23u)) | (cs << 23u) | FAR_MAP_COVER_BIT;
+      }
+    }
     if (ok) { e |= FAR_MAP_VALID; }
     atomicStore(&farMap[farMapWord(level, m)], e);
   }

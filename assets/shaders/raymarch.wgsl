@@ -4581,8 +4581,10 @@ fn farHfAO(level : u32, fineV : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
   return clamp(1.0 - (occ / 3.0) * TUNE_AO_STRENGTH * reach, 0.0, 1.0);
 }
 
-// farfield.cpp kHyst (2 level chunks) + 1 for the plane a recentre queues.
-const FAR_SPHERE_MARGIN_CHUNKS : i32 = 3;
+// farfield.cpp kHyst (2 level chunks): the nearest a box face can be. A
+// plane still queued pulls the VALID face one chunk nearer for the few ticks
+// it takes to land; then the box exit is the handoff, as before.
+const FAR_SPHERE_MARGIN_CHUNKS : i32 = 2;
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   var out : FarHit;
   out.hit = false;
@@ -4652,9 +4654,10 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // with the dither hash changed or off and with the refine at 0/2/8). A
     // sphere about the eye is crossed head-on by every ray, so the flip is a
     // circle the dither dissolves, never a lattice. Radius: the nearest the
-    // box face can be (half the box less the recentre hysteresis) less one
-    // chunk for the leading plane a shift re-queues — so a plane refill
-    // happens beyond the handoff and is never seen as a pop. The outermost
+    // box face can be (half the box less the recentre hysteresis), so a
+    // settled plane refill
+    // happens beyond the handoff and is rarely seen as a pop. (13 chunks
+    // was tried first; 14 keeps 8% more of each level's range.) The outermost
     // level keeps its box: nothing takes over behind it.
     var tLvlOut = min(min(tmax.x, min(tmax.y, tmax.z)), tCeil / s);
     if (level < FAR_LEVELS) {
@@ -10896,28 +10899,29 @@ fn farBandNearWeight(tFine : f32) -> f32 {
   return 1.0 - smoothstep(TUNE_LOD_HANDOFF_DIST, FAR_BAND_END_M, tFine * VOXEL_METERS);
 }
 
-// ---- THE FOOTPRINT FADE: fine-lattice detail below a pixel (package E) ----
-// Three things on the far surface repeat on the FINE-VOXEL lattice and are
-// drawn by one sample per pixel: the tread/riser alternation of a terraced
-// slope (a lit top and a shaded riser every voxel -- on a bowl or a dune
-// hollow, concentric contour rings), the palette variant (white noise per
-// voxel) and surfaceGrain's fine octave (~2.5 voxels). Below ~2 px per voxel
-// they alias into the 1-2 px salt-and-pepper on distant slopes (strongest on
-// snow, and made finer by the surface-map refine, whose level-1 columns ARE
-// fine voxels). (The concentric-ring moire is a different thing: level box
-// faces seen edge-on — see traceFar's sphere handoff.) The far field now
-// draws, for each of them, its EXPECTED
-// value over the footprint as the footprint shrinks: the variant eases to the
-// mean of the three palette entries, each grain octave to its mean once its
-// feature is under two pixels, and a heightfield hit to the average look of
-// the voxel STAIRCASE under it (farStairShade) -- not to a smooth slope: seen
-// from low down a hillside shows mostly risers, in the sub-skin's colour and
-// the risers' light, and shading it as a smooth snowy slope turned distant
-// stone-and-snow mountains white (tried first; seam_veg on the meadow map).
+// ---- THE FOOTPRINT FADE: detail below a pixel (package E) ----
+// Things on the far surface that repeat faster than the pixels sample them
+// alias into the 1-2 px salt-and-pepper on distant slopes (strongest on snow,
+// and made finer by the surface-map refine, whose level-1 columns ARE fine
+// voxels): the palette variant (white noise per fine voxel), surfaceGrain's
+// octaves, and the tread/riser alternation of a staircase of refined sub-
+// columns. (The concentric-ring moire is a different thing: level box faces
+// seen edge-on — see traceFar's sphere handoff.) Each eases to its EXPECTED
+// value as its footprint shrinks: the variant to the mean of its three
+// palette entries and each grain octave to its mean (keyed on the FINE voxel's
+// size), and a staircase whose drawn element — sub-column or cell — is under
+// ~2 px to its average (keyed on the ELEMENT: see FAR_FP_STAIR_*): skin and
+// sub-skin in the shares the view sees, LIT BY THE SMOOTH HEIGHTFIELD NORMAL
+// so slopes keep their shading. Two first cuts were wrong and are recorded
+// so they are not repeated: a smooth normal that also took the skin for the
+// ALBEDO turned stone-and-snow mountains white (seen from low down a hillside
+// is mostly risers), and averaging the staircase's LIGHTING by the fine
+// voxel's size flattened every distant hill (the orchestrator's review of
+// ef553c5: cascade band luminance std 28.7 -> 25.2).
 //
-// KEYED ON THE FINE VOXEL'S PROJECTED SIZE and nothing else -- the same
-// quantity at every cascade level, so the fade is continuous across every
-// level seam -- and it begins no nearer than the handoff: the start is the
+// The fine-voxel fades are continuous across every level seam (the same
+// quantity at every level)
+// -- and they begin no nearer than the handoff: the start is the
 // voxel's size at render.lodHandoffDist when that is under the nominal start,
 // so at any resolution / FOV the far side of the handoff is still at zero
 // fade and the near field (which never draws a voxel smaller than that) needs
@@ -10930,8 +10934,13 @@ fn farFootprintFade(voxPx : f32, full : f32, start : f32) -> f32 {
   let s = min(start, hand);
   return 1.0 - smoothstep(s * (full / start), s, voxPx);
 }
-const FAR_FP_STAIR_FULL : f32 = 1.0;    // px per voxel: the staircase fully averaged
-const FAR_FP_STAIR_START : f32 = 3.0;   // px per voxel: untouched
+// The staircase fade is keyed on the ELEMENT the far field drew — a refined
+// sub-column (half a cell) or a whole cell — not on the fine voxel: cascade
+// cells stay 3-8 px wide at every level (the kFarN law), so their terraces are
+// real relief, and keying them on the fine voxel (the first cut of this)
+// flattened every distant hill. Only an element under ~2 px is averaged.
+const FAR_FP_STAIR_FULL : f32 = 1.0;    // px per element: fully averaged
+const FAR_FP_STAIR_START : f32 = 2.5;   // px per element: untouched
 const FAR_FP_JITTER_FULL : f32 = 1.0;
 const FAR_FP_JITTER_START : f32 = 2.0;
 fn paletteMean(m : Material) -> vec3f {
@@ -10949,56 +10958,114 @@ fn surfaceGrainFp(cell : vec3<i32>, amp : f32, voxPx : f32) -> f32 {
   if (kf > 0.0) { n += (valueNoise(p, TUNE_GRAIN_FINE_SCALE) - 0.5) * (1.0 - TUNE_GRAIN_MIX) * kf; }
   return 1.0 + (n - 0.5) * 2.0 * amp;
 }
-// The heightfield under a far hit: the gradient (fine voxels of rise per fine
-// voxel of run, x and z) from the surface map's tops two sub-columns either
-// side (a 4-sub-column baseline: 40 cm at level 1, 2^k x 20 cm above), and the
-// skin / sub-skin palette slots of the hit's own sub-column. ok = false when
-// any tap is outside the valid box or not vouched for (an edit, a ruin): the
-// caller keeps the face shade there.
-struct FarSmooth { ok : bool, g : vec2f, skin : u32, sub : u32 };
-fn farSmoothAt(level : u32, hitP : vec3f) -> FarSmooth {
-  var r : FarSmooth;
+// THE MAP UNDER A FAR HIT: the entry of the sub-column the hit point lies
+// over (`e`), its cell's four (`q`), the sub-skin slot with the cover bit
+// resolved (`sub`), and the heightfield gradient (fine voxels of rise per fine
+// voxel of run, x and z) from the tops two sub-columns either side (a
+// 4-sub-column baseline: 40 cm at level 1, 2^k x 20 cm above) when `grad` is
+// asked for. The map is filled at EVERY level, whatever farRefineLevel caps
+// the refine at. ok = false when an entry is outside the valid box or not
+// vouched for (an edit, a ruin): the caller keeps the plain cell shade there.
+const FAR_MAP_COVER_BIT : u32 = 0x40000000u;   // worldgen.wgsl, same name
+struct FarSurf { ok : bool, e : u32, q : vec4<u32>, sub : u32, g : vec2f, gok : bool };
+// The sub-skin of entry `ez` of cell `q`: its own field, or — when the cover
+// bit took that field for the plant's slot — the first uncovered sibling's,
+// else the skin.
+fn farMapSubOf(ez : u32, q : vec4<u32>) -> u32 {
+  if ((ez & FAR_MAP_COVER_BIT) == 0u) { return (ez >> 23u) & 0x7Fu; }
+  var r = (ez >> 16u) & 0x7Fu;
+  if ((q.w & FAR_MAP_COVER_BIT) == 0u) { r = (q.w >> 23u) & 0x7Fu; }
+  if ((q.z & FAR_MAP_COVER_BIT) == 0u) { r = (q.z >> 23u) & 0x7Fu; }
+  if ((q.y & FAR_MAP_COVER_BIT) == 0u) { r = (q.y >> 23u) & 0x7Fu; }
+  if ((q.x & FAR_MAP_COVER_BIT) == 0u) { r = (q.x >> 23u) & 0x7Fu; }
+  return r;
+}
+fn farSurfAt(level : u32, hitP : vec3f, grad : bool) -> FarSurf {
+  var r : FarSurf;
   r.ok = false;
+  r.gok = false;
   let w = f32(1u << (farCellShift(level) - 1u));
   let m = vec2<i32>(floor(vec2f(hitP.x, hitP.z) / w));
   let b = farBox(level);
-  let x0 = farHfTopAt(level, m - vec2<i32>(2, 0), b);
-  let x1 = farHfTopAt(level, m + vec2<i32>(2, 0), b);
-  let z0 = farHfTopAt(level, m - vec2<i32>(0, 2), b);
-  let z1 = farHfTopAt(level, m + vec2<i32>(0, 2), b);
-  if (min(min(x0, x1), min(z0, z1)) < -1000000000) { return r; }
   let c = m >> vec2<u32>(1u);
   if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return r; }
-  let q = farMap[farMapCell(level, c)];
+  r.q = farMap[farMapCell(level, c)];
   let hx = (m.x & 1) != 0;
-  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), (m.y & 1) != 0);
-  if ((e & FAR_MAP_VALID) == 0u) { return r; }
+  r.e = select(select(r.q.x, r.q.y, hx), select(r.q.z, r.q.w, hx), (m.y & 1) != 0);
+  if ((r.e & FAR_MAP_VALID) == 0u) { return r; }
   r.ok = true;
-  r.g = vec2f(f32(x1 - x0), f32(z1 - z0)) / (4.0 * w);
-  r.skin = (e >> 16u) & 0x7Fu;
-  r.sub = (e >> 23u) & 0x7Fu;
+  r.sub = farMapSubOf(r.e, r.q);
+  if (grad) {
+    let x0 = farHfTopAt(level, m - vec2<i32>(2, 0), b);
+    let x1 = farHfTopAt(level, m + vec2<i32>(2, 0), b);
+    let z0 = farHfTopAt(level, m - vec2<i32>(0, 2), b);
+    let z1 = farHfTopAt(level, m + vec2<i32>(0, 2), b);
+    r.gok = min(min(x0, x1), min(z0, z1)) > -1000000000;
+    r.g = vec2f(f32(x1 - x0), f32(z1 - z0)) / (4.0 * w);
+  }
   return r;
 }
-// What a pixel covering many voxels of a heightfield staircase sees, on
-// average. Per unit of ground a ray going DOWN sees |rd.y| of tread, and per
-// axis |g * rd| of riser when it is heading UPHILL on that axis (a riser faces
-// downhill; a ray heading downhill sees only treads). Those three areas weight
-// the three faces' wrapped Lambert, face weight and n.y (ambient, openness,
-// bounce and wetness are linear in n.y), and the albedo: a tread wears the
-// skin; a riser the skin on its top voxel and the sub-skin below it, i.e. the
-// sub-skin for all but 1 / max(1, |g|) of its height. Returns x = lambert,
-// y = face weight, z = n.y, w = riser fraction (for the albedo).
-fn farStairShade(g : vec2f, rd : vec3f) -> vec4f {
+// The riser share of what a pixel over a heightfield staircase sees: per
+// unit of ground a descending ray sees |rd.y| of tread and, per axis, |g * rd|
+// of riser when heading UPHILL on that axis (a riser faces downhill). The
+// ALBEDO of the averaged staircase is skin and sub-skin in these shares; its
+// LIGHTING is the smooth heightfield normal's, so the relief survives.
+fn farRiserShare(g : vec2f, rd : vec3f) -> f32 {
   let wT = max(-rd.y, 0.0);
-  let wX = select(0.0, abs(g.x * rd.x), g.x * rd.x > 0.0);
-  let wZ = select(0.0, abs(g.y * rd.z), g.y * rd.z > 0.0);
-  let inv = 1.0 / max(wT + wX + wZ, 1e-6);
+  let wR = select(0.0, abs(g.x * rd.x), g.x * rd.x > 0.0) +
+           select(0.0, abs(g.y * rd.z), g.y * rd.z > 0.0);
+  return wR / max(wT + wR, 1e-6);
+}
+
+// ---- THE COVER TINT: the plants' look where the plants have gone ----
+// Past the handoff a meadow was its bare skin (the far field has no plants),
+// and B's fade thins the near plants to nothing by the handoff: grass, then
+// turf. The ground's top face now takes the plants' colour by how much of it
+// the plants would HIDE from this view: over a 2x2 block of columns (a
+// level-1 cell: exactly the four entries the far side loads) the covered
+// fraction f and the plant's height H give an optical depth
+//   tau = f * (1 + COVER_K * H / |rd.y|)
+// — the footprint, plus the ground a stand of height H hides behind it along
+// a ray descending at |rd.y| (blades are thin: COVER_K is their opacity x
+// width) — and the tint is 1 - exp(-tau) of the plant's look (body and tip
+// palette means). At the eye-height seam that is ~all of a meadow and a
+// fraction of a desert's tussocks; from above, about the footprint.
+// SAME FUNCTION BOTH SIDES: the far side reads the four map entries of the
+// cell (cover bit + the plant's slot, worldgen farmap), the near side the four
+// voxels over the same four columns, and the near weight ramps in across B's
+// fade band as the plants themselves go, so it is 1 from DETAIL_FADE_END_M on
+// — before the handoff. The plant's identity is its far palette slot's owner
+// on both sides, so an aliased plant looks the same across the seam.
+const FAR_COVER_K : f32 = 0.15;
+fn coverLook(pm : u32) -> vec4f {
+  let om = farPalMat(&materials, matFarPal(&materials, pm));
+  let mb = microBricks[om];
+  if ((mb.flags & MICROF_PLANT) != 0u) {
+    let d = plantDefOf(mb);
+    let body = select(om, d.body, d.body != 0u);
+    let tip = select(body, d.tip, d.tip != 0u);
+    return vec4f(mix(paletteMean(materials[body]), paletteMean(materials[tip]), 0.3),
+                 f32(max(d.maxH, 1)));
+  }
+  return vec4f(paletteMean(materials[om]), 1.0);
+}
+// What the eye sees of a stand of plants is BLADES, lit as upright surfaces
+// facing it, not a lawn lit as a tread: the cover colour is scaled by the
+// ratio of an upright face's light (hemisphere ambient at the view-facing
+// horizontal normal, wrapped key light on it) to an up face's. Depends on the
+// view and the sky only, so both sides compute the same number.
+fn coverBladeLight(rd : vec3f) -> f32 {
+  let nb = normalize(vec3f(-rd.x, 0.0, -rd.z) + vec3f(1e-4, 0.0, 0.0));
   let kd = keyLightDir();
-  let lam = wT * wrapDiffuse(kd.y, TUNE_DIFFUSE_WRAP) +
-            wX * wrapDiffuse(-sign(g.x) * kd.x, TUNE_DIFFUSE_WRAP) +
-            wZ * wrapDiffuse(-sign(g.y) * kd.z, TUNE_DIFFUSE_WRAP);
-  return vec4f(lam * inv, (wT + wX * TUNE_FACE_X + wZ * TUNE_FACE_Z) * inv,
-               wT * inv, (wX + wZ) * inv);
+  let kl = dot(keyLightColor(), vec3f(0.2126, 0.7152, 0.0722));
+  let side = dot(ambientAt(nb), vec3f(0.2126, 0.7152, 0.0722)) * FAR_OPEN_RISER +
+             kl * wrapDiffuse(dot(nb, kd), TUNE_DIFFUSE_WRAP);
+  let up = dot(ambientAt(vec3f(0.0, 1.0, 0.0)), vec3f(0.2126, 0.7152, 0.0722)) +
+           kl * wrapDiffuse(kd.y, TUNE_DIFFUSE_WRAP);
+  return clamp(side / max(up, 1e-4), 0.0, 1.0);
+}
+fn coverWeight(f : f32, hVox : f32, rd : vec3f) -> f32 {
+  return 1.0 - exp(-f * (1.0 + FAR_COVER_K * hVox / max(-rd.y, 0.02)));
 }
 
 // ---- far WET GROUND: the near rain term, with openness replaced ----
@@ -11235,33 +11302,60 @@ fn fs(in : VSOut) -> FSOut {
       let hitP = R.camPos + rd * far.t;
       let fineV = vec3<i32>(floor(hitP - n * 0.5));
       var albedo = paletteJitter(m, synthJitterState(fineV, R.seed));
-      // THE FOOTPRINT FADE (farFootprintFade): the variant, the grain octaves
-      // and the tread/riser staircase ease to their means below a pixel.
+      // THE FOOTPRINT FADE (farFootprintFade): the variant and the grain
+      // octaves ease to their means below ~2 px per fine voxel; the staircase
+      // below ~2 px per drawn element (wN, below).
       let voxPx = farVoxPx(far.t);
       let wJ = farFootprintFade(voxPx, FAR_FP_JITTER_FULL, FAR_FP_JITTER_START);
-      let wN = farFootprintFade(voxPx, FAR_FP_STAIR_FULL, FAR_FP_STAIR_START);
       if (wJ > 0.0) { albedo = mix(albedo, paletteMean(m), wJ); }
-      // The STAIRCASE AVERAGE (farStairShade), eased in by wN, for a hit that
-      // IS the heightfield surface (its material is its sub-column's skin or
-      // sub-skin): a trunk or a rock keeps its cube shade. `nSh` carries only
-      // the averaged n.y, for the laws that read nothing else (ambient,
-      // openness, bounce, wetness); the face normal `n` stays the geometry
-      // (AO taps, shadow start, the band's near-grid lookup).
+      // THE MAP UNDER THE HIT (farSurfAt), for a hit that IS the heightfield
+      // surface (its material is its sub-column's skin or sub-skin: a trunk or
+      // a rock keeps its cube shade). Two things read it:
+      //  * the COVER TINT (see coverWeight) on the top face;
+      //  * the STAIRCASE AVERAGE, eased in by wN once the drawn element is
+      //    under ~2 px: albedo = skin / sub-skin in the tread / riser shares
+      //    the view sees, LIGHTING = the smooth heightfield normal's (Lambert,
+      //    face weight, and `nSh` for ambient, openness, bounce, wetness). The
+      //    face normal `n` stays the geometry (AO taps, shadow start, the
+      //    band's near-grid lookup).
+      let elemPx = voxPx * select(sL, 0.5 * sL, fRefined);
+      let wN = farFootprintFade(elemPx, FAR_FP_STAIR_FULL, FAR_FP_STAIR_START);
       var nSh = n;
-      var stair = vec4f(-1.0);
+      var lamSm = -1.0;
+      var faceSm = 1.0;
       var smoothAlb = vec3f(-1.0);
-      if (wN > 0.0 && m.klass != CLASS_LIQUID) {
-        let fsm = farSmoothAt(flv, hitP);
-        if (fsm.ok) {
-          let skinM = farPalMat(&materials, fsm.skin);
-          let subM = farPalMat(&materials, fsm.sub);
+      if (m.klass != CLASS_LIQUID) {
+        let fs2 = farSurfAt(flv, hitP, wN > 0.0);
+        if (fs2.ok) {
+          let skinM = farPalMat(&materials, (fs2.e >> 16u) & 0x7Fu);
+          let subM = farPalMat(&materials, fs2.sub);
           if (far.mat == skinM || far.mat == subM) {
-            stair = farStairShade(fsm.g, rd);
-            nSh = vec3f(n.x * (1.0 - wN), mix(n.y, stair.z, wN), n.z * (1.0 - wN));
-            let skinA = paletteMean(materials[skinM]);
-            let riserA = mix(skinA, paletteMean(materials[subM]),
-                             1.0 - 1.0 / max(1.0, max(abs(fsm.g.x), abs(fsm.g.y))));
-            smoothAlb = mix(skinA, riserA, stair.w);
+            // The cover: this sub-column's bit, or the cell's fraction once a
+            // sub-column is under ~2 px; the plant is this sub-column's, or
+            // the first covered sibling's.
+            // The cover (coverWeight): the cell's covered fraction and the
+            // first covered entry's plant, in the near side's column order.
+            let cb = (fs2.q & vec4<u32>(FAR_MAP_COVER_BIT)) != vec4<u32>(0u);
+            var skinA = paletteMean(materials[skinM]);
+            if (any(cb)) {
+              let frac = dot(select(vec4f(0.0), vec4f(0.25), cb), vec4f(1.0));
+              let ce = select(select(select(fs2.q.w, fs2.q.z, cb.z), fs2.q.y, cb.y),
+                              fs2.q.x, cb.x);
+              let cl = coverLook(farPalMat(&materials, (ce >> 23u) & 0x7Fu));
+              let cw = coverWeight(frac, cl.w, rd);
+              let cc = cl.rgb * coverBladeLight(rd);
+              skinA = mix(skinA, cc, cw);
+              if (n.y > 0.5) { albedo = mix(albedo, cc, cw); }
+            }
+            if (wN > 0.0 && fs2.gok) {
+              let nS = normalize(vec3f(-fs2.g.x, 1.0, -fs2.g.y));
+              lamSm = wrapDiffuse(dot(nS, keyLightDir()), TUNE_DIFFUSE_WRAP);
+              faceSm = nS.y * nS.y + nS.x * nS.x * TUNE_FACE_X + nS.z * nS.z * TUNE_FACE_Z;
+              nSh = normalize(mix(n, nS, wN));
+              let riserA = mix(skinA, paletteMean(materials[subM]),
+                               1.0 - 1.0 / max(1.0, max(abs(fs2.g.x), abs(fs2.g.y))));
+              smoothAlb = mix(skinA, riserA, farRiserShare(fs2.g, rd));
+            }
           }
         }
       }
@@ -11284,7 +11378,7 @@ fn fs(in : VSOut) -> FSOut {
       var face = 1.0;
       if (far.axis == 0) { face = TUNE_FACE_X; }
       else if (far.axis == 2) { face = TUNE_FACE_Z; }
-      if (stair.x >= 0.0) { face = mix(face, stair.y, wN); }
+      if (lamSm >= 0.0) { face = mix(face, faceSm, wN); }
       // Same lattice as the near field's surfaceGrain(h.cell, ...) — see the
       // fine-voxel note above. TUNE_GRAIN_AMP_FAR ships equal to TUNE_GRAIN_AMP
       // now that the pattern matches; it stays a knob so the far field can be
@@ -11309,7 +11403,7 @@ fn fs(in : VSOut) -> FSOut {
       // visible brightness step at the window seam.
       var lambert = select(wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP),
                            0.0, farWater);
-      if (stair.x >= 0.0) { lambert = mix(lambert, stair.x, wN); }
+      if (lamSm >= 0.0 && !farWater) { lambert = mix(lambert, lamSm, wN); }
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         var hp = R.camPos + rd * (far.t - 1e-3) + n * (0.55 * sL);
@@ -11520,6 +11614,35 @@ fn fs(in : VSOut) -> FSOut {
         n = microNormalToWorld(n, microBricks[voxMat(h.word)].flags,
                                microCellHash(microBricks[voxMat(h.word)].flags,
                                              h.cell));
+      }
+    }
+
+    // THE COVER TINT (coverWeight): the plants' look on the ground's top
+    // face, the far field's rule, ramped in as B's fade takes the plants.
+    // (coverWeight: the same 2x2 block of columns the far side's cell is,
+    // read as the voxels over them; ramped in across B's fade band.)
+    let dCov = h.t * VOXEL_METERS;
+    if (!isMicro && n.y > 0.5 && m.klass != CLASS_LIQUID && dCov > DETAIL_FADE_START_M) {
+      let b0 = (h.cell & vec3<i32>(~1, ~0, ~1)) + vec3<i32>(0, 1, 0);
+      var nCov = 0.0;
+      var pm = MAT_AIR;
+      for (var k = 3; k >= 0; k--) {
+        let uc = b0 + vec3<i32>(k & 1, 0, k >> 1);
+        if (inBounds(uc)) {
+          let um = voxMat(voxWordAt(uc));
+          if (um != MAT_AIR && (materials[um].flags & MATF_MICRO) != 0u &&
+              matFarPal(&materials, um) != 0u) {
+            nCov += 0.25;
+            pm = um;
+          }
+        }
+      }
+      if (nCov > 0.0) {
+        let cl = coverLook(pm);
+        let ramp = clamp((dCov - DETAIL_FADE_START_M) /
+                         (DETAIL_FADE_END_M - DETAIL_FADE_START_M), 0.0, 1.0);
+        albedo = mix(albedo, cl.rgb * coverBladeLight(rd),
+                     coverWeight(nCov, cl.w, rd) * ramp);
       }
     }
 

@@ -11973,18 +11973,18 @@ where you hear from either (§12b, "The ears are on the character").
   window over the 512³ far grid; this table said 1 until 2026-09-28, which was
   stale since kFarN went 512) and `kVoxelMeters = 0.10` that gives (level:
   cell size, where it hands the ray to the next level — a SPHERE about the
-  eye, 13 level chunks (the box half less the recentre hysteresis and one
-  plane; the box itself is 16 chunks half — see "each level hands off on a
-  sphere" below) — and the smallest edit it can show):
+  eye, 14 level chunks (the box half less the recentre hysteresis; the box
+  itself is 16 chunks half — see "each level hands off on a sphere" below) —
+  and the smallest edit it can show):
 
   | level | cell | hands off at (box half) | smallest visible edit |
   |---|---|---|---|
-  | 1 | 2 vox (0.2 m) | 41.6 m (51 m) | ~0.2 m — a brush stroke |
-  | 2 | 4 vox (0.4 m) | 83 m (102 m) | ~0.4 m — a doorway |
-  | 3 | 8 vox (0.8 m) | 166 m (205 m) | ~0.8 m — a small crater |
-  | 4 | 16 vox (1.6 m) | 333 m (410 m) | ~1.6 m — a room, a big blast |
-  | 5 | 32 vox (3.2 m) | 666 m (819 m) | ~3 m — a tower, a quarry |
-  | 6–8 | 64–256 vox | 1.3–2.7 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
+  | 1 | 2 vox (0.2 m) | 44.8 m (51 m) | ~0.2 m — a brush stroke |
+  | 2 | 4 vox (0.4 m) | 90 m (102 m) | ~0.4 m — a doorway |
+  | 3 | 8 vox (0.8 m) | 179 m (205 m) | ~0.8 m — a small crater |
+  | 4 | 16 vox (1.6 m) | 358 m (410 m) | ~1.6 m — a room, a big blast |
+  | 5 | 32 vox (3.2 m) | 717 m (819 m) | ~3 m — a tower, a quarry |
+  | 6–8 | 64–256 vox | 1.4–2.9 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
 
   The SURFACE of pristine terrain is no longer bound by this table: the far
   surface map below draws each surface cell as its 2x2 true-height
@@ -12213,17 +12213,38 @@ where you hear from either (§12b, "The ears are on the character").
     takes the near's `shadowLiftCap` on that openness, so a shadowed riser has
     the same depth either side.
   - **The footprint fade** (`farFootprintFade`): below ~2 px per fine voxel
-    the palette variant eases to the mean of its three entries, each
-    `surfaceGrain` octave to its mean once its feature is under 2 px, and a
-    heightfield hit to the AVERAGE of the voxel staircase under it
-    (`farStairShade`: tread and uphill-riser areas projected on the ray weight
-    the three faces' Lambert, face weight and n.y, and the skin / sub-skin
-    albedo). Keyed on the fine voxel's projected size only, so it is
-    continuous across every level seam, and it starts no nearer than the
-    handoff at any resolution. It removes A's salt-and-pepper. A smooth
-    heightfield normal was tried first and rejected: seen from low down a
-    hillside is mostly risers, and shading it as a smooth slope turned
-    stone-and-snow mountains white.
+    the palette variant eases to the mean of its three entries and each
+    `surfaceGrain` octave to its mean; and where the DRAWN ELEMENT (a refined
+    sub-column, or a whole cell) is under ~2.5 px, the staircase eases to its
+    average: skin / sub-skin albedo in the tread / riser shares the view sees
+    (`farRiserShare`), LIT BY THE SMOOTH HEIGHTFIELD NORMAL from the surface
+    map's column tops (`farSurfAt`, any level). It removes the salt-and-pepper
+    and keeps the relief. Two first cuts, both reverted: a smooth normal that
+    also took the skin as the albedo (stone-and-snow mountains turned white),
+    and keying the staircase on the FINE voxel with the lighting averaged too
+    (commit ef553c5) — cascade cells stay 3-8 px wide at every level, so their
+    terraces are real relief, and that flattened every distant hill: luminance
+    std of `screenshot_cascade` rows 380-760 went 27.6 -> 23.4 (Rec.709 luma,
+    before/after); keyed on the element it is 27.2.
+  - **The cover tint** (`coverWeight`, raymarch.wgsl; the COVER bit of the
+    far surface map, worldgen.wgsl `farmap`). The far field has no plants
+    (`farCellIsSolid` drops MATF_MICRO) and B's fade thins the near plants to
+    nothing by the handoff, so a meadow was grass, then turf. The fill now
+    looks at the voxel over each sample column's top: a MATF_MICRO plant there
+    sets bit 30 of the entry and puts the PLANT's far slot in the sub-skin
+    field (the renderer takes the sub-skin from an uncovered sibling of the same
+    cell, `farMapSubOf`). The ground's top face then takes the plants' look —
+    body and tip palette means, times the light an upright blade facing the
+    eye gets relative to a tread (`coverBladeLight`) — by how much of it the
+    plants would hide from this view: over the 2x2 columns of a level-1 cell,
+    covered fraction f and plant height H give tau = f (1 + 0.15 H / |rd.y|),
+    weight 1 - exp(-tau). The near side computes the same from the four voxels
+    over the same four columns, ramped in across B's fade band as the plants
+    go, so it is at full weight before the handoff. Measured on the meadow
+    test map (seam_veg, far meadow band): main 119/142/96, ef553c5 112/151/97,
+    now 111/148/95 RGB. The COLOUR moves toward the near field; the far meadow
+    still reads as lawn, not blades — the blades' texture and their tan heads
+    are not something a colour on the ground can carry.
   - **Each level hands off on a sphere, not on its box** (`tLvlOut` in
     `traceFar`). The concentric-ring MOIRE (seam_veg's far ridge, the cascade
     camera's pond bowls and dune bands) was not shading: a per-pixel debug of
@@ -12235,27 +12256,30 @@ where you hear from either (§12b, "The ears are on the character").
     hash replaced, with the dither off (split-screen A/B in one frame) and
     with the refine at 0, 2 and 8. A sphere is crossed head-on by every ray,
     so the flip is a circle the dither dissolves. Radius = box half less the
-    2-chunk recentre hysteresis less the one plane a shift re-queues (13 level
-    chunks), so a plane refill lands beyond the handoff: the ~50 m valid-box
-    refill pop no longer shows. The outermost level keeps its box.
+    2-chunk recentre hysteresis (14 level chunks; 13, one chunk more margin,
+    was tried first and cost 8% of every level's range), so a settled plane
+    refill lands beyond the handoff; a plane still queued pulls the valid face
+    in for the few ticks it takes to land. The outermost level keeps its box.
   - A traversal bug found on the way (not the moire): a level whose step
     budget died inside a chunk's cell walk handed the next level the NEXT
     chunk's entry, leaving up to 16 cells marched by nobody. Fixed (`tDied`).
   - **Measured** (`--render-budget`, RTX 3060 Ti 1080p, exclusive lock, main
-    a6234e9's exe and this tree back to back): seam 10.16 -> 9.00 ms,
-    seamveg 9.99 -> 9.63, cascade 3.69 -> 2.89 — the handoff move and the
+    a6234e9's exe and this tree in the same session): seam 10.16 -> 9.23 ms,
+    seamveg 9.99 -> 9.75, cascade 3.69 -> 2.94 — the handoff move and the
     level spheres pay for everything A-E added (main's own seam number moved
     9.66-10.16 between two exclusive runs, so read the seam delta as
-    -0.7 to -1.2 ms). raymarch `fs` 128 registers, 112 B local (was 144).
+    -0.4 to -0.9 ms). raymarch `fs` 128 registers, 112 B local (was 144).
   - **Still visible**, honestly: plants end in a fade 16-20 m out (B's design:
     the far field has no plant representation); the near side keeps more
     contrast (its openness blotches and contact shadows) than the far side
-    past the 2 m band; trees, rocks and cacti stay centre-sampled cells; at a
+    past the 2 m band; the far meadow is lawn-coloured cover, not blades;
+    trees, rocks and cacti stay centre-sampled cells; at a
     low sun (SANDVOX_BUDGET_SUN_DEG=12) cast shadows continue across the
     handoff, but a heightfield contact-shadow walk tried for the refined
     ground was removed (it made the noon distributions disagree more, near
     tread shadow p20 1.0 vs far 0.66, and did not move the low-sun ones);
-    and a meadow reads as grass, then bare ground.
+    and a plant eaten or trampled after the map was filled keeps its cover
+    tint until that column refills (edits only clear VALID).
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -12457,13 +12481,13 @@ where you hear from either (§12b, "The ears are on the character").
     near field's own 10 cm columns instead of 20 cm terraces, and the coarse
     levels read as slopes rather than slab stacks; the cost of the finer
     geometry is 1-2 px stair aliasing on distant slopes (salt-and-pepper
-    step edges, strongest on snow) — now removed by the footprint fade
-    (package E, below). The concentric-ring moire on distant slopes predated
+    step edges, strongest on snow) — now averaged by the footprint fade
+    where a sub-column is under ~2 px (package E, below). The concentric-ring moire on distant slopes predated
     this and was unchanged by it; it was the level box faces, fixed by the
     sphere handoffs (package E). Package E ships the refine CAPPED AT LEVEL 2:
     levels 3+ were 0.61 ms of the 4.44 ms cascade camera and nothing on the
-    eye-height cameras, and past ~77 m the footprint fade draws the average of
-    the staircase anyway, so their extra columns bought only silhouette.
+    eye-height cameras. The surface MAP is still filled at every level: the
+    shading reads it (heightfield normal, cover) wherever the refine does not.
   - **Gate** `far-surface`: after a full refill every sampled valid level-1
     entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
     cell holding that top wears the same far slot as the entry's skin; levels
