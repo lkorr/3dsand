@@ -12490,11 +12490,22 @@ confirms it: the world hash is byte-identical with the feature on and with
 - `TUNE_MICRO_MAX_PER_RAY` (~8) caps how many bricks ONE ray may enter, because
   a grazing ray over a meadow crosses dozens of cells and every *miss* keeps it
   alive. Past the cap the next micro cell is treated as solid — terminating is
-  bounded, letting the ray fly is not;
-- past `TUNE_MICRO_LOD_DIST` the cell shades as a plain voxel, since at ~1 px per
-  cell the nested march is deciding the colour of a sub-pixel. This makes a
-  micro material's own `colors` its LOD colours, so they must be authored as the
-  model's AVERAGE (a poppy is muted green with a red cast, not red).
+  bounded, letting the ray fly is not — but only NEARER than the near-detail
+  fade band; inside the band it passes as air (below);
+- **micro detail fades out before the far handoff (2026-09-28, LOD seam
+  package B).** It used to become a plain solid voxel past
+  `TUNE_MICRO_LOD_DIST` (40 m) and then vanish at the window face, because the
+  far cascade drops `MATF_MICRO` (`farCellIsSolid`): a line where the bushes and
+  moss stopped. Now every micro model thins to ZERO density across
+  `[DETAIL_FADE_START_M, DETAIL_FADE_END_M]` of camera distance (defined next to
+  `DETAIL_SLOTS` in `raymarch.wgsl`; see "Analytic plants" below for the rule).
+  A faded cell is air to the primary ray, which then lands on the ground skin
+  under it — the same skin the far cascade draws past the seam. No micro cell is
+  drawn as a plain voxel by the primary ray at a distance any more (only as the
+  budget-spent solid, nearer than the band), so a micro material's own
+  `colors` are no longer its distant look.
+  `TUNE_MICRO_LOD_DIST` now governs only partial POWDER cells (the grain
+  arrangement), not micro bricks.
 
 **Shadows and occupancy.** Shadow and reflection rays skip micro cells entirely
 (v1, matching the plan), and `isRayBlocker` correspondingly excludes
@@ -12626,16 +12637,55 @@ Only records charge `microBudget`; cells collapsed onto an existing record are
 free, and `render.microMaxPerRay` is clamped to `DETAIL_SLOTS` (4). The
 traversal cost of a REAL meadow remains unmeasured — the harness world holds
 756 plant cells and no leaves at all, so everything above is a PRESENCE cost.
-Full arm tables in `docs/PLAN_frame_perf.md`. Past
-`TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
-solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
-Column plants take the SHORTER of that and `render.plantLodDist` (16 m): an
-evaluation is a wind sample plus six to eight blade tests, charged for every
-cell a grazing ray crosses up to `microMaxPerRay`, and a blade is sub-pixel
-long before its cell is — at 40 m a meadow ran at a third of the frame rate of
-snow (2026-09-04). Inside the grass loop each blade's chord box is tested
-against the ray's XZ footprint through the cell before `hitBlade`, exact and
-conservative, so most of a tuft's blades cost two hashes and a compare.
+Full arm tables in `docs/PLAN_frame_perf.md`. Inside the grass loop each
+blade's chord box is tested against the ray's XZ footprint through the cell
+before `hitBlade`, exact and conservative, so most of a tuft's blades cost two
+hashes and a compare.
+
+**Plants fade out before the far handoff; there are no proxy cubes
+(2026-09-28, LOD seam package B).** Until then a column plant became a SOLID
+proxy cube past `render.plantLodDist` (16 m) and a tile plant's centre column
+did past `microLodDist` (40 m), and all of it vanished at the window face
+because the far cascade drops `MATF_MICRO`. At eye height that was two lines:
+a field of 10 cm pillars starting at 16 m (the proxies read as tall tan-topped
+posts, nothing like the blades in front of them), and the pillars ending at
+the box face 22-27 m out, stepping with the window. Now:
+
+- **Density thinning, world-keyed.** Each model draws a fixed hash — a column
+  plant or brick from its (x, z) column (`detailColumnId`), a tile plant from
+  its tile key (`plantTileKey`) — and the hash places its VANISH DISTANCE
+  uniformly in `[DETAIL_FADE_START_M, DETAIL_FADE_END_M]`
+  (`detailVanishDist`). Phase 1 compares the camera distance to the CELL
+  CENTRE (`detailDist`, per cell, not per pixel, so every pixel of a cell
+  agrees) against it; past it the cell is air. TAA is off, so the fade has to
+  be spatially stable and it is: as the camera moves only each model's
+  threshold moves, a tuft either exists or does not and never flickers.
+  Density falls linearly and is exactly zero at END.
+- **Column plants also shrink.** Grass and flowers scale their height (and a
+  flower its head and leaves) by `lodH`, which ramps 1 → 0 over the last
+  `DETAIL_SHRINK_M` (1.5 m) before the tuft's own vanish distance, so a tuft is
+  already flat when phase 1 removes it: thinning without the pop. Tile
+  plants, small mushrooms and bricks only thin (sparse, and no single height
+  to scale).
+- **A spent record budget is air inside the band**, solid only nearer than
+  START (the shipped bound) — a solid cube there would bring back the pillars.
+- **The ground under faded plants is left as it is.** The far cascade draws
+  the same skin material, so the bare skin IS the far look; a "cover tint" on
+  the near skin would have been a new seam of its own.
+- **One place for the distances.** `DETAIL_FADE_END_M = min(render.lodHandoffDist,
+  WINDOW_HALF_EXTENT_METERS - 2 chunks) - 0.5 m`: the handoff, capped at the
+  nearest the window face gets (25.6 m less the 2-chunk stream hysteresis =
+  22.4 m), less half a metre — 21.9 m while the handoff ships disabled at 26 m,
+  20.5 m at a 21 m handoff. `DETAIL_FADE_START_M = min(render.plantLodDist,
+  END - 1 m)` — `plantLodDist` (16 m) no longer switches anything to a cube;
+  it is where the fade begins, for EVERY kind of micro detail. Moving the
+  handoff moves the fade with it; no knob was added.
+
+Cost (`--render-budget`, 1080p, RTX 3060 Ti, meadow-biome test map): the meadow
+camera (grass at 0-20 m) 8.43 → 8.42 ms, the canopy camera (a grass ridge
+crest at 16-25 m) 5.83 → 6.04 ms — the band's plants are now evaluated rather
+than terminated on a cube, bounded by the same four records. `fs`: 128
+registers, local memory +144 B, both unchanged.
 
 **Density is a look knob and it was halved (2026-09-04).** Every ground-cover
 rate — `flowerAt`'s per-mille thresholds and tall-grass stand density, the
@@ -12643,8 +12693,8 @@ rate — `flowerAt`'s per-mille thresholds and tall-grass stand density, the
 for the tile plants, the shore/pond `worldgen.*Chance` tuning rows and the
 `chance` of every biome cover row in `assets/biomes/*.json` — is half what the
 plant overhaul shipped with. Not for the raymarch: while flying the live
-telemetry showed ~0 micro steps per pixel (plants are cubes past
-`plantLodDist`). For WORLDGEN and the far refill, which were 8 + 16 ms of a
+telemetry showed ~0 micro steps per pixel (plants were cubes past
+`plantLodDist` then; they fade out there now). For WORLDGEN and the far refill, which were 8 + 16 ms of a
 53 ms GPU frame in flight: a column inside a fern footprint pays a second
 `landColumn` and a 25-tile tree scan (`plantSiteAt`) in `genColumn`, which the
 `far` sieve runs 256 times per level chunk, and every placed cell is one the

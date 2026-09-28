@@ -4201,26 +4201,32 @@ struct Tuning {
     float gamma = TPD(render, gamma);
 
     // static micro-detail (traceMicro in raymarch.wgsl)
-    // Distance in METRES past which a micro cell is drawn as a plain voxel
-    // instead of running its nested DDA. At 0.0625 m voxels a cell subtends
-    // one pixel at ~110 m for a 1080p 90-degree view, so anything past that is
-    // paying a 3*subdiv-step march to decide the colour of a sub-pixel — the
-    // LOD is not an approximation there, it is the same answer for less.
+    // Distance in METRES past which a PARTIAL POWDER cell stops being drawn as
+    // its grain arrangement (tracePowder) and becomes a whole cube or air by
+    // mass. It USED to be the micro-brick LOD too (a plain voxel past it);
+    // since 2026-09-28 micro bricks and plants instead fade out entirely
+    // before the far handoff — see plantLodDist below and NEAR-DETAIL FADE in
+    // raymarch.wgsl — so this no longer affects them.
     float microLodDist = TPD(render, microLodDist);
-    // The same cut for COLUMN plants (grass, flowers, small mushrooms —
-    // tracePlant, not the brick DDA), and the reason it is a separate knob:
-    // an analytic tuft costs a wind sample, a trample lookup and six to eight
-    // blade intersections per cell the ray crosses, up to microMaxPerRay cells
-    // per ray, and a blade is sub-pixel long before a cell is. Measured
-    // 2026-09-04: a meadow at 40 m fell from ~50 to ~15 fps against ~50 in
-    // snow. Tile plants (ferns, big toadstools) are 30-50 cm and keep
-    // microLodDist. Effective distance is min(microLodDist, plantLodDist).
+    // Where the NEAR-DETAIL FADE begins (metres of camera distance), for
+    // every micro model — plants, tile plants, bricks. Past it each model
+    // thins out (a world-keyed hash places its vanish distance in the band)
+    // and column plants shrink into the ground, reaching zero density at
+    // DETAIL_FADE_END_M = min(lodHandoffDist, nearest window face) - 0.5 m,
+    // so nothing near-only is left when the far cascade takes over. Clamped
+    // in the shader to at most END - 1 m. Until 2026-09-28 this was the
+    // distance past which a column plant became a SOLID PROXY CUBE (the
+    // measured reason: an analytic tuft is a wind sample plus 6-8 blade
+    // tests per cell, and a 40 m meadow fell from ~50 to ~15 fps); the cubes
+    // are gone — the fade bounds the band's cost instead.
     float plantLodDist = TPD(render, plantLodDist);
     // Cap on nested micro marches per primary ray. A ray grazing a meadow can
     // cross dozens of grass cells, and each one that MISSES keeps the ray
     // alive, so without a cap one pixel can pay for the whole field. Past the
     // cap a micro cell is treated as SOLID (not as air), because terminating
-    // the ray is bounded and correct-ish while letting it fly is neither.
+    // the ray is bounded and correct-ish while letting it fly is neither —
+    // nearer than plantLodDist; inside the fade band it is air (a solid cube
+    // there would bring back the proxy pillars the fade replaced).
     int microMaxPerRay = TPD(render, microMaxPerRay);
     // Wind bend at a swaying plant's TIP, in sub-voxels (subdiv 8 => 1.25 cm
     // each). Clamped to 2.0: the models keep a 2-sub-voxel margin from their
