@@ -117,6 +117,8 @@ PIPE_TO_MEMBER = {
     "PIPE_FAR_FILL": "farFill_",
     # The edit-patch half `far` was split into (PLAN_shader_compile package C).
     "PIPE_FAR_PATCH_FILL": "farPatchFill_",
+    # The far SURFACE MAP fill (LOD-seam package A): worldgen.wgsl `farmap`.
+    "PIPE_FAR_MAP_FILL": "farMapFill_",
     "PIPE_FAR_DOWN": "farDown_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
@@ -257,6 +259,7 @@ BUF_TO_WGSL = {
     "FarUBO": {"F", "farP"},
     "FarPatch": {"farPatch"},
     "FarSig": {"farSig"},
+    "FarMap": {"farMap"},
     "PageTable": {"pageTable"},
     # The openness (sky-visibility) grid, bindings 27/28 of simBGL_
     # (docs/PLAN_gi.md 2). Written only by sim_openness.wgsl; the render
@@ -431,7 +434,8 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 "worldMap"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
-_FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch", "farSig"}
+_FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch", "farSig",
+               "farMap"}
 # Gas particles (docs/PLAN_gas_particles.md stage 1). farVox + farP are in this
 # group as well as the far one: a parcel outside the residency window asks the
 # cascade what it is drifting into, and that is the whole reason gas has a

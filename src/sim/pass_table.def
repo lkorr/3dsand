@@ -775,7 +775,8 @@ PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPU
 PASS(farDownHash, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)))
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
+          A(FarMap)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -813,7 +814,8 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)))
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
+          A(FarMap)))
 
 // ---- phase 5c: the openness (sky-visibility) grid -------------------------
 // docs/PLAN_gi.md §2. RENDER-ONLY DERIVED DATA written on the TICK table, which
@@ -1138,6 +1140,18 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
+// THE SURFACE MAP FILL (worldgen.wgsl `farmap`, LOD-seam package A). Same
+// dispatch extent; only an entry carrying kFarListMapBit does any work — one
+// per level-chunk COLUMN of an X/Z plane or reset, which rewrites the 2D map
+// under that column's XZ footprint from procgen. It sits BETWEEN the sweep and
+// the patch for one hazard: `farpatch` INVALIDATES the map entries over every
+// cell it patches (an edited level chunk), and that clear must land after the
+// fill it corrects, or a refill would vouch for pristine ground over a crater.
+// A(FarMap) on both rows is what generates that barrier.
+PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarMap)
+          R(TreeAtlas) R(WorldMap)))
 // R(FarPatch) lives on THIS row now, not on the sweep: the sweep no longer
 // reads the patch buffer at all, and a read declared where it does not happen
 // is the spurious-barrier direction the checker warns about.
@@ -1145,7 +1159,7 @@ PASS(farPatchFill, "farPatchFill", PT_FARFILL, PIPE_FAR_PATCH_FILL, K_COMPUTE,
      D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) R(FarPatch)
-          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
+          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap) A(FarMap)))
 
 // ====================================================== PT_SHADOWCACHE =====
 // Simulation::EncodeShadowResolve — the voxel-keyed shadow cache's resolve

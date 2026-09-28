@@ -11969,18 +11969,25 @@ where you hear from either (§12b, "The ears are on the character").
   rejected: the sieve would have to evaluate `genCell` 2^3k times per cell
   (4096× at level 4, unbounded by level 8), and any rule other than
   center-sampling breaks the sieve↔downsample agreement that keeps refilled
-  planes seamless against live chunks. At `kFarShiftBase = 1` and
-  `kVoxelMeters = 0.10` that gives (level: cell size, band it serves, smallest
-  edit it can show):
+  planes seamless against live chunks. At `kFarShiftBase = 0` (the 512³
+  window over the 512³ far grid; this table said 1 until 2026-09-28, which was
+  stale since kFarN went 512) and `kVoxelMeters = 0.10` that gives (level:
+  cell size, band it serves, smallest edit it can show):
 
   | level | cell | serves out to | smallest visible edit |
   |---|---|---|---|
-  | 1 | 4 vox (0.4 m) | 51 m | ~0.4 m — a brush stroke |
-  | 2 | 8 vox (0.8 m) | 102 m | ~0.8 m — a doorway |
-  | 3 | 16 vox (1.6 m) | 205 m | ~1.6 m — a small crater |
-  | 4 | 32 vox (3.2 m) | 410 m | ~3 m — a room, a big blast |
-  | 5 | 64 vox (6.4 m) | 819 m | ~6 m — a tower, a quarry |
-  | 6–8 | 128–512 vox | 1.6–6.6 km | 13–51 m — terrain-scale work only |
+  | 1 | 2 vox (0.2 m) | 51 m | ~0.2 m — a brush stroke |
+  | 2 | 4 vox (0.4 m) | 102 m | ~0.4 m — a doorway |
+  | 3 | 8 vox (0.8 m) | 205 m | ~0.8 m — a small crater |
+  | 4 | 16 vox (1.6 m) | 410 m | ~1.6 m — a room, a big blast |
+  | 5 | 32 vox (3.2 m) | 819 m | ~3 m — a tower, a quarry |
+  | 6–8 | 64–256 vox | 1.6–6.6 km | 6–26 m — terrain-scale work only |
+
+  The SURFACE of pristine terrain is no longer bound by this table: the far
+  surface map below draws each surface cell as its 2x2 true-height
+  sub-columns, so the ground itself resolves at half a cell (level 1: the fine
+  10 cm columns). The table still binds everything else — edits, trees, rocks,
+  anything that is not the heightfield.
 
   So "dig a crater and see it from 60 m" (level 2, needs ~0.8 m) works and
   "see a single dug voxel from 3 km" does not, and the second one is correct
@@ -12268,7 +12275,8 @@ where you hear from either (§12b, "The ears are on the character").
   survives a refill, and the determinism gate proves the hash is unmoved).
   Remaining limits: center-sampling terraces the surface *within* a level (the
   dither only addresses the seams between levels; a real blend would cost a
-  second march per pixel), edits smaller than a cascade cell are invisible at
+  second march per pixel) — for pristine heightfield terrain that is what the
+  far surface map below removes, at 2x each level's resolution — edits smaller than a cascade cell are invisible at
   that level (the table above), and an edit landing on a hash tick (every 15th,
   which takes the whole-world occupancy path and never compacts the dirty list)
   propagates one tick late. Coarse-level cave
@@ -12276,6 +12284,113 @@ where you hear from either (§12b, "The ears are on the character").
   capped at `h - 10`, so caves never breach the surface and coarse center
   samples never land in a void — verified by rendering levels 4–6 with fog at
   3% of nominal, which shows solid terrain with no swiss-cheese.
+  **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
+  is the cascade's resolution limit and the window edge is where it shows: a
+  level-1 cell is a 20 cm cube standing where the near field draws four 10 cm
+  columns of different heights, its top off by up to a voxel and its footprint
+  half a voxel off in XZ, and every coarser level terraces the same way at its
+  own scale. A 3D byte per cell has no room for more (farVox is already 1 GiB),
+  but the SURFACE is 2D, so a 2D side table can carry it at a fraction of the
+  cost. `farMap` (world.h `kFarMap*`) is, per level, a toroidal grid of
+  SUB-COLUMNS at twice the level's XZ resolution — 2^(k-1) fine voxels wide,
+  so level 1's are the fine columns themselves — 1024² u32 per level, 32 MiB
+  in all, blocked 2x2 per level cell so one cell's four sub-columns are one
+  16-byte load. An entry is the column's top (the fine y of its topmost
+  far-solid voxel: the ground contract's `h`, or the standing fluid's surface
+  over it; 16 bits, biased), the SKIN's far palette slot (the top voxel), the
+  SUB-SKIN's (the voxel under it — what a side face below the top voxel wears:
+  grass over dirt, sand over stone) and a VALID bit.
+  - **Fill** (worldgen.wgsl `farmap`, a third PT_FARFILL row between the sweep
+    and the patch). The map is 2D, so a Y step changes nothing in it and an X/Z
+    step turns over whole columns: `FarField` flags ONE entry per level-chunk
+    column of an X/Z plane or a reset — slot layer y == 0, which both plane
+    orders and the reset's slot order already put first in that column
+    (`kFarListMapBit`, bit 31 of the farList word) — and that entry refills the
+    32x32 sub-columns under its footprint: one `genColumn` at the sub-column's
+    CENTRE column (the sieve's own convention, one level down; exact at level
+    1) and two `genCellIn` (skin, sub-skin), no per-cell work — about an
+    eighth of the sieve's column work on the same planes. Levels >= 5 paint the
+    canopy proxy onto the skin exactly as `farSurfaceMat` does, or a refined
+    far forest would turn to bare grass. An authored stamp over the column (a
+    ruin: `wmSiteTopAt` above the ground) makes the entry invalid.
+  - **Edits: the map only ever loses its claim, it never re-derives one.**
+    `fardown`, after it rewrites a changed chunk's cells, checks every
+    sub-column whose sample column lies in the chunk: every voxel of the chunk
+    in the band the renderer trusts the map for (from the floor of the lowest
+    partly-empty cell of the sub-column's level cell up to the voxel over its
+    top) must be what the entry claims — far-solid at or under the top, not
+    over it. Anything else clears VALID (a dug voxel, a placed block, a burnt
+    trunk base). `farpatch` clears all four sub-columns of every cell it
+    patches, because a refilled EDITED level chunk has been re-derived from
+    pristine procgen and FarEdits holds only the centre samples, not the fine
+    columns. Both writes are `atomicAnd` of one bit, so they commute and race
+    with nothing; a refill after `fardown` in the same tick re-derives a
+    column pristine exactly when it also refills that column's cells pristine,
+    so the two stay consistent. The rule this buys is the one that matters:
+    **an edit is never ghosted or hidden by the refine**, because wherever the
+    live grid disagrees with the map the renderer draws the cells, which
+    `fardown` / `farpatch` keep correct as before. What it gives up: an edited
+    column shows the plain cascade cell until a pristine refill of it.
+  - **Render** (raymarch.wgsl `farRefineCell`, in traceFar's cell loop, up to
+    `render.farRefineLevel`, default 8). A cell is a CANDIDATE when it is a
+    material cell or the flagged air directly over one (one byte read) — so the
+    map is loaded for at most a couple of cells per ray, never for the cover-
+    height rows of blocker flags the ray crossed on the way down. If its four
+    entries are VALID and the cell is in the SURFACE BAND (partly full under
+    the heightfield: floor <= max top, ceiling > min top), the ray is
+    intersected against the four sub-columns — the mid planes cut the cell's
+    segment into at most three pieces, each an infinitely deep box up to its
+    top — and a hit returns the true point, face and skin / sub-skin; a miss
+    continues the DDA as if the cell were air. Outside the band, and for a
+    cell the map does not vouch for, the cell is drawn exactly as before.
+    THE UNION RULE keeps things standing on the ground: a material cell whose
+    centre sample lies ABOVE the map's top at that sample column (a trunk, a
+    rock, a wall the player built) is not terrain and keeps its plain cell. The
+    refined hit's fine voxel feeds `synthJitterState` / `surfaceGrain` as
+    before, so the texture lands on the true columns; AO is voxelAO's four-tap
+    rule on the heightfield itself (`farHfAO`: x/z in sub-columns, y in fine
+    voxels — the near field's own voxels at level 1); the shadow ray starts
+    over the hit's cell, because a refined hit sits inside a cell the far
+    shadow march would otherwise count as its own blocker. The level word of
+    `FarHit` carries the refined flag, so fs keeps its state size.
+  - **Measured** (2026-09-28, `--verify ... --budget-cams seam,seamveg,cascade`,
+    one process, exclusive lock, RTX 3060 Ti 1080p; arms `norefine`,
+    `refine1`/`refine2` = cap at level 1/2, `lod20`): the refine costs
+    **+0.58 ms on `seam`** (0.38 of it level 1), **+0.29 ms on `seamveg`**,
+    +0.82 ms on `cascade` (almost all levels >= 2, which is where that camera's
+    pixels are). With the handoff moved in to 20 m (`lod20`, package E) the
+    seam frame is +0.29 ms over the unrefined, 26 m-handoff frame. raymarch
+    `fs` stays at 128 registers / 144 B local (`--shader-stats`, unchanged).
+    What the cost is NOT: the candidate test and the map load are free (an
+    arm that ran both and skipped only the intersection priced at the
+    unrefined frame). It is divergence — lanes reach their candidate at
+    different DDA iterations, so a warp runs the body up to once per lane —
+    which is why the body exits early (a ray whose lowest point in the cell is
+    over the tallest top leaves before the piece walk) and takes vector
+    components by `select`, never `v[i]` (a runtime index put the map vector
+    in local memory: that alone was 0.8 ms of the cascade camera's 2.15).
+    Tried and removed: returning the candidate and refining in fs after the
+    loop, resuming the march on a miss — the re-seeded passes cost MORE
+    (seam +1.41 ms). Looks: at the window edge the level-1 side now shows the
+    near field's own 10 cm columns instead of 20 cm terraces, and the coarse
+    levels read as slopes rather than slab stacks; the cost of the finer
+    geometry is 1-2 px stair aliasing on distant slopes (salt-and-pepper
+    step edges, strongest on snow), which a level cap (`farRefineLevel` 1-2)
+    trades back. The concentric-ring moire on distant slopes predates this
+    and is unchanged by it.
+  - **Gate** `far-surface`: after a full refill every sampled valid level-1
+    entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
+    cell holding that top wears the same far slot as the entry's skin; levels
+    2-3 agree with `TerrainHeight`; a crater dug and a block built inside the
+    window clear their entries while a control column keeps its; refilled with
+    an empty edit index the crater's entry is pristine again, refilled with the
+    edited chunks indexed `farpatch` clears it again.
+  What it does not do: trees, rocks, overhangs and edits keep the centre-
+  sampled cells (see the level table); columns whose top is off the far
+  field's 16-bit window (|y| > 3.2 km) are simply invalid; far shadows are
+  still cast by cells; and a surface cell whose band the blocker flag missed
+  (a sub-column more than a cell taller than its cell's sample column, on a
+  cliff) keeps the old cell.
 - **Water as a surface, not fog (implemented 2026-08-19):** translucent liquids
   were originally shaded purely as participating media — a per-metre tint
   accumulated along the ray — and that is why a lake read as a flat blue disc

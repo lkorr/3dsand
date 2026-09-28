@@ -637,6 +637,11 @@ TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f, 1.0f, 400.0f)
 // 1-based level, so a negative would read as "off" by accident rather
 // than by intent and anything past the top level is a lie about coverage.
 TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0, 0, kFarLevels)
+// The far SURFACE MAP refine (LOD-seam package A, world.h kFarMap*): the
+// highest cascade level whose surface cells traceFar refines against the
+// map's 2x-resolution sub-columns. A level cap like the one above, so 0
+// (off: the plain centre-sampled cells, the feature's A/B) .. kFarLevels.
+TP_I(render, farRefineLevel, TUNE_FAR_REFINE_LEVEL, 8, 0, kFarLevels)
 
 // ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
 // The LOD handoff must not land in front of the near clip: a zero here

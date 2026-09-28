@@ -1928,6 +1928,23 @@ const RenderArm kRenderArms[] = {
     {"nofar", "farSteps 384 -> 0",
      [](Tuning& t) { t.render.farSteps = 0; }, true, 1,
      "the far-field cascade march for rays that leave the fine window"},
+    // The far SURFACE MAP refine (LOD-seam package A). Off = every surface
+    // cell is the plain centre-sampled cube again; baseline - norefine is what
+    // the refine costs (map loads + the 2x2 sub-column test) on this camera.
+    {"norefine", "farRefineLevel 8 -> 0",
+     [](Tuning& t) { t.render.farRefineLevel = 0; }, true, 1,
+     "the far surface-map refine: map loads + sub-column intersections"},
+    // The handoff the refine exists to allow (package E): the cascade takes
+    // over at 20 m, inside the window, instead of at the window box.
+    {"refine1", "farRefineLevel 8 -> 1",
+     [](Tuning& t) { t.render.farRefineLevel = 1; }, true, 1,
+     "the refine on levels 2..8 (baseline - refine1)"},
+    {"refine2", "farRefineLevel 8 -> 2",
+     [](Tuning& t) { t.render.farRefineLevel = 2; }, true, 1,
+     "the refine on levels 3..8 (baseline - refine2)"},
+    {"lod20", "lodHandoffDist 26 -> 20 m",
+     [](Tuning& t) { t.render.lodHandoffDist = 20.0f; }, true, 1,
+     "fine marching between 20 m and the window edge that the cascade covers"},
 
     {"nomicro", "microMaxPerRay 8 -> 0",
      [](Tuning& t) { t.render.microMaxPerRay = 0; }, true, 1,
@@ -2610,7 +2627,7 @@ const char* const kArmsReduced[] = {
 // are the ones that price it and the ones that bound what is left. `nofar` is
 // the ceiling on everything the cascade could ever cost.
 const char* const kArmsCascade[] = {
-    "baseline", "nofar", "noshadow", "halfres", nullptr};
+    "baseline", "nofar", "noshadow", "halfres", "norefine", "refine1", "refine2", nullptr};
 // The foliage cameras: the picture-dependent rows plus the ceilings that only
 // mean something with plants in the frame. `nomicro` is the ceiling on the
 // whole plant march; `micro1` / `plantlod4` price its two knobs; `lod8` and
@@ -2682,7 +2699,10 @@ bool CamSeamVeg(Scene& s, uint32_t& tick, std::string&) {
   return CamSeamAt(s, tick, SeamVegPose());
 }
 const char* const kArmsSeam[] = {
-    "baseline", "noshadow", "nofar", "nogi", "nomicro", "halfres", nullptr};
+    "baseline", "noshadow", "nofar", "nogi", "nomicro", "halfres",
+    // LOD-seam package A: the surface-map refine's cost, and the 20 m handoff
+    // it exists to allow (package E).
+    "norefine", "refine1", "refine2", "lod20", nullptr};
 
 const BudgetCam kBudgetCams[] = {
     {"noon",
