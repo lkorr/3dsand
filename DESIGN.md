@@ -16132,6 +16132,24 @@ carried together.
   the SAME rule the flight is drawn with (first carried matter's colour, else
   the delivery's `look.color`), with a short flare on each press. The HUD's
   hand slot and the spell bar draw the same colour as a pool under the glyph.
+- **The arm shows it.** A hand holding a spell is ARMED: it plays the library
+  clip `spell_ready` (its derived mirror on the left) — upper arm a little
+  forward and out, forearm level and pointing ahead, wrist cocked up so the
+  open hand presents the spell (the Skyrim ready pose), with a slow sway. A
+  clip, not the arm claim, so both hands can be armed at once
+  (`PoseSpellReady`). A CAST throws that arm out along the aim
+  (`PoseSpellHands`): the hand is drawn back toward the shoulder (0.07 s),
+  pushed out to 0.95 of the arm's reach along the folded aim `swFwd` (0.10 s,
+  ease-out), held 0.20 s and for as long as the hand's button stays down (a
+  beam's sustain), then the claim fades back into the armed pose. It is the
+  ONE weapon-arm claim, pointed at the empty fist (`StrikeEffectorMode::Chain`
+  on the hand part), elbow pole down as the bench's carried flask; it runs
+  after the melee pose and the bench, gives way to a live strike and to a
+  carried flask, and holds off the idle strike-hand switch while it is out.
+  Casting with the other hand takes the claim over (`ReleaseOffArm` hands the
+  first arm back). The cast itself is on the press tick; the arm moves from
+  the next one. The target follows the aim every tick, only the start point
+  is remembered, so nothing snaps.
 
 Gate `spell-hands` (runs the real tick through `TickRig`, which now carries a
 `TickOps::input` command and exposes its glyph library).

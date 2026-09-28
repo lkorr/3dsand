@@ -13425,7 +13425,12 @@ int main(int argc, char** argv) {
           if (have != want || !isIn(a) || (b >= 0 && !isIn(b))) {
             benchInHand[0] = benchInHand[1] = KitRef{};
             if (b < 0) {
-              const int hk = avatar.HandUsable(Hand::Right) ? 0 : 1;
+              // The hand that can GRIP it (session.cpp's bench equip refuses
+              // a hand below melee.injuredArmDrop).
+              const int hk = avatar.HandCondition(Hand::Right) >=
+                                     std::max(CurrentTuning().melee.injuredArmDrop, 1e-6f)
+                                 ? 0
+                                 : 1;
               benchInHand[hk] = views[a].ref;
             } else {
               const bool aLeft = views[a].pose.pos.x < views[b].pose.pos.x;

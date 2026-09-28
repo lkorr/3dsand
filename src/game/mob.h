@@ -2471,6 +2471,16 @@ class Mob {
   // whenever that hand changes what it holds. The player's are the kit hand
   // stacks', set by the session every tick.
   void SetHeldContents(const alchemy::Composition& c, Hand h) { held_[HandIndex(h)].contents = c; }
+  // A BORROWED HOLD: the fist shows an item that lives somewhere else (the
+  // alchemy bench's vessels, session.cpp BenchHold -- the flask is in the
+  // bag, the hand only draws it). A borrowed hold is never the item: it
+  // does not fall out of the hand as one (GripFails, a sever, a knock-out
+  // just take the prop away), is not loot, does not rise with a corpse and
+  // is not saved or sent. Without this, a hand too hurt to grip dropped the
+  // bench's flask as a real item every tick while the bench put it back --
+  // a new flask of whatever it held, each tick. Cleared by EquipItem.
+  void SetHeldBorrowed(Hand h, bool b) { held_[HandIndex(h)].borrowed = b; }
+  bool HeldBorrowed(Hand h) const { return held_[HandIndex(h)].borrowed; }
   const alchemy::Composition& HeldContents(Hand h) const { return held_[HandIndex(h)].contents; }
   // ...AND WHAT IT SHOWS (phys/fillview.h): drawn level against the held
   // body's rotation every frame in place of the slot's dye word
@@ -4688,6 +4698,7 @@ class Mob {
     ContainerHeldFill fill;  // SetHeldFill; render-only
     float aimWeight = 0;     // SetHeldAim
     Vec3 aimAxis{0, 1, 0};
+    bool borrowed = false;   // SetHeldBorrowed: a prop, not the item
     void Clear() { *this = HeldHand{}; }
   };
   HeldHand held_[kHands];

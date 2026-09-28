@@ -610,6 +610,149 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   }
 }
 
+// ---- A SPELL ARMED IN THE HAND (assets/anims/spell_ready.json) ---------------
+// Every hand holding a spell holds it up: forearm level and pointing ahead,
+// the open hand presenting it (the Skyrim ready pose). A CLIP, not the arm
+// claim, so both hands can be armed at once; the left plays the library's
+// derived mirror. The cast's thrust (PoseSpellHands) is IK over the top of it
+// and fades back into it.
+static void PoseSpellReady(PlayerSession& s, PlayerAvatar& avatar,
+                           const HandsNow& hands) {
+  for (int hk = 0; hk < kHands; hk++) {
+    const Hand h = HandAt(hk);
+    // Also an arm whose hand is GONE but still has a spell equipped: the pose
+    // is what places that spell (SpellHandPoint reads the absent hand's posed
+    // point), so the stump presents it where the hand would.
+    const bool armed = avatar.Spawned() &&
+                       (hands.hand[hk].spell ||
+                        (hands.hand[hk].item == nullptr && s.caster.hand[hk].Equipped()));
+    const std::string clip = avatar.HandClip("spell_ready", h);
+    if (clip.empty()) continue;
+    // Re-played if it is gone while it should be up: an R/F5 reload rebuilds
+    // the rig's clip state under a hand that is still armed.
+    const bool lost = armed && s.spellClip[hk] && avatar.ClipWeight(clip.c_str()) <= 0.0f;
+    if (armed != s.spellClip[hk] || lost) {
+      if (armed) avatar.PlayClip(clip);
+      else avatar.StopClip(clip);
+    }
+    s.spellClip[hk] = armed;
+  }
+}
+
+// ---- THE CASTING ARM (session.h spellArm*) ----------------------------------
+// A cast from a spell hand throws that arm out the way the spell flies: the
+// hand is drawn back toward the shoulder, pushed out to nearly the arm's full
+// reach along the aim, held there while the hand's button is held (a beam's
+// sustain), then the claim fades and the animation takes the arm back.
+//
+// It drives the ONE weapon-arm claim, pointed at the empty fist itself
+// (StrikeEffectorMode::Chain on the hand part, the way an unarmed style is),
+// so it runs after the melee pose and PoseBenchHands and wins over the idle
+// ready pose. It gives way to a live strike and to the bench's carried flask.
+//
+// The target is recomputed from the aim EVERY tick, so turning while the arm
+// is out swings it with you. Only the start point is remembered: the push
+// begins where the arm actually was, so nothing snaps.
+static void PoseSpellHands(PlayerSession& s, PlayerAvatar& avatar,
+                           const HandsNow& hands, const TickInput& ti,
+                           Vec3 aim, bool strikeLive) {
+  // Seconds: the draw-back, the push, and the hold after it (at least).
+  constexpr float kCock = 0.07f, kThrust = 0.10f, kHold = 0.20f;
+  // Reach fractions: how far out the drawn-back hand sits and where the push
+  // ends (short of straight, where the two-bone solve is ill-conditioned).
+  constexpr float kCockReach = 0.42f, kOutReach = 0.95f;
+  if (s.spellCastHand >= 0) {
+    s.spellArmHand = s.spellCastHand;
+    s.spellArmT = 0.0f;
+    s.spellArmFresh = true;
+    s.spellCastHand = -1;
+  }
+  const int hk = s.spellArmHand;
+  if (hk < 0) return;
+  const Hand h = HandAt(hk);
+  auto drop = [&] {
+    s.spellArmHand = -1;
+    s.spellArmW = 0.0f;
+    s.spellArmFresh = false;
+  };
+  // A strike took the arm (its effector is the strike's now: leave it), or
+  // the bench is carrying a flask.
+  if (strikeLive || s.benchPourW > 0.0f) {
+    drop();
+    return;
+  }
+  const int part = h == Hand::Left ? avatar.Parts().handL : avatar.Parts().handR;
+  // The hand stopped being a spell hand (an item arrived, the arm was ruined)
+  // or the body is gone: hand the arm straight back.
+  if (!avatar.Spawned() || !hands.hand[hk].spell || part < 0 || !avatar.HandUsable(h)) {
+    avatar.ClearStrikeEffector();
+    drop();
+    return;
+  }
+  avatar.SetStrikeHand(h);
+  avatar.SetStrikeEffector(part, StrikeEffectorMode::Chain);
+  Vec3 live;
+  float reach = 0;
+  if (!avatar.WeaponArmPose(live, reach) || reach <= 1e-3f) {
+    avatar.ClearStrikeEffector();
+    drop();
+    return;
+  }
+  if (s.spellArmFresh) {
+    s.spellArmFrom = live;
+    s.spellArmFresh = false;
+  }
+  const float t = s.spellArmT;
+  s.spellArmT += kTickDt;
+  const bool held = ti.Held(h == Hand::Right ? TB_ATTACK : TB_ALT);
+  const bool out = t < kCock + kThrust + kHold || held;
+  if (out) {
+    s.spellArmW = 1.0f;
+  } else {
+    s.spellArmW *= std::exp(-kTickDt * 10.0f);
+    if (s.spellArmW < 0.02f) {
+      avatar.ClearStrikeEffector();
+      drop();
+      return;
+    }
+  }
+  // THE AIM, never through the body: a camera looking back at the caster's
+  // face would ask the arm to reach behind its own back. The horizontal part
+  // is kept in front of the body's facing; pitch is the aim's.
+  const Vec3 bodyFwd = QuatRotate(QuatAxisAngle({0, 1, 0}, avatar.Heading()), Vec3{0, 0, 1});
+  Vec3 dir = aim.len() > 1e-4f ? aim.normalized() : bodyFwd;
+  const float along = dir.x * bodyFwd.x + dir.z * bodyFwd.z;
+  if (along < 0.3f) dir = (dir + bodyFwd * (0.3f - along)).normalized();
+  const Vec3 cocked = dir * (reach * kCockReach) + Vec3{0, reach * 0.12f, 0};
+  const Vec3 goal = dir * (reach * kOutReach);
+  auto smooth = [](float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
+  };
+  Vec3 target;
+  if (t < kCock) {
+    target = s.spellArmFrom + (cocked - s.spellArmFrom) * smooth(t / kCock);
+  } else if (t < kCock + kThrust) {
+    // Ease OUT: the push is fastest as it leaves, the way a throw is.
+    const float u = std::clamp((t - kCock) / kThrust, 0.0f, 1.0f);
+    const float e = 1.0f - (1.0f - u) * (1.0f - u) * (1.0f - u);
+    target = cocked + (goal - cocked) * e;
+  } else {
+    target = goal;
+  }
+  WeaponPose wp;
+  wp.hand = target;
+  wp.weight = s.spellArmW;
+  wp.steerBlade = false;
+  // ELBOW DOWN, as the bench's carried flask: a hand straight out in front
+  // at shoulder height is antiparallel to the rig's own back pole and the
+  // elbow would flip from tick to tick (PoseBenchHands says so at length).
+  wp.usePole = true;
+  wp.bendPole = Vec3{0, -1, 0};
+  wp.elbowAxisCone = 3.14159265f;
+  avatar.SetWeaponPose(wp);
+}
+
 static inline uint32_t OpLandingTick(const TickAuthorityCtx& w, uint32_t tick) {
   return tick + (w.opsync ? w.opsync->Delay() : 0u);
 }
@@ -2754,10 +2897,20 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                   hands.hand[hk].item != nullptr && !kit.equip.InHand(h).Empty()
                       ? hands.hand[hk].item
                       : nullptr;
+              // A bench vessel goes only into a hand that can GRIP it (the
+              // KitMove rule, melee.injuredArmDrop): GripFails would take it
+              // straight back out.
+              const float dropBelow = CurrentTuning().melee.injuredArmDrop;
               if (bench.active)
-                want = avatar.HandUsable(h) ? items.Named(bench.hand[hk].item) : nullptr;
+                want = avatar.HandUsable(h) && avatar.HandCondition(h) >= dropBelow
+                           ? items.Named(bench.hand[hk].item)
+                           : nullptr;
               const std::string wantName = want ? want->name : std::string();
               if (avatar.HeldItem(h) != wantName) avatar.EquipItem(want, h);
+              // ...and it is the BENCH's, shown in the fist while the flask
+              // itself stays in the bag (Mob::SetHeldBorrowed): never shed,
+              // looted or saved as the item.
+              avatar.SetHeldBorrowed(h, bench.active && want != nullptr);
             }
             // THE IDLE STRIKE HAND: between strokes the driver's ready pose
             // is on the hand last used, if it can swing, else on the other.
@@ -2768,8 +2921,10 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // leaves the pour clip the arm.
             // (Not while the bench's pour owns an arm: it sets the strike
             // hand itself, below, and this would hand it straight back.)
+            // (Nor while a cast has an arm thrown out: PoseSpellHands holds
+            // the claim on the spell hand until it has faded.)
             if (!playerStrike.Active() && melee.Phase() == SwingPhase::Idle &&
-                s.benchPourW <= 0.0f) {
+                s.benchPourW <= 0.0f && s.spellArmHand < 0) {
               Hand idle = s.lastHand;
               if (!hands[idle].ready && hands[OtherHand(idle)].ready)
                 idle = OtherHand(idle);
@@ -3181,6 +3336,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             if (s.strikeMirrored) MirrorWeaponPose(wp);
             avatar.SetWeaponPose(wp);
             PoseBenchHands(s, avatar);
+            PoseSpellReady(s, avatar, hands);
+            PoseSpellHands(s, avatar, hands, ti, swFwd, playerStrike.Active());
           }
         }
         // ---- ARMOUR: the body wears what the kit's equipment says -----------
@@ -3626,6 +3783,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                                        nullptr, &bodyProbe);
           caster.lastOutcome = res.outcome;
           caster.beamHand = hk;
+          // ...and the arm throws out after it (PoseSpellHands, next tick's
+          // pose). A cast the VM refused throws nothing.
+          if (res.outcome != CastOutcome::Nothing) s.spellCastHand = hk;
         }
 
         // A held beam follows the aim while the button of the hand that cast

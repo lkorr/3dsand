@@ -2995,7 +2995,7 @@ bool MobSystem::ServiceRising(size_t ri) {
   for (int hk = 0; hk < kHands; hk++) {
     const Mob::HeldHand& hh = src->held_[hk];
     if (hh.slot < 0 || hh.slot >= (int)src->limbs_.size() ||
-        !src->limbs_[hh.slot].body || hh.item.empty())
+        !src->limbs_[hh.slot].body || hh.item.empty() || hh.borrowed)
       continue;
     RiseGear g;
     g.item = hh.item;
@@ -5748,6 +5748,12 @@ int Mob::GripFails(float dropBelow) {
     // the arm that is still there and too hurt to grip.
     const float c = HandCondition(HandAt(hk));
     if (c <= 0.0f || c >= dropBelow) continue;
+    // A BORROWED prop (SetHeldBorrowed) is not the item: the hand lets go of
+    // the picture, and nothing lands.
+    if (held_[hk].borrowed) {
+      EquipItem(nullptr, HandAt(hk));
+      continue;
+    }
     DetachLimb(slot, /*adopt=*/true);
     fell++;
   }
@@ -22003,6 +22009,15 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
 void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body) return;
+  // A BORROWED hold (SetHeldBorrowed) is never adopted: the item it shows is
+  // still wherever it lives (the bag), so a body registered as that item
+  // would be a second one. The prop's body is removed; held_ keeps the slot
+  // so the next EquipItem still tears it down.
+  {
+    Hand bh;
+    if (adopt && IsHeldSlot(limbIndex, &bh) && held_[HandIndex(bh)].borrowed)
+      adopt = false;
+  }
   // Whatever was still dripping from THIS limb leaves with it: a stump that
   // is itself cut off has no wound left on this body (its parent's does, and
   // Sever() opens that one), and a detached limb that kept `stumpOpen` would
@@ -22720,7 +22735,7 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
   for (int hk = 0; hk < kHands; hk++) {
     const HeldHand& hh = held_[hk];
     if (hh.slot < 0 || hh.slot >= (int)limbs_.size() ||
-        !limbs_[hh.slot].body || hh.item.empty())
+        !limbs_[hh.slot].body || hh.item.empty() || hh.borrowed)
       continue;
     LootPiece piece;
     piece.kind = LootPiece::Kind::Held;
@@ -24257,7 +24272,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
   for (int hk = 0; hk < kHands; hk++) {
     const HeldHand& hh = held_[hk];
     if (hh.slot < 0 || hh.slot >= (int)limbs_.size() ||
-        !limbs_[hh.slot].body || hh.item.empty())
+        !limbs_[hh.slot].body || hh.item.empty() || hh.borrowed)
       continue;
     ::net::WireGear g;
     g.name = hh.item;
@@ -25881,7 +25896,58 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // NOT the inverse form (Inverse(grip) x socket) VR rigs use: that solves for
   // a hand pose given a fixed grip, which is not the question here.
   const MobLimb& hand = limbs_[sock.partIndex];
-  const Quat q = QuatMul(sock.rotation, grip->rotation);
+
+  // ---- THE LEFT HAND HOLDS THE MIRROR IMAGE --------------------------------
+  //
+  // An item with no authored `held_left` is held in the left fist by its
+  // `held_right` grip (ItemDef::Grip), on a socket that is itself the right
+  // one reflected (MirrorHeldSockets: Rs_L = M Rs M, M = diag(-1, 1, 1)). The
+  // hand frames of a mirrored pose are reflections too (Rh_L = M Rh_R M), so
+  // re-using the right grip rotation Rg unchanged gives the item the world
+  // orientation M Rh Rs M Rg -- the right hand's blade turned by an extra
+  // reflection-of-a-rotation, i.e. pointing somewhere no mirror sends it.
+  //
+  // The mirror image of the right-hand item is M Rh Rs Rg, which is not a
+  // rotation: it would need the ART reflected. But a held item is symmetric
+  // across one of its own planes (a blade across its flat, a mace or flask
+  // across any side), and a reflection F on that plane maps the art onto
+  // itself -- so M (Rh Rs Rg) F, a proper rotation, draws the same voxels
+  // the mirror would. Solving Rh_L Rs_L Rg_L = M Rh Rs Rg F for the grip:
+  //   Rg_L = M Rg F.
+  // F is taken about the item's own box centre on that axis, so the grip
+  // point's component along it reflects about the centre too (2c - g), which
+  // is a no-op for any hilt authored on the mid-plane.
+  //
+  // The flat (edgeFlat) comes out NEGATED in the hand frame, which is what
+  // MirrorWeaponPose already expects of a mirrored stroke's bladeFlat, so the
+  // wrist steer rolls the edge to the same side the right hand would.
+  const bool mirrorGrip =
+      whichHand == Hand::Left && item->grip.find("held_left") == item->grip.end();
+  const float invScale = 1.0f / (float)(item->scale ? item->scale : 1);
+  Quat gripRot = grip->rotation;
+  int mirrorAxis = -1;
+  if (mirrorGrip) {
+    // THE SYMMETRY PLANE: the blade's flat when the art says which way it
+    // faces, else the item's thinnest box axis.
+    if (item->hasEdgeFlat) {
+      const Vec3 f = item->edgeFlat;
+      const float ax = std::fabs(f.x), ay = std::fabs(f.y), az = std::fabs(f.z);
+      mirrorAxis = ax >= ay && ax >= az ? 0 : (ay >= az ? 1 : 2);
+    } else {
+      mirrorAxis = item->size.x <= item->size.y && item->size.x <= item->size.z
+                       ? 0
+                       : (item->size.y <= item->size.z ? 1 : 2);
+    }
+    Vec3 col[3] = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
+    for (int i = 0; i < 3; i++) {
+      Vec3 c = QuatRotate(grip->rotation, col[i]);
+      c.x = -c.x;                              // M
+      if (i == mirrorAxis) c = c * -1.0f;      // F
+      col[i] = c;
+    }
+    gripRot = QuatFromBasis(col[0], col[1], col[2]);
+  }
+  const Quat q = QuatMul(sock.rotation, gripRot);
   ap.rest.rot = q;
   // The slot's rest position, relative to the hand part, is the socket offset
   // measured from the hand's own model corner.
@@ -25898,9 +25964,18 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // gripLocal is the vector, IN THE ITEM'S OWN FRAME, from the item's origin
   // to the point the fist closes on. With a hilt box that is the hilt centre
   // (plus any residual nudge); without one it degrades to the bare translation.
-  const Vec3 gripLocal =
+  Vec3 gripLocal =
       item->hilt.has ? item->hilt.center - grip->translation
                      : (grip->translation * -1.0f);
+  if (mirrorAxis >= 0) {
+    // F about the box centre on the mirror axis (see the grip block above).
+    auto iof = [&](const IVec3& v) {
+      return mirrorAxis == 0 ? v.x : (mirrorAxis == 1 ? v.y : v.z);
+    };
+    float& g = mirrorAxis == 0 ? gripLocal.x
+                               : (mirrorAxis == 1 ? gripLocal.y : gripLocal.z);
+    g = (float)(2 * iof(item->offset) + iof(item->size)) * invScale - g;
+  }
   // REST.POS IS THE ANCHOR, exactly as it is for every other part.
   //
   // This is the convention the whole rig runs on and the item must not be the

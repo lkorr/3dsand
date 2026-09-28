@@ -99,6 +99,9 @@ struct UIState {
   // disagreeing is visible rather than inferred. Off by default and free when
   // off (the draw is skipped at zero boxes).
   bool showCollisionBoxes = false;
+  // Top-right corner readout: fps + the material under the crosshair. Drawn
+  // whether or not the dev panel is open (that is the point of it).
+  bool showCornerReadout = true;
   bool showDirtyChunks = false;
   bool showDirtyVoxels = false;
   // Vector-field overlay (F4), a THREE-state cycle: off -> wind -> current.

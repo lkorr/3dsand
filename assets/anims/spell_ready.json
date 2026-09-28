@@ -1,0 +1,128 @@
+{
+  "//": "A SPELL ARMED IN THE HAND (session.cpp PoseSpellReady): the Skyrim ready pose. The upper arm a little forward and out from the side, the forearm just below level and pointing ahead, the wrist cocked up so the open hand presents its spell in front of the body; a slow breathing sway so it reads as held, not frozen. Plays on every hand holding a spell (the left plays the library's derived spell_ready.mirror), under the cast's thrust: PoseSpellHands IKs the arm out along the aim and fades back into this. Rotations: X negative = forward/up (pour.json's convention), Z negative = the right arm out from the side.",
+  "name": "spell_ready",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 2600,
+  "loop": true,
+  "mode": "override",
+  "blendInMs": 200,
+  "blendOutMs": 240,
+  "mask": [
+    "armU.R",
+    "armL.R",
+    "hand.R"
+  ],
+  "//quiet": "quietAdditive: while this plays, the walk/run/idle ADDITIVE layers on these parts are silenced by this share (anim.cpp stage 3) — the walk's shoulder swing and elbow pump on an arm held out in front read as the hands pumping back and forth. pitchFollow: share of the look pitch each part turns through (pose.cpp), so the hands rise and dip a little with the view. Both mirror with the clip.",
+  "quietAdditive": {
+    "armU.R": 1.0,
+    "armL.R": 1.0,
+    "hand.R": 1.0
+  },
+  "pitchFollow": {
+    "armU.R": 0.3
+  },
+  "tracks": {
+    "armU.R": {
+      "rot": [
+        {
+          "t": 0,
+          "q": [
+            -0.155,
+            0.0199,
+            -0.1026,
+            0.9824
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 1300,
+          "q": [
+            -0.19,
+            0.0255,
+            -0.1103,
+            0.9752
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 2600,
+          "q": [
+            -0.155,
+            0.0199,
+            -0.1026,
+            0.9824
+          ],
+          "ease": "cubicInOut"
+        }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        {
+          "t": 0,
+          "q": [
+            -0.515,
+            0,
+            0,
+            0.8572
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 1300,
+          "q": [
+            -0.487,
+            0,
+            0,
+            0.8734
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 2600,
+          "q": [
+            -0.515,
+            0,
+            0,
+            0.8572
+          ],
+          "ease": "cubicInOut"
+        }
+      ]
+    },
+    "hand.R": {
+      "rot": [
+        {
+          "t": 0,
+          "q": [
+            -0.1564,
+            0,
+            0,
+            0.9877
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 1300,
+          "q": [
+            -0.2079,
+            0,
+            0,
+            0.9781
+          ],
+          "ease": "cubicInOut"
+        },
+        {
+          "t": 2600,
+          "q": [
+            -0.1564,
+            0,
+            0,
+            0.9877
+          ],
+          "ease": "cubicInOut"
+        }
+      ]
+    }
+  }
+}

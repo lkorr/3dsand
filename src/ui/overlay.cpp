@@ -1550,6 +1550,8 @@ void Overlay::DrawDevView(UIState& s) {
         "shortRangeDist, shortRangeNearDist, shortRangeFogStart/Density.");
   }
   if (Section("Debug draw")) {
+    ImGui::Checkbox("corner readout (fps + looking at)", &s.showCornerReadout);
+    ImGui::SetItemTooltip("Top-right, stays up with this panel closed.");
     ImGui::Checkbox("collision boxes (F3)", &s.showCollisionBoxes);
     ImGui::SetItemTooltip(
         "Wireframes around every physics collider, from the actual Jolt shape:\n"
@@ -1819,6 +1821,33 @@ void Overlay::Draw(UIState& s) {
     c.x *= 0.5f;
     c.y *= 0.5f;
     dl->AddCircleFilled(c, 2.5f, IM_COL32(255, 255, 255, 200));
+  }
+
+  // ---- corner readout: fps + what the crosshair is on, panel open or not ----
+  if (s.showCornerReadout) {
+    ImGui::PushFont(ui::FontSmall());
+    ImDrawList* d = ImGui::GetForegroundDrawList();
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    const float pad = 10.0f, icon = 12.0f, gap = 4.0f;
+    char fps[48];
+    std::snprintf(fps, sizeof fps, "%.0f fps  %.1f ms", s.fps, s.frameMs);
+    const bool hasMat = s.hoverMat > 0 && s.hoverMat < (int)s.materialNames.size();
+    const std::string mat = hasMat ? MatLabel(s, s.hoverMat) : std::string("---");
+    const ImVec2 fs = ImGui::CalcTextSize(fps);
+    const ImVec2 ms = ImGui::CalcTextSize(mat.c_str());
+    const float lineH = std::max(fs.y, icon);
+    const float matW = ms.x + (hasMat ? icon + gap : 0.0f);
+    const float boxW = std::max(fs.x, matW);
+    const float x1 = disp.x - pad, y0 = pad;
+    d->AddRectFilled(ImVec2(x1 - boxW - 6, y0 - 4), ImVec2(x1 + 4, y0 + lineH * 2 + gap + 4),
+                     IM_COL32(0, 0, 0, 140), 3.0f);
+    d->AddText(ImVec2(x1 - fs.x, y0), IM_COL32(235, 235, 235, 255), fps);
+    const float y1 = y0 + lineH + gap;
+    if (hasMat) MatIcon(d, ImVec2(x1 - matW, y1 + (lineH - icon) * 0.5f), icon, s, s.hoverMat);
+    d->AddText(ImVec2(x1 - ms.x, y1),
+               hasMat ? IM_COL32(235, 225, 190, 255) : IM_COL32(140, 140, 140, 255),
+               mat.c_str());
+    ImGui::PopFont();
   }
 
   if (!s.visible) return;

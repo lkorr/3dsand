@@ -2892,6 +2892,38 @@ Status GateDualWield(Ctx& c, std::string& detail) {
     check((pl - hl).len() < (pl - hr).len() && (pr - hr).len() < (pr - hl).len(),
           "each item rides its own hand");
   }
+  // ---- 3b. the left fist holds the MIRROR IMAGE (Mob::EquipItem) ------------
+  // The same sword in both fists: the left blade must run the right one's
+  // direction reflected through the sagittal plane, and its flat must come out
+  // as MirrorWeaponPose's mirrored bladeFlat, (x, -y, -z). Read on the equip
+  // frame, where the held body's quaternion is still the hand-relative grip
+  // (socket x grip) -- the drive loop has not yet posed it in the world, so
+  // the two hands' own poses do not enter.
+  if (mob->EquipItem(sword, Hand::Right)) {
+    const Hand keep = mob->StrikeHand();
+    Vec3 bL, tL, fL, bR, tR, fR;
+    float hw = 0;
+    mob->SetStrikeHand(Hand::Left);
+    const bool okL = mob->WeaponEdge(bL, tL, hw, &fL);
+    mob->SetStrikeHand(Hand::Right);
+    const bool okR = mob->WeaponEdge(bR, tR, hw, &fR);
+    mob->SetStrikeHand(keep);
+    if (okL && okR) {
+      const Vec3 dL = (tL - bL).normalized(), dR = (tR - bR).normalized();
+      const Vec3 want{-dR.x, dR.y, dR.z};
+      const Vec3 wantFlat{fR.x, -fR.y, -fR.z};
+      check((dL - want).len() < 1e-3f,
+            Format("the left blade points the right one's MIRROR way "
+                   "(L %.3f,%.3f,%.3f vs mirrored R %.3f,%.3f,%.3f)",
+                   dL.x, dL.y, dL.z, want.x, want.y, want.z).c_str());
+      if (sword->hasEdgeFlat)
+        check((fL - wantFlat).len() < 1e-3f,
+              "and its flat is the mirrored stroke's (x, -y, -z)");
+    } else {
+      check(false, "both fists report a blade edge");
+    }
+    check(mob->EquipItem(second, Hand::Right), "the right fist takes its own item back");
+  }
   check(mob->EquipItem(nullptr, Hand::Right) && mob->HeldSlot(Hand::Right) < 0 &&
             mob->HeldSlot(Hand::Left) >= 0 && mob->HeldItem(Hand::Left) == sword->name,
         "emptying the right fist leaves the left alone (its slot renumbered, "
@@ -2974,6 +3006,35 @@ Status GateDualWield(Ctx& c, std::string& detail) {
       check(mob->GetKit().equip.InHand(Hand::Left).Empty(),
             "and the kit's hand slot is emptied at once, so no second sword is "
             "drawn from it");
+      // A BORROWED hold (the alchemy bench's flask, Mob::SetHeldBorrowed) in
+      // the same hurt hand: the hand lets go of the picture and NOTHING
+      // lands. Owner report 2026-09-27: the bench re-equipped its flask
+      // every tick and GripFails dropped it every tick -- ~50 real flasks of
+      // blood out of one.
+      shed.clear();
+      mob->ClearLostGear();
+      mob->KitMut().equip.InHand(Hand::Left) =
+          StackOf(c.items, c.items.Find(sword->name), 1);
+      mob->EquipItem(sword, Hand::Left);
+      mob->SetHeldBorrowed(Hand::Left, true);
+      const int fellB = mob->GripFails(0.15f);
+      check(fellB == 0 && mob->HeldSlot(Hand::Left) < 0 && shed.empty() &&
+                mob->LostGearEvents().empty(),
+            "a borrowed hold in a hurt hand is let go of, and no item falls");
+      check(mob->GetKit().equip.InHand(Hand::Left).count == 1,
+            "and the kit is untouched by a borrowed hold");
+      // ...and it is not the item on the wire (saves, the network) either.
+      mob->EquipItem(sword, Hand::Right);
+      mob->SetHeldBorrowed(Hand::Right, true);
+      {
+        std::vector<::net::WireGear> wire;
+        mob->CaptureGear(wire);
+        bool heldOnWire = false;
+        for (const ::net::WireGear& g : wire) heldOnWire |= g.held != 0u;
+        check(!heldOnWire, "a borrowed hold is not saved or sent as held gear");
+      }
+      mob->EquipItem(nullptr, Hand::Right);
+      mob->KitMut().equip.InHand(Hand::Left) = ItemStack{};
       mobs.SetOnItemShed(nullptr);
       mob->ClearLostGear();
     } else {
