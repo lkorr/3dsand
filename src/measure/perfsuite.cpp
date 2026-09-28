@@ -23,6 +23,7 @@
 #include "measure/perfnodes.h"
 #include "measure/perfscope.h"
 #include "sim/celestial.h"
+#include "sim/farfield.h"
 #include "sim/materials.h"
 #include "sim/microvox.h"
 #include "sim/pagetable.h"
@@ -2637,6 +2638,8 @@ bool CamFire(Scene& s, uint32_t& tick, std::string& why) {
     if ((t & 31u) == 0u) s.ctx.WaitIdle();   // keep the queue shallow
   }
   s.ctx.WaitIdle();
+  // SetupForestfire moved the window to the spawn; the cascade follows it.
+  RefillFarAround(s.ctx, s.world, s.sim, pc);
   s.cam.yaw = 0.785f;
   s.cam.pitch = 0.08f;
   s.note += "; burned 600 ticks, frame frozen";
@@ -2646,6 +2649,40 @@ bool CamFire(Scene& s, uint32_t& tick, std::string& why) {
 const char* const kArmsFire[] = {
     "baseline", "noshadow", "nocache", "nogi",      "noglow", "noopenness",
     "nofar",    "halfres",  "primary256", "lod8",   "nospec", nullptr};
+
+// THE LOD SEAM AT EYE HEIGHT (2026-09-28). The residency window's face is
+// where the fine march hands off to the far cascade, and at eye height it is a
+// visible line ~22-27 m ahead. Every camera above either looks down from well
+// over the terrain or stands in a window centred somewhere else, so none of
+// them sees the seam at the distance play puts it. These two re-centre the
+// window and the far field on the eye exactly as Stream / FarField do in play
+// (CentreWindowOnEye) and look level down +x, so the face is 25.6 m ahead.
+// Same poses as --shot's screenshot_seam_x / screenshot_seam_veg. Put LAST in
+// the table: they leave the window relocated.
+bool CamSeamAt(Scene& s, uint32_t& tick, const SeamPose& p) {
+  s.stream.OnRegen();
+  CentreWindowOnEye(s.ctx, s.world, s.sim, p.ex, p.ey, p.ez, 120);
+  s.eye = {p.ex, p.ey, p.ez};
+  s.cam.yaw = 0.0f;     // +x: Camera::Forward is (cos yaw, sin pitch, sin yaw)
+  s.cam.pitch = 0.0f;
+  char note[256];
+  std::snprintf(note, sizeof note,
+                "SEAM: eye 1.7 m over ground y=%d at (%d,%d) [%s], window + "
+                "far field centred on the eye as in play, looking level down "
+                "+x -- the window face is 25.6 m ahead",
+                p.ground, p.x, p.z, p.what);
+  s.note = note;
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+bool CamSeam(Scene& s, uint32_t& tick, std::string&) {
+  return CamSeamAt(s, tick, SeamPlainPose());
+}
+bool CamSeamVeg(Scene& s, uint32_t& tick, std::string&) {
+  return CamSeamAt(s, tick, SeamVegPose());
+}
+const char* const kArmsSeam[] = {
+    "baseline", "noshadow", "nofar", "nogi", "nomicro", "halfres", nullptr};
 
 const BudgetCam kBudgetCams[] = {
     {"noon",
@@ -2667,6 +2704,12 @@ const BudgetCam kBudgetCams[] = {
      CamCanopy, kArmsFoliage},
     {"fire", "inside a burning forest 20 s after ignition, looking level",
      CamFire, kArmsFire},
+    {"seam", "eye height on the pad, window centred as in play, level at the "
+             "window face (the LOD seam)",
+     CamSeam, kArmsSeam},
+    {"seamveg", "the same at the nearest meadow to the spawn: plants across "
+                "the seam",
+     CamSeamVeg, kArmsSeam},
 };
 constexpr int kBudgetCamCount =
     (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));
@@ -2710,6 +2753,11 @@ class RenderBudgetRunner {
       SubmitTick(ctx_, world_, sim_, t, kDefaultSeed, {}, {}, {}, t % 15 == 0,
                  {8, 3, 8}, false, false);
     ctx_.WaitIdle();
+    // THE CASCADE, centred on the window as play centres it on the player.
+    // Nothing here filled it before 2026-09-28: every camera timed whatever
+    // an earlier harness in the process had left in farVox (under --verify,
+    // --shot's), or an empty cascade standalone.
+    RefillFarAround(ctx_, world_, sim_, WindowCentreChunk(world_));
   }
 
   ArmResult Measure(const RenderArm& arm, const Tuning& base, const Scene& s,
@@ -3703,6 +3751,138 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
               runs.size() == 1 ? "" : "s");
   std::printf("open the tuner's Performance tab to read it.\n");
   return ctx.ReportVkValidation("--perf") > 0 ? 1 : 0;
+}
+
+// ---- THE LOD SEAM AT EYE HEIGHT (perfsuite.h) ------------------------------
+namespace {
+SeamPose SeamPoseAt(int x, int z, const char* what) {
+  SeamPose p;
+  const World::Column c = World::TerrainColumn(x, z, kDefaultSeed);
+  p.x = x;
+  p.z = z;
+  p.ground = c.water != INT32_MIN ? std::max(c.h, c.water) : c.h;
+  p.ex = (float)x + 0.5f;
+  p.ey = (float)(p.ground + 17) + 0.5f;  // 1.7 m: the player's eye
+  p.ez = (float)z + 0.5f;
+  p.what = what;
+  return p;
+}
+// How far the ground strays from the eye column's along a view line, sampled
+// every 25 voxels out to `len`; INT_MAX if the line crosses standing water.
+// The seam frames want FLAT ground: a hill in front puts the window face
+// half-way up a slope, where the handoff line cannot be told from terrain.
+int SeamRelief(int x, int z, int dx, int dz, int len) {
+  const int h0 = World::TerrainColumn(x, z, kDefaultSeed).h;
+  int worst = 0;
+  for (int t = 0; t <= len; t += 25) {
+    const World::Column c =
+        World::TerrainColumn(x + dx * t, z + dz * t, kDefaultSeed);
+    if (c.water != INT32_MIN) return INT_MAX;
+    worst = std::max(worst, std::abs(c.h - h0));
+  }
+  return worst;
+}
+}  // namespace
+
+SeamPose SeamPlainPose() {
+  // The flattest column of the harness pad (bare sand: the pad refuses all
+  // cover) looking down +x for 60 m AND toward the (-x,+z) corner for 42 m.
+  // A 32-voxel lattice, scanned in a fixed order with a strict `<`, so the
+  // choice is a pure function of the map.
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  int bx = 256, bz = 256, best = INT_MAX;
+  for (int z = m.padZ0 + 64; z <= m.padZ1 - 64; z += 32)
+    for (int x = m.padX0 + 64; x <= m.padX1 - 64; x += 32) {
+      const int r = std::max(SeamRelief(x, z, 1, 0, 600),
+                             SeamRelief(x, z, -1, 1, 425));
+      if (r < best) { best = r; bx = x; bz = z; }
+    }
+  return SeamPoseAt(bx, bz, best == INT_MAX
+                                ? "harness pad fallback (256,256)"
+                                : "flattest harness-pad column (bare sand)");
+}
+
+SeamPose SeamVegPose() {
+  // MapBiomeAt's value is the biome file's `index` (the harness map lists
+  // them in index order): meadow is 1. The harness map's nearest meadow cell
+  // is ~6 km from the spawn, so search the map's CELLS first (nearest to the
+  // spawn cell), then a 64-voxel lattice inside the first cell that has a
+  // column whose eye and +x view line (60 m) are meadow, dry and flat.
+  constexpr uint32_t kMeadow = 1;
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  int scx, scz;
+  m.CellOf(m.spawnX, m.spawnZ, &scx, &scz);
+  std::vector<std::pair<int, int>> cells;   // (dist2, index)
+  for (int cz = 0; cz < m.height; cz++)
+    for (int cx = 0; cx < m.width; cx++)
+      if (m.BiomeCell(cx, cz) == kMeadow)
+        cells.push_back({(cx - scx) * (cx - scx) + (cz - scz) * (cz - scz),
+                         cz * m.width + cx});
+  std::sort(cells.begin(), cells.end());
+  const int span = 1 << m.cellLog2;
+  for (size_t i = 0; i < cells.size() && i < 64; i++) {
+    const int cx = cells[i].second % m.width, cz = cells[i].second / m.width;
+    const int x0 = (cx - m.originCellX) * span, z0 = (cz - m.originCellZ) * span;
+    int bx = 0, bz = 0, best = INT_MAX;
+    for (int z = z0 + 64; z < z0 + span - 64; z += 64)
+      for (int x = x0 + 64; x < x0 + span - 64; x += 64) {
+        bool ok = true;
+        for (int t = 0; t <= 600 && ok; t += 150)
+          ok = World::MapBiomeAt(x + t, z, kDefaultSeed) == kMeadow;
+        if (!ok) continue;
+        // Below the plants' maxY (227 in meadow.json) with margin, or the
+        // "meadow" is a snowcap: the first version of this search picked
+        // ground y=290 and photographed bare snow.
+        const int h = World::TerrainColumn(x, z, kDefaultSeed).h;
+        if (h > 215 || h < m.seaLevelY + 4) continue;
+        const int r = SeamRelief(x, z, 1, 0, 600);
+        if (r < best) { best = r; bx = x; bz = z; }
+      }
+    if (best <= 24)
+      return SeamPoseAt(bx, bz, "flattest meadow column nearest the spawn");
+  }
+  return SeamPoseAt(m.spawnX, m.spawnZ,
+                    "map spawn (forest; NO flat meadow found -- fallback)");
+}
+
+void RefillFarAround(GpuContext& ctx, World& world, Simulation& sim,
+                     IVec3 playerChunk) {
+  FarField far;
+  far.Init(&world);
+  far.FullRefill(playerChunk);
+  uint32_t n;
+  while ((n = far.PrepareTick(ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = n;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, n);
+    ctx.queue.Submit(enc.Finish());
+  }
+  ctx.WaitIdle();
+}
+
+IVec3 WindowCentreChunk(const World& world) {
+  const IVec3 o = world.WindowOrigin();
+  const int half = (int)kNChunk / 2;
+  return {o.x + half, o.y + half, o.z + half};
+}
+
+void CentreWindowOnEye(GpuContext& ctx, World& world, Simulation& sim,
+                       float ex, float ey, float ez, uint32_t settleTicks) {
+  const int half = (int)kNChunk / 2;
+  const IVec3 pc{(int)std::floor(ex) >> 4, (int)std::floor(ey) >> 4,
+                 (int)std::floor(ez) >> 4};
+  world.SetWindowOrigin({pc.x - half, pc.y - half, pc.z - half});
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  RefillFarAround(ctx, world, sim, pc);
+  for (uint32_t t = 1; t <= settleTicks; t++) {
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, pc, false,
+               false);
+    if ((t & 31u) == 0u) ctx.WaitIdle();
+  }
+  ctx.WaitIdle();
 }
 
 }  // namespace sandvox

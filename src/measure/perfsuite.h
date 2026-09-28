@@ -39,6 +39,8 @@
 #include <string>
 #include <vector>
 
+#include "math3d.h"   // IVec3 (the seam / far-refill helpers)
+
 class GpuContext;
 class World;
 class Simulation;
@@ -109,5 +111,43 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
                     const PerfOptions& opt,
                     std::vector<RenderBudgetRow>* rows = nullptr);
+
+// ---- THE LOD SEAM AT EYE HEIGHT (2026-09-28, LOD-seam overhaul P0) --------
+//
+// Shared by --shot's screenshot_seam_* frames and the `seam` / `seamveg`
+// --render-budget cameras, so the frame the look review judges is the frame
+// the budget times. A pose is a column plus an eye 17 voxels (1.7 m) over its
+// ground, the ground ASKED FOR (World::TerrainColumn), never written down.
+struct SeamPose {
+  int x = 0, z = 0;
+  int ground = 0;           // TerrainColumn(x, z).h (or the water surface)
+  float ex = 0, ey = 0, ez = 0;
+  const char* what = "";    // how the site was chosen, for the log / note
+};
+// The flattest column of the harness pad (bare desert sand -- the pad refuses
+// all cover) along +x (60 m) and toward the (-x,+z) corner: the geometry /
+// shading seam with no plants and no hill in the way.
+SeamPose SeamPlainPose();
+// The flattest column, in the MEADOW-biome map cell nearest the spawn, whose
+// +x view line stays meadow, dry and flat for 60 m (the harness pad has no
+// vegetation; the nearest meadow is ~6 km out). Falls back to the spawn
+// column (forest), and says so in `what`.
+SeamPose SeamVegPose();
+// Centre the residency window AND the far field on the eye exactly as play
+// does (Stream::Update's target: origin = eye chunk - kNChunk/2 on all three
+// axes; FarField recentred on the eye chunk), regenerate, drain the far fill
+// and settle `settleTicks` ticks. Without this the window face sits wherever
+// the harness origin put it, not 25.6 m ahead of the eye, and the frame is not
+// of the in-game seam. The caller resets any Stream (OnRegen) first.
+void CentreWindowOnEye(GpuContext& ctx, World& world, Simulation& sim,
+                       float ex, float ey, float ez, uint32_t settleTicks);
+// A wholesale far-field refill centred on `playerChunk` (a FINE chunk coord,
+// as play's FarField::Update takes), drained to completion. What every
+// headless view of the cascade needs: without it the budget runner rendered
+// whatever cascade an earlier harness left behind, or none.
+void RefillFarAround(GpuContext& ctx, World& world, Simulation& sim,
+                     IVec3 playerChunk);
+// The fine chunk at the residency window's centre (origin + kNChunk/2).
+IVec3 WindowCentreChunk(const World& world);
 
 }  // namespace sandvox
