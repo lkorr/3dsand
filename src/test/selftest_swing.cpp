@@ -2162,6 +2162,13 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     check(!StrikeChains(m, hr, hr, 1) && !StrikeChains(m, hr, up, 1) &&
               !StrikeChains(m, hr, dn, 1) && !StrikeChains(m, hr, ur, 1),
           "chain: the same side and the perpendiculars wait the recover out");
+    // A SHORT BLADE'S STAB REPEATS on a plain click (`clickRepeat`); a long
+    // blade's, a blunt's, a fist's and any other stroke's does not.
+    const int fShort = WeaponFormOf("short"), fLong = WeaponFormOf("long");
+    check(StrikeRepeats(m, dn, fShort) && !StrikeRepeats(m, dn, fLong) &&
+              !StrikeRepeats(m, dn, WeaponFormOf("blunt")) &&
+              !StrikeRepeats(m, dn, -1) && !StrikeRepeats(m, hr, fShort),
+          "repeat: only the thrust, only with a short blade");
     // ...and the chained windup is the rate faster, never under 2 ticks.
     const AttackStyle* s = lib.At(hl);
     if (s != nullptr) {

@@ -793,6 +793,17 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
             }
           }
           if (si < 0) {
+            // No flick after a SHORT BLADE'S STAB (the compass's
+            // `clickRepeat`): stab again with the hand that stabbed, and it
+            // chains (chainsNow below), so clicking is a fast repeated stab.
+            // Flick any direction to leave it.
+            const ItemDef* pItem = hands[ph].weapon ? hands[ph].item : nullptr;
+            if (s.strikeBaseHand == ph &&
+                StrikeRepeats(map, strikeBase,
+                              pItem ? WeaponFormOf(pItem->weaponClass) : -1))
+              si = strikeBase;
+          }
+          if (si < 0) {
             // No flick: alternate the two horizontals so plain clicking is a
             // usable L/R rhythm rather than the same cut stamped.
             si = NeutralStrike(map, strikePicker.altRight);
@@ -2876,9 +2887,19 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             auto chainsNow = [&](int next, Hand nextHand) {
               if (playerStrike.phase != StrokeCursor::Phase::Recover) return false;
               if (nextHand != playerStrike.hand) return true;
-              return StrikeChains(
-                  PlayerCompass(mobs.AttackStyles(), hands[nextHand].weapon),
-                  strikeBase, next, chainT.chainSectorLeeway);
+              const PlayerStrikeMap& cmap =
+                  PlayerCompass(mobs.AttackStyles(), hands[nextHand].weapon);
+              // ...AND A SHORT BLADE'S STAB CHAINS INTO ITSELF (`clickRepeat`):
+              // the point comes back along the line it went out on, so the
+              // next stab starts from there like an opposite cut does.
+              const ItemDef* nItem =
+                  hands[nextHand].weapon ? hands[nextHand].item : nullptr;
+              if (next == strikeBase &&
+                  StrikeRepeats(cmap, strikeBase,
+                                nItem ? WeaponFormOf(nItem->weaponClass) : -1))
+                return true;
+              return StrikeChains(cmap, strikeBase, next,
+                                  chainT.chainSectorLeeway);
             };
             // A chaining strike clicked during the CUT was banked; it goes
             // the moment the recover begins rather than at its end.
@@ -2948,6 +2969,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                     playerStrike.hand = qHand;
                     playerStrike.mirrored = mirror;
                     strikeBase = strikeQueued;
+                    s.strikeBaseHand = qHand;
                     // ...and the style's body animation, exactly as the NPC's
                     // BeginStroke does (strokes.h AttackStyle::clip) — its
                     // mirror, swung with the other arm (Mob::StrokeClip).
@@ -3045,6 +3067,25 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                         break;
                       }
                     }
+                    // ...BUT NEVER PAST WHERE THE TIP CAN MEET THE LINE. A
+                    // bearing to a point 40 voxels out is all but parallel to
+                    // the camera line, so a thrust into open air ran beside
+                    // the reticle a shoulder's offset low and wide of it and
+                    // never crossed it. The point on the line exactly the
+                    // arm's outer reach from the pivot is where a straight-
+                    // ahead tip lands ON the reticle; anything hit nearer
+                    // still wins.
+                    {
+                      float reachLo = 0, reachHi = 0;
+                      melee.ReachBand(reachLo, reachHi);
+                      const Vec3 e = eye - pivot;
+                      const float b = e.dot(look);
+                      const float disc = b * b - (e.dot(e) - reachHi * reachHi);
+                      if (reachHi > 0.0f && disc >= 0.0f) {
+                        const float dConv = -b + std::sqrt(disc);
+                        if (dConv > 0.0f) hitDist = std::min(hitDist, dConv);
+                      }
+                    }
                     StrokeAimAt(pivot, eye + look * hitDist, strikeRightNow(),
                                 bodyUp, bodyFwd, aimAz, aimEl, aimDist);
                   }
@@ -3090,20 +3131,20 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           // every tick the slash is live. Latched (not played here) because
           // this is inside the tick loop and audio drains once per frame.
           //
-          // THE VOLUME AND PITCH COME OFF THE SPEED THE GAME ACTUALLY READ,
-          // not off the tuning's threshold, so a whoosh is the audible half of
-          // "speed is the damage" (melee.h note 2): the player hears the same
-          // number the damage curve used, and a lazy wave under
-          // combatfx.whooshMinSpeed makes no sound at all rather than a quiet
-          // one — which is the honest report that it was not a cut.
+          // EVERY STRIKE WHOOSHES. This used to be gated on the driver's
+          // MOUSE speed, which nothing has fed since strikes became clicks
+          // (the picker is the only consumer of the look delta), so it sat
+          // near zero and a strike whooshed only when some leftover motion
+          // happened to clear combatfx.whooshMinSpeed. The volume and pitch
+          // come off the TIP speed instead — the number the damage curve
+          // reads — measured by the sweep below on this same tick
+          // (whooshArmed), so the player still hears "speed is the damage".
           if (strikeCutEdge) {
             const Tuning::CombatFx& fx = CurrentTuning().combatfx;
-            const float lo = fx.whooshMinSpeed;
-            const float hi = std::max(melee.tuning.commitSpeed, lo + 1.0f);
-            const float sp = melee.MouseSpeed();
-            if (sp > lo) {
+            {
+              s.whooshArmed = true;
               combatWhooshCue.pending = true;
-              combatWhooshCue.power = std::clamp((sp - lo) / (hi - lo), 0.0f, 1.0f);
+              combatWhooshCue.power = 0.0f;
               // A POINT ALONG THE BLADE, not either end of it, and the SAME
               // point the voice then follows for the length of the sample (the
               // audio block moves it every frame). The hand alone was where this
@@ -4083,6 +4124,15 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
         Vec3 eb, et, ef;
         float ehw = 0;
         if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
+          // THE WHOOSH'S LOUDNESS (armed on the cut edge above): this tick's
+          // tip travel against the damage curve's own min/full speeds.
+          if (s.whooshArmed && lastEdgeValid) {
+            const float sp = (et - lastEdgeTip).len() / kTickDt;
+            const float lo = melee.tuning.minSpeed;
+            const float hi = std::max(melee.tuning.fullSpeed, lo + 1e-3f);
+            combatWhooshCue.power = std::clamp((sp - lo) / (hi - lo), 0.0f, 1.0f);
+          }
+          s.whooshArmed = false;
           // THE PROGRAM'S CUT is the cut — the NPC's own contract:
           // MobSystem::StepStroke sweeps on the CURSOR's cut, and tip speed
           // still scales the damage.

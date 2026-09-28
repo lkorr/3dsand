@@ -684,7 +684,42 @@ async function loadLimbFromCreature(entry, replace) {
  * Lengths: the sidecar authors hilt/translation in MICRO units and the engine
  * divides by `scale` at load (avatar.cpp:291 `inv`), so everything below is
  * converted to world voxels before it is composed.
+ *
+ * FRAMES (melee.cpp, the hilt block): the HILT box is authored in the .vox's
+ * own Z-up scene coordinates and the engine maps it (x, z, -y) and rebases it
+ * on the model's scene min; `grip.translation` is taken as it stands, in the
+ * item's engine (Y-up) frame. This preview used the hilt's raw numbers as if
+ * they were already Y-up, which put every hilt centre on the wrong axes -- the
+ * preview's blade sat off the game's, and grips tuned here by eye came out
+ * displaced in game by exactly that difference (cleaver, shortsword, dagger;
+ * corrected 2026-09-27). hiltEngine() is the one conversion both the
+ * placement and the wireframe read.
  */
+
+/**
+ * The item's hilt box in the ITEM'S ENGINE FRAME, item micro units, measured
+ * from the prefab's min corner (the frame the item's voxels are drawn in):
+ * { center, size }, or null with no hilt. melee.cpp's conversion exactly:
+ * lo = (min.x, min.z, -(min.y + size.y)), extent = (size.x, size.z, size.y),
+ * minus modelOrigin = (sceneMin.x, sceneMin.y, sceneMin.z - 1).
+ */
+function hiltEngine() {
+  const h = itemSc?.hilt;
+  if (!h || !Array.isArray(h.min) || !Array.isArray(h.size)) return null;
+  const mn = h.min.map(Number), sz = h.size.map(Number);
+  const m = itemDoc?.models?.find(x => x.name === (itemSc.model || heldItemId)) ||
+            itemDoc?.models?.[0];
+  const sm = m?.sceneMin || { x: 0, y: 0, z: 0 };
+  const off = m?.offset || { x: 0, y: 0, z: 0 };
+  return {
+    center: {
+      x: mn[0] + sz[0] / 2 - sm.x + off.x,
+      y: mn[2] + sz[2] / 2 - sm.y + off.y,
+      z: -(mn[1] + sz[1] / 2) - (sm.z - 1) + off.z,
+    },
+    size: { x: sz[0], y: sz[2], z: sz[1] },
+  };
+}
 
 /** Euler degrees (X then Y then Z, the engine's order) -> quaternion. */
 function eulerToQuat(d) {
@@ -812,12 +847,12 @@ function heldItemTransform() {
   const tr = { x: t[0] * voxRatio, y: t[1] * voxRatio, z: t[2] * voxRatio };
 
   let gl;
-  const hilt = itemSc.hilt;
-  if (hilt && Array.isArray(hilt.min) && Array.isArray(hilt.size)) {
+  const hilt = hiltEngine();
+  if (hilt) {
     const c = {
-      x: (+hilt.min[0] + +hilt.size[0] / 2) * voxRatio,
-      y: (+hilt.min[1] + +hilt.size[1] / 2) * voxRatio,
-      z: (+hilt.min[2] + +hilt.size[2] / 2) * voxRatio,
+      x: hilt.center.x * voxRatio,
+      y: hilt.center.y * voxRatio,
+      z: hilt.center.z * voxRatio,
     };
     gl = { x: c.x - tr.x, y: c.y - tr.y, z: c.z - tr.z };
   } else {
@@ -861,19 +896,16 @@ function updateSocketAxes() {
  */
 function updateHiltBox() {
   const xf = heldItemTransform();
-  const hilt = itemSc?.hilt;
-  if (!xf || !hilt || !Array.isArray(hilt.min) || !Array.isArray(hilt.size)) {
+  const hilt = hiltEngine();
+  if (!xf || !hilt) {
     ed.setHiltBox?.(null);
     return;
   }
   const s = xf.scale;
-  const cx = (+hilt.min[0] + +hilt.size[0] / 2) * s;
-  const cy = (+hilt.min[1] + +hilt.size[1] / 2) * s;
-  const cz = (+hilt.min[2] + +hilt.size[2] / 2) * s;
-  const r = qrot(xf.quat, { x: cx, y: cy, z: cz });
+  const r = qrot(xf.quat, { x: hilt.center.x * s, y: hilt.center.y * s, z: hilt.center.z * s });
   ed.setHiltBox?.({
     pos: [r.x + xf.pos.x, r.y + xf.pos.y, r.z + xf.pos.z],
-    size: [+hilt.size[0] * s, +hilt.size[1] * s, +hilt.size[2] * s],
+    size: [hilt.size.x * s, hilt.size.y * s, hilt.size.z * s],
     quat: xf.quat,
   });
 }
@@ -3975,8 +4007,24 @@ function bladeSegmentModel() {
     ? { x: +e.axis[0] || 0, y: +e.axis[1] || 0, z: +e.axis[2] || 0 }
     : { x: 0, y: 0, z: 1 };
   const axE = AN.vnorm(AN.v3(ax.x, ax.z, -ax.y));      // Z-up -> Y-up
+  // WHERE ACROSS THE BLADE (melee.cpp `line`): a point in the art's Z-up scene
+  // units, mapped and rebased exactly as hiltEngine() maps the hilt, then
+  // projected off the edge axis. Without it the segment rides the model's
+  // origin line -- the box corner -- and the trail drew beside the steel
+  // while the engine's hitbox ran through it.
+  let lineOff = AN.v3();
+  if (Array.isArray(e.line) && e.line.length === 3) {
+    const l = e.line.map(Number);
+    const m = itemDoc?.models?.find(x => x.name === (itemSc.model || heldItemId)) ||
+              itemDoc?.models?.[0];
+    const sm = m?.sceneMin || { x: 0, y: 0, z: 0 };
+    const off = m?.offset || { x: 0, y: 0, z: 0 };
+    const o = AN.v3(l[0] - sm.x + off.x, l[2] - sm.y + off.y,
+                    -l[1] - (sm.z - 1) + off.z);
+    lineOff = AN.vsub(o, AN.vmul(axE, AN.vdot(axE, o)));
+  }
   const at = d => {
-    const p = AN.qrot(xf.quat, AN.vmul(axE, d * xf.scale));
+    const p = AN.qrot(xf.quat, AN.vmul(AN.vadd(AN.vmul(axE, d), lineOff), xf.scale));
     return AN.vadd(xf.pos, p);
   };
   const seg = { base: at(+e.from || 0), tip: at(+e.to || 0) };

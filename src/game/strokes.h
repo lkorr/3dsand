@@ -686,6 +686,11 @@ struct PlayerStrikeMap {
   };
   std::vector<Sector> sectors;
   int neutral[2] = {-1, -1};   // the directionless click alternates these
+  // THE CLICK THAT REPEATS (`clickRepeat`): after this style, a directionless
+  // click with the same hand throws it again instead of a neutral, and chains
+  // — but only for a weapon whose form bit is in repeatForms (StrikeRepeats).
+  int repeat = -1;
+  unsigned repeatForms = 0;    // bit f = weapon form f (kWeaponFormNames)
   bool Usable() const { return !sectors.empty() || neutral[0] >= 0; }
 };
 
@@ -740,6 +745,11 @@ int NeutralStrike(const PlayerStrikeMap& map, bool right);
 // holds them. A chained strike may begin during the recover and winds up
 // faster; any other one waits the recover out.
 bool StrikeChains(const PlayerStrikeMap& map, int prev, int next, int leeway);
+// DOES `prev` REPEAT ON A PLAIN CLICK with a weapon of `form`? (the map's
+// `clickRepeat`: the dagger's stab.) When it does, the directionless click
+// names `prev` again and that repeat chains off it the way StrikeChains'
+// opposite does. Base style index; form -1 (fists, no item) never repeats.
+bool StrikeRepeats(const PlayerStrikeMap& map, int prev, int form);
 // Which compass a player press reads: fists or armed. ONE armed compass for
 // every weapon — what differs by weapon is the stroke's FORM, not which
 // stroke a flick names. One function because the tick (session.cpp) and the

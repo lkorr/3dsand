@@ -424,6 +424,10 @@ export function readVox(buf) {
           name: p.name,
           modelId: p.modelId,
           offset: { x: p.mn.x - pmn.x, y: p.mn.y - pmn.y, z: p.mn.z - pmn.z },
+          // The engine-space min BEFORE the rebase: voxload.cpp's `sceneMin`.
+          // A sidecar box authored in the .vox's own coordinates (an item's
+          // hilt, melee.cpp modelOrigin) is brought onto this grid through it.
+          sceneMin: { x: p.mn.x, y: p.mn.y, z: p.mn.z },
           dim, grid: g,
         };
       }),

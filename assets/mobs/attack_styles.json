@@ -65,7 +65,14 @@
     "neutralAlternate": [
       "horizontal_r",
       "horizontal_l"
-    ]
+    ],
+    "clickRepeat": {
+      "//": "A short blade's stab repeats: after this style, a plain (unflicked) click with the same hand throws it again instead of the neutral alternate, and it chains (starts in the recover, melee.chainWindupRate faster). Only for the weapon classes listed.",
+      "style": "thrust",
+      "weaponClasses": [
+        "short"
+      ]
+    }
   },
   "playerUnarmed": {
     "sectors": [

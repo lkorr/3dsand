@@ -620,6 +620,12 @@ struct PlayerSession {
   // The BASE style (the compass's index, before ResolveForm) of the stroke in
   // playerStrike, -1 = none: what StrikeChains asks "the opposite side of".
   int strikeBase = -1;
+  // ...and the hand that threw it: a plain click repeats a `clickRepeat`
+  // style (the dagger's stab) only with the hand that stabbed.
+  Hand strikeBaseHand = Hand::Right;
+  // A whoosh was requested on this tick's cut edge and its power is still to
+  // be read off the sweep's tip speed (session.cpp, THE SWING WHOOSH).
+  bool whooshArmed = false;
   // THE LAST ATTACK PRESS, as the picker read it — for the HUD's strike
   // compass (overlay.cpp) and nothing else; the sim never reads it.
   // `flicked` false = no flick, the neutral alternate fired. `serial` bumps

@@ -675,6 +675,23 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         log += std::string(path) + ": " + key + " neutralAlternate \"" + name +
                "\" is unknown — skipped\n";
     }
+    const auto& cr = p.value("clickRepeat", json::object());
+    if (cr.is_object() && cr.contains("style")) {
+      const std::string name = cr.value("style", "");
+      auto it = playerDerived.find(name);
+      map.repeat = (it != playerDerived.end()) ? it->second : lib.Find(name);
+      if (map.repeat < 0)
+        log += std::string(path) + ": " + key + " clickRepeat \"" + name +
+               "\" is unknown — skipped\n";
+      for (const auto& wc : cr.value("weaponClasses", json::array())) {
+        const int f = wc.is_string() ? WeaponFormOf(wc.get<std::string>()) : -1;
+        if (f >= 0)
+          map.repeatForms |= 1u << f;
+        else
+          log += std::string(path) + ": " + key +
+                 " clickRepeat weaponClass is unknown — skipped\n";
+      }
+    }
   };
   readMap("player", lib.player);
   readMap("playerUnarmed", lib.playerUnarmed);
@@ -731,6 +748,11 @@ bool StrikeChains(const PlayerStrikeMap& map, int prev, int next, int leeway) {
     }
   }
   return false;
+}
+
+bool StrikeRepeats(const PlayerStrikeMap& map, int prev, int form) {
+  return prev >= 0 && prev == map.repeat && form >= 0 && form < kWeaponForms &&
+         (map.repeatForms & (1u << form)) != 0;
 }
 
 const PlayerStrikeMap& PlayerCompass(const StyleLibrary& lib, bool armed) {
