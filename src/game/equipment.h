@@ -98,6 +98,10 @@ enum class MoveResult : uint8_t {
   WrongKind,    // the destination refuses this ItemKind
   SameSlot,     // dragged onto itself: a no-op, not an error
   BadSlot,      // out-of-range index (a UI bug, reported rather than clamped)
+  // The hand the item would go into is too hurt to grip it (Mob::KitMove,
+  // melee.injuredArmDrop). Refused rather than equipped and then dropped by
+  // Mob::GripFails on the next tick.
+  HandTooHurt,
 };
 
 // One equipment slot's authored rules. `accepts` empty means REFUSE
@@ -458,6 +462,12 @@ inline const char* MoveResultText(MoveResult r, const KitRef& to) {
     case MoveResult::WrongKind:
       return to.space == KitSpace::Equip ? EquipSlotAt(to.index).why
                                          : "that does not go there";
+    case MoveResult::HandTooHurt:
+      if (to.space == KitSpace::Equip && to.index == EquipSlotOfHand(Hand::Left))
+        return "your left hand is too hurt to hold that";
+      if (to.space == KitSpace::Equip && to.index == EquipSlotOfHand(Hand::Right))
+        return "your right hand is too hurt to hold that";
+      return "that hand is too hurt to hold anything";
     case MoveResult::BadSlot:
     default:
       return "no such slot";

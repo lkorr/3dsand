@@ -3658,6 +3658,25 @@ MoveResult Mob::KitMove(const KitRef& from, const KitRef& to,
   // harmless — it only brings the stack up to date.
   if (from.space == KitSpace::Equip) KitFlushWorn(from.index);
   if (to.space == KitSpace::Equip) KitFlushWorn(to.index);
+  // A HAND TOO HURT TO HOLD ON TAKES NOTHING (melee.injuredArmDrop). Below
+  // that condition Mob::GripFails would drop the item on the next tick, so
+  // equipping it would only be a round trip to the floor. Checked for either
+  // end: a swap OUT of a hand puts the other slot's item INTO it. Emptying
+  // the hand is always allowed.
+  if (alive_ && def_ != nullptr &&
+      !(from.space == to.space && from.index == to.index)) {
+    const float dropBelow = CurrentTuning().melee.injuredArmDrop;
+    auto intoHurtHand = [&](const KitRef& hand, const KitRef& other) {
+      Hand h;
+      if (hand.space != KitSpace::Equip || !EquipSlotIsHand(hand.index, &h))
+        return false;
+      const ItemStack* in = kit_.Resolve(other);
+      if (in == nullptr || in->Empty()) return false;
+      return HandCondition(h) < dropBelow;
+    };
+    if (dropBelow > 0.0f && (intoHurtHand(to, from) || intoHurtHand(from, to)))
+      return MoveResult::HandTooHurt;
+  }
   const MoveResult r = kit_.Move(from, to, lib);
   if (r == MoveResult::Ok) {
     // Two identical tunics swapped are two different objects: re-dress even
