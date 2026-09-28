@@ -50,6 +50,8 @@ class Simulation {
   // only thing that may clear it, so "uploaded" and "no longer dirty" cannot
   // drift apart at a call site that forgot the second half.
   void UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set);
+  // Brick-pool bytes UploadMicroBodies has sent, whole run (--frames report).
+  uint64_t MicroPoolBytesSent() const { return mbPoolBytesSent_; }
   // Publish the ART palette: per-voxel skin colours from loaded prefabs, which
   // are NOT material colours (a creature is one material all over and painted
   // per voxel — sim/voxload.h). They live in reserved material-table entries
@@ -352,7 +354,15 @@ class Simulation {
   void DrawWindField(const rhi::RenderPass& pass, uint32_t arrows);
   // The current field's arrows (docs/PLAN_water_master.md component 8).
   void DrawCurrentField(const rhi::RenderPass& pass, uint32_t arrows);
+  // Body cubes: vertices per instance (three camera-facing faces, see
+  // debris.wgsl bodyVertex). Every body draw uses this count.
+  static constexpr uint32_t kBodyCubeVerts = 18;
+  // The whole instance list [0, voxInstances): the harness/gate path.
   void DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances);
+  // Culled per-body draws: [firstInstance, count] pairs (CullBodyRanges,
+  // game/bodyreg.h). The frame loop's path.
+  void DrawBodyRanges(const rhi::RenderPass& pass,
+                      const std::vector<std::pair<uint32_t, uint32_t>>& draws);
   // Microvoxel bodies (PLAN §C): one 36-vertex OBB per entry in `insts`, drawn
   // between DrawBodies and DrawSprites. `insts` is the compacted (slot, model)
   // list built by the caller from the frame's body slots; an empty list draws
@@ -742,6 +752,8 @@ class Simulation {
   bool artPaletteLive_ = false;
   std::vector<MicroBodyModelGpu> mbModelScratch_, mbModelLast_;
   bool mbModelLive_ = false;
+  uint64_t mbPoolBytesSent_ = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> mbRangeScratch_;
   // Static micro-detail (render-only). Deliberately NOT in any sim bind group.
   rhi::Buffer microTableBuf_, microPoolBuf_;
   // Dynamic micro BODIES (render-only, same doctrine): per-def limb models, the

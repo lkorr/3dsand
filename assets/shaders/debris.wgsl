@@ -257,12 +257,33 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
 // in a speckle of holes, and the only way to make two entry points agree to
 // the last ulp is to have them run the same instructions. Returns false for a
 // face the camera cannot see (BODY_VIEW_CULL).
+//
+// 18 VERTICES PER CUBE, NOT 36 (2026-09-28). A cube seen from outside shows at
+// most one face per axis, and which one is decided by the side of the cube's
+// centre plane the eye is on — so `vi` 0..17 names (axis, corner) and the
+// SIGN is picked here from the camera. The back three faces used to run the
+// vertex stage in full only to be collapsed by the plane test below; now they
+// are never generated. The plane test stays: when the eye is inside a face's
+// slab (edge-on) neither face of that axis is visible and it still drops it.
+// Both entry points call this, so both passes pick the same faces bit for bit.
+fn bodySlot(packed : u32) -> u32 {
+  // Bits 16..27 only: 28..31 are the ART colour (BodyVoxInst). Indexing
+  // bodyXf with the art bits still set read far past the transform array, so
+  // a painted cube-path voxel was drawn wherever that garbage pointed.
+  return (packed >> 16u) & 0xFFFu;
+}
+
 fn bodyVertex(vi : u32, inst : u32, out_world : ptr<function, vec3f>,
               out_wn : ptr<function, vec3f>, out_n : ptr<function, vec3f>) -> bool {
   let b = bodyInst[inst];
-  let xf = bodyXf[b.packed >> 16u];
+  let xf = bodyXf[bodySlot(b.packed)];
+  let axis = vi / 6u;
+  let centre = xf.pos + quatRotate(xf.quat, vec3f(b.lx, b.ly, b.lz) + vec3f(0.5));
+  let axisW = quatRotate(xf.quat, axisUnit(axis));
+  // Eye on the + side of the centre plane -> the + face; otherwise the - face.
+  let neg = select(0u, 1u, dot(axisW, centre - R.camPos) > 0.0);
   var n : vec3f;
-  let off = cubeOffset(vi, &n);
+  let off = cubeOffset((axis * 2u + neg) * 6u + vi % 6u, &n);
   let local = vec3f(b.lx, b.ly, b.lz) + vec3f(0.5) + off;
   let world = xf.pos + quatRotate(xf.quat, local);
   let wn = quatRotate(xf.quat, n);
@@ -314,7 +335,7 @@ fn fsBodyDepth() -> @location(0) vec4f {
 fn vsBody(@builtin(vertex_index) vi : u32,
           @builtin(instance_index) inst : u32) -> BodyVSOut {
   let b = bodyInst[inst];
-  let xf = bodyXf[b.packed >> 16u];
+  let xf = bodyXf[bodySlot(b.packed)];
 
   var world : vec3f;
   var wn : vec3f;

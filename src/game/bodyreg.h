@@ -1,12 +1,92 @@
 #pragma once
 #include <cstdarg>
 #include <cstdint>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "game/avatar.h"
 #include "game/mob.h"
 #include "phys/debris.h"
 #include "sim/microbody.h"
+
+// ---- BodyInstanceArena: the cube-instance buffer as per-body SPANS ----------
+//
+// (rigidbody perf package, 2026-09-28.) BuildInstances emits one list for
+// every body in the world, and it used to be uploaded WHOLE whenever any one
+// body's flag went up — a burning body flags every tick, so a burning log
+// re-sent every other body's instances with it (up to 4 MiB), and the draw
+// was one Draw over all of them wherever they were.
+//
+// The arena keeps a CPU mirror of the GPU buffer in which each body (keyed by
+// its physics handle, the one identity that survives a slot shift) owns a
+// span with slack. Commit() takes the freshly built list, compares each
+// body's run with what its span already holds and records only the
+// instances that differ, so a burning body re-sends its own changed range and
+// nothing else. A span that outgrows its slack moves to the end; holes are
+// reclaimed by a full repack when they outweigh the live data. A span whose
+// body is absent this commit is KEPT (not drawn) for kKeepCommits commits, so
+// a mask toggle (the inventory portrait unhiding the avatar's torso) finds
+// its old span and costs no upload at all.
+//
+// Ranges() is one entry per drawn slot with its local AABB, which is what
+// CullBodyRanges needs to give each body its own frustum test. Everything
+// here is RENDER-ONLY: no sim state, nothing hashed.
+struct BodyDrawRange {
+  uint32_t first = 0, count = 0, slot = 0;
+  float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};  // body-local cube AABB
+};
+class BodyInstanceArena {
+ public:
+  // `inst` is BuildInstances' output (runs of one slot each, walk order);
+  // `handles[s]` the physics body drawn at slot s (BuildHandles).
+  void Commit(const std::vector<BodyVoxInst>& inst,
+              const std::vector<uint64_t>& handles);
+  // The draw list of the last Commit.
+  const std::vector<BodyDrawRange>& Ranges() const { return ranges_; }
+  // Instance ranges [lo, hi) of the mirror that changed since the last
+  // TakeUploads, sorted and coalesced. The caller WriteBuffers each one from
+  // Data() and the list is cleared.
+  void TakeUploads(std::vector<std::pair<uint32_t, uint32_t>>& out);
+  const BodyVoxInst* Data() const { return mirror_.data(); }
+  uint32_t End() const { return end_; }
+  // Instances refused because the buffer (kMaxBodyVoxInstances) was full even
+  // after a repack — bodies that are NOT drawn. Last commit's count.
+  uint32_t Dropped() const { return dropped_; }
+  uint32_t Repacks() const { return repacks_; }
+  // Forget everything; the next Commit re-sends all of it (device reset,
+  // reload).
+  void Reset();
+
+ private:
+  struct Span {
+    uint32_t off = 0, cap = 0, count = 0, lastSeen = 0;
+    float lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};  // cached with the content
+  };
+  static constexpr uint32_t kKeepCommits = 120;
+  bool CommitPass(const std::vector<BodyVoxInst>& inst,
+                  const std::vector<uint64_t>& handles, bool repacking);
+  void MarkDirty(uint32_t lo, uint32_t hi);
+
+  std::vector<BodyVoxInst> mirror_;
+  std::unordered_map<uint64_t, Span> spans_;  // keyed by physics handle
+  std::vector<std::pair<uint32_t, uint32_t>> dirty_;
+  std::vector<BodyDrawRange> ranges_;
+  uint32_t end_ = 0, commit_ = 0, dropped_ = 0, repacks_ = 0;
+  uint32_t lastDropped_ = 0;
+};
+
+// Per-body frustum cull of the arena's ranges against one camera (the main
+// view or the portrait). Each range's local AABB is carried into world space
+// as a bounding sphere through its slot's transform and tested against the
+// four side planes and the near plane. Visible runs that sit back to back in
+// the buffer are merged into one draw. `draws` gets [first, count] pairs.
+void CullBodyRanges(const std::vector<BodyDrawRange>& ranges,
+                    const std::vector<BodyXformGpu>& xforms, const Vec3& eye,
+                    const Vec3& fwd, const Vec3& right, const Vec3& up,
+                    float tanHalfFovY, float aspect,
+                    std::vector<std::pair<uint32_t, uint32_t>>& draws,
+                    uint32_t* instancesDrawn = nullptr);
 
 // BodyRegistry — owns the ONE definition of the body GPU slot-space.
 //

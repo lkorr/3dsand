@@ -4962,6 +4962,14 @@ Vec3 DebrisSystem::BodyWoundWorld(uint32_t i) const {
   return b.xf.pos + QuatRot(b.xf.quat, b.wound.local);
 }
 
+bool DebrisSystem::BodyVoxelWorld(uint32_t i, uint32_t k, Vec3& out) const {
+  if (i >= bodies_.size() || k >= bodies_[i].voxels.size()) return false;
+  const Body& b = bodies_[i];
+  const DebrisVoxel& v = b.voxels[k];
+  out = b.xf.pos + QuatRot(b.xf.quat, Vec3{v.x + 0.5f, v.y + 0.5f, v.z + 0.5f});
+  return true;
+}
+
 bool DebrisSystem::WoundBody(uint64_t handle, Vec3 woundW, float budget,
                              int gushTicks) {
   if (!phys_) return false;
@@ -6717,18 +6725,38 @@ bool BodyDrawAllVoxels() {
   return all;
 }
 
-// Emits the instances for one body into `out`, culling enclosed voxels.
-// `scratch` is the occupancy lattice, reused across bodies and calls.
-void EmitExposedBodyVoxels(const std::vector<DebrisVoxel>& voxels,
-                           int8_t lmin[3], int8_t lmax[3], uint32_t slot,
-                           std::vector<uint8_t>& scratch,
-                           std::vector<BodyVoxInst>& out,
-                           uint32_t& exposed) {
+// SANDVOX_BODY_INST_LEGACY=1: the one-binary A/B arm for the 2026-09-28 body
+// render package — no per-body cull cache here, and main.cpp goes back to a
+// whole-list upload and one undivided draw. Read in both places (the same
+// variable), so neither has to export it through a header.
+bool BodyInstLegacyArm() {
+  static const bool on = [] {
+    const char* e = std::getenv("SANDVOX_BODY_INST_LEGACY");
+    return e && e[0] != '0';
+  }();
+  return on;
+}
+
+// The indices (into `voxels`) of the voxels that are not enclosed on all six
+// sides, in list order. `scratch` is the occupancy lattice, reused across
+// bodies and calls.
+void ExposedBodyVoxels(const std::vector<DebrisVoxel>& voxels,
+                       const int8_t lmin[3], const int8_t lmax[3],
+                       std::vector<uint8_t>& scratch,
+                       std::vector<uint32_t>& outIdx) {
+  outIdx.clear();
   const int dx = (int)lmax[0] - (int)lmin[0] + 3;  // +1 pad each side
   const int dy = (int)lmax[1] - (int)lmin[1] + 3;
   const int dz = (int)lmax[2] - (int)lmin[2] + 3;
   const size_t vol = (size_t)dx * (size_t)dy * (size_t)dz;
-  scratch.assign(vol, 0);
+  // The lattice is kept ALL-ZERO between calls and only the cells this body
+  // sets are cleared again on the way out, so a call costs O(voxels) rather
+  // than a memset of the whole bounding box (~700 KB for a felled birch —
+  // most of the old per-call cost on a burning body, whose count changes
+  // every tick it loses a voxel).
+  if (scratch.size() < vol) scratch.resize(vol, 0);
+  // The A/B arm (SANDVOX_BODY_INST_LEGACY) pays the old whole-box clear.
+  if (BodyInstLegacyArm()) std::fill(scratch.begin(), scratch.begin() + vol, 0);
   auto idx = [&](const DebrisVoxel& v) -> size_t {
     return (size_t)(v.x - lmin[0] + 1) +
            (size_t)dx * ((size_t)(v.y - lmin[1] + 1) +
@@ -6736,17 +6764,25 @@ void EmitExposedBodyVoxels(const std::vector<DebrisVoxel>& voxels,
   };
   for (const DebrisVoxel& v : voxels) scratch[idx(v)] = 1;
   const size_t sx = 1, sy = (size_t)dx, sz = (size_t)dx * (size_t)dy;
-  for (const DebrisVoxel& v : voxels) {
-    if (out.size() >= kMaxBodyVoxInstances) break;
-    const size_t i = idx(v);
+  for (uint32_t k = 0; k < (uint32_t)voxels.size(); k++) {
+    const size_t i = idx(voxels[k]);
     const bool enclosed = scratch[i - sx] && scratch[i + sx] &&
                           scratch[i - sy] && scratch[i + sy] &&
                           scratch[i - sz] && scratch[i + sz];
-    if (enclosed) continue;
-    exposed++;
-    out.push_back({(float)v.x, (float)v.y, (float)v.z,
-                   (uint32_t)v.payload | (slot << 16)});
+    if (!enclosed) outIdx.push_back(k);
   }
+  for (const DebrisVoxel& v : voxels) scratch[idx(v)] = 0;
+}
+
+// SANDVOX_BODY_INST_VERIFY=1: re-run the cull on EVERY build and abort on the
+// first body whose cached list disagrees — the check that the (count,
+// geomGen, address) key really does witness every geometry edit.
+bool BodyInstVerify() {
+  static const bool on = [] {
+    const char* e = std::getenv("SANDVOX_BODY_INST_VERIFY");
+    return e && e[0] != '0';
+  }();
+  return on;
 }
 }  // namespace
 
@@ -6781,9 +6817,42 @@ void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
       }
       continue;
     }
-    RefreshLocalBounds(b);
-    EmitExposedBodyVoxels(b.voxels, b.lmin, b.lmax, (uint32_t)bi, occScratch,
-                          out, exposed);
+    // THE CULL IS CACHED PER BODY (rigidbody perf package, 2026-09-28). The
+    // enclosed/exposed split depends only on voxel POSITIONS, and every edit
+    // that moves one changes the count or bumps geomGen (the same key the
+    // bounds above use). A burning body rewrites payloads every tick and
+    // used to pay the lattice clear + two full passes for it — for EVERY
+    // body, since one flag rebuilds the whole list. Now a body whose shape
+    // did not change re-emits by gathering its exposed indices, picking up
+    // the fresh payloads.
+    if (BodyInstLegacyArm() || b.drawCount != (uint32_t)b.voxels.size() ||
+        b.drawGen != b.geomGen || b.drawData != (const void*)b.voxels.data()) {
+      RefreshLocalBounds(b);
+      ExposedBodyVoxels(b.voxels, b.lmin, b.lmax, occScratch, b.drawIdx);
+      b.drawCount = (uint32_t)b.voxels.size();
+      b.drawGen = b.geomGen;
+      b.drawData = b.voxels.data();
+    } else if (BodyInstVerify()) {
+      static std::vector<uint32_t> check;
+      RefreshLocalBounds(b);
+      ExposedBodyVoxels(b.voxels, b.lmin, b.lmax, occScratch, check);
+      if (check != b.drawIdx) {
+        std::fprintf(stderr,
+                     "*** SANDVOX_BODY_INST_VERIFY: body %zu (%zu voxels, gen %u) "
+                     "cached %zu exposed, recomputed %zu\n",
+                     bi, b.voxels.size(), b.geomGen, b.drawIdx.size(),
+                     check.size());
+        std::abort();
+      }
+    }
+    const uint32_t slotBits = (uint32_t)bi << 16;
+    for (uint32_t k : b.drawIdx) {
+      if (out.size() >= kMaxBodyVoxInstances) break;
+      const DebrisVoxel& v = b.voxels[k];
+      out.push_back({(float)v.x, (float)v.y, (float)v.z,
+                     (uint32_t)v.payload | slotBits});
+    }
+    exposed += (uint32_t)b.drawIdx.size();
   }
   // One line per DISTINCT population, so the --frames harness can quote the
   // cull's ratio: burning rewrites payloads and leaves both counts alone, so a

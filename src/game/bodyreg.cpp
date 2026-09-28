@@ -1,7 +1,9 @@
 #include "game/bodyreg.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,27 +73,36 @@ void BodyRegistry::BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
   // That is the failure MicroBodyClone was written to prevent (see its
   // header). Catching it HERE, in the compacted draw list, names the TWO
   // bodies involved and which system each one came from.
+  //
+  // Both checks below run every frame, so they sort (key, inst) pairs in a
+  // reused scratch vector rather than building a hash map and a hash set per
+  // frame (at most kMaxBodySlots entries: a sort is a few microseconds and
+  // allocates nothing once the scratch has grown).
+  static thread_local std::vector<std::pair<uint32_t, uint32_t>> pairs;
   if (microSet_) {
-    std::unordered_map<uint32_t, uint32_t> seen;
-    seen.reserve(out.size());
     auto region = [&](uint32_t idx) -> const char* {
       if (idx < debrisEnd) return "debris";
       if (idx < avatarEnd) return "avatar";
       return "mob";
     };
+    pairs.clear();
     for (uint32_t i = 0; i < (uint32_t)out.size(); i++) {
       const uint32_t m = out[i].model;
       if (m == kMicroBodyNoModel) continue;
       if (m >= microSet_->owned.size() || !microSet_->owned[m]) continue;
-      auto it = seen.find(m);
-      if (it != seen.end()) {
-        Report("MICRO MODEL ALIAS: owned model %u drawn by inst %u "
-               "(%s, slot %u) AND inst %u (%s, slot %u)",
-               m, it->second, region(it->second), out[it->second].slot,
-               i, region(i), out[i].slot);
-      } else {
-        seen[m] = i;
-      }
+      pairs.push_back({m, i});
+    }
+    std::sort(pairs.begin(), pairs.end());
+    for (size_t k = 1; k < pairs.size(); k++) {
+      if (pairs[k].first != pairs[k - 1].first) continue;
+      // The FIRST drawer of this model is the head of its run.
+      size_t h = k - 1;
+      while (h > 0 && pairs[h - 1].first == pairs[k].first) h--;
+      const uint32_t a = pairs[h].second, i = pairs[k].second;
+      Report("MICRO MODEL ALIAS: owned model %u drawn by inst %u "
+             "(%s, slot %u) AND inst %u (%s, slot %u)",
+             pairs[k].first, a, region(a), out[a].slot, i, region(i),
+             out[i].slot);
     }
   }
 
@@ -104,19 +115,23 @@ void BodyRegistry::BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
   // than from a walk is how that happens.
   {
     const uint32_t total = TotalSlots();
-    std::unordered_set<uint32_t> slots;
-    slots.reserve(out.size());
+    pairs.clear();
     for (uint32_t i = 0; i < (uint32_t)out.size(); i++) {
       const uint32_t s = out[i].slot;
       if (s >= total || s >= kMaxBodySlots)
         Report("MICRO SLOT OUT OF RANGE: inst %u claims slot %u of %u "
                "(ceiling %u) — it will march a transform nobody wrote",
                i, s, total, kMaxBodySlots);
-      if (!slots.insert(s).second)
-        Report("MICRO SLOT COLLISION: two instances claim slot %u "
-               "(inst %u model %u, and inst %u model %u) — one of these two "
-               "bodies is drawn at the other's transform",
-               s, i, out[i].model, i, out[i].model);
+      pairs.push_back({s, i});
+    }
+    std::sort(pairs.begin(), pairs.end());
+    for (size_t k = 1; k < pairs.size(); k++) {
+      if (pairs[k].first != pairs[k - 1].first) continue;
+      const uint32_t a = pairs[k - 1].second, i = pairs[k].second;
+      Report("MICRO SLOT COLLISION: two instances claim slot %u "
+             "(inst %u model %u, and inst %u model %u) — one of these two "
+             "bodies is drawn at the other's transform",
+             pairs[k].first, a, out[a].model, i, out[i].model);
     }
   }
 }
@@ -254,6 +269,223 @@ void BodyRegistry::Report(const char* fmt, ...) const {
     std::fprintf(f, "%s\n", msg);
     std::fclose(f);
   }
+}
+
+// ---- BodyInstanceArena ------------------------------------------------------
+
+void BodyInstanceArena::Reset() {
+  mirror_.clear();
+  spans_.clear();
+  dirty_.clear();
+  ranges_.clear();
+  end_ = 0;
+  dropped_ = 0;
+}
+
+void BodyInstanceArena::MarkDirty(uint32_t lo, uint32_t hi) {
+  if (hi > lo) dirty_.push_back({lo, hi});
+}
+
+bool BodyInstanceArena::CommitPass(const std::vector<BodyVoxInst>& inst,
+                                   const std::vector<uint64_t>& handles,
+                                   bool repacking) {
+  ranges_.clear();
+  dropped_ = 0;
+  const uint32_t n = (uint32_t)inst.size();
+  uint32_t i = 0;
+  while (i < n) {
+    // Bits 16..27 are the slot (debris.wgsl BodyVoxInst); 28..31 the art.
+    const uint32_t slot = (inst[i].packed >> 16) & 0xFFFu;
+    uint32_t j = i + 1;
+    while (j < n && ((inst[j].packed >> 16) & 0xFFFu) == slot) j++;
+    const uint32_t cnt = j - i;
+    uint64_t key = slot < handles.size() && handles[slot]
+                       ? handles[slot]
+                       : ((1ull << 63) | slot);
+    auto it = spans_.find(key);
+    // A slot whose run is split in two (no walk does that today) must not
+    // share one span with itself: the second run takes a salted key.
+    if (it != spans_.end() && it->second.lastSeen == commit_) {
+      key ^= 0x4000000000000000ull + (uint64_t)i;
+      it = spans_.find(key);
+    }
+    if (it != spans_.end() && it->second.cap < cnt) {
+      spans_.erase(it);  // outgrew its slack: the old span becomes a hole
+      it = spans_.end();
+    }
+    bool fresh = false;
+    if (it == spans_.end()) {
+      uint32_t cap = cnt + cnt / 8 + 8;
+      if (end_ + cap > kMaxBodyVoxInstances) {
+        if (!repacking) return false;  // Commit repacks and comes back
+        cap = cnt;
+        if (end_ + cap > kMaxBodyVoxInstances) {
+          dropped_ += cnt;
+          i = j;
+          continue;
+        }
+      }
+      Span s;
+      s.off = end_;
+      s.cap = cap;
+      end_ += cap;
+      if (mirror_.size() < end_) mirror_.resize(end_);
+      it = spans_.emplace(key, s).first;
+      fresh = true;
+    }
+    Span& sp = it->second;
+    BodyVoxInst* dst = mirror_.data() + sp.off;
+    const BodyVoxInst* src = inst.data() + i;
+    bool changed = false;
+    if (fresh || sp.count != cnt) {
+      std::memcpy(dst, src, (size_t)cnt * sizeof(BodyVoxInst));
+      MarkDirty(sp.off, sp.off + cnt);
+      changed = true;
+    } else if (std::memcmp(dst, src, (size_t)cnt * sizeof(BodyVoxInst)) != 0) {
+      // (The bulk compare above is the common case — an untouched body — at
+      // memcmp speed; the per-instance walk only runs on a body that moved.)
+      // Only the stretch that differs: a burning body's changed payloads.
+      uint32_t a = 0;
+      while (a < cnt && std::memcmp(dst + a, src + a, sizeof(BodyVoxInst)) == 0) a++;
+      uint32_t b = cnt;
+      while (b > a && std::memcmp(dst + b - 1, src + b - 1, sizeof(BodyVoxInst)) == 0) b--;
+      std::memcpy(dst + a, src + a, (size_t)(b - a) * sizeof(BodyVoxInst));
+      MarkDirty(sp.off + a, sp.off + b);
+      changed = true;
+    }
+    sp.count = cnt;
+    sp.lastSeen = commit_;
+    if (changed) {
+      // The local AABB, recomputed only when the run's content changed.
+      float lo[3] = {src[0].lx, src[0].ly, src[0].lz};
+      float hi[3] = {lo[0], lo[1], lo[2]};
+      for (uint32_t k = 1; k < cnt; k++) {
+        const float p[3] = {src[k].lx, src[k].ly, src[k].lz};
+        for (int ax = 0; ax < 3; ax++) {
+          lo[ax] = std::min(lo[ax], p[ax]);
+          hi[ax] = std::max(hi[ax], p[ax]);
+        }
+      }
+      for (int ax = 0; ax < 3; ax++) {
+        sp.lo[ax] = lo[ax];
+        sp.hi[ax] = hi[ax] + 1.0f;  // an instance is its min corner; the cube is 1 wide
+      }
+    }
+    BodyDrawRange r;
+    r.first = sp.off;
+    r.count = cnt;
+    r.slot = slot;
+    for (int ax = 0; ax < 3; ax++) {
+      r.lo[ax] = sp.lo[ax];
+      r.hi[ax] = sp.hi[ax];
+    }
+    ranges_.push_back(r);
+    i = j;
+  }
+  return true;
+}
+
+void BodyInstanceArena::Commit(const std::vector<BodyVoxInst>& inst,
+                               const std::vector<uint64_t>& handles) {
+  commit_++;
+  bool ok = CommitPass(inst, handles, /*repacking=*/false);
+  if (ok) {
+    // Retire spans nobody has drawn for a while; their room becomes a hole.
+    uint64_t live = 0;
+    for (auto it = spans_.begin(); it != spans_.end();) {
+      if (commit_ - it->second.lastSeen > kKeepCommits) {
+        it = spans_.erase(it);
+      } else {
+        live += it->second.cap;
+        ++it;
+      }
+    }
+    // Holes past the live data (plus 1 MiB of headroom): repack.
+    ok = (uint64_t)end_ <= 2 * live + 65536;
+  }
+  if (!ok) {
+    spans_.clear();
+    dirty_.clear();
+    end_ = 0;
+    CommitPass(inst, handles, /*repacking=*/true);
+    dirty_.clear();
+    MarkDirty(0, end_);
+    repacks_++;
+  }
+  if (dropped_ != lastDropped_) {
+    // THE OVERFLOW USED TO BE SILENT: the list stopped at kMaxBodyVoxInstances
+    // and whichever bodies came last in the walk were simply not drawn.
+    if (dropped_)
+      std::fprintf(stderr,
+                   "*** body instances: %u cube instances NOT DRAWN — the "
+                   "buffer holds %u (kMaxBodyVoxInstances) and the bodies "
+                   "want more\n",
+                   dropped_, kMaxBodyVoxInstances);
+    lastDropped_ = dropped_;
+  }
+}
+
+void BodyInstanceArena::TakeUploads(std::vector<std::pair<uint32_t, uint32_t>>& out) {
+  out.clear();
+  if (dirty_.empty()) return;
+  std::sort(dirty_.begin(), dirty_.end());
+  // 64 instances (1 KiB) of unchanged data are cheaper to re-send than a
+  // second WriteBuffer.
+  constexpr uint32_t kGap = 64;
+  std::pair<uint32_t, uint32_t> cur = dirty_[0];
+  for (size_t k = 1; k < dirty_.size(); k++) {
+    if (dirty_[k].first <= cur.second + kGap) {
+      cur.second = std::max(cur.second, dirty_[k].second);
+    } else {
+      out.push_back(cur);
+      cur = dirty_[k];
+    }
+  }
+  out.push_back(cur);
+  dirty_.clear();
+}
+
+void CullBodyRanges(const std::vector<BodyDrawRange>& ranges,
+                    const std::vector<BodyXformGpu>& xforms, const Vec3& eye,
+                    const Vec3& fwd, const Vec3& right, const Vec3& up,
+                    float tanHalfFovY, float aspect,
+                    std::vector<std::pair<uint32_t, uint32_t>>& draws,
+                    uint32_t* instancesDrawn) {
+  draws.clear();
+  uint32_t drawn = 0;
+  const float ty = tanHalfFovY, tx = tanHalfFovY * aspect;
+  // A sphere clears a side plane |x| <= z*t when x - z*t <= r*sqrt(1+t^2).
+  const float kx = std::sqrt(1.0f + tx * tx), ky = std::sqrt(1.0f + ty * ty);
+  for (const BodyDrawRange& r : ranges) {
+    bool visible = true;
+    if (r.slot < xforms.size()) {
+      const BodyXformGpu& x = xforms[r.slot];
+      const Vec3 lc{0.5f * (r.lo[0] + r.hi[0]), 0.5f * (r.lo[1] + r.hi[1]),
+                    0.5f * (r.lo[2] + r.hi[2])};
+      const Vec3 he{0.5f * (r.hi[0] - r.lo[0]), 0.5f * (r.hi[1] - r.lo[1]),
+                    0.5f * (r.hi[2] - r.lo[2])};
+      // Same rotation debris.wgsl's quatRotate applies (q * v * q^-1).
+      const Vec3 u{x.quat[0], x.quat[1], x.quat[2]};
+      const Vec3 t = u.cross(lc) * 2.0f;
+      const Vec3 wc = Vec3{x.pos[0], x.pos[1], x.pos[2]} + lc + t * x.quat[3] +
+                      u.cross(t);
+      // +1 voxel of margin: TAA jitter, the render offset's sub-voxel slide,
+      // and the float error of a quaternion that is not quite unit.
+      const float rad = he.len() + 1.0f;
+      const Vec3 d = wc - eye;
+      const float z = d.dot(fwd), xr = d.dot(right), yu = d.dot(up);
+      if (z < -rad) visible = false;
+      else if (std::fabs(xr) - z * tx > rad * kx) visible = false;
+      else if (std::fabs(yu) - z * ty > rad * ky) visible = false;
+    }
+    if (!visible) continue;
+    drawn += r.count;
+    if (!draws.empty() && draws.back().first + draws.back().second == r.first)
+      draws.back().second += r.count;
+    else
+      draws.push_back({r.first, r.count});
+  }
+  if (instancesDrawn) *instancesDrawn = drawn;
 }
 
 uint32_t BodyRegistry::TotalSlots() const {

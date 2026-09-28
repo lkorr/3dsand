@@ -671,6 +671,17 @@ bool g_duelDummy = false;
 // render half of the handoff (BuildInstances, the drawBodies span, the
 // whole-frame time) only exists as a number HERE, under --frames.
 bool g_fellTree = false;
+// THE BODY RENDER HALF, as numbers (rigidbody perf package, 2026-09-28): the
+// CPU time spent building the cube-instance list, the bytes it sent, the micro
+// brick-pool bytes, and how many body draws were issued. Whole run; printed by
+// the --frames report as the "body-render" line. `frames` counts frames that
+// had any body slot at all, which is the divisor every mean below uses.
+struct BodyRenderStats {
+  uint64_t frames = 0, builds = 0, instBytes = 0, microPoolBytes = 0;
+  uint64_t cubeDraws = 0, cubeInstDrawn = 0, cubeInstLive = 0;
+  double buildUs = 0, buildMaxUs = 0, listUs = 0, commitUs = 0;
+};
+BodyRenderStats g_bodyStats;
 int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
 // An optional site ("x,z"): the game then STARTS 48 voxels west of it looking
 // +X, so the tree stands there. Default is 48 voxels ahead of wherever the
@@ -6584,6 +6595,9 @@ int main(int argc, char** argv) {
                       (float)g_fellSiteZ};
     cam.yaw = 0.0f;    // Forward() = +X: the tree is planted 48 voxels that way
     cam.pitch = 0.0f;
+    // SANDVOX_FELL_YAW=<radians>: look away from the tree by that much — the
+    // body-cull arm (the pieces half in view, or wholly behind the camera).
+    if (const char* e = std::getenv("SANDVOX_FELL_YAW")) cam.yaw = (float)std::atof(e);
     std::printf("--fell-tree: spawn moved to (%d, %d) so the tree stands at (%d, %d)\n",
                 px, g_fellSiteZ, g_fellSiteX, g_fellSiteZ);
   }
@@ -6972,6 +6986,20 @@ int main(int argc, char** argv) {
   double labWatchPoll = 0.0;
   uint32_t tick = 0;
   uint32_t bodyInstCount = 0;
+  // The cube-instance buffer as per-body spans (game/bodyreg.h
+  // BodyInstanceArena): only what changed is uploaded, and each body is
+  // frustum-culled on its own. `bodyDraws` is the main view's culled list.
+  BodyInstanceArena bodyArena;
+  // SANDVOX_BODY_INST_LEGACY=1: whole-list upload + one undivided draw, the
+  // one-binary A/B arm for the arena and the cull (phys/debris.cpp reads the
+  // same variable for its cull cache). The 18-vertex cube is NOT in the arm.
+  const bool bodyInstLegacy = [] {
+    const char* e = std::getenv("SANDVOX_BODY_INST_LEGACY");
+    return e && e[0] != '0';
+  }();
+  std::vector<BodyVoxInst> bodyInstScratch;
+  std::vector<uint64_t> bodyHandles;
+  std::vector<std::pair<uint32_t, uint32_t>> bodyUploads, bodyDraws;
   // Per-frame render scratch, hoisted so the steady state reuses capacity.
   std::vector<BodyXformGpu> bodyXf;
   std::vector<MicroBodyInstGpu> microInsts;
@@ -7547,6 +7575,58 @@ int main(int argc, char** argv) {
                     "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies %u\n",
                     win.size(), pct(0.5), pct(0.95), pct(0.99),
                     win.empty() ? 0.0 : win.back(), over33, debris.BodyCount());
+        std::fflush(stdout);
+      }
+      // SANDVOX_FELL_IGNITE=<ticks>: that long after the tree becomes a body,
+      // scatter fire (IfAir) through every body's world AABB so the pieces
+      // burn — the "any body's payload changes every tick" half of the
+      // rigidbody render cost (instance rebuild + upload per burning tick).
+      // Fixed lattice, so the seed set is the same every run.
+      static const int igniteAfter = [] {
+        const char* e = std::getenv("SANDVOX_FELL_IGNITE");
+        return e ? std::atoi(e) : 0;
+      }();
+      static bool ignited = false;
+      if (igniteAfter > 0 && !ignited && fellTreeTick != 0 &&
+          tick >= fellTreeTick + (uint32_t)igniteAfter) {
+        ignited = true;
+        uint32_t fire = matByName("fire");
+        size_t seeded = 0;
+        // Every 24th collider voxel's own cell (air in the grid: the body is
+        // not in it), so the fire sits against the wood it is meant to light.
+        // SANDVOX_FELL_IGNITE_ONE=1: light only the SMALLEST piece, so the
+        // other bodies stay unchanged while one flags every tick — the case
+        // per-body instance caching exists for.
+        uint32_t only = UINT32_MAX;
+        if (std::getenv("SANDVOX_FELL_IGNITE_ONE")) {
+          uint32_t best = UINT32_MAX;
+          for (uint32_t b = 0; b < debris.BodyCount(); b++)
+            if (debris.BodyVoxelCount(b) < best) {
+              best = debris.BodyVoxelCount(b);
+              only = b;
+            }
+        }
+        for (uint32_t b = 0; b < debris.BodyCount(); b++) {
+          if (only != UINT32_MAX && b != only) continue;
+          Vec3 w{};
+          for (uint32_t k = 0; only == UINT32_MAX && debris.BodyVoxelWorld(b, k, w); k += 24) {
+            const IVec3 cc{ifloor(w.x), ifloor(w.y), ifloor(w.z)};
+            if (!world.CellInWindow(cc)) continue;
+            if (cellOps.size() >= kMaxCellOpsPerTick) break;
+            cellOps.push_back({World::SlotCellIndex(cc), fire | kCellOpIfAir});
+            seeded++;
+          }
+          // ...and embers IN the lattice (the corpse-crossheat fixture's way
+          // of lighting a body), so it burns whether or not the world's fire
+          // reaches it before going out.
+          const uint64_t h = debris.BodyHandle(b);
+          const uint32_t ember = matByName("ember");
+          for (const char* fuel : {"leaves", "autumn_leaves", "birch_wood", "wood"})
+            if (const uint32_t fm = matByName(fuel); fm && ember)
+              seeded += debris.RewriteBodyMaterial(h, fm, ember, 64);
+        }
+        std::printf("--fell-tree: IGNITE at tick %u: %zu fire seeds over %u bodies\n",
+                    tick, seeded, debris.BodyCount());
         std::fflush(stdout);
       }
     };
@@ -15104,6 +15184,7 @@ int main(int argc, char** argv) {
       // pool every tick, and the whole pool is 4 MiB).
       if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
       BodyRegistry bodyReg(debris, mobs, &avatar, &mbSet);
+      const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
       // healthy, a named report the moment two entities point at one brick
       // record or a holder is left pointing at a freed one — the owner-visible
@@ -15112,14 +15193,39 @@ int main(int argc, char** argv) {
       // build/microbody_audit.log, because this fires while somebody is
       // playing and a windowed session's stderr goes nowhere.
       bodyReg.AuditMicroModels();
-      if (bodyReg.AnyInstancesDirty()) {
-        std::vector<BodyVoxInst> inst;
-        bodyReg.BuildInstances(inst);
-        bodyInstCount = (uint32_t)inst.size();
-        if (!inst.empty())
-          ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
-                                inst.size() * sizeof(BodyVoxInst));
-      }
+      // Build -> commit into the arena -> send only the changed ranges. Used
+      // by the main view and, twice more, by the inventory portrait.
+      auto commitBodyInstances = [&] {
+        const auto c0 = std::chrono::steady_clock::now();
+        bodyReg.BuildInstances(bodyInstScratch);
+        bodyReg.BuildHandles(bodyHandles);
+        const auto c1 = std::chrono::steady_clock::now();
+        g_bodyStats.listUs += std::chrono::duration<double, std::micro>(c1 - c0).count();
+        if (bodyInstLegacy) {
+          // The A/B arm: the whole list, every time (see BodyInstLegacyArm).
+          if (!bodyInstScratch.empty())
+            ctx.queue.WriteBuffer(world.bodyInstances, 0, bodyInstScratch.data(),
+                                  bodyInstScratch.size() * sizeof(BodyVoxInst));
+          g_bodyStats.instBytes += bodyInstScratch.size() * sizeof(BodyVoxInst);
+          bodyInstCount = (uint32_t)bodyInstScratch.size();
+          g_bodyStats.builds++;
+          return;
+        }
+        bodyArena.Commit(bodyInstScratch, bodyHandles);
+        bodyArena.TakeUploads(bodyUploads);
+        g_bodyStats.commitUs += std::chrono::duration<double, std::micro>(
+                                    std::chrono::steady_clock::now() - c1).count();
+        for (const auto& u : bodyUploads) {
+          ctx.queue.WriteBuffer(world.bodyInstances,
+                                (uint64_t)u.first * sizeof(BodyVoxInst),
+                                bodyArena.Data() + u.first,
+                                (size_t)(u.second - u.first) * sizeof(BodyVoxInst));
+          g_bodyStats.instBytes += (uint64_t)(u.second - u.first) * sizeof(BodyVoxInst);
+        }
+        bodyInstCount = (uint32_t)bodyInstScratch.size();
+        g_bodyStats.builds++;
+      };
+      if (bodyReg.AnyInstancesDirty()) commitBodyInstances();
       // Micro bodies (PLAN §C) share the slot space with the cube path: each
       // slot is claimed by exactly one of the two passes. Both scratch vectors
       // are hoisted out of the loop so a steady-state frame reuses their
@@ -15134,6 +15240,36 @@ int main(int argc, char** argv) {
       // Upload BEFORE the render pass opens (barrier graph §4.6): a buffer
       // write with the pass open is legal in WebGPU and illegal in Vulkan.
       uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+      // Per-body frustum cull, against the camera the main pass is drawn with
+      // (the jittered one: the +1 voxel margin in CullBodyRanges covers the
+      // jitter either way).
+      auto cullBodies = [&](const Vec3& e, const Camera& c, float asp,
+                            std::vector<std::pair<uint32_t, uint32_t>>& out) {
+        uint32_t n = 0;
+        if (bodyInstLegacy) {  // one undivided draw of the whole list
+          out.clear();
+          if (bodyInstCount) out.push_back({0u, bodyInstCount});
+          return bodyInstCount;
+        }
+        CullBodyRanges(bodyArena.Ranges(), bodyXf, e, c.Forward(), c.Right(),
+                       c.Up(), std::tan(CurrentTuning().camera.fovY * 0.5f),
+                       asp, out, &n);
+        return n;
+      };
+      const uint32_t bodyInstDrawn =
+          cullBodies(eye, jcam, (float)ctx.width / (float)ctx.height, bodyDraws);
+      if (bodyReg.TotalSlots() > 0) {
+        // Audit + instance build/upload + xforms + micro list: the whole
+        // per-frame CPU half of the body render, main view only.
+        const double us = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - bodyT0).count();
+        g_bodyStats.frames++;
+        g_bodyStats.buildUs += us;
+        g_bodyStats.buildMaxUs = std::max(g_bodyStats.buildMaxUs, us);
+        g_bodyStats.cubeInstLive += bodyInstCount;
+        g_bodyStats.cubeInstDrawn += bodyInstDrawn;
+        g_bodyStats.cubeDraws += 2 * bodyDraws.size();
+      }
 
       // ======================================================================
       // THE AVATAR PORTRAIT PASS — its own submit, before the frame's.
@@ -15194,12 +15330,19 @@ int main(int argc, char** argv) {
         ui.alchemy.texReady = true;
       }
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
-        avatar.SetHiddenParts({});               // the WHOLE body, always
-        std::vector<BodyVoxInst> pInst;
-        bodyReg.BuildInstances(pInst);
-        if (!pInst.empty())
-          ctx.queue.WriteBuffer(world.bodyInstances, 0, pInst.data(),
-                                pInst.size() * sizeof(BodyVoxInst));
+        // THE WHOLE BODY, ALWAYS — but only a mask that actually hides
+        // something needs swapping (third person hides nothing). The arena
+        // keeps a hidden part's span alive between toggles (kKeepCommits), so
+        // the swap re-sends at most the parts whose content moved, and the
+        // portrait draws only the bodies ITS camera sees (CullBodyRanges)
+        // instead of every body in the world. (Was: two full rebuilds and two
+        // whole-buffer uploads per frame while the screen was open.)
+        const bool maskSwap = std::any_of(hide.begin(), hide.end(),
+                                          [](uint8_t h) { return h != 0; });
+        if (maskSwap) {
+          avatar.SetHiddenParts({});
+          commitBodyInstances();
+        }
         // The TRANSFORMS need no re-upload FOR THE MASK: a hidden limb still
         // consumes its slot (game/mob.cpp's walk advances for every part with
         // a body, drawn or not), so the transform array is mask-independent by
@@ -15231,6 +15374,11 @@ int main(int argc, char** argv) {
         microInsts.clear();
         bodyReg.BuildMicroInsts(microInsts);
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+        // bodyXf carries the death pose here when there is one, so the cull
+        // tests the pose the portrait draws.
+        std::vector<std::pair<uint32_t, uint32_t>> pDraws;
+        const uint32_t pDrawn = cullBodies(portraitCam.eye, portraitCam.cam,
+                                           portraitCam.aspect, pDraws);
 
         // auxView: the portrait is drawn INSIDE the main view's frame, so it
         // must not touch the main view's cloud history or weather ease (see
@@ -15251,7 +15399,7 @@ int main(int argc, char** argv) {
         sim.DrawWorld(pRp);
         sim.DrawParticles(pRp);
         if (CurrentTuning().render.fluidSurface < 0.5f) sim.DrawFluid(pRp, fluidCount);
-        sim.DrawBodies(pRp, (uint32_t)pInst.size());
+        sim.DrawBodyRanges(pRp, pDraws);
         sim.DrawMicroBodies(pRp, pMicro);
         sim.DrawSprites(pRp, (uint32_t)sprv.size());
         pRp.End();
@@ -15270,7 +15418,7 @@ int main(int argc, char** argv) {
                                 frameCounter == kShotInvDeathTurnShot))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
                       "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)%s\n",
-                      pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
+                      (size_t)pDrawn, pMicro, portraitCam.eye.x, portraitCam.eye.y,
                       portraitCam.eye.z, portraitCam.target.x,
                       portraitCam.target.y, portraitCam.target.z,
                       posedDead ? "  [death pose]" : "");
@@ -15285,13 +15433,12 @@ int main(int argc, char** argv) {
           ctx.queue.WriteBuffer(world.bodyXforms, 0, bodyXf.data(),
                                 bodyXf.size() * sizeof(BodyXformGpu));
         }
-        avatar.SetHiddenParts(hide);
-        std::vector<BodyVoxInst> mInst;
-        bodyReg.BuildInstances(mInst);
-        bodyInstCount = (uint32_t)mInst.size();
-        if (!mInst.empty())
-          ctx.queue.WriteBuffer(world.bodyInstances, 0, mInst.data(),
-                                mInst.size() * sizeof(BodyVoxInst));
+        if (maskSwap) {
+          avatar.SetHiddenParts(hide);
+          commitBodyInstances();
+        }
+        // Re-cull the main view: the swap may have moved spans (a repack).
+        cullBodies(eye, jcam, (float)ctx.width / (float)ctx.height, bodyDraws);
         microInsts.clear();
         bodyReg.BuildMicroInsts(microInsts);
         microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
@@ -15395,7 +15542,7 @@ int main(int argc, char** argv) {
       }
       {
         const LiveSpan sp = spanBegin("rm_bodies");
-        sim.DrawBodies(rp, bodyInstCount);
+        sim.DrawBodyRanges(rp, bodyDraws);
         spanEnd(sp);
       }
       {
@@ -15534,7 +15681,7 @@ int main(int argc, char** argv) {
         rhi::RenderPass srp = sim.BeginRenderPass(
             senc, shotTex.CreateView(), ctx.surfaceFormat, W, H);
         sim.DrawWorld(srp);
-        sim.DrawBodies(srp, bodyInstCount);
+        sim.DrawBodyRanges(srp, bodyDraws);
         sim.DrawMicroBodies(srp, microCount);
         sim.DrawPourMarker(srp, pourMarkerAt);
         overlay.RenderRecorded(srp);
@@ -16221,6 +16368,22 @@ int main(int argc, char** argv) {
         }
         {
           const DebrisSystem::SettleProbe& sp = debris.Settle();
+          {
+            const BodyRenderStats& bs = g_bodyStats;
+            const double f = bs.frames ? (double)bs.frames : 1.0;
+            std::printf("--frames harness: body-render over %llu body frames: "
+                        "instance build %.1f us/frame (max %.1f), %llu rebuilds, "
+                        "cube upload %.1f KiB/frame, micro pool upload %.1f "
+                        "KiB/frame, cube draws %.2f/frame, cube instances "
+                        "%.0f live / %.0f drawn per frame\n",
+                        (unsigned long long)bs.frames, bs.buildUs / f, bs.buildMaxUs,
+                        (unsigned long long)bs.builds, bs.instBytes / f / 1024.0,
+                        (double)sim.MicroPoolBytesSent() / f / 1024.0,
+                        bs.cubeDraws / f, bs.cubeInstLive / f, bs.cubeInstDrawn / f);
+            std::printf("    body-render split: list build %.1f us/frame, arena "
+                        "commit %.1f us/frame, %u arena repacks\n",
+                        bs.listUs / f, bs.commitUs / f, bodyArena.Repacks());
+          }
           std::printf("    terrain patches: %u rebuilt, %u deferred by the per-tick "
                       "budget, %u refreshed with an identical occupancy box\n",
                       sp.terrainBuilds, sp.terrainDeferred, sp.terrainSame);
