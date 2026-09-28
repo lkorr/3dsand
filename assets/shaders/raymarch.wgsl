@@ -10320,6 +10320,128 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   return color;
 }
 
+// ============================================================================
+// FAR-FIELD SHADING TERMS THAT MUST MATCH THE NEAR FIELD AT THE SEAM
+// (the LOD-seam overhaul, package D — DESIGN.md §9 "far-field shading")
+// ============================================================================
+// The window edge is a plane the player walks up to at eye height, so every
+// term the near shade has and the cascade shade lacks draws that plane on the
+// screen. These three are the ones that are not geometry, shadow or plants,
+// each reduced to what the near field actually SHOWS at 20-26 m — which is a
+// lot less than it computes at 2 m — so the far arm can reproduce it with ALU
+// and no new data. All three run only on far hits, after traceFar has
+// returned, so nothing here is live across a march loop.
+
+// ---- far WATER: shadeWater's surface, without the bed ----
+// The cascade used to paint a lake flat colour0 + 35% airglow, lit like rock.
+// Near water at the seam is almost none of that: seen from eye height 25 m out
+// the view is ~4 degrees off grazing, where Schlick puts the reflection at
+// ~70% of the pixel, and the refracted remainder is a column so long (the ray
+// runs ~15x the depth before it meets the bed) that Beer-Lambert has taken the
+// bed away and left the body's in-scatter. So the far arm is exactly
+// shadeWater's up-facing, bed-less limit:
+//   * the SAME normal law — waveSlope's deep-water field with the SAME
+//     screen-footprint damping (waterRippleFootprint), so at the seam both
+//     sides carry the same surviving swell bands (the 2.6/1.7 m ones; chop
+//     is already averaged out there by the per-band Nyquist fade);
+//   * the SAME Fresnel (Schlick on WATER_F0 = 0.0204, render.waterFresnelPower,
+//     scaled by the liquid's optics.fresnel), against reflectionSky — the
+//     near field's fallback when its reflected ray finds nothing, which over an
+//     open lake is what it finds;
+//   * refracted = the body's in-scatter (trans -> 0 over the long column),
+//     through liquidClearBlend so a murky liquid keeps its own colour;
+//   * the sun glint with the near field's far lobe power.
+// What it does NOT reproduce: the bed of SHALLOW water (a shore reads as
+// deep), shoreline foam, the traced reflection of the far shore, caustics.
+// All four are near-shore, near-camera features; none survives 25 m of
+// grazing view as more than a few pixels.
+// A far water top face is a CASCADE CELL TOP (20 cm at level 1), not the
+// fullness plane, so the waterline can sit up to one fine voxel off the near
+// field's across the seam — a geometry matter, package A's surface map.
+// Returned UNFOGGED: the caller applies applyAerial like every far hit.
+fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f) -> vec3f {
+  let up = nFace.y > 0.5;
+  var n = nFace;
+  if (up) {
+    let s = waveSlope(vec2f(hitP.x, hitP.z) * VOXEL_METERS, R.time,
+                      waterRippleFootprint(hitP), WAVE_DEEP_H, vec2f(0.0));
+    n = normalize(vec3f(-s.x, 1.0, -s.y));
+  }
+  let v = -rd;
+  let cosI = clamp(dot(n, v), 0.0, 1.0);
+  let optics = liquidClearBlend(liquidOptics(m), WATER_ABSORB, WATER_SCATTER);
+  var fres = (WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER)) *
+             optics.fresnel;
+  if (!up) { fres *= 0.5; }   // shadeWater's side-wall rule
+  var color = mix(optics.scatter, reflectionSky(reflect(rd, n)), fres);
+  if (up) {
+    // shadeWater's glint at its far lobe (distM >= 40 m is past the seam's
+    // 25 m, but the mix is one clamp: keep the law, not a constant).
+    let distM = length(hitP - R.camPos) * VOXEL_METERS;
+    let power = mix(TUNE_GLINT_POWER_NEAR, TUNE_GLINT_POWER_FAR,
+                    clamp(distM / 40.0, 0.0, 1.0));
+    let spec = pow(max(dot(n, normalize(keyLightDir() + v)), 0.0), power);
+    let glintTint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
+    color += glintTint * min(spec, 1.0) * TUNE_GLINT_INTENSITY * (0.25 + fres);
+  }
+  return color;
+}
+
+// ---- far GI BOUNCE: the irradiance gather's answer on open terrain ----
+// The near shade adds albedo x ao x giBounceAt x giStrength (2.0); the cascade
+// had nothing, so every riser and overhang went darker by that much the moment
+// it crossed the window edge (measured on screenshot_ground: up to 95/255 on a
+// sunlit riser, 0 on an open tread). giGatherRays is a cosine-weighted
+// quadrature over nine rays — the normal owning 0.25, eight 45-degree ring
+// rays 0.09375 each — of the radiance LEAVING the first surface each ray
+// meets. On open terrain that has a closed form per face orientation:
+//   * a tread (n up):      every ray goes to sky              -> 0
+//   * a riser (n sideways): the three ring rays that lean down land on the
+//                           lit ground in front of it          -> 3 x 0.09375
+//   * an underside (n down): all nine land on ground           -> 1
+// and what the ground sends back is its own direct term, albedo x key light x
+// the wrapped Lambert of an up face (the resolve pass deposits direct light;
+// the ground's own bounce is ~0 by the tread rule). Using the receiver's
+// albedo for the ground's is the one approximation — a cascade cell's
+// neighbours are almost always its own material. Cloud shadow and a shadowed
+// foreground are not modelled: the near grid sees them, this does not.
+//
+// CALIBRATED, NOT DERIVED. The ideal 3 x 0.09375 over-predicts what the grid
+// actually delivers by 3x: measured on screenshot_ground (harness sand, noon,
+// giStrength 2 vs 0, tonemap inverted to linear), a near riser's bounce is
+// 0.107-0.129 of the adjacent tread's radiance, where the ideal weights give
+// 0.36 (sand albedo 0.76, sun ~85% of a tread). The two diagonal down-rays
+// land on the neighbouring cells' dim vertical faces as often as on the
+// tread, and the gather's distance falloff takes the rest. So the side
+// weight is ONE ring ray (0.09375 -> ratio 0.12), and the underside keeps the
+// same 1/3 of its ideal 1.0.
+const FAR_GI_SIDE_FRAC : f32 = 0.09375;
+const FAR_GI_UNDER_FRAC : f32 = 0.33;
+fn farGiBounce(albedo : vec3f, n : vec3f) -> vec3f {
+  let frac = select(select(FAR_GI_SIDE_FRAC, FAR_GI_UNDER_FRAC, n.y < -0.5),
+                    0.0, n.y > 0.5);
+  let ground = albedo * keyLightColor() *
+               wrapDiffuse(keyLightDir().y, TUNE_DIFFUSE_WRAP);
+  return albedo * ground * (frac * TUNE_GI_STRENGTH);
+}
+
+// ---- far WET GROUND: the near rain term, with openness replaced ----
+// The near shade darkens rain-soaked ground by R.wetness x expo x
+// mix(0.3, 1, n.y), expo = clamp(openness x 1.6 - 0.35) — and the cascade had
+// no term at all, which in rain drew a DRY ring round the player at the window
+// edge. The cascade has no openness grid (it is keyed on residency slots), so
+// expo is the value the near law gives the two cases that matter on open
+// terrain: an up face under open sky reads openness 1 -> expo 1, and a riser
+// sees about half the sky -> 0.5 x 1.6 - 0.35 = 0.45. A cell with something
+// directly on top of it (the far AO's "cell above occupied" test: canopy, an
+// overhang) is covered -> 0. Returns the wet coverage `wv`; the caller darkens
+// the albedo by TUNE_CLOUD_WET_DARKEN x wv and adds the near field's sheen at
+// wv x 0.55, exactly as the near shade does.
+fn farWetness(n : vec3f, covered : bool) -> f32 {
+  let expo = select(select(0.45, 1.0, n.y > 0.5), 0.0, covered);
+  return R.wetness * expo * mix(0.3, 1.0, clamp(n.y, 0.0, 1.0));
+}
+
 @fragment
 fn fs(in : VSOut) -> FSOut {
   // No per-pixel "dry" clear: a veil record is live only when its w6 names
@@ -10534,13 +10656,18 @@ fn fs(in : VSOut) -> FSOut {
       let hitP = R.camPos + rd * far.t;
       let fineV = vec3<i32>(floor(hitP - n * 0.5));
       var albedo = paletteJitter(m, synthJitterState(fineV, R.seed));
+      // Clear, non-viscous liquid seen through open air takes shadeFarWater
+      // (the near field's surface law) below and skips the lit-rock terms —
+      // including the shadow march, which a water pixel does not read. A
+      // ray that already crossed a NEAR liquid surface keeps the old paint:
+      // that far hit is the scene behind a shadeWater interface, not a surface.
+      let farWater = m.klass == CLASS_LIQUID && h.liqT <= 0.0 &&
+                     (m.flags & MATF_OPAQUE) == 0u && !isViscousLiquid(m);
       if (m.klass == CLASS_LIQUID) {
         albedo = unpackColor(m.color0);
-        // distant water: a touch of sky reflection on up-facing surfaces so
-        // lakes read as water instead of flat blue paint. Airglow only — a
-        // full skyColor() here reflects individual stars off LOD-scale water
-        // cells, which is both wrong (a star is far below a cascade cell's
-        // angular footprint) and reads as sparkling noise on every far lake.
+        // Airglow only on the remaining (viscous / seen-through-water) far
+        // liquid — a full skyColor() here reflects individual stars off
+        // LOD-scale cells; reflectionSky in shadeFarWater is body-free too.
         if (n.y > 0.5) { albedo = mix(albedo, skyAirglow(reflect(rd, n)), 0.35); }
       }
       // Match the near field's face weights exactly — a different constant
@@ -10561,7 +10688,8 @@ fn fs(in : VSOut) -> FSOut {
       albedo = bt.albedo;
       // Same wrapped diffuse as the near field — a different falloff here is a
       // visible brightness step at the window seam.
-      var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
+      var lambert = select(wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP),
+                           0.0, farWater);
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
         let hp = R.camPos + rd * (far.t - 1e-3) +
@@ -10614,14 +10742,35 @@ fn fs(in : VSOut) -> FSOut {
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
-      if (farInValid(up, farBox(far.level)) &&
-          farPalAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
+      let covered = farInValid(up, farBox(far.level)) &&
+                    farPalAt(far.level, up) != 0u;
+      if (covered) { ao *= TUNE_AO_FAR; }
       // Shading LOD: the crease AO of a staircase fades with its treads.
       ao = mix(ao, 1.0, lodShadeFade(far.t));
+      // WET GROUND (farWetness): the near field's rain darkening, so rain
+      // does not leave a dry ring at the window edge.
+      var wet = 0.0;
+      if (R.wetness > 0.001 && m.klass != CLASS_LIQUID) {
+        let wv = farWetness(n, covered);
+        albedo *= 1.0 - TUNE_CLOUD_WET_DARKEN * wv;
+        wet = wv * 0.55;
+      }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
       color = albedo * face * (ambientAt(n) * ao + fsun);
+      // The near field's one-bounce GI, in its open-terrain closed form
+      // (farGiBounce). Occluded by the same ao, as the near term is.
+      // TUNE_GI_STRENGTH = 0 folds it away with the near gather (`nogi`).
+      if (TUNE_GI_STRENGTH > 0.0) { color += ao * farGiBounce(albedo, n); }
+      // The near field's wet sheen (its `wet > 0` block), same lobe.
+      if (wet > 0.0) {
+        let hv = normalize(keyLightDir() - rd);
+        color += keyLightColor() *
+                 (pow(max(dot(n, hv), 0.0), TUNE_STAIN_SHEEN_POWER) *
+                  lambert * wet * TUNE_STAIN_SHEEN);
+      }
+      if (farWater) { color = shadeFarWater(hitP, rd, m, n); }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
       // moves any more. The plasma field crawls and pulses over its emission,
