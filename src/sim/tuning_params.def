@@ -1184,6 +1184,15 @@ TP_U(debug, vegetation, TUNE_VEGETATION, 1, TP_OPEN, TP_OPEN)
 // + a hand-written rule in LoadTuning
 TP_U(debug, groundCover, TUNE_GROUND_COVER, 1, TP_OPEN, TP_OPEN)
 
+// THE PERF EXPERIMENT SELECTOR. An integer a shader experiment may branch on
+// (`if (TUNE_PERF_EXP == 2) { ... }`, const-folded), driven by the
+// --render-budget arms exp1..exp3 so an experiment is measured against the
+// frame it changes IN ONE PROCESS — boot-to-boot noise on the dev machine is
+// +-0.8 ms, bigger than most levers. 0 is the shipped renderer; nothing may
+// ship reading a non-zero value. Only the shaders that name it pay the prelude
+// line (ReferencedTuningBlock), so adding one costs one shader's cache miss.
+TP_I(debug, perfExp, TUNE_PERF_EXP, 0, 0, 15)
+
 // ---- oil / petroleum-like viscous liquids (shadeViscous) ----
 // Oil and blood share the viscous SURFACE path but look nothing alike, and the
 // blood constants applied to oil rendered the pool as flat beige mud. These are

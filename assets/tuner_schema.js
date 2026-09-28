@@ -1402,6 +1402,9 @@ const TUNING_SCHEMA = [
       {k:'groundCover', n:'ground cover',
        d:'Whether worldgen places the SMALL plants \u2014 the ones a body walks through. Off leaves the trees and the cacti standing and removes the biome cover rows (tall grass, wildflowers, undergrowth, scrub, the alpine cushion), the tile plants (ferns, big toadstools), the shore rows, the pond life (reeds, lilypads, kelp), the wet moss skin and the cave flora. This is the half of \u201cvegetation\u201d you usually want: clearing the grass used to clear the wood with it, so there was no way to look at bare ground under a canopy. ANDed with vegetation, so that switch off is still the bare world however this one is set. In-game: press F7 (reload + regen) after flipping it. Moves the world hash while off.',
        bool:true, boolInt:true},
+      {k:'perfExp', n:'perf experiment', sec:{t:'profiling', d:'render experiments for --render-budget'},
+       d:'Selects a shader experiment for the --render-budget exp1..exp3 arms, so a render-side change is compared against the same frame in one process (boot-to-boot noise is larger than most single levers). 0 is the shipped renderer; nothing ships reading another value.',
+       step:1},
     ],
   },
 ];

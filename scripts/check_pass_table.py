@@ -135,6 +135,8 @@ PIPE_TO_MEMBER = {
     "PIPE_SHADOW_RESOLVE": "shadowResolve_",
     "PIPE_SKY_TOP_CLEAR": "skyTopClear_",
     "PIPE_SKY_TOP_REDUCE": "skyTopReduce_",
+    "PIPE_RAY_START_TRACE": "rayStartTrace_",
+    "PIPE_RAY_START_MIN": "rayStartMin_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
     "PIPE_FLUID_ALLOC": "fluidAlloc_",
@@ -211,6 +213,7 @@ BUF_TO_WGSL = {
     "ShadowCache": {"shadowCache"},
     "ShadowReq": {"shadowReq"},
     "ShadowHist": {"shadowHist"},
+    "RayStart": {"rayStart"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
     # The clouds (cloud.wgsl). CloudUBO is `C` there; the raymarcher and the

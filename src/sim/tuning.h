@@ -4695,6 +4695,9 @@ struct Tuning {
     // all off). The half of `vegetation` you usually want; ANDed with it, so
     // vegetation = 0 is still the bare world. See tuning_params.def.
     int groundCover = TPD(debug, groundCover);
+    // --render-budget's exp1..exp3 arms set this; shader experiments branch on
+    // TUNE_PERF_EXP. 0 = the shipped renderer (tuning_params.def says more).
+    int perfExp = TPD(debug, perfExp);
   } debug;
 
   // Values that failed validation, for the overlay / console. Empty on success.

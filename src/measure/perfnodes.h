@@ -294,7 +294,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     // counts over a 1-in-16 pixel sample), and --render-budget is the exact
     // per-feature millisecond answer when a knob is on trial.
     {"raymarch", "World raymarch", "renderPass", PerfSide::Gpu,
-     PerfScope::Count, "",
+     PerfScope::Count, "ray_start_trace;ray_start_min",
      "The fullscreen raymarch draw alone (no raster geometry, no overlay). "
      "Usually the largest single number on this page, and the one resolution "
      "scales. The `rm*` counters say which trace inside it took the steps."},

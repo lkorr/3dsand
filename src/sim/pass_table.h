@@ -197,6 +197,14 @@ enum class Buf : uint8_t {
   // it is on the table for the reason WorldMap is: a buffer the table does not
   // know about is the failure mode this file exists to make impossible.
   ShadowHist,
+  // The ray-start map (assets/shaders/ray_start.wgsl): per 2x2 pixel block,
+  // a distance along the primary ray before which nothing can be hit.
+  // WRITTEN by the two per-frame rows on the ShadowCache table and READ by
+  // raymarch.wgsl's fragment stage in the same command buffer -- the
+  // compute->fragment hop the table exists to synchronise. Render-private
+  // like ShadowCache: never hashed, never saved, sized on the render TARGET
+  // (Simulation::EnsureRayStart), not the world.
+  RayStart,
   ShadowArgsStage,
   ShadowArgs,
   // ---- the openness (sky-visibility) grid (world.h kOpenFaces) ----
@@ -370,6 +378,9 @@ enum class Pipe : uint8_t {
   // per-FRAME rows on the ShadowCache table. Before ShadowResolve for the copy
   // loop's bound.
   SkyTopClear, SkyTopReduce,
+  // The ray-start map (ray_start.wgsl), per-FRAME rows on the ShadowCache
+  // table, after the sky bound they read and before the resolve.
+  RayStartTrace, RayStartMin,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
@@ -528,6 +539,11 @@ enum class Cond : uint8_t {
   // gated by EncodeShadowResolve returning early; now that the table also
   // carries the clouds, the gate has to be a row condition.
   ShadowCacheOn,
+  // RayStart: the ray-start map's two rows (RecordCtx::rayStartGx > 0, i.e.
+  // a world pass has sized its buffer). Off = no row, and the raymarch's
+  // key check reads the stale key as "not this frame" and marches from
+  // the camera.
+  RayStart,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -608,6 +624,11 @@ enum class DispatchSel : uint32_t {
   // ---- the clouds: one 8x8 workgroup per tile of the low-res target ----
   CloudGx,
   CloudGy,
+  // ---- the ray-start map: one 8x8 workgroup per tile of the half-size
+  // sample grid of the LARGEST target sized so far (ray_start.wgsl bounds
+  // each thread against this frame's own size) ----
+  RayStartGx,
+  RayStartGy,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
 };
 
@@ -759,6 +780,9 @@ struct RecordCtx {
   uint32_t cloudFlags = 0;
   // Workgroups (8x8) over the low-res cloud target, from the frame's size.
   uint32_t cloudGx = 0, cloudGy = 0;
+  // Workgroups (8x8) over the ray-start map's sample grid; 0 = no buffer
+  // yet, and then neither ray-start row records (Cond::RayStart).
+  uint32_t rayStartGx = 0, rayStartGy = 0;
 };
 
 }  // namespace pass

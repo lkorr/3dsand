@@ -374,6 +374,7 @@ const TUNING_PARAMS = {
   'sim.currentDrag':{t:'f',def:6,min:0,max:30,wgsl:'TUNE_CURRENT_DRAG'},
   'debug.vegetation':{t:'u',def:1,wgsl:'TUNE_VEGETATION'},
   'debug.groundCover':{t:'u',def:1,wgsl:'TUNE_GROUND_COVER'},
+  'debug.perfExp':{t:'i',def:0,min:0,max:15,wgsl:'TUNE_PERF_EXP'},
   'render.oilSatLow':{t:'f',def:0.5,wgsl:'TUNE_OIL_SAT_LOW'},
   'render.oilSatHigh':{t:'f',def:0.78,wgsl:'TUNE_OIL_SAT_HIGH'},
   'render.oilF0':{t:'f',def:0.043,wgsl:'TUNE_OIL_F0'},

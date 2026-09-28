@@ -1199,6 +1199,21 @@ PASS(sky_top_clear, "skyTop", PT_SHADOWCACHE, PIPE_SKY_TOP_CLEAR, K_COMPUTE, 1,1
 PASS(sky_top_reduce, "skyTop", PT_SHADOWCACHE, PIPE_SKY_TOP_REDUCE, K_COMPUTE, kSkyTopGroups,1,1,
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
      USES(A(FarOcc) U(FarUBO)))
+// ---- THE RAY-START MAP (assets/shaders/ray_start.wgsl) ---------------------
+// One conservative first-hit ray per 2x2 pixel block (fine window, then the
+// cascade), then a 5x5 min filter; raymarch.wgsl's fs() starts its fine and
+// cascade marches at the result. AFTER the sky bound (the far half clips to
+// it: A(FarOcc) -> R(FarOcc) is that RAW), per FRAME because it is a
+// function of the camera. The fragment read is BeginRendering's flush, as
+// for ShadowCache. Fixed grid over the largest target sized so far; each
+// thread bounds itself against the frame's own size (RenderUBO).
+PASS(ray_start_trace, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_TRACE, K_COMPUTE, D_RSGX,D_RSGY,1,
+     GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
+     USES(R(Voxels) R(Occupancy) U(RenderUBO) R(PageTable) R(FarVox) R(FarOcc)
+          U(FarUBO) W(RayStart)))
+PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
+     GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
+     USES(U(RenderUBO) RW(RayStart)))
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
      GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))
