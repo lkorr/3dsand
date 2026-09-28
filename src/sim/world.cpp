@@ -406,6 +406,10 @@ void World::Init(const rhi::Device& device) {
                           U::Storage | U::CopyDst, "farPatch");
   farSig = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
                         "farSig");
+  // Zero-initialised = every entry INVALID (kFarMapValid clear), which is the
+  // safe state: the renderer refines nothing it was not told about.
+  farMap = CreateBuffer(device, kFarMapWords * 4, U::Storage | U::CopySrc,
+                        "farMap");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");

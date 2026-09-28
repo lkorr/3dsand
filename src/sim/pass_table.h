@@ -97,6 +97,7 @@ enum class Buf : uint8_t {
   FarUBO,
   FarPatch,   // cascade edit patches, read by farFill (world.h kFarPatch*)
   FarSig,     // per-slot far-matter signature, fardown's skip (world.h farSig)
+  FarMap,     // the far SURFACE MAP (world.h kFarMap*): farmap fills, farpatch/fardown invalidate
   // ---- the software page table (docs/PLAN_page_table.md §5.1) ----
   // PageTable is READ by every row whose entry point touches a voxel and
   // written by nothing on the tick path — it is dispatch-invariant
@@ -337,7 +338,9 @@ enum class Pipe : uint8_t {
   // `farpatch`). Two pipelines, two rows on PT_FARFILL, recorded back to back
   // — the pass table's edge between them is the storageBarrier that used to
   // sit inside the merged entry.
-  FarFill, FarPatchFill, FarDown,
+  // FarMapFill is the far SURFACE MAP's fill (worldgen.wgsl `farmap`), a third
+  // row between the two: after the sweep, before the patch that invalidates it.
+  FarFill, FarMapFill, FarPatchFill, FarDown,
   // The openness grid (sim_openness.wgsl). Two entry points: the dirty walk
   // (indirect on the compacted dirty list, exactly like occupancyDirty) and the
   // rolling refresh. BEFORE ShadowPrepare so the pipeline-copy loop's bound in

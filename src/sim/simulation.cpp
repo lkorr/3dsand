@@ -646,6 +646,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(28, T::ReadOnlyStorage, S::Fragment),               // solTable
         entry(29, T::ReadOnlyStorage, S::Fragment),               // solPool
         entry(30, T::ReadOnlyStorage, S::Fragment),               // solSpec
+        // THE FAR SURFACE MAP (world.h kFarMap*, LOD-seam package A): the
+        // per-level sub-column heights + skin traceFar refines a surface cell
+        // against. Same standing and arrow as farVox at 4: written by the
+        // PT_FARFILL / PT_TICK far rows, read in the FRAGMENT stage, covered by
+        // the global barrier every command buffer opens with.
+        entry(31, T::ReadOnlyStorage, S::Fragment),               // farMap
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -710,6 +716,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(4, T::ReadOnlyStorage),  // dirtyList (phase-2 downsample work set)
         entry(5, T::ReadOnlyStorage),  // farPatch (cascade edit persistence)
         entry(6, T::Storage),          // farSig (fardown's unchanged-chunk skip)
+        entry(7, T::Storage),          // farMap (the surface map: farmap / farpatch / fardown)
     };
     farBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -863,12 +870,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(15, T::Storage),         // cloudMaps
         entry(16, T::Storage),         // cloudRaw
         entry(17, T::Storage),         // cloudHist
-        // THE SKY BOUND (shadow_resolve.wgsl skyTopClear/skyTopReduce): the
-        // far cascade's occupancy words, reduced once per frame into one
-        // "highest occupied cell" word per level at the buffer's tail, plus
-        // the level origins that turn a slot row into an absolute height.
-        entry(18, T::Storage),         // farOcc
-        entry(19, T::Uniform),         // FarParams
+        // The far cascade, read by the resolve so a patch's shadow ray that
+        // leaves the window unblocked continues into it (shadow_resolve.wgsl,
+        // CASTERS OUTSIDE THE WINDOW). The clouds do not use them. farOcc is
+        // plain Storage: sky_top.wgsl's reduce writes the sky-bound tail.
+        entry(18, T::ReadOnlyStorage), // farVox
+        entry(19, T::Storage),         // farOcc (read_write in sky_top.wgsl)
+        entry(20, T::Uniform),         // farUBO
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -951,6 +959,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(4, world_->dirtyList),
         b(5, world_->farPatch),
         b(6, world_->farSig),
+        b(7, world_->farMap),
     };
     farBG_ = device.CreateBindGroup(farBGL_, entries, std::size(entries), "farBG");
   }
@@ -1722,6 +1731,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The clouds (cloud.wgsl): six render-path entry points on shadowPL_, loaded
   // here for mShadow's reason — F5 recompiles everything through this function.
   rhi::ShaderModule mCloud;
+  // The far cascade's sky bound (sky_top.wgsl): two per-frame entries on
+  // shadowPL_, its own module because it writes the farOcc shadow_resolve reads.
+  rhi::ShaderModule mSkyTop;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
@@ -1746,6 +1758,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mOpenness, "sim_openness.wgsl");
     mod(&mGlow, "sim_glow.wgsl");
     mod(&mShadow, "shadow_resolve.wgsl");
+    mod(&mSkyTop, "sky_top.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
@@ -1767,7 +1780,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
-      !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
+      !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -1814,8 +1827,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // enable path is ONE test in one place rather than a load-time fork.
   pool.Add([&] { shadowPrepare_ = MakeComputePipeline(device, shadowPL_, mShadow, "prepare", "shadowPrepare"); });
   pool.Add([&] { shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve"); });
-  pool.Add([&] { skyTopClear_ = MakeComputePipeline(device, shadowPL_, mShadow, "skyTopClear", "skyTopClear"); });
-  pool.Add([&] { skyTopReduce_ = MakeComputePipeline(device, shadowPL_, mShadow, "skyTopReduce", "skyTopReduce"); });
+  pool.Add([&] { skyTopClear_ = MakeComputePipeline(device, shadowPL_, mSkyTop, "skyTopClear", "skyTopClear"); });
+  pool.Add([&] { skyTopReduce_ = MakeComputePipeline(device, shadowPL_, mSkyTop, "skyTopReduce", "skyTopReduce"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
     pool.Add([&] { cloudWeather_ = MakeComputePipeline(device, shadowPL_, mCloud, "weather", "cloudWeather"); });
@@ -1957,6 +1970,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // WaitForFarPipelines at the top of this function joined its thread, so
   // nothing is compiling from the module these handles came from.
   farFill_ = {};
+  farMapFill_ = {};
   farPatchFill_ = {};
   farDown_ = {};
   farPublished_ = false;
@@ -2050,7 +2064,13 @@ void Simulation::StartFarBuild(unsigned threads) {
       r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
                                     "farPatchFill");
     });
+    // The surface map's fill (LOD-seam package A): its own genColumn + skin
+    // copies, so its own thread for the same max()-not-sum reason.
+    std::thread map([&] {
+      r.map = MakeComputePipeline(dev, layout, module, "farmap", "farMapFill");
+    });
     r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    map.join();
     patch.join();
     down.join();
     // SANDVOX_FAR_DELAY_S: hold the horizon back by N seconds. The cascades'
@@ -2089,6 +2109,7 @@ void Simulation::StartFarBuild(unsigned threads) {
   if (threads <= 1) {
     FarPipelines r = build();
     farFill_ = std::move(r.fill);
+    farMapFill_ = std::move(r.map);
     farPatchFill_ = std::move(r.patch);
     farDown_ = std::move(r.down);
     farPublished_ = true;
@@ -2101,16 +2122,17 @@ void Simulation::StartFarBuild(unsigned threads) {
 void Simulation::PublishFarPipelines() {
   FarPipelines r = farFuture_.get();  // blocks if the thread is still running
   farFill_ = std::move(r.fill);
+  farMapFill_ = std::move(r.map);
   farPatchFill_ = std::move(r.patch);
   farDown_ = std::move(r.down);
   farPublished_ = true;
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
-  if (!farFill_ || !farPatchFill_ || !farDown_)
+  if (!farFill_ || !farMapFill_ || !farPatchFill_ || !farDown_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
-                 "stay empty (worldgen.wgsl far/farpatch/fardown)\n");
+                 "stay empty (worldgen.wgsl far/farmap/farpatch/fardown)\n");
 }
 
 bool Simulation::PollFarPipelines() {
@@ -2127,7 +2149,7 @@ void Simulation::WaitForFarPipelines() {
   // for up to twelve minutes with no output.
   if (farFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
     std::printf("waiting for the deferred far-cascade pipelines "
-                "(worldgen.wgsl far/farpatch/fardown)...\n");
+                "(worldgen.wgsl far/farmap/farpatch/fardown)...\n");
   std::fflush(stdout);
   PublishFarPipelines();
 }
@@ -2229,6 +2251,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FarUBO:         return world_->farUBO;
     case B::FarPatch:       return world_->farPatch;
     case B::FarSig:         return world_->farSig;
+    case B::FarMap:         return world_->farMap;
     case B::PageTable:      return world_->pageTable;
     case B::PageFaults:     return world_->pageFaults;
     case B::FluidParticlesRead:  return world_->fluidParticles[page_];
@@ -2326,6 +2349,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::PResolve:       return pResolve_;
     case P::FarFill:        return farFill_;
     case P::FarPatchFill:   return farPatchFill_;
+    case P::FarMapFill:     return farMapFill_;
     case P::FarDown:        return farDown_;
     case P::OpennessDirty:   return opennessDirty_;
     case P::OpennessRefresh: return opennessRefresh_;
@@ -2542,7 +2566,9 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   // Both halves or neither: the sweep alone would write PRISTINE procgen over
   // cells the player has edited, which is a wrong horizon rather than a
   // missing one (the patch entry is what puts the edits back).
-  if (!farFill_ || !farPatchFill_) return;
+  // The map fill joins them: without it an X/Z plane would leave the surface
+  // map holding the OUTGOING face's columns under the incoming one's cells.
+  if (!farFill_ || !farMapFill_ || !farPatchFill_) return;
   RecordCtx cx{};
   cx.farCount = count;
   RecordTable(enc, pass::Table::FarFill, &cx);
@@ -3119,6 +3145,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(28, world_->solTable),
         b(29, world_->solPool),
         b(30, solSpecBuf_),
+        b(31, world_->farMap),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3177,8 +3204,9 @@ void Simulation::BuildShadowBindGroup() {
       b(15, cloudMapsBuf_),
       b(16, cloudRawBuf_),
       b(17, cloudHistBuf_),
-      b(18, world_->farOcc),
-      b(19, world_->farUBO),
+      b(18, world_->farVox),
+      b(19, world_->farOcc),
+      b(20, world_->farUBO),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

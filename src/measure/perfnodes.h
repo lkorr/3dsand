@@ -228,7 +228,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "EVERY tick over the window; GPU is the fills a sentinel chunk needs. Page "
      "FAULTS are a bug, not a cost — the page shows them as a red counter."},
     {"farField", "Far-Field Cascades", "worldStorage", PerfSide::Gpu,
-     PerfScope::Count, "farDown;farDownHash;farFill;farPatchFill",
+     PerfScope::Count, "farDown;farDownHash;farFill;farMapFill;farPatchFill",
      "Downsample into the cascade pyramid. Flat per tick; the render-side cost "
      "of reading it is in raymarch."},
 
@@ -237,7 +237,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "", "CPU here is draw-call encode and instance uploads only. The GPU cost "
      "of the frame is the raymarch row."},
     {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
-     PerfScope::Count, "shadow_prepare;shadow_resolve",
+     PerfScope::Count, "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce",
      "One media-blind shadow ray per visible surface PATCH, instead of one per "
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "

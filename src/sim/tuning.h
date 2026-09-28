@@ -4201,26 +4201,32 @@ struct Tuning {
     float gamma = TPD(render, gamma);
 
     // static micro-detail (traceMicro in raymarch.wgsl)
-    // Distance in METRES past which a micro cell is drawn as a plain voxel
-    // instead of running its nested DDA. At 0.0625 m voxels a cell subtends
-    // one pixel at ~110 m for a 1080p 90-degree view, so anything past that is
-    // paying a 3*subdiv-step march to decide the colour of a sub-pixel — the
-    // LOD is not an approximation there, it is the same answer for less.
+    // Distance in METRES past which a PARTIAL POWDER cell stops being drawn as
+    // its grain arrangement (tracePowder) and becomes a whole cube or air by
+    // mass. It USED to be the micro-brick LOD too (a plain voxel past it);
+    // since 2026-09-28 micro bricks and plants instead fade out entirely
+    // before the far handoff — see plantLodDist below and NEAR-DETAIL FADE in
+    // raymarch.wgsl — so this no longer affects them.
     float microLodDist = TPD(render, microLodDist);
-    // The same cut for COLUMN plants (grass, flowers, small mushrooms —
-    // tracePlant, not the brick DDA), and the reason it is a separate knob:
-    // an analytic tuft costs a wind sample, a trample lookup and six to eight
-    // blade intersections per cell the ray crosses, up to microMaxPerRay cells
-    // per ray, and a blade is sub-pixel long before a cell is. Measured
-    // 2026-09-04: a meadow at 40 m fell from ~50 to ~15 fps against ~50 in
-    // snow. Tile plants (ferns, big toadstools) are 30-50 cm and keep
-    // microLodDist. Effective distance is min(microLodDist, plantLodDist).
+    // Where the NEAR-DETAIL FADE begins (metres of camera distance), for
+    // every micro model — plants, tile plants, bricks. Past it each model
+    // thins out (a world-keyed hash places its vanish distance in the band)
+    // and column plants shrink into the ground, reaching zero density at
+    // DETAIL_FADE_END_M = min(lodHandoffDist, nearest window face) - 0.5 m,
+    // so nothing near-only is left when the far cascade takes over. Clamped
+    // in the shader to at most END - 1 m. Until 2026-09-28 this was the
+    // distance past which a column plant became a SOLID PROXY CUBE (the
+    // measured reason: an analytic tuft is a wind sample plus 6-8 blade
+    // tests per cell, and a 40 m meadow fell from ~50 to ~15 fps); the cubes
+    // are gone — the fade bounds the band's cost instead.
     float plantLodDist = TPD(render, plantLodDist);
     // Cap on nested micro marches per primary ray. A ray grazing a meadow can
     // cross dozens of grass cells, and each one that MISSES keeps the ray
     // alive, so without a cap one pixel can pay for the whole field. Past the
     // cap a micro cell is treated as SOLID (not as air), because terminating
-    // the ray is bounded and correct-ish while letting it fly is neither.
+    // the ray is bounded and correct-ish while letting it fly is neither —
+    // nearer than plantLodDist; inside the fade band it is air (a solid cube
+    // there would bring back the proxy pillars the fade replaced).
     int microMaxPerRay = TPD(render, microMaxPerRay);
     // Wind bend at a swaying plant's TIP, in sub-voxels (subdiv 8 => 1.25 cm
     // each). Clamped to 2.0: the models keep a 2-sub-voxel margin from their
@@ -4327,6 +4333,18 @@ struct Tuning {
     // the frame. Raise it to 2 to see the trade; it is one tuning edit and no
     // rebuild.
     int farBlockerHitLevel = TPD(render, farBlockerHitLevel);
+
+    // ---- the far SURFACE MAP refine (LOD-seam package A, DESIGN.md §9) ----
+    // Highest cascade level whose SURFACE cells are refined against the far
+    // surface map (world.h kFarMap*): a per-level 2D heightfield at twice the
+    // level's XZ resolution — level 1's is the fine 10 cm column grid — holding
+    // each column's true top and skin. A cell the map vouches for (pristine
+    // heightfield, not edited) is intersected against its 2x2 sub-columns
+    // instead of being drawn as one centre-sampled cube, so level 1 draws the
+    // near field's own columns and every coarser level gains 2x surface
+    // detail. Trees, rocks, ruins and edits keep the 3D cells. 0 turns it off
+    // everywhere (the A/B), which is what `--budget-arms norefine` does.
+    int farRefineLevel = TPD(render, farRefineLevel);
 
     // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
     // Distance in METERS past which the PRIMARY march stops resolving fine
@@ -4462,7 +4480,8 @@ struct Tuning {
     float cloudCirrusScaleM = TPD(render, cloudCirrusScaleM);
     // How much the clouds in a direction colour the distance fog and reflections in it (the env map).
     float cloudFogMix = TPD(render, cloudFogMix);
-    // shipped: 26 = past the 25.6 m window face, i.e. OFF (tuning.json)
+    // shipped: 20.5 m (tuning.json) = ON, a camera sphere inside the nearest
+    // window face (22.4 m); >= 25.6 disables it (the window box is the handoff).
     float lodHandoffDist = TPD(render, lodHandoffDist);
     // ---- frame pacing and internal resolution (CPU-only: NO_WGSL rows, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------

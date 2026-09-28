@@ -94,6 +94,180 @@
 // read-modify-written below. Bound here and NOWHERE else: the fragment shader
 // reads the published byte out of shadowCache and never this.
 @group(0) @binding(11) var<storage, read_write> shadowHist : array<u32>;
+// (12..17 are the clouds', cloud.wgsl — same layout, different kernel.)
+// The far cascade, read-only, for CASTERS OUTSIDE THE WINDOW (below).
+@group(0) @binding(18) var<storage, read> farVox : array<u32>;
+@group(0) @binding(19) var<storage, read> farOcc : array<u32>;
+@group(0) @binding(20) var<uniform> F : FarParams;
+
+// ===================== CASTERS OUTSIDE THE WINDOW ===========================
+//
+// WHAT THIS FIXES (LOD-seam package C, 2026-09-28). traceOpaque clips to the
+// residency window, so a patch's ray that leaves the window unblocked read as
+// SUN — and every caster outside the window (the tree two metres past the
+// face, the ridge the low sun sits behind) shadowed nothing inside it. On the
+// sun-facing side the ground along the face was lit where the far field one
+// cell further out was in shadow, and a long evening tree shadow stopped dead
+// at the face. Both are the seam the eye picks out while walking, because the
+// face is fixed in the world and jumps a chunk at a time.
+//
+// So the ray does not stop at the face: it continues through the far cascade
+// from the exit point, with the SAME cone schedule and the SAME reach the far
+// field's own shadow uses (raymarch.wgsl farShadowMarch, whose header has the
+// why). Both the schedule and the reach are measured from the patch, so a
+// patch one voxel inside the face and a far cell one cell outside it see the
+// same casters out to the same distance. It runs per jittered sample, so the
+// 16-frame window below turns a far caster's edge into the same penumbra a
+// near one gets.
+//
+// THIS IS A SECOND COPY OF A DDA, which this file's own header calls the
+// classic silent bug. It is one because the far march lives in raymarch.wgsl
+// against bindings common.wgsl cannot name, and moving it into common.wgsl
+// costs every shader in the engine a recompile (CLAUDE.md). What holds it
+// honest: raymarch.wgsl's cache-off sunShadowAt runs the continuation through
+// farShadowMarch itself, and --gate shadow-cache compares that frame against
+// this pass's. The copy below drops only the penumbra estimate (the cone
+// jitter does that job here) and the render-stats counters.
+//
+// COST lands only on rays that actually leave the window within
+// TUNE_FAR_SHADOW_REACH of their patch: a ray that exits through the top of
+// the window 25 m up is past the reach before it starts and pays one compare.
+const FAR_SHADOW_SEG_CELLS : f32 = 32.0;    // raymarch.wgsl, same name
+const FAR_SHADOW_STEP_CAP : i32 = 160;      // raymarch.wgsl, same name
+const FAR_FACE_BITS : u32 = 5u;             // world.h kFarFaceBits (check_invariants.py)
+const FAR_FACE_MASK : u32 = 31u;            // world.h kFarFaceMax
+const FAR_FACE_ALL  : u32 = 1u << 30u;      // world.h kFarFaceAllPending
+struct FarBox { lo : vec3<i32>, hi : vec3<i32> };
+// raymarch.wgsl farBox, verbatim: the VALID box of a level (the pending faces
+// the sieve has not refilled yet are cut off).
+fn farBox(level : u32) -> FarBox {
+  let o = F.origins[level - 1u];
+  let w = u32(o.w);
+  var b : FarBox;
+  b.lo = o.xyz * i32(CHUNK);
+  if ((w & FAR_FACE_ALL) != 0u) { b.hi = b.lo; return b; }
+  let lo = vec3<i32>(i32((w >> (0u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (2u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (4u * FAR_FACE_BITS)) & FAR_FACE_MASK));
+  let hi = vec3<i32>(i32((w >> (1u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (3u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (5u * FAR_FACE_BITS)) & FAR_FACE_MASK));
+  b.lo = (o.xyz + lo) * i32(CHUNK);
+  b.hi = (o.xyz + vec3<i32>(i32(FAR_NCHUNK)) - hi) * i32(CHUNK);
+  return b;
+}
+fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
+  return all(c >= b.lo) && all(c < b.hi);
+}
+// raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag.
+fn farShadowBlocked(level : u32, c : vec3<i32>) -> bool {
+  let bi = farVoxByteIndex(level, c);
+  return ((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & FAR_PAL_MASK) != 0u;
+}
+// raymarch.wgsl shadowWindowExitT.
+fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {
+  let inv = 1.0 / rd;
+  let lo = vec3f(R.origin * i32(CHUNK));
+  let t0 = (lo - ro) * inv;
+  let t1 = (lo + vec3f(f32(WORLD_N)) - ro) * inv;
+  let tmax = max(t0, t1);
+  return max(min(tmax.x, min(tmax.y, tmax.z)), 0.0);
+}
+// raymarch.wgsl farShadowMarch minus the penumbra estimate: the blocker
+// distance in FINE voxels from `roFine`, or -1.
+fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f32 {
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let stepv = vec3<i32>(sign(rd));
+  let tDelta = abs(inv);
+  let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
+  var tF = tStartFine;
+  var budget = FAR_SHADOW_STEP_CAP;
+  for (var level = level0; level <= FAR_LEVELS; level++) {
+    if (tF >= reachF || budget <= 0) { break; }
+    let s = f32(1u << farCellShift(level));
+    let tEndF = select(min(reachF, FAR_SHADOW_SEG_CELLS * s), reachF,
+                       level == FAR_LEVELS);
+    if (tEndF <= tF) { continue; }
+    let roL = roFine / s;
+    let box = farBox(level);
+    let tt0 = (vec3f(box.lo) - roL) * inv;
+    let tt1 = (vec3f(box.hi) - roL) * inv;
+    let tExit = min(min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z))),
+                    tEndF / s);
+    var tCur = tF / s;
+    var cc = worldChunkOf(vec3<i32>(floor(roL + rd * tCur)));
+    var cNext : vec3f;
+    for (var a = 0; a < 3; a++) {
+      let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
+      cNext[a] = (b - roL[a]) * inv[a];
+    }
+    while (budget > 0) {
+      budget -= 1;
+      if (!farInValid(cc * i32(CHUNK), box)) { break; }
+      if (tCur >= tExit) { break; }
+      let tOut = min(cNext.x, min(cNext.y, cNext.z));
+      let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
+      if (occ != 0u) {
+        var tIn = tCur;
+        var walk = true;
+        let top = farOccTop(occ);
+        if (top != 0u) {
+          let yTop = cc.y * i32(CHUNK) + i32(top);
+          let yEnter = roL.y + rd.y * (tIn + 1e-4);
+          if (yEnter >= f32(yTop)) {
+            if (rd.y >= 0.0) {
+              walk = false;
+            } else {
+              let tPlane = max((f32(yTop) - roL.y) * inv.y, tIn);
+              if (tPlane + 1e-4 >= tOut) { walk = false; }
+              else { tIn = tPlane + 1e-4; }
+            }
+          }
+        }
+        if (walk) {
+          let cLo = cc * i32(CHUNK);
+          var vCur = tIn;
+          var vc = clamp(vec3<i32>(floor(roL + rd * (tIn + 1e-4))),
+                         cLo, cLo + vec3<i32>(i32(CHUNK) - 1));
+          var vMax : vec3f;
+          for (var a = 0; a < 3; a++) {
+            let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
+            vMax[a] = (boundary - roL[a]) * inv[a];
+          }
+          for (var j = 0; j < 3 * i32(CHUNK); j++) {
+            if (budget <= 0) { break; }
+            budget -= 1;
+            if (farShadowBlocked(level, vc)) { return vCur * s; }
+            if (vMax.x < vMax.y && vMax.x < vMax.z) {
+              vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x;
+            } else if (vMax.y < vMax.z) {
+              vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y;
+            } else {
+              vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
+            }
+            if (vCur >= tOut || vCur >= tExit) { break; }
+          }
+        }
+      }
+      if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
+        tCur = cNext.x; cc.x += stepv.x;
+        cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
+      } else if (cNext.y <= cNext.z) {
+        tCur = cNext.y; cc.y += stepv.y;
+        cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
+      } else {
+        tCur = cNext.z; cc.z += stepv.z;
+        cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
+      }
+    }
+    tF = max(tF, min(tCur, tExit) * s);
+  }
+  return -1.0;
+}
 
 // ======================= THE SUN IS NOT A POINT ============================
 //
@@ -321,8 +495,8 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // function in common.wgsl and not a knob read twice. The two pointers are
   // how a function in common.wgsl reaches bindings declared after it (see
   // traceOpaque).
-  let s = traceOpaque(hp + n3 * TUNE_SHADOW_BIAS, dir,
-                      TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+  let ro = hp + n3 * TUNE_SHADOW_BIAS;
+  let s = traceOpaque(ro, dir, TUNE_SHADOW_STEPS, shadowCoarseFromT(),
                       &occupancy, &materials);
   // A BURIED PATCH HAS NO OPINION. The ray starts TUNE_SHADOW_BIAS off the
   // face; a hit within a twentieth of a voxel of that means the cell in front
@@ -352,7 +526,21 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // nothing inside a cave and into the usual soft lift outdoors. Same rule in
   // sunShadowAt (raymarch.wgsl); the gate compares them.
   let ranOut = !s.hit && s.steps > u32(TUNE_SHADOW_STEPS);
-  let sunSeen = !s.hit && !ranOut;
+  // ---- past the window face (CASTERS OUTSIDE THE WINDOW, above) ----
+  // The near ray left the window clear; the cascade decides the rest. `bHit`
+  // and `bT` are the verdict and blocker distance everything below reads —
+  // the buried test above stays on the near ray alone, since a far blocker is
+  // by construction never within a twentieth of a voxel of the patch.
+  var bHit = s.hit;
+  var bT = s.t;
+  if (!s.hit && !ranOut) {
+    let tw = shadowWindowExitT(ro, dir);
+    if (tw < TUNE_FAR_SHADOW_REACH / VOXEL_METERS) {
+      let ft = farShadowT(1u, ro, dir, tw);
+      if (ft >= 0.0) { bHit = true; bT = ft; }
+    }
+  }
+  let sunSeen = !bHit && !ranOut;
   let bit = 1u << slotIdx;
   hist = select(hist & ~bit, hist | bit, sunSeen);
   if (fill < SHADOW_SAMPLES) { fill = fill + 1u; }
@@ -364,8 +552,8 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   var liftB = (hist >> SHADOW_LIFT_SHIFT) & 0xFFu;
   if (centre) {
     var lv = 0.0;
-    if (s.hit) {
-      let dM = s.t * VOXEL_METERS;
+    if (bHit) {
+      let dM = bT * VOXEL_METERS;
       lv = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
                  TUNE_SHADOW_LIFT, 0.0, 1.0);
     } else if (ranOut) {
@@ -474,64 +662,4 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   atomicStore(&shadowCache[bucket * 2u + 1u],
               shadowPackState(u32(valU), R.frameIdx & 15u,
                               shadowStateRequested(old), !buried, ver));
-}
-
-// ============================ THE SKY BOUND =================================
-// (2026-09-28, raymarch perf.) One word per far level at farOcc's tail: the
-// highest occupied LEVEL CELL in that level's whole box, biased so that 0 means
-// "the level holds nothing". raymarch.wgsl's traceFar and farShadowDist clip
-// every ray to the slab below it: a sky ray used to enter all FAR_LEVELS
-// shells and chunk-walk each one (8..16 chunk probes a shell) to learn there
-// was nothing up there — measured as the largest single piece of the far
-// march on every camera with sky in it.
-//
-// CONSERVATIVE BY CONSTRUCTION. It is a max over EVERY slot, including slots a
-// pending face still holds stale bytes in (farBox excludes those from the
-// march, but they are counted here under their new absolute row), and the
-// per-chunk top row it reads is itself conservative-high (farOccTop's note).
-// Extra slots can only raise a max, so the bound is never below a cell the
-// march could hit. Recomputed from scratch every frame, so it also comes back
-// DOWN when the terrain that raised it streams out.
-//
-// Render-only derived data; the sim never reads farOcc.
-@group(0) @binding(18) var<storage, read_write> farOcc : array<atomic<u32>>;
-@group(0) @binding(19) var<uniform> F : FarParams;
-
-const SKY_TOP_BASE : u32 = FAR_LEVELS * FAR_NUM_CHUNKS;   // raymarch.wgsl agrees
-const SKY_TOP_BIAS : i32 = 1 << 24;                       // raymarch.wgsl agrees
-
-@compute @workgroup_size(16)
-fn skyTopClear(@builtin(local_invocation_index) li : u32) {
-  atomicStore(&farOcc[SKY_TOP_BASE + li], 0u);
-}
-
-var<workgroup> skyWgMax : atomic<u32>;
-
-@compute @workgroup_size(64)
-fn skyTopReduce(@builtin(local_invocation_index) li : u32,
-                @builtin(workgroup_id) wg : vec3<u32>) {
-  if (li == 0u) { atomicStore(&skyWgMax, 0u); }
-  workgroupBarrier();
-  // FAR_NUM_CHUNKS is a multiple of 64 (pass_table.cpp asserts it), so a
-  // workgroup's 64 words all belong to one level.
-  let idx = wg.x * 64u + li;
-  let level0 = idx / FAR_NUM_CHUNKS;
-  let slot = idx % FAR_NUM_CHUNKS;
-  let occ = atomicLoad(&farOcc[idx]);
-  if ((occ & 0xFFFFu) != 0u) {
-    // farChunkIndexG's order is (z * N + y) * N + x.
-    let sy = i32((slot / FAR_NCHUNK) % FAR_NCHUNK);
-    let o = F.origins[level0].xyz;
-    let cy = o.y + ((sy - o.y) & i32(FAR_NCHUNK_MASK));   // farSlotToChunk
-    let top = farOccTop(occ);
-    // top 0 = "unknown, assume full": the chunk's top row.
-    let row = select(i32(top) - 1, i32(CHUNK) - 1, top == 0u);
-    let yTop = cy * i32(CHUNK) + row;
-    atomicMax(&skyWgMax, u32(yTop + SKY_TOP_BIAS + 1));
-  }
-  workgroupBarrier();
-  if (li == 0u) {
-    let m = atomicLoad(&skyWgMax);
-    if (m != 0u) { atomicMax(&farOcc[SKY_TOP_BASE + level0], m); }
-  }
 }

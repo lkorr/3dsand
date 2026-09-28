@@ -258,6 +258,7 @@ const TUNING_PARAMS = {
   'render.farSteps':{t:'i',def:384,min:1,max:2048,wgsl:'TUNE_FAR_STEPS'},
   'render.farShadowReach':{t:'f',def:60,min:1,max:400,wgsl:'TUNE_FAR_SHADOW_REACH'},
   'render.farBlockerHitLevel':{t:'i',def:0,min:0,max:8,wgsl:'TUNE_FAR_BLOCKER_HIT_LEVEL'},
+  'render.farRefineLevel':{t:'i',def:8,min:0,max:8,wgsl:'TUNE_FAR_REFINE_LEVEL'},
   'render.gasBlendStart':{t:'f',def:0.5,min:0,max:1,wgsl:'TUNE_GAS_BLEND_START'},
   'render.farPlumeStrength':{t:'f',def:1,min:0,max:16,wgsl:'TUNE_FAR_PLUME_STRENGTH'},
   'render.farPlumeHeight':{t:'f',def:28,min:0,max:409.6,wgsl:'TUNE_FAR_PLUME_HEIGHT'},

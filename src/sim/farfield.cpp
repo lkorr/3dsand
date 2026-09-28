@@ -95,17 +95,31 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord,
       s[axis] = sa;
       s[(axis + 1) % 3] = a;
       s[(axis + 2) % 3] = b;
+      // ---- THE SURFACE MAP RIDES THE X/Z PLANES (LOD-seam package A) -----
+      // The far surface map is 2D, so a Y step changes nothing in it and an
+      // X or Z step turns over whole COLUMNS of it. One entry per level-chunk
+      // column refills the map under that column's XZ footprint: the one in
+      // slot layer y == 0, which both plane orders below and ResetLevel's
+      // slot order put FIRST among its column's entries, so the fill always
+      // lands no later than any `farpatch` of the same column (which clears
+      // map entries over edited cells and must not be overwritten after).
+      const bool mapFill = axis != 1 && s[1] == 0;
       // ---- A DIAGONAL STEP QUEUES THE CROSSING LINE ONCE -----------------
       // Two planes of one Update cross in a line of kFarNChunk slots. The
       // earlier plane already holds it, earlier in this level's FIFO, so its
       // fill lands before this plane's last entry releases this face.
+      // EXCEPT a map-fill entry whose earlier twin belongs to a Y plane: the
+      // Y plane carries no map fill, so dropping it would leave this column's
+      // map stale. It is queued anyway (one extra sieve entry per such step).
       bool dup = false;
       for (int e = 0; e < 3; e++)
-        if (e != axis && skipSa[e] >= 0 && s[e] == skipSa[e]) dup = true;
+        if (e != axis && skipSa[e] >= 0 && s[e] == skipSa[e] &&
+            !(mapFill && e == 1))
+          dup = true;
       if (dup) { edgeDedupes_++; continue; }
       uint32_t slot = ((uint32_t)s[2] * kFarNChunk + (uint32_t)s[1]) * kFarNChunk +
                       (uint32_t)s[0];
-      Enqueue(k, slot);
+      Enqueue(k, slot | (mapFill ? kFarListMapBit : 0u));
       n++;
     }
   }
@@ -133,7 +147,13 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   // No farSig clear HERE: the entries that overlap the window raise it as
   // they are dispatched (sigClear_), which is the only moment it is not racing
   // the refill.
-  for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
+  // Slot order is x fastest, then y, then z, so every level-chunk column's
+  // y == 0 entry — the one that refills the surface map under it (see
+  // EnqueuePlane) — comes before the rest of that column.
+  for (uint32_t slot = 0; slot < kFarNumChunks; slot++) {
+    const bool mapFill = ((slot / kFarNChunk) % kFarNChunk) == 0;
+    Enqueue(k, slot | (mapFill ? kFarListMapBit : 0u));
+  }
   bulkPending_[k] += kFarNumChunks;
   // Every plane record queued for this level is now meaningless — the whole
   // level is invalid until the reset lands — so it stops owning a face.
@@ -370,7 +390,10 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   for (uint32_t k = 0; k < kFarLevels && !budgetHit; k++) {
     std::deque<uint32_t>& q = queue_[k];
     while (!q.empty() && list_.size() < cap) {
-      const uint32_t slot = q.front();
+      // The queue word is the slot plus, for one entry per level-chunk
+      // column, the surface-map fill flag (EnqueuePlane / ResetLevel).
+      const uint32_t mapBit = q.front() & kFarListMapBit;
+      const uint32_t slot = q.front() & kFarSlotMask;
 
       // The queue names SLOTS, so the world level chunk resident in that slot
       // is resolved here under the SAME origins the kernel will read this
@@ -399,7 +422,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
       patchHeader_.push_back(n);
       if (n) patchPayload_.insert(patchPayload_.end(), patch->begin(), patch->end());
 
-      list_.push_back((k << kFarSlotShift) | slot);
+      list_.push_back((k << kFarSlotShift) | slot | mapBit);
       q.pop_front();
       // A refill of cells a resident chunk owns undoes that chunk's last
       // downsample: clear the signatures on the NEXT PrepareTick (sigClear_).

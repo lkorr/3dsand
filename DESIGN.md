@@ -11866,7 +11866,7 @@ where you hear from either (§12b, "The ears are on the character").
   `kFarNChunk`, a count that will not fit escalates to the pending bit rather
   than clamping, and `scripts/check_invariants.py` pins the WGSL literals.
   raymarch.wgsl `farBox` unpacks it and every far reader (`traceFar`,
-  `farShadowDist`, the far AO taps) marches the full box less those faces —
+  `farShadowMarch` and its copy in `shadow_resolve.wgsl`, the far AO taps) marches the full box less those faces —
   empty during a reset — so a ray in an excluded slab leaves the level at the
   shrunken face and the next coarser level, which is filled, picks it up at
   the same t by the seam contract `traceFar` already keeps for a ray out of
@@ -11969,18 +11969,28 @@ where you hear from either (§12b, "The ears are on the character").
   rejected: the sieve would have to evaluate `genCell` 2^3k times per cell
   (4096× at level 4, unbounded by level 8), and any rule other than
   center-sampling breaks the sieve↔downsample agreement that keeps refilled
-  planes seamless against live chunks. At `kFarShiftBase = 1` and
-  `kVoxelMeters = 0.10` that gives (level: cell size, band it serves, smallest
-  edit it can show):
+  planes seamless against live chunks. At `kFarShiftBase = 0` (the 512³
+  window over the 512³ far grid; this table said 1 until 2026-09-28, which was
+  stale since kFarN went 512) and `kVoxelMeters = 0.10` that gives (level:
+  cell size, where it hands the ray to the next level — a SPHERE about the
+  eye, 14 level chunks (the box half less the recentre hysteresis; the box
+  itself is 16 chunks half — see "each level hands off on a sphere" below) —
+  and the smallest edit it can show):
 
-  | level | cell | serves out to | smallest visible edit |
+  | level | cell | hands off at (box half) | smallest visible edit |
   |---|---|---|---|
-  | 1 | 4 vox (0.4 m) | 51 m | ~0.4 m — a brush stroke |
-  | 2 | 8 vox (0.8 m) | 102 m | ~0.8 m — a doorway |
-  | 3 | 16 vox (1.6 m) | 205 m | ~1.6 m — a small crater |
-  | 4 | 32 vox (3.2 m) | 410 m | ~3 m — a room, a big blast |
-  | 5 | 64 vox (6.4 m) | 819 m | ~6 m — a tower, a quarry |
-  | 6–8 | 128–512 vox | 1.6–6.6 km | 13–51 m — terrain-scale work only |
+  | 1 | 2 vox (0.2 m) | 44.8 m (51 m) | ~0.2 m — a brush stroke |
+  | 2 | 4 vox (0.4 m) | 90 m (102 m) | ~0.4 m — a doorway |
+  | 3 | 8 vox (0.8 m) | 179 m (205 m) | ~0.8 m — a small crater |
+  | 4 | 16 vox (1.6 m) | 358 m (410 m) | ~1.6 m — a room, a big blast |
+  | 5 | 32 vox (3.2 m) | 717 m (819 m) | ~3 m — a tower, a quarry |
+  | 6–8 | 64–256 vox | 1.4–2.9 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
+
+  The SURFACE of pristine terrain is no longer bound by this table: the far
+  surface map below draws each surface cell as its 2x2 true-height
+  sub-columns, so the ground itself resolves at half a cell (level 1: the fine
+  10 cm columns). The table still binds everything else — edits, trees, rocks,
+  anything that is not the heightfield.
 
   So "dig a crater and see it from 60 m" (level 2, needs ~0.8 m) works and
   "see a single dug voxel from 3 km" does not, and the second one is correct
@@ -11996,7 +12006,9 @@ where you hear from either (§12b, "The ears are on the character").
   the previous box's exit) keeps coarse data from ever occluding fine data.
   **A ray leaves the fine march at whichever comes first: the window exit, or
   the in-window LOD handoff** (`TUNE_LOD_HANDOFF_DIST`, render group — **ships
-  DISABLED at 26 m since the LOD-seam pass, 2026-09-04**; it was 24). The
+  ON at 20.5 m since the LOD-seam overhaul, 2026-09-28**; it was disabled at
+  26 m from 2026-09-04, and 24 before that — why it is back is the LOD-seam
+  overhaul's closing paragraph, below). The
   handoff is a `min()` clamp on `trace()`'s `tExit`, so it moves where the
   cascade takes over without touching the handoff machinery — the cascade
   start distance, the one-sided seam dither and the `tPrev` ordering all read
@@ -12009,9 +12021,12 @@ where you hear from either (§12b, "The ears are on the character").
   ring: a `t` clamp on a normalised ray is a sphere around the camera, so every
   representation change the seam carries (cell size 10 → 20 cm, and every
   shading term listed under the seam pass below) landed on one circle on the
-  ground at a constant 24 m, where a 20 cm cell is still 6 px. The box edge is
-  25.6-44 m away, is not a circle, and is where the fine data genuinely ends.
-  Turn the knob back down to buy the 8-11% at the cost of the ring.
+  ground at a constant 24 m, where a 20 cm cell is still 6 px. The box edge
+  was the handoff from then until 2026-09-28: 22.4-38 m away, not a circle,
+  and STEPPING — fixed in the world while you walk, then jumping a 1.6 m chunk
+  with the window (in Y too), which is the line the user saw. With the far
+  surface map, the plant fade, the far shadows and the far shading terms in
+  place the circle carries little, and the circle moves with you.
   **Distance look (phase 4, 2026-08-19):** kFarLevels is 8 (128 MiB farVox —
   exactly the WebGPU default storage-binding limit; the horizon sits 2 km out
   at 6.25 cm voxels). Cell COLOR is decoupled from cell SHAPE: shape still
@@ -12026,7 +12041,7 @@ where you hear from either (§12b, "The ears are on the character").
   material instead (`treeCanopyAt`) — trees too thin to survive center
   sampling are flattened into the terrain, so the far forest keeps its canopy
   color. Far hits shade with the same palette/face/ambient constants as the
-  near field plus sky reflection on distant water top faces; the texture, AO
+  near field (far water: `shadeFarWater`, below); the texture, AO
   and shadow terms are the near field's own since the seam pass below (phase 4
   had a 0.5 m palette hash, a one-sample AO and a flat ×0.3 shadow lift). Fog
   is aerial perspective: `applyAerial` converges surfaces exactly to
@@ -12046,16 +12061,39 @@ where you hear from either (§12b, "The ears are on the character").
   fine lattice, so a cascade cell wears the speckle the voxels under it would
   have shown; `grainAmpFar` ships equal to `grainAmp`. (2) **AO** — `farVoxelAO`
   is `voxelAO`'s four-tap rule over cascade cells at `aoStrength`, occluders
-  being MATERIAL cells only. (3) **shadow** — `farShadowDist` returns the
+  being MATERIAL cells only. (3) **shadow** — `farShadowMarch` returns the
   blocker distance and the far hit takes `shadowFromOpaqueHit`, the one
-  softening law the terrain and the raster bodies share; levels ≥ 3 keep a
-  floor at `shadowFarLift`. Its reach is `render.farShadowReach` in metres,
-  converted to steps per level and capped at 64: it ships at 24 m (was 60)
-  because once the blocker flag stopped being a caster an UNSHADOWED ray walks
-  the whole reach — the owner's live flight measured 38 far-shadow steps per
-  pixel against 136 far-march steps, on a frame that was 81% cascade — and a
-  caster a cascade pixel can show is a canopy or a ridge within a few tens of
-  metres. Likewise `render.farSteps` is an LOD handoff rather than a cliff: a
+  softening law the terrain and the raster bodies share. Its reach is
+  `render.farShadowReach` in metres and ships at 24 m (was 60) because once
+  the blocker flag stopped being a caster an UNSHADOWED ray walks the whole
+  reach — the owner's live flight measured 38 far-shadow steps per pixel
+  against 136 far-march steps, on a frame that was 81% cascade — and a caster
+  a cascade pixel can show is a canopy or a ridge within a few tens of metres.
+  **Since 2026-09-28 (LOD-seam package C) the reach is a DISTANCE test, the ray
+  is a cone trace, the edge is soft and there is no per-level floor.** The old
+  ray converted the reach to steps and clamped the count at 64, charged for
+  chunk crossings and for every cell of a diagonal DDA, so what shipped was
+  ~9 m at level 1 and ~17 m at levels 2-3: one tree's shadow changed length at
+  the window face and again at the level-1/level-2 seam, both of which move
+  with the camera. Now the ray starts in the receiver's level and hands itself
+  to the next coarser level every 32 cells of distance (level 1 to 6.4 m, level
+  2 to 12.8 m, level 3 to 25.6 m) — cells no finer than the sun disc's
+  `2·d·tan(render.shadowSunAngle)` penumbra at that distance, so nothing the
+  near field's soft shadow shows is lost — and stops on `tF ≥ reach`; the
+  step cap (160) is a safety net. The edge: `farShadowCover` estimates the
+  fraction of the disc the blocker covers from where the ray crossed the
+  blocker cell (perpendicular distance to the silhouette edge between its
+  entry and exit faces, when the cell past the exit face is empty, against the
+  disc's projected width), which gives the far edge the near field's slope at
+  no extra ray — the inner half of the penumbra only, so it sits half a
+  penumbra inside the geometric edge and is continuous at it. The level ≥ 3
+  floor at `shadowFarLift` is gone: the shading-LOD lift (`lodShadeFade`,
+  §9.u) had already raised every contact shadow to 0.7 well before level 3
+  (~102 m) at any ordinary FOV, so it only mattered under zoom, where it was a
+  0.3 step at 102 m. `shadowFarLift` now only feeds the dead-by-default
+  `shadowMaxDist` experiment (`sunShadowFar`). The near half — casters OUTSIDE
+  the window shadowing receivers inside it — is §9.s's "Casters outside the
+  window". Likewise `render.farSteps` is an LOD handoff rather than a cliff: a
   ray that exhausts a level's budget hands the next level its STOP POINT, not
   the box exit (which left the rest of that level marched by nobody — a hole
   on a grazing hillside), so the budget may be tuned for the frame and its
@@ -12067,7 +12105,7 @@ where you hear from either (§12b, "The ears are on the character").
   skips chunks with nothing in them, and every chunk of the surface band has
   something: a ray 12 m up pitched at the middle distance walked ~90 level-1
   cells of air per band chunk before it met the ground. Above that row
-  `traceFar` and `farShadowDist` now jump to the chunk's exit face (ascending)
+  `traceFar` and `farShadowMarch` now jump to the chunk's exit face (ascending)
   or drop straight onto the row (descending) and resume the DDA there —
   exact, measured pixel-identical to the cell-by-cell march within the
   wind-animated noise of two frames. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
@@ -12085,13 +12123,163 @@ where you hear from either (§12b, "The ears are on the character").
   material, not a cell rule. What is still not matched, in order of visibility:
   the blades themselves end at the window edge (analytic plants have no far
   representation); the 2× cell step is a 3 px → 6 px block change at the seam
-  and at every level box; the near field's one-bounce GI and openness terms
-  have no far equivalent; far water is an opaque disc. The structural answer
+  and at every level box; far water is an opaque disc (it now SHADES as
+  water — see the next paragraph — but has no depth and no bed). The structural answer
   for the first two is the mesh game's: surface memory scales with area, so it
   keeps full-detail chunks out to ~500 m (1.5 px per block at the swap), where
   a dense cascade level costs volume — see `docs/PLAN_far_field_cascades.md`
   §5.6 for why `kFarN` is the only knob and what a sparse near level would
   take.
+  **The near-only shading terms (LOD-seam overhaul package D, 2026-09-28).**
+  Three terms the near shade had and the cascade lacked, each reduced to what
+  the near field SHOWS at the seam (20-26 m, eye height) and reproduced with
+  ALU only, in helpers beside `fs` (`raymarch.wgsl`):
+  (a) **water** — `shadeFarWater` is `shadeWater`'s up-facing, bed-less limit:
+  the same deep-water `waveSlope` normal with the same screen-footprint
+  damping (so both sides carry the same surviving swell bands), the same
+  Schlick Fresnel (F0 0.0204, `waterFresnelPower`, × `liquidOptics.fresnel`)
+  against `reflectionSky`, the body's in-scatter as the refracted term (at a
+  grazing seam the column runs ~15× the depth, so Beer-Lambert has already
+  removed the bed), and the glint at its far lobe. The old far shade was
+  `color0` + 35% airglow LIT LIKE ROCK — a blue slab against the near field's
+  sky-grey sheet. Only clear, non-viscous liquid seen through open air takes
+  it (a far hit behind a near water surface keeps the old paint), and a far
+  water pixel no longer runs the far shadow march. Measured on
+  screenshot_cascade's far oasis ponds against the near fixture lake
+  (68/122/154): old far 143/182/224, new 114/145/164 (the remainder is 60 m
+  more aerial haze). A bed probe (a top face looking up to 8 cells down its
+  level for the bed, lit through the column) was tried and REMOVED in package
+  E: it moved those ponds by +3 blue and was the only per-pixel loop in the
+  far-water path, on the camera where the far field is the whole frame. Not reproduced:
+  shore foam, the traced reflection of the far shore, caustics; and the far
+  waterline is a cascade cell top, up to one fine voxel off the near
+  fullness plane (a geometry matter). (b) **GI bounce** —
+  `farGiBounce` is the irradiance gather's closed form on open terrain:
+  0 on a tread (every ray sees sky), one ring ray's weight (0.09375) on a
+  riser, 0.33 on an underside, of the ground's direct radiance
+  (albedo × key light × the wrapped Lambert of an up face), × `giStrength`,
+  × the far AO. CALIBRATED, not derived: measured near, a riser's bounce is
+  0.11-0.13 of the adjacent tread's radiance (screenshot_ground, giStrength
+  2 vs 0, tonemap inverted), a third of what the ideal three-ray weight
+  predicts. **The bounce is not allowed without the openness that pays for
+  it** (`farOpenness`): the near field scales a riser's ambient by its
+  openness BEFORE the gather adds the ground's light back, and the
+  hemisphere's ambGround half was the pre-GI stand-in for that same light —
+  so bounce alone counted the ground twice. Measured on screenshot_seam_x
+  (far band vs near band, 20 rows either side of the handoff line, p20 ≈
+  risers): far risers sat +16/255 above the near ones before, +28 with the
+  bounce alone, +19 with bounce + openness (up 1, riser 0.72 = the fan less
+  its three down rays, underside 0.25; package E moved the riser to 0.6, the
+  MEASURED median of the near grid on the seam frames' risers, and reads the
+  near grid itself in the handoff band — below). The far-vs-near differences that
+  remain on the seam frames (far treads ~28/255 darker on seam_x, the whole
+  far band ~36 darker on seam_diag) move by 1-3 under these terms and are
+  shadow / geometry (packages C / A). (c) **wet ground** — `farWetness` is
+  the near rain law on `farOpenness` (a cell with something on top 0), plus
+  the near sheen. Rain used to leave a dry ring at the window edge; measured
+  with SANDVOX_WEATHER=rain, the median darkening either side of the line is
+  now x0.925 near / x0.935 far (seam_x) and x0.77 / x0.81 (seam_diag).
+  Newly streamed chunks at the window edge: the openness fallback (stamp
+  missing) is 1.0, i.e. exactly the far look, so the ambient does not pop;
+  the GI gather of a new chunk reads an irradiance grid its deposits have not
+  reached yet and ramps in over frames. Once the handoff is a camera radius
+  inside the box (package E) new planes stream in beyond it and neither is
+  on screen.
+  **Making the seam invisible (LOD-seam overhaul package E, 2026-09-28) — the
+  closing account.** The seam the user saw at eye height was the residency
+  window's BOX face: 22.4-38 m ahead, fixed in the world while walking, then
+  jumping a chunk. Packages A-D made the two sides agree (A the geometry,
+  B the plants, C the shadows, D the missing far terms); E moved the line and
+  finished the agreement:
+  - **The handoff is a camera sphere again, at 20.5 m** (the paragraph on
+    `TUNE_LOD_HANDOFF_DIST` above), inside the nearest the box face can be
+    (22.4 m), so it moves continuously and never steps; B's fade ends 0.5 m
+    before it automatically. A sphere, not a view-depth plane: a plane's
+    distance grows toward the screen corners (by 1/cos of the off-axis
+    angle) and there runs past the window.
+  - **The handoff band** (`farBandNearWeight`, raymarch.wgsl): a cascade hit
+    between the sphere and 22.3 m still sits over window cells the near field
+    has measured, so its OPENNESS is read from the near grid there and eased
+    to the far constant across the band — never on the stepping face. This was
+    ATTRIBUTED, not guessed: a temporary debug output wrote each shading term
+    (albedo, face, wrapped Lambert, shadow, AO, ambient, GI, openness,
+    pre-aerial colour, aerial fraction, final) for near and far pixels, and the
+    20-row bands either side of the handoff were compared. At 20.5 m on
+    seam_x the treads already matched (final median 0.753 vs 0.753 of full
+    scale); the risers differed by OPENNESS (near median 0.50, spread
+    0.33-1.0; far constant 0.72) — the near's soft dark blotches are the
+    openness grid, not shadow. With the band and the measured riser constant
+    (0.6) the riser medians are 0.525 near vs 0.510 far. The far arm also
+    takes the near's `shadowLiftCap` on that openness, so a shadowed riser has
+    the same depth either side.
+  - **The footprint fade** (`farFootprintFade`): below ~2 px per fine voxel
+    the palette variant eases to the mean of its three entries and each
+    `surfaceGrain` octave to its mean; and where the DRAWN ELEMENT (a refined
+    sub-column, or a whole cell) is under ~2.5 px, the staircase eases to its
+    average: skin / sub-skin albedo in the tread / riser shares the view sees
+    (`farRiserShare`), LIT BY THE SMOOTH HEIGHTFIELD NORMAL from the surface
+    map's column tops (`farSurfAt`, any level). It removes the salt-and-pepper
+    and keeps the relief. Two first cuts, both reverted: a smooth normal that
+    also took the skin as the albedo (stone-and-snow mountains turned white),
+    and keying the staircase on the FINE voxel with the lighting averaged too
+    (commit ef553c5) — cascade cells stay 3-8 px wide at every level, so their
+    terraces are real relief, and that flattened every distant hill: luminance
+    std of `screenshot_cascade` rows 380-760 went 27.6 -> 23.4 (Rec.709 luma,
+    before/after); keyed on the element it is 27.2.
+  - **The cover tint** (`coverWeight`, raymarch.wgsl; the COVER bit of the
+    far surface map, worldgen.wgsl `farmap`). The far field has no plants
+    (`farCellIsSolid` drops MATF_MICRO) and B's fade thins the near plants to
+    nothing by the handoff, so a meadow was grass, then turf. The fill now
+    looks at the voxel over each sample column's top: a MATF_MICRO plant there
+    sets bit 30 of the entry and puts the PLANT's far slot in the sub-skin
+    field (the renderer takes the sub-skin from an uncovered sibling of the same
+    cell, `farMapSubOf`). The ground's top face then takes the plants' look —
+    body and tip palette means, times the light an upright blade facing the
+    eye gets relative to a tread (`coverBladeLight`) — by how much of it the
+    plants would hide from this view: over the 2x2 columns of a level-1 cell,
+    covered fraction f and plant height H give tau = f (1 + 0.15 H / |rd.y|),
+    weight 1 - exp(-tau). The near side computes the same from the four voxels
+    over the same four columns, ramped in across B's fade band as the plants
+    go, so it is at full weight before the handoff. Measured on the meadow
+    test map (seam_veg, far meadow band): main 119/142/96, ef553c5 112/151/97,
+    now 111/148/95 RGB. The COLOUR moves toward the near field; the far meadow
+    still reads as lawn, not blades — the blades' texture and their tan heads
+    are not something a colour on the ground can carry.
+  - **Each level hands off on a sphere, not on its box** (`tLvlOut` in
+    `traceFar`). The concentric-ring MOIRE (seam_veg's far ridge, the cascade
+    camera's pond bowls and dune bands) was not shading: a per-pixel debug of
+    the far march showed every ring pixel was a level-(k+1) hit whose
+    level-k march had just left its VALID BOX. A side face is seen edge-on, so
+    which level a pixel draws flips with the cell lattice on the face plane
+    wherever the levels disagree (a cactus or crown the coarse centre sample
+    dropped, a crest drawn lower). The pattern was identical with the dither
+    hash replaced, with the dither off (split-screen A/B in one frame) and
+    with the refine at 0, 2 and 8. A sphere is crossed head-on by every ray,
+    so the flip is a circle the dither dissolves. Radius = box half less the
+    2-chunk recentre hysteresis (14 level chunks; 13, one chunk more margin,
+    was tried first and cost 8% of every level's range), so a settled plane
+    refill lands beyond the handoff; a plane still queued pulls the valid face
+    in for the few ticks it takes to land. The outermost level keeps its box.
+  - A traversal bug found on the way (not the moire): a level whose step
+    budget died inside a chunk's cell walk handed the next level the NEXT
+    chunk's entry, leaving up to 16 cells marched by nobody. Fixed (`tDied`).
+  - **Measured** (`--render-budget`, RTX 3060 Ti 1080p, exclusive lock, main
+    a6234e9's exe and this tree in the same session): seam 10.16 -> 9.23 ms,
+    seamveg 9.99 -> 9.75, cascade 3.69 -> 2.94 — the handoff move and the
+    level spheres pay for everything A-E added (main's own seam number moved
+    9.66-10.16 between two exclusive runs, so read the seam delta as
+    -0.4 to -0.9 ms). raymarch `fs` 128 registers, 112 B local (was 144).
+  - **Still visible**, honestly: plants end in a fade 16-20 m out (B's design:
+    the far field has no plant representation); the near side keeps more
+    contrast (its openness blotches and contact shadows) than the far side
+    past the 2 m band; the far meadow is lawn-coloured cover, not blades;
+    trees, rocks and cacti stay centre-sampled cells; at a
+    low sun (SANDVOX_BUDGET_SUN_DEG=12) cast shadows continue across the
+    handoff, but a heightfield contact-shadow walk tried for the refined
+    ground was removed (it made the noon distributions disagree more, near
+    tread shadow p20 1.0 vs far 0.66, and did not move the low-sun ones);
+    and a plant eaten or trampled after the map was filled keeps its cover
+    tint until that column refills (edits only clear VALID).
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -12149,7 +12337,7 @@ where you hear from either (§12b, "The ears are on the character").
   downsample would disagree with it at their shared boundary. Its cost is one
   comparison for all but ONE cell per column — the surface band, where the four
   corner columns are sampled — and its blind spot is edits, which reach the far
-  field only through the material byte. `farShadowDist` does NOT treat it as a
+  field only through the material byte. `farShadowMarch` does NOT treat it as a
   caster (it did, at every level, until the LOD-seam pass): the flag covers the
   whole band of cells the ground surface passes through, so honouring it
   shadowed most of the far surface at near-zero distance — the ×0.3 lift was
@@ -12193,7 +12381,8 @@ where you hear from either (§12b, "The ears are on the character").
   survives a refill, and the determinism gate proves the hash is unmoved).
   Remaining limits: center-sampling terraces the surface *within* a level (the
   dither only addresses the seams between levels; a real blend would cost a
-  second march per pixel), edits smaller than a cascade cell are invisible at
+  second march per pixel) — for pristine heightfield terrain that is what the
+  far surface map below removes, at 2x each level's resolution — edits smaller than a cascade cell are invisible at
   that level (the table above), and an edit landing on a hash tick (every 15th,
   which takes the whole-world occupancy path and never compacts the dirty list)
   propagates one tick late. Coarse-level cave
@@ -12201,6 +12390,117 @@ where you hear from either (§12b, "The ears are on the character").
   capped at `h - 10`, so caves never breach the surface and coarse center
   samples never land in a void — verified by rendering levels 4–6 with fog at
   3% of nominal, which shows solid terrain with no swiss-cheese.
+  **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
+  is the cascade's resolution limit and the window edge is where it shows: a
+  level-1 cell is a 20 cm cube standing where the near field draws four 10 cm
+  columns of different heights, its top off by up to a voxel and its footprint
+  half a voxel off in XZ, and every coarser level terraces the same way at its
+  own scale. A 3D byte per cell has no room for more (farVox is already 1 GiB),
+  but the SURFACE is 2D, so a 2D side table can carry it at a fraction of the
+  cost. `farMap` (world.h `kFarMap*`) is, per level, a toroidal grid of
+  SUB-COLUMNS at twice the level's XZ resolution — 2^(k-1) fine voxels wide,
+  so level 1's are the fine columns themselves — 1024² u32 per level, 32 MiB
+  in all, blocked 2x2 per level cell so one cell's four sub-columns are one
+  16-byte load. An entry is the column's top (the fine y of its topmost
+  far-solid voxel: the ground contract's `h`, or the standing fluid's surface
+  over it; 16 bits, biased), the SKIN's far palette slot (the top voxel), the
+  SUB-SKIN's (the voxel under it — what a side face below the top voxel wears:
+  grass over dirt, sand over stone) and a VALID bit.
+  - **Fill** (worldgen.wgsl `farmap`, a third PT_FARFILL row between the sweep
+    and the patch). The map is 2D, so a Y step changes nothing in it and an X/Z
+    step turns over whole columns: `FarField` flags ONE entry per level-chunk
+    column of an X/Z plane or a reset — slot layer y == 0, which both plane
+    orders and the reset's slot order already put first in that column
+    (`kFarListMapBit`, bit 31 of the farList word) — and that entry refills the
+    32x32 sub-columns under its footprint: one `genColumn` at the sub-column's
+    CENTRE column (the sieve's own convention, one level down; exact at level
+    1) and two `genCellIn` (skin, sub-skin), no per-cell work — about an
+    eighth of the sieve's column work on the same planes. Levels >= 5 paint the
+    canopy proxy onto the skin exactly as `farSurfaceMat` does, or a refined
+    far forest would turn to bare grass. An authored stamp over the column (a
+    ruin: `wmSiteTopAt` above the ground) makes the entry invalid.
+  - **Edits: the map only ever loses its claim, it never re-derives one.**
+    `fardown`, after it rewrites a changed chunk's cells, checks every
+    sub-column whose sample column lies in the chunk: every voxel of the chunk
+    in the band the renderer trusts the map for (from the floor of the lowest
+    partly-empty cell of the sub-column's level cell up to the voxel over its
+    top) must be what the entry claims — far-solid at or under the top, not
+    over it. Anything else clears VALID (a dug voxel, a placed block, a burnt
+    trunk base). `farpatch` clears all four sub-columns of every cell it
+    patches, because a refilled EDITED level chunk has been re-derived from
+    pristine procgen and FarEdits holds only the centre samples, not the fine
+    columns. Both writes are `atomicAnd` of one bit, so they commute and race
+    with nothing; a refill after `fardown` in the same tick re-derives a
+    column pristine exactly when it also refills that column's cells pristine,
+    so the two stay consistent. The rule this buys is the one that matters:
+    **an edit is never ghosted or hidden by the refine**, because wherever the
+    live grid disagrees with the map the renderer draws the cells, which
+    `fardown` / `farpatch` keep correct as before. What it gives up: an edited
+    column shows the plain cascade cell until a pristine refill of it.
+  - **Render** (raymarch.wgsl `farRefineCell`, in traceFar's cell loop, up to
+    `render.farRefineLevel`, ships at 2 — see the measurement below). A cell is a CANDIDATE when it is a
+    material cell or the flagged air directly over one (one byte read) — so the
+    map is loaded for at most a couple of cells per ray, never for the cover-
+    height rows of blocker flags the ray crossed on the way down. If its four
+    entries are VALID and the cell is in the SURFACE BAND (partly full under
+    the heightfield: floor <= max top, ceiling > min top), the ray is
+    intersected against the four sub-columns — the mid planes cut the cell's
+    segment into at most three pieces, each an infinitely deep box up to its
+    top — and a hit returns the true point, face and skin / sub-skin; a miss
+    continues the DDA as if the cell were air. Outside the band, and for a
+    cell the map does not vouch for, the cell is drawn exactly as before.
+    THE UNION RULE keeps things standing on the ground: a material cell whose
+    centre sample lies ABOVE the map's top at that sample column (a trunk, a
+    rock, a wall the player built) is not terrain and keeps its plain cell. The
+    refined hit's fine voxel feeds `synthJitterState` / `surfaceGrain` as
+    before, so the texture lands on the true columns; AO is voxelAO's four-tap
+    rule on the heightfield itself (`farHfAO`: x/z in sub-columns, y in fine
+    voxels — the near field's own voxels at level 1); the shadow ray starts
+    over the hit's cell, because a refined hit sits inside a cell the far
+    shadow march would otherwise count as its own blocker. The level word of
+    `FarHit` carries the refined flag, so fs keeps its state size.
+  - **Measured** (2026-09-28, `--verify ... --budget-cams seam,seamveg,cascade`,
+    one process, exclusive lock, RTX 3060 Ti 1080p; arms `norefine`,
+    `refine1`/`refine2` = cap at level 1/2, `lod20`): the refine costs
+    **+0.58 ms on `seam`** (0.38 of it level 1), **+0.29 ms on `seamveg`**,
+    +0.82 ms on `cascade` (almost all levels >= 2, which is where that camera's
+    pixels are). With the handoff moved in to 20 m (`lod20`, package E) the
+    seam frame is +0.29 ms over the unrefined, 26 m-handoff frame. raymarch
+    `fs` stays at 128 registers / 144 B local (`--shader-stats`, unchanged).
+    What the cost is NOT: the candidate test and the map load are free (an
+    arm that ran both and skipped only the intersection priced at the
+    unrefined frame). It is divergence — lanes reach their candidate at
+    different DDA iterations, so a warp runs the body up to once per lane —
+    which is why the body exits early (a ray whose lowest point in the cell is
+    over the tallest top leaves before the piece walk) and takes vector
+    components by `select`, never `v[i]` (a runtime index put the map vector
+    in local memory: that alone was 0.8 ms of the cascade camera's 2.15).
+    Tried and removed: returning the candidate and refining in fs after the
+    loop, resuming the march on a miss — the re-seeded passes cost MORE
+    (seam +1.41 ms). Looks: at the window edge the level-1 side now shows the
+    near field's own 10 cm columns instead of 20 cm terraces, and the coarse
+    levels read as slopes rather than slab stacks; the cost of the finer
+    geometry is 1-2 px stair aliasing on distant slopes (salt-and-pepper
+    step edges, strongest on snow) — now averaged by the footprint fade
+    where a sub-column is under ~2 px (package E, below). The concentric-ring moire on distant slopes predated
+    this and was unchanged by it; it was the level box faces, fixed by the
+    sphere handoffs (package E). Package E ships the refine CAPPED AT LEVEL 2:
+    levels 3+ were 0.61 ms of the 4.44 ms cascade camera and nothing on the
+    eye-height cameras. The surface MAP is still filled at every level: the
+    shading reads it (heightfield normal, cover) wherever the refine does not.
+  - **Gate** `far-surface`: after a full refill every sampled valid level-1
+    entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
+    cell holding that top wears the same far slot as the entry's skin; levels
+    2-3 agree with `TerrainHeight`; a crater dug and a block built inside the
+    window clear their entries while a control column keeps its; refilled with
+    an empty edit index the crater's entry is pristine again, refilled with the
+    edited chunks indexed `farpatch` clears it again.
+  What it does not do: trees, rocks, overhangs and edits keep the centre-
+  sampled cells (see the level table); columns whose top is off the far
+  field's 16-bit window (|y| > 3.2 km) are simply invalid; far shadows are
+  still cast by cells; and a surface cell whose band the blocker flag missed
+  (a sub-column more than a cell taller than its cell's sample column, on a
+  cliff) keeps the old cell.
 - **Water as a surface, not fog (implemented 2026-08-19):** translucent liquids
   were originally shaded purely as participating media — a per-metre tint
   accumulated along the ray — and that is why a lake read as a flat blue disc
@@ -12490,11 +12790,22 @@ confirms it: the world hash is byte-identical with the feature on and with
 - `TUNE_MICRO_MAX_PER_RAY` (~8) caps how many bricks ONE ray may enter, because
   a grazing ray over a meadow crosses dozens of cells and every *miss* keeps it
   alive. Past the cap the next micro cell is treated as solid — terminating is
-  bounded, letting the ray fly is not;
-- past `TUNE_MICRO_LOD_DIST` the cell shades as a plain voxel, since at ~1 px per
-  cell the nested march is deciding the colour of a sub-pixel. This makes a
-  micro material's own `colors` its LOD colours, so they must be authored as the
-  model's AVERAGE (a poppy is muted green with a red cast, not red).
+  bounded, letting the ray fly is not — but only NEARER than the near-detail
+  fade band; inside the band it passes as air (below);
+- **micro detail fades out before the far handoff (2026-09-28, LOD seam
+  package B).** It used to become a plain solid voxel past
+  `TUNE_MICRO_LOD_DIST` (40 m) and then vanish at the window face, because the
+  far cascade drops `MATF_MICRO` (`farCellIsSolid`): a line where the bushes and
+  moss stopped. Now every micro model thins to ZERO density across
+  `[DETAIL_FADE_START_M, DETAIL_FADE_END_M]` of camera distance (defined next to
+  `DETAIL_SLOTS` in `raymarch.wgsl`; see "Analytic plants" below for the rule).
+  A faded cell is air to the primary ray, which then lands on the ground skin
+  under it — the same skin the far cascade draws past the seam. No micro cell is
+  drawn as a plain voxel by the primary ray at a distance any more (only as the
+  budget-spent solid, nearer than the band), so a micro material's own
+  `colors` are no longer its distant look.
+  `TUNE_MICRO_LOD_DIST` now governs only partial POWDER cells (the grain
+  arrangement), not micro bricks.
 
 **Shadows and occupancy.** Shadow and reflection rays skip micro cells entirely
 (v1, matching the plan), and `isRayBlocker` correspondingly excludes
@@ -12626,16 +12937,55 @@ Only records charge `microBudget`; cells collapsed onto an existing record are
 free, and `render.microMaxPerRay` is clamped to `DETAIL_SLOTS` (4). The
 traversal cost of a REAL meadow remains unmeasured — the harness world holds
 756 plant cells and no leaves at all, so everything above is a PRESENCE cost.
-Full arm tables in `docs/PLAN_frame_perf.md`. Past
-`TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
-solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
-Column plants take the SHORTER of that and `render.plantLodDist` (16 m): an
-evaluation is a wind sample plus six to eight blade tests, charged for every
-cell a grazing ray crosses up to `microMaxPerRay`, and a blade is sub-pixel
-long before its cell is — at 40 m a meadow ran at a third of the frame rate of
-snow (2026-09-04). Inside the grass loop each blade's chord box is tested
-against the ray's XZ footprint through the cell before `hitBlade`, exact and
-conservative, so most of a tuft's blades cost two hashes and a compare.
+Full arm tables in `docs/PLAN_frame_perf.md`. Inside the grass loop each
+blade's chord box is tested against the ray's XZ footprint through the cell
+before `hitBlade`, exact and conservative, so most of a tuft's blades cost two
+hashes and a compare.
+
+**Plants fade out before the far handoff; there are no proxy cubes
+(2026-09-28, LOD seam package B).** Until then a column plant became a SOLID
+proxy cube past `render.plantLodDist` (16 m) and a tile plant's centre column
+did past `microLodDist` (40 m), and all of it vanished at the window face
+because the far cascade drops `MATF_MICRO`. At eye height that was two lines:
+a field of 10 cm pillars starting at 16 m (the proxies read as tall tan-topped
+posts, nothing like the blades in front of them), and the pillars ending at
+the box face 22-27 m out, stepping with the window. Now:
+
+- **Density thinning, world-keyed.** Each model draws a fixed hash — a column
+  plant or brick from its (x, z) column (`detailColumnId`), a tile plant from
+  its tile key (`plantTileKey`) — and the hash places its VANISH DISTANCE
+  uniformly in `[DETAIL_FADE_START_M, DETAIL_FADE_END_M]`
+  (`detailVanishDist`). Phase 1 compares the camera distance to the CELL
+  CENTRE (`detailDist`, per cell, not per pixel, so every pixel of a cell
+  agrees) against it; past it the cell is air. TAA is off, so the fade has to
+  be spatially stable and it is: as the camera moves only each model's
+  threshold moves, a tuft either exists or does not and never flickers.
+  Density falls linearly and is exactly zero at END.
+- **Column plants also shrink.** Grass and flowers scale their height (and a
+  flower its head and leaves) by `lodH`, which ramps 1 → 0 over the last
+  `DETAIL_SHRINK_M` (1.5 m) before the tuft's own vanish distance, so a tuft is
+  already flat when phase 1 removes it: thinning without the pop. Tile
+  plants, small mushrooms and bricks only thin (sparse, and no single height
+  to scale).
+- **A spent record budget is air inside the band**, solid only nearer than
+  START (the shipped bound) — a solid cube there would bring back the pillars.
+- **The ground under faded plants is left as it is.** The far cascade draws
+  the same skin material, so the bare skin IS the far look; a "cover tint" on
+  the near skin would have been a new seam of its own.
+- **One place for the distances.** `DETAIL_FADE_END_M = min(render.lodHandoffDist,
+  WINDOW_HALF_EXTENT_METERS - 2 chunks) - 0.5 m`: the handoff, capped at the
+  nearest the window face gets (25.6 m less the 2-chunk stream hysteresis =
+  22.4 m), less half a metre — 20.0 m at the shipped 20.5 m handoff (21.9 m
+  with it disabled). `DETAIL_FADE_START_M = min(render.plantLodDist,
+  END - 1 m)` — `plantLodDist` (16 m) no longer switches anything to a cube;
+  it is where the fade begins, for EVERY kind of micro detail. Moving the
+  handoff moves the fade with it; no knob was added.
+
+Cost (`--render-budget`, 1080p, RTX 3060 Ti, meadow-biome test map): the meadow
+camera (grass at 0-20 m) 8.43 → 8.42 ms, the canopy camera (a grass ridge
+crest at 16-25 m) 5.83 → 6.04 ms — the band's plants are now evaluated rather
+than terminated on a cube, bounded by the same four records. `fs`: 128
+registers, local memory +144 B, both unchanged.
 
 **Density is a look knob and it was halved (2026-09-04).** Every ground-cover
 rate — `flowerAt`'s per-mille thresholds and tall-grass stand density, the
@@ -12643,8 +12993,8 @@ rate — `flowerAt`'s per-mille thresholds and tall-grass stand density, the
 for the tile plants, the shore/pond `worldgen.*Chance` tuning rows and the
 `chance` of every biome cover row in `assets/biomes/*.json` — is half what the
 plant overhaul shipped with. Not for the raymarch: while flying the live
-telemetry showed ~0 micro steps per pixel (plants are cubes past
-`plantLodDist`). For WORLDGEN and the far refill, which were 8 + 16 ms of a
+telemetry showed ~0 micro steps per pixel (plants were cubes past
+`plantLodDist` then; they fade out there now). For WORLDGEN and the far refill, which were 8 + 16 ms of a
 53 ms GPU frame in flight: a column inside a fern footprint pays a second
 `landColumn` and a 25-tile tree scan (`plantSiteAt`) in `genColumn`, which the
 `far` sieve runs 256 times per level chunk, and every placed cell is one the
@@ -13012,7 +13362,8 @@ changed the cost, not the answer.
 ambient by `opennessScale(opennessAt(...))`, alongside `ao` and never the sun
 (the sun has its own shadow ray). Far-cascade hits keep the plain lerp — the
 grid is keyed on residency slots and a cascade hit is outside the window by
-definition. Micro hits sample the cell BELOW with the +Y face, because a grass
+definition; open ground reads 1.0 so the two agree there, and the far GI
+stand-in is `farGiBounce` (§9 far field, "near-only shading terms"). Micro hits sample the cell BELOW with the +Y face, because a grass
 tuft is not a ray blocker and its own block has no entry. `microbody.wgsl` uses
 `opennessScaleAtBody`, which walks down at most six blocks to the ground the
 body stands on and takes that surface's value: a body is not in the voxel grid,
@@ -13160,6 +13511,34 @@ are no spare bits for a second 16-sample window, and a fixed ray is what keeps
 the byte — and therefore the published value — bit-stable in a static scene.
 The two compose as `open + (1 − open)·lift`, which degenerates to the pre-cone
 value exactly when every sample agrees.
+
+**Casters outside the window** (added 2026-09-28, LOD-seam package C).
+`traceOpaque` clips to the residency window, so a patch ray that left the window
+unblocked used to read as sun: a tree two metres past the face, or the ridge a
+low sun sits behind, shadowed nothing inside the window, and a long evening
+shadow stopped dead at the face — a line fixed in the world that jumps a chunk
+at a time as the player walks. The resolve pass now continues every such ray
+(each jittered sample, so the window above softens far casters exactly like
+near ones) through the far cascade from the window exit, with the same cone
+schedule and the same `render.farShadowReach` as the far field's own shadow
+(§9 far-field item (3)), both measured from the PATCH: a receiver one voxel
+inside the face and a far cell one cell outside it see the same casters out to
+the same distance. A ray already past the reach when it leaves the window (the
+usual case for a ray exiting the top) pays one compare. The resolve layout
+gained bindings 18-20 (`farVox`, `farOcc`, `farUBO`) and the `shadow_resolve`
+pass-table row their reads. It is a second copy of the far DDA
+(`shadow_resolve.wgsl farShadowT`), because the march reads bindings
+`common.wgsl` cannot name; what holds it to `raymarch.wgsl farShadowMarch` is
+the cache-off reference (`sunShadowAt(..., beyondWindow = true)`) running the
+same continuation, which `--gate shadow-cache` compares the cache against, and
+`check_invariants.py` pinning its `farBox` literals. Measured (RTX 3060 Ti,
+1080p, `SANDVOX_RUN_EXCLUSIVE=1`, `--render-budget` with
+`SANDVOX_BUDGET_SUN_DEG=15`, which re-times every budget camera to a 15° sun):
+the shadow share (`baseline − noshadow`) of the eye-height `seam` camera went
+1.96 → 2.10 ms, `seamveg` 1.39 → 1.59, `dusk` 0.30 → 0.46, `cascade` 0.30 →
+0.47 — continuation and the far cone trace together; at noon all four moved by
+less than the noise. `--shader-stats`: `raymarch` fs unchanged at 128 registers
++ 144 B local; `shadowResolve` 63 → 64 registers.
 
 **A window belongs to a PATCH, not to a slot.** The slot's `valid` bit is the
 only signal that distinguishes "my samples" from "the samples of whatever patch
