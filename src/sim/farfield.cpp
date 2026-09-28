@@ -431,7 +431,17 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
       // filled from here on — SafeRadiusMeters is read on the render path of
       // the same frame, one submit behind at worst.
       pending_[k]--;
-      if (bulkPending_[k] > 0) bulkPending_[k]--;  // resets pop first in a level
+      // resets pop first in a level. THE LAST ONE REPUBLISHES THE UBO: while
+      // bulkPending_ is nonzero FaceWord says kFarFaceAllPending ("march
+      // nothing in this level"), so the word must be re-sent the moment it
+      // stops being true. Without this the ALL-PENDING word published by the
+      // first PrepareTick of a reset stayed on the GPU after the drain, and a
+      // level only came back when some unrelated face change happened to set
+      // uboDirty_: every headless FullRefill drain (--shot, the far gates'
+      // DrainFullRefill, the seam frames) rendered ZERO cascade pixels
+      // (rmPxFar 0.000, traceFar skipping every level), and in play a player
+      // standing still after a load had no horizon until level 1 stepped.
+      if (bulkPending_[k] > 0 && --bulkPending_[k] == 0) uboDirty_ = true;
       // The plane this entry belongs to is the level's front record (same
       // FIFO). Its face is released when its last entry is dispatched —
       // published next tick, after this tick's sieve is in the queue.
