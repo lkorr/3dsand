@@ -13203,7 +13203,14 @@ pass-table row their reads. It is a second copy of the far DDA
 `common.wgsl` cannot name; what holds it to `raymarch.wgsl farShadowMarch` is
 the cache-off reference (`sunShadowAt(..., beyondWindow = true)`) running the
 same continuation, which `--gate shadow-cache` compares the cache against, and
-`check_invariants.py` pinning its `farBox` literals.
+`check_invariants.py` pinning its `farBox` literals. Measured (RTX 3060 Ti,
+1080p, `SANDVOX_RUN_EXCLUSIVE=1`, `--render-budget` with
+`SANDVOX_BUDGET_SUN_DEG=15`, which re-times every budget camera to a 15° sun):
+the shadow share (`baseline − noshadow`) of the eye-height `seam` camera went
+1.96 → 2.10 ms, `seamveg` 1.39 → 1.59, `dusk` 0.30 → 0.46, `cascade` 0.30 →
+0.47 — continuation and the far cone trace together; at noon all four moved by
+less than the noise. `--shader-stats`: `raymarch` fs unchanged at 128 registers
++ 144 B local; `shadowResolve` 63 → 64 registers.
 
 **A window belongs to a PATCH, not to a slot.** The slot's `valid` bit is the
 only signal that distinguishes "my samples" from "the samples of whatever patch
