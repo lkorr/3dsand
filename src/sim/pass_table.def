@@ -1198,9 +1198,14 @@ PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_IND
 // missing. W, not A: the read-modify-write is plain, and a slot belongs to one
 // patch, so the only racer would be a duplicate claim — which the publish
 // guard below already drops.
+// R(FarVox) R(FarOcc) U(FarUBO) since LOD-seam package C (2026-09-28): a patch
+// ray that leaves the window unblocked continues through the far cascade, so
+// casters outside the window shadow receivers inside it. The far fill rows
+// (farFill / farPatchFill / fardown) are its writers; declaring the reads is
+// what orders this per-frame dispatch after them.
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
           A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)
-          R(Openness) W(ShadowHist)))
+          R(Openness) W(ShadowHist) R(FarVox) R(FarOcc) U(FarUBO)))
 
 // ---- THE CLOUDS (assets/shaders/cloud.wgsl, DESIGN.md §9.w) ---------------
 // Same table, same reason: per-FRAME render-path compute whose writes the

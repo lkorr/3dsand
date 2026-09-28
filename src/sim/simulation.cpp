@@ -863,6 +863,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(15, T::Storage),         // cloudMaps
         entry(16, T::Storage),         // cloudRaw
         entry(17, T::Storage),         // cloudHist
+        // The far cascade, read by the resolve so a patch's shadow ray that
+        // leaves the window unblocked continues into it (shadow_resolve.wgsl,
+        // CASTERS OUTSIDE THE WINDOW). Read-only; the clouds do not use them.
+        entry(18, T::ReadOnlyStorage), // farVox
+        entry(19, T::ReadOnlyStorage), // farOcc
+        entry(20, T::Uniform),         // farUBO
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -3166,6 +3172,9 @@ void Simulation::BuildShadowBindGroup() {
       b(15, cloudMapsBuf_),
       b(16, cloudRawBuf_),
       b(17, cloudHistBuf_),
+      b(18, world_->farVox),
+      b(19, world_->farOcc),
+      b(20, world_->farUBO),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

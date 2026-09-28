@@ -11866,7 +11866,7 @@ where you hear from either (§12b, "The ears are on the character").
   `kFarNChunk`, a count that will not fit escalates to the pending bit rather
   than clamping, and `scripts/check_invariants.py` pins the WGSL literals.
   raymarch.wgsl `farBox` unpacks it and every far reader (`traceFar`,
-  `farShadowDist`, the far AO taps) marches the full box less those faces —
+  `farShadowMarch` and its copy in `shadow_resolve.wgsl`, the far AO taps) marches the full box less those faces —
   empty during a reset — so a ray in an excluded slab leaves the level at the
   shrunken face and the next coarser level, which is filled, picks it up at
   the same t by the seam contract `traceFar` already keeps for a ray out of
@@ -12046,16 +12046,39 @@ where you hear from either (§12b, "The ears are on the character").
   fine lattice, so a cascade cell wears the speckle the voxels under it would
   have shown; `grainAmpFar` ships equal to `grainAmp`. (2) **AO** — `farVoxelAO`
   is `voxelAO`'s four-tap rule over cascade cells at `aoStrength`, occluders
-  being MATERIAL cells only. (3) **shadow** — `farShadowDist` returns the
+  being MATERIAL cells only. (3) **shadow** — `farShadowMarch` returns the
   blocker distance and the far hit takes `shadowFromOpaqueHit`, the one
-  softening law the terrain and the raster bodies share; levels ≥ 3 keep a
-  floor at `shadowFarLift`. Its reach is `render.farShadowReach` in metres,
-  converted to steps per level and capped at 64: it ships at 24 m (was 60)
-  because once the blocker flag stopped being a caster an UNSHADOWED ray walks
-  the whole reach — the owner's live flight measured 38 far-shadow steps per
-  pixel against 136 far-march steps, on a frame that was 81% cascade — and a
-  caster a cascade pixel can show is a canopy or a ridge within a few tens of
-  metres. Likewise `render.farSteps` is an LOD handoff rather than a cliff: a
+  softening law the terrain and the raster bodies share. Its reach is
+  `render.farShadowReach` in metres and ships at 24 m (was 60) because once
+  the blocker flag stopped being a caster an UNSHADOWED ray walks the whole
+  reach — the owner's live flight measured 38 far-shadow steps per pixel
+  against 136 far-march steps, on a frame that was 81% cascade — and a caster
+  a cascade pixel can show is a canopy or a ridge within a few tens of metres.
+  **Since 2026-09-28 (LOD-seam package C) the reach is a DISTANCE test, the ray
+  is a cone trace, the edge is soft and there is no per-level floor.** The old
+  ray converted the reach to steps and clamped the count at 64, charged for
+  chunk crossings and for every cell of a diagonal DDA, so what shipped was
+  ~9 m at level 1 and ~17 m at levels 2-3: one tree's shadow changed length at
+  the window face and again at the level-1/level-2 seam, both of which move
+  with the camera. Now the ray starts in the receiver's level and hands itself
+  to the next coarser level every 32 cells of distance (level 1 to 6.4 m, level
+  2 to 12.8 m, level 3 to 25.6 m) — cells no finer than the sun disc's
+  `2·d·tan(render.shadowSunAngle)` penumbra at that distance, so nothing the
+  near field's soft shadow shows is lost — and stops on `tF ≥ reach`; the
+  step cap (160) is a safety net. The edge: `farShadowCover` estimates the
+  fraction of the disc the blocker covers from where the ray crossed the
+  blocker cell (perpendicular distance to the silhouette edge between its
+  entry and exit faces, when the cell past the exit face is empty, against the
+  disc's projected width), which gives the far edge the near field's slope at
+  no extra ray — the inner half of the penumbra only, so it sits half a
+  penumbra inside the geometric edge and is continuous at it. The level ≥ 3
+  floor at `shadowFarLift` is gone: the shading-LOD lift (`lodShadeFade`,
+  §9.u) had already raised every contact shadow to 0.7 well before level 3
+  (~102 m) at any ordinary FOV, so it only mattered under zoom, where it was a
+  0.3 step at 102 m. `shadowFarLift` now only feeds the dead-by-default
+  `shadowMaxDist` experiment (`sunShadowFar`). The near half — casters OUTSIDE
+  the window shadowing receivers inside it — is §9.s's "Casters outside the
+  window". Likewise `render.farSteps` is an LOD handoff rather than a cliff: a
   ray that exhausts a level's budget hands the next level its STOP POINT, not
   the box exit (which left the rest of that level marched by nobody — a hole
   on a grazing hillside), so the budget may be tuned for the frame and its
@@ -12067,7 +12090,7 @@ where you hear from either (§12b, "The ears are on the character").
   skips chunks with nothing in them, and every chunk of the surface band has
   something: a ray 12 m up pitched at the middle distance walked ~90 level-1
   cells of air per band chunk before it met the ground. Above that row
-  `traceFar` and `farShadowDist` now jump to the chunk's exit face (ascending)
+  `traceFar` and `farShadowMarch` now jump to the chunk's exit face (ascending)
   or drop straight onto the row (descending) and resume the DDA there —
   exact, measured pixel-identical to the cell-by-cell march within the
   wind-animated noise of two frames. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
@@ -12149,7 +12172,7 @@ where you hear from either (§12b, "The ears are on the character").
   downsample would disagree with it at their shared boundary. Its cost is one
   comparison for all but ONE cell per column — the surface band, where the four
   corner columns are sampled — and its blind spot is edits, which reach the far
-  field only through the material byte. `farShadowDist` does NOT treat it as a
+  field only through the material byte. `farShadowMarch` does NOT treat it as a
   caster (it did, at every level, until the LOD-seam pass): the flag covers the
   whole band of cells the ground surface passes through, so honouring it
   shadowed most of the far surface at near-zero distance — the ×0.3 lift was
@@ -13210,6 +13233,34 @@ are no spare bits for a second 16-sample window, and a fixed ray is what keeps
 the byte — and therefore the published value — bit-stable in a static scene.
 The two compose as `open + (1 − open)·lift`, which degenerates to the pre-cone
 value exactly when every sample agrees.
+
+**Casters outside the window** (added 2026-09-28, LOD-seam package C).
+`traceOpaque` clips to the residency window, so a patch ray that left the window
+unblocked used to read as sun: a tree two metres past the face, or the ridge a
+low sun sits behind, shadowed nothing inside the window, and a long evening
+shadow stopped dead at the face — a line fixed in the world that jumps a chunk
+at a time as the player walks. The resolve pass now continues every such ray
+(each jittered sample, so the window above softens far casters exactly like
+near ones) through the far cascade from the window exit, with the same cone
+schedule and the same `render.farShadowReach` as the far field's own shadow
+(§9 far-field item (3)), both measured from the PATCH: a receiver one voxel
+inside the face and a far cell one cell outside it see the same casters out to
+the same distance. A ray already past the reach when it leaves the window (the
+usual case for a ray exiting the top) pays one compare. The resolve layout
+gained bindings 18-20 (`farVox`, `farOcc`, `farUBO`) and the `shadow_resolve`
+pass-table row their reads. It is a second copy of the far DDA
+(`shadow_resolve.wgsl farShadowT`), because the march reads bindings
+`common.wgsl` cannot name; what holds it to `raymarch.wgsl farShadowMarch` is
+the cache-off reference (`sunShadowAt(..., beyondWindow = true)`) running the
+same continuation, which `--gate shadow-cache` compares the cache against, and
+`check_invariants.py` pinning its `farBox` literals. Measured (RTX 3060 Ti,
+1080p, `SANDVOX_RUN_EXCLUSIVE=1`, `--render-budget` with
+`SANDVOX_BUDGET_SUN_DEG=15`, which re-times every budget camera to a 15° sun):
+the shadow share (`baseline − noshadow`) of the eye-height `seam` camera went
+1.96 → 2.10 ms, `seamveg` 1.39 → 1.59, `dusk` 0.30 → 0.46, `cascade` 0.30 →
+0.47 — continuation and the far cone trace together; at noon all four moved by
+less than the noise. `--shader-stats`: `raymarch` fs unchanged at 128 registers
++ 144 B local; `shadowResolve` 63 → 64 registers.
 
 **A window belongs to a PATCH, not to a slot.** The slot's `valid` bit is the
 only signal that distinguishes "my samples" from "the samples of whatever patch
