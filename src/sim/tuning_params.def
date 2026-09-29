@@ -1779,6 +1779,10 @@ TP_F(gore, contactImpulseMin, NO_WGSL, 40.0f, 0.0f, 2000.0f)
 TP_F(gore, contactHpPerImpulse, NO_WGSL, 0.25f, 0.0f, 4.0f)
 TP_F(gore, contactMaxHp, NO_WGSL, 60.0f, 0.0f, 1000.0f)
 TP_I(gore, contactMaxPerTick, NO_WGSL, 8, 0, 64)
+// Striker's own approach speed floor (vox/s) and its minimum run of motion
+// (voxels) before a contact is a blow: walking into a body never hurts.
+TP_F(gore, contactMinSpeed, NO_WGSL, 15.0f, 0.0f, 500.0f)
+TP_F(gore, contactMinTravel, NO_WGSL, 2.0f, 0.0f, 100.0f)
 // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
 // A negative rate would make bleeding HEAL, which is not a tuning
 // mistake anyone means; zero is a legitimate "blood is cosmetic again".
