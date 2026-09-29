@@ -5023,6 +5023,9 @@ int main(int argc, char** argv) {
       g_shotBench = true;
       // SANDVOX_BENCH_INVERT runs a longer script (the lift, the turn, the pour).
       g_harnessFrames = kShotBenchLast + (std::getenv("SANDVOX_BENCH_INVERT") ? 160 : 0);
+      // SANDVOX_BENCH_HOLD=<frames>: keep the bench open that much longer
+      // after the pour (watch a reaction play out; with SANDVOX_BENCH_PROF).
+      if (const char* h = std::getenv("SANDVOX_BENCH_HOLD")) g_harnessFrames += (uint64_t)std::max(0, std::atoi(h));
     }
     else if (a == "--shot-devpanel") {
       g_shotDevPanel = true;
@@ -9850,7 +9853,11 @@ int main(int argc, char** argv) {
         if (f == 565) ui.alchemy.wantClose = true;
         if (f == 580) g_shotJumpPath = "screenshot_bench_closed.bmp";
       }
-      if (!invert && f >= 260 && f < 400 && haveA && haveB && !chemNoPour) {
+      // SANDVOX_BENCH_HOLD keeps B held over A's mouth, tipped, that much
+      // longer (the carry lags the pointer: at 400 it had barely arrived).
+      static const uint64_t benchHold =
+          std::getenv("SANDVOX_BENCH_HOLD") ? (uint64_t)std::max(0, std::atoi(std::getenv("SANDVOX_BENCH_HOLD"))) : 0;
+      if (!invert && f >= 260 && f < 400 + benchHold && haveA && haveB && !chemNoPour) {
         const alchemy::V2 grabL{0.0f, hb * 0.35f};
         if (f == 260) {
           grabAt = {pb.pos.x + grabL.x, pb.pos.y + grabL.y};
@@ -9860,7 +9867,12 @@ int main(int argc, char** argv) {
         auto ease = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3 - 2 * t); };
         const float fl = (float)f;
         const alchemy::V2 mouth{pa.pos.x, pa.pos.y + ha};
-        want = fl < 290 ? 0.0f : fl < 330 ? 1.6f * ease((fl - 290) / 40) : 1.6f + 0.9f * ease((fl - 330) / 50);
+        // SANDVOX_BENCH_HOLD (a long pour, a full source): carry it UPRIGHT until
+        // its lip is over the mouth, then tip it about that lip as it lowers
+        // -- a full flask tipped on the way over pours beside the target.
+        const bool careful = benchHold > 0;
+        want = careful ? (fl < 340 ? 0.0f : 2.5f * ease((fl - 340) / 90))
+               : fl < 290 ? 0.0f : fl < 330 ? 1.6f * ease((fl - 290) / 40) : 1.6f + 0.9f * ease((fl - 330) / 50);
         // Where the grab point must be for the lip to sit over the mouth.
         // Tip toward A: counter-clockwise off the left lip when A is to the
         // left, clockwise off the right lip when it is to the right.
@@ -9872,8 +9884,11 @@ int main(int argc, char** argv) {
         const alchemy::V2 lipL{-side * 0.30f * wb * 0.5f, hb};
         const alchemy::V2 r{lipL.x - grabL.x, lipL.y - grabL.y};
         const float c = std::cos(want), sn = std::sin(want);
-        const alchemy::V2 over{mouth.x - (r.x * c - r.y * sn), mouth.y + 14.0f - (r.x * sn + r.y * c)};
-        const alchemy::V2 lifted{start.x, std::max(start.y, mouth.y + hb * 0.7f)};
+        const float clear = careful ? 30.0f * (1.0f - ease((fl - 340) / 90)) : 0.0f;
+        // (The stream leaves the lip moving away from B: aim it short.)
+        const float aim = careful ? side * 7.0f : 0.0f;
+        const alchemy::V2 over{mouth.x + aim - (r.x * c - r.y * sn), mouth.y + 14.0f + clear - (r.x * sn + r.y * c)};
+        const alchemy::V2 lifted{start.x, std::max(start.y, mouth.y + hb * (careful ? 1.0f : 0.7f))};
         alchemy::V2 at = lifted;
         // SANDVOX_BENCH_HIGH=1: lift it as high as the bench lets it go and
         // sweep it side to side up there, no tilt (the raised-arm repro).
@@ -9887,7 +9902,7 @@ int main(int argc, char** argv) {
           const float t = ease((fl - 260) / 30);
           at = {start.x + (lifted.x - start.x) * t, start.y + (lifted.y - start.y) * t};
         } else if (!away) {
-          const float t = ease((fl - 290) / 40);
+          const float t = ease((fl - 290) / (careful ? 50.0f : 40.0f));
           at = {lifted.x + (over.x - lifted.x) * t, lifted.y + (over.y - lifted.y) * t};
         }
         ui.alchemy.tool = 0;
@@ -9903,8 +9918,27 @@ int main(int argc, char** argv) {
         if (f == 289 && !chemNoPour) g_shotJumpPath = "screenshot_bench_lift.bmp";
         if (f == 300 && !chemNoPour) g_shotJumpPath = "screenshot_bench_pour.bmp";
         if (f == 398 && !chemNoPour) g_shotJumpPath = "screenshot_bench_poured.bmp";
-        if (f == 405) ui.alchemy.wantClose = true;
-        if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
+        if (benchHold && (f == 450 || f == 520 || f == 600))
+          g_shotJumpPath = f == 450 ? "screenshot_bench_hold1.bmp" : f == 520 ? "screenshot_bench_hold2.bmp" : "screenshot_bench_hold3.bmp";
+        if (f == 405 + benchHold) ui.alchemy.wantClose = true;
+        if (f == 420 + benchHold) g_shotJumpPath = "screenshot_bench_closed.bmp";
+      }
+      // SANDVOX_BENCH_PROF: the GAME's frame time while the bench runs (the
+      // bench's own step profile prints from its thread, AlchemyBench::Run).
+      static const bool benchProf = std::getenv("SANDVOX_BENCH_PROF") != nullptr;
+      if (benchProf) {
+        using clk = std::chrono::steady_clock;
+        static clk::time_point last = clk::now();
+        static double sum = 0, worst = 0;
+        const clk::time_point now = clk::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+        sum += ms;
+        worst = std::max(worst, ms);
+        if (f % 30 == 0) {
+          std::printf("bench prof: game frames %llu: %.2f ms mean, %.2f worst\n", (unsigned long long)f, sum / 30, worst);
+          sum = worst = 0;
+        }
       }
     }
     // --shot-dialogue's schedule (see g_shotDialogue).
@@ -14688,7 +14722,11 @@ int main(int argc, char** argv) {
         // back to the vessel nearest where it fell off the table.
         std::vector<alchemy::BenchSpill> fellBy;
         float exitX = -1.0f;
-        if (bench.IsOpen() && bench.TakeSpill(fellBy, exitX)) {
+        // SANDVOX_BENCH_NOSTREAM=1 (a diagnosis arm): what leaves the table is
+        // dropped, not poured into the world.
+        static const bool benchNoStream = std::getenv("SANDVOX_BENCH_NOSTREAM") != nullptr;
+        if (bench.IsOpen() && bench.TakeSpill(fellBy, exitX) && benchNoStream) fellBy.clear();
+        if (!fellBy.empty()) {
           for (const alchemy::BenchSpill& bs : fellBy) {
             const alchemy::Composition& fell = bs.what;
             ContainerSpill sp;
@@ -14723,10 +14761,15 @@ int main(int argc, char** argv) {
             sp.seed = rng::Hash3(0xA1C4E5u, (uint32_t)frameCounter,
                                  fell.Total() + 131u * (uint32_t)(&bs - fellBy.data()));
             tickCtx.vesselSpills.push_back(sp);
-            if (std::getenv("SANDVOX_BENCH_DEBUG"))
-              std::printf("bench spill: frame %llu, %u eighths off the table at x %.0f, from %s (view %d)\n",
+            if (std::getenv("SANDVOX_BENCH_DEBUG")) {
+              std::string what;
+              for (int i = 0; i < fell.n; i++)
+                if (fell.p[i].mat < mats.size())
+                  what += " " + mats[fell.p[i].mat].name + " " + std::to_string(fell.p[i].eighths);
+              std::printf("bench spill: frame %llu, %u eighths off the table at x %.0f, from %s (view %d):%s\n",
                           (unsigned long long)frameCounter, fell.Total(), exitX,
-                          bs.ref.Valid() ? "its vessel" : "no known vessel", nearest);
+                          bs.ref.Valid() ? "its vessel" : "no known vessel", nearest, what.c_str());
+            }
           }
         }
       }

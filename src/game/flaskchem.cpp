@@ -86,6 +86,15 @@ inline int Enc(int v) {
   return t.v[std::clamp(v, 0, 255)];
 }
 
+// A die that is a function of WHAT it is for (the step, the pixel or face,
+// which throw), not of how many were thrown before it: the loops that use
+// it run on the bench's workers in any order and still roll the same.
+inline float HashU01(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t h = a * 0x9E3779B1u ^ (b + 0x632BE5ABu) * 0x85EBCA77u ^ (c + 0x1B873593u) * 0xC2B2AE3Du;
+  h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+  return (float)(h >> 8) * (1.0f / 16777216.0f);
+}
+
 inline uint8_t DirOf(float dx, float dy) {
   if (std::fabs(dy) >= std::fabs(dx)) return dy > 0 ? kChemUp : kChemDown;
   return kChemSide;
@@ -108,6 +117,7 @@ inline float Noise2(float x, float y) {
 }
 
 }  // namespace
+
 
 // ---- setup -----------------------------------------------------------------
 
@@ -791,6 +801,10 @@ void FlaskSim::BucketChem() {
   for (int k : chemTouched_) chemHead_[k] = -1;
   chemTouched_.clear();
   chemNext_.assign(px_.size(), -1);
+  if (nearLiq_.size() != N) nearLiq_.assign(N, 0);
+  for (int k : nearLiqTouched_) nearLiq_[k] = 0;
+  nearLiqTouched_.clear();
+  const float r = spacing_ * 0.8f, r2 = r * r;
   for (size_t i = 0; i < px_.size(); i++) {
     const int x = (int)std::floor(px_[i].x), y = (int)std::floor(px_[i].y);
     if (x < 0 || y < 0 || x >= W || y >= H) continue;
@@ -798,6 +812,15 @@ void FlaskSim::BucketChem() {
     if (chemHead_[k] < 0) chemTouched_.push_back(k);
     chemNext_[i] = chemHead_[k];
     chemHead_[k] = (int)i;
+    if (!pw_[i]) continue;
+    const V2 p = px_[i];
+    for (int yy = std::max(0, (int)std::floor(p.y - r - 0.5f)); yy <= std::min(H - 1, (int)std::floor(p.y + r - 0.5f) + 1); yy++)
+      for (int xx = std::max(0, (int)std::floor(p.x - r - 0.5f)); xx <= std::min(W - 1, (int)std::floor(p.x + r - 0.5f) + 1); xx++) {
+        const float dx = xx + 0.5f - p.x, dy = yy + 0.5f - p.y;
+        if (dx * dx + dy * dy >= r2) continue;
+        const int kk = yy * W + xx;
+        if (!nearLiq_[kk]) { nearLiq_[kk] = 1; nearLiqTouched_.push_back(kk); }
+      }
   }
 }
 
@@ -902,7 +925,8 @@ void FlaskSim::GatherPixelNbrs(int x, int y, int hv, bool isGas, std::vector<Che
   out.clear();
   const int W = cfg_.gridW, H = cfg_.gridH;
   static const int kD[4][2] = {{0, 1}, {1, 0}, {-1, 0}, {0, -1}};
-  if (isGas) {
+  const bool masked = nearLiq_.size() == (size_t)W * H;
+  if (isGas && (!masked || nearLiq_[(size_t)y * W + x])) {
     // A bubble: the liquid it is in.
     const int j = NearestParticle(x + 0.5f, y + 0.5f, spacing_ * 0.6f);
     if (j >= 0) out.push_back({NbParticle, j, psub_[j], kChemSide, px_[j]});
@@ -920,7 +944,7 @@ void FlaskSim::GatherPixelNbrs(int x, int y, int hv, bool isGas, std::vector<Che
       out.push_back({NbGrain, gi, grains_[gi].sub, dir, at});
       continue;
     }
-    const int j = NearestParticle(at.x, at.y, spacing_ * 0.8f);
+    const int j = masked && !nearLiq_[k] ? -1 : NearestParticle(at.x, at.y, spacing_ * 0.8f);
     if (j >= 0) {
       out.push_back({NbParticle, j, psub_[j], dir, px_[j]});
       continue;
@@ -951,7 +975,16 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
   // Matter units for a side of a pair that converts `qf` GAS units' worth
   // (a gas side converts its gas units as they are).
   auto matterOf = [&](int64_t qf) { return (int)std::max<int64_t>(1, (qf + E - 1) / E); };
-  const int nn = (int)nb.size();
+  // The neighbours, gathered on first need (StepChemistry's gas pixels come
+  // here with nbPending_ set and `nb` empty).
+  auto gather = [&]() -> int {
+    if (nbPending_.on) {
+      nbPending_.on = false;
+      GatherPixelNbrs(nbPending_.x, nbPending_.y, nbPending_.hv, nbPending_.isGas, nbScratch_);
+    }
+    return (int)nb.size();
+  };
+  const std::vector<uint8_t>* live = slot < (int)ruleLive_.size() ? &ruleLive_[slot] : nullptr;
   auto matches = [&](const ChemRule& r, const ChemNb& n) {
     switch (n.type) {
       case NbAir: return ChemNbrMatches(r, 0, 0, 0, true);
@@ -968,7 +1001,10 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     if (n.type == NbSpark && chem_.spark.mat != 0xFFFFFFFFu) return (uint16_t)chem_.spark.mat;
     return 0;
   };
-  for (const ChemRule& r : rules) {
+  for (size_t ri = 0; ri < rules.size(); ri++) {
+    const ChemRule& r = rules[ri];
+    // A pair whose neighbour nothing on the bench can be this step.
+    if (live && ri < live->size() && !(*live)[ri]) continue;
     if (!ChemGateOpen(r.cond, chem_.daylight)) continue;
     // THE CONCENTRATION CONDITION (benchchem.h ChemRule::soluteSpecies), the
     // world's solRuleAllows on a particle: only a LIQUID self (a particle)
@@ -1008,23 +1044,24 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     //    lip, and fills it (owner, 2026-09-27: "the gas is heavier than air
     //    and should build up"). Its dispersal waits until it has spilled
     //    over the lip; out there it sinks, and fades or vents to the world.
-    if (inVessel && selfType == NbGas && subs_[slot].heavy && r.kind == kChemDecay &&
-        r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen)
-      continue;
-    if (sealed && r.kind == kChemDecay && r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen)
-      continue;
+    //  - A FLAME's decay to air is none of these: it is the flame BURNING
+    //    OUT where it is (fire, burning ether -- FlaskSim::Flame), in a sealed
+    //    vessel, in a bottle or in the room alike. Held back, every flame on
+    //    the bench outlived the world's and ended as smoke: poured into a hot
+    //    flask, 128 eighths of ether filled a third of the bench with it.
+    if (inVessel && selfType == NbGas && subs_[slot].heavy && Disperses(r, slot)) continue;
+    if (sealed && Disperses(r, slot)) continue;
     //  - A GAS OUT OF EVERY VESSEL is in the room: it lingers, thins and
     //    VENTS into the world (StepGas), where the world's own rule disperses
     //    it. Its slow dispersal here too deleted what the world should get --
     //    fumes born under acid (noxious gas fades in ~2 s) crossed the mouth
     //    and were gone before a single eighth reached the world
     //    (alchemy-react vented 0).
-    if (!inVessel && selfType == NbGas && r.kind == kChemDecay && r.prodSelf == kChemAir &&
-        r.chance * 10u < chem_.chanceDen)
-      continue;
+    if (!inVessel && selfType == NbGas && Disperses(r, slot)) continue;
     if (r.kind == kChemDecay) {
       uint32_t chance = r.chance;
       if (ChemScaleArmed(r.cond)) {
+        const int nn = gather();
         uint32_t count = 0;
         for (int k = 0; k < nn && count < 6; k++)
           count += matches(r, nb[k]) != ChemScaleInverted(r.cond);
@@ -1059,6 +1096,13 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
       firedTotal_++;
       return true;
     }
+    // ROLL FIRST, then look: a pair or an emit fires on ONE roll against the
+    // neighbour it finds, and the heat's factor is at most 1 -- a roll over
+    // the rule's own chance fails whatever is there, so nothing need be
+    // gathered to know it. The same odds, far fewer gathers.
+    const double roll = Rand01() * den;
+    if (roll >= r.chance * scale) continue;
+    const int nn = gather();
     if (!nn) continue;
     const int rot = (int)(Rand() % (uint32_t)nn);
     if (r.kind == kChemEmit) {
@@ -1070,9 +1114,26 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
         break;
       }
       if (hit < 0) continue;
-      if (Rand01() * den >= r.chance * scale) continue;
-      const int q = std::min(matterOf(FineOf(selfType, selfIdx)), cfg_.unitsPerParticle);
-      if (r.prodNbr >= 0) {
+      if (r.prodNbr >= 0 && selfType == NbGas) {
+        // A GAS PIXEL IS A FRACTION OF A CELL: it emits its own amount of
+        // the product, in gas units. Rounded up to a whole matter unit (a
+        // world cell's worth, gasExpand gas units), a burning wisp of 7 gas
+        // units threw 128 of fire -- 18x the world's one-for-one -- and a
+        // cloud of burning ether filled the bench with fire and its smoke.
+        // What is under a whole unit waits in the emitter's credit (not
+        // matter yet: nothing is counted until it is produced).
+        const size_t S = subs_.size(), need = (vessels_.size() + 1) * S;
+        if (emitCredit_.size() < need) emitCredit_.resize(need, 0);
+        uint32_t& cr = emitCredit_[(size_t)GasBin(hv) * S + (size_t)r.prodNbr];
+        cr += gasAmt_[selfIdx];
+        const uint32_t whole = cr / (uint32_t)E;
+        cr -= whole * (uint32_t)E;
+        if (whole) {
+          produced_[r.prodNbr] += whole;
+          Deposit(r.prodNbr, whole, nb[hit].at, hv);
+        }
+      } else if (r.prodNbr >= 0) {
+        const int q = std::min(matterOf(FineOf(selfType, selfIdx)), cfg_.unitsPerParticle);
         produced_[r.prodNbr] += q;
         Deposit(r.prodNbr, (uint32_t)q, nb[hit].at, hv);
       }
@@ -1098,7 +1159,7 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     const ChemNb n = nb[hit];
     // Through the glass, heat is as strong as the glass is hot.
     const double factor = n.type == NbHeat ? std::max(0.0f, vessels_[n.idx].heat) : 1.0;
-    if (Rand01() * den >= r.chance * scale * factor) continue;
+    if (roll >= r.chance * scale * factor) continue;
     const bool virt = n.type == NbAir || n.type == NbHeat || n.type == NbSpark;
     // THE QUANTUM: the smaller side, in GAS units (the finest there is), so
     // a pixel of thin gas meets a particle as the little matter it is. Each
@@ -1135,6 +1196,8 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
 // ---- one chemistry step ------------------------------------------------------
 
 void FlaskSim::StepChemistry() {
+  const double tc0 = NowMs();
+  prof_.chemSteps++;
   UpdateDevices();
   chemStep_++;
   if (!chemOn_ || chemPaused_) {
@@ -1173,10 +1236,14 @@ void FlaskSim::StepChemistry() {
   for (const Vessel& v : vessels_)
     if (!v.outline.empty()) { anyHeat |= v.heat > 0.02f; anyShock |= v.shock > 0; }
   bool anyActive = false;
+  if (ruleLive_.size() != subs_.size()) ruleLive_.assign(subs_.size(), {});
   for (size_t s = 0; s < subs_.size(); s++) {
     activeSlot_[s] = 0;
     if (!present_[s]) continue;
-    for (const ChemRule& r : chem_.rules[s]) {
+    std::vector<uint8_t>& live = ruleLive_[s];
+    live.assign(chem_.rules[s].size(), 0);
+    for (size_t ri = 0; ri < chem_.rules[s].size(); ri++) {
+      const ChemRule& r = chem_.rules[s][ri];
       if (!ChemGateOpen(r.cond, chem_.daylight)) continue;
       bool can = r.kind != kChemPair;
       if (!can && r.nbrMat == 0) can = true;
@@ -1187,6 +1254,7 @@ void FlaskSim::StepChemistry() {
       for (size_t t = 0; t < subs_.size() && !can; t++)
         can = present_[t] && ChemNbrMatches(r, subs_[t].mat, subs_[t].tagMask, subs_[t].klass, false);
       if (!can) continue;
+      live[ri] = 1;
       // Bit 1: it can fire somewhere. Bit 2: it can fire inside a STOPPERED
       // vessel too -- a slow decay to air or a drying rule cannot (TryRules),
       // and a flask full of vapour whose only rule is its dispersal need not
@@ -1194,12 +1262,15 @@ void FlaskSim::StepChemistry() {
       // Bit 4: it can fire inside an OPEN vessel (a drying rule cannot).
       activeSlot_[s] |= 1;
       // (Nor can a heavy gas's slow dispersal: TryRules keeps it in the bottle.)
-      const bool heavyStays = subs_[s].gas && subs_[s].heavy && r.kind == kChemDecay && r.prodSelf == kChemAir &&
-                              r.chance * 10u < chem_.chanceDen;
+      const bool disperses = Disperses(r, (int)s);
+      const bool heavyStays = subs_[s].gas && subs_[s].heavy && disperses;
       if (!r.drying && !heavyStays) activeSlot_[s] |= 4;
-      const bool blockedSealed =
-          r.drying || (r.kind == kChemDecay && r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen);
-      if (!blockedSealed) { activeSlot_[s] |= 2 | 4; break; }
+      // Bit 8: it can fire on a GAS PIXEL OUT IN THE ROOM -- a gas's slow
+      // dispersal cannot (TryRules: the world gets it), and a room full of
+      // smoke whose only rule is its dispersal need not gather anything.
+      if (!subs_[s].gas || !disperses) activeSlot_[s] |= 8;
+      const bool blockedSealed = r.drying || disperses;
+      if (!blockedSealed) activeSlot_[s] |= 2 | 4 | 8;
     }
     anyActive |= activeSlot_[s] != 0;
   }
@@ -1210,8 +1281,11 @@ void FlaskSim::StepChemistry() {
     if (hv < 0) return a != 0;
     return (a & (vessels_[hv].stoppered ? 2 : 4)) != 0;
   };
+  auto canFireGas = [&](int s, int hv) { return hv < 0 ? (activeSlot_[s] & 8) != 0 : canFire(s, hv); };
 
   // PARTICLES: their rules, then what is dissolved in them.
+  const double tc1 = NowMs();
+  prof_.chemTail += tc1 - tc0;
   const int n0 = (int)px_.size();
   for (int i = 0; i < n0 && firedThisStep_ < cfg_.chemMaxFires; i++) {
     if (!pw_[i]) continue;
@@ -1265,6 +1339,8 @@ void FlaskSim::StepChemistry() {
 
   // GRAINS: dissolving first (a species' powder touching its solvent), then
   // their rules.
+  const double tc2 = NowMs();
+  prof_.chemPart += tc2 - tc1;
   const int g0 = (int)grains_.size();
   for (int gi = 0; gi < g0 && firedThisStep_ < cfg_.chemMaxFires; gi++) {
     if (grainDead_[gi]) continue;
@@ -1299,6 +1375,8 @@ void FlaskSim::StepChemistry() {
   }
 
   // GAS: its rules (smoke fades, a spark dies, hydrogen meets the flame).
+  const double tc3 = NowMs();
+  prof_.chemGrain += tc3 - tc2;
   if (anyActive) {
     const size_t nG = gasList_.size();
     for (size_t a = 0; a < nG && firedThisStep_ < cfg_.chemMaxFires; a++) {
@@ -1309,12 +1387,17 @@ void FlaskSim::StepChemistry() {
       const int x = k % W, y = k / W;
       int hv = (int)inside_[k] - 1;
       if (hv >= (int)vessels_.size() || (hv >= 0 && vessels_[hv].outline.empty())) hv = -1;
-      if (!canFire(s, hv)) continue;
-      GatherPixelNbrs(x, y, hv, true, nbScratch_);
+      if (!canFireGas(s, hv)) continue;
+      nbScratch_.clear();
+      nbPending_ = {true, x, y, hv, true};
       TryRules(NbGas, k, s, nbScratch_, hv, {x + 0.5f, y + 0.5f}, scale);
+      nbPending_.on = false;
     }
   }
 
+  const double tc4 = NowMs();
+  prof_.chemGas += tc4 - tc3;
+  prof_.peakFires = std::max(prof_.peakFires, firedThisStep_);
   FlushPools();
   CompactDead();
   CheckPressure();
@@ -1322,6 +1405,7 @@ void FlaskSim::StepChemistry() {
     needPartition_ = false;
     Partition();
   }
+  prof_.chemTail += NowMs() - tc4;
 }
 
 void FlaskSim::CompactDead() {
@@ -1626,7 +1710,9 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
   // breathed across the glass.
   const float buoyK = cfg_.gasBuoyancy / (float)(C * C * R);
   const int T = kGasTile;
-  for (int j = by0; j <= by1; j++)
+  // A row of cells at a time on the bench's workers: a cell writes only its own.
+  BenchParallelFor(by1 - by0 + 1, 8, [&](int rb, int re) {
+  for (int j = by0 + rb; j < by0 + re; j++)
     for (int i = bx0; i <= bx1; i++) {
       if (!gTileOn_[(size_t)(j / T) * gtlW_ + i / T]) continue;   // open air (lf 2)
       int solid = 0, freePx = 0, wallV = -1;
@@ -1677,6 +1763,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       }
       gcBuoy_[c] = b;
     }
+  });
 
   // 3. FORCES, on faces between two air cells: buoyancy (vertical faces),
   // the frame's felt acceleration, vorticity confinement; then damping.
@@ -1690,7 +1777,8 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
     // The curl at each air cell (centred differences of face velocities
     // averaged to the centres; a solid or open neighbour mirrors its own).
     std::vector<float>& curl = gcCurl_;
-    for (int j = by0; j <= by1; j++)
+    BenchParallelFor(by1 - by0 + 1, 8, [&](int rb, int re) {
+    for (int j = by0 + rb; j < by0 + re; j++)
       for (int i = bx0; i <= bx1; i++) {
         const int l = L(i, j), c = cell(i, j);
         if (lf[l] != 0) { curl[c] = 0; continue; }
@@ -1699,6 +1787,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
         const float ut = lf[l + LW] == 0 ? uc(i, j + 1) : u0, ub = lf[l - LW] == 0 ? uc(i, j - 1) : u0;
         curl[c] = 0.5f * (vr - vl) - 0.5f * (ut - ub);
       }
+    });
     // The confinement force, weighted by the gas in the cell (pure air is
     // left to calm: the curls worth keeping are the ones you can see).
     for (int j = by0; j <= by1; j++)
@@ -1721,10 +1810,11 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
   // an exchange -- a flask held mouth-down would hold its heavy vapour over
   // the neck for ever instead of glugging it out.
   const float jitA = cfg_.gasJitter;
-  auto jit = [&](int ca, int cb) {
+  const uint32_t jitStep = step_;
+  auto jit = [&](int ca, int cb, uint32_t face) {
     if (jitA <= 0) return 0.0f;
     const float w = std::min(1.0f, 2.0f * (gcDen_[ca] + gcDen_[cb]));
-    return w > 0 ? jitA * w * (float)(Rand01() - 0.5) : 0.0f;
+    return w > 0 ? jitA * w * (HashU01(jitStep, face, 0x717u) - 0.5f) : 0.0f;
   };
   // THE DRAUGHT (SimConfig::gasWind): air outside every vessel is pulled
   // toward the room's breeze, gasWindGrip of the difference a step. Its
@@ -1749,7 +1839,9 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       w[4] = windU0_ * (0.7f + 0.3f * (j + 0.5f) * C / (float)H);
     }
   }
-  for (int j = by0; j <= by1; j++)
+  // Faces a row at a time on the bench's workers: each writes only itself.
+  BenchParallelFor(by1 - by0 + 1, 8, [&](int rb, int re) {
+  for (int j = by0 + rb; j < by0 + re; j++)
     for (int i = bx0 + 1; i <= bx1; i++) {
       const int c0 = j * cw;
       const int l = L(i, j);
@@ -1763,9 +1855,11 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
         u += grip * (wr[4] + 0.6f * windA * wc[0] * wr[3] - u);
       }
       const size_t q = (size_t)(j - by0) * bw + (i - bx0);
-      u = (u + 0.5f * (conf[q - 1].x + conf[q].x) + jit(c0 + i - 1, c0 + i)) * keep;
+      u = (u + 0.5f * (conf[q - 1].x + conf[q].x) + jit(c0 + i - 1, c0 + i, (uint32_t)(j * U1 + i) * 2u)) * keep;
     }
-  for (int j = by0 + 1; j <= by1; j++)
+  });
+  BenchParallelFor(by1 - by0, 8, [&](int rb, int re) {
+  for (int j = by0 + 1 + rb; j < by0 + 1 + re; j++)
     for (int i = bx0; i <= bx1; i++) {
       const int l = L(i, j);
       if (lf[l - LW] != 0 || lf[l] != 0) continue;
@@ -1780,12 +1874,16 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       }
       const size_t q = (size_t)(j - by0) * bw + (i - bx0);
       v += b;
-      v = (v + 0.5f * (conf[q - bw].y + conf[q].y) + jit(cell(i, j - 1), cell(i, j))) * keep;
+      v = (v + 0.5f * (conf[q - bw].y + conf[q].y) + jit(cell(i, j - 1), cell(i, j), (uint32_t)(j * cw + i) * 2u + 1u)) * keep;
     }
+  });
 
   // 4. SELF-ADVECTION (semi-Lagrangian): each face takes the velocity from
   // where its air was a step ago.
-  for (int j = by0; j <= by1; j++)
+  const double ta0 = NowMs();
+  // Rows on the bench's workers: a face reads the old field, writes its own.
+  BenchParallelFor(by1 - by0 + 1, 8, [&](int rb, int re) {
+  for (int j = by0 + rb; j < by0 + re; j++)
     for (int i = bx0; i <= bx1 + 1; i++) {
       const int l = L(i, j);
       if (lf[l - 1] != 0 && lf[l] != 0) continue;
@@ -1793,7 +1891,9 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       const float u = gu[j * U1 + i], v = SampleGv(x, y);
       gu2_[j * U1 + i] = SampleGu(x - u, y - v);
     }
-  for (int j = by0; j <= by1 + 1; j++)
+  });
+  BenchParallelFor(by1 - by0 + 2, 8, [&](int rb, int re) {
+  for (int j = by0 + rb; j < by0 + re; j++)
     for (int i = bx0; i <= bx1; i++) {
       const int l = L(i, j);
       if (lf[l - LW] != 0 && lf[l] != 0) continue;
@@ -1801,6 +1901,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       const float u = SampleGu(x, y), v = gv[j * cw + i];
       gv2_[j * cw + i] = SampleGv(x - u, y - v);
     }
+  });
   for (int j = by0; j <= by1; j++)
     for (int i = bx0; i <= bx1 + 1; i++) {
       const int l = L(i, j);
@@ -1814,6 +1915,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       gv[j * cw + i] = gv2_[j * cw + i];
     }
 
+  prof_.flowAdvect += NowMs() - ta0;
   // 5. THE WALLS: a face between air and a solid moves with the solid, as
   // seen from the air's frame; between two solids (or on the table) it is still.
   auto wallFace = [&](int ai, int aj, int bi, int bj, int la, int lb, bool horiz, float& f) {
@@ -1923,6 +2025,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       }
   }
 
+  const double ts0 = NowMs();
   // 7. PRESSURE: red-black successive over-relaxation, warm-started. Solid
   // and open cells hold p = 0 in `lp`, so a neighbour's term is just its p;
   // only the count differs (a solid neighbour is not counted: Neumann).
@@ -1960,6 +2063,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       }
   }
 
+  prof_.flowSolve += NowMs() - ts0;
   // 8. PROJECT: subtract the pressure gradient from every face with air on
   // at least one side and no wall on either.
   const float vmax = cfg_.gasMaxSpeed;
@@ -2012,7 +2116,8 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       // The phase is not interpolated across a wrap: the nearest texel's.
       o[4] = (tx < 0.5f ? (ty < 0.5f ? a : c) : (ty < 0.5f ? b : d))[4];
     };
-    for (int j = tj0; j <= tj1; j++)
+    BenchParallelFor(tj1 - tj0 + 1, 4, [&](int rb, int re) {
+    for (int j = tj0 + rb; j < tj0 + re; j++)
       for (int i = ti0; i <= ti1; i++) {
         const float x = (i + 0.5f) * T, y = (j + 0.5f) * T;
         const float u = SampleGu(x, y), v = SampleGv(x, y);
@@ -2027,11 +2132,23 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
         if (ph0 < 0.5f && ph >= 0.5f) { o[2] = x; o[3] = y; }
         o[4] = ph;
       }
+    });
   }
   (void)H;
 }
 
 void FlaskSim::StepGas() {
+  const double tg0 = NowMs();
+  prof_.gasSteps++;
+  struct Timed {
+    Profile& p;
+    double t0, t1 = -1;
+    ~Timed() {
+      const double t = NowMs();
+      if (t1 < 0) p.gasFlow += t - t0;
+      else { p.gasFlow += t1 - t0; p.gasMove += t - t1; }
+    }
+  } timed{prof_, tg0};
   const int W = cfg_.gridW, H = cfg_.gridH, C = kGasCell;
   // Drop drained pixels from the list.
   {
@@ -2111,6 +2228,7 @@ void FlaskSim::StepGas() {
   gbx0_ = bx0; gby0_ = by0; gbx1_ = bx1; gby1_ = by1;
 
   StepGasFlow(bx0, by0, bx1, by1);
+  timed.t1 = NowMs();
 
   // ---- TRANSPORT -------------------------------------------------------------
   const uint32_t cap = (uint32_t)cfg_.gasPixelCap;
@@ -2177,6 +2295,13 @@ void FlaskSim::StepGas() {
     if (wall_[nk] || grid_[nk] || liqPx_[nk]) return false;
     return !gasAmt_[nk] || gasSub_[nk] == s;
   };
+  // THREE PASSES. (A) in list order: what leaves the flow -- a pixel in
+  // glass, the room's thinning, a bubble -- with its dice; (B) the flow's
+  // fluxes of every pixel left, on the bench's workers (the face velocities,
+  // the mouth's draw, the neighbours: most of the cost, and no dice);
+  // (C) in list order again: each flux rounded and moved. (The fluxes read
+  // the neighbours after all of A's thinning, not partway through it.)
+  flowK_.clear();
   const size_t nG = gasList_.size();
   for (size_t a = 0; a < nG; a++) {
     const int k = gasList_[a];
@@ -2241,6 +2366,18 @@ void FlaskSim::StepGas() {
       }
       continue;
     }
+    flowK_.push_back(k);
+  }
+  const int nF = (int)flowK_.size();
+  flowF_.resize((size_t)nF * 4);
+  flowTo_.resize((size_t)nF * 4);
+  BenchParallelFor(nF, 256, [&](int fb, int fe) {
+  for (int fi = fb; fi < fe; fi++) {
+    const int k = flowK_[fi];
+    const int x = k % W, y = k / W;
+    const int s = gasSub_[k];
+    const Substance& S = subs_[s];
+    const uint32_t amt = gasAmt_[k];
     // THE FLOW: upwind through each face by its velocity, plus diffusion
     // down the difference.
     const float cx = x + 0.5f, cy = y + 0.5f;
@@ -2264,9 +2401,8 @@ void FlaskSim::StepGas() {
       vel[2] += sp * md.up.y; vel[3] -= sp * md.up.y;
     }
     static const int kD[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-    float f[4];
-    int to[4];
-    float sum = 0;
+    float* f = &flowF_[(size_t)fi * 4];
+    int* to = &flowTo_[(size_t)fi * 4];
     for (int d = 0; d < 4; d++) {
       f[d] = 0;
       to[d] = -1;
@@ -2275,7 +2411,6 @@ void FlaskSim::StepGas() {
       if (ny >= H) {   // off the top: in the world
         to[d] = -2;
         f[d] = (float)amt * std::max(0.0f, vel[d]);
-        sum += f[d];
         continue;
       }
       const int nk = ny * W + nx;
@@ -2288,19 +2423,47 @@ void FlaskSim::StepGas() {
       const float ex = std::max(0.0f, (float)amt - Rf) - std::max(0.0f, b - Rf);
       f[d] = (float)amt * std::max(0.0f, vel[d]) + D * std::max(0.0f, (float)amt - b) + Dx * std::max(0.0f, ex);
       to[d] = nk;
-      sum += f[d];
     }
-    if (sum <= 0) continue;
-    const float lim = 0.95f * (float)amt;
-    const float sc = sum > lim ? lim / sum : 1.0f;
-    uint32_t left = amt;
-    for (int d = 0; d < 4 && left; d++) {
-      if (to[d] == -1 || f[d] <= 0) continue;
-      const uint32_t n = std::min(left, stoch(f[d] * sc));
-      if (!n) continue;
-      if (to[d] == -2) { vent(k, n); left -= n; continue; }
-      gasMoves_.push_back({k, to[d], (uint16_t)n, (uint8_t)s, gasAge_[k]});
-      left -= n;
+  }
+  });
+  // Each flux rounded to whole units -- on the workers, with dice that
+  // belong to the pixel and the face (HashU01), so any order rolls the same --
+  // then moved, in list order.
+  flowN_.resize((size_t)nF * 4);
+  const uint32_t moveStep = step_;
+  BenchParallelFor(nF, 512, [&](int fb, int fe) {
+    for (int fi = fb; fi < fe; fi++) {
+      const int k = flowK_[fi];
+      const float* f = &flowF_[(size_t)fi * 4];
+      const int* to = &flowTo_[(size_t)fi * 4];
+      uint16_t* nOut = &flowN_[(size_t)fi * 4];
+      nOut[0] = nOut[1] = nOut[2] = nOut[3] = 0;
+      const float sum = f[0] + f[1] + f[2] + f[3];
+      if (sum <= 0) continue;
+      const uint32_t amt = gasAmt_[k];
+      const float lim = 0.95f * (float)amt;
+      const float sc = sum > lim ? lim / sum : 1.0f;
+      uint32_t left = amt;
+      for (int d = 0; d < 4 && left; d++) {
+        if (to[d] == -1 || f[d] <= 0) continue;
+        const float x = f[d] * sc, fl = std::floor(x);
+        const uint32_t r = (uint32_t)fl + (HashU01(moveStep, (uint32_t)k, 0xA0u + (uint32_t)d) < x - fl ? 1u : 0u);
+        const uint32_t n = std::min(left, r);
+        nOut[d] = (uint16_t)n;
+        left -= n;
+      }
+    }
+  });
+  for (int fi = 0; fi < nF; fi++) {
+    const uint16_t* nIn = &flowN_[(size_t)fi * 4];
+    if (!(nIn[0] | nIn[1] | nIn[2] | nIn[3])) continue;
+    const int k = flowK_[fi];
+    const int* to = &flowTo_[(size_t)fi * 4];
+    const int s = gasSub_[k];
+    for (int d = 0; d < 4; d++) {
+      if (!nIn[d]) continue;
+      if (to[d] == -2) { vent(k, nIn[d]); continue; }
+      gasMoves_.push_back({k, to[d], nIn[d], (uint8_t)s, gasAge_[k]});
     }
   }
   // Apply: every move leaves its pixel first, then arrives -- a pixel that
@@ -2315,8 +2478,15 @@ void FlaskSim::StepGas() {
       const uint32_t room = cap - std::min<uint32_t>(cap, gasAmt_[dst]);
       const uint32_t put = std::min(q, room);
       if (put) {
+        // The age of what is there, by weight: a thin old haze that takes a
+        // wisp of fresh smoke stays old. (It took the YOUNGER age, and since
+        // diffusion trades units between neighbours every step the youngest
+        // age flooded a whole connected cloud at a pixel a step -- a room of
+        // smoke fed by one flame never aged, so never thinned into the room:
+        // the ether fire held ~30k px of haze for as long as it burned.)
         if (!gasAmt_[dst]) gasAge_[dst] = m.age;
-        else gasAge_[dst] = std::min(gasAge_[dst], m.age);
+        else gasAge_[dst] = (uint8_t)(((uint32_t)gasAge_[dst] * gasAmt_[dst] + (uint32_t)m.age * put +
+                                       (gasAmt_[dst] + put) / 2) / (gasAmt_[dst] + put));
         gasSub_[dst] = m.sub;
         gasAmt_[dst] = (uint16_t)(gasAmt_[dst] + put);
         AddGasPixel(dst);
@@ -2353,9 +2523,16 @@ void FlaskSim::CarryGas() {
     const Vessel& v = vessels_[vi];
     if (v.outline.empty()) continue;
     if (v.x.pos.x == v.prevX.pos.x && v.x.pos.y == v.prevX.pos.y && v.x.angle == v.prevX.angle) continue;
+    // Only what lay in its box before the move can have been inside it.
+    float bx0 = 1e9f, bx1 = -1e9f, by0 = 1e9f, by1 = -1e9f;
+    for (V2 o : v.outline) {
+      const V2 w = ToWorld(v.prevX, o);
+      bx0 = std::min(bx0, w.x); bx1 = std::max(bx1, w.x); by0 = std::min(by0, w.y); by1 = std::max(by1, w.y);
+    }
     for (int k : gasList_) {
       if (!gasAmt_[k]) continue;
       const V2 p{(k % W) + 0.5f, (k / W) + 0.5f};
+      if (p.x < bx0 || p.x > bx1 || p.y < by0 || p.y > by1) continue;
       const V2 l = ToLocal(v.prevX, p);
       if (!InsideLocal(v, l)) continue;
       const V2 w = ToWorld(v.x, l);
@@ -2393,6 +2570,11 @@ void FlaskSim::CarryGas() {
 // here reads the clock. Lit from above: a deep cloud is darker underneath.
 // In liquid it is bubbles.
 void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
+  struct Timed {
+    Profile& p;
+    double t0;
+    ~Timed() { p.renderGas += NowMs() - t0; }
+  } timed{prof_, NowMs()};
   if (gasList_.empty() || gtc_.empty()) return;
   const int W = cfg_.gridW, H = cfg_.gridH, C = kGasCell;
   const float invR = 1.0f / (float)GasR();
@@ -2414,28 +2596,41 @@ void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
   rGas_.assign(n, 0.0f);
   std::vector<float>& tmp = rGasTmp_;
   tmp.assign(n, 0.0f);
-  for (int yy = 0; yy < bh; yy++)
-    for (int xx = 0; xx < bw; xx++) {
-      const size_t k = (size_t)(yy + y0) * W + xx + x0;
-      if (!gasAmt_[k]) continue;
-      const float a = (float)gasAmt_[k] * invR;
-      for (int t = -kR; t <= kR; t++) {
-        const int x = xx + t;
-        if (x >= 0 && x < bw) tmp[(size_t)yy * bw + x] += a * kG[t + kR];
+  // GATHERED, a row at a time on the bench's workers: each output sums its
+  // five taps in the order the old scatter added them (source left to
+  // right, then bottom to top), so the same floats.
+  BenchParallelFor(bh, 16, [&](int rb, int re) {
+    for (int yy = rb; yy < re; yy++) {
+      const uint16_t* row = &gasAmt_[(size_t)(yy + y0) * W + x0];
+      for (int x = 0; x < bw; x++) {
+        float acc = 0.0f;
+        for (int t = kR; t >= -kR; t--) {
+          const int xx = x - t;
+          if (xx < 0 || xx >= bw || !row[xx]) continue;
+          acc += (float)row[xx] * invR * kG[t + kR];
+        }
+        tmp[(size_t)yy * bw + x] = acc;
       }
     }
-  for (int yy = 0; yy < bh; yy++)
-    for (int xx = 0; xx < bw; xx++) {
-      const float a = tmp[(size_t)yy * bw + xx];
-      if (a <= 0) continue;
-      for (int t = -kR; t <= kR; t++) {
-        const int y = yy + t;
-        if (y >= 0 && y < bh) rGas_[(size_t)y * bw + xx] += a * kG[t + kR];
+  });
+  BenchParallelFor(bh, 16, [&](int rb, int re) {
+    for (int y = rb; y < re; y++)
+      for (int xx = 0; xx < bw; xx++) {
+        float acc = 0.0f;
+        for (int t = kR; t >= -kR; t--) {
+          const int yy = y - t;
+          if (yy < 0 || yy >= bh) continue;
+          const float a = tmp[(size_t)yy * bw + xx];
+          if (a <= 0) continue;
+          acc += a * kG[t + kR];
+        }
+        rGas_[(size_t)y * bw + xx] = acc;
       }
-    }
+  });
   // Which gas a pixel shows: its own, else the fullest within reach.
   rGasSub_.assign(n, 0xFF);
-  for (int yy = 0; yy < bh; yy++)
+  BenchParallelFor(bh, 16, [&](int rb, int re) {
+  for (int yy = rb; yy < re; yy++)
     for (int xx = 0; xx < bw; xx++) {
       const size_t j = (size_t)yy * bw + xx;
       if (rGas_[j] <= 0.01f) continue;
@@ -2451,16 +2646,19 @@ void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
           if (gasAmt_[k2] > best) { best = gasAmt_[k2]; rGasSub_[j] = gasSub_[k2]; }
         }
     }
+  });
   // Light from above through the cloud: optical depth accumulated down each
   // column (a deep pool of vapour is shadowed at its bottom). Kept as the
   // depth; its exp is taken only where a pixel is drawn.
   std::vector<float>& shade = tmp;
-  for (int xx = 0; xx < bw; xx++) {
-    float acc = 0;
+  {
+    // Row by row, every column at once (the column walk strode through memory).
+    std::vector<float>& acc = rGasAcc_;
+    acc.assign((size_t)bw, 0.0f);
     for (int yy = bh - 1; yy >= 0; yy--) {
-      const size_t j = (size_t)yy * bw + xx;
-      acc = acc * 0.93f + rGas_[j];
-      shade[j] = acc;
+      const float* g = &rGas_[(size_t)yy * bw];
+      float* o = &shade[(size_t)yy * bw];
+      for (int xx = 0; xx < bw; xx++) o[xx] = acc[xx] = acc[xx] * 0.93f + g[xx];
     }
   }
   // The advected texture, bilinear over cell centres.
@@ -2492,7 +2690,9 @@ void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
     o = Over(o, r, g, b, a);
   };
   const float t = (float)step_;
-  for (int yy = 0; yy < bh; yy++)
+  // A row at a time on the bench's workers: a pixel writes only itself.
+  BenchParallelFor(bh, 8, [&](int rb, int re) {
+  for (int yy = rb; yy < re; yy++)
     for (int xx = 0; xx < bw; xx++) {
       const size_t j = (size_t)yy * bw + xx;
       const float d = rGas_[j];
@@ -2533,6 +2733,7 @@ void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
       b += (int)((255 - b) * glow * 0.5f);
       put(x, y, r, g, b, (int)(std::min(0.92f, a + glow * 0.3f * std::min(1.0f, d)) * 255));
     }
+  });
 }
 
 // ---- the look ----------------------------------------------------------------

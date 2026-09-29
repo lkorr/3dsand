@@ -32,6 +32,7 @@
 #include "test/selftest.h"
 #include "test/support.h"
 
+
 using namespace sandvox;
 
 namespace selftest {
@@ -1048,13 +1049,13 @@ Status GateAlchemyEvaporate(Ctx& c, std::string& detail) {
                   "%d evaporations (%d in the last 6 s), pressure %.2f (peak %.2f, pops at %.1f)%s, audit %s, ledger %s; "
                   "heated: %s; open 20 s: ether -> %u, %d evaporations (%d with liquid above), vapour %lld units "
                   "faded, %u eighths out of the mouth, audit %s, ledger %s; volume: 1 eighth (%d px of liquid) -> "
-                  "%d px of vapour (E %d)%s",
+                  "%d px of vapour (E %d, %d particles left)%s",
                   secs, t1.vessel[v].AmountOf(mE), t1.vessel[v].AmountOf(mV), gasPx, air, s.Evaporations(), lateEvap,
                   p1, peakP, cfg.popAt, events.empty() ? "" : (" EVENTS: " + events).c_str(),
                   audit1 ? "exact" : why1.c_str(), ledger1 ? "validates" : lwhy1.c_str(),
                   hotEvents.empty() ? "NOTHING" : hotEvents.c_str(), t2.vessel[v2].AmountOf(mE), evap2, buried2,
                   (long long)faded2, vented2, audit2 ? "exact" : why2.c_str(), ledger2 ? "validates" : lwhy2.c_str(),
-                  liquidPx, vapPx, E, audit3 ? "" : (", audit " + why3).c_str());
+                  liquidPx, vapPx, E, s3.ParticleCount(), audit3 ? "" : (", audit " + why3).c_str());
   std::printf("alchemy-evaporate: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -2056,6 +2057,125 @@ Status GateAlchemyCoherence(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ETHER POURED INTO A HOT EMPTY FLASK (owner, 2026-09-29: "turns into ignited
+// ether right when entering the glass and a few reactions go off that
+// completely tank and destroy frame rate"). A flask on the burner, heated
+// through, then a second flask of ether tipped into it and held there until
+// it has emptied (see THE GAME'S SITUATION below). The bench's frame is
+// Step(4) + Render at 60 Hz on its own thread: this reports the cost of a
+// bench frame per second of bench time, split by phase (FlaskSim::Profile),
+// and asserts the worst second is under `alchemy.etherFireMaxMsPerFrame`
+// (30: a regression guard -- the burn peaked at 38 ms with 61k gas pixels
+// before the fixes of 2026-09-29, ~20 after; a timing, so noisy under load).
+// Also: the ether ignited (the scenario is the scenario), the units audit
+// exact.
+Status GateAlchemyEtherFire(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int ether = SlotOfName(b, c, "ether"), burning = SlotOfName(b, c, "ether_burning");
+  if (ether < 0 || burning < 0) { detail = "missing ether / ether_burning"; return Status::Fail; }
+  const uint16_t mE = b.subs[ether].mat;
+  // THE GAME'S SITUATION: two of the game's flasks (the `flask` item, 1024
+  // eighths, as ShapeFor makes it), the source 0.9 full (--shot-bench with
+  // SANDVOX_BENCH_B=ether:0.9: 1843 particles), on a bench the size the
+  // panel gives it, the source held tipped over the mouth until it has
+  // emptied (the harness's first version poured a vial into a 512-eighth
+  // bowl and swung it away after a second -- not what anyone does).
+  const uint32_t pourEighths = (uint32_t)BaselineNumber("alchemy.etherFirePourEighths", 920);
+  alchemy::SimConfig cfg = ChemConfig();
+  cfg.gridW = 420;
+  cfg.gridH = 400;
+  FlaskSim s(cfg);
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const Composition none;
+  const int A = s.AddVessel(BenchFlask(1024), {{110, 4}, 0}, none);
+  s.SetBurner(A, true);
+  Composition drained;
+  for (int f = 0; f < 60 * 4; f++) { s.Step(4); Drain(s, drained); }
+  const float heat = s.Heat(A);
+  // The vial swings in from the right and tips about its left lip over A's mouth.
+  const alchemy::VesselShape vial = BenchFlask(1024);
+  const alchemy::VesselShape& sa = s.Shape(A);
+  const float aTop = 4 + sa.height;
+  const float lipHalf = vial.profile.back().x * vial.width * 0.5f;
+  auto pose = [&](float t) {
+    const float u = std::min(1.f, t / 0.5f), e = u * u * (3 - 2 * u);
+    const float ang = 2.6f * t;
+    const V2 lipL{-lipHalf, vial.height};
+    const V2 lipW{110 + 150 + (4 - 150) * e, aTop + 60 + (14 - 60) * e};
+    const float cs = std::cos(ang), sn = std::sin(ang);
+    return Xform{{lipW.x - (lipL.x * cs - lipL.y * sn), lipW.y - (lipL.x * sn + lipL.y * cs)}, ang};
+  };
+  Composition in;
+  in.Add(mE, pourEighths);
+  const int B = s.AddVessel(vial, pose(0), in);
+  struct Win { double frameMs = 0, worstFrame = 0; FlaskSim::Profile p; int gasPx = 0, parts = 0, grains = 0; };
+  std::vector<Win> wins;
+  Win w;
+  s.ResetProfile();
+  const int frames = 60 * (int)BaselineNumber("alchemy.etherFireSecs", 16);
+  bool lit = false;
+  std::vector<uint32_t> pic;
+  for (int f = 0; f < frames; f++) {
+    // Tipped over 2 s, held there 5 s, set back over 1.5 s.
+    if (f < 420) s.SetVesselXform(B, pose(std::min(1.0f, f / 120.0f)));
+    else if (f < 510) s.SetVesselXform(B, pose(std::max(0.0f, 1.0f - (f - 420) / 90.0f)));
+    const double t0 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    s.Step(4);
+    s.Render(pic);   // the bench redraws every step while anything moves
+    const double t1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    Drain(s, drained);
+    w.frameMs += t1 - t0;
+    w.worstFrame = std::max(w.worstFrame, t1 - t0);
+    if (!lit && (f % 10) == 0) {
+      // ether_burning anywhere on the bench (or already out of it): lit.
+      const alchemy::Tally t = s.Count();
+      for (const Composition& v : t.vessel) lit |= v.AmountOf(b.subs[burning].mat) > 0;
+      lit |= t.spilled.AmountOf(b.subs[burning].mat) > 0 || drained.AmountOf(b.subs[burning].mat) > 0;
+    }
+    if (f == 200) Shot(s, "alchemy_ether_fire.bmp");
+    if (f == 400) Shot(s, "alchemy_ether_fire_late.bmp");
+    if ((f + 1) % 60 == 0) {
+      std::vector<int> gp;
+      std::vector<int64_t> gu;
+      s.GasBySlot(gp, gu);
+      std::string by;
+      for (size_t k = 0; k < gp.size(); k++)
+        if (gp[k]) by += Format(" %s %d px %.1f/px", c.mats[b.subs[k].mat].name.c_str(), gp[k], (double)gu[k] / gp[k]);
+      std::printf("alchemy-ether-fire: s%d gas:%s\n", f / 60, by.c_str());
+      w.p = s.Prof();
+      w.gasPx = w.p.peakGasPx; w.parts = w.p.peakParticles; w.grains = w.p.peakGrains;
+      wins.push_back(w);
+      w = Win{};
+      s.ResetProfile();
+    }
+  }
+  double worst = 0;
+  size_t worstAt = 0;
+  for (size_t i = 0; i < wins.size(); i++) {
+    const Win& x = wins[i];
+    const double per = x.frameMs / 60.0;
+    if (per > worst) { worst = per; worstAt = i; }
+    const auto& p = x.p;
+    std::printf("alchemy-ether-fire: s%-2zu %6.2f ms/frame (worst %6.1f) | move %.2f liq %.2f grain %.2f gasFlow %.2f "
+                "gasMove %.2f chemPart %.2f chemGrain %.2f chemGas %.2f chemTail %.2f render %.2f (solve %.2f advect "
+                "%.2f renderGas %.2f) | gasPx %d parts %d grains %d fires %d\n",
+                i, per, x.worstFrame, p.move / 60, p.liquid / 60, p.grains / 60, p.gasFlow / 60, p.gasMove / 60,
+                p.chemPart / 60, p.chemGrain / 60, p.chemGas / 60, p.chemTail / 60, p.render / 60, p.flowSolve / 60,
+                p.flowAdvect / 60, p.renderGas / 60, x.gasPx, x.parts, x.grains, p.peakFires);
+  }
+  std::string a;
+  const bool audit = s.AuditUnits(&a);
+  const double maxMs = BaselineNumber("alchemy.etherFireMaxMsPerFrame", 30.0);
+  RecordObserved("alchemy.etherFireWorstMsPerFrame", worst);
+  const bool ok = lit && audit && worst <= maxMs;
+  detail = Format("burner heat %.2f, %u eighths of ether poured, %s; worst second %.2f ms a bench frame (s%zu, max %.1f)%s",
+                  heat, pourEighths, lit ? "it lit" : "it NEVER LIT", worst, worstAt, maxMs,
+                  audit ? "" : (" audit: " + a).c_str());
+  std::printf("alchemy-ether-fire: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AlchemyGates() {
@@ -2082,6 +2202,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},
       {"alchemy-brine-electrolysis", "player", {}, false, GateAlchemyBrineElectrolysis},
       {"alchemy-explode", "player", {}, false, GateAlchemyExplode},
+      {"alchemy-ether-fire", "player", {}, false, GateAlchemyEtherFire},
       // Package E: the creative expansion's recipes on the bench.
       {"chem-bench", "player", {}, false, GateChemBench},
   };

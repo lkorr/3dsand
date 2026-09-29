@@ -6,6 +6,12 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <limits>
+#include <mutex>
+#include <thread>
 
 namespace alchemy {
 
@@ -227,13 +233,137 @@ void FlaskSim::SetSubstances(const std::vector<Substance>& subs) {
   }
 }
 
+// ---- the workers -------------------------------------------------------------
+namespace {
+class BenchPool {
+ public:
+  static BenchPool& Get() {
+    static BenchPool pool;
+    return pool;
+  }
+  int Lanes() const { return (int)workers_.size() + 1; }
+  // Runs job(c) for every c in [0, chunks). False (nothing run) when the pool
+  // is busy with another caller's loop: the caller runs it serially.
+  bool Run(int chunks, const std::function<void(int)>& job) {
+    std::unique_lock<std::mutex> own(runMu_, std::try_to_lock);
+    if (!own.owns_lock() || workers_.empty()) return false;
+    {
+      std::unique_lock<std::mutex> lk(mu_);
+      // A worker that woke late for the last loop may still be in its pull
+      // loop (it will find nothing left); it must be out before the counters
+      // are reset under it.
+      idle_.wait(lk, [&] { return inFlight_ == 0; });
+      job_ = &job;
+      chunks_ = chunks;
+      next_.store(0);
+      done_.store(0);
+      gen_++;
+      genA_.store(gen_, std::memory_order_release);
+    }
+    wake_.notify_all();
+    Pull(&job, chunks);
+    std::unique_lock<std::mutex> lk(mu_);
+    idle_.wait(lk, [&] { return done_.load() == chunks; });
+    return true;
+  }
+  ~BenchPool() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      quit_ = true;
+      quitA_.store(true);
+    }
+    wake_.notify_all();
+    for (std::thread& t : workers_) t.join();
+  }
+
+ private:
+  BenchPool() {
+    int n = 3;   // + the caller: four lanes, on a 16-thread machine that also runs the game
+    if (const char* e = std::getenv("SANDVOX_BENCH_THREADS")) n = std::max(0, std::atoi(e) - 1);
+    const unsigned hw = std::thread::hardware_concurrency();
+    if (hw > 0) n = std::min(n, (int)hw - 1);
+    for (int i = 0; i < n; i++) workers_.emplace_back([this] { Work(); });
+  }
+  void Pull(const std::function<void(int)>* job, int chunks) {
+    for (;;) {
+      const int c = next_.fetch_add(1);
+      if (c >= chunks) break;
+      (*job)(c);
+      if (done_.fetch_add(1) + 1 == chunks) {
+        std::lock_guard<std::mutex> lk(mu_);
+        idle_.notify_all();
+      }
+    }
+  }
+  void Work() {
+    uint64_t seen = 0;
+    for (;;) {
+      const std::function<void(int)>* job;
+      int chunks;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        wake_.wait(lk, [&] { return quit_ || gen_ != seen; });
+        if (quit_) return;
+        seen = gen_;
+        job = job_;
+        chunks = chunks_;
+        inFlight_++;
+      }
+      Pull(job, chunks);
+      std::lock_guard<std::mutex> lk(mu_);
+      inFlight_--;
+      idle_.notify_all();
+    }
+  }
+  std::vector<std::thread> workers_;
+  std::mutex runMu_, mu_;
+  std::condition_variable wake_, idle_;
+  const std::function<void(int)>* job_ = nullptr;
+  int chunks_ = 0, inFlight_ = 0;
+  uint64_t gen_ = 0;
+  bool quit_ = false;
+  std::atomic<int> next_{0}, done_{0};
+  std::atomic<uint64_t> genA_{0};
+  std::atomic<bool> quitA_{false};
+};
+}  // namespace
+
+void BenchParallelFor(int n, int grain, const std::function<void(int, int)>& fn) {
+  if (n <= 0) return;
+  BenchPool& pool = BenchPool::Get();
+  const int lanes = pool.Lanes();
+  const int chunks = std::min(lanes * 2, (n + std::max(1, grain) - 1) / std::max(1, grain));
+  if (lanes <= 1 || chunks <= 1) { fn(0, n); return; }
+  // The split is a function of n and the chunk count only.
+  auto job = [&](int c) {
+    const int b = (int)((int64_t)n * c / chunks), e = (int)((int64_t)n * (c + 1) / chunks);
+    if (b < e) fn(b, e);
+  };
+  if (!pool.Run(chunks, job))
+    for (int c = 0; c < chunks; c++) job(c);
+}
+
+// The last angle's cos and sin, per direction and thread: the hot loops
+// (the gas's carry, the mouth's draw, the hot glass per cell) convert
+// thousands of points through one pose, and the trig was most of that. The
+// same expressions as ever, so the same bits.
+namespace {
+struct TrigMemo {
+  float a = std::numeric_limits<float>::quiet_NaN(), c = 1, s = 0;
+};
+thread_local TrigMemo tToLocal, tToWorld;
+}  // namespace
 V2 FlaskSim::ToLocal(const Xform& x, V2 w) const {
   V2 d = w - x.pos;
-  float c = std::cos(-x.angle), s = std::sin(-x.angle);
+  TrigMemo& m = tToLocal;
+  if (!(m.a == x.angle)) { m.a = x.angle; m.c = std::cos(-x.angle); m.s = std::sin(-x.angle); }
+  const float c = m.c, s = m.s;
   return {d.x * c - d.y * s, d.x * s + d.y * c};
 }
 V2 FlaskSim::ToWorld(const Xform& x, V2 l) const {
-  float c = std::cos(x.angle), s = std::sin(x.angle);
+  TrigMemo& m = tToWorld;
+  if (!(m.a == x.angle)) { m.a = x.angle; m.c = std::cos(x.angle); m.s = std::sin(x.angle); }
+  const float c = m.c, s = m.s;
   return {x.pos.x + l.x * c - l.y * s, x.pos.y + l.x * s + l.y * c};
 }
 
@@ -2439,8 +2569,13 @@ void FlaskSim::MoveVessels() {
   }
 }
 
+double FlaskSim::NowMs() {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void FlaskSim::Step(int substeps) {
   for (int s = 0; s < substeps; s++) {
+    double t0 = NowMs();
     MoveVessels();
     // Each vessel's CONTENTS FRAME: the motion of its interior's centre this
     // step (the carry of grains and liquid alike) and its change.
@@ -2491,14 +2626,24 @@ void FlaskSim::Step(int substeps) {
 
     UpdateSleep();
     if ((step_ & 15) == 0 && nAct_ > 64) Partition();
+    double t1 = NowMs();
+    prof_.move += t1 - t0;
     grainMoves_ = 0;
     StepLiquid();
+    t0 = NowMs();
+    prof_.liquid += t0 - t1;
     StepGrains();
+    t1 = NowMs();
+    prof_.grains += t1 - t0;
     // THE CHEMISTRY and THE GAS (flaskchem.cpp): after the matter has moved,
     // so a rule reads this step's neighbours.
     const int fired0 = firedTotal_;
     if (cfg_.gasEvery > 0 && (step_ % (uint32_t)cfg_.gasEvery) == 0) StepGas();
     if (cfg_.chemEvery > 0 && (step_ % (uint32_t)cfg_.chemEvery) == 0) StepChemistry();
+    prof_.steps++;
+    prof_.peakGasPx = std::max(prof_.peakGasPx, (int)gasList_.size());
+    prof_.peakParticles = std::max(prof_.peakParticles, (int)px_.size());
+    prof_.peakGrains = std::max(prof_.peakGrains, (int)grains_.size());
     active_ = anyMoved || stickOn_ || nAct_ > 0 || grainMoves_ > 0 || !gasList_.empty() ||
               firedTotal_ != fired0 || anyDevice_;
     for (const Grain& g : grains_)
@@ -2846,6 +2991,11 @@ std::vector<float> FlaskSim::MeanHeights() const {
 // ---- drawing ---------------------------------------------------------------
 
 void FlaskSim::Render(std::vector<uint32_t>& out) const {
+  struct Timed {
+    Profile& p;
+    double t0;
+    ~Timed() { p.render += NowMs() - t0; p.renders++; }
+  } timed{prof_, NowMs()};
   // THE LOOK. Everything here is derived from what the world's renderer
   // reads for the same material (Look, from SetSubstances): the opaque flag
   // (a molten surface that glows and churns), isViscousLiquid's pair (a dark
@@ -3040,8 +3190,10 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
     }
   }
 
-  // 5. Compose.
-  for (int y = 0; y < H; y++) {
+  // 5. Compose. A row at a time on the bench's workers: each pixel reads
+  // the fields above and writes only itself.
+  BenchParallelFor(H, 24, [&](int yBegin, int yEnd) {
+  for (int y = yBegin; y < yEnd; y++) {
     const int row = H - 1 - y;  // image rows top-down
     for (int x = 0; x < W; x++) {
       const size_t k = (size_t)y * W + x;
@@ -3132,6 +3284,7 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
       out[(size_t)row * W + x] = c;
     }
   }
+  });
 
   // Bubbles over it all.
   for (const Bubble& b : bubbles_) {
@@ -3202,13 +3355,19 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
     const float ca = std::cos(-v.x.angle), sa = std::sin(-v.x.angle);
     const auto& pr = v.shape.profile;
     const float hw = v.shape.width * 0.5f, VH = v.shape.height;
-    for (int y = iy0; y <= iy1; y++)
+    const bool raster = !v.near.empty();
+    BenchParallelFor(iy1 - iy0 + 1, 16, [&](int rb, int re) {
+    for (int y = iy0 + rb; y < iy0 + re; y++)
       for (int x = ix0; x <= ix1; x++) {
         const size_t k = (size_t)y * W + x;
         if (wall_[k]) continue;
         const float dx = x + 0.5f - v.x.pos.x, dy = y + 0.5f - v.x.pos.y;
         const V2 l{dx * ca - dy * sa, dx * sa + dy * ca};
-        if (!InsideLocal(v, l)) continue;
+        // The near-glass raster answers for all but the pixels by the glass
+        // (a far cell is a whole contact radius from it, a pixel's offset
+        // cannot cross it); the polygon test only there.
+        const uint8_t nr = raster ? v.Near(l) : Vessel::kNear;
+        if (nr == Vessel::kFarOut || (nr == Vessel::kNear && !InsideLocal(v, l))) continue;
         // The inside's half-width at this height, from the profile.
         const float hy = std::clamp(l.y / VH, pr.front().y, pr.back().y);
         size_t j = 1;
@@ -3251,6 +3410,7 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
         if (a == 0) oa = std::max(oa, h * 255.0f);
         o = PackRGBA((int)std::lround(r), (int)std::lround(g), (int)std::lround(b), (int)std::lround(oa));
       }
+    });
   }
 }
 

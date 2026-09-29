@@ -2406,7 +2406,7 @@
       }
     },
     {
-      "note": "-------- SPIRITS and ETHER --------\nSpirits burn readily (400 authored, ~116 scaled; a drifting flame a quarter). Spirits touching acid become ETHER (20; the acid is the catalyst and is not spent -- the spirits are). Ether is the most volatile thing here: every cell with an air face EVAPORATES (25 per-mille, a decay gated and scaled on its air faces -- the phosphorus rule's form) into ether_vapour, which is HEAVY (gas_heavy: it sinks and creeps, sim_step.wgsl stepHeavyGas) and EXPLODES near a flame or a spark (radius 2 power 40 -- a whoomph, not a grenade). A vapour cloud goes off as a chain bounded by the blast cap and the vapour itself; left alone it disperses (5 per-mille)."
+      "note": "-------- SPIRITS and ETHER --------\nSpirits burn readily (400 authored, ~116 scaled; a drifting flame a quarter). Spirits touching acid become ETHER (20; the acid is the catalyst and is not spent -- the spirits are). Ether is the most volatile thing here: every cell with an air face EVAPORATES (25 per-mille, a decay gated and scaled on its air faces -- the phosphorus rule's form) into ether_vapour, which is HEAVY (gas_heavy: it sinks and creeps, sim_step.wgsl stepHeavyGas) and near a flame or a spark CATCHES as ether_burning, a heavy flame that lasts ~2 s a cell and lights the vapour beside it (see ether_burning below -- it replaced a radius-2 blast, 2026-09-29). A vapour cloud burns through as a chain bounded by the vapour itself; left alone it disperses (5 per-mille)."
     },
     {
       "self": "spirits",
@@ -2435,46 +2435,77 @@
       }
     },
     {
+      "note": "ETHER BOILS OFF AS ~8 VAPOUR A VOXEL (owner, 2026-09-29: 'liquid ether should give off like 8 gas ether before it disappears'). Two rules with one ratio: the EMIT puts a vapour cell into an air neighbour and keeps the liquid (233 per-mille), and the decay after it turns the liquid itself into the last vapour (43). Both need an air face -- the emit only fires into air, the decay is gated on one (scaleByNeighbors, scaleMax 1: gated, NOT scaled, so the ratio holds whatever the face count). The emit is rolled first, so the decay fires with (1 - 0.233) x 0.043 = 0.033 a tick: 0.233 / 0.033 = ~7 emits, then the conversion = ~8 vapour per liquid voxel, and a surface voxel still lasts ~30 ticks (~1 s), what the old single 25..50-per-mille decay gave it. The vapour it makes is heavy and pools on the liquid, covering the air faces both rules need -- a puddle in a pit smothers its own boil-off until the vapour creeps away."
+    },
+    {
+      "self": "ether",
+      "emit": "ether_vapour",
+      "dir": "any",
+      "chance": 233
+    },
+    {
       "self": "ether",
       "decay": true,
-      "chance": 25,
+      "chance": 43,
       "becomes": "ether_vapour",
       "scaleByNeighbors": {
         "neighbor": "air",
-        "scaleMax": 2
+        "scaleMax": 1
       }
     },
     {
       "self": "ether_vapour",
       "neighbor": "tag:hot",
-      "chance": 500,
-      "selfBecomes": "fire",
-      "effects": [
-        {
-          "kind": "explode",
-          "radius": 2,
-          "power": 40
-        }
-      ]
+      "chance": 1000,
+      "selfBecomes": "ether_burning"
     },
     {
       "self": "ether_vapour",
       "neighbor": "tag:electric",
       "chance": 600,
-      "selfBecomes": "fire",
-      "effects": [
-        {
-          "kind": "explode",
-          "radius": 2,
-          "power": 40
-        }
-      ]
+      "selfBecomes": "ether_burning"
     },
     {
       "self": "ether_vapour",
       "decay": true,
       "chance": 5,
       "becomes": "air"
+    },
+    {
+      "note": "-------- ether_burning: the vapour ALIGHT (2026-09-29) --------\nReplaces the radius-2 blast the vapour used to set off (owner: a lit voxel that burns for a couple of seconds is far more destructive than one that annihilates instantly). The ignition above is authored at 1000 and compiles at x spreadPct (~290 per-mille per hot face at 29%), so the flame front runs through a cloud in a handful of ticks, cell to cell -- ether_burning is tag:hot and lights the vapour beside it. Each lit cell then burns for ~2 s: the decays are burnDuration rules, 34 authored / burnDurationPct 200 = ~17 per-mille, a mean of ~60 ticks at 30 Hz. While it burns it throws `fire` up into any air above it, which is what reaches a ceiling or a canopy over the pool. Water puts it out."
+    },
+    {
+      "self": "ether_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 400,
+      "selfBecomes": "smoke"
+    },
+    {
+      "self": "ether_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 60,
+      "becomes": "smoke"
+    },
+    {
+      "self": "ether_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 60
+    },
+    {
+      "self": "ether_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 26,
+      "becomes": "air"
+    },
+    {
+      "self": "ether_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 8,
+      "becomes": "smoke"
     },
     {
       "note": "-------- SUGAR and SYRUP --------\nSugar burns (30, scaled). It DISSOLVES into water as the `sugar` solute (solutes.json) and a saturated cell becomes syrup there -- a solute convert, on the bench and in package B's world layer; there is no pair rule for it. Syrup beside a FUNGUS (the yeast) ferments: most of it into spirits (6 per-mille), a little into choke damp (1). Slow on purpose: brewing takes a while."

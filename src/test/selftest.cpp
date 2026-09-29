@@ -847,7 +847,7 @@ const char* const kOrder[] = {
     "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-resort", "alchemy-spawn", "alchemy-sand-carry",
     "alchemy-lift", "alchemy-place", "alchemy-coherence",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
-    "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-gas-vent", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode",
+    "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-gas-vent", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode", "alchemy-ether-fire",
     "alchemy-brine-electrolysis",
     // Package E on the bench: every headline recipe through the world's table.
     "chem-bench",

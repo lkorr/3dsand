@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 
 #include "game/container.h"
@@ -904,6 +906,20 @@ void AlchemyBench::Run() {
     if (draw) {
       sim_.Render(pic);
       PaintMouthHover(pic);
+    }
+    // SANDVOX_BENCH_PROF: where a bench frame's time went, each second
+    // (FlaskSim::Profile; the gate alchemy-ether-fire prints the same).
+    static const bool prof = std::getenv("SANDVOX_BENCH_PROF") != nullptr;
+    if (prof && (ticks_ % 60) == 0) {
+      const FlaskSim::Profile& p = sim_.Prof();
+      const double n = 60.0;
+      std::printf("bench prof: %.2f ms a bench frame (move %.2f liquid %.2f grains %.2f gas flow %.2f move %.2f "
+                  "chem %.2f render %.2f) | gas px %d particles %d grains %d fires %d\n",
+                  (p.Total() + p.render) / n, p.move / n, p.liquid / n, p.grains / n, p.gasFlow / n, p.gasMove / n,
+                  (p.chemPart + p.chemGrain + p.chemGas + p.chemTail) / n, p.render / n, p.peakGasPx,
+                  p.peakParticles, p.peakGrains, p.peakFires);
+      std::fflush(stdout);
+      sim_.ResetProfile();
     }
     std::vector<Composition> live;
     std::vector<uint8_t> liveOn;

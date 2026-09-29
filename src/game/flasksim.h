@@ -58,7 +58,18 @@
 #include "game/benchchem.h"
 #include "game/composition.h"
 
+#include <functional>
+
 namespace alchemy {
+
+// THE BENCH'S WORKERS. Runs fn(begin, end) over [0, n) in a FIXED split --
+// the same chunks every call, whichever thread takes one -- on a few worker
+// threads and the caller's. For loops whose iterations write disjoint data
+// and read nothing another iteration writes (a row of the picture, a face of
+// the flow), so the result is bit for bit the serial one. Serial when n is
+// under `grain` per chunk, when the pool is already running a loop, and
+// with SANDVOX_BENCH_THREADS=0 (the A/B arm).
+void BenchParallelFor(int n, int grain, const std::function<void(int, int)>& fn);
 
 struct V2 {
   float x = 0, y = 0;
@@ -260,7 +271,12 @@ struct SimConfig {
   // world chance is scaled by chemEvery / 8 x chemRate per step.
   int chemEvery = 4;
   float chemRate = 1.0f;
-  int chemMaxFires = 600;        // rule firings per chemistry step (bounded)
+  // Rule firings per chemistry step (bounded). 600 starved a lit cloud: a
+  // few thousand pixels of fire want ~700 decays a step on their own, and
+  // the pixels at the tail of the list waited -- flames outlived the world's,
+  // threw more fire, and the cloud grew (the ether fire). A firing is cheap
+  // next to the per-pixel walk that finds it.
+  int chemMaxFires = 4000;
   int gasEvery = 2;              // one gas step every this many substeps
   // Gas steps a cloud lingers outside every vessel before it starts to thin
   // into the room (gasFadeLight / gasFadeHeavy of it a step, stochastic):
@@ -558,6 +574,30 @@ class FlaskSim {
   // Does the picture move on its own even when nothing is simulated (glow,
   // fizz, the light on water)? The panel keeps redrawing it, slower.
   bool Animated() const { return !px_.empty() || !gasList_.empty() || anyDevice_ || !shards_.empty(); }
+  // WHERE THE BENCH'S TIME GOES: ms summed per phase since ResetProfile, and
+  // the peak of what drives each (for gates and SANDVOX_BENCH_PROF). A clock
+  // read per phase a substep -- nothing next to the phases themselves.
+  struct Profile {
+    double move = 0, liquid = 0, grains = 0, gasFlow = 0, gasMove = 0;
+    double chemPart = 0, chemGrain = 0, chemGas = 0, chemTail = 0, render = 0;
+    // Inside the above: the gas flow's pressure solve and self-advection, the
+    // gas's share of the picture.
+    double flowSolve = 0, flowAdvect = 0, renderGas = 0;
+    int steps = 0, gasSteps = 0, chemSteps = 0, renders = 0;
+    int peakGasPx = 0, peakParticles = 0, peakGrains = 0, peakFires = 0;
+    double Total() const {
+      return move + liquid + grains + gasFlow + gasMove + chemPart + chemGrain + chemGas + chemTail;
+    }
+  };
+  const Profile& Prof() const { return prof_; }
+  void ResetProfile() { prof_ = Profile{}; }
+  // For gates: live gas pixels per substance slot, and their units.
+  void GasBySlot(std::vector<int>& pixels, std::vector<int64_t>& units) const {
+    pixels.assign(subs_.size(), 0);
+    units.assign(subs_.size(), 0);
+    for (int k : gasList_)
+      if (gasAmt_[k] && gasSub_[k] < subs_.size()) { pixels[gasSub_[k]]++; units[gasSub_[k]] += gasAmt_[k]; }
+  }
   // Read-only views for gates and the lab.
   const std::vector<V2>& Positions() const { return px_; }
   const std::vector<V2>& Velocities() const { return pv_; }
@@ -656,6 +696,28 @@ class FlaskSim {
   void CheckPressure();
   bool TryRules(uint8_t selfType, int selfIdx, int slot, const std::vector<ChemNb>& nb, int hv, V2 at,
                 double scale);
+  // LAZY NEIGHBOURS (a gas pixel's): TryRules gathers them only once a rule's
+  // roll has passed -- most of a cloud's pixels roll nothing in a step, and
+  // gathering was most of what a chemistry step cost (the ether fire).
+  struct PendingNb { bool on = false; int x = 0, y = 0, hv = -1; bool isGas = false; };
+  PendingNb nbPending_;
+  // Per slot, per rule: can its neighbour predicate match anything on the
+  // bench this step (a present slot, the air, a live virtual neighbour)? A
+  // rule that cannot is skipped without gathering (StepChemistry).
+  std::vector<std::vector<uint8_t>> ruleLive_;
+  // A FLAME (a slot carrying the burner's hot tags: fire, burning ether): its
+  // decay to air is it BURNING OUT, not a vapour dispersing into the room.
+  bool Flame(int slot) const { return chem_.heat.on && (subs_[slot].tagMask & chem_.heat.tags) != 0; }
+  // A slow decay to air of a non-flame: dispersal (TryRules keeps it off in a
+  // sealed vessel, for a heavy gas in any vessel, and for a gas in the room).
+  bool Disperses(const ChemRule& r, int slot) const {
+    return r.kind == kChemDecay && r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen && !Flame(slot);
+  }
+  // Pixels within reach of a liquid particle (NearestParticle's widest query
+  // from a pixel, 0.8 spacing), rebuilt with the buckets: a pixel off it has
+  // no particle to find, and most of a cloud is off it.
+  std::vector<uint8_t> nearLiq_;
+  std::vector<int> nearLiqTouched_;
   void GatherParticleNbrs(int i, int hv, std::vector<ChemNb>& out);
   void GatherPixelNbrs(int x, int y, int hv, bool isGas, std::vector<ChemNb>& out);
   int NearestParticle(float x, float y, float r) const;
@@ -872,6 +934,7 @@ class FlaskSim {
   std::vector<uint8_t> gasListed_;
   std::vector<Pool> pools_;             // units waiting to become a particle / grain (matter units) / gas (GAS units)
   std::vector<uint32_t> gasBank_;       // (vessels + 1) x slots, gas units (BankGas)
+  std::vector<uint32_t> emitCredit_;    // (vessels + 1) x product slots: gas units a gas's emits owe, under a unit
   int evapFires_ = 0, evapBuried_ = 0;
   std::vector<int> chemHead_, chemNext_, chemTouched_;   // particles by pixel
   std::vector<uint8_t> present_, activeSlot_;
@@ -927,6 +990,9 @@ class FlaskSim {
   int gbx0_ = 0, gby0_ = 0, gbx1_ = -1, gby1_ = -1;   // the active box, cells
   struct GasMove { int from, to; uint16_t n; uint8_t sub, age; };
   std::vector<GasMove> gasMoves_;
+  std::vector<int> flowK_, flowTo_;     // StepGas's flowing pixels, and per face where to (-1 none, -2 the world)
+  std::vector<float> flowF_;            // ... and per face the flux, units
+  std::vector<uint16_t> flowN_;         // ... and per face the whole units it moves
   void EnsureGasFlow();
   void StepGasFlow(int bx0, int by0, int bx1, int by1);
   // The room's draught: this gas step's phases, from the step count (StepGas
@@ -953,6 +1019,7 @@ class FlaskSim {
   mutable std::vector<float> rGas_;
   mutable std::vector<uint8_t> rGasSub_;
   mutable std::vector<float> rGasTmp_;
+  mutable std::vector<float> rGasAcc_;
   void BucketChem();
   std::vector<ChemNb> nbScratch_;
   uint32_t chemStep_ = 0;
@@ -962,6 +1029,8 @@ class FlaskSim {
     if (!gasListed_[k]) { gasListed_[k] = 1; gasList_.push_back(k); }
   }
   bool active_ = true;
+  mutable Profile prof_;
+  static double NowMs();   // steady clock, ms (the profile's)
   int grainMoves_ = 0;   // grains moved in the current step
   uint32_t rng_;
   uint32_t step_ = 0;

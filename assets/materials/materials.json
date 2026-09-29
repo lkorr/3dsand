@@ -4696,6 +4696,24 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "ETHER VAPOUR ALIGHT (owner, 2026-09-29: 'each voxel burns and persists for a couple of seconds ... much more destructive than instantaneously annihilating'). What ether_vapour becomes near a flame or a spark, replacing the radius-2 blast it used to set off: a blast consumed the whole cloud in one tick and left nothing burning. This is a flame that STAYS -- ~2 s a cell at the shipped burnDurationPct -- and it keeps the vapour's gas_heavy, so a lit cloud still pools and creeps along the floor as a burning carpet, cooking whatever it rolls over. Tagged hot, so it lights the ether_vapour beside it through that material's own ignition rule (the flame front runs through the cloud) and everything flammable it touches at that fuel's usual rate. Bounded by the vapour it consumes (CLAUDE.md rule 2): not flammable, and it only ever becomes air or smoke.",
+      "id": "ether_burning",
+      "far": "fire",
+      "class": "gas",
+      "density": 4,
+      "emission": 255,
+      "opacity": 120,
+      "colors": [
+        "#ffb347",
+        "#9fc4ff",
+        "#ffd27a"
+      ],
+      "tags": [
+        "hot",
+        "gas_heavy"
+      ]
     }
   ]
 }
