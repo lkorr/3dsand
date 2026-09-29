@@ -177,6 +177,13 @@ constexpr uint32_t kWorldTimeSaveVersion = 1;
 // (all of them in one file) still loads, and so do the gates that round-trip
 // one section's bytes.
 //
+// 'REFS' (r_x_y_z.sve, one record per REFERENCE that has a delta -- door
+// open, npc spawned; world/refs_game.h MakeRefsSection) is registered when
+// `refs` is non-null, AFTER 'MOBS' so a load has the creatures back before
+// the ref states that name them.
+namespace refs {
+class RefStore;
+}
 // 'DLGF' v1 (world.sve, GLOBAL): the dialogue store's FLAGS and MET set
 // (game/dialogue.h). Registered only when `talk` is given; its reset clears
 // both, so a save without the section loads a world where nobody has been
@@ -185,6 +192,7 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar,
                       const PlayerKitRefs* player = nullptr,
                       const WorldItemRefs* ground = nullptr,
+                      refs::RefStore* refStore = nullptr,
                       dialogue::Store* talk = nullptr);
 
 // THE SKY AFTER A LOAD, when the sim clock could not follow the save.

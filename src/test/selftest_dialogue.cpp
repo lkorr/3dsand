@@ -322,7 +322,7 @@ Status GateDialogueSave(Ctx& c, std::string& detail) {
   std::filesystem::remove_all(kPath);
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
-  EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr, nullptr, nullptr, &store);
+  EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr, nullptr, nullptr, nullptr, &store);
   bool registered = false;
   for (const EntitySection& sec : eio.sections)
     if (sec.id == Tag4('D', 'L', 'G', 'F'))

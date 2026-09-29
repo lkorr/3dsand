@@ -2273,6 +2273,14 @@ class Mob {
   // avatar and re-dresses the respawned rig, so looting it would duplicate),
   // and a rising from it takes the owning avatar's kit (keepKitOnTurn).
   bool PlayerCorpse() const { return playerCorpse_; }
+  // THE REFERENCE THIS CREATURE WAS SPAWNED FROM (world/refs.h, PLAN_world_
+  // editor.md §2.1): "harrowby/osric", or "" for a creature nobody authored.
+  // Its STABLE identity -- Id() is re-issued on every load and unpark; this
+  // is not. Saved in the MOBS record (v11), so a parked or saved villager
+  // comes back as the same villager, and MobSystem::LoadOne refuses a record
+  // whose ref already has a live creature (one ref, one body).
+  const std::string& RefId() const { return refId_; }
+  void SetRefId(std::string id) { refId_ = std::move(id); }
   // LAST LOOK AT A LIVING RIG. Called from Die() after the cause is recorded,
   // before the rig goes limp and (for the bodies that still go to debris)
   // before a single limb is handed over.
@@ -4306,6 +4314,7 @@ class Mob {
   uint64_t deadWakeKey_ = 0;   // DeadWakeKey() when it fell asleep
   uint64_t deathSeq_ = 0;      // see DeathSeq()
   bool playerCorpse_ = false;  // see PlayerCorpse()
+  std::string refId_;          // see RefId()
   uint64_t collisionOwner_ = 0;  // see SetCollisionOwner (avatars only)
   bool swinging_ = false;
   GoreProfile gore_;           // this creature's own bleed character
@@ -5507,6 +5516,9 @@ class MobSystem {
   // id-keyed wrappers below remain for callers that only hold a body handle
   // or an id.
   Mob* FindMobById(uint64_t id);
+  // The creature (living or dead, in mobs_) spawned from reference `refId`
+  // (Mob::RefId), or null. "" finds nothing.
+  Mob* FindMobByRef(const std::string& refId);
   // Take one creature out of the world with no corpse — its rig is released
   // (bodies destroyed, not handed to debris). A test/harness seam: the game
   // kills things, it does not delete them. False for an unknown id.
@@ -5779,7 +5791,13 @@ class MobSystem {
   // 10 (2026-09-27): A VESSEL'S STOPPER. Every ItemInstance ends with its
   // stopper word (iteminstance.h kItemFmtStopper); a v9 record's vessels
   // load unstoppered.
-  static constexpr uint32_t kSaveVersion = 10;
+  //
+  // 11 (2026-09-29, PLAN_world_editor.md P1): THE REFERENCE ID. After the gear
+  // list, before the dead block: the ref the creature was spawned from
+  // (Mob::RefId, "" for none), so an authored villager keeps its identity
+  // through a save, a load, a park and an unpark. v10 and older load with no
+  // ref -- which is what they were.
+  static constexpr uint32_t kSaveVersion = 11;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;

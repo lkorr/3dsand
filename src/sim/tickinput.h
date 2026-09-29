@@ -72,13 +72,19 @@ enum TickButton : uint32_t {
   TB_SCOOP = 1u << 12,
   TB_APPLY_L = 1u << 13,
   TB_SCOOP_L = 1u << 14,
+  // THE USE VERB (docs/PLAN_world_editor.md §2.5, world/refs_game.h): a
+  // press that USES the reference named by TickInput::useRef -- open a door,
+  // talk to a villager, search a chest. An edge, carried with its target so
+  // the tick acts on what the HUD prompt promised, not on a re-aimed ray.
+  TB_USE = 1u << 15,
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
 // op record's frame header (sim/oprecord.h) and refused on mismatch.
 // 4: dual wielding — TB_ALT is the left hand, per-hand vessel modes.
-// 5: `talk` (was pad0) — the conversation command (game/dialogue.h).
-constexpr uint32_t kTickInputVersion = 5;   // 2: TB_THROW, 3: TB_APPLY
+// 5: TB_USE + `useRef` (the use verb, PLAN_world_editor.md P1).
+// 6: `talk` (was pad0) — the conversation command (game/dialogue.h).
+constexpr uint32_t kTickInputVersion = 6;   // 2: TB_THROW, 3: TB_APPLY
 
 // THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
 // in the conversation panel is a player INPUT like a strike or a use, so it
@@ -126,6 +132,11 @@ struct TickInput {
   int16_t tool = -1;
   // A TalkCommand (above), or kTalkNone. An EDGE: delivered to one tick.
   int16_t talk = kTalkNone;
+  // WHAT A TB_USE PRESS USES: refs::RefHash of the reference id the frame's
+  // use prompt showed (world/refs.h), 0 = nothing. A hash, not the string,
+  // because this is a fixed-size wire POD; the store detects collisions at
+  // load. One-shot like the edge it rides with (TickInputFeeder::Consume).
+  uint32_t useRef = 0;
 
   // The camera basis AT TICK TIME. flatFwd is the horizontal walk forward,
   // right the horizontal strafe axis, lookFwd the full 3D aim (fly and swim).
@@ -143,7 +154,7 @@ struct TickInput {
   }
 };
 
-static_assert(sizeof(TickInput) == 72, "TickInput is a wire message");
+static_assert(sizeof(TickInput) == 76, "TickInput is a wire message");
 
 // ---- THE FRAME LAYER'S ACCUMULATOR ---------------------------------------
 //
@@ -182,6 +193,11 @@ struct TickInputFeeder {
   // The newest conversation answer since the last tick wins (two keys in one
   // frame is a fumble, not two answers).
   void Talk(int code) { pend.talk = (int16_t)code; }
+  // A use press and its target, together (the newest press wins).
+  void Use(uint32_t refHash) {
+    pend.pressed |= TB_USE;
+    pend.useRef = refHash;
+  }
   void SetSelection(int tool, int hotbarSlot) {
     pend.tool = (int16_t)tool;
     pend.hotbar = (int16_t)hotbarSlot;
@@ -197,6 +213,7 @@ struct TickInputFeeder {
     pend.lookDx = pend.lookDy = 0;
     pend.strikeStyle = -1;
     pend.talk = kTalkNone;
+    pend.useRef = 0;
     return out;
   }
 };

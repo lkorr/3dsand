@@ -575,3 +575,79 @@ loads). Warnings load.
 It is plain text; a text editor and R work fine. Keep one choice per line.
 The full schema, with every key, is at the top of `src/game/dialogue.h`.
 `node scripts/test_dialogue.mjs` checks every file the way the tab does.
+
+## 10. References — the placed things in a map (in game: F1 → World → References)
+
+A **reference** ("ref") is one thing you placed on purpose: a villager, a well,
+later a house, a door, a chest. Each has an **id** like `harrowby/osric` that
+never changes — schedules, dialogue and saves all point at things by that id.
+
+Refs live in plain text: `assets/worldmap/<map>/refs/<group>.json`, one ref per
+line. A group is a place (`harrowby.json`). You can edit these files in any text
+editor and press **R** in game; or use the in-game page below, which writes the
+same file.
+
+```json
+{ "id": "harrowby/osric", "kind": "npc", "base": "human", "pos": [612, 204, 3530], "yaw": 180, "props": { "name": "Osric" } }
+```
+
+| Field | Means |
+|---|---|
+| `id` | `group/name`, lowercase letters, digits, `_` and `-` only |
+| `kind` | what sort of thing: `marker`, `npc` (more arrive: `structure`, `door`, `container`, `bed`, `waynode`) |
+| `base` | what it's an instance of — for an `npc`, the mob def (`human`, `dummy`, ...) |
+| `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells |
+| `yaw` | facing in degrees: 0 faces +Z, 90 faces +X |
+| `props` | anything else; each kind reads what it needs (`name`, `tags`, ...) |
+
+Anything the game doesn't recognise (a prop, a field, even a kind) is kept
+exactly as you wrote it and shown as a warning — nothing you typed is ever
+silently thrown away.
+
+### How do I…
+
+- **See what's placed?** F1 → **World** tab → open **References**. Refs are
+  listed by group; `*` marks the ones active right now (near you). Filter by
+  kind or type in the search box (it searches ids, bases and props). A red row
+  is a kind this build doesn't know.
+- **Go and look at one?** Double-click its row, or select it and press **fly to
+  it**. You're put in fly mode a few metres off it, looking at it.
+- **Place a new one?** Under **new reference**: type an id (`harrowby/well`),
+  pick a kind, optionally a base, then **place at crosshair** (the block you're
+  looking at, one above) or **place at my feet**. The group file is created if
+  it's new.
+- **Move or turn one?** Select it, edit **pos** / **yaw** (the ± buttons step
+  yaw by 15°), press **apply pos/yaw**. Or **move to my feet** / **move to
+  crosshair**.
+- **Change what it is?** Pick another **kind**; type a new **base** and press
+  Enter.
+- **Edit a prop?** Change the value and press **Enter**. Values are JSON (`3`,
+  `true`, `["gather", "water"]`, `"text"`), but a bare word like `Osric` is taken
+  as text. Add a prop with the empty row at the bottom; **x** removes one.
+- **Delete one?** **delete...**, then **really delete?**.
+- **Fix a typo by hand?** Edit the `.json` in a text editor, save, press **R**
+  in game. Only the refs whose line changed are re-applied.
+- **See what's wrong?** The **warnings** list at the bottom of the page names
+  the file, the ref id and the field for every problem (unknown kind, a missing
+  `pos`, two refs with the same id, a saved state for a ref you deleted).
+
+### Using things in the world
+
+Walk up to a usable thing (a villager for now; doors and chests arrive later)
+and look at it: the prompt under the crosshair says what **G** will do ("G  Talk
+to Osric"). Tap **G**. If something lying on the ground is also under the
+crosshair, G picks that up first — look at the thing you mean.
+
+### What saves, and what doesn't
+
+The ref files are the design; a save only remembers what *changed in play*
+(a villager was spawned and walked off, later: a door left open, a chest
+emptied). So:
+
+- Editing a ref file between saves is safe. A saved state for a ref you've since
+  deleted or renamed is dropped with a warning — it does not break the save.
+- A villager, once spawned, belongs to the world: it keeps its identity
+  (`harrowby/osric`) through saving, loading and walking out of range. Editing
+  its ref (moving it, changing its base) re-spawns it where the file now says.
+- The harness map's `refs/fixture.json` is for the automated tests only; the
+  game never loads it.

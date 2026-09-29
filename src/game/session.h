@@ -105,6 +105,9 @@
 #include "ui/overlay.h"
 
 class WorldItems;  // game/worlditems.h; TickAuthorityCtx holds it by pointer
+namespace refs {
+class RefStore;  // world/refs.h; TickAuthorityCtx holds it by pointer
+}
 
 // THE OP EXCHANGE, BY NAME ONLY (M9.3-B). net/opsync.h includes this header
 // for OpBatch, so the dependency has to point one way: a pointer to an
@@ -1003,7 +1006,16 @@ struct TickAuthorityCtx {
   // every harness that does not bind it, and then nothing is thrown or broken.
   WorldItems* ground = nullptr;
 
-  // ---- H3. CONVERSATIONS (game/dialogue.h), owned by main().
+  // ---- H3. THE MAP'S REFERENCES (world/refs.h, PLAN_world_editor.md P1).
+  //
+  // Per-WORLD, owned by main(). When set, the tick runs refs::TickRefs
+  // between phases G and H: activation against the window (in id order) and
+  // every session's TB_USE. NULL IN EVERY HARNESS except the refs-* gates --
+  // the harness map's refs are gate fixtures, and a gate that did not ask for
+  // them must not find an NPC standing in its world.
+  refs::RefStore* refs = nullptr;
+
+  // ---- H4. CONVERSATIONS (game/dialogue.h), owned by main().
   //
   // The world-scoped dialogue store: the loaded conversations, the flags and
   // the met set. When non-null, the tick's first act for each session is

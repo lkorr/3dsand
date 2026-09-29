@@ -24,6 +24,7 @@
 #include "sim/weather.h" // the weather row: preset pin + readout
 #include "ui/dialogue_ui.h"
 #include "ui/inventory_ui.h"
+#include "ui/refs_ui.h"
 #include "ui/theme.h"
 
 bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
@@ -1593,6 +1594,9 @@ void Overlay::DrawDevWorld(UIState& s) {
         "40 -> 5.7, 20 -> 2.9, 6 -> 0.86 vox/tick.");
     ImGui::TextDisabled("wind primitives (fans, vortices): Spawn page");
   }
+
+  // ---- the map's references (ui/refs_ui.cpp) ----
+  if (Section("References", false)) DrawRefsPage(s);
 
   if (Section("World file & reload")) {
     const float w = CellWidth(2);

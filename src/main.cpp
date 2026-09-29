@@ -107,6 +107,8 @@
 #include "test/tickrig.h"   // support::TickRig: the --shot-* harnesses tick TickAuthority
 #include "test/treefixture.h"
 #include "ui/overlay.h"
+#include "world/refs.h"
+#include "world/refs_game.h"
 #include "crash.h"
 
 // The sim/render plumbing these once defined in place now lives in
@@ -8572,7 +8574,7 @@ int main(int argc, char** argv) {
       ctx.WaitIdle();
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, &talkStore);
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, nullptr, &talkStore);
       WorldStamp stamp{tick, (uint32_t)kDefaultSeed, true};
       if (SaveWorld(ctx, world, stream, "build/smoke_world.svd", mats, &eio,
                     stamp)) {
@@ -9080,6 +9082,21 @@ int main(int argc, char** argv) {
   // The ground-item registry: the tick throws vessels into it and breaks the
   // ones that land hard (session.h section H2).
   tickCtx.ground = &ground;
+  // ---- THE MAP'S REFERENCES (world/refs.h, PLAN_world_editor.md P1) -------
+  // assets/worldmap/<map>/refs/*.json: villagers, doors, markers, houses. The
+  // tick activates them against the window and runs the use verb
+  // (session.h section H3). NOT for the harness map: its refs are the refs-*
+  // gates' fixtures, and a --shot or a smoke must not find a villager in it.
+  refs::RegisterAllKinds();
+  refs::RefStore refStore;
+  uint32_t lookUseRef = 0;   // the use prompt's target (refs::RefHash), 0 = none
+  auto refsMapName = [] { return worldmap::ActiveMapName(CurrentTuning().world.mapLayer); };
+  if (refsMapName() != kHarnessMapName) {
+    refStore.LoadMap(assetDir, refsMapName());
+    refStore.BindChunkStore(&stream.Store());
+    tickCtx.refs = &refStore;
+    ui.refs = &refStore;
+  }
   if (netRoleBoot != NetRole::None) tickCtx.remotes = &remotes;
   // ...and so does the op exchange. Null in every harness and in every
   // single-player frame; even here it does nothing until Connected().
@@ -10233,7 +10250,25 @@ int main(int argc, char** argv) {
     // closes: a few paces, the same "still standing over it" a pickup means.
     constexpr float kLootRange = 40.0f;
     lookBody = 0;
+    lookUseRef = 0;
     ui.lookPrompt.clear();
+    // ---- "fly to" from F1 -> World -> References (ui/refs_ui.cpp) --------
+    // Fly mode, a few metres off the ref and above it, looking at it.
+    if (ui.refFlyTo) {
+      ui.refFlyTo = false;
+      ui.fly = true;
+      const Vec3 at{ui.refFlyPos[0] + 0.5f, ui.refFlyPos[1] + 8.0f, ui.refFlyPos[2] + 0.5f};
+      player.pos = at + Vec3{-28.0f, 14.0f, -28.0f};
+      player.vel = Vec3{0, 0, 0};
+      const Vec3 d = at - player.EyePos();
+      const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+      if (len > 1e-3f) {
+        cam.yaw = std::atan2(d.z, d.x);
+        cam.pitch = std::asin(std::clamp(d.y / len, -1.0f, 1.0f));
+      }
+      player.ResetViewSmooth();
+      player.SnapRender();
+    }
     if (captured && !ui.inventoryOpen) {
       // TWO THINGS THIS RAY MUST NOT DO, both measured 2026-09-12 with a
       // walking avatar (a fly-mode harness has no rig and showed neither):
@@ -10282,6 +10317,18 @@ int main(int argc, char** argv) {
         const std::string name = c->Def() ? c->Def()->name : std::string();
         ui.lookPrompt = pieces.empty() ? name + "  -  nothing left on it"
                                        : "G  loot " + name;
+      }
+      // ...and a USABLE REFERENCE when nothing lying about claims the key: a
+      // door, a chest, a villager (world/refs_game.h). The prompt says what
+      // G will do; the press carries THIS ref's hash, so the tick acts on
+      // what was promised (TickInput::useRef).
+      if (ui.lookPrompt.empty() && tickCtx.refs != nullptr) {
+        refs::RefCtx rc{&refStore, &mobs, &world, &stream.Store(), nullptr, tick};
+        std::string p;
+        if (const refs::Ref* r = refs::PickUsable(refStore, rc, from, fwd, hand, &p)) {
+          lookUseRef = r->hash;
+          ui.lookPrompt = "G  " + p;
+        }
       }
       // ...and the second half of the same prompt: anything the grab would
       // accept says so, whether or not it is also an item. The prompt is how
@@ -10481,7 +10528,12 @@ int main(int argc, char** argv) {
           }
         }
       }
-      if (!eDown && ePrevDown && !eGrabbed && captured) takeE();
+      // A tap USES the reference the prompt named when there is one (the use
+      // verb, world/refs_game.h), else takes / loots as it always did.
+      if (!eDown && ePrevDown && !eGrabbed && captured) {
+        if (lookUseRef != 0) feeder.Use(lookUseRef);
+        else takeE();
+      }
       if (!eDown) eHeld = 0.0f;
       ePrevDown = eDown;
     }
@@ -10814,6 +10866,12 @@ int main(int argc, char** argv) {
       // authored data next to materials, and a tuner edit of a sky should show
       // on the same keypress.
       weather::Presets().Reload();
+      // ...and the map's references: a hand edit of a group file shows on
+      // the same key (world/refs.h RefStore::Reload re-applies what changed).
+      if (tickCtx.refs != nullptr) {
+        refs::RefCtx rc{&refStore, &mobs, &world, &stream.Store(), nullptr, tick};
+        refStore.Reload(rc);
+      }
       std::vector<MaterialDef> newMats;
       std::vector<ReactionGpu> newReactions;
       // THE ALCHEMY BENCH: its substances, rules and ledger are indexed by the
@@ -11097,6 +11155,16 @@ int main(int argc, char** argv) {
       fluidPendingSpawns.clear();  // table zeroes the GPU count + calm state)
       debris.Reset();
       mobs.Reset();
+      // A new world: the refs start as authored (no deltas, nothing active),
+      // read again from the map F7 may just have switched to.
+      if (refsMapName() != kHarnessMapName) {
+        refStore.LoadMap(assetDir, refsMapName());
+        tickCtx.refs = &refStore;
+        ui.refs = &refStore;
+      } else {
+        tickCtx.refs = nullptr;
+        ui.refs = nullptr;
+      }
       // The avatar's severed parts live in DebrisSystem and its live limbs are
       // Jolt bodies in the world that just went away; despawn rather than
       // leave it holding handles into a system that has been reset. The
@@ -11112,7 +11180,7 @@ int main(int argc, char** argv) {
       // players/local.svp, and per-region r_*.sve buckets (S4).
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, &talkStore);
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs, &talkStore);
       // M9.5-B: the directory is `--load-world`'s, and the save now carries
       // the SIM TICK and the SEED (meta.svm's SVM5 pair). The tick is what a
       // reload has to resume above so that the per-chunk tick tags this
@@ -11126,7 +11194,7 @@ int main(int argc, char** argv) {
       ctx.WaitIdle();
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, &talkStore);
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs, &talkStore);
       WorldStamp loaded{};
       if (LoadWorld(ctx, world, sim, stream, worldDir, mats, &eio, &loaded)) {
         mobParking.ResetWaits();

@@ -84,6 +84,8 @@ const std::vector<Gate>& SoluteGates();
 // Conversations (docs/PLAN_world_editor.md P3): the sample through the real
 // tick, and the flags + met set through a real save/load.
 const std::vector<Gate>& DialogueGates();
+// REFERENCES (docs/PLAN_world_editor.md P1, world/refs.h).
+const std::vector<Gate>& RefsGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -127,6 +129,9 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    // With it: `refs-roundtrip` is CPU-only over the harness map's fixture
+    // group and a scratch copy under build/ -- no world, no GPU.
+    "refs-roundtrip",
     "vessel",
     // With it: `spells-oracle` is pure CPU over glyphs.json and the generated
     // grammar oracle -- no world, no GPU, nothing left behind -- and a parser
@@ -562,6 +567,12 @@ const char* const kOrder[] = {
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
     "corpse-save",
+    // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
+    // exit contract: mobs and debris reset, id counter restored, park function
+    // removed, store cleared, and worldgen regenerated at the origin the gate
+    // found (both move the window to the harness origin to meet the fixture).
+    "refs-activate",
+    "refs-npc-identity",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find
@@ -1002,7 +1013,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

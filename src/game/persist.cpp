@@ -9,6 +9,7 @@
 #include "game/dialogue.h"
 #include "sim/mattable.h"
 #include "sim/waterbody.h"
+#include "world/refs_game.h"
 
 namespace {
 constexpr uint32_t FourCC(char a, char b, char c, char d) {
@@ -741,7 +742,8 @@ void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t v
 
 EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar, const PlayerKitRefs* player,
-                      const WorldItemRefs* ground, dialogue::Store* talk) {
+                      const WorldItemRefs* ground, refs::RefStore* refStore,
+                      dialogue::Store* talk) {
   EntityIO io;
   io.sections.push_back(EntitySection{
       FourCC('D', 'B', 'R', 'S'), DebrisSystem::kSaveVersion,
@@ -827,6 +829,10 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
     };
     io.sections.push_back(std::move(mobsSec));
   }
+  // ---- 'REFS': the map's references' deltas, bucketed by REGION -----------
+  // (world/refs_game.h). After MOBS: an npc ref's state says "spawned", and
+  // the creature it names comes back through MOBS first.
+  if (refStore != nullptr) io.sections.push_back(refs::MakeRefsSection(*refStore, &mobs));
   if (avatar) {
     io.sections.push_back(EntitySection{
         FourCC('A', 'V', 'T', 'R'), PlayerAvatar::kSaveVersion,
