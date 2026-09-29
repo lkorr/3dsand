@@ -166,7 +166,10 @@ class Cues {
   enum class CombatCue { Whoosh, Flesh, Clang, StrikeEdge, StrikeBlunt, Cut };
   // `gainDb` is an extra level on top of the power law, for a hit that is the
   // same kind of event but softer (a mace's haft: ItemDef::haftGainDb).
-  int Combat(CombatCue cue, const Vec3& posVox, float power, float gainDb = 0.0f);
+  // `priority` = this cue must play (audio/world.h VoiceConfig::priority):
+  // used for blows landing on the player.
+  int Combat(CombatCue cue, const Vec3& posVox, float power, float gainDb = 0.0f,
+             bool priority = false);
 
   // Move a still-playing cue (the handle from Combat). Silently does nothing
   // once the sample has finished or its voice was stolen, so a caller may keep

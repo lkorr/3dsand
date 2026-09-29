@@ -5323,6 +5323,14 @@ class MobSystem {
   void PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t);
   const std::vector<BlockEvent>& BlockEvents() const { return blocks_; }
   void ClearBlockEvents() { blocks_.clear(); }
+  // ---- BLOWS THAT LANDED (game/melee.h StrikeEvent) -----------------------
+  // Pushed by MeleeSweepDamage for an NPC stroke, once per victim per stroke;
+  // drained by the frame loop into the combat cues. Capped like blocks_.
+  void PushStrikeEvent(const StrikeEvent& ev) {
+    if (strikes_.size() < kMaxMobs * 2) strikes_.push_back(ev);
+  }
+  const std::vector<StrikeEvent>& StrikeEvents() const { return strikes_; }
+  void ClearStrikeEvents() { strikes_.clear(); }
 
   // ---- THE OTHER TWO KINDS OF BLOW (game/impact.h) ------------------------
   // The system-level twins of Damage/CutLimb: resolve the handle against the
@@ -7260,6 +7268,7 @@ class MobSystem {
   const ItemLibrary* items_ = nullptr;
   std::function<void(uint64_t, const ItemInstance&)> onItemShed_;
   std::vector<BlockEvent> blocks_;
+  std::vector<StrikeEvent> strikes_;
   // The players' bodies, registered by the frame layer so the handle-keyed
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
   std::vector<Mob*> avatars_;

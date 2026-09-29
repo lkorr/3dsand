@@ -194,7 +194,7 @@ int AudioWorld::PlayOneShotTracked(const std::vector<float>* buf,
   const float rank = Audibility(cfg.gain, distM, cfg.audibleRadius);
   // Below this the sound is inaudible in the mix; spending a voice on it would
   // only starve one that matters.
-  if (rank < 1e-4f) return -1;
+  if (rank < 1e-4f && !cfg.priority) return -1;
 
   Voice* pick = nullptr;
   size_t pickSlot = 0;
@@ -213,7 +213,7 @@ int AudioWorld::PlayOneShotTracked(const std::vector<float>* buf,
     // sounds from cutting each other off every frame.
     Voice* worst = nullptr;
     size_t worstSlot = 0;
-    float worstRank = rank * 0.7f;
+    float worstRank = cfg.priority ? 3.4e38f : rank * 0.7f;
     for (size_t i = 0; i < oneShots_.size(); i++) {
       Voice& v = *oneShots_[i];
       const float d = (v.worldPos - listener_.posVox * kVoxelMeters).len();

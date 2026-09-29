@@ -545,7 +545,8 @@ bool Cues::CombatActive(int handle) const {
   return enabled_ && handle >= 0 && world_.OneShotActive(handle);
 }
 
-int Cues::Combat(CombatCue cue, const Vec3& posVox, float power, float gainDb) {
+int Cues::Combat(CombatCue cue, const Vec3& posVox, float power, float gainDb,
+                 bool priority) {
   // COUNTED BEFORE THE DEVICE CHECK. See Stats::combat — this is the only
   // signal a headless gate has that the game asked for the right sound at the
   // right moment, and putting it after `enabled_` would freeze it at 0 in
@@ -605,6 +606,7 @@ int Cues::Combat(CombatCue cue, const Vec3& posVox, float power, float gainDb) {
   // swing reads as a pitch bug.
   cfg.doppler = false;
   cfg.rate = std::clamp(rate, 0.25f, 4.0f);
+  cfg.priority = priority;
   const int handle = world_.PlayOneShotTracked(buf, posVox, cfg);
   if (handle < 0) stats_.dropped++;
   return handle;

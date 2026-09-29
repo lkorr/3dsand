@@ -426,6 +426,7 @@
     "blockNudgeAz": 0.300000012,
     "blockNudgeEl": 0.180000007,
     "pickMinSpeed": 250,
+    "repeatHitScale": 0.5,
     "aimYaw": 70,
     "torsoShare": 0.349999994,
     "torsoPitch": 0.200000003,

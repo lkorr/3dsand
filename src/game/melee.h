@@ -441,6 +441,9 @@ struct MeleeTuning {
   // weapon exactly what it would have cost their arm, which is too much: an arm
   // absorbs a cut by being cut, a blade absorbs it by being a blade.
   float blockItemDamage = 0.35f;
+  // Tuning::Melee::repeatHitScale: hp multiplier compounding per repeat
+  // strike of one stroke on one creature (EdgeSweep::victimHits).
+  float repeatHitScale = 0.5f;
   // THE SWEEP'S DENSITY (MeleeSweepDamage): the widest gap, world voxels,
   // between two rows of probe rays across one tick's travel, and the most rows
   // a sweep may cast. Dead initialisers: filled from Tuning::Melee
@@ -601,6 +604,22 @@ struct BlockEvent {
   float power = 0;           // 0..1, speed x edge alignment of the blow
 };
 
+// A BLOW LANDED ON A CREATURE (2026-09-28). Pushed by MeleeSweepDamage, only
+// for a sweep that asks (EdgeSweep::reportStrikes), the FIRST time a stroke
+// meets each victim -- one blow, one sound, not one per cut tick. The player's
+// own sweep does not ask: it latches its cues by differencing the mob queues
+// (session.cpp resolveSweep). An NPC's did not do anything at all, so an enemy
+// hitting you made no weapon or gore sound; this is that sound's source.
+struct StrikeEvent {
+  uint64_t attackerId = 0;
+  uint64_t victimId = 0;     // the creature struck (the player's actor id too)
+  Vec3 at{};                 // world voxels, the probe's contact point
+  float power = 0;           // 0..1, speed ramp x edge alignment
+  float gainDb = 0;          // EdgeSweep::cueGainDb (a haft's softer level)
+  bool flesh = false;        // met flesh (live or dead) rather than a shell
+  bool edged = false;        // strike.cut > strike.blunt: ring + wet cut layer
+};
+
 // One resolved cut of the blade this tick: the quad the edge swept, how fast it
 // was going, and which way its flat was facing while it did. MeleeSweepDamage
 // turns this into carves.
@@ -722,6 +741,32 @@ struct EdgeSweep {
   // same reason: `bite-rot` fabricates ten separate sweeps on purpose and each
   // of them is its own bite.
   bool* bitten = nullptr;
+  // ---- ...AND EVERY STRIKE AFTER THE FIRST IS WORTH LESS (2026-09-28) -----
+  //
+  // One stroke meets the same creature many times: the kerf runs on every cut
+  // tick, and a swing that crosses an arm carries on into the chest behind
+  // it. Each of those was full hp, so the damage of a blow was set by how long
+  // the blade stayed in the body rather than by where it landed. Now strike n
+  // of this stroke on one creature does `MeleeTuning::repeatHitScale^(n-1)` of
+  // its hp -- 100%, 50%, 25% at the default -- so the FIRST contact, the one
+  // the blow was aimed and arrived with, is always the heaviest.
+  //
+  // (creature id, strikes so far). BY CREATURE, not by body like `struck`:
+  // the falloff is about one person being hit repeatedly by one swing, whichever
+  // limbs it crosses. A STRIKE is one body resolved in one sweep, so the kerf
+  // still deepens every tick (the wound geometry is untouched) -- only the hp
+  // it charges falls. Loose matter is not counted: it has no hp.
+  //
+  // NULL MEANS "NO STROKE IDENTITY", exactly as `struck` does: a gate that
+  // fabricates N sweeps gets N full blows. The head and the haft of one stroke
+  // share ONE of these -- it is the same swing hitting the same person.
+  std::vector<std::pair<uint64_t, int>>* victimHits = nullptr;
+  // Push a StrikeEvent the first time this stroke meets each creature (needs
+  // `victimHits` to know "first"). Set by the NPC stroke runner; the player's
+  // sweep latches its own cues and leaves it off.
+  bool reportStrikes = false;
+  // The level those events carry (ItemDef::haftGainDb for the haft sweep).
+  float cueGainDb = 0.0f;
   // ---- ...AND THEY CLOSE ON THE THING THE STROKE AIMED AT (2026-09-19) ----
   //
   // THE DRAW CHOSE A LIMB AND THE JAWS BIT WHATEVER THEY MET FIRST. Those are

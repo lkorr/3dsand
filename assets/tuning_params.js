@@ -794,6 +794,7 @@ const TUNING_PARAMS = {
   'melee.blockNudgeAz':{t:'f',def:0.3,min:0,max:1},
   'melee.blockNudgeEl':{t:'f',def:0.18,min:0,max:1},
   'melee.pickMinSpeed':{t:'f',def:250,min:1,max:1500},
+  'melee.repeatHitScale':{t:'f',def:0.5,min:0,max:1},
   'melee.aimYaw':{t:'f',def:70,min:0,max:90},
   'melee.torsoShare':{t:'f',def:0.35,min:0,max:1},
   'melee.torsoPitch':{t:'f',def:0.2,min:0,max:1},

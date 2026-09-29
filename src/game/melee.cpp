@@ -1403,8 +1403,8 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // ticks the blade then spends inside the limb must not re-stab it --
       // each would snap its entry to the bottom of the last bore and drive it
       // another full depth. `parts` is therefore built first.
-      const StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
-                                                 power, out.tipSpeed, hitSeed);
+      StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
+                                           power, out.tipSpeed, hitSeed);
       bool firstContact = true;
       if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f ||
                                   (s.strike.cut > 0.0f && parts.cut.stab))) {
@@ -1422,6 +1422,41 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // one this test is off and first contact wins.
       const bool wrongTarget = s.bitePrefer != 0 && hb != s.bitePrefer &&
                                s.biteHoldout;
+
+      // ---- STRIKE n OF THIS STROKE ON THIS CREATURE (melee.h victimHits) --
+      //
+      // Counted per creature, after every `continue` that could drop this
+      // probe, so a strike is a body actually resolved. The hp of all three
+      // parts falls by `repeatHitScale` per repeat; the kerf's GEOMETRY does
+      // not, so the wound still deepens along the blade's path. Loose matter
+      // has no hp and is not counted.
+      float repeat = 1.0f;
+      if (kind != StruckKind::Debris && s.victimHits != nullptr) {
+        const uint64_t vid = owner->Id();
+        int n = 0;
+        for (auto& e : *s.victimHits)
+          if (e.first == vid) n = ++e.second;
+        if (n == 0) {
+          s.victimHits->push_back({vid, 1});
+          n = 1;
+          if (s.reportStrikes) {
+            StrikeEvent ev;
+            ev.attackerId = wielder.Id();
+            ev.victimId = vid;
+            ev.at = at;
+            ev.power = out.power * out.edgeAlign;
+            ev.gainDb = s.cueGainDb;
+            ev.flesh = kind == StruckKind::Flesh;
+            ev.edged = s.strike.cut > s.strike.blunt;
+            mobs.PushStrikeEvent(ev);
+          }
+        }
+        if (n > 1)
+          repeat = std::pow(std::clamp(t.repeatHitScale, 0.0f, 1.0f),
+                            (float)(n - 1));
+      }
+      parts.blunt.hp *= repeat;
+      parts.bite.hp *= repeat;
 
 
       // ---- LOOSE MATTER RESOLVES IT AND THE PROBE MOVES ON ----------------
@@ -1480,7 +1515,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // kerf outright rather than building a zero-depth slot and asking the
       // wound model to notice that it is nothing.
       if (s.strike.cut > 0.0f) {
-        const float dmg = s.strike.cut * power;
+        const float dmg = s.strike.cut * power * repeat;
         // Everything severed by these two calls is a BLADE cut, and gets the
         // wet dismember sound on top of the creature's own cry. Both can sever
         // several frames deep — Damage() at zero hp or over the impact
@@ -1584,6 +1619,7 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.sweepMaxSteps = m.sweepMaxSteps;
   dst.blockGap = MetresToCells(m.blockGapM);             // m -> voxels
   dst.blockItemDamage = m.blockItemDamage;
+  dst.repeatHitScale = m.repeatHitScale;
   dst.blockNudgeAz = m.blockNudgeAz;
   dst.blockNudgeEl = m.blockNudgeEl;
   dst.torsoShare = m.torsoShare;

@@ -1941,6 +1941,10 @@ TP_F(melee, blockItemDamage, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeAz, NO_WGSL, 0.30f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeEl, NO_WGSL, 0.18f, 0.0f, 1.0f)
 TP_F(melee, pickMinSpeed, NO_WGSL, 250.0f, 1.0f, 1500.0f)
+// Each further strike one stroke lands on the same creature does this
+// fraction of the previous one: 0.5 = 100%, 50%, 25%, ... 1 = no falloff,
+// 0 = only the first contact hurts.
+TP_F(melee, repeatHitScale, NO_WGSL, 0.5f, 0.0f, 1.0f)
 // Capped at 90: past it a look is reflected to the front (ResolveSwingYaw),
 // so a wider cone could never be reached. 0 pins every swing to the body.
 TP_F(melee, aimYaw, NO_WGSL, 70.0f, 0.0f, 90.0f)

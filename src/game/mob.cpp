@@ -3519,6 +3519,7 @@ void MobSystem::Reset(bool rewindIds) {
   attacks_.clear();
   actors_.clear();
   blocks_.clear();
+  strikes_.clear();
   // The corpse coat's derived indices: their bodies belong to the world being
   // torn down (StainDeadFlesh).
   fleshCoat_.clear();
@@ -6590,6 +6591,12 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     // not per slot: a lunging zombie's head passes a shoulder, a chest and an
     // arm on the way in, and it may tear a hole in exactly one of them.
     sw.bitten = &st.bitten;
+    // ...every strike after the first on the same creature worth less, and
+    // the first one on each creature REPORTED so the frame loop can voice it
+    // (melee.h EdgeSweep::victimHits / reportStrikes). Without the report an
+    // NPC's blow made no weapon or flesh sound at all -- even on the player.
+    sw.victimHits = &st.victimHits;
+    sw.reportStrikes = true;
     // ...and WHICH limb that one bite is trying to close on (melee.h
     // EdgeSweep::bitePrefer). The draw already happened, once, at the start of
     // the stroke (StartStroke) and the aim already moved onto that limb; this is
@@ -6657,6 +6664,7 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       hs.powerScale = hPow;
       hs.struck = &st.haftStruck;
       hs.bitten = nullptr;
+      hs.cueGainDb = hDb;
       const EdgeSweepResult hr =
           MeleeSweepDamage(hs, st.melee.tuning, mob, *phys_, *this, *debris_,
                            world, spawns);

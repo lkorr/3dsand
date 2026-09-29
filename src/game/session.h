@@ -680,6 +680,9 @@ struct PlayerSession {
   // them. Per-player because they are one stroke's readout.
   std::vector<uint64_t> playerStruck;
   bool playerBitten = false;
+  // Strikes the current swing has landed per creature (melee.h
+  // EdgeSweep::victimHits), cleared with `playerStruck`.
+  std::vector<std::pair<uint64_t, int>> playerVictimHits;
   CombatCueRequest combatWhooshCue, combatFleshCue, combatClangCue,
       combatStrikeCue, combatCutCue;
   bool combatStrikeEdged = true;

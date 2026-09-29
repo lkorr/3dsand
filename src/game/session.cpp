@@ -4308,6 +4308,7 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
             playerStruck.clear();
             playerBitten = false;
             s.playerHaftStruck.clear();
+            s.playerVictimHits.clear();
           }
           if (lastEdgeValid && playerStrike.Cutting()) {
             EdgeSweep sw;
@@ -4348,6 +4349,9 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
             // cutting, the same line the sweep gate above reads.
             sw.struck = &playerStruck;
             sw.bitten = &playerBitten;
+            // Strike n on one creature does repeatHitScale^(n-1) of its hp;
+            // the haft copies this pointer and shares the count.
+            sw.victimHits = &s.playerVictimHits;
             // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted).
             sw.selfMounted = avatar.EffectorWeapon() != nullptr;
             sw.valid = true;

@@ -2073,6 +2073,13 @@ struct Tuning {
     float blockNudgeAz = TPD(melee, blockNudgeAz);
     //   open, azimuth and elevation, at power 1
     float blockNudgeEl = TPD(melee, blockNudgeEl);
+    // ---- ONE STROKE, DIMINISHING STRIKES (game/melee.h EdgeSweep::victimHits)
+    // The hp multiplier on each strike after the first that one stroke lands
+    // on the same creature, compounding: strike n does repeatHitScale^(n-1).
+    // A strike is one body resolved in one sweep tick, so a blade dragged
+    // through an arm for three ticks and then into the chest is four strikes,
+    // and the first -- where the blow ARRIVED -- is the one at full weight.
+    float repeatHitScale = TPD(melee, repeatHitScale);
     // ---- DISCRETE STRIKES (the player's ONLY control since 2026-09-25) ------
     // A click fires an AUTHORED stroke program (the same attack_styles.json
     // entries the NPCs replay), direction picked by the mouse flick at the

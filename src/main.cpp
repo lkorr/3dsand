@@ -12180,6 +12180,37 @@ int main(int argc, char** argv) {
           audioCues.Combat(audio::Cues::CombatCue::Clang, combatClangCue.at,
                            combatClangCue.power, combatClangCue.gainDb);
         }
+        // ---- BLOWS AN NPC LANDED (game/melee.h StrikeEvent, 2026-09-28) ----
+        //
+        // The latches above are the PLAYER's own sweep. An NPC's sweep had no
+        // cue path at all, so an enemy's sword in your ribs was silent unless
+        // a limb came off. MeleeSweepDamage now reports each NPC stroke's
+        // first contact with each creature, and it gets the same layers a
+        // player blow does: the weapon's ring/thud, flesh or clang, and the
+        // wet cut for an edge in flesh.
+        //
+        // A BLOW ON THE PLAYER IS NEVER DROPPED: no cap, and `priority` takes a
+        // voice even from a saturated pool. Everyone else's are capped per
+        // frame so a brawl across the yard cannot drown the mixer.
+        {
+          const uint64_t meId = avatar.Spawned() ? avatar.Id() : 0;
+          int others = 0;
+          for (const StrikeEvent& ev : mobs.StrikeEvents()) {
+            const bool onMe = meId != 0 && ev.victimId == meId;
+            if (!onMe && others >= 4) continue;
+            if (!onMe) others++;
+            const float pw = std::clamp(ev.power, 0.0f, 1.0f);
+            audioCues.Combat(ev.edged ? audio::Cues::CombatCue::StrikeEdge
+                                      : audio::Cues::CombatCue::StrikeBlunt,
+                             ev.at, pw, ev.gainDb, onMe);
+            audioCues.Combat(ev.flesh ? audio::Cues::CombatCue::Flesh
+                                      : audio::Cues::CombatCue::Clang,
+                             ev.at, pw, ev.gainDb, onMe);
+            if (ev.flesh && ev.edged)
+              audioCues.Combat(audio::Cues::CombatCue::Cut, ev.at, pw,
+                               ev.gainDb, onMe);
+          }
+        }
         // Liquid that landed in a flask since the last frame: one call, at
         // the fill the LAST cell reached (Cues::FlaskFill rate-limits).
         if (!session.flaskFills.empty())
@@ -12293,6 +12324,7 @@ int main(int argc, char** argv) {
       debris.ClearImpactEvents();
       mobs.ClearSeverEvents();
       mobs.ClearVoiceEvents();
+      mobs.ClearStrikeEvents();
       debris.ClearGoreEvents();
       // OUTSIDE the audio block, exactly like the queues above and for the
       // same reason stated there: a request that only clears when audio

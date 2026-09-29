@@ -50,6 +50,10 @@ struct VoiceConfig {
   float dopplerScale = 1.0f;
   float occlusionScale = 1.0f;  // < 1 for spatially extended sources
   float rate = 1.0;             // playback rate (pitch); 1 = natural
+  // MUST be heard (a blow landing on the player): never refused for being
+  // quiet, and on a saturated pool it takes the least audible voice outright
+  // instead of having to beat it by the steal margin.
+  bool priority = false;
 };
 
 class AudioWorld {

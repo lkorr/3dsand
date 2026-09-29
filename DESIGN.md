@@ -6067,6 +6067,18 @@ bite that touched flesh" is a fact about what this sweep met. Debris melts on
 `Total()` and skips the rest. Every part draws off one per-probe key, so a
 replay of the same tick cuts, bruises and tears identically.
 
+**Repeat strikes of one stroke fall off** (2026-09-28). A stroke meets the same
+creature many times -- the kerf runs every cut tick, and a swing that crosses an
+arm carries on into the chest -- and each of those used to be full hp, so a
+blow was worth as much as the time the blade spent inside. `EdgeSweep::victimHits`
+(per stroke, per CREATURE, shared by head and haft) counts them, and strike n
+charges `melee.repeatHitScale^(n-1)` of the hp of all three parts (0.5: 100%,
+50%, 25%...). Hp only; the kerf geometry is untouched. A null set is "no stroke
+identity" and every sweep is full, as for `struck`. The same count is what
+makes NPC blows audible: a sweep with `reportStrikes` pushes a `StrikeEvent` on
+each first contact, and the frame loop voices it (ring/thud, flesh/clang, wet
+cut); a blow on the player is never capped and plays at `VoiceConfig::priority`.
+
 **Blunt is trauma, and it never takes a limb off.** On FLESH `Mob::BluntHit`
 charges hp through the ordinary `Damage` (flinch, hurt cry, and death on a vital
 limb at zero, all unchanged), tops the drip budget up at only
