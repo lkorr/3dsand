@@ -1,0 +1,4 @@
+{"seed": 5, "params": {"width": 9.5, "depth": 7, "storeys": 1, "storeyHeight": 2.8, "wallStyle": "cobble",
+ "plinth": 0, "roofShape": "gable", "roofMaterial": "tile", "pitch": 38, "overhang": 0.4, "chimney": "left",
+ "doorsFront": 1, "doorsBack": 0, "doorsSide": 0, "windows": 1, "sideWindows": 1, "windowStyle": "shutters",
+ "floor": "flagstone", "partitions": 1, "loft": false, "beds": 1, "chests": 1}}

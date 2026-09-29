@@ -1,0 +1,127 @@
+# HARROWBY 03 -- the Cotters' longhouse, by hand, on the generated scaffold.
+#
+# House frame: y = 0 floor, +z the FRONT (door at x -9..-1, z 28), the back
+# door opposite (x -29..-21, z -29): a cross passage. x -69..70 wall to wall.
+#   x -69..-45  the BYRE: the gable (left, -x) door, two stalls, mangers
+#   x -45..28   the HALL: the open central hearth (x -28..-17, z -6..5),
+#               the board and benches, the meal chest, Maud's shelf
+#   x 31..70    the inner room under the sleeping LOFT (loft floor y 26)
+# In the world the longhouse faces south (yaw 0) onto the green.
+{"cmd": "struct.open", "args": {"ref": "harrowby/longhouse"}}
+
+# ---- the byre: a low rail across the hall, a passage from the gable door ----
+{"cmd": "vox.box_fill", "args": {"min": [-44, 0, -28], "max": [-44, 10, -28], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 0, -8], "max": [-44, 10, -8], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 0, 8], "max": [-44, 10, 8], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 0, 26], "max": [-44, 10, 26], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 5, -27], "max": [-44, 5, -9], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 9, -27], "max": [-44, 9, -9], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 5, 9], "max": [-44, 5, 25], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-44, 9, 9], "max": [-44, 9, 25], "mat": "timber"}}
+# stall dividers from the rail to the passage
+{"cmd": "vox.box_fill", "args": {"min": [-56, 0, -18], "max": [-56, 8, -18], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-55, 7, -18], "max": [-45, 7, -18], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-56, 0, 17], "max": [-56, 8, 17], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-55, 7, 17], "max": [-45, 7, 17], "mat": "timber"}}
+# mangers against the gable wall either side of the door, full of hay
+{"cmd": "vox.box_fill", "args": {"min": [-67, 0, -27], "max": [-63, 6, -9], "mat": "plank"}}
+{"cmd": "vox.clear", "args": {"min": [-66, 3, -26], "max": [-64, 6, -10]}}
+{"cmd": "vox.box_fill", "args": {"min": [-66, 3, -26], "max": [-64, 5, -10], "mat": "straw_bed"}}
+{"cmd": "vox.box_fill", "args": {"min": [-67, 0, 9], "max": [-63, 6, 26], "mat": "plank"}}
+{"cmd": "vox.clear", "args": {"min": [-66, 3, 10], "max": [-64, 6, 25]}}
+{"cmd": "vox.box_fill", "args": {"min": [-66, 3, 10], "max": [-64, 5, 25], "mat": "straw_bed"}}
+# straw litter on the stall floors
+{"cmd": "vox.box_fill", "args": {"min": [-62, 0, -27], "max": [-46, 0, -20], "mat": "straw_bed"}}
+{"cmd": "vox.box_fill", "args": {"min": [-62, 0, 19], "max": [-50, 0, 26], "mat": "straw_bed"}}
+
+# ---- the open hearth: ash in the kerb, a pot of pottage on three stones ----
+{"cmd": "vox.box_fill", "args": {"min": [-27, 0, -5], "max": [-18, 0, 4], "mat": "ash"}}
+{"cmd": "vox.box_fill", "args": {"min": [-24, 1, -2], "max": [-24, 1, -2], "mat": "cobble"}}
+{"cmd": "vox.box_fill", "args": {"min": [-20, 1, -2], "max": [-20, 1, -2], "mat": "cobble"}}
+{"cmd": "vox.box_fill", "args": {"min": [-22, 1, 2], "max": [-22, 1, 2], "mat": "cobble"}}
+{"cmd": "vox.box_fill", "args": {"min": [-24, 2, -2], "max": [-20, 5, 2], "mat": "iron"}}
+{"cmd": "vox.clear", "args": {"min": [-23, 3, -1], "max": [-21, 5, 1]}}
+{"cmd": "vox.box_fill", "args": {"min": [-23, 3, -1], "max": [-21, 4, 1], "mat": "water"}}
+{"cmd": "vox.box_fill", "args": {"min": [-26, 1, -4], "max": [-25, 1, -3], "mat": "charcoal"}}
+{"cmd": "vox.box_fill", "args": {"min": [-19, 1, 2], "max": [-18, 1, 3], "mat": "charcoal"}}
+
+# ---- the board: a plank table and two benches, clear of the door's swing --
+# (the front door hangs on x -9 and sweeps x -9..0, z 19..28 as it opens)
+{"cmd": "vox.box_fill", "args": {"min": [2, 7, 10], "max": [20, 7, 16], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [4, 0, 11], "max": [4, 6, 15], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [18, 0, 11], "max": [18, 6, 15], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [4, 2, 13], "max": [18, 2, 13], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [3, 4, 7], "max": [19, 4, 8], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [4, 0, 7], "max": [4, 3, 7], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [18, 0, 7], "max": [18, 3, 7], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [3, 4, 18], "max": [19, 4, 19], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [4, 0, 19], "max": [4, 3, 19], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [18, 0, 19], "max": [18, 3, 19], "mat": "timber"}}
+# two wooden bowls on the board
+{"cmd": "vox.box_fill", "args": {"min": [7, 8, 12], "max": [8, 8, 13], "mat": "wood"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 8, 13], "max": [15, 8, 14], "mat": "wood"}}
+
+# ---- the meal chest by the back wall, and Maud's shelf above it ------------
+{"cmd": "vox.box_fill", "args": {"min": [-42, 0, -28], "max": [-36, 4, -25], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [-42, 0, -25], "max": [-42, 4, -25], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-36, 0, -25], "max": [-36, 4, -25], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-42, 4, -28], "max": [-36, 4, -28], "mat": "timber"}}
+{"cmd": "slot.add", "args": {"name": "meal_chest", "kind": "container", "pos": [-39, 0, -25], "yaw": 0, "props": {"box": {"min": [-42, 0, -28], "max": [-36, 4, -25]}, "title": "Meal chest", "items": [{"item": "pouch", "count": 2}, {"item": "flask", "count": 1}]}}}
+{"cmd": "vox.box_fill", "args": {"min": [-43, 12, -28], "max": [-33, 12, -27], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [-43, 11, -28], "max": [-43, 11, -28], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-33, 11, -28], "max": [-33, 11, -28], "mat": "timber"}}
+# the herbal: the only book in Harrowby, bound in leather, a glass bottle by it
+{"cmd": "vox.box_fill", "args": {"min": [-41, 13, -28], "max": [-39, 16, -27], "mat": "leather"}}
+{"cmd": "vox.box_fill", "args": {"min": [-41, 13, -27], "max": [-39, 16, -27], "mat": "linen"}}
+{"cmd": "vox.box_fill", "args": {"min": [-41, 13, -28], "max": [-41, 16, -27], "mat": "leather"}}
+{"cmd": "vox.box_fill", "args": {"min": [-36, 13, -28], "max": [-36, 14, -28], "mat": "glass"}}
+
+# ---- the loft stair and the loft's edge ---------------------------------------
+# Timber strings either side of the generator's plank treads, and a rail along
+# the loft's open edge: without it, a villager turning for his bed at the top
+# of the stair walked off the loft into the hall and spent the night under it.
+{"cmd": "vox.line", "args": {"from": [-16, 0, -28], "to": [10, 26, -28], "mat": "timber"}}
+{"cmd": "vox.line", "args": {"from": [-16, 0, -21], "to": [10, 26, -21], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 30, -19], "max": [14, 30, 27], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 27, -19], "max": [14, 29, -19], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 27, -8], "max": [14, 29, -8], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 27, 4], "max": [14, 29, 4], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 27, 16], "max": [14, 29, 16], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [14, 27, 27], "max": [14, 29, 27], "mat": "timber"}}
+
+# ---- the inner room: grain sacks and a barrel under the loft ---------------
+{"cmd": "vox.box_fill", "args": {"min": [34, 0, -28], "max": [38, 5, -24], "mat": "linen"}}
+{"cmd": "vox.box_fill", "args": {"min": [40, 0, -28], "max": [44, 4, -25], "mat": "linen"}}
+{"cmd": "vox.box_fill", "args": {"min": [35, 6, -27], "max": [37, 6, -25], "mat": "linen"}}
+{"cmd": "vox.box_fill", "args": {"min": [60, 0, -28], "max": [66, 9, -22], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [60, 2, -28], "max": [66, 2, -22], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [60, 7, -28], "max": [66, 7, -22], "mat": "timber"}}
+{"cmd": "vox.clear", "args": {"min": [60, 0, -28], "max": [60, 9, -28]}}
+{"cmd": "vox.clear", "args": {"min": [66, 0, -28], "max": [66, 9, -28]}}
+{"cmd": "vox.clear", "args": {"min": [60, 0, -22], "max": [60, 9, -22]}}
+{"cmd": "vox.clear", "args": {"min": [66, 0, -22], "max": [66, 9, -22]}}
+
+# ---- the walking graph: the generator put the hall's node IN the hearth ----
+# Move it off the fire to the back of the hall, and route the byre door
+# round the hearth through a new node rather than across the ashes.
+{"cmd": "slot.move", "args": {"name": "waynode_room_0", "pos": [-8, 0, -14]}}
+{"cmd": "slot.add", "args": {"name": "waynode_hall_w", "kind": "waynode", "pos": [-36, 0, -8], "yaw": 0, "props": {"links": ["waynode_room_0", "waynode_left_0_in"]}}}
+{"cmd": "slot.set_prop", "args": {"name": "waynode_left_0_in", "key": "links", "value": ["waynode_left_0_out", "waynode_hall_w"]}}
+{"cmd": "slot.set_prop", "args": {"name": "waynode_room_0", "key": "links", "value": ["waynode_back_0_in", "waynode_front_0_in", "waynode_partition_0", "waynode_stair_bottom"]}}
+# Up in the loft the clothes chest stands between the loft's node and Edric's
+# bed: a second loft node on the stair side of the chest reaches it.
+{"cmd": "slot.add", "args": {"name": "waynode_loft_w", "kind": "waynode", "pos": [22, 27, -10], "yaw": 0, "props": {"links": ["waynode_stair_top", "waynode_loft"]}}}
+# ...and one beside Maud's bed, so she climbs in over the side rail and not
+# over the bed's end board (the loft's own node is off the end of it).
+{"cmd": "slot.add", "args": {"name": "waynode_loft_e", "kind": "waynode", "pos": [55, 27, -10], "yaw": 0, "props": {"links": ["waynode_loft"]}}}
+# The `hearth` (Maud's work, where the Cotters eat) stood south of the fire,
+# so every walk from it to the back of the hall cut across the kerb and the
+# pot. Stand it on the EAST side instead, facing the fire, clear of the board.
+{"cmd": "slot.move", "args": {"name": "hearth", "pos": [-12, 0, 0], "yaw": 270}}
+
+# ---- slots: Edric's clothes chest in the loft; the generator's spare work spot goes
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "title", "value": "Clothes chest"}}
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "items", "value": [{"item": "hood", "count": 1}, {"item": "footwraps", "count": 1}]}}
+{"cmd": "slot.remove", "args": {"name": "work_1"}}
+
+{"cmd": "struct.save", "args": {}}

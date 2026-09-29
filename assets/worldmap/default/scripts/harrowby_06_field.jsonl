@@ -1,0 +1,72 @@
+# HARROWBY 06 -- Edric's barley, behind the longhouse, with the treeline beyond.
+#
+# Another structure from nothing. 16 x 7 m of ripe barley (dry_tussock is the
+# golden late-summer grass) in rows on dirt furrows, a rail fence with a gate
+# gap south (toward the longhouse's back door) and north (where Edric stands
+# and looks at the trees), and a scarecrow that also faces the trees.
+# House frame: y = 0 the ground, +z = south (the longhouse side).
+{"cmd": "struct.new", "args": {"asset": "harrowby_field"}}
+
+# the furrows: dirt in place of the grass
+{"cmd": "vox.box_fill", "args": {"min": [-80, -1, -35], "max": [79, -1, 34], "mat": "dirt"}}
+# one row of barley and one bare furrow, then double it until the field is full
+{"cmd": "vox.box_fill", "args": {"min": [-78, 0, -34], "max": [77, 0, -34], "mat": "dry_tussock"}}
+{"cmd": "vox.copy", "args": {"min": [-78, 0, -34], "max": [77, 0, -33]}}
+{"cmd": "vox.paste", "args": {"pos": [-78, 0, -32]}}
+{"cmd": "vox.copy", "args": {"min": [-78, 0, -34], "max": [77, 0, -31]}}
+{"cmd": "vox.paste", "args": {"pos": [-78, 0, -30]}}
+{"cmd": "vox.copy", "args": {"min": [-78, 0, -34], "max": [77, 0, -27]}}
+{"cmd": "vox.paste", "args": {"pos": [-78, 0, -26]}}
+{"cmd": "vox.copy", "args": {"min": [-78, 0, -34], "max": [77, 0, -19]}}
+{"cmd": "vox.paste", "args": {"pos": [-78, 0, -18]}}
+{"cmd": "vox.copy", "args": {"min": [-78, 0, -34], "max": [77, 0, -3]}}
+{"cmd": "vox.paste", "args": {"pos": [-78, 0, -2]}}
+{"cmd": "vox.copy", "args": {"min": [-78, 0, -34], "max": [77, 0, 1]}}
+{"cmd": "vox.paste", "args": {"pos": [-78, 0, -2]}}
+# a headland path up the middle, gate to gate
+{"cmd": "vox.clear", "args": {"min": [-3, 0, -35], "max": [3, 0, 34]}}
+
+# the fence: two rails round the field, posts every 4 m, gaps at both gates
+{"cmd": "vox.box_fill", "args": {"min": [-82, 3, -37], "max": [81, 3, -37], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-82, 6, -37], "max": [81, 6, -37], "mat": "timber"}}
+{"cmd": "vox.copy", "args": {"min": [-82, 3, -37], "max": [81, 6, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [-82, 3, 36]}}
+{"cmd": "vox.box_fill", "args": {"min": [-82, 3, -36], "max": [-82, 3, 35], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-82, 6, -36], "max": [-82, 6, 35], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [81, 3, -36], "max": [81, 3, 35], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [81, 6, -36], "max": [81, 6, 35], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-82, 0, -37], "max": [-82, 8, -37], "mat": "timber"}}
+{"cmd": "vox.copy", "args": {"min": [-82, 0, -37], "max": [-82, 8, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [-42, 0, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [-6, 0, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [6, 0, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [42, 0, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [81, 0, -37]}}
+{"cmd": "vox.paste", "args": {"pos": [-82, 0, 36]}}
+{"cmd": "vox.paste", "args": {"pos": [-42, 0, 36]}}
+{"cmd": "vox.paste", "args": {"pos": [-6, 0, 36]}}
+{"cmd": "vox.paste", "args": {"pos": [6, 0, 36]}}
+{"cmd": "vox.paste", "args": {"pos": [42, 0, 36]}}
+{"cmd": "vox.paste", "args": {"pos": [81, 0, 36]}}
+{"cmd": "vox.paste", "args": {"pos": [-82, 0, 0]}}
+{"cmd": "vox.paste", "args": {"pos": [81, 0, 0]}}
+{"cmd": "vox.clear", "args": {"min": [-5, 0, -37], "max": [5, 8, -37]}}
+{"cmd": "vox.clear", "args": {"min": [-5, 0, 36], "max": [5, 8, 36]}}
+
+# the scarecrow: a timber cross in a linen shirt with a straw head, looking north
+{"cmd": "vox.box_fill", "args": {"min": [36, 0, -2], "max": [36, 17, -2], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [31, 13, -2], "max": [41, 13, -2], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [34, 8, -3], "max": [38, 13, -1], "mat": "linen"}}
+{"cmd": "vox.box_fill", "args": {"min": [35, 16, -3], "max": [37, 19, -1], "mat": "straw_bed"}}
+{"cmd": "vox.box_fill", "args": {"min": [34, 19, -4], "max": [38, 19, 0], "mat": "leather"}}
+
+# where Edric stands to work: the north gate, looking out at the trees
+{"cmd": "slot.add", "args": {"name": "field_edge", "kind": "marker", "pos": [0, 0, -37], "yaw": 180, "props": {"tags": ["field_edge"]}}}
+# a walking node at each gate and one in the middle, joined up the headland
+{"cmd": "slot.add", "args": {"name": "waynode_gate_s", "kind": "waynode", "pos": [0, 0, 40], "yaw": 0, "props": {"links": ["waynode_middle"]}}}
+{"cmd": "slot.add", "args": {"name": "waynode_middle", "kind": "waynode", "pos": [0, 0, 0], "yaw": 0, "props": {"links": ["waynode_gate_n"]}}}
+{"cmd": "slot.add", "args": {"name": "waynode_gate_n", "kind": "waynode", "pos": [0, 0, -33], "yaw": 0, "props": {}}}
+
+{"cmd": "struct.save", "args": {}}
+
+{"cmd": "ref.place", "args": {"id": "harrowby/field", "kind": "structure", "base": "harrowby_field", "pos": [560, 201, 3170], "yaw": 0, "props": {"padMargin": 4}}}

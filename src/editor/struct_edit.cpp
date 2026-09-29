@@ -323,6 +323,31 @@ bool StructEdit::Load(const std::string& assetDir, const std::string& nm, std::s
   return true;
 }
 
+void StructEdit::InitNew(const std::string& nm, int voxelsPerMetre) {
+  name = nm;
+  // The P2 key order, so a new file diffs like a generated one.
+  json_ = Json::object();
+  json_["name"] = nm;
+  json_["origin"] = Json::array({0, 0, 0});
+  json_["size"] = Json::array({1, 1, 1});
+  json_["voxelsPerMetre"] = voxelsPerMetre;
+  json_["materials"] = Json::object();
+  json_["slots"] = Json::array();
+  json_["generator"] = nullptr;
+  json_["handEdited"] = true;
+  rgba_.clear();
+  origin_ = {0, 0, 0};
+  size_ = {0, 0, 0};
+  cells_.clear();
+  changed_.clear();
+  cellHash_ = 0;
+  slots_.clear();
+  RehashSlots();
+  changed_.clear();
+  savedHash_ = hash_;
+  rev_++;
+}
+
 // ---- save -------------------------------------------------------------------------
 
 structures::Asset StructEdit::AsAsset() const {

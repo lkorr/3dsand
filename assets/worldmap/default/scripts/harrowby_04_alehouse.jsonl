@@ -1,0 +1,114 @@
+# HARROWBY 04 -- Agnes's cottage, which is the alehouse in all but name.
+#
+# House frame: y = 0 floor, +z the FRONT (door x 0..8, z 29; it swings in
+# over x 0..9, z 20..29, so nothing stands there). The plank partition at
+# x -16 closes off the back room with the two beds (Agnes, Wat); the front
+# room x -14..44 runs to the chimney gable (the fire at x 46, right).
+# In the world it is turned 90: the front faces EAST onto the green.
+{"cmd": "struct.open", "args": {"ref": "harrowby/alehouse"}}
+
+# ---- the trestle board and its two benches, mid-room, 1.7 m long; a 1.4 m
+# gangway past its west end leads to the back-room door ------------------------
+{"cmd": "vox.box_fill", "args": {"min": [-2, 7, -8], "max": [14, 7, -2], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 0, -7], "max": [0, 6, -7], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 0, -3], "max": [0, 6, -3], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 3, -6], "max": [0, 3, -4], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 0, -7], "max": [12, 6, -7], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 0, -3], "max": [12, 6, -3], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 3, -6], "max": [12, 3, -4], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 3, -5], "max": [12, 3, -5], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-2, 4, -11], "max": [14, 4, -10], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 0, -11], "max": [0, 3, -11], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 0, -11], "max": [12, 3, -11], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-2, 4, 1], "max": [14, 4, 2], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 0, 2], "max": [0, 3, 2], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 0, 2], "max": [12, 3, 2], "mat": "timber"}}
+# tankards and a jug on the board
+{"cmd": "vox.box_fill", "args": {"min": [0, 8, -6], "max": [0, 9, -6], "mat": "wood"}}
+{"cmd": "vox.box_fill", "args": {"min": [4, 8, -4], "max": [4, 9, -4], "mat": "wood"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 8, -7], "max": [10, 9, -7], "mat": "wood"}}
+{"cmd": "vox.box_fill", "args": {"min": [6, 8, -6], "max": [7, 10, -5], "mat": "roof_tile"}}
+
+# ---- two standing barrels against the back wall (under the window) ---------
+{"cmd": "vox.box_fill", "args": {"min": [-4, 0, -28], "max": [2, 8, -22], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [-4, 2, -28], "max": [2, 2, -22], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-4, 6, -28], "max": [2, 6, -22], "mat": "timber"}}
+{"cmd": "vox.clear", "args": {"min": [-4, 0, -28], "max": [-4, 8, -28]}}
+{"cmd": "vox.clear", "args": {"min": [2, 0, -28], "max": [2, 8, -28]}}
+{"cmd": "vox.clear", "args": {"min": [-4, 0, -22], "max": [-4, 8, -22]}}
+{"cmd": "vox.clear", "args": {"min": [2, 0, -22], "max": [2, 8, -22]}}
+{"cmd": "vox.copy", "args": {"min": [-4, 0, -28], "max": [2, 8, -22]}}
+{"cmd": "vox.paste", "args": {"pos": [3, 0, -28], "air": "skip"}}
+
+# ---- the cask rack: a timber frame with three casks lying on their sides ----
+{"cmd": "vox.box_fill", "args": {"min": [10, 0, -28], "max": [10, 15, -28], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 0, -22], "max": [10, 15, -22], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [30, 0, -28], "max": [30, 15, -28], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [30, 0, -22], "max": [30, 15, -22], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 2, -28], "max": [30, 2, -28], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 2, -22], "max": [30, 2, -22], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 9, -28], "max": [30, 9, -28], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 9, -22], "max": [30, 9, -22], "mat": "timber"}}
+# one cask, built once: staves along z, two hoops, the ends facing the room
+{"cmd": "vox.box_fill", "args": {"min": [12, 3, -28], "max": [18, 8, -23], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 3, -26], "max": [18, 8, -26], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [12, 3, -24], "max": [18, 8, -24], "mat": "timber"}}
+{"cmd": "vox.clear", "args": {"min": [12, 3, -28], "max": [12, 3, -23]}}
+{"cmd": "vox.clear", "args": {"min": [18, 3, -28], "max": [18, 3, -23]}}
+{"cmd": "vox.clear", "args": {"min": [12, 8, -28], "max": [12, 8, -23]}}
+{"cmd": "vox.clear", "args": {"min": [18, 8, -28], "max": [18, 8, -23]}}
+{"cmd": "vox.box_fill", "args": {"min": [15, 5, -22], "max": [15, 5, -21], "mat": "timber"}}
+# ...and copied twice: beside it, and on the upper rails
+{"cmd": "vox.copy", "args": {"min": [12, 3, -28], "max": [18, 8, -21]}}
+{"cmd": "vox.paste", "args": {"pos": [21, 3, -28], "air": "skip"}}
+{"cmd": "vox.paste", "args": {"pos": [16, 10, -28], "air": "skip"}}
+
+# ---- by the fire: a settle for the old folk --------------------------------
+{"cmd": "vox.box_fill", "args": {"min": [30, 4, 10], "max": [40, 4, 13], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [30, 5, 13], "max": [40, 11, 13], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [30, 0, 10], "max": [30, 3, 13], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [40, 0, 10], "max": [40, 3, 13], "mat": "timber"}}
+
+# ---- the cellar chest in the corner by the chimney: Agnes's good flasks -----
+{"cmd": "vox.box_fill", "args": {"min": [34, 0, -28], "max": [41, 4, -24], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [34, 0, -24], "max": [34, 4, -24], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [41, 0, -24], "max": [41, 4, -24], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [34, 4, -28], "max": [41, 4, -28], "mat": "timber"}}
+{"cmd": "slot.add", "args": {"name": "cellar_chest", "kind": "container", "pos": [37, 0, -24], "yaw": 0, "props": {"box": {"min": [34, 0, -28], "max": [41, 4, -24]}, "title": "Cellar chest", "items": [{"item": "flask", "count": 4}]}}}
+
+# ---- the places people stand ------------------------------------------------
+# Agnes's work spot: at the cask rack, facing the room, the board before her.
+{"cmd": "slot.add", "args": {"name": "trestle", "kind": "marker", "pos": [20, 0, -18], "yaw": 0, "props": {"tags": ["trestle"]}}}
+# The evening gathering (schedules say `at: alehouse`): the open floor between
+# the board and the fire. Anyone without a place of their own stands here.
+{"cmd": "slot.add", "args": {"name": "gathering", "kind": "marker", "pos": [22, 0, 4], "yaw": 270, "props": {"tags": ["alehouse"]}}}
+# Three regulars, three places at the board, each named on the villager's own
+# ref (props.alehouse): five people sent to ONE marker shoulder each other off
+# it all night. Osric and Edric at the front bench, Wat on the back bench.
+{"cmd": "slot.add", "args": {"name": "seat_osric", "kind": "marker", "pos": [2, 0, 5], "yaw": 180, "props": {"tags": ["alehouse_seat"]}}}
+{"cmd": "slot.add", "args": {"name": "seat_edric", "kind": "marker", "pos": [10, 0, 5], "yaw": 180, "props": {"tags": ["alehouse_seat"]}}}
+{"cmd": "slot.add", "args": {"name": "seat_wat", "kind": "marker", "pos": [6, 0, -15], "yaw": 0, "props": {"tags": ["alehouse_seat"]}}}
+
+# ---- the walking graph, redrawn round the board ----------------------------
+# NPCs walk STRAIGHT between nodes (the local pathfinder only sees the ground
+# near the player), so every leg must be clear. The generator's front-room
+# node stood where the board now is, and its link to the back room's doorway
+# ran diagonally through the board. Now:
+#   front door -- room_1 (the open floor by the fire) -- bar (the cask rack)
+#   front door -- hall_w -- hall_nw (down the gangway past the board's west
+#   end) -- the partition doorway -- the back room
+{"cmd": "slot.move", "args": {"name": "waynode_room_1", "pos": [24, 0, 8]}}
+{"cmd": "slot.add", "args": {"name": "waynode_bar", "kind": "waynode", "pos": [18, 0, -15], "yaw": 0, "props": {"links": ["waynode_room_1"]}}}
+{"cmd": "slot.add", "args": {"name": "waynode_hall_nw", "kind": "waynode", "pos": [-9, 0, -19], "yaw": 0, "props": {"links": ["waynode_partition_0"]}}}
+{"cmd": "slot.add", "args": {"name": "waynode_hall_w", "kind": "waynode", "pos": [-9, 0, 10], "yaw": 0, "props": {"links": ["waynode_front_0_in", "waynode_hall_nw"]}}}
+# the partition's node stood a pace east of the doorway: put it IN the doorway
+{"cmd": "slot.move", "args": {"name": "waynode_partition_0", "pos": [-16, 0, -22]}}
+{"cmd": "slot.set_prop", "args": {"name": "waynode_partition_0", "key": "links", "value": ["waynode_room_0"]}}
+{"cmd": "slot.set_prop", "args": {"name": "waynode_room_1", "key": "links", "value": ["waynode_front_0_in"]}}
+
+# ---- slots from the scaffold ------------------------------------------------
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "title", "value": "Wat's box"}}
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "items", "value": [{"item": "hood", "count": 1}]}}
+{"cmd": "slot.remove", "args": {"name": "work_0"}}
+
+{"cmd": "struct.save", "args": {}}

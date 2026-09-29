@@ -704,7 +704,9 @@ can't be dragged with hold-G.
    set counts with the number fields; **x** removes a row. That writes
    `props.items`, e.g. `[{"item": "bread", "count": 3}]`. A red name is an
    item the game doesn't have (it's skipped). Optional `props.title`
-   (`"Strongbox"`) changes what the prompt and the panel call it.
+   (`"Strongbox"`) changes what the prompt and the panel call it, and
+   `props.locked: true` makes it say "Locked strongbox" and stay shut (no keys
+   yet — the same rule as a locked door).
 4. In game, **G** on it says "Search chest" and opens the loot panel beside
    your pack: right-click a slot or **take all** to take; drag from your bag or
    hotbar onto the panel to put something in.
@@ -1232,6 +1234,7 @@ numbers whichever way a copy is turned), or in world voxels with
 | `ref.duplicate` | `{id, as, by?}` | copy to a new id |
 | `ref.link` / `ref.unlink` | `{a, b}` | join / part two waynodes |
 | `struct.open` | `{ref}` or `{asset}` | open a house for editing |
+| `struct.new` | `{asset}` | start a NEW, empty structure (a well, a fence, a field): build it with `vox.*` / `slot.*` in its own frame (y = 0 the ground, x/z centred), then `struct.save` writes both files and `ref.place` puts it down |
 | `struct.save` | `{struct?}` | write it and re-stamp every copy |
 | `struct.close` | `{discard?}` | stop editing (refuses unsaved edits unless `discard`) |
 | `struct.revert` | `{struct?}` | throw away unsaved edits |
@@ -1276,3 +1279,182 @@ name (`"cobble"`) or id.
   nothing) and `--gate editor-struct-edit` (a turned house edited in the
   world, saved, re-stamped, equal to a fresh world). `--shot-editor` writes
   three pictures of the editor.
+
+---
+
+## 14. Building a village: Harrowby, step by step
+
+Harrowby is the hamlet just north of where a new game starts: three houses
+round a green, a well, a barley field against the treeline, and five people
+with homes and days. Everything in it was made with the tools in §9–§13, and
+every step is a file you can read in `assets/worldmap/default/scripts/`, in
+number order:
+
+| File | What it did |
+|---|---|
+| `harrowby_00_ground.sh` | levelled the clearing (the map's sculpt layer) |
+| `harrowby_*.params.json` | the house generator's settings for the three houses |
+| `harrowby_01_place.jsonl` | put the three houses on the ground |
+| `harrowby_02_smithy.jsonl` | Osric's forge bay, anvil, trough, tool rack, strongbox |
+| `harrowby_03_longhouse.jsonl` | the byre, the open hearth, the board, the loft stair and rail |
+| `harrowby_04_alehouse.jsonl` | Agnes's trestle, barrels, cask rack, cellar chest, the regulars' places |
+| `harrowby_05_green.jsonl` | the green and its well, built from nothing |
+| `harrowby_06_field.jsonl` | Edric's barley field, fence and scarecrow |
+| `harrowby_07_people.jsonl` | the paths between the doors (waynodes), the yard marker, the five villagers |
+| `harrowby_08_paths.sh` | the gravel and dirt paths painted on the ground |
+
+The `.jsonl` files are edit scripts (§13): `#` lines are comments, one command
+per line. You never need to run them again — the result is already in the
+files below — but they are the exact record of what was done, and you can
+copy any line into your own script.
+
+**Where it is** (world voxels, 10 to the metre; north is -z):
+
+```
+         z 3080  . . . . . . . treeline . . . . . . .
+         z 3133        Edric's spot, the field's north gate
+         z 3170  [ field: harrowby/field, barley + scarecrow ]
+         z 3212           south gate  |  lane (dirt)
+         z 3340  [ longhouse: harrowby/longhouse, door faces south ]
+                    byre door (west)          back door (north) -> field
+         z 3378                    | gravel
+  alehouse ------- gravel ------ [ well ] ------- gravel ------- smithy
+  harrowby/alehouse           harrowby/green              harrowby/smithy
+  x 415, door faces east      (555, 3467)                 x 700, forge bay faces west
+                                    |
+         z 3515                   spawn (580, 3515)
+```
+
+The files that make it up:
+
+- `assets/worldmap/default/refs/harrowby.json` — the placed things: five
+  structures, five villagers, the outdoor waynodes, the smithy-yard marker.
+- `assets/structures/harrowby_{longhouse,smithy,alehouse,green,field}.vox` +
+  `.struct.json` — the buildings; their doors, beds, chests, hearths and the
+  places people stand are SLOTS in these files (`harrowby/smithy/anvil`, ...).
+- `assets/worldmap/default/map.json` — the site `harrowby_clearing` (no trees
+  or bushes in that box) and `editLayer: "default_ground"`.
+- `assets/worldmap/default/sculpt.svsculpt` — the levelled ground.
+- `assets/worldedits/default_ground.svedit` — the painted paths.
+- `assets/schedules/{edric,maud,osric,agnes,wat}.json`,
+  `assets/dialogue/{edric,maud,osric,agnes,wat}.json` — their days and their
+  talk.
+
+### Adding a fourth house, the way the first three were made
+
+Say a cottage for a woodcutter, **Hob**, west of the field.
+
+**1. Make the house** (§11). Environment → Structures → **new from…**
+`cottage`, move the sliders (a woodcutter: plank walls, a chimney, one bed,
+one chest), **Save as…** `harrowby_cottage`. Or from a terminal, with a params
+file like `harrowby_smithy.params.json`:
+
+```bash
+node scripts/bake_structure.mjs harrowby_cottage my_cottage.params.json
+```
+
+**2. Find it room.** A house levels a SQUARE of ground as wide as its longest
+side plus its `padMargin` (4 voxels in Harrowby), and two squares that touch
+are a warning (the References page's warnings list names both). The stats line
+on the Structures page gives the house's size; a 7 m cottage needs a clear
+square about 7.5 m across. Keep it off the spawn column (580, 3515) too. The
+clearing is level at ground 200, so its floor is **201**.
+
+**3. Place it** (§12). In game: F1 → World → References → **place a
+structure**, pick `harrowby_cottage`, id `harrowby/cottage`, turn it with
+**-90 / +90** until the red box (the door side) faces where people will come
+from, **confirm**. Or in F8 with the **Place** tool, or one script line:
+
+```
+{"cmd": "ref.place", "args": {"id": "harrowby/cottage", "kind": "structure", "base": "harrowby_cottage", "pos": [420, 201, 3230], "yaw": 90, "props": {"padMargin": 4}}}
+```
+
+**4. Make it his** (§13, F8). Double-click the house to open it. Use Box to
+fill a chopping block, Line for a saw-horse, Pencil for the axe on the wall.
+Look at its slots while it is open (they are drawn): **the generator's walking
+nodes do not know about your furniture** — if a `waynode_*` now sits in the
+table or behind it, select it and drag it clear (or `slot.move`). Villagers
+walk STRAIGHT from node to node (they only find their own way round things
+near the player), so every drawn line between two nodes must be clear of
+furniture, and a door's inside node must be out of the leaf's swing. Give the
+chest its contents in the inspector (`items`, `title`, `locked`). **Ctrl+S**.
+
+**5. Join it to the village.** Its door has an outside node,
+`harrowby/cottage/waynode_front_0_out`. With the **Link** tool click that, then
+the nearest village node (`harrowby/lane_back` for this spot); a link works
+both ways and is written in the village file, so the house file never changes.
+Check the drawn line does not cross a wall or a fence.
+
+**6. The villager** (§10.2). Place a ref of kind **npc**, id `harrowby/hob`,
+base `human` or one of the characters (`brug`, `sherp`, …), and set its props:
+`name` "Hob", `home` `harrowby/cottage`, `bed` `harrowby/cottage/bed_0`,
+`work` (a marker you place where he chops, facing the woodpile), `schedule`
+`hob`, `dialogue` `hob`, `outfit` e.g. `["smock#6B5A3E", "breeches", "clogs"]`.
+If he should drink at Agnes's of an evening, give him his own place there: open
+the alehouse, add a marker slot (`seat_hob`), and set Hob's prop `alehouse` to
+`harrowby/alehouse/seat_hob` — two people sent to one marker shoulder each
+other off it all evening.
+
+**7. His day** (§10.2): the schedule table under the villager, **save** as
+`hob` → `assets/schedules/hob.json`. Rows name `bed`, `home`, `work`, a tag
+(`well`, `green`, `alehouse`, `smithy_yard`) or a ref id.
+
+**8. His talk** (§9): the tuner's Dialogue tab → new file `hob`. Read what the
+others set (`edric_lights`, `wat_asked`, ...) so he can have an opinion about
+them.
+
+**9. A path to his door.** The ground between the houses is the map's, not a
+house's, so the F8 voxel tools do not reach it. Paint it:
+
+```bash
+node scripts/paint_ground.mjs default --mat dirt --width 12 --ragged 3 --path 470,3292 430,3250
+```
+
+Add the line to `harrowby_08_paths.sh` so the record stays complete. (The
+World map page's voxel view paints the same layer by hand.)
+
+**10. Try it.** In game, select Hob on the References page and press the
+**jump clock to** buttons: he should walk each row, open his door and shut it
+behind him. Then the gate:
+
+```bash
+bash scripts/run.sh ./build/Release/sandvox.exe --selftest --gate village-harrowby
+```
+
+It loads the game's map, checks every file loads with no warnings, every
+schedule row of every villager resolves and has a waynode route from home,
+spawns everyone, runs a fast day (the clock waits at each change of row until
+everyone has arrived), and checks every door ends the day shut and nobody got
+hurt. The day's trace is PINNED: after any change to the village it will say
+the trace differs from the pin — that is expected. If everything else passed,
+record the new day with
+
+```bash
+bash scripts/run.sh ./build/Release/sandvox.exe --selftest --gate village-harrowby --rebaseline
+```
+
+Pictures of the day: `SANDVOX_HARROWBY_SHOTS=build/hb` on the same command
+writes `build/hb_overview.bmp`, `_green`, `_osric_at_work`, `_smithy`,
+`_longhouse`, `_byre`, `_alehouse`, `_field`. A conversation, on the real
+map: `SANDVOX_SHOT_TALK=harrowby/wat bash scripts/run.sh ./build/Release/sandvox.exe --shot-dialogue`
+(`SANDVOX_SHOT_TALK_AT=1080` for 18:00).
+
+### When it goes wrong
+
+- **"… and site … overlap"** in the warnings — two squares touch (step 2):
+  move one house, or lower its `padMargin`.
+- **A villager "never reached its anchor"** in the gate — the line names where
+  it stood, which way it was going and its last notes ("no progress toward
+  harrowby/alehouse/waynode_bar"). Almost always a node line through
+  furniture, a node inside a door's swing, or two people sent to one spot.
+- **"lost blood over an ordinary day"** — something in the village hurts
+  people: a door that hit them was one (fixed in the engine), a stair they
+  fall off another (the longhouse loft has a rail for that reason).
+- **The ground round a house is a step or a ditch** — the house's floor is not
+  one above the ground there. On the levelled clearing use 201; elsewhere use
+  **move to crosshair** on the ground (§12), or level the ground first:
+  `node scripts/sculpt_flatten.mjs default --rect x0,z0,x1,z1 --y <ground> --feather 96`
+  (the World map page's sculpt brush edits the same layer).
+- **The village moved out of the gate's window** — the gate centres a 51 m
+  window on Harrowby's refs; a house much further out than the field needs its
+  own place, not this group.

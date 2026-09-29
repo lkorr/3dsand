@@ -1,0 +1,14 @@
+{
+  "name": "harrowby_green",
+  "origin": [42,1,42],
+  "size": [84,28,84],
+  "voxelsPerMetre": 10,
+  "materials": {"stone":1,"wood":2,"water":5,"linen":111,"iron":121,"plank":192,"timber":193,"flagstone":197,"roof_tile":198},
+  "slots": [
+    {"name":"well","kind":"marker","pos":[44,1,46],"yaw":180,"props":{"tags":["well","gather"]}},
+    {"name":"well_west","kind":"marker","pos":[29,1,36],"yaw":90,"props":{"tags":["gather"]}},
+    {"name":"middle","kind":"marker","pos":[47,1,67],"yaw":0,"props":{"tags":["green","gather"]}}
+  ],
+  "generator": null,
+  "handEdited": true
+}

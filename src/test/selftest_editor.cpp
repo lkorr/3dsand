@@ -123,7 +123,12 @@ Status GateEditorCommands(Ctx& c, std::string& detail) {
     g.refs.push_back(b);
     std::ofstream(root + "/worldmap/gate/refs/gate.json", std::ios::binary) << refs::WriteGroup(g);
   }
-  const std::vector<std::string> assetFiles{gateDir + "/edhouse.vox", gateDir + "/edhouse.struct.json"};
+  // ...and the asset struct.new makes (P8): absent at the start, so undo-all
+  // must DELETE it again and redo-all bring it back byte for byte.
+  fs::remove(gateDir + "/edthing.vox", ec);
+  fs::remove(gateDir + "/edthing.struct.json", ec);
+  const std::vector<std::string> assetFiles{gateDir + "/edhouse.vox", gateDir + "/edhouse.struct.json",
+                                            gateDir + "/edthing.vox", gateDir + "/edthing.struct.json"};
   const std::string refsDir = root + "/worldmap";
 
   // The script: every public command at least once.
@@ -168,6 +173,11 @@ Status GateEditorCommands(Ctx& c, std::string& detail) {
       R"({"cmd":"redo"})",
       R"({"cmd":"struct.save","args":{}})",
       R"({"cmd":"vox.set","args":{"pos":[0,1,0],"mat":"cobble"}})",
+      R"({"cmd":"struct.save","args":{}})",
+      R"({"cmd":"struct.close","args":{}})",
+      R"({"cmd":"struct.new","args":{"asset":"_gate/edthing"}})",
+      R"({"cmd":"vox.box_fill","args":{"min":[-2,-1,-2],"max":[2,3,2],"mat":"stone"}})",
+      R"({"cmd":"slot.add","args":{"name":"spot","kind":"marker","pos":[0,0,4],"yaw":180}})",
       R"({"cmd":"struct.save","args":{}})",
       R"({"cmd":"struct.close","args":{}})",
   };
@@ -274,6 +284,8 @@ Status GateEditorCommands(Ctx& c, std::string& detail) {
   fs::remove_all(root, ec);
   fs::remove(gateDir + "/edhouse.vox", ec);
   fs::remove(gateDir + "/edhouse.struct.json", ec);
+  fs::remove(gateDir + "/edthing.vox", ec);
+  fs::remove(gateDir + "/edthing.struct.json", ec);
   if (fs::is_empty(gateDir, ec)) fs::remove(gateDir, ec);
   structures::TakeReapply();
   detail = Format("%zu/%zu commands in the script, %d lines applied, %zu saved | undo %d steps -> start "

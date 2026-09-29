@@ -880,9 +880,26 @@ void RegisterDoorKinds() {
     }
     if (r.props.contains("title") && !r.props["title"].is_string())
       p.push_back("props.title: text");
+    if (r.props.contains("locked") && !r.props["locked"].is_boolean())
+      p.push_back("props.locked: true or false");
   };
-  box.usePrompt = [](RefCtx&, const Ref& r) { return "Search " + Lower(ContainerTitle(r)); };
-  box.onUse = [](RefCtx&, const Ref& r, RefUse& u) { u.openContainer = r.id; };
+  // props.locked: the door rule for a chest (P8, Osric's strongbox). A locked
+  // chest says so and does not open -- no keys yet, exactly like a door.
+  auto chestLocked = [](const Ref& r) {
+    return r.props.contains("locked") && r.props["locked"].is_boolean() &&
+           r.props["locked"].get<bool>();
+  };
+  box.usePrompt = [chestLocked](RefCtx&, const Ref& r) {
+    return chestLocked(r) ? "Locked " + Lower(ContainerTitle(r))
+                          : "Search " + Lower(ContainerTitle(r));
+  };
+  box.onUse = [chestLocked](RefCtx&, const Ref& r, RefUse& u) {
+    if (chestLocked(r)) {
+      u.message = "The " + Lower(ContainerTitle(r)) + " is locked.";
+      return;
+    }
+    u.openContainer = r.id;
+  };
   box.useRadius = 5.0f;
   Kinds().Register(std::move(box));
 

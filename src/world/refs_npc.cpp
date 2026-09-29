@@ -415,6 +415,8 @@ void Replan(RefCtx& c, Resident& R, const Vec3& foot, const std::string& why) {
   R.st.note = why;
   if (R.replansThisRow > kMaxReplans) {
     R.st.phase = ResidentPhase::NoRoute;
+    R.bestDist = 1e9f;   // the straight walk gets its own stuck clock
+    R.bestTick = c.tick;
     R.st.note = why + " -- gave up on this row's route after " +
                 std::to_string(kMaxReplans) + " tries; walking straight at the anchor";
     return;
@@ -647,11 +649,29 @@ void StepResident(RefCtx& c, const Ref& r) {
       rt.goal = A.foot;
       rt.final = true;
       rt.arriveRadius = radius;
-      if (Planar(foot, A.foot) <= radius) {
+      const float d = Planar(foot, A.foot);
+      if (d <= radius) {
         R.st.phase = ResidentPhase::AtAnchor;
         if (R.st.arrivedTick == 0) {
           R.st.arrivedTick = c.tick;
           R.st.arrivals++;
+        }
+      } else if (!busy) {
+        // GIVING UP IS NOT FOREVER (P8, Harrowby). Four failed legs in a row
+        // are usually ANOTHER VILLAGER in a doorway or on a stair -- two of
+        // the Cotters climbing to the loft at ten -- and walking straight at
+        // the anchor from the foot of the stair gets nowhere all night. When
+        // the straight walk stalls too, forget the bad legs and try the
+        // waynodes again from where it now stands.
+        if (d < R.bestDist - 1.0f) {
+          R.bestDist = d;
+          R.bestTick = c.tick;
+        } else if (c.tick - R.bestTick > kStuckTicks) {
+          R.bad.clear();
+          R.replansThisRow = 0;
+          Plan(c, R, foot);
+          R.st.note = "walking straight got nowhere either: trying the waynodes again";
+          return;
         }
       }
     } else {

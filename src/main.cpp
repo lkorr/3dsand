@@ -5409,6 +5409,13 @@ int main(int argc, char** argv) {
       biomes::BiomeSet set;
       worldmap::WorldMapData map;
       std::string blog;
+      // SANDVOX_HEIGHTMAP_BARE=1: the ground WITHOUT the map's structure refs'
+      // pads (scripts/sculpt_flatten.mjs): a sculpt pass that read the pads
+      // would leave the terrain under every house unsculpted, and the pads'
+      // ramps would then fall into a ditch round each one.
+      static const std::vector<worldmap::StructurePlacement> kNoStructures;
+      if (const char* bare = std::getenv("SANDVOX_HEIGHTMAP_BARE"); bare && *bare && *bare != '0')
+        worldmap::SetStructureOverride(&kNoStructures);
       if (!biomes::LoadBiomeSet(ad, m, set, blog) ||
           !worldmap::LoadWorldMap(ad, worldmap::ActiveMapName(CurrentTuning().world.mapLayer), set, m.size(), kDefaultSeed, map, blog)) {
         std::fprintf(stderr, "--heightmap: %s", blog.c_str());
@@ -9630,21 +9637,73 @@ int main(int argc, char** argv) {
     // --shot-dialogue's schedule (see g_shotDialogue).
     if (g_shotDialogue) {
       const uint64_t f = frameCounter;
+      // SANDVOX_SHOT_TALK=<npc ref id> (P8): talk to an AUTHORED villager of
+      // the game's map instead of a spawned dummy -- the player is stood in
+      // front of him and the conversation is his own ref's `dialogue`, begun
+      // with his ref id, so the panel shows the real speaker and his entry
+      // node. The villagers' clock is held at SANDVOX_SHOT_TALK_AT (minutes,
+      // default 600 = 10:00) so he is awake and about his day.
+      static const std::string talkRef = [] {
+        const char* e = std::getenv("SANDVOX_SHOT_TALK");
+        return std::string(e ? e : "");
+      }();
+      if (!talkRef.empty() && f == 1) {
+        const char* at = std::getenv("SANDVOX_SHOT_TALK_AT");
+        const int minute = at ? std::atoi(at) : 600;
+        schedule::SetMinuteOverride(minute);
+        // ...and the SKY at that hour too: the dev overlay's time slider
+        // engages the same celestial clock (a new game starts at midnight,
+        // and a conversation photographed in the dark shows nobody).
+        CelestialClock& cc = Celestial();
+        cc.engaged = true;
+        cc.scaleNum = cc.scaleDen = 1;
+        cc.ticks = (int64_t)((double)(minute % 1440) / 1440.0 * (double)TicksPerDay(CurrentTuning()));
+        cc.prevTicks = cc.ticks;
+        cc.rem = 0;
+      }
+      const Mob* talkMob = talkRef.empty() ? nullptr : mobs.FindMobByRef(talkRef);
+      if (talkMob != nullptr && talkMob->Def() != nullptr && f >= kShotDlgSpawn &&
+          f <= kShotDlgBegin) {
+        // 1.6 m in front of him, on his own floor, looking at his face.
+        const Vec3 o = talkMob->Origin(), s = talkMob->Def()->worldSize;
+        const Vec3 c{o.x + s.x * 0.5f, o.y, o.z + s.z * 0.5f};
+        const float h = talkMob->Heading();
+        const Vec3 at{c.x + std::sin(h) * 16.0f, c.y + 9.0f, c.z + std::cos(h) * 16.0f};
+        player.pos = at;
+        player.vel = Vec3{0, 0, 0};
+        player.SnapRender();
+        cam.yaw = std::atan2(c.z - at.z, c.x - at.x);
+        cam.pitch = -0.08f;
+      }
       // On foot, looking level: the listener spawns "a few metres ahead",
       // and a first-person camera pitched at the sky photographs stars.
       if (f == 1) {
         ui.fly = false;
         player.fly = false;
       }
-      if (f < kShotDlgBegin) cam.pitch = -0.12f;
+      if (f < kShotDlgBegin && talkRef.empty()) cam.pitch = -0.12f;
       if (f == kShotDlgSpawn) {
         ui.visible = false;       // the dev panel is not in the picture
-        ui.aiSpawnDummy = true;   // blind, never moves: stands and listens
+        ui.aiSpawnDummy = talkRef.empty();   // blind, never moves: stands and listens
+      }
+      if (f == kShotDlgBegin && !talkRef.empty()) {
+        dialogue::Speaker sp;
+        std::string dlg;
+        if (const refs::Ref* r = refStore.Find(talkRef)) {
+          sp.refId = r->id;
+          sp.name = r->props.value("name", r->id);
+          dlg = r->props.value("dialogue", "");
+        }
+        if (talkMob != nullptr) sp.mobId = talkMob->Id();
+        if (sp.mobId != 0 && !dlg.empty())
+          session.talkBegin = dialogue::BeginRequest{true, sp, dlg};
+        std::printf("--shot-dialogue: talking to %s (mob %llu, dialogue '%s')\n", talkRef.c_str(),
+                    (unsigned long long)sp.mobId, dlg.c_str());
       }
       // The listener is the creature the panel just spawned, by id: "nearest
       // within 12 m" depends on where the spawn landed, and a picture of no
       // conversation proves nothing. Same queue the dev hook uses.
-      if (f == kShotDlgBegin) {
+      if (f == kShotDlgBegin && talkRef.empty()) {
         dialogue::Speaker sp;
         if (!tickCtx.aiSpawnedMobs.empty()) {
           sp.mobId = tickCtx.aiSpawnedMobs.back();

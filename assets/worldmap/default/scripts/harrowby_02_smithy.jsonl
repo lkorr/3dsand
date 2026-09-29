@@ -1,0 +1,84 @@
+# HARROWBY 02 -- Osric's smithy, by hand, on top of the generated scaffold.
+#
+# House frame (the same numbers however the smithy is turned in the world):
+# y = 0 is the floor, +z is the FRONT wall (z 31..34), x -46..50 wall to wall.
+# The forge is the LEFT end (the chimney gable, x < 0); Osric's back room with
+# his bed is the RIGHT end behind the plank partition (x > 12).
+# In the world the smithy is turned 270, so its front faces WEST onto the
+# green and the forge end is the NORTH end.
+{"cmd": "struct.open", "args": {"ref": "harrowby/smithy"}}
+
+# ---- the open forge bay: take the front wall out of the forge end ----------
+# 2.8 m wide, 2 m high, a timber bressumer across the top carrying the
+# cobble above; a 0.5 m cobble pier is left between the bay and the door.
+{"cmd": "vox.clear", "args": {"min": [-39, 0, 31], "max": [-12, 19, 34]}}
+{"cmd": "vox.box_fill", "args": {"min": [-41, 20, 31], "max": [-10, 21, 34], "mat": "timber"}}
+
+# ---- the forge hearth: a waist-high cobble bed run into the old fireplace ----
+# The chimney recess (x -52..-43) becomes the back of the forge; the bed
+# comes 0.9 m into the room. Its top is a bed of charcoal inside a cobble rim.
+# A COLD forge: live ember would never sleep and would find the timber.
+{"cmd": "vox.box_fill", "args": {"min": [-52, 0, -5], "max": [-43, 6, 4], "mat": "cobble"}}
+{"cmd": "vox.box_fill", "args": {"min": [-42, 0, -7], "max": [-34, 7, 6], "mat": "cobble"}}
+{"cmd": "vox.box_fill", "args": {"min": [-50, 7, -4], "max": [-36, 7, 3], "mat": "charcoal"}}
+{"cmd": "vox.box_fill", "args": {"min": [-47, 8, -2], "max": [-40, 8, 1], "mat": "charcoal"}}
+
+# the bellows beside it: a leather bag between two boards, a timber handle
+{"cmd": "vox.box_fill", "args": {"min": [-41, 1, 8], "max": [-35, 1, 12], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [-40, 2, 8], "max": [-36, 5, 12], "mat": "leather"}}
+{"cmd": "vox.box_fill", "args": {"min": [-41, 6, 8], "max": [-35, 6, 12], "mat": "plank"}}
+{"cmd": "vox.line", "args": {"from": [-35, 6, 10], "to": [-30, 9, 10], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-38, 3, 7], "max": [-38, 3, 7], "mat": "iron"}}
+
+# ---- the anvil: iron on a timber stump, just inside the open bay -----------
+# Near the front so it is in no walk from the door to the back of the room,
+# and so the green sees the smith at it.
+{"cmd": "vox.box_fill", "args": {"min": [-24, 0, 21], "max": [-20, 4, 25], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-23, 5, 22], "max": [-21, 5, 24], "mat": "iron"}}
+{"cmd": "vox.box_fill", "args": {"min": [-27, 6, 22], "max": [-17, 7, 24], "mat": "iron"}}
+{"cmd": "vox.box_fill", "args": {"min": [-29, 7, 23], "max": [-28, 7, 23], "mat": "iron"}}
+# where Osric stands to work: behind the anvil, facing it and the bay (+z)
+{"cmd": "slot.add", "args": {"name": "anvil", "kind": "marker", "pos": [-22, 0, 15], "yaw": 0, "props": {"tags": ["anvil"]}}}
+
+# ---- the quench trough: a stone basin of water by the bay ------------------
+{"cmd": "vox.box_fill", "args": {"min": [-41, 0, 18], "max": [-32, 5, 27], "mat": "stone"}}
+{"cmd": "vox.clear", "args": {"min": [-40, 1, 19], "max": [-33, 5, 26]}}
+{"cmd": "vox.box_fill", "args": {"min": [-40, 1, 19], "max": [-33, 3, 26], "mat": "water"}}
+
+# ---- the tool rack on the back wall: tongs, two hammers, a punch, the mace --
+{"cmd": "vox.box_fill", "args": {"min": [-38, 15, -31], "max": [-14, 16, -31], "mat": "timber"}}
+{"cmd": "vox.line", "args": {"from": [-36, 14, -31], "to": [-36, 6, -31], "mat": "iron"}}
+{"cmd": "vox.line", "args": {"from": [-34, 14, -31], "to": [-34, 6, -31], "mat": "iron"}}
+{"cmd": "vox.line", "args": {"from": [-30, 14, -31], "to": [-30, 9, -31], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-32, 7, -31], "max": [-28, 8, -31], "mat": "iron"}}
+{"cmd": "vox.line", "args": {"from": [-25, 14, -31], "to": [-25, 10, -31], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-26, 8, -31], "max": [-24, 9, -31], "mat": "iron"}}
+{"cmd": "vox.line", "args": {"from": [-21, 14, -31], "to": [-21, 9, -31], "mat": "iron"}}
+{"cmd": "vox.line", "args": {"from": [-17, 14, -31], "to": [-17, 8, -31], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-18, 5, -31], "max": [-16, 7, -31], "mat": "iron"}}
+
+# ---- the workbench against the partition (x 7..8), a few shoes waiting on it --
+{"cmd": "vox.box_fill", "args": {"min": [0, 7, -18], "max": [6, 7, -2], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 0, -18], "max": [0, 6, -18], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 0, -2], "max": [0, 6, -2], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [6, 0, -18], "max": [6, 6, -18], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [6, 0, -2], "max": [6, 6, -2], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [2, 8, -15], "max": [3, 8, -14], "mat": "iron"}}
+{"cmd": "vox.box_fill", "args": {"min": [2, 8, -9], "max": [4, 8, -9], "mat": "iron"}}
+{"cmd": "vox.box_fill", "args": {"min": [1, 8, -5], "max": [1, 9, -5], "mat": "iron"}}
+
+# ---- fuel: a heap of charcoal in the back corner ----------------------------
+{"cmd": "vox.box_fill", "args": {"min": [-42, 0, -31], "max": [-37, 2, -26], "mat": "charcoal"}}
+{"cmd": "vox.box_fill", "args": {"min": [-41, 3, -30], "max": [-39, 4, -28], "mat": "charcoal"}}
+
+# ---- Osric's strongbox in the back room: locked, his old soldiering in it ----
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "title", "value": "Strongbox"}}
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "locked", "value": true}}
+{"cmd": "slot.set_prop", "args": {"name": "chest_0", "key": "items", "value": [{"item": "iron_helm", "count": 1}, {"item": "shortsword", "count": 1}]}}
+# the generator's spare work spot is not used: Osric works at the anvil
+{"cmd": "slot.remove", "args": {"name": "work_1"}}
+# the house's `hearth` (where Osric eats: his `home`) stood where the forge
+# bed now is; step it out in front of the forge, still facing the fire
+{"cmd": "slot.move", "args": {"name": "hearth", "pos": [-30, 0, 0]}}
+
+{"cmd": "struct.save", "args": {}}

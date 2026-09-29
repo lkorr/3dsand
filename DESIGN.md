@@ -20809,3 +20809,75 @@ undone SAVE re-stamps the old asset while the buffer keeps the newer voxels
 (the world and the buffer then differ until the next save or undo). Only the
 opened instance previews live; other copies change on save. A paste inside a
 `batch` does not record its clipboard. Arbitrary yaw stays out (P4).
+
+### 16.P8 Harrowby: the first hand-built place, and what building it changed (added 2026-09-29)
+
+`docs/PLAN_world_editor.md` P8 / §6. CONTENT, not a system: the default map's
+`refs/harrowby.json` (four structure refs, five villagers, the outdoor
+waynodes, a marker), five structure assets (`assets/structures/harrowby_*`:
+three generated houses hand-edited through the command layer, and the green
+and the field built from nothing), the map's pad box `harrowby_clearing`, its
+sculpt layer and its ground edit layer (`default_ground`). Every step is a
+readable file in `assets/worldmap/default/scripts/` (params, `.jsonl` edit
+scripts, two `.sh` ground scripts), run in number order. How-to (and how to
+add a fourth house): `docs/EDITOR_GUIDE.md` §14. Gate: `village-harrowby`.
+
+**The gate** switches to the GAME's map (the only gate that does), regenerates
+the window around the village, and asserts: zero map and refs warnings; the
+villagers' dialogue and schedule files load and validate; every schedule row
+of every villager resolves to an anchor reachable over the waynode graph; all
+five spawn; a FAST DAY -- the schedule clock held at each boundary until
+everyone whose row changed stands at the new anchor (`harrowby.arriveMaxTicks`)
+-- reaches every row; every door ends the day shut; nobody bleeds. Its
+determinism claim is the **pinned day trace** (`harrowby.dayTrace`: every
+villager's exact body position and heading and every door's phase and hinge
+angle, every tick), the determinismHash pattern: identical on every boot,
+moved by a content edit (`--rebaseline`). NOT npc-schedule's in-process second
+run: measured, a second day in one process matched the first bit for bit in
+every villager until the first door swung, whose hinge angle then differed in
+the fifth decimal (tick 470; with a fresh Jolt world per run, tick 474) --
+state that outlives the harness's resets, recorded here as an open finding.
+The same leak crosses gates (after npc-schedule, or after a --verify list's
+other gates, the day is a tick shorter with another trace -- each scope stable
+boot to boot), so the pin is compared, and recorded, only when the village is
+the FIRST gate to tick the world in its process (`World::TicksEncoded() == 0`
+at entry); elsewhere the trace is printed and not judged.
+`SANDVOX_HARROWBY_SHOTS=<prefix>` writes the village pictures from the day.
+
+**What building it changed in the tools** (each a gap a person would hit):
+- `struct.new {asset}` (editor): a structure from nothing -- a well, a field,
+  a green. The first save writes both files; undoing that save deletes them.
+- A container's `props.locked` (P6's door rule for chests: "Locked strongbox",
+  "The strongbox is locked."). Osric's strongbox.
+- **An open door leaf deals no contact damage** (`MobSystem::
+  ApplyContactDamage` skips `BodyRole::Door`): the hinge motor presses the leaf
+  on whoever stands in its arc and every step of that read as an approach --
+  on the first day every villager bled, 4 to 67 blood, in proportion to the
+  doors they had used.
+- **A villager that gave up on its route tries again** (`refs_npc.cpp`
+  NoRoute): after four failed legs it used to walk straight at the anchor for
+  the rest of the row; a second villager on the loft stair made that a night
+  spent under the loft. The straight walk now has its own stuck clock, and a
+  stall re-plans from where it stands with the bad legs forgotten.
+- `scripts/sculpt_flatten.mjs` (a headless flatten into the map's sculpt
+  layer, through `map.js`'s own reader/writer) and `--heightmap` under
+  `SANDVOX_HEIGHTMAP_BARE=1` (the ground without the map's houses: a pass that
+  read the pads left the ground under every house unsculpted and each pad's
+  ramp fell into a ditch).
+- `scripts/paint_ground.mjs`: paths painted into the map's ground-relative
+  edit layer along a polyline -- the F8 editor edits houses, and the ground
+  between them belongs to no house.
+- `--shot-dialogue` with `SANDVOX_SHOT_TALK=<npc ref>`: the conversation panel
+  with an authored villager of the game's map, at `SANDVOX_SHOT_TALK_AT`
+  (minutes, default 10:00; the sky follows through the celestial clock).
+
+**Authoring rules the village taught** (EDITOR_GUIDE §14 says them for a
+person): villagers walk STRAIGHT between waynodes (the local pathfinder only
+sees ground near the player), so every leg must be clear, and a generator's
+room node can sit where furniture goes (the longhouse's stood in the hearth,
+the alehouse's under the board); a placed structure levels a SQUARE as wide as
+its longest side plus `padMargin`, and two squares that touch are a warning --
+the green is a structure precisely so its square levels the ground the houses'
+squares do not reach, and the spawn column must stay outside every square; two
+villagers sent to one marker shoulder each other off it all evening, so each
+regular has his own place (a prop naming a ref beats the tag).

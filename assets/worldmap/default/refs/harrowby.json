@@ -1,0 +1,25 @@
+{
+  "group": "harrowby",
+  "about": "HARROWBY, the hamlet north of the spawn (docs/PLAN_world_editor.md P8; how it was built and how to add to it: docs/EDITOR_GUIDE.md section 14). Three houses round a green, a barley field, five villagers. Written by the edit scripts in ../scripts/ (harrowby_01..07) and by every edit since; the houses' own doors, beds, chests and places are slots in assets/structures/harrowby_*.struct.json. Gate: --selftest --gate village-harrowby.",
+  "refs": [
+    { "id": "harrowby/longhouse", "kind": "structure", "base": "harrowby_longhouse", "pos": [560, 201, 3340], "yaw": 0, "props": { "padMargin": 4 } },
+    { "id": "harrowby/smithy", "kind": "structure", "base": "harrowby_smithy", "pos": [700, 201, 3460], "yaw": 270, "props": { "padMargin": 4 } },
+    { "id": "harrowby/alehouse", "kind": "structure", "base": "harrowby_alehouse", "pos": [415, 201, 3460], "yaw": 90, "props": { "padMargin": 4 } },
+    { "id": "harrowby/green", "kind": "structure", "base": "harrowby_green", "pos": [555, 201, 3467], "yaw": 0, "props": { "padMargin": 3 } },
+    { "id": "harrowby/field", "kind": "structure", "base": "harrowby_field", "pos": [560, 201, 3170], "yaw": 0, "props": { "padMargin": 4 } },
+    { "id": "harrowby/smithy_yard", "kind": "marker", "pos": [654, 201, 3434], "yaw": 90, "props": { "tags": ["smithy_yard"] } },
+    { "id": "harrowby/path_north", "kind": "waynode", "pos": [555, 201, 3420], "yaw": 0, "props": { "links": ["harrowby/longhouse/waynode_front_0_out", "path_west", "path_east"] } },
+    { "id": "harrowby/path_west", "kind": "waynode", "pos": [515, 201, 3456], "yaw": 0, "props": { "links": ["harrowby/alehouse/waynode_front_0_out", "path_south"] } },
+    { "id": "harrowby/path_east", "kind": "waynode", "pos": [600, 201, 3456], "yaw": 0, "props": { "links": ["harrowby/smithy/waynode_front_0_out", "path_south", "path_yard"] } },
+    { "id": "harrowby/path_south", "kind": "waynode", "pos": [557, 201, 3490], "yaw": 0 },
+    { "id": "harrowby/path_yard", "kind": "waynode", "pos": [640, 201, 3432], "yaw": 0, "props": { "links": ["harrowby/smithy/waynode_front_0_out"] } },
+    { "id": "harrowby/lane_byre", "kind": "waynode", "pos": [470, 201, 3400], "yaw": 0, "props": { "links": ["path_west", "harrowby/longhouse/waynode_left_0_out"] } },
+    { "id": "harrowby/lane_back", "kind": "waynode", "pos": [470, 201, 3292], "yaw": 0, "props": { "links": ["lane_byre", "harrowby/longhouse/waynode_back_0_out", "lane_field"] } },
+    { "id": "harrowby/lane_field", "kind": "waynode", "pos": [545, 201, 3240], "yaw": 0, "props": { "links": ["harrowby/longhouse/waynode_back_0_out", "harrowby/field/waynode_gate_s"] } },
+    { "id": "harrowby/edric", "kind": "npc", "base": "sherp", "pos": [548, 201, 3398], "yaw": 180, "props": { "name": "Edric Cotter", "home": "harrowby/longhouse", "bed": "harrowby/longhouse/bed_0", "work": "harrowby/field/field_edge", "alehouse": "harrowby/alehouse/seat_edric", "schedule": "edric", "dialogue": "edric", "outfit": ["smock#8B7D5A", "breeches#5C4E3C", "footwraps"], "behavior": "villager" } },
+    { "id": "harrowby/maud", "kind": "npc", "base": "shana", "pos": [562, 201, 3398], "yaw": 180, "props": { "name": "Maud Cotter", "home": "harrowby/longhouse", "bed": "harrowby/longhouse/bed_1", "work": "harrowby/longhouse/hearth", "schedule": "maud", "dialogue": "maud", "outfit": ["smock#8E4B3A", "hood", "shoes#4A3A2A"], "behavior": "villager" } },
+    { "id": "harrowby/osric", "kind": "npc", "base": "zeus", "pos": [650, 201, 3470], "yaw": 270, "props": { "name": "Osric", "home": "harrowby/smithy", "bed": "harrowby/smithy/bed_0", "work": "harrowby/smithy/anvil", "alehouse": "harrowby/alehouse/seat_osric", "schedule": "osric", "dialogue": "osric", "outfit": ["jerkin#3E2C1E", "trousers#3F3A34", "boots"], "behavior": "villager" } },
+    { "id": "harrowby/agnes", "kind": "npc", "base": "ferdruk", "pos": [462, 201, 3470], "yaw": 90, "props": { "name": "Agnes", "home": "harrowby/alehouse", "bed": "harrowby/alehouse/bed_0", "work": "harrowby/alehouse/trestle", "well": "harrowby/green/well_west", "schedule": "agnes", "dialogue": "agnes", "outfit": ["smock#5B6178", "hood", "clogs"], "behavior": "villager" } },
+    { "id": "harrowby/wat", "kind": "npc", "base": "fleepo", "pos": [462, 201, 3446], "yaw": 90, "props": { "name": "Wat", "home": "harrowby/alehouse", "bed": "harrowby/alehouse/bed_1", "work": "harrowby/smithy_yard", "alehouse": "harrowby/alehouse/seat_wat", "schedule": "wat", "dialogue": "wat", "outfit": ["tunic#9C8A4E", "hose#6B5A3E", "footwraps"], "behavior": "villager" } }
+  ]
+}

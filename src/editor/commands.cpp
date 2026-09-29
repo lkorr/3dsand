@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 
+#include "sim/world.h"
 #include "world/refs_npc.h"
 #include "world/structures.h"
 
@@ -545,6 +546,41 @@ void RegisterBuiltins(Registry& R) {
                 return true;
               },
               false});
+  // A structure from nothing (P8: a well, a bench, a fence -- anything the
+  // house generator does not make). Opens an EMPTY buffer under a new asset
+  // name; the voxel and slot tools build it in the house frame (y = 0 is the
+  // floor, x/z centred by convention) and struct.save writes both files.
+  R.Register({"struct.new", "{asset}",
+              "start a new, empty structure asset (build it with vox.* / slot.*, then struct.save)",
+              [](Context& c, const Command& cmd, std::vector<Command>&, std::string& err) {
+                std::string asset;
+                if (!GetStr(cmd.args, "asset", asset, err)) return false;
+                bool okName = !asset.empty() && asset.front() != '/' && asset.back() != '/' &&
+                              std::count(asset.begin(), asset.end(), '/') <= 1;
+                for (char ch : asset)
+                  okName &= (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' ||
+                            ch == '/';
+                if (!okName) {
+                  err = "asset: \"" + asset + "\" -- lowercase letters, digits and _, optionally "
+                        "one folder (\"harrowby_well\", \"props/bench\")";
+                  return false;
+                }
+                const std::string base = c.assetDir + "/structures/" + asset;
+                if (c.structs.count(asset) != 0 || std::filesystem::exists(base + ".vox") ||
+                    std::filesystem::exists(base + ".struct.json")) {
+                  err = "asset: structures/" + asset + " already exists (struct.open it instead)";
+                  return false;
+                }
+                std::error_code ec;
+                std::filesystem::create_directories(std::filesystem::path(base).parent_path(), ec);
+                auto se = std::make_unique<StructEdit>();
+                se->InitNew(asset, ::kVoxelsPerMetre);
+                c.structs.emplace(asset, std::move(se));
+                c.active = asset;
+                c.instance.clear();
+                return true;
+              },
+              false});
   R.Register({"struct.close", "{discard?: bool}",
               "stop editing the open structure (refuses unsaved edits unless discard)",
               [](Context& c, const Command& cmd, std::vector<Command>&, std::string& err) {
@@ -597,6 +633,13 @@ void RegisterBuiltins(Registry& R) {
                   ss << in.rdbuf();
                   *keep = ss.str();
                   in.close();
+                  if (bytes->empty()) {
+                    // The undone save was the FIRST (struct.new): there was
+                    // no file before it, so there is none after.
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                    continue;
+                  }
                   std::ofstream f(path, std::ios::binary | std::ios::trunc);
                   if (!f) {
                     err = "could not write " + path;

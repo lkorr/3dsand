@@ -57,6 +57,11 @@ class StructEdit {
   // Read the asset. False + err (names the file). Non-fatal doubts -> warn.
   bool Load(const std::string& assetDir, const std::string& name, std::string& err,
             std::vector<std::string>& warn);
+  // A NEW, EMPTY structure (struct.new): no files yet, no voxels, no slots,
+  // "generator": null. The house frame's origin is wherever the author puts
+  // the ground: y = 0 is the floor row, (0, 0) the footprint centre by
+  // convention. The first save writes both files.
+  void InitNew(const std::string& name, int voxelsPerMetre);
 
   // ---- voxels (house frame; 0 = air) -----------------------------------------
   uint16_t Get(IVec3 h) const;

@@ -10986,6 +10986,13 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
       // Creature against creature (a ragdoll's own limbs, a held weapon, two
       // bodies in a scrum) is melee's and the ragdoll's, not a thrown thing.
       if (FindOwner(other) != nullptr) continue;
+      // AN OPEN DOOR LEAF IS NOT A MISSILE (world/refs_doors.h). Its hinge
+      // motor presses it on whoever stands in its arc and walks it back to the
+      // frame against them, and the listener reports each of those steps as an
+      // approach -- measured on Harrowby's first day: every villager bled,
+      // 4 to 67 blood, in proportion to the doors they had used. A door stops
+      // against a man; it does not wound him.
+      if (phys.BodyRoleOf(other) == Physics::BodyRole::Door) continue;
       // ...AND A PLAYER'S CAPSULE IS A CREATURE TOO. It is no limb, so
       // FindOwner misses it, and the proxy is a dynamic body carrying the
       // player's whole mass (Physics::CreatePlayerBody): read as a thrown

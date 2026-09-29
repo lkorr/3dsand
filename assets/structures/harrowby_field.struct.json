@@ -1,0 +1,15 @@
+{
+  "name": "harrowby_field",
+  "origin": [82,1,37],
+  "size": [164,21,74],
+  "voxelsPerMetre": 10,
+  "materials": {"dirt":16,"leather":53,"dry_tussock":74,"linen":111,"timber":193,"straw_bed":200},
+  "slots": [
+    {"name":"field_edge","kind":"marker","pos":[82,1,0],"yaw":180,"props":{"tags":["field_edge"]}},
+    {"name":"waynode_gate_s","kind":"waynode","pos":[82,1,77],"yaw":0,"props":{"links":["waynode_middle"]}},
+    {"name":"waynode_middle","kind":"waynode","pos":[82,1,37],"yaw":0,"props":{"links":["waynode_gate_n"]}},
+    {"name":"waynode_gate_n","kind":"waynode","pos":[82,1,4],"yaw":0,"props":{}}
+  ],
+  "generator": null,
+  "handEdited": true
+}

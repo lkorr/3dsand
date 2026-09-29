@@ -92,6 +92,9 @@ const std::vector<Gate>& StructureGates();
 // The in-game editor's command layer (docs/PLAN_world_editor.md P5,
 // editor/commands.h).
 const std::vector<Gate>& EditorGates();
+// Harrowby, the first hand-built village: a CONTENT gate over the game map
+// (docs/PLAN_world_editor.md P8, selftest_village.cpp).
+const std::vector<Gate>& VillageGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -573,6 +576,14 @@ const char* const kOrder[] = {
     // contract: mobs, debris and risings reset, id counter restored, park
     // function removed, store cleared, worldgen regenerated at home.
     "corpse-save",
+    // P8 Harrowby: the one gate on the GAME's map, placed BEFORE the other
+    // world-editor gates so a --verify list that names it with them runs it
+    // first: its pinned day trace is only comparable when no gate ticked the
+    // world before it (engine state outlives the gates' resets). It switches
+    // the map, runs the village day once, and on the way out switches back,
+    // reloads the environment and regenerates the window at the origin it
+    // found (the structure gates' exit contract).
+    "village-harrowby",
     // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
     // exit contract: mobs and debris reset, id counter restored, park function
     // removed, store cleared, and worldgen regenerated at the origin the gate
@@ -1043,7 +1054,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

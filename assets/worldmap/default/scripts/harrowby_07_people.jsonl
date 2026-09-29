@@ -1,0 +1,39 @@
+# HARROWBY 07 -- the places, the paths and the five people.
+#
+# Everything here is a reference in refs/harrowby.json, in WORLD voxels
+# (the green is at y 201). The houses' own slots (beds, hearths, the anvil,
+# the trestle, the alehouse gathering spot, the well marker, the field edge)
+# came with the structures; here are the village-level places, the outdoor
+# walking graph that joins every door to every other, and the villagers.
+
+# ---- places the schedules name by TAG ---------------------------------------
+# (`green` and `well` are markers of the green itself, script 05)
+# `smithy_yard`: outside the open forge bay, where Wat watches Osric work
+{"cmd": "ref.place", "args": {"id": "harrowby/smithy_yard", "kind": "marker", "pos": [654, 201, 3434], "yaw": 90, "props": {"tags": ["smithy_yard"]}}}
+
+# ---- the outdoor walking graph ----------------------------------------------
+# Four nodes round the well, one per door, joined in a ring; a lane from the
+# longhouse's back door to the field gate. Each house's `..._out` node is
+# the outside of its door (a slot of the house); a link written here joins
+# both ends, so the house files never change.
+{"cmd": "ref.place", "args": {"id": "harrowby/path_north", "kind": "waynode", "pos": [555, 201, 3420], "yaw": 0, "props": {"links": ["harrowby/longhouse/waynode_front_0_out", "path_west", "path_east"]}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/path_west", "kind": "waynode", "pos": [515, 201, 3456], "yaw": 0, "props": {"links": ["harrowby/alehouse/waynode_front_0_out", "path_south"]}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/path_east", "kind": "waynode", "pos": [600, 201, 3456], "yaw": 0, "props": {"links": ["harrowby/smithy/waynode_front_0_out", "path_south", "path_yard"]}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/path_south", "kind": "waynode", "pos": [557, 201, 3490], "yaw": 0, "props": {}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/path_yard", "kind": "waynode", "pos": [640, 201, 3432], "yaw": 0, "props": {"links": ["harrowby/smithy/waynode_front_0_out"]}}}
+# the lane: round the longhouse's west end (the byre door) to its back door and on to the field gate
+{"cmd": "ref.place", "args": {"id": "harrowby/lane_byre", "kind": "waynode", "pos": [470, 201, 3400], "yaw": 0, "props": {"links": ["path_west", "harrowby/longhouse/waynode_left_0_out"]}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/lane_back", "kind": "waynode", "pos": [470, 201, 3292], "yaw": 0, "props": {"links": ["lane_byre", "harrowby/longhouse/waynode_back_0_out", "lane_field"]}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/lane_field", "kind": "waynode", "pos": [545, 201, 3240], "yaw": 0, "props": {"links": ["harrowby/longhouse/waynode_back_0_out", "harrowby/field/waynode_gate_s"]}}}
+
+# ---- the villagers ----------------------------------------------------------
+# pos is only where a villager is put if its day has nowhere to be; a new
+# game places each one where its schedule says it is at that hour.
+# home / bed / work are the roles the schedules name; `alehouse` on the three
+# regulars is a role too (a prop naming a ref beats the `alehouse` tag), so
+# each stands at his own place in Agnes's front room of an evening.
+{"cmd": "ref.place", "args": {"id": "harrowby/edric", "kind": "npc", "base": "sherp", "pos": [548, 201, 3398], "yaw": 180, "props": {"name": "Edric Cotter", "home": "harrowby/longhouse", "bed": "harrowby/longhouse/bed_0", "work": "harrowby/field/field_edge", "alehouse": "harrowby/alehouse/seat_edric", "schedule": "edric", "dialogue": "edric", "outfit": ["smock#8B7D5A", "breeches#5C4E3C", "footwraps"], "behavior": "villager"}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/maud", "kind": "npc", "base": "shana", "pos": [562, 201, 3398], "yaw": 180, "props": {"name": "Maud Cotter", "home": "harrowby/longhouse", "bed": "harrowby/longhouse/bed_1", "work": "harrowby/longhouse/hearth", "schedule": "maud", "dialogue": "maud", "outfit": ["smock#8E4B3A", "hood", "shoes#4A3A2A"], "behavior": "villager"}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/osric", "kind": "npc", "base": "zeus", "pos": [650, 201, 3470], "yaw": 270, "props": {"name": "Osric", "home": "harrowby/smithy", "bed": "harrowby/smithy/bed_0", "work": "harrowby/smithy/anvil", "alehouse": "harrowby/alehouse/seat_osric", "schedule": "osric", "dialogue": "osric", "outfit": ["jerkin#3E2C1E", "trousers#3F3A34", "boots"], "behavior": "villager"}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/agnes", "kind": "npc", "base": "ferdruk", "pos": [462, 201, 3470], "yaw": 90, "props": {"name": "Agnes", "home": "harrowby/alehouse", "bed": "harrowby/alehouse/bed_0", "work": "harrowby/alehouse/trestle", "well": "harrowby/green/well_west", "schedule": "agnes", "dialogue": "agnes", "outfit": ["smock#5B6178", "hood", "clogs"], "behavior": "villager"}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/wat", "kind": "npc", "base": "fleepo", "pos": [462, 201, 3446], "yaw": 90, "props": {"name": "Wat", "home": "harrowby/alehouse", "bed": "harrowby/alehouse/bed_1", "work": "harrowby/smithy_yard", "alehouse": "harrowby/alehouse/seat_wat", "schedule": "wat", "dialogue": "wat", "outfit": ["tunic#9C8A4E", "hose#6B5A3E", "footwraps"], "behavior": "villager"}}}

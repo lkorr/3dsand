@@ -1,0 +1,4 @@
+{"seed": 7, "params": {"width": 10, "depth": 6.4, "storeys": 1, "storeyHeight": 2.6, "wallStyle": "plank_daub",
+ "plinth": 0.3, "roofShape": "hip", "roofMaterial": "thatch", "pitch": 52, "overhang": 0.6, "chimney": "right",
+ "doorsFront": 1, "doorsBack": 0, "doorsSide": 0, "windows": 3, "sideWindows": 1, "windowStyle": "shutters",
+ "floor": "flagstone", "partitions": 1, "loft": false, "beds": 2, "chests": 1}}

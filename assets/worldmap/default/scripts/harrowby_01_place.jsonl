@@ -1,0 +1,27 @@
+# HARROWBY 01 -- put the three houses on the ground.
+#
+# The houses were generated first (the Structures page, or from a terminal):
+#   node scripts/bake_structure.mjs harrowby_longhouse assets/worldmap/default/scripts/harrowby_longhouse.params.json
+#   node scripts/bake_structure.mjs harrowby_smithy    assets/worldmap/default/scripts/harrowby_smithy.params.json
+#   node scripts/bake_structure.mjs harrowby_alehouse  assets/worldmap/default/scripts/harrowby_alehouse.params.json
+#
+# The green is the space between them (a structure of its own, script 05,
+# centred at (555, 3467) with the well just north of its middle); the map's
+# spawn (580, 3515) is on the green's open south side, so a new game starts
+# looking at the village.
+#
+#            N (-z)
+#    [ longhouse, door faces S ]
+#   alehouse     well     smithy
+#   door faces E  green   door faces W (the forge bay opens onto the green)
+#                spawn
+#
+# pos is the middle of the house's footprint, y the floor you walk on (the
+# clearing is levelled to ground 200, so floor 201). A placed house levels a
+# SQUARE pad as wide as its longest side plus padMargin; two pads that overlap
+# are a load warning, so the margins are kept tight (4) and the houses spaced
+# to the voxel: the longhouse's square ends at z 3419, the green's begins at
+# 3421; the alehouse's ends at x 476, the smithy's begins at 643.
+{"cmd": "ref.place", "args": {"id": "harrowby/longhouse", "kind": "structure", "base": "harrowby_longhouse", "pos": [560, 201, 3340], "yaw": 0, "props": {"padMargin": 4}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/smithy", "kind": "structure", "base": "harrowby_smithy", "pos": [700, 201, 3460], "yaw": 270, "props": {"padMargin": 4}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/alehouse", "kind": "structure", "base": "harrowby_alehouse", "pos": [415, 201, 3460], "yaw": 90, "props": {"padMargin": 4}}}

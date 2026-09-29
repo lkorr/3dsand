@@ -1,0 +1,74 @@
+# HARROWBY 05 -- the green and its well: a structure built from nothing.
+#
+# struct.new starts an empty asset; its house frame is wherever we say the
+# ground is: y = 0 is the grass you stand on, (0, 0) the middle of the green.
+# y = -1 cells REPLACE the ground (the well's flagstone apron).
+#
+# WHY THE GREEN IS A STRUCTURE AND NOT JUST GRASS. A placed structure levels
+# its own footprint square dead flat (its pad), and the ground's fine grain
+# does not: after the clearing was levelled (script 00) the houses stood on
+# smooth lawns and the green between them was a field of hand-high lumps. Four
+# boundary stones at the corners make this asset 8.4 m square, so its pad
+# levels the heart of the green. The square is as big as it can be: the
+# longhouse's pad ends just north of it, and the game's spawn column
+# (580, 3515) must stay OUTSIDE every footprint -- it is on the green's open
+# south side, one voxel clear.
+{"cmd": "struct.new", "args": {"asset": "harrowby_green"}}
+
+# ---- the boundary stones (they also set the footprint) ----------------------
+{"cmd": "vox.box_fill", "args": {"min": [-42, 0, -42], "max": [-40, 2, -40], "mat": "stone"}}
+{"cmd": "vox.box_fill", "args": {"min": [39, 0, -42], "max": [41, 2, -40], "mat": "stone"}}
+{"cmd": "vox.box_fill", "args": {"min": [-42, 0, 39], "max": [-40, 2, 41], "mat": "stone"}}
+{"cmd": "vox.box_fill", "args": {"min": [39, 0, 39], "max": [41, 2, 41], "mat": "stone"}}
+
+# ---- the well, a little north of the middle ----------------------------------
+# the apron: flagstones set into the grass, corners knocked off
+{"cmd": "vox.box_fill", "args": {"min": [-11, -1, -19], "max": [11, -1, 3], "mat": "flagstone"}}
+{"cmd": "vox.clear", "args": {"min": [-11, -1, -19], "max": [-9, -1, -17]}}
+{"cmd": "vox.clear", "args": {"min": [9, -1, -19], "max": [11, -1, -17]}}
+{"cmd": "vox.clear", "args": {"min": [-11, -1, 1], "max": [-9, -1, 3]}}
+{"cmd": "vox.clear", "args": {"min": [9, -1, 1], "max": [11, -1, 3]}}
+# the ring: 1.3 m across, 0.9 m high, chamfered, water standing in it
+{"cmd": "vox.box_fill", "args": {"min": [-6, 0, -14], "max": [6, 8, -2], "mat": "stone"}}
+{"cmd": "vox.clear", "args": {"min": [-4, 0, -12], "max": [4, 8, -4]}}
+{"cmd": "vox.clear", "args": {"min": [-6, 0, -14], "max": [-5, 8, -13]}}
+{"cmd": "vox.clear", "args": {"min": [5, 0, -14], "max": [6, 8, -13]}}
+{"cmd": "vox.clear", "args": {"min": [-6, 0, -3], "max": [-5, 8, -2]}}
+{"cmd": "vox.clear", "args": {"min": [5, 0, -3], "max": [6, 8, -2]}}
+{"cmd": "vox.box_fill", "args": {"min": [-4, -1, -12], "max": [4, -1, -4], "mat": "stone"}}
+{"cmd": "vox.box_fill", "args": {"min": [-4, 0, -12], "max": [4, 3, -4], "mat": "water"}}
+# the frame: two posts, a beam, the windlass with its crank, rope and bucket
+{"cmd": "vox.box_fill", "args": {"min": [-9, 0, -9], "max": [-8, 22, -8], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [8, 0, -9], "max": [9, 22, -8], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-10, 23, -9], "max": [10, 23, -8], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [-7, 16, -9], "max": [7, 17, -8], "mat": "wood"}}
+{"cmd": "vox.box_fill", "args": {"min": [10, 16, -8], "max": [11, 16, -8], "mat": "iron"}}
+{"cmd": "vox.box_fill", "args": {"min": [11, 13, -8], "max": [11, 15, -8], "mat": "iron"}}
+{"cmd": "vox.box_fill", "args": {"min": [0, 9, -8], "max": [0, 15, -8], "mat": "linen"}}
+{"cmd": "vox.box_fill", "args": {"min": [-1, 6, -9], "max": [1, 8, -7], "mat": "plank"}}
+# the roof: three courses of tile, a ridge along x
+{"cmd": "vox.box_fill", "args": {"min": [-11, 24, -13], "max": [11, 24, -4], "mat": "roof_tile"}}
+{"cmd": "vox.box_fill", "args": {"min": [-11, 25, -11], "max": [11, 25, -6], "mat": "roof_tile"}}
+{"cmd": "vox.box_fill", "args": {"min": [-11, 26, -9], "max": [11, 26, -8], "mat": "roof_tile"}}
+
+# ---- a bench on the green, north-east of the well, off the smithy path -------
+{"cmd": "vox.box_fill", "args": {"min": [14, 3, -26], "max": [16, 3, -16], "mat": "plank"}}
+{"cmd": "vox.box_fill", "args": {"min": [15, 0, -25], "max": [15, 2, -25], "mat": "timber"}}
+{"cmd": "vox.box_fill", "args": {"min": [15, 0, -17], "max": [15, 2, -17], "mat": "timber"}}
+
+# ---- the places people stand ------------------------------------------------
+# `well` (schedules: `at: well`): south of the ring on the apron, facing it
+{"cmd": "slot.add", "args": {"name": "well", "kind": "marker", "pos": [2, 0, 4], "yaw": 180, "props": {"tags": ["well", "gather"]}}}
+# ...and a second place on the west side, facing the ring: Maud and Agnes are
+# at the well together from five to six, and two people cannot stand on one
+# spot. Agnes's ref names this one (props.well); it has no `well` tag, so
+# anyone else asking for `well` still gets the south one.
+{"cmd": "slot.add", "args": {"name": "well_west", "kind": "marker", "pos": [-13, 0, -6], "yaw": 90, "props": {"tags": ["gather"]}}}
+# `green` (Wat wanders round it, 6 m): the open grass south of the well
+{"cmd": "slot.add", "args": {"name": "middle", "kind": "marker", "pos": [5, 0, 25], "yaw": 0, "props": {"tags": ["green", "gather"]}}}
+
+{"cmd": "struct.save", "args": {}}
+
+# ...and put it down: pos = the middle of the green, y = the grass. padMargin 3
+# keeps its square clear of the longhouse's and of the spawn column.
+{"cmd": "ref.place", "args": {"id": "harrowby/green", "kind": "structure", "base": "harrowby_green", "pos": [555, 201, 3467], "yaw": 0, "props": {"padMargin": 3}}}

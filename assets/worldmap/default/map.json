@@ -1,5 +1,6 @@
 {
   "name": "default",
+  "editLayer": "default_ground",
   "about": "The shipped starting map (first written by scripts/seed_worldmap.py, repainted since). Edit it on the tuner's Environment > World map page. Tier A: seed-independent.",
   "cellLog2": 10,
   "size": [
@@ -59,6 +60,19 @@
         3515
       ],
       "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land and off any lake: the spawn-site gate checks all of that."
+    },
+    {
+      "id": "harrowby_clearing",
+      "kind": "pad",
+      "min": [
+        345,
+        3080
+      ],
+      "max": [
+        780,
+        3560
+      ],
+      "about": "Harrowby's clearing (docs/EDITOR_GUIDE.md, Building a village): no tree, bush or ground cover grows in this box, so the green, the lanes and Edric's field stay open; the forest stands round it and the treeline is its north edge, past the field. The houses are refs/harrowby.json."
     },
     {
       "id": "home_lake",
