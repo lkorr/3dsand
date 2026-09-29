@@ -168,8 +168,14 @@ def readable():
 # `biomes` and `water` are the Environment tab's two asset directories: one
 # JSON per biome (its feature stacks) and one per body-of-water preset. Plain
 # JSON, no binary bake, so they need nothing beyond the containment check.
+#
+# `structures` (and its `samples` folder, listed as a directory of its own so
+# the page sees the fixtures) holds building blueprints: <name>.vox + a
+# <name>.struct.json of slots and the generator record (PLAN_world_editor
+# §2.2). The one rule beyond containment is HAND-EDITED protection, in
+# _structure_guard() below.
 MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs", "trees", "prefabs",
-              "anims", "biomes", "water")
+              "anims", "biomes", "water", "structures", "structures/samples")
 MODEL_EXTS = (".vox", ".json", ".svtree")
 # The one MODEL_DIRS entry with a delete route (/api/limb/delete). Named here
 # so that route cannot be pointed at another directory by editing one string.
@@ -207,6 +213,51 @@ def _model_path(rel):
         root = os.path.realpath(d)
         if path.startswith(root + os.sep):
             return path
+    return None
+
+
+def _structure_guard(path, data, force):
+    """Refuse a write that would overwrite a HAND-EDITED structure, or None.
+
+    PLAN_world_editor §2.2: once a person has edited a structure's .vox it is
+    the truth, and regenerating writes a NEW name -- it never overwrites. The
+    Structures page already offers "<name>_v2"; this is the same rule where
+    every writer passes, so a script or a second tab cannot clobber the edit.
+
+      * writing <name>.vox when <name>.struct.json says handEdited: true
+      * writing <name>.struct.json that CLEARS handEdited (true -> false)
+
+    `force=1` on the query overrides (the in-game editor's own save path marks
+    the file hand-edited and is the one writer that may).
+    """
+    root = os.path.realpath(os.path.join(ASSETS, "structures"))
+    if force or not path.startswith(root + os.sep):
+        return None
+    low = path.lower()
+    if low.endswith(".struct.json"):
+        sj = path
+    elif low.endswith(".vox"):
+        sj = path[:-4] + ".struct.json"
+    else:
+        return None
+    try:
+        with open(sj, "r", encoding="utf-8") as f:
+            cur = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(cur, dict) and cur.get("handEdited") is True):
+        return None
+    if low.endswith(".vox"):
+        return ("%s is HAND-EDITED (its .struct.json says so): its .vox is the "
+                "truth and is not overwritten. Save the regenerated scaffold "
+                "under a new name." % os.path.basename(path))
+    try:
+        incoming = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return None
+    if isinstance(incoming, dict) and incoming.get("handEdited") is not True:
+        return ("%s is HAND-EDITED; a write may not clear that flag. Save "
+                "under a new name." % os.path.basename(path))
     return None
 
 
@@ -1695,6 +1746,10 @@ class Handler(BaseHTTPRequestHandler):
             data = self._raw()
             if not data:
                 return self._json(400, {"ok": False, "error": "empty body"})
+            guard = _structure_guard(path, data,
+                                     self._query().get("force", [""])[0] == "1")
+            if guard:
+                return self._json(409, {"ok": False, "error": guard})
             is_json = path.lower().endswith(".json")
             if is_json:
                 # Same rule as /api/save: never write a .json that will not

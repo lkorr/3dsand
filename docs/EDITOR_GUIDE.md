@@ -470,3 +470,98 @@ viewport. It stops at 200px, and never shrinks the viewport below 220px.
 - **Save aborted: round-trip failed** — the writer refused to produce a file
   that reads back differently. That's the guard doing its job; report the
   toast text.
+
+---
+
+## 9. Buildings — the Structures page
+
+A **structure** is a building blueprint: `assets/structures/<name>.vox` (the
+voxels) plus `<name>.struct.json` (where the doors, beds, chests, hearth and
+walking nodes are). You make one from the house generator, then hand-edit it.
+Open **Environment → Structures** (sidebar, under Components).
+
+### How do I make a new house?
+
+1. Pick a starting point in **new from…** (cottage, longhouse, smithy,
+   alehouse, townhouse).
+2. Move the sliders. Every row has a tooltip saying what it does. The preview
+   regenerates as you drag; the stats line under it says how many voxels,
+   rooms, doors, windows, beds and chests you got, and prints a warning in
+   orange if something you asked for did not fit (a window between two doors,
+   a bed with no headroom, a stair in a house too narrow for it).
+3. Not keen on the small choices (which way the corner braces run, where the
+   beds went)? Press **Reroll** — a new seed, same house. Type a seed to get a
+   particular one back.
+4. **Save as…** and give it a lowercase name (`harrowby_smithy`, or
+   `samples/barn` to put it in a folder). Two files appear in
+   `assets/structures/`.
+
+Undo/redo is `Ctrl+Z` / `Ctrl+Shift+Z` (or the ↶ ↷ buttons); a whole slider
+drag is one undo step.
+
+### How do I see inside?
+
+The **view** select: *roof off*, *ground floor*, *upper / loft*. It only cuts
+the preview — the saved house is never cut. Clicking a row in the slot table
+selects that slot, points the camera at it and cuts the roof away for you if
+it is inside.
+
+### What are the coloured markers and labels?
+
+Slots. Toggle them with the **slots** / **labels** boxes; the legend is in
+the view bar.
+
+| Colour | Slot | What it is for |
+|---|---|---|
+| orange | `door_front_0`, `door_back_0`, `door_left_0` … | the door leaf (box) and its hinge (red line). Doors open inward. |
+| blue | `bed_0` … | where a sleeper lies; the tick points foot → head |
+| yellow | `chest_0` … | a container; contents are added later (References page) |
+| green | `hearth`, `work_1` … | where someone stands to cook / work, facing the tick |
+| cyan | `waynode_*` | walking points NPCs route through; the lines are the links |
+
+### How do I change an existing house?
+
+Click it in the list (or pick it in the **structure** dropdown). You first see
+the file **on disk**. Move any slider and the preview switches to the
+**generated** scaffold; **Save** writes it back.
+
+Houses marked **hand-edited** (orange badge) are different: someone edited
+the voxels, so the `.vox` is now the real house and the generator must not
+overwrite it. Save on one of those offers `<name>_v2` instead, and the tuner
+refuses a direct overwrite too. To regenerate a hand-edited house for real,
+delete its two files yourself.
+
+### How do I make one from a terminal?
+
+```bash
+node scripts/bake_structure.mjs harrowby_smithy --preset smithy --seed 12
+node scripts/bake_structure.mjs harrowby_smithy                    # re-bake from its own settings
+node scripts/bake_structure.mjs my_house params.json               # {"seed": 3, "params": {...}}
+node scripts/bake_structure.mjs --samples                          # rebuild the three samples
+```
+
+Same generator as the page, same bytes. It never overwrites a hand-edited
+structure.
+
+### Where do the materials come from?
+
+Nine building materials in `materials.json` (Materials tab): `timber` (dark
+beams), `plank` (boards), `daub` (pale plaster panels), `cobble` (rubble
+stone), `flagstone` (floors, hearths, quoins), `roof_tile`, `thatch`,
+`door_wood` (only ever a door leaf), `straw_bed`. Wood, thatch and straw
+burn; stone, daub and tile do not. Change a colour there and press `R` in
+game.
+
+### Troubleshooting
+
+- **A window / bed / door I asked for is missing** — read the orange warning
+  in the stats line; it names what did not fit and why. Usually: widen the
+  house, or ask for fewer.
+- **"materials.json renumbered since this was written"** — the house's `.vox`
+  stores material numbers; someone inserted a material instead of appending.
+  Re-bake it (`bake_structure.mjs <name>`), or if it is hand-edited, fix the
+  materials list.
+- **Save is refused with "HAND-EDITED"** — working as intended; save under a
+  new name.
+- **Check the page works:** `bash scripts/check_structures.sh`; a picture:
+  `bash scripts/check_structures.sh --shot out.png --structure samples/smithy --clean`.

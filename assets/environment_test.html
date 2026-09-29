@@ -113,8 +113,8 @@ function readLit(wv, cv){
     var E = await import('./editor/environment.js');
     E.attach(hooks);
     var pages = E._pages();
-    say(!!pages.map && !!pages.biome && !!pages.trees && !!pages.water && !pages.caves && !pages.cover,
-        'four pages mounted: map, biome, trees, water (the caves / cover knob pages went with the worldgen group)');
+    say(!!pages.map && !!pages.biome && !!pages.trees && !!pages.water && !!pages.structures && !pages.caves && !pages.cover,
+        'five pages mounted: map, biome, trees, water, structures (the caves / cover knob pages went with the worldgen group)');
     say(pages.trees.id === 'view-trees' && !pages.trees.classList.contains('view'),
         'trees page is #view-trees WITHOUT class "view" (check_tabs.sh would count it otherwise)');
     E.activate();
@@ -272,6 +272,16 @@ function readLit(wv, cv){
     pages.trees.querySelectorAll('a.tghint').forEach(function (a) { if (/biome pages/.test(a.textContent)) ownerLink = a; });
     say(!weightRow && !!ownerLink, 'species placement shows no weight mirror and links to the biome pages' +
         (weightRow ? ': found ' + weightRow.textContent.slice(0, 60) : ''));
+
+    // ---- 5b. the Structures page mounts inside the shell (PLAN_world_editor P2) -----------------------------------
+    // scripts/check_structures.sh drives the page itself; this asserts only the
+    // shell's wiring: a sidebar entry, the page switch and a deep link.
+    say(!!pages.structures && [].slice.call(nav.querySelectorAll('button[data-page="structures"]')).length === 1,
+        'the sidebar lists a Structures page');
+    var ST = E._modules.Structures;
+    await E._open('structures', 'samples/smithy');
+    ok = await waitFor(function(){ return pages.structures.classList.contains('active') && ST.currentName() === 'samples/smithy' && ST._slots().length > 5; }, 30000);
+    say(ok, 'deep link opened samples/smithy on the Structures page (' + ST._slots().length + ' slots)');
 
     // ---- 6. the World map page: the front door (P-I) ----------------------------------------------------------
     E._open('map');

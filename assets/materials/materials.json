@@ -4494,6 +4494,208 @@
         "#ffffff"
       ],
       "tags": []
+    },
+    {
+      "//": "BUILDING MATERIALS (PLAN_world_editor P2, assets/editor/housegen.js). Nine static solids a rural-medieval house is made of, each a MATERIAL rather than a paint colour because each behaves differently: the timbers burn, the stone and daub do not, the thatch goes up fast, a door leaf has to read as a door. Every one carries a `far` alias because the far-field palette was already full (128 slots owned). The flammable ones reuse the existing burn chain by PRODUCT (wood-kind ignites to `ember`, straw-kind to `leaf_burning`): reactions.json has one ignition rule per material, the only shape the compiler accepts (`self` is a material name, never a tag). PLANK: sawn boards, a weathered mid-brown lighter than `wood` so floors and weatherboards read as worked timber rather than a trunk.",
+      "id": "plank",
+      "arcane": 2,
+      "far": "wood",
+      "sounds": {
+        "break": "branch"
+      },
+      "footstep": "branch",
+      "class": "solid",
+      "density": 550,
+      "hardness": 35,
+      "rubble": "ash",
+      "colors": [
+        "#8c6a45",
+        "#7e5f3d",
+        "#98764f"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "TIMBER: the dark oak of a box frame -- posts, rails, braces, lintels, tie beams. Darker than plank so the frame reads against daub at any distance; slower to catch than boards (heavy section), same burn chain.",
+      "id": "timber",
+      "arcane": 2,
+      "far": "bark_dark",
+      "sounds": {
+        "break": "branch"
+      },
+      "footstep": "branch",
+      "class": "solid",
+      "density": 750,
+      "hardness": 50,
+      "rubble": "ash",
+      "colors": [
+        "#4b3524",
+        "#422f20",
+        "#57402c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "THATCH: long straw laid thick on a roof, weathered from gold to grey-brown. Light, soft, and the most flammable thing a hamlet owns: it catches on the straw rule and burns away to nothing through leaf_burning, the way a roof fire actually goes.",
+      "id": "thatch",
+      "arcane": 1,
+      "far": "dry_tussock",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 240,
+      "hardness": 8,
+      "rubble": "dust",
+      "colors": [
+        "#9e8552",
+        "#8f7747",
+        "#ac935f"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "DAUB: wattle and daub -- clay, dung and straw on woven hazel, limewashed a pale ochre. The panel infill of a timber frame. Not flammable (clay), soft to dig, crumbles to dirt.",
+      "id": "daub",
+      "arcane": 1,
+      "far": "sand",
+      "footstep": "path",
+      "class": "solid",
+      "density": 1600,
+      "hardness": 20,
+      "rubble": "dirt",
+      "colors": [
+        "#d3c197",
+        "#c8b58b",
+        "#dccba3"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "COBBLE: rubble-stone walling, field stones in lime mortar -- plinths, footings, chimney stacks, the smithy walls. A shade warmer and more mottled than bare `stone` so a wall reads as built, not as bedrock.",
+      "id": "cobble",
+      "arcane": 2,
+      "far": "stone",
+      "footstep": "path",
+      "class": "solid",
+      "density": 2400,
+      "hardness": 80,
+      "rubble": "gravel",
+      "colors": [
+        "#807b72",
+        "#6e6a62",
+        "#8f8a80"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "FLAGSTONE: dressed, flat-split stone -- floors, hearths, a chimney cap, the quoins of a cobble wall. Cooler and smoother than cobble.",
+      "id": "flagstone",
+      "arcane": 2,
+      "far": "stone",
+      "footstep": "path",
+      "class": "solid",
+      "density": 2500,
+      "hardness": 85,
+      "rubble": "gravel",
+      "colors": [
+        "#8b877d",
+        "#7e7a71",
+        "#97938a"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "ROOF_TILE: fired clay, a dull terracotta. Not flammable (a tiled roof is why the smithy does not burn the hamlet down), brittle. The far alias is bark_light, the nearest warm OWNED slot (no owned material is terracotta).",
+      "id": "roof_tile",
+      "arcane": 1,
+      "far": "bark_light",
+      "footstep": "path",
+      "class": "solid",
+      "density": 1900,
+      "hardness": 30,
+      "rubble": "gravel",
+      "colors": [
+        "#9a4b33",
+        "#8a412b",
+        "#a8573d"
+      ],
+      "tags": [
+        "mineral"
+      ],
+      "molten": "lava"
+    },
+    {
+      "//": "DOOR_WOOD: the leaf of a door, and ONLY that. A distinct material so a closed door reads as a door (redder and warmer than the frame around it), and so the door system can tell its own leaf cells from the wall they hang in: a door whose leaf box is no longer all door_wood has been burned or broken and stops being a door (PLAN_world_editor 2.4). Burns like plank.",
+      "id": "door_wood",
+      "arcane": 2,
+      "far": "wood",
+      "sounds": {
+        "break": "branch"
+      },
+      "footstep": "branch",
+      "class": "solid",
+      "density": 600,
+      "hardness": 38,
+      "rubble": "ash",
+      "colors": [
+        "#6d4128",
+        "#603921",
+        "#7a4b30"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "STRAW_BED: a straw-stuffed tick on a bed frame. Solid (you lie ON it), soft, pale, and catches faster than anything else in the house.",
+      "id": "straw_bed",
+      "arcane": 1,
+      "far": "dry_tussock",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 150,
+      "hardness": 3,
+      "rubble": "dust",
+      "colors": [
+        "#cbb37c",
+        "#bda56f",
+        "#d7c18a"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }
