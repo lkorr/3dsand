@@ -1,0 +1,83 @@
+{
+  "name": "maud",
+  "speaker": "Maud Cotter",
+  "canLeave": true,
+  "notes": "Edric's wife; keeps the herbal. Thread: argues the treeline is poachers (maud_poachers), lets slip the old battle (maud_bones).",
+  "entry": [
+    { "if": [ { "activity": "sleep" } ], "goto": "asleep" },
+    { "if": [ { "met": true } ], "goto": "again" },
+    { "if": [ { "met": "edric" } ], "goto": "hello_edric" },
+    { "goto": "hello" }
+  ],
+  "nodes": [
+    {
+      "id": "hello",
+      "text": "Can I help you? We don't get many through Harrowby who aren't lost.",
+      "goto": "ask"
+    },
+    {
+      "id": "hello_edric",
+      "text": "You've been talking to my husband. I can tell by your face.",
+      "goto": "ask"
+    },
+    {
+      "id": "again",
+      "text": "You again. Wipe your feet.",
+      "goto": "ask"
+    },
+    {
+      "id": "ask",
+      "text": "Well?",
+      "choices": [
+        { "text": "Edric says there are lights at the treeline.", "goto": "maud_lights", "if": [ { "flag": "edric_lights" }, { "!flag": "maud_poachers" } ] },
+        { "text": "Is that a book?", "goto": "herbal" },
+        { "text": "What is there to do here?", "goto": "work" },
+        { "text": "Goodbye." }
+      ]
+    },
+    {
+      "id": "maud_lights",
+      "text": "Edric says a great many things after dark. It's poachers from Stowe, after the lord's deer, and they've the sense not to be seen by day. There is nothing in that wood but deer and old bones.",
+      "do": [ { "set": "maud_poachers" } ],
+      "choices": [
+        { "text": "Old bones?", "goto": "bones" },
+        { "text": "Fair enough.", "goto": "ask" }
+      ]
+    },
+    {
+      "id": "bones",
+      "text": "There was fighting on the ridge, years before we came. Osric was in it. Ask him, if you want a short answer and a long silence.",
+      "do": [ { "set": "maud_bones" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "herbal",
+      "text": "The only book in Harrowby, and it's mine. Herbs and roots, what cures what. Half of it's wrong, and the other half has saved Wat's life twice.",
+      "choices": [
+        { "text": "Could you teach me?", "goto": "teach" },
+        { "text": "Twice?", "goto": "twice" },
+        { "text": "Something else.", "goto": "ask" }
+      ]
+    },
+    {
+      "id": "teach",
+      "text": "I could teach you which end of a nettle to hold. The rest is years.",
+      "goto": "ask"
+    },
+    {
+      "id": "twice",
+      "text": "Once from a fever and once from a dare involving Osric's quench trough. Don't mention the second to Agnes.",
+      "goto": "ask"
+    },
+    {
+      "id": "work",
+      "text": "Work, mostly. If you're idle you can carry water. I suspect you won't.",
+      "goto": "ask"
+    },
+    {
+      "id": "asleep",
+      "text": "Out. Now. Before you wake Edric; he's worse than I am.",
+      "do": [ { "end": true } ]
+    }
+  ]
+}

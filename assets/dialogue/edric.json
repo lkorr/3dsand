@@ -1,0 +1,97 @@
+{
+  "name": "edric",
+  "speaker": "Edric Cotter",
+  "canLeave": true,
+  "notes": "Farmer. Thread: the lights at the treeline (sets edric_lights, edric_burial). Maud disagrees (maud.json); Osric knows what is buried there (osric.json).",
+  "entry": [
+    { "if": [ { "activity": "sleep" } ], "goto": "asleep" },
+    { "if": [ { "met": true } ], "goto": "again" },
+    { "goto": "hello" }
+  ],
+  "nodes": [
+    {
+      "id": "hello",
+      "text": "Stranger. You came up the stream road? Then you passed the treeline. See anything up there?",
+      "choices": [
+        { "text": "Nothing but trees.", "goto": "nothing" },
+        { "text": "What should I have seen?", "goto": "lights" },
+        { "text": "Who are you?", "goto": "who" },
+        { "text": "Just passing through.", "do": [ { "end": true } ] }
+      ]
+    },
+    {
+      "id": "nothing",
+      "text": "Mm. Good. That's good.",
+      "goto": "ask"
+    },
+    {
+      "id": "who",
+      "text": "Edric Cotter. That's my longhouse, that's my barley, and that's my wife Maud watching you from the door. I'd wave, if I were you.",
+      "goto": "ask"
+    },
+    {
+      "id": "again",
+      "if": [ { "time": [ "06:00", "20:00" ] } ],
+      "else": "again_night",
+      "text": "Back again? The field won't reap itself, but go on.",
+      "goto": "ask"
+    },
+    {
+      "id": "again_night",
+      "text": "Late to be wandering. Keep away from the treeline after dark.",
+      "goto": "ask"
+    },
+    {
+      "id": "ask",
+      "text": "Well?",
+      "choices": [
+        { "text": "Tell me about the lights.", "goto": "lights", "if": [ { "!flag": "edric_lights" } ] },
+        { "text": "You said Osric knows something.", "goto": "osric_hint", "if": [ { "flag": "edric_burial" } ] },
+        { "text": "How's the harvest?", "goto": "harvest" },
+        { "text": "Tell me about the others here.", "goto": "others" },
+        { "text": "Goodbye." }
+      ]
+    },
+    {
+      "id": "lights",
+      "text": "Lights. Low down, between the trunks, three nights running. Not lanterns; lanterns swing. These just stood there. Maud says it's poachers.",
+      "do": [ { "set": "edric_lights" } ],
+      "choices": [
+        { "text": "Maybe it is poachers.", "goto": "poachers" },
+        { "text": "Have you gone to look?", "goto": "look" },
+        { "text": "I'll keep an eye out.", "goto": "ask" }
+      ]
+    },
+    {
+      "id": "poachers",
+      "text": "Poachers don't stand still for an hour. And they don't keep coming back to the same spot. That's where the old burial ground is. Osric knows about it. He won't talk of it.",
+      "do": [ { "set": "edric_burial" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "look",
+      "text": "With what? A billhook and a bad knee? I've a harvest to bring in. If they're still there come the new moon, I'll go. Maybe.",
+      "goto": "ask"
+    },
+    {
+      "id": "osric_hint",
+      "text": "He was a soldier, before he was a smith. There was fighting on that ridge. Ask him yourself; you'll get more out of an anvil.",
+      "goto": "ask"
+    },
+    {
+      "id": "harvest",
+      "text": "Barley's the best in years. Which is how you know something else is about to go wrong.",
+      "goto": "ask"
+    },
+    {
+      "id": "others",
+      "text": "Osric's the smith. Keeps to himself, soldiered once. Agnes brews, and knows your business before you do. Her grandson Wat is a good lad hiding inside a lazy one.",
+      "goto": "ask"
+    },
+    {
+      "id": "asleep",
+      "text": "Mm? Whassit. It's the middle of the night. Go away.",
+      "do": [ { "end": true } ]
+    }
+  ]
+}
