@@ -10341,10 +10341,66 @@ void Mob::PostStep() {
     if (!limb.body) continue;
     phys_->GetTransform(limb.body, limb.xf);
   }
+  // Hair onto its head first: a hood is worn on the head, never on the hair,
+  // so the shells below read nothing this moves.
+  if (limp) DriveRootedHair();
   // LAST, off transforms that are already final for this tick — see the note on
   // the declaration. Nothing after this may move a host limb, or the garment on
   // it is a tick behind for the frame that draws it.
   DriveWornShells();
+}
+
+// ---- HAIR IS PART OF THE HEAD (Mob::DriveRootedHair) ------------------------
+//
+// Owner, 2026-09-29: "ensure the hair is always coupled to the head". On a
+// living rig it is by construction (the animation poses both). On a limp one
+// the only thing holding a hair piece on is a Fixed joint, and a joint is a
+// SOFT constraint: an afro several times the mass of a carved-out head, a
+// corpse landing, or a joint made cold by a rebuild (the laser rebuilds the
+// head every tick it burns) all open a visible gap -- `corpse-head-laser`
+// measured 0.59 vox and 0.28 rad while the beam was on, with the rig anchors
+// already in (Mob::RigJointDesc), where the joint alone recovers only once the
+// beam stops.
+//
+// So a Fixed-jointed hair piece is put back exactly on its head after every
+// limp step: the head's rotation (the rest relation of two base slots is the
+// identity, RigJointDesc) and the joint point through both frames, the same
+// two steps DriveWornShells takes for a garment. The joint stays: the hair's
+// weight still hangs on the head through it, so the head falls like a head
+// with hair on it. Only while both are awake, and without touching Jolt's
+// sleep timer (Physics::SnapBodyTransform): a sleeping corpse must be able to
+// fall asleep and stay that way (Mob::DeadAsleep, `corpse-sleep`).
+void Mob::DriveRootedHair() {
+  if (phys_ == nullptr) return;
+  for (int i = 0; i < baseLimbs_ && i < (int)limbs_.size(); i++) {
+    MobLimb& hair = limbs_[(size_t)i];
+    if (!hair.body || !hair.joint || hair.holdSeconds > 0) continue;
+    const MobLimbDef& ld = limbDefs_[(size_t)i];
+    if (!ld.bloodless || ld.joint != Physics::JointType::Fixed) continue;
+    const int pi = ParentLimbIndex(i);
+    if (pi < 0 || pi >= baseLimbs_) continue;
+    const MobLimb& head = limbs_[(size_t)pi];
+    if (!head.body || head.holdSeconds > 0) continue;
+    if (!phys_->IsActive(head.body)) continue;
+    const Quat q{head.xf.quat[0], head.xf.quat[1], head.xf.quat[2],
+                 head.xf.quat[3]};
+    const Vec3 pos = head.xf.pos + Rotate(q, hair.anchorRoot - head.restOffset) -
+                     Rotate(q, hair.anchorLimb);
+    const float quat[4] = {q.x, q.y, q.z, q.w};
+    // SNAP, not SetBodyTransform: that one resets the sleep timer, and a pose
+    // put back every tick would hold the corpse awake for good. An asleep
+    // hair piece is not moved at all (its head is not moving either).
+    if (!phys_->SnapBodyTransform(hair.body, pos, quat)) continue;
+    Vec3 lin{}, ang{};
+    if (phys_->GetBodyVelocities(head.body, lin, ang))
+      phys_->SetBodyVelocities(hair.body, lin + ang.cross(pos - head.xf.pos),
+                               ang);
+    hair.xf.pos = pos;
+    hair.xf.quat[0] = q.x;
+    hair.xf.quat[1] = q.y;
+    hair.xf.quat[2] = q.z;
+    hair.xf.quat[3] = q.w;
+  }
 }
 
 void Mob::DriveWornShells() {
@@ -11015,17 +11071,20 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
       // THE STRIKER'S SPEED, NOT THE CLOSING SPEED. The listener reports how
       // fast the pair closed; a creature walking into a resting log closes
       // on it at walking pace, and that is the creature kicking the log, not
-      // the log striking the creature. So the limb's own velocity toward the
-      // other body is taken back out (`normal` points bodyA -> bodyB).
-      // (The velocity of what was TOUCHED: a capsule walked into a log is the
-      // player kicking it, exactly as a limb is.)
-      float strike = ci.speedVoxPerSec;
-      Vec3 lv{}, la{};
-      if (phys.GetBodyVelocities(hitBody, lv, la)) {
-        const Vec3 toOther = side == 0 ? ci.normal : ci.normal * -1.0f;
-        strike -= std::max(0.0f, lv.dot(toOther));
-      }
-      if (strike <= 0.0f) continue;
+      // the log striking the creature. So the blow is the OTHER body's own
+      // velocity toward the creature, as the listener read it BEFORE the
+      // solver answered the contact (`normal` points bodyA -> bodyB, so B
+      // approaches A at -velB and A approaches B at +velA). Subtracting the
+      // limb's post-step velocity instead missed a PLAYER entirely: the
+      // capsule is teleported onto the player, so it reads no walk, and the
+      // log a player walked into billed the whole closing speed.
+      const float strike =
+          std::min(ci.speedVoxPerSec,
+                   side == 0 ? -ci.velBVoxPerSec : ci.velAVoxPerSec);
+      if (!(strike > 0.0f) || strike < gt.contactMinSpeed) continue;
+      // ...AND IT HAD TO BE GOING SOMEWHERE. A log nudged an inch, or rolling
+      // back onto the foot that pushed it, has no run of motion behind it.
+      if (phys.MotionRunVox(other) < gt.contactMinTravel) continue;
       const float impulse = mu * strike * kVoxelMeters;
       if (impulse <= gt.contactImpulseMin) continue;
       hits.push_back({limbBody, other, ci.posVoxel, impulse,
@@ -14086,6 +14145,32 @@ uint32_t MobSystem::RewriteLimbSurface(uint64_t mobId, int limb, uint32_t fromMa
   return done;
 }
 
+// A joint RE-made between a parent and child slot of an already-posed rig
+// (a collider rebuild). JointDescFor reads the pivot off the bodies' poses as
+// they are NOW, which is right at spawn (they are the rest pose) and wrong on
+// a corpse: the solver lets every joint sag a little each tick, and a rebuild
+// that re-records the sag makes it permanent. The laser rebuilds the head
+// every tick it burns, so the droop RATCHETED -- the head walked a voxel off
+// its neck and the hair (a Fixed joint, which locks the whole relative
+// transform) turned 50 degrees off the scalp (`corpse-head-laser`).
+//
+// So a base-rig joint carries the rig's own pivot on both sides -- the child's
+// anchorLimb, and the same rest point in the parent's frame -- and a Fixed one
+// the rest relative rotation, which for two base slots is the identity (every
+// base body is built unrotated at spawn, and that is when their joints are
+// first made). Both are invariant across carve rebases (ReskinLimbMicro moves
+// restOffset and anchorLimb together). An appended slot (a held item, a worn
+// piece) keeps the pose-read joint: its rest relation is not the identity.
+Physics::JointDesc Mob::RigJointDesc(int child, int parent, Vec3 anchorW) const {
+  Physics::JointDesc jd = JointDescFor(limbDefs_[child], anchorW);
+  if (child < baseLimbs_ && parent >= 0 && parent < baseLimbs_) {
+    jd.rigAnchors = true;
+    jd.localA = limbs_[child].anchorRoot - limbs_[parent].restOffset;
+    jd.localB = limbs_[child].anchorLimb;
+  }
+  return jd;
+}
+
 bool Mob::RebuildLimbBody(int limbIndex) {
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body || limb.voxels.empty()) return false;
@@ -14163,8 +14248,8 @@ bool Mob::RebuildLimbBody(int limbIndex) {
             child.xf.quat[3]};
     Vec3 anchorW = child.xf.pos + Rotate(cq, child.anchorLimb);
     phys_->DestroyJoint(child.joint);
-    child.joint = phys_->CreateJoint(nh, child.body,
-                                     JointDescFor(limbDefs_[k], anchorW));
+    child.joint = phys_->CreateJoint(
+        nh, child.body, RigJointDesc((int)k, limbIndex, anchorW));
   }
   // Alive AND not limp: a carve during a live ragdoll (a second blast, acid
   // on a body on the floor) rebuilds a DYNAMIC limb, or the rebuilt piece
@@ -14210,7 +14295,7 @@ bool Mob::RebuildLimbBody(int limbIndex) {
       Vec3 anchorW = limb.xf.pos + Rotate(q, limb.anchorLimb);
       limb.joint = phys_->CreateJoint(
           limbs_[k].body, limb.body,
-          JointDescFor(limbDefs_[limbIndex], anchorW));
+          RigJointDesc(limbIndex, (int)k, anchorW));
       break;
     }
   }
@@ -24119,6 +24204,49 @@ Vec3 MobSystem::LimbAnchorPos(uint64_t mobId, int limbIndex) const {
     return limb.xf.pos + Rotate(q, limb.anchorLimb);
   }
   return Vec3{};
+}
+
+float MobSystem::LimbJointGap(uint64_t mobId, int limbIndex, bool jolt,
+                              float* relQuatOut) const {
+  for (const Mob& mob : CreatureWithId(mobId)) {
+    if (mob.id_ != mobId) continue;
+    const int pi = mob.ParentLimbIndex(limbIndex);
+    if (pi < 0 || limbIndex >= (int)mob.limbs_.size()) return -1.0f;
+    const MobLimb& c = mob.limbs_[(size_t)limbIndex];
+    const MobLimb& p = mob.limbs_[(size_t)pi];
+    if (!c.body || !p.body || !mob.phys_) return -1.0f;
+    BodyTransform cx = c.xf, px = p.xf;
+    if (jolt) {
+      mob.phys_->GetTransform(c.body, cx);
+      mob.phys_->GetTransform(p.body, px);
+    }
+    const Quat cq{cx.quat[0], cx.quat[1], cx.quat[2], cx.quat[3]};
+    const Quat pq{px.quat[0], px.quat[1], px.quat[2], px.quat[3]};
+    if (relQuatOut) {
+      const Quat r = QuatMul(QuatConj(pq), cq);
+      relQuatOut[0] = r.x;
+      relQuatOut[1] = r.y;
+      relQuatOut[2] = r.z;
+      relQuatOut[3] = r.w;
+    }
+    const Vec3 onChild = cx.pos + Rotate(cq, c.anchorLimb);
+    const Vec3 onParent = px.pos + Rotate(pq, c.anchorRoot - p.restOffset);
+    return (onChild - onParent).len();
+  }
+  return -1.0f;
+}
+
+float MobSystem::LimbArtColliderGap(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : CreatureWithId(mobId)) {
+    if (mob.id_ != mobId) continue;
+    if (limbIndex < 0 || limbIndex >= (int)mob.limbs_.size()) return -1.0f;
+    const MobLimb& l = mob.limbs_[(size_t)limbIndex];
+    if (!l.body || !mob.phys_) return -1.0f;
+    BodyTransform jx{};
+    mob.phys_->GetTransform(l.body, jx);
+    return (jx.pos - l.xf.pos).len();
+  }
+  return -1.0f;
 }
 
 uint32_t MobSystem::LimbArtVoxelCount(uint64_t mobId, int limbIndex) const {

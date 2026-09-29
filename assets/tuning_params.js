@@ -742,6 +742,8 @@ const TUNING_PARAMS = {
   'gore.contactHpPerImpulse':{t:'f',def:0.25,min:0,max:4},
   'gore.contactMaxHp':{t:'f',def:60,min:0,max:1000},
   'gore.contactMaxPerTick':{t:'i',def:8,min:0,max:64},
+  'gore.contactMinSpeed':{t:'f',def:15,min:0,max:500},
+  'gore.contactMinTravel':{t:'f',def:2,min:0,max:100},
   'gore.bleedHpPerVoxel':{t:'f',def:0.6,min:0,max:5},
   'gore.stumpBleedsOpen':{t:'b',def:true},
   'gore.burnCapMidFraction':{t:'f',def:0.4,min:0.05,max:0.95},

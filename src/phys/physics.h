@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -99,14 +100,22 @@ class Physics {
                             IVec3 originVoxel,
                             const std::vector<float>& densityOfMat,
                             bool allowKinematic = false,
-                            float voxelPitch = 1.0f);
+                            float voxelPitch = 1.0f,
+                            bool looseMatter = false);
   // Same, but at an arbitrary transform (laser splits inherit the parent
   // body's pose mid-tumble — PLAN §C2).
+  // `looseMatter`: world-scale rubble (islands, burn fragments, splits of
+  // them). Its collider box budget scales with its size (a box per 16
+  // voxels, 32..256; ColliderBoxBudgetFor in physics.cpp) instead of taking
+  // the whole ceiling -- a burnt plank does not need the 256 boxes a tree
+  // does, and the narrow phase and the swept cast pay per box. Creature limbs
+  // and severed parts leave it false and keep the full budget.
   uint64_t CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
                               const BodyTransform& xf,
                               const std::vector<float>& densityOfMat,
                               bool allowKinematic = false,
-                              float voxelPitch = 1.0f);
+                              float voxelPitch = 1.0f,
+                              bool looseMatter = false);
   // Analytic sphere collider — a greedy-boxed voxel ball can never roll
   // smoothly, so rolling objects get a true Jolt sphere. Mass = density *
   // sphere volume. The voxel ball that renders it is the caller's business
@@ -211,6 +220,21 @@ class Physics {
     // right-handed), as a spring of `motorFreq` Hz, critically damped.
     float motorTorque = 0.0f;
     float motorFreq = 2.0f;
+    // ---- Rig anchors (a joint RE-made on a rig that is already posed) ----
+    // Off: the pivot is `anchorVoxel` for both bodies and a Fixed joint locks
+    // whatever relative transform the two bodies have at this instant — right
+    // at spawn, where the bodies ARE the rest pose. On: the pivot is given in
+    // each body's own frame (`localA`/`localB`, world voxels from the body
+    // origin) and a Fixed joint holds B at `relB` (B's rotation in A's frame,
+    // x,y,z,w) — so re-making a joint on a corpse that has sagged restores the
+    // rig's relationship instead of recording the sag as the new rest. That
+    // was the laser-kill bug: the beam rebuilds the head every tick, each
+    // rebuild re-locked the last tick's droop, and the head walked off the
+    // neck and out from under its hair (`corpse-head-laser`).
+    // Ignored for a world-anchored joint (bodyA 0).
+    bool rigAnchors = false;
+    Vec3 localA{}, localB{};
+    float relB[4] = {0, 0, 0, 1};
   };
 
   // Returns an opaque handle (0 = failure). Joints attached to a body are
@@ -333,6 +357,13 @@ class Physics {
   // tick of lag on a limb falling at 40 m/s is four voxels of daylight between
   // a hood and the head inside it.
   bool SetBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
+  // SetBodyTransform for a body that is ALREADY AWAKE and must be allowed to
+  // fall asleep: Jolt's teleport resets the body's sleep timer, so a pose
+  // corrected every tick keeps its whole island awake forever (a corpse whose
+  // hair is put back on its head, Mob::DriveRootedHair, never slept). This one
+  // leaves the timer alone and never activates: false, and nothing moves, for
+  // a sleeping, static or dead body.
+  bool SnapBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
 
   // ---- A BODY'S COLLISION LAYER IS DERIVED FROM ITS ROLE (W2-N) -----------
   //
@@ -509,6 +540,24 @@ class Physics {
   // Static terrain collision patch (triangles in voxel units, world space).
   uint64_t CreateTerrainMesh(const std::vector<float>& vertsXYZ,
                              const std::vector<uint32_t>& indices);
+  // ...the same in two halves, so a tick's patches can be BUILT in parallel
+  // (DebrisSystem::ManageTerrain) and still be ADDED in one fixed order. The
+  // build is a pure function of the triangles -- Jolt's MeshShapeSettings::
+  // Create, ~1 ms for a 1-2k triangle patch, and the whole of a patch's cost
+  // -- and touches no shared state, so it is safe on any thread. `shape` is
+  // an AddRef'd JPH::Shape*, released by AddTerrainShape (which must run on
+  // the game thread, outside Step) or by DropTerrainShape.
+  struct TerrainShapeJob {
+    std::vector<float> verts;       // voxel units, world space
+    std::vector<uint32_t> indices;
+    const void* shape = nullptr;
+  };
+  void BuildTerrainShape(TerrainShapeJob& job) const;
+  uint64_t AddTerrainShape(TerrainShapeJob& job);
+  void DropTerrainShape(TerrainShapeJob& job) const;
+  // Run fn(0..n-1) on Jolt's worker pool (the calling thread helps) and
+  // return when all are done. Only between Steps: the pool is Jolt's.
+  void ParallelFor(uint32_t n, const std::function<void(uint32_t)>& fn);
 
   // ---- player proxy (deferred from M6; DESIGN.md §8) ----
   // Capsule the debris collides against. Voxel terrain collision stays in the
@@ -574,6 +623,13 @@ class Physics {
     Vec3 posVoxel{};                // contact point, world voxels
     Vec3 normal{};                  // unit, points from bodyA toward bodyB
     float speedVoxPerSec = 0;       // |approach speed| along `normal`
+    // Each body's OWN point velocity along `normal`, signed, vox/s, read in
+    // the listener -- i.e. BEFORE the solver resolved this contact. A post-step
+    // velocity is the bounce, not the blow, and a player capsule's post-step
+    // velocity does not carry the walk that teleported it into the body. So
+    // "who struck whom" is answered from these: A moves toward B when
+    // velA > 0, B toward A when velB < 0 (ApplyContactDamage).
+    float velAVoxPerSec = 0, velBVoxPerSec = 0;
   };
   const std::vector<ContactImpact>& ContactImpacts() const;
   // The contacts the filter above keeps OUT of that list because one side is
@@ -590,6 +646,16 @@ class Physics {
   // Jolt job threads, which must never read a game-side global themselves
   // (same contract as the audio thread — DESIGN.md §12b).
   void SetContactReportSpeed(float voxPerSec);
+  // How far this body has travelled, in voxels, in its CURRENT run of motion
+  // -- continuously above kMotionRunRestVox -- measured at the START of the
+  // last Step from the velocity it entered that step with, and counting that
+  // step's travel (so a body that just struck something and stopped still
+  // reports the run that brought it there). 0 for a body at rest, asleep,
+  // static or
+  // unknown. Contact damage reads it: a log nudged an inch, or one you are
+  // leaning on, has no run and strikes nobody.
+  static constexpr float kMotionRunRestVox = 2.0f;  // 0.2 m/s
+  float MotionRunVox(uint64_t handle) const;
 
   void RemoveBody(uint64_t handle);
   bool GetTransform(uint64_t handle, BodyTransform& out) const;
@@ -632,6 +698,18 @@ class Physics {
   // Wake dynamic bodies whose AABB intersects the given voxel-space sphere
   // (terrain changed under them).
   void WakeNear(Vec3 centerVoxel, float radiusVoxels);
+  // Wake every body whose BROAD-PHASE box overlaps [loVoxel, hiVoxel]: the
+  // bodies that can actually be touching matter that changed there. A
+  // broad-phase query, so its cost is the bodies it finds rather than every
+  // dynamic body, and -- unlike WakeNear's centre-of-mass sphere -- a long
+  // plank resting on the changed chunk with its centre outside it is woken.
+  void WakeInBox(Vec3 loVoxel, Vec3 hiVoxel);
+  // A body's broad-phase box in METRES (Jolt units), for callers comparing
+  // one body against itself (DebrisSystem's burn rebuild: did it lose its
+  // footing?).
+  bool BodyWorldBoundsM(uint64_t handle, float outMin[3], float outMax[3]) const {
+    return WorldBounds(handle, outMin, outMax);
+  }
 
   uint32_t NumActiveBodies() const;
 
@@ -664,6 +742,15 @@ class Physics {
     uint32_t manifoldsStatic = 0, pointsStatic = 0;  // body vs terrain/static
   };
   const StepStats& LastStep() const { return lastStep_; }
+  // Where the terrain-collider and wake time goes (always on: a few clock
+  // reads per terrain build, which is itself ~1 ms). Reset by the caller.
+  struct MeshStats {
+    double shapeUs = 0, addUs = 0, removeUs = 0, wakeUs = 0;
+    uint64_t meshes = 0, tris = 0, removes = 0, wakeCalls = 0, woken = 0;
+  };
+  const MeshStats& Meshes() const { return meshStats_; }
+  void ResetMeshStats() { meshStats_ = MeshStats{}; }
+  void NoteShapeBuildUs(double us) { meshStats_.shapeUs += us; }
   void ResetRunawayProbe() { runaway_ = RunawayProbe{}; }
   // The ceilings every dynamic body this class creates is born with, so a test
   // can assert against the engine's number rather than a copy of it.
@@ -742,11 +829,17 @@ class Physics {
   void SweepRunawayRigs();
   RunawayProbe runaway_{};
   StepStats lastStep_{};
+  MeshStats meshStats_{};
   // Jolt body INDEX -> consecutive-ish steps spent at the ceiling. Climbs by
   // one per hot step and falls by one per quiet one, so a body that is being
   // DRIVEN escalates while a body that was merely thrown hard decays back to
   // nothing. Bounded by the active list; entries are dropped at zero.
   std::unordered_map<uint32_t, uint16_t> hotSteps_;
+  // MotionRunVox: body handle -> voxels travelled in the current run of
+  // motion. Rebuilt from the active list at the head of every Step, so it is
+  // bounded by it and a body that stops or sleeps drops out.
+  void TrackMotionRuns(float dt);
+  std::unordered_map<uint64_t, float> motionRun_;
   int runawayReports_ = 0;  // rate limit on the three reporters above
   // SANDVOX_PHYS_FAULT: the deliberate blow-up that proves the two above
   // (and the Jolt FP-exception setting) actually do something. No-op unset.

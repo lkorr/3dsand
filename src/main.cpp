@@ -762,6 +762,18 @@ int g_fellSiteX = 0, g_fellSiteZ = 0;
 bool g_forestFire = false;
 int g_forestFireAt = 240;
 bool g_forestFireDone = false;
+// `--burn-house [tick]`: the HOUSE FIRE harness (owner report 2026-09-29: a
+// burning house drops the game to ~5 fps as the roof comes down in pieces).
+// Stamps assets/structures/<SANDVOX_BURN_HOUSE or harrowby_alehouse> ~100
+// voxels in front of the camera on a levelled footing, waits for the far
+// pipelines, lights the roof and the rooms, and prints a 60-tick timeline
+// (frame p50/max, bodies, body voxels, the worst Jolt step and its manifolds)
+// until +SANDVOX_BURN_TICKS (default 2400) after ignition, then ends the run
+// so the normal --frames report is the fire's.
+//   bash scripts/run.sh ./build/Release/sandvox.exe --frames 100000 --burn-house
+bool g_burnHouse = false;
+int g_burnHouseAt = 240;
+bool g_burnHouseDone = false;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
 // procedural surface route happens to stop.
 //
@@ -5049,6 +5061,10 @@ int main(int argc, char** argv) {
       g_forestFire = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_forestFireAt = std::atoi(argv[++i]);
     }
+    else if (a == "--burn-house") {
+      g_burnHouse = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_burnHouseAt = std::atoi(argv[++i]);
+    }
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -7963,6 +7979,238 @@ int main(int argc, char** argv) {
       }
     };
   }
+  if (g_burnHouse && !g_fellTree && !g_forestFire) {
+    // ---- --burn-house (see g_burnHouse). Borrows the fell-tree slot too.
+    tickCtx.fellTree = [&world, &mats, &debris, &mobs, &player, &cam, &sim, &phys](
+                           uint32_t tick, std::vector<CellOp>& cellOps) {
+      static std::vector<CellOp> stamp, fire;
+      static size_t stampAt = 0, fireAt = 0, winFrame0 = 0;
+      static int phase = 0;  // 0 wait, 1 stamping, 2 settling, 3 burning
+      static uint32_t t1 = 0, tIgnite = 0;
+      static uint32_t peakBodies = 0, peakVox = 0, worstMan = 0, worstManS = 0;
+      static double worstStep = 0;
+      static const uint32_t burnTicks = [] {
+        const char* e = std::getenv("SANDVOX_BURN_TICKS");
+        return e ? (uint32_t)std::max(60, std::atoi(e)) : 2400u;
+      }();
+      if (g_burnHouseDone) return;
+      if (phase == 0) {
+        if (tick < (uint32_t)g_burnHouseAt) return;
+        if (!sim.FarPipelinesReady()) {
+          g_burnHouseAt = (int)tick + 60;
+          return;
+        }
+        const char* nm = std::getenv("SANDVOX_BURN_HOUSE");
+        structures::Asset a;
+        std::string err;
+        std::vector<std::string> warn;
+        if (!structures::LoadAsset(AssetDir(), nm ? nm : "harrowby_alehouse", true, a,
+                                   err, warn)) {
+          std::printf("--burn-house: %s\n", err.c_str());
+          g_burnHouseDone = true;
+          return;
+        }
+        auto matByName = [&](const char* n) -> uint32_t {
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == n) return (uint32_t)i;
+          return 0u;
+        };
+        // SANDVOX_BURN_DIST=<voxels>: how far in front of the camera the
+        // house's centre lands (100 by default; ~50 puts the camera at its
+        // wall, which is where the rigid bodies fill the screen).
+        static const float dist = [] {
+          const char* e = std::getenv("SANDVOX_BURN_DIST");
+          return e ? (float)std::atof(e) : 100.0f;
+        }();
+        const Vec3 fwd = cam.Forward();
+        const int cx = ifloor(player.pos.x + fwd.x * dist);
+        const int cz = ifloor(player.pos.z + fwd.z * dist);
+        const int nx = a.prefab.size.x, ny = a.prefab.size.y, nz = a.prefab.size.z;
+        const int x0 = cx - nx / 2, z0 = cz - nz / 2;
+        // Grade = the highest ground under the footprint, so nothing of the
+        // house is buried; the footing below it is filled with stone and the
+        // ground above grade inside the box is cleared.
+        int grade = INT32_MIN;
+        for (int z = 0; z < nz; z++)
+          for (int x = 0; x < nx; x++)
+            grade = std::max(grade, World::TerrainHeight(x0 + x, z0 + z, kDefaultSeed) + 1);
+        const int yBase = grade - a.origin.y;
+        const uint32_t stone = matByName("stone");
+        std::vector<uint8_t> occ((size_t)nx * ny * nz, 0);
+        auto occAt = [&](int x, int y, int z) -> uint8_t& {
+          return occ[((size_t)z * ny + y) * nx + x];
+        };
+        for (const PrefabModel& m : a.prefab.models)
+          for (const PrefabVoxel& v : m.voxels) {
+            const int lx = v.x + m.offset.x, ly = v.y + m.offset.y, lz = v.z + m.offset.z;
+            if (lx < 0 || ly < 0 || lz < 0 || lx >= nx || ly >= ny || lz >= nz) continue;
+            occAt(lx, ly, lz) = 1;
+            const IVec3 c{x0 + lx, yBase + ly, z0 + lz};
+            if (!world.CellInWindow(c)) continue;
+            stamp.push_back({World::SlotCellIndex(c),
+                             PackVoxNew(v.material, (uint32_t)(lx * 7 + ly * 3 + lz) % 3u)});
+          }
+        for (int z = 0; z < nz; z++)
+          for (int x = 0; x < nx; x++) {
+            const int g = World::TerrainHeight(x0 + x, z0 + z, kDefaultSeed);
+            for (int y = std::min(g, yBase - 1) - 2; y < yBase; y++) {
+              const IVec3 c{x0 + x, y, z0 + z};
+              if (world.CellInWindow(c))
+                stamp.push_back({World::SlotCellIndex(c), PackVoxNew(stone, 0)});
+            }
+            for (int y = yBase; y <= std::min(g + 40, yBase + ny - 1); y++) {
+              if (occAt(x, y - yBase, z)) continue;
+              const IVec3 c{x0 + x, y, z0 + z};
+              if (world.CellInWindow(c)) stamp.push_back({World::SlotCellIndex(c), 0u});
+            }
+          }
+        // Fire: on top of every third roof column (the topmost house cell)
+        // and a lattice through the rooms. IfAir, so only air takes it.
+        // SANDVOX_BURN_SEED=low lights only the ground floor instead: the
+        // walls and posts burn out from under the roof, which then comes down
+        // in LARGE pieces -- the collapse, rather than a roof that burns away
+        // where it stands.
+        const uint32_t fm = matByName("fire");
+        const char* seedMode = std::getenv("SANDVOX_BURN_SEED");
+        const bool low = seedMode && std::string(seedMode) == "low";
+        if (low)
+          for (int ly = a.origin.y + 1; ly < a.origin.y + 12; ly += 3)
+            for (int z = 0; z < nz; z += 2)
+              for (int x = 0; x < nx; x += 2) {
+                const IVec3 c{x0 + x, yBase + ly, z0 + z};
+                if (world.CellInWindow(c))
+                  fire.push_back({World::SlotCellIndex(c), fm | kCellOpIfAir});
+              }
+        for (int z = 0; z < nz && !low; z += 3)
+          for (int x = 0; x < nx; x += 3)
+            for (int ly = ny - 1; ly >= 0; ly--)
+              if (occAt(x, ly, z)) {
+                const IVec3 c{x0 + x, yBase + ly + 1, z0 + z};
+                if (world.CellInWindow(c))
+                  fire.push_back({World::SlotCellIndex(c), fm | kCellOpIfAir});
+                break;
+              }
+        for (int ly = a.origin.y + 2; ly < ny && !low; ly += 12)
+          for (int z = 2; z < nz; z += 7)
+            for (int x = 2; x < nx; x += 7) {
+              const IVec3 c{x0 + x, yBase + ly, z0 + z};
+              if (world.CellInWindow(c))
+                fire.push_back({World::SlotCellIndex(c), fm | kCellOpIfAir});
+            }
+        std::printf("--burn-house: %s %dx%dx%d at (%d,%d,%d), %zu stamp ops, %zu fire "
+                    "seeds, tick %u\n", a.name.c_str(), nx, ny, nz, x0, yBase, z0,
+                    stamp.size(), fire.size(), tick);
+        std::fflush(stdout);
+        phase = 1;
+      }
+      if (phase == 1) {
+        while (stampAt < stamp.size() && cellOps.size() < kMaxCellOpsPerTick)
+          cellOps.push_back(stamp[stampAt++]);
+        if (stampAt < stamp.size()) return;
+        t1 = tick;
+        phase = 2;
+        return;
+      }
+      if (phase == 2) {
+        if (tick < t1 + 150u) return;
+        tIgnite = tick;
+        phase = 3;
+        // Every --frames series starts over at ignition: the exit report is
+        // the fire and nothing before it.
+        g_frameMs.clear();
+        g_activeChunks.clear();
+        for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+          g_frameScopeSum[i] = 0;
+          g_frameScopeMax[i] = 0;
+          g_frameScopeSeries[i].clear();
+        }
+        for (int n = 0; n < sandvox::kPerfNodeCount; n++) g_frameGpuSeries[n].clear();
+        g_frameGpuPassSeries.clear();
+        g_frameGpuFrames = 0;
+        debris.SetProfiling(true);
+        debris.ResetProfile();
+        mobs.ResetBurnStats();
+        phys.ResetRunawayProbe();
+        winFrame0 = 0;
+        std::printf("--burn-house: IGNITE at tick %u, bodies before %u\n", tick,
+                    debris.BodyCount());
+        std::fflush(stdout);
+      }
+      while (fireAt < fire.size() && cellOps.size() < kMaxCellOpsPerTick)
+        cellOps.push_back(fire[fireAt++]);
+      uint32_t vox = 0;
+      for (uint32_t b = 0; b < debris.BodyCount(); b++) vox += debris.BodyVoxelCount(b);
+      peakBodies = std::max(peakBodies, debris.BodyCount());
+      peakVox = std::max(peakVox, vox);
+      worstStep = std::max(worstStep, phys.LastStep().ms);
+      worstMan = std::max(worstMan, phys.LastStep().manifoldsDyn);
+      worstManS = std::max(worstManS, phys.LastStep().manifoldsStatic);
+      static std::vector<double> allSteps;
+      allSteps.push_back(phys.LastStep().ms);
+      static double stepSum = 0;
+      static uint64_t activeSum = 0;
+      stepSum += phys.LastStep().ms;
+      activeSum += phys.NumActiveBodies();
+      if ((tick - tIgnite) % 60u == 59u) {
+        const Physics::MeshStats& ms = phys.Meshes();
+        std::printf("--burn-house:        step mean %.2f ms, active bodies mean %.0f | "
+                    "terrain meshes %llu (%.0f tris avg) shape %.2f add %.2f remove "
+                    "%.2f ms/tick | wake calls %llu woke %llu, %.2f ms/tick\n",
+                    stepSum / 60.0, (double)activeSum / 60.0,
+                    (unsigned long long)ms.meshes,
+                    ms.meshes ? (double)ms.tris / (double)ms.meshes : 0.0,
+                    ms.shapeUs / 60000.0, ms.addUs / 60000.0, ms.removeUs / 60000.0,
+                    (unsigned long long)ms.wakeCalls, (unsigned long long)ms.woken,
+                    ms.wakeUs / 60000.0);
+        phys.ResetMeshStats();
+        stepSum = 0;
+        activeSum = 0;
+        std::vector<double> w(
+            g_frameMs.begin() + (ptrdiff_t)std::min(winFrame0, g_frameMs.size()),
+            g_frameMs.end());
+        std::sort(w.begin(), w.end());
+        const WorldSnapshot& sn = world.Snap();
+        std::printf("--burn-house: +%4u frames %3zu p50 %6.1f max %6.1f | bodies %u vox "
+                    "%u | jolt worst %.1f ms, manifolds dyn %u static %u | active %u\n",
+                    tick - tIgnite, w.size(), w.empty() ? 0.0 : w[w.size() / 2],
+                    w.empty() ? 0.0 : w.back(), debris.BodyCount(), vox,
+                    phys.Runaway().worstStepMs, worstMan, worstManS,
+                    sn.valid ? sn.activeChunks : 0u);
+        phys.ResetRunawayProbe();
+        worstMan = worstManS = 0;
+        winFrame0 = g_frameMs.size();
+        std::fflush(stdout);
+      }
+      if (tick >= tIgnite + burnTicks) {
+        {
+          std::vector<double> v = allSteps;
+          std::sort(v.begin(), v.end());
+          double sum = 0;
+          for (double x : v) sum += x;
+          size_t over10 = 0, over20 = 0;
+          for (double x : v) { over10 += x > 10.0; over20 += x > 20.0; }
+          if (!v.empty())
+            std::printf("--burn-house: JOLT STEP over %zu ticks: mean %.2f p50 %.2f p95 "
+                        "%.2f p99 %.2f max %.2f ms, >10ms %zu, >20ms %zu\n",
+                        v.size(), sum / (double)v.size(), v[v.size() / 2],
+                        v[(size_t)(0.95 * (v.size() - 1))],
+                        v[(size_t)(0.99 * (v.size() - 1))], v.back(), over10, over20);
+        }
+        std::printf("--burn-house: peak bodies %u, peak body voxels %u, worst step "
+                    "%.1f ms\n--burn-house: debris profile over the burn: %s\n",
+                    peakBodies, peakVox, worstStep, debris.ProfileReport().c_str());
+        const MobSystem::BurnStats& bs = mobs.Burn();
+        std::printf("--burn-house: body-reaction evaluator: %llu visits (%llu loose), "
+                    "%llu world cells walked, %llu index builds over %llu cells\n",
+                    (unsigned long long)bs.visits, (unsigned long long)bs.looseVisits,
+                    (unsigned long long)bs.walkCells,
+                    (unsigned long long)bs.indexBuilds,
+                    (unsigned long long)bs.indexCells);
+        std::fflush(stdout);
+        g_burnHouseDone = true;
+      }
+    };
+  }
   // Respawn out of an open inventory hands the cursor back to the window:
   // `captureBeforeUi`, glfwSetInputMode and the cursor-position reset are all
   // the WINDOW's, and there is no window on the authority side.
@@ -9305,6 +9553,7 @@ int main(int argc, char** argv) {
       // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
       static const bool noReload =
           std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire ||
+          g_burnHouse ||
           g_shotDialogue ||  // the reload would wipe the listener it spawned
           g_shotEditor ||    // ...or the house it placed
           g_shotSpawn;       // (a picture, not a reload test: the compile would own the run)
@@ -9316,7 +9565,8 @@ int main(int argc, char** argv) {
     }
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
-    if (g_parkDone || g_forestFireDone) glfwSetWindowShouldClose(window, 1);
+    if (g_parkDone || g_forestFireDone || g_burnHouseDone)
+      glfwSetWindowShouldClose(window, 1);
 
     // --shot-jump: decide whether THIS frame is one of the four pictures.
     //

@@ -17,6 +17,7 @@
 #include "phys/damagecause.h"  // DamageCause: shared with Mob
 #include "phys/kerf.h"   // KerfCut/KerfSlot: the shape a blade takes out
 #include "phys/lattice.h"
+#include "phys/marching_cubes.h"  // kMcOccWords/kMcOccCells: TerrainBuild
 #include "phys/physics.h"
 #include "sim/bodyreact.h"
 #include "sim/materials.h"
@@ -1643,6 +1644,19 @@ class DebrisSystem {
                             // liquids flowing through a chunk neither rebuild
                             // nor wake, and the compare runs BEFORE the mesh
   };
+  // One patch this tick's terrain sweep decided to rebuild, captured by value
+  // so the polygonize + Jolt shape build can run on worker threads after the
+  // sweep (ManageTerrain, "THE TICK'S PATCHES, BUILT IN PARALLEL").
+  struct TerrainBuild {
+    TerrainEntry* entry = nullptr;
+    IVec3 wc{}, origin{};
+    uint32_t occ[kMcOccWords] = {};
+    uint8_t dens[kMcOccCells] = {};
+    bool partial = false;
+    uint32_t version = 0;
+    uint64_t occHash = 0, vacateKey = 0;
+    Physics::TerrainShapeJob job;
+  };
 
   // Are every one of this region's chunks cached at or past `required`? When
   // `requestFetch`, missing ones are asked for — plus the one-chunk RING around
@@ -2031,6 +2045,7 @@ class DebrisSystem {
   };
   std::vector<Anchor> extraAnchors_;                    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
+  std::vector<TerrainBuild> terrainBuilds_;  // this tick's, see TerrainBuild
   uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on
   // Per chunk, the tick of the last grid write this system made into it
   // (island removal, rubble, settle-back). A scan may not read the chunk from

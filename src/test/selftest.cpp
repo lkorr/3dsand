@@ -765,7 +765,7 @@ const char* const kOrder[] = {
     // long: a gate added to a suite that shares one World has to go where it
     // disturbs the fewest gates that were there first, and that is the END of
     // its group — not the middle of it, however well it reads there.
-    "wound-chip", "hair-rooted", "wound-accumulate", "wound-heft", "wound-bleed",
+    "wound-chip", "hair-rooted", "corpse-head-laser", "wound-accumulate", "wound-heft", "wound-bleed",
     // ---- NPCs SWINGING, AND BLADES MEETING BLADES (phase C) ---------------
     // APPENDED at the very end of the mob group, following the rule the block
     // above spells out: a new gate in a shared-World suite goes LAST in its

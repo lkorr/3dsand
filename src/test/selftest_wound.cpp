@@ -282,14 +282,13 @@ void PrepareWorld(Ctx& c) {
 // half the strokes AT THE ANCHOR (the joint test's whole subject) and half
 // through the mass. Asserted: the cuts took hair (it is a wound, not armour)
 // and the piece is still on the creature at the end.
-Status GateHairRooted(Ctx& c, std::string& detail) {
+// The biggest bloodless (hair) limb, measured by spawning -- ChooseTarget's
+// method, with its hair exclusion inverted. Invalid if nothing has hair.
+Target ChooseHairTarget(Ctx& c) {
   MobSystem& mobs = c.mobs;
-  IdCounterScope idScope(mobs);
-  PrepareWorld(c);
-  // The biggest bloodless (hair) limb, measured by spawning -- ChooseTarget's
-  // method, with its hair exclusion inverted. Hair lives on the random-human
-  // POOL bodies (MobSystem::PoolDef), which no startup load lists, so the
-  // candidates are the loaded defs plus the first pool body that has any.
+  // Hair lives on the random-human POOL bodies (MobSystem::PoolDef), which no
+  // startup load lists, so the candidates are the loaded defs plus the first
+  // pool body that has any.
   auto hasHair = [&](int d) {
     for (const MobLimbDef& ld : mobs.Defs()[d].limbs)
       if (ld.bloodless) return true;
@@ -322,6 +321,14 @@ Status GateHairRooted(Ctx& c, std::string& detail) {
     }
   }
   mobs.Reset();
+  return t;
+}
+
+Status GateHairRooted(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseHairTarget(c);
   if (!t.valid()) {
     detail = "no loaded or pool mob def has a hair (bloodless) limb with a body";
     return Status::Fail;
@@ -435,6 +442,155 @@ Status GateHairRooted(Ctx& c, std::string& detail) {
                   before, after, attached ? "still on" : "CAME OFF WHOLE",
                   rebase, mismatch, gapMax);
   std::printf("hair-rooted: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// corpse-head-laser: a beam kill leaves the head on the neck, the hair on the head
+// ---------------------------------------------------------------------------
+// Owner report 2026-09-29: "when killing a mob via a laser their head gets
+// offset and displaced on the corpse ... the head becomes decoupled from their
+// hair". The laser is the one weapon that keeps carving the SAME limb every
+// tick, alive and dead, and that kills from the head (gore.brainHpPerVoxel), so
+// the head is rebased and rebuilt dozens of times across the moment the rig
+// is handed to the solver.
+//
+// FIXTURE. The haired def hair-rooted uses; the hair piece whose parent is the
+// head (vital). The beam bores the head tick after tick through the real
+// entry points (MobSystem::LaserHit, then the phase-K CarveLimbRadial clean
+// bore), aimed alternately at a surviving voxel and at the brick's FIRST voxel
+// (its low side: the carve that forces a rebase), until the creature dies and
+// for kPostDeath ticks after; then the corpse settles.
+//
+// Measured every tick, at the joints (MobSystem::LimbJointGap, invariant
+// across rebases): hair-head and head-neck, through the poses the ART is drawn
+// at and through the colliders, plus each limb's art-vs-collider split and the
+// hair's rotation in the head frame (its joint is Fixed: that must not turn).
+Status GateCorpseHeadLaser(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  Target t = ChooseHairTarget(c);
+  if (!t.valid()) {
+    detail = "no loaded or pool mob def has a hair (bloodless) limb with a body";
+    return Status::Fail;
+  }
+  // The hair on the HEAD, not the mane on the torso.
+  int headLi = -1;
+  {
+    const MobDef& def = mobs.Defs()[t.defIndex];
+    int best = -1;
+    uint32_t bestN = 0;
+    mobs.Reset();
+    const uint64_t probe = mobs.Spawn(t.defIndex, FixtureSite(c.world, 170));
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      if (!def.limbs[li].bloodless) continue;
+      int pi = -1;
+      for (size_t k = 0; k < def.limbs.size(); k++)
+        if (def.limbs[k].name == def.limbs[li].parent) pi = (int)k;
+      if (pi < 0 || !def.limbs[pi].vital) continue;
+      const uint32_t n = probe ? mobs.LimbVoxelsAtSpawn(probe, (int)li) : 0;
+      if (best < 0 || n > bestN) { best = (int)li; bestN = n; headLi = pi; }
+    }
+    mobs.Reset();
+    if (best < 0) {
+      detail = t.defName + " has no hair piece on a vital limb";
+      return Status::Fail;
+    }
+    t.limb = best;
+    t.limbName = def.limbs[best].name;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 170, pchunk);
+  if (!id) { detail = "spawn refused"; return Status::Fail; }
+  uint32_t tick = 63999;
+  support::TickCursor ticker{c, tick, pchunk};
+  for (int i = 0; i < 3; i++) ticker();
+
+  float hairRef[4] = {0, 0, 0, 1};
+  mobs.LimbJointGap(id, t.limb, false, hairRef);
+  struct Worst {
+    float hairArt = 0, hairJolt = 0, neckArt = 0, neckJolt = 0;
+    float headSplit = 0, hairSplit = 0, hairTurn = 0;
+    int hairAt = -1;  // step (beam tick, then settle ticks after) of hairArt
+  } alive, dead;
+  int step = 0;
+  auto sample = [&](Worst& w) {
+    float rel[4];
+    const float ha = mobs.LimbJointGap(id, t.limb, false, rel);
+    if (ha > w.hairArt) w.hairAt = step;
+    w.hairArt = std::max(w.hairArt, ha);
+    w.hairJolt = std::max(w.hairJolt, mobs.LimbJointGap(id, t.limb, true));
+    w.neckArt = std::max(w.neckArt, mobs.LimbJointGap(id, headLi, false));
+    w.neckJolt = std::max(w.neckJolt, mobs.LimbJointGap(id, headLi, true));
+    w.headSplit = std::max(w.headSplit, mobs.LimbArtColliderGap(id, headLi));
+    w.hairSplit = std::max(w.hairSplit, mobs.LimbArtColliderGap(id, t.limb));
+    if (ha >= 0.0f) {
+      const float d = std::fabs(rel[0] * hairRef[0] + rel[1] * hairRef[1] +
+                                rel[2] * hairRef[2] + rel[3] * hairRef[3]);
+      w.hairTurn = std::max(w.hairTurn,
+                            2.0f * std::acos(std::min(1.0f, d)));
+    }
+  };
+  const float bore = (float)CurrentTuning().tools.laserCarveRadius;
+  const int kMaxBeam = 240, kPostDeath = 45, kSettle = 90;
+  int beamTicks = 0, diedAt = -1, bored = 0;
+  std::vector<ParticleSpawn> spawns;
+  for (int k = 0; k < kMaxBeam; k++) {
+    if (diedAt >= 0 && k - diedAt > kPostDeath) break;
+    const uint64_t hb = mobs.LimbBody(id, headLi);
+    if (!hb) break;
+    const uint32_t n = (k & 1) ? (uint32_t)k * 7919u : 0u;
+    const Vec3 at = mobs.LimbVoxelPos(id, headLi, n);
+    float b = 0.0f;
+    if (mobs.LaserHit(hb, at, b) &&
+        mobs.CarveLimbRadial(hb, at, b > 0.0f ? b : bore, /*ragged=*/false,
+                             /*eject=*/false, c.world, spawns,
+                             DamageCtx(DamageCause::Beam)))
+      bored++;
+    spawns.clear();
+    ticker();
+    beamTicks++;
+    const bool isAlive = mobs.IsAlive(id);
+    if (!isAlive && diedAt < 0) diedAt = k;
+    step = k;
+    sample(isAlive ? alive : dead);
+  }
+  for (int i = 0; i < kSettle; i++) {
+    ticker();
+    step = beamTicks + i;
+    sample(dead);
+  }
+  const float hairEnd = mobs.LimbJointGap(id, t.limb, false);
+  const float neckEnd = mobs.LimbJointGap(id, headLi, false);
+  const bool headOn = mobs.LimbBody(id, headLi) != 0;
+  const bool hairOn = mobs.LimbBody(id, t.limb) != 0;
+  const std::string headName = mobs.Defs()[t.defIndex].limbs[headLi].name;
+  mobs.Reset();
+  c.debris.Reset();
+
+  const float hairMax = (float)BaselineNumber("corpseHairGapMax", 0.05);
+  const float neckMax = (float)BaselineNumber("corpseNeckGapMax", 0.6);
+  const float turnMax = (float)BaselineNumber("corpseHairTurnMax", 0.02);
+  const bool ok = diedAt >= 0 && headOn && hairOn &&
+                  dead.hairArt <= hairMax && dead.hairTurn <= turnMax &&
+                  dead.neckArt <= neckMax;
+  detail = Format(
+      "%s %s on %s: %d beam ticks, %d bored, died at %d, head %s hair %s | "
+      "alive: hair gap art %.3f jolt %.3f, neck art %.3f jolt %.3f, split "
+      "head %.3f hair %.3f, hair turn %.3f | dead: hair gap art %.3f jolt "
+      "%.3f, neck art %.3f jolt %.3f, split head %.3f hair %.3f, hair turn "
+      "%.3f at step %d | end hair %.3f neck %.3f (max hair %.3f neck %.3f "
+      "turn %.3f)",
+      t.defName.c_str(), t.limbName.c_str(), headName.c_str(), beamTicks,
+      bored, diedAt, headOn ? "on" : "OFF", hairOn ? "on" : "OFF",
+      alive.hairArt, alive.hairJolt, alive.neckArt, alive.neckJolt,
+      alive.headSplit, alive.hairSplit, alive.hairTurn, dead.hairArt,
+      dead.hairJolt, dead.neckArt, dead.neckJolt, dead.headSplit,
+      dead.hairSplit, dead.hairTurn, dead.hairAt, hairEnd, neckEnd, hairMax,
+      neckMax, turnMax);
+  std::printf("corpse-head-laser: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -8998,6 +9154,8 @@ const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
       {"hair-rooted", "mob", {}, false, GateHairRooted, /*needsRender=*/false},
+      {"corpse-head-laser", "mob", {}, false, GateCorpseHeadLaser,
+       /*needsRender=*/false},
       {"wound-accumulate", "mob", {}, false, GateWoundAccumulate, false},
       {"wound-heft", "mob", {}, false, GateWoundHeft, false},
       {"wound-bleed", "mob", {}, false, GateWoundBleed, false},

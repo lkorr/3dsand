@@ -13876,7 +13876,8 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
   // thrown rock never hurt the player. Now both are reported on their own
   // list (Physics::OwnedBodyImpacts) and billed through the same rule. The
   // audio list must not grow by them. Pre-W2-K: billed 0.
-  Throw atPlayer;
+  Throw atPlayer, walkedInto;
+  int walkedIntoContacts = 0;
   size_t audioOnPlayer = 0;
   {
     mobs.Reset();
@@ -13935,6 +13936,37 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
         c.phys.RemoveBody(bh);
         atPlayer.ran = true;
       }
+      // ---- H. the player WALKS INTO a resting stone -------------------------
+      // The capsule is teleported onto the player every tick, so it reports
+      // no velocity of its own: the old rule (closing speed minus the limb's
+      // post-step velocity) billed the whole walk as the stone striking the
+      // player. Now only the stone's own pre-impact approach, after a run of
+      // motion, is a blow -- and a stone at rest has neither.
+      const int gy = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+      const IVec3 st0{(int)std::floor(pl.pos.x + Player::kHalfXZ) + 3, gy + 2,
+                      (int)std::floor(pl.pos.z) - 1};
+      const uint64_t rest = c.phys.CreateDebrisBody(vox, st0, density);
+      if (rest != 0) {
+        const uint32_t n0 = mobs.ContactHitsBilled();
+        std::vector<ParticleSpawn> spawns;
+        Vec3 p = pl.pos;
+        // DIRECT PHASE CALLS ON PURPOSE (W2-O): the contact-damage phase alone,
+        // with the capsule driven the way the frame loop drives it.
+        for (int i = 0; i < 40; i++) {
+          p.x += 40.0f * kTickDt;  // 4 m/s, a run
+          c.phys.MovePlayerBody(proxy, p, kTickDt);
+          c.phys.Step(kTickDt);
+          // The arm is vacuous unless the capsule actually met the stone.
+          for (const Physics::ContactImpact& ci : c.phys.OwnedBodyImpacts())
+            if ((ci.bodyA == proxy && ci.bodyB == rest) ||
+                (ci.bodyB == proxy && ci.bodyA == rest))
+              walkedIntoContacts++;
+          mobs.ApplyContactDamage(c.phys, c.world, spawns);
+        }
+        walkedInto.billed = mobs.ContactHitsBilled() - n0;
+        c.phys.RemoveBody(rest);
+        walkedInto.ran = true;
+      }
     }
     mobs.SetAvatar(nullptr);
     av.Despawn();
@@ -13951,6 +13983,15 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
     fail("a 15 m/s stone into the PLAYER was not a blow");
   else if (audioOnPlayer != 0)
     fail("the player's contacts reached the audio list");
+  std::printf("  player runs 4 m/s into a resting stone: %d capsule contacts, "
+              "billed %u (must be 0)\n",
+              walkedIntoContacts, walkedInto.billed);
+  if (!walkedInto.ran)
+    fail("the walked-into-stone fixture did not run");
+  else if (walkedIntoContacts == 0)
+    fail("the walking capsule never met the resting stone");
+  else if (walkedInto.billed != 0)
+    fail("walking into a resting stone hurt the player");
 
   // ---- E. the struck voxel (report) -----------------------------------------
   {

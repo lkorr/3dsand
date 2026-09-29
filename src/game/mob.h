@@ -3846,6 +3846,12 @@ class Mob {
   // name that names nothing). Parentage is by NAME in limbDefs_, which is the
   // only place it exists.
   int ParentLimbIndex(int limbIndex) const;
+  // The joint between base slots `child` and `parent` as the RIG defines it,
+  // for re-making one on a posed rig (RebuildLimbBody; the why is at the impl).
+  Physics::JointDesc RigJointDesc(int child, int parent, Vec3 anchorW) const;
+  // A limp rig's Fixed-jointed hair put back exactly on its head after the
+  // step (PostStep; the why is at the impl).
+  void DriveRootedHair();
   // Where this limb's joint sits in its PARENT's local frame, clamped into the
   // parent's lattice bounding box. Limb-local world voxels, ready for
   // NeckCountAt.
@@ -6920,6 +6926,17 @@ class MobSystem {
   // cross-section needs and LimbVoxelPos cannot give — that one names the nth
   // SURVIVING voxel and therefore walks as the limb is eaten.
   Vec3 LimbAnchorPos(uint64_t mobId, int limbIndex) const;
+  // How far a limb has come away from its PARENT at their joint, in world
+  // voxels: the joint point through the limb's own pose (anchorLimb) against
+  // the same rest point through the parent's (child.anchorRoot -
+  // parent.restOffset), both invariant across carve rebases. `jolt` measures
+  // the two colliders, otherwise the poses the ART is drawn at (MobLimb::xf).
+  // `relQuatOut` (optional, 4 floats) gets the limb's rotation in its parent's
+  // frame, for a caller comparing it over time. -1 when either is gone.
+  float LimbJointGap(uint64_t mobId, int limbIndex, bool jolt,
+                     float* relQuatOut = nullptr) const;
+  // |art pose - collider pose| of one limb, world voxels (-1 if no body).
+  float LimbArtColliderGap(uint64_t mobId, int limbIndex) const;
   // Voxels on the AUTHORITATIVE lattice (skin when there is one), i.e. the
   // lattice LimbVoxelsAtSpawn counted. LimbVoxelCount reports the collider,
   // and mixing the two scales every fraction by (skinScale/physScale)^3.
