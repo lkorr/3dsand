@@ -6628,6 +6628,18 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // it worked, and it cost 40 registers in an fs already at the occupancy cliff
 // (128 -> 168 measured with --shader-stats, slowing cameras with no GI in
 // them). Do not reintroduce per-pixel state to say what a grid already knows.
+// ---- NEAREST BELOW SHADOW_NEAREST_PX, BILINEAR ABOVE (2026-09-28) ----------
+// The bilinear blend reads FOUR patches a pixel, and every patch a pixel reads
+// is one the cache keeps live and the resolve re-casts every
+// SHADOW_REFRESH_PERIOD frames. Where a patch is a few pixels wide the blend
+// buys a 2-4 px softer step inside a value the penumbra window has already
+// graded. What it cost, measured in one process (--render-budget, nearest
+// everywhere vs bilinear above 1 px, `base2` drift under 0.4 ms): noon 0.7,
+// meadow 0.8-1.3, canopy 0.8-1.1, seam 1.1-1.2, fire 1.7-2.4 ms — a fifth of it
+// in the resolve pass, the rest in the fragment shader's four hash lookups.
+// Close up, where a patch is wider than SHADOW_NEAREST_PX, the blend stays:
+// there a patch-square staircase along a shadow edge is plainly visible.
+const SHADOW_NEAREST_PX : f32 = 4.0;
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -6659,7 +6671,7 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
   // it, which only makes the staircase less visible, so face-on is the
   // conservative side.
   let patchPx = R.viewPx / (2.0 * R.tanHalfFov * m * max(camDistFine, 1.0));
-  if (patchPx < 1.0) {
+  if (patchPx < SHADOW_NEAREST_PX) {
     // Nearest: an integer coordinate makes the +1 taps' weights exactly zero,
     // and the loop below skips them.
     u = min(floor(fu * m), m - 1.0);

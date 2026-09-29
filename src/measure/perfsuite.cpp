@@ -2120,6 +2120,13 @@ const RenderArm kExtraArms[] = {
     // machine is +-0.8 ms (2026-09-28), larger than most single levers; an
     // arm pair in one boot is within ~0.1 ms. 0 = shipped; nothing may ship
     // reading a non-zero value.
+    // The baseline AGAIN, last: arms share one world and one set of render
+    // caches (shadow cache, GI cache, openness), so an arm that changes what
+    // those caches hold hands the NEXT arm a different warm state. `base2`
+    // after the experiments says how far the baseline itself drifted.
+    {"base2", "everything on (again, after the other arms)", nullptr, true, 1,
+     "drift: this minus `baseline` is the noise floor of the arms between",
+     false, false, /*anyCamera=*/true},
     {"exp1", "debug.perfExp 0 -> 1",
      [](Tuning& t) { t.debug.perfExp = 1; }, true, 1,
      "whatever experiment 1 in the shaders is — see TUNE_PERF_EXP",
