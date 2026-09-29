@@ -1,0 +1,53 @@
+{
+  "name": "samples/alehouse",
+  "origin": [53,2,36],
+  "size": [108,82,72],
+  "voxelsPerMetre": 10,
+  "materials": {"timber":193,"plank":192,"daub":195,"cobble":196,"flagstone":197,"thatch":194,"door_wood":199,"straw_bed":200},
+  "slots": [
+    {"name":"door_front_0","kind":"door","pos":[58,2,63],"yaw":0,"props":{"leaf":{"min":[54,2,63],"max":[62,21,63]},"hinge":"left","hingeLine":[63,63],"opens":"in","openAngle":95,"wall":"front"}},
+    {"name":"hearth","kind":"marker","pos":[89,2,36],"yaw":90,"props":{"tags":["hearth"]}},
+    {"name":"work_0","kind":"marker","pos":[26,2,53],"yaw":0,"props":{"tags":["work"]}},
+    {"name":"bed_0","kind":"bed","pos":[14,6,18],"yaw":180,"props":{"box":{"min":[10,2,9],"max":[18,5,27]},"level":"ground"}},
+    {"name":"bed_1","kind":"bed","pos":[27,6,18],"yaw":180,"props":{"box":{"min":[23,2,9],"max":[31,5,27]},"level":"ground"}},
+    {"name":"chest_0","kind":"container","pos":[15,2,31],"yaw":0,"props":{"box":{"min":[11,2,29],"max":[18,6,33]},"items":[]}},
+    {"name":"waynode_front_0_in","kind":"waynode","pos":[58,2,54],"yaw":0,"props":{"links":["waynode_front_0_out","waynode_room_1"]}},
+    {"name":"waynode_front_0_out","kind":"waynode","pos":[58,2,73],"yaw":0,"props":{"links":["waynode_front_0_in"]}},
+    {"name":"waynode_partition_0","kind":"waynode","pos":[44,2,16],"yaw":0,"props":{"links":["waynode_room_0","waynode_room_1"]}},
+    {"name":"waynode_room_0","kind":"waynode","pos":[26,2,36],"yaw":0,"props":{"links":["waynode_partition_0"]}},
+    {"name":"waynode_room_1","kind":"waynode","pos":[71,2,36],"yaw":0,"props":{"links":["waynode_front_0_in","waynode_partition_0"]}}
+  ],
+  "generator": {
+    "tool": "housegen",
+    "version": 1,
+    "seed": 7,
+    "params": {
+      "width": 9.5,
+      "depth": 6,
+      "storeys": 1,
+      "storeyHeight": 2.6,
+      "wallStyle": "plank_daub",
+      "plinth": 0.3,
+      "panel": 1.2,
+      "braces": true,
+      "roofShape": "hip",
+      "roofMaterial": "thatch",
+      "pitch": 50,
+      "overhang": 0.6,
+      "chimney": "right",
+      "doorsFront": 1,
+      "doorsBack": 0,
+      "doorsSide": 0,
+      "windows": 3,
+      "sideWindows": 1,
+      "windowStyle": "shutters",
+      "floor": "flagstone",
+      "partitions": 1,
+      "loft": false,
+      "loftLength": 0.5,
+      "beds": 2,
+      "chests": 1
+    }
+  },
+  "handEdited": false
+}

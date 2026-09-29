@@ -18603,6 +18603,135 @@ links, save routes), `--selftest --gate biomes` (the engine's side),
 `check_trees.sh` still pass: the tree editor mounts into a `div#view-trees`
 inside the Environment section, without class `view`.
 
+## 9e. Structures: building blueprints and the house generator (added 2026-09-29)
+
+`docs/PLAN_world_editor.md` §2.2, package P2. A **structure** is a building
+blueprint: voxels plus the places in it where things happen. It is authored in
+the tuner (Environment → Structures), generated as a SCAFFOLD by
+`assets/editor/housegen.js`, and then hand-edited. Placing one in the world
+is P4 (a `structure` ref → the worldgen stamp path); P2 is the format, the
+materials, the generator and the page.
+
+### The files
+
+```
+assets/structures/<name>.vox          the voxels (MagicaVoxel; palette index == engine material id)
+assets/structures/<name>.struct.json  { name, origin, size, voxelsPerMetre, materials, slots, generator, handEdited }
+```
+
+`<name>` may carry one folder (`samples/smithy`). The three committed samples
+(`samples/longhouse`, `samples/smithy`, `samples/alehouse`) are P4's fixtures.
+
+- **The local frame is the .vox's OCCUPIED box**, because that is what
+  `voxload.cpp` rebases a model to. The generator crops to its occupied cells
+  before writing, so every coordinate in the json survives the load. Y up; the
+  front (door) wall faces +Z; a gable ridge runs along X.
+- **`origin`** = `[footprint centre x, GRADE, footprint centre z]`. GRADE is
+  the first row above the ground-floor slab: where your feet are, and where the
+  outside ground should meet the walls. A placing ref's `pos.y` is this row.
+  A 0.2 m footing sits below it so a house on a not-quite-level pad does not
+  float.
+- **`materials`** (an addition to §2.2) maps every material NAME used to the
+  engine id the .vox was written with. `.vox` can only carry ids, and the tree
+  atlas's `i+1` incident is what an id table that nobody checks does; with the
+  names recorded, a loader (P4) or the page can see that `materials.json` was
+  renumbered and remap or refuse by name. The Structures page already warns.
+- **`voxelsPerMetre`** (also an addition): the scale it was generated at,
+  read from `world.h` by the bake exactly as `bake_trees.mjs` does.
+- **`slots`**, one per line: `{ name, kind, pos, yaw, props }`, `pos` a local
+  cell (the FEET row for anything stood at), `yaw` heading degrees (0 = +Z,
+  90 = +X). Kinds are the ref kinds of §2.1:
+  - `door_<wall>_<n>` · `door` — `props.leaf {min,max}` (inclusive cell box,
+    all `door_wood`), `hinge` `left|right` **as seen from outside**, where
+    "right" is heading+90 from the way the viewer faces, `hingeLine [x,z]`
+    (the vertical hinge edge in cell-corner coordinates, on the leaf's inner
+    face — unambiguous whatever "left" means), `opens: "in"`, `openAngle: 95`,
+    `wall`. The hinge is on the side nearer a corner so the open leaf lies back
+    against the wall.
+  - `bed_<n>` · `bed` — `pos` is the first air row over the mattress centre,
+    `yaw` points foot → head, `props.box` the frame, `level` ground/upper/loft.
+  - `chest_<n>` · `container` — `props.box`, `items: []`; `yaw` = the side the
+    lid opens toward.
+  - `hearth` · `marker` `tags: ["hearth"]` — stand here, facing the fire.
+  - `work_<room>` · `marker` `tags: ["work"]` — one per ground room without
+    the hearth.
+  - `waynode_*` · `waynode` — `props.links` by SLOT name (instancing turns
+    them into `<instance>/<slot>` ids): outside and inside every door, each
+    ground room's centre, each partition doorway, the stair foot and head, the
+    upper floor / loft. Symmetric and connected (the gate checks both).
+- **`generator`** `{tool: "housegen", version, seed, params}` records where the
+  scaffold came from; `handEdited: false` until a person edits the .vox.
+
+### Once hand-edited, the .vox is the truth
+
+`handEdited: true` means regenerating may never overwrite it. Three places
+enforce it: the page (Save over a hand-edited structure offers `<name>_v2`),
+`scripts/bake_structure.mjs` (refuses, naming the next free `_vN`), and the
+tuner server (`_structure_guard`: HTTP 409 on a `.vox` write into a
+hand-edited structure, or on a `.struct.json` write that clears the flag;
+`?force=1` is reserved for the in-game editor's own save, P5).
+
+### The generator (`assets/editor/housegen.js`)
+
+Pure, Node-runnable, deterministic from `(params, seed)` with the counter
+hash (keyed by WHAT is decided, never by call order). Every size is authored
+in metres. The schema (`SCHEMA`, 25 rows) is the one list of knobs: footprint
+(width, depth, storeys, storey height), walls (`timber` box frame with daub
+panels set back one voxel / `plank_daub` / `plank` weatherboard / `cobble`
+0.4 m with flagstone quoins; plinth; max panel; braces), roof (gable / hip,
+thatch / tile, pitch snapped to a rise of 2..8 per 4 voxels so the slope steps
+in a regular rhythm, overhang, chimney none/left/right), openings (front /
+back / gable doors, windows per storey, gable windows, shutters or glass),
+interior (floor, 0–2 partitions, loft + length, beds, chests). What it builds,
+in order: footing and slab; four walls with posts on bay lines, sill beam, mid
+rail at sill height (omitted when the plinth leaves under 0.4 m of panel),
+plate, seeded corner braces; door frames with lintels and a threshold, the
+`door_wood` leaf on the inner face; windows with a projecting sill, lintel and
+folded-back plank shutters (glass: a mid-wall pane behind a cross mullion);
+upper slab on 0.5 m joists; loft; plank partitions with framed open doorways;
+gable infill; trusses (tie beam, principal rafters, king post); the covering
+(thatch ~0.4 m with a raised, scalloped ridge roll; tile with course lips,
+ridge tiles, fascia); bargeboards; the chimney stack with cap, open flue,
+fireplace, bressumer and flagstone apron — or an open central hearth; a steep
+open-tread stair on a stringer; then beds and chests placed by a reservation
+map that keeps door swings, the stair, the hearth and doorways clear, with
+1 m of headroom checked against the real voxels. Where the plan does not fit
+(a door behind the stair, a window between two doorways) it degrades in a
+fixed order — the stair and loft give way for the only door, then partitions
+— and says so in `meta.warnings`, which the page prints.
+
+**Windows are open holes with shutters by default** (the plan let P2 choose):
+glass was dear in a hamlet, an open shutter reads at any distance, and it
+keeps the wall light-permeable the way the renderer already handles. `glass`
+is one select away.
+
+### Materials
+
+`plank`, `timber`, `thatch`, `daub`, `cobble`, `flagstone`, `roof_tile`,
+`door_wood`, `straw_bed` (ids 192–200, appended). All static solids. **The far
+palette was already full** (128 owned slots), so every one carries a `far`
+alias to an owning material (wood, bark_dark, dry_tussock, sand, stone,
+bark_light). The flammable ones join the existing burn chain by PRODUCT:
+wood-kind ignite to `ember` (plank/door_wood 12, timber 8, against wood's 12),
+straw-kind to `leaf_burning` (thatch 60, straw_bed 90) so a roof fire takes
+the roof away. That is one ignition rule each in reactions.json — the plan
+asked for "by tag, not new rules", but the compiler takes `self` as a material
+NAME only (`materials.cpp` FindMaterial), and a tag-matching `self` is a C++
+change; no burn behaviour was duplicated. `door_wood` exists so a closed door
+reads as a door and so P6 can tell a leaf from the wall it hangs in.
+
+### Verify
+
+`node scripts/test_housegen.mjs` (62 checks: determinism, every slot contract
+over the presets and an 80-set hashed parameter sweep, the .vox round trip and
+tight crop, struct.json key order and material map, the samples regenerating
+byte-for-byte, the far-palette budget, one ignition rule per flammable,
+hand-edit refusal), `bash scripts/check_structures.sh` (the page in real
+Chrome, no exe: mount, list + badge, disk view, a label per slot, framebuffer,
+one-undo drag, reroll, cutaway, save, both halves of the hand-edit guard;
+`--shot out.png --structure samples/smithy --clean` for a picture), and
+`check_environment.sh` (the page mounts in the shell and deep-links).
+
 ## 10. Networking — the model of record (decided 2026-09-10)
 
 Until 2026-09-10 this section said "both classic models are viable, decide at
@@ -19586,6 +19715,103 @@ its idle counterpart — that a settled pile reports nothing, that a corpse says
 nothing more, that a dry world finds no water. Headless is silent, so the event
 layer is the only thing there is to test, and it is the half that breaks
 quietly.
+
+## 12c. Dialogue — branching conversations (added 2026-09-29; `game/dialogue.*`, `ui/dialogue_ui.*`, PLAN_world_editor P3)
+
+A conversation is a JSON graph in `assets/dialogue/<name>.json`; the file NAME
+is its identity (what a ref's `dialogue` prop, a `met` condition and the dev
+hook name). The full schema is at the top of `src/game/dialogue.h`; the
+human tutorial is `docs/EDITOR_GUIDE.md` §"Writing a conversation".
+
+### Three layers, three owners
+
+| Layer | What | Owner | Saved? |
+|---|---|---|---|
+| Content | `Library` of parsed + validated `Dialogue`s | `dialogue::Store::lib`, reloaded on R | it IS the file |
+| World | flags (`std::map<string,int>`) + the `met` set | `dialogue::Store`, one per world, owned by `main()`, borrowed by `TickAuthorityCtx::talk` | `'DLGF'` v1 in `world.sve` |
+| Player | `Conversation`: file, node, speaker, the visible choice list | `PlayerSession::talk` | no — a save mid-sentence loads with nobody talking |
+
+Flags are WORLD-scoped by design (§2.7 of the plan): a flag Wat sets is the
+flag Osric reads. `met` is keyed by DIALOGUE NAME, not by NPC — one file is one
+person's voice, and it lets an author write `{"met": "osric"}` without knowing
+a ref id. Two NPCs sharing a file share a `met`.
+
+### Every answer is a TickInput
+
+`TickInput::talk` (the old `pad0`, `kTickInputVersion` 5) carries a
+`TalkCommand`: 1..9 = the n-th VISIBLE choice, 10 = continue, 11 = leave. The
+panel (`ui/dialogue_ui.cpp`) only draws a mirror (`UIState::talk`, filled from
+`dialogue::MakeView`) and latches a click; main.cpp puts keys and clicks into
+the feeder; `dialogue::TickSession` — the FIRST thing `TickAuthority` does for
+each session — applies it. The visible list is fixed when a node is ENTERED
+(after the node's own `do`), so the number on the screen and the tick that
+applies it cannot disagree about what "2" meant.
+
+While a conversation is open `TickSession` zeroes the session's command in
+place (keeping `talk`, the selection and the camera basis), so the controller,
+the hands and the op record all see a player standing still. The frame layer
+frees the cursor on the open edge and restores it on the close edge (the
+`captureBeforeUi` rule), hides the HUD, and gates `gameKeys`.
+
+Starting a conversation is `dialogue::Begin(store, session, speaker, name,
+tick)`, called from inside the tick: by P1's use verb, by P7's NPCs, and — the
+one exception — by the Spawn page's dev hook, which queues a
+`BeginRequest` on the session (a UI transaction like `castAtPartQueued`) that
+the next `TickSession` starts. A conversation whose speaker mob dies or leaves
+the world ends on the next tick; `dialogue::IsInConversation(store, mobId)`
+is the question P7's arbiter asks to face the player and hold its schedule.
+
+### Evaluation
+
+Conditions are pure over (store, the player's kit, the minute of the in-game
+day, the speaker): `flag` / `!flag` (+ optional exact `value`), `time`
+(`[from, to)`, wraps midnight; minutes derived from `DayPhaseNow(tick)`, or
+`Store::minuteOverride` in a gate), `activity` (`Store::activity`, a callback
+P7 supplies; unset = false, silently), `has` / `!has` (bag + hotbar; worn gear
+does not count), `met`. Actions: `set` / `add` / `clear` a flag, `give` /
+`take` an item BY NAME through the kit's own merge rule (bag, then hotbar; a
+full pack refuses and counts `stats.refusedGives`), `end`. Nothing writes a
+voxel; the only world state touched is integer flags, so determinism is the
+tick's by construction.
+
+A node whose `if` fails on arrival goes to its `else` (or ends); the chain is
+bounded at 32 hops so an `else` cycle is an authoring error, not a hang.
+
+### Validation — one set of checks, two implementations
+
+`Library::Validate` (C++) and `assets/editor/dialoguelib.js` (the tuner) run
+the same checks and say them the same way — file, node, field, message:
+errors for a dangling goto/else/entry, a duplicate id, an unknown
+condition/action key, an unknown item, a bad time; warnings for an unreachable
+node, a flag written and never read (and read and never written — library-wide,
+because flags are), an unknown activity, a `met` naming no file, more than nine
+choices. A file with an ERROR is skipped at load (the rest load); in the game
+the list is on F1 → Spawn → Dialogue, in the tuner under the graph.
+`scripts/test_dialogue.mjs` pins the JS half (and that every shipped file is
+already in the writer's canonical layout, so a tuner save diffs as the edit).
+
+### Authoring surfaces
+
+- **Tuner → Dialogue tab** (`assets/editor/dialogue.js`): file list, node list,
+  a graph (columns by distance from the entries; numbered choice edges, `>` for
+  continue, dashed red for else), inline editing with dropdowns for known
+  flags / items / activities / dialogue names, add node / choice, jump to a
+  target, validation, Save (Ctrl+S) through `/api/dialogue`.
+- **In game**: R reloads (flags kept); F1 → Spawn → Dialogue lists the files,
+  talks to the nearest creature or to nobody, clears flags + met, and shows the
+  problems.
+- A command-layer twin (`dialogue.set_line`, plan §2.3) waits for P5's
+  `editor/commands.h`; the tuner writes the files directly until then.
+
+### Verify
+
+`--gate dialogue-graph` (the sample walked through `TickAuthority` with
+answers on `TickInput::talk`; exact flag/item/met end state, entry precedence,
+the day/night `else`, the activity hook, a refused Esc, a vanished speaker, a
+talking player who does not walk) and `--gate dialogue-save` (a real
+SaveWorld/LoadWorld round trip of 'DLGF', its refusals, and a save without the
+section loading a world where nobody has been met). The panel's look:
+`--shot-dialogue` → `screenshot_dialogue.bmp` + `screenshot_dialogue_2.bmp`.
 
 ## 13. Roadmap
 

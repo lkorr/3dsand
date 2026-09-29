@@ -76,6 +76,7 @@
 #include "game/caster.h"
 #include "game/container.h"
 #include "game/corpses.h"
+#include "game/dialogue.h"
 #include "game/equipment.h"
 #include "game/grab.h"
 #include "game/item.h"
@@ -521,6 +522,14 @@ struct PlayerSession {
   // specific rig part, a UI transaction rather than a player command, and it
   // has no meaning on a remote peer.
   int castAtPartQueued = -1;
+  // ---- CONVERSATION (game/dialogue.h, PLAN_world_editor P3) ----
+  // Who this player is talking to and where in the graph they are. Not saved:
+  // a save taken mid-sentence loads with nobody talking. `talkBegin` is the
+  // dev hook's queued start (the Spawn page's "talk" button) — a UI
+  // transaction like castAtPartQueued, started by the next tick; the use
+  // verb (P1) and NPCs (P7) call dialogue::Begin from inside the tick.
+  dialogue::Conversation talk;
+  dialogue::BeginRequest talkBegin;
   // ...and with a filled VESSEL chosen on the character screen's FLASKS row
   // the portrait is a BRUSH instead (game/container.h, MobSystem::PourOnBody):
   // while the button is held, the world ray main.cpp built from the portrait
@@ -1005,6 +1014,15 @@ struct TickAuthorityCtx {
   // the harness map's refs are gate fixtures, and a gate that did not ask for
   // them must not find an NPC standing in its world.
   refs::RefStore* refs = nullptr;
+
+  // ---- H4. CONVERSATIONS (game/dialogue.h), owned by main().
+  //
+  // The world-scoped dialogue store: the loaded conversations, the flags and
+  // the met set. When non-null, the tick's first act for each session is
+  // dialogue::TickSession (start a queued talk, apply TickInput::talk, and
+  // hold a talking player still). Null in every harness that does not bind
+  // it, and then nothing about the tick changes.
+  dialogue::Store* talk = nullptr;
 
   // ---- I. THE TWO-PROCESS SMOKE'S DELIBERATE DIVERGENCE (M9.3-C).
   //

@@ -5290,6 +5290,13 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
     if (!p.s->localView && !p.s->sink)
       p.s->sink = std::make_unique<PresentationSink>();
 
+  // CONVERSATIONS FIRST (game/dialogue.h): a choice carried by this tick's
+  // command is applied, and a talking player's command is zeroed in place
+  // before anything below reads it — so the controller, the hands and the op
+  // record all see a player standing still.
+  if (w.talk)
+    for (SessionTick& p : players)
+      dialogue::TickSession(*w.talk, *p.s, p.ti, tick, &w.mobs);
   for (SessionTick& p : players) ResolveHands(w, p);
   for (size_t i = 0; i < players.size(); i++)
     PhaseA(w, ws, players[i], scratch[i], tick, out);

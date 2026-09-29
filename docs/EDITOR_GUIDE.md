@@ -27,6 +27,7 @@ value, alt-tab, press a key.
 | Reactions | `reactions.json` — tag-driven interactions | `R` in game |
 | Tuning | `tuning.json` — 160+ look/feel/sim knobs | `F5` in game |
 | **Models** | `.vox` art + mob sidecar JSONs | restart / respawn the mob |
+| **Dialogue** | `assets/dialogue/*.json` — conversations (§9) | `R` in game |
 
 Ctrl+S saves whichever tab you're on (on Models it saves the model, not the
 JSONs).
@@ -473,7 +474,109 @@ viewport. It stops at 200px, and never shrinks the viewport below 220px.
 
 ---
 
-## 9. References — the placed things in a map (in game: F1 → World → References)
+## 9. Writing a conversation (the Dialogue tab)
+
+A conversation is one file, `assets/dialogue/<name>.json`. The file's NAME is
+what everything calls it: an NPC's `dialogue` property, a `met` condition, the
+in-game picker. The worked example is `sample_stranger.json` — open it first;
+it uses every condition and every action there is.
+
+### The loop
+
+1. Tuner → **Dialogue** tab. Pick a file on the left, or **+ new file**.
+2. Edit (below). The list under the graph shows problems as you type.
+3. **Save** (Ctrl+S). The file is written in a tidy one-line-per-choice
+   layout, so `git diff` shows exactly what you changed.
+4. In the game press **R** — conversations reload with the materials; the
+   world's flags are kept.
+5. F1 → **Spawn** → **Dialogue**: pick the file, then **talk to nearest
+   creature** (anything alive within 12 m speaks the lines — it does not have
+   to be a person) or **talk (no speaker)** to read it through with nobody
+   there. **forget flags + met** puts the world back to "never spoken to
+   anyone" so you can try it from the start. The same section lists any
+   problems with the files, in red (errors) and amber (warnings).
+
+In a conversation: **1-9** or a click picks a choice, **Space/Enter** is
+[continue], **Esc** leaves (unless that line says you may not). You cannot
+walk while talking.
+
+### How a conversation is put together
+
+- **Nodes** are lines. Each has an **id** (unique in the file), the **text**
+  the speaker says, and usually some **choices** — what the player can answer.
+- A **choice** has its text and **leads to** a node. "(end the conversation)"
+  is also a destination.
+- A node with no choice showing gets **[continue]**, which goes where the
+  node's own **"With no choice showing, [continue] goes to"** says — or ends.
+- **Entries** (the file settings, the ⚙ item at the top of the node list)
+  decide where a conversation STARTS: the first entry whose conditions hold
+  wins, so put the special cases first and a plain "start at hello" last.
+- The **speaker** name in the header comes from the node, else the file.
+
+### Conditions ("only if")
+
+A condition row is a dropdown and a value. A choice with conditions is HIDDEN
+unless all of them hold; an entry is skipped; a node you arrive at goes to its
+**otherwise go to** node instead (or ends).
+
+| Condition | Holds when |
+|---|---|
+| `flag` x | flag x is set (non-zero). Put a number after `=` to need exactly that value |
+| `!flag` x | flag x is not set |
+| `time` from–to | the in-game clock is in that range (wraps midnight: 20:00–05:00 is night) |
+| `activity` / `!activity` | the speaker's current schedule row is (not) that activity — sleep, work, wander, socialize, eat, goto. Until NPC schedules exist this is always false |
+| `has` / `!has` item | the player's pack or hotbar holds (at least N of) that item. Worn gear does not count |
+| `met` (this conversation) | the player has finished this conversation before |
+| `met` other_name | the player has finished THAT conversation before — how Agnes knows you spoke to Osric |
+
+### Actions ("do")
+
+Run in order, on arriving at a node or on picking a choice (before it moves on).
+
+| Action | Does |
+|---|---|
+| `set` x = n | flag x becomes n (default 1) |
+| `add` x + n | flag x goes up by n (count visits, favours owed) |
+| `clear` x | flag x is unset |
+| `give` item × n | into the player's pack (the bag, then the hotbar; a full pack refuses) |
+| `take` item × n | out of the pack/hotbar (guard the choice with `has` so it cannot fail) |
+| `end` | the conversation ends after this |
+
+**Flags are world-wide.** A flag set in Wat's conversation is the same flag
+Osric's reads. That is how two NPCs talk about you: Wat's choice does `set
+wat_asked`, and Osric's reply has a choice shown only if `flag wat_asked`.
+Flags and who you have met are saved with the world (F9).
+
+### The graph
+
+Boxes are nodes, in columns by how many steps they are from the start. Blue
+numbered arrows are choices, grey `>` is [continue], dashed red is "otherwise".
+Faint arrows go back to an earlier node (most conversations return to a
+question hub like `ask`). A dashed box is a node nothing leads to. Drag to pan,
+wheel to zoom, **Fit graph** to see everything, click a box to edit it. The
+**→** buttons beside a "leads to" jump to that node.
+
+### What the checks mean
+
+| Message | Fix |
+|---|---|
+| `goes to 'x', which is not a node in this file` | a typo in a destination, or a node you deleted |
+| `cannot be reached from any entry` | nothing leads there; link it or delete it |
+| `flag 'x' is set ... but no condition reads it` | usually a typo in one of the two spellings |
+| `flag 'x' is read ... but nothing sets it` | same, from the other side |
+| `'x' is not an item` | item names are the ones in the Items tab |
+| `unknown condition` / `unknown action` | a typo in the key if you edited the JSON by hand |
+
+A file with an **error** is skipped by the game (every other file still
+loads). Warnings load.
+
+### Editing the JSON by hand
+
+It is plain text; a text editor and R work fine. Keep one choice per line.
+The full schema, with every key, is at the top of `src/game/dialogue.h`.
+`node scripts/test_dialogue.mjs` checks every file the way the tab does.
+
+## 10. References — the placed things in a map (in game: F1 → World → References)
 
 A **reference** ("ref") is one thing you placed on purpose: a villager, a well,
 later a house, a door, a chest. Each has an **id** like `harrowby/osric` that
@@ -491,7 +594,7 @@ same file.
 | Field | Means |
 |---|---|
 | `id` | `group/name`, lowercase letters, digits, `_` and `-` only |
-| `kind` | what sort of thing: `marker`, `npc`, `door`, `container`, `bed` (§9.1; more arrive: `structure`, `waynode`) |
+| `kind` | what sort of thing: `marker`, `npc`, `door`, `container`, `bed` (§10.1; more arrive: `structure`, `waynode`) |
 | `base` | what it's an instance of — for an `npc`, the mob def (`human`, `dummy`, ...) |
 | `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells |
 | `yaw` | facing in degrees: 0 faces +Z, 90 faces +X |
@@ -549,7 +652,7 @@ emptied). So:
 - The harness map's `refs/fixture.json` is for the automated tests only; the
   game never loads it.
 
-### 9.1 Doors, chests and beds
+### 10.1 Doors, chests and beds
 
 These are three more kinds of ref. The door, chest and bed themselves are
 **voxels you built** (in the world, or later in a house's structure file); the
@@ -622,3 +725,96 @@ down on it.
 
 A door left open saves as open (with its exact voxels) and comes back open; a
 chest saves what's in it now; a bed saves nothing.
+
+## 11. Buildings — the Structures page
+
+A **structure** is a building blueprint: `assets/structures/<name>.vox` (the
+voxels) plus `<name>.struct.json` (where the doors, beds, chests, hearth and
+walking nodes are). You make one from the house generator, then hand-edit it.
+Open **Environment → Structures** (sidebar, under Components).
+
+### How do I make a new house?
+
+1. Pick a starting point in **new from…** (cottage, longhouse, smithy,
+   alehouse, townhouse).
+2. Move the sliders. Every row has a tooltip saying what it does. The preview
+   regenerates as you drag; the stats line under it says how many voxels,
+   rooms, doors, windows, beds and chests you got, and prints a warning in
+   orange if something you asked for did not fit (a window between two doors,
+   a bed with no headroom, a stair in a house too narrow for it).
+3. Not keen on the small choices (which way the corner braces run, where the
+   beds went)? Press **Reroll** — a new seed, same house. Type a seed to get a
+   particular one back.
+4. **Save as…** and give it a lowercase name (`harrowby_smithy`, or
+   `samples/barn` to put it in a folder). Two files appear in
+   `assets/structures/`.
+
+Undo/redo is `Ctrl+Z` / `Ctrl+Shift+Z` (or the ↶ ↷ buttons); a whole slider
+drag is one undo step.
+
+### How do I see inside?
+
+The **view** select: *roof off*, *ground floor*, *upper / loft*. It only cuts
+the preview — the saved house is never cut. Clicking a row in the slot table
+selects that slot, points the camera at it and cuts the roof away for you if
+it is inside.
+
+### What are the coloured markers and labels?
+
+Slots. Toggle them with the **slots** / **labels** boxes; the legend is in
+the view bar.
+
+| Colour | Slot | What it is for |
+|---|---|---|
+| orange | `door_front_0`, `door_back_0`, `door_left_0` … | the door leaf (box) and its hinge (red line). Doors open inward. |
+| blue | `bed_0` … | where a sleeper lies; the tick points foot → head |
+| yellow | `chest_0` … | a container; contents are added later (References page) |
+| green | `hearth`, `work_1` … | where someone stands to cook / work, facing the tick |
+| cyan | `waynode_*` | walking points NPCs route through; the lines are the links |
+
+### How do I change an existing house?
+
+Click it in the list (or pick it in the **structure** dropdown). You first see
+the file **on disk**. Move any slider and the preview switches to the
+**generated** scaffold; **Save** writes it back.
+
+Houses marked **hand-edited** (orange badge) are different: someone edited
+the voxels, so the `.vox` is now the real house and the generator must not
+overwrite it. Save on one of those offers `<name>_v2` instead, and the tuner
+refuses a direct overwrite too. To regenerate a hand-edited house for real,
+delete its two files yourself.
+
+### How do I make one from a terminal?
+
+```bash
+node scripts/bake_structure.mjs harrowby_smithy --preset smithy --seed 12
+node scripts/bake_structure.mjs harrowby_smithy                    # re-bake from its own settings
+node scripts/bake_structure.mjs my_house params.json               # {"seed": 3, "params": {...}}
+node scripts/bake_structure.mjs --samples                          # rebuild the three samples
+```
+
+Same generator as the page, same bytes. It never overwrites a hand-edited
+structure.
+
+### Where do the materials come from?
+
+Nine building materials in `materials.json` (Materials tab): `timber` (dark
+beams), `plank` (boards), `daub` (pale plaster panels), `cobble` (rubble
+stone), `flagstone` (floors, hearths, quoins), `roof_tile`, `thatch`,
+`door_wood` (only ever a door leaf), `straw_bed`. Wood, thatch and straw
+burn; stone, daub and tile do not. Change a colour there and press `R` in
+game.
+
+### Troubleshooting
+
+- **A window / bed / door I asked for is missing** — read the orange warning
+  in the stats line; it names what did not fit and why. Usually: widen the
+  house, or ask for fewer.
+- **"materials.json renumbered since this was written"** — the house's `.vox`
+  stores material numbers; someone inserted a material instead of appending.
+  Re-bake it (`bake_structure.mjs <name>`), or if it is hand-edited, fix the
+  materials list.
+- **Save is refused with "HAND-EDITED"** — working as intended; save under a
+  new name.
+- **Check the page works:** `bash scripts/check_structures.sh`; a picture:
+  `bash scripts/check_structures.sh --shot out.png --structure samples/smithy --clean`.

@@ -10,6 +10,10 @@
 #include "phys/debris.h"
 #include "sim/worldio.h"
 
+namespace dialogue {
+class Store;
+}
+
 // The ONE place the entity systems register into the save format
 // (sim/worldio.h entities.sve). Both the frame loop and the selftest build
 // their EntityIO here, so a system added in one place is persistable in both —
@@ -166,7 +170,7 @@ constexpr uint32_t kMobGlobalSaveVersion = 1;
 constexpr uint32_t kWorldTimeSaveVersion = 1;
 
 // WHICH FILE EACH SECTION LIVES IN (S4, sim/worldio.h layout):
-//   world.sve          DBRS, MOBG, TIME, WTRB
+//   world.sve          DBRS, MOBG, TIME, WTRB, DLGF
 //   players/<id>.svp   AVTR, PLYR
 //   r_x_y_z.sve        MOBS, ITMS -- one record per creature / item
 // Every section keeps its whole-payload save/load, so a pre-S4 entities.sve
@@ -180,11 +184,16 @@ constexpr uint32_t kWorldTimeSaveVersion = 1;
 namespace refs {
 class RefStore;
 }
+// 'DLGF' v1 (world.sve, GLOBAL): the dialogue store's FLAGS and MET set
+// (game/dialogue.h). Registered only when `talk` is given; its reset clears
+// both, so a save without the section loads a world where nobody has been
+// spoken to. The conversations themselves are content and are not saved.
 EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar,
                       const PlayerKitRefs* player = nullptr,
                       const WorldItemRefs* ground = nullptr,
-                      refs::RefStore* refStore = nullptr);
+                      refs::RefStore* refStore = nullptr,
+                      dialogue::Store* talk = nullptr);
 
 // THE SKY AFTER A LOAD, when the sim clock could not follow the save.
 //

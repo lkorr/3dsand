@@ -15,7 +15,10 @@
  *                the feature stacks (cover, trees, water, caves) and a
  *                composed swatch
  *   COMPONENTS   the libraries the stacks pick from: Trees (the existing
- *                editor, unchanged, mounted here) and Water bodies
+ *                editor, unchanged, mounted here) and Water bodies; and
+ *                Structures (building blueprints: housegen.js scaffolds +
+ *                slots, PLAN_world_editor P2), which no biome picks from --
+ *                a structure is placed by a `structure` ref (P4)
  *
  * — and the pages link to each other: a biome's tree row has "edit species →",
  * a water row has "edit preset →", and the band strip on the climate section
@@ -34,6 +37,7 @@
 
 import * as Trees from './trees.js';
 import * as Water from './water.js';
+import * as Structures from './structures.js';
 import * as Biome from './biome.js';
 import * as WorldMap from './map.js';
 import * as Link from './envlink.js';
@@ -46,8 +50,8 @@ let dirtyBy = {};
 let els = {};
 let envActive = false;
 
-const PAGE_ORDER = ['map', 'biome', 'trees', 'water'];
-const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies'};
+const PAGE_ORDER = ['map', 'biome', 'trees', 'water', 'structures'];
+const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies', structures: 'Structures'};
 
 const CSS = `
 #view-environment.active{display:flex;gap:10px;height:calc(100vh - 150px);min-height:520px}
@@ -91,7 +95,8 @@ function showPage(id) {
 }
 
 function apiOf(id) {
-  return id === 'trees' ? Trees : id === 'water' ? Water : id === 'biome' ? Biome : id === 'map' ? WorldMap : null;
+  return id === 'trees' ? Trees : id === 'water' ? Water : id === 'biome' ? Biome : id === 'map' ? WorldMap :
+         id === 'structures' ? Structures : null;
 }
 
 /** Deep link from a page: open a biome / species / preset by name. */
@@ -101,6 +106,7 @@ async function openPage(id, name) {
     if (id === 'biome' && name) { await Biome.open(name); paintNav(); }
     else if (id === 'water' && name) await Water.open(name);
     else if (id === 'trees' && name && Trees.open) await Trees.open(name);
+    else if (id === 'structures' && name) await Structures.open(name);
   } catch (e) { H.toast('could not open ' + id + '/' + name + ': ' + (e && e.message || e), true); }
 }
 
@@ -160,7 +166,7 @@ async function paintNav() {
   nav.append(add);
 
   nav.append(el('h4', {}, 'Components'));
-  for (const id of ['trees', 'water']) {
+  for (const id of ['trees', 'water', 'structures']) {
     const b = el('button', {'data-page': id, class: current === id ? 'on' : ''},
                  el('span', {}, PAGE_LABEL[id]),
                  el('span', {class: 'pill' + (dirtyBy[id] ? ' dirty' : '')},
@@ -273,6 +279,7 @@ export function attach(hooks) {
 
   Trees.attach(shared('trees'));
   Water.attach(shared('water'));
+  Structures.attach(shared('structures'));
   Biome.attach(shared('biome'));
   WorldMap.attach(shared('map'));
   paintNav();
@@ -308,4 +315,4 @@ export function refreshGameBar() { paintGameBar(); }
 export function _pages() { return pages; }
 export function _current() { return current; }
 export function _open(id, name) { return openPage(id, name); }
-export const _modules = {Trees, Water, Biome, WorldMap};
+export const _modules = {Trees, Water, Biome, WorldMap, Structures};

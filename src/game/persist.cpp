@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 
+#include "game/dialogue.h"
 #include "sim/mattable.h"
 #include "sim/waterbody.h"
 #include "world/refs_game.h"
@@ -741,7 +742,8 @@ void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t v
 
 EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar, const PlayerKitRefs* player,
-                      const WorldItemRefs* ground, refs::RefStore* refStore) {
+                      const WorldItemRefs* ground, refs::RefStore* refStore,
+                      dialogue::Store* talk) {
   EntityIO io;
   io.sections.push_back(EntitySection{
       FourCC('D', 'B', 'R', 'S'), DebrisSystem::kSaveVersion,
@@ -899,6 +901,21 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                                                           : RecordLoad::Dropped;
     };
     io.sections.push_back(std::move(itms));
+  }
+  // ---- 'DLGF': the dialogue flags + met set, GLOBAL (PLAN_world_editor P3) --
+  //
+  // World-scoped by design (§2.7): a flag Wat sets is one Osric reads, and
+  // "has the stranger spoken to Agnes" is a fact about the world, not about
+  // whichever file a player's kit is in. Reset clears both, so a save without
+  // the section loads a world where nobody has been spoken to.
+  if (talk) {
+    io.sections.push_back(EntitySection{
+        FourCC('D', 'L', 'G', 'F'), dialogue::Store::kSaveVersion,
+        [talk] { talk->ResetState(); },
+        [talk](std::vector<uint8_t>& out) { talk->SaveState(out); },
+        [talk](const uint8_t* d, size_t n, uint32_t v) {
+          return talk->LoadState(d, n, v);
+        }});
   }
   // ---- 'TIME': the celestial clock, GLOBAL (S4) ------------------------------
   //

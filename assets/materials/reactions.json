@@ -1387,6 +1387,59 @@
       }
     },
     {
+      "note": "-------- BUILDING MATERIALS (PLAN_world_editor P2) --------\nOne ignition rule each, and NOTHING else: the burn itself is the product's. Wood-kind (plank, door_wood, timber) ignite to `ember` exactly as `wood` does, so a burning house smoulders, drops ash and is doused by water on ember's own rules (a doused ember reverts to `wood`, which is what a charred board is). Straw-kind (thatch, straw_bed) ignite to `leaf_burning`, the stationary flame foliage uses, which burns to nothing: a thatched roof fire takes the roof away rather than leaving a straw-coloured ghost of it. Chances sit against wood's 12: boards and a door leaf 12, heavy timber 8 (a 0.2 m beam), thatch 60 and a straw tick 90 (dry straw catches from a spark, still well under green leaves' 133 so a roof takes a moment). Daub, cobble, flagstone and roof_tile have no rule: they do not burn. (A tag rule would be the tidier spelling, but the compiler takes `self` as a material NAME only -- sim/materials.cpp FindMaterial -- and that is C++.)"
+    },
+    {
+      "self": "plank",
+      "neighbor": "tag:hot",
+      "chance": 12,
+      "rainDamped": true,
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "door_wood",
+      "neighbor": "tag:hot",
+      "chance": 12,
+      "rainDamped": true,
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "timber",
+      "neighbor": "tag:hot",
+      "chance": 8,
+      "rainDamped": true,
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "thatch",
+      "neighbor": "tag:hot",
+      "chance": 60,
+      "rainDamped": true,
+      "selfBecomes": "leaf_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "straw_bed",
+      "neighbor": "tag:hot",
+      "chance": 90,
+      "rainDamped": true,
+      "selfBecomes": "leaf_burning",
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
       "note": "ANATOMY. `flesh` and `muscle` are the interior layers the human's anatomy recipe bakes under its skin (assets/editor/anatomy.js). They enter the skin's burn chain at the same chance, on the same entry rule, so once fire has charred the skin off a limb the layer it exposes cooks on the same clock rather than sitting there pink and inert. Bone deliberately has NO rule here -- see the note above the flesh_cooked chain."
     },
     {

@@ -1,0 +1,202 @@
+<!doctype html>
+<!-- Headless harness for Environment -> Structures (PLAN_world_editor P2).
+     Loaded by scripts/check_structures.sh through Chrome; prints PASS/FAIL
+     lines into #out for --dump-dom.
+
+     WHAT IT COVERS THAT `node scripts/test_housegen.mjs` DOES NOT: the PAGE.
+     That it mounts, lists the structures on disk with their hand-edited
+     badge, opens a sample from disk (the .vox, not a regenerate), draws a
+     label for every slot, reaches the framebuffer, regenerates on a slider
+     drag as ONE undo step, rerolls the seed, cuts the roof away, saves a new
+     structure through /api/model, and that the hand-edit guard holds on BOTH
+     sides (the page redirects to <name>_v2; the server refuses a raw write).
+
+     NEEDS NO BUILT EXE. `?shot=<structure>&view=<whole|noroof|ground|upper>`
+     skips the checks and just frames one structure for a screenshot. -->
+<meta charset="utf-8">
+<title>structures harness</title>
+<body style="background:#111;color:#ddd;font:12px monospace;margin:0">
+<div id="host" style="width:1280px;height:760px;display:flex"></div>
+<pre id="out">running</pre>
+<script src="worldview.js"></script>
+<script type="module">
+var log = [], fail = 0;
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; document.getElementById('out').textContent = 'running' + String.fromCharCode(10) + log.join(String.fromCharCode(10)); }
+function done(){
+  document.getElementById('out').textContent = log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
+  document.title = fail ? 'FAIL' : 'OK';
+}
+async function waitFor(pred, ms){
+  var t0 = performance.now();
+  while (performance.now() - t0 < (ms || 40000)) {
+    try { if (pred()) return true; } catch (e) {}
+    await fetch('/api/status').catch(function(){});
+  }
+  return false;
+}
+function readLit(wv, cv){
+  wv.render();
+  var px = new Uint8Array(cv.width * cv.height * 4);
+  wv.gl.readPixels(0, 0, cv.width, cv.height, wv.gl.RGBA, wv.gl.UNSIGNED_BYTE, px);
+  var lit = 0;
+  for (var i = 0; i < px.length; i += 4) if (px[i] > 26 || px[i+1] > 30 || px[i+2] > 36) lit++;
+  return {lit: lit, tot: px.length / 4, quads: wv.stats.quads};
+}
+var q = new URLSearchParams(location.search);
+var live = true;
+
+(async function(){
+  try {
+    var files = await (await fetch('/api/files', {cache: 'no-store'})).json();
+    var mats = JSON.parse(files.materials).materials;
+    var toasts = [];
+    var host = document.getElementById('host');
+    host.className = 'envpage active';
+    var hooks = {
+      el: function (tag, attrs) {
+        var e = document.createElement(tag);
+        for (var k in (attrs || {})) {
+          if (k === 'class') e.className = attrs[k];
+          else if (attrs[k] !== false && attrs[k] != null) e.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
+        }
+        for (var i = 2; i < arguments.length; i++) {
+          var c = arguments[i];
+          if (c == null) continue;
+          e.append(c.nodeType ? c : document.createTextNode(String(c)));
+        }
+        return e;
+      },
+      toast: function (m, bad) { toasts.push((bad ? 'ERR ' : '') + m); },
+      materials: function () { return mats; },
+      onDirty: function () {},
+      section: host,
+      // Flipped off when the harness is finished: a render loop left running
+      // makes --virtual-time-budget advance one SwiftShader frame at a time,
+      // and a shot that never goes idle never ends.
+      isVisible: function () { return live; },
+      voxelsPerMetre: function () { return 10; }
+    };
+    var S = await import('./editor/structures.js');
+    S.attach(hooks);
+    var root = document.getElementById('env-structures');
+    root.classList.add('active');
+
+    if (q.get('shot')) {
+      await S.open(q.get('shot'));
+      await waitFor(function(){ return S._slots().length > 0; }, 20000);
+      var sel = root.querySelector('select[title^="Cut the preview"]');
+      sel.value = q.get('view') || 'whole'; sel.dispatchEvent(new Event('change'));
+      var wv0 = S._view();
+      if (q.get('yaw')) wv0.cam.yaw = parseFloat(q.get('yaw'));
+      if (q.get('pitch')) wv0.cam.pitch = parseFloat(q.get('pitch'));
+      if (q.get('dist')) wv0.cam.dist *= parseFloat(q.get('dist'));
+      if (q.get('labels') === '0') { root.querySelector('.sgshowlabels').checked = false; }
+      if (q.get('slots') === '0') { var c0 = root.querySelector('.sgshowslots'); c0.checked = false; c0.dispatchEvent(new Event('change')); }
+      if (q.get('big')) { root.querySelector('.sgleft').style.display = 'none'; }
+      await waitFor(function(){ return readLit(wv0, root.querySelector('canvas.sgview')).quads > 100; }, 30000);
+      readLit(wv0, root.querySelector('canvas.sgview'));
+      if (q.get('labels') !== '0') await new Promise(function (r) { requestAnimationFrame(function () { requestAnimationFrame(r); }); });
+      live = false;
+      document.getElementById('out').textContent = 'RESULT OK (shot ' + q.get('shot') + ')';
+      return;
+    }
+
+    // ---- 1. mount + list ----------------------------------------------------------
+    say(!!root && !!root.querySelector('canvas.sgview'), 'page mounted with a canvas');
+    say(root.querySelectorAll('.sgsec').length === 5, 'five parameter sections (' + root.querySelectorAll('.sgsec').length + ')');
+    S.activate();
+    var ok = await waitFor(function(){ return S._list().length >= 3 && S._mode() === 'disk'; }, 30000);
+    say(ok, 'lists ' + S._list().length + ' structures and opened ' + S.currentName() + ' from disk');
+    say(S._list().filter(function (s) { return /^samples\//.test(s.name); }).length === 3, 'the three samples are listed');
+    say(/ON DISK/.test(root.querySelector('.sgstats').textContent), 'stats say ON DISK: ' + root.querySelector('.sgstats').textContent.slice(0, 90));
+
+    // ---- 2. slots drawn and labelled ---------------------------------------------
+    var slots = S._slots();
+    say(slots.length >= 10, 'the open sample carries ' + slots.length + ' slots');
+    var rows = root.querySelectorAll('.sgslotrow').length;
+    say(rows === slots.length, 'slot table lists every slot (' + rows + ')');
+    await waitFor(function(){ return [].slice.call(root.querySelectorAll('.sglabel')).filter(function (d) { return d.style.display === 'block'; }).length > 0; }, 20000);
+    var labels = [].slice.call(root.querySelectorAll('.sglabel'));
+    var vis = labels.filter(function (d) { return d.style.display === 'block'; }).length;
+    say(labels.length === slots.length && vis >= slots.length * 0.5, 'a label per slot, ' + vis + ' of ' + labels.length + ' on screen');
+    say(labels.some(function (d) { return /^door_/.test(d.textContent); }) && labels.some(function (d) { return /^bed_/.test(d.textContent); }), 'door and bed labels present');
+    var wv = S._view(), cv = root.querySelector('canvas.sgview');
+    var lb = null;
+    ok = await waitFor(function(){ lb = readLit(wv, cv); return lb.quads > 1000 && lb.lit > lb.tot * 0.05; }, 30000);
+    say(ok, 'the house reaches the framebuffer: ' + (lb && lb.quads.toLocaleString()) + ' quads, ' + (lb && (100 * lb.lit / lb.tot).toFixed(1)) + '% lit');
+    // click a slot row: selected, camera re-targeted, roof cut away for an inside slot
+    var bedRow = [].slice.call(root.querySelectorAll('.sgslotrow')).filter(function (r) { return /^bed_/.test(r.firstChild.textContent); })[0];
+    bedRow.click();
+    say(root.querySelector('.sgslotrow.sel') && root.querySelector('select[title^="Cut the preview"]').value !== 'whole', 'clicking a bed row selects it and cuts the view away (' + root.querySelector('select[title^="Cut the preview"]').value + ')');
+
+    // ---- 3. regenerate: slider drag = one undo step --------------------------------
+    var d0 = S._undoDepth();
+    var widthRow = [].slice.call(root.querySelectorAll('.sgrow')).filter(function (r) { return r.querySelector('label').textContent === 'width (m)'; })[0];
+    var rng = widthRow.querySelector('.sgrng');
+    var w0 = S._params().width;
+    for (var i = 0; i < 5; i++) { rng.value = String(parseFloat(rng.value) + 0.1); rng.dispatchEvent(new Event('input', {bubbles: true})); }
+    ok = await waitFor(function(){ return S._mode() === 'generated' && S._last() && Math.abs(S._last().params.width - (w0 + 0.5)) < 1e-6; }, 20000);
+    say(ok, 'a five-step width drag regenerated (' + w0 + ' -> ' + (S._last() && S._last().params.width) + ' m), mode ' + S._mode());
+    say(S._undoDepth() === d0 + 1, 'and cost exactly one undo step (' + (S._undoDepth() - d0) + ')');
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true}));
+    ok = await waitFor(function(){ return Math.abs(S._params().width - w0) < 1e-6; }, 10000);
+    say(ok, 'Ctrl+Z put the width back (' + S._params().width + ')');
+    var seed0 = parseInt(root.querySelector('input[type=number][max="99999"]').value, 10);
+    [].slice.call(root.querySelectorAll('button')).filter(function (b) { return b.textContent === 'Reroll'; })[0].click();
+    var seed1 = parseInt(root.querySelector('input[type=number][max="99999"]').value, 10);
+    say(seed1 !== seed0 && S._last().seed === seed1, 'Reroll picked a new seed (' + seed0 + ' -> ' + seed1 + ') and regenerated');
+
+    // ---- 4. cutaway ---------------------------------------------------------------
+    var sel = root.querySelector('select[title^="Cut the preview"]');
+    sel.value = 'whole'; sel.dispatchEvent(new Event('change'));
+    var qWhole = 0;
+    await waitFor(function(){ qWhole = readLit(wv, cv).quads; return qWhole > 1000; }, 20000);
+    sel.value = 'ground'; sel.dispatchEvent(new Event('change'));
+    ok = await waitFor(function(){ var r = readLit(wv, cv); return r.quads > 0 && r.quads !== qWhole; }, 20000);
+    say(ok, 'the ground-floor cutaway re-meshes a different house (' + qWhole + ' quads whole)');
+
+    // ---- 5. save a new structure, then the hand-edit guard --------------------------
+    await S._save('_harness');
+    ok = await waitFor(function(){ return S.currentName() === '_harness' && S._list().some(function (s) { return s.name === '_harness'; }); }, 20000);
+    say(ok, 'Save as _harness wrote it and it is listed');
+    var sj = await (await fetch('/api/model?path=structures/_harness.struct.json', {cache: 'no-store'})).json();
+    say(sj.name === '_harness' && sj.handEdited === false && sj.generator && sj.generator.tool === 'housegen' && sj.slots.length > 5,
+        'the struct.json round-trips: ' + sj.slots.length + ' slots, generator seed ' + sj.generator.seed);
+    var vx = await fetch('/api/model?path=structures/_harness.vox', {cache: 'no-store'});
+    var vb = new Uint8Array(await vx.arrayBuffer());
+    say(vx.ok && vb[0] === 86 && vb[1] === 79 && vb[2] === 88, 'the .vox is on disk (' + vb.length + ' bytes)');
+    // mark it hand-edited, as the in-game editor will
+    sj.handEdited = true;
+    var w = await (await fetch('/api/model?path=structures/_harness.struct.json', {method: 'POST', body: JSON.stringify(sj)})).json();
+    say(w.ok, 'marking it hand-edited is allowed');
+    var r1 = await fetch('/api/model?path=structures/_harness.vox', {method: 'POST', body: vb});
+    var j1 = await r1.json();
+    say(r1.status === 409 && !j1.ok, 'the server refuses a raw .vox write over a hand-edited structure: ' + (j1.error || '').slice(0, 70));
+    sj.handEdited = false;
+    var r2 = await fetch('/api/model?path=structures/_harness.struct.json', {method: 'POST', body: JSON.stringify(sj)});
+    say(r2.status === 409, 'and refuses a write that clears the flag');
+    await S._save('_harness').catch(function(){});   // list is stale: the page still thinks it is not hand-edited
+    // refresh the page's list, then save through the page: it must redirect
+    await S.open('_harness');
+    ok = await waitFor(function(){ return S._list().some(function (s) { return s.name === '_harness' && s.handEdited; }); }, 10000);
+    say(ok, 'the list shows _harness with the hand-edited badge: ' + (root.querySelector('.sglist .sgbadge') ? 'yes' : 'no'));
+    window.confirm = function () { return true; };
+    await S._save('_harness');
+    ok = await waitFor(function(){ return S.currentName() === '_harness_v2'; }, 20000);
+    say(ok, 'saving over it redirects to _harness_v2 (' + S.currentName() + ')');
+    var still = await (await fetch('/api/model?path=structures/_harness.struct.json', {cache: 'no-store'})).json();
+    say(still.handEdited === true, 'and the hand-edited original is untouched');
+
+    // ---- 6. path safety -----------------------------------------------------------
+    var esc = await (await fetch('/api/model?path=structures/../materials/tuning.json', {method: 'POST', body: '{}'})).json();
+    say(esc.ok === false, 'a traversal out of structures/ is refused');
+    var bad = toasts.filter(function (t) { return /^ERR/.test(t) && !/save failed/.test(t); });
+    say(bad.length === 0, 'no unexpected error toasts' + (bad.length ? ': ' + bad.join(' | ').slice(0, 160) : ''));
+  } catch (e) {
+    say(false, 'threw: ' + (e && e.stack || e));
+  }
+  live = false;
+  done();
+})();
+</script>
+</body>

@@ -34,6 +34,7 @@
 #include "game/equipment.h"
 #include "game/worlditems.h"
 #include "game/corpses.h"
+#include "game/dialogue.h"
 #include "world/refs_doors.h"
 #include "game/dye.h"
 #include "game/grab.h"
@@ -401,6 +402,15 @@ bool g_shotDevPanel = false;
 constexpr uint64_t kShotDevFirst = 90, kShotDevStep = 12;
 constexpr uint64_t kShotDevLast = kShotDevFirst + kShotDevStep * 7;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
+// `--shot-dialogue`: the CONVERSATION PANEL's look-iteration harness
+// (ui/dialogue_ui.h). A dummy human is spawned ahead, the sample dialogue is
+// started with it (by id, through the dev hook's session queue), and the panel is shot
+// at its entry node (screenshot_dialogue.bmp), then again after [continue]
+// is answered through the tick command, on the choice rows
+// (screenshot_dialogue_2.bmp).
+bool g_shotDialogue = false;
+constexpr uint64_t kShotDlgSpawn = 90, kShotDlgBegin = 130, kShotDlgShot1 = 160,
+                   kShotDlgChoose = 170, kShotDlgShot2 = 200, kShotDlgLast = 206;
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
@@ -4814,6 +4824,8 @@ int main(int argc, char** argv) {
           "                        <def>[@gap][:limb,...][+item,...], e.g.\n"
           "                        --shot-strike zombie bite_lunge human+iron_cuirass\n"
           "  --shot-devpanel       One BMP per F1 sidebar page\n"
+          "  --shot-dialogue       The conversation panel: screenshot_dialogue.bmp\n"
+          "                        (entry node) and _2.bmp (the choice rows)\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
           "  --shot-spellpage      The spell page, one BMP per word list:\n"
@@ -4955,6 +4967,10 @@ int main(int argc, char** argv) {
     else if (a == "--shot-devpanel") {
       g_shotDevPanel = true;
       g_harnessFrames = kShotDevLast + 2;
+    }
+    else if (a == "--shot-dialogue") {
+      g_shotDialogue = true;
+      g_harnessFrames = kShotDlgLast;
     }
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
@@ -6730,6 +6746,13 @@ int main(int argc, char** argv) {
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
   // that hotbar slot; an empty selected slot takes the hand's item back).
   KeyEdge eQ, eE;
+  // THE CONVERSATION KEYS (game/dialogue.h): 1-9 answer, Space/Enter
+  // continue. Their own edges: the number row's other bindings are gated off
+  // while the panel is up, and a held key must answer once.
+  KeyEdge eTalk[9], eTalkGo;
+  // What `captured` was before a conversation freed the cursor (the
+  // captureBeforeUi rule, for the panel).
+  bool talkWasOpen = false, captureBeforeTalk = true;
   // (G has no KeyEdge: it is a hold-aware binding — tap to take, hold to
   // drag or, with a throwable vessel in hand, to throw — see the block by
   // `takeE` — and an edge tracker would only be half of it.)
@@ -7246,6 +7269,27 @@ int main(int argc, char** argv) {
       .farBiggest = g_farBiggest,
       .labScene = labScene,
   };
+  // ---- CONVERSATIONS (game/dialogue.h, PLAN_world_editor P3) -------------
+  // One store per world: the loaded assets/dialogue/*.json, the flags and the
+  // met set (saved as 'DLGF' in world.sve). R reloads the files and keeps the
+  // flags; the Spawn page's Dialogue section lists what is wrong with them.
+  dialogue::Store talkStore;
+  talkStore.dir = assetDir + "/dialogue";
+  talkStore.items = &items;
+  auto reloadDialogue = [&]() {
+    talkStore.Reload();
+    ui.dialogueNames.clear();
+    for (const dialogue::Dialogue& d : talkStore.lib.All())
+      ui.dialogueNames.push_back(d.name);
+    ui.dialogueProblems.clear();
+    for (const dialogue::Problem& p : talkStore.problems)
+      ui.dialogueProblems.push_back(p.Line());
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%zu conversation(s) loaded", talkStore.lib.All().size());
+    ui.dialogueStatus = buf;
+  };
+  reloadDialogue();
+  tickCtx.talk = &talkStore;
   // The per-WORLD scratch main() still reads, aliased back out of the ctx the
   // same way the player's members are aliased out of `session`.
   auto& sphereModels = tickCtx.sphereModels;
@@ -8531,7 +8575,7 @@ int main(int argc, char** argv) {
       ctx.WaitIdle();
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, nullptr, &talkStore);
       WorldStamp stamp{tick, (uint32_t)kDefaultSeed, true};
       if (SaveWorld(ctx, world, stream, "build/smoke_world.svd", mats, &eio,
                     stamp)) {
@@ -9139,7 +9183,8 @@ int main(int argc, char** argv) {
       // tail of a default `--frames` run is the compiler, not the game.
       // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
       static const bool noReload =
-          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire;
+          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire ||
+          g_shotDialogue;  // the reload would wipe the listener it spawned
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -9488,6 +9533,44 @@ int main(int argc, char** argv) {
         if (f == 405) ui.alchemy.wantClose = true;
         if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
       }
+    }
+    // --shot-dialogue's schedule (see g_shotDialogue).
+    if (g_shotDialogue) {
+      const uint64_t f = frameCounter;
+      // On foot, looking level: the listener spawns "a few metres ahead",
+      // and a first-person camera pitched at the sky photographs stars.
+      if (f == 1) {
+        ui.fly = false;
+        player.fly = false;
+      }
+      if (f < kShotDlgBegin) cam.pitch = -0.12f;
+      if (f == kShotDlgSpawn) {
+        ui.visible = false;       // the dev panel is not in the picture
+        ui.aiSpawnDummy = true;   // blind, never moves: stands and listens
+      }
+      // The listener is the creature the panel just spawned, by id: "nearest
+      // within 12 m" depends on where the spawn landed, and a picture of no
+      // conversation proves nothing. Same queue the dev hook uses.
+      if (f == kShotDlgBegin) {
+        dialogue::Speaker sp;
+        if (!tickCtx.aiSpawnedMobs.empty()) {
+          sp.mobId = tickCtx.aiSpawnedMobs.back();
+          if (const Mob* m = mobs.FindMobById(sp.mobId); m && m->Def())
+            sp.name = m->Def()->name;
+        }
+        session.talkBegin = dialogue::BeginRequest{true, sp, "sample_stranger"};
+        std::printf("--shot-dialogue: talking to mob %llu\n",
+                    (unsigned long long)sp.mobId);
+      }
+      // Once the panel has freed the cursor, park it off the choice rows (a
+      // hovered row is a different picture). Not before: moving a CAPTURED
+      // cursor is a look delta, and the camera would spin.
+      if (f == kShotDlgBegin + 10 && !captured) glfwSetCursorPos(window, 40.0, 40.0);
+      if (f == kShotDlgShot1) g_shotJumpPath = "screenshot_dialogue.bmp";
+      // [continue] past the greeting to the question hub: the second picture
+      // is the numbered choice rows.
+      if (f == kShotDlgChoose) feeder.Talk(kTalkContinue);
+      if (f == kShotDlgShot2) g_shotJumpPath = "screenshot_dialogue_2.bmp";
     }
     // --shot-devpanel: page k is selected at kShotDevFirst + k*step and shot
     // step-2 frames later (a page's first frame lays out before it settles).
@@ -9881,7 +9964,7 @@ int main(int argc, char** argv) {
     //             unreachable because a menu is up.
     const bool uiTyping = overlay.WantsKeyboard();
     const bool devKeys = !uiTyping;
-    const bool gameKeys = !ui.inventoryOpen && !uiTyping;
+    const bool gameKeys = !ui.inventoryOpen && !ui.talk.open && !uiTyping;
 
     // I opens and closes the character screen. Opening frees the cursor and
     // remembers what capture WAS, so closing restores it rather than assuming.
@@ -9912,6 +9995,11 @@ int main(int argc, char** argv) {
     // means "let go of the mouse" is the order every game uses, and it is the
     // one that does not strand a player with a menu they cannot dismiss.
     if (devKeys && eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
+      // A conversation first: Esc is "leave", when the node allows it (a
+      // command for the tick, like every other answer).
+      if (ui.talk.open) {
+        if (ui.talk.canLeave) feeder.Talk(kTalkLeave);
+      } else
       // The bench first: Esc puts the vessels back and leaves the screen up.
       if (ui.alchemy.open) {
         ui.alchemy.wantClose = true;
@@ -9934,6 +10022,36 @@ int main(int argc, char** argv) {
       glfwSetInputMode(window, GLFW_CURSOR,
                        captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
       glfwGetCursorPos(window, &mx0, &my0);
+    }
+    // ---- THE CONVERSATION (game/dialogue.h) ------------------------------
+    // Opening frees the cursor for the choice rows and closing hands back
+    // what it was (the captureBeforeUi rule). The answer -- a key or a click
+    // on the panel (UIState::talk.pick) -- goes into the tick COMMAND; the
+    // tick applies it (dialogue::TickSession), never this frame.
+    if (ui.talk.open != talkWasOpen) {
+      talkWasOpen = ui.talk.open;
+      if (ui.talk.open) {
+        captureBeforeTalk = captured;
+        captured = false;
+      } else {
+        captured = captureBeforeTalk;
+      }
+      glfwSetInputMode(window, GLFW_CURSOR,
+                       captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+      glfwGetCursorPos(window, &mx0, &my0);
+    }
+    if (ui.talk.open && !uiTyping) {
+      for (int i = 0; i < 9; i++)
+        if (eTalk[i].Pressed(key(GLFW_KEY_1 + i)) && i < (int)ui.talk.choices.size())
+          feeder.Talk(i + 1);
+      if (eTalkGo.Pressed(key(GLFW_KEY_SPACE) || key(GLFW_KEY_ENTER) ||
+                          key(GLFW_KEY_KP_ENTER)) &&
+          ui.talk.canContinue)
+        feeder.Talk(kTalkContinue);
+    }
+    if (ui.talk.pick != 0) {
+      feeder.Talk(ui.talk.pick);
+      ui.talk.pick = 0;
     }
     // The wheel, drained once per frame. Three claimants, in priority order:
     //
@@ -10950,6 +11068,9 @@ int main(int argc, char** argv) {
           // moving what is already picked.
           rebuildWardrobe();
           rebuildAiWear();
+          // Conversations name items; re-read and re-validate them against
+          // the library just loaded.
+          reloadDialogue();
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
@@ -11074,7 +11195,7 @@ int main(int argc, char** argv) {
       // players/local.svp, and per-region r_*.sve buckets (S4).
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs);
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs, &talkStore);
       // M9.5-B: the directory is `--load-world`'s, and the save now carries
       // the SIM TICK and the SEED (meta.svm's SVM5 pair). The tick is what a
       // reload has to resume above so that the per-chunk tick tags this
@@ -11088,7 +11209,7 @@ int main(int argc, char** argv) {
       ctx.WaitIdle();
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs);
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs, &talkStore);
       WorldStamp loaded{};
       if (LoadWorld(ctx, world, sim, stream, worldDir, mats, &eio, &loaded)) {
         mobParking.ResetWaits();
@@ -14773,6 +14894,65 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- THE CONVERSATION MIRROR + THE DEV HOOK (game/dialogue.h) -------
+      {
+        const dialogue::View v = dialogue::MakeView(talkStore, session.talk);
+        ui.talk.open = v.open;
+        ui.talk.dialogue = v.dialogue;
+        ui.talk.speaker = v.speaker;
+        ui.talk.text = v.text;
+        ui.talk.choices = v.choices;
+        ui.talk.canContinue = v.canContinue;
+        ui.talk.canLeave = v.canLeave;
+        ui.talk.steps = v.steps;
+        if (ui.dialogueReload) {
+          ui.dialogueReload = false;
+          reloadDialogue();
+        }
+        if (ui.dialogueResetFlags) {
+          ui.dialogueResetFlags = false;
+          talkStore.ResetState();
+          ui.dialogueStatus = "flags and met cleared";
+        }
+        // "talk to nearest creature" / "talk (no speaker)": queued on the
+        // session and started by the next tick (dialogue::BeginRequest).
+        if ((ui.dialogueTalkNearest || ui.dialogueTalkVoice) &&
+            !ui.dialogueNames.empty()) {
+          const std::string name = ui.dialogueNames[std::clamp(
+              ui.dialoguePick, 0, (int)ui.dialogueNames.size() - 1)];
+          dialogue::Speaker sp;
+          bool ok = true;
+          if (ui.dialogueTalkNearest) {
+            const float reach = 12.0f / kVoxelMeters;
+            float best = reach * reach;
+            for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+              const Mob* m = mobs.MobAt(i);
+              if (!m || !m->Alive() || !m->Def()) continue;
+              const Vec3 d = m->Origin() - player.pos;
+              const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+              if (d2 < best) {
+                best = d2;
+                sp.mobId = m->Id();
+                sp.name = m->Def()->name;
+              }
+            }
+            ok = sp.mobId != 0;
+            ui.dialogueStatus = ok ? "talking to " + sp.name + " (" + name + ")"
+                                   : "nobody within 12 m to talk to";
+          } else {
+            ui.dialogueStatus = "talking (" + name + ")";
+          }
+          std::printf("dialogue: %s\n", ui.dialogueStatus.c_str());
+          if (ok) session.talkBegin = dialogue::BeginRequest{true, sp, name};
+        }
+        ui.dialogueTalkNearest = ui.dialogueTalkVoice = false;
+        if (ui.visible) {
+          ui.dialogueFlags.clear();
+          for (const auto& [k, val] : talkStore.flags)
+            ui.dialogueFlags.push_back(k + " = " + std::to_string(val));
+          for (const std::string& m : talkStore.met) ui.dialogueFlags.push_back("met: " + m);
+        }
+      }
       overlay.BeginFrame();
       // HUD first, dev panel second: the panel is a real ImGui window and gets
       // to sit on top of the chrome, not the other way round.
@@ -14781,7 +14961,8 @@ int main(int argc, char** argv) {
       // already shows both pools and the body condition, larger and with the
       // numbers spelled out, so drawing the corner chrome underneath it is two
       // readouts of the same thing fighting for the same corner.
-      if (!ui.inventoryOpen) overlay.DrawHUD(ui);
+      // ...and while talking: the conversation panel sits where the hotbar is.
+      if (!ui.inventoryOpen && !ui.talk.open) overlay.DrawHUD(ui);
       overlay.Draw(ui);
 
       // Wind force multipliers. Its OWN latch, and deliberately not folded

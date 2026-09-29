@@ -1,0 +1,86 @@
+{
+  "name": "sample_stranger",
+  "speaker": "Hooded Stranger",
+  "canLeave": true,
+  "notes": "The worked example: every condition (flag, !flag, flag value, time, activity, has, !has, met true, met by name) and every action (set, add, clear, give, take, end) appears at least once. The dialogue-graph gate walks it; docs/EDITOR_GUIDE.md explains it.",
+  "entry": [
+    { "if": [ { "activity": "sleep" } ], "goto": "asleep" },
+    { "if": [ { "flag": "stranger_owed", "value": 2 } ], "goto": "settled" },
+    { "if": [ { "flag": "stranger_visits", "value": 3 } ], "goto": "tired" },
+    { "if": [ { "met": true } ], "goto": "again" },
+    { "goto": "hello" }
+  ],
+  "nodes": [
+    {
+      "id": "hello",
+      "text": "A traveller on the Harrowby road, and at this hour. Sit, if you like. This fire is the only warm thing between here and the smithy.",
+      "goto": "ask"
+    },
+    {
+      "id": "again",
+      "text": "Back again. The road must be lonelier than it looks.",
+      "do": [ { "add": "stranger_visits", "value": 1 } ],
+      "goto": "ask"
+    },
+    {
+      "id": "tired",
+      "text": "Third night running. Either you like my company or you have nowhere better to be. Sit down, then.",
+      "goto": "ask"
+    },
+    {
+      "id": "ask",
+      "text": "Well? Ask what you came to ask.",
+      "choices": [
+        { "text": "Who are you?", "goto": "who" },
+        { "text": "Have you seen anything at the treeline?", "goto": "treeline", "if": [ { "!flag": "asked_treeline" } ], "do": [ { "set": "asked_treeline" } ] },
+        { "text": "You look thirsty. Take my flask.", "goto": "thanks", "if": [ { "has": "flask" } ], "do": [ { "take": "flask", "count": 1 }, { "set": "stranger_owed", "value": 1 } ] },
+        { "text": "I have nothing to defend myself with.", "goto": "gift", "if": [ { "!has": "dagger" }, { "!flag": "stranger_gave" } ] },
+        { "text": "Agnes, you said. Would she talk to me?", "goto": "agnes", "if": [ { "met": "sample_stranger" } ] },
+        { "text": "Enough talk. Good night.", "do": [ { "clear": "asked_treeline" }, { "end": true } ] }
+      ]
+    },
+    {
+      "id": "who",
+      "text": "Someone who walks at night so as not to be asked that. Agnes at the alehouse would tell you more than I will.",
+      "goto": "ask"
+    },
+    {
+      "id": "treeline",
+      "if": [ { "time": [ "20:00", "05:00" ] } ],
+      "else": "treeline_day",
+      "text": "Look for yourself, it is dark enough. Lights, low down among the trunks, where nobody lives.",
+      "goto": "ask"
+    },
+    {
+      "id": "treeline_day",
+      "text": "In daylight? Nothing but trees. Come back after dark and ask me again.",
+      "goto": "ask"
+    },
+    {
+      "id": "thanks",
+      "canLeave": false,
+      "text": "Water, to a stranger, on a dark road. No - hold still, I will not be in your debt. Take my spare hood; the nights are turning cold.",
+      "do": [ { "give": "hood", "count": 1 }, { "set": "stranger_owed", "value": 2 } ],
+      "goto": "ask"
+    },
+    {
+      "id": "gift",
+      "text": "Then have this. It has been sharpened more often than it has been used, which is the right way round. Mind the edge.",
+      "do": [ { "give": "dagger", "count": 1 }, { "set": "stranger_gave" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "agnes",
+      "text": "Agnes talks to everyone. The trick is getting her to stop.",
+      "goto": "ask"
+    },
+    {
+      "id": "settled",
+      "text": "We are square, you and I. Safe roads."
+    },
+    {
+      "id": "asleep",
+      "text": "The stranger is asleep by the fire, hood over their face. Better not."
+    }
+  ]
+}
