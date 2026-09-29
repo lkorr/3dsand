@@ -1810,6 +1810,15 @@ struct Tuning {
     float contactHpPerImpulse = TPD(gore, contactHpPerImpulse);
     float contactMaxHp = TPD(gore, contactMaxHp);
     int contactMaxPerTick = TPD(gore, contactMaxPerTick);
+    // ...AND ONLY A BODY THAT WAS ALREADY MOVING STRIKES. The approach speed
+    // is the STRIKER's own (pre-impact, along the contact normal, toward the
+    // creature), so walking into a resting log is you kicking it and bills
+    // nothing. Below contactMinSpeed (vox/s) nothing is a blow; nor is a body
+    // whose current run of motion (Physics::MotionRunVox) is shorter than
+    // contactMinTravel voxels -- a log nudged an inch, or rolling back onto
+    // the foot that pushed it, has not been going anywhere.
+    float contactMinSpeed = TPD(gore, contactMinSpeed);
+    float contactMinTravel = TPD(gore, contactMinTravel);
 
     // ========================================================================
     // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it

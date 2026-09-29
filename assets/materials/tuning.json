@@ -374,7 +374,9 @@
     "contactImpulseMin": 40,
     "contactHpPerImpulse": 0.25,
     "contactMaxHp": 60,
-    "contactMaxPerTick": 8
+    "contactMaxPerTick": 8,
+    "contactMinSpeed": 15,
+    "contactMinTravel": 2
   },
   "coat": {
     "recountTicks": 8,

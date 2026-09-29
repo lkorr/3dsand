@@ -414,6 +414,8 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     ci.normal = Vec3{m.mWorldSpaceNormal.GetX(), m.mWorldSpaceNormal.GetY(),
                      m.mWorldSpaceNormal.GetZ()};
     ci.speedVoxPerSec = speedVox;
+    ci.velAVoxPerSec = v1.Dot(m.mWorldSpaceNormal) / kVoxelMeters;
+    ci.velBVoxPerSec = v2.Dot(m.mWorldSpaceNormal) / kVoxelMeters;
 
     std::lock_guard<std::mutex> lk(mu);
     if (toBody) {
@@ -493,6 +495,7 @@ bool Physics::Init() {
 void Physics::Shutdown() {
   pendingRelease_.clear();
   playerBodies_.clear();
+  motionRun_.clear();
   joints_.reset();  // constraint refs drop before the system that owns bodies
   system_.reset();  // ...and the system drops before the listener it points at
   contacts_.reset();
@@ -509,6 +512,37 @@ const std::vector<Physics::ContactImpact>& Physics::ContactImpacts() const {
 const std::vector<Physics::ContactImpact>& Physics::OwnedBodyImpacts() const {
   static const std::vector<ContactImpact> kNone;
   return contacts_ ? contacts_->bodyImpacts : kNone;
+}
+
+void Physics::TrackMotionRuns(float dt) {
+  const uint32_t n =
+      system_ ? system_->GetNumActiveBodies(JPH::EBodyType::RigidBody) : 0;
+  const JPH::BodyID* active =
+      n ? system_->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody) : nullptr;
+  if (!active) {
+    motionRun_.clear();
+    return;
+  }
+  // Rebuilt, not patched: a body missing from the active list (asleep,
+  // removed) or under the rest bar has no run. Per-key and order-free, so
+  // the job threads' active-list order cannot reach the result.
+  std::unordered_map<uint64_t, float> next;
+  next.reserve(n);
+  const JPH::BodyInterface& bi = system_->GetBodyInterfaceNoLock();
+  for (uint32_t i = 0; i < n; i++) {
+    const JPH::BodyID id = active[i];
+    const float speedVox = bi.GetLinearVelocity(id).Length() / kVoxelMeters;
+    if (!(speedVox >= kMotionRunRestVox)) continue;
+    const uint64_t h = FromBodyID(id);
+    auto it = motionRun_.find(h);
+    next[h] = (it == motionRun_.end() ? 0.0f : it->second) + speedVox * dt;
+  }
+  motionRun_.swap(next);
+}
+
+float Physics::MotionRunVox(uint64_t handle) const {
+  auto it = motionRun_.find(handle);
+  return it == motionRun_.end() ? 0.0f : it->second;
 }
 
 void Physics::SetContactReportSpeed(float voxPerSec) {
@@ -1114,6 +1148,9 @@ void Physics::Step(float dt) {
   // ...and straight after it, because it is written to assume the sweep has
   // already removed everything that cannot safely be squared.
   SweepRunawayRigs();
+  // Before Update, so MotionRunVox answers for the motion that CARRIED a body
+  // into this step's contacts, not for the stop the contact put it in.
+  TrackMotionRuns(dt);
   // Gravity is re-applied here rather than only at Init so a tuning reload
   // takes effect without restarting the world.
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));

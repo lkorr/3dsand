@@ -11071,17 +11071,20 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
       // THE STRIKER'S SPEED, NOT THE CLOSING SPEED. The listener reports how
       // fast the pair closed; a creature walking into a resting log closes
       // on it at walking pace, and that is the creature kicking the log, not
-      // the log striking the creature. So the limb's own velocity toward the
-      // other body is taken back out (`normal` points bodyA -> bodyB).
-      // (The velocity of what was TOUCHED: a capsule walked into a log is the
-      // player kicking it, exactly as a limb is.)
-      float strike = ci.speedVoxPerSec;
-      Vec3 lv{}, la{};
-      if (phys.GetBodyVelocities(hitBody, lv, la)) {
-        const Vec3 toOther = side == 0 ? ci.normal : ci.normal * -1.0f;
-        strike -= std::max(0.0f, lv.dot(toOther));
-      }
-      if (strike <= 0.0f) continue;
+      // the log striking the creature. So the blow is the OTHER body's own
+      // velocity toward the creature, as the listener read it BEFORE the
+      // solver answered the contact (`normal` points bodyA -> bodyB, so B
+      // approaches A at -velB and A approaches B at +velA). Subtracting the
+      // limb's post-step velocity instead missed a PLAYER entirely: the
+      // capsule is teleported onto the player, so it reads no walk, and the
+      // log a player walked into billed the whole closing speed.
+      const float strike =
+          std::min(ci.speedVoxPerSec,
+                   side == 0 ? -ci.velBVoxPerSec : ci.velAVoxPerSec);
+      if (!(strike > 0.0f) || strike < gt.contactMinSpeed) continue;
+      // ...AND IT HAD TO BE GOING SOMEWHERE. A log nudged an inch, or rolling
+      // back onto the foot that pushed it, has no run of motion behind it.
+      if (phys.MotionRunVox(other) < gt.contactMinTravel) continue;
       const float impulse = mu * strike * kVoxelMeters;
       if (impulse <= gt.contactImpulseMin) continue;
       hits.push_back({limbBody, other, ci.posVoxel, impulse,
