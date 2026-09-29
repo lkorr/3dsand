@@ -1386,19 +1386,58 @@ static int wmSiteI(uint32_t sid, uint32_t w) {
 // Is (x, z) inside site `sid`'s own footprint? A lake (P-F): its DISC plus
 // its shore/berm band. A tree (P6): its trunk keep-out square. A stamp: its
 // pad (Chebyshev radius + margin). worldgen.wgsl siteFootprintHas, same test.
+// A stamp's footprint rect / apron and a soften site's scales, read from the
+// site itself (worldgen.wgsl reads the same numbers as record words
+// kS_BoxX0.. / kS_Apron / kS_Soft*).
+static const worldmap::WorldMapData::StampSite& wmSite(uint32_t sid) {
+  return worldmap::CurrentWorldMap().sites[sid - 1];
+}
+// worldgen.wgsl stampRectDist: the larger axis gap to the rect plus half the
+// smaller (an octagon), 0 inside.
+static int stampRectDist(uint32_t sid, int x, int z) {
+  const worldmap::WorldMapData::StampSite& s = wmSite(sid);
+  const int gx = std::max(std::max(s.bx0 - x, x - s.x1), 0);
+  const int gz = std::max(std::max(s.bz0 - z, z - s.z1), 0);
+  return std::max(gx, gz) + (std::min(gx, gz) >> 1u);
+}
+// worldgen.wgsl sitePadWeight: Q8 share of the pad height, 256 over rect +
+// apron, a smoothstep to 0 across the margin.
+static int sitePadWeight(uint32_t sid, int x, int z) {
+  const worldmap::WorldMapData::StampSite& s = wmSite(sid);
+  if ((uint32_t)s.kind != WM_SITE_STAMP) return 0;
+  const int e = stampRectDist(sid, x, z) - s.apron;
+  if (e <= 0) return 256;
+  const int margin = std::max(s.padMargin, 1);
+  if (e >= margin) return 0;
+  const int t = ((margin - e) * 256) / margin;
+  return (t * t * (768 - 2 * t)) >> 16u;
+}
+// worldgen.wgsl sitePadNear: is any stamp's whole pad within r?
+static bool sitePadNear(int x, int z, int r);
+// worldgen.wgsl softenAt: the Q8 scales of the three local octaves.
+struct Soften {
+  int hill;
+  int bump;
+  int grain;
+};
+static Soften softenAt(int x, int z);
+// Is (x, z) inside site `sid`'s own footprint? A lake (P-F): its DISC plus
+// its shore/berm band. A tree (P6): its trunk keep-out square. A stamp: its
+// FLAT core, rect + apron (2026-09-29; the ramp is ordinary ground).
+// worldgen.wgsl siteFootprintHas, same test.
 static bool siteFootprintHas(uint32_t sid, int x, int z) {
   const uint32_t kind = (uint32_t)(wmSiteI(sid, WM_S_KIND));
-  // A clearing keeps crowns off and nothing else: no footprint.
-  if (kind == worldmap::kSiteClearing) return false;
+  // A clearing keeps crowns off and nothing else: no footprint. Nor does
+  // softened ground or a route.
+  if (kind == worldmap::kSiteClearing || kind == worldmap::kSiteSoften || kind == worldmap::kSitePath) return false;
   const int dx = x - wmSiteI(sid, WM_S_X);
   const int dz = z - wmSiteI(sid, WM_S_Z);
   if (kind == WM_SITE_WATER) {
     const int reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
     return dx * dx + dz * dz <= reach * reach;
   }
-  const int r = kind == WM_SITE_TREE ? (int)worldmap::kSiteTreeKeepOut
-                                     : wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
-  return std::max(std::abs(dx), std::abs(dz)) <= r;
+  if (kind == WM_SITE_STAMP) return stampRectDist(sid, x, z) <= wmSite(sid).apron;
+  return std::max(std::abs(dx), std::abs(dz)) <= (int)worldmap::kSiteTreeKeepOut;
 }
 // The keep-out every feature avoids: the pad box, and every listed site's
 // footprint (never its cells, since P6). Same test as the shader's.
@@ -1429,19 +1468,71 @@ static uint32_t wmWaterSiteAt(int x, int z) {
   }
   return first;
 }
-// The stamp whose pad reaches this column (worldgen.wgsl wmPadSiteAt): the
-// first listed stamp within radius + margin, 0 = none. sitePadAt levels to it.
-static uint32_t wmPadSiteAt(int x, int z) {
+static bool sitePadNear(int x, int z, int r) {
   const uint32_t* lst = wmSiteList(x, z);
   const uint32_t n = wmSiteN(lst);
   for (uint32_t k = 0u; k < n; k++) {
     const uint32_t sid = wmSiteK(lst, k);
-    if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_STAMP) { continue; }
-    const int d = std::max(std::abs(x - wmSiteI(sid, WM_S_X)), std::abs(z - wmSiteI(sid, WM_S_Z))) -
-                  wmSiteI(sid, WM_S_RADIUS);
-    if (d < std::max(wmSiteI(sid, WM_S_PAD_MARGIN), 1)) { return sid; }
+    if ((uint32_t)wmSite(sid).kind != WM_SITE_STAMP) continue;
+    if (stampRectDist(sid, x, z) < wmSite(sid).apron + wmSite(sid).padMargin + r) return true;
   }
-  return 0u;
+  return false;
+}
+// worldgen.wgsl routeDist2: squared distance to a route's segment, -1 when
+// outside its box grown by `reach`.
+static int routeDist2(const worldmap::WorldMapData::StampSite& st, int x, int z, int reach) {
+  const int ax = st.x, az = st.z, bx = st.x1, bz = st.z1;
+  if (x < std::min(ax, bx) - reach || x > std::max(ax, bx) + reach ||
+      z < std::min(az, bz) - reach || z > std::max(az, bz) + reach) return -1;
+  const int vx = bx - ax, vz = bz - az;
+  const int l2 = vx * vx + vz * vz;
+  const int t = (x - ax) * vx + (z - az) * vz;
+  int cx = ax, cz = az;
+  if (l2 > 0 && t >= l2) { cx = bx; cz = bz; }
+  else if (l2 > 0 && t > 0) { cx = ax + (vx * t) / l2; cz = az + (vz * t) / l2; }
+  const int dx = x - cx, dz = z - cz;
+  return dx * dx + dz * dz;
+}
+static Soften softenAt(int x, int z) {
+  Soften s{256, 256, 256};
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  int wbox = 0, pathQ = 256;
+  for (uint32_t k = 0u; k < n; k++) {
+    const worldmap::WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
+    if ((uint32_t)st.kind != worldmap::kSiteSoften) continue;
+    const int d = std::max(std::max(st.x - x, x - st.x1), std::max(st.z - z, z - st.z1));
+    int w = 256;
+    if (d > 0) {
+      const int f = st.padMargin;
+      if (d >= f) continue;
+      const int t = ((f - d) * 256) / f;
+      w = (t * t * (768 - 2 * t)) >> 16u;
+    }
+    s.hill = std::min(s.hill, 256 - (((256 - st.softHill) * w) >> 8u));
+    s.bump = std::min(s.bump, 256 - (((256 - st.softBump) * w) >> 8u));
+    s.grain = std::min(s.grain, 256 - (((256 - st.softGrain) * w) >> 8u));
+    if (w > wbox) { wbox = w; pathQ = st.softPath; }
+  }
+  if (wbox > 0) {
+    int wr = 0;
+    for (uint32_t k = 0u; k < n; k++) {
+      const worldmap::WorldMapData::StampSite& st = wmSite(wmSiteK(lst, k));
+      if ((uint32_t)st.kind != worldmap::kSitePath) continue;
+      const int d2 = routeDist2(st, x, z, (int)worldmap::kRouteSoftOuter);
+      if (d2 < 0 || d2 >= (int)worldmap::kRouteSoftOuter * (int)worldmap::kRouteSoftOuter) continue;
+      int t = 256;
+      const int i2 = (int)worldmap::kRouteSoftInner * (int)worldmap::kRouteSoftInner;
+      if (d2 > i2) {
+        const int o2 = (int)worldmap::kRouteSoftOuter * (int)worldmap::kRouteSoftOuter;
+        t = ((o2 - d2) * 256) / (o2 - i2);
+      }
+      wr = std::max(wr, (t * t * (768 - 2 * t)) >> 16u);
+    }
+    const int wp = (wr * wbox) >> 8u;
+    s.hill = std::min(s.hill, 256 - (((256 - pathQ) * wp) >> 8u));
+  }
+  return s;
 }
 // The painted cell's biome, no warp and no seed (worldgen.wgsl biomeCellAt):
 // whose water rows roll at a pond tile.
@@ -1848,10 +1939,11 @@ static Land landAt(int x, int z, uint32_t seed) {
   int homeY = wmTerrain(WM_H_TERRAIN_HOME_Y);
   int coarse = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT) + cv.x - homeY;
   Oct sp = sculptOctave(x, z);
-  int bed = homeY + o2.dev + o3.dev + o4.dev
+  Soften sf = softenAt(x, z);
+  int bed = homeY + ((o2.dev * sf.hill) >> 8) + ((o3.dev * sf.bump) >> 8) + ((o4.dev * sf.grain) >> 8)
           + ((coarse * ws) >> 14) + sp.dev;
 
-  int slope = std::abs(g2x + sp.gx) + std::abs(g2z + sp.gz);
+  int slope = std::abs(g1x + ((o2.gx * sf.hill) >> 8) + sp.gx) + std::abs(g1z + ((o2.gz * sf.hill) >> 8) + sp.gz);
   int room = std::max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
   int sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   int sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
@@ -1988,7 +2080,7 @@ static Pond pondRoll(int pt, int pz, uint32_t seed) {
   if (tile - 2 * inset < 1) { return p; }
   cx = std::clamp(cx, pt * tile + inset, pt * tile + tile - 1 - inset);
   cz = std::clamp(cz, pz * tile + inset, pz * tile + tile - 1 - inset);
-  if (siteKeepOut(cx, cz)) { return p; }
+  if (siteKeepOut(cx, cz) || sitePadNear(cx, cz, r)) { return p; }
   p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.wp = wp;
   p.minY = wmWaterRow(biome, row, WM_R_MIN_Y);
   p.maxY = wmWaterRow(biome, row, WM_R_MAX_Y);
@@ -2266,17 +2358,16 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
 }
 
 static int sitePadAt(int x, int z, int h) {
-  const uint32_t sid = wmPadSiteAt(x, z);
-  if (sid == 0u) { return h; }
-  const int sx = wmSiteI(sid, WM_S_X);
-  const int sz = wmSiteI(sid, WM_S_Z);
-  const int r = wmSiteI(sid, WM_S_RADIUS);
-  const int margin = std::max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
-  const int d = std::max(std::max(std::abs(x - sx), std::abs(z - sz)) - r, 0);
-  if (d >= margin) { return h; }
-  const int padY = sitePadY(sid);
-  const int w = ((margin - d) * 256) / margin;
-  return h + (((padY - h) * w) >> 8);
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  int hh = h;
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    const int w = sitePadWeight(sid, x, z);
+    if (w <= 0) { continue; }
+    hh = hh + (((sitePadY(sid) - hh) * w + 128) >> 8u);
+  }
+  return hh;
 }
 
 int World::TerrainHeight(int x, int z, uint32_t seed) {

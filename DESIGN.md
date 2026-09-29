@@ -18518,6 +18518,92 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   forest near its spawn, with / without arms: no tree voxel in the box, trunk
   bases past feather + the widest crown kept, cover inside, ground voxels
   and the height mirror identical; the loader's refusal and warning).
+  A VILLAGE DOES NOT NEED ONE (2026-09-29): every structure keeps the crowns
+  off itself (the per-tree building rule, next bullet); the clearing is for
+  an open field or a glade.
+* **LIVE (2026-09-29): A VILLAGE IN THE FOREST -- the per-tree building rule,
+  the soft pad, softened ground and the routes.** Owner: "trees should be
+  able to exist so long as they don't clip through the buildings", "the
+  ground still slightly hilly ... flat where the houses are", "paths
+  generally flatter but not 100%". Four mechanisms, all in worldgen, all on
+  every map, near and far alike (the far cascades take trees and ground from
+  the same `treeInfoBare` / `landAt`):
+  - **THE PER-TREE BUILDING RULE** (`siteBlocksTrunk`, kind stamp). A stamp
+    now carries its FOOTPRINT RECT (`kS_BoxX0/Z0 .. kS_BoxX1/Z1`: exactly the
+    cells `wmStampCell` draws, `x - nx/2 .. + nx - 1`) and a lattice trunk is
+    refused when its species' CROWN square (Chebyshev reach) comes within
+    `kStampTreeClear` (10 voxels) of it -- 2D on purpose, a crown over a roof
+    reads as wrong as one through it, and it is what the village gate's
+    "stamped box + 48 above" count asserts -- or when the trunk stands on the
+    pad (rect + apron + ramp: a tree's base is `landAt`'s ground, which the
+    pad reshapes). A stamp is listed in every cell its rect + the widest
+    crown + the clearance reaches (the lattice asks from the trunk's cell).
+    Authored tree sites are the author's and stand.
+  - **ROUTES** (`kSitePath`, not in map.json): `LoadWorldMap` reads every
+    waynode LINK of the map's refs (`structures::ReadWaySegments`: the refs
+    group files plus every placed structure's slot children, resolved the
+    way `refs_npc.cpp`'s WayGraph resolves names), drops the links wholly
+    inside one house, splits the rest into pieces of at most 256 voxels (the
+    shader's integer projection, `routeDist2`, stays inside i32) and lists
+    each as a site: no trunk within `kPathTrunkKeepOut` (1.5 m) of the line.
+    Hashed into `structureHash`. A moved link takes effect at the next
+    environment reload (F7 / Apply); `autoLink` edges are not routes. The
+    door's own outside node is a route end, so doors are kept clear too.
+  - **THE SOFT PAD** (`sitePadAt`, mirrored in `world.cpp`; weights in
+    `sitePadWeight` / `stampRectDist` outside the mirror on both sides). Was:
+    the whole SQUARE of the longest side levelled, a linear ramp over
+    `padMargin` (4 voxels in Harrowby), the first stamp in the list winning
+    -- hard-edged lawns. Now: the rect + `kS_Apron` (`props.padApron`,
+    default 8: the doorsteps, level with every threshold on every side) is
+    exactly `padY`; past it a SMOOTHSTEP over `padMargin` (default 24) in an
+    octagonal distance (max + min/2, integer; rounded corners, no hip); and
+    EVERY stamp reaching the column blends in turn, so ramps that meet stay
+    continuous. The keep-out (`siteFootprintHas`) is the flat core only, so
+    cover grows on the ramp; rolled ponds and cacti keep off the whole pad
+    (`sitePadNear`: both stand on the bare ground the pad reshapes).
+    **A RAMP NEVER STEPS MORE THAN A VOXEL**: after the pad heights are baked
+    the loader widens `padMargin` to 2 x the largest gap between the floor
+    and the bare ground round the pad's edge (+ 2, up to 64) -- the
+    smoothstep's steepest point is 1.5 x that gap over the margin -- but
+    never so far that it reaches the flat core of a stamp on another floor
+    (`structure-stamp` caught exactly that: four hillside houses 15 m apart,
+    one ramp widened into its neighbour's apron). Overlap
+    warnings: a ramp reaching the flat core of a stamp on ANOTHER floor (two
+    structures on one floor may share ramps: a floor blended with itself is
+    that floor). The structure re-apply's box grows by apron + margin (+ the
+    clearance and the widest crown when the rect moved).
+  - **SOFTENED GROUND** (`kSiteSoften`, map.json kind `"soften"`: `{min, max,
+    feather?, hills?, bumps?, grain?, paths?}`, percents, defaults 40 / 20 /
+    0 / 10, feather 96). `softenAt` (outside the height mirror, both sides)
+    returns Q8 scales for the three LOCAL octaves and the mirrored `landAt`
+    multiplies `o2` (hill, 12.8 m), `o3` (detail, 3 m) and `o4` (grain, 0.8
+    m) by them before summing -- 256 outside every box, where each product
+    is exact and no world moves. The landform and range rungs are left
+    alone (a village keeps its place on the hill; in the home area they are
+    faded out anyway). The feather is a smoothstep of the Chebyshev distance;
+    overlapping boxes take the smaller scale. ON A ROUTE inside a box the
+    hill scale drops further to `paths` within `kRouteSoftInner` (1.2 m) of
+    the line, easing out by `kRouteSoftOuter` (3.6 m): the tracks between
+    the doors are the low-passed ground, flatter than the green, never a
+    plane. `Land.slope` (the wedge's gate) follows the scaled hill gradient.
+  **What the noise was** (Harrowby before this): the green and the ground
+  between the houses were a `sculpt_flatten --keep-grain` plateau, which
+  cancels the swells but keeps the biome's detail and grain octaves at full
+  amplitude -- +-8 voxels over 3 m and +-2 over 0.8 m on a plane, i.e. a
+  lattice of one- and two-voxel risers, and a grass skin one voxel deep
+  shows its dirt subsoil on every 2-step; the painted gravel and dirt
+  tracks are POWDERS and slump where a riser is 2 (the dark pits); the
+  pads were bare-lawn squares with 0.4 m linear edges (the keep-out
+  suppressed cover over the whole square); and the four "stray grey
+  blocks" were the green asset's boundary stones, placed only to stretch
+  its square pad over the green. Gate: `structure-ground` (harness map,
+  forest near the spawn, soft-only vs soft + a house: no tree voxel within
+  the clearance, every trunk past the widest crown kept, trunks inside
+  that band kept (the rule is per tree), the flat core exact, the ramp
+  between ground and floor and adding no step the ground did not have,
+  nothing moved past it, the GPU ground = the CPU mirror, the soften box
+  smoother and with half the steps); `structure-stamp`'s pad check moved
+  to the apron.
 * **LIVE (map overhaul P5, 2026-09-26): THE SCULPT LAYER — the tier between
   the 102 m landform cell and the voxel.** `assets/worldmap/<name>/
   sculpt.svsculpt` is a sparse, tiled, SIGNED height offset in whole voxels
@@ -18819,8 +18905,12 @@ centre chosen so worldgen's `S_X - nx/2 + column` lands the rotated origin on
 the pad (`wmStampCell` `ly = y - padY - 1 + sink`, `wmSiteTopAt` lowers the top
 the same, genCell overlays from `h - 2 - WM_STAMP_SINK_MAX`). **The pad is the
 AUTHORED floor**: `padY = pos.y - 1` (ground top one below GRADE), not the
-baked `BareGroundHeight` a `map.json` stamp gets; `props.padMargin` (default
-`kStructurePadMargin` 12) is the ramp back. `yaw` not a multiple of 90 is a
+baked `BareGroundHeight` a `map.json` stamp gets; `props.padApron` (default
+`kStructurePadApron` 8) is the level ring round the walls and `props.padMargin`
+(default `kStructurePadMargin` 24, widened by the loader where the ground is
+far from the floor) the smoothstep back -- the soft pad, §9c "A VILLAGE IN THE
+FOREST". Both are sliders in the inspector's structure panel
+(`DrawStructureFields`) and part of `SiteInSync`, so a changed ramp re-applies. `yaw` not a multiple of 90 is a
 load warning naming the ref and the house is not placed (validate says the
 same on the References page); a missing asset or a voxel size that disagrees
 with `kVoxelsPerMetre` likewise. **Materials remap by NAME**: the struct.json's
@@ -20849,13 +20939,13 @@ opened instance previews live; other copies change on save. A paste inside a
 `refs/harrowby.json` (four structure refs, five villagers, the outdoor
 waynodes, a marker), five structure assets (`assets/structures/harrowby_*`:
 three generated houses hand-edited through the command layer, and the green
-and the field built from nothing), the map's forest clearing `harrowby_clearing`
-(kind `clearing`; it was a harness-style PAD BOX until 2026-09-29, which bared
-the ground cover too and calmed the relief, so a new game started on a bald,
-jittered square with the spawn inside it), its sculpt layer and its ground edit
-layer (`default_ground`). The spawn stands in the wood 10 m south of the
-clearing, (580, 3620) -- (580, 3515) sat on the green's edge, where no tree can
-stand without its crown over the green. Every step is a
+and the field built from nothing), the map's softened ground `harrowby_ground`
+(kind `soften`, §9c "A VILLAGE IN THE FOREST": hills 25 %, bumps 0, grain 0,
+paths 10 %; until the owner's look pass of 2026-09-29 it was a forest CLEARING
+over a `sculpt_flatten` plateau, and before that a harness-style pad box) and
+its ground edit layer (`default_ground`, tracks painted two cells deep). No
+clearing: the forest stands among the houses under the per-tree building
+rule. The spawn stands in the wood south of the village, (580, 3620). Every step is a
 readable file in `assets/worldmap/default/scripts/` (params, `.jsonl` edit
 scripts, two `.sh` ground scripts), run in number order. How-to (and how to
 add a fourth house): `docs/EDITOR_GUIDE.md` §14. Gate: `village-harrowby`.
@@ -20881,10 +20971,13 @@ boot to boot), so the pin is compared, and recorded, only when the village is
 the FIRST gate to tick the world in its process (`World::TicksEncoded() == 0`
 at entry); elsewhere the trace is printed and not judged.
 `SANDVOX_HARROWBY_SHOTS=<prefix>` writes the village pictures from the day.
-Since the clearing (2026-09-29) it also counts, right after worldgen, every
-tree-material voxel (the species files' bark / leaf / autumn-leaf names)
-inside each structure's stamped box and the 48 voxels above it, per
-structure: want 0. `--shot-spawn` is the matching picture of the GAME: the
+It also counts, right after worldgen, every tree-material voxel (the species
+files' bark / leaf / autumn-leaf names) inside each structure's stamped box and
+the 48 voxels above it, per structure: want 0 -- with no clearing since the
+look pass, this is the per-tree building rule's assertion on the real village.
+Its per-villager line reports each body's coats at dawn and dusk (with the hp
+lost by cause), and `SANDVOX_HARROWBY_SHOTS` adds three pictures on foot from
+the green and two doorsteps. `--shot-spawn` is the matching picture of the GAME: the
 real map from the spawn, on foot, toward `SANDVOX_SHOT_SPAWN_LOOK=x,z`, then
 turned round, then from above.
 
@@ -20911,8 +21004,23 @@ turned round, then from above.
   AVERAGE over +-R voxels instead of every 8-voxel sample: an exact flatten
   cancels the fine grain only at the samples and leaves a plane of one- and
   two-voxel risers with dirt on each, which read as churned ground from the
-  spawn; Harrowby's layer is now `--rect` = its clearing, `--feather 64`,
-  `--keep-grain 24`.
+  spawn; Harrowby's layer was `--rect` = its clearing, `--feather 64`,
+  `--keep-grain 24` -- and was DELETED in the look pass (2026-09-29): a
+  flatten keeps the fine octaves, which were the noise; the `soften` kind
+  scales them instead. The tool stays for shaping by hand.
+- **The look pass (2026-09-29)**: the green asset lost its four boundary
+  stones and was cropped to the well and bench (origin and slots shifted, so
+  every world cell stays put); the alehouse's and longhouse's twelve open
+  shutters, which touched their walls only along an edge and fell off as
+  32-voxel debris islands whenever the island scan reached them, got two
+  timber hinge knuckles each. FOUND, NOT FIXED: on some days every villager
+  ends with a blood coat and tracks red prints along the paths with no blood
+  lost and no hp lost -- `SANDVOX_COAT_TRACE=<mat id>` (env; mob.cpp) traced
+  it to body voxels of the human anatomy's own `blood` material leaving
+  Maud's lower leg as air (`BurnOneLimb`'s removal, not a world rule, not a
+  splatter, not a wound stain), which bares its neighbours and paints the
+  `bareBlood` coat; the others pick it up from the stained gravel. Which of
+  her own voxel rules fires is the next question for the gore owner.
 - `scripts/paint_ground.mjs`: paths painted into the map's ground-relative
   edit layer along a polyline -- the F8 editor edits houses, and the ground
   between them belongs to no house.

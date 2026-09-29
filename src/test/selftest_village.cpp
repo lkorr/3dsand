@@ -30,13 +30,16 @@
 //                          voxel of a tree material (every assets/trees/*.json
 //                          bark / leaf / autumnLeaf) inside any structure's
 //                          stamped box or the 48 voxels of air above its roof
-//                          -- the forest stands round the village's clearing
-//                          (map.json kind "clearing"), its crowns included.
-//                          Counted per structure.
+//                          -- the forest stands among the houses and the
+//                          per-tree building rule (worldgen.wgsl
+//                          siteBlocksTrunk) leaves out every tree whose crown
+//                          would come near one. Counted per structure.
 //                     SANDVOX_HARROWBY_SHOTS=<prefix> also writes pictures
 //                     from the first run: the village from above at midday,
-//                     each interior, a villager at work
-//                     (<prefix>_overview.bmp, ..._smithy.bmp, ...).
+//                     each interior, a villager at work, and on foot from the
+//                     green and two doorsteps
+//                     (<prefix>_overview.bmp, ..._smithy.bmp,
+//                     ..._ground_north.bmp, ..._door_longhouse.bmp, ...).
 //
 // The map is the game's map (worldmap::ActiveMapName of world.mapLayer, or
 // SANDVOX_VILLAGE_MAP); the gate switches to it, regenerates the window
@@ -441,6 +444,16 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
   if (out.spawned != (int)v.npcs.size())
     out.why.push_back(Format("%d of %zu villagers spawned after %d ticks", out.spawned,
                              v.npcs.size(), waited));
+  // What each body carries when it wakes (its coats; see the dusk line).
+  {
+    std::string dawn;
+    for (const refs::Ref* n : v.npcs)
+      if (const Mob* m = c.mobs.FindMobByRef(n->id)) {
+        const LimbCoat bc = c.mobs.BodyCoat(m->Id());
+        dawn += Format("%s%s %u", dawn.empty() ? "" : ", ", n->id.substr(n->id.find('/') + 1).c_str(), bc.sumAmt);
+      }
+    out.lines += "coat sums at dawn: " + dawn + "; ";
+  }
 
   // The day, one boundary at a time.
   for (int b : order) {
@@ -510,6 +523,17 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
            shots + "_alehouse.bmp");
       Shot(c, HousePoint(st, "harrowby/field", 0, 22, -60), HousePoint(st, "harrowby/field", 0, 0, 10),
            shots + "_field.bmp");
+      // ON FOOT (eye 1.7 m over the floor level), the owner's viewpoint: from
+      // the green toward each house, and two doorways from 4.5 m out -- the
+      // ground between the houses, how it meets their floors, the trees
+      // among them.
+      Shot(c, green + Vec3{8.0f, 17.0f, 70.0f}, green + Vec3{0.0f, 12.0f, -100.0f}, shots + "_ground_north.bmp");
+      Shot(c, green + Vec3{40.0f, 17.0f, 20.0f}, green + Vec3{-150.0f, 10.0f, 0.0f}, shots + "_ground_west.bmp");
+      Shot(c, green + Vec3{-40.0f, 17.0f, 20.0f}, green + Vec3{150.0f, 10.0f, 0.0f}, shots + "_ground_east.bmp");
+      Shot(c, HousePoint(st, "harrowby/longhouse", -5, 17, 73), HousePoint(st, "harrowby/longhouse", -5, 8, 28),
+           shots + "_door_longhouse.bmp");
+      Shot(c, HousePoint(st, "harrowby/smithy", -3, 17, 76), HousePoint(st, "harrowby/smithy", -3, 8, 31),
+           shots + "_door_smithy.bmp");
     }
   }
   // D. every door shut at the end of the day.
@@ -534,10 +558,28 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
     const float bled = body != nullptr ? body->BloodLost() : 0.0f;
     if (bled > 0.0f)
       out.why.push_back(Format("%s lost %.1f blood over an ordinary day", n->id.c_str(), bled));
-    out.lines += Format("%s%s %d/%d rows, %u doors%s", out.lines.empty() ? "" : "; ",
+    // What the body carries at the end of the day (a coat of blood with no
+    // blood lost is someone ELSE's, tracked round the village by the feet):
+    // named, so a red trail in the pictures has an owner (CLAUDE.md rule 6).
+    std::string coat;
+    if (body != nullptr) {
+      const LimbCoat bc = c.mobs.BodyCoat(body->Id());
+      for (int k = 0; k < kCoatTop; k++)
+        if (bc.top[k].sumAmt > 0 && bc.top[k].mat < c.mats.size())
+          coat += Format("%s%s %u", coat.empty() ? ", coat " : "+", c.mats[bc.top[k].mat].name.c_str(),
+                         bc.top[k].sumAmt);
+      // ...and what hurt it, by cause (a bruise saturates into a blood coat
+      // with no blood lost: Mob::BruiseLimb).
+      static const char* kCause[] = {"other", "blade", "blunt", "bite", "beam", "blast", "unarmed", "burn", "spawnrot", "fall"};
+      for (int k = 0; k < (int)DamageCause::Count && k < 10; k++)
+        if (body->HpLostBy((DamageCause)k) > 0.0f)
+          coat += Format(", hurt %s %.2f", kCause[k], body->HpLostBy((DamageCause)k));
+    }
+    out.lines += Format("%s%s %d/%d rows, %u doors%s%s", out.lines.empty() ? "" : "; ",
                         n->id.substr(n->id.find('/') + 1).c_str(), tr.reached, tr.rows, rs.doorOpens,
-                        bled > 0.0f ? Format(", BLED %.1f", bled).c_str() : "");
+                        bled > 0.0f ? Format(", BLED %.1f", bled).c_str() : "", coat.c_str());
   }
+  out.lines += Format("; %u bodies in the world at dusk", c.mobs.MobCount());
   rig.reset();
   refs::RefCtx rc{&st, &c.mobs, &c.world, &c.stream.Store()};
   rc.phys = &c.phys;
@@ -721,8 +763,9 @@ Status GateVillageHarrowby(Ctx& c, std::string& detail) {
     canopyLine += Format("%s%s %d+%d", canopyLine.empty() ? "" : ", ", name.c_str(), cc.inBox, cc.overhead);
     if (cc.inBox + cc.overhead > 0)
       check(false, Format("%s: %d tree-material voxels inside its stamped box (%d,%d,%d)..(%d,%d,%d) and %d in "
-                          "the 48 above it, the first at (%d,%d,%d): the forest's crowns reach into the "
-                          "village -- widen the map's clearing (map.json kind \"clearing\") over it",
+                          "the 48 above it, the first at (%d,%d,%d): a tree reaches into the house, which "
+                          "the per-tree building rule (worldgen.wgsl siteBlocksTrunk) exists to refuse -- "
+                          "an authored tree site there, or a bug in the rule",
                           cc.id.c_str(), cc.inBox, cc.lo.x, cc.lo.y, cc.lo.z, cc.hi.x, cc.hi.y, cc.hi.z,
                           cc.overhead, cc.first.x, cc.first.y, cc.first.z));
   }

@@ -17,11 +17,13 @@
 #                spawn
 #
 # pos is the middle of the house's footprint, y the floor you walk on (the
-# clearing is levelled to ground 200, so floor 201). A placed house levels a
-# SQUARE pad as wide as its longest side plus padMargin; two pads that overlap
-# are a load warning, so the margins are kept tight (4) and the houses spaced
-# to the voxel: the longhouse's square ends at z 3419, the green's begins at
-# 3421; the alehouse's ends at x 476, the smithy's begins at 643.
-{"cmd": "ref.place", "args": {"id": "harrowby/longhouse", "kind": "structure", "base": "harrowby_longhouse", "pos": [560, 201, 3340], "yaw": 0, "props": {"padMargin": 4}}}
-{"cmd": "ref.place", "args": {"id": "harrowby/smithy", "kind": "structure", "base": "harrowby_smithy", "pos": [700, 201, 3460], "yaw": 270, "props": {"padMargin": 4}}}
-{"cmd": "ref.place", "args": {"id": "harrowby/alehouse", "kind": "structure", "base": "harrowby_alehouse", "pos": [415, 201, 3460], "yaw": 90, "props": {"padMargin": 4}}}
+# village's softened ground rolls round 200, so floor 201). A placed house
+# levels its own footprint and a ring round it (padApron, 0.8 m: the
+# doorsteps) to the floor, then eases back into the ground with a smooth
+# S-curve over padMargin (3.6 m). Ramps of houses on the same floor may meet;
+# a ramp reaching the flat ring of a house on ANOTHER floor is a load warning.
+# (Until 2026-09-29 a pad was a SQUARE as wide as the longest side with a
+# 0.4 m straight ramp -- the hard-edged lawns.)
+{"cmd": "ref.place", "args": {"id": "harrowby/longhouse", "kind": "structure", "base": "harrowby_longhouse", "pos": [560, 201, 3340], "yaw": 0, "props": {"padApron": 8, "padMargin": 36}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/smithy", "kind": "structure", "base": "harrowby_smithy", "pos": [700, 201, 3460], "yaw": 270, "props": {"padApron": 8, "padMargin": 36}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/alehouse", "kind": "structure", "base": "harrowby_alehouse", "pos": [415, 201, 3460], "yaw": 90, "props": {"padApron": 8, "padMargin": 36}}}

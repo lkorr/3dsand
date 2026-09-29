@@ -16,6 +16,7 @@
 #include "ui/overlay.h"
 #include "ui/theme.h"
 #include "world/refs.h"
+#include "sim/worldmap.h"
 #include "world/structures.h"
 
 namespace sandvox {
@@ -333,6 +334,39 @@ void DrawContainerFields(UIState& s, refs::RefStore& st, const refs::Ref& r) {
   }
 }
 
+// A structure's PAD (sim/worldmap.h "STAMPS carry their FOOTPRINT RECT"):
+// the flat ring round the house and the smoothstep ramp back to the ground.
+// Applied when the slider is let go; the house re-applies (SiteInSync).
+void DrawStructureFields(UIState& s, refs::RefStore& st, const refs::Ref& r) {
+  (void)s;
+  std::string err;
+  const std::string id = r.id;
+  ImGui::TextColored(V4(ui::ColGoldDim()), "ground round the house");
+  static int apron = worldmap::kStructurePadApron, ramp = worldmap::kStructurePadMargin;
+  static std::string forId;
+  if (forId != id || !ImGui::IsAnyItemActive()) {
+    apron = PropI(r, "padApron", worldmap::kStructurePadApron);
+    ramp = PropI(r, "padMargin", worldmap::kStructurePadMargin);
+  }
+  forId = id;
+  ImGui::SetNextItemWidth(160);
+  ImGui::SliderInt("flat apron", &apron, 0, 32, "%d vox");
+  if (ImGui::IsItemDeactivatedAfterEdit())
+    Report(refs::SetProp(st, id, "padApron", refs::Json(apron), &err), "padApron set", err);
+  ImGui::SetItemTooltip(
+      "How far the ground stays dead level with the floor all round\n"
+      "the house (voxels, 10 = 1 m): the doorsteps. props.padApron.");
+  ImGui::SetNextItemWidth(160);
+  ImGui::SliderInt("ramp", &ramp, 1, 64, "%d vox");
+  if (ImGui::IsItemDeactivatedAfterEdit())
+    Report(refs::SetProp(st, id, "padMargin", refs::Json(ramp), &err), "padMargin set", err);
+  ImGui::SetItemTooltip(
+      "How wide the ground eases from the level apron back into the\n"
+      "natural slope (a smooth S-curve; voxels). Wider = gentler.\n"
+      "Trees keep off apron + ramp, and no tree's crown comes within\n"
+      "1 m of the walls. props.padMargin.");
+}
+
 void DrawBedFields(UIState& s, const refs::Ref& r) {
   refs::BedAnchor a;
   ImGui::TextColored(V4(ui::ColGoldDim()), "bed");
@@ -620,6 +654,7 @@ void DrawRefsPage(UIState& s) {
       else if (cur->kind == "bed") DrawBedFields(s, *cur);
       else if (cur->kind == "npc") DrawNpcFields(s, st, *cur);
       else if (cur->kind == "waynode") DrawWaynodeFields(s, st, *cur);
+      else if (cur->kind == "structure") DrawStructureFields(s, st, *cur);
     }
   }
 
@@ -785,4 +820,5 @@ void DrawRefKindFields(UIState& s, refs::RefStore& st, const refs::Ref& r) {
   else if (r.kind == "bed") DrawBedFields(s, r);
   else if (r.kind == "npc") DrawNpcFields(s, st, r);
   else if (r.kind == "waynode") DrawWaynodeFields(s, st, r);
+  else if (r.kind == "structure") DrawStructureFields(s, st, r);
 }

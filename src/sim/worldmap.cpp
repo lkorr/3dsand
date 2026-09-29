@@ -1002,6 +1002,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         }
         st.rot = s.value("rot", 0) & 3;
         st.padMargin = std::clamp(s.value("padMargin", 8), 1, 64);
+        st.apron = std::clamp(s.value("padApron", 0), 0, 32);
         st.salt = static_cast<uint32_t>(s.value("salt", 0));
         if (st.templateName.empty()) {
           log += at + "site \"" + id + "\" kind stamp needs a template name (assets/prefabs/<name>.vox)\n";
@@ -1140,9 +1141,52 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         st.salt = 0;
         if (!readTreeSpecies()) return false;   // the index reach needs the widest crown
         out.sites.push_back(std::move(st));
+      } else if (kind == "soften") {
+        // SOFTENED GROUND (worldmap.h kSiteSoften): the local octaves scaled
+        // inside a box, easing back across the feather. Same box rules as a
+        // clearing: corners the wrong way round are a refusal naming it.
+        WorldMapData::StampSite st;
+        st.id = id;
+        st.kind = kSiteSoften;
+        if (!(s.contains("min") && s.contains("max") && s["min"].is_array() && s["max"].is_array() &&
+              s["min"].size() == 2 && s["max"].size() == 2 && s["min"][0].is_number() &&
+              s["min"][1].is_number() && s["max"][0].is_number() && s["max"][1].is_number())) {
+          log += at + "site \"" + id + "\" kind soften needs min[2]/max[2] in world voxels\n";
+          return false;
+        }
+        st.x = s["min"][0].get<int>(); st.z = s["min"][1].get<int>();
+        st.x1 = s["max"][0].get<int>(); st.z1 = s["max"][1].get<int>();
+        if (st.x1 < st.x || st.z1 < st.z) {
+          log += at + "site \"" + id + "\" kind soften: min (" + std::to_string(st.x) + "," +
+                 std::to_string(st.z) + ") is not below max (" + std::to_string(st.x1) + "," +
+                 std::to_string(st.z1) + ") on both axes\n";
+          return false;
+        }
+        const int fe = s.value("feather", static_cast<int>(kSoftenFeatherDefault));
+        st.padMargin = std::clamp(fe, 0, static_cast<int>(kClearingFeatherMax));
+        if (fe != st.padMargin)
+          warn("site \"" + id + "\": feather " + std::to_string(fe) + " clamped to " +
+               std::to_string(st.padMargin) + " (0.." + std::to_string(kClearingFeatherMax) + ")");
+        // Percent of the biome's own amplitude -> Q8. Out of 0..100 is a
+        // warning and a clamp (more than the biome's own relief is what the
+        // sculpt layer and the biome's terrain block are for).
+        auto pct = [&](const char* key, int def) -> int {
+          int v = def;
+          if (s.contains(key) && s[key].is_number()) v = static_cast<int>(std::lround(s[key].get<double>()));
+          const int c = std::clamp(v, 0, 100);
+          if (c != v) warn("site \"" + id + "\": " + key + " " + std::to_string(v) + " clamped to " + std::to_string(c) + " (0..100 %)");
+          return (c * 256 + 50) / 100;
+        };
+        st.softHill = pct("hills", static_cast<int>(kSoftenHillDefault));
+        st.softBump = pct("bumps", static_cast<int>(kSoftenBumpDefault));
+        st.softGrain = pct("grain", static_cast<int>(kSoftenGrainDefault));
+        st.softPath = pct("paths", static_cast<int>(kSoftenPathsDefault));
+        st.radius = 0;
+        st.salt = 0;
+        out.sites.push_back(std::move(st));
       } else {
         warn("site \"" + id + "\": unknown kind \"" + kind +
-             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree, clearing)");
+             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree, clearing, soften)");
       }
     }
   }
@@ -1208,6 +1252,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.z = f.siteZ;
       st.rot = f.rot;
       st.padMargin = sp.padMargin > 0 ? std::clamp(sp.padMargin, 1, 64) : kStructurePadMargin;
+      st.apron = sp.padApron >= 0 ? std::clamp(sp.padApron, 0, 32) : kStructurePadApron;
+      st.refPadMargin = sp.padMargin;
+      st.refPadApron = sp.padApron;
       st.salt = 0;
       st.padY = sp.y - 1;   // the AUTHORED floor: ground top is one below GRADE
       st.sink = f.sink;
@@ -1230,8 +1277,53 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     for (const StructurePlacement& sp : placements) {
       const std::string k = sp.id + "|" + sp.base + "|" + std::to_string(sp.x) + "," +
                             std::to_string(sp.y) + "," + std::to_string(sp.z) + "|" +
-                            std::to_string(sp.yaw) + "|" + std::to_string(sp.padMargin);
+                            std::to_string(sp.yaw) + "|" + std::to_string(sp.padMargin) + "|" +
+                            std::to_string(sp.padApron);
       sh = FnvBytes(sh == 0 ? 2166136261u : sh, reinterpret_cast<const uint8_t*>(k.data()), k.size());
+    }
+    // THE WALKING ROUTES (worldmap.h kSitePath): every waynode link of the
+    // map's refs outside the houses becomes a trunk keep-out, so the forest
+    // that now stands in a village (no clearing needed) never puts a trunk
+    // on a villager's straight line. Read from the files like the
+    // placements; a gate's structure override has no routes.
+    if (!StructureOverrideActive()) {
+      std::vector<structures::WaySegment> segs;
+      structures::ReadWaySegments(assetDir, name, segs);
+      auto inHouse = [&](int x, int z) {
+        for (const WorldMapData::StampSite& h : out.sites)
+          if (h.structure && x >= h.x - h.nx / 2 && x < h.x - h.nx / 2 + h.nx &&
+              z >= h.z - h.nz / 2 && z < h.z - h.nz / 2 + h.nz)
+            return true;
+        return false;
+      };
+      int nPath = 0;
+      for (const structures::WaySegment& g : segs) {
+        // A link with both ends indoors is a house's own route: no trunk can
+        // stand inside a house, so it needs no keep-out (and no index words).
+        if (inHouse(g.ax, g.az) && inHouse(g.bx, g.bz)) continue;
+        // Pieces of at most 256 voxels a side: the shader's projection
+        // (worldgen.wgsl routeNear) then stays far inside i32.
+        const int len = std::max(std::abs(g.bx - g.ax), std::abs(g.bz - g.az));
+        const int pieces = std::max(1, (len + 255) / 256);
+        for (int q = 0; q < pieces; q++) {
+          WorldMapData::StampSite st;
+          st.id = "route " + g.a + " - " + g.b + (pieces > 1 ? " #" + std::to_string(q + 1) : std::string());
+          st.kind = kSitePath;
+          st.x = g.ax + (g.bx - g.ax) * q / pieces;
+          st.z = g.az + (g.bz - g.az) * q / pieces;
+          st.x1 = g.ax + (g.bx - g.ax) * (q + 1) / pieces;
+          st.z1 = g.az + (g.bz - g.az) * (q + 1) / pieces;
+          st.padMargin = kPathTrunkKeepOut;
+          st.radius = 0;
+          st.salt = 0;
+          out.sites.push_back(std::move(st));
+        }
+        nPath++;
+        const std::string k = "route|" + g.a + "|" + g.b + "|" + std::to_string(g.ax) + "," + std::to_string(g.az) +
+                              "|" + std::to_string(g.bx) + "," + std::to_string(g.bz);
+        sh = FnvBytes(sh == 0 ? 2166136261u : sh, reinterpret_cast<const uint8_t*>(k.data()), k.size());
+      }
+      if (nPath > 0) std::printf("world map: '%s' %d waynode link(s) keep trunks off their line\n", name.c_str(), nPath);
     }
     out.structureHash = sh;
   }
@@ -1396,19 +1488,48 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // A clearing's reach is past its BOX (its x, z is the min corner): the
   // feather + the widest crown, because a trunk that far out still has its
   // crown's gap to the box measured (siteBlocksTrunk asks from the trunk).
+  // A STAMP's footprint RECT (worldmap.h "STAMPS carry their FOOTPRINT
+  // RECT"): exactly the cells wmStampCell draws into, x - nx/2 .. + nx - 1.
+  // Its reach is the pad (rect + apron + margin) or, for the per-tree
+  // building rule, the widest crown + kStampTreeClear, whichever is further:
+  // the lattice asks from the TRUNK's cell whether its crown meets the rect.
+  // A soften box is listed over box + feather; a route over its segment's
+  // box + the keep-out.
+  bool anyStamp = false;
+  for (WorldMapData::StampSite& st : out.sites) {
+    if (st.kind != kSiteStamp) continue;
+    anyStamp = true;
+    st.bx0 = st.x - st.nx / 2;
+    st.bz0 = st.z - st.nz / 2;
+    st.x1 = st.bx0 + std::max(st.nx, 1) - 1;
+    st.z1 = st.bz0 + std::max(st.nz, 1) - 1;
+  }
+  if (anyStamp && !readTreeSpecies()) return false;
   for (WorldMapData::StampSite& st : out.sites) {
     if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
     else if (st.kind == kSiteClearing) st.indexReach = st.padMargin + treeMaxReach + 1;
+    else if (st.kind == kSiteSoften) st.indexReach = st.padMargin + 1;
+    else if (st.kind == kSitePath) st.indexReach = std::max(st.padMargin, static_cast<int>(kRouteSoftOuter)) + 1;
+    else if (st.kind == kSiteStamp)
+      st.indexReach = std::max(st.apron + 64, static_cast<int>(kStampTreeClear) + treeMaxReach) + 1;
     else st.indexReach = st.radius + st.padMargin + (st.kind == kSiteWater ? 1 : 0);
   }
   {
     std::map<size_t, std::vector<uint32_t>> byCell;   // ordered: the pack is a pure function of the map
     for (size_t si = 0; si < out.sites.size(); si++) {
       const WorldMapData::StampSite& st = out.sites[si];
-      const int hx = st.kind == kSiteClearing ? st.x1 : st.x;   // the far corner
-      const int hz = st.kind == kSiteClearing ? st.z1 : st.z;
+      // The listed box: a centre +- reach, or a BOX kind's own corners + reach
+      // (a clearing / soften: min .. max; a stamp: its rect; a route: its two
+      // ends in either order).
+      int lx = st.x, lz = st.z, hx = st.x, hz = st.z;
+      if (st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath) {
+        lx = std::min(st.x, st.x1); hx = std::max(st.x, st.x1);
+        lz = std::min(st.z, st.z1); hz = std::max(st.z, st.z1);
+      } else if (st.kind == kSiteStamp) {
+        lx = st.bx0; lz = st.bz0; hx = st.x1; hz = st.z1;
+      }
       int c0x, c0z, c1x, c1z;
-      out.CellOf(st.x - st.indexReach, st.z - st.indexReach, &c0x, &c0z);
+      out.CellOf(lx - st.indexReach, lz - st.indexReach, &c0x, &c0z);
       out.CellOf(hx + st.indexReach, hz + st.indexReach, &c1x, &c1z);
       for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.height - 1); cz++)
         for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.width - 1); cx++)
@@ -1451,21 +1572,49 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // source. The spawn inside a footprint is said too (spawn-site asserts it
   // for the game's map; this names it for every map, on the page).
   {
-    struct Fp { bool disc; int64_t x, z, r; };
-    auto fpOf = [&](const WorldMapData::StampSite& s) -> Fp {
-      if (s.kind == kSiteWater) return {true, s.x, s.z, s.radius + s.padMargin};
-      if (s.kind == kSiteTree) return {false, s.x, s.z, kSiteTreeKeepOut};
-      return {false, s.x, s.z, s.radius + s.padMargin};
+    // A footprint is a disc (a lake) or an axis box (x0..x1, z0..z1). A
+    // stamp is TWO: its FLAT core (rect + apron) and its whole pad (+ the
+    // ramp). Two stamps' ramps may meet -- sitePadAt blends them in turn and
+    // stays continuous -- but one's ramp must not reach the other's flat
+    // core, or that floor tilts; `fpOf(s, core)` picks which.
+    struct Fp { bool disc; int64_t x0, z0, x1, z1, r; };
+    auto fpOf = [&](const WorldMapData::StampSite& s, bool core) -> Fp {
+      if (s.kind == kSiteWater) return {true, s.x, s.z, s.x, s.z, s.radius + s.padMargin};
+      if (s.kind == kSiteTree)
+        return {false, s.x - kSiteTreeKeepOut, s.z - kSiteTreeKeepOut, s.x + kSiteTreeKeepOut, s.z + kSiteTreeKeepOut, 0};
+      const int64_t e = s.apron + (core ? 0 : s.padMargin);
+      return {false, s.bx0 - e, s.bz0 - e, s.x1 + e, s.z1 + e, 0};
     };
     auto meets = [](const Fp& a, const Fp& b) -> bool {
-      const int64_t dx = a.x - b.x, dz = a.z - b.z;
-      if (a.disc && b.disc) return dx * dx + dz * dz < (a.r + b.r) * (a.r + b.r);
-      if (!a.disc && !b.disc) return std::llabs(dx) <= a.r + b.r && std::llabs(dz) <= a.r + b.r;
+      if (a.disc && b.disc) {
+        const int64_t dx = a.x0 - b.x0, dz = a.z0 - b.z0;
+        return dx * dx + dz * dz < (a.r + b.r) * (a.r + b.r);
+      }
+      if (!a.disc && !b.disc) return a.x0 <= b.x1 && b.x0 <= a.x1 && a.z0 <= b.z1 && b.z0 <= a.z1;
       const Fp& d = a.disc ? a : b;
       const Fp& q = a.disc ? b : a;
-      const int64_t ex = std::max<int64_t>(std::llabs(d.x - q.x) - q.r, 0);
-      const int64_t ez = std::max<int64_t>(std::llabs(d.z - q.z) - q.r, 0);
+      const int64_t ex = std::max<int64_t>(std::max(q.x0 - d.x0, d.x0 - q.x1), 0);
+      const int64_t ez = std::max<int64_t>(std::max(q.z0 - d.z0, d.z0 - q.z1), 0);
       return ex * ex + ez * ez < d.r * d.r;
+    };
+    // Two stamps: the pad's own octagon distance (worldgen.wgsl stampRectDist)
+    // between the rects, less the other's apron, against the ramp's reach.
+    // Two pads at the SAME height never tilt each other (the blend of a floor
+    // with itself is that floor), so they may overlap freely -- a village's
+    // houses all on one level is the common case.
+    auto rectGap = [](const WorldMapData::StampSite& a, const WorldMapData::StampSite& b) -> int64_t {
+      const int64_t gx = std::max<int64_t>({(int64_t)b.bx0 - a.x1, (int64_t)a.bx0 - b.x1, 0});
+      const int64_t gz = std::max<int64_t>({(int64_t)b.bz0 - a.z1, (int64_t)a.bz0 - b.z1, 0});
+      return std::max(gx, gz) + (std::min(gx, gz) >> 1);
+    };
+    auto clash = [&](const WorldMapData::StampSite& a, const WorldMapData::StampSite& b) -> bool {
+      if (a.kind == kSiteStamp && b.kind == kSiteStamp) {
+        const int64_t g = rectGap(a, b);
+        if (g <= a.apron || g <= b.apron) return true;   // the flat cores themselves meet
+        if (a.structure && b.structure && a.padY == b.padY) return false;   // map stamps bake padY below
+        return g - b.apron < a.apron + a.padMargin || g - a.apron < b.apron + b.padMargin;
+      }
+      return meets(fpOf(a, false), fpOf(b, false));
     };
     auto kindName = [](int k) { return k == kSiteWater ? "lake" : k == kSiteTree ? "tree" : "stamp"; };
     std::set<std::pair<uint32_t, uint32_t>> seen;
@@ -1479,8 +1628,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           const WorldMapData::StampSite& sb = out.sites[ib - 1];
           // A clearing claims no ground: it is MEANT to hold houses, lakes
           // and authored trees (two clearings overlapping is one bigger one).
-          if (sa.kind == kSiteClearing || sb.kind == kSiteClearing) continue;
-          if (!meets(fpOf(sa), fpOf(sb))) continue;
+          // Nor does softened ground or a route.
+          auto claimsNone = [](int k) { return k == kSiteClearing || k == kSiteSoften || k == kSitePath; };
+          if (claimsNone(sa.kind) || claimsNone(sb.kind)) continue;
+          if (!clash(sa, sb)) continue;
           warn("site \"" + sa.id + "\" (" + kindName(sa.kind) + " at " + std::to_string(sa.x) + "," +
                std::to_string(sa.z) + ") and site \"" + sb.id + "\" (" + kindName(sb.kind) + " at " +
                std::to_string(sb.x) + "," + std::to_string(sb.z) + ") overlap; where they meet \"" + sa.id +
@@ -1499,8 +1650,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                  "): the player starts in the open, not among trees");
           continue;
         }
-        const Fp f = fpOf(s);
-        const Fp sp{false, out.spawnX, out.spawnZ, 0};
+        if (s.kind == kSiteSoften || s.kind == kSitePath) continue;   // walkable ground, both
+        const Fp f = fpOf(s, false);
+        const Fp sp{false, out.spawnX, out.spawnZ, out.spawnX, out.spawnZ, 0};
         if (meets(f, sp))
           warn("the spawn (" + std::to_string(out.spawnX) + "," + std::to_string(out.spawnZ) +
                ") is inside site \"" + s.id + "\"'s footprint (" + kindName(s.kind) + ")");
@@ -1522,7 +1674,37 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     Slot() = out;
     for (WorldMapData::StampSite& st : out.sites) {
       if (st.structure) continue;   // the AUTHORED floor, set above (P4)
-      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing ? 0 : BareGroundHeight(st.x, st.z, seed);
+      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath
+                    ? 0 : BareGroundHeight(st.x, st.z, seed);
+    }
+    // A RAMP NEVER STEPS MORE THAN A VOXEL (2026-09-29). The smoothstep's
+    // steepest point is 1.5 x the height it makes up over the margin, so a
+    // pad cut into a hillside, or raised off a hollow, by more than the
+    // margin can ease would step 2+ voxels a column. The authored margin is
+    // the MINIMUM: it widens to twice the largest gap between the floor and
+    // the bare ground round the pad's outer edge (+2), up to the 64 the prop
+    // allows. Harrowby's houses sit within a metre of their floors and keep
+    // their authored ramps. The index reach of a stamp already covers 64
+    // (kStampTreeClear + the widest crown is further).
+    for (WorldMapData::StampSite& st : out.sites) {
+      if (st.kind != kSiteStamp) continue;
+      const int e = st.apron + st.padMargin;
+      int gap = 0;
+      auto probe = [&](int x, int z) { gap = std::max(gap, std::abs(BareGroundHeight(x, z, seed) - st.padY)); };
+      for (int x = st.bx0 - e; x <= st.x1 + e; x += 8) { probe(x, st.bz0 - e); probe(x, st.z1 + e); }
+      for (int z = st.bz0 - e; z <= st.z1 + e; z += 8) { probe(st.bx0 - e, z); probe(st.x1 + e, z); }
+      int need = std::min(64, 2 * gap + 2);
+      // ...but never so far that it reaches the flat core of a stamp on
+      // ANOTHER floor (the overlap warning above judged the authored ramps;
+      // a widened one must not tilt a neighbour's floor that was fine).
+      for (const WorldMapData::StampSite& o : out.sites) {
+        if (&o == &st || o.kind != kSiteStamp || o.padY == st.padY) continue;
+        const int gx = std::max({o.bx0 - st.x1, st.bx0 - o.x1, 0});
+        const int gz = std::max({o.bz0 - st.z1, st.bz0 - o.z1, 0});
+        const int g = std::max(gx, gz) + (std::min(gx, gz) >> 1);
+        need = std::min(need, g - o.apron - st.apron - 1);
+      }
+      if (need > st.padMargin) st.padMargin = need;
     }
     Slot() = std::move(prev);
   }
@@ -1563,6 +1745,13 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   int nClear = 0;
   for (const WorldMapData::StampSite& s : m.sites) nClear += s.kind == kSiteClearing ? 1 : 0;
   j["clearings"] = nClear;
+  int nSoft = 0, nRoute = 0;
+  for (const WorldMapData::StampSite& s : m.sites) {
+    nSoft += s.kind == kSiteSoften ? 1 : 0;
+    nRoute += s.kind == kSitePath ? 1 : 0;
+  }
+  j["softens"] = nSoft;
+  j["routes"] = nRoute;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
   j["warnings"] = m.warnings;
   j["error"] = error;
@@ -1631,7 +1820,17 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
     r[kS_Species] = U(s.species);
     r[kS_Variant] = U(s.variant);
     r[kS_Sink] = U(s.sink);
-    if (s.kind == kSiteClearing) { r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1); }
+    if (s.kind == kSiteClearing || s.kind == kSitePath) { r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1); }
+    if (s.kind == kSiteSoften) {
+      r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
+      r[kS_SoftHill] = U(s.softHill); r[kS_SoftBump] = U(s.softBump); r[kS_SoftGrain] = U(s.softGrain);
+      r[kS_SoftPath] = U(s.softPath);
+    }
+    if (s.kind == kSiteStamp) {
+      r[kS_BoxX0] = U(s.bx0); r[kS_BoxZ0] = U(s.bz0);
+      r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1);
+      r[kS_Apron] = U(s.apron);
+    }
     if (s.kind != kSiteStamp || s.words.empty()) continue;   // a water site has no block
     // The stamp block: rebase its relative offsets (column dir + run offsets)
     // onto the buffer as it is appended.

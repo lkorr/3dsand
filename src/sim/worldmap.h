@@ -491,6 +491,42 @@ enum : uint32_t {
 // widest crown reaches, because the lattice asks from the trunk's cell
 // (worldgen.wgsl siteBlocksTrunk -> clearingRefuses; the far cascades draw
 // trees through the same treeInfoBare, so they agree by construction).
+// kSiteSoften (2026-09-29): SOFTENED GROUND -- `{kind: "soften", min: [x, z],
+// max: [x, z], feather?, hills?, bumps?, grain?}` in map.json. A box (world
+// voxels, inclusive) inside which the three LOCAL octaves of the terrain are
+// scaled: `hills` (the 12.8 m swells), `bumps` (the 3 m detail) and `grain`
+// (the sub-metre grain), each a percent 0..100 of the biome's own amplitude
+// (defaults 40 / 20 / 0). The landform and the coarse range rung are left
+// alone, so a softened village keeps its place on the hillside; the scale
+// eases back to 100 % across the feather (smoothstep, Chebyshev from the
+// box). Applied inside the height mirror (landAt, both sides) through
+// softenAt, so the ground, the trees on it, the CPU heights and the far
+// cascades all agree. kS_X / kS_Z the MIN corner, kS_BoxX1 / kS_BoxZ1 the
+// max, kS_PadMargin the feather, kS_SoftHill / Bump / Grain the three Q8
+// scales (256 = untouched), kS_SoftPath the hill scale ON the map's walking
+// routes (`paths`, default 10 %: the waynode links, kSitePath, within
+// kRouteSoftInner of the line and easing out by kRouteSoftOuter) -- the
+// tracks between the doors are flatter than the green round them, but not
+// planed. What it is for: a village that keeps the
+// biome's rolling ground at a walkable amplitude with no sub-metre lumps,
+// instead of a flattened plateau (docs/EDITOR_GUIDE.md section 14).
+// kSitePath (2026-09-29): A TRUNK KEEP-OUT ALONG A WALKING ROUTE -- not in
+// map.json: LoadWorldMap derives one per outdoor waynode LINK of the map's
+// refs (both ends resolved the way refs_npc.cpp's graph resolves them, slot
+// children of structures included), so the procedural forest never plants a
+// trunk on the line a villager walks. kS_X / kS_Z one end, kS_BoxX1 /
+// kS_BoxZ1 the other, kS_PadMargin the half-width (kPathTrunkKeepOut). A
+// trunk whose column is within that distance of the segment is refused
+// (siteBlocksTrunk); nothing else reads it.
+// STAMPS carry their FOOTPRINT RECT (2026-09-29): kS_BoxX0 / kS_BoxZ0 ..
+// kS_BoxX1 / kS_BoxZ1 the template's own rotated nx x nz box (inclusive,
+// what wmStampCell draws into), kS_Apron the flat ring round it. The pad is
+// flat over rect + apron and eases back to the terrain over kS_PadMargin more
+// with a smoothstep (sitePadAt), and every stamp reaching a column blends in
+// turn, so two ramps that meet stay continuous. A lattice trunk is refused
+// on the whole pad (rect + apron + margin: the tree's base is the bare
+// ground) AND wherever its crown square would come within kStampTreeClear of
+// the rect -- the per-tree building rule, so no house needs a clearing.
 enum : uint32_t {
   kSiteRecWords = 16,
   kS_Kind = 0,          // kSiteStamp | kSiteWater | kSiteTree | kSiteClearing
@@ -519,10 +555,18 @@ enum : uint32_t {
                         // (a structure's footing under GRADE, PLAN_world_editor
                         // P4). 0 for a map.json stamp: its bottom row sits on
                         // the pad, as it always has. <= kStampSinkMax.
-  kS_BoxX1 = 13,        // clearing site: the box's MAX corner, inclusive. A
+  kS_BoxX1 = 13,        // clearing / soften site: the box's MAX corner, inclusive. A
   kS_BoxZ1 = 14,        // clearing's kS_X / kS_Z are its MIN corner (not a
                         // centre) and kS_PadMargin its feather, in voxels.
-  // 15 reserved
+                        // A stamp: its footprint rect's max; a path: its
+                        // second end.
+  kS_BoxX0 = 10,        // stamp site: its footprint rect's MIN corner (the
+  kS_BoxZ0 = 11,        // words a tree site spends on species / variant)
+  kS_Apron = 15,        // stamp site: the flat ring round the rect, voxels
+  kS_SoftHill = 8,      // soften site: Q8 scale of the hill octave (256 = untouched)
+  kS_SoftBump = 10,     // soften site: Q8 scale of the detail octave
+  kS_SoftGrain = 11,    // soften site: Q8 scale of the grain octave
+  kS_SoftPath = 12,     // soften site: Q8 scale of the hill octave ON the routes
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -534,6 +578,8 @@ enum : uint32_t {
   kSiteRotRolled = 4,   // kS_Rot of a tree site the map did not turn
   kSiteClearing = 5,    // a forest clearing (kind "clearing"): no crown over
                         // its box, trunks thinned across its feather band
+  kSiteSoften = 6,      // softened ground (kind "soften"): the local octaves scaled
+  kSitePath = 7,        // a waynode link's trunk keep-out (derived from the refs)
   // At most this many sites may reach one map cell (the per-cell list); more
   // is a load error. Was 4 ("two neighbouring buildings, a lake and a tree")
   // until the world editor's P4: a village is ~10 structure refs plus its
@@ -552,6 +598,22 @@ enum : uint32_t {
   // may be, in voxels (worldmap.cpp clamps).
   kClearingFeatherDefault = 64,
   kClearingFeatherMax = 512,
+  // A soften site's feather when map.json names none (voxels), and its
+  // default scales in percent of the biome's own octave amplitudes.
+  kSoftenFeatherDefault = 96,
+  kSoftenHillDefault = 40,
+  kSoftenBumpDefault = 20,
+  kSoftenGrainDefault = 0,
+  kSoftenPathsDefault = 10,
+  // A route flattens the softened ground fully within this many voxels of its
+  // line and not at all past kRouteSoftOuter (a smoothstep between).
+  kRouteSoftInner = 12,
+  kRouteSoftOuter = 36,
+  // No lattice tree's CROWN comes within this many voxels of a stamp's
+  // footprint rect (the per-tree building rule, siteBlocksTrunk).
+  kStampTreeClear = 10,
+  // A waynode link keeps trunks this far from its line (voxels, 1.5 m).
+  kPathTrunkKeepOut = 15,
 };
 
 }  // namespace worldmap
@@ -709,6 +771,10 @@ struct WorldMapData {
     // inclusive; padMargin is the feather. Every other kind: (x, z) is the centre.
     int x = 0, z = 0, radius = 0, padMargin = 8, rot = 0;
     int x1 = 0, z1 = 0;
+    // A stamp: its footprint rect's min corner (x1 / z1 are its max) and the
+    // flat apron round it. A soften site: the three Q8 octave scales.
+    int bx0 = 0, bz0 = 0, apron = 0;
+    int softHill = 256, softBump = 256, softGrain = 256, softPath = 256;
     uint32_t salt = 0;
     int preset = 0;                       // water site: 1 + preset index
     int species = 0, variant = 0;         // tree site: kS_Species / kS_Variant
@@ -730,6 +796,7 @@ struct WorldMapData {
     int sink = 0;
     std::string base;
     int refX = 0, refY = 0, refZ = 0, refYaw = 0;
+    int refPadMargin = -1, refPadApron = -1;   // the ref's props as written (-1 = default)
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
   // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
@@ -822,9 +889,14 @@ struct StructurePlacement {
   int x = 0, y = 0, z = 0;      // the ref's pos: the asset's origin lands here
   int yaw = 0;
   int padMargin = -1;           // props.padMargin, -1 = the default
+  int padApron = -1;            // props.padApron, -1 = the default
 };
-// Default pad ramp for a structure, voxels (props.padMargin overrides, 1..64).
-constexpr int kStructurePadMargin = 12;
+// Default pad ramp for a structure, voxels (props.padMargin overrides, 1..64):
+// the smoothstep from the flat apron back to the terrain.
+constexpr int kStructurePadMargin = 24;
+// Default flat ring round a structure's footprint, voxels (props.padApron
+// overrides, 0..32): the doorsteps, level with the floor's threshold.
+constexpr int kStructurePadApron = 8;
 // THE GATES' SEAM: when set, LoadWorldMap uses this list INSTEAD of reading
 // the map's refs directory -- so a gate can place a house on the harness map
 // (whose refs dir is the refs gates' fixture) through the real loader, the

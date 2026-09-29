@@ -89,6 +89,19 @@ struct Asset {
 // the file and the field.
 bool LoadAsset(const std::string& assetDir, const std::string& name, bool withVoxels,
                Asset& out, std::string& err, std::vector<std::string>& warn);
+// THE WALKING ROUTES, for worldgen (worldmap.h kSitePath): every waynode LINK
+// of the map's refs group files as a world segment, both ends resolved the
+// way refs_npc.cpp's WayGraph resolves them (the name as an id, a sibling
+// slot, then the group) over the authored refs AND every placed structure's
+// slot children. One segment per linked pair, in id order. LoadWorldMap
+// turns the ones outside every house into trunk keep-outs, so the forest
+// never plants a tree on a villager's line. autoLink edges are not included.
+struct WaySegment {
+  int ax = 0, az = 0, bx = 0, bz = 0;
+  std::string a, b;   // the two waynode ids
+};
+void ReadWaySegments(const std::string& assetDir, const std::string& mapName,
+                     std::vector<WaySegment>& out);
 // Every structure under <assetDir>/structures (one folder deep, "samples/x"),
 // sorted: the References page's picker.
 std::vector<std::string> ListAssets(const std::string& assetDir);

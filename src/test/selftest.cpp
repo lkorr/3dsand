@@ -267,6 +267,10 @@ const char* const kOrder[] = {
     // window moved to forest near the spawn and put back; the pristine world
     // is regenerated and the far field refilled on the way out.
     "clearing",
+    // Then: a house in the forest with no clearing -- the per-tree building
+    // rule, the soft pad and the `soften` site kind. Same seam and exit as
+    // `clearing` (plus the structure override, cleared on the way out).
+    "structure-ground",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean

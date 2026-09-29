@@ -4,22 +4,13 @@
 # ground is: y = 0 is the grass you stand on, (0, 0) the middle of the green.
 # y = -1 cells REPLACE the ground (the well's flagstone apron).
 #
-# WHY THE GREEN IS A STRUCTURE AND NOT JUST GRASS. A placed structure levels
-# its own footprint square dead flat (its pad), and the ground's fine grain
-# does not: after the clearing was levelled (script 00) the houses stood on
-# smooth lawns and the green between them was a field of hand-high lumps. Four
-# boundary stones at the corners make this asset 8.4 m square, so its pad
-# levels the heart of the green. The square is as big as it can be: the
-# longhouse's pad ends just north of it, and the game's spawn column
-# (580, 3515) must stay OUTSIDE every footprint -- it is on the green's open
-# south side, one voxel clear.
+# The green is a structure so the well, its apron and the bench stand on a
+# level floor of their own; the grass round them is the village's softened
+# ground (script 00), not a pad. Until 2026-09-29 four boundary stones at the
+# corners stretched this asset to 8.4 m square so its pad would plane the whole
+# green -- the stray grey blocks on the grass -- and they are gone: the asset
+# is now just the well and the bench (2.8 x 3 m).
 {"cmd": "struct.new", "args": {"asset": "harrowby_green"}}
-
-# ---- the boundary stones (they also set the footprint) ----------------------
-{"cmd": "vox.box_fill", "args": {"min": [-42, 0, -42], "max": [-40, 2, -40], "mat": "stone"}}
-{"cmd": "vox.box_fill", "args": {"min": [39, 0, -42], "max": [41, 2, -40], "mat": "stone"}}
-{"cmd": "vox.box_fill", "args": {"min": [-42, 0, 39], "max": [-40, 2, 41], "mat": "stone"}}
-{"cmd": "vox.box_fill", "args": {"min": [39, 0, 39], "max": [41, 2, 41], "mat": "stone"}}
 
 # ---- the well, a little north of the middle ----------------------------------
 # the apron: flagstones set into the grass, corners knocked off
@@ -69,6 +60,6 @@
 
 {"cmd": "struct.save", "args": {}}
 
-# ...and put it down: pos = the middle of the green, y = the grass. padMargin 3
-# keeps its square clear of the longhouse's and of the spawn column.
-{"cmd": "ref.place", "args": {"id": "harrowby/green", "kind": "structure", "base": "harrowby_green", "pos": [555, 201, 3467], "yaw": 0, "props": {"padMargin": 3}}}
+# ...and put it down: pos = the middle of the green, y = the grass. A 0.6 m
+# level apron round the well and bench, easing into the green over 2.4 m.
+{"cmd": "ref.place", "args": {"id": "harrowby/green", "kind": "structure", "base": "harrowby_green", "pos": [555, 201, 3467], "yaw": 0, "props": {"padApron": 6, "padMargin": 24}}}

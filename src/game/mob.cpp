@@ -11939,6 +11939,16 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
                            const std::vector<IVec3>* crater, float rimCells,
                            float wetness) {
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
+  {
+    // SANDVOX_COAT_TRACE: a wound stain is a coat that no bleeding paid for.
+    static const bool trace = std::getenv("SANDVOX_COAT_TRACE") != nullptr;
+    static int traced = 0;
+    if (trace && traced < 12) {
+      traced++;
+      std::printf("coat trace: StainWoundAs mob %llu (%s) limb %d radius %.2f rewrite %u smear %u\n",
+                  (unsigned long long)id_, def_->name.c_str(), limbIndex, radiusWorld, rewriteMat, smearMat);
+    }
+  }
   // A GARMENT HAS NO BLOOD IN IT, and neither has a sword. Both are borrowed
   // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
   // is how the gore code previously sprayed a wearer's blood out of their own
@@ -16013,6 +16023,17 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const Vec3 wv = worldOf(p);
         emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, pm, state);
       }
+      {
+        // SANDVOX_COAT_TRACE: a body voxel LEAVING (what bares the blood).
+        static const bool trace = std::getenv("SANDVOX_COAT_TRACE") != nullptr;
+        static int traced = 0;
+        if (trace && traced < 8 && v.bareBloodMat) {
+          traced++;
+          const Vec3 wv = worldOf(p);
+          std::printf("coat trace: body voxel mat %u leaves as %u at (%.1f,%.1f,%.1f) tick %u\n", v.Mat(i), pm, wv.x,
+                      wv.y, wv.z, tick);
+        }
+      }
       v.Set(i, 0, 0);      // tombstone; FlushBurn compacts it away
       // ...and it wears nothing. A tombstone waits for its batch's flush --
       // indefinitely, on a limb that stops losing voxels short of FlushBurn's
@@ -16797,6 +16818,17 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // A world cell's rule with effects (sodium + blood -> explode) fired
         // ONTO this body: the blast is at the body voxel it fired on.
         noteBodyFx(r, vp);
+        {
+          // SANDVOX_COAT_TRACE: a WORLD cell's rule rewriting a body voxel
+          // (what bares bone, and so paints blood with no blood lost).
+          static const bool trace = std::getenv("SANDVOX_COAT_TRACE") != nullptr;
+          static int traced = 0;
+          if (trace && traced < 8) {
+            traced++;
+            std::printf("coat trace: world mat %u rewrites body voxel mat %u -> %u at (%.1f,%.1f,%.1f) tick %u\n",
+                        wm, m, r.prodNbr, vp.x, vp.y, vp.z, tick);
+          }
+        }
         applyTo(cell, r.prodNbr, rr);
         fired = true;
         break;
@@ -19503,6 +19535,22 @@ void Mob::RecountCoat(uint32_t tick, bool force) {
       MobSystem::TallyCoat(v, out, &sys_->matCorrodes_, foot);
     }
     l.coat = out;
+    {
+      // SANDVOX_COAT_TRACE=<mat>: the first recount that finds that coat on
+      // each body -- who, which limb, when, where the limb is.
+      static const int traceMat =
+          std::getenv("SANDVOX_COAT_TRACE") ? std::atoi(std::getenv("SANDVOX_COAT_TRACE")) : 0;
+      static std::vector<uint64_t> seenIds;
+      if (traceMat > 1 && std::find(seenIds.begin(), seenIds.end(), id_) == seenIds.end())
+        for (const CoatEntry& en : out.top)
+          if ((int)en.mat == traceMat && en.sumAmt > 0) {
+            seenIds.push_back(id_);
+            std::printf("coat trace: FIRST mat %d on mob %llu (%s) limb %d (%s) amt %u tick %u\n",
+                        traceMat, (unsigned long long)id_, def_ ? def_->name.c_str() : "?", li,
+                        li < (int)limbDefs_.size() ? limbDefs_[li].name.c_str() : "?", en.sumAmt, tick);
+            break;
+          }
+    }
     // THE BODY IS THE BASE RIG. A robe soaked through is not the wearer being
     // covered in it — the same exclusion StainWound applies, for the same
     // reason (a garment and a held sword are borrowed rig slots, not anatomy).
@@ -19802,6 +19850,17 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                                        (float)kStainAmtMax);
     } else {
       return false;
+    }
+    // SANDVOX_COAT_TRACE=1: name the first few WORDS a body takes a coat
+    // from (what the substance is and which branch resolved it), so a coat
+    // with no bleeding behind it has a source (CLAUDE.md rule 6).
+    // =<material id> names only that coat (1 = any).
+    static const int traceMat = std::getenv("SANDVOX_COAT_TRACE") ? std::atoi(std::getenv("SANDVOX_COAT_TRACE")) : 0;
+    static int traced = 0;
+    if (traceMat != 0 && !c.wash && traced < 12 && (traceMat == 1 || (int)c.mat == traceMat)) {
+      traced++;
+      std::printf("coat trace: word 0x%08x (mat %u, stain type %u amt %u) -> coat mat %u, amount %u, chance %u\n",
+                  w, m, VoxStainType(w), VoxStainAmt(w), c.mat, c.amount, c.chance);
     }
     return c.chance != 0 && (c.wash || c.amount != 0);
   };
@@ -23939,6 +23998,17 @@ void MobSystem::RecountCoatOn(uint64_t mobId, uint32_t tick) {
 void MobSystem::QueueSplatter(const SplatterEvent& e) {
   if (e.count <= 0 || e.mat == 0 || e.amount == 0 || e.reach <= 0.0f) return;
   if (splatters_.size() >= kSplatterMaxEvents) return;
+  {
+    // SANDVOX_COAT_TRACE: who threw a splash (a bleeder, a spilled vessel).
+    static const bool trace = std::getenv("SANDVOX_COAT_TRACE") != nullptr;
+    static int traced = 0;
+    if (trace && traced < 8) {
+      traced++;
+      std::printf("coat trace: splatter mat %u x%d from mob %llu limb %d at (%.1f,%.1f,%.1f) tick %u\n", e.mat,
+                  e.count, (unsigned long long)e.sourceMob, e.sourceLimb, e.origin.x, e.origin.y, e.origin.z,
+                  e.tick);
+    }
+  }
   splatters_.push_back(e);
 }
 

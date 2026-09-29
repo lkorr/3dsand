@@ -702,7 +702,14 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // which all read this function's h. An empty layer is dev == gx == gz == 0,
   // and every line below reads what it read before P5.
   let sp = sculptOctave(x, z);
-  let bed = homeY + o2.dev + o3.dev + o4.dev
+  // ---- SOFTENED GROUND (map.json kind "soften") ----
+  // The three LOCAL rungs scaled by the site's Q8 factors (256 everywhere
+  // else, where every product below is exact and nothing moves): a village
+  // keeps the biome's swells at a walkable fraction and loses the sub-metre
+  // grain, instead of being planed flat. The landform and range rungs are
+  // not touched, so the village keeps its place on the hill.
+  let sf = softenAt(x, z);
+  let bed = homeY + ((o2.dev * sf.hill) >> 8) + ((o3.dev * sf.bump) >> 8) + ((o4.dev * sf.grain) >> 8)
           + ((coarse * ws) >> 14) + sp.dev;
 
   // ---- THE SEDIMENT WEDGE ----
@@ -742,7 +749,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // The SCULPT's gradient joins it: an authored bank is landform, not
   // roughness, and a wedge laid down a sculpted cliff is exactly the powder-
   // on-a-wall the gate exists to prevent.
-  let slope = abs(g2x + sp.gx) + abs(g2z + sp.gz);
+  let slope = abs(g1x + ((o2.gx * sf.hill) >> 8) + sp.gx) + abs(g1z + ((o2.gz * sf.hill) >> 8) + sp.gz);
   let room = max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
   var sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   let sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
@@ -968,7 +975,9 @@ fn pondRoll(pt : i32, pz : i32, seed : u32) -> Pond {
   cz = clamp(cz, pz * tile + inset, pz * tile + tile - 1 - inset);
   // Keep-outs, by CENTRE (as stamps always were): the pad box, every
   // stamp's cells, every authored lake's disc + band. A site wins its ground.
-  if (siteKeepOut(cx, cz)) { return p; }
+  // And no disc on a stamp's pad or ramp: the bowl is cut in the bare ground
+  // and the pad reshapes it afterwards.
+  if (siteKeepOut(cx, cz) || sitePadNear(cx, cz, r)) { return p; }
   p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.wp = wp;
   p.minY = wmWaterRow(biome, row, WM_R_MIN_Y);
   p.maxY = wmWaterRow(biome, row, WM_R_MAX_Y);
@@ -1359,11 +1368,24 @@ const WM_S_VARIANT       : u32 = 11u;   // tree site: 1 + variant, 0 = rolled
 const WM_S_SINK          : u32 = 12u;   // stamp site: template rows below pad top + 1 (P4 footing)
 const WM_S_BOX_X1        : u32 = 13u;   // clearing site: box max corner (kS_X / kS_Z = min corner)
 const WM_S_BOX_Z1        : u32 = 14u;
+const WM_S_BOX_X0        : u32 = 10u;   // stamp site: footprint rect MIN corner (x1/z1 above = its max)
+const WM_S_BOX_Z0        : u32 = 11u;
+const WM_S_APRON         : u32 = 15u;   // stamp site: the flat ring round the rect
+const WM_S_SOFT_HILL     : u32 = 8u;    // soften site: Q8 scale of the hill octave
+const WM_S_SOFT_BUMP     : u32 = 10u;   // soften site: Q8 scale of the detail octave
+const WM_S_SOFT_GRAIN    : u32 = 11u;   // soften site: Q8 scale of the grain octave
+const WM_S_SOFT_PATH     : u32 = 12u;   // soften site: Q8 hill scale on the walking routes
+const WM_ROUTE_SOFT_INNER : i32 = 12;   // worldmap.h kRouteSoftInner
+const WM_ROUTE_SOFT_OUTER : i32 = 36;   // worldmap.h kRouteSoftOuter
 const WM_SITE_STAMP      : u32 = 1u;
 const WM_SITE_WATER      : u32 = 2u;    // an authored lake (worldmap.h kSiteWater)
 const WM_SITE_TREE       : u32 = 3u;    // one authored tree (worldmap.h kSiteTree, P6)
 const WM_SITE_ROT_ROLLED : u32 = 4u;    // a tree site's kS_Rot when the map did not turn it
 const WM_SITE_CLEARING   : u32 = 5u;    // a forest clearing (worldmap.h kSiteClearing)
+const WM_SITE_SOFTEN     : u32 = 6u;    // softened ground (worldmap.h kSiteSoften)
+const WM_SITE_PATH       : u32 = 7u;    // a waynode link's trunk keep-out (worldmap.h kSitePath)
+// No lattice crown within this many voxels of a stamp's rect (kStampTreeClear).
+const WM_STAMP_TREE_CLEAR : i32 = 10;
 // The salt of a clearing's feather-band thinning roll (clearingRefuses): its
 // own hash stream, so it does not correlate with the tile's density roll.
 const CLEARING_THIN_SALT : u32 = 0xC1EA5u;
@@ -1685,9 +1707,137 @@ fn siteFootprintHas(sid : u32, x : i32, z : i32) -> bool {
     let reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
     return dx * dx + dz * dz <= reach * reach;
   }
-  let r = select(wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN),
-                 i32(WM_SITE_TREE_KEEP_OUT), kind == WM_SITE_TREE);
-  return max(abs(dx), abs(dz)) <= r;
+  // Softened ground and a route keep nothing out either.
+  if (kind == WM_SITE_SOFTEN || kind == WM_SITE_PATH) { return false; }
+  // A stamp: its FLAT core -- the template's rect + the apron. The ramp past
+  // it is ordinary ground, so cover grows on it and the lawn has no edge.
+  if (kind == WM_SITE_STAMP) { return stampRectDist(sid, x, z) <= wmSiteI(sid, WM_S_APRON); }
+  return max(abs(dx), abs(dz)) <= i32(WM_SITE_TREE_KEEP_OUT);
+}
+// Chebyshev-ish distance from a column to a stamp's footprint RECT, 0 inside:
+// the larger axis gap plus half the smaller, an octagon, so the pad's ramp
+// rounds its corners instead of running out in a pyramid's hip. Integer, and
+// world.cpp spells the same helper (the mirrored sitePadAt calls it).
+fn stampRectDist(sid : u32, x : i32, z : i32) -> i32 {
+  let gx = max(max(wmSiteI(sid, WM_S_BOX_X0) - x, x - wmSiteI(sid, WM_S_BOX_X1)), 0);
+  let gz = max(max(wmSiteI(sid, WM_S_BOX_Z0) - z, z - wmSiteI(sid, WM_S_BOX_Z1)), 0);
+  return max(gx, gz) + (min(gx, gz) >> 1u);
+}
+// Is any stamp's PAD (rect + apron + ramp) within `r` of the column? What
+// keeps a rolled pond's disc and a cactus (both standing on the BARE ground)
+// off the ground a pad reshapes; siteKeepOut is only the flat core since the
+// ramp became ordinary, cover-growing ground. world.cpp spells the same.
+fn sitePadNear(x : i32, z : i32, r : i32) -> bool {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_STAMP) { continue; }
+    if (stampRectDist(sid, x, z) < wmSiteI(sid, WM_S_APRON) + wmSiteI(sid, WM_S_PAD_MARGIN) + r) { return true; }
+  }
+  return false;
+}
+// How much of site `sid`'s pad height a column takes, Q8 (256 = exactly the
+// floor): 256 over the rect + apron, then a SMOOTHSTEP down to 0 across the
+// pad margin -- flat at the doorstep, flat where it meets the ground, no lip
+// and no terrace ring. 0 for anything that is not a stamp. world.cpp spells
+// the same helper.
+fn sitePadWeight(sid : u32, x : i32, z : i32) -> i32 {
+  if (wmSiteKind(sid) != WM_SITE_STAMP) { return 0; }
+  let e = stampRectDist(sid, x, z) - wmSiteI(sid, WM_S_APRON);
+  if (e <= 0) { return 256; }
+  let margin = max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
+  if (e >= margin) { return 0; }
+  let t = ((margin - e) * 256) / margin;
+  return (t * t * (768 - 2 * t)) >> 16u;
+}
+// The SOFTENED GROUND at a column (map.json kind "soften", worldmap.h
+// kSiteSoften): the Q8 scales landAt applies to the hill, detail and grain
+// octaves -- 256 = the biome's own ground. Inside a soften box the site's
+// scales; across its feather they ease back to 256 by a smoothstep of the
+// Chebyshev distance; two boxes that overlap take the smaller scale each.
+// ON A WALKING ROUTE (a waynode link, kSitePath) inside a soften box the hill
+// scale drops further, to the box's `paths` scale, within WM_ROUTE_SOFT_INNER
+// of the line and easing back by WM_ROUTE_SOFT_OUTER: the tracks between the
+// doors are flatter than the green, not planed. Outside the height mirror on
+// both sides (world.cpp softenAt is the twin); the mirrored landAt calls it
+// by name.
+struct Soften {
+  hill  : i32,
+  bump  : i32,
+  grain : i32,
+};
+fn softenAt(x : i32, z : i32) -> Soften {
+  var s : Soften;
+  s.hill = 256; s.bump = 256; s.grain = 256;
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  var wbox = 0;
+  var pathQ = 256;
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_SOFTEN) { continue; }
+    let d = max(max(wmSiteI(sid, WM_S_X) - x, x - wmSiteI(sid, WM_S_BOX_X1)),
+                max(wmSiteI(sid, WM_S_Z) - z, z - wmSiteI(sid, WM_S_BOX_Z1)));
+    var w = 256;
+    if (d > 0) {
+      let f = wmSiteI(sid, WM_S_PAD_MARGIN);
+      if (d >= f) { continue; }
+      let t = ((f - d) * 256) / f;
+      w = (t * t * (768 - 2 * t)) >> 16u;
+    }
+    s.hill = min(s.hill, 256 - (((256 - wmSiteI(sid, WM_S_SOFT_HILL)) * w) >> 8u));
+    s.bump = min(s.bump, 256 - (((256 - wmSiteI(sid, WM_S_SOFT_BUMP)) * w) >> 8u));
+    s.grain = min(s.grain, 256 - (((256 - wmSiteI(sid, WM_S_SOFT_GRAIN)) * w) >> 8u));
+    if (w > wbox) { wbox = w; pathQ = wmSiteI(sid, WM_S_SOFT_PATH); }
+  }
+  if (wbox > 0) {
+    var wr = 0;
+    for (var k = 0u; k < n; k++) {
+      let sid = wmSiteK(lst, k);
+      if (wmSiteKind(sid) != WM_SITE_PATH) { continue; }
+      let d2 = routeDist2(sid, x, z, WM_ROUTE_SOFT_OUTER);
+      if (d2 < 0 || d2 >= WM_ROUTE_SOFT_OUTER * WM_ROUTE_SOFT_OUTER) { continue; }
+      var t = 256;
+      if (d2 > WM_ROUTE_SOFT_INNER * WM_ROUTE_SOFT_INNER) {
+        let o2 = WM_ROUTE_SOFT_OUTER * WM_ROUTE_SOFT_OUTER;
+        t = ((o2 - d2) * 256) / (o2 - WM_ROUTE_SOFT_INNER * WM_ROUTE_SOFT_INNER);
+      }
+      wr = max(wr, (t * t * (768 - 2 * t)) >> 16u);
+    }
+    let wp = (wr * wbox) >> 8u;
+    s.hill = min(s.hill, 256 - (((256 - pathQ) * wp) >> 8u));
+  }
+  return s;
+}
+// The squared distance from the column to route `sid`'s segment, or -1 when
+// the column is outside the segment's box grown by `reach`. The ends are at
+// most 256 voxels apart (the loader splits longer links), so the
+// projection's products stay far inside i32 after the box reject. world.cpp
+// spells the same helper (softenAt reads it on both sides).
+fn routeDist2(sid : u32, x : i32, z : i32, reach : i32) -> i32 {
+  let ax = wmSiteI(sid, WM_S_X);
+  let az = wmSiteI(sid, WM_S_Z);
+  let bx = wmSiteI(sid, WM_S_BOX_X1);
+  let bz = wmSiteI(sid, WM_S_BOX_Z1);
+  if (x < min(ax, bx) - reach || x > max(ax, bx) + reach ||
+      z < min(az, bz) - reach || z > max(az, bz) + reach) { return -1; }
+  let vx = bx - ax;
+  let vz = bz - az;
+  let l2 = vx * vx + vz * vz;
+  let t = (x - ax) * vx + (z - az) * vz;
+  var cx = ax;
+  var cz = az;
+  if (l2 > 0 && t >= l2) { cx = bx; cz = bz; }
+  else if (l2 > 0 && t > 0) { cx = ax + (vx * t) / l2; cz = az + (vz * t) / l2; }
+  let dx = x - cx;
+  let dz = z - cz;
+  return dx * dx + dz * dz;
+}
+// Is the column within `keep` of route `sid`'s line? (siteBlocksTrunk)
+fn routeNear(sid : u32, x : i32, z : i32, keep : i32) -> bool {
+  let d2 = routeDist2(sid, x, z, keep);
+  return d2 >= 0 && d2 <= keep * keep;
 }
 // The keep-out tarns, cacti, tile plants and cover avoid: the pad box and
 // every listed site's footprint.
@@ -1736,6 +1886,21 @@ fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
     } else if (wmSiteKind(sid) == WM_SITE_TREE) {
       let d = max(abs(wx - wmSiteI(sid, WM_S_X)), abs(wz - wmSiteI(sid, WM_S_Z)));
       if (d <= wmSiteI(sid, WM_S_RADIUS) + reach) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_STAMP) {
+      // THE PER-TREE BUILDING RULE. No trunk on the pad -- rect, apron and
+      // ramp: the tree stands on landAt's ground, which the pad reshapes --
+      // and no tree whose CROWN square (Chebyshev `reach`) comes within
+      // WM_STAMP_TREE_CLEAR of the building's rect. So a forest stands round
+      // and between the houses of any village with no clearing, and not one
+      // branch goes through a wall or a roof. 2D on purpose: a crown over a
+      // roof is as wrong to the eye as one through it.
+      if (stampRectDist(sid, wx, wz) < wmSiteI(sid, WM_S_APRON) + wmSiteI(sid, WM_S_PAD_MARGIN)) { return true; }
+      let gx = max(wmSiteI(sid, WM_S_BOX_X0) - wx, wx - wmSiteI(sid, WM_S_BOX_X1));
+      let gz = max(wmSiteI(sid, WM_S_BOX_Z0) - wz, wz - wmSiteI(sid, WM_S_BOX_Z1));
+      if (max(gx, gz) <= reach + WM_STAMP_TREE_CLEAR) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_PATH) {
+      // A villager's route: no trunk within the keep-out of its line.
+      if (routeNear(sid, wx, wz, wmSiteI(sid, WM_S_PAD_MARGIN))) { return true; }
     } else if (siteFootprintHas(sid, wx, wz)) { return true; }
   }
   return false;
@@ -1758,20 +1923,6 @@ fn wmWaterSiteAt(x : i32, z : i32) -> u32 {
     if (first == 0u) { first = sid; }
   }
   return first;
-}
-// The stamp whose pad reaches this column: the first listed stamp within
-// radius + margin (Chebyshev), 0 = none. sitePadAt levels to it; world.cpp
-// spells the same helper.
-fn wmPadSiteAt(x : i32, z : i32) -> u32 {
-  let lst = wmSiteList(x, z);
-  let n = wmSiteN(lst);
-  for (var k = 0u; k < n; k++) {
-    let sid = wmSiteK(lst, k);
-    if (wmSiteKind(sid) != WM_SITE_STAMP) { continue; }
-    let d = max(abs(x - wmSiteI(sid, WM_S_X)), abs(z - wmSiteI(sid, WM_S_Z))) - wmSiteI(sid, WM_S_RADIUS);
-    if (d < max(wmSiteI(sid, WM_S_PAD_MARGIN), 1)) { return sid; }
-  }
-  return 0u;
 }
 // The template voxel this world cell would carry, MAT_AIR if none: the
 // stamp's footprint is centred on the site, its bottom row sits one above
@@ -2784,7 +2935,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
   if (h >= treeline()) { return c; }
-  if (siteKeepOut(c.wx, c.wz)) { return c; }
+  if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0)) { return c; }
   if (pondCoversP(ponds,c.wx, c.wz)) { return c; }
 
   // Density and mix are the biome's (cover.cactusChance / saguaroFraction,
@@ -3511,26 +3662,29 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
 }
 
 
-// The pad under an authored site: inside the footprint the ground IS
-// the height at the site's centre (exact, so a stamped floor is flat), and
-// over `margin` columns past it the terrain ramps back. The centre's height is
-// sitePadY's baked one. Spelled identically in world.cpp; the site readers it
-// calls live outside the mirror.
+// The pad under an authored site: over the stamp's footprint RECT and its
+// flat apron the ground IS the pad height (exact, so a stamped floor is flat
+// and every doorstep is level with the threshold), and across `margin` more
+// columns it eases back into the terrain by a smoothstep (sitePadWeight).
+// EVERY stamp reaching the column blends in turn, in site order, so two
+// ramps that meet stay continuous (the loader warns when one ramp reaches
+// another's flat core). The height is sitePadY's baked one. Spelled
+// identically in world.cpp; the site readers it calls live outside the mirror.
 fn sitePadAt(x : i32, z : i32, h : i32) -> i32 {
-  // Only a STAMP pads (wmPadSiteAt): a water site is a bowl, not a building
-  // -- the pond block above already shaped the ground under it, and
-  // levelling it here would fill the lake -- and a tree stands on the ground.
-  let sid = wmPadSiteAt(x, z);
-  if (sid == 0u) { return h; }
-  let sx = wmSiteI(sid, WM_S_X);
-  let sz = wmSiteI(sid, WM_S_Z);
-  let r = wmSiteI(sid, WM_S_RADIUS);
-  let margin = max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
-  let d = max(max(abs(x - sx), abs(z - sz)) - r, 0);
-  if (d >= margin) { return h; }
-  let padY = sitePadY(sid);
-  let w = ((margin - d) * 256) / margin;
-  return h + (((padY - h) * w) >> 8);
+  // Only a STAMP pads (sitePadWeight is 0 for the rest): a water site is a
+  // bowl, not a building -- the pond block above already shaped the ground
+  // under it, and levelling it here would fill the lake -- and a tree stands
+  // on the ground.
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  var hh = h;
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    let w = sitePadWeight(sid, x, z);
+    if (w <= 0) { continue; }
+    hh = hh + (((sitePadY(sid) - hh) * w + 128) >> 8u);
+  }
+  return hh;
 }
 
 // The height contract's public face: the bare column with the site pad

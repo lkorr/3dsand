@@ -2389,7 +2389,7 @@ bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Strea
     if (s.structure) after[s.id] = s;
   auto same = [](const Site& a, const Site& b) {
     return a.x == b.x && a.z == b.z && a.padY == b.padY && a.rot == b.rot && a.sink == b.sink &&
-           a.radius == b.radius && a.padMargin == b.padMargin && a.words == b.words;
+           a.radius == b.radius && a.padMargin == b.padMargin && a.apron == b.apron && a.words == b.words;
   };
   // The widest tree: a trunk the OLD footprint kept out may stand in the new
   // gap, crown and all (and one the new footprint refuses must go).
@@ -2404,7 +2404,7 @@ bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Strea
       }
   }
   // What a changed site can have changed, and so the box to regenerate:
-  //  - its voxels and its pad: the footprint + ramp (radius + padMargin);
+  //  - its voxels and its pad: the footprint + apron + ramp;
   //  - everything genChunk derives from the column's ground height h under
   //    the pad: the skin and subsoil just below it, and the near-surface
   //    cavern band, which follows h down to h - 100 (caveBands: h - vlen(40)
@@ -2413,12 +2413,15 @@ bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Strea
   //  - trees, ONLY when the footprint itself moved or resized (the lattice
   //    keeps trunks off it, siteBlocksTrunk): a trunk the old footprint kept
   //    out may stand now and one the new footprint refuses must go, crown
-  //    and all -- the widest reach sideways, the tallest tree upward. An
+  //    and all -- the per-tree building rule keeps every crown
+  //    kStampTreeClear off the rect, so the widest reach + that sideways,
+  //    the tallest tree upward. An
   //    asset edit in place keeps the footprint, and that is the common case
   //    (P5's save), so it does not pay for the forest.
   const int belowGround = (128 * kVoxelsPerMetre) / 10;
   auto boxOf = [&](const Site& s, bool trees) {
-    const int r = s.radius + s.padMargin + (trees ? treeReach : 0) + 1;
+    const int r = s.radius + s.apron + s.padMargin +
+                  (trees ? (int)worldmap::kStampTreeClear + treeReach : 0) + 1;
     IVec3 lo{s.x - r, 0, s.z - r}, hi{s.x + r, 0, s.z + r};
     // The ground the pad cuts or fills, sampled over the box (the bare
     // ground: what the terrain is without this or any pad).
@@ -2445,6 +2448,8 @@ bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Strea
     const bool footprintSame = b != before.end() && a != after.end() &&
                                b->second.x == a->second.x && b->second.z == a->second.z &&
                                b->second.radius == a->second.radius &&
+                               b->second.nx == a->second.nx && b->second.nz == a->second.nz &&
+                               b->second.apron == a->second.apron &&
                                b->second.padMargin == a->second.padMargin;
     if (b != before.end()) rep.boxes.push_back(boxOf(b->second, !footprintSame));
     if (a != after.end()) rep.boxes.push_back(boxOf(a->second, !footprintSame));

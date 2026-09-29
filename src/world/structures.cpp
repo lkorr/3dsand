@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 
 #include "sim/worldmap.h"
@@ -500,11 +501,81 @@ void ReadPlacements(const std::string& assetDir, const std::string& mapName,
       sp.yaw = r.yaw;
       if (r.props.contains("padMargin") && r.props["padMargin"].is_number_integer())
         sp.padMargin = r.props["padMargin"].get<int>();
+      if (r.props.contains("padApron") && r.props["padApron"].is_number_integer())
+        sp.padApron = r.props["padApron"].get<int>();
       byId[r.id] = sp;
     }
   }
   for (auto& [id, sp] : byId) out.push_back(sp);   // id order
   (void)warn;
+}
+
+void ReadWaySegments(const std::string& assetDir, const std::string& mapName,
+                     std::vector<WaySegment>& out) {
+  out.clear();
+  const fs::path dir = fs::path(assetDir) / "worldmap" / mapName / "refs";
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) return;
+  std::vector<fs::path> files;
+  for (const fs::directory_entry& e : fs::directory_iterator(dir, ec))
+    if (e.is_regular_file() && e.path().extension() == ".json") files.push_back(e.path());
+  std::sort(files.begin(), files.end());
+  // Every ref of every group, then every placed structure's slot children:
+  // the node set refs_npc.cpp's WayGraph builds from (it walks the RefStore,
+  // which holds the same two sets).
+  std::map<std::string, refs::Ref> byId;
+  std::map<std::string, Asset> assets;
+  for (const fs::path& p : files) {
+    std::string text;
+    if (!ReadFile(p.string(), text)) continue;
+    refs::RefGroupFile g;
+    std::vector<std::string> ignored;
+    if (!refs::ParseGroup(text, "refs/" + p.filename().string(), g, ignored)) continue;
+    for (refs::Ref r : g.refs) {
+      if (r.group.empty()) r.group = g.group;
+      if (byId.count(r.id)) continue;
+      byId.emplace(r.id, r);
+    }
+  }
+  std::vector<refs::Ref> kids;
+  for (const auto& [id, r] : byId) {
+    if (r.kind != "structure" || !ValidYaw(r.yaw)) continue;
+    auto it = assets.find(r.base);
+    if (it == assets.end()) {
+      Asset a;
+      std::string err;
+      std::vector<std::string> aw;
+      if (!LoadAsset(assetDir, r.base, false, a, err, aw)) continue;
+      it = assets.emplace(r.base, std::move(a)).first;
+    }
+    DeriveChildren(it->second, r, kids);
+  }
+  for (refs::Ref& k : kids) byId.emplace(k.id, std::move(k));
+  // The links, resolved the WayGraph's way: the name as an id, then as a
+  // sibling (the linking ref's parent + "/" + name), then in its group. One
+  // segment per unordered pair; a link naming nothing is the refs page's
+  // warning to give, not this one's.
+  std::set<std::pair<std::string, std::string>> seen;
+  for (const auto& [id, r] : byId) {
+    if (r.kind != "waynode" || !r.props.contains("links") || !r.props["links"].is_array()) continue;
+    const size_t cut = r.id.rfind('/');
+    const std::string parent = cut == std::string::npos ? std::string() : r.id.substr(0, cut);
+    for (const refs::Json& l : r.props["links"]) {
+      if (!l.is_string()) continue;
+      const std::string name = l.get<std::string>();
+      const refs::Ref* t = nullptr;
+      for (const std::string& cand : {name, parent.empty() ? std::string() : parent + "/" + name,
+                                       r.group + "/" + name}) {
+        auto f = byId.find(cand);
+        if (!cand.empty() && f != byId.end() && f->second.kind == "waynode") { t = &f->second; break; }
+      }
+      if (t == nullptr || t->id == r.id) continue;
+      const std::pair<std::string, std::string> key = r.id < t->id ? std::make_pair(r.id, t->id)
+                                                                    : std::make_pair(t->id, r.id);
+      if (!seen.insert(key).second) continue;
+      out.push_back(WaySegment{r.pos.x, r.pos.z, t->pos.x, t->pos.z, key.first, key.second});
+    }
+  }
 }
 
 // ---- live re-apply ----------------------------------------------------------------
@@ -519,8 +590,13 @@ bool SiteInSync(const refs::Ref& r) {
   const bool placeable = ValidYaw(r.yaw) && AssetExists(sandvox::AssetDir(), r.base);
   for (const worldmap::WorldMapData::StampSite& s : worldmap::CurrentWorldMap().sites) {
     if (!s.structure || s.id != r.id) continue;
+    // The pad's shape is the ref's too: a changed ramp or apron re-applies.
+    auto propInt = [&](const char* k) {
+      return r.props.contains(k) && r.props[k].is_number_integer() ? r.props[k].get<int>() : -1;
+    };
     return placeable && s.base == r.base && s.refX == r.pos.x && s.refY == r.pos.y &&
-           s.refZ == r.pos.z && s.refYaw == r.yaw;
+           s.refZ == r.pos.z && s.refYaw == r.yaw && s.refPadMargin == propInt("padMargin") &&
+           s.refPadApron == propInt("padApron");
   }
   return !placeable;
 }
@@ -584,6 +660,12 @@ void RegisterStructureKinds() {
       if (!m.is_number_integer() || m.get<int>() < 1 || m.get<int>() > 64)
         problems.push_back("props.padMargin: must be a whole number of voxels 1..64 (the ramp "
                            "from the levelled pad back to the terrain)");
+    }
+    if (r.props.contains("padApron")) {
+      const refs::Json& m = r.props["padApron"];
+      if (!m.is_number_integer() || m.get<int>() < 0 || m.get<int>() > 32)
+        problems.push_back("props.padApron: must be a whole number of voxels 0..32 (the flat "
+                           "ground round the house, level with its threshold)");
     }
   };
   k.derive = [](const refs::Ref& r, std::vector<refs::Ref>& children,

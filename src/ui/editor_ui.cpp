@@ -2210,7 +2210,7 @@ void EditorMode::Frame(UIState& ui, float dt, float fovY) {
             // the SAME code as the References page. It writes refs itself, so
             // what it changes is diffed here and recorded as an undo step.
             if (cur->kind == "door" || cur->kind == "container" || cur->kind == "bed" || cur->kind == "npc" ||
-                cur->kind == "waynode") {
+                cur->kind == "waynode" || cur->kind == "structure") {
               ImGui::Separator();
               std::map<std::string, refs::Ref> before;
               for (const auto& [rid, rr] : p.store->All())

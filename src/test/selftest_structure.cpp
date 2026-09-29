@@ -236,7 +236,7 @@ Status GateStructureStamp(Ctx& c, std::string& detail) {
   BoxRead rd{{}, &c.ctx, &c.world};
   size_t wrong = 0, intrude = 0, padBad = 0, padChecked = 0, voxels = 0;
   size_t leafBad = 0, leafCells = 0, bedBad = 0, beds = 0, linkBad = 0, doors = 0;
-  std::string firstWrong;
+  std::string firstWrong, firstPadBad;
   uint32_t hash1 = 2166136261u;
   std::vector<std::pair<IVec3, IVec3>> boxes;
   for (int i = 0; i < 4; i++) {
@@ -268,17 +268,21 @@ Status GateStructureStamp(Ctx& c, std::string& detail) {
             intrude++;
           }
         }
-    // (c) the pad: columns just outside the house on each side, inside the
-    // levelled footprint, have their ground top at pos.y - 1.
+    // (c) the pad: columns just outside the house on each side, on its flat
+    // apron (worldmap.h kStructurePadApron: level with the floor), have their
+    // ground top at pos.y - 1.
     const int sx = f.siteX, sz = f.siteZ;
-    const int r = std::max(f.nx, f.nz) / 2 + 1;
-    const IVec3 cols[4] = {{sx + r, 0, sz}, {sx - r, 0, sz}, {sx, 0, sz + r}, {sx, 0, sz - r}};
+    const int a = std::max(worldmap::kStructurePadApron / 2, 1);
+    const IVec3 cols[4] = {{hi.x + a, 0, sz}, {lo.x - a, 0, sz}, {sx, 0, hi.z + a}, {sx, 0, lo.z - a}};
     for (const IVec3& col : cols) {
       if (col.x >= lo.x && col.x <= hi.x && col.z >= lo.z && col.z <= hi.z) continue;
       padChecked++;
       const bool ok = rd.Mat({col.x, p.y - 1, col.z}) != 0 && rd.Mat({col.x, p.y, col.z}) == 0 &&
                       rd.Mat({col.x, p.y + 1, col.z}) == 0;
-      if (!ok) padBad++;
+      if (!ok && padBad++ == 0)
+        firstPadBad = Format("%s (%d,%d): mats y-1 %u, y %u, y+1 %u, y+2 %u (floor %d)", p.id.c_str(), col.x, col.z,
+                             rd.Mat({col.x, p.y - 1, col.z}), rd.Mat({col.x, p.y, col.z}), rd.Mat({col.x, p.y + 1, col.z}),
+                             rd.Mat({col.x, p.y + 2, col.z}), p.y);
     }
     // (d) the child refs, from the same derivation the RefStore runs.
     refs::Ref inst;
@@ -316,7 +320,8 @@ Status GateStructureStamp(Ctx& c, std::string& detail) {
                         " asset voxels wrong; first " + firstWrong);
   check(intrude == 0, std::to_string(intrude) + " non-air cells inside the houses above grade");
   check(padChecked > 0 && padBad == 0,
-        std::to_string(padBad) + "/" + std::to_string(padChecked) + " pad columns not levelled to the floor");
+        std::to_string(padBad) + "/" + std::to_string(padChecked) + " pad columns not levelled to the floor (first: " +
+            firstPadBad + ")");
   check(doors > 0 && leafBad == 0,
         std::to_string(leafBad) + "/" + std::to_string(leafCells) + " door-leaf cells not door_wood");
   check(beds > 0 && bedBad == 0, std::to_string(bedBad) + "/" + std::to_string(beds) +

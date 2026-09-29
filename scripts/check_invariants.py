@@ -1229,9 +1229,9 @@ MIRROR_RE = re.compile(
 
 # WGSL spellings that have no counterpart token on the C++ side, and vice versa.
 _WGSL_DROP = (r"\b(?:let|var|fn|i32|u32|f32|bool"
-              r"|N2|Oct|Land|Pond|PondSet|Shore|LandCol|CaveBands|TreeCands|BiomeMix|BiomeRelief)\b")
+              r"|N2|Oct|Land|Pond|PondSet|Shore|LandCol|CaveBands|TreeCands|BiomeMix|BiomeRelief|Soften)\b")
 _CPP_DROP = (r"\b(?:static|inline|const|int|uint32_t|int32_t|unsigned|bool"
-             r"|N2|Oct|Land|Pond|PondSet|Shore|IV2|BiomeMix|BiomeRelief)\b")
+             r"|N2|Oct|Land|Pond|PondSet|Shore|IV2|BiomeMix|BiomeRelief|Soften)\b")
 
 
 def _mirror_blocks(text, tag):
@@ -1605,7 +1605,11 @@ def check_worldmap_layout():
              "kSiteTree": "WM_SITE_TREE", "kSiteRotRolled": "WM_SITE_ROT_ROLLED",
              "kSiteCellMax": "WM_SITE_CELL_MAX", "kSiteTreeKeepOut": "WM_SITE_TREE_KEEP_OUT",
              # the forest clearing (kind "clearing")
-             "kSiteClearing": "WM_SITE_CLEARING"}
+             "kSiteClearing": "WM_SITE_CLEARING",
+             # softened ground, the waynode routes, the per-tree building rule
+             "kSiteSoften": "WM_SITE_SOFTEN", "kSitePath": "WM_SITE_PATH",
+             "kStampTreeClear": "WM_STAMP_TREE_CLEAR",
+             "kRouteSoftInner": "WM_ROUTE_SOFT_INNER", "kRouteSoftOuter": "WM_ROUTE_SOFT_OUTER"}
     for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for name, wgname in list(alias.items()):

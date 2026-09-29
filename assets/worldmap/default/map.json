@@ -59,21 +59,25 @@
         580,
         3620
       ],
-      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land and off any lake: the spawn-site gate checks all of that. In the wood 10 m south of Harrowby's clearing, so a new game wakes among trees with the village ahead (north); it was (580, 3515), on the green's edge, until the clearing replaced the pad box."
+      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land and off any lake: the spawn-site gate checks all of that. In the wood south of Harrowby, so a new game wakes among trees with the village ahead (north); it was (580, 3515), on the green's edge, until 2026-09-29."
     },
     {
-      "id": "harrowby_clearing",
-      "kind": "clearing",
+      "id": "harrowby_ground",
+      "kind": "soften",
       "min": [
-        375,
-        3131
+        330,
+        3090
       ],
       "max": [
-        741,
-        3518
+        790,
+        3650
       ],
-      "feather": 64,
-      "about": "Harrowby's clearing (docs/EDITOR_GUIDE.md, Building a village): the houses, the green and the field of refs/harrowby.json plus 2 voxels. No forest tree's crown reaches over this box and the trees thin out over the 64 voxels past the crowns, so the wood stands round the hamlet with a ragged edge; grass and flowers, the ground and its shape are untouched. The village-harrowby gate counts tree voxels inside every house (want 0)."
+      "feather": 120,
+      "hills": 25,
+      "bumps": 0,
+      "grain": 0,
+      "paths": 10,
+      "about": "Harrowby's ground (docs/EDITOR_GUIDE.md section 14): inside this box the biome's own rolling relief is kept at a fraction of its swells (hills) and 3 m bumps (bumps), with no sub-metre grain and the tracks between the doors flatter still (paths), easing back to the untouched forest floor across the feather. No clearing: the forest stands among the houses, and every tree whose crown would come within 1 m of a building is left out (the per-tree building rule); the houses level their own floors and doorsteps and ease into this ground over their ramps (refs/harrowby.json padMargin / padApron)."
     },
     {
       "id": "home_lake",

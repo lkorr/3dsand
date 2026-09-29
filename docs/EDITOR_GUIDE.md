@@ -945,7 +945,12 @@ file that says *which* blueprint, *where* and *which way round*.
 | `base` | the blueprint: the path under `assets/structures/` without the extension (`samples/smithy`, `harrowby_smithy`) |
 | `pos` | where the house's **front-door floor** goes: x and z are the middle of the house, **y is the floor you walk on**. The ground around the house is levelled so its top is one voxel below that. |
 | `yaw` | which way the front door faces: `0` = +Z, `90` = +X, `180`, `270`. **Only quarter turns** — anything else is refused with a warning and the house is not built. |
-| `props.padMargin` | optional: how many voxels the levelled ground takes to blend back into the terrain (default 12 = 1.2 m; 1..64) |
+| `props.padApron` | optional: how many voxels round the walls stay dead level with the floor -- the doorsteps (default 8 = 0.8 m; 0..32) |
+| `props.padMargin` | optional: how many voxels the levelled ground takes to ease (a smooth S-curve) back into the terrain past the apron (default 24 = 2.4 m; 1..64; widened automatically where the ground is too far from the floor for that to stay one voxel a column) |
+
+No forest tree grows whose crown would come within 1 m of the house (§14.1), so
+a house needs no clearing. Both pad props are sliders in the inspector ("ground
+round the house").
 
 The house is part of the **terrain**: it shows at any distance, it is not in
 your save, and it comes back the same every time. Damage done to it in play is
@@ -1292,7 +1297,7 @@ number order:
 
 | File | What it did |
 |---|---|
-| `harrowby_00_ground.sh` | the forest clearing, and the levelled ground (the map's sculpt layer) |
+| `harrowby_00_ground.sh` | the village's ground: nothing to run -- it says where the softened ground, the houses' ramps and the tree rule live |
 | `harrowby_*.params.json` | the house generator's settings for the three houses |
 | `harrowby_01_place.jsonl` | put the three houses on the ground |
 | `harrowby_02_smithy.jsonl` | Osric's forge bay, anvil, trough, tool rack, strongbox |
@@ -1311,7 +1316,7 @@ copy any line into your own script.
 **Where it is** (world voxels, 10 to the metre; north is -z):
 
 ```
-         z 3131  . . . . . . clearing, north edge . . . . . .
+         z 3090  . . . . softened ground, north edge . . . . .
          z 3133        Edric's spot, the field's north gate
          z 3170  [ field: harrowby/field, barley + scarecrow ]
          z 3212           south gate  |  lane (dirt)
@@ -1322,9 +1327,9 @@ copy any line into your own script.
   harrowby/alehouse           harrowby/green              harrowby/smithy
   x 415, door faces east      (555, 3467)                 x 700, forge bay faces west
                                     |
-         z 3518  . . . . . . clearing, south edge . . . . . .
-                        (the wood)
+                        (the wood, among and round the houses)
          z 3620                   spawn (580, 3620)
+         z 3650  . . . . softened ground, south edge . . . . .
 ```
 
 The files that make it up:
@@ -1334,10 +1339,11 @@ The files that make it up:
 - `assets/structures/harrowby_{longhouse,smithy,alehouse,green,field}.vox` +
   `.struct.json` — the buildings; their doors, beds, chests, hearths and the
   places people stand are SLOTS in these files (`harrowby/smithy/anvil`, ...).
-- `assets/worldmap/default/map.json` — the forest clearing `harrowby_clearing`
-  (§14.1: no tree's crown over that box, the wood thinning out round it) and
-  `editLayer: "default_ground"`.
-- `assets/worldmap/default/sculpt.svsculpt` — the levelled ground.
+- `assets/worldmap/default/map.json` — `harrowby_ground`, the village's
+  SOFTENED GROUND (§14.1: the forest floor's hills kept at 25 %, its bumps and
+  grain at 0, the tracks between the doors flatter still) and
+  `editLayer: "default_ground"`. There is no clearing: the wood stands among
+  the houses, and no tree's crown comes within 1 m of a wall (§14.1).
 - `assets/worldedits/default_ground.svedit` — the painted paths.
 - `assets/schedules/{edric,maud,osric,agnes,wat}.json`,
   `assets/dialogue/{edric,maud,osric,agnes,wat}.json` — their days and their
@@ -1356,15 +1362,18 @@ file like `harrowby_smithy.params.json`:
 node scripts/bake_structure.mjs harrowby_cottage my_cottage.params.json
 ```
 
-**2. Find it room.** A house levels a SQUARE of ground as wide as its longest
-side plus its `padMargin` (4 voxels in Harrowby), and two squares that touch
-are a warning (the References page's warnings list names both). The stats line
-on the Structures page gives the house's size; a 7 m cottage needs a clear
-square about 7.5 m across. Then **widen the clearing over it** (§14.1): the
-forest keeps its crowns out of the clearing's box and nowhere else, so a house
-outside the box gets a tree through its roof (the gate counts those). The
-levelled ground is at 200, so its floor is **201**; outside the flattened area
-use **move to crosshair** (§12).
+**2. Find it room.** A house levels its own footprint to its floor, plus a
+flat ring round it (the doorsteps, `padApron`, 0.8 m in Harrowby), and eases
+back into the ground round it with a smooth S-curve over `padMargin` (3.6 m in
+Harrowby; it widens itself where the ground is further from the floor than it
+can ease without a two-voxel step). Two houses on the same floor may share
+ramp; a ramp that reaches the flat ring of a house on ANOTHER floor is a
+warning (the References page's warnings list names both). The stats line on
+the Structures page gives the house's size. You do **not** need a clearing:
+worldgen leaves out every tree whose crown would come within 1 m of a wall, and
+keeps trunks off the pad, its ramp and the villagers' walking lines (§14.1).
+Inside the softened ground the grass rolls round **200**, so the floor is
+**201**; elsewhere use **move to crosshair** (§12).
 
 **3. Place it** (§12). In game: F1 → World → References → **place a
 structure**, pick `harrowby_cottage`, id `harrowby/cottage`, turn it with
@@ -1445,40 +1454,64 @@ writes `build/hb_overview.bmp`, `_green`, `_osric_at_work`, `_smithy`,
 map: `SANDVOX_SHOT_TALK=harrowby/wat bash scripts/run.sh ./build/Release/sandvox.exe --shot-dialogue`
 (`SANDVOX_SHOT_TALK_AT=1080` for 18:00).
 
-### 14.1 A clearing in the forest (the World map page's Clearing tool)
+### 14.1 The ground and the trees of a village
 
-A **clearing** is a box on the map that no forest tree's crown reaches over;
-past it the trees thin out across a **feather** band, so the wood's edge is
-ragged rather than ruled. It changes nothing else: the ground keeps its shape
-and its grass and flowers, ponds stay, and trees you placed by hand (the Tree
-tool) still stand. Harrowby sits in one; use one for any village, camp or glade.
+Harrowby stands in the forest the way a hamlet does: trees between the houses,
+the ground rolling a little, level where the houses are, and the tracks between
+the doors flatter than the green round them. Three things make that, and all
+three are yours to change.
 
-1. Tuner → Environment → **World map**. Zoom in on the place (wheel) until one
-   screen pixel is a few voxels — the box snaps to the column under the cursor.
-2. Pick the **Clearing** tool and **drag** a box over everything that must stay
-   open: the houses, the green, the field. Lime outline = the box; the dashed
-   line outside it = the feather band. `clearing feather` in the toolbar sets
-   the band for new boxes (64 voxels = 6.4 m is a natural edge; 0 is a hard one).
-3. Fine-tune in the **Sites** panel: select the clearing (click inside it with
-   the Clearing or Select tool) and type its exact corners (`min x`, `min z`,
-   `max x`, `max z`, world voxels) and its `feather`. The panel says the size.
-4. Drag inside a clearing to move it; **Shift+click** inside it (or × in the
-   Sites list) deletes it; **Ctrl+Z** undoes any of it. **Save map**, then F7 in
-   the game (or Apply) regenerates the world.
+**The trees: automatic.** No tree grows whose CROWN would come within 1 m of
+any building (every placed structure, on every map -- the crown's full width,
+so a tall tree does not overhang a low roof either); no trunk stands on a
+house's pad or its ramp; and no trunk stands within 1.5 m of a line a villager
+walks (every waynode link of the map's refs, the houses' own door nodes
+included). So big oaks stand back from the walls and bushes, birches and pines
+come closer. To keep a spot open that is not a house -- a field, a glade --
+use a clearing (below). To have a particular tree right beside a house, place
+it with the Tree tool (the rule is for the forest's own trees). Moving a
+waynode link moves its keep-out after the next F7 (Apply).
 
-How big: trees are kept back by their OWN crown's width, so the open ground you
-see is the box plus a few metres (a bush's 1.8 m, an oak's 5.4 m, a great oak's
-11.5 m) plus the ragged band. So draw the box just round what must stay open —
-Harrowby's is its buildings' outline plus 2 voxels.
+**The ground: softened.** Environment → **World map** → the **Soften** tool.
+Drag a box over the village. Inside it the forest floor keeps a fraction of
+its own relief, easing back to the untouched forest across the dashed feather.
+Select it (click inside it) and set, in the **Sites** panel:
 
-Keep the **spawn** outside every clearing if a new game should wake among trees:
-the Load check panel warns when it is inside one. (A clearing whose corners are
-the wrong way round is refused, naming it.) Not the **Pad box**: that is the
-selftest's fixture ground — it bares the grass too and flattens the hills, which
-is what put Harrowby on bald, jittered ground before it had a clearing.
+| field | what it keeps | Harrowby |
+|---|---|---|
+| `hills %` | the 12.8 m swells: how rolling the village is | 25 |
+| `bumps %` | the 3 m bumps: what makes a walk lumpy | 0 |
+| `grain %` | the sub-metre grain: the one-voxel steps and pits | 0 |
+| `paths %` | the swells kept ON the villagers' routes (1.2 m either side of each waynode link, easing out by 3.6 m) | 10 |
+| `feather` | how far past the box it eases back, voxels | 120 |
 
-The gate `village-harrowby` counts tree voxels inside every house (want 0);
-`clearing` tests the site kind itself. The look, from where a new game starts:
+100 everywhere is the biome's own ground; 0 hills is the flat level of the
+calm home area. The landform (the hillside the village is on) is never
+touched. **Save map**, then F7 in the game (or **Apply**).
+
+**Each house: its pad.** Select the house (F8, or F1 → World → References) and
+under **ground round the house**: `flat apron` (voxels of level ground round
+the walls -- the doorsteps, so every door meets the ground at its threshold)
+and `ramp` (how wide the S-curve back to the ground is; wider is gentler).
+Let go of the slider and the house re-applies.
+
+**A clearing** (the **Clearing** tool) is a box no forest tree's crown reaches
+over; past it the trees thin out across a **feather** band, so the edge is
+ragged. It changes nothing else: the ground keeps its shape and its grass and
+flowers, ponds stay, and trees you placed by hand still stand. Use it for an
+open field, a glade or a meadow -- not for a village, which has its houses'
+own rule. Drag a box; fine-tune its corners and feather in the Sites panel;
+drag inside one to move it; **Shift+click** deletes it; **Ctrl+Z** undoes.
+Trees are kept back by their OWN crown's width (a bush 1.8 m, an oak 5.4 m, a
+great oak 11.5 m), so the open ground is the box plus a few metres. Keep the
+**spawn** outside every clearing if a new game should wake among trees (the
+Load check panel warns). Not the **Pad box**: that is the selftest's fixture
+ground -- it bares the grass and flattens the hills.
+
+The gate `village-harrowby` counts tree voxels inside and over every house
+(want 0); `structure-ground` tests the tree rule, the pad and the soften box
+themselves; `clearing` tests clearings. The look, on foot, from where a new
+game starts:
 
 ```bash
 SANDVOX_SHOT_SPAWN_LOOK=557,3440 bash scripts/run.sh ./build/Release/sandvox.exe --shot-spawn
@@ -1486,7 +1519,10 @@ SANDVOX_SHOT_SPAWN_LOOK=557,3440 bash scripts/run.sh ./build/Release/sandvox.exe
 
 writes `screenshot_spawn.bmp` (standing at the spawn, looking at that column),
 `screenshot_spawn_back.bmp` (turned round) and `screenshot_spawn_high.bmp`
-(from above and behind); `SANDVOX_SHOT_SPAWN_AT=<minutes>` sets the hour.
+(from above and behind); `SANDVOX_SHOT_SPAWN_AT=<minutes>` sets the hour. The
+village gate's pictures (`SANDVOX_HARROWBY_SHOTS=build/hb`) include three on
+foot from the green (`_ground_north`, `_ground_west`, `_ground_east`) and two
+doorsteps (`_door_longhouse`, `_door_smithy`).
 
 ### When it goes wrong
 
@@ -1499,13 +1535,17 @@ writes `screenshot_spawn.bmp` (standing at the spawn, looking at that column),
 - **"lost blood over an ordinary day"** — something in the village hurts
   people: a door that hit them was one (fixed in the engine), a stair they
   fall off another (the longhouse loft has a rail for that reason).
-- **The ground round a house is a step or a ditch** — the house's floor is not
-  one above the ground there. On the levelled clearing use 201; elsewhere use
-  **move to crosshair** on the ground (§12), or level the ground first:
-  `node scripts/sculpt_flatten.mjs default --rect x0,z0,x1,z1 --y <ground> --feather 96`
-  (the World map page's sculpt brush edits the same layer).
-- **"tree-material voxels inside its stamped box"** in the gate — the forest
-  reaches into that house: widen the clearing over it (§14.1).
+- **The ground round a house is a step or a ditch** — the house's floor is
+  far from the ground there. Widen its `ramp` (it widens itself as far as 64
+  voxels to avoid a two-voxel step), or put the floor nearer the ground: inside
+  the softened ground use 201; elsewhere **move to crosshair** (§12).
+- **The village looks lumpy or pitted** — lower the soften box's `bumps` and
+  `grain`; a lower `hills` flattens the swells. Dark pits in a gravel or dirt
+  track are loose grains kicked off the top: paint tracks two cells deep
+  (`--depth 2`, as `harrowby_08_paths.sh` does).
+- **"tree-material voxels inside its stamped box"** in the gate — a tree
+  reaches into that house, which the building rule exists to refuse: a Tree
+  site placed there by hand, or a bug.
 - **The village moved out of the gate's window** — the gate centres a 51 m
   window on Harrowby's refs; a house much further out than the field needs its
   own place, not this group.

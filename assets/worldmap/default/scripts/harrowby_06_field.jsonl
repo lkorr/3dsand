@@ -69,4 +69,4 @@
 
 {"cmd": "struct.save", "args": {}}
 
-{"cmd": "ref.place", "args": {"id": "harrowby/field", "kind": "structure", "base": "harrowby_field", "pos": [560, 201, 3170], "yaw": 0, "props": {"padMargin": 4}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/field", "kind": "structure", "base": "harrowby_field", "pos": [560, 201, 3170], "yaw": 0, "props": {"padApron": 4, "padMargin": 30}}}
