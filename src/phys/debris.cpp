@@ -2592,6 +2592,12 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
       b.inactiveTicks = 0;
       continue;
     }
+    // A FIXTURE (an open door leaf) is not rubble at rest: its owner writes
+    // it back, exactly, when it closes (world/refs_doors.h).
+    if (b.fixture) {
+      b.inactiveTicks = 0;
+      continue;
+    }
     // A GHOST MUST NEVER RE-ENTER THE GRID. Settle-back is the single most
     // destructive thing a body can do -- it writes its whole lattice into the
     // world as voxels and frees itself -- and a ghost is a render proxy for
@@ -6659,10 +6665,12 @@ void DebrisSystem::PostStep() {
     // Jolt here would hand it back the pose it is about to be re-derived from,
     // one tick stale. Its host is clamped and read like anything else, which is
     // the same rule Mob's limp-rig path applies to a worn shell.
-    if (!b.Follower()) {
+    // A FIXTURE (an open door) is held by its hinge and cannot tunnel; the
+    // clamp's SetBodyPosition would only fight the constraint.
+    if (!b.Follower() && !b.fixture) {
       UntunnelBody(b.handle, b.xf.pos);
-      phys_->GetTransform(b.handle, b.xf);
     }
+    if (!b.Follower()) phys_->GetTransform(b.handle, b.xf);
     // bodies that leave the residency window despawn: there is no terrain to
     // collide with out there (Noita despawns offscreen bodies the same way)
     const float kPad = 32.0f;
@@ -6681,9 +6689,13 @@ void DebrisSystem::PostStep() {
     }
   }
   // body budget: oldest bodies despawn first (they are usually settled rubble)
+  // -- never a FIXTURE (an open door), which its owner is still holding.
   while (bodies_.size() > MaxBodies()) {
-    ReleaseBody(bodies_.front());
-    bodies_.erase(bodies_.begin());
+    size_t victim = 0;
+    while (victim < bodies_.size() && bodies_[victim].fixture) victim++;
+    if (victim >= bodies_.size()) break;
+    ReleaseBody(bodies_[victim]);
+    bodies_.erase(bodies_.begin() + (ptrdiff_t)victim);
     instancesDirty_ = true;
   }
   // LAST: the cull above is what decides whether a host still exists, and the
@@ -6942,8 +6954,15 @@ bool DebrisSystem::BodyActive(uint32_t i) const {
 
 void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
   ByteWriter w{out};
-  w.U32((uint32_t)bodies_.size());
-  for (const Body& b : bodies_) {
+  // FIXTURES ARE NOT SAVED HERE (SetBodyFixture): an open door's leaf is
+  // re-created from its ref delta. The strap index below is into THIS list.
+  std::vector<const Body*> saved;
+  saved.reserve(bodies_.size());
+  for (const Body& b : bodies_)
+    if (!b.fixture) saved.push_back(&b);
+  w.U32((uint32_t)saved.size());
+  for (const Body* bp : saved) {
+    const Body& b = *bp;
     w.Pod(b.xf);
     w.U32(b.physScale);
     w.U32(b.micro.skinScale);
@@ -6962,8 +6981,8 @@ void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
     // build the motor StrapBody exists to avoid.
     uint32_t hostIdx = 0xFFFFFFFFu;
     if (b.Follower())
-      for (size_t j = 0; j < bodies_.size(); j++)
-        if (bodies_[j].handle == b.wornHost) { hostIdx = (uint32_t)j; break; }
+      for (size_t j = 0; j < saved.size(); j++)
+        if (saved[j]->handle == b.wornHost) { hostIdx = (uint32_t)j; break; }
     w.U32(hostIdx);
     w.Pod(b.wornRelPos);
     for (float q : b.wornRelQuat) w.F32(q);

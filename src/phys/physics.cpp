@@ -103,6 +103,16 @@ constexpr JPH::ObjectLayer PROP = 4;
 // included. Reported by the contact listener like MOVING — it is a real
 // projectile, and its impacts are what break it.
 constexpr JPH::ObjectLayer THROWN = 5;
+// A DOOR LEAF WHILE IT IS OPEN (world/refs_doors.h, BodyRole::Door): a
+// dynamic body on a hinge to the world. It meets bodies, creatures and every
+// player capsule -- it stops against a man in the doorway and he cannot walk
+// through it -- but NOT terrain. The terrain collider around it is meshed from
+// the fetch cache, which still holds the leaf's own cells for a tick or two
+// after they were cleared, and the frame touches the leaf on three faces:
+// meeting STATIC would start every door inside its own wall. What stops the
+// leaf is the hinge's limit, and what keeps a wall out of its arc is the
+// author (the References page draws the arc).
+constexpr JPH::ObjectLayer DOOR = 6;
 // OWNER-SCOPED LAYERS (W2-N), one per player slot. PLAYER_BASE+s is player s's
 // capsule. OWNED_BASE+s is MOVING except that it never meets PLAYER_BASE+s:
 // player s's own limbs, worn shells and grabbed load — exempt from THEIR
@@ -167,6 +177,7 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
     // the SIMULATION's; queries take a JPH::BroadPhaseLayerFilter instead and
     // are unaffected (see Layers::PROP).
     if (layer == Layers::PROP) return false;
+    if (layer == Layers::DOOR) return bp == BP::MOVING;  // never terrain
     return true;
   }
 };
@@ -180,6 +191,10 @@ class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
     // a second, disagreeing answer underneath the one combat actually reads.
     if (a == Layers::PROP || b == Layers::PROP) return false;
     if (a == Layers::STATIC && b == Layers::STATIC) return false;
+    if (a == Layers::DOOR || b == Layers::DOOR) {
+      const JPH::ObjectLayer o = a == Layers::DOOR ? b : a;
+      return o != Layers::STATIC && o != Layers::DOOR;
+    }
     // A capsule meets bodies only (terrain is the AABB controller's), never
     // another capsule, and never a body exempt from IT: the EXEMPT layer is
     // exempt from everyone, an OWNED/THROWN one from its own player only.
@@ -225,7 +240,7 @@ class PushLayerFilter final : public JPH::ObjectLayerFilter {
  public:
   explicit PushLayerFilter(int ownSlot) : ownSlot_(ownSlot) {}
   bool ShouldCollide(JPH::ObjectLayer layer) const override {
-    if (layer == Layers::MOVING) return true;
+    if (layer == Layers::MOVING || layer == Layers::DOOR) return true;
     const int s = Layers::OwnedSlot(layer);
     return s >= 0 && s != ownSlot_;
   }
@@ -425,6 +440,9 @@ struct Physics::JointImpls {
     Physics::JointDesc desc;
     JPH::Vec3 anchorLocalA = JPH::Vec3::sZero();
     JPH::Vec3 anchorLocalB = JPH::Vec3::sZero();
+    // A motored hinge's target (SetJointMotorTarget), re-applied when the
+    // joint is rebuilt against a replacement body.
+    float motorTarget = 0.0f;
   };
   std::unordered_map<uint64_t, Entry> joints;                 // handle -> entry
   std::unordered_map<uint64_t, std::vector<uint64_t>> byBody; // body -> joints
@@ -1778,7 +1796,16 @@ static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
       s.mLimitsMin = std::max(d.minAngle, -JPH::JPH_PI);
       s.mLimitsMax = std::min(d.maxAngle, JPH::JPH_PI);
       s.mMaxFrictionTorque = FrictionTorque(*b, anchor, d.friction);
+      if (d.motorTorque > 0.0f) {
+        s.mMotorSettings = JPH::MotorSettings(std::max(d.motorFreq, 0.1f), 1.0f);
+        s.mMotorSettings.SetTorqueLimit(d.motorTorque);
+      }
       constraint = s.Create(*a, *b);
+      if (d.motorTorque > 0.0f && constraint) {
+        auto* h = static_cast<JPH::HingeConstraint*>(constraint.GetPtr());
+        h->SetMotorState(JPH::EMotorState::Position);
+        h->SetTargetAngle(0.0f);
+      }
       break;
     }
     case JointType::Ball: {
@@ -1825,13 +1852,15 @@ static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
 
 uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
                               const JointDesc& d) {
-  if (!system_ || bodyA == 0 || bodyB == 0) return 0;
-  // TwoBodyConstraintSettings::Create wants Body&: lock both bodies
+  if (!system_ || bodyB == 0) return 0;
+  // TwoBodyConstraintSettings::Create wants Body&: lock both bodies. bodyA 0
+  // is the world (Body::sFixedToWorld, never locked: it is not in the system).
   const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
-  JPH::BodyID ids[2] = {ToBodyID(bodyA), ToBodyID(bodyB)};
-  JPH::BodyLockMultiWrite lock(bli, ids, 2);
-  JPH::Body* a = lock.GetBody(0);
-  JPH::Body* b = lock.GetBody(1);
+  const bool world = bodyA == 0;
+  JPH::BodyID ids[2] = {world ? ToBodyID(bodyB) : ToBodyID(bodyA), ToBodyID(bodyB)};
+  JPH::BodyLockMultiWrite lock(bli, ids, world ? 1 : 2);
+  JPH::Body* a = world ? &JPH::Body::sFixedToWorld : lock.GetBody(0);
+  JPH::Body* b = world ? lock.GetBody(0) : lock.GetBody(1);
   if (!a || !b) return 0;
 
   JPH::RVec3 anchor(VoxToM(d.anchorVoxel.x), VoxToM(d.anchorVoxel.y),
@@ -1868,10 +1897,13 @@ bool Physics::RetargetJoint(uint64_t joint, uint64_t oldBody,
   const uint64_t newA = aMoves ? newBody : e.bodyA;
   const uint64_t newB = bMoves ? newBody : e.bodyB;
   const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
-  JPH::BodyID ids[2] = {ToBodyID(newA), ToBodyID(newB)};
-  JPH::BodyLockMultiWrite lock(bli, ids, 2);
-  JPH::Body* a = lock.GetBody(0);
-  JPH::Body* b = lock.GetBody(1);
+  // A WORLD-ANCHORED joint (bodyA 0, CreateJoint): only B is a real body.
+  const bool world = newA == 0;
+  if (world && !bMoves) return false;
+  JPH::BodyID ids[2] = {world ? ToBodyID(newB) : ToBodyID(newA), ToBodyID(newB)};
+  JPH::BodyLockMultiWrite lock(bli, ids, world ? 1 : 2);
+  JPH::Body* a = world ? &JPH::Body::sFixedToWorld : lock.GetBody(0);
+  JPH::Body* b = world ? lock.GetBody(0) : lock.GetBody(1);
   if (!a || !b) return false;
   // THE ANCHOR COMES FROM THE SIDE THAT DID NOT CHANGE. A rebuilt collider
   // may sit at a rebased origin (DebrisSystem::RebaseVoxels shifts the
@@ -1885,6 +1917,8 @@ bool Physics::RetargetJoint(uint64_t joint, uint64_t oldBody,
   JPH::Vec3 boneOut = JPH::Vec3::sZero();
   JPH::Ref<JPH::Constraint> c = BuildConstraint(*a, *b, e.desc, anchor, boneOut);
   if (!c) return false;
+  if (e.desc.type == JointType::Hinge && e.desc.motorTorque > 0.0f)
+    static_cast<JPH::HingeConstraint*>(c.GetPtr())->SetTargetAngle(e.motorTarget);
   system_->RemoveConstraint(e.constraint);
   system_->AddConstraint(c);
   e.constraint = c;
@@ -2049,9 +2083,37 @@ void Physics::DestroyJoint(uint64_t joint) {
   // waking both sides matters: a severed limb must start falling even if the
   // ragdoll had gone to sleep
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  if (bi.IsAdded(ToBodyID(it->second.bodyA))) bi.ActivateBody(ToBodyID(it->second.bodyA));
-  if (bi.IsAdded(ToBodyID(it->second.bodyB))) bi.ActivateBody(ToBodyID(it->second.bodyB));
+  for (uint64_t body : {it->second.bodyA, it->second.bodyB})
+    if (body != 0 && bi.IsAdded(ToBodyID(body))) bi.ActivateBody(ToBodyID(body));
   joints_->joints.erase(it);
+}
+
+bool Physics::JointAlive(uint64_t joint) const {
+  return joints_ && joints_->joints.count(joint) != 0;
+}
+
+bool Physics::SetJointMotorTarget(uint64_t joint, float radians) {
+  if (!system_ || !joints_) return false;
+  auto it = joints_->joints.find(joint);
+  if (it == joints_->joints.end()) return false;
+  JointImpls::Entry& e = it->second;
+  if (e.desc.type != JointType::Hinge || !(e.desc.motorTorque > 0.0f)) return false;
+  e.motorTarget = radians;
+  static_cast<JPH::HingeConstraint*>(e.constraint.GetPtr())->SetTargetAngle(radians);
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  for (uint64_t body : {e.bodyA, e.bodyB})
+    if (body != 0 && bi.IsAdded(ToBodyID(body))) bi.ActivateBody(ToBodyID(body));
+  return true;
+}
+
+bool Physics::JointHingeAngle(uint64_t joint, float& outRadians) const {
+  outRadians = 0.0f;
+  if (!system_ || !joints_) return false;
+  auto it = joints_->joints.find(joint);
+  if (it == joints_->joints.end() || it->second.desc.type != JointType::Hinge) return false;
+  outRadians = static_cast<const JPH::HingeConstraint*>(it->second.constraint.GetPtr())
+                   ->GetCurrentAngle();
+  return true;
 }
 
 void Physics::SetBodyKinematic(uint64_t handle, bool kinematic) {
@@ -2311,6 +2373,7 @@ const char* Physics::RoleName(BodyRole r) {
     case BodyRole::Carried: return "carried";
     case BodyRole::SeveredHold: return "severed-hold";
     case BodyRole::Thrown: return "thrown";
+    case BodyRole::Door: return "door";
     default: return "?";
   }
 }
@@ -2319,6 +2382,8 @@ int Physics::ResolveLayer(BodyRole role, int ownerSlot, bool clearing) {
   switch (role) {
     case BodyRole::HeldProp:
       return Layers::PROP;
+    case BodyRole::Door:
+      return Layers::DOOR;
     case BodyRole::SeveredHold:
       return Layers::EXEMPT;
     case BodyRole::Thrown:

@@ -566,6 +566,11 @@ const char* const kOrder[] = {
     // found (both move the window to the harness origin to meet the fixture).
     "refs-activate",
     "refs-npc-identity",
+    // P6 doors: same exit contract as refs-npc-identity (it builds a doorway
+    // at absolute coordinates, saves and loads, and regenerates on the way
+    // out). container-persist is CPU-only and could go anywhere.
+    "door-cycle",
+    "container-persist",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

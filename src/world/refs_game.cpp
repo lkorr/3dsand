@@ -63,6 +63,10 @@ void TickRefs(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick
   RefStore& s = *w.refs;
   s.BindChunkStore(&w.stream.Store());
   RefCtx ctx{&s, &w.mobs, &w.world, &w.stream.Store(), &out, tick};
+  ctx.phys = &w.phys;
+  ctx.debris = &w.debris;
+  ctx.mats = &w.mats;
+  ctx.items = &w.items;
   s.Update(ctx, w.world.WindowOrigin());
 
   // THE USE VERB, per session in index order (the op-order rule: session 0's
@@ -101,9 +105,46 @@ void TickRefs(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick
         w.ui.kitMessage = u.message;
         w.ui.kitMessageAge = 0.0f;
       }
+      // ...and so does the loot panel a chest opens (main.cpp's loot block
+      // picks the request up on the next frame).
+      if (players[i].s->localView && !u.openContainer.empty()) {
+        w.ui.lootRef = u.openContainer;
+        w.ui.lootRefOpenReq = true;
+      }
     }
     s.NoteUse(std::move(rec));
   }
+
+  // DEV USES (References page "test open/close"): no player, no reach check,
+  // same place in the op order as a player's use.
+  for (const std::string& id : s.TakeDevUses()) {
+    UseRecord rec;
+    rec.tick = tick;
+    rec.player = 0xFFFFFFFFu;
+    rec.id = id;
+    const Ref* r = s.Find(id);
+    const RefKind* k = r != nullptr ? Kinds().Find(r->kind) : nullptr;
+    if (r == nullptr || k == nullptr || !k->onUse) {
+      rec.message = "dev use: no usable ref \"" + id + "\"";
+    } else if (!s.IsActive(id)) {
+      rec.message = "dev use: not active (outside the window or waiting)";
+    } else {
+      RefUse u;
+      u.player = 0xFFFFFFFFu;
+      k->onUse(ctx, *r, u);
+      rec.used = true;
+      rec.message = u.message;
+    }
+    if (!rec.message.empty()) {
+      w.ui.kitMessage = rec.message;
+      w.ui.kitMessageAge = 0.0f;
+    }
+    s.NoteUse(std::move(rec));
+  }
+
+  // THE KINDS' OWN TICKS (a door swinging), in kind-name order.
+  for (const std::string& name : Kinds().Names())
+    if (const RefKind* k = Kinds().Find(name); k != nullptr && k->tick) k->tick(ctx);
 }
 
 // ---- the save ---------------------------------------------------------------------

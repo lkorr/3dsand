@@ -552,6 +552,7 @@ add_library(sandvox_core OBJECT
   src/world/refs.cpp
   src/world/refs_kinds.cpp
   src/world/refs_game.cpp
+  src/world/refs_doors.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing

@@ -20148,3 +20148,98 @@ group file (temp + rename), and marks the ref for re-apply on the next Update.
 Inverting a sequence restores the file byte for byte (`refs-roundtrip` E). R in
 game re-reads the directory (`RefStore::Reload`): changed lines re-apply,
 vanished ones undo, new ones activate.
+
+### 16.P6 Doors, containers, beds (added 2026-09-29)
+
+`docs/PLAN_world_editor.md` §2.4 / §5 P6. Code: `src/world/refs_doors.{h,cpp}`
+(the three kinds, door geometry, container contents), `Physics` world-anchored
+motored hinges, `DebrisSystem::SetBodyFixture`, the References page's per-kind
+fields (`src/ui/refs_ui.cpp`), the chest branch of main.cpp's loot block. Gates:
+`door-cycle`, `container-persist`. How-to: `docs/EDITOR_GUIDE.md` §9.1.
+
+**Two hooks the store grew.** `RefKind::tick` — once per tick per KIND, after
+activation and the uses, for a kind with moving parts (the door); it returns at
+once when nothing of its kind is moving (rule 2). `RefStore::QueueDevUse` — the
+References page's "test open/close": run by the next `TickRefs` inside the tick
+(same op-order slot as a player's use), no player, no reach check. `RefCtx`
+carries `phys`, `debris`, `mats`, `items`; `RefUse::openContainer` hands a
+chest to the using window's loot panel.
+
+**A door is voxels when closed, a hinged body only while open** (owner's
+decision). The ref names the leaf: `pos` = the hinge-side bottom cell of the
+FRONT layer, `yaw` = the direction it swings toward (whole quarter-turns),
+props `width`/`height`/`thickness` (9/20/1, thickness behind the front face),
+`hinge` left|right (as seen facing the door from the side it opens toward),
+`openAngle` (95), `locked`, `autoClose` s. `refs::DoorGeometry` is the one
+place that turns those into cells, the hinge line and the swing sign — the kind,
+the page's arc preview and the gates all call it.
+
+- **Open.** A use requests the leaf's chunks from the FETCH CACHE (never the
+  3×3×3 mirror; a door is used from across a room and NPCs use doors anywhere)
+  and waits (phase `Opening`) until they are no older than the use. Every
+  `CLASS_SOLID` cell in the box IS the leaf — whatever the words are; no
+  material is assumed — captured word for word (bits 16..23 and 31 masked). The
+  cells leave the grid by `CellOpClearIfMat` (rule 3; a cell that changed
+  material since the capture keeps what is there). The same voxels become ONE
+  body (`Physics::CreateDebrisBody`), adopted by `DebrisSystem` so it draws and
+  burns like any body, flagged a **fixture**, and hung on a Jolt
+  `HingeConstraint` to the WORLD (`CreateJoint(0, body, …)` —
+  `Body::sFixedToWorld`) with a POSITION motor (torque 25 N·m per kg of leaf,
+  2 Hz critically damped) driven to `openSign × openAngle`. An empty box, or
+  nothing left in the hinge column, is not a door: `Broken`.
+- **Close.** Motor target 0. When the hinge is within ~3.4° and turning slower
+  than ~17°/s (`Settling`), the box is read through the cache again: air takes
+  the captured word with `kCellOpIfAir`, gas is overwritten, anything else
+  (a stone put in the doorway, water) makes the close WAIT and re-read every
+  15 ticks. A body in the doorway blocks the swing itself (the leaf meets it).
+  Then the body is destroyed (the hinge dies with it) and the exact words are
+  written back. The leaf is compared to what was hung (count + material
+  histogram) first: a leaf that burned or was cut while open is `Broken` — the
+  hinge is dropped, the fixture flag cleared, the pieces are loose debris, and
+  the prompt says "Broken door" until the ref is edited.
+- **The door layer.** `BodyRole::Door` → `Layers::DOOR`: meets bodies and every
+  player capsule (PushLayerFilter includes it: you cannot walk through an open
+  leaf), NEVER terrain. The terrain collider is meshed from the fetch cache,
+  which still holds the leaf's own cells for a tick or two after the clear, and
+  the frame touches the leaf on three faces; meeting STATIC would start every
+  door inside its own wall. The hinge limit stops the leaf; keeping walls out
+  of the arc is the author's job, which is why the page draws the arc.
+- **A fixture** (`DebrisSystem::SetBodyFixture`): never settles back (a leaf
+  standing at 90° is axis-aligned and asleep and WOULD be stamped into the grid
+  open), never evicted by the body budget, never saved in DBRS (the ref delta
+  re-creates it; a saved copy would load as a second, loose leaf), not
+  untunnel-clamped (the hinge holds it; the clamp would fight the constraint),
+  and **not grabbable** — `GrabHold::Grabbable` refuses it, so hold-G on an
+  open door does nothing and tap-G uses it. Damage that REPLACES the handle
+  keeps the flag and the hinge (`ReplaceBody` → `RetargetJoint`, which now
+  understands a world side); the door follows `Physics::Successor`.
+- **Persistence.** Delta (kind `door`, v1): `u32 1` + the captured
+  `(cell, word)` list while open, `u32 2` when broken, none when closed. On
+  activation an open delta re-hangs the saved words already at the open angle
+  (the joint is built at the closed pose so angle 0 stays "shut", then the body
+  is turned about the hinge); the grid under it is air because the chunk save
+  holds the cleared cells. WindowLeft destroys the body and keeps the delta;
+  Edited / Deleted write the leaf back (`kCellOpIfAir`) and clear it; Reset
+  (a load) touches nothing. A write-back asked for outside a tick (R deleting
+  an open door) is held and pushed into the next tick's ops.
+- **Determinism.** Every grid effect is an op pushed from inside TickAuthority,
+  and the words written back are the captured ones, so the grid after a close
+  does not depend on how the body swung. The TICK of the close does depend on
+  the Jolt step (home detection), exactly as debris settle-back does; the op
+  stream records it, so `ops-replay` reproduces it.
+
+**Container** (`container`): a Bag owned by the ref. Contents = the delta
+(kind `container` v1: the non-empty slots, `WriteItemInstance` at
+`kItemFmtStopper`) if there is one, else `props.items`
+(`[{"item", "count"}]`, names the library lacks skipped; `props.title`). Stateless
+on purpose: every read decodes the delta, every change rewrites it, so a load
+cannot leave a stale cached bag. Use → "Search chest" → the using window's loot
+panel (`UIState::lootRef`), take one / take all / put by drag, through
+`refs::ContainerTake` / `ContainerPut` (room probed first; a full pack moves
+nothing; puts refuse equip slots — a worn piece leaves through `Mob::KitMove`).
+**Known gap:** take/put are frame-side like corpse looting, not TickInput
+events; the OPEN is a TickInput use.
+
+**Bed** (`bed`): an anchor. `pos` = the head cell on the mattress, `yaw` = head →
+foot, `props.length` (18). `refs::BedAnchorOf` gives head, foot and heading for
+P7. Use = "Rest", a line of text (skipping time is out of scope).

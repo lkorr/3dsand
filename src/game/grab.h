@@ -88,6 +88,10 @@ class GrabHold {
     if (mobs != nullptr)
       if (const uint64_t limb = mobs->GrabbableDeadLimb(body)) return limb;
     if (const uint64_t host = debris.WornHostOf(body)) body = host;
+    // AN OPEN DOOR IS NOT A THING TO CARRY: its leaf is a debris body only so
+    // that it draws and burns (DebrisSystem::SetBodyFixture). A servo on a
+    // body hinged to the world would fight the hinge; G taps it instead.
+    if (debris.IsFixture(body)) return 0;
     return debris.HasBody(body) ? body : 0;
   }
 

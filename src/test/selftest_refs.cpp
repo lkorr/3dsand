@@ -12,6 +12,12 @@
 //                      through the real tick: a TB_USE press carrying a ref's
 //                      hash runs its onUse; out of reach / not active is
 //                      refused and recorded.
+//   door-cycle         P6. A door opens into one hinged body (cells empty,
+//                      swung toward its yaw), a blocked close waits, the
+//                      close writes the exact words back, and an open door
+//                      survives save + load.
+//   container-persist  P6, CPU. Take / put / a full pack refusing, and the
+//                      contents exact through the REFS save records.
 //   refs-npc-identity  An NPC spawned from a ref carries Mob::RefId through a
 //                      save + load and through park + unpark, the ref never
 //                      spawns a second body, a duplicate record is refused,
@@ -42,6 +48,10 @@
 #include "test/tickrig.h"
 #include "world/refs.h"
 #include "world/refs_game.h"
+#include "world/refs_doors.h"
+#include "game/equipment.h"
+#include "phys/debris.h"
+#include "phys/physics.h"
 
 using namespace sandvox;
 
@@ -600,6 +610,394 @@ Status GateRefsNpcIdentity(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+
+// ---- P6: door-cycle, container-persist ---------------------------------------
+//
+// A scratch map dir with NO fixture copied in: these gates place their own
+// refs through refs::Place (the authoring path), so the refs-* fixture's
+// activation-order strings are not disturbed.
+std::string EmptyScratch(const char* name, const char* map) {
+  const std::string root = std::string("build/selftest_refs_") + name;
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root + "/worldmap/" + map + "/refs", ec);
+  return root;
+}
+
+uint32_t MatId(const Ctx& c, const char* name) {
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == name) return (uint32_t)i;
+  return 0;
+}
+
+// door-cycle — a doorway built from ops, a `door` ref placed on its leaf:
+//   A. use (TB_USE through the real tick) -> the leaf becomes ONE hinged body,
+//      its cells go empty, it swings TOWARD the yaw to the open angle;
+//   B. a stone set in the doorway while open -> a use closes the swing but
+//      the write-back WAITS (Settling, body kept); clearing it -> closed, body
+//      gone, the box's words byte-identical to before the first open;
+//   C. open again, save + load: the door comes back open (body re-hung from
+//      the delta at the open angle, cells still empty), and closes exact.
+Status GateDoorCycle(Ctx& c, std::string& detail) {
+  refs::RegisterAllKinds();
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) why.push_back(what);
+    return ok;
+  };
+  const char* kPath = "selftest_door_cycle.svd";
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  std::error_code ec;
+  fs::remove_all(kPath, ec);
+  c.stream.Store().Clear();
+  c.debris.Reset();
+  c.mobs.Reset();
+  const IVec3 home{0, 0, 0};
+  c.world.SetWindowOrigin(home);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  // ---- the doorway: yaw 0 (opens toward +Z), hinge left (leaf runs +X) ----
+  const int X0 = 152, Z0 = 152, W = 5, H = 8;
+  const int G = FixtureYOver(X0 - 6, Z0 - 4, X0 + W + 6, Z0 + 10, kDefaultSeed, 0);
+  const int Y0 = G + 1;
+  const uint32_t stone = MatId(c, "stone"), wood = MatId(c, "wood");
+  std::vector<CellOp> build;
+  auto put = [&](int x, int y, int z, uint32_t m, uint32_t state) {
+    build.push_back({World::SlotCellIndex({x, y, z}), m == 0 ? 0u : PackVoxNew(m, state)});
+  };
+  // The WALL FIRST: two cell ops on one cell in one tick keep the FIRST
+  // (CLAUDE.md rule 3), and the clearing pass below covers the wall's cells.
+  for (int x = X0 - 6; x <= X0 + W + 6; x++)
+    for (int y = Y0; y <= Y0 + H; y++) {
+      const bool doorway = x >= X0 && x < X0 + W && y < Y0 + H;
+      if (doorway) put(x, y, Z0, wood, (uint32_t)((x + y) % 3));          // the leaf
+      else put(x, y, Z0, stone, 0);                                       // wall + lintel
+    }
+  for (int x = X0 - 6; x <= X0 + W + 6; x++)
+    for (int z = Z0 - 4; z <= Z0 + 10; z++) {
+      for (int y = G - 6; y <= G; y++) put(x, y, z, stone, 0);           // the floor slab
+      for (int y = Y0; y <= Y0 + H + 4; y++) put(x, y, z, 0, 0);         // clear air above
+    }
+
+  const std::string root = EmptyScratch("door", "door");
+  refs::RefStore st;
+  st.LoadMap(root, "door");
+  refs::Ref dr;
+  dr.id = "doorfix/front";
+  dr.kind = "door";
+  dr.pos = {X0, Y0, Z0};
+  dr.yaw = 0;
+  dr.props = refs::Json{{"width", W}, {"height", H}, {"hinge", "left"}};
+  std::string err;
+  check(refs::Place(st, dr, &err), "place: " + err);
+  st.BindChunkStore(&c.stream.Store());
+  const refs::DoorGeom g = refs::DoorGeometry(*st.Find(dr.id));
+  check(g.ok, "geometry: " + g.why);
+  const std::vector<IVec3> box = g.Cells();
+
+  uint32_t t = 14000;
+  const IVec3 fixChunk{X0 >> 4, Y0 >> 4, Z0 >> 4};
+  auto rig = std::make_unique<support::TickRig>(c, t, fixChunk);
+  rig->Authority().refs = &st;
+  PlayerSession& ps = rig->Session();
+  auto standInFront = [&]() {
+    ps.player.pos = Vec3{(float)X0 + 2.5f, (float)Y0 + 2.0f, (float)Z0 + 16.0f};
+    ps.player.vel = Vec3{0, 0, 0};
+  };
+  standInFront();
+  support::RunTicks(*rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = build; });
+  support::RunTicks(*rig, 8);
+
+  // The box's words through the fetch cache, no older than now.
+  auto boxWords = [&](std::vector<uint32_t>& out) {
+    const uint32_t since = rig->tick;
+    for (int i = 0; i < 40; i++) {
+      bool fresh = true;
+      for (const IVec3& cell : box) {
+        const IVec3 wc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+        const CachedChunk* cc = c.world.Cached(wc);
+        if (cc == nullptr || cc->voxels.size() != kChunkVol || cc->version < since) {
+          fresh = false;
+          c.world.RequestChunkFetch(wc);
+        }
+      }
+      if (fresh) break;
+      support::RunTicks(*rig, 1);
+    }
+    out.clear();
+    for (const IVec3& cell : box) {
+      const CachedChunk* cc = c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+      const uint32_t w = cc ? cc->voxels[(size_t)(((cell.z & 15) * 16 + (cell.y & 15)) * 16 +
+                                                   (cell.x & 15))]
+                            : 0xFFFFFFFFu;
+      out.push_back(w & 0x7F00FFFFu);
+    }
+  };
+  auto allAir = [](const std::vector<uint32_t>& w) {
+    for (uint32_t v : w)
+      if ((v & 0xFFFu) != 0) return false;
+    return true;
+  };
+  auto press = [&]() {
+    standInFront();
+    support::RunTicks(*rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.input.SetPressed(TB_USE, true);
+      o.input.useRef = st.Find(dr.id)->hash;
+    });
+  };
+  auto waitPhase = [&](refs::DoorPhase want, int maxTicks) {
+    refs::DoorStatus s;
+    for (int i = 0; i < maxTicks; i++) {
+      if (refs::DoorStatusOf(dr.id, s) && s.phase == want) return i;
+      support::RunTicks(*rig, 1);
+    }
+    return -1;
+  };
+
+  std::vector<uint32_t> before;
+  boxWords(before);
+  int leafCount = 0;
+  for (uint32_t w : before) leafCount += (w & 0xFFFu) == wood ? 1 : 0;
+  check(leafCount == W * H, Format("fixture: %d wood cells in the box, want %d", leafCount, W * H));
+  const bool activeOk = check(st.IsActive(dr.id), "the door ref never activated");
+
+  // A. OPEN.
+  press();
+  const int openAfter = waitPhase(refs::DoorPhase::Open, 60);
+  support::RunTicks(*rig, 45);   // let it swing
+  refs::DoorStatus sA;
+  refs::DoorStatusOf(dr.id, sA);
+  std::vector<uint32_t> openWords;
+  boxWords(openWords);
+  Vec3 com{};
+  const bool haveBody = sA.body != 0 && c.debris.HasBody(sA.body) && c.phys.BodyCenterOfMass(sA.body, com);
+  const float target = g.openSign * g.openRad;
+  const bool swungToward = haveBody && com.z > g.Center().z + 1.0f;
+  const bool angleOk = std::fabs(sA.angle - target) < 0.2f;
+  const bool okA = check(openAfter >= 0 && haveBody && allAir(openWords) && swungToward && angleOk &&
+                             sA.leafCells == (uint32_t)(W * H) && c.debris.IsFixture(sA.body),
+                         Format("A: open after %d ticks, body %d, cells empty %d, com.z %.1f vs %.1f, "
+                                "angle %.2f want %.2f, leaf %u",
+                                openAfter, haveBody, allAir(openWords), com.z, g.Center().z,
+                                sA.angle, target, sA.leafCells));
+
+  // B. BLOCKED CLOSE, then clear. The plug stands on the floor slab (a lone
+  // voxel in mid-air is an island the debris system takes over).
+  const IVec3 plug{X0 + 2, Y0, Z0};
+  const size_t plugIdx = (size_t)(2 * H);
+  support::RunTicks(*rig, 1, [&](uint32_t, support::TickOps& o) {
+    o.cells.push_back({World::SlotCellIndex(plug), PackVoxNew(stone, 0)});
+  });
+  press();
+  support::RunTicks(*rig, 75);
+  refs::DoorStatus sB;
+  refs::DoorStatusOf(dr.id, sB);
+  const bool waited = sB.phase == refs::DoorPhase::Settling && sB.blockedTicks > 0 &&
+                      sB.body != 0 && c.debris.HasBody(sB.body);
+  check(waited, Format("B: blocked close: phase %s, blocked %u ticks, body %d (%s)",
+                       refs::DoorPhaseName(sB.phase), sB.blockedTicks,
+                       sB.body != 0 && c.debris.HasBody(sB.body), sB.note.c_str()));
+  support::RunTicks(*rig, 1, [&](uint32_t, support::TickOps& o) {
+    o.cells.push_back({World::SlotCellIndex(plug), 0u});
+  });
+  std::vector<uint32_t> cleared;
+  boxWords(cleared);
+  const uint32_t plugAfterClear = cleared.size() > plugIdx ? cleared[plugIdx] : 0xFFFFFFFFu;
+  const int closedAfter = waitPhase(refs::DoorPhase::Closed, 120);
+  support::RunTicks(*rig, 3);
+  std::vector<uint32_t> after;
+  boxWords(after);
+  const bool bodyGone = sB.body == 0 || !c.debris.HasBody(sB.body);
+  const bool exact = after == before;
+  int diff = 0;
+  for (size_t i = 0; i < after.size() && i < before.size(); i++) diff += after[i] != before[i];
+  refs::DoorStatus sB2;
+  refs::DoorStatusOf(dr.id, sB2);
+  uint32_t firstDiff = 0, firstWas = 0;
+  for (size_t i = 0; i < after.size() && i < before.size(); i++)
+    if (after[i] != before[i]) {
+      firstDiff = after[i];
+      firstWas = before[i];
+      break;
+    }
+  const bool okB = check(waited && closedAfter >= 0 && bodyGone && exact && st.Delta(dr.id) == nullptr,
+                         Format("B: closed after %d ticks, body gone %d, %d of %zu words differ "
+                                "(first %08x, was %08x; plug cell %08x right after the clear, "
+                                "%08x now); door %s %.2f rad: %s",
+                                closedAfter, bodyGone, diff, after.size(), firstDiff, firstWas,
+                                plugAfterClear, after.size() > plugIdx ? after[plugIdx] : 0u,
+                                refs::DoorPhaseName(sB2.phase), sB2.angle, sB2.note.c_str()));
+
+  // C. OPEN, SAVE, LOAD: comes back open; closes exact.
+  press();
+  waitPhase(refs::DoorPhase::Open, 60);
+  support::RunTicks(*rig, 40);
+  EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr, nullptr, nullptr, &st);
+  const bool saved = SaveWorld(c.ctx, c.world, c.stream, kPath, c.mats, &eio);
+  EntityFileReport lr;
+  const bool loaded = LoadWorld(c.ctx, c.world, c.sim, c.stream, kPath, c.mats, &eio, nullptr, &lr);
+  const bool deltaBack = st.Delta(dr.id) != nullptr;
+  t = rig->tick;
+  rig = std::make_unique<support::TickRig>(c, t, fixChunk);
+  rig->Authority().refs = &st;
+  standInFront();
+  const int reopenAfter = waitPhase(refs::DoorPhase::Open, 30);
+  support::RunTicks(*rig, 20);
+  refs::DoorStatus sC;
+  refs::DoorStatusOf(dr.id, sC);
+  std::vector<uint32_t> loadedWords;
+  boxWords(loadedWords);
+  const bool backOpen = reopenAfter >= 0 && sC.body != 0 && c.debris.HasBody(sC.body) &&
+                        std::fabs(sC.angle - target) < 0.25f && allAir(loadedWords);
+  press();
+  const int closedC = waitPhase(refs::DoorPhase::Closed, 150);
+  support::RunTicks(*rig, 3);
+  std::vector<uint32_t> afterC;
+  boxWords(afterC);
+  const bool okC = check(saved && loaded && deltaBack && backOpen && closedC >= 0 && afterC == before,
+                         Format("C: saved %d loaded %d delta %d, open again after %d ticks at "
+                                "%.2f rad (body %d, cells empty %d), closed after %d, exact %d",
+                                saved, loaded, deltaBack, reopenAfter, sC.angle,
+                                sC.body != 0 && c.debris.HasBody(sC.body), allAir(loadedWords),
+                                closedC, afterC == before));
+
+  // Leave nothing behind.
+  {
+    refs::RefCtx rc{&st, &c.mobs, &c.world, &c.stream.Store()};
+    rc.phys = &c.phys;
+    rc.debris = &c.debris;
+    st.DeactivateAll(rc, refs::RefEvent::Reset);
+  }
+  rig.reset();
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(idCounterWas);
+  c.stream.Store().Clear();
+  fs::remove_all(kPath, ec);
+  fs::remove_all(root, ec);
+  c.world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  detail = Format(
+      "active %d | A %s: open in %d ticks, one body, %d cells emptied, swung +Z to %.0f deg | "
+      "B %s: blocked close waited %u ticks, closed exact (%d diffs) | C %s: open survives "
+      "save/load (%.0f deg), closes exact",
+      activeOk, okA ? "ok" : "FAIL", openAfter, W * H, sA.angle * 57.2958f, okB ? "ok" : "FAIL",
+      sB.blockedTicks, diff, okC ? "ok" : "FAIL", sC.angle * 57.2958f);
+  if (!why.empty()) detail += " | FAIL: " + why[0];
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
+// container-persist — CPU. A `container` ref's initial contents come from
+// props.items; take one, take one more, put a stack back (merging), then the
+// REFS region records the real save writes go through ResetForLoad and back:
+// contents exact, slot for slot. A second chest never touched has no delta and
+// still reads as authored. A full pack refuses a take and moves nothing.
+Status GateContainerPersist(Ctx& c, std::string& detail) {
+  refs::RegisterAllKinds();
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) why.push_back(what);
+    return ok;
+  };
+  // Two plain items the library has (whatever they are called today).
+  std::vector<std::string> names;
+  for (const ItemDef& d : c.items.items)
+    if (names.size() < 2 && !d.name.empty()) names.push_back(d.name);
+  if (names.size() < 2) {
+    detail = "the item library has fewer than two items";
+    return Status::Fail;
+  }
+  const std::string root = EmptyScratch("chest", "chest");
+  refs::RefStore st;
+  st.LoadMap(root, "chest");
+  std::string err;
+  refs::Ref a;
+  a.id = "chestfix/strongbox";
+  a.kind = "container";
+  a.pos = {100, 170, 100};
+  a.props = refs::Json{{"title", "Strongbox"},
+                       {"items", refs::Json::array({refs::Json{{"item", names[0]}, {"count", 3}},
+                                                    refs::Json{{"item", names[1]}, {"count", 1}},
+                                                    refs::Json{{"item", "no_such_thing"}, {"count", 2}}})}};
+  refs::Ref b = a;
+  b.id = "chestfix/untouched";
+  b.pos = {104, 170, 100};
+  check(refs::Place(st, a, &err) && refs::Place(st, b, &err), "place: " + err);
+  const refs::Ref* ra = st.Find(a.id);
+  Bag start;
+  refs::ContainerContents(st, *ra, &c.items, start);
+  check(start.Count() == 2 && start.slots[0].name == names[0] && start.slots[0].count == 3,
+        Format("authored contents: %d stacks (want 2, the unknown one skipped)", start.Count()));
+
+  // Take stack 0 (x3) and stack 1 into an empty kit; put the first back.
+  Kit kit;
+  std::string msg;
+  const bool took0 = refs::ContainerTake(st, a.id, 0, kit, c.items, &msg);
+  const bool took1 = refs::ContainerTake(st, a.id, 0, kit, c.items, &msg);
+  Bag mid;
+  refs::ContainerContents(st, *st.Find(a.id), &c.items, mid);
+  const bool emptyNow = mid.Count() == 0;
+  int kitCount = 0;
+  for (const ItemStack& s2 : kit.bag.slots) kitCount += s2.Empty() ? 0 : s2.count;
+  ItemStack back = kit.bag.slots[0];
+  const bool put = refs::ContainerPut(st, a.id, back, &msg) && back.Empty();
+  kit.bag.slots[0] = ItemStack{};
+  Bag want;
+  refs::ContainerContents(st, *st.Find(a.id), &c.items, want);
+  check(took0 && took1 && emptyNow && kitCount == 4 && put && want.Count() == 1,
+        Format("take/put: took %d %d, empty %d, kit %d items, put %d, %d stacks after", took0,
+               took1, emptyNow, kitCount, put, want.Count()));
+  // A full pack refuses and moves nothing.
+  Kit full;
+  for (int i = 0; i < Bag::kSlots + kItemSlots; i++) {
+    ItemStack filler;
+    filler.name = names[1] + "_filler" + std::to_string(i);
+    filler.count = 1;
+    if (i < Bag::kSlots) full.bag.slots[i] = filler;
+    else full.hotbar.slots[i - Bag::kSlots] = filler;
+  }
+  const bool refused = !refs::ContainerTake(st, a.id, 0, full, c.items, &msg);
+  Bag stillWant;
+  refs::ContainerContents(st, *st.Find(a.id), &c.items, stillWant);
+  check(refused && stillWant.Count() == 1, "a full pack did not refuse cleanly: " + msg);
+
+  // SAVE -> LOAD through the region records.
+  EntitySection sec = refs::MakeRefsSection(st, nullptr);
+  std::vector<EntityRecord> recs;
+  sec.saveRecords(recs);
+  refs::RefCtx rc{&st};
+  st.ResetForLoad(rc);
+  const bool goneAfterReset = st.Delta(a.id) == nullptr;
+  int applied = 0;
+  for (const EntityRecord& r : recs)
+    applied += sec.loadRecord(r.bytes.data(), r.bytes.size(), refs::RefStore::kSaveVersion) ==
+               RecordLoad::Applied;
+  Bag got;
+  refs::ContainerContents(st, *st.Find(a.id), &c.items, got);
+  bool same = got.Count() == want.Count();
+  for (int i = 0; i < Bag::kSlots && same; i++)
+    same = got.slots[i].name == want.slots[i].name && got.slots[i].count == want.slots[i].count;
+  Bag untouched;
+  refs::ContainerContents(st, *st.Find(b.id), &c.items, untouched);
+  const bool okSave = check(recs.size() == 1 && goneAfterReset && applied == 1 && same &&
+                                untouched.Count() == 2 && st.Delta(b.id) == nullptr,
+                            Format("save/load: %zu records, reset cleared %d, applied %d, exact %d, "
+                                   "untouched chest %d stacks",
+                                   recs.size(), goneAfterReset, applied, same, untouched.Count()));
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  detail = Format("authored %d stacks (unknown name skipped) | take x2 + put back | full pack "
+                  "refused | %s: %zu REFS record, contents exact after load, untouched chest "
+                  "has no delta",
+                  start.Count(), okSave ? "ok" : "FAIL", recs.size());
+  if (!why.empty()) detail += " | FAIL: " + why[0];
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& RefsGates() {
@@ -610,6 +1008,10 @@ const std::vector<Gate>& RefsGates() {
       {"refs-activate", "world", {}, false, GateRefsActivate, /*needsRender=*/false},
       // Stable NPC identity through save/load and park/unpark.
       {"refs-npc-identity", "world", {}, false, GateRefsNpcIdentity, /*needsRender=*/false},
+      // P6: a door opens into a hinged body and closes back exact; a chest's
+      // contents survive the save.
+      {"door-cycle", "world", {}, false, GateDoorCycle, /*needsRender=*/false},
+      {"container-persist", "world", {}, false, GateContainerPersist, /*needsRender=*/false},
   };
   return g;
 }

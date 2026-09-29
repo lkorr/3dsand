@@ -204,11 +204,29 @@ class Physics {
     // falls under its own weight, just not like wet rope — which is the
     // difference between a corpse and a rubber toy. 0 disables it.
     float friction = 0.15f;
+    // ---- Hinge motor (a door, world/refs_doors.h) ----
+    // Max torque the POSITION motor may apply, N*m. 0 = no motor (every rig
+    // joint). With a motor the hinge drives toward the target angle set by
+    // SetJointMotorTarget (radians from the pose at creation, about `axis`,
+    // right-handed), as a spring of `motorFreq` Hz, critically damped.
+    float motorTorque = 0.0f;
+    float motorFreq = 2.0f;
   };
 
   // Returns an opaque handle (0 = failure). Joints attached to a body are
   // destroyed automatically when that body is removed.
+  //
+  // `bodyA == 0` is THE WORLD (Jolt's Body::sFixedToWorld): a door leaf hung
+  // on a hinge that nothing can move. Such a joint survives ReplaceBody on its
+  // one body like any other (the world side "did not move"), and dies with it.
   uint64_t CreateJoint(uint64_t bodyA, uint64_t bodyB, const JointDesc& desc);
+  // A motored hinge's target (radians, see JointDesc::motorTorque); wakes the
+  // body. False for a joint that is not a motored hinge or is dead.
+  bool SetJointMotorTarget(uint64_t joint, float radians);
+  // A hinge's current angle, radians from its creation pose. False if dead
+  // or not a hinge.
+  bool JointHingeAngle(uint64_t joint, float& outRadians) const;
+  bool JointAlive(uint64_t joint) const;
   void DestroyJoint(uint64_t joint);  // <- this is dismemberment
   // Everything that referenced `oldHandle` now references `newHandle`, then
   // the old body is removed. Every joint on the old body is rebuilt against
@@ -340,6 +358,7 @@ class Physics {
   //   RigLimp       MOVING, entered through CLEARING
   //   RigDead       MOVING, entered through CLEARING
   //   Thrown        THROWN(P) / THROWN while clearing, then Debris on MOVING
+  //   Door          DOOR: bodies + every capsule, never terrain (open leaf)
   //
   // OWNED(P) is the OWNER-SCOPED exemption: exactly MOVING, except that it
   // never meets player P's capsule and P's PlayerPushOut never sees it. Every
@@ -393,6 +412,9 @@ class Physics {
     Carried,
     SeveredHold,
     Thrown,
+    // An OPEN DOOR LEAF (world/refs_doors.h): dynamic, hinged to the world,
+    // meets bodies and capsules but never terrain (Layers::DOOR).
+    Door,
     Count,
   };
   static constexpr uint64_t kNoOwner = 0;

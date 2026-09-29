@@ -636,6 +636,43 @@ class DebrisSystem {
     return false;
   }
 
+  // ---- A FIXTURE: a body a world reference owns (an open door leaf) --------
+  //
+  // world/refs_doors.h hands an open door's leaf over here so it is DRAWN,
+  // burns, and takes damage like any body -- and marks it a fixture, which is
+  // the list of things ordinary debris does that a door must not:
+  //   * it never SETTLES BACK (SettleBodies): a leaf standing at 90 degrees is
+  //     axis-aligned and asleep, and would be stamped into the grid open;
+  //   * it is never evicted by the body budget (the oldest-first cull);
+  //   * it is not SAVED with the debris ('DBRS'): the door's own ref delta
+  //     holds its exact words and re-creates it on load, so a saved copy
+  //     would come back as a second, loose leaf;
+  //   * it cannot be grabbed (GrabHold::Grabbable asks IsFixture).
+  // Damage that REPLACES the handle keeps the flag (the Body is edited in
+  // place); a split's second half does not -- a door cut in two is debris.
+  // False when the handle is not a body here.
+  bool SetBodyFixture(uint64_t handle, bool fixture) {
+    for (Body& b : bodies_)
+      if (b.handle == handle) {
+        b.fixture = fixture;
+        return true;
+      }
+    return false;
+  }
+  bool IsFixture(uint64_t handle) const {
+    if (!handle) return false;
+    for (const Body& b : bodies_)
+      if (b.handle == handle) return b.fixture;
+    return false;
+  }
+  // The voxel lattice of a body (collider units), or null. For a fixture's
+  // owner to compare what is left against what it hung (a burned door).
+  const std::vector<DebrisVoxel>* BodyVoxelsOf(uint64_t handle) const {
+    for (const Body& b : bodies_)
+      if (b.handle == handle) return &b.voxels;
+    return nullptr;
+  }
+
   // Per-material density, as every body-creating call here already takes it.
   // Exposed so a caller that builds a body and hands it straight over (a
   // dropped item — game/worlditems.h) uses the SAME table this system does,
@@ -1436,6 +1473,9 @@ class DebrisSystem {
     Vec3 wornRelPos{};
     float wornRelQuat[4] = {0, 0, 0, 1};
     bool Follower() const { return wornHost != 0; }
+    // Owned by a world reference (SetBodyFixture): never settles, never
+    // evicted, never saved here, never grabbed.
+    bool fixture = false;
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
     // Nonzero = one shard of a welded island (PLAN_rigidbody_islands.md §5):
     // every body sharing the id was cut from the same component and is joined

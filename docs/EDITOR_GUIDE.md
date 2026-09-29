@@ -491,7 +491,7 @@ same file.
 | Field | Means |
 |---|---|
 | `id` | `group/name`, lowercase letters, digits, `_` and `-` only |
-| `kind` | what sort of thing: `marker`, `npc` (more arrive: `structure`, `door`, `container`, `bed`, `waynode`) |
+| `kind` | what sort of thing: `marker`, `npc`, `door`, `container`, `bed` (§9.1; more arrive: `structure`, `waynode`) |
 | `base` | what it's an instance of — for an `npc`, the mob def (`human`, `dummy`, ...) |
 | `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells |
 | `yaw` | facing in degrees: 0 faces +Z, 90 faces +X |
@@ -530,7 +530,7 @@ silently thrown away.
 
 ### Using things in the world
 
-Walk up to a usable thing (a villager for now; doors and chests arrive later)
+Walk up to a usable thing (a villager, a door, a chest, a bed)
 and look at it: the prompt under the crosshair says what **G** will do ("G  Talk
 to Osric"). Tap **G**. If something lying on the ground is also under the
 crosshair, G picks that up first — look at the thing you mean.
@@ -548,3 +548,77 @@ emptied). So:
   its ref (moving it, changing its base) re-spawns it where the file now says.
 - The harness map's `refs/fixture.json` is for the automated tests only; the
   game never loads it.
+
+### 9.1 Doors, chests and beds
+
+These are three more kinds of ref. The door, chest and bed themselves are
+**voxels you built** (in the world, or later in a house's structure file); the
+ref only says "this box of cells is a door", "this cell is a chest", "a person
+lies here".
+
+#### How do I add a door?
+
+1. **Build the doorway and the leaf** out of voxels: a gap in a wall, filled
+   with the door's material (any solid — `wood` today, `door_wood` once the
+   building materials land). A human-sized door is 9 wide × 20 tall × 1 thick.
+2. **Stand on the side you want it to swing toward**, look at the doorway, and
+   place a ref of kind **door** (F1 → World → References → new reference,
+   kind `door`, **place at my feet**).
+3. Set its **pos** to the leaf's **bottom cell on the hinge side, in the front
+   layer** (the layer facing you), and its **yaw** to the direction it should
+   swing toward (0 = +Z, 90 = +X, 180, 270 — whole quarter-turns only).
+   Apply pos/yaw.
+4. The door's own fields appear under the props:
+   - **hinge** `left` / `right` — seen from where you're standing (the side it
+     opens toward), facing the door, which hand the hinge is on;
+   - **open angle** — how far it swings (default 95°);
+   - **w / h / thick** — the leaf size in cells (default 9 / 20 / 1; thickness
+     goes *away* from you, behind the front face). Press Enter to apply;
+   - **locked** — a locked door says "Locked" and won't open (no keys yet);
+   - **auto-close s** — seconds before it swings shut on its own (0 = never).
+5. **Check the arc**: while the door is selected, its outline (gold), its
+   fully-open position (orange) and the path its edge sweeps are drawn in the
+   world, with the hinge in red. If the arc goes through a wall or the hinge is
+   on the wrong side, flip **hinge** or change **yaw**.
+6. Press **test open/close** to swing it from wherever you are (the door must be
+   near enough to be active, `*` in the list). Or walk up and tap **G**
+   ("Open door" / "Close door").
+
+What happens: open lifts the leaf out of the wall and hangs it on a hinge as
+one solid object — you can't walk through it, and it stops against anyone in
+its way. Close swings it home and puts the exact same voxels back. If something
+was put in the doorway, it waits and tries again. A door that burns or gets
+cut while it's open stops being a door ("Broken door") and the pieces fall —
+rebuild the leaf and edit the ref (any change) to revive it. An open door
+can't be dragged with hold-G.
+
+#### How do I add a chest?
+
+1. Build the chest out of voxels.
+2. Place a ref of kind **container** on the chest's cell (stand close: the use
+   prompt answers when the crosshair passes within half a metre of that cell).
+3. Under **contents**, type in the search box and click an item to add it;
+   set counts with the number fields; **x** removes a row. That writes
+   `props.items`, e.g. `[{"item": "bread", "count": 3}]`. A red name is an
+   item the game doesn't have (it's skipped). Optional `props.title`
+   (`"Strongbox"`) changes what the prompt and the panel call it.
+4. In game, **G** on it says "Search chest" and opens the loot panel beside
+   your pack: right-click a slot or **take all** to take; drag from your bag or
+   hotbar onto the panel to put something in.
+
+Once anything is taken or put, the chest's contents are part of the **save**,
+and editing `props.items` only changes what a *new* game starts with. The page
+says "this playthrough has changed it" and offers **reset to authored**.
+
+#### How do I add a bed?
+
+Place a ref of kind **bed** with **pos** on the mattress cell where the **head**
+lies and **yaw** pointing from head to foot; `props.length` (default 18 cells)
+is how long it is. The page draws a blue line head → foot. In game **G** says
+"Rest" (sleeping through the night isn't in yet). Villagers (next package) lie
+down on it.
+
+#### What a door, a chest and a bed save
+
+A door left open saves as open (with its exact voxels) and comes back open; a
+chest saves what's in it now; a bed saves nothing.

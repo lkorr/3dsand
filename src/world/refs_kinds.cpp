@@ -163,6 +163,8 @@ void RegisterP1Kinds() {
 
 }  // namespace
 
+void RegisterDoorKinds();   // world/refs_doors.cpp (P6)
+
 void RegisterAllKinds() {
   static bool done = false;
   if (done) return;
@@ -171,7 +173,7 @@ void RegisterAllKinds() {
   // ---- later packages: one line each, AFTER P1 (a later registration of the
   // same name replaces the earlier one) ----
   // RegisterStructureKinds();   // P4
-  // RegisterDoorKinds();        // P6: door, container, bed
+  RegisterDoorKinds();           // P6: door, container, bed
   // RegisterResidentKinds();    // P7: npc (replaces P1's), waynode
 }
 
