@@ -165,6 +165,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::Clouds:        return (cx.cloudFlags & 1u) != 0u;
     case pass::Cond::CloudBake:     return (cx.cloudFlags & 2u) != 0u;
     case pass::Cond::ShadowCacheOn: return (cx.cloudFlags & 4u) != 0u;
+    case pass::Cond::RayStart:      return cx.rayStartGx > 0 && cx.rayStartGy > 0;
   }
   return false;
 }
@@ -206,6 +207,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
       return cx.gasFarWideCount;
     case pass::DispatchSel::CloudGx: return cx.cloudGx;
     case pass::DispatchSel::CloudGy: return cx.cloudGy;
+    case pass::DispatchSel::RayStartGx: return cx.rayStartGx;
+    case pass::DispatchSel::RayStartGy: return cx.rayStartGy;
     default:                          return v;
   }
 }

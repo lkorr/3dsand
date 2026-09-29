@@ -11766,6 +11766,31 @@ where you hear from either (§12b, "The ears are on the character").
   the cost was never traversal — it was the register footprint of the inlined
   copy. `--selftest --gate shadow-cache` asserts the compute-stage and
   fragment-stage casts still agree.
+- **The ray-start map (2026-09-28; `assets/shaders/ray_start.wgsl`).** The
+  primary ray's TRAVERSAL was 54-82% of the raymarch frame on main 6c0638f, and
+  most of it was the approach: the fine march crossing empty chunks and the far
+  march walking ~30 cascade cells and ~16 level chunks a pixel to reach a
+  surface its neighbour had just walked to. Two per-frame compute rows on the
+  ShadowCache table (`ray_start_trace`, `ray_start_min`) march one ray per 2x2
+  pixel block to the first cell that COULD stop a primary ray — any non-air
+  fine voxel, or a cascade cell `traceFar` could report a hit in — and take the
+  5x5 minimum; `fs()` then starts both its fine march (`trace`'s `tMin`) and
+  its cascade march there, less a margin (`RS_NEAR_ABS`, `RS_FAR_REL`).
+  **It is conservative, not approximate:** at 1080p every cell a ray can meet
+  is >= 3.5 px wide on screen (a fine voxel inside the LOD handoff; a cascade
+  cell by the kFarN law), so it holds a sample of the 2-px lattice within the
+  5x5 window, and that sample meets it or something nearer; the margin covers
+  the cell's diagonal. `rayStartAt` refuses the map when that law fails (a low
+  resolution or wide FOV: `RS_LAW_PX`), within 2 samples of the screen edge,
+  and whenever the key in word 0 is not this frame's camera, size and frame
+  index — every refusal is the old march from the camera, never a skipped
+  surface. Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
+  3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
+  canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
+  13.49, the prepass's own 0.4-0.8 ms included; primary steps 20.4 -> 3.7 and
+  far steps 47.3 -> 10.1 a pixel at noon; every camera's picture at the
+  run-to-run noise floor. `RAY_START` (raymarch.wgsl) is the one-const
+  differential oracle.
 - Variant nibble → palette jitter in-shader (stable per-grain color, no reshuffling
   as grains move — exactly why the variant lives in the voxel).
 - Rigidbodies/debris: two options. v1 = raster their marching-cubes meshes,
@@ -12907,11 +12932,14 @@ one bit per 4-voxel block, written by the same three producers in the same
 sweeps (`world.h` `kSubOccShift`, `common.wgsl` SUB-CHUNK OCCUPANCY). It is one
 buffer rather than two so every `pass_table.def` `uses` row, barrier and
 bind-group entry for `Occupancy` already covers it. **The raymarcher's consumer
-is DEFAULT OFF** (`const SUBOCC_SKIP` in `raymarch.wgsl`): measured, it makes
-the frame slower, because the mean chord of a 4-voxel box is 2.7 voxels and a
-box-exit jump costs 3-4 DDA steps. Kept as a re-runnable refutation with the
-content number it turns on reported by `--measure` (MEASUREMENT 1d); the full
-argument is Correction 6 of `docs/PLAN_surface_flight_perf.md`.
+is ON since 2026-09-28** (`const SUBOCC_SKIP` in `raymarch.wgsl`). It was off
+from its introduction because, measured at 168 registers, it made the frame
+slower (the mean chord of a 4-voxel box is 2.7 voxels and a box-exit jump
+costs 3-4 DDA steps; Correction 6 of `docs/PLAN_surface_flight_perf.md`).
+After the two-phase detail resolve took the shader to 128 registers the same
+flip measured a win on every `--render-budget` camera (the const's comment has
+the table); the ray-start map's prepass (`ray_start.wgsl`) uses the same
+TOTAL-class mask.
 
 Worldgen does not place these yet (Wave 1a deliberately does not touch it); the
 `--shot` harness paints a demo meadow, and they are brush-selectable like any

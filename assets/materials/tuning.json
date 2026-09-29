@@ -1046,7 +1046,8 @@
   },
   "debug": {
     "vegetation": 1,
-    "groundCover": 1
+    "groundCover": 1,
+    "perfExp": 0
   },
   "dayNight": {
     "cycleMinutes": 6,

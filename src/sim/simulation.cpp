@@ -652,6 +652,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // PT_FARFILL / PT_TICK far rows, read in the FRAGMENT stage, covered by
         // the global barrier every command buffer opens with.
         entry(31, T::ReadOnlyStorage, S::Fragment),               // farMap
+        // THE RAY-START MAP (ray_start.wgsl): where each 2x2 pixel block's
+        // primary ray may begin marching. Written by the ShadowCache
+        // table's ray_start rows in the same command buffer, read here;
+        // BeginRendering's flush is the compute->fragment barrier.
+        entry(32, T::ReadOnlyStorage, S::Fragment),               // rayStart
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -822,6 +827,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     using U = rhi::BufferUsage;
     veilBuf_ = CreateBuffer(device, 4, U::Storage, "waterVeil");
     veilNone_ = CreateBuffer(device, 4, U::Storage, "waterVeilNone");
+    // A placeholder until EnsureRayStart sizes it: its word 0 is no frame's
+    // key, and the fragment shader's length check refuses it anyway.
+    rayStartBuf_ = CreateBuffer(device, 16, U::Storage, "rayStart");
     veilPixels_ = 0;
     BuildRenderBindGroup(renderBG_, veilBuf_);
     BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
@@ -877,6 +885,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(18, T::ReadOnlyStorage), // farVox
         entry(19, T::Storage),         // farOcc (read_write in sky_top.wgsl)
         entry(20, T::Uniform),         // farUBO
+        // The ray-start map (ray_start.wgsl): written by its two per-frame
+        // rows, read by the raymarch at renderBGL_ 32.
+        entry(21, T::Storage),         // rayStart
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1737,6 +1748,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The far cascade's sky bound (sky_top.wgsl): two per-frame entries on
   // shadowPL_, its own module because it writes the farOcc shadow_resolve reads.
   rhi::ShaderModule mSkyTop;
+  // The ray-start map (ray_start.wgsl): two per-frame entries on shadowPL_.
+  rhi::ShaderModule mRayStart;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
@@ -1762,6 +1775,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mGlow, "sim_glow.wgsl");
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mSkyTop, "sky_top.wgsl");
+    mod(&mRayStart, "ray_start.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
@@ -1783,7 +1797,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
-      !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop) {
+      !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
+      !mRayStart) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -1832,6 +1847,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve"); });
   pool.Add([&] { skyTopClear_ = MakeComputePipeline(device, shadowPL_, mSkyTop, "skyTopClear", "skyTopClear"); });
   pool.Add([&] { skyTopReduce_ = MakeComputePipeline(device, shadowPL_, mSkyTop, "skyTopReduce", "skyTopReduce"); });
+  pool.Add([&] { rayStartTrace_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartTrace", "rayStartTrace"); });
+  pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
     pool.Add([&] { cloudWeather_ = MakeComputePipeline(device, shadowPL_, mCloud, "weather", "cloudWeather"); });
@@ -2276,6 +2293,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowCache:         return world_->shadowCache;
     case B::ShadowReq:           return world_->shadowReq;
     case B::ShadowHist:          return world_->shadowHist;
+    case B::RayStart:            return rayStartBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
     case B::Openness:            return world_->openness;
@@ -2367,6 +2385,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::CloudResolve:   return cloudResolve_;
     case P::SkyTopClear:    return skyTopClear_;
     case P::SkyTopReduce:   return skyTopReduce_;
+    case P::RayStartTrace:  return rayStartTrace_;
+    case P::RayStartMin:    return rayStartMin_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -2588,6 +2608,12 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
   // every frame the far cascade is drawn, cache or clouds or neither.
   RecordCtx cx{};
   cx.cloudFlags = (shadowCacheOn_ ? 4u : 0u);
+  // The ray-start map covers the largest target sized so far; each thread
+  // bounds itself against THIS frame's size (ray_start.wgsl).
+  if (rayStartW_ > 0 && rayStartH_ > 0 && !rayStartOff_) {
+    cx.rayStartGx = ((rayStartW_ + 1) / 2 + 7) / 8;
+    cx.rayStartGy = ((rayStartH_ + 1) / 2 + 7) / 8;
+  }
   if (clouds) {
     EnsureClouds(cf.lowW, cf.lowH);
     cx.cloudFlags |= 1u;
@@ -3149,6 +3175,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(29, world_->solPool),
         b(30, solSpecBuf_),
         b(31, world_->farMap),
+        b(32, rayStartBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3174,6 +3201,33 @@ void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
   veilBuf_ = CreateBuffer(device_, px * kVeilWords * 4, rhi::BufferUsage::Storage,
                           "waterVeil");
   BuildRenderBindGroup(renderBG_, veilBuf_);
+}
+
+// The ray-start map (ray_start.wgsl): a header plus two half-size planes of
+// one f32 per 2x2 pixel block. Grow-only on BOTH axes, like the veil, so a
+// smaller --shot or portrait never reallocates and the per-frame rows — which
+// are recorded before the render pass that knows the size — always cover the
+// target. A rebuilt buffer rebinds the render and shadow groups; its word 0 is
+// no frame's key, so the first frame after a resize marches from the camera.
+void Simulation::EnsureRayStart(uint32_t width, uint32_t height) {
+  if (width <= rayStartW_ && height <= rayStartH_) return;
+  rayStartW_ = std::max(rayStartW_, width);
+  rayStartH_ = std::max(rayStartH_, height);
+  // Must match ray_start.wgsl: RS_HEADER words, then two Wq x Hq planes.
+  constexpr uint64_t kHeader = 8;
+  const uint64_t q = (uint64_t)((rayStartW_ + 1) / 2) * ((rayStartH_ + 1) / 2);
+  // THE OLD BUFFER IS STILL IN THIS COMMAND BUFFER. The ShadowCache table's
+  // ray-start rows were recorded (through shadowBG_) before the render pass
+  // that called this, and a released handle is destroyed once the LAST
+  // SUBMITTED command buffer retires — which is before the one being recorded
+  // (--vk-validation: "vkDestroyBuffer ... in use by VkDescriptorSet"). So the
+  // replaced buffer is parked until the next growth, which is frames away.
+  rayStartPrev_ = rayStartBuf_;
+  rayStartBuf_ = CreateBuffer(device_, (kHeader + 2 * q) * 4,
+                              rhi::BufferUsage::Storage, "rayStart");
+  BuildRenderBindGroup(renderBG_, veilBuf_);
+  BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
+  BuildShadowBindGroup();
 }
 
 // The shadow cache's bind group, which the clouds share (cloud.wgsl binds 3
@@ -3210,6 +3264,7 @@ void Simulation::BuildShadowBindGroup() {
       b(18, world_->farVox),
       b(19, world_->farOcc),
       b(20, world_->farUBO),
+      b(21, rayStartBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }
@@ -3946,6 +4001,7 @@ rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,
   EnsureRenderPipelines(format);
   EnsureDepth(width, height);
   EnsureVeil(width, height);
+  EnsureRayStart(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
   veilSplitPending_ = false;
 
@@ -3974,6 +4030,7 @@ rhi::RenderPass Simulation::BeginAuxRenderPass(const rhi::CommandEncoder& enc,
   EnsureRenderPipelines(format);
   EnsureAuxDepth(width, height);
   EnsureVeil(width, height);
+  EnsureRayStart(width, height);
   veilLive_ = false;  // until this pass's DrawWorld writes it
   veilSplitPending_ = false;
 

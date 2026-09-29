@@ -581,6 +581,9 @@ class Simulation {
   // judged by: `baseline` minus `nospec` is what the variant is worth, measured
   // the same way `shadow0` measures the shadow call site's footprint.
   void SetForceUniversalRaymarch(bool on) { forceUniversalRay_ = on; }
+  // Leave the ray-start map's rows unrecorded (the `norstart` arm): the
+  // raymarch then reads a stale key and marches every ray from the camera.
+  void SetRayStartOff(bool on) { rayStartOff_ = on; }
 
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
@@ -648,6 +651,10 @@ class Simulation {
   // The water veil (common.wgsl THE WATER VEIL): grow the per-pixel record
   // buffer to cover a width x height target and rebuild renderBG_ around it.
   void EnsureVeil(uint32_t width, uint32_t height);
+  // The ray-start map (ray_start.wgsl), grow-only like the veil: sized for
+  // the largest target a world pass has drawn into, so the per-frame rows
+  // (recorded BEFORE the pass that learns the size) cover any later one.
+  void EnsureRayStart(uint32_t width, uint32_t height);
   // THE CLOUDS (cloud.wgsl): grow the low-res raw + history buffers to cover
   // a lowW x lowH target and rebuild the two bind groups that name them.
   // Grow-only, like the veil. Fresh buffers are written with "clear sky"
@@ -818,6 +825,8 @@ class Simulation {
   rhi::ComputePipeline shadowPrepare_, shadowResolve_;
   // The far cascade's per-level sky bound (shadow_resolve.wgsl skyTop*).
   rhi::ComputePipeline skyTopClear_, skyTopReduce_;
+  // The ray-start map (ray_start.wgsl rayStartTrace / rayStartMin).
+  rhi::ComputePipeline rayStartTrace_, rayStartMin_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -870,6 +879,7 @@ class Simulation {
   bool rayLeanPublished_ = true;   // "nothing pending", the pre-build state
   bool deferRayVariantOk_ = false;
   bool forceUniversalRay_ = false;
+  bool rayStartOff_ = false;
   rhi::TextureFormat targetFormat_ = rhi::TextureFormat::Undefined;
 
   rhi::Texture depthTex_;
@@ -962,6 +972,14 @@ class Simulation {
   // shrunk); renderBGNoVeil_ binds veilNone_, one zeroed record. veilLive_ is
   // true between a pass's DrawWorld and the next Begin*RenderPass.
   rhi::Buffer veilBuf_, veilNone_;
+  // The ray-start map: bound at 32 in renderBGL_ (fragment, read) and at
+  // 21 in shadowBGL_ (compute, written). rayStartW_/H_ = the largest target
+  // it is sized for; 0 until the first world pass, and no row records.
+  rhi::Buffer rayStartBuf_;
+  // The buffer EnsureRayStart last replaced, kept alive one growth longer
+  // because the frame that grew it had already recorded the prepass against it.
+  rhi::Buffer rayStartPrev_;
+  uint32_t rayStartW_ = 0, rayStartH_ = 0;
   uint64_t veilPixels_ = 0;
   rhi::BindGroup renderBGNoVeil_;
   bool veilLive_ = false;

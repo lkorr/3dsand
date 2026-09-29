@@ -176,6 +176,12 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 // only by the far fill / downsample rows, covered by the command buffer's
 // opening barrier like farVox.
 @group(0) @binding(31) var<storage, read> farMap : array<vec4<u32>>;
+// ---- THE RAY-START MAP (ray_start.wgsl) --------------------------------------
+// Per 2x2 pixel block, a distance along the primary ray before which nothing
+// can be hit, from this frame's ray_start_trace / ray_start_min rows on the
+// ShadowCache table. fs() starts the fine march (trace's tMin) and the cascade
+// march there; see rayStartAt for when it is trusted.
+@group(0) @binding(32) var<storage, read> rayStart : array<u32>;
 // world.h's kSol* values (scripts/check_invariants.py `solute` checks these
 // against world.h too -- they are NOT the sim's MIRROR block, which needs
 // atomics and solMeta that a fragment stage must not bind).
@@ -2908,7 +2914,8 @@ const SUBOCC_SKIP : bool = true;
 // points. With one call site and a literal argument, Tint and the driver fold
 // them away, so the fragment shader pays nothing for keeping them legible.
 // If you ever add a second call site, ask first whether traceOpaque answers it.
-fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
+fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
+         tMin : f32) -> Hit {
   var out : Hit;
   out.hit = false;
   out.saturated = false;
@@ -3010,7 +3017,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   let tt1 = (wlo + vec3f(nf) - ro) * inv;
   let tmin = min(tt0, tt1);
   let tmax = max(tt0, tt1);
-  let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+  let tEnter0 = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
   var tExit = min(tmax.x, min(tmax.y, tmax.z));
 
   // ---- IN-WINDOW LOD HANDOFF (PLAN_surface_flight_perf.md A1) ----
@@ -3072,7 +3079,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // be (22.4 m) with room for the far arm's handoff band (farBandNearWeight),
   // which reads the window's own openness out to 22.3 m.
   if (wantMedia && TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
-    tExit = min(tExit, max(tEnter, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
+    tExit = min(tExit, max(tEnter0, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
   }
 
   // ---- SHORT-RANGE MODE (RenderParams flag bit 2, arm in bit 4) ----
@@ -3085,8 +3092,21 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // wantMedia gate (shadow/reflection rays are budget-capped elsewhere and
   // must not report "lit" because they gave up at the ceiling).
   if (SPEC_SHORT_RANGE && wantMedia && (R.flags & 4u) != 0u) {
-    tExit = min(tExit, max(tEnter, shortRangeCeilM() / VOXEL_METERS));
+    tExit = min(tExit, max(tEnter0, shortRangeCeilM() / VOXEL_METERS));
   }
+
+  // ---- THE RAY-START MAP (ray_start.wgsl): skip the empty approach ----------
+  // `tMin` is a distance before which this ray can meet nothing (fs() takes it
+  // from rayStartAt, 0 when the map is not trusted), so the march may begin
+  // there. Clamped to just short of the exit rather than past it: the exit is
+  // still the contract with traceFar (out.tExit below), and a ray the map says
+  // is empty all the way crosses one cell and hands over exactly as before.
+  // Only the START moves: the first cells it skips are air by the map's
+  // argument, so no media, liquid, record or hit is lost with them. The entry
+  // `axis` below is the window face's, which is only read if the FIRST cell is
+  // a hit — and the map's margin puts at least one empty voxel in front of
+  // anything it skipped to.
+  let tEnter = max(tEnter0, min(tMin, tExit - 0.01));
 
   if (tExit <= tEnter) { return out; }
   out.tExit = tExit;
@@ -5035,6 +5055,74 @@ fn farHfAO(level : u32, fineV : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
 // plane still queued pulls the VALID face one chunk nearer for the few ticks
 // it takes to land; then the box exit is the handoff, as before.
 const FAR_SPHERE_MARGIN_CHUNKS : i32 = 2;
+
+// ---- THE RAY-START MAP, read side (ray_start.wgsl has the argument) ---------
+// RAY_START false folds every read away and fs() marches from the camera as it
+// always did: the differential oracle for the whole feature, one const.
+const RAY_START : bool = true;
+const RS_HEADER : u32 = 8u;      // ray_start.wgsl agrees
+const RS_NONE : f32 = 1e30;      // ray_start.wgsl agrees
+// The margins the conservative argument needs (ray_start.wgsl WHY IT IS
+// CONSERVATIVE): the pixel's entry into the cell a sample hit differs from the
+// sample's by at most the cell's diagonal. A fine voxel's is 1.73 voxels; a
+// cascade cell's is sqrt(3) s, and s <= t / 112 everywhere — level k draws
+// from its predecessor's sphere (112 s) to its own (224 s), and a dithered
+// seam's overlap holds level k+1 cells at t ~ 112 s' — so 1.55% of t. The
+// margins keep ~30% over those bounds. They are not free: every cascade step a
+// pixel re-walks costs ~0.2 ms of frame at 1080p (4% measured 13.8 far steps a
+// pixel on the cascade camera against the exact-start bound's 5.9).
+const RS_NEAR_ABS : f32 = 2.25;  // fine voxels
+const RS_NEAR_REL : f32 = 0.0;
+const RS_FAR_REL : f32 = 0.02;
+// The lattice argument needs every cell the march can meet to be >= RS_LAW_PX
+// wide on screen. A fine voxel is narrowest at the far end of the fine march,
+// a cascade cell at its level's handoff sphere (the kFarN law: 3.5 px at
+// 1080p and camera.fovY 1.2). Below it — a low resolution, a wide FOV — the
+// map is not trusted at all and every ray marches from the camera.
+const RS_LAW_PX : f32 = 3.0;
+const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
+                                     TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
+                                     TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
+const RS_FAR_MAX_CELLS : f32 =
+    f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK));
+fn rayStartDims() -> vec2<u32> {
+  return vec2<u32>(u32(round(R.viewPx * R.aspect)), u32(round(R.viewPx)));
+}
+// BYTE-IDENTICAL to ray_start.wgsl's. A disagreement only turns the map off.
+fn rayStartKey() -> u32 {
+  let d = rayStartDims();
+  var h = pcg(bitcast<u32>(R.camPos.x) ^ 0x52415953u);
+  h = pcg(h ^ bitcast<u32>(R.camPos.y));
+  h = pcg(h ^ bitcast<u32>(R.camPos.z));
+  h = pcg(h ^ bitcast<u32>(R.camFwd.x));
+  h = pcg(h ^ bitcast<u32>(R.camFwd.y));
+  h = pcg(h ^ bitcast<u32>(R.camFwd.z));
+  h = pcg(h ^ bitcast<u32>(R.camRight.x));
+  h = pcg(h ^ bitcast<u32>(R.camRight.z));
+  h = pcg(h ^ bitcast<u32>(R.tanHalfFov));
+  h = pcg(h ^ R.frameIdx);
+  h = pcg(h ^ (d.x | (d.y << 16u)) ^ bitcast<u32>(R.origin.x) ^
+          (bitcast<u32>(R.origin.z) << 7u) ^ (bitcast<u32>(R.origin.y) << 14u));
+  return h | 1u;
+}
+// The start distance (fine voxels) for the pixel at `px`: 0 = unknown, march
+// from the camera; RS_NONE = no sample in reach saw anything, near or far.
+// Called twice by fs() — before trace() and after it — rather than carried
+// across the fine march: a value live across trace()'s loop is the register
+// cliff (gotcha-raymarch-register-cliff).
+fn rayStartAt(px : vec2f) -> f32 {
+  if (!RAY_START) { return 0.0; }
+  let d = rayStartDims();
+  let q = (d + vec2<u32>(1u)) / 2u;
+  if (RS_HEADER + 2u * q.x * q.y > arrayLength(&rayStart)) { return 0.0; }
+  let k = R.viewPx * 0.5 / R.tanHalfFov;   // px per fine voxel at t = 1
+  if (k < RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS)) { return 0.0; }
+  if (rayStart[0] != rayStartKey()) { return 0.0; }
+  let i = min(u32(max(px.x, 0.0)) >> 1u, q.x - 1u);
+  let j = min(u32(max(px.y, 0.0)) >> 1u, q.y - 1u);
+  return bitcast<f32>(rayStart[RS_HEADER + q.x * q.y + j * q.x + i]);
+}
+
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   var out : FarHit;
   out.hit = false;
@@ -5262,91 +5350,99 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
             rsAdd(RS_FAR, 1u);
             budget -= 1;
             let cellByte = farByteAt(level, vc);
-            var mat = farPalMat(&materials, cellByte & FAR_PAL_MASK);
-            // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
-            //
-            // Shadows take the flag at every level (farShadowMarch) because a
-            // shadow that is half a cell too tall on the horizon costs nothing.
-            // The VISIBLE surface cannot: the flag is set for every cell whose
-            // floor is at or below the ground, so honouring it raises the
-            // terrain by up to one cell EVERYWHERE — 0.4 m at level 1, 51 m at
-            // level 8. Past the knob the horizon stops being a ridge and
-            // becomes the staircase 13.2.2 predicted, which is why this is a
-            // level cap and not a boolean. 0 is exactly the behaviour before
-            // this flag existed and const-folds the block away.
-            if (mat == 0u && (cellByte & FAR_BLOCKER_BIT) != 0u &&
-                i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL) {
-              // The flag carries no material of its own, so take the nearest
-              // one below in this column. NEVER shade air: an unbacked flag (a
-              // cave roof with nothing under it in this level, a cell at the
-              // bottom edge of the box) falls through and the march continues,
-              // which is the old behaviour and the safe direction.
-              var probe = vc;
-              for (var d = 0; d < 3; d++) {
-                probe.y -= 1;
-                if (!farInValid(probe, box)) { break; }
-                let below = farMatAt(level, probe);
-                if (below != 0u) { mat = below; break; }
+            // AN EMPTY CELL IS DONE HERE (2026-09-28). Most cells a far ray
+            // tests are air under the chunk's top row, and every one of them
+            // used to pay the palette lookup below — a load DEPENDENT on the
+            // byte load, of slot 0, for a material that is known to be air —
+            // plus the blocker and refine predicates. Air has no material, no
+            // flag and no refine candidacy (all three read a non-zero byte).
+            if (cellByte != 0u) {
+              var mat = farPalMat(&materials, cellByte & FAR_PAL_MASK);
+              // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
+              //
+              // Shadows take the flag at every level (farShadowMarch) because a
+              // shadow that is half a cell too tall on the horizon costs nothing.
+              // The VISIBLE surface cannot: the flag is set for every cell whose
+              // floor is at or below the ground, so honouring it raises the
+              // terrain by up to one cell EVERYWHERE — 0.4 m at level 1, 51 m at
+              // level 8. Past the knob the horizon stops being a ridge and
+              // becomes the staircase 13.2.2 predicted, which is why this is a
+              // level cap and not a boolean. 0 is exactly the behaviour before
+              // this flag existed and const-folds the block away.
+              if (mat == 0u && (cellByte & FAR_BLOCKER_BIT) != 0u &&
+                  i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL) {
+                // The flag carries no material of its own, so take the nearest
+                // one below in this column. NEVER shade air: an unbacked flag (a
+                // cave roof with nothing under it in this level, a cell at the
+                // bottom edge of the box) falls through and the march continues,
+                // which is the old behaviour and the safe direction.
+                var probe = vc;
+                for (var d = 0; d < 3; d++) {
+                  probe.y -= 1;
+                  if (!farInValid(probe, box)) { break; }
+                  let below = farMatAt(level, probe);
+                  if (below != 0u) { mat = below; break; }
+                }
               }
-            }
-            // ---- THE SURFACE REFINE (see farRefineCell) ----
-            // A candidate: this cell holds something, and it is a material
-            // cell or the flagged air directly over one. Only then the map.
-            if (i32(level) <= TUNE_FAR_REFINE_LEVEL && cellByte != 0u &&
-                (mat != 0u || farPalAt(level, vc - vec3<i32>(0, 1, 0)) != 0u)) {
-              let e = farMap[farMapCell(level, vc.xz)];
-              if (all((e & vec4<u32>(FAR_MAP_VALID)) != vec4<u32>(0u))) {
-                let hq = vec4<i32>(e & vec4<u32>(0xFFFFu)) - vec4<i32>(FAR_MAP_H_BIAS);
-                let minH = min(min(hq.x, hq.y), min(hq.z, hq.w));
-                let maxH = max(max(hq.x, hq.y), max(hq.z, hq.w));
-                let si = 1 << farCellShift(level);
-                let y0 = vc.y * si;
-                // The band: partly full under the heightfield. Fully under it
-                // or fully over it, the cell is drawn as it always was.
-                if (y0 + si - 1 > minH && y0 <= maxH) {
-                  // THE UNION: a material cell whose centre sample is ABOVE
-                  // the top of its sample column stands on the ground (a
-                  // trunk, a rock, a built wall) and keeps its plain cell. The
-                  // sample column is sub-column (1,1) at level 1 exactly; past
-                  // it the tallest sub-column bounds it.
-                  // ...except a cell a STALK was marked into (package F:
-                  // worldgen.wgsl farmap): its slot is a sub-column's
-                  // sub-skin there, and the stalk IS that sub-column.
-                  let stalkCell = any(((e >> vec4<u32>(23u)) & vec4<u32>(0x7Fu)) ==
-                                      vec4<u32>(cellByte & FAR_PAL_MASK));
-                  let hc = select(maxH, hq.w, level == 1u && !stalkCell);
-                  if (mat == 0u || y0 + (si >> 1) <= hc) {
-                    let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,
-                                           min(vMax.x, min(vMax.y, vMax.z)), axis,
-                                           maxH);
-                    if (rf.hit) {
-                      out.hit = true;
-                      out.t = rf.t * s;   // back to fine-voxel units
-                      out.axis = rf.axis;
-                      out.sgn = sign(select(select(rd.x, rd.z, rf.axis == 2), rd.y,
-                                            rf.axis == 1));
-                      out.mat = farPalMat(&materials, rf.pal);
-                      out.cell = vc;
-                      out.level = level | FAR_HIT_REFINED;
-                      return out;
+              // ---- THE SURFACE REFINE (see farRefineCell) ----
+              // A candidate: this cell holds something, and it is a material
+              // cell or the flagged air directly over one. Only then the map.
+              if (i32(level) <= TUNE_FAR_REFINE_LEVEL && cellByte != 0u &&
+                  (mat != 0u || farPalAt(level, vc - vec3<i32>(0, 1, 0)) != 0u)) {
+                let e = farMap[farMapCell(level, vc.xz)];
+                if (all((e & vec4<u32>(FAR_MAP_VALID)) != vec4<u32>(0u))) {
+                  let hq = vec4<i32>(e & vec4<u32>(0xFFFFu)) - vec4<i32>(FAR_MAP_H_BIAS);
+                  let minH = min(min(hq.x, hq.y), min(hq.z, hq.w));
+                  let maxH = max(max(hq.x, hq.y), max(hq.z, hq.w));
+                  let si = 1 << farCellShift(level);
+                  let y0 = vc.y * si;
+                  // The band: partly full under the heightfield. Fully under it
+                  // or fully over it, the cell is drawn as it always was.
+                  if (y0 + si - 1 > minH && y0 <= maxH) {
+                    // THE UNION: a material cell whose centre sample is ABOVE
+                    // the top of its sample column stands on the ground (a
+                    // trunk, a rock, a built wall) and keeps its plain cell. The
+                    // sample column is sub-column (1,1) at level 1 exactly; past
+                    // it the tallest sub-column bounds it.
+                    // ...except a cell a STALK was marked into (package F:
+                    // worldgen.wgsl farmap): its slot is a sub-column's
+                    // sub-skin there, and the stalk IS that sub-column.
+                    let stalkCell = any(((e >> vec4<u32>(23u)) & vec4<u32>(0x7Fu)) ==
+                                        vec4<u32>(cellByte & FAR_PAL_MASK));
+                    let hc = select(maxH, hq.w, level == 1u && !stalkCell);
+                    if (mat == 0u || y0 + (si >> 1) <= hc) {
+                      let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,
+                                             min(vMax.x, min(vMax.y, vMax.z)), axis,
+                                             maxH);
+                      if (rf.hit) {
+                        out.hit = true;
+                        out.t = rf.t * s;   // back to fine-voxel units
+                        out.axis = rf.axis;
+                        out.sgn = sign(select(select(rd.x, rd.z, rf.axis == 2), rd.y,
+                                              rf.axis == 1));
+                        out.mat = farPalMat(&materials, rf.pal);
+                        out.cell = vc;
+                        out.level = level | FAR_HIT_REFINED;
+                        return out;
+                      }
+                      mat = 0u;   // the ray passes between the sub-columns
                     }
-                    mat = 0u;   // the ray passes between the sub-columns
                   }
                 }
               }
-            }
-            // (THE FEATURES are drawn after the march: farFeatMarch, fs. A
-            // cactus stalk is not a feature any more but part of the surface
-            // map, refined like the ground -- see farmap in worldgen.wgsl.)
-            if (mat != 0u) {
-              out.hit = true;
-              out.t = vCur * s;   // back to fine-voxel units
-              out.axis = axis;
-              out.sgn = sign(rd[axis]);
-              out.mat = mat;
-              out.cell = vc;
-              out.level = level;
-              return out;
+              // (THE FEATURES are drawn after the march: farFeatMarch, fs. A
+              // cactus stalk is not a feature any more but part of the surface
+              // map, refined like the ground -- see farmap in worldgen.wgsl.)
+              if (mat != 0u) {
+                out.hit = true;
+                out.t = vCur * s;   // back to fine-voxel units
+                out.axis = axis;
+                out.sgn = sign(rd[axis]);
+                out.mat = mat;
+                out.cell = vc;
+                out.level = level;
+                return out;
+              }
             }
             if (vMax.x < vMax.y && vMax.x < vMax.z) {
               vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x; axis = 0;
@@ -6959,6 +7055,18 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // it worked, and it cost 40 registers in an fs already at the occupancy cliff
 // (128 -> 168 measured with --shader-stats, slowing cameras with no GI in
 // them). Do not reintroduce per-pixel state to say what a grid already knows.
+// ---- NEAREST BELOW SHADOW_NEAREST_PX, BILINEAR ABOVE (2026-09-28) ----------
+// The bilinear blend reads FOUR patches a pixel, and every patch a pixel reads
+// is one the cache keeps live and the resolve re-casts every
+// SHADOW_REFRESH_PERIOD frames. Where a patch is a few pixels wide the blend
+// buys a 2-4 px softer step inside a value the penumbra window has already
+// graded. What it cost, measured in one process (--render-budget, nearest
+// everywhere vs bilinear above 1 px, `base2` drift under 0.4 ms): noon 0.7,
+// meadow 0.8-1.3, canopy 0.8-1.1, seam 1.1-1.2, fire 1.7-2.4 ms — a fifth of it
+// in the resolve pass, the rest in the fragment shader's four hash lookups.
+// Close up, where a patch is wider than SHADOW_NEAREST_PX, the blend stays:
+// there a patch-square staircase along a shadow edge is plainly visible.
+const SHADOW_NEAREST_PX : f32 = 4.0;
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -6990,7 +7098,7 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
   // it, which only makes the staircase less visible, so face-on is the
   // conservative side.
   let patchPx = R.viewPx / (2.0 * R.tanHalfFov * m * max(camDistFine, 1.0));
-  if (patchPx < 1.0) {
+  if (patchPx < SHADOW_NEAREST_PX) {
     // Nearest: an integer coordinate makes the +1 taps' weights exactly zero,
     // and the loop below skips them.
     u = min(floor(fu * m), m - 1.0);
@@ -11597,7 +11705,14 @@ fn fs(in : VSOut) -> FSOut {
                    + R.camUp    * (ndc.y * R.tanHalfFov));
 
   if (RENDER_STATS) { gRsTraceSteps = 0u; }
-  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true);
+  // THE RAY-START MAP (rayStartAt): march from where the 2x2 block's
+  // conservative first hit says nothing can come sooner. Folded into trace's
+  // start and dead before its loop; RS_NONE (nothing anywhere in reach) makes
+  // the fine march one cell long and skips the cascade below.
+  let rs0 = rayStartAt(in.pos.xy);
+  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true,
+                select(max(rs0 * (1.0 - RS_NEAR_REL) - RS_NEAR_ABS, 0.0), RS_NONE,
+                       rs0 >= RS_NONE));
   rsAdd(RS_PRIMARY, gRsTraceSteps);
 
   // Rays that leave the window without a surface hit (and weren't absorbed by
@@ -11605,13 +11720,20 @@ fn fs(in : VSOut) -> FSOut {
   var far : FarHit;
   far.hit = false;
   if (!h.hit && !h.saturated) {
-    // in.pos.xy is the fragment's pixel coordinate — the dither key (see
-    // farDither: screen-space, time-free, stable per pixel)
-    far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
-    // The plants in the far ray's way (package F, farFeatMarch).
-    // Rides the refine's knob: the feature plane is the refine levels' data,
-    // and render.farRefineLevel 0 (the `norefine` budget arm) prices both.
-    if (far.hit && TUNE_FAR_REFINE_LEVEL >= 1) { far = farFeatMarch(R.camPos, rd, far, h.tExit); }
+    // Re-read, not carried across trace() (rayStartAt says why). The cascade
+    // starts at the map's distance less RS_FAR_REL, never before the fine
+    // march handed over.
+    let rs1 = rayStartAt(in.pos.xy);
+    if (rs1 < RS_NONE) {
+      // in.pos.xy is the fragment's pixel coordinate — the dither key (see
+      // farDither: screen-space, time-free, stable per pixel)
+      far = traceFar(R.camPos, rd, max(h.tExit, rs1 * (1.0 - RS_FAR_REL)),
+                     in.pos.xy);
+      // The plants in the far ray's way (package F, farFeatMarch).
+      // Rides the refine's knob: the feature plane is the refine levels' data,
+      // and render.farRefineLevel 0 (the `norefine` budget arm) prices both.
+      if (far.hit && TUNE_FAR_REFINE_LEVEL >= 1) { far = farFeatMarch(R.camPos, rd, far, h.tExit); }
+    }
   }
 
   // ---- coarse gas (docs/PLAN_gas_particles.md §2.5 + stage 1b) ------------

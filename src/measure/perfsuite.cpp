@@ -1885,6 +1885,18 @@ struct RenderArm {
   // miss for all 21 shaders including worldgen's `far`. Last, with a default,
   // so every existing aggregate initializer above and below still compiles.
   bool universalShader = false;
+  // Suppress the ray-start map's rows (Simulation::SetRayStartOff), so every
+  // primary ray marches from the camera as it did before the map existed. Same
+  // standing as universalShader: a CPU switch, no tuning row, no reload — so
+  // the pair `baseline` / `norstart` is one process, one camera, one frame,
+  // and the only A/B of the feature that is not at the mercy of boot-to-boot
+  // noise (+-1 ms at noon on this machine, 2026-09-28).
+  bool noRayStart = false;
+  // Run on EVERY camera when --budget-arms names it, whatever the camera's own
+  // arm list says. For arms that are a property of the renderer rather than of
+  // a picture (the ray-start map, the perfExp experiments), so a one-process
+  // A/B covers all seven cameras without seven list edits.
+  bool anyCamera = false;
 };
 
 const RenderArm kRenderArms[] = {
@@ -2095,6 +2107,38 @@ const RenderArm kExtraArms[] = {
      "and the short-range ceiling being compiled into a shader that runs none "
      "of them",
      /*universalShader=*/true},
+    // The ray-start map (assets/shaders/ray_start.wgsl): its rows unrecorded,
+    // so the raymarch's key check fails and every ray marches from the camera.
+    // NEGATIVE saved-ms is what the map is worth; the map's own cost is in the
+    // `pre` span of `baseline`, not of this row.
+    {"norstart", "ray-start map off (rows unrecorded)", nullptr, true, 1,
+     "what the ray-start map SAVES — read the delta with the sign flipped",
+     /*universalShader=*/false, /*noRayStart=*/true, /*anyCamera=*/true},
+    // debug.perfExp: a WGSL-visible integer (TUNE_PERF_EXP) that a shader
+    // experiment branches on, so a render-side change can be A/B'd IN ONE
+    // PROCESS against the frame it modifies. Boot-to-boot noise on this
+    // machine is +-0.8 ms (2026-09-28), larger than most single levers; an
+    // arm pair in one boot is within ~0.1 ms. 0 = shipped; nothing may ship
+    // reading a non-zero value.
+    // The baseline AGAIN, last: arms share one world and one set of render
+    // caches (shadow cache, GI cache, openness), so an arm that changes what
+    // those caches hold hands the NEXT arm a different warm state. `base2`
+    // after the experiments says how far the baseline itself drifted.
+    {"base2", "everything on (again, after the other arms)", nullptr, true, 1,
+     "drift: this minus `baseline` is the noise floor of the arms between",
+     false, false, /*anyCamera=*/true},
+    {"exp1", "debug.perfExp 0 -> 1",
+     [](Tuning& t) { t.debug.perfExp = 1; }, true, 1,
+     "whatever experiment 1 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp2", "debug.perfExp 0 -> 2",
+     [](Tuning& t) { t.debug.perfExp = 2; }, true, 1,
+     "whatever experiment 2 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp3", "debug.perfExp 0 -> 3",
+     [](Tuning& t) { t.debug.perfExp = 3; }, true, 1,
+     "whatever experiment 3 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
     {"nogodray", "godRaySteps 14 -> 0",
      [](Tuning& t) { t.render.godRaySteps = 0; }, true, 1,
      "the whole underwater god-ray march — 14 steps, each with its own shadow "
@@ -2738,6 +2782,11 @@ constexpr int kBudgetCamCount =
 struct ArmResult {
   const RenderArm* arm = nullptr;
   double gpuP50 = 0, gpuP95 = 0;
+  // The per-frame compute table's share of gpuP50 (EncodeShadowResolve: the
+  // shadow resolve, the sky bound, the clouds, the ray-start map), timed as its
+  // own span so a lever that moves work between the fragment shader and that
+  // table shows up as a move and not as a saving. gpuP50 stays the SUM.
+  double preP50 = 0;
   int frames = 0;
   bool ok = false;
   std::string why;
@@ -2823,12 +2872,27 @@ class RenderBudgetRunner {
     // copy above does — the `halfres`-measured-at-shadowSteps-32 bug in the
     // comment above is what an un-restored arm state looks like.
     sim_.SetForceUniversalRaymarch(arm.universalShader);
+    sim_.SetRayStartOff(arm.noRayStart);
 
     const uint32_t d = arm.widthDiv;
     const uint32_t W = opt_.width / d, H = opt_.height / d;
     const rhi::TextureView& view = view_[d == 1 ? 0 : 1];
 
-    std::vector<double> ms;
+    std::vector<double> ms, pre;
+    // One frame's two spans arrive together in LastFrame(): the per-frame
+    // table ("pre") and the world pass ("render"). `ms` keeps their sum so the
+    // headline number means what it always meant.
+    auto take = [&](const std::vector<PassSample>& fr) {
+      double sum = 0, p = 0;
+      for (const PassSample& ps : fr) {
+        sum += (double)ps.ns / 1e6;
+        if (ps.name && std::strcmp(ps.name, "pre") == 0) p += (double)ps.ns / 1e6;
+      }
+      if (!fr.empty()) {
+        ms.push_back(sum);
+        pre.push_back(p);
+      }
+    };
     timer_.ResetStats();
     for (uint32_t f = 0; f < warm + frames; f++) {
       // The camera and the frame index are FIXED across arms. `frame` feeds
@@ -2845,10 +2909,13 @@ class RenderBudgetRunner {
                         arm.shadows, kBudgetAnimTime, kFarFogDensity, (float)H,
                         skyTick_, s.fluidLive);
       rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
-      uint32_t rb = 0, re = 0;
+      uint32_t pb = 0, pe = 0, rb = 0, re = 0;
+      const bool timedPre = timer_.AllocPassPair("pre", pb, pe);
+      if (timedPre) enc.WriteTimestamp(timer_.NativeQuerySet(), pb, false);
+      sim_.EncodeShadowResolve(enc);
+      if (timedPre) enc.WriteTimestamp(timer_.NativeQuerySet(), pe, true);
       const bool timed = timer_.AllocPassPair("render", rb, re);
       if (timed) enc.WriteTimestamp(timer_.NativeQuerySet(), rb, false);
-      sim_.EncodeShadowResolve(enc);
       {
         rhi::RenderPass rp = sim_.BeginRenderPass(
             enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
@@ -2864,9 +2931,7 @@ class RenderBudgetRunner {
       ctx_.ProcessEvents();
       if (timer_.PollDeferred(ctx_) > 0) {
         const uint32_t tag = timer_.LastFrameTag();
-        if (tag >= warm)
-          for (const PassSample& ps : timer_.LastFrame())
-            ms.push_back((double)ps.ns / 1e6);
+        if (tag >= warm) take(timer_.LastFrame());
       }
     }
     pacer_.Drain();
@@ -2874,8 +2939,7 @@ class RenderBudgetRunner {
     for (int drain = 0; drain < 8; drain++) {
       ctx_.ProcessEvents();
       if (timer_.PollDeferred(ctx_) > 0 && timer_.LastFrameTag() >= warm)
-        for (const PassSample& ps : timer_.LastFrame())
-          ms.push_back((double)ps.ns / 1e6);
+        take(timer_.LastFrame());
     }
 
     if (ms.empty()) {
@@ -2884,6 +2948,7 @@ class RenderBudgetRunner {
     }
     res.gpuP50 = Percentile(ms, 0.50);
     res.gpuP95 = Percentile(ms, 0.95);
+    res.preP50 = Percentile(pre, 0.50);
     res.frames = (int)ms.size();
     res.ok = true;
     return res;
@@ -3276,6 +3341,13 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       for (const RenderArm* a : arms)
         for (const std::string& want : opt.arms)
           if (want == a->id) { kept.push_back(a); break; }
+      // ...plus the renderer-wide arms, on every camera (RenderArm::anyCamera).
+      for (const std::string& want : opt.arms) {
+        const RenderArm* a = FindArm(want.c_str());
+        if (a && a->anyCamera &&
+            std::find(kept.begin(), kept.end(), a) == kept.end())
+          kept.push_back(a);
+      }
       arms.swap(kept);
     }
 
@@ -3304,7 +3376,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                                    /*frames=*/48);
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
-      else std::printf("%7.2f ms\n", r.gpuP50);
+      else std::printf("%7.2f ms  (pre %.2f)\n", r.gpuP50, r.preP50);
       std::fflush(stdout);
       if (rows) {
         RenderBudgetRow row;
@@ -3438,9 +3510,10 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                        r.ok ? "true" : "false");
           if (r.ok)
             std::fprintf(f,
-                         ",\"p50\":%s,\"p95\":%s,\"frames\":%d,"
-                         "\"savedMs\":%s,\"pct\":%s",
+                         ",\"p50\":%s,\"p95\":%s,\"preP50\":%s,"
+                         "\"frames\":%d,\"savedMs\":%s,\"pct\":%s",
                          JNum(r.gpuP50).c_str(), JNum(r.gpuP95).c_str(),
+                         JNum(r.preP50).c_str(),
                          r.frames, JNum(b - r.gpuP50).c_str(),
                          JNum(b > 0 ? 100.0 * (b - r.gpuP50) / b : 0.0)
                              .c_str());
