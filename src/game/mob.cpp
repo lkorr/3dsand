@@ -3866,6 +3866,13 @@ void MobSystem::RefreshGoreProfiles() {
   ForEachCreature([](Mob& mob) { mob.gore_ = Mob::MakeGoreProfile(mob.id_); });
 }
 
+Mob* MobSystem::FindMobByRef(const std::string& refId) {
+  if (refId.empty()) return nullptr;
+  for (Mob& m : mobs_)
+    if (m.RefId() == refId) return &m;
+  return nullptr;
+}
+
 Mob* MobSystem::FindMobById(uint64_t id) {
   for (Mob& mob : mobs_)
     if (mob.id_ == id) return &mob;
@@ -24430,6 +24437,8 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   std::vector<::net::WireGear> gear;
   CaptureGear(gear);
   WriteRecordGear(w, gear, version);
+  // v11: the reference id (Mob::RefId), "" for a creature nobody authored.
+  if (version >= 11) w.Str(refId_);
   if (!dead) return;
   // The cause by NAME: deathCause_ points at a literal in this file, and the
   // loader interns the name back onto the same literal (InternDeathCause).
@@ -24534,6 +24543,7 @@ struct MobSystem::MobRecord {
   bool haveRise = false;
   uint32_t riseTicksLeft = 0;
   std::vector<std::string> riseFx;
+  std::string refId;   // v11: Mob::RefId, "" for older records
 };
 
 bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
@@ -24657,6 +24667,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     out.appendedNames.assign(nApp, std::string());
     for (std::string& nm : out.appendedNames) r.Str(nm);
     if (!ReadRecordGear(r, out.gear, version)) return false;
+    if (version >= 11) r.Str(out.refId);
     if (out.dead) {
       r.Str(out.deathCause);
       r.Pod(out.deathSeq);
@@ -24747,6 +24758,7 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   m.origin_ = rec.origin;
   m.heading_ = m.desiredHeading_ = rec.heading;
   m.bodyY_ = rec.bodyY;
+  if (rec.version >= 11) m.refId_ = rec.refId;   // v11: the authored identity
   m.anim_.lastPos = rec.origin;
   // THE PACK REPLACES, it does not merge. `rec` is the whole truth about this
   // creature's carried stacks: on a load `loading_` already kept Spawn from
@@ -24939,6 +24951,18 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
   }
   MobRecord rec;
   if (!ReadMobRecord(r, rec, version)) return nullptr;
+  // ONE REF, ONE BODY (v11, world/refs.h). A record naming a reference that
+  // already has a creature standing is a second copy of the same villager --
+  // an edit re-spawned it while its old record sat parked, or a save was
+  // loaded over a live session. Refused for GOOD (not `spawnRefused`): the
+  // live one is the truth, and a record kept for retry would come back the
+  // moment the live one died.
+  if (!rec.refId.empty() && FindMobByRef(rec.refId) != nullptr) {
+    std::printf("mob: a record for ref '%s' while that ref already has a live "
+                "creature; the duplicate is dropped\n",
+                rec.refId.c_str());
+    return nullptr;
+  }
 
   // Resolve the def BY NAME: index order is whatever the directory listing
   // was the day the save was written. A missing def skips the mob (the save

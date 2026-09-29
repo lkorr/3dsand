@@ -22,7 +22,9 @@
 #include "sim/tuning.h"  // the Combat panel edits melee/combatfx/gore live
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
 #include "sim/weather.h" // the weather row: preset pin + readout
+#include "ui/dialogue_ui.h"
 #include "ui/inventory_ui.h"
+#include "ui/refs_ui.h"
 #include "ui/theme.h"
 
 bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
@@ -1313,6 +1315,53 @@ void Overlay::DrawDevSpawn(UIState& s) {
     }
   }
 
+  // ---- conversations (game/dialogue.h) ----
+  // THE DEV HOOK until NPCs carry their own dialogue (PLAN_world_editor P7):
+  // pick a conversation file and talk to the nearest creature with it, or to
+  // nobody at all. What is wrong with the files is listed here, by file, node
+  // and field, so a typo shows in the game and not only on stderr.
+  if (Section("Dialogue", false)) {
+    if (s.dialogueNames.empty()) {
+      ImGui::TextDisabled("no conversations in assets/dialogue/");
+    } else {
+      if (s.dialoguePick < 0 || s.dialoguePick >= (int)s.dialogueNames.size())
+        s.dialoguePick = 0;
+      PickList("##dialogues", s.dialogueNames, s.dialoguePick, 5);
+      const float w = CellWidth(2);
+      if (ImGui::Button("talk to nearest creature", ImVec2(w, 0)))
+        s.dialogueTalkNearest = true;
+      ImGui::SetItemTooltip("the closest living creature within 12 m speaks\n"
+                            "these lines (it does not have to be a person)");
+      ImGui::SameLine();
+      if (ImGui::Button("talk (no speaker)", ImVec2(w, 0))) s.dialogueTalkVoice = true;
+      ImGui::SetItemTooltip("the conversation with nobody standing there:\n"
+                            "for reading a file through");
+    }
+    {
+      const float w = CellWidth(2);
+      if (ImGui::Button("reload files (R)", ImVec2(w, 0))) s.dialogueReload = true;
+      ImGui::SameLine();
+      if (ImGui::Button("forget flags + met", ImVec2(w, 0))) s.dialogueResetFlags = true;
+      ImGui::SetItemTooltip("clears every dialogue flag and who you have met,\n"
+                            "so a conversation can be tried from the start");
+    }
+    if (!s.dialogueStatus.empty()) ImGui::TextWrapped("%s", s.dialogueStatus.c_str());
+    if (!s.dialogueProblems.empty()) {
+      Caption("problems");
+      for (const std::string& p : s.dialogueProblems) {
+        const bool err = p.rfind("error", 0) == 0;
+        ImGui::PushStyleColor(ImGuiCol_Text, err ? ImVec4(1.0f, 0.45f, 0.4f, 1.0f)
+                                                 : ImVec4(1.0f, 0.75f, 0.35f, 1.0f));
+        ImGui::TextWrapped("%s", p.c_str());
+        ImGui::PopStyleColor();
+      }
+    }
+    if (!s.dialogueFlags.empty() && ImGui::TreeNode("flags + met")) {
+      for (const std::string& f : s.dialogueFlags) ImGui::TextUnformatted(f.c_str());
+      ImGui::TreePop();
+    }
+  }
+
   // ---- clothes (game/dye.h) ----
   // The art is a greyscale weave; the colour is applied at shade time, so a
   // dye is PAINT, not a material — dyed linen burns and tears like undyed.
@@ -1545,6 +1594,9 @@ void Overlay::DrawDevWorld(UIState& s) {
         "40 -> 5.7, 20 -> 2.9, 6 -> 0.86 vox/tick.");
     ImGui::TextDisabled("wind primitives (fans, vortices): Spawn page");
   }
+
+  // ---- the map's references (ui/refs_ui.cpp) ----
+  if (Section("References", false)) DrawRefsPage(s);
 
   if (Section("World file & reload")) {
     const float w = CellWidth(2);
@@ -1855,6 +1907,12 @@ void Overlay::Draw(UIState& s) {
   if (s.inventoryOpen) {
     ImGui::PushFont(ui::FontLarge());
     DrawInventoryScreen(s);
+    ImGui::PopFont();
+  } else if (s.talk.open) {
+    // A CONVERSATION owns the frame the same way: the cursor is free for the
+    // choice rows, so there is no crosshair (ui/dialogue_ui.h).
+    ImGui::PushFont(ui::FontLarge());
+    DrawDialoguePanel(s);
     ImGui::PopFont();
   } else {
     ImDrawList* dl = ImGui::GetForegroundDrawList();

@@ -2,6 +2,7 @@
 // file draws and for the rule that comes with it.
 
 #include "game/session.h"
+#include "world/refs_game.h"
 
 #include <algorithm>
 #include <cmath>
@@ -5289,6 +5290,13 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
     if (!p.s->localView && !p.s->sink)
       p.s->sink = std::make_unique<PresentationSink>();
 
+  // CONVERSATIONS FIRST (game/dialogue.h): a choice carried by this tick's
+  // command is applied, and a talking player's command is zeroed in place
+  // before anything below reads it — so the controller, the hands and the op
+  // record all see a player standing still.
+  if (w.talk)
+    for (SessionTick& p : players)
+      dialogue::TickSession(*w.talk, *p.s, p.ti, tick, &w.mobs);
   for (SessionTick& p : players) ResolveHands(w, p);
   for (size_t i = 0; i < players.size(); i++)
     PhaseA(w, ws, players[i], scratch[i], tick, out);
@@ -5324,6 +5332,10 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   }
   for (size_t i = 0; i < players.size(); i++)
     PhaseG(w, ws, players[i], scratch[i], tick, out);
+  // THE MAP'S REFERENCES (world/refs_game.h): activation against the window
+  // and the use verb. Before phase H so a villager a ref spawns is stepped by
+  // this tick's mobs.PreTick. Null in every harness but the refs-* gates.
+  if (w.refs != nullptr) refs::TickRefs(w, players, tick, out);
   PhaseH(w, ws, players, scratch, tick, out);
   for (size_t i = 0; i < players.size(); i++)
     PhaseI(w, ws, players[i], scratch[i], tick, out);
