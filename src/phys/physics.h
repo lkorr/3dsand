@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -99,14 +100,22 @@ class Physics {
                             IVec3 originVoxel,
                             const std::vector<float>& densityOfMat,
                             bool allowKinematic = false,
-                            float voxelPitch = 1.0f);
+                            float voxelPitch = 1.0f,
+                            bool looseMatter = false);
   // Same, but at an arbitrary transform (laser splits inherit the parent
   // body's pose mid-tumble — PLAN §C2).
+  // `looseMatter`: world-scale rubble (islands, burn fragments, splits of
+  // them). Its collider box budget scales with its size (a box per 16
+  // voxels, 32..256; ColliderBoxBudgetFor in physics.cpp) instead of taking
+  // the whole ceiling -- a burnt plank does not need the 256 boxes a tree
+  // does, and the narrow phase and the swept cast pay per box. Creature limbs
+  // and severed parts leave it false and keep the full budget.
   uint64_t CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
                               const BodyTransform& xf,
                               const std::vector<float>& densityOfMat,
                               bool allowKinematic = false,
-                              float voxelPitch = 1.0f);
+                              float voxelPitch = 1.0f,
+                              bool looseMatter = false);
   // Analytic sphere collider — a greedy-boxed voxel ball can never roll
   // smoothly, so rolling objects get a true Jolt sphere. Mass = density *
   // sphere volume. The voxel ball that renders it is the caller's business
@@ -509,6 +518,24 @@ class Physics {
   // Static terrain collision patch (triangles in voxel units, world space).
   uint64_t CreateTerrainMesh(const std::vector<float>& vertsXYZ,
                              const std::vector<uint32_t>& indices);
+  // ...the same in two halves, so a tick's patches can be BUILT in parallel
+  // (DebrisSystem::ManageTerrain) and still be ADDED in one fixed order. The
+  // build is a pure function of the triangles -- Jolt's MeshShapeSettings::
+  // Create, ~1 ms for a 1-2k triangle patch, and the whole of a patch's cost
+  // -- and touches no shared state, so it is safe on any thread. `shape` is
+  // an AddRef'd JPH::Shape*, released by AddTerrainShape (which must run on
+  // the game thread, outside Step) or by DropTerrainShape.
+  struct TerrainShapeJob {
+    std::vector<float> verts;       // voxel units, world space
+    std::vector<uint32_t> indices;
+    const void* shape = nullptr;
+  };
+  void BuildTerrainShape(TerrainShapeJob& job) const;
+  uint64_t AddTerrainShape(TerrainShapeJob& job);
+  void DropTerrainShape(TerrainShapeJob& job) const;
+  // Run fn(0..n-1) on Jolt's worker pool (the calling thread helps) and
+  // return when all are done. Only between Steps: the pool is Jolt's.
+  void ParallelFor(uint32_t n, const std::function<void(uint32_t)>& fn);
 
   // ---- player proxy (deferred from M6; DESIGN.md §8) ----
   // Capsule the debris collides against. Voxel terrain collision stays in the
@@ -632,6 +659,18 @@ class Physics {
   // Wake dynamic bodies whose AABB intersects the given voxel-space sphere
   // (terrain changed under them).
   void WakeNear(Vec3 centerVoxel, float radiusVoxels);
+  // Wake every body whose BROAD-PHASE box overlaps [loVoxel, hiVoxel]: the
+  // bodies that can actually be touching matter that changed there. A
+  // broad-phase query, so its cost is the bodies it finds rather than every
+  // dynamic body, and -- unlike WakeNear's centre-of-mass sphere -- a long
+  // plank resting on the changed chunk with its centre outside it is woken.
+  void WakeInBox(Vec3 loVoxel, Vec3 hiVoxel);
+  // A body's broad-phase box in METRES (Jolt units), for callers comparing
+  // one body against itself (DebrisSystem's burn rebuild: did it lose its
+  // footing?).
+  bool BodyWorldBoundsM(uint64_t handle, float outMin[3], float outMax[3]) const {
+    return WorldBounds(handle, outMin, outMax);
+  }
 
   uint32_t NumActiveBodies() const;
 
@@ -664,6 +703,15 @@ class Physics {
     uint32_t manifoldsStatic = 0, pointsStatic = 0;  // body vs terrain/static
   };
   const StepStats& LastStep() const { return lastStep_; }
+  // Where the terrain-collider and wake time goes (always on: a few clock
+  // reads per terrain build, which is itself ~1 ms). Reset by the caller.
+  struct MeshStats {
+    double shapeUs = 0, addUs = 0, removeUs = 0, wakeUs = 0;
+    uint64_t meshes = 0, tris = 0, removes = 0, wakeCalls = 0, woken = 0;
+  };
+  const MeshStats& Meshes() const { return meshStats_; }
+  void ResetMeshStats() { meshStats_ = MeshStats{}; }
+  void NoteShapeBuildUs(double us) { meshStats_.shapeUs += us; }
   void ResetRunawayProbe() { runaway_ = RunawayProbe{}; }
   // The ceilings every dynamic body this class creates is born with, so a test
   // can assert against the engine's number rather than a copy of it.
@@ -742,6 +790,7 @@ class Physics {
   void SweepRunawayRigs();
   RunawayProbe runaway_{};
   StepStats lastStep_{};
+  MeshStats meshStats_{};
   // Jolt body INDEX -> consecutive-ish steps spent at the ceiling. Climbs by
   // one per hot step and falls by one per quiet one, so a body that is being
   // DRIVEN escalates while a body that was merely thrown hard decays back to

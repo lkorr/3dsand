@@ -5335,6 +5335,51 @@ neighbors, so this needs an explicit connectivity pass:
   and `DominantMaterial` tallies into a flat array: 3.7 ms for the eight. Gate
   `big-body-collider` pins the budget, the full coverage, the exact trunk box,
   and Discrete-for-thick / LinearCast-for-thin, with no timing in it.
+- **A burning house (2026-09-29).** Owner report: "burning down a house drops
+  to ~5 fps, the roof collapses into dozens of bodies". Harness
+  `--frames 100000 --burn-house` (main.cpp: stamps
+  `structures/harrowby_alehouse` in front of the camera, ignites it, prints a
+  60-tick timeline of frame p50/max, bodies, Jolt step mean/worst, manifolds,
+  terrain patch and wake costs, then the debris phase profile; knobs
+  `SANDVOX_BURN_SEED=low` (ground floor only: the roof comes down in pieces),
+  `SANDVOX_BURN_DIST`, `SANDVOX_BURN_TICKS`, `SANDVOX_BURN_HOUSE`). Measured
+  before: ~200 bodies (the `debris.maxBodies` cap) for the length of the fire,
+  CPU per frame terrainMesh 5.0 ms (p99 19), physics 3.4 (p99 12), debris
+  1.9; Jolt steps 6-10 ms mean with 20-55 ms spikes in the collapse. Every
+  one of those rides the up-to-4-ticks-a-frame catch-up, which is what turns a
+  heavy frame into a collapse. Six changes, all in `phys/`:
+  1. **Jolt runs on half the hardware threads less one, 2..7** (was a literal
+     2). Worker count is not a Jolt determinism condition. `SANDVOX_PHYS_THREADS`.
+  2. **Pair / contact-constraint capacity 16k** (was 4096 / 2048 — the fire
+     ran at ~1,500 manifolds, and past the ceiling Jolt drops contacts).
+  3. **A tick's terrain patches are built in parallel.** `ManageTerrain`
+     captures each rebuild's occupancy and runs marching cubes + Jolt's
+     `MeshShapeSettings::Create` (1-1.5 ms a patch) on Jolt's idle worker pool
+     (`Physics::ParallelFor`); the body add/remove stays sequential in the
+     sweep's nearest-first order, so body ids are a pure function of the
+     tick. `SANDVOX_NO_PARALLEL_FOR=1` is the serial arm.
+  4. **Wakes are broad-phase boxes, not centre-of-mass spheres**
+     (`Physics::WakeInBox`). A rebuilt patch wakes what touches its chunk
+     (+2 voxels), an island scan what touches its changed box (+4) — it was a
+     64-voxel sphere, which with a scan a tick held the whole fallen roof awake
+     for the whole fire. A patch that goes to sky now wakes too (it did not).
+  5. **A sleeping body stays asleep through its burn rebuild** unless its
+     lowest point rose (what it stood on burned away). A new body is created
+     awake and wakes everything it touches, and a burning pile rebuilds one
+     member a tick.
+  6. **Loose matter gets a box budget scaled to its size**: one box per 16
+     voxels, 32..256 (`looseMatter` on `CreateDebrisBodyXf`: islands, burn
+     fragments, splits, rebuilds of non-flesh world-scale bodies; creature
+     limbs and severed parts keep 256). A charred 600-voxel plank was 130+
+     boxes. In one binary on the collapse: a flat 64 took the step p99 6.5 ->
+     3.4 ms and max 10.8 -> 4.5; no casts at all did no better (2.7 / 4.7).
+  Also: the contact-impact lists are collected uncapped and capped AFTER the
+  step under a total order (strongest first), because "the first 64 to
+  arrive" from racing workers was scheduling-dependent and `bodyImpacts` feeds
+  contact damage. Same scene after: terrainMesh 1.6 ms (p99 5.5), physics 1.1
+  (p99 3.8), debris 1.1, Jolt step mean 1.75 / max 5.8; the frame is then
+  GPU-bound on the fire itself (`rm_world` ~9 ms, `ca` ~7 ms a tick at ~4k
+  awake chunks — the forest-fire smoke cost, not the bodies).
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

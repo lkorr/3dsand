@@ -10,6 +10,7 @@
 #include <limits>
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 #include <Jolt/Jolt.h>
@@ -414,12 +415,35 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
                      m.mWorldSpaceNormal.GetZ()};
     ci.speedVoxPerSec = speedVox;
 
+    // COLLECTED UNCAPPED, CAPPED AFTER THE STEP (Finish). The job threads
+    // race here, so "the first 64 to arrive" was a function of scheduling --
+    // on a busy step the kept set changed run to run, and bodyImpacts feeds
+    // MobSystem::ApplyContactDamage. Finish sorts and keeps the strongest
+    // under a total order, so the list is the same for any worker count.
+    // kCollectCeiling bounds the allocation on a pathological step.
     std::lock_guard<std::mutex> lk(mu);
-    if (toBody) {
-      if (bodyImpacts.size() < kMaxBodyPerStep) bodyImpacts.push_back(ci);
-    } else if (impacts.size() < kMaxPerStep) {
-      impacts.push_back(ci);
-    }
+    std::vector<ContactImpact>& dst = toBody ? bodyImpacts : impacts;
+    if (dst.size() < kCollectCeiling) dst.push_back(ci);
+  }
+  static constexpr size_t kCollectCeiling = 4096;
+  // Game thread, after Update: strongest first, ties broken by every field,
+  // then the per-step caps.
+  void Finish() {
+    auto order = [](const ContactImpact& a, const ContactImpact& b) {
+      if (a.speedVoxPerSec != b.speedVoxPerSec) return a.speedVoxPerSec > b.speedVoxPerSec;
+      if (a.bodyA != b.bodyA) return a.bodyA < b.bodyA;
+      if (a.bodyB != b.bodyB) return a.bodyB < b.bodyB;
+      if (a.posVoxel.x != b.posVoxel.x) return a.posVoxel.x < b.posVoxel.x;
+      if (a.posVoxel.y != b.posVoxel.y) return a.posVoxel.y < b.posVoxel.y;
+      if (a.posVoxel.z != b.posVoxel.z) return a.posVoxel.z < b.posVoxel.z;
+      if (a.normal.x != b.normal.x) return a.normal.x < b.normal.x;
+      if (a.normal.y != b.normal.y) return a.normal.y < b.normal.y;
+      return a.normal.z < b.normal.z;
+    };
+    std::sort(impacts.begin(), impacts.end(), order);
+    if (impacts.size() > kMaxPerStep) impacts.resize(kMaxPerStep);
+    std::sort(bodyImpacts.begin(), bodyImpacts.end(), order);
+    if (bodyImpacts.size() > kMaxBodyPerStep) bodyImpacts.resize(kMaxBodyPerStep);
   }
 };
 
@@ -465,6 +489,35 @@ bool AntiTunnelOff(AntiTunnel part) {
   return (mask & (1u << (unsigned)part)) != 0;
 }
 
+// ---- JOLT'S WORKER THREADS -------------------------------------------------
+//
+// Was a literal 2 on a 16-thread machine. A burning house is ~200 awake
+// compounds, and one Update over them was 6-10 ms a tick on two workers
+// (--burn-house, 2026-09-29) -- the largest CPU cost of the fire after the
+// terrain meshes, and with up to four ticks a frame it is what tips a slow
+// frame into the next. The narrow phase and the solver islands are exactly
+// what Jolt spreads across workers.
+//
+// DETERMINISM: Jolt's contract (Docs/Architecture.md, "Deterministic
+// Simulation") is same binary + same API call order; the worker count is not
+// a condition -- contacts and constraints are sorted before solving. The one
+// thread-order-dependent thing in this file is ContactImpls' capped impact
+// list, which was already filled from two racing workers.
+//
+// Half the hardware threads less one (the main thread helps while it waits),
+// clamped to [2, 7]: the GPU driver, audio and the voxel mirror also want
+// cores. SANDVOX_PHYS_THREADS=<n> is the A/B arm in one binary.
+static int PhysicsWorkerThreads() {
+  if (const char* e = std::getenv("SANDVOX_PHYS_THREADS")) {
+    const int n = std::atoi(e);
+    if (n >= 1) return std::min(n, 32);
+  }
+  const int hw = (int)std::thread::hardware_concurrency();
+  return std::clamp(hw / 2 - 1, 2, 7);
+}
+constexpr JPH::uint kMaxBodyPairs = 16384;
+constexpr JPH::uint kMaxContactConstraints = 16384;
+
 Physics::Physics() = default;
 Physics::~Physics() { Shutdown(); }
 
@@ -474,16 +527,22 @@ bool Physics::Init() {
     JPH::Factory::sInstance = new JPH::Factory();
     JPH::RegisterTypes();
   }
-  tempAlloc_ = std::make_unique<JPH::TempAllocatorImpl>(16 * 1024 * 1024);
+  // 64 MB of step scratch: a burning house is ~200 awake compounds over ~1,500
+  // manifolds, and TempAllocatorImpl ABORTS when a step outgrows it.
+  tempAlloc_ = std::make_unique<JPH::TempAllocatorImpl>(64 * 1024 * 1024);
   jobs_ = std::make_unique<JPH::JobSystemThreadPool>(
-      JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, 2 /*threads*/);
+      JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, PhysicsWorkerThreads());
   layers_ = std::make_unique<LayerImpls>();
   joints_ = std::make_unique<JointImpls>();
   contacts_ = std::make_unique<ContactImpls>();
 
   system_ = std::make_unique<JPH::PhysicsSystem>();
-  system_->Init(4096 /*max bodies*/, 0, 4096, 2048, layers_->bpInterface,
-                layers_->objVsBp, layers_->objPair);
+  // Pair and contact-constraint capacity. These were 4096 / 2048, and a
+  // burning house ran at ~1,500 manifolds (--burn-house, 2026-09-29): past the
+  // ceiling Jolt DROPS contacts, bodies sink into each other and the ground,
+  // and the pile never comes to rest. Memory is ~100 bytes a slot.
+  system_->Init(4096 /*max bodies*/, 0, kMaxBodyPairs, kMaxContactConstraints,
+                layers_->bpInterface, layers_->objVsBp, layers_->objPair);
   system_->SetContactListener(contacts_.get());
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
   return true;
@@ -654,6 +713,31 @@ constexpr double kStepWatchdogMs = 100.0;
 // builder's note says how a body over it is re-merged.
 constexpr float kDiscreteMinExtentVox = 24.0f;
 constexpr int kColliderBoxBudget = 256;
+// ...AND A SMALL BODY GETS A SMALL SHARE OF IT (2026-09-29). The narrow phase
+// and the LinearCast both pay per sub-shape, and a burnt plank is exactly the
+// shape the greedy merge does worst on: a 600-voxel piece of charred roof came
+// out as 130+ boxes, a 2,000-voxel one at the full 256. Two hundred of them in
+// one pile made single Jolt steps of 20-55 ms (--burn-house with
+// SANDVOX_BURN_SEED=low: the roof comes down in pieces). Measured in one
+// binary on that scene: a flat 64 took the step p99 6.5 -> 3.4 ms and the max
+// 10.8 -> 4.5; turning the casts off entirely did no better (2.7 / 4.7).
+// The budget is therefore a box per 16 voxels, floored at 32 and capped at the
+// ceiling, so a tree (28k voxels) keeps its 256 and rubble keeps its shape to
+// within the coarse lattice the over-budget path already uses.
+// SANDVOX_BOX_BUDGET=<n> replaces the rule with a flat <n> (the A/B arm).
+constexpr int kColliderBoxesPerVoxel = 16;
+constexpr int kColliderBoxFloor = 32;
+static int ColliderBoxBudgetFor(size_t voxels) {
+  static const int flat = [] {
+    const char* e = std::getenv("SANDVOX_BOX_BUDGET");
+    const int n = e ? std::atoi(e) : 0;
+    return n >= 4 ? n : 0;
+  }();
+  if (flat) return flat;
+  return std::clamp((int)std::min<size_t>(voxels / kColliderBoxesPerVoxel,
+                                          (size_t)kColliderBoxBudget),
+                    kColliderBoxFloor, kColliderBoxBudget);
+}
 // A greedy box at least this big (and at least 2 voxels on every side) is
 // kept exactly when a body is over budget; everything smaller goes coarse.
 constexpr int kFatBoxMinVoxels = 8;
@@ -1138,6 +1222,7 @@ void Physics::Step(float dt) {
                         .count();
   if (ms > runaway_.worstStepMs) runaway_.worstStepMs = ms;
   lastStep_.ms = ms;
+  if (contacts_) contacts_->Finish();
   if (contacts_) {
     lastStep_.manifoldsDyn = contacts_->manifoldsDyn.load();
     lastStep_.pointsDyn = contacts_->pointsDyn.load();
@@ -1196,17 +1281,20 @@ void Physics::Step(float dt) {
 uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
                                    IVec3 originVoxel,
                                    const std::vector<float>& densityOfMat,
-                                   bool allowKinematic, float voxelPitch) {
+                                   bool allowKinematic, float voxelPitch,
+                                   bool looseMatter) {
   BodyTransform xf{};
   xf.pos = Vec3{(float)originVoxel.x, (float)originVoxel.y, (float)originVoxel.z};
   xf.quat[3] = 1;
-  return CreateDebrisBodyXf(voxels, xf, densityOfMat, allowKinematic, voxelPitch);
+  return CreateDebrisBodyXf(voxels, xf, densityOfMat, allowKinematic, voxelPitch,
+                            looseMatter);
 }
 
 uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
                                      const BodyTransform& xf,
                                      const std::vector<float>& densityOfMat,
-                                     bool allowKinematic, float voxelPitch) {
+                                     bool allowKinematic, float voxelPitch,
+                                     bool looseMatter) {
   if (!system_ || voxels.empty()) return 0;
   if (!(voxelPitch > 0.0f)) voxelPitch = 1.0f;
 
@@ -1261,7 +1349,9 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   // The box budget below bounds the sub-shape list, so this reserve is exact
   // for a budgeted body and an upper bound (n voxels = n boxes at worst)
   // otherwise; it keeps Jolt's Array from regrowing.
-  compound.mSubShapes.reserve(std::min<size_t>(voxels.size(), kColliderBoxBudget));
+  const int boxBudget =
+      looseMatter ? ColliderBoxBudgetFor(voxels.size()) : kColliderBoxBudget;
+  compound.mSubShapes.reserve(std::min<size_t>(voxels.size(), (size_t)boxBudget));
   float totalMass = 0;
   // One supplied voxel is `voxelPitch` world voxels on a side, so its physical
   // volume is (pitch * kVoxelMeters)^3. A scale-2 limb has 8x the voxels at 1/8
@@ -1328,7 +1418,7 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   std::vector<Box> emit;
   int coarseCell = 1;
   size_t keptFat = 0;
-  if ((int)fine.size() <= kColliderBoxBudget) {
+  if ((int)fine.size() <= boxBudget) {
     emit = std::move(fine);
   } else {
     std::vector<uint32_t> order(fine.size());
@@ -1345,7 +1435,7 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
       for (int k = 0; k < b.sz; k++)
         for (int j = 0; j < b.sy; j++)
           for (int ii = 0; ii < b.sx; ii++) occ[idx(b.x + ii, b.y + j, b.z + k)] = 3;
-      if ((int)emit.size() >= kColliderBoxBudget / 2) break;
+      if ((int)emit.size() >= boxBudget / 2) break;
     }
     keptFat = emit.size();
     // Everything a kept box does not hold, on a lattice of `cell` voxels.
@@ -1400,7 +1490,7 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
             coarse.push_back(b);
           }
       coarseCell = cell;
-      if ((int)(keptFat + coarse.size()) <= kColliderBoxBudget ||
+      if ((int)(keptFat + coarse.size()) <= boxBudget ||
           cell >= std::max(ex, std::max(ey, ez)))
         break;
     }
@@ -1536,16 +1626,26 @@ uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
 uint64_t Physics::CreateTerrainMesh(const std::vector<float>& vertsXYZ,
                                     const std::vector<uint32_t>& indices) {
   if (!system_ || indices.size() < 3) return 0;
+  TerrainShapeJob job;
+  job.verts = vertsXYZ;
+  job.indices = indices;
+  BuildTerrainShape(job);
+  return AddTerrainShape(job);
+}
 
+void Physics::BuildTerrainShape(TerrainShapeJob& job) const {
+  job.shape = nullptr;
+  if (job.indices.size() < 3) return;
   JPH::VertexList verts;
-  verts.reserve(vertsXYZ.size() / 3);
-  for (size_t i = 0; i + 2 < vertsXYZ.size(); i += 3)
-    verts.push_back(JPH::Float3(VoxToM(vertsXYZ[i]), VoxToM(vertsXYZ[i + 1]),
-                                VoxToM(vertsXYZ[i + 2])));
+  verts.reserve(job.verts.size() / 3);
+  for (size_t i = 0; i + 2 < job.verts.size(); i += 3)
+    verts.push_back(JPH::Float3(VoxToM(job.verts[i]), VoxToM(job.verts[i + 1]),
+                                VoxToM(job.verts[i + 2])));
   JPH::IndexedTriangleList tris;
-  tris.reserve(indices.size() / 3);
-  for (size_t i = 0; i + 2 < indices.size(); i += 3)
-    tris.push_back(JPH::IndexedTriangle(indices[i], indices[i + 1], indices[i + 2]));
+  tris.reserve(job.indices.size() / 3);
+  for (size_t i = 0; i + 2 < job.indices.size(); i += 3)
+    tris.push_back(JPH::IndexedTriangle(job.indices[i], job.indices[i + 1],
+                                        job.indices[i + 2]));
 
   JPH::MeshShapeSettings mesh(verts, tris);
   // Default is cos(5°): nearly every seam between marching-cubes triangles
@@ -1555,15 +1655,53 @@ uint64_t Physics::CreateTerrainMesh(const std::vector<float>& vertsXYZ,
   // the dynamic bodies.
   mesh.mActiveEdgeCosThresholdAngle = 0.9063f;  // cos(25 deg)
   auto shapeResult = mesh.Create();
-  if (shapeResult.HasError()) return 0;
+  if (shapeResult.HasError()) return;
+  const JPH::Shape* sh = shapeResult.Get().GetPtr();
+  sh->AddRef();  // the ShapeResult's ref dies with it; this one is the job's
+  job.shape = sh;
+}
 
-  JPH::BodyCreationSettings bcs(shapeResult.Get(), JPH::RVec3::sZero(),
-                                JPH::Quat::sIdentity(), JPH::EMotionType::Static,
-                                Layers::STATIC);
+void Physics::DropTerrainShape(TerrainShapeJob& job) const {
+  if (job.shape) static_cast<const JPH::Shape*>(job.shape)->Release();
+  job.shape = nullptr;
+}
+
+uint64_t Physics::AddTerrainShape(TerrainShapeJob& job) {
+  if (!system_ || !job.shape) {
+    DropTerrainShape(job);
+    return 0;
+  }
+  const JPH::Shape* sh = static_cast<const JPH::Shape*>(job.shape);
+  JPH::BodyCreationSettings bcs(sh, JPH::RVec3::sZero(), JPH::Quat::sIdentity(),
+                                JPH::EMotionType::Static, Layers::STATIC);
   bcs.mFriction = CurrentTuning().physics.terrainFriction;
+  const auto t0 = std::chrono::steady_clock::now();
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::DontActivate);
+  meshStats_.meshes++;
+  meshStats_.tris += job.indices.size() / 3;
+  meshStats_.addUs += std::chrono::duration<double, std::micro>(
+                          std::chrono::steady_clock::now() - t0).count();
+  DropTerrainShape(job);  // the body holds its own reference now
   return id.IsInvalid() ? 0 : FromBodyID(id);
+}
+
+void Physics::ParallelFor(uint32_t n, const std::function<void(uint32_t)>& fn) {
+  if (n == 0) return;
+  // SANDVOX_NO_PARALLEL_FOR=1: the serial arm of the A/B, in one binary.
+  static const bool serial = std::getenv("SANDVOX_NO_PARALLEL_FOR") != nullptr;
+  if (!jobs_ || n == 1 || serial) {
+    for (uint32_t i = 0; i < n; i++) fn(i);
+    return;
+  }
+  JPH::JobSystem::Barrier* barrier = jobs_->CreateBarrier();
+  for (uint32_t i = 0; i < n; i++) {
+    JPH::JobHandle h =
+        jobs_->CreateJob("sv-parallel-for", JPH::Color::sGreen, [&fn, i] { fn(i); });
+    barrier->AddJob(h);
+  }
+  jobs_->WaitForJobs(barrier);
+  jobs_->DestroyBarrier(barrier);
 }
 
 uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
@@ -2663,8 +2801,12 @@ void Physics::RemoveBody(uint64_t handle) {
   // to whatever is created next in its slot, and that body would be cut on its
   // fifth bad step instead of its forty-fifth.
   hotSteps_.erase(id.GetIndex());
+  const auto tr0 = std::chrono::steady_clock::now();
   bi.RemoveBody(id);
   bi.DestroyBody(id);
+  meshStats_.removes++;
+  meshStats_.removeUs += std::chrono::duration<double, std::micro>(
+                             std::chrono::steady_clock::now() - tr0).count();
   for (size_t i = 0; i < playerBodies_.size(); i++) {
     if (playerBodies_[i] == handle) {
       playerBodies_.erase(playerBodies_.begin() + (ptrdiff_t)i);
@@ -2843,15 +2985,40 @@ void Physics::ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels,
 
 void Physics::WakeNear(Vec3 centerVoxel, float radiusVoxels) {
   if (!system_) return;
-  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  // The NO-LOCK interface: this runs on the game thread between Steps (the
+  // terrain sweep calls it once per rebuilt patch, the island drain once per
+  // scan), where nothing else can touch a body, and the locking interface
+  // took a body lock three times per body per call.
+  JPH::BodyInterface& bi = system_->GetBodyInterfaceNoLock();
   JPH::RVec3 c(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y), VoxToM(centerVoxel.z));
   float rM = VoxToM(radiusVoxels);
+  const auto t0 = std::chrono::steady_clock::now();
+  meshStats_.wakeCalls++;
   for (uint64_t h : dynamicBodies_) {
     JPH::BodyID id = ToBodyID(h);
     if (!bi.IsAdded(id)) continue;
-    if (JPH::Vec3(bi.GetCenterOfMassPosition(id) - c).Length() <= rM)
+    if (JPH::Vec3(bi.GetCenterOfMassPosition(id) - c).Length() <= rM) {
+      if (!bi.IsActive(id)) meshStats_.woken++;
       bi.ActivateBody(id);
+    }
   }
+  meshStats_.wakeUs += std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - t0).count();
+}
+
+void Physics::WakeInBox(Vec3 loVoxel, Vec3 hiVoxel) {
+  if (!system_) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  meshStats_.wakeCalls++;
+  const JPH::AABox box(JPH::Vec3(VoxToM(loVoxel.x), VoxToM(loVoxel.y), VoxToM(loVoxel.z)),
+                       JPH::Vec3(VoxToM(hiVoxel.x), VoxToM(hiVoxel.y), VoxToM(hiVoxel.z)));
+  const uint32_t before = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+  system_->GetBodyInterfaceNoLock().ActivateBodiesInAABox(
+      box, JPH::BroadPhaseLayerFilter{}, JPH::ObjectLayerFilter{});
+  const uint32_t after = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+  if (after > before) meshStats_.woken += after - before;
+  meshStats_.wakeUs += std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - t0).count();
 }
 
 uint32_t Physics::NumActiveBodies() const {

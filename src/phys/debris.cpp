@@ -1758,7 +1758,8 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       const IVec3 origin = sh.mn;
       {
         PhaseTimer pt(prof_, Phase::BodyCreate);
-        body.handle = phys_->CreateDebrisBody(body.voxels, origin, densityOf_);
+        body.handle = phys_->CreateDebrisBody(body.voxels, origin, densityOf_, false,
+                                              1.0f, /*looseMatter=*/true);
       }
       if (prof_.on) {
         prof_.bodiesCreated++;
@@ -2138,12 +2139,23 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
         // terrain under the blast changed: sleeping debris nearby must re-check
         // Around what CHANGED, not the 256-cell region: waking every body in
         // a 128-cell radius on every scan would keep a whole battlefield up.
-        Vec3 c{(float)(e.seedLo.x + e.seedHi.x) * 0.5f,
-               (float)(e.seedLo.y + e.seedHi.y) * 0.5f,
-               (float)(e.seedLo.z + e.seedHi.z) * 0.5f};
+        //
+        // ...AND NOT A 64-VOXEL SPHERE ROUND IT EITHER (2026-09-29). A burning
+        // house raises a scan a tick, and a sphere that size round each one
+        // held the whole pile of its fallen roof awake for the length of the
+        // fire -- ~200 bodies that never slept, never settled back, and were
+        // stepped every tick (--burn-house). A body can only be affected by
+        // what changed if it TOUCHES the changed box: its broad-phase box
+        // overlaps it (a few voxels of margin for contact slop). Anything
+        // resting on matter the scan turned into a body is woken by Jolt when
+        // that body moves against it, and anything resting on grid the scan
+        // erased is woken by the collider rebuild of that chunk (ManageTerrain).
         settle_.blastWakes++;
         settle_.lastWakeTick = tick;
-        phys_->WakeNear(c, 64.0f);
+        phys_->WakeInBox(Vec3{(float)e.seedLo.x - 4.0f, (float)e.seedLo.y - 4.0f,
+                              (float)e.seedLo.z - 4.0f},
+                         Vec3{(float)e.seedHi.x + 5.0f, (float)e.seedHi.y + 5.0f,
+                              (float)e.seedHi.z + 5.0f});
         continue;  // qi now indexes the entry that followed it
       }
       if (tick > e.tick + kEventStuckTicks) {
@@ -3139,12 +3151,27 @@ bool DebrisSystem::BurnTail(Body& b, uint32_t removed, bool changed,
       if (b.micro.Valid()) ReskinMicro(b);
       Vec3 lin{}, ang{};
       phys_->GetBodyVelocities(b.handle, lin, ang);
+      // A SLEEPING BODY STAYS ASLEEP THROUGH ITS REBUILD (2026-09-29). Jolt
+      // creates the new body awake, an awake body wakes everything it
+      // touches, and a burning pile rebuilds one member a tick -- so the
+      // fallen roof of a burning house (~200 bodies, all touching) never
+      // slept, never settled back into the grid, and was stepped whole every
+      // tick (--burn-house). Burning only REMOVES matter, so the rebuilt body
+      // can only have lost support, never gained a push: it goes back to
+      // sleep unless its lowest point rose, i.e. unless what it stood on
+      // burned away. (A lost corner under an unchanged bottom face keeps it
+      // asleep until the next wake near it -- the terrain rebuilds a fire
+      // keeps making do that within a few ticks.)
+      const bool wasAsleep = !phys_->IsActive(b.handle);
+      float oMin[3] = {}, oMax[3] = {};
+      const bool haveOld = wasAsleep && phys_->BodyWorldBoundsM(b.handle, oMin, oMax);
       // Micro bodies build at 1/physScale: a scale-4 body's voxels are quarter
       // size, and building at pitch 1 would give it 64x its real volume and
       // mass (RebuildCollider says the same thing at the other call site).
       uint64_t nh = phys_->CreateDebrisBodyXf(
           b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(),
-          1.0f / (float)std::max(1u, b.physScale));
+          1.0f / (float)std::max(1u, b.physScale),
+          /*looseMatter=*/b.physScale <= 1u && !b.Follower() && !IsFlesh(b));
       if (nh != 0) {
         // ReplaceBody, never RemoveBody: a corpse's joints ride to the new
         // handle (see RebuildCollider).
@@ -3153,6 +3180,14 @@ bool DebrisSystem::BurnTail(Body& b, uint32_t removed, bool changed,
         b.handle = nh;
         CarryStrap(oh, nh);
         phys_->SetBodyVelocities(nh, lin, ang);
+        if (haveOld) {
+          float nMin[3] = {}, nMax[3] = {};
+          // Half a voxel (WorldBounds is in metres): a bottom-face voxel burned
+          // away lifts the box by a whole one.
+          if (phys_->BodyWorldBoundsM(nh, nMin, nMax) &&
+              nMin[1] <= oMin[1] + 0.5f * kVoxelMeters)
+            phys_->DeactivateBody(nh);
+        }
         b.burnedSinceRebuild = 0;
         rebuiltOne = true;
       }
@@ -3437,7 +3472,8 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
                                            (float)mn.z * mnInv});
       const float pitch = 1.0f / (float)std::max(1u, nb.physScale);
       nb.handle =
-          phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_, false, pitch);
+          phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_, false, pitch,
+                                    /*looseMatter=*/pitch >= 1.0f);
       if (nb.handle != 0) {
         // Born where the parent is: a piece splitting off a body that is
         // still inside the player is inside the player too (CarryLayer).
@@ -3521,7 +3557,8 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
     // fragment path two branches up (and RebuildCollider) always passed it.
     const float pitch = 1.0f / (float)std::max(1u, b.physScale);
     uint64_t nh = phys_->CreateDebrisBodyXf(
-        b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch);
+        b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch,
+        /*looseMatter=*/b.physScale <= 1u && !b.Follower() && !IsFlesh(b));
     if (nh != 0) {
       const uint64_t oh = b.handle;
       phys_->ReplaceBody(b.handle, nh);  // joints ride along (RebuildCollider)
@@ -4347,7 +4384,8 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   // pitch 1 would inflate a scale-2 body to twice its size and 8x its mass.
   const float pitch = 1.0f / (float)std::max(1u, b.physScale);
   uint64_t nh = phys_->CreateDebrisBodyXf(
-      b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch);
+      b.voxels, b.xf, densityOf_, /*allowKinematic=*/b.Follower(), pitch,
+      /*looseMatter=*/b.physScale <= 1u && !b.Follower() && !IsFlesh(b));
   if (nh == 0) return false;
   // REPLACE, NOT REMOVE. Dead flesh here can be a set of debris bodies left
   // JOINTED (a severed multi-limb part, DetachLimb's keepJoint; a decayed
@@ -5653,7 +5691,8 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
     BodyTransform xf = b.xf;
     Vec3 shift = rot(Vec3{(float)mn.x, (float)mn.y, (float)mn.z});
     xf.pos += shift;
-    newBodies[h].handle = phys_->CreateDebrisBodyXf(halves[h], xf, densityOf_);
+    newBodies[h].handle = phys_->CreateDebrisBodyXf(halves[h], xf, densityOf_, false,
+                                                    1.0f, /*looseMatter=*/true);
     if (newBodies[h].handle == 0) {
       if (h == 1 && newBodies[0].handle) phys_->RemoveBody(newBodies[0].handle);
       return false;
@@ -6298,6 +6337,14 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       continue;
     }
     if (!anyOcc) {  // sky: nothing to mesh, nothing to charge
+      // ...but a patch that HAD ground and lost all of it leaves whatever was
+      // asleep on it in mid-air: wake what touched it, as a rebuild would.
+      if (t.handle)
+        phys_->WakeInBox(Vec3{(float)origin.x - 2.0f, (float)origin.y - 2.0f,
+                              (float)origin.z - 2.0f},
+                         Vec3{(float)origin.x + (float)kChunk + 2.0f,
+                              (float)origin.y + (float)kChunk + 2.0f,
+                              (float)origin.z + (float)kChunk + 2.0f});
       if (t.handle) phys_->RemoveBody(t.handle);
       t.handle = 0;
       t.builtVersion = cc->version;
@@ -6312,26 +6359,71 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     builds++;
     settle_.terrainBuilds++;
 
-    pst.To(Phase::TerrainPoly);
-    if (prof_.on) prof_.polys++;
-    std::vector<float> verts;
-    std::vector<uint32_t> indices;
-    PolygonizeChunk(origin, occ, verts, indices, anyPartial ? dens : nullptr);
+    // DEFERRED to after the sweep, where the tick's builds run in parallel
+    // (see below). Everything the build needs is captured here by value.
+    TerrainBuild& tb = terrainBuilds_.emplace_back();
+    tb.entry = &t;  // unordered_map: element addresses survive rehashing
+    tb.wc = wc;
+    tb.origin = origin;
+    std::memcpy(tb.occ, occ, sizeof occ);
+    tb.partial = anyPartial;
+    if (anyPartial) std::memcpy(tb.dens, dens, sizeof dens);
+    tb.version = cc->version;
+    tb.occHash = h;
+    tb.vacateKey = vacateKey;
+  }
 
-    pst.To(Phase::TerrainJolt);
-    if (prof_.on) prof_.joltMeshes++;
-    if (t.handle) phys_->RemoveBody(t.handle);
-    t.handle = indices.empty() ? 0 : phys_->CreateTerrainMesh(verts, indices);
-    t.builtVersion = cc->version;
-    t.occHash = h;
-    t.vacateKey = vacateKey;
-    // ground under sleeping debris may have moved: let them re-settle
-    settle_.terrainWakes++;
-    settle_.lastWakeTick = tick;
-    settle_.lastWakeChunk = wc;
-    phys_->WakeNear(Vec3{(float)origin.x + 8, (float)origin.y + 8,
-                         (float)origin.z + 8},
-                    24.0f);
+  // ---- THE TICK'S PATCHES, BUILT IN PARALLEL --------------------------------
+  //
+  // Marching cubes plus Jolt's MeshShapeSettings::Create is ~1-1.5 ms a patch
+  // (a 16^3 chunk of burning house is 1-2.5k triangles), and a fire keeps the
+  // kTerrainBuildsPerTick budget full every tick: measured on --burn-house
+  // 2026-09-29, 4-9 ms of every tick, serially, on the game thread. Both
+  // halves are pure functions of the captured occupancy, so they run on
+  // Jolt's worker pool (idle here: PreTick is before Step) and only the
+  // body add/remove -- which fixes Jolt body ids, and so must keep ONE order
+  // -- stays sequential, in the sweep's nearest-first order as before.
+  if (!terrainBuilds_.empty()) {
+    PhaseSwitch pst0(prof_, Phase::TerrainPoly);
+    const auto tp0 = std::chrono::steady_clock::now();
+    phys_->ParallelFor((uint32_t)terrainBuilds_.size(), [this](uint32_t i) {
+      TerrainBuild& tb = terrainBuilds_[i];
+      tb.job.verts.clear();
+      tb.job.indices.clear();
+      PolygonizeChunk(tb.origin, tb.occ, tb.job.verts, tb.job.indices,
+                      tb.partial ? tb.dens : nullptr);
+      phys_->BuildTerrainShape(tb.job);
+    });
+    phys_->NoteShapeBuildUs(std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - tp0).count());
+    pst0.To(Phase::TerrainJolt);
+    for (TerrainBuild& tb : terrainBuilds_) {
+      if (prof_.on) {
+        prof_.polys++;
+        prof_.joltMeshes++;
+      }
+      TerrainEntry& t = *tb.entry;
+      if (t.handle) phys_->RemoveBody(t.handle);
+      t.handle = tb.job.indices.empty() ? 0 : phys_->AddTerrainShape(tb.job);
+      phys_->DropTerrainShape(tb.job);  // no-op unless the add was skipped
+      t.builtVersion = tb.version;
+      t.occHash = tb.occHash;
+      t.vacateKey = tb.vacateKey;
+      // ground under sleeping debris may have moved: let them re-settle. The
+      // bodies whose broad-phase box touches THIS patch (plus contact slop),
+      // not every centre of mass within 24 voxels of its middle: that woke
+      // bodies resting on unchanged chunks next door and missed a long body
+      // lying across this one with its centre outside the sphere.
+      settle_.terrainWakes++;
+      settle_.lastWakeTick = tick;
+      settle_.lastWakeChunk = tb.wc;
+      phys_->WakeInBox(Vec3{(float)tb.origin.x - 2.0f, (float)tb.origin.y - 2.0f,
+                            (float)tb.origin.z - 2.0f},
+                       Vec3{(float)tb.origin.x + (float)kChunk + 2.0f,
+                            (float)tb.origin.y + (float)kChunk + 2.0f,
+                            (float)tb.origin.z + (float)kChunk + 2.0f});
+    }
+    terrainBuilds_.clear();
   }
 
   if (prof_.on) {
