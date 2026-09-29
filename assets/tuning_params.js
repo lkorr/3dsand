@@ -518,6 +518,8 @@ const TUNING_PARAMS = {
   'avatar.turnMinSpeed':{t:'f',def:0.35,min:0,max:3},
   'avatar.velocityHalflife':{t:'f',def:0.08,min:0,max:0.5},
   'avatar.firstPersonTurnHalflife':{t:'f',def:0.05,min:0,max:0.3},
+  'avatar.crawlTurnRate':{t:'f',def:0.8,min:0.05,max:40},
+  'avatar.firstPersonHeadHalflife':{t:'f',def:0.05,min:0,max:0.5},
   'avatar.headLookYaw':{t:'f',def:70,min:0,max:110},
   'avatar.headLookReleaseYaw':{t:'f',def:50,min:0,max:110},
   'avatar.headLookPitchUp':{t:'f',def:55,min:0,max:89},

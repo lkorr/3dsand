@@ -114,6 +114,8 @@
     "turnMinSpeed": 0.35,
     "velocityHalflife": 0.08,
     "firstPersonTurnHalflife": 0.05,
+    "crawlTurnRate": 0.8,
+    "firstPersonHeadHalflife": 0.05,
     "headLookYaw": 70,
     "headLookReleaseYaw": 50,
     "headLookPitchUp": 55,

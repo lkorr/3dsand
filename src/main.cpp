@@ -6441,6 +6441,10 @@ int main(int argc, char** argv) {
   float& avatarHeading = session.avatarHeading;   // body facing, radians +Y
   float& fovNow = session.fovNow;
   fovNow = CurrentTuning().camera.fovY;
+  // First-person eye: its eased offset from the player's own eye to the
+  // posed head's eyes (PlayerAvatar::HeadEyeWorld). Render-only.
+  Vec3 fpHeadDelta{};
+  bool fpHeadValid = false;
   float& respawnTimer = session.respawnTimer;
   // Night-ambience rarity roll. Deliberately a plain PRNG and NOT the sim's
   // counter-based hash: this decides whether a mood bed plays, never anything
@@ -11922,9 +11926,35 @@ int main(int argc, char** argv) {
           std::min(1.0f, std::max(0.0f, (float)(accumulator / kTickDt)));
       Vec3 eye = player.RenderEyePos(tickAlpha);
       if (camMode == CameraMode::First) {
+        // THE EYE RIDES THE HEAD. The player's eye point is a fixed height
+        // over the collision box, which is right for a standing body and
+        // wrong for everything the pose does to the head -- above all a
+        // crawl, where the head is down on the floor out in front of the
+        // box. The head's posed eyes are measured as an OFFSET from the
+        // body's tick position, that offset is eased
+        // (avatar.firstPersonHeadHalflife), and the eye is placed where the
+        // DRAWN head is: the same RenderBodyOffset the art is drawn with
+        // (tick interpolation + step banking), so eye and body stay one rigid
+        // thing and only the head's own movement (posed at 30 Hz) is eased.
+        // Render-only: every pick, ray and the sim still read EyePos().
+        Vec3 headEye;
+        if (avatar.Spawned() && avatar.HeadEyeWorld(headEye)) {
+          const Vec3 want = headEye - player.pos;
+          const float hl = CurrentTuning().avatar.firstPersonHeadHalflife;
+          const float k =
+              hl <= 1e-4f ? 1.0f : 1.0f - std::exp2(-dt / hl);
+          fpHeadDelta = fpHeadValid ? fpHeadDelta + (want - fpHeadDelta) * k
+                                    : want;
+          fpHeadValid = true;
+          eye = player.pos + player.RenderBodyOffset(tickAlpha) + fpHeadDelta;
+        } else {
+          fpHeadValid = false;
+        }
         const float fpFwd =
             CurrentTuning().avatar.firstPersonForward / kVoxelMeters;
         eye = eye + cam.FlatForward() * fpFwd;
+      } else {
+        fpHeadValid = false;
       }
       // ...and the BODY gets the same two corrections, or the art and the
       // camera disagree. The avatar is posed once per 30 Hz tick around

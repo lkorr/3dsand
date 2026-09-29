@@ -28,7 +28,7 @@ const char* CameraModeName(CameraMode m) {
 }
 
 float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
-                           Vec3 planarVel, float dt) {
+                           Vec3 planarVel, float dt, float prone) {
   const auto& av = CurrentTuning().avatar;
   const float sp = planarVel.len() * kVoxelMeters;   // voxels/s -> m/s
   const bool moving = sp > av.turnMinSpeed;
@@ -57,6 +57,16 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
   } else {
     const float maxStep = av.turnRate * dt;
     out += std::clamp(d, -maxStep, maxStep);
+  }
+  // CRAWLING TURNS SLOWLY, in either mode: a body on the floor drags itself
+  // round. The limit eases from the mode's own answer to crawlTurnRate with
+  // how prone the pose is, so getting down or up has no step in it.
+  const float pr = std::clamp(prone, 0.0f, 1.0f);
+  if (pr > 0.0f) {
+    const float free = std::fabs(out - heading);
+    const float crawl = av.crawlTurnRate * dt;
+    const float lim = free + (std::min(crawl, free) - free) * pr;
+    out = heading + std::clamp(out - heading, -lim, lim);
   }
   while (out > 3.14159265f) out -= 6.2831853f;
   while (out < -3.14159265f) out += 6.2831853f;

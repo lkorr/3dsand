@@ -48,8 +48,10 @@ const char* CameraModeName(CameraMode m);
 // `camHeading` and `heading` are in the rig's heading convention (forward is
 // (sin h, ., cos h)); `planarVel` is the player's world-voxel velocity with y
 // dropped. Returns the NEW heading, already wrapped.
+// `prone` (0..1, Mob::LocoGroundAlign) blends in avatar.crawlTurnRate as a
+// rate limit on top of either mode: a crawling body turns slowly.
 float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
-                           Vec3 planarVel, float dt);
+                           Vec3 planarVel, float dt, float prone = 0.0f);
 
 // ---- swing aim policy ------------------------------------------------------
 // The sword's version of the neck rule above. The melee driver (game/melee.h)

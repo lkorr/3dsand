@@ -536,6 +536,16 @@ struct Tuning {
     // half-life keeps them attached to the view without visible lag. 0 restores
     // the old hard snap.
     float firstPersonTurnHalflife = TPD(avatar, firstPersonTurnHalflife);
+    // Rate limit (radians/sec) on the body yaw while PRONE (crawling on the
+    // ground, Mob::LocoGroundAlign), in BOTH camera modes: a body lying on
+    // the floor drags itself round slowly instead of pivoting like a
+    // standing one. Blended in by how prone the pose is.
+    float crawlTurnRate = TPD(avatar, crawlTurnRate);
+    // Half-life (seconds) of the FIRST-PERSON eye following the posed HEAD.
+    // The head is posed once per 30 Hz tick; this eases the eye between
+    // poses so it tracks the head (a crawl puts it near the floor, out in
+    // front of the body) without stepping at the tick rate.
+    float firstPersonHeadHalflife = TPD(avatar, firstPersonHeadHalflife);
     // ---- head look ---------------------------------------------------------
     // How far the HEAD may yaw toward the camera away from the body's facing,
     // in degrees (PlayerAvatar::SetLook clamps to it). It does NOT drive the

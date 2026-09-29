@@ -309,6 +309,12 @@ class PlayerAvatar : public Mob {
   // authored (caller falls back to a constant).
   float EyeRestHeight() const { return def_ ? def_->eyeRestHeight : 0.0f; }
   bool HasEyeLocal() const { return def_ && def_->hasEyeLocal; }
+  // WHERE THE EYES ARE THIS TICK, world voxels: the head's POSED transform
+  // (PartPosedWorld -- the animation's answer, not Jolt's one-tick-latent
+  // readback) carried out to the sidecar's eyeLocal. The first-person
+  // camera rides this, so a crawl puts the eye near the floor where the head
+  // is. False with no head, no eyeLocal, or a dead body.
+  bool HeadEyeWorld(Vec3& out) const;
 
   // ---- render plumbing ----
   // Inherited from Mob (identical slot walk to MobSystem's), except that the

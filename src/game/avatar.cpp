@@ -1165,6 +1165,21 @@ bool PlayerAvatar::PartPosedWorld(int part, Vec3& outPos, Quat& outRot) const {
   return true;
 }
 
+bool PlayerAvatar::HeadEyeWorld(Vec3& out) const {
+  if (!spawned_ || !alive_ || def_ == nullptr || !def_->hasEyeLocal)
+    return false;
+  const int head = parts_.head;
+  if (head < 0 || head >= (int)limbs_.size()) return false;
+  Vec3 corner;
+  Quat q;
+  if (!PartPosedWorld(head, corner, q)) return false;
+  // eyeLocal is an offset from the head's ANCHOR (the neck joint) in art
+  // voxels, rest frame (MobDef::eyeLocal); the posed rotation carries both.
+  out = corner + Rotate(q, limbs_[(size_t)head].anchorLimb +
+                              def_->eyeLocal * def_->ArtToWorld());
+  return true;
+}
+
 bool PlayerAvatar::PartAnchorWorld(int part, Vec3& out) const {
   if (part < 0 || part >= (int)limbs_.size()) return false;
   const MobLimb& p = limbs_[part];
