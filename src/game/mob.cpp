@@ -28571,7 +28571,7 @@ void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   if (keyed) {
     const WeaponPose::Keyed& K = weapon_.keyed;
     if (K.fromLive) {
-      if (!S.keyLiveValid) {
+      if (!S.keyLiveValid || K.recapture) {
         bool same = S.lastValid;
         for (int k = 0; k < kArmJoints; k++) same = same && S.lastPart[k] == parts[k];
         for (int k = 0; k < kArmJoints; k++) S.keyLive[k] = same ? S.last[k] : want[k];

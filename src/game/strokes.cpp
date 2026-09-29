@@ -401,6 +401,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     // The optional body animation (strokes.h AttackStyle::clip). Whether a
     // rig HAS it is a mob-load question, answered there with a loader line.
     st.clip = s.value("clip", std::string());
+    st.chargeTwist = s.value("chargeTwistDeg", 0.0f) * 0.017453293f;
     // ---- WHAT SWINGS IT, and when (strokes.h; plan §4/§5) ------------------
     // Every one of these defaults to the behaviour a style authored before
     // they existed already had: the held weapon, never a fallback, the
@@ -619,6 +620,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
           ReadFrames(fj["frames"], fs.joints, path, fs.name, fs.frames, log);
         if (fj.contains("release"))
           fs.release = std::max(1, fj.value("release", fs.release));
+        if (fj.contains("chargeTwistDeg"))
+          fs.chargeTwist = fj.value("chargeTwistDeg", 0.0f) * 0.017453293f;
         rows[i][f] = (int)lib.styles.size();
         lib.styles.push_back(std::move(fs));
       }
@@ -956,11 +959,27 @@ void StrokeKeyedPose(const StrokeCursor& cur, const AttackStyle& sty, WeaponPose
     const Ease e = sty.frames[k].chase ? Ease::Linear : sty.frames[k].ease;
     t = ApplyEase(e, std::clamp((float)cur.frameTick / (float)len, 0.0f, 1.0f));
   }
+  // ---- A RE-AIMED CHARGED HOLD (ReaimChargedStroke) -------------------------
+  // The arm stood somewhere between two styles' windup ends when the mouse
+  // named a new one, and neither style's frames describe that pose: the blend
+  // is FROM THE LIVE ARM, re-taken on its first tick, to this style's windup
+  // end on QuadInOut. The cut after it starts from the live arm too, so a
+  // release mid-blend swings from where the arm actually is.
+  const bool reaimed = cur.chargeBlendTicks > 0 && !hold && cur.firstCut > 0;
+  const bool reaimHold = reaimed && k == cur.firstCut - 1;
+  const bool reaimCut = reaimed && k == cur.firstCut;
+  if (reaimHold)
+    t = ApplyEase(Ease::QuadInOut,
+                  std::clamp((float)cur.chargeBlend / (float)cur.chargeBlendTicks,
+                             0.0f, 1.0f));
   const StrokePose& to = sty.frames[k].pose;
-  const StrokePose* from = k > 0 ? &sty.frames[k - 1].pose : nullptr;
+  const StrokePose* from =
+      (k > 0 && !reaimHold && !reaimCut) ? &sty.frames[k - 1].pose : nullptr;
   WeaponPose::Keyed& K = wp.keyed;
   K.on = true;
   K.fromLive = from == nullptr;
+  K.recapture = (reaimHold && cur.chargeBlend <= 1) ||
+                (reaimCut && cur.frameTick == 0);
   K.t = t;
   for (int j = 0; j < kArmJoints; j++) {
     K.to[j] = to.joint[j];
@@ -969,7 +988,14 @@ void StrokeKeyedPose(const StrokeCursor& cur, const AttackStyle& sty, WeaponPose
   }
   if (from) aimOf(k - 1, K.aimFromYaw, K.aimFromPitch);
   aimOf(k, K.aimToYaw, K.aimToPitch);
-  const float tw0 = from ? from->twist : 0.0f, pt0 = from ? from->pitch : 0.0f;
+  float tw0 = from ? from->twist : 0.0f, pt0 = from ? from->pitch : 0.0f;
+  if (reaimHold) {
+    tw0 = cur.chargeTwist0;
+    pt0 = cur.chargePitch0;
+  } else if (reaimCut) {
+    tw0 = sty.frames[k - 1].pose.twist;
+    pt0 = sty.frames[k - 1].pose.pitch;
+  }
   wp.torsoTwist = tw0 + (to.twist - tw0) * t;
   wp.torsoPitch = pt0 + (to.pitch - pt0) * t;
 }
@@ -981,6 +1007,9 @@ WeaponPose StrokePoseNow(const StrokeCursor& cur, const AttackStyle* sty,
     wp.smooth = StrokeJointsNow(cur, *sty);
     StrokeKeyedPose(cur, *sty, wp);
   }
+  // A charged hold's extra chest turn (AttackStyle::chargeTwist), on top of
+  // whatever the frames or the driver asked for. Mirrored with the rest.
+  wp.torsoTwist += cur.chargeTwistNow;
   return wp;
 }
 
@@ -1048,6 +1077,7 @@ void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
                         float slow) {
   cur.style = styleIndex;
   cur.seed = seed;
+  cur.slow = slow;
   cur.fromPending = false;
   cur.fromTick = 0;
   const float tempo =
@@ -1257,7 +1287,10 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       const float rg = std::max(t.reachGain, 1e-4f);
       const int len = std::max(1, cur.frameTicks[k]);
       const int into = cur.frameTick;
-      if (f.chase) {
+      // PARKED at the end of a charged windup: the frame has no ticks left to
+      // spread a gap over (a re-aim just moved its pose), so close on it at
+      // the chase rate instead of in one tick.
+      if (f.chase || into >= len) {
         // CHASE: close on the pose at a capped rate (the frame's own).
         const float cap = f.chaseRate, capR = f.chaseRate * (18.0f / 16.0f);
         smp.dx = std::clamp((toAz - m.StrokeAz()) / t.aimGainX, -cap, cap);
@@ -1278,7 +1311,15 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       m.Step(smp, dt, true, right, up, fwd);
       if (cur.phase == StrokeCursor::Phase::Cut) cur.cutLeg = k - cur.firstCut;
       cur.phaseTick++;
-      if (++cur.frameTick >= len) {
+      if (cur.chargeBlend < cur.chargeBlendTicks) cur.chargeBlend++;
+      ++cur.frameTick;
+      // A CHARGED HOLD: the last windup frame is over but the button is still
+      // down, so the program parks on that frame's end pose (and keeps
+      // tracking the live aim — the commit below waits for the release).
+      if (cur.frameTick >= len && cur.holdWindup && k + 1 == cur.firstCut) {
+        cur.frameTick = len;
+        cur.charged = true;
+      } else if (cur.frameTick >= len) {
         // COMMIT at the end of the last windup frame, on that tick's aim.
         if (k + 1 == cur.firstCut) {
           cur.aimAz = liveAz;
@@ -1305,7 +1346,40 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
     default:
       return StrokeStepResult::Idle;
   }
+  // THE CHARGED HOLD'S CHEST TURN eases toward the style's while parked and
+  // back to nothing once released (a quarter of the gap per tick: ~90% in 8
+  // ticks), so neither the hold nor the release snaps the torso.
+  {
+    const float want = (sty != nullptr && cur.Holding()) ? sty->chargeTwist : 0.0f;
+    cur.chargeTwistNow += (want - cur.chargeTwistNow) * 0.25f;
+  }
   return StrokeStepResult::Live;
+}
+
+bool ReaimChargedStroke(StrokeCursor& cur, const AttackStyle& from,
+                        const AttackStyle& to, int toIndex, int blendTicks) {
+  const int toCut = std::min(to.FirstCut(), std::min((int)to.frames.size(), kMaxFrames) - 1);
+  if (toCut <= 0) return false;
+  // The torso as the rig is showing it right now — mid-blend included — is
+  // where the new blend's torso starts.
+  WeaponPose now;
+  now.release = -1.0f;
+  StrokeKeyedPose(cur, from, now);
+  const float twist0 = now.torsoTwist, pitch0 = now.torsoPitch;
+  // `to`'s program from the top (tick counts, cut window), then parked where
+  // a hold of it would be. The seed is kept so the start bow does not jump.
+  BeginStrokeProgram(cur, to, toIndex, cur.seed, 1.0f, cur.slow);
+  cur.frame = cur.firstCut - 1;
+  cur.frameTick = cur.frameTicks[cur.frame];
+  cur.phase = StrokeCursor::Phase::Windup;
+  cur.phaseTick = cur.windupTicks;
+  cur.holdWindup = true;
+  cur.charged = true;
+  cur.chargeBlend = 0;
+  cur.chargeBlendTicks = std::max(1, blendTicks);
+  cur.chargeTwist0 = twist0;
+  cur.chargePitch0 = pitch0;
+  return true;
 }
 
 int PickAttackStyle(const StyleLibrary& lib,

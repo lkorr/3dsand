@@ -1917,6 +1917,19 @@ TP_I(melee, sweepMaxSteps, NO_WGSL, 24, 1, 64)
 // early start with no speed-up; leeway 0 allows exactly opposite only.
 TP_F(melee, chainWindupRate, NO_WGSL, 2.0f, 1.0f, 8.0f)
 TP_I(melee, chainSectorLeeway, NO_WGSL, 1, 0, 4)
+// A CHARGED STRIKE (session.cpp, strokes.h StrokeCursor::holdWindup). Held
+// past its windup, a player strike parks at the windup's end until the button
+// is released and then lands chargeDamage times harder (every hp in the
+// weapon's strike profile). While held, a flick names another stroke and the
+// arm re-aims to that one's windup end over chargeBlendTicks ticks (QuadInOut).
+TP_F(melee, chargeDamage, NO_WGSL, 1.5f, 1.0f, 5.0f)
+TP_I(melee, chargeBlendTicks, NO_WGSL, 15, 1, 60)
+// A RE-AIM IS A FLICK, NOT A TURN (strike_pick.h Feed). While a charged
+// strike is held, a mouse motion re-aims it only if it is over within
+// chargeFlickTicks ticks and moved at most chargeFlickPx pixels; a longer or
+// bigger one is the camera turning and leaves the held strike alone.
+TP_I(melee, chargeFlickTicks, NO_WGSL, 8, 1, 30)
+TP_F(melee, chargeFlickPx, NO_WGSL, 240.0f, 10.0f, 5000.0f)
 // AN INJURED ARM (dual wielding; Mob::HandCondition, the weakest hp fraction
 // of the arm chain and hand). Below injuredArmFrom a stroke that arm throws
 // is stretched in tempo, up to 1 + injuredArmSlow times as long as the arm

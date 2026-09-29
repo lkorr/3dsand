@@ -2074,6 +2074,16 @@ struct Tuning {
     float chainWindupRate = TPD(melee, chainWindupRate);
     // compass steps either side of dead opposite that still chain
     int chainSectorLeeway = TPD(melee, chainSectorLeeway);
+    // a strike held past its windup parks there and, released, lands this
+    //   many times harder (session.cpp charged strike)
+    float chargeDamage = TPD(melee, chargeDamage);
+    // ticks a held strike takes to re-aim to another stroke's windup end
+    int chargeBlendTicks = TPD(melee, chargeBlendTicks);
+    // a held strike re-aims only on a FLICK: a mouse motion over within this
+    //   many ticks and at most chargeFlickPx pixels; longer or bigger is a
+    //   camera turn and leaves the held strike alone (strike_pick.h Feed)
+    int chargeFlickTicks = TPD(melee, chargeFlickTicks);
+    float chargeFlickPx = TPD(melee, chargeFlickPx);
     // AN INJURED ARM (Mob::HandCondition: the arm chain's weakest hp
     //   fraction). Below `injuredArmFrom` its strokes slow, up to
     //   1 + `injuredArmSlow` times as long; below `injuredArmDrop` the

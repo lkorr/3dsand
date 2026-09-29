@@ -161,6 +161,9 @@ const char* const kOrder[] = {
     // that parsed and then ran as a straight line. Its styles are built in
     // memory and its loader probe is a temp file — milliseconds, no world.
     "cut-path",
+    // ...and `charged-strike`: the held strike's park, re-aim blend and
+    // release, on the same runner and the same in-memory footing.
+    "charged-strike",
     // AND WITH THEM: `tick-input` is Player alone over a synthetic ground
     // lambda — no world, no GPU, no assets — and it asserts that the
     // controller's trajectory is a function of the COMMAND STREAM and not of

@@ -64,6 +64,7 @@
 #include "game/avatar.h"
 #include "game/melee.h"
 #include "game/player.h"
+#include "game/strike_pick.h"
 #include "game/strokes.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -3662,6 +3663,277 @@ Status GateCutPath(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- charged-strike: THE HELD STRIKE ON THE RUNNER ITSELF -------------------
+//
+// The player's charged strike (session.cpp, strokes.h StrokeCursor::
+// holdWindup) is three claims about the stroke runner, asserted here on the
+// shipped library with no world and no rig, through the same two calls the
+// session makes (StepStrokeProgram, then StrokePoseNow):
+//   1. held, the program PARKS at its last windup frame's end — for as long as
+//      the button is down — and latches `charged`; unheld it never does;
+//   2. a re-aim (ReaimChargedStroke) blends from the live arm to the new
+//      style's windup end over exactly chargeBlendTicks on QuadInOut, a
+//      re-aim mid-blend re-takes the live arm, and a style with no windup is
+//      refused;
+//   3. released, the cut starts on the next tick, from the live arm, and the
+//      stroke still finishes.
+Status GateChargedStrike(Ctx& c, std::string& detail) {
+  (void)c;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("charged-strike: FAILED %s\n", what.c_str());
+    }
+  };
+  StyleLibrary lib;
+  std::string log;
+  if (!LoadAttackStyles(AssetDir() + "/mobs/attack_styles.json", lib, log) ||
+      lib.empty()) {
+    detail = "attack_styles.json did not load";
+    std::printf("charged-strike: SKIP (%s)\n%s", detail.c_str(), log.c_str());
+    return Status::Skip;
+  }
+  const int iA = lib.Find("horizontal_r"), iB = lib.Find("diag_tr_bl"),
+            iC = lib.Find("overhead");
+  if (iA < 0 || iB < 0 || iC < 0) {
+    detail = "compass styles missing";
+    std::printf("charged-strike: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const AttackStyle &A = lib.styles[iA], &B = lib.styles[iB], &C = lib.styles[iC];
+  const float dt = 1.0f / 30.0f;
+  const int blend = 15;
+  auto fresh = [&](MeleeState& m) {
+    m = MeleeState{};
+    ApplyMeleeTuning(m.tuning);
+    m.SetStroke(Vec3{-0.4f, -3.0f, -0.3f}, Vec3{-0.4f, 2.5f, -0.3f},
+                Vec3{0, 0, 1}, kRestReach);
+    m.SetHandSign(1.0f);
+  };
+  auto step = [&](StrokeCursor& cur, const AttackStyle& sty, MeleeState& m) {
+    const StrokeStepResult r =
+        StepStrokeProgram(cur, &sty, m, 0.0f, 0.0f, 0.0f, dt, kRight, kUp, kFwd);
+    return std::make_pair(r, StrokePoseNow(cur, &sty, m));
+  };
+  auto sameQuat = [](const Quat& a, const Quat& b) {
+    return std::fabs(a.x - b.x) + std::fabs(a.y - b.y) + std::fabs(a.z - b.z) +
+               std::fabs(a.w - b.w) < 1e-5f;
+  };
+  auto atWindupEnd = [&](const WeaponPose& wp, const AttackStyle& sty) {
+    const StrokePose& p = sty.frames[sty.FirstCut() - 1].pose;
+    return wp.keyed.on && wp.keyed.t > 0.9999f &&
+           sameQuat(wp.keyed.to[kArmShoulder], p.joint[kArmShoulder]) &&
+           sameQuat(wp.keyed.to[kArmElbow], p.joint[kArmElbow]);
+  };
+
+  // ---- P. THE TWO READS OF ONE PICKER (strike_pick.h) ---------------------
+  // A normal click reads the LIVE flick, gone once the mouse settles; a
+  // charged hold reads the REMEMBERED one, which only a short FLICK sets — a
+  // long or big motion is a camera turn and leaves it alone — and which the
+  // press re-seeds.
+  {
+    const float minSp = 250.0f;
+    const int fT = 8;
+    const float fPx = 240.0f;
+    StrikePicker pk;
+    auto feed = [&](int n, float dx, float dy) {
+      for (int i = 0; i < n; i++) pk.Feed(dx, dy, dt, minSp, fT, fPx);
+    };
+    float fx = 0, fy = 0;
+    check(!pk.Pick(minSp, fx, fy) && !pk.Remembered(fx, fy),
+          "a fresh picker has no direction");
+    feed(3, 0.0f, -40.0f);   // a flick up: 0.1 s, 120 px
+    feed(20, 0.0f, 0.0f);
+    check(!pk.Pick(minSp, fx, fy), "live: a settled mouse has no flick (click alternates)");
+    check(pk.Remembered(fx, fy) && fy < -0.99f && pk.lastGestureFlick,
+          Format("remembered: the flick up survives 20 still ticks (%.2f, %.2f)", fx, fy));
+    feed(20, 0.3f, 0.0f);    // 9 px/s drift
+    check(pk.Remembered(fx, fy) && fy < -0.99f,
+          "remembered: a slow drift under the bar does not move it");
+    feed(20, 40.0f, 0.0f);   // a camera turn right: 0.67 s, 800 px
+    feed(20, 0.0f, 0.0f);
+    check(pk.Remembered(fx, fy) && fy < -0.99f && !pk.lastGestureFlick,
+          Format("a long turn right is a TURN: the held side stays (%.2f, %.2f)", fx, fy));
+    feed(3, 200.0f, 0.0f);   // a snap turn: short but 600 px
+    feed(20, 0.0f, 0.0f);
+    check(pk.Remembered(fx, fy) && fy < -0.99f && !pk.lastGestureFlick,
+          "a short but huge snap is a TURN too");
+    feed(3, 40.0f, 0.0f);    // a flick right
+    feed(20, 0.0f, 0.0f);
+    check(pk.Remembered(fx, fy) && fx > 0.99f,
+          Format("a flick right re-aims (%.2f, %.2f)", fx, fy));
+    // A press lands mid-flick: the flick's tail curls another way before it
+    // stops, and the hold must still start where the press pointed.
+    feed(2, 0.0f, 40.0f);                 // flicking down...
+    pk.Seed(true, 0.0f, 1.0f);            // ...the click, pointing down
+    feed(3, 60.0f, 0.0f);                 // the tail swings right
+    feed(20, 0.0f, 0.0f);
+    check(pk.Remembered(fx, fy) && fy > 0.99f,
+          Format("the motion a press landed in is the press's (%.2f, %.2f)", fx, fy));
+    feed(3, 40.0f, 0.0f);                 // the NEXT flick still re-aims
+    feed(20, 0.0f, 0.0f);
+    check(pk.Remembered(fx, fy) && fx > 0.99f, "the next flick after it re-aims");
+    pk.Seed(false, 0.0f, 0.0f);
+    check(!pk.Remembered(fx, fy), "a neutral press clears it");
+    pk.Seed(true, 0.0f, 1.0f);
+    check(pk.Remembered(fx, fy) && fy > 0.99f, "a flicked press seeds it");
+  }
+
+  // ---- T. THE HOLD'S CHEST TURN (AttackStyle::chargeTwist) ---------------
+  // A style authoring `chargeTwistDeg` turns the torso that much further
+  // while parked — eased in, never a step — and hands it back after release.
+  if (const int iL = lib.Find("horizontal_l"); iL >= 0 &&
+                                               lib.styles[iL].chargeTwist != 0.0f) {
+    const AttackStyle& L = lib.styles[iL];
+    MeleeState ml;
+    fresh(ml);
+    StrokeCursor cl;
+    BeginStrokeProgram(cl, L, iL, 7u);
+    float prev = 0.0f, worstStep = 0.0f;
+    for (int i = 0; i < cl.windupTicks + 30; i++) {
+      cl.holdWindup = true;
+      step(cl, L, ml);
+      worstStep = std::max(worstStep, std::fabs(cl.chargeTwistNow - prev));
+      prev = cl.chargeTwistNow;
+    }
+    const float want = L.chargeTwist;
+    check(std::fabs(cl.chargeTwistNow - want) < 0.02f,
+          Format("held horizontal_l turns the chest %.1f deg (want %.1f)",
+                 cl.chargeTwistNow * 57.2958f, want * 57.2958f));
+    check(worstStep <= std::fabs(want) * 0.26f,
+          Format("the chest turn eases in (worst step %.2f deg)", worstStep * 57.2958f));
+    const WeaponPose held = StrokePoseNow(cl, &L, ml);
+    WeaponPose bare = ml.Pose();
+    StrokeKeyedPose(cl, L, bare);
+    check(std::fabs(held.torsoTwist - (bare.torsoTwist + cl.chargeTwistNow)) < 1e-5f,
+          "the turn rides on top of the frames' own twist");
+    cl.holdWindup = false;
+    for (int i = 0; i < 14; i++) step(cl, L, ml);
+    check(std::fabs(cl.chargeTwistNow) < std::fabs(want) * 0.05f,
+          Format("released, the turn hands back (%.2f deg left)",
+                 cl.chargeTwistNow * 57.2958f));
+  } else {
+    check(false, "horizontal_l authors a chargeTwistDeg");
+  }
+
+  // ---- 0. the control: unheld, the cut starts when the windup ends --------
+  {
+    MeleeState m;
+    fresh(m);
+    StrokeCursor cur;
+    BeginStrokeProgram(cur, A, iA, 7u);
+    int cutAt = -1;
+    for (int i = 0; i < 200 && cutAt < 0; i++) {
+      step(cur, A, m);
+      if (cur.Cutting()) cutAt = i + 1;
+    }
+    check(cutAt == cur.windupTicks,
+          Format("unheld cut begins at tick %d, want the windup's %d", cutAt,
+                 cur.windupTicks));
+    check(!cur.charged, "an unheld strike is not charged");
+  }
+
+  MeleeState m;
+  fresh(m);
+  StrokeCursor cur;
+  BeginStrokeProgram(cur, A, iA, 7u);
+  const int windA = cur.windupTicks;
+  // ---- 1. held: parked, as long as the button is down -----------------------
+  bool parkedAll = true, poseAll = true;
+  for (int i = 0; i < windA + 30; i++) {
+    cur.holdWindup = true;
+    const auto [r, wp] = step(cur, A, m);
+    if (i + 1 >= windA) {
+      parkedAll = parkedAll && cur.Holding() && r == StrokeStepResult::Live;
+      poseAll = poseAll && atWindupEnd(wp, A);
+    }
+  }
+  check(parkedAll, "held past the windup, the program stays parked");
+  check(poseAll, "parked, the arm is the last windup frame's end pose");
+  check(cur.charged, "reaching the hold latches `charged`");
+
+  // ---- 2. re-aim: QuadInOut over `blend`, from the live arm ---------------
+  check(ReaimChargedStroke(cur, A, B, iB, blend), "re-aim A->B accepted");
+  check(cur.style == iB && cur.Holding() && cur.charged,
+        "after the re-aim the cursor holds B, still charged");
+  std::vector<float> ts;
+  bool toB = true, live = true;
+  int recaptures = 0;
+  for (int i = 0; i < blend + 5; i++) {
+    cur.holdWindup = true;
+    const auto [r, wp] = step(cur, B, m);
+    (void)r;
+    ts.push_back(wp.keyed.t);
+    live = live && wp.keyed.fromLive;
+    recaptures += wp.keyed.recapture ? 1 : 0;
+    const StrokePose& p = B.frames[B.FirstCut() - 1].pose;
+    toB = toB && sameQuat(wp.keyed.to[kArmShoulder], p.joint[kArmShoulder]);
+  }
+  check(toB, "the re-aim blends TO B's windup end");
+  check(live && recaptures == 1,
+        Format("the blend is from the live arm, taken once (%d)", recaptures));
+  bool mono = true;
+  for (size_t i = 1; i < ts.size(); i++) mono = mono && ts[i] >= ts[i - 1];
+  check(mono, "the blend never goes backward");
+  check(std::fabs(ts[blend - 1] - 1.0f) < 1e-5f && ts[blend - 2] < 1.0f,
+        Format("the blend arrives on tick %d exactly (t %.3f, %.3f)", blend,
+               ts[blend - 2], ts[blend - 1]));
+  const float first = ts[0], mid = ts[blend / 2] - ts[blend / 2 - 1],
+              last = ts[blend - 1] - ts[blend - 2];
+  check(std::fabs(first - ApplyEase(Ease::QuadInOut, 1.0f / blend)) < 1e-5f,
+        Format("first tick is QuadInOut(1/%d) (%.4f)", blend, first));
+  check(mid > 2.0f * first && mid > 2.0f * last,
+        Format("eased in AND out: steps %.3f .. %.3f .. %.3f", first, mid, last));
+
+  // ...a re-aim mid-blend re-takes the live arm at once.
+  check(ReaimChargedStroke(cur, B, C, iC, blend), "re-aim B->C accepted");
+  for (int i = 0; i < 5; i++) {
+    cur.holdWindup = true;
+    step(cur, C, m);
+  }
+  check(ReaimChargedStroke(cur, C, A, iA, blend), "re-aim mid-blend accepted");
+  {
+    cur.holdWindup = true;
+    const auto [r, wp] = step(cur, A, m);
+    (void)r;
+    check(wp.keyed.recapture && wp.keyed.t < 0.05f,
+          Format("a re-aim mid-blend restarts from the live arm (t %.3f)",
+                 wp.keyed.t));
+  }
+  // ...and a style with no windup has nothing to hold.
+  {
+    AttackStyle noWind = B;
+    noWind.frames[0].cuts = true;
+    StrokeCursor probe = cur;
+    check(!ReaimChargedStroke(probe, A, noWind, iB, blend) &&
+              probe.style == cur.style,
+          "a style whose first frame cuts is refused, cursor untouched");
+  }
+
+  // ---- 3. release: the cut starts next tick, from the live arm -----------
+  {
+    cur.holdWindup = false;
+    const auto [r, wp] = step(cur, A, m);
+    (void)r;
+    check(cur.Cutting(), "released, the cut starts on the next tick");
+    check(wp.keyed.fromLive && wp.keyed.recapture,
+          "the cut after a re-aim starts from the live arm");
+    check(cur.charged, "the cut is a charged one");
+    int left = 0;
+    StrokeStepResult rr = StrokeStepResult::Live;
+    while (rr != StrokeStepResult::Finished && left++ < 300)
+      rr = step(cur, A, m).first;
+    check(rr == StrokeStepResult::Finished, "the charged stroke finishes");
+  }
+
+  detail = Format("%d checks", checks);
+  std::printf("charged-strike: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SwingGates() {
@@ -3678,6 +3950,9 @@ const std::vector<Gate>& SwingGates() {
       // spellings. Same shape as the two above — its own in-memory styles, one
       // temp file, no world — so it sits with them in kOrder.
       {"cut-path", "player", {}, false, GateCutPath},
+      // The player's CHARGED strike on the runner: the hold, the re-aim
+      // blend, the release. Same footing as the three above.
+      {"charged-strike", "player", {}, false, GateChargedStrike},
       // The opposite: the whole pipeline, on real terrain, against a real body.
       // Expensive, so it runs LATE in kOrder with the other world-touching
       // gates and regenerates worldgen on the way out (CLAUDE.md rule 7).

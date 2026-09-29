@@ -296,6 +296,20 @@ struct UIState {
   float strikeLastAge = 1e9f;   // seconds since that press
   uint32_t strikeLastSerial = 0;  // main.cpp's edge detector on the press
   std::string strikeNowText;    // running strike: name, phase, frame
+  // ---- ...AND THE CHARGED STRIKE on the same compass ----------------------
+  // `strikeCharging`: a strike is parked at the end of its windup
+  // (StrokeCursor::Holding). `strikeCharged`: the running strike is a charged
+  // one (held, or its release still cutting). While charging the compass
+  // shows the HELD sector, the remembered flick it re-aims to
+  // (strike_pick.h Remembered; `strikeMemValid` false = none since the
+  // press), and the re-aim slide's progress 0..1 (1 = arrived).
+  bool strikeCharging = false;
+  bool strikeCharged = false;
+  int strikeHeldSector = -1;
+  bool strikeMemValid = false;
+  float strikeMemX = 0, strikeMemY = 0;
+  float strikeBlend = 1.0f;
+  float strikeChargeMul = 1.5f;
 
   // Ledge-grab readout (dev panel). main.cpp composes the text from the
   // player's per-frame probe so a refused grab says WHICH latch gate refused;

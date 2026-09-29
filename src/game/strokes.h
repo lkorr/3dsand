@@ -653,6 +653,13 @@ struct AttackStyle {
   // claim still wins on the arm. A name no rig knows is a loud loader line,
   // not a crash: PlayClip no-ops on a miss.
   std::string clip;
+  // EXTRA TORSO TWIST WHILE A CHARGED HOLD OF THIS STYLE IS PARKED (radians,
+  // + toward the wielder's right like StrokePose::twist; authored in degrees
+  // as `chargeTwistDeg`, per style or per form). The windup end is authored
+  // for a quick strike; held with the head turned hard toward the weapon it
+  // can lay the arm through the other one, and turning the chest with it is
+  // the fix. Eased in while parked and out after (StrokeCursor::chargeTwistNow).
+  float chargeTwist = 0.0f;
   // THE WEAPON FORM this copy is ("short" / "long" / "blunt"), "" for the
   // style itself. Set only on the copies the loader makes from `forms`.
   std::string form;
@@ -872,6 +879,35 @@ struct StrokeCursor {
   // and its pose is reflected on the way to the rig (MirrorWeaponPose).
   Hand hand = Hand::Right;
   bool mirrored = false;
+
+  // ---- A CHARGED STRIKE (the player's held button, session.cpp) ----------
+  // `holdWindup` is the CALLER's, set every tick before StepStrokeProgram:
+  // while true the program does not leave its last windup frame, and the arm
+  // stays at that frame's end pose. Reaching the hold latches `charged`, which
+  // the caller reads as "this swing lands harder" (melee.chargeDamage). A
+  // style whose first frame already cuts has no windup to hold and never
+  // charges.
+  bool holdWindup = false;
+  bool charged = false;
+  // THE RE-AIM BLEND (ReaimChargedStroke): ticks into it, and its length;
+  // 0 length = no blend running. The arm goes from where it stood at the
+  // re-aim to the new style's windup end on QuadInOut; the torso from
+  // `chargeTwist0`/`chargePitch0`.
+  int chargeBlend = 0;
+  int chargeBlendTicks = 0;
+  float chargeTwist0 = 0.0f, chargePitch0 = 0.0f;
+  // The style's `chargeTwist` as applied right now: eased toward it while
+  // parked, toward 0 otherwise (StepStrokeProgram), added to the torso by
+  // StrokePoseNow. Carried across a re-aim so a change of style never snaps.
+  float chargeTwistNow = 0.0f;
+  // A mirrored cursor's frames are authored-side; the slow a re-aim re-begins
+  // with is the one the swing began with (an injured arm stays slow).
+  float slow = 1.0f;
+  // Is the hold reached (the program parked at the end of its windup)?
+  bool Holding() const {
+    return holdWindup && phase == Phase::Windup && firstCut > 0 &&
+           frame == firstCut - 1 && frameTick >= frameTicks[frame];
+  }
 
   bool Active() const { return phase != Phase::Idle; }
   bool Cutting() const { return phase == Phase::Cut; }
@@ -1103,6 +1139,16 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
                                    MeleeState& m, float liveAz, float liveEl,
                                    float liveDist, float dt, const Vec3& right,
                                    const Vec3& up, const Vec3& fwd);
+
+// RE-AIM A CHARGED HOLD (the player's charged strike): the cursor, parked at
+// the end of `from`'s windup (StrokeCursor::Holding), becomes `to`'s program
+// parked at the end of ITS windup, and the arm blends there from wherever it
+// stands over `blendTicks` ticks on QuadInOut (a re-aim mid-blend starts a
+// fresh blend from the in-between pose, so it never snaps). Keeps the hand,
+// the mirror, the seed and the charge. Refuses (false, cursor untouched) a
+// `to` with no windup to hold.
+bool ReaimChargedStroke(StrokeCursor& cur, const AttackStyle& from,
+                        const AttackStyle& to, int toIndex, int blendTicks);
 
 // An authored reach offset -> a radius the arm can actually serve. Public
 // because the gates state their expectations in the same band positions the

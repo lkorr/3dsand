@@ -913,6 +913,7 @@
     {
       "name": "horizontal_l",
       "label": "Backhand cut, across to weapon side",
+      "chargeTwistDeg": -20,
       "jitter": {
         "az": 0.1,
         "el": 0.04,

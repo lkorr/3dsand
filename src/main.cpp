@@ -12965,10 +12965,11 @@ int main(int argc, char** argv) {
       // Debug readout while a weapon is in hand: the same map the press reads
       // (strokes.h PlayerCompass), the picker's live velocity, and what the
       // last press resolved to. Render-only; nothing here feeds the tick.
-      ui.strikeCompass = meleeArmed && avatar.Spawned();
+      // Fists too: the unarmed compass charges exactly as a weapon's does.
+      ui.strikeCompass = meleeReady && avatar.Spawned();
       if (ui.strikeCompass) {
         const StyleLibrary& lib = mobs.AttackStyles();
-        const PlayerStrikeMap& map = PlayerCompass(lib, true);
+        const PlayerStrikeMap& map = PlayerCompass(lib, meleeArmed);
         auto baseName = [&](int si) -> std::string {
           const AttackStyle* st = lib.At(si);
           if (!st) return "?";
@@ -13041,6 +13042,26 @@ int main(int argc, char** argv) {
         } else {
           ui.strikeLastAge += dt;
         }
+        // ---- THE CHARGED STRIKE (strokes.h StrokeCursor::holdWindup) -------
+        // Which sector the HELD strike is (the base style the hold now
+        // names, which a re-aim changes), the remembered flick it re-aims to,
+        // and how far the re-aim slide has got.
+        ui.strikeCharging = playerStrike.Holding();
+        ui.strikeCharged = playerStrike.Active() && playerStrike.charged;
+        ui.strikeChargeMul = CurrentTuning().melee.chargeDamage;
+        ui.strikeMemValid = pk.Remembered(ui.strikeMemX, ui.strikeMemY);
+        ui.strikeHeldSector =
+            ui.strikeCharged
+                ? sectorOf(session.strikeBase,
+                           ui.strikeMemValid ? ui.strikeMemX : 1.0f,
+                           ui.strikeMemValid ? ui.strikeMemY : 0.0f)
+                : -1;
+        ui.strikeBlend =
+            playerStrike.chargeBlendTicks > 0
+                ? std::clamp((float)playerStrike.chargeBlend /
+                                 (float)playerStrike.chargeBlendTicks,
+                             0.0f, 1.0f)
+                : 1.0f;
         ui.strikeNowText.clear();
         if (playerStrike.Active()) {
           if (const AttackStyle* sty = lib.At(playerStrike.style)) {

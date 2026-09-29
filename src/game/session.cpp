@@ -757,6 +757,26 @@ static inline uint32_t OpLandingTick(const TickAuthorityCtx& w, uint32_t tick) {
   return tick + (w.opsync ? w.opsync->Delay() : 0u);
 }
 
+// THE FLICK -> A COMPASS STYLE FOR THIS HAND, -1 when the flick names none.
+// A MIRRORED STROKE TRAVELS THE MIRROR OF ITS SECTOR (strokes.h "THE LEFT HAND
+// IS THE RIGHT, MIRRORED"): the left hand swinging a right-authored style
+// reflects it through the body, so the sector the flick named would cut the
+// OTHER way across the screen. Pick with the flick reflected instead, so the
+// blade goes where the mouse went — kept only if that pick is mirrored too
+// (the unarmed compass has native left-side punches). The press and the
+// charged hold's re-aim both ask this, so they can never disagree.
+static int FlickStyleFor(const StyleLibrary& lib, const PlayerStrikeMap& map,
+                         Hand hand, float fx, float fy) {
+  int si = QuantizeStrike(map, fx, fy);
+  const AttackStyle* raw = lib.At(si);
+  if (raw && StrokeMirrored(*raw, hand)) {
+    const int ri = QuantizeStrike(map, -fx, fy);
+    const AttackStyle* refl = lib.At(ri);
+    if (refl && StrokeMirrored(*refl, hand)) si = ri;
+  }
+  return si;
+}
+
 // ---- PHASE A (PLAYER) - the controller, the look delta and the strike quantize
 // Verbatim from the single-body TickAuthority, lines 246-361 at 54fe241.
 static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
@@ -896,7 +916,13 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
       // feeding it the mouse as well would bend every authored cut (D10 of the
       // discrete-strikes plan — the freeform mode that did is gone).
       {
-        strikePicker.Feed(ti.lookDx, ti.lookDy, kTickDt);
+        // ...and it LATCHES the remembered direction (strike_pick.h) that a
+        // CHARGED hold re-aims to; a normal press still reads the live flick.
+        // On the tick clock, from the command, like the rest.
+        strikePicker.Feed(ti.lookDx, ti.lookDy, kTickDt,
+                          CurrentTuning().melee.pickMinSpeed,
+                          CurrentTuning().melee.chargeFlickTicks,
+                          CurrentTuning().melee.chargeFlickPx);
         // DISCRETE STRIKES: the click is the whole input, and the flick is
         // read at the tick that consumes the press edge — the freshest read
         // available, since the delta above is every pixel moved since the
@@ -921,23 +947,7 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
           int si = -1;
           const bool flicked =
               strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy);
-          if (flicked) {
-            si = QuantizeStrike(map, fx, fy);
-            // A MIRRORED STROKE TRAVELS THE MIRROR OF ITS SECTOR (strokes.h
-            // "THE LEFT HAND IS THE RIGHT, MIRRORED"): the left hand swinging
-            // a right-authored style reflects it through the body, so the
-            // sector the flick named would cut the OTHER way across the
-            // screen. Pick with the flick reflected instead, so the blade
-            // goes where the mouse went — kept only if that pick is mirrored
-            // too (the unarmed compass has native left-side punches).
-            const StyleLibrary& lib = mobs.AttackStyles();
-            const AttackStyle* raw = lib.At(si);
-            if (raw && StrokeMirrored(*raw, ph)) {
-              const int ri = QuantizeStrike(map, -fx, fy);
-              const AttackStyle* refl = lib.At(ri);
-              if (refl && StrokeMirrored(*refl, ph)) si = ri;
-            }
-          }
+          if (flicked) si = FlickStyleFor(mobs.AttackStyles(), map, ph, fx, fy);
           if (si < 0) {
             // No flick after a SHORT BLADE'S STAB (the compass's
             // `clickRepeat`): stab again with the hand that stabbed, and it
@@ -960,6 +970,10 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
             s.strikeQueuedHand = ph;
             s.lastHand = ph;
           }
+          // A hold of this strike starts from what it threw (strike_pick.h
+          // Seed): a neutral click remembers nothing, so it re-aims only on
+          // a flick made while held.
+          strikePicker.Seed(flicked, fx, fy);
           s.lastStrikePick.style = si;
           s.lastStrikePick.fx = fx;
           s.lastStrikePick.fy = fy;
@@ -3152,6 +3166,44 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               // its sword between the press and this tick): gone, not banked.
               strikeQueued = -1;
             }
+            // ---- A CHARGED STRIKE (strokes.h StrokeCursor::holdWindup) ------
+            // The strike's own button still down at the end of its windup
+            // parks the arm there; letting go throws the cut, harder
+            // (melee.chargeDamage, applied at the sweep below). While parked,
+            // a flick names a stroke exactly as a press would, and the arm
+            // moves over to THAT stroke's windup end (ReaimChargedStroke), so
+            // sweeping the mouse from a right horizontal to a diagonal slides
+            // the held weapon between the two. The aim keeps tracking the
+            // crosshair until the release commits it, as a windup's does.
+            if (playerStrike.Active()) {
+              const Hand ch = playerStrike.hand;
+              playerStrike.holdWindup = ti.Held(ch == Hand::Left ? TB_ALT : TB_ATTACK);
+              float fx = 0, fy = 0;
+              if (playerStrike.Holding() && strikePicker.Remembered(fx, fy)) {
+                const StyleLibrary& lib = mobs.AttackStyles();
+                const PlayerStrikeMap& map = PlayerCompass(lib, hands[ch].weapon);
+                const int base = FlickStyleFor(lib, map, ch, fx, fy);
+                const ItemDef* cItem = hands[ch].weapon ? hands[ch].item : nullptr;
+                const int formed = lib.ResolveForm(base, FormForItem(cItem));
+                const AttackStyle* was = lib.At(playerStrike.style);
+                const AttackStyle* next = lib.At(formed);
+                // Only a stroke the SAME arm, the same part and the same
+                // basis can swing: anything else would need a new take-over,
+                // and a hold is not the place for one.
+                if (base >= 0 && base != strikeBase && was && next &&
+                    next->weapon == was->weapon &&
+                    StrokeMirrored(*next, ch) == playerStrike.mirrored &&
+                    ReaimChargedStroke(playerStrike, *was, *next, formed,
+                                       chainT.chargeBlendTicks)) {
+                  strikeBase = base;
+                  s.lastStrikePick.style = base;
+                  s.lastStrikePick.fx = fx;
+                  s.lastStrikePick.fy = fy;
+                  s.lastStrikePick.flicked = true;
+                  s.lastStrikePick.serial++;
+                }
+              }
+            }
             bool stepped = false;
             if (playerStrike.Active()) {
               const AttackStyle* sty = mobs.AttackStyles().At(playerStrike.style);
@@ -4342,6 +4394,17 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
               const auto& goreT = CurrentTuning().gore;
               sw.heft = heldItem->HeftFactor(goreT.woundHeftRef,
                                              goreT.woundHeftMax);
+            }
+            // A CHARGED STRIKE (held past its windup) lands harder: every hp
+            // of the profile, so a charged mace and a charged sword are each
+            // their own blow, stronger. The haft sweep copies `sw`, so it is
+            // charged too. `power` (tip speed x edge) is untouched: the swing
+            // is the same swing.
+            if (playerStrike.charged) {
+              const float cm = CurrentTuning().melee.chargeDamage;
+              sw.strike.cut *= cm;
+              sw.strike.blunt *= cm;
+              sw.strike.bite *= cm;
             }
             sw.tick = tick;
             // BLUNT AND BITE ARE IMPULSES (melee.h EdgeSweep::struck). The

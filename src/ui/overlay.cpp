@@ -272,10 +272,17 @@ void Overlay::DrawHUD(const UIState& s) {
       s.manaReserved > 0 ? s.manaMax : -1);
 
   // ---- the strike compass, right of the bars (UIState::strikeCompass) -------
-  // A debug readout: the flick map's spokes, the live flick against the pick
-  // threshold (the inner ring), the spoke a press would take NOW (gold), the
-  // spoke the last press took (ember, fading), and two lines naming the last
-  // strike and where the running one is.
+  // The flick map's spokes, the live flick against the pick threshold (the
+  // inner ring), the spoke a press would take NOW (gold), the spoke the last
+  // press took (ember, fading), and two lines naming the last strike and
+  // where the running one is.
+  //
+  // ...AND THE CHARGED STRIKE. Holding the button past the windup turns the
+  // box ember: the HELD spoke is drawn ember and grows to full length as the
+  // arm slides onto it (a re-aim restarts it short), the remembered flick it
+  // re-aims to is a hollow square on the rim, the centre fills, and the first
+  // readout line says what a release does. The charged cut keeps the ember
+  // spoke until the stroke ends.
   if (s.strikeCompass) {
     const float S = 116.0f;
     const float bx = std::floor(x + w + 14.0f);
@@ -286,7 +293,9 @@ void Overlay::DrawHUD(const UIState& s) {
     d->AddRectFilled(ImVec2(bx - 2, by - 2), ImVec2(bx + S + 2, by + S + 2),
                      IM_COL32(0, 0, 0, 110));
     d->AddRectFilled(ImVec2(bx, by), ImVec2(bx + S, by + S), IM_COL32(18, 20, 28, 200));
-    d->AddRect(ImVec2(bx, by), ImVec2(bx + S, by + S), ui::ColBronze(), 0.0f, 0, 2.0f);
+    d->AddRect(ImVec2(bx, by), ImVec2(bx + S, by + S),
+               s.strikeCharging ? ui::ColEmber() : ui::ColBronze(), 0.0f, 0,
+               s.strikeCharging ? 3.0f : 2.0f);
     d->AddCircle(c, r0, IM_COL32(255, 255, 255, 50), 20, 1.0f);
     const float lastA = std::clamp(1.0f - s.strikeLastAge / 3.0f, 0.0f, 1.0f);
     // "horizontal_r" -> "hor_r": every word cut to three.
@@ -312,11 +321,24 @@ void Overlay::DrawHUD(const UIState& s) {
         col = ui::Mix(col, ui::ColEmber(), lastA);
         thick = 4.0f;
       }
-      if (k == s.strikeHover) {
+      if (k == s.strikeHover && !s.strikeCharged) {
         col = ui::ColGoldHi();
         thick = 4.0f;
       }
-      d->AddLine(c, tip, col, thick);
+      if (k == s.strikeHeldSector) {
+        // The held (or charged-and-cutting) strike: a dim full-length guide
+        // with the ember spoke over it, as long as the slide is far along.
+        d->AddLine(c, tip, ui::Fade(ui::ColEmber(), 0.35f), 5.0f);
+        const float grow = 0.30f + 0.70f * s.strikeBlend;
+        const ImVec2 gt(std::floor(c.x + sec.x * R * 0.55f * grow),
+                        std::floor(c.y + sec.y * R * 0.55f * grow));
+        d->AddLine(c, gt, ui::ColEmber(), 5.0f);
+        d->AddRectFilled(ImVec2(gt.x - 3, gt.y - 3), ImVec2(gt.x + 3, gt.y + 3),
+                         ui::ColEmber());
+        col = ui::ColEmber();   // the label below takes the colour
+      } else {
+        d->AddLine(c, tip, col, thick);
+      }
       const std::string lab = shortName(sec.name);
       const ImVec2 ts = ImGui::CalcTextSize(lab.c_str());
       const ImVec2 lc(c.x + sec.x * R * 0.80f, c.y + sec.y * R * 0.80f);
@@ -341,16 +363,35 @@ void Overlay::DrawHUD(const UIState& s) {
       d->AddRectFilled(ImVec2(lp.x - 3, lp.y - 3), ImVec2(lp.x + 3, lp.y + 3),
                        ui::Fade(ui::ColEmber(), lastA));
     }
-    d->AddRectFilled(ImVec2(c.x - 2, c.y - 2), ImVec2(c.x + 2, c.y + 2), ui::ColParch());
+    // The remembered flick a charged hold re-aims to: a hollow square on the
+    // rim (only while holding — a normal click never reads it).
+    if (s.strikeCharging && s.strikeMemValid) {
+      const ImVec2 mp(std::floor(c.x + s.strikeMemX * R), std::floor(c.y + s.strikeMemY * R));
+      d->AddRect(ImVec2(mp.x - 4, mp.y - 4), ImVec2(mp.x + 4, mp.y + 4), ui::ColEmber(), 0.0f, 0, 2.0f);
+    }
+    if (s.strikeCharged)
+      d->AddRectFilled(ImVec2(c.x - 4, c.y - 4), ImVec2(c.x + 4, c.y + 4), ui::ColEmber());
+    else
+      d->AddRectFilled(ImVec2(c.x - 2, c.y - 2), ImVec2(c.x + 2, c.y + 2), ui::ColParch());
 
     // The readout, bottom-aligned beside the box.
     const float tx = bx + S + 10.0f;
     const float lh = ImGui::GetTextLineHeight() + 2.0f;
     float ty = std::floor(by + S - lh * 3.0f);
     char buf[96];
-    std::snprintf(buf, sizeof buf, "flick %.0f px/s (pick at %.0f)", sp, s.strikePickMin);
-    ui::ShadowText(d, ImVec2(tx, ty),
-                   sp >= s.strikePickMin ? ui::ColGoldPale() : ui::ColParchDim(), buf);
+    if (s.strikeCharging) {
+      std::snprintf(buf, sizeof buf, "CHARGED x%.1f  release to strike, flick to re-aim",
+                    s.strikeChargeMul);
+      ui::ShadowText(d, ImVec2(tx, ty), ui::ColEmber(), buf);
+    } else if (s.strikeCharged) {
+      std::snprintf(buf, sizeof buf, "CHARGED STRIKE x%.1f", s.strikeChargeMul);
+      ui::ShadowText(d, ImVec2(tx, ty), ui::ColEmber(), buf);
+    } else {
+      std::snprintf(buf, sizeof buf, "flick %.0f px/s (pick at %.0f)  hold to charge",
+                    sp, s.strikePickMin);
+      ui::ShadowText(d, ImVec2(tx, ty),
+                     sp >= s.strikePickMin ? ui::ColGoldPale() : ui::ColParchDim(), buf);
+    }
     ty += lh;
     if (!s.strikeLastText.empty()) {
       const std::string t = "last: " + s.strikeLastText;

@@ -1020,6 +1020,10 @@ struct WeaponPose {
   struct Keyed {
     bool on = false;
     bool fromLive = false;
+    // Re-take the live arm THIS tick even if a `fromLive` blend is already
+    // running: a charged hold re-aimed at another style (strokes.h
+    // ReaimChargedStroke) starts a new blend from wherever the arm is now.
+    bool recapture = false;
     Quat from[kArmJoints]{};
     Quat to[kArmJoints]{};
     bool hasJoint[kArmJoints] = {false, false, false};  // the wrist may be unkeyed
