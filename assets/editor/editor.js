@@ -613,7 +613,10 @@ function applySidecarSnapshot(json) {
   Object.keys(sidecar).forEach(k => delete sidecar[k]);
   Object.assign(sidecar, restored);
   needsRebuild = true;
-  hooks.onSidecarChanged?.();
+  // { undo: true }: the SAME sidecar stepped back or forward, so rig.js may
+  // keep the open clip, its cursor and the selected part (every other caller
+  // is a different document, where those names mean nothing).
+  hooks.onSidecarChanged?.({ undo: true });
 }
 
 function dispatchUndo(e) {
@@ -4895,6 +4898,9 @@ async function save(saveAs) {
       hooks.toast(`content floats ${shift.x},${shift.y},${shift.z} off the ` +
         'origin — saved anchors were rebased to match the engine\'s crop', true);
     }
+    // rig.js leaves out what is open but not this rig's (library clips being
+    // edited in place are written to assets/anims/ by onSave instead).
+    if (sideOut && hooks.sidecarForSave) sideOut = hooks.sidecarForSave(sideOut);
     try {
       if (sideOut && Object.keys(sideOut).length) {
         const sr = await fetch('/api/model?path=' + encodeURIComponent(spath), {

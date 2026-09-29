@@ -3538,9 +3538,23 @@ function modelTransform(modelIndex) {
   // anchor would put it.
   const dp = AN.vsub(posed.pos, rest.pos);
 
+  const off = previewBodyOffset();
+  return {
+    pivot: { x: anchor.x, y: anchor.y, z: anchor.z },
+    quat: dq,
+    pos: { x: dp.x + off.x, y: dp.y + off.y, z: dp.z + off.z },
+  };
+}
+
+/**
+ * Where the preview has carried the WHOLE body, in file voxels: the gait's
+ * ride height and the lunge. Every part is drawn with this added, so anything
+ * placed on the posed rig from anim.model (the clip pose handles) adds it too.
+ */
+function previewBodyOffset() {
   // Body height: the whole rig rides on bodyY relative to its rest ground.
   let dy = 0;
-  if (gaitOn && skel.gait.present && anim.feet.length) {
+  if (gaitOn && skel?.gait?.present && anim?.feet?.length) {
     // Same frame as anim.js/mob.cpp: bodyY is the prefab min corner, and the
     // rest stance is the sole height plus the rideHeight trim about it. Using
     // the old `rideHeight * legLength` here would offset the preview by a leg
@@ -3549,17 +3563,12 @@ function modelTransform(modelIndex) {
                   (skel.gait.rideHeight - 1) * (anim.feet[0].legLength || 1);
     dy = anim.bodyY - restY;
   }
-
   // THE LUNGE CARRIES THE WHOLE BODY, so it is added here rather than to any
   // one part: the arc is a translation of the creature, exactly as
   // Mob::Launch moves `origin_` and every limb rides it. In FILE voxels,
   // which is the one conversion this seam owns.
   const lg = lungeOffsetModel();
-  return {
-    pivot: { x: anchor.x, y: anchor.y, z: anchor.z },
-    quat: dq,
-    pos: { x: dp.x + lg.x, y: dp.y + dy + lg.y, z: dp.z + lg.z },
-  };
+  return AN.v3(lg.x, lg.y + dy, lg.z);
 }
 
 /** Where the lunge has carried the body, in FILE voxels. Zero when not flying. */
@@ -5665,7 +5674,7 @@ function renderTimeline() {
       onclick: () => { activeTag = t; gotoFrame(0); renderTimeline(); },
     }, t + ' (' + (fb[t].frames?.length || 0) + ')'));
   }
-  tagbar.append(
+  tagbar.append(...[   // (DOM append prints a null as "null"; drop them)
     el('button', {
       class: 'small', title: 'new flipbook tag',
       onclick: () => {
@@ -5705,7 +5714,7 @@ function renderTimeline() {
         renderTimeline();
       },
     }, '✕ tag') : null,
-    el('span', { class: 'spacer' }));
+    el('span', { class: 'spacer' })].filter(x => x != null));
 
   // Part selector for the active tag. The engine DROPS frames whose part does
   // not resolve to a limb, so a rigged file's tag without a part is dead data
@@ -5943,21 +5952,91 @@ async function saveClipToLibrary(name) {
   }
 }
 
+/* ---- LIBRARY CLIPS EDITED IN PLACE --------------------------------------
+ * A library clip (assets/anims/<name>.json: crawl, hop, squirm, idle, ...) is
+ * opened by putting it in the open sidecar's `clips` — that is what the
+ * preview, the lane and the pose handles all read — but it is NOT the rig's
+ * clip: saving the model writes it back to its library file and strips it
+ * from the sidecar (sidecarForSave). Without that, the first model save baked
+ * a copy into human.json, and a sidecar clip of the same name wins over the
+ * library on that rig, so every later library edit was silently shadowed on
+ * the rig it was authored on.
+ *
+ * name -> { vpm, text }: the file's own world-length stamp and its JSON as
+ * opened, so a save rewrites only files that changed. */
+const libraryOpen = new Map();
+
+function libraryFileDoc(name, clip) {
+  const e = libraryOpen.get(name);
+  const vpm = e && Number.isFinite(+e.vpm) ? +e.vpm
+    : (Number.isFinite(+sc().sidecarVoxelsPerMetre) ? +sc().sidecarVoxelsPerMetre : 10);
+  return Object.assign({ name, sidecarVoxelsPerMetre: vpm }, clip);
+}
+
+// Put library clip `name` on the rig for editing (in memory only).
+async function loadLibraryClip(name) {
+  const r = await fetch('/api/model?path=' + encodeURIComponent('anims/' + name + '.json'),
+                        { cache: 'no-store' });
+  if (!r.ok) return false;
+  const doc = await r.json();
+  const clip = Object.assign({}, doc);
+  delete clip.name; delete clip.sidecarVoxelsPerMetre;
+  if (!clip.tracks || typeof clip.tracks !== 'object') clip.tracks = {};
+  clips()[name] = clip;
+  libraryOpen.set(name, { vpm: doc.sidecarVoxelsPerMetre, text: null });
+  libraryOpen.get(name).text = JSON.stringify(libraryFileDoc(name, clip));
+  rebuildSkeleton();
+  return true;
+}
+
 async function ensureClipOnSkeleton(name) {
   if (!skel || !name) return false;
   if (skel.clips.some(c => c.name === name)) return true;
+  try { return await loadLibraryClip(name); } catch { return false; }
+}
+
+// A library chip in the clip bar: open it for editing.
+async function openLibraryClip(name) {
   try {
-    const r = await fetch('/api/model?path=' + encodeURIComponent('anims/' + name + '.json'),
-                          { cache: 'no-store' });
-    if (!r.ok) return false;
-    const doc = await r.json();
-    const clip = Object.assign({}, doc);
-    delete clip.name; delete clip.sidecarVoxelsPerMetre;
-    if (!clip.tracks || typeof clip.tracks !== 'object') clip.tracks = {};
-    clips()[name] = clip;
-    rebuildSkeleton();
-    return true;
-  } catch { return false; }
+    if (!clips()[name] && !(await loadLibraryClip(name)))
+      return toast(`could not read anims/${name}.json`, true);
+  } catch (e) { return toast('library read failed: ' + (e.message || e), true); }
+  activeClip = name; clipCursorMs = 0; selectedKey = null; clipPlaying = false;
+  reseedPose();
+  renderAllPanels();
+}
+
+/** The sidecar as it goes to disk: library clips opened here left out. */
+function sidecarForSave(obj) {
+  const names = [...libraryOpen.keys()].filter(n => obj?.clips?.[n]);
+  if (!names.length) return obj;
+  const out = JSON.parse(JSON.stringify(obj));
+  for (const n of names) delete out.clips[n];
+  if (!Object.keys(out.clips).length) delete out.clips;
+  return out;
+}
+
+/** On model save: write every changed library clip back to its file. */
+async function saveOpenLibraryClips() {
+  const C = clips();
+  const saved = [];
+  for (const [name, e] of libraryOpen) {
+    if (!C[name]) continue;
+    const doc = libraryFileDoc(name, C[name]);
+    const text = JSON.stringify(doc);
+    if (text === e.text) continue;
+    const r = await fetch('/api/model?path=' + encodeURIComponent('anims/' + name + '.json'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(doc, null, 2) + '\n',
+    });
+    const j = await r.json().catch(() => ({ ok: false }));
+    if (!j.ok) { toast(`anims/${name}.json save FAILED: ` + (j.error || r.status), true); continue; }
+    e.text = text;
+    saved.push(name);
+  }
+  if (saved.length)
+    toast('library clips saved: ' + saved.map(n => `anims/${n}.json`).join(', ') +
+          ' (press R in the game to hot-reload)');
 }
 
 async function importClipFromLibrary(name) {
@@ -6016,9 +6095,13 @@ function renderClipLane() {
     // completely differently from one called `walk2`. Marking them is the
     // cheapest way to stop an author renaming one and losing the arm swing.
     const loco = LOCO_FAMILY.includes(n);
+    const fromLib = libraryOpen.has(n);
     bar.append(el('button', {
       class: 'small' + (activeClip === n ? ' on' : ''),
-      title: loco
+      title: fromLib
+        ? `library clip assets/anims/${n}.json, open for editing: Save writes it ` +
+          'back to that file (it is not stored in this rig\'s sidecar)'
+        : loco
         ? `"${n}" is a LOCOMOTION clip: the engine (and the gait preview) ` +
           'starts it by name and retires the rest of the family. Renaming it ' +
           'silently stops it ever playing.'
@@ -6030,9 +6113,23 @@ function renderClipLane() {
         reseedPose();
         renderAllPanels();
       },
-    }, loco ? '◆ ' + n : n));
+    }, (fromLib ? '▤ ' : '') + (loco ? '◆ ' + n : n)));
   }
-  bar.append(
+  // THE SHARED LIBRARY, IN THE BAR. Crawl, hop, squirm, idle, ... live in
+  // assets/anims/ and play on every rig they fit, but used to be reachable
+  // only through the "← library" dropdown, so the bar looked like the rig had
+  // six animations. A dashed chip opens one for editing IN the library.
+  if (!libraryClips) refreshLibraryClips().then(() => renderClipLane());
+  for (const l of (libraryClips || [])) {
+    if (C[l.name]) continue;
+    bar.append(el('button', {
+      class: 'small', style: 'border-style:dashed;opacity:0.8',
+      title: `library clip assets/anims/${l.name}.json — click to open it on this rig ` +
+        'and edit it; Save writes it back to that file (every rig it fits plays it)',
+      onclick: () => openLibraryClip(l.name),
+    }, '▤ ' + l.name));
+  }
+  bar.append(...[
     el('button', {
       class: 'small',
       onclick: () => {
@@ -6112,7 +6209,7 @@ function renderClipLane() {
         'the default 0.45 px/ms',
       onclick: () => { CLIP_PX_PER_MS = Math.min(4, CLIP_PX_PER_MS * 1.5);
                        renderClipLane(); },
-    }, '+') : null);
+    }, '+') : null].filter(x => x != null));
   clipWrap.append(bar);
 
   const c = clipObj();
@@ -6122,6 +6219,11 @@ function renderClipLane() {
       'the engine samples them with nlerp between fused quat+pos keys.'));
     return;
   }
+
+  if (libraryOpen.has(activeClip))
+    clipWrap.append(el('div', { class: 'hint', style: 'margin:2px 0' },
+      `▤ library clip — Save (Ctrl+S) writes assets/anims/${activeClip}.json; ` +
+      'it is not stored in this rig. Press R in the game to hot-reload it.'));
 
   /* ---- clip properties ---- */
   const props = el('div', { class: 'clipprops' });
@@ -6166,6 +6268,9 @@ function renderClipLane() {
   maskWrap.append(el('span', { class: 'hint' },
     (!c.mask || !c.mask.length) ? '(empty = all parts)' : ''));
   clipWrap.append(maskWrap);
+
+  /* ---- frames: whole poses, posed with the ✋ handles (section 6c) ---- */
+  clipWrap.append(clipFramesPanel(c));
 
   /* ---- scrubber ---- */
   const dur = Math.max(1, num(c.durationMs, 500));
@@ -6445,6 +6550,809 @@ function deleteFrame() {
 }
 
 /* ==========================================================================
+   6c. POSE FRAMES — the attack editor's way of working, for EVERY clip
+
+   The Attacks lane made an animation a list of FRAMES, each one a whole pose
+   you drag into shape with handles on the rig (hand, elbow, whole arm, wrist,
+   roll), stepped with , and . and copied / pasted / mirrored as a unit. A
+   clip (crawl, walk, idle, hop, squirm, ...) is the same idea stored as
+   per-part key tracks, so this section gives it the same surface without
+   changing the file format the engine reads:
+
+     * a FRAME is a time at which any track keys. The frames list edits all
+       the keys at that time together (time, pacing, copy, mirror, delete).
+     * ✋ pose puts handles on EVERY limb chain (the sidecar's two-bone
+       `chains`: arms and legs) and every other part (hips, torso, head, ...):
+         ✥ hand / foot      move it; the limb re-solves, the hand/foot keeps
+                            its orientation, the knee/elbow stays on its side
+         ⟲ elbow / knee     swing the bend round the root-to-end line
+         ↻ armU / legU      turn the whole limb about its root joint
+         ✥ wrist / ankle    bend the hand / foot
+         ⟳ roll             roll it about its own length
+         ↻ torso / head ... turn that part about its joint (children follow)
+       Click a handle to select its part: the selected limb shows its full
+       set, the others only their end handle.
+     * THE HANDLES EDIT THE STORED POSE, not the drawn one: the pose is read
+       straight off the clip at the cursor (no fade, no gait, no clamp) and
+       written back as keys at the cursor. The drawn rig still goes through
+       the stage-6 pose limits exactly as the engine does, so a handle that
+       leaves its limb behind is a pose the joint limits will not allow.
+     * EDITING ONE FRAME NEVER MOVES ANOTHER: before a part is keyed at a
+       frame it is keyed at EVERY frame with what it showed there, so a new
+       key can only reshape the curve between its own neighbours.
+     * ADDITIVE clips (walk, run, idle, limp, ...) are edited in the same pose
+       space — rest turned by the clip's delta — and written back as the key
+       that produces that delta. Their FIRST frame is the reference every
+       delta is measured against, so it is always the base pose and cannot be
+       posed.
+   ========================================================================== */
+
+let clipPoseMode = false;         // ✋ handles on the rig
+let clipPoseBoard = null;         // { locals: { part: [x,y,z,w] }, from }
+let clipHandlesOn = false;
+let clipDrag = null;              // { id, moved, wrote, refused }
+const kPoseClickPx = 3;           // a handle "drag" shorter than this is a click
+
+const compiledClip = () =>
+  (skel && activeClip ? skel.clips.find(k => k.name === activeClip) || null : null);
+const partNameOf = i => skel?.parts[i]?.name || '';
+const mirrorPartName = n => n.endsWith('.L') ? n.slice(0, -2) + '.R'
+  : n.endsWith('.R') ? n.slice(0, -2) + '.L' : n;
+// The reflection about the model's X axis (see pasteKey for why this is the
+// rig's symmetry plane and why a quaternion reflects as (x, -y, -z, w)).
+const reflectQ = q => ({ x: q.x, y: -q.y, z: -q.z, w: q.w });
+const quatOf = a => ({ x: +a[0] || 0, y: +a[1] || 0, z: +a[2] || 0, w: Number.isFinite(+a[3]) ? +a[3] : 1 });
+
+/** Every time any track keys (rot or pos): the clip's FRAMES. */
+function clipFrameTimes(c) {
+  const t = new Set();
+  for (const tr of Object.values(c?.tracks || {})) {
+    for (const k of (tr?.rot || [])) t.add(+k.t || 0);
+    for (const k of (tr?.pos || [])) t.add(+k.t || 0);
+  }
+  return [...t].sort((a, b) => a - b);
+}
+
+/** Parts the open clip keys (by index). */
+function clipTrackedParts(c) {
+  const out = [];
+  for (const name of Object.keys(c?.tracks || {})) {
+    const pi = skel.findPart(name);
+    if (pi >= 0) out.push(pi);
+  }
+  return out;
+}
+
+/**
+ * THE STORED POSE at t: each part's local transform as the clip ALONE puts it
+ * on the rest pose — anim.js animSampleAndBlend at full weight: override
+ * takes the key, additive turns rest by the delta against the track's first
+ * key. No blend-in/out, gait, procedural layer or clamp.
+ */
+function clipLocalsAt(cc, t) {
+  const loc = skel.parts.map(p => ({ rot: { ...p.rest.rot }, pos: { ...p.rest.pos } }));
+  if (!cc) return loc;
+  for (const tr of cc.tracks) {
+    if (tr.part < 0 || tr.part >= loc.length) continue;
+    if (cc.mask && cc.mask.length && (tr.part >= cc.mask.length || !cc.mask[tr.part]))
+      continue;
+    const s = AN.sampleTrack(tr, t);
+    if (!s) continue;
+    const L = loc[tr.part];
+    if (cc.mode === 'additive') {
+      const ref = tr.keys[0].rot || AN.qid();
+      L.rot = AN.qnorm(AN.qmul(L.rot, AN.qmul(AN.qconj(ref), s.rot)));
+    } else {
+      if (s.gotRot) L.rot = AN.qnorm(s.rot);
+      if (s.gotPos) L.pos = AN.vadd(skel.parts[tr.part].rest.pos, s.pos);
+    }
+  }
+  return loc;
+}
+
+function flattenLocals(loc) {
+  const st = { local: loc, model: [] };
+  AN.animFlatten(skel, st);
+  return st.model;
+}
+
+/**
+ * New locals after setting some parts' MODEL rotations (`want`: part -> quat).
+ * Every other part keeps its local, so the children of a turned part ride it.
+ */
+function localsWithModel(loc, want) {
+  const out = loc.map(l => ({ rot: { ...l.rot }, pos: { ...l.pos } }));
+  const model = [];
+  for (let i = 0; i < skel.parts.length; i++) {
+    const par = skel.parts[i].parent;
+    const pr = par >= 0 ? model[par].rot : AN.qid();
+    if (want.has(i)) out[i].rot = AN.qnorm(AN.qmul(AN.qconj(pr), want.get(i)));
+    model[i] = {
+      rot: AN.qnorm(AN.qmul(pr, out[i].rot)),
+      pos: par >= 0 ? AN.vadd(model[par].pos, AN.qrot(pr, out[i].pos)) : { ...out[i].pos },
+    };
+  }
+  return out;
+}
+
+function frameEaseAt(c, t) {
+  for (const tr of Object.values(c?.tracks || {}))
+    for (const ch of ['rot', 'pos'])
+      for (const k of (tr?.[ch] || []))
+        if ((+k.t || 0) === t && k.ease) return k.ease;
+  return 'linear';
+}
+
+function upsertKey(list, t, field, val, ease) {
+  let k = list.find(o => (+o.t || 0) === t);
+  if (!k) { k = { t, ease }; list.push(k); }
+  k[field] = val;
+  return k;
+}
+const q4 = q => [round4(q.x), round4(q.y), round4(q.z), round4(q.w)];
+
+/**
+ * KEY A PART AT EVERY FRAME before one frame of it is edited, with what it
+ * shows there now, so a new key only reshapes the curve between its own
+ * neighbours: a track keyed at 0 and 1200 alone would move its 600 pose the
+ * moment a key landed at 300. Values are the RAW key space (sampled off the
+ * compiled track), so for an additive track the reference stays put.
+ */
+function lockTrack(c, cc, pi, times) {
+  const name = partNameOf(pi);
+  if (!c.tracks || typeof c.tracks !== 'object') c.tracks = {};
+  const jt = c.tracks[name] || (c.tracks[name] = {});
+  const ct = cc ? cc.tracks.find(tr => tr.part === pi) : null;
+  const additive = c.mode === 'additive';
+  for (const t of times) {
+    const s = ct ? AN.sampleTrack(ct, t) : null;
+    if (!(jt.rot || []).some(k => (+k.t || 0) === t)) {
+      // No rot channel: an additive track's delta is identity, an override
+      // track shows rest.
+      const q = s && s.gotRot ? s.rot : (additive ? AN.qid() : skel.parts[pi].rest.rot);
+      upsertKey(jt.rot || (jt.rot = []), t, 'q', q4(q), frameEaseAt(c, t));
+    }
+    if (jt.pos?.length && s?.gotPos && !jt.pos.some(k => (+k.t || 0) === t))
+      upsertKey(jt.pos, t, 'v', [round4(s.pos.x), round4(s.pos.y), round4(s.pos.z)],
+                frameEaseAt(c, t));
+  }
+  sortTrack(jt);
+}
+
+/**
+ * Write LOCAL rotations (part index -> quat, the parent-relative pose space
+ * the handles and the mirror work in) at time t into the open clip. The clip
+ * mode decides what the KEY is. A looping clip whose first and last frames
+ * are the same moment keeps them equal. Returns false (and says why) when the
+ * write is refused.
+ */
+function writeClipLocals(t, locals, quiet) {
+  const c = clipObj(), cc = compiledClip();
+  if (!c || !cc || !locals.size) return false;
+  const additive = c.mode === 'additive';
+  const dur = Math.max(1, num(c.durationMs, 500));
+  let times = clipFrameTimes(c);
+  if (!times.length) times = c.loop ? [0, dur] : [0];
+  if (additive && t <= times[0]) {
+    if (!quiet) toast('the FIRST frame of an additive clip is its reference: every ' +
+      'other frame is measured from it, so it is always the base pose. Pose the ' +
+      'later frames.', true);
+    return false;
+  }
+  for (const pi of locals.keys()) lockTrack(c, cc, pi, times);
+  const at = [t];
+  if (c.loop && t === 0 && times.includes(dur)) at.push(dur);
+  if (c.loop && t === dur && times.includes(0) && !additive) at.push(0);
+  const mask = Array.isArray(c.mask) && c.mask.length ? c.mask : null;
+  const masked = [];
+  for (const [pi, L] of locals) {
+    const name = partNameOf(pi);
+    const jt = c.tracks[name];
+    let q = AN.qnorm(L);
+    if (additive) {
+      // key = ref · rest⁻¹ · L, so ref⁻¹ · key (the delta) turns rest into L.
+      const ref = quatOf(jt.rot[0].q);
+      q = AN.qnorm(AN.qmul(ref, AN.qmul(AN.qconj(skel.parts[pi].rest.rot), L)));
+    }
+    for (const tt of at) upsertKey(jt.rot, tt, 'q', q4(q), frameEaseAt(c, tt));
+    sortTrack(jt);
+    if (mask && !mask.includes(name)) { mask.push(name); masked.push(name); }
+  }
+  if (masked.length && !quiet)
+    toast('added to the clip\'s mask (a masked-out part never plays): ' + masked.join(', '));
+  return true;
+}
+
+/** One undoable pose operation from a button: snapshot, edit, commit, redraw. */
+function poseOp(fn) {
+  if (!clipObj() || !skel) return;
+  ed.commitSidecarUndo();
+  ed.touchSidecar();
+  fn();
+  rebuildSkeleton();
+  ed.commitSidecarUndo();
+  selectedKey = null;
+  reseedPose();
+  renderAllPanels();
+}
+
+/** The pose (every part's local) of the open clip at t. */
+const storedLocals = t => clipLocalsAt(compiledClip(), t);
+
+/** Mirror left-right: each part takes its mirror's reflected local. */
+function mirroredLocals(loc, parts) {
+  const out = new Map();
+  const set = new Set(parts);
+  for (const pi of parts) {
+    const m = skel.findPart(mirrorPartName(partNameOf(pi)));
+    if (m >= 0) set.add(m);
+  }
+  for (const pi of set) {
+    const src = skel.findPart(mirrorPartName(partNameOf(pi)));
+    out.set(pi, reflectQ(loc[src >= 0 ? src : pi].rot));
+  }
+  return out;
+}
+
+function copyClipPose(t) {
+  const c = clipObj();
+  if (!c) return;
+  const loc = storedLocals(t);
+  const locals = {};
+  for (const pi of clipTrackedParts(c)) locals[partNameOf(pi)] = q4(loc[pi].rot);
+  if (!Object.keys(locals).length) return toast('nothing keyed in this clip to copy', true);
+  clipPoseBoard = { locals, from: `${activeClip} @ ${t}ms` };
+  toast('copied pose: ' + clipPoseBoard.from);
+  renderClipLane();
+}
+
+function pasteClipPose(t, mirror) {
+  if (!clipPoseBoard) return toast('no pose copied yet', true);
+  poseOp(() => {
+    const src = new Map();
+    for (const [name, q] of Object.entries(clipPoseBoard.locals)) {
+      const pi = skel.findPart(name);
+      if (pi >= 0) src.set(pi, quatOf(q));
+    }
+    let out = src;
+    if (mirror) {
+      const loc = storedLocals(t);
+      for (const [pi, q] of src) loc[pi].rot = q;
+      out = mirroredLocals(loc, [...src.keys()]);
+    }
+    writeClipLocals(t, out);
+  });
+}
+
+function deleteClipFrame(t) {
+  poseOp(() => {
+    const c = clipObj();
+    for (const [name, tr] of Object.entries(c.tracks || {})) {
+      if (tr.rot) tr.rot = tr.rot.filter(k => (+k.t || 0) !== t);
+      if (tr.pos) tr.pos = tr.pos.filter(k => (+k.t || 0) !== t);
+      if (!tr.rot?.length) delete tr.rot;
+      if (!tr.pos?.length) delete tr.pos;
+      if (!tr.rot && !tr.pos) delete c.tracks[name];
+    }
+  });
+}
+
+function moveClipFrame(t, nt) {
+  const c = clipObj();
+  if (!c || nt === t) return;
+  if (clipFrameTimes(c).includes(nt)) return toast(`there is already a frame at ${nt} ms`, true);
+  poseOp(() => {
+    for (const tr of Object.values(c.tracks || {})) {
+      for (const k of [...(tr.rot || []), ...(tr.pos || [])]) if ((+k.t || 0) === t) k.t = nt;
+      sortTrack(tr);
+    }
+  });
+  clipCursorMs = nt;
+  reseedPose();
+  renderClipLane();
+}
+
+function setClipFrameEase(t, ease) {
+  poseOp(() => {
+    for (const tr of Object.values(clipObj().tracks || {}))
+      for (const k of [...(tr.rot || []), ...(tr.pos || [])])
+        if ((+k.t || 0) === t) k.ease = ease;
+  });
+}
+
+function gotoClipTime(t) {
+  clipCursorMs = t;
+  clipPlaying = false;
+  selectedKey = null;
+  reseedPose();
+  renderClipLane();
+  ed.invalidate();
+}
+
+// Step to the previous / next frame (keys , and .), wrapping round.
+function stepClipFrame(dir) {
+  const c = clipObj();
+  const times = clipFrameTimes(c);
+  if (!times.length) return;
+  const t = Math.round(clipCursorMs);
+  let nt;
+  if (dir > 0) nt = times.find(x => x > t) ?? times[0];
+  else nt = [...times].reverse().find(x => x < t) ?? times[times.length - 1];
+  gotoClipTime(nt);
+}
+
+/* ---- the handles ------------------------------------------------------- */
+
+// The sidecar's limb chains the handles can solve: three parts, each the
+// parent of the next (upper, lower, end: shoulder-elbow-hand, hip-knee-foot).
+function poseChains() {
+  return (skel?.chains || []).filter(ch => ch.parts.length === 3 &&
+    skel.parts[ch.parts[1]]?.parent === ch.parts[0] &&
+    skel.parts[ch.parts[2]]?.parent === ch.parts[1]);
+}
+
+function clipPoseActive() {
+  return laneTab === 'animation' && clipPoseMode && !!activeClip && !clipPlaying &&
+    !!skel && !!compiledClip() && !gaitOn && !strokeLive() && !!restModel;
+}
+
+function clipPoseState() {
+  const cc = compiledClip();
+  const t = Math.round(clipCursorMs);
+  const loc = clipLocalsAt(cc, t);
+  return { cc, t, loc, model: flattenLocals(loc), off: previewBodyOffset() };
+}
+
+// A prefab point on part i, carried by the stored pose to the scene — the
+// same delta modelTransform hands the renderer.
+function poseScenePt(st, i, p) {
+  const m = st.model[i], r = restModel[i];
+  const a = skel.parts[i].anchorLocal;
+  const dq = AN.qnorm(AN.qmul(m.rot, AN.qconj(r.rot)));
+  return AN.vadd(AN.vadd(AN.vadd(a, AN.qrot(dq, AN.vsub(p, a))), AN.vsub(m.pos, r.pos)), st.off);
+}
+const poseJoint = (st, i) => poseScenePt(st, i, skel.parts[i].anchorLocal);
+
+// The LEVER of a part: the far end of its box from its joint (prefab coords).
+// A hand's is the fingertips, a torso's the top of the chest.
+function partLever(i) {
+  const p = skel.parts[i];
+  const m = ed.getModels()[p.modelIndex];
+  const a = p.anchorLocal;
+  if (!m) return AN.vadd(a, AN.v3(0, 3, 0));
+  const c = AN.v3(m.offset.x + m.dim.x / 2, m.offset.y + m.dim.y / 2, m.offset.z + m.dim.z / 2);
+  const d = AN.vsub(c, a);
+  if (AN.vlen(d) >= 0.75) return AN.vadd(a, AN.vmul(d, 2));
+  // Jointed at its own centre (a root usually is): point the lever up.
+  return AN.vadd(a, AN.v3(0, Math.max(m.dim.y / 2 + 1, 2), 0));
+}
+// Where part i's roll handle sits: off the middle of its joint-to-lever
+// line, on a side FIXED IN THE PART (so the handle turns with the roll and
+// follows the mouse, instead of sitting still while the part spins under it).
+function rollPointOf(st, i) {
+  const a = skel.parts[i].anchorLocal, lvl = partLever(i);
+  const d = AN.vsub(lvl, a);
+  const side0 = perps(AN.vlen(d) > 1e-4 ? AN.vnorm(d) : AN.v3(0, 1, 0))[0];
+  const dq = AN.qnorm(AN.qmul(st.model[i].rot, AN.qconj(restModel[i].rot)));
+  const mid = AN.vmul(AN.vadd(poseJoint(st, i), poseScenePt(st, i, lvl)), 0.5);
+  return AN.vadd(mid, AN.vmul(AN.qrot(dq, side0), 1.5 * rigScale()));
+}
+
+/**
+ * The stored pose THROUGH THE JOINT LIMITS (stage 6, AnimClampPoseLimits) —
+ * what the viewport draws on a paused clip and what the game will show.
+ * Handles sit here, on the drawn limb; the drags still solve against the
+ * STORED pose (what the file says), and the difference is reported by the
+ * frames panel (clipLimitReport) instead of being hidden. Computed from the
+ * stored pose rather than read off anim.model, which is the rest pose between
+ * a rebuildSkeleton and the next preview step.
+ */
+function drawnPoseState(st) {
+  const cl = {
+    local: st.loc.map(l => ({ rot: { ...l.rot }, pos: { ...l.pos } })),
+    model: st.model.map(m => ({ rot: { ...m.rot }, pos: { ...m.pos } })),
+  };
+  AN.animClampPoseLimits(skel, cl, null);
+  return { model: cl.model, off: st.off };
+}
+
+// Parts the joint limits turn by more than 3 degrees away from the stored
+// pose at the cursor: "the game will not bend this the way the keys say".
+function clipLimitReport() {
+  if (!skel || !compiledClip() || !restModel) return [];
+  const st = clipPoseState(), dr = drawnPoseState(st);
+  const out = [];
+  for (let i = 0; i < skel.parts.length; i++) {
+    const par = skel.parts[i].parent;
+    const loc = q => par >= 0 ? AN.qmul(AN.qconj(q[par].rot), q[i].rot) : q[i].rot;
+    const d = Math.abs(AN.qdot(AN.qnorm(loc(st.model)), AN.qnorm(loc(dr.model))));
+    const deg = 2 * Math.acos(Math.min(1, d)) * 180 / Math.PI;
+    if (deg > 3) out.push(`${partNameOf(i)} ${Math.round(deg)}°`);
+  }
+  return out;
+}
+
+// Which part a handle id belongs to (clicking a handle selects it).
+function handlePart(id) {
+  const [kind, s] = id.split(':');
+  const n = +s;
+  if (kind === 'rot' || kind === 'roll') return n;
+  const ch = poseChains()[n];
+  if (!ch) return -1;
+  return kind === 'tl' ? ch.parts[0] : kind === 'sw' ? ch.parts[1] : ch.parts[2];
+}
+
+function drawClipPoseHandles() {
+  if (!clipPoseActive()) {
+    if (clipHandlesOn) { ed.setPoseHandles?.(null); clipHandlesOn = false; }
+    return;
+  }
+  clipHandlesOn = true;
+  ed.setPoseHandles?.(clipHandleList(clipPoseState()), clipDragCb);
+}
+
+// The handle list for the stored pose `st` (drawClipPoseHandles, test seam).
+function clipHandleList(stored) {
+  const st = drawnPoseState(stored);
+  const P = v => [v.x, v.y, v.z];
+  const sel = selectedPart ? skel.findPart(selectedPart) : -1;
+  const list = [];
+  const inChain = new Set();
+  poseChains().forEach((ch, ci) => {
+    const [u, f, w] = ch.parts;
+    ch.parts.forEach(p => inChain.add(p));
+    const leg = ch.tag === 'leg' || /leg|foot/i.test(partNameOf(w));
+    const on = ch.parts.includes(sel);
+    const H = poseJoint(st, w);
+    list.push({ id: 'ik:' + ci, pos: P(H), text: '✥ ' + partNameOf(w),
+      color: on ? '#ff9f5a' : '#caa27e', active: sel === w,
+      title: `drag: MOVE THE ${leg ? 'FOOT' : 'HAND'} — the ${leg ? 'leg' : 'arm'} ` +
+        `re-solves, the ${leg ? 'knee' : 'elbow'} stays on its side and the ` +
+        `${leg ? 'foot' : 'hand'} keeps its angle · click: select this limb` });
+    if (!on) return;
+    const S = poseJoint(st, u), E = poseJoint(st, f);
+    const lv = poseScenePt(st, w, partLever(w));
+    list.push(
+      { id: 'sw:' + ci, pos: P(E), text: leg ? '⟲ knee' : '⟲ elbow', color: '#7cf03a',
+        title: `drag: swing the ${leg ? 'KNEE' : 'ELBOW'} round the ` +
+          `${leg ? 'hip-to-ankle' : 'shoulder-to-wrist'} line (the end stays put)` },
+      { id: 'tl:' + ci, pos: P(AN.vmul(AN.vadd(S, E), 0.5)), text: '↻ ' + partNameOf(u),
+        color: '#8fd3ff', title: `drag: turn the WHOLE ${leg ? 'LEG' : 'ARM'} about the ` +
+          `${leg ? 'hip' : 'shoulder'}` },
+      { id: 'wb:' + ci, pos: P(lv), text: leg ? '✥ ankle' : '✥ wrist', color: '#ffc857',
+        title: `drag: BEND THE ${leg ? 'ANKLE' : 'WRIST'} — point the ` +
+          `${leg ? 'foot' : 'hand'} (it stays attached where it is)` },
+      { id: 'wr:' + ci, pos: P(rollPointOf(st, w)), text: '⟳ roll', color: '#e8a0ff',
+        title: `drag: ROLL the ${leg ? 'foot' : 'hand'} about its own length` });
+  });
+  for (let i = 0; i < skel.parts.length; i++) {
+    if (inChain.has(i) || skel.parts[i].modelIndex < 0 || !restModel[i]) continue;
+    const J = poseJoint(st, i), lv = poseScenePt(st, i, partLever(i));
+    list.push({ id: 'rot:' + i, pos: P(lv), text: '↻ ' + partNameOf(i),
+      color: sel === i ? '#8fd3ff' : '#9fb4c8', active: sel === i,
+      title: `drag: turn ${partNameOf(i)} about its joint (everything attached ` +
+        'follows) · click: select it' });
+    if (sel === i)
+      list.push({ id: 'roll:' + i, pos: P(rollPointOf(st, i)), text: '⟳ roll', color: '#e8a0ff',
+        title: `drag: ROLL ${partNameOf(i)} about its own length` });
+  }
+  return list;
+}
+
+// A drag -> new MODEL rotations for the parts it moves (part -> quat).
+function clipHandleSolve(id, st, dx, dy) {
+  const [kind, s] = id.split(':');
+  const n = +s;
+  const M = st.model;
+  const want = new Map();
+  const rotAboutPt = (q, pivot, pt) => AN.vadd(pivot, AN.qrot(q, AN.vsub(pt, pivot)));
+  const arr = v => [v.x, v.y, v.z];
+  // Two turns square to pivot->pt: the rotation that walks pt after the mouse.
+  const turn2 = (pivot, pt) => {
+    const dir = AN.vsub(pt, pivot);
+    if (AN.vlen(dir) < 1e-4) return null;
+    const [a1, a2] = perps(AN.vnorm(dir));
+    const f = (a, b) => AN.qmul(AN.qaxisangle(a1, a), AN.qaxisangle(a2, b));
+    const J1 = jac(a => arr(rotAboutPt(f(a, 0), pivot, pt)), 0, 1e-3);
+    const J2 = jac(b => arr(rotAboutPt(f(0, b), pivot, pt)), 0, 1e-3);
+    const [da, db] = solve2(J1, J2, dx, dy).map(capStep);
+    return f(da, db);
+  };
+  // One turn about the axis from -> to, following the mouse with pt.
+  const roll1 = (from, to, pt) => {
+    const ax = AN.vsub(to, from);
+    if (AN.vlen(ax) < 1e-4) return null;
+    const axis = AN.vnorm(ax);
+    const J = jac(a => arr(rotAboutPt(AN.qaxisangle(axis, a), from, pt)), 0, 1e-3);
+    return AN.qaxisangle(axis, capStep(solve1(J, dx, dy)));
+  };
+  const turnPart = (i, Q) => { if (Q) want.set(i, AN.qnorm(AN.qmul(Q, M[i].rot))); };
+
+  if (kind === 'rot' || kind === 'roll') {
+    const J = poseJoint(st, n), lv = poseScenePt(st, n, partLever(n));
+    turnPart(n, kind === 'rot' ? turn2(J, lv) : roll1(J, lv, rollPointOf(st, n)));
+    return want;
+  }
+  const ch = poseChains()[n];
+  if (!ch) return want;
+  const [u, f, w] = ch.parts;
+  const S = poseJoint(st, u), E = poseJoint(st, f), H = poseJoint(st, w);
+  if (kind === 'tl') {
+    turnPart(u, turn2(S, AN.vmul(AN.vadd(S, E), 0.5)));
+  } else if (kind === 'wb' || kind === 'wr') {
+    const lv = poseScenePt(st, w, partLever(w));
+    turnPart(w, kind === 'wb' ? turn2(H, lv) : roll1(H, lv, rollPointOf(st, w)));
+  } else if (kind === 'sw') {
+    // The upper and lower bone swing together about S->H (the lower keeps its
+    // local, so turning the upper carries it); the end keeps its angle.
+    turnPart(u, roll1(S, H, E));
+    if (want.size) want.set(w, M[w].rot);
+  } else if (kind === 'ik') {
+    // attacks' "✥ hand" (keyedDragCb khand), on any limb: two-bone solve to
+    // the moved end, the bend kept on its side of the root-to-end line.
+    const goal = AN.vadd(H, screenMove3(H, dx, dy));
+    const L1 = AN.vlen(AN.vsub(E, S)), L2 = AN.vlen(AN.vsub(H, E));
+    if (L1 < 1e-4 || L2 < 1e-4) return want;
+    const to = AN.vsub(goal, S);
+    const d0 = AN.vlen(to);
+    if (d0 < 1e-4) return want;
+    const d = Math.max(Math.abs(L1 - L2) + 1e-3, Math.min(L1 + L2 - 1e-3, d0));
+    const dir = AN.vmul(to, 1 / d0);
+    const oldAxis = AN.vnorm(AN.vsub(H, S));
+    let pole = AN.vsub(E, AN.vadd(S, AN.vmul(oldAxis, AN.vdot(AN.vsub(E, S), oldAxis))));
+    pole = AN.vsub(pole, AN.vmul(dir, AN.vdot(pole, dir)));
+    if (AN.vlen(pole) < 1e-4) pole = perps(dir)[0];
+    pole = AN.vnorm(pole);
+    const x = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+    const h = Math.sqrt(Math.max(0, L1 * L1 - x * x));
+    const E2 = AN.vadd(S, AN.vadd(AN.vmul(dir, x), AN.vmul(pole, h)));
+    const H2 = AN.vadd(S, AN.vmul(dir, d));
+    const U2 = AN.qnorm(AN.qmul(AN.qfromto(AN.vsub(E, S), AN.vsub(E2, S)), M[u].rot));
+    const F1 = AN.qnorm(AN.qmul(U2, AN.qmul(AN.qconj(M[u].rot), M[f].rot)));
+    const lowerNow = AN.qrot(F1, AN.qrotinv(M[f].rot, AN.vsub(H, E)));
+    const F2 = AN.qnorm(AN.qmul(AN.qfromto(lowerNow, AN.vsub(H2, E2)), F1));
+    want.set(u, U2); want.set(f, F2); want.set(w, M[w].rot);
+  }
+  return want;
+}
+
+const clipDragCb = {
+  down: (id) => { clipDrag = { id, moved: 0, wrote: false, refused: false }; },
+  drag: (id, dx, dy) => {
+    if (!clipDrag) return;
+    clipDrag.moved += Math.abs(dx) + Math.abs(dy);
+    if (clipDrag.moved < kPoseClickPx || clipDrag.refused) return;
+    const st = clipPoseState();
+    const want = clipHandleSolve(id, st, dx, dy);
+    if (!want.size) return;
+    if (!clipDrag.wrote) { ed.commitSidecarUndo(); ed.touchSidecar(); clipDrag.wrote = true; }
+    const loc2 = localsWithModel(st.loc, want);
+    const out = new Map();
+    for (const pi of want.keys()) out.set(pi, loc2[pi].rot);
+    if (!writeClipLocals(st.t, out, clipDrag.refused)) { clipDrag.refused = true; return; }
+    ed.touchSidecar();
+    rebuildSkeleton();
+    ed.invalidate();
+  },
+  up: (id) => {
+    const d = clipDrag;
+    clipDrag = null;
+    if (!d) return;
+    if (d.moved < kPoseClickPx) {
+      const pi = handlePart(id);
+      if (pi >= 0) {
+        selectedPart = partNameOf(pi);
+        bindGizmo();
+        renderAllPanels();
+      }
+      return;
+    }
+    if (d.wrote) ed.commitSidecarUndo();
+    selectedKey = null;
+    reseedPose();
+    renderAllPanels();
+  },
+};
+
+/**
+ * THE OTHER BEND SOLUTION for one limb at one frame (attacks' "⇅ flip
+ * elbow"): the upper and lower bone each turn half a turn about their own
+ * line. The knee/elbow, the end and its angle stay exactly where they are;
+ * the bend changes sign and the root loses (or gains) a 180° twist.
+ */
+function flipChainAt(ci) {
+  const ch = poseChains()[ci];
+  if (!ch) return;
+  poseOp(() => {
+    const st = clipPoseState();
+    const [u, f, w] = ch.parts;
+    const S = poseJoint(st, u), E = poseJoint(st, f), H = poseJoint(st, w);
+    const half = (Q, a, b) => AN.vlen(AN.vsub(b, a)) > 1e-4
+      ? AN.qnorm(AN.qmul(AN.qaxisangle(AN.vnorm(AN.vsub(b, a)), Math.PI), Q)) : Q;
+    const want = new Map([[u, half(st.model[u].rot, S, E)],
+                          [f, half(st.model[f].rot, E, H)], [w, st.model[w].rot]]);
+    const loc2 = localsWithModel(st.loc, want);
+    const out = new Map();
+    for (const pi of want.keys()) out.set(pi, loc2[pi].rot);
+    writeClipLocals(st.t, out);
+  });
+}
+
+// Ctrl+C / Ctrl+V copy and paste the POSE at the cursor while ✋ pose is on
+// (Ctrl+Shift+V pastes it mirrored). Capture phase, ahead of the voxel
+// editor's own Ctrl+C / Ctrl+V — the attacks lane does the same.
+document.addEventListener('keydown', (ev) => {
+  if (!clipPoseMode || !activeClip || laneTab !== 'animation' || !clipWrap?.isConnected ||
+      clipWrap.offsetParent === null) return;
+  const tg = ev.target, tag = (tg && tg.tagName || '').toLowerCase();
+  if (tg && (tg.isContentEditable || tag === 'input' || tag === 'textarea' || tag === 'select')) return;
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return;
+  const key = ev.key.toLowerCase();
+  const t = Math.round(clipCursorMs);
+  if (key === 'c') copyClipPose(t);
+  else if (key === 'v') pasteClipPose(t, ev.shiftKey);
+  else return;
+  ev.preventDefault();
+  ev.stopImmediatePropagation();
+}, true);
+
+/* ---- the frames panel -------------------------------------------------- */
+
+// One number cell that commits on change.
+function frameNum(value, onSet, opts = {}) {
+  const i = el('input', { class: 'cell num', type: 'number', step: String(opts.step || 1),
+    style: `width:${opts.w || 5}em`, title: opts.title || '' });
+  i.value = value;
+  i.addEventListener('change', () => {
+    const v = +i.value;
+    if (Number.isFinite(v)) onSet(v);
+  });
+  return i;
+}
+
+function clipFramesPanel(c) {
+  const box = el('div', { class: 'clipframes', style: 'margin:4px 0;padding:4px 6px;' +
+    'border:1px solid var(--line,#3a3a3a);border-radius:4px' });
+  const times = clipFrameTimes(c);
+  const dur = Math.max(1, num(c.durationMs, 500));
+  const cur = Math.round(clipCursorMs);
+  const hk = times.indexOf(cur);
+  const b = (label, title, onclick, disabled, extra = '') => el('button', {
+    class: 'small' + extra, title, onclick, style: 'padding:0 5px',
+    ...(disabled ? { disabled: true } : {}) }, label);
+
+  // ---- bar: pose mode, stepper, add frame, clipboard ----
+  const why = gaitOn ? 'K is walking the rig — stop it (K) to pose'
+    : strokeLive() ? 'a swing is playing' : clipPlaying ? 'stop the clip (P) to pose' : '';
+  box.append(el('div', { class: 'rigbtns', style: 'gap:6px;flex-wrap:wrap;align-items:center' },
+    el('b', { title: 'A FRAME is a time where the clip keys. Each one is a whole ' +
+      'pose; between frames every part turns straight to the next on the ' +
+      'frame\'s pacing.' }, 'frames'),
+    b(clipPoseMode ? '✋ posing' : '✋ pose', 'POSE THE FRAME AT THE CURSOR BY ' +
+      'DRAGGING THE RIG: handles on every hand, foot, elbow, knee and part. ' +
+      'Click a handle to select that limb (it shows its full set). Every drag ' +
+      'writes keys at the cursor and is one undo.',
+      () => { clipPoseMode = !clipPoseMode; renderClipLane(); ed.invalidate(); },
+      false, clipPoseMode ? ' on' : ''),
+    b('◀', 'previous frame (key , )', () => stepClipFrame(-1), !times.length),
+    el('span', { class: 'hint' }, hk >= 0 ? `frame ${hk + 1} / ${times.length}`
+      : `${cur} ms (between frames)`),
+    b('▶', 'next frame (key . )', () => stepClipFrame(1), !times.length),
+    b('+ frame here', 'make the cursor a FRAME: key every keyed part with the pose ' +
+      'it shows here now (nothing moves; the frame can then be posed on its own)',
+      () => poseOp(() => {
+        const parts = clipTrackedParts(c);
+        const loc = storedLocals(cur);
+        writeClipLocals(cur, new Map(parts.map(pi => [pi, loc[pi].rot])));
+      }), hk >= 0 || !clipTrackedParts(c).length),
+    el('span', { class: 'spacer', style: 'flex:1' }),
+    el('span', { class: 'hint' }, 'pose: ' + (clipPoseBoard ? clipPoseBoard.from : '—')),
+    why && clipPoseMode ? el('span', { class: 'hint', style: 'color:#e0a050' }, why) : null));
+  const lim = clipLimitReport();
+  if (lim.length)
+    box.append(el('div', { class: 'hint', style: 'color:#e0a050;margin-top:2px',
+      title: 'The drawn rig goes through the joint limits (the limb\'s poseLimit, ' +
+        'stage 6) exactly as the game does, and at this frame they bend these ' +
+        'parts away from what the keys say. The handles sit on the drawn limb; ' +
+        'what you drag is the keyed pose. Pose inside the limits, or widen them ' +
+        'on the limb.' }, 'joint limits bend this frame: ' + lim.join(' · ')));
+
+  // ---- one row per frame ----
+  times.forEach((t, k) => {
+    const next = times[k + 1] ?? (c.loop ? times[0] + dur : null);
+    const on = t === cur;
+    const row = el('div', { class: 'rigbtns', style: 'gap:5px;flex-wrap:wrap;align-items:center;' +
+      'margin-top:3px;padding:1px 3px;border-radius:3px;' +
+      (on ? 'background:rgba(120,160,255,0.12);outline:1px solid #6d8fd6' : '') });
+    const easeS = el('select', { class: 'small', title: 'PACING from this frame to the ' +
+      'next: linear = even; …In = slow start; …Out = slow finish; instant = jump' });
+    for (const e of AN.EASES) easeS.append(el('option', { value: e }, e));
+    easeS.value = frameEaseAt(c, t);
+    easeS.addEventListener('change', () => setClipFrameEase(t, easeS.value));
+    const isRef = c.mode === 'additive' && k === 0;
+    // (DOM append prints a null as the text "null"; el() skips them.)
+    row.append(...[
+      el('b', { style: 'min-width:1.6em' }, String(k + 1)),
+      b(on ? '◉' : '◎', 'go to this frame (hold it on the rig)', () => gotoClipTime(t)),
+      frameNum(t, v => moveClipFrame(t, clamp(Math.round(v), 0, dur)),
+        { step: 10, title: 'the frame\'s time, ms — every key at this time moves' }),
+      el('span', { class: 'hint', style: 'min-width:5em' },
+        next !== null ? `→ ${Math.round(next - t)} ms` : 'end'),
+      easeS,
+      isRef ? el('span', { class: 'hint', title: 'an additive clip measures every ' +
+        'frame from its first: this one is always the base pose' }, 'reference') : null,
+      el('span', { class: 'spacer', style: 'flex:1' }),
+      b('⎘', 'copy this frame\'s pose (every keyed part)', () => copyClipPose(t)),
+      b('⎀', clipPoseBoard ? 'paste the copied pose here — ' + clipPoseBoard.from
+        : 'nothing copied', () => pasteClipPose(t, false), !clipPoseBoard || isRef),
+      b('⎀⇋', 'paste the copied pose MIRRORED left-right here', () => pasteClipPose(t, true),
+        !clipPoseBoard || isRef),
+      b('⇋', 'MIRROR this frame left-right in place (left limbs take the right\'s ' +
+        'pose and vice versa; the spine reflects)', () => poseOp(() => {
+          writeClipLocals(t, mirroredLocals(storedLocals(t), clipTrackedParts(c)));
+        }), isRef),
+      c.loop ? b('⇋ +½', 'write this frame MIRRORED half a cycle later ' +
+        `(${Math.round((t + dur / 2) % dur)} ms) — a crawl or walk is one side ` +
+        'authored, then the other side half a period on', () => poseOp(() => {
+          const t2 = Math.round((t + dur / 2) % dur);
+          writeClipLocals(t2, mirroredLocals(storedLocals(t), clipTrackedParts(c)));
+        })) : null,
+      k > 0 ? b('← prev', 'copy the PREVIOUS frame\'s pose into this one', () => poseOp(() => {
+        const loc = storedLocals(times[k - 1]);
+        writeClipLocals(t, new Map(clipTrackedParts(c).map(pi => [pi, loc[pi].rot])));
+      }), isRef) : null,
+      k + 1 < times.length ? b('next →', 'copy the NEXT frame\'s pose into this one',
+        () => poseOp(() => {
+          const loc = storedLocals(times[k + 1]);
+          writeClipLocals(t, new Map(clipTrackedParts(c).map(pi => [pi, loc[pi].rot])));
+        }), isRef) : null,
+      b('✕', 'delete this frame (every key at this time)', () => {
+        if (confirm(`Delete the frame at ${t} ms (every part's key there)?`)) deleteClipFrame(t);
+      })].filter(x => x != null));
+    box.append(row);
+  });
+  if (!times.length)
+    box.append(el('div', { class: 'hint' }, 'No frames yet: turn on ✋ pose and drag a ' +
+      'limb — the first drag makes this cursor a frame.'));
+
+  // ---- the selected part at this time: exact numbers + limb tools ----
+  const sp = selectedPart ? skel?.findPart(selectedPart) : -1;
+  if (sp >= 0 && compiledClip()) {
+    const loc = storedLocals(cur);
+    const e = quatToEuler(loc[sp].rot).map(v => Math.round(v * 10) / 10);
+    const setE = (ax, v) => poseOp(() => {
+      const d = e.slice();
+      d[ax] = v;
+      writeClipLocals(cur, new Map([[sp, eulerToQuat(d)]]));
+    });
+    const ci = poseChains().findIndex(ch => ch.parts.includes(sp));
+    const leg = ci >= 0 && (poseChains()[ci].tag === 'leg' ||
+      /leg|foot/i.test(partNameOf(poseChains()[ci].parts[2])));
+    const mp = skel.findPart(mirrorPartName(selectedPart));
+    box.append(el('div', { class: 'rigbtns', style: 'gap:5px;flex-wrap:wrap;align-items:center;' +
+      'margin-top:5px;border-top:1px dashed var(--line,#3a3a3a);padding-top:4px' },
+      el('b', {}, selectedPart),
+      el('span', { class: 'hint' }, `@ ${cur} ms, degrees from its parent (X→Y→Z):`),
+      ...[0, 1, 2].map(ax => frameNum(e[ax], v => setE(ax, v),
+        { title: `${'XYZ'[ax]} turn of ${selectedPart} relative to its parent at this ` +
+          'time (writes a key here)' })),
+      b('rest', `put ${selectedPart} back to its rest angle at this time`, () => poseOp(() => {
+        writeClipLocals(cur, new Map([[sp, skel.parts[sp].rest.rot]]));
+      })),
+      mp >= 0 && mp !== sp ? b('⇋ from ' + partNameOf(mp), `copy ${partNameOf(mp)}'s pose ` +
+        `onto ${selectedPart}, mirrored, at this time`, () => poseOp(() => {
+          writeClipLocals(cur, new Map([[sp, reflectQ(storedLocals(cur)[mp].rot)]]));
+        })) : null,
+      ci >= 0 ? b(leg ? '⇅ flip knee' : '⇅ flip elbow', 'THE OTHER BEND SOLUTION: the ' +
+        'upper and lower bone turn half a turn about their own lines — the joint and ' +
+        'the end stay put, the bend changes sign. Use it when a frame looks right but ' +
+        'the limb spins going into or out of it. Click again to undo.',
+        () => flipChainAt(ci)) : null));
+  }
+  return box;
+}
+
+/* ==========================================================================
    7. onion skinning
 
    Ghost instances appended to the SAME InstancedMesh as the live model, so
@@ -6538,6 +7446,11 @@ function onKey(ev) {
   if (k === 'k') { setGait(!gaitOn); renderAllPanels(); return true; }
   if (k === 'p') { clipPlaying = !clipPlaying; reseedPose(); renderClipLane(); return true; }
   if (k === 'i') { writeKey(); return true; }
+  // , and . step the clip's FRAMES while one is open (the attacks lane's keys).
+  if (activeClip && laneTab === 'animation' && (k === ',' || k === '.')) {
+    stepClipFrame(k === '.' ? 1 : -1);
+    return true;
+  }
   if (k === '[') { gotoFrame(frameIndex - 1); return true; }
   if (k === ']') { gotoFrame(frameIndex + 1); return true; }
   if (k === 'd') { duplicateFrame(); return true; }
@@ -6616,6 +7529,7 @@ function tick(dt) {
   if (laneTab === 'attacks') ATK.tickUI();
   drawAngleGuide();
   drawPoseHandles();
+  drawClipPoseHandles();
   drawAimOrb();
 }
 
@@ -7432,6 +8346,71 @@ function installTestSeam() {
     },
     handPos: () => { const p = weaponArmParts(); const h = p[2] >= 0 ? p[2] : p[1];
                      return h >= 0 && anim.model[h] ? { ...anim.model[h].pos } : null; },
+    // ---- clip pose frames (section 6c) ----
+    // Open a clip (a library one is copied onto the rig first), ✋ on.
+    clipPoseOpen: async (name) => {
+      if (!clips()[name]) {
+        if (!(await ensureClipOnSkeleton(name))) return false;
+      }
+      laneTab = 'animation';
+      activeClip = name; clipCursorMs = 0; clipPlaying = false; selectedKey = null;
+      clipPoseMode = true; gaitOn = false;
+      reseedPose(); renderAllPanels();
+      return true;
+    },
+    clipGoto: t => gotoClipTime(t),
+    clipSelect: name => { selectedPart = name; bindGizmo(); renderAllPanels(); },
+    clipFrames: () => clipFrameTimes(clipObj()),
+    clipHandles: () => (clipPoseActive() ? clipHandleList(clipPoseState()) : [])
+      .map(h => ({ id: h.id, text: h.text, pos: h.pos.map(v => +v.toFixed(2)) })),
+    // One drag of a handle, as editor.js delivers it: down, N moves, up.
+    dragClipHandle: (id, dx, dy, n = 4) => {
+      clipDragCb.down(id);
+      for (let i = 0; i < n; i++) clipDragCb.drag(id, dx / n, dy / n);
+      clipDragCb.up(id);
+    },
+    clipLocals: t => {
+      const loc = storedLocals(t);
+      const o = {};
+      skel.parts.forEach((p, i) => { o[p.name] = [loc[i].rot.x, loc[i].rot.y, loc[i].rot.z, loc[i].rot.w].map(v => +v.toFixed(4)); });
+      return o;
+    },
+    // Where the handles put a joint vs where the viewport DRAWS it (want 0).
+    clipJointCheck: () => {
+      if (!clipPoseActive()) return null;
+      const st = drawnPoseState(clipPoseState()), off = previewBodyOffset();
+      let worst = 0, at = '';
+      skel.parts.forEach((p, i) => {
+        if (!anim.model[i]) return;
+        const d = AN.vlen(AN.vsub(poseJoint(st, i), AN.vadd(anim.model[i].pos, off)));
+        if (d > worst) { worst = d; at = p.name; }
+      });
+      return { worst: +worst.toFixed(3), at };
+    },
+    clipDoc: () => JSON.parse(JSON.stringify(clipObj() || null)),
+    clipLimits: () => clipLimitReport(),
+    // Library clips open for in-place editing: which, whether the saved
+    // sidecar leaves them out, and which differ from their file.
+    libraryState: () => {
+      const out = sidecarForSave(sc());
+      return {
+        open: [...libraryOpen.keys()],
+        inSavedSidecar: [...libraryOpen.keys()].filter(n => out?.clips?.[n]),
+        changed: [...libraryOpen.entries()].filter(([n, e]) => clips()[n] &&
+          JSON.stringify(libraryFileDoc(n, clips()[n])) !== e.text).map(([n]) => n),
+      };
+    },
+    clipOp: (op, t, arg) => {
+      const c = clipObj();
+      if (op === 'mirror') poseOp(() => writeClipLocals(t, mirroredLocals(storedLocals(t), clipTrackedParts(c))));
+      else if (op === 'half') poseOp(() => writeClipLocals(Math.round((t + c.durationMs / 2) % c.durationMs), mirroredLocals(storedLocals(t), clipTrackedParts(c))));
+      else if (op === 'copy') copyClipPose(t);
+      else if (op === 'paste') pasteClipPose(t, !!arg);
+      else if (op === 'flip') flipChainAt(arg);
+      else if (op === 'move') moveClipFrame(t, arg);
+      else if (op === 'delete') deleteClipFrame(t);
+      else if (op === 'ease') setClipFrameEase(t, arg);
+    },
     tickPreview: (n = 4) => { for (let i = 0; i < n; i++) stepPreviewFixed(kPreviewDt); },
     stylesDoc: () => JSON.stringify(ATK.rawDoc(), null, 2),
     keyedNames: () => (ATK.library()?.styles || []).filter(MELEE.styleKeyed).map(s => s.name),
@@ -7584,16 +8563,30 @@ export const hooks = {
   // it drags, so without this the orange ball would sit at the pre-move
   // position until the part was reselected.
   onModelsChanged: () => { rebuildSkeleton(); bindGizmo(); renderAllPanels(); },
-  onSidecarChanged: () => {
-    selectedPart = null; selectedParts.clear(); selectedSocket = null; activeTag = null; frameIndex = 0;
-    activeClip = null; selectedKey = null; poseEdit = null;
-    clipCursorMs = 0; clipPlaying = false; playing = false;
+  onSidecarChanged: (opts) => {
+    // An UNDO / REDO of this same sidecar keeps the open clip, its cursor and
+    // the selected part when they still exist: posing a clip frame by frame
+    // is a run of small undoable drags, and closing the clip on every Ctrl+Z
+    // threw the author out of the frame they were fixing.
+    const keep = !!opts?.undo;
+    const keepClip = keep && activeClip && clips()[activeClip] ? activeClip : null;
+    // A different document: whatever library clips were open belong to the old one.
+    if (!keep) libraryOpen.clear();
+    const keepPart = keep && selectedPart && limbByName(selectedPart) ? selectedPart : null;
+    const keepMs = keepClip ? clipCursorMs : 0;
+    selectedPart = keepPart; selectedParts.clear(); selectedSocket = null; activeTag = null; frameIndex = 0;
+    activeClip = keepClip; selectedKey = null; poseEdit = null;
+    clipCursorMs = keepMs; clipPlaying = false; playing = false;
     clearTimeout(_touchTimer); ed.discardSidecarUndo();
     rebuildSkeleton();
     bindGizmo(); renderAllPanels();
   },
   onSelectionChanged: () => { renderRigPanel(); },
-  onSave: () => { if (itemDirty) return saveHeldItem(); },
+  onSave: async () => {
+    await saveOpenLibraryClips();
+    if (itemDirty) return saveHeldItem();
+  },
+  sidecarForSave: obj => sidecarForSave(obj),
   // Another session (or another tab) may have saved a limb since this page
   // loaded; rescanning on tab entry is what keeps the shelf from going stale
   // without making the user find the ↻ button.

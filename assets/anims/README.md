@@ -18,6 +18,11 @@ One keyframed clip per `<name>.json`, in the same schema as a mob sidecar's
 Both mirror with the clip (`<name>.mirror` swaps the part names). The tuner's
 clip lane does not edit them; hand-edit the file.
 
+Posing: the clip lane's FRAMES list and ✋ pose handles (rig.js section 6c)
+edit these keys as whole poses frame by frame — drag hands, feet, elbows,
+knees, hips, torso, head; mirror, flip, copy/paste. Import a library clip
+with "← library", pose it, write it back with "→ library".
+
 Written by the tuner's clip lane ("→ library"), read back by "← library"
 (which copies a file into the open sidecar for editing). `LoadMobDefs`
 compiles every file here onto every rig whose part names it fits; a sidecar

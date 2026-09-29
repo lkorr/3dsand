@@ -1,0 +1,164 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>clip pose harness</title>
+<!-- clip_pose_test.html -- scripts/check_clip_pose.sh drives this. The real
+     tuner in an iframe, the human rig, the crawl clip (from assets/anims) and
+     the human's additive walk, posed through the clip lane's pose-frame
+     handles (rig.js section 6c) via window.__tunerRigForTest. Asserts: each
+     handle changes exactly the parts it should, no other frame moves, the
+     handles sit on the drawn limbs, mirror / flip are involutions, copy-paste
+     round-trips, Ctrl+Z restores one drag, an additive clip's reference frame
+     refuses a pose. Nothing is saved. ?shot=1 stops after opening the clip
+     (for a screenshot). Results are POSTed to /api/testresult. -->
+<pre id="out">running…</pre>
+<iframe id="f" src="tuner.html" style="position:absolute;left:0;top:0;width:1400px;height:900px;border:0"></iframe>
+<script>
+const out = document.getElementById('out');
+const log = [];
+const post = () => fetch('/api/testresult', { method: 'POST', body: log.join('\n') }).catch(() => {});
+const say = m => { log.push(m); out.textContent = log.join('\n'); post(); };
+const fails = [];
+const check = (ok, what) => { if (!ok) fails.push(what); say((ok ? 'ok   ' : 'FAIL ') + what); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(pred, ms = 30000, step = 200) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (pred()) return true; await sleep(step); }
+  return pred();
+}
+// parts whose quats differ (q and -q are the same rotation)
+const diffParts = (a, b, eps = 2e-3) => Object.keys(a).filter(k =>
+  a[k].some((v, i) => Math.abs(v - b[k][i]) > eps) && a[k].some((v, i) => Math.abs(-v - b[k][i]) > eps));
+(async () => {
+try {
+  const f = document.getElementById('f');
+  if (!(f.contentDocument && f.contentDocument.readyState === 'complete' && f.contentWindow.location.href.includes('tuner')))
+    await new Promise(r => f.addEventListener('load', r, {once: true}));
+  const doc = f.contentDocument, win = f.contentWindow;
+  const errors = [];
+  win.addEventListener('error', e => errors.push((e.message || 'error') + ' @ ' + e.filename + ':' + e.lineno));
+  [...doc.querySelectorAll('nav.tabs button[data-tab]')].find(b => b.dataset.tab === 'models').click();
+  const view = doc.querySelector('#view-models');
+  await until(() => !!view.querySelector('.edtimeline'));
+  let picker = null, human = null;
+  await until(() => {
+    for (const s of doc.querySelectorAll('select')) {
+      const o = [...s.options].find(o => /mobs\/human\.vox$/.test(o.value));
+      if (o) { picker = s; human = o; return true; }
+    }
+    return false;
+  });
+  picker.value = human.value;
+  picker.dispatchEvent(new win.Event('change', {bubbles: true}));
+  await until(() => [...view.querySelectorAll('*')].some(e => e.textContent === 'armU.R'));
+  const api = win.__tunerRigForTest;
+  const params = new URLSearchParams(location.search);
+  const which = params.get('clip') || 'crawl';
+  say('rig loaded; errors so far: ' + (errors.join(' | ') || 'none'));
+  // The library is IN the clip bar: a dashed chip per assets/anims clip.
+  await until(() => [...view.querySelectorAll('.clipwrap button')].some(b => b.textContent === '▤ ' + which), 15000);
+  const chipL = [...view.querySelectorAll('.clipwrap button')].find(b => b.textContent === '▤ ' + which);
+  check(!!chipL, `library chip "▤ ${which}" in the clip bar`);
+  if (chipL) chipL.click();
+  await until(() => api.libraryState().open.includes(which), 10000);
+  check(api.libraryState().open.includes(which) && api.libraryState().changed.length === 0,
+        'clicking it opens the library clip, unchanged');
+  say('open ' + which + ': ' + await api.clipPoseOpen(which));
+  await sleep(300);
+  api.tickPreview(2);
+  const frames = api.clipFrames();
+  say('frames ' + JSON.stringify(frames));
+  const mid = frames[1];
+  api.clipGoto(mid);
+  api.clipSelect('armL.L');
+  api.tickPreview(2);
+  if (params.has('shot')) {
+    await sleep(500);
+    const fr = view.querySelector('.clipframes');
+    say('frames panel: ' + (fr ? fr.getBoundingClientRect().width + 'x' + fr.getBoundingClientRect().height : 'MISSING'));
+    if (fr) fr.scrollIntoView({ block: 'center' });
+    await sleep(500);
+    say('shot limits: ' + api.clipLimits().join(' | '));
+    say('DONE'); return;
+  }
+  const H = api.clipHandles();
+  say('handles: ' + H.map(h => h.id + '=' + h.text).join(' '));
+  check((api.clipJointCheck()?.worst ?? 1) < 0.01, 'handles sit on the drawn joints ' + JSON.stringify(api.clipJointCheck()));
+  say('limits: ' + api.clipLimits().join(' | '));
+  const id = t => (H.find(h => h.text === t) || {}).id;
+  const ends = frames.filter(t => t !== mid);
+  const drags = [[id('✥ hand.L'), 30, -20, 'armL.L,armU.L,hand.L'], [id('⟲ elbow'), 25, 0, 'armU.L,hand.L'],
+                 [id('↻ armU.L'), 0, 25, 'armU.L'], [id('✥ wrist'), 20, 10, 'hand.L'], [id('⟳ roll'), 20, 0, 'hand.L'],
+                 [id('↻ torso'), 20, 0, 'torso'], [id('↻ head'), 0, 15, 'head']];
+  for (const [hid, dx, dy, expect] of drags) {
+    if (!hid) { check(false, 'handle present for ' + expect); continue; }
+    const others0 = ends.map(t => api.clipLocals(t));
+    const a = api.clipLocals(mid);
+    const h0 = api.clipHandles().find(h => h.id === hid);
+    api.dragClipHandle(hid, dx, dy);
+    api.tickPreview(1);
+    const b = api.clipLocals(mid);
+    const h1 = api.clipHandles().find(h => h.id === hid);
+    const othersMoved = ends.map((t, i) => diffParts(others0[i], api.clipLocals(t)).length).reduce((x, y) => x + y, 0);
+    const ch = diffParts(a, b).sort().join(',');
+    check(ch === expect && othersMoved === 0, `drag ${hid}: changed [${ch}] want [${expect}], other frames moved ${othersMoved}`);
+  }
+  check((api.clipJointCheck()?.worst ?? 1) < 0.01, 'handles on the drawn joints after the drags');
+  const pre = api.clipLocals(mid);
+  api.clipOp('mirror', mid);
+  const post1 = api.clipLocals(mid);
+  const r = pre['armU.R'], l = post1['armU.L'];
+  check(diffParts({ q: l }, { q: [r[0], -r[1], -r[2], r[3]] }).length === 0, 'mirror: armU.L takes armU.R reflected');
+  api.clipOp('mirror', mid);
+  check(diffParts(pre, api.clipLocals(mid)).length === 0, 'mirror twice is the original');
+  const armChain = +(id('✥ hand.L') || 'ik:0').split(':')[1];
+  api.clipOp('flip', mid, armChain);
+  check(diffParts(pre, api.clipLocals(mid)).sort().join(',') === 'armL.L,armU.L,hand.L', 'flip elbow turns the arm chain');
+  api.clipOp('flip', mid, armChain);
+  check(diffParts(pre, api.clipLocals(mid)).length === 0, 'flip twice is the original');
+  api.clipOp('copy', mid);
+  api.clipOp('paste', 300);
+  check(api.clipFrames().includes(300) && diffParts(api.clipLocals(mid), api.clipLocals(300)).length === 0, 'paste at 300 makes a frame with the copied pose');
+  api.clipOp('move', 300, 450);
+  check(JSON.stringify(api.clipFrames()) === JSON.stringify([...frames, 450].sort((x, y) => x - y)), 'move frame 300 -> 450');
+  api.clipOp('delete', 450);
+  check(JSON.stringify(api.clipFrames()) === JSON.stringify(frames), 'delete frame 450');
+  const ls = api.libraryState();
+  check(ls.changed.includes(which) && ls.inSavedSidecar.length === 0,
+        'an edited library clip is marked for its file and left out of the saved sidecar ' + JSON.stringify(ls));
+  const docBefore = JSON.stringify(api.clipDoc());
+  api.clipGoto(mid);
+  api.dragClipHandle(id('✥ hand.L'), 40, 0);
+  const changed = JSON.stringify(api.clipDoc()) !== docBefore;
+  doc.body.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  await sleep(200);
+  const afterUndo = JSON.stringify(api.clipDoc());
+  check(changed && afterUndo === docBefore, 'Ctrl+Z undoes one drag and keeps the clip open');
+  if (afterUndo !== docBefore) { let i = 0; while (afterUndo[i] === docBefore[i]) i++; say('  first diff @' + i + ': ' + docBefore.slice(i - 60, i + 80) + '  VS  ' + afterUndo.slice(i - 60, i + 80)); }
+  say('open walk: ' + await api.clipPoseOpen('walk'));
+  api.tickPreview(2);
+  const wf = api.clipFrames();
+  say('walk frames ' + JSON.stringify(wf));
+  api.clipSelect('armL.R');
+  api.clipGoto(wf[0]);
+  api.tickPreview(1);
+  const hidw = (api.clipHandles().find(h => h.text === '✥ hand.R') || {}).id;
+  const w0 = api.clipLocals(wf[0]);
+  api.dragClipHandle(hidw, 30, -20);
+  check(diffParts(w0, api.clipLocals(wf[0])).length === 0, 'additive walk: the reference frame refuses a pose');
+  const wm = wf[1];
+  api.clipGoto(wm);
+  api.tickPreview(1);
+  const a2 = api.clipLocals(wm);
+  const o2 = wf.filter(t => t !== wm).map(t => api.clipLocals(t));
+  api.dragClipHandle(hidw, 30, -20);
+  api.tickPreview(1);
+  check(diffParts(a2, api.clipLocals(wm)).sort().join(',') === 'armL.R,armU.R,hand.R' &&
+        wf.filter(t => t !== wm).every((t, i) => diffParts(o2[i], api.clipLocals(t)).length === 0),
+        'additive walk: a later frame poses, the others do not move');
+  check((api.clipJointCheck()?.worst ?? 1) < 0.01, 'additive walk: handles on the drawn joints');
+  check(!errors.length, 'no page errors ' + errors.join(' | '));
+  say(fails.length ? `check_clip_pose: FAIL (${fails.length})` : 'check_clip_pose: PASS');
+  say('DONE');
+} catch (e) { say('EXCEPTION ' + (e && e.stack || e)); }
+})();
+</script>
