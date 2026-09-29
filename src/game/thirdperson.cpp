@@ -42,6 +42,19 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
     // Face where you RUN. Below the threshold hold the current facing rather
     // than chasing a near-zero velocity vector, which would spin on the spot.
     wantHeading = moving ? std::atan2(planarVel.x, planarVel.z) : heading;
+  } else if (prone >= 0.5f) {
+    // ...EXCEPT ON THE FLOOR. A crawling body does not swing round every time
+    // you glance aside: the HEAD turns (the head look), and the body only
+    // drags itself round once the view is further off it than a neck can
+    // crane (avatar.headLookYaw) -- and then only far enough to bring the
+    // view back to that limit, at crawlTurnRate below.
+    float off = camHeading - heading;
+    while (off > 3.14159265f) off -= 6.2831853f;
+    while (off < -3.14159265f) off += 6.2831853f;
+    const float crane = av.headLookYaw * (3.14159265f / 180.0f);
+    wantHeading = std::fabs(off) <= crane
+                      ? heading
+                      : camHeading - std::copysign(crane, off);
   }
 
   float d = wantHeading - heading;
