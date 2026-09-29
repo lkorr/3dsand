@@ -5953,13 +5953,71 @@ fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
   return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, d.x);
 }
 
+// One drop of the rain overlay against the view ray: the drop is a real 3-D
+// segment centred at c along fallDir (rain: the motion blur of one frame) or
+// a point (snow), and the ray is tested against it by distance. Every drop is
+// drawn no thinner than ~0.7 px and dimmed by how much it had to be widened,
+// so a far streak thins out instead of shimmering between present and absent.
+fn rainDropCover(camM : vec3f, rd : vec3f, c : vec3f, fallDir : vec3f, sp : f32,
+                 snow : f32, pxAng : f32) -> f32 {
+  // A drop within half a metre of the eye would cover the screen as a
+  // smear: real ones that close are out of focus and gone in a frame.
+  if (dot(c - camM, rd) < 0.5) { return 0.0; }
+  let halfLen = mix(0.17, 0.0, snow) * sp;
+  let a = c - fallDir * halfLen;
+  let ab = fallDir * (2.0 * halfLen);
+  // Closest points between the ray (cam + rd s) and the segment a + ab u.
+  let w0 = camM - a;
+  let bb = dot(ab, ab);
+  let rdab = dot(rd, ab);
+  let rdw = dot(rd, w0);
+  let abw = dot(ab, w0);
+  let den = bb - rdab * rdab;
+  let u = select(clamp((abw - rdab * rdw) / den, 0.0, 1.0), 0.5, den < 1e-8);
+  let pc = a + ab * u;
+  let s = max(dot(pc - camM, rd), 0.01);
+  let dist = length(camM + rd * s - pc);
+  let width = mix(0.0025, 0.011, snow);
+  let wEff = max(width, pxAng * s * 0.7);
+  return exp(-(dist * dist) / (wEff * wEff)) * (width / wEff);
+}
+// Snow's flutter for drop n of the column hashed hsh: (bob along the column in
+// metres, sway across it in COLUMNS). Up to 0.45 period along and 0.9 column
+// across, at 0.4..1.1 Hz each. At snow's fall speed that is a +-60% swing in a
+// flake's speed and a sideways drift of a third of it — every flake on its own
+// path, which is what makes snow read as snow.
+fn rainFlutter(hsh : u32, n : f32, period : f32, snow : f32) -> vec2f {
+  let fh = pcg(hsh ^ (u32(i32(n) + 1000000) * 0x85EBCA6Bu));
+  let wv = 2.5 + 4.5 * f32(fh & 255u) / 255.0;
+  let wt = 2.5 + 4.5 * f32((fh >> 8u) & 255u) / 255.0;
+  let av = 0.45 * f32((fh >> 16u) & 255u) / 255.0;
+  let at = 0.9 * f32((fh >> 24u) & 255u) / 255.0;
+  let phv = f32((fh >> 3u) & 1023u) * 0.006136;
+  let pht = f32((fh >> 13u) & 1023u) * 0.006136;
+  return vec2f(sin(R.time * wv + phv) * av * period * snow,
+               sin(R.time * wt + pht) * at * snow);
+}
+// One lattice layer's drops over the pixel, dimmed where the drop's cell is
+// roofed: the openness there, looking up. Unknown = open.
+fn rainComposite(color : vec3f, aIn : f32, p : vec3f, dropLit : vec3f) -> vec3f {
+  var a = aIn;
+  if (a < 0.003) { return color; }
+  let cell = vec3<i32>(floor(p / VOXEL_METERS));
+  if (inBounds(cell)) {
+    let o = opennessAt(cell, p / VOXEL_METERS, vec3f(0.0, 1.0, 0.0), &openness, &opennessGen);
+    if (o >= 0.0) { a *= clamp(o * 2.0 - 0.4, 0.0, 1.0); }
+  }
+  return mix(color, dropLit, clamp(a, 0.0, 1.0));
+}
 // Rain and snow around the eye. Four cylinders at 1.2 / 2.6 / 5.5 / 11 m, a
 // lattice of drops on each (columns with hashed phase and speed), sheared
 // along the wind. The cylinder only FINDS the drop a ray passes: the drop
 // itself is a real 3-D segment (rain, the motion blur of one frame) or point
 // (snow), and the ray is tested against it by distance — painting streaks on
 // the cylinder's surface instead stretched them into arcs and ribbons wherever
-// the view grazes the cylinder, i.e. looking up or down. A layer is skipped
+// the view grazes the cylinder, i.e. looking up or down. Views near the fall
+// axis, which no cylinder can see, read four horizontal planes instead (see
+// "TWO LATTICES" below). A layer is skipped
 // where the scene is nearer than it; a drop is dropped where the openness
 // grid says its cell cannot see the sky.
 // Share of the (20 m averaged) wind the streaks lean with; see rainOverlay.
@@ -6003,109 +6061,133 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   // Fall direction: down, carried along by the wind. A rain drop is a short
   // SEGMENT along it (motion blur over a frame's exposure); a flake a point.
   let fallDir = normalize(vec3f(wind.x, -fallV, wind.y));
-  // THE RAY IN THE SHEARED FRAME. The lattice's cylinders are upright in the
-  // frame sheared along the fall, i.e. they LEAN with fallDir in the world,
-  // so the ray must be intersected with the leaning cylinder: at distance t
-  // its sheared horizontal offset is t * dq. Intersecting the upright world
-  // cylinder instead (t = radius / |rd.xz|) put the lookup point off the
-  // drops' cylinder by an amount that grew as the view turned toward the
-  // lean, until looking along it found no drop at all — an empty tube round
-  // the fall axis, obvious under snow's 56-degree lean. What remains is the
-  // cone where the view runs down the axis itself (|dq| -> 0), where the
-  // cylinder is seen end-on; the far cap below keeps it a few degrees wide.
+  // THE RAY IN THE SHEARED FRAME. The lattice's columns are upright in the
+  // frame sheared along the fall, i.e. they LEAN with fallDir in the world:
+  // at distance t along the ray its sheared horizontal offset is t * dq, and
+  // dq -> 0 is the view running straight down the fall axis.
   let dq = rd.xz + wind * (rd.y / fallV);
   let hq = length(dq);
-  if (hq < 0.01) { return colorIn; }
-  let farCap = mix(8.0, 24.0, snow);
+  // TWO LATTICES, ONE PER VIEW. Rings of columns round the fall axis (the
+  // cylinders) find the drop a sideways ray passes, but a ray along the axis
+  // runs PARALLEL to every ring: t = radius / hq goes to infinity and the
+  // cylinders see nothing — a cone of no rain round the fall line, straight
+  // up and straight down through the eye (it survived the fix of the
+  // upright-vs-leaning cylinder, which was a different, wider hole). So the
+  // steep views read their columns off a second lattice: a square grid on
+  // horizontal planes above/below the eye, which a steep ray crosses
+  // head-on. They crossfade on the view's angle off the fall axis; the grid
+  // pitch sqrt(colW * period) gives a plane the same drops per square metre
+  // of surface as a ring, so the handoff keeps its density.
+  let sinAx = hq / max(length(vec2f(hq, rd.y)), 1e-6);
+  let wCyl = smoothstep(0.25, 0.5, sinAx);
   // Snow flutters: each flake bobs along its column and sways across it, at
   // its own rate and amplitude, so no two share a velocity. The sway may
   // carry a flake into the next column, so snow searches the neighbours
   // (colSpan) and one more drop along the column; rain stays 1 x 2.
   let colSpan = select(0, 1, snow > 0.01);
   let dnHi = select(0, 1, snow > 0.01);
-  for (var k = 0u; k < 4u; k++) {
-    let radius = 1.2 * pow(2.12, f32(k));
-    let t = radius / hq;
-    if (t > sceneM || t > radius * farCap) { continue; }
-    let p = camM + rd * t;
-    // The lattice lives in a frame SHEARED along the fall: each column of
-    // drops is a straight slanted line in 3-D, so it stays one on screen.
-    let hRel = p.y - camM.y;
-    let q = dq * t;
-    let ang = atan2(q.x, q.y);
-    let colW = mix(0.05, 0.06, snow) * (1.0 + f32(k) * 0.35);
-    let colF = ang * radius / colW;
-    let period = mix(1.6, 0.42, snow) * (1.0 + f32(k) * 0.25);
-    var best = 0.0;
-    for (var dc = -colSpan; dc <= colSpan; dc++) {
-      let col = floor(colF) + f32(dc);
-      let hsh = pcg(u32(i32(col) + 100000) ^ (k * 0x9E3779B9u));
-      let jx = f32(hsh & 1023u) / 1023.0;
-      // Per-column fall speed: +-25% for rain, +-50% for snow.
-      let sp = 1.0 + mix(0.25, 0.5, snow) * (f32((hsh >> 10u) & 255u) / 127.5 - 1.0);
-      let ph = f32((hsh >> 18u) & 1023u) / 1023.0;
-      // Which drop of this column the ray passes nearest: the drop's centre
-      // height in the sheared frame, then back to the world.
-      let fallOff = R.time * fallV * sp;
-      let vNow = (hRel + fallOff) / period + ph;
-      for (var dn = -1; dn <= dnHi; dn++) {
-        let n = floor(vNow) + f32(dn);
-        var hc = (n + 0.5 - ph) * period - fallOff;
-        var angC = (col + 0.25 + 0.5 * jx) * colW / radius;
-        if (snow > 0.01) {
-          // Flutter: up to 0.45 period along the column (the n search above
-          // covers it) and 0.9 column across (the neighbour search does), at
-          // 0.4..1.1 Hz each. At snow's fall speed that is a +-60% swing in a
-          // flake's speed and a sideways drift of a third of it — every flake
-          // on its own path, which is what makes snow read as snow.
-          let fh = pcg(hsh ^ (u32(i32(n) + 1000000) * 0x85EBCA6Bu));
-          let wv = 2.5 + 4.5 * f32(fh & 255u) / 255.0;
-          let wt = 2.5 + 4.5 * f32((fh >> 8u) & 255u) / 255.0;
-          let av = 0.45 * f32((fh >> 16u) & 255u) / 255.0;
-          let at = 0.9 * f32((fh >> 24u) & 255u) / 255.0;
-          let phv = f32((fh >> 3u) & 1023u) * 0.006136;
-          let pht = f32((fh >> 13u) & 1023u) * 0.006136;
-          hc += sin(R.time * wv + phv) * av * period * snow;
-          angC += sin(R.time * wt + pht) * at * snow * colW / radius;
+  let dropLit = lit * mix(1.0, 1.6, snow);
+  if (wCyl > 0.0 && hq >= 0.01) {
+    for (var k = 0u; k < 4u; k++) {
+      let radius = 1.2 * pow(2.12, f32(k));
+      let t = radius / hq;
+      if (t > sceneM) { continue; }
+      let p = camM + rd * t;
+      // The lattice lives in a frame SHEARED along the fall: each column of
+      // drops is a straight slanted line in 3-D, so it stays one on screen.
+      let hRel = p.y - camM.y;
+      let q = dq * t;
+      let ang = atan2(q.x, q.y);
+      let colW = mix(0.05, 0.06, snow) * (1.0 + f32(k) * 0.35);
+      let colF = ang * radius / colW;
+      let period = mix(1.6, 0.42, snow) * (1.0 + f32(k) * 0.25);
+      var best = 0.0;
+      for (var dc = -colSpan; dc <= colSpan; dc++) {
+        let col = floor(colF) + f32(dc);
+        let hsh = pcg(u32(i32(col) + 100000) ^ (k * 0x9E3779B9u));
+        let jx = f32(hsh & 1023u) / 1023.0;
+        // Per-column fall speed: +-25% for rain, +-50% for snow.
+        let sp = 1.0 + mix(0.25, 0.5, snow) * (f32((hsh >> 10u) & 255u) / 127.5 - 1.0);
+        let ph = f32((hsh >> 18u) & 1023u) / 1023.0;
+        // Which drop of this column the ray passes nearest: the drop's centre
+        // height in the sheared frame, then back to the world.
+        let fallOff = R.time * fallV * sp;
+        let vNow = (hRel + fallOff) / period + ph;
+        for (var dn = -1; dn <= dnHi; dn++) {
+          let n = floor(vNow) + f32(dn);
+          var hc = (n + 0.5 - ph) * period - fallOff;
+          var angC = (col + 0.25 + 0.5 * jx) * colW / radius;
+          if (snow > 0.01) {
+            let fl = rainFlutter(hsh, n, period, snow);
+            hc += fl.x;
+            angC += fl.y * colW / radius;
+          }
+          let qc = vec2f(sin(angC), cos(angC)) * radius;
+          let xz = qc - wind * (hc / fallV);
+          let c = camM + vec3f(xz.x, hc, xz.y);
+          best = max(best, rainDropCover(camM, rd, c, fallDir, sp, snow, pxAng));
         }
-        let qc = vec2f(sin(angC), cos(angC)) * radius;
-        let xz = qc - wind * (hc / fallV);
-        let c = camM + vec3f(xz.x, hc, xz.y);
-        // A drop within half a metre of the eye would cover the screen as a
-        // smear: real ones that close are out of focus and gone in a frame.
-        if (dot(c - camM, rd) < 0.5) { continue; }
-        // Distance from the ray to the drop (point or segment).
-        let halfLen = mix(0.17, 0.0, snow) * sp;
-        let a = c - fallDir * halfLen;
-        let b = c + fallDir * halfLen;
-        let ab = b - a;
-        // Closest points between the ray (cam + rd s) and the segment a + ab u.
-        let w0 = camM - a;
-        let bb = dot(ab, ab);
-        let rdab = dot(rd, ab);
-        let rdw = dot(rd, w0);
-        let abw = dot(ab, w0);
-        let den = bb - rdab * rdab;
-        var u = select(clamp((abw - rdab * rdw) / den, 0.0, 1.0), 0.5, den < 1e-8);
-        let pc = a + ab * u;
-        let s = max(dot(pc - camM, rd), 0.01);
-        let dist = length(camM + rd * s - pc);
-        let width = mix(0.0025, 0.011, snow);
-        let wPix = pxAng * s * 0.7;
-        let wEff = max(width, wPix);
-        let fade = width / wEff;
-        best = max(best, exp(-(dist * dist) / (wEff * wEff)) * fade);
       }
+      let a = best * amount * wCyl * mix(0.35, 0.9, snow) / (1.0 + f32(k) * 0.4);
+      color = rainComposite(color, a, p, dropLit);
     }
-    var a = best * amount * mix(0.35, 0.9, snow) / (1.0 + f32(k) * 0.4);
-    if (a < 0.003) { continue; }
-    // Roofed? The openness at the drop's cell, looking up. Unknown = open.
-    let cell = vec3<i32>(floor(p / VOXEL_METERS));
-    if (inBounds(cell)) {
-      let o = opennessAt(cell, p / VOXEL_METERS, vec3f(0.0, 1.0, 0.0), &openness, &opennessGen);
-      if (o >= 0.0) { a *= clamp(o * 2.0 - 0.4, 0.0, 1.0); }
+  }
+  // The planes: the same four distances as the rings, above the eye looking
+  // up and below it looking down.
+  if (wCyl < 1.0 && abs(rd.y) > 1e-3) {
+    let sgnY = sign(rd.y);
+    let dd = dot(dq, dq);
+    for (var k = 0u; k < 4u; k++) {
+      let hPl = sgnY * 1.2 * pow(2.12, f32(k));
+      let t = hPl / rd.y;
+      if (t > sceneM) { continue; }
+      let p = camM + rd * t;
+      let colW = mix(0.05, 0.06, snow) * (1.0 + f32(k) * 0.35);
+      let period = mix(1.6, 0.42, snow) * (1.0 + f32(k) * 0.25);
+      let g = sqrt(colW * period);
+      // The 2 x 2 columns nearest where the ray crosses the plane.
+      let base = vec2<i32>(floor((dq * t) / g - 0.5));
+      var best = 0.0;
+      for (var ci = 0; ci < 2; ci++) {
+        for (var cj = 0; cj < 2; cj++) {
+          let cl = base + vec2<i32>(ci, cj);
+          let hsh = pcg((u32(cl.x + 100000) * 0x27D4EB2Fu) ^ u32(cl.y + 100000)
+                        ^ (k * 0x9E3779B9u) ^ 0x5BD1E995u);
+          let h2 = pcg(hsh);
+          let jx = f32(hsh & 1023u) / 1023.0;
+          let jz = f32(h2 & 1023u) / 1023.0;
+          let sp = 1.0 + mix(0.25, 0.5, snow) * (f32((hsh >> 10u) & 255u) / 127.5 - 1.0);
+          let ph = f32((hsh >> 18u) & 1023u) / 1023.0;
+          let colQ = (vec2f(cl) + vec2f(0.2 + 0.6 * jx, 0.2 + 0.6 * jz)) * g;
+          // The height at which the ray passes this column (closest approach
+          // in the sheared frame, where the column is vertical), held inside
+          // this plane's slab so neighbouring planes do not redraw its drops.
+          var yAt = hPl;
+          if (dd > 1e-8) {
+            yAt = clamp(dot(colQ, dq) / dd * rd.y, hPl - 0.5 * period, hPl + 0.5 * period);
+          }
+          // The two drops bracketing that height (plus one more for snow's bob).
+          let fallOff = R.time * fallV * sp;
+          let vNow = (yAt + fallOff) / period + ph - 0.5;
+          for (var dn = -dnHi; dn <= 1; dn++) {
+            let n = floor(vNow) + f32(dn);
+            var hc = (n + 0.5 - ph) * period - fallOff;
+            var qd = colQ;
+            if (snow > 0.01) {
+              let fl = rainFlutter(hsh, n, period, snow);
+              hc += fl.x;
+              let sa = f32(h2 >> 22u) * 0.006136;
+              qd += vec2f(cos(sa), sin(sa)) * fl.y * g * 0.5;
+            }
+            let xz = qd - wind * (hc / fallV);
+            let c = camM + vec3f(xz.x, hc, xz.y);
+            best = max(best, rainDropCover(camM, rd, c, fallDir, sp, snow, pxAng));
+          }
+        }
+      }
+      let a = best * amount * (1.0 - wCyl) * mix(0.35, 0.9, snow) / (1.0 + f32(k) * 0.4);
+      color = rainComposite(color, a, p, dropLit);
     }
-    color = mix(color, lit * mix(1.0, 1.6, snow), clamp(a, 0.0, 1.0));
   }
   return color;
 }
