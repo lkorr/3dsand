@@ -5789,6 +5789,24 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   `bleed.woundHeals`, so a zombie's cuts go on rotting outward and shedding its
   limbs while the living keep theirs. A severed limb is debris and has never
   had the table, so a part already on the ground rots either way.
+- **Living blood does not dry** (2026-09-29). The same table fired blood's
+  rule on the ANATOMY recipe's blood too (speckled through the muscle), and it
+  is a `"drying"` rule (reactions.json; `sim/bodyreact.h` `ruleDrying`). It
+  only ran once something had built the limb's burn index -- a coat pass: a
+  foot on stained ground, rain, a wet coat -- because `BuildBurnIndex` seeded
+  the front with every self-active voxel, and then the blood dried at a ~3 s
+  half-life with no wound and no damage event; each voxel that left bared
+  bone, the bared-bone pass painted it with the creature's blood, and
+  `ShedCoat` printed that round Harrowby's green on every villager. **Rule:
+  on a living body whose wounds heal (`revive` armed), a drying rule fires
+  only on a remembered soak (`MobLimb::woundWas`,
+  `BurnLimbView::LivingKeeps`); a voxel whose only self rule is drying
+  (`selfDryingOnly`) and is not a soak is not alight and never joins the
+  front.** Blood leaves a living body only through a wound. The dead and the
+  undead (`woundHeals` off) still dry as before. Counted as
+  `BurnStats::livingDryRefused`; gates `living-blood` (a storm on a live
+  dummy, then on its corpse as the control) and `village-harrowby` F (per
+  villager: skin and anatomy-blood voxels unchanged, no blood coat).
 - **Two structural sever rules, both blade-only.** *Cut through*: a component of
   the limb at least `gore.woundSeverFraction` of what it had is no longer joined
   to the anchor — the edge came out the other side. *Hanging by a thread*: the
@@ -21058,14 +21076,11 @@ turned round, then from above.
   every world cell stays put); the alehouse's and longhouse's twelve open
   shutters, which touched their walls only along an edge and fell off as
   32-voxel debris islands whenever the island scan reached them, got two
-  timber hinge knuckles each. FOUND, NOT FIXED: on some days every villager
-  ends with a blood coat and tracks red prints along the paths with no blood
-  lost and no hp lost -- `SANDVOX_COAT_TRACE=<mat id>` (env; mob.cpp) traced
-  it to body voxels of the human anatomy's own `blood` material leaving
-  Maud's lower leg as air (`BurnOneLimb`'s removal, not a world rule, not a
-  splatter, not a wound stain), which bares its neighbours and paints the
-  `bareBlood` coat; the others pick it up from the stained gravel. Which of
-  her own voxel rules fires is the next question for the gore owner.
+  timber hinge knuckles each. The villagers' blood prints that followed (a
+  blood coat on everyone, no blood or hp lost) were living anatomy blood
+  DRYING -- FIXED 2026-09-29, see "Living blood does not dry" in the wounds
+  section; `SANDVOX_COAT_TRACE` now names the limb, the rule kind that removed
+  the voxel and why the limb was awake at `BurnOneLimb`'s removal.
 - `scripts/paint_ground.mjs`: paths painted into the map's ground-relative
   edit layer along a polyline -- the F8 editor edits houses, and the ground
   between them belongs to no house.

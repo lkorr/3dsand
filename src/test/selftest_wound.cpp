@@ -4926,6 +4926,125 @@ Status GateMobRain(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- living-blood: a LIVING body's anatomy blood does not dry -----------------
+//
+// Harrowby, 2026-09-29: over one quiet day every villager ended up tracking
+// blood round the green with no blood lost. SANDVOX_COAT_TRACE named it: the
+// anatomy recipe's blood (speckled through the muscle, assets/mobs/human.json)
+// left a LIVING limb by its own decay rule -- blood's `"drying"` rule, blood ->
+// air, authored for a pool on the ground -- on a limb with no world threat
+// near it, awake only because a coat pass (a foot on stained ground, rain, a
+// wet coat) had built its burn index and the index seeded the front with every
+// self-active voxel. Each voxel that left bared bone; the bared-bone pass
+// painted the bone with the creature's blood; the feet printed it.
+//
+// The fixture is the general case, not the village: a pinned dummy under a
+// storm (rain holds the index every tick, mob-rain's word), then the SAME
+// dummy dead under the same storm. Claims, per arm, over every base limb:
+//   * LIVING: not one blood voxel gone, not one skin voxel gone, no blood coat,
+//     nothing bled -- and the fixture reached the path: the rain coated it and
+//     a limb holds a burn index (the build that used to seed the front with
+//     the anatomy blood), or the fixture proves nothing.
+//   * DEAD (the control that proves the counter can see a loss): a corpse's
+//     blood still dries, so its count falls. The dead do not heal
+//     (Mob::WoundsHeal), and drying is what a corpse does.
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): as mob-rain, the rain word is this
+// fixture's input on MobSystem, which the real tick's phase H overwrites.
+Status GateLivingBlood(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  const uint32_t mBlood = mobs.MaterialIdNamed("blood");
+  if (!t.valid() || !mBlood) {
+    detail = "no bleeding mob def / no blood material";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  const int nLimbs = (int)def.limbs.size();
+  auto count = [&](uint64_t& skin, uint64_t& blood) {
+    skin = blood = 0;
+    for (int li = 0; li < nLimbs; li++) {
+      skin += mobs.LimbSkinVoxelCount(id, li);
+      blood += mobs.LimbMaterialCount(id, li, mBlood);
+    }
+  };
+  uint32_t simTick = 54000;
+  auto run = [&](int ticks) {
+    for (int k = 0; k < ticks; k++) {
+      ++simTick;
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+  };
+  auto coatOf = [&](uint32_t mat) -> uint32_t {
+    mobs.RecountCoatOn(id, simTick);
+    const LimbCoat body = mobs.BodyCoat(id);
+    uint32_t sum = 0;
+    for (const CoatEntry& en : body.top)
+      if (en.mat == mat) sum += en.sumAmt;
+    return sum;
+  };
+  const uint32_t mWater = mobs.MaterialIdNamed("water");
+  const int ticks = (int)BaselineNumber("livingBloodTicks", 600.0);
+  // weather::SimRainWord's layout: rain | damp << 8 | wetness << 16.
+  const uint32_t storm = 242u | (153u << 8) | (255u << 16);
+  uint64_t skin0 = 0, blood0 = 0, skin1 = 0, blood1 = 0;
+  count(skin0, blood0);
+  mobs.ResetBurnStats();
+  mobs.SetWeatherRain(storm);
+  run(ticks);
+  count(skin1, blood1);
+  const uint32_t refused = mobs.Burn().livingDryRefused;
+  // THE FIXTURE REACHED THE PATH: the rain holds a burn index on the limbs,
+  // and building one is what seeded the front with the anatomy blood before
+  // the fix (BuildBurnIndex now leaves it off, so the rule loop's refusal is
+  // a backstop and may count 0).
+  int indexed = 0;
+  for (int li = 0; li < nLimbs; li++)
+    if (mobs.LimbBody(id, li) && mobs.LimbBurnStateOf(id, li).indexed) indexed++;
+  const uint32_t bloodCoat = coatOf(mBlood);
+  const uint32_t wet = mWater ? coatOf(mWater) : 0u;
+  const float bled = mobs.BloodLost(id);
+  // THE CONTROL: the same body, dead, the same storm.
+  uint64_t deadSkin0 = 0, deadBlood0 = 0, deadSkin1 = 0, deadBlood1 = 0;
+  bool died = false;
+  if (Mob* m = mobs.FindMobById(id)) {
+    m->Die();
+    died = true;
+  }
+  count(deadSkin0, deadBlood0);
+  run(ticks);
+  count(deadSkin1, deadBlood1);
+  mobs.SetWeatherRain(0u);
+  mobs.Reset();
+  const bool livingOk = blood1 == blood0 && skin1 == skin0 && bloodCoat == 0 && bled <= 0.0f;
+  const bool exercised = blood0 > 0 && indexed > 0 && wet > 0;
+  const bool controlOk = died && deadBlood1 < deadBlood0;
+  const bool ok = livingOk && exercised && controlOk;
+  detail = Format("%s: %s under a storm for %d ticks -- LIVING: anatomy blood %llu -> %llu, skin %llu -> %llu, "
+                  "blood coat %u, bled %.1f (want all unchanged / 0); %d limbs holding a burn index (want > 0), "
+                  "drying refused in the rule loop %u, water coat %u (want > 0) | DEAD control: blood %llu -> "
+                  "%llu (want it to fall)",
+                  ok ? "PASS" : "FAIL", t.defName.c_str(), ticks, (unsigned long long)blood0,
+                  (unsigned long long)blood1, (unsigned long long)skin0, (unsigned long long)skin1, bloodCoat,
+                  bled, indexed, refused, wet, (unsigned long long)deadBlood0, (unsigned long long)deadBlood1);
+  std::printf("living-blood: %s\n", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- rain-oil: oil goes on OVER rain, and rain takes it back off ---------
 //
 // Owner report 2026-09-23: oiled in a storm, the HUD said only "water", and
@@ -9182,6 +9301,8 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-splatter", "mob", {}, false, GateCorpseSplatter, false},
       {"body-coat", "mob", {}, false, GateBodyCoat, false},
       {"mob-rain", "mob", {}, false, GateMobRain, false},
+      // A living body's anatomy blood does not dry (no wound, no loss).
+      {"living-blood", "mob", {}, false, GateLivingBlood, false},
       {"rain-oil", "mob", {}, false, GateRainOil, false},
       {"blast-stain", "mob", {}, false, GateBlastStain, false},
       {"wound-heal", "mob", {}, false, GateWoundHeal, false},

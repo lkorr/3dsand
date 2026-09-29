@@ -864,6 +864,7 @@ const char* const kOrder[] = {
     // body-stain, same world regeneration on the way out.
     "body-coat",
     "mob-rain",
+    "living-blood",
     "rain-oil",
     // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
     // crater took no voxel from stays clean, and the limb it did hit gets a

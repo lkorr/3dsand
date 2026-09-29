@@ -25,7 +25,12 @@
 //                          tests/baseline.json -- the same day on every boot
 //                          (why not an in-process second run: see the gate);
 //                       F. nobody bleeds (a door leaf or a jostle that draws
-//                          blood is a bug in the village);
+//                          blood is a bug in the village), and per villager
+//                          no skin voxel and none of its own anatomy blood
+//                          is gone at dusk and it wears no blood coat (blood
+//                          that left somebody with no wound: living anatomy
+//                          blood used to DRY, bare the bone and be tracked
+//                          round the green by the feet);
 //                       G. NO TREE IN A HOUSE: right after worldgen, not one
 //                          voxel of a tree material (every assets/trees/*.json
 //                          bark / leaf / autumnLeaf) inside any structure's
@@ -444,12 +449,38 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
   if (out.spawned != (int)v.npcs.size())
     out.why.push_back(Format("%d of %zu villagers spawned after %d ticks", out.spawned,
                              v.npcs.size(), waited));
+  // WHAT A BODY IS MADE OF, dawn and dusk (F): every base limb's skin voxels,
+  // and how many of them are the creature's own blood (the anatomy recipe's
+  // speckle through the muscle). An ordinary day may move neither -- nothing
+  // cut anyone -- and a blood coat on a villager is blood that left SOMEONE
+  // with no wound (the drying of living anatomy blood, 2026-09-29).
+  const uint32_t bloodMat = c.mobs.MaterialIdNamed("blood");
+  struct Makeup {
+    uint64_t skin = 0, blood = 0;
+  };
+  auto makeupOf = [&](const Mob& m) {
+    Makeup k;
+    for (int li = 0; li < m.AppendedBase(); li++) {
+      k.skin += c.mobs.LimbSkinVoxelCount(m.Id(), li);
+      if (bloodMat) k.blood += c.mobs.LimbMaterialCount(m.Id(), li, bloodMat);
+    }
+    return k;
+  };
+  auto bloodCoatOf = [&](const Mob& m) -> uint32_t {
+    const LimbCoat bc = c.mobs.BodyCoat(m.Id());
+    uint32_t sum = 0;
+    for (int k = 0; k < kCoatTop; k++)
+      if (bc.top[k].mat == bloodMat) sum += bc.top[k].sumAmt;
+    return sum;
+  };
+  std::map<std::string, Makeup> dawnMakeup;
   // What each body carries when it wakes (its coats; see the dusk line).
   {
     std::string dawn;
     for (const refs::Ref* n : v.npcs)
       if (const Mob* m = c.mobs.FindMobByRef(n->id)) {
         const LimbCoat bc = c.mobs.BodyCoat(m->Id());
+        dawnMakeup[n->id] = makeupOf(*m);
         dawn += Format("%s%s %u", dawn.empty() ? "" : ", ", n->id.substr(n->id.find('/') + 1).c_str(), bc.sumAmt);
       }
     out.lines += "coat sums at dawn: " + dawn + "; ";
@@ -558,6 +589,21 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
     const float bled = body != nullptr ? body->BloodLost() : 0.0f;
     if (bled > 0.0f)
       out.why.push_back(Format("%s lost %.1f blood over an ordinary day", n->id.c_str(), bled));
+    // ...and nobody's body changed, or picked blood up (F, per villager).
+    std::string makeup;
+    if (body != nullptr && dawnMakeup.count(n->id)) {
+      const Makeup d0 = dawnMakeup[n->id], d1 = makeupOf(*body);
+      const uint32_t bc = bloodCoatOf(*body);
+      const long long lostSkin = (long long)d0.skin - (long long)d1.skin;
+      const long long lostBlood = (long long)d0.blood - (long long)d1.blood;
+      makeup = Format(", skin %llu->%llu, anatomy blood %llu->%llu, blood coat %u", (unsigned long long)d0.skin,
+                      (unsigned long long)d1.skin, (unsigned long long)d0.blood, (unsigned long long)d1.blood, bc);
+      if (lostSkin != 0 || lostBlood != 0)
+        out.why.push_back(Format("%s's body changed over an ordinary day: %lld skin voxels, %lld of its own "
+                                 "blood voxels gone", n->id.c_str(), lostSkin, lostBlood));
+      if (bc != 0)
+        out.why.push_back(Format("%s ends the day wearing %u levels of blood nobody bled", n->id.c_str(), bc));
+    }
     // What the body carries at the end of the day (a coat of blood with no
     // blood lost is someone ELSE's, tracked round the village by the feet):
     // named, so a red trail in the pictures has an owner (CLAUDE.md rule 6).
@@ -575,9 +621,9 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
         if (body->HpLostBy((DamageCause)k) > 0.0f)
           coat += Format(", hurt %s %.2f", kCause[k], body->HpLostBy((DamageCause)k));
     }
-    out.lines += Format("%s%s %d/%d rows, %u doors%s%s", out.lines.empty() ? "" : "; ",
+    out.lines += Format("%s%s %d/%d rows, %u doors%s%s%s", out.lines.empty() ? "" : "; ",
                         n->id.substr(n->id.find('/') + 1).c_str(), tr.reached, tr.rows, rs.doorOpens,
-                        bled > 0.0f ? Format(", BLED %.1f", bled).c_str() : "", coat.c_str());
+                        bled > 0.0f ? Format(", BLED %.1f", bled).c_str() : "", coat.c_str(), makeup.c_str());
   }
   out.lines += Format("; %u bodies in the world at dusk", c.mobs.MobCount());
   rig.reset();

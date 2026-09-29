@@ -58,6 +58,16 @@ struct BodyReactFlags {
   // What a voxel of this material CATCHES as when a flame is made on it
   // (DESIGN.md §6 clause 2c; CatchFormTable below). 0 = it does not catch.
   std::vector<uint32_t> catchForm;
+  // ---- DRYING IS NOT A LIVING BODY'S CLOCK (2026-09-29) --------------------
+  // Per RULE (indexed like the reaction table): reactions.json `"drying"`
+  // (MaterialDef::RuleFx::drying) -- matter soaking into the ground or drying
+  // in the open, blood's `blood -> air`. Per MATERIAL: selfActive, and every
+  // ungated self rule it owns is a drying rule, so on a living body that is
+  // not a remembered wound soak it has nothing to do on its own at all (a
+  // human's anatomy blood). MobSystem::BurnOneLimb refuses the rule and keeps
+  // the voxel off the front; see DESIGN.md §6 "Living blood does not dry".
+  std::vector<uint8_t> ruleDrying;
+  std::vector<uint8_t> selfDryingOnly;
 };
 
 // The BIT one tag name owns, recovered from the compiled masks: the bits
@@ -161,6 +171,9 @@ inline void BuildBodyReactFlags(const std::vector<MaterialDef>& mats,
   out.hot.assign(n, 0);
   out.attacksBody.assign(n, 0);
   out.catchForm = CatchFormTable(mats, reactions);
+  out.ruleDrying.assign(reactions.size(), 0);
+  out.selfDryingOnly.assign(n, 0);
+  std::vector<uint8_t> selfOther(n, 0);  // an ungated self rule that is NOT drying
   const uint32_t hotMask = BodyReactTagBit(mats, "hot");
   const uint32_t dissolvableMask = BodyReactTagBit(mats, "dissolvable");
   std::vector<MaterialGpu> gpu;
@@ -172,9 +185,15 @@ inline void BuildBodyReactFlags(const std::vector<MaterialDef>& mats,
       const ReactionGpu& r = reactions[g.reactOffset + ri];
       const uint32_t kind = r.packed & 3u;
       if (ReactScaleArmed(r)) out.hasScaled[mi] = 1;
+      const bool drying = ri < mats[mi].ruleFx.size() && mats[mi].ruleFx[ri].drying;
+      if (drying && (size_t)g.reactOffset + ri < out.ruleDrying.size())
+        out.ruleDrying[(size_t)g.reactOffset + ri] = 1;
       if (kind == kReactDecay || kind == kReactEmit) {
         if (ReactScaleArmed(r)) out.selfScaled[mi] = 1;
-        else out.selfActive[mi] = 1;
+        else {
+          out.selfActive[mi] = 1;
+          if (!drying) selfOther[mi] = 1;
+        }
       }
       if (kind == kReactPair) {
         out.hasPair[mi] = 1;
@@ -190,6 +209,7 @@ inline void BuildBodyReactFlags(const std::vector<MaterialDef>& mats,
       }
     }
     out.hot[mi] = (g.tagMask & hotMask) != 0 ? 1 : 0;
+    out.selfDryingOnly[mi] = out.selfActive[mi] && !selfOther[mi] ? 1 : 0;
   }
   // Which materials some rewrite rule can land on: a second pass, because the
   // predicate test needs the whole table.

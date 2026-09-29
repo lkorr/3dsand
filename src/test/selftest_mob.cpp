@@ -4164,13 +4164,24 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       }
       return false;
     };
+    // ...AND THE DOUSE HAS TO HAVE SETTLED. Until 2026-09-29 the living
+    // anatomy blood dried off every limb's front first (~560 ticks here), and
+    // that drain was, silently, what let the doused water round the feet stop
+    // moving before the window below opened. Living blood no longer dries
+    // (DESIGN.md §6), the front empties at t+40, and a window opened then
+    // measures "miss world" on every limb -- the puddle still flowing, which
+    // is the world waking the walk, not a limb that cannot sleep. The wait is
+    // now explicit: mobBurnSleepSettleTicks (tests/baseline.json).
+    const int settleMin = (int)BaselineNumber("mobBurnSleepSettleTicks", 560.0);
     int settled = -1;
     for (int i = 0; i < 1500 && mobs.IsAlive(id); i++) {
       burnTick(id, 0, 0);
       // Past the index's release grace (kBurnIndexGrace) before asking.
       if (i >= 40 && !anyAwake()) {
-        settled = i;
-        break;
+        if (settled < 0) settled = i;  // when the fronts emptied (reported)
+        if (i >= settleMin) break;
+      } else {
+        settled = -1;
       }
     }
     // Off the front, the idle exit still holds the index for kBurnIndexGrace

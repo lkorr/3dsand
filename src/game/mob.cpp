@@ -2301,6 +2301,8 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matHot_ = std::move(rf.hot);
     matAttacksBody_ = std::move(rf.attacksBody);
     matCatchForm_ = std::move(rf.catchForm);
+    ruleDrying_ = std::move(rf.ruleDrying);
+    matSelfDryingOnly_ = std::move(rf.selfDryingOnly);
   }
   for (size_t mi = 0; mi < mats.size(); mi++) {
     const MaterialDef& m = mats[mi];
@@ -12862,6 +12864,7 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
         (uint32_t)std::lround(std::max(1.0f, gt.infectHealSlow)));
     if (n > 0) {
       v.revive = &Mob::ReviveWoundVoxel;
+      v.soakAt = &Mob::IsWoundSoak;
       v.reviveCtx = &limb;
     }
   }
@@ -12872,6 +12875,18 @@ bool Mob::WoundsHeal() const {
   // The DEAD do not heal: a soak on a corpse settles as the dead flesh it is
   // (the reading a severed piece has always had, BurnLimbView's note).
   return alive_ && def_ && def_->woundHeals && CurrentTuning().gore.woundHeals;
+}
+
+bool Mob::IsWoundSoak(void* ctx, IVec3 p) {
+  const MobLimb& limb = *(const MobLimb*)ctx;
+  if (limb.woundWas.empty()) return false;
+  const uint64_t k = WoundWasKey(p.x, p.y, p.z);
+  const auto it = std::lower_bound(
+      limb.woundWas.begin(), limb.woundWas.end(), k,
+      [](const MobLimb::WoundWas& e, uint64_t key) {
+        return WoundWasKey(e.x, e.y, e.z) < key;
+      });
+  return it != limb.woundWas.end() && WoundWasKey(it->x, it->y, it->z) == k;
 }
 
 bool Mob::ReviveWoundVoxel(void* ctx, IVec3 p, uint32_t& word,
@@ -13101,6 +13116,12 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
     const uint32_t m = v.Mat(i);
     if (m == 0 || m >= matSelfActive_.size() || !matSelfActive_[m]) continue;
     IVec3 p = v.At(i);
+    // Living anatomy blood is not alight: its only clock is drying, which a
+    // living body refuses off a wound soak (BurnLimbView::LivingKeeps). On the
+    // front it would latch `alight` and keep the limb awake for nothing.
+    if (m < matSelfDryingOnly_.size() && matSelfDryingOnly_[m] &&
+        v.LivingKeeps(p))
+      continue;
     st.front.push_back(
         (uint32_t)(((size_t)(p.z - mn.z) * dims.y + (p.y - mn.y)) * dims.x +
                    (p.x - mn.x)));
@@ -15809,7 +15830,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // AN EMPTY FRONT UNDER A LATCHED `alight`, WITH NOTHING ELSE GOING ON, ASKS
   // FOR THE SWEEP. Only BuildBurnIndex may clear the flag, and it runs only
   // when the index is missing -- so a limb whose last self-active voxel went
-  // (a human torso's anatomy blood decays to air over ~900 ticks) held its
+  // (a CORPSE torso's anatomy blood decays to air over ~900 ticks; a living
+  // one's no longer dries at all, BurnLimbView::LivingKeeps) held its
   // index, an empty front and alight=1 forever: never quiet, never dropping
   // the index, never taking the idle exit above, and a corpse built from it
   // could never sleep. Only when no world heat is near and no corrosive coat
@@ -16026,6 +16048,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
 
   // Cells a removal emptied this tick, for the bared-bone pass after the loop.
   std::vector<uint32_t> bared;
+  // WHICH RULE is removing a voxel, for the SANDVOX_COAT_TRACE line at the
+  // removal below (CLAUDE.md rule 6: name the cause at the point of failure).
+  // Set by every call site; a string literal, so it costs nothing.
+  const char* applyCause = "?";
   auto applyTo = [&](uint32_t cell, uint32_t prod, uint32_t rr) {
     if (prod == kProdKeep) return;
     const uint32_t vi = st.idx[cell] & ~kBurnQueued;
@@ -16112,11 +16138,13 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // SANDVOX_COAT_TRACE: a body voxel LEAVING (what bares the blood).
         static const bool trace = std::getenv("SANDVOX_COAT_TRACE") != nullptr;
         static int traced = 0;
-        if (trace && traced < 8 && v.bareBloodMat) {
+        if (trace && traced < 32 && v.bareBloodMat) {
           traced++;
           const Vec3 wv = worldOf(p);
-          std::printf("coat trace: body voxel mat %u leaves as %u at (%.1f,%.1f,%.1f) tick %u\n", v.Mat(i), pm, wv.x,
-                      wv.y, wv.z, tick);
+          std::printf("coat trace: LIVE limb %d (key %08x) voxel mat %u leaves as %u by %s at world "
+                      "(%.1f,%.1f,%.1f) lattice (%d,%d,%d) tick %u; limb awake with %zu world threats, alight %d%s\n",
+                      v.selfLimb, limbKey, v.Mat(i), pm, applyCause, wv.x, wv.y, wv.z, p.x, p.y, p.z, tick,
+                      scanHot.size(), (int)st.alight, v.WoundSlot(was) >= 0 ? " [wound material, no remembered soak]" : "");
         }
       }
       v.Set(i, 0, 0);      // tombstone; FlushBurn compacts it away
@@ -16582,6 +16610,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         burnStats_.coatFired++;
         if (rf >= 0) release(rf, r.prodSelf, rr);
         if (rewrites && pk == -1) {
+          applyCause = "coat rule on its wearer";
           applyTo(cell, r.prodNbr, rr);
           selfDone = true;
           if ((st.idx[cell] & ~kBurnQueued) == 0) {
@@ -16608,6 +16637,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
           }
         } else {
+          applyCause = "coat rule on a lattice neighbour";
           if (rewrites) applyTo(ncell[pk], r.prodNbr, Pcg(rr));
           const uint32_t left =
               rewrites ? paidLeft(coatAmt, rr) : coatLevelsAfter(coatAmt, 1u);
@@ -16623,6 +16653,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           const uint32_t cf = m < matCatchForm_.size() ? matCatchForm_[m] : 0u;
           if (rf >= 0 && cf != 0 && cf != m) {
             burnStats_.coatCaught++;
+            applyCause = "coat flame catch";
             applyTo(cell, cf, Pcg(rr ^ 0x2Cu));
             selfDone = true;
             if ((st.idx[cell] & ~kBurnQueued) != 0 && heldCoat) setCoat(i, 0);
@@ -16645,6 +16676,23 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const MaterialGpu& mg = matGpu_[m];
     for (uint32_t ri = 0; ri < mg.reactCount && !fired; ri++) {
       const ReactionGpu& r = reactions_[mg.reactOffset + ri];
+      // ---- LIVING BLOOD DOES NOT DRY (DESIGN.md §6, 2026-09-29) -----------
+      // A DRYING rule (reactions.json `"drying"`: blood -> air) is the
+      // world's abstraction of a pool soaking in or drying in the open. On a
+      // living body whose wounds heal it fires ONLY on a remembered soak (the
+      // revive below turns it back into the flesh it covered); on anything
+      // else -- the anatomy recipe's blood speckled through the muscle -- it
+      // is refused. Without this, any pass that built this limb's index (a
+      // foot on stained ground, rain, a wet coat) seeded the front with the
+      // anatomy blood, and it dried away at a ~3 s half-life with no wound
+      // and no damage event: each voxel that left bared bone, the bared-bone
+      // pass painted the bone with the creature's blood, and the feet printed
+      // it round the village (gate village-harrowby, living-blood).
+      if (!ruleDrying_.empty() && mg.reactOffset + ri < ruleDrying_.size() &&
+          ruleDrying_[mg.reactOffset + ri] && v.LivingKeeps(vp)) {
+        burnStats_.livingDryRefused++;
+        continue;
+      }
       if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
       // (WET DOES NOT CATCH is no longer a skip list here: a wet voxel beside
       // heat is COVERED by its water's own `+ tag:hot` rule (section 0, rule
@@ -16801,6 +16849,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       noteBodyFx(r, vp);
       const uint32_t kind = r.packed & 3u;
       if (kind == kReactDecay) {
+        applyCause = "own decay rule";
         applyTo(cell, r.prodSelf, rr);
         fired = true;
       } else if (kind == kReactEmit) {
@@ -16837,6 +16886,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // with it, or it was rewritten in place under a HELD coat, which
           // goes with its substrate (clause 2b).
           if (coatRelease >= 0) release(coatRelease, r.prodNbr, rr);
+          applyCause = "own pair rule, coat partner";
           applyTo(cell, r.prodSelf, rr);
           if ((st.idx[cell] & ~kBurnQueued) != 0) {
             const bool rewrote = r.prodSelf != kProdKeep;
@@ -16855,6 +16905,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // and ncell says kNoBurnCell for it, so it takes this same path.
         const bool isWorld = ncell[match] == kNoBurnCell;
         if (isWorld && r.prodNbr != kProdKeep) continue;
+        applyCause = "own pair rule";
         applyTo(cell, r.prodSelf, rr);
         if (!isWorld && r.prodNbr != kProdKeep)
           applyTo(ncell[match], r.prodNbr, Pcg(rr));
@@ -16910,10 +16961,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           static int traced = 0;
           if (trace && traced < 8) {
             traced++;
-            std::printf("coat trace: world mat %u rewrites body voxel mat %u -> %u at (%.1f,%.1f,%.1f) tick %u\n",
+            std::printf("coat trace: world mat %u rewrites body voxel mat %u -> %u at lattice (%d,%d,%d) tick %u\n",
                         wm, m, r.prodNbr, vp.x, vp.y, vp.z, tick);
           }
         }
+        applyCause = "a world cell's rule (inbound)";
         applyTo(cell, r.prodNbr, rr);
         fired = true;
         break;
@@ -17002,7 +17054,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     e &= ~kBurnQueued;
     if (e == 0) continue;
     const uint32_t m = v.Mat(e - 1);
-    if (m && m < matSelfActive_.size() && matSelfActive_[m]) st.front.push_back(c);
+    if (m && m < matSelfActive_.size() && matSelfActive_[m] &&
+        !(m < matSelfDryingOnly_.size() && matSelfDryingOnly_[m] &&
+          v.LivingKeeps(v.At(e - 1))))  // living blood: BuildBurnIndex's note
+      st.front.push_back(c);
     if (m && m < matHot_.size() && matHot_[m]) hot++;
   }
   // Only the CANDIDATES were re-tested, so an empty front here does not by

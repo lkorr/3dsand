@@ -1128,6 +1128,18 @@ struct BurnLimbView {
                             uint32_t& color);
   ReviveFn revive = nullptr;
   void* reviveCtx = nullptr;
+  // The same lookup WITHOUT spending it: is lattice cell `p` a remembered
+  // soak? Armed with `revive` (same ctx). Asked by the drying refusal
+  // (LivingKeeps): on a living, healing body a DRYING rule (reactions.json
+  // `"drying"`: blood -> air) fires only on a wound soak, never on the
+  // creature's own anatomy blood, which is tissue, not a puddle.
+  using SoakFn = bool (*)(void* ctx, IVec3 p);
+  SoakFn soakAt = nullptr;
+  // True when a drying rule may NOT fire on lattice cell `p` of this view:
+  // a living healing body (revive armed) and not a remembered soak.
+  bool LivingKeeps(IVec3 p) const {
+    return revive != nullptr && soakAt != nullptr && !soakAt(reviveCtx, p);
+  }
 };
 
 // ---- WHAT IS ON A BODY, AS A LEDGER -----------------------------------------
@@ -4006,6 +4018,8 @@ class Mob {
   // and a voxel cut again is remembered again, as the new thing it is.
   static bool ReviveWoundVoxel(void* ctx, IVec3 p, uint32_t& word,
                                uint32_t& color);
+  // BurnLimbView::SoakFn: the lookup above, read-only.
+  static bool IsWoundSoak(void* ctx, IVec3 p);
   // Does this creature's flesh close over a cut? def AND the global switch.
   bool WoundsHeal() const;
   // ---- BLOOD ON A BODY, from the world and from other bodies -------------
@@ -6853,6 +6867,9 @@ class MobSystem {
   // whether the threshold or the fire is what is missing.
   struct BurnStats {
     uint32_t candidates = 0;    // voxels the pass evaluated a rule for
+    // Drying rules refused on a living body's non-soak voxel (anatomy blood;
+    // BurnLimbView::LivingKeeps). Nonzero is the refusal working, not a fault.
+    uint32_t livingDryRefused = 0;
     uint32_t rampRolls = 0;     // scaled rules reached
     uint32_t rampRefused = 0;   // ...of which minCount refused outright
     uint32_t rampWidened = 0;   // ...and ones the world-pitch reading raised
@@ -7157,6 +7174,12 @@ class MobSystem {
   std::vector<uint8_t> burnable_;
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // has UNGATED decay/emit rules — ALIGHT
+  // sim/bodyreact.h ruleDrying / selfDryingOnly: which rules are DRYING, and
+  // which materials have nothing but drying to do on their own. On a living
+  // body a non-soak voxel of the latter is not alight (BurnLimbView::
+  // LivingKeeps): a human's anatomy blood does not dry inside it.
+  std::vector<uint8_t> ruleDrying_;
+  std::vector<uint8_t> matSelfDryingOnly_;
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
   BurnStats burnStats_{};
