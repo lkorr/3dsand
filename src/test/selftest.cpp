@@ -95,6 +95,7 @@ const std::vector<Gate>& EditorGates();
 // Harrowby, the first hand-built village: a CONTENT gate over the game map
 // (docs/PLAN_world_editor.md P8, selftest_village.cpp).
 const std::vector<Gate>& VillageGates();
+const std::vector<Gate>& ClearingGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -261,6 +262,11 @@ const char* const kOrder[] = {
     // environment reloaded from disk, the world regenerated, and the far
     // cascades refilled, so `waterbody` still sees what `terrain` left.
     "sculpt",
+    // Then: the forest CLEARING site kind. Same seam and same exit as
+    // `sculpt` (a synthetic site on this map, regenerated, read back), plus a
+    // window moved to forest near the spawn and put back; the pristine world
+    // is regenerated and the far field refilled on the way out.
+    "clearing",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean
@@ -1054,7 +1060,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &ClearingGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

@@ -1388,6 +1388,8 @@ static int wmSiteI(uint32_t sid, uint32_t w) {
 // pad (Chebyshev radius + margin). worldgen.wgsl siteFootprintHas, same test.
 static bool siteFootprintHas(uint32_t sid, int x, int z) {
   const uint32_t kind = (uint32_t)(wmSiteI(sid, WM_S_KIND));
+  // A clearing keeps crowns off and nothing else: no footprint.
+  if (kind == worldmap::kSiteClearing) return false;
   const int dx = x - wmSiteI(sid, WM_S_X);
   const int dz = z - wmSiteI(sid, WM_S_Z);
   if (kind == WM_SITE_WATER) {

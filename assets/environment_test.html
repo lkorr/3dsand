@@ -126,6 +126,10 @@ function readLit(wv, cv){
     say(ok, 'no "(unsaved biome)" placeholder while the first biome is merely loading');
     say(nav.querySelectorAll('button[data-page]').length >= 6, 'and the map + two component pages');
 
+    // ?only=map runs the mount and the World map page alone (sections 1, 2,
+    // 6, 6b): the page's tools can be iterated on without the swatch bakes.
+    var ONLY_MAP = /[?&]only=map(&|$)/.test(location.search);
+    if (!ONLY_MAP) {
     // ---- 3. the biome page --------------------------------------------------------------------------
     // Since the World map page (P3) the tab opens on the map, so the biome
     // page is deep-linked here the way the sidebar does it.
@@ -283,6 +287,7 @@ function readLit(wv, cv){
     ok = await waitFor(function(){ return pages.structures.classList.contains('active') && ST.currentName() === 'samples/smithy' && ST._slots().length > 5; }, 30000);
     say(ok, 'deep link opened samples/smithy on the Structures page (' + ST._slots().length + ' slots)');
 
+    }   // !ONLY_MAP
     // ---- 6. the World map page: the front door (P-I) ----------------------------------------------------------
     E._open('map');
     var M = E._modules.WorldMap;
@@ -315,6 +320,10 @@ function readLit(wv, cv){
     say(cv.clientWidth > 100 && cv.clientHeight > 100, 'map canvas laid out ' + cv.clientWidth + 'x' + cv.clientHeight);
     // SCULPT: a raise stroke writes the layer, one undo step, Undo takes it back.
     var S = M._sculpt(), u0 = M._undoDepth(), tiles0 = S.tiles.size;
+    // The map may carry a sculpt layer of its own (the default map's
+    // Harrowby flatten): Undo must give back exactly what was there.
+    var left0 = 0;
+    S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left0 = Math.max(left0, Math.abs(t[i])); });
     M._tool('sculpt');
     S.mode = 'raise'; S.radius = 2048; S.strength = 50;
     ptr('pointerdown', 0.5, 0.5); ptr('pointermove', 0.55, 0.5); ptr('pointermove', 0.6, 0.52); ptr('pointerup', 0.6, 0.52);
@@ -329,7 +338,7 @@ function readLit(wv, cv){
     [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
     var left = 0;
     S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left = Math.max(left, Math.abs(t[i])); });
-    say(S.tiles.size === tiles0 && left === 0 && M._undoDepth() === u0, 'Undo takes the stroke back (' + S.tiles.size + ' tiles, max |offset| ' + left + ')');
+    say(S.tiles.size === tiles0 && left === left0 && M._undoDepth() === u0, 'Undo takes the stroke back (' + S.tiles.size + ' tiles, max |offset| ' + left + ', was ' + left0 + ')');
     // TREE: a click plants the picked species at the column, the Sites panel edits it; Undo removes it.
     ok = await waitFor(function(){ return M._trees().list.length > 0; }, 10000);
     say(ok, 'tree species listed from assets/trees/*.svtree: ' + M._trees().list.join(', '));
@@ -345,6 +354,24 @@ function readLit(wv, cv){
         'the new tree is selected, listed, and its panel has the species select');
     [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
     say(M._map().json.sites.length === nSites, 'Undo removes it (' + M._map().json.sites.length + ' sites)');
+    // CLEARING: a drag draws a forest clearing box, selected with its corner
+    // and feather fields; a drag inside moves it; shift+click deletes it; Undo
+    // brings it back and Undo again takes the drawing back.
+    M._tool('clearing');
+    ptr('pointerdown', 0.40, 0.40); ptr('pointermove', 0.44, 0.45); ptr('pointerup', 0.44, 0.45);
+    var cs = M._map().json.sites[M._map().json.sites.length - 1];
+    say(M._map().json.sites.length === nSites + 1 && cs.kind === 'clearing' && cs.min[0] < cs.max[0] && cs.min[1] < cs.max[1] &&
+        cs.feather === 64 && M._selected() === cs && pages.map.querySelectorAll('.mapsites-panel input[type=number]').length >= 5,
+        'the Clearing tool drew ' + JSON.stringify(cs) + ', selected, with corner + feather fields');
+    var w0 = cs.max[0] - cs.min[0], x0 = cs.min[0];
+    ptr('pointerdown', 0.42, 0.42); ptr('pointermove', 0.43, 0.42); ptr('pointerup', 0.43, 0.42);
+    say(cs.min[0] > x0 && cs.max[0] - cs.min[0] === w0, 'a drag inside it moves it, same size (x ' + x0 + ' -> ' + cs.min[0] + ')');
+    ptr('pointerdown', 0.43, 0.43, {shiftKey: true}); ptr('pointerup', 0.43, 0.43, {shiftKey: true});
+    say(M._map().json.sites.length === nSites, 'shift+click inside it deletes it');
+    var undoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0];
+    undoBtn.click(); undoBtn.click(); undoBtn.click();
+    say(M._map().json.sites.length === nSites && !M._map().json.sites.some(function (s) { return s.kind === 'clearing' && s.id === cs.id; }),
+        'three Undos take back the delete, the move and the drawing (' + M._map().json.sites.length + ' sites)');
     // LOAD CHECK: the panel asked the engine (or says why it could not).
     ok = await waitFor(function(){ return !!M._check(); }, 60000);
     var ck = M._check();
@@ -358,6 +385,7 @@ function readLit(wv, cv){
     // and the map page's adoption code.
     say(/id="wgPreviewHost"/.test(page) && /wgPreviewShow/.test(page), 'tuner.html carries the preview host the map page adopts');
 
+    if (ONLY_MAP) { done(); return; }
     // ---- 7. hidden tab -> no active page ------------------------------------------------------------------------
     host.classList.remove('active');
     ok = await waitFor(function(){ return !Object.values(pages).some(function (p) { return p.classList.contains('active'); }); }, 5000);

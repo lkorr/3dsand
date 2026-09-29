@@ -57,22 +57,23 @@
       "kind": "spawn",
       "at": [
         580,
-        3515
+        3620
       ],
-      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land and off any lake: the spawn-site gate checks all of that."
+      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land and off any lake: the spawn-site gate checks all of that. In the wood 10 m south of Harrowby's clearing, so a new game wakes among trees with the village ahead (north); it was (580, 3515), on the green's edge, until the clearing replaced the pad box."
     },
     {
       "id": "harrowby_clearing",
-      "kind": "pad",
+      "kind": "clearing",
       "min": [
-        345,
-        3080
+        375,
+        3131
       ],
       "max": [
-        780,
-        3560
+        741,
+        3518
       ],
-      "about": "Harrowby's clearing (docs/EDITOR_GUIDE.md, Building a village): no tree, bush or ground cover grows in this box, so the green, the lanes and Edric's field stay open; the forest stands round it and the treeline is its north edge, past the field. The houses are refs/harrowby.json."
+      "feather": 64,
+      "about": "Harrowby's clearing (docs/EDITOR_GUIDE.md, Building a village): the houses, the green and the field of refs/harrowby.json plus 2 voxels. No forest tree's crown reaches over this box and the trees thin out over the 64 voxels past the crowns, so the wood stands round the hamlet with a ragged edge; grass and flowers, the ground and its shape are untouched. The village-harrowby gate counts tree voxels inside every house (want 0)."
     },
     {
       "id": "home_lake",

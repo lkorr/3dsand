@@ -18485,6 +18485,36 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   first authored one exercises the whole path. Not yet: `proc:` kinds
   (the ruin shell is gone; a generator per kind is the follow-up plan),
   slope-gated rules, sites larger than 512 voxels a side.
+* **LIVE (2026-09-29): THE FOREST CLEARING, kind `clearing`.** `{min: [x, z],
+  max: [x, z], feather?}` in `map.json` sites (world voxels, inclusive;
+  `feather` default 64, clamped 0..512; many per map). A box that no LATTICE
+  tree's CROWN reaches over: `siteBlocksTrunk` -> `clearingRefuses` refuses a
+  trunk whose species' reach square meets the box, and across the feather
+  band past the crown's edge keeps a trunk with probability gap / feather by
+  a counter hash of the trunk column (`CLEARING_THIN_SALT`, integer, seed +
+  position only), so the forest edge is ragged, not ruled. That is all it
+  does: terrain height, skin, cover rows, tile plants and ponds are untouched
+  (it is no footprint: `siteFootprintHas` says no on both sides, so
+  `siteKeepOut` ignores it; the forest floor inside grows its open-sky rows
+  because cover is placed by canopy cover), authored tree sites stand, and
+  the bush / dead tree are atlas species, so thinned like any tree. The
+  record's `kS_X` / `kS_Z` are the box's MIN corner, `kS_BoxX1` /
+  `kS_BoxZ1` (words 13, 14) its max, `kS_PadMargin` the feather; it is listed
+  in every cell the box + feather + the widest crown reaches, because the
+  lattice asks from the trunk's cell. The far cascades take their trees
+  through the same `treeInfoBare`, so near and far agree by construction.
+  Loader: min > max on either axis is a refusal naming the site; the spawn
+  inside a clearing is a warning (the player then wakes in the open); a
+  clearing never takes part in the overlap warnings (it is meant to hold
+  houses). It is what the PAD BOX is not: the pad (`kind: "pad"`, one per
+  map, the harness's) bares trunks, crowns, tarns AND cover and calms the
+  coarse relief, which is what a selftest fixture wants and what put a new
+  game on bare, jittered ground when Harrowby used one (16.P8). Authored on
+  the World map page's Clearing tool (drag a box; corners and feather in the
+  Sites panel). Gate: `clearing` (harness map, a synthetic clearing over
+  forest near its spawn, with / without arms: no tree voxel in the box, trunk
+  bases past feather + the widest crown kept, cover inside, ground voxels
+  and the height mirror identical; the loader's refusal and warning).
 * **LIVE (map overhaul P5, 2026-09-26): THE SCULPT LAYER — the tier between
   the 102 m landform cell and the voxel.** `assets/worldmap/<name>/
   sculpt.svsculpt` is a sparse, tiled, SIGNED height offset in whole voxels
@@ -20816,8 +20846,13 @@ opened instance previews live; other copies change on save. A paste inside a
 `refs/harrowby.json` (four structure refs, five villagers, the outdoor
 waynodes, a marker), five structure assets (`assets/structures/harrowby_*`:
 three generated houses hand-edited through the command layer, and the green
-and the field built from nothing), the map's pad box `harrowby_clearing`, its
-sculpt layer and its ground edit layer (`default_ground`). Every step is a
+and the field built from nothing), the map's forest clearing `harrowby_clearing`
+(kind `clearing`; it was a harness-style PAD BOX until 2026-09-29, which bared
+the ground cover too and calmed the relief, so a new game started on a bald,
+jittered square with the spawn inside it), its sculpt layer and its ground edit
+layer (`default_ground`). The spawn stands in the wood 10 m south of the
+clearing, (580, 3620) -- (580, 3515) sat on the green's edge, where no tree can
+stand without its crown over the green. Every step is a
 readable file in `assets/worldmap/default/scripts/` (params, `.jsonl` edit
 scripts, two `.sh` ground scripts), run in number order. How-to (and how to
 add a fourth house): `docs/EDITOR_GUIDE.md` §14. Gate: `village-harrowby`.
@@ -20843,6 +20878,12 @@ boot to boot), so the pin is compared, and recorded, only when the village is
 the FIRST gate to tick the world in its process (`World::TicksEncoded() == 0`
 at entry); elsewhere the trace is printed and not judged.
 `SANDVOX_HARROWBY_SHOTS=<prefix>` writes the village pictures from the day.
+Since the clearing (2026-09-29) it also counts, right after worldgen, every
+tree-material voxel (the species files' bark / leaf / autumn-leaf names)
+inside each structure's stamped box and the 48 voxels above it, per
+structure: want 0. `--shot-spawn` is the matching picture of the GAME: the
+real map from the spawn, on foot, toward `SANDVOX_SHOT_SPAWN_LOOK=x,z`, then
+turned round, then from above.
 
 **What building it changed in the tools** (each a gap a person would hit):
 - `struct.new {asset}` (editor): a structure from nothing -- a well, a field,
@@ -20863,7 +20904,12 @@ at entry); elsewhere the trace is printed and not judged.
   layer, through `map.js`'s own reader/writer) and `--heightmap` under
   `SANDVOX_HEIGHTMAP_BARE=1` (the ground without the map's houses: a pass that
   read the pads left the ground under every house unsculpted and each pad's
-  ramp fell into a ditch).
+  ramp fell into a ditch). `--keep-grain R` (2026-09-29) levels the ground's
+  AVERAGE over +-R voxels instead of every 8-voxel sample: an exact flatten
+  cancels the fine grain only at the samples and leaves a plane of one- and
+  two-voxel risers with dirt on each, which read as churned ground from the
+  spawn; Harrowby's layer is now `--rect` = its clearing, `--feather 64`,
+  `--keep-grain 24`.
 - `scripts/paint_ground.mjs`: paths painted into the map's ground-relative
   edit layer along a polyline -- the F8 editor edits houses, and the ground
   between them belongs to no house.

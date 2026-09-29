@@ -622,6 +622,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_structure.cpp
   src/test/selftest_editor.cpp
   src/test/selftest_village.cpp
+  src/test/selftest_clearing.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp

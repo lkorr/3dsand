@@ -1292,7 +1292,7 @@ number order:
 
 | File | What it did |
 |---|---|
-| `harrowby_00_ground.sh` | levelled the clearing (the map's sculpt layer) |
+| `harrowby_00_ground.sh` | the forest clearing, and the levelled ground (the map's sculpt layer) |
 | `harrowby_*.params.json` | the house generator's settings for the three houses |
 | `harrowby_01_place.jsonl` | put the three houses on the ground |
 | `harrowby_02_smithy.jsonl` | Osric's forge bay, anvil, trough, tool rack, strongbox |
@@ -1311,7 +1311,7 @@ copy any line into your own script.
 **Where it is** (world voxels, 10 to the metre; north is -z):
 
 ```
-         z 3080  . . . . . . . treeline . . . . . . .
+         z 3131  . . . . . . clearing, north edge . . . . . .
          z 3133        Edric's spot, the field's north gate
          z 3170  [ field: harrowby/field, barley + scarecrow ]
          z 3212           south gate  |  lane (dirt)
@@ -1322,7 +1322,9 @@ copy any line into your own script.
   harrowby/alehouse           harrowby/green              harrowby/smithy
   x 415, door faces east      (555, 3467)                 x 700, forge bay faces west
                                     |
-         z 3515                   spawn (580, 3515)
+         z 3518  . . . . . . clearing, south edge . . . . . .
+                        (the wood)
+         z 3620                   spawn (580, 3620)
 ```
 
 The files that make it up:
@@ -1332,8 +1334,9 @@ The files that make it up:
 - `assets/structures/harrowby_{longhouse,smithy,alehouse,green,field}.vox` +
   `.struct.json` — the buildings; their doors, beds, chests, hearths and the
   places people stand are SLOTS in these files (`harrowby/smithy/anvil`, ...).
-- `assets/worldmap/default/map.json` — the site `harrowby_clearing` (no trees
-  or bushes in that box) and `editLayer: "default_ground"`.
+- `assets/worldmap/default/map.json` — the forest clearing `harrowby_clearing`
+  (§14.1: no tree's crown over that box, the wood thinning out round it) and
+  `editLayer: "default_ground"`.
 - `assets/worldmap/default/sculpt.svsculpt` — the levelled ground.
 - `assets/worldedits/default_ground.svedit` — the painted paths.
 - `assets/schedules/{edric,maud,osric,agnes,wat}.json`,
@@ -1357,8 +1360,11 @@ node scripts/bake_structure.mjs harrowby_cottage my_cottage.params.json
 side plus its `padMargin` (4 voxels in Harrowby), and two squares that touch
 are a warning (the References page's warnings list names both). The stats line
 on the Structures page gives the house's size; a 7 m cottage needs a clear
-square about 7.5 m across. Keep it off the spawn column (580, 3515) too. The
-clearing is level at ground 200, so its floor is **201**.
+square about 7.5 m across. Then **widen the clearing over it** (§14.1): the
+forest keeps its crowns out of the clearing's box and nowhere else, so a house
+outside the box gets a tree through its roof (the gate counts those). The
+levelled ground is at 200, so its floor is **201**; outside the flattened area
+use **move to crosshair** (§12).
 
 **3. Place it** (§12). In game: F1 → World → References → **place a
 structure**, pick `harrowby_cottage`, id `harrowby/cottage`, turn it with
@@ -1439,6 +1445,49 @@ writes `build/hb_overview.bmp`, `_green`, `_osric_at_work`, `_smithy`,
 map: `SANDVOX_SHOT_TALK=harrowby/wat bash scripts/run.sh ./build/Release/sandvox.exe --shot-dialogue`
 (`SANDVOX_SHOT_TALK_AT=1080` for 18:00).
 
+### 14.1 A clearing in the forest (the World map page's Clearing tool)
+
+A **clearing** is a box on the map that no forest tree's crown reaches over;
+past it the trees thin out across a **feather** band, so the wood's edge is
+ragged rather than ruled. It changes nothing else: the ground keeps its shape
+and its grass and flowers, ponds stay, and trees you placed by hand (the Tree
+tool) still stand. Harrowby sits in one; use one for any village, camp or glade.
+
+1. Tuner → Environment → **World map**. Zoom in on the place (wheel) until one
+   screen pixel is a few voxels — the box snaps to the column under the cursor.
+2. Pick the **Clearing** tool and **drag** a box over everything that must stay
+   open: the houses, the green, the field. Lime outline = the box; the dashed
+   line outside it = the feather band. `clearing feather` in the toolbar sets
+   the band for new boxes (64 voxels = 6.4 m is a natural edge; 0 is a hard one).
+3. Fine-tune in the **Sites** panel: select the clearing (click inside it with
+   the Clearing or Select tool) and type its exact corners (`min x`, `min z`,
+   `max x`, `max z`, world voxels) and its `feather`. The panel says the size.
+4. Drag inside a clearing to move it; **Shift+click** inside it (or × in the
+   Sites list) deletes it; **Ctrl+Z** undoes any of it. **Save map**, then F7 in
+   the game (or Apply) regenerates the world.
+
+How big: trees are kept back by their OWN crown's width, so the open ground you
+see is the box plus a few metres (a bush's 1.8 m, an oak's 5.4 m, a great oak's
+11.5 m) plus the ragged band. So draw the box just round what must stay open —
+Harrowby's is its buildings' outline plus 2 voxels.
+
+Keep the **spawn** outside every clearing if a new game should wake among trees:
+the Load check panel warns when it is inside one. (A clearing whose corners are
+the wrong way round is refused, naming it.) Not the **Pad box**: that is the
+selftest's fixture ground — it bares the grass too and flattens the hills, which
+is what put Harrowby on bald, jittered ground before it had a clearing.
+
+The gate `village-harrowby` counts tree voxels inside every house (want 0);
+`clearing` tests the site kind itself. The look, from where a new game starts:
+
+```bash
+SANDVOX_SHOT_SPAWN_LOOK=557,3440 bash scripts/run.sh ./build/Release/sandvox.exe --shot-spawn
+```
+
+writes `screenshot_spawn.bmp` (standing at the spawn, looking at that column),
+`screenshot_spawn_back.bmp` (turned round) and `screenshot_spawn_high.bmp`
+(from above and behind); `SANDVOX_SHOT_SPAWN_AT=<minutes>` sets the hour.
+
 ### When it goes wrong
 
 - **"… and site … overlap"** in the warnings — two squares touch (step 2):
@@ -1455,6 +1504,8 @@ map: `SANDVOX_SHOT_TALK=harrowby/wat bash scripts/run.sh ./build/Release/sandvox
   **move to crosshair** on the ground (§12), or level the ground first:
   `node scripts/sculpt_flatten.mjs default --rect x0,z0,x1,z1 --y <ground> --feather 96`
   (the World map page's sculpt brush edits the same layer).
+- **"tree-material voxels inside its stamped box"** in the gate — the forest
+  reaches into that house: widen the clearing over it (§14.1).
 - **The village moved out of the gate's window** — the gate centres a 51 m
   window on Harrowby's refs; a house much further out than the field needs its
   own place, not this group.

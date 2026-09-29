@@ -25,7 +25,14 @@
 //                          tests/baseline.json -- the same day on every boot
 //                          (why not an in-process second run: see the gate);
 //                       F. nobody bleeds (a door leaf or a jostle that draws
-//                          blood is a bug in the village).
+//                          blood is a bug in the village);
+//                       G. NO TREE IN A HOUSE: right after worldgen, not one
+//                          voxel of a tree material (every assets/trees/*.json
+//                          bark / leaf / autumnLeaf) inside any structure's
+//                          stamped box or the 48 voxels of air above its roof
+//                          -- the forest stands round the village's clearing
+//                          (map.json kind "clearing"), its crowns included.
+//                          Counted per structure.
 //                     SANDVOX_HARROWBY_SHOTS=<prefix> also writes pictures
 //                     from the first run: the village from above at midday,
 //                     each interior, a villager at work
@@ -39,6 +46,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +55,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "game/bodyreg.h"
@@ -69,6 +79,8 @@
 #include "world/refs_doors.h"
 #include "world/refs_npc.h"
 #include "world/structures.h"
+
+#include <nlohmann/json.hpp>
 
 using namespace sandvox;
 
@@ -109,6 +121,89 @@ Village Survey(const refs::RefStore& st) {
     v.hi = {std::max(v.hi.x, r.pos.x), std::max(v.hi.y, r.pos.y), std::max(v.hi.z, r.pos.z)};
   }
   return v;
+}
+
+// ---- G. canopy intrusion -------------------------------------------------------------
+// The materials worldgen's trees are made of: every species file's bark, leaf
+// and autumn-leaf ramps (assets/trees/<name>.json), resolved by name. The
+// species files are the truth the atlas is baked from, so a new species'
+// materials join without an edit here.
+std::set<uint32_t> TreeMaterials(const std::vector<MaterialDef>& mats) {
+  std::set<std::string> names;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator(AssetDir() + "/trees", ec)) {
+    if (e.path().extension() != ".json") continue;
+    std::ifstream f(e.path());
+    nlohmann::json j;
+    try { f >> j; } catch (...) { continue; }
+    for (const char* k : {"bark", "leaf", "autumnLeaf"})
+      if (j.contains(k) && j[k].is_array())
+        for (const auto& n : j[k])
+          if (n.is_string()) names.insert(n.get<std::string>());
+  }
+  std::set<uint32_t> ids;
+  for (size_t i = 0; i < mats.size(); i++)
+    if (names.count(mats[i].name)) ids.insert((uint32_t)i);
+  return ids;
+}
+
+struct CanopyCount {
+  std::string id;
+  int inBox = 0, overhead = 0;
+  long long cells = 0;
+  IVec3 lo{}, hi{};
+  IVec3 first{0, -1, 0};   // the first intruding cell, for the report
+};
+
+// Every structure ref's stamped box (structures::Frame::Box) plus the 48
+// voxels above it, read back chunk by chunk, counting tree-material cells
+// the HOUSE did not put there: a cell the asset authors is the asset's (a
+// table of `wood` is furniture, not a branch), so only the asset's empty
+// cells and the air above it are asked.
+std::vector<CanopyCount> CountCanopy(Ctx& c, const std::vector<const refs::Ref*>& structs) {
+  std::vector<CanopyCount> out;
+  const std::set<uint32_t> tree = TreeMaterials(c.mats);
+  std::map<uint32_t, std::vector<uint32_t>> chunks;
+  auto mat = [&](IVec3 p) -> uint32_t {
+    if (!c.world.CellInWindow(p)) return 0u;
+    const uint32_t slot = World::SlotChunkIndex({p.x >> 4, p.y >> 4, p.z >> 4});
+    auto it = chunks.find(slot);
+    if (it == chunks.end()) {
+      std::vector<uint32_t> w(kChunkVol);
+      ReadVoxelsSync(c.ctx, c.world, slot, 1, w.data(), "village canopy");
+      it = chunks.emplace(slot, std::move(w)).first;
+    }
+    return it->second[((uint32_t)(p.z & 15) * kChunk + (uint32_t)(p.y & 15)) * kChunk + (uint32_t)(p.x & 15)] & 0xFFFu;
+  };
+  for (const refs::Ref* r : structs) {
+    CanopyCount cc;
+    cc.id = r->id;
+    structures::Asset a;
+    std::string err;
+    std::vector<std::string> aw;
+    if (!structures::LoadAsset(AssetDir(), r->base, true, a, err, aw) || a.prefab.models.empty()) {
+      cc.inBox = -1;
+      out.push_back(cc);
+      continue;
+    }
+    const structures::Frame f = structures::MakeFrame(a, r->pos, r->yaw);
+    f.Box(cc.lo, cc.hi);
+    std::set<std::tuple<int, int, int>> own;   // world cells the asset authors
+    for (const PrefabVoxel& v : a.prefab.models[0].voxels) {
+      const IVec3 w = f.Cell({v.x, v.y, v.z});
+      own.insert({w.x, w.y, w.z});
+    }
+    for (int z = cc.lo.z; z <= cc.hi.z; z++)
+      for (int y = cc.lo.y; y <= cc.hi.y + 48; y++)
+        for (int x = cc.lo.x; x <= cc.hi.x; x++) {
+          cc.cells++;
+          if (!tree.count(mat({x, y, z})) || own.count({x, y, z})) continue;
+          (y <= cc.hi.y ? cc.inBox : cc.overhead)++;
+          if (cc.first.y < 0) cc.first = {x, y, z};
+        }
+    out.push_back(cc);
+  }
+  return out;
 }
 
 // ---- pictures (SANDVOX_HARROWBY_SHOTS) --------------------------------------------
@@ -197,6 +292,7 @@ struct DayResult {
   uint32_t opens = 0, closes = 0, arrivals = 0, replans = 0;
   int doorsLeftOpen = 0;
   std::string lines;   // per-villager summary
+  std::vector<CanopyCount> canopy;   // G, read right after worldgen
 };
 
 DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
@@ -216,6 +312,8 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
   st.LoadMap(AssetDir(), mapName);
   st.BindChunkStore(&c.stream.Store());
   const Village v = Survey(st);
+  // G. The generated village, before anyone moves: no tree in any house.
+  out.canopy = CountCanopy(c, v.structures);
 
   const int maxArrive = (int)BaselineNumber("harrowby.arriveMaxTicks", 2400);
   // The boundaries of everyone's day, in order, from the 05:30 start (all
@@ -610,6 +708,25 @@ Status GateVillageHarrowby(Ctx& c, std::string& detail) {
   const std::string* pinned = BaselineValue("harrowby.dayTrace");
   const bool pinOk = !firstToTick || pinned == nullptr || pinned->empty() || *pinned == traceHex;
   for (const std::string& w : a.why) check(false, w);
+  // G. canopy intrusion, per structure.
+  std::string canopyLine;
+  int canopyTotal = 0;
+  for (const CanopyCount& cc : a.canopy) {
+    const std::string name = cc.id.substr(cc.id.find('/') + 1);
+    if (cc.inBox < 0) {
+      check(false, cc.id + ": its asset did not load for the canopy count");
+      continue;
+    }
+    canopyTotal += cc.inBox + cc.overhead;
+    canopyLine += Format("%s%s %d+%d", canopyLine.empty() ? "" : ", ", name.c_str(), cc.inBox, cc.overhead);
+    if (cc.inBox + cc.overhead > 0)
+      check(false, Format("%s: %d tree-material voxels inside its stamped box (%d,%d,%d)..(%d,%d,%d) and %d in "
+                          "the 48 above it, the first at (%d,%d,%d): the forest's crowns reach into the "
+                          "village -- widen the map's clearing (map.json kind \"clearing\") over it",
+                          cc.id.c_str(), cc.inBox, cc.lo.x, cc.lo.y, cc.lo.z, cc.hi.x, cc.hi.y, cc.hi.z,
+                          cc.overhead, cc.first.x, cc.first.y, cc.first.z));
+  }
+  RecordObserved("harrowby.canopyVoxels", (double)canopyTotal);
   if (!pinOk && why.empty()) {
     MarkPinnedOnly();
     check(false, "the day's trace " + traceHex + " is not the pinned " + *pinned +
@@ -622,11 +739,11 @@ Status GateVillageHarrowby(Ctx& c, std::string& detail) {
       "map '%s': %d map + %d refs warnings | %zu villagers, %zu structures, %zu doors | dialogue "
       "%d errors (%d warnings) | %d schedule rows, %d unresolved, %d unrouted | day: %d spawned, "
       "%d segments in %d ticks, worst arrival %d ticks (%s, bound %d), doors opened %u closed %u, "
-      "%d left open, re-plans %u [%s] | trace %s (%s)",
+      "%d left open, re-plans %u [%s] | canopy in houses (box+above) %s | trace %s (%s)",
       mapName.c_str(), mapWarn, refWarn, v.npcs.size(), v.structures.size(), v.doors.size(), dErr,
       dWarn, rows, badAnchors, straight, a.spawned, a.segments, a.ticks, a.worst,
       a.worstWho.c_str(), (int)BaselineNumber("harrowby.arriveMaxTicks", 2400), a.opens, a.closes,
-      a.doorsLeftOpen, a.replans, a.lines.c_str(), traceHex.c_str(),
+      a.doorsLeftOpen, a.replans, a.lines.c_str(), canopyLine.c_str(), traceHex.c_str(),
       !firstToTick ? Format("not compared: %u ticks ran before this gate in this process", ticksAtEntry).c_str()
       : pinned == nullptr || pinned->empty() ? "not pinned yet"
       : (pinOk ? "= pinned" : "DIFFERS from the pin"));

@@ -474,9 +474,26 @@ enum : uint32_t {
 // the far cascades' canopy and the undergrowth cover like any other tree.
 // Not grown at or above the treeline: treeMaxTop() is a world-wide bound
 // every sky skip relies on.
+// kSiteClearing: A FOREST CLEARING -- `{kind: "clearing", min: [x, z],
+// max: [x, z], feather?}` in map.json. An axis-aligned box (world voxels,
+// inclusive) that no LATTICE tree's CROWN reaches over: a trunk is refused
+// when its species' reach square meets the box, and across the `feather`
+// band past that (Chebyshev, crown edge to box) trunks are thinned
+// deterministically -- kept with probability gap / feather, a counter hash of
+// the trunk column -- so the forest edge is ragged, not ruled. That is ALL it
+// does: terrain height, ground skin, cover rows, tile plants and ponds are
+// untouched (cover under an open sky grows the open-sky rows, because it is
+// placed by canopy cover), and it is not a keep-out (siteFootprintHas says no).
+// The bush and the dead tree are atlas species, so they are thinned like any
+// tree; authored tree sites are the author's and stand. Many per map; the
+// record's kS_X / kS_Z are the box's MIN corner, kS_BoxX1 / kS_BoxZ1 its MAX,
+// kS_PadMargin the feather. Listed in every cell the box + feather + the
+// widest crown reaches, because the lattice asks from the trunk's cell
+// (worldgen.wgsl siteBlocksTrunk -> clearingRefuses; the far cascades draw
+// trees through the same treeInfoBare, so they agree by construction).
 enum : uint32_t {
   kSiteRecWords = 16,
-  kS_Kind = 0,          // kSiteStamp | kSiteWater | kSiteTree
+  kS_Kind = 0,          // kSiteStamp | kSiteWater | kSiteTree | kSiteClearing
   kS_X = 1,             // world voxel centre (i32 in u32)
   kS_Z = 2,
   kS_Radius = 3,        // Chebyshev footprint radius in voxels: keep-out + pad
@@ -502,7 +519,10 @@ enum : uint32_t {
                         // (a structure's footing under GRADE, PLAN_world_editor
                         // P4). 0 for a map.json stamp: its bottom row sits on
                         // the pad, as it always has. <= kStampSinkMax.
-  // 13..15 reserved
+  kS_BoxX1 = 13,        // clearing site: the box's MAX corner, inclusive. A
+  kS_BoxZ1 = 14,        // clearing's kS_X / kS_Z are its MIN corner (not a
+                        // centre) and kS_PadMargin its feather, in voxels.
+  // 15 reserved
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -512,6 +532,8 @@ enum : uint32_t {
   kSiteWater = 2,
   kSiteTree = 3,
   kSiteRotRolled = 4,   // kS_Rot of a tree site the map did not turn
+  kSiteClearing = 5,    // a forest clearing (kind "clearing"): no crown over
+                        // its box, trunks thinned across its feather band
   // At most this many sites may reach one map cell (the per-cell list); more
   // is a load error. Was 4 ("two neighbouring buildings, a lake and a tree")
   // until the world editor's P4: a village is ~10 structure refs plus its
@@ -526,6 +548,10 @@ enum : uint32_t {
   // voxels. No tarn centre, cactus, tile plant or cover row inside it; the
   // ground under the crown keeps its undergrowth like a lattice tree's does.
   kSiteTreeKeepOut = 6,
+  // A clearing's feather band when map.json names none, and the widest it
+  // may be, in voxels (worldmap.cpp clamps).
+  kClearingFeatherDefault = 64,
+  kClearingFeatherMax = 512,
 };
 
 }  // namespace worldmap
@@ -678,8 +704,11 @@ struct WorldMapData {
   // tree's species. `siteIndex` / `siteLists` are the per-cell lists.
   struct StampSite {
     std::string id, templateName;         // templateName: stamp .vox / water preset / tree species
-    int kind = kSiteStamp;                // kSiteStamp | kSiteWater (P-F) | kSiteTree (P6)
+    int kind = kSiteStamp;                // kSiteStamp | kSiteWater (P-F) | kSiteTree (P6) | kSiteClearing
+    // A CLEARING: (x, z) is the box's MIN corner and (x1, z1) its max,
+    // inclusive; padMargin is the feather. Every other kind: (x, z) is the centre.
     int x = 0, z = 0, radius = 0, padMargin = 8, rot = 0;
+    int x1 = 0, z1 = 0;
     uint32_t salt = 0;
     int preset = 0;                       // water site: 1 + preset index
     int species = 0, variant = 0;         // tree site: kS_Species / kS_Variant

@@ -1603,7 +1603,9 @@ def check_worldmap_layout():
              "kSitePad": "WM_SITE_PAD", "kSiteStamp": "WM_SITE_STAMP", "kSiteWater": "WM_SITE_WATER",
              # P6 (PLAN_map_overhaul): the tree site kind and the per-cell list
              "kSiteTree": "WM_SITE_TREE", "kSiteRotRolled": "WM_SITE_ROT_ROLLED",
-             "kSiteCellMax": "WM_SITE_CELL_MAX", "kSiteTreeKeepOut": "WM_SITE_TREE_KEEP_OUT"}
+             "kSiteCellMax": "WM_SITE_CELL_MAX", "kSiteTreeKeepOut": "WM_SITE_TREE_KEEP_OUT",
+             # the forest clearing (kind "clearing")
+             "kSiteClearing": "WM_SITE_CLEARING"}
     for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for name, wgname in list(alias.items()):

@@ -27,7 +27,10 @@
  * of the calm home area; PLAN_environment_truth P-C), `kind: "stamp"`
  * markers (P5), `kind: "water"` AUTHORED LAKES (P-F: a water preset at a
  * fixed centre, the same on every seed) and `kind: "tree"` AUTHORED TREES
- * (P6 of docs/PLAN_map_overhaul.md: a species at a column). Every placed kind
+ * (P6 of docs/PLAN_map_overhaul.md: a species at a column) and `kind:
+ * "clearing"` FOREST CLEARINGS (a box no procedural tree's crown reaches
+ * over, the forest thinning across its `feather` band; terrain, skin and
+ * ground cover untouched; many per map). Every placed kind
  * spells its column `at: [x, z]` (a pre-P6 stamp's x / z still loads). The
  * engine lists each site in the map cells its reach touches (at most four a
  * cell, or the load is refused) and every reader tests the site's own
@@ -71,7 +74,7 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, biome:Uint8Array, landform:Uint8Array, moisture:Uint8Array}
 let dirty = false;
-let tool = 'biome';        // biome | landform (the plane brushes) | pad | spawn | stamp | water | lfsite | tree | site | sculpt
+let tool = 'biome';        // biome | landform (the plane brushes) | pad | spawn | stamp | water | lfsite | tree | clearing | site | sculpt
 // P-G: the terrain block map.json carries. Its DEFAULTS (what a map missing a
 // key gets) have one copy, src/sim/worldmap.h TerrainParams, which the tuner
 // server reads and serves (/api/worldmap/terrain-defaults, via
@@ -145,6 +148,22 @@ let undo = [];
 let redo = [];
 let stroke = null;         // snapshot taken at pointerdown, pushed at pointerup if anything changed
 let padDrag = null;
+// The Clearing tool (kind "clearing"): the feather a NEW clearing gets, and
+// the drag in progress -- {mode: 'new', x0, z0, site} draws a box from the
+// press point, {mode: 'move', site, dx, dz} slides an existing one.
+let clearing = {feather: 64};
+let clearDrag = null;
+/** The clearing whose BOX holds world column (wx, wz), the last drawn first. */
+function clearingAt(wx, wz) {
+  const ss = (map.json.sites || []).filter(s => s.kind === 'clearing' && Array.isArray(s.min) && Array.isArray(s.max));
+  for (let i = ss.length - 1; i >= 0; i--) {
+    const s = ss[i];
+    if (wx >= s.min[0] && wx <= s.max[0] && wz >= s.min[1] && wz <= s.max[1]) return s;
+  }
+  return null;
+}
+/** A box site's centre (pad / clearing), world voxels. */
+function boxCentre(s) { return [Math.round((s.min[0] + s.max[0]) / 2), Math.round((s.min[1] + s.max[1]) / 2)]; }
 let img = null;            // ImageData of the planes
 let imgDirty = true;       // the planes (or the palette / shading) changed since img was built
 let palCache = {key: '', pal: []};   // biome palette -> RGB, rebuilt when map.json.biomes changes
@@ -579,7 +598,7 @@ function syncCheck() {
       row.title = 'select ' + hit.id;
       row.addEventListener('click', () => {
         selected = hit;
-        const cv = 1 << map.json.cellLog2, [x, z] = hit.kind === 'pad' ? [0, 0] : siteXZ(hit);
+        const cv = 1 << map.json.cellLog2, [x, z] = hit.kind === 'pad' ? [0, 0] : hit.kind === 'clearing' ? boxCentre(hit) : siteXZ(hit);
         view.cx = x / cv + map.json.originCell[0]; view.cz = z / cv + map.json.originCell[1];
         syncSites(); paint();
       });
@@ -715,6 +734,28 @@ function paint() {
     ctx.fillStyle = '#ffb454'; ctx.font = '11px monospace';
     ctx.fillText(s.id || 'pad', ox + x0 * view.scale + 3, oy + z0 * view.scale - 3);
   }
+  // forest clearings: the box solid over a faint fill, the feather band as a
+  // dashed ring round it (where the forest thins out), lime so they never
+  // read as the orange pad box
+  for (const s of (map.json.sites || [])) {
+    if (s.kind !== 'clearing' || !Array.isArray(s.min) || !Array.isArray(s.max)) continue;
+    const cv = 1 << map.json.cellLog2, f = s.feather == null ? 64 : s.feather;
+    const px = x => ox + (x / cv + ocx) * view.scale, pz = z => oy + (z / cv + ocz) * view.scale;
+    const x0 = px(s.min[0]), z0 = pz(s.min[1]), x1 = px(s.max[0] + 1), z1 = pz(s.max[1] + 1);
+    const sel = selected === s;
+    ctx.fillStyle = 'rgba(198,240,106,0.12)';
+    ctx.fillRect(x0, z0, Math.max(1, x1 - x0), Math.max(1, z1 - z0));
+    ctx.strokeStyle = sel ? '#ffffff' : (tool === 'clearing' ? '#ff7a7a' : '#c6f06a'); ctx.lineWidth = sel ? 3 : 2;
+    ctx.strokeRect(x0, z0, Math.max(1, x1 - x0), Math.max(1, z1 - z0));
+    if (f > 0) {
+      const fp = f / cv * view.scale;
+      ctx.setLineDash([4, 3]); ctx.lineWidth = 1; ctx.strokeStyle = '#c6f06a';
+      ctx.strokeRect(x0 - fp, z0 - fp, (x1 - x0) + 2 * fp, (z1 - z0) + 2 * fp);
+      ctx.setLineDash([]);
+    }
+    ctx.fillStyle = '#c6f06a'; ctx.font = '11px monospace';
+    ctx.fillText((s.id || 'clearing') + ' (feather ' + f + ')', x0 + 3, z0 - 3);
+  }
   // the spawn site: a diamond at the column, the default (dim) if the map
   // names none -- the engine starts the player there either way
   {
@@ -794,7 +835,7 @@ function paint() {
     ctx.fillText((s.id || s.shape) + ' (' + s.shape + ' ' + ((s.heightVox || 0) / 10).toFixed(0) + ' m)', sx + rr + 3, sz + 4);
   }
   // the selected site of any other kind: a white ring
-  if (selected && selected.kind !== 'landform') {
+  if (selected && selected.kind !== 'landform' && selected.kind !== 'clearing') {
     const l = map.json.cellLog2, cv = 1 << l;
     const at = siteXZ(selected);
     if (selected.kind !== 'pad') {
@@ -893,6 +934,36 @@ function wire() {
       const [wx, wz] = worldOfCell(cx, cz);
       stroke = snapshot();
       padDrag = {x0: wx, z0: wz};
+      return;
+    }
+    if (tool === 'clearing') {
+      // THE CLEARING TOOL: drag on open map draws a new clearing box (world
+      // columns: zoom in for single voxels); click inside one selects it and a
+      // drag slides it; shift+click inside one deletes it. Its feather and
+      // exact corners are edited in the Sites panel.
+      const [wx, wz] = worldColumnAt(ev);
+      const sites = map.json.sites || (map.json.sites = []);
+      const hit = clearingAt(wx, wz);
+      stroke = snapshot();
+      if (ev.shiftKey && hit) {
+        sites.splice(sites.indexOf(hit), 1);
+        if (selected === hit) selected = null;
+        stroke.changed = true;
+      } else if (hit) {
+        selected = hit;
+        clearDrag = {mode: 'move', site: hit, dx: hit.min[0] - wx, dz: hit.min[1] - wz,
+                     w: hit.max[0] - hit.min[0], h: hit.max[1] - hit.min[1]};
+      } else {
+        const n = sites.filter(s => s.kind === 'clearing').length;
+        let id = 'clearing_' + n;
+        for (let k = n; sites.some(s => s.id === id); k++) id = 'clearing_' + (k + 1);
+        const s = {id, kind: 'clearing', min: [wx, wz], max: [wx, wz], feather: Math.round(clearing.feather)};
+        sites.push(s);
+        selected = s;
+        clearDrag = {mode: 'new', site: s, x0: wx, z0: wz};
+      }
+      syncSites();
+      paint();
       return;
     }
     if (tool === 'spawn') {
@@ -1073,6 +1144,18 @@ function wire() {
       if (s) { s.min = box.min; s.max = box.max; }
       else map.json.sites = [...(map.json.sites || []), {id: 'harness', kind: 'pad', ...box}];
       stroke.changed = true;
+    } else if (clearDrag && ev.buttons & 1) {
+      const [wx, wz] = worldColumnAt(ev);
+      const s = clearDrag.site;
+      if (clearDrag.mode === 'new') {
+        s.min = [Math.min(clearDrag.x0, wx), Math.min(clearDrag.z0, wz)];
+        s.max = [Math.max(clearDrag.x0, wx), Math.max(clearDrag.z0, wz)];
+      } else {
+        s.min = [wx + clearDrag.dx, wz + clearDrag.dz];
+        s.max = [s.min[0] + clearDrag.w, s.min[1] + clearDrag.h];
+      }
+      stroke.changed = true;
+      syncSites();
     } else if (waterDrag && ev.buttons & 1) {
       const [wx, wz] = worldColumnAt(ev);
       waterDrag.site.at = [wx + waterDrag.dx, wz + waterDrag.dz];
@@ -1117,6 +1200,19 @@ function wire() {
   const up = () => {
     panning = null;
     padDrag = null;
+    if (clearDrag && clearDrag.mode === 'new') {
+      // A click without a drag is not a clearing: take the empty box back.
+      const s = clearDrag.site;
+      if (s.max[0] - s.min[0] < 8 || s.max[1] - s.min[1] < 8) {
+        const sites = map.json.sites || [];
+        if (sites.includes(s)) sites.splice(sites.indexOf(s), 1);
+        if (selected === s) selected = null;
+        if (stroke) stroke.changed = false;
+        toast('drag to draw a clearing (at least 8 voxels a side; zoom in for voxel precision)');
+        syncSites();
+      } else if (stroke) stroke.changed = true;
+    }
+    clearDrag = null;
     waterDrag = null;
     landDrag = null;
     if (stroke) {
@@ -1190,6 +1286,16 @@ function siteAt(wx, wz) {
     let at = Array.isArray(s.at) ? s.at : null;
     if (s.kind === 'stamp') at = siteXZ(s);
     if (s.kind === 'pad' && Array.isArray(s.min) && Array.isArray(s.max)) at = [(s.min[0] + s.max[0]) / 2, (s.min[1] + s.max[1]) / 2];
+    if (s.kind === 'clearing' && Array.isArray(s.min) && Array.isArray(s.max)) {
+      // inside the box always hits (the smallest-centre-distance one wins)
+      const c = boxCentre(s);
+      if (wx >= s.min[0] && wx <= s.max[0] && wz >= s.min[1] && wz <= s.max[1]) {
+        const d = Math.hypot(c[0] - wx, c[1] - wz);
+        if (d < bd) { bd = d; best = s; }
+        continue;
+      }
+      at = c;
+    }
     if (!at) continue;
     const d = Math.hypot(at[0] - wx, at[1] - wz);
     const r = s.kind === 'landform' ? (s.radius || 1024) : s.kind === 'water' ? ((s.radius || (water.geom[s.preset] || {}).radius || 60)) : reach;
@@ -1244,14 +1350,14 @@ function syncTerrain() {
 function buildSitesPanel() {
   const el = H.el;
   const det = el('details', {class: 'mapsites', open: true});
-  det.append(el('summary', {}, 'Sites — everything declared on this map (pad, spawn, water, landform, stamp)'));
+  det.append(el('summary', {}, 'Sites — everything declared on this map (pad, clearing, spawn, water, landform, stamp, tree)'));
   els.sitesList = el('div', {class: 'mapsites-list'});
   els.sitePanel = el('div', {class: 'mapsites-panel'});
   det.append(els.sitesList, els.sitePanel);
   return det;
 }
 function siteWhere(s) {
-  if (s.kind === 'pad' && Array.isArray(s.min)) return '(' + s.min.join(',') + ')..(' + s.max.join(',') + ')';
+  if ((s.kind === 'pad' || s.kind === 'clearing') && Array.isArray(s.min)) return '(' + s.min.join(',') + ')..(' + s.max.join(',') + ')';
   if (s.kind === 'stamp') return '(' + siteXZ(s).join(',') + ')';
   return Array.isArray(s.at) ? '(' + s.at.join(',') + ')' : '';
 }
@@ -1260,7 +1366,7 @@ function syncSites() {
   const el = H.el;
   const sites = map.json.sites || (map.json.sites = []);
   els.sitesList.innerHTML = '';
-  const order = {pad: 0, spawn: 1, water: 2, landform: 3, stamp: 4, tree: 5};
+  const order = {pad: 0, clearing: 1, spawn: 2, water: 3, landform: 4, stamp: 5, tree: 6};
   const sorted = sites.slice().sort((a, b) => (order[a.kind] ?? 9) - (order[b.kind] ?? 9));
   for (const s of sorted) {
     const row = el('div', {class: 'mapsite' + (selected === s ? ' on' : '')});
@@ -1323,6 +1429,31 @@ function syncSites() {
     pnl.append(el('span', {class: 'mapnote'}, 'Where the game starts and the centre of the calm home area (Terrain \u2192 home area). Move it with the Spawn tool; the spawn-site gate checks it is on land, off the pad and off any lake.'));
   } else if (s.kind === 'pad') {
     pnl.append(el('span', {class: 'mapnote'}, 'The calm pad box: no trunks, crowns, tarns or cover inside. Drag it with the Pad box tool.'));
+  } else if (s.kind === 'clearing') {
+    // the corners as four numbers (min <= max is kept: editing one past the
+    // other swaps them), and the feather
+    const corner = (label, arr, i, title) => {
+      const inp = el('input', {type: 'number', step: 1, value: s[arr][i], style: 'width:80px', title});
+      inp.addEventListener('change', () => {
+        undo.push(snapshot()); if (undo.length > 40) undo.shift(); redo = [];
+        s[arr][i] = Math.round(+inp.value || 0);
+        const lo = Math.min(s.min[i], s.max[i]), hi = Math.max(s.min[i], s.max[i]);
+        s.min[i] = lo; s.max[i] = hi;
+        markDirty(true); syncSites(); paint();
+      });
+      return el('label', {title}, label, ' ', inp);
+    };
+    if (s.feather == null) s.feather = 64;
+    const w = s.max[0] - s.min[0] + 1, h = s.max[1] - s.min[1] + 1;
+    pnl.append(corner('min x', 'min', 0, 'west edge, world voxels (inclusive)'),
+               corner('min z', 'min', 1, 'north edge, world voxels (inclusive)'),
+               corner('max x', 'max', 0, 'east edge, world voxels (inclusive)'),
+               corner('max z', 'max', 1, 'south edge, world voxels (inclusive)'),
+               num('feather (vox)', 'feather', 0, 512, 8, 'How wide the ragged forest edge is, past the crowns: across it trees thin out (half of them survive at its middle); 0 = a hard edge.'),
+               el('span', {class: 'mapnote'}, w + ' × ' + h + ' vox (' + (w / 10).toFixed(1) + ' × ' + (h / 10).toFixed(1) + ' m). ' +
+                  'No procedural tree’s CROWN reaches over this box (a trunk is kept its own crown’s width away, so big trees stand further back), and across the dashed feather band trees thin out, so the edge is ragged. ' +
+                  'The bush and the dead tree are trees here; grass, flowers and ferns, the ground, its skin and ponds are untouched, and authored Tree sites still stand. ' +
+                  'Drag it with the Clearing tool; shift+click inside it deletes it. Keep the spawn outside it if the player should wake among trees (the load check warns).'));
   } else if (s.kind === 'stamp') {
     pnl.append(el('span', {class: 'mapnote'}, 'assets/prefabs/' + (s.template || '?') + '.vox' + (s.rot ? ', rotated ' + s.rot : '') + '. Shift+click its marker with the Stamp tool to delete.'));
   } else if (s.kind === 'tree') {
@@ -1567,6 +1698,7 @@ export function attach(hooks) {
 #env-map .mapkind-water{color:#5fc8ff}
 #env-map .mapkind-spawn{color:#8dff9a}
 #env-map .mapkind-pad{color:#ffb454}
+#env-map .mapkind-clearing{color:#c6f06a}
 #env-map .mapkind-stamp{color:#7fd4ff}
 #env-map .mapkind-tree{color:#6fe07a}
 #env-map details.mapcheck summary.bad{color:#ffb454}
@@ -1600,6 +1732,7 @@ export function attach(hooks) {
     // Landform BRUSH above: the paint brush had no button and its slider
     // switched to this tool)
     lfsite: el('button', {title: 'click: DECLARE A LANDFORM (a peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed); drag one to move it; shift+click: delete it'}, 'Landform site'),
+    clearing: el('button', {title: 'drag: draw a FOREST CLEARING (a box no tree crown reaches over; the forest thins across its feather band; ground, cover and terrain untouched); click one to select it, drag to move it; shift+click inside one: delete it'}, 'Clearing'),
     tree: el('button', {title: 'click: place an AUTHORED TREE (the species beside it, from assets/trees/*.svtree) on the ground at that column; drag a tree to move it; shift+click: delete it. The procedural forest keeps its trunks a crown’s width away.'}, 'Tree'),
     site: el('button', {title: 'click a site marker of any kind to select it in the Sites panel'}, 'Select'),
     sculpt: el('button', {title: 'SCULPT the ground: raise / lower / smooth / flatten / erase the map\u2019s height-offset layer (sculpt.svsculpt, 0.8 m samples). Zoom in, click Heights to see the engine\u2019s ground under it live.'}, 'Sculpt'),
@@ -1627,6 +1760,10 @@ export function attach(hooks) {
   els.treeRot.append(el('option', {value: '-1'}, 'rolled'));
   for (let i = 0; i < 4; i++) els.treeRot.append(el('option', {value: String(i)}, (i * 90) + '°'));
   els.treeRot.addEventListener('change', () => { trees.rot = +els.treeRot.value; });
+  // The clearing tool's feather for a NEW clearing; an existing one is edited
+  // in the Sites panel.
+  els.clearFeather = el('input', {type: 'number', min: 0, max: 512, step: 8, value: clearing.feather, style: 'width:56px', title: 'feather in voxels for a NEW clearing: the band past the crowns where the forest thins out (0 = a hard edge)'});
+  els.clearFeather.addEventListener('change', () => { clearing.feather = Math.max(0, Math.min(512, Math.round(+els.clearFeather.value || 0))); els.clearFeather.value = clearing.feather; tool = 'clearing'; syncControls(); paint(); });
   // The landform tool's parameters for a NEW site (P-G); an existing one is
   // edited in the Sites panel.
   els.lfShape = el('select', {title: 'the shape a new landform takes'});
@@ -1692,11 +1829,12 @@ export function attach(hooks) {
     el('label', {title: 'the edit layer this map applies over its worldgen (map.json editLayer)'}, ' edits ', els.editSel),
     els.save, undoBtn, redoBtn, fitBtn, els.heightsBtn,
     el('span', {style: 'width:10px'}),
-    els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.lfsite, els.tools.tree, els.tools.sculpt,
+    els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.lfsite, els.tools.tree, els.tools.clearing, els.tools.sculpt,
     el('label', {}, ' sculpt ', els.scMode, ' r ', els.scRadius, ' ', els.scRadiusOut, ' str ', els.scStrength, ' ', els.scStrengthOut, ' ', scShow, ' show'),
     el('label', {}, ' lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
     el('label', {}, ' stamp ', els.stampTpl, ' ', els.stampRot),
     el('label', {}, ' tree ', els.treeSp, ' v ', els.treeVar, ' ', els.treeRot),
+    el('label', {}, ' clearing feather ', els.clearFeather, ' vox'),
     el('label', {}, ' new landform ', els.lfShape, ' r ', els.lfRadius, ' h ', els.lfHeight, ' \u00b0 ', els.lfRot),
     el('label', {}, ' brush ', els.radius, ' ', els.radiusOut),
     el('label', {}, ' landform paint ', els.land, ' ', els.landOut),
@@ -1708,6 +1846,7 @@ export function attach(hooks) {
     'A stamp site places assets/prefabs/<name>.vox (picked from the files that exist) on a levelled pad at that column; a site whose .vox has since gone is skipped with a warning at load. ' +
     'A water site is an AUTHORED LAKE: the chosen preset (Environment > Water bodies) carved at that column on every seed. ' +
     'A landform site is a DECLARED mountain: a peak, ridge, basin or plateau overlaid onto the landform plane at load. ' +
+    'A clearing is a FOREST CLEARING: a box (drag it with the Clearing tool) that no procedural tree\u2019s crown reaches over, the forest thinning across its dashed feather band so the edge is ragged; the ground, its cover and the terrain are untouched, and there may be many. Use it for a village or a glade; the pad box is the selftest\u2019s and bares everything. ' +
     'A tree site is ONE AUTHORED TREE: a species (assets/trees/*.svtree) standing on the ground at that column, near and far; the procedural forest keeps its trunks a crown’s width away. ' +
     'Sites keep out by their own footprint (a stamp’s pad, a lake’s disc + shore band, a tree’s trunk), never by the 102 m cell; at most four sites may reach one cell. The Load check panel says what the engine thinks of the saved map. ' +
     'SCULPT shapes the ground itself: a signed height offset every 0.8 m (sculpt.svsculpt, 25.6 m tiles that exist only where you sculpt), added AFTER all the seeded noise and the home-area fade, so a 12 m raise is 12 m anywhere; the sediment, ponds, sea and site pads react to it. Zoom in and click Heights: the backdrop then covers the view and follows your strokes live (exact except the sediment wedge\u2019s reaction, which the next save redraws). An erased layer saves as no file at all. ' +

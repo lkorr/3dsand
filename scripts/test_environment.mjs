@@ -217,8 +217,15 @@ for (const mapName of ['default', 'harness']) {
     ok(stamps.every(s => prefabs.has(s.template)), 'every stamp site names an existing assets/prefabs/<template>.vox');
     // P6: every site kind is one the loader knows (an unknown one is a load
     // warning and ignored), and every tree site names a baked species.
-    const kinds = new Set(['spawn', 'pad', 'stamp', 'water', 'landform', 'tree']);
+    const kinds = new Set(['spawn', 'pad', 'stamp', 'water', 'landform', 'tree', 'clearing']);
     ok((j.sites || []).every(s => kinds.has(s.kind)), 'every site kind is known to the loader');
+    // A forest clearing is a box (min <= max on both axes, the loader refuses
+    // otherwise) with a feather 0..512.
+    const clearings = (j.sites || []).filter(s => s.kind === 'clearing');
+    ok(clearings.every(s => Array.isArray(s.min) && Array.isArray(s.max) && s.min.length === 2 && s.max.length === 2 &&
+                            [...s.min, ...s.max].every(Number.isInteger) && s.min[0] <= s.max[0] && s.min[1] <= s.max[1] &&
+                            (s.feather == null || (Number.isInteger(s.feather) && s.feather >= 0 && s.feather <= 512))),
+       `${clearings.length} clearing(s) are boxes (min <= max) with a feather 0..512`);
     const svtree = new Set(readdirSync(join(ROOT, 'assets', 'trees')).filter(f => f.endsWith('.svtree')).map(f => f.slice(0, -7)));
     const treeSites = (j.sites || []).filter(s => s.kind === 'tree');
     ok(treeSites.every(s => svtree.has(s.species) && colOk(s)), `${treeSites.length} tree site(s) name a baked species (assets/trees/<name>.svtree) at a column`);

@@ -1109,9 +1109,40 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                                                                      : static_cast<int>(kSiteRotRolled);
         st.salt = 0;
         out.sites.push_back(std::move(st));
+      } else if (kind == "clearing") {
+        // A FOREST CLEARING (worldmap.h kSiteClearing): a box no lattice
+        // crown reaches over, the forest thinning across `feather` past it.
+        // A box whose corners are the wrong way round is a refusal naming
+        // the site (the map page cannot draw one, so a hand edit made it).
+        WorldMapData::StampSite st;
+        st.id = id;
+        st.kind = kSiteClearing;
+        if (!(s.contains("min") && s.contains("max") && s["min"].is_array() && s["max"].is_array() &&
+              s["min"].size() == 2 && s["max"].size() == 2 && s["min"][0].is_number() &&
+              s["min"][1].is_number() && s["max"][0].is_number() && s["max"][1].is_number())) {
+          log += at + "site \"" + id + "\" kind clearing needs min[2]/max[2] in world voxels\n";
+          return false;
+        }
+        st.x = s["min"][0].get<int>(); st.z = s["min"][1].get<int>();
+        st.x1 = s["max"][0].get<int>(); st.z1 = s["max"][1].get<int>();
+        if (st.x1 < st.x || st.z1 < st.z) {
+          log += at + "site \"" + id + "\" kind clearing: min (" + std::to_string(st.x) + "," +
+                 std::to_string(st.z) + ") is not below max (" + std::to_string(st.x1) + "," +
+                 std::to_string(st.z1) + ") on both axes\n";
+          return false;
+        }
+        const int fe = s.value("feather", static_cast<int>(kClearingFeatherDefault));
+        st.padMargin = std::clamp(fe, 0, static_cast<int>(kClearingFeatherMax));
+        if (fe != st.padMargin)
+          warn("site \"" + id + "\": feather " + std::to_string(fe) + " clamped to " +
+               std::to_string(st.padMargin) + " (0.." + std::to_string(kClearingFeatherMax) + ")");
+        st.radius = 0;
+        st.salt = 0;
+        if (!readTreeSpecies()) return false;   // the index reach needs the widest crown
+        out.sites.push_back(std::move(st));
       } else {
         warn("site \"" + id + "\": unknown kind \"" + kind +
-             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree)");
+             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree, clearing)");
       }
     }
   }
@@ -1338,7 +1369,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           const int wz = ((cz - out.originCellZ) << out.cellLog2) + cellVox / 2 + jz;
           bool tooClose = false;
           for (const WorldMapData::StampSite& o : out.sites)
-            if (std::max(std::abs(o.x - wx), std::abs(o.z - wz)) < minSpacing) { tooClose = true; break; }
+            if (o.kind != kSiteClearing &&   // a clearing's (x, z) is a corner, and it keeps nothing out
+                std::max(std::abs(o.x - wx), std::abs(o.z - wz)) < minSpacing) { tooClose = true; break; }
           if (tooClose || out.InPadBox(wx, wz)) continue;
           WorldMapData::StampSite st;
           st.id = rid + "_" + std::to_string(placed);
@@ -1361,17 +1393,23 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // shore/berm band, + 1 for the bisection's outer column; a tree's own reach
   // + the WIDEST species' reach, because the lattice keeps its trunks a
   // crown's width (site reach + its own) away and asks from the trunk's cell.
+  // A clearing's reach is past its BOX (its x, z is the min corner): the
+  // feather + the widest crown, because a trunk that far out still has its
+  // crown's gap to the box measured (siteBlocksTrunk asks from the trunk).
   for (WorldMapData::StampSite& st : out.sites) {
     if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
+    else if (st.kind == kSiteClearing) st.indexReach = st.padMargin + treeMaxReach + 1;
     else st.indexReach = st.radius + st.padMargin + (st.kind == kSiteWater ? 1 : 0);
   }
   {
     std::map<size_t, std::vector<uint32_t>> byCell;   // ordered: the pack is a pure function of the map
     for (size_t si = 0; si < out.sites.size(); si++) {
       const WorldMapData::StampSite& st = out.sites[si];
+      const int hx = st.kind == kSiteClearing ? st.x1 : st.x;   // the far corner
+      const int hz = st.kind == kSiteClearing ? st.z1 : st.z;
       int c0x, c0z, c1x, c1z;
       out.CellOf(st.x - st.indexReach, st.z - st.indexReach, &c0x, &c0z);
-      out.CellOf(st.x + st.indexReach, st.z + st.indexReach, &c1x, &c1z);
+      out.CellOf(hx + st.indexReach, hz + st.indexReach, &c1x, &c1z);
       for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.height - 1); cz++)
         for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.width - 1); cx++)
           byCell[static_cast<size_t>(cz) * out.width + cx].push_back(static_cast<uint32_t>(si + 1));
@@ -1439,6 +1477,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           if (!seen.insert({ia, ib}).second) continue;
           const WorldMapData::StampSite& sa = out.sites[ia - 1];
           const WorldMapData::StampSite& sb = out.sites[ib - 1];
+          // A clearing claims no ground: it is MEANT to hold houses, lakes
+          // and authored trees (two clearings overlapping is one bigger one).
+          if (sa.kind == kSiteClearing || sb.kind == kSiteClearing) continue;
           if (!meets(fpOf(sa), fpOf(sb))) continue;
           warn("site \"" + sa.id + "\" (" + kindName(sa.kind) + " at " + std::to_string(sa.x) + "," +
                std::to_string(sa.z) + ") and site \"" + sb.id + "\" (" + kindName(sb.kind) + " at " +
@@ -1448,6 +1489,16 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
     if (out.spawnAuthored)
       for (const WorldMapData::StampSite& s : out.sites) {
+        if (s.kind == kSiteClearing) {
+          // Legal (it only keeps crowns off), but the player then wakes in
+          // open ground, which is rarely what a map with a forest means.
+          if (out.spawnX >= s.x && out.spawnX <= s.x1 && out.spawnZ >= s.z && out.spawnZ <= s.z1)
+            warn("the spawn (" + std::to_string(out.spawnX) + "," + std::to_string(out.spawnZ) +
+                 ") is inside clearing \"" + s.id + "\" (" + std::to_string(s.x) + "," + std::to_string(s.z) +
+                 ")..(" + std::to_string(s.x1) + "," + std::to_string(s.z1) +
+                 "): the player starts in the open, not among trees");
+          continue;
+        }
         const Fp f = fpOf(s);
         const Fp sp{false, out.spawnX, out.spawnZ, 0};
         if (meets(f, sp))
@@ -1471,7 +1522,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     Slot() = out;
     for (WorldMapData::StampSite& st : out.sites) {
       if (st.structure) continue;   // the AUTHORED floor, set above (P4)
-      st.padY = st.kind == kSiteWater ? 0 : BareGroundHeight(st.x, st.z, seed);
+      st.padY = st.kind == kSiteWater || st.kind == kSiteClearing ? 0 : BareGroundHeight(st.x, st.z, seed);
     }
     Slot() = std::move(prev);
   }
@@ -1509,6 +1560,9 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   int nStruct = 0;
   for (const WorldMapData::StampSite& s : m.sites) nStruct += s.structure ? 1 : 0;
   j["structures"] = nStruct;           // P4: structure refs placed as sites
+  int nClear = 0;
+  for (const WorldMapData::StampSite& s : m.sites) nClear += s.kind == kSiteClearing ? 1 : 0;
+  j["clearings"] = nClear;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
   j["warnings"] = m.warnings;
   j["error"] = error;
@@ -1577,6 +1631,7 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
     r[kS_Species] = U(s.species);
     r[kS_Variant] = U(s.variant);
     r[kS_Sink] = U(s.sink);
+    if (s.kind == kSiteClearing) { r[kS_BoxX1] = U(s.x1); r[kS_BoxZ1] = U(s.z1); }
     if (s.kind != kSiteStamp || s.words.empty()) continue;   // a water site has no block
     // The stamp block: rebase its relative offsets (column dir + run offsets)
     // onto the buffer as it is appended.

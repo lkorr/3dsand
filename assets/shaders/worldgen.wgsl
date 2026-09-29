@@ -1357,10 +1357,16 @@ const WM_S_PAD_Y         : u32 = 9u;    // pad / stamp / tree site: bare ground 
 const WM_S_SPECIES       : u32 = 10u;   // tree site: atlas species index
 const WM_S_VARIANT       : u32 = 11u;   // tree site: 1 + variant, 0 = rolled
 const WM_S_SINK          : u32 = 12u;   // stamp site: template rows below pad top + 1 (P4 footing)
+const WM_S_BOX_X1        : u32 = 13u;   // clearing site: box max corner (kS_X / kS_Z = min corner)
+const WM_S_BOX_Z1        : u32 = 14u;
 const WM_SITE_STAMP      : u32 = 1u;
 const WM_SITE_WATER      : u32 = 2u;    // an authored lake (worldmap.h kSiteWater)
 const WM_SITE_TREE       : u32 = 3u;    // one authored tree (worldmap.h kSiteTree, P6)
 const WM_SITE_ROT_ROLLED : u32 = 4u;    // a tree site's kS_Rot when the map did not turn it
+const WM_SITE_CLEARING   : u32 = 5u;    // a forest clearing (worldmap.h kSiteClearing)
+// The salt of a clearing's feather-band thinning roll (clearingRefuses): its
+// own hash stream, so it does not correlate with the tile's density roll.
+const CLEARING_THIN_SALT : u32 = 0xC1EA5u;
 const WM_SITE_CELL_MAX   : u32 = 32u;   // sites per cell list (the loader refuses more)
 const WM_STAMP_SINK_MAX  : i32 = 8;     // deepest kS_Sink (worldmap.h kStampSinkMax)
 const WM_SITE_TREE_KEEP_OUT : u32 = 6u; // a tree site's trunk keep-out, Chebyshev voxels
@@ -1670,6 +1676,9 @@ fn sitePadY(sid : u32) -> i32 {
 // until P6. world.cpp siteFootprintHas is the same test.
 fn siteFootprintHas(sid : u32, x : i32, z : i32) -> bool {
   let kind = wmSiteKind(sid);
+  // A clearing keeps CROWNS off (clearingRefuses) and nothing else: cover,
+  // tarns and tile plants grow in it as they would anywhere.
+  if (kind == WM_SITE_CLEARING) { return false; }
   let dx = x - wmSiteI(sid, WM_S_X);
   let dz = z - wmSiteI(sid, WM_S_Z);
   if (kind == WM_SITE_WATER) {
@@ -1699,12 +1708,32 @@ fn siteKeepOut(x : i32, z : i32) -> bool {
 // shore from outside is allowed, as it was. Asked once per TILE (treeInfoBare,
 // the tile cache), never per column. The tree site's index reach is its own
 // + the atlas's widest (worldmap.cpp), so the trunk's cell lists it.
-fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32) -> bool {
+// A CLEARING (map.json kind "clearing", worldmap.h kSiteClearing) refuses a
+// trunk whose crown square (Chebyshev `reach`) meets its box, and thins the
+// trunks across its feather band beyond: `gap` is the distance from the
+// crown's edge to the box, and a trunk there is kept with probability
+// gap / feather -- 0 at the box, 1 at the band's outer edge -- by a counter
+// hash of the trunk column (integer, seed + position only). Checked where the
+// crown width is known, like the pad's crownMeetsPad; the far cascades draw
+// their trees through this same treeInfoBare, so near and far agree.
+fn clearingRefuses(sid : u32, wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
+  let gx = max(wmSiteI(sid, WM_S_X) - wx, wx - wmSiteI(sid, WM_S_BOX_X1));
+  let gz = max(wmSiteI(sid, WM_S_Z) - wz, wz - wmSiteI(sid, WM_S_BOX_Z1));
+  let gap = max(gx, gz) - reach;
+  if (gap < 0) { return true; }
+  let feather = wmSiteI(sid, WM_S_PAD_MARGIN);
+  if (gap >= feather) { return false; }
+  let roll = hash3(seed ^ CLEARING_THIN_SALT, bitcast<u32>(wx), bitcast<u32>(wz)) % u32(feather);
+  return i32(roll) >= gap;
+}
+fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
   let lst = wmSiteList(wx, wz);
   let n = wmSiteN(lst);
   for (var k = 0u; k < n; k++) {
     let sid = wmSiteK(lst, k);
-    if (wmSiteKind(sid) == WM_SITE_TREE) {
+    if (wmSiteKind(sid) == WM_SITE_CLEARING) {
+      if (clearingRefuses(sid, wx, wz, reach, seed)) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_TREE) {
       let d = max(abs(wx - wmSiteI(sid, WM_S_X)), abs(wz - wmSiteI(sid, WM_S_Z)));
       if (d <= wmSiteI(sid, WM_S_RADIUS) + reach) { return true; }
     } else if (siteFootprintHas(sid, wx, wz)) { return true; }
@@ -2268,7 +2297,9 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   // outside a pad or a shore is allowed and wanted. (Until P6 this refused
   // every trunk in the site's 102 m CELLS, so an authored lake balded a
   // hectare of forest around itself.)
-  if (siteBlocksTrunk(t.wx, t.wz, t.reach)) { return t; }
+  // A clearing's box keeps crowns off too, and its feather band thins the
+  // edge (clearingRefuses, same call).
+  if (siteBlocksTrunk(t.wx, t.wz, t.reach, seed)) { return t; }
 
   t.sp = sp;
   t.above = i32(taSpecies(sp, TA_S_ABOVE));

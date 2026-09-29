@@ -417,6 +417,21 @@ bool g_shotDialogue = false;
 constexpr uint64_t kShotDlgSpawn = 90, kShotDlgBegin = 130, kShotDlgShot1 = 160,
                    kShotDlgChoose = 170, kShotDlgShot2 = 200, kShotDlgLast = 206;
 
+// `--shot-spawn`: WHAT A NEW GAME SEES. The real game on the real map
+// (world.mapLayer), started as a player starts it -- at the map's spawn site,
+// on foot -- with the sky held at SANDVOX_SHOT_SPAWN_AT (minutes, default 600
+// = 10:00) and the dev panel hidden. Once the near window and the far field
+// have built, three pictures: standing at the spawn looking toward
+// SANDVOX_SHOT_SPAWN_LOOK="x,z" (world voxels; default: due north, -Z)
+// (screenshot_spawn.bmp), the same spot turned round (screenshot_spawn_back.bmp),
+// and from 30 m above and 40 m behind the spawn looking the same way
+// (screenshot_spawn_high.bmp). Built for the Harrowby clearing (the spawn
+// must stand among trees, the village in a clearing ahead) and useful for any
+// map edit that changes what the player wakes to.
+bool g_shotSpawn = false;
+constexpr uint64_t kShotSpLook = 560, kShotSpShot1 = 620, kShotSpShot2 = 660, kShotSpHigh = 700,
+                   kShotSpShot3 = 760, kShotSpLast = 766;
+
 // `--shot-editor`: the IN-GAME EDITOR's look-iteration harness (ui/editor_ui.h,
 // PLAN_world_editor P5). Enters F8 mode, places a sample house on the
 // flattest spot 20 m around the player at 11:00 (a scratch refs group
@@ -4851,6 +4866,9 @@ int main(int argc, char** argv) {
           "  --shot-devpanel       One BMP per F1 sidebar page\n"
           "  --shot-dialogue       The conversation panel: screenshot_dialogue.bmp\n"
           "                        (entry node) and _2.bmp (the choice rows)\n"
+          "  --shot-spawn          What a new game sees: screenshot_spawn.bmp (at the\n"
+          "                        spawn, toward SANDVOX_SHOT_SPAWN_LOOK=x,z), _back and\n"
+          "                        _high.bmp (SANDVOX_SHOT_SPAWN_AT=minutes, default 600)\n"
           "  --shot-editor         The in-game editor (F8): screenshot_editor_house,\n"
           "                        _paste and _refs.bmp (a sample house, undone after)\n"
           "  --edit-script F.jsonl Apply editor commands headlessly, then save\n"
@@ -5297,6 +5315,10 @@ int main(int argc, char** argv) {
     }
     else if (a == "--edit-commands") editCommands = true;
     else if (a == "--edit-no-save") editNoSave = true;
+    else if (a == "--shot-spawn") {
+      g_shotSpawn = true;
+      g_harnessFrames = kShotSpLast;
+    }
     else if (a == "--shot-editor") {
       g_shotEditor = true;
       g_harnessFrames = kShotEdLast;
@@ -9284,7 +9306,8 @@ int main(int argc, char** argv) {
       static const bool noReload =
           std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire ||
           g_shotDialogue ||  // the reload would wipe the listener it spawned
-          g_shotEditor;      // ...or the house it placed
+          g_shotEditor ||    // ...or the house it placed
+          g_shotSpawn;       // (a picture, not a reload test: the compile would own the run)
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -9723,6 +9746,51 @@ int main(int argc, char** argv) {
       // is the numbered choice rows.
       if (f == kShotDlgChoose) feeder.Talk(kTalkContinue);
       if (f == kShotDlgShot2) g_shotJumpPath = "screenshot_dialogue_2.bmp";
+    }
+    // --shot-spawn's schedule (see g_shotSpawn).
+    if (g_shotSpawn) {
+      const uint64_t f = frameCounter;
+      if (f == 1) {
+        const char* at = std::getenv("SANDVOX_SHOT_SPAWN_AT");
+        const int minute = at ? std::atoi(at) : 600;
+        schedule::SetMinuteOverride(minute);   // the villagers keep the same hour
+        CelestialClock& cc = Celestial();
+        cc.engaged = true;
+        cc.scaleNum = cc.scaleDen = 1;
+        cc.ticks = (int64_t)((double)(minute % 1440) / 1440.0 * (double)TicksPerDay(CurrentTuning()));
+        cc.prevTicks = cc.ticks;
+        cc.rem = 0;
+        ui.fly = false;
+        player.fly = false;
+        ui.visible = false;
+      }
+      const worldmap::WorldMapData& wm = worldmap::CurrentWorldMap();
+      float lx = (float)wm.spawnX + 0.5f, lz = (float)wm.spawnZ - 400.0f;
+      if (const char* e = std::getenv("SANDVOX_SHOT_SPAWN_LOOK")) {
+        int x = 0, z = 0;
+        if (std::sscanf(e, "%d,%d", &x, &z) == 2) { lx = (float)x; lz = (float)z; }
+      }
+      const float yawTo = std::atan2(lz - ((float)wm.spawnZ + 0.5f), lx - ((float)wm.spawnX + 0.5f));
+      if (f >= kShotSpLook && f < kShotSpShot2 - 30) { cam.yaw = yawTo; cam.pitch = -0.02f; }
+      if (f >= kShotSpShot2 - 30 && f < kShotSpHigh) { cam.yaw = yawTo + 3.14159265f; cam.pitch = -0.02f; }
+      if (f == kShotSpHigh) {
+        // Up and back: the clearing and the forest round it in one frame.
+        ui.fly = true;
+        player.fly = true;
+        const float bx = std::cos(yawTo), bz = std::sin(yawTo);
+        const Vec3 sp = SpawnPos();
+        player.pos = Vec3{sp.x - bx * 400.0f, sp.y + 300.0f, sp.z - bz * 400.0f};
+        player.vel = Vec3{0, 0, 0};
+        player.SnapRender();
+      }
+      if (f >= kShotSpHigh) { cam.yaw = yawTo; cam.pitch = -0.42f; player.vel = Vec3{0, 0, 0}; }
+      if (f == kShotSpShot1) {
+        std::printf("--shot-spawn: player at (%.1f, %.1f, %.1f), spawn site (%d, %d), looking toward (%.0f, %.0f)\n",
+                    player.pos.x, player.pos.y, player.pos.z, wm.spawnX, wm.spawnZ, lx, lz);
+        g_shotJumpPath = "screenshot_spawn.bmp";
+      }
+      if (f == kShotSpShot2) g_shotJumpPath = "screenshot_spawn_back.bmp";
+      if (f == kShotSpShot3) g_shotJumpPath = "screenshot_spawn_high.bmp";
     }
     // --shot-devpanel: page k is selected at kShotDevFirst + k*step and shot
     // step-2 frames later (a page's first frame lays out before it settles).

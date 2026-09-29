@@ -10,7 +10,7 @@
  * the result and a person keeps brushing on top of it.
  *
  *   node scripts/sculpt_flatten.mjs <map> --rect x0,z0,x1,z1 --y <ground top>
- *        [--feather 96] [--strength 1] [--passes 2] [--dry]
+ *        [--feather 96] [--strength 1] [--passes 2] [--keep-grain 0] [--dry]
  *
  *   --rect      world voxels, inclusive: the area brought to the height
  *   --y         the ground TOP the area is brought to (a house placed on it
@@ -21,6 +21,16 @@
  *   --passes    heightmap -> correct -> repeat: the sediment wedge and the
  *               houses' own pad ramps react to the new slope, so a second
  *               pass takes out what the first could not see (default 2)
+ *   --keep-grain R  level the ground's AVERAGE over +-R voxels instead of every
+ *               sample column (0, the default: exactly flat at the samples).
+ *               The layer is one sample every 8 voxels, so an exact flatten
+ *               cancels the ground's fine grain AT the samples only and leaves
+ *               its residue between them: a plane of one- and two-voxel steps
+ *               every few voxels, dirt showing on every riser -- measured on
+ *               Harrowby's clearing, where it read as churned ground. With R
+ *               (24 is a good start) the correction is smooth, the tilt and the
+ *               swells go, and the ground keeps the same fine texture as the
+ *               untouched forest round it.
  *   --dry       report what would change, write nothing
  *
  * HOW. The ground the engine generates is procedural + the sculpt offset
@@ -50,13 +60,14 @@ const opt = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] :
 const map = args[0];
 if (!map || map.startsWith('--') || !opt('--rect') || opt('--y') === undefined) {
   console.error('usage: node scripts/sculpt_flatten.mjs <map> --rect x0,z0,x1,z1 --y <ground top> ' +
-                '[--feather 96] [--strength 1] [--passes 2] [--dry]');
+                '[--feather 96] [--strength 1] [--passes 2] [--keep-grain 0] [--dry]');
   process.exit(2);
 }
 const [x0, z0, x1, z1] = opt('--rect').split(',').map(Number);
 const Y = Number(opt('--y'));
 const feather = Math.max(0, Number(opt('--feather', 96)));
 const strength = Math.min(1, Math.max(0, Number(opt('--strength', 1))));
+const grainK = Math.max(0, Math.round(Number(opt('--keep-grain', 0)) / 8));   // the window, in samples
 const passes = Math.max(1, Number(opt('--passes', 2)) | 0);
 const dry = args.includes('--dry');
 if (![x0, z0, x1, z1, Y].every(Number.isFinite) || x1 < x0 || z1 < z0) {
@@ -110,6 +121,16 @@ for (let pass = 1; pass <= passes; pass++) {
   const b = readFileSync(hmPath), d = new DataView(b.buffer, b.byteOffset, b.byteLength);
   if (d.getUint32(0, true) !== 0x4D485653 || d.getUint32(8, true) !== res) { console.error('unexpected heightmap'); process.exit(1); }
   let moved = 0, worst = 0, sum = 0, cnt = 0;
+  // --keep-grain: every sample's height averaged over the +-grainK samples
+  // round it (clipped at the read grid's edge, which the feather covers).
+  const hAt = (i, j) => d.getInt32(48 + (j * res + i) * 8, true);
+  const hSmooth = (i, j) => {
+    if (grainK <= 0) return hAt(i, j);
+    let a = 0, n = 0;
+    for (let jj = Math.max(0, j - grainK); jj <= Math.min(res - 1, j + grainK); jj++)
+      for (let ii = Math.max(0, i - grainK); ii <= Math.min(res - 1, i + grainK); ii++) { a += hAt(ii, jj); n++; }
+    return a / n;
+  };
   for (let j = 0; j < res; j++) {
     const sz = sz0 + j;
     if (sz > sz1) break;
@@ -118,7 +139,7 @@ for (let pass = 1; pass <= passes; pass++) {
       if (sx > sx1) break;
       const w = weight(sx * SP, sz * SP);
       if (w <= 0) continue;
-      const h = d.getInt32(48 + (j * res + i) * 8, true);
+      const h = hSmooth(i, j);
       const dy = (Y - h) * w;
       if (Math.abs(dy) >= 0.5) moved++;
       worst = Math.max(worst, Math.abs(Y - h) * (w >= strength ? 1 : 0));
