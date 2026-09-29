@@ -21,6 +21,7 @@
 #include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
+#include <Jolt/Physics/Collision/BroadPhase/BroadPhase.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
@@ -1749,14 +1750,17 @@ static JPH::Vec3 AnchorLocal(const JPH::Body& body, JPH::RVec3Arg anchor) {
          JPH::Vec3(anchor - body.GetPosition());
 }
 
-// The constraint itself, from two LOCKED bodies and a world anchor in metres.
-// One function for CreateJoint and ReplaceBody, so a joint rebuilt against a
+// The constraint itself, from two LOCKED bodies and the pivot in world metres
+// as each body holds it (`anchor` on A, `anchorB` on B: the same point unless
+// the desc carries rig anchors and the bodies have drifted apart). One
+// function for CreateJoint and ReplaceBody, so a joint rebuilt against a
 // replacement body is the same joint with the same limits, not a second
 // reading of the desc.
 static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
                                                  JPH::Body& bodyB,
                                                  const Physics::JointDesc& d,
                                                  JPH::RVec3Arg anchor,
+                                                 JPH::RVec3Arg anchorB,
                                                  JPH::Vec3& boneOut) {
   using JointType = Physics::JointType;
   JPH::Body* a = &bodyA;
@@ -1774,13 +1778,30 @@ static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
   switch (d.type) {
     case JointType::Fixed: {
       JPH::FixedConstraintSettings s;
-      s.mAutoDetectPoint = true;
+      if (!d.rigAnchors) {
+        s.mAutoDetectPoint = true;
+      } else {
+        // B's frame is A's frame turned by relB: the same two world axes a
+        // body pair AT that relationship would report, whatever pose the pair
+        // is in now, so Jolt drives them back to it rather than keeping it.
+        const JPH::Quat relInv =
+            JPH::Quat(d.relB[0], d.relB[1], d.relB[2], d.relB[3])
+                .Normalized()
+                .Conjugated();
+        s.mPoint1 = anchor;
+        s.mPoint2 = anchorB;
+        s.mAxisX1 = ra * JPH::Vec3::sAxisX();
+        s.mAxisY1 = ra * JPH::Vec3::sAxisY();
+        s.mAxisX2 = rb * (relInv * JPH::Vec3::sAxisX());
+        s.mAxisY2 = rb * (relInv * JPH::Vec3::sAxisY());
+      }
       constraint = s.Create(*a, *b);
       break;
     }
     case JointType::Hinge: {
       JPH::HingeConstraintSettings s;
-      s.mPoint1 = s.mPoint2 = anchor;
+      s.mPoint1 = anchor;
+      s.mPoint2 = anchorB;
       JPH::Vec3 ax(d.axis.x, d.axis.y, d.axis.z);
       if (ax.LengthSq() < 1e-6f) ax = JPH::Vec3::sAxisX();
       ax = ax.Normalized();
@@ -1795,7 +1816,7 @@ static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
       s.mNormalAxis2 = rb * nrm;
       s.mLimitsMin = std::max(d.minAngle, -JPH::JPH_PI);
       s.mLimitsMax = std::min(d.maxAngle, JPH::JPH_PI);
-      s.mMaxFrictionTorque = FrictionTorque(*b, anchor, d.friction);
+      s.mMaxFrictionTorque = FrictionTorque(*b, anchorB, d.friction);
       if (d.motorTorque > 0.0f) {
         s.mMotorSettings = JPH::MotorSettings(std::max(d.motorFreq, 0.1f), 1.0f);
         s.mMotorSettings.SetTorqueLimit(d.motorTorque);
@@ -1823,7 +1844,8 @@ static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
                                        : plane.Normalized();
 
       JPH::SwingTwistConstraintSettings s;
-      s.mPosition1 = s.mPosition2 = anchor;
+      s.mPosition1 = anchor;
+      s.mPosition2 = anchorB;
       s.mTwistAxis1 = ra * bone;
       s.mTwistAxis2 = rb * bone;
       s.mPlaneAxis1 = ra * plane;
@@ -1841,7 +1863,7 @@ static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
       const float tw = std::clamp(d.twist, 0.0f, kMax);
       s.mTwistMinAngle = -tw;
       s.mTwistMaxAngle = tw;
-      s.mMaxFrictionTorque = FrictionTorque(*b, anchor, d.friction);
+      s.mMaxFrictionTorque = FrictionTorque(*b, anchorB, d.friction);
       constraint = s.Create(*a, *b);
       boneOut = bone;
       break;
@@ -1865,9 +1887,21 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
 
   JPH::RVec3 anchor(VoxToM(d.anchorVoxel.x), VoxToM(d.anchorVoxel.y),
                     VoxToM(d.anchorVoxel.z));
+  JPH::RVec3 anchorB = anchor;
+  if (d.rigAnchors && !world) {
+    // Each body's own record of the pivot, through its pose now (JointDesc).
+    anchor = a->GetPosition() +
+             a->GetRotation() * JPH::Vec3(VoxToM(d.localA.x),
+                                          VoxToM(d.localA.y),
+                                          VoxToM(d.localA.z));
+    anchorB = b->GetPosition() +
+              b->GetRotation() * JPH::Vec3(VoxToM(d.localB.x),
+                                           VoxToM(d.localB.y),
+                                           VoxToM(d.localB.z));
+  }
   JPH::Vec3 boneOut = JPH::Vec3::sZero();
   JPH::Ref<JPH::Constraint> constraint =
-      BuildConstraint(*a, *b, d, anchor, boneOut);
+      BuildConstraint(*a, *b, d, anchor, anchorB, boneOut);
   if (!constraint) return 0;
   system_->AddConstraint(constraint);
 
@@ -1879,7 +1913,7 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
   e.boneAxis = boneOut;
   e.desc = d;
   e.anchorLocalA = AnchorLocal(*a, anchor);
-  e.anchorLocalB = AnchorLocal(*b, anchor);
+  e.anchorLocalB = AnchorLocal(*b, anchorB);
   joints_->joints[h] = e;
   joints_->byBody[bodyA].push_back(h);
   joints_->byBody[bodyB].push_back(h);
@@ -1915,7 +1949,8 @@ bool Physics::RetargetJoint(uint64_t joint, uint64_t oldBody,
   const JPH::RVec3 anchor =
       keeper.GetPosition() + keeper.GetRotation() * local;
   JPH::Vec3 boneOut = JPH::Vec3::sZero();
-  JPH::Ref<JPH::Constraint> c = BuildConstraint(*a, *b, e.desc, anchor, boneOut);
+  JPH::Ref<JPH::Constraint> c =
+      BuildConstraint(*a, *b, e.desc, anchor, anchor, boneOut);
   if (!c) return false;
   if (e.desc.type == JointType::Hinge && e.desc.motorTorque > 0.0f)
     static_cast<JPH::HingeConstraint*>(c.GetPtr())->SetTargetAngle(e.motorTarget);
@@ -2248,6 +2283,33 @@ bool Physics::SetBodyTransform(uint64_t handle, Vec3 posVoxel,
                             JPH::RVec3(VoxToM(posVoxel.x), VoxToM(posVoxel.y),
                                        VoxToM(posVoxel.z)),
                             q, JPH::EActivation::Activate);
+  return true;
+}
+
+bool Physics::SnapBodyTransform(uint64_t handle, Vec3 posVoxel,
+                                const float quat[4]) {
+  if (!system_ || handle == 0) return false;
+  JPH::Quat q(quat[0], quat[1], quat[2], quat[3]);
+  const float len2 = q.LengthSq();  // SetBodyTransform's guard, same reason
+  if (!std::isfinite(len2) || len2 < 1.0e-6f) return false;
+  q = q.Normalized();
+  const JPH::BodyID id = ToBodyID(handle);
+  JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), id);
+  if (!lock.Succeeded()) return false;
+  JPH::Body& body = lock.GetBody();
+  if (body.IsStatic() || !body.IsActive() || !body.IsInBroadPhase())
+    return false;
+  // BodyInterface::SetPositionAndRotation with the one difference that
+  // matters: inResetSleepTimer false. The broadphase is told exactly as it
+  // tells it (the query interface IS the broadphase; Jolt only hands it out
+  // const).
+  body.SetPositionAndRotationInternal(
+      JPH::RVec3(VoxToM(posVoxel.x), VoxToM(posVoxel.y), VoxToM(posVoxel.z)), q,
+      /*inResetSleepTimer=*/false);
+  JPH::BroadPhase& bp = static_cast<JPH::BroadPhase&>(
+      const_cast<JPH::BroadPhaseQuery&>(system_->GetBroadPhaseQuery()));
+  JPH::BodyID ids[1] = {id};
+  bp.NotifyBodiesAABBChanged(ids, 1);
   return true;
 }
 

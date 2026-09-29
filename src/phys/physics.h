@@ -211,6 +211,21 @@ class Physics {
     // right-handed), as a spring of `motorFreq` Hz, critically damped.
     float motorTorque = 0.0f;
     float motorFreq = 2.0f;
+    // ---- Rig anchors (a joint RE-made on a rig that is already posed) ----
+    // Off: the pivot is `anchorVoxel` for both bodies and a Fixed joint locks
+    // whatever relative transform the two bodies have at this instant — right
+    // at spawn, where the bodies ARE the rest pose. On: the pivot is given in
+    // each body's own frame (`localA`/`localB`, world voxels from the body
+    // origin) and a Fixed joint holds B at `relB` (B's rotation in A's frame,
+    // x,y,z,w) — so re-making a joint on a corpse that has sagged restores the
+    // rig's relationship instead of recording the sag as the new rest. That
+    // was the laser-kill bug: the beam rebuilds the head every tick, each
+    // rebuild re-locked the last tick's droop, and the head walked off the
+    // neck and out from under its hair (`corpse-head-laser`).
+    // Ignored for a world-anchored joint (bodyA 0).
+    bool rigAnchors = false;
+    Vec3 localA{}, localB{};
+    float relB[4] = {0, 0, 0, 1};
   };
 
   // Returns an opaque handle (0 = failure). Joints attached to a body are
@@ -333,6 +348,13 @@ class Physics {
   // tick of lag on a limb falling at 40 m/s is four voxels of daylight between
   // a hood and the head inside it.
   bool SetBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
+  // SetBodyTransform for a body that is ALREADY AWAKE and must be allowed to
+  // fall asleep: Jolt's teleport resets the body's sleep timer, so a pose
+  // corrected every tick keeps its whole island awake forever (a corpse whose
+  // hair is put back on its head, Mob::DriveRootedHair, never slept). This one
+  // leaves the timer alone and never activates: false, and nothing moves, for
+  // a sleeping, static or dead body.
+  bool SnapBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
 
   // ---- A BODY'S COLLISION LAYER IS DERIVED FROM ITS ROLE (W2-N) -----------
   //
