@@ -641,7 +641,7 @@ TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0, 0, kFarLevels)
 // highest cascade level whose surface cells traceFar refines against the
 // map's 2x-resolution sub-columns. A level cap like the one above, so 0
 // (off: the plain centre-sampled cells, the feature's A/B) .. kFarLevels.
-TP_I(render, farRefineLevel, TUNE_FAR_REFINE_LEVEL, 8, 0, kFarLevels)
+TP_I(render, farRefineLevel, TUNE_FAR_REFINE_LEVEL, 2, 0, kFarLevels)
 
 // ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
 // The LOD handoff must not land in front of the near clip: a zero here
@@ -680,7 +680,7 @@ TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f, 0.0f, 409.6f)
 TP_F(render, farPlumeRange, TUNE_FAR_PLUME_RANGE, 3276.8f, 0.0f, 3276.8f)
 
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
-TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 26.0f, 2.0f, 60.0f)
+TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 20.5f, 2.0f, 60.0f)
 // 0 is meaningful here (all shadows go through the cascade), so only
 // negatives are refused.
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f, 0.0f, 999.0f)

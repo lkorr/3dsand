@@ -3960,6 +3960,88 @@ fn ccLoad(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>) {
 // that composition, and the world hash (genChunk hoists, the far skin lookup
 // does not) is what proves there is none.
 //
+// ---- THE COVER ROW A COLUMN GROWS (the biome cover stack's pick) -----------
+// Rows are rolled IN ORDER and the FIRST row whose chance, canopy band,
+// altitude band, slope, water distance and patch mask all pass is the
+// column's plant — whatever y is asked about: a cell above that row's stalk
+// is air, never the next row's (the loop used to `break` there). So the pick
+// is a pure function of the column, and it lives here, out of genCellIn,
+// because the far SURFACE MAP's feature fill (`farmap`, LOD-seam package F)
+// needs the stalk's height and head without evaluating a cell per voxel of it.
+// genCellIn calls it for the cells, so the two cannot drift (and the world
+// hash, which covers every cell genCellIn writes, is what proves the split
+// changed nothing).
+//
+// Returns mat = MAT_AIR when no row takes the column. The caller owns the
+// column gates (GROUND_COVER, y > h, !inRim, pond < 0, !siteKeepOut).
+//
+// Cost: on surface columns only, one vnoise2d + one hash per AUTHORED row
+// until a hit; a biome with no rows pays one header read. Everything placed
+// is inert (rule 2).
+//
+// THE CANOPY CONDITION: rows may bound undergrowthSite's cover
+// (WM_C_CANOPY_MIN / MAX). The scan runs ONCE PER COLUMN, and only for a
+// biome that authors such a row (WM_BF_CANOPY_ROWS): genChunk and `far`
+// hand the column's answer in as `canopyMemo`; the far skin lookup passes -1
+// and pays the scan here, once, for the surface cell it asks for.
+struct CoverPick { mat : u32, head : u32, hgt : i32 };
+fn coverRowPick(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
+                canopyMemo : i32, x : i32, z : i32, seed : u32) -> CoverPick {
+  var cp : CoverPick;
+  cp.mat = MAT_AIR;
+  cp.head = 0u;
+  cp.hgt = 0;
+  let h = (*col).h;
+  let biome = (*col).biome;
+  let nRows = wmBiome(biome, WM_B_COVER_COUNT);
+  let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
+  let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
+  var canopy = canopyMemo;
+  if (canopy < 0 && wmFlag(biome, WM_BF_CANOPY_ROWS)) {
+    canopy = undergrowthSite(x, z, seed, ponds).cover;
+  }
+  for (var i = 0u; i < nRows; i++) {
+    let chance = wmCover(biome, i, WM_C_CHANCE);
+    if (chance == 0u) { continue; }
+    let hRow = hash3(seed ^ (0xC0E0u + i * 0x9E37u), bitcast<u32>(x), bitcast<u32>(z));
+    if ((hRow % chance) != 0u) { continue; }
+    let cMin = i32(wmCover(biome, i, WM_C_CANOPY_MIN));
+    let cMax = i32(wmCover(biome, i, WM_C_CANOPY_MAX));
+    if (max(canopy, 0) < cMin || max(canopy, 0) > cMax) { continue; }
+    // Conditions: altitude band, steepness and water distance, per row,
+    // like a species'. One compare each on the column's own numbers; the
+    // water distance (waterDistAt, arithmetic on the pond set) is paid only
+    // by a row that authors a bound, AFTER the chance roll.
+    let minY = bitcast<i32>(wmCover(biome, i, WM_C_MIN_Y));
+    let maxY = bitcast<i32>(wmCover(biome, i, WM_C_MAX_Y));
+    if (minY >= 0 && h < minY) { continue; }
+    if (maxY >= 0 && h > maxY) { continue; }
+    let rSlope = i32(wmCover(biome, i, WM_C_MAX_SLOPE));
+    if (rSlope > 0 && rSlope < 1024 && (*col).slope > rSlope) { continue; }
+    let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
+    let nwMin = i32(wmCover(biome, i, WM_C_NEAR_WATER_MIN));
+    if (nwMax >= 0 || nwMin > 0) {
+      let d = waterDistAt(ponds, x, z, max(nwMax, nwMin));
+      if (!nearWaterOk(d, nwMax, nwMin)) { continue; }
+    }
+    // The patch mask: the biome's threshold, raised further by the row's.
+    let thresh = max(bThresh, i32(wmCover(biome, i, WM_C_PATCH_THRESH)));
+    if (thresh > 0) {
+      let off = i32(i) * 613;
+      let pm = vnoise2d(x - 617 + off, z + 431 - off, pLog2, seed ^ (0xD5E7u + i)).n >> 6;
+      if (pm <= thresh) { continue; }
+    }
+    // Height: the row's stalk, jittered per column so a bed of stalks all
+    // cut to one height does not read as a fence; the head caps the top.
+    let base = i32(wmCover(biome, i, WM_C_HEIGHT));
+    cp.hgt = select(base, max(1, base + i32((hRow >> 5u) % 3u) - 1), base >= 3);
+    cp.head = wmCover(biome, i, WM_C_HEAD);
+    cp.mat = wmCover(biome, i, WM_C_MAT);
+    break;
+  }
+  return cp;
+}
+
 // `canopyMemo` is the column's canopy cover when the caller computed it,
 // -1 to have the cover block scan on demand.
 fn genCellIn(col : ptr<function, Col>,
@@ -4279,69 +4361,19 @@ fn genCellIn(col : ptr<function, Col>,
   // Rows are rolled IN ORDER and the first hit wins, so an author puts the
   // common ground layer last, the way the shore set does. One salt per row
   // (see the pond-life block). The patch field is sampled at a per-row offset
-  // so the rows' lattices do not line up at cell corners.
-  //
-  // Cost: on surface columns only, one vnoise2d + one hash per AUTHORED row
-  // until a hit; a biome with no rows pays one header read. Everything placed
-  // is inert (rule 2).
+  // so the rows' lattices do not line up at cell corners. Cost and the canopy
+  // condition: coverRowPick.
   //
   // No treeline gate: a row's own minY / maxY is its altitude band (the
   // alpine cushion is a row with `minY` at the treeline).
-  //
-  // THE CANOPY CONDITION: rows may bound undergrowthSite's cover
-  // (WM_C_CANOPY_MIN / MAX). The scan runs ONCE PER COLUMN, and only for a
-  // biome that authors such a row (WM_BF_CANOPY_ROWS): genChunk and `far`
-  // hand the column's answer in as `canopyMemo`; the far skin lookup passes -1
-  // and pays the scan here, once, for the surface cell it asks for.
   if (GROUND_COVER && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
       !siteKeepOut(x, z)) {
+    // The row is a property of the COLUMN (coverRowPick); only "is this cell
+    // inside its stalk" depends on y.
+    let cp = coverRowPick(col, ponds, canopyMemo, x, z, seed);
     let up = y - h;
-    let nRows = wmBiome(biome, WM_B_COVER_COUNT);
-    let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
-    let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
-    var canopy = canopyMemo;
-    if (canopy < 0 && wmFlag(biome, WM_BF_CANOPY_ROWS)) {
-      canopy = undergrowthSite(x, z, seed, ponds).cover;
-    }
-    for (var i = 0u; i < nRows; i++) {
-      let chance = wmCover(biome, i, WM_C_CHANCE);
-      if (chance == 0u) { continue; }
-      let hRow = hash3(seed ^ (0xC0E0u + i * 0x9E37u), bitcast<u32>(x), bitcast<u32>(z));
-      if ((hRow % chance) != 0u) { continue; }
-      let cMin = i32(wmCover(biome, i, WM_C_CANOPY_MIN));
-      let cMax = i32(wmCover(biome, i, WM_C_CANOPY_MAX));
-      if (max(canopy, 0) < cMin || max(canopy, 0) > cMax) { continue; }
-      // Conditions: altitude band, steepness and water distance, per row,
-      // like a species'. One compare each on the column's own numbers; the
-      // water distance (waterDistAt, arithmetic on the pond set) is paid only
-      // by a row that authors a bound, AFTER the chance roll.
-      let minY = bitcast<i32>(wmCover(biome, i, WM_C_MIN_Y));
-      let maxY = bitcast<i32>(wmCover(biome, i, WM_C_MAX_Y));
-      if (minY >= 0 && h < minY) { continue; }
-      if (maxY >= 0 && h > maxY) { continue; }
-      let rSlope = i32(wmCover(biome, i, WM_C_MAX_SLOPE));
-      if (rSlope > 0 && rSlope < 1024 && (*col).slope > rSlope) { continue; }
-      let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
-      let nwMin = i32(wmCover(biome, i, WM_C_NEAR_WATER_MIN));
-      if (nwMax >= 0 || nwMin > 0) {
-        let d = waterDistAt(ponds, x, z, max(nwMax, nwMin));
-        if (!nearWaterOk(d, nwMax, nwMin)) { continue; }
-      }
-      // The patch mask: the biome's threshold, raised further by the row's.
-      let thresh = max(bThresh, i32(wmCover(biome, i, WM_C_PATCH_THRESH)));
-      if (thresh > 0) {
-        let off = i32(i) * 613;
-        let pm = vnoise2d(x - 617 + off, z + 431 - off, pLog2, seed ^ (0xD5E7u + i)).n >> 6;
-        if (pm <= thresh) { continue; }
-      }
-      // Height: the row's stalk, jittered per column so a bed of stalks all
-      // cut to one height does not read as a fence; the head caps the top.
-      let base = i32(wmCover(biome, i, WM_C_HEIGHT));
-      let hgt = select(base, max(1, base + i32((hRow >> 5u) % 3u) - 1), base >= 3);
-      if (up > hgt) { break; }
-      let head = wmCover(biome, i, WM_C_HEAD);
-      mat = select(wmCover(biome, i, WM_C_MAT), head, head != 0u && up == hgt);
-      break;
+    if (cp.mat != MAT_AIR && up <= cp.hgt) {
+      mat = select(cp.mat, cp.head, cp.head != 0u && up == cp.hgt);
     }
   }
 
@@ -5489,6 +5521,120 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
 // common.wgsl because a common.wgsl edit recompiles every shader.
 const FAR_MAP_COVER_BIT : u32 = 0x40000000u;
 
+// ---- THE FEATURE PLANE (LOD-seam package F, 2026-09-28) ---------------------
+// The cells centre-sample, so a plant one voxel wide is in the far field with
+// probability 1/4 at level 1 (a 20 cm cube when it is) and not at all past it,
+// and a MICRO plant (grass, a flower, a bush) is dropped outright
+// (farCellIsSolid). Past the handoff a desert's 1.2 m cactus stalks vanished
+// and a meadow turned to lawn. The feature plane records, per SUB-COLUMN of
+// the refine levels, the thin thing standing on its top, so traceFar can draw
+// it at its true fine column and height instead of the cell.
+//
+// Layout: the words after the surface map (farMap[FAR_FEAT_BASE +
+// farMapWord(level, m)], levels 1..FAR_FEAT_LEVELS only; world.cpp sizes the
+// buffer, farfeat.h owns the C++ half, raymarch.wgsl reads the same bits):
+//   bits  0..7   the feature's TOP voxel y, mod 256 (readers decode it
+//                against a y they hold within 128 of it)
+//   bits  8..11  its height in voxels over the ground (1..15); 0 = no feature
+//   bit  12, 13  which fine column of the sub-column it stands in (x, z):
+//                level 2's sub-columns are 2x2 fine columns, level 1's are one
+//   bits 14..15  how many of the sub-column's fine columns grow one, less 1
+//                (level 2: the far side keeps the COVERAGE of all of them)
+//   bits 16..22  the stalk's far palette slot (the body)
+//   bits 23..29  the head's slot (the top voxel: a bloom, a seed head), 0 none
+//   bit  30      SOLID: a far-solid stalk (a cactus stalk). Not drawn from
+//                this word: the fill raises the MAP entry to the stalk's top
+//                and marks its cells, so the refine draws it; the word is
+//                fardown's (the cut check) and the gate's. Clear = a MICRO
+//                plant, drawn as its blade card (raymarch.wgsl bladeCardHit)
+// Filled by `farmap` beside the map entry; cleared (never re-derived) by
+// `farpatch` with the entry's VALID, and by `fardown` when the live grid no
+// longer holds the plant at the feature's base (eaten, trampled, dug, burnt).
+const FAR_FEAT_LEVELS : u32 = 2u;   // farfeat.h kFarFeatLevels
+const FAR_FEAT_BASE : u32 = FAR_LEVELS * FAR_N * FAR_N * 4u;
+const FAR_FEAT_SOLID : u32 = 0x40000000u;
+fn farFeatWord(level : u32, m : vec2<i32>) -> u32 {
+  return FAR_FEAT_BASE + farMapWord(level, m);
+}
+// The far slot a feature may name: a plant with a far slot of its own.
+fn farFeatSlot(mat : u32) -> u32 {
+  if (mat == MAT_AIR) { return 0u; }
+  return matFarPal(&materials, mat);
+}
+
+// The feature of one map entry (sub-column `m` of a level with 2^wsh fine
+// columns per sub-column), whose sample column (fx, fz) the caller holds as
+// `col` with `cover` = the voxel over its top. The SAMPLE column is exact:
+// its cover-row pick is checked against the voxel genCellIn actually put
+// there (a trunk, a saguaro, a shore reed or a tile plant may have taken the
+// cell first). The other fine columns of a level-2 sub-column roll the cover
+// stack against the sample column's ground (their own ground is within a
+// voxel or two: a far feature, 45-90 m out) and do not see those overrides.
+struct FarFeatPick { card : u32, stalk : u32 };
+fn farFeatFill(col : ptr<function, Col>, ponds : ptr<function, PondSet>, cover : u32,
+               m : vec2<i32>, wsh : u32, fx : i32, fz : i32, seed : u32) -> FarFeatPick {
+  var r : FarFeatPick;
+  r.card = 0u;
+  r.stalk = 0u;
+  let h = (*col).h;
+  if (!GROUND_COVER || (*col).inRim || (*col).pond >= 0) { return r; }
+  let biome = (*col).biome;
+  var canopy = -1;
+  if (wmFlag(biome, WM_BF_CANOPY_ROWS)) { canopy = undergrowthSite(fx, fz, seed, ponds).cover; }
+  let n = 1 << wsh;
+  // The tallest MICRO plant (a card) and the tallest SOLID one (a stalk),
+  // separately: a stalk goes into the heightfield, a card into the word.
+  var cH = 0;  var cMat = MAT_AIR;  var cHead = MAT_AIR;  var cD = vec2<i32>(0);  var cCount = 0u;
+  var sH = 0;  var sMat = MAT_AIR;  var sHead = MAT_AIR;  var sD = vec2<i32>(0);
+  for (var i = unrollFence(); i < n * n; i++) {
+    let d = vec2<i32>(i % n, i / n);
+    let x = (m.x << wsh) + d.x;
+    let z = (m.y << wsh) + d.y;
+    var mat = MAT_AIR;
+    var head = MAT_AIR;
+    var hgt = 0;
+    if (!siteKeepOut(x, z)) {
+      let cp = coverRowPick(col, ponds, canopy, x, z, seed);
+      if (x == fx && z == fz) {
+        // What genCellIn actually put over the sample column's top.
+        if (cover == MAT_AIR) {
+        } else if (cp.mat != MAT_AIR && (cover == cp.mat || cover == cp.head)) {
+          mat = cp.mat; head = cp.head; hgt = cp.hgt;
+        } else if (cover == (*col).plant.mat) {
+          mat = cover; hgt = (*col).plant.top - h;          // a tile plant
+        } else if ((materials[cover].flags & MATF_MICRO) != 0u) {
+          mat = cover; hgt = 1;                             // a shore plant, a pad
+        }
+      } else if (cp.mat != MAT_AIR) {
+        mat = cp.mat; head = cp.head; hgt = cp.hgt;
+      }
+    }
+    if (hgt > 0 && farFeatSlot(mat) != 0u) {
+      let solid = (materials[mat].flags & MATF_MICRO) == 0u &&
+                  materials[mat].klass == CLASS_SOLID;
+      if (solid) {
+        if (hgt > sH) { sH = hgt; sMat = mat; sHead = head; sD = d; }
+      } else {
+        cCount += 1u;
+        if (hgt > cH) { cH = hgt; cMat = mat; cHead = head; cD = d; }
+      }
+    }
+  }
+  if (cCount > 0u) {
+    let hq = clamp(cH, 1, 15);
+    r.card = (u32(h + hq) & 0xFFu) | (u32(hq) << 8u) | (u32(cD.x) << 12u) |
+             (u32(cD.y) << 13u) | ((min(cCount, 4u) - 1u) << 14u) |
+             (farFeatSlot(cMat) << 16u) | (farFeatSlot(cHead) << 23u);
+  }
+  if (sH > 0) {
+    let hq = clamp(sH, 1, 15);
+    r.stalk = (u32(h + hq) & 0xFFu) | (u32(hq) << 8u) | (u32(sD.x) << 12u) |
+              (u32(sD.y) << 13u) | (farFeatSlot(sMat) << 16u) |
+              (farFeatSlot(sHead) << 23u) | FAR_FEAT_SOLID;
+  }
+  return r;
+}
+
 @compute @workgroup_size(64)
 fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
           @builtin(local_invocation_index) li : u32) {
@@ -5554,8 +5700,50 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
         e = (e & ~(0x7Fu << 23u)) | (cs << 23u) | FAR_MAP_COVER_BIT;
       }
     }
+    // THE FEATURES (see FAR_FEAT_*): what stands on a valid ground top.
+    var feat = 0u;
+    if (level <= FAR_FEAT_LEVELS && ok && top == col.h) {
+      let fp = farFeatFill(&col, &ponds, cover, m, wsh, fx, fz, T.seed);
+      feat = fp.card;
+      if (fp.stalk != 0u) {
+        // A STALK IS PART OF THE HEIGHTFIELD. A cactus stalk is far-solid,
+        // one voxel wide and up to 1.5 m tall: at level 1 the sub-column IS
+        // its fine column, so the entry's top is simply raised to the stalk's
+        // (the column's topmost far-solid voxel, which is what the entry
+        // always meant) and the refine draws it exactly -- head over body
+        // as skin over sub-skin. At level 2 the tallest of the sub-column's
+        // four stalks stands for them, 20 cm wide. The cells it passes
+        // through are MARKED with its slot (a conservative fill, like the
+        // blocker flag: the centre sample only caught one stalk in four), so
+        // the far march stops on them and the refine gets its candidate --
+        // no extra walk, no extra load on any other cell.
+        feat = fp.stalk;
+        let sTop = col.h + i32((fp.stalk >> 8u) & 15u);
+        let body = (fp.stalk >> 16u) & 0x7Fu;
+        let head = (fp.stalk >> 23u) & 0x7Fu;
+        e = (e & ~0x3FFFFFFFu) | u32(clamp(sTop + FAR_MAP_H_BIAS, 0, 0xFFFF)) |
+            (select(body, head, head != 0u) << 16u) | (body << 23u);
+        let origin = F.origins[level - 1u].xyz;
+        let c = m >> vec2<u32>(1u);
+        for (var cy = (col.h + 1) >> shift; cy <= sTop >> shift; cy++) {
+          let cc = vec3<i32>(c.x, cy, c.y);
+          if (!farInBox(cc, origin)) { continue; }
+          let bi = farVoxByteIndex(level, cc);
+          let bsh = (bi & 3u) * 8u;
+          let cur = atomicLoad(&farVox[bi >> 2u]);
+          if (((cur >> bsh) & FAR_PAL_MASK) == 0u) {
+            atomicOr(&farVox[bi >> 2u], (body | FAR_BLOCKER_BIT) << bsh);
+          }
+          atomicMax(&farOcc[farOccIndex(level, cc)],
+                    farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+        }
+      }
+    }
     if (ok) { e |= FAR_MAP_VALID; }
     atomicStore(&farMap[farMapWord(level, m)], e);
+    if (level <= FAR_FEAT_LEVELS) {
+      atomicStore(&farMap[farFeatWord(level, m)], feat);
+    }
   }
 }
 
@@ -5674,6 +5862,11 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
     // the cost of that is the plain cascade cell, never a wrong one.
     let mw = farMapCell(level, pcc.xz) * 4u;
     for (var q = 0u; q < 4u; q++) { atomicAnd(&farMap[mw + q], ~FAR_MAP_VALID); }
+    // Its features go with it (package F): the plants there were pristine
+    // procgen's, and an edited chunk may have eaten them.
+    if (level <= FAR_FEAT_LEVELS) {
+      for (var q = 0u; q < 4u; q++) { atomicStore(&farMap[FAR_FEAT_BASE + mw + q], 0u); }
+    }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
     let bsh = (bi & 3u) * 8u;
     atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
@@ -5730,6 +5923,13 @@ fn farFirstCenter(b : i32, step : i32, half : i32) -> i32 {
 }
 // How many of those centers land in [b, b + CHUNK). c0 >= b by construction,
 // so the span is never negative before the clamp.
+// What the downsample's skip signature sums: every far-visible cell, and
+// since package F every PLANT cell too (MATF_MICRO, which farCellIsSolid
+// drops) — the feature plane draws plants, so a chunk whose only change is a
+// tuft eaten or a stalk cut must not skip the downsample that clears it.
+fn farSigCounts(mat : u32) -> bool {
+  return mat != MAT_AIR && materials[mat].klass != CLASS_GAS;
+}
 fn farCenterCount(b : i32, c0 : i32, step : i32) -> i32 {
   let span = b + i32(CHUNK) - c0;
   if (span <= 0) { return 0; }
@@ -5785,12 +5985,12 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
     // skip is allowed to err in. EMPTY (and any non-far-visible material)
     // still contributes 0, exactly like an all-air page.
     let m = pe & PT_MAT_MASK;
-    if (li == 0u && farCellIsSolid(m)) { acc = pcg(m ^ 0x5E17A1u); }
+    if (li == 0u && farSigCounts(m)) { acc = pcg(m ^ 0x5E17A1u); }
   } else {
     let pageBase = pe * CHUNK_VOL;
     for (var i = li; i < CHUNK_VOL; i += 64u) {
       let m = voxels[pageBase + i] & 0xFFFu;
-      if (farCellIsSolid(m)) { acc += pcg((m << 12u) | i); }
+      if (farSigCounts(m)) { acc += pcg((m << 12u) | i); }
     }
   }
   atomicAdd(&wgFarCount, acc);
@@ -5945,13 +6145,88 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       // holds minH + 1 (the lowest partly-empty one) up to the voxel over top.
       let lo = max(fdiv(minH + 1, step) * step, base.y);
       let hi = min(hTop + 1, base.y + i32(CHUNK) - 1);
+      // A STALK's entry (package F) claims ITS fine column to the stalk's
+      // top, so that is the column checked (the sample column of a level-2
+      // sub-column need not be it). If the claim fails, the cells the fill
+      // marked with the stalk's slot go too, or a cut stalk would stand on at
+      // distance as a column of cells (the ghost this check exists to stop).
+      let fw = select(0u, atomicLoad(&farMap[FAR_FEAT_BASE + me]), level <= FAR_FEAT_LEVELS);
+      let isStalk = (fw & FAR_FEAT_SOLID) != 0u && ((fw >> 8u) & 15u) != 0u;
+      var qx = fx;
+      var qz = fz;
+      if (isStalk) {
+        qx = (m.x << wsh) + i32((fw >> 12u) & 1u);
+        qz = (m.y << wsh) + i32((fw >> 13u) & 1u);
+      }
       for (var y = lo; y <= hi; y++) {
-        let solid = farCellIsSolid(voxWordAt(vec3<i32>(fx, y, fz)) & 0xFFFu);
+        let solid = farCellIsSolid(voxWordAt(vec3<i32>(qx, y, qz)) & 0xFFFu);
         if (solid != (y <= hTop)) {
           atomicAnd(&farMap[me], ~FAR_MAP_VALID);
+          if (isStalk) {
+            let body = (fw >> 16u) & 0x7Fu;
+            let head = (fw >> 23u) & 0x7Fu;
+            let c = m >> vec2<u32>(1u);
+            let sBase = hTop - i32((fw >> 8u) & 15u) + 1;
+            for (var cy = sBase >> shift; cy <= hTop >> shift; cy++) {
+              let cc = vec3<i32>(c.x, cy, c.y);
+              if (!farInBox(cc, origin)) { continue; }
+              let bi = farVoxByteIndex(level, cc);
+              let bsh = (bi & 3u) * 8u;
+              let sl = (atomicLoad(&farVox[bi >> 2u]) >> bsh) & FAR_PAL_MASK;
+              if (sl != 0u && (sl == body || sl == head)) {
+                atomicAnd(&farVox[bi >> 2u], ~(FAR_PAL_MASK << bsh));
+              }
+            }
+          }
           break;
         }
       }
+    }
+  }
+
+  // ---- THE FEATURES, CHECKED AGAINST THE LIVE GRID (package F) -------------
+  // A feature (FAR_FEAT_*) is drawn from the map alone, so the live grid has
+  // to be able to take it back: a tuft eaten, a stalk cut, a plant burnt or
+  // dug away. For every sub-column of the feature levels under this chunk
+  // (they never straddle one: 1 and 2 fine columns wide, chunks 16), the
+  // voxel at the feature's BASE (the map top + 1, at its own fine column) must
+  // still be the feature's body or head material by far slot; anything else,
+  // and an entry the map has stopped vouching for, clears the feature. Clear
+  // only, like the claim above: a re-derived plant waits for a refill.
+  for (var level = 1u; level <= FAR_FEAT_LEVELS; level++) {
+    let wsh = farCellShift(level) - 1u;
+    let nS = i32(CHUNK) >> wsh;                  // sub-columns per chunk axis
+    let origin = F.origins[level - 1u].xz;
+    let cols = u32(nS * nS);
+    for (var ci = li; ci < cols; ci += 64u) {
+      let m = (base.xz >> vec2<u32>(wsh)) + vec2<i32>(i32(ci) % nS, i32(ci) / nS);
+      let d = (m >> vec2<u32>(1u)) - origin * i32(CHUNK);
+      if (any(d < vec2<i32>(0)) || any(d >= vec2<i32>(i32(FAR_N)))) { continue; }
+      let fwI = farFeatWord(level, m);
+      let fw = atomicLoad(&farMap[fwI]);
+      let hg = i32((fw >> 8u) & 15u);
+      if (hg == 0) { continue; }
+      let e = atomicLoad(&farMap[fwI - FAR_FEAT_BASE]);
+      var gone = (e & FAR_MAP_VALID) == 0u;
+      let yb = farMapTop(e) + 1;
+      if (!gone && yb >= base.y && yb < base.y + i32(CHUNK)) {
+        let fc = (m << vec2<u32>(wsh)) +
+                 vec2<i32>(i32((fw >> 12u) & 1u), i32((fw >> 13u) & 1u));
+        // Level 2's feature column is not always the map's sample column, and
+        // its own ground may sit a voxel either side of the sample's: any of
+        // the three voxels round the base holding the plant keeps it.
+        gone = true;
+        for (var k = -1; k <= 1; k++) {
+          let yk = yb + select(0, k, level > 1u);
+          if (yk < base.y || yk >= base.y + i32(CHUNK)) { continue; }
+          let vm = voxWordAt(vec3<i32>(fc.x, yk, fc.y)) & 0xFFFu;
+          let vs = select(0u, matFarPal(&materials, vm), vm != MAT_AIR);
+          if (vs != 0u && (vs == ((fw >> 16u) & 0x7Fu) || vs == ((fw >> 23u) & 0x7Fu))) {
+            gone = false;
+          }
+        }
+      }
+      if (gone) { atomicStore(&farMap[fwI], 0u); }
     }
   }
 }

@@ -12280,6 +12280,89 @@ where you hear from either (§12b, "The ears are on the character").
     tread shadow p20 1.0 vs far 0.66, and did not move the low-sun ones);
     and a plant eaten or trampled after the map was filled keeps its cover
     tint until that column refills (edits only clear VALID).
+    (Package F, next, answers the plants, the stalks and the contact shadow.)
+  **Plants past the handoff, and the last seam term (LOD-seam overhaul
+  package F, 2026-09-28).** Two owner complaints after E: plants still ended
+  at ~20 m (1-voxel cactus stalks never reached the far field; a meadow was
+  lawn past the handoff), and a faint line of different shading stayed at the
+  seam.
+  - **Stalks are part of the heightfield.** A cover-row stalk (desert
+    `cactus_flesh`, 1.2 m, one voxel wide, far-solid) survived level 1 as a
+    20 cm centre-sampled cube one time in four. The map fill (`farmap`) now
+    knows the column's cover pick (`coverRowPick`, split out of `genCellIn`
+    as a pure refactor; the world hash is unchanged) and RAISES a stalk
+    column's entry to the stalk's top (skin = head/bloom, sub-skin = body):
+    the entry is the column's topmost far-solid voxel, which is what it always
+    claimed to be. At level 1 the refine then draws the exact 10 cm stalk; at
+    level 2 the tallest of a sub-column's four stands for them, 20 cm wide.
+    The fill also MARKS the level cells the stalk passes through with its slot
+    (+ farOcc), so the far march stops on them and the refine gets its
+    candidate with no extra walk or load anywhere else (`farMapFill` now
+    declares A(FarVox) A(FarOcc)). The union rule's level-1 sample-column test
+    skips a cell whose slot is a sub-column's sub-skin (the stalk's own cell).
+    Stalks shade, cast contact shadows and take AO as terrain. `fardown`
+    checks a stalk entry's claim at the stalk's own fine column; a cut stalk
+    clears VALID and un-marks its cells (no ghost column).
+  - **The FEATURE PLANE** (`sim/farfeat.h`; worldgen.wgsl `FAR_FEAT_*`): 8 MiB
+    after the surface map in the same buffer (no new binding), levels 1-2, one
+    word per sub-column: the tallest MICRO plant's top (mod 256), height,
+    fine-column offset, count of planted fine columns, body/head slots
+    (a stalk's word, SOLID bit set, is kept for `fardown` and the gate).
+    Cleared (never re-derived) by `farpatch` with VALID, and by `fardown` when
+    the live voxel at the plant's base is no longer its body/head (eaten,
+    trampled flat, dug, burnt); the downsample's skip signature now sums plant
+    cells too, so a chunk whose only change is a plant is not skipped.
+  - **Plants hand over instead of vanishing.** B's per-column vanish distance
+    (16-20 m) now switches a plant cell to its FAR FORM (`bladeCardHit`): one
+    vertical card per column, yaw (8 steps) and offset hashed from the column,
+    carrying a row of blades that cover `BLADE_COVER` (0.45) of its length;
+    blades are never drawn thinner than 0.8 px, so as a pixel grows they widen
+    and thin (lattice offset per column) — coverage kept by PROJECTED PIXEL
+    SIZE, not cut at a distance. The far field draws the same function from
+    the feature plane (`farFeatMarch`, fs after `traceFar`; level-2 cards per
+    2x2 sub-column carrying the count's coverage). B's shrink is gone. The
+    near side tests the card in PHASE 3 of `trace()` (`nearFarForm`, a
+    re-walk after the records, where the march's registers are dead): testing
+    it in the march pushed fs from 128 to 168 registers.
+  - **The cards are tested over the last `FAR_CARD_MILE` (1.6 m) before the
+    ground the ray hit, on BOTH sides.** Walking the whole cover band a
+    grazing ray skims measured 1.0-1.3 ms on the meadow camera for 7% of its
+    far pixels ending on a blade (per-pixel counters: ~50 cell steps, 19 quad
+    loads, 0.5 tests per far pixel — the ray is in the flag band but ABOVE
+    the plants). Inside a stand the ray is within ~10 cm of the ground over
+    that stretch and crosses ~16 columns, so a stand's pixel is a blade with
+    the same odds; what is given up is a plant seen against ground more than
+    1.6 m behind it (a stand's crest edge, a sparse tussock's upper part).
+    The cover tint now applies only where the features are gone
+    (`1 - farFeatKeep`, 67-87 m).
+  - **The line was the CONTACT SHADOW** (attributed, not guessed: a per-term
+    debug frame — side, face class, distance bucket, shadow, AO, openness, GI
+    per pixel — against the normal frame; tools in the package notes). Near
+    treads at 19-20.5 m: shadow mean 0.88, p5 0.51; far treads at
+    20.5-22 m: 0.99 / 1.00 — the far march starts a refined hit over its cell
+    and never saw the one-voxel steps' shadows. `farHfShadow` walks the ray
+    toward the sun over the surface map's sub-columns (level 1 = the near
+    field's own voxels, 4 steps) and feeds `shadowFromOpaqueHit` + the same
+    LOD lift and cap; it fades out 6-12 m past the handoff (cost bounded to
+    the band that has a near side to match). After: far treads 0.878 / 0.55.
+    (E's attempt disagreed because it over-shadowed; this one starts 0.02
+    voxels off the true hit along the normal and tests each column where the
+    ray enters it.)
+  - **Measured.** Tread luma near vs far (19-20.5 / 20.5-22 m, seam_x):
+    default sun main 188.6 / 193.2 (+4.6) -> 187.5 / 188.8 (+1.3); low sun
+    (`--time 0.28`) main 178.9 / 185.3 (+6.4) -> 179.0 / 180.4 (+1.4). Row
+    profile across the handoff (far->near transitions from the attribution
+    frame; trend-corrected step): default main -2.26 -> +0.58/255, low sun
+    -3.55 -> +0.40. `--render-budget`, exclusive, alternating main/tree x2:
+    seam 5.56 -> 5.91 ms, seamveg 8.47 -> 8.80, cascade 2.76 -> 2.81; fs 128
+    registers, 112 B local (unchanged).
+  - **Still visible**: far risers past the 1.8 m openness band sit brighter
+    than near ones on the desert (far constant 0.6 vs the grid's 0.38 mean
+    there, +4-6 luma, a gradient over the band, not a line); stalks are
+    20 cm wide at level 2 and gone past 90 m (level 3+ centre-samples them);
+    cards are not tested for rays whose far hit is at level 3+; sparse micro
+    plants (tussocks) show only close in front of their ground; a shore reed
+    over the sample column is recorded one voxel tall.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -12942,6 +13025,10 @@ blade's chord box is tested against the ray's XZ footprint through the cell
 before `hitBlade`, exact and conservative, so most of a tuft's blades cost two
 hashes and a compare.
 
+**SUPERSEDED IN PART by package F (same day): past its vanish distance a
+plant cell is no longer air but its FAR FORM (a blade card), which the far
+field draws too, and the shrink is gone — see "Plants past the handoff" in
+§9 far field.**
 **Plants fade out before the far handoff; there are no proxy cubes
 (2026-09-28, LOD seam package B).** Until then a column plant became a SOLID
 proxy cube past `render.plantLodDist` (16 m) and a tile plant's centre column

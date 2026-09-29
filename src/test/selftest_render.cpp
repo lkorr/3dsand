@@ -19,6 +19,7 @@
 #include "gpu/resources.h"
 #include "sim/celestial.h"
 #include "sim/faredits.h"
+#include "sim/farfeat.h"
 #include "sim/farfield.h"
 #include "sim/microvox.h"
 #include "sim/plants.h"
@@ -547,6 +548,20 @@ uint32_t FarMapEntry(GpuContext& ctx, World& world, uint32_t level, int mx, int 
   return word;
 }
 int FarMapTopOf(uint32_t e) { return (int)(e & 0xFFFFu) - kFarMapHBias; }
+// `count` consecutive words of the farMap buffer (map + feature plane) from
+// word `first`, one copy.
+std::vector<uint32_t> FarMapWords(GpuContext& ctx, World& world, uint64_t first,
+                                  uint32_t count) {
+  rhi::Buffer staging = CreateBuffer(
+      ctx.device, (uint64_t)count * 4,
+      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "farMapBulk");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.farMap, first * 4, staging, 0, (uint64_t)count * 4);
+  ctx.queue.Submit(enc.Finish());
+  std::vector<uint32_t> out(count, 0);
+  rhi::ReadBufferBlocking(ctx.device, staging, 0, out.data(), (size_t)count * 4);
+  return out;
+}
 }  // namespace
 
 Status GateFarSurface(Ctx& c, std::string& detail) {
@@ -672,14 +687,160 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   const bool keptBuild = !validAt(build.x, build.z);
   const bool cOk = healed && keptCrater && keptBuild;
 
-  const bool ok = aOk && bOk && cOk;
+  // ---- (d) THE FEATURE PLANE (sim/farfeat.h, LOD-seam package F) -----------
+  // Pristine: every level-1 feature in the window describes the plant the
+  // live grid holds on that column -- its base voxel (map top + 1) and its top
+  // voxel wear the feature's body or head slot, and the voxel over its top
+  // does not continue it. Then a feature's plant is cut (its voxels over the
+  // ground, not the ground) and ticked: `fardown` must clear the feature while
+  // the column's map entry stays VALID (it was the feature rule, not the
+  // claim), and a control feature in another chunk must be untouched.
+  //
+  // AT A DESERT SITE, because the harness window has no cover at all (the pad
+  // box refuses it). The window and the far field are stood over the cactus
+  // flats east of the seam site and regenerated there, and put back (and
+  // regenerated, and refilled with no edit index) before returning -- the
+  // `pond-shore` pattern, so no neighbour sees the move.
+  const IVec3 savedOrigin = world.WindowOrigin();
+  const IVec3 dSite{300, World::TerrainHeight(300, -150, seed), -150};
+  const IVec3 dChunk{dSite.x >> 4, dSite.y >> 4, dSite.z >> 4};
+  const int halfN = (int)kNChunk / 2;
+  world.SetWindowOrigin({dChunk.x - halfN, dChunk.y - halfN, dChunk.z - halfN});
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
+  edits.Clear();
+  DrainFullRefill(ctx, world, sim, dChunk);
+  const IVec3 wo = world.WindowOrigin();
+  const int wx0 = wo.x * (int)kChunk, wz0 = wo.z * (int)kChunk;
+  const uint32_t plane = kFarN * kFarN * 4;   // one level's words
+  const std::vector<uint32_t> map1 = FarMapWords(ctx, world, 0, plane);
+  const std::vector<uint32_t> feat1 = FarMapWords(ctx, world, kFarMapWords, plane);
+  const std::vector<uint32_t> feat2 =
+      FarMapWords(ctx, world, kFarMapWords + plane, plane);
+  struct Feat { int x, z, top, h; uint32_t w; };
+  std::vector<Feat> feats;
+  int nSolid = 0, nMicro = 0, nL2 = 0;
+  for (int mz = wz0; mz < wz0 + (int)kWorldN; mz++)
+    for (int mx = wx0; mx < wx0 + (int)kWorldN; mx++) {
+      const uint32_t w = feat1[kFarMapWord(1, mx, mz)];
+      const uint32_t e = map1[kFarMapWord(1, mx, mz)];
+      if (FarFeatHeight(w) == 0 || !(e & kFarMapValid)) continue;
+      if (w & kFarFeatSolid) nSolid++; else nMicro++;
+      // A STALK's entry is raised to the stalk's top (it is part of the
+      // heightfield); its ground is that less its height.
+      const int ground = FarMapTopOf(e) - ((w & kFarFeatSolid) ? FarFeatHeight(w) : 0);
+      feats.push_back({mx, mz, ground, FarFeatHeight(w), w});
+    }
+  // Level 2's words sit at the same offsets one plane on (kFarMapWord's level
+  // term is a plane stride).
+  for (int mz = wz0 / 2; mz < (wz0 + (int)kWorldN) / 2; mz++)
+    for (int mx = wx0 / 2; mx < (wx0 + (int)kWorldN) / 2; mx++)
+      if (FarFeatHeight(feat2[kFarMapWord(2, mx, mz) - plane]) != 0) nL2++;
+  // Live voxels, a chunk at a time.
+  std::vector<uint32_t> chunkBuf(kChunkVol);
+  IVec3 bufChunk{INT32_MIN, 0, 0};
+  auto voxAt = [&](int x, int y, int z) -> uint32_t {
+    const IVec3 wc{x >> 4, y >> 4, z >> 4};
+    if (!world.ChunkInWindow(wc)) return 0xFFFFFFFFu;
+    if (!(wc.x == bufChunk.x && wc.y == bufChunk.y && wc.z == bufChunk.z)) {
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, chunkBuf.data(),
+                     "farFeat");
+      bufChunk = wc;
+    }
+    return chunkBuf[((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15)] & 0xFFFu;
+  };
+  auto slotOf = [&](uint32_t m) -> uint32_t {
+    return (m == 0 || m >= c.mats.size()) ? 0u : c.mats[m].farPalSlot;
+  };
+  auto isFeatMat = [&](uint32_t m, uint32_t w) {
+    const uint32_t sl = slotOf(m);
+    return sl != 0 && (sl == FarFeatBody(w) || sl == FarFeatHead(w));
+  };
+  const int wyLo = wo.y * (int)kChunk, wyHi = (wo.y + (int)kNChunk) * (int)kChunk;
+  int checked = 0, agree = 0;
+  std::string firstBad;
+  const size_t stride = std::max<size_t>(1, feats.size() / 24);
+  for (size_t i = 0; i < feats.size() && checked < 24; i += stride) {
+    const Feat& f = feats[i];
+    if (f.top < wyLo + 2 || f.top + f.h + 2 >= wyHi) continue;
+    checked++;
+    const uint32_t mb = voxAt(f.x, f.top + 1, f.z);
+    const uint32_t mt = voxAt(f.x, f.top + f.h, f.z);
+    const uint32_t mo = voxAt(f.x, f.top + f.h + 1, f.z);
+    // The voxel over the top must end a STALK (its height is exact); a micro
+    // plant taken over from a shore row or a pad is recorded 1 voxel tall.
+    const bool fine = isFeatMat(mb, f.w) && isFeatMat(mt, f.w) &&
+                      (!(f.w & kFarFeatSolid) || !isFeatMat(mo, f.w));
+    if (fine) agree++;
+    else if (firstBad.empty())
+      firstBad = Format(" first bad (%d,%d) top %d h %d: base %u top %u over %u slots %u/%u",
+                        f.x, f.z, f.top, f.h, mb, mt, mo, FarFeatBody(f.w),
+                        FarFeatHead(f.w));
+  }
+  // The cut: prefer a SOLID feature (a stalk), with a control >= 64 voxels off.
+  // A stalk's entry claims the stalk, so the cut must also clear its VALID
+  // (and the far cells the fill marked with the stalk's slot: no ghost); a
+  // card's entry claims only the ground, which the cut does not touch.
+  int ti = -1, ci = -1;
+  for (int pass = 0; pass < 2 && ti < 0; pass++)
+    for (size_t i = 0; i < feats.size(); i++) {
+      const Feat& f = feats[i];
+      if (pass == 0 && !(f.w & kFarFeatSolid)) continue;
+      if (f.top < wyLo + 4 || f.top + 8 >= wyHi) continue;
+      ti = (int)i;
+      break;
+    }
+  if (ti >= 0)
+    for (size_t i = 0; i < feats.size(); i++)
+      if (std::abs(feats[i].x - feats[ti].x) >= 64 || std::abs(feats[i].z - feats[ti].z) >= 64) {
+        ci = (int)i;
+        break;
+      }
+  bool dOk = feats.size() >= 20 && checked > 0 && agree == checked && ti >= 0 && ci >= 0;
+  bool cutCleared = false, cutMapValid = false, ctlKept = false, noGhost = true;
+  bool cutSolid = false;
+  if (dOk) {
+    const Feat& t = feats[ti];
+    const Feat& k = feats[ci];
+    // Radius 1 one voxel over the base: the plant's voxels, never the ground
+    // two under the centre.
+    for (uint32_t tk = 1; tk <= 4; tk++) {
+      std::vector<BrushOp> ops;
+      if (tk == 1) ops.push_back({t.x, t.top + 2, t.z, 1, kMatAir, 1u, 0, 0});
+      SubmitTick(ctx, world, sim, tk, seed, ops, {}, {}, false, dChunk, false,
+                 false);
+    }
+    ctx.WaitIdle();
+    cutSolid = (t.w & kFarFeatSolid) != 0;
+    cutCleared = FarFeatHeight(FarMapWords(ctx, world, FarFeatWord(1, t.x, t.z), 1)[0]) == 0;
+    cutMapValid = (FarMapEntry(ctx, world, 1, t.x, t.z) & kFarMapValid) != 0;
+    ctlKept = FarMapWords(ctx, world, FarFeatWord(1, k.x, k.z), 1)[0] == k.w;
+    if (cutSolid) {
+      // The level-1 cell over the cut must not still wear the stalk.
+      const uint32_t cb = FarVoxByte(ctx, world, 1, {t.x >> 1, (t.top + 2) >> 1, t.z >> 1});
+      noGhost = (cb & 0x7Fu) != FarFeatBody(t.w) || (cb & 0x7Fu) == 0;
+    }
+    dOk = cutCleared && (cutSolid ? !cutMapValid : cutMapValid) && ctlKept && noGhost;
+  }
+  world.SetWindowOrigin(savedOrigin);
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
+  edits.Clear();
+  DrainFullRefill(ctx, world, sim, playerChunk);
+  const std::string dDetail =
+      Format("feat %d stalk + %d card (L2 %d), %d/%d agree; cut %s %d map %d ghost %d ctl %d",
+             nSolid, nMicro, nL2, agree, checked, cutSolid ? "stalk" : "card", cutCleared,
+             cutMapValid, !noGhost, ctlKept);
+
+  const bool ok = aOk && bOk && cOk && dOk;
   detail = Format("L1 %d/%d valid, %d exact + %d fluid, %d cell/skin agree, %d wrong; "
-                  "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d",
+                  "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d; %s",
                   valid, sampled, exact, fluid, cellAgree, wrong, coarseExact, coarse,
                   preCrater, preBuild, preControl, postCrater, postBuild,
-                  postControl, postCrater2, healed, keptCrater, keptBuild);
-  std::printf("far surface: %s (%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
-              detail.c_str(), firstWrong.c_str(), noted);
+                  postControl, postCrater2, healed, keptCrater, keptBuild,
+                  dDetail.c_str());
+  std::printf("far surface: %s (%s%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
+              detail.c_str(), firstWrong.c_str(), firstBad.c_str(), noted);
   // Leave the cascades as the next gate expects to find them: pristine + the
   // index the harness had (none), not our two edits' patches.
   edits.Clear();

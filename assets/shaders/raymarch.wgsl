@@ -1901,6 +1901,163 @@ fn detailDist(ro : vec3f, cell : vec3<i32>) -> f32 {
   return length(vec3f(cell) + 0.5 - ro) * VOXEL_METERS;
 }
 
+// ======================= THE FAR FORM OF A PLANT (LOD-seam package F) =======
+// Package B's fade used to END the plants here: past each model's vanish
+// distance its cells were air, so a meadow was grass to 16 m, thinning to
+// nothing at 20 m, and lawn-coloured ground past the handoff. Now the model
+// HANDS OVER instead of vanishing: past its vanish distance a plant cell is
+// drawn as its FAR FORM, and the far field draws the very same form from the
+// feature plane (traceFar's farFeatCell, worldgen.wgsl FAR_FEAT_*), so the
+// handoff is not a line in the grass either: both sides evaluate one
+// function of the world column.
+//
+// THE FORM: one vertical CARD per column, yaw and offset hashed from the
+// column, carrying a row of BLADES. What a meadow is at 20 m is a texture of
+// thin upright strokes; eight tapered, swaying, individually lit blades per
+// cell (tracePlant) are well under a pixel each there, and the card keeps the
+// strokes while costing one plane intersection. The blades cover
+// BLADE_COVER of the card's length: THAT is the invariant the level of detail
+// keeps, not the blade count. A blade is never drawn thinner than
+// BLADE_MIN_PX pixels, so as the pixel grows the blades widen and there are
+// fewer of them per card, and once fewer than one fits a column the lattice
+// (offset per column) simply leaves some columns empty — coverage by
+// PROJECTED PIXEL SIZE, the same at a given distance whichever side of the
+// handoff draws it, instead of a hard distance cut.
+//
+// Per cell, so the near march can test it in the one cell it is in: blades
+// span their cells whole, except in the column's TOP voxel, where each ends at
+// its own hashed height (0.35..1 of the voxel) and tapers over its last voxel.
+// The near side knows the top voxel as "the cell above is not a plant"; the
+// far side from the feature's height.
+const BLADE_SALT : u32 = 0xB1ADEu;
+const BLADE_W0 : f32 = 0.15;       // a blade's true width, voxels (tall_grass: halfWidth 0.075)
+const BLADE_COVER : f32 = 0.45;    // share of a card's length the blades cover
+const BLADE_MIN_PX : f32 = 0.8;    // the thinnest a blade is drawn, pixels
+// The card of the column (or level-2 sub-column) whose min corner is `org`
+// and width `W`: its hash, its direction and its centre.
+struct BladeCard { hc : u32, dir : vec2f, ctr : vec2f };
+fn bladeCardOf(org : vec2<i32>, W : f32) -> BladeCard {
+  var c : BladeCard;
+  c.hc = hash3(bitcast<u32>(org.x), bitcast<u32>(org.y), BLADE_SALT);
+  // One of EIGHT yaws over the half circle (a card has no front), from a
+  // select table rather than cos/sin: this runs in the far feature march's
+  // cell loop, where every live value is paid for.
+  let k0 = (c.hc & 1u) != 0u;
+  let k1 = (c.hc & 2u) != 0u;
+  let k2 = (c.hc & 4u) != 0u;
+  // yaw = (hc & 7) x 22.5 degrees
+  c.dir = vec2f(
+      select(select(select(1.0, 0.9239, k0), select(0.7071, 0.3827, k0), k1),
+             select(select(0.0, -0.3827, k0), select(-0.7071, -0.9239, k0), k1), k2),
+      select(select(select(0.0, 0.3827, k0), select(0.7071, 0.9239, k0), k1),
+             select(select(1.0, 0.9239, k0), select(0.7071, 0.3827, k0), k1), k2));
+  c.ctr = vec2f(org) + 0.5 * W +
+          (vec2f(f32((c.hc >> 16u) & 255u), f32(c.hc >> 24u)) * (1.0 / 255.0) - 0.5) *
+          (0.3 * W);
+  return c;
+}
+// The lit normal of a card, turned to face the ray and tipped up a little:
+// blades lean and catch sky, and a strictly horizontal normal lit the far
+// meadow like a field of walls. fs rebuilds it from the hit column (it is not
+// carried in FarHit).
+fn bladeCardNormal(c : BladeCard, rd : vec3f) -> vec3f {
+  var nn = vec2f(-c.dir.y, c.dir.x);
+  if (dot(rd.xz, nn) > 0.0) { nn = -nn; }
+  return normalize(vec3f(nn.x, 0.3, nn.y));
+}
+// t of the ray against card `c` in [tA, tB), or -1. `W` the footprint width,
+// `topV` the column's top voxel y (1e9 when this is not the top cell),
+// `occ` plants per fine column along the card (1 for one column; a level-2
+// sub-column's count / 2), `pxVox` one pixel's width in voxels at this t.
+fn bladeCardHit(c : BladeCard, org : vec2<i32>, W : f32, topV : f32, occ : f32,
+                pxVox : f32, ro : vec3f, rd : vec3f, tA : f32, tB : f32) -> f32 {
+  let nrm = vec2f(-c.dir.y, c.dir.x);
+  let den = dot(rd.xz, nrm);
+  if (abs(den) < 1e-5 || occ <= 0.0) { return -1.0; }
+  let t = dot(c.ctr - ro.xz, nrm) / den;
+  if (t < tA || t >= tB) { return -1.0; }
+  let p = ro + rd * t;
+  let lp = p.xz - vec2f(org);
+  if (any(lp < vec2f(0.0)) || any(lp >= vec2f(W))) { return -1.0; }
+  let w = max(BLADE_W0, BLADE_MIN_PX * pxVox);
+  let cf = min(BLADE_COVER * occ, 0.9);
+  let sp = w / cf;
+  let u = dot(p.xz - c.ctr, c.dir) / sp + f32((c.hc >> 5u) & 1023u) * (1.0 / 1024.0);
+  let k = floor(u);
+  let hk = hash3(c.hc, bitcast<u32>(i32(k)), 0x7A11u);
+  let tip = topV + 0.35 + 0.65 * f32((hk >> 8u) & 255u) * (1.0 / 255.0);
+  if (p.y >= tip) { return -1.0; }
+  let jit = (f32(hk & 255u) * (1.0 / 255.0) - 0.5) * (1.0 - cf);
+  let taper = clamp(tip - p.y, 0.35, 1.0);
+  if (abs(fract(u) - 0.5 - jit) * sp > 0.5 * w * taper) { return -1.0; }
+  return t;
+}
+// ---- PHASE 3 of trace(): the far forms the march passed ----
+// A voxel DDA from t0 to t1 (< NEAR_FF_STEPS cells) over the cells phase 1
+// passed as air because their plant was past its vanish distance — the same
+// test, the same identity (a tile plant's key, else the column) — drawing
+// each as its card. Nothing else is tested: t1 is what the march resolved.
+const NEAR_FF_STEPS : i32 = 96;
+struct NearFF { hit : bool, t : f32, cell : vec3<i32>, word : u32, key : u32 };
+fn nearFarForm(ro : vec3f, rd : vec3f, inv : vec3f, t0 : f32, t1 : f32) -> NearFF {
+  var r : NearFF;
+  r.hit = false;
+  var cell = vec3<i32>(floor(ro + rd * (t0 + 1e-4)));
+  let stepv = vec3<i32>(sign(rd));
+  var tMax : vec3f;
+  for (var a = 0; a < 3; a++) {
+    let bnd = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+    tMax[a] = (bnd - ro[a]) * inv[a];
+  }
+  let tDelta = abs(inv);
+  var tCur = t0;
+  let px = pxVoxAt(t0);
+  for (var i = 0; i < NEAR_FF_STEPS; i++) {
+    if (tCur >= t1 || !inBounds(cell)) { break; }
+    let tNext = min(tMax.x, min(tMax.y, tMax.z));
+    let w = voxWordAt(cell);
+    let mat = voxMat(w);
+    if (mat != MAT_AIR && (materials[mat].flags & MATF_MICRO) != 0u &&
+        microBricks[mat].base != MICRO_NONE) {
+      let mb = microBricks[mat];
+      var key = 0u;
+      if ((mb.flags & MICROF_PLANT) != 0u) {
+        let pTile = i32((microPool[mb.base + 1u] >> 16u) & 0xFFu);
+        if (pTile != 0) { key = plantTileKey(microPool[mb.base] & 0xFFu, cell, mat); }
+      }
+      if (detailDist(ro, cell) >= detailVanishDist(select(detailColumnId(cell), key, key != 0u))) {
+        let bc = bladeCardOf(cell.xz, 1.0);
+        let ac = cell + vec3<i32>(0, 1, 0);
+        var topV = 1e9;
+        if (!inBounds(ac) || (materials[voxMat(voxWordAt(ac))].flags & MATF_MICRO) == 0u) {
+          topV = f32(cell.y);
+        }
+        let tb = bladeCardHit(bc, cell.xz, 1.0, topV, 1.0, px, ro, rd, tCur, min(tNext, t1));
+        if (tb >= 0.0) {
+          r.hit = true;
+          r.t = tb;
+          r.cell = cell;
+          r.word = w;
+          r.key = bc.hc | 1u;
+          return r;
+        }
+      }
+    }
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x;
+    } else if (tMax.y < tMax.z) {
+      cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y;
+    } else {
+      cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z;
+    }
+  }
+  return r;
+}
+// One pixel's width in voxels at fine-voxel distance t.
+fn pxVoxAt(tFine : f32) -> f32 {
+  return max(tFine, 1.0) * R.tanHalfFov * 2.0 / R.viewPx;
+}
+
 struct PlantDef {
   kind : u32,
   body : u32, tip : u32, accent : u32, accent2 : u32, stem : u32,
@@ -2798,6 +2955,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   var detT0 = 0.0; var detT1 = 0.0; var detT2 = 0.0; var detT3 = 0.0;
   var detTau = 0.0;
   var detFire = 0.0;
+  // Package F: the t of the first plant cell the march passed as its FAR
+  // FORM (past its vanish distance), or -1. Resolved by PHASE 3 below.
+  var ffT0 = -1.0;
 
   // ---- micro-detail budget for THIS ray ----
   // `wantMedia` is exactly "this is the primary camera ray" at every call site
@@ -3367,7 +3527,13 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         if (tileMode) { key = plantTileKey(pKind, cell, mat); }
         let dM = detailDist(ro, cell);
         if (dM >= detailVanishDist(select(detailColumnId(cell), key, tileMode))) {
-          // faded out: fall through as air
+          // HANDED OVER, not faded (package F): past its vanish distance the
+          // model is its FAR FORM (bladeCardHit). The march only notes WHERE
+          // the first such cell is and passes it as air; PHASE 3 at the tail
+          // re-walks the cells from there and draws the cards (nearFarForm),
+          // when this loop's state is dead -- testing the card here pushed
+          // fs from 128 to 168 registers.
+          if (ffT0 < 0.0) { ffT0 = tCur; }
         } else if (detN >= detMax) {
           if (dM < DETAIL_FADE_START_M) {
             out.hit = true;
@@ -3641,13 +3807,11 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
                    - ro) * inv;
         let tCellExit = min(bnd.x, min(bnd.y, bnd.z));
         let tClip = select(max(tCellExit - pt, 1e-3) + 1e-3, 1e9, isTile);
-        // NEAR-DETAIL FADE, the shrink half: a column plant lowers into the
-        // ground over the last DETAIL_SHRINK_M before phase 1 removes it, so
-        // it is already flat when it goes. Same identity and distance as
-        // phase 1's test, recomputed here where registers are free.
-        let lodH = clamp((detailVanishDist(detailColumnId(dc)) -
-                          detailDist(ro, dc)) / DETAIL_SHRINK_M, 0.02, 1.0);
-        mh = tracePlant(mb, pd, dm, dc, entry, rd, tClip, lodH);
+        // (Package B shrank a column plant into the ground over the last
+        // DETAIL_SHRINK_M before its vanish distance. Since package F the
+        // plant hands over to its far form there instead of vanishing, and a
+        // shrunk tuft next to a full-height card was a pop: full height.)
+        mh = tracePlant(mb, pd, dm, dc, entry, rd, tClip, 1.0);
       } else {
         mh = traceMicro(mb, dc, entry, rd, R.tick);
       }
@@ -3761,6 +3925,42 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         }
       }
       break;
+    }
+  }
+  // ======================== PHASE 3: the far forms (package F) =============
+  // The plant cells phase 1 passed as their far form (past their vanish
+  // distance) are re-walked from the first of them to whatever the ray
+  // resolved, and the first card hit wins if it is nearer.
+  if (ffT0 >= 0.0) {
+    let tEnd = select(tExit, out.t, out.hit || out.saturated);
+    // The same last stretch the far field's cards are tested over.
+    let t0 = max(ffT0, tEnd - FAR_CARD_MILE);
+    if (t0 < tEnd) {
+      let fh = nearFarForm(ro, rd, inv, t0, tEnd);
+      if (fh.hit) {
+        out.hit = true;
+        out.saturated = false;
+        out.t = fh.t;
+        out.cell = fh.cell;
+        out.axis = 1;
+        out.sgn = -1.0;
+        out.word = fh.word;
+        out.micMat = voxMat(fh.word);
+        out.micN = bladeCardNormal(bladeCardOf(fh.cell.xz, 1.0), rd);
+        out.micSmooth = 1u;
+        out.micKey = fh.key;
+        // The crossings latched behind the card are behind a surface now
+        // (the record path's unwind, less the media snapshot it has).
+        if (out.liqT >= fh.t) {
+          out.liqT = 0.0;
+          out.liqPath = 0.0;
+          out.liqCell = vec3<i32>(0);
+          out.liqAxis = 1;
+          out.liqSgn = -1.0;
+        }
+        if (out.tsT >= fh.t) { out.tsT = 0.0; out.tsPath = 0.0; out.tsMat = 0u; }
+        if (out.gasHalfT >= fh.t) { out.gasHalfT = 0.0; }
+      }
     }
   }
   return out;
@@ -4573,6 +4773,183 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
   return r;
 }
 
+// ======================= THE FEATURES (LOD-seam package F) ==================
+// The far field's cells are centre samples, so the thin things standing on
+// the ground were not in it: a 1-voxel cactus stalk survives level 1 as a
+// 20 cm cube one time in four and never past it, and a MICRO plant (grass, a
+// flower, a bush) is dropped by every far writer. The feature plane
+// (worldgen.wgsl FAR_FEAT_*: per sub-column of the refine levels, the plant on
+// its top — height, fine column, body and head slots, SOLID or not) puts them
+// back where they stand:
+//   * a SOLID feature (a cactus stalk) is NOT drawn from here: the map fill
+//     raises the stalk's column to its top and marks its cells, so the
+//     surface refine draws it exactly, like terrain;
+//   * a MICRO feature is the plant's FAR FORM, the blade card the near field
+//     hands its plants over to (bladeCardHit): at level 1 per fine column,
+//     identical to the near side's; at level 2 one card per 2x2 sub-column,
+//     carrying the coverage of every plant under it (the count field).
+// Tested after traceFar (farFeatMarch) over the last FAR_CARD_MILE before
+// the far ground hit, in the hit's level (1 or 2): see FAR_CARD_MILE.
+//
+// PAST THE LAST FEATURE LEVEL there is nothing: features thin out ahead of
+// its sphere (farFeatKeep scales a card's coverage), and the ground's cover tint (coverWeight)
+// takes over by the same weight — the tint IS what a meadow of sub-pixel
+// blades averages to.
+const FAR_FEAT_LEVELS : u32 = 2u;                    // worldgen.wgsl, same name
+const FAR_FEAT_VEC : u32 = FAR_LEVELS * FAR_N * FAR_N;   // the plane, in vec4s
+const FAR_FEAT_SOLID : u32 = 0x40000000u;            // worldgen.wgsl, same name
+const FAR_HIT_FEATURE : u32 = 0x200u;   // FarHit.level flag: a feature hit
+const FAR_HIT_FEAT_CARD : u32 = 0x400u; // ... drawn as a blade card
+// The last feature level's handoff sphere (traceFar's tLvlOut), metres, and
+// the band ahead of it where the features go.
+const FAR_FEAT_END_M : f32 =
+    f32(((i32(FAR_NCHUNK) / 2 - 2) * i32(CHUNK)) << (FAR_FEAT_LEVELS + FAR_SHIFT_BASE)) *
+    VOXEL_METERS * 0.97;
+const FAR_FEAT_START_M : f32 = FAR_FEAT_END_M * 0.75;
+fn farFeatKeep(tFine : f32) -> f32 {
+  return 1.0 - smoothstep(FAR_FEAT_START_M, FAR_FEAT_END_M, tFine * VOXEL_METERS);
+}
+struct FarFeat { t : f32, axis : i32, pal : u32, card : bool, drop : u32, tested : bool };
+// The nearest feature of level cell `vc` (entries `fq`) the ray meets in
+// [tA, tB) — FINE-voxel t, unlike farRefineCell. t < 0: none. `drop` is the
+// slot of a SOLID feature standing in this cell's footprint: a centre-sampled
+// cell of that slot IS the stalk, and the caller passes it as air so the
+// stalk is drawn once, at its true width.
+fn farFeatCell(fq : vec4<u32>, level : u32, vc : vec3<i32>, ro : vec3f, rd : vec3f,
+               inv : vec3f, tA : f32, tB : f32) -> FarFeat {
+  var r : FarFeat;
+  r.t = -1.0;
+  r.axis = 1;
+  r.pal = 0u;
+  r.card = false;
+  r.drop = 0u;
+  r.tested = false;
+  let shift = farCellShift(level);
+  let wsh = shift - 1u;
+  let y0 = vc.y << shift;
+  let yLo = min(ro.y + rd.y * tA, ro.y + rd.y * tB);
+  let keep = farFeatKeep(tA);
+  var best = tB;
+  for (var q = 0u; q < 4u; q++) {
+    // Component by SELECT, never fq[i] (farRefineCell says why).
+    let e = select(select(fq.x, fq.y, q == 1u), select(fq.z, fq.w, q == 3u), q >= 2u);
+    let hg = i32((e >> 8u) & 15u);
+    if (hg == 0) { continue; }
+    let topF = y0 + (((i32(e & 255u) - y0 + 128) & 255) - 128);
+    // A SOLID word is a stalk, drawn by the surface map's refine (it is
+    // part of the heightfield): the word is there for fardown's cut check.
+    if ((e & FAR_FEAT_SOLID) != 0u) { continue; }
+    if (yLo >= f32(topF + 1)) { continue; }
+    let sm = vc.xz * 2 + vec2<i32>(i32(q & 1u), i32(q >> 1u));
+    let fc = (sm << vec2<u32>(wsh)) + vec2<i32>(i32((e >> 12u) & 1u), i32((e >> 13u) & 1u));
+    // The ray's stretch over this SUB-COLUMN's footprint (a slab test, no
+    // hash): most of a cell's four are not under the ray at all.
+    let f0 = (vec2f(sm << vec2<u32>(wsh)) - ro.xz) * inv.xz;
+    let f1 = (vec2f((sm + 1) << vec2<u32>(wsh)) - ro.xz) * inv.xz;
+    let sA = max(tA, max(min(f0.x, f1.x), min(f0.y, f1.y)));
+    let sB = min(tB, min(max(f0.x, f1.x), max(f0.y, f1.y)));
+    if (sA >= sB) { continue; }
+    r.tested = true;
+    var t = -1.0;
+    let ax = 1;
+    {
+      let W = f32(1 << wsh);
+      let org = select(fc, sm << vec2<u32>(wsh), level > 1u);
+      let occ = f32(((e >> 14u) & 3u) + 1u) / W * keep;
+      t = bladeCardHit(bladeCardOf(org, W), org, W, f32(topF), occ, pxVoxAt(tA), ro, rd,
+                       sA, sB);
+    }
+    if (t >= 0.0 && t < best) {
+      best = t;
+      r.t = t;
+      r.axis = ax;
+      r.card = true;
+      let yh = ro.y + rd.y * t;
+      let head = (e >> 23u) & 0x7Fu;
+      r.pal = select((e >> 16u) & 0x7Fu, head, head != 0u && yh >= f32(topF));
+    }
+  }
+  return r;
+}
+
+
+// ---- THE FEATURE MARCH (package F): the plants along a far ray ----
+// After traceFar has found the ground, walk the level cells of the hit's
+// level (1 or 2) over the last FAR_CARD_MILE before it and return the nearest
+// card (farFeatCell). Separate from traceFar's loop on purpose: there it cost
+// 40 registers of fs. A ray that hit nothing, or hit past level 2, is not
+// walked.
+const FAR_FEAT_STEPS : i32 = 16;
+// ---- THE CARDS ARE TESTED OVER THE LAST FAR_CARD_MILE BEFORE THE GROUND ----
+// A grazing ray skims the cover band for tens of metres; walking all of it
+// (level-2 cells, chunk and row skips) measured 1.0-1.3 ms on the meadow
+// camera for 7% of its far pixels ending on a blade: the walk is the cost,
+// not the tests. Over the last 1.6 m before the ground the ray is inside any
+// stand (it is within ~10 cm of the ground), and a dense stand's cards cover
+// a crossed column ~25% of the time, so ~16 columns later a stand's pixel is
+// a blade with the same odds the whole walk gave it -- a nearer blade on the
+// same ray is the same colour. What the stretch gives up is plants seen
+// against ground MORE than FAR_CARD_MILE behind them: a stand's top edge on a
+// crest, and a sparse tussock's upper part. The near field's far forms
+// (nearFarForm) take the same rule, so it is one definition on both sides
+// of the handoff, not a far-only cut. Stalks are not cards (the map's refine
+// draws them, whole).
+const FAR_CARD_MILE : f32 = 16.0;
+fn farFeatMarch(ro : vec3f, rdIn : vec3f, far : FarHit, tStart : f32) -> FarHit {
+  var out = far;
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  // THE LAST STRETCH ONLY (FAR_CARD_MILE before the ground the ray hit; see
+  // FAR_CARD_MILE). It is short -- 8 level-1 cells, 4 level-2 ones -- so
+  // this is a plain DDA in the level the hit is in (1 or 2), no skips: every
+  // extra value live here is one fs spills (it runs with trace()'s Hit
+  // still held for the shading after it).
+  let tCur = max(tStart, far.t - FAR_CARD_MILE);
+  let tHand1 = f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK)) *
+               f32(1u << farCellShift(1u));
+  let level = select(2u, 1u, far.t < tHand1);
+  if (level > FAR_FEAT_LEVELS || tCur >= far.t) { return out; }
+  let s = f32(1u << farCellShift(level));
+  let b = farBox(level);
+  let roL = ro / s;
+  var vc = vec3<i32>(floor(roL + rd * (tCur / s + 1e-4)));
+  let stepv = vec3<i32>(sign(rd));
+  var vMax = (vec3f(vc) + select(vec3f(0.0), vec3f(1.0), rd > vec3f(0.0)) - roL) * inv;
+  let tD = abs(inv);
+  var vCur = tCur / s;
+  for (var k = 0; k < FAR_FEAT_STEPS; k++) {
+    if (vCur * s >= far.t || !farInValid(vc, b)) { break; }
+    let vOut = min(vMax.x, min(vMax.y, vMax.z));
+    if (farByteAt(level, vc) != 0u) {
+      let fq = farMap[FAR_FEAT_VEC + farMapCell(level, vc.xz)];
+      if (any((fq & vec4<u32>(0xF00u)) != vec4<u32>(0u))) {
+        let ff = farFeatCell(fq, level, vc, ro, rd, inv, vCur * s, min(vOut * s, far.t));
+        if (ff.t >= 0.0) {
+          out.hit = true;
+          out.t = ff.t;
+          out.axis = 1;
+          out.sgn = sign(rd.y);
+          out.mat = farPalMat(&materials, ff.pal);
+          out.cell = vc;
+          out.level = level | FAR_HIT_FEATURE | FAR_HIT_FEAT_CARD;
+          return out;
+        }
+      }
+    }
+    if (vMax.x < vMax.y && vMax.x < vMax.z) {
+      vc.x += stepv.x; vCur = vMax.x; vMax.x += tD.x;
+    } else if (vMax.y < vMax.z) {
+      vc.y += stepv.y; vCur = vMax.y; vMax.y += tD.y;
+    } else {
+      vc.z += stepv.z; vCur = vMax.z; vMax.z += tD.z;
+    }
+  }
+  return out;
+}
+
 // The top (fine y) of sub-column `m` of `level`, or a floor no tap reaches when
 // the entry is outside the valid box or not vouched for: the heightfield AO
 // below treats both as open, as farAoSolidAt treats cells outside the box.
@@ -4584,6 +4961,48 @@ fn farHfTopAt(level : u32, m : vec2<i32>, b : FarBox) -> i32 {
   let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), (m.y & 1) != 0);
   if ((e & FAR_MAP_VALID) == 0u) { return -1073741824; }
   return farMapTop(e);
+}
+
+// ---- THE HEIGHTFIELD'S CONTACT SHADOW (package F) ----
+// The far shadow march starts a refined hit over its cell's top (its cell may
+// be a material cell it would stop on at once), so the shadow a one-voxel
+// step casts on the tread beside it — which the near field's cache draws, and
+// which the seam-term pass measured as THE difference at the handoff (noon,
+// seam_x: near tread shadow mean 0.88, p5 0.51; far 0.99, p5 1.00) — was never
+// in the far field. This walks the ray toward the sun over the SUB-COLUMN
+// lattice of the surface map (level 1: the fine columns, i.e. the near
+// field's own voxels) for FAR_HF_SHADOW_STEPS columns and reports the
+// distance (fine voxels) to the first column whose top face the ray passes
+// under, or -1. A ray rises within a column, so testing it where it ENTERS
+// each column is exact. Invalid entries (an edit, a ruin) never block: the
+// cell march covers them.
+const FAR_HF_SHADOW_STEPS : i32 = 4;
+const FAR_HF_SHADOW_FADE_M : f32 = 12.0;
+fn farHfShadow(level : u32, p : vec3f, L : vec3f) -> f32 {
+  if (L.y <= 0.0) { return -1.0; }
+  let wsh = farCellShift(level) - 1u;
+  let w = f32(1u << wsh);
+  let b = farBox(level);
+  let q = p.xz / w;                       // in sub-columns
+  let d = L.xz;
+  var m = vec2<i32>(floor(q));
+  let stp = vec2<i32>(select(-1, 1, d.x > 0.0), select(-1, 1, d.y > 0.0));
+  let inv = 1.0 / select(d, vec2f(1e-6), abs(d) < vec2f(1e-6));
+  // t along the ray in sub-column units of horizontal travel
+  var tM = (vec2f(m + max(stp, vec2<i32>(0))) - q) * inv;
+  let dt = abs(inv);
+  for (var i = 0; i < FAR_HF_SHADOW_STEPS; i++) {
+    var t = 0.0;
+    if (tM.x < tM.y) { t = tM.x; m.x += stp.x; tM.x += dt.x; }
+    else { t = tM.y; m.y += stp.y; tM.y += dt.y; }
+    // q + d t (sub-columns) is p.xz + d (t w) (fine voxels), and d = L.xz, so
+    // the ray's own parameter there is t w.
+    let tr = t * w;
+    let y = p.y + L.y * tr;
+    let top = farHfTopAt(level, m, b);
+    if (y < f32(top + 1)) { return tr; }
+  }
+  return -1.0;
 }
 
 // voxelAO's four-tap rule (farVoxelAO's twin) on the HEIGHTFIELD, for a refined
@@ -4890,7 +5309,12 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                   // trunk, a rock, a built wall) and keeps its plain cell. The
                   // sample column is sub-column (1,1) at level 1 exactly; past
                   // it the tallest sub-column bounds it.
-                  let hc = select(maxH, hq.w, level == 1u);
+                  // ...except a cell a STALK was marked into (package F:
+                  // worldgen.wgsl farmap): its slot is a sub-column's
+                  // sub-skin there, and the stalk IS that sub-column.
+                  let stalkCell = any(((e >> vec4<u32>(23u)) & vec4<u32>(0x7Fu)) ==
+                                      vec4<u32>(cellByte & FAR_PAL_MASK));
+                  let hc = select(maxH, hq.w, level == 1u && !stalkCell);
                   if (mat == 0u || y0 + (si >> 1) <= hc) {
                     let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,
                                            min(vMax.x, min(vMax.y, vMax.z)), axis,
@@ -4911,6 +5335,9 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                 }
               }
             }
+            // (THE FEATURES are drawn after the march: farFeatMarch, fs. A
+            // cactus stalk is not a feature any more but part of the surface
+            // map, refined like the ground -- see farmap in worldgen.wgsl.)
             if (mat != 0u) {
               out.hit = true;
               out.t = vCur * s;   // back to fine-voxel units
@@ -11181,6 +11608,10 @@ fn fs(in : VSOut) -> FSOut {
     // in.pos.xy is the fragment's pixel coordinate — the dither key (see
     // farDither: screen-space, time-free, stable per pixel)
     far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
+    // The plants in the far ray's way (package F, farFeatMarch).
+    // Rides the refine's knob: the feature plane is the refine levels' data,
+    // and render.farRefineLevel 0 (the `norefine` budget arm) prices both.
+    if (far.hit && TUNE_FAR_REFINE_LEVEL >= 1) { far = farFeatMarch(R.camPos, rd, far, h.tExit); }
   }
 
   // ---- coarse gas (docs/PLAN_gas_particles.md §2.5 + stage 1b) ------------
@@ -11355,6 +11786,21 @@ fn fs(in : VSOut) -> FSOut {
       let flv = far.level & 0xFFu;
       let fRefined = (far.level & FAR_HIT_REFINED) != 0u;
       let sL = f32(1u << farCellShift(flv));
+      // A FEATURE hit (farFeatCell, package F): a stalk is a voxel column and
+      // shades as one; a CARD is the plant's far form and shades as the near
+      // field shades that same card (the micro path's rules: its palette key,
+      // the card's normal, the ground's openness, no AO).
+      let fFeat = (far.level & FAR_HIT_FEATURE) != 0u;
+      let fCard = (far.level & FAR_HIT_FEAT_CARD) != 0u;
+      var cardHc = 0u;
+      if (fCard) {
+        let wC = f32(1u << (farCellShift(flv) - 1u));
+        let pC = R.camPos + rd * far.t;
+        let org = vec2<i32>(floor(pC.xz / wC)) * i32(wC);
+        let bc = bladeCardOf(org, wC);
+        n = bladeCardNormal(bc, rd);
+        cardHc = bc.hc | 1u;
+      }
       // ---- TEXTURE AT THE FINE VOXEL, NOT AT THE CELL (the LOD-seam pass) ----
       // The near field's per-voxel "texture" is two positional hashes: the
       // worldgen palette variant (synthJitterState, the state nibble every
@@ -11372,8 +11818,9 @@ fn fs(in : VSOut) -> FSOut {
       // paletteJitter, NOT paletteColor: this is a hash, not a state nibble,
       // and paletteColor() would read it as a MATF_TINTED dye index.
       let hitP = R.camPos + rd * far.t;
-      let fineV = vec3<i32>(floor(hitP - n * 0.5));
-      var albedo = paletteJitter(m, synthJitterState(fineV, R.seed));
+      let fineV = select(vec3<i32>(floor(hitP - n * 0.5)), vec3<i32>(floor(hitP)), fCard);
+      var albedo = paletteJitter(m, select(synthJitterState(fineV, R.seed),
+                                           hash3(R.seed, 1u, cardHc ^ far.mat), fCard));
       // THE FOOTPRINT FADE (farFootprintFade): the variant and the grain
       // octaves ease to their means below ~2 px per fine voxel; the staircase
       // below ~2 px per drawn element (wN, below).
@@ -11396,7 +11843,7 @@ fn fs(in : VSOut) -> FSOut {
       var lamSm = -1.0;
       var faceSm = 1.0;
       var smoothAlb = vec3f(-1.0);
-      if (m.klass != CLASS_LIQUID) {
+      if (m.klass != CLASS_LIQUID && !fFeat) {
         let fs2 = farSurfAt(flv, hitP, wN > 0.0);
         if (fs2.ok) {
           let skinM = farPalMat(&materials, (fs2.e >> 16u) & 0x7Fu);
@@ -11414,7 +11861,9 @@ fn fs(in : VSOut) -> FSOut {
               let ce = select(select(select(fs2.q.w, fs2.q.z, cb.z), fs2.q.y, cb.y),
                               fs2.q.x, cb.x);
               let cl = coverLook(farPalMat(&materials, (ce >> 23u) & 0x7Fu));
-              let cw = coverWeight(frac, cl.w, rd);
+              // Only where the features have gone (farFeatKeep): nearer, the
+              // blades themselves are drawn (package F).
+              let cw = coverWeight(frac, cl.w, rd) * (1.0 - farFeatKeep(far.t));
               let cc = cl.rgb * coverBladeLight(rd);
               skinA = mix(skinA, cc, cw);
               if (n.y > 0.5) { albedo = mix(albedo, cc, cw); }
@@ -11450,6 +11899,10 @@ fn fs(in : VSOut) -> FSOut {
       var face = 1.0;
       if (far.axis == 0) { face = TUNE_FACE_X; }
       else if (far.axis == 2) { face = TUNE_FACE_Z; }
+      if (fCard) {
+        // The near micro rule: keyed on the world normal.
+        face = select(select(1.0, TUNE_FACE_Z, abs(n.z) > 0.5), TUNE_FACE_X, abs(n.x) > 0.5);
+      }
       if (lamSm >= 0.0) { face = mix(face, faceSm, wN); }
       // Same lattice as the near field's surfaceGrain(h.cell, ...) — see the
       // fine-voxel note above. TUNE_GRAIN_AMP_FAR ships equal to TUNE_GRAIN_AMP
@@ -11465,8 +11918,9 @@ fn fs(in : VSOut) -> FSOut {
       albedo = bt.albedo;
       // THE WINDOW'S OWN OPENNESS IN THE HANDOFF BAND (farBandNearWeight).
       // Read before the sun: the shadow's lift cap wants it, as the near's does.
-      var openF = farOpenness(nSh);
-      let bandW = farBandNearWeight(far.t);
+      // A card reads the GROUND's openness, as a near micro hit does.
+      var openF = select(farOpenness(nSh), 1.0, fCard);
+      let bandW = select(farBandNearWeight(far.t), 0.0, fCard);
       if (bandW > 0.0 && inBounds(fineV)) {
         let oN = opennessAt(fineV, hitP, n, &openness, &opennessGen);
         if (oN >= 0.0) { openF = mix(openF, oN, bandW); }
@@ -11511,6 +11965,21 @@ fn fs(in : VSOut) -> FSOut {
         if (fsh.t >= 0.0) {
           sh = mix(1.0, shadowFromOpaqueHit(true, fsh.t, 0u), fsh.cov);
         }
+        // THE CONTACT SHADOW THE CELL MARCH GAVE UP (package F): a refined
+        // hit's own cell, and the steps of the heightfield round it, on the
+        // surface map (farHfShadow) — what the near field's shadow cache
+        // shows one voxel inside the handoff, where it was the whole seam.
+        // Only where it has a near field to match: it fades out over
+        // FAR_HF_SHADOW_FADE_M past the handoff (the treads beyond get the
+        // cell march's shadow alone, as they always did), which also keeps
+        // its cost to the band the seam is in.
+        let hfW = 1.0 - smoothstep(TUNE_LOD_HANDOFF_DIST + FAR_HF_SHADOW_FADE_M * 0.5,
+                                   TUNE_LOD_HANDOFF_DIST + FAR_HF_SHADOW_FADE_M,
+                                   far.t * VOXEL_METERS);
+        if (fRefined && flv <= 2u && hfW > 0.0) {
+          let tb = farHfShadow(flv, hitP + n * 0.02, keyLightDir());
+          if (tb >= 0.0) { sh = min(sh, mix(1.0, shadowFromOpaqueHit(true, tb, 0u), hfW)); }
+        }
         if (sh < 1.0) {
           // Shading LOD (see lodShadeFade): the staircase's contact shadow
           // is an artefact of the sampling at this projected size.
@@ -11541,7 +12010,9 @@ fn fs(in : VSOut) -> FSOut {
       let a1 = select(0, 1, far.axis == 0);
       let a2 = select(2, 1, far.axis == 2);
       var ao = 1.0;
-      if (fRefined) {
+      if (fFeat) {
+        // Open air round a stalk or a blade; the near micro path takes 1 too.
+      } else if (fRefined) {
         // The heightfield's own four taps (farHfAO), on the sub-column lattice:
         // x/z in sub-columns (half a cell), y in fine voxels.
         let wS = 0.5 * sL;
@@ -11557,7 +12028,7 @@ fn fs(in : VSOut) -> FSOut {
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
-      let covered = farInValid(up, farBox(flv)) &&
+      let covered = !fFeat && farInValid(up, farBox(flv)) &&
                     farPalAt(flv, up) != 0u;
       if (covered) { ao *= TUNE_AO_FAR; }
       // Shading LOD: the crease AO of a staircase fades with its treads.
@@ -11579,7 +12050,9 @@ fn fs(in : VSOut) -> FSOut {
       // The near field's one-bounce GI, in its open-terrain closed form
       // (farGiBounce). Occluded by the same ao, as the near term is.
       // TUNE_GI_STRENGTH = 0 folds it away with the near gather (`nogi`).
-      if (TUNE_GI_STRENGTH > 0.0) { color += ao * farGiBounce(albedo, nSh); }
+      if (TUNE_GI_STRENGTH > 0.0) {
+        color += ao * farGiBounce(albedo, select(nSh, vec3f(0.0, 1.0, 0.0), fCard));
+      }
       // The near field's wet sheen (its `wet > 0` block), same lobe.
       if (wet > 0.0) {
         let hv = normalize(keyLightDir() - rd);
@@ -11689,34 +12162,10 @@ fn fs(in : VSOut) -> FSOut {
       }
     }
 
-    // THE COVER TINT (coverWeight): the plants' look on the ground's top
-    // face, the far field's rule, ramped in as B's fade takes the plants.
-    // (coverWeight: the same 2x2 block of columns the far side's cell is,
-    // read as the voxels over them; ramped in across B's fade band.)
-    let dCov = h.t * VOXEL_METERS;
-    if (!isMicro && n.y > 0.5 && m.klass != CLASS_LIQUID && dCov > DETAIL_FADE_START_M) {
-      let b0 = (h.cell & vec3<i32>(~1, ~0, ~1)) + vec3<i32>(0, 1, 0);
-      var nCov = 0.0;
-      var pm = MAT_AIR;
-      for (var k = 3; k >= 0; k--) {
-        let uc = b0 + vec3<i32>(k & 1, 0, k >> 1);
-        if (inBounds(uc)) {
-          let um = voxMat(voxWordAt(uc));
-          if (um != MAT_AIR && (materials[um].flags & MATF_MICRO) != 0u &&
-              matFarPal(&materials, um) != 0u) {
-            nCov += 0.25;
-            pm = um;
-          }
-        }
-      }
-      if (nCov > 0.0) {
-        let cl = coverLook(pm);
-        let ramp = clamp((dCov - DETAIL_FADE_START_M) /
-                         (DETAIL_FADE_END_M - DETAIL_FADE_START_M), 0.0, 1.0);
-        albedo = mix(albedo, cl.rgb * coverBladeLight(rd),
-                     coverWeight(nCov, cl.w, rd) * ramp);
-      }
-    }
+    // (THE COVER TINT used to ramp in here across B's fade band, as the
+    // plants went. Since package F they do not go — they hand over to their
+    // far form, which the far field draws too — and the tint only starts past
+    // the last feature level, far outside the window: see coverWeight.)
 
     // Voxel-scale grain: breaks up the white-noise palette confetti into
     // correlated patches (see surfaceGrain). Liquids are excluded — their state

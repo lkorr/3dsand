@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "gpu/resources.h"
+#include "sim/farfeat.h"
 #include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
 #include "sim/rng.h"
@@ -408,8 +409,10 @@ void World::Init(const rhi::Device& device) {
                         "farSig");
   // Zero-initialised = every entry INVALID (kFarMapValid clear), which is the
   // safe state: the renderer refines nothing it was not told about.
-  farMap = CreateBuffer(device, kFarMapWords * 4, U::Storage | U::CopySrc,
-                        "farMap");
+  // + the FEATURE plane after it (sim/farfeat.h, LOD-seam package F): the
+  // levels 1..kFarFeatLevels thin-feature words, zero = no feature.
+  farMap = CreateBuffer(device, (kFarMapWords + kFarFeatWords) * 4,
+                        U::Storage | U::CopySrc, "farMap");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");

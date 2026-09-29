@@ -1148,10 +1148,13 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
 // cell it patches (an edited level chunk), and that clear must land after the
 // fill it corrects, or a refill would vouch for pristine ground over a crater.
 // A(FarMap) on both rows is what generates that barrier.
+// A(FarVox) A(FarOcc) since LOD-seam package F: a cactus stalk the map
+// raises its column to is also MARKED into the level's cells (farmap), after
+// the sweep wrote them and before the patch rewrites an edited chunk's.
 PASS(farMapFill, "farMapFill", PT_FARFILL, PIPE_FAR_MAP_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) A(FarMap)
-          R(TreeAtlas) R(WorldMap)))
+          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
 // R(FarPatch) lives on THIS row now, not on the sweep: the sweep no longer
 // reads the patch buffer at all, and a read declared where it does not happen
 // is the spurious-barrier direction the checker warns about.
