@@ -1883,6 +1883,7 @@
   <button data-tab="characters">Characters</button>
   <button data-tab="environment">Environment</button>
   <button data-tab="audio">Audio</button>
+  <button data-tab="dialogue">Dialogue</button>
   <span class="tabsep"></span>
   <button data-tab="wiki">Wiki</button>
   <button data-tab="notes">Notes</button>
@@ -2274,6 +2275,10 @@
       <div class="wikibody" id="wikiBody"></div>
     </div>
   </section>
+
+  <!-- DIALOGUE - branching conversations, assets/dialogue/*.json. Built by
+       assets/editor/dialogue.js (PLAN_world_editor P3). -->
+  <section class="view" id="view-dialogue"></section>
 
   <!-- NOTES — markdown pages autosaved to notes/ -->
   <section class="view" id="view-notes">
@@ -2713,7 +2718,7 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
     // wiki and notes render with whatever is loaded, including nothing.
-    if((mat&&rx)||['tuning','models','characters','environment','wiki','notes','engine','alchemy'].includes(activeTab))renderAll();
+    if((mat&&rx)||['tuning','models','characters','environment','wiki','notes','engine','alchemy','dialogue'].includes(activeTab))renderAll();
   });
 });
 // DEEP LINK: ?tab=environment opens a tab; &voxels=1 additionally opens the
@@ -5516,6 +5521,9 @@ function renderAll(){
   // guard too. Its Caves / Ground cover pages want tuning.json as well and
   // degrade to a notice without it.
   if(activeTab==='environment'){envActivate();return;}
+  // Dialogue owns its own DOM and reads assets/dialogue/ through the server;
+  // it needs no JSON loaded at all.
+  if(activeTab==='dialogue'){if(window.__tunerDialogue)window.__tunerDialogue.activate();return;}
   // Characters (the generator + breeding page) owns its own DOM and needs only
   // materials.json (for the .vox palette) and tuning.json (for the two player
   // speeds the gait derivation reads), so it returns before the mat/rx guard
@@ -8820,8 +8828,16 @@ const ARCH_NODES={
     desc:'Player, avatar, mobs, brush, spells, melee, camera — all CPU-side, all reading the one-tick-latent voxel mirror and writing the world only through MutationQueue ops. Rigid-body contact goes through Jolt.',
     files:['src/game/'],
     rule:3,
-    children:['player','avatar','mobSys','aiBehavior','aiNav','animRuntime','brush','spellSys','spellGraph','melee','selfclip','impact','strokes','chargedStrike','combatFx','itemSys','camera','thirdPerson','persistSys']},
+    children:['player','avatar','mobSys','aiBehavior','aiNav','animRuntime','brush','spellSys','spellGraph','melee','selfclip','impact','strokes','chargedStrike','combatFx','itemSys','camera','thirdPerson','persistSys','dialogueSys']},
 
+  dialogueSys:{label:'Dialogue',tag:'cpu',
+    wip:'PLAN_world_editor P3 landed on its branch; P7 wires NPCs (Begin from the use verb / a ref\'s dialogue prop, IsInConversation into the arbiter, the activity hook). No portrait render yet (a monogram slot), no command-layer twin (dialogue.set_line waits for P5), and met is per world, not per player.',
+    desc:'Branching conversations: one JSON graph per assets/dialogue/<name>.json (entries chosen by conditions, nodes with choices, goto / else / continue), world-scoped flags and a met set saved as DLGF in world.sve, a pixel-art conversation panel, and a tuner Dialogue tab with a graph view and validation. Every answer is a TickInput (talk) applied by TickAuthority.',
+    files:['src/game/dialogue.h','src/game/dialogue.cpp','src/ui/dialogue_ui.h','src/ui/dialogue_ui.cpp','src/sim/tickinput.h','assets/dialogue/sample_stranger.json','assets/editor/dialogue.js','assets/editor/dialoguelib.js','scripts/test_dialogue.mjs','src/test/selftest_dialogue.cpp'],
+    sym:['dialogue::Store','dialogue::Begin','dialogue::End','dialogue::TickSession','dialogue::IsInConversation','dialogue::MakeView','dialogue::Library::Validate','TickInput::talk','DrawDialoguePanel'],
+    cst:['tickinput.h  kTickInputVersion','dialogue.h  Store::kSaveVersion'],
+    tst:['dialogue-graph','dialogue-save'],
+    details:'<b>Three layers.</b> CONTENT (the Library, reloaded on R), WORLD (flags + met, one Store per world, TickAuthorityCtx::talk, saved as <code>DLGF</code>), PLAYER (PlayerSession::talk: file, node, speaker, the visible choice list; not saved).<br><br><b>Answers are commands.</b> <code>TickInput::talk</code>: 1..9 = the n-th visible choice, 10 continue, 11 leave. The panel draws a mirror and latches a click; <code>dialogue::TickSession</code>, the first thing TickAuthority does per session, applies it and zeroes a talking player\'s command so nothing walks. The visible list is fixed when the node is entered.<br><br><b>Conditions</b> flag / !flag (+value), time (wraps midnight), activity (a callback P7 supplies; unset = false), has / !has (bag + hotbar), met (this file or another by name). <b>Actions</b> set / add / clear, give / take by item name through the kit, end.<br><br><b>One set of checks, twice.</b> Library::Validate and dialoguelib.js agree: dangling goto, unreachable node, flag written but never read (library-wide), unknown item / key / activity. Shown in game on F1 \u2192 Spawn \u2192 Dialogue and in the tuner under the graph.<br><br><b>Look:</b> <code>--shot-dialogue</code>.'},
   mpReadiness:{label:'Multiplayer readiness',tag:'cpu',
     desc:'The six pieces of debt that grew with every gameplay feature and would have made M9 a rewrite, removed 2026-09-20 on branch mp-land (docs/RESEARCH_multiplayer_readiness.md, docs/PLAN_multiplayer_now.md). The snapshot a gameplay decision reads is a FIXED K=4 ticks old rather than whatever the fence delivered; the player is one TickInput command per tick and the controller runs at kTickDt; the op stream is a framed record with a defined winner for two ops on one cell; the sim tick inputs are integer end to end; one player is a PlayerSession and one tick is TickAuthority; residency takes an InterestSet. NONE of this is networking - it is the debt whose cost was linear in what got built on top of it.',
     files:['src/game/session.h','src/game/session.cpp','src/sim/tickinput.h','src/sim/oprecord.h','src/sim/oprecord.cpp','src/sim/interest.h','src/sim/intmath.h','src/sim/tuningstamp.h','src/sim/wind.h','src/sim/world.h','src/test/support.cpp','assets/shaders/sim_mutate.wgsl','src/net/link.h','src/net/protocol.h','src/net/authority.h','src/net/mobsync.h','src/net/debrissync.h','src/game/remoteplayer.h','assets/shaders/sim_occupancy.wgsl'],
@@ -10864,6 +10880,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'Dialogue: branching conversations, flags, a pixel-art conversation panel and a tuner Dialogue tab',desc:'2026-09-29, PLAN_world_editor P3. <code>assets/dialogue/&lt;name&gt;.json</code> graphs (entries by condition, choices, continue, else) with conditions flag / !flag / time / activity / has / met and actions set / add / clear / give / take / end; world-scoped flags + met saved as <code>DLGF</code> in world.sve; every answer is <code>TickInput::talk</code> applied by TickAuthority, and a talking player cannot walk. The panel is the character screen\'s chrome along the bottom of the screen (1-9, Space, Esc, mouse). Dev hook: F1 \u2192 Spawn \u2192 Dialogue (talk to the nearest creature). Tuner \u2192 Dialogue: file + node lists, graph view, inline editing with dropdowns, validation, save. Gates <code>dialogue-graph</code>, <code>dialogue-save</code>; look with <code>--shot-dialogue</code>. Waiting on P7 to give NPCs their own conversations.'},
     {label:'A charged strike re-aims to the remembered flick; the strike compass shows the charge',desc:'2026-09-28. Normal clicks read the live flick exactly as before (a settled mouse alternates L/R). The picker now also REMEMBERS the last flick over <code>melee.pickMinSpeed</code> (<code>StrikePicker::Remembered</code>, latched in <code>Feed</code>, re-seeded by each press with what it threw), and a CHARGED hold re-aims to that, so a flick while holding stays chosen after the mouse settles. Only a FLICK sets it: a motion over within <code>melee.chargeFlickTicks</code> and at most <code>melee.chargeFlickPx</code>; a longer or bigger one is a camera turn, so a strike charged on the left can be carried round to the right and released there. The motion a press lands in belongs to that press (<code>StrikePicker::Seed</code>), so a hold always starts where the compass pointed at the click. A style may author <code>chargeTwistDeg</code> (per style or per form): extra chest turn eased in while parked; <code>horizontal_l</code> has -20 so a held backhand with the head turned left does not lay the sword arm through the other arm. The strike compass (bottom left, fists too) shows it: ember border while charging, the held spoke in ember growing as the arm slides onto it, the remembered flick as a hollow square on the rim, and CHARGED xN / release to strike. Gate <code>charged-strike</code>.'},
     {label:'Charged strikes: hold the click and the weapon waits at the end of its windup; move the mouse to re-aim it; let go for a 1.5x blow',desc:'2026-09-28, from the owner&rsquo;s request. A strike whose button is still down when its windup ends PARKS there (<code>StrokeCursor::holdWindup</code>, the stroke runner) and keeps tracking the crosshair. While it is held, a flick names another stroke exactly as a press would (<code>FlickStyleFor</code>), and the arm slides from wherever it stands to that stroke&rsquo;s windup end over <code>melee.chargeBlendTicks</code> (15) on QuadInOut (<code>ReaimChargedStroke</code>; the keyed blend re-takes the live arm, so a change of mind mid-slide never snaps). Released, the cut runs from the live arm and every hp of the strike profile is multiplied by <code>melee.chargeDamage</code> (1.5). Player only; per hand (LMB right, RMB left). Gate <code>charged-strike</code>.'},
     {label:'First-person eye rides the head; a crawling body turns slowly',desc:'2026-09-28, owner request. The first-person camera sits at the posed head&rsquo;s eyes (PlayerAvatar::HeadEyeWorld) instead of a fixed height over the collision box, so crawling puts the view on the floor where the head is; eased by avatar.firstPersonHeadHalflife and drawn with the same render offset as the body. While prone the body yaw is rate-limited to avatar.crawlTurnRate (0.8 rad/s) in both camera modes.'},
@@ -11343,6 +11360,20 @@ try{
   console.error('characters tab failed to initialise',e);
   const s=document.querySelector('#view-characters');
   if(s)s.textContent='the character generator failed to load: '+(e.message||e);
+}
+</script>
+<!-- The Dialogue tab (PLAN_world_editor P3): its own module and its own
+     try/catch, for the same reason as the three above. -->
+<script type="module">
+try{
+  const dlg=await import('./editor/dialogue.js');
+  dlg.attach(document.querySelector('#view-dialogue'));
+  window.__tunerDialogue=dlg;
+  if(typeof activeTab!=='undefined'&&activeTab==='dialogue')dlg.activate();
+}catch(e){
+  console.error('dialogue tab failed to initialise',e);
+  const s=document.querySelector('#view-dialogue');
+  if(s)s.textContent='the dialogue editor failed to load: '+(e.message||e);
 }
 </script>
 <script>

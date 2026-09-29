@@ -81,6 +81,9 @@ const std::vector<Gate>& NetGates();
 // The solute layer (docs/PLAN_solutes.md): conservation, the dilution floor,
 // the phase change. Each regenerates worldgen and builds its own stone box.
 const std::vector<Gate>& SoluteGates();
+// Conversations (docs/PLAN_world_editor.md P3): the sample through the real
+// tick, and the flags + met set through a real save/load.
+const std::vector<Gate>& DialogueGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -468,6 +471,10 @@ const char* const kOrder[] = {
     // resets mobs + debris and regenerates at the origin on the way out --
     // so chunk-exchange, which regenerates on entry anyway, inherits nothing.
     "save-material-remap",
+    // Conversations' flags + met through a real SaveWorld/LoadWorld: it
+    // regenerates on the way in and leaves a loaded copy of that world, which
+    // chunk-exchange (next) regenerates over anyway.
+    "dialogue-save",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
@@ -964,6 +971,10 @@ const char* const kOrder[] = {
     // harness window and leaves their marks. Late, where nothing after it
     // places a fixture on the ground it burned (voxregion/worldedit regenerate).
     "spell-hands",
+    // Conversations through the real tick (TickInput::talk). Its rig's body is
+    // a fly-mode camera that walks a few voxels in the control arm; it writes
+    // no voxel.
+    "dialogue-graph",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -991,7 +1002,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

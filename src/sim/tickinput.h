@@ -77,7 +77,21 @@ enum TickButton : uint32_t {
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
 // op record's frame header (sim/oprecord.h) and refused on mismatch.
 // 4: dual wielding — TB_ALT is the left hand, per-hand vessel modes.
-constexpr uint32_t kTickInputVersion = 4;   // 2: TB_THROW, 3: TB_APPLY
+// 5: `talk` (was pad0) — the conversation command (game/dialogue.h).
+constexpr uint32_t kTickInputVersion = 5;   // 2: TB_THROW, 3: TB_APPLY
+
+// THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
+// in the conversation panel is a player INPUT like a strike or a use, so it
+// rides the command and is applied by TickAuthority, never by the panel: a
+// replay or a peer sees the same answer given at the same tick. 1..9 pick the
+// n-th choice the panel SHOWS (the node's visible list, fixed when the node
+// was entered), so the number on the key is the number on the screen.
+enum TalkCommand : int16_t {
+  kTalkNone = 0,
+  // 1..9: choose the n-th visible choice
+  kTalkContinue = 10,  // a node with no choices: "[continue]"
+  kTalkLeave = 11,     // Esc, when the node allows leaving
+};
 
 struct TickInput {
   uint32_t version = kTickInputVersion;
@@ -110,7 +124,8 @@ struct TickInput {
   // and which hotbar slot a brush op or a strike came from.
   int16_t hotbar = -1;
   int16_t tool = -1;
-  int16_t pad0 = 0;
+  // A TalkCommand (above), or kTalkNone. An EDGE: delivered to one tick.
+  int16_t talk = kTalkNone;
 
   // The camera basis AT TICK TIME. flatFwd is the horizontal walk forward,
   // right the horizontal strafe axis, lookFwd the full 3D aim (fly and swim).
@@ -164,6 +179,9 @@ struct TickInputFeeder {
     pend.lookDy += dy;
   }
   void SetStrike(int style) { pend.strikeStyle = (int16_t)style; }
+  // The newest conversation answer since the last tick wins (two keys in one
+  // frame is a fumble, not two answers).
+  void Talk(int code) { pend.talk = (int16_t)code; }
   void SetSelection(int tool, int hotbarSlot) {
     pend.tool = (int16_t)tool;
     pend.hotbar = (int16_t)hotbarSlot;
@@ -178,6 +196,7 @@ struct TickInputFeeder {
     pend.pressed = 0;
     pend.lookDx = pend.lookDy = 0;
     pend.strikeStyle = -1;
+    pend.talk = kTalkNone;
     return out;
   }
 };

@@ -27,6 +27,7 @@ value, alt-tab, press a key.
 | Reactions | `reactions.json` — tag-driven interactions | `R` in game |
 | Tuning | `tuning.json` — 160+ look/feel/sim knobs | `F5` in game |
 | **Models** | `.vox` art + mob sidecar JSONs | restart / respawn the mob |
+| **Dialogue** | `assets/dialogue/*.json` — conversations (§9) | `R` in game |
 
 Ctrl+S saves whichever tab you're on (on Models it saves the model, not the
 JSONs).
@@ -470,3 +471,107 @@ viewport. It stops at 200px, and never shrinks the viewport below 220px.
 - **Save aborted: round-trip failed** — the writer refused to produce a file
   that reads back differently. That's the guard doing its job; report the
   toast text.
+
+---
+
+## 9. Writing a conversation (the Dialogue tab)
+
+A conversation is one file, `assets/dialogue/<name>.json`. The file's NAME is
+what everything calls it: an NPC's `dialogue` property, a `met` condition, the
+in-game picker. The worked example is `sample_stranger.json` — open it first;
+it uses every condition and every action there is.
+
+### The loop
+
+1. Tuner → **Dialogue** tab. Pick a file on the left, or **+ new file**.
+2. Edit (below). The list under the graph shows problems as you type.
+3. **Save** (Ctrl+S). The file is written in a tidy one-line-per-choice
+   layout, so `git diff` shows exactly what you changed.
+4. In the game press **R** — conversations reload with the materials; the
+   world's flags are kept.
+5. F1 → **Spawn** → **Dialogue**: pick the file, then **talk to nearest
+   creature** (anything alive within 12 m speaks the lines — it does not have
+   to be a person) or **talk (no speaker)** to read it through with nobody
+   there. **forget flags + met** puts the world back to "never spoken to
+   anyone" so you can try it from the start. The same section lists any
+   problems with the files, in red (errors) and amber (warnings).
+
+In a conversation: **1-9** or a click picks a choice, **Space/Enter** is
+[continue], **Esc** leaves (unless that line says you may not). You cannot
+walk while talking.
+
+### How a conversation is put together
+
+- **Nodes** are lines. Each has an **id** (unique in the file), the **text**
+  the speaker says, and usually some **choices** — what the player can answer.
+- A **choice** has its text and **leads to** a node. "(end the conversation)"
+  is also a destination.
+- A node with no choice showing gets **[continue]**, which goes where the
+  node's own **"With no choice showing, [continue] goes to"** says — or ends.
+- **Entries** (the file settings, the ⚙ item at the top of the node list)
+  decide where a conversation STARTS: the first entry whose conditions hold
+  wins, so put the special cases first and a plain "start at hello" last.
+- The **speaker** name in the header comes from the node, else the file.
+
+### Conditions ("only if")
+
+A condition row is a dropdown and a value. A choice with conditions is HIDDEN
+unless all of them hold; an entry is skipped; a node you arrive at goes to its
+**otherwise go to** node instead (or ends).
+
+| Condition | Holds when |
+|---|---|
+| `flag` x | flag x is set (non-zero). Put a number after `=` to need exactly that value |
+| `!flag` x | flag x is not set |
+| `time` from–to | the in-game clock is in that range (wraps midnight: 20:00–05:00 is night) |
+| `activity` / `!activity` | the speaker's current schedule row is (not) that activity — sleep, work, wander, socialize, eat, goto. Until NPC schedules exist this is always false |
+| `has` / `!has` item | the player's pack or hotbar holds (at least N of) that item. Worn gear does not count |
+| `met` (this conversation) | the player has finished this conversation before |
+| `met` other_name | the player has finished THAT conversation before — how Agnes knows you spoke to Osric |
+
+### Actions ("do")
+
+Run in order, on arriving at a node or on picking a choice (before it moves on).
+
+| Action | Does |
+|---|---|
+| `set` x = n | flag x becomes n (default 1) |
+| `add` x + n | flag x goes up by n (count visits, favours owed) |
+| `clear` x | flag x is unset |
+| `give` item × n | into the player's pack (the bag, then the hotbar; a full pack refuses) |
+| `take` item × n | out of the pack/hotbar (guard the choice with `has` so it cannot fail) |
+| `end` | the conversation ends after this |
+
+**Flags are world-wide.** A flag set in Wat's conversation is the same flag
+Osric's reads. That is how two NPCs talk about you: Wat's choice does `set
+wat_asked`, and Osric's reply has a choice shown only if `flag wat_asked`.
+Flags and who you have met are saved with the world (F9).
+
+### The graph
+
+Boxes are nodes, in columns by how many steps they are from the start. Blue
+numbered arrows are choices, grey `>` is [continue], dashed red is "otherwise".
+Faint arrows go back to an earlier node (most conversations return to a
+question hub like `ask`). A dashed box is a node nothing leads to. Drag to pan,
+wheel to zoom, **Fit graph** to see everything, click a box to edit it. The
+**→** buttons beside a "leads to" jump to that node.
+
+### What the checks mean
+
+| Message | Fix |
+|---|---|
+| `goes to 'x', which is not a node in this file` | a typo in a destination, or a node you deleted |
+| `cannot be reached from any entry` | nothing leads there; link it or delete it |
+| `flag 'x' is set ... but no condition reads it` | usually a typo in one of the two spellings |
+| `flag 'x' is read ... but nothing sets it` | same, from the other side |
+| `'x' is not an item` | item names are the ones in the Items tab |
+| `unknown condition` / `unknown action` | a typo in the key if you edited the JSON by hand |
+
+A file with an **error** is skipped by the game (every other file still
+loads). Warnings load.
+
+### Editing the JSON by hand
+
+It is plain text; a text editor and R work fine. Keep one choice per line.
+The full schema, with every key, is at the top of `src/game/dialogue.h`.
+`node scripts/test_dialogue.mjs` checks every file the way the tab does.

@@ -267,6 +267,39 @@ def _note_path(name):
     return path
 
 
+# ------------------------------------------------------------- dialogue ----
+# assets/dialogue/<name>.json: one conversation per file (game/dialogue.h).
+# Named, not pathed, like notes: lowercase letters, digits and underscores
+# only, which is also what a mob sidecar or a ref's `dialogue` prop can name.
+_DIALOGUE_OK = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+def dialogue_dir():
+    return os.path.abspath(os.path.join(ASSETS, "dialogue"))
+
+
+def _dialogue_path(name):
+    if not isinstance(name, str) or not name or len(name) > 64:
+        return None
+    if any(c not in _DIALOGUE_OK for c in name):
+        return None
+    root = dialogue_dir()
+    path = os.path.abspath(os.path.join(root, name + ".json"))
+    if os.path.dirname(path) != root:
+        return None
+    return path
+
+
+def _item_names():
+    try:
+        with open(os.path.join(ASSETS, "items", "items.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        rows = d if isinstance(d, list) else d.get("items", [])
+        return [r.get("name") or r.get("id") for r in rows if isinstance(r, dict)]
+    except (OSError, ValueError):
+        return []
+
+
 # ---------------------------------------------------------------- sounds ----
 # assets/sounds/ mirrors src/audio/library.h exactly: a SET is a FOLDER and its
 # files are the variants. The server therefore never invents structure — it
@@ -1495,6 +1528,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "name": name,
                                         "text": f.read()})
 
+        if p == "/api/dialogues":
+            # Every conversation file WITH its text (they are small), plus the
+            # item names the Dialogue tab's dropdowns need.
+            d = dialogue_dir()
+            files = []
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                names = []
+            for n in names:
+                full = os.path.join(d, n)
+                if not n.endswith(".json") or not os.path.isfile(full):
+                    continue
+                with open(full, encoding="utf-8") as f:
+                    files.append({"name": n[:-5], "text": f.read(),
+                                  "mtime": int(os.path.getmtime(full))})
+            return self._json(200, {"ok": True, "dir": d, "files": files,
+                                    "items": _item_names()})
+
         if p == "/api/heightmap":
             return self._heightmap()
         if p == "/api/voxregion":
@@ -1780,6 +1832,46 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "name": name,
                                     "bytes": len(text.encode("utf-8")),
                                     "mtime": int(os.path.getmtime(path))})
+
+        if p == "/api/dialogue":
+            # Save one conversation. The text is written as sent (the tab's
+            # writer is the canonical layout); an old name makes it a rename,
+            # new file first so a failure loses nothing. Press R in the game.
+            name = self._query().get("name", [""])[0]
+            path = _dialogue_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error":
+                                        "a dialogue name is lowercase letters, digits and _"})
+            body = self._body()
+            text = body.get("text")
+            if not isinstance(text, str):
+                return self._json(400, {"ok": False, "error": "no text"})
+            try:
+                json.loads(text)
+            except ValueError as e:
+                return self._json(400, {"ok": False, "error": "not JSON: %s" % e})
+            old = _dialogue_path(body.get("rename")) if body.get("rename") else None
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                if old and old != path and os.path.isfile(old):
+                    os.remove(old)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True, "name": name,
+                                    "mtime": int(os.path.getmtime(path))})
+
+        if p == "/api/dialogue/delete":
+            name = self._query().get("name", [""])[0]
+            path = _dialogue_path(name)
+            if not path or not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "not found"})
+            try:
+                os.remove(path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": repr(e)})
+            return self._json(200, {"ok": True})
 
         # ---- sounds ----
         # The whole point of this group is that dropping a .wav on a slot in

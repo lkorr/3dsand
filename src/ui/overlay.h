@@ -1184,6 +1184,35 @@ struct UIState {
   // What E would do to the thing under the crosshair, or empty. Written by
   // main.cpp's reach ray every frame, drawn by DrawHUD under the crosshair.
   std::string lookPrompt;
+  // ---- THE CONVERSATION PANEL (ui/dialogue_ui.h, game/dialogue.h) ----------
+  // A MIRROR of the primary session's conversation, filled by main.cpp every
+  // frame from dialogue::MakeView. The panel draws it and writes `pick` (a
+  // TalkCommand: 1..9 a choice, 10 continue, 11 leave); main.cpp hands that
+  // to the tick command, and the TICK applies it. The panel never advances a
+  // conversation itself.
+  struct TalkUI {
+    bool open = false;
+    std::string dialogue;
+    std::string speaker;
+    std::string text;
+    std::vector<std::string> choices;
+    bool canContinue = false;
+    bool canLeave = true;
+    uint32_t steps = 0;
+    int pick = 0;      // intent latch, 0 = none
+    int hover = -1;    // which row the mouse is on (drawing only)
+  } talk;
+  // The Spawn page's Dialogue section (the dev hook until P7 wires NPCs).
+  std::vector<std::string> dialogueNames;
+  int dialoguePick = 0;
+  bool dialogueTalkNearest = false;  // talk to the nearest creature (12 m)
+  bool dialogueTalkVoice = false;    // talk with nobody in the world
+  bool dialogueReload = false;
+  bool dialogueResetFlags = false;
+  std::string dialogueStatus;
+  std::vector<std::string> dialogueProblems;  // file / node / field lines
+  std::vector<std::string> dialogueFlags;     // "name = value", then "met: ..."
+
   // RIGHT-CLICK: "put this where it belongs, I do not want to aim." The panel
   // deliberately does NOT pick the destination slot — it has the accepted-kinds
   // mirror and could, but choosing where a piece goes is the equipment system's

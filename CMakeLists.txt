@@ -520,6 +520,9 @@ add_library(sandvox_core OBJECT
   src/game/ai_nav.cpp
   src/game/bodyreg.cpp
   src/game/persist.cpp
+  # Branching conversations: content, flags store, the tick hook
+  # (docs/PLAN_world_editor.md P3, game/dialogue.h).
+  src/game/dialogue.cpp
   src/game/anim.cpp
   src/game/avatar.cpp
   # ONE POSE PIPELINE for NPCs and the player (game/pose.h, W2-L):
@@ -595,6 +598,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_impact.cpp
   src/test/selftest_audio.cpp
   src/test/selftest_net.cpp
+  src/test/selftest_dialogue.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp
@@ -629,6 +633,8 @@ add_library(sandvox_core OBJECT
   # inventory_ui.cpp is a pure drawing function over UIState.
   src/ui/theme.cpp
   src/ui/inventory_ui.cpp
+  # The conversation panel (pixel art, ui/dialogue_ui.h).
+  src/ui/dialogue_ui.cpp
   # spellgraph_ui.cpp is the composer's CANVAS: it draws UIState::spellGraph
   # (main.cpp's mirror of game/spellgraph.h) and turns a gesture into a
   # GraphEditIntent. It applies no op itself.
