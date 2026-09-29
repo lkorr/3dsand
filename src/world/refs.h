@@ -100,6 +100,11 @@ struct Ref {
   // ---- derived at load, never written ----
   std::string group;  // the group file it lives in
   uint32_t hash = 0;  // RefHash(id): what TickInput::useRef carries
+  // A DERIVED ref (P4): a child another ref's kind made (a structure's slot
+  // -> "<instance>/<slot>"). Never in a group file, never editable by the
+  // authoring actions; re-derived whenever its parent or the parent's asset
+  // changes. Empty for every authored ref.
+  std::string derivedFrom;
 };
 
 // FNV-1a 32 of the id. Collisions are detected at load (a warning names both).
@@ -210,6 +215,19 @@ struct RefKind {
   float useRadius = 6.0f;   // how near the look ray must pass usePoint, voxels
   // Bumped when the kind's delta bytes change meaning; carried in the record.
   uint32_t deltaVersion = 1;
+  // ---- P4 (structures) ----
+  // CHILD REFS this ref implies (a structure's slots). Called at load, on
+  // Reload, after every authoring action and on RefreshDerived; the children
+  // are held in the store like any ref (Find, ChildrenOf, activation, deltas)
+  // but never written to a file. Push problems as "<field>: <what>". Optional.
+  std::function<void(const Ref&, std::vector<Ref>& children,
+                     std::vector<std::string>& problems)> derive;
+  // The AUTHORED line of a ref of this kind changed -- placed (before null),
+  // edited, or deleted (after null) -- by an authoring action or an R reload,
+  // whether or not the ref is active. For kinds whose effect is not tied to
+  // activation (a structure is worldgen input and shows at any distance).
+  // Optional.
+  std::function<void(const Ref* before, const Ref* after)> onEdit;
   // ONCE PER TICK, per KIND (not per ref), after activation and the uses, for
   // a kind with moving parts (a door swinging). Must cost ~nothing when
   // nothing of its kind is moving (rule 2). Optional.
@@ -279,6 +297,11 @@ class RefStore {
   // re-applied (Edited), vanished ones Deleted, new ones activate on the next
   // Update. `ctx` reaches the hooks.
   void Reload(RefCtx& ctx);
+  // Re-derive every DERIVED ref (RefKind::derive) from the refs as they are:
+  // an asset a kind derives from changed on disk (structures::Reload). New
+  // children activate on the next Update, changed ones re-apply (Edited),
+  // vanished ones undo (Deleted).
+  void RefreshDerived();
   const std::string& Dir() const { return dir_; }
   const std::string& MapName() const { return map_; }
 
@@ -367,6 +390,11 @@ class RefStore {
   void Activate(RefCtx& ctx, const Ref& r);
   void Deactivate(RefCtx& ctx, const std::string& id, RefEvent why);
   bool ValidateRef(const Ref& r, const std::string& label);
+  // Add every derived child of the authored refs in `refs` (P4).
+  void DeriveInto(std::map<std::string, Ref>& refs, std::vector<std::string>* warn);
+  // Bring refs_'s derived children in line with its authored refs.
+  void SyncDerived(bool warn);
+  void NoteEdit(const Ref* before, const Ref* after);
 
   std::string assetDir_, map_, dir_;
   std::map<std::string, RefGroupFile> groups_;

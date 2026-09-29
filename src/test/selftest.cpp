@@ -88,6 +88,7 @@ const std::vector<Gate>& DialogueGates();
 const std::vector<Gate>& RefsGates();
 // NPC residents (docs/PLAN_world_editor.md P7, world/refs_npc.h).
 const std::vector<Gate>& NpcGates();
+const std::vector<Gate>& StructureGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -575,6 +576,15 @@ const char* const kOrder[] = {
     // found (both move the window to the harness origin to meet the fixture).
     "refs-activate",
     "refs-npc-identity",
+    // STRUCTURE INSTANCES (PLAN_world_editor.md P4). Same exit contract as
+    // the refs gates: they install houses on the harness map through the
+    // structure override, and on the way out clear it, reload the
+    // environment and regenerate the window at the origin they found.
+    "structure-stamp",
+    "structure-reload",
+    // Derived doors / chests / beds are P6's kinds: cycles two doors through
+    // the tick and restores the window, like door-cycle.
+    "structure-door",
     // P6 doors: same exit contract as refs-npc-identity (it builds a doorway
     // at absolute coordinates, saves and loads, and regenerates on the way
     // out). container-persist is CPU-only and could go anywhere.
@@ -1025,7 +1035,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

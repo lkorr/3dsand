@@ -108,6 +108,15 @@ class FarField {
   // farfield.cpp. An empty set is a no-op for the same reason Update's is.
   void FullRefill(const InterestSet& interest);
 
+  // Re-fill, on every level, just the level chunks that overlap a world VOXEL
+  // box (inclusive) and are inside that level's current box -- plus each
+  // touched column's surface-map entry. What an edited structure's re-apply
+  // (sandvox::ApplyStructureChanges) needs instead of a FullRefill: a house
+  // is a few level chunks per level, the full refill is ~15 s of fogged
+  // horizon. Queued like a plane (not a reset), so no face goes pending.
+  // Returns the entries queued.
+  uint32_t RefillBox(IVec3 loVox, IVec3 hiVox);
+
   size_t PendingFills() const {
     size_t n = 0;
     for (uint32_t k = 0; k < kFarLevels; k++) n += queue_[k].size();

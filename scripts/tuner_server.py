@@ -1707,6 +1707,31 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self._json(200, {"ok": True, "maps": maps})
+        if p == "/api/structures/usedby":
+            # Which maps place structure `name` (PLAN_world_editor P4): every
+            # `structure` ref in assets/worldmap/*/refs/*.json whose base is it.
+            # The same question world/structures.cpp UsedBy answers in C++.
+            name = (self._query().get("name") or [""])[0]
+            uses = []
+            try:
+                for m in sorted(os.listdir(WORLDMAP_DIR)):
+                    rd = os.path.join(WORLDMAP_DIR, m, "refs")
+                    if not os.path.isdir(rd):
+                        continue
+                    for fn in sorted(os.listdir(rd)):
+                        if not fn.endswith(".json"):
+                            continue
+                        try:
+                            with open(os.path.join(rd, fn), encoding="utf-8") as f:
+                                g = json.load(f)
+                        except (OSError, ValueError):
+                            continue
+                        for r in g.get("refs", []) if isinstance(g, dict) else []:
+                            if isinstance(r, dict) and r.get("kind") == "structure" and r.get("base") == name:
+                                uses.append(m + ": " + str(r.get("id")))
+            except OSError:
+                pass
+            return self._json(200, {"ok": True, "name": name, "uses": uses})
         if p == "/api/worldmap/check":
             return self._mapcheck()
         if p == "/api/worldmap/sculpt":

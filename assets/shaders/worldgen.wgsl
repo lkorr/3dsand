@@ -1356,11 +1356,13 @@ const WM_S_PRESET        : u32 = 8u;    // water site: 1 + preset index
 const WM_S_PAD_Y         : u32 = 9u;    // pad / stamp / tree site: bare ground at the centre (baked)
 const WM_S_SPECIES       : u32 = 10u;   // tree site: atlas species index
 const WM_S_VARIANT       : u32 = 11u;   // tree site: 1 + variant, 0 = rolled
+const WM_S_SINK          : u32 = 12u;   // stamp site: template rows below pad top + 1 (P4 footing)
 const WM_SITE_STAMP      : u32 = 1u;
 const WM_SITE_WATER      : u32 = 2u;    // an authored lake (worldmap.h kSiteWater)
 const WM_SITE_TREE       : u32 = 3u;    // one authored tree (worldmap.h kSiteTree, P6)
 const WM_SITE_ROT_ROLLED : u32 = 4u;    // a tree site's kS_Rot when the map did not turn it
-const WM_SITE_CELL_MAX   : u32 = 4u;    // sites per cell list (the loader refuses more)
+const WM_SITE_CELL_MAX   : u32 = 32u;   // sites per cell list (the loader refuses more)
+const WM_STAMP_SINK_MAX  : i32 = 8;     // deepest kS_Sink (worldmap.h kStampSinkMax)
 const WM_SITE_TREE_KEEP_OUT : u32 = 6u; // a tree site's trunk keep-out, Chebyshev voxels
 const WM_STAMP_HDR_WORDS : u32 = 4u;
 const WM_STAMP_NX        : u32 = 0u;
@@ -1744,7 +1746,9 @@ fn wmPadSiteAt(x : i32, z : i32) -> u32 {
 }
 // The template voxel this world cell would carry, MAT_AIR if none: the
 // stamp's footprint is centred on the site, its bottom row sits one above
-// the pad height (`padY`, sitePadY: the same baked height sitePadAt levels to).
+// the pad height (`padY`, sitePadY: the same baked height sitePadAt levels to)
+// minus the site's SINK -- a structure ref's footing, the rows of its asset
+// below GRADE (PLAN_world_editor P4; 0 for every map.json stamp).
 fn wmStampCell(sid : u32, x : i32, y : i32, z : i32, padY : i32) -> u32 {
   let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
   if (blk == 0u) { return MAT_AIR; }
@@ -1753,7 +1757,7 @@ fn wmStampCell(sid : u32, x : i32, y : i32, z : i32, padY : i32) -> u32 {
   let nz = i32(worldMap[blk + WM_STAMP_NZ]);
   let lx = x - (wmSiteI(sid, WM_S_X) - nx / 2);
   let lz = z - (wmSiteI(sid, WM_S_Z) - nz / 2);
-  let ly = y - padY - 1;
+  let ly = y - padY - 1 + wmSiteI(sid, WM_S_SINK);
   if (lx < 0 || lz < 0 || ly < 0 || lx >= nx || lz >= nz || ly >= ny) { return MAT_AIR; }
   let ci = worldMap[blk + WM_STAMP_COLUMNS] + u32(lz * nx + lx) * 2u;
   let runOff = worldMap[ci];
@@ -1781,7 +1785,7 @@ fn wmSiteTopAt(x : i32, z : i32) -> i32 {
     let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
     if (blk == 0u) { continue; }
     if (max(abs(x - wmSiteI(sid, WM_S_X)), abs(z - wmSiteI(sid, WM_S_Z))) > wmSiteI(sid, WM_S_RADIUS)) { continue; }
-    top = max(top, sitePadY(sid) + 1 + i32(worldMap[blk + WM_STAMP_NY]));
+    top = max(top, sitePadY(sid) + 1 - wmSiteI(sid, WM_S_SINK) + i32(worldMap[blk + WM_STAMP_NY]));
   }
   return top;
 }
@@ -4384,8 +4388,11 @@ fn genCellIn(col : ptr<function, Col>,
   // One read for the common case (no site); in a site's cells, each listed
   // stamp's column of runs. Non-air template voxels replace whatever the
   // terrain and cover put here; template air leaves the world alone, so a
-  // stamp is a building on the ground, not a box cut out of it.
-  if (y > h - 2) {
+  // stamp is a building on the ground, not a box cut out of it. The band
+  // reaches WM_STAMP_SINK_MAX further down for a structure's footing (P4):
+  // a sunk row lands at pad top + 1 - sink >= h - 7, and a stamp with no
+  // sink returns MAT_AIR there, so the extra rows change nothing else.
+  if (y > h - 2 - WM_STAMP_SINK_MAX) {
     let sm = wmStampsCell(x, y, z);
     if (sm != MAT_AIR) { mat = sm; }
   }

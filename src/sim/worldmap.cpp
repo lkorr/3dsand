@@ -24,6 +24,7 @@
 #include "sim/tuning.h"
 #include "sim/voxload.h"
 #include "sim/world.h"
+#include "world/structures.h"   // P4: the map's `structure` refs become stamp sites
 
 using nlohmann::json;
 
@@ -1114,6 +1115,96 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       }
     }
   }
+  // ---- structure refs (PLAN_world_editor P4, world/structures.h) -------------
+  // The map's `structure` refs, read from its refs group files (the SAME parse
+  // the RefStore uses) -- or the gates' override -- each one a stamp site:
+  // the asset's voxels packed at the ref's quarter turn, centred so the
+  // asset's ORIGIN lands on the ref's pos, the pad levelled to the AUTHORED
+  // floor (pos.y - 1) and the footing sunk `origin.y` rows into it. After
+  // the map.json sites (a hand-placed map site wins an overlap, as the
+  // earlier site in the table always has) and BEFORE the rules, so a rolled
+  // crypt keeps its minSpacing from a house. A structure that cannot be
+  // placed (no asset, a yaw that is not a quarter turn, a scale mismatch) is
+  // a warning naming the ref and the file, and the world boots without it:
+  // one stale house must not stop the world.
+  {
+    std::vector<StructurePlacement> placements;
+    std::vector<std::string> swarn;
+    if (StructureOverrideActive()) {
+      placements = *StructureOverrideSlot();
+    } else {
+      structures::ReadPlacements(assetDir, name, placements, swarn);
+    }
+    for (const std::string& w : swarn) warn(w);
+    std::map<std::string, structures::Asset> assets;   // one load per base
+    for (const StructurePlacement& sp : placements) {
+      const std::string who = sp.file + ": " + sp.id + ": ";
+      if (!structures::ValidYaw(sp.yaw)) {
+        warn(who + "yaw: " + std::to_string(sp.yaw) +
+             " is not a quarter turn (0, 90, 180, 270); structures only turn in 90-degree "
+             "steps in this slice -- structure not placed");
+        continue;
+      }
+      auto it = assets.find(sp.base);
+      if (it == assets.end()) {
+        structures::Asset a;
+        std::string err;
+        std::vector<std::string> aw;
+        if (!structures::LoadAsset(assetDir, sp.base, true, a, err, aw)) {
+          for (const std::string& w : aw) warn(w);
+          warn(who + "base: " + err + " -- structure not placed");
+          continue;
+        }
+        for (const std::string& w : aw) warn(w);
+        it = assets.emplace(sp.base, std::move(a)).first;
+      }
+      const structures::Asset& a = it->second;
+      if (a.voxelsPerMetre != 0 && a.voxelsPerMetre != kVoxelsPerMetre) {
+        warn(who + "base: \"" + sp.base + "\" was built at " + std::to_string(a.voxelsPerMetre) +
+             " voxels/m and this world is " + std::to_string(kVoxelsPerMetre) +
+             " -- re-bake it (scripts/bake_structure.mjs); structure not placed");
+        continue;
+      }
+      const structures::Frame f = structures::MakeFrame(a, IVec3{sp.x, sp.y, sp.z}, sp.yaw);
+      WorldMapData::StampSite st;
+      st.id = sp.id;
+      st.templateName = "structures/" + sp.base;
+      st.kind = kSiteStamp;
+      st.structure = true;
+      st.base = sp.base;
+      st.refX = sp.x; st.refY = sp.y; st.refZ = sp.z; st.refYaw = sp.yaw;
+      st.x = f.siteX;
+      st.z = f.siteZ;
+      st.rot = f.rot;
+      st.padMargin = sp.padMargin > 0 ? std::clamp(sp.padMargin, 1, 64) : kStructurePadMargin;
+      st.salt = 0;
+      st.padY = sp.y - 1;   // the AUTHORED floor: ground top is one below GRADE
+      st.sink = f.sink;
+      if (st.sink > static_cast<int>(kStampSinkMax)) {
+        warn(who + "base: \"" + sp.base + "\" has " + std::to_string(st.sink) +
+             " rows below its origin; only " + std::to_string(kStampSinkMax) +
+             " can sink into the ground -- the lowest rows are not drawn");
+        st.sink = static_cast<int>(kStampSinkMax);
+      }
+      if (!PackStamp(a.prefab, st.rot, st, log)) return false;
+      st.radius = std::max(st.nx, st.nz) / 2 + 1;
+      out.sites.push_back(std::move(st));
+    }
+    if (!placements.empty())
+      std::printf("world map: '%s' %zu structure ref(s) -> stamp sites\n", name.c_str(), placements.size());
+    // What the save fingerprint / env stamp sees: the placements and every
+    // placed asset's bytes (folded into contentHash below, only when any).
+    uint32_t sh = 0;
+    for (const auto& [b, a] : assets) sh = (sh ^ a.contentHash) * 16777619u;
+    for (const StructurePlacement& sp : placements) {
+      const std::string k = sp.id + "|" + sp.base + "|" + std::to_string(sp.x) + "," +
+                            std::to_string(sp.y) + "," + std::to_string(sp.z) + "|" +
+                            std::to_string(sp.yaw) + "|" + std::to_string(sp.padMargin);
+      sh = FnvBytes(sh == 0 ? 2166136261u : sh, reinterpret_cast<const uint8_t*>(k.data()), k.size());
+    }
+    out.structureHash = sh;
+  }
+
   // ---- the water table for the CPU twin (worldmap.h WorldMapData::water) ----
   // The same WaterGeomOf / PackWaterRows the packer runs, kept here so
   // World::TerrainHeight reads the integers the shader reads.
@@ -1378,8 +1469,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   {
     WorldMapData prev = std::move(Slot());
     Slot() = out;
-    for (WorldMapData::StampSite& st : out.sites)
+    for (WorldMapData::StampSite& st : out.sites) {
+      if (st.structure) continue;   // the AUTHORED floor, set above (P4)
       st.padY = st.kind == kSiteWater ? 0 : BareGroundHeight(st.x, st.z, seed);
+    }
     Slot() = std::move(prev);
   }
   // A tree at or above the treeline does not grow (worldgen.wgsl siteTree:
@@ -1398,6 +1491,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   }
   // Only when the file exists, so a map without one reports what it did.
   if (!sculptRaw.empty()) hsh = FnvBytes(hsh, sculptRaw.data(), sculptRaw.size());
+  // ...and the structure refs, only when there are any, for the same reason.
+  if (out.structureHash != 0) {
+    const uint32_t sh = out.structureHash;
+    hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(&sh), sizeof sh);
+  }
   out.contentHash = hsh;
   return true;
 }
@@ -1408,6 +1506,10 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   j["ok"] = ok;
   j["map"] = name;
   j["sites"] = static_cast<int>(m.sites.size());
+  int nStruct = 0;
+  for (const WorldMapData::StampSite& s : m.sites) nStruct += s.structure ? 1 : 0;
+  j["structures"] = nStruct;           // P4: structure refs placed as sites
+  j["siteCellMax"] = static_cast<int>(kSiteCellMax);
   j["warnings"] = m.warnings;
   j["error"] = error;
   return j.dump();
@@ -1474,6 +1576,7 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
     r[kS_PadY] = U(s.padY);
     r[kS_Species] = U(s.species);
     r[kS_Variant] = U(s.variant);
+    r[kS_Sink] = U(s.sink);
     if (s.kind != kSiteStamp || s.words.empty()) continue;   // a water site has no block
     // The stamp block: rebase its relative offsets (column dir + run offsets)
     // onto the buffer as it is appended.
@@ -1499,6 +1602,25 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
               map.name.c_str(), map.width, map.height, 1 << map.cellLog2,
               map.originCellX, map.originCellZ, map.palette.size(), W[kHContentHash]);
   return true;
+}
+
+namespace {
+std::vector<StructurePlacement>& OverrideList() {
+  static std::vector<StructurePlacement> v;
+  return v;
+}
+bool& OverrideOn() {
+  static bool on = false;
+  return on;
+}
+}  // namespace
+void SetStructureOverride(const std::vector<StructurePlacement>* list) {
+  OverrideOn() = list != nullptr;
+  OverrideList() = list ? *list : std::vector<StructurePlacement>{};
+}
+bool StructureOverrideActive() { return OverrideOn(); }
+const std::vector<StructurePlacement>* StructureOverrideSlot() {
+  return OverrideOn() ? &OverrideList() : nullptr;
 }
 
 const WorldMapData& CurrentWorldMap() { return Slot(); }

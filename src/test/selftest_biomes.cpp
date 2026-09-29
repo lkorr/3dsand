@@ -183,17 +183,20 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
   } else if (loaded) {
     bad.push_back("D: a tree site did not load");
   }
-  // Overflow: five sites reaching one cell refuse the load, naming the cell.
+  // Overflow: kSiteCellMax + 1 sites reaching one cell refuse the load,
+  // naming the cell. (Was five against a cap of 4; the world editor's P4
+  // raised the cap to 32 for a village, so the crowd follows the constant.)
   {
     nlohmann::json jo = base;
-    for (int k = 0; k < 5; k++)
+    const int crowd = static_cast<int>(worldmap::kSiteCellMax) + 1;
+    for (int k = 0; k < crowd; k++)
       jo["sites"].push_back({{"id", "p6_crowd_" + std::to_string(k)}, {"kind", "tree"}, {"species", sp->name},
-                             {"at", {15000 + k * 40, 15000}}});
+                             {"at", {14400 + k * 20, 15000}}});
     worldmap::WorldMapData over;
     std::string olog, ot = jo.dump();
     const bool refused = !worldmap::LoadWorldMap(dir, real.name, set, c.mats.size(), kDefaultSeed, over, olog, &ot);
     say(refused && olog.find("at most") != std::string::npos,
-        "D: five sites in one cell did not refuse the load (" + olog + ")");
+        "D: " + std::to_string(crowd) + " sites in one cell did not refuse the load (" + olog + ")");
   }
 
   // E. The tree on the GPU.

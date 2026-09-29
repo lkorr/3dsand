@@ -31,6 +31,11 @@
 #include "sim/currentprim.h"
 #include "sim/trample.h"
 #include "sim/solutes.h"
+#include "sim/stream.h"   // ApplyStructureChanges: Stream::RegenerateChunks
+
+#include <map>
+#include <set>
+#include <tuple>
 
 namespace sandvox {
 
@@ -2367,6 +2372,98 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
   // to. The caller's SubmitWorldgen queues it and re-seeds the far field.
   LoadWorldEditLayerForMap(assetDir);
   stamp = biomes::StampEnvironment(assetDir, mapName, worldmap::CurrentWorldMap().editLayer);
+  return true;
+}
+
+bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
+                           FarField* far, const std::vector<MaterialDef>& mats,
+                           biomes::EnvironmentStamp& stamp, StructureReapply& rep) {
+  (void)world;
+  using Site = worldmap::WorldMapData::StampSite;
+  std::map<std::string, Site> before;
+  for (const Site& s : worldmap::CurrentWorldMap().sites)
+    if (s.structure) before[s.id] = s;
+  if (!ReloadEnvironment(ctx, sim, mats, stamp, rep.log)) return false;
+  std::map<std::string, Site> after;
+  for (const Site& s : worldmap::CurrentWorldMap().sites)
+    if (s.structure) after[s.id] = s;
+  auto same = [](const Site& a, const Site& b) {
+    return a.x == b.x && a.z == b.z && a.padY == b.padY && a.rot == b.rot && a.sink == b.sink &&
+           a.radius == b.radius && a.padMargin == b.padMargin && a.words == b.words;
+  };
+  // The widest tree: a trunk the OLD footprint kept out may stand in the new
+  // gap, crown and all (and one the new footprint refuses must go).
+  int treeReach = 0, treeAbove = 0;
+  {
+    std::vector<TreeSpeciesHeader> hs;
+    std::string tl;
+    if (ReadTreeSpeciesHeaders(AssetDir() + "/trees", hs, tl))
+      for (const TreeSpeciesHeader& h : hs) {
+        treeReach = std::max(treeReach, h.reach);
+        treeAbove = std::max(treeAbove, h.above);
+      }
+  }
+  // What a changed site can have changed, and so the box to regenerate:
+  //  - its voxels and its pad: the footprint + ramp (radius + padMargin);
+  //  - everything genChunk derives from the column's ground height h under
+  //    the pad: the skin and subsoil just below it, and the near-surface
+  //    cavern band, which follows h down to h - 100 (caveBands: h - vlen(40)
+  //    - up to vlen(60)); so the box reaches 128 below the lower of the bare
+  //    ground and the pad;
+  //  - trees, ONLY when the footprint itself moved or resized (the lattice
+  //    keeps trunks off it, siteBlocksTrunk): a trunk the old footprint kept
+  //    out may stand now and one the new footprint refuses must go, crown
+  //    and all -- the widest reach sideways, the tallest tree upward. An
+  //    asset edit in place keeps the footprint, and that is the common case
+  //    (P5's save), so it does not pay for the forest.
+  const int belowGround = (128 * kVoxelsPerMetre) / 10;
+  auto boxOf = [&](const Site& s, bool trees) {
+    const int r = s.radius + s.padMargin + (trees ? treeReach : 0) + 1;
+    IVec3 lo{s.x - r, 0, s.z - r}, hi{s.x + r, 0, s.z + r};
+    // The ground the pad cuts or fills, sampled over the box (the bare
+    // ground: what the terrain is without this or any pad).
+    int gMin = s.padY, gMax = s.padY;
+    for (int j = 0; j <= 4; j++)
+      for (int i = 0; i <= 4; i++) {
+        const int g = worldmap::BareGroundHeight(lo.x + (hi.x - lo.x) * i / 4,
+                                                 lo.z + (hi.z - lo.z) * j / 4, kDefaultSeed);
+        gMin = std::min(gMin, g);
+        gMax = std::max(gMax, g);
+      }
+    lo.y = gMin - std::max(belowGround, (int)worldmap::kStampSinkMax + 16);
+    hi.y = std::max(s.padY + 1 - s.sink + s.ny, gMax + (trees ? treeAbove : 0)) + 16;
+    return std::make_pair(lo, hi);
+  };
+  std::set<std::string> ids;
+  for (const auto& [id, s] : before) ids.insert(id);
+  for (const auto& [id, s] : after) ids.insert(id);
+  for (const std::string& id : ids) {
+    auto b = before.find(id);
+    auto a = after.find(id);
+    if (b != before.end() && a != after.end() && same(b->second, a->second)) continue;
+    rep.changed.push_back(id);
+    const bool footprintSame = b != before.end() && a != after.end() &&
+                               b->second.x == a->second.x && b->second.z == a->second.z &&
+                               b->second.radius == a->second.radius &&
+                               b->second.padMargin == a->second.padMargin;
+    if (b != before.end()) rep.boxes.push_back(boxOf(b->second, !footprintSame));
+    if (a != after.end()) rep.boxes.push_back(boxOf(a->second, !footprintSame));
+  }
+  // Every chunk of every box, once, in a fixed order (the gen list is part
+  // of the op record: a pure function of the boxes).
+  std::set<std::tuple<int, int, int>> seen;
+  std::vector<IVec3> chunks;
+  for (const auto& [lo, hi] : rep.boxes)
+    for (int cz = lo.z >> 4; cz <= (hi.z >> 4); cz++)
+      for (int cy = lo.y >> 4; cy <= (hi.y >> 4); cy++)
+        for (int cx = lo.x >> 4; cx <= (hi.x >> 4); cx++)
+          if (seen.insert({cz, cy, cx}).second) chunks.push_back({cx, cy, cz});
+  if (!chunks.empty()) rep.chunks = stream.RegenerateChunks(chunks, &rep.dropped);
+  if (far != nullptr)
+    for (const auto& [lo, hi] : rep.boxes) rep.farEntries += far->RefillBox(lo, hi);
+  std::printf("structures: re-applied %zu changed structure(s): %u chunks regenerated, %u "
+              "stored edits dropped, %u far fills\n",
+              rep.changed.size(), rep.chunks, rep.dropped, rep.farEntries);
   return true;
 }
 

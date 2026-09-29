@@ -14,6 +14,7 @@
 // respawns -- and adds the schedule, the walking graph and the talk.
 
 #include "world/refs.h"
+#include "world/structures.h"
 
 namespace refs {
 
@@ -46,8 +47,9 @@ void RegisterAllKinds() {
   RegisterP1Kinds();
   // ---- later packages: one line each, AFTER P1 (a later registration of the
   // same name replaces the earlier one) ----
-  // RegisterStructureKinds();   // P4
   RegisterDoorKinds();           // P6: door, container, bed
+  // P4 after P6: a structure derives door/container/bed CHILD refs
+  structures::RegisterStructureKinds();   // P4: structure (world/structures.h)
   RegisterResidentKinds();       // P7: npc, waynode
 }
 

@@ -307,6 +307,10 @@ void RefStore::Warn(const std::string& w) {
 
 bool RefStore::ValidateRef(const Ref& r, const std::string& label) {
   const RefKind* k = Kinds().Find(r.kind);
+  // A derived child of a kind this build does not know yet (a door before P6)
+  // is inert by design: one warning per slot of every house would bury the
+  // list. Its parent's line is what a person edits anyway.
+  if (k == nullptr && !r.derivedFrom.empty()) return false;
   if (k == nullptr) {
     Warn(label + ": " + r.id + ": kind: \"" + r.kind +
          "\" is not a kind this build knows; kept as written, inert");
@@ -394,6 +398,87 @@ RefStore::~RefStore() {
   for (auto f : GoneHooks()) f(this);
 }
 
+void RefStore::DeriveInto(std::map<std::string, Ref>& refs, std::vector<std::string>* warn) {
+  std::vector<std::string> parents;
+  for (const auto& [id, r] : refs)
+    if (r.derivedFrom.empty()) parents.push_back(id);   // id order
+  for (const std::string& pid : parents) {
+    const Ref& p = refs.at(pid);
+    const RefKind* k = Kinds().Find(p.kind);
+    if (k == nullptr || !k->derive) continue;
+    std::vector<Ref> kids;
+    std::vector<std::string> problems;
+    k->derive(p, kids, problems);
+    const std::string at = "refs/" + p.group + ".json: " + p.id + ": ";
+    if (warn)
+      for (const std::string& pr : problems) warn->push_back(at + pr);
+    for (Ref& c : kids) {
+      c.derivedFrom = p.id;
+      c.group = p.group;
+      c.hash = RefHash(c.id);
+      std::string why;
+      if (!ValidId(c.id, &why)) {
+        if (warn) warn->push_back(at + "slot child \"" + c.id + "\": " + why + "; skipped");
+        continue;
+      }
+      if (refs.count(c.id)) {
+        if (warn)
+          warn->push_back(at + "slot child \"" + c.id + "\" has the id of another ref; the "
+                          "other one is kept and this slot is inert");
+        continue;
+      }
+      refs[c.id] = std::move(c);
+    }
+  }
+}
+
+void RefStore::SyncDerived(bool warn) {
+  std::map<std::string, Ref> fresh;
+  for (const auto& [id, r] : refs_)
+    if (r.derivedFrom.empty()) fresh[id] = r;
+  std::vector<std::string> w;
+  DeriveInto(fresh, warn ? &w : nullptr);
+  for (const std::string& x : w) Warn(x);
+  for (auto it = refs_.begin(); it != refs_.end();) {
+    auto f = fresh.find(it->first);
+    if (!it->second.derivedFrom.empty() && (f == fresh.end() || f->second.derivedFrom.empty())) {
+      graveyard_[it->first] = it->second;
+      deltas_.erase(it->first);
+      reapply_.erase(it->first);
+      retry_.erase(it->first);
+      it = refs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto& [id, r] : fresh) {
+    if (r.derivedFrom.empty()) continue;
+    auto old = refs_.find(id);
+    if (old == refs_.end()) {
+      refs_[id] = r;
+      ValidateRef(r, "refs/" + r.group + ".json");
+    } else if (RefLine(old->second) != RefLine(r) || old->second.derivedFrom != r.derivedFrom) {
+      if (active_.count(id) && !prev_.count(id)) prev_[id] = old->second;
+      old->second = r;
+      reapply_.insert(id);
+    }
+  }
+  Index();
+  haveOrigin_ = false;
+}
+
+void RefStore::RefreshDerived() {
+  SyncDerived(true);
+  revision_++;
+}
+
+void RefStore::NoteEdit(const Ref* before, const Ref* after) {
+  const RefKind* ka = after ? Kinds().Find(after->kind) : nullptr;
+  const RefKind* kb = before ? Kinds().Find(before->kind) : nullptr;
+  if (ka != nullptr && ka->onEdit) ka->onEdit(before, after);
+  if (kb != nullptr && kb != ka && kb->onEdit) kb->onEdit(before, after);
+}
+
 void RefStore::LoadMap(const std::string& assetDir, const std::string& mapName) {
   assetDir_ = assetDir;
   map_ = mapName;
@@ -413,6 +498,7 @@ void RefStore::LoadMap(const std::string& assetDir, const std::string& mapName) 
   haveOrigin_ = false;
   std::vector<std::string> warn;
   ReadDir(dir_, groups_, groupOrder_, refs_, warn);
+  DeriveInto(refs_, &warn);
   for (const std::string& w : warn) Warn(w);
   for (const auto& [id, r] : refs_) ValidateRef(r, "refs/" + r.group + ".json");
   Index();
@@ -427,6 +513,18 @@ void RefStore::Reload(RefCtx& ctx) {
   std::map<std::string, Ref> refs;
   std::vector<std::string> warn;
   ReadDir(dir_, groups, order, refs, warn);
+  DeriveInto(refs, &warn);
+  // What changed in the AUTHORED lines, for the kinds that care whether or
+  // not the ref is active (RefKind::onEdit; a structure is worldgen input).
+  std::vector<std::pair<Ref, Ref>> edits;   // (before, after); empty id = none
+  for (const auto& [id, r] : refs_) {
+    if (!r.derivedFrom.empty()) continue;
+    auto n = refs.find(id);
+    if (n == refs.end()) edits.push_back({r, Ref{}});
+    else if (RefLine(n->second) != RefLine(r)) edits.push_back({r, n->second});
+  }
+  for (const auto& [id, r] : refs)
+    if (r.derivedFrom.empty() && !refs_.count(id)) edits.push_back({Ref{}, r});
   // Vanished refs: undo now (we still hold their old line), forget the delta.
   for (auto it = refs_.begin(); it != refs_.end(); ++it) {
     if (refs.count(it->first)) continue;
@@ -452,6 +550,8 @@ void RefStore::Reload(RefCtx& ctx) {
   Index();
   haveOrigin_ = false;   // force the next Update to look at everything
   revision_++;
+  for (const auto& [b, a] : edits)
+    NoteEdit(b.id.empty() ? nullptr : &b, a.id.empty() ? nullptr : &a);
   std::printf("refs: reloaded '%s': %zu ref(s), %zu to re-apply, %zu warning(s)\n",
               map_.c_str(), refs_.size(), reapply_.size(), warnings_.size());
 }
@@ -744,7 +844,16 @@ bool RefStore::Upsert(const Ref& in, std::string* err, int fileIndex) {
   }
   Ref r = in;
   r.hash = RefHash(r.id);
+  r.derivedFrom.clear();
   auto old = refs_.find(r.id);
+  if (old != refs_.end() && !old->second.derivedFrom.empty()) {
+    if (err)
+      *err = r.id + " is a slot of " + old->second.derivedFrom +
+             " (derived from its structure asset, never written to a file): edit the "
+             "structure, or place a separate ref";
+    return false;
+  }
+  const Ref before = old != refs_.end() ? old->second : Ref{};
   r.group = old != refs_.end() ? old->second.group : GroupOfId(r.id);
   if (old == refs_.end()) {
     for (const auto& [h, id] : byHash_)
@@ -777,8 +886,10 @@ bool RefStore::Upsert(const Ref& in, std::string* err, int fileIndex) {
   ValidateRef(r, "refs/" + r.group + ".json");
   Index();
   if (old != refs_.end() || active_.count(r.id)) reapply_.insert(r.id);
+  SyncDerived(false);
   haveOrigin_ = false;
   revision_++;
+  NoteEdit(before.id.empty() ? nullptr : &before, &refs_[r.id]);
   return true;
 }
 
@@ -789,7 +900,14 @@ bool RefStore::Erase(const std::string& id, std::string* err, Ref* removed,
     if (err) *err = "no ref \"" + id + "\"";
     return false;
   }
+  if (!it->second.derivedFrom.empty()) {
+    if (err)
+      *err = id + " is a slot of " + it->second.derivedFrom +
+             " (derived from its structure asset): delete the structure, or edit its asset";
+    return false;
+  }
   const std::string group = it->second.group;
+  const Ref before = it->second;
   if (removed) *removed = it->second;
   graveyard_[id] = it->second;
   refs_.erase(it);
@@ -806,8 +924,10 @@ bool RefStore::Erase(const std::string& id, std::string* err, Ref* removed,
   reapply_.erase(id);
   retry_.erase(id);
   if (!WriteGroupFile(group, err)) return false;
+  SyncDerived(false);
   Index();
   revision_++;
+  NoteEdit(&before, nullptr);
   return true;
 }
 

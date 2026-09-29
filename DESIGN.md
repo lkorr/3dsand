@@ -18754,6 +18754,121 @@ one-undo drag, reroll, cutaway, save, both halves of the hand-edit guard;
 `--shot out.png --structure samples/smithy --clean` for a picture), and
 `check_environment.sh` (the page mounts in the shell and deep-links).
 
+## 9f. Structure instances: a `structure` ref places a house (added 2026-09-29)
+
+`docs/PLAN_world_editor.md` §2.2 / P4. Code: `src/world/structures.{h,cpp}`
+(asset load + material remap, the transform, slot derivation, the kind, the
+re-apply request), `worldmap.cpp` (structure refs -> stamp sites),
+`sandvox::ApplyStructureChanges` (`test/support.cpp`, the live re-apply),
+`Stream::RegenerateChunks`, `ChunkStore::Erase`, `FarField::RefillBox`, the
+References page's "place a structure" (`ui/refs_ui.cpp`). Gates:
+`structure-stamp`, `structure-reload`. How-to: `docs/EDITOR_GUIDE.md` §12.
+
+```jsonc
+{ "id": "harrowby/smithy", "kind": "structure", "base": "samples/smithy",
+  "pos": [x, y, z], "yaw": 90, "props": { "padMargin": 12 } }
+```
+
+**A placed structure is worldgen input, not a mutation.** Each `structure`
+ref becomes a `kSiteStamp` site in the map's site table — the authored-`.vox`
+overlay the map overhaul built for `map.json` stamps (`wmStampCell`), so a house
+is in the near field AND every far cascade, is never saved, and regenerates
+identically; player damage is an ordinary chunk edit. That is also why rule 3
+is not bent: nothing writes voxels, the generator does (a snapshot restore).
+
+**The placement contract.** `pos` IS the asset's `origin` (P2: `[footprint
+centre x, GRADE, footprint centre z]` in the .vox's occupied-box frame).
+`MakeFrame` is the one place a world coordinate of a placed structure is
+computed: the packer's quarter turn (`YawToRot`: heading 0 = the asset's +Z
+front, 90 = +X; RotXZ turns the other way, so rot = 4 - yaw/90), the site
+centre chosen so worldgen's `S_X - nx/2 + column` lands the rotated origin on
+`pos`, and **`kS_Sink` = origin.y** — the footing rows below GRADE sink into
+the pad (`wmStampCell` `ly = y - padY - 1 + sink`, `wmSiteTopAt` lowers the top
+the same, genCell overlays from `h - 2 - WM_STAMP_SINK_MAX`). **The pad is the
+AUTHORED floor**: `padY = pos.y - 1` (ground top one below GRADE), not the
+baked `BareGroundHeight` a `map.json` stamp gets; `props.padMargin` (default
+`kStructurePadMargin` 12) is the ramp back. `yaw` not a multiple of 90 is a
+load warning naming the ref and the house is not placed (validate says the
+same on the References page); a missing asset or a voxel size that disagrees
+with `kVoxelsPerMetre` likewise. **Materials remap by NAME**: the struct.json's
+`materials` map (name -> id as written) against `materials.json`'s order; a
+renumbered id is a warning and remapped, a vanished name drops its voxels.
+
+**Ordering: both sides read the same files, independently.** `LoadWorldMap`
+calls `structures::ReadPlacements` (the SAME `refs::ParseGroup`) on
+`worldmap/<map>/refs/*.json` before any `RefStore` exists, so boot, F7,
+`ReloadEnvironment`, `--voxserve`, `--mapcheck` (now `"structures"`,
+`"siteCellMax"` in its JSON) and the save fingerprint (`structureHash`
+folded into `contentHash` only when there are structures — the default map's
+hash does not move) all see the houses with no new call order. The harness
+map's refs dir (the refs gates' fixture) has no structure refs; gates place
+houses through `worldmap::SetStructureOverride`. Structures sit after the
+`map.json` sites (an overlap's winner stays the hand-placed site) and before
+the rules (a rolled stamp keeps its spacing from a house). **`kSiteCellMax` is
+32** (was 4): a village of ~10 houses plus its well, trees and lake in one
+102 m cell. The lists walk their own `n`, so an empty cell still costs one read.
+
+**Edits reach worldgen through a request, applied between ticks.** The
+`structure` kind's `onEdit` hook (new in `RefKind`: an AUTHORED line changed
+by Place/Move/SetProp/SetField/Delete or an R reload, active or not — a house
+a kilometre off is in the far field) and its `activate` (a site-table
+mismatch, `SiteInSync`) call `structures::RequestReapply`; `structures::Reload
+(store, name)` (an asset re-saved — P5's save calls it) re-derives the slots
+and requests too. The frame loop takes it next to F7 and runs
+`ApplyStructureChanges`: `ReloadEnvironment` (so the site table is rebuilt from
+the files), a DIFF of the structure sites before/after (position, pad, turn,
+sink, radius, margin and the packed words — an asset edit is found by
+content), and for each changed id its old and new box — footprint + pad ramp,
+from 12.8 m below the lower of the bare ground and the pad (the near-surface
+cavern band follows the column's h down to h - 10 m) up to the house top; and,
+only when the FOOTPRINT moved or resized (not for an asset edited in place),
+widened by the widest tree's reach and raised by the tallest tree, since the
+lattice keeps trunks off a footprint — regenerated through
+`Stream::RegenerateChunks`: FillSlots' own gen path (genChunk, page verdict,
+wake, edit-layer re-queue, the op record's gen list), with the chunks' STORED
+copies dropped first (`ChunkStore::Erase`), because the stored copy of an
+edited chunk is the old house. That is the documented price: an authoring
+re-apply resets play edits inside the house's box, and counts them. The far
+field re-fills the same boxes per level (`FarField::RefillBox`, queued like a
+plane with a face-less record — not a 15 s FullRefill). `structure-reload`
+holds the result to a from-scratch worldgen of the new state, word for word.
+
+**Slots are derived child refs** (`RefKind::derive`, new): `<instance>/<slot>`
+with the slot's kind, `pos` through the frame, `yaw` + the instance's, box
+props (`leaf`, `box`: `{min, max}`) and `hingeLine` (cell corners) transformed
+to world, `links` to child ids, plus `slot` and `structure` props. They live in
+the `RefStore` (`Find`, `ChildrenOf`, activation, deltas — a door's "open" is a
+delta on `harrowby/smithy/door_front_0`), are never written to a group file,
+are refused by every authoring action ("edit the structure"), and are
+re-derived on load, Reload, every authoring action and `RefreshDerived`. A
+child of a kind this build lacks (waynode before P7) is inert WITHOUT a warning
+per slot.
+
+**Slots speak P6.** P2's slot vocabulary is translated into P6's kinds in two
+named functions, geometrically, so the two packages' differing "left/right"
+words never meet. `DoorFromSlot`: swing heading = the slot's (outward) yaw +
+180 for `opens: in`; thickness = the leaf box's extent along the swing,
+width across it, height in y; the hinge END is whichever end of the width the
+P2 `hingeLine` sits on; `pos` = that end's bottom cell in the leaf's FRONT
+layer (the face toward the swing); P6's `hinge` is the word whose `along`
+(`HeadingAxis(yaw+90)` for "left") points from that end across the leaf. The
+result reproduces the slot's leaf box AND hinge line exactly under
+`refs::DoorGeometry` (asserted, both yaws, by `structure-door`). `BedFromSlot`:
+yaw = slot yaw + 180 (P6 is head -> foot), the head cell = the mattress top
+one inside the frame box's head-end layer (P2's headboard), length = the box
+extent minus that layer. Chests pass through (`items` is already P6's shape).
+The P2 `leaf`, `hingeLine`, `box`, `opens`, `wall` props stay on the child for
+reference; `hinge` is overwritten with P6's meaning.
+
+**Known gaps.** Arbitrary yaw (by design, this slice). The re-apply box does
+not reach a rolled tarn whose centre fell in/out of a footprint (the harness pad
+and any village keep-out make this rare; F7 fixes it). The far-field EDIT index
+(`FarEdits`) still holds cells a player edited inside a re-applied box until
+the next load. Solutes kept for a regenerated chunk are not cleared. The op
+record carries the regenerated gen list but not the environment reload, so
+`ops-replay` of a session with a live structure edit diverges (as with F7).
+"open in editor" is P5's.
+
 ## 10. Networking — the model of record (decided 2026-09-10)
 
 Until 2026-09-10 this section said "both classic models are viable, decide at
@@ -20333,7 +20448,9 @@ id and field, listed on the References page. The harness map's
 
 **Kinds are a registry** (`refs::Kinds()`, `RefKind`): validate / activate
 (→ Done or Retry) / deactivate(event) / flushDelta / usePrompt / usePoint /
-onUse / useRadius / deltaVersion. A package adds its kinds with one line in
+onUse / useRadius / deltaVersion, and since P4 `derive` (child refs a ref
+implies — a structure's slots, held in the store but never written; §9f) and
+`onEdit` (the authored line changed, active or not). A package adds its kinds with one line in
 `refs::RegisterAllKinds()` (`refs_kinds.cpp`); a later registration of the same
 name replaces the earlier (P7's `npc` over P1's temporary one). An unknown kind
 is a load warning and the ref stays inert. P1 ships `marker` (inert,

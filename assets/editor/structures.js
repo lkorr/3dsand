@@ -418,6 +418,35 @@ function paintMode() {
     ? 'showing the file <b>on disk</b>: ' + esc(where) + badge + ' — move any slider to regenerate'
     : 'showing the <b>generated</b> scaffold (seed ' + seed + ')' + (name ? ' for ' + esc(where) + badge : '') + (dirty ? ' · <span class="warn">unsaved</span>' : ''));
   els.save.disabled = !(dirty || mode === 'generated') || !name;
+  paintUsedBy();
+}
+
+// "used by": which maps place this structure (a `structure` ref whose base is
+// it, world-editor P4). One request per selected name, cached; the in-game
+// References page is where a house is placed.
+const usedByCache = new Map();
+function paintUsedBy() {
+  if (!els.mode || !name) return;
+  const show = (uses) => {
+    if (!els.mode) return;
+    const txt = uses.length
+      ? 'used by ' + uses.map(esc).join(', ')
+      : 'not placed on any map yet (in game: F1 → World → References → place a structure)';
+    let sp = els.mode.querySelector('.' + CLS + 'usedby');
+    if (!sp) {
+      sp = document.createElement('div');
+      sp.className = CLS + 'usedby';
+      sp.style.opacity = '0.75';
+      els.mode.append(sp);
+    }
+    sp.innerHTML = txt;
+  };
+  if (usedByCache.has(name)) { show(usedByCache.get(name)); return; }
+  const n = name;
+  fetch('/api/structures/usedby?name=' + encodeURIComponent(n), {cache: 'no-store'})
+    .then((r) => (r.ok ? r.json() : {uses: []}))
+    .then((j) => { usedByCache.set(n, j.uses || []); if (n === name) show(j.uses || []); })
+    .catch(() => {});
 }
 
 function paintList() {

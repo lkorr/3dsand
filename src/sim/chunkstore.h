@@ -67,6 +67,10 @@ class ChunkStore {
   // Pointer is valid only until the next Put/Get/Clear: either may LRU-spill
   // the region that owns it. Use immediately.
   const std::vector<uint32_t>* Get(IVec3 wc);
+  // Forget one stored chunk (RAM, and the region file on the next Flush), so
+  // the next refill regenerates it. False if there was none. The live re-apply
+  // of an edited structure (Stream::RegenerateChunks) is the one caller.
+  bool Erase(IVec3 wc);
 
   // Forget everything in RAM and detach from any bound directory. Files are
   // left on disk untouched (a regen must not destroy the last explicit save;
