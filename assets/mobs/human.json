@@ -845,7 +845,17 @@
         "armL.L",
         "armU.R",
         "armL.R",
-        "torso"
+        "torso",
+        "head",
+        "hips",
+        "hand.L",
+        "hand.R",
+        "legU.L",
+        "legL.L",
+        "foot.L",
+        "legU.R",
+        "legL.R",
+        "foot.R"
       ],
       "tracks": {
         "armU.L": {
