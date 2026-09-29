@@ -103,6 +103,12 @@ const CSS = `
 async function load() {
   try {
     const r = await fetch('/api/dialogues');
+    // A 404 here is a server older than this tab, most often a frozen
+    // sandvox_tuner.exe built before the route existed; say so instead of
+    // failing to parse its plain-text "not found".
+    if (r.status === 404) throw new Error('this tuner server is older than the Dialogue tab. ' +
+      'Rebuild the app with "python scripts/build_tuner_exe.py" (close the tuner first), ' +
+      'or run "python scripts/tuner_server.py" instead');
     const j = await r.json();
     st.items = j.items || [];
     st.files = (j.files || []).map(f => {

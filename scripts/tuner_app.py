@@ -66,6 +66,9 @@ def main():
         return 2
 
     import tuner_server as ts
+    # Where the server THOUGHT the project was (PyInstaller's temp dir once
+    # frozen); every module-level path it built hangs off this.
+    import_root = ts.ROOT
     # Point the server at the resolved root rather than its own file location,
     # which is wrong once frozen.
     ts.ROOT = root
@@ -76,19 +79,14 @@ def main():
     # listed no maps for exactly that reason.
     ts.WORLDEDIT_DIR = os.path.join(ts.ASSETS, "worldedits")
     ts.WORLDMAP_DIR = os.path.join(ts.ASSETS, "worldmap")
-    # REBUILT, NOT PATCHED, and that is a standing hazard: this dict is a second
-    # copy of tuner_server.WRITABLE and the two silently drift. `items` was
-    # missing here for exactly that reason -- the browser could save items.json
-    # and the packaged app could not, with no error either side. Derive the keys
-    # from the module rather than retyping them, so a new writable file is added
-    # once.
-    ts.WRITABLE = {
-        "materials": os.path.join(ts.MATDIR, "materials.json"),
-        "reactions": os.path.join(ts.MATDIR, "reactions.json"),
-        "tuning": os.path.join(ts.MATDIR, "tuning.json"),
-        "items": os.path.join(ts.ASSETS, "items", "items.json"),
-    }
+    # WRITABLE is DERIVED from the module's own dict (re-rooted), never
+    # retyped: a hand-kept copy here drifted once already (`items` could be
+    # saved from the browser and silently not from the packaged app).
+    ts.WRITABLE = {k: os.path.join(root, os.path.relpath(v, import_root))
+                   for k, v in ts.WRITABLE.items()}
     ts.EXE = os.path.join(root, "build", "Release", "sandvox.exe")
+    ts.VOXCACHE = os.path.join(root, "build", "voxcache")
+    ts.VOXTMP = os.path.join(root, "build", "voxtmp")
 
     port = free_port()
     from http.server import ThreadingHTTPServer
