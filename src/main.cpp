@@ -9964,6 +9964,20 @@ int main(int argc, char** argv) {
     const bool harnessInput = HarnessTicksPerFrame() > 0;
     if (captured && !g_fellSiteSet && !harnessInput)
       cam.ApplyMouse((float)(mx - mx0), (float)(my - my0));
+    // CRAWLING LOCKS THE VIEW TO THE BODY (avatar.crawlLookYaw). Looking no
+    // longer turns a crawling body (ResolveAvatarHeading), so the view is
+    // held within a cone either side of it instead of looking through it.
+    // Camera yaw -> rig heading is h = pi/2 - yaw.
+    if (camMode == CameraMode::First && avatar.Spawned() &&
+        avatar.LocoGroundAlign() >= 0.5f) {
+      const float lim =
+          CurrentTuning().avatar.crawlLookYaw * (3.14159265f / 180.0f);
+      float off = (1.5707963f - cam.yaw) - avatarHeading;
+      while (off > 3.14159265f) off -= 6.2831853f;
+      while (off < -3.14159265f) off += 6.2831853f;
+      if (std::fabs(off) > lim)
+        cam.yaw = 1.5707963f - (avatarHeading + std::copysign(lim, off));
+    }
     // The look delta is ACCUMULATED into the tick command (N2) rather than
     // delivered to a consumer here: the mouse is sampled per frame, and the
     // strike picker integrates one whole tick's pixels at kTickDt inside the

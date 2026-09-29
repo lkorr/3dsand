@@ -541,6 +541,10 @@ struct Tuning {
     // the floor drags itself round slowly instead of pivoting like a
     // standing one. Blended in by how prone the pose is.
     float crawlTurnRate = TPD(avatar, crawlTurnRate);
+    // While crawling in first person the VIEW is locked to this many degrees
+    // either side of the body, and looking never turns the body; it turns by
+    // crawling toward where it is going (ResolveAvatarHeading).
+    float crawlLookYaw = TPD(avatar, crawlLookYaw);
     // Half-life (seconds) of the FIRST-PERSON eye following the posed HEAD.
     // The head is posed once per 30 Hz tick; this eases the eye between
     // poses so it tracks the head (a crawl puts it near the floor, out in

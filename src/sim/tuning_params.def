@@ -1428,6 +1428,8 @@ TP_F(avatar, velocityHalflife, NO_WGSL, 0.08f, 0.0f, 0.5f)
 TP_F(avatar, firstPersonTurnHalflife, NO_WGSL, 0.05f, 0.0f, 0.3f)
 // Radians/sec. The floor keeps a prone body from never turning at all.
 TP_F(avatar, crawlTurnRate, NO_WGSL, 0.8f, 0.05f, 40.0f)
+// Degrees either side of the body. 180 = no lock.
+TP_F(avatar, crawlLookYaw, NO_WGSL, 100.0f, 10.0f, 180.0f)
 // Seconds. 0 = the eye snaps to the head every frame (30 Hz steps).
 TP_F(avatar, firstPersonHeadHalflife, NO_WGSL, 0.05f, 0.0f, 0.5f)
 // 0 is meaningful (body always faces the camera, the old behaviour); the
