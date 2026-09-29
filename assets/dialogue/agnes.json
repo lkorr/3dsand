@@ -1,0 +1,79 @@
+{
+  "name": "agnes",
+  "speaker": "Agnes",
+  "canLeave": true,
+  "notes": "Alewife; her cottage is the alehouse. Reads everyone else's threads (met + flags) and comments on them. Gives a flask once (agnes_gave).",
+  "entry": [
+    { "if": [ { "activity": "sleep" } ], "goto": "asleep" },
+    { "if": [ { "met": true } ], "goto": "again" },
+    { "goto": "hello" }
+  ],
+  "nodes": [
+    {
+      "id": "hello",
+      "text": "Come in, come in, and let the door shut behind you, it lets the flies in. You'll be the stranger. Everyone's talking about you. Well, I'm talking about you, which here is the same thing.",
+      "goto": "ask"
+    },
+    {
+      "id": "again",
+      "text": "There you are. Sit, sit.",
+      "goto": "ask"
+    },
+    {
+      "id": "ask",
+      "text": "Now. What'll it be?",
+      "choices": [
+        { "text": "Something to drink?", "goto": "drink", "if": [ { "!flag": "agnes_gave" } ] },
+        { "text": "Osric's decided about Wat.", "goto": "wat_yes", "if": [ { "flag": "osric_decided", "value": 1 } ] },
+        { "text": "I spoke to Osric about Wat.", "goto": "wat_no", "if": [ { "flag": "osric_decided", "value": 2 } ] },
+        { "text": "Edric told me about the lights.", "goto": "lights", "if": [ { "flag": "edric_lights" }, { "!flag": "agnes_lights" } ] },
+        { "text": "What do you make of Maud?", "goto": "maud", "if": [ { "met": "maud" } ] },
+        { "text": "What do you make of Osric?", "goto": "osric", "if": [ { "met": "osric" } ] },
+        { "text": "Who's who, here?", "goto": "who", "if": [ { "!met": "maud" }, { "!met": "osric" } ] },
+        { "text": "Goodbye." }
+      ]
+    },
+    {
+      "id": "drink",
+      "text": "First one's free. The second one I'll remember.",
+      "do": [ { "give": "flask", "count": 1 }, { "set": "agnes_gave" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "wat_yes",
+      "text": "Is it true? Osric's taking our Wat on? At dawn? That boy hasn't seen a dawn since the one he was born in. Oh, bless you.",
+      "goto": "ask"
+    },
+    {
+      "id": "wat_no",
+      "text": "Osric told me what you said about Wat. Honest. Not kind. He'll get over it. I might not.",
+      "goto": "ask"
+    },
+    {
+      "id": "lights",
+      "text": "He's been at you about his lights, has he. He's not wrong, mind. I've seen them from my back window. I don't tell Maud. She'd only argue, and then she'd be right, and then where would we be.",
+      "do": [ { "set": "agnes_lights" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "maud",
+      "text": "Sharp as a nail and twice as useful. Don't borrow her book without asking. Don't borrow it with asking either.",
+      "goto": "ask"
+    },
+    {
+      "id": "osric",
+      "text": "Kind man, underneath. You have to dig a long way, mind, and he'll hand you the shovel and watch.",
+      "goto": "ask"
+    },
+    {
+      "id": "who",
+      "text": "Edric farms, Maud runs Edric, Osric hits things, I pour, and Wat helps me pour. Mostly into himself.",
+      "goto": "ask"
+    },
+    {
+      "id": "asleep",
+      "text": "We're closed. Come back when the sun's up.",
+      "do": [ { "end": true } ]
+    }
+  ]
+}

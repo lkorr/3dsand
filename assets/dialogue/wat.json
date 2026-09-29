@@ -1,0 +1,88 @@
+{
+  "name": "wat",
+  "speaker": "Wat",
+  "canLeave": true,
+  "notes": "Agnes's grandson, 16. Starts the apprenticeship thread (sets wat_asked); pays it off with a crooked dagger (osric_decided = 1) or sulks (= 2).",
+  "entry": [
+    { "if": [ { "activity": "sleep" } ], "goto": "asleep" },
+    { "if": [ { "flag": "osric_decided", "value": 1 }, { "!flag": "wat_thanked" } ], "goto": "thanks" },
+    { "if": [ { "flag": "osric_decided", "value": 2 }, { "!flag": "wat_sulked" } ], "goto": "sulk" },
+    { "if": [ { "met": true } ], "goto": "again" },
+    { "goto": "hello" }
+  ],
+  "nodes": [
+    {
+      "id": "hello",
+      "text": "Oh! Hello. You're new. You're not from Stowe, are you? Everyone from Stowe is awful.",
+      "choices": [
+        { "text": "Who are you?", "goto": "who" },
+        { "text": "What do you do here?", "goto": "do" },
+        { "text": "Goodbye." }
+      ]
+    },
+    {
+      "id": "again",
+      "text": "Oh, it's you. Hello again.",
+      "goto": "ask"
+    },
+    {
+      "id": "who",
+      "text": "Wat. Agnes is my gran. I help her with the barrels. Well. I'm near the barrels.",
+      "goto": "ask"
+    },
+    {
+      "id": "do",
+      "text": "Nothing, mostly. That's the problem.",
+      "goto": "dream"
+    },
+    {
+      "id": "ask",
+      "text": "Anyway.",
+      "choices": [
+        { "text": "What would you rather be doing?", "goto": "dream", "if": [ { "!flag": "wat_asked" } ] },
+        { "text": "About Osric...", "goto": "nag", "if": [ { "flag": "wat_asked" }, { "!flag": "osric_told" } ] },
+        { "text": "Goodbye." }
+      ]
+    },
+    {
+      "id": "dream",
+      "text": "I want to be a smith. Like Osric. Proper work, with fire. He says I'm too soft. Would you... put in a word? He might listen to someone who's been places.",
+      "choices": [
+        { "text": "I'll talk to him.", "goto": "promise", "do": [ { "set": "wat_asked" } ] },
+        { "text": "Ask him yourself.", "goto": "yourself" }
+      ]
+    },
+    {
+      "id": "promise",
+      "text": "Really? Thanks! Don't tell him I asked. No, do tell him. Tell him I'm keen. I am keen.",
+      "goto": "ask"
+    },
+    {
+      "id": "yourself",
+      "text": "I have. Four times. He just hands me a broom.",
+      "goto": "ask"
+    },
+    {
+      "id": "nag",
+      "text": "Have you asked him yet? Go on, he's at the forge. Or the alehouse. He's always one or the other.",
+      "goto": "ask"
+    },
+    {
+      "id": "thanks",
+      "text": "He said yes! Dawn tomorrow! I've never seen a dawn on purpose. Here, I made this on the sly at the back of the forge. It's a bit crooked. It's yours.",
+      "do": [ { "give": "dagger", "count": 1 }, { "set": "wat_thanked" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "sulk",
+      "text": "Gran says you told Osric I was idle. ...I am idle. That's the worst part.",
+      "do": [ { "set": "wat_sulked" } ],
+      "goto": "ask"
+    },
+    {
+      "id": "asleep",
+      "text": "Nnh. Five more minutes.",
+      "do": [ { "end": true } ]
+    }
+  ]
+}

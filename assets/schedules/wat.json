@@ -1,0 +1,12 @@
+{
+  "about": "Wat, sixteen. Sleeps late, drifts round the green, spends every afternoon loitering in the smithy yard watching Osric (tag smithy_yard), evenings at his gran's.",
+  "rows": [
+    {"from": "23:00", "to": "08:00", "do": "sleep", "at": "bed"},
+    {"from": "08:00", "to": "09:00", "do": "eat", "at": "home"},
+    {"from": "09:00", "to": "12:00", "do": "wander", "at": "green", "radius": 6},
+    {"from": "12:00", "to": "13:00", "do": "eat", "at": "home"},
+    {"from": "13:00", "to": "17:00", "do": "socialize", "at": "smithy_yard", "radius": 2},
+    {"from": "17:00", "to": "18:00", "do": "wander", "at": "green", "radius": 6},
+    {"from": "18:00", "to": "23:00", "do": "socialize", "at": "alehouse", "radius": 3}
+  ]
+}

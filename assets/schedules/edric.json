@@ -1,0 +1,12 @@
+{
+  "about": "Edric Cotter, farmer. The field edge by day (his `work` is a marker at the edge of the barley, facing the treeline); the alehouse after supper.",
+  "rows": [
+    {"from": "22:00", "to": "06:00", "do": "sleep", "at": "bed"},
+    {"from": "06:00", "to": "07:00", "do": "eat", "at": "home"},
+    {"from": "07:00", "to": "12:00", "do": "work", "at": "work"},
+    {"from": "12:00", "to": "13:00", "do": "eat", "at": "home"},
+    {"from": "13:00", "to": "19:00", "do": "work", "at": "work"},
+    {"from": "19:00", "to": "21:00", "do": "socialize", "at": "alehouse", "radius": 3},
+    {"from": "21:00", "to": "22:00", "do": "wander", "at": "home", "radius": 2}
+  ]
+}

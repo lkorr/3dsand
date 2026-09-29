@@ -1,0 +1,12 @@
+{
+  "about": "Agnes, alewife. Brews all day at her trestle (`work`), serves in the evening at the same spot: her cottage IS the alehouse. Goes to the well once, late afternoon.",
+  "rows": [
+    {"from": "22:00", "to": "06:00", "do": "sleep", "at": "bed"},
+    {"from": "06:00", "to": "08:00", "do": "eat", "at": "home"},
+    {"from": "08:00", "to": "12:00", "do": "work", "at": "work"},
+    {"from": "12:00", "to": "13:00", "do": "eat", "at": "home"},
+    {"from": "13:00", "to": "17:00", "do": "work", "at": "work"},
+    {"from": "17:00", "to": "18:00", "do": "socialize", "at": "well", "radius": 2},
+    {"from": "18:00", "to": "22:00", "do": "work", "at": "work"}
+  ]
+}

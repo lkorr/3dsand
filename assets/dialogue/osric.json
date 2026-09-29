@@ -1,0 +1,104 @@
+{
+  "name": "osric",
+  "speaker": "Osric",
+  "canLeave": true,
+  "notes": "Smith, ex-soldier. Thread 1: Wat's apprenticeship (reads wat_asked; the player's word sets osric_told and osric_decided, 1 = vouched, 2 = called him idle). Thread 2: the battle on the ridge (reads edric_burial / maud_bones, sets osric_battle).",
+  "entry": [
+    { "if": [ { "activity": "sleep" } ], "goto": "asleep" },
+    { "if": [ { "activity": "socialize" } ], "goto": "evening" },
+    { "if": [ { "met": true } ], "goto": "again" },
+    { "goto": "hello" }
+  ],
+  "nodes": [
+    {
+      "id": "hello",
+      "text": "Forge is hot. Mind your sleeves.",
+      "goto": "ask"
+    },
+    {
+      "id": "again",
+      "text": "You again.",
+      "goto": "ask"
+    },
+    {
+      "id": "evening",
+      "text": "Not at the forge now. Sit, or leave. No shop talk.",
+      "choices": [
+        { "text": "About Wat...", "goto": "wat", "if": [ { "flag": "wat_asked" }, { "!flag": "osric_told" } ] },
+        { "text": "Just sitting.", "do": [ { "end": true } ] }
+      ]
+    },
+    {
+      "id": "ask",
+      "text": "What?",
+      "choices": [
+        { "text": "You're the smith?", "goto": "smith" },
+        { "text": "Wat wants to learn the trade.", "goto": "wat", "if": [ { "flag": "wat_asked" }, { "!flag": "osric_told" } ] },
+        { "text": "Edric thinks something's out at the treeline.", "goto": "battle", "if": [ { "flag": "edric_burial" }, { "!flag": "osric_battle" } ] },
+        { "text": "Maud says you fought on the ridge.", "goto": "battle", "if": [ { "flag": "maud_bones" }, { "!flag": "edric_burial" }, { "!flag": "osric_battle" } ] },
+        { "text": "Goodbye." }
+      ]
+    },
+    {
+      "id": "smith",
+      "text": "Only one for a day's walk. Horseshoes, hinges, nails.",
+      "choices": [
+        { "text": "And before that?", "goto": "soldier" },
+        { "text": "Something else.", "goto": "ask" }
+      ]
+    },
+    {
+      "id": "soldier",
+      "text": "Things with edges. Different lord, different war. Now: hinges.",
+      "goto": "ask"
+    },
+    {
+      "id": "wat",
+      "text": "Did he send you? Course he did.",
+      "choices": [
+        { "text": "He's keen. He'd work hard for you.", "goto": "wat_good", "do": [ { "set": "osric_told", "value": 1 } ] },
+        { "text": "Give him a chance. Waiting only makes him lazier.", "goto": "wat_good", "do": [ { "set": "osric_told", "value": 1 } ] },
+        { "text": "Honestly? He seems idle.", "goto": "wat_bad", "do": [ { "set": "osric_told", "value": 2 } ] }
+      ]
+    },
+    {
+      "id": "wat_good",
+      "text": "Keen. He's keen on sleeping till the bell and eating his gran's bread. ...He's in my yard every afternoon, though. Watching. I'll grant him that. Tell him dawn, tomorrow. Late once and he's done.",
+      "do": [ { "set": "osric_decided", "value": 1 } ],
+      "goto": "ask"
+    },
+    {
+      "id": "wat_bad",
+      "text": "Aye. That's what I told him. Kind of you to say it plain.",
+      "do": [ { "set": "osric_decided", "value": 2 } ],
+      "goto": "ask"
+    },
+    {
+      "id": "battle",
+      "text": "People should mind their own fields.",
+      "choices": [
+        { "text": "Something is out there.", "goto": "battle2" },
+        { "text": "I'll drop it.", "goto": "ask" }
+      ]
+    },
+    {
+      "id": "battle2",
+      "text": "Eleven years back there was a fight on that ridge. We buried them where they fell, both sides, no priest. Shallow, because we were tired and it was raining. That's all I'll say.",
+      "do": [ { "set": "osric_battle" } ],
+      "choices": [
+        { "text": "Could they be... walking?", "goto": "walking" },
+        { "text": "Thank you for telling me.", "goto": "ask" }
+      ]
+    },
+    {
+      "id": "walking",
+      "text": "Don't be daft. ...Keep a blade close, all the same.",
+      "goto": "ask"
+    },
+    {
+      "id": "asleep",
+      "text": "The door was shut for a reason.",
+      "do": [ { "end": true } ]
+    }
+  ]
+}

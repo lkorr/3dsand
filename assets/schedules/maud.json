@@ -1,0 +1,14 @@
+{
+  "about": "Maud Cotter. Runs the longhouse (her `work` is the hearth); fetches water at the well morning and evening, which is where she hears everything Agnes does not.",
+  "rows": [
+    {"from": "22:00", "to": "06:00", "do": "sleep", "at": "bed"},
+    {"from": "06:00", "to": "08:00", "do": "work", "at": "work"},
+    {"from": "08:00", "to": "09:00", "do": "socialize", "at": "well", "radius": 2},
+    {"from": "09:00", "to": "12:00", "do": "work", "at": "work"},
+    {"from": "12:00", "to": "13:00", "do": "eat", "at": "home"},
+    {"from": "13:00", "to": "17:00", "do": "work", "at": "work"},
+    {"from": "17:00", "to": "18:00", "do": "socialize", "at": "well", "radius": 2},
+    {"from": "18:00", "to": "21:00", "do": "work", "at": "work"},
+    {"from": "21:00", "to": "22:00", "do": "wander", "at": "home", "radius": 2}
+  ]
+}
