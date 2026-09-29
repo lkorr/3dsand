@@ -45,6 +45,7 @@
     "ledgeBoostSpeed": 5.25,
     "ledgeMantleSpeed": 1.5,
     "ledgeMantleTime": 2.8,
+    "ledgeClimbTime": 1.9,
     "ledgeSettleSpeed": 4.5,
     "ledgeShimmySpeed": 0.8,
     "ledgePullDelay": 0.25,

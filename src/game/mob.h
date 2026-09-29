@@ -3592,6 +3592,11 @@ class Mob {
   void ApplyAirArms(const AnimSkeleton& sk, AnimState& st);
   void ApplyHangArms(const PoseInputs& in, float dt, const AnimSkeleton& sk,
                      AnimState& st);
+  // The ledge climb (pose.cpp): the drive and torso lean BEFORE the flatten,
+  // the legs AFTER the leg IK. The arms are ApplyHangArms, kept on the lip.
+  void UpdateClimbDrive(const PoseInputs& in, float dt);
+  void ApplyClimbLean(const AnimSkeleton& sk, AnimState& st);
+  void ApplyClimbLegs(const AnimSkeleton& sk, AnimState& st);
   // The LIVE half of AddBodyVelocity / BodyVelocity: whichever integrator the
   // DRIVER runs. An NPC's is its ballistic state; the avatar overrides both to
   // reach Player::vel.

@@ -122,6 +122,12 @@ struct PoseInputs {
   bool hangActive = false;
   IVec3 hangLip{};       // the held lip voxel, world
   Vec3 hangDir{1, 0, 0};  // horizontal facing at grab time, toward the wall
+  // The ledge climb out of that hang (pose.cpp, "the ledge climb"): the muscle-up,
+  // the knee onto the lip and the stand, all keyed on `climbRise` — how far
+  // the BODY has risen, 0 = the dead hang, 1 = feet on the lip (Player::
+  // LedgeClimbRise) — against the same hangLip / hangDir as the hang.
+  bool climbActive = false;
+  float climbRise = 0.0f;
   // Anything else a driver needs to solve, AFTER the leg IK, the weapon arm
   // and the hang palms and BEFORE the anatomical clamp (so it is clamped like
   // everything else). Empty on both current drivers.
@@ -160,6 +166,12 @@ struct PoseDrive {
   float lookYaw = 0.0f, lookPitch = 0.0f;
   // ---- ledge-hang palms, faded like gaitWeight ---------------------------
   float hangIkWeight = 0.0f;
+  // ---- the ledge climb: how much of the pose it owns, faded the same way,
+  // and the rise it is posed at (held through the fade-out) -----------------
+  float climbW = 0.0f;
+  float climbRise = 0.0f;
+  IVec3 climbLip{};
+  Vec3 climbDir{1, 0, 0};
   // Has the drawn height ever been set by the pipeline? The feet-derived
   // height snaps to its target the first time and eases ever after.
   bool bodyPlaced = false;

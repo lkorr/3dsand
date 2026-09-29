@@ -1,3 +1,4 @@
+      {k:'ledgeClimbTime', n:'climb duration', d:'Seconds from the dead hang to standing on the lip. The rise follows a muscle-up curve (pull, a stop, the waist heaved to the lip, a lag while one knee swings on, then the stand) and the climb pose is keyed on that rise, so this scales the whole animation.', step:0.05, u:'s'},
 /* ==========================================================================
    tuning.json parameter schema — the single description of every knob.
    ==========================================================================

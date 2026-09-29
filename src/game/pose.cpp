@@ -28,6 +28,15 @@ inline Quat AxisAngle(Vec3 axis, float a) { return QuatAxisAngle(axis, a); }
 inline Quat Mul(const Quat& a, const Quat& b) { return QuatMul(a, b); }
 inline Vec3 Rotate(const Quat& q, Vec3 v) { return QuatRotate(q, v); }
 inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
+// Smoothstep of an already-normalised parameter, clamped to 0..1.
+inline float Smooth01(float x) {
+  x = std::clamp(x, 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+// Smooth01 over the span [a, b] of `x`.
+inline float SmoothSpan(float a, float b, float x) {
+  return Smooth01((x - a) / std::max(b - a, 1e-4f));
+}
 
 // Ceiling on the gait's velocity lookahead, in leg lengths. `leadTime` is a
 // DURATION, so the unclamped offset grows linearly with speed and blows past
@@ -552,6 +561,11 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // The airborne arms, at their own joints and in the same layer as the lean
   // they hang off — see ApplyAirArms for why they are posed rather than solved.
   ApplyAirArms(sk, st);
+  // The ledge climb's torso lean, in the same pre-flatten layer as the air
+  // lean; its legs are solved after the leg IK below, its arms are the hang
+  // palms kept on the lip.
+  UpdateClimbDrive(in, dt);
+  ApplyClimbLean(sk, st);
 
   // ---- stage 3.7: the body answers a blow (mob.h Mob::HitReact) ----
   // After the aim and the twist, so a creature mid-bite that gets hit rocks
@@ -723,6 +737,9 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       AnimSolveTwoBone(sk, st, sk.chains[c], target, weight);
     }
   }
+
+  // ---- the ledge climb's legs: the knee onto the lip, then the stand ----
+  ApplyClimbLegs(sk, st);
 
   // ---- stage 5.5: the weapon arm (game/melee.h) ----
   // THE SAME CALL FOR EVERY CREATURE: a stroke is driven by aiming the WEAPON
@@ -1544,7 +1561,15 @@ void Mob::ApplyAirArms(const AnimSkeleton& sk, AnimState& st) {
 void Mob::ApplyHangArms(const PoseInputs& in, float dt, const AnimSkeleton& sk,
                         AnimState& st) {
   {
-    const float want = in.hangActive ? 1.0f : 0.0f;
+    // A ledge climb keeps the palms on the lip through the muscle-up: the
+    // body rises past hands that stay put, which IS the arms travelling from
+    // overhead, through the pull, to pressing down at the sides. Once the
+    // knee has the weight they let go and ease back to the clip's (idle)
+    // arms — the drift down to the sides.
+    float want = in.hangActive ? 1.0f : 0.0f;
+    if (!in.hangActive && in.climbActive)
+      want = 1.0f - Smooth01((in.climbRise - ledgeclimb::kHKneeOn) /
+                             (ledgeclimb::kHKneel + 0.18f - ledgeclimb::kHKneeOn));
     pose_.hangIkWeight += (want - pose_.hangIkWeight) *
                           HalfLifeK(dt, CurrentTuning().avatar.ikBlendHalflife);
     if (pose_.hangIkWeight < 1e-3f) pose_.hangIkWeight = 0.0f;
@@ -1629,14 +1654,17 @@ void Mob::ApplyHangArms(const PoseInputs& in, float dt, const AnimSkeleton& sk,
     const float shortBy = toT.len() - armReach;
     // Ghost guard, same geometry rule as the legs — but only while FADING
     // OUT: a live hang is allowed to be short (the shrug covers it).
-    if (!in.hangActive && shortBy > 3.0f) continue;
+    const bool gripping = in.hangActive || in.climbActive;
+    if (!gripping && shortBy > 3.0f) continue;
 
     // ---- SHOULDER SHRUG: the stretch that makes short arms reach -------
     // Two-bone IK clamps to its annulus, so a chibi rig whose arms cannot span
     // shoulder->lip lands its hands the shortfall below it. The whole chain
     // TRANSLATES toward the target by the (capped, 25 cm) shortfall instead —
     // shoulders pulled up by the body's weight. ZERO on a rig whose arms reach.
-    if (shortBy > 0.0f && toT.len() > 1e-4f) {
+    // Only ever UP: a climber pressing down on the lip whose arms have run
+    // out of length lifts the hands off it; the shoulders never drop to it.
+    if (shortBy > 0.0f && toT.len() > 1e-4f && toT.y > 0.0f) {
       const float kShrugCap = MetresToCells(0.25f);
       const Vec3 shift = toT * (std::min(shortBy, kShrugCap) / toT.len() * weight);
       st.model[i0].pos += shift;
@@ -1649,6 +1677,193 @@ void Mob::ApplyHangArms(const PoseInputs& in, float dt, const AnimSkeleton& sk,
     AnimSolveTwoBone(sk, st, ch, wristT, weight);
     palmOff = QuatRotate(st.model[ie].rot, sockLocal);
     AnimSolveTwoBone(sk, st, ch, palmPrefab - palmOff, weight);
+  }
+}
+
+// ---- the ledge climb: a muscle-up, a knee onto the lip, the stand -----------
+//
+// The body's RISE is authored in Player (player.h ledgeclimb): a pull that
+// gets the chest over the hands, a stop, a slow heave of the waist to the lip,
+// a lag while one knee swings on, the stand. Everything here is keyed on that
+// rise — how far the body actually is from the dead hang — never on a clock,
+// so the limbs cannot run ahead of a body the world has stalled, and a
+// network ghost poses from nothing but its position and the lip.
+//
+// Three layers, each where its kind of pose already lives:
+//   - the ARMS are ApplyHangArms with the palms kept on the lip: the body
+//     rising past hands that stay put is the whole muscle-up, overhead ->
+//     pulling -> pressing down at the sides; then they let go and ease back
+//     to the clip's arms (see the weight there);
+//   - the TORSO leans over the lip (pre-flatten, like the air lean);
+//   - the LEGS are two-bone targets in the WALL'S frame (post-flatten, like
+//     the gait): hanging, then the lead knee onto the lip, then both feet up
+//     onto it.
+void Mob::UpdateClimbDrive(const PoseInputs& in, float dt) {
+  const bool on = in.climbActive && alive_ && !Ragdolled();
+  if (on) {
+    // Held through the fade-out: the last pose the climb had is what blends
+    // into the gait (a finished climb) or back into the hang (a cancelled one).
+    pose_.climbRise = std::clamp(in.climbRise, 0.0f, 1.0f);
+    pose_.climbLip = in.hangLip;
+    pose_.climbDir = in.hangDir;
+  }
+  pose_.climbW += ((on ? 1.0f : 0.0f) - pose_.climbW) *
+                  HalfLifeK(dt, CurrentTuning().avatar.ikBlendHalflife);
+  if (pose_.climbW < 1e-3f) pose_.climbW = 0.0f;
+  if (pose_.climbW > 0.999f) pose_.climbW = 1.0f;
+}
+
+namespace {
+// Forward lean of the torso over the lip, radians, at rise `h`: none in the
+// hang, the chest thrown over the hands by the end of the pull, deepest while
+// the waist comes up and the knee swings on, upright again standing.
+float ClimbLeanAt(float h) {
+  constexpr float kDeg = 3.14159265f / 180.0f;
+  struct K {
+    float h, deg;
+  };
+  const K keys[] = {{0.0f, 0.0f},
+                    {ledgeclimb::kHChestOver, 26.0f},
+                    {ledgeclimb::kHWaist, 38.0f},
+                    {ledgeclimb::kHKneel, 30.0f},
+                    {1.0f, 0.0f}};
+  for (size_t i = 0; i + 1 < sizeof(keys) / sizeof(keys[0]); i++)
+    if (h <= keys[i + 1].h)
+      return (keys[i].deg + (keys[i + 1].deg - keys[i].deg) *
+                                SmoothSpan(keys[i].h, keys[i + 1].h, h)) *
+             kDeg;
+  return 0.0f;
+}
+}  // namespace
+
+// Mostly up the BACK, some at the pelvis: a climber folds at the waist over
+// the lip while the hips hang under it.
+void Mob::ApplyClimbLean(const AnimSkeleton& sk, AnimState& st) {
+  if (pose_.climbW <= 0.0f || def_ == nullptr) return;
+  const float pitch = ClimbLeanAt(pose_.climbRise) * pose_.climbW;
+  if (std::fabs(pitch) <= 1e-4f) return;
+  constexpr float kRootShare = 0.35f;
+  const int root = def_->rootLimb;
+  if (root >= 0 && root < (int)sk.parts.size() &&
+      (root >= (int)st.partAlive.size() || st.partAlive[root]))
+    st.local[root].rot = QuatNormalize(
+        Mul(st.local[root].rot, AxisAngle({1, 0, 0}, pitch * kRootShare)));
+  int nSpine = 0;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "spine" && (int)i != root) nSpine++;
+  if (nSpine == 0) return;
+  const Quat per = AxisAngle({1, 0, 0}, pitch * (1.0f - kRootShare) / nSpine);
+  for (size_t i = 0; i < sk.parts.size(); i++) {
+    if (sk.parts[i].tag != "spine" || (int)i == root) continue;
+    if (i < st.partAlive.size() && !st.partAlive[i]) continue;
+    st.local[i].rot = QuatNormalize(Mul(st.local[i].rot, per));
+  }
+}
+
+void Mob::ApplyClimbLegs(const AnimSkeleton& sk, AnimState& st) {
+  if (pose_.climbW <= 0.0f || sk.chains.empty() || def_ == nullptr) return;
+  const float h = pose_.climbRise;
+  const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+  const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  const Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
+  auto toWorld = [&](Vec3 p) { return bodyOrigin + pivot + Rotate(yaw, p - pivot); };
+  auto toPrefab = [&](Vec3 w) { return RotateInv(yaw, w - bodyOrigin - pivot) + pivot; };
+  const Vec3 up{0, 1, 0};
+  const Vec3 dir = pose_.climbDir;
+  const Vec3 leftW{dir.z, 0.0f, -dir.x};  // model +X is the rig's left
+  const Vec3 centre{origin_.x + pivot.x, 0.0f, origin_.z + pivot.z};
+  const float lipTopY = (float)(pose_.climbLip.y + 1);
+  // The wall face under the lip, as a distance along `dir` from the body's
+  // centre column. Every target below is placed against it, so they are
+  // fixed in the WORLD: the body stepping across onto the lip at the end
+  // walks its hips over feet that stay where they were put.
+  const float face = ((float)pose_.climbLip.x + 0.5f - centre.x) * dir.x +
+                     ((float)pose_.climbLip.z + 0.5f - centre.z) * dir.z - 0.5f;
+  const float ankleH = MetresToCells(0.08f);
+
+  // Phases, 0..1 each, on the rise.
+  const float swing = SmoothSpan(ledgeclimb::kHWaist - 0.05f,
+                                 ledgeclimb::kHKneeOn, h);        // knee comes up
+  const float leadUp = SmoothSpan(ledgeclimb::kHKneel, 1.0f, h);  // onto the foot
+  const float trailLift = SmoothSpan(ledgeclimb::kHKneel, 0.86f, h);
+  const float trailOver = SmoothSpan(0.80f, 1.0f, h);
+
+  int legOrdinal = 0;
+  for (size_t c = 0; c < sk.chains.size(); c++) {
+    if (!IsLegChain(sk, c)) continue;
+    const IkChain& ch = sk.chains[c];
+    const bool lead = legOrdinal++ == 0;
+    if (ch.parts.size() < 2 || ch.effector < 0) continue;
+    const int i0 = ch.parts[0], i1 = ch.parts[1], ie = ch.effector;
+    if (i0 >= (int)st.model.size() || i1 >= (int)st.model.size() ||
+        ie >= (int)st.model.size())
+      continue;
+    if (!st.partAlive.empty() && (!st.partAlive[i0] || !st.partAlive[i1]))
+      continue;  // a lost leg's chain has gone silent; so must this
+    const float weight = ch.weight * pose_.climbW;
+    if (weight <= 0.0f) continue;
+    const float L1 = (st.model[i1].pos - st.model[i0].pos).len();
+    const float L2 = (st.model[ie].pos - st.model[i1].pos).len();
+    if (L1 < 1e-3f || L2 < 1e-3f) continue;
+    const float L = L1 + L2;
+
+    const Vec3 hipW = toWorld(st.model[i0].pos);
+    const Vec3 hipRel{hipW.x - centre.x, 0.0f, hipW.z - centre.z};
+    const float lat = hipRel.dot(leftW);
+    const float hipAlong = hipRel.dot(dir);
+    // A point in this leg's column: `along` from the centre, at height y.
+    auto at = [&](float along, float y) {
+      return Vec3{centre.x + leftW.x * lat + dir.x * along, y,
+                  centre.z + leftW.z * lat + dir.z * along};
+    };
+    // Dangling: straight down, knees soft, a touch back off the wall.
+    const Vec3 hangF = hipW - up * (0.93f * L) - dir * (0.10f * L);
+
+    Vec3 target = hangF;
+    if (lead) {
+      // THE KNEE ON THE LIP: on its top surface, a thigh's length from the
+      // hip, at least a hand past the edge. The shin trails back over the
+      // edge from it — a knee on a ledge, not a foot.
+      const float kneeY = lipTopY + MetresToCells(0.07f);
+      const float dy = hipW.y - kneeY;
+      const float minAlong = face + MetresToCells(0.12f);
+      const float reach = std::fabs(dy) < L1 ? std::sqrt(L1 * L1 - dy * dy) : -1.0f;
+      Vec3 kneeW;
+      if (reach >= 0.0f && hipAlong + reach >= minAlong) {
+        kneeW = at(hipAlong + reach, kneeY);
+      } else {
+        const Vec3 d = at(minAlong, kneeY) - hipW;
+        kneeW = hipW + d * (L1 / std::max(d.len(), 1e-4f));
+      }
+      const Vec3 shinDir = (dir * -0.9f - up * 0.44f).normalized();
+      const Vec3 kneelF = kneeW + shinDir * L2;
+      // The swing: the thigh rotates up from hanging to the lip and the shin
+      // folds under it, so the foot rides an arc behind the knee instead of
+      // being dragged straight through the wall.
+      const Vec3 thighHang = (up * -0.97f - dir * 0.24f).normalized();
+      const Vec3 thighKneel = (kneeW - hipW) * (1.0f / L1);
+      Vec3 thigh = thighHang + (thighKneel - thighHang) * swing;
+      thigh = thigh.len() > 1e-4f ? thigh.normalized() : thighKneel;
+      Vec3 shin = up * -1.0f + (shinDir + up) * swing;
+      shin = shin.len() > 1e-4f ? shin.normalized() : shinDir;
+      const Vec3 swungF = hipW + thigh * L1 + shin * L2;
+      target = hangF + (swungF - hangF) * swing;
+      // ...then up onto that foot: planted on the lip ahead, carried over
+      // the edge on a small arc so it does not scrape through the corner.
+      const Vec3 standF = at(face + MetresToCells(0.16f), lipTopY + ankleH);
+      if (leadUp > 0.0f)
+        target = kneelF + (standF - kneelF) * leadUp +
+                 up * (std::sin(leadUp * 3.14159265f) * MetresToCells(0.15f));
+    } else if (trailLift > 0.0f || trailOver > 0.0f) {
+      // The trailing leg comes up last: lifted clear of the edge while it is
+      // still behind it, then brought over to stand beside the lead foot.
+      const float clearY = lipTopY + ankleH + MetresToCells(0.10f);
+      Vec3 f = hangF;
+      f.y = hangF.y + (std::max(hangF.y, clearY) - hangF.y) * trailLift;
+      const Vec3 standF = at(face + MetresToCells(0.06f), lipTopY + ankleH);
+      target = f + (standF - f) * trailOver;
+    }
+    AnimSolveTwoBone(sk, st, ch, toPrefab(target), weight);
   }
 }
 

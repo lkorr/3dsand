@@ -143,6 +143,9 @@ struct PlayerState {
     // plays the clips on the transitions it sees (RemotePlayersPreTick).
     kThrowDraw = 1u << 9,
     kThrowSwing = 1u << 10,
+    // The mantle in progress is a LEDGE CLIMB out of a hang (not a water
+    // climb-out): the ghost's avatar poses the muscle-up from it.
+    kMantleFromHang = 1u << 11,
   };
   bool Has(Flag f) const { return (flags & (uint32_t)f) != 0; }
   void Set(Flag f, bool on) {

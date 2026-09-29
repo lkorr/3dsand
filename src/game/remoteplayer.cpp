@@ -48,6 +48,7 @@ PlayerState MakePlayerState(const PlayerSession& s, uint32_t tick,
   st.Set(PlayerState::kSwimming, p.swimming);
   st.Set(PlayerState::kFly, p.fly);
   st.Set(PlayerState::kHanging, p.hanging);
+  st.Set(PlayerState::kMantleFromHang, p.mantleFromHang);
   st.Set(PlayerState::kBlindFall, p.blindFall);
   st.Set(PlayerState::kThrowDraw, s.throwTicks > 0);
   st.Set(PlayerState::kThrowSwing, s.throwLaunchIn > 0);
@@ -91,6 +92,7 @@ void RemotePlayer::Apply(const PlayerState& st) {
   ghost.swimming = st.Has(PlayerState::kSwimming);
   ghost.fly = st.Has(PlayerState::kFly);
   ghost.hanging = st.Has(PlayerState::kHanging);
+  ghost.mantleFromHang = st.Has(PlayerState::kMantleFromHang);
   ghost.blindFall = st.Has(PlayerState::kBlindFall);
   ghost.mantleTimer = st.mantleTimer;
   ghost.hangLip = IVec3{st.hangLip[0], st.hangLip[1], st.hangLip[2]};

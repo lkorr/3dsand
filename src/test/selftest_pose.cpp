@@ -284,11 +284,252 @@ Status GatePoseParity(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ledge-climb-pose ----------------------------------------------------
+//
+// The ledge climb is a muscle-up (player.h ledgeclimb): the BODY rises on an
+// authored curve with slow beats in it, and the pose (pose.cpp, "the ledge
+// climb") is keyed on how far it has risen. This drives a real Player up the
+// player-ledgegrab gate's plateau — jump, catch, dangle, hold W — and feeds
+// the avatar the PoseInputs PlayerAvatar::PreTick would, every tick, so what
+// is asserted is the composed thing a player sees:
+//   - the rise has its beats: after the pull starts there are at least two
+//     separate stretches where the body nearly stops (the stop at the top of
+//     the pull, the lag while the knee swings on);
+//   - through the pull the hands stay ON the lip (the arms are what move);
+//   - while the weight is on the knee, the lead knee is ON the lip;
+//   - standing at the end, both feet are on the lip and the hands have come
+//     down below the shoulders.
+// CPU only: the wall is a kindAt lambda, the body is never stepped by Jolt.
+Status GateLedgeClimbPose(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  int defIndex = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == kAvatarDefName) defIndex = (int)i;
+  if (defIndex < 0) {
+    detail = std::string("no \"") + kAvatarDefName + "\" def";
+    std::printf("ledge-climb-pose: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  auto partNamed = [&](const char* n) {
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (def.limbs[i].name == n) return (int)i;
+    return -1;
+  };
+  const int shoulderR = partNamed("armU.R"), wristR = partNamed("hand.R");
+  const int wristL = partNamed("hand.L");
+  // The LEAD leg is the first leg chain (pose.cpp counts leg ordinals).
+  int leadHip = -1, leadKnee = -1, leadAnkle = -1, trailAnkle = -1;
+  for (const IkChain& ch : def.skel.chains) {
+    if (ch.tag != "leg" || ch.parts.size() < 2) continue;
+    if (leadHip < 0) {
+      leadHip = ch.parts[0];
+      leadKnee = ch.parts[1];
+      leadAnkle = ch.effector;
+    } else if (trailAnkle < 0) {
+      trailAnkle = ch.effector;
+    }
+  }
+  if (shoulderR < 0 || wristR < 0 || wristL < 0 || leadKnee < 0 ||
+      trailAnkle < 0) {
+    detail = "the avatar def has no arm/leg parts by the expected names";
+    std::printf("ledge-climb-pose: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // player-ledgegrab's plateau: launch floor to x<140 (top y=100), wall from
+  // x=150 up to y=115, so the lip cell is y=114 and the wall faces -X.
+  auto plateauKind = [](IVec3 q) {
+    if (q.y < 60) return CellKind::Solid;
+    if (q.x < 140) return q.y < 100 ? CellKind::Solid : CellKind::Air;
+    if (q.x >= 150) return q.y < 115 ? CellKind::Solid : CellKind::Air;
+    return CellKind::Air;
+  };
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  const float heading = 1.5707963f;  // facing +X (heading 0 = +Z)
+  const float dt = kTickDt;
+
+  PlayerAvatar av;
+  av.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  av.SetDefs(&c.mobs.Defs(), def.name);
+  Player p;
+  p.fly = false;
+  p.pos = Vec3{132.0f, 100.0f + Player::kHalfY, 200.5f};
+  if (!av.Spawn(p, heading)) {
+    detail = "PlayerAvatar::Spawn refused the fixture";
+    std::printf("ledge-climb-pose: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // ---- run up, jump, catch: player only, no pose yet ----------------------
+  int guard = 0;
+  {
+    TickInput in;
+    in.SetHeld(TB_SPRINT, true);
+    in.forward = 1.0f;
+    while (!(p.grounded && p.pos.x > 135.0f) && ++guard < 600)
+      p.Update(dt, in, fwd, right, fwd, plateauKind);
+    in.SetPressed(TB_JUMP, true);
+    in.SetHeld(TB_JUMP, true);
+    p.Update(dt, in, fwd, right, fwd, plateauKind);
+    in.SetPressed(TB_JUMP, false);
+    guard = 0;
+    while (!p.hanging && ++guard < 600)
+      p.Update(dt, in, fwd, right, fwd, plateauKind);
+  }
+  if (!p.hanging) {
+    av.Despawn();
+    detail = "the fixture jump never caught the lip";
+    std::printf("ledge-climb-pose: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // ---- dangle, then climb, posing every tick --------------------------------
+  const float lipTop = (float)(p.hangLip.y + 1);
+  const float face = (float)p.hangLip.x;  // the wall faces -X: its face is x
+  struct Sample {
+    float h, feetY;
+    Vec3 wristR, wristL, shoulderR, knee, leadAnk, trailAnk;
+  };
+  std::vector<Sample> climb;
+  bool nan = false, climbed = false;
+  uint32_t tick = 52000;
+  auto toWorld = [&](Vec3 m) {
+    const Vec3 pivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
+    const Vec3 o = av.Origin();
+    return Vec3{o.x, av.BodyY(), o.z} + pivot +
+           QuatRotate(QuatAxisAngle({0, 1, 0}, heading), m - pivot);
+  };
+  for (int f = 0; f < 60 * 8; f++, tick++) {
+    TickInput in;
+    in.SetHeld(TB_JUMP, true);
+    in.forward = f >= 30 ? 1.0f : 0.0f;  // half a second of dead hang first
+    p.Update(dt, in, fwd, right, fwd, plateauKind);
+
+    PoseInputs pin;
+    pin.velocity = p.vel;
+    const bool climbing = p.mantleFromHang && p.mantleTimer > 0.0f;
+    pin.grounded = p.grounded;
+    pin.airPoseEligible = false;
+    pin.height = PoseInputs::Height::FromDriver;
+    pin.tiltFromGround = false;
+    pin.hangActive = p.hanging;
+    pin.hangLip = p.hangLip;
+    pin.hangDir = p.hangDir;
+    pin.climbActive = climbing;
+    pin.climbRise = climbing ? p.LedgeClimbRise() : 0.0f;
+    av.SetDriverPlacement(Vec3{p.pos.x - def.worldSize.x * 0.5f,
+                               p.pos.y - Player::kHalfY,
+                               p.pos.z - def.worldSize.z * 0.5f},
+                          heading);
+    av.PosePipeline(pin, dt, c.world, tick);
+
+    const auto& m = av.ModelPose();
+    for (const Transform& t : m)
+      if (!std::isfinite(t.pos.x + t.pos.y + t.pos.z + t.rot.w)) nan = true;
+    if (climbing) {
+      Sample s;
+      s.h = pin.climbRise;
+      s.feetY = p.pos.y - Player::kHalfY;
+      s.wristR = toWorld(m[wristR].pos);
+      s.wristL = toWorld(m[wristL].pos);
+      s.shoulderR = toWorld(m[shoulderR].pos);
+      s.knee = toWorld(m[leadKnee].pos);
+      s.leadAnk = toWorld(m[leadAnkle].pos);
+      s.trailAnk = toWorld(m[trailAnkle].pos);
+      climb.push_back(s);
+    } else if (!climb.empty()) {
+      climbed = p.grounded;
+      break;
+    }
+  }
+  av.Despawn();
+
+  // ---- the numbers ---------------------------------------------------------
+  // Rows relative to the lip: y above its top, x past its face.
+  std::printf("ledge-climb-pose: %zu climb ticks, lip top y=%.0f face x=%.0f\n",
+              climb.size(), lipTop, face);
+  std::printf("  tick     h  feet | wristR y/x  | shldR y  | knee y/x    | "
+              "leadAnk y/x | trailAnk y/x\n");
+  for (size_t i = 0; i < climb.size(); i += 3) {
+    const Sample& s = climb[i];
+    std::printf("  %4zu %5.3f %5.1f | %5.1f %5.1f | %6.1f   | %5.1f %5.1f | "
+                "%5.1f %5.1f | %5.1f %5.1f\n",
+                i, s.h, s.feetY - lipTop, s.wristR.y - lipTop, s.wristR.x - face,
+                s.shoulderR.y - lipTop, s.knee.y - lipTop, s.knee.x - face,
+                s.leadAnk.y - lipTop, s.leadAnk.x - face, s.trailAnk.y - lipTop,
+                s.trailAnk.x - face);
+  }
+
+  bool ok = !nan && climbed && climb.size() > 10;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("ledge-climb-pose: FAILED %s\n", what);
+    }
+  };
+  check(!nan, "the pose stayed finite");
+  check(climbed, "the climb finished standing on the lip");
+
+  // The beats: stretches of >= 5 ticks rising under a quarter of the peak,
+  // between the pull starting and the stand finishing.
+  float peak = 0.0f;
+  for (size_t i = 1; i < climb.size(); i++)
+    peak = std::max(peak, climb[i].feetY - climb[i - 1].feetY);
+  int beats = 0, run = 0;
+  for (size_t i = 1; i < climb.size(); i++) {
+    const float v = climb[i].feetY - climb[i - 1].feetY;
+    const bool mid = climb[i].h > 0.05f && climb[i].h < 0.95f;
+    if (mid && v < 0.25f * peak) {
+      if (++run == 5) beats++;
+    } else {
+      run = 0;
+    }
+  }
+  check(beats >= 2, "the rise stops/lags at least twice after the pull");
+
+  // The tolerance is the dead hang's own: the hang IK leaves the WRIST ~3 vox
+  // over the lip top (the palm socket is below it), and the climb must not
+  // pull the hands further off than that.
+  // Hands on the lip through the pull; knee on it while kneeling; feet on it
+  // and hands down at the end.
+  float worstHand = 0.0f, worstKnee = 1e9f, kneeAlong = 1e9f;
+  for (const Sample& s : climb) {
+    if (s.h <= ledgeclimb::kHChestOver)
+      worstHand = std::max({worstHand, std::fabs(s.wristR.y - lipTop),
+                            std::fabs(s.wristL.y - lipTop)});
+    if (s.h >= ledgeclimb::kHKneeOn + 0.02f && s.h <= ledgeclimb::kHKneel) {
+      worstKnee = std::min(worstKnee, s.knee.y - lipTop);
+      kneeAlong = std::min(kneeAlong, s.knee.x - face);
+    }
+  }
+  const float handTol = (float)BaselineNumber("ledgeClimbPose.handTolVox", 4.0);
+  check(worstHand <= handTol, "the hands stay on the lip through the pull");
+  check(worstKnee > -1.0f && worstKnee < 2.5f && kneeAlong > 0.0f,
+        "the lead knee is on the lip while the weight is on it");
+  if (!climb.empty()) {
+    const Sample& e = climb.back();
+    check(std::fabs(e.leadAnk.y - lipTop) < 2.0f &&
+              std::fabs(e.trailAnk.y - lipTop) < 2.0f,
+          "both feet are on the lip standing");
+    check(e.wristR.y < e.shoulderR.y - 2.0f, "the arms are down at the end");
+  }
+  detail = Format("%zu ticks, %d beats, hands off lip <= %.1f vox, knee %.1f "
+                  "above lip %.1f past face",
+                  climb.size(), beats, worstHand, worstKnee, kneeAlong);
+  std::printf("ledge-climb-pose: %s (%d checks, %s)\n", ok ? "PASS" : "FAIL",
+              checks, detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PoseGates() {
   static const std::vector<Gate> g = {
       {"pose-parity", "mob", {}, false, GatePoseParity},
+      {"ledge-climb-pose", "mob", {}, false, GateLedgeClimbPose},
   };
   return g;
 }

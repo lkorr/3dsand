@@ -566,7 +566,67 @@ float StepSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
   return 0.0f;
 }
 
+// Feet-below-lip distance of the dead hang, voxels: the whole rise of a ledge
+// climb. The hang anchor puts the HEAD ledgeHangDrop below the lip top.
+float LedgeClimbDepth() {
+  return 2.0f * Player::kHalfY + T().ledgeHangDrop / kVoxelMeters;
+}
+
 }  // namespace
+
+// ---- the ledge climb's rise profile (player.h ledgeclimb) ----
+namespace ledgeclimb {
+float RiseAt(float u) {
+  constexpr int n = (int)(sizeof(kKeys) / sizeof(kKeys[0]));
+  u = std::clamp(u, 0.0f, 1.0f);
+  int i = 0;
+  while (i < n - 2 && u > kKeys[i + 1].t) i++;
+  // Fritsch-Carlson tangents: the secant average, zeroed where the curve
+  // turns and limited so no segment overshoots its neighbours. A flat
+  // segment therefore stays flat-and-slow rather than dipping backward.
+  auto secant = [](int k) {
+    return (kKeys[k + 1].h - kKeys[k].h) / (kKeys[k + 1].t - kKeys[k].t);
+  };
+  auto tangent = [&](int k) {
+    if (k == 0) return secant(0);
+    if (k == n - 1) return 0.0f;  // ease into standing
+
+    const float a = secant(k - 1), b = secant(k);
+    if (a * b <= 0.0f) return 0.0f;
+    // Fritsch-Butland weighted harmonic mean of the two secants.
+    const float h0 = kKeys[k].t - kKeys[k - 1].t;
+    const float h1 = kKeys[k + 1].t - kKeys[k].t;
+    const float w1 = 2.0f * h1 + h0, w2 = h1 + 2.0f * h0;
+    return (w1 + w2) / (w1 / a + w2 / b);
+  };
+  const float t0 = kKeys[i].t, t1 = kKeys[i + 1].t;
+  const float span = t1 - t0;
+  const float s = (u - t0) / span;
+  const float s2 = s * s, s3 = s2 * s;
+  return (2 * s3 - 3 * s2 + 1) * kKeys[i].h +
+         (s3 - 2 * s2 + s) * span * tangent(i) +
+         (-2 * s3 + 3 * s2) * kKeys[i + 1].h +
+         (s3 - s2) * span * tangent(i + 1);
+}
+
+float TimeAt(float h) {
+  // Bisection: RiseAt is monotone, and this runs once per climb start.
+  float lo = 0.0f, hi = 1.0f;
+  for (int k = 0; k < 24; k++) {
+    const float mid = 0.5f * (lo + hi);
+    (RiseAt(mid) < h ? lo : hi) = mid;
+  }
+  return 0.5f * (lo + hi);
+}
+}  // namespace ledgeclimb
+
+float Player::LedgeClimbRise() const {
+  const float lipTop = (float)(hangLip.y + 1);
+  const float feet = pos.y - kHalfY;
+  const float d0 = LedgeClimbDepth();
+  if (d0 <= 1e-3f) return 1.0f;
+  return std::clamp(1.0f - (lipTop - feet) / d0, 0.0f, 1.0f);
+}
 
 Player::Box Player::BoxFor(bool crouched) const {
   const float h =
@@ -784,7 +844,22 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       Vec3 d = mantleTarget - pos;
       const float rise = (mantleSpeed / kVoxelMeters) * dt;
       float yBefore = pos.y;
-      if (d.y > 1e-3f) {
+      if (d.y > 1e-3f && mantleFromHang) {
+        // The ledge climb rises on its authored profile (player.h
+        // ledgeclimb), so the pauses the pose plays are pauses of the BODY.
+        // A rise the sweep refuses holds the clock where it is: the profile
+        // resumes from where the body actually is once the way clears,
+        // instead of catching up in one lurch.
+        const float dur = std::max(T().ledgeClimbTime, 0.05f);
+        climbClock = std::min(climbClock + dt, dur);
+        const float h = ledgeclimb::RiseAt(climbClock / dur);
+        const float lipTop = (float)(hangLip.y + 1);
+        const float yWant =
+            std::min(mantleTarget.y,
+                     lipTop - LedgeClimbDepth() * (1.0f - h) + kHalfY);
+        if (yWant > pos.y) SweepAxis(pos, yWant - pos.y, 1, b, kindAt);
+        if (pos.y < yWant - 0.5f) climbClock = std::max(0.0f, climbClock - dt);
+      } else if (d.y > 1e-3f) {
         SweepAxis(pos, std::min(d.y, rise), 1, b, kindAt);
       } else {
         // At height: cross onto the bank. Only now, so the horizontal press
@@ -867,8 +942,12 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       if (!Collides(hangStand, b, kindAt)) {
         mantleTarget = hangStand;
         mantleSpeed = T().ledgeMantleSpeed;
-        mantleTimer = T().ledgeMantleTime;
+        // The timeout must outlast the authored rise plus the step across.
+        mantleTimer = std::max(T().ledgeMantleTime, T().ledgeClimbTime + 1.0f);
         mantleFromHang = true;  // a HOLD: W released mid-climb cancels
+        // Resume a cancelled climb where the body is, not from the start.
+        climbClock = ledgeclimb::TimeAt(LedgeClimbRise()) *
+                     std::max(T().ledgeClimbTime, 0.05f);
         vel = Vec3{0, 0, 0};
         impactDeltaV = {0, 0, 0};
         return;  // the mantle block above drives from the next frame

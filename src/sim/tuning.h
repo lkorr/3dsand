@@ -242,8 +242,15 @@ struct Tuning {
     // climb takes over a second): at the old 4.5 the pull-up read as a big
     // jump, not as hauling yourself up. The timeout must cover the full climb
     // at this speed or it aborts mid-pull.
+    // Since the ledge climb got its muscle-up profile (ledgeClimbTime below)
+    // the SPEED only drives the ledge climb's final step across onto the lip,
+    // and the water climb-out; the timeout is floored at ledgeClimbTime + 1 s.
     float ledgeMantleSpeed = TPD(player, ledgeMantleSpeed);
     float ledgeMantleTime = TPD(player, ledgeMantleTime);
+    // Seconds from the dead hang to standing on the lip. The RISE follows the
+    // authored muscle-up curve (player.h ledgeclimb::kKeys: pull, stop, heave
+    // the waist up, lag while the knee swings on, stand); this scales it.
+    float ledgeClimbTime = TPD(player, ledgeClimbTime);
     // How fast the body settles into the dead hang after a catch. Split from
     // the mantle speed on purpose: slowing the pull-up must not make the
     // catch itself feel sluggish.

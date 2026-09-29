@@ -934,6 +934,9 @@ const char* const kOrder[] = {
     // Mob::PosePipeline only (no PreTick, no Jolt step), and resets mobs +
     // debris and regenerates worldgen on the way out.
     "pose-parity",
+    // CPU only: a synthetic-wall Player climb posing a PlayerAvatar through
+    // PosePipeline; spawns and despawns its own avatar, touches no world.
+    "ledge-climb-pose",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the

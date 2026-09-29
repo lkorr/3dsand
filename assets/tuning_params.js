@@ -457,6 +457,7 @@ const TUNING_PARAMS = {
   'player.ledgeBoostSpeed':{t:'f',def:5.25,min:0,max:15},
   'player.ledgeMantleSpeed':{t:'f',def:1.5,min:0.1,max:20},
   'player.ledgeMantleTime':{t:'f',def:2.8,min:0.1,max:3},
+  'player.ledgeClimbTime':{t:'f',def:1.9,min:0.3,max:6},
   'player.ledgeSettleSpeed':{t:'f',def:4.5,min:0.1,max:20},
   'player.ledgeShimmySpeed':{t:'f',def:0.8,min:0,max:5},
   'player.ledgePullDelay':{t:'f',def:0.25,min:0,max:1.5},

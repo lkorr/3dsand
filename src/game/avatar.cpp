@@ -407,6 +407,8 @@ PoseInputs PlayerAvatar::AvatarPoseInputs(bool grounded,
   in.hangActive = hangActive_;
   in.hangLip = hangLipW_;
   in.hangDir = hangDirW_;
+  in.climbActive = climbActive_;
+  in.climbRise = climbRise_;
   return in;
 }
 
@@ -479,6 +481,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     airTime_ = 0.0f;
     wasGrounded_ = true;
     hangActive_ = false;
+    climbActive_ = false;
     pose_.hangIkWeight = 0.0f;
     // Jolt owns every limb here and no pose pass runs, so the air pose must be
     // put away rather than left faded: getting up starts from the pose the
@@ -496,6 +499,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // SubmitPose does the rest.
     TickGetUp(dt);
     hangActive_ = false;
+    climbActive_ = false;
     crouchWant_ = false;
     airPoseEligible_ = false;
     playerVel_ = Vec3{};
@@ -521,7 +525,10 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // hold the fall clip open for the whole flight.
     airPoseEligible_ = !player.hanging && player.mantleTimer <= 0.0f &&
                        !player.inLiquid && !player.fly;
-    if (player.hanging) {
+    // A ledge climb is the hang's continuation: same lip, same wall.
+    climbActive_ = player.mantleFromHang && player.mantleTimer > 0.0f;
+    climbRise_ = climbActive_ ? player.LedgeClimbRise() : 0.0f;
+    if (player.hanging || climbActive_) {
       hangLipW_ = player.hangLip;
       hangDirW_ = player.hangDir;
     }

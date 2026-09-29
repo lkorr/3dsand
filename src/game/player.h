@@ -21,6 +21,48 @@
 // AABB character vs the one-tick-latent voxel mirror (DESIGN.md v0 note).
 // All units are voxels; sizes below are stated in meters and converted via
 // kVoxelMeters so voxel size can be tuned in one place (world.h).
+// ---- THE LEDGE CLIMB IS A MUSCLE-UP, NOT A LIFT ----------------------------
+//
+// The pull-up from a hang used to raise the body at a flat ledgeMantleSpeed,
+// which with no animation on it read as floating up the wall. It now follows
+// an authored height-vs-time curve whose SLOW BEATS are the ones a body makes:
+// the explosive pull that gets the chest over the hands, a stop at the top of
+// it, the slow heave that brings the waist to the lip, a lag while one knee
+// swings up onto it, then the stand. The pose (pose.cpp, "the ledge climb") keys its
+// phases on the RISE (Player::LedgeClimbRise), not on the clock, so wherever
+// the body stalls the limbs stall with it.
+//
+// `t` is a fraction of player.ledgeClimbTime, `h` the fraction of the rise from
+// the dead hang to standing on the lip. Strictly increasing in both — the curve
+// is inverted when a cancelled climb resumes part-way — and interpolated
+// monotone (Fritsch-Carlson), so the flat stretches are slow, never backward.
+namespace ledgeclimb {
+struct Key {
+  float t, h;
+};
+inline constexpr Key kKeys[] = {
+    {0.00f, 0.000f},  // dead hang
+    {0.06f, 0.012f},  // loading the pull
+    {0.24f, 0.260f},  // the explosive pull: chest over the hands
+    {0.34f, 0.272f},  // STOP at the top of it
+    {0.52f, 0.500f},  // the heave: arms press out, waist to the lip
+    {0.66f, 0.545f},  // lag: the knee swings up onto the lip
+    {0.78f, 0.680f},  // weight onto the knee
+    {1.00f, 1.000f},  // stand up
+};
+// The pose's phase marks, on the same `h` axis as the keys above.
+inline constexpr float kHChestOver = 0.26f;  // shoulders have passed the hands
+// Measured on the human rig (ledge-climb-pose): hips are ~0.78 m over the
+// soles, so they reach the lip top at h ~0.50 — the knee cannot go on before
+// that without folding the hip past its 85 degree limit into the block.
+inline constexpr float kHWaist = 0.50f;      // arms locked out, hips at the lip
+inline constexpr float kHKneeOn = 0.545f;    // lead knee is on the lip
+inline constexpr float kHKneel = 0.68f;      // weight is on that knee
+// h at `u` (a fraction of the climb time), and the inverse.
+float RiseAt(float u);
+float TimeAt(float h);
+}  // namespace ledgeclimb
+
 class Player {
  public:
   using KindFn = std::function<CellKind(IVec3)>;
@@ -303,6 +345,17 @@ class Player {
   // Water climb-outs stay committed — they were triggered by a discrete jump
   // press and have no hold to release.
   bool mantleFromHang = false;
+  // Seconds into the ledge climb's authored RISE PROFILE (ledgeclimb::kKeys,
+  // player.ledgeClimbTime long). Only the ledge pull-up reads it; the water
+  // climb-out is still a flat-rate drive. Held back while a live world blocks
+  // the rise, so the clock never runs ahead of the body.
+  float climbClock = 0.0f;
+  // How far through the ledge climb the BODY is, 0 (the dead hang) .. 1
+  // (feet on the lip), measured from pos and hangLip — not from climbClock.
+  // That makes it the one number the pose can follow on any body that has
+  // those two facts, a network ghost included, and keeps the limbs in step
+  // with where the body actually is when the rise is held or cancelled.
+  float LedgeClimbRise() const;
 
   // ---- ledge grab (procedural climbing) ----
   // Airborne with space held and the arms facing a voxel lip within hand

@@ -523,6 +523,9 @@ class PlayerAvatar : public Mob {
   bool hangActive_ = false;
   IVec3 hangLipW_{};        // the held lip voxel, world
   Vec3 hangDirW_{1, 0, 0};  // horizontal facing at grab time, toward the wall
+  // ---- the ledge climb out of that hang (pose.cpp, "the ledge climb") ----
+  bool climbActive_ = false;
+  float climbRise_ = 0.0f;  // Player::LedgeClimbRise, 0 hang .. 1 standing
 
   // Seconds spent continuously off the ground; debounces the flickering
   // `grounded` bit so air-state clips fire once per real takeoff.
