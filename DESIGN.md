@@ -14624,11 +14624,13 @@ each, never a march):
 
 **Precipitation, tier 1 only.** Rain curtains hang under raining cells in the
 march (with the primary and secondary RAINBOW at 42°/51° from the anti-solar
-point, only where sunlit rain actually is). Near the eye, `rainOverlay` finds
-drops through four cylinders round the fall axis — and, for views within ~30°
-of that axis, where a ray runs parallel to every cylinder and found nothing (a
-cone of no rain straight up and down through the eye), through four horizontal
-planes of the same columns, crossfaded on the angle — but tests each ray against the drop itself — a 3-D
+point, only where sunlit rain actually is). Near the eye, `rainOverlay` walks
+the ray through a VOLUME of drop columns (sheared along the fall, fine tier to
+~3 m, coarse to 14 m, crossfaded on each drop's distance; `rainColumns`, a 2-D
+DDA with a conservative per-column reject that keeps it at the old cost). It
+replaced four cylinders round the fall axis plus crossfaded horizontal planes:
+any surface a falling drop cannot leave is made of fall lines, so a ray along
+the axis ran parallel to it — a hole, then a seam. It tests each ray against the drop itself — a 3-D
 segment for rain, a point for snow — with pixel-footprint antialiasing, gated
 per drop on the openness grid (it stops at a roof and keeps falling outside) and
 on the camera probe (it rains HERE, not on average). The streaks lean along the

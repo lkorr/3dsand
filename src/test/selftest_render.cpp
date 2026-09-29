@@ -4910,6 +4910,28 @@ Status GateClouds(Ctx& c, std::string& detail) {
     }
     armTick = tick;
   }
+  // ---- the RAIN LOOK SET (SANDVOX_RAIN_GALLERY=1): not an assertion ----
+  // The near-eye rain/snow overlay from the views that broke it before: along
+  // the horizon, oblique, and straight up / straight down the fall axis, where
+  // a surface lattice round the eye sees nothing. Writes
+  // build/rain_gallery_<preset>_<view>.bmp.
+  if (const char* g = std::getenv("SANDVOX_RAIN_GALLERY"); g && g[0] == '1') {
+    struct View { const char* name; float pitch; };
+    const View views[] = {{"side", 0.0f}, {"oblique", 0.8f}, {"zenith", 1.5f},
+                          {"nadir", -1.5f}, {"down45", -0.8f}};
+    for (const char* pn : {"rain", "snow"}) {
+      for (const View& v : views) {
+        std::vector<uint8_t> im;
+        std::vector<float> dp;
+        double ms = 0;
+        armTick = tick;
+        if (!renderArm(pn, true, gndEye, 0.785f, v.pitch, im, dp, ms)) break;
+        WriteBmpFile(std::string("build/rain_gallery_") + pn + "_" + v.name + ".bmp", im, W, H);
+        std::printf("rain gallery: %-5s %-8s %.2f ms/frame\n", pn, v.name, ms);
+      }
+    }
+    armTick = tick;
+  }
 
   // ---- C. A SECOND VIEW DOES NOT DISTURB THE FIRST -------------------------
   // The inventory portrait writes its render params between two game frames,
