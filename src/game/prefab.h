@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <deque>
+#include <utility>
 #include <vector>
 
 #include "sim/materials.h"
@@ -25,6 +26,14 @@ class PrefabPlacer {
   // dispatch would race on GPU write order, so colliding voxels retry next
   // tick. Voxels whose chunk streamed out are dropped.
   void PreTick(const World& world, std::vector<CellOp>& cellOps);
+
+  // Queue exact voxel words at world cells, 0 = air (the in-game editor's
+  // live preview of a structure edit, ui/editor_ui.h): drained by PreTick
+  // like a stamp, so the write is an ordinary cell op in the tick's stream.
+  // LAST write per cell wins (an edit and its undo in one frame): the cell-op
+  // canonicalization keeps the FIRST op on a cell, so duplicates are
+  // collapsed here, including against what is still pending.
+  void QueueWords(const std::vector<std::pair<IVec3, uint32_t>>& cells);
 
   size_t PendingCount() const { return pending_.size(); }
 

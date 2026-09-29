@@ -113,6 +113,8 @@
 #include "world/refs.h"
 #include "world/refs_game.h"
 #include "world/structures.h"
+#include "editor/commands.h"
+#include "ui/editor_ui.h"
 #include "crash.h"
 
 // The sim/render plumbing these once defined in place now lives in
@@ -414,6 +416,21 @@ float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
 bool g_shotDialogue = false;
 constexpr uint64_t kShotDlgSpawn = 90, kShotDlgBegin = 130, kShotDlgShot1 = 160,
                    kShotDlgChoose = 170, kShotDlgShot2 = 200, kShotDlgLast = 206;
+
+// `--shot-editor`: the IN-GAME EDITOR's look-iteration harness (ui/editor_ui.h,
+// PLAN_world_editor P5). Enters F8 mode, places a sample house on the
+// flattest spot 20 m around the player at 11:00 (a scratch refs group
+// "_shot_editor", undone at the end so the map is left byte-identical),
+// opens it with a box selection and a
+// paste ghost (screenshot_editor_house.bmp, screenshot_editor_paste.bmp), then
+// closes it and selects a villager with the gizmo showing
+// (screenshot_editor_refs.bmp).
+bool g_shotEditor = false;
+// Late on purpose: the near window and the far field finish building first
+// (a paused editor would otherwise photograph a half-built world).
+constexpr uint64_t kShotEdEnter = 540, kShotEdPlace = 545, kShotEdOpen = 640, kShotEdShot1 = 700,
+                   kShotEdPaste = 706, kShotEdShot2 = 722, kShotEdRefs = 728, kShotEdShot3 = 800,
+                   kShotEdUndo = 806, kShotEdLast = 830;
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
@@ -4722,6 +4739,11 @@ int main(int argc, char** argv) {
   // --mapcheck <name> — load one map exactly as the game would and print its
   // load warnings / refusal as JSON (the World map page's warnings panel).
   std::string mapcheckName;
+  // --edit-script <file.jsonl> — apply editor commands headlessly and save
+  // (PLAN_world_editor P5, editor/commands.h). --edit-commands lists them.
+  std::string editScript;
+  bool editCommands = false;
+  bool editNoSave = false;
   // --voxdump ox,oy,oz,nx,ny,nz,lod[,seed] / --voxserve (tools/voxregion.h)
   std::string voxdumpArgs;
   std::string voxdumpOut = "build/voxregion.bin";
@@ -4829,6 +4851,11 @@ int main(int argc, char** argv) {
           "  --shot-devpanel       One BMP per F1 sidebar page\n"
           "  --shot-dialogue       The conversation panel: screenshot_dialogue.bmp\n"
           "                        (entry node) and _2.bmp (the choice rows)\n"
+          "  --shot-editor         The in-game editor (F8): screenshot_editor_house,\n"
+          "                        _paste and _refs.bmp (a sample house, undone after)\n"
+          "  --edit-script F.jsonl Apply editor commands headlessly, then save\n"
+          "                        (all or nothing; --edit-no-save skips the save)\n"
+          "  --edit-commands       List the editor commands and their arguments\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
           "  --shot-spellpage      The spell page, one BMP per word list:\n"
@@ -5264,6 +5291,16 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--heightmap-out wants a path\n"); return 1; }
       heightmapOut = argv[++i];
     }
+    else if (a == "--edit-script") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--edit-script wants a .jsonl file\n"); return 1; }
+      editScript = argv[++i];
+    }
+    else if (a == "--edit-commands") editCommands = true;
+    else if (a == "--edit-no-save") editNoSave = true;
+    else if (a == "--shot-editor") {
+      g_shotEditor = true;
+      g_harnessFrames = kShotEdLast;
+    }
     else if (a == "--mapcheck") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--mapcheck wants a map name\n"); return 1; }
       mapcheckName = argv[++i];
@@ -5404,6 +5441,41 @@ int main(int argc, char** argv) {
     ok = ok && biomes::LoadBiomeSet(ad, m, set, blog);
     ok = ok && worldmap::LoadWorldMap(ad, mapcheckName, set, m.size(), kDefaultSeed, map, blog);
     std::printf("MAPCHECK %s\n", worldmap::MapCheckJson(mapcheckName, ok, map, ok ? "" : blog).c_str());
+    return 0;
+  }
+
+  // --edit-commands / --edit-script (editor/commands.h): GPU-free. The script
+  // edits the map's refs files and structure assets exactly as the in-game
+  // editor (F8) would, all-or-nothing, then saves every structure it touched.
+  if (editCommands) {
+    std::printf("%s", editor::CommandListText().c_str());
+    return 0;
+  }
+  if (!editScript.empty()) {
+    Tuning tune;
+    LoadTuning(AssetDir() + "/materials/tuning.json", tune);
+    SetCurrentTuning(tune);
+    const std::string ad = AssetDir();
+    refs::RegisterAllKinds();
+    refs::RefStore store;
+    const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+    store.LoadMap(ad, mapName);
+    editor::Session es;
+    es.ctx.refs = &store;
+    es.ctx.assetDir = ad;
+    es.ctx.mats = editor::LoadMaterialNames(ad);
+    editor::ScriptResult res;
+    const bool ok = editor::RunScript(es, editScript, res, !editNoSave);
+    if (!ok) {
+      std::fprintf(stderr, "EDIT-SCRIPT FAILED: %s\n(nothing was changed: every step this run applied was undone)\n",
+                   res.error.c_str());
+      return 1;
+    }
+    std::printf("EDIT-SCRIPT OK: %s: %d command(s) on map '%s'", editScript.c_str(), res.applied,
+                mapName.c_str());
+    for (const std::string& a : res.saved) std::printf(", saved %s", a.c_str());
+    std::printf("\n");
+    for (const std::string& w : store.Warnings()) std::printf("  refs warning: %s\n", w.c_str());
     return 0;
   }
 
@@ -6743,7 +6815,7 @@ int main(int argc, char** argv) {
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
 
-  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eJ, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
   // THE HANDS (dual wielding, 2026-09-27): Q puts the selected hotbar stack
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
@@ -9106,6 +9178,18 @@ int main(int argc, char** argv) {
     tickCtx.refs = &refStore;
     ui.refs = &refStore;
   }
+  // ---- THE IN-GAME EDITOR (F8; ui/editor_ui.h, PLAN_world_editor P5) -----
+  // Owns its own camera and a command session over the map's refs and the
+  // structure assets. While it is on the sim is PAUSED (ui.paused), and each
+  // edit runs exactly one tick (ui.stepOnce) so its ops land.
+  editor_ui::EditorMode editorMode;
+  editorMode.Init(ui.refs, assetDir,
+                  [](int x, int z) { return World::TerrainHeight(x, z, kDefaultSeed); });
+  bool edPausedBefore = false;
+  bool edVisibleBefore = true;
+  int edCatchUpTicks = 0;
+  bool edCapturedBefore = true;
+  float edCamYaw = 0.0f, edCamPitch = 0.0f;
   if (netRoleBoot != NetRole::None) tickCtx.remotes = &remotes;
   // ...and so does the op exchange. Null in every harness and in every
   // single-player frame; even here it does nothing until Connected().
@@ -9192,7 +9276,8 @@ int main(int argc, char** argv) {
       // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
       static const bool noReload =
           std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire ||
-          g_shotDialogue;  // the reload would wipe the listener it spawned
+          g_shotDialogue ||  // the reload would wipe the listener it spawned
+          g_shotEditor;      // ...or the house it placed
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -9972,7 +10057,143 @@ int main(int argc, char** argv) {
     //             unreachable because a menu is up.
     const bool uiTyping = overlay.WantsKeyboard();
     const bool devKeys = !uiTyping;
-    const bool gameKeys = !ui.inventoryOpen && !ui.talk.open && !uiTyping;
+    // The editor (F8) owns the keyboard and the mouse while it is on: no game
+    // binding may fire under it (its own keys are read through ImGui).
+    const bool edActive = editorMode.Active();
+    const bool gameKeys = !ui.inventoryOpen && !ui.talk.open && !uiTyping && !edActive;
+    // F8: into the editor -- pause, free the cursor, detach the camera.
+    auto enterEditor = [&]() {
+      edPausedBefore = ui.paused;
+      edCapturedBefore = captured;
+      edCamYaw = cam.yaw;
+      edCamPitch = cam.pitch;
+      // The F1 sidebar folds away (F1 brings it back): the editor's own
+      // panels take the screen edges.
+      edVisibleBefore = ui.visible;
+      ui.visible = false;
+      ui.paused = true;
+      captured = false;
+      glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+      glfwGetCursorPos(window, &mx0, &my0);
+      editorMode.Enter(player.EyePos(), cam.yaw, cam.pitch);
+    };
+    if (devKeys && eF8.Pressed(key(GLFW_KEY_F8))) {
+      if (!edActive) enterEditor();
+      else editorMode.RequestExit();
+    }
+    // "open in editor" on the References page (a structure ref id).
+    if (!ui.structOpenRequest.empty()) {
+      if (!editorMode.Active()) enterEditor();
+      editorMode.OpenStructureRef(ui.structOpenRequest);
+      ui.structOpenRequest.clear();
+    }
+    // ---- --shot-editor's schedule (see g_shotEditor) ----------------------
+    if (g_shotEditor) {
+      static const std::string kHouse = "_shot_editor/house";
+      static IVec3 at{};
+      const uint64_t f = frameCounter;
+      editor::Session& es = editorMode.Session();
+      int ww = 1, wh = 1;
+      glfwGetWindowSize(window, &ww, &wh);
+      std::string err;
+      if (f == kShotEdPlace) {
+        std::error_code ec;
+        std::filesystem::remove(assetDir + "/worldmap/" + refsMapName() + "/refs/_shot_editor.json", ec);
+        if (ui.refs == nullptr) {
+          std::fprintf(stderr, "--shot-editor: no refs store (harness map?)\n");
+        } else {
+          refStore.LoadMap(assetDir, refsMapName());
+          // The flattest of 16 spots 20 m around the player (the terrain
+          // column's spread over the footprint), in daylight.
+          int bestSpread = INT32_MAX;
+          for (int k = 0; k < 16; k++) {
+            const float a = (float)k / 16.0f * 6.2831853f;
+            const int x = ifloor(player.pos.x + std::cos(a) * 200.0f), z = ifloor(player.pos.z + std::sin(a) * 200.0f);
+            int lo = INT32_MAX, hi = INT32_MIN;
+            for (int dz = -50; dz <= 50; dz += 25)
+              for (int dx = -50; dx <= 50; dx += 25) {
+                const int h = World::TerrainHeight(x + dx, z + dz, kDefaultSeed);
+                lo = std::min(lo, h);
+                hi = std::max(hi, h);
+              }
+            if (hi - lo < bestSpread) {
+              bestSpread = hi - lo;
+              at = {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z};
+            }
+          }
+          ui.jumpClockMinute = 11 * 60;
+          if (!es.Run("ref.place", editor::Json{{"id", kHouse}, {"kind", "structure"}, {"base", "samples/smithy"},
+                                                {"pos", {at.x, at.y, at.z}}, {"yaw", 90}}, &err))
+            std::fprintf(stderr, "--shot-editor: place: %s\n", err.c_str());
+          std::printf("--shot-editor: placed %s at %d %d %d\n", kHouse.c_str(), at.x, at.y, at.z);
+        }
+      }
+      if (f == kShotEdEnter && !editorMode.Active()) enterEditor();
+      if (f == kShotEdOpen) {
+        editorMode.OpenStructureRef(kHouse);
+        editorMode.SetTool(4);
+        // A window bay in the front wall, and one real edit so the unsaved
+        // marker and the live preview are in the picture.
+        es.Run("vox.box_fill", editor::Json{{"min", {-16, 4, 34}}, {"max", {-8, 12, 36}}, {"mat", "timber"}}, &err);
+        editorMode.SetSelection({-30, 0, 28}, {-4, 24, 36});
+        // From the front (+X at yaw 90) and high, over the neighbours' crowns.
+        const Vec3 c{(float)at.x, (float)at.y + 25.0f, (float)at.z};
+        const Vec3 eyeAt = c + Vec3{105.0f, 80.0f, -55.0f};
+        const Vec3 d = (c - eyeAt).normalized();
+        editorMode.SetCamera(eyeAt, std::atan2(d.z, d.x), std::asin(d.y));
+        editorMode.SetScriptedCursor(ww * 0.52f, wh * 0.55f);
+      }
+      if (f == kShotEdShot1) {
+        g_shotJumpPath = "screenshot_editor_house.bmp";
+        std::printf("--shot-editor: tick %u, far fills pending %zu\n", tick, far.PendingFills());
+      }
+      if (f == kShotEdPaste) {
+        es.Run("vox.copy", editor::Json{{"min", {-30, 0, 28}}, {"max", {-4, 24, 36}}}, &err);
+        editorMode.StartPaste();
+        editorMode.SetScriptedCursor(ww * 0.50f, wh * 0.47f);
+      }
+      if (f == kShotEdShot2) g_shotJumpPath = "screenshot_editor_paste.bmp";
+      if (f == kShotEdRefs) {
+        editorMode.SetScriptedCursor(-1, -1);
+        es.Undo(&err);   // the window-bay fill: back to the saved house
+        es.Run("struct.close", editor::Json::object(), &err);
+        editorMode.SetTool(1);
+        const IVec3 front{at.x + 60, World::TerrainHeight(at.x + 60, at.z + 10, kDefaultSeed) + 1, at.z + 10};
+        es.Run("ref.place", editor::Json{{"id", "_shot_editor/osric"}, {"kind", "npc"}, {"base", "human"},
+                                         {"pos", {front.x, front.y, front.z}}, {"yaw", 270},
+                                         {"props", {{"name", "Osric"}}}}, &err);
+        es.Run("ref.place", editor::Json{{"id", "_shot_editor/path_a"}, {"kind", "waynode"},
+                                         {"pos", {front.x + 12, front.y, front.z - 14}}, {"yaw", 0}}, &err);
+        es.Run("ref.place", editor::Json{{"id", "_shot_editor/path_b"}, {"kind", "waynode"},
+                                         {"pos", {front.x + 14, front.y, front.z + 16}}, {"yaw", 0}}, &err);
+        es.Run("ref.link", editor::Json{{"a", "_shot_editor/path_a"}, {"b", "_shot_editor/path_b"}}, &err);
+        editorMode.SelectRef("_shot_editor/osric");
+        edCatchUpTicks = 40;   // let the villager's ground wait finish and it spawn
+        const Vec3 c{front.x + 0.5f, front.y + 9.0f, front.z + 0.5f};
+        const Vec3 eyeAt = c + Vec3{-30.0f, 42.0f, 62.0f};
+        const Vec3 d = (c - eyeAt).normalized();
+        editorMode.SetCamera(eyeAt, std::atan2(d.z, d.x), std::asin(d.y));
+      }
+      if (f == kShotEdShot3) g_shotJumpPath = "screenshot_editor_refs.bmp";
+      if (f == kShotEdUndo) {
+        int n = 0;
+        while (es.UndoDepth() > 0 && es.Undo(&err)) n++;
+        std::error_code ec;
+        const bool gone = !std::filesystem::exists(
+            assetDir + "/worldmap/" + refsMapName() + "/refs/_shot_editor.json", ec);
+        std::printf("--shot-editor: undid %d step(s); scratch refs file removed: %s\n", n, gone ? "yes" : "NO");
+        editorMode.RequestExit();
+      }
+    }
+    if (editorMode.TakeExited()) {
+      ui.paused = edPausedBefore;
+      ui.visible = ui.visible || edVisibleBefore;
+      captured = edCapturedBefore;
+      cam.yaw = edCamYaw;
+      cam.pitch = edCamPitch;
+      glfwSetInputMode(window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+      glfwGetCursorPos(window, &mx0, &my0);
+    }
 
     // I opens and closes the character screen. Opening frees the cursor and
     // remembers what capture WAS, so closing restores it rather than assuming.
@@ -10002,7 +10223,7 @@ int main(int argc, char** argv) {
     // did. Escape meaning "back out of the thing in front of me" before it
     // means "let go of the mouse" is the order every game uses, and it is the
     // one that does not strand a player with a menu they cannot dismiss.
-    if (devKeys && eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
+    if (devKeys && !edActive && eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
       // A conversation first: Esc is "leave", when the node allows it (a
       // command for the tick, like every other answer).
       if (ui.talk.open) {
@@ -10134,9 +10355,9 @@ int main(int argc, char** argv) {
 
     // The DEV tier: still live with the character screen open, dead while an
     // ImGui field has focus.
-    if (devKeys && eP.Pressed(key(GLFW_KEY_P))) ui.paused = !ui.paused;
-    if (devKeys && ui.devControls && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
-    if (devKeys && ui.devControls && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
+    if (devKeys && !edActive && eP.Pressed(key(GLFW_KEY_P))) ui.paused = !ui.paused;
+    if (devKeys && !edActive && ui.devControls && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
+    if (devKeys && !edActive && ui.devControls && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
     if (devKeys && eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
     // F2: PLAY <-> DEV controls (UIState::devControls). The transition itself
     // is applied below, where the checkbox path lands too.
@@ -10172,7 +10393,7 @@ int main(int argc, char** argv) {
     }
     if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
-    if (devKeys && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
+    if (devKeys && !edActive && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
     if (gameKeys && ui.devControls && eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
       ui.brushRadius = std::max(1, ui.brushRadius - 1);
     if (gameKeys && ui.devControls && eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
@@ -11216,6 +11437,7 @@ int main(int argc, char** argv) {
         tickCtx.refs = nullptr;
         ui.refs = nullptr;
       }
+      editorMode.SetStore(ui.refs);
       // The avatar's severed parts live in DebrisSystem and its live limbs are
       // Jolt bodies in the world that just went away; despawn rather than
       // leave it holding handles into a system that has been reset. The
@@ -11240,6 +11462,10 @@ int main(int argc, char** argv) {
                         "edited chunks reset (%s)", rep.changed.size(), rep.chunks, rep.dropped,
                         why.c_str());
           ui.structReapplyStatus = line;
+          // In the editor the world is paused, but a re-stamp needs ticks to
+          // SHOW (the occupancy / far refill / wake run inside the tick): let
+          // it run for ~1.5 s of ticks, one per frame.
+          if (editorMode.Active()) edCatchUpTicks = 60;
         } else {
           std::fprintf(stderr, "%s", rep.log.c_str());
           ui.structReapplyStatus = "re-apply REFUSED: the environment did not reload (see stderr)";
@@ -12268,6 +12494,14 @@ int main(int argc, char** argv) {
         Vec3 focus = eye;
         tpRig.Update(dt, camMode, cam, focus, loco, world, kindAt);
         if (camMode != CameraMode::First) eye = tpRig.EyePos();
+        // THE EDITOR'S CAMERA (F8) is detached from the body: it renders
+        // from its own eye and angles (restored on exit). Render-only, like
+        // the boom: the sim is paused and reads player.EyePos() anyway.
+        if (editorMode.Active()) {
+          eye = editorMode.CamPos();
+          cam.yaw = editorMode.CamYaw();
+          cam.pitch = editorMode.CamPitch();
+        }
         pourFrom = eye;
         pourFromValid = true;
 
@@ -12289,7 +12523,7 @@ int main(int argc, char** argv) {
           // player is armed and the weapon would never be addressable here.
           hide.assign(avatar.PartCount(), 0);
           const int heldPart = avatar.HeldSlot();
-          if (camMode == CameraMode::First) {
+          if (camMode == CameraMode::First && !editorMode.Active()) {
             // Show the whole body except the head (its inside would fill the
             // view). Worn shells over the head are hidden too -- and so is
             // anything else hung off it, which since long hair became a BASE
@@ -15021,8 +15255,40 @@ int main(int argc, char** argv) {
       // numbers spelled out, so drawing the corner chrome underneath it is two
       // readouts of the same thing fighting for the same corner.
       // ...and while talking: the conversation panel sits where the hotbar is.
-      if (!ui.inventoryOpen && !ui.talk.open) overlay.DrawHUD(ui);
+      if (!ui.inventoryOpen && !ui.talk.open && !editorMode.Active()) overlay.DrawHUD(ui);
       overlay.Draw(ui);
+      // ---- THE EDITOR (F8): its panels, overlays and input, then its world
+      // preview through the MutationQueue: the open house's changed cells
+      // become cell ops (PrefabPlacer, drained inside the tick) and ONE tick
+      // runs so they land -- the sim stays paused otherwise.
+      if (editorMode.Active()) {
+        ui.paused = true;
+        editorMode.Frame(ui, dt, cam.fovY);
+      }
+      {
+        std::vector<std::pair<IVec3, uint16_t>> cells = editorMode.TakeWorldCells();
+        if (!cells.empty()) {
+          std::vector<std::pair<IVec3, uint32_t>> words;
+          words.reserve(cells.size());
+          IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX}, hi{INT32_MIN, INT32_MIN, INT32_MIN};
+          for (const auto& [c, m] : cells) {
+            uint32_t w = 0;
+            if (m != 0 && m < mats.size()) {
+              const uint32_t h = (uint32_t)c.x * 73856093u ^ (uint32_t)c.y * 19349663u ^ (uint32_t)c.z * 83492791u;
+              w = PackVoxNew(m, mats[m].gpu.klass == CLASS_LIQUID ? 7u : (h >> 8) % 3u);
+            }
+            words.push_back({c, w});
+            lo = {std::min(lo.x, c.x), std::min(lo.y, c.y), std::min(lo.z, c.z)};
+            hi = {std::max(hi.x, c.x), std::max(hi.y, c.y), std::max(hi.z, c.z)};
+          }
+          placer.QueueWords(words);
+          stream.MarkModifiedBox(lo, hi);
+        }
+        if (editorMode.TakeWantsTick()) ui.stepOnce = true;
+        if (edCatchUpTicks > 0) {
+          edCatchUpTicks--;
+          ui.stepOnce = true;
+        }      }
 
       // Wind force multipliers. Its OWN latch, and deliberately not folded
       // into fluidTuningDirty below: that path ends in sim.ReloadShaders(),

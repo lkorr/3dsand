@@ -560,6 +560,10 @@ add_library(sandvox_core OBJECT
   # STRUCTURE INSTANCES (PLAN_world_editor.md P4): `structure` refs -> worldgen
   # stamp sites, slots -> derived child refs. See src/world/structures.h.
   src/world/structures.cpp
+  # PLAN_world_editor P5: editor commands (undo/redo, journal, --edit-script) +
+  # the structure edit buffer. See src/editor/commands.h.
+  src/editor/commands.cpp
+  src/editor/struct_edit.cpp
   src/world/refs_doors.cpp
   # P7 NPC residents: the npc + waynode kinds, schedules, the day's routing.
   src/world/refs_npc.cpp
@@ -616,6 +620,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_refs.cpp
   src/test/selftest_npc.cpp
   src/test/selftest_structure.cpp
+  src/test/selftest_editor.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp
@@ -655,6 +660,7 @@ add_library(sandvox_core OBJECT
   # F1 -> World -> References: the ref list + inspector (world/refs.h).
   src/ui/refs_ui.cpp
   src/ui/refs_npc_ui.cpp
+  src/ui/editor_ui.cpp
   # spellgraph_ui.cpp is the composer's CANVAS: it draws UIState::spellGraph
   # (main.cpp's mirror of game/spellgraph.h) and turns a gesture into a
   # GraphEditIntent. It applies no op itself.

@@ -1004,10 +1004,8 @@ until NPC residents arrive. Schedules and dialogue can name any slot by id.
 ### I edited the blueprint — how do I see it in the world?
 
 Select any house built from it and press **reload asset**. Every copy of that
-blueprint is re-stamped, and its slots are re-read. (The in-game editor, when it
-arrives, does this for you on save. **open in editor** is its button; for now it
-tells you to edit the `.vox` in MagicaVoxel or regenerate on Environment →
-Structures.)
+blueprint is re-stamped, and its slots are re-read. The in-game editor (F8,
+§13) does this for you on save; **open in editor** is its button.
 
 Editing the refs file in a text editor and pressing **R** works too, and **F7**
 (regenerate the world) always shows the latest of everything.
@@ -1027,3 +1025,254 @@ Editing the refs file in a text editor and pressing **R** works too, and **F7**
   `--gate structure-reload` (the live re-build equals a fresh world).
   `SANDVOX_STRUCTURE_SHOT=house.bmp` with `structure-stamp` also saves a
   picture.
+
+---
+
+## 13. Editor mode — building in the game (F8)
+
+Editor mode is where you build a place by hand: the houses' walls, doors and
+furniture, and every villager, chest and path in the map. It runs inside the
+game, on the real world.
+
+**Press F8.** The game stops being played:
+
+- **The world pauses.** The orange **WORLD PAUSED** at the top-left means
+  nothing burns, flows or walks while you work. Each edit you make advances the
+  world by exactly one tick so the change reaches it (so sand you paint does
+  fall one step). F8 again returns you to your body where you left it.
+- **The camera leaves your body.** Hold the **right mouse button** and move the
+  mouse to look; **W A S D** fly, **Q / E** go down / up, **Shift** is 4x
+  faster, the **mouse wheel** sets the speed (shown in the toolbar). **F**
+  frames whatever is selected.
+- **The cursor is free** and three panels come up: the **toolbar** (left),
+  the **inspector** (right, when something is selected) and the **status bar**
+  (bottom: tool, selection size, `* unsaved`, undo / redo depth, the keys for
+  the tool in your hand, and the last thing that happened — red when something
+  was refused, with the reason).
+
+Everything you do is **undoable**: **Ctrl+Z** undo, **Ctrl+Y** (or
+Ctrl+Shift+Z) redo, 256 steps. A brush drag or a cut is one step.
+
+### Two kinds of thing you edit
+
+| | What | Saved |
+|---|---|---|
+| **References** | villagers, doors, chests, beds, markers, waynodes, and where each house stands (`assets/worldmap/<map>/refs/*.json`) | **immediately**, every edit |
+| **A house** (open it first) | its voxels and its slots — the doors, beds, chests, markers and paths that are part of the blueprint (`assets/structures/<name>.vox` + `.struct.json`) | on **Ctrl+S**; until then it is shown live in the world and the status bar says `* unsaved` |
+
+Saving a house re-stamps **every copy** of it in the world (the same thing as
+**reload asset**), marks it `handEdited` so the generator on the Structures page
+never overwrites it, and moves the world hash (that is expected). Placing,
+moving or saving a house lets the world run for about two seconds so the
+rebuilt ground and house appear; otherwise it stays paused.
+
+### The keys
+
+| Key | Does |
+|---|---|
+| `F8` | enter / leave the editor (leaving asks about unsaved houses: Save all / Discard / Keep editing) |
+| right mouse + drag | look |
+| `W A S D`, `Q E` | fly, down / up (`Shift` 4x) |
+| mouse wheel | flying speed |
+| `F` | frame the selection |
+| `1` – `8` | tools: Select, Pencil, Brush, Box, Line, Eyedropper, Place, Link |
+| `Ctrl+Z` / `Ctrl+Y` | undo / redo |
+| `Ctrl+S` | save the open house |
+| `Esc` | cancel what you are doing (paste, line, link), then clear the selection |
+| `H` | show all the keys in a window |
+
+### The tools
+
+**1 Select.** Click a thing (its box and label are drawn in its kind's colour)
+to select it; the inspector opens on the right. A selected thing has a
+**gizmo**: drag the **red / green / blue arrow** to move it along x / y / z one
+voxel at a time (hold **Shift** for 1 m steps), drag the **yellow ring** to turn
+it (15° steps; houses and slots in 90° steps — the red line shows which way it
+faces). Keyboard: **arrows** nudge x / z, **PgUp / PgDn** nudge y, **R** turns
+(Shift+R back), **Delete** deletes (Ctrl+Z puts it back on the same line of its
+file), **Ctrl+D** duplicates. **Double-click a house** to open it.
+
+**2 Pencil** *(house open)*. Click a face to put one voxel on it; drag to draw.
+**Shift+click** erases the voxel under the cursor. **Alt+click** takes its
+material. The cursor shows the cell a click will fill.
+
+**3 Brush** *(house open)*. Paints a sphere, or a cube (**B** toggles), of the
+current material at the cursor. **[ / ]** size. Shift erases, Alt picks.
+
+**4 Box** *(house open)*. Drag across the house to select a box (drawn in blue
+with its size). **PgUp / PgDn** raise / lower the top (with **Shift**, the
+bottom); **arrows** slide the box, **Ctrl+arrows** move the voxels in it; the
+toolbar has the exact min / max to type into. Then:
+
+| Key / button | Does |
+|---|---|
+| `Enter` — **Fill** | fill the box with the current material |
+| `Shift+Enter` — **Walls** | the six faces in the material (walls, floor, ceiling), inside untouched |
+| `Backspace` — **Hollow** | empty the inside, keep the faces (carve a room out of a block) |
+| `Delete` — **Clear** | empty it |
+| `T` — **replace** | every voxel of the "replace" material (the list shows what is in the box) becomes the current one |
+| `Ctrl+C` / `Ctrl+X` | copy / cut |
+| `Ctrl+V` — **Paste...** | a green **ghost** of the copy follows the cursor; **R** turns it 90°, **M** mirrors it (x, then z, then off), hold **Shift** to leave the air in the copy out; **click** to land it (click again for another copy), **Esc** to stop |
+
+**5 Line** *(house open)*. Click one end, then the other: a beam of the current
+material between them. **[ / ]** thickness (0 = one voxel). Shift-click ends on
+the voxel itself instead of on its face.
+
+**6 Eyedropper** *(house open)*. Click a voxel of any house to take its
+material (Alt+click does this in the other voxel tools).
+
+**The material** is shown with a **change** button in the voxel tools; the
+picker is the same one as the F1 brush (search, columns by class). A house can
+only hold materials 1–255.
+
+**7 Place.** With **no house open** it places **references** into the map: pick
+a kind (npc, door, container, bed, marker, waynode, structure), the group file
+it goes in (`village` → `refs/village.json`; ids are `<group>/<kind>_<n>`) and
+the facing, then click the ground or a floor. For **structure**, pick the
+blueprint: its footprint box follows the cursor with its front marked. With
+**a house open** it adds **slots** to the house instead (door, bed, container,
+marker, waynode), with sensible starting boxes: a 9 x 20 door leaf, a bed frame,
+a chest box.
+
+**8 Link.** Click a waynode, then another: they are joined (a link is two-way;
+it is written on the first one you clicked, or on whichever is not part of a
+house). **Shift+click** the second to unlink. Inside an open house, linking two
+slots writes the house's own path.
+
+### Editing a house
+
+1. Open it: **double-click** it with Select, double-click it in the toolbar's
+   **Houses in this map** list, or press **open in editor** on the References
+   page (F1 → World → References). The camera swings to a three-quarter view.
+2. The house's **box** (gold), its **front** (red line) and its **slots** are
+   drawn. Doors show their leaf, the **orange swing** and the **red hinge** —
+   if a door opens into a wall you see it before anyone tries.
+3. Edit with tools 2–6. Everything you do shows in the world at once.
+   **A turned house edits correctly**: you work on the house as it stands, and
+   the editor writes the change into the blueprint's own frame.
+4. Slots: select one (Select tool), drag it with the gizmo, or type its pos /
+   yaw / props in the inspector. Props in a house are in the **house frame**
+   (0 0 0 = the front-centre floor cell, y up, +z toward the front). Delete
+   removes a slot; Place adds one.
+5. **Ctrl+S** saves (or **Save** in the toolbar). **Close house** asks first if
+   there is anything unsaved (Save then close / Discard / Cancel).
+
+The blueprint may grow past its old box (a porch, a chimney): the files are
+re-based around the house's anchor, so nothing else moves. A `.vox` is at most
+256 voxels on a side; the save says so if you go past it.
+
+### The inspector
+
+For a **reference**: kind, base, pos / yaw (type and **apply**), every prop as
+JSON (`3`, `true`, `"text"`, `["a", "b"]`; a bare word is text; Enter applies,
+`x` removes, the last row adds), **duplicate**, **delete**, **open house** for a
+structure — and underneath, the same panels as the References page: a door's
+hinge / angle / size / locked with **test open/close**, a chest's contents, a
+bed's line, a villager's schedule and live state, a waynode's links. Their
+edits are undoable here too.
+
+For a **slot**: pos / yaw in the house frame, its props, **remove slot**.
+
+A slot of a house you have NOT opened is read-only (it comes from the
+blueprint) — the inspector offers **open its house**.
+
+### The session journal
+
+Every command you run is appended to `build/editor/session_<date>_<time>.jsonl`
+(the path is at the bottom of the **H** window). It is an edit script: read it
+to see what you did, or replay it with `--edit-script`.
+
+### Edit scripts (building from a text file)
+
+```bash
+bash scripts/run.sh ./build/Release/sandvox.exe --edit-script my_village.jsonl
+./build/Release/sandvox.exe --edit-commands          # every command and its arguments
+```
+
+One command per line, as JSON: `{"cmd": "<name>", "args": {...}}` (or the args
+inline). `#` and `//` lines are comments. It runs on the map the game would
+load (`SANDVOX_MAP=<name>` picks another) and is **all or nothing**: if any
+line is refused, everything the script had done is undone and the error names
+the file, the line, the command and the field:
+
+    EDIT-SCRIPT FAILED: my_village.jsonl:12: vox.box_fill: mat: "cobbel" is not a material in materials.json (did you mean "cobble"?)
+
+On success every house it edited is saved. `--edit-no-save` leaves houses
+unsaved (refs are still written).
+
+Coordinates: **refs in world voxels**. **Voxels and slots in the house frame**
+of the open house (y = 0 is the floor, +z the front, unrotated — the same
+numbers whichever way a copy is turned), or in world voxels with
+`"frame": "world"` (converted through the copy you opened).
+
+```
+# a well, a villager, a path node joined to the smithy's front door node
+{"cmd": "ref.place", "args": {"id": "harrowby/well", "kind": "marker", "pos": [4120, 188, 3960], "props": {"tags": ["gather", "water"]}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/osric", "kind": "npc", "base": "human", "pos": [4130, 188, 3972], "yaw": 180, "props": {"name": "Osric"}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/path_1", "kind": "waynode", "pos": [4125, 188, 3965]}}
+{"cmd": "ref.link",  "args": {"a": "harrowby/path_1", "b": "harrowby/smithy/waynode_front_0_out"}}
+# the smithy: a hearth, a window bay, a ceiling beam, a new chest slot
+{"cmd": "struct.open",  "args": {"ref": "harrowby/smithy"}}
+{"cmd": "vox.box_fill", "args": {"min": [-40, 0, -6], "max": [-34, 8, 6], "mat": "cobble"}}
+{"cmd": "vox.clear",    "args": {"min": [-16, 8, 36], "max": [-10, 14, 36]}}
+{"cmd": "vox.line",     "args": {"from": [-40, 22, -30], "to": [40, 22, -30], "mat": "timber", "radius": 1}}
+{"cmd": "slot.add",     "args": {"name": "chest_1", "kind": "container", "pos": [20, 0, 10], "props": {"box": {"min": [17, 0, 8], "max": [23, 4, 12]}, "items": [{"item": "bread", "count": 3}]}}}
+{"cmd": "struct.save",  "args": {}}
+```
+
+**The commands** (`--edit-commands` prints this list from the build you have):
+
+| Command | Args | Does |
+|---|---|---|
+| `ref.place` | `{id, kind, base?, pos, yaw?, props?}` | a new reference |
+| `ref.move` | `{id, pos?, by?, yaw?}` | move / turn |
+| `ref.set_prop` | `{id, key, value}` | set a prop (`null` removes it) |
+| `ref.set_field` | `{id, field: "kind" or "base", value}` | change kind / base |
+| `ref.delete` | `{id}` | delete |
+| `ref.duplicate` | `{id, as, by?}` | copy to a new id |
+| `ref.link` / `ref.unlink` | `{a, b}` | join / part two waynodes |
+| `struct.open` | `{ref}` or `{asset}` | open a house for editing |
+| `struct.save` | `{struct?}` | write it and re-stamp every copy |
+| `struct.close` | `{discard?}` | stop editing (refuses unsaved edits unless `discard`) |
+| `struct.revert` | `{struct?}` | throw away unsaved edits |
+| `vox.set` | `{pos, mat}` | one voxel (`"air"` erases) |
+| `vox.set_cells` | `{cells: [[x, y, z, mat], ...]}` | a list of voxels |
+| `vox.brush` | `{pos, radius, shape?: "sphere" or "cube", mat}` | a ball / block |
+| `vox.box_fill` | `{min, max, mat}` | fill a box |
+| `vox.clear` | `{min, max}` | empty a box |
+| `vox.box_hollow` | `{min, max}` | empty the inside, keep the faces |
+| `vox.box_shell` | `{min, max, mat}` | the six faces in a material |
+| `vox.replace` | `{min, max, from, to}` | swap one material for another in a box |
+| `vox.line` | `{from, to, mat, radius?}` | a beam |
+| `vox.copy` | `{min, max}` | to the clipboard |
+| `vox.paste` | `{pos, rot?: 0-3, mirror?: "none", "x" or "z", air?: "keep" or "skip"}` | the clipboard, min corner at pos (mirrored, then turned) |
+| `vox.move` | `{min, max, by}` | move a box of voxels |
+| `slot.add` | `{name, kind, pos, yaw?, props?}` | a slot in the open house |
+| `slot.move` | `{name, pos?, by?, yaw?}` | move / turn a slot (its boxes go with it) |
+| `slot.set_prop` | `{name, key, value}` | a slot prop |
+| `slot.remove` | `{name}` | remove a slot |
+| `batch` | `{cmds: [{cmd, args}, ...]}` | several commands as one undo step |
+| `undo` / `redo` | — | as Ctrl+Z / Ctrl+Y |
+
+Every vox / slot command also takes `"frame": "world"` and `"struct": "<asset>"`
+(a house that is loaded but not the open one). `mat` is a `materials.json`
+name (`"cobble"`) or id.
+
+### Troubleshooting
+
+- **A voxel tool is greyed out** — open a house first (double-click it).
+- **"opened by asset name"** — the house was opened without a placed copy
+  (a script's `{"asset": ...}`), so there is nothing in the world to click;
+  open a placed copy instead.
+- **My edit shows but the other copies of the house did not change** — they
+  update when you save (Ctrl+S).
+- **The far world looks unedited / cannot be clicked** — the loaded window
+  stays around your body (where you pressed F8, about 25 m each way); leave
+  the editor, walk there and press F8 again.
+- **Picking goes through a tree or a rock** — the editor's clicks see houses,
+  the ground and the placed things, not every voxel of the world.
+- **Check it works:** `--selftest --gate editor-commands` (every command,
+  undo-all byte-identical, redo-all byte-identical, a refused script changes
+  nothing) and `--gate editor-struct-edit` (a turned house edited in the
+  world, saved, re-stamped, equal to a fresh world). `--shot-editor` writes
+  three pictures of the editor.

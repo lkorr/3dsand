@@ -1,6 +1,7 @@
 #include "game/prefab.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace {
@@ -89,4 +90,22 @@ void PrefabPlacer::PreTick(const World& world, std::vector<CellOp>& cellOps) {
     budget--;
   }
   for (const PendingCell& pc : retry) pending_.push_front(pc);
+}
+
+void PrefabPlacer::QueueWords(const std::vector<std::pair<IVec3, uint32_t>>& cells) {
+  if (cells.empty()) return;
+  std::unordered_map<uint64_t, uint32_t> last;
+  last.reserve(cells.size() * 2);
+  for (const auto& [c, w] : cells) last[PackCell(c)] = w;
+  // Drop pending entries these supersede, then append in first-seen order.
+  std::deque<PendingCell> kept;
+  for (const PendingCell& pc : pending_)
+    if (!last.count(PackCell(pc.cell))) kept.push_back(pc);
+  pending_.swap(kept);
+  for (const auto& [c, w] : cells) {
+    auto it = last.find(PackCell(c));
+    if (it == last.end()) continue;
+    pending_.push_back({c, it->second});
+    last.erase(it);
+  }
 }

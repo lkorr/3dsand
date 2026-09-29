@@ -382,6 +382,10 @@ class RefStore {
   // undo needs to put it back.
   bool Erase(const std::string& id, std::string* err, Ref* removed = nullptr,
              int* fileIndex = nullptr);
+  // P5: undo of the Place that CREATED a group file. When `group` holds no
+  // refs, remove its file and forget the group (so the directory is byte-for-
+  // byte what it was). False (nothing done) when it still holds refs.
+  bool DropGroupIfEmpty(const std::string& group, std::string* err = nullptr);
 
  private:
   bool WriteGroupFile(const std::string& group, std::string* err);

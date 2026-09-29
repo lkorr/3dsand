@@ -29,3 +29,7 @@ void DrawRefsPage(UIState& s);
 // (links, add/remove by picking, autoLink, the graph drawn).
 void DrawNpcFields(UIState& s, refs::RefStore& st, const refs::Ref& r);
 void DrawWaynodeFields(UIState& s, refs::RefStore& st, const refs::Ref& r);
+
+// P5: the kind's own fields (door / container / bed / npc / waynode; nothing
+// for other kinds), for the in-game editor's inspector (ui/editor_ui.cpp).
+void DrawRefKindFields(UIState& s, refs::RefStore& st, const refs::Ref& r);

@@ -1463,6 +1463,13 @@ struct UIState {
   std::string structReapplyStatus;
 };
 
+// P5: the F1 material picker and the "current material" line, for the
+// in-game editor (ui/editor_ui.cpp). `ids` = the candidates (a structure can
+// only hold ids 1..255).
+bool OverlayMaterialPicker(const UIState& s, const char* id, const std::vector<int>& ids,
+                           int& selected, char* search, size_t searchN, float maxH);
+void OverlayCurrentMaterial(const UIState& s, int id, const char* what);
+
 class Overlay {
  public:
   // `assetDir` is where assets/ui/chrome.{bmp,json} live. A missing or broken

@@ -931,6 +931,21 @@ bool RefStore::Erase(const std::string& id, std::string* err, Ref* removed,
   return true;
 }
 
+bool RefStore::DropGroupIfEmpty(const std::string& group, std::string* err) {
+  auto it = groups_.find(group);
+  if (it == groups_.end()) return true;
+  if (!it->second.refs.empty()) {
+    if (err) *err = "group \"" + group + "\" still holds refs";
+    return false;
+  }
+  std::error_code ec;
+  fs::remove(GroupPath(group), ec);
+  groups_.erase(it);
+  groupOrder_.erase(std::remove(groupOrder_.begin(), groupOrder_.end(), group), groupOrder_.end());
+  revision_++;
+  return true;
+}
+
 // ---- the four authoring actions ---------------------------------------------
 
 bool Place(RefStore& s, const Ref& r, std::string* err, int fileIndex) {

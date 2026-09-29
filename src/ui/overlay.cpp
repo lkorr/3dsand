@@ -3338,3 +3338,12 @@ void Overlay::Shutdown() {
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
 }
+
+// ---- P5: the material picker, for the in-game editor (ui/editor_ui.cpp) ----------
+bool OverlayMaterialPicker(const UIState& s, const char* id, const std::vector<int>& ids,
+                           int& selected, char* search, size_t searchN, float maxH) {
+  return MaterialPicker(s, id, ids, selected, search, searchN, maxH);
+}
+void OverlayCurrentMaterial(const UIState& s, int id, const char* what) {
+  CurrentMaterial(s, id, what);
+}

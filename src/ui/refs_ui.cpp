@@ -544,10 +544,10 @@ void DrawRefsPage(UIState& s) {
                             sel->base.c_str());
       ImGui::SameLine();
       if (ImGui::Button("open in editor")) {
-        s.structOpenRequest = sel->base;
-        Status("the in-game structure editor is P5 and not in this build yet: edit "
-               "assets/structures/" + sel->base + ".vox in MagicaVoxel (or regenerate it on "
-               "Environment -> Structures), then press 'reload asset'", true);
+        // P5: the in-game editor (F8) opens this INSTANCE, so a turned house
+        // edits in its own frame (ui/editor_ui.h).
+        s.structOpenRequest = sel->id;
+        Status("opening " + sel->id + " (" + sel->base + ") in the editor (F8 mode)", false);
       }
       const std::vector<const refs::Ref*> kids = st.ChildrenOf(id);
       char kh[64];
@@ -774,4 +774,15 @@ void DrawRefsPage(UIState& s) {
     for (size_t i = w.size(); i-- > 0;) ImGui::TextWrapped("%s", w[i].c_str());
     ImGui::TreePop();
   }
+}
+
+// P5 (ui/editor_ui.cpp): the per-kind fields of the inspector, so the in-game
+// editor shows exactly the panels this page does (doors, chests, beds, P7's
+// npc and waynode) -- one implementation of each.
+void DrawRefKindFields(UIState& s, refs::RefStore& st, const refs::Ref& r) {
+  if (r.kind == "door") DrawDoorFields(s, st, r);
+  else if (r.kind == "container") DrawContainerFields(s, st, r);
+  else if (r.kind == "bed") DrawBedFields(s, r);
+  else if (r.kind == "npc") DrawNpcFields(s, st, r);
+  else if (r.kind == "waynode") DrawWaynodeFields(s, st, r);
 }

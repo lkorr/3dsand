@@ -89,6 +89,9 @@ const std::vector<Gate>& RefsGates();
 // NPC residents (docs/PLAN_world_editor.md P7, world/refs_npc.h).
 const std::vector<Gate>& NpcGates();
 const std::vector<Gate>& StructureGates();
+// The in-game editor's command layer (docs/PLAN_world_editor.md P5,
+// editor/commands.h).
+const std::vector<Gate>& EditorGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -585,6 +588,11 @@ const char* const kOrder[] = {
     // Derived doors / chests / beds are P6's kinds: cycles two doors through
     // the tick and restores the window, like door-cycle.
     "structure-door",
+    // P5 editor: editor-commands is CPU-only (scratch refs + a _gate asset);
+    // editor-struct-edit installs a turned house like structure-reload and
+    // keeps its exit contract (override cleared, window regenerated).
+    "editor-commands",
+    "editor-struct-edit",
     // P6 doors: same exit contract as refs-npc-identity (it builds a doorway
     // at absolute coordinates, saves and loads, and regenerates on the way
     // out). container-persist is CPU-only and could go anywhere.
@@ -1035,7 +1043,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

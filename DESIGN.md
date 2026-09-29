@@ -20718,3 +20718,94 @@ integer minute, the body's position and the door phases; the wander draw is
 twice from the same start and compares the per-tick trace (feet at 1/8 voxel,
 row, phase, door phase). Villager positions are CPU gameplay state; the grid
 effects are the door ops.
+
+### 16.P5 The in-game editor: commands, F8 mode, structure editing (added 2026-09-29)
+
+`docs/PLAN_world_editor.md` §2.3 / P5. Code: `src/editor/commands.{h,cpp}` (the
+command registry, the session: undo / redo / journal, `RunScript`),
+`src/editor/struct_edit.{h,cpp}` (one structure asset held for editing, the
+.vox writer), `src/ui/editor_ui.{h,cpp}` (F8 mode: camera, picking, tools,
+overlays, panels), `PrefabPlacer::QueueWords` (the live preview's ops),
+`RefStore::DropGroupIfEmpty`. Gates: `editor-commands`, `editor-struct-edit`.
+Harness: `--shot-editor`. How-to: `docs/EDITOR_GUIDE.md` §13.
+
+**Every authoring action is a command.** `{name, args}` applied by a
+registered handler that returns its INVERSE as command(s) (bulk data — a big
+fill's previous materials, a save's previous file bytes, a slot list, a ref's
+exact old line — rides in a `Payload`, not in JSON). Ref commands wrap P1's
+`refs::Place / Move / SetProp / SetField / Delete`; the inverse of every ref
+edit is `_ref.put` (Upsert of the EXACT old `Ref`, so prop key order survives
+a removal and a re-add), of a place `_ref.erase` (+ `DropGroupIfEmpty` when the
+place created the group file), of a delete `_ref.put` at the old row. Waynode
+links use P7's rule (two-way; written on the authored end). The UI calls
+nothing else; the P6/P7 kind panels (`DrawRefKindFields`, shared with the
+References page) write refs themselves, so the editor diffs the store around
+them and records the change with `Session::Record` — also undoable. Undo is a
+data diff, never a GPU readback (§2.3). The session keeps 256 steps (a brush
+drag or a cut is one, via `BeginGroup`), journals every command as JSONL to
+`build/editor/session_<time>.jsonl`, and **redo re-runs the forward command**
+(recorded with the structure and the instance it acted through, and a paste
+with the clipboard it pasted), recomputing its inverse. Guarantee
+(`editor-commands`): a script of every public command, undo-all → every touched
+file byte-identical to the start (a created group file removed), redo-all →
+byte-identical to the applied state. Needs the refs files in `WriteGroup`'s
+canonical form (they are unless hand-formatted; the first edit canonicalises).
+
+**`--edit-script <file.jsonl>`** (GPU-free, before any device) loads the map
+the game would (`world.mapLayer` / `SANDVOX_MAP`), applies one command per line
+with the undo depth unlimited, and is ALL OR NOTHING: the first refused line
+undoes everything the run did and reports `file:line: command: field: what`
+(unknown materials and commands get a "did you mean"). Success saves every
+structure with unsaved edits. `--edit-commands` prints the list.
+
+**The house frame.** A structure's files use the .vox's occupied-box frame
+(P2), which MOVES when an edit grows or shrinks the box. The editor works in
+the **house frame** instead: origin-relative (y = 0 is the floor row), the
+asset's own axes. Because `structures::Frame::Cell` depends only on
+`local - origin` (the sizes cancel), `world = pos + turn(yaw, house)` for
+every asset size (`editor::HouseToWorld`, held equal to `Frame::Cell` at all
+four turns by `editor-struct-edit`), so undo entries, the clipboard and script
+coordinates survive any save. A SAVE re-bases: occupied box → new `origin =
+-lo`, `size`, slots and their box / `hingeLine` props shifted, the voxels
+written trimmed (one model, sorted z-y-x so the bytes are a pure function of
+the buffer, palette index = material id, the original RGBA chunk carried
+over), `materials` = the used names with live ids (the original order kept),
+every other json field kept in place, `"handEdited": true`. Ids over 255 and
+axes over 256 are refused by name. Dirty is EXACT (an order-independent hash of
+cells + slots vs. the hash on disk, restored by an undone save), so undoing
+back to the saved state clears `* unsaved`.
+
+**F8 mode.** Pauses the sim (`ui.paused`, forced every frame while on; the
+banner says so). The camera is the editor's own (main renders from it; the
+player's view is restored on exit) — RMB look, WASD/QE, wheel speed, F frames.
+Game bindings are gated off (`gameKeys`, P/N/V/R/Esc); the editor reads keys
+through ImGui. **The live preview**: edits to the open house change the
+buffer; the changed cells, through the instance it was opened by, become
+exact-word cell ops via `PrefabPlacer::QueueWords` (last write per cell wins —
+the op canonicalization keeps the first, so duplicates collapse there) and the
+frame asks for ONE tick (`ui.stepOnce`): the MutationQueue path (rule 3), in the
+op record. Save calls `structures::Reload` → P4's `ApplyStructureChanges`
+re-stamps every copy (and resets the preview's chunk edits in the box, which
+by then equal the asset). A re-stamp needs TICKS to show (the wake, the
+occupancy and the far refill run inside the tick), so any re-apply while the
+editor is on grants 60 catch-up ticks, one per frame (`edCatchUpTicks`) —
+measured: with only the one edit tick, a freshly placed house was still a void
+in the near window 100 frames later. Discarding pushes the on-disk voxels back over every
+cell the buffer differed in (no re-stamp would, the asset being unchanged).
+**Picking is CPU**, with the cursor anywhere: placed houses from their assets
+(the open one from its live buffer) by DDA in the house frame, the ground by
+`World::TerrainHeight`, refs by per-kind boxes (npc 0.6 x 1.8 m, door leaf,
+props.box, bed anchor, else a small cube), the open house's slots from
+`DeriveChildren` of the buffer. Overlays are ImGui background-list lines
+through the editor camera, near-plane clipped: every ref (kind colour, label,
+door swing + hinge), P7's waynode graph, the open house's box / front / slots,
+the box selection, the brush / pencil cursor, the paste ghost (the clipboard's
+exposed faces, back-to-front, in material colours), the gizmo.
+
+**Known gaps.** Picking does not see world voxels that are not a house or the
+ground (trees, rocks, player edits). The residency window stays around the
+body, so far houses show only in the far field and cannot be clicked. An
+undone SAVE re-stamps the old asset while the buffer keeps the newer voxels
+(the world and the buffer then differ until the next save or undo). Only the
+opened instance previews live; other copies change on save. A paste inside a
+`batch` does not record its clipboard. Arbitrary yaw stays out (P4).

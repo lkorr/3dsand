@@ -323,6 +323,8 @@
   "structure-stamp": "pass",
   "structure-reload": "pass",
   "structure-door": "pass",
+  "editor-commands": "pass",
+  "editor-struct-edit": "pass",
   "door-cycle": "pass",
   "container-persist": "pass",
   "npc-schedule": "pass",
