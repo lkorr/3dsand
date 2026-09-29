@@ -28,6 +28,7 @@
 #include "sim/bytestream.h"
 #include "sim/world.h"
 #include "world/refs.h"
+#include "world/structures.h"
 
 namespace refs {
 
@@ -170,7 +171,7 @@ void RegisterAllKinds() {
   RegisterP1Kinds();
   // ---- later packages: one line each, AFTER P1 (a later registration of the
   // same name replaces the earlier one) ----
-  // RegisterStructureKinds();   // P4
+  structures::RegisterStructureKinds();   // P4: structure (world/structures.h)
   // RegisterDoorKinds();        // P6: door, container, bed
   // RegisterResidentKinds();    // P7: npc (replaces P1's), waynode
 }

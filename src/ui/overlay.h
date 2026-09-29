@@ -1424,6 +1424,18 @@ struct UIState {
   bool refFlyTo = false;
   float refFlyPos[3] = {};
   // R also reloads the map's refs (main.cpp's reloadMaterials path).
+  // P4: "place structure here" -- while the page is choosing, the footprint
+  // box it would occupy (world voxels, inclusive) is drawn in the world as a
+  // wireframe (main.cpp's debug-box list), plus a small box on its front
+  // door side. Written by the page every frame it is open; main clears it.
+  bool structPreview = false;
+  int structPreviewLo[3] = {}, structPreviewHi[3] = {};
+  int structPreviewFront[3] = {};
+  // "open in editor" (P5 hands the structure to the in-game editor). Until
+  // P5 lands the page says so; the request is kept here for it to take.
+  std::string structOpenRequest;
+  // The last live re-apply's one-line result (main.cpp), for the page.
+  std::string structReapplyStatus;
 };
 
 class Overlay {

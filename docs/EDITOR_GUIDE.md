@@ -744,3 +744,102 @@ game.
   new name.
 - **Check the page works:** `bash scripts/check_structures.sh`; a picture:
   `bash scripts/check_structures.sh --shot out.png --structure samples/smithy --clean`.
+- **Which maps use this house?** The **used by** line under the structure
+  list names every map ref that places it (`default: harrowby/smithy`).
+
+## 12. Putting a house in the world (in game: F1 → World → References)
+
+A house in the world is a **`structure` reference**: one line in a map's refs
+file that says *which* blueprint, *where* and *which way round*.
+
+```json
+{ "id": "harrowby/smithy", "kind": "structure", "base": "samples/smithy", "pos": [612, 204, 3530], "yaw": 90 }
+```
+
+| Field | Means |
+|---|---|
+| `base` | the blueprint: the path under `assets/structures/` without the extension (`samples/smithy`, `harrowby_smithy`) |
+| `pos` | where the house's **front-door floor** goes: x and z are the middle of the house, **y is the floor you walk on**. The ground around the house is levelled so its top is one voxel below that. |
+| `yaw` | which way the front door faces: `0` = +Z, `90` = +X, `180`, `270`. **Only quarter turns** — anything else is refused with a warning and the house is not built. |
+| `props.padMargin` | optional: how many voxels the levelled ground takes to blend back into the terrain (default 12 = 1.2 m; 1..64) |
+
+The house is part of the **terrain**: it shows at any distance, it is not in
+your save, and it comes back the same every time. Damage done to it in play is
+an ordinary edit and *is* saved.
+
+### How do I place a house?
+
+1. F1 → **World** → **References**, scroll to **place a structure**.
+2. Pick the blueprint in the dropdown (**rescan** if you just saved a new one
+   in the tuner).
+3. Type an id: `harrowby/smithy` (group / name; the group file is created if
+   it is new).
+4. Press **place structure here...** A gold wireframe box shows the space the
+   house will take, standing on the block under your crosshair; the small
+   **red box marks the front door side**. Look around — the box follows the
+   crosshair.
+5. **-90 / +90** turn it. Tick **pin** (or type numbers into **floor**) to stop
+   it following the crosshair while you walk round it. The line above says the
+   floor position and the footprint in metres.
+6. **confirm: place it.** The line is written to the refs file and the house
+   appears within a frame or two (the status line says "re-applied 1
+   structure(s): N chunks regenerated").
+
+**cancel** leaves without writing anything.
+
+### How do I move, turn or remove a house?
+
+Select it in the list (structures show `+N slots`). Then:
+
+- **move**: edit **pos** and **apply pos/yaw**, or **move to my feet** / **move
+  to crosshair**;
+- **turn**: the **-90 / +90** buttons beside **reload asset**;
+- **swap it for another blueprint**: type a new **base** and press Enter;
+- **remove**: **delete...** → **really delete?**.
+
+Each re-builds only the ground the house covered and now covers; the rest of
+the world (and everyone in it) carries on.
+
+> A re-build puts the chunks it touches back to the terrain + house. Anything
+> you dug, burnt or built by hand **inside the house's box** in this session is
+> reset, and the status line counts those chunks. Edit houses before you play
+> in them.
+
+### The doors, beds and chests inside
+
+Every slot of the blueprint becomes its own reference, named
+`<house id>/<slot>`: `harrowby/smithy/door_front_0`, `.../bed_0`,
+`.../chest_0`, `.../hearth`, `.../waynode_room_0`. Open **slots (N)** under a
+selected house to see them; click one for where it is and what it holds (the
+door's leaf box and hinge, already turned to match the house). They are
+**read-only here**: they come from the blueprint, so to move a bed you edit the
+house. Doors, chests and beds do something once those systems land (until then
+they are listed in grey and do nothing); schedules and dialogue can already
+name them by id.
+
+### I edited the blueprint — how do I see it in the world?
+
+Select any house built from it and press **reload asset**. Every copy of that
+blueprint is re-stamped, and its slots are re-read. (The in-game editor, when it
+arrives, does this for you on save. **open in editor** is its button; for now it
+tells you to edit the `.vox` in MagicaVoxel or regenerate on Environment →
+Structures.)
+
+Editing the refs file in a text editor and pressing **R** works too, and **F7**
+(regenerate the world) always shows the latest of everything.
+
+### Troubleshooting
+
+- **The house isn't there** — look at the **warnings** list on the References
+  page: a `base` that names no file, a `yaw` that is not a quarter turn, or a
+  blueprint built at a different voxel size each say so, naming the ref.
+- **It floats / is buried** — `pos.y` is the floor. Use **move to crosshair**
+  aimed at the ground where the door should be (that sets y to one above the
+  block), or type y.
+- **"N sites reach map cell … a cell holds at most 32"** — that many houses,
+  lakes and authored trees within one 102 m square; spread them out.
+- **Check it works:** `--selftest --gate structure-stamp` (every voxel of a
+  sample, four turns, the levelled ground, the slots) and
+  `--gate structure-reload` (the live re-build equals a fresh world).
+  `SANDVOX_STRUCTURE_SHOT=house.bmp` with `structure-stamp` also saves a
+  picture.

@@ -1864,6 +1864,39 @@ void Stream::ReloadWindow(IVec3 origin) {
   FillSlots(slots, /*deferWake=*/false);
 }
 
+uint32_t Stream::RegenerateChunks(const std::vector<IVec3>& chunks, uint32_t* dropped) {
+  // See stream.h. Store first, for every listed chunk, resident or not: an
+  // eviction still in flight for one of them is completed so its bytes land
+  // (and are then dropped) rather than landing AFTER the drop and bringing
+  // the old house back on the next re-entry.
+  uint32_t drop = 0;
+  std::vector<uint32_t> slots;
+  std::vector<uint8_t> seen(kNumSlots, 0);
+  for (const IVec3& wc : chunks) {
+    while (pendingChunks_.count(World::PackChunkKey(wc))) CompleteOldest(/*discard=*/false);
+    if (store_.Erase(wc)) drop++;
+    if (!world_->ChunkInWindow(wc)) continue;
+    const uint32_t s = World::SlotChunkIndex(wc);
+    if (s >= kNumSlots || seen[s]) continue;
+    // A slot held for a peer's copy keeps waiting for it (M9.5-A): the
+    // authority's bytes are the truth there, not our generator.
+    if (s < awaitingRemote_.size() && awaitingRemote_[s]) continue;
+    seen[s] = 1;
+    slots.push_back(s);
+  }
+  if (dropped) *dropped = drop;
+  // Batched like SubmitWorldgen: one batch's transient page demand is what
+  // the pool's headroom is sized for (world.h kWorldgenBatch).
+  fillIgnoresExchange_ = true;
+  for (size_t i = 0; i < slots.size(); i += kWorldgenBatch) {
+    const size_t n = std::min<size_t>(kWorldgenBatch, slots.size() - i);
+    std::vector<uint32_t> batch(slots.begin() + (ptrdiff_t)i, slots.begin() + (ptrdiff_t)(i + n));
+    FillSlots(batch, /*deferWake=*/false);
+  }
+  fillIgnoresExchange_ = false;
+  return (uint32_t)slots.size();
+}
+
 // ============================================================================
 // THE SOLUTE LAYER'S HALF OF STREAMING (docs/PLAN_solutes.md §7.1)
 //

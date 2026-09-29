@@ -498,7 +498,11 @@ enum : uint32_t {
                         // re-running landColumnBare per column / per voxel.
   kS_Species = 10,      // tree site: the atlas species index
   kS_Variant = 11,      // tree site: 1 + variant (mod the species' count), 0 = rolled
-  // 12..15 reserved
+  kS_Sink = 12,         // stamp site: rows of the template BELOW the pad top + 1
+                        // (a structure's footing under GRADE, PLAN_world_editor
+                        // P4). 0 for a map.json stamp: its bottom row sits on
+                        // the pad, as it always has. <= kStampSinkMax.
+  // 13..15 reserved
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -509,10 +513,15 @@ enum : uint32_t {
   kSiteTree = 3,
   kSiteRotRolled = 4,   // kS_Rot of a tree site the map did not turn
   // At most this many sites may reach one map cell (the per-cell list); more
-  // is a load error. Four is two neighbouring buildings, a lake and a tree
-  // with room to spare at a 102 m cell; the shader's list walks are bounded
-  // by it.
-  kSiteCellMax = 4,
+  // is a load error. Was 4 ("two neighbouring buildings, a lake and a tree")
+  // until the world editor's P4: a village is ~10 structure refs plus its
+  // well, trees and pond in ONE 102 m cell, so 32. The shader's list walks
+  // iterate the list's own n, bounded by this; a cell no site reaches still
+  // costs one read.
+  kSiteCellMax = 32,
+  // The deepest a stamp may sink (kS_Sink): genCell overlays template cells
+  // from h - 1 - kStampSinkMax up, so a deeper footing would be cut off.
+  kStampSinkMax = 8,
   // A tree site's own keep-out (siteKeepOut): the trunk and a little, in
   // voxels. No tarn centre, cactus, tile plant or cover row inside it; the
   // ground under the crown keeps its undergrowth like a lattice tree's does.
@@ -683,6 +692,15 @@ struct WorldMapData {
     int indexReach = 0;
     int nx = 0, ny = 0, nz = 0;
     std::vector<uint32_t> words;          // the packed stamp block, offsets RELATIVE to its start
+    // A STRUCTURE REF's site (PLAN_world_editor P4, world/structures.h): its
+    // padY is the AUTHORED floor (ref pos.y - 1), not the baked bare ground,
+    // and its template sinks `sink` rows below the pad top + 1. `base`,
+    // `refPos` and `refYaw` are the ref's own fields, kept so the live
+    // re-apply can tell an in-step site from a stale one.
+    bool structure = false;
+    int sink = 0;
+    std::string base;
+    int refX = 0, refY = 0, refZ = 0, refYaw = 0;
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
   // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
@@ -729,6 +747,9 @@ struct WorldMapData {
   std::vector<uint8_t> landform;
   std::vector<uint8_t> moisture;
   uint32_t contentHash = 0;               // FNV-1a over both files
+  // P4: the structure refs' placements + their assets' bytes (0 = none, and
+  // then contentHash is exactly what it was before structures existed).
+  uint32_t structureHash = 0;
   // map.json `editLayer` (P7): assets/worldedits/<name>.svedit, applied over
   // this map's worldgen (sim/worldedit.h). "" = none. A bare name, never a path.
   std::string editLayer;
@@ -762,6 +783,26 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
                   WorldMapData& out, std::string& log,
                   const std::string* mapJson = nullptr);
+
+// ---- structure refs as sites (PLAN_world_editor P4, world/structures.h) ------
+// One `structure` ref, as LoadWorldMap reads it out of the map's refs group
+// files: the placement only; the asset is resolved (and refused with a
+// warning when missing / mis-yawed) by the loader.
+struct StructurePlacement {
+  std::string id, base, file;   // file: "refs/<group>.json", for warnings
+  int x = 0, y = 0, z = 0;      // the ref's pos: the asset's origin lands here
+  int yaw = 0;
+  int padMargin = -1;           // props.padMargin, -1 = the default
+};
+// Default pad ramp for a structure, voxels (props.padMargin overrides, 1..64).
+constexpr int kStructurePadMargin = 12;
+// THE GATES' SEAM: when set, LoadWorldMap uses this list INSTEAD of reading
+// the map's refs directory -- so a gate can place a house on the harness map
+// (whose refs dir is the refs gates' fixture) through the real loader, the
+// real ReloadEnvironment and the real re-apply. Null restores the files.
+void SetStructureOverride(const std::vector<StructurePlacement>* list);
+bool StructureOverrideActive();
+const std::vector<StructurePlacement>* StructureOverrideSlot();   // null = off
 
 /**
  * `--mapcheck <name>`'s answer, one line of JSON: {"ok", "map", "sites",

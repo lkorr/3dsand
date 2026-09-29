@@ -405,6 +405,21 @@ void ChunkStore::Put(IVec3 wc, std::vector<uint32_t> rle, uint32_t tick) {
   SpillOverBudget();
 }
 
+bool ChunkStore::Erase(IVec3 wc) {
+  // Get() pulls the region in from disk (if bound) and says whether it holds
+  // the chunk; after it the region is in RAM and fully merged, so erasing the
+  // RAM entry and marking the region dirty is what removes it from the file.
+  if (Get(wc) == nullptr) return false;
+  auto rit = regions_.find(World::PackChunkKey(RegionOf(wc)));
+  if (rit == regions_.end()) return false;
+  const uint64_t key = World::PackChunkKey(wc);
+  if (rit->second.chunks.erase(key) == 0) return false;
+  chunkCount_--;
+  rit->second.dirty = true;
+  tickTags_.erase(key);
+  return true;
+}
+
 const std::vector<uint32_t>* ChunkStore::Get(IVec3 wc) {
   const IVec3 rc = RegionOf(wc);
   const uint64_t rkey = World::PackChunkKey(rc);

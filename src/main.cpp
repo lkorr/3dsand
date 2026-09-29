@@ -109,6 +109,7 @@
 #include "ui/overlay.h"
 #include "world/refs.h"
 #include "world/refs_game.h"
+#include "world/structures.h"
 #include "crash.h"
 
 // The sim/render plumbing these once defined in place now lives in
@@ -11172,6 +11173,29 @@ int main(int argc, char** argv) {
       avatar.Despawn();
       tpRig.Snap();
     }
+    // ---- PLACED STRUCTURES: an edit reaches worldgen (PLAN_world_editor P4) --
+    // A structure ref was placed / moved / turned / deleted (References page,
+    // a hand edit + R, P5's commands) or an asset was re-saved
+    // (structures::Reload): the kind raised the request; here, BETWEEN ticks
+    // like F7, the environment is reloaded and only the chunks the changed
+    // houses touch are regenerated (sandvox::ApplyStructureChanges). No world
+    // reset: mobs, the player and the tick carry on.
+    {
+      std::string why;
+      if (structures::TakeReapply(&why)) {
+        StructureReapply rep;
+        if (ApplyStructureChanges(ctx, world, sim, stream, &far, mats, envStamp, rep)) {
+          char line[256];
+          std::snprintf(line, sizeof line, "re-applied %zu structure(s): %u chunks regenerated, %u "
+                        "edited chunks reset (%s)", rep.changed.size(), rep.chunks, rep.dropped,
+                        why.c_str());
+          ui.structReapplyStatus = line;
+        } else {
+          std::fprintf(stderr, "%s", rep.log.c_str());
+          ui.structReapplyStatus = "re-apply REFUSED: the environment did not reload (see stderr)";
+        }
+      }
+    }
     if (ui.saveWorld) {
       ui.saveWorld = false;
       ctx.WaitIdle();
@@ -15423,6 +15447,29 @@ int main(int argc, char** argv) {
             dbg.push_back(b);
           }
         }
+      }
+      // ---- "place structure here" preview (ui/refs_ui.cpp, P4) -------------
+      // The box the chosen house would occupy, and a small box on its front
+      // (door) side so the turn reads before anything is written. Set by the
+      // References page every frame it is choosing; one-shot here.
+      if (ui.structPreview && dbg.size() + 2 <= kMaxDebugBoxes) {
+        ui.structPreview = false;
+        DebugBox b{};
+        for (int a = 0; a < 3; a++) {
+          b.pos[a] = 0.5f * (float)(ui.structPreviewLo[a] + ui.structPreviewHi[a] + 1);
+          b.half[a] = 0.5f * (float)(ui.structPreviewHi[a] - ui.structPreviewLo[a] + 1);
+        }
+        b.quat[3] = 1.0f;
+        b.color = 0xE040E0FFu;   // warm gold (0xAABBGGRR)
+        dbg.push_back(b);
+        DebugBox f{};
+        for (int a = 0; a < 3; a++) {
+          f.pos[a] = (float)ui.structPreviewFront[a] + 0.5f;
+          f.half[a] = 4.0f;
+        }
+        f.quat[3] = 1.0f;
+        f.color = 0xE04040FFu;   // red: the front
+        dbg.push_back(f);
       }
       // ---- NPC AI debug viz (game/ai_behavior.h) --------------------------
       //

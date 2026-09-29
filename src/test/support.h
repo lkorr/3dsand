@@ -26,6 +26,9 @@
 #include "sim/worlddefaults.h"
 #include "sim/worldgen_run.h"
 
+class Stream;
+class FarField;
+
 namespace sandvox {
 
 constexpr float kTickDt = 1.0f / 30.0f;
@@ -184,6 +187,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
                        const std::vector<MaterialDef>& mats,
                        biomes::EnvironmentStamp& stamp, std::string& log);
+
+// ---- THE LIVE RE-APPLY OF PLACED STRUCTURES (PLAN_world_editor P4) --------
+// A structure ref was placed / moved / turned / deleted, or its asset changed
+// on disk (structures::Reload): reload the environment (ReloadEnvironment, so
+// the site table is re-read from the refs files and the assets), DIFF the
+// structure sites before and after, and regenerate ONLY the chunks a changed
+// house touches -- its old box and its new box, each widened by its pad ramp
+// and the widest tree's reach and height (a trunk the old footprint kept out
+// may grow now) -- through Stream::RegenerateChunks (the streamer's own
+// procgen path; stored edits in those chunks are dropped and counted). The
+// far field re-fills the same boxes (FarField::RefillBox) when `far` is
+// given. Between ticks only. False (and `rep.log`) when the environment
+// refused to reload: nothing changed then.
+struct StructureReapply {
+  std::vector<std::string> changed;   // site ids that differ, id order
+  uint32_t chunks = 0;                // resident chunks regenerated
+  uint32_t dropped = 0;               // stored (edited) chunks discarded
+  uint32_t farEntries = 0;            // far-field fills queued
+  std::vector<std::pair<IVec3, IVec3>> boxes;   // the voxel boxes, inclusive
+  std::string log;
+};
+bool ApplyStructureChanges(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
+                           FarField* far, const std::vector<MaterialDef>& mats,
+                           biomes::EnvironmentStamp& stamp, StructureReapply& rep);
 
 // ---- harness snapshot drain (PLAN_page_table.md, phase 7b) ----------------
 //

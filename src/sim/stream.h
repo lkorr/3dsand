@@ -301,6 +301,24 @@ class Stream {
   // reset residency bookkeeping. Used by LoadWorld and world regen.
   void ReloadWindow(IVec3 origin);
 
+  // ---- REGENERATE A HANDFUL OF CHUNKS FROM THE CURRENT GENERATOR (P4) ------
+  //
+  // The live re-apply of an edited structure (sandvox::ApplyStructureChanges):
+  // the environment tables were just reloaded, so these chunks' procgen is now
+  // different, and they are re-made exactly the way a streamed-in chunk is —
+  // FillSlots' gen path (genChunk, the page verdict, the wake, the edit
+  // layer's re-queue, the op record's gen list) — with the store BYPASSED:
+  // the stored copy of an edited chunk IS the old house, and keeping it
+  // would make the re-apply a no-op wherever the player had ever touched.
+  // Stored copies of the listed chunks are dropped (resident or not), so a
+  // chunk re-entering the window later also comes back from the new
+  // generator. That is the documented price: an authoring re-apply discards
+  // play edits inside the structure's box, and says how many.
+  //
+  // Call BETWEEN ticks only (it submits, like ReloadWindow). Returns the
+  // resident chunks regenerated; `dropped` gets the store entries discarded.
+  uint32_t RegenerateChunks(const std::vector<IVec3>& chunks, uint32_t* dropped = nullptr);
+
   // ---- THE SOLUTE LAYER'S HALF OF STREAMING (docs/PLAN_solutes.md §7.1) ----
   //
   // Dissolved mass is AUTHORITATIVE world state keyed by world chunk, and a

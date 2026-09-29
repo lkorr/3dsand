@@ -196,6 +196,43 @@ void FarField::FullRefill(const InterestSet& interest) {
     ResetLevel(k, DesiredOrigin(playerChunk, k));
 }
 
+uint32_t FarField::RefillBox(IVec3 lo, IVec3 hi) {
+  uint32_t total = 0;
+  const int n = (int)kFarNChunk;
+  const int m = n - 1;
+  auto fdiv = [](int v, int d) { return v >= 0 ? v / d : -((-v + d - 1) / d); };
+  for (uint32_t k = 0; k < kFarLevels; k++) {
+    // A level-k chunk spans 2^(k + 1 + kFarShiftBase) fine chunks per axis
+    // (LevelChunkHitsWindow), i.e. that many kChunk-voxel chunks.
+    const int span = (int)kChunk << (k + 1 + kFarShiftBase);
+    const IVec3 o = origins_[k];
+    const int x0 = std::max(fdiv(lo.x, span), o.x), x1 = std::min(fdiv(hi.x, span), o.x + m);
+    const int y0 = std::max(fdiv(lo.y, span), o.y), y1 = std::min(fdiv(hi.y, span), o.y + m);
+    const int z0 = std::max(fdiv(lo.z, span), o.z), z1 = std::min(fdiv(hi.z, span), o.z + m);
+    if (x0 > x1 || z0 > z1) continue;
+    uint32_t cnt = 0;
+    for (int lz = z0; lz <= z1; lz++)
+      for (int lx = x0; lx <= x1; lx++) {
+        // The column's surface map rides its slot-layer-0 entry (EnqueuePlane's
+        // rule), queued FIRST so a farpatch of the same column lands after it.
+        const uint32_t sx = (uint32_t)(lx & m), sz = (uint32_t)(lz & m);
+        Enqueue(k, ((sz * kFarNChunk + 0u) * kFarNChunk + sx) | kFarListMapBit);
+        cnt++;
+        for (int ly = y0; ly <= y1; ly++) {
+          const uint32_t sy = (uint32_t)(ly & m);
+          if (sy == 0u) continue;   // the map entry above already fills it
+          Enqueue(k, (sz * kFarNChunk + sy) * kFarNChunk + sx);
+          cnt++;
+        }
+      }
+    // A record like a plane's, owning no face (axis -1): PrepareTick's
+    // front-record bookkeeping needs every queued entry to belong to one.
+    recs_[k].push_back({k, -1, 0, -1, cnt, epoch_[k]});
+    total += cnt;
+  }
+  return total;
+}
+
 float FarField::SafeRadiusMeters() const {
   // THE FARTHEST COMPLETE LEVEL, not the nearest incomplete one (2026-09-10).
   //

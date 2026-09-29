@@ -86,6 +86,7 @@ const std::vector<Gate>& SoluteGates();
 const std::vector<Gate>& DialogueGates();
 // REFERENCES (docs/PLAN_world_editor.md P1, world/refs.h).
 const std::vector<Gate>& RefsGates();
+const std::vector<Gate>& StructureGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -573,6 +574,12 @@ const char* const kOrder[] = {
     // found (both move the window to the harness origin to meet the fixture).
     "refs-activate",
     "refs-npc-identity",
+    // STRUCTURE INSTANCES (PLAN_world_editor.md P4). Same exit contract as
+    // the refs gates: they install houses on the harness map through the
+    // structure override, and on the way out clear it, reload the
+    // environment and regenerate the window at the origin they found.
+    "structure-stamp",
+    "structure-reload",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find
@@ -1013,7 +1020,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &StructureGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
