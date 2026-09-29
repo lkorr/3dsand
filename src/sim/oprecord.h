@@ -324,7 +324,9 @@ struct Header {
 // 4: TickInputs lost hasSplashMat + fluidSplashMat[4] (W1-B2: a fluid
 //    particle splashes as its own material, so the per-species splash table
 //    is gone). TickInputs is written as one POD, so the frame shrank.
-constexpr uint32_t kRecordVersion = 4;
+// 5: TickInput grew `useRef` (72 -> 76 bytes, the use verb, PLAN_world_
+//    editor.md P1); the frame's command POD grew with it.
+constexpr uint32_t kRecordVersion = 5;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its

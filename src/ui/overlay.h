@@ -7,6 +7,9 @@
 #include "gpu/rhi.h"
 
 struct GLFWwindow;
+namespace refs {
+class RefStore;  // world/refs.h: the References page reads and edits it
+}
 
 // Everything the debug overlay shows/edits. main.cpp owns the values.
 struct UIState {
@@ -1380,6 +1383,18 @@ struct UIState {
   // from AvatarLocomotion::stateName. One line, and it says more about a pair
   // of lost legs than any number of bars.
   std::string locoState;
+
+  // ---- F1 -> World -> References (ui/refs_ui.cpp, world/refs.h) ----------
+  // The map's reference store, owned by main(); null = the page says there is
+  // none (a harness run). The page EDITS it through refs::Place / Move /
+  // SetProp / SetField / Delete, which write the group JSON file -- authored
+  // data, like the tuner's JSON editors -- and the next tick re-applies.
+  refs::RefStore* refs = nullptr;
+  // "fly to" on a ref: main puts the player in fly mode a few metres off it,
+  // looking at it. One-shot.
+  bool refFlyTo = false;
+  float refFlyPos[3] = {};
+  // R also reloads the map's refs (main.cpp's reloadMaterials path).
 };
 
 class Overlay {

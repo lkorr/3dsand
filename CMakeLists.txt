@@ -546,6 +546,12 @@ add_library(sandvox_core OBJECT
   # a PlayerAvatar driven from a peer's PlayerState OUTCOME, not a re-simulated
   # controller. See src/game/remoteplayer.h.
   src/game/remoteplayer.cpp
+  # REFERENCES (docs/PLAN_world_editor.md P1): authored, placed things with
+  # stable ids -- the group files, the kind registry, activation against the
+  # window, the use verb, the 'REFS' save deltas. See src/world/refs.h.
+  src/world/refs.cpp
+  src/world/refs_kinds.cpp
+  src/world/refs_game.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
@@ -595,6 +601,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_impact.cpp
   src/test/selftest_audio.cpp
   src/test/selftest_net.cpp
+  src/test/selftest_refs.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp
@@ -629,6 +636,8 @@ add_library(sandvox_core OBJECT
   # inventory_ui.cpp is a pure drawing function over UIState.
   src/ui/theme.cpp
   src/ui/inventory_ui.cpp
+  # F1 -> World -> References: the ref list + inspector (world/refs.h).
+  src/ui/refs_ui.cpp
   # spellgraph_ui.cpp is the composer's CANVAS: it draws UIState::spellGraph
   # (main.cpp's mirror of game/spellgraph.h) and turns a gesture into a
   # GraphEditIntent. It applies no op itself.

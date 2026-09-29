@@ -72,12 +72,18 @@ enum TickButton : uint32_t {
   TB_SCOOP = 1u << 12,
   TB_APPLY_L = 1u << 13,
   TB_SCOOP_L = 1u << 14,
+  // THE USE VERB (docs/PLAN_world_editor.md §2.5, world/refs_game.h): a
+  // press that USES the reference named by TickInput::useRef -- open a door,
+  // talk to a villager, search a chest. An edge, carried with its target so
+  // the tick acts on what the HUD prompt promised, not on a re-aimed ray.
+  TB_USE = 1u << 15,
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
 // op record's frame header (sim/oprecord.h) and refused on mismatch.
 // 4: dual wielding — TB_ALT is the left hand, per-hand vessel modes.
-constexpr uint32_t kTickInputVersion = 4;   // 2: TB_THROW, 3: TB_APPLY
+// 5: TB_USE + `useRef` (the use verb, PLAN_world_editor.md P1).
+constexpr uint32_t kTickInputVersion = 5;   // 2: TB_THROW, 3: TB_APPLY
 
 struct TickInput {
   uint32_t version = kTickInputVersion;
@@ -111,6 +117,11 @@ struct TickInput {
   int16_t hotbar = -1;
   int16_t tool = -1;
   int16_t pad0 = 0;
+  // WHAT A TB_USE PRESS USES: refs::RefHash of the reference id the frame's
+  // use prompt showed (world/refs.h), 0 = nothing. A hash, not the string,
+  // because this is a fixed-size wire POD; the store detects collisions at
+  // load. One-shot like the edge it rides with (TickInputFeeder::Consume).
+  uint32_t useRef = 0;
 
   // The camera basis AT TICK TIME. flatFwd is the horizontal walk forward,
   // right the horizontal strafe axis, lookFwd the full 3D aim (fly and swim).
@@ -128,7 +139,7 @@ struct TickInput {
   }
 };
 
-static_assert(sizeof(TickInput) == 72, "TickInput is a wire message");
+static_assert(sizeof(TickInput) == 76, "TickInput is a wire message");
 
 // ---- THE FRAME LAYER'S ACCUMULATOR ---------------------------------------
 //
@@ -164,6 +175,11 @@ struct TickInputFeeder {
     pend.lookDy += dy;
   }
   void SetStrike(int style) { pend.strikeStyle = (int16_t)style; }
+  // A use press and its target, together (the newest press wins).
+  void Use(uint32_t refHash) {
+    pend.pressed |= TB_USE;
+    pend.useRef = refHash;
+  }
   void SetSelection(int tool, int hotbarSlot) {
     pend.tool = (int16_t)tool;
     pend.hotbar = (int16_t)hotbarSlot;
@@ -178,6 +194,7 @@ struct TickInputFeeder {
     pend.pressed = 0;
     pend.lookDx = pend.lookDy = 0;
     pend.strikeStyle = -1;
+    pend.useRef = 0;
     return out;
   }
 };

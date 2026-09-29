@@ -1,0 +1,12 @@
+{
+  "group": "fixture",
+  "about": "THE REFS GATES' FIXTURE (src/test/selftest_refs.cpp: refs-roundtrip, refs-activate, refs-npc-identity). The harness map's refs are never loaded by the game or a --shot (main.cpp). The file is in the canonical form refs::WriteGroup writes; refs-roundtrip asserts that byte for byte, so edit it with the References page or keep the one-ref-per-line shape. Rows are in author order, NOT id order, on purpose: activation must still run in id order.",
+  "refs": [
+    { "id": "fixture/villager", "kind": "npc", "base": "human", "pos": [256, 181, 256], "yaw": 180, "props": { "name": "Fixture Fred", "schedule": "none" } },
+    { "id": "fixture/probe_b", "kind": "selftest_probe", "pos": [262, 176, 246], "yaw": 0 },
+    { "id": "fixture/probe_a", "kind": "selftest_probe", "pos": [248, 170, 236], "yaw": 0, "props": { "prompt": "Poke probe A" } },
+    { "id": "fixture/green_well", "kind": "marker", "pos": [240, 169, 236], "yaw": 0, "props": { "tags": ["gather", "water"] } },
+    { "id": "fixture/mystery", "kind": "teapot", "pos": [232, 172, 232], "yaw": 45, "props": { "zz_unknown": { "nested": [1, 2.5, "x", null, true] }, "brew": "oolong" }, "note": "an unknown kind AND an unknown top-level field: both kept verbatim" },
+    { "id": "fixture/far_marker", "kind": "marker", "pos": [4000, 200, 4000], "yaw": 90 }
+  ]
+}
