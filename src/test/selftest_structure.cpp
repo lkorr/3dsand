@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -44,7 +45,12 @@
 #include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "game/equipment.h"
+#include "game/session.h"
+#include "phys/debris.h"
+#include "test/tickrig.h"
 #include "world/refs.h"
+#include "world/refs_doors.h"
 #include "world/structures.h"
 
 using namespace sandvox;
@@ -226,7 +232,7 @@ Status GateStructureStamp(Ctx& c, std::string& detail) {
   for (const auto& s : worldmap::CurrentWorldMap().sites) nSites += s.structure ? 1 : 0;
   check(nSites == 4, "want 4 structure sites, have " + std::to_string(nSites));
 
-  const uint32_t mDoor = MatId(c.mats, "door_wood"), mBed = MatId(c.mats, "straw_bed");
+  const uint32_t mDoor = MatId(c.mats, "door_wood");
   BoxRead rd{{}, &c.ctx, &c.world};
   size_t wrong = 0, intrude = 0, padBad = 0, padChecked = 0, voxels = 0;
   size_t leafBad = 0, leafCells = 0, bedBad = 0, beds = 0, linkBad = 0, doors = 0;
@@ -298,7 +304,7 @@ Status GateStructureStamp(Ctx& c, std::string& detail) {
       }
       if (k.kind == "bed") {
         beds++;
-        if (rd.Mat(k.pos) != 0 || rd.Mat({k.pos.x, k.pos.y - 1, k.pos.z}) != mBed) bedBad++;
+        if (rd.Mat(k.pos) == 0 || rd.Mat({k.pos.x, k.pos.y + 1, k.pos.z}) != 0) bedBad++;   // P6 head cell: bed below, air above
       }
       if (k.props.contains("links"))
         for (const refs::Json& l : k.props["links"])
@@ -314,7 +320,7 @@ Status GateStructureStamp(Ctx& c, std::string& detail) {
   check(doors > 0 && leafBad == 0,
         std::to_string(leafBad) + "/" + std::to_string(leafCells) + " door-leaf cells not door_wood");
   check(beds > 0 && bedBad == 0, std::to_string(bedBad) + "/" + std::to_string(beds) +
-                                     " bed slots not standing on straw_bed");
+                                     " bed head cells not a bed under air");
   check(linkBad == 0, std::to_string(linkBad) + " waynode links name no child");
 
   // (e) THE REFSTORE: the four houses as a group file -> children derived,
@@ -541,12 +547,266 @@ Status GateStructureReload(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- structure-door ---------------------------------------------------------------
+//
+// The slots a house derives are P6's REAL kinds, through structures::
+// DoorFromSlot / BedFromSlot. Two copies of the smithy (yaw 0 and yaw 90), and
+// through THE TICK (TickRig, the References page's dev-use queue):
+//   A. each front door's derived ref is a valid P6 door whose leaf box and
+//      hinge line are exactly the transformed P2 slot's, and whose box holds
+//      door_wood in the world;
+//   B. a use opens it (a hinged body, the leaf cells empty), a second use
+//      closes it and the box's words come back byte-identical;
+//   C. the derived chest carries its authored contents and a player's use
+//      opens it (the loot panel request names it); the beds satisfy P6's
+//      anchor (the head cell is inside the frame).
+Status GateStructureDoor(Ctx& c, std::string& detail) {
+  refs::RegisterAllKinds();
+  structures::TakeReapply();
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok && why.size() < 8) why.push_back(what);
+    return ok;
+  };
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  c.stream.Store().Clear();
+  c.debris.Reset();
+  c.mobs.Reset();
+  const std::string ad = AssetDir();
+  std::string itemName;
+  for (const ItemDef& d : c.items.items)
+    if (itemName.empty() && !d.name.empty()) itemName = d.name;
+  // The smithy with an AUTHORED chest: a copy whose chest_0 holds 3 of an item.
+  const std::string gateDir = ad + "/structures/_gate";
+  std::error_code ec;
+  fs::create_directories(gateDir, ec);
+  fs::copy_file(ad + "/structures/samples/smithy.vox", gateDir + "/doorhouse.vox",
+                fs::copy_options::overwrite_existing, ec);
+  {
+    std::ifstream f(ad + "/structures/samples/smithy.struct.json", std::ios::binary);
+    refs::Json j = refs::Json::parse(f);
+    for (refs::Json& sl : j["slots"])
+      if (sl["name"] == "chest_0")
+        sl["props"]["items"] = refs::Json::array({refs::Json{{"item", itemName}, {"count", 3}}});
+    std::ofstream(gateDir + "/doorhouse.struct.json", std::ios::binary) << j.dump(1);
+  }
+  c.world.SetWindowOrigin({0, 0, 0});
+  std::vector<worldmap::StructurePlacement> list;
+  const int yaws[2] = {0, 90}, xs[2] = {130, 130}, zs[2] = {130, 330};
+  for (int i = 0; i < 2; i++) {
+    worldmap::StructurePlacement p;
+    p.id = "gate/door_" + std::to_string(yaws[i]);
+    p.base = "_gate/doorhouse";
+    p.file = "refs/gate.json";
+    p.x = xs[i];
+    p.z = zs[i];
+    p.y = World::TerrainHeight(p.x, p.z, kDefaultSeed) + 1;
+    p.yaw = yaws[i];
+    list.push_back(p);
+  }
+  std::string log;
+  if (!Install(c, &list, log)) {
+    Restore(c, savedOrigin);
+    fs::remove_all(gateDir, ec);
+    detail = "ReloadEnvironment refused: " + log;
+    return Status::Fail;
+  }
+  const std::string root = ScratchRefs("door", GroupText(list, nullptr));
+  refs::RefStore st;
+  st.LoadMap(root, "gate");
+  st.BindChunkStore(&c.stream.Store());
+  const uint32_t mDoor = MatId(c.mats, "door_wood");
+
+  uint32_t t = 15000;
+  std::string doorLines;
+  int cycles = 0;
+  for (int i = 0; i < 2; i++) {
+    const std::string id = list[i].id + "/door_front_0";
+    const refs::Ref* d = st.Find(id);
+    if (!check(d != nullptr && d->kind == "door", id + ": no derived door")) continue;
+    // A. geometry == the transformed slot.
+    const refs::DoorGeom g = refs::DoorGeometry(*d);
+    IVec3 llo{}, lhi{};
+    const refs::Json& L = d->props["leaf"];
+    llo = {L["min"][0].get<int>(), L["min"][1].get<int>(), L["min"][2].get<int>()};
+    lhi = {L["max"][0].get<int>(), L["max"][1].get<int>(), L["max"][2].get<int>()};
+    const int hx = d->props["hingeLine"][0].get<int>(), hz = d->props["hingeLine"][1].get<int>();
+    const bool boxSame = g.ok && g.lo.x == llo.x && g.lo.y == llo.y && g.lo.z == llo.z &&
+                         g.hi.x == lhi.x && g.hi.y == lhi.y && g.hi.z == lhi.z;
+    const bool hingeSame = g.ok && std::fabs(g.hinge.x - (float)hx) < 0.01f &&
+                           std::fabs(g.hinge.z - (float)hz) < 0.01f;
+    check(boxSame && hingeSame,
+          Format("%s: P6 geometry (%s) box (%d,%d,%d)-(%d,%d,%d) hinge (%.1f,%.1f) vs slot leaf "
+                 "(%d,%d,%d)-(%d,%d,%d) hinge line (%d,%d)",
+                 id.c_str(), g.ok ? "ok" : g.why.c_str(), g.lo.x, g.lo.y, g.lo.z, g.hi.x, g.hi.y,
+                 g.hi.z, g.hinge.x, g.hinge.z, llo.x, llo.y, llo.z, lhi.x, lhi.y, lhi.z, hx, hz));
+    if (!g.ok) continue;
+    const std::vector<IVec3> box = g.Cells();
+
+    // B. through the tick.
+    auto rig = std::make_unique<support::TickRig>(c, t, IVec3{d->pos.x >> 4, d->pos.y >> 4, d->pos.z >> 4});
+    rig->Authority().refs = &st;
+    PlayerSession& ps = rig->Session();
+    const IVec3 out = {-g.face.x, 0, -g.face.z};   // the side it does NOT swing to
+    auto stand = [&]() {
+      ps.player.pos = Vec3{(float)d->pos.x + 0.5f + out.x * 30.0f, (float)d->pos.y + 20.0f,
+                           (float)d->pos.z + 0.5f + out.z * 30.0f};
+      ps.player.vel = Vec3{0, 0, 0};
+    };
+    stand();
+    support::RunTicks(*rig, 8);
+    auto boxWords = [&](std::vector<uint32_t>& o) {
+      const uint32_t since = rig->tick;
+      for (int k = 0; k < 40; k++) {
+        bool fresh = true;
+        for (const IVec3& cell : box) {
+          const IVec3 wc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+          const CachedChunk* cc = c.world.Cached(wc);
+          if (cc == nullptr || cc->voxels.size() != kChunkVol || cc->version < since) {
+            fresh = false;
+            c.world.RequestChunkFetch(wc);
+          }
+        }
+        if (fresh) break;
+        stand();
+        support::RunTicks(*rig, 1);
+      }
+      o.clear();
+      for (const IVec3& cell : box) {
+        const CachedChunk* cc = c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+        const uint32_t w = cc ? cc->voxels[(size_t)(((cell.z & 15) * 16 + (cell.y & 15)) * 16 +
+                                                     (cell.x & 15))]
+                              : 0xFFFFFFFFu;
+        o.push_back(w & 0x7F00FFFFu);
+      }
+    };
+    auto waitPhase = [&](refs::DoorPhase want, int maxTicks) {
+      refs::DoorStatus s;
+      for (int k = 0; k < maxTicks; k++) {
+        if (refs::DoorStatusOf(id, s) && s.phase == want) return k;
+        stand();
+        support::RunTicks(*rig, 1);
+      }
+      return -1;
+    };
+    std::vector<uint32_t> before, opened, after;
+    boxWords(before);
+    int wood = 0;
+    for (uint32_t w : before) wood += (w & 0xFFFu) == mDoor ? 1 : 0;
+    check(st.IsActive(id), id + ": never activated");
+    check(wood == (int)box.size(), Format("%s: %d of %zu leaf cells are door_wood", id.c_str(), wood,
+                                          box.size()));
+    st.QueueDevUse(id);
+    const int openAfter = waitPhase(refs::DoorPhase::Open, 60);
+    for (int k = 0; k < 40; k++) {
+      stand();
+      support::RunTicks(*rig, 1);
+    }
+    refs::DoorStatus sO;
+    refs::DoorStatusOf(id, sO);
+    boxWords(opened);
+    bool air = true;
+    for (uint32_t w : opened) air &= (w & 0xFFFu) == 0;
+    const bool body = sO.body != 0 && c.debris.HasBody(sO.body);
+    check(openAfter >= 0 && body && air && sO.leafCells == (uint32_t)box.size(),
+          Format("%s: open after %d ticks, body %d, cells empty %d, leaf %u (%s)", id.c_str(),
+                 openAfter, body, air, sO.leafCells, sO.note.c_str()));
+    st.QueueDevUse(id);
+    const int closedAfter = waitPhase(refs::DoorPhase::Closed, 200);
+    for (int k = 0; k < 3; k++) {
+      stand();
+      support::RunTicks(*rig, 1);
+    }
+    boxWords(after);
+    const bool gone = sO.body == 0 || !c.debris.HasBody(sO.body);
+    const bool exact = after == before;
+    check(closedAfter >= 0 && gone && exact,
+          Format("%s: closed after %d ticks, body gone %d, box byte-identical %d", id.c_str(),
+                 closedAfter, gone, exact));
+    if (openAfter >= 0 && body && air && closedAfter >= 0 && exact) cycles++;
+    doorLines += Format("%s%s yaw %d hinge %s: open %d / close %d ticks", doorLines.empty() ? "" : "; ",
+                        id.c_str(), d->yaw, d->props.value("hinge", "?").c_str(), openAfter, closedAfter);
+    t = rig->tick;
+  }
+
+  // C. the chest (house 0) and the beds.
+  bool chestOk = false, bedOk = true;
+  {
+    const std::string cid = list[0].id + "/chest_0";
+    const refs::Ref* ch = st.Find(cid);
+    Bag bag;
+    if (ch != nullptr) refs::ContainerContents(st, *ch, &c.items, bag);
+    const bool contents = ch != nullptr && ch->kind == "container" && bag.Count() == 1 &&
+                          bag.slots[0].name == itemName && bag.slots[0].count == 3;
+    bool opened = false;
+    if (ch != nullptr) {
+      support::TickRig rig(c, t, IVec3{ch->pos.x >> 4, ch->pos.y >> 4, ch->pos.z >> 4});
+      rig.Authority().refs = &st;
+      PlayerSession& ps = rig.Session();
+      ps.player.pos = Vec3{(float)ch->pos.x + 0.5f, (float)ch->pos.y + 0.0f, (float)ch->pos.z + 8.5f};
+      ps.player.vel = Vec3{0, 0, 0};
+      support::RunTicks(rig, 4);
+      st.ClearUses();
+      rig.Authority().ui.lootRef.clear();
+      support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+        o.input.SetPressed(TB_USE, true);
+        o.input.useRef = ch->hash;
+      });
+      const std::vector<refs::UseRecord>& u = st.Uses();
+      opened = !u.empty() && u.back().used && u.back().id == cid &&
+               rig.Authority().ui.lootRef == cid;
+      check(opened, cid + ": the use did not open it: " +
+                        (u.empty() ? std::string("no use recorded") : u.back().message));
+      t = rig.tick;
+    }
+    check(contents, Format("%s: contents %d stacks (want 1 x3 %s)", cid.c_str(), bag.Count(),
+                           itemName.c_str()));
+    chestOk = contents && opened;
+    for (const auto& p : list)
+      for (const refs::Ref* k : st.ChildrenOf(p.id)) {
+        if (k->kind != "bed") continue;
+        refs::BedAnchor a;
+        IVec3 blo, bhi;
+        const refs::Json& B = k->props["box"];
+        blo = {B["min"][0].get<int>(), B["min"][1].get<int>(), B["min"][2].get<int>()};
+        bhi = {B["max"][0].get<int>(), B["max"][1].get<int>(), B["max"][2].get<int>()};
+        const bool in = refs::BedAnchorOf(*k, a) && k->pos.x >= blo.x && k->pos.x <= bhi.x &&
+                        k->pos.z >= blo.z && k->pos.z <= bhi.z && k->pos.y >= blo.y &&
+                        k->pos.y <= bhi.y && a.foot.x >= blo.x && a.foot.x <= bhi.x + 1 &&
+                        a.foot.z >= blo.z && a.foot.z <= bhi.z + 1;
+        if (!in) bedOk = false;
+        check(in, k->id + ": P6 bed anchor outside the slot's frame");
+      }
+  }
+  bool noWarn = true;
+  for (const std::string& w : st.Warnings())
+    if (w.find("gate/door_") != std::string::npos) {
+      noWarn = false;
+      check(false, "store warning: " + w);
+    }
+
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(idCounterWas);
+  c.stream.Store().Clear();
+  fs::remove_all(root, ec);
+  fs::remove_all(gateDir, ec);
+  Restore(c, savedOrigin);
+  detail = Format("%d/2 doors cycled exact (%s) | chest %s | beds %s | P6 validate clean %d",
+                  cycles, doorLines.c_str(), chestOk ? "authored contents + opened" : "FAIL",
+                  bedOk ? "anchored in frame" : "FAIL", noWarn ? 1 : 0);
+  if (!why.empty()) detail += " | FAIL: " + why[0];
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& StructureGates() {
   static const std::vector<Gate> g = {
       {"structure-stamp", "world", {}, false, GateStructureStamp, /*needsRender=*/false},
       {"structure-reload", "world", {}, false, GateStructureReload, /*needsRender=*/false},
+      {"structure-door", "world", {}, false, GateStructureDoor, /*needsRender=*/false},
   };
   return g;
 }

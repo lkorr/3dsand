@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -1183,6 +1184,13 @@ struct UIState {
     bool all = false;
   } takeLoot;
   bool lootClose = false;              // the panel's close button
+  // ---- A CHEST (world/refs_doors.h `container`) in the same panel ----------
+  // Non-empty while the loot panel shows a container ref's contents instead
+  // of a corpse's. Set by the tick's use verb (refs::TickRefs), with
+  // `lootRefOpenReq` asking the frame to open the screen around it. A chest
+  // TAKES PUTS: a drag from the bag/hotbar onto the panel stores the stack.
+  std::string lootRef;
+  bool lootRefOpenReq = false;
   // ---- the look prompt ------------------------------------------------------
   // What E would do to the thing under the crosshair, or empty. Written by
   // main.cpp's reach ray every frame, drawn by DrawHUD under the crosshair.
@@ -1419,6 +1427,13 @@ struct UIState {
   // SetProp / SetField / Delete, which write the group JSON file -- authored
   // data, like the tuner's JSON editors -- and the next tick re-applies.
   refs::RefStore* refs = nullptr;
+  // Every item name the library knows (the container contents editor's
+  // searchable list), mirrored by main.cpp.
+  std::vector<std::string> itemLibraryNames;
+  // World voxels -> screen pixels through the MAIN camera, or false when the
+  // point is behind it. Installed by main.cpp (which owns the camera
+  // convention); the References page draws a door's swing arc with it.
+  std::function<bool(const float world[3], float screen[2])> projectWorld;
   // "fly to" on a ref: main puts the player in fly mode a few metres off it,
   // looking at it. One-shot.
   bool refFlyTo = false;

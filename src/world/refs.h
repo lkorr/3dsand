@@ -72,6 +72,10 @@
 class MobSystem;
 class World;
 class ChunkStore;
+class Physics;
+class DebrisSystem;
+struct ItemLibrary;
+struct MaterialDef;
 struct OpBatch;
 struct PlayerSession;
 
@@ -151,6 +155,13 @@ struct RefCtx {
   ChunkStore* store = nullptr;
   OpBatch* ops = nullptr;   // THIS tick's batch: every voxel write goes here (rule 3)
   uint32_t tick = 0;
+  // P6 (doors): the leaf becomes a hinged body while open, so a door needs the
+  // physics and the debris system that draws it, and the material table to
+  // tell a solid leaf cell from a wisp of smoke. Containers name items.
+  Physics* phys = nullptr;
+  DebrisSystem* debris = nullptr;
+  const std::vector<MaterialDef>* mats = nullptr;
+  const ItemLibrary* items = nullptr;
 };
 
 // One use of one ref by one player (the §2.5 verb).
@@ -158,6 +169,9 @@ struct RefUse {
   uint32_t player = 0;                 // session index in the tick's span
   PlayerSession* session = nullptr;    // the user; null in a store-only gate
   std::string message;                 // what the HUD says back (kitMessage)
+  // A container was opened: the ref id the using player's loot panel should
+  // show (TickRefs hands it to the window's UI; "" = none).
+  std::string openContainer;
 };
 
 enum class Activation : uint8_t { Done, Retry };
@@ -201,6 +215,10 @@ struct RefKind {
   // activation (a structure is worldgen input and shows at any distance).
   // Optional.
   std::function<void(const Ref* before, const Ref* after)> onEdit;
+  // ONCE PER TICK, per KIND (not per ref), after activation and the uses, for
+  // a kind with moving parts (a door swinging). Must cost ~nothing when
+  // nothing of its kind is moving (rule 2). Optional.
+  std::function<void(RefCtx&)> tick;
 };
 
 class RefKindRegistry {
@@ -299,6 +317,15 @@ class RefStore {
   const std::vector<UseRecord>& Uses() const { return uses_; }
   void NoteUse(UseRecord u);
   void ClearUses() { uses_.clear(); }
+  // A DEV USE: the References page's "test open/close" button. Queued here and
+  // run by the next TickRefs inside the tick (so its ops land in op order like
+  // a player's), with no reach check and no player (RefUse::session null).
+  void QueueDevUse(const std::string& id) { devUses_.push_back(id); }
+  std::vector<std::string> TakeDevUses() {
+    std::vector<std::string> v;
+    v.swap(devUses_);
+    return v;
+  }
 
   // ---- deltas (the save's half) ---------------------------------------------
   // Bind the ChunkStore whose region buckets hold dormant 'REFS' records.
@@ -366,6 +393,7 @@ class RefStore {
   std::vector<std::string> warnings_;
   std::vector<RefActivity> log_;
   std::vector<UseRecord> uses_;
+  std::vector<std::string> devUses_;
   std::map<std::string, RefDelta> deltas_;
   std::set<uint64_t> pulledRegions_;
   ChunkStore* chunkStore_ = nullptr;

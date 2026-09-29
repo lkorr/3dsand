@@ -127,7 +127,31 @@ Frame MakeFrame(const Asset& a, IVec3 pos, int yaw);
 // derivedFrom = instance id). Box props (`leaf`, `box`: {min, max}) and
 // `hingeLine` are transformed to world coordinates, `links` to child ids;
 // `slot` and `structure` props name where the child came from.
-void DeriveChildren(const Asset& a, const refs::Ref& instance, std::vector<refs::Ref>& out);
+void DeriveChildren(const Asset& a, const refs::Ref& instance, std::vector<refs::Ref>& out,
+                    std::vector<std::string>* problems = nullptr);
+
+// ---- P2 slot -> P6 kind (the ONE place the two vocabularies meet) -------------
+// P2's door slot says: a leaf box, a hinge LINE (cell-corner x/z on the leaf's
+// inner face), the wall's outward heading (the slot yaw) and `opens: in|out`.
+// P6's door (world/refs_doors.h) says: pos = the hinge-side bottom cell of the
+// leaf's FRONT layer (the face it swings toward), yaw = the heading it swings
+// toward, width/height/thickness (thickness behind the front face), hinge
+// left|right in P6's own frame (DoorGeometry: along = HeadingAxis(yaw + 90)
+// for "left"). The translation is GEOMETRIC, so P2's and P6's differing
+// "left/right" conventions never meet: swing heading = outward + 180 for
+// `in`; thickness = the leaf's extent along it; the hinge END is whichever end
+// of the leaf's width the hinge line sits on; then P6's `hinge` is the word
+// whose `along` points from that end across the leaf. False + `why` for a leaf
+// that is not an axis-aligned slab. Pure; `worldLeaf*`, `hingeX/Z` in world.
+bool DoorFromSlot(IVec3 leafLo, IVec3 leafHi, int hingeX, int hingeZ, int swingYaw,
+                  IVec3& pos, std::string& hinge, int& width, int& height, int& thickness,
+                  std::string* why);
+// P2 bed slot (pos = first air row over the mattress centre, yaw = foot -> head,
+// box = the frame) -> P6 bed (pos = the mattress cell where the head lies,
+// yaw = head -> foot, props.length = cells head to foot). The frame box's
+// head-end layer is the headboard, so the head cell is one inside it.
+void BedFromSlot(IVec3 slotPos, int slotYaw, IVec3 boxLo, IVec3 boxHi, IVec3& pos, int& yaw,
+                 int& length);
 
 // ---- the map side -------------------------------------------------------------
 // Every `structure` ref in <assetDir>/worldmap/<map>/refs/*.json (the SAME

@@ -580,6 +580,14 @@ const char* const kOrder[] = {
     // environment and regenerate the window at the origin they found.
     "structure-stamp",
     "structure-reload",
+    // Derived doors / chests / beds are P6's kinds: cycles two doors through
+    // the tick and restores the window, like door-cycle.
+    "structure-door",
+    // P6 doors: same exit contract as refs-npc-identity (it builds a doorway
+    // at absolute coordinates, saves and loads, and regenerates on the way
+    // out). container-persist is CPU-only and could go anywhere.
+    "door-cycle",
+    "container-persist",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

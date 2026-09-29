@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -332,7 +333,71 @@ void Frame::Box(IVec3& lo, IVec3& hi) const {
   hi = {std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)};
 }
 
-void DeriveChildren(const Asset& a, const refs::Ref& inst, std::vector<refs::Ref>& out) {
+namespace {
+// Heading -> unit axis, P6's HeadingAxis (0 = +Z, 90 = +X).
+IVec3 Axis(int yaw) {
+  switch (((yaw % 360) + 360) % 360) {
+    case 0: return {0, 0, 1};
+    case 90: return {1, 0, 0};
+    case 180: return {0, 0, -1};
+    default: return {-1, 0, 0};
+  }
+}
+bool GetBox(const Json& p, const char* key, IVec3& lo, IVec3& hi) {
+  if (!p.contains(key)) return false;
+  const Json& v = p[key];
+  return v.is_object() && v.contains("min") && v.contains("max") && ReadIVec3(v["min"], lo) &&
+         ReadIVec3(v["max"], hi);
+}
+}  // namespace
+
+bool DoorFromSlot(IVec3 lo, IVec3 hi, int hingeX, int hingeZ, int swingYaw, IVec3& pos,
+                  std::string& hinge, int& width, int& height, int& thickness, std::string* why) {
+  const IVec3 F = Axis(swingYaw);
+  // Thickness runs along the swing axis; width along the other horizontal one.
+  const bool fx = F.x != 0;
+  thickness = fx ? hi.x - lo.x + 1 : hi.z - lo.z + 1;
+  const int a0 = fx ? lo.z : lo.x, a1 = fx ? hi.z : hi.x;
+  const int hc = fx ? hingeZ : hingeX;   // the hinge line's corner on the width axis
+  width = a1 - a0 + 1;
+  height = hi.y - lo.y + 1;
+  if (thickness < 1 || thickness > 8 || width < 1 || height < 1) {
+    if (why) *why = "the leaf box is not a slab across the swing direction";
+    return false;
+  }
+  // Which END of the width the hinge is on: the corner nearer the line.
+  const bool lowEnd = std::abs(hc - a0) <= std::abs(hc - (a1 + 1));
+  IVec3 along = fx ? IVec3{0, 0, lowEnd ? 1 : -1} : IVec3{lowEnd ? 1 : -1, 0, 0};
+  const int wCoord = lowEnd ? a0 : a1;
+  // The FRONT layer: the leaf's face toward the swing.
+  const int fCoord = fx ? (F.x > 0 ? hi.x : lo.x) : (F.z > 0 ? hi.z : lo.z);
+  pos = fx ? IVec3{fCoord, lo.y, wCoord} : IVec3{wCoord, lo.y, fCoord};
+  // P6: along = Axis(yaw + 90) for "left", its negation for "right".
+  const IVec3 right = Axis(swingYaw + 90);
+  hinge = (along.x == right.x && along.z == right.z) ? "left" : "right";
+  return true;
+}
+
+void BedFromSlot(IVec3 slotPos, int slotYaw, IVec3 lo, IVec3 hi, IVec3& pos, int& yaw,
+                 int& length) {
+  const IVec3 H = Axis(slotYaw);   // foot -> head
+  yaw = ((slotYaw + 180) % 360 + 360) % 360;
+  pos = slotPos;
+  pos.y = slotPos.y - 1;           // the mattress top under the first air row
+  // P2's frame box includes the HEADBOARD as its head-end layer (housegen:
+  // a plank board standing above the mattress); the head lies on the first
+  // mattress cell inside it, and the mattress runs to the box's foot end.
+  if (H.x != 0) {
+    pos.x = H.x > 0 ? hi.x - 1 : lo.x + 1;
+    length = hi.x - lo.x;
+  } else {
+    pos.z = H.z > 0 ? hi.z - 1 : lo.z + 1;
+    length = hi.z - lo.z;
+  }
+}
+
+void DeriveChildren(const Asset& a, const refs::Ref& inst, std::vector<refs::Ref>& out,
+                    std::vector<std::string>* problems) {
   const Frame f = MakeFrame(a, inst.pos, inst.yaw);
   for (const Slot& sl : a.slots) {
     refs::Ref c;
@@ -370,6 +435,32 @@ void DeriveChildren(const Asset& a, const refs::Ref& inst, std::vector<refs::Ref
     }
     p["slot"] = sl.name;
     p["structure"] = inst.id;
+    // ---- P2 slot vocabulary -> the P6 kinds (DoorFromSlot / BedFromSlot) ----
+    IVec3 blo, bhi;
+    if (sl.kind == "door" && GetBox(p, "leaf", blo, bhi) && p.contains("hingeLine") &&
+        p["hingeLine"].is_array() && p["hingeLine"].size() == 2) {
+      // The slot yaw is the wall's OUTWARD heading; "in" swings the other way.
+      const bool opensIn = !(p.contains("opens") && p["opens"].is_string() &&
+                             p["opens"].get<std::string>() == "out");
+      const int swing = opensIn ? (c.yaw + 180) % 360 : c.yaw;
+      std::string hinge, why;
+      int w = 0, h = 0, t = 0;
+      if (DoorFromSlot(blo, bhi, p["hingeLine"][0].get<int>(), p["hingeLine"][1].get<int>(), swing,
+                       c.pos, hinge, w, h, t, &why)) {
+        c.yaw = swing;
+        p["hinge"] = hinge;   // P6's frame now; P2's word is superseded by the geometry
+        p["width"] = w;
+        p["height"] = h;
+        p["thickness"] = t;
+        if (!p.contains("openAngle")) p["openAngle"] = 95;
+      } else if (problems) {
+        problems->push_back("slot " + sl.name + ": door: " + why);
+      }
+    } else if (sl.kind == "bed" && GetBox(p, "box", blo, bhi)) {
+      int len = 18;
+      BedFromSlot(c.pos, c.yaw, blo, bhi, c.pos, c.yaw, len);
+      p["length"] = len;
+    }
     c.props = std::move(p);
     out.push_back(std::move(c));
   }
@@ -503,7 +594,7 @@ void RegisterStructureKinds() {
     std::vector<std::string> warn;
     if (!LoadAsset(sandvox::AssetDir(), r.base, false, a, err, warn)) return;
     for (const std::string& w : warn) problems.push_back("base: " + w);
-    DeriveChildren(a, r, children);
+    DeriveChildren(a, r, children, &problems);
   };
   // The voxels are worldgen's (fact 1): activation writes nothing. What it
   // does is notice an edit worldgen has not seen yet -- a placed, moved,

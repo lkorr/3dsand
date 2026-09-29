@@ -35,6 +35,7 @@
 #include "game/worlditems.h"
 #include "game/corpses.h"
 #include "game/dialogue.h"
+#include "world/refs_doors.h"
 #include "game/dye.h"
 #include "game/grab.h"
 #include "game/item.h"
@@ -10255,6 +10256,11 @@ int main(int argc, char** argv) {
     ui.lookPrompt.clear();
     // ---- "fly to" from F1 -> World -> References (ui/refs_ui.cpp) --------
     // Fly mode, a few metres off the ref and above it, looking at it.
+    // The container editor's item list (References page): the library's names.
+    if (ui.itemLibraryNames.size() != items.items.size()) {
+      ui.itemLibraryNames.clear();
+      for (const ItemDef& d : items.items) ui.itemLibraryNames.push_back(d.name);
+    }
     if (ui.refFlyTo) {
       ui.refFlyTo = false;
       ui.fly = true;
@@ -10325,6 +10331,10 @@ int main(int argc, char** argv) {
       // what was promised (TickInput::useRef).
       if (ui.lookPrompt.empty() && tickCtx.refs != nullptr) {
         refs::RefCtx rc{&refStore, &mobs, &world, &stream.Store(), nullptr, tick};
+        rc.phys = &phys;
+        rc.debris = &debris;
+        rc.mats = &tickCtx.mats;
+        rc.items = &items;
         std::string p;
         if (const refs::Ref* r = refs::PickUsable(refStore, rc, from, fwd, hand, &p)) {
           lookUseRef = r->hash;
@@ -10422,6 +10432,7 @@ int main(int argc, char** argv) {
         // cursor dance is the I key's, and `lootOpenedScreen` remembers that
         // it was E who opened the screen so closing the loot closes it again.
         lootCorpse = corpse->Id();
+        ui.lootRef.clear();   // a corpse, not a chest (world/refs_doors.h)
         ui.lootOpen = true;
         ui.lootTitle = corpse->Def() ? corpse->Def()->name : std::string();
         if (!ui.inventoryOpen) {
@@ -10871,6 +10882,10 @@ int main(int argc, char** argv) {
       // the same key (world/refs.h RefStore::Reload re-applies what changed).
       if (tickCtx.refs != nullptr) {
         refs::RefCtx rc{&refStore, &mobs, &world, &stream.Store(), nullptr, tick};
+        rc.phys = &phys;
+        rc.debris = &debris;
+        rc.mats = &tickCtx.mats;
+        rc.items = &items;
         refStore.Reload(rc);
       }
       std::vector<MaterialDef> newMats;
@@ -12278,6 +12293,27 @@ int main(int argc, char** argv) {
         fovNow += (fovGoal - fovNow) * k;
         cam.fovY = fovNow;
       }
+      // ---- WORLD -> SCREEN for the References page (a door's swing arc) ----
+      // The inverse of raymarch.wgsl's primary ray (see ProjectToPortrait),
+      // against THIS frame's render eye. The UI draws with it and owns no
+      // camera convention of its own.
+      {
+        const Vec3 pfwd = cam.Forward(), pright = cam.Right(), pup = cam.Up();
+        const float th = std::tan(cam.fovY * 0.5f);
+        int winW = 1, winH = 1;
+        glfwGetWindowSize(window, &winW, &winH);   // ImGui's DisplaySize
+        const float dispX = (float)std::max(winW, 1), dispY = (float)std::max(winH, 1);
+        const float asp = dispX / dispY;
+        const Vec3 peye = eye;
+        ui.projectWorld = [=](const float w[3], float out[2]) {
+          const Vec3 d = Vec3{w[0], w[1], w[2]} - peye;
+          const float z = d.dot(pfwd);
+          if (z <= 0.05f) return false;
+          out[0] = (0.5f + 0.5f * d.dot(pright) / (z * th * asp)) * dispX;
+          out[1] = (0.5f - 0.5f * d.dot(pup) / (z * th)) * dispY;
+          return true;
+        };
+      }
 
       // ---- audio ----
       // THE EARS ARE ON THE CHARACTER, NOT ON THE CAMERA. `eye` is the RENDER
@@ -13438,6 +13474,7 @@ int main(int argc, char** argv) {
           ui.lootOpen = false;
           ui.lootClose = false;
           lootCorpse = 0;
+          ui.lootRef.clear();
           if (lootOpenedScreen && ui.inventoryOpen) {
             ui.inventoryOpen = false;
             captured = captureBeforeUi;
@@ -13454,13 +13491,93 @@ int main(int argc, char** argv) {
           }
           lootOpenedScreen = false;
         };
+        // A CHEST the tick's use verb opened (world/refs_doors.h container):
+        // the same panel and the same cursor dance as E on a corpse.
+        if (ui.lootRefOpenReq) {
+          ui.lootRefOpenReq = false;
+          const refs::Ref* cr = ui.lootRef.empty() ? nullptr : refStore.Find(ui.lootRef);
+          if (cr != nullptr) {
+            lootCorpse = 0;
+            ui.lootOpen = true;
+            ui.lootTitle = refs::ContainerTitle(*cr);
+            if (!ui.inventoryOpen) {
+              lootOpenedScreen = true;
+              ui.inventoryOpen = true;
+              captureBeforeUi = captured;
+              captured = false;
+              glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+              glfwGetCursorPos(window, &mx0, &my0);
+            }
+          } else {
+            ui.lootRef.clear();
+          }
+        }
         // The screen closed under the panel (I / Esc): the loot goes with it.
         if (ui.lootOpen && !ui.inventoryOpen) {
           ui.lootOpen = false;
           lootCorpse = 0;
+          ui.lootRef.clear();
           lootOpenedScreen = false;
         }
         if (ui.lootClose) closeLoot();
+        // ---- THE CHEST BRANCH: take one / take all / put, then skip the
+        // corpse code below (it would close a panel with no corpse behind it).
+        const bool chestOpen = ui.lootOpen && !ui.lootRef.empty();
+        if (chestOpen) {
+          const refs::Ref* cr = refStore.Find(ui.lootRef);
+          const Vec3 cp = cr ? Vec3{(float)cr->pos.x + 0.5f, (float)cr->pos.y + 0.5f,
+                                    (float)cr->pos.z + 0.5f}
+                             : Vec3{};
+          if (cr == nullptr || (cp - player.pos).len() > kLootRange) {
+            closeLoot();
+          } else {
+            const std::string cid = ui.lootRef;
+            auto takeChest = [&](int index) -> bool {
+              std::string m;
+              const bool ok = refs::ContainerTake(refStore, cid, index, kit, items, &m);
+              say(m);
+              return ok;
+            };
+            if (ui.moveItem.pending && ui.moveItem.to.space == KitSpace::Loot &&
+                ui.moveItem.from.space != KitSpace::Loot) {
+              // PUT: the whole stack from the bag or the hotbar. Not from an
+              // equip slot -- a worn piece leaves through Mob::KitMove, which
+              // flushes its shells; take it off first.
+              ui.moveItem.pending = false;
+              if (ui.moveItem.from.space == KitSpace::Equip) {
+                say("take it off first");
+              } else if (ItemStack* src = kit.Resolve(ui.moveItem.from);
+                         src != nullptr && !src->Empty()) {
+                ItemStack moving = *src;
+                std::string m;
+                if (refs::ContainerPut(refStore, cid, moving, &m)) *src = ItemStack{};
+                say(m);
+              }
+            }
+            if (ui.moveItem.pending && ui.moveItem.from.space == KitSpace::Loot) {
+              ui.moveItem.pending = false;
+              takeChest(ui.moveItem.from.index);
+            }
+            if (ui.equipItem.pending && ui.equipItem.from.space == KitSpace::Loot) {
+              ui.equipItem.pending = false;
+              takeChest(ui.equipItem.from.index);
+            }
+            if (ui.takeLoot.pending) {
+              ui.takeLoot.pending = false;
+              if (ui.takeLoot.all) {
+                int took = 0;
+                while (took < Bag::kSlots && takeChest(0)) took++;
+                if (took > 1) say("took everything that fit");
+              } else {
+                takeChest(ui.takeLoot.index);
+              }
+            }
+            if (ui.dropItem.pending && ui.dropItem.from.space == KitSpace::Loot) {
+              ui.dropItem.pending = false;
+              say("take it out of the " + refs::ContainerTitle(*cr) + " first");
+            }
+          }
+        }
         // Walked away, or the heap is gone / picked clean: close by itself.
         // The dead Mob the panel is open on, or null once it is not one any
         // more (released to debris by the dead cap, risen, removed).
@@ -13468,7 +13585,7 @@ int main(int argc, char** argv) {
           Mob* m = lootCorpse ? mobs.FindMobById(lootCorpse) : nullptr;
           return m != nullptr && m->Lootable() ? m : nullptr;
         };
-        if (ui.lootOpen) {
+        if (ui.lootOpen && !chestOpen) {
           const Mob* c = lootMob();
           if (!c || !c->AnyLimbWithin(player.pos, kLootRange)) closeLoot();
         }
@@ -13485,7 +13602,7 @@ int main(int argc, char** argv) {
           say(LootResultText(r, dest));
           return false;
         };
-        if (ui.moveItem.pending && ui.lootOpen &&
+        if (ui.moveItem.pending && ui.lootOpen && !chestOpen &&
             ui.moveItem.to.space == KitSpace::Loot) {
           ui.moveItem.pending = false;
           if (ui.moveItem.from.space != KitSpace::Loot)
@@ -14529,7 +14646,16 @@ int main(int argc, char** argv) {
         // read off the death-time capture, the only record there is for a
         // piece nobody is wearing.
         ui.lootSlots.clear();
-        if (ui.lootOpen) {
+        if (ui.lootOpen && !ui.lootRef.empty()) {
+          // A CHEST: its bag, in slot order, the order ContainerTake counts.
+          if (const refs::Ref* cr = refStore.Find(ui.lootRef)) {
+            ui.lootTitle = refs::ContainerTitle(*cr);
+            Bag chest;
+            refs::ContainerContents(refStore, *cr, &items, chest);
+            for (const ItemStack& st : chest.slots)
+              if (!st.Empty()) ui.lootSlots.push_back(mirror(st));
+          }
+        } else if (ui.lootOpen) {
           const Mob* c = lootCorpse ? mobs.FindMobById(lootCorpse) : nullptr;
           if (c && c->Lootable()) {
             ui.lootTitle = c->Def() ? c->Def()->name : std::string();

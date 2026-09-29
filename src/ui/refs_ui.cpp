@@ -21,6 +21,7 @@
 namespace sandvox {
 std::string AssetDir();
 }
+#include "world/refs_doors.h"
 
 namespace {
 
@@ -118,6 +119,230 @@ bool ParseValue(const char* text, refs::Json& out) {
 bool Report(bool ok, const std::string& what, const std::string& err) {
   Status(ok ? what : what + " refused: " + err, !ok);
   return ok;
+}
+
+// ---- P6: the per-kind fields (world/refs_doors.h) ------------------------------
+
+int PropI(const refs::Ref& r, const char* k, int def) {
+  return r.props.contains(k) && r.props[k].is_number() ? r.props[k].get<int>() : def;
+}
+float PropF(const refs::Ref& r, const char* k, float def) {
+  return r.props.contains(k) && r.props[k].is_number() ? r.props[k].get<float>() : def;
+}
+
+// A world-space polyline through the main camera (UIState::projectWorld),
+// drawn over the scene. Segments behind the eye are skipped.
+void WorldLine(UIState& s, const std::vector<Vec3>& pts, ImU32 col, float thick) {
+  if (!s.projectWorld || pts.size() < 2) return;
+  ImDrawList* dl = ImGui::GetBackgroundDrawList();
+  bool havePrev = false;
+  ImVec2 prev{};
+  for (const Vec3& p : pts) {
+    const float w[3] = {p.x, p.y, p.z};
+    float sc[2];
+    if (!s.projectWorld(w, sc)) {
+      havePrev = false;
+      continue;
+    }
+    const ImVec2 cur(sc[0], sc[1]);
+    if (havePrev) dl->AddLine(prev, cur, col, thick);
+    prev = cur;
+    havePrev = true;
+  }
+}
+
+// THE SWING ARC: the closed leaf's outline, where it stands fully open, and
+// the path its latch edge sweeps -- so a wall in the way is visible before
+// anyone opens the door.
+void DrawDoorPreview(UIState& s, const refs::DoorGeom& g) {
+  if (!g.ok) return;
+  const float y0 = g.hinge.y, y1 = g.hinge.y + (float)g.height;
+  const float target = g.openSign * g.openRad;
+  auto leaf = [&](float rad) {
+    const Vec3 l = g.LatchAt(rad);
+    return std::vector<Vec3>{{g.hinge.x, y0, g.hinge.z}, {l.x, y0, l.z}, {l.x, y1, l.z},
+                             {g.hinge.x, y1, g.hinge.z}, {g.hinge.x, y0, g.hinge.z}};
+  };
+  WorldLine(s, leaf(0.0f), ui::ColGoldHi(), 2.0f);
+  WorldLine(s, leaf(target), ui::ColEmber(), 2.0f);
+  for (const float y : {y0 + 0.05f, 0.5f * (y0 + y1)}) {
+    std::vector<Vec3> arc;
+    for (int i = 0; i <= 16; i++) {
+      const Vec3 l = g.LatchAt(target * (float)i / 16.0f);
+      arc.push_back({l.x, y, l.z});
+    }
+    WorldLine(s, arc, ui::ColEmber(), 1.5f);
+  }
+  // The hinge line itself.
+  WorldLine(s, {{g.hinge.x, y0, g.hinge.z}, {g.hinge.x, y1, g.hinge.z}}, ui::ColBloodHi(), 3.0f);
+}
+
+void DrawDoorFields(UIState& s, refs::RefStore& st, const refs::Ref& r) {
+  std::string err;
+  const std::string id = r.id;
+  const refs::DoorGeom g = refs::DoorGeometry(r);
+  ImGui::TextColored(V4(ui::ColGoldDim()), "door");
+  if (!g.ok) ImGui::TextColored(V4(ui::ColBloodHi()), "%s", g.why.c_str());
+  // hinge
+  {
+    const std::string h = r.props.contains("hinge") && r.props["hinge"].is_string()
+                              ? r.props["hinge"].get<std::string>()
+                              : "left";
+    int hi = h == "right" ? 1 : 0;
+    const char* opts[] = {"left", "right"};
+    ImGui::SetNextItemWidth(90);
+    if (ImGui::Combo("hinge", &hi, opts, 2) && opts[hi] != h)
+      Report(refs::SetProp(st, id, "hinge", refs::Json(opts[hi]), &err),
+             "hinge -> " + std::string(opts[hi]), err);
+    ImGui::SetItemTooltip(
+        "Seen from the side the door opens toward, facing the\n"
+        "door: which hand the hinge is on. The arc drawn in the\n"
+        "world shows it; if it is on the wrong side, flip this.");
+  }
+  // open angle: applied when the slider is let go.
+  {
+    static int angle = 95;
+    static std::string angleFor;
+    if (angleFor != id || !ImGui::IsAnyItemActive()) angle = (int)PropF(r, "openAngle", 95.0f);
+    angleFor = id;
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderInt("open angle", &angle, 5, 175, "%d deg");
+    if (ImGui::IsItemDeactivatedAfterEdit())
+      Report(refs::SetProp(st, id, "openAngle", refs::Json(angle), &err), "openAngle set", err);
+  }
+  {
+    int wht[3] = {PropI(r, "width", 9), PropI(r, "height", 20), PropI(r, "thickness", 1)};
+    ImGui::SetNextItemWidth(200);
+    if (ImGui::InputInt3("w / h / thick", wht, ImGuiInputTextFlags_EnterReturnsTrue)) {
+      const bool ok = refs::SetProp(st, id, "width", refs::Json(wht[0]), &err) &&
+                      refs::SetProp(st, id, "height", refs::Json(wht[1]), &err) &&
+                      refs::SetProp(st, id, "thickness", refs::Json(wht[2]), &err);
+      Report(ok, "leaf size set", err);
+    }
+    ImGui::SetItemTooltip(
+        "The leaf box in cells: width along the leaf from the hinge,\n"
+        "height up from pos, thickness BEHIND the front face.\n"
+        "pos = the hinge-side bottom cell of the front layer;\n"
+        "yaw = the way it opens. Enter applies.");
+  }
+  {
+    bool locked = r.props.contains("locked") && r.props["locked"].is_boolean() &&
+                  r.props["locked"].get<bool>();
+    if (ImGui::Checkbox("locked", &locked))
+      Report(refs::SetProp(st, id, "locked", refs::Json(locked), &err),
+             locked ? "locked" : "unlocked", err);
+    ImGui::SameLine();
+    float ac = PropF(r, "autoClose", 0.0f);
+    ImGui::SetNextItemWidth(80);
+    if (ImGui::InputFloat("auto-close s", &ac, 0, 0, "%.1f",
+                          ImGuiInputTextFlags_EnterReturnsTrue))
+      Report(refs::SetProp(st, id, "autoClose", refs::Json(std::max(0.0f, ac)), &err),
+             "autoClose set", err);
+    ImGui::SetItemTooltip("Seconds it stays open before it swings shut. 0 = never.");
+  }
+  if (ImGui::Button("test open/close")) {
+    st.QueueDevUse(id);
+    Status("asked " + id + " to open/close (next tick)", false);
+  }
+  ImGui::SetItemTooltip(
+      "Uses the door as a player would, from anywhere (no reach\n"
+      "check). The ref must be active (in the window).");
+  refs::DoorStatus ds;
+  if (refs::DoorStatusOf(id, ds))
+    ImGui::TextDisabled("%s  %.0f deg  %u cells%s%s", refs::DoorPhaseName(ds.phase),
+                        ds.angle * 57.2958f, ds.leafCells, ds.note.empty() ? "" : "  - ",
+                        ds.note.c_str());
+  DrawDoorPreview(s, g);
+}
+
+void DrawContainerFields(UIState& s, refs::RefStore& st, const refs::Ref& r) {
+  static char search[48] = {};
+  std::string err;
+  const std::string id = r.id;
+  ImGui::TextColored(V4(ui::ColGoldDim()), "contents (props.items: what it starts with)");
+  refs::Json items = r.props.contains("items") && r.props["items"].is_array()
+                         ? r.props["items"]
+                         : refs::Json::array();
+  bool changed = false;
+  int erase = -1;
+  for (size_t i = 0; i < items.size(); i++) {
+    refs::Json& e = items[i];
+    if (!e.is_object()) continue;
+    ImGui::PushID((int)i);
+    const std::string name =
+        e.contains("item") && e["item"].is_string() ? e["item"].get<std::string>() : "?";
+    const bool known =
+        std::find(s.itemLibraryNames.begin(), s.itemLibraryNames.end(), name) != s.itemLibraryNames.end();
+    if (!known) ImGui::PushStyleColor(ImGuiCol_Text, V4(ui::ColBloodHi()));
+    ImGui::TextUnformatted(name.c_str());
+    if (!known) ImGui::PopStyleColor();
+    if (!known) ImGui::SetItemTooltip("no item by this name in the library: it is skipped");
+    ImGui::SameLine(150);
+    const int had = e.contains("count") && e["count"].is_number_integer() ? e["count"].get<int>() : 1;
+    int n = had;
+    ImGui::SetNextItemWidth(90);
+    ImGui::InputInt("##n", &n, 1, 5);
+    if (n != had) {
+      e["count"] = std::max(1, n);
+      changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("x")) erase = (int)i;
+    ImGui::PopID();
+  }
+  if (erase >= 0) {
+    items.erase(items.begin() + erase);
+    changed = true;
+  }
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::InputTextWithHint("##itemsearch", "add an item: type to search...", search,
+                           sizeof search);
+  if (search[0] != 0) {
+    ImGui::BeginChild("##itempick", ImVec2(0, 90), ImGuiChildFlags_Borders);
+    int shown = 0;
+    for (const std::string& nm : s.itemLibraryNames) {
+      if (nm.find(search) == std::string::npos) continue;
+      if (ImGui::Selectable(nm.c_str())) {
+        bool merged = false;
+        for (refs::Json& e : items)
+          if (e.is_object() && e.value("item", std::string()) == nm) {
+            e["count"] = e.value("count", 1) + 1;
+            merged = true;
+          }
+        if (!merged) items.push_back(refs::Json{{"item", nm}, {"count", 1}});
+        changed = true;
+        search[0] = 0;
+      }
+      if (++shown >= 40) break;
+    }
+    ImGui::EndChild();
+  }
+  if (changed)
+    Report(refs::SetProp(st, id, "items", items.empty() ? refs::Json() : items, &err),
+           "contents of " + id + " set", err);
+  if (const refs::RefDelta* d = st.Delta(id); d != nullptr && d->kind == "container") {
+    ImGui::TextColored(V4(ui::ColEmber()), "this playthrough has changed it (a save delta)");
+    ImGui::SetItemTooltip(
+        "Something was taken or put: from then on the chest holds\n"
+        "what it holds now, and these authored contents are only\n"
+        "where a NEW game starts.");
+    if (ImGui::SmallButton("reset to authored")) {
+      st.ClearDelta(id);
+      Status(id + ": back to its authored contents", false);
+    }
+  }
+}
+
+void DrawBedFields(UIState& s, const refs::Ref& r) {
+  refs::BedAnchor a;
+  ImGui::TextColored(V4(ui::ColGoldDim()), "bed");
+  if (!refs::BedAnchorOf(r, a)) {
+    ImGui::TextColored(V4(ui::ColBloodHi()), "yaw must be 0/90/180/270, length >= 1");
+    return;
+  }
+  ImGui::TextDisabled("head at pos, feet toward yaw, %d cells (props.length)",
+                      PropI(r, "length", 18));
+  WorldLine(s, {a.head, a.foot}, ui::ColMana(), 3.0f);
 }
 
 }  // namespace
@@ -386,6 +611,13 @@ void DrawRefsPage(UIState& s) {
                         "props." + std::string(p.newKey) + " added", err)) {
         p.newKey[0] = p.newValue[0] = '\0';
       }
+    }
+    // The kind's own fields (P6): friendlier than raw JSON, same file.
+    if (const refs::Ref* cur = st.Find(id)) {
+      ImGui::Spacing();
+      if (cur->kind == "door") DrawDoorFields(s, st, *cur);
+      else if (cur->kind == "container") DrawContainerFields(s, st, *cur);
+      else if (cur->kind == "bed") DrawBedFields(s, *cur);
     }
   }
 

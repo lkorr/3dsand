@@ -558,6 +558,7 @@ add_library(sandvox_core OBJECT
   # STRUCTURE INSTANCES (PLAN_world_editor.md P4): `structure` refs -> worldgen
   # stamp sites, slots -> derived child refs. See src/world/structures.h.
   src/world/structures.cpp
+  src/world/refs_doors.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
