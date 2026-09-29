@@ -2299,7 +2299,10 @@ void Overlay::Draw(UIState& s) {
                                               "approach", "holdRange",
                                               "circle",   "attack",
                                               "flee",     "guard",
-                                              "dodge"};
+                                              "dodge",    "sleep",
+                                              "work",     "wander",
+                                              "socialize", "eat",
+                                              "goto"};
               static_assert(sizeof(kIntent) / sizeof(kIntent[0]) ==
                             (size_t)UIState::kAiIntents);
               for (int k = 0; k < UIState::kAiIntents; k++) {

@@ -831,6 +831,15 @@
       ],
       "clip": "headless",
       "speedScale": 0.7
+    },
+    {
+      "name": "sleep",
+      "activity": "sleep",
+      "clip": "sleep",
+      "speedScale": 0,
+      "disableGait": true,
+      "bodyYOffset": 0,
+      "groundAlign": 1
     }
   ],
   "clips": {

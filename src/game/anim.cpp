@@ -263,8 +263,14 @@ int AnimSelectState(const AnimSkeleton& sk, const AnimState& st) {
     for (int p : ch.parts) lost |= dead(p);
     chainsLost += lost ? 1 : 0;
   }
+  // Activity states first (AnimStateRule::activity): what the body is doing
+  // outranks how it is damaged.
+  if (!st.activity.empty())
+    for (size_t r = 0; r < sk.states.size(); r++)
+      if (sk.states[r].activity == st.activity) return (int)r;
   for (size_t r = 0; r < sk.states.size(); r++) {
     const AnimStateRule& rule = sk.states[r];
+    if (!rule.activity.empty()) continue;   // matched above or not at all
     // an empty predicate would shadow every rule after it — never match it
     if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
         rule.minChainsLost <= 0)

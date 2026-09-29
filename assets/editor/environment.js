@@ -38,6 +38,7 @@
 import * as Trees from './trees.js';
 import * as Water from './water.js';
 import * as Structures from './structures.js';
+import * as Schedules from './schedules.js';
 import * as Biome from './biome.js';
 import * as WorldMap from './map.js';
 import * as Link from './envlink.js';
@@ -50,8 +51,9 @@ let dirtyBy = {};
 let els = {};
 let envActive = false;
 
-const PAGE_ORDER = ['map', 'biome', 'trees', 'water', 'structures'];
-const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies', structures: 'Structures'};
+const PAGE_ORDER = ['map', 'biome', 'trees', 'water', 'structures', 'schedules'];
+const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies', structures: 'Structures',
+                    schedules: 'Schedules'};
 
 const CSS = `
 #view-environment.active{display:flex;gap:10px;height:calc(100vh - 150px);min-height:520px}
@@ -96,7 +98,7 @@ function showPage(id) {
 
 function apiOf(id) {
   return id === 'trees' ? Trees : id === 'water' ? Water : id === 'biome' ? Biome : id === 'map' ? WorldMap :
-         id === 'structures' ? Structures : null;
+         id === 'structures' ? Structures : id === 'schedules' ? Schedules : null;
 }
 
 /** Deep link from a page: open a biome / species / preset by name. */
@@ -107,6 +109,7 @@ async function openPage(id, name) {
     else if (id === 'water' && name) await Water.open(name);
     else if (id === 'trees' && name && Trees.open) await Trees.open(name);
     else if (id === 'structures' && name) await Structures.open(name);
+    else if (id === 'schedules' && name) await Schedules.open(name);
   } catch (e) { H.toast('could not open ' + id + '/' + name + ': ' + (e && e.message || e), true); }
 }
 
@@ -166,7 +169,7 @@ async function paintNav() {
   nav.append(add);
 
   nav.append(el('h4', {}, 'Components'));
-  for (const id of ['trees', 'water', 'structures']) {
+  for (const id of ['trees', 'water', 'structures', 'schedules']) {
     const b = el('button', {'data-page': id, class: current === id ? 'on' : ''},
                  el('span', {}, PAGE_LABEL[id]),
                  el('span', {class: 'pill' + (dirtyBy[id] ? ' dirty' : '')},
@@ -280,6 +283,7 @@ export function attach(hooks) {
   Trees.attach(shared('trees'));
   Water.attach(shared('water'));
   Structures.attach(shared('structures'));
+  Schedules.attach(shared('schedules'));
   Biome.attach(shared('biome'));
   WorldMap.attach(shared('map'));
   paintNav();
@@ -315,4 +319,4 @@ export function refreshGameBar() { paintGameBar(); }
 export function _pages() { return pages; }
 export function _current() { return current; }
 export function _open(id, name) { return openPage(id, name); }
-export const _modules = {Trees, Water, Biome, WorldMap, Structures};
+export const _modules = {Trees, Water, Biome, WorldMap, Structures, Schedules};

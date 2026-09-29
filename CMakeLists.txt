@@ -523,6 +523,8 @@ add_library(sandvox_core OBJECT
   # Branching conversations: content, flags store, the tick hook
   # (docs/PLAN_world_editor.md P3, game/dialogue.h).
   src/game/dialogue.cpp
+  # Villager schedules (assets/schedules/*.json), game/schedule.h.
+  src/game/schedule.cpp
   src/game/anim.cpp
   src/game/avatar.cpp
   # ONE POSE PIPELINE for NPCs and the player (game/pose.h, W2-L):
@@ -556,6 +558,8 @@ add_library(sandvox_core OBJECT
   src/world/refs_kinds.cpp
   src/world/refs_game.cpp
   src/world/refs_doors.cpp
+  # P7 NPC residents: the npc + waynode kinds, schedules, the day's routing.
+  src/world/refs_npc.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
@@ -607,6 +611,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_net.cpp
   src/test/selftest_dialogue.cpp
   src/test/selftest_refs.cpp
+  src/test/selftest_npc.cpp
   src/audio/device.cpp
   src/audio/library.cpp
   src/audio/voice.cpp
@@ -645,6 +650,7 @@ add_library(sandvox_core OBJECT
   src/ui/dialogue_ui.cpp
   # F1 -> World -> References: the ref list + inspector (world/refs.h).
   src/ui/refs_ui.cpp
+  src/ui/refs_npc_ui.cpp
   # spellgraph_ui.cpp is the composer's CANVAS: it draws UIState::spellGraph
   # (main.cpp's mirror of game/spellgraph.h) and turns a gesture into a
   # GraphEditIntent. It applies no op itself.

@@ -527,7 +527,7 @@ struct UIState {
       aiDisengageTicks = 22;
   float aiHysteresis = 0.22f;
   // One per ai::Intent, in enum order (main.cpp static_asserts the count).
-  static constexpr int kAiIntents = 9;
+  static constexpr int kAiIntents = 15;
   float aiIntentWeight[kAiIntents] = {};
   int aiIntentCooldown[kAiIntents] = {};
   int aiIntentDwell[kAiIntents] = {};
@@ -1439,6 +1439,16 @@ struct UIState {
   bool refFlyTo = false;
   float refFlyPos[3] = {};
   // R also reloads the map's refs (main.cpp's reloadMaterials path).
+  // P7 "jump clock to ..." (the npc inspector): minutes after midnight, -1 =
+  // none. main.cpp moves the celestial clock there (the sky, the day phase,
+  // every schedule and the dialogue `time` condition follow) -- a dev tool,
+  // like the time slider, and it moves the world hash the same way.
+  int jumpClockMinute = -1;
+  // What the schedule clock reads right now (-1 = unknown), mirrored by main
+  // for the npc inspector's "now" line; and whether the day is frozen by
+  // tuning (dayNight.freeze), in which case a jump does nothing.
+  int clockMinute = -1;
+  bool clockFrozen = false;
 };
 
 class Overlay {

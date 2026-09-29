@@ -533,6 +533,8 @@ void DrawRefsPage(UIState& s) {
       if (cur->kind == "door") DrawDoorFields(s, st, *cur);
       else if (cur->kind == "container") DrawContainerFields(s, st, *cur);
       else if (cur->kind == "bed") DrawBedFields(s, *cur);
+      else if (cur->kind == "npc") DrawNpcFields(s, st, *cur);
+      else if (cur->kind == "waynode") DrawWaynodeFields(s, st, *cur);
     }
   }
 

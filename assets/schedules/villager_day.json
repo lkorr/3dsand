@@ -1,0 +1,12 @@
+{
+  "about": "A plain villager's day: the sample schedule (docs/EDITOR_GUIDE.md, How do I give an NPC a home and a day). Roles bed / work / home are props on the npc ref; gather is a TAG on a marker. Edit here or on F1 > World > References with the villager selected, then press R.",
+  "rows": [
+    { "from": "22:00", "to": "06:00", "do": "sleep", "at": "bed" },
+    { "from": "06:00", "to": "07:00", "do": "eat", "at": "home" },
+    { "from": "07:00", "to": "12:00", "do": "work", "at": "work" },
+    { "from": "12:00", "to": "13:00", "do": "eat", "at": "home" },
+    { "from": "13:00", "to": "18:00", "do": "work", "at": "work" },
+    { "from": "18:00", "to": "20:00", "do": "socialize", "at": "gather", "radius": 3 },
+    { "from": "20:00", "to": "22:00", "do": "wander", "at": "home", "radius": 2 }
+  ]
+}

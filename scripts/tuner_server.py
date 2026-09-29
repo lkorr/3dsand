@@ -175,7 +175,10 @@ def readable():
 # §2.2). The one rule beyond containment is HAND-EDITED protection, in
 # _structure_guard() below.
 MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs", "trees", "prefabs",
-              "anims", "biomes", "water", "structures", "structures/samples")
+              "anims", "biomes", "water", "structures", "structures/samples",
+              # villagers' days (game/schedule.h), the Environment tab's
+              # Schedules page (assets/editor/schedules.js, PLAN_world_editor P7)
+              "schedules")
 MODEL_EXTS = (".vox", ".json", ".svtree")
 # The one MODEL_DIRS entry with a delete route (/api/limb/delete). Named here
 # so that route cannot be pointed at another directory by editing one string.

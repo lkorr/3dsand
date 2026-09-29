@@ -377,6 +377,23 @@ void ReadDir(const std::string& dir, std::map<std::string, RefGroupFile>& groups
 }
 }  // namespace
 
+namespace {
+std::vector<void (*)(RefStore*)>& GoneHooks() {
+  static std::vector<void (*)(RefStore*)> h;
+  return h;
+}
+}  // namespace
+
+void AddStoreGoneHook(void (*fn)(RefStore*)) {
+  for (auto f : GoneHooks())
+    if (f == fn) return;
+  GoneHooks().push_back(fn);
+}
+
+RefStore::~RefStore() {
+  for (auto f : GoneHooks()) f(this);
+}
+
 void RefStore::LoadMap(const std::string& assetDir, const std::string& mapName) {
   assetDir_ = assetDir;
   map_ = mapName;

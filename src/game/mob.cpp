@@ -1921,6 +1921,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       partList("missing", rule.missingAll);
       partList("missingAny", rule.missingAnyOf);
       rule.minChainsLost = s.value("minChainsLost", 0);
+      rule.activity = s.value("activity", "");
       rule.clip = s.value("clip", "");
       rule.speedScale = s.value("speedScale", 1.0f);
       // Read AFTER speedScale so its default can BE speedScale (anim.h).
@@ -1937,7 +1938,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
                "\" sets groundAlign without disableGait; the gait's foot "
                "plane will fight the ground fit\n";
       if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
-          rule.minChainsLost <= 0)
+          rule.minChainsLost <= 0 && rule.activity.empty())
         log += jp + ": state \"" + rule.name +
                "\" has an empty predicate and will never match\n";
       sk.states.push_back(std::move(rule));
@@ -3477,6 +3478,12 @@ bool MobSystem::SetMobBehavior(uint64_t mobId, const std::string& name) {
 
 const ai::Brain* MobSystem::MobBrain(uint64_t mobId) const {
   for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return &m.ai_;
+  return nullptr;
+}
+
+ai::Brain* MobSystem::MobBrainMut(uint64_t mobId) {
+  for (Mob& m : mobs_)
     if (m.id_ == mobId) return &m.ai_;
   return nullptr;
 }
@@ -7752,6 +7759,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // none and is a legal target for anything hostile. That is the useful
     // default: a wandering critter should be huntable without being authored.
     a.faction = pr != nullptr ? ai::FactionId(pr->faction) : ~0u;
+    a.hostile = pr != nullptr && pr->perception.aggro == ai::Aggro::Hostile;
     a.alive = true;
     PublishCombatant(m, a);
     a.targetId = m.ai_.hasTarget ? m.ai_.targetId : 0;
@@ -24943,7 +24951,7 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
 // refused spawn, or a short read — all three of which it reports exactly as
 // the loop always did.
 Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
-                        bool* spawnRefused) {
+                        bool* spawnRefused, bool catchUp) {
   if (spawnRefused) *spawnRefused = false;
   if (version < kSaveVersionMin || version > kSaveVersion) {
     std::printf("mob: unknown mob record version %u\n", version);
@@ -24977,6 +24985,19 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
     std::printf("mob: saved def '%s' no longer exists; skipping\n",
                 rec.defName.c_str());
     return nullptr;
+  }
+  // CATCH-UP (P7, mob.h SetUnparkPlacer): an unparking villager comes back
+  // where its schedule says it is now, standing, rather than frozen where it
+  // left the window.
+  if (catchUp && unparkPlacer_ && !rec.dead && !rec.refId.empty()) {
+    const Vec3 ws = defs_[(size_t)defIndex].worldSize;
+    Vec3 foot{rec.origin.x + ws.x * 0.5f, rec.origin.y, rec.origin.z + ws.z * 0.5f};
+    float h = rec.heading;
+    if (unparkPlacer_(rec.refId, foot, h)) {
+      rec.origin = Vec3{foot.x - ws.x * 0.5f, foot.y, foot.z - ws.z * 0.5f};
+      rec.heading = h;
+      placeLimbs = false;
+    }
   }
   // Scoped rather than set-and-clear: `loading_` is what keeps spawn-time rot
   // (MobRotDef) out of a body whose holes are about to be restored, and a flag

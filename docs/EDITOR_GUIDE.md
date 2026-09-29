@@ -594,7 +594,7 @@ same file.
 | Field | Means |
 |---|---|
 | `id` | `group/name`, lowercase letters, digits, `_` and `-` only |
-| `kind` | what sort of thing: `marker`, `npc`, `door`, `container`, `bed` (§10.1; more arrive: `structure`, `waynode`) |
+| `kind` | what sort of thing: `marker`, `npc` (§10.2), `waynode` (§10.2), `door`, `container`, `bed` (§10.1; `structure` arrives with houses) |
 | `base` | what it's an instance of — for an `npc`, the mob def (`human`, `dummy`, ...) |
 | `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells |
 | `yaw` | facing in degrees: 0 faces +Z, 90 faces +X |
@@ -718,13 +718,121 @@ says "this playthrough has changed it" and offers **reset to authored**.
 Place a ref of kind **bed** with **pos** on the mattress cell where the **head**
 lies and **yaw** pointing from head to foot; `props.length` (default 18 cells)
 is how long it is. The page draws a blue line head → foot. In game **G** says
-"Rest" (sleeping through the night isn't in yet). Villagers (next package) lie
-down on it.
+"Rest" (sleeping through the night isn't in yet). Villagers lie down on it
+(§10.2).
 
 #### What a door, a chest and a bed save
 
 A door left open saves as open (with its exact voxels) and comes back open; a
 chest saves what's in it now; a bed saves nothing.
+
+### 10.2 How do I give an NPC a home and a day?
+
+A villager is a ref of kind **npc**. Its *day* is a **schedule** — a short list
+of "from this time to that time, do this, there" — and the places it names are
+other refs: its bed, the spot where it works, a well it chats at. It walks
+between them over **waynodes** (dots you place along its paths and through
+doorways), opens the doors on the way and shuts them behind it.
+
+#### 1. Place the villager
+
+F1 → World → References → **new reference**: id `harrowby/osric`, kind **npc**,
+base `human` (or any character: `brug`, `jujunud`, ...), **place at my feet**.
+Then set its props (the page shows a **villager** panel under them):
+
+| Prop | What |
+|---|---|
+| `name` | what the prompt calls it ("Talk to Osric") |
+| `schedule` | which `assets/schedules/<name>.json` it follows (pick it in the panel) |
+| `bed`, `work`, `home` | the refs it sleeps on / works at / eats at — pick them from the dropdowns. Any other prop naming a ref (`"tavern": "harrowby/alehouse/hearth"`) becomes a place a schedule can name too |
+| `dialogue` | which conversation **G** starts (`assets/dialogue/<name>.json`, §9) |
+| `outfit` | what it wears: `["tunic#B4472A", "breeches", "boots"]` (`#RRGGBB` dyes a dyeable piece) |
+| `weapon` | what it holds: `"cleaver"` |
+| `behavior` | its character (default `villager`: minds its own business, runs from monsters, hits back if you hit it) |
+
+The bed is a **bed** ref (§10.1), the work spot is any **marker** (its **yaw** is
+the way the villager faces while it works), and a gathering place is a marker
+with a tag: `props.tags: ["gather"]`.
+
+#### 2. Write its day
+
+With the villager selected, the **schedule** table is right there on the page:
+one row per span of the day — **from** / **to** (drag the hour and minute),
+**do** (the activity), **at** (where), **m** (a radius in metres), and **jump**.
+
+| do | What it does there |
+|---|---|
+| `sleep` | walks to its bed and lies down on it |
+| `work` | stands at the spot facing the marker's yaw |
+| `eat` | stands at home (a house's hearth) |
+| `socialize` | stands at the place and turns to the nearest other villager |
+| `wander` | strolls around the place, within the radius |
+| `goto` | goes there and stands |
+
+**at** is a *role* (`bed`, `work`, `home`, or one you added), a *tag* (the
+nearest marker wearing it, e.g. `gather`) or a ref id (`harrowby/green_well`).
+Rows may wrap midnight (`22:00` → `06:00`). Under the table the page says if a
+minute of the day isn't covered (the villager then idles at home) or two rows
+overlap (the upper one wins). **save** writes `assets/schedules/<name>.json`;
+type a new name first to save a copy and switch this villager to it. Several
+villagers can share one schedule.
+
+The same files are on the tuner's **Environment → Schedules** page (a table,
+time pickers, the same checks, the raw JSON), or in any text editor — press
+**R** in game after a hand edit:
+
+```json
+{
+  "about": "Osric: the anvil by day, the alehouse of an evening.",
+  "rows": [
+    { "from": "22:00", "to": "06:00", "do": "sleep", "at": "bed" },
+    { "from": "07:00", "to": "18:00", "do": "work", "at": "work" },
+    { "from": "18:00", "to": "22:00", "do": "socialize", "at": "tavern", "radius": 3 }
+  ]
+}
+```
+
+#### 3. Give it paths (waynodes)
+
+A villager finds its way across a room by itself, but not across a village or
+through a door. Place refs of kind **waynode** where people walk: in each room,
+a pace **inside and outside every doorway**, and along the paths between
+houses. A house made on the Structures page already has its own (inside/outside
+each door and in each room).
+
+Select a waynode: its **links** are listed and drawn in the world (orange = the
+link goes through a door). Pick another waynode in the list under it to **link**
+them; **x** unlinks. A link works both ways, so you only write it once — and
+that is how houses join the village: put a waynode on the green and link it to
+the house's *outside-door* node (`harrowby/smithy/waynode_front_0_out`); the
+house file never changes. **autoLink** (metres) joins a node to every node that
+close — handy on an open green, but it doesn't check for walls, so use explicit
+links wherever there's something in the way.
+
+#### 4. Try it
+
+The villager panel shows what it is doing **now** — the row, where that is, the
+walk (`travel`, `door: harrowby/smithy/door_front_0`, `at anchor`), and what
+comes **next**. Its route is drawn in the world (blue, with an orange post at
+each door it will open). Press a **jump clock to** button (or **jump** on a row)
+to move the in-game clock to that row and watch it go. Tap **G** on it to talk:
+it turns to you and waits until you're done.
+
+If jumping does nothing, the day is frozen by tuning (`dayNight.freeze`); the
+panel says so.
+
+#### When it doesn't go where you expect
+
+- *"no schedule named ..."* — the `schedule` prop names a file that doesn't
+  exist yet; save one from the table.
+- *"'x' is not a prop on ..., not a ref id and no ref has it as a tag"* — a row's
+  **at** names nothing. Add the role prop, or the tag on a marker.
+- *"no progress toward ..."* / *"gave up ..."* — something blocks the walk
+  (a wall between two linked waynodes, a missing link). Select the waynodes and
+  look at the drawn links; add one through the doorway.
+- *"door ... is locked"* — villagers don't have keys either.
+- Walked out of range and came back? A villager is put where its day says it
+  should be *now* (asleep in bed at night), not where you last saw it.
 
 ## 11. Buildings — the Structures page
 

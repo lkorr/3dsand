@@ -10592,6 +10592,28 @@ twice the damage) and that every shipped style actually swings in a live duel.
 **Not yet:** a player's held guard still only blocks while cutting (its avatar
 never enters an NPC Guard phase), and nothing reads `targetFacingMe` yet.
 
+**A villager's day (2026-09-29, PLAN_world_editor P7; §16.P7).** Six more verbs
+at the end of the enum — `sleep`, `work`, `wander`, `socialize`, `eat`, `goto`,
+the schedule activities spelled exactly as a row's `do` — share ONE scorer and
+ONE actuator: they score a flat 1 only while the resident layer has written an
+`ai::Routine` onto the brain (`Brain::routine`, every tick, from TickRefs before
+`mobs.PreTick`) and only the verb its row names; the actuator walks to
+`Routine::goal` on the same local navigator Approach uses (`UpdatePath` now
+takes the goal explicitly), and on arrival — or while `hold` is set at a closed
+door or in a conversation — turns to `faceHeading` / `facePoint`. WHEN the day
+loses is the profile's weights, like any verb: `villager` weighs the day at 0.6,
+so a fight (approach 1.15, attack 3) or a fright (the `hostiles` rule, flee 2)
+wins. Two perception additions make that profile possible: `aggro: "neutral"`
+now means something — no NEW target until the creature is hurt, then for
+`perception.provokeTicks` it acquires like a hostile one, preferring whoever
+names it as their target (there is no attacker attribution on a wound, so this
+is the honest approximation) — and `Actor::hostile` (published from the
+profile's aggro) feeds a `hostiles` fact and makes a hostile the threat Flee
+runs from, so a villager bolts from the zombie and not from the player beside
+it. The hurt check moved ahead of Perceive (`NoteHurt`) because neutral
+perception reads it. No existing profile is neutral or names the new verbs, so
+every other creature is arbitrated exactly as before.
+
 ### NPCs swinging, and blades meeting blades (2026-08-31; `game/strokes.*`, `assets/mobs/attack_styles.json`)
 
 The AI decides *when* and *where*; this is what turns that into a sword moving
@@ -20469,3 +20491,113 @@ events; the OPEN is a TickInput use.
 **Bed** (`bed`): an anchor. `pos` = the head cell on the mattress, `yaw` = head →
 foot, `props.length` (18). `refs::BedAnchorOf` gives head, foot and heading for
 P7. Use = "Rest", a line of text (skipping time is out of scope).
+
+### 16.P7 NPC residents: a home and a day (added 2026-09-29)
+
+`docs/PLAN_world_editor.md` §2.6 / §5 P7. Code: `src/world/refs_npc.{h,cpp}` (the
+`npc` and `waynode` kinds, anchors, the waynode graph, the resident controller,
+catch-up), `src/game/schedule.{h,cpp}` (the schedule format + clock),
+`ai_behavior` (the six activity verbs, `Routine`, neutral aggro, `hostiles`),
+`Mob::SetActivity` + `AnimStateRule::activity` (the sleep pose),
+`MobSystem::SetUnparkPlacer` (catch-up), `src/ui/refs_npc_ui.cpp` (the page),
+`assets/editor/schedules.js` (tuner, Environment → Schedules). Gates:
+`npc-schedule`, `npc-catchup`. How-to: `docs/EDITOR_GUIDE.md` §10.2.
+
+**The `npc` kind** replaces P1's temporary one and keeps its contract (one spawn
+per ref — delta `spawned`; `Mob::RefId`; an edit despawns and respawns). New:
+the FIRST spawn is at the place the schedule says it is now (catch-up, below),
+the body is put on `props.behavior` (default `villager`), dressed from
+`props.outfit` (`["tunic#B4472A", ...]`, `Mob::WearItem` — the player's path, so
+the kit says what it wears) and armed from `props.weapon` (`EquipItem`). The
+use verb ("Talk to <name>") begins `props.dialogue` through `dialogue::Begin`
+(`RefCtx::talk`); no dialogue = a line of text. An unknown schedule name is not
+a load warning (schedules are content written later); the page says so.
+
+**Schedules** — `assets/schedules/<name>.json`, `{ "about"?, "rows": [ { "from":
+"HH:MM", "to": "HH:MM", "do": <activity>, "at"?: <where>, "radius"?: metres,
+"note"? } ] }`, unknown keys kept, one row per line (`schedule::Write`; the tuner
+page writes the same bytes). `[from, to)` may wrap midnight; first match wins
+where rows overlap; a gap idles at home; both are validator warnings. `at` is a
+ROLE (any npc prop naming a ref — `bed`, `work`, `home`, or invented), a REF ID
+(contains `/`), or a TAG (the nearest ref wearing it in `props.tags`, measured
+from the npc's authored pos); absent = `home`, and no `home` prop = the npc's own
+pos. An anchor that is a `bed` resolves to the mattress middle facing foot→head
+(the sleep pose lies forward); a structure (anything with children) to its
+`hearth` child, else its first waynode. The CLOCK is `schedule::MinuteNow(tick)`
+= dayPhase × 1440 / 65536 (integer), the same celestial clock the sky and the
+dialogue `time` condition read; `SetMinuteOverride` pins it for gates. The
+References page's "jump" buttons move the celestial clock (engaging it like the
+time slider — a dev tool that moves the world hash the same way); under
+`dayNight.freeze` they do nothing and the page says so.
+
+**The waynode graph.** Nodes are every `waynode` ref (id order); edges are
+TWO-WAY — a link written on either end joins both — so an outdoor node joins a
+house by naming the house's outside-door child (`harrowby/smithy/
+waynode_front_0_out`) and the structure asset never knows the village exists. A
+link name resolves as an exact id, else a sibling slot (same parent + `/name`,
+which is how P2's slot-name links work on P4's child refs), else a ref in the
+same group; anything else is a References-page warning and no edge.
+`props.autoLink` (metres, opt-in per node) joins every node within that distance
+and 2 m of height — with NO line-of-sight test (the voxels are not on the CPU);
+an auto edge an NPC fails to walk is dropped for that NPC and it re-plans. An
+edge whose segment crosses any `door` ref's leaf box is a DOOR EDGE. The graph
+is rebuilt when the store's revision changes (`refs::Graph`).
+
+**Routing.** `PlanRoute`: nearest node to the feet (height weighted ×3), nearest
+to the anchor, Dijkstra between (ties to the lower index), then the anchor; the
+first / last node is skipped when the body already stands past it and the leg
+is not a door edge; same nearest node, or no waynodes, = walk straight. The
+arbiter walks ONE leg at a time on the local A* (`ai_nav`, radius from the
+profile), so a leg between two nodes is the only distance the local planner is
+asked to cover. A point counts as reached at 3.5 voxels planar (the anchor at a
+per-activity radius); no progress for 150 ticks marks the leg bad for that
+villager and re-plans (4 tries, then it walks straight at the anchor).
+
+**Doors.** At the node before a door edge the villager asks the DOOR KIND's own
+`onUse` — the player's path, recorded in `RefStore::Uses` as player
+`0xFFFFFFFE` — waits at a point straight out from the doorway (clear of the
+leaf's swing when the leaf swings toward it), and walks once the hinge stands
+≥ 70 % open AND the fetch cache has re-read the leaf's chunks since it opened
+(the body's probes read that cache; the leaf's cells left the grid by ops). A
+door shut in its face is re-opened; a locked one or one that will not open in
+240 ticks marks the edge bad and re-plans. Once through and clear of the swing
+(past the hinge by more than the leaf is long on the swing side, 4 voxels
+behind the plane on the other) it closes it; one it opened and never went
+through (the row changed) is closed once it is well away and off the route.
+Every door effect is ops from inside TickAuthority, as for a player.
+
+**The resident tick** (the `npc` kind's `tick`, TickRefs, before `mobs.PreTick`):
+per active npc with a live body, id order — schedule row for the minute →
+anchor → route → `Brain::routine` (verb, goal, radius, speed 0.5, face). A
+conversation (`RefCtx::talkers`, filled from every session with `talk.active`)
+holds it and faces the speaker; the day resumes where it stood. While the
+arbiter has chosen a fight or a flight the stuck clock stops. At the anchor:
+`sleep` sets `Mob::SetActivity("sleep")` — `AnimSelectState` picks the rig's
+activity state before any damage state; `human.json`'s `sleep` state is prone
+(`groundAlign` 1, gait off, speed 0) with the library clip `anims/sleep.json`,
+so every human variant inherits it by the named-array merge — `work` / `eat` /
+`goto` face the anchor's yaw, `socialize` faces the nearest other villager,
+`wander` strolls between points hashed from `(ref hash, tick)` within `radius`.
+Knocked more than 2.4 m off its spot (4 m + radius when wandering), it walks
+back. Resident state is CPU scratch (`refs::ResidentStatusOf` for the page and
+the gates), never saved: after a load a villager re-plans from where it stands.
+`dialogue::Store::activity` answers the `activity` condition from the current
+row (`refs::ResidentActivity`, wired in main).
+
+**Catch-up.** The first spawn of an npc ref is at `refs::ScheduledPlace` (the
+current row's anchor), not its authored pos (the fallback when there is no
+schedule). An UNPARK — `MobParking` passes `catchUp` to `MobSystem::LoadOne` —
+of a living record with a ref id asks the installed `UnparkPlacer` (the npc
+kind installs it; it reads the last tick's store, nulled by `~RefStore` via
+`refs::AddStoreGoneHook`) for the foot and heading NOW; the record's origin is
+moved there and it stands in its rest pose (limbs are not placed: the pose it
+froze in belongs to where it froze). A save LOAD never relocates. Known gap: a
+villager parked in a region the window never returns to stays there; its home
+activating does not fetch it (that needs a pull of its bucket by ref id).
+
+**Determinism.** Every decision is a function of the refs, the schedule, the
+integer minute, the body's position and the door phases; the wander draw is
+`rng::Hash3(RefHash(id), tick, seq)`. `npc-schedule` runs a whole fast-clock day
+twice from the same start and compares the per-tick trace (feet at 1/8 voxel,
+row, phase, door phase). Villager positions are CPU gameplay state; the grid
+effects are the door ops.

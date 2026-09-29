@@ -320,6 +320,34 @@
         { "note": "with allies: hold the line", "when": { "allies": ">=1" }, "tune": { "circle": 0.5 } },
         { "note": "not my turn: shield up at the edge", "when": { "pressRank": ">=2" }, "scale": { "attack": 0.3 }, "tune": { "band": 5 } }
       ]
+    },
+    {
+      "comment": "AN AUTHORED VILLAGER (PLAN_world_editor P7, world/refs_npc.h). Every `npc` ref gets this unless its props.behavior says otherwise. Its DAY is the six activity verbs (sleep / work / wander / socialize / eat / goto): the resident layer writes the schedule row's verb and the next place to put its feet onto the brain, and they score a flat 1 x 0.6 here -- so anything below that outweighs the day. PASSIVE TO STRANGERS: aggro `neutral` picks no target until it is hurt, then for provokeTicks it answers the nearest stranger (whoever named IT as their target first) with its fists. FLEES HOSTILES: the `hostiles` fact counts creatures whose own profile is aggro hostile (a zombie, not the player), and the rule lets flight (2.0) beat both the day and a fight it is not winning.",
+      "name": "villager",
+      "label": "Villager",
+      "color": 3232809136,
+      "faction": "harrowby",
+      "hysteresis": 0.3,
+      "perception": { "sightRange": 60, "fovDegrees": 360, "requireLos": true, "aggro": "neutral", "alertDecayTicks": 150, "keepRangeScale": 1.3, "stickiness": 6, "preferWeak": 0, "provokeTicks": 240 },
+      "movement": { "mobile": true, "rangeMin": 4, "rangeMax": 7, "bandSlack": 1.4, "approachSpeed": 0.9, "strafeSpeed": 0.4, "retreatSpeed": 0.6, "fleeSpeed": 1.0, "circleTendency": 0, "circleHoldTicks": 30, "repathTicks": 12, "navRadius": 30 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "thrust"], "reach": 6, "aimTolerance": 0.5, "cadenceTicks": 50, "jitterTicks": 20, "commitTicks": 10, "disengageTicks": 20, "pursueSpeed": 0.5, "leadTicks": 12 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "sleep": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "work": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "wander": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "socialize": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "eat": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "goto": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 0 }
+      },
+      "rules": [
+        { "note": "a monster in sight: run from it", "when": { "hostiles": ">0" }, "weight": { "flee": 2.0 } },
+        { "note": "badly hurt in a fight: run", "when": { "hp": "<0.35", "hasTarget": 1 }, "weight": { "flee": 3.5 } }
+      ]
     }
   ]
 }

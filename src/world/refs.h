@@ -78,6 +78,9 @@ struct ItemLibrary;
 struct MaterialDef;
 struct OpBatch;
 struct PlayerSession;
+namespace dialogue {
+class Store;
+}
 
 namespace refs {
 
@@ -157,6 +160,16 @@ struct RefCtx {
   DebrisSystem* debris = nullptr;
   const std::vector<MaterialDef>* mats = nullptr;
   const ItemLibrary* items = nullptr;
+  // P7 (NPC residents): the conversations (the use verb on an npc begins its
+  // `dialogue`), and who is talking to whom this tick -- one entry per
+  // session with a conversation open: the speaker's mob id and the talking
+  // player's eye, so a villager can turn to face them.
+  dialogue::Store* talk = nullptr;
+  struct Talker {
+    uint64_t mobId = 0;
+    Vec3 eye{};
+  };
+  const std::vector<Talker>* talkers = nullptr;
 };
 
 // One use of one ref by one player (the §2.5 verb).
@@ -247,6 +260,12 @@ struct UseRecord {
 
 class RefStore {
  public:
+  RefStore() = default;
+  RefStore(const RefStore&) = delete;
+  RefStore& operator=(const RefStore&) = delete;
+  // Tells anything holding this store's address between ticks (the P7
+  // catch-up placer) that it is gone.
+  ~RefStore();
   // Switch on at this margin inside the window; switch off wholly outside.
   static constexpr int kActivateMarginChunks = 1;
 
@@ -394,6 +413,10 @@ bool SetField(RefStore& s, const std::string& id, const std::string& field,
 // `removed` / `fileIndex` receive the deleted line and its row (for undo).
 bool Delete(RefStore& s, const std::string& id, std::string* err = nullptr,
             Ref* removed = nullptr, int* fileIndex = nullptr);
+
+// A kind that keeps a RefStore's address between ticks (P7's catch-up placer)
+// registers here to hear when that store is destroyed. Idempotent per fn.
+void AddStoreGoneHook(void (*fn)(RefStore*));
 
 // ---- helpers kinds share -----------------------------------------------------
 // The live mob spawned from ref `id`, or null (MobSystem::FindMobByRef).

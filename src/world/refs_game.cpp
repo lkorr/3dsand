@@ -67,6 +67,14 @@ void TickRefs(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick
   ctx.debris = &w.debris;
   ctx.mats = &w.mats;
   ctx.items = &w.items;
+  // P7: the conversations, and who is talking to whom (a villager being
+  // spoken to turns to the speaker and holds its schedule).
+  ctx.talk = w.talk;
+  std::vector<RefCtx::Talker> talkers;
+  for (const SessionTick& p : players)
+    if (p.s != nullptr && p.s->talk.active && p.s->talk.speaker.mobId != 0)
+      talkers.push_back({p.s->talk.speaker.mobId, p.s->player.EyePos()});
+  ctx.talkers = &talkers;
   s.Update(ctx, w.world.WindowOrigin());
 
   // THE USE VERB, per session in index order (the op-order rule: session 0's

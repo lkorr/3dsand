@@ -119,8 +119,22 @@ const char* IntentName(Intent i) {
     case Intent::Flee: return "flee";
     case Intent::Guard: return "guard";
     case Intent::Dodge: return "dodge";
+    case Intent::Sleep: return "sleep";
+    case Intent::Work: return "work";
+    case Intent::Wander: return "wander";
+    case Intent::Socialize: return "socialize";
+    case Intent::Eat: return "eat";
+    case Intent::Goto: return "goto";
     default: return "?";
   }
+}
+
+// The schedule's `do` words ARE the verb names, on purpose: one vocabulary,
+// so a row, a profile's intent map and the dev panel all say "sleep".
+Intent IntentForActivity(const std::string& act) {
+  for (int i = (int)Intent::Sleep; i <= (int)Intent::Goto; i++)
+    if (act == IntentName((Intent)i)) return (Intent)i;
+  return Intent::Count;
 }
 
 Intent IntentFromName(const std::string& s) {
@@ -154,6 +168,7 @@ const char* FactName(Fact f) {
     case Fact::TargetFacingMe: return "targetFacingMe";
     case Fact::EngagedAllies: return "engagedAllies";
     case Fact::PressRank: return "pressRank";
+    case Fact::Hostiles: return "hostiles";
     default: return "?";
   }
 }
@@ -406,6 +421,7 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.perception.keepRangeScale = q.value("keepRangeScale", 1.4f);
       pr.perception.stickiness = q.value("stickiness", 0.0f);
       pr.perception.preferWeak = q.value("preferWeak", 0.0f);
+      pr.perception.provokeTicks = q.value("provokeTicks", 240u);
     }
     if (p.contains("movement")) {
       const auto& q = p["movement"];
@@ -585,7 +601,8 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << "\", \"alertDecayTicks\": " << p.perception.alertDecayTicks
       << ", \"keepRangeScale\": " << num(p.perception.keepRangeScale)
       << ", \"stickiness\": " << num(p.perception.stickiness)
-      << ", \"preferWeak\": " << num(p.perception.preferWeak) << " },\n";
+      << ", \"preferWeak\": " << num(p.perception.preferWeak)
+      << ", \"provokeTicks\": " << p.perception.provokeTicks << " },\n";
     o << "      \"movement\": { \"mobile\": "
       << (p.movement.mobile ? "true" : "false")
       << ", \"rangeMin\": " << num(p.movement.rangeMin)
@@ -755,6 +772,12 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
   // NEAREST, ADJUSTED (Perception::stickiness / preferWeak). Both are 0 on a
   // profile that does not author them, and then `score == d` exactly — the
   // plain nearest-enemy pick every profile had before.
+  // NEUTRAL (P7): nobody is a NEW target until this creature has been hurt,
+  // and then only for `provokeTicks`; one it already holds is kept below
+  // exactly as a hostile creature keeps one.
+  const bool neutral = pr.perception.aggro == Aggro::Neutral;
+  const bool provoked =
+      b.everHurt && tick - b.hurtTick <= pr.perception.provokeTicks;
   const Actor* best = nullptr;
   float bestDist = 1e30f;
   float bestScore = 1e30f;
@@ -763,10 +786,13 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
     if (a.faction == self.faction) continue;
     float d = 0;
     const bool current = b.hasTarget && a.id == b.targetId;
+    if (neutral && !current && !provoked) continue;
     const float range = current ? keep : acquire;
     if (!Perceives(self, pr, v, a, range, d)) continue;
     float score = d;
     if (current) score -= pr.perception.stickiness;
+    // Whoever is fighting ME is the one a provoked neutral answers.
+    if (neutral && a.targetId == self.id) score -= 1000.0f;
     score -= pr.perception.preferWeak *
              (1.0f - std::clamp(a.hpFrac, 0.0f, 1.0f));
     if (score < bestScore) {
@@ -895,7 +921,7 @@ void TrackTargetMotion(Brain& b, const SelfView& self, uint32_t tick, float dt) 
 constexpr float kWaypointRadius = 1.9f;
 
 void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
-                const WorldView& v, uint32_t tick) {
+                const WorldView& v, uint32_t tick, const Vec3& goal) {
   NavParams np;
   np.radius = (int)std::lround(pr.movement.navRadius);
   // THE BODY'S BUDGET UNLESS THE PROFILE OVERRODE IT. A planner that refuses
@@ -948,7 +974,7 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
   // learn nothing. This is also where a mob that has just rounded an obstacle
   // DROPS its detour, and the graceful-degradation path: with no plan and a
   // clear line, "walk at them" is exactly right.
-  if (LineWalkable(v.probe, np, foot, b.targetPos)) {
+  if (LineWalkable(v.probe, np, foot, goal)) {
     b.path.Clear();
     b.navFailed = false;
     return;
@@ -968,7 +994,7 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
   // question, and it also covers the destructible-terrain case this world
   // actually has: a path that now runs into a fresh crater stops making
   // progress by itself.
-  if (!b.path.Done() && PlanarDist(b.pathTarget, b.targetPos) <= 4.0f) {
+  if (!b.path.Done() && PlanarDist(b.pathTarget, goal) <= 4.0f) {
     const float dw = PlanarDist(foot, b.path.Current());
     if (dw < b.lastWaypointDist - 0.25f) {
       b.lastWaypointDist = dw;
@@ -979,18 +1005,18 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
     if (b.stuckTicks < 30) return;
   }
 
-  b.pathTarget = b.targetPos;
+  b.pathTarget = goal;
   b.replans++;
   b.stuckTicks = 0;
-  b.navFailed = !FindPath(v.probe, np, foot, b.targetPos, b.path);
+  b.navFailed = !FindPath(v.probe, np, foot, goal, b.path);
   b.lastWaypointDist =
       b.path.Done() ? 1e9f : PlanarDist(foot, b.path.Current());
 }
 
 // Where the follower currently wants to walk: the live waypoint, or the target
 // itself when there is no path (open ground, or the planner gave up).
-Vec3 SteerPoint(const Brain& b) {
-  return b.path.Done() ? b.targetPos : b.path.Current();
+Vec3 SteerPoint(const Brain& b, const Vec3& goal) {
+  return b.path.Done() ? goal : b.path.Current();
 }
 
 }  // namespace
@@ -1006,16 +1032,21 @@ namespace {
 
 constexpr float kNever = 1.0e9f;
 
-void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
-                   const WorldView& view, uint32_t tick) {
-  // HURT = life went down since the last think, by any cause. Bleeding counts:
-  // a creature losing blood IS being hurt, and a rule that wants "struck in the
-  // last second" can say sinceHurt < 30 and let a slow bleed keep it true.
+// HURT = life went down since the last think, by any cause. Bleeding counts:
+// a creature losing blood IS being hurt, and a rule that wants "struck in the
+// last second" can say sinceHurt < 30 and let a slow bleed keep it true.
+// Run FIRST in Think (before Perceive), because a neutral creature's
+// perception depends on it (Perception::provokeTicks).
+void NoteHurt(Brain& b, const SelfView& self, uint32_t tick) {
   if (b.prevHp >= 0.0f && self.hpFrac < b.prevHp) {
     b.hurtTick = tick;
     b.everHurt = true;
   }
   b.prevHp = self.hpFrac;
+}
+
+void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
+                   const WorldView& view, uint32_t tick) {
 
   // Who is around, within what this creature can see. No line-of-sight test:
   // these are counts for character ("alone", "outnumbered"), not targets, and
@@ -1025,9 +1056,10 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   // be authored to run).
   const Vec3 c = self.Centre();
   const float range = pr.perception.sightRange;
-  int allies = 0, enemies = 0;
-  float nearest = kNever;
+  int allies = 0, enemies = 0, hostiles = 0;
+  float nearest = kNever, nearestHostile = kNever;
   b.hasThreat = false;
+  Vec3 hostilePos{};
   if (view.actors != nullptr && range > 0.0f) {
     for (const Actor& a : *view.actors) {
       if (!a.alive || a.id == self.id) continue;
@@ -1042,9 +1074,19 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
           b.threatPos = a.centre;
           b.hasThreat = true;
         }
+        if (a.hostile) {
+          hostiles++;
+          if (d < nearestHostile) {
+            nearestHostile = d;
+            hostilePos = a.centre;
+          }
+        }
       }
     }
   }
+  // A HOSTILE is the threat when there is one: a villager bolting from the
+  // zombie must not run from the (nearer) player standing beside it.
+  if (hostiles > 0) b.threatPos = hostilePos;
   if (b.hasTarget) {
     b.threatPos = b.targetPos;
     b.hasThreat = true;
@@ -1060,6 +1102,7 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   f[(int)Fact::TargetDist] = b.hasTarget ? b.targetDist : kNever;
   f[(int)Fact::Allies] = (float)allies;
   f[(int)Fact::Enemies] = (float)enemies;
+  f[(int)Fact::Hostiles] = (float)hostiles;
 
   // ---- WHAT I HOLD AND WHAT I FACE (2026-09-27) ---------------------------
   // The target's side is read off its published Actor: what a watching
@@ -1184,6 +1227,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.guard = false;
   out.cancelSwing = false;
 
+  NoteHurt(brain, self, tick);
   Perceive(brain, pr, self, view, tick);
   TrackTargetMotion(brain, self, tick, dt);
   EvaluateRules(brain, pr, self, view, tick);
@@ -1572,6 +1616,14 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     }
   }
   if (attackReady) raw[(int)Intent::RequestAttack] = 1.0f;
+  // THE DAY'S ACTIVITY (P7): exactly the verb the schedule row names, at a
+  // flat 1, while the resident layer has a routine on this brain. Everything
+  // about WHEN it loses -- to a fight, to a fright -- is the profile's
+  // weights and rules, like every other verb.
+  brain.routine.arrived = false;
+  if (brain.routine.active && (int)brain.routine.verb >= (int)Intent::Sleep &&
+      (int)brain.routine.verb <= (int)Intent::Goto)
+    raw[(int)brain.routine.verb] = 1.0f;
   // Flee: always available to a body that can move. What decides WHEN is the
   // weight, which is 0 unless the profile or a holding rule says otherwise --
   // so a creature runs exactly when its JSON says it does, and never else.
@@ -1684,8 +1736,8 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       break;
 
     case Intent::Approach: {
-      UpdatePath(brain, pr, self, view, tick);
-      const Vec3 wp = SteerPoint(brain);
+      UpdatePath(brain, pr, self, view, tick, brain.targetPos);
+      const Vec3 wp = SteerPoint(brain, brain.targetPos);
       const float want = BearingTo(self.Foot(), wp);
       // THE FAN STAYS, EVEN ON A PLANNED ROUTE — and this is the one place the
       // two-avoidance-layers objection has to lose, because the drive's veto is
@@ -1957,6 +2009,44 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       }
       out.driveScale = -back;
       out.driveStrafe = lat;
+      break;
+    }
+
+    case Intent::Sleep:
+    case Intent::Work:
+    case Intent::Wander:
+    case Intent::Socialize:
+    case Intent::Eat:
+    case Intent::Goto: {
+      // ---- ONE ACTUATOR FOR THE WHOLE DAY (P7) ------------------------------
+      // Walk to the routine's goal over the same local navigator Approach
+      // uses (a straight line when it is clear, A* when it is not), and on
+      // arrival -- or while holding at a closed door or in a conversation --
+      // stand and turn to what the routine asks. The resident layer moves
+      // `goal` along the waynode route; this only ever walks ONE leg.
+      Routine& r = brain.routine;
+      const Vec3 foot = self.Foot();
+      const float dist = PlanarDist(foot, r.goal);
+      const bool there = r.final && dist <= r.arriveRadius;
+      r.arrived = there;
+      float faceTo = self.heading;
+      if (r.facePointSet) faceTo = BearingTo(foot, r.facePoint);
+      else if (r.faceHeadingSet) faceTo = r.faceHeading;
+      if (r.hold || there) {
+        brain.path.Clear();
+        out.desiredHeading = faceTo;
+        out.driveScale = 0;
+        break;
+      }
+      UpdatePath(brain, pr, self, view, tick, r.goal);
+      const Vec3 wp = SteerPoint(brain, r.goal);
+      out.desiredHeading = Deflect(BearingTo(foot, wp), self.heading, ground);
+      float drive = sp * std::max(0.0f, r.speed) * spd;
+      // Ease into the anchor (not into every waypoint: slowing at each
+      // corner of a route is a shuffle).
+      if (r.final && brain.path.Done())
+        drive = std::min(drive, sp * std::max(0.25f, arrive(dist - r.arriveRadius * 0.5f)));
+      out.driveScale = drive;
       break;
     }
 

@@ -36,6 +36,8 @@
 #include "game/corpses.h"
 #include "game/dialogue.h"
 #include "world/refs_doors.h"
+#include "world/refs_npc.h"
+#include "game/schedule.h"
 #include "game/dye.h"
 #include "game/grab.h"
 #include "game/item.h"
@@ -7290,6 +7292,11 @@ int main(int argc, char** argv) {
   };
   reloadDialogue();
   tickCtx.talk = &talkStore;
+  // P7: a conversation's `activity` condition asks the villager's schedule
+  // row (world/refs_npc.h ResidentActivity).
+  talkStore.activity = [](uint64_t, const std::string& refId) {
+    return refs::ResidentActivity(refId);
+  };
   // The per-WORLD scratch main() still reads, aliased back out of the ctx the
   // same way the player's members are aliased out of `session`.
   auto& sphereModels = tickCtx.sphereModels;
@@ -10260,6 +10267,31 @@ int main(int argc, char** argv) {
       ui.itemLibraryNames.clear();
       for (const ItemDef& d : items.items) ui.itemLibraryNames.push_back(d.name);
     }
+    // ---- P7 "jump clock to ..." (References page, npc inspector) --------
+    // The celestial clock is the game's own way to move the sun (the dev
+    // time slider drives it); engage it and place it at that minute of the
+    // current day (or the next, so time only runs forward). Schedules, the
+    // sky and the dialogue `time` condition all read it.
+    ui.clockMinute = schedule::MinuteNow(tick);
+    ui.clockFrozen = CurrentTuning().dayNight.freeze != 0;
+    if (ui.jumpClockMinute >= 0) {
+      const int want = ui.jumpClockMinute % 1440;
+      ui.jumpClockMinute = -1;
+      CelestialClock& sky = Celestial();
+      if (!sky.engaged) {
+        sky.SetScale(2.0f, tick);   // any value but 1.0 engages the clock
+        sky.SetScale(1.0f, tick);   // ...then back to real time
+      }
+      const int64_t tpd = (int64_t)TicksPerDay(CurrentTuning());
+      if (tpd > 0) {
+        const int64_t now = std::max<int64_t>(0, sky.ticks);
+        int64_t target = (now / tpd) * tpd + tpd * want / 1440;
+        if (target <= now) target += tpd;
+        sky.ticks = target;
+        sky.prevTicks = target;
+        sky.rem = 0;
+      }
+    }
     if (ui.refFlyTo) {
       ui.refFlyTo = false;
       ui.fly = true;
@@ -10879,6 +10911,9 @@ int main(int argc, char** argv) {
       weather::Presets().Reload();
       // ...and the map's references: a hand edit of a group file shows on
       // the same key (world/refs.h RefStore::Reload re-applies what changed).
+      // ...and the villagers' schedules (assets/schedules), BEFORE the refs
+      // so a re-applied npc plans against the new rows.
+      refs::ReloadSchedules();
       if (tickCtx.refs != nullptr) {
         refs::RefCtx rc{&refStore, &mobs, &world, &stream.Store(), nullptr, tick};
         rc.phys = &phys;

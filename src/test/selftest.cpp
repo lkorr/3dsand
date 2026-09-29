@@ -86,6 +86,8 @@ const std::vector<Gate>& SoluteGates();
 const std::vector<Gate>& DialogueGates();
 // REFERENCES (docs/PLAN_world_editor.md P1, world/refs.h).
 const std::vector<Gate>& RefsGates();
+// NPC residents (docs/PLAN_world_editor.md P7, world/refs_npc.h).
+const std::vector<Gate>& NpcGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -578,6 +580,11 @@ const char* const kOrder[] = {
     // out). container-persist is CPU-only and could go anywhere.
     "door-cycle",
     "container-persist",
+    // P7 NPC residents: same exit contract as door-cycle (they build rooms at
+    // absolute coordinates, move the window away and back, and regenerate
+    // at the origin they found on the way out).
+    "npc-schedule",
+    "npc-catchup",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find
@@ -1018,7 +1025,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates()})
+                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

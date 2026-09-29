@@ -15,7 +15,17 @@
 #pragma once
 
 struct UIState;
+namespace refs {
+class RefStore;
+struct Ref;
+}
 
 // Draws the page body (the caller has opened the section). Reads/edits
 // `s.refs`; raises `s.refFlyTo`.
 void DrawRefsPage(UIState& s);
+
+// P7 (ui/refs_npc_ui.cpp): the npc panel (live status, route drawn in the
+// world, schedule table editor, jump-clock buttons) and the waynode panel
+// (links, add/remove by picking, autoLink, the graph drawn).
+void DrawNpcFields(UIState& s, refs::RefStore& st, const refs::Ref& r);
+void DrawWaynodeFields(UIState& s, refs::RefStore& st, const refs::Ref& r);

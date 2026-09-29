@@ -1178,8 +1178,10 @@ uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
           // build with a different materials.json comes back by name.
           const ScopedLoadRemap remapScope(store.Tables().RemapFor(r.matTable));
           // placeLimbs: it comes back in the pose it left in (mob.h LoadOne).
-          if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true, &refused) !=
-              nullptr) {
+          // catchUp: an authored villager comes back where its schedule
+          // says it is now (mob.h SetUnparkPlacer, P7).
+          if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true, &refused,
+                           /*catchUp=*/true) != nullptr) {
             made++;
             stats_.unparked++;
           } else if (refused) {

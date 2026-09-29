@@ -3081,6 +3081,11 @@ class Mob {
     aimLookValid_ = true;
   }
   void ClearAimLook() { aimLookValid_ = false; }
+  // WHAT THE BODY IS DOING (P7, anim.h AnimState::activity): "sleep" selects
+  // the rig's activity state (a villager lying on its bed), "" stands it back
+  // up. Set every tick by the resident layer; presentation, never saved.
+  void SetActivity(const std::string& a) { anim_.activity = a; }
+  const std::string& Activity() const { return anim_.activity; }
   // The live loco state's `groundAlign` (0 when upright or stateless) and the
   // body's own up. MobBasis reads both: a prone creature's punch has to be
   // solved in the frame it is actually lying in, or the stroke is expressed
@@ -5093,6 +5098,10 @@ class MobSystem {
   // it IS the introspection surface, and every field on it is already
   // presentation state.
   const ai::Brain* MobBrain(uint64_t mobId) const;
+  // ...and the one writable seam into it: the resident layer (world/
+  // refs_npc.h) writes Brain::routine every tick for an authored villager.
+  // Nothing else writes a brain from outside.
+  ai::Brain* MobBrainMut(uint64_t mobId);
 
   // WHO THE MOBS ARE FIGHTING. Pushed in once per tick by the frame loop with
   // the player's capsule; the selftest pushes a scripted point instead, which
@@ -5843,7 +5852,23 @@ class MobSystem {
   // holding the record should keep it and retry. False with a null return is
   // permanent (retired def, corrupt or short record).
   Mob* LoadOne(ByteReader& r, uint32_t version, bool placeLimbs = false,
-               bool* spawnRefused = nullptr);
+               bool* spawnRefused = nullptr, bool catchUp = false);
+
+  // ==== CATCH-UP: A VILLAGER COMES BACK WHERE ITS DAY SAYS (P7) ============
+  //
+  // An UNPARK (MobParking passes `catchUp`) of a LIVING record that carries a
+  // ref id asks this function where that villager should be NOW -- `foot`
+  // (the centre of the footprint at the sole, world voxels; it arrives
+  // holding where the record froze) and heading -- and true moves the record
+  // there before the spawn, and
+  // the rig then stands in its rest pose at the new place (placeLimbs is
+  // dropped: the pose it left in belongs to where it left). Installed by the
+  // resident layer; null = every record comes back where it froze. A save
+  // LOAD never asks (a save is where you left the world).
+  using UnparkPlacer =
+      std::function<bool(const std::string& refId, Vec3& foot, float& heading)>;
+  void SetUnparkPlacer(UnparkPlacer fn) { unparkPlacer_ = std::move(fn); }
+  bool HasUnparkPlacer() const { return (bool)unparkPlacer_; }
 
   // ==== OWNERSHIP: who steps which creature (M9.4-B) ========================
   //
@@ -7348,6 +7373,7 @@ class MobSystem {
   uint32_t localPlayerId_ = kLocalOwner;
   std::function<uint32_t(uint64_t, Vec3)> ownershipFn_;
   ParkFn parkFn_;               // S5b; null = despawn out of window (pre-S5b)
+  UnparkPlacer unparkPlacer_;   // P7 catch-up; null = come back where it froze
   uint64_t parkedTotal_ = 0;
   uint64_t aiSteps_ = 0;
   // Evaluated at the top of PreTick, before anything steps: one creature's

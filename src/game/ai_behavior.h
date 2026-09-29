@@ -128,8 +128,26 @@ enum class Intent : uint8_t {
   Guard,         // raise the held weapon onto the incoming blade (the parry is
                  // the existing blade-on-blade test; this only puts one there)
   Dodge,         // step back and aside, out of the reach of the blow
+  // ---- A VILLAGER'S DAY (2026-09-29, PLAN_world_editor P7) ----------------
+  // One verb per schedule activity. They score ONLY while the resident layer
+  // (world/refs_npc.h) has written a Routine onto the brain, and only the one
+  // the current schedule row names; the profile's weights decide how easily a
+  // fight or a fright takes over. All six share one actuator (walk to
+  // Routine::goal over the local navigator, then hold the pose the routine
+  // asks for) -- what differs between them is WHERE the resident layer sends
+  // the body and what it does on arrival, and that is not the arbiter's
+  // business.
+  Sleep,         // lie on the bed anchor
+  Work,          // stand at the work anchor facing its yaw
+  Wander,        // stroll between points around an anchor
+  Socialize,     // stand at a gathering place facing someone
+  Eat,           // stand at home facing the hearth
+  Goto,          // go there and stand
   Count,
 };
+// The activity verb for a schedule row's `do` ("sleep" -> Intent::Sleep), or
+// Intent::Count for anything else.
+Intent IntentForActivity(const std::string& act);
 
 // What a combatant is doing with its weapon right now, as others see it.
 // Published per actor (Actor::action) from the NPC stroke phase or the player's
@@ -182,6 +200,14 @@ struct Perception {
   //                missing life). A predator finishes the wounded one.
   float stickiness = 0.0f;
   float preferWeak = 0.0f;
+  // ---- NEUTRAL: "fights back if struck" (2026-09-29, P7) -------------------
+  // An `aggro: "neutral"` creature perceives nobody as a target UNTIL IT IS
+  // HURT; for this many ticks after life last fell it acquires like a hostile
+  // one (preferring whoever has named IT as their target -- the one hitting
+  // it), and a target it holds is kept through the alert decay as usual.
+  // There is no attacker attribution on a wound, so "the nearest stranger
+  // when it hurt" is the honest approximation; see DESIGN.md §16.P7.
+  uint32_t provokeTicks = 240;
 };
 
 struct Movement {
@@ -485,6 +511,10 @@ enum class Fact : uint8_t {
   EngagedAllies,    // allies of mine fighting the same target
   PressRank,        // how many of those are NEARER it than me (0 = I am the
                     // front of the queue). The press-limit rule reads this.
+  // ---- (2026-09-29, P7) ----------------------------------------------------
+  Hostiles,         // live actors of another faction within sightRange whose
+                    // own profile is `aggro: "hostile"` (Actor::hostile): a
+                    // villager runs from the zombie, not from the player
   Count,
 };
 const char* FactName(Fact f);
@@ -623,6 +653,9 @@ struct Actor {
   bool haveTip = false;     // weapon point known this tick
   Vec3 tip{};               // world voxels
   uint64_t targetId = 0;    // who IT is fighting (NPCs; 0 = nobody/unknown)
+  // Its profile is `aggro: "hostile"` -- it attacks strangers unprovoked.
+  // What Fact::Hostiles counts and what a fleeing villager runs from.
+  bool hostile = false;
 };
 
 // Everything Think() may read about the outside world.
@@ -749,6 +782,31 @@ struct AttackRequest {
   uint32_t tick = 0;
   uint32_t commitTicks = 0;
   float distance = 0;       // centre-to-centre at the moment of the decision
+};
+
+// ---- THE ROUTINE: what the resident layer asks of the body (P7) -----------
+//
+// Written EVERY TICK by world/refs_npc.cpp (the resident controller, which
+// runs in TickRefs before mobs.PreTick) for an NPC that has a schedule, and
+// read by Think. The split is the arbiter's own: the resident layer decides
+// WHERE (the schedule row, the anchor, the waynode route, the door it is
+// waiting at) and this struct carries only the next place to put the feet and
+// the pose to hold there. `active` false = no routine (every creature that is
+// not an authored villager), and the six activity verbs cannot score.
+struct Routine {
+  bool active = false;
+  Intent verb = Intent::Goto;   // which activity verb scores (Sleep..Goto)
+  Vec3 goal{};                  // where the FEET go next, world voxels
+  bool final = false;           // goal is the anchor itself (slow into it)
+  float arriveRadius = 3.0f;    // world voxels, planar
+  float speed = 0.5f;           // multiplier on the def's walk speed
+  bool hold = false;            // stand still here (a closed door, a talk)
+  bool faceHeadingSet = false;  // at the goal / holding: turn to this heading
+  float faceHeading = 0.0f;
+  bool facePointSet = false;    // ...or to look at this point (wins)
+  Vec3 facePoint{};
+  // OUT, written by Think: the feet are within arriveRadius of a final goal.
+  bool arrived = false;
 };
 
 // ---- per-creature runtime state -------------------------------------------
@@ -882,6 +940,9 @@ struct Brain {
   // off the straight line it was planned along — see UpdatePath.
   float lastWaypointDist = 1e9f;
   uint32_t stuckTicks = 0;
+
+  // ---- the schedule's ask (P7) ----
+  Routine routine;
 
   void Reset() {
     *this = Brain{profile};

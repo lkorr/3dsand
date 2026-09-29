@@ -232,6 +232,13 @@ struct AnimStateRule {
   std::vector<int> missingAll;    // every one of these parts is severed
   std::vector<int> missingAnyOf;  // at least one of these parts is severed
   int minChainsLost = 0;          // >= N IK chains disabled ("legs of use lost")
+  // ACTIVITY STATES (2026-09-29, P7). A rule with an `activity` matches when,
+  // and only when, AnimState::activity equals it -- whatever the limbs say
+  // -- and is tested BEFORE the damage rules, so a sleeper with a missing
+  // hand still lies down. "sleep" is authored in human.json (a prone state
+  // with the library's `sleep` clip); a rig with no such state simply keeps
+  // standing, which is the harmless answer.
+  std::string activity;
   std::string clip;               // looping loco clip, crossfaded on entry
   float speedScale = 1.0f;        // walk-drive speed multiplier
   // ...and the same multiplier for a BALLISTIC opening (strokes.h StyleLunge).
@@ -475,6 +482,10 @@ struct AnimState {
   std::vector<float> pitchFollow;
   FlipbookState flipbook;
   int locoState = -1;             // index into skeleton.states, -1 = normal
+  // What the body is DOING, when something outside the rig says so (P7: the
+  // resident layer's "sleep" once a villager is on its bed). "" = nothing.
+  // Matched by AnimStateRule::activity; never saved (re-set every tick).
+  std::string activity;
   float gaitPhase = 0;
   Vec3 lastPos{};
   Vec3 velocity{};
