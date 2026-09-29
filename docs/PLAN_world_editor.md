@@ -1,6 +1,6 @@
 # PLAN: world editor, first slice — the hamlet of Harrowby
 
-Status: plan of record, 2026-09-28. Orchestrated; packages P1–P8 below are the
+Status: SLICE COMPLETE 2026-09-29 (P1-P8 on main, last 5e62edf). Plan of record, 2026-09-28. Orchestrated; packages P1–P8 below are the
 agent prompts. Owner decisions (2026-09-28): rural medieval hamlet; branching
 dialogue; doors are STATIC VOXELS WHEN CLOSED and a HINGED RIGID BODY WHILE
 OPEN; packages merge to main as they land.
