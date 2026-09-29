@@ -3216,6 +3216,13 @@ void Simulation::EnsureRayStart(uint32_t width, uint32_t height) {
   // Must match ray_start.wgsl: RS_HEADER words, then two Wq x Hq planes.
   constexpr uint64_t kHeader = 8;
   const uint64_t q = (uint64_t)((rayStartW_ + 1) / 2) * ((rayStartH_ + 1) / 2);
+  // THE OLD BUFFER IS STILL IN THIS COMMAND BUFFER. The ShadowCache table's
+  // ray-start rows were recorded (through shadowBG_) before the render pass
+  // that called this, and a released handle is destroyed once the LAST
+  // SUBMITTED command buffer retires — which is before the one being recorded
+  // (--vk-validation: "vkDestroyBuffer ... in use by VkDescriptorSet"). So the
+  // replaced buffer is parked until the next growth, which is frames away.
+  rayStartPrev_ = rayStartBuf_;
   rayStartBuf_ = CreateBuffer(device_, (kHeader + 2 * q) * 4,
                               rhi::BufferUsage::Storage, "rayStart");
   BuildRenderBindGroup(renderBG_, veilBuf_);

@@ -976,6 +976,9 @@ class Simulation {
   // 21 in shadowBGL_ (compute, written). rayStartW_/H_ = the largest target
   // it is sized for; 0 until the first world pass, and no row records.
   rhi::Buffer rayStartBuf_;
+  // The buffer EnsureRayStart last replaced, kept alive one growth longer
+  // because the frame that grew it had already recorded the prepass against it.
+  rhi::Buffer rayStartPrev_;
   uint32_t rayStartW_ = 0, rayStartH_ = 0;
   uint64_t veilPixels_ = 0;
   rhi::BindGroup renderBGNoVeil_;
