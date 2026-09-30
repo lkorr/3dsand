@@ -3698,6 +3698,22 @@ struct Tuning {
     int stormBursts = TPD(wind, stormBursts);
     float stormBurstRadius = TPD(wind, stormBurstRadius);
     bool stormFrontJet = TPD(wind, stormFrontJet);
+    // GUST STREAKS (wind_streak.wgsl; render-only, never hashed; live through
+    // RenderParams, no F5). streakAlpha is the master visibility: 0 records
+    // neither the update pass nor the draw. A streak is born only where the
+    // gust excess (the bands along the local mean, plus primitives) passes
+    // streakThreshold m/s, with certainty by threshold + streakSpan; it lives
+    // streakLife s within streakRadius m of the camera, drawn as a ribbon of
+    // streakTrail points pushed every streakSpacing s, streakWidth m wide.
+    float streakAlpha = TPD(wind, streakAlpha);
+    int streakCount = TPD(wind, streakCount);
+    float streakThreshold = TPD(wind, streakThreshold);
+    float streakSpan = TPD(wind, streakSpan);
+    int streakTrail = TPD(wind, streakTrail);
+    float streakSpacing = TPD(wind, streakSpacing);
+    float streakLife = TPD(wind, streakLife);
+    float streakRadius = TPD(wind, streakRadius);
+    float streakWidth = TPD(wind, streakWidth);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a

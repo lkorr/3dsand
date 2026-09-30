@@ -1214,6 +1214,14 @@ PASS(ray_start_trace, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_TRACE, K_COMPUT
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(R(Voxels) R(Occupancy) U(RenderUBO) R(PageTable) R(FarVox) R(FarOcc)
           U(FarUBO) W(RayStart)))
+// ---- THE GUST STREAKS (assets/shaders/wind_streak.wgsl, docs/RESEARCH_wind.md 13.6)
+// Render-only per-frame compute: advect the streak pool through windAt() and
+// respawn dead slots where the gust excess is high. RW on its own buffer; the
+// streak DRAW reads it in the vertex stage of the same command buffer, which
+// BeginRendering's FlushForRenderDomain covers. C_STREAKS = streakAlpha > 0.
+PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_STREAKGX,1,1,
+     GRP_SHADOW, DYN_NONE, C_STREAKS, 1,
+     USES(U(RenderUBO) RW(WindStreaks)))
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))

@@ -2405,6 +2405,16 @@ static_assert((1 << kWindTerrShift) == kWindTerrCell, "cell size is 2^shift");
 // interpolate linearly.
 constexpr uint32_t kWindProfKnots = 16;
 
+// ---- GUST STREAKS (assets/shaders/wind_streak.wgsl; render-only) ----------
+// The fixed particle pool: kWindStreakCap slots of kWindStreakStride vec4f
+// rows (position+age, life/strength/ring head/timer, then the trail ring of
+// kWindStreakTrail positions). Must match STREAK_TRAIL_MAX / STREAK_STRIDE in
+// the shader (check_invariants `windstreak`). ~590 KiB; never hashed.
+constexpr uint32_t kWindStreakCap = 2048;
+constexpr uint32_t kWindStreakTrail = 16;
+constexpr uint32_t kWindStreakStride = 18;
+static_assert(kWindStreakStride == 2 + kWindStreakTrail, "streak row layout");
+
 // ---- WATER BODIES (docs/PLAN_water_master.md; src/sim/waterbody.h) --------
 // Live still-water descriptors world-wide, and the rule-2 bound on the whole
 // subsystem. Here rather than in waterbody.h for the wind-primitive reason:

@@ -2269,6 +2269,16 @@ TP_F(wind, stormJump, NO_WGSL, 90.0f, 0.0f, 180.0f)
 TP_I(wind, stormBursts, NO_WGSL, 2, 0, 6)
 TP_F(wind, stormBurstRadius, NO_WGSL, 25.0f, 3.0f, 51.0f)
 TP_B(wind, stormFrontJet, NO_WGSL, true)
+// ---- gust streaks (wind_streak.wgsl; render-only) ----
+TP_F(wind, streakAlpha, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_I(wind, streakCount, NO_WGSL, 1024, 0, kWindStreakCap)
+TP_F(wind, streakThreshold, NO_WGSL, 2.0f, 0.0f, 20.0f)
+TP_F(wind, streakSpan, NO_WGSL, 4.0f, 0.1f, 30.0f)
+TP_I(wind, streakTrail, NO_WGSL, 12, 2, kWindStreakTrail)
+TP_F(wind, streakSpacing, NO_WGSL, 0.04f, 0.01f, 0.2f)
+TP_F(wind, streakLife, NO_WGSL, 1.6f, 0.2f, 6.0f)
+TP_F(wind, streakRadius, NO_WGSL, 20.0f, 2.0f, 60.0f)
+TP_F(wind, streakWidth, NO_WGSL, 0.03f, 0.005f, 0.2f)
 TP_B(wind, dbgWindField, NO_WGSL, false)
 
 

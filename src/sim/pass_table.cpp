@@ -88,6 +88,7 @@ namespace {
 #define PIPE_SKY_TOP_REDUCE  Pipe::SkyTopReduce
 #define PIPE_RAY_START_TRACE Pipe::RayStartTrace
 #define PIPE_RAY_START_MIN   Pipe::RayStartMin
+#define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark
@@ -191,6 +192,7 @@ namespace {
 #define C_CLOUDBAKE Cond::CloudBake
 #define C_SHADOWON  Cond::ShadowCacheOn
 #define C_RAYSTART  Cond::RayStart
+#define C_STREAKS   Cond::WindStreaks
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
@@ -222,6 +224,7 @@ namespace {
 #define D_CLOUDGY         (uint32_t)DispatchSel::CloudGy
 #define D_RSGX            (uint32_t)DispatchSel::RayStartGx
 #define D_RSGY            (uint32_t)DispatchSel::RayStartGy
+#define D_STREAKGX        (uint32_t)DispatchSel::StreakGx
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 
 // ---- expansion 1: the rows -----------------------------------------------

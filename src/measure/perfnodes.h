@@ -253,6 +253,15 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "resolution and accumulated over frames, plus the maps the rest of the "
      "renderer reads the clouds through. Measure it under a full overcast "
      "looking up — sky pixels were free before clouds existed."},
+    // The gust streaks (wind_streak.wgsl): one per-FRAME update row on the
+    // ShadowCache table, bounded by the pool, not the world. Zero at
+    // wind.streakAlpha 0 (no row recorded, no draw). The ribbon draw itself is
+    // inside the world pass's raster spans.
+    {"windStreaks", "Gust streaks", "renderPass", PerfSide::Gpu, PerfScope::Count,
+     "wind_streak",
+     "Advects the streak pool through windAt() and respawns dead slots where "
+     "the gust excess is high: one thread per live slot (wind.streakCount), "
+     "a few windAt() evaluations each."},
     // Billed to `renderPass` and not to `simTick`, even though its two rows are
     // recorded on the TICK command buffer. The bill follows what the cost is
     // FOR: nothing in the sim reads this grid, and turning off

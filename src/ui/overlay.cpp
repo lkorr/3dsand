@@ -1768,6 +1768,22 @@ void Overlay::DrawDevWorld(UIState& s) {
       ImGui::TreePop();
     }
 
+    if (ImGui::TreeNode("Visuals##wnd")) {
+      changed |= EditableSliderFloat("streaks##wnd", &w.streakAlpha, 0.0f, 1.0f, "%.2f");
+      ImGui::SetItemTooltip("Gust streaks: master visibility. 0 skips the pass entirely (live).");
+      changed |= ImGui::SliderInt("streak count##wnd", &w.streakCount, 0, (int)kWindStreakCap);
+      changed |= EditableSliderFloat("spawn threshold##wnd", &w.streakThreshold, 0.0f, 20.0f, "%.1f m/s");
+      ImGui::SetItemTooltip("A streak is born only where the gust excess (bands along the mean,\n"
+                            "plus primitives) passes this. Calm days show nothing.");
+      changed |= ImGui::SliderInt("trail points##wnd", &w.streakTrail, 2, (int)kWindStreakTrail);
+      changed |= EditableSliderFloat("trail spacing##wnd", &w.streakSpacing, 0.01f, 0.2f, "%.3f s");
+      changed |= EditableSliderFloat("lifetime##wnd", &w.streakLife, 0.2f, 6.0f, "%.1f s");
+      changed |= EditableSliderFloat("radius##wnd", &w.streakRadius, 2.0f, 60.0f, "%.0f m");
+      changed |= EditableSliderFloat("width##wnd", &w.streakWidth, 0.005f, 0.2f, "%.3f m");
+      ImGui::TextDisabled("arrows: F4 or Debug draw; spacing/radius (F5) %.0f/%.0f vox", w.dbgWindSpacing,
+                          w.dbgWindRadius);
+      ImGui::TreePop();
+    }
     if (changed) SetCurrentTuning(t);
 
     // ---- the per-tier force multipliers (unchanged: they ride TickParams) ----

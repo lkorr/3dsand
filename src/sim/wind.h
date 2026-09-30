@@ -269,3 +269,13 @@ inline uint32_t WindDebugArrowCount(const Tuning& t) {
   const uint32_t n = WindDebugArrowsPerAxis(t);
   return n * n * n;
 }
+
+// ---- gust streaks (wind_streak.wgsl) -----------------------------------------
+// Instances for the streak draw: the live pool, or 0 when the master alpha is
+// off — the SAME test Simulation::EncodeShadowResolve uses to record the
+// update row, so the draw never reads a pool nobody advanced.
+inline uint32_t WindStreakDrawCount(const Tuning& t) {
+  if (t.wind.streakAlpha <= 0.0f) return 0u;
+  const int n = t.wind.streakCount < 0 ? 0 : t.wind.streakCount;
+  return (uint32_t)(n > (int)kWindStreakCap ? (int)kWindStreakCap : n);
+}

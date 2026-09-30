@@ -859,6 +859,34 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     rp.windDir[1] = wind.dirZ;
     rp.windSpeed = wind.speed;
     rp.windGust = wind.gust;
+    // THE GUST STREAKS (wind_streak.wgsl): live knobs as uniforms, in engine
+    // units. The frame's dt is measured here, on the MAIN view only — an aux
+    // view (the portrait) is written with dt 0, so the per-frame update the
+    // table records after it advances the pool once, not twice.
+    {
+      const Tuning::Wind& tw = tun.wind;
+      static float lastTime = -1.0f;
+      static uint32_t frame = 0;
+      float dt = 0.0f;
+      if (!auxView) {
+        if (lastTime >= 0.0f) dt = std::clamp(time - lastTime, 0.0f, 0.1f);
+        lastTime = time;
+        frame++;
+      }
+      const float cells = 1.0f / kVoxelMeters;
+      rp.streakA[0] = std::clamp(tw.streakAlpha, 0.0f, 1.0f);
+      rp.streakA[1] = tw.streakThreshold * cells;
+      rp.streakA[2] = tw.streakSpan * cells;
+      rp.streakA[3] = tw.streakRadius * cells;
+      rp.streakB[0] = tw.streakLife;
+      rp.streakB[1] = tw.streakSpacing;
+      rp.streakB[2] = tw.streakWidth * cells;
+      rp.streakB[3] = dt;
+      rp.streakN[0] = (uint32_t)std::clamp(tw.streakCount, 0, (int)kWindStreakCap);
+      rp.streakN[1] = (uint32_t)std::clamp(tw.streakTrail, 2, (int)kWindStreakTrail);
+      rp.streakN[2] = frame;
+      rp.streakN[3] = 0;
+    }
     // The field block, from the same resolution the sim's copy comes from
     // (SubmitTick), with the three clocks at the frame's sub-tick instant so
     // the grass animates between ticks instead of stepping at 30 Hz.

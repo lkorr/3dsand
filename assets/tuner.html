@@ -8704,7 +8704,7 @@ const ARCH_NODES={
     sym:['Simulation::BeginRenderPass','Simulation::DrawWorld','Simulation::EnsureRenderPipelines'],
     tst:['screenshots','far-fog'],
     details:'Everything below composites through one shared reversed-Z depth attachment. Cost scales with screen pixels x traversal depth, NOT with world activity — the opposite of rule 2’s shape, which is why rendering is measured separately.',
-    children:['raymarch','sky','drawParticles','drawBodies','drawMicro','drawFluid','drawSprites','drawDebug','denoise','taaResolve']},
+    children:['raymarch','sky','drawParticles','drawBodies','drawMicro','drawFluid','drawSprites','drawDebug','windStreaks','denoise','taaResolve']},
 
   taaResolve:{label:'TAA + Temporal Upscale',tag:'render',wip:'W1-A, on a worktree branch. Built, aligned (proved by the gate), clean under sync validation and cheap (+0.20 ms for the resolve; a half-res frame plus the resolve is 4.64 ms against 13.90 ms full-res). What is NOT established is that it RECONSTRUCTS: over 48 accumulated frames it scores level with a NEAREST blit and its error rises with frame count, so it is converging to a half-pixel blur rather than to the reference. render.taa therefore ships 0 and render.taaSharpness is the sweepable dial. The SVGF half of the package was NOT built - see the note below on why this engine has nothing for it to denoise.',
     desc:'The pass that replaces the NEAREST blit at the end of a render.renderScale frame. A sub-pixel R2 camera jitter each frame, then a full-screen resolve that reprojects a native-resolution history through depth + the previous camera, reconstructs each native pixel from a weighted 3x3 tap of the low-resolution frame, and blends the two in proportion to the reconstruction filter’s response. Turns render.renderScale from "a smaller picture" into "the same picture, reconstructed over frames".',
@@ -8807,6 +8807,13 @@ const ARCH_NODES={
     sym:['Simulation::DrawSprites'],
     cst:['world.h  kMaxSprites']},
 
+  windStreaks:{label:'Gust Streaks',tag:'render',
+    desc:'Faint white streaks that trace the wind, visible mainly in strong gusts. A fixed pool of up to 2048 particles near the camera: one per-FRAME compute row (wind_streak on the ShadowCache table) advects them through windAt() \u2014 the same function the grass sway and the debug arrows sample, primitives included \u2014 and respawns dead slots only where the GUST EXCESS (the gust bands along the local mean, plus any primitive) passes a threshold, so calm days show nothing and gales show plenty. Each is drawn as a camera-facing ribbon of its last N positions, fading head to tail, over its life, near the eye, at the pool radius and into the fog. Render-only: never touches TickParams or anything hashed.',
+    files:['assets/shaders/wind_streak.wgsl','src/sim/simulation.cpp','src/sim/pass_table.def','src/test/support.cpp','src/sim/wind.h'],
+    sym:['update','vsStreak','Simulation::DrawWindStreaks','WindStreakDrawCount'],
+    cst:['world.h  kWindStreakCap / kWindStreakTrail / kWindStreakStride','world.h  RenderParams streakA/B/N'],
+    rule:2,
+    details:'<b>Bounded by the pool, never the world.</b> The update is one thread per live slot (wind.streakCount) and the draw one instance per slot with (trail - 1) x 6 vertices; wind.streakAlpha 0 records neither (Cond::WindStreaks). <b>Live knobs.</b> Every streak knob rides RenderParams (streakA/B/N), so the F1 Visuals sliders need no F5. <b>dt is the main view\u2019s</b>: WriteRenderParams measures it only for the main view, so a portrait frame does not advance the pool twice.'},
   drawDebug:{label:'Debug Boxes',tag:'render',
     desc:'Oriented wireframe boxes for the collision-box overlay — alpha blended, no depth test, so a hitbox inside geometry is still visible.',
     files:['assets/shaders/debug_lines.wgsl'],

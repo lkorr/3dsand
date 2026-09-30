@@ -657,6 +657,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // table's ray_start rows in the same command buffer, read here;
         // BeginRendering's flush is the compute->fragment barrier.
         entry(32, T::ReadOnlyStorage, S::Fragment),               // rayStart
+        // THE GUST STREAKS (wind_streak.wgsl): the pool the per-frame
+        // `wind_streak` row just advected, read by the ribbon draw's VERTEX
+        // stage. BeginRendering's flush is the compute->vertex barrier.
+        entry(33, T::ReadOnlyStorage, S::Vertex),                 // windStreaks
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -830,6 +834,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // A placeholder until EnsureRayStart sizes it: its word 0 is no frame's
     // key, and the fragment shader's length check refuses it anyway.
     rayStartBuf_ = CreateBuffer(device, 16, U::Storage, "rayStart");
+    // The gust streak pool: fixed, zeroed (lifetime 0 = never spawned).
+    {
+      const uint64_t words = (1ull + (uint64_t)kWindStreakCap * kWindStreakStride) * 4ull;
+      windStreakBuf_ = CreateBuffer(device, words * 4ull, U::Storage | U::CopyDst, "windStreaks");
+      std::vector<uint32_t> zero((size_t)words, 0u);
+      device.GetQueue().WriteBuffer(windStreakBuf_, 0, zero.data(), zero.size() * 4);
+    }
     veilPixels_ = 0;
     BuildRenderBindGroup(renderBG_, veilBuf_);
     BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
@@ -888,6 +899,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The ray-start map (ray_start.wgsl): written by its two per-frame
         // rows, read by the raymarch at renderBGL_ 32.
         entry(21, T::Storage),         // rayStart
+        // The gust streaks' pool (wind_streak.wgsl `update`), read-modify-
+        // written once a frame; the draw reads it at renderBGL_ 33.
+        entry(22, T::Storage),         // windStreaks
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1750,6 +1764,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mSkyTop;
   // The ray-start map (ray_start.wgsl): two per-frame entries on shadowPL_.
   rhi::ShaderModule mRayStart;
+  rhi::ShaderModule mWindStreak;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
@@ -1776,6 +1791,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mSkyTop, "sky_top.wgsl");
     mod(&mRayStart, "ray_start.wgsl");
+    mod(&mWindStreak, "wind_streak.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
@@ -1798,7 +1814,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart) {
+      !mRayStart || !mWindStreak) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -1849,6 +1865,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { skyTopReduce_ = MakeComputePipeline(device, shadowPL_, mSkyTop, "skyTopReduce", "skyTopReduce"); });
   pool.Add([&] { rayStartTrace_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartTrace", "rayStartTrace"); });
   pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
+  pool.Add([&] { windStreak_ = MakeComputePipeline(device, shadowPL_, mWindStreak, "update", "windStreak"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
     pool.Add([&] { cloudWeather_ = MakeComputePipeline(device, shadowPL_, mCloud, "weather", "cloudWeather"); });
@@ -2047,6 +2064,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
   debugWindModule_ = mDebugWind;
+  windStreakModule_ = mWindStreak;
   debugCurModule_ = mDebugCur;
   targetFormat_ = rhi::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
@@ -2294,6 +2312,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowReq:           return world_->shadowReq;
     case B::ShadowHist:          return world_->shadowHist;
     case B::RayStart:            return rayStartBuf_;
+    case B::WindStreaks:         return windStreakBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
     case B::Openness:            return world_->openness;
@@ -2387,6 +2406,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::SkyTopReduce:   return skyTopReduce_;
     case P::RayStartTrace:  return rayStartTrace_;
     case P::RayStartMin:    return rayStartMin_;
+    case P::WindStreak:     return windStreak_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -2608,6 +2628,12 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
   // every frame the far cascade is drawn, cache or clouds or neither.
   RecordCtx cx{};
   cx.cloudFlags = (shadowCacheOn_ ? 4u : 0u);
+  // The gust streaks: one thread per live slot, nothing at all at alpha 0.
+  {
+    const Tuning::Wind& tw = CurrentTuning().wind;
+    const uint32_t n = (uint32_t)std::clamp(tw.streakCount, 0, (int)kWindStreakCap);
+    if (tw.streakAlpha > 0.0f && n > 0 && windStreak_) cx.streakGx = (n + 63) / 64;
+  }
   // The ray-start map covers the largest target sized so far; each thread
   // bounds itself against THIS frame's size (ray_start.wgsl).
   if (rayStartW_ > 0 && rayStartH_ > 0 && !rayStartOff_) {
@@ -3176,6 +3202,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(30, solSpecBuf_),
         b(31, world_->farMap),
         b(32, rayStartBuf_),
+        b(33, windStreakBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3265,6 +3292,7 @@ void Simulation::BuildShadowBindGroup() {
       b(19, world_->farOcc),
       b(20, world_->farUBO),
       b(21, rayStartBuf_),
+      b(22, windStreakBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }
@@ -3843,6 +3871,17 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.depth = dsWind;
     pool.Add([this, d] { debugWindDraw_ = device_.CreateRenderPipeline(d); });
 
+    // The GUST STREAKS' ribbons (wind_streak.wgsl). The arrows' depth rule —
+    // hidden by the world in front, writing nothing — and the same straight
+    // alpha: a streak is a faint white wisp over the scene, not geometry.
+    d.label = "windStreakDraw";
+    d.vertexModule = windStreakModule_;
+    d.vertexEntry = "vsStreak";
+    d.fragmentModule = windStreakModule_;
+    d.fragmentEntry = "fsStreak";
+    d.depth = dsWind;
+    pool.Add([this, d] { windStreakDraw_ = device_.CreateRenderPipeline(d); });
+
     // The CURRENT field's arrows (water plan component 8). Same pipeline
     // state, same depth rule, same argument for it — a different field.
     d.label = "debugCurrentDraw";
@@ -4170,6 +4209,17 @@ void Simulation::DrawWindField(const rhi::RenderPass& pass, uint32_t arrows) {
   // segment quad). No vertex or instance buffer: the shader derives its
   // lattice point from the instance index and R.camPos.
   pass.Draw(18, arrows);
+}
+
+void Simulation::DrawWindStreaks(const rhi::RenderPass& pass, uint32_t count,
+                                 uint32_t trail) {
+  if (count == 0 || trail < 2 || !windStreakDraw_) return;   // off: not even a bind
+  pass.SetPipeline(windStreakDraw_);
+  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  // (trail - 1) ribbon segments x 6 vertices, one instance per pool slot. No
+  // vertex buffer: the shader reads the pool at renderBGL_ 33.
+  pass.Draw(6 * (trail - 1), count);
 }
 
 void Simulation::DrawCurrentField(const rhi::RenderPass& pass,

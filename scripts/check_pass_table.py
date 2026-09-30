@@ -137,6 +137,7 @@ PIPE_TO_MEMBER = {
     "PIPE_SKY_TOP_REDUCE": "skyTopReduce_",
     "PIPE_RAY_START_TRACE": "rayStartTrace_",
     "PIPE_RAY_START_MIN": "rayStartMin_",
+    "PIPE_WIND_STREAK": "windStreak_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
     "PIPE_FLUID_ALLOC": "fluidAlloc_",
@@ -214,6 +215,8 @@ BUF_TO_WGSL = {
     "ShadowReq": {"shadowReq"},
     "ShadowHist": {"shadowHist"},
     "RayStart": {"rayStart"},
+    # The streak DRAW's read-only view (`streaksR`, renderBGL_ 33) is not a row.
+    "WindStreaks": {"streaks"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
     # The clouds (cloud.wgsl). CloudUBO is `C` there; the raymarcher and the

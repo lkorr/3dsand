@@ -1722,6 +1722,9 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       sim.DrawWindField(rp, CurrentTuning().wind.dbgWindField
                                 ? WindDebugArrowCount(CurrentTuning())
                                 : 0u);
+      // Gust streaks (render-only): the pool the per-frame table advected.
+      sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
+                          (uint32_t)CurrentTuning().wind.streakTrail);
       // The CURRENT field's arrows, reached the same way and for the same
       // reason (water plan component 8).
       sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
@@ -1785,6 +1788,54 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         (uint32_t)(0.02 * (double)shotTicksPerDay) % shotTicksPerDay;
     renderAt({108, (float)(h108 + 60), 108}, 0.785f, 0.35f,
              "screenshot_night_sky.bmp", (int64_t)nightTick);
+  }
+  // ---- WIND shots (docs/RESEARCH_wind.md §13) ------------------------------
+  // The weather-driven field and its gust streaks, which a four-frame shot at
+  // one fixed time cannot show: the streak pool fills over SECONDS of frames
+  // (it is advanced by the frame's dt), so these render 100 frames with the
+  // clock and the tick advancing, and grab the last. A pinned regime blowing
+  // toward +X, the camera looking across it (+Z) so the streaks and arrows run
+  // left-to-right. The tuning is restored afterwards.
+  //   screenshot_wind_gale         the gale's streaks
+  //   screenshot_wind_gale_arrows  the same instant with the arrow field
+  //   screenshot_wind_calm         the same view becalmed: no streaks at all
+  {
+    auto windShot = [&](const char* path, const char* regime, bool arrows) {
+      if (!ShotWanted(path)) return;
+      const Tuning saved = CurrentTuning();
+      Tuning t = saved;
+      t.wind.regime = regime;
+      t.wind.weatherAuto = false;
+      t.wind.windDirDeg = 90.0f;
+      t.wind.streakAlpha = 0.8f;
+      t.wind.dbgWindField = arrows;
+      SetCurrentTuning(t);
+      Camera c;
+      c.yaw = 1.5708f;
+      c.pitch = -0.12f;
+      const Vec3 eye{108.0f, (float)(h108 + 22), 108.0f};
+      for (int f = 0; f < 100; f++) {
+        WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true,
+                          kShotTime + (float)f / 30.0f, kFarFogDensity, 1080.0f,
+                          shotTick + (uint32_t)f);
+        rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+        sim.EncodeShadowResolve(enc);
+        rhi::RenderPass rp =
+            sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+        sim.DrawWorld(rp);
+        sim.DrawWindField(rp, arrows ? WindDebugArrowCount(CurrentTuning()) : 0u);
+        sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
+                            (uint32_t)CurrentTuning().wind.streakTrail);
+        rp.End();
+        ctx.queue.Submit(enc.Finish());
+      }
+      ctx.WaitIdle();
+      grab(path);
+      SetCurrentTuning(saved);
+    };
+    windShot("screenshot_wind_gale.bmp", "gale", false);
+    windShot("screenshot_wind_gale_arrows.bmp", "gale", true);
+    windShot("screenshot_wind_calm.bmp", "calm", false);
   }
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
@@ -16933,6 +16984,11 @@ int main(int argc, char** argv) {
         sim.DrawWindField(rp, ui.fieldViz == UIState::kFieldVizWind
                                   ? WindDebugArrowCount(CurrentTuning())
                                   : 0u);
+        // Gust streaks: faint white ribbons riding the same field, visible
+        // mainly in strong gusts. Zero at streakAlpha 0 (then neither the
+        // update row nor this draw is recorded).
+        sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
+                            (uint32_t)CurrentTuning().wind.streakTrail);
         sim.DrawCurrentField(rp, ui.fieldViz == UIState::kFieldVizCurrent
                                      ? CurrentDebugArrowCount()
                                      : 0u);

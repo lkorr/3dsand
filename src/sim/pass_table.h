@@ -205,6 +205,10 @@ enum class Buf : uint8_t {
   // like ShadowCache: never hashed, never saved, sized on the render TARGET
   // (Simulation::EnsureRayStart), not the world.
   RayStart,
+  // The gust streaks' particle pool (wind_streak.wgsl). Read-modify-written by
+  // the per-frame `wind_streak` row and read by the streak draw's VERTEX stage
+  // in the same command buffer; render-only, never hashed.
+  WindStreaks,
   ShadowArgsStage,
   ShadowArgs,
   // ---- the openness (sky-visibility) grid (world.h kOpenFaces) ----
@@ -381,6 +385,7 @@ enum class Pipe : uint8_t {
   // The ray-start map (ray_start.wgsl), per-FRAME rows on the ShadowCache
   // table, after the sky bound they read and before the resolve.
   RayStartTrace, RayStartMin,
+  WindStreak,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
@@ -539,6 +544,9 @@ enum class Cond : uint8_t {
   // gated by EncodeShadowResolve returning early; now that the table also
   // carries the clouds, the gate has to be a row condition.
   ShadowCacheOn,
+  // WindStreaks: the gust streaks' update row (RecordCtx::streakGx > 0, i.e.
+  // wind.streakAlpha > 0 and a nonzero pool). Off = no row and no draw.
+  WindStreaks,
   // RayStart: the ray-start map's two rows (RecordCtx::rayStartGx > 0, i.e.
   // a world pass has sized its buffer). Off = no row, and the raymarch's
   // key check reads the stale key as "not this frame" and marches from
@@ -629,6 +637,8 @@ enum class DispatchSel : uint32_t {
   // each thread against this frame's own size) ----
   RayStartGx,
   RayStartGy,
+  // ---- the gust streaks: one 64-thread workgroup per 64 live slots ----
+  StreakGx,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
 };
 
@@ -783,6 +793,8 @@ struct RecordCtx {
   // Workgroups (8x8) over the ray-start map's sample grid; 0 = no buffer
   // yet, and then neither ray-start row records (Cond::RayStart).
   uint32_t rayStartGx = 0, rayStartGy = 0;
+  // Workgroups over the live streak pool; 0 = streaks off (Cond::WindStreaks).
+  uint32_t streakGx = 0;
 };
 
 }  // namespace pass

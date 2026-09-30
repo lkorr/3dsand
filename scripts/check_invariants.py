@@ -1037,6 +1037,34 @@ def check_wind_mirror():
                             f"({what}) -- it has drifted from common.wgsl")
 
 
+def check_wind_streak():
+    """wind_streak.wgsl's pool layout must match world.h's.
+
+    The C++ sizes and zeroes the buffer from kWindStreakCap x kWindStreakStride
+    and clamps the trail knob to kWindStreakTrail; the shader strides by
+    STREAK_STRIDE and wraps its ring at STREAK_TRAIL_MAX. A mismatch reads the
+    next slot's rows as this slot's trail -- streaks that jump between each
+    other, with no error anywhere.
+    """
+    wh = read("src/sim/world.h")
+    ws = read("assets/shaders/wind_streak.wgsl")
+    if not wh or not ws:
+        return
+    t = re.search(r"constexpr\s+uint32_t\s+kWindStreakTrail\s*=\s*(\d+)", wh)
+    st = re.search(r"constexpr\s+uint32_t\s+kWindStreakStride\s*=\s*(\d+)", wh)
+    gt = re.search(r"const\s+STREAK_TRAIL_MAX\s*:\s*u32\s*=\s*(\d+)u", ws)
+    gs = re.search(r"const\s+STREAK_STRIDE\s*:\s*u32\s*=\s*(\d+)u", ws)
+    if not (t and st and gt and gs):
+        problems.append("wind streak layout: could not find kWindStreakTrail/Stride in "
+                        "world.h or STREAK_TRAIL_MAX/STREAK_STRIDE in wind_streak.wgsl")
+        return
+    checked.append("wind streaks")
+    if t.group(1) != gt.group(1) or st.group(1) != gs.group(1):
+        problems.append(f"world.h kWindStreakTrail/Stride = {t.group(1)}/{st.group(1)} but "
+                        f"wind_streak.wgsl STREAK_TRAIL_MAX/STREAK_STRIDE = "
+                        f"{gt.group(1)}/{gs.group(1)} -- the pool's rows would misalign")
+
+
 def check_water_ledger():
     """The water-body ledger's word map lives in THREE places, positionally.
 
@@ -2893,6 +2921,7 @@ ALL = {
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
     "windmirror": check_wind_mirror,
+    "windstreak": check_wind_streak,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,
     "counts": check_tick_counts,
@@ -2957,6 +2986,7 @@ RELEVANT = {
     "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx"],
     "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror"],
     "src/sim/windfield.cpp": ["windmirror"],
+    "assets/shaders/wind_streak.wgsl": ["windstreak"],
     "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],
 }
