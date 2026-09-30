@@ -1024,6 +1024,17 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           if (s.is_string()) rd.skip.push_back(s.get<std::string>());
     }
   }
+  // The race (MobDef::race): what a generated character's GENOME says it is
+  // first -- its own statement, where the `race` key may only be inherited
+  // (a sylvan saved before the key existed would read its base's "human") --
+  // else the sidecar's `race`, own or inherited.
+  if (j.contains("genome") && j["genome"].is_object() &&
+      j["genome"].contains("body") && j["genome"]["body"].is_object() &&
+      j["genome"]["body"].contains("race") &&
+      j["genome"]["body"]["race"].is_string())
+    def.race = j["genome"]["body"]["race"].get<std::string>();
+  if (def.race.empty() && j.contains("race") && j["race"].is_string())
+    def.race = j["race"].get<std::string>();
   if (j.contains("bleed")) {
     std::string bm = j["bleed"].value("material", "");
     int id = FindMaterialId(mats, bm);

@@ -2436,6 +2436,32 @@ Status GateWoodBleed(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- EVERY DEF KNOWS ITS RACE (MobDef::race, the F1 spawn list's filter) ----
+// The shipped human declares "human"; a generated character inherits it or
+// says its own (a sylvan's sidecar `race`, or its genome's body.race).
+Status GateMobRace(Ctx& c, std::string& detail) {
+  const MobSystem& mobs = c.mobs;
+  auto raceOf = [&](const char* n) -> std::string {
+    const int d = mobs.FindDef(n);
+    return d < 0 ? std::string("<no def>") : mobs.Defs()[d].race;
+  };
+  int humans = 0, sylvans = 0, other = 0;
+  for (const MobDef& d : mobs.Defs())
+    (d.race == "human" ? humans : d.race == "sylvan" ? sylvans : other)++;
+  detail = Format("human '%s', newcomer '%s', deku '%s', flew '%s' | %d human, %d sylvan, "
+                  "%d other defs", raceOf("human").c_str(),
+                  raceOf("newcomer").c_str(), raceOf("deku").c_str(),
+                  raceOf("flew").c_str(), humans,
+                  sylvans, other);
+  const bool ok = raceOf("human") == "human" &&
+                  (mobs.FindDef("newcomer") < 0 || raceOf("newcomer") == "human") &&
+                  (mobs.FindDef("deku") < 0 || raceOf("deku") == "sylvan") &&
+                  // a sylvan saved BEFORE the `race` key existed: its genome
+                  // must win over the "human" it inherits from human.json
+                  (mobs.FindDef("flew") < 0 || raceOf("flew") == "sylvan");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -2448,6 +2474,7 @@ const std::vector<Gate>& ImpactGates() {
       {"bite-limbs", "mob", {}, false, GateBiteLimbs, false},
       {"joint-rot", "mob", {}, false, GateJointRot, false},
       {"wood-bleed", "mob", {}, false, GateWoodBleed, false},
+      {"mob-race", "mob", {}, false, GateMobRace, false},
   };
   return g;
 }

@@ -2,6 +2,7 @@
   "//": "A CHARACTER, not a creature: flew inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs flew --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
   "extends": "human",
   "model": "flew",
+  "race": "sylvan",
   "sidecarVoxelsPerMetre": 10,
   "bleed": {
     "material": "syrup",
@@ -479,7 +480,7 @@
   },
   "genome": {
     "archetype": "humanoid",
-    "name": "newcomer",
+    "name": "flew",
     "displayName": "Untitled",
     "body": {
       "race": "sylvan",
@@ -620,7 +621,10 @@
       "moss": "#7b983b",
       "branch": "#69533f",
       "flower": "#e6e6d9",
-      "flowerEye": "#dfba4a"
+      "flowerEye": "#dfba4a",
+      "leaf2": "#a6c94a",
+      "leaf3": "#2f5a24",
+      "leaf4": "#7a5a2e"
     },
     "sylvan": {
       "face": "veiled",
@@ -645,8 +649,15 @@
       "branches": 0.35,
       "branchLen": 0.15,
       "branchFork": 0.2,
+      "branchStyle": "sprigs",
+      "shoulderBranches": 0,
+      "backBranches": 0,
+      "boughLen": 0.5,
+      "tufts": 0.6,
       "flowers": 0.1,
       "flowerSize": 0,
+      "leafMix": 0.35,
+      "leafPatch": 0.5,
       "veil": 0.7
     }
   }

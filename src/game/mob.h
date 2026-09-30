@@ -452,6 +452,11 @@ struct MobDef {
     return (mat < tissue.size() && tissue[mat]) ? 1.0f : 0.0f;
   }
   float bleedPerDamage = 1.5f; // wound budget voxels per point of damage
+  // WHAT KIND OF PERSON THIS IS (sidecar `race`, 2026-09-29): "human",
+  // "sylvan", or "" for a creature that is neither (critter, dummy). Read by
+  // the F1 spawn list's race filter only. Falls back to the genome's
+  // body.race for a generated character written before the key existed.
+  std::string race;
   // ---- IS THIS THING ALIVE? (sidecar `undead`) -----------------------------
   //
   // One flag, and deliberately only two consequences, because "undead" here is

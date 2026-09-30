@@ -1216,8 +1216,49 @@ void Overlay::DrawDevSpawn(UIState& s) {
     ImGui::TextDisabled("spawn a few metres ahead (or at the crosshair)");
     if (!s.aiCreatureNames.empty()) {
       if (s.aiCreaturePick >= (int)s.aiCreatureNames.size()) s.aiCreaturePick = 0;
+      // THE RACE FILTER: which kind of person the list below shows. The pick
+      // stays an index into the FULL list (the spawn reads it that way); the
+      // filtered view maps its rows back.
+      static const char* kRaces[] = {"all", "human", "sylvan", "other"};
+      Caption("race");
+      {
+        const float w = CellWidth(4);
+        for (int r = 0; r < 4; r++) {
+          if (r) ImGui::SameLine();
+          if (ToggleButton((std::string(kRaces[r]) + "##airace").c_str(),
+                           s.aiRaceFilter == r, w, 22))
+            s.aiRaceFilter = r;
+        }
+      }
+      auto raceOf = [&](int i) -> std::string {
+        return i < (int)s.aiCreatureRaces.size() ? s.aiCreatureRaces[i]
+                                                 : std::string();
+      };
+      std::vector<std::string> shown;
+      std::vector<int> index;
+      for (int i = 0; i < (int)s.aiCreatureNames.size(); i++) {
+        const std::string r = raceOf(i);
+        const bool keep =
+            s.aiRaceFilter == 0 ||
+            (s.aiRaceFilter == 1 && r == "human") ||
+            (s.aiRaceFilter == 2 && r == "sylvan") ||
+            (s.aiRaceFilter == 3 && r != "human" && r != "sylvan");
+        if (!keep) continue;
+        shown.push_back(s.aiCreatureNames[i]);
+        index.push_back(i);
+      }
       Caption("body");
-      PickList("##creatures", s.aiCreatureNames, s.aiCreaturePick, 5);
+      if (shown.empty()) {
+        ImGui::TextDisabled("no %s creatures loaded", kRaces[s.aiRaceFilter]);
+      } else {
+        int at = 0;
+        for (int k = 0; k < (int)index.size(); k++)
+          if (index[k] == s.aiCreaturePick) at = k;
+        // A filter that hides the current pick moves it onto the first
+        // visible row, so the spawn buttons never spawn something unseen.
+        s.aiCreaturePick = index[at];
+        if (PickList("##creatures", shown, at, 5)) s.aiCreaturePick = index[at];
+      }
     }
     // One box per published effect: MobSystem::DefWithEffects prefers an
     // authored combination and composes one when there is none.

@@ -2,6 +2,7 @@
   "//": "A CHARACTER, not a creature: deku inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs deku --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
   "extends": "human",
   "model": "deku",
+  "race": "sylvan",
   "sidecarVoxelsPerMetre": 10,
   "bleed": {
     "material": "syrup",

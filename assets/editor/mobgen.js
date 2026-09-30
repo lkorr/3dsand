@@ -4993,6 +4993,8 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     // encoded "and the world is 10 cm" into every sidecar, which is how the
     // human halved in metres the moment kVoxelMeters did.
     artVoxelsPerMetre: ART_VOXELS_PER_METRE,
+    // What kind of person (MobDef::race; the F1 spawn list filters by it).
+    race: g.body.race,
     // The scale the WORLD-space rows below (speed, severImpactSpeed,
     // rideHeight, bodyYOffset, clip pos) are written at. Stated rather than
     // defaulted: a modded asset silently assumed to be 10 vox/m is the exact

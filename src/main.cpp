@@ -6757,12 +6757,15 @@ int main(int argc, char** argv) {
                                 ? ui.aiCreatureNames[ui.aiCreaturePick]
                                 : std::string();
     ui.aiCreatureNames.clear();
+    ui.aiCreatureRaces.clear();
     for (const MobDef& d : mobs.Defs())
       // ...and not a random-human pool body a spawn built this session
       // (MobSystem::PoolDef): those are the "random human" button's.
       if (d.FindSocket("held_right") >= 0 && d.effects.empty() &&
-          !MobSystem::IsPoolName(d.name))
+          !MobSystem::IsPoolName(d.name)) {
         ui.aiCreatureNames.push_back(d.name);
+        ui.aiCreatureRaces.push_back(d.race);   // the list's race filter
+      }
     // First build defaults to the avatar's own species, which is the def the
     // old code preferred when it picked for you — so the panel's behaviour is
     // unchanged until somebody touches the combo.

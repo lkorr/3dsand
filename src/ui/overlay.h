@@ -456,6 +456,10 @@ struct UIState {
   // combinations live in `aiEffectNames` below instead: a body, plus boxes.
   std::vector<std::string> aiCreatureNames;
   int aiCreaturePick = 0;
+  // Each creature's race (MobDef::race), parallel to aiCreatureNames, and the
+  // list's race filter: 0 all, 1 human, 2 sylvan, 3 other.
+  std::vector<std::string> aiCreatureRaces;
+  int aiRaceFilter = 0;
   // ---- ...AND WHAT IS WRONG WITH IT (2026-09-20) --------------------------
   //
   // One checkbox per `assets/mobs/effects/*.json` (game/mob.h MobEffectNames),
