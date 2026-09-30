@@ -583,3 +583,162 @@ in both directions.
   `RetireOwner` are all in place, so a prefab/material tag that registers one on
   place and retires it on break is a small content-side addition rather than an
   engine change. It waits on there being a fan to place.
+
+## 13. The weather-driven field (2026-09-30)
+
+Six changes that make the ambient field behave like real near-surface wind:
+it depends on height above the ground and on terrain, its CHARACTER (not
+just its speed) changes with the weather, its gust fronts travel the right
+way, and there is something to see it by. Code: `src/sim/windfield.{h,cpp}`,
+`src/sim/wind.h`, the WIND FIELD section of `common.wgsl`,
+`assets/shaders/wind_streak.wgsl`, `assets/wind/regimes.json`. Gate:
+`wind-field` (CPU-only, through the C++ mirror of `windAtQ`).
+
+### 13.1 Gust fronts travel downwind (the bug)
+
+The bands were `sin(rate * t + K * s)`. A crest sits where `rate t + K s` is
+constant, so it moves at `ds/dt = -rate / K`: **upwind**, at ~0.8 m/s, at any
+wind speed. Measured on the shipped integer field with the wind toward +X: a
+crest at x = 12 at tick 0 was at x = 8 fifteen ticks later (−8 cells/s,
+analytic −8.4).
+
+Now `sin(c * (K s - adv) - rate_c * tt)`: `adv = K * ∫U dt` is how far the air
+has travelled, so the pattern is frozen into the moving air and crosses the
+meadow downwind at the mean. The integral is NOT `U * t` — U changes, and
+`U(t) * t` flings the whole pattern by `U' * t` (kilometres after an hour) at
+every weather change. It is summed on the CPU over 16-tick blocks of the
+reference speed `WindWeatherQ` produces (`windfield::AdvPhase`), memoised per
+(seed, tuning fingerprint) — a cache, not state: recomputing from tick 0 gives
+the same integers. It is reduced mod 10 turns because every band coefficient
+is a multiple of 0.1. The old incommensurate rates survive as a slow
+EVOLUTION term (`wind.gustSpeed`, now 0.35 rad/s) in the air's own frame
+(Taylor's frozen turbulence is approximate), with the advection's sign. The
+spatial wavelength is unchanged, so a stronger wind means more frequent gusts
+at a point. Fronts ride the REFERENCE speed, not the local one — a local U
+would shred the pattern (`K t ∇U · p` grows without bound); gust momentum is
+brought down from aloft anyway. `wind.gustAdvect` scales it. The clouds drift
+by the same sum (`AirDrift`), so sky and grass share one wind.
+
+Found on the way: `windSinQ`'s correction square `ay * ay` overflowed i32 for
+every |sin| > 0.707 (sin 45° read 0.48, the peak 0.77), so every sim-side gust
+had been clipped flat on top. Staged as `(ay >> 1)² / 16384`.
+
+### 13.2 Height above ground, exposure, altitude
+
+`ramp = profile(hAGL) × exposure(x, z) × absTerm(y)` replaced
+`1 + 0.6 (y - 64) / 100`, which was anchored 136 voxels below the default map's
+ground and stood every player in 1.8x the authored wind.
+
+- **profile** — log-law `ln(h/z0 + 1) / ln(href/z0 + 1)`, clamped to [floor,
+  cap], with `href` (1.5 m) the height where the mean equals the authored
+  speed. Shipped as a 16-knot table (h = 0, 1, 2, 4 … 16384 voxels), built on
+  the CPU with exact integer log2 (`imath::Log2Q16`; the base cancels in the
+  ratio) and interpolated linearly between doubling knots on both sides, so
+  the sim reads the same integers on every machine.
+- **exposure** — `1 + gain × clamp(TPI / scale, -1, 1)`, TPI the ground minus
+  its neighbourhood mean (100 m). With `scale` = radius / 2 a gain of 1 is the
+  textbook hill speed-up 2H/L. Separate ridge (s > 0) and hollow (s < 0) gains,
+  each blended light → strong by intensity; fades with height (40 m).
+- **absTerm** — `1 + absGain (y - seaLevel)`, small (4% / 100 m), the only term
+  that still reads absolute altitude and the only one past the table.
+
+**The terrain table** (`world.h kWindTerrN`): 64 × 64 cells of 32 voxels =
+204.8 m centred on the window, one word each — surface height i16 (standing
+water counts), exposure i8, water fraction u8 — stored toroidally (a window
+shift leaves surviving cells in place). Filled from `World::TerrainColumn`
+(the bit-exact CPU twin of `genColumn`): fine heights at cell centres, the
+neighbourhood mean and water fraction from a 128-voxel coarse lattice through
+a prefix-sum box filter, bilinear to the fine cell. Cached by world cell, so a
+window shift queries one new row or column. It rides TickParams and
+RenderParams (+16 KiB each) rather than a storage binding: a binding would
+mean a new entry in every consumer's layout (sim_step, particle, fluid, gas,
+raymarch, arrows, clouds) and pass-table rows, for data that is a pure
+function of (seed, map, cell) and changes only when the window shifts. Sampled
+bilinearly — in exact integer weights on the sim side — with the gradient
+coming free from the same four taps. Outside coverage: `absTerm × neutral`,
+blended over the outer two cells. It is WORLDGEN height: digging a pit does not
+shelter it (accepted; DESIGN.md §9b).
+
+This is the one STORED field in the wind system. DESIGN.md §9b's invariant 1
+is amended accordingly: the terrain table is static, seed-derived, derived
+data (rebuilt, never saved); the weather is still not stored.
+
+### 13.3 The regime: intensity changes the pattern
+
+Three inputs, all Q16 (`wind.h WeatherRegime`): **intensity** (≈ Beaufort/12),
+**gale** weight, **convective** weight, plus the sky **cover**. Named presets
+live in `assets/wind/regimes.json` (calm, light, breezy, windy, gale,
+thunderstorm — a new one is a row). **One weather:** every sky preset in
+`assets/weather/*.json` names a regime in its `"wind"` field and the sky's
+integer ladder (`weather::SimWindRegime`, the same `ScheduledQ` the rain word
+walks) blends them, so a storm sky blows a storm and fog is calm. The wind's
+own ~68 s epochs swing the sky's intensity ±`moodSpread`, and an epoch that
+draws a storm under a windy sky becomes a gale. `SetWindRegimeSource` is the
+hook a future weather system installs (it must be a pure function);
+`wind.regime` pins a preset and `wind.intensity` overrides the intensity
+(both live, the F1 picker and slider). With no sky, the epochs drive it.
+
+`WindWeatherQ` (integer end to end) turns the regime and the day phase into
+field parameters, each a knob:
+
+| term | light / convective | strong / gale |
+|---|---|---|
+| mean speed | windSpeed × curve(I): 0.1x at 0, **1x at 0.3**, 3.2x at 0.75, 5x at 1 | |
+| stability | + by day (sun), − at night, × (1 − 0.7 cover), mixed to 0 by I = 0.55 | neutral |
+| ground coupling | 1 − 0.6 × stable, recovering by 25 m | 1 |
+| gust fraction | 0.8 (+0.4 convective) | 0.5 (gust factor ~1.5) |
+| thermals | 1.2 m/s isotropic, 25 m cells, 14 s | 0 |
+| heading meander | ±45°, 80 m, 45 s | ±12°; a gale suppresses it 80% and holds an ~18 min heading |
+| ridge / hollow gain | 0.25 / 1.2 (hollows shelter) | 1.0 / 0.5 (2H/L) |
+| lee rotor | off | past I 0.55: slopes falling downwind steeper than 0.5 get +0.8 gust and reverse flow (0.35) in a 12 m layer |
+
+On the shader side the meander turns the mean and the band FRAME but not the
+gust PHASE (turning the phase would put a far-from-origin sample through
+`K |p| dθ` of phase); thermals and the local winds are an additive `extra`
+term that `windMeanWS` adds, so every consumer sees them; the lee reads the
+table's own bilinear gradient.
+
+### 13.4 Local winds and storms
+
+- **Slope winds** — up the table's slope by day (anabatic), down it at night
+  (katabatic, 0.7x), 2 m/s at full stability in a 15 m layer.
+- **Sea / lake breeze** — along the water-fraction gradient, onshore by day,
+  offshore at night (0.4x), 3 m/s in a 60 m layer. Both fade to nothing as the
+  mean passes 6 m/s.
+- **Thunderstorm** — a timeline in cycles of `stormCycle` (240 s) weighted by
+  the convective input: lull (0.3x), the gust front at u = 0.25 (heading jump
+  ±~90° drawn per cycle, 2.5x spike), decay to 1.4x, then gusty decay home. Its
+  spatial half is emitted through the existing primitives
+  (`windfield::WeatherPrims`): a wide CONE jet sweeping across the window along
+  the new heading at the storm's speed, and downbursts (BURST, half their
+  radius above `TerrainHeight`) after the front. A pure function of (tuning,
+  seed, tick, window), appended to both primitive lists after the placed ones;
+  Air only, so no entrainment licence and no footprint wake.
+- **Gale** — sustained intensity, steady heading, gust factor ~1.5 (§13.3).
+
+### 13.5 The sim's response
+
+Saltation was a threshold then a FLAT rate: a wind 1% over the line moved a
+dune as fast as a gale. Sand flux grows roughly with the cube of the excess,
+so the hop chance is now `rate × min(excess / (threshold × span), 1)^power`,
+power 3 (`sim.windEntrainPower/Span`). `windEntrainSpeed` 2 → 1.2 m/s: sand
+(friction 5, derived) lifts at 6 m/s AT THE GRAIN — the observed 5–7 m/s near
+the ground; the profile puts a grain at ~0.3x the reference wind. The drift
+bias stays linear on purpose: it is ADVECTION of a passive tracer (smoke, a
+falling grain carried by the air), which is linear in U; force ∝ U² is the
+particle tier's drag law, which is already `rate(|w|) × Δv`.
+
+### 13.6 Gust streaks (render-only)
+
+A fixed pool (2048, trail 16) near the camera, one per-frame compute row and
+one ribbon draw, both skipped at visibility 0. A dead slot respawns only
+where the gust excess (bands along the mean + primitives) passes a threshold,
+so calm days show nothing; each streak is advected by `windAt` (primitives
+included), i.e. the streaks are the field, drawn. All knobs are live uniforms.
+
+### 13.7 The C++ mirror
+
+`windfield::Probe/ProbeMany` transcribe the integer field over the same wf*
+block the tick ships (i32 wraps emulated) — the F1 readout and the
+`wind-field` gate read it. `check_invariants windmirror` holds its constants to
+the shader's; nothing compares the two bit for bit at run time.

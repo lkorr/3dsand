@@ -166,7 +166,9 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   out.pos = projectView(rel + perp * (side * width), R);
   let lf = h0.w / h1.x;
   let life = smoothstep(0.0, 0.15, lf) * (1.0 - smoothstep(0.55, 1.0, lf));
-  let near = smoothstep(5.0, 15.0, dist);
+  // Gone within a metre of the eye, full by four: a streak that close is a
+  // slab across the screen, not a wisp.
+  let near = smoothstep(10.0, 40.0, dist);
   let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w, length(q.xz - R.camPos.xz));
   let fog = exp(-dist * VOXEL_METERS * R.fogDensity);
   out.alpha = clamp(R.streakA.x * h1.y * (1.0 - kf) * life * near * far * fog, 0.0, 1.0);

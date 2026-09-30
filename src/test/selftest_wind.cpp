@@ -952,13 +952,18 @@ Status GateWindField(Ctx& c, std::string& detail) {
     std::vector<int32_t> xyz;
     for (int i = 0; i < kN; i++) { xyz.push_back(cx - kN / 2 + i); xyz.push_back(y); xyz.push_back(cz); }
     std::vector<windfield::FieldProbe> a(kN), b(kN);
-    const uint32_t dt = 3;
+    // Two ticks: the crest moves ~U * dt, a few cells at any sane wind, well
+    // inside half the base band's wavelength (the search below is limited to
+    // that half-period, or a pure sinusoid's shift is ambiguous mod lambda:
+    // +12 and -36 cells are the same shift for a 48-cell wave).
+    const uint32_t dt = 2;
     windfield::ProbeMany(t, seed, tick, kWindNoDayPhase, o3, xyz.data(), kN, a.data());
     windfield::ProbeMany(t, seed, tick + dt, kWindNoDayPhase, o3, xyz.data(), kN, b.data());
     // The shift that best maps a onto b: b(x) = a(x - s).
     int best = 0;
     double bestC = -1e30;
-    for (int s = -40; s <= 40; s++) {
+    const int half = std::max(2, (int)(0.5f * t.wind.gustWavelength / kVoxelMeters) - 1);
+    for (int s = -half; s <= half; s++) {
       double cc = 0;
       for (int i = 48; i < kN - 48; i++) cc += (double)b[i].band1 * a[i - s].band1;
       if (cc > bestC) { bestC = cc; best = s; }

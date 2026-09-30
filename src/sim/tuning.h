@@ -3555,8 +3555,10 @@ struct Tuning {
 
     // ---- field shape (mirrored in tuning_params.def as TUNE_WIND_*) ----
     // Distance between gust crests along the wind, metres. Short wavelengths
-    // read as a rippling meadow; long ones as slow rolling swells. 4.8 m
-    // reproduces the spatial frequency the sway code shipped with.
+    // read as a rippling meadow; long ones as slow rolling swells. 8 m since
+    // 2026-09-30 (was 4.8, the old sway code's): the fronts now ride the wind,
+    // so a crest passes a point at U / wavelength — 0.8 Hz in a 6 m/s breeze
+    // at 8 m, where 4.8 m flickered at 1.3 Hz.
     float gustWavelength = TPD(wind, gustWavelength);
     // EVOLUTION rate of the gust bands, rad/s — how fast the pattern changes
     // shape in the frame moving WITH the air. Since 2026-09-30 the fronts are

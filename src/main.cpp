@@ -1807,7 +1807,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       t.wind.regime = regime;
       t.wind.weatherAuto = false;
       t.wind.windDirDeg = 90.0f;
-      t.wind.streakAlpha = 0.8f;
+      t.wind.streakAlpha = std::max(t.wind.streakAlpha, 0.3f);   // the default look, forced on
       t.wind.dbgWindField = arrows;
       SetCurrentTuning(t);
       Camera c;

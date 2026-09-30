@@ -14803,15 +14803,38 @@ already *is*, for free, with no convergence latency. See RESEARCH_wind.md §3.
 ### The field
 
 ```
-windAt(p, t) = (weather(t) + gustBands(p, t)) * altRamp(p.y)
+windAt(p, t) = (meanDir(p) * speed * lee.mean
+                + gustBands(p, s - adv(t)) * gust * lee.gust) * ramp(p)
+             + thermal(p) * ramp(p) + slopeWind(p) + seaBreeze(p)
              + updraft(heatBelow(p))     // phase 5
-             + Σ primitives_i(p, t)      // phase 2
+             + Σ primitives_i(p, t)      // phase 2, + the storm's own
+ramp(p) = profile(height above ground) * exposure(x, z) * absTerm(y)
 ```
 
 Units are world **cells per second** (`kVoxelMeters` = 0.10, so cells/s = m/s ×
-10); the m/s knobs are converted once, on the CPU. The altitude ramp scales the
-whole field including the mean, because wind aloft is faster wind rather than
-the same wind with bigger gusts.
+10); the m/s knobs are converted once, on the CPU. The ramp scales the whole
+field including the mean, because wind aloft is faster wind rather than the
+same wind with bigger gusts.
+
+**The weather-driven field (2026-09-30; `docs/RESEARCH_wind.md` §13 is the
+model, `src/sim/windfield.{h,cpp}` the CPU half).** The ramp is a log-law in
+HEIGHT ABOVE GROUND times a terrain EXPOSURE term (ridges faster, hollows
+sheltered, by intensity) times a small absolute-altitude term — it replaced an
+absolute-Y ramp anchored at y = 64 that stood every player on the y ≈ 200 map in
+1.8x the wind. Gust fronts ride an advection clock (the CPU-summed integral of
+the reference speed) and travel DOWNWIND at the mean; before this they ran
+upwind at ~0.8 m/s. A weather REGIME — intensity, gale, convective, from the
+sky's preset ladder by default (`assets/wind/regimes.json`, each sky preset
+naming one) — sets the field's character: ground coupling (stable nights
+decouple), gust fraction, heading meander (±45° light, ±12° strong, held by a
+gale), thermals, ridge/hollow gains, a lee rotor, slope winds and a sea/lake
+breeze on light days, and the thunderstorm timeline, whose gust front and
+downbursts are emitted as ordinary wind primitives. Everything per tick rides
+a flat `wf*` block on BOTH TickParams and RenderParams (`world.h`
+kWindTerrN's note), filled by `windfield::FillWindField` alone. Knobs: F1 →
+World → Wind & weather, all live except `gustWavelength`/`gustSpeed` (F5).
+Visuals: the gust streaks (`wind_streak.wgsl`, render-only; §9b is the field,
+the streaks only draw it).
 
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being
@@ -14842,13 +14865,27 @@ float ones by at most 1 LSB (3 on gust) over 30,770 sampled ticks.
 
 ### Invariants
 
-1. **Wind is a function. There is no stored wind field and no per-voxel wind
-   state, ever** — voxel bits 19–23 stay free.
+1. **Wind is a function. There is no stored wind WEATHER and no per-voxel wind
+   state, ever** — voxel bits 19–23 stay free. **Amended 2026-09-30: the
+   TERRAIN TABLE is a stored field**, and deliberately so — 64 × 64 cells of
+   32 voxels around the window holding ground height, exposure (TPI) and water
+   fraction, because height above ground cannot be a pure function of position
+   without a ground query. It is static, seed-derived DERIVED data: a pure
+   function of (seed, map, world cell, tuning) built from
+   `World::TerrainColumn`, rebuilt on a window shift or a key change, never
+   saved and not hashed on its own (it reaches the hash only as a TickParams
+   input a replay reproduces). It is WORLDGEN height: digging a pit or building
+   a wall does not change the wind there. Accepted for now; a live-grid ground
+   term would need the CPU mirror or a GPU reduction, and both are bigger than
+   the effect. The weather is still not stored anywhere.
 2. **One authoritative field implementation, in `common.wgsl`.** Every consumer
    samples it; none builds its own bands. This is why the debug overlay is
    evidence rather than decoration — it calls the same function the grass
    calls, so it cannot draw a wind the world is not in. A C++ mirror, if one is
-   ever needed, gets a `check_invariants.py` entry.
+   ever needed, gets a `check_invariants.py` entry — and since 2026-09-30 one
+   exists: `windfield::Probe` transcribes the INTEGER field for the F1 readout
+   and the `wind-field` gate, held to the shader by `windmirror`. The storm's
+   gust front and downbursts are primitives, not a second field.
 3. **The ambient field never wakes a chunk.** Primitives (phase 2) dirty-mark
    only their own bounded, budget-charged footprint, through the mutation path.
    This is the "light-gated rules never sleep" lesson applied ahead of time: a
