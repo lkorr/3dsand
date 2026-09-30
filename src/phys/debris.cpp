@@ -439,6 +439,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   densityOf_.clear();
   rubbleOf_.clear();
   bleedOf_.clear();
+  fluidOf_.clear();
   foliageOf_.clear();
   matTints_.clear();
   tintMapValid_ = false;  // tint lists just moved: the art map derived from them
@@ -471,6 +472,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     if (r < 0) r = (int)selfIdx;
     rubbleOf_.push_back((uint32_t)r);
     bleedOf_.push_back(m.bleed);
+    fluidOf_.push_back(m.bleedFluid);
     selfIdx++;
     uint8_t foliage = 0;
     for (const auto& t : m.tags)
@@ -3999,6 +4001,16 @@ uint64_t DebrisSystem::HandleOfGlobalId(uint64_t globalId) const {
   return 0;
 }
 
+uint32_t DebrisSystem::BodyBleedMat(uint64_t handle) const {
+  const int i = IndexOfHandle(handle);
+  return i >= 0 ? bodies_[i].bleedMat : 0u;
+}
+
+uint32_t DebrisSystem::BodyWoundFluid(uint64_t handle) const {
+  const int i = IndexOfHandle(handle);
+  return i >= 0 && bodies_[i].bleedMat != 0 ? WoundFluidOf(bodies_[i]) : 0u;
+}
+
 uint32_t DebrisSystem::OwnerOfBody(uint64_t handle) const {
   const int i = IndexOfHandle(handle);
   if (i >= 0) return bodies_[i].owner;
@@ -4652,6 +4664,18 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     lostCentroid = lostCentroid * (1.0f / (float)removed.size());
   }
   const size_t lostN = fine ? skinLostN : removed.size();
+  // WHAT THIS CUT LEAKS (materials.h bleedFluid): the majority fluid of the
+  // matter it took, else the body's own -- a corpse's wooden arm cut again
+  // oozes syrup from the wood and blood from the flesh beside it.
+  uint32_t cutFluid = 0;
+  if (b.bleedMat != 0) {
+    FluidTally t;
+    for (const DebrisVoxel& v : removed) {
+      const uint32_t m = v.payload & 0xFFFu;
+      if (m < fluidOf_.size()) t.Add(fluidOf_[m], bleedOf_[m]);
+    }
+    cutFluid = t.Winner(b.bleedMat);
+  }
   if (b.bleedMat != 0 && lostN > 0) {
     woundW = b.xf.pos + QuatRot(b.xf.quat, lostCentroid * (1.0f / lostScale));
     carvedWorldVox =
@@ -4664,8 +4688,8 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // hole's walls count as exposed) and BEFORE the shatter (so every fragment
   // carries its share); the re-skin below writes it into the brick. Until
   // 2026-09-13 a corpse cut showed clean flesh and clean bone.
-  if (b.bleedMat != 0 && lostN > 0 && b.bleedMat < matGpu_.size()) {
-    const uint32_t stainType = matGpu_[b.bleedMat].stainPack & kStainPackTypeMask;
+  if (cutFluid != 0 && lostN > 0 && cutFluid < matGpu_.size()) {
+    const uint32_t stainType = matGpu_[cutFluid].stainPack & kStainPackTypeMask;
     const auto& gt = CurrentTuning().gore;
     if (stainType != 0 && gt.stainCutRadius > 0.0f) {
       // Tissue = what crumbles to this body's blood (MobDef::tissue's rule);
@@ -4673,7 +4697,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
       std::vector<uint8_t> tissue(rubbleOf_.size(), 0);
       bool any = false;
       for (size_t m = 0; m < rubbleOf_.size(); m++)
-        if (rubbleOf_[m] == b.bleedMat || m == b.bleedMat) { tissue[m] = 1; any = true; }
+        if (rubbleOf_[m] == cutFluid || m == cutFluid) { tissue[m] = 1; any = true; }
       if (!any) tissue.clear();
       const float sk = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
       // The centroid is already on the lattice this soaks (the skin when there
@@ -4684,7 +4708,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
       // smeared with whatever that body bled. `stainType` above is still what
       // decides the cut smears at all -- a bleed material with no stain block
       // has nothing to draw.
-      soak.mat = b.bleedMat;
+      soak.mat = cutFluid;
       soak.radius = gt.stainCutRadius * sk;
       soak.amountExposed = gt.stainCutAmount;
       soak.amountBuried = gt.stainCutBuried;
@@ -4819,7 +4843,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
         const Vec3 at{woundW.x + rng::SignedUnit(rng::Pcg(h ^ 0x2A5u)) * sprd,
                       woundW.y + rng::SignedUnit(rng::Pcg(h ^ 0xB77u)) * sprd,
                       woundW.z + rng::SignedUnit(rng::Pcg(h ^ 0xC3Du)) * sprd};
-        spawns.push_back(BloodSpawn(at, dir * sp, b.bleedMat, false, 0, 0));
+        spawns.push_back(BloodSpawn(at, dir * sp, cutFluid, false, 0, 0));
       }
     }
   }
@@ -5053,6 +5077,14 @@ void DebrisSystem::ArmWound(Body& b, Vec3 woundW, Vec3 dirW, float budget,
   // fifth of a flesh one's budget and gout.
   const float matScale = bestMat < bleedOf_.size() ? bleedOf_[bestMat] : 1.0f;
   budget *= matScale;
+  // ...and WHAT it leaks (materials.h bleedFluid): that voxel's fluid when it
+  // has one, the same "bigger share takes the wound" rule Mob::NoteWoundFluid
+  // keeps, else whatever the wound already leaked (0 = the body's own).
+  {
+    const uint32_t f = bestMat < fluidOf_.size() ? fluidOf_[bestMat] : 0u;
+    if (f != 0 && (b.wound.fluid == 0 || budget >= b.wound.budget))
+      b.wound.fluid = f;
+  }
   b.wound.scale = b.wound.gushTicks > 0 ? std::min(b.wound.scale, matScale)
                                         : matScale;
   centroid = centroid * (1.0f / (float)b.voxels.size());
@@ -5115,7 +5147,7 @@ void DebrisSystem::BleedBodies(uint32_t tick, World& world,
                  axis.z + rng::SignedUnit(rng::Pcg(h ^ 0xB0011u)) * cone};
         const float sp = gore.severSpraySpeed *
                          (0.75f + 0.5f * rng::Unit01(rng::Pcg(h ^ 0x1234u)));
-        spawns.push_back(BloodSpawn(at, dir * sp, b.bleedMat, true,
+        spawns.push_back(BloodSpawn(at, dir * sp, WoundFluidOf(b), true,
                                     gore.microLifeTicks, ms));
       }
       w.gushTicks--;
@@ -5131,7 +5163,7 @@ void DebrisSystem::BleedBodies(uint32_t tick, World& world,
       const uint32_t h = rng::Hash3(b.serial * 40503u, tick ^ 0xB1005u, 0u);
       Vec3 dir{axis.x + rng::SignedUnit(h) * 0.3f, axis.y,
                axis.z + rng::SignedUnit(rng::Pcg(h ^ 0x77u)) * 0.3f};
-      spawns.push_back(BloodSpawn(at + axis * 0.6f, dir * 1.5f, b.bleedMat,
+      spawns.push_back(BloodSpawn(at + axis * 0.6f, dir * 1.5f, WoundFluidOf(b),
                                   false, 0, 0));
       w.budget -= 1.0f;
       drips++;
@@ -5147,7 +5179,7 @@ void DebrisSystem::BleedBodies(uint32_t tick, World& world,
       Vec3 dir{rng::SignedUnit(h) * cone,
                0.6f + 0.4f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x77u))),
                rng::SignedUnit(rng::Pcg(h ^ 0xC0FFEEu)) * cone};
-      spawns.push_back(BloodSpawn(at, dir * gore.bleedSpraySpeed, b.bleedMat,
+      spawns.push_back(BloodSpawn(at, dir * gore.bleedSpraySpeed, WoundFluidOf(b),
                                   true, gore.microLifeTicks, ms));
     }
   }

@@ -54,6 +54,7 @@
 #include <vector>
 
 #include "sim/wind.h"
+#include "sim/windfield.h"
 #include "sim/windprim.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -807,6 +808,300 @@ Status GateWindGas(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- wind-field: the weather-driven model, as numbers (docs/RESEARCH_wind.md §13)
+//
+// CPU ONLY. It evaluates the INTEGER field through windfield.h's C++ mirror of
+// windAtQ on the same wf* block the tick ships, so it needs no ticks, no
+// fixture and no GPU round trip — a few thousand probe cells over the live
+// terrain table around the window. Each claim of the model is one line:
+//
+//   spawn     the mean wind at the reference height (1.5 m) over the table is
+//             ~1x the authored speed (the old absolute-Y ramp gave 1.8x)
+//   terrain   ridges (top-exposure cells) windier than hollows, hollows more
+//             sheltered in light wind, ridges faster in strong wind
+//   fronts    the base gust band's crests travel DOWNWIND at ~the mean speed
+//             (they ran upwind at ~0.8 m/s before 2026-09-30)
+//   meander   light air wanders several times more than a gale
+//   gusts     a gale's peak gust / mean ~1.5
+//   storm     the thunderstorm cycle has its lull, its front spike, its jump
+//             and its primitives
+//   stability a calm night decouples the ground wind; a calm noon has thermals
+//
+// Thresholds are tests/baseline.json numbers ("windField.*"), defaults here.
+Status GateWindField(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  const uint32_t seed = world.WorldSeed();
+  const IVec3 wo = world.WindowOrigin();
+  const int32_t o3[3] = {wo.x, wo.y, wo.z};
+  const int32_t cx = wo.x * (int)kChunk + (int)kWorldN / 2;
+  const int32_t cz = wo.z * (int)kChunk + (int)kWorldN / 2;
+  const uint32_t tick = 3000;
+  char buf[512];
+  bool ok = true;
+  std::string out;
+  auto note = [&](const char* s) { out += s; out += "; "; };
+
+  Tuning base = CurrentTuning();
+  base.wind.weatherAuto = false;
+  base.wind.windDirDeg = 90.0f;      // blowing toward +X
+  base.wind.regime = "auto";
+  base.wind.intensity = -1.0f;
+  base.wind.windSpeed = 6.0f;
+  base.wind.gustStrength = 1.0f;
+
+  // A grid of probe columns over the table, 1.5 m above ITS ground.
+  const int kG = 24;
+  auto columnProbes = [&](const Tuning& t, uint32_t tk, uint32_t day, float aglM,
+                          std::vector<windfield::FieldProbe>& res) {
+    std::vector<int32_t> xyz;
+    // First pass at y = 0 only to learn the ground of each column.
+    for (int j = 0; j < kG; j++)
+      for (int i = 0; i < kG; i++) {
+        xyz.push_back(cx - 800 + i * 1600 / kG + 16);
+        xyz.push_back(0);
+        xyz.push_back(cz - 800 + j * 1600 / kG + 16);
+      }
+    res.assign(xyz.size() / 3, {});
+    windfield::ProbeMany(t, seed, tk, day, o3, xyz.data(), (int)res.size(), res.data());
+    for (size_t k = 0; k < res.size(); k++)
+      xyz[3 * k + 1] = (int32_t)std::floor(res[k].groundY) + (int32_t)std::lround(aglM * 10.0f);
+    windfield::ProbeMany(t, seed, tk, day, o3, xyz.data(), (int)res.size(), res.data());
+  };
+  auto hspeed = [](const float v[3]) { return std::sqrt(v[0] * v[0] + v[2] * v[2]); };
+
+  // ---- spawn: the mean at the reference height over the table ------------
+  {
+    std::vector<windfield::FieldProbe> pr;
+    columnProbes(base, tick, kWindNoDayPhase, 1.5f, pr);
+    std::vector<float> ratio;
+    for (const auto& p : pr)
+      if (p.inTable && p.refSpeed > 0.0f) ratio.push_back(hspeed(p.mean) / p.refSpeed);
+    std::sort(ratio.begin(), ratio.end());
+    const float med = ratio.empty() ? 0.0f : ratio[ratio.size() / 2];
+    const windfield::FieldProbe centre =
+        windfield::Probe(base, seed, tick, kWindNoDayPhase, o3, cx, 0, cz);
+    const windfield::FieldProbe atC = windfield::Probe(
+        base, seed, tick, kWindNoDayPhase, o3, cx, (int32_t)std::floor(centre.groundY) + 15, cz);
+    const float lo = (float)BaselineNumber("windField.spawnMin", 0.8);
+    const float hi = (float)BaselineNumber("windField.spawnMax", 1.25);
+    const bool pass = med >= lo && med <= hi;
+    std::snprintf(buf, sizeof buf,
+                  "spawn: 1.5 m mean / authored = %.2f median over %zu columns "
+                  "(window centre %.2f: profile %.2f exposure %+.2f) [%.2f..%.2f] %s",
+                  med, ratio.size(), hspeed(atC.mean) / std::max(atC.refSpeed, 1e-6f),
+                  atC.profile, atC.exposure, lo, hi, pass ? "ok" : "FAIL");
+    note(buf);
+    RecordObserved("windField.spawnRatio", med);
+    ok = ok && pass;
+  }
+
+  // ---- terrain: ridges vs hollows, light vs strong ------------------------
+  {
+    struct Arm { const char* name; float I; float ridge = 0, flat = 0, hollow = 0; };
+    Arm arms[2] = {{"light", 0.12f}, {"strong", 0.8f}};
+    float eMin = 1.0f, eMax = -1.0f;
+    for (Arm& a : arms) {
+      Tuning t = base;
+      t.wind.intensity = a.I;
+      std::vector<windfield::FieldProbe> pr;
+      columnProbes(t, tick, kWindNoDayPhase, 1.5f, pr);
+      std::vector<std::pair<float, float>> es;   // (exposure, speed / ref)
+      for (const auto& p : pr)
+        if (p.inTable && p.refSpeed > 0.0f) es.push_back({p.exposure, hspeed(p.mean) / p.refSpeed});
+      std::sort(es.begin(), es.end());
+      if (es.size() < 20) continue;
+      const size_t n5 = std::max<size_t>(es.size() / 10, 1);
+      auto avg = [&](size_t b, size_t e) {
+        double s = 0;
+        for (size_t k = b; k < e; k++) s += es[k].second;
+        return (float)(s / (double)(e - b));
+      };
+      a.hollow = avg(0, n5);
+      a.ridge = avg(es.size() - n5, es.size());
+      a.flat = avg(es.size() / 2 - n5 / 2, es.size() / 2 + n5 / 2 + 1);
+      eMin = std::min(eMin, es.front().first);
+      eMax = std::max(eMax, es.back().first);
+    }
+    const bool relief = eMax - eMin > 0.1f;
+    const bool order = arms[0].ridge > arms[0].hollow && arms[1].ridge > arms[1].hollow;
+    const bool lightShelter = arms[0].hollow / std::max(arms[0].flat, 1e-6f) <
+                              arms[1].hollow / std::max(arms[1].flat, 1e-6f);
+    const bool strongRidge = arms[1].ridge / std::max(arms[1].flat, 1e-6f) >
+                             arms[0].ridge / std::max(arms[0].flat, 1e-6f);
+    const bool pass = !relief || (order && lightShelter && strongRidge);
+    std::snprintf(buf, sizeof buf,
+                  "terrain (exposure %.2f..%.2f): light ridge %.2f flat %.2f hollow %.2f, "
+                  "strong ridge %.2f flat %.2f hollow %.2f %s",
+                  eMin, eMax, arms[0].ridge, arms[0].flat, arms[0].hollow, arms[1].ridge,
+                  arms[1].flat, arms[1].hollow,
+                  !relief ? "(flat table: not asserted)" : pass ? "ok" : "FAIL");
+    note(buf);
+    RecordObserved("windField.ridgeOverHollowStrong",
+                   arms[1].ridge / std::max(arms[1].hollow, 1e-6f));
+    ok = ok && pass;
+  }
+
+  // ---- fronts: the base band's crests move downwind at ~the mean ----------
+  {
+    Tuning t = base;
+    t.wind.intensity = 0.5f;
+    t.wind.wanderLight = t.wind.wanderStrong = 0.0f;   // a straight line to track along
+    const int32_t y = (int32_t)std::floor(
+                          windfield::Probe(t, seed, tick, kWindNoDayPhase, o3, cx, 0, cz).groundY) + 15;
+    const int kN = 192;
+    std::vector<int32_t> xyz;
+    for (int i = 0; i < kN; i++) { xyz.push_back(cx - kN / 2 + i); xyz.push_back(y); xyz.push_back(cz); }
+    std::vector<windfield::FieldProbe> a(kN), b(kN);
+    // Two ticks: the crest moves ~U * dt, a few cells at any sane wind, well
+    // inside half the base band's wavelength (the search below is limited to
+    // that half-period, or a pure sinusoid's shift is ambiguous mod lambda:
+    // +12 and -36 cells were the same shift for the old 48-cell wave).
+    const uint32_t dt = 2;
+    windfield::ProbeMany(t, seed, tick, kWindNoDayPhase, o3, xyz.data(), kN, a.data());
+    windfield::ProbeMany(t, seed, tick + dt, kWindNoDayPhase, o3, xyz.data(), kN, b.data());
+    // The shift that best maps a onto b: b(x) = a(x - s). The window is
+    // [kMargin, kN - kMargin), so |s| must stay under kMargin or a[i - s]
+    // reads outside the probe row — which a wavelength over ~9.8 m (the
+    // knob goes to 60) used to do.
+    const int kMargin = 48;
+    int best = 0;
+    double bestC = -1e30;
+    const int half = std::clamp((int)(0.5f * t.wind.gustWavelength / kVoxelMeters) - 1, 2,
+                                kMargin - 1);
+    for (int s = -half; s <= half; s++) {
+      double cc = 0;
+      for (int i = kMargin; i < kN - kMargin; i++) cc += (double)b[i].band1 * a[i - s].band1;
+      if (cc > bestC) { bestC = cc; best = s; }
+    }
+    const float v = (float)best / ((float)dt / 30.0f) * (float)kVoxelMeters;   // m/s along +X
+    const float u = a[kN / 2].refSpeed * t.wind.gustAdvect;
+    const float r = u > 0 ? v / u : 0.0f;
+    const float lo = (float)BaselineNumber("windField.frontMin", 0.7);
+    const float hi = (float)BaselineNumber("windField.frontMax", 1.3);
+    const bool pass = r >= lo && r <= hi;
+    std::snprintf(buf, sizeof buf,
+                  "fronts: crest shift %+d cells in %u ticks = %+.1f m/s downwind vs mean %.1f m/s "
+                  "(ratio %.2f) [%.2f..%.2f] %s",
+                  best, dt, v, u, r, lo, hi, pass ? "ok" : "FAIL");
+    note(buf);
+    RecordObserved("windField.frontRatio", r);
+    ok = ok && pass;
+  }
+
+  // ---- meander: light air wanders, a gale holds ---------------------------
+  {
+    auto spread = [&](const char* regime) {
+      Tuning t = base;
+      t.wind.regime = regime;
+      double s2 = 0;
+      int n = 0;
+      for (uint32_t k = 0; k < 12; k++) {
+        std::vector<int32_t> xyz;
+        for (int i = 0; i < 16; i++) {
+          xyz.push_back(cx - 600 + i * 80);
+          xyz.push_back(0);
+          xyz.push_back(cz - 300 + (int)k * 50);
+        }
+        std::vector<windfield::FieldProbe> pr(16);
+        windfield::ProbeMany(t, seed, tick + k * 211, kWindNoDayPhase, o3, xyz.data(), 16, pr.data());
+        for (const auto& p : pr) {
+          float d = p.localHeadingDeg - p.weatherHeadingDeg;
+          while (d > 180.0f) d -= 360.0f;
+          while (d < -180.0f) d += 360.0f;
+          s2 += (double)d * d;
+          n++;
+        }
+      }
+      return (float)std::sqrt(s2 / std::max(n, 1));
+    };
+    const float light = spread("light"), gale = spread("gale");
+    const float need = (float)BaselineNumber("windField.meanderRatioMin", 2.5);
+    const bool pass = light > need * gale && gale < 12.0f;
+    std::snprintf(buf, sizeof buf, "meander: rms heading deviation light %.1f deg, gale %.1f deg %s",
+                  light, gale, pass ? "ok" : "FAIL");
+    note(buf);
+    RecordObserved("windField.meanderLightDeg", light);
+    RecordObserved("windField.meanderGaleDeg", gale);
+    ok = ok && pass;
+  }
+
+  // ---- gusts: a gale's gust factor ---------------------------------------
+  {
+    Tuning t = base;
+    t.wind.regime = "gale";
+    std::vector<windfield::FieldProbe> pr;
+    float peak = 0, meanSum = 0;
+    int n = 0;
+    for (uint32_t k = 0; k < 8; k++) {
+      columnProbes(t, tick + k * 97, kWindNoDayPhase, 10.0f, pr);
+      for (const auto& p : pr) {
+        if (!p.inTable) continue;
+        const float m = hspeed(p.mean);
+        const float tot = std::sqrt((p.mean[0] + p.bands[0]) * (p.mean[0] + p.bands[0]) +
+                                    (p.mean[2] + p.bands[2]) * (p.mean[2] + p.bands[2]));
+        if (m > 0) { peak = std::max(peak, tot / m); meanSum += m; n++; }
+      }
+    }
+    const bool pass = peak > 1.3f && peak < 1.8f;
+    std::snprintf(buf, sizeof buf, "gusts: gale peak/mean at 10 m = %.2f (mean %.1f m/s) %s", peak,
+                  n ? meanSum / n : 0.0f, pass ? "ok" : "FAIL");
+    note(buf);
+    RecordObserved("windField.galeGustFactor", peak);
+    ok = ok && pass;
+  }
+
+  // ---- storm: the timeline and its primitives ------------------------------
+  {
+    Tuning t = base;
+    t.wind.regime = "thunderstorm";
+    const uint32_t P = (uint32_t)std::lround(t.wind.stormCycle * 30.0f);
+    const uint32_t c0 = P * 7;
+    float envMin = 9, envMax = 0, jumpMax = 0;
+    uint32_t prims = 0;
+    for (uint32_t k = 0; k < 64; k++) {
+      const uint32_t tk = c0 + (P * k) / 64;
+      const WindStateQ q = WindWeatherQ(t, seed, tk);
+      envMin = std::min(envMin, (float)q.envelope / 65536.0f);
+      envMax = std::max(envMax, (float)q.envelope / 65536.0f);
+      jumpMax = std::max(jumpMax, std::fabs((float)(int32_t)q.jumpBam) * (180.0f / 2147483648.0f));
+      WindPrimGpu g[kWindPrimCap];
+      int32_t lo[3] = {INT32_MAX, INT32_MAX, INT32_MAX}, hi[3] = {INT32_MIN, INT32_MIN, INT32_MIN};
+      prims = std::max(prims, windfield::WeatherPrims(t, seed, tk, o3, g, kWindPrimCap, lo, hi));
+    }
+    const bool pass = envMin <= t.wind.stormLull + 0.05f && envMax >= t.wind.stormFront - 0.1f &&
+                      jumpMax > 30.0f && prims > 0;
+    std::snprintf(buf, sizeof buf,
+                  "storm: envelope %.2f..%.2f x, jump up to %.0f deg, up to %u weather primitives %s",
+                  envMin, envMax, jumpMax, prims, pass ? "ok" : "FAIL");
+    note(buf);
+    ok = ok && pass;
+  }
+
+  // ---- stability: night decoupling, noon thermals, a gale mixes both away --
+  {
+    Tuning t = base;
+    t.wind.regime = "light";
+    const WindStateQ night = WindWeatherQ(t, seed, tick, 0);
+    const WindStateQ noon = WindWeatherQ(t, seed, tick, kDayNoon);
+    t.wind.regime = "gale";
+    const WindStateQ galeNoon = WindWeatherQ(t, seed, tick, kDayNoon);
+    const bool pass = night.coupling < 52429 && noon.thermal > 0 && galeNoon.thermal == 0 &&
+                      galeNoon.coupling == 65536;
+    std::snprintf(buf, sizeof buf,
+                  "stability: light night S %+.2f coupling %.2f; light noon S %+.2f thermal %.2f m/s; "
+                  "gale noon S %+.2f %s",
+                  night.stability / 65536.0f, night.coupling / 65536.0f, noon.stability / 65536.0f,
+                  noon.thermal / 65536.0f * (float)kVoxelMeters, galeNoon.stability / 65536.0f,
+                  pass ? "ok" : "FAIL");
+    note(buf);
+    ok = ok && pass;
+  }
+
+  detail = out;
+  std::printf("wind-field: %s\n  %s\n", ok ? "PASS" : "FAIL", out.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WindGates() {
@@ -814,6 +1109,7 @@ const std::vector<Gate>& WindGates() {
       {"wind", "sim", {}, false, GateWind},
       {"wind-gas", "sim", {}, false, GateWindGas},
       {"wind-prim", "sim", {}, false, GateWindPrim},
+      {"wind-field", "sim", {}, false, GateWindField},
   };
   return g;
 }

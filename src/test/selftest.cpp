@@ -342,6 +342,9 @@ const char* const kOrder[] = {
     // Oil on water: a disturbed slick must not diffuse into isolated cells.
     // Same sealed-box fixture as ca-level.
     "oil-slick",
+    // A pool of oil alight: catches at once, burns ~10 s, pours black smoke.
+    // Same pit neighbourhood and dim-dawn pinning.
+    "oil-fire",
     // Passable plants hold nothing up: sand, a lone chip and a grid particle
     // each crush the bramble they land on. Same sealed-box fixture.
     "plant-crush",
@@ -352,6 +355,10 @@ const char* const kOrder[] = {
     // disturbs a neighbour.
     "pond-shore",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
+    // The weather-driven field model (docs/RESEARCH_wind.md §13), CPU-only
+    // through windfield.h's mirror: reads the terrain table around the
+    // window and changes no world state.
+    "wind-field",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-identity", "fluid-settle",
     "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "fluid-self-react", "far-fog",  "far-downsample",
     "far-persist", "far-surface",
@@ -898,7 +905,7 @@ const char* const kOrder[] = {
     // counter (mob ids seed gore variance).
     "impact-blunt", "impact-armor", "impact-fist", "bite-rot", "bite-infect",
     // ...and how much a wound bleeds by what it opened: wood a fifth of flesh.
-    "wood-bleed", "mob-race",
+    "wood-bleed", "bleed-fluid", "mob-race",
     // ...and the structural consequence the rot had none of until 2026-09-19:
     // a limb whose ATTACHMENT has been eaten comes off, whatever ate it.
     "joint-rot",

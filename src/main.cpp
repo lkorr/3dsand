@@ -91,6 +91,7 @@
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
 #include "sim/wind.h"
+#include "sim/windfield.h"
 #include "sim/weather.h"
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
@@ -1721,6 +1722,9 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
       sim.DrawWindField(rp, CurrentTuning().wind.dbgWindField
                                 ? WindDebugArrowCount(CurrentTuning())
                                 : 0u);
+      // Gust streaks (render-only): the pool the per-frame table advected.
+      sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
+                          (uint32_t)CurrentTuning().wind.streakTrail);
       // The CURRENT field's arrows, reached the same way and for the same
       // reason (water plan component 8).
       sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
@@ -1784,6 +1788,59 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         (uint32_t)(0.02 * (double)shotTicksPerDay) % shotTicksPerDay;
     renderAt({108, (float)(h108 + 60), 108}, 0.785f, 0.35f,
              "screenshot_night_sky.bmp", (int64_t)nightTick);
+  }
+  // ---- WIND shots (docs/RESEARCH_wind.md §13) ------------------------------
+  // The weather-driven field and its gust streaks, which a four-frame shot at
+  // one fixed time cannot show: the streak pool fills over SECONDS of frames
+  // (it is advanced by the frame's dt), so these render 100 frames with the
+  // clock and the tick advancing, and grab the last. A pinned regime blowing
+  // toward +X, the camera looking across it (+Z) so the streaks and arrows run
+  // left-to-right. The tuning is restored afterwards.
+  //   screenshot_wind_gale         the gale's streaks
+  //   screenshot_wind_gale_arrows  the same instant with the arrow field
+  //   screenshot_wind_calm         the same view becalmed: no streaks at all
+  {
+    auto windShot = [&](const char* path, const char* regime, bool arrows) {
+      if (!ShotWanted(path)) return;
+      const Tuning saved = CurrentTuning();
+      Tuning t = saved;
+      t.wind.regime = regime;
+      t.wind.weatherAuto = false;
+      t.wind.windDirDeg = 90.0f;
+      t.wind.streakAlpha = std::max(t.wind.streakAlpha, 0.3f);   // the default look, forced on
+      t.wind.dbgWindField = arrows;
+      SetCurrentTuning(t);
+      Camera c;
+      c.yaw = 1.5708f;
+      c.pitch = -0.12f;
+      const Vec3 eye{108.0f, (float)(h108 + 22), 108.0f};
+      for (int f = 0; f < 100; f++) {
+        WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true,
+                          kShotTime + (float)f / 30.0f, kFarFogDensity, 1080.0f,
+                          shotTick + (uint32_t)f);
+        rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+        sim.EncodeShadowResolve(enc);
+        rhi::RenderPass rp =
+            sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+        sim.DrawWorld(rp);
+        sim.DrawWindField(rp, arrows ? WindDebugArrowCount(CurrentTuning()) : 0u);
+        sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
+                            (uint32_t)CurrentTuning().wind.streakTrail);
+        rp.End();
+        ctx.queue.Submit(enc.Finish());
+      }
+      ctx.WaitIdle();
+      grab(path);
+      SetCurrentTuning(saved);
+    };
+    windShot("screenshot_wind_gale.bmp", "gale", false);
+    windShot("screenshot_wind_gale_arrows.bmp", "gale", true);
+    windShot("screenshot_wind_calm.bmp", "calm", false);
+    // The frames below pin one time, so their update rows see dt 0 and never
+    // age a streak out: whatever the gale left alive (all of it, when the calm
+    // frame was filtered out) would be drawn, frozen, into every later shot —
+    // screenshot_ground's eye is 0.6 m from this one.
+    sim.ClearWindStreaks();
   }
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
@@ -14159,6 +14216,50 @@ int main(int argc, char** argv) {
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
+      // The wind readout: windfield::Probe (the C++ mirror of windAtQ) at
+      // head height, 1.5 m above the feet. Same seed, tick and window the
+      // tick's own wf* block was resolved from.
+      {
+        const IVec3 wo = world.WindowOrigin();
+        const int32_t o3[3] = {wo.x, wo.y, wo.z};
+        const windfield::FieldProbe fp = windfield::Probe(
+            CurrentTuning(), world.WorldSeed(), tick, DayPhaseNow(tick), o3,
+            (int32_t)std::floor(player.pos.x), (int32_t)std::floor(player.pos.y) + 15,
+            (int32_t)std::floor(player.pos.z));
+        UIState::WindReadout& wr = ui.wind;
+        const float toMs = (float)kVoxelMeters / 65536.0f;
+        wr.valid = true;
+        wr.source = fp.q.source;
+        wr.intensity = fp.q.intensity / 65536.0f;
+        wr.gale = fp.q.gale / 65536.0f;
+        wr.convective = fp.q.convective / 65536.0f;
+        wr.stability = fp.q.stability / 65536.0f;
+        wr.coupling = fp.q.coupling / 65536.0f;
+        wr.gustFrac = fp.q.gustFrac / 65536.0f;
+        wr.wanderDeg = fp.q.wanderAmp * (360.0f / 65536.0f);
+        wr.thermalMs = fp.q.thermal * toMs;
+        wr.slopeMs = fp.q.slopeWind * toMs;
+        wr.seaMs = fp.q.seaBreeze * toMs;
+        wr.stormPhase = fp.q.stormPhase < 0 ? -1.0f : fp.q.stormPhase / 65536.0f;
+        wr.envelope = fp.q.envelope / 65536.0f;
+        wr.jumpDeg = (float)(int32_t)fp.q.jumpBam * (180.0f / 2147483648.0f);
+        wr.refSpeed = fp.refSpeed;
+        wr.gustAmp = fp.gustAmp;
+        wr.headingDeg = fp.weatherHeadingDeg;
+        wr.localHeadingDeg = fp.localHeadingDeg;
+        wr.totalMs = std::sqrt(fp.total[0] * fp.total[0] + fp.total[2] * fp.total[2]);
+        wr.meanMs = std::sqrt(fp.mean[0] * fp.mean[0] + fp.mean[2] * fp.mean[2]);
+        wr.gustExcess = fp.gustExcess;
+        wr.extraMs = std::sqrt(fp.extra[0] * fp.extra[0] + fp.extra[2] * fp.extra[2]);
+        wr.haglM = fp.haglM;
+        wr.groundY = fp.groundY;
+        wr.profile = fp.profile;
+        wr.exposure = fp.exposure;
+        wr.expMul = fp.expMul;
+        wr.ramp = fp.ramp;
+        wr.leeMean = fp.leeMean;
+        wr.terrQueries = windfield::TerrainQueries();
+      }
 
       // crosshair material readout — same sim_pick snapshot the brush, laser
       // and prefab placer read, so the name shown is exactly the cell those
@@ -17016,6 +17117,11 @@ int main(int argc, char** argv) {
         sim.DrawWindField(rp, ui.fieldViz == UIState::kFieldVizWind
                                   ? WindDebugArrowCount(CurrentTuning())
                                   : 0u);
+        // Gust streaks: faint white ribbons riding the same field, visible
+        // mainly in strong gusts. Zero at streakAlpha 0 (then neither the
+        // update row nor this draw is recorded).
+        sim.DrawWindStreaks(rp, WindStreakDrawCount(CurrentTuning()),
+                            (uint32_t)CurrentTuning().wind.streakTrail);
         sim.DrawCurrentField(rp, ui.fieldViz == UIState::kFieldVizCurrent
                                      ? CurrentDebugArrowCount()
                                      : 0u);

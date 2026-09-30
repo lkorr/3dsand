@@ -1009,6 +1009,25 @@ struct MaterialDef {
   // a human arm that has somehow become wood bleeds a fifth of the blood --
   // it is the MATTER that decides, not the creature. CPU-only (body wounds).
   float bleed = 1.0f;
+  // WHAT A WOUND IN THIS LEAKS (materials.json "bleedFluid", 2026-09-29): the
+  // LIQUID that comes out when this matter is opened on a body -- the drip,
+  // the spray, the gout, the thrown voxels, the smear on the cut. The matter
+  // decides, not the creature: a human arm turned to wood leaks syrup, a
+  // sylvan that grew a flesh arm bleeds blood from it, a zombie's rotten
+  // patches ooze ichor. Resolved by name after the whole table loads:
+  //   * "bleedFluid": "<liquid>"  -> that liquid (must be class liquid);
+  //   * "bleedFluid": false       -> no opinion (the body decides);
+  //   * absent                    -> DERIVED from `rubble` when that is a
+  //     liquid: tissue that crumbles to blood bleeds blood (skin, flesh,
+  //     muscle, brain...), rotflesh -> ichor. Everything else has no opinion.
+  // 0 = no opinion. The resolution order a wound follows (Mob::FluidAt,
+  // DebrisSystem::ArmWound): the struck matter's fluid, else the LIMB's
+  // majority fluid among voxels that have one, else the creature's authored
+  // `bleed.material`. A creature with no `bleed` block bleeds nothing at all.
+  // CPU-only (body wounds); nothing here reaches a shader or the world hash.
+  uint32_t bleedFluid = 0;
+  std::string bleedFluidName;   // as authored ("" = derive from rubble)
+  bool bleedFluidOff = false;   // authored `false`
   // HOW BURNT A VOXEL OF THIS READS (materials.json "burnStage", W1-F
   // 2026-09-24): 0 = intact, 1 = half (cooked / seared / alight), 2 = whole
   // (charred / cinder / ash). A body's burnt fraction, its burn health cap,
@@ -1089,3 +1108,30 @@ void CheckPinnedMaterialIds(const std::vector<MaterialDef>& mats,
 // Everything else still sees a solid: the CA, fire, the brush, explosions, the
 // laser and the renderer all read gpu.klass directly and are untouched.
 std::vector<uint32_t> BuildCollisionClasses(const std::vector<MaterialDef>& mats);
+
+// WHICH FLUID A PIECE OF BODY LEAKS, BY MAJORITY (materials.h bleedFluid).
+// A wound that opened several materials at once -- a carve, a severed piece,
+// a limb census -- asks every voxel with an OPINION (bleedFluid != 0) and
+// weights the vote by how much that matter bleeds (`bleed`), so a wooden arm
+// with a flesh sliver still leaks syrup and bone (no opinion) never outvotes
+// the meat around it. Fixed capacity, first-seen order, strict `>` on ties:
+// the answer is a pure function of the voxel order, which the lattices keep
+// deterministic. A fifth distinct fluid in one wound is dropped (none exists).
+struct FluidTally {
+  uint32_t id[4] = {0, 0, 0, 0};
+  float w[4] = {0, 0, 0, 0};
+  int n = 0;
+  void Add(uint32_t fluid, float weight) {
+    if (fluid == 0) return;
+    for (int i = 0; i < n; i++)
+      if (id[i] == fluid) { w[i] += weight; return; }
+    if (n < 4) { id[n] = fluid; w[n] = weight; n++; }
+  }
+  // The heaviest vote, or `fallback` when nothing voted.
+  uint32_t Winner(uint32_t fallback) const {
+    int best = -1;
+    for (int i = 0; i < n; i++)
+      if (best < 0 || w[i] > w[best]) best = i;
+    return best < 0 ? fallback : id[best];
+  }
+};

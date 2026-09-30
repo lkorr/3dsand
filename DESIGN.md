@@ -4622,6 +4622,53 @@ them; raising the cap a long way is a settle-time change as much as a look one.
 
 ## 7. Destruction, Islands, and Rigidbodies
 
+### What a wound leaks is the MATTER's (2026-09-29; `materials.h` `bleed` + `bleedFluid`, `Mob::FluidAt`)
+
+How MUCH a wound bleeds and WHAT comes out are both properties of the voxels the
+wound opened, not of the creature. `materials.json` `bleed` is the amount
+(flesh 1, wood / bark / leaves / crystal 0.2, a multiplier on the body's
+`bleed.perDamage`); `bleedFluid` is the liquid. The fluid is resolved once at
+load: an authored name (must be a liquid), else DERIVED from a liquid `rubble`
+(skin, flesh, muscle and brain crumble to blood, so they bleed blood with no
+key; rotflesh -> ichor), else no opinion (bone, hair, art slots); `false`
+opts out. The wood family authors `"bleedFluid": "syrup"`.
+
+Every wound resolves it through ONE chain: **struck matter -> the limb's
+majority -> the creature**. `Mob::FluidAt(limb, mat)` is the matter's own
+fluid else `Mob::LimbFluid` (a `FluidTally` over the limb's authoritative
+lattice, voting only voxels with an opinion, weighted by `bleed`, so bone never
+outvotes the meat round it) else the sidecar's `bleed.material`, which is now
+the LAST rung and speaks only for matter with no opinion. A creature with no
+`bleed` block still bleeds nothing, and a bloodless slot (hair, a garment)
+still leaks nothing.
+
+The decision is taken where the wound is made and kept on the limb
+(`MobLimb::woundFluid`, set through `Mob::NoteWoundFluid`: the bigger share of
+budget takes the wound over; cleared when the wound closes): a hit from the
+struck voxel, a carve from the majority of the carved voxels, a sever from the
+parent's voxel at the cut (the stump) and the piece's own census (the piece),
+the fall from the legs, a fall splat from the whole body (`Mob::BodyFluid`).
+Every emitter reads it -- the drip op, spray and gout droplets, the thrown
+voxels, the drag smear, the splatter event, the cut smear (`Mob::SmearMatFor`:
+the creature's `woundMaterial` chain for its own blood, else the fluid
+itself), the bared-bone coat and a split bruise. Debris carries it on: a
+severed piece is adopted with its OWN fluid as `Body::bleedMat`, a gobbet with
+the majority of its voxels, and `DebrisSystem::ArmWound` re-reads the voxel at
+each new wound into `BodyWound::fluid` (never on the wire; a ghost does not
+bleed).
+
+So a human whose arm has been turned to wood leaks syrup from it and blood from
+the flesh shoulder it hangs off; a sylvan grown a flesh arm bleeds blood from it
+and sap from its stump -- no race or creature code anywhere. A new tissue is one
+JSON key (or none, if its rubble already names its fluid). Gate `bleed-fluid`
+(six arms, including both ends of each sever) and `wood-bleed` (the amounts).
+
+NOT per-fluid yet: the wound REWRITE (`MobDef::woundMat`, the soaked-meat
+material) and its `tissue` census are still the creature's -- they already
+refuse matter that does not crumble to the creature's blood, so a wooden arm on
+a man is not rewritten to blood-meat, but a sylvan's flesh arm is not rewritten
+to blood-meat either (it gets the blood smear only).
+
 ### Large-scale destruction
 - **Explosions**: cast rays from the blast center to every voxel on the blast
   sphere's *surface*, DDA-traversing voxel by voxel. Compare each voxel's
@@ -14894,15 +14941,38 @@ already *is*, for free, with no convergence latency. See RESEARCH_wind.md §3.
 ### The field
 
 ```
-windAt(p, t) = (weather(t) + gustBands(p, t)) * altRamp(p.y)
+windAt(p, t) = (meanDir(p) * speed * lee.mean
+                + gustBands(p, s - adv(t)) * gust * lee.gust) * ramp(p)
+             + thermal(p) * ramp(p) + slopeWind(p) + seaBreeze(p)
              + updraft(heatBelow(p))     // phase 5
-             + Σ primitives_i(p, t)      // phase 2
+             + Σ primitives_i(p, t)      // phase 2, + the storm's own
+ramp(p) = profile(height above ground) * exposure(x, z) * absTerm(y)
 ```
 
 Units are world **cells per second** (`kVoxelMeters` = 0.10, so cells/s = m/s ×
-10); the m/s knobs are converted once, on the CPU. The altitude ramp scales the
-whole field including the mean, because wind aloft is faster wind rather than
-the same wind with bigger gusts.
+10); the m/s knobs are converted once, on the CPU. The ramp scales the whole
+field including the mean, because wind aloft is faster wind rather than the
+same wind with bigger gusts.
+
+**The weather-driven field (2026-09-30; `docs/RESEARCH_wind.md` §13 is the
+model, `src/sim/windfield.{h,cpp}` the CPU half).** The ramp is a log-law in
+HEIGHT ABOVE GROUND times a terrain EXPOSURE term (ridges faster, hollows
+sheltered, by intensity) times a small absolute-altitude term — it replaced an
+absolute-Y ramp anchored at y = 64 that stood every player on the y ≈ 200 map in
+1.8x the wind. Gust fronts ride an advection clock (the CPU-summed integral of
+the reference speed) and travel DOWNWIND at the mean; before this they ran
+upwind at ~0.8 m/s. A weather REGIME — intensity, gale, convective, from the
+sky's preset ladder by default (`assets/wind/regimes.json`, each sky preset
+naming one) — sets the field's character: ground coupling (stable nights
+decouple), gust fraction, heading meander (±45° light, ±12° strong, held by a
+gale), thermals, ridge/hollow gains, a lee rotor, slope winds and a sea/lake
+breeze on light days, and the thunderstorm timeline, whose gust front and
+downbursts are emitted as ordinary wind primitives. Everything per tick rides
+a flat `wf*` block on BOTH TickParams and RenderParams (`world.h`
+kWindTerrN's note), filled by `windfield::FillWindField` alone. Knobs: F1 →
+World → Wind & weather, all live except `gustWavelength`/`gustSpeed` (F5).
+Visuals: the gust streaks (`wind_streak.wgsl`, render-only; §9b is the field,
+the streaks only draw it).
 
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being
@@ -14933,13 +15003,27 @@ float ones by at most 1 LSB (3 on gust) over 30,770 sampled ticks.
 
 ### Invariants
 
-1. **Wind is a function. There is no stored wind field and no per-voxel wind
-   state, ever** — voxel bits 19–23 stay free.
+1. **Wind is a function. There is no stored wind WEATHER and no per-voxel wind
+   state, ever** — voxel bits 19–23 stay free. **Amended 2026-09-30: the
+   TERRAIN TABLE is a stored field**, and deliberately so — 64 × 64 cells of
+   32 voxels around the window holding ground height, exposure (TPI) and water
+   fraction, because height above ground cannot be a pure function of position
+   without a ground query. It is static, seed-derived DERIVED data: a pure
+   function of (seed, map, world cell, tuning) built from
+   `World::TerrainColumn`, rebuilt on a window shift or a key change, never
+   saved and not hashed on its own (it reaches the hash only as a TickParams
+   input a replay reproduces). It is WORLDGEN height: digging a pit or building
+   a wall does not change the wind there. Accepted for now; a live-grid ground
+   term would need the CPU mirror or a GPU reduction, and both are bigger than
+   the effect. The weather is still not stored anywhere.
 2. **One authoritative field implementation, in `common.wgsl`.** Every consumer
    samples it; none builds its own bands. This is why the debug overlay is
    evidence rather than decoration — it calls the same function the grass
    calls, so it cannot draw a wind the world is not in. A C++ mirror, if one is
-   ever needed, gets a `check_invariants.py` entry.
+   ever needed, gets a `check_invariants.py` entry — and since 2026-09-30 one
+   exists: `windfield::Probe` transcribes the INTEGER field for the F1 readout
+   and the `wind-field` gate, held to the shader by `windmirror`. The storm's
+   gust front and downbursts are primitives, not a second field.
 3. **The ambient field never wakes a chunk.** Primitives (phase 2) dirty-mark
    only their own bounded, budget-charged footprint, through the mutation path.
    This is the "light-gated rules never sleep" lesson applied ahead of time: a

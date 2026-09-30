@@ -352,6 +352,13 @@ class Simulation {
   // point from its instance index and R.camPos, so there is no arrow buffer,
   // no per-arrow CPU work, and no new bind group.
   void DrawWindField(const rhi::RenderPass& pass, uint32_t arrows);
+  // The gust streaks (wind_streak.wgsl): `count` pool slots, `trail` points
+  // each. Zero count is skipped outright; see WindStreakDrawCount.
+  void DrawWindStreaks(const rhi::RenderPass& pass, uint32_t count, uint32_t trail);
+  // Kill every streak (zero the pool, lifetime 0 = never spawned). For a
+  // harness that pinned a windy regime and must not leave its streaks, frozen,
+  // in the frames that follow.
+  void ClearWindStreaks();
   // The current field's arrows (docs/PLAN_water_master.md component 8).
   void DrawCurrentField(const rhi::RenderPass& pass, uint32_t arrows);
   // Body cubes: vertices per instance (three camera-facing faces, see
@@ -848,6 +855,8 @@ class Simulation {
   rhi::ComputePipeline rayStartTrace_, rayStartMin_;
   // The rain shadow map (rain_map.wgsl rainMapPrep / rainMapBuild).
   rhi::ComputePipeline rainMapPrep_, rainMapBuild_;
+  // The gust streaks' update (wind_streak.wgsl `update`, per-frame table).
+  rhi::ComputePipeline windStreak_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -883,9 +892,9 @@ class Simulation {
       fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_, bodyDepth_,
       microBodyDraw_, debugBoxDraw_, pourMarkerDraw_, debugWindDraw_, debugCurrentDraw_,
-      fluidDraw_;
+      fluidDraw_, windStreakDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
-      debugLineModule_, debugWindModule_, debugCurModule_;
+      debugLineModule_, debugWindModule_, debugCurModule_, windStreakModule_;
   // ---- the specialized raymarch (W2-A) --------------------------------------
   // `raymarchLeanModule_` is raymarchModule_'s assembled source with the three
   // SPEC_* consts flipped to false (BuildRaymarchVariant). `raymarchLean_` is
@@ -998,6 +1007,8 @@ class Simulation {
   // 21 in shadowBGL_ (compute, written). rayStartW_/H_ = the largest target
   // it is sized for; 0 until the first world pass, and no row records.
   rhi::Buffer rayStartBuf_;
+  // The gust streaks' fixed particle pool (world.h kWindStreakCap).
+  rhi::Buffer windStreakBuf_;
   // The buffer EnsureRayStart last replaced, kept alive one growth longer
   // because the frame that grew it had already recorded the prepass against it.
   rhi::Buffer rayStartPrev_;

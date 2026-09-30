@@ -2339,17 +2339,26 @@ int LimbNamed(const MobDef& d, const char* name) {
 // stump's standing top-up are scaled by the matter at the cut (MobLimb::
 // woundScale), so a wooden stump must pay a fraction of a flesh one.
 int SeverBleedCount(Ctx& c, int defIndex, int limb, bool toWood, int inset,
-                    std::string& why) {
+                    std::string& why, std::string* parts = nullptr) {
   MobSystem& mobs = c.mobs;
   mobs.Reset();
   c.debris.Reset();
   const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, inset));
   if (!id) { why = "spawn refused"; return -1; }
   mobs.SetMobBehavior(id, "dummy");
-  const uint32_t bleedMat = mobs.Defs()[defIndex].bleedMat;
+  // EVERY LIQUID it leaks, not only the def's `bleed.material`: since
+  // materials.h bleedFluid a wooden stump on a man leaks SYRUP, and counting
+  // his blood alone would score it 0 and pass without measuring anything.
+  auto isFluid = [&](uint32_t m) {
+    return m != 0 && m < c.mats.size() && c.mats[m].gpu.klass == CLASS_LIQUID;
+  };
   // DIRECT PHASE CALLS ON PURPOSE (W2-O): the subject is the stump's bleed,
   // which Mob::BleedTick (inside PreTick) pays; nothing else is wanted.
   int count = 0;
+  // WHICH EMITTER paid it: micro droplets (gout + spray), whole voxels (the
+  // sever's throw), paint ops (the stump's drip). A bare total cannot say
+  // why one stump pays a twentieth of another at the same woundScale.
+  int nMicro = 0, nWhole = 0, nOps = 0, nOther = 0;
   auto tick = [&](uint32_t t, bool measure) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -2359,9 +2368,14 @@ int SeverBleedCount(Ctx& c, int defIndex, int limb, bool toWood, int inset,
     mobs.PostStep();
     if (!measure) return;
     for (const ParticleSpawn& p : spawns)
-      if ((p.payload & 0xFFFu) == bleedMat) count++;
+      if (isFluid(p.payload & 0xFFFu)) {
+        count++;
+        ((p.flags & kPFlagMicro) ? nMicro : nWhole)++;
+      } else {
+        nOther++;
+      }
     for (const BrushOp& o : ops)
-      if (o.material == bleedMat) count += 1 + 6 * o.radius;
+      if (isFluid(o.material)) { count += 1 + 6 * o.radius; nOps++; }
   };
   for (int i = 0; i < 8; i++) tick(3000u + (uint32_t)i, false);
   if (toWood) {
@@ -2379,9 +2393,27 @@ int SeverBleedCount(Ctx& c, int defIndex, int limb, bool toWood, int inset,
           if (m != wood && mobs.LimbMaterialCount(id, l, m))
             mobs.RewriteLimbMaterial(id, l, m, wood, 1u << 30);
   }
+  int parentLimb = -1;
+  {
+    const MobDef& dd = mobs.Defs()[defIndex];
+    for (size_t i = 0; i < dd.limbs.size(); i++)
+      if (dd.limbs[i].name == dd.limbs[limb].parent) parentLimb = (int)i;
+  }
   mobs.Sever(id, limb);
+  const float budget0 = parentLimb >= 0 ? mobs.LimbBleedBudget(id, parentLimb) : -1.0f;
+  const bool open0 = parentLimb >= 0 && mobs.LimbWoundOpen(id, parentLimb);
   const int kTicks = (int)BaselineNumber("woodBleedSeverTicks", 90);
-  for (int i = 0; i < kTicks; i++) tick(3100u + (uint32_t)i, true);
+  int closedAt = -1;
+  for (int i = 0; i < kTicks; i++) {
+    tick(3100u + (uint32_t)i, true);
+    if (closedAt < 0 && parentLimb >= 0 && !mobs.LimbWoundOpen(id, parentLimb))
+      closedAt = i;
+  }
+  if (parts)
+    *parts = Format("[micro %d, whole %d, ops %d, other spawns %d; stump "
+                    "budget %.1f open %d, closed at tick %d]",
+                    nMicro, nWhole, nOps, nOther, budget0, open0 ? 1 : 0,
+                    closedAt);
   mobs.Reset();
   c.debris.Reset();
   return count;
@@ -2419,19 +2451,164 @@ Status GateWoodBleed(Ctx& c, std::string& detail) {
     ok = ok && sap >= 0.0f && sap / flesh <= maxRatio;
   }
   // ---- the amputation: gout, thrown voxels and the stump's drip ----
-  const int sevFlesh = SeverBleedCount(c, human, limb, false, 445, why);
-  const int sevWood = SeverBleedCount(c, human, limb, true, 445, why);
+  std::string pFlesh, pWood, pDeku;
+  const int sevFlesh = SeverBleedCount(c, human, limb, false, 445, why, &pFlesh);
+  const int sevWood = SeverBleedCount(c, human, limb, true, 445, why, &pWood);
   RecordObserved("woodBleedSeverFlesh", (double)sevFlesh);
   RecordObserved("woodBleedSeverWood", (double)sevWood);
-  detail += Format(" | severed forearm: flesh %d, wood %d", sevFlesh, sevWood);
+  detail += Format(" | severed forearm: flesh %d %s, wood %d %s", sevFlesh,
+                   pFlesh.c_str(), sevWood, pWood.c_str());
   ok = ok && sevFlesh > 0 && sevWood >= 0 &&
        (float)sevWood / (float)sevFlesh <= maxRatio;
   if (deku >= 0) {
     const int dl = LimbNamed(mobs.Defs()[deku], "armL.R");
-    const int sevDeku = dl >= 0 ? SeverBleedCount(c, deku, dl, false, 445, why) : -1;
+    const int sevDeku = dl >= 0 ? SeverBleedCount(c, deku, dl, false, 445, why, &pDeku) : -1;
     RecordObserved("woodBleedSeverDeku", (double)sevDeku);
-    detail += Format(", deku %d", sevDeku);
+    detail += Format(", deku %d %s", sevDeku, pDeku.c_str());
     ok = ok && sevDeku >= 0 && (float)sevDeku / (float)sevFlesh <= maxRatio;
+  }
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- A WOUND LEAKS WHAT IT OPENED (2026-09-29, materials.h bleedFluid) ------
+//
+// The FLUID is the matter's, like the amount (`wood-bleed` above): struck
+// voxel -> the limb's majority -> the creature's `bleed.material`. So a human
+// whose forearm has become wood leaks syrup from it, a sylvan that grew a
+// flesh forearm bleeds blood from it, and when either is cut OFF each end of
+// the cut leaks its own: the stump what the upper arm is made of, the piece
+// what the forearm is. Six arms on the same blade and the same forearm:
+//   cut   human as is -> blood      human turned to wood -> syrup
+//         deku as is  -> syrup      deku turned to flesh -> blood
+//   sever human, wooden forearm -> stump blood, piece syrup
+//         deku, flesh forearm   -> stump syrup, piece blood
+// Every cut arm also counts what the body EMITTED for 60 ticks after the cut
+// (droplets + paint ops), which must be all the expected fluid and none of
+// the other: the wound state and the emitters agree, not just the state.
+struct FluidProbe {
+  uint32_t wound = 0;      // the cut limb's wound fluid (or the stump's)
+  uint32_t piece = 0;      // sever: the severed piece's debris bleed material
+  int want = 0, other = 0; // emitted voxels of the expected / any other liquid
+  bool ok = false;
+};
+
+FluidProbe ProbeBleedFluid(Ctx& c, int defIndex, int limb, uint32_t rewriteTo,
+                           bool sever, uint32_t expect, std::string& why) {
+  FluidProbe r;
+  MobSystem& mobs = c.mobs;
+  mobs.Reset();
+  c.debris.Reset();
+  const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, 445));
+  if (!id) { why = "spawn refused"; return r; }
+  mobs.SetMobBehavior(id, "dummy");
+  auto isFluid = [&](uint32_t m) {
+    return m != 0 && m < c.mats.size() && c.mats[m].gpu.klass == CLASS_LIQUID;
+  };
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing, then the body's own
+  // bleed (Mob::BleedTick inside PreTick) and nothing else.
+  auto tick = [&](uint32_t t, bool measure) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(t, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+    if (!measure) return;
+    for (const ParticleSpawn& p : spawns) {
+      const uint32_t m = p.payload & 0xFFFu;
+      if (isFluid(m)) (m == expect ? r.want : r.other)++;
+    }
+    for (const BrushOp& o : ops)
+      if (isFluid(o.material)) (o.material == expect ? r.want : r.other) += 1;
+  };
+  for (int i = 0; i < 8; i++) tick(3000u + (uint32_t)i, false);
+  if (rewriteTo) {
+    for (uint32_t m = 1; m < (uint32_t)c.mats.size(); m++)
+      if (m != rewriteTo && mobs.LimbMaterialCount(id, limb, m))
+        mobs.RewriteLimbMaterial(id, limb, m, rewriteTo, 1u << 30);
+    if (mobs.LimbMaterialCount(id, limb, rewriteTo) == 0) {
+      why = "the forearm was not rewritten";
+      return r;
+    }
+  }
+  if (sever) {
+    const MobDef& dd = mobs.Defs()[defIndex];
+    int parent = -1;
+    for (size_t i = 0; i < dd.limbs.size(); i++)
+      if (dd.limbs[i].name == dd.limbs[limb].parent) parent = (int)i;
+    const uint64_t pieceBody = mobs.LimbBody(id, limb);
+    mobs.Sever(id, limb);
+    r.wound = parent >= 0 ? mobs.LimbWoundFluid(id, parent) : 0u;
+    r.piece = c.debris.BodyBleedMat(pieceBody);
+  } else {
+    const LimbAxis ax = MeasureLimb(mobs, id, limb);
+    std::vector<ParticleSpawn> spawns;
+    CutOnce(mobs, c.world, id, limb, ax, ax.reach * 0.5f, 6.0f, 0.6f,
+            0x0B1EEDu, spawns);
+    if (!mobs.LimbBody(id, limb)) { why = "the forearm came off"; return r; }
+    r.wound = mobs.LimbWoundFluid(id, limb);
+  }
+  for (int i = 0; i < 60; i++) tick(3100u + (uint32_t)i, true);
+  mobs.Reset();
+  c.debris.Reset();
+  r.ok = true;
+  return r;
+}
+
+Status GateBleedFluid(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  auto mat = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t blood = mat("blood"), syrup = mat("syrup"), wood = mat("wood"),
+                 flesh = mat("flesh");
+  if (!blood || !syrup || !wood || !flesh) {
+    detail = "blood / syrup / wood / flesh missing from materials.json";
+    return Status::Fail;
+  }
+  // The data the whole rule rests on, checked by name before any body: flesh
+  // DERIVES blood from its rubble, wood AUTHORS syrup, bone has no opinion.
+  const uint32_t bone = mat("bone");
+  const bool data = c.mats[flesh].bleedFluid == blood &&
+                    c.mats[wood].bleedFluid == syrup &&
+                    (!bone || c.mats[bone].bleedFluid == 0);
+  const int human = mobs.FindDef("human");
+  const int deku = mobs.FindDef("deku");
+  if (human < 0) { detail = "no `human` def"; return Status::Fail; }
+  auto name = [&](uint32_t m) {
+    return m && m < c.mats.size() ? c.mats[m].name : std::string("none");
+  };
+  std::string why;
+  bool ok = data;
+  detail = data ? "" : "[DATA: flesh/wood/bone bleedFluid wrong] ";
+  auto arm = [&](const char* label, int def, uint32_t rewrite, bool sever,
+                 uint32_t expectWound, uint32_t expectPiece) {
+    const int limb = LimbNamed(mobs.Defs()[def], "armL.R");
+    if (limb < 0) { detail += Format("%s: no armL.R; ", label); ok = false; return; }
+    const FluidProbe r = ProbeBleedFluid(c, def, limb, rewrite, sever,
+                                         expectWound, why);
+    const bool good = r.ok && r.wound == expectWound &&
+                      (!sever || r.piece == expectPiece) && r.want > 0 &&
+                      r.other == 0;
+    detail += Format("%s: wound %s", label, name(r.wound).c_str());
+    if (sever) detail += Format(", piece %s", name(r.piece).c_str());
+    detail += Format(", emitted %d/%d stray%s; ", r.want, r.other,
+                     good ? "" : r.ok ? " [WRONG]" : (" [" + why + "]").c_str());
+    ok = ok && good;
+  };
+  arm("human", human, 0, false, blood, 0);
+  arm("human wood-arm", human, wood, false, syrup, 0);
+  arm("human wood-arm severed", human, wood, true, blood, syrup);
+  if (deku >= 0) {
+    arm("deku", deku, 0, false, syrup, 0);
+    arm("deku flesh-arm", deku, flesh, false, blood, 0);
+    arm("deku flesh-arm severed", deku, flesh, true, syrup, blood);
+  } else {
+    detail += "(no deku def: sylvan arms skipped)";
   }
   return ok ? Status::Pass : Status::Fail;
 }
@@ -2474,6 +2651,7 @@ const std::vector<Gate>& ImpactGates() {
       {"bite-limbs", "mob", {}, false, GateBiteLimbs, false},
       {"joint-rot", "mob", {}, false, GateJointRot, false},
       {"wood-bleed", "mob", {}, false, GateWoodBleed, false},
+      {"bleed-fluid", "mob", {}, false, GateBleedFluid, false},
       {"mob-race", "mob", {}, false, GateMobRace, false},
   };
   return g;

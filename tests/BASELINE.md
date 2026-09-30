@@ -795,3 +795,25 @@ Hash unchanged (5cede91d); twice-run reproduces after each package.
 - `corpse-splatter` fails only in per-file subsets; passes standalone on both
   exes (subset artifact). `mob-loot` 'rose with 0' and `ai-pursue`: identical
   before conversion (subset artifacts).
+
+## 2026-09-30 — `a00b3523` → `9bd138e9` (the weather-driven wind field, docs/RESEARCH_wind.md §13)
+
+Intentional; the twice-run comparison reproduces (gas digest `fee71d33`,
+reproduced) and the suite reports 0 page faults. Every stage of the package
+changes what `windAtQ` returns, so the CA drift bias, the particle drag and
+the MPM node force all see a different field:
+
+- the gust bands advect DOWNWIND with the air (they ran upwind), the base
+  wavelength is 8 m (was 4.8) and the evolution rate 0.35 rad/s (was 1.1);
+- `windSinQ`'s correction square no longer overflows i32 above |sin| 0.707;
+- the ramp is profile(height above ground) x exposure x altitude, from the
+  terrain table the tick now carries (`wf*`, TickParams grew 16 KiB);
+- the regime (sky-driven intensity / gale / convective) sets meander,
+  thermals, coupling, gustiness, the lee rotor, slope and sea breezes and the
+  storm timeline, whose front and downbursts are wind primitives;
+- saltation is threshold-plus-power, `windEntrainSpeed` 2 → 1.2 m/s.
+
+New gate `wind-field` recorded `pass` (CPU-only; it asserts the model's
+behaviour, see selftest_wind.cpp). The smoke probe tables were NOT re-pinned
+(owner directive: no smoke runs for a sim change); expect `--vk-smoke*` to
+report moved probes until someone runs `--vk-smoke-loud --rebaseline`.

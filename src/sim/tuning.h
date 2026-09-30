@@ -3083,11 +3083,22 @@ struct Tuning {
     // Entrainment (windMode 2): the per-axis wind speed that just lifts a grain
     // whose windFriction is 1; the threshold scales with the authored nibble,
     // so friction 4 needs four times this. Bagnold's fluid threshold, authored.
+    // 1.2 m/s (was 2 until 2026-09-30): sand (friction 5, derived from its
+    // density) lifts at 6 m/s AT THE GRAIN, the observed 5-7 m/s near the
+    // ground; the height profile puts a grain at ~0.3x the reference wind.
     float windEntrainSpeed = TPD(sim, windEntrainSpeed);
     // ...and how often a grain over that threshold actually hops, in chances
     // per second. This is the bound (rule 2): entrainment is a rate, not a
     // certainty, so a dune creeps instead of exploding.
     float windEntrainRate = TPD(sim, windEntrainRate);
+    // THRESHOLD PLUS POWER (2026-09-30). Saltation does not switch on at a
+    // threshold and run at a flat rate: sand flux grows roughly with the CUBE
+    // of the excess over the threshold. The hop chance is windEntrainRate x
+    // min(excess / (threshold x windEntrainSpan), 1)^windEntrainPower, so a
+    // wind just over the line barely creeps and one at (1 + span) x the line
+    // runs at the full rate. Still bounded by the rate (rule 2).
+    float windEntrainPower = TPD(sim, windEntrainPower);
+    float windEntrainSpan = TPD(sim, windEntrainSpan);
 
     // ---- dev force multipliers, one per TIER ----
     // NO_WGSL rows in tuning_params.def, and that is deliberate rather than
@@ -3516,8 +3527,9 @@ struct Tuning {
   //     to the shader each frame. Their tuning_params.def rows are NO_WGSL
   //     because a compile-time constant cannot drift over minutes, which is
   //     exactly what weather has to do.
-  //   * gustWavelength / gustSpeed / altitudeGain / altitudeRefY / dbgWind*
-  //     are WGSL rows and const-fold into every shader (F5).
+  //   * gustWavelength / gustSpeed / dbgWind* are WGSL rows and const-fold
+  //     into every shader (F5). Everything added by the 2026-09-30 wind
+  //     overhaul is CPU-side and rides the wf* block (windfield.h): live.
   //
   // Phase 1 is render-only: the two foliage sway sites and the debug overlay.
   // The CA does not read wind until phase 4, which is gated behind
@@ -3548,24 +3560,167 @@ struct Tuning {
 
     // ---- field shape (mirrored in tuning_params.def as TUNE_WIND_*) ----
     // Distance between gust crests along the wind, metres. Short wavelengths
-    // read as a rippling meadow; long ones as slow rolling swells. 4.8 m
-    // reproduces the spatial frequency the sway code shipped with.
+    // read as a rippling meadow; long ones as slow rolling swells. 8 m since
+    // 2026-09-30 (was 4.8, the old sway code's): the fronts now ride the wind,
+    // so a crest passes a point at U / wavelength — 0.8 Hz in a 6 m/s breeze
+    // at 8 m, where 4.8 m flickered at 1.3 Hz.
     float gustWavelength = TPD(wind, gustWavelength);
-    // Rate of the gust bands. This is the field's clock, shared by every
-    // consumer — see the note on render.microSwaySpeed, which is now only a
+    // EVOLUTION rate of the gust bands, rad/s — how fast the pattern changes
+    // shape in the frame moving WITH the air. Since 2026-09-30 the fronts are
+    // carried downwind by the advection clock (gustAdvect below); this is no
+    // longer what moves them, and at the old 1.1 it made the bands run
+    // upwind. Shared by every consumer — render.microSwaySpeed is only a
     // foliage-local trim on top of it.
     float gustSpeed = TPD(wind, gustSpeed);
-    // Fractional wind speed-up per 100 world voxels (10 m) above altitudeRefY.
-    // SIGNED both ways: below the reference the boundary layer slows the wind,
-    // which is why a valley floor is calmer than the ridge above it. Clamped
-    // in the shader to [0.15x, 4x] so a silly value is still a look.
-    float altitudeGain = TPD(wind, altitudeGain);
-    // World Y the altitude ramp is measured from. 64 sits mid-terrain
-    // (worldgen's band is y32..y86), so ridges get a gain and basins a loss.
-    // Absolute Y rather than terrain-relative on purpose: terrain-relative
-    // needs a height query at every sample point, and absolute is what makes
-    // the field a pure function of position (research doc §8).
-    float altitudeRefY = TPD(wind, altitudeRefY);
+    // How fast the gust FRONTS travel, as a fraction of the reference mean
+    // wind (docs/RESEARCH_wind.md §13.1). 1.0 is physical: the pattern is
+    // frozen into the moving air and crosses the meadow downwind at the mean
+    // speed, so a stronger wind means more frequent gusts at a point with the
+    // wavelength unchanged. gustSpeed above is then only the slow EVOLUTION of
+    // the pattern in the air's own frame. CPU-side (windfield.h AdvPhase), live.
+    float gustAdvect = TPD(wind, gustAdvect);
+    // ---- the height/terrain ramp (CPU-side; windfield.cpp; live) ----
+    // ramp = profile(height above ground) x exposure(x, z) x absTerm(y),
+    // docs/RESEARCH_wind.md §13.2. Replaced altitudeGain/altitudeRefY
+    // (2026-09-30), which ramped on ABSOLUTE Y from y = 64 while the map's
+    // ground sits near y = 200 — every player stood in 1.8x the wind.
+    //
+    // Log-law profile ln(h / roughness + 1) / ln(profileRef / roughness + 1),
+    // clamped to [profileFloor, profileCap]. roughness is z0 in metres (grass
+    // ~0.03); profileRef is the height, metres, where the mean wind equals the
+    // authored speed — about chest height, so "the wind speed" is the wind you
+    // stand in. profileNeutral is used outside the table's 204.8 m coverage.
+    float roughness = TPD(wind, roughness);
+    float profileRef = TPD(wind, profileRef);
+    float profileFloor = TPD(wind, profileFloor);
+    float profileCap = TPD(wind, profileCap);
+    float profileNeutral = TPD(wind, profileNeutral);
+    // Fractional speed-up per 100 m above sea level. Small: the only term
+    // that still reads absolute altitude, and the only one past the table.
+    float absGain = TPD(wind, absGain);
+    // Exposure = 1 + gain x clamp(TPI / tpiScale, -1, 1). TPI (topographic
+    // position) is the ground minus the mean ground within tpiRadius metres.
+    // A hill's speed-up is ~2H/L; with tpiScale = tpiRadius / 2 a gain of 1
+    // is exactly that. Ridge and hollow gains are separate and blended from
+    // light to strong wind by the regime intensity: in light wind hollows are
+    // strongly sheltered and ridges barely faster; in strong wind the ridge
+    // speed-up approaches 2H/L. exposureDepth (m) fades it with height.
+    float tpiRadius = TPD(wind, tpiRadius);
+    float tpiScale = TPD(wind, tpiScale);
+    float ridgeLight = TPD(wind, ridgeLight);
+    float ridgeStrong = TPD(wind, ridgeStrong);
+    float valleyLight = TPD(wind, valleyLight);
+    float valleyStrong = TPD(wind, valleyStrong);
+    float exposureDepth = TPD(wind, exposureDepth);
+    // Radius, metres, of the water fraction stored per table cell: the signal
+    // the sea/lake breeze blows along (stage 4).
+    float seaRadius = TPD(wind, seaRadius);
+    // ---- the weather REGIME (CPU-side; WindWeatherQ; live) ----
+    // Pin a named wind regime (assets/wind/regimes.json: calm, light, breezy,
+    // windy, gale, thunderstorm, ...) or "auto" to let the sky drive it. The
+    // F1 preset picker writes this. Live.
+    std::string regime = TPD(wind, regime);
+    // Manual intensity override, 0..1 (~ Beaufort / 12); below 0 = off. Beats
+    // the sky and a pinned regime alike, so it is the one slider that always
+    // answers "what does THIS strength look like". Live.
+    float intensity = TPD(wind, intensity);
+    // How far the wind's own ~68 s epoch draw swings the sky's intensity, +-
+    // this fraction: the sky sets the day, the epochs set the hour.
+    float moodSpread = TPD(wind, moodSpread);
+    // The intensity -> mean speed curve, as multiples of windSpeed: piecewise
+    // linear through (0, calm), (0.3, 1.0), (0.75, gale), (1, max). windSpeed
+    // is therefore the mean at intensity 0.3 — a breezy day, and the manual
+    // default — at the reference height.
+    float speedCalmMul = TPD(wind, speedCalmMul);
+    float speedGaleMul = TPD(wind, speedGaleMul);
+    float speedMaxMul = TPD(wind, speedMaxMul);
+    // Stability. The day phase makes the air convective by day (sun) and stable
+    // at night, damped by cloud cover; wind MIXES that away, linearly to zero at
+    // this intensity — a gale is neutral day and night.
+    float mixIntensity = TPD(wind, mixIntensity);
+    // In stable air (a calm night) the air near the ground partly stops
+    // following the air above: the surface wind is scaled by 1 - this x
+    // stability at the ground, returning to 1 by decoupleHeight metres.
+    float stableDecouple = TPD(wind, stableDecouple);
+    float decoupleHeight = TPD(wind, decoupleHeight);
+    // Gust amplitude as a fraction of the mean, light -> strong wind, before
+    // gustStrength. Peak gust ~ mean x (1 + this): 1.5x in strong wind.
+    // gustConvective adds to it in light convective (sunny) air, galeGust is
+    // what a gale converges to.
+    float gustLight = TPD(wind, gustLight);
+    float gustStrong = TPD(wind, gustStrong);
+    float gustConvective = TPD(wind, gustConvective);
+    float galeGust = TPD(wind, galeGust);
+    // Direction MEANDER: a slow, spatially coherent heading perturbation,
+    // +- this many degrees in light wind and in strong wind, with a period
+    // (s) and a spatial wavelength (m). galeHold is the fraction a gale
+    // suppresses it by — a gale holds its heading.
+    float wanderLight = TPD(wind, wanderLight);
+    float wanderStrong = TPD(wind, wanderStrong);
+    float wanderPeriod = TPD(wind, wanderPeriod);
+    float wanderWavelength = TPD(wind, wanderWavelength);
+    float galeHold = TPD(wind, galeHold);
+    // Thermals: a small ISOTROPIC gust term (m/s at full convection) with its
+    // own cell size (m) and period (s). Present only in convective air.
+    float thermalGust = TPD(wind, thermalGust);
+    float thermalWavelength = TPD(wind, thermalWavelength);
+    float thermalPeriod = TPD(wind, thermalPeriod);
+    // LEE TURBULENCE: past leeOnset intensity, the lee slope of a steep drop
+    // (ground descending downwind steeper than leeSlope) gets a gust boost
+    // (leeGust) and some reverse flow (leeReverse), in a layer leeDepth
+    // metres deep. leeStrength scales it all.
+    float leeOnset = TPD(wind, leeOnset);
+    float leeStrength = TPD(wind, leeStrength);
+    float leeSlope = TPD(wind, leeSlope);
+    float leeDepth = TPD(wind, leeDepth);
+    float leeReverse = TPD(wind, leeReverse);
+    float leeGust = TPD(wind, leeGust);
+    // LOCAL WINDS on light-wind days (docs/RESEARCH_wind.md §13.4). Slope winds:
+    // up the table's slope by day at up to slopeWind m/s (x convective
+    // stability), down it at night at slopeNight x that (katabatic), in a layer
+    // slopeDepth metres deep. The sea/lake breeze: onshore by day along the
+    // water-fraction gradient at up to seaBreeze m/s, offshore at night at
+    // seaNight x that, seaDepth metres deep. Both fade to nothing as the mean
+    // wind rises past localFade m/s.
+    float slopeWind = TPD(wind, slopeWind);
+    float slopeNight = TPD(wind, slopeNight);
+    float slopeDepth = TPD(wind, slopeDepth);
+    float seaBreeze = TPD(wind, seaBreeze);
+    float seaNight = TPD(wind, seaNight);
+    float seaDepth = TPD(wind, seaDepth);
+    float localFade = TPD(wind, localFade);
+    // THE THUNDERSTORM TIMELINE (§13.4): cycles of stormCycle seconds weighted
+    // by the regime's convective input. A lull to stormLull x the mean, the
+    // gust front (heading jumps ~stormJump degrees, mean spikes to stormFront x),
+    // decay to stormDecay x, then gusty decay home with the gust fraction
+    // raised by stormGust. The front sweeps across as a wind-primitive jet
+    // (stormFrontJet) and stormBursts downbursts of stormBurstRadius metres
+    // land near the window, all positioned from seed + tick.
+    float stormCycle = TPD(wind, stormCycle);
+    float stormLull = TPD(wind, stormLull);
+    float stormFront = TPD(wind, stormFront);
+    float stormDecay = TPD(wind, stormDecay);
+    float stormGust = TPD(wind, stormGust);
+    float stormJump = TPD(wind, stormJump);
+    int stormBursts = TPD(wind, stormBursts);
+    float stormBurstRadius = TPD(wind, stormBurstRadius);
+    bool stormFrontJet = TPD(wind, stormFrontJet);
+    // GUST STREAKS (wind_streak.wgsl; render-only, never hashed; live through
+    // RenderParams, no F5). streakAlpha is the master visibility: 0 records
+    // neither the update pass nor the draw. A streak is born only where the
+    // gust excess (the bands along the local mean, plus primitives) passes
+    // streakThreshold m/s, with certainty by threshold + streakSpan; it lives
+    // streakLife s within streakRadius m of the camera, drawn as a ribbon of
+    // streakTrail points pushed every streakSpacing s, streakWidth m wide.
+    float streakAlpha = TPD(wind, streakAlpha);
+    int streakCount = TPD(wind, streakCount);
+    float streakThreshold = TPD(wind, streakThreshold);
+    float streakSpan = TPD(wind, streakSpan);
+    int streakTrail = TPD(wind, streakTrail);
+    float streakSpacing = TPD(wind, streakSpacing);
+    float streakLife = TPD(wind, streakLife);
+    float streakRadius = TPD(wind, streakRadius);
+    float streakWidth = TPD(wind, streakWidth);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a

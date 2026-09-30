@@ -1435,6 +1435,13 @@ struct MobLimb {
   // throws are all scaled by it. Set by Sever() from the matter at the cut --
   // a wooden stump (a sylvan's, or an arm turned to wood) gouts a fifth.
   float woundScale = 1.0f;
+  // WHAT THIS LIMB'S OPEN WOUND LEAKS (materials.h bleedFluid): blood, syrup,
+  // ichor -- decided by the matter the wound opened, set wherever the wound
+  // is (Damage, CarveLimb, Sever, the fall) through Mob::NoteWoundFluid, and
+  // read by every emitter of it (the drip, the spray, the gout, the thrown
+  // voxels, the drag smear, the splatter). 0 = not decided: Mob::WoundFluid
+  // falls back to the limb's census. Cleared when the wound has closed.
+  uint32_t woundFluid = 0;
   // HIT FLASH: a briefly-lit limb, in LINEAR HDR units, added on top of the
   // material's own emission by the micro-body pass at shade time.
   //
@@ -2340,6 +2347,34 @@ class Mob {
   float MaterialHardness(uint32_t mat) const;
   // materials.json `bleed` of `mat`: how much a wound in it bleeds, 1 = flesh.
   float BleedWeightOf(uint32_t mat) const;
+  // ---- WHAT A WOUND LEAKS (materials.h bleedFluid) -------------------------
+  // ONE chain, and every emitter goes through it: the STRUCK MATTER's fluid,
+  // else the LIMB's majority fluid (FluidTally over voxels with an opinion),
+  // else the creature's authored `bleed.material`. So a limb that became wood
+  // leaks syrup and a sylvan's grafted flesh arm bleeds blood without a line
+  // of creature- or race-specific code; a new tissue is one JSON key. All
+  // return 0 for a creature with no `bleed` block and for a bloodless limb.
+  //
+  // The material's own opinion, 0 = none (bone, hair, an art slot).
+  uint32_t OwnFluidOf(uint32_t mat) const;
+  // What `mat` leaks when opened on limb `limbIndex`: its own fluid, else the
+  // limb's (LimbFluid).
+  uint32_t FluidAt(int limbIndex, uint32_t mat) const;
+  // The limb's majority fluid, else the creature's. A census of its
+  // authoritative lattice: called at wound events, never per voxel per tick.
+  uint32_t LimbFluid(int limbIndex) const;
+  // The fluid the limb's open wound leaks (MobLimb::woundFluid), else
+  // LimbFluid.
+  uint32_t WoundFluid(int limbIndex) const;
+  // The whole body's majority fluid (a fall splat has no one limb).
+  uint32_t BodyFluid() const;
+  // A wound of `fluid` is being opened or widened by `added` budget: it takes
+  // the wound over when it is the bigger share (or the wound had none).
+  // Called BEFORE the budget is added.
+  static void NoteWoundFluid(MobLimb& limb, uint32_t fluid, float added) {
+    if (fluid != 0 && (limb.woundFluid == 0 || added >= limb.bleedBudget))
+      limb.woundFluid = fluid;
+  }
   // ShellResponseOf(hardness of the struck voxel, cause) for a worn slot.
   ShellResponse ShellResponseAt(int limbIndex, Vec3 worldPos,
                                 const DamageCtx& ctx) const;
@@ -4022,6 +4057,11 @@ class Mob {
   // creature's wound material if the palette can draw it, else its blood, else
   // nothing. One function because three call sites wanted the same chain.
   uint32_t DefaultSmearMat() const;
+  // ...and the smear for a wound leaking `fluid` (WoundFluid / LimbFluid): the
+  // creature's own chain above when it is the creature's own blood, else the
+  // fluid itself when the palette can draw it -- a wooden stump on a man is
+  // sticky with syrup, not painted with his blood. 0 = nothing to smear.
+  uint32_t SmearMatFor(uint32_t fluid) const;
   // ---- and the other half: the soak DRIES BACK TO FLESH -------------------
   // BurnLimbView::ReviveFn over one limb's `woundWas` table. A raw function
   // pointer for the same reason WornAlong is one: the view is rebuilt per limb
@@ -6765,6 +6805,10 @@ class MobSystem {
   // question. -1 for an unknown id or limb, so a gate cannot read "no such
   // creature" as "dry".
   float LimbBleedBudget(uint64_t mobId, int limbIndex) const;
+  // The fluid limb `limbIndex`'s wound leaks (Mob::WoundFluid) and the limb's
+  // own census (Mob::LimbFluid); 0 for an unknown id or limb, or no blood.
+  uint32_t LimbWoundFluid(uint64_t mobId, int limbIndex) const;
+  uint32_t LimbTissueFluid(uint64_t mobId, int limbIndex) const;
   // ---- A LIMB'S WOUND, THE WAY A GATE ASKS A DEBRIS BODY'S -----------------
   // (PLAN_corpse_is_a_mob.md: a corpse's limbs are a dead Mob's now, and the
   // corpse gates ask them what they used to ask DebrisSystem.) Open = the
@@ -7276,6 +7320,7 @@ class MobSystem {
   std::vector<float> coatRestore_, coatRestoreRate_;
   std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
   std::vector<float> matBleed_;       // MaterialDef::bleed (wound bleed weight)
+  std::vector<uint32_t> matFluid_;    // MaterialDef::bleedFluid (0 = no opinion)
   std::vector<int32_t> coatContact_;  // MaterialDef::coatContact (-1 = stain chance)
   // (MobSystem::CoatBeneath -- "a corrosive coat displaces one that is not;
   // anything displaces a washer's wetness" -- is now the class clause of the

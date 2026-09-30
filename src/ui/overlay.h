@@ -149,6 +149,21 @@ struct UIState {
   // notices the air at all.
   float windDragRef = 40.0f;
   bool windTuningDirty = false;
+  // ---- the wind readout (F1 -> World -> Wind & weather) ------------------
+  // Filled by the frame loop from windfield::Probe — the C++ mirror of the
+  // sim's windAtQ — at the player's head, so "what is the wind here, and
+  // why" has numbers: the regime, the ramp's pieces, the terms. Readout only.
+  struct WindReadout {
+    bool valid = false;
+    int source = 0;
+    float intensity = 0, gale = 0, convective = 0, stability = 0, coupling = 1;
+    float refSpeed = 0, gustAmp = 0, gustFrac = 0, headingDeg = 0, localHeadingDeg = 0;
+    float totalMs = 0, meanMs = 0, gustExcess = 0, extraMs = 0;
+    float haglM = 0, groundY = 0, profile = 0, exposure = 0, expMul = 1, ramp = 1, leeMean = 1;
+    float wanderDeg = 0, thermalMs = 0, slopeMs = 0, seaMs = 0;
+    float stormPhase = -1, envelope = 1, jumpDeg = 0;
+    uint32_t terrQueries = 0;
+  } wind;
   // ---- placing a wind PRIMITIVE by hand (docs/RESEARCH_wind.md §4.3) ------
   // The dev-panel producer, and the reason it exists is that the gameplay
   // producers are content: a fan is a spell glyph or a prefab tag, and neither

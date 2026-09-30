@@ -1,0 +1,17 @@
+{
+  "about": "Named WIND REGIMES: presets of the three inputs that set the wind's character (docs/RESEARCH_wind.md 13.3). intensity is 0..1, roughly Beaufort / 12, and sets the mean speed through wind.speed*Mul; gale and convective are 0..1 weights of the sustained-gale and thunderstorm characters. Sky presets (assets/weather/*.json) name one of these in their \"wind\" field and the sky's ladder blends them; wind.regime pins one directly (F1 -> Wind -> Weather). Add a regime by adding a row: nothing in C++ switches on a name.",
+  "regimes": [
+    {"name": "calm", "label": "Calm", "intensity": 0.05, "gale": 0, "convective": 0,
+     "about": "Near still. Smoke rises almost vertically, hollows go dead still, the heading wanders freely."},
+    {"name": "light", "label": "Light air", "intensity": 0.16, "gale": 0, "convective": 0,
+     "about": "Light breeze. Leaves rustle; on a sunny day thermals and slope winds are as strong as the breeze itself."},
+    {"name": "breezy", "label": "Breezy", "intensity": 0.32, "gale": 0, "convective": 0,
+     "about": "A gentle-to-moderate breeze, the default day: grass leaning and rippling, gust fronts crossing the meadow."},
+    {"name": "windy", "label": "Windy day", "intensity": 0.52, "gale": 0, "convective": 0,
+     "about": "Fresh-to-strong breeze. Ridges noticeably windier, hollows still sheltered, gusts ~1.5x the mean."},
+    {"name": "gale", "label": "Gale", "intensity": 0.78, "gale": 1, "convective": 0,
+     "about": "Sustained gale: a steady direction, gust factor ~1.5, turbulence in the lee of steep drops, sand on the move."},
+    {"name": "thunderstorm", "label": "Thunderstorm", "intensity": 0.5, "gale": 0, "convective": 1,
+     "about": "A convective storm cycle: a calm lull, then the gust front (a direction jump and a 2-3x speed spike, downbursts), then gusty decay."}
+  ]
+}

@@ -93,6 +93,7 @@ namespace {
 #define PIPE_RAY_START_MIN   Pipe::RayStartMin
 #define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
 #define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
+#define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark
@@ -198,6 +199,7 @@ namespace {
 #define C_RAYSTART  Cond::RayStart
 #define C_RAINMAP   Cond::RainMap
 #define C_RAINEXPO  Cond::RainExpo
+#define C_STREAKS   Cond::WindStreaks
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_RAINFALL  (uint32_t)DispatchSel::RainFallSel
@@ -231,6 +233,7 @@ namespace {
 #define D_CLOUDGY         (uint32_t)DispatchSel::CloudGy
 #define D_RSGX            (uint32_t)DispatchSel::RayStartGx
 #define D_RSGY            (uint32_t)DispatchSel::RayStartGy
+#define D_STREAKGX        (uint32_t)DispatchSel::StreakGx
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 
 // ---- expansion 1: the rows -----------------------------------------------

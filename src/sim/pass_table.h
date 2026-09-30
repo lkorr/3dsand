@@ -218,6 +218,10 @@ enum class Buf : uint8_t {
   // in full on every tick that can read it, so it is not hashed or saved (it
   // is a pure function of the grid and TickParams at that point of the tick).
   RainExpo,
+  // The gust streaks' particle pool (wind_streak.wgsl). Read-modify-written by
+  // the per-frame `wind_streak` row and read by the streak draw's VERTEX stage
+  // in the same command buffer; render-only, never hashed.
+  WindStreaks,
   ShadowArgsStage,
   ShadowArgs,
   // ---- the openness (sky-visibility) grid (world.h kOpenFaces) ----
@@ -399,6 +403,7 @@ enum class Pipe : uint8_t {
   // The rain shadow map (rain_map.wgsl), per-FRAME rows on the ShadowCache
   // table, after the clouds (the prep reads the env pass's wind probe).
   RainMapPrep, RainMapBuild,
+  WindStreak,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
@@ -557,6 +562,9 @@ enum class Cond : uint8_t {
   // gated by EncodeShadowResolve returning early; now that the table also
   // carries the clouds, the gate has to be a row condition.
   ShadowCacheOn,
+  // WindStreaks: the gust streaks' update row (RecordCtx::streakGx > 0, i.e.
+  // wind.streakAlpha > 0 and a nonzero pool). Off = no row and no draw.
+  WindStreaks,
   // RayStart: the ray-start map's two rows (RecordCtx::rayStartGx > 0, i.e.
   // a world pass has sized its buffer). Off = no row, and the raymarch's
   // key check reads the stale key as "not this frame" and marches from
@@ -662,6 +670,8 @@ enum class DispatchSel : uint32_t {
   // with the same integer formulas the kernels bound themselves by ----
   RainFallSel,
   RainExpoSel,
+  // ---- the gust streaks: one 64-thread workgroup per 64 live slots ----
+  StreakGx,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
 };
 
@@ -820,6 +830,8 @@ struct RecordCtx {
   // is never 0 (it runs every tick: rain or drying); rainExpo's is 0 on a
   // tick with neither rain nor wetness, which leaves its row unrecorded.
   uint32_t rainFallGroups = 64, rainExpoGroups = 0;
+  // Workgroups over the live streak pool; 0 = streaks off (Cond::WindStreaks).
+  uint32_t streakGx = 0;
 };
 
 }  // namespace pass

@@ -84,7 +84,7 @@
 // read-only here: cloud.wgsl's `weather` / `env` write it (the probe words).
 @group(0) @binding(15) var<storage, read> cloudMaps : array<u32>;
 @group(0) @binding(19) var<storage, read> farOcc : array<u32>;
-@group(0) @binding(22) var<storage, read_write> rainMap : array<u32>;
+@group(0) @binding(23) var<storage, read_write> rainMap : array<u32>;
 
 // ---- layout (raymarch.wgsl rainMapHeight reads the same) ----------------------
 // [0] frame stamp (C.frame of the prep that wrote it)   [1] flags (1 = live)

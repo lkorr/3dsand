@@ -140,6 +140,7 @@ PIPE_TO_MEMBER = {
     "PIPE_RAIN_MAP_PREP": "rainMapPrep_",
     "PIPE_RAIN_MAP_BUILD": "rainMapBuild_",
     "PIPE_RAIN_EXPO": "rainExpo_",
+    "PIPE_WIND_STREAK": "windStreak_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
     "PIPE_FLUID_ALLOC": "fluidAlloc_",
@@ -219,6 +220,8 @@ BUF_TO_WGSL = {
     "RayStart": {"rayStart"},
     "RainMap": {"rainMap"},
     "RainExpo": {"rainExpo"},
+    # The streak DRAW's read-only view (`streaksR`, renderBGL_ 33) is not a row.
+    "WindStreaks": {"streaks"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
     # The clouds (cloud.wgsl). CloudUBO is `C` there; the raymarcher and the

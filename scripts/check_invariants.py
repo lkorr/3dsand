@@ -996,6 +996,75 @@ def check_wind_prims():
             f"stride past the primitive it is decoding")
 
 
+# ------------------------------------------------------- wind field mirror
+def check_wind_mirror():
+    """windfield.cpp's C++ mirror of windAtQ must use the shader's constants.
+
+    The mirror (windfield.h Probe / ProbeMany) drives the F1 wind readout and
+    the `wind-field` gate. It is a transcription of the integer field in
+    common.wgsl, and nothing compares the two at run time -- so the literals
+    that define each function's shape are held equal here: the integer sine's
+    0.225 correction and its STAGED square (the unstaged one overflowed i32
+    until 2026-09-30 and clipped every gust above 0.707), the meander's
+    0.65 / 0.35 mix and 3/5 cross frequency, the thermal's 0.4 updraft and
+    83/100 z frequency, and the table decode's /127 and /255.
+    """
+    cw = read("assets/shaders/common.wgsl")
+    cpp = read("src/sim/windfield.cpp")
+    if not cw or not cpp:
+        return
+    pairs = [
+        ("14746 * (sq - y)", "14746 * (sq - y)", "windSinQ's 0.225 correction"),
+        ("((ay >> 1u) * (ay >> 1u)) / 16384", "(ay >> 1) * (ay >> 1)), 16384",
+         "windSinQ's staged square"),
+        ("wq(42598, sa) + wq(22938, sc)", "Mwq(42598, sa) + Mwq(22938, sc)",
+         "the meander's 0.65 / 0.35 mix"),
+        ("(k * 3) / 5", "(k * 3) / 5", "the meander's cross frequency"),
+        ("(k * 83) / 100", "(k * 83) / 100", "the thermal's z frequency"),
+        ("wq(26214, windSinQ", "Mwq(26214, MirrorSinQ", "the thermal's 0.4 updraft"),
+        ("(es * 64) / 127", "(es * 64) / 127", "the exposure decode"),
+        ("* 64) / 255", "* 64) / 255", "the water-fraction decode"),
+        ("max(s0 >> 8u, 1)) * 256", "std::max(s0 >> 8, 1)) * 256", "the lee ratio staging"),
+    ]
+    checked.append("wind mirror")
+    for w, c, what in pairs:
+        if w not in cw:
+            problems.append(f"common.wgsl no longer contains `{w}` ({what}) -- if the "
+                            f"integer wind field changed, change windfield.cpp's mirror "
+                            f"in the same edit and update this check")
+        if c not in cpp:
+            problems.append(f"windfield.cpp's windAtQ mirror no longer contains `{c}` "
+                            f"({what}) -- it has drifted from common.wgsl")
+
+
+def check_wind_streak():
+    """wind_streak.wgsl's pool layout must match world.h's.
+
+    The C++ sizes and zeroes the buffer from kWindStreakCap x kWindStreakStride
+    and clamps the trail knob to kWindStreakTrail; the shader strides by
+    STREAK_STRIDE and wraps its ring at STREAK_TRAIL_MAX. A mismatch reads the
+    next slot's rows as this slot's trail -- streaks that jump between each
+    other, with no error anywhere.
+    """
+    wh = read("src/sim/world.h")
+    ws = read("assets/shaders/wind_streak.wgsl")
+    if not wh or not ws:
+        return
+    t = re.search(r"constexpr\s+uint32_t\s+kWindStreakTrail\s*=\s*(\d+)", wh)
+    st = re.search(r"constexpr\s+uint32_t\s+kWindStreakStride\s*=\s*(\d+)", wh)
+    gt = re.search(r"const\s+STREAK_TRAIL_MAX\s*:\s*u32\s*=\s*(\d+)u", ws)
+    gs = re.search(r"const\s+STREAK_STRIDE\s*:\s*u32\s*=\s*(\d+)u", ws)
+    if not (t and st and gt and gs):
+        problems.append("wind streak layout: could not find kWindStreakTrail/Stride in "
+                        "world.h or STREAK_TRAIL_MAX/STREAK_STRIDE in wind_streak.wgsl")
+        return
+    checked.append("wind streaks")
+    if t.group(1) != gt.group(1) or st.group(1) != gs.group(1):
+        problems.append(f"world.h kWindStreakTrail/Stride = {t.group(1)}/{st.group(1)} but "
+                        f"wind_streak.wgsl STREAK_TRAIL_MAX/STREAK_STRIDE = "
+                        f"{gt.group(1)}/{gs.group(1)} -- the pool's rows would misalign")
+
+
 def check_water_ledger():
     """The water-body ledger's word map lives in THREE places, positionally.
 
@@ -2851,6 +2920,8 @@ ALL = {
     "perfscopes": check_perf_scope_notes,
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
+    "windmirror": check_wind_mirror,
+    "windstreak": check_wind_streak,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,
     "counts": check_tick_counts,
@@ -2913,7 +2984,9 @@ RELEVANT = {
     "scripts/test_environment.mjs": ["envpred"],
     "src/sim/materials.h": ["reactgate", "coatflame", "reactfx"],
     "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx"],
-    "assets/shaders/common.wgsl": ["stainprec", "powdermass"],
+    "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror"],
+    "src/sim/windfield.cpp": ["windmirror"],
+    "assets/shaders/wind_streak.wgsl": ["windstreak"],
     "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],
 }

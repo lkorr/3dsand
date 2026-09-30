@@ -149,4 +149,31 @@ inline uint32_t BamFromDegrees(double deg) {
   return (uint32_t)((uint64_t)v & 0xFFFFFFFFull);
 }
 
+/**
+ * log2 of a Q16.16 value, Q16.16 out, exact for a given input. `x` must be
+ * > 0; x = 65536 (1.0) gives 0. The integer part is the position of the top
+ * bit; the fraction is the classic bit-by-bit squaring loop on a Q30 mantissa
+ * in [1, 2): square it, and if it reached 2 that bit of the log is set and the
+ * mantissa halves. Sixteen iterations for sixteen fraction bits. No float, no
+ * libm — the wind profile's log-law is built from this so the lookup table the
+ * sim reads is the same integers on every machine.
+ */
+inline int32_t Log2Q16(uint64_t x) {
+  if (x == 0) return INT32_MIN;
+  int msb = 63;
+  while (((x >> msb) & 1u) == 0) msb--;
+  const int32_t ip = msb - 16;
+  // Mantissa in Q30, [2^30, 2^31).
+  uint64_t m = msb >= 30 ? (x >> (msb - 30)) : (x << (30 - msb));
+  int32_t frac = 0;
+  for (int b = 15; b >= 0; b--) {
+    m = (m * m) >> 30;
+    if (m >= (2ull << 30)) {
+      m >>= 1;
+      frac |= (1 << b);
+    }
+  }
+  return ip * 65536 + frac;
+}
+
 }  // namespace imath

@@ -787,6 +787,14 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (!(d.bareBlood == d.bareBlood)) d.bareBlood = 0.0f;   // NaN
     d.bleed = std::clamp(m.value("bleed", 1.0f), 0.0f, 4.0f);
     if (!(d.bleed == d.bleed)) d.bleed = 1.0f;               // NaN
+    // The fluid a wound in this leaks, by name; resolved (and derived from
+    // `rubble` when absent) after the whole table exists -- LoadMaterials.
+    if (m.contains("bleedFluid")) {
+      if (m["bleedFluid"].is_string())
+        d.bleedFluidName = m["bleedFluid"].get<std::string>();
+      else if (m["bleedFluid"].is_boolean() && !m["bleedFluid"].get<bool>())
+        d.bleedFluidOff = true;
+    }
     // 0 intact / 1 half / 2 whole (materials.h burnStage). Clamped, like the
     // weights above: a silly number should misbehave visibly, not refuse.
     d.burnStage = (uint8_t)std::clamp(m.value("burnStage", 0), 0, 2);
@@ -1746,6 +1754,26 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
                   d.molten + "\"\n";
       else
         d.gpu.molten = (uint32_t)id;
+    }
+  }
+  // WHAT A WOUND IN EACH LEAKS (materials.h bleedFluid): authored by name,
+  // else derived from a LIQUID rubble (flesh crumbles to blood, so it bleeds
+  // blood), else no opinion. A named fluid that is not a liquid is refused:
+  // a wound cannot drip stone.
+  for (auto& d : m) {
+    d.bleedFluid = 0;
+    if (d.bleedFluidOff) continue;
+    if (!d.bleedFluidName.empty()) {
+      const int id = FindMaterial(m, d.bleedFluidName);
+      if (id <= 0 || m[id].gpu.klass != CLASS_LIQUID)
+        errors += materialsPath + ": material \"" + d.name +
+                  "\": bleedFluid \"" + d.bleedFluidName +
+                  "\" is not a liquid material\n";
+      else
+        d.bleedFluid = (uint32_t)id;
+    } else if (!d.rubble.empty()) {
+      const int id = FindMaterial(m, d.rubble);
+      if (id > 0 && m[id].gpu.klass == CLASS_LIQUID) d.bleedFluid = (uint32_t)id;
     }
   }
   CheckPinnedMaterialIds(m, materialsPath, errors);

@@ -188,7 +188,7 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 // ShadowCache table's rain_map rows; read by the rain overlay (which drops are
 // drawn) and the near-field wet shading. Trusted only when its header is this
 // frame's (rainMapHeader) -- otherwise both fall back to the openness path.
-@group(0) @binding(33) var<storage, read> rainMap : array<u32>;
+@group(0) @binding(34) var<storage, read> rainMap : array<u32>;
 // world.h's kSol* values (scripts/check_invariants.py `solute` checks these
 // against world.h too -- they are NOT the sim's MIRROR block, which needs
 // atomics and solMeta that a fragment stage must not bind).

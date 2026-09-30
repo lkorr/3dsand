@@ -169,6 +169,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::RainMap:       return (cx.cloudFlags & 8u) != 0u;
     // ...and only when the CA runs: its rainExposed is the one reader.
     case pass::Cond::RainExpo:      return cx.rainExpoGroups > 0 && cx.caActive;
+    case pass::Cond::WindStreaks:   return cx.streakGx > 0;
   }
   return false;
 }
@@ -214,6 +215,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::RayStartGy: return cx.rayStartGy;
     case pass::DispatchSel::RainFallSel: return cx.rainFallGroups;
     case pass::DispatchSel::RainExpoSel: return cx.rainExpoGroups;
+    case pass::DispatchSel::StreakGx: return cx.streakGx;
     default:                          return v;
   }
 }
