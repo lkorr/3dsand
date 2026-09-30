@@ -1775,6 +1775,9 @@ void Overlay::DrawDevWorld(UIState& s) {
       changed |= EditableSliderFloat("spawn threshold##wnd", &w.streakThreshold, 0.0f, 20.0f, "%.1f m/s");
       ImGui::SetItemTooltip("A streak is born only where the gust excess (bands along the mean,\n"
                             "plus primitives) passes this. Calm days show nothing.");
+      changed |= EditableSliderFloat("spawn span##wnd", &w.streakSpan, 0.1f, 30.0f, "%.1f m/s");
+      ImGui::SetItemTooltip("Excess above the threshold at which every spawn attempt succeeds;\n"
+                            "also how bright a streak is.");
       changed |= ImGui::SliderInt("trail points##wnd", &w.streakTrail, 2, (int)kWindStreakTrail);
       changed |= EditableSliderFloat("trail spacing##wnd", &w.streakSpacing, 0.01f, 0.2f, "%.3f s");
       changed |= EditableSliderFloat("lifetime##wnd", &w.streakLife, 0.2f, 6.0f, "%.1f s");

@@ -355,6 +355,10 @@ class Simulation {
   // The gust streaks (wind_streak.wgsl): `count` pool slots, `trail` points
   // each. Zero count is skipped outright; see WindStreakDrawCount.
   void DrawWindStreaks(const rhi::RenderPass& pass, uint32_t count, uint32_t trail);
+  // Kill every streak (zero the pool, lifetime 0 = never spawned). For a
+  // harness that pinned a windy regime and must not leave its streaks, frozen,
+  // in the frames that follow.
+  void ClearWindStreaks();
   // The current field's arrows (docs/PLAN_water_master.md component 8).
   void DrawCurrentField(const rhi::RenderPass& pass, uint32_t arrows);
   // Body cubes: vertices per instance (three camera-facing faces, see

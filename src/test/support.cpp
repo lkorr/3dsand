@@ -863,15 +863,30 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     // units. The frame's dt is measured here, on the MAIN view only — an aux
     // view (the portrait) is written with dt 0, so the per-frame update the
     // table records after it advances the pool once, not twice.
+    //
+    // A main view may be written TWICE in one frame — the portrait path
+    // rewrites it after its own aux write, and that rewrite is what the frame's
+    // update row reads. Keyed on `time`, a same-instant rewrite repeats the
+    // frame's dt (and frame number) instead of measuring 0 since itself, which
+    // froze the streaks whenever the character screen was open. Repeated
+    // ONCE: a harness rendering many frames at one pinned time must not keep
+    // re-applying the dt its first frame measured.
     {
       const Tuning::Wind& tw = tun.wind;
       static float lastTime = -1.0f;
+      static float repeatDt = 0.0f;
       static uint32_t frame = 0;
       float dt = 0.0f;
       if (!auxView) {
-        if (lastTime >= 0.0f) dt = std::clamp(time - lastTime, 0.0f, 0.1f);
-        lastTime = time;
-        frame++;
+        if (time != lastTime) {
+          dt = lastTime >= 0.0f ? std::clamp(time - lastTime, 0.0f, 0.1f) : 0.0f;
+          repeatDt = dt;
+          lastTime = time;
+          frame++;
+        } else {
+          dt = repeatDt;
+          repeatDt = 0.0f;
+        }
       }
       const float cells = 1.0f / kVoxelMeters;
       rp.streakA[0] = std::clamp(tw.streakAlpha, 0.0f, 1.0f);

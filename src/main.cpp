@@ -1836,6 +1836,11 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     windShot("screenshot_wind_gale.bmp", "gale", false);
     windShot("screenshot_wind_gale_arrows.bmp", "gale", true);
     windShot("screenshot_wind_calm.bmp", "calm", false);
+    // The frames below pin one time, so their update rows see dt 0 and never
+    // age a streak out: whatever the gale left alive (all of it, when the calm
+    // frame was filtered out) would be drawn, frozen, into every later shot —
+    // screenshot_ground's eye is 0.6 m from this one.
+    sim.ClearWindStreaks();
   }
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");

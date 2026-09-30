@@ -94,16 +94,29 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // ---- advect by THE field ----
   let w = windAt(h0.xyz, R.time, &R);
-  let p = h0.xyz + w * dt;
-  h0 = vec4f(p, h0.w + dt);
+  let p0 = h0.xyz;
+  let a0 = h0.w;
+  let p = p0 + w * dt;
+  h0 = vec4f(p, a0 + dt);
   var head = u32(h1.z) % trail;
-  var timer = h1.w + dt;
+  // Push a trail point every `spacing` seconds — AS MANY as fell inside this
+  // frame, each placed where the streak was at that instant along the frame's
+  // step. One push per frame made a frame longer than `spacing` (anything
+  // under 1 / spacing = 40 fps at the default) stretch the ribbon to
+  // trail x dt: the same gust drew a longer streak on a slower machine.
+  // Only the newest `trail` of them are written: older ones would be
+  // overwritten within this same frame anyway.
   let spacing = max(R.streakB.y, 1e-3);
-  if (timer >= spacing) {
-    timer = min(timer - spacing, spacing);
+  let total = h1.w + dt;
+  let cnt = u32(floor(total / spacing));
+  for (var k = select(0u, cnt - trail, cnt > trail); k < cnt; k++) {
+    // How long before the frame's end the streak passed push k.
+    let ago = total - spacing * f32(k + 1u);
+    let f = clamp(1.0 - ago / dt, 0.0, 1.0);
     head = (head + 1u) % trail;
-    streaks[base + 2u + head] = vec4f(p, h0.w);
+    streaks[base + 2u + head] = vec4f(mix(p0, p, f), a0 + dt * f);
   }
+  let timer = min(total - spacing * f32(cnt), spacing);
   // Out of the pool's reach, or into the ground: done (age = life).
   let d = p.xz - R.camPos.xz;
   var dead = dot(d, d) > radius * radius * 1.69;
@@ -148,21 +161,34 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   let sdir = s1 - s0;
   let slen = length(sdir);
   if (slen < 1e-4) { return out; }            // not pushed yet: no segment
+  // Every cull below is decided for the WHOLE segment, from both ends, before
+  // any vertex is placed. Per-vertex culls put a culled corner at clip
+  // (0, 0, 0, 1) while its triangle's other corners stay put — a sliver from
+  // the streak to the middle of the screen.
+  let rel0 = s0 - R.camPos;
+  let rel1 = s1 - R.camPos;
+  if (min(dot(rel0, R.camFwd), dot(rel1, R.camFwd)) <= 2.0) { return out; }  // behind / at the eye
+  let sd = sdir / slen;
+  let pl0 = length(cross(sd, normalize(rel0)));
+  let pl1 = length(cross(sd, normalize(rel1)));
+  if (min(pl0, pl1) < 1e-4) { return out; }   // seen end-on: no width to give it
   // Same expansion as debug_wind.wgsl: (s0-, s0+, s1-), (s1-, s0+, s1+).
   let atEnd = (v == 2u || v == 3u || v == 5u);
   let side = select(-1.0, 1.0, (v == 1u || v == 3u || v == 4u));
   let q = select(s0, s1, atEnd);
-  let rel = q - R.camPos;
+  let rel = select(rel0, rel1, atEnd);
   let dist = length(rel);
-  if (dot(rel, R.camFwd) <= 2.0) { return out; }   // behind / at the eye
-  var perp = cross(sdir / slen, rel / max(dist, 1e-4));
-  let pl = length(perp);
-  if (pl < 1e-4) { return out; }
-  perp = perp / pl;
+  let perp = cross(sd, rel / dist) / select(pl0, pl1, atEnd);
   // 0 at the head, 1 at the tail.
   let kf = f32(select(seg, seg + 1u, atEnd)) / f32(trail - 1u);
-  let pxWorld = max(dist, 0.001) * R.tanHalfFov * 2.0 / max(R.viewPx, 1.0);
-  let width = max(R.streakB.z * (1.0 - 0.7 * kf), pxWorld * 0.6);
+  let pxWorld = dist * R.tanHalfFov * 2.0 / max(R.viewPx, 1.0);
+  // Never thinner than ~a pixel (a thinner ribbon drops in and out of the
+  // raster as it moves) — but a ribbon WIDENED to that floor is dimmed by the
+  // same factor, so a distant wisp keeps the brightness its real width earns
+  // instead of reading as a bold line.
+  let want = R.streakB.z * (1.0 - 0.7 * kf);
+  let width = max(want, pxWorld * 0.6);
+  let cover = want / width;
   out.pos = projectView(rel + perp * (side * width), R);
   let lf = h0.w / h1.x;
   let life = smoothstep(0.0, 0.15, lf) * (1.0 - smoothstep(0.55, 1.0, lf));
@@ -171,10 +197,16 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   let near = smoothstep(10.0, 40.0, dist);
   let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w, length(q.xz - R.camPos.xz));
   let fog = exp(-dist * VOXEL_METERS * R.fogDensity);
-  out.alpha = clamp(R.streakA.x * h1.y * (1.0 - kf) * life * near * far * fog, 0.0, 1.0);
-  // White, dimmed with the light: a streak is lit air, not a lamp.
-  let lit = clamp(R.dayWeight * 0.85 + R.moonLit * 0.25 + 0.08, 0.08, 1.0);
-  out.color = vec3f(0.92, 0.95, 1.0) * lit;
+  // Tapered at BOTH ends: fading in over the first segment behind the head
+  // and out toward the tail. A full-alpha head was a blunt cap, which reads
+  // as a comet (a thing) rather than a wisp (moving air).
+  let shape = min(kf * f32(trail - 1u), 1.0) * (1.0 - kf);
+  out.alpha = clamp(R.streakA.x * h1.y * shape * cover * life * near * far * fog, 0.0, 1.0);
+  // The same translucent white day and night (owner call, 2026-09-30). It was
+  // dimmed with the light (down to 0.08 at night), and a dark colour blended
+  // at the streak's alpha reads as a BLACK line over a moonlit scene, not as
+  // faint air. Visibility is the alpha's job; the colour stays constant.
+  out.color = vec3f(0.92, 0.95, 1.0);
   return out;
 }
 

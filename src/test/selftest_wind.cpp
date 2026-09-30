@@ -955,17 +955,22 @@ Status GateWindField(Ctx& c, std::string& detail) {
     // Two ticks: the crest moves ~U * dt, a few cells at any sane wind, well
     // inside half the base band's wavelength (the search below is limited to
     // that half-period, or a pure sinusoid's shift is ambiguous mod lambda:
-    // +12 and -36 cells are the same shift for a 48-cell wave).
+    // +12 and -36 cells were the same shift for the old 48-cell wave).
     const uint32_t dt = 2;
     windfield::ProbeMany(t, seed, tick, kWindNoDayPhase, o3, xyz.data(), kN, a.data());
     windfield::ProbeMany(t, seed, tick + dt, kWindNoDayPhase, o3, xyz.data(), kN, b.data());
-    // The shift that best maps a onto b: b(x) = a(x - s).
+    // The shift that best maps a onto b: b(x) = a(x - s). The window is
+    // [kMargin, kN - kMargin), so |s| must stay under kMargin or a[i - s]
+    // reads outside the probe row — which a wavelength over ~9.8 m (the
+    // knob goes to 60) used to do.
+    const int kMargin = 48;
     int best = 0;
     double bestC = -1e30;
-    const int half = std::max(2, (int)(0.5f * t.wind.gustWavelength / kVoxelMeters) - 1);
+    const int half = std::clamp((int)(0.5f * t.wind.gustWavelength / kVoxelMeters) - 1, 2,
+                                kMargin - 1);
     for (int s = -half; s <= half; s++) {
       double cc = 0;
-      for (int i = 48; i < kN - 48; i++) cc += (double)b[i].band1 * a[i - s].band1;
+      for (int i = kMargin; i < kN - kMargin; i++) cc += (double)b[i].band1 * a[i - s].band1;
       if (cc > bestC) { bestC = cc; best = s; }
     }
     const float v = (float)best / ((float)dt / 30.0f) * (float)kVoxelMeters;   // m/s along +X

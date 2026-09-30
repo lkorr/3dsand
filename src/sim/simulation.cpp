@@ -4211,6 +4211,13 @@ void Simulation::DrawWindField(const rhi::RenderPass& pass, uint32_t arrows) {
   pass.Draw(18, arrows);
 }
 
+void Simulation::ClearWindStreaks() {
+  if (!windStreakBuf_) return;
+  const size_t words = (1u + (size_t)kWindStreakCap * kWindStreakStride) * 4u;
+  std::vector<uint32_t> zero(words, 0u);
+  device_.GetQueue().WriteBuffer(windStreakBuf_, 0, zero.data(), zero.size() * 4);
+}
+
 void Simulation::DrawWindStreaks(const rhi::RenderPass& pass, uint32_t count,
                                  uint32_t trail) {
   if (count == 0 || trail < 2 || !windStreakDraw_) return;   // off: not even a bind
