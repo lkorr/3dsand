@@ -70,6 +70,13 @@ struct Preset {
   // ---- the world under it ----
   float mist = 0.0f;        // extra ground fog, x the base fog density (+1)
   float lightning = 0.0f;   // mean flashes per minute (0 = never)
+
+  // ---- the wind under it ----
+  // A wind REGIME by name (assets/wind/regimes.json), resolved at load into
+  // the three numbers below. ONE WEATHER: the sky's ladder blends these the
+  // way it blends coverage, so a storm sky blows a storm and fog is calm.
+  std::string wind = "breezy";
+  float windIntensity = 0.32f, windGale = 0.0f, windConvective = 0.0f;
 };
 
 // The weather for one frame, resolved and blended. What WriteRenderParams and
@@ -100,6 +107,8 @@ Preset Lerp(const Preset& a, const Preset& b, float t);
 // from these in integers only — see SimRainWord.
 struct PresetQ {
   int64_t weight = 0, coverage = 0, precip = 0, precipType = 0;
+  // The wind regime this sky blows (Preset::wind, resolved), Q16.
+  int64_t windI = 0, windG = 0, windC = 0;
 };
 
 class Library {
@@ -183,6 +192,21 @@ uint32_t TakeTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
 // The word the last SimRainWord call returned — a readout for the dev panel,
 // never an input to anything.
 uint32_t LastSimRainWord();
+
+// THE SKY'S WIND: the regime the scheduled (or pinned) sky blows at `tick`,
+// Q16 — intensity, gale, convective, and the coverage the stability term
+// reads. The same integer ladder SimRainWord walks (ScheduledQ), so the wind
+// and the rain are one weather. False when the sky does not drive anything
+// (weather.clouds off, or no presets) — the wind then falls back to its own
+// epochs. A pure function of (tuning, presets, seed, tick, the pin): the
+// wind's advection clock samples it at arbitrary past ticks.
+bool SimWindRegime(const Tuning& t, uint32_t seed, uint32_t tick,
+                   int32_t& intensity, int32_t& gale, int32_t& convective,
+                   int32_t& cover);
+
+// A fingerprint of everything SimWindRegime reads, so a cache of the wind's
+// history (windfield.h AdvPhase) can tell that the sky's schedule changed.
+uint64_t SimWindFingerprint(const Tuning& t);
 
 // The last State Resolve returned, for the dev panel's readout and the gate.
 const State& Last();

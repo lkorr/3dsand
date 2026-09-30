@@ -11,6 +11,7 @@
 
 #include "sim/rng.h"
 #include "sim/tuning.h"
+#include "sim/windfield.h"
 #include "test/support.h"  // AssetDir(): the one asset-path chokepoint
 
 namespace weather {
@@ -78,6 +79,7 @@ bool ReadPreset(const std::string& path, Preset& p, std::string& err) {
   num("precipType", p.precipType, 0.0f, 1.0f);
   num("mist", p.mist, 0.0f, 20.0f);
   num("lightning", p.lightning, 0.0f, 60.0f);
+  if (j.contains("wind") && j["wind"].is_string()) p.wind = j["wind"].get<std::string>();
   if (p.label.empty()) p.label = p.name;
   return true;
 }
@@ -335,6 +337,9 @@ PresetQ ScheduledQ(const SimTuneQ& q, const std::vector<PresetQ>& ps, int pinned
   o.coverage = LerpQ(ps[a].coverage, ps[b].coverage, t);
   o.precip = LerpQ(ps[a].precip, ps[b].precip, t);
   o.precipType = LerpQ(ps[a].precipType, ps[b].precipType, t);
+  o.windI = LerpQ(ps[a].windI, ps[b].windI, t);
+  o.windG = LerpQ(ps[a].windG, ps[b].windG, t);
+  o.windC = LerpQ(ps[a].windC, ps[b].windC, t);
   return o;
 }
 
@@ -413,10 +418,29 @@ void Library::EnsureLoaded() {
     return a.name < b.name;
   });
   for (const std::string& w : warnings_) std::fprintf(stderr, "weather: %s\n", w.c_str());
+  // Each sky's wind regime, by name (assets/wind/regimes.json). An unknown
+  // name is a warning, not a failure: the sky keeps the breezy default.
+  for (Preset& p : presets_) {
+    const windfield::Regime* r = windfield::FindRegime(p.wind);
+    if (r) {
+      p.windIntensity = r->intensity;
+      p.windGale = r->gale;
+      p.windConvective = r->convective;
+    } else {
+      warnings_.push_back("weather/" + p.name + ".json: unknown wind regime '" + p.wind +
+                          "' (assets/wind/regimes.json); using breezy");
+      std::fprintf(stderr, "weather: %s\n", warnings_.back().c_str());
+    }
+  }
   // The sim's quantised copy, parallel and in the same (sorted) order.
   presetsQ_.clear();
-  for (const Preset& p : presets_)
-    presetsQ_.push_back({Q16(p.weight), Q16(p.coverage), Q16(p.precip), Q16(p.precipType)});
+  for (const Preset& p : presets_) {
+    PresetQ q{Q16(p.weight), Q16(p.coverage), Q16(p.precip), Q16(p.precipType)};
+    q.windI = Q16(p.windIntensity);
+    q.windG = Q16(p.windGale);
+    q.windC = Q16(p.windConvective);
+    presetsQ_.push_back(q);
+  }
 }
 
 const std::vector<Preset>& Library::Presets() {
@@ -437,6 +461,7 @@ const Preset* Library::Find(const std::string& name) {
 }
 
 void Library::Reload() {
+  windfield::ReloadRegimes();
   loaded_ = false;
   EnsureLoaded();
   gEasedValid = false;
@@ -603,6 +628,44 @@ uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
 }
 
 uint32_t LastSimRainWord() { return gLastSimWord; }
+
+bool SimWindRegime(const Tuning& tn, uint32_t seed, uint32_t tick, int32_t& intensity,
+                   int32_t& gale, int32_t& convective, int32_t& cover) {
+  EnsureEnvPin();
+  if (!tn.weather.clouds) return false;
+  const std::vector<Preset>& ps = Presets().Presets();
+  const std::vector<PresetQ>& pq = Presets().PresetsQ();
+  if (ps.empty()) return false;
+  const SimTuneQ q = QuantiseTuning(tn);
+  int pinned = 0;
+  for (int i = 0; i < (int)ps.size(); i++)
+    if (ps[i].name == tn.weather.preset) pinned = i;
+  const Preset* ov = gOverride.empty() ? nullptr : Presets().Find(gOverride);
+  const PresetQ now = ov ? pq[(size_t)(ov - ps.data())]
+                         : ScheduledQ(q, pq, pinned, seed, (int64_t)tick);
+  intensity = (int32_t)ClampQ(now.windI);
+  gale = (int32_t)ClampQ(now.windG);
+  convective = (int32_t)ClampQ(now.windC);
+  cover = (int32_t)ClampQ(now.coverage + Q16(tn.weather.coverageBias));
+  return true;
+}
+
+uint64_t SimWindFingerprint(const Tuning& tn) {
+  EnsureEnvPin();
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](const void* p, size_t n) {
+    const auto* b = (const unsigned char*)p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+  };
+  const Tuning::Weather& w = tn.weather;
+  const int64_t v[] = {w.clouds ? 1 : 0, w.autoCycle ? 1 : 0, Q16(w.epochMinutes),
+                       Q16(w.cycleSpeed), (int64_t)w.seedOffset, Q16(w.coverageBias)};
+  mix(v, sizeof v);
+  mix(w.preset.data(), w.preset.size());
+  mix(gOverride.data(), gOverride.size());
+  for (const PresetQ& p : Presets().PresetsQ()) mix(&p, sizeof p);
+  return h;
+}
 
 uint32_t LatchTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
   gRainLatchWord = SimRainWord(tn, seed, tick);

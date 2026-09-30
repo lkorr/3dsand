@@ -14,5 +14,6 @@
   "precip": 0.75,
   "precipType": 0.0,
   "mist": 1.4,
-  "lightning": 0.3
+  "lightning": 0.3,
+  "wind": "windy"
 }

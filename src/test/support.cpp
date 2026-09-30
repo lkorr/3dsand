@@ -827,7 +827,7 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // here and (phase 4) in TickParams, so the renderer and the CA cannot end up
   // in different weather.
   {
-    const WindState wind = WindWeather(tun, rp.seed, tick);
+    const WindState wind = WindWeather(tun, rp.seed, tick, DayPhaseNow(tick));
     rp.windDir[0] = wind.dirX;
     rp.windDir[1] = wind.dirZ;
     rp.windSpeed = wind.speed;
@@ -1214,7 +1214,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // so a per-gate SetCurrentTuning moves it without a pipeline rebuild.
   {
     const Tuning& wtun = CurrentTuning();
-    const WindStateQ wq = WindQuantize(WindWeather(wtun, seed, tick));
+    const WindStateQ wq = WindQuantize(WindWeather(wtun, seed, tick, DayPhaseNow(tick)));
     tp.windDirQ[0] = wq.dirX;
     tp.windDirQ[1] = wq.dirZ;
     tp.windSpeedQ = wq.speed;

@@ -2539,6 +2539,11 @@ struct WindSample {
   amp   : f32,     // gust amplitude, cells/s, altitude ramp applied
   ramp  : f32,     // the height/terrain ramp that scaled both (readouts)
   hagl  : f32,     // height above ground, voxels (0 outside the table)
+  // The regime's additive terms in world space, cells/s: thermals and (stage
+  // 4) the slope and sea/lake breezes. windMeanWS adds them, so every
+  // consumer that reads the mean — the sway, the arrows, the streaks — sees
+  // them without knowing they exist.
+  extra : vec3f,
 };
 
 // ================= THE HEIGHT/TERRAIN RAMP (research doc §13.2) ============
@@ -2673,6 +2678,64 @@ fn windRampF(p : vec3f, R : ptr<uniform, RenderParams>) -> WindRampF {
   return o;
 }
 
+// ====================== THE REGIME'S FIELD TERMS (§13.3) ===================
+// Three per-sample terms the weather regime switches on, float here and in
+// integers beside windAtQ. Their strengths ride the wf* block, so a calm
+// gale-free day evaluates each as one compare against zero.
+//
+//   MEANDER  the mean heading rotated by a slow, spatially coherent angle:
+//            +-45 deg in light air, +-12 in strong wind, held by a gale. Two
+//            waves, one along the wind and one across it, on a CPU clock.
+//            It turns the MEAN and the band frame; the gust PHASE keeps the
+//            weather heading (turning it too would put a far-from-origin
+//            sample's phase through kilometres of K x |p| x dtheta).
+//   THERMAL  a small isotropic gust with a little updraft, in convective air
+//            only: every direction, cells ~25 m across, cycling ~14 s.
+//   LEE      past the regime's lee onset, a slope falling away downwind
+//            steeper than wfLeeSlopeQ gets a gust boost and reverse flow in a
+//            layer wfLeeDepth thick — the rotor under a cliff edge. Read from
+//            the table's own bilinear gradient: no extra lookups.
+//
+// ROTATION CONVENTION: (x, z) -> (x c + z s, z c - x s) turns a heading by
+// +theta (0 = +Z, increasing toward +X), the same the CPU's storm jump uses.
+
+const WIND_TAU_BAM : f32 = 6.28318531 / 65536.0;
+
+fn windWanderF(p : vec3f, d : vec2f, R : ptr<uniform, RenderParams>) -> vec2f {
+  if ((*R).wfWanderAmp <= 0) { return d; }
+  let amp = f32((*R).wfWanderAmp) * WIND_TAU_BAM;
+  let k = f32((*R).wfWanderK) * WIND_TAU_BAM;
+  let ph = f32((*R).wfWanderPhase) * WIND_TAU_BAM;
+  let a = dot(p.xz, d) * k;
+  let c = dot(p.xz, vec2f(-d.y, d.x)) * k * 0.6;
+  let th = amp * (0.65 * sin(a + ph) + 0.35 * sin(c - ph + 1.7));
+  let cs = cos(th);
+  let sn = sin(th);
+  return vec2f(d.x * cs + d.y * sn, d.y * cs - d.x * sn);
+}
+
+fn windThermalF(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if ((*R).wfThermalQ <= 0) { return vec3f(0.0); }
+  let a = f32((*R).wfThermalQ) * (1.0 / 65536.0);
+  let k = f32((*R).wfThermalK) * WIND_TAU_BAM;
+  let ph = f32((*R).wfThermalPhase) * WIND_TAU_BAM;
+  let fx = p.x * k;
+  let fz = p.z * k * 0.83;
+  return vec3f(sin(fx + ph), 0.4 * sin(fx + fz + ph + 2.2), sin(fz - ph + 1.3)) * a;
+}
+
+// (mean multiplier, gust multiplier) of the lee rotor at a sample.
+fn windLeeF(rp : WindRampF, dl : vec2f, R : ptr<uniform, RenderParams>) -> vec2f {
+  if ((*R).wfLeeQ <= 0 || rp.tr.edge <= 0.0) { return vec2f(1.0); }
+  let lee = f32((*R).wfLeeQ) * (1.0 / 65536.0);
+  let sa = rp.tr.gx * dl.x + rp.tr.gz * dl.y;   // < 0: the ground falls away downwind
+  let s0 = max(f32((*R).wfLeeSlopeQ) * (1.0 / 65536.0), 1e-3);
+  let l = lee * clamp((-sa - s0) / s0, 0.0, 1.0) *
+          (1.0 - min(rp.hagl / f32(max((*R).wfLeeDepth, 1)), 1.0)) * rp.tr.edge;
+  return vec2f(1.0 - l * (1.0 + f32((*R).wfLeeRevQ) * (1.0 / 65536.0)),
+               1.0 + l * f32((*R).wfLeeGustQ) * (1.0 / 65536.0));
+}
+
 // `ph` is the consumer's per-instance phase scatter (per grass column, per
 // blade). It is a decorrelation offset, NOT part of the field: windAt passes
 // 0.0, which is what the debug overlay draws and what "the wind at this point"
@@ -2688,14 +2751,19 @@ fn windSampleAt(p : vec3f, t : f32, ph : f32,
   // come out of the same function, and phase 4's TickParams copy will too, so
   // the sim and the renderer cannot end up in different weather.
   let d = (*R).windDir;
-  s.along = d;
-  s.crossw = vec2f(-d.y, d.x);
   let rp = windRampF(p, R);
   let alt = rp.ramp;
   s.ramp = alt;
   s.hagl = rp.hagl;
-  s.mean = d * ((*R).windSpeed * alt);
-  s.amp = (*R).windGust * alt;
+  // The local heading: the weather's, turned by the meander. The mean and the
+  // band FRAME follow it; the gust phase below keeps `d` (windWanderF's note).
+  let dl = windWanderF(p, d, R);
+  s.along = dl;
+  s.crossw = vec2f(-dl.y, dl.x);
+  let lee = windLeeF(rp, dl, R);
+  s.mean = dl * ((*R).windSpeed * alt * lee.x);
+  s.amp = (*R).windGust * alt * lee.y;
+  s.extra = windThermalF(p, R) * alt;
   // Travelling gust phase. `gp` is the distance DOWNWIND in radians of the
   // base band; `adv` is how far the AIR has travelled, in the same radians —
   // K * integral(U dt), summed on the CPU (windfield.h AdvPhase) because U
@@ -2739,7 +2807,7 @@ fn windBandWS(s : WindSample, b : vec3f) -> vec3f {
 // The mean, in world space. Kept separate from the bands for the reason in the
 // WindSample note above.
 fn windMeanWS(s : WindSample) -> vec3f {
-  return vec3f(s.mean.x, 0.0, s.mean.y);
+  return vec3f(s.mean.x, 0.0, s.mean.y) + s.extra;
 }
 
 // ====================== WIND PRIMITIVES (research doc §4.3) =================
@@ -3198,6 +3266,52 @@ fn windRampQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> WindRampQ {
   return o;
 }
 
+// ---- the regime's field terms, in integers (windWanderF and friends) --------
+const WINDQ_PH_17 : i32 = i32(round(1.7 * WINDQ_RAD));
+const WINDQ_PH_22 : i32 = i32(round(2.2 * WINDQ_RAD));
+const WINDQ_PH_13 : i32 = i32(round(1.3 * WINDQ_RAD));
+
+fn windWanderQ(p : vec3<i32>, d : vec2<i32>, T : ptr<uniform, TickParams>) -> vec2<i32> {
+  let amp = (*T).wfWanderAmp;
+  if (amp <= 0) { return d; }
+  let k = (*T).wfWanderK;
+  let ph = (*T).wfWanderPhase;
+  let sa = windSinQ(i32(windPhaseQ(p, d, k) + ph));
+  let sc = windSinQ(i32(windPhaseQ(p, vec2<i32>(-d.y, d.x), (k * 3) / 5) - ph) + WINDQ_PH_17);
+  let sw = wq(42598, sa) + wq(22938, sc);          // 0.65 / 0.35, Q16
+  let th = (amp * sw) / 65536;                     // amp <= 2^14: no overflow
+  let cs = windSinQ(th + 16384);
+  let sn = windSinQ(th);
+  return vec2<i32>(wq(d.x, cs) + wq(d.y, sn), wq(d.y, cs) - wq(d.x, sn));
+}
+
+fn windThermalQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  let a = (*T).wfThermalQ;
+  if (a <= 0) { return vec3<i32>(0); }
+  let k = (*T).wfThermalK;
+  let ph = (*T).wfThermalPhase;
+  let fx = u32(p.x) * u32(k);
+  let fz = u32(p.z) * u32((k * 83) / 100);
+  return vec3<i32>(wq(a, windSinQ(i32(fx + ph))),
+                   wq(a, wq(26214, windSinQ(i32(fx + fz + ph) + WINDQ_PH_22))),
+                   wq(a, windSinQ(i32(fz - ph) + WINDQ_PH_13)));
+}
+
+// (mean multiplier, gust multiplier), Q16.
+fn windLeeQ(rq : WindRampQ, dl : vec2<i32>, T : ptr<uniform, TickParams>) -> vec2<i32> {
+  let lee = (*T).wfLeeQ;
+  if (lee <= 0 || rq.tr.edge <= 0) { return vec2<i32>(65536, 65536); }
+  let sa = wq(rq.tr.gx, dl.x) + wq(rq.tr.gz, dl.y);
+  let s0 = max((*T).wfLeeSlopeQ, 256);
+  // (-sa - s0) / s0 as Q16, staged through Q8 so a cliff-steep slope (tens of
+  // thousands of Q16) cannot leave i32.
+  let f = clamp(((-sa - s0) / max(s0 >> 8u, 1)) * 256, 0, 65536);
+  var l = wq(wq(lee, f), 65536 - windDepthFracQ(rq.hQ10, (*T).wfLeeDepth));
+  l = wq(l, rq.tr.edge);
+  return vec2<i32>(65536 - wq(l, 65536 + (*T).wfLeeRevQ),
+                   65536 + wq(l, (*T).wfLeeGustQ));
+}
+
 // ---- wind primitives, in integers (research doc §4.3) ----------------------
 // The transcription of windPrimEvalF above. Same three shapes, same profiles,
 // same constants — and, like windAtQ against windAt, it is transcribed rather
@@ -3367,9 +3481,13 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   let rq = windRampQ(p, T);
   let alt = rq.ramp;
   let d = (*T).windDirQ;                 // unit XZ, downwind, Q16.16
-  let cw = vec2<i32>(-d.y, d.x);         // 90 degrees to its left
-  let spd = wq((*T).windSpeedQ, alt);
-  let amp = wq((*T).windGustQ, alt);
+  // The meandered local heading: the mean and the band frame turn with it,
+  // the gust phase keeps `d` — windSampleAt's arrangement.
+  let dl = windWanderQ(p, d, T);
+  let cw = vec2<i32>(-dl.y, dl.x);       // 90 degrees to its left
+  let lee = windLeeQ(rq, dl, T);
+  let spd = wq(wq((*T).windSpeedQ, alt), lee.x);
+  let amp = wq(wq((*T).windGustQ, alt), lee.y);
 
   // Band components in the (along, cross, up) frame. Five spatial phases,
   // five advection offsets and six evolution clocks, exactly as windSampleAt
@@ -3395,18 +3513,22 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
 
   // Rotate each band out of that frame into world space and scale by the gust
   // amplitude — windBandWS(), in integers.
-  let w1 = vec3<i32>(wq(amp, wq(d.x, b1a) + wq(cw.x, b1c)),
+  let w1 = vec3<i32>(wq(amp, wq(dl.x, b1a) + wq(cw.x, b1c)),
                      wq(amp, b1u),
-                     wq(amp, wq(d.y, b1a) + wq(cw.y, b1c)));
-  let w2 = vec3<i32>(wq(amp, wq(d.x, b2a) + wq(cw.x, b2c)),
+                     wq(amp, wq(dl.y, b1a) + wq(cw.y, b1c)));
+  let w2 = vec3<i32>(wq(amp, wq(dl.x, b2a) + wq(cw.x, b2c)),
                      wq(amp, b2u),
-                     wq(amp, wq(d.y, b2a) + wq(cw.y, b2c)));
+                     wq(amp, wq(dl.y, b2a) + wq(cw.y, b2c)));
+  // The regime's additive terms, scaled by the ramp like the mean they sit
+  // beside (windMeanWS's `extra`).
+  let th = windThermalQ(p, T);
+  let extra = vec3<i32>(wq(th.x, alt), wq(th.y, alt), wq(th.z, alt));
   // windMeanWS() + the 0.7/0.3 mix, then the primitive sum. The primitives are
   // ADDED to the ambient field rather than replacing it, which is what makes a
   // fan feel like it is blowing INTO weather instead of switching the weather
   // off inside a box — and it is why a gust bolt fired downwind carries further
   // than one fired upwind with no code saying so.
-  return vec3<i32>(wq(d.x, spd), 0, wq(d.y, spd)) +
+  return vec3<i32>(wq(dl.x, spd), 0, wq(dl.y, spd)) + extra +
          vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
          vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z)) +
          windPrimAtQ(p, T);

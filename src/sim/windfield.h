@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "sim/wind.h"
 #include "sim/world.h"
@@ -71,5 +73,28 @@ void FillWindField(RenderParams& rp, const Tuning& t, uint32_t seed, uint32_t ti
 
 // Column queries the terrain table's last (re)build paid -- the dev readout.
 uint32_t TerrainQueries();
+
+// ---- the regime library (assets/wind/regimes.json) ------------------------
+// Named presets of the three regime inputs. Sky presets name one in their
+// "wind" field; wind.regime pins one. File order is the picker's order.
+struct Regime {
+  std::string name, label, about;
+  float intensity = 0.32f, gale = 0.0f, convective = 0.0f;
+};
+const std::vector<Regime>& Regimes();
+const Regime* FindRegime(const std::string& name);
+void ReloadRegimes();
+uint64_t RegimeFingerprint();
+
+// ---- the pieces of WindWeatherQ that stage 4 owns --------------------------
+// The convective storm timeline at `tick`, weighted by `convective` (Q16):
+// fills o.storm* and returns the speed envelope (Q16), the extra gust
+// fraction (Q16) and the heading jump (BAM32).
+void StormTimeline(const Tuning& t, uint32_t seed, uint32_t tick, int32_t convective,
+                   WindStateQ& o, int64_t& envelope, int64_t& stormGust,
+                   uint32_t& jumpBam);
+// Slope and sea/lake breezes from the stability S (Q16, [-1, 1]) and the
+// mean speed (they fade out as the synoptic wind rises).
+void LocalWinds(const Tuning& t, WindStateQ& o, int64_t speedQ, int64_t S);
 
 }  // namespace windfield

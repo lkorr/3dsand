@@ -3597,6 +3597,66 @@ struct Tuning {
     // Radius, metres, of the water fraction stored per table cell: the signal
     // the sea/lake breeze blows along (stage 4).
     float seaRadius = TPD(wind, seaRadius);
+    // ---- the weather REGIME (CPU-side; WindWeatherQ; live) ----
+    // Pin a named wind regime (assets/wind/regimes.json: calm, light, breezy,
+    // windy, gale, thunderstorm, ...) or "auto" to let the sky drive it. The
+    // F1 preset picker writes this. Live.
+    std::string regime = TPD(wind, regime);
+    // Manual intensity override, 0..1 (~ Beaufort / 12); below 0 = off. Beats
+    // the sky and a pinned regime alike, so it is the one slider that always
+    // answers "what does THIS strength look like". Live.
+    float intensity = TPD(wind, intensity);
+    // How far the wind's own ~68 s epoch draw swings the sky's intensity, +-
+    // this fraction: the sky sets the day, the epochs set the hour.
+    float moodSpread = TPD(wind, moodSpread);
+    // The intensity -> mean speed curve, as multiples of windSpeed: piecewise
+    // linear through (0, calm), (0.3, 1.0), (0.75, gale), (1, max). windSpeed
+    // is therefore the mean at intensity 0.3 — a breezy day, and the manual
+    // default — at the reference height.
+    float speedCalmMul = TPD(wind, speedCalmMul);
+    float speedGaleMul = TPD(wind, speedGaleMul);
+    float speedMaxMul = TPD(wind, speedMaxMul);
+    // Stability. The day phase makes the air convective by day (sun) and stable
+    // at night, damped by cloud cover; wind MIXES that away, linearly to zero at
+    // this intensity — a gale is neutral day and night.
+    float mixIntensity = TPD(wind, mixIntensity);
+    // In stable air (a calm night) the air near the ground partly stops
+    // following the air above: the surface wind is scaled by 1 - this x
+    // stability at the ground, returning to 1 by decoupleHeight metres.
+    float stableDecouple = TPD(wind, stableDecouple);
+    float decoupleHeight = TPD(wind, decoupleHeight);
+    // Gust amplitude as a fraction of the mean, light -> strong wind, before
+    // gustStrength. Peak gust ~ mean x (1 + this): 1.5x in strong wind.
+    // gustConvective adds to it in light convective (sunny) air, galeGust is
+    // what a gale converges to.
+    float gustLight = TPD(wind, gustLight);
+    float gustStrong = TPD(wind, gustStrong);
+    float gustConvective = TPD(wind, gustConvective);
+    float galeGust = TPD(wind, galeGust);
+    // Direction MEANDER: a slow, spatially coherent heading perturbation,
+    // +- this many degrees in light wind and in strong wind, with a period
+    // (s) and a spatial wavelength (m). galeHold is the fraction a gale
+    // suppresses it by — a gale holds its heading.
+    float wanderLight = TPD(wind, wanderLight);
+    float wanderStrong = TPD(wind, wanderStrong);
+    float wanderPeriod = TPD(wind, wanderPeriod);
+    float wanderWavelength = TPD(wind, wanderWavelength);
+    float galeHold = TPD(wind, galeHold);
+    // Thermals: a small ISOTROPIC gust term (m/s at full convection) with its
+    // own cell size (m) and period (s). Present only in convective air.
+    float thermalGust = TPD(wind, thermalGust);
+    float thermalWavelength = TPD(wind, thermalWavelength);
+    float thermalPeriod = TPD(wind, thermalPeriod);
+    // LEE TURBULENCE: past leeOnset intensity, the lee slope of a steep drop
+    // (ground descending downwind steeper than leeSlope) gets a gust boost
+    // (leeGust) and some reverse flow (leeReverse), in a layer leeDepth
+    // metres deep. leeStrength scales it all.
+    float leeOnset = TPD(wind, leeOnset);
+    float leeStrength = TPD(wind, leeStrength);
+    float leeSlope = TPD(wind, leeSlope);
+    float leeDepth = TPD(wind, leeDepth);
+    float leeReverse = TPD(wind, leeReverse);
+    float leeGust = TPD(wind, leeGust);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a

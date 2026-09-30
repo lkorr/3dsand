@@ -2,14 +2,20 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "sim/intmath.h"
 #include "sim/tuning.h"
+#include "sim/weather.h"
 #include "sim/worldmap.h"
+#include "test/support.h"  // AssetDir(): the one asset-path chokepoint
 
 namespace windfield {
 
@@ -50,6 +56,15 @@ uint64_t RefFingerprint(const Tuning& t) {
   f.I(w.weatherAuto ? 1 : 0);
   f.F(w.gustWavelength);
   f.F(w.gustAdvect);
+  f.Bytes(w.regime.data(), w.regime.size());
+  f.F(w.intensity);
+  f.F(w.moodSpread);
+  f.F(w.speedCalmMul);
+  f.F(w.speedGaleMul);
+  f.F(w.speedMaxMul);
+  f.F(w.galeHold);
+  f.I((int64_t)RegimeFingerprint());
+  f.I((int64_t)weather::SimWindFingerprint(t));
   return f.h;
 }
 
@@ -389,22 +404,56 @@ int32_t LerpQ(int32_t a, int32_t b, int64_t u) {
 // different offsets, and a second hand-written copy is how they drift.
 struct Block {
   uint32_t advPhase = 0;
+  int32_t couplingQ = 65536, decoupleH = 1;
+  int32_t wanderAmp = 0, wanderK = 1;
+  uint32_t wanderPhase = 0;
+  int32_t thermalQ = 0, thermalK = 1;
+  uint32_t thermalPhase = 0;
+  int32_t leeQ = 0, leeSlopeQ = 32768, leeDepth = 1, leeRevQ = 0, leeGustQ = 0;
+  int32_t slopeWindQ = 0, slopeDepth = 1, seaBreezeQ = 0, seaDepth = 1;
   int32_t ridgeQ = 0, valleyQ = 0, expDepth = 1, absGainQ = 0;
   int32_t seaRadius = 1, seaLevelY = 0, neutralQ = 65536;
   int32_t prof[kWindProfKnots] = {};
   const TerrState* terr = nullptr;
 };
 
+// A clock that completes one turn (BAM16 65536) every `periodS` seconds, at
+// tick + frac. Integer on the sim path (frac == 0); the render path adds the
+// sub-tick fraction in double, which only ever reaches RenderParams.
+uint32_t Clock(float periodS, uint32_t tick, float frac) {
+  const int64_t pt = std::max<int64_t>((int64_t)((double)periodS * 30.0 + 0.5), 1);
+  if (frac <= 0.0f) return (uint32_t)((((uint64_t)tick * 65536ull) / (uint64_t)pt) & 0xFFFFull);
+  const double v = ((double)tick + (double)frac) * 65536.0 / (double)pt;
+  return (uint32_t)((uint64_t)v & 0xFFFFull);
+}
+// BAM16 per voxel of a spatial wave `metres` long.
+int32_t KOf(float metres) {
+  return std::max((int32_t)(65536.0 / ((double)std::max(metres, 0.1f) * 10.0) + 0.5), 1);
+}
+
 Block Resolve(const Tuning& t, uint32_t seed, uint32_t tick, float frac,
-              uint32_t /*dayPhase*/, const int32_t origin[3]) {
+              uint32_t dayPhase, const int32_t origin[3]) {
   const Tuning::Wind& w = t.wind;
   Block b;
   b.advPhase = AdvPhase(t, seed, tick, frac);
-  const WindStateQ q = WindWeatherQ(t, seed, tick);
-  // Terrain response by intensity: light -> strong, smoothstepped.
-  const int64_t s = SmoothQ(q.speed01);
-  b.ridgeQ = LerpQ(Q16(w.ridgeLight), Q16(w.ridgeStrong), s);
-  b.valleyQ = LerpQ(Q16(w.valleyLight), Q16(w.valleyStrong), s);
+  const WindStateQ q = WindWeatherQ(t, seed, tick, dayPhase);
+  b.ridgeQ = q.ridgeGain;
+  b.valleyQ = q.valleyGain;
+  b.couplingQ = q.coupling;
+  b.decoupleH = Vox(w.decoupleHeight);
+  b.wanderAmp = q.wanderAmp;
+  b.wanderK = KOf(w.wanderWavelength);
+  b.wanderPhase = Clock(w.wanderPeriod, tick, frac);
+  b.thermalQ = q.thermal;
+  b.thermalK = KOf(w.thermalWavelength);
+  b.thermalPhase = Clock(w.thermalPeriod, tick, frac);
+  b.leeQ = q.lee;
+  b.leeSlopeQ = Q16(w.leeSlope);
+  b.leeDepth = Vox(w.leeDepth);
+  b.leeRevQ = Q16(w.leeReverse);
+  b.leeGustQ = Q16(w.leeGust);
+  b.slopeWindQ = q.slopeWind;
+  b.seaBreezeQ = q.seaBreeze;
   b.expDepth = Vox(w.exposureDepth);
   // Per 100 m -> per 1024 voxels: x 1.024.
   b.absGainQ = (int32_t)((double)w.absGain * 1.024 * 65536.0 + (w.absGain >= 0 ? 0.5 : -0.5));
@@ -419,8 +468,23 @@ Block Resolve(const Tuning& t, uint32_t seed, uint32_t tick, float frac,
 template <class P>
 void Write(P& p, const Block& b) {
   p.wfAdvPhase = b.advPhase;
-  p.wfCouplingQ = 65536;
-  p.wfDecoupleH = 1;
+  p.wfWanderPhase = b.wanderPhase;
+  p.wfWanderAmp = b.wanderAmp;
+  p.wfWanderK = b.wanderK;
+  p.wfThermalQ = b.thermalQ;
+  p.wfThermalPhase = b.thermalPhase;
+  p.wfThermalK = b.thermalK;
+  p.wfCouplingQ = b.couplingQ;
+  p.wfDecoupleH = b.decoupleH;
+  p.wfLeeQ = b.leeQ;
+  p.wfLeeSlopeQ = b.leeSlopeQ;
+  p.wfLeeDepth = b.leeDepth;
+  p.wfLeeRevQ = b.leeRevQ;
+  p.wfLeeGustQ = b.leeGustQ;
+  p.wfSlopeWindQ = b.slopeWindQ;
+  p.wfSlopeDepth = b.slopeDepth;
+  p.wfSeaBreezeQ = b.seaBreezeQ;
+  p.wfSeaDepth = b.seaDepth;
   p.wfRidgeQ = b.ridgeQ;
   p.wfValleyQ = b.valleyQ;
   p.wfExpDepth = b.expDepth;
@@ -451,4 +515,316 @@ void FillWindField(RenderParams& rp, const Tuning& t, uint32_t seed, uint32_t ti
   Write(rp, Resolve(t, seed, tick, frac, dayPhase, origin));
 }
 
+// ============================================================================
+// THE STORM TIMELINE and LOCAL WINDS (stage 4 of §13; identity until then)
+// ============================================================================
+
+void StormTimeline(const Tuning& /*t*/, uint32_t /*seed*/, uint32_t /*tick*/,
+                   int32_t /*convective*/, WindStateQ& o, int64_t& envelope,
+                   int64_t& stormGust, uint32_t& jumpBam) {
+  o.stormPhase = -1;
+  envelope = 65536;
+  stormGust = 0;
+  jumpBam = 0;
+}
+
+void LocalWinds(const Tuning& /*t*/, WindStateQ& o, int64_t /*speedQ*/, int64_t /*S*/) {
+  o.slopeWind = 0;
+  o.seaBreeze = 0;
+}
+
+// ============================================================================
+// THE REGIME LIBRARY (assets/wind/regimes.json)
+// ============================================================================
+
+namespace {
+
+struct RegimeLib {
+  bool loaded = false;
+  std::vector<Regime> list;
+  uint64_t fp = 0;
+};
+RegimeLib gReg;
+
+std::vector<Regime> BuiltInRegimes() {
+  auto r = [](const char* n, const char* l, float i, float g, float c) {
+    Regime x;
+    x.name = n;
+    x.label = l;
+    x.intensity = i;
+    x.gale = g;
+    x.convective = c;
+    return x;
+  };
+  return {r("calm", "Calm", 0.05f, 0, 0),         r("light", "Light air", 0.16f, 0, 0),
+          r("breezy", "Breezy", 0.32f, 0, 0),     r("windy", "Windy day", 0.52f, 0, 0),
+          r("gale", "Gale", 0.78f, 1, 0),         r("thunderstorm", "Thunderstorm", 0.5f, 0, 1)};
+}
+
+void EnsureRegimes() {
+  if (gReg.loaded) return;
+  gReg.loaded = true;
+  gReg.list.clear();
+  const std::string path = std::string(sandvox::AssetDir()) + "/wind/regimes.json";
+  std::ifstream f(path);
+  if (f) {
+    try {
+      nlohmann::json j;
+      f >> j;
+      for (const auto& e : j.at("regimes")) {
+        Regime r;
+        r.name = e.at("name").get<std::string>();
+        r.label = e.value("label", r.name);
+        r.about = e.value("about", std::string());
+        r.intensity = std::clamp((float)e.value("intensity", 0.32), 0.0f, 1.0f);
+        r.gale = std::clamp((float)e.value("gale", 0.0), 0.0f, 1.0f);
+        r.convective = std::clamp((float)e.value("convective", 0.0), 0.0f, 1.0f);
+        gReg.list.push_back(r);
+      }
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "wind: %s: %s; using the built-in regimes\n", path.c_str(), ex.what());
+      gReg.list.clear();
+    }
+  }
+  if (gReg.list.empty()) gReg.list = BuiltInRegimes();
+  Fp fp;
+  for (const Regime& r : gReg.list) {
+    fp.Bytes(r.name.data(), r.name.size());
+    fp.F(r.intensity);
+    fp.F(r.gale);
+    fp.F(r.convective);
+  }
+  gReg.fp = fp.h;
+}
+
+}  // namespace
+
+const std::vector<Regime>& Regimes() {
+  EnsureRegimes();
+  return gReg.list;
+}
+
+const Regime* FindRegime(const std::string& name) {
+  EnsureRegimes();
+  for (const Regime& r : gReg.list)
+    if (r.name == name) return &r;
+  return nullptr;
+}
+
+void ReloadRegimes() {
+  gReg.loaded = false;
+  EnsureRegimes();
+}
+
+uint64_t RegimeFingerprint() {
+  EnsureRegimes();
+  return gReg.fp;
+}
+
 }  // namespace windfield
+
+// ============================================================================
+// THE WEATHER, IN INTEGERS (wind.h WindWeatherQ)
+// ============================================================================
+
+namespace {
+WindRegimeSource gRegimeSource = nullptr;
+
+int32_t KnobQ16(float v) {
+  const double r = (double)v * 65536.0;
+  return (int32_t)(r >= 0.0 ? r + 0.5 : r - 0.5);
+}
+int64_t Smooth16(int64_t x) {
+  x = std::clamp<int64_t>(x, 0, 65536);
+  return (x * x * (3 * 65536 - 2 * x)) >> 32;
+}
+int64_t Lerp16(int64_t a, int64_t b, int64_t u) { return a + (((b - a) * u) >> 16); }
+int64_t Clamp01(int64_t v) { return std::clamp<int64_t>(v, 0, 65536); }
+
+// Heading as a Q30 vector from the epoch blend at `tick`, epochs 2^shift ticks
+// long. Returns the smoothstepped Q24 position too.
+void EpochHeading(uint32_t seed, uint32_t tick, uint32_t shift, uint32_t salt,
+                  int64_t& vx, int64_t& vz, int64_t& uQ24,
+                  winddetail::EpochQ& e0, winddetail::EpochQ& e1) {
+  const uint32_t epoch = tick >> shift;
+  const uint32_t span = 1u << shift;
+  int64_t u = (int64_t)(tick & (span - 1u)) << (24 - shift);
+  const int64_t uu = (u * u) >> 24;
+  u = (uu * (3ll * kWQOne - 2 * u)) >> 24;
+  e0 = winddetail::EpochTargetQ(seed ^ salt, epoch);
+  e1 = winddetail::EpochTargetQ(seed ^ salt, epoch + 1u);
+  vx = (((int64_t)imath::SinQ30(e0.headBam) * (kWQOne - u) +
+         (int64_t)imath::SinQ30(e1.headBam) * u) >> 24);
+  vz = (((int64_t)imath::CosQ30(e0.headBam) * (kWQOne - u) +
+         (int64_t)imath::CosQ30(e1.headBam) * u) >> 24);
+  uQ24 = u;
+}
+
+// The intensity -> mean speed curve, Q16 multiple of wind.windSpeed:
+// piecewise linear through (0, calm), (0.3, 1), (0.75, gale), (1, max).
+int64_t SpeedCurveQ(const Tuning::Wind& w, int64_t iQ) {
+  const int64_t k0 = KnobQ16(w.speedCalmMul), k1 = 65536;
+  const int64_t k2 = KnobQ16(w.speedGaleMul), k3 = KnobQ16(w.speedMaxMul);
+  const int64_t a = 19661, b = 49152;   // 0.3, 0.75
+  iQ = Clamp01(iQ);
+  if (iQ <= a) return k0 + ((k1 - k0) * iQ) / a;
+  if (iQ <= b) return k1 + ((k2 - k1) * (iQ - a)) / (b - a);
+  return k2 + ((k3 - k2) * (iQ - b)) / (65536 - b);
+}
+
+}  // namespace
+
+void SetWindRegimeSource(WindRegimeSource src) { gRegimeSource = src; }
+
+WindStateQ WindWeatherQ(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase) {
+  const Tuning::Wind& w = t.wind;
+  WindStateQ o;
+
+  // ---- 1. the epochs: heading and the two mood draws -------------------------
+  uint32_t headBam = imath::BamFromDegrees((double)w.windDirDeg);
+  int64_t vx = imath::SinQ30(headBam), vz = imath::CosQ30(headBam);
+  int32_t sp01 = kWQOne / 2, gu01 = kWQOne / 2;
+  int64_t stormW = 0;  // epoch storm draw, blended, Q16
+  if (w.weatherAuto) {
+    int64_t u;
+    winddetail::EpochQ e0, e1;
+    EpochHeading(seed, tick, kWindEpochShift, 0u, vx, vz, u, e0, e1);
+    sp01 = winddetail::LerpQ24(e0.speed01, e1.speed01, u);
+    gu01 = winddetail::LerpQ24(e0.gust01, e1.gust01, u);
+    stormW = ((e0.storm ? (kWQOne - u) : 0) + (e1.storm ? u : 0)) >> 8;
+  }
+  o.speed01 = (sp01 + 128) >> 8;
+  o.gust01 = (gu01 + 128) >> 8;
+
+  // ---- 2. the regime --------------------------------------------------------
+  // Pinned preset > manual > the source (the sky) > the wind's own epochs, and
+  // the intensity override beats all of them.
+  WeatherRegime r;
+  const windfield::Regime* pin =
+      (w.regime.empty() || w.regime == "auto") ? nullptr : windfield::FindRegime(w.regime);
+  if (pin) {
+    r.intensity = KnobQ16(pin->intensity);
+    r.gale = KnobQ16(pin->gale);
+    r.convective = KnobQ16(pin->convective);
+    o.source = kWindSrcPreset;
+  } else if (!w.weatherAuto) {
+    o.source = kWindSrcManual;
+  } else {
+    bool got = false;
+    if (gRegimeSource) {
+      got = gRegimeSource(t, seed, tick, r);
+    } else {
+      got = weather::SimWindRegime(t, seed, tick, r.intensity, r.gale, r.convective, r.cover);
+    }
+    if (got) {
+      o.source = kWindSrcSky;
+      // The mood: the epoch draw swings the sky's intensity by +-moodSpread.
+      const int64_t m = ((int64_t)o.speed01 * 2 - 65536);   // [-1, 1]
+      const int64_t sprQ = KnobQ16(w.moodSpread);
+      r.intensity = (int32_t)Clamp01(r.intensity + ((int64_t)r.intensity * ((m * sprQ) >> 16) >> 16));
+      // A windy sky whose epoch drew a storm becomes a GALE for that epoch:
+      // the sky has no gale preset of its own, and a gale that arrived with
+      // every rain would be a gale most afternoons.
+      const int64_t windy = Clamp01(((int64_t)r.intensity - 26214) * 10);   // 0.4..0.5
+      r.gale = (int32_t)std::max<int64_t>(r.gale, (stormW * windy) >> 16);
+      r.intensity = (int32_t)Lerp16(r.intensity, std::max<int64_t>(r.intensity, 51118), r.gale);
+    } else {
+      // No sky: the epochs alone, mapped onto the intensity scale.
+      o.source = kWindSrcEpochs;
+      const int64_t s01 = ((int64_t)sp01 + 128) >> 8;   // Q16, 0.1..1.0
+      r.intensity = (int32_t)Clamp01(3277 + ((s01 - 6554) * 52429) / 58982);  // 0.05..0.85
+      r.gale = (int32_t)stormW;
+    }
+  }
+  if (w.intensity >= 0.0f) r.intensity = (int32_t)Clamp01(KnobQ16(w.intensity));
+  o.intensity = r.intensity;
+  o.gale = r.gale;
+  o.convective = r.convective;
+  o.cover = r.cover;
+  o.storm = std::max(r.gale, r.convective) > 32768;
+  const int64_t I = r.intensity;
+
+  // ---- 3. the convective storm timeline (stage 4 fills this) -----------------
+  int64_t envelope = 65536, stormGust = 0;
+  uint32_t jump = 0;
+  windfield::StormTimeline(t, seed, tick, r.convective, o, envelope, stormGust, jump);
+
+  // ---- 4. heading: a gale holds it -------------------------------------------
+  // The slow heading: the same draw on epochs 16x longer (~18 min), salted
+  // apart. A gale pulls the weather heading toward it by galeHold x gale.
+  if (w.weatherAuto && r.gale > 0) {
+    int64_t lx, lz, lu;
+    winddetail::EpochQ l0, l1;
+    EpochHeading(seed, tick, kWindEpochShift + 4, 0x6A1Eu, lx, lz, lu, l0, l1);
+    const int64_t g = (KnobQ16(w.galeHold) * (int64_t)r.gale) >> 16;
+    vx = vx + (((lx - vx) * g) >> 16);
+    vz = vz + (((lz - vz) * g) >> 16);
+  }
+  const int64_t len = (int64_t)imath::Sqrt64((uint64_t)(vx * vx + vz * vz));
+  if (len > 107374) {
+    o.dirX = (int32_t)imath::DivRound(vx << 16, len);
+    o.dirZ = (int32_t)imath::DivRound(vz << 16, len);
+  } else {
+    o.dirX = imath::SinQ16(headBam);
+    o.dirZ = imath::CosQ16(headBam);
+  }
+  if (jump != 0) {
+    // Rotate by the storm's jump: (x, z) -> (x c + z s, -x s + z c) turns the
+    // heading by +jump in the engine's 0 = +Z, toward +X convention.
+    const int64_t c = imath::CosQ16(jump), s = imath::SinQ16(jump);
+    const int64_t x = o.dirX, z = o.dirZ;
+    o.dirX = (int32_t)((x * c + z * s) >> 16);
+    o.dirZ = (int32_t)((z * c - x * s) >> 16);
+  }
+  o.jumpBam = jump;
+
+  // ---- 5. the mean speed at the reference height -------------------------------
+  const int64_t baseQ = winddetail::MetresPerSecToCellsQ(w.windSpeed);
+  int64_t speedQ = imath::MulShiftRound(baseQ, SpeedCurveQ(w, I), 16);
+  speedQ = imath::MulShiftRound(speedQ, envelope, 16);
+  o.speed = winddetail::ClampQ(speedQ);
+  o.envelope = (int32_t)envelope;
+
+  // ---- 6. stability ----------------------------------------------------------
+  // Convective by day (the sun heats the ground), stable at night (it cools),
+  // both damped by cloud, both mixed away by wind. [-1, 1].
+  int64_t S = 0;
+  if (dayPhase != kWindNoDayPhase) {
+    const int64_t day = DaylightStrengthCpu(dayPhase);            // 0..255
+    const int64_t raw = (day * 2 * 65536) / 255 - 65536;
+    const int64_t damp = 65536 - ((45875 * Clamp01(r.cover)) >> 16);   // 1 - 0.7 cover
+    const int64_t mix = Clamp01(65536 - (I * 65536) / std::max<int64_t>(KnobQ16(w.mixIntensity), 1));
+    S = (((raw * damp) >> 16) * mix) >> 16;
+  }
+  o.stability = (int32_t)S;
+  const int64_t Sp = std::max<int64_t>(S, 0), Sn = std::max<int64_t>(-S, 0);
+
+  // ---- 7. the field parameters -------------------------------------------------
+  // Gust fraction: light -> strong over intensity 0..0.8, plus thermals in
+  // light convective air, converging on the gale's; the storm adds its own.
+  const int64_t iS = Smooth16((I * 5) / 4);
+  int64_t gf = Lerp16(KnobQ16(w.gustLight), KnobQ16(w.gustStrong), iS);
+  gf += (KnobQ16(w.gustConvective) * ((Sp * (65536 - iS)) >> 16)) >> 16;
+  gf = Lerp16(gf, KnobQ16(w.galeGust), r.gale);
+  gf += stormGust;
+  gf = (gf * KnobQ16(w.gustStrength)) >> 16;
+  if (w.weatherAuto) gf = (gf * (52429 + ((26214 * (int64_t)o.gust01) >> 16))) >> 16;  // 0.8 + 0.4u
+  o.gustFrac = (int32_t)std::max<int64_t>(gf, 0);
+  o.gust = winddetail::ClampQ(imath::MulShiftRound(speedQ, o.gustFrac, 16));
+
+  o.coupling = (int32_t)(65536 - ((KnobQ16(w.stableDecouple) * Sn) >> 16));
+  const int64_t wl = (int64_t)(w.wanderLight * 65536.0f / 360.0f);
+  const int64_t ws = (int64_t)(w.wanderStrong * 65536.0f / 360.0f);
+  int64_t wa = Lerp16(wl, ws, Smooth16((I * 10) / 7));
+  wa = (wa * (65536 - ((KnobQ16(w.galeHold) * (int64_t)r.gale) >> 16))) >> 16;
+  o.wanderAmp = (int32_t)std::clamp<int64_t>(wa, 0, 16384);
+  o.thermal = winddetail::ClampQ((winddetail::MetresPerSecToCellsQ(w.thermalGust) * Sp) >> 16);
+  const int64_t tS = Smooth16(I);
+  o.ridgeGain = (int32_t)Lerp16(KnobQ16(w.ridgeLight), KnobQ16(w.ridgeStrong), tS);
+  o.valleyGain = (int32_t)Lerp16(KnobQ16(w.valleyLight), KnobQ16(w.valleyStrong), tS);
+  o.lee = (int32_t)((KnobQ16(w.leeStrength) *
+                     Clamp01(((I - KnobQ16(w.leeOnset)) * 65536) / 9830)) >> 16);   // over 0.15
+  windfield::LocalWinds(t, o, speedQ, S);
+  return o;
+}
+
