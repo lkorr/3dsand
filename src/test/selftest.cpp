@@ -342,6 +342,9 @@ const char* const kOrder[] = {
     // Oil on water: a disturbed slick must not diffuse into isolated cells.
     // Same sealed-box fixture as ca-level.
     "oil-slick",
+    // A pool of oil alight: catches at once, burns ~10 s, pours black smoke.
+    // Same pit neighbourhood and dim-dawn pinning.
+    "oil-fire",
     // Passable plants hold nothing up: sand, a lone chip and a grid particle
     // each crush the bramble they land on. Same sealed-box fixture.
     "plant-crush",

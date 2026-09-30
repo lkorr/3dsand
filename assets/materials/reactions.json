@@ -363,6 +363,20 @@
       "note": "OIL IS HOW EASILY AN OILED THING CATCHES (2026-09-24). This one rule runs for a pool of oil AND, through the coat rule (DESIGN.md §6), for every oiled voxel, ground or body: each firing spends one level of the coat, throws a flame into an open face, and (clause 2c) makes the flame ON the voxel, which catches as its own catch form -- oiled grass to fire, an oiled plank to ember, oiled skin to flesh_burning. So this chance is the owner's \"oil should catch fire easily in all scenarios\", one number for all of them. 350 -> 700 on that ask: at 350 an oiled forearm under lava burnt 14,246 voxel-ticks against the pre-W2-J2 22,920; at 700 21,728; at 1000 21,181 (saturated: past ~700 the limit is heat reaching the oiled skin, not the oil catching). Compiled through combustion.spreadPct like every ignition, and a drifting flame lights oil at neighborChance x combustion.flamePct of it."
     },
     {
+      "note": "A POOL OF OIL CATCHES AS oil_burning, not as a flash of fire (owner, 2026-09-30: burn 'like ether gas ... for a good 10ish seconds'). A DECAY gated on a hot face (scaleByNeighbors tag:hot, scaleMax 1: gated, not scaled) and FIRST in oil's bucket, for one reason: a coat runs only its material's PAIR rules and needs their product to be a flame (sim_step.wgsl coatReact, rules 2-3) -- a liquid product would COVER the cell under an oil coat instead of setting it alight. So the coat keeps the pair rule below, untouched, and the pool rolls this one first. Authored 1000, compiled x combustion.spreadPct (~290 per-mille a tick beside anything hot): extremely flammable, and the burning oil is itself hot, so a front runs through a spill a cell or so a tick. A floating flame gets no discount here (a count ramp has no per-material weight). The pair rule still fires when this roll fails -- about a third of a pool flashes straight to fire, which reads as the flare at the edge of an oil fire."
+    },
+    {
+      "self": "oil",
+      "decay": true,
+      "chance": 1000,
+      "rainDamped": true,
+      "becomes": "oil_burning",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "scaleMax": 1
+      }
+    },
+    {
       "self": "oil",
       "neighbor": "tag:hot",
       "chance": 700,
@@ -517,7 +531,11 @@
       "self": "water",
       "neighbor": "tag:hot",
       "chance": 180,
-      "selfBecomes": "steam"
+      "selfBecomes": "steam",
+      "//neighborChance": "A burning oil slick FLOATS on water and burns ~10 s: at the full 180 it would boil a hole in the lake under itself. x0.03 (~5 per-mille) lets the surface simmer.",
+      "neighborChance": {
+        "oil_burning": 0.03
+      }
     },
     {
       "note": "-------- lava: crusts against water, melts sand. Deliberately NOT tag:meltable: glass must be stable next to lava or the pool rim remelts its own crust forever and never sleeps --------"
@@ -2814,6 +2832,63 @@
       "self": "glare",
       "decay": true,
       "chance": 400,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- oil_burning: a POOL of oil alight (2026-09-30) --------\nWhat oil becomes beside heat (oil's gated decay, above). ~10 s a cell: the two retire decays are burnDuration rules FIRST in the bucket, so the lifetime is fixed whatever the emits do. MEASURED, not derived: 13.4 authored / burnDurationPct 200 = 6.7 per-mille reads as a ~150-tick mean, but the `oil-fire` gate measures a lit cell burning TWICE that (half the authored 6.7 burnt 20.1 s), so the realised per-tick rate is half the compiled one here. Retune against the gate's `burn` number (oilFire.burnSecObserved), not the arithmetic. While it burns it throws fire up (the flames over the pool) and pours BLACK SMOKE out of its open faces, ~0.2 a tick -- ~60 cells over a surface cell's life, against the handful a burning plank gives off. Bounded (rule 2): emits only into air, and every cell retires. Water does not douse it (a grease fire floats and keeps burning); choke damp smothers it back to oil (which relights if the fire is still beside it), and rain puts it out slowly."
+    },
+    {
+      "self": "oil_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 9,
+      "becomes": "air"
+    },
+    {
+      "self": "oil_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 4.4,
+      "becomes": "black_smoke"
+    },
+    {
+      "self": "oil_burning",
+      "neighbor": "choke_damp",
+      "chance": 300,
+      "selfBecomes": "oil"
+    },
+    {
+      "self": "oil_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 25,
+      "becomes": "black_smoke"
+    },
+    {
+      "self": "oil_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 70
+    },
+    {
+      "self": "oil_burning",
+      "emit": "black_smoke",
+      "dir": "up",
+      "chance": 150
+    },
+    {
+      "self": "oil_burning",
+      "emit": "black_smoke",
+      "dir": "side",
+      "chance": 50
+    },
+    {
+      "note": "black_smoke fades a little slower than smoke (6 against 9 per-mille, ~5.5 s)."
+    },
+    {
+      "self": "black_smoke",
+      "decay": true,
+      "chance": 6,
       "becomes": "air"
     }
   ]
