@@ -14527,13 +14527,16 @@ reaction flags read it (`materials.h`
   slow to catch for ~`weather.drySeconds` after. Only a rescale: it still holds
   its chunk awake, or a fire front would fall asleep mid-spread.
 
-Rain-exposed (`sim_step.wgsl rainExposed`) = sees the sky, or a horizontal face
-opens onto a cell that does — every read at Chebyshev distance 1, the reach
-`seesSky`'s note proves scheduling-free. So a trunk wets down its sides, and a
-room's interior stays dry only where a ceiling is directly over it (the
-one-cell-up limit `seesSky` already has). The same arithmetic runs in
+Rain-exposed (`sim_step.wgsl rainExposed`, since 2026-09-30) = the cell is not
+below the first ray blocker on its own FALL LINE, by the rain exposure map built
+before the CA (see "Where the rain lands" below), or a horizontal face opens onto
+an air-ish neighbour the map calls exposed. So a roof keeps its floor dry however
+high it is, a windward doorway lets the rain in, and a trunk still wets down its
+sides. (It was "sees the sky one cell up, or a side neighbour does", which made
+every air cell beside an indoor wall rain-open.) The same arithmetic runs in
 `sim_gas.wgsl` (a parcel outside the window is exposed by construction) and on
-bodies and limbs (`RainScaledChance`, `reactcpu.h`; a body counts as exposed).
+bodies and limbs (`RainScaledChance`, `reactcpu.h`, fed by
+`MobSystem::RainExposedCpu`: the same fall line walked on the CPU mirror).
 Every burning material carries a rain douse beside its extinguisher douse, and
 every combustion ignition is rain-damped (`reactions.json`'s RAIN note); snow
 does neither yet. `weather.rainTouchesWorld` off = the word is 0. Gated by
@@ -14570,8 +14573,9 @@ grid is laid out on the TARGET size (`targetW/targetH`), not `viewPx`, which
 under TAA + `render.taaSharpLod` is the native height.
 
 The same word WETS CREATURES (`MobSystem::RainOneLimb`, in the living's and
-the corpses' stain pass): a limb under open sky (`OpenToSky`, InSunlight's
-column probe without the daylight half) has its world-up-facing voxels take one
+the corpses' stain pass): a limb the rain reaches (`RainExposedCpu`, the sim's
+fall line on the CPU mirror; it was `OpenToSky`, a vertical column) has its
+world-up-facing voxels take one
 level of water, sampled every 5 ticks at 1479 x (rain/255)^4 voxels a visit — a
 fourth power so a storm soaks ~20x faster than a drizzle — rinsing a foreign
 coat a level first, capped at 12 x rain/255; the existing wet lifecycle (wick,
@@ -14696,15 +14700,102 @@ replaced four cylinders round the fall axis plus crossfaded horizontal planes:
 any surface a falling drop cannot leave is made of fall lines, so a ray along
 the axis ran parallel to it — a hole, then a seam. It tests each ray against the drop itself — a 3-D
 segment for rain, a point for snow — with pixel-footprint antialiasing, gated
-per drop on the openness grid (it stops at a roof and keeps falling outside) and
-on the camera probe (it rains HERE, not on average). The streaks lean along the
-wind AVERAGED over a 20 m disc round the camera (17 `windAt` samples, one thread
-of the env pass, probe words 4..6) — a point sample swung the sheet with every
-~5 m gust front — at 40% of that wind (80% for snow) and capped at ~35° off
-vertical (~56° snow): the full wind read as sideways rain. Wet ground darkens and
+per drop on the RAIN SHADOW MAP (it stops at a roof, comes in through a windward
+door, and keeps falling outside; below) and on the camera probe (it rains HERE,
+not on average). The streaks lean along the wind AVERAGED over a 20 m disc round
+the camera (17 `windAt` samples, one thread of the env pass, probe words 4..6) —
+a point sample swung the sheet with every ~5 m gust front — at the PRESET's share
+of that wind, capped at its lean (`windShare` / `maxLeanDeg` in
+`assets/weather/*.json`, blended like every other field; absent, they are what
+this used to hard-code: 40% / ~35° for rain, 80% / ~56° for snow; the storm
+authors 1.0 / 70°). A lean too steep for `rainColumns`' 48-column walk pulls the
+tiers' far fade in rather than cutting the far drops. Wet ground darkens and
 glints by `wetness`, a leaky integral of past rain evaluated as a pure sum,
-scaled by openness. Rain does not yet place water or stain the world; it does
-douse fire and damp ignition (above).
+scaled by the rain shadow map's exposure near the eye and by openness past it
+(`farWetness`). Rain stains the ground wet and douses fire / damps ignition
+(above).
+
+#### Where the rain lands (2026-09-30)
+
+Precipitation is a directional light: it arrives along ONE direction, and "is
+this wet" is "is this the first thing on its fall line". Both halves of the
+engine now answer it that way, and neither with the openness grid (which has no
+opinion in empty 4^3 blocks, reads a roof with open sides as ~0.67 open, and
+does not know which way the rain falls).
+
+**Render: the rain shadow map** (`assets/shaders/rain_map.wgsl`, render-only).
+A 512^2 toroidal map, one voxel a texel, round the eye's key in the SHEARED
+coordinate `key = xz + s·y` (`s` = the lean's drift per unit fallen — the
+rain overlay's own `wind / fallV`, so a column of drops is one fall line). Each
+texel holds the top of the first ray blocker its fall line meets coming down
+(`traceOpaque` coarse from the sky bound + two chunks, then fine from just
+before the block it stopped in), and a TAG (key bits + generation) the readers
+check. Per frame, on the ShadowCache table after the clouds: `rain_map_prep`
+(one thread: the lean, the centre, a new generation — i.e. a full re-march —
+when the lean moves by more than 2°) and `rain_map_build` (a thread per texel:
+stale tags, the strip a re-centre uncovered, and 8 rolling rows a frame, so an
+edit reaches the rain in ~1 s). Readers: `rainMapDropVis` per drop (one load; a
+one-voxel ramp under the cover height; nothing above the frame's ray start is
+looked up) and `rainMapExposure` for near-field wet shading (bilinear over the
+2x2 fall lines, exposed within ~1.5 voxels of the line's first blocker). A
+header stamped with another frame, `weather.rainShadowMap` off, or a texel
+outside the map: the openness path of before. `--render-budget` arm
+`norainmap` A/Bs it (pin the sky: `SANDVOX_WEATHER=rain`). Measured 2026-09-30,
+RTX 3060 Ti 1080p: +0.0..0.2 ms a frame over the openness gate (rows ~0.05-0.1 of
+it), under rain and under a 70° storm lean alike. `--shot` frames
+`screenshot_rain_{calm,wind,storm}_{in,out,pav}` (+ `_storm_out_nomap`): a
+roofed hut with a doorway and an open pavilion, three skies.
+
+**Sim: a slope on the tick stream, a slanted sampler, an exposure map.**
+`weather::SimRain` puts the rain SLOPE beside the word
+(`TickParams.rainSlopeQx/Qz`, the old `padWp2/3`): Q16 drift per cell fallen,
+integer end to end — the MEAN wind of `WindWeatherQ` (not gusts, not the wind
+primitives: one slope per tick for the whole window), the preset's `windShare`
+and lean cap quantised through an integer tangent table, a fall speed of
+(8.5 − 7.4·snow) m/s, rounded to SIXTEENTHS and capped at 44/16 (70°). Latched,
+recorded and replayed with the word (`TickRain`, `opstream::RecordedRainSlope`).
+0 when no rain reaches the ground; then nothing slanted runs. The lattice
+(`src/sim/rainexpo.h`, byte-copied into three shaders) is
+`key(c) = c.xz + (n·c.y + 8) >> 4`, anchored to absolute y; a line's path between
+levels is an L (down, along x, along z), so a line moving 2-3 cells a level cannot
+step through a one-voxel wall.
+
+- `sim_mutate.wgsl rainFall` walks 8x8 KEY tiles along the fall line (the top
+  face plus the strip upwind whose lines enter through the window's side). It
+  lands only on a line's own MAIN cell — every cell is the main cell of exactly
+  one line, so no two threads can write one cell; a drop spent against another
+  line's cell writes nothing. Thread count fixed at today's 4096: a slant's extra
+  tiles are visited by a window advancing each tick, which thins the rain per
+  unit of ground by tiles/4096 (0.27x at the 70° cap) instead of multiplying the
+  pass. At slope 0 it is the old column walk, hash for hash.
+- `sim_rain_expo.wgsl` (row `rainExpo`, before the CA, only on ticks with rain
+  or wetness and an active CA): per 4-key texel, the level of the first ray
+  blocker on the texel's representative line (key 4t + 2), marched down from
+  the window top with an exact sentinel-chunk skip. REBUILT IN FULL every tick
+  that can read it — no history, so nothing to carry across a save, a load, a
+  replay start or a window move. The CA reads it read-only; that snapshot is what
+  makes a long read legal where `seesSky`'s 48-cell column was not.
+- `stainDry`: while it rains, a wet cell the map calls exposed (read leniently,
+  the 3x3 texels round it) is the rain's surface like a top face — it neither
+  dries nor holds its chunk awake. Without it a storm's lean wetted every riser
+  and trunk flank and the CA went 1.3 → 9.1 ms a tick in `--perf --scenario idle`.
+- CPU mirror: `MobSystem::RainExposedCpu` walks the same representative line
+  UPWARD from the body over the CPU chunk cache (`rainlat::ExposedWalkUp`; an
+  uncached chunk ends the walk exposed and asks for it, `OpenToSky`'s rule), for
+  body douses/damps (`ReactLightMatches(..., rainExposed)`) and `RainOneLimb`.
+
+Gated by `--gate rain-lean`: a floating stone hut with a doorway under two
+pinned skies and a pinned wind into the door — embers doused on the open pad in
+both, doused inside the door only under the 70° lean, never behind the lee
+wall; after the storm the windward face wet and the lee face dry; the CPU walk
+and the GPU map agree at every sampled cell. `rain-stain` pins its wind calm
+(its one-voxel trenches judge the lean's geometry, not the stain rules).
+Measured (`--perf --scenario idle`, `SANDVOX_WEATHER=storm`, RTX 3060 Ti): per
+raining tick `rainExpo` 0.73 ms at the default wind's lean (11/16 on a diagonal),
+1.45 ms at the 70° cap on a diagonal; `rainFall` 0.21 → 0.47 ms at the default
+lean, 0.35 ms at the cap (longer slanted walks, same thread count); the CA 1.33 →
+1.8 ms at the default lean, 1.2 ms at the cap (more surfaces wet at first
+contact). Dry ticks: `rainExpo` unrecorded, `rainFall` 0.07 ms as before.
 
 **Cost (RTX 3060 Ti, 1080p, `cloudResDiv` 3):** ~1.2 ms of GPU per frame under a
 scattered sky in the game loop (march 0.84, weather 0.14, env/resolve/shadow

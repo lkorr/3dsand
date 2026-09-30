@@ -3347,6 +3347,11 @@ struct Tuning {
     float precipScale = TPD(weather, precipScale);
     // Time constant, in sim seconds, over which rained-on ground dries.
     float drySeconds = TPD(weather, drySeconds);
+    // The RAIN SHADOW MAP (rain_map.wgsl, render-only): drops and wet ground
+    // follow the lean of the fall, so a roof keeps its floor dry and a
+    // windward door lets a wedge of rain in. Off = the old openness gate
+    // (its rows are not recorded) -- the A/B switch, not a look knob.
+    bool rainShadowMap = TPD(weather, rainShadowMap);
     // ---- where the sky touches the WORLD (weather::SimRainWord) ----
     // The one sim-affecting half of the weather: rain on the tick stream, read
     // by reactions authored "rain" (douses) and "rainDamped" (ignitions).

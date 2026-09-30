@@ -205,6 +205,19 @@ enum class Buf : uint8_t {
   // like ShadowCache: never hashed, never saved, sized on the render TARGET
   // (Simulation::EnsureRayStart), not the world.
   RayStart,
+  // The rain shadow map (assets/shaders/rain_map.wgsl): per fall line of this
+  // frame's precipitation lean, the top of the first blocker. WRITTEN by the
+  // two per-frame rows on the ShadowCache table, READ by raymarch.wgsl's rain
+  // overlay and wet shading in the same command buffer. Render-private like
+  // RayStart: never hashed, never saved, never bound by a sim kernel.
+  RainMap,
+  // The RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl, src/sim/
+  // rainexpo.h): per 4-key texel of the tick's fall-line lattice, the level of
+  // the first ray blocker. SIM state, unlike RainMap above: written by the
+  // tick's rainExpo row before the CA, read by the CA's rainExposed. Rebuilt
+  // in full on every tick that can read it, so it is not hashed or saved (it
+  // is a pure function of the grid and TickParams at that point of the tick).
+  RainExpo,
   ShadowArgsStage,
   ShadowArgs,
   // ---- the openness (sky-visibility) grid (world.h kOpenFaces) ----
@@ -291,6 +304,8 @@ enum class Pipe : uint8_t {
   // Rain on the ground and the drying of wet top surfaces (sim_mutate.wgsl
   // `rainFall`): one thread per kRainTile^2 column tile, every tick.
   RainFall,
+  // The rain exposure map (sim_rain_expo.wgsl `build`), before the CA.
+  RainExpo,
   Compact, CompactNext,
   Step,
   Occupancy, OccupancyDirty,
@@ -381,6 +396,9 @@ enum class Pipe : uint8_t {
   // The ray-start map (ray_start.wgsl), per-FRAME rows on the ShadowCache
   // table, after the sky bound they read and before the resolve.
   RayStartTrace, RayStartMin,
+  // The rain shadow map (rain_map.wgsl), per-FRAME rows on the ShadowCache
+  // table, after the clouds (the prep reads the env pass's wind probe).
+  RainMapPrep, RainMapBuild,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
@@ -544,6 +562,15 @@ enum class Cond : uint8_t {
   // key check reads the stale key as "not this frame" and marches from
   // the camera.
   RayStart,
+  // RainMap: the rain shadow map's two rows (RecordCtx::cloudFlags bit 8: the
+  // clouds are on, it is precipitating, render.rainShadowMap is on and no
+  // harness switched it off). Off = no row, and the readers' stamp check sees
+  // a stale header and take the openness path.
+  RainMap,
+  // RainExpo: the rain exposure map's row (RecordCtx::rainExpoGroups > 0:
+  // rain or wetness in the tick's rain word, i.e. exactly the ticks on which
+  // the CA's rainExposed can be asked).
+  RainExpo,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -629,6 +656,12 @@ enum class DispatchSel : uint32_t {
   // each thread against this frame's own size) ----
   RayStartGx,
   RayStartGy,
+  // ---- the rain lattice (src/sim/rainexpo.h): one THREAD per key tile of
+  // sim_mutate's rainFall, one per texel of sim_rain_expo, 64 to a group --
+  // both extents depend on the tick's rain slope, so the CPU computes them
+  // with the same integer formulas the kernels bound themselves by ----
+  RainFallSel,
+  RainExpoSel,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
 };
 
@@ -783,6 +816,10 @@ struct RecordCtx {
   // Workgroups (8x8) over the ray-start map's sample grid; 0 = no buffer
   // yet, and then neither ray-start row records (Cond::RayStart).
   uint32_t rayStartGx = 0, rayStartGy = 0;
+  // The rain lattice's workgroup counts (Simulation::SetTickRain). rainFall's
+  // is never 0 (it runs every tick: rain or drying); rainExpo's is 0 on a
+  // tick with neither rain nor wetness, which leaves its row unrecorded.
+  uint32_t rainFallGroups = 64, rainExpoGroups = 0;
 };
 
 }  // namespace pass

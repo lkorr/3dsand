@@ -584,6 +584,20 @@ class Simulation {
   // Leave the ray-start map's rows unrecorded (the `norstart` arm): the
   // raymarch then reads a stale key and marches every ray from the camera.
   void SetRayStartOff(bool on) { rayStartOff_ = on; }
+  // Leave the rain shadow map's rows unrecorded (the `norainmap` arm): the
+  // raymarch's stamp check then reads the header as stale and gates rain and
+  // wetness on openness, the pre-map path.
+  void SetRainMapOff(bool on) { rainMapOff_ = on; }
+  // THE RAIN LATTICE for the next EncodeTick (src/sim/rainexpo.h): this
+  // tick's TickParams weatherRain + rainSlopeQx/Qz and window origin (chunks),
+  // from which the rainFall and rainExpo dispatch extents are computed with
+  // the kernels' own integer formulas. SubmitTick calls it beside the
+  // TickParams upload; a caller that never does gets the vertical, dry
+  // defaults (64 rainFall groups, no exposure map).
+  void SetTickRain(uint32_t rainWord, int32_t slopeQx, int32_t slopeQz,
+                   IVec3 originChunk);
+  // The rain exposure map buffer, for a gate's readback (rain-lean) only.
+  const rhi::Buffer& RainExpoBuffer() const { return rainExpoBuf_; }
 
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
@@ -781,6 +795,11 @@ class Simulation {
   rhi::ComputePipeline windWake_;
   // Rain on the ground + drying of wet top surfaces (sim_mutate.wgsl rainFall).
   rhi::ComputePipeline rainFall_;
+  rhi::ComputePipeline rainExpo_;   // sim_rain_expo.wgsl `build`
+  // The rain exposure map (rainexpo.h), 45 in simBGL_, and the two extents
+  // SetTickRain derives for the next EncodeTick.
+  rhi::Buffer rainExpoBuf_;
+  uint32_t rainFallGroups_ = 64, rainExpoGroups_ = 0;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five
@@ -827,6 +846,8 @@ class Simulation {
   rhi::ComputePipeline skyTopClear_, skyTopReduce_;
   // The ray-start map (ray_start.wgsl rayStartTrace / rayStartMin).
   rhi::ComputePipeline rayStartTrace_, rayStartMin_;
+  // The rain shadow map (rain_map.wgsl rainMapPrep / rainMapBuild).
+  rhi::ComputePipeline rainMapPrep_, rainMapBuild_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -880,6 +901,7 @@ class Simulation {
   bool deferRayVariantOk_ = false;
   bool forceUniversalRay_ = false;
   bool rayStartOff_ = false;
+  bool rainMapOff_ = false;
   rhi::TextureFormat targetFormat_ = rhi::TextureFormat::Undefined;
 
   rhi::Texture depthTex_;
@@ -979,6 +1001,9 @@ class Simulation {
   // The buffer EnsureRayStart last replaced, kept alive one growth longer
   // because the frame that grew it had already recorded the prepass against it.
   rhi::Buffer rayStartPrev_;
+  // The rain shadow map (rain_map.wgsl; world.h kRainMap*): fixed size, made
+  // at Init. 22 in shadowBGL_ (compute, written), 33 in renderBGL_ (fragment).
+  rhi::Buffer rainMapBuf_;
   uint32_t rayStartW_ = 0, rayStartH_ = 0;
   uint64_t veilPixels_ = 0;
   rhi::BindGroup renderBGNoVeil_;

@@ -647,6 +647,11 @@ const char* const kOrder[] = {
     // absolute coordinates under pinned skies, restores the pin, regenerates
     // on the way out -- stain-react's reasons, stain-react's slot.
     "rain-stain",
+    // The rain's slope and where it lands (2026-09-30): a stone fixture at
+    // absolute coordinates under two pinned skies and a pinned wind, the
+    // pin, the tuning and the world restored on the way out -- rain-stain's
+    // reasons, rain-stain's slot.
+    "rain-lean",
     // The substep stamp alias vs sleep (rule-unification W2-R): acid shafts
     // on anchored steel columns at absolute coordinates, weather pinned clear
     // and restored, regenerates on the way out -- stain-react's reasons.

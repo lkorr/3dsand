@@ -4969,6 +4969,15 @@ class MobSystem {
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
   // TickParams::weatherRain for this tick (materials.h kRainAmountMask et al).
   void SetWeatherRain(uint32_t w) { weatherRain_ = w; }
+  // The tick's rain slope (TickParams rainSlopeQx / Qz, weather::TickRain),
+  // latched beside the word: what RainExposedCpu walks along.
+  void SetRainSlope(int32_t sx, int32_t sz) { rainSlopeQx_ = sx; rainSlopeQz_ = sz; }
+  // Does the rain reach a body at `p` (world cells)? The sim's rain exposure
+  // (sim_rain_expo.wgsl + sim_step rainExposed's map half) walked on the CPU
+  // mirror: the representative fall line of p's texel, upward from p, for a
+  // ray blocker (src/sim/rainexpo.h ExposedWalkUp). An uncached chunk ends the
+  // walk EXPOSED and asks for the chunk, OpenToSky's rule.
+  bool RainExposedCpu(World& world, const Vec3& p) const;
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
   // The loader's leftovers, so this system can build one more creature after
@@ -7284,6 +7293,7 @@ class MobSystem {
   std::vector<uint32_t> ignitedForm_;
   uint32_t dayPhase_ = 0;
   uint32_t weatherRain_ = 0;
+  int32_t rainSlopeQx_ = 0, rainSlopeQz_ = 0;
   // EVERY LIVE BODY POINTS INTO THIS VECTOR (Mob::def_, and the avatar's too,
   // which this system cannot reach). So it is never allowed to reallocate
   // after a load: SetDefs reserves room for kDerivedDefs compositions up

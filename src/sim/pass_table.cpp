@@ -15,11 +15,13 @@
 #include "sim/world.h"
 
 namespace {
-// sim_mutate.wgsl `rainFall`: one thread per RAIN_TILE x RAIN_TILE column tile
-// of the window, 64 to a workgroup. kRainTile must match RAIN_TILE there.
+// sim_mutate.wgsl `rainFall`: one thread per RAIN_TILE x RAIN_TILE KEY tile of
+// the tick's fall-line lattice (src/sim/rainexpo.h), 64 to a workgroup; the
+// count follows the rain slope (D_RAINFALL, Simulation::SetTickRain). At a
+// vertical fall it is the window's column tiles, kRainFallGroupsFlat.
 constexpr uint32_t kRainTile = 8;
-constexpr uint32_t kRainFallGroups = (kWorldN / kRainTile) * (kWorldN / kRainTile) / 64;
-static_assert(kRainFallGroups > 0 && kRainFallGroups < 0x10000000u, "literal extent");
+constexpr uint32_t kRainFallGroupsFlat = (kWorldN / kRainTile) * (kWorldN / kRainTile) / 64;
+static_assert(kRainFallGroupsFlat == 64, "RecordCtx::rainFallGroups' default");
 // The sky bound's reduce (shadow_resolve.wgsl skyTopReduce): one thread per far
 // occupancy word, 64 per group, and a group never straddles two levels.
 static_assert((kFarNumChunks % 64u) == 0u, "skyTopReduce groups straddle levels");
@@ -53,6 +55,7 @@ namespace {
 #define PIPE_MUTATE_CELLS    Pipe::MutateCells
 #define PIPE_WIND_WAKE       Pipe::WindWake
 #define PIPE_RAIN_FALL       Pipe::RainFall
+#define PIPE_RAIN_EXPO       Pipe::RainExpo
 #define PIPE_COMPACT         Pipe::Compact
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
@@ -88,6 +91,8 @@ namespace {
 #define PIPE_SKY_TOP_REDUCE  Pipe::SkyTopReduce
 #define PIPE_RAY_START_TRACE Pipe::RayStartTrace
 #define PIPE_RAY_START_MIN   Pipe::RayStartMin
+#define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
+#define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark
@@ -191,8 +196,12 @@ namespace {
 #define C_CLOUDBAKE Cond::CloudBake
 #define C_SHADOWON  Cond::ShadowCacheOn
 #define C_RAYSTART  Cond::RayStart
+#define C_RAINMAP   Cond::RainMap
+#define C_RAINEXPO  Cond::RainExpo
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
+#define D_RAINFALL  (uint32_t)DispatchSel::RainFallSel
+#define D_RAINEXPO  (uint32_t)DispatchSel::RainExpoSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
 #define D_CELLS     (uint32_t)DispatchSel::Cells
 #define D_EXP       (uint32_t)DispatchSel::Exp

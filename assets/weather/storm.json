@@ -14,5 +14,7 @@
   "precip": 0.95,
   "precipType": 0.0,
   "mist": 1.8,
-  "lightning": 7.0
+  "lightning": 7.0,
+  "windShare": 1.0,
+  "maxLeanDeg": 70
 }

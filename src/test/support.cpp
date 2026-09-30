@@ -540,6 +540,10 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   cp.cirrus = w.cirrus;
   cp.cirrusAltM = w.cirrusAltM;
   cp.precipType = w.precipType;
+  // The lean of the fall (weather::Preset windShare / leanTan): what the rain
+  // overlay draws the streaks along and the rain shadow map is built along.
+  cp.rainWindShare = w.windShare;
+  cp.rainLeanTan = w.leanTan;
   cp.overcast = st.overcast;
   cp.wetness = st.wetness;
   cp.mist = w.mist;
@@ -695,6 +699,12 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
     gCloudFrame.on = on;
     gCloudFrame.lowW = lowW;
     gCloudFrame.lowH = lowH;
+    // The rain shadow map (rain_map.wgsl) runs while anything reads it: rain
+    // streaks near the camera, or ground still wet from rain that has
+    // stopped (the wet shading reads it too, and falling back to openness
+    // the moment the rain stopped would wet every floor under a roof).
+    gCloudFrame.rainMap = on && tun.weather.rainShadowMap &&
+                          ((rp.weatherFlags & kRwfRain) != 0u || st.wetness > 0.001f);
   }
 }
 
@@ -1272,8 +1282,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // ONE value per tick, shared with the CPU rain readers the session fed
     // from the same latch (weather::LatchTickRain); a replay takes the
     // recorded word, because the pin inside it is a human input.
-    tp.weatherRain = weather::TakeTickRain(wtun, seed, tick);
+    // The rain SLOPE rides the same latch (weather.h TickRain) and the same
+    // record: one value per tick, the replay's when replaying.
+    {
+      const weather::TickRain tr = weather::TakeTickRain(wtun, seed, tick);
+      tp.weatherRain = tr.word;
+      tp.rainSlopeQx = tr.slopeQx;
+      tp.rainSlopeQz = tr.slopeQz;
+    }
     opstream::RecordedWeatherRain(tick, tp.weatherRain);
+    opstream::RecordedRainSlope(tick, tp.rainSlopeQx, tp.rainSlopeQz);
+    // The rainFall / rainExpo dispatch extents follow the slope and the
+    // window: handed to the recorder from the very values the kernels read.
+    sim.SetTickRain(tp.weatherRain, tp.rainSlopeQx, tp.rainSlopeQz,
+                    world.WindowOrigin());
     // The gas edge (docs/PLAN_gas_particles.md). Read here, from the same
     // tuning snapshot windMode comes from, so the value the kernel branches on
     // and the value Simulation gates Cond::Gas on are one read.

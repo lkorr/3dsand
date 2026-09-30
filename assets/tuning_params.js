@@ -910,6 +910,7 @@ const TUNING_PARAMS = {
   'weather.coverageBias':{t:'f',def:0,min:-1,max:1},
   'weather.precipScale':{t:'f',def:1,min:0,max:4},
   'weather.drySeconds':{t:'f',def:240,min:5,max:36000},
+  'weather.rainShadowMap':{t:'b',def:true},
   'weather.rainTouchesWorld':{t:'b',def:true},
   'weather.rainIgniteDamp':{t:'f',def:0.6,min:0,max:1},
   'combustion.burnDurationPct':{t:'i',def:200,min:25,max:800},

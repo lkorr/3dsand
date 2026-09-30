@@ -2222,6 +2222,134 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
            -0.85f, "screenshot_openness_floor.bmp");
   }
 
+  // ---- rain cover: the RAIN SHADOW MAP (rain_map.wgsl, DESIGN.md 9.w) ----
+  // Rain and wet ground under a roof, in three skies: rain with no wind, rain
+  // in a moderate wind, and the storm's steep lean (70 degrees) blowing
+  // straight INTO the hut's doorway. Two structures, side by side on one
+  // levelled stone pad: a closed HUT with a doorway in its -Z wall, and an
+  // open-sided PAVILION (a roof on four posts). What each sky must show:
+  //   calm      no drops and no wet floor inside either structure;
+  //   moderate  the same, less a thin sliver at the pavilion's downwind edge;
+  //   storm     a wedge of drops and wet floor just inside the doorway, the
+  //             hut's lee (+Z) wall dry, the pavilion's upwind half wet and
+  //             its downwind half dry, and the open pad identical to calm.
+  // The wind is PINNED (weatherAuto off, no gusts) so the lean is the one the
+  // frame says; the rain is pinned with weather::SetOverride + Snap so the
+  // very first of the four warm frames already rains.
+  {
+    const int gx = 300, gz = 250;          // hut centre
+    const int px = gx + 44;                // pavilion centre, same z
+    const int kR = 12, kH = 20;            // hut half-extent / interior height
+    const int kP = 12, kPH = 18;           // pavilion half-extent / roof height
+    int floorY = 0;
+    for (int x = gx - kR - 12; x <= px + kP + 12; x += 4)
+      for (int z = gz - kR - 24; z <= gz + kR + 12; z += 4)
+        floorY = std::max(floorY, World::TerrainHeight(x, z, kDefaultSeed));
+    std::vector<CellOp> ops;
+    auto put = [&](int x, int y, int z, uint32_t mat) {
+      IVec3 c{x, y, z};
+      if (!world.CellInWindow(c)) return;
+      ops.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
+    };
+    // The pad: stone from 4 below the highest ground to floorY, air above it
+    // up past both roofs, so no tree or tuft stands in either structure.
+    for (int x = gx - kR - 12; x <= px + kP + 12; x++)
+      for (int z = gz - kR - 24; z <= gz + kR + 12; z++) {
+        for (int y = floorY - 4; y <= floorY; y++) put(x, y, z, kMatStone);
+        for (int y = floorY + 1; y <= floorY + kH + 8; y++) put(x, y, z, kMatAir);
+      }
+    // The hut: roof two thick, four walls, a 7-wide x 12-high doorway in -Z.
+    for (int x = -kR; x <= kR; x++)
+      for (int z = -kR; z <= kR; z++) {
+        put(gx + x, floorY + kH, gz + z, kMatWood);
+        put(gx + x, floorY + kH + 1, gz + z, kMatWood);
+      }
+    for (int y = 1; y < kH; y++)
+      for (int t = -kR; t <= kR; t++) {
+        const bool door = (t >= -3 && t <= 3 && y <= 12);
+        if (!door) put(gx + t, floorY + y, gz - kR, kMatStone);
+        put(gx + t, floorY + y, gz + kR, kMatStone);
+        put(gx - kR, floorY + y, gz + t, kMatStone);
+        put(gx + kR, floorY + y, gz + t, kMatStone);
+      }
+    // The pavilion: a roof on four 2x2 posts, open on every side.
+    for (int x = -kP; x <= kP; x++)
+      for (int z = -kP; z <= kP; z++) {
+        put(px + x, floorY + kPH, gz + z, kMatWood);
+        put(px + x, floorY + kPH + 1, gz + z, kMatWood);
+      }
+    for (int y = 1; y < kPH; y++)
+      for (int sx : {-kP, kP - 1})
+        for (int sz : {-kP, kP - 1})
+          for (int dx = 0; dx < 2; dx++)
+            for (int dz = 0; dz < 2; dz++)
+              put(px + sx + dx, floorY + y, gz + sz + dz, kMatWood);
+    // ~130k cell ops: more than one tick's kMaxCellOpsPerTick, so they go in
+    // slices (a clamped stream would silently drop the tail -- the roofs).
+    uint32_t t = 141;
+    for (size_t at = 0; at < ops.size(); at += 60000, t++) {
+      const size_t end = std::min(ops.size(), at + 60000);
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 std::vector<CellOp>(ops.begin() + (long)at, ops.begin() + (long)end),
+                 false, {8, 3, 8}, false, false);
+    }
+    for (uint32_t k = 0; k < 6; k++, t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+
+    struct Sky { const char* tag; const char* preset; float speed; };
+    // windDirDeg 0 = downwind +Z (wind.h: heading 0 = +Z), i.e. INTO the
+    // doorway in the -Z wall. 30 m/s x the storm's windShare 1.0 over rain's
+    // 8.5 m/s fall is 74 degrees, so the storm's 70-degree cap is what binds.
+    const Sky skies[] = {{"calm", "rain", 0.0f},
+                         {"wind", "rain", 8.0f},
+                         {"storm", "storm", 30.0f}};
+    const Tuning saved = CurrentTuning();
+    const std::string savedPin = weather::Override();
+    for (const Sky& sky : skies) {
+      Tuning tr = saved;
+      tr.wind.weatherAuto = false;
+      tr.wind.windDirDeg = 0.0f;
+      tr.wind.windSpeed = sky.speed;
+      tr.wind.gustStrength = 0.0f;
+      SetCurrentTuning(tr);
+      weather::SetOverride(sky.preset);
+      weather::Snap();
+      char name[96];
+      // Inside the hut, back to its lee wall, looking out through the door:
+      // the drop wedge and the wet floor wedge are between the eye and it.
+      std::snprintf(name, sizeof name, "screenshot_rain_%s_in.bmp", sky.tag);
+      render({(float)gx, (float)(floorY + 10), (float)(gz + kR - 3)}, -1.5708f,
+             -0.22f, name);
+      // Outside, off the windward corner, both structures in frame: the open
+      // pad (must match calm), the hut's wet windward wall, the pavilion.
+      std::snprintf(name, sizeof name, "screenshot_rain_%s_out.bmp", sky.tag);
+      render({(float)(gx - 30), (float)(floorY + 14), (float)(gz - 46)}, 1.05f,
+             -0.14f, name);
+      // The same storm frame with the map OFF (the openness gate of before):
+      // the A/B that says the open ground did not change, pixel for pixel
+      // away from the structures.
+      if (std::strcmp(sky.tag, "storm") == 0) {
+        Tuning tn = tr;
+        tn.weather.rainShadowMap = false;
+        SetCurrentTuning(tn);
+        render({(float)(gx - 30), (float)(floorY + 14), (float)(gz - 46)}, 1.05f,
+               -0.14f, "screenshot_rain_storm_out_nomap.bmp");
+        SetCurrentTuning(tr);
+      }
+      // Beside the pavilion looking +X, ACROSS the wind (which blows toward
+      // +Z): which half of its floor is wet, and whether any drop falls under
+      // its roof.
+      std::snprintf(name, sizeof name, "screenshot_rain_%s_pav.bmp", sky.tag);
+      render({(float)(px - kP - 6), (float)(floorY + 12), (float)gz}, 0.0f,
+             -0.35f, name);
+    }
+    SetCurrentTuning(saved);
+    weather::SetOverride(savedPin);
+    weather::Snap();
+  }
+
   // ---- blood: the spatter case AND the pooled case, in one frame ----
   // Blood's whole shading problem is that it is usually NOT a still pool: it
   // comes out of NPCs as droplets, runs and thin trails. shadeViscous blends

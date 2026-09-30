@@ -662,6 +662,7 @@ const TUNING_SCHEMA = [
       {k:'coverageBias', n:'coverage bias', d:'Added to every preset\'s coverage: the global "cloudier / clearer" knob.', step:0.01},
       {k:'precipScale', n:'raininess scale', d:'Multiplier on every preset\'s raininess: the global "wetter / drier" knob.', step:0.05},
       {k:'drySeconds', n:'ground dry time (s)', d:'How long rained-on ground takes to dry, in sim seconds. Also how long wet ground stays slow to catch fire.', step:5, u:'s'},
+      {k:'rainShadowMap', n:'rain shadow map', d:'On: rain streaks and wet ground follow the lean of the fall (a per-frame shadow map along it), so a roof keeps its floor dry and a windward doorway lets a wedge of rain in. Off: the old openness gate, which does not know which way the rain falls. Render-only.', bool:true},
       {k:'rainTouchesWorld', n:'rain touches the world', d:'On: rain douses fire and damps ignition on rain-exposed cells, bodies and limbs (reactions authored "rain" / "rainDamped"). Off: the sim sees a dry sky whatever is drawn.', bool:true},
       {k:'rainIgniteDamp', n:'rain ignition damp', d:'How much of an exposed ignition chance full rain or soaked ground removes. 0.6 = soaked ground (a storm) keeps 40% of a dry ignition chance, a drizzle about 57%; the rain douse rules are what actually put a fire out.', step:0.05},
     ],

@@ -2946,9 +2946,13 @@ struct TickParams {
   // 0 = a dry sky and every such rule takes its dry path.
   uint32_t weatherRain = 0;
   int32_t windPrimLo[3] = {1, 1, 1};   // union AABB of every live primitive,
-  int32_t pad_wp2 = 0;                 // inclusive world cells (lo > hi = none)
+  // THE RAIN SLOPE (weather::SimRainSlopeQ; was the pad_wp2 / pad_wp3 pair,
+  // so the layout is unchanged): Q16 horizontal cells a drop drifts per cell
+  // it falls. Integer, latched once per tick beside weatherRain and recorded
+  // with it for ops-replay; 0 whenever weatherRain's amount is 0.
+  int32_t rainSlopeQx = 0;             // inclusive world cells (lo > hi = none)
   int32_t windPrimHi[3] = {0, 0, 0};
-  int32_t pad_wp3 = 0;
+  int32_t rainSlopeQz = 0;
   // kWindPrimCap primitives x kWindPrimWords i32 words. Declared WGSL-side as
   // array<vec4<i32>, 3 * WIND_PRIM_CAP>, which is the same bytes: std140
   // strides a uniform array to 16 B, so three rows per primitive is the
@@ -3578,6 +3582,14 @@ constexpr uint64_t kCloudNoiseWords =
 //              m/s f32, written by the env pass — what the rain streaks lean
 //              along; 7 spare]
 constexpr uint32_t kCloudProbeWords = 8;
+// THE RAIN SHADOW MAP (assets/shaders/rain_map.wgsl, DESIGN.md 9.w): a
+// kRainMapN^2 toroidal grid of fall lines round the eye, one voxel a texel,
+// two words each (cover height, tag), behind a kRainMapHeaderWords header.
+// Render-only. NOT in the shader prelude on purpose (a prelude line misses the
+// SPIR-V cache for every shader): rain_map.wgsl and raymarch.wgsl declare
+// RMAP_N / RMAP_HEADER themselves, and must agree with these.
+constexpr uint32_t kRainMapN = 512;
+constexpr uint32_t kRainMapHeaderWords = 16;
 constexpr uint64_t kCloudMapsWords =
     (uint64_t)kCloudShadowN * kCloudShadowN +
     (uint64_t)kCloudEnvN * kCloudEnvN * 2 + kCloudProbeWords;
@@ -3618,7 +3630,10 @@ struct CloudParams {
   uint32_t lowW = 0, lowH = 0, fullW = 0, fullH = 0;
   // Word offsets of the two history halves: `histCur` is written this frame
   // and is what the composite reads; `histPrev` is last frame's.
-  uint32_t histCur = 0, histPrev = 0, resDiv = 2, pad_c0 = 0;
+  uint32_t histCur = 0, histPrev = 0, resDiv = 2;
+  // The precipitation's lean (weather::Preset windShare / maxLeanDeg, blended):
+  // share of the camera wind a drop takes. common.wgsl `rainWindShare`.
+  float rainWindShare = 0.4f;
   // ---- the weather (weather::State::mix) ----
   float coverage = 0.0f, cloudType = 0.5f, density = 1.0f, precip = 0.0f;
   float baseM = 1400.0f, thicknessM = 1600.0f, darkness = 0.0f, cirrus = 0.0f;
@@ -3632,7 +3647,9 @@ struct CloudParams {
   // grid so the map does not swim as the camera moves.
   float weatherOrigin[2]; float weatherTexelM = 125.0f; float shadowTexelM = 40.0f;
   // The shadow map's texel 0 corner at the deck-base plane, and that plane.
-  float shadowOrigin[2]; float shadowPlaneM = 1400.0f; float pad_c1 = 0.0f;
+  float shadowOrigin[2]; float shadowPlaneM = 1400.0f;
+  // tan of the lean cap (0.7 = today's rain, 1.5 = snow). `rainLeanTan`.
+  float rainLeanTan = 0.7f;
   float weatherOff[2]; float windX = 0.0f, windZ = 1.0f;
   // Lightning stroke: absolute metres (x, altitude, z) and brightness.
   float flash[3]; float flashAmp = 0.0f;

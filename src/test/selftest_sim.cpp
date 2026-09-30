@@ -27,6 +27,7 @@
 #include "sim/rng_simd.h"  // rng::Pcg8 / JitterStateInRow8 (the simd gate)
 #include "sim/scan.h"      // scan::FirstIndexWhereMasked   (the simd gate)
 #include "sim/weather.h"  // SetOverride / SimRainWord (rain-fire gate)
+#include "sim/rainexpo.h"  // rain-lean: the fall-line lattice, CPU side
 #include "sim/stream.h"  // RleEncodeChunk / RleEncodeSentinelChunk (fusion gate)
 
 using namespace sandvox;
@@ -5970,6 +5971,19 @@ Status GateRainStain(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   const std::string prevPin = weather::Override();
+  // THE WIND IS PINNED CALM (2026-09-30): the rain falls along the tick's
+  // slope now (rain-lean), and this fixture's strips are one-voxel trenches
+  // walled a voxel above their floor -- a slanted line meets the wall top or
+  // the trench's edge before its floor, so under the auto wind the strips
+  // would be judged on the geometry of the lean, not on the stain rules this
+  // gate is about. The slant is rain-lean's; the stains are this gate's.
+  const Tuning savedTune = CurrentTuning();
+  {
+    Tuning t = savedTune;
+    t.wind.weatherAuto = false;
+    t.wind.windSpeed = 0.0f;
+    SetCurrentTuning(t);
+  }
   weather::SetOverride("clear");
   weather::Snap();
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -6089,6 +6103,7 @@ Status GateRainStain(Ctx& c, std::string& detail) {
 
   weather::SetOverride(prevPin);
   weather::Snap();
+  SetCurrentTuning(savedTune);
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
@@ -6124,6 +6139,250 @@ Status GateRainStain(Ctx& c, std::string& detail) {
       dryMaxFrac, sleeps ? "ok" : "FAIL", awake, chunkBuf.size());
   detail = buf;
   std::printf("rain-stain: %s\n", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- rain-lean: the rain falls ALONG ITS SLOPE, and only where it lands ------
+//
+// 2026-09-30 (DESIGN.md §9.w "Where the rain lands"). The sim's rain follows a
+// slope on the tick stream (weather::SimRain -> TickParams rainSlopeQx/Qz): the
+// ground sampler (sim_mutate rainFall) walks the slanted fall line, and a rain
+// DOUSE reaches a cell only if the rain exposure map (sim_rain_expo, built
+// before the CA) says it is the first blocker on its fall line. This gate
+// builds one floating stone fixture -- a pad, a roofed hut with a doorway in
+// its -Z wall -- and asserts, under a pinned wind blowing +Z (into the door):
+//
+//   rain, no wind (slope 0): embers on the open pad are doused, embers on the
+//     hut floor just inside the door are NOT (the roof is over them);
+//   storm, 30 m/s (slope at the 70-degree cap): embers on the open pad ARE
+//     doused, the same embers inside the door ARE (the rain comes in at 70
+//     degrees), embers behind the hut's lee wall are NOT;
+//   stains after the storm: the windward (-Z) wall's outer face wet, the lee
+//     (+Z) face dry;
+//   the CPU mirror (MobSystem::RainExposedCpu's walk, rainexpo.h
+//     ExposedWalkUp over the read-back grid) agrees with the GPU map at every
+//     sampled cell of the fixture, before any fire exists to move under it.
+//
+// An ember becomes WOOD only by a douse (its `rain` rule or an extinguisher,
+// and there is none): so "doused" is a wood cell at the site, and a sheltered
+// site must show exactly none. The pin, the tuning and the world are restored
+// on the way out (rule 7).
+Status GateRainLean(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mStone = matId("stone"), mEmber = matId("ember"),
+                 mWood = matId("wood"), mWater = matId("water");
+  if (!mStone || !mEmber || !mWood || !mWater) {
+    detail = "stone/ember/wood/water missing from materials.json";
+    return Status::Fail;
+  }
+  const uint32_t wetType = c.mats[mWater].gpu.stainPack & kStainPackTypeMask;
+  const std::string prevPin = weather::Override();
+  const Tuning saved = CurrentTuning();
+  const uint32_t kTicks = (uint32_t)BaselineNumber("rainLeanTicks", 240.0);
+
+  // ---- the fixture, relative to (cx, y0, cz); y0 is the pad's top ----
+  const int cx = 200, cz = 200;
+  const int kPadX = 30, kPadZ = 44;          // pad half-extents
+  const int kHx = 10, kHz = 12, kH = 10;     // hut half-extents, wall height
+  const int kDoorX = 4, kDoorH = 8;          // doorway half-width, height
+  const int y0 = FixtureYOver(cx - kPadX, cz - kPadZ, cx + kPadX, cz + kPadZ,
+                              kDefaultSeed, 24);
+  std::map<std::tuple<int, int, int>, uint32_t> fixture;
+  for (int x = -kPadX; x <= kPadX; x++)
+    for (int z = -kPadZ; z <= kPadZ; z++) {
+      fixture[{cx + x, y0, cz + z}] = mStone;
+      for (int y = 1; y <= kH + 6; y++) fixture[{cx + x, y0 + y, cz + z}] = 0u;
+    }
+  for (int x = -kHx; x <= kHx; x++)
+    for (int z = -kHz; z <= kHz; z++) {
+      fixture[{cx + x, y0 + kH + 1, cz + z}] = mStone;   // roof, two thick
+      fixture[{cx + x, y0 + kH + 2, cz + z}] = mStone;
+    }
+  for (int y = 1; y <= kH; y++) {
+    for (int x = -kHx; x <= kHx; x++) {
+      const bool door = std::abs(x) <= kDoorX && y <= kDoorH;
+      if (!door) fixture[{cx + x, y0 + y, cz - kHz}] = mStone;
+      fixture[{cx + x, y0 + y, cz + kHz}] = mStone;
+    }
+    for (int z = -kHz; z <= kHz; z++) {
+      fixture[{cx - kHx, y0 + y, cz + z}] = mStone;
+      fixture[{cx + kHx, y0 + y, cz + z}] = mStone;
+    }
+  }
+  std::vector<CellOp> fixtureOps;
+  for (const auto& [k, w] : fixture)
+    fixtureOps.push_back(
+        {World::SlotCellIndex({std::get<0>(k), std::get<1>(k), std::get<2>(k)}), w});
+
+  // ---- the ember sites (on the pad / hut floor, y0 + 1) ----
+  enum Site { kOpen, kInside, kLee, kSites };
+  const char* kSiteName[kSites] = {"open", "inside", "lee"};
+  std::vector<IVec3> sites[kSites];
+  for (int x = -12; x <= 12; x += 3) sites[kOpen].push_back({cx + x, y0 + 1, cz - 32});
+  for (int x : {-3, -1, 1, 3})
+    for (int d : {3, 5, 7}) sites[kInside].push_back({cx + x, y0 + 1, cz - kHz + d});
+  for (int x : {-6, -2, 2, 6})
+    for (int d : {4, 6, 8}) sites[kLee].push_back({cx + x, y0 + 1, cz + kHz + d});
+
+  struct Run {
+    const char* preset; float wind;
+    weather::TickRain rain;
+    uint32_t doused[kSites] = {};
+    uint32_t windwardWet = 0, windwardCells = 0, leeWet = 0, leeCells = 0;
+    uint32_t mirrorChecked = 0, mirrorMismatch = 0;
+    IVec3 firstMismatch{0, 0, 0};
+  };
+  Run runs[2] = {{"rain", 0.0f, {}}, {"storm", 30.0f, {}}};
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
+  for (Run& r : runs) {
+    Tuning t = saved;
+    t.wind.weatherAuto = false;
+    t.wind.windDirDeg = 0.0f;      // heading 0 = downwind +Z: into the door
+    t.wind.windSpeed = r.wind;
+    t.wind.gustStrength = 0.0f;
+    t.weather.rainTouchesWorld = true;
+    SetCurrentTuning(t);
+    weather::SetOverride(r.preset);
+    weather::Snap();
+    r.rain = weather::SimRain(t, kDefaultSeed, 1);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = 1;
+    SubmitTick(ctx, world, sim, tick, kDefaultSeed, {}, {}, fixtureOps, false,
+               {12, 12, 12}, false, false);
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, {}, false,
+               {12, 12, 12}, false, false);
+    ctx.WaitIdle();
+
+    // ---- THE CPU MIRROR vs THE GPU MAP, on the static fixture ----
+    if (r.wind > 0.0f) {
+      ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "rainLeanRead");
+      std::vector<uint32_t> map((size_t)rainlat::kExpoMaxAxis * rainlat::kExpoMaxAxis);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.RainExpoBuffer(), 0, map.data(),
+                            map.size() * 4, "rainLeanMap");
+      const IVec3 o = world.WindowOrigin();
+      rainlat::Box b;
+      b.lo[0] = o.x * (int32_t)kChunk;
+      b.lo[1] = o.y * (int32_t)kChunk;
+      b.lo[2] = o.z * (int32_t)kChunk;
+      for (int a = 0; a < 3; a++) b.hi[a] = b.lo[a] + (int32_t)kWorldN - 1;
+      const int32_t nx = rainlat::N(r.rain.slopeQx), nz = rainlat::N(r.rain.slopeQz);
+      int32_t lo[2], ext[2];
+      rainlat::ExpoDomain(b, nx, nz, lo, ext);
+      auto blocks = [&](int32_t x, int32_t y, int32_t z) -> int {
+        const uint32_t m = vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
+        if (m == 0 || m >= c.mats.size()) return 0;
+        const MaterialGpu& g = c.mats[m].gpu;
+        if ((g.flags & kMatFlagMicro) != 0) return 0;
+        return (g.klass == CLASS_SOLID || g.klass == CLASS_POWDER ||
+                (g.klass == CLASS_LIQUID && (g.flags & kMatFlagOpaque) != 0)) ? 1 : 0;
+      };
+      for (int x = -kPadX + 2; x <= kPadX - 2; x += 2)
+        for (int z = -kPadZ + 2; z <= kPadZ - 2; z += 2)
+          for (int y = 1; y <= kH + 4; y += 3) {
+            const IVec3 p{cx + x, y0 + y, cz + z};
+            const int32_t kx = p.x + rainlat::Drift(nx, p.y);
+            const int32_t kz = p.z + rainlat::Drift(nz, p.y);
+            const int32_t tx = (kx >> rainlat::kExpoTexShift) - lo[0];
+            const int32_t tz = (kz >> rainlat::kExpoTexShift) - lo[1];
+            if (tx < 0 || tz < 0 || tx >= ext[0] || tz >= ext[1]) continue;
+            const int32_t h = (int32_t)map[(size_t)tz * ext[0] + tx];
+            const bool gpu = h == rainlat::kExpoOpen || p.y >= h - rainlat::kExpoMargin;
+            const bool cpu = rainlat::ExposedWalkUp(b, nx, nz, p.x, p.y, p.z, blocks);
+            r.mirrorChecked++;
+            if (gpu != cpu) {
+              if (r.mirrorMismatch == 0) r.firstMismatch = p;
+              r.mirrorMismatch++;
+            }
+          }
+    }
+
+    // ---- the fire, then the rain on it ----
+    std::vector<CellOp> embers;
+    for (int s = 0; s < kSites; s++)
+      for (const IVec3& p : sites[s]) embers.push_back({World::SlotCellIndex(p), mEmber});
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, embers, false,
+               {12, 12, 12}, false, false);
+    for (uint32_t i = 0; i < kTicks; i++)
+      SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, {}, false,
+                 {12, 12, 12}, false, false);
+    ctx.WaitIdle();
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "rainLeanRead");
+    for (int s = 0; s < kSites; s++)
+      for (const IVec3& p : sites[s])
+        if ((vox[World::SlotCellIndex(p)] & 0xFFFu) == mWood) r.doused[s]++;
+    // The walls' OUTER faces: -Z (windward) and +Z (lee), doorway excluded.
+    for (int y = 1; y <= kH; y++)
+      for (int x = -kHx; x <= kHx; x++) {
+        if (!(std::abs(x) <= kDoorX && y <= kDoorH)) {
+          const uint32_t w = vox[World::SlotCellIndex({cx + x, y0 + y, cz - kHz})];
+          r.windwardCells++;
+          if (((w >> 28) & 7u) == wetType) r.windwardWet++;
+        }
+        const uint32_t w = vox[World::SlotCellIndex({cx + x, y0 + y, cz + kHz})];
+        r.leeCells++;
+        if (((w >> 28) & 7u) == wetType) r.leeWet++;
+      }
+  }
+  SetCurrentTuning(saved);
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const Run& calm = runs[0];
+  const Run& storm = runs[1];
+  const double minFrac = BaselineNumber("rainLeanDousedMinFrac", 0.25);
+  const double windwardMin = BaselineNumber("rainLeanWindwardWetMinFrac", 0.5);
+  auto frac = [&](uint32_t n, int s) { return (double)n / (double)sites[s].size(); };
+  const bool slopeOk = calm.rain.slopeQx == 0 && calm.rain.slopeQz == 0 &&
+                       storm.rain.slopeQx == 0 &&
+                       storm.rain.slopeQz == weather::kRainSlopeMaxN * 4096 &&
+                       (calm.rain.word & 0xFFu) != 0 && (storm.rain.word & 0xFFu) != 0;
+  const bool calmOk = frac(calm.doused[kOpen], kOpen) >= minFrac && calm.doused[kInside] == 0;
+  const bool stormOk = frac(storm.doused[kOpen], kOpen) >= minFrac &&
+                       frac(storm.doused[kInside], kInside) >= minFrac &&
+                       storm.doused[kLee] == 0;
+  const bool stainOk =
+      (double)storm.windwardWet >= windwardMin * (double)storm.windwardCells &&
+      storm.leeWet == 0;
+  const bool mirrorOk = storm.mirrorChecked > 0 && storm.mirrorMismatch == 0;
+  const bool ok = slopeOk && calmOk && stormOk && stainOk && mirrorOk;
+
+  char buf[768];
+  std::snprintf(
+      buf, sizeof(buf),
+      "%s: slope calm %d/%d storm %d/%d sixteenths (%s) | doused after %u ticks "
+      "(wood / sites): calm open %u/%zu inside %u/%zu (%s: open >= %.0f%%, "
+      "inside 0) | storm open %u/%zu inside %u/%zu lee %u/%zu (%s: open, "
+      "inside >= %.0f%%, lee 0) | stains after the storm: windward face %u/%u "
+      "wet, lee face %u/%u (%s: windward >= %.0f%%, lee 0) | CPU mirror vs GPU "
+      "map: %u/%u cells agree%s",
+      ok ? "PASS" : "FAIL", rainlat::N(calm.rain.slopeQx), rainlat::N(calm.rain.slopeQz),
+      rainlat::N(storm.rain.slopeQx), rainlat::N(storm.rain.slopeQz),
+      slopeOk ? "ok" : "FAIL", kTicks, calm.doused[kOpen], sites[kOpen].size(),
+      calm.doused[kInside], sites[kInside].size(), calmOk ? "ok" : "FAIL",
+      100.0 * minFrac, storm.doused[kOpen], sites[kOpen].size(),
+      storm.doused[kInside], sites[kInside].size(), storm.doused[kLee],
+      sites[kLee].size(), stormOk ? "ok" : "FAIL", 100.0 * minFrac,
+      storm.windwardWet, storm.windwardCells, storm.leeWet, storm.leeCells,
+      stainOk ? "ok" : "FAIL", 100.0 * windwardMin,
+      storm.mirrorChecked - storm.mirrorMismatch, storm.mirrorChecked,
+      mirrorOk ? "" : " (MIRROR DISAGREES)");
+  if (storm.mirrorMismatch)
+    std::snprintf(buf + std::strlen(buf), sizeof(buf) - std::strlen(buf),
+                  "; first at (%d,%d,%d)", storm.firstMismatch.x,
+                  storm.firstMismatch.y, storm.firstMismatch.z);
+  (void)kSiteName;
+  detail = buf;
+  std::printf("rain-lean: %s\n", buf);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -6353,6 +6612,7 @@ const std::vector<Gate>& SimGates() {
       {"rain-fire", "sim", {}, false, GateRainFire},
       {"stain-react", "sim", {}, false, GateStainReact},
       {"rain-stain", "sim", {}, false, GateRainStain},
+      {"rain-lean", "sim", {}, false, GateRainLean},
       {"stamp-sleep", "sim", {}, false, GateStampSleep},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},

@@ -11,6 +11,7 @@
 
 #include "sim/rng.h"
 #include "sim/tuning.h"
+#include "sim/wind.h"   // WindWeatherQ: the mean wind the rain slope leans on
 #include "test/support.h"  // AssetDir(): the one asset-path chokepoint
 
 namespace weather {
@@ -76,6 +77,21 @@ bool ReadPreset(const std::string& path, Preset& p, std::string& err) {
   num("cirrusAltM", p.cirrusAltM, 1000.0f, 20000.0f);
   num("precip", p.precip, 0.0f, 1.0f);
   num("precipType", p.precipType, 0.0f, 1.0f);
+  // The lean. Defaults follow this preset's own precipType (weather.h).
+  p.windShare = 0.4f + 0.4f * p.precipType;
+  p.leanTan = 0.7f + 0.8f * p.precipType;
+  p.windShareAuthored = j.contains("windShare");
+  num("windShare", p.windShare, 0.0f, 2.0f);
+  {
+    auto it = j.find("maxLeanDeg");
+    if (it != j.end()) {
+      if (!it->is_number()) err += "maxLeanDeg not a number; ";
+      else {
+        p.maxLeanDeg = std::clamp((float)it->get<double>(), 0.0f, 80.0f);
+        p.leanTan = (float)std::tan((double)p.maxLeanDeg * 0.017453292519943295);
+      }
+    }
+  }
   num("mist", p.mist, 0.0f, 20.0f);
   num("lightning", p.lightning, 0.0f, 60.0f);
   if (p.label.empty()) p.label = p.name;
@@ -204,7 +220,7 @@ bool gEnvPinRead = false;
 uint32_t gLastSimWord = 0;
 bool gRainLatched = false;
 uint32_t gRainLatchTick = 0;
-uint32_t gRainLatchWord = 0;
+TickRain gRainLatch;
 State gLast;
 Preset gEased;
 bool gEasedValid = false;
@@ -335,7 +351,29 @@ PresetQ ScheduledQ(const SimTuneQ& q, const std::vector<PresetQ>& ps, int pinned
   o.coverage = LerpQ(ps[a].coverage, ps[b].coverage, t);
   o.precip = LerpQ(ps[a].precip, ps[b].precip, t);
   o.precipType = LerpQ(ps[a].precipType, ps[b].precipType, t);
+  o.windShare = LerpQ(ps[a].windShare, ps[b].windShare, t);
+  o.leanTan = LerpQ(ps[a].leanTan, ps[b].leanTan, t);
   return o;
+}
+
+// tan(d degrees) for d = 0..80, Q16: round(tan * 65536). The lean cap's one
+// transcendental, as literals — the kWetDecayQ reason.
+constexpr int64_t kTanDegQ[81] = {
+    0,      1144,   2289,   3435,   4583,   5734,   6888,   8047,   9210,
+    10380,  11556,  12739,  13930,  15130,  16340,  17560,  18792,  20036,
+    21294,  22566,  23853,  25157,  26478,  27818,  29179,  30560,  31964,
+    33392,  34846,  36327,  37837,  39378,  40951,  42560,  44205,  45889,
+    47615,  49385,  51202,  53070,  54991,  56970,  59009,  61113,  63287,
+    65536,  67865,  70279,  72785,  75391,  78103,  80930,  83882,  86969,
+    90203,  93595,  97161,  100917, 104880, 109070, 113512, 118230, 123255,
+    128622, 134369, 140542, 147196, 154393, 162207, 170727, 180059, 190330,
+    201699, 214359, 228551, 244584, 262851, 283868, 308323, 337153, 371673};
+// tan of a Q16 angle in degrees, linear between whole degrees; clamped 0..80.
+int64_t TanDegQ(int64_t degQ) {
+  degQ = std::clamp<int64_t>(degQ, 0, 80 * kQ);
+  const int64_t i = degQ >> 16, f = degQ & (kQ - 1);
+  if (i >= 80) return kTanDegQ[80];
+  return kTanDegQ[i] + (((kTanDegQ[i + 1] - kTanDegQ[i]) * f) >> 16);
 }
 
 int64_t GroundPrecipQ(const PresetQ& p) {
@@ -362,6 +400,8 @@ Preset Lerp(const Preset& a, const Preset& b, float tIn) {
   o.precipType = L(a.precipType, b.precipType);
   o.mist = L(a.mist, b.mist);
   o.lightning = L(a.lightning, b.lightning);
+  o.windShare = L(a.windShare, b.windShare);
+  o.leanTan = L(a.leanTan, b.leanTan);
   return o;
 }
 
@@ -415,8 +455,17 @@ void Library::EnsureLoaded() {
   for (const std::string& w : warnings_) std::fprintf(stderr, "weather: %s\n", w.c_str());
   // The sim's quantised copy, parallel and in the same (sorted) order.
   presetsQ_.clear();
-  for (const Preset& p : presets_)
-    presetsQ_.push_back({Q16(p.weight), Q16(p.coverage), Q16(p.precip), Q16(p.precipType)});
+  for (const Preset& p : presets_) {
+    PresetQ q{Q16(p.weight), Q16(p.coverage), Q16(p.precip), Q16(p.precipType)};
+    // The lean, in integers: an authored value is quantised once (the angle
+    // through kTanDegQ); an absent one is the precipType default computed in
+    // Q16 (0.4 + 0.4 pt, 0.7 + 0.8 pt), not the float default's rounding.
+    q.windShare = p.windShareAuthored ? Q16(p.windShare)
+                                      : 26214 + ((26214 * q.precipType) >> 16);
+    q.leanTan = p.maxLeanDeg >= 0.0f ? TanDegQ(Q16(p.maxLeanDeg))
+                                     : 45875 + ((52429 * q.precipType) >> 16);
+    presetsQ_.push_back(q);
+  }
 }
 
 const std::vector<Preset>& Library::Presets() {
@@ -560,8 +609,16 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, bool commit)
 const State& Last() { return gLast; }
 
 uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  return SimRain(tn, seed, tick).word;
+}
+
+TickRain SimRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
   EnsureEnvPin();
-  if (!tn.weather.clouds || !tn.weather.rainTouchesWorld) return 0u;
+  TickRain out;
+  if (!tn.weather.clouds || !tn.weather.rainTouchesWorld) {
+    gLastSimWord = 0;
+    return out;
+  }
   // Integers only from here (the block above the anonymous namespace's end
   // says how the floats got in). The same steps as the renderer's
   // Scheduled / GroundPrecip / WetnessAt, on PresetQ.
@@ -599,26 +656,50 @@ uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
       (ClampQ(((acc / wsum) * 104858) >> 16) * (kQ - now.precipType)) >> 16;
   auto q8 = [](int64_t v) { return (uint32_t)((ClampQ(v) * 255 + kQ / 2) >> 16); };
   gLastSimWord = (q8(rain) & 0xFFu) | (q8(q.igniteDampQ) << 8) | (q8(wet) << 16);
-  return gLastSimWord;
+  out.word = gLastSimWord;
+
+  // ---- THE RAIN SLOPE (weather.h TickRain) --------------------------------
+  // Only while rain is actually reaching the ground: a dry tick (wet or not)
+  // falls straight down, which is today's sampler exactly.
+  if ((out.word & 0xFFu) == 0u) return out;
+  const WindStateQ wq = WindWeatherQ(tn, seed, tick);
+  // Fall speed, Q16 cells/s: (8.5 - 7.4 snow) m/s x kVoxelsPerMetre.
+  const int64_t fallMsQ = 557056 - ((484966 * now.precipType) >> 16);
+  const int64_t fallQ = std::max<int64_t>(fallMsQ * kVoxelsPerMetre, 1);
+  // Horizontal drift speed and the tangent of the lean, capped.
+  const int64_t driftQ = ((int64_t)wq.speed * now.windShare) >> 16;
+  int64_t tanQ = (driftQ << 16) / fallQ;
+  tanQ = std::min(tanQ, now.leanTan);
+  tanQ = std::min<int64_t>(tanQ, (int64_t)kRainSlopeMaxN << 12);
+  // Along the downwind unit (windDirQ), to sixteenths, rounded to nearest
+  // (FloorDiv: half-up on both signs, the same rule everywhere).
+  auto sixteenths = [&](int32_t dirQ) {
+    const int64_t sQ = ((int64_t)dirQ * tanQ) >> 16;
+    const int64_t n = FloorDiv(sQ + 2048, 4096);
+    return (int32_t)std::clamp<int64_t>(n, -kRainSlopeMaxN, kRainSlopeMaxN);
+  };
+  out.slopeQx = sixteenths(wq.dirX) * 4096;
+  out.slopeQz = sixteenths(wq.dirZ) * 4096;
+  return out;
 }
 
 uint32_t LastSimRainWord() { return gLastSimWord; }
 
-uint32_t LatchTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
-  gRainLatchWord = SimRainWord(tn, seed, tick);
+TickRain LatchTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  gRainLatch = SimRain(tn, seed, tick);
   gRainLatchTick = tick;
   gRainLatched = true;
-  return gRainLatchWord;
+  return gRainLatch;
 }
 
-uint32_t TakeTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
+TickRain TakeTickRain(const Tuning& tn, uint32_t seed, uint32_t tick) {
   if (gRainLatched && gRainLatchTick == tick) {
     gRainLatched = false;
-    gLastSimWord = gRainLatchWord;
-    return gRainLatchWord;
+    gLastSimWord = gRainLatch.word;
+    return gRainLatch;
   }
   gRainLatched = false;  // a stale latch (a tick that never submitted) dies here
-  return SimRainWord(tn, seed, tick);
+  return SimRain(tn, seed, tick);
 }
 
 void Snap() { gEasedValid = false; }

@@ -69,15 +69,25 @@ inline bool ReactNbrMatches(const ReactionGpu& r, uint32_t nmat,
 // The tick-only half is reactPhaseOpen (materials.h), the mirror of the one
 // WGSL definition in common.wgsl; the exposure half is `seesSky`, which a body
 // answers for both the sky and the rain.
+//
+// `rainExposed` (2026-09-30) splits the RAIN half off `seesSky`: a body still
+// sees the sky (the sunlight rules), but whether the rain reaches it is the
+// sim's rain exposure answer walked on the CPU (MobSystem::RainExposedCpu, the
+// integer fall-line lattice of src/sim/rainexpo.h), so a burning corpse under
+// a roof is not doused and one in a windward doorway is.
 inline bool ReactLightMatches(const ReactionGpu& r, uint32_t dayPhase,
-                              bool seesSky, uint32_t rainWord) {
+                              bool seesSky, uint32_t rainWord, bool rainExposed) {
   const uint32_t cond = r.cond & 0xFFu;
   if (cond == 0) return true;  // unconditional: the common case, free
   if (!reactPhaseOpen(r.cond, DaylightStrengthCpu(dayPhase), rainWord))
     return false;
-  if ((cond & kCondRain) != 0 && !seesSky) return false;
+  if ((cond & kCondRain) != 0 && !rainExposed) return false;
   if ((cond & kCondSky) != 0 && !seesSky) return false;
   return true;
+}
+inline bool ReactLightMatches(const ReactionGpu& r, uint32_t dayPhase,
+                              bool seesSky, uint32_t rainWord) {
+  return ReactLightMatches(r, dayPhase, seesSky, rainWord, seesSky);
 }
 
 // Is the neighbour-count ramp armed on this rule? Callers test this BEFORE

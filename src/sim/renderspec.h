@@ -77,6 +77,9 @@ bool GasFarRenderActive();
 // is set from exactly this `on`).
 struct CloudFrame {
   bool on = false;       // the cloud rows record, and the composite reads
+  // The rain shadow map's rows record too (rain_map.wgsl): clouds on, it is
+  // precipitating near the camera, render.rainShadowMap on.
+  bool rainMap = false;
   unsigned lowW = 1, lowH = 1;
 };
 const CloudFrame& LastCloudFrame();

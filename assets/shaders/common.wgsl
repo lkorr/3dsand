@@ -847,9 +847,14 @@ struct TickParams {
   // Read by RCOND_RAIN / RCOND_RAINDAMP rules (sim_step rainChance).
   weatherRain : u32,
   windPrimLo : vec3<i32>,   // union AABB, inclusive world cells; the whole-loop
-  padWp2 : i32,             // early-out. lo > hi means "no primitives".
+  // THE RAIN SLOPE, the sim's copy (weather::SimRainSlopeQ; must match world.h
+  // -- it was the padWp2 / padWp3 pad pair, so the layout is unchanged): Q16
+  // horizontal cells a drop drifts per cell it falls, x and z. Integer, on the
+  // tick stream, 0 when dry. sim_mutate's rainFall walks along it and
+  // sim_rain_expo builds the exposure map along it.
+  rainSlopeQx : i32,        // early-out. lo > hi means "no primitives".
   windPrimHi : vec3<i32>,
-  padWp3 : i32,
+  rainSlopeQz : i32,
   // WIND_PRIM_CAP primitives x 3 rows. The literal 96 is deliberate: this file
   // and world.h are compared by scripts/check_invariants.py on TOTAL SIZE, so a
   // cap changed on one side and not the other fails the check rather than
@@ -1741,7 +1746,11 @@ struct CloudParams {
   prevFwd   : vec3f, prevTanHalfFov : f32,
   eyeDeltaM : vec3f, prevAspect : f32,
   lowW : u32, lowH : u32, fullW : u32, fullH : u32,
-  histCur : u32, histPrev : u32, resDiv : u32, _pc0 : u32,
+  // rainWindShare / rainLeanTan (were pads): the precipitation's lean, per
+  // preset (weather::Preset windShare / maxLeanDeg) -- the share of the
+  // local wind a drop takes and tan of the cap on its lean off vertical.
+  // Read by raymarch.wgsl rainOverlay and rain_map.wgsl, which must agree.
+  histCur : u32, histPrev : u32, resDiv : u32, rainWindShare : f32,
   coverage : f32, cloudType : f32, density : f32, precip : f32,
   baseM : f32, thicknessM : f32, darkness : f32, cirrus : f32,
   cirrusAltM : f32, precipType : f32, overcast : f32, wetness : f32,
@@ -1749,7 +1758,7 @@ struct CloudParams {
   shapeOff : vec3f, weatherEvolve : f32,
   detailOff : vec3f, cirrusEvolve : f32,
   weatherOrigin : vec2f, weatherTexelM : f32, shadowTexelM : f32,
-  shadowOrigin : vec2f, shadowPlaneM : f32, _pc1 : f32,
+  shadowOrigin : vec2f, shadowPlaneM : f32, rainLeanTan : f32,
   weatherOff : vec2f, windX : f32, windZ : f32,
   flash : vec3f, flashAmp : f32,
   jitter : vec2f, cirrusOff : vec2f,

@@ -405,6 +405,9 @@ void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas);
 // record rather than rebuilding it from whatever the replaying process has
 // pinned (weather::TakeTickRain).
 bool RecordedWeatherRain(uint32_t tick, uint32_t& word);
+// ...and the rain SLOPE beside it (TickParams rainSlopeQx / Qz), for the same
+// reason: it is derived from the same pinned preset.
+bool RecordedRainSlope(uint32_t tick, int32_t& sx, int32_t& sz);
 
 // While replaying, re-apply this tick's recorded chunk replaces through
 // `stream`. A no-op (one pointer test) otherwise, so the drive loops call it

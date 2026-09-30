@@ -190,11 +190,13 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Full-world on hash ticks, dirty-list only otherwise. The hash-tick "
      "spike every 15 ticks is this row."},
     {"wind", "Wind + Rain", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "windWake;rainFall",
+     "windWake;rainFall;rainExpo",
      "windAt() is a pure function evaluated in the kernels that need it; only "
      "the wake pass is separately timed. rainFall is the rain-on-the-ground "
-     "column sampler (wets while it rains, dries top surfaces while it does "
-     "not): a fixed cost every tick, one thread per 8x8 column tile."},
+     "fall-line sampler (wets while it rains, dries top surfaces while it does "
+     "not): every tick, one thread per 8x8 key tile of the slanted lattice. "
+     "rainExpo is the rain exposure map the CA's douse and damp rules read: "
+     "only on rain or wet ticks, one fall line per 4x4 key texel."},
     {"readback", "Async Readback", "simTick", PerfSide::Cpu, PerfScope::Readback,
      "", "Map callbacks + the 3x3x3 CPU mirror rebuild. One tick latent, never "
      "blocking — if this is large the mirror copy is the reason. The blocking "
@@ -248,7 +250,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     // no row is recorded. The march is the one that scales (with coverage,
     // resolution and render.cloudSteps); the rest are fixed-size.
     {"clouds", "Clouds", "renderPass", PerfSide::Gpu, PerfScope::Count,
-     "cloud_noise;cloud_weather;cloud_shadow;cloud_env;cloud_march;cloud_resolve",
+     "cloud_noise;cloud_weather;cloud_shadow;cloud_env;cloud_march;cloud_resolve;rain_map_prep;rain_map_build",
      "Volumetric cloud deck, cirrus and rain curtains, marched at 1/cloudResDiv "
      "resolution and accumulated over frames, plus the maps the rest of the "
      "renderer reads the clouds through. Measure it under a full overcast "

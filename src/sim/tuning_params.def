@@ -2156,6 +2156,9 @@ TP_F(weather, transitionSeconds, NO_WGSL, 12.0f, 0.0f, 600.0f)
 TP_F(weather, coverageBias, NO_WGSL, 0.0f, -1.0f, 1.0f)
 TP_F(weather, precipScale, NO_WGSL, 1.0f, 0.0f, 4.0f)
 TP_F(weather, drySeconds, NO_WGSL, 240.0f, 5.0f, 36000.0f)
+// Render-only A/B switch for the rain shadow map (rain_map.wgsl); off = the
+// openness-gated rain and wetness of before, rows unrecorded.
+TP_B(weather, rainShadowMap, NO_WGSL, true)
 TP_B(weather, rainTouchesWorld, NO_WGSL, true)
 TP_F(weather, rainIgniteDamp, NO_WGSL, 0.6f, 0.0f, 1.0f)
 

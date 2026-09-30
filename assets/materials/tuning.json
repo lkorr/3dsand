@@ -1102,6 +1102,7 @@
     "coverageBias": 0,
     "precipScale": 1,
     "drySeconds": 240,
+    "rainShadowMap": true,
     "rainTouchesWorld": true,
     "rainIgniteDamp": 0.6
   },

@@ -8,6 +8,13 @@ tuner PAGE for authoring presets (they are plain JSON; the Clouds and Sky
 weather tabs cover the knobs), thunder audio, cloud god-rays, biome-driven
 weather, and recovering the raymarch fs spill (16 -> 96 B/thread).
 
+2026-09-30: rain LEANS and lands where its fall line lands -- a render-only
+rain shadow map along the lean (drops + wet ground), per-preset `windShare` /
+`maxLeanDeg`, and on the sim side an integer rain slope on TickParams, a
+slanted ground sampler and a rain exposure map the douse/damp rules read (tier
+2's exposure, done properly). DESIGN.md §9.w "Where the rain lands"; gate
+`rain-lean`.
+
 Deviations from the plan, and why:
 - §2.1 did NOT extend WindWeather/TickParams: nothing in the sim reads weather
   yet, so the resolver is its own render-only module (`src/sim/weather.*`) that

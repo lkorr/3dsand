@@ -26,6 +26,7 @@
 #include "sim/oprecord.h"  // BrushAuthorScope: a landing's ops (ApplyFallDamage)
 #include "sim/coatrule.h"
 #include "sim/reactcpu.h"
+#include "sim/rainexpo.h"  // RainExposedCpu: the rain fall-line lattice
 #include "sim/rng.h"
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
 #include "sim/tuning.h"
@@ -15534,6 +15535,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   BodyBurnState& st = *v.burn;
   const uint32_t limbKey = rngKey;
   burnStats_.visits++;
+  // THE RAIN reaches this limb? Asked once per visit, and only while the rain
+  // word can ask it (rain now, or wet ground for the RAINDAMP rules): the
+  // sim's exposure walked on the CPU mirror at the limb's origin
+  // (RainExposedCpu). Every body rule below reads this instead of the old
+  // "a body is always exposed".
+  const bool rainExp =
+      (weatherRain_ & (kRainAmountMask | (0xFFu << kRainWetShift))) == 0u || !v.xf ||
+      RainExposedCpu(world, v.xf->pos);
 
   // One-entry chunk memo. A limb spans one or two chunks and the ignition scan
   // asks the same one over and over; without this the walk is a hash lookup per
@@ -16610,7 +16619,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       for (uint32_t rj = 0; rj < cg.reactCount; rj++) {
         const ReactionGpu& r = reactions_[cg.reactOffset + rj];
         if ((r.packed & 3u) != kReactPair) continue;
-        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_))
+        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_, rainExp))
           continue;
         // The coat's own rule-index space (+128), apart from the voxel's
         // self (+0) and inbound (+64) passes.
@@ -16640,7 +16649,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         if (verdict & kCoatVerdictCovers) covered = true;
         burnStats_.coatMatched++;
         if (rr % kReactChanceDen >=
-            RainScaledChance(r.cond, r.chance, weatherRain_, true))
+            RainScaledChance(r.cond, r.chance, weatherRain_, rainExp))
           continue;
         // ---- FIRED ----
         burnStats_.coatFired++;
@@ -16729,7 +16738,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         burnStats_.livingDryRefused++;
         continue;
       }
-      if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
+      if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_, rainExp)) continue;
       // (WET DOES NOT CATCH is no longer a skip list here: a wet voxel beside
       // heat is COVERED by its water's own `+ tag:hot` rule (section 0, rule
       // 3), so the rules below see only the coat and nothing hot.)
@@ -16880,7 +16889,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       }
       // Weather last, on the fully-scaled chance: rain douses a burning limb
       // and damps its catching exactly as it does a grid cell (reactcpu.h).
-      chance = RainScaledChance(r.cond, chance, weatherRain_, true);
+      chance = RainScaledChance(r.cond, chance, weatherRain_, rainExp);
       if (rr % kReactChanceDen >= chance) continue;
       noteBodyFx(r, vp);
       const uint32_t kind = r.packed & 3u;
@@ -16978,14 +16987,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const ReactionGpu& r = reactions_[wg.reactOffset + rj];
         if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
         if (!ReactNbrMatches(r, m, matGpu_)) continue;
-        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
+        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_, rainExp)) continue;
         // A distinct rule-index space (+64) from the self pass, so a voxel
         // that is both burning and dissolving does not roll one stream
         // twice and correlate the two.
         const uint32_t rr =
             Hash3(lk ^ (ck * 668265263u), tick, 64u + rj);
         if (rr % kReactChanceDen >=
-            RainScaledChance(r.cond, r.chance, weatherRain_, true))
+            RainScaledChance(r.cond, r.chance, weatherRain_, rainExp))
           continue;
         // A world cell's rule with effects (sodium + blood -> explode) fired
         // ONTO this body: the blast is at the body voxel it fired on.
@@ -19229,6 +19238,43 @@ bool MobSystem::OpenToSky(World& world, const Vec3& p) const {
   return true;
 }
 
+bool MobSystem::RainExposedCpu(World& world, const Vec3& p) const {
+  const IVec3 o = world.WindowOrigin();
+  rainlat::Box b;
+  b.lo[0] = o.x * (int32_t)kChunk;
+  b.lo[1] = o.y * (int32_t)kChunk;
+  b.lo[2] = o.z * (int32_t)kChunk;
+  for (int a = 0; a < 3; a++) b.hi[a] = b.lo[a] + (int32_t)kWorldN - 1;
+  IVec3 memo{INT_MIN, INT_MIN, INT_MIN};
+  const CachedChunk* cc = nullptr;
+  bool asked = false;
+  // 1 = a ray blocker (sim_rain_expo rxBlocks: isRayBlocker, material level),
+  // 0 = clear, -1 = not cached (and asked for, once per walk).
+  auto blocks = [&](int32_t x, int32_t y, int32_t z) -> int {
+    const IVec3 wc = ChunkOfCell(x, y, z);
+    if (wc.x != memo.x || wc.y != memo.y || wc.z != memo.z) {
+      memo = wc;
+      cc = world.Cached(wc);
+      if (cc && cc->voxels.size() != kChunkVol) cc = nullptr;
+      if (!cc && !asked) {
+        world.RequestChunkFetch(wc, World::FetchSource::Mob);
+        asked = true;
+      }
+    }
+    if (!cc) return -1;
+    const uint32_t m = cc->voxels[((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk +
+                                  (uint32_t)(x & 15)] & 0xFFFu;
+    if (m == 0 || m >= matGpu_.size()) return 0;
+    const MaterialGpu& g = matGpu_[m];
+    if ((g.flags & kMatFlagMicro) != 0) return 0;
+    const bool blocker = g.klass == CLASS_SOLID || g.klass == CLASS_POWDER ||
+                         (g.klass == CLASS_LIQUID && (g.flags & kMatFlagOpaque) != 0);
+    return blocker ? 1 : 0;
+  };
+  return rainlat::ExposedWalkUp(b, rainlat::N(rainSlopeQx_), rainlat::N(rainSlopeQz_),
+                                ifloor(p.x), ifloor(p.y), ifloor(p.z), blocks);
+}
+
 uint32_t MobSystem::CoatDryTicks(uint32_t mat) const {
   const float secs = mat < coatDecay_.size() ? coatDecay_[mat] : 0.0f;
   if (secs <= 0.0f) return 0;
@@ -19397,7 +19443,9 @@ bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
     rs.sated++;
     return false;
   }
-  if (world && !OpenToSky(*world, v.xf->pos)) { rs.roofed++; return false; }
+  // Where the RAIN reaches, along the tick's lean (RainExposedCpu) -- no
+  // longer the vertical sun column: a limb in a windward doorway gets wet.
+  if (world && !RainExposedCpu(*world, v.xf->pos)) { rs.roofed++; return false; }
   const uint32_t water = MaterialIdNamed("water");
   if (water == 0) { rs.noWater++; return false; }
   if (st.idx.empty()) BuildBurnIndex(v);

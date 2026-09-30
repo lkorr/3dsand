@@ -137,6 +137,9 @@ PIPE_TO_MEMBER = {
     "PIPE_SKY_TOP_REDUCE": "skyTopReduce_",
     "PIPE_RAY_START_TRACE": "rayStartTrace_",
     "PIPE_RAY_START_MIN": "rayStartMin_",
+    "PIPE_RAIN_MAP_PREP": "rainMapPrep_",
+    "PIPE_RAIN_MAP_BUILD": "rainMapBuild_",
+    "PIPE_RAIN_EXPO": "rainExpo_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
     "PIPE_FLUID_ALLOC": "fluidAlloc_",
@@ -214,6 +217,8 @@ BUF_TO_WGSL = {
     "ShadowReq": {"shadowReq"},
     "ShadowHist": {"shadowHist"},
     "RayStart": {"rayStart"},
+    "RainMap": {"rainMap"},
+    "RainExpo": {"rainExpo"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
     # The clouds (cloud.wgsl). CloudUBO is `C` there; the raymarcher and the
@@ -403,6 +408,9 @@ _SIM_GROUP0 = {
     "waterFlux",
     # The solute layer, bindings 40..43 (docs/PLAN_solutes.md).
     "solTable", "solPool", "solMeta", "solSpec", "solStage",
+    # The rain exposure map, binding 45 (sim_rain_expo.wgsl writes it before
+    # the CA; sim_step's rainExposed reads it).
+    "rainExpo",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

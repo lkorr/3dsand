@@ -16,6 +16,7 @@
 #include "sim/bodyreact.h"  // CatchFormTable (what a coat flame lights, §6 clause 2c)
 #include "sim/farplumes.h"  // FarPlumes::SetMaterials (what a frozen fire is)
 #include "sim/pagetable.h"
+#include "sim/rainexpo.h"  // the rain lattice (rainFall / rainExpo extents)
 #include "sim/renderspec.h"  // LastRenderSpec(): which raymarch variant this frame takes
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
@@ -356,6 +357,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(42, T::Storage),         // solMeta (free stack, lists, ledger)
         entry(43, T::ReadOnlyStorage), // solSpec (solutes.json, per material)
         entry(44, T::Storage),         // solStage (eviction / restore records)
+        // The rain exposure map (sim_rain_expo.wgsl, src/sim/rainexpo.h):
+        // written by its own row, read by the CA. simBGL_ only. 45 is the
+        // first free slot of this dense 0..44 layout.
+        entry(45, T::Storage),         // rainExpo (per lattice texel)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -657,6 +662,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // table's ray_start rows in the same command buffer, read here;
         // BeginRendering's flush is the compute->fragment barrier.
         entry(32, T::ReadOnlyStorage, S::Fragment),               // rayStart
+        // THE RAIN SHADOW MAP (rain_map.wgsl): where precipitation lands.
+        // Written by the ShadowCache table's rain_map rows in the same command
+        // buffer, read by the rain overlay and the wet shading here.
+        entry(33, T::ReadOnlyStorage, S::Fragment),               // rainMap
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -746,6 +755,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     e.size = size;  // 0 = whole buffer, per rhi::BindGroupEntry
     return e;
   };
+  // The rain exposure map (sim_rain_expo.wgsl): sized for the steepest slope
+  // the weather can hand the sim (rainlat::kExpoMaxAxis per axis), so no
+  // slope ever reallocates it. Its contents need no initial value: every
+  // tick that reads it rebuilt it first (C_RAINEXPO).
+  rainExpoBuf_ = CreateBuffer(
+      device, (uint64_t)rainlat::kExpoMaxAxis * rainlat::kExpoMaxAxis * 4,
+      rhi::BufferUsage::Storage, "rainExpo");
   BuildSimBindGroups(device);
   for (int page = 0; page < 2; page++) {
     rhi::BindGroupEntry pentries[] = {
@@ -830,6 +846,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // A placeholder until EnsureRayStart sizes it: its word 0 is no frame's
     // key, and the fragment shader's length check refuses it anyway.
     rayStartBuf_ = CreateBuffer(device, 16, U::Storage, "rayStart");
+    // The rain shadow map (rain_map.wgsl): fixed size, world-anchored rather
+    // than target-sized, so it is made once here. Zeroed: a zero header is
+    // "not live" and a zero tag matches no generation (they run 1..255).
+    {
+      const uint64_t words = kRainMapHeaderWords + 2ull * kRainMapN * kRainMapN;
+      rainMapBuf_ = CreateBuffer(device, words * 4, U::Storage, "rainMap");
+      const std::vector<uint32_t> zero((size_t)words, 0u);
+      device.GetQueue().WriteBuffer(rainMapBuf_, 0, zero.data(), words * 4);
+    }
     veilPixels_ = 0;
     BuildRenderBindGroup(renderBG_, veilBuf_);
     BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
@@ -888,6 +913,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The ray-start map (ray_start.wgsl): written by its two per-frame
         // rows, read by the raymarch at renderBGL_ 32.
         entry(21, T::Storage),         // rayStart
+        // The rain shadow map (rain_map.wgsl): written by its two per-frame
+        // rows, read by the raymarch at renderBGL_ 33.
+        entry(22, T::Storage),         // rainMap
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1121,6 +1149,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(42, world_->solMeta),
         b(43, solSpecBuf_),
         b(44, world_->solStage),
+        b(45, rainExpoBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1724,6 +1753,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // function was entered (the tuning, the tree lattice, the world map) and
   // writes only its own handle.
   rhi::ShaderModule mWorldgen, mMutate, mCompact, mStep, mOcc, mPick;
+  // The rain exposure map (sim_rain_expo.wgsl): one tick entry on simPL_.
+  rhi::ShaderModule mRainExpo;
   // The solute layer's allocator, diffusion, compaction and hash
   // (docs/PLAN_solutes.md). Its own module: the CA carries mass through its
   // liquid moves and this file does everything else.
@@ -1750,6 +1781,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mSkyTop;
   // The ray-start map (ray_start.wgsl): two per-frame entries on shadowPL_.
   rhi::ShaderModule mRayStart;
+  // The rain shadow map (rain_map.wgsl): two per-frame entries on shadowPL_.
+  rhi::ShaderModule mRainMap;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
@@ -1766,6 +1799,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     };
     mod(&mWorldgen, "worldgen.wgsl");
     mod(&mMutate, "sim_mutate.wgsl");
+    mod(&mRainExpo, "sim_rain_expo.wgsl");
     mod(&mCompact, "sim_compact.wgsl");
     mod(&mStep, "sim_step.wgsl");
     mod(&mSolute, "sim_solute.wgsl");
@@ -1776,6 +1810,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mSkyTop, "sky_top.wgsl");
     mod(&mRayStart, "ray_start.wgsl");
+    mod(&mRainMap, "rain_map.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
@@ -1798,7 +1833,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart) {
+      !mRayStart || !mRainMap) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -1849,6 +1884,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { skyTopReduce_ = MakeComputePipeline(device, shadowPL_, mSkyTop, "skyTopReduce", "skyTopReduce"); });
   pool.Add([&] { rayStartTrace_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartTrace", "rayStartTrace"); });
   pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
+  pool.Add([&] { rainMapPrep_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapPrep", "rainMapPrep"); });
+  pool.Add([&] { rainMapBuild_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapBuild", "rainMapBuild"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
     pool.Add([&] { cloudWeather_ = MakeComputePipeline(device, shadowPL_, mCloud, "weather", "cloudWeather"); });
@@ -1864,6 +1901,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // binds, so a fan costs no new binding and no new layout.
   pool.Add([&] { windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake"); });
   pool.Add([&] { rainFall_ = MakeComputePipeline(device, simPL_, mMutate, "rainFall", "rainFall"); });
+  pool.Add([&] { rainExpo_ = MakeComputePipeline(device, simPL_, mRainExpo, "build", "rainExpo"); });
   // The solute POUR (world.h CellOpSolute): in the mutate module because it
   // writes voxels (the powder a pour with no solvent leaves).
   pool.Add([&] { solPour_ = MakeComputePipeline(device, simPL_, mMutate, "solPour", "solPour"); });
@@ -2014,7 +2052,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // skipped far row is a missing horizon rather than a wrong sim. Their
   // verdict is checked where they are published (PublishFarPipelines).
   if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
-      !mutateCells_ || !windWake_ || !rainFall_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !mutateCells_ || !windWake_ || !rainFall_ || !rainExpo_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
@@ -2294,6 +2332,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowReq:           return world_->shadowReq;
     case B::ShadowHist:          return world_->shadowHist;
     case B::RayStart:            return rayStartBuf_;
+    case B::RainMap:             return rainMapBuf_;
+    case B::RainExpo:            return rainExpoBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
     case B::Openness:            return world_->openness;
@@ -2347,6 +2387,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::MutateCells:    return mutateCells_;
     case P::WindWake:       return windWake_;
     case P::RainFall:       return rainFall_;
+    case P::RainExpo:       return rainExpo_;
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
@@ -2387,6 +2428,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::SkyTopReduce:   return skyTopReduce_;
     case P::RayStartTrace:  return rayStartTrace_;
     case P::RayStartMin:    return rayStartMin_;
+    case P::RainMapPrep:    return rainMapPrep_;
+    case P::RainMapBuild:   return rainMapBuild_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -2597,6 +2640,42 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   RecordTable(enc, pass::Table::FarFill, &cx);
 }
 
+void Simulation::SetTickRain(uint32_t rainWord, int32_t slopeQx, int32_t slopeQz,
+                             IVec3 originChunk) {
+  // The same integer domains the kernels bound themselves by (rainexpo.h):
+  // rainFall's key tiles (8 keys) and the exposure map's texels (4 keys).
+  rainlat::Box b;
+  for (int a = 0; a < 3; a++) {
+    const int32_t o = (a == 0 ? originChunk.x : a == 1 ? originChunk.y : originChunk.z) *
+                      (int32_t)kChunk;
+    b.lo[a] = o;
+    b.hi[a] = o + (int32_t)kWorldN - 1;
+  }
+  const int32_t nx = rainlat::N(slopeQx), nz = rainlat::N(slopeQz);
+  uint64_t tiles = 1;
+  for (int i = 0; i < 2; i++) {
+    const int a = i == 0 ? 0 : 2;
+    const int32_t n = i == 0 ? nx : nz;
+    const int32_t d0 = rainlat::Drift(n, b.lo[1]), d1 = rainlat::Drift(n, b.hi[1]);
+    const int32_t lo = (b.lo[a] + std::min(d0, d1)) >> 3;
+    const int32_t hi = (b.hi[a] + std::max(d0, d1)) >> 3;
+    tiles *= (uint64_t)(hi - lo + 1);
+  }
+  // At most today's thread count: a slant's extra tiles are visited in a
+  // window that advances every tick (sim_mutate THE COST IS STILL FIXED).
+  constexpr uint64_t kRainThreads = (kWorldN / 8) * (kWorldN / 8);
+  rainFallGroups_ = (uint32_t)((std::min(tiles, kRainThreads) + 63) / 64);
+  // The map only on ticks the CA can read it: rain now, or wet ground (the
+  // RAINDAMP rules' exposure) -- materials.h kRainAmountMask / kRainWetShift.
+  const bool wants = (rainWord & 0xFFu) != 0u || ((rainWord >> 16) & 0xFFu) != 0u;
+  rainExpoGroups_ = 0;
+  if (wants) {
+    int32_t lo[2], ext[2];
+    rainlat::ExpoDomain(b, nx, nz, lo, ext);
+    rainExpoGroups_ = (uint32_t)(((uint64_t)ext[0] * ext[1] + 63) / 64);
+  }
+}
+
 void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
   // The per-FRAME table carries two systems now: the voxel shadow cache and
   // the clouds. Each has its own row condition, so this records whichever of
@@ -2623,6 +2702,10 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
     }
     cx.cloudGx = (cf.lowW + 7) / 8;
     cx.cloudGy = (cf.lowH + 7) / 8;
+    // The rain shadow map rides the clouds: it needs the env pass's wind
+    // probe, and without clouds nothing draws rain.
+    if (cf.rainMap && !rainMapOff_ && rainMapPrep_ && rainMapBuild_)
+      cx.cloudFlags |= 8u;
   }
   RecordTable(enc, pass::Table::ShadowCache, &cx);
   // The weather row just recorded: if the uniform asked it to rebuild the map
@@ -2870,6 +2953,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // is where the blocking lives. Waiting here instead would have made every
   // gate in the suite pay `far`'s 746 s for a row most of them never use.
   RecordCtx cx{};
+  // The rain lattice's extents (SetTickRain, from this tick's TickParams).
+  cx.rainFallGroups = rainFallGroups_;
+  cx.rainExpoGroups = rainExpoGroups_;
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
   cx.expCount = expCount;
@@ -3176,6 +3262,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(30, solSpecBuf_),
         b(31, world_->farMap),
         b(32, rayStartBuf_),
+        b(33, rainMapBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3265,6 +3352,7 @@ void Simulation::BuildShadowBindGroup() {
       b(19, world_->farOcc),
       b(20, world_->farUBO),
       b(21, rayStartBuf_),
+      b(22, rainMapBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

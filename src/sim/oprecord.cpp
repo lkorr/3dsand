@@ -492,6 +492,17 @@ void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas) {
   gas.clear();
 }
 
+bool RecordedRainSlope(uint32_t tick, int32_t& sx, int32_t& sz) {
+  if (!g_replay) return false;
+  for (const Frame& f : g_replay->frames) {
+    if (f.in.tick != tick) continue;
+    sx = f.tp.rainSlopeQx;
+    sz = f.tp.rainSlopeQz;
+    return true;
+  }
+  return false;
+}
+
 bool RecordedWeatherRain(uint32_t tick, uint32_t& word) {
   if (!g_replay) return false;
   for (const Frame& f : g_replay->frames) {

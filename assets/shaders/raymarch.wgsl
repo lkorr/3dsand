@@ -182,6 +182,13 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 // ShadowCache table. fs() starts the fine march (trace's tMin) and the cascade
 // march there; see rayStartAt for when it is trusted.
 @group(0) @binding(32) var<storage, read> rayStart : array<u32>;
+// ---- THE RAIN SHADOW MAP (rain_map.wgsl) -------------------------------------
+// Per fall line (a texel of the sheared key xz + s*y), the top of the first
+// blocker rain meets coming down along this frame's lean. Written by the
+// ShadowCache table's rain_map rows; read by the rain overlay (which drops are
+// drawn) and the near-field wet shading. Trusted only when its header is this
+// frame's (rainMapHeader) -- otherwise both fall back to the openness path.
+@group(0) @binding(33) var<storage, read> rainMap : array<u32>;
 // world.h's kSol* values (scripts/check_invariants.py `solute` checks these
 // against world.h too -- they are NOT the sim's MIRROR block, which needs
 // atomics and solMeta that a fragment stage must not bind).
@@ -5953,6 +5960,73 @@ fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
   return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, d.x);
 }
 
+// ---- THE RAIN SHADOW MAP, read side (rain_map.wgsl writes it) ---------------
+// The header, read once per use site: live only when the prep row of THIS
+// frame wrote it (its stamp is CL.frame) -- a norainmap arm, a first frame or a
+// portrait drawn with other params reads the openness path instead.
+const RMAP_N : u32 = 512u;                  // rain_map.wgsl agrees
+const RMAP_MASK : i32 = 511;                // rain_map.wgsl agrees
+const RMAP_HEADER : u32 = 16u;              // rain_map.wgsl agrees
+const RMAP_OPEN : i32 = -2147483647 - 1;    // rain_map.wgsl agrees
+struct RainMapHdr { live : bool, s : vec2f, gen : u32, lo : vec2<i32>, top : f32 };
+fn rainMapHeader() -> RainMapHdr {
+  var h : RainMapHdr;
+  h.live = arrayLength(&rainMap) >= RMAP_HEADER + RMAP_N * RMAP_N * 2u &&
+           rainMap[0] == CL.frame && rainMap[1] == 1u;
+  h.s = vec2f(bitcast<f32>(rainMap[2]), bitcast<f32>(rainMap[3]));
+  h.gen = rainMap[4];
+  h.lo = vec2<i32>(bitcast<i32>(rainMap[5]), bitcast<i32>(rainMap[6])) -
+         vec2<i32>(i32(RMAP_N / 2u));
+  h.top = bitcast<f32>(rainMap[8]);
+  return h;
+}
+// rain_map.wgsl rainMapTag, byte for byte.
+fn rainMapTagR(key : vec2<i32>, gen : u32) -> u32 {
+  return (u32(key.x) & 0xFFFu) | ((u32(key.y) & 0xFFFu) << 12u) | ((gen & 0xFFu) << 24u);
+}
+// The cover height of fall line `key` (world voxel y of the top of the first
+// blocker; RMAP_OPEN = none), or `unknown` = true outside the map or on a
+// stale tag. The caller decides what unknown means.
+fn rainMapTexel(rm : RainMapHdr, key : vec2<i32>, unknown : ptr<function, bool>) -> i32 {
+  let d = key - rm.lo;
+  if (any(d < vec2<i32>(0)) || any(d >= vec2<i32>(i32(RMAP_N)))) { *unknown = true; return RMAP_OPEN; }
+  let t = vec2<u32>(key & vec2<i32>(RMAP_MASK));
+  let at = RMAP_HEADER + (t.y * RMAP_N + t.x) * 2u;
+  if (rainMap[at + 1u] != rainMapTagR(key, rm.gen)) { *unknown = true; return RMAP_OPEN; }
+  return bitcast<i32>(rainMap[at]);
+}
+// A drop at `p` (world voxels): 1 above its fall line's cover, 0 more than a
+// voxel below it, a one-voxel ramp between (the drop fades into the eave it
+// lands on rather than popping). Outside the map = open.
+fn rainMapDropVis(rm : RainMapHdr, p : vec3f) -> f32 {
+  // Above where this frame's rays started nothing can cover it: no load. Most
+  // of the sheet over an overlook (the cascade camera) is up there.
+  if (p.y >= rm.top) { return 1.0; }
+  var unknown = false;
+  let hgt = rainMapTexel(rm, vec2<i32>(floor(p.xz + rm.s * p.y)), &unknown);
+  if (unknown || hgt == RMAP_OPEN) { return 1.0; }
+  return clamp(p.y - f32(hgt) + 1.0, 0.0, 1.0);
+}
+// How much of the rain reaches a SURFACE point `p` (world voxels, just off
+// the face): bilinear over the 2x2 fall lines round it, each tap exposed when
+// p is within ~1.5 voxels of its line's first blocker (so the blocker's own
+// faces count as hit). Returns -1 if any tap is unknown (outside the map):
+// the caller then uses the openness path.
+fn rainMapExposure(rm : RainMapHdr, p : vec3f) -> f32 {
+  let k = p.xz + rm.s * p.y - 0.5;
+  let k0 = vec2<i32>(floor(k));
+  let f = k - floor(k);
+  var unknown = false;
+  var e = vec4f(0.0);
+  for (var i = 0; i < 4; i++) {
+    let o = vec2<i32>(i & 1, i >> 1);
+    let hgt = rainMapTexel(rm, k0 + o, &unknown);
+    e[i] = select(smoothstep(f32(hgt) - 2.0, f32(hgt) - 1.0, p.y), 1.0, hgt == RMAP_OPEN);
+  }
+  if (unknown) { return -1.0; }
+  return mix(mix(e.x, e.y, f.x), mix(e.z, e.w, f.x), f.y);
+}
+
 // One drop of the rain overlay against the view ray: the drop is a real 3-D
 // segment centred at c along fallDir (rain: the motion blur of one frame) or
 // a point (snow), and the ray is tested against it by distance. Every drop is
@@ -6021,7 +6095,8 @@ fn rainFlutter(hsh : u32, n : f32, period : f32, snow : f32) -> vec2f {
 // as it falls through a tier boundary instead of being cut by it.
 fn rainColumns(camM : vec3f, rd : vec3f, dq : vec2f, wind : vec2f, fallV : f32,
                fallDir : vec3f, snow : f32, pxAng : f32, sceneM : f32,
-               g : f32, h : f32, salt : u32, fade : vec4f, alpha : f32) -> f32 {
+               g : f32, h : f32, salt : u32, fade : vec4f, alpha : f32,
+               rm : RainMapHdr) -> f32 {
   // The t span that can hold a drop of this tier: the fade band plus a rain
   // streak's half length either side.
   let t0 = max(fade.x - 0.3, 0.0);
@@ -6091,12 +6166,21 @@ fn rainColumns(camM : vec3f, rd : vec3f, dq : vec2f, wind : vec2f, fallV : f32,
         var a = cov * alpha * 1.24 / (1.0 + 0.2 * dist)
               * smoothstep(fade.x, fade.y, dist) * (1.0 - smoothstep(fade.z, fade.w, dist));
         if (a < 0.003) { continue; }
-        // Roofed? The openness at the drop's cell, looking up. Unknown = open.
+        // Under cover? THE RAIN SHADOW MAP: the drop is drawn only above the
+        // first blocker on its own fall line (one load, rainMapDropVis), so a
+        // roof stops it, a windward doorway lets a wedge of it in and the lee
+        // stays dry. Without a live map (switched off, a first frame, a view
+        // whose rows did not run) the old openness gate, which knows nothing
+        // of the lean. Unknown = open on both paths.
         let pM = camM + rel;
-        let vc = vec3<i32>(floor(pM / VOXEL_METERS));
-        if (inBounds(vc)) {
-          let o = opennessAt(vc, pM / VOXEL_METERS, vec3f(0.0, 1.0, 0.0), &openness, &opennessGen);
-          if (o >= 0.0) { a *= clamp(o * 2.0 - 0.4, 0.0, 1.0); }
+        if (rm.live) {
+          a *= rainMapDropVis(rm, pM / VOXEL_METERS);
+        } else {
+          let vc = vec3<i32>(floor(pM / VOXEL_METERS));
+          if (inBounds(vc)) {
+            let o = opennessAt(vc, pM / VOXEL_METERS, vec3f(0.0, 1.0, 0.0), &openness, &opennessGen);
+            if (o >= 0.0) { a *= clamp(o * 2.0 - 0.4, 0.0, 1.0); }
+          }
         }
         trans *= 1.0 - clamp(a, 0.0, 1.0);
       }
@@ -6116,9 +6200,6 @@ fn rainColumns(camM : vec3f, rd : vec3f, dq : vec2f, wind : vec2f, fallV : f32,
 // painting streaks on a lattice surface instead stretched them into arcs and
 // ribbons wherever the view grazed it. A drop is dropped behind the scene and
 // where the openness grid says its cell cannot see the sky.
-// Share of the (20 m averaged) wind the streaks lean with; see rainOverlay.
-const RAIN_WIND_SHARE : f32 = 0.4;
-const SNOW_WIND_SHARE : f32 = 0.8;
 fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   let here = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 2u]);
   let amount = clamp(here * 1.4, 0.0, 1.0) * TUNE_CLOUD_RAIN_STREAKS;
@@ -6149,9 +6230,13 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   // off vertical for rain, ~56 for snow. The cap also keeps a fan's mouth or
   // a tornado's rim from laying the streaks flat, and bounds how many columns
   // a ray crosses (|dq| below).
-  let wLean = wField.xz * mix(RAIN_WIND_SHARE, SNOW_WIND_SHARE, snow);
+  // The share and the cap are the PRESET's (weather::Preset windShare /
+  // maxLeanDeg, blended like every other field; the defaults are the numbers
+  // this used to hard-code: 40% / 35 degrees for rain, 80% / 56 for snow).
+  // rain_map.wgsl rainLeanWindHere is this computation and must stay so.
+  let wLean = wField.xz * CL.rainWindShare;
   let wLen = length(wLean);
-  let wMax = fallV * mix(0.7, 1.5, snow);   // tan(lean cap)
+  let wMax = fallV * CL.rainLeanTan;   // tan(lean cap)
   let wind = wLean * select(1.0, wMax / max(wLen, 1e-4), wLen > wMax);
   // Fall direction: down, carried along by the wind. A rain drop is a short
   // SEGMENT along it (motion blur over a frame's exposure); a flake a point.
@@ -6166,13 +6251,28 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   // fine columns (g 0.33 m, a drop per 1.2 m; snow 0.29 / 0.5) from 0.7 m to
   // 3.5 m, coarse (0.77 / 2.4; snow 0.74 / 0.8) from 2.5 m out to 14 m. A drop
   // nearer than ~1 m fades out: real ones that close are out of focus.
+  let rm = rainMapHeader();
+  // THE COLUMN BUDGET. rainColumns walks at most 48 columns, and a ray crosses
+  // |dq| t / g of them by distance t -- |dq| grows to 1 + |wind| / fallV (3.75
+  // at a storm's 70-degree lean), so a steep sheet seen from above or below
+  // used to run out of columns mid-tier and drop its far drops at a hard edge.
+  // Each tier's far fade is pulled in to what the budget reaches (46 columns,
+  // two to spare), so the drops fade out with distance instead of vanishing.
+  // At the old 35-degree cap the coarse tier's 14 m already fitted.
+  let dqLen = max(length(dq), 1e-3);
+  let gF = mix(0.33, 0.29, snow);
+  let gC = mix(0.77, 0.74, snow);
+  let reachF = 46.0 * gF / dqLen;
+  let reachC = 46.0 * gC / dqLen;
   var trans = rainColumns(camM, rd, dq, wind, fallV, fallDir, snow, pxAng, sceneM,
-                          mix(0.33, 0.29, snow), mix(1.2, 0.5, snow), 0x9E3779B9u,
-                          vec4f(0.7, 1.2, 2.5, 3.5), alpha);
+                          gF, mix(1.2, 0.5, snow), 0x9E3779B9u,
+                          vec4f(0.7, 1.2, min(2.5, 0.7 * reachF), min(3.5, reachF)),
+                          alpha, rm);
   if (trans > 0.02) {
     trans *= rainColumns(camM, rd, dq, wind, fallV, fallDir, snow, pxAng, sceneM,
-                         mix(0.77, 0.74, snow), mix(2.4, 0.8, snow), 0x5BD1E995u,
-                         vec4f(2.5, 3.5, 10.0, 14.0), alpha);
+                         gC, mix(2.4, 0.8, snow), 0x5BD1E995u,
+                         vec4f(2.5, 3.5, min(10.0, 0.7 * reachC), min(14.0, reachC)),
+                         alpha, rm);
   }
   return mix(colorIn, lit * mix(1.0, 1.6, snow), 1.0 - trans);
 }
@@ -12479,12 +12579,21 @@ fn fs(in : VSOut) -> FSOut {
     if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
       lambert *= cloudSunAt(hp, keyLightDir(), &CL, &cloudMaps);
     }
-    // WET GROUND (weather.h wetness): rain darkens what it soaks — sky-facing
-    // surfaces that can SEE the sky, by openness, so the floor of a barn stays
-    // dry while the yard outside goes dark. Liquids are already wet. The
-    // sheen below picks it up through `wet`, so a soaked field glints.
+    // WET GROUND (weather.h wetness): rain darkens what it soaks -- surfaces
+    // the rain can REACH, which is the rain shadow map's question: a point is
+    // exposed if it is the first blocker on its own fall line (rainMapExposure),
+    // so the floor of a barn stays dry, a porch stays dry, and a windward wall
+    // and the floor just inside a windward door get wet. Liquids are already
+    // wet. The sheen below picks it up through `wet`, so a soaked field glints.
+    // Outside the map, or with no live map, the old openness law (which does
+    // not know which way the rain falls).
     if (R.wetness > 0.001 && m.klass != CLASS_LIQUID) {
-      let expo = select(1.0, clamp(openRaw * 1.6 - 0.35, 0.0, 1.0), openRaw >= 0.0);
+      var expo = select(1.0, clamp(openRaw * 1.6 - 0.35, 0.0, 1.0), openRaw >= 0.0);
+      let rmw = rainMapHeader();
+      if (rmw.live) {
+        let em = rainMapExposure(rmw, hp + n * 0.05);
+        if (em >= 0.0) { expo = em; }
+      }
       let wv = R.wetness * expo * mix(0.3, 1.0, clamp(n.y, 0.0, 1.0));
       albedo *= 1.0 - TUNE_CLOUD_WET_DARKEN * wv;
       wet = max(wet, wv * 0.55);

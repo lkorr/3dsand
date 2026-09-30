@@ -2651,9 +2651,12 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // reactions and the GPU kernels read one value even if the weather pin
       // moves between here and the submit.
       {
-        const uint32_t rainWord =
+        const weather::TickRain rain =
             weather::LatchTickRain(CurrentTuning(), kDefaultSeed, tick);
-        mobs.SetWeatherRain(rainWord);
+        mobs.SetWeatherRain(rain.word);
+        // The slope the body rain exposure walks along (MobSystem
+        // RainExposedCpu), the same TickParams will carry.
+        mobs.SetRainSlope(rain.slopeQx, rain.slopeQz);
       }
 
       // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------

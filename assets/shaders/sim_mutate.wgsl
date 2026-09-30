@@ -719,51 +719,171 @@ fn windWake(@builtin(global_invocation_id) gid : vec3<u32>) {
 // SENTINEL on top (a uniform chunk whose top face is the surface) has no page
 // to write, so the drop is dropped rather than faulted.
 //
-// DETERMINISM (rule 1). Every tile is one thread and owns its columns, so no
-// two threads write one cell; each writes only the STAIN bits of its cell, and
-// what it reads of a neighbour is its material, which nothing here changes.
-// The column and the rolls are hash3 of (seed, tick, tile); the rain word is
-// TickParams, which ops-replay records.
+// THE SLANT (2026-09-30). The drop falls along TickParams' rain slope, not
+// straight down: the lattice of fall lines is src/sim/rainexpo.h's (key(c) =
+// c.xz + (n c.y + 8) >> 4, n = slope in sixteenths; sim_rain_expo.wgsl and
+// sim_step.wgsl read the same one). A thread's TILE is 8 x 8 KEYS, not 8 x 8
+// columns of the top face, and the tiles cover every key whose line crosses
+// the window: the top face AND the strip upwind of it, whose lines enter
+// through the window's upwind side -- without it a steep slope never wets the
+// downwind edge of the window. At n = 0 the key tile grid IS today's column
+// grid, cell for cell and hash for hash.
+//
+// THE COST IS STILL FIXED: RAIN_THREADS threads, today's count, whatever the
+// slope. A slant has more tiles than that (the strip), so each tick the threads
+// take a WINDOW of consecutive tiles that advances by RAIN_THREADS a tick and
+// wraps: every tile is visited, each one tick in ceil(tiles / RAIN_THREADS)
+// on average -- the lean thins the rain per unit of ground by that factor
+// (0.35x at a 35-degree diagonal, 0.27x at the 70-degree cap along an axis)
+// instead of multiplying the pass. Consecutive tiles mod the count are
+// distinct, so no two threads of a tick share a tile.
+//
+// The walk: level by level down the line, testing the L-shaped PATH between
+// consecutive MAIN cells (down, along x, along z -- rainexpo.h says why: a
+// line that moves two cells a level must not step through a one-voxel wall).
+// The first cell that is not air or gas ends it. If that cell is the line's
+// MAIN cell at its level, the drop lands there; if it is an intermediate path
+// cell, the drop is spent against it and writes nothing (that cell is some
+// other line's main cell, and only its own line may write it -- below). A line
+// that leaves the window sideways, or reaches its floor, is a miss.
+//
+// DETERMINISM (rule 1). Every cell is the MAIN cell of exactly one line (the
+// key is a function of the cell), every line belongs to exactly one tile, and
+// every tile is one thread: so no two threads can land on one cell, and a
+// thread writes only the STAIN bits of the one main cell it lands on. What it
+// reads is materials, which nothing here changes. The line and the rolls are
+// hash3 of (seed, tick, tile); the rain word and the slope are TickParams,
+// which ops-replay records. At n = 0 there are no intermediate path cells and
+// this is the vertical column walk it replaced.
 const RAIN_TILE : u32 = 8u;            // pass_table.cpp kRainTile
-const RAIN_TILES : u32 = WORLD_N / RAIN_TILE;
+const RAIN_THREADS : u32 = (WORLD_N / RAIN_TILE) * (WORLD_N / RAIN_TILE);
 const RAIN_SALT : u32 = 0x5A1D0F00u;
+
+// src/sim/rainexpo.h's lattice, byte for byte (sim_rain_expo.wgsl agrees).
+fn rfFloorDiv(a : i32, b : i32) -> i32 {
+  return select(-((-a + b - 1) / b), a / b, a >= 0);
+}
+fn rfDrift(n : i32, y : i32) -> i32 { return rfFloorDiv(n * y + 8, 16); }
+fn rfAxisSpan(k : i32, n : i32, lo : i32, hi : i32) -> vec2<i32> {
+  let A = k - hi;
+  let B = k - lo;
+  if (n == 0) {
+    return select(vec2<i32>(1, 0), vec2<i32>(-1073741824, 1073741823), A <= 0 && 0 <= B);
+  }
+  if (n > 0) {
+    return vec2<i32>(-rfFloorDiv(-(16 * A - 8), n), rfFloorDiv(16 * B + 7, n));
+  }
+  let m = -n;
+  return vec2<i32>(rfFloorDiv(8 - 16 * B - 16, m) + 1, rfFloorDiv(8 - 16 * A, m));
+}
+// The key-tile domain: tile lo (xy) and extent (zw). pass_table.cpp's
+// RainFallThreads computes the same extent for the dispatch.
+fn rfTiles(n : vec2<i32>, b : vec3<i32>) -> vec4<i32> {
+  let yb = b.y;
+  let yt = b.y + i32(WORLD_N) - 1;
+  let d0 = vec2<i32>(rfDrift(n.x, yb), rfDrift(n.y, yb));
+  let d1 = vec2<i32>(rfDrift(n.x, yt), rfDrift(n.y, yt));
+  let lo = (b.xz + min(d0, d1)) >> vec2<u32>(3u);
+  let hi = (b.xz + vec2<i32>(i32(WORLD_N) - 1) + max(d0, d1)) >> vec2<u32>(3u);
+  return vec4<i32>(lo, hi - lo + 1);
+}
+fn rfInWindow(c : vec3<i32>, b : vec3<i32>) -> bool {
+  let d = c - b;
+  return all(d >= vec3<i32>(0)) && all(d < vec3<i32>(i32(WORLD_N)));
+}
+// Does the drop stop in this cell? Anything that is not air or gas.
+fn rfStops(c : vec3<i32>, b : vec3<i32>) -> bool {
+  if (!rfInWindow(c, b)) { return false; }
+  let cm = voxMat(voxWordAt(c));
+  return cm != MAT_AIR && materials[cm].klass != CLASS_GAS;
+}
 
 @compute @workgroup_size(64)
 fn rainFall(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (gid.x >= RAIN_TILES * RAIN_TILES) { return; }
-  let h = hash3(T.seed ^ RAIN_SALT, T.tick, gid.x);
   let base = T.origin * i32(CHUNK);
-  let x = base.x + i32((gid.x % RAIN_TILES) * RAIN_TILE + (h % RAIN_TILE));
-  let z = base.z + i32((gid.x / RAIN_TILES) * RAIN_TILE + ((h / RAIN_TILE) % RAIN_TILE));
+  let n = vec2<i32>(T.rainSlopeQx >> 12u, T.rainSlopeQz >> 12u);
+  let tiles = rfTiles(n, base);
+  let count = u32(tiles.z * tiles.w);
+  if (gid.x >= RAIN_THREADS || gid.x >= count) { return; }
+  // This tick's window of tiles (THE COST IS STILL FIXED, above). At n = 0
+  // count == RAIN_THREADS and the tile is gid.x, as it always was.
+  let ti = select((gid.x + (T.tick % count) * RAIN_THREADS) % count, gid.x,
+                  count == RAIN_THREADS);
+  let h = hash3(T.seed ^ RAIN_SALT, T.tick, ti);
+  let tile = tiles.xy + vec2<i32>(i32(ti % u32(tiles.z)), i32(ti / u32(tiles.z)));
+  let k = tile * i32(RAIN_TILE) +
+          vec2<i32>(i32(h % RAIN_TILE), i32((h / RAIN_TILE) % RAIN_TILE));
   let rain = T.weatherRain & RAIN_AMOUNT_MASK;
   let roll = hash3(h, 0x7A11u, T.tick);
   // A dry sky dries; the drying chance is read off the cell's stain below.
   // Rolled FIRST while it rains, so a drizzle's idle threads skip the walk.
   if (rain != 0u && (roll % 255u) >= rain) { return; }
 
-  // Down the column to the first surface.
-  var y = base.y + i32(WORLD_N) - 1;
+  // Down the line to the first surface. Only the levels at which the main
+  // cell is inside the window, plus one either side for the path's legs.
+  let yt = base.y + i32(WORLD_N) - 1;
+  let hiXZ = base.xz + vec2<i32>(i32(WORLD_N) - 1);
+  let sx = rfAxisSpan(k.x, n.x, base.x, hiXZ.x);
+  let sz = rfAxisSpan(k.y, n.y, base.z, hiXZ.y);
+  var y = min(yt, min(sx.y, sz.y) + 1);
+  let yEnd = max(base.y, max(sx.x, sz.x) - 1);
+  var p = k - vec2<i32>(rfDrift(n.x, y + 1), rfDrift(n.y, y + 1));
   var idx = PT_NO_WORD;
   var w = 0u;
+  var mc = vec3<i32>(0);
   loop {
-    if (y < base.y) { return; }
-    let e = pageEntryOf(voxSlotOfCell(vec3<i32>(x, y, z)));
+    if (y < yEnd) { return; }
+    let m = k - vec2<i32>(rfDrift(n.x, y), rfDrift(n.y, y));
+    mc = vec3<i32>(m.x, y, m.y);
+    if (y < yt) {
+      // The path's intermediate cells: a drop spent against one writes nothing.
+      let st = select(vec2<i32>(-1), vec2<i32>(1), m >= p);
+      var ax = p.x;
+      loop {
+        if (ax == m.x) { break; }
+        if (rfStops(vec3<i32>(ax, y, p.y), base)) { return; }
+        ax += st.x;
+      }
+      var az = p.y;
+      loop {
+        if (az == m.y) { break; }
+        if (rfStops(vec3<i32>(m.x, y, az), base)) { return; }
+        az += st.y;
+      }
+    }
+    if (!rfInWindow(mc, base)) {
+      p = m;
+      y -= 1;
+      continue;
+    }
+    let e = pageEntryOf(voxSlotOfCell(mc));
     if ((e & PT_SENTINEL_BIT) != 0u) {
       let sm = e & PT_MAT_MASK;
       if (sm != MAT_AIR && materials[sm].klass != CLASS_GAS) { return; }
-      y = ((y >> CHUNK_SHIFT) << CHUNK_SHIFT) - 1;  // the whole chunk is sky
+      // The whole chunk is sky: jump to the lowest level whose main cell is
+      // still in it (every path cell between is in it too).
+      let c0 = (mc >> vec3<u32>(CHUNK_SHIFT)) * i32(CHUNK);
+      let cx = rfAxisSpan(k.x, n.x, c0.x, c0.x + i32(CHUNK) - 1);
+      let cz = rfAxisSpan(k.y, n.y, c0.z, c0.z + i32(CHUNK) - 1);
+      let yl = max(c0.y, max(cx.x, cz.x));
+      p = k - vec2<i32>(rfDrift(n.x, yl), rfDrift(n.y, yl));
+      y = yl - 1;
       continue;
     }
-    let lo = vec3<u32>(vec3<i32>(x, y, z) & vec3<i32>(CHUNK_MASK));
+    let lo = vec3<u32>(mc & vec3<i32>(CHUNK_MASK));
     let i = e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
     let cw = voxels[i];
     let cm = voxMat(cw);
-    if (cm == MAT_AIR || materials[cm].klass == CLASS_GAS) { y -= 1; continue; }
+    if (cm == MAT_AIR || materials[cm].klass == CLASS_GAS) {
+      p = m;
+      y -= 1;
+      continue;
+    }
     idx = i;
     w = cw;
     break;
   }
-  let c = vec3<i32>(x, y, z);
+  let c = mc;
   let m = materials[voxMat(w)];
   if (m.klass != CLASS_SOLID && m.klass != CLASS_POWDER) { return; }
 

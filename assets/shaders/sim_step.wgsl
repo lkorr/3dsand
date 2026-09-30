@@ -1711,26 +1711,76 @@ fn seesSky(c : vec3<i32>) -> bool {
   return !isRayBlocker(materials[nmat]);
 }
 
-// Does rain reach this cell? Rain falls at an angle and splashes, so a burning
-// trunk is wet down its SIDES, not only on top: the cell is exposed if it sees
-// the sky, or if a horizontal face opens onto a cell that does (an air-ish
-// side neighbour whose own cell above is not a ray blocker). Every read is at
-// Chebyshev distance 1 — the side neighbour and the diagonal above it — which
-// is the reach seesSky's note proves is scheduling-free: an actor in this pass
-// is >= 3 away and writes reach 1, so it cannot touch a cell within 1 of me.
-// Costs nothing while dry: both callers test T.weatherRain first.
+// Does rain reach this cell? THE RAIN EXPOSURE MAP (sim_rain_expo.wgsl,
+// built this tick before the CA from the grid as the tick's mutations left it,
+// read-only here): the cell is exposed if it is not below the first ray
+// blocker on its own fall line -- along this tick's slope, so a roof keeps its
+// floor dry however far up it is, and a windward door lets rain in while the
+// lee side stays dry. The map is a SNAPSHOT, which is what makes the long read
+// legal here where seesSky's 48-cell column was not: nothing in this pass
+// writes it.
+//
+// Rain splashes, so a burning trunk is wet down its SIDES, not only on top: a
+// horizontal face opening onto an air-ish neighbour that the map calls exposed
+// counts too. (It used to be any neighbour whose own cell above was clear,
+// which made every air cell beside an indoor wall rain-open.) The neighbour
+// read is at Chebyshev distance 1, the reach seesSky's note proves is
+// scheduling-free.
+// Costs nothing while dry: both callers test T.weatherRain first, and the map
+// is built on exactly the ticks where that test can pass (rain or wetness).
+@group(0) @binding(45) var<storage, read> rainExpo : array<u32>;
+// sim_rain_expo.wgsl's lattice, byte for byte (and src/sim/rainexpo.h).
+const RX_TEX_SHIFT : u32 = 2u;
+const RX_OPEN : i32 = -2147483647 - 1;
+const RX_MARGIN : i32 = 1;                  // rainlat::kExpoMargin
+fn rxFloorDiv(a : i32, b : i32) -> i32 {
+  return select(-((-a + b - 1) / b), a / b, a >= 0);
+}
+fn rxDrift(n : i32, y : i32) -> i32 { return rxFloorDiv(n * y + 8, 16); }
+fn rainMapExposed(c : vec3<i32>) -> bool {
+  let n = vec2<i32>(T.rainSlopeQx >> 12u, T.rainSlopeQz >> 12u);
+  let b = T.origin * i32(CHUNK);
+  let yb = b.y;
+  let yt = b.y + i32(WORLD_N) - 1;
+  let d0 = vec2<i32>(rxDrift(n.x, yb), rxDrift(n.y, yb));
+  let d1 = vec2<i32>(rxDrift(n.x, yt), rxDrift(n.y, yt));
+  let lo = (b.xz + min(d0, d1)) >> vec2<u32>(RX_TEX_SHIFT);
+  let hi = (b.xz + vec2<i32>(i32(WORLD_N) - 1) + max(d0, d1)) >> vec2<u32>(RX_TEX_SHIFT);
+  let key = c.xz + vec2<i32>(rxDrift(n.x, c.y), rxDrift(n.y, c.y));
+  let t = (key >> vec2<u32>(RX_TEX_SHIFT)) - lo;
+  let ext = hi - lo + 1;
+  if (any(t < vec2<i32>(0)) || any(t >= ext)) { return true; }
+  let h = bitcast<i32>(rainExpo[u32(t.y * ext.x + t.x)]);
+  return h == RX_OPEN || c.y >= h - RX_MARGIN;
+}
+// The rain's SURFACE, leniently: exposed by any of the 3x3 texels round the
+// cell's own. stainDry asks "is this wet cell one the rain keeps wet" -- and
+// the ground sampler wet it along its OWN fall line (sim_mutate rainFall is
+// exact per line), where the map answers for a texel's representative line,
+// up to two keys off. On a hillside riser the representative line can meet
+// the tread above first and call the riser covered; the cell then dried and
+// held its chunk awake while the rain re-wet it, every tick of the storm.
+// Leniency here is harmless: a covered cell judged exposed only waits for the
+// rain to stop before it dries.
+fn rainMapExposedNear(c : vec3<i32>) -> bool {
+  for (var i = 0; i < 9; i++) {
+    let d = vec3<i32>((i % 3 - 1) * 4, 0, (i / 3 - 1) * 4);
+    if (rainMapExposed(c + d)) { return true; }
+  }
+  return false;
+}
 fn rainOpen(n : vec3<i32>) -> bool {
   if (!inBounds(n)) { return true; }
   let nm = voxMat(voxWordAt(n));
   return nm == MAT_AIR || !isRayBlocker(materials[nm]);
 }
 fn rainExposed(c : vec3<i32>) -> bool {
-  if (seesSky(c)) { return true; }
+  if (rainMapExposed(c)) { return true; }
   for (var i = 0u; i < 4u; i++) {
     let d = select(vec3<i32>(0, 0, select(-1, 1, i == 3u)),
                    vec3<i32>(select(-1, 1, i == 1u), 0, 0), i < 2u);
     let n = c + d;
-    if (rainOpen(n) && rainOpen(n + vec3<i32>(0, 1, 0))) { return true; }
+    if (rainOpen(n) && rainMapExposed(n)) { return true; }
   }
   return false;
 }
@@ -2157,11 +2207,25 @@ fn stainDry(c : vec3<i32>, idx : u32, w : u32, m : Material, rnd : u32, probe : 
     let um = voxMat(voxWordAt(up));
     open = um == MAT_AIR || materials[um].klass == CLASS_GAS;
   }
+  // SLANTED RAIN'S SURFACES (2026-09-30). While it rains along a slope the
+  // rain lands on faces with something over them too -- a windward wall, the
+  // floor inside a windward door -- and each of those is, by construction, the
+  // first blocker on its fall line: exposed by the rain exposure map (read
+// leniently, rainMapExposedNear says why). It is the
+  // rain's surface exactly as a top face is, so it neither dries nor holds its
+  // chunk awake while the rain lasts (measured: without this, a storm's lean
+  // wetted every hillside riser and tree flank in the window and the CA went
+  // 1.3 -> 9.1 ms a tick, every one of those cells re-wetted as it dried). The
+  // map exists on every raining tick the CA runs (C_RAINEXPO), which is the
+  // only tick this reads it on. After the rain those faces dry here, awake,
+  // bounded by their 15 levels -- the same standing a wall a flow wetted has.
+  let raining = (T.weatherRain & RAIN_AMOUNT_MASK) != 0u;
+  if (!open && raining && rainMapExposedNear(c)) { open = true; }
   if (!open) { markDirtyR(c, DIRTY_R_STAIN); }
   // Nothing open to the sky dries while it rains: that is the rain's surface.
   // (Measured: drying through a storm left a third of a rained-on stone strip
   // CLEAN -- its 1-level wet mark dried between drops.)
-  if (open && (T.weatherRain & RAIN_AMOUNT_MASK) != 0u) { return false; }
+  if (open && raining) { return false; }
   if (probe || (hash3(rnd, 0xD41E5u, 0u) % 1000u) >= chance) { return false; }
   let left = voxStainAmt(w) - 1u;
   var nw = w & ~STAIN_BITS;

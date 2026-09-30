@@ -1897,6 +1897,11 @@ struct RenderArm {
   // a picture (the ray-start map, the perfExp experiments), so a one-process
   // A/B covers all seven cameras without seven list edits.
   bool anyCamera = false;
+  // Suppress the rain shadow map's rows (Simulation::SetRainMapOff): rain and
+  // wet ground go back to the openness gate. Same standing as noRayStart. The
+  // pair only means something under precipitation — pin it for the run with
+  // SANDVOX_WEATHER=rain (or storm, for the steep lean).
+  bool noRainMap = false;
 };
 
 const RenderArm kRenderArms[] = {
@@ -2114,6 +2119,18 @@ const RenderArm kExtraArms[] = {
     {"norstart", "ray-start map off (rows unrecorded)", nullptr, true, 1,
      "what the ray-start map SAVES — read the delta with the sign flipped",
      /*universalShader=*/false, /*noRayStart=*/true, /*anyCamera=*/true},
+    // The rain shadow map (assets/shaders/rain_map.wgsl): its rows unrecorded,
+    // so the raymarch's stamp check fails and the rain overlay and the wet
+    // shading take the openness path they used before. Positive saved-ms is
+    // the map's cost (its rows, in `pre`, plus its reads); negative, what it
+    // saves over the per-drop openness taps. Meaningless in a dry sky: run
+    // with SANDVOX_WEATHER=rain / storm.
+    {"norainmap", "rain shadow map off (rows unrecorded, openness gate)", nullptr,
+     true, 1,
+     "the rain shadow map: its prep + build rows and the per-drop / per-wet-"
+     "pixel reads, against the openness taps they replaced",
+     /*universalShader=*/false, /*noRayStart=*/false, /*anyCamera=*/true,
+     /*noRainMap=*/true},
     // debug.perfExp: a WGSL-visible integer (TUNE_PERF_EXP) that a shader
     // experiment branches on, so a render-side change can be A/B'd IN ONE
     // PROCESS against the frame it modifies. Boot-to-boot noise on this
@@ -2873,6 +2890,7 @@ class RenderBudgetRunner {
     // comment above is what an un-restored arm state looks like.
     sim_.SetForceUniversalRaymarch(arm.universalShader);
     sim_.SetRayStartOff(arm.noRayStart);
+    sim_.SetRainMapOff(arm.noRainMap);
 
     const uint32_t d = arm.widthDiv;
     const uint32_t W = opt_.width / d, H = opt_.height / d;

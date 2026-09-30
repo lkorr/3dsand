@@ -1018,11 +1018,15 @@ fn writeRainWindProbe() {
   // eye moves by dWind * h / fallSpeed when it changes — with snow's 1.1 m/s
   // fall a wind shift swung the entire field round the eye like one rigid
   // sheet. Easing the lean over a few seconds (longer for snow) keeps that
-  // swing slower than the flakes' own motion. A first frame or a clock that
-  // went backwards snaps to the new value.
+  // swing slower than the flakes' own motion. A first frame, a clock that
+  // went backwards or a clock that did NOT move snaps to the new value: a
+  // frozen clock (a paused game, every --shot frame at kShotTime) would
+  // otherwise blend by exactly 0 forever and keep the first frame's wind --
+  // the storm shots leaned the way the calm ones did. Frozen time means the
+  // wind is not moving either, so the snap is what the ease converges to.
   let tPrev = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 7u]);
   let dt = R.time - tPrev;
-  if (dt >= 0.0 && dt < 1.0) {
+  if (dt > 0.0 && dt < 1.0) {
     let prev = vec3f(bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 4u]),
                      bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 5u]),
                      bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 6u]));

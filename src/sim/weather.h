@@ -66,6 +66,21 @@ struct Preset {
   // ---- precipitation ----
   float precip = 0.0f;      // raininess: how readily cloud turns into rain
   float precipType = 0.0f;  // 0 rain, 1 snow (blends: sleet)
+  // THE LEAN of the fall: the share of the local wind a drop drifts with, and
+  // the tangent of the cap on its angle off vertical. Authored as `windShare`
+  // and `maxLeanDeg`; ABSENT, they take what the rain overlay used to hard-code
+  // for this preset's precipType (40% / 35 degrees rain, 80% / 56 degrees
+  // snow, linear between — so a sleet preset and a rain-to-snow blend both
+  // land where they always did). Blended as the TANGENT, not the angle, which
+  // is what makes an unauthored blend reproduce the old mix() exactly. Read
+  // by the rain overlay and the rain shadow map (render) and, quantised, by
+  // the sim's slanted rain (SimRainSlopeQ).
+  float windShare = 0.4f;
+  float leanTan = 0.7f;
+  // As authored, for the sim's quantised copy: whether windShare was given,
+  // and maxLeanDeg (-1 = absent). Not blended; Lerp keeps `a`'s or `b`'s.
+  bool windShareAuthored = false;
+  float maxLeanDeg = -1.0f;
 
   // ---- the world under it ----
   float mist = 0.0f;        // extra ground fog, x the base fog density (+1)
@@ -100,6 +115,9 @@ Preset Lerp(const Preset& a, const Preset& b, float t);
 // from these in integers only — see SimRainWord.
 struct PresetQ {
   int64_t weight = 0, coverage = 0, precip = 0, precipType = 0;
+  // The lean, Q16: windShare, and tan(maxLeanDeg) through an integer table
+  // (no libm on the sim's path — see SimRainWord).
+  int64_t windShare = 0, leanTan = 0;
 };
 
 class Library {
@@ -169,6 +187,30 @@ State Resolve(const Tuning& t, uint32_t seed, double timeSeconds,
 // 0 when weather.clouds or weather.rainTouchesWorld is off.
 uint32_t SimRainWord(const Tuning& t, uint32_t seed, uint32_t tick);
 
+// THE SIM'S RAIN, WHOLE: the word above plus THE RAIN SLOPE -- TickParams
+// rainSlopeQx / rainSlopeQz, Q16 cells a drop drifts DOWNWIND per cell it
+// falls. What sim_mutate's rainFall walks along and sim_rain_expo builds the
+// exposure map along. Integer end to end, like the word:
+//   * the MEAN wind of WindWeatherQ (the TickParams windDirQ / windSpeedQ of
+//     this tick) -- not the gust band and not the wind primitives: a fan or a
+//     tornado steers the drawn streaks (the renderer's windAt probe) but not
+//     the sim's rain, because the slope is ONE number per tick for the whole
+//     window and a primitive is local;
+//   * the preset's windShare and lean cap (PresetQ, the tangent through an
+//     integer table), blended by the same schedule and pin as the word;
+//   * a fall speed per precipitation type, Q16 mix(8.5, 1.1, snow) m/s -- the
+//     rain overlay's fallV -- in cells/s.
+// Quantised to SIXTEENTHS (a multiple of 4096) so it changes rarely and so the
+// line lattice (x + (n y + 8) >> 4) is exact in 32-bit WGSL, and clamped to
+// kRainSlopeMaxN sixteenths. Zero whenever the rain amount is 0 (dry, or
+// weather.rainTouchesWorld / weather.clouds off): nothing slanted runs.
+struct TickRain {
+  uint32_t word = 0;
+  int32_t slopeQx = 0, slopeQz = 0;
+};
+constexpr int32_t kRainSlopeMaxN = 44;   // 2.75 = tan(70 deg), in sixteenths
+TickRain SimRain(const Tuning& t, uint32_t seed, uint32_t tick);
+
 // THE TICK'S RAIN WORD, decided ONCE. The authority (session.cpp) calls
 // LatchTickRain at the head of the tick and hands the result to the CPU rain
 // readers (mob and debris body reactions); SubmitTick calls TakeTickRain to
@@ -178,8 +220,9 @@ uint32_t SimRainWord(const Tuning& t, uint32_t seed, uint32_t tick);
 // kernels read ONE value per tick even if the dev-panel pin changes between
 // the two calls: the pin is sampled once, and what TickParams records (and
 // ops-replay feeds back, opstream::RecordedWeatherRain) is that sample.
-uint32_t LatchTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
-uint32_t TakeTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
+// The slope rides the same latch as the word: one TickRain per tick.
+TickRain LatchTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
+TickRain TakeTickRain(const Tuning& t, uint32_t seed, uint32_t tick);
 // The word the last SimRainWord call returned — a readout for the dev panel,
 // never an input to anything.
 uint32_t LastSimRainWord();

@@ -208,7 +208,12 @@ PASS(windWake, "prep(mutate+explode+compact)", PT_TICK, PIPE_WIND_WAKE, K_COMPUT
 // on; each thread owns its tile, so no two write one cell. A(DirtyOut): a cell
 // newly wetted declares its chunk (modified tracking, and the coat rules see
 // it); before `compact` for the windWake reason.
-PASS(rainFall, "prep(mutate+explode+compact)", PT_TICK, PIPE_RAIN_FALL, K_COMPUTE, kRainFallGroups,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+// SINCE 2026-09-30 THE DROP FALLS ALONG THE TICK'S RAIN SLOPE (sim_mutate's
+// THE SLANT note): 8x8 KEY tiles of the fall-line lattice, the window's top
+// face plus the strip upwind of it, visited by at most today's 4096 threads
+// (a window of tiles advancing each tick), so the cost stays fixed. D_RAINFALL
+// because a clamp of the tile count is still a count; 64 groups in practice.
+PASS(rainFall, "prep(mutate+explode+compact)", PT_TICK, PIPE_RAIN_FALL, K_COMPUTE, D_RAINFALL,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
      USES(R(Materials) U(TickUBO) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)))
 // mark reads the neighborhood, apply writes it. The two-phase split is what
 // makes the explosion kernel race-free (CLAUDE.md build gotchas); it only works
@@ -357,6 +362,18 @@ PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPAT
      USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           R(PageTable) W(ReposeSnap)))
 
+// ---- THE RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl) ----------
+// Before the CA, after every mutation of the tick: one thread per texel of the
+// fall-line lattice marches its line down from the window top to the first
+// ray blocker and writes that level to its own texel. Reads the grid, writes
+// only RainExpo; the CA reads RainExpo only (its rainExposed) -- so the long
+// read that seesSky's note forbids INSIDE the CA is a snapshot here, race-free
+// by construction. Recorded only on ticks the CA can ask (rain or wetness in
+// the rain word, C_RAINEXPO), so fair weather costs nothing, and in full every
+// time: no history to carry across a load or a replay start.
+PASS(rainExpo, "rainExpo", PT_TICK, PIPE_RAIN_EXPO, K_COMPUTE, D_RAINEXPO,1,1, GRP_SIM, DYN_ZERO, C_RAINEXPO, 1,
+     USES(R(Materials) U(TickUBO) R(Voxels) R(PageTable) W(RainExpo)))
+
 // ---- phase 3: the CA loop -------------------------------------------------
 // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
 // world dispatches zero workgroups here (DESIGN.md §11). DYN_CA feeds iteration
@@ -368,6 +385,7 @@ PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPAT
 // point only READS it (dirtyList[wg.x] at the top of main).
 // read-only in practice: declared read_write only because WGSL cannot mix
 // access modes for one binding across the module's entry points.
+// R(RainExpo): rainExposed reads the rain exposure map the row above builds.
 // The three MLS-MPM buffers are the excited-fluid coupling (DESIGN.md §5):
 // doReactions synthesizes an excited cell as a liquid neighbour from LAST
 // tick's block map + node mass + the seam's intent word, and flags the cell
@@ -399,7 +417,7 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
-          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec)))
+          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //
@@ -1290,6 +1308,24 @@ PASS(cloud_march, "cloudMarch", PT_SHADOWCACHE, PIPE_CLOUD_MARCH, K_COMPUTE, D_C
 PASS(cloud_resolve, "cloudResolve", PT_SHADOWCACHE, PIPE_CLOUD_RESOLVE, K_COMPUTE, D_CLOUDGX,D_CLOUDGY,1,
      GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
      USES(U(RenderUBO) U(CloudUBO) R(CloudRaw) RW(CloudHist)))
+
+// ---- THE RAIN SHADOW MAP (assets/shaders/rain_map.wgsl) --------------------
+// Where precipitation lands: per fall line along this frame's lean, the top
+// of the first blocker. AFTER the clouds because the prep reads the env pass's
+// 20 m wind probe (R(CloudMaps) orders it after cloud_env's W), and after the
+// sky bound whose tail it starts its rays under (R(FarOcc)). One thread
+// decides the lean, generation and centre (prep); one thread per texel
+// re-marches the stale and rolling texels (build). The raymarch reads the map
+// in the fragment stage of this command buffer (BeginRendering's flush).
+// C_RAINMAP: clouds on, precipitating, render.rainShadowMap on. Off = no row.
+PASS(rain_map_prep, "rainMap", PT_SHADOWCACHE, PIPE_RAIN_MAP_PREP, K_COMPUTE, 1,1,1,
+     GRP_SHADOW, DYN_NONE, C_RAINMAP, 1,
+     USES(U(RenderUBO) U(CloudUBO) R(CloudMaps) R(FarOcc) RW(RainMap)))
+// 64 x 64 workgroups of 8x8 = one thread per texel of the 512^2 map.
+PASS(rain_map_build, "rainMap", PT_SHADOWCACHE, PIPE_RAIN_MAP_BUILD, K_COMPUTE, 64,64,1,
+     GRP_SHADOW, DYN_NONE, C_RAINMAP, 1,
+     USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
+          R(FarOcc) RW(RainMap)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded
