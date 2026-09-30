@@ -1125,10 +1125,15 @@ TP_F(sim, windDriftSpeed, TUNE_WIND_DRIFT_SPEED, 12.0f, 0.5f, 200.0f)
 // Capped below 1: at 1.0 a moving voxel ALWAYS tries downwind first, which
 // removes the RNG order entirely and turns a gas into a conveyor belt.
 TP_F(sim, windDriftMax, TUNE_WIND_DRIFT_MAX, 0.5f, 0.0f, 0.95f)
-TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 2.0f, 0.5f, 200.0f)
+TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 1.2f, 0.5f, 200.0f)
 // Rate, not certainty (rule 2). 30/s is one hop per tick, which is the
 // most the substep gate can deliver anyway.
 TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f, 0.0f, 30.0f)
+// Saltation flux rises with a POWER of the excess over the threshold
+// (~cube, docs/RESEARCH_wind.md 13.5): the hop chance is
+// rate x min(excess / (threshold x span), 1)^power.
+TP_F(sim, windEntrainPower, TUNE_WIND_ENTRAIN_POWER, 3.0f, 1.0f, 6.0f)
+TP_F(sim, windEntrainSpan, TUNE_WIND_ENTRAIN_SPAN, 1.0f, 0.1f, 10.0f)
 // ---- the CURRENT field's one sim coupling (PLAN_water_master.md comp 8)
 // The only current knob the SHADER reads. Everything else about the field is
 // resolved into primitives on the CPU, so this is the whole .def surface:
@@ -2247,6 +2252,23 @@ TP_F(wind, leeSlope, NO_WGSL, 0.5f, 0.05f, 3.0f)
 TP_F(wind, leeDepth, NO_WGSL, 12.0f, 1.0f, 100.0f)
 TP_F(wind, leeReverse, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_F(wind, leeGust, NO_WGSL, 0.8f, 0.0f, 4.0f)
+// ---- local winds and the storm timeline (docs/RESEARCH_wind.md 13.4) ----
+TP_F(wind, slopeWind, NO_WGSL, 2.0f, 0.0f, 10.0f)
+TP_F(wind, slopeNight, NO_WGSL, 0.7f, 0.0f, 2.0f)
+TP_F(wind, slopeDepth, NO_WGSL, 15.0f, 1.0f, 200.0f)
+TP_F(wind, seaBreeze, NO_WGSL, 3.0f, 0.0f, 15.0f)
+TP_F(wind, seaNight, NO_WGSL, 0.4f, 0.0f, 2.0f)
+TP_F(wind, seaDepth, NO_WGSL, 60.0f, 1.0f, 400.0f)
+TP_F(wind, localFade, NO_WGSL, 6.0f, 0.5f, 40.0f)
+TP_F(wind, stormCycle, NO_WGSL, 240.0f, 30.0f, 3600.0f)
+TP_F(wind, stormLull, NO_WGSL, 0.3f, 0.0f, 1.0f)
+TP_F(wind, stormFront, NO_WGSL, 2.5f, 1.0f, 5.0f)
+TP_F(wind, stormDecay, NO_WGSL, 1.4f, 1.0f, 4.0f)
+TP_F(wind, stormGust, NO_WGSL, 0.6f, 0.0f, 3.0f)
+TP_F(wind, stormJump, NO_WGSL, 90.0f, 0.0f, 180.0f)
+TP_I(wind, stormBursts, NO_WGSL, 2, 0, 6)
+TP_F(wind, stormBurstRadius, NO_WGSL, 25.0f, 3.0f, 51.0f)
+TP_B(wind, stormFrontJet, NO_WGSL, true)
 TP_B(wind, dbgWindField, NO_WGSL, false)
 
 

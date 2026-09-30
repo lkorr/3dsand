@@ -291,6 +291,33 @@ bool GasFarRenderActive() { return gGasFarRenderActive; }
 namespace {
 CloudFrame gCloudFrame;
 
+// Write the placed primitives' count/box plus the storm's own primitives into
+// a TickParams or RenderParams list. `n` placed entries are already copied;
+// the weather's go after them, capped at the list. Empty stays the empty box.
+void AppendWeatherPrims(const Tuning& tun, uint32_t seed, uint32_t tick,
+                        const int32_t origin[3], uint32_t n, IVec3 lo, IVec3 hi,
+                        int32_t* prims, uint32_t& count, int32_t* outLo, int32_t* outHi) {
+  int32_t l3[3] = {lo.x, lo.y, lo.z}, h3[3] = {hi.x, hi.y, hi.z};
+  if (n == 0) {
+    l3[0] = l3[1] = l3[2] = INT32_MAX;
+    h3[0] = h3[1] = h3[2] = INT32_MIN;
+  }
+  WindPrimGpu extra[kWindPrimCap];
+  const uint32_t m = windfield::WeatherPrims(tun, seed, tick, origin, extra,
+                                             kWindPrimCap - n, l3, h3);
+  for (uint32_t i = 0; i < m; i++)
+    std::memcpy(&prims[(n + i) * kWindPrimWords], extra[i].w, kWindPrimWords * sizeof(int32_t));
+  count = n + m;
+  if (count == 0) {
+    l3[0] = l3[1] = l3[2] = 1;
+    h3[0] = h3[1] = h3[2] = 0;
+  }
+  for (int k = 0; k < 3; k++) {
+    outLo[k] = l3[k];
+    outHi[k] = h3[k];
+  }
+}
+
 // Cloud DRIFT in metres, a pure function of the sim clock.
 //
 // The drift is the integral of the wind over time, and an integral is exactly
@@ -849,13 +876,17 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   {
     const WindPrimSystem& wp = WindPrims();
     const uint32_t n = std::min(wp.Count(), kWindPrimCap);
-    rp.windPrimCount = n;
     const IVec3 lo = wp.BoundsLo(), hi = wp.BoundsHi();
-    rp.windPrimLo[0] = lo.x; rp.windPrimLo[1] = lo.y; rp.windPrimLo[2] = lo.z;
-    rp.windPrimHi[0] = hi.x; rp.windPrimHi[1] = hi.y; rp.windPrimHi[2] = hi.z;
     for (uint32_t i = 0; i < n; i++)
       std::memcpy(&rp.windPrims[i * kWindPrimWords], wp.Resolved()[i].w,
                   kWindPrimWords * sizeof(int32_t));
+    // The storm's own primitives (windfield.h WeatherPrims), after the placed
+    // ones — the same call SubmitTick makes, so the grass leans in the same
+    // downburst the smoke is pushed by.
+    const IVec3 wo = world.WindowOrigin();
+    const int32_t o3[3] = {wo.x, wo.y, wo.z};
+    AppendWeatherPrims(tun, rp.seed, tick, o3, n, lo, hi, rp.windPrims, rp.windPrimCount,
+                       rp.windPrimLo, rp.windPrimHi);
   }
   // THE CURRENT FIELD, the render copy (plan component 8). The SAME resolved
   // list SubmitTick shipped to the sim this tick — CurrentPrims() is advanced
@@ -1274,13 +1305,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     WindPrimSystem& wp = WindPrims();
     wp.Tick(tick);
     const uint32_t n = std::min(wp.Count(), kWindPrimCap);
-    tp.windPrimCount = n;
     const IVec3 lo = wp.BoundsLo(), hi = wp.BoundsHi();
-    tp.windPrimLo[0] = lo.x; tp.windPrimLo[1] = lo.y; tp.windPrimLo[2] = lo.z;
-    tp.windPrimHi[0] = hi.x; tp.windPrimHi[1] = hi.y; tp.windPrimHi[2] = hi.z;
     for (uint32_t i = 0; i < n; i++)
       std::memcpy(&tp.windPrims[i * kWindPrimWords], wp.Resolved()[i].w,
                   kWindPrimWords * sizeof(int32_t));
+    // The storm's primitives: a gust-front jet and downbursts, a pure function
+    // of (tuning, seed, tick, window). After the placed ones, so a full list
+    // refuses the weather rather than a player's fan; Air only, so they add
+    // nothing to the wake below.
+    {
+      const IVec3 wo = world.WindowOrigin();
+      const int32_t o3[3] = {wo.x, wo.y, wo.z};
+      AppendWeatherPrims(CurrentTuning(), seed, tick, o3, n, lo, hi, tp.windPrims,
+                         tp.windPrimCount, tp.windPrimLo, tp.windPrimHi);
+    }
 
     // THE FOOTPRINT WAKE (§10). Only primitives holding the entrainment
     // licence produce one, and the snapshot's occupancy filters out the sky —

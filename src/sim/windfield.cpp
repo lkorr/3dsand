@@ -14,6 +14,7 @@
 #include "sim/intmath.h"
 #include "sim/tuning.h"
 #include "sim/weather.h"
+#include "sim/windprim.h"
 #include "sim/worldmap.h"
 #include "test/support.h"  // AssetDir(): the one asset-path chokepoint
 
@@ -63,6 +64,11 @@ uint64_t RefFingerprint(const Tuning& t) {
   f.F(w.speedGaleMul);
   f.F(w.speedMaxMul);
   f.F(w.galeHold);
+  f.F(w.stormCycle);
+  f.F(w.stormLull);
+  f.F(w.stormFront);
+  f.F(w.stormDecay);
+  f.F(w.stormJump);
   f.I((int64_t)RegimeFingerprint());
   f.I((int64_t)weather::SimWindFingerprint(t));
   return f.h;
@@ -453,7 +459,9 @@ Block Resolve(const Tuning& t, uint32_t seed, uint32_t tick, float frac,
   b.leeRevQ = Q16(w.leeReverse);
   b.leeGustQ = Q16(w.leeGust);
   b.slopeWindQ = q.slopeWind;
+  b.slopeDepth = Vox(w.slopeDepth);
   b.seaBreezeQ = q.seaBreeze;
+  b.seaDepth = Vox(w.seaDepth);
   b.expDepth = Vox(w.exposureDepth);
   // Per 100 m -> per 1024 voxels: x 1.024.
   b.absGainQ = (int32_t)((double)w.absGain * 1.024 * 65536.0 + (w.absGain >= 0 ? 0.5 : -0.5));
@@ -516,21 +524,206 @@ void FillWindField(RenderParams& rp, const Tuning& t, uint32_t seed, uint32_t ti
 }
 
 // ============================================================================
-// THE STORM TIMELINE and LOCAL WINDS (stage 4 of §13; identity until then)
+// THE STORM TIMELINE and LOCAL WINDS (docs/RESEARCH_wind.md §13.4)
 // ============================================================================
+//
+// A THUNDERSTORM is a timeline, not a stronger breeze. The clock runs in
+// cycles of wind.stormCycle seconds whether or not a storm is on; the regime's
+// convective weight decides how much of it you feel, so a sky easing into a
+// storm grows the cycle in rather than switching it on. One cycle:
+//
+//   u 0.00 - 0.15   the wind falls away toward the LULL (stormLull x mean)
+//   u 0.15 - 0.25   the lull: the air goes still and heavy ahead of the cell
+//   u 0.25 - 0.28   the GUST FRONT: the heading jumps by ~stormJump degrees
+//                   and the mean spikes to stormFront x (2-3x)
+//   u 0.28 - 0.45   the spike decays to stormDecay x, the heading holds
+//   u 0.45 - 1.00   gusty decay back to 1x, heading easing home, gust
+//                   fraction raised by stormGust and falling off
+//
+// Integer on Q16 of the cycle position; every number is a pure function of
+// (tuning, seed, tick). The spatial structure — a gust front sweeping across
+// the window, downbursts — is added by WeatherPrims below through the wind
+// primitive list, not by a new mechanism.
 
-void StormTimeline(const Tuning& /*t*/, uint32_t /*seed*/, uint32_t /*tick*/,
-                   int32_t /*convective*/, WindStateQ& o, int64_t& envelope,
-                   int64_t& stormGust, uint32_t& jumpBam) {
-  o.stormPhase = -1;
+namespace {
+
+constexpr uint32_t kStormSalt = 0x57A4u;
+
+// Piecewise-linear through (x_i, y_i), all Q16, x ascending.
+int64_t Pw(int64_t u, const int64_t* xs, const int64_t* ys, int n) {
+  if (u <= xs[0]) return ys[0];
+  for (int i = 1; i < n; i++) {
+    if (u <= xs[i]) {
+      const int64_t span = std::max<int64_t>(xs[i] - xs[i - 1], 1);
+      return ys[i - 1] + ((ys[i] - ys[i - 1]) * (u - xs[i - 1])) / span;
+    }
+  }
+  return ys[n - 1];
+}
+
+int64_t StormTicks(const Tuning& t) {
+  return std::max<int64_t>((int64_t)((double)t.wind.stormCycle * 30.0 + 0.5), 300);
+}
+
+}  // namespace
+
+void StormTimeline(const Tuning& t, uint32_t seed, uint32_t tick, int32_t convective,
+                   WindStateQ& o, int64_t& envelope, int64_t& stormGust,
+                   uint32_t& jumpBam) {
+  const Tuning::Wind& w = t.wind;
   envelope = 65536;
   stormGust = 0;
   jumpBam = 0;
+  o.stormPhase = -1;
+  if (convective <= 0) return;
+  const int64_t P = StormTicks(t);
+  const uint32_t n = (uint32_t)((int64_t)tick / P);
+  const int64_t u = (((int64_t)tick % P) * 65536) / P;
+  o.stormPhase = (int32_t)u;
+  o.stormCycle = n;
+  const int64_t C = convective;
+
+  const int64_t lull = Q16(w.stormLull), front = Q16(w.stormFront), dec = Q16(w.stormDecay);
+  static const int64_t xe[] = {0, 9830, 16384, 18350, 29491, 65536};   // 0 .15 .25 .28 .45 1
+  const int64_t ye[] = {65536, lull, lull, front, dec, 65536};
+  const int64_t f = Pw(u, xe, ye, 6);
+  envelope = 65536 + ((f - 65536) * C >> 16);
+
+  // The jump: its size and sign are this cycle's draw.
+  const uint32_t h = rng::Hash3(seed ^ kStormSalt, n, 0u);
+  const int64_t mag = 45875 + (int64_t)((h & 0xFFFFu) * 39322 >> 16);    // 0.7 .. 1.3
+  const int64_t jdeg = ((int64_t)Q16(w.stormJump) * mag) >> 16;          // Q16 degrees
+  static const int64_t xj[] = {0, 16384, 18350, 29491, 65536};
+  static const int64_t yj[] = {0, 0, 65536, 65536, 0};
+  const int64_t jw = (Pw(u, xj, yj, 5) * C) >> 16;
+  // Q16 degrees x weight -> BAM32: deg / 360 * 2^32 = deg * 2^32 / 360.
+  int64_t bam = (((jdeg * jw) >> 16) * 11930465) >> 16;   // 2^32 / 360 = 11930464.7
+  if ((h >> 16) & 1u) bam = -bam;
+  jumpBam = (uint32_t)bam;
+
+  static const int64_t xg[] = {0, 16384, 18350, 65536};
+  const int64_t yg[] = {0, 0, Q16(w.stormGust), 0};
+  stormGust = (Pw(u, xg, yg, 4) * C) >> 16;
 }
 
-void LocalWinds(const Tuning& /*t*/, WindStateQ& o, int64_t /*speedQ*/, int64_t /*S*/) {
-  o.slopeWind = 0;
-  o.seaBreeze = 0;
+void LocalWinds(const Tuning& t, WindStateQ& o, int64_t speedQ, int64_t S) {
+  const Tuning::Wind& w = t.wind;
+  // They fade out as the synoptic wind rises past wind.localFade: a thermal
+  // circulation is only visible when nothing larger is blowing.
+  const int64_t fadeRef = std::max<int64_t>(winddetail::MetresPerSecToCellsQ(w.localFade), 65536);
+  const int64_t fade = std::clamp<int64_t>(65536 - (speedQ * 65536) / fadeRef, 0, 65536);
+  const int64_t Sp = std::max<int64_t>(S, 0), Sn = std::max<int64_t>(-S, 0);
+  // By day (S > 0) the slopes heat: air flows UP them; the land heats past the
+  // water: the breeze blows ONSHORE. At night both reverse, weaker.
+  const int64_t slope = winddetail::MetresPerSecToCellsQ(w.slopeWind);
+  const int64_t sea = winddetail::MetresPerSecToCellsQ(w.seaBreeze);
+  const int64_t sDay = (slope * Sp) >> 16;
+  const int64_t sNight = (((slope * Q16(w.slopeNight)) >> 16) * Sn) >> 16;
+  const int64_t bDay = (sea * Sp) >> 16;
+  const int64_t bNight = (((sea * Q16(w.seaNight)) >> 16) * Sn) >> 16;
+  o.slopeWind = winddetail::ClampQ(((sDay - sNight) * fade) >> 16);
+  o.seaBreeze = winddetail::ClampQ(((bDay - bNight) * fade) >> 16);
+}
+
+// ---- weather primitives -----------------------------------------------------
+//
+// A storm's gust front and its downbursts, emitted as ordinary wind
+// primitives (windprim.h) so every consumer — grass, arrows, streaks, the
+// particle tier, the CA drift bias — feels them with no code of its own. They
+// are NOT spawned into WindPrims(): they are a pure function of (tuning,
+// seed, tick, window), resolved here for the tick and appended to the list
+// the tick ships, the render copy getting the same call. kWindPrimAir only:
+// no entrainment licence, so no footprint wake (rule 2: the ambient weather
+// never wakes a chunk; windprim.h).
+//
+// Positions are relative to the WINDOW CENTRE, which is itself on the tick
+// stream, and grounded with World::TerrainHeight (the worldgen twin), so the
+// list is reproducible.
+uint32_t WeatherPrims(const Tuning& t, uint32_t seed, uint32_t tick,
+                      const int32_t origin[3], WindPrimGpu* out, uint32_t cap,
+                      int32_t lo[3], int32_t hi[3]) {
+  const Tuning::Wind& w = t.wind;
+  const WindStateQ q = WindWeatherQ(t, seed, tick);
+  if (q.convective <= 0 || q.stormPhase < 0 || cap == 0) return 0;
+  const int64_t P = StormTicks(t);
+  const int64_t cycle0 = (int64_t)q.stormCycle * P;   // tick the cycle began
+  const int32_t half = (int32_t)kWorldN / 2;
+  const int32_t cx = origin[0] * (int32_t)kChunk + half;
+  const int32_t cy = origin[1] * (int32_t)kChunk + half;
+  const int32_t cz = origin[2] * (int32_t)kChunk + half;
+  const int64_t C = q.convective;
+  uint32_t n = 0;
+  auto emit = [&](const WindPrim& p) {
+    if (n >= cap) return;
+    out[n++] = WindPrimResolve(p, tick);
+    IVec3 a, b;
+    WindPrimBounds(p, tick, a, b);
+    lo[0] = std::min(lo[0], a.x); lo[1] = std::min(lo[1], a.y); lo[2] = std::min(lo[2], a.z);
+    hi[0] = std::max(hi[0], b.x); hi[1] = std::max(hi[1], b.y); hi[2] = std::max(hi[2], b.z);
+  };
+
+  // The GUST FRONT: a wide jet sweeping across the window along the new
+  // heading at the front's speed, arriving over the window centre at u = 0.26.
+  if (w.stormFrontJet) {
+    const int64_t tStart = cycle0 + (P * 14418) / 65536;   // u = 0.22
+    const int64_t tEnd = cycle0 + (P * 26214) / 65536;     // u = 0.40
+    if ((int64_t)tick >= tStart && (int64_t)tick < tEnd) {
+      WindPrim p;
+      p.kind = kWindPrimCone;
+      p.flags = kWindPrimAir;
+      p.radius = kWindPrimMaxExtent * 3 / 4;
+      p.reach = kWindPrimMaxExtent;
+      p.dirX = q.dirX;
+      p.dirY = 0;
+      p.dirZ = q.dirZ;
+      // Front speed: the storm's own mean (with its envelope), per tick.
+      const int64_t vt = (int64_t)q.speed / 30;                       // Q16.16 cells/tick
+      p.velX = (int32_t)((vt * q.dirX) >> 16);
+      p.velZ = (int32_t)((vt * q.dirZ) >> 16);
+      // At u = 0.26 the jet's mouth is `reach` upwind of the centre, so the
+      // strong band of the cone is over it.
+      const int64_t tArrive = cycle0 + (P * 17039) / 65536;          // u = 0.26
+      const int64_t back = ((vt * (tArrive - tStart)) >> 16) + p.reach / 2;
+      p.x = cx - (int32_t)((back * q.dirX) >> 16);
+      p.z = cz - (int32_t)((back * q.dirZ) >> 16);
+      p.y = World::TerrainHeight(cx, cz, seed) + 16;
+      p.spawnTick = (uint32_t)tStart;
+      p.ttl = (uint32_t)(tEnd - tStart);
+      const int64_t s = (((int64_t)q.speed * std::max<int64_t>(Q16(w.stormFront) - 65536, 0)) >> 17) * C >> 16;
+      p.strengthQ = (int32_t)std::min<int64_t>(s, (int64_t)kWindPrimMaxSpeed << 16);
+      emit(p);
+    }
+  }
+
+  // DOWNBURSTS: a burst centred half its radius above the ground spreads
+  // outward along it and pushes down from above — a microburst's footprint.
+  const int32_t nb = std::clamp(w.stormBursts, 0, 6);
+  const int32_t rad = std::clamp(Vox(w.stormBurstRadius), 16, kWindPrimMaxExtent);
+  for (int32_t i = 0; i < nb; i++) {
+    const uint32_t h0 = rng::Hash3(seed ^ kStormSalt, q.stormCycle, 16u + (uint32_t)i);
+    const uint32_t h1 = rng::Hash3(seed ^ kStormSalt, q.stormCycle, 32u + (uint32_t)i);
+    const int64_t uStart = 17039 + (int64_t)((h0 & 0xFFFFu) * 16384 >> 16);  // 0.26..0.51
+    const int64_t tStart = cycle0 + (P * uStart) / 65536;
+    const uint32_t ttl = 450;                                                 // 15 s
+    if ((int64_t)tick < tStart || (int64_t)tick >= tStart + ttl) continue;
+    WindPrim p;
+    p.kind = kWindPrimBurst;
+    p.flags = kWindPrimAir;
+    p.radius = rad;
+    p.reach = rad;
+    const int32_t ox = (int32_t)((h1 & 0x3FFu) % 601u) - 300;
+    const int32_t oz = (int32_t)(((h1 >> 10) & 0x3FFu) % 601u) - 300;
+    p.x = cx + ox;
+    p.z = cz + oz;
+    p.y = World::TerrainHeight(p.x, p.z, seed) + rad / 2;
+    (void)cy;
+    p.spawnTick = (uint32_t)tStart;
+    p.ttl = ttl;
+    const int64_t s = (((int64_t)q.speed * 78643) >> 16) * C >> 16;   // 1.2 x mean
+    p.strengthQ = (int32_t)std::min<int64_t>(s, (int64_t)kWindPrimMaxSpeed << 16);
+    emit(p);
+  }
+  return n;
 }
 
 // ============================================================================

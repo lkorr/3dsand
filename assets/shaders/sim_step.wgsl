@@ -3530,6 +3530,13 @@ const WIND_ENTRAIN_REF : i32 = i32(round(
 // bound that makes a dune creep instead of detonate (rule 2).
 const WIND_ENTRAIN_CHANCE : i32 =
     i32(round(clamp(TUNE_WIND_ENTRAIN_RATE, 0.0, 30.0) * 1024.0 / 30.0));
+// ...scaled by a POWER of the excess (2026-09-30, docs/RESEARCH_wind.md
+// §13.5): chance = rate x min(excess / (threshold x span), 1)^power. Sand flux
+// grows roughly with the cube of the excess over the threshold; a flat rate
+// past a step made a wind 1% over the line move a dune as fast as a gale.
+const WIND_ENTRAIN_POWER : i32 = clamp(i32(round(TUNE_WIND_ENTRAIN_POWER)), 1, 6);
+const WIND_ENTRAIN_SPAN_Q10 : i32 =
+    i32(round(clamp(TUNE_WIND_ENTRAIN_SPAN, 0.1, 10.0) * 1024.0));
 
 // ---- THE GAS MOTION MODEL LIVES IN common.wgsl -----------------------------
 // gasRndK / windLateralCode / windLateralStartK / windAxisFrac / gasLateralRot
@@ -3788,8 +3795,17 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   if (d.x == 0 && d.y == 0) { return false; }
   // The rate gate. Drawn AFTER the threshold test so a becalmed dune costs a
   // compare, and drawn at all so that a wind sitting just over the threshold
-  // moves a surface slowly rather than all at once.
-  if (i32((windRnd(slotIdx) >> 10u) & 1023u) >= WIND_ENTRAIN_CHANCE) {
+  // moves a surface slowly rather than all at once. The chance rises with a
+  // power of the excess on the stronger axis, in Q10; a zero threshold
+  // (friction 0) is always "far past" it.
+  let ex = max(abs(wv.x), abs(wv.z)) - thresh;
+  var x10 = 1024;
+  if (thresh > 0) {
+    x10 = min(((ex / max(thresh >> 10u, 1)) * 1024) / WIND_ENTRAIN_SPAN_Q10, 1024);
+  }
+  var pw = x10;
+  for (var k = 1; k < WIND_ENTRAIN_POWER; k++) { pw = (pw * x10) >> 10u; }
+  if (i32((windRnd(slotIdx) >> 10u) & 1023u) >= (WIND_ENTRAIN_CHANCE * pw) >> 10u) {
     return false;
   }
   // A GRAIN, not a cell (POWDER ENTERS THE WORLD AS GRAINS): a wind that

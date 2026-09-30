@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "sim/wind.h"
+#include "sim/windprim.h"
 #include "sim/world.h"
 
 // windfield.h — the WIND FIELD BLOCK: everything the ambient field needs per
@@ -96,5 +97,16 @@ void StormTimeline(const Tuning& t, uint32_t seed, uint32_t tick, int32_t convec
 // Slope and sea/lake breezes from the stability S (Q16, [-1, 1]) and the
 // mean speed (they fade out as the synoptic wind rises).
 void LocalWinds(const Tuning& t, WindStateQ& o, int64_t speedQ, int64_t S);
+
+// THE STORM'S PRIMITIVES at `tick`: the gust-front jet and the downbursts,
+// resolved, written to out[0 .. return), `cap` at most, and folded into the
+// union box lo/hi (which the caller seeds, empty or with its own list). A
+// pure function of (tuning, seed, tick, window origin) — SubmitTick appends
+// them to the tick's list and WriteRenderParams to the render copy, so the
+// grass and the smoke feel the same downburst. Air only: no entrainment
+// licence, so no footprint wake.
+uint32_t WeatherPrims(const Tuning& t, uint32_t seed, uint32_t tick,
+                      const int32_t origin[3], WindPrimGpu* out, uint32_t cap,
+                      int32_t lo[3], int32_t hi[3]);
 
 }  // namespace windfield

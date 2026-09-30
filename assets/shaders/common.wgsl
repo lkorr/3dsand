@@ -2724,6 +2724,34 @@ fn windThermalF(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
   return vec3f(sin(fx + ph), 0.4 * sin(fx + fz + ph + 2.2), sin(fz - ph + 1.3)) * a;
 }
 
+// THE LOCAL WINDS (§13.4), float: the slope wind along the table's own
+// gradient (up by day, down at night — the sign rides wfSlopeWindQ) with a
+// small vertical share that follows the slope, and the sea/lake breeze down
+// the water-fraction gradient (onshore by day). Each confined to its layer
+// above the ground, both zero outside the table. The gradients are clamped to
+// unit length (Chebyshev) so a cliff does not make a jet.
+fn windLocalF(rp : WindRampF, R : ptr<uniform, RenderParams>) -> vec3f {
+  if (rp.tr.edge <= 0.0) { return vec3f(0.0); }
+  var v = vec3f(0.0);
+  if ((*R).wfSlopeWindQ != 0) {
+    var g = vec2f(rp.tr.gx, rp.tr.gz) * 3.0;
+    let m = max(abs(g.x), abs(g.y));
+    if (m > 1.0) { g = g / m; }
+    let f = f32((*R).wfSlopeWindQ) * (1.0 / 65536.0) *
+            (1.0 - min(rp.hagl / f32(max((*R).wfSlopeDepth, 1)), 1.0));
+    v += vec3f(g.x, g.x * rp.tr.gx + g.y * rp.tr.gz, g.y) * f;
+  }
+  if ((*R).wfSeaBreezeQ != 0) {
+    var g = vec2f(rp.tr.wgx, rp.tr.wgz);
+    let m = max(abs(g.x), abs(g.y));
+    if (m > 1.0) { g = g / m; }
+    let f = -f32((*R).wfSeaBreezeQ) * (1.0 / 65536.0) *
+            (1.0 - min(rp.hagl / f32(max((*R).wfSeaDepth, 1)), 1.0));
+    v += vec3f(g.x, 0.0, g.y) * f;
+  }
+  return v * rp.tr.edge;
+}
+
 // (mean multiplier, gust multiplier) of the lee rotor at a sample.
 fn windLeeF(rp : WindRampF, dl : vec2f, R : ptr<uniform, RenderParams>) -> vec2f {
   if ((*R).wfLeeQ <= 0 || rp.tr.edge <= 0.0) { return vec2f(1.0); }
@@ -2763,7 +2791,7 @@ fn windSampleAt(p : vec3f, t : f32, ph : f32,
   let lee = windLeeF(rp, dl, R);
   s.mean = dl * ((*R).windSpeed * alt * lee.x);
   s.amp = (*R).windGust * alt * lee.y;
-  s.extra = windThermalF(p, R) * alt;
+  s.extra = windThermalF(p, R) * alt + windLocalF(rp, R);
   // Travelling gust phase. `gp` is the distance DOWNWIND in radians of the
   // base band; `adv` is how far the AIR has travelled, in the same radians —
   // K * integral(U dt), summed on the CPU (windfield.h AdvPhase) because U
@@ -3297,6 +3325,32 @@ fn windThermalQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
                    wq(a, windSinQ(i32(fz - ph) + WINDQ_PH_13)));
 }
 
+// Chebyshev-clamp a Q16 2-vector to unit length, staged so a cliff's slope
+// (tens of units, Q16) cannot leave i32.
+fn windClampUnitQ(g : vec2<i32>) -> vec2<i32> {
+  let m = max(abs(g.x), abs(g.y));
+  if (m <= 65536) { return g; }
+  let d = max(m >> 8u, 1);
+  return vec2<i32>((g.x / d) * 256, (g.y / d) * 256);
+}
+
+// windLocalF, in integers.
+fn windLocalQ(rq : WindRampQ, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if (rq.tr.edge <= 0) { return vec3<i32>(0); }
+  var v = vec3<i32>(0);
+  if ((*T).wfSlopeWindQ != 0) {
+    let g = windClampUnitQ(vec2<i32>(rq.tr.gx * 3, rq.tr.gz * 3));
+    let f = wq((*T).wfSlopeWindQ, 65536 - windDepthFracQ(rq.hQ10, (*T).wfSlopeDepth));
+    v += vec3<i32>(wq(g.x, f), wq(wq(g.x, rq.tr.gx) + wq(g.y, rq.tr.gz), f), wq(g.y, f));
+  }
+  if ((*T).wfSeaBreezeQ != 0) {
+    let g = windClampUnitQ(vec2<i32>(rq.tr.wgx, rq.tr.wgz));
+    let f = -wq((*T).wfSeaBreezeQ, 65536 - windDepthFracQ(rq.hQ10, (*T).wfSeaDepth));
+    v += vec3<i32>(wq(g.x, f), 0, wq(g.y, f));
+  }
+  return vec3<i32>(wq(v.x, rq.tr.edge), wq(v.y, rq.tr.edge), wq(v.z, rq.tr.edge));
+}
+
 // (mean multiplier, gust multiplier), Q16.
 fn windLeeQ(rq : WindRampQ, dl : vec2<i32>, T : ptr<uniform, TickParams>) -> vec2<i32> {
   let lee = (*T).wfLeeQ;
@@ -3522,7 +3576,7 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   // The regime's additive terms, scaled by the ramp like the mean they sit
   // beside (windMeanWS's `extra`).
   let th = windThermalQ(p, T);
-  let extra = vec3<i32>(wq(th.x, alt), wq(th.y, alt), wq(th.z, alt));
+  let extra = vec3<i32>(wq(th.x, alt), wq(th.y, alt), wq(th.z, alt)) + windLocalQ(rq, T);
   // windMeanWS() + the 0.7/0.3 mix, then the primitive sum. The primitives are
   // ADDED to the ambient field rather than replacing it, which is what makes a
   // fan feel like it is blowing INTO weather instead of switching the weather

@@ -3083,11 +3083,22 @@ struct Tuning {
     // Entrainment (windMode 2): the per-axis wind speed that just lifts a grain
     // whose windFriction is 1; the threshold scales with the authored nibble,
     // so friction 4 needs four times this. Bagnold's fluid threshold, authored.
+    // 1.2 m/s (was 2 until 2026-09-30): sand (friction 5, derived from its
+    // density) lifts at 6 m/s AT THE GRAIN, the observed 5-7 m/s near the
+    // ground; the height profile puts a grain at ~0.3x the reference wind.
     float windEntrainSpeed = TPD(sim, windEntrainSpeed);
     // ...and how often a grain over that threshold actually hops, in chances
     // per second. This is the bound (rule 2): entrainment is a rate, not a
     // certainty, so a dune creeps instead of exploding.
     float windEntrainRate = TPD(sim, windEntrainRate);
+    // THRESHOLD PLUS POWER (2026-09-30). Saltation does not switch on at a
+    // threshold and run at a flat rate: sand flux grows roughly with the CUBE
+    // of the excess over the threshold. The hop chance is windEntrainRate x
+    // min(excess / (threshold x windEntrainSpan), 1)^windEntrainPower, so a
+    // wind just over the line barely creeps and one at (1 + span) x the line
+    // runs at the full rate. Still bounded by the rate (rule 2).
+    float windEntrainPower = TPD(sim, windEntrainPower);
+    float windEntrainSpan = TPD(sim, windEntrainSpan);
 
     // ---- dev force multipliers, one per TIER ----
     // NO_WGSL rows in tuning_params.def, and that is deliberate rather than
@@ -3657,6 +3668,36 @@ struct Tuning {
     float leeDepth = TPD(wind, leeDepth);
     float leeReverse = TPD(wind, leeReverse);
     float leeGust = TPD(wind, leeGust);
+    // LOCAL WINDS on light-wind days (docs/RESEARCH_wind.md §13.4). Slope winds:
+    // up the table's slope by day at up to slopeWind m/s (x convective
+    // stability), down it at night at slopeNight x that (katabatic), in a layer
+    // slopeDepth metres deep. The sea/lake breeze: onshore by day along the
+    // water-fraction gradient at up to seaBreeze m/s, offshore at night at
+    // seaNight x that, seaDepth metres deep. Both fade to nothing as the mean
+    // wind rises past localFade m/s.
+    float slopeWind = TPD(wind, slopeWind);
+    float slopeNight = TPD(wind, slopeNight);
+    float slopeDepth = TPD(wind, slopeDepth);
+    float seaBreeze = TPD(wind, seaBreeze);
+    float seaNight = TPD(wind, seaNight);
+    float seaDepth = TPD(wind, seaDepth);
+    float localFade = TPD(wind, localFade);
+    // THE THUNDERSTORM TIMELINE (§13.4): cycles of stormCycle seconds weighted
+    // by the regime's convective input. A lull to stormLull x the mean, the
+    // gust front (heading jumps ~stormJump degrees, mean spikes to stormFront x),
+    // decay to stormDecay x, then gusty decay home with the gust fraction
+    // raised by stormGust. The front sweeps across as a wind-primitive jet
+    // (stormFrontJet) and stormBursts downbursts of stormBurstRadius metres
+    // land near the window, all positioned from seed + tick.
+    float stormCycle = TPD(wind, stormCycle);
+    float stormLull = TPD(wind, stormLull);
+    float stormFront = TPD(wind, stormFront);
+    float stormDecay = TPD(wind, stormDecay);
+    float stormGust = TPD(wind, stormGust);
+    float stormJump = TPD(wind, stormJump);
+    int stormBursts = TPD(wind, stormBursts);
+    float stormBurstRadius = TPD(wind, stormBurstRadius);
+    bool stormFrontJet = TPD(wind, stormFrontJet);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a
