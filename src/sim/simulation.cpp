@@ -765,7 +765,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // tick that reads it rebuilt it first (C_RAINEXPO).
   rainExpoBuf_ = CreateBuffer(
       device, (uint64_t)rainlat::kExpoMaxAxis * rainlat::kExpoMaxAxis * 4,
-      rhi::BufferUsage::Storage, "rainExpo");
+      rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc, "rainExpo");
   BuildSimBindGroups(device);
   for (int page = 0; page < 2; page++) {
     rhi::BindGroupEntry pentries[] = {
