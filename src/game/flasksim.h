@@ -385,6 +385,28 @@ struct SimEvent {
   int count = 1;
 };
 
+// WHERE EVERYTHING IN A VESSEL WAS when it left the bench (owner,
+// 2026-09-29: "if it can remember the orientation and how exactly materials
+// were laid out in a flask that would be ideal"). Positions are in the
+// vessel's OWN frame (x across its axis, y up from its bottom), so the layers
+// come back against the glass however the vessel stood; one put away tilted
+// comes back upright and slumps in AddVessel's settle, as if time had passed.
+// By MATERIAL ID, not substance slot: slots are per session.
+//
+// Only the picture of the grains and the liquid is kept. Dissolved matter and
+// gas have no place of their own: SeedExtras spreads them from the
+// Composition as it always has. `layered` -- the non-gas, undissolved
+// portions it was taken with -- is the KEY: AddVessel uses the layout only if
+// the contents' layered portions still equal it, and seeds by portion order
+// otherwise. A few hundred to a few thousand entries a vessel.
+struct VesselLayout {
+  Composition layered;
+  struct Grain { float x, y; uint16_t mat; uint8_t variant; };
+  struct Drop { float x, y; uint16_t mat; uint16_t units; uint8_t var, heat; };
+  std::vector<Grain> grains;
+  std::vector<Drop> drops;
+};
+
 struct Tally {
   std::vector<Composition> vessel;  // one per AddVessel, in order
   Composition spilled;              // left the panel, or in flight at close
@@ -410,8 +432,19 @@ class FlaskSim {
   // layered by density, heaviest at the bottom, liquids on a rest lattice,
   // powders packed, gas in the headspace, dissolved portions spread through
   // their solvent. `stoppered` closes the mouth. Returns the vessel index.
+  // With a `layout` whose key matches `c` (VesselLayout), the grains and
+  // liquid go back where they were instead, then settle the same way.
   int AddVessel(const VesselShape& shape, const Xform& x, const Composition& c,
-                bool stoppered = false);
+                bool stoppered = false, const VesselLayout* layout = nullptr);
+  // THE PICTURE OF VESSEL `v` NOW (its grains and liquid, in its own frame).
+  // Take it BEFORE RemoveVessel, then FinishLayout it with what came out.
+  VesselLayout SnapshotVessel(int v) const;
+  // Keys `L` to `c` (what the vessel was taken off with) and puts `c`'s
+  // portions in bottom-up order by where they were in `L`: layered portions
+  // by mean height, then dissolved and gas portions as they were.
+  void FinishLayout(VesselLayout& L, Composition& c) const;
+  // Would AddVessel use `L` for `c`?
+  bool LayoutFits(const VesselLayout& L, const Composition& c) const;
 
   // ---- the vessel's devices (flaskchem.cpp) ----------------------------------
   // A stopper closes the mouth: nothing -- gas, liquid, powder -- leaves.
@@ -678,7 +711,10 @@ class FlaskSim {
   V2 ToLocal(const Xform& x, V2 w) const;
   V2 ToWorld(const Xform& x, V2 l) const;
 
-  void SeedVessel(int vi, const Composition& c);
+  void SeedVessel(int vi, const Composition& c, const VesselLayout* layout = nullptr);
+  void SeedFromLayout(int vi, const Composition& c, const VesselLayout& L);
+  // `c`'s layered portions (no gas, nothing dissolved, nothing without a slot).
+  Composition LayeredOf(const Composition& c) const;
   // ---- chemistry (flaskchem.cpp) ----
   struct ChemNb {
     uint8_t type;    // NbParticle / NbGrain / NbGas / NbAir / NbHeat / NbSpark

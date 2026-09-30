@@ -17626,9 +17626,29 @@ as a transfer intent; the game checks conservation and applies it. Contents
 change only through that intent.
 
 **Contents** (`game/composition.h`): up to 16 `(material, eighths)` portions
-per vessel. No layer state is persisted: whenever the bench opens, each vessel
-is seeded ALREADY SETTLED (heaviest at the bottom), which is what a flask that
-sat in a bag would look like. A stirred emulsion does not survive closing.
+per vessel, in BOTTOM-UP order (2026-09-29): a vessel leaving the table writes
+its portions lowest layer first (`FlaskSim::FinishLayout`, by each material's
+mean height in the glass), `Add` puts a new substance on top, and seeding lays
+layers in that order -- density reorders only a pair where a liquid is
+involved (a powder sinks through a liquid, a light liquid under a heavy one
+rises). Two powders keep the order they were put in: grains never sort
+themselves, so dirt laid on sodium is still dirt on sodium after closing, a
+save, or a pour. The order is persisted with the contents.
+
+**The picture** (`VesselLayout`, flasksim.h): taken off the table or left on
+it at Finish, a vessel's grains and liquid particles are recorded in the
+glass's own frame, by material id, and ride on `ItemInstance::layout` --
+MEMORY ONLY, not saved, not on the wire. Put back on, `AddVessel` restores
+them grain for grain and runs its usual settle (a vessel put away tilted comes
+back upright and slumps, as if time passed). The picture is used only while
+its key -- the non-gas, undissolved portions it was taken with -- equals the
+contents' (`LayoutFits`); any pour, scoop or reaction since leaves it unused
+and the portion order seeds instead, so none of the ~34 places that change
+`contents` has to know it exists. Dissolved matter and gas are re-spread from
+the Composition (`SeedExtras`) either way. Units are exact: each slot is
+restored bottom-up to exactly its eighths, the top of a surplus dropped, a
+shortfall seeded just above its layer. Gate `alchemy-remember` (four poured
+bands come back 95% grain-for-grain; the control without the picture 53%).
 
 **Liquids**: Clavet et al. 2005 double-density relaxation, the method behind
 grantkot.com/ll -- not MLS-MPM, which is heavier and buys nothing at this scale.

@@ -419,7 +419,7 @@ bool FlaskSim::InsideLocal(const Vessel& v, V2 p) const {
 bool FlaskSim::InsideVessel(const Vessel& v, V2 w) const { return InsideLocal(v, ToLocal(v.x, w)); }
 
 int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composition& c,
-                        bool stoppered) {
+                        bool stoppered, const VesselLayout* layout) {
   Vessel v;
   v.shape = shape;
   v.x = v.prevX = v.target = x;
@@ -437,7 +437,7 @@ int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composit
     if (sl >= 0) seeded_[sl] += (int64_t)c.p[i].eighths * cfg_.unitsPerEighth;
   }
   if (!cfg_.settleOnAdd) {
-    SeedVessel(vi, c);
+    SeedVessel(vi, c, layout);
     Partition();
     return vi;
   }
@@ -459,7 +459,7 @@ int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composit
   // hold); no rule fires while a vessel is being settled.
   tmp.SetChemistry(chem_);
   tmp.PauseChemistry(true);
-  tmp.AddVessel(shape, x, c, stoppered);
+  tmp.AddVessel(shape, x, c, stoppered, layout);
   for (int s = 0; s < 1500; s++) {
     tmp.Step(1);
     if (s > 30 && tmp.VesselAsleep(0) && tmp.grainMoves_ == 0 && tmp.MovingCount(0.25f) == 0) break;
@@ -592,9 +592,14 @@ uint8_t FlaskSim::SeedHeat(V2 p) {
   return (uint8_t)std::clamp((int)(v / 0.8775f * 255.0f), 0, 255);
 }
 
-void FlaskSim::SeedVessel(int vi, const Composition& c) {
+void FlaskSim::SeedVessel(int vi, const Composition& c, const VesselLayout* layout) {
+  if (layout && LayoutFits(*layout, c)) {
+    SeedFromLayout(vi, c, *layout);
+    SeedExtras(vi, c);
+    return;
+  }
   Vessel& v = vessels_[vi];
-  // Substance slots present, heaviest first.
+  // Substance slots present, in PORTION ORDER: bottom-up (composition.h).
   struct Layer { int sub; uint32_t units; };
   std::vector<Layer> layers;
   for (int i = 0; i < c.n; i++) {
@@ -605,9 +610,23 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
     if (sub < 0 || c.p[i].eighths == 0 || subs_[sub].gas) continue;
     layers.push_back({sub, c.p[i].eighths * (uint32_t)cfg_.unitsPerEighth});
   }
-  std::stable_sort(layers.begin(), layers.end(), [&](const Layer& a, const Layer& b) {
-    return subs_[a.sub].density > subs_[b.sub].density;
-  });
+  // Density reorders only a pair physics would: one of them a liquid, the
+  // upper one heavier (a powder sinks through a liquid, a liquid under a
+  // lighter one rises, a powder floats on a heavier liquid). Two powders
+  // stay as they were put in -- grains never sort themselves, so dirt laid
+  // on sodium is dirt on sodium. Every swap removes one density inversion,
+  // so this ends.
+  for (bool swapped = true; swapped;) {
+    swapped = false;
+    for (size_t i = 0; i + 1 < layers.size(); i++) {
+      const Substance& lo = subs_[layers[i].sub];
+      const Substance& up = subs_[layers[i + 1].sub];
+      if ((!lo.powder || !up.powder) && up.density > lo.density) {
+        std::swap(layers[i], layers[i + 1]);
+        swapped = true;
+      }
+    }
+  }
 
   // The vessel's interior pixels by local row, bottom up (pixel centres
   // inside the outline and clear of the glass).
@@ -714,6 +733,135 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
     }
   }
   SeedExtras(vi, c);
+}
+
+// ---- layouts (VesselLayout) -------------------------------------------------
+
+Composition FlaskSim::LayeredOf(const Composition& c) const {
+  Composition out;
+  for (int i = 0; i < c.n; i++) {
+    if (IsDissolved(c.p[i].mat) || !c.p[i].eighths) continue;
+    const int sl = SlotOf(c.p[i].mat);
+    if (sl < 0 || subs_[sl].gas) continue;
+    out.Add(c.p[i].mat, c.p[i].eighths);
+  }
+  return out;
+}
+
+bool FlaskSim::LayoutFits(const VesselLayout& L, const Composition& c) const {
+  return !L.layered.Empty() && LayeredOf(c).SameAs(L.layered);
+}
+
+VesselLayout FlaskSim::SnapshotVessel(int vi) const {
+  VesselLayout L;
+  if (!VesselAlive(vi)) return L;
+  const Vessel& v = vessels_[vi];
+  // The same membership RemoveVessel and Count use: liquid by the outline,
+  // a grain by the inside mask (one in the glass band by its home).
+  for (size_t i = 0; i < px_.size(); i++) {
+    if (!InsideVessel(v, px_[i])) continue;
+    const V2 l = ToLocal(v.x, px_[i]);
+    L.drops.push_back({l.x, l.y, subs_[psub_[i]].mat, pw_[i], pvar_[i], pheat_[i]});
+  }
+  const int W = cfg_.gridW;
+  for (const Grain& g : grains_) {
+    const size_t k = (size_t)g.y * W + g.x;
+    const int owner = wall_[k] ? g.home : (int)inside_[k] - 1;
+    if (owner != vi) continue;
+    const V2 l = ToLocal(v.x, {g.x + 0.5f, g.y + 0.5f});
+    L.grains.push_back({l.x, l.y, subs_[g.sub].mat, g.variant});
+  }
+  return L;
+}
+
+void FlaskSim::FinishLayout(VesselLayout& L, Composition& c) const {
+  L.layered = LayeredOf(c);
+  // Mean height of each material in the picture, by the units it holds.
+  auto meanY = [&](uint16_t mat) {
+    double sum = 0, w = 0;
+    for (const VesselLayout::Grain& g : L.grains)
+      if (g.mat == mat) { sum += g.y; w += 1; }
+    for (const VesselLayout::Drop& d : L.drops)
+      if (d.mat == mat) { sum += (double)d.y * d.units; w += d.units; }
+    return w > 0 ? sum / w : 1e9;  // nowhere in the picture (a pool): on top
+  };
+  struct Keyed { Portion p; int group; double y; };
+  std::vector<Keyed> k;
+  for (int i = 0; i < c.n; i++) {
+    const uint16_t m = c.p[i].mat;
+    const bool layered = L.layered.AmountOf(m) != 0;
+    k.push_back({c.p[i], layered ? 0 : 1, layered ? meanY(m) : 0.0});
+  }
+  std::stable_sort(k.begin(), k.end(), [](const Keyed& a, const Keyed& b) {
+    if (a.group != b.group) return a.group < b.group;
+    return a.group == 0 && a.y < b.y;
+  });
+  for (int i = 0; i < c.n; i++) c.p[i] = k[i].p;
+}
+
+void FlaskSim::SeedFromLayout(int vi, const Composition& c, const VesselLayout& L) {
+  const Vessel& v = vessels_[vi];
+  const uint32_t upe = (uint32_t)cfg_.unitsPerEighth;
+  // What each slot must hold, in units: exactly what the contents say (the
+  // ledger's opening balance). The picture can differ by the part of an
+  // eighth the tally rounded away; restored bottom-up, a surplus is the top.
+  std::vector<int64_t> want(subs_.size(), 0);
+  std::vector<float> topY(subs_.size(), -1.0f);
+  const Composition lay = LayeredOf(c);
+  for (int i = 0; i < lay.n; i++) want[SlotOf(lay.p[i].mat)] += (int64_t)lay.p[i].eighths * upe;
+  std::vector<int> order(L.grains.size());
+  for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return L.grains[a].y < L.grains[b].y; });
+  for (int i : order) {
+    const VesselLayout::Grain& e = L.grains[i];
+    const int sl = SlotOf(e.mat);
+    // A material that is no longer a powder (an R reload) is left to the
+    // shortfall below, which seeds it as what it is now.
+    if (sl < 0 || !subs_[sl].powder || want[sl] <= 0) continue;
+    const V2 w = ToWorld(v.x, {e.x, e.y});
+    Grain g{};
+    g.sub = (uint8_t)sl;
+    g.variant = e.variant;
+    g.home = (int8_t)vi;
+    g.src = (int8_t)vi;
+    if (PlaceGrain(g, (int)std::floor(w.x), (int)std::floor(w.y), vi)) {
+      want[sl]--;
+      topY[sl] = std::max(topY[sl], e.y);
+    }
+  }
+  std::vector<int> dorder(L.drops.size());
+  for (size_t i = 0; i < dorder.size(); i++) dorder[i] = (int)i;
+  std::stable_sort(dorder.begin(), dorder.end(), [&](int a, int b) { return L.drops[a].y < L.drops[b].y; });
+  for (int i : dorder) {
+    const VesselLayout::Drop& e = L.drops[i];
+    const int sl = SlotOf(e.mat);
+    if (sl < 0 || subs_[sl].powder || subs_[sl].gas || want[sl] <= 0 || !e.units) continue;
+    const int u = (int)std::min<int64_t>(e.units, want[sl]);
+    const int k = SpawnParticle(ToWorld(v.x, {e.x, e.y}), sl, u, vi);
+    pvar_[k] = e.var;
+    pheat_[k] = e.heat;
+    calm_[k] = (uint8_t)std::clamp(cfg_.calmSteps, 0, 255);
+    want[sl] -= u;
+    topY[sl] = std::max(topY[sl], e.y);
+  }
+  // THE SHORTFALL (the rounding, a grain with no pixel left, a material that
+  // changed kind): just over where its kind was, or low in the middle.
+  const uint32_t upp = (uint32_t)std::max(1, cfg_.unitsPerParticle);
+  for (size_t s = 0; s < want.size(); s++) {
+    if (want[s] <= 0) continue;
+    const float y = topY[s] >= 0 ? topY[s] + 1.0f : v.shape.height * 0.3f;
+    const V2 at = ToWorld(v.x, {0.0f, y});
+    if (subs_[s].powder) {
+      AddPool(vi, (int)s, (uint32_t)want[s], at);
+      continue;
+    }
+    for (int64_t left = want[s]; left > 0;) {
+      const uint32_t u = (uint32_t)std::min<int64_t>(left, upp);
+      const V2 j{at.x + (float)((int)(Rand() % 5) - 2) * 0.4f, at.y + (float)((int)(Rand() % 5) - 2) * 0.4f};
+      SpawnParticle(j, (int)s, (int)u, vi);
+      left -= u;
+    }
+  }
 }
 
 // ---- walls -----------------------------------------------------------------

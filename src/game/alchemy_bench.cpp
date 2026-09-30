@@ -300,6 +300,7 @@ bool AlchemyBench::Place(KitRef ref, const ItemDef& def, const ItemInstance& ins
     e.capacity = def.container.capacity;
     e.before = inst.contents;
     e.after = inst.contents;
+    e.layout = inst.layout;
     e.stoppered = inst.stoppered;
     entries_.push_back(e);
     ei = (int)entries_.size() - 1;
@@ -309,6 +310,7 @@ bool AlchemyBench::Place(KitRef ref, const ItemDef& def, const ItemInstance& ins
   std::lock_guard<std::mutex> lk(mu_);
   Cmd c{Cmd::kPlace, ei, ShapeFor(def), entries_[ei].after};
   c.on = entries_[ei].stoppered;
+  c.layout = entries_[ei].layout;
   cmds_.push_back(c);
   return true;
 }
@@ -475,6 +477,7 @@ void AlchemyBench::Frame(const BenchInput& in, BenchTool tool) {
   for (auto& r : removed_)
     if (r.entry >= 0 && r.entry < (int)entries_.size()) {
       entries_[r.entry].after = r.c;
+      entries_[r.entry].layout = r.layout;
       entries_[r.entry].stoppered = r.stoppered;
     }
   removed_.clear();
@@ -510,6 +513,7 @@ BenchResult AlchemyBench::Finish(bool abrupt) {
   for (auto& rm : removed_)
     if (rm.entry >= 0 && rm.entry < (int)entries_.size()) {
       entries_[rm.entry].after = rm.c;
+      entries_[rm.entry].layout = rm.layout;
       entries_[rm.entry].stoppered = rm.stoppered;
     }
   removed_.clear();
@@ -537,6 +541,13 @@ BenchResult AlchemyBench::Finish(bool abrupt) {
       if (sim_.Broken(slots_[i].sim)) {
         entries_[i].broken = true;
         entries_[i].after = Composition{};
+        entries_[i].layout.reset();
+      } else {
+        // Left standing on the table: its picture as it stands (the gas an
+        // open one loses below is not part of the key).
+        auto lay = std::make_shared<VesselLayout>(sim_.SnapshotVessel(slots_[i].sim));
+        sim_.FinishLayout(*lay, entries_[i].after);
+        entries_[i].layout = std::move(lay);
       }
     }
     r.vessels.push_back(entries_[i]);
@@ -625,16 +636,19 @@ void AlchemyBench::Apply(Cmd& c) {
     }
     // Settled before it is shown (FlaskSim::AddVessel): it arrives at rest,
     // stoppered if it was put away stoppered.
-    s.sim = sim_.AddVessel(c.shape, pose, c.contents, c.on);
+    s.sim = sim_.AddVessel(c.shape, pose, c.contents, c.on, c.layout.get());
     s.goal = pose;
   } else if (c.kind == Cmd::kRemove) {
     if (s.sim < 0) return;
     const bool stop = sim_.Stoppered(s.sim);
+    // The picture first: RemoveVessel empties the glass.
+    auto lay = std::make_shared<VesselLayout>(sim_.SnapshotVessel(s.sim));
     Composition out = sim_.RemoveVessel(s.sim);
+    sim_.FinishLayout(*lay, out);
     s.sim = -1;
     if (held_ == c.entry) held_ = -1;
     std::lock_guard<std::mutex> lk(mu_);
-    removed_.push_back({c.entry, out, stop});
+    removed_.push_back({c.entry, out, stop, std::move(lay)});
   } else if (s.sim >= 0) {
     if (c.kind == Cmd::kStopper) sim_.SetStopper(s.sim, c.on);
     else if (c.kind == Cmd::kBurner) sim_.SetBurner(s.sim, c.on);

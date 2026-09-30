@@ -14530,6 +14530,7 @@ int main(int argc, char** argv) {
           ItemStack* st = kit.Resolve(e.ref);
           if (!st) continue;
           st->contents = e.after;
+          st->layout = e.layout;
           st->stoppered = e.stoppered;
           const bool breaks = e.broken || (breakHeld && e.onTable);
           if (!breaks) continue;

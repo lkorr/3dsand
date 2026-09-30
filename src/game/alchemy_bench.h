@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -61,6 +62,9 @@ struct BenchEntry {
   int capacity = 0;       // eighths
   Composition before;     // what it held when it first came on
   Composition after;      // what it holds now (taken off, or at Finish)
+  // Where it all was when it last left the table (FlaskSim::SnapshotVessel):
+  // put back on, it comes back as it was. Written onto the item with `after`.
+  std::shared_ptr<const VesselLayout> layout;
   bool onTable = false;
   bool stoppered = false;  // now (ItemInstance::stoppered is written from this)
   bool broken = false;     // its glass burst on the bench: the item is gone
@@ -300,6 +304,7 @@ class AlchemyBench {
     VesselShape shape;
     Composition contents;
     bool on = false;
+    std::shared_ptr<const VesselLayout> layout;   // kPlace: how it was laid out
   };
   struct Slot {                // per entry, sim-thread side
     int sim = -1;              // FlaskSim vessel index, -1 when off the table
@@ -346,7 +351,7 @@ class AlchemyBench {
   std::vector<std::vector<uint32_t>> streamOut_;
   double streamXSum_ = 0, streamXW_ = 0;
   int heldPub_ = -1;                                   // entry in the hand
-  struct Removed { int entry; Composition c; bool stoppered; };
+  struct Removed { int entry; Composition c; bool stoppered; std::shared_ptr<const VesselLayout> layout; };
   std::vector<Removed> removed_;                       // what left with each vessel taken off
   std::vector<int> refused_;                           // entries the table had no spot for
   std::string lateRefusal_;                            // frame thread (Frame fills it)

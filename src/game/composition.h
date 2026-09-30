@@ -2,10 +2,15 @@
 // What a vessel holds: up to kMaxSubstances (material id, amount) portions.
 //
 // Amounts are in EIGHTHS OF A CELL, the unit every vessel path already speaks
-// (item.h kContainerUnitsPerCell). A portion's order carries no meaning — the
-// layering a player sees is re-derived from density whenever the alchemy
-// panel opens (flasksim.h), so two compositions with the same portions are the
-// same contents. Mixing never makes matter: every change to a Composition in
+// (item.h kContainerUnitsPerCell). PORTION ORDER IS BOTTOM-UP (owner,
+// 2026-09-29: dirt put on sodium must come back as dirt on sodium): the bench
+// writes a vessel's portions lowest layer first when it leaves the table
+// (FlaskSim::FinishLayout), Add appends a new substance on top, Take keeps the
+// rest in order, and the bench seeds layers in this order -- density only
+// reorders a pair physics would (a liquid is involved). Two compositions with
+// the same portions in another order are still the same MATTER (SameAs), and
+// the exact picture rides beside it as a VesselLayout (flasksim.h), memory
+// only. Mixing never makes matter: every change to a Composition in
 // gameplay is a transfer between two of them (or to the world), and the
 // alchemy panel's tally is exact by construction (FlaskSim::Tally).
 #include <cstdint>
@@ -13,6 +18,9 @@
 namespace alchemy {
 
 constexpr int kMaxSubstances = 16;
+
+// Where everything in a vessel was when it last left the bench (flasksim.h).
+struct VesselLayout;
 
 // DISSOLVED MATTER (docs/PLAN_alchemy_chemistry.md contract 2.4). A portion
 // whose `mat` carries this bit is powder DISSOLVED in the vessel's liquid:

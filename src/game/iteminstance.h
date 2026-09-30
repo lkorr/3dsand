@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -151,6 +152,14 @@ struct ItemInstance {
   // PLYR v9, ITMS v6, MOBS v10, net protocol 3 (kItemFmtStopper). A break
   // still spills everything; the glass is gone.
   bool stoppered = false;
+  // WHERE EVERYTHING IN IT WAS when it last left the alchemy bench, relative
+  // to the glass (alchemy::VesselLayout, game/flasksim.h): the bench puts it
+  // back grain for grain. MEMORY ONLY -- not saved, not on the wire; a save
+  // or a peer gets `contents`, whose bottom-up portion order still keeps the
+  // layers. Never kept in step with `contents`: the bench uses it only while
+  // its record of what it was taken with still equals `contents`, so any
+  // pour, scoop or reaction since simply leaves it unused.
+  std::shared_ptr<const alchemy::VesselLayout> layout;
 
   bool Empty() const { return name.empty() || count <= 0; }
   bool Filled() const { return !contents.Empty(); }

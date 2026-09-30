@@ -6,13 +6,16 @@
 //   - CONSERVATION, exactly: every eighth that goes in comes out, in a vessel
 //     or in the spill, per material. The panel commits Count() as a transfer
 //     the game validates, so a leak here would be a matter printer.
-//   - ORDER: at rest, substances stack by the 3D sim's density, powders
-//     included (sand floats on lava, sinks through water).
+//   - ORDER: at rest, substances stack by the 3D sim's density wherever a
+//     liquid is involved (sand floats on lava, sinks through water); two
+//     powders stay in the order they were put in (alchemy-remember).
 //   - A POUR moves matter from the tilted vessel into the other one.
 //   - STIRRING mixes, and the mix separates again.
 // Each writes a picture of its last frame beside the exe (alchemy_*.bmp).
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2176,6 +2179,124 @@ Status GateAlchemyEtherFire(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// A VESSEL COMES BACK AS IT WAS PUT AWAY (owner, 2026-09-29: "if i put dirt
+// on top of sodium, when i exit and go back in it should not invert"). Dirt
+// is the heavier powder, and the bench used to re-seed every vessel by
+// density, so dirt laid on sodium came back under it. Now:
+//   (1) ORDER: a Composition's portions are bottom-up, and two powders seed
+//       in that order -- sodium, then dirt on top -- while oil, a liquid,
+//       still goes where its density puts it;
+//   (2) taken off, the portions come out bottom-up (FinishLayout), so the
+//       ORDER survives even without the picture (a save, a pour since);
+//   (3) THE PICTURE: sodium and dirt poured in four alternating bands --
+//       what no list of portions can say, one portion per material -- taken
+//       off and put back with its VesselLayout: at least
+//       alchemy.layoutKeptMin of its grains are the same material at the
+//       same place in the glass. The same contents put back WITHOUT it are
+//       the control (two layers again, so well under that).
+// Every arm conserves exactly and passes the units audit.
+Status GateAlchemyRemember(Ctx& c, std::string& detail) {
+  const int sodium = MatId(c, "sodium"), dirt = MatId(c, "dirt"), oil = MatId(c, "oil");
+  if (sodium < 0 || dirt < 0 || oil < 0) { detail = "missing sodium/dirt/oil"; return Status::Fail; }
+  Composition in;
+  in.Add((uint16_t)sodium, 200);
+  in.Add((uint16_t)dirt, 200);
+  in.Add((uint16_t)oil, 150);
+  auto subs = alchemy::SubstancesFor(c.mats, {&in});
+  const alchemy::VesselShape shape = BenchFlask(1024);
+  const Xform pose{{240, 4}, 0};
+  std::string why;
+  bool ok = true;
+  auto heights = [&](const FlaskSim& s) {
+    const auto mh = s.MeanHeights();
+    return std::array<float, 3>{mh[s.SlotOf((uint16_t)sodium)], mh[s.SlotOf((uint16_t)dirt)],
+                                mh[s.SlotOf((uint16_t)oil)]};
+  };
+  auto audit = [&](const FlaskSim& s, const char* arm) {
+    std::string a;
+    if (s.AuditUnits(&a)) return true;
+    why += Format("%s audit: %s; ", arm, a.c_str());
+    return false;
+  };
+  // (1) and (2)
+  FlaskSim s1(BenchConfig());
+  s1.SetSubstances(subs);
+  const int v1 = s1.AddVessel(shape, pose, in);
+  const auto h1 = heights(s1);
+  const bool order1 = h1[0] < h1[1] && h1[1] < h1[2];
+  alchemy::VesselLayout L1 = s1.SnapshotVessel(v1);
+  Composition out1 = s1.RemoveVessel(v1);
+  s1.FinishLayout(L1, out1);
+  const bool outOrder = out1.n == 3 && out1.p[0].mat == sodium && out1.p[1].mat == dirt && out1.p[2].mat == oil;
+  FlaskSim s2(BenchConfig());
+  s2.SetSubstances(subs);
+  s2.AddVessel(shape, pose, out1);
+  const auto h2 = heights(s2);
+  const bool order2 = h2[0] < h2[1];
+  Composition all;
+  for (int i = 0; i < out1.n; i++) all.Add(out1.p[i].mat, out1.p[i].eighths);
+  ok &= Conserved(all, s2.Count(), why) && audit(s1, "seed") && audit(s2, "reseed");
+
+  // (3) poured in bands, then put away
+  Composition oilOnly;
+  oilOnly.Add((uint16_t)oil, 150);
+  FlaskSim s3(BenchConfig());
+  s3.SetSubstances(subs);
+  const int v3 = s3.AddVessel(shape, pose, oilOnly);
+  const float hgt = s3.Shape(v3).height;
+  const int bandUnits = 100 * 12;  // 100 eighths a band
+  for (int band = 0; band < 4; band++) {
+    const int sl = s3.SlotOf((uint16_t)((band & 1) ? dirt : sodium));
+    for (int left = bandUnits, f = 0; left > 0 && f < 2000; f++) {
+      left -= s3.EmitGrains(sl, {240, 4 + hgt + 6}, std::min(left, 16), {0, -1});
+      s3.Step(3);
+    }
+    for (int f = 0; f < 150; f++) s3.Step(3);
+  }
+  for (int f = 0; f < 300; f++) s3.Step(3);
+  Shot(s3, "alchemy_remember_before.bmp");
+  alchemy::VesselLayout L3 = s3.SnapshotVessel(v3);
+  const alchemy::VesselLayout before = L3;
+  Composition out3 = s3.RemoveVessel(v3);
+  s3.FinishLayout(L3, out3);
+  const bool fits = s3.LayoutFits(L3, out3);
+  // Grain pictures compared pixel for pixel in the glass's own frame.
+  auto kept = [&](const alchemy::VesselLayout& a, const alchemy::VesselLayout& b) {
+    std::map<std::pair<int, int>, uint16_t> at;
+    for (const auto& g : b.grains) at[{(int)std::floor(g.x), (int)std::floor(g.y)}] = g.mat;
+    size_t same = 0;
+    for (const auto& g : a.grains) {
+      auto it = at.find({(int)std::floor(g.x), (int)std::floor(g.y)});
+      same += it != at.end() && it->second == g.mat;
+    }
+    return a.grains.empty() ? 0.0 : (double)same / (double)a.grains.size();
+  };
+  FlaskSim s4(BenchConfig());
+  s4.SetSubstances(subs);
+  const int v4 = s4.AddVessel(shape, pose, out3, false, &L3);
+  Shot(s4, "alchemy_remember_after.bmp");
+  const double keptWith = kept(before, s4.SnapshotVessel(v4));
+  FlaskSim s5(BenchConfig());
+  s5.SetSubstances(subs);
+  const int v5 = s5.AddVessel(shape, pose, out3);
+  const double keptWithout = kept(before, s5.SnapshotVessel(v5));
+  Composition all3;
+  for (int i = 0; i < out3.n; i++) all3.Add(out3.p[i].mat, out3.p[i].eighths);
+  ok &= Conserved(all3, s4.Count(), why) && audit(s3, "stir") && audit(s4, "restore");
+  const double keptMin = BaselineNumber("alchemy.layoutKeptMin", 0.9);
+  RecordObserved("alchemy.layoutKept", keptWith);
+  // The control must MISS the bar, or the fixture tests nothing.
+  ok &= order1 && outOrder && order2 && fits && keptWith >= keptMin && keptWithout < keptMin;
+  detail = Format("seeded sodium@%.1f dirt@%.1f oil@%.1f (%s); taken off bottom-up: %s; reseeded sodium@%.1f "
+                  "dirt@%.1f (%s); banded mix put back: %.1f%% of %zu grains in place with its layout (min %.0f%%), "
+                  "%.1f%% without; layout key %s; %s",
+                  h1[0], h1[1], h1[2], order1 ? "ok" : "WRONG", outOrder ? "yes" : "NO", h2[0], h2[1],
+                  order2 ? "ok" : "INVERTED", keptWith * 100, before.grains.size(), keptMin * 100,
+                  keptWithout * 100, fits ? "fits" : "DOES NOT FIT", why.empty() ? "conserved" : why.c_str());
+  std::printf("alchemy-remember: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AlchemyGates() {
@@ -2187,6 +2308,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-shake", "player", {}, false, GateAlchemyShake},
       {"alchemy-resort", "player", {}, false, GateAlchemyResort},
       {"alchemy-spawn", "player", {}, false, GateAlchemySpawn},
+      {"alchemy-remember", "player", {}, false, GateAlchemyRemember},
       {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
       {"alchemy-lift", "player", {}, false, GateAlchemyLift},
       {"alchemy-place", "player", {}, false, GateAlchemyPlace},
