@@ -168,6 +168,7 @@ DebrisSystem::BodyWound WoundOf(const MobLimb& l) {
   w.budget = l.bleedBudget;
   w.gushTicks = l.gushTicks;
   w.scale = l.woundScale;
+  w.fluid = l.woundFluid;
   return w;
 }
 
@@ -2277,6 +2278,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   coatRestoreRate_.clear();
   matBareBlood_.clear();
   matBleed_.clear();
+  matFluid_.clear();
   coatContact_.clear();
   for (uint32_t& m : matOfStainType_) m = 0;
   ignitedForm_.clear();
@@ -2361,6 +2363,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     coatRestoreRate_.push_back(slot != 0 ? m.coatRestoreRate : 0.0f);
     matBareBlood_.push_back(m.bareBlood);
     matBleed_.push_back(m.bleed);
+    matFluid_.push_back(m.bleedFluid);
     coatContact_.push_back(m.coatContact);
   }
   // The coat CLASS the one stain-precedence rule reads (phys/bodystain.h,
@@ -9361,6 +9364,16 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       limb.bleedBudget = 0.0f;
       continue;
     }
+    // A CLOSED WOUND FORGETS WHAT IT LEAKED, so the next one is decided by
+    // the matter IT opens (the limb may have turned to wood in between).
+    if (limb.bleedBudget < 1.0f && !limb.stumpOpen && limb.gushTicks <= 0)
+      limb.woundFluid = 0;
+    // WHAT THIS WOUND LEAKS (Mob::WoundFluid): the matter it opened, not the
+    // creature -- every emitter below uses it, never def.bleedMat.
+    const uint32_t fluid =
+        (limb.bleedBudget >= 1.0f || limb.stumpOpen || limb.gushTicks > 0)
+            ? WoundFluid((int)li)
+            : 0u;
     Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
             limb.xf.quat[3]};
 
@@ -9410,7 +9423,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         if (!world.CellInWindow({ifloor(gOrigin.x), ifloor(gOrigin.y),
                                  ifloor(gOrigin.z)}))
           break;
-        spawns.push_back(MakeDroplet(gOrigin, dir * sp, def.bleedMat, true,
+        spawns.push_back(MakeDroplet(gOrigin, dir * sp, fluid, true,
                                      life, gore.microScale));
         gushed++;
       }
@@ -9427,7 +9440,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         ev.speed = std::max(0.0f, gore_.severSpraySpeed);
         ev.life = std::clamp(gore_.microLifeTicks, 1, 255);
         ev.count = gushed;
-        ev.mat = def.bleedMat;
+        ev.mat = fluid;
         ev.amount = (uint32_t)std::max(0, gore.splatterAmount);
         ev.sourceMob = id_;
         ev.sourceLimb = (int)li;
@@ -9545,7 +9558,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // bound on matter entering the CA once clump size leaves 0 (rule 2).
     if (ops.size() >= kMaxOpsPerTick) break;  // charge the CAP before emitting
     ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
-                   def.bleedMat, 0 /*paint into air*/, 0, 0});
+                   fluid, 0 /*paint into air*/, 0, 0});
     const float clumpVox = (float)BleedClumpVoxels(clumpR);
     limb.bleedBudget -= clumpVox;
     bleedOps++;
@@ -9579,7 +9592,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       int life = EventVarI(gore_.microLifeTicks, gore.microLifeTicksVar,
                            es, tick, (uint32_t)k * 3u + 3u);
       life = life < 1 ? 1 : (life > 255 ? 255 : life);
-      spawns.push_back(MakeDroplet(w, dir * sp, def.bleedMat, true, life,
+      spawns.push_back(MakeDroplet(w, dir * sp, fluid, true, life,
                                    gore.microScale));
     }
     // ...and the spray as a splatter event, so a wound dripping against
@@ -9594,7 +9607,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       ev.speed = std::max(0.0f, gore_.bleedSpraySpeed);
       ev.life = std::clamp(gore_.microLifeTicks, 1, 255);
       ev.count = sprayed;
-      ev.mat = def.bleedMat;
+      ev.mat = fluid;
       ev.amount = (uint32_t)std::max(0, gore.splatterAmount);
       ev.sourceMob = id_;
       ev.sourceLimb = (int)li;
@@ -9634,7 +9647,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                             ifloor(dragContact_.z)})) {
       dragTrailDist_ = 0.0f;
       ops.push_back({ifloor(dragContact_.x), ifloor(dragContact_.y),
-                     ifloor(dragContact_.z), 0, def.bleedMat,
+                     ifloor(dragContact_.z), 0, WoundFluid(dragStumpLimb_),
                      0 /*paint into air*/, 0, 0});
       bleedOps++;
       // Blood on the floor is blood out of the body, by the same measure as
@@ -9825,8 +9838,9 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
                                 impactMs * pt.fallSplatImpulsePerMs, &skip);
     }
 
-    // Blood micro-spray burst.
-    if (def.bleedMat != 0) {
+    // Blood micro-spray burst -- of what the BODY is mostly made of.
+    const uint32_t splatFluid = BodyFluid();
+    if (splatFluid != 0) {
       const int droplets = std::max(0, pt.fallSplatDroplets);
       for (int k = 0; k < droplets; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
@@ -9839,7 +9853,7 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
         float sp = gore.severSpraySpeed *
                    (0.5f + 1.0f * (float)(Pcg(h ^ 0xC003u) & 0xFFFFu) / 65535.0f);
         int life = std::clamp(gore.microLifeTicks, 1, 255);
-        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, true,
+        spawns.push_back(MakeDroplet(center, dir * sp, splatFluid, true,
                                      life, gore.microScale));
       }
       // Whole-voxel blood thrown outward — pools and persists.
@@ -9854,7 +9868,7 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
         if (len > 1e-4f) dir = dir * (1.0f / len);
         float sp = gore.severVoxelSpeed *
                    (0.6f + 0.8f * (float)(Pcg(h ^ 0xF006u) & 0xFFFFu) / 65535.0f);
-        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, false,
+        spawns.push_back(MakeDroplet(center, dir * sp, splatFluid, false,
                                      0, 0));
       }
       // Blood stain at the impact site. Budget charged BEFORE emission
@@ -9863,7 +9877,7 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
       // cap is authoring an op that silently never happens.
       if (ops.size() < kMaxOpsPerTick)
         ops.push_back({(int)std::floor(center.x), (int)std::floor(center.y),
-                       (int)std::floor(center.z), 2, def.bleedMat, 0, 0, 0});
+                       (int)std::floor(center.z), 2, splatFluid, 0, 0, 0});
     }
     return true;
   }
@@ -9879,8 +9893,9 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
       // its name, which a sidecar is free to call anything.
       const MobLimbDef& ld = limbDefs_[i];
       if (ld.tag != "leg" && ld.tag != "foot") continue;
-      limbs_[i].bleedBudget = AddBleedBudget(
-          limbs_[i].bleedBudget, damage * pt.fallLegBleed * def.bleedPerDamage);
+      const float add = damage * pt.fallLegBleed * def.bleedPerDamage;
+      NoteWoundFluid(limbs_[i], LimbFluid((int)i), add);
+      limbs_[i].bleedBudget = AddBleedBudget(limbs_[i].bleedBudget, add);
       Quat q{limbs_[i].xf.quat[0], limbs_[i].xf.quat[1],
              limbs_[i].xf.quat[2], limbs_[i].xf.quat[3]};
       limbs_[i].woundLocal = RotateInv(q, center - limbs_[i].xf.pos);
@@ -10135,6 +10150,16 @@ float MobSystem::LimbHp(uint64_t mobId, int limbIndex) const {
   for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.LimbHpAt(limbIndex);
   return -1.0f;
+}
+uint32_t MobSystem::LimbWoundFluid(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return 0;
+  return m->WoundFluid(limbIndex);
+}
+uint32_t MobSystem::LimbTissueFluid(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return 0;
+  return m->LimbFluid(limbIndex);
 }
 float MobSystem::LimbBleedBudget(uint64_t mobId, int limbIndex) const {
   const Mob* m = FindMob(mobId);
@@ -11281,11 +11306,15 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // WHAT WAS STRUCK DECIDES HOW MUCH IT BLEEDS (materials.json `bleed`):
     // the nearest live voxel to the hit, so a wooden arm -- or a sylvan --
     // bleeds a fifth of what flesh would from the same blow.
-    if (pol.hitBleed != BleedRate::None)
-      limb.bleedBudget = AddBleedBudget(
-          limb.bleedBudget,
-          amount * def_->bleedPerDamage * BleedRateScale(pol.hitBleed) *
-              BleedWeightOf(ShellMaterialAt((int)i, hitWorldVoxel)));
+    // ...and it decides WHAT comes out (Mob::FluidAt): the struck voxel's
+    // fluid, else the limb's -- a wooden arm on a man leaks syrup.
+    if (pol.hitBleed != BleedRate::None) {
+      const uint32_t struck = ShellMaterialAt((int)i, hitWorldVoxel);
+      const float add = amount * def_->bleedPerDamage *
+                        BleedRateScale(pol.hitBleed) * BleedWeightOf(struck);
+      NoteWoundFluid(limb, FluidAt((int)i, struck), add);
+      limb.bleedBudget = AddBleedBudget(limb.bleedBudget, add);
+    }
     // hp reaching zero is a statement about DEATH, and a corpse has had its
     // one: on the dead only the impact exception (a sword knocked out of a
     // dead hand) still takes anything off.
@@ -11839,15 +11868,25 @@ uint32_t Mob::DefaultSmearMat() const {
   return 0;
 }
 
+uint32_t Mob::SmearMatFor(uint32_t fluid) const {
+  if (!def_) return 0;
+  if (fluid == 0 || fluid == def_->bleedMat) return DefaultSmearMat();
+  return sys_ && sys_->StainTypeOf(fluid) ? fluid : 0u;
+}
+
 uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
                          uint32_t seed, const std::vector<IVec3>* crater,
                          float rimCells, float wetness) {
   // THE ORDINARY CUT: the victim's own wound material, smeared with whatever
   // that derives to. One line, and it is the only place the old defaults live
   // now -- see Mob::StainWoundAs for why the two halves are separate arguments.
+  // The smear is what THIS wound leaks (a wooden stump on a man is sticky
+  // with syrup); the rewrite stays the creature's, and its `tissue` rule
+  // already keeps it off matter that does not crumble to that blood.
   return StainWoundAs(limbIndex, centreLocal, radiusWorld, seed,
-                      def_ ? def_->woundMat : 0u, DefaultSmearMat(), crater,
-                      rimCells, wetness);
+                      def_ ? def_->woundMat : 0u,
+                      SmearMatFor(WoundFluid(limbIndex)), crater, rimCells,
+                      wetness);
 }
 
 // ============================================================================
@@ -11947,7 +11986,8 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // rounding up.
   const uint32_t bleedFrom = (uint32_t)std::lround(
       (float)cap * std::clamp(gt.bruiseBleedFrom, 0.0f, 1.0f));
-  const uint32_t bloodMat = def_->bleedMat;
+  // A split bruise bleeds what the LIMB bleeds (Mob::LimbFluid).
+  const uint32_t bloodMat = LimbFluid(limbIndex);
   const float bleedChance =
       std::clamp(effBleedChance, 0.0f, 1.0f) * pw * blowScale;
 
@@ -12352,7 +12392,7 @@ uint32_t Mob::ReBloodWound(int limbIndex, Vec3 centreLocal, float wet,
   if (wet <= 0.0f || gt.woundRebloodRadius <= 0.0f ||
       gt.woundRebloodAmount <= 0)
     return 0;
-  const uint32_t smear = DefaultSmearMat();
+  const uint32_t smear = SmearMatFor(WoundFluid(limbIndex));
   if (!sys_ || !smear || !sys_->StainTypeOf(smear)) return 0;
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body) return 0;
@@ -12852,7 +12892,8 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   v.carved = &limb.carved;
   v.flipbook = &limb.flipbookModel;
   v.burn = &limb.burn;
-  v.bareBloodMat = DefaultSmearMat();
+  // What a bared voxel is left wearing is what THIS limb bleeds.
+  v.bareBloodMat = SmearMatFor(LimbFluid((int)(&limb - limbs_.data())));
   // ---- the wound revert (BurnLimbView's note) -----------------------------
   // Armed only on a creature's OWN limbs, which is all this view is ever built
   // for; a severed limb has become debris and gets DebrisSystem's view, with
@@ -14428,7 +14469,16 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
   //
   // A BLOODLESS SOURCE (hair) hands the debris no bleed material at all, so
   // cutting the lock again later cannot draw blood out of it either.
-  const uint32_t fragBleed = IsBloodless(srcLimb) ? 0u : def_->bleedMat;
+  //
+  // ...and a lump leaks what IT is made of (materials.h bleedFluid), else what
+  // the limb it came off leaks: a chip off a wooden arm oozes syrup.
+  uint32_t fragBleed = 0;
+  if (!IsBloodless(srcLimb)) {
+    FluidTally t;
+    for (const DebrisVoxel& v : part)
+      t.Add(OwnFluidOf(v.payload & 0xFFFu), BleedWeightOf(v.payload & 0xFFFu));
+    fragBleed = t.Winner(LimbFluid(srcLimb));
+  }
   debris_->AdoptBody(h, std::move(part), xf, micro, 0, {},
                      fragBleed, {}, /*dead=*/true, defIndex_, id_);
   // A lump of live flesh oozes from the face it was cut on: the wound sits on
@@ -14535,6 +14585,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // ...and how much of what was lost BLEEDS (materials.json `bleed`), summed
   // over the same voxels: the wound bleeds by the mean of the matter it opened.
   float skinLostBleed = 0.0f;
+  FluidTally skinLostFluid;   // what the lost skin leaks (materials.h bleedFluid)
   // The cells themselves, for a caller that wants to measure FROM the hole.
   // Only when asked: a burning limb carves itself dozens of times a second
   // and has no use for the list.
@@ -14551,6 +14602,8 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                          skinLostSq += p.dot(p);
                          skinLostN++;
                          skinLostBleed += BleedWeightOf(v.material & 0xFFFu);
+                         skinLostFluid.Add(OwnFluidOf(v.material & 0xFFFu),
+                                           BleedWeightOf(v.material & 0xFFFu));
                          if (report) skinLostCells.push_back({v.x, v.y, v.z});
                          return true;
                        }),
@@ -14600,6 +14653,8 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
             skinLostSq += p.dot(p);
             skinLostN++;
             skinLostBleed += BleedWeightOf(v.material & 0xFFFu);
+            skinLostFluid.Add(OwnFluidOf(v.material & 0xFFFu),
+                              BleedWeightOf(v.material & 0xFFFu));
             if (report) skinLostCells.push_back({v.x, v.y, v.z});
           });
       if (took) skinRemoved = true;
@@ -14841,18 +14896,27 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     // The mean `bleed` of the matter that left (1 = flesh; wood 0.2). On the
     // skin when there is one, else over the collider cells the carve removed;
     // nothing measured (a loss only the re-derive saw) bleeds as flesh.
+    // ...and WHAT it leaks is the majority fluid of that same matter, else
+    // the limb's (Mob::LimbFluid).
     float matBleed = 1.0f;
+    FluidTally lostFluid = skinLostFluid;
     if (skinLostN) {
       matBleed = skinLostBleed / (float)skinLostN;
     } else if (!removed.empty()) {
       float sum = 0.0f;
-      for (const DebrisVoxel& v : removed) sum += BleedWeightOf(v.payload & 0xFFFu);
+      for (const DebrisVoxel& v : removed) {
+        const uint32_t m = v.payload & 0xFFFu;
+        sum += BleedWeightOf(m);
+        lostFluid.Add(OwnFluidOf(m), BleedWeightOf(m));
+      }
       matBleed = sum / (float)removed.size();
     }
-    limb.bleedBudget =
-        AddBleedBudget(limb.bleedBudget,
-                       lost * (float)at0 * def.bleedPerDamage * bleedScale *
-                           matBleed);
+    const float add = lost * (float)at0 * def.bleedPerDamage * bleedScale *
+                      matBleed;
+    NoteWoundFluid(limb, lostFluid.n ? lostFluid.Winner(0)
+                                     : LimbFluid((int)(&limb - limbs_.data())),
+                   add);
+    limb.bleedBudget = AddBleedBudget(limb.bleedBudget, add);
   }
 
   // Carved down past the point of being a limb at all: it comes off. This is
@@ -17724,7 +17788,7 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
   // whole coat is skipped and the behaviour is exactly what it was.
   const uint32_t boneIchorMat =
       (sys_ && sys_->StainTypeOf(limb.infectStain)) ? (uint32_t)limb.infectStain : 0u;
-  const uint32_t boneBloodMat = DefaultSmearMat();
+  const uint32_t boneBloodMat = SmearMatFor(LimbFluid(li));
   const float boneBase = std::clamp(gtc.infectBoneStain, 0.0f, 15.0f);
   const float boneVary = std::clamp(gtc.infectBoneStainVary, 0.0f, 15.0f);
   const float boneIchorP = std::clamp(gtc.infectBoneIchor, 0.0f, 1.0f);
@@ -22156,6 +22220,8 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
               if (v.payload & 0xFFFu) { sum += BleedWeightOf(v.payload & 0xFFFu); n++; }
           }
           piece.woundScale = n ? sum / (float)n : 1.0f;
+          // ...and leaks what it is made of (Mob::LimbFluid).
+          piece.woundFluid = LimbFluid(limbIndex);
         }
         piece.bleedBudget = AddBleedBudget(piece.bleedBudget,
                                            gt.severStumpBudget * piece.woundScale);
@@ -22189,6 +22255,10 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
                  parent.xf.quat[3]};
           const auto& gore = CurrentTuning().gore;
           parent.woundLocal = RotateInv(q, anchorW - parent.xf.pos);
+          // WHAT THE STUMP LEAKS is the parent's matter at the cut (Mob::
+          // FluidAt), decided before the smear so the smear is of it: a flesh
+          // shoulder under a wooden arm bleeds blood, and the reverse.
+          parent.woundFluid = FluidAt((int)k, ShellMaterialAt((int)k, anchorW));
           // The stump's face is bloodied too (see the piece above).
           StainWound((int)k, parent.woundLocal, gore.woundStainRadius,
                      Hash3((uint32_t)id_, (uint32_t)k, 0x57B4Fu));
@@ -22271,7 +22341,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
                       anchorW.y + SignedUnit(Pcg(hm ^ 0x2A5u)) * sprd,
                       anchorW.z + SignedUnit(Pcg(hm ^ 0xB77u)) * sprd};
               pendingSpawns_.push_back(
-                  MakeDroplet(at, dir * sp, def.bleedMat, false, 0, 0));
+                  MakeDroplet(at, dir * sp, WoundFluid((int)k), false, 0, 0));
             }
           }
           // The thrown voxels are whole blood and leave the body NOW, so
@@ -22376,7 +22446,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels),
-                       IsBloodless(limbIndex) ? 0u : def.bleedMat,
+                       IsBloodless(limbIndex) ? 0u : LimbFluid(limbIndex),
                        WoundOf(limb), /*dead=*/true, defIndex_, id_);
     limb.skinVoxels.clear();
     limb.carved = false;
@@ -22709,7 +22779,7 @@ void Mob::ReleaseRigToDebris() {
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels),
-                       IsBloodless((int)i) ? 0u : def_->bleedMat,
+                       IsBloodless((int)i) ? 0u : LimbFluid((int)i),
                        WoundOf(limb), /*dead=*/true, defIndex_, id_);
     // DebrisSystem's now: loose Debris, clear of the player first, then debris
     // like any other — the same rule a severed piece follows (Mob::Die's note).
@@ -27190,6 +27260,65 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
 float Mob::BleedWeightOf(uint32_t mat) const {
   if (sys_ == nullptr || mat == 0 || mat >= sys_->matBleed_.size()) return 1.0f;
   return sys_->matBleed_[mat];
+}
+
+// ---- WHAT A WOUND LEAKS (mob.h, materials.h bleedFluid) ---------------------
+// struck matter -> limb census -> creature. The creature's `bleed.material` is
+// the LAST rung, not the answer: it speaks only for matter with no opinion of
+// its own (bone, hair, a critter's art slots), and a creature with no bleed
+// block at all still bleeds nothing.
+uint32_t Mob::OwnFluidOf(uint32_t mat) const {
+  if (sys_ == nullptr || mat == 0 || mat >= sys_->matFluid_.size()) return 0;
+  return sys_->matFluid_[mat];
+}
+
+uint32_t Mob::LimbFluid(int limbIndex) const {
+  if (!def_ || def_->bleedMat == 0) return 0;
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return def_->bleedMat;
+  if (IsBloodless(limbIndex)) return 0;
+  const MobLimb& limb = limbs_[limbIndex];
+  FluidTally t;
+  if (limb.HasFineSkin()) {
+    for (const PrefabVoxel& v : limb.skinVoxels) {
+      const uint32_t m = v.material & 0xFFFu;
+      t.Add(OwnFluidOf(m), BleedWeightOf(m));
+    }
+  } else {
+    for (const DebrisVoxel& v : limb.voxels) {
+      const uint32_t m = v.payload & 0xFFFu;
+      t.Add(OwnFluidOf(m), BleedWeightOf(m));
+    }
+  }
+  return t.Winner(def_->bleedMat);
+}
+
+uint32_t Mob::FluidAt(int limbIndex, uint32_t mat) const {
+  if (!def_ || def_->bleedMat == 0) return 0;
+  if (limbIndex >= 0 && limbIndex < (int)limbs_.size() && IsBloodless(limbIndex))
+    return 0;
+  const uint32_t own = OwnFluidOf(mat);
+  return own ? own : LimbFluid(limbIndex);
+}
+
+uint32_t Mob::WoundFluid(int limbIndex) const {
+  if (!def_ || def_->bleedMat == 0) return 0;
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return def_->bleedMat;
+  if (IsBloodless(limbIndex)) return 0;
+  const uint32_t f = limbs_[limbIndex].woundFluid;
+  return f ? f : LimbFluid(limbIndex);
+}
+
+uint32_t Mob::BodyFluid() const {
+  if (!def_ || def_->bleedMat == 0) return 0;
+  FluidTally t;
+  const int n = std::min(baseLimbs_, (int)limbs_.size());
+  for (int i = 0; i < n; i++) {
+    if (IsBloodless(i)) continue;
+    const MobLimb& l = limbs_[i];
+    const size_t vox = l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size();
+    if (vox) t.Add(LimbFluid(i), (float)vox);
+  }
+  return t.Winner(def_->bleedMat);
 }
 
 float Mob::MaterialHardness(uint32_t mat) const {

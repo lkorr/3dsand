@@ -163,6 +163,11 @@ class DebrisSystem {
     // materials.json `bleed` of the matter at the wound (1 = flesh): scales
     // the gout. ArmWound measures it; a limb's hand-off carries its own.
     float scale = 1.0f;
+    // What the wound leaks (materials.h bleedFluid): the matter at the wound
+    // (ArmWound), or the limb's own wound handed over (Mob::WoundFluid).
+    // 0 = the body's `bleedMat`, which a limb's hand-off already sets to the
+    // limb's own fluid (Mob::LimbFluid). Not on the wire: a ghost never bleeds.
+    uint32_t fluid = 0;
   };
 
   void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
@@ -504,6 +509,11 @@ class DebrisSystem {
   // The current owner of a body by handle, or kLocalOwner for an unknown one
   // (an unknown handle is not a thing this machine has to stop stepping).
   uint32_t OwnerOfBody(uint64_t handle) const;
+  // What body `handle` bleeds (Body::bleedMat -- a limb's own fluid since
+  // 2026-09-29) and what its open wound leaks (WoundFluidOf). 0 = unknown
+  // handle or a bloodless body. For gates.
+  uint32_t BodyBleedMat(uint64_t handle) const;
+  uint32_t BodyWoundFluid(uint64_t handle) const;
   // Is this body posed from the wire rather than stepped here?
   bool IsGhost(uint64_t handle) const;
   // How many ghosts exist. For the `--frames` net report and for the gate.
@@ -1903,6 +1913,11 @@ class DebrisSystem {
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;
   std::vector<float> bleedOf_;   // MaterialDef::bleed (wound bleed weight)
+  std::vector<uint32_t> fluidOf_;  // MaterialDef::bleedFluid (0 = no opinion)
+  // What body `b`'s open wound leaks: its own fluid, else the body's.
+  static uint32_t WoundFluidOf(const Body& b) {
+    return b.wound.fluid ? b.wound.fluid : b.bleedMat;
+  }
   std::vector<std::string> matNames_;   // id -> name, for authored-by-name coats
   std::vector<uint8_t> foliageOf_;  // tag:foliage — sub-8 floaters vanish, no rubble
   // body burn tables (rebuilt on materials hot-reload; data-driven, no

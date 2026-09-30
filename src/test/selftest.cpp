@@ -900,7 +900,7 @@ const char* const kOrder[] = {
     // counter (mob ids seed gore variance).
     "impact-blunt", "impact-armor", "impact-fist", "bite-rot", "bite-infect",
     // ...and how much a wound bleeds by what it opened: wood a fifth of flesh.
-    "wood-bleed", "mob-race",
+    "wood-bleed", "bleed-fluid", "mob-race",
     // ...and the structural consequence the rot had none of until 2026-09-19:
     // a limb whose ATTACHMENT has been eaten comes off, whatever ate it.
     "joint-rot",

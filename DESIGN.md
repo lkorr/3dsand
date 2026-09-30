@@ -4622,6 +4622,53 @@ them; raising the cap a long way is a settle-time change as much as a look one.
 
 ## 7. Destruction, Islands, and Rigidbodies
 
+### What a wound leaks is the MATTER's (2026-09-29; `materials.h` `bleed` + `bleedFluid`, `Mob::FluidAt`)
+
+How MUCH a wound bleeds and WHAT comes out are both properties of the voxels the
+wound opened, not of the creature. `materials.json` `bleed` is the amount
+(flesh 1, wood / bark / leaves / crystal 0.2, a multiplier on the body's
+`bleed.perDamage`); `bleedFluid` is the liquid. The fluid is resolved once at
+load: an authored name (must be a liquid), else DERIVED from a liquid `rubble`
+(skin, flesh, muscle and brain crumble to blood, so they bleed blood with no
+key; rotflesh -> ichor), else no opinion (bone, hair, art slots); `false`
+opts out. The wood family authors `"bleedFluid": "syrup"`.
+
+Every wound resolves it through ONE chain: **struck matter -> the limb's
+majority -> the creature**. `Mob::FluidAt(limb, mat)` is the matter's own
+fluid else `Mob::LimbFluid` (a `FluidTally` over the limb's authoritative
+lattice, voting only voxels with an opinion, weighted by `bleed`, so bone never
+outvotes the meat round it) else the sidecar's `bleed.material`, which is now
+the LAST rung and speaks only for matter with no opinion. A creature with no
+`bleed` block still bleeds nothing, and a bloodless slot (hair, a garment)
+still leaks nothing.
+
+The decision is taken where the wound is made and kept on the limb
+(`MobLimb::woundFluid`, set through `Mob::NoteWoundFluid`: the bigger share of
+budget takes the wound over; cleared when the wound closes): a hit from the
+struck voxel, a carve from the majority of the carved voxels, a sever from the
+parent's voxel at the cut (the stump) and the piece's own census (the piece),
+the fall from the legs, a fall splat from the whole body (`Mob::BodyFluid`).
+Every emitter reads it -- the drip op, spray and gout droplets, the thrown
+voxels, the drag smear, the splatter event, the cut smear (`Mob::SmearMatFor`:
+the creature's `woundMaterial` chain for its own blood, else the fluid
+itself), the bared-bone coat and a split bruise. Debris carries it on: a
+severed piece is adopted with its OWN fluid as `Body::bleedMat`, a gobbet with
+the majority of its voxels, and `DebrisSystem::ArmWound` re-reads the voxel at
+each new wound into `BodyWound::fluid` (never on the wire; a ghost does not
+bleed).
+
+So a human whose arm has been turned to wood leaks syrup from it and blood from
+the flesh shoulder it hangs off; a sylvan grown a flesh arm bleeds blood from it
+and sap from its stump -- no race or creature code anywhere. A new tissue is one
+JSON key (or none, if its rubble already names its fluid). Gate `bleed-fluid`
+(six arms, including both ends of each sever) and `wood-bleed` (the amounts).
+
+NOT per-fluid yet: the wound REWRITE (`MobDef::woundMat`, the soaked-meat
+material) and its `tissue` census are still the creature's -- they already
+refuse matter that does not crumble to the creature's blood, so a wooden arm on
+a man is not rewritten to blood-meat, but a sylvan's flesh arm is not rewritten
+to blood-meat either (it gets the blood smear only).
+
 ### Large-scale destruction
 - **Explosions**: cast rays from the blast center to every voxel on the blast
   sphere's *surface*, DDA-traversing voxel by voxel. Compare each voxel's
