@@ -9269,6 +9269,161 @@ Status GateHealWound(Ctx& c, std::string& detail) {
   return bloodOk && waterOk ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// liquid-coats: EVERY liquid coats a body (owner report 2026-09-29)
+// ---------------------------------------------------------------------------
+//
+// "Syrup doesn't stain characters when they walk through it, nor does it show
+// when applied manually." Syrup had no stain block, so it had no stain slot:
+// the contact pass (StainOneLimb) skipped it and the micro renderer's coat
+// filter (microbody.cpp DrawsCoat) drew the coat SoakLimb did write as clean.
+// A liquid with no stain block now gets materials.json `liquidStainDefault`
+// (materials.cpp DefaultLiquidStain). Claims:
+//   * EVERY LIQUID IS WIRED: a body stain slot, a nonzero coat opacity, a
+//     nonzero contact rate and a look the renderer draws -- unless it opted out
+//     with `"stain": false` (named in the detail).
+//   * SYRUP LOOKS LIKE SYRUP: its coat colour is its own base colour at the
+//     default opacity, and it never marks the ground (no GPU stain type).
+//   * APPLIED BY HAND IT LANDS: SoakLimb puts syrup on a limb.
+//   * WALKED THROUGH IT LANDS: a creature standing in a syrup pool picks the
+//     coat up through the real contact pass.
+Status GateLiquidCoats(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  // ---- 1. the table ------------------------------------------------------
+  const MicroBodySet* set = mobs.MicroSet();
+  uint32_t liquids = 0, wired = 0;
+  std::string unwired, optedOut;
+  uint32_t mSyrup = 0;
+  for (size_t i = 1; i < c.mats.size(); i++) {
+    const MaterialDef& m = c.mats[i];
+    if (m.name == "syrup") mSyrup = (uint32_t)i;
+    if (m.gpu.klass != CLASS_LIQUID) continue;
+    liquids++;
+    if (m.stain.empty()) {  // `"stain": false`
+      optedOut += " " + m.name;
+      continue;
+    }
+    const uint32_t groundChance =
+        (m.gpu.stainPack >> kStainPackChanceShift) & kStainPackChanceMask;
+    const bool contact = m.coatContact > 0 || (m.coatContact < 0 && groundChance > 0);
+    const bool draws = set && i < set->drawsCoat.size() && set->drawsCoat[i] != 0;
+    const bool ok = m.stainSlot != 0 && mobs.StainTypeOf((uint32_t)i) != 0 &&
+                    (m.gpu.stainColor >> 24) != 0 && contact && draws;
+    if (ok) wired++;
+    else
+      unwired += Format(" %s(slot %u opacity %u contact %d draws %d)", m.name.c_str(),
+                        m.stainSlot, m.gpu.stainColor >> 24, m.coatContact, draws ? 1 : 0);
+  }
+  const bool tableOk = wired + (uint32_t)std::count(optedOut.begin(), optedOut.end(), ' ') ==
+                           liquids && liquids > 0;
+  if (!mSyrup) {
+    detail = "syrup material missing";
+    return Status::Fail;
+  }
+  const MaterialDef& syrup = c.mats[mSyrup];
+  const bool syrupLook = syrup.stainAuto &&
+                         (syrup.gpu.stainPack & kStainPackTypeMask) == 0 &&
+                         (syrup.gpu.stainColor & 0xFFFFFFu) == (syrup.gpu.color0 & 0xFFFFFFu) &&
+                         std::abs((int)(syrup.gpu.stainColor >> 24) - 128) <= 1;
+
+  // ---- 2. by hand, and 3. walked through --------------------------------
+  PrepareWorld(c);
+  constexpr int kInset = 330;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int root = def.rootLimb;
+  uint32_t simTick = 29000;
+  support::TickCursor ticker{c, simTick, pchunk};
+  auto tick = [&](const std::function<void(std::vector<CellOp>&)>& fill) {
+    support::TickOps pre;
+    fill(pre.cells);
+    if (root >= 0 && mobs.LimbBody(id, root)) {
+      const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+      ticker.chunk = IVec3{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
+    }
+    ticker(pre);
+  };
+  for (int i = 0; i < 20; i++) tick([](std::vector<CellOp>&) {});
+
+  // By hand: the target limb, which the pool below cannot reach from the feet
+  // unless it IS a leg -- counted separately either way.
+  const uint32_t handMarked = mobs.SoakLimb(id, t.limb, mSyrup, 5, simTick);
+  const uint32_t handCoat = mobs.LimbCoatMatCount(id, t.limb, mSyrup, 1);
+
+  // Walked through: two voxels of syrup round the feet, re-poured into air
+  // (or syrup) cells every tick for 40 ticks, as body-stain's shallow pool.
+  auto mirrorMat = [&](IVec3 cc) -> int {
+    const CachedChunk* k = c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+    if (!k || k->voxels.size() != kChunkVol) return -1;
+    return (int)(k->voxels[(((uint32_t)cc.z & 15u) * kChunk + ((uint32_t)cc.y & 15u)) * kChunk +
+                           ((uint32_t)cc.x & 15u)] & 0xFFFu);
+  };
+  float footLo = 1e30f;
+  for (size_t li = 0; li < def.limbs.size(); li++) {
+    float lo = 0.0f, hi = 0.0f;
+    if ((int)li != t.limb && mobs.LimbBody(id, (int)li) &&
+        mobs.LimbStainWorldYRange(id, (int)li, 0, lo, hi))
+      footLo = std::min(footLo, lo);
+  }
+  uint32_t poolCells = 0, walkCoat = 0;
+  if (footLo < 1e29f && root >= 0 && mobs.LimbBody(id, root)) {
+    const int footY = ifloor(footLo);
+    const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+    const int gx = ifloor(at.x), gz = ifloor(at.z);
+    for (int i = 0; i < 40; i++) {
+      tick([&](std::vector<CellOp>& ops) {
+        for (int dz = -5; dz <= 5; dz++)
+          for (int dx = -5; dx <= 5; dx++)
+            for (int dy = 0; dy <= 1; dy++) {
+              const IVec3 cc{gx + dx, footY + dy, gz + dz};
+              if (!c.world.CellInWindow(cc) || ops.size() >= kMaxCellOpsPerTick) continue;
+              const int m = mirrorMat(cc);
+              if (m != 0 && m != (int)mSyrup) continue;
+              ops.push_back({World::SlotCellIndex(cc), PackVoxNew(mSyrup, 8u)});
+              poolCells++;
+            }
+      });
+    }
+    // Every limb but the hand-soaked one: only the pool can have coated them.
+    for (size_t li = 0; li < def.limbs.size(); li++)
+      if ((int)li != t.limb && mobs.LimbBody(id, (int)li))
+        walkCoat += mobs.LimbCoatMatCount(id, (int)li, mSyrup, 1);
+  }
+  const bool handOk = handMarked > 0 && handCoat > 0;
+  const bool walkOk = walkCoat > 0;
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+
+  const bool ok = tableOk && syrupLook && handOk && walkOk;
+  detail = Format(
+      "%s: %u/%u liquids wired%s%s%s%s | syrup auto %d, gpu type %u, colour "
+      "0x%06x vs base 0x%06x, opacity %u%s | by hand on %s.%s: marked %u, coated %u%s | "
+      "pool (%u cell writes over 40 ticks): %u syrup-coated voxels on the other "
+      "limbs%s",
+      ok ? "PASS" : "FAIL", wired, liquids, optedOut.empty() ? "" : ", opted out:",
+      optedOut.c_str(), unwired.empty() ? "" : " UNWIRED:", unwired.c_str(),
+      syrup.stainAuto ? 1 : 0, syrup.gpu.stainPack & kStainPackTypeMask,
+      syrup.gpu.stainColor & 0xFFFFFFu, syrup.gpu.color0 & 0xFFFFFFu,
+      syrup.gpu.stainColor >> 24, syrupLook ? "" : " [WRONG LOOK]", t.defName.c_str(),
+      t.limbName.c_str(), handMarked, handCoat, handOk ? "" : " [HAND POUR REFUSED]",
+      poolCells, walkCoat, walkOk ? "" : " [WALKING THROUGH SYRUP LEFT NOTHING]");
+  std::printf("liquid-coats: %s\n", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -9312,6 +9467,8 @@ const std::vector<Gate>& WoundGates() {
       {"acid-coat", "mob", {}, false, GateAcidCoat, false},
       {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},
       {"lava-oil-coat", "mob", {}, false, GateLavaOilCoat, false},
+      // Every liquid coats a body; syrup by hand and by walking through it.
+      {"liquid-coats", "mob", {}, false, GateLiquidCoats, false},
       // A HEALING coat (alchemy package D): enchanted blood / water rebuild
       // the limb toward its recipe, bounded by what was poured.
       {"heal-restore", "mob", {}, false, GateHealRestore, false},

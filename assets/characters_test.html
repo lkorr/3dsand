@@ -303,14 +303,26 @@ var toasts = [], dirt = [];
         names.join(','));
     var side2 = await (await fetch('/api/model?path=mobs/human/_harness.json',
                                    { cache: 'no-store' })).json();
-    say(Array.isArray(side2.limbs) && side2.limbs.length === 15,
-        'the sidecar has the 15-limb rig', 'limbs: ' +
-        (side2.limbs ? side2.limbs.length : 'none'));
-    say(!!side2.anatomy && !!side2.anatomy.limbs.head,
-        'the sidecar carries the anatomy recipe, head override and all');
+    // A SAVED CHARACTER IS A DIFF against the human (mobgen.thinSidecar,
+    // since 2026-09-20): the rig, the anatomy recipe and artVoxelsPerMetre
+    // reach it by `extends`. So those are asserted on the RESOLVED sidecar,
+    // exactly as the engine loads it, and only the genome on the file itself.
+    var SCm = await import('./editor/sidecar.js');
+    var baseDoc = await (await fetch('/api/model?path=mobs/human.json',
+                                     { cache: 'no-store' })).json();
+    var docs2 = { human: baseDoc, _harness: side2 };
+    var full2 = SCm.resolveSidecar(function(stem){
+      return docs2[stem] ? JSON.parse(JSON.stringify(docs2[stem])) : null;
+    }, '_harness');
+    say(side2.extends === 'human', 'the sidecar extends the human');
+    say(Array.isArray(full2.limbs) && full2.limbs.length === 15,
+        'the resolved sidecar has the 15-limb rig', 'limbs: ' +
+        (full2.limbs ? full2.limbs.length : 'none'));
+    say(!!full2.anatomy && !!full2.anatomy.limbs && !!full2.anatomy.limbs.head,
+        'it resolves to the anatomy recipe, head override and all');
     say(!!side2.genome,
         'the sidecar carries its own genome, so it can be bred from later');
-    say(side2.artVoxelsPerMetre === 80,
+    say(full2.artVoxelsPerMetre === 80,
         'artVoxelsPerMetre is declared (not the legacy skinScale)');
     // The saved genome must round-trip: load it back and get the same body.
     var reloaded = mg.generateMob(side2.genome, 0,
@@ -361,6 +373,80 @@ var toasts = [], dirt = [];
     say(dirt.includes(true) && dirt[dirt.length - 1] === false,
         'editing marks the page dirty and saving clears it',
         dirt.join(','));
+
+    mark('10. the race toggle: human <-> sylvan');
+    // ---- 10. the race toggle ------------------------------------------------
+    // The sylvan (editor/sylvan.js) is a second surface on the same rig. What
+    // only the page can show: the toggle is at the top, it swaps the rows the
+    // page offers, the preview repaints as wood, a litter stays the race you
+    // are working on, and a save files the character in assets/mobs/sylvan/.
+    breed.__test.preset('human');
+    var raceBtns = [...host.querySelectorAll('.racerow .racebtn')];
+    say(raceBtns.length === 2, 'the race toggle is at the top of the pane',
+        raceBtns.length + ' buttons');
+    var pre = host.querySelector('.prev canvas').toDataURL();
+    var sylBtn = raceBtns.find(function(b){ return b.textContent === 'sylvan'; });
+    if (sylBtn) sylBtn.click();
+    say(st.genome.body.race === 'sylvan', 'clicking sylvan makes a sylvan');
+    say(host.querySelector('.prev canvas').toDataURL() !== pre,
+        'the preview repaints as a sylvan');
+    say(!!host.querySelector('.sf-sel') && !!host.querySelector('.sc-sel'),
+        'the sylvan face and crown pickers appear');
+    var labels = [...host.querySelectorAll('.grow .gl')].map(function(e){
+      return e.textContent; });
+    say(labels.some(function(t){ return t.indexOf('eye depth') === 0; }) &&
+        labels.some(function(t){ return t.indexOf('bark') === 0; }),
+        'the sylvan rows (eye depth, bark...) are offered');
+    var before10 = host.querySelector('.prev canvas').toDataURL();
+    var sc = host.querySelector('.sc-sel');
+    sc.value = 'blossom'; sc.dispatchEvent(new Event('change'));
+    say(st.genome.sylvan.crown === 'blossom' &&
+        host.querySelector('.prev canvas').toDataURL() !== before10,
+        'picking a crown reaches the preview');
+    // Branches are their own picker, independent of the crown.
+    var before10b = host.querySelector('.prev canvas').toDataURL();
+    var sb = host.querySelector('.sb-sel');
+    say(!!sb, 'the branch picker is offered');
+    if (sb) { sb.value = 'shoulders'; sb.dispatchEvent(new Event('change')); }
+    say(st.genome.sylvan.branchStyle === 'shoulders' &&
+        st.genome.sylvan.crown === 'blossom' &&
+        host.querySelector('.prev canvas').toDataURL() !== before10b,
+        'picking shoulder boughs reaches the preview and keeps the crown');
+    var sw = [...host.querySelectorAll('.glowsw')];
+    say(sw.length >= 8, 'a row of eye-glow swatches is offered', sw.length + '');
+    var violet = sw.find(function(b){ return b.title === 'violet'; });
+    if (violet) violet.click();
+    say(st.genome.colors.eye === mg.SYLVAN_GLOWS.violet,
+        'clicking a glow swatch sets the eye colour');
+    say([...host.querySelectorAll('.grow .gl')].some(function(e){
+          return e.textContent.indexOf('leaf mix') === 0; }),
+        'the leaf mix row is offered');
+    st.source = 'random';
+    breed.__test.rollLitter();
+    say(st.litter.length > 0 && st.litter.every(function(c){
+          return c.genome.body.race === 'sylvan'; }),
+        'a random litter stays sylvan');
+    st.name = '_harness_syl';
+    await breed.saveFromHost();
+    var svox = await fetch('/api/model?path=mobs/sylvan/_harness_syl.vox',
+                           { cache: 'no-store' });
+    say(svox.ok, 'a sylvan saves into assets/mobs/sylvan/');
+    if (svox.ok) {
+      var sb = new Uint8Array(await svox.arrayBuffer());
+      var sp = vox2.readVox(sb).prefab;
+      var sm = new Set();
+      for (var m2 of sp.models) for (var v2 of m2.grid.data) if (v2) sm.add(v2);
+      var snames = [...sm].map(function(id){ return materials[id - 1].id; });
+      say(snames.indexOf('bark_light') >= 0 && snames.indexOf('skin') < 0 &&
+          snames.indexOf('crystal') >= 0,
+          'the saved sylvan is bark over wood with a crystal heart',
+          snames.join(','));
+    }
+    var humBtn = [...host.querySelectorAll('.racerow .racebtn')]
+      .find(function(b){ return b.textContent === 'human'; });
+    if (humBtn) humBtn.click();
+    say(st.genome.body.race === 'human' && !host.querySelector('.sf-sel'),
+        'clicking human switches back and hides the sylvan rows');
   } catch (e) {
     say(false, 'harness threw: ' + (e && e.message || e),
         e && e.stack ? String(e.stack).split('\n')[1] : '');

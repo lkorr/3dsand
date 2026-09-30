@@ -727,7 +727,9 @@ async function saveCharacter() {
   if (b.complaints.length)
     return toast('refused: ' + b.complaints[0], true);
   const existing = S.pool.find(p => p.name === name);
-  const dir = mobDirFor(name, mg.BASE_MOB);
+  // FILED by race: a sylvan lands in assets/mobs/sylvan/, beside its kin. The
+  // folder is filing only (src/game/sidecar.h); it still extends the human.
+  const dir = mobDirFor(name, mg.raceFolder(S.genome));
   if (existing && !confirm(`assets/${dir}/${name}.{vox,json} already exists. ` +
                            'Overwrite?')) return;
   // THE ANATOMY IS BAKED HERE, not left to a command line. A body straight out
@@ -843,7 +845,8 @@ function rollLitter() {
     const rng = mg.makeRng(S.seed * 4096 + i);
     let g, label;
     if (S.source === 'random') {
-      g = mg.rollColors(mg.randomGenome(rng, locks), rng);
+      g = mg.rollColors(mg.randomGenome(rng, locks,
+                                        { race: S.genome.body.race }), rng);
       // A locked gene must survive the colour roll too, or the lock only holds
       // for half the page.
       g = reapplyLocks(g, S.genome, locks);
@@ -974,6 +977,11 @@ function css() {
 #view-characters .sexbtn{font-size:10px;padding:1px 10px;opacity:.55}
 #view-characters .sexbtn.on{opacity:1;border-color:#c9b46a;color:#fff3c8;
   background:#2a2618}
+#view-characters .glowctl{display:inline-flex;gap:3px;align-items:center;
+  flex-wrap:wrap}
+#view-characters .glowsw{width:14px;height:14px;padding:0;min-width:0;
+  border:1px solid #333;box-shadow:0 0 4px currentColor}
+#view-characters .glowsw.on{border:2px solid #fff3c8}
 #view-characters .hcsw{display:inline-block;width:12px;height:12px;
   border:1px solid #444;vertical-align:middle}
 #view-characters .note{font-size:10px;opacity:.6;line-height:1.4;margin:4px 0}
@@ -1208,6 +1216,8 @@ function tweakPane() {
   const geneRows = [];
   let group = null;
   for (const spec of mg.GENE_SPECS) {
+    // A row another race has (the sylvan's face, bark and crown) is hidden.
+    if (!mg.specApplies(spec, S.genome)) continue;
     if (spec.group !== group) {
       group = spec.group;
       const g = mg.GENE_GROUPS.find(x => x.key === group);
@@ -1219,6 +1229,7 @@ function tweakPane() {
     geneRows.push(geneRow(spec));
   }
 
+  const sylvan = S.genome.body.race === 'sylvan';
   const presetSel = el('select', {
     title: 'load a worked example — a build the generator can make, to start ' +
            'from rather than to keep',
@@ -1229,12 +1240,14 @@ function tweakPane() {
         return;
       }
       S.genome = mg.presetGenome(e.target.value);
-      S.name = e.target.value === 'human' ? 'newcomer' : e.target.value;
+      S.name = e.target.value === 'human' ? 'newcomer'
+             : e.target.value === 'sylvan' ? 'sprig' : e.target.value;
       setDirty(false);
       render();
     },
   }, el('option', { value: '' }, 'preset…'),
-     mg.PRESET_ORDER.map(k => el('option', { value: k }, k)));
+     (sylvan ? mg.SYLVAN_PRESET_ORDER : mg.PRESET_ORDER)
+       .map(k => el('option', { value: k }, k)));
 
   const both = S.collapsed.pool && S.collapsed.litter;
   return el('div', { class: 'bcol' },
@@ -1253,10 +1266,16 @@ function tweakPane() {
       el('div', { class: 'prev' },
         el('div', { class: 'pcanv' }, big, side),
         el('div', {},
+          el('div', { class: 'brow racerow' },
+            el('span', { title: 'the kind of person: human, or sylvan (a ' +
+                                'wood spirit on the same frame, so every ' +
+                                'armour piece and weapon fits both)' }, 'race'),
+            raceToggle()),
           el('div', { class: 'brow' },
             el('input', { value: S.name, size: 12, placeholder: 'name',
-                          title: 'the filename this saves as: ' +
-                                 'assets/mobs/human/<name>.vox and .json. Lowercase ' +
+                          title: 'the filename this saves as: assets/mobs/' +
+                                 mg.raceFolder(S.genome) +
+                                 '/<name>.vox and .json. Lowercase ' +
                                  'letters, digits and underscores.',
                           oninput: e => { S.name = e.target.value; } }),
             presetSel),
@@ -1265,10 +1284,34 @@ function tweakPane() {
                                 'typical difference between the sexes; drag ' +
                                 'them afterwards as you like' }, 'sex'),
             sexToggle()),
+          sylvan ? el('div', { class: 'brow' },
+            el('span', { title: 'a starting face: every sylvan face setting ' +
+                                'further down at once' }, 'face'),
+            listStyleControl('sf', mg.SYLVAN_FACES, S.genome.sylvan.face,
+                             pickSylvanFace)) : null,
+          sylvan ? el('div', { class: 'brow' },
+            el('span', { title: 'a starting crown: the leaves, branches and ' +
+                                'flowers further down, and the leaf hair ' +
+                                'under them' }, 'crown'),
+            listStyleControl('sc', mg.SYLVAN_CROWNS, S.genome.sylvan.crown,
+                             pickSylvanCrown)) : null,
+          sylvan ? el('div', { class: 'brow' },
+            el('span', { title: 'stock eye glows. The eye swatch further ' +
+                                'down takes any colour -- the glow is the ' +
+                                'eye colour.' }, 'eye glow'),
+            glowControl()) : null,
+          sylvan ? el('div', { class: 'brow' },
+            el('span', { title: 'the wood growing out of the head, the ' +
+                                'shoulders and the back -- independent of ' +
+                                'the crown' }, 'branches'),
+            listStyleControl('sb', mg.SYLVAN_BRANCHES,
+                             S.genome.sylvan.branchStyle, pickSylvanBranches))
+            : null,
           el('div', { class: 'brow' },
             el('span', { title: 'a starting point for every hair setting ' +
                                 'further down; drag them afterwards and you ' +
-                                'are off the preset, which is fine' }, 'hair'),
+                                'are off the preset, which is fine' },
+               sylvan ? 'leaf hair' : 'hair'),
             hairStyleControl()),
           el('div', { class: 'brow' },
             el('span', { title: 'a starting point for every facial-hair ' +
@@ -1278,7 +1321,8 @@ function tweakPane() {
           el('div', { class: 'brow' },
             el('span', { title: 'stock hair colours, darkest to lightest. ' +
                                 'The hair swatch further down still takes ' +
-                                'any colour.' }, 'hair colour'),
+                                'any colour.' },
+               sylvan ? 'leaf colour' : 'hair colour'),
             hairColorControl(),
             el('button', {
               title: 'picks a complexion, a hair colour and a cloth colour ' +
@@ -1293,7 +1337,8 @@ function tweakPane() {
             }, 'roll colours')),
           el('div', { class: 'bstats' }, statLines(b)),
           el('div', { class: 'brow' },
-            el('button', { title: 'writes assets/mobs/human/<name>.vox and .json, ' +
+            el('button', { title: 'writes assets/mobs/' + mg.raceFolder(S.genome) +
+                                  '/<name>.vox and .json, ' +
                                   'with the anatomy baked in — a finished ' +
                                   'character the game will spawn as it is',
                            onclick: saveCharacter },
@@ -1312,6 +1357,107 @@ function tweakPane() {
                'un-pin all')),
           variantRow())),
       el('div', { class: 'genes' }, geneRows)));
+}
+
+// ---- race: two buttons, one lit ------------------------------------------------
+//
+// mg.applyRace, not gset, for applySex's reason: a switch MOVES the build (a
+// sylvan is slighter) and dresses the body in the race's colours, face and
+// crown, and switching back undoes the build move exactly.
+function raceToggle() {
+  const cur = S.genome.body.race === 'sylvan' ? 'sylvan' : 'human';
+  const btn = race => el('button', {
+    class: 'sexbtn racebtn' + (cur === race ? ' on' : ''),
+    title: race === cur ? 'this character is ' + race
+      : race === 'sylvan'
+        ? 'become a sylvan: bark over sapwood, roots round the limbs, a ' +
+          'crown of leaves, glowing eyes. Same limbs and proportions, so ' +
+          'armour and weapons still fit.'
+        : 'become a human again: skin, a stock complexion and a plain ' +
+          'hairstyle; the build moves back by exactly what it moved',
+    onclick: () => {
+      if (race === cur) return;
+      mg.applyRace(S.genome, race, S.locks);
+      if (S.name === 'newcomer' && race === 'sylvan') S.name = 'sprig';
+      else if (S.name === 'sprig' && race === 'human') S.name = 'newcomer';
+      setDirty(true);
+      render();
+    },
+  }, race);
+  return el('span', { class: 'sexctl' }, btn('human'), btn('sylvan'));
+}
+
+/** A dropdown + step slider over a named list, the hairstyle control's shape,
+ *  for the sylvan face and crown. `cls` prefixes the classes the pickers
+ *  sync through. */
+function listStyleControl(cls, order, cur, pick) {
+  const i = Math.max(0, order.indexOf(cur));
+  return el('span', { class: 'hsctl' },
+    el('select', { class: cls + '-sel', onchange: e => pick(e.target.value) },
+       order.map(k => el('option', { value: k, selected: cur === k }, k))),
+    el('input', { type: 'range', class: cls + '-rng', min: 0,
+                  max: order.length - 1, step: 1, value: i,
+                  oninput: e => pick(order[Number(e.target.value)]) }),
+    el('span', { class: cls + '-name gv' }, (i + 1) + '/' + order.length));
+}
+
+function syncListControl(cls, order, v) {
+  const i = order.indexOf(v);
+  root.querySelectorAll('.' + cls + '-sel').forEach(e => { e.value = v; });
+  root.querySelectorAll('.' + cls + '-rng').forEach(e => { e.value = String(i); });
+  root.querySelectorAll('.' + cls + '-name').forEach(e => {
+    e.textContent = (i + 1) + '/' + order.length; });
+}
+
+function pickSylvanFace(style) {
+  mg.applyFace(S.genome, style);
+  setDirty(true);
+  syncListControl('sf', mg.SYLVAN_FACES, style);
+  syncRows(p => p.startsWith('sylvan.'));
+  renderPreviewOnly();
+}
+
+function pickSylvanBranches(style) {
+  mg.applyBranches(S.genome, style);
+  setDirty(true);
+  syncListControl('sb', mg.SYLVAN_BRANCHES, style);
+  syncRows(p => p.startsWith('sylvan.'));
+  renderPreviewOnly();
+}
+
+function pickSylvanCrown(style) {
+  mg.applyCrown(S.genome, style);
+  setDirty(true);
+  syncListControl('sc', mg.SYLVAN_CROWNS, style);
+  // The crown sets the leaf hair under it too.
+  const hs = S.genome.hair.style;
+  root.querySelectorAll('.hs-sel').forEach(e => { e.value = hs; });
+  root.querySelectorAll('.hs-rng').forEach(e => {
+    e.value = String(mg.HAIR_STYLE_ORDER.indexOf(hs)); });
+  syncRows(p => p.startsWith('sylvan.') || p.startsWith('hair.'));
+  renderPreviewOnly();
+}
+
+/** A sylvan's eye glow as a row of stock swatches (mg.SYLVAN_GLOWS). One
+ *  click sets `colors.eye`; the lit one is the colour the eyes have now. */
+function glowControl() {
+  const cur = String(S.genome.colors.eye).toLowerCase();
+  const name = (Object.entries(mg.SYLVAN_GLOWS).find(([, h]) => h === cur) ||
+                ['custom'])[0];
+  return el('span', { class: 'glowctl' },
+    Object.entries(mg.SYLVAN_GLOWS).map(([k, hex]) => el('button', {
+      class: 'glowsw' + (hex === cur ? ' on' : ''), title: k,
+      style: 'background:' + hex,
+      onclick: () => {
+        gset('colors.eye', hex);
+        root.querySelectorAll('.glowsw').forEach(b => {
+          b.classList.toggle('on', b.title === k); });
+        root.querySelectorAll('.glow-name').forEach(e => { e.textContent = k; });
+        syncRows(p => p === 'colors.eye');
+        renderPreviewOnly();
+      },
+    })),
+    el('span', { class: 'glow-name gv', style: 'text-align:left' }, name));
 }
 
 // ---- sex: two buttons, one lit -------------------------------------------------
@@ -1413,10 +1559,15 @@ function beardStyleControl() {
     el('span', { class: 'bs-name gv' }, (i + 1) + '/' + order.length));
 }
 
+/** The stock list the hair stepper walks: hair colours, or on a sylvan, leaf
+ *  colours. */
+const stockList = () => S.genome.body.race === 'sylvan' ? mg.LEAF_STOCK
+                                                        : mg.HAIR_STOCK;
+
 /** The stock entry whose colours the genome holds exactly, or -1 (custom). */
 function stockIndex() {
   const c = S.genome.colors;
-  return mg.HAIR_STOCK.findIndex(([, v]) => v.hair === c.hair &&
+  return stockList().findIndex(([, v]) => v.hair === c.hair &&
                                             v.hairShade === c.hairShade);
 }
 
@@ -1425,7 +1576,7 @@ function stockIndex() {
 function nearestStock() {
   const n = parseInt(S.genome.colors.hair.slice(1), 16);
   let best = 0, bd = Infinity;
-  mg.HAIR_STOCK.forEach(([, v], i) => {
+  stockList().forEach(([, v], i) => {
     const m = parseInt(v.hair.slice(1), 16);
     const d = [16, 8, 0].reduce((s, sh) =>
       s + (((n >> sh) & 255) - ((m >> sh) & 255)) ** 2, 0);
@@ -1436,7 +1587,7 @@ function nearestStock() {
 
 function syncHairColor() {
   const i = stockIndex();
-  const name = i >= 0 ? mg.HAIR_STOCK[i][0] : 'custom';
+  const name = i >= 0 ? stockList()[i][0] : 'custom';
   root.querySelectorAll('.hc-rng').forEach(e => {
     e.value = String(i >= 0 ? i : nearestStock()); });
   root.querySelectorAll('.hc-name').forEach(e => { e.textContent = name; });
@@ -1446,14 +1597,15 @@ function syncHairColor() {
 
 function hairColorControl() {
   const i = stockIndex();
+  const list = stockList();
   return el('span', { class: 'hcctl' },
     el('input', { type: 'range', class: 'hc-rng', min: 0,
-                  max: mg.HAIR_STOCK.length - 1, step: 1,
+                  max: list.length - 1, step: 1,
                   value: i >= 0 ? i : nearestStock(),
-                  title: 'stock hair colours, darkest to lightest: ' +
-                         mg.HAIR_STOCK.map(([k]) => k).join(', '),
+                  title: 'stock colours, darkest to lightest: ' +
+                         list.map(([k]) => k).join(', '),
                   oninput: e => {
-                    const [, v] = mg.HAIR_STOCK[Number(e.target.value)];
+                    const [, v] = list[Number(e.target.value)];
                     // Base and shade together, as a stock pair: the shade is
                     // hand-matched per colour, which a carry cannot improve on.
                     gset('colors.hair', v.hair);
@@ -1465,13 +1617,13 @@ function hairColorControl() {
                   } }),
     el('span', { class: 'hcsw', style: 'background:' + S.genome.colors.hair }),
     el('span', { class: 'hc-name gv', style: 'text-align:left' },
-       i >= 0 ? mg.HAIR_STOCK[i][0] : 'custom'));
+       i >= 0 ? list[i][0] : 'custom'));
 }
 
 /** The stock-colour stepper as a gene-list row, above the hair swatch. Not a
  *  gene: it writes two genes, and there is nothing of its own to pin. */
 function hairStockRow() {
-  const hint = 'Steps through ' + mg.HAIR_STOCK.length + ' stock hair ' +
+  const hint = 'Steps through ' + stockList().length + ' stock ' +
                'colours, darkest to lightest, setting the hair and its shade ' +
                'together. The swatches below still take any colour.';
   return el('div', { class: 'grow', title: hint },
@@ -1553,6 +1705,14 @@ function geneRow(spec) {
       input.checked = !!mg.getPath(S.genome, spec.path); });
   } else if (spec.path === 'body.sex') {
     input = sexToggle();
+  } else if (spec.path === 'body.race') {
+    input = raceToggle();
+  } else if (spec.path === 'sylvan.face') {
+    input = listStyleControl('sf', mg.SYLVAN_FACES, v, pickSylvanFace);
+  } else if (spec.path === 'sylvan.crown') {
+    input = listStyleControl('sc', mg.SYLVAN_CROWNS, v, pickSylvanCrown);
+  } else if (spec.path === 'sylvan.branchStyle') {
+    input = listStyleControl('sb', mg.SYLVAN_BRANCHES, v, pickSylvanBranches);
   } else if (spec.path === 'hair.style') {
     // The dropdown AND a slider that steps through every style, the same
     // control as the one under the preview (the two stay in step).
@@ -1599,18 +1759,20 @@ function geneRow(spec) {
   // slider (see .ghint in the CSS). Both, not either: the column is what you
   // read while dragging, the tooltip is the whole sentence when the column
   // had to clamp it.
-  const label = el('span', { class: 'gl' }, spec.label,
+  // A sylvan's colour rows say what they colour on a sylvan: bark, leaves.
+  const txt = mg.specText(spec, S.genome);
+  const label = el('span', { class: 'gl' }, txt.label,
                    spec.unit ? el('span', { class: 'gu' }, ' ' + spec.unit)
                              : null,
                    spec.tone ? el('span', { class: 'gu' }, ' ↳') : null);
   // A TONE ROW carries the extra sentence, because "why did this move when I
   // rolled" is the question it would otherwise leave you with.
   const hint = spec.tone
-    ? spec.hint + ' Rolls move it with the ' + spec.tone +
+    ? txt.hint + ' Rolls move it with the ' + spec.tone +
       ' above, keeping whatever relationship you leave it at — so the back ' +
       'of a figure is never a different colour from its front. Pin it to ' +
       'hold it still.'
-    : spec.hint;
+    : txt.hint;
   const row = el('div', { class: 'grow' + (locked ? ' locked' : '') +
                                  (spec.tone ? ' tone' : ''),
                           title: hint ? hint + '\n\n(' + spec.path + ')'

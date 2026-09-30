@@ -55,7 +55,7 @@ const rel = p => path.relative(ROOT, path.resolve(ROOT, p)).split(path.sep).join
 // its code inputs come from the import closure, not from here.
 const TESTS = [
   { name: 'mobgen', script: 'scripts/test_mobgen.mjs',
-    reads: ['assets/mobs/', 'assets/anims/', 'assets/materials/', 'src/game/avatar.cpp',
+    reads: ['assets/mobs/', 'assets/anims/', 'assets/materials/', 'src/game/pose.cpp',
             'build/sidecar_resolved.json'] },
   { name: 'anatomy', script: 'scripts/test_anatomy.mjs',
     reads: ['assets/mobs/', 'assets/materials/'] },

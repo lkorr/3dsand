@@ -153,6 +153,9 @@ static void ParseStain(const json& m, const std::string& path,
                        std::string& errors) {
   if (!m.contains("stain")) return;
   const json& s = m["stain"];
+  // `"stain": false` is a liquid opting OUT of the default body coat
+  // (DefaultLiquidStain); it stains nothing, exactly as an absent block used to.
+  if (s.is_boolean() && !s.get<bool>()) return;
   if (!s.is_object()) {
     errors += path + ": material \"" + d.name + "\": \"stain\" must be an object\n";
     return;
@@ -426,6 +429,59 @@ static void ParseAbsorb(const json& m, const std::string& path, MaterialDef& d,
   d.absorbCapacity = (uint32_t)capacity;
   d.gpu.stainPack = (d.gpu.stainPack & ~(kStainPackAbsorbMask << kStainPackAbsorbShift)) |
                     ((uint32_t)capacity << kStainPackAbsorbShift);
+}
+
+// ---- EVERY LIQUID COATS A BODY (2026-09-29) ---------------------------------
+//
+// A body coat exists only for a material with a stain slot, and every writer
+// (contact in StainOneLimb, the pour brush, splashes) refuses one without --
+// so a liquid nobody wrote a "stain" block for (syrup, slime, quicksilver, the
+// potions: 19 of 24 liquids when this landed) could be walked through or poured
+// on someone and leave nothing, and had no colour to draw if it had. This gives
+// such a liquid the table's DEFAULT coat instead, built as ordinary JSON and fed
+// through the same ParseStain / ParseCoat as an authored one, so there is one
+// parser and one set of range checks:
+//   * the stain is `bodyOnly`: the ground's seven slots are all spent (lava/oil
+//     note in DESIGN.md), and a bodyOnly slot has no GPU type bits, so no kernel
+//     sees it and the world hash cannot move;
+//   * its colour is the liquid's OWN base colour (color0), not the darker
+//     color1 an authored block defaults to -- syrup on an arm should read as
+//     syrup, and the coat `opacity` (0.5 by default) is what makes it a film;
+//   * the coat numbers come from materials.json `liquidStainDefault.coat`
+//     (built-in fallback below), and any key the material's own "coat" block
+//     authors wins, so a liquid can tune one number without owning the stain.
+// `"stain": false` opts a liquid out. Hot and corrosive liquids pick up the
+// hot/corrosive coat behaviour the same way lava and acid do (mob.cpp
+// matCorrodes_, from their rules and tags) -- which is why the default decays.
+static bool DefaultLiquidStain(const json& table, const json& m, const MaterialDef& d,
+                               json& out) {
+  if (d.gpu.klass != CLASS_LIQUID || m.contains("stain")) return false;
+  static const json kBuiltIn = {
+      {"stain", {{"amount", 5}}},
+      {"coat", {{"opacity", 0.5}, {"decay", 6.0}, {"contact", 60}}}};
+  const json& def = table.contains("liquidStainDefault") &&
+                            table["liquidStainDefault"].is_object()
+                        ? table["liquidStainDefault"]
+                        : kBuiltIn;
+  out = m;
+  json stain = def.value("stain", json::object());
+  if (!stain.is_object()) stain = json::object();
+  stain.erase("//");
+  stain["type"] = d.name;
+  stain["bodyOnly"] = true;
+  char hex[8];
+  const uint32_t c = d.gpu.color0;  // 0xAABBGGRR (ParseColor)
+  std::snprintf(hex, sizeof hex, "#%02x%02x%02x", c & 0xFFu, (c >> 8) & 0xFFu,
+                (c >> 16) & 0xFFu);
+  if (!stain.contains("color")) stain["color"] = hex;
+  out["stain"] = stain;
+  json coat = def.value("coat", json::object());
+  if (!coat.is_object()) coat = json::object();
+  coat.erase("//");
+  if (m.contains("coat") && m["coat"].is_object())
+    for (auto& [k, v] : m["coat"].items()) coat[k] = v;
+  out["coat"] = coat;
+  return true;
 }
 
 static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>& mats,
@@ -729,6 +785,8 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.rotRate > 1.0f) d.rotRate = 1.0f;
     d.bareBlood = std::clamp(m.value("bareBlood", 0.0f), 0.0f, 1.0f);
     if (!(d.bareBlood == d.bareBlood)) d.bareBlood = 0.0f;   // NaN
+    d.bleed = std::clamp(m.value("bleed", 1.0f), 0.0f, 4.0f);
+    if (!(d.bleed == d.bleed)) d.bleed = 1.0f;               // NaN
     // 0 intact / 1 half / 2 whole (materials.h burnStage). Clamped, like the
     // weights above: a silly number should misbehave visibly, not refuse.
     d.burnStage = (uint8_t)std::clamp(m.value("burnStage", 0), 0, 2);
@@ -755,8 +813,13 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       for (auto& [slot, name] : m["sounds"].items())
         if (name.is_string() && !name.get<std::string>().empty())
           d.sounds[slot] = name.get<std::string>();
-    ParseStain(m, path, stainReg, d, errors);
-    ParseCoat(m, path, d, errors);  // after ParseStain: it checks d.stain
+    {
+      json withDefault;  // a liquid with no stain block: DefaultLiquidStain
+      d.stainAuto = DefaultLiquidStain(j, m, d, withDefault);
+      const json& sm = d.stainAuto ? withDefault : m;
+      ParseStain(sm, path, stainReg, d, errors);
+      ParseCoat(sm, path, d, errors);  // after ParseStain: it checks d.stain
+    }
     ParseAbsorb(m, path, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {

@@ -892,6 +892,8 @@ const char* const kOrder[] = {
     // and resets mobs and debris on every exit, and each restores the id
     // counter (mob ids seed gore variance).
     "impact-blunt", "impact-armor", "impact-fist", "bite-rot", "bite-infect",
+    // ...and how much a wound bleeds by what it opened: wood a fifth of flesh.
+    "wood-bleed",
     // ...and the structural consequence the rot had none of until 2026-09-19:
     // a limb whose ATTACHMENT has been eaten comes off, whatever ate it.
     "joint-rot",
@@ -921,6 +923,9 @@ const char* const kOrder[] = {
     // ...and a HOT coat (lava) sets the limb alight and eats it, a FUEL coat
     // (oil) is inert until heat reaches it and then flashes. Pose ticks only.
     "lava-oil-coat",
+    // ...and EVERY liquid coats a body, syrup by hand and walked through
+    // (DefaultLiquidStain). Ticks the world; regenerated on the way out.
+    "liquid-coats",
     // ...and a HEALING coat (enchanted blood / water, alchemy package D)
     // rebuilds a carved, cut and cooked limb toward its recipe, paid for out
     // of the coat and no further. Pose ticks; resets mobs on the way out.

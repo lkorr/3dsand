@@ -472,46 +472,90 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   std::vector<Ranked>& wideRanked = wideRanked_;
   uint32_t extraShift = 0;
   for (;; extraShift++) {
-    // Reused, not rebuilt: clear() keeps the bucket array, so a steady fire
-    // field costs no allocation per build. The output is sorted by a total
-    // order (RankLess) below, so the map's iteration order never reaches it.
-    std::unordered_map<Key, WideAgg, KeyHash>& wide = wide_;
-    wide.clear();
-    for (const Cand& c : cand) {
-      const uint32_t w = (255u - c.wFine) * c.outer / 255u;
-      if (w == 0) continue;
-      const Key k{(c.e.x - wov.x) >> (kGasFarOuterShift + extraShift),
-                  (c.e.y - wov.y) >> (kGasFarOuterShiftY + extraShift),
-                  (c.e.z - wov.z) >> (kGasFarOuterShift + extraShift)};
-      auto it = wide.find(k);
-      if (it == wide.end()) {
-        wide.emplace(k, WideAgg{c.e, (uint64_t)c.e.strength * w});
-      } else {
-        // Saturating at the 24 bits the record's strength field has; a
-        // hillside could in principle overflow one.
-        it->second.e.strength = (uint32_t)std::min<uint64_t>(
-            (uint64_t)it->second.e.strength + c.e.strength,
-            (uint64_t)kGasFarEmitStrengthMask);
-        it->second.sw += (uint64_t)c.e.strength * w;
-        if (c.e.y > it->second.e.y) {
-          it->second.e.y = c.e.y;
-          it->second.e.x = c.e.x;
-          it->second.e.z = c.e.z;
-        }
-      }
-    }
+    // ---- CLUSTERS, NOT GRID CELLS (2026-09-29) ----------------------------
+    // Owner report: a burning house gave next to no distant smoke while a tree
+    // beside it billowed. Same fire, different SPREAD: a roof is thin per
+    // column and spans many chunks, a crown is dense in a few. A fixed grid
+    // cut the house into many faint records (each under the renderer's
+    // erosion threshold, GAS_CORE_COUNT_WIDE) and could split even a compact
+    // fire across a cell edge. The rule now: fire within kClusterVox of a
+    // cluster's SEED is one plume, so 1000 burning voxels over five chunks
+    // draw what 1000 in one chunk draw.
+    //
+    // Greedy, strongest first: the strongest unclaimed emitter seeds a
+    // cluster and claims every unclaimed emitter within the radius of IT (max
+    // norm). No chaining -- a cluster's diameter is bounded by 2x the radius,
+    // so a forest fire does not collapse into one record standing somewhere
+    // none of its trees is (round seven's "cloud from nowhere"). Ranked by raw
+    // strength and position, never by the eye-dependent weight, so walking
+    // does not reshuffle clusters and make plumes hop.
+    //
+    // The record stands at the strength-weighted CENTROID in x/z and the
+    // topmost member's y (smoke leaves the top of the fire). The radius
+    // doubles with extraShift, the same overflow ladder the grid had.
+    constexpr int32_t kClusterVox = 64;   // 6.4 m: a house, a stand of trees
+    const int32_t rad = kClusterVox << extraShift;
+    std::vector<uint32_t> order;
+    order.reserve(cand.size());
+    for (uint32_t i = 0; i < (uint32_t)cand.size(); i++)
+      if ((255u - cand[i].wFine) * cand[i].outer / 255u != 0) order.push_back(i);
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+      const Emitter& ea = cand[a].e;
+      const Emitter& eb = cand[b].e;
+      if (ea.strength != eb.strength) return ea.strength > eb.strength;
+      if (ea.x != eb.x) return ea.x < eb.x;
+      if (ea.y != eb.y) return ea.y < eb.y;
+      return ea.z < eb.z;
+    });
+    // Spatial hash at the radius, so a seed only visits the 27 cells round it.
+    auto cellOf = [&](const Emitter& e) {
+      auto fl = [&](int32_t v) { return v >= 0 ? v / rad : -((-v + rad - 1) / rad); };
+      return Key{fl(e.x), fl(e.y), fl(e.z)};
+    };
+    std::unordered_map<Key, std::vector<uint32_t>, KeyHash> grid;
+    for (uint32_t oi = 0; oi < (uint32_t)order.size(); oi++)
+      grid[cellOf(cand[order[oi]].e)].push_back(oi);
+    std::vector<uint8_t> taken(order.size(), 0);
     wideRanked.clear();
-    wideRanked.reserve(wide.size());
-    for (const auto& kv : wide) {
-      const Emitter& e = kv.second.e;
-      const int dx = e.x - cx, dy = e.y - cy, dz = e.z - cz;
-      // Strength-weighted mean of the columns' weights; the strength itself is
-      // saturating, so divide the weighted sum by the UNSATURATED total for the
-      // mean to stay a mean.
-      const uint32_t w8 = e.strength ? (uint32_t)std::min<uint64_t>(
-                                           kv.second.sw / e.strength, 255) : 255;
+    for (uint32_t oi = 0; oi < (uint32_t)order.size(); oi++) {
+      if (taken[oi]) continue;
+      const Emitter seed = cand[order[oi]].e;
+      const Key sc = cellOf(seed);
+      uint64_t str = 0, sw = 0;
+      int64_t sx = 0, sz = 0;
+      int32_t topY = seed.y;
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++) {
+            auto it = grid.find(Key{sc.x + dx, sc.y + dy, sc.z + dz});
+            if (it == grid.end()) continue;
+            for (uint32_t mj : it->second) {
+              if (taken[mj]) continue;
+              const Cand& c = cand[order[mj]];
+              if (std::abs(c.e.x - seed.x) > rad || std::abs(c.e.y - seed.y) > rad ||
+                  std::abs(c.e.z - seed.z) > rad)
+                continue;
+              taken[mj] = 1;
+              const uint32_t w = (255u - c.wFine) * c.outer / 255u;
+              str += c.e.strength;
+              sw += (uint64_t)c.e.strength * w;
+              sx += (int64_t)c.e.x * c.e.strength;
+              sz += (int64_t)c.e.z * c.e.strength;
+              topY = std::max(topY, c.e.y);
+            }
+          }
+      Emitter e;
+      e.x = str ? (int32_t)(sx / (int64_t)str) : seed.x;
+      e.z = str ? (int32_t)(sz / (int64_t)str) : seed.z;
+      e.y = topY;
+      // Saturating at the 24 bits the record's strength field has.
+      e.strength = (uint32_t)std::min<uint64_t>(str, (uint64_t)kGasFarEmitStrengthMask);
+      const int ddx = e.x - cx, ddy = e.y - cy, ddz = e.z - cz;
+      // Strength-weighted mean of the members' weights, over the UNSATURATED
+      // total so it stays a mean.
+      const uint32_t w8 = str ? (uint32_t)std::min<uint64_t>(sw / str, 255) : 255;
       wideRanked.push_back(
-          {(int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz, e, w8});
+          {(int64_t)ddx * ddx + (int64_t)ddy * ddy + (int64_t)ddz * ddz, e, w8});
     }
     // TWO DOUBLINGS AND NO MORE, which is a correctness bound and not a
     // budget. Merging buckets CONCENTRATES MASS AT ONE POSITION: an aggregate
@@ -520,8 +564,8 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     // fire" (hMul = sqrt(cols)). Coarsen without limit and a scatter of small
     // fires over a wide area collapses into one record that draws a four-times
     // -height column somewhere none of them is -- "billowing clouds from a
-    // place with no fire" by a second route. At x4 the bucket is 25.6 m, which
-    // is a genuinely local cluster. Past that CapAndSort truncates as it always
+    // place with no fire" by a second route. At x4 the cluster radius is 25.6 m
+    // (a village). Past that CapAndSort truncates as it always
     // did, and the cap report below says which bound bit.
     if (wideRanked.size() <= kGasFarEmitMaxWide || extraShift >= 2u)
       break;

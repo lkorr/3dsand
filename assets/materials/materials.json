@@ -1,5 +1,10 @@
 {
-  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here — append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune. fluid: what a voxel of this does INSIDE a liquid - {lift, drag, wander}, each 0-15, absent means derived from class and density. Buoyancy is exact from density (a rock sinks in a pond, a plank washes about on top of it), so lift is a STRENGTH and never a direction; lift 0 is the way out - liquids do not touch this material and a voxel in flight stops dead at the surface, which is what everything did before the block existed. drag is per-tick damping in sixteenths of speed; wander is the sideways drift of something already floating, in 1/256 voxel per tick.",
+  "comment": "Order defines the 12-bit GPU material ID; id 0 is always air (implicit). class: solid|powder|liquid|gas. density drives displacement (air=10). emission: 0-255 glow. moveEvery: viscosity (move only every Nth tick). wanders: critter scuttle. opaque: liquid renders as a surface, not translucent media. passable: bodies (player, mobs, spell projectiles) move straight through this solid - soft vegetation like reeds and kelp; it stays a normal solid for the CA, fire, the brush and the renderer, so it is still destructible. colors: 3 palette variants picked by the voxel state nibble. Tags feed reactions.json (tag:xxx matchers). Worldgen (worldgen.wgsl + world.cpp) and world.h assume the ID order of everything listed here — append new materials at the end, never reorder. hardness: 0-255 blast/dig resistance (class defaults: solid 60, powder 12, liquid 4, gas 0; 255 on sources/void = practically indestructible). molten: what the laser/heat melt brush (mode 2) converts this material into; absent = vaporized to air; 255-hardness matter is immune. fluid: what a voxel of this does INSIDE a liquid - {lift, drag, wander}, each 0-15, absent means derived from class and density. Buoyancy is exact from density (a rock sinks in a pond, a plank washes about on top of it), so lift is a STRENGTH and never a direction; lift 0 is the way out - liquids do not touch this material and a voxel in flight stops dead at the surface, which is what everything did before the block existed. drag is per-tick damping in sixteenths of speed; wander is the sideways drift of something already floating, in 1/256 voxel per tick. bleed: how much a WOUND in this matter bleeds, a multiplier on the body's bleed.perDamage taken from the matter the blow opened (default 1 = flesh; wood, bark, leaves and crystal 0.2, so a wood spirit bleeds a fifth of its sap and a limb turned to wood a fifth of its blood). CPU-only.",
+  "liquidStainDefault": {
+    "//": "EVERY LIQUID COATS A BODY. A liquid with no \"stain\" block gets this one (materials.cpp DefaultLiquidStain): a bodyOnly stain (never on the ground; the seven ground slots are spent) drawn in the liquid's own base colour (colors[0]) at coat.opacity, so syrup on an arm reads as a half-see-through film of syrup. Any key the liquid's own \"coat\" block authors wins over these. \"stain\": false opts a liquid out. decay is seconds per level (amount 5 -> gone in ~30 s); contact is per-mille per exposed voxel per tick while standing in it.",
+    "stain": { "amount": 5 },
+    "coat": { "opacity": 0.5, "decay": 6, "contact": 60 }
+  },
   "materials": [
     {
       "id": "stone",
@@ -22,6 +27,7 @@
     },
     {
       "id": "wood",
+      "bleed": 0.2,
       "arcane": 2,
       "sounds": {
         "break": "branch"
@@ -677,6 +683,7 @@
     },
     {
       "id": "leaves",
+      "bleed": 0.2,
       "footstep": "leaf",
       "class": "solid",
       "density": 320,
@@ -717,6 +724,7 @@
     },
     {
       "id": "autumn_leaves",
+      "bleed": 0.2,
       "footstep": "leaf",
       "class": "solid",
       "density": 320,
@@ -737,6 +745,7 @@
     },
     {
       "id": "birch_wood",
+      "bleed": 0.2,
       "sounds": {
         "break": "branch"
       },
@@ -986,6 +995,7 @@
     },
     {
       "id": "leaf_green",
+      "bleed": 0.2,
       "footstep": "leaf",
       "class": "solid",
       "density": 300,
@@ -1181,6 +1191,7 @@
     },
     {
       "id": "staff_wood",
+      "bleed": 0.2,
       "sounds": {
         "break": "branch"
       },
@@ -1212,6 +1223,7 @@
     },
     {
       "id": "gem_arcane",
+      "bleed": 0.2,
       "class": "solid",
       "density": 2600,
       "hardness": 90,
@@ -2334,6 +2346,7 @@
     {
       "//": "A tree seedling waiting for a light gap. Deliberately RARE in worldgen: unlike everything else in this layer a sapling is a recognisable tree, so the eye finds it, and one every few metres reads as a nursery rather than a forest. It is also the entry that must never gain a growth reaction -- a sapling that grew into a tree is precisely the reaction-driven growth rule 2 forbids, and the one material here where that would be a tempting idea.",
       "id": "sapling",
+      "bleed": 0.2,
       "passable": true,
       "footstep": "branch",
       "class": "solid",
@@ -2652,6 +2665,7 @@
     {
       "//": "TREE SHADE RAMPS (assets/editor/treegen.js). Each foliage and bark family is a THREE-material ramp -- dark, the plain material the rest of the game already knows, and lit -- and the tree voxelizer picks between them offline from a baked normal (part clump-sphere, part whole-canopy) plus depth into the clump. That is the entire Rundlett canopy trick, and it costs the renderer nothing: by the time a voxel exists its shade is already a material id. The three colours inside each material stay what they are everywhere else, per-cell palette jitter on the state nibble, so a crown has texture as well as form. Every one of these is INERT and carries exactly id 34's tag row, so fire, dissolve and the foliage rules treat a dark leaf as a leaf.",
       "id": "leaves_dark",
+      "bleed": 0.2,
       "footstep": "leaf",
       "class": "solid",
       "density": 320,
@@ -2672,6 +2686,7 @@
     },
     {
       "id": "leaves_lit",
+      "bleed": 0.2,
       "footstep": "leaf",
       "class": "solid",
       "density": 320,
@@ -2773,6 +2788,7 @@
     {
       "//": "Bark ramp. Same three-tier idea on the wood side: a bole with a shaded and a lit face reads as a cylinder, where one flat brown reads as a column of paint.",
       "id": "bark_dark",
+      "bleed": 0.2,
       "sounds": {
         "break": "branch"
       },
@@ -2794,6 +2810,7 @@
     },
     {
       "id": "bark_light",
+      "bleed": 0.2,
       "sounds": {
         "break": "branch"
       },
@@ -2931,6 +2948,7 @@
     {
       "//": "THE ONLY LIGHT UNDER THE WORLD THAT IS NOT LAVA. Worldgen has no sun direction and a cave has no sky, so Lin 13.3.4's \"place plants by how open the sky is\" bottoms out down here as \"place what grows in the dark\". caveBands (worldgen.wgsl) gives a deep cavern's floor and ceiling in CLOSED FORM per column, so a seam can be hung off either without a march.\n\nemission 120 is deliberately under lava's 255: a crystal seam should let you SEE the cavern you are standing in, not light it like a furnace, and the magma table at LAVA_LEVEL stays the thing that reads as heat. Placement keeps a margin above that level so a seam never grows into the lava it is lighting.\n\nINERT, and that is load-bearing (CLAUDE.md rule 2): no reaction names it as `self` or as an emit, it is not flammable and it does not melt, so a cavern full of it generates AT REST and its chunks sleep on the first tick exactly as the stone around them does.\n\nhardness 6 is above stone's, so a seam survives the blast that opens the rock around it and reads as a vein rather than as coloured gravel.",
       "id": "crystal",
+      "bleed": 0.2,
       "class": "solid",
       "density": 2600,
       "hardness": 6,
@@ -4653,6 +4671,7 @@
     {
       "//": "DOOR_WOOD: the leaf of a door, and ONLY that. A distinct material so a closed door reads as a door (redder and warmer than the frame around it), and so the door system can tell its own leaf cells from the wall they hang in: a door whose leaf box is no longer all door_wood has been burned or broken and stops being a door (PLAN_world_editor 2.4). Burns like plank.",
       "id": "door_wood",
+      "bleed": 0.2,
       "arcane": 2,
       "far": "wood",
       "sounds": {

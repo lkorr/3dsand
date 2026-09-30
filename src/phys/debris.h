@@ -160,6 +160,9 @@ class DebrisSystem {
     Vec3 dir{0, 1, 0};
     float budget = 0.0f;
     int gushTicks = 0;
+    // materials.json `bleed` of the matter at the wound (1 = flesh): scales
+    // the gout. ArmWound measures it; a limb's hand-off carries its own.
+    float scale = 1.0f;
   };
 
   void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
@@ -1899,6 +1902,7 @@ class DebrisSystem {
   std::vector<uint32_t> classOf_;
   std::vector<float> densityOf_;
   std::vector<uint32_t> rubbleOf_;
+  std::vector<float> bleedOf_;   // MaterialDef::bleed (wound bleed weight)
   std::vector<std::string> matNames_;   // id -> name, for authored-by-name coats
   std::vector<uint8_t> foliageOf_;  // tag:foliage — sub-8 floaters vanish, no rubble
   // body burn tables (rebuilt on materials hot-reload; data-driven, no

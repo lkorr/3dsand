@@ -6962,6 +6962,24 @@ sees its coat. `body-coat` now measures 2 seared vs 415 (the parked
 `fireDrySeconds` reaches nothing). `IgniteOneLimb` still refuses a wet voxel
 (a direct write, not a rule).
 
+**Every liquid coats a body (2026-09-29).** Owner report: syrup neither stained a
+character walking through it nor showed when poured on one. It had no `stain`
+block, so no slot: `StainOneLimb`'s contact pass skipped it, and the coat
+`SoakLimb` did write was drawn as clean by the micro renderer's filter
+(`microbody.cpp DrawsCoat`). 19 of 24 liquids were in the same state. A liquid
+with no `stain` block now gets materials.json `liquidStainDefault`
+(`materials.cpp DefaultLiquidStain`, built-in fallback if the key is absent):
+a `bodyOnly` stain named after the material, coloured with its OWN base colour
+(`colors[0]`, not the darker `color1` an authored block defaults to), and the
+default coat (opacity 0.5, decay 6 s/level, contact 60). Keys the liquid's own
+`coat` block authors override the default coat; `"stain": false` opts out.
+Built as JSON and fed through the same `ParseStain`/`ParseCoat`, so there is
+one parser. `bodyOnly` means no GPU type bits: the world hash cannot move.
+Hot or corrosive liquids (molten metals, aqua fortis/regia, lye) and fuels
+(spirits, ether) pick up the hot/corrosive/fuel coat behaviour below from their
+own rules and tags, exactly as lava, acid and oil do -- which is why the
+default decays. Gate `liquid-coats`.
+
 **A coat that EATS: acid on a body (2026-09-23).** Owner report: acid poured
 on a character neither showed nor dissolved anything. Two gaps: acid had no
 `stain` block, so every coat write (pour, splash, contact) refused it; and a
@@ -7758,6 +7776,51 @@ genome. So the vocabulary lives in one table (`ARCHETYPE`) and no builder
 contains the string, which makes a future `quadruped` a second table with its
 own clip set rather than a grep through nine builders.
 
+**RACES ARE SURFACES ON THE ONE ARCHETYPE** (2026-09-29, `assets/editor/sylvan.js`).
+`body.race` is `human` or `sylvan` — a wood spirit (deku, dryad) — and a race
+changes NOTHING a downstream system binds to: the same fifteen limb boxes,
+anchors, sockets, chains, natural weapons, gait and clips (`test_mobgen.mjs` §O
+asserts a sylvan switched from a human has exactly that human's), because every
+helm, cuirass, greave and weapon is fit to those boxes. What a race changes:
+- **materials, by art slot.** A human is one material (`skin`) with colour in the
+  art layer; a sylvan is several, picked per ART SLOT when the .vox is written
+  (`slotMaterialNames`): `bark_light` bark, `bark_dark` roots, `leaves` for every
+  leaf / flower / the wrap, `staff_wood` branches, and `gem_arcane` eyes — the
+  glow is that material's emission, coloured by the eye's art colour. All are
+  existing ids <= 127, so no engine or materials.json change.
+- **the inside.** Its own anatomy recipe: sapwood (`birch_wood`) and heartwood
+  (`wood`) under the bark, a `crystal` heart in the chest and behind the eyes,
+  and none of the surface materials below the surface (anatomy.js rewrites a kept
+  voxel whose material the recipe also puts inside). It bleeds `syrup` (sap).
+- **the surface, inside the box.** `barkPass` runs on the shipped lattice after
+  the shoulder round: grain, knots, moss, roots wound round each limb and
+  standing proud because the bark BESIDE them is carved one cell (never grown),
+  a leaf wrap that frays to bare bark; on the head, sockets with the glow at the
+  bottom, a brow, a carved mouth, a warped skull.
+- **the crown, as hair.** `crownExtras` runs inside `hairMass` (so it is
+  bloodless, severable hair-part geometry): a wreath, leaf clumps, forking
+  branches, flowers, a see-through leaf veil over the face, and a deku pipe
+  mouth as its own `snout` part. Foliage comes in five colours (main, shade and
+  three variants, `leafVariant`: patches or speckle, whole clumps in one).
+- **boughs, on the torso.** Branches out of the shoulders and upper back are
+  their own `bough` parts riding the TORSO on a FIXED joint (they cross the
+  neck line that splits head hair from the sprung mane, so they can be neither),
+  grow through hanging leaf hair, and a piece not face-touching the torso is
+  dropped. Branch genes are their own group with their own presets
+  (`BRANCH_STYLES`), independent of the crown.
+Race-only genes carry `race: 'sylvan'` in GENE_SPECS: hidden on a human's page
+and skipped by a human's mutate / roll / cross WITHOUT a random draw, so every
+seeded human litter is unchanged. `applyRace` moves the build by offsets (like
+`applySex`) and is reversible. A sylvan still `extends: human`; it is FILED in
+`assets/mobs/sylvan/`.
+
+**EVERY HAIR PIECE HAS A COLLIDER.** A limb's collider is the majority fill of
+2x2x2 skin blocks (`phys/lattice.h`), counted in ENGINE axes (the loader's
+`(x, z, -y)`, so from the max corner in scene y); a piece with no block half full
+has an empty collider and `Mob::BuildRig` refuses the whole spawn. A one-cell
+twig or ring (a sylvan branch, a thin braid) is therefore thickened at one spot
+by `hairMass`, and §F asserts it on every rolled body.
+
 **Interactive evolution, and that is the whole algorithm.** A human is the
 fitness function: `mutate(genome, sigma, rng, locks)`, `cross(parents, rng)` and
 `randomGenome(rng)` are a page of code between them, with no scoring, no
@@ -7896,7 +7959,8 @@ red test does not disarm the gate for the others.
 **Verified** by `node scripts/test_mobgen.mjs` (the rig contract against
 `human.json`, genome normalisation, mutate/cross reproducibility and bounds, and ~100 rolled bodies
 each asserted sound: anchors inside their own limbs, the eye row on the face,
-one material ≤ 127, art slots only, and every limb ONE CONNECTED PIECE) and by
+one material ≤ 127 — a sylvan, its five surface materials — art slots only,
+every limb ONE CONNECTED PIECE with a collider) and by
 `bash scripts/check_characters.sh` (the real module in real headless Chrome: the
 tuner wiring, the mount, inked pixels on the painter's canvas, a slider reaching
 the preview, a lock surviving a randomize, and both save routes round-tripping

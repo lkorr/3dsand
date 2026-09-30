@@ -167,6 +167,7 @@ DebrisSystem::BodyWound WoundOf(const MobLimb& l) {
   w.dir = l.gushDir;
   w.budget = l.bleedBudget;
   w.gushTicks = l.gushTicks;
+  w.scale = l.woundScale;
   return w;
 }
 
@@ -2264,6 +2265,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   coatRestore_.clear();
   coatRestoreRate_.clear();
   matBareBlood_.clear();
+  matBleed_.clear();
   coatContact_.clear();
   for (uint32_t& m : matOfStainType_) m = 0;
   ignitedForm_.clear();
@@ -2347,6 +2349,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     coatRestore_.push_back(slot != 0 ? m.coatRestore : 0.0f);
     coatRestoreRate_.push_back(slot != 0 ? m.coatRestoreRate : 0.0f);
     matBareBlood_.push_back(m.bareBlood);
+    matBleed_.push_back(m.bleed);
     coatContact_.push_back(m.coatContact);
   }
   // The coat CLASS the one stain-precedence rule reads (phys/bodystain.h,
@@ -9362,7 +9365,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // droplet count released rather than a rate to be multiplied out.
       float frac = (float)limb.gushTicks / (float)decay;
       int want = (int)std::lround(2.0f * (float)gore_.severSpray * frac /
-                                  (float)decay);
+                                  (float)decay * limb.woundScale);
       // Bodyless fallback goes through bodyFrame(), not origin_ +
       // anchorRoot: origin_.y is the spawn corner, so the raw offset puts
       // the wound at the creature's feet instead of at the joint, and it
@@ -9463,7 +9466,8 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       if (limb.bleedBudget < clumpVox)
         limb.bleedBudget =
             std::min(clumpVox, limb.bleedBudget +
-                                   clumpVox * std::max(0.0f, gore.bleedVoxelGain));
+                                   clumpVox * std::max(0.0f, gore.bleedVoxelGain) *
+                                       limb.woundScale);
     }
 
     // ---- A BLEEDING WOUND STAYS BLOODY (2026-09-26) -------------------------
@@ -11263,10 +11267,14 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // None for it): BleedTick would refuse to drip it anyway, and a budget left
     // standing would read as an open wound to every "is this limb bleeding"
     // query.
+    // WHAT WAS STRUCK DECIDES HOW MUCH IT BLEEDS (materials.json `bleed`):
+    // the nearest live voxel to the hit, so a wooden arm -- or a sylvan --
+    // bleeds a fifth of what flesh would from the same blow.
     if (pol.hitBleed != BleedRate::None)
       limb.bleedBudget = AddBleedBudget(
           limb.bleedBudget,
-          amount * def_->bleedPerDamage * BleedRateScale(pol.hitBleed));
+          amount * def_->bleedPerDamage * BleedRateScale(pol.hitBleed) *
+              BleedWeightOf(ShellMaterialAt((int)i, hitWorldVoxel)));
     // hp reaching zero is a statement about DEATH, and a corpse has had its
     // one: on the dead only the impact exception (a sword knocked out of a
     // dead hand) still takes anything off.
@@ -14513,6 +14521,9 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   Vec3 skinLostSum{};
   float skinLostSq = 0.0f;
   size_t skinLostN = 0;
+  // ...and how much of what was lost BLEEDS (materials.json `bleed`), summed
+  // over the same voxels: the wound bleeds by the mean of the matter it opened.
+  float skinLostBleed = 0.0f;
   // The cells themselves, for a caller that wants to measure FROM the hole.
   // Only when asked: a burning limb carves itself dozens of times a second
   // and has no use for the list.
@@ -14528,6 +14539,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                          skinLostSum += p;
                          skinLostSq += p.dot(p);
                          skinLostN++;
+                         skinLostBleed += BleedWeightOf(v.material & 0xFFFu);
                          if (report) skinLostCells.push_back({v.x, v.y, v.z});
                          return true;
                        }),
@@ -14576,6 +14588,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
             skinLostSum += p;
             skinLostSq += p.dot(p);
             skinLostN++;
+            skinLostBleed += BleedWeightOf(v.material & 0xFFFu);
             if (report) skinLostCells.push_back({v.x, v.y, v.z});
           });
       if (took) skinRemoved = true;
@@ -14814,9 +14827,21 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     // ...and a DENT drips at the same reduced rate the trauma that made it
     // does (Mob::Damage's note): a caved-in face is not an open wound.
     const float bleedScale = BleedRateScale(pol.carveBleed);
+    // The mean `bleed` of the matter that left (1 = flesh; wood 0.2). On the
+    // skin when there is one, else over the collider cells the carve removed;
+    // nothing measured (a loss only the re-derive saw) bleeds as flesh.
+    float matBleed = 1.0f;
+    if (skinLostN) {
+      matBleed = skinLostBleed / (float)skinLostN;
+    } else if (!removed.empty()) {
+      float sum = 0.0f;
+      for (const DebrisVoxel& v : removed) sum += BleedWeightOf(v.payload & 0xFFFu);
+      matBleed = sum / (float)removed.size();
+    }
     limb.bleedBudget =
         AddBleedBudget(limb.bleedBudget,
-                       lost * (float)at0 * def.bleedPerDamage * bleedScale);
+                       lost * (float)at0 * def.bleedPerDamage * bleedScale *
+                           matBleed);
   }
 
   // Carved down past the point of being a limb at all: it comes off. This is
@@ -22107,7 +22132,22 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
         piece.gushDir = RotateInv(cq, olen > 1e-3f ? outW * (1.0f / olen)
                                                     : Vec3{0, 1, 0});
         piece.gushTicks = std::max(piece.gushTicks, gore_.severDecayTicks);
-        piece.bleedBudget = AddBleedBudget(piece.bleedBudget, gt.severStumpBudget);
+        // The piece bleeds as what it is MADE of: the mean `bleed` of its
+        // own voxels (a wooden forearm off a man bleeds as wood).
+        {
+          float sum = 0.0f;
+          size_t n = 0;
+          if (piece.HasFineSkin()) {
+            for (const PrefabVoxel& v : piece.skinVoxels)
+              if (v.material & 0xFFFu) { sum += BleedWeightOf(v.material & 0xFFFu); n++; }
+          } else {
+            for (const DebrisVoxel& v : piece.voxels)
+              if (v.payload & 0xFFFu) { sum += BleedWeightOf(v.payload & 0xFFFu); n++; }
+          }
+          piece.woundScale = n ? sum / (float)n : 1.0f;
+        }
+        piece.bleedBudget = AddBleedBudget(piece.bleedBudget,
+                                           gt.severStumpBudget * piece.woundScale);
         // THE CUT FACE IS BLOODIED, on the piece, before it leaves: the kerf
         // soak in CutLimb runs only when the limb SURVIVES the carve, so a
         // limb that came off (and one severed outright, by hp or by
@@ -22143,8 +22183,12 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
                      Hash3((uint32_t)id_, (uint32_t)k, 0x57B4Fu));
           // The stump's own drip budget, on top of the thrown voxels below:
           // this is the puddle that keeps forming under a fresh amputation.
+          // ...scaled by what the STUMP is made of at the cut (the parent's
+          // voxel nearest the joint): wood a fifth of flesh.
+          parent.woundScale = BleedWeightOf(ShellMaterialAt((int)k, anchorW));
           parent.bleedBudget =
-              AddBleedBudget(parent.bleedBudget, gore.severStumpBudget);
+              AddBleedBudget(parent.bleedBudget,
+                             gore.severStumpBudget * parent.woundScale);
           // ...and it never closes (BleedTick tops it up while
           // gore.stumpBleedsOpen), so the amputation bleeds the creature out.
           parent.stumpOpen = true;
@@ -22183,6 +22227,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
           // voxel counter alone; the mob id keeps it distinct between mobs.
           int nVox = EventVarI(gore_.severVoxels, gore.severVoxelsVar, es,
                                0x5EEDu, 0u);
+          nVox = (int)std::lround((float)nVox * parent.woundScale);
           if (nVox < 0) nVox = 0;
           // Gobbet size SUBDIVIDES the throw: severVoxels stays the total voxel
           // count and `gob` of them share one trajectory, so raising it makes
@@ -27130,6 +27175,11 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
 }
 
 // ---- ONE SHELL RESPONSE (W2-H, game/shellresponse.h) -----------------------
+
+float Mob::BleedWeightOf(uint32_t mat) const {
+  if (sys_ == nullptr || mat == 0 || mat >= sys_->matBleed_.size()) return 1.0f;
+  return sys_->matBleed_[mat];
+}
 
 float Mob::MaterialHardness(uint32_t mat) const {
   if (sys_ == nullptr || mat == 0 || mat >= sys_->matGpu_.size()) return 0.0f;

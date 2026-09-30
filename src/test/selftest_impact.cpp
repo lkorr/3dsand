@@ -2271,6 +2271,171 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
   return Status::Fail;
 }
 
+
+// ---- WOOD BLEEDS A FIFTH (2026-09-29, materials.json `bleed`) ---------------
+//
+// How much a wound bleeds is a property of the MATTER the blow opens, not of
+// the creature: flesh 1, wood / bark / leaves / crystal 0.2. Three arms, the
+// same blade cuts at the same place on a forearm:
+//   A  a human's forearm, as it is (the control);
+//   B  the SAME forearm with every voxel rewritten to `wood` first -- "a human
+//      turned their arm into wood" -- which must bleed about a fifth of A;
+//   C  a sylvan's forearm (a wood spirit: bark over wood, bleeding sap), which
+//      must bleed far less than A too.
+// The ratio ceiling lives in tests/baseline.json (woodBleedMaxRatio).
+float WoodBleedArm(Ctx& c, int defIndex, int limb, bool toWood, int inset,
+                   std::string& why) {
+  MobSystem& mobs = c.mobs;
+  mobs.Reset();
+  c.debris.Reset();
+  const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, inset));
+  if (!id) { why = "spawn refused"; return -1.0f; }
+  mobs.SetMobBehavior(id, "dummy");
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, as SpawnTarget.
+  for (int i = 0; i < 8; i++) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  }
+  if (toWood) {
+    uint32_t wood = 0;
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "wood") wood = (uint32_t)i;
+    for (uint32_t m = 1; m < (uint32_t)c.mats.size(); m++) {
+      if (m == wood) continue;
+      if (mobs.LimbMaterialCount(id, limb, m))
+        mobs.RewriteLimbMaterial(id, limb, m, wood, 1u << 30);
+    }
+    if (mobs.LimbMaterialCount(id, limb, wood) == 0) {
+      why = "the forearm did not turn to wood";
+      return -1.0f;
+    }
+  }
+  const LimbAxis ax = MeasureLimb(mobs, id, limb);
+  std::vector<ParticleSpawn> spawns;
+  const int kCuts = (int)BaselineNumber("woodBleedCuts", 2);
+  for (int k = 0; k < kCuts; k++)
+    CutOnce(mobs, c.world, id, limb, ax, ax.reach * 0.5f, 6.0f, 0.6f,
+            0x0B1EEDu + (uint32_t)k * 2654435761u, spawns);
+  const float b = mobs.LimbBody(id, limb) ? mobs.LimbBleedBudget(id, limb) : -1.0f;
+  if (b < 0) why = "the forearm came off";
+  mobs.Reset();
+  c.debris.Reset();
+  return b;
+}
+
+int LimbNamed(const MobDef& d, const char* name) {
+  for (size_t i = 0; i < d.limbs.size(); i++)
+    if (d.limbs[i].name == name) return (int)i;
+  return -1;
+}
+
+// ARM D: THE AMPUTATION. Sever the forearm outright and count everything of
+// the creature's bleed material that leaves over the gout's window: droplets,
+// thrown voxels and the drip's paint ops. The gout, the thrown voxels and the
+// stump's standing top-up are scaled by the matter at the cut (MobLimb::
+// woundScale), so a wooden stump must pay a fraction of a flesh one.
+int SeverBleedCount(Ctx& c, int defIndex, int limb, bool toWood, int inset,
+                    std::string& why) {
+  MobSystem& mobs = c.mobs;
+  mobs.Reset();
+  c.debris.Reset();
+  const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, inset));
+  if (!id) { why = "spawn refused"; return -1; }
+  mobs.SetMobBehavior(id, "dummy");
+  const uint32_t bleedMat = mobs.Defs()[defIndex].bleedMat;
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): the subject is the stump's bleed,
+  // which Mob::BleedTick (inside PreTick) pays; nothing else is wanted.
+  int count = 0;
+  auto tick = [&](uint32_t t, bool measure) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(t, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+    if (!measure) return;
+    for (const ParticleSpawn& p : spawns)
+      if ((p.payload & 0xFFFu) == bleedMat) count++;
+    for (const BrushOp& o : ops)
+      if (o.material == bleedMat) count += 1 + 6 * o.radius;
+  };
+  for (int i = 0; i < 8; i++) tick(3000u + (uint32_t)i, false);
+  if (toWood) {
+    uint32_t wood = 0;
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "wood") wood = (uint32_t)i;
+    // The forearm AND its parent: the stump is the upper arm's end.
+    const MobDef& dd = mobs.Defs()[defIndex];
+    int parent = -1;
+    for (size_t i = 0; i < dd.limbs.size(); i++)
+      if (dd.limbs[i].name == dd.limbs[limb].parent) parent = (int)i;
+    for (int l : {limb, parent})
+      if (l >= 0)
+        for (uint32_t m = 1; m < (uint32_t)c.mats.size(); m++)
+          if (m != wood && mobs.LimbMaterialCount(id, l, m))
+            mobs.RewriteLimbMaterial(id, l, m, wood, 1u << 30);
+  }
+  mobs.Sever(id, limb);
+  const int kTicks = (int)BaselineNumber("woodBleedSeverTicks", 90);
+  for (int i = 0; i < kTicks; i++) tick(3100u + (uint32_t)i, true);
+  mobs.Reset();
+  c.debris.Reset();
+  return count;
+}
+
+Status GateWoodBleed(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const int human = mobs.FindDef("human");
+  if (human < 0) { detail = "no `human` def"; return Status::Fail; }
+  const int limb = LimbNamed(mobs.Defs()[human], "armL.R");
+  if (limb < 0) { detail = "the human has no armL.R"; return Status::Fail; }
+  std::string why;
+  const float flesh = WoodBleedArm(c, human, limb, false, 445, why);
+  const float wooden = WoodBleedArm(c, human, limb, true, 445, why);
+  if (flesh <= 0.0f || wooden < 0.0f) {
+    detail = "arm did not measure: " + why;
+    return Status::Fail;
+  }
+  RecordObserved("woodBleedFlesh", flesh);
+  RecordObserved("woodBleedWood", wooden);
+  const double maxRatio = BaselineNumber("woodBleedMaxRatio", 0.3);
+  const float ratio = wooden / flesh;
+  detail = Format("human forearm bled %.2f; turned to wood %.2f (x%.2f)",
+                  flesh, wooden, ratio);
+  bool ok = ratio <= maxRatio && ratio >= 0.05f;
+  // ...and a wood spirit, when one is loaded (assets/mobs/sylvan/).
+  const int deku = mobs.FindDef("deku");
+  if (deku >= 0) {
+    const int dl = LimbNamed(mobs.Defs()[deku], "armL.R");
+    const float sap = dl >= 0 ? WoodBleedArm(c, deku, dl, false, 445, why) : -1.0f;
+    RecordObserved("woodBleedDeku", sap);
+    detail += Format("; deku forearm %.2f (x%.2f)", sap, sap / flesh);
+    ok = ok && sap >= 0.0f && sap / flesh <= maxRatio;
+  }
+  // ---- the amputation: gout, thrown voxels and the stump's drip ----
+  const int sevFlesh = SeverBleedCount(c, human, limb, false, 445, why);
+  const int sevWood = SeverBleedCount(c, human, limb, true, 445, why);
+  RecordObserved("woodBleedSeverFlesh", (double)sevFlesh);
+  RecordObserved("woodBleedSeverWood", (double)sevWood);
+  detail += Format(" | severed forearm: flesh %d, wood %d", sevFlesh, sevWood);
+  ok = ok && sevFlesh > 0 && sevWood >= 0 &&
+       (float)sevWood / (float)sevFlesh <= maxRatio;
+  if (deku >= 0) {
+    const int dl = LimbNamed(mobs.Defs()[deku], "armL.R");
+    const int sevDeku = dl >= 0 ? SeverBleedCount(c, deku, dl, false, 445, why) : -1;
+    RecordObserved("woodBleedSeverDeku", (double)sevDeku);
+    detail += Format(", deku %d", sevDeku);
+    ok = ok && sevDeku >= 0 && (float)sevDeku / (float)sevFlesh <= maxRatio;
+  }
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -2282,6 +2447,7 @@ const std::vector<Gate>& ImpactGates() {
       {"bite-infect", "mob", {}, false, GateBiteInfect, false},
       {"bite-limbs", "mob", {}, false, GateBiteLimbs, false},
       {"joint-rot", "mob", {}, false, GateJointRot, false},
+      {"wood-bleed", "mob", {}, false, GateWoodBleed, false},
   };
   return g;
 }

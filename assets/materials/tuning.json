@@ -72,7 +72,7 @@
   },
   "camera": {
     "mouseSensitivity": 0.0022,
-    "fovY": 1.2,
+    "fovY": 1.35,
     "pitchClamp": 1.55
   },
   "thirdPerson": {
@@ -135,7 +135,7 @@
     "airPoseFallSpeed": 9,
     "airPoseLandHeight": 1.1,
     "airPoseLean": 16,
-    "firstPersonForward": 0.15,
+    "firstPersonForward": 0.0,
     "footTrim": 0,
     "respawnDelay": 3,
     "keepKitOnTurn": true

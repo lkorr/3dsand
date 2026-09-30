@@ -1,0 +1,641 @@
+{
+  "//": "A CHARACTER, not a creature: thornwood inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs thornwood --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "thornwood",
+  "sidecarVoxelsPerMetre": 10,
+  "bleed": {
+    "material": "syrup",
+    "perDamage": 1.5
+  },
+  "anatomy": {
+    "layers": [
+      {
+        "material": "bark_light",
+        "depth": 1,
+        "keep": true
+      },
+      {
+        "material": "birch_wood",
+        "depth": 2
+      },
+      {
+        "material": "wood"
+      }
+    ],
+    "garments": [],
+    "limbs": {
+      "head": {
+        "layers": [
+          {
+            "material": "bark_light",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "birch_wood",
+            "depth": 1
+          },
+          {
+            "material": "wood",
+            "depth": 1
+          },
+          {
+            "material": "crystal"
+          }
+        ],
+        "carve": null
+      },
+      "torso": {
+        "carve": [
+          {
+            "material": "crystal",
+            "where": "wood",
+            "box": {
+              "x": [
+                0.36,
+                0.64
+              ],
+              "y": [
+                0.5,
+                0.74
+              ],
+              "z": [
+                0.35,
+                0.78
+              ]
+            }
+          }
+        ]
+      },
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      },
+      "hair.2": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      },
+      "snout": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "gait": {
+    "rideHeight": 1.153
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 135
+    },
+    {
+      "name": "torso",
+      "hp": 135,
+      "anchor": [
+        18,
+        84,
+        10
+      ]
+    },
+    {
+      "name": "head",
+      "anchor": [
+        18,
+        116,
+        10
+      ]
+    },
+    {
+      "name": "armU.L",
+      "anchor": [
+        32,
+        118,
+        10
+      ]
+    },
+    {
+      "name": "armL.L",
+      "anchor": [
+        32,
+        98,
+        10
+      ]
+    },
+    {
+      "name": "hand.L",
+      "anchor": [
+        32,
+        78,
+        10
+      ]
+    },
+    {
+      "name": "armU.R",
+      "anchor": [
+        4,
+        118,
+        10
+      ]
+    },
+    {
+      "name": "armL.R",
+      "anchor": [
+        4,
+        98,
+        10
+      ]
+    },
+    {
+      "name": "hand.R",
+      "anchor": [
+        4,
+        78,
+        10
+      ]
+    },
+    {
+      "name": "legU.L",
+      "hp": 80,
+      "anchor": [
+        24,
+        72,
+        10
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 66,
+      "anchor": [
+        24,
+        40,
+        10
+      ]
+    },
+    {
+      "name": "legU.R",
+      "hp": 80,
+      "anchor": [
+        12,
+        72,
+        10
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 66,
+      "anchor": [
+        12,
+        40,
+        10
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 27,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        25.5,
+        138,
+        9.5
+      ]
+    },
+    {
+      "name": "hair.2",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 4,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        24.5,
+        136,
+        14.5
+      ]
+    },
+    {
+      "name": "snout",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 4,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        18.5,
+        128,
+        16.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        4,
+        73,
+        10
+      ]
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "walk": {
+      "durationMs": 703,
+      "mask": [
+        "armU.L",
+        "armL.L",
+        "armU.R",
+        "armL.R",
+        "torso"
+      ],
+      "tracks": {
+        "armU.L": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 351,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 703,
+              "q": [
+                0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armU.R": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 351,
+              "q": [
+                0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 703,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armL.L": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 351,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 703,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armL.R": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 351,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 703,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ]
+            }
+          ]
+        },
+        "torso": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                -0.0184,
+                0,
+                0.9998
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 351,
+              "q": [
+                0,
+                0.0184,
+                0,
+                0.9998
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 703,
+              "q": [
+                0,
+                -0.0184,
+                0,
+                0.9998
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "run": {
+      "durationMs": 357
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "thornwood",
+    "displayName": "Thornwood",
+    "body": {
+      "race": "sylvan",
+      "sex": "male",
+      "bust": 0,
+      "heightM": 1.84,
+      "hipWidth": 10,
+      "shoulderWidth": 12,
+      "bodyDepth": 6,
+      "headWidth": 10,
+      "headDepth": 10,
+      "limbWidth": 4,
+      "footDepth": 7,
+      "stack": {
+        "foot": 4,
+        "shin": 15,
+        "thigh": 16,
+        "hips": 10,
+        "torso": 18,
+        "head": 15
+      },
+      "armStack": {
+        "upper": 11,
+        "fore": 11,
+        "hand": 5
+      },
+      "armLengths": 1
+    },
+    "shape": {
+      "waist": 0.72,
+      "chest": 0.85,
+      "shoulder": 1,
+      "chestDepth": 0.94,
+      "seat": 0.94,
+      "armGirth": 0.8,
+      "legGirth": 0.8,
+      "upperArm": 1,
+      "bicep": 0,
+      "deltoid": 0,
+      "foreArm": 1,
+      "forearmMuscle": 0
+    },
+    "head": {
+      "jaw": 0.94,
+      "cheek": 1,
+      "crown": 1.05,
+      "skullBack": 0.6
+    },
+    "face": {
+      "eyeDx": 2.5,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0,
+      "browHeight": 0,
+      "browInner": 1,
+      "browOuter": 0,
+      "browThick": 1,
+      "browTilt": 0,
+      "browArch": 0,
+      "browSparse": 0,
+      "browTone": "shade",
+      "browProud": false,
+      "mouthCurve": 0,
+      "mouthSkew": 0,
+      "mouthShift": 0,
+      "mouthOpen": 0,
+      "mouthTone": "shade",
+      "lips": 0,
+      "nose": 0,
+      "noseWidth": 1,
+      "earSize": 1,
+      "earPoint": false,
+      "eyeWhites": false,
+      "eyeBags": 0,
+      "cheeks": 0,
+      "freckles": 0,
+      "wrinkles": 0,
+      "scar": 0,
+      "beardStyle": "clean",
+      "beardLip": 0,
+      "beardChin": 0,
+      "beardJaw": 0,
+      "beardCheek": 0,
+      "beardSide": 0,
+      "beardWidth": 0,
+      "beardDensity": 1,
+      "beardRagged": 0.45,
+      "beardTone": "shade",
+      "beardLen": 0,
+      "beardPoint": 0,
+      "beardFork": false
+    },
+    "hair": {
+      "style": "cropped",
+      "back": 8.5,
+      "front": 8.5,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 0,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.7,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0.5,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0.45,
+      "fuzz": 0,
+      "fuzzTop": 1,
+      "fuzzSide": 1,
+      "fuzzBack": 1,
+      "fuzzLow": 0.5,
+      "fuzzFray": 0.5
+    },
+    "colors": {
+      "skin": "#4a3a2c",
+      "skinShade": "#32271e",
+      "skinLight": "#5f4b3a",
+      "hair": "#c8742a",
+      "hairShade": "#8e4a1a",
+      "eye": "#ff6a3a",
+      "cloth": "#9a5a26",
+      "clothShade": "#6e3e1a",
+      "nail": "#221a13",
+      "root": "#1e1712",
+      "moss": "#8a8a3a",
+      "branch": "#3e3024",
+      "flower": "#f2eee2",
+      "flowerEye": "#e8c34a",
+      "leaf2": "#d8b440",
+      "leaf3": "#a8322a",
+      "leaf4": "#6a4424"
+    },
+    "sylvan": {
+      "face": "gnarled",
+      "crown": "sparse",
+      "glow": true,
+      "sockets": 0.65,
+      "eyeSize": 1,
+      "brow": 1,
+      "mouthHole": 0.5,
+      "snout": 0.15,
+      "warp": 0.85,
+      "grain": 0.6,
+      "knots": 0.6,
+      "roots": 0.85,
+      "rootTwist": 0.8,
+      "relief": 0.7,
+      "moss": 0.25,
+      "wrap": 0.45,
+      "wreath": 0.15,
+      "leaves": 0.2,
+      "leafSize": 0.25,
+      "branches": 0.75,
+      "branchLen": 0.95,
+      "branchFork": 0.85,
+      "branchStyle": "antlers",
+      "shoulderBranches": 0,
+      "backBranches": 0,
+      "boughLen": 0.5,
+      "tufts": 0.25,
+      "flowers": 0,
+      "flowerSize": 0,
+      "leafMix": 0.35,
+      "leafPatch": 0.5,
+      "veil": 0
+    }
+  }
+}

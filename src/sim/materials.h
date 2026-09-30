@@ -828,6 +828,11 @@ struct MaterialDef {
   // This is the material that falls as RAIN ("stain": {"rain": true}): the
   // stain sim_mutate.wgsl `rainFall` lays on the ground it hits. One per table.
   bool stainIsRain = false;
+  // This liquid authored NO stain block, so the loader gave it the table's
+  // default body coat (materials.json `liquidStainDefault`, materials.cpp
+  // DefaultLiquidStain): bodyOnly, drawn in the liquid's own colour. Every
+  // liquid can coat a body unless it says `"stain": false`. Tuner/wiki only.
+  bool stainAuto = false;
   // ---- WHAT THIS SUBSTANCE DOES WHILE IT IS ON A BODY ("coat") -------------
   //
   // A body voxel's coat names a MATERIAL (sim/voxload.h PrefabVoxel::stain),
@@ -996,6 +1001,14 @@ struct MaterialDef {
   // Rolled ONCE per voxel, keyed on its lattice position, so a voxel bared
   // twice gets the same answer both times. 0 = never. CPU-only (body coats).
   float bareBlood = 0.0f;
+  // HOW MUCH A WOUND IN THIS BLEEDS (materials.json "bleed", 2026-09-29): a
+  // multiplier on the creature's own bleed.perDamage, taken from the matter
+  // the blow actually opened -- the struck voxel for a hit, the carved-out
+  // voxels for a carve. 1 = flesh (the default: every existing body bleeds
+  // exactly as it did). Wood is 0.2: a sylvan bleeds a fifth of the sap, and
+  // a human arm that has somehow become wood bleeds a fifth of the blood --
+  // it is the MATTER that decides, not the creature. CPU-only (body wounds).
+  float bleed = 1.0f;
   // HOW BURNT A VOXEL OF THIS READS (materials.json "burnStage", W1-F
   // 2026-09-24): 0 = intact, 1 = half (cooked / seared / alight), 2 = whole
   // (charred / cinder / ash). A body's burnt fraction, its burn health cap,

@@ -54,10 +54,10 @@ const tuning = readJson(join(ROOT, 'assets/materials/tuning.json'));
 
 // Same gait constants gen_mobs.mjs reads out of avatar.cpp.
 function avatarConstants() {
-  const src = readFileSync(join(ROOT, 'src/game/avatar.cpp'), 'utf8');
+  const src = readFileSync(join(ROOT, 'src/game/pose.cpp'), 'utf8');  // the gait constants moved here from avatar.cpp
   const get = name => {
     const m = src.match(new RegExp(`constexpr float ${name}\\s*=\\s*([0-9.]+)f`));
-    if (!m) throw new Error(`could not find ${name} in src/game/avatar.cpp`);
+    if (!m) throw new Error(`could not find ${name} in src/game/pose.cpp`);
     return parseFloat(m[1]);
   };
   return { swingTravelFrac: get('kSwingTravelFrac'),

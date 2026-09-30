@@ -438,6 +438,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   classOf_.clear();
   densityOf_.clear();
   rubbleOf_.clear();
+  bleedOf_.clear();
   foliageOf_.clear();
   matTints_.clear();
   tintMapValid_ = false;  // tint lists just moved: the art map derived from them
@@ -469,6 +470,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     int r = m.rubble.empty() ? -1 : FindMaterialId(mats, m.rubble);
     if (r < 0) r = (int)selfIdx;
     rubbleOf_.push_back((uint32_t)r);
+    bleedOf_.push_back(m.bleed);
     selfIdx++;
     uint8_t foliage = 0;
     for (const auto& t : m.tags)
@@ -4804,7 +4806,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
       // and they are the lasting mess. Thrown from the cut, up and outward.
       const int nVox =
           (int)std::lround(goutFrac * (float)std::max(0, gore.severVoxels) *
-                           std::max(0.0f, gore.bleedGain));
+                           std::max(0.0f, gore.bleedGain) * b.wound.scale);
       const float sprd = gore.severGobbetSpread;
       for (int k = 0; k < nVox; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
@@ -5038,13 +5040,21 @@ void DebrisSystem::ArmWound(Body& b, Vec3 woundW, Vec3 dirW, float budget,
   // of it rather than from a point in mid-air. One pass; hit ticks only.
   float best = 1e30f;
   Vec3 bestC = pl, centroid{};
+  uint32_t bestMat = 0;
   for (const DebrisVoxel& v : b.voxels) {
     const Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
     centroid += c;
     const Vec3 d = c - pl;
     const float d2 = d.dot(d);
-    if (d2 < best) { best = d2; bestC = c; }
+    if (d2 < best) { best = d2; bestC = c; bestMat = v.payload & 0xFFFu; }
   }
+  // WHAT IS CUT DECIDES HOW MUCH IT BLEEDS (materials.json `bleed`): the
+  // voxel at the wound, so a wooden corpse or a sylvan's severed arm pays a
+  // fifth of a flesh one's budget and gout.
+  const float matScale = bestMat < bleedOf_.size() ? bleedOf_[bestMat] : 1.0f;
+  budget *= matScale;
+  b.wound.scale = b.wound.gushTicks > 0 ? std::min(b.wound.scale, matScale)
+                                        : matScale;
   centroid = centroid * (1.0f / (float)b.voxels.size());
   b.wound.open = true;
   b.wound.local = bestC * (1.0f / ps);
@@ -5094,7 +5104,7 @@ void DebrisSystem::BleedBodies(uint32_t tick, World& world,
       const float frac = (float)w.gushTicks / (float)decay;
       const int want = (int)std::lround(2.0f * (float)gore.severSpray *
                                         std::max(0.0f, gore.bleedGain) * frac /
-                                        (float)decay);
+                                        (float)decay * w.scale);
       for (int k = 0; k < want; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
         const uint32_t h = rng::Hash3(b.serial * 2654435761u, tick,

@@ -12201,6 +12201,19 @@ int main(int argc, char** argv) {
       }
       fPrev = fDown;
     }
+    // AN EMPTY VESSEL SCOOPS. Pour and apply have nothing to give, so the
+    // moment a hand holds an empty one -- equipped empty, or the last drop
+    // just left -- its mode drops to scoop. Edge-triggered, so F still cycles
+    // an empty flask by hand; it only snaps back on the next empty edge.
+    {
+      static bool wasEmpty[kHands] = {};
+      for (int hk = 0; hk < kHands; hk++) {
+        const bool empty =
+            handVessel(HandAt(hk)) && !kit.equip.InHand(HandAt(hk)).Filled();
+        if (empty && !wasEmpty[hk]) ui.vesselMode[hk] = 1;
+        wasEmpty[hk] = empty;
+      }
+    }
     for (int hk = 0; hk < kHands; hk++)
       ui.vesselModeShown[hk] = handVessel(HandAt(hk)) ? ui.vesselMode[hk] : -1;
     ui.lastHand = HandIndex(session.lastHand);

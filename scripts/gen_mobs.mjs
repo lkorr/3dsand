@@ -67,7 +67,7 @@ let baseCache = null;
 const argv = process.argv.slice(2);
 // Options that take a VALUE, so the value is not mistaken for the name
 // positional. Declared before `positional` reads it.
-const OPTS_WITH_VALUES = new Set(['preset', 'genome', 'seed', 'out', 'litter',
+const OPTS_WITH_VALUES = new Set(['preset', 'genome', 'seed', 'out', 'litter', 'race',
                                   'parents', 'variant-of', 'saturation',
                                   'brightness', 'tint', 'tint-amount', 'sigma',
                                   'behavior']);
@@ -92,10 +92,10 @@ const tuning = readJson(join(ROOT, 'assets/materials/tuning.json'));
  *  browser can run without the C++ in hand; the bake reads the real thing, and
  *  scripts/test_mobgen.mjs fails if the two ever disagree. */
 function avatarConstants() {
-  const src = readFileSync(join(ROOT, 'src/game/avatar.cpp'), 'utf8');
+  const src = readFileSync(join(ROOT, 'src/game/pose.cpp'), 'utf8');  // the gait constants moved here from avatar.cpp
   const get = name => {
     const m = src.match(new RegExp(`constexpr float ${name}\\s*=\\s*([0-9.]+)f`));
-    if (!m) throw new Error(`could not find ${name} in src/game/avatar.cpp`);
+    if (!m) throw new Error(`could not find ${name} in src/game/pose.cpp`);
     return parseFloat(m[1]);
   };
   return { swingTravelFrac: get('kSwingTravelFrac'),
@@ -203,7 +203,8 @@ if (opt('litter')) {
   if (flag('rebake')) genome = loadGenomeByName(name);
   else if (opt('genome')) genome = mg.normalizeGenome(readJson(opt('genome')));
   else if (opt('preset')) genome = mg.presetGenome(opt('preset'));
-  else if (flag('random')) genome = mg.rollColors(mg.randomGenome(mg.makeRng(seed)),
+  else if (flag('random')) genome = mg.rollColors(mg.randomGenome(mg.makeRng(seed), null,
+                                                                 { race: opt('race', 'human') }),
                                                   mg.makeRng(seed ^ 0x5bf03635));
   else genome = mg.defaultGenome();
   if (flag('roll-colors')) genome = mg.rollColors(genome, mg.makeRng(seed));
@@ -289,7 +290,9 @@ function write(name, genome) {
       .sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(', '));
   }
   if (dry) { console.log('  (--dry: wrote nothing)'); return; }
-  const fd = fileDirFor(name, mg.BASE_MOB);
+  // Filed by race (a sylvan beside its kin in assets/mobs/sylvan/); every
+  // character still extends mg.BASE_MOB.
+  const fd = fileDirFor(name, mg.raceFolder(genome));
   mkdirSync(fd, { recursive: true });
   const vp = join(fd, name + '.vox'), jp = join(fd, name + '.json');
   // THE FILE IS THE DIFF. `built.sidecar` is the whole creature; what is

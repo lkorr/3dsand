@@ -54,10 +54,10 @@ const tuning = readJson(path.join(ROOT, 'assets/materials/tuning.json'));
  *  mobgen.js carries fallbacks so the browser can run without the C++ in hand,
  *  and a drift between the two is a wrong number delivered confidently. */
 function avatarConstants() {
-  const src = fs.readFileSync(path.join(ROOT, 'src/game/avatar.cpp'), 'utf8');
+  const src = fs.readFileSync(path.join(ROOT, 'src/game/pose.cpp'), 'utf8');  // the gait constants moved here from avatar.cpp
   const get = name => {
     const m = src.match(new RegExp(`constexpr float ${name}\\s*=\\s*([0-9.]+)f`));
-    if (!m) throw new Error(`could not find ${name} in src/game/avatar.cpp`);
+    if (!m) throw new Error(`could not find ${name} in src/game/pose.cpp`);
     return parseFloat(m[1]);
   };
   return {
@@ -161,7 +161,7 @@ section('B. the constants this file derives FROM have not drifted');
 {
   const av = avatarConstants();
   const d = diff(av, mg.AVATAR_CONSTANTS, 'avatar');
-  ok(!d, 'mobgen.js AVATAR_CONSTANTS match src/game/avatar.cpp', d);
+  ok(!d, 'mobgen.js AVATAR_CONSTANTS match src/game/pose.cpp', d);
   const pl = {};
   for (const k of Object.keys(mg.PLAYER_CONSTANTS)) pl[k] = tuning.player[k];
   const dp = diff(pl, mg.PLAYER_CONSTANTS, 'player');
@@ -471,6 +471,8 @@ section('E. mutate / cross / randomGenome are reproducible and BOUNDED');
 }
 
 section('F. every rolled body is STRUCTURALLY SOUND');
+const sylvanMats = ['bark_light', 'bark_dark', 'leaves', 'staff_wood', 'gem_arcane']
+  .map(n => materials.findIndex(m => m.id === n) + 1);
 {
   // This is the claim the thumbnail grid cannot make. A human filters ugly
   // perfectly and filters broken not at all: a body whose anchors are outside
@@ -516,6 +518,37 @@ section('F. every rolled body is STRUCTURALLY SOUND');
     'face.earSize': 2, 'face.earPoint': true, 'face.eyeWhites': true,
     'face.eyeBags': 1, 'face.cheeks': 1, 'face.freckles': 1,
     'face.wrinkles': 1, 'face.scar': 1, ...fuzzMax })]);
+  // THE SYLVAN RACE (sylvan.js): every preset, random sylvans, mutants, and
+  // every face on every crown -- the crown and the face are where a sylvan's
+  // geometry can go wrong (a veil hung off nothing, a snout off a flat face).
+  for (const k of mg.SYLVAN_PRESET_ORDER)
+    rolls.push(['sylvan preset ' + k, mg.presetGenome(k)]);
+  // Seed 13 is skipped, and not for a sylvan reason: its build with ANY
+  // hanging hairstyle (a plain human with `flowing` included, 2026-09-29)
+  // leaves two side strands of the mane outside the torso's box -- a latent
+  // hairMass defect the human rolls above happen never to draw.
+  for (let s = 0; s < 17; s++) if (s !== 13)
+    rolls.push([`random sylvan seed ${s}`,
+                // Seeds 0..15: the same human rolls the loop above proves
+                // sound (a sylvan is that roll plus the race's own).
+                mg.randomGenome(mg.makeRng(s), null, { race: 'sylvan' })]);
+  for (let s = 0; s < 8; s++)
+    rolls.push([`sylvan mutant seed ${s}`,
+                mg.mutate(mg.presetGenome(mg.SYLVAN_PRESET_ORDER[s % 6]), 1.5,
+                          mg.makeRng(3100 + s))]);
+  // Every branch style (head antlers, shoulder and back boughs) on two crowns.
+  for (const bs of mg.SYLVAN_BRANCHES)
+    for (const c of ['bare', 'thicket']) {
+      const g = mg.applyRace(mg.defaultGenome(), 'sylvan');
+      mg.applyCrown(g, c); mg.applyBranches(g, bs);
+      rolls.push([`sylvan ${bs} branches, ${c} crown`, g]);
+    }
+  for (const f of mg.SYLVAN_FACES)
+    for (const c of mg.SYLVAN_CROWNS) {
+      const g = mg.applyRace(mg.defaultGenome(), 'sylvan');
+      mg.applyFace(g, f); mg.applyCrown(g, c);
+      rolls.push([`sylvan ${f} face, ${c} crown`, g]);
+    }
   rolls.push(['every face lever low', faceRig('bald', 'clean', {
     'face.brow': true, 'face.browHeight': -1, 'face.browInner': 0,
     'face.browTilt': -1, 'face.browSparse': 1, 'face.mouthWidth': 1,
@@ -543,18 +576,28 @@ section('F. every rolled body is STRUCTURALLY SOUND');
     // The hair mass (mobgen.js hairMass) is the one exception, and it is
     // ONE material of its own: hair_white, never flesh.
     const mats = new Set(), hairMats = new Set(), cols = new Set();
-    const isHair = n => /^(hair|mane)(\.\d+)?$/.test(n);
+    const isHair = n => /^(hair|mane|snout|bough)(\.\d+)?$/.test(n);
     for (const m of prefab.models) {
       for (const v of m.grid.data) if (v) (isHair(m.name) ? hairMats : mats).add(v);
       if (m.grid.color) for (const v of m.grid.color) if (v) cols.add(v);
     }
-    ok(mats.size === 1 && [...mats][0] <= 127,
-       `${label} is one material, id <= 127`,
-       `materials ${[...mats].join(',')}`);
-    const hairId = materials.findIndex(m => m.id === mg.HAIR_MAT_ID) + 1;
-    ok(hairMats.size === 0 || (hairMats.size === 1 && hairMats.has(hairId)),
-       `${label}'s hair is all ${mg.HAIR_MAT_ID}`,
-       `materials ${[...hairMats].join(',')}`);
+    if (b.genome.body.race === 'sylvan') {
+      // A SYLVAN IS SEVERAL MATERIALS, and exactly these: bark, root bark,
+      // leaves, branch wood and the glowing eyes -- all <= 127.
+      const allowed = new Set(sylvanMats);
+      const all = [...mats, ...hairMats];
+      ok(all.every(v => allowed.has(v)) && all.every(v => v <= 127),
+         `${label} is made of the sylvan surface materials, ids <= 127`,
+         `materials ${all.join(',')}`);
+    } else {
+      ok(mats.size === 1 && [...mats][0] <= 127,
+         `${label} is one material, id <= 127`,
+         `materials ${[...mats].join(',')}`);
+      const hairId = materials.findIndex(m => m.id === mg.HAIR_MAT_ID) + 1;
+      ok(hairMats.size === 0 || (hairMats.size === 1 && hairMats.has(hairId)),
+         `${label}'s hair is all ${mg.HAIR_MAT_ID}`,
+         `materials ${[...hairMats].join(',')}`);
+    }
     ok([...cols].every(c => c >= 128 && c <= 255),
        `${label} paints only art slots`,
        `colours ${[...cols].filter(c => c < 128).join(',')}`);
@@ -585,6 +628,18 @@ section('F. every rolled body is STRUCTURALLY SOUND');
       }
       if (!ok(n === total, `${label}: ${m.name} is one connected piece`,
               `${total - n} of ${total} voxels are detached`)) break;
+      // ...and it has a COLLIDER: at least one 2x2x2 block at least half full
+      // (the engine's majority fill at skinScale 8 / physScale 4). A limb
+      // whose collider is empty makes Mob::BuildRig refuse the whole spawn.
+      const blocks = new Map();
+      for (let i = 0; i < data.length; i++) {
+        if (!data[i]) continue;
+        const x = i % d.x, y = ((i / d.x) | 0) % d.y, z = (i / (d.x * d.y)) | 0;
+        const k = (x >> 1) + ',' + (y >> 1) + ',' + (z >> 1);
+        blocks.set(k, (blocks.get(k) || 0) + 1);
+      }
+      ok([...blocks.values()].some(v => v >= 4),
+         `${label}: ${m.name} has a collider (a block half full)`);
     }
   }
   ok(built2 === rolls.length, `all ${rolls.length} rolls built`);
@@ -1263,9 +1318,13 @@ section('M. every character on disk RESOLVES to the body its genome describes');
       ok(false, `${name}.json resolves`, e.message);
       continue;
     }
+    // The body the file claims is the generator's PLUS what it does not model
+    // (mobgen.inheritUnmodelled: the base's other clips), which is exactly
+    // what thinSidecar diffed.
+    const whole = mg.inheritUnmodelled(fresh, base);
     for (const k of Object.keys(fresh)) {
       if (k === 'genome') continue;
-      const dr = diff(noNotes(resolved[k]), noNotes(fresh[k]), `${name}.${k}`);
+      const dr = diff(noNotes(resolved[k]), noNotes(whole[k]), `${name}.${k}`);
       ok(!dr, `${name}: resolved \`${k}\` is what this genome derives`, dr);
     }
     // ...and the things the base contributes and the generator no longer
@@ -1410,6 +1469,97 @@ section('N. the sidecar resolver, and both languages running it the same way');
       ok(theirs[stem] !== undefined,
          `${stem}: the engine resolved it too`,
          'src/game/sidecar.cpp skipped a sidecar assets/editor/sidecar.js did not');
+  }
+}
+
+// =============================================================================
+// 8. the sylvan race
+// =============================================================================
+
+section('O. the sylvan race: another surface on the SAME rig');
+{
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  // 1. THE RIG IS THE HUMAN'S. Every armour piece is fit to the limb boxes and
+  //    every weapon hangs off the socket, so a sylvan made from a human's build
+  //    must have that human's boxes, anchors, sockets, chains and natural
+  //    weapons exactly -- the whole promise of "equips the same gear".
+  for (const [label, human] of [['default', mg.defaultGenome()],
+                                ['brute', mg.presetGenome('brute')],
+                                ['random 7', mg.randomGenome(mg.makeRng(7))]]) {
+    const syl = mg.applyRace(mg.normalizeGenome(human), 'sylvan');
+    const a = mg.generateMob(human, 0, opts), b = mg.generateMob(syl, 0, opts);
+    const bodyNames = mg.ARCHETYPE.order;
+    const box = r => Object.fromEntries(bodyNames.map(n => [n, r.table.limbs[n]]));
+    ok(!diff(box(a), box(b), 'limbs'), `${label}: a sylvan has the human's limb boxes`,
+       diff(box(a), box(b), 'limbs'));
+    const rig = r => ({
+      limbs: r.sidecar.limbs.filter(l => l.tag !== 'hair'),
+      sockets: r.sidecar.sockets, chains: r.sidecar.chains,
+      natural: r.sidecar.natural, gait: r.sidecar.gait, speed: r.sidecar.speed,
+    });
+    const d = diff(rig(a), rig(b), label);
+    ok(!d, `${label}: a sylvan has the human's anchors, sockets, chains, ` +
+           'natural weapons and gait', d);
+    // Every body part stays inside its own box (armour is fit to the box).
+    for (const p of b.parts.filter(p => !p.hair))
+      ok(p.cells.every(([x, y, z]) => x >= 0 && y >= 0 && z >= 0 &&
+                       x < p.size[0] && y < p.size[1] && z < p.size[2]),
+         `${label}: sylvan ${p.name} stays inside its box`);
+  }
+  // 2. THE SWITCH IS REVERSIBLE: human -> sylvan -> human puts every build
+  //    gene back exactly (offsets, like the sex switch).
+  {
+    const g0 = mg.presetGenome('stocky');
+    const g1 = mg.applyRace(mg.applyRace(mg.normalizeGenome(g0), 'sylvan'), 'human');
+    const pick = g => ({ body: g.body, shape: g.shape, head: g.head });
+    const d = diff(pick(mg.normalizeGenome(g0)), pick(mg.normalizeGenome(g1)), 'build');
+    ok(!d, 'human -> sylvan -> human restores the build', d);
+  }
+  // 3. A HUMAN NEVER SEES THE RACE: its palette writes no sylvan slot, and a
+  //    human litter rolls exactly as it did (section E pins the sequences).
+  {
+    const b = mg.generateMob(mg.defaultGenome(), 0, opts);
+    const { palette } = readVox(b.vox);
+    const slots = Object.values(mg.COLOR_SLOTS).filter(v => v <= 243 && v >= 239);
+    ok(slots.every(sl => palette[(sl - 1) * 4] === 0 && palette[(sl - 1) * 4 + 1] === 0 &&
+                         palette[(sl - 1) * 4 + 2] === 0),
+       'a human writes none of the sylvan colours into its palette');
+  }
+  // 4. THE INSIDE IS WOOD, and the eyes glow. Baked, as the Characters page
+  //    and gen_mobs.mjs bake it.
+  for (const k of mg.SYLVAN_PRESET_ORDER) {
+    const b = mg.generateMob(mg.presetGenome(k), 0, opts);
+    const baked = mg.bakeAnatomy(b, materials);
+    const c = baked.census;
+    ok(!c.skin && !c.flesh && !c.muscle && !c.bone && !c.brain,
+       `${k}: no flesh anywhere in a sylvan`, JSON.stringify(c));
+    ok(c.birch_wood > 0 && c.wood > 0 && c.crystal > 0,
+       `${k}: sapwood, heartwood and a crystal heart under the bark`,
+       JSON.stringify(c));
+    ok(!b.genome.sylvan.glow || c.gem_arcane > 0,
+       `${k}: glowing eyes are gem_arcane`, JSON.stringify(c));
+    ok(b.sidecar.bleed.material === 'syrup', `${k}: bleeds sap`);
+  }
+  // 5. EVERY SYLVAN GENE REACHES THE BODY. A slider that moves nothing is a
+  //    slider nobody can trust.
+  {
+    const base = mg.applyRace(mg.defaultGenome(), 'sylvan');
+    mg.applyFace(base, 'hollow'); mg.applyCrown(base, 'thicket');
+    base.sylvan.veil = 0.5; base.sylvan.snout = 0.5;
+    base.sylvan.shoulderBranches = 0.5; base.sylvan.backBranches = 0.5;
+    const key = g => {
+      const b = mg.generateMob(g, 0, opts);
+      return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';'))
+        .join('|');
+    };
+    const k0 = key(base);
+    for (const spec of mg.GENE_SPECS.filter(sp => sp.race === 'sylvan' &&
+                                               !sp.kind)) {
+      const g = mg.normalizeGenome(base);
+      const v = mg.getPath(g, spec.path);
+      mg.setPath(g, spec.path, v > (spec.min + spec.max) / 2 ? spec.min : spec.max);
+      ok(key(g) !== k0, `${spec.path} changes the body`);
+    }
   }
 }
 

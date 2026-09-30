@@ -81,6 +81,7 @@ import { writeVox, readVox, tightenPrefab, prefabToVoxModels,
          prefabRoundTripTest } from './vox.js';
 import * as ANA from './anatomy.js';
 import * as SC from './sidecar.js';
+import * as SY from './sylvan.js';
 
 // =============================================================================
 // Python parity
@@ -214,6 +215,13 @@ export const ARCHETYPE = {
     { gene: 'torso', overlap: 3 },
     { gene: 'head',  overlap: 1 },
   ],
+  /** What KIND of surface each part is, for a race that dresses the surface
+   *  (sylvan.js barkPass): the trunk, the head, a limb, a hand, a foot. */
+  roles: { hips: 'trunk', torso: 'trunk', head: 'head',
+           'armU.L': 'limb', 'armL.L': 'limb', 'hand.L': 'hand',
+           'armU.R': 'limb', 'armL.R': 'limb', 'hand.R': 'hand',
+           'legU.L': 'limb', 'legL.L': 'limb', 'foot.L': 'foot',
+           'legU.R': 'limb', 'legL.R': 'limb', 'foot.R': 'foot' },
   /** The arm hangs from the shoulder (the torso's top) downward, same idea. */
   armStack: [
     { gene: 'upper', overlap: 0 },
@@ -257,6 +265,9 @@ export const ART = {
   HAIR_WISP1: 246,
   HAIR_WISP2: 245,
   HAIR_WISP3: 244,
+  // THE SYLVAN'S OWN SLOTS (sylvan.js): roots, moss, branches, flowers. Never
+  // painted on a human and never written into a human's palette.
+  ...SY.SLOTS,
 };
 
 /** Coverage of each wisp tier, 0..255. The steps are even in how THIN they
@@ -292,7 +303,8 @@ export const HAIR_MAT_ID = 'hair_white';
  *  head that turns sixty degrees to look would otherwise swing a curtain of
  *  hair through the shoulders. Neither exists on a body whose style has no
  *  mass, so every pre-existing character builds exactly as it did. */
-export const HAIR_PARTS = { hair: 'head', mane: 'torso' };
+export const HAIR_PARTS = { hair: 'head', mane: 'torso', snout: 'head',
+                            bough: 'torso' };
 
 /** genome.colors key -> art slot. The genome names a colour by what it IS,
  *  the slot is where it lands; the UI pickers walk this map. */
@@ -306,6 +318,7 @@ export const COLOR_SLOTS = {
   cloth: ART.CLOTH,
   clothShade: ART.CLOTH_SHADE,
   nail: ART.NAIL,
+  ...SY.COLOR_SLOTS,
 };
 
 /**
@@ -421,6 +434,11 @@ export function defaultGenome() {
     displayName: 'Untitled',
 
     body: {
+      /** 'human' | 'sylvan' (sylvan.js). The SAME rig either way -- the race
+       *  is the surface, the materials and what grows off the head, never a
+       *  limb box, so armour and weapons fit both. Switched with applyRace,
+       *  which moves the build by SY.BUILD_DELTA the way applySex moves it. */
+      race: 'human',
       /** 'male' | 'female'. Not a switch in the generator so much as a
        *  PRESET OF OFFSETS over the build genes (applySex): the toggle moves
        *  the sliders, the sliders build the body. Two things read it directly:
@@ -606,7 +624,22 @@ export function defaultGenome() {
       cloth: '#7a6a4e',
       clothShade: '#5c4f39',
       nail: '#d9ae90',
+      // Sylvan-only colours (sylvan.js). Carried by every genome so a race
+      // switch has somewhere to put them; a human never paints them.
+      root: SY.DEFAULT_COLORS.root,
+      moss: SY.DEFAULT_COLORS.moss,
+      branch: SY.DEFAULT_COLORS.branch,
+      flower: SY.DEFAULT_COLORS.flower,
+      flowerEye: SY.DEFAULT_COLORS.flowerEye,
+      leaf2: SY.DEFAULT_COLORS.leaf2,
+      leaf3: SY.DEFAULT_COLORS.leaf3,
+      leaf4: SY.DEFAULT_COLORS.leaf4,
     },
+
+    /** The sylvan's genes: face, bark and crown (sylvan.js). Inert on a
+     *  human, and skipped by a human's mutation, roll and cross loops without
+     *  consuming a random draw. */
+    sylvan: SY.defaultSylvan(),
   };
 }
 
@@ -795,6 +828,8 @@ export const GENE_GROUPS = [
           'skin included -- a fade on shaved sides, a buzz on a bald head, ' +
           'stubble growing back. Separate from the style above: picking a ' +
           'style keeps it. Lengths are in voxels.' },
+  // The sylvan's groups (sylvan.js). `race` hides them on a human's page.
+  ...SY.GENE_GROUPS,
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
           'which way it faces, so the three skin tones want to be the same ' +
@@ -843,8 +878,20 @@ const COLOR_LABELS = {
  * the hint never repeats them either.
  *
  * `uiMax` narrows the SLIDER without narrowing the gene (see hair.back).
+ *
+ * `race` (sylvan.js) marks a gene only that race has: the page hides it on
+ * any other, and mutate / randomGenome / cross skip it WITHOUT a random draw,
+ * which is what keeps every human litter's sequence exactly as it was.
+ * `fixed` marks a gene no roll ever moves (the race itself: a litter is the
+ * race you are working on; switching is applyRace's job).
  */
 export const GENE_SPECS = [
+  { path: 'body.race', label: 'race', group: 'body', fixed: true,
+    hint: 'Human, or sylvan: a wood spirit on the same frame -- bark over ' +
+          'sapwood, roots wound round the limbs, a crown of leaves, ' +
+          'branches and flowers, glowing eyes. The same limbs and ' +
+          'proportions, so every armour piece and weapon fits both.',
+    kind: 'enum', choices: SY.RACES, sigma: 0 },
   { path: 'body.sex', label: 'sex', group: 'body',
     hint: 'Male or female. Switching moves the build sliders by the ' +
           'typical difference (shorter, narrower shoulders, narrower waist, ' +
@@ -1300,7 +1347,31 @@ export const GENE_SPECS = [
     tone: COLOR_BASE_OF[k] || null,
     group: 'colour', kind: 'color', sigma: 0.10,
   })),
+  // The sylvan's own colours, last, still in the colour group.
+  ...SY.COLOR_SPECS.map(([k, label, hint]) => ({
+    path: 'colors.' + k, label, hint, group: 'colour', kind: 'color',
+    sigma: 0.10, race: 'sylvan',
+  })),
 ];
+// The sylvan's face / bark / crown rows go in BEFORE the colours, so the page
+// stacks them under their own headings. Their place in the list moves no
+// human draw: a race-gated row is skipped without one (see `race` above).
+GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
+                  ...SY.GENE_SPECS);
+
+/** Does this row apply to this genome? (race-gated rows, see GENE_SPECS) */
+export const specApplies = (spec, genome) =>
+  !spec.race || spec.race === ((genome && genome.body && genome.body.race) || 'human');
+
+/** The label and hint a row shows for this genome: a sylvan's skin is bark. */
+export function specText(spec, genome) {
+  const race = (genome && genome.body && genome.body.race) || 'human';
+  if (race === 'sylvan' && spec.path.startsWith('colors.')) {
+    const t = SY.COLOR_LABELS[spec.path.slice(7)];
+    if (t) return { label: t[0], hint: t[1] };
+  }
+  return { label: spec.label, hint: spec.hint };
+}
 
 const SPEC_BY_PATH = new Map(GENE_SPECS.map(s => [s.path, s]));
 
@@ -1347,7 +1418,8 @@ export function normalizeGenome(src) {
     // Scalars and strings first, so `name`/`displayName`/`archetype` survive.
     for (const k of ['name', 'displayName', 'archetype'])
       if (typeof src[k] === 'string' && src[k]) g[k] = src[k];
-    for (const k of ['body', 'shape', 'head', 'face', 'hair', 'colors']) {
+    for (const k of ['body', 'shape', 'head', 'face', 'hair', 'colors',
+                     'sylvan']) {
       if (!src[k] || typeof src[k] !== 'object') continue;
       for (const kk of Object.keys(g[k])) {
         if (!(kk in src[k])) continue;
@@ -1425,6 +1497,81 @@ export function applySex(genome, sex, locks) {
     applyBeardStyle(genome, 'clean');
   }
   return genome;
+}
+
+/**
+ * SWITCH RACE. Like applySex, the build moves by OFFSETS (SY.BUILD_DELTA: a
+ * sylvan is slighter), so the sliders you set survive a round trip. Going
+ * sylvan also puts on the race's look -- its colours, a face and a crown --
+ * because a human's skin tone and hairstyle on bark are not a wood spirit, and
+ * the page is where you then change them. Going human puts back the stock
+ * complexion and a plain hairstyle. `locks` holds pinned genes still.
+ */
+export function applyRace(genome, race, locks) {
+  if (!SY.RACES.includes(race)) return genome;
+  const was = genome.body.race === 'sylvan' ? 'sylvan' : 'human';
+  genome.body.race = race;
+  if (was === race) return genome;
+  const sign = race === 'sylvan' ? 1 : -1;
+  for (const [path, d] of Object.entries(SY.BUILD_DELTA)) {
+    if (isLocked(locks, path)) continue;
+    const spec = SPEC_BY_PATH.get(path);
+    let v = getPath(genome, path) + sign * d;
+    if (spec) v = clamp(v, spec.min, spec.max);
+    setPath(genome, path, v);
+  }
+  const setColors = set => {
+    for (const [k, v] of Object.entries(set))
+      if (!isLocked(locks, 'colors.' + k)) genome.colors[k] = v;
+  };
+  if (race === 'sylvan') {
+    setColors(SY.DEFAULT_COLORS);
+    if (!isLocked(locks, 'sylvan.face')) SY.applyFace(genome, genome.sylvan.face);
+    if (!isLocked(locks, 'sylvan.crown')) applyCrown(genome, genome.sylvan.crown);
+  } else {
+    const def = defaultGenome().colors;
+    setColors(Object.fromEntries(Object.entries(def)
+      .filter(([k]) => !(k in SY.COLOR_SLOTS))));
+    if (!isLocked(locks, 'hair.style'))
+      applyHairStyle(genome, genome.body.sex === 'female' ? 'long' : 'swept');
+  }
+  return genome;
+}
+
+/** A crown is its own genes PLUS the hairstyle it sits on. */
+export function applyCrown(genome, style) {
+  const hs = SY.applyCrownGenes(genome, style);
+  if (hs) {
+    applyHairStyle(genome, hs);
+    Object.assign(genome.hair, SY.crownHairOverrides(style));
+  }
+  return genome;
+}
+export const applyFace = (genome, style) => SY.applyFace(genome, style);
+export const SYLVAN_FACES = SY.FACE_ORDER;
+export const SYLVAN_CROWNS = SY.CROWN_ORDER;
+export const SYLVAN_BRANCHES = SY.BRANCH_ORDER;
+export const applyBranches = (genome, style) => SY.applyBranches(genome, style);
+export const LEAF_STOCK = SY.LEAF_STOCK;
+export const SYLVAN_GLOWS = SY.GLOWS;
+
+/** Everything a random SYLVAN adds on top of a random human: a face and a
+ *  crown picked whole, every sylvan number jittered about them, and a colour
+ *  roll from the race's own sets. Runs AFTER the human roll, on the same rng,
+ *  so a human roll's sequence is untouched. */
+function sylvanize(g, r, locks) {
+  applyRace(g, 'sylvan', locks);
+  if (!isLocked(locks, 'sylvan.face')) SY.applyFace(g, r.pick(SY.FACE_ORDER));
+  if (!isLocked(locks, 'sylvan.crown')) applyCrown(g, r.pick(SY.CROWN_ORDER));
+  if (!isLocked(locks, 'sylvan.branchStyle'))
+    SY.applyBranches(g, r.pick(SY.BRANCH_ORDER));
+  for (const spec of SY.GENE_SPECS) {
+    if (spec.kind || isLocked(locks, spec.path)) continue;
+    const v = getPath(g, spec.path) + r.norm() * (spec.sigma ?? 0.1) * 0.6;
+    setPath(g, spec.path, clamp(v, spec.min, spec.max));
+  }
+  if (!isLocked(locks, 'sylvan.glow')) g.sylvan.glow = r() < 0.85;
+  return g;
 }
 
 /** Which hairstyles a random roll favours for each sex: three times as likely
@@ -1561,6 +1708,7 @@ export function mutate(genome, sigma, rng, locks) {
   const r = typeof rng === 'function' ? rng : makeRng(rng | 0);
   for (const spec of GENE_SPECS) {
     if (isLocked(locks, spec.path)) continue;
+    if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
     const cur = getPath(g, spec.path);
     const s = (spec.sigma ?? 0.1) * sigma;
     if (spec.kind === 'color') {
@@ -1584,6 +1732,18 @@ export function mutate(genome, sigma, rng, locks) {
   if (!isLocked(locks, 'face.beardStyle') &&
       g.face.beardStyle !== (genome?.face?.beardStyle ?? 'clean'))
     applyBeardStyle(g, g.face.beardStyle);
+  // ...and a sylvan face or crown pick, likewise.
+  if (g.body.race === 'sylvan') {
+    if (!isLocked(locks, 'sylvan.face') &&
+        g.sylvan.face !== genome?.sylvan?.face)
+      SY.applyFace(g, g.sylvan.face);
+    if (!isLocked(locks, 'sylvan.crown') &&
+        g.sylvan.crown !== genome?.sylvan?.crown)
+      applyCrown(g, g.sylvan.crown);
+    if (!isLocked(locks, 'sylvan.branchStyle') &&
+        g.sylvan.branchStyle !== genome?.sylvan?.branchStyle)
+      SY.applyBranches(g, g.sylvan.branchStyle);
+  }
   // ...and so does a sex flip (sigma 0 on the gene: mutation never flips it
   // today, but a genome edited to flip must still move the body).
   const sexWas = genome?.body?.sex === 'female' ? 'female' : 'male';
@@ -1619,6 +1779,7 @@ export function cross(parents, rng, opts = {}) {
   };
   for (const spec of GENE_SPECS) {
     if (isLocked(opts.locks, spec.path)) continue;
+    if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
     if (spec.kind === 'enum' || spec.kind === 'bool') {
       setPath(g, spec.path, getPath(r.pick(ps), spec.path));
     } else if (spec.kind === 'color') {
@@ -1690,12 +1851,13 @@ export function cross(parents, rng, opts = {}) {
 
 /** A fresh character from nothing: every unlocked gene drawn uniformly across
  *  its declared range, which is what the range is FOR. */
-export function randomGenome(rng, locks) {
+export function randomGenome(rng, locks, opts = {}) {
   const r = typeof rng === 'function' ? rng : makeRng(rng | 0);
   const g = defaultGenome();
   const was = { ...g.colors };
   for (const spec of GENE_SPECS) {
     if (isLocked(locks, spec.path)) continue;
+    if (spec.fixed || !specApplies(spec, g)) continue;   // no draw: see `race`
     // A RARE FEATURE stays at its default unless its own draw comes up: a
     // scar, freckles or pointed ears on every other roll is not variety.
     if (spec.roll !== undefined && r() >= spec.roll) continue;
@@ -1742,6 +1904,12 @@ export function randomGenome(rng, locks) {
   // a `long` is not always exactly 6 micro.
   if (g.hair.length > 0) g.hair.length = Math.round(g.hair.length * (0.6 + r()));
   reshadeFamily(g, was, locks);
+  // THE RACE IS NOT ROLLED: a litter is the race you are working on. A sylvan
+  // is a random human, then the race's own roll on top (sylvanize).
+  if (opts.race === 'sylvan') {
+    sylvanize(g, r, locks);
+    rollColors(g, r);
+  }
   return normalizeGenome(g);
 }
 
@@ -1811,6 +1979,14 @@ export const CLOTH_COLORS = {
 export function rollColors(genome, rng, opts = {}) {
   const r = typeof rng === 'function' ? rng : makeRng(rng | 0);
   const pick = obj => obj[r.pick(Object.keys(obj))];
+  // A SYLVAN picks from its own sets: a bark, a foliage, a glow and a
+  // flower, each whole. No jitter: the sets are the look, and every exact
+  // colour is one the engine's shared art palette can dedupe across bodies.
+  if (genome.body && genome.body.race === 'sylvan') {
+    Object.assign(genome.colors, pick(SY.BARKS), pick(SY.LEAVES),
+                  pick(SY.FLOWERS), { eye: pick(SY.GLOWS) });
+    return genome;
+  }
   const jitter = opts.jitter ?? 0.02;
   const hair = jitter === 0 ? r.pick(HAIR_STOCK)[1] : pick(HAIR_COLORS);
   const set = Object.assign({}, pick(COMPLEXIONS), hair,
@@ -2917,7 +3093,7 @@ export function hairWants(h) {
          h.drop > 0 || h.tail > 0 || h.bangs > 0;
 }
 
-function hairMass(g, parts) {
+function hairMass(g, parts, extra = {}) {
   const h = g.hair;
   // THREE REASONS TO BUILD: the mass proper, the short-hair layer and a
   // hanging beard. The last two root on skin as well as scalp, so a bald
@@ -2926,7 +3102,10 @@ function hairMass(g, parts) {
   const fuzzOn = h.fuzz > 0 &&
                  (h.fuzzTop > 0 || h.fuzzSide > 0 || h.fuzzBack > 0);
   const beardOn = g.face.beardLen > 0 && g.face.beard > 0;
-  if (!massOn && !fuzzOn && !beardOn) return [];
+  // A FOURTH: the sylvan crown (sylvan.js crownExtras), which roots on bare
+  // bark as happily as on leaf hair.
+  const crownOn = g.body.race === 'sylvan' && SY.crownWants(g);
+  if (!massOn && !fuzzOn && !beardOn && !crownOn) return [];
   const U = SKIN_UPSCALE;
   const K = (x, y, z) => ((z + 512) * 2048 + (y + 1024)) * 2048 + (x + 1024);
   const P = {};
@@ -2951,11 +3130,13 @@ function hairMass(g, parts) {
     // SKIN_LIGHT on the skull is scalp showing through thin hair (headVox's
     // scalpShows): still scalp, so the mass roots there and is not pushed off
     // it the way it is pushed off the face.
-    if (c === ART.HAIR || c === ART.HAIR_SHADE || c === ART.SKIN_LIGHT)
+    // (On a sylvan the cap's leaves come in more colours than two: SY.SLOTS.)
+    if (c === ART.HAIR || c === ART.HAIR_SHADE || c === ART.SKIN_LIGHT ||
+        c === ART.LEAF2 || c === ART.LEAF3 || c === ART.LEAF4)
       scalp.push([X, Y, Z]);
     else skin.add(K(X, Y, Z));
   }
-  if (!scalp.length && !fuzzOn && !beardOn) return [];  // bald: no roots
+  if (!scalp.length && !fuzzOn && !beardOn && !crownOn) return [];  // bald: no roots
   const C = [(c0[0] + c1[0] + 1) / 2, (c0[1] + c1[1] + 1) / 2,
              (c0[2] + c1[2] + 1) / 2];
   const halfW = (c1[0] - c0[0] + 1) / 2, halfD = (c1[1] - c0[1] + 1) / 2;
@@ -3580,8 +3761,21 @@ function hairMass(g, parts) {
     }
   }
 
+  // ---- the sylvan crown ---------------------------------------------------------
+  // After the mass is built AND thinned (the thinning only touches hair slots,
+  // but it also deletes cells in front of the eyes, which the veil must see
+  // gone), before the split. Leaves use the hair slots, so they are leaves.
+  let snoutCells = [], boughCells = [];
+  if (crownOn) {
+    const got = SY.crownExtras(g, { ART, K, add, C, halfW, halfD, skullH,
+                                    head, mass, body, face: extra.face,
+                                    splitZ, torso: P.torso });
+    snoutCells = got.snout;
+    boughCells = got.boughs;
+  }
+
   // ---- split by what it rides, then into connected pieces -------------------
-  const groups = { hair: [], mane: [] };
+  const groups = { hair: [], mane: [], snout: snoutCells, bough: boughCells };
   // A TAIL RIDES THE HEAD all the way down: it is tied to the head, and a
   // ponytail swinging when the head turns is what one does.
   for (const [k, v] of mass)
@@ -3616,6 +3810,81 @@ function hairMass(g, parts) {
     }
     return { pieces, comp, idx };
   };
+  // EVERY PIECE NEEDS A COLLIDER. The engine derives a limb's collider from
+  // its skin by MAJORITY FILL of 2x2x2 blocks (phys/lattice.h DownsampleSkin;
+  // skinScale 8 over physScale 4 on every generated body), aligned to the
+  // piece's own min corner, and a limb whose collider comes out EMPTY fails
+  // Mob::BuildRig -- the whole creature refuses to spawn. A one-cell twig, a
+  // thin ring (a sylvan's branch or snout) or a single braid strand has no
+  // block half full. So a piece with none is THICKENED at one spot, filling
+  // free cells of the first block that can reach four, and dropped only if
+  // no block can.
+  const taken = new Set([...mass.keys()]);
+  for (const c of groups.snout || []) taken.add(K(c[0], c[1], c[2]));
+  for (const c of groups.bough || []) taken.add(K(c[0], c[1], c[2]));
+  // THE BLOCKS ARE THE ENGINE'S: the loader maps scene (x, y, z) to engine
+  // (x, z, -y) and rebases to the min corner, so a block runs up from the min
+  // corner in x and z but DOWN from the max corner in scene y.
+  const giveCollider = cells => {
+    const mn = [0, 1, 2].map(i => Math.min(...cells.map(c => c[i])));
+    const mxY = Math.max(...cells.map(c => c[1]));
+    const blk = c => [mn[0] + ((c[0] - mn[0]) >> 1) * 2,
+                      mxY - 1 - ((mxY - c[1]) >> 1) * 2,
+                      mn[2] + ((c[2] - mn[2]) >> 1) * 2];
+    const count = new Map();
+    for (const c of cells) {
+      const b = blk(c).join(',');
+      count.set(b, (count.get(b) || 0) + 1);
+    }
+    for (const n of count.values()) if (n >= 4) return cells;
+    const have = new Set(cells.map(c => K(c[0], c[1], c[2])));
+    for (const c of cells) {
+      const [bx, by, bz] = blk(c);
+      const free = [];
+      for (let dz = 0; dz < 2; dz++)
+        for (let dy = 0; dy < 2; dy++)
+          for (let dx = 0; dx < 2; dx++) {
+            const k = K(bx + dx, by + dy, bz + dz);
+            // Never past the max-y corner the blocks are counted from.
+            if (by + dy > mxY) continue;
+            if (!have.has(k) && !body.has(k) && !taken.has(k))
+              free.push([bx + dx, by + dy, bz + dz, c[3]]);
+          }
+      const n = count.get([bx, by, bz].join(','));
+      if (n + free.length < 4) continue;
+      // Grown FACE TO FACE from what is already there: a block cell that only
+      // touches the piece along an edge would be a detached voxel to the
+      // engine (and to the one-piece assert).
+      const add = [], near = new Set(have);
+      let grew = true;
+      while (n + add.length < 4 && grew) {
+        grew = false;
+        for (const f of free) {
+          const k = K(f[0], f[1], f[2]);
+          if (near.has(k)) continue;
+          if (![[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1],
+                [0, 0, -1]].some(([dx, dy, dz]) =>
+                near.has(K(f[0] + dx, f[1] + dy, f[2] + dz)))) continue;
+          near.add(k); add.push(f); grew = true;
+          if (n + add.length >= 4) break;
+        }
+      }
+      if (n + add.length < 4) continue;
+      for (const a of add) taken.add(K(a[0], a[1], a[2]));
+      return cells.concat(add);
+    }
+    return null;
+  };
+  // A bough piece must be ROOTED: face-touching the torso it rides. A tuft or
+  // a fork that the arm cut off from its branch is a floating scrap, and goes.
+  const torsoCells = new Set();
+  if (P.torso)
+    for (const [x, y, z] of P.torso.cells)
+      torsoCells.add(K(P.torso.mn[0] + x, P.torso.mn[1] + y, P.torso.mn[2] + z));
+  const rooted = cs => cs.some(([X, Y, Z]) =>
+    torsoCells.has(K(X + 1, Y, Z)) || torsoCells.has(K(X - 1, Y, Z)) ||
+    torsoCells.has(K(X, Y + 1, Z)) || torsoCells.has(K(X, Y - 1, Z)) ||
+    torsoCells.has(K(X, Y, Z + 1)) || torsoCells.has(K(X, Y, Z - 1)));
   for (const [base, list] of Object.entries(groups)) {
     let cells = list;
     for (let pass = 0; pass < 4; pass++) {
@@ -3649,12 +3918,18 @@ function hairMass(g, parts) {
     const total = cells.length;
     // Specks too small to be a limb (a crest ray that clipped a corner) are
     // dropped; everything else is a limb.
-    pieces.filter(p => p.length >= Math.max(32, total * 0.02))
+    // (The snout is small and deliberate: it keeps anything past a speck.)
+    pieces.filter(p => p.length >= (base === 'snout' || base === 'bough' ? 8
+                                                     : Math.max(32, total * 0.02)))
       .sort((a, b) => b.length - a.length)
-      .forEach((p, n) => out.push({
+      .map(p => p.map(i => cells[i]))
+      .filter(pc => base !== 'bough' || rooted(pc))
+      .map(pc => giveCollider(pc))
+      .filter(Boolean)
+      .forEach((pc, n) => out.push({
         name: n === 0 ? base : `${base}.${n + 1}`,
         parent: HAIR_PARTS[base],
-        cells: p.map(i => cells[i]),
+        cells: pc,
       }));
   }
   return out;
@@ -3881,7 +4156,11 @@ const LIMB_BASE = {
  * this adds is the AUTHORING NOTES — the `//` keys a human reading
  * assets/mobs/*.json wants and a module constant should not carry.
  */
-export function anatomyRecipe() {
+export function anatomyRecipe(race = 'human') {
+  if (race === 'sylvan') {
+    const r = JSON.parse(JSON.stringify(SY.ANATOMY));
+    return { ...SY.ANATOMY_NOTES, ...r };
+  }
   const r = JSON.parse(JSON.stringify(ANA.DEFAULT_ANATOMY));
   return {
     '//': 'What is under the skin, by depth from the surface, baked into the ' +
@@ -4072,6 +4351,13 @@ function buildStates() {
       missingAny: ['armU.L', 'armL.L', 'hand.L', 'armU.R', 'armL.R', 'hand.R'],
       clip: 'onearm', speedScale: 0.92 },
     { name: 'headless', missing: ['head'], clip: 'headless', speedScale: 0.7 },
+    // ASLEEP (659ab19, NPC residents): an ACTIVITY state, not a damage one --
+    // the schedule puts a resident to bed and the body lies down on the spot.
+    // Restated here because human.json is the standard this list follows, and
+    // a generated body missing it could not be written as a diff at all (a
+    // named array cannot say "remove this element").
+    { name: 'sleep', activity: 'sleep', clip: 'sleep', speedScale: 0,
+      disableGait: true, bodyYOffset: 0, groundAlign: 1.0 },
   ];
 }
 
@@ -4153,6 +4439,10 @@ export function generateMob(genome, seed = 0, opts = {}) {
   // Voxels the shoulder round took off, reported in stats so the Characters
   // page can say the sculpting ran rather than leaving you to squint for it.
   let rounded = 0;
+  const sylvan = g.body.race === 'sylvan';
+  // What the sylvan face pass found (eyes, mouth, brow), head-local shipped:
+  // the crown hangs its veil and its snout off it.
+  let sylFace = null;
   for (const nm of ARCHETYPE.order) {
     const artSize = L[nm].size;
     const size = artSize.map(v => v * SKIN_UPSCALE);
@@ -4179,6 +4469,21 @@ export function generateMob(genome, seed = 0, opts = {}) {
       else if (ARCHETYPE.shoulders.cap.includes(nm))
         cells = roundShoulders(cells, size, 'cap');
       rounded += before - cells.length;
+    }
+    // THE SYLVAN SURFACE (sylvan.js barkPass): bark, grain, roots in relief,
+    // knots, moss, and on the head the wooden face. Inside the part's own box.
+    if (sylvan) {
+      const info = { ART, mn };
+      if (ARCHETYPE.roles[nm] === 'head') {
+        const eyeA = table.eyeZ - L[nm].mn[2] + g.face.eyeRow;
+        const neckA = Math.max(1, Math.round(2 * artSize[2] / DEF.head.size[2]));
+        info.eyeRow = eyeA * SKIN_UPSCALE;
+        info.mouthRow = (eyeA - g.face.mouthDrop) * SKIN_UPSCALE + 0.5;
+        info.mouthDx = g.face.mouthShift * SKIN_UPSCALE;
+        info.neckTop = (neckA + 1) * SKIN_UPSCALE;
+      }
+      cells = SY.barkPass(g, ARCHETYPE.roles[nm], nm, cells, size, info);
+      if (info.face) sylFace = info.face;
     }
     const seen = new Set();
     const uniq = [];
@@ -4212,7 +4517,7 @@ export function generateMob(genome, seed = 0, opts = {}) {
     throw new Error(`"${HAIR_MAT_ID}" is material ${hairId}; mob voxel ` +
                     `material ids must stay <= 127`);
   const hairParts = [];
-  for (const hp of hairMass(g, parts)) {
+  for (const hp of hairMass(g, parts, { face: sylFace })) {
     const mn = [0, 1, 2].map(i => Math.min(...hp.cells.map(c => c[i])));
     const mx = [0, 1, 2].map(i => Math.max(...hp.cells.map(c => c[i])));
     const size = [0, 1, 2].map(i => mx[i] - mn[i] + 1);
@@ -4228,6 +4533,22 @@ export function generateMob(genome, seed = 0, opts = {}) {
   }
 
   // ---- .vox ---------------------------------------------------------------
+  // A SYLVAN IS SEVERAL MATERIALS, picked by art slot (sylvan.js
+  // slotMaterialNames): bark, root bark, leaves, branch wood, glowing eyes.
+  // Resolved by name, each held to the same <= 127 rule as FLESH_ID.
+  let slotMat = null;
+  if (sylvan && opts.materials) {
+    slotMat = {};
+    for (const [slot, nmMat] of Object.entries(SY.slotMaterialNames(g, ART))) {
+      const id = opts.materials.findIndex(m => m.id === nmMat) + 1;
+      if (id <= 0)
+        throw new Error(`materials.json has no "${nmMat}" material (sylvan)`);
+      if (id > 127)
+        throw new Error(`"${nmMat}" is material ${id}; mob voxel material ids ` +
+                        `must stay <= 127`);
+      slotMat[slot] = id;
+    }
+  }
   let vox = null;
   if (opts.materials) {
     const models = [];
@@ -4239,11 +4560,13 @@ export function generateMob(genome, seed = 0, opts = {}) {
                   z: p.mn[2] + (p.size[2] >> 1) };
       const mat = p.mat || fleshId;
       models.push({ name: p.name, size, t,
-                    voxels: p.cells.map(([x, y, z]) => ({ x, y, z, c: mat })) });
+                    voxels: p.cells.map(([x, y, z, c]) =>
+                      ({ x, y, z, c: (slotMat && slotMat[c]) || mat })) });
       models.push({ name: p.name + '.col', size, t,
                     voxels: p.cells.map(([x, y, z, c]) => ({ x, y, z, c })) });
     }
-    vox = writeVox(models, paletteBytes(opts.materials, g.colors), { scene: true });
+    vox = writeVox(models, paletteBytes(opts.materials, g.colors, g.body.race),
+                   { scene: true });
   }
 
   const sidecar = buildSidecar(g, table, opts, name, hairParts);
@@ -4333,7 +4656,7 @@ export function bakeAnatomy(built, materials) {
   return built.anatomyBaked;
 }
 
-export function paletteBytes(materials, colors) {
+export function paletteBytes(materials, colors, race = 'human') {
   const pal = new Uint8Array(1024);
   const put = (idx, hex) => {
     const h = String(hex).replace('#', '');
@@ -4348,8 +4671,12 @@ export function paletteBytes(materials, colors) {
     const hex = m && (m.colors ? m.colors[0] : m.color0);
     if (hex) put(i + 1, hex);
   });
+  // The sylvan's own slots are written for a sylvan only: the engine merges
+  // every loaded body's art into ONE shared palette, and five colours no
+  // human paints would cost it five slots per human.
   for (const [k, slot] of Object.entries(COLOR_SLOTS))
-    if (colors[k]) put(slot, colors[k]);
+    if (colors[k] && (race === 'sylvan' || !(k in SY.COLOR_SLOTS)))
+      put(slot, colors[k]);
   for (const [slot, hex] of Object.entries(wispColors(colors)))
     put(Number(slot), hex);
   return pal;
@@ -4632,11 +4959,14 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     }
     const hp = Math.max(4, Math.min(40, Math.round(p.cells.length / 60)));
     const limb = {
-      name: p.name, parent: p.parent, joint: p.parent === 'head' ? 'fixed' : 'ball',
+      // A BOUGH is wood growing out of the torso: fixed, like the head's hair,
+      // not the hanging mane's sprung ball.
+      name: p.name, parent: p.parent,
+      joint: p.parent === 'head' || p.name.startsWith('bough') ? 'fixed' : 'ball',
       hp, severable: true, vital: false, bloodless: true, tag: 'hair',
       anchor: anchor([best[0] + 0.5, best[1] + 0.5, best[2] + 1]),
     };
-    if (p.parent !== 'head') {
+    if (p.parent !== 'head' && !p.name.startsWith('bough')) {
       Object.assign(limb, { cone: 0.3, coneSide: 0.2, twist: 0.15,
                             spring: { halflife: 0.3, gain: 0.3, maxAngle: 0.25 } });
     }
@@ -4645,7 +4975,7 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     hairAnatomy[p.name] = { layers: [{ material: HAIR_MAT_ID, keep: true }] };
   }
   limbs.push(...hairLimbs);
-  const anatomy = anatomyRecipe();
+  const anatomy = anatomyRecipe(g.body.race);
   if (hairLimbs.length) {
     anatomy['//hair'] = 'Hair has no inside: every voxel of a hair piece is ' +
                         'kept as generated, and keep-only pieces are left out ' +
@@ -4668,7 +4998,9 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     // defaulted: a modded asset silently assumed to be 10 vox/m is the exact
     // failure mob.cpp's legacy path warns about.
     sidecarVoxelsPerMetre: SIDECAR_VOXELS_PER_METRE,
-    bleed: { material: 'blood', perDamage: 2.5 },
+    // A sylvan bleeds sap (sylvan.js SAP): less of it, and it soaks the cut.
+    bleed: g.body.race === 'sylvan' ? { material: SY.SAP, perDamage: 1.5 }
+                                    : { material: 'blood', perDamage: 2.5 },
     anatomy,
     speed: pyRound(gait.refSpeed, 4),
     gait: {
@@ -4758,12 +5090,61 @@ export const PRESETS = {
 };
 export const PRESET_ORDER = ['human', 'lanky', 'stocky', 'waif', 'elder', 'brute'];
 
+/** SYLVAN starting points. `face` and `crown` name presets (sylvan.js); the
+ *  rest merges over the race-switched default exactly as a human preset
+ *  merges over the default. Kept out of PRESET_ORDER, which is the human
+ *  list and which test_mobgen indexes by position. */
+export const SYLVAN_PRESETS = {
+  sylvan: { face: 'hollow', crown: 'leafy' },
+  dryad: {
+    face: 'veiled', crown: 'blossom', branches: 'none',
+    body: { sex: 'female', heightM: 1.66 },
+    colors: { ...SY.BARKS.birch, ...SY.LEAVES.spring, ...SY.FLOWERS.pink,
+              eye: SY.GLOWS.cyan },
+  },
+  deku: {
+    face: 'mask', crown: 'leafy',
+    body: { heightM: 1.55, stack: { shin: 12, thigh: 12, torso: 17, head: 18 } },
+    colors: { ...SY.BARKS.oak, ...SY.LEAVES.forest, eye: SY.GLOWS.amber },
+    sylvan: { roots: 0.3, grain: 0.4 },
+  },
+  thornwood: {
+    face: 'gnarled', crown: 'sparse', branches: 'antlers',
+    body: { heightM: 1.84, shoulderWidth: 12, bodyDepth: 6,
+            stack: { shin: 15, thigh: 16, torso: 18, head: 15 } },
+    shape: { waist: 0.72, chest: 0.85, armGirth: 0.78, legGirth: 0.78 },
+    colors: { ...SY.BARKS.dark, ...SY.LEAVES.autumn, eye: SY.GLOWS.ember },
+    sylvan: { roots: 0.85, rootTwist: 0.8, knots: 0.6 },
+  },
+  willowkin: {
+    face: 'hollow', crown: 'willow', branches: 'none',
+    body: { sex: 'female', heightM: 1.78 },
+    colors: { ...SY.BARKS.ash, ...SY.LEAVES.silver, ...SY.FLOWERS.white,
+              eye: SY.GLOWS.white },
+  },
+  mossback: {
+    face: 'howler', crown: 'mossy', branches: 'shoulders',
+    body: { heightM: 1.7, shoulderWidth: 14, bodyDepth: 10, limbWidth: 6 },
+    shape: { chest: 1.1, shoulder: 1.1, armGirth: 1.05 },
+    colors: { ...SY.BARKS.mossy, ...SY.LEAVES.forest, eye: SY.GLOWS.green },
+    sylvan: { moss: 0.9, roots: 0.7 },
+  },
+};
+export const SYLVAN_PRESET_ORDER = Object.keys(SYLVAN_PRESETS);
+
 /** A preset as a full genome. Presets are PARTIAL on purpose: a preset that
  *  restated every gene would silently freeze at whatever the defaults were the
  *  day it was written. */
 /** The creature every generated character inherits from. A stem, not a path:
  *  it is `extends` in the file and the file lives beside the base. */
 export const BASE_MOB = 'human';
+
+/** The FOLDER a character is filed in (src/game/sidecar.h "PROTOTYPES AND
+ *  VARIANTS": filing, not semantics). Every generated character still
+ *  `extends` BASE_MOB -- a sylvan is the human's rig with another surface --
+ *  but a sylvan is filed beside its kin in assets/mobs/sylvan/. */
+export const raceFolder = genome =>
+  (genome && genome.body && genome.body.race === 'sylvan') ? 'sylvan' : BASE_MOB;
 
 /**
  * A GENERATED CHARACTER IS A DIFF, NOT A BODY.
@@ -4793,8 +5174,32 @@ export const BASE_MOB = 'human';
  * @param {object} base   the RESOLVED base sidecar (assets/mobs/human.json)
  * @param {string} name   the asset stem this will be saved under
  */
-export function thinSidecar(full, base, name) {
+/**
+ * WHAT THE GENERATOR DOES NOT MODEL IS INHERITED -- one level down as well as
+ * at the top. A generated body authors TWO clips (walk and run, whose period
+ * its own leg sets); every other clip on the human -- a bite, a lunge, the
+ * punches -- is the base's business, and a body with no opinion about it must
+ * inherit it rather than delete it (diffAgainst would write `bite: null`, and
+ * the character could no longer bite). Returns a copy of `full` with those
+ * filled in from `base`; thinSidecar diffs THIS, and test_mobgen section M
+ * compares a resolved file against it.
+ */
+export function inheritUnmodelled(full, base) {
   const body = { ...full };
+  for (const k of Object.keys(base))
+    if (!k.startsWith('//') && !(k in body))
+      body[k] = JSON.parse(JSON.stringify(base[k]));
+  if (base.clips && body.clips) {
+    body.clips = { ...body.clips };
+    for (const [k, v] of Object.entries(base.clips))
+      if (!k.startsWith('//') && !(k in body.clips))
+        body.clips[k] = JSON.parse(JSON.stringify(v));
+  }
+  return body;
+}
+
+export function thinSidecar(full, base, name) {
+  const body = inheritUnmodelled(full, base);
   delete body.genome;                       // the input, never inherited
   // WHAT THE GENERATOR DOES NOT MODEL IS INHERITED, NOT DELETED.
   //
@@ -4805,10 +5210,8 @@ export function thinSidecar(full, base, name) {
   // not a whole creature, so a key it has no opinion about would be STRIPPED
   // FROM EVERY CHARACTER IN THE POOL the day it was added to the human.
   // `turn` (what a body gets up as) was the first one and cost this comment;
-  // whatever the next one is, absent means inherited.
-  for (const k of Object.keys(base))
-    if (!k.startsWith('//') && !(k in body))
-      body[k] = JSON.parse(JSON.stringify(base[k]));
+  // whatever the next one is, absent means inherited (inheritUnmodelled,
+  // which also does it for the clips the generator does not author).
   const patch = SC.diffAgainst(base, body) || {};
   return {
     '//': `A CHARACTER, not a creature: ${name} inherits ${BASE_MOB}'s rig — ` +
@@ -4829,7 +5232,8 @@ export function thinSidecar(full, base, name) {
 }
 
 export function presetGenome(key) {
-  const p = PRESETS[key];
+  const sp = SYLVAN_PRESETS[key];
+  const p = PRESETS[key] || sp;
   if (!p) return defaultGenome();
   const g = defaultGenome();
   const merge = (dst, src) => {
@@ -4838,7 +5242,16 @@ export function presetGenome(key) {
       else dst[k] = v;
     }
   };
-  merge(g, p);
+  if (sp) {
+    const { face, crown, branches, body, ...rest } = sp;
+    const { sex, ...bodyRest } = body || {};
+    if (sex) applySex(g, sex);
+    applyRace(g, 'sylvan');
+    SY.applyFace(g, face);
+    applyCrown(g, crown);
+    SY.applyBranches(g, branches || 'sprigs');
+    merge(g, { body: bodyRest, ...rest });
+  } else merge(g, p);
   g.name = key;
   g.displayName = key[0].toUpperCase() + key.slice(1);
   return normalizeGenome(g);

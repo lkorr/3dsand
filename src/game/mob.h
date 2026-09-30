@@ -1425,6 +1425,11 @@ struct MobLimb {
   int gushTicks = 0;
   Vec3 gushLocal{};
   Vec3 gushDir{0, 1, 0};
+  // HOW MUCH THIS LIMB'S DISMEMBERMENT WOUND BLEEDS (materials.json `bleed`,
+  // 1 = flesh): the gout, the stump's standing top-up and the voxels a sever
+  // throws are all scaled by it. Set by Sever() from the matter at the cut --
+  // a wooden stump (a sylvan's, or an arm turned to wood) gouts a fifth.
+  float woundScale = 1.0f;
   // HIT FLASH: a briefly-lit limb, in LINEAR HDR units, added on top of the
   // material's own emission by the micro-body pass at shade time.
   //
@@ -2328,6 +2333,8 @@ class Mob {
   uint32_t ShellMaterialAt(int limbIndex, Vec3 worldPos) const;
   // Hardness (materials.json 0..255) of a material id; 0 when unknown.
   float MaterialHardness(uint32_t mat) const;
+  // materials.json `bleed` of `mat`: how much a wound in it bleeds, 1 = flesh.
+  float BleedWeightOf(uint32_t mat) const;
   // ShellResponseOf(hardness of the struck voxel, cause) for a worn slot.
   ShellResponse ShellResponseAt(int limbIndex, Vec3 worldPos,
                                 const DamageCtx& ctx) const;
@@ -7254,6 +7261,7 @@ class MobSystem {
   // second); 0 = not restorative. Read by Mob::HealTick and SoakLimb.
   std::vector<float> coatRestore_, coatRestoreRate_;
   std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
+  std::vector<float> matBleed_;       // MaterialDef::bleed (wound bleed weight)
   std::vector<int32_t> coatContact_;  // MaterialDef::coatContact (-1 = stain chance)
   // (MobSystem::CoatBeneath -- "a corrosive coat displaces one that is not;
   // anything displaces a washer's wetness" -- is now the class clause of the
