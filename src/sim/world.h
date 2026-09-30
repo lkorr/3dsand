@@ -2370,6 +2370,41 @@ static_assert(kWindPrimScalars == kWindPrimCap * kWindPrimWords,
 // refused rather than silently trimmed.
 constexpr uint32_t kWindWakeCap = 128;
 
+// ---- THE WIND FIELD BLOCK (src/sim/windfield.h owns it; must match the wf*
+// members of TickParams AND RenderParams in assets/shaders/common.wgsl) ------
+//
+// Everything about the ambient field that is not a compile-time TUNE_*
+// constant and not the three weather words above: the gust-front advection
+// clock, the regime's per-tick field parameters, the height profile as a
+// lookup table, and the TERRAIN TABLE. Flat members in both structs rather
+// than one nested struct, because check_invariants.py's layout comparison
+// does not model a nested struct and would skip TickParams silently.
+//
+// THE TERRAIN TABLE is the one stored field in the wind system (DESIGN.md
+// §9b): ground height, exposure (topographic position) and water fraction per
+// 32-voxel column cell, 64 x 64 cells = 204.8 m centred on the window. It is a
+// pure function of (seed, world cell, tuning) — worldgen height, not the live
+// grid — so it is derived data: rebuilt, never saved, never hashed on its own.
+// It rides the tick stream because the sim reads it, and a replay therefore
+// reproduces it by construction.
+//
+// Cells per axis. Coverage must exceed the 51.2 m window: grass, arrows and
+// streaks are drawn out past it, and a table only one window wide would put
+// its fallback seam right at the window face.
+constexpr uint32_t kWindTerrN = 64;
+constexpr int32_t kWindTerrShift = 5;        // 32-voxel cells
+constexpr int32_t kWindTerrCell = 32;
+// kWindTerrN * kWindTerrN, a LITERAL for kWindPrimScalars' reason.
+constexpr uint32_t kWindTerrWords = 4096;
+static_assert(kWindTerrWords == kWindTerrN * kWindTerrN,
+              "kWindTerrWords must equal kWindTerrN^2");
+static_assert((1 << kWindTerrShift) == kWindTerrCell, "cell size is 2^shift");
+// The height profile's lookup table: knot 0 is height-above-ground 0, knot k
+// (k >= 1) is 2^(k-1) voxels, so the last knot is 2^14 voxels = 1.6 km. The
+// profile is log-law, and doubling knots are where a log curve is flattest to
+// interpolate linearly.
+constexpr uint32_t kWindProfKnots = 16;
+
 // ---- WATER BODIES (docs/PLAN_water_master.md; src/sim/waterbody.h) --------
 // Live still-water descriptors world-wide, and the rule-2 bound on the whole
 // subsystem. Here rather than in waterbody.h for the wind-primitive reason:
@@ -3165,6 +3200,42 @@ struct TickParams {
   uint32_t waterImpulseCount = 0;
   uint32_t padWi0 = 0, padWi1 = 0, padWi2 = 0;
   int32_t waterImpulses[kWaterImpulseScalars] = {};
+
+  // ---- THE WIND FIELD BLOCK, the SIM's copy (kWindTerrN's note above;
+  // windfield.h FillWindField is the only writer). Integers, on the tick input
+  // stream: a replay reproduces them and the twice-run gate compares them.
+  // RenderParams carries the identical member list, filled from the same
+  // resolved values (advection/wander/thermal clocks at the frame's sub-tick
+  // time instead of the tick's).
+  uint32_t wfAdvPhase = 0;     // gust-front advection, BAM16 mod 10 turns
+  uint32_t wfWanderPhase = 0;  // direction-meander clock, BAM16
+  int32_t wfWanderAmp = 0;     // max heading deviation, BAM16
+  int32_t wfWanderK = 0;       // meander spatial frequency, BAM16 per cell
+  int32_t wfThermalQ = 0;      // isotropic thermal gust, Q16.16 cells/s
+  uint32_t wfThermalPhase = 0; // thermal clock, BAM16
+  int32_t wfCouplingQ = 65536; // surface coupling at the ground, Q16
+  int32_t wfDecoupleH = 1;     // height the coupling returns to 1, voxels
+  int32_t wfRidgeQ = 0;        // exposure gain, ridges (s > 0), Q16
+  int32_t wfValleyQ = 0;       // exposure gain, hollows (s < 0), Q16
+  int32_t wfExpDepth = 1;      // height the exposure term fades out by, voxels
+  int32_t wfAbsGainQ = 0;      // absolute-altitude gain, Q16 per 1024 voxels
+  int32_t wfLeeQ = 0;          // lee turbulence strength, Q16 (0 = off)
+  int32_t wfLeeSlopeQ = 32768; // downwind slope where the lee starts, Q16
+  int32_t wfLeeDepth = 1;      // lee layer depth, voxels
+  int32_t wfLeeRevQ = 0;       // reverse-flow share at full lee, Q16
+  int32_t wfLeeGustQ = 0;      // gust boost at full lee, Q16
+  int32_t wfSlopeWindQ = 0;    // up(+)/down(-)slope wind, Q16.16 cells/s
+  int32_t wfSlopeDepth = 1;    // slope-wind layer depth, voxels
+  int32_t wfSeaBreezeQ = 0;    // onshore(+)/offshore(-) breeze, Q16.16 cells/s
+  int32_t wfSeaDepth = 1;      // breeze layer depth, voxels
+  int32_t wfSeaRadius = 1;     // water-fraction radius, voxels
+  int32_t wfSeaLevelY = 0;     // absolute-altitude term's zero, world Y
+  int32_t wfNeutralQ = 65536;  // profile outside the table's coverage, Q16
+  int32_t wfTerrBase[2] = {0, 0};  // table's min CELL (world cell >> 5)
+  uint32_t wfTerrOn = 0;       // 0 = no table yet: neutral profile everywhere
+  int32_t wfThermalK = 0;      // thermal cell spatial frequency, BAM16/cell
+  int32_t wfProf[kWindProfKnots] = {};  // profile at the knots, Q16
+  uint32_t wfTerr[kWindTerrWords] = {}; // h i16 | exposure i8 | water u8
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -3532,6 +3603,50 @@ struct RenderParams {
   float pad_kl1 = 0.0f;
   float ambSky[3] = {0.0f, 0.0f, 0.0f};
   float pad_kl2 = 0.0f;
+
+  // ---- GUST STREAKS (wind_streak.wgsl; render-only, never hashed) ---------
+  // Live uniforms rather than TUNE_* so the F1 sliders move them without F5.
+  // streakA: master alpha, spawn threshold (cells/s), spawn span (cells/s),
+  //          radius (voxels).
+  // streakB: lifetime (s), trail spacing (s), ribbon width (voxels), frame dt.
+  // streakN: live pool size, trail points, frame counter, 0.
+  float streakA[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  float streakB[4] = {1.0f, 0.05f, 0.3f, 0.0f};
+  uint32_t streakN[4] = {0u, 2u, 0u, 0u};
+
+  // ---- THE WIND FIELD BLOCK, the RENDER copy (TickParams' twin; must match
+  // RenderParams in common.wgsl). Same members, same resolved values; the
+  // three clocks are evaluated at the frame's sub-tick time so the grass
+  // animates between ticks.
+  uint32_t wfAdvPhase = 0;
+  uint32_t wfWanderPhase = 0;
+  int32_t wfWanderAmp = 0;
+  int32_t wfWanderK = 0;
+  int32_t wfThermalQ = 0;
+  uint32_t wfThermalPhase = 0;
+  int32_t wfCouplingQ = 65536;
+  int32_t wfDecoupleH = 1;
+  int32_t wfRidgeQ = 0;
+  int32_t wfValleyQ = 0;
+  int32_t wfExpDepth = 1;
+  int32_t wfAbsGainQ = 0;
+  int32_t wfLeeQ = 0;
+  int32_t wfLeeSlopeQ = 32768;
+  int32_t wfLeeDepth = 1;
+  int32_t wfLeeRevQ = 0;
+  int32_t wfLeeGustQ = 0;
+  int32_t wfSlopeWindQ = 0;
+  int32_t wfSlopeDepth = 1;
+  int32_t wfSeaBreezeQ = 0;
+  int32_t wfSeaDepth = 1;
+  int32_t wfSeaRadius = 1;
+  int32_t wfSeaLevelY = 0;
+  int32_t wfNeutralQ = 65536;
+  int32_t wfTerrBase[2] = {0, 0};
+  uint32_t wfTerrOn = 0;
+  int32_t wfThermalK = 0;
+  int32_t wfProf[kWindProfKnots] = {};
+  uint32_t wfTerr[kWindTerrWords] = {};
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

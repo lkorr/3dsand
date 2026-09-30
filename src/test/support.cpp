@@ -28,6 +28,7 @@
 #include "sim/worldedit.h"
 #include "sim/waterbody.h"
 #include "sim/windprim.h"
+#include "sim/windfield.h"
 #include "sim/currentprim.h"
 #include "sim/trample.h"
 #include "sim/solutes.h"
@@ -293,74 +294,19 @@ CloudFrame gCloudFrame;
 // Cloud DRIFT in metres, a pure function of the sim clock.
 //
 // The drift is the integral of the wind over time, and an integral is exactly
-// the kind of state this engine refuses to keep (a frame-rate-dependent
-// accumulator is a sky that differs between a replay and the run it
-// replays). So it is evaluated in closed form: WindWeather's velocity is a
-// smoothstep blend between per-epoch targets, and the integral of
-// V0 + (V1 - V0) s(u) over a whole epoch is (V0 + V1) / 2 exactly, and over a
-// partial one V0 u + (V1 - V0)(u^3 - u^4 / 2). Summed over the epochs so far —
-// a prefix sum cached per epoch and invalidated when the wind knobs change —
-// it costs one WindWeather call per new epoch and is continuous at every
-// frame, which a numerical integral re-sampled each frame would not be.
-//
-// The blend uses the VECTOR lerp of the two targets (speed x direction), not
-// WindWeather's renormalised direction, so this is the drift of a wind that
-// agrees with the surface wind at every epoch boundary and differs from it
-// only in how it turns in between — invisible at cloud distance, and it is
-// what makes the closed form exact.
+// the kind of state this engine refuses to keep. It used to be summed here in
+// closed form over WindWeather's epoch blend; since 2026-09-30 the SAME sum
+// moves the gust fronts (windfield.h AirDrift / AdvPhase — a prefix over
+// 16-tick blocks of the reference wind, memoised per tuning), so the sky and
+// the grass are carried by one wind rather than two integrals of it that
+// agree only while the weather is a smoothstep between epochs (storm
+// envelopes and the sky-driven regime are not).
 void CloudDrift(const Tuning& tun, uint32_t seed, double tSec, double& dx, double& dz) {
-  const double epochS = (double)(1u << kWindEpochShift) / 30.0;
-  auto vel = [&](uint32_t epoch, double& vx, double& vz) {
-    const WindState w = WindWeather(tun, seed, epoch << kWindEpochShift);
-    const double mps = (double)w.speed * (double)kVoxelMeters;
-    vx = (double)w.dirX * mps;
-    vz = (double)w.dirZ * mps;
-  };
   if (tSec < 0.0) tSec = 0.0;
-  if (!tun.wind.weatherAuto) {
-    double vx, vz;
-    vel(0, vx, vz);
-    dx = vx * tSec;
-    dz = vz * tSec;
-    return;
-  }
-  struct Key {
-    uint32_t seed; float speed, dir, gust; bool operator==(const Key& o) const {
-      return seed == o.seed && speed == o.speed && dir == o.dir && gust == o.gust;
-    }
-  };
-  static Key key{0xFFFFFFFFu, -1.0f, 0.0f, 0.0f};
-  static std::vector<double> px, pz;  // drift at the START of epoch i
-  const Key k{seed, tun.wind.windSpeed, tun.wind.windDirDeg, tun.wind.gustStrength};
-  if (!(k == key)) {
-    key = k;
-    px.assign(1, 0.0);
-    pz.assign(1, 0.0);
-  }
-  const double eF = tSec / epochS;
-  const uint32_t e = (uint32_t)std::min(eF, 4.0e9);
-  // Extend the prefix to epoch e. Bounded per frame so a jump to tick 10^9 (a
-  // --sweep of time) cannot stall one frame for minutes; past the bound the
-  // drift is extrapolated at the last epoch's velocity, which is continuous.
-  size_t budget = 20000;
-  while (px.size() <= e && budget-- > 0) {
-    const uint32_t i = (uint32_t)px.size() - 1;
-    double ax, az, bx, bz;
-    vel(i, ax, az);
-    vel(i + 1, bx, bz);
-    px.push_back(px.back() + (ax + bx) * 0.5 * epochS);
-    pz.push_back(pz.back() + (az + bz) * 0.5 * epochS);
-  }
-  const uint32_t have = (uint32_t)px.size() - 1;
-  const uint32_t ei = std::min(e, have);
-  double ax, az, bx, bz;
-  vel(ei, ax, az);
-  vel(ei + 1, bx, bz);
-  const double u = std::clamp(eF - (double)ei, 0.0, 1e6);
-  const double uc = std::min(u, 1.0);
-  const double shape = uc * uc * uc - uc * uc * uc * uc * 0.5;
-  dx = px[ei] + (ax * uc + (bx - ax) * shape) * epochS + (u - uc) * bx * epochS;
-  dz = pz[ei] + (az * uc + (bz - az) * shape) * epochS + (u - uc) * bz * epochS;
+  const double tt = tSec * 30.0;
+  const double fl = std::floor(tt);
+  const uint32_t tick = (uint32_t)std::min(fl, 4.0e9);
+  windfield::AirDrift(tun, seed, tick, (float)(tt - fl), dx, dz);
 }
 
 double Wrap(double v, double period) {
@@ -886,6 +832,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     rp.windDir[1] = wind.dirZ;
     rp.windSpeed = wind.speed;
     rp.windGust = wind.gust;
+    // The field block, from the same resolution the sim's copy comes from
+    // (SubmitTick), with the three clocks at the frame's sub-tick instant so
+    // the grass animates between ticks instead of stepping at 30 Hz.
+    windfield::FillWindField(rp, tun, rp.seed, tick, frameFrac, DayPhaseNow(tick));
   }
   // WIND PRIMITIVES (§4.3). The SAME resolved list SubmitTick shipped to the
   // sim this tick — WindPrims() is advanced there and read here, which is what
@@ -1611,6 +1561,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   tp.dayPhase = DayPhaseNow(tick);
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;
+  // THE WIND FIELD BLOCK (windfield.h): the gust-front advection clock, the
+  // regime's field parameters, the height profile and the terrain table. After
+  // the origin, because the table is centred on the window. A pure function
+  // of (tuning, seed, tick, window), like everything else on this stream.
+  windfield::FillWindField(tp, CurrentTuning(), seed, tick, tp.dayPhase);
   // The mirror corner for the seam's fluid-occupancy fold: the SAME clamp
   // EncodeReadbacks applies to the same input below, so the fold and the
   // voxel mirror describe one cube.

@@ -719,7 +719,7 @@ TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f, 0.05f, 24
 // this constant (WIND_GUST_K) because a shader compiled offline never
 // passes through here at all.
 TP_F(wind, gustWavelength, TUNE_WIND_GUST_WAVELENGTH, 4.8f, 0.25f, 60.0f)
-TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 1.1f, 0.0f, 5.0f)
+TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 0.35f, 0.0f, 5.0f)
 TP_F(wind, altitudeGain, TUNE_WIND_ALT_GAIN, 0.6f, -2.0f, 4.0f)
 TP_F(wind, altitudeRefY, TUNE_WIND_ALT_REF_Y, 64.0f, 0.0f, 256.0f)
 // The overlay's cost is cubic in radius/spacing, and the arrow count is
@@ -2190,6 +2190,11 @@ TP_F(wind, windSpeed, NO_WGSL, 6.0f, 0.0f, 40.0f)
 TP_F(wind, windDirDeg, NO_WGSL, 45.0f, 0.0f, 360.0f)
 TP_F(wind, gustStrength, NO_WGSL, 1.0f, 0.0f, 2.0f)
 TP_B(wind, weatherAuto, NO_WGSL, true)
+// The gust fronts ride the air at this fraction of the reference mean speed
+// (windfield.h AdvPhase). 1 = physical; 0 freezes the fronts in place and
+// leaves only the slow evolution term. Summed from tick 0, so moving it
+// jumps the pattern once.
+TP_F(wind, gustAdvect, NO_WGSL, 1.0f, 0.0f, 4.0f)
 TP_B(wind, dbgWindField, NO_WGSL, false)
 
 

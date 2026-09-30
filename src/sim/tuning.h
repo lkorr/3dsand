@@ -3546,10 +3546,20 @@ struct Tuning {
     // read as a rippling meadow; long ones as slow rolling swells. 4.8 m
     // reproduces the spatial frequency the sway code shipped with.
     float gustWavelength = TPD(wind, gustWavelength);
-    // Rate of the gust bands. This is the field's clock, shared by every
-    // consumer — see the note on render.microSwaySpeed, which is now only a
+    // EVOLUTION rate of the gust bands, rad/s — how fast the pattern changes
+    // shape in the frame moving WITH the air. Since 2026-09-30 the fronts are
+    // carried downwind by the advection clock (gustAdvect below); this is no
+    // longer what moves them, and at the old 1.1 it made the bands run
+    // upwind. Shared by every consumer — render.microSwaySpeed is only a
     // foliage-local trim on top of it.
     float gustSpeed = TPD(wind, gustSpeed);
+    // How fast the gust FRONTS travel, as a fraction of the reference mean
+    // wind (docs/RESEARCH_wind.md §13.1). 1.0 is physical: the pattern is
+    // frozen into the moving air and crosses the meadow downwind at the mean
+    // speed, so a stronger wind means more frequent gusts at a point with the
+    // wavelength unchanged. gustSpeed above is then only the slow EVOLUTION of
+    // the pattern in the air's own frame. CPU-side (windfield.h AdvPhase), live.
+    float gustAdvect = TPD(wind, gustAdvect);
     // Fractional wind speed-up per 100 world voxels (10 m) above altitudeRefY.
     // SIGNED both ways: below the reference the boundary layer slows the wind,
     // which is why a valley floor is calmer than the ridge above it. Clamped

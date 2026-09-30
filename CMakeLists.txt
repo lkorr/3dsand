@@ -478,6 +478,9 @@ add_library(sandvox_core OBJECT
   # Wind primitives: fans / spell gusts / vortices as op-stream parametric
   # objects (docs/RESEARCH_wind.md §4.3).
   src/sim/windprim.cpp
+  # The wind FIELD block: gust-front advection clock, terrain table, regime ->
+  # field parameters, weather primitives, the C++ mirror of windAtQ.
+  src/sim/windfield.cpp
   # Water bodies: the basin registry, container curve and jurisdiction ladder
   # a still lake needs before draining it can be arithmetic
   # (docs/PLAN_water_master.md).
