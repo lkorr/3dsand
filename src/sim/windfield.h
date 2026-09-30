@@ -109,4 +109,31 @@ uint32_t WeatherPrims(const Tuning& t, uint32_t seed, uint32_t tick,
                       const int32_t origin[3], WindPrimGpu* out, uint32_t cap,
                       int32_t lo[3], int32_t hi[3]);
 
+// ---- the C++ mirror of windAtQ: readouts and the wind-field gate ------------
+// The ambient INTEGER field (primitives excluded) at world cell (x, y, z) for
+// `tick`, in its component parts, metres per second. Resolved from the same
+// wf* block the tick ships (windfield.cpp says how it is kept in step).
+struct FieldProbe {
+  bool inTable = false;
+  float groundY = 0.0f;        // table ground under the cell, world Y
+  float haglM = 0.0f;          // height above that ground, metres
+  float profile = 0.0f;        // log-law profile x coupling
+  float exposure = 0.0f;       // s in [-1, 1]: ridge > 0, hollow < 0
+  float expMul = 1.0f;         // the exposure factor it produced
+  float ramp = 1.0f;           // profile x exposure x altitude term
+  float leeMean = 1.0f, leeGust = 1.0f;
+  float mean[3] = {}, bands[3] = {}, extra[3] = {}, total[3] = {};
+  float band1 = 0.0f;          // the base band's along-wind component, unscaled
+  float refSpeed = 0.0f;       // the weather's mean at the reference height
+  float gustAmp = 0.0f;        // the weather's gust amplitude there
+  float weatherHeadingDeg = 0.0f, localHeadingDeg = 0.0f;
+  float gustExcess = 0.0f;     // gust bands along the local mean, m/s
+  WindStateQ q;                // the weather words behind all of it
+};
+FieldProbe Probe(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
+                 const int32_t origin[3], int32_t x, int32_t y, int32_t z);
+// The same for n cells (xyz packed), resolving the weather once.
+void ProbeMany(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
+               const int32_t origin[3], const int32_t* xyz, int n, FieldProbe* out);
+
 }  // namespace windfield

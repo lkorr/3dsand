@@ -3091,7 +3091,8 @@ fn wq(a : i32, b : i32) -> i32 {
 //
 // Every intermediate is bounded by construction: |x| <= 65536, and the peak of
 // x*(65536-|x|) is at |x| = 32768 where it is 2^30 — inside i32 with a bit to
-// spare, so no staging shift is needed and the sine keeps its full precision.
+// spare. The correction's square is NOT (|y| reaches 65536): it is staged, see
+// below. src/sim/windfield.cpp MirrorSinQ is the C++ twin.
 fn windSinQ(a : i32) -> i32 {
   // Fold to [-pi, pi): (a mod 2pi) - pi, so the parabola's symmetric form
   // applies. The pi shift is undone by the negation at the end (sin(t-pi) =
@@ -3100,8 +3101,13 @@ fn windSinQ(a : i32) -> i32 {
   let ax = abs(x);
   let par = (ax * (65536 - ax)) / 65536;
   var y = 4 * select(par, -par, x < 0);
+  // y|y| / 65536, STAGED: |y| reaches 65536 and ay * ay overflowed i32 for
+  // every |sin| > 0.707 until 2026-09-30 — the wrap made sin(45 deg) read 0.48
+  // and the peak 0.77, so the sim's gusts were clipped flat on top. Halving
+  // both factors keeps the square under 2^30 at the cost of one low bit.
   let ay = abs(y);
-  let sq = select((ay * ay) / 65536, -((ay * ay) / 65536), y < 0);
+  let a2 = ((ay >> 1u) * (ay >> 1u)) / 16384;
+  let sq = select(a2, -a2, y < 0);
   y = y + (14746 * (sq - y)) / 65536;   // 0.225 in Q16.16
   return -y;
 }

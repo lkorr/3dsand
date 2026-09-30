@@ -22,6 +22,7 @@
 #include "sim/tuning.h"  // the Combat panel edits melee/combatfx/gore live
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
 #include "sim/weather.h" // the weather row: preset pin + readout
+#include "sim/windfield.h" // the wind & weather section: regimes + readout
 #include "ui/dialogue_ui.h"
 #include "ui/inventory_ui.h"
 #include "ui/refs_ui.h"
@@ -1605,11 +1606,172 @@ void Overlay::DrawDevWorld(UIState& s) {
     if (changed) SetCurrentTuning(t);
   }
 
-  // ---- wind force multipliers, one per tier ----
-  // Live: these ride TickParams. Split by tier because that is how the engine
-  // is split — the CA steers what is already moving, particles carry the
-  // violence — and pinning one to 0 shows which tier an effect comes from.
-  if (Section("Wind")) {
+  // ---- WIND & WEATHER (docs/RESEARCH_wind.md §13) ----
+  // One section, grouped as the model is: the regime that sets the wind's
+  // character, the profile/terrain ramp, the gusts, local winds, storms, the
+  // visuals. Every knob here is CPU-side (it rides the wf* block or
+  // RenderParams) and applies on the next tick with no F5, EXCEPT the ones
+  // marked (F5), which are compiled into the shaders.
+  if (Section("Wind & weather")) {
+    Tuning t = CurrentTuning();
+    Tuning::Wind& w = t.wind;
+    bool changed = false;
+    const UIState::WindReadout& r = s.wind;
+
+    // ---- the readout: the ambient field where you stand ----
+    if (r.valid) {
+      static const char* kSrc[] = {"manual", "sky", "epochs", "pinned"};
+      ImGui::Text("%s  I %.2f  gale %.2f  storm %.2f", r.source >= 0 && r.source < 4 ? kSrc[r.source] : "?",
+                  r.intensity, r.gale, r.convective);
+      ImGui::SetItemTooltip("Who set the regime (manual knobs / the sky's preset ladder / the wind's own\n"
+                            "epochs / a pinned regime), and the three regime inputs: intensity (~Beaufort/12),\n"
+                            "gale weight, convective-storm weight.");
+      ImGui::Text("ref %.1f m/s  gust %.1f  heading %.0f deg", r.refSpeed, r.gustAmp, r.headingDeg);
+      ImGui::Text("here %.1f m/s (mean %.1f, gusts %+.1f, local %.1f)", r.totalMs, r.meanMs, r.gustExcess,
+                  r.extraMs);
+      ImGui::SetItemTooltip("The C++ mirror of the SIM's windAtQ (windfield.h Probe) at your head height:\n"
+                            "total horizontal speed, the mean after the ramp, the gust bands along the\n"
+                            "mean right now, and the thermal + slope + sea terms. Primitives excluded.");
+      ImGui::Text("%.1f m above ground (y %.0f)  profile %.2f", r.haglM, r.groundY, r.profile);
+      ImGui::Text("exposure %+.2f -> x%.2f  ramp x%.2f  lee x%.2f", r.exposure, r.expMul, r.ramp, r.leeMean);
+      ImGui::TextDisabled("stability %+.2f  coupling %.2f  meander %.0f deg  heading here %.0f", r.stability,
+                          r.coupling, r.wanderDeg, r.localHeadingDeg);
+      ImGui::TextDisabled("thermal %.1f  slope %+.1f  sea %+.1f m/s  gust frac %.2f", r.thermalMs, r.slopeMs,
+                          r.seaMs, r.gustFrac);
+      if (r.stormPhase >= 0.0f)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "storm cycle %.0f%%  envelope x%.2f  jump %+.0f deg",
+                           r.stormPhase * 100.0f, r.envelope, r.jumpDeg);
+      ImGui::TextDisabled("terrain table: %u column queries on its last rebuild", r.terrQueries);
+    }
+
+    // ---- Weather: the preset picker and the manual intensity ----
+    if (ImGui::TreeNodeEx("Weather##wnd", ImGuiTreeNodeFlags_DefaultOpen)) {
+      const auto& regs = windfield::Regimes();
+      const float bw = CellWidth(4);
+      const bool autoOn = w.regime.empty() || w.regime == "auto";
+      if (ToggleButton("auto (sky)##wreg", autoOn, bw)) { w.regime = "auto"; changed = true; }
+      ImGui::SetItemTooltip("The sky drives the wind: each sky preset names a regime and the sky's\n"
+                            "ladder blends them (a storm sky blows a storm, fog is calm).");
+      int n = 1;
+      for (const windfield::Regime& g : regs) {
+        if (n++ % 4 != 0) ImGui::SameLine();
+        const bool on = w.regime == g.name;
+        if (ToggleButton((g.label + "##wreg" + g.name).c_str(), on, bw)) {
+          w.regime = on ? "auto" : g.name;
+          changed = true;
+        }
+        if (!g.about.empty()) ImGui::SetItemTooltip("%s", g.about.c_str());
+      }
+      bool ovr = w.intensity >= 0.0f;
+      if (ImGui::Checkbox("manual intensity##wnd", &ovr)) {
+        w.intensity = ovr ? std::max(r.intensity, 0.0f) : -1.0f;
+        changed = true;
+      }
+      ImGui::SetItemTooltip("Overrides the intensity whatever the sky or a pinned regime says (live).\n"
+                            "0.05 calm, 0.3 breezy, 0.5 windy, 0.8 gale.");
+      if (ovr) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        changed |= EditableSliderFloat("##wint", &w.intensity, 0.0f, 1.0f, "%.2f");
+      }
+      changed |= ImGui::Checkbox("evolving weather##wnd", &w.weatherAuto);
+      ImGui::SetItemTooltip("On: heading and mood wander by epoch and the sky drives the regime.\n"
+                            "Off: heading = direction below, intensity 0.3 (so the mean at the\n"
+                            "reference height IS the wind speed below) unless pinned.");
+      changed |= EditableSliderFloat("wind speed##wnd", &w.windSpeed, 0.0f, 40.0f, "%.1f m/s");
+      ImGui::SetItemTooltip("The mean at the reference height at intensity 0.3 (breezy). The\n"
+                            "regime's intensity curve multiplies it.");
+      changed |= EditableSliderFloat("direction##wnd", &w.windDirDeg, 0.0f, 360.0f, "%.0f deg");
+      changed |= EditableSliderFloat("mood spread##wnd", &w.moodSpread, 0.0f, 1.0f, "%.2f");
+      changed |= EditableSliderFloat("speed at calm##wnd", &w.speedCalmMul, 0.0f, 1.0f, "%.2fx");
+      changed |= EditableSliderFloat("speed at gale##wnd", &w.speedGaleMul, 1.0f, 10.0f, "%.2fx");
+      changed |= EditableSliderFloat("speed at max##wnd", &w.speedMaxMul, 1.0f, 12.0f, "%.2fx");
+      changed |= EditableSliderFloat("mixing intensity##wnd", &w.mixIntensity, 0.05f, 1.0f, "%.2f");
+      ImGui::SetItemTooltip("Wind mixes the day/night stability away, to neutral by this intensity.");
+      changed |= EditableSliderFloat("stable decoupling##wnd", &w.stableDecouple, 0.0f, 0.95f, "%.2f");
+      changed |= EditableSliderFloat("decoupling depth##wnd", &w.decoupleHeight, 1.0f, 200.0f, "%.0f m");
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Profile & terrain##wnd")) {
+      changed |= EditableSliderFloat("roughness z0##wnd", &w.roughness, 0.001f, 2.0f, "%.3f m");
+      changed |= EditableSliderFloat("reference height##wnd", &w.profileRef, 0.1f, 50.0f, "%.1f m");
+      ImGui::SetItemTooltip("Height above ground where the mean equals the authored speed.");
+      changed |= EditableSliderFloat("profile floor##wnd", &w.profileFloor, 0.0f, 1.0f, "%.2fx");
+      changed |= EditableSliderFloat("profile cap##wnd", &w.profileCap, 1.0f, 4.0f, "%.2fx");
+      changed |= EditableSliderFloat("outside table##wnd", &w.profileNeutral, 0.1f, 4.0f, "%.2fx");
+      changed |= EditableSliderFloat("altitude gain##wnd", &w.absGain, -0.5f, 1.0f, "%.2f /100m");
+      changed |= EditableSliderFloat("neighbourhood##wnd", &w.tpiRadius, 13.0f, 400.0f, "%.0f m");
+      ImGui::SetItemTooltip("TPI radius: the mean ground is taken over this. Rebuilds the table.");
+      changed |= EditableSliderFloat("exposure scale##wnd", &w.tpiScale, 1.0f, 400.0f, "%.0f m");
+      changed |= EditableSliderFloat("ridge gain light##wnd", &w.ridgeLight, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("ridge gain strong##wnd", &w.ridgeStrong, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("hollow shelter light##wnd", &w.valleyLight, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("hollow shelter strong##wnd", &w.valleyStrong, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("exposure depth##wnd", &w.exposureDepth, 1.0f, 400.0f, "%.0f m");
+      changed |= EditableSliderFloat("water radius##wnd", &w.seaRadius, 13.0f, 400.0f, "%.0f m");
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Gusts##wnd")) {
+      changed |= EditableSliderFloat("gustiness x##wnd", &w.gustStrength, 0.0f, 2.0f, "%.2fx");
+      changed |= EditableSliderFloat("gust frac light##wnd", &w.gustLight, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("gust frac strong##wnd", &w.gustStrong, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("convective extra##wnd", &w.gustConvective, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("gale gust frac##wnd", &w.galeGust, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("front speed##wnd", &w.gustAdvect, 0.0f, 4.0f, "%.2fx mean");
+      ImGui::SetItemTooltip("Gust fronts travel downwind at this fraction of the mean. Re-sums the\n"
+                            "front clock from tick 0, so the pattern jumps once.");
+      changed |= EditableSliderFloat("meander light##wnd", &w.wanderLight, 0.0f, 90.0f, "%.0f deg");
+      changed |= EditableSliderFloat("meander strong##wnd", &w.wanderStrong, 0.0f, 90.0f, "%.0f deg");
+      changed |= EditableSliderFloat("meander period##wnd", &w.wanderPeriod, 5.0f, 600.0f, "%.0f s");
+      changed |= EditableSliderFloat("meander scale##wnd", &w.wanderWavelength, 5.0f, 1000.0f, "%.0f m");
+      changed |= EditableSliderFloat("thermals##wnd", &w.thermalGust, 0.0f, 10.0f, "%.1f m/s");
+      changed |= EditableSliderFloat("thermal cells##wnd", &w.thermalWavelength, 2.0f, 400.0f, "%.0f m");
+      changed |= EditableSliderFloat("thermal period##wnd", &w.thermalPeriod, 1.0f, 300.0f, "%.0f s");
+      ImGui::TextDisabled("(F5) wavelength %.1f m, evolution %.2f rad/s", w.gustWavelength, w.gustSpeed);
+      ImGui::SetItemTooltip("gustWavelength and gustSpeed are compiled into the shaders: edit them in\n"
+                            "tuning.json / the tuner's Wind tab and press F5.");
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Local winds##wnd")) {
+      changed |= EditableSliderFloat("slope wind##wnd", &w.slopeWind, 0.0f, 10.0f, "%.1f m/s");
+      ImGui::SetItemTooltip("Up the slopes by day, down them at night, on light-wind days.");
+      changed |= EditableSliderFloat("night drainage##wnd", &w.slopeNight, 0.0f, 2.0f, "%.2fx");
+      changed |= EditableSliderFloat("slope depth##wnd", &w.slopeDepth, 1.0f, 200.0f, "%.0f m");
+      changed |= EditableSliderFloat("sea breeze##wnd", &w.seaBreeze, 0.0f, 15.0f, "%.1f m/s");
+      changed |= EditableSliderFloat("land breeze##wnd", &w.seaNight, 0.0f, 2.0f, "%.2fx");
+      changed |= EditableSliderFloat("breeze depth##wnd", &w.seaDepth, 1.0f, 400.0f, "%.0f m");
+      changed |= EditableSliderFloat("fade by##wnd", &w.localFade, 0.5f, 40.0f, "%.1f m/s");
+      ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNode("Storms##wnd")) {
+      changed |= EditableSliderFloat("cycle##wnd", &w.stormCycle, 30.0f, 3600.0f, "%.0f s");
+      changed |= EditableSliderFloat("lull##wnd", &w.stormLull, 0.0f, 1.0f, "%.2fx");
+      changed |= EditableSliderFloat("gust front##wnd", &w.stormFront, 1.0f, 5.0f, "%.2fx");
+      changed |= EditableSliderFloat("post-front##wnd", &w.stormDecay, 1.0f, 4.0f, "%.2fx");
+      changed |= EditableSliderFloat("storm gustiness##wnd", &w.stormGust, 0.0f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("direction jump##wnd", &w.stormJump, 0.0f, 180.0f, "%.0f deg");
+      changed |= ImGui::SliderInt("downbursts##wnd", &w.stormBursts, 0, 6);
+      changed |= EditableSliderFloat("burst radius##wnd", &w.stormBurstRadius, 3.0f, 51.0f, "%.0f m");
+      changed |= ImGui::Checkbox("front jet##wnd", &w.stormFrontJet);
+      changed |= EditableSliderFloat("gale holds heading##wnd", &w.galeHold, 0.0f, 1.0f, "%.2f");
+      ImGui::SeparatorText("lee turbulence");
+      changed |= EditableSliderFloat("onset##wndlee", &w.leeOnset, 0.0f, 1.0f, "I %.2f");
+      changed |= EditableSliderFloat("strength##wndlee", &w.leeStrength, 0.0f, 1.0f, "%.2f");
+      changed |= EditableSliderFloat("slope##wndlee", &w.leeSlope, 0.05f, 3.0f, "%.2f");
+      changed |= EditableSliderFloat("depth##wndlee", &w.leeDepth, 1.0f, 100.0f, "%.0f m");
+      changed |= EditableSliderFloat("reverse flow##wndlee", &w.leeReverse, 0.0f, 1.0f, "%.2f");
+      changed |= EditableSliderFloat("gust boost##wndlee", &w.leeGust, 0.0f, 4.0f, "%.2f");
+      ImGui::TreePop();
+    }
+
+    if (changed) SetCurrentTuning(t);
+
+    // ---- the per-tier force multipliers (unchanged: they ride TickParams) ----
+    ImGui::SeparatorText("force multipliers");
     ImGui::SetNextItemWidth(-110);
     if (EditableSliderFloat("x voxels", &s.windGasScale, 0.0f, 16.0f, "%.2fx"))
       s.windTuningDirty = true;

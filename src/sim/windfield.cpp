@@ -524,6 +524,377 @@ void FillWindField(RenderParams& rp, const Tuning& t, uint32_t seed, uint32_t ti
 }
 
 // ============================================================================
+// THE C++ MIRROR OF windAtQ (readouts and the wind-field gate)
+// ============================================================================
+//
+// A transcription of the INTEGER field in common.wgsl — windSinQ, wq,
+// windPhaseQ, windClockQ, windTerrQ, windProfQ, windRampQ, windWanderQ,
+// windThermalQ, windLocalQ, windLeeQ and windAtQ's composition — evaluated on
+// the same wf* block (filled by the same Write template the TickParams gets).
+// It exists for two consumers: the F1 wind readout ("what is the wind where I
+// stand, and why") and the `wind-field` gate, which asserts the model's
+// behaviour (spawn ~1x, ridges > hollows, fronts travel downwind, a gale holds
+// its heading) as numbers without a GPU round trip.
+//
+// DESIGN.md §9b invariant 2 allows a C++ mirror only with a checker:
+// scripts/check_invariants.py `windmirror` holds the constants of the
+// integer functions (windSinQ's 0.225 and the staged square, the meander's
+// 0.65 / 0.35 and 3/5, the thermal's 0.4 and 83/100, the band mix) to the
+// same literals here. Nothing compares the two bit for bit at run time; if
+// you change a function in the WGSL, change it here in the same edit.
+//
+// Integer overflow wraps in WGSL; here every i32 product goes through W() so
+// the C++ does the same thing instead of being undefined behaviour.
+// Primitives are NOT included: the probe is the ambient field.
+
+namespace {
+
+int32_t W(int64_t v) { return (int32_t)(uint32_t)(uint64_t)v; }
+int32_t Tdiv(int32_t a, int32_t b) { return a / b; }   // C++ and WGSL both truncate
+
+int32_t Mwq(int32_t a, int32_t b) {
+  const int32_t m = W((int64_t)(std::abs(a) >> 8) * (int64_t)(std::abs(b) >> 8));
+  return ((a ^ b) < 0) ? -m : m;
+}
+
+int32_t MirrorSinQ(int32_t a) {
+  const int32_t x = W((int64_t)((a & 65535) - 32768) * 2);
+  const int32_t ax = std::abs(x);
+  const int32_t par = Tdiv(W((int64_t)ax * (65536 - ax)), 65536);
+  int32_t y = 4 * (x < 0 ? -par : par);
+  const int32_t ay = std::abs(y);
+  const int32_t a2 = Tdiv(W((int64_t)(ay >> 1) * (ay >> 1)), 16384);
+  const int32_t sq = y < 0 ? -a2 : a2;
+  y = y + Tdiv(W((int64_t)14746 * (sq - y)), 65536);
+  return -y;
+}
+
+uint32_t MirrorPhaseQ(int32_t px, int32_t pz, int32_t dx, int32_t dz, int32_t k) {
+  const int32_t kx = Tdiv(W((int64_t)dx * k), 65536);
+  const int32_t kz = Tdiv(W((int64_t)dz * k), 65536);
+  return ((uint32_t)px * (uint32_t)kx + (uint32_t)pz * (uint32_t)kz) & 65535u;
+}
+
+uint32_t MirrorClockQ(uint32_t tick, uint32_t k) { return (tick * k) >> 16; }
+
+// The TUNE_*-derived constants, const-evaluated in f32 as Tint does.
+struct MirrorConsts {
+  uint32_t t100, t083, t131, t173, t219, t261;
+  int32_t k100, k120, k070, k050, k030;
+  int32_t ph21, ph17, ph22, ph13;
+  int32_t cross, vert, w1, w2;
+};
+MirrorConsts MakeConsts(const Tuning& t) {
+  MirrorConsts c{};
+  const float rad = 65536.0f / 6.28318531f;
+  const float hz = 4294967296.0f / (6.28318531f * 30.0f);
+  const float rate = std::clamp(t.wind.gustSpeed, 0.0f, 64.0f);
+  c.t100 = (uint32_t)(rate * 1.00f * hz);
+  c.t083 = (uint32_t)(rate * 0.83f * hz);
+  c.t131 = (uint32_t)(rate * 1.31f * hz);
+  c.t173 = (uint32_t)(rate * 1.73f * hz);
+  c.t219 = (uint32_t)(rate * 2.19f * hz);
+  c.t261 = (uint32_t)(rate * 2.61f * hz);
+  const int32_t kb = GustKBase(t);
+  c.k100 = kb;
+  c.k120 = (int32_t)std::nearbyint((float)kb * 1.2f);
+  c.k070 = (int32_t)std::nearbyint((float)kb * 0.7f);
+  c.k050 = (int32_t)std::nearbyint((float)kb * 0.5f);
+  c.k030 = (int32_t)std::nearbyint((float)kb * 0.3f);
+  c.ph21 = (int32_t)std::nearbyint(2.1f * rad);
+  c.ph17 = (int32_t)std::nearbyint(1.7f * rad);
+  c.ph22 = (int32_t)std::nearbyint(2.2f * rad);
+  c.ph13 = (int32_t)std::nearbyint(1.3f * rad);
+  c.cross = (int32_t)std::nearbyint(0.6f * 65536.0f);
+  c.vert = (int32_t)std::nearbyint(0.18f * 65536.0f);
+  c.w1 = (int32_t)std::nearbyint(0.7f * 65536.0f);
+  c.w2 = (int32_t)std::nearbyint(0.3f * 65536.0f);
+  return c;
+}
+
+// The params the mirror reads: TickParams' wind members, by the same names,
+// so the Write template fills it exactly as it fills the real struct.
+struct MirrorParams {
+  uint32_t tick = 0;
+  int32_t windDirQ[2] = {0, 65536};
+  int32_t windSpeedQ = 0, windGustQ = 0;
+  uint32_t wfAdvPhase = 0, wfWanderPhase = 0;
+  int32_t wfWanderAmp = 0, wfWanderK = 0, wfThermalQ = 0;
+  uint32_t wfThermalPhase = 0;
+  int32_t wfCouplingQ = 65536, wfDecoupleH = 1, wfRidgeQ = 0, wfValleyQ = 0, wfExpDepth = 1;
+  int32_t wfAbsGainQ = 0, wfLeeQ = 0, wfLeeSlopeQ = 32768, wfLeeDepth = 1, wfLeeRevQ = 0;
+  int32_t wfLeeGustQ = 0, wfSlopeWindQ = 0, wfSlopeDepth = 1, wfSeaBreezeQ = 0, wfSeaDepth = 1;
+  int32_t wfSeaRadius = 1, wfSeaLevelY = 0, wfNeutralQ = 65536;
+  int32_t wfTerrBase[2] = {0, 0};
+  uint32_t wfTerrOn = 0;
+  int32_t wfThermalK = 0;
+  int32_t wfProf[kWindProfKnots] = {};
+  uint32_t wfTerr[kWindTerrWords] = {};
+};
+
+struct MTerr {
+  int32_t hQ10 = 0, gx = 0, gz = 0, e = 0, w = 0, wgx = 0, wgz = 0, edge = 0;
+};
+
+int32_t HI(uint32_t w) { return (int32_t)(int16_t)(w & 0xFFFFu); }
+int32_t EI(uint32_t w) { return (int32_t)(int8_t)((w >> 16) & 0xFFu); }
+int32_t WI(uint32_t w) { return (int32_t)(w >> 24); }
+
+MTerr MirrorTerr(const MirrorParams& T, int32_t px, int32_t py, int32_t pz) {
+  MTerr o;
+  o.hQ10 = py * 1024;
+  if (T.wfTerrOn == 0) return o;
+  const int32_t ux = px - 16, uz = pz - 16;
+  const int32_t cx = ux >> 5, cz = uz >> 5;
+  const int32_t fx = ux & 31, fz = uz & 31;
+  const int32_t ix = cx - T.wfTerrBase[0], iz = cz - T.wfTerrBase[1];
+  const int32_t n1 = (int32_t)kWindTerrN - 2;
+  if (ix < 0 || iz < 0 || ix > n1 || iz > n1) return o;
+  const int32_t dmin = std::min(std::min(ix, n1 - ix), std::min(iz, n1 - iz));
+  o.edge = std::min(dmin * 32768, 65536);
+  const uint32_t m = kWindTerrN - 1;
+  const uint32_t x0 = (uint32_t)cx & m, x1 = (uint32_t)(cx + 1) & m;
+  const uint32_t z0 = (uint32_t)cz & m, z1 = (uint32_t)(cz + 1) & m;
+  const uint32_t w00 = T.wfTerr[z0 * kWindTerrN + x0], w10 = T.wfTerr[z0 * kWindTerrN + x1];
+  const uint32_t w01 = T.wfTerr[z1 * kWindTerrN + x0], w11 = T.wfTerr[z1 * kWindTerrN + x1];
+  const int32_t ax = 32 - fx, az = 32 - fz;
+  const int32_t h00 = HI(w00), h10 = HI(w10), h01 = HI(w01), h11 = HI(w11);
+  o.hQ10 = h00 * ax * az + h10 * fx * az + h01 * ax * fz + h11 * fx * fz;
+  o.gx = ((h10 - h00) * az + (h11 - h01) * fz) * 64;
+  o.gz = ((h01 - h00) * ax + (h11 - h10) * fx) * 64;
+  const int32_t es = EI(w00) * ax * az + EI(w10) * fx * az + EI(w01) * ax * fz + EI(w11) * fx * fz;
+  o.e = (es * 64) / 127;
+  const int32_t a00 = WI(w00), a10 = WI(w10), a01 = WI(w01), a11 = WI(w11);
+  o.w = ((a00 * ax * az + a10 * fx * az + a01 * ax * fz + a11 * fx * fz) * 64) / 255;
+  const int32_t rad = T.wfSeaRadius;
+  o.wgx = ((((a10 - a00) * az + (a11 - a01) * fz) * 64) / 255) * rad / 32;
+  o.wgz = ((((a01 - a00) * ax + (a11 - a10) * fx) * 64) / 255) * rad / 32;
+  return o;
+}
+
+int32_t Knot(const MirrorParams& T, int32_t k) { return T.wfProf[std::clamp(k, 0, 15)]; }
+int32_t MirrorProf(const MirrorParams& T, int32_t hQ10) {
+  const int32_t h = std::max(hQ10, 0);
+  const int32_t hi = h >> 10;
+  if (hi == 0) {
+    const int32_t a = Knot(T, 0);
+    return a + ((Knot(T, 1) - a) * h) / 1024;
+  }
+  int32_t k = 31;
+  while (((uint32_t)hi >> k) == 0) k--;
+  if (k >= 14) return Knot(T, 15);
+  const int32_t fr = (h - (1024 << k)) >> k;
+  const int32_t a = Knot(T, k + 1);
+  return a + ((Knot(T, k + 2) - a) * fr) / 1024;
+}
+int32_t MirrorDepthFrac(int32_t hQ10, int32_t depth) {
+  return std::min((std::min(hQ10, 1 << 24) / std::max(depth, 1)) * 64, 65536);
+}
+
+struct MRamp {
+  int32_t ramp = 65536, hQ10 = 0, pr = 0, ex = 65536;
+  MTerr tr;
+};
+MRamp MirrorRamp(const MirrorParams& T, int32_t px, int32_t py, int32_t pz) {
+  MRamp o;
+  o.tr = MirrorTerr(T, px, py, pz);
+  const int32_t absT = std::clamp(65536 + W((int64_t)(py - T.wfSeaLevelY) * (T.wfAbsGainQ >> 4)) / 64,
+                                  32768, 163840);
+  const int32_t neutral = T.wfNeutralQ;
+  if (o.tr.edge <= 0) {
+    o.ramp = Mwq(neutral, absT);
+    return o;
+  }
+  const int32_t h = std::max(py * 1024 + 512 - o.tr.hQ10, 0);
+  o.hQ10 = h;
+  const int32_t cpl = T.wfCouplingQ;
+  o.pr = Mwq(MirrorProf(T, h), cpl + Mwq(65536 - cpl, MirrorDepthFrac(h, T.wfDecoupleH)));
+  const int32_t gain = o.tr.e > 0 ? T.wfRidgeQ : T.wfValleyQ;
+  o.ex = std::clamp(65536 + Mwq(Mwq(gain, o.tr.e), 65536 - MirrorDepthFrac(h, T.wfExpDepth)),
+                    6554, 196608);
+  const int32_t full = Mwq(o.pr, o.ex);
+  const int32_t mixd = neutral + Mwq(full - neutral, o.tr.edge);
+  o.ramp = Mwq(mixd, absT);
+  return o;
+}
+
+void MirrorWander(const MirrorParams& T, const MirrorConsts& C, int32_t px, int32_t pz,
+                  int32_t dx, int32_t dz, int32_t& ox, int32_t& oz) {
+  ox = dx;
+  oz = dz;
+  const int32_t amp = T.wfWanderAmp;
+  if (amp <= 0) return;
+  const int32_t k = T.wfWanderK;
+  const uint32_t ph = T.wfWanderPhase;
+  const int32_t sa = MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, k) + ph));
+  const int32_t sc = MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, -dz, dx, (k * 3) / 5) - ph) + C.ph17);
+  const int32_t sw = Mwq(42598, sa) + Mwq(22938, sc);
+  const int32_t th = W((int64_t)amp * sw) / 65536;
+  const int32_t cs = MirrorSinQ(th + 16384), sn = MirrorSinQ(th);
+  ox = Mwq(dx, cs) + Mwq(dz, sn);
+  oz = Mwq(dz, cs) - Mwq(dx, sn);
+}
+
+void MirrorThermal(const MirrorParams& T, const MirrorConsts& C, int32_t px, int32_t pz,
+                   int32_t out[3]) {
+  out[0] = out[1] = out[2] = 0;
+  const int32_t a = T.wfThermalQ;
+  if (a <= 0) return;
+  const int32_t k = T.wfThermalK;
+  const uint32_t ph = T.wfThermalPhase;
+  const uint32_t fx = (uint32_t)px * (uint32_t)k;
+  const uint32_t fz = (uint32_t)pz * (uint32_t)((k * 83) / 100);
+  out[0] = Mwq(a, MirrorSinQ((int32_t)(fx + ph)));
+  out[1] = Mwq(a, Mwq(26214, MirrorSinQ((int32_t)(fx + fz + ph) + C.ph22)));
+  out[2] = Mwq(a, MirrorSinQ((int32_t)(fz - ph) + C.ph13));
+}
+
+void MirrorClampUnit(int32_t& gx, int32_t& gz) {
+  const int32_t m = std::max(std::abs(gx), std::abs(gz));
+  if (m <= 65536) return;
+  const int32_t d = std::max(m >> 8, 1);
+  gx = (gx / d) * 256;
+  gz = (gz / d) * 256;
+}
+
+void MirrorLocal(const MirrorParams& T, const MRamp& rq, int32_t out[3]) {
+  out[0] = out[1] = out[2] = 0;
+  if (rq.tr.edge <= 0) return;
+  int32_t v[3] = {0, 0, 0};
+  if (T.wfSlopeWindQ != 0) {
+    int32_t gx = rq.tr.gx * 3, gz = rq.tr.gz * 3;
+    MirrorClampUnit(gx, gz);
+    const int32_t f = Mwq(T.wfSlopeWindQ, 65536 - MirrorDepthFrac(rq.hQ10, T.wfSlopeDepth));
+    v[0] += Mwq(gx, f);
+    v[1] += Mwq(Mwq(gx, rq.tr.gx) + Mwq(gz, rq.tr.gz), f);
+    v[2] += Mwq(gz, f);
+  }
+  if (T.wfSeaBreezeQ != 0) {
+    int32_t gx = rq.tr.wgx, gz = rq.tr.wgz;
+    MirrorClampUnit(gx, gz);
+    const int32_t f = -Mwq(T.wfSeaBreezeQ, 65536 - MirrorDepthFrac(rq.hQ10, T.wfSeaDepth));
+    v[0] += Mwq(gx, f);
+    v[2] += Mwq(gz, f);
+  }
+  for (int i = 0; i < 3; i++) out[i] = Mwq(v[i], rq.tr.edge);
+}
+
+void MirrorLee(const MirrorParams& T, const MRamp& rq, int32_t dlx, int32_t dlz,
+               int32_t& meanMul, int32_t& gustMul) {
+  meanMul = gustMul = 65536;
+  const int32_t lee = T.wfLeeQ;
+  if (lee <= 0 || rq.tr.edge <= 0) return;
+  const int32_t sa = Mwq(rq.tr.gx, dlx) + Mwq(rq.tr.gz, dlz);
+  const int32_t s0 = std::max(T.wfLeeSlopeQ, 256);
+  const int32_t f = std::clamp(((-sa - s0) / std::max(s0 >> 8, 1)) * 256, 0, 65536);
+  int32_t l = Mwq(Mwq(lee, f), 65536 - MirrorDepthFrac(rq.hQ10, T.wfLeeDepth));
+  l = Mwq(l, rq.tr.edge);
+  meanMul = 65536 - Mwq(l, 65536 + T.wfLeeRevQ);
+  gustMul = 65536 + Mwq(l, T.wfLeeGustQ);
+}
+
+// The mirror, split into the pieces the probe reports. Q16.16 cells/s.
+struct MSample {
+  MRamp rq;
+  int32_t dlx = 0, dlz = 65536;
+  int32_t leeMean = 65536, leeGust = 65536;
+  int32_t mean[3] = {}, bands[3] = {}, extra[3] = {};
+  int32_t b1a = 0;   // the base band's along component, unscaled (the gate tracks its crest)
+};
+MSample MirrorSample(const MirrorParams& T, const MirrorConsts& C, int32_t px, int32_t py,
+                     int32_t pz) {
+  MSample o;
+  o.rq = MirrorRamp(T, px, py, pz);
+  const int32_t alt = o.rq.ramp;
+  const int32_t dx = T.windDirQ[0], dz = T.windDirQ[1];
+  MirrorWander(T, C, px, pz, dx, dz, o.dlx, o.dlz);
+  const int32_t cwx = -o.dlz, cwz = o.dlx;
+  MirrorLee(T, o.rq, o.dlx, o.dlz, o.leeMean, o.leeGust);
+  const int32_t spd = Mwq(Mwq(T.windSpeedQ, alt), o.leeMean);
+  const int32_t amp = Mwq(Mwq(T.windGustQ, alt), o.leeGust);
+  const uint32_t tick = T.tick, adv = T.wfAdvPhase;
+  const int32_t b1a = MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, C.k100) - adv -
+                                           MirrorClockQ(tick, C.t100)));
+  const int32_t b1c = Mwq(C.cross, MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, C.k120) -
+                                                        (adv * 12u) / 10u - MirrorClockQ(tick, C.t083)) + C.ph21));
+  const int32_t b1u = Mwq(C.vert, MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, C.k070) -
+                                                       (adv * 7u) / 10u - MirrorClockQ(tick, C.t131))));
+  const int32_t b2a = MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, C.k050) - adv / 2u -
+                                           MirrorClockQ(tick, C.t173)));
+  const int32_t b2c = Mwq(C.cross, MirrorSinQ((int32_t)MirrorClockQ(tick, C.t219)));
+  const int32_t b2u = Mwq(C.vert, MirrorSinQ((int32_t)(MirrorPhaseQ(px, pz, dx, dz, C.k030) -
+                                                       (adv * 3u) / 10u - MirrorClockQ(tick, C.t261))));
+  o.b1a = b1a;
+  const int32_t w1[3] = {Mwq(amp, Mwq(o.dlx, b1a) + Mwq(cwx, b1c)), Mwq(amp, b1u),
+                         Mwq(amp, Mwq(o.dlz, b1a) + Mwq(cwz, b1c))};
+  const int32_t w2[3] = {Mwq(amp, Mwq(o.dlx, b2a) + Mwq(cwx, b2c)), Mwq(amp, b2u),
+                         Mwq(amp, Mwq(o.dlz, b2a) + Mwq(cwz, b2c))};
+  int32_t th[3], loc[3];
+  MirrorThermal(T, C, px, pz, th);
+  MirrorLocal(T, o.rq, loc);
+  for (int i = 0; i < 3; i++) {
+    o.extra[i] = Mwq(th[i], alt) + loc[i];
+    o.bands[i] = Mwq(C.w1, w1[i]) + Mwq(C.w2, w2[i]);
+  }
+  o.mean[0] = Mwq(o.dlx, spd);
+  o.mean[1] = 0;
+  o.mean[2] = Mwq(o.dlz, spd);
+  return o;
+}
+
+}  // namespace
+
+void ProbeMany(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
+               const int32_t origin[3], const int32_t* xyz, int n, FieldProbe* out) {
+  static MirrorParams T;   // 16 KiB of table: not on the stack
+  const WindStateQ q = WindWeatherQ(t, seed, tick, dayPhase);
+  T.tick = tick;
+  T.windDirQ[0] = q.dirX;
+  T.windDirQ[1] = q.dirZ;
+  T.windSpeedQ = q.speed;
+  T.windGustQ = q.gust;
+  Write(T, Resolve(t, seed, tick, 0.0f, dayPhase, origin));
+  const MirrorConsts C = MakeConsts(t);
+  const float toMs = (float)kVoxelMeters / 65536.0f;
+  for (int k = 0; k < n; k++) {
+    const MSample s = MirrorSample(T, C, xyz[3 * k], xyz[3 * k + 1], xyz[3 * k + 2]);
+    FieldProbe& o = out[k];
+    o = FieldProbe{};
+    o.inTable = s.rq.tr.edge > 0;
+    o.groundY = (float)s.rq.tr.hQ10 / 1024.0f;
+    o.haglM = (float)s.rq.hQ10 / 1024.0f * (float)kVoxelMeters;
+    o.profile = (float)s.rq.pr / 65536.0f;
+    o.exposure = (float)s.rq.tr.e / 65536.0f;
+    o.expMul = (float)s.rq.ex / 65536.0f;
+    o.ramp = (float)s.rq.ramp / 65536.0f;
+    o.leeMean = (float)s.leeMean / 65536.0f;
+    o.leeGust = (float)s.leeGust / 65536.0f;
+    for (int i = 0; i < 3; i++) {
+      o.mean[i] = (float)s.mean[i] * toMs;
+      o.bands[i] = (float)s.bands[i] * toMs;
+      o.extra[i] = (float)s.extra[i] * toMs;
+      o.total[i] = o.mean[i] + o.bands[i] + o.extra[i];
+    }
+    o.band1 = (float)s.b1a / 65536.0f;
+    o.refSpeed = (float)q.speed * toMs;
+    o.gustAmp = (float)q.gust * toMs;
+    o.weatherHeadingDeg = std::atan2((float)q.dirX, (float)q.dirZ) * 57.2957795f;
+    o.localHeadingDeg = std::atan2((float)s.dlx, (float)s.dlz) * 57.2957795f;
+    const float ml = std::sqrt(o.mean[0] * o.mean[0] + o.mean[2] * o.mean[2]);
+    o.gustExcess = ml > 1e-6f ? (o.bands[0] * o.mean[0] + o.bands[2] * o.mean[2]) / ml : 0.0f;
+    o.q = q;
+  }
+}
+
+FieldProbe Probe(const Tuning& t, uint32_t seed, uint32_t tick, uint32_t dayPhase,
+                 const int32_t origin[3], int32_t x, int32_t y, int32_t z) {
+  const int32_t p[3] = {x, y, z};
+  FieldProbe o;
+  ProbeMany(t, seed, tick, dayPhase, origin, p, 1, &o);
+  return o;
+}
+
+// ============================================================================
 // THE STORM TIMELINE and LOCAL WINDS (docs/RESEARCH_wind.md §13.4)
 // ============================================================================
 //

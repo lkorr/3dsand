@@ -91,6 +91,7 @@
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
 #include "sim/wind.h"
+#include "sim/windfield.h"
 #include "sim/weather.h"
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
@@ -14031,6 +14032,50 @@ int main(int argc, char** argv) {
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;
+      // The wind readout: windfield::Probe (the C++ mirror of windAtQ) at
+      // head height, 1.5 m above the feet. Same seed, tick and window the
+      // tick's own wf* block was resolved from.
+      {
+        const IVec3 wo = world.WindowOrigin();
+        const int32_t o3[3] = {wo.x, wo.y, wo.z};
+        const windfield::FieldProbe fp = windfield::Probe(
+            CurrentTuning(), world.WorldSeed(), tick, DayPhaseNow(tick), o3,
+            (int32_t)std::floor(player.pos.x), (int32_t)std::floor(player.pos.y) + 15,
+            (int32_t)std::floor(player.pos.z));
+        UIState::WindReadout& wr = ui.wind;
+        const float toMs = (float)kVoxelMeters / 65536.0f;
+        wr.valid = true;
+        wr.source = fp.q.source;
+        wr.intensity = fp.q.intensity / 65536.0f;
+        wr.gale = fp.q.gale / 65536.0f;
+        wr.convective = fp.q.convective / 65536.0f;
+        wr.stability = fp.q.stability / 65536.0f;
+        wr.coupling = fp.q.coupling / 65536.0f;
+        wr.gustFrac = fp.q.gustFrac / 65536.0f;
+        wr.wanderDeg = fp.q.wanderAmp * (360.0f / 65536.0f);
+        wr.thermalMs = fp.q.thermal * toMs;
+        wr.slopeMs = fp.q.slopeWind * toMs;
+        wr.seaMs = fp.q.seaBreeze * toMs;
+        wr.stormPhase = fp.q.stormPhase < 0 ? -1.0f : fp.q.stormPhase / 65536.0f;
+        wr.envelope = fp.q.envelope / 65536.0f;
+        wr.jumpDeg = (float)(int32_t)fp.q.jumpBam * (180.0f / 2147483648.0f);
+        wr.refSpeed = fp.refSpeed;
+        wr.gustAmp = fp.gustAmp;
+        wr.headingDeg = fp.weatherHeadingDeg;
+        wr.localHeadingDeg = fp.localHeadingDeg;
+        wr.totalMs = std::sqrt(fp.total[0] * fp.total[0] + fp.total[2] * fp.total[2]);
+        wr.meanMs = std::sqrt(fp.mean[0] * fp.mean[0] + fp.mean[2] * fp.mean[2]);
+        wr.gustExcess = fp.gustExcess;
+        wr.extraMs = std::sqrt(fp.extra[0] * fp.extra[0] + fp.extra[2] * fp.extra[2]);
+        wr.haglM = fp.haglM;
+        wr.groundY = fp.groundY;
+        wr.profile = fp.profile;
+        wr.exposure = fp.exposure;
+        wr.expMul = fp.expMul;
+        wr.ramp = fp.ramp;
+        wr.leeMean = fp.leeMean;
+        wr.terrQueries = windfield::TerrainQueries();
+      }
 
       // crosshair material readout — same sim_pick snapshot the brush, laser
       // and prefab placer read, so the name shown is exactly the cell those

@@ -352,6 +352,10 @@ const char* const kOrder[] = {
     // disturbs a neighbour.
     "pond-shore",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
+    // The weather-driven field model (docs/RESEARCH_wind.md §13), CPU-only
+    // through windfield.h's mirror: reads the terrain table around the
+    // window and changes no world state.
+    "wind-field",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-identity", "fluid-settle",
     "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "fluid-self-react", "far-fog",  "far-downsample",
     "far-persist", "far-surface",
