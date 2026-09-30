@@ -23,6 +23,8 @@
   "alchemy.coherenceWorstMax": "0.08",
   "alchemy.coherenceAfterMax": "0.03",
   "alchemy.fallRatioMin": "0.85",
+  "alchemy.soakBuriedMax": "5",
+  "_alchemySoak_about": "alchemy-soak THRESHOLD: water poured upside down onto a sand bed may have at most soakBuriedMax particles under 3+ grains at any frame (2026-09-29: 99 before the fix, 0 after), and none once settled.",
   "alchemy.pourOutRatioMax": "1.5",
   "_alchemyPourSeeds_about": "alchemy-pour runs its pour under pourSeeds RNG seeds and asserts pourMinFrac / pourMaxSpillFrac on the MEAN (one pour is a chaotic sample: 0..60 eighths of oil spilled across seeds of the same code); conservation and the spill's source filing on every run. alchemy-resort: at most resortMaxLeft (or a twentieth of the mix, if more) out-of-order pairs may be left after the re-sort: the ~15 pinned at the glass.",
   "alchemy.pourSeeds": "5",

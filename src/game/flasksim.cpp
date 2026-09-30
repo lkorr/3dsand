@@ -1392,6 +1392,32 @@ void FlaskSim::CollideLiquid() {
         continue;
       }
     }
+    // DEEP IN A BED, past the seep's reach: the liquid PERCOLATES out along
+    // its own column -- up to the first pixel no resting grain holds (down,
+    // for a liquid heavier than the powder), through the grains, never
+    // through glass. Left where it was, a particle inside a packed bed with
+    // the vessel still had nowhere to go: it sat inside the grain for good,
+    // twitching under the relaxation and keeping the vessel awake.
+    {
+      const uint8_t side = inside_.empty() ? 0 : inside_[(size_t)y * W + x];
+      const int gi0 = grid_[(size_t)y * W + x] - 1;
+      const bool sinks = gi0 >= 0 && mass_[psub_[i]] > mass_[grains_[gi0].sub];
+      int to = -1;
+      for (int pass = 0; pass < 2 && to < 0; pass++) {
+        const int dir = (pass == 0) != sinks ? 1 : -1;
+        for (int yy = y + dir; yy >= 0 && yy < H; yy += dir) {
+          const size_t k = (size_t)yy * W + x;
+          if (wall_[k] || (!inside_.empty() && inside_[k] != side)) break;
+          if (!wallGrain(k)) { to = yy; break; }
+        }
+      }
+      if (to >= 0) {
+        const V2 d{0.0f, (float)(to - y)};
+        px_[i] = px_[i] + d;
+        pprev_[i] = pprev_[i] + d;  // carried, not launched
+        continue;
+      }
+    }
     // (one sweep memo epoch for this pass)
     // TRAPPED past the seep's reach (liquid squeezed between a rising
     // bottom and a sand bed it cannot push). The liquid wins: the GRAIN is
@@ -1994,8 +2020,8 @@ void FlaskSim::StepGrains() {
     // grain that is itself moving holds nothing up), anywhere out of every
     // vessel (liquid in flight carries what is in it), or with the liquid
     // running past it (relative to its vessel) faster than kEntrainFree --
-    // or, held or not, faster than kEntrainHeld (a hard slosh lifts a bed's
-    // top). Left to the CA as a still pixel, a grain in a falling blob of
+    // or, held but at the bed's surface, running across or off it faster
+    // than kEntrainHeld (a hard slosh scours a bed's top). Left to the CA as a still pixel, a grain in a falling blob of
     // slime sank through it at the CA's settling rate, a tenth of a pixel a
     // step, and held the slime up on it: the blob hovered.
     if (cfg_.grainFlow) {
@@ -2026,10 +2052,22 @@ void FlaskSim::StepGrains() {
         // pocket in a bed) is left to the CA, which drops it into the gap.
         int cb = 0;
         if (!held && ml < mg) LiquidMassAt(g.x, g.y - 1, &cb, nullptr);
+        // A HELD grain is lifted only by flow ACROSS or OFF what holds it,
+        // and only from the bed's surface (no grain on it): a hard slosh
+        // scours the top, but liquid falling ONTO a bed pushes it into its
+        // own support, which pushes back. Taken at full speed, a poured
+        // stream (2-3 px a step where it lands) flung the top grain, ran
+        // into its pixel, flung the one under it, and so on down: water
+        // tunnelled through a sand bed and was left in pockets inside it
+        // (lab, 2026-09-29: 51 particles buried mid-pour, 0 with this).
         constexpr float kEntrainFree = 0.25f, kEntrainHeld = 1.0f;
-        if ((!held && ((ml < mg && cb) || g.home < 0 || sp > kEntrainFree)) || sp > kEntrainHeld) {
-          g.vx = lr.x;
-          g.vy = std::min(lr.y, follow);
+        const V2 scour{lr.x, std::max(lr.y, 0.0f)};
+        const bool surface = g.y + 1 >= H || !grid_[(size_t)(g.y + 1) * W + g.x];
+        const bool scoured = surface && Len(scour) > kEntrainHeld;
+        if ((!held && ((ml < mg && cb) || g.home < 0 || sp > kEntrainFree)) || scoured) {
+          const V2 go = held ? scour : lr;
+          g.vx = go.x;
+          g.vy = std::min(go.y, follow);
           if (g.vx == 0 && g.vy == 0) g.vy = -1e-4f;
           g.fx = g.x + 0.5f;
           g.fy = g.y + 0.5f;

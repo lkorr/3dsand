@@ -844,7 +844,7 @@ const char* const kOrder[] = {
     // blood landing on it (owner report 2026-09-22). Each ticks the world and
     // regenerates it on the way out.
     "corpse-crossheat", "garment-burn", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-sand", "vessel-mpm", "vessel-break",
-    "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-resort", "alchemy-spawn", "alchemy-remember", "alchemy-sand-carry",
+    "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-resort", "alchemy-spawn", "alchemy-remember", "alchemy-sand-carry", "alchemy-soak",
     "alchemy-lift", "alchemy-place", "alchemy-coherence",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
     "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-gas-vent", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode", "alchemy-ether-fire",

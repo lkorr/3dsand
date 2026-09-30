@@ -479,6 +479,75 @@ Status GateAlchemySandCarry(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// WATER POURED ON SAND STAYS ON TOP OF IT (owner, 2026-09-29: "liquids just
+// fall through sand and then individual droplets get stuck within the powder
+// and spasm around"). A full-size flask with a sand bed; a second one,
+// holding water, is carried over it and turned upside down, its mouth 30 px
+// over the other's. Two defects, each asserted: the stream landing on the bed
+// flung the top grain, ran into its pixel and flung the next, tunnelling down
+// (lab: ~100 particles buried at once mid-pour) -- at most
+// alchemy.soakBuriedMax particles may be under 3+ grains at any frame; and a
+// particle deep in the bed stayed inside its grain for good, twitching -- none
+// may be buried once it settles, and the flask must sleep.
+Status GateAlchemySoak(Ctx& c, std::string& detail) {
+  const int water = MatId(c, "water"), sand = MatId(c, "sand");
+  if (water < 0 || sand < 0) { detail = "missing water/sand"; return Status::Fail; }
+  Composition bed, jug;
+  bed.Add((uint16_t)sand, 300);
+  jug.Add((uint16_t)water, 300);
+  auto subs = alchemy::SubstancesFor(c.mats, {&bed, &jug});
+  alchemy::SimConfig cfg = BenchConfig();
+  cfg.tableY = 4;
+  FlaskSim s(cfg);
+  s.SetSubstances(subs);
+  const alchemy::VesselShape shape = BenchFlask(1024);
+  const float h = shape.height;
+  const int A = s.AddVessel(shape, {{150, 4}, 0}, bed);
+  // Turned about its mouth, which slides in over A's first (by 40% of the turn).
+  auto pose = [&](float t) {
+    const float ang = 3.14159f * std::clamp(t, 0.0f, 1.0f), e = std::min(1.0f, t / 0.4f);
+    const V2 m{150.0f + 150.0f * (1 - e), 4 + h + 30.0f + 60.0f * (1 - e)};
+    return Xform{{m.x + h * std::sin(ang), m.y - h * std::cos(ang)}, ang};
+  };
+  const int B = s.AddVessel(shape, pose(0), jug);
+  // Particles under 3+ grains of their own column.
+  const int W = cfg.gridW, H = cfg.gridH;
+  std::vector<V2> gp;
+  std::vector<uint8_t> grid;
+  auto buried = [&]() {
+    s.GrainPositions(gp);
+    grid.assign((size_t)W * H, 0);
+    for (const V2& p : gp) grid[(size_t)p.y * W + (int)p.x] = 1;
+    int n = 0;
+    for (const V2& p : s.Positions()) {
+      const int x = (int)std::floor(p.x), y = (int)std::floor(p.y);
+      if (x < 0 || x >= W || y < 0 || y >= H) continue;
+      int above = 0;
+      for (int yy = y + 1; yy < H && yy < y + 40; yy++) above += grid[(size_t)yy * W + x];
+      n += above >= 3;
+    }
+    return n;
+  };
+  int worst = 0;
+  for (int f = 0; f < 900; f++) {
+    s.SetVesselXform(B, pose(f / 300.0f));
+    s.Step(4);
+    worst = std::max(worst, buried());
+  }
+  s.Settle(1200);
+  Shot(s, "alchemy_soak.bmp");
+  const int after = buried();
+  const uint32_t inA = s.Count().vessel[A].AmountOf((uint16_t)water);
+  const int maxBuried = (int)BaselineNumber("alchemy.soakBuriedMax", 5);
+  RecordObserved("alchemy.soakBuriedWorst", worst);
+  const bool poured = inA >= 150;
+  const bool ok = worst <= maxBuried && after == 0 && s.VesselAsleep(A) && poured;
+  detail = Format("buried worst %d (max %d), after settling %d; water in the sand flask %u/300; %s", worst, maxBuried,
+                  after, inA, s.VesselAsleep(A) ? "asleep" : "AWAKE");
+  std::printf("alchemy-soak: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // A FLASK HELD UPSIDE DOWN OVER ANOTHER POURS INTO IT (owner, 2026-09-27: "it's
 // impossible to lift it above the other flask and rotate upside down"). The
 // bench's grid is never shorter than AlchemyBench::kLiftH, whatever its box;
@@ -2310,6 +2379,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-spawn", "player", {}, false, GateAlchemySpawn},
       {"alchemy-remember", "player", {}, false, GateAlchemyRemember},
       {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
+      {"alchemy-soak", "player", {}, false, GateAlchemySoak},
       {"alchemy-lift", "player", {}, false, GateAlchemyLift},
       {"alchemy-place", "player", {}, false, GateAlchemyPlace},
       {"alchemy-coherence", "player", {}, false, GateAlchemyCoherence},
