@@ -835,7 +835,11 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     // The field block, from the same resolution the sim's copy comes from
     // (SubmitTick), with the three clocks at the frame's sub-tick instant so
     // the grass animates between ticks instead of stepping at 30 Hz.
-    windfield::FillWindField(rp, tun, rp.seed, tick, frameFrac, DayPhaseNow(tick));
+    {
+      const IVec3 wo = world.WindowOrigin();
+      const int32_t o3[3] = {wo.x, wo.y, wo.z};
+      windfield::FillWindField(rp, tun, rp.seed, tick, frameFrac, DayPhaseNow(tick), o3);
+    }
   }
   // WIND PRIMITIVES (§4.3). The SAME resolved list SubmitTick shipped to the
   // sim this tick — WindPrims() is advanced there and read here, which is what

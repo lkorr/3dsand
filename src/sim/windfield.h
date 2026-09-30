@@ -25,8 +25,13 @@
 //     memo is a cache, not state: recomputing it from tick 0 gives the same
 //     integers, which is what makes it replay-safe.
 //
-// The later stages of docs/RESEARCH_wind.md §13 add the terrain table, the
-// regime's field parameters and the storm primitives to this file.
+//   * THE TERRAIN TABLE (§13.2): ground height, exposure and water fraction
+//     per 32-voxel cell, 204.8 m around the window, from World::TerrainColumn
+//     -- worldgen height, a pure function of (seed, map, cell). Cached by
+//     world cell; a window shift queries one new row or column.
+//   * THE HEIGHT PROFILE: the log-law as a 16-knot table built with exact
+//     integer log2 (imath::Log2Q16), so the sim's lookup is the same
+//     integers on every machine.
 
 namespace windfield {
 
@@ -39,8 +44,8 @@ constexpr uint32_t kAdvBlock = 16;
 // sim). BAM16 of the BASE gust band (coefficient 1.0), reduced mod 10 turns
 // (655360): every band coefficient is a multiple of 0.1, so band c's clock is
 // (phase * c10 / 10) and wraps at a whole number of turns exactly when this
-// does. `kBam` is the base spatial frequency, BAM16 per cell — the same
-// integer WINDQ_K_BASE the shader const-folds (see GustKBase).
+// does. The spatial frequency it is scaled by is GustKBase, the CPU twin of
+// the shader's WINDQ_K_BASE.
 uint32_t AdvPhase(const Tuning& t, uint32_t seed, uint32_t tick, float frac);
 
 // The air's displacement since tick 0, METRES, as the weather's reference
@@ -51,15 +56,20 @@ void AirDrift(const Tuning& t, uint32_t seed, uint32_t tick, float frac,
               double& dxM, double& dzM);
 
 // WINDQ_K_BASE, on the CPU: round(65536 / wavelength-in-cells), capped at
-// 27000. Must match the shader's const, which is computed from the same knob
-// with the same formula — check_invariants holds the formula text.
+// 27000, in f32 operation for operation like the shader const (WINDQ_K_BASE).
+// A one-unit disagreement would only scale the front speed by ~1/1365.
 int32_t GustKBase(const Tuning& t);
 
 // Fill the wf* block of a TickParams / RenderParams. `tick` + `frac` is the
 // instant the clocks are evaluated at (frac = 0 for the sim).
 void FillWindField(TickParams& tp, const Tuning& t, uint32_t seed, uint32_t tick,
                    uint32_t dayPhase);
+// The render copy takes the window origin explicitly: WriteRenderParams fills
+// its own origin later than its wind block.
 void FillWindField(RenderParams& rp, const Tuning& t, uint32_t seed, uint32_t tick,
-                   float frac, uint32_t dayPhase);
+                   float frac, uint32_t dayPhase, const int32_t origin[3]);
+
+// Column queries the terrain table's last (re)build paid -- the dev readout.
+uint32_t TerrainQueries();
 
 }  // namespace windfield

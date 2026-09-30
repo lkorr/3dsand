@@ -2518,9 +2518,12 @@ const WIND_GUST_K : f32 =
 // (TUNE_MICRO_SWAY_AMP, in sub-voxels). Sway is a displacement and wind is a
 // velocity, so something has to relate them; putting the reference here rather
 // than in a knob is deliberate — it is a calibration of the existing authored
-// amplitude, not a thing to tune. 120 cells/s = 12 m/s, chosen so the DEFAULT
-// windSpeed + gustStrength reproduce the peak bend the sway code shipped with.
-const WIND_SWAY_REF : f32 = 120.0;
+// amplitude, not a thing to tune. RECALIBRATED 2026-09-30 with the height
+// profile: a blade's root sits ~0.1 m above the ground, where the log-law gives
+// ~0.37 of the reference-height wind, and the old absolute-Y ramp gave it 1.8x
+// at the default map's y ~ 200. Same bend for the same authored wind is
+// therefore 120 x 0.37 / 1.8 ~ 25; 28 is that, eyeballed against the meadow.
+const WIND_SWAY_REF : f32 = 28.0;
 
 // One evaluation of the field, kept in its component parts. The parts exist
 // because the strand path must re-weight the GUSTS per blade without
@@ -2534,15 +2537,140 @@ struct WindSample {
   b1    : vec3f,   // band 1 as (along, cross, up), unit-ish amplitude
   b2    : vec3f,   // band 2, same frame
   amp   : f32,     // gust amplitude, cells/s, altitude ramp applied
+  ramp  : f32,     // the height/terrain ramp that scaled both (readouts)
+  hagl  : f32,     // height above ground, voxels (0 outside the table)
 };
 
-// Altitude gain. altitudeGain is the fractional speed-up per 100 world voxels
-// (10 m) above altitudeRefY, so it is signed: below the reference the boundary
-// layer slows the wind down. Clamped at both ends because a knob is allowed to
-// be silly and a negative or exploding wind is not a look, it is a bug report.
-fn windAltRamp(y : f32) -> f32 {
-  return clamp(1.0 + TUNE_WIND_ALT_GAIN * (y - TUNE_WIND_ALT_REF_Y) * 0.01,
-               0.15, 4.0);
+// ================= THE HEIGHT/TERRAIN RAMP (research doc §13.2) ============
+// ramp = profile(hAGL) x exposure(x, z) x absTerm(y)
+//
+// Height ABOVE GROUND is the main variable, not absolute Y: the wind a blade
+// of grass stands in depends on how far it is off the ground and on whether
+// that ground is a ridge or a hollow, and hardly at all on the altitude of the
+// hill. The old ramp (1 + 0.6 * (y - 64) / 100) was anchored at y = 64 while
+// the default map's ground sits near y = 200, so every player stood in 1.8x
+// the authored wind.
+//
+//   * profile  a log-law, ln(h / z0 + 1) / ln(href / z0 + 1), clamped, as a
+//              16-knot table the CPU builds (windfield.h) — doubling knots, so
+//              linear interpolation between them tracks the log closely. The
+//              sim reads the same integers the renderer does.
+//   * exposure 1 + gain x s, s = clamp(TPI / scale, -1, 1), TPI the ground
+//              minus its ~100 m neighbourhood mean. Ridges (s > 0) and hollows
+//              (s < 0) have separate gains, and the weather sets both. Fades
+//              out with height (wfExpDepth): terrain speed-up is a boundary-
+//              layer effect.
+//   * absTerm  1 + absGain x (y - seaLevel): the only term that still sees the
+//              altitude, and the only one that applies OUTSIDE the table.
+//
+// THE TABLE (wfTerr, world.h kWindTerrN): 64 x 64 cells of 32 voxels centred on
+// the window, h i16 | exposure i8 | water u8, sampled BILINEARLY (in integers
+// on the sim side). Outside its coverage — far plumes, clouds, the far field —
+// the ramp falls back to absTerm x wfNeutralQ, blended over the outer two
+// cells so there is no seam. It is WORLDGEN height (World::TerrainColumn), so
+// digging a pit does not shelter it; accepted, and stated in DESIGN.md §9b.
+
+const WIND_TERR_N : u32 = 64u;   // must match kWindTerrN (world.h)
+
+// One sample of the terrain table, float. `edge` is the coverage weight: 1
+// inside, 0 outside, ramped over the outer two cells.
+struct WindTerrF {
+  h    : f32,   // ground (surface of standing water included), world Y
+  gx   : f32,   // ground slope dh/dx
+  gz   : f32,   // ground slope dh/dz
+  e    : f32,   // exposure s in [-1, 1]
+  w    : f32,   // water fraction in [0, 1]
+  wgx  : f32,   // water-fraction gradient x radius (dimensionless)
+  wgz  : f32,
+  edge : f32,
+};
+
+fn wtWordR(R : ptr<uniform, RenderParams>, i : u32) -> u32 {
+  return (*R).wfTerr[i >> 2u][i & 3u];
+}
+fn wtH(w : u32) -> f32 { return f32(bitcast<i32>(w << 16u) >> 16u); }
+fn wtE(w : u32) -> f32 { return f32(bitcast<i32>(w << 8u) >> 24u) * (1.0 / 127.0); }
+fn wtW(w : u32) -> f32 { return f32(w >> 24u) * (1.0 / 255.0); }
+
+fn windTerrF(p : vec3f, R : ptr<uniform, RenderParams>) -> WindTerrF {
+  var o : WindTerrF;
+  o.h = p.y;
+  if ((*R).wfTerrOn == 0u) { return o; }
+  // Cell centres sit at 32c + 16; bilinear between the four around p.
+  let u = (p.xz - vec2f(16.0)) * (1.0 / 32.0);
+  let c = floor(u);
+  let f = u - c;
+  let ci = vec2<i32>(c);
+  let ix = ci.x - (*R).wfTerrBase.x;
+  let iz = ci.y - (*R).wfTerrBase.y;
+  let n1 = i32(WIND_TERR_N) - 2;
+  if (ix < 0 || iz < 0 || ix > n1 || iz > n1) { return o; }
+  let dmin = min(min(ix, n1 - ix), min(iz, n1 - iz));
+  o.edge = clamp(f32(dmin) * 0.5, 0.0, 1.0);
+  let m = WIND_TERR_N - 1u;
+  let x0 = u32(ci.x) & m;
+  let x1 = u32(ci.x + 1) & m;
+  let z0 = u32(ci.y) & m;
+  let z1 = u32(ci.y + 1) & m;
+  let w00 = wtWordR(R, z0 * WIND_TERR_N + x0);
+  let w10 = wtWordR(R, z0 * WIND_TERR_N + x1);
+  let w01 = wtWordR(R, z1 * WIND_TERR_N + x0);
+  let w11 = wtWordR(R, z1 * WIND_TERR_N + x1);
+  let h00 = wtH(w00); let h10 = wtH(w10); let h01 = wtH(w01); let h11 = wtH(w11);
+  o.h = mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+  o.gx = mix(h10 - h00, h11 - h01, f.y) * (1.0 / 32.0);
+  o.gz = mix(h01 - h00, h11 - h10, f.x) * (1.0 / 32.0);
+  o.e = mix(mix(wtE(w00), wtE(w10), f.x), mix(wtE(w01), wtE(w11), f.x), f.y);
+  let a00 = wtW(w00); let a10 = wtW(w10); let a01 = wtW(w01); let a11 = wtW(w11);
+  o.w = mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+  let rad = f32((*R).wfSeaRadius) * (1.0 / 32.0);
+  o.wgx = mix(a10 - a00, a11 - a01, f.y) * rad;
+  o.wgz = mix(a01 - a00, a11 - a10, f.x) * rad;
+  return o;
+}
+
+// The profile table at height-above-ground `h` (voxels), float. Knot 0 is
+// h = 0; knot k >= 1 is h = 2^(k-1).
+fn wpKnotR(R : ptr<uniform, RenderParams>, k : i32) -> f32 {
+  let kk = u32(clamp(k, 0, 15));
+  return f32((*R).wfProf[kk >> 2u][kk & 3u]) * (1.0 / 65536.0);
+}
+fn windProfF(h : f32, R : ptr<uniform, RenderParams>) -> f32 {
+  let hh = max(h, 0.0);
+  if (hh < 1.0) { return mix(wpKnotR(R, 0), wpKnotR(R, 1), hh); }
+  let k = i32(floor(log2(hh)));
+  if (k >= 14) { return wpKnotR(R, 15); }
+  let base = exp2(f32(k));
+  return mix(wpKnotR(R, k + 1), wpKnotR(R, k + 2), clamp((hh - base) / base, 0.0, 1.0));
+}
+
+// The whole ramp at p, float, and the pieces the rest of windSampleAt reads.
+struct WindRampF {
+  ramp : f32,
+  hagl : f32,   // height above ground, voxels (0 outside the table)
+  tr   : WindTerrF,
+};
+fn windRampF(p : vec3f, R : ptr<uniform, RenderParams>) -> WindRampF {
+  var o : WindRampF;
+  o.tr = windTerrF(p, R);
+  let absT = clamp(1.0 + f32((*R).wfAbsGainQ) * (1.0 / 65536.0) *
+                   (p.y - f32((*R).wfSeaLevelY)) * (1.0 / 1024.0), 0.5, 2.5);
+  let neutral = f32((*R).wfNeutralQ) * (1.0 / 65536.0);
+  if (o.tr.edge <= 0.0) {
+    o.ramp = neutral * absT;
+    return o;
+  }
+  let h = max(p.y - o.tr.h, 0.0);
+  o.hagl = h;
+  let cpl = f32((*R).wfCouplingQ) * (1.0 / 65536.0);
+  let pr = windProfF(h, R) *
+           (cpl + (1.0 - cpl) * min(h / f32(max((*R).wfDecoupleH, 1)), 1.0));
+  let gain = select(f32((*R).wfValleyQ), f32((*R).wfRidgeQ), o.tr.e > 0.0) *
+             (1.0 / 65536.0);
+  let ex = clamp(1.0 + gain * o.tr.e *
+                 (1.0 - min(h / f32(max((*R).wfExpDepth, 1)), 1.0)), 0.1, 3.0);
+  o.ramp = mix(neutral, pr * ex, o.tr.edge) * absT;
+  return o;
 }
 
 // `ph` is the consumer's per-instance phase scatter (per grass column, per
@@ -2562,7 +2690,10 @@ fn windSampleAt(p : vec3f, t : f32, ph : f32,
   let d = (*R).windDir;
   s.along = d;
   s.crossw = vec2f(-d.y, d.x);
-  let alt = windAltRamp(p.y);
+  let rp = windRampF(p, R);
+  let alt = rp.ramp;
+  s.ramp = alt;
+  s.hagl = rp.hagl;
   s.mean = d * ((*R).windSpeed * alt);
   s.amp = (*R).windGust * alt;
   // Travelling gust phase. `gp` is the distance DOWNWIND in radians of the
@@ -2943,12 +3074,129 @@ const WINDQ_CROSS : i32 = i32(round(0.6 * 65536.0));
 const WINDQ_VERT  : i32 = i32(round(0.18 * 65536.0));
 const WINDQ_W1    : i32 = i32(round(0.7 * 65536.0));
 const WINDQ_W2    : i32 = i32(round(0.3 * 65536.0));
-// Altitude ramp, windAltRamp() in integers: 1.0 + gain * (y - refY) / 100,
-// clamped to the same [0.15x, 4x].
-const WINDQ_ALT_GAIN  : i32 = i32(round(TUNE_WIND_ALT_GAIN * 0.01 * 65536.0));
-const WINDQ_ALT_REF_Y : i32 = i32(round(TUNE_WIND_ALT_REF_Y));
-const WINDQ_ALT_MIN   : i32 = 9830;     // 0.15 in Q16.16
-const WINDQ_ALT_MAX   : i32 = 262144;   // 4.0
+// ---- the height/terrain ramp, in integers (windRampF above) ---------------
+// Same table, same knots, same composition. Bilinear in exact integer
+// weights (fx, fz in 0..31 over a 32-voxel cell), so a cell's ground height is
+// the same integer on every machine; the float side agrees to rounding.
+
+struct WindTerrQ {
+  hQ10 : i32,   // ground, world Y x 1024
+  gx   : i32,   // slope dh/dx, Q16
+  gz   : i32,
+  e    : i32,   // exposure s, Q16 in [-65536, 65536]
+  w    : i32,   // water fraction, Q16
+  wgx  : i32,   // water gradient x radius, Q16
+  wgz  : i32,
+  edge : i32,   // coverage weight, Q16
+};
+
+fn wtWordT(T : ptr<uniform, TickParams>, i : u32) -> u32 {
+  return (*T).wfTerr[i >> 2u][i & 3u];
+}
+fn wtHI(w : u32) -> i32 { return bitcast<i32>(w << 16u) >> 16u; }
+fn wtEI(w : u32) -> i32 { return bitcast<i32>(w << 8u) >> 24u; }
+fn wtWI(w : u32) -> i32 { return i32(w >> 24u); }
+
+fn windTerrQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> WindTerrQ {
+  var o : WindTerrQ;
+  o.hQ10 = p.y * 1024;
+  if ((*T).wfTerrOn == 0u) { return o; }
+  let ux = p.x - 16;
+  let uz = p.z - 16;
+  let cx = ux >> 5u;          // arithmetic shift: floor, negatives included
+  let cz = uz >> 5u;
+  let fx = ux & 31;
+  let fz = uz & 31;
+  let ix = cx - (*T).wfTerrBase.x;
+  let iz = cz - (*T).wfTerrBase.y;
+  let n1 = i32(WIND_TERR_N) - 2;
+  if (ix < 0 || iz < 0 || ix > n1 || iz > n1) { return o; }
+  let dmin = min(min(ix, n1 - ix), min(iz, n1 - iz));
+  o.edge = min(dmin * 32768, 65536);
+  let m = WIND_TERR_N - 1u;
+  let x0 = u32(cx) & m;
+  let x1 = u32(cx + 1) & m;
+  let z0 = u32(cz) & m;
+  let z1 = u32(cz + 1) & m;
+  let w00 = wtWordT(T, z0 * WIND_TERR_N + x0);
+  let w10 = wtWordT(T, z0 * WIND_TERR_N + x1);
+  let w01 = wtWordT(T, z1 * WIND_TERR_N + x0);
+  let w11 = wtWordT(T, z1 * WIND_TERR_N + x1);
+  let ax = 32 - fx;
+  let az = 32 - fz;
+  let h00 = wtHI(w00); let h10 = wtHI(w10); let h01 = wtHI(w01); let h11 = wtHI(w11);
+  o.hQ10 = h00 * ax * az + h10 * fx * az + h01 * ax * fz + h11 * fx * fz;
+  // (sum over the cell's 32 voxels of the corner difference) / 1024 = slope;
+  // x 65536 for Q16 is x 64.
+  o.gx = ((h10 - h00) * az + (h11 - h01) * fz) * 64;
+  o.gz = ((h01 - h00) * ax + (h11 - h10) * fx) * 64;
+  let es = wtEI(w00) * ax * az + wtEI(w10) * fx * az + wtEI(w01) * ax * fz +
+           wtEI(w11) * fx * fz;
+  o.e = (es * 64) / 127;
+  let a00 = wtWI(w00); let a10 = wtWI(w10); let a01 = wtWI(w01); let a11 = wtWI(w11);
+  o.w = ((a00 * ax * az + a10 * fx * az + a01 * ax * fz + a11 * fx * fz) * 64) / 255;
+  let rad = (*T).wfSeaRadius;
+  o.wgx = ((((a10 - a00) * az + (a11 - a01) * fz) * 64) / 255) * rad / 32;
+  o.wgz = ((((a01 - a00) * ax + (a11 - a10) * fx) * 64) / 255) * rad / 32;
+  return o;
+}
+
+fn wpKnotT(T : ptr<uniform, TickParams>, k : i32) -> i32 {
+  let kk = u32(clamp(k, 0, 15));
+  return (*T).wfProf[kk >> 2u][kk & 3u];
+}
+// The profile at height-above-ground hQ10 (voxels x 1024, >= 0), Q16.
+fn windProfQ(hQ10 : i32, T : ptr<uniform, TickParams>) -> i32 {
+  let h = max(hQ10, 0);
+  let hi = h >> 10u;
+  if (hi == 0) {
+    let a = wpKnotT(T, 0);
+    return a + ((wpKnotT(T, 1) - a) * h) / 1024;
+  }
+  let k = i32(firstLeadingBit(u32(hi)));
+  if (k >= 14) { return wpKnotT(T, 15); }
+  // Fraction of the way from knot k+1 (h = 2^k) to k+2 (2^(k+1)), Q10.
+  let fr = (h - (1024 << u32(k))) >> u32(k);
+  let a = wpKnotT(T, k + 1);
+  return a + ((wpKnotT(T, k + 2) - a) * fr) / 1024;
+}
+
+struct WindRampQ {
+  ramp : i32,   // Q16
+  hQ10 : i32,   // height above ground, voxels x 1024 (0 outside the table)
+  tr   : WindTerrQ,
+};
+// min(h / depth, 1) as Q16, h in voxels x 1024, depth in voxels.
+fn windDepthFracQ(hQ10 : i32, depth : i32) -> i32 {
+  return min((min(hQ10, 1 << 24) / max(depth, 1)) * 64, 65536);
+}
+fn windRampQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> WindRampQ {
+  var o : WindRampQ;
+  o.tr = windTerrQ(p, T);
+  // (y - sea) * gain / 1024, clamped [0.5, 2.5]. Staged so a y of +-2^15 and a
+  // gain of 2^17 stay inside i32.
+  let absT = clamp(65536 + ((p.y - (*T).wfSeaLevelY) * ((*T).wfAbsGainQ >> 4)) / 64,
+                   32768, 163840);
+  let neutral = (*T).wfNeutralQ;
+  if (o.tr.edge <= 0) {
+    o.ramp = wq(neutral, absT);
+    return o;
+  }
+  // The cell's centre: p.y is its floor, so + 0.5 voxel.
+  let h = max(p.y * 1024 + 512 - o.tr.hQ10, 0);
+  o.hQ10 = h;
+  let cpl = (*T).wfCouplingQ;
+  let pr = wq(windProfQ(h, T),
+              cpl + wq(65536 - cpl, windDepthFracQ(h, (*T).wfDecoupleH)));
+  let gain = select((*T).wfValleyQ, (*T).wfRidgeQ, o.tr.e > 0);
+  let ex = clamp(65536 + wq(wq(gain, o.tr.e),
+                            65536 - windDepthFracQ(h, (*T).wfExpDepth)),
+                 6554, 196608);
+  let full = wq(pr, ex);
+  let mixd = neutral + wq(full - neutral, o.tr.edge);
+  o.ramp = wq(mixd, absT);
+  return o;
+}
 
 // ---- wind primitives, in integers (research doc §4.3) ----------------------
 // The transcription of windPrimEvalF above. Same three shapes, same profiles,
@@ -3116,8 +3364,8 @@ fn windPrimEntrainsQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> bool {
 // one evaluation per chunk per tick, the God of War shape — NOT a cheaper field.
 fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   if ((*T).windMode == WIND_MODE_OFF) { return vec3<i32>(0, 0, 0); }
-  let alt = clamp(65536 + (p.y - WINDQ_ALT_REF_Y) * WINDQ_ALT_GAIN,
-                  WINDQ_ALT_MIN, WINDQ_ALT_MAX);
+  let rq = windRampQ(p, T);
+  let alt = rq.ramp;
   let d = (*T).windDirQ;                 // unit XZ, downwind, Q16.16
   let cw = vec2<i32>(-d.y, d.x);         // 90 degrees to its left
   let spd = wq((*T).windSpeedQ, alt);

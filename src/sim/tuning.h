@@ -3511,8 +3511,9 @@ struct Tuning {
   //     to the shader each frame. Their tuning_params.def rows are NO_WGSL
   //     because a compile-time constant cannot drift over minutes, which is
   //     exactly what weather has to do.
-  //   * gustWavelength / gustSpeed / altitudeGain / altitudeRefY / dbgWind*
-  //     are WGSL rows and const-fold into every shader (F5).
+  //   * gustWavelength / gustSpeed / dbgWind* are WGSL rows and const-fold
+  //     into every shader (F5). Everything added by the 2026-09-30 wind
+  //     overhaul is CPU-side and rides the wf* block (windfield.h): live.
   //
   // Phase 1 is render-only: the two foliage sway sites and the debug overlay.
   // The CA does not read wind until phase 4, which is gated behind
@@ -3560,17 +3561,42 @@ struct Tuning {
     // wavelength unchanged. gustSpeed above is then only the slow EVOLUTION of
     // the pattern in the air's own frame. CPU-side (windfield.h AdvPhase), live.
     float gustAdvect = TPD(wind, gustAdvect);
-    // Fractional wind speed-up per 100 world voxels (10 m) above altitudeRefY.
-    // SIGNED both ways: below the reference the boundary layer slows the wind,
-    // which is why a valley floor is calmer than the ridge above it. Clamped
-    // in the shader to [0.15x, 4x] so a silly value is still a look.
-    float altitudeGain = TPD(wind, altitudeGain);
-    // World Y the altitude ramp is measured from. 64 sits mid-terrain
-    // (worldgen's band is y32..y86), so ridges get a gain and basins a loss.
-    // Absolute Y rather than terrain-relative on purpose: terrain-relative
-    // needs a height query at every sample point, and absolute is what makes
-    // the field a pure function of position (research doc §8).
-    float altitudeRefY = TPD(wind, altitudeRefY);
+    // ---- the height/terrain ramp (CPU-side; windfield.cpp; live) ----
+    // ramp = profile(height above ground) x exposure(x, z) x absTerm(y),
+    // docs/RESEARCH_wind.md §13.2. Replaced altitudeGain/altitudeRefY
+    // (2026-09-30), which ramped on ABSOLUTE Y from y = 64 while the map's
+    // ground sits near y = 200 — every player stood in 1.8x the wind.
+    //
+    // Log-law profile ln(h / roughness + 1) / ln(profileRef / roughness + 1),
+    // clamped to [profileFloor, profileCap]. roughness is z0 in metres (grass
+    // ~0.03); profileRef is the height, metres, where the mean wind equals the
+    // authored speed — about chest height, so "the wind speed" is the wind you
+    // stand in. profileNeutral is used outside the table's 204.8 m coverage.
+    float roughness = TPD(wind, roughness);
+    float profileRef = TPD(wind, profileRef);
+    float profileFloor = TPD(wind, profileFloor);
+    float profileCap = TPD(wind, profileCap);
+    float profileNeutral = TPD(wind, profileNeutral);
+    // Fractional speed-up per 100 m above sea level. Small: the only term
+    // that still reads absolute altitude, and the only one past the table.
+    float absGain = TPD(wind, absGain);
+    // Exposure = 1 + gain x clamp(TPI / tpiScale, -1, 1). TPI (topographic
+    // position) is the ground minus the mean ground within tpiRadius metres.
+    // A hill's speed-up is ~2H/L; with tpiScale = tpiRadius / 2 a gain of 1
+    // is exactly that. Ridge and hollow gains are separate and blended from
+    // light to strong wind by the regime intensity: in light wind hollows are
+    // strongly sheltered and ridges barely faster; in strong wind the ridge
+    // speed-up approaches 2H/L. exposureDepth (m) fades it with height.
+    float tpiRadius = TPD(wind, tpiRadius);
+    float tpiScale = TPD(wind, tpiScale);
+    float ridgeLight = TPD(wind, ridgeLight);
+    float ridgeStrong = TPD(wind, ridgeStrong);
+    float valleyLight = TPD(wind, valleyLight);
+    float valleyStrong = TPD(wind, valleyStrong);
+    float exposureDepth = TPD(wind, exposureDepth);
+    // Radius, metres, of the water fraction stored per table cell: the signal
+    // the sea/lake breeze blows along (stage 4).
+    float seaRadius = TPD(wind, seaRadius);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a

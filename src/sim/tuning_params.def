@@ -720,8 +720,6 @@ TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f, 0.05f, 24
 // passes through here at all.
 TP_F(wind, gustWavelength, TUNE_WIND_GUST_WAVELENGTH, 4.8f, 0.25f, 60.0f)
 TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 0.35f, 0.0f, 5.0f)
-TP_F(wind, altitudeGain, TUNE_WIND_ALT_GAIN, 0.6f, -2.0f, 4.0f)
-TP_F(wind, altitudeRefY, TUNE_WIND_ALT_REF_Y, 64.0f, 0.0f, 256.0f)
 // The overlay's cost is cubic in radius/spacing, and the arrow count is
 // computed identically on the CPU (for the instance count) and in the
 // vertex shader (for the lattice). Clamping the INPUTS here is what keeps
@@ -2195,6 +2193,30 @@ TP_B(wind, weatherAuto, NO_WGSL, true)
 // leaves only the slow evolution term. Summed from tick 0, so moving it
 // jumps the pattern once.
 TP_F(wind, gustAdvect, NO_WGSL, 1.0f, 0.0f, 4.0f)
+// ---- the height/terrain ramp (docs/RESEARCH_wind.md 13.2; windfield.cpp) ----
+// Roughness length z0 and the reference height where the log profile is 1.0,
+// both metres. z0 below a millimetre makes the profile a step at the ground;
+// the reference must be above z0 or the log ratio inverts.
+TP_F(wind, roughness, NO_WGSL, 0.03f, 0.001f, 2.0f)
+TP_F(wind, profileRef, NO_WGSL, 1.5f, 0.1f, 50.0f)
+TP_F(wind, profileFloor, NO_WGSL, 0.3f, 0.0f, 1.0f)
+TP_F(wind, profileCap, NO_WGSL, 2.2f, 1.0f, 4.0f)
+TP_F(wind, profileNeutral, NO_WGSL, 1.0f, 0.1f, 4.0f)
+// Fractional speed-up per 100 m above sea level; the only term outside the table.
+TP_F(wind, absGain, NO_WGSL, 0.04f, -0.5f, 1.0f)
+// Topographic position: the neighbourhood the mean ground is taken over, and
+// the height difference that counts as a full ridge/hollow (s = +-1). Metres.
+TP_F(wind, tpiRadius, NO_WGSL, 100.0f, 13.0f, 400.0f)
+TP_F(wind, tpiScale, NO_WGSL, 50.0f, 1.0f, 400.0f)
+// Exposure gains: ridges (s > 0) and hollows (s < 0), in light and in strong
+// wind. A hollow gain above 1 can take the wind to the 0.1x floor.
+TP_F(wind, ridgeLight, NO_WGSL, 0.25f, 0.0f, 3.0f)
+TP_F(wind, ridgeStrong, NO_WGSL, 1.0f, 0.0f, 3.0f)
+TP_F(wind, valleyLight, NO_WGSL, 1.2f, 0.0f, 3.0f)
+TP_F(wind, valleyStrong, NO_WGSL, 0.5f, 0.0f, 3.0f)
+TP_F(wind, exposureDepth, NO_WGSL, 40.0f, 1.0f, 400.0f)
+// Water-fraction radius for the sea/lake breeze signal, metres.
+TP_F(wind, seaRadius, NO_WGSL, 120.0f, 13.0f, 400.0f)
 TP_B(wind, dbgWindField, NO_WGSL, false)
 
 
