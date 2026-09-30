@@ -4733,6 +4733,40 @@
         "hot",
         "gas_heavy"
       ]
+    },
+    {
+      "//": "OIL ALIGHT (owner, 2026-09-30: 'like ether gas lights on fire for a while ... extremely flammable and then burn for a good 10ish seconds', with black smoke and much more of it than a normal fire). What a POOL of oil becomes near heat -- a LIQUID, so a burning spill stays a spill: it still flows (oil's moveEvery 2), still floats on water (oil's 900) as a burning slick, and carries its fullness through the ignition. Tagged hot, so it lights the oil beside it (oil's hot-gated decay, reactions.json), cooks whatever it touches and lights anything flammable at that fuel's own rate. Each cell burns ~10 s at the shipped burnDurationPct, throws fire up and pours black_smoke out of every open face. Water does NOT put it out (a grease fire): the water under a slick only simmers (water's heat rule is x0.05 against it). Rain and choke damp do. \"stain\": false -- a splash burns rather than coats. Bounded by the oil it consumes (rule 2): not flammable, and it only ever becomes air, black_smoke or oil.",
+      "id": "oil_burning",
+      "far": "lava",
+      "class": "liquid",
+      "density": 900,
+      "hardness": 4,
+      "moveEvery": 2,
+      "emission": 230,
+      "opacity": 235,
+      "colors": [
+        "#ff7a1c",
+        "#e0501a",
+        "#ffa640"
+      ],
+      "stain": false,
+      "tags": [
+        "hot"
+      ]
+    },
+    {
+      "//": "BLACK SMOKE: what burning oil pours out -- sooty, near-opaque (200 against smoke's 70) and hanging ~5 s (decay 6 against smoke's 9). Rises like any gas; wind carries it. Appended after `smoke`, so the far-field plume material (raymarch.wgsl gasOuterMat: the FIRST non-emissive absorbing gas) is still smoke.",
+      "id": "black_smoke",
+      "far": "smoke",
+      "class": "gas",
+      "density": 2,
+      "opacity": 200,
+      "colors": [
+        "#1d1b1a",
+        "#161514",
+        "#262322"
+      ],
+      "tags": []
     }
   ]
 }

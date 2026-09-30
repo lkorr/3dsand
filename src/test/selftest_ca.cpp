@@ -1023,6 +1023,166 @@ Status GateOilSlick(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// oil-fire — a pool of oil catches at once, burns ~10 s, pours black smoke
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-30: "similar to how ether gas lights on fire for awhile,
+// i want that same kind of behavior for oil; it should be extremely flammable
+// and then burn for a good 10ish seconds ... black smoke ... much more smoke
+// than normal fires do." A pool near heat becomes oil_burning (a hot liquid
+// with burnDuration retire rules) instead of flashing to `fire`, and pours
+// black_smoke (reactions.json, oil_burning).
+//
+// FIXTURE. An open-topped stone pit (walls 4 high, air cleared well above it),
+// a 12x12 floor under two full layers of oil, and ONE ember set into the wall
+// at the top layer at kLightAt. Sampled every kEvery ticks over the pit and
+// the air above it:
+//   CATCH   ticks from the ember until <= 10% of the oil is still unlit oil.
+//   BURN    burning cell-ticks / cells that ever burned (peak): the mean
+//           seconds a lit cell burns. ~10 s at the shipped burnDurationPct.
+//   SMOKE   peak black_smoke cells over the initial oil cells.
+//   IDLE    at the end: no oil, nothing burning, the pit's chunks asleep.
+// Thresholds in baseline.json (oilFire.*).
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): a sim-only CA fixture like oil-slick;
+// it tests reaction rules in a sealed-off pit, and nothing the rest of the
+// tick grows may touch it.
+Status GateOilFire(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t oilId = 0, burnId = 0, smokeId = 0, emberId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "oil") oilId = (uint32_t)i;
+    if (c.mats[i].name == "oil_burning") burnId = (uint32_t)i;
+    if (c.mats[i].name == "black_smoke") smokeId = (uint32_t)i;
+    if (c.mats[i].name == "ember") emberId = (uint32_t)i;
+  }
+  if (!oilId || !burnId || !smokeId || !emberId) {
+    detail = "missing oil / oil_burning / black_smoke / ember";
+    return Status::Fail;
+  }
+
+  // Dim dawn, as oil-slick: nothing but the fire changes the pit.
+  Tuning dawn = CurrentTuning();
+  dawn.dayNight.freeze = 1;
+  dawn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(dawn);
+
+  const int px = 96, py = 120, pz = 96;
+  const int x0 = px - 6, x1 = px + 5, z0 = pz - 6, z1 = pz + 5;
+  const int floorY = py, wallTop = py + 4, clearTop = py + 28;
+  const int kLightAt = 20, kEvery = 15, kTicks = 2400;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  std::vector<CellOp> build, pool;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = floorY; y <= clearTop; y++) {
+        const bool wall = x < x0 || x > x1 || z < z0 || z > z1;
+        const bool solid = y == floorY || (wall && y <= wallTop);
+        build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
+      }
+  for (int z = z0; z <= z1; z++)
+    for (int x = x0; x <= x1; x++)
+      for (int y = floorY + 1; y <= floorY + 2; y++)
+        pool.push_back({World::SlotCellIndex({x, y, z}), (oilId & 0xFFFu) | (7u << 12)});
+  const std::vector<CellOp> light = {
+      {World::SlotCellIndex({x0 - 1, floorY + 2, pz}), emberId & 0xFFFu}};
+
+  // Pit chunks (the sleep check) and the counting region: the pit plus a
+  // chunk of margin round it and the air column the plume rises through.
+  std::vector<uint32_t> pitChunks, countChunks;
+  for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+    for (int cy = floorY >> 4; cy <= (wallTop >> 4); cy++)
+      for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++)
+        pitChunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+  for (int cz = (z0 - 17) >> 4; cz <= ((z1 + 17) >> 4); cz++)
+    for (int cy = floorY >> 4; cy <= ((floorY + 64) >> 4); cy++)
+      for (int cx = (x0 - 17) >> 4; cx <= ((x1 + 17) >> 4); cx++)
+        countChunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+
+  struct Counts { uint32_t oil = 0, burning = 0, smoke = 0; };
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  auto count = [&]() {
+    Counts n;
+    for (uint32_t ci : countChunks) {
+      ReadVoxelsSync(ctx, world, ci, 1, cbuf.data(), "oilFireVox");
+      for (uint32_t k = 0; k < kChunkVol; k++) {
+        const uint32_t m = cbuf[k] & 0xFFFu;
+        n.oil += m == oilId;
+        n.burning += m == burnId;
+        n.smoke += m == smokeId;
+      }
+    }
+    return n;
+  };
+
+  uint32_t t = 43000;
+  uint32_t oil0 = 0, peakBurn = 0, peakSmoke = 0, activeInPit = 0;
+  int catchTicks = -1;
+  double burnCellTicks = 0.0;
+  Counts last;
+  for (int i = 0; i < kTicks; i++) {
+    const std::vector<CellOp> ops = i == 0 ? build : i == 2 ? pool : i == kLightAt
+                                                                       ? light
+                                                                       : std::vector<CellOp>{};
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, ops, false, {6, 7, 6},
+               false, false);
+    if (i == kLightAt - 1) {
+      ctx.WaitIdle();
+      oil0 = count().oil;
+    }
+    if (i >= kLightAt && (i - kLightAt) % kEvery == 0) {
+      ctx.WaitIdle();
+      last = count();
+      peakBurn = std::max(peakBurn, last.burning);
+      peakSmoke = std::max(peakSmoke, last.smoke);
+      burnCellTicks += (double)last.burning * kEvery;
+      if (catchTicks < 0 && last.oil * 10 <= oil0) catchTicks = i - kLightAt;
+    }
+    if (i == kTicks - 1) {
+      ctx.WaitIdle();
+      last = count();
+      std::vector<uint32_t> flags(kNumSlots, 0);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                            flags.data(), kNumSlots * 4, "oilFireActive");
+      for (uint32_t ci : pitChunks)
+        if (flags[ci] != 0) activeInPit++;
+    }
+  }
+  ctx.WaitIdle();
+  SetCurrentTuning(saved);
+
+  const double burnSec = peakBurn ? burnCellTicks / (double)peakBurn / 30.0 : 0.0;
+  const double smokeRatio = oil0 ? (double)peakSmoke / (double)oil0 : 0.0;
+  const double catchMax = BaselineNumber("oilFire.catchTicksMax", 120);
+  const double burnMin = BaselineNumber("oilFire.burnSecMin", 6.0);
+  const double burnMax = BaselineNumber("oilFire.burnSecMax", 16.0);
+  const double smokeMin = BaselineNumber("oilFire.smokePerOilMin", 2.0);
+  RecordObserved("oilFire.catchTicksObserved", (double)catchTicks);
+  RecordObserved("oilFire.burnSecObserved", burnSec);
+  RecordObserved("oilFire.smokePerOilObserved", smokeRatio);
+  const bool caught = catchTicks >= 0 && catchTicks <= catchMax;
+  const bool burned = burnSec >= burnMin && burnSec <= burnMax;
+  const bool smoked = smokeRatio >= smokeMin;
+  const bool idle = last.oil == 0 && last.burning == 0 && activeInPit == 0;
+  const bool ok = oil0 > 0 && caught && burned && smoked && idle;
+  detail = Format(
+      "%u oil cells; %d ticks to light 90%% (max %.0f); peak %u burning, mean burn "
+      "%.1f s (%.0f..%.0f); peak black smoke %u = %.1f x the oil (min %.1f); at "
+      "tick %d: %u oil, %u burning, %u smoke, %u of %zu pit chunks awake",
+      oil0, catchTicks, catchMax, peakBurn, burnSec, burnMin, burnMax, peakSmoke,
+      smokeRatio, smokeMin, kTicks, last.oil, last.burning, last.smoke, activeInPit,
+      pitChunks.size());
+  std::printf("oil-fire: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // plant-crush — passable vegetation holds nothing up
 // ---------------------------------------------------------------------------
 // The owner, 2026-09-25: voxels thrown off a killed mob "land on top of and
@@ -2511,6 +2671,7 @@ const std::vector<Gate>& CaGates() {
       {"ca-level-pond", "sim", {}, false, GateCaLevelPond},
       {"ca-gutter", "sim", {}, false, GateCaGutter},
       {"oil-slick", "sim", {}, false, GateOilSlick},
+      {"oil-fire", "sim", {}, false, GateOilFire},
       {"plant-crush", "sim", {}, false, GatePlantCrush},
       // The other half of ca-gutter: the same rule at a real shoreline, with
       // nothing switched off. It moves the residency window and regenerates on
