@@ -4366,7 +4366,7 @@ class Mob {
   float InfectAdmits(const InfectSpec& s, uint32_t m) const;
   // A COAT SEEDS ITS INFECTION (PLAN_weapon_coats B2). Where a coat that
   // carries one (MobSystem::coatInfects_) sits on a voxel the infection
-  // targets, or face-adjacent to an EXPOSED one, that voxel becomes the
+  // targets, or on a face neighbour that faces the same open space (a wound rim; Mob::CoatInfectTick), that voxel becomes the
   // infection and the coat pays coatInfectCost_ levels for it. Runs only when
   // RecountCoat armed `coatSeedDue_`. Never reshapes limbs_ (it converts, it
   // does not remove), so no return contract.
@@ -4520,11 +4520,24 @@ class Mob {
     uint32_t mat = 0;
     uint32_t seeded = 0, spread = 0, eaten = 0;
     float hp = 0.0f;   // flat hp the infection's `hp` charged
+    // WHAT IT TOOK, by the material each converted cell was before (seeded,
+    // spread and joint-crossed alike) -- "did venom ever convert bone" is a
+    // question about this map, not about a bone census the carve's own
+    // connectivity split also moves. Ordered map: deterministic to print.
+    std::map<uint32_t, uint32_t> took;
   };
   const InfectStat* InfectStatOf(uint32_t mat) const {
     for (const InfectStat& s : infectStats_)
       if (s.mat == mat) return &s;
     return nullptr;
+  }
+  // The infection material in one of a limb's slots (MobLimb::infects), 0 =
+  // none / out of range. For gates and the debugger.
+  uint16_t LimbInfectMat(int limbIndex, int slot) const {
+    if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || slot < 0 ||
+        slot >= MobLimb::kInfectSlots)
+      return 0;
+    return limbs_[limbIndex].infects[slot].mat;
   }
  protected:
   std::vector<InfectStat> infectStats_;

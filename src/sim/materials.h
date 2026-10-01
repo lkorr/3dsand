@@ -1038,7 +1038,7 @@ struct MaterialDef {
   std::string infectDeath;
   // ...AND A COAT THAT CARRIES ONE ("coat": {"infects": "<material>",
   // "infectCost": <levels>}, B2). Where a coat of this sits ON, or face-
-  // adjacent to an EXPOSED voxel the named infection targets, that voxel
+  // adjacent to one the named infection targets that faces the same open space as the coat (a wound rim), that voxel
   // becomes the infection, and each conversion spends `infectCost` levels of
   // the coat, so the dose is bounded by what was poured (rule 2). Skin is not
   // a soft-tissue target and the flesh under intact skin is not exposed, so a

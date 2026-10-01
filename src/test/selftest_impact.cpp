@@ -2699,16 +2699,24 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   const double kWindowLo = BaselineNumber("venomWoundWindowLo", 0.2);
   const double kWindowHi = BaselineNumber("venomWoundWindowHi", 3.0);
 
-  // The first segment of each arm and leg on the human.
-  const MobDef& def = mobs.Defs()[human];
+  // The first segment of each arm and leg on the human. COPIED out of the def
+  // (names, scale): a spawn may compose and append defs, and a reference into
+  // mobs.Defs() is not something to hold across one.
   std::vector<int> limbs;
-  for (size_t li = 0; li < def.limbs.size(); li++) {
-    const MobLimbDef& ld = def.limbs[li];
-    if (ld.tag != "arm" && ld.tag != "leg") continue;
-    bool parentSame = false;
-    for (const MobLimbDef& p : def.limbs)
-      if (p.name == ld.parent && p.tag == ld.tag) parentSame = true;
-    if (!parentSame) limbs.push_back((int)li);
+  std::vector<std::string> limbName;
+  uint32_t defSkinScale = 1;
+  {
+    const MobDef& def = mobs.Defs()[human];
+    defSkinScale = def.skinScale ? def.skinScale : 1u;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      const MobLimbDef& ld = def.limbs[li];
+      limbName.push_back(ld.name);
+      if (ld.tag != "arm" && ld.tag != "leg") continue;
+      bool parentSame = false;
+      for (const MobLimbDef& p : def.limbs)
+        if (p.name == ld.parent && p.tag == ld.tag) parentSame = true;
+      if (!parentSame) limbs.push_back((int)li);
+    }
   }
   if (limbs.empty()) {
     detail = "the human has no limb tagged arm / leg";
@@ -2828,6 +2836,31 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   }
   const Mob::InfectStat sa = mobs.InfectStatsOf(a, envenomed);
   const Mob::InfectStat sb = mobs.InfectStatsOf(b, envenomed);
+  // WHERE IT IS STILL SITTING, when it did not burn out (rule 6: a bare count
+  // is not a measurement): every limb still holding envenomed, with whether it
+  // has a body and which infections its slots carry.
+  std::string left;
+  if (!clearedAt) {
+    if (Mob* m = mobs.FindMobById(a)) {
+      for (int li = 0; li < m->LimbCount(); li++) {
+        const uint32_t n = mobs.LimbMaterialCount(a, li, envenomed);
+        if (!n) continue;
+        left += Format(" %s:%u%s[", li < (int)limbName.size() ? limbName[li].c_str() : "?",
+                       n, mobs.LimbBody(a, li) ? "" : " NO BODY");
+        for (int s = 0; s < 3; s++) left += Format("%u,", m->LimbInfectMat(li, s));
+        left += "]";
+      }
+    }
+  }
+  // What it converted, by the material each cell was.
+  std::string took;
+  uint32_t tookBone = 0, tookSkin = 0;
+  const uint32_t skinMat = mobs.MaterialIdNamed("skin");
+  for (const auto& [mat, n] : sa.took) {
+    took += Format(" %s %u", mat < c.mats.size() ? c.mats[mat].name.c_str() : "?", n);
+    if (boneMat && mat == boneMat) tookBone += n;
+    if (skinMat && mat == skinMat) tookSkin += n;
+  }
   float hpInfA = 0.0f, hpInfB = 0.0f;
   if (Mob* m = mobs.FindMobById(a)) hpInfA = m->HpLostBy(DamageCause::Infection);
   if (Mob* m = mobs.FindMobById(b)) hpInfB = m->HpLostBy(DamageCause::Infection);
@@ -2837,7 +2870,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
 
   // THE EXPECTED WINDOW, from the authored numbers at the scaled rate: the
   // largest limb's dose divided by e - s in its own lattice cells a tick.
-  uint32_t scale = def.skinScale ? def.skinScale : 1u;
+  const uint32_t scale = defSkinScale;
   const double lat = (double)scale * scale * scale;
   const double netPerTick =
       (double)(envDef.infectEat - envDef.infectSpread) * kScale * lat / 1800.0;
@@ -2870,7 +2903,11 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   const bool threeX = ratio >= kRatioLo && ratio <= kRatioHi;
   const bool onTime = window >= kWindowLo && window <= kWindowHi;
   const bool hurt = hpInfA > 0.0f && sa.hp > 0.0f && hpA1 < hpA0;
-  const bool boneKept = bone1 == bone0;
+  // BONE AND SKIN STOP IT: not one cell of either was ever converted. (The
+  // bone CENSUS is reported, not asserted: the carve's connectivity split
+  // drops stranded specks of bone once the flesh round them is gone, which is
+  // the wound model's business and not the venom's.)
+  const bool boneKept = tookBone == 0 && tookSkin == 0;
   const bool skinStops = sb.seeded == 0 && sb.spread == 0 && bMax == 0 &&
                          hpInfB == 0.0f;
 
@@ -2886,6 +2923,8 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
       expectTicks, doseMax, hpInfA, sa.hp, hpA0, hpA1, bone0, bone1,
       aliveA ? "" : " (A DIED)", sb.seeded, sb.spread, bMax, hpInfB);
   detail += conserved ? " | books balance" : " | books off (twin overlap)";
+  detail += " | took:" + took;
+  if (!left.empty()) detail += " | still envenomed:" + left;
   if (seeded && spread && burntOut && threeX && onTime && hurt && boneKept &&
       skinStops)
     return Status::Pass;
@@ -2895,7 +2934,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
                     : !threeX    ? "eaten / seeded is outside the band round 3"
                     : !onTime    ? "the burn-out took far from D / (e - s)"
                     : !hurt      ? "no hp was booked to Infection"
-                    : !boneKept  ? "the venom touched bone"
+                    : !boneKept  ? "the venom converted bone or skin"
                                  : "a venom coat on whole skin seeded or hurt";
   detail = std::string(why) + ": " + detail;
   return Status::Fail;

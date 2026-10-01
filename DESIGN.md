@@ -6507,7 +6507,7 @@ rot's rule (`RotSpec`).
 
 **A coat can seed one** (`coat.infects`, `coat.infectCost`). Where a coat that
 names an infection sits ON a voxel the infection targets, or is face-adjacent
-to an EXPOSED one (a free face in the limb's own lattice), that voxel becomes
+to one that faces the same open space (below), that voxel becomes
 the infection and the coat pays `infectCost` levels for it — so the dose is
 the coat (rule 2). A coat on whole skin seeds nothing: skin is not soft tissue,
 and the flesh under it has no open face. A coat in a wound sits on the wall's
@@ -6548,10 +6548,25 @@ rot); `"disinfect:tag:<t>"` stops only those whose material carries `<t>`, and
 it already made stay until healing (`HealTick` mends any non-recipe cell) or a
 blade takes them.
 
-Gate `venom-wound` (`src/test/selftest_impact.cpp`): a carved hole in four
-human limbs, soaked with venom; envenomed appears, spreads and returns to 0;
-eaten / seeded within `baseline.json`'s band around 3; the limbs' hp fell;
-bone untouched; the same soak on a second, uncut human seeds nothing.
+**Where a coat reaches.** The voxel it is on, and a face neighbour only round a
+corner of the SAME open space (some side across the step is open beside both):
+a wound's rim, where the skin's coat and the flesh wall face the same pit. The
+first version let a coat reach any neighbour with a free face, and a venom film
+on the skin then chased the infection along under the whole limb — the flesh
+under whole skin gets a free face the moment the venom beside it is eaten — and
+re-seeded it for ever (measured: never cleared in 3,000 ticks).
+
+Gate `venom-wound` (`src/test/selftest_impact.cpp`): a small carved hole in the
+first segment of each human arm and leg, all four soaked with venom, rates x8
+through a copy of the material table; envenomed appears, spreads and returns to
+0; eaten / seeded within `baseline.json`'s band round 3 (measured 3.63 over four
+limbs, joint re-seeds included); hp booked to `Infection`; not one cell of bone
+or skin converted (`Mob::InfectStat::took`, by source material — measured flesh
+82, muscle 71); the same soak on a second, uncut human seeds nothing. The bone
+CENSUS on those limbs does fall (364 -> 291): bone is never converted, but the
+carve's own tail (collider re-derive, connectivity split) drops bone cells
+stranded once the soft tissue round them is eaten — the wound model's business,
+the same as under the rot, and a follow-up if bone should stand alone.
 
 ### Blood is health, and burns cap it (2026-09-02; `Mob::DrainBlood`, `Mob::RecountBurn`, `sim/tuning.h` §F/§G)
 

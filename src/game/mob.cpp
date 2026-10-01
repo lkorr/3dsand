@@ -17896,6 +17896,7 @@ bool Mob::InfectStep(int li, int slot, uint32_t tick, uint32_t nSpread,
         // DELIBERATELY NOT RECORDED IN `woundWas`. That table is what lets a
         // soak dry BACK to the flesh it covered; an infection that undoes
         // itself is the behaviour this whole pass replaces.
+        stat.took[v.Mat(i) & 0xFFFu]++;
         v.Set(i, infect, (rr >> 6) % 3u);
         if (poke)
           MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
@@ -18311,6 +18312,9 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, int slot, uint32_t tick,
   {
     const uint32_t rr = Hash3(ci, tick, 0xB17Eu);
     const uint16_t w = (uint16_t)(infect | (((rr >> 6) % 3u) << 12));
+    // (The entry exists: InfectStep made it before calling here.)
+    InfectStatFor(infect).took[fine ? (dst.skinVoxels[ci].material & 0xFFFu)
+                                    : (dst.voxels[ci].payload & 0xFFFu)]++;
     IVec3 p;
     if (fine) {
       dst.skinVoxels[ci].material = w;
@@ -18335,12 +18339,12 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, int slot, uint32_t tick,
 //
 // A coat material may name an infection (materials.json `coat.infects`:
 // venom -> envenomed). Wherever such a coat sits on a voxel that infection
-// targets, or is face-adjacent to an EXPOSED one, that voxel becomes the
+// targets, or is face-adjacent to one that faces the SAME open space, that voxel becomes the
 // infection and the coat pays `coat.infectCost` levels for it. Nothing here
 // knows what venom is: the coat names the infection and the infection names
 // its diet.
 //
-// WHY "EXPOSED". A coat lives on a surface. On whole skin the coat sits on
+// WHY "THE SAME OPEN SPACE". A coat lives on a surface. On whole skin the coat sits on
 // skin -- not a soft-tissue target -- and the flesh under it has no open face,
 // so nothing is in reach: a venom-coated hand that never breaks the skin is a
 // venom-coated hand. In a wound the coat sits ON the wall's flesh and muscle,
@@ -18388,9 +18392,22 @@ void Mob::CoatInfectTick(uint32_t tick) {
     auto voxAt = [&](uint32_t c) -> uint32_t {
       return c == kNoBurnCell ? 0u : (st.idx[c] & ~kBurnQueued);
     };
-    auto exposed = [&](IVec3 p) {
-      for (const IVec3& d : kBurnDirs)
-        if (voxAt(cellOf({p.x + d.x, p.y + d.y, p.z + d.z})) == 0) return true;
+    auto open = [&](IVec3 p, const IVec3& e) {
+      return voxAt(cellOf({p.x + e.x, p.y + e.y, p.z + e.z})) == 0;
+    };
+    // CAN A FILM ON `a` REACH `b` (its face neighbour along `d`)? Only round a
+    // corner of the SAME open space: some side `e` across `d` is open beside
+    // both of them. That is a wound's rim -- the skin's coat faces the pit and
+    // so does the flesh wall under it -- and it is NOT flesh under whole skin
+    // that the infection has hollowed out beneath: there the skin's open side
+    // is the air above it and the flesh's is the cavity beside it, never the
+    // same side. A plain "b has a free face" rule let a coat on the skin chase
+    // the venom along under the whole limb, re-seeding it forever.
+    auto reaches = [&](IVec3 a, const IVec3& d, IVec3 b) {
+      for (const IVec3& e : kBurnDirs) {
+        if (e.x * d.x + e.y * d.y + e.z * d.z != 0) continue;  // e across d
+        if (open(a, e) && open(b, e)) return true;
+      }
       return false;
     };
     bool poke = false;
@@ -18428,6 +18445,7 @@ void Mob::CoatInfectTick(uint32_t tick) {
         ownBrick();
         const IVec3 p = v.At(j);
         const uint32_t rr = Hash3((uint32_t)j, tick, 0xC0A7u);
+        InfectStatFor(inf).took[m]++;
         v.Set(j, inf, (rr >> 6) % 3u);
         if (poke)
           MicroBodyPoke(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
@@ -18442,7 +18460,7 @@ void Mob::CoatInfectTick(uint32_t tick) {
         if (left < cost) break;
         const uint32_t j = voxAt(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
         if (j == 0) continue;
-        if (!exposed(v.At(j - 1))) continue;
+        if (!reaches(p, d, v.At(j - 1))) continue;
         if (take(j - 1)) left -= cost;
       }
       if (left == amt) continue;
