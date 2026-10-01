@@ -331,10 +331,10 @@
       }
     }
   ],
-  "//bite": "WHAT THE FANGS CARRY. PLACEHOLDERS until package B: `infect` will be `envenomed` and `stain` will be `venom`; they are the zombie's rot for now so the bite path is exercised end to end.",
+  "//bite": "WHAT THE FANGS CARRY: the bite tears a shallow hole (strike.biteRadius) and rewrites the exposed soft tissue to `infect` (envenomed, an infection material: materials.json `infect` block), smeared with the `stain` liquid (venom). The same BiteHit path a zombie uses with rotflesh / ichor.",
   "bite": {
-    "infect": "rotflesh",
-    "stain": "ichor"
+    "infect": "envenomed",
+    "stain": "venom"
   },
   "behavior": "snake",
   "//states": "A SNAKE IS PRONE BY NATURE: `always` matches unconditionally, so the body is laid on the fitted ground plane (SettleClipOwnedBody) and every segment follows its own stretch of it (ConformProneSegments), the same two stages a legless zombie's crawl uses. bodyYOffset -0.65 lays it INTO the fitted plane: the prone placement holds a body's lowest collider corner half a voxel proud (kProneEmbedVox), which on a body 1.1 voxels thick is a snake hovering a hand above the ground (the snake gate measured 0.62..0.92 voxels of clearance at 0).",
