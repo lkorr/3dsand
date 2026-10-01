@@ -773,10 +773,13 @@ PASS(gasResolve, "gasResolve", PT_TICK, PIPE_GAS_RESOLVE, K_INDIRECT, IND_GASARG
 // be absent is a PassTimer scope that means two different things run to run.
 //
 // R(GasFarEmit) + U(TickUBO) is the whole read set: the list, and the tick +
-// window origin + wind field the animation keys on.
+// window origin + wind field the animation keys on. A(GasPlumeTrack): each
+// plume's lateral offsets, read and rewritten every tick (world.h
+// kGasPlumeTrackSlots); both rows touch it, so they serialize on it.
+// R(Materials): the plume names its gas by property for its wind response.
 PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAREMIT,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GASFAR, 1,
-     USES(U(TickUBO) R(GasFarEmit) A(GasOuter)))
+     USES(U(TickUBO) R(Materials) R(GasFarEmit) A(GasOuter) A(GasPlumeTrack)))
 // ...and the same kernel one LOD out, into the long-range box. Its own
 // condition, so a world whose only distant fire is 300 m away records THIS row
 // and not the one above it -- the two emitter lists are disjoint by
@@ -787,7 +790,7 @@ PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAR
 // R(GasFarEmit) for the list, A(GasFarOuter) for the only thing it produces.
 PASS(gasFarPlumeWide, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUMEW, K_COMPUTE, D_GASFARWIDE,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GASWIDE, 1,
-     USES(U(TickUBO) R(GasFarEmit) A(GasFarOuter)))
+     USES(U(TickUBO) R(Materials) R(GasFarEmit) A(GasFarOuter) A(GasPlumeTrack)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 // W(ChunkHash) and not A(ChunkHash): the digest is a PLAIN STORE per slot (one

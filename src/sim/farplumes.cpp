@@ -310,7 +310,20 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // the same point and the shells can run their full width. That is the case
   // every gate and headless harness is in.
   const int slack = hasEye_ ? kGasFarEyeSlackVox : 0;
-  const int fineFadeIn = fineHalf - kGasFarBlendVox;   // the window face
+  // THE INNER LEAD, eye-weighted runs only. With an eye the shell's far end
+  // loses `slack`, so the visible ramp is 256 - 96 = 160 voxels, and its far
+  // end cannot move (that is the proof above). Its NEAR end can: an emitter
+  // only exists past the window face measured from the CENTRE, but its weight
+  // is measured from the EYE, which can be up to ~slack closer -- so starting
+  // the fade before the face just means such an emitter is already a little
+  // wide when it appears. The weights still sum to 255, so nothing is drawn
+  // twice; the smoothstep's flat start keeps that first bit of coarse twin
+  // under ~15%. 48 = 30% of the 160-voxel ramp (2026-09-30: "make the medium
+  // and far LODs bleed into each other more, for longer"). No eye (gates,
+  // headless) has no slack to recover and keeps the face as the start.
+  const int fineLead = hasEye_ ? (kGasFarBlendVox - kGasFarEyeSlackVox) * 3 / 10
+                               : 0;
+  const int fineFadeIn = fineHalf - kGasFarBlendVox - fineLead;
   const int fineFadeOut = fineHalf - slack;
   const int wideFadeEnd = wideEnd - slack;
   const int wideFadeStart = wideFadeEnd - kGasFarRangeFadeVox;

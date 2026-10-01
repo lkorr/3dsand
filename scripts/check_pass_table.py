@@ -265,6 +265,8 @@ BUF_TO_WGSL = {
     # group and 23 of the render group. Two independent declarations, two legal
     # numbers, same buffer -- exactly gasOuter's situation one LOD out.
     "GasFarOuter": {"gasFarOuter"},
+    # The far plumes' carried tracks, binding 13 of the GAS group only.
+    "GasPlumeTrack": {"gasPlumeTrack"},
     "RenderUBO": {"R"},
     "Reactions": {"reactions"},
     "DirtyList": {"dirtyList", "farDirty"},
@@ -486,7 +488,9 @@ _GAS_GROUP1 = {"gasRead", "gasWrite", "gasCounts", "gasSpawn", "gasClaim",
                # writes gasOuter, which is already here.
                "gasFarEmit",
                # ...and the long-range box the wide splat writes, binding 12.
-               "gasFarOuter"}
+               "gasFarOuter",
+               # ...and the plume tracks, binding 13.
+               "gasPlumeTrack"}
 _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
                  "fluidBlockList", "fluidGrid", "fluidArgs",
                  # splash coupling: particle write page + counts (bindings 6/7)

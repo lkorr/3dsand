@@ -2038,14 +2038,23 @@ synthesizes their plumes. Both halves are deliberately small:
   either direction — the test simply stops passing when the window arrives, and
   starts again when it leaves.
 * `gasFarPlume` is one workgroup per emitter, one thread per CELL of height. Each
-  thread scatters three puffs into a radius that grows with height, tilted
-  downwind by (wind speed / rise speed) and modulated by a hash of (emitter,
-  height packet) where the packet index slides down with the tick — so the
-  billowing RISES through the column at the speed a parcel would, with no state
-  anywhere.
+  thread scatters puffs into a radius that grows with height, offset by the
+  plume's CARRIED wind track and modulated by a hash of (emitter, height
+  packet) where the packet index slides down with the tick — so the billowing
+  RISES through the column at the speed a parcel would.
+* **The wind track (2026-09-30)** is the one piece of state. `gasPlumeTrack`
+  (world.h `kGasPlumeTrackSlots`, render-only, keyed by emitter POSITION in an
+  open-addressed table) holds each plume's lateral offset per height cell. Each
+  tick every cell takes the offset of the air one rise below it and adds the
+  CA's EXPECTED drift at its own displaced position (`plumeDrift`, read off
+  `gasIntentK`'s tiers: fh² per voxel of rise, dominant axis, 45° cap). So the
+  far plume leans as far as the voxel smoke it continues, and a wind change
+  enters at the fire and climbs the column instead of re-aiming it. A plume
+  with no state from the previous tick is seeded by integrating the current
+  field. The old `speed / 60 vox/s` tilt leaned 2-4x too far and was rigid.
 
-**It is render-only, structurally.** The only buffer it writes is `gasOuter`,
-which the sim never reads, the world hash never covers, and which is rebuilt
+**It is render-only, structurally.** The only buffers it writes are `gasOuter`
+(and its own track table, equally unread by the sim), which the sim never reads, the world hash never covers, and which is rebuilt
 from scratch every tick. It does NOT queue parcels: the parcel pool is
 deterministic sim state pinned by `kGasSpDigest`, and a parcel that drifts back
 in writes a hashed voxel — so a frozen fire able to spawn parcels would be a

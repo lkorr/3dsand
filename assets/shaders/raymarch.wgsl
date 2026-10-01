@@ -245,8 +245,11 @@ const GAS_OUTER_STEPS : u32 = 16u;
 // overlap. Its own budget rather than a share of the one above, so widening
 // the crossfade cannot thin the distant plume: that segment is at most one
 // window half-extent per axis (~22 m on the diagonal at gasBlendStart 0.5) and
-// 12 samples is ~1.8 m apart at worst, about two cells.
-const GAS_BAND_STEPS  : u32 = 12u;
+// 12 samples was ~1.8 m apart at worst, about two cells. 16 since the band
+// also starts at gasCoarseW's handoff ramp (10.25 m along the ray) and carries
+// ALL the gas past the handoff rather than a fading half -- a longer segment
+// whose samples now decide most of the midrange plume's opacity.
+const GAS_BAND_STEPS  : u32 = 16u;
 // ---- the LONG-RANGE box (world.h kGasFarOuterN) ---------------------------
 // Declared here for GAS_OUTER_N's reason and pinned by check_invariants.py the
 // same way: a constant two shaders must AGREE on, kept out of common.wgsl
@@ -429,6 +432,32 @@ fn gasBlendW(p : vec3f) -> f32 {
   let ctr = vec3f(R.origin * i32(CHUNK)) + vec3f(halfExt);
   let d = max(max(abs(p.x - ctr.x), abs(p.y - ctr.y)), abs(p.z - ctr.z));
   return smoothstep(min(TUNE_GAS_BLEND_START, 0.99) * halfExt, halfExt, d);
+}
+
+// THE COARSE BOX'S SHARE OF A GAS SAMPLE at `p`, `t` voxels along a camera ray
+// -- the weight BOTH halves of the crossfade read (trace()'s voxel fade is
+// 1 - this, gasOuterFill's band multiplies by it), so they stay complements.
+//
+// gasBlendW alone was the whole answer while trace() marched gas out to the
+// window face. It no longer does: the LOD handoff (render.lodHandoffDist,
+// 20.5 m) ends the media march on a CAMERA SPHERE, and gasBlendW is a
+// max-norm shell from the WINDOW CENTRE that only reaches 1 at 25.6 m on the
+// axes and ~36 m on a diagonal. Every voxel of smoke between the sphere and
+// that shell was drawn by neither path except at weight bw -- ~0.05 at 20.5 m
+// on a horizontal diagonal -- which is the "midrange smoke is far too thin"
+// report: the band right after the voxel smoke carried a few percent of it.
+//
+// So the coarse weight also ramps to 1 BY the handoff distance along the
+// ray, from the same fraction of it gasBlendStart names for the shell
+// (0.5 => 10.25 m .. 20.5 m). Past the handoff there are no voxels to
+// complement, and the coarse box carries all of the gas.
+fn gasCoarseW(p : vec3f, t : f32) -> f32 {
+  var w = gasBlendW(p);
+  if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
+    let h = TUNE_LOD_HANDOFF_DIST / VOXEL_METERS;
+    w = max(w, smoothstep(min(TUNE_GAS_BLEND_START, 0.99) * h, h, t));
+  }
+  return w;
 }
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
@@ -3703,7 +3732,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       // full opacity instead of disappearing.
       var fade = 1.0;
       if ((R.flags & RFLAG_GAS) != 0u && cellLiq == 0.0) {
-        let bw = gasBlendW(ro + rd * tCur);
+        let bw = gasCoarseW(ro + rd * tCur, tCur);
         if (bw > 0.0 && gasOuterAnyAt(ro + rd * tCur)) {
           fade = 1.0 - bw;
         }
@@ -4523,8 +4552,14 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   let tExitI = min(tmaxI.x, min(tmaxI.y, tmaxI.z));
   let tEnterI = max(max(tminI.x, tminI.y), tminI.z);
   let insideInner = tEnterI <= 0.0 && tExitI > 0.0;
-  let bandA = max(max(max(tminW.x, tminW.y), max(tminW.z, 0.0)),
-                  select(0.0, tExitI, insideInner));
+  // ...or where gasCoarseW's handoff ramp starts, if that is nearer: on a
+  // diagonal the ray is still inside the inner box well past the handoff.
+  var innerA = select(0.0, tExitI, insideInner);
+  if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
+    innerA = min(innerA, min(TUNE_GAS_BLEND_START, 0.99) *
+                         TUNE_LOD_HANDOFF_DIST / VOXEL_METERS);
+  }
+  let bandA = max(max(max(tminW.x, tminW.y), max(tminW.z, 0.0)), innerA);
   let bandB = min(tExitW, tEnd);
   if (bandB > bandA) {
     let dt = (bandB - bandA) / f32(GAS_BAND_STEPS);
@@ -4533,7 +4568,7 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
       let p = ro + rd * t;
       // The count is weighted by the SAME ramp trace() faded the voxels by,
       // so the two representations sum to one plume across the whole shell.
-      acc += gasOuterCountAt(p) * gasBlendW(p) * dt;
+      acc += gasOuterCountAt(p) * gasCoarseW(p, t) * dt;
       t += dt;
     }
   }

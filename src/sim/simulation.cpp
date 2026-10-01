@@ -453,6 +453,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // entry against a whole extra layout to bind.
         entry(11, T::ReadOnlyStorage), // gasFarEmit
         entry(12, T::Storage),         // gasFarOuter (the long-range box)
+        entry(13, T::Storage),         // gasPlumeTrack (carried plume offsets)
     };
     gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
@@ -832,6 +833,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(10, world_->gasSpawnOps),
         b(11, world_->gasFarEmit),
         b(12, world_->gasFarOuter),
+        b(13, world_->gasPlumeTrack),
     };
     gasBG_[page] =
         device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
@@ -2445,6 +2447,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasOuter:            return world_->gasOuter;
     case B::GasFarEmit:          return world_->gasFarEmit;
     case B::GasFarOuter:         return world_->gasFarOuter;
+    case B::GasPlumeTrack:       return world_->gasPlumeTrack;
     case B::ReposeSnap:          return world_->reposeSnap;
     case B::CloudUBO:            return world_->cloudUBO;
     case B::CloudNoise:          return cloudNoiseBuf_;

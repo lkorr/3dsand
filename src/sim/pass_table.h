@@ -86,6 +86,9 @@ enum class Buf : uint8_t {
   // standing -- render-only derived data written on the tick command buffer and
   // read by the raymarcher in the fragment stage -- at eight times the cell.
   GasFarOuter,
+  // The far plumes' carried tracks (world.h kGasPlumeTrackSlots): read AND
+  // written by both far-plume kernels, persistent across ticks, render-only.
+  GasPlumeTrack,
   // Render-only derived data, on the table for the shadow cache's reason: the
   // splat WRITES it on the tick command buffer and the raymarcher READS it in
   // the fragment stage, and a hazard the table does not know about generates

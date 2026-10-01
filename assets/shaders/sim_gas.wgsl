@@ -70,6 +70,10 @@ const PT_KERNEL : u32 = PT_K_GAS;
 // is, at 8x the cell size and 8x the span, for the fires that are further out
 // than gasOuter reaches. Render-only in exactly the same sense.
 @group(1) @binding(12) var<storage, read_write> gasFarOuter : array<atomic<u32>>;
+// Each far plume's CARRIED lateral offsets (world.h kGasPlumeTrackSlots; see
+// plumeTrack below). Persistent across ticks and render-only: not hashed, not
+// saved, never cleared after the RHI's creation fill.
+@group(1) @binding(13) var<storage, read_write> gasPlumeTrack : array<atomic<u32>>;
 
 // ---- constants that must agree with sim_step.wgsl and src/sim/world.h ------
 // Kept out of common.wgsl on purpose (CLAUDE.md: a constant only its consumers
@@ -146,6 +150,23 @@ const GAS_FAR_WEIGHT_SHIFT : u32 = 24u;
 // offset so this kernel can address them without first reading the fine count.
 const GAS_FAR_WIDE_MAX  : u32 = 256u;
 const GAS_FAR_WIDE_BASE : u32 = 1028u;
+// The plume-track table (world.h kGasPlumeTrackSlots), pinned by
+// check_invariants.py: [key x, key y, key z, stamp] then one vec2 f32 lateral
+// offset (voxels) per height cell. Two tables, fine then wide.
+const PLUME_TRACK_SLOTS  : u32 = 1024u;
+const PLUME_TRACK_HDR    : u32 = 4u;
+const PLUME_TRACK_STRIDE : u32 = 132u;
+const_assert PLUME_TRACK_STRIDE == PLUME_TRACK_HDR + 2u * 64u;
+const PLUME_TRACK_WIDE : u32 = PLUME_TRACK_SLOTS * PLUME_TRACK_STRIDE;
+// Linear-probe length. The table is >= 4x sparse (world.h static_assert), so
+// a miss past 8 probes means a pathological cluster, and the plume simply
+// re-seeds each tick instead of carrying -- the pre-track behaviour.
+const PLUME_TRACK_PROBES : u32 = 8u;
+// The slowest rise the track advects at, in voxels per tick. A CA downdraft
+// can pin gas outright (rise 0, see gasIntentK), and an emitter column that
+// stopped rising would pile every tick's drift into its bottom cell forever,
+// walking the plume's base off the fire. A quarter speed keeps it anchored.
+const PLUME_TRACK_VMIN : f32 = 0.25;
 // The long-range box itself (world.h kGasFarOuterN / kGasFarOuterShift).
 const GAS_FAROUT_N     : u32 = 128u;
 const GAS_FAROUT_SHIFT : u32 = 6u;
@@ -309,12 +330,8 @@ const_assert FAR_PLUME_CEIL +
 // distant plume scrolled like a shimmer instead of rising like smoke. Dividing
 // by the caller's own cellVox is what makes it one physical speed; the fine box
 // still evaluates to exactly the 0.125 it always had, so its contents do not
-// move. Consistent with FAR_PLUME_RISE_VPS below: 1 voxel/tick x 60 tps = 60.
+// move. (The wind LEAN is no longer derived from this: see plumeDrift.)
 const FAR_PLUME_RISE_VOX : f32 = 1.0;
-// Voxels per second a plume rises, used ONLY to turn the wind speed into a
-// tilt: lateral cells per vertical cell is (wind vox/s) / this. 1 voxel/tick at
-// 60 ticks/s.
-const FAR_PLUME_RISE_VPS : f32 = 60.0;
 
 // (a) RESIDENCY, in the tickets-P0 sense (docs/tickets_p0_audit.md): every
 // caller here asks "may I read or write this cell", never "where is the window
@@ -841,32 +858,29 @@ struct PlumePuff {
 // how large the fire really is) and sqrt(fine columns) for the wide list, whose
 // emitter aggregates up to 256 of them.
 //
-// THE COLUMN STANDS ON THE FIRE. The only lateral terms are the wind tilt (zero
-// at s = 0) and the puff scatter (radius 0.32 m at s = 0, a twentieth of a
-// cell), so the base of the plume is the emitter's own cell and nothing else.
-// The footprint pass added a height-keyed snake here and it put the base a cell
-// sideways at s = 0 (cos 0 = 1), which with the disc on top of it is what made
-// the smoke look as though it came from chunks away. No snake.
+// THE COLUMN STANDS ON THE FIRE. The only lateral terms are the carried wind
+// offset `lat` (plumeTrack: ~zero at s = 0) and the puff scatter (radius
+// 0.32 m at s = 0, a twentieth of a cell), so the base of the plume is the
+// emitter's own cell and nothing else. The footprint pass added a height-keyed
+// snake here and it put the base a cell sideways at s = 0 (cos 0 = 1), which
+// with the disc on top of it is what made the smoke look as though it came
+// from chunks away. No snake.
 // `cellXZ` / `cellY` are the box's cell sizes in voxels, and they are the ONLY
-// scale-bearing inputs: the radius, the tilt and the rise are carried in
+// scale-bearing inputs: the radius, the offset and the rise are carried in
 // physical units and divided by them here. They differ for the wide box (64
 // across, 8 tall) and not for the fine one.
+//
+// `lat` is in VOXELS. It used to be computed right here as this tick's wind
+// speed over a fixed 60 vox/s rise, times the height -- which leaned the column
+// 2-4x further than the CA leans the same smoke (the CA's drift saturates at
+// sim.windDriftSpeed and goes as its SQUARE; see plumeDrift), and swung the
+// whole column as one rigid line whenever the wind changed. Both are why the
+// far plume did not continue the near one.
 fn plumePuff(burn : f32, hMul : f32, s : u32, hCells : u32, idx : u32,
-             k : u32, cellXZ : f32, cellY : f32) -> PlumePuff {
+             k : u32, cellXZ : f32, cellY : f32, lat : vec2f) -> PlumePuff {
   var o : PlumePuff;
   let t = f32(s) / f32(hCells);          // 0 at the fire, 1 at the top
-  // Wind tilt: lateral cells per vertical cell is the wind speed over the rise
-  // speed, both in voxels/s — a RATIO, so it is the same number in either box
-  // and needs no cellVox. windDirQ is the unit downwind XZ the CA and the
-  // renderer already share, so a far plume leans the way the near grass does.
-  var tilt = vec2f(0.0, 0.0);
-  if (T.windMode != WIND_MODE_OFF) {
-    let dir = vec2f(f32(T.windDirQ.x), f32(T.windDirQ.y)) / 65536.0;
-    let spd = f32(T.windSpeedQ) / 65536.0;          // voxels/s
-    // ...times this height in VOXELS, over the x/z cell: the ratio is voxels
-    // per voxel, and the two cell sizes need not agree.
-    tilt = dir * (spd / FAR_PLUME_RISE_VPS) * (f32(s) * cellY / cellXZ);
-  }
+  let tilt = lat / cellXZ;
   // The column widens and dilutes with height, which is the whole reason it
   // reads as smoke and not as a bar.
   let radM = (FAR_PLUME_R0_M + FAR_PLUME_SPREAD_M * t) * hMul;
@@ -917,6 +931,175 @@ fn plumePuff(burn : f32, hMul : f32, s : u32, hCells : u32, idx : u32,
   return o;
 }
 
+// ---- THE CA'S EXPECTED GAS MOTION, per tick (2026-09-30) -------------------
+// What one tick of gasIntentK does to a gas voxel AT p, on average: x/y of the
+// result = the expected lateral step (world x/z) and z = the expected vertical
+// one, all in voxels. Read straight off its tiers so the far plume leans
+// exactly as far as the voxel smoke it continues:
+//
+//   rise  (1 - down)             +1 y, AND a downwind step with prob `lean`
+//   flat  (the remainder)        a horizontal step
+//   sink  ((down - 1) / 2)       -1 y, AND a downwind step with prob `lean`
+//
+// and every horizontal step goes DOWNWIND with probability fh and to a uniform
+// random lateral otherwise, which averages to zero. So the drift is fh x the
+// share of moves that carry a horizontal step -- in calm-to-moderate wind
+// fh x fh per voxel of rise, saturating at 45 degrees at sim.windDriftSpeed.
+// The old far tilt was speed / 60 vox/s, uncapped: at 6 m/s 45 degrees against
+// the CA's 14, at 12 m/s 63 against 45.
+//
+// Downwind is windLateralCode's DOMINANT AXIS, as in the CA, not the true
+// heading: the near smoke leans along a lattice axis and so does this, or the
+// two would disagree by up to 45 degrees of azimuth at the handover.
+//
+// f32 is fine: this feeds the render-only density boxes and nothing hashed.
+fn plumeDrift(p : vec3<i32>, resp : i32) -> vec3f {
+  if (T.windMode == WIND_MODE_OFF || resp == 0) { return vec3f(0.0, 0.0, 1.0); }
+  let w = windAtQ(p, &T);
+  let fx = f32(windAxisFrac(w.x, resp, &T)) / 1024.0;
+  let fz = f32(windAxisFrac(w.z, resp, &T)) / 1024.0;
+  let fy = f32(windAxisFrac(w.y, resp, &T)) / 1024.0;
+  let fh = min(1.0, max(abs(fx), abs(fz)));
+  let down = max(0.0, -fy);
+  let up = max(0.0, fy);
+  let rise = clamp(1.0 - down, 0.0, 1.0);
+  let sink = clamp((down - 1.0) * 0.5, 0.0, 1.0);
+  let lean = clamp(fh - up, 0.0, 1.0);
+  let flat = max(1.0 - rise - sink, 0.0);
+  let ax = vec2f(lateralDir(windLateralCode(w)));
+  let lat = ax * fh * ((rise + sink) * lean + flat);
+  return vec3f(lat, rise - sink);
+}
+
+// Which gas the far plume is made of, for its wind response: the renderer's
+// rule (raymarch.wgsl gasOuterMat), "the first non-emissive absorbing gas" --
+// smoke on the shipped table. Named by property, never by id.
+fn plumeWindResp() -> i32 {
+  let n = arrayLength(&materials);
+  for (var i = 1u; i < n; i++) {
+    let m = materials[i];
+    if (m.klass == CLASS_GAS && m.emission == 0u && m.opacity > 0u) {
+      return i32(matWindResponse(m));
+    }
+  }
+  return 0;
+}
+
+fn trackLoad(a : u32) -> f32 { return bitcast<f32>(atomicLoad(&gasPlumeTrack[a])); }
+fn trackStore(a : u32, v : f32) { atomicStore(&gasPlumeTrack[a], bitcast<u32>(v)); }
+
+var<workgroup> wgTrackSlot : i32;     // word base of this plume's slot, -1 = none
+var<workgroup> wgTrackFresh : u32;    // 1 = no carried state: seed from the wind
+var<workgroup> wgTrackResp : i32;
+var<workgroup> wgTrackOld : array<vec2f, FAR_PLUME_STEPS>;
+var<workgroup> wgTrackRun : array<vec2f, FAR_PLUME_STEPS>;
+
+// ---- THE TRACK: a plume's lateral offset per height cell, CARRIED ----------
+// The stateless column read the wind of THIS tick at every height, so when the
+// wind turned the whole column turned with it, top and bottom in the same
+// frame. Real smoke at height h left the fire h / rise seconds ago and has
+// drifted with the wind it met on the way up; a change in the wind enters at
+// the fire and climbs. That needs memory, and this is it: each tick every cell
+// takes the offset of the air that was `rise` below it (a semi-Lagrangian
+// shift up the column), then adds this tick's expected CA drift at its own
+// position. Gusts the wind field carries in SPACE kink the column where they
+// cross it; a change in TIME travels up it at the CA's rise speed. Exactly the
+// two things the near voxel smoke does, at the near smoke's average.
+//
+// The interpolation diffuses a kink by a few cells over the column's life,
+// which reads as the smoke spreading -- the CA's own random laterals do the
+// same thing to a voxel plume.
+//
+// SEEDING. A slot with no state from the previous tick (a new plume, or one
+// whose fire left the window this tick) is integrated up the CURRENT field
+// instead: the column a steady wind would have built. A fire handed over from
+// the CA to the far list therefore appears already leaning the way its voxel
+// smoke leant.
+//
+// IDENTITY. The emitter lists are re-ranked whenever the eye moves, so a list
+// index is not a plume. The slot is found by POSITION in an open-addressed
+// table, `stamp` = tick + 1 of the last touch: touched last tick = carried,
+// older = free to reclaim. The claim is a CAS on the stamp -- scheduling-
+// dependent, which rule 1 permits here because nothing downstream is hashed.
+//
+// Called by EVERY thread of the workgroup (it holds barriers), one thread per
+// height cell `s`; returns cell s's offset in voxels.
+fn plumeTrack(table : u32, base : vec3<i32>, s : u32, cellY : f32) -> vec2f {
+  if (s == 0u) {
+    let tick = T.tick;
+    let h = hash3(bitcast<u32>(base.x), bitcast<u32>(base.y),
+                  bitcast<u32>(base.z) ^ GAS_PLUME_SALT);
+    var slot = -1;
+    var fresh = 1u;
+    var cand = -1;
+    var candOld = 0u;
+    for (var i = 0u; i < PLUME_TRACK_PROBES; i++) {
+      let b = table + ((h + i) & (PLUME_TRACK_SLOTS - 1u)) * PLUME_TRACK_STRIDE;
+      let st = atomicLoad(&gasPlumeTrack[b + 3u]);
+      if (st != 0u &&
+          bitcast<i32>(atomicLoad(&gasPlumeTrack[b + 0u])) == base.x &&
+          bitcast<i32>(atomicLoad(&gasPlumeTrack[b + 1u])) == base.y &&
+          bitcast<i32>(atomicLoad(&gasPlumeTrack[b + 2u])) == base.z) {
+        slot = i32(b);
+        fresh = select(1u, 0u, st == tick);
+        atomicStore(&gasPlumeTrack[b + 3u], tick + 1u);
+        break;
+      }
+      // Free: never used, untouched for over a tick, or stamped in the future
+      // (a load rewound the tick -- the slot can never be "last tick" again).
+      if (cand < 0 && (st < tick || st > tick + 1u)) { cand = i32(b); candOld = st; }
+    }
+    if (slot < 0 && cand >= 0) {
+      let b = u32(cand);
+      let r = atomicCompareExchangeWeak(&gasPlumeTrack[b + 3u], candOld, tick + 1u);
+      if (r.exchanged) {
+        atomicStore(&gasPlumeTrack[b + 0u], bitcast<u32>(base.x));
+        atomicStore(&gasPlumeTrack[b + 1u], bitcast<u32>(base.y));
+        atomicStore(&gasPlumeTrack[b + 2u], bitcast<u32>(base.z));
+        slot = cand;
+      }
+    }
+    wgTrackSlot = slot;
+    wgTrackFresh = fresh;
+    wgTrackResp = plumeWindResp();
+  }
+  workgroupBarrier();
+  let slot = wgTrackSlot;
+  let fresh = wgTrackFresh != 0u;
+  let at = u32(max(slot, 0)) + PLUME_TRACK_HDR + 2u * s;
+
+  var old = vec2f(0.0);
+  if (slot >= 0 && !fresh) { old = vec2f(trackLoad(at), trackLoad(at + 1u)); }
+  wgTrackOld[s] = old;
+
+  // The wind where this cell's smoke IS, i.e. displaced by its own offset.
+  let p = base + vec3<i32>(i32(round(old.x)), i32((f32(s) + 0.5) * cellY),
+                           i32(round(old.y)));
+  let d = plumeDrift(p, wgTrackResp);
+  let rate = max(d.z, PLUME_TRACK_VMIN);
+  // The steady-state offset this cell adds over the one below: drift per
+  // voxel of rise, times the cell's height.
+  wgTrackRun[s] = d.xy * (cellY / rate);
+  workgroupBarrier();
+
+  var nw : vec2f;
+  if (fresh) {
+    // Integrate up the column to this cell's centre.
+    nw = 0.5 * wgTrackRun[s];
+    for (var j = 0u; j < s; j++) { nw += wgTrackRun[j]; }
+  } else {
+    // Shift up by this tick's rise: the air now at cell s came from `a`
+    // cells below. Cell 0's centre is half a cell above the fire, whose own
+    // offset is zero by definition.
+    let a = min(rate / cellY, 1.0);
+    let below = select(wgTrackOld[max(s, 1u) - 1u], vec2f(0.0), s == 0u);
+    let aa = select(a, min(2.0 * a, 1.0), s == 0u);
+    nw = mix(wgTrackOld[s], below, aa) + d.xy;
+  }
+  if (slot >= 0) { trackStore(at, nw.x); trackStore(at + 1u, nw.y); }
+  return nw;
+}
+
 // How many cells of height this plume gets. `hMul` scales it, and the min
 // against FAR_PLUME_STEPS is the belt to the tuning clamp's brace: a knob
 // edited past the clamp costs a shorter plume, never an out-of-bounds thread.
@@ -934,12 +1117,16 @@ fn gasFarPlume(@builtin(workgroup_id) wg : vec3<u32>,
   let cellVox = f32(1u << GAS_OUTER_SHIFT);
   let hCells = plumeHeightCells(1.0, cellVox);
   let s = li.x;
-  if (s >= hCells) { return; }
 
   let b = GAS_FAR_EMIT_HDR + wg.x * GAS_FAR_EMIT_STRIDE;
   let base = vec3<i32>(bitcast<i32>(gasFarEmit[b + 0u]),
                        bitcast<i32>(gasFarEmit[b + 1u]),
                        bitcast<i32>(gasFarEmit[b + 2u]));
+  // The carried wind offset. Every thread, BEFORE the height early-out: the
+  // track holds barriers, and keeps cells above this plume's height current
+  // so a column that grows does not grow into stale offsets.
+  let lat = plumeTrack(0u, base, s, cellVox);
+  if (s >= hCells) { return; }
   // 0..1: how much of this column footprint is actually on fire, times the
   // CROSSFADE WEIGHT in the word's top byte (world.h kGasFarBlendVox): an
   // emitter in the shell inside the fine box's face fades out here at full
@@ -965,7 +1152,7 @@ fn gasFarPlume(@builtin(workgroup_id) wg : vec3<u32>,
   var amt : array<f32, 4u * FAR_PLUME_PUFFS>;
   var nSeen = 0u;
   for (var k = 0u; k < FAR_PLUME_PUFFS; k++) {
-    let sp = plumePuff(burn, 1.0, s, hCells, wg.x, k, cellVox, cellVox);
+    let sp = plumePuff(burn, 1.0, s, hCells, wg.x, k, cellVox, cellVox, lat);
     let b = floor(sp.fxz);
     let fr = sp.fxz - b;
     let bi = vec2<i32>(b);
@@ -1025,6 +1212,10 @@ fn gasFarPlumeWide(@builtin(workgroup_id) wg : vec3<u32>,
   let cellY = f32(1u << GAS_FAROUT_SHIFT_Y);
   let hCells = plumeHeightCells(hMul, cellY);
   let s = li.x;
+  // The carried offset, from the WIDE table: this aggregate is its own plume
+  // (its position is the bucket's, not any one column's). Every thread,
+  // before the early-out, for gasFarPlume's reason.
+  let lat = plumeTrack(PLUME_TRACK_WIDE, base, s, cellY);
   if (s >= hCells) { return; }
 
   let c0 = gasFarOuterCell(base);
@@ -1044,7 +1235,7 @@ fn gasFarPlumeWide(@builtin(workgroup_id) wg : vec3<u32>,
   // the gas-farplume2 fixture). Capped at the 8x8 fine columns a wide cell
   // holds; the per-add clamp in gasFarOuterAddCell saturates a real hillside
   // at 47% smoke by volume long before that, which is opaque.
-  let sp = plumePuff(1.0, hMul, s, hCells, wg.x + 0x9E37u, 0u, cellXZ, cellY);
+  let sp = plumePuff(1.0, hMul, s, hCells, wg.x + 0x9E37u, 0u, cellXZ, cellY, lat);
   let stack = clamp(cols, 0.0, FAR_PLUME_WIDE_CHORD * FAR_PLUME_WIDE_CHORD) * blend;
   let m = sp.amt * stack * (FAR_PLUME_WIDE_FILL / FAR_PLUME_WIDE_CHORD);
   gasFarOuterAddBilinear(c0, sp.fxz, i32(s), u32(max(m, 0.0)));

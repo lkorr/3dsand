@@ -2321,6 +2321,11 @@ def check_gas_consts():
         ("kGasFarEmitHdr", "GAS_FAR_EMIT_HDR", [("sim_gas.wgsl", gas)]),
         ("kGasFarEmitStride", "GAS_FAR_EMIT_STRIDE", [("sim_gas.wgsl", gas)]),
         ("kGasFarEmitMaxWide", "GAS_FAR_WIDE_MAX", [("sim_gas.wgsl", gas)]),
+        # The plume-track table's layout: a slot stride that disagreed would
+        # read one plume's offsets as another's key.
+        ("kGasPlumeTrackSlots", "PLUME_TRACK_SLOTS", [("sim_gas.wgsl", gas)]),
+        ("kGasPlumeTrackHdr", "PLUME_TRACK_HDR", [("sim_gas.wgsl", gas)]),
+        ("kGasPlumeTrackStride", "PLUME_TRACK_STRIDE", [("sim_gas.wgsl", gas)]),
         # The LONG-RANGE box. THREE declarations again and for gasOuter's
         # reason: sim_gas splats into it and raymarch samples it, and a common
         # .wgsl constant would cost the whole SPIR-V cache. Either of them

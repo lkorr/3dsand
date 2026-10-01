@@ -290,6 +290,10 @@ void World::Init(const rhi::Device& device) {
   // CopyDst for the per-tick clear, exactly like gasOuter.
   gasFarOuter = CreateBuffer(device, (uint64_t)kGasFarOuterWords * 4,
                              U::Storage | U::CopySrc | U::CopyDst, "gasFarOuter");
+  // The far plumes' carried tracks (world.h kGasPlumeTrackSlots). Starts zeroed
+  // (the RHI zero-fills every buffer), which reads as "every slot empty".
+  gasPlumeTrack = CreateBuffer(device, (uint64_t)kGasPlumeTrackWords * 4,
+                               U::Storage | U::CopyDst, "gasPlumeTrack");
 
   // MLS-MPM fluid (world.h fluid block). CopySrc on the particle pair is for
   // the fluid gates' mass audits; the frame path reads back only the small

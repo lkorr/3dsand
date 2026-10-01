@@ -656,6 +656,26 @@ constexpr uint32_t kGasFarEmitWideBase =
     kGasFarEmitHdr + kGasFarEmitMax * kGasFarEmitStride;   // 1,028
 constexpr uint32_t kGasFarEmitWords =
     kGasFarEmitWideBase + kGasFarEmitMaxWide * kGasFarEmitStride;  // 2,052 u32 = 8.2 KiB
+// THE PLUME TRACKS (2026-09-30): each far plume's lateral offset per height
+// cell, CARRIED from tick to tick (sim_gas.wgsl plumeTrack). A stateless column
+// leaning by the wind of THIS tick swings as one rigid line when the wind
+// turns; a carried one shifts up by the tick's rise and adds the tick's drift
+// at every height, so a change enters at the fire and climbs the column the
+// way the CA's voxel smoke does. Keyed by the emitter's position in an
+// open-addressed table (the emitter lists are re-ranked whenever the eye
+// moves, so an index is no identity). Two tables, fine then wide.
+// Render-only derived data: not hashed, not saved, and a lost slot only costs
+// that plume a re-seed from the current wind.
+constexpr uint32_t kGasPlumeTrackSlots = 1024;   // per table; >= 4x either list cap
+constexpr uint32_t kGasPlumeTrackHdr = 4;        // key x, y, z, stamp
+constexpr uint32_t kGasPlumeTrackStride = 132;  // hdr + a vec2 per height cell (FAR_PLUME_STEPS 64)
+static_assert(kGasPlumeTrackStride == kGasPlumeTrackHdr + 2 * 64, "track slot layout");
+constexpr uint32_t kGasPlumeTrackWords =
+    2 * kGasPlumeTrackSlots * kGasPlumeTrackStride;   // 270,336 u32 = 1.03 MiB
+static_assert(kGasPlumeTrackSlots >= 4 * kGasFarEmitMax &&
+              kGasPlumeTrackSlots >= 4 * kGasFarEmitMaxWide,
+              "the track table must stay sparse at a full emitter list, or "
+              "probing fails and plumes fall back to a per-tick re-seed");
 // A column footprint is one gasOuter cell in x/z by one fine CHUNK in y, so the
 // most hot voxels one emitter can stand for is (1<<kGasOuterShift)^2 * kChunk.
 // The shader divides by it, so it is a constant both sides must agree on.
@@ -5210,6 +5230,9 @@ class World {
   // re-splatted on every tick that has a wide emitter — and differing only in
   // its cell size. CopySrc so a gate can read it back.
   rhi::Buffer gasFarOuter;      // kGasFarOuterWords u32 (two u16 counts each)
+  // Per-plume carried lateral offsets (see kGasPlumeTrackSlots). PERSISTENT
+  // across ticks, unlike the two boxes: never cleared after the creation fill.
+  rhi::Buffer gasPlumeTrack;    // kGasPlumeTrackWords u32
 
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,
