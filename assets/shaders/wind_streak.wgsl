@@ -56,6 +56,19 @@ fn streakU01(a : u32, b : u32) -> f32 {
 
 fn streakAlive(h0 : vec4f, h1 : vec4f) -> bool { return h1.x > 0.0 && h0.w < h1.x; }
 
+// How far into "flying" the camera is: 0 within one radius of the ground,
+// 1 from two radii up. Drives the spawn band's blend from the surface layer to
+// a box round the eye.
+fn streakFly(ground : f32, radius : f32) -> f32 {
+  return clamp((R.camPos.y - ground) / max(radius, 1.0) - 1.0, 0.0, 1.0);
+}
+// The vertical half-reach of the band at this flying fraction: the surface
+// layer's 6.2 m on the ground, the radius high up (whichever is larger).
+fn streakVertReach(ground : f32, radius : f32) -> f32 {
+  let fly = streakFly(ground, radius);
+  return max(mix(R.camPos.y - ground + 62.0, radius, fly), 62.0);
+}
+
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
@@ -76,8 +89,17 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
     var p = vec3f(R.camPos.x + cos(ang) * rr, 0.0, R.camPos.z + sin(ang) * rr);
     let tr = windTerrF(p, &R);
     let ground = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
+    // HEIGHT. Near the ground the band is the surface layer, 0.2 .. 6.2 m up
+    // and most of them low, because that is where the gusts are seen against
+    // the grass. Climb and it follows the camera: past one radius above the
+    // ground it blends into a box +-radius round the eye, fully by two, so a
+    // flier high up still sees streaks around them instead of a carpet of
+    // them far below.
     let hq = streakU01(4u, i);
-    p.y = ground + 2.0 + hq * hq * 60.0;       // 0.2 .. 6.2 m, most of them low
+    let fly = streakFly(ground, radius);
+    let lo = mix(ground + 2.0, max(ground + 2.0, R.camPos.y - radius), fly);
+    let hi = mix(ground + 62.0, max(ground + 62.0, R.camPos.y + radius), fly);
+    p.y = lo + mix(hq * hq, hq, fly) * (hi - lo);
     let s = windSampleAt(p, R.time, 0.0, &R);
     let bands = windBandWS(s, s.b1) * WIND_BAND_W1 + windBandWS(s, s.b2) * WIND_BAND_W2;
     let m = windMeanWS(s);
@@ -130,7 +152,10 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
   // Out of the pool's reach, or into the ground: done (age = life).
   let d = p.xz - R.camPos.xz;
   var dead = dot(d, d) > radius * radius * 1.69;
+  // ...or out of it vertically: the band's own reach (streakVertReach).
   let tr = windTerrF(p, &R);
+  let groundHere = select(R.camPos.y - 17.0, tr.h, tr.edge > 0.0);
+  if (abs(p.y - R.camPos.y) > streakVertReach(groundHere, radius) * 1.3) { dead = true; }
   if (tr.edge > 0.0 && p.y < tr.h) { dead = true; }
   if (dead) { h0.w = h1.x; }
   streaks[base] = h0;
@@ -205,7 +230,12 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   // Gone within a metre of the eye, full by four: a streak that close is a
   // slab across the screen, not a wisp.
   let near = smoothstep(10.0, 40.0, dist);
-  let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w, length(q.xz - R.camPos.xz));
+  // Horizontal reach, plus any vertical distance past the surface band's own
+  // 6.2 m: on the ground nothing changes, high up a streak far above or below
+  // the eye fades like one far off to the side.
+  let dyEx = max(abs(q.y - R.camPos.y) - 62.0, 0.0);
+  let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w,
+                             length(vec2f(length(q.xz - R.camPos.xz), dyEx)));
   let fog = exp(-dist * VOXEL_METERS * R.fogDensity);
   // Tapered at BOTH ends: fading in over the first segment behind the head
   // and out toward the tail. A full-alpha head was a blunt cap, which reads
