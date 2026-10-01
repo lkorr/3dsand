@@ -138,17 +138,17 @@ StageCamera MakeCamera(const LatticeGrid& g, const View& v, int w, int h) {
   c.right = right.normalized();
   c.up = up.normalized();
   c.back = back.normalized();
-  // The bounding sphere fits the SHORTER side at zoom 1, with a margin for
-  // the outline.
+  // THE ITEM FILLS THE PICTURE AT ZOOM 1, as laid in the base view: its
+  // longest extent across the width, its middle one up the height, a margin
+  // for the outline. (It was the bounding SPHERE on the shorter side, which
+  // drew a sword -- long and thin -- across 40% of the picture.) Turned on
+  // end it can overrun the frame; the wheel zooms out.
   const float aspect = (float)c.w / (float)c.h;
-  const float fit = rad * 1.04f / std::max(0.05f, v.zoom);
-  if (aspect >= 1.0f) {
-    c.halfH = fit;
-    c.halfW = fit * aspect;
-  } else {
-    c.halfW = fit;
-    c.halfH = fit / aspect;
-  }
+  const float needH = std::max((float)ext[ord[1]] * 0.5f,
+                               (float)ext[ord[0]] * 0.5f / std::max(0.2f, aspect));
+  const float fit = std::max(needH * 1.2f, rad * 0.45f) / std::max(0.05f, v.zoom);
+  c.halfH = fit;
+  c.halfW = fit * aspect;
   c.depth = rad * 2.0f + 4.0f;
   return c;
 }
@@ -166,14 +166,39 @@ void Render(const LatticeGrid& g, const std::vector<PrefabVoxel>& lat,
   rgba.assign((size_t)W * H * 4, 0);
   if (g.Empty() || !look.mats) return;
   std::vector<float> depth((size_t)W * H, -1.0f);
+  struct VoxelLook {
+    bool done = false, hasGrad = false;
+    Vec3 grad{}, albedo{};
+    float glow = 0.0f;
+  };
+  std::vector<VoxelLook> cache(lat.size());
   // Studio light, fixed to the CAMERA so it turns with the orbit: a warm key
   // from the upper left, a cool fill from the right, a rim from behind.
   const Vec3 key = (cam.right * -0.55f + cam.up * 0.70f + cam.back * 0.55f).normalized();
   const Vec3 fill = (cam.right * 0.75f + cam.up * -0.15f + cam.back * 0.45f).normalized();
   const Vec3 keyCol{1.00f, 0.95f, 0.86f}, fillCol{0.55f, 0.62f, 0.78f};
   const Vec3 rimCol{0.95f, 0.85f, 0.62f};
-  for (int py = 0; py < H; py++) {
-    for (int px = 0; px < W; px++) {
+  // Only the pixels the grid's box can cover are shot: the box's eight
+  // corners projected, padded a pixel. A sword laid across covers a band a
+  // quarter of the picture tall, and every ray outside it would miss.
+  int bx0 = W, by0 = H, bx1 = -1, by1 = -1;
+  for (int k = 0; k < 8; k++) {
+    const Vec3 corner{(float)(g.lo.x + ((k & 1) ? g.dim.x : 0)),
+                      (float)(g.lo.y + ((k & 2) ? g.dim.y : 0)),
+                      (float)(g.lo.z + ((k & 4) ? g.dim.z : 0))};
+    float qx, qy;
+    cam.Project(corner, qx, qy);
+    bx0 = std::min(bx0, (int)std::floor(qx) - 1);
+    by0 = std::min(by0, (int)std::floor(qy) - 1);
+    bx1 = std::max(bx1, (int)std::ceil(qx) + 1);
+    by1 = std::max(by1, (int)std::ceil(qy) + 1);
+  }
+  bx0 = std::max(bx0, 0);
+  by0 = std::max(by0, 0);
+  bx1 = std::min(bx1, W - 1);
+  by1 = std::min(by1, H - 1);
+  for (int py = by0; py <= by1; py++) {
+    for (int px = bx0; px <= bx1; px++) {
       Vec3 ro, rd;
       cam.Ray((float)px + 0.5f, (float)py + 0.5f, ro, rd);
       const Hit h = Raycast(g, ro, rd);
@@ -187,19 +212,29 @@ void Render(const LatticeGrid& g, const std::vector<PrefabVoxel>& lat,
         const float s = (float)-h.sign;
         nFace = h.axis == 0 ? Vec3{s, 0, 0} : h.axis == 1 ? Vec3{0, s, 0} : Vec3{0, 0, s};
       }
-      Vec3 grad{};
-      for (int dz = -1; dz <= 1; dz++)
-        for (int dy = -1; dy <= 1; dy++)
-          for (int dx = -1; dx <= 1; dx++) {
-            if (!dx && !dy && !dz) continue;
-            if (g.At(h.cell.x + dx, h.cell.y + dy, h.cell.z + dz) >= 0) continue;
-            const float inv = 1.0f / std::sqrt((float)(dx * dx + dy * dy + dz * dz));
-            grad += Vec3{(float)dx, (float)dy, (float)dz} * inv;
-          }
+      // The gradient and the albedo belong to the VOXEL, and a voxel covers
+      // several pixels: each is worked out once per redraw (it was 26 grid
+      // reads and the whole coat model per pixel).
+      VoxelLook& vl = cache[(size_t)h.voxel];
+      if (!vl.done) {
+        Vec3 grad{};
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              if (!dx && !dy && !dz) continue;
+              if (g.At(h.cell.x + dx, h.cell.y + dy, h.cell.z + dz) >= 0) continue;
+              const float inv = 1.0f / std::sqrt((float)(dx * dx + dy * dy + dz * dz));
+              grad += Vec3{(float)dx, (float)dy, (float)dz} * inv;
+            }
+        vl.hasGrad = grad.len() > 1e-4f;
+        vl.grad = vl.hasGrad ? grad.normalized() : Vec3{};
+        vl.albedo = Albedo(v, look, vl.glow);
+        vl.done = true;
+      }
       Vec3 n = nFace;
-      if (grad.len() > 1e-4f) n = Mix(nFace, grad.normalized(), 0.55f).normalized();
-      float glow = 0.0f;
-      const Vec3 alb = Albedo(v, look, glow);
+      if (vl.hasGrad) n = Mix(nFace, vl.grad, 0.55f).normalized();
+      const float glow = vl.glow;
+      const Vec3 alb = vl.albedo;
       // Banded key light: four steps, so the shading reads as pixel art.
       const float kd = std::max(0.0f, n.dot(key));
       const float kb = std::floor(kd * 4.0f + 0.35f) / 4.0f;

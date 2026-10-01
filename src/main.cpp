@@ -405,6 +405,50 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // the carried arm prints every tick (session.cpp PoseBenchHands).
 bool g_shotBench = false;
 constexpr uint64_t kShotBenchLast = 425;
+// `--shot-stage`: the ITEM STAGE's look-iteration harness (ui/item_stage.h),
+// driven through the real panels with a SYNTHETIC MOUSE (Overlay::injectInput
+// + UIState::uiRects): a sword in the right hand, a venom flask in the pack
+// and a cuirass on the chest; the screen opened, the sword double-clicked,
+// the flask chosen on the FLASKS row, strokes painted, the item turned and
+// zoomed, Esc, the sword double-clicked again, then the cuirass double-
+// clicked, its next shell chosen and painted. Pictures
+// screenshot_stage_<step>.bmp; the stage's own cost (redraws against frames)
+// is printed at the end.
+bool g_shotStage = false;
+constexpr uint64_t kShotStageLast = 520;
+// The stage's cost, counted while it is open: frames, CPU redraws of the
+// picture, and the milliseconds of each (--shot-stage prints them).
+struct StageProf {
+  uint64_t frames = 0, renders = 0;
+  double frameMs = 0.0, renderMs = 0.0;
+};
+StageProf g_stageProf;
+// --shot-stage's synthetic mouse: where it is, and the button/wheel events
+// still to be delivered, ONE per frame (a real click is a press on one frame
+// and a release on a later one, which is what ImGui's click and double-click
+// detection are built on).
+struct HarnessMouse {
+  bool active = false;
+  float x = 0, y = 0;
+  struct Ev {
+    int button;   // 0 left, 1 right; -1 = wheel
+    bool down;
+    float wheel;
+  };
+  std::vector<Ev> queue;
+  void Click(int b) {
+    queue.push_back({b, true, 0});
+    queue.push_back({b, false, 0});
+  }
+  void DoubleClick(int b) {
+    Click(b);
+    Click(b);
+  }
+};
+HarnessMouse g_harnessMouse;
+// A harness's key held down this frame (GLFW key code), -1 = none: read by
+// the frame loop's `key()` beside the real keyboard (--shot-stage's Esc).
+int g_harnessKey = -1;
 // `--shot-devpanel`: the F1 sidebar's look-iteration harness. One picture per
 // page (screenshot_devpanel_<page>.bmp), through g_shotJumpPath, plus the
 // Spawn page with a flask picked so the vessel picker's columns are in shot.
@@ -5296,6 +5340,10 @@ int main(int argc, char** argv) {
       // after the pour (watch a reaction play out; with SANDVOX_BENCH_PROF).
       if (const char* h = std::getenv("SANDVOX_BENCH_HOLD")) g_harnessFrames += (uint64_t)std::max(0, std::atoi(h));
     }
+    else if (a == "--shot-stage") {
+      g_shotStage = true;
+      g_harnessFrames = kShotStageLast + 2;
+    }
     else if (a == "--shot-devpanel") {
       g_shotDevPanel = true;
       g_harnessFrames = kShotDevLast + 2;
@@ -6769,8 +6817,11 @@ int main(int argc, char** argv) {
   // ---- THE ITEM STAGE'S PICTURE (ui/item_stage.h) ---------------------------
   // The bench's arrangement again: drawn on the CPU (a DDA through the item's
   // lattice), copied in through a staging buffer when it changes, sampled
-  // nearest at an integer scale. Small on purpose: it is pixel art.
-  constexpr uint32_t kStageW = 256, kStageH = 192;
+  // nearest at an integer scale. Small on purpose: it is pixel art. The
+  // TEXTURE is the largest picture; the picture drawn is sized each frame to
+  // fill the panel's room at an integer scale of at least 2 (ItemStageUI::
+  // areaW/H), so a big screen gets more pixels, never blurrier ones.
+  constexpr uint32_t kStageW = 480, kStageH = 360;
   rhi::Texture stageTexture = ctx.device.CreateTexture(
       {kStageW, kStageH, 1}, rhi::TextureFormat::RGBA8Unorm,
       rhi::TextureUsage::CopyDst | rhi::TextureUsage::TextureBinding, "itemStage");
@@ -10542,6 +10593,192 @@ int main(int argc, char** argv) {
         }
       }
     }
+    // --shot-stage's script (see g_shotStage). Frame-counted like the rest;
+    // every gesture goes through the synthetic mouse, aimed at the rectangles
+    // the panels drew last frame (UIState::uiRects).
+    if (g_shotStage) {
+      const uint64_t f = frameCounter;
+      HarnessMouse& hm = g_harnessMouse;
+      auto rectMid = [&](const std::string& id, float& x, float& y) -> bool {
+        const UIState::UiRect* r = ui.FindRect(id);
+        if (!r) {
+          std::printf("--shot-stage: frame %llu: no rect '%s' on screen\n",
+                      (unsigned long long)f, id.c_str());
+          return false;
+        }
+        x = (r->x0 + r->x1) * 0.5f;
+        y = (r->y0 + r->y1) * 0.5f;
+        return true;
+      };
+      auto aim = [&](const std::string& id) { return rectMid(id, hm.x, hm.y); };
+      // A point on the stage picture, in its own pixels (0..imgW, 0..imgH).
+      auto aimStage = [&](float sx, float sy) {
+        hm.x = ui.itemStage.imgX + sx * ui.itemStage.imgScale;
+        hm.y = ui.itemStage.imgY + sy * ui.itemStage.imgScale;
+      };
+      const int handR = EquipSlotOfHand(Hand::Right);
+      const int chest = (int)EquipSlotId::Chest;
+      static int flaskBag = -1, daggerBag = -1;
+      if (f == 1) {
+        ui.fly = false;
+        player.fly = false;
+      }
+      if (f == 140) {
+        // THE FIXTURE, through the kit (the wear sync puts the sword in the
+        // fist and the cuirass on the body, as for a player's own drag).
+        const int si = items.Find("sword"), ci = items.Find("iron_cuirass");
+        const int fi = items.Find("flask"), di = items.Find("dagger");
+        if (si >= 0) kit.equip.slots[handR] = StackOf(items, si);
+        if (ci >= 0) kit.equip.slots[chest] = StackOf(items, ci);
+        if (fi >= 0) {
+          ItemStack fl = StackOf(items, fi);
+          fl.contents = ContainerParseFillSpec("venom:0.6", items.At(fi)->container.capacity, mats);
+          flaskBag = kit.bag.FirstFree();
+          if (flaskBag >= 0) kit.bag.slots[flaskBag] = fl;
+        }
+        if (di >= 0) {
+          daggerBag = kit.bag.FirstFree();
+          if (daggerBag >= 0) kit.bag.slots[daggerBag] = StackOf(items, di);
+        }
+        ui.inventoryOpen = true;
+        ui.visible = false;   // the dev panel, not the game UI
+        captured = false;
+        captureBeforeUi = false;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        ui.recordRects = true;
+        hm.active = true;
+        hm.x = 20;
+        hm.y = 20;
+        overlay.injectInput = [](void* io) {
+          HarnessMouse& m = g_harnessMouse;
+          if (!m.active) return;
+          int b = -1;
+          bool down = false;
+          float wheel = 0.0f;
+          if (!m.queue.empty()) {
+            const HarnessMouse::Ev e = m.queue.front();
+            m.queue.erase(m.queue.begin());
+            if (e.button >= 0) {
+              b = e.button;
+              down = e.down;
+            } else {
+              wheel = e.wheel;
+            }
+          }
+          Overlay::QueueMouse(io, m.x, m.y, b, down, wheel, 1.0f);
+        };
+        std::printf("--shot-stage: sword in hand R, iron_cuirass on the chest, "
+                    "venom flask bag %d, dagger bag %d\n", flaskBag, daggerBag);
+      }
+      const std::string handId = "eq" + std::to_string(handR);
+      const std::string chestId = "eq" + std::to_string(chest);
+      const std::string flaskId = "flask" + std::to_string((int)KitSpace::Bag) + "_" +
+                                  std::to_string(flaskBag);
+      // The held sword: hover (the tooltip), double-click, choose the flask.
+      if (f == 175) aim(handId);
+      if (f == 185) g_shotJumpPath = "screenshot_stage_tooltip.bmp";
+      if (f == 188 && aim(handId)) hm.DoubleClick(0);
+      if (f == 205) g_shotJumpPath = "screenshot_stage_open.bmp";
+      if (f == 208 && aim(flaskId)) hm.Click(0);
+      if (f == 218) g_shotJumpPath = "screenshot_stage_brush.bmp";
+      // A stroke along the middle of the picture (the base view lays the
+      // longest axis across): press, drag, release.
+      const float W = (float)ui.itemStage.imgW, H = (float)ui.itemStage.imgH;
+      if (f >= 222 && f <= 262) {
+        const float t = (float)(f - 222) / 40.0f;
+        aimStage(W * (0.22f + 0.56f * t), H * 0.5f);
+        if (f == 222) hm.queue.push_back({0, true, 0});
+        if (f == 262) hm.queue.push_back({0, false, 0});
+      }
+      if (f == 270) g_shotJumpPath = "screenshot_stage_painted.bmp";
+      // Turn it (right-drag) and zoom (the wheel).
+      if (f == 275) {
+        aimStage(W * 0.5f, H * 0.5f);
+        hm.queue.push_back({1, true, 0});
+      }
+      if (f > 276 && f < 300) hm.x += 7.0f, hm.y += 1.5f;
+      if (f == 300) hm.queue.push_back({1, false, 0});
+      if (f == 304) hm.queue.push_back({-1, false, 3.0f});
+      if (f == 312) g_shotJumpPath = "screenshot_stage_turned.bmp";
+      // Esc: the stage closes, the screen stays.
+      if (f == 318) g_harnessKey = GLFW_KEY_ESCAPE;
+      if (f == 320) g_harnessKey = -1;
+      if (f == 328) g_shotJumpPath = "screenshot_stage_closed.bmp";
+      // Reopen: the coat is still on it (and drying in the fist).
+      if (f == 335 && aim(handId)) hm.DoubleClick(0);
+      if (f == 350) g_shotJumpPath = "screenshot_stage_reopen.bmp";
+      if (f == 352 && avatar.Spawned()) {
+        const Mob* wm = mobs.FindCreature(avatar.Id());
+        std::vector<PrefabVoxel> live;
+        uint32_t coated = 0;
+        if (wm && wm->KitShellLattice(handR, 0, live))
+          for (const PrefabVoxel& v : live) coated += v.stain ? 1u : 0u;
+        const ItemStack& hs = kit.equip.slots[handR];
+        const std::vector<PrefabVoxel>* rec = ItemLatticeIfAny(hs, 0);
+        uint32_t recCoated = 0;
+        if (rec)
+          for (const PrefabVoxel& v : *rec) recCoated += v.stain ? 1u : 0u;
+        std::printf("--shot-stage: held sword: %u coated voxels on the live blade, "
+                    "%u in the stack's record\n", coated, recCoated);
+      }
+      if (f == 355 && aim("##stagedone")) hm.Click(0);
+      // The worn cuirass: double-click it on the body, step to the torso.
+      if (f == 362) aim(chestId);
+      if (f == 365 && aim(chestId)) hm.DoubleClick(0);
+      if (f == 380) g_shotJumpPath = "screenshot_stage_armour.bmp";
+      if (f >= 383 && f <= 415) {
+        const float t = (float)(f - 383) / 32.0f;
+        aimStage(W * (0.3f + 0.4f * t), H * (0.45f + 0.1f * t));
+        if (f == 383) hm.queue.push_back({0, true, 0});
+        if (f == 415) hm.queue.push_back({0, false, 0});
+      }
+      if (f == 422) g_shotJumpPath = "screenshot_stage_armour_painted.bmp";
+      if (f == 425 && aim("##stagenext")) hm.Click(0);
+      if (f == 436) g_shotJumpPath = "screenshot_stage_armour_next.bmp";
+      if (f == 442 && avatar.Spawned()) {
+        const Mob* wm = mobs.FindCreature(avatar.Id());
+        const ItemStack& cs = kit.equip.slots[chest];
+        for (int sh = 0; sh < ItemLatticeCount(*items.Of(cs)); sh++) {
+          std::vector<PrefabVoxel> live;
+          uint32_t coated = 0, rc = 0;
+          if (wm && wm->KitShellLattice(chest, sh, live))
+            for (const PrefabVoxel& v : live) coated += v.stain ? 1u : 0u;
+          if (const std::vector<PrefabVoxel>* r = ItemLatticeIfAny(cs, sh))
+            for (const PrefabVoxel& v : *r) rc += v.stain ? 1u : 0u;
+          std::printf("--shot-stage: cuirass shell %d (%s): %u coated on the body, %u in the record\n",
+                      sh, itemstage::ShellName(*items.Of(cs), sh).c_str(), coated, rc);
+        }
+      }
+      // A piece in the PACK: Esc, then the dagger, painted (its coat is kept).
+      if (f == 445) g_harnessKey = GLFW_KEY_ESCAPE;
+      if (f == 447) g_harnessKey = -1;
+      const std::string daggerId = "bag" + std::to_string(daggerBag);
+      if (f == 455 && aim(daggerId)) hm.DoubleClick(0);
+      if (f == 470) g_shotJumpPath = "screenshot_stage_bag.bmp";
+      if (f >= 472 && f <= 492) {
+        const float t = (float)(f - 472) / 20.0f;
+        aimStage(W * (0.3f + 0.4f * t), H * 0.5f);
+        if (f == 472) hm.queue.push_back({0, true, 0});
+        if (f == 492) hm.queue.push_back({0, false, 0});
+      }
+      if (f == 500) g_shotJumpPath = "screenshot_stage_bag_painted.bmp";
+      // Esc twice: the stage, then the screen.
+      if (f == 505 || f == 512) g_harnessKey = GLFW_KEY_ESCAPE;
+      if (f == 507 || f == 514) g_harnessKey = -1;
+      if (f == 518) {
+        std::printf("--shot-stage: after Esc x2: stage %s, screen %s\n",
+                    ui.itemStage.open ? "OPEN" : "closed",
+                    ui.inventoryOpen ? "OPEN" : "closed");
+        const StageProf& p = g_stageProf;
+        std::printf("--shot-stage: stage cost: %llu frames open, %llu redraws "
+                    "(%.2f ms each), %.3f ms/frame of non-drawing upkeep\n",
+                    (unsigned long long)p.frames, (unsigned long long)p.renders,
+                    p.renders ? p.renderMs / (double)p.renders : 0.0,
+                    p.frames ? (p.frameMs - p.renderMs) / (double)p.frames : 0.0);
+        hm.active = false;
+        overlay.injectInput = nullptr;
+      }
+    }
     // --shot-dialogue's schedule (see g_shotDialogue).
     if (g_shotDialogue) {
       const uint64_t f = frameCounter;
@@ -11052,7 +11289,9 @@ int main(int argc, char** argv) {
     }
 
     // ---- input ----
-    auto key = [&](int k) { return glfwGetKey(window, k) == GLFW_PRESS; };
+    auto key = [&](int k) {
+      return k == g_harnessKey || glfwGetKey(window, k) == GLFW_PRESS;
+    };
 
     // ---- WHO IS LISTENING TO THE KEYBOARD ----------------------------------
     //
@@ -14471,11 +14710,13 @@ int main(int argc, char** argv) {
         ui.applyText.clear();
         ui.applyColor = 0;
         ui.applyStoppered = false;
+        ui.applyCoats = false;
         const uint16_t topMat = hp ? ContainerTopMat(*hp, &mats) : 0;
         if (hd && hd->IsContainer() && hp->Filled() && topMat < mats.size()) {
           const ItemStack& hs = *hp;
           ui.applyText = ContainerFillText(*hd, hs, mats);
           ui.applyStoppered = hs.stoppered;
+          ui.applyCoats = mats[topMat].stainSlot != 0;
           ui.pourDrainPerSec = PourBrushCellsPerSec(*hd, ui.pourRadius);
           // The brush paints with what comes out: the top layer.
           const uint32_t c = mats[topMat].gpu.color0;
@@ -15327,7 +15568,13 @@ int main(int argc, char** argv) {
             if (bench.IsOpen()) finishBench();
             ui.itemStage.open = true;
             ui.itemStage.texReady = false;
+            // A worn piece opens on its LARGEST shell (a cuirass on the
+            // torso, not on the left forearm that happens to be listed first).
             ui.itemStage.shell = 0;
+            size_t most = 0;
+            for (int k = 0; k < ItemLatticeCount(*d); k++)
+              if (const std::vector<PrefabVoxel>* a = ItemAuthoredLattice(*d, k))
+                if (a->size() > most) { most = a->size(); ui.itemStage.shell = k; }
             ui.itemStage.resetView = true;
             stageItem = st->name;
             stageKey = 0;
@@ -15355,58 +15602,130 @@ int main(int argc, char** argv) {
           }
           const int nShell = ItemLatticeCount(*sdef);
           T.shell = std::clamp(T.shell, 0, std::max(0, nShell - 1));
+          // WORDS, NOT IDENTIFIERS: "iron cuirass", "body armour", "left
+          // forearm" -- the item's file name, the kind enum and the rig's part
+          // names are content ids (BodySlotLabel's rule).
           T.name = sdef->name;
-          T.kindText = sdef->cover.empty() ? std::string(ItemKindName(sdef->kind))
-                                           : std::string("worn: ") + ItemKindName(sdef->kind);
-          T.where = T.openRef.space == KitSpace::Equip   ? "on you"
-                    : T.openRef.space == KitSpace::Hotbar ? "on the hotbar"
-                                                          : "in the pack";
+          std::replace(T.name.begin(), T.name.end(), '_', ' ');
+          switch (sdef->kind) {
+            case ItemKind::Melee: T.kindText = "weapon"; break;
+            case ItemKind::ArmorHead: T.kindText = "worn on the head"; break;
+            case ItemKind::ArmorChest: T.kindText = "worn on the body"; break;
+            case ItemKind::ArmorLegs: T.kindText = "worn on the legs"; break;
+            case ItemKind::ArmorBoots: T.kindText = "worn on the feet"; break;
+            case ItemKind::ArmorShoulders: T.kindText = "worn on the shoulders"; break;
+            case ItemKind::ArmorHands: T.kindText = "worn on the hands"; break;
+            case ItemKind::ArmorBelt: T.kindText = "worn at the waist"; break;
+            case ItemKind::Trinket: T.kindText = "a trinket"; break;
+            default: T.kindText = ItemKindName(sdef->kind); break;
+          }
+          {
+            Hand sh = Hand::Right;
+            const bool inHand = T.openRef.space == KitSpace::Equip &&
+                                EquipSlotIsHand(T.openRef.index, &sh);
+            T.where = inHand ? (sh == Hand::Right ? "in your right hand" : "in your left hand")
+                      : T.openRef.space == KitSpace::Equip  ? "you are wearing it"
+                      : T.openRef.space == KitSpace::Hotbar ? "on the hotbar"
+                                                            : "in the pack";
+            // A coat dries only in the hand or on the body; in the pack it is
+            // kept as it is (DESIGN.md "A coat moves on contact").
+            T.frozen = T.openRef.space != KitSpace::Equip;
+          }
           T.shellNames.clear();
-          if (!sdef->cover.empty())
-            for (int k = 0; k < nShell; k++) T.shellNames.push_back(itemstage::ShellName(*sdef, k));
-          static std::vector<PrefabVoxel> stageScratch;
-          const std::vector<PrefabVoxel>* lat =
-              itemstage::ViewLattice(*sst, *sdef, T.shell, stageScratch);
-          static itemstage::LatticeGrid grid;
-          if (lat) grid.Build(*lat);
-          else grid = itemstage::LatticeGrid{};
-          const itemstage::View view{T.yaw, T.pitch, T.zoom};
-          const itemstage::StageCamera scam =
-              itemstage::MakeCamera(grid, view, (int)kStageW, (int)kStageH);
-          T.imgW = (int)kStageW;
-          T.imgH = (int)kStageH;
-          T.cellPx = scam.PxPerCell();
-          // The readout: every coat on this shell, heaviest coverage first.
-          T.voxels = lat ? (int)lat->size() : 0;
-          T.coats.clear();
-          if (lat)
-            for (const itemstage::CoatShare& c : itemstage::CoatSummary(*lat)) {
-              UIState::ItemStageUI::Coat uc;
-              uc.name = c.mat < mats.size() ? mats[c.mat].name : std::string("?");
-              uc.color = c.mat < mats.size()
-                             ? (0xFF000000u | (mats[c.mat].gpu.stainColor & 0x00FFFFFFu))
-                             : 0xFF808080u;
-              uc.voxels = (int)c.voxels;
-              uc.frac = T.voxels ? (float)c.voxels / (float)T.voxels : 0.0f;
-              T.coats.push_back(uc);
+          if (!sdef->cover.empty()) {
+            // The part a shell covers, as the character screen names it: the
+            // wearer's own rig gives the part's tag, BodySlotFor the figure
+            // slot, BodySlotLabel the words. A part no figure slot has keeps
+            // its rig name.
+            const Mob* wm = avatar.Spawned() ? mobs.FindCreature(avatar.Id()) : nullptr;
+            for (int k = 0; k < nShell; k++) {
+              const std::string part = itemstage::ShellName(*sdef, k);
+              std::string tag;
+              if (wm)
+                for (int li = 0; li < wm->LimbCount(); li++)
+                  if (wm->LimbDefAt(li).name == part) { tag = wm->LimbDefAt(li).tag; break; }
+              const int slot = BodySlotFor(part.c_str(), tag.c_str());
+              std::string label = slot >= 0 ? std::string(BodySlotLabel(slot)) : part;
+              if (!label.empty()) label[0] = (char)std::tolower((unsigned char)label[0]);
+              T.shellNames.push_back(label);
             }
-          // Redraw only when what it shows moved: the coats, the view, the
-          // shell, the dye.
-          uint64_t key = 0xcbf29ce484222325ull;
-          auto mixKey = [&](uint64_t v) { key = (key ^ v) * 0x100000001b3ull; };
+          }
+          // WHAT IS SHOWN: the stack's recorded lattice; else, for a piece on
+          // the body that records nothing, the rig's LIVE lattice (a worn
+          // shell is resampled to fit its wearer, so the authored cover is not
+          // where its cells are, and the stroke coats the live one -- itemstage
+          // ApplyStroke); else the authored lattice, clean.
+          const auto profT0 = std::chrono::steady_clock::now();
+          static std::vector<PrefabVoxel> stageScratch;
+          const std::vector<PrefabVoxel>* lat = ItemLatticeIfAny(*sst, T.shell);
+          if (!lat && T.openRef.space == KitSpace::Equip && avatar.Spawned()) {
+            const Mob* wm = mobs.FindCreature(avatar.Id());
+            if (wm && wm->KitShellLattice(T.openRef.index, T.shell, stageScratch))
+              lat = &stageScratch;
+          }
+          if (!lat) lat = itemstage::ViewLattice(*sst, *sdef, T.shell, stageScratch);
+          // REDRAW ONLY WHEN WHAT IT SHOWS MOVED. Two keys: the LATTICE (its
+          // cells, words and coats, the shell, the dye) decides whether the
+          // pick grid and the readout are rebuilt; the lattice and the VIEW
+          // together decide whether the picture is redrawn. A stage left open
+          // on a sword costs one hash over its cells a frame and nothing else.
+          uint64_t latKey = 0xcbf29ce484222325ull;
+          auto mixInto = [](uint64_t& k, uint64_t v) { k = (k ^ v) * 0x100000001b3ull; };
           if (lat)
-            for (const PrefabVoxel& v : *lat) mixKey(((uint64_t)v.stain << 16) ^ v.material);
+            for (const PrefabVoxel& v : *lat)
+              mixInto(latKey, ((uint64_t)v.stain << 32) ^ ((uint64_t)v.material << 16) ^
+                                  ((uint64_t)(uint16_t)v.x << 40) ^ v.color ^
+                                  ((uint64_t)(uint16_t)v.y << 8) ^ ((uint64_t)(uint16_t)v.z << 24));
+          mixInto(latKey, lat ? lat->size() : 0);
+          mixInto(latKey, (uint64_t)T.shell + 1);
+          mixInto(latKey, sst->dye);
+          static itemstage::LatticeGrid grid;
+          static uint64_t gridKey = 0;
+          if (latKey != gridKey || stageKey == 0) {
+            if (lat) grid.Build(*lat);
+            else grid = itemstage::LatticeGrid{};
+            gridKey = latKey;
+            // The readout: every coat on this shell, heaviest coverage first.
+            T.voxels = lat ? (int)lat->size() : 0;
+            T.coats.clear();
+            if (lat)
+              for (const itemstage::CoatShare& c : itemstage::CoatSummary(*lat)) {
+                UIState::ItemStageUI::Coat uc;
+                uc.name = c.mat < mats.size() ? mats[c.mat].name : std::string("?");
+                uc.color = c.mat < mats.size()
+                               ? (0xFF000000u | (mats[c.mat].gpu.stainColor & 0x00FFFFFFu))
+                               : 0xFF808080u;
+                uc.voxels = (int)c.voxels;
+                uc.frac = T.voxels ? (float)c.voxels / (float)T.voxels : 0.0f;
+                T.coats.push_back(uc);
+              }
+          }
+          // THE PICTURE'S SIZE: the panel's room (last frame's) at the
+          // smallest integer scale >= 2 that keeps it inside the texture.
+          int pw = 256, ph = 192;
+          if (T.areaW > 64.0f && T.areaH > 48.0f) {
+            const int sc = std::max({2, (int)std::ceil(T.areaW / (float)kStageW),
+                                     (int)std::ceil(T.areaH / (float)kStageH)});
+            pw = std::clamp((int)(T.areaW / (float)sc), 64, (int)kStageW);
+            ph = std::clamp((int)(T.areaH / (float)sc), 48, (int)kStageH);
+          }
+          const itemstage::View view{T.yaw, T.pitch, T.zoom};
+          const itemstage::StageCamera scam = itemstage::MakeCamera(grid, view, pw, ph);
+          T.imgW = pw;
+          T.imgH = ph;
+          T.cellPx = scam.PxPerCell();
+          uint64_t key = latKey;
+          mixInto(key, ((uint64_t)pw << 16) | (uint64_t)ph);
           uint32_t vb[3];
           std::memcpy(&vb[0], &T.yaw, 4);
           std::memcpy(&vb[1], &T.pitch, 4);
           std::memcpy(&vb[2], &T.zoom, 4);
-          mixKey(vb[0]);
-          mixKey(vb[1]);
-          mixKey(vb[2]);
-          mixKey((uint64_t)T.shell + 1);
-          mixKey(sst->dye);
-          mixKey(lat ? lat->size() : 0);
+          mixInto(key, vb[0]);
+          mixInto(key, vb[1]);
+          mixInto(key, vb[2]);
+          if (key == 0) key = 1;   // 0 means "never drawn"
           if (key != stageKey && lat) {
+            const auto r0 = std::chrono::steady_clock::now();
             itemstage::Look look;
             look.mats = &mats;
             look.artColors = mobs.MicroSet() ? &mobs.MicroSet()->artColors : nullptr;
@@ -15415,7 +15734,13 @@ int main(int argc, char** argv) {
             itemstage::Render(grid, *lat, scam, look, stagePixels);
             stageKey = key;
             stageFresh = true;
+            g_stageProf.renders++;
+            g_stageProf.renderMs += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - r0).count();
           }
+          g_stageProf.frames++;
+          g_stageProf.frameMs += std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - profT0).count();
           // The pick under the cursor: the ring, and the ray the tick pours on.
           if (T.over && lat) {
             Vec3 ro, rd;
@@ -15935,6 +16260,39 @@ int main(int argc, char** argv) {
           u.name = d->name;
           u.count = st.count;
           u.wearable = ItemKindIsWorn(d->kind);
+          u.stageable = itemstage::StageTakes(*d);
+          // ITS COAT: the material on most voxels, over every lattice the item
+          // has -- the rig's live one for a piece in hand or worn (the rig is
+          // its truth there, itemcoat.h), else the stack's record.
+          if (u.stageable && ui.inventoryOpen) {
+            uint32_t bestN = 0, bestMat = 0;
+            std::vector<std::pair<uint32_t, uint32_t>> tally;
+            auto count = [&](const std::vector<PrefabVoxel>& lat) {
+              for (const PrefabVoxel& v : lat) {
+                if (!v.stain) continue;
+                const uint32_t m = BodyStainMat(v.stain);
+                bool found = false;
+                for (auto& t : tally)
+                  if (t.first == m) { t.second++; found = true; break; }
+                if (!found) tally.push_back({m, 1u});
+              }
+            };
+            const Mob* wm = equipSlot >= 0 && avatar.Spawned() ? mobs.FindCreature(avatar.Id()) : nullptr;
+            static std::vector<PrefabVoxel> liveScratch;
+            for (int k = 0; k < ItemLatticeCount(*d); k++) {
+              if (wm && wm->KitShellLattice(equipSlot, k, liveScratch)) count(liveScratch);
+              else if (const std::vector<PrefabVoxel>* r = ItemLatticeIfAny(st, k)) count(*r);
+            }
+            for (const auto& t : tally)
+              if (t.second > bestN || (t.second == bestN && t.first < bestMat)) {
+                bestN = t.second;
+                bestMat = t.first;
+              }
+            if (bestN && bestMat < mats.size()) {
+              u.coatSwatch = 0xFF000000u | (mats[bestMat].gpu.stainColor & 0x00FFFFFFu);
+              u.coatName = mats[bestMat].name;
+            }
+          }
           if (u.wearable) {
             u.condition = conditionOf(st, equipSlot);
             u.ruined = GearRuined(u.condition, ruinedAt);
@@ -17435,18 +17793,22 @@ int main(int argc, char** argv) {
         ui.alchemy.texReady = true;
       }
       // THE ITEM STAGE'S PICTURE, the same way, only when it was redrawn.
-      if (ui.itemStage.open && stageFresh &&
-          stagePixels.size() == (size_t)kStageW * kStageH * 4) {
+      // The picture is ui.itemStage.imgW x imgH, packed at the top-left of
+      // the texture (the panel samples that corner).
+      const uint32_t siW = (uint32_t)std::max(0, ui.itemStage.imgW);
+      const uint32_t siH = (uint32_t)std::max(0, ui.itemStage.imgH);
+      if (ui.itemStage.open && stageFresh && siW > 0 && siH > 0 && siW <= kStageW &&
+          siH <= kStageH && stagePixels.size() == (size_t)siW * siH * 4) {
         stageFresh = false;
         ctx.queue.WriteBuffer(stageStaging, 0, stagePixels.data(), stagePixels.size());
         rhi::CommandEncoder sEnc = ctx.device.CreateCommandEncoder();
         rhi::TexelCopyBuffer src;
         src.buffer = stageStaging;
-        src.bytesPerRow = kStageW * 4;
-        src.rowsPerImage = kStageH;
+        src.bytesPerRow = siW * 4;
+        src.rowsPerImage = siH;
         rhi::TexelCopyTexture dst;
         dst.texture = stageTexture;
-        sEnc.CopyBufferToTexture(src, dst, {kStageW, kStageH, 1});
+        sEnc.CopyBufferToTexture(src, dst, {siW, siH, 1});
         ctx.queue.Submit(sEnc.Finish());
         ui.itemStage.texReady = true;
       }

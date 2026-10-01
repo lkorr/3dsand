@@ -1,5 +1,6 @@
 #include "game/itemcoat.h"
 
+#include "game/equipment.h"
 #include "game/mob.h"
 
 #include <unordered_map>
@@ -147,6 +148,32 @@ uint32_t CaptureGroundCoat(ItemInstance& it, const ItemDef& def,
   }
   ItemLatticeSettle(it, def);
   return changed;
+}
+
+bool Mob::KitShellLattice(int equipSlot, int shell,
+                          std::vector<PrefabVoxel>& out) const {
+  out.clear();
+  if (equipSlot < 0 || equipSlot >= kEquipSlotCount || rigReleased_) return false;
+  const ItemStack& st = kit_.equip.slots[equipSlot];
+  if (st.Empty()) return false;
+  Hand h = Hand::Right;
+  if (EquipSlotIsHand(equipSlot, &h)) {
+    const HeldHand& hh = held_[HandIndex(h)];
+    if (shell != 0 || hh.slot < 0 || hh.borrowed || hh.kitStale || hh.item != st.name)
+      return false;
+    LatticeOfSlot(hh.slot, out);
+    return !out.empty();
+  }
+  for (const WornPiece& p : worn_) {
+    if (p.equipSlot != equipSlot || p.item != st.name) continue;
+    for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++)
+      if (p.cover[k] == shell) {
+        LatticeOfSlot(p.slots[k], out);
+        return !out.empty();
+      }
+    return false;
+  }
+  return false;
 }
 
 int PushItemLatticeToLimb(Mob& wearer, const KitRef& ref) {

@@ -17420,10 +17420,28 @@ portrait -- the item is shown with nothing else in the picture, neutrally lit.
 
 **The picture is the CPU's, like the bench's.** `ui/item_stage.cpp` raymarches
 the item's own lattice (a few thousand cells) with an orthographic DDA per pixel
-into a 256x192 RGBA buffer, uploaded through a staging buffer only when what it
-shows changed (a hash over the coat words, the view, the shell and the dye) and
-drawn at the largest integer scale with nearest filtering, so it stays pixel art.
-It shades as `microbody.wgsl` does, restated on the CPU: art colour or the
+into an RGBA buffer, uploaded through a staging buffer only when what it shows
+changed, and drawn at an integer scale with nearest filtering, so it stays pixel
+art. The picture is sized each frame to FILL the panel's room at the smallest
+integer scale of at least 2 that keeps it inside the 480x360 texture (the
+panel reports its room in `ItemStageUI::areaW/H`; ~330x335 at 2x on a
+1600x900 screen) -- it was a fixed 256x192, which left most of the column
+empty. At zoom 1 the item fills the picture as laid in the base view (longest
+extent across, middle extent up; it was the bounding sphere on the shorter side,
+which drew a sword across 40% of the width); turned on end it may overrun, and
+the wheel zooms out.
+
+**Redrawn only when it changed, measured.** Two keys, both an FNV hash over the
+shown lattice's cells (position, word, colour, coat) plus the shell and the dye:
+when the LATTICE key moves the pick grid and the readout are rebuilt; when it or
+the VIEW (yaw, pitch, zoom, picture size) moves the picture is redrawn. The
+gradient and the albedo (coat included) are worked out once per VOXEL per
+redraw, not per pixel, and only the pixels the grid's projected box covers are
+shot. `--shot-stage` counts it: over 270 frames open, 104
+redraws (every one of them a stroke tick, a drag frame or a zoom step) at ~9 ms
+each for a ~330x335 picture, and 0.02 ms a frame of upkeep when nothing moved.
+
+The picture shades as `microbody.wgsl` does, restated on the CPU: art colour or the
 material's 3-variant palette keyed on the cell, the dye by luminance over
 `kDyeRef`, then the coat (`stainColor`, its authored opacity, the
 `render.stain*` knobs, a value-noise mottle, the coat's glow). Light is fixed to
@@ -17468,23 +17486,64 @@ held blade's coat drying in the fist. In the bag nothing ticks it: the coat is
 frozen (§7 "A coat moves on contact").
 
 A worn piece is one lattice per cover entry; the stage shows one shell at a
-time with a part selector. The readout under the picture is the shell's coats,
-heaviest coverage first, the per-limb ledger's shape.
+time with a part selector (`<` / `>`), opening on the LARGEST shell (a cuirass
+on the torso). **A piece on the body that records nothing is shown and coated
+on its LIVE lattice** (`Mob::KitShellLattice`): a worn shell is resampled to fit
+its wearer, so its authored cover cells are not where the shell's are, and a
+stroke painted on the authored lattice used to reach only the coincident cells
+when pushed. `ApplyStroke` seeds the stack's record from the rig before the
+first write (counts taken as whole on this wearer, so the fit does not read as
+wear), and puts the stack back exactly as it was when the brush missed.
+
+The readout under the picture is the shell's coats, heaviest coverage first,
+the per-limb ledger's shape. It names things in words, not ids ("iron
+cuirass", "worn on the body", "left forearm" via `BodySlotFor` /
+`BodySlotLabel` off the wearer's own rig, "in your right hand"); an item in the
+pack or on the hotbar says its coat "won't dry until drawn". A flask whose top
+substance has no body coat is shown with "will not coat it" instead of arming
+the brush (`UIState::applyCoats`).
+
+**In the pack.** A coated item wears a drop of its coat's colour in the slot's
+lower-left corner and "coated with <substance>" in its tooltip (the rig's live
+lattice for a piece in hand or worn, else the stack's record), and every
+weapon or worn piece's tooltip ends "double-click to inspect"
+(`KitSlotUI::stageable`, `itemstage::StageTakes` of the def -- not a kind
+string). Esc backs out in order: conversation, bench, stage, screen.
+
+**Seen in the real game: `--shot-stage`.** The look-iteration harness drives
+the windowed game through the panels' own input with a SYNTHETIC MOUSE
+(`Overlay::injectInput` queues ImGui events after the platform backend and
+before `NewFrame`; `UIState::uiRects` records where each slot and stage button
+was drawn): a sword in the right hand, a venom flask in the pack and an iron
+cuirass on the chest; the screen opened, the sword's tooltip, a double-click,
+the flask clicked on the FLASKS row, a stroke dragged along the blade, a
+right-drag turn and a wheel zoom, Esc (stage closes, screen stays), a second
+double-click (the coat is still there, the live blade and the record agree
+voxel for voxel), `done`, the cuirass double-clicked on the body and painted
+(the coat appears on the portrait's torso at once), the next shell, Esc, a
+dagger in the pack double-clicked and painted, Esc twice.
+`screenshot_stage_*.bmp`, plus the cost line above.
 
 **Gate `item-stage`** (selftest_itemstage.cpp) runs the game's own functions on
 a real creature's kit: the sword is drawn (pixels, centred), the centre pixel
 picks a voxel, a stroke with a full flask on the sword in the PACK coats voxels
 and spends exactly what it reports, the stack moved away and back gives a
 byte-identical lattice AND picture, a washer rinses the coat down, and in the
-fist the live slot's coat equals the item's lattice voxel for voxel. It writes
-`build/item_stage.bmp`.
+fist the live slot's coat equals the item's lattice voxel for voxel, and (G) a
+chest piece worn but never touched is coated on its live shell: every coated
+cell of the record is a coated cell on the body, and the counts agree. It
+writes `build/item_stage.bmp`.
 
-Not yet: a worn piece that was never captured off a wearer (an untouched
-garment) is coated in its AUTHORED cover coordinates; the push matches by
-position, so on a wearer whose fit resample moved the cells only the coincident
-ones change until the piece is captured once (any damage, any coat from the
-world). The stage has no undo, and the coat's pulse (`bodyCoatWave`) is drawn
-static.
+**Persistence** is §7's (`PutCoats`, PLYR v10 / ITMS v7), held, worn and
+bagged alike. One defect it had in common with every saved lattice:
+`RemapPrefabVoxels` (sim/mattable.h) remapped the whole 16-bit material word,
+so any voxel carrying a palette variant (bits 12..15 -- every held item's
+voxels, and the infection writers' cells) was out of the table's range and kept
+its STALE id when the material table changed between save and load. It remaps
+bits 0..11 and keeps the variant now.
+
+By design rather than missing: the stage has no undo (washing is water), and
+the coat's pulse (`bodyCoatWave`) is drawn static -- it is a still picture.
 
 ## 8c. Armour and equippables (added 2026-08-29)
 

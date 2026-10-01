@@ -3865,9 +3865,11 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             if (r.hit) {
               if (s.itemStageTicks == 0) {
                 const ItemStack* st = kit.Resolve(is.item);
+                std::string what = st ? st->name : std::string("item");
+                std::replace(what.begin(), what.end(), '_', ' ');
                 ui.kitMessage = "you pour " +
                                 (r.mat < mats.size() ? mats[r.mat].name : std::string("it")) +
-                                " over the " + (st ? st->name : std::string("item"));
+                                " over the " + what;
                 ui.kitMessageAge = 0.0f;
               }
               s.itemStageTicks++;

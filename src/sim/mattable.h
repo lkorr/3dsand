@@ -125,7 +125,12 @@ MatRemap BuildMatRemap(const MaterialNameTable& saved,
 template <class V>
 void RemapPrefabVoxels(std::vector<V>& v, const MatRemap& r) {
   for (V& x : v) {
-    x.material = (uint16_t)r.Mat(x.material);
+    // The id is bits 0..11; 12..15 are the palette variant a body and a held
+    // item carry (Mob::EquipItem, the infection writers). Mat() of the whole
+    // word was out of the table's range for any variant but 0 and came back
+    // UNREMAPPED, so a held blade or a limb saved under an older table kept
+    // stale ids (2026-10-01).
+    x.material = (uint16_t)((x.material & 0xF000u) | r.Mat(x.material & 0xFFFu));
     x.stain = r.BodyStain(x.stain);
   }
 }
