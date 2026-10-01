@@ -24514,9 +24514,11 @@ std::vector<PrefabVoxel> MobSystem::LimbLattice(uint64_t mobId,
     const MobLimb& l = mob.limbs_[limbIndex];
     if (l.HasFineSkin()) return l.skinVoxels;
     out.reserve(l.voxels.size());
-    for (const DebrisVoxel& v : l.voxels)
+    for (const DebrisVoxel& v : l.voxels) {
       out.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
                                 (uint16_t)(v.payload & 0xFFFu), v.color});
+      out.back().stain = v.stain;   // the coat word rides the collider too
+    }
     return out;
   }
   return out;

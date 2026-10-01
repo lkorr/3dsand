@@ -293,6 +293,7 @@ Status GateCoatTransfer(Ctx& c, std::string& detail) {
   // ---- B: the tip of the same blade ------------------------------------------
   Arm B;
   uint32_t bWound = 0, bWall = 0, tipBefore = 0, tipAfter = 0, bladeBled = 0;
+  uint32_t bladeFluid = 0;
   if (Mob* w = setup(B, sword, tipHalf)) {
     strike(B, *w, sword->strike, sword->edgeHalfWidth, sword->carveBonus,
            swordHeft, 0.85f, kLen, false, 7100u);
@@ -304,7 +305,15 @@ Status GateCoatTransfer(Ctx& c, std::string& detail) {
       }
     tipBefore = SumCoat(B.bladeBefore, liq);
     tipAfter = SumCoat(B.bladeAfter, liq);
-    if (B.res.bleedMat) bladeBled = CountCoat(B.bladeAfter, B.res.bleedMat);
+    // Whatever the blade wears now that is not the test liquid came off the
+    // target: it was clean or coated in the liquid before the blow. (By
+    // count, not by the last contact's report: a sweep may meet a second
+    // limb after this one and overwrite it.)
+    for (const PrefabVoxel& v : B.bladeAfter)
+      if (v.stain && BodyStainMat(v.stain) != liq) {
+        bladeBled++;
+        bladeFluid = BodyStainMat(v.stain);
+      }
     if (!B.landed) fail("B: the tip strike never landed");
     if (bWall == 0) fail("B: no coat on the wound wall");
     if (bWall != bWound) fail(Format("B: %u coated voxels buried", bWound - bWall));
@@ -314,46 +323,9 @@ Status GateCoatTransfer(Ctx& c, std::string& detail) {
     fail("B: fixture refused");
   }
 
-  // ---- C: a coated mace on intact skin ---------------------------------------
-  Arm C;
-  uint32_t cSurf = 0, cDeep = 0;
-  if (Mob* w = setup(C, mace, [](const Vec3&) { return true; })) {
-    strike(C, *w, mace->strike, mace->edgeHalfWidth, mace->carveBonus,
-           mace->HeftFactor(g.woundHeftRef, g.woundHeftMax), 0.5f, kLen, false,
-           7200u);
-    Occ occ(C.targetAfter);
-    for (const PrefabVoxel& v : C.targetAfter)
-      if (v.stain && BodyStainMat(v.stain) == liq) (occ.Exposed(v) ? cSurf : cDeep)++;
-    if (!C.landed) fail("C: the mace never landed");
-    if (cSurf == 0) fail("C: the mace left no coat");
-    if (cDeep != 0) fail(Format("C: %u coated voxels below depth 1", cDeep));
-  } else {
-    fail("C: fixture refused");
-  }
-
-  // ---- D: a coated fist -------------------------------------------------------
-  Arm D;
-  uint32_t dCoat = 0;
-  if (Mob* w = setup(D, nullptr, {})) {
-    const MobDef& def = mobs.Defs()[t.defIndex];
-    const int ni = def.FindNatural("fist.R");
-    const MobNaturalWeaponDef* nw = w->NaturalWeapon(ni);
-    if (nw && nw->partIndex >= 0) {
-      mobs.SoakLimb(D.wid, nw->partIndex, liq, coatAmt, 7300u);
-      w->SetStrikeEffector(nw->partIndex, StrikeEffectorMode::Chain, ni);
-      const float hw = std::max(nw->edgeHalfWidth, MetresToCells(0.10f));
-      strike(D, *w, w->StrikeProfileFor(*nw), hw, 0.0f, 1.0f, 0.5f, 2.0f, true,
-             7300u);
-      dCoat = CountCoat(D.targetAfter, liq);
-    }
-    if (!D.landed) fail("D: the punch never landed");
-    if (dCoat == 0) fail("D: the fist left no coat");
-  } else {
-    fail("D: fixture refused");
-  }
-
   // ---- E: into the bag, ticked, and back ---------------------------------
-  // Arm B's blade, as the tip strike left it (coated AND bloodied).
+  // Arm B's blade, as the tip strike left it (coated AND bloodied). Run before
+  // C and D, whose fixtures reset the creatures.
   uint32_t eVox = 0, eMoved = 0, eDiff = 0, eTicks = 0;
   bool eRan = false;
   if (Mob* w = B.ran ? mobs.FindMobById(B.wid) : nullptr) {
@@ -402,6 +374,45 @@ Status GateCoatTransfer(Ctx& c, std::string& detail) {
   if (eMoved) fail(Format("E: %u coat words changed in the bag", eMoved));
   if (eDiff) fail(Format("E: %u voxels differ after re-equip", eDiff));
 
+  // ---- C: a coated mace on intact skin ---------------------------------------
+  Arm C;
+  uint32_t cSurf = 0, cDeep = 0;
+  if (Mob* w = setup(C, mace, [](const Vec3&) { return true; })) {
+    strike(C, *w, mace->strike, mace->edgeHalfWidth, mace->carveBonus,
+           mace->HeftFactor(g.woundHeftRef, g.woundHeftMax), 0.5f, kLen, false,
+           7200u);
+    Occ occ(C.targetAfter);
+    for (const PrefabVoxel& v : C.targetAfter)
+      if (v.stain && BodyStainMat(v.stain) == liq) (occ.Exposed(v) ? cSurf : cDeep)++;
+    if (!C.landed) fail("C: the mace never landed");
+    if (cSurf == 0) fail("C: the mace left no coat");
+    if (cDeep != 0) fail(Format("C: %u coated voxels below depth 1", cDeep));
+  } else {
+    fail("C: fixture refused");
+  }
+
+  // ---- D: a coated fist -------------------------------------------------------
+  Arm D;
+  uint32_t dCoat = 0;
+  if (Mob* w = setup(D, nullptr, {})) {
+    const MobDef& def = mobs.Defs()[t.defIndex];
+    const int ni = def.FindNatural("fist.R");
+    const MobNaturalWeaponDef* nw = w->NaturalWeapon(ni);
+    if (nw && nw->partIndex >= 0) {
+      mobs.SoakLimb(D.wid, nw->partIndex, liq, coatAmt, 7300u);
+      w->SetStrikeEffector(nw->partIndex, StrikeEffectorMode::Chain, ni);
+      const float hw = std::max(nw->edgeHalfWidth, MetresToCells(0.10f));
+      strike(D, *w, w->StrikeProfileFor(*nw), hw, 0.0f, 1.0f, 0.5f, 2.0f, true,
+             7300u);
+      dCoat = CountCoat(D.targetAfter, liq);
+    }
+    if (!D.landed) fail("D: the punch never landed");
+    if (dCoat == 0) fail("D: the fist left no coat");
+  } else {
+    fail("D: fixture refused");
+  }
+
+
   RecordObserved("coatTransferTipWall", (double)bWall);
   RecordObserved("coatTransferBluntSurface", (double)cSurf);
   RecordObserved("coatTransferFist", (double)dCoat);
@@ -417,7 +428,7 @@ Status GateCoatTransfer(Ctx& c, std::string& detail) {
       "re-equipped %u voxels, %u differ%s",
       t.defName.c_str(), t.limbName.c_str(), liqName ? liqName->c_str() : "oil",
       coatAmt, aWound, A.landed ? 1 : 0, A.res.strikerTouched, bWall, bWound,
-      tipBefore, tipAfter, bladeBled, B.res.bleedMat, B.res.toTarget,
+      tipBefore, tipAfter, bladeBled, bladeFluid, B.res.toTarget,
       B.res.toStriker, cSurf, cDeep, dCoat, eTicks, eMoved, eVox, eDiff,
       why.c_str());
   std::printf("coat-transfer: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());

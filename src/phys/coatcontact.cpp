@@ -13,7 +13,7 @@ bool Owned(MicroBodySet* micro, int model) {
          micro->owned[(size_t)model];
 }
 
-float CellDist(const IVec3& v, const Vec3& p) {
+float CentreDist(const IVec3& v, const Vec3& p) {
   const Vec3 d{(float)v.x + 0.5f - p.x, (float)v.y + 0.5f - p.y,
                (float)v.z + 0.5f - p.z};
   return std::sqrt(d.dot(d));
@@ -86,7 +86,7 @@ std::vector<CoatCell> CoatContactCells(const StainLattice& L,
   for (size_t i = 0; i < n; i++) {
     if (L.Mat(i) == 0) continue;
     const IVec3 v = L.At(i);
-    const float d = CellDist(v, p);
+    const float d = CentreDist(v, p);
     if (d < near && occ.Exposed(v)) near = d;
   }
   if (near >= 1e29f) return out;
@@ -96,7 +96,7 @@ std::vector<CoatCell> CoatContactCells(const StainLattice& L,
   for (size_t i = 0; i < n; i++) {
     if (L.Mat(i) == 0) continue;
     const IVec3 v = L.At(i);
-    const float d = CellDist(v, p);
+    const float d = CentreDist(v, p);
     if (d > lim || !occ.Exposed(v)) continue;
     out.push_back(CoatCell{(uint32_t)i, d});
     if (splitDepth) in[i] = 1;
@@ -117,7 +117,7 @@ std::vector<CoatCell> CoatContactCells(const StainLattice& L,
           const int m = std::abs(v.x - s.x) + std::abs(v.y - s.y) +
                         std::abs(v.z - s.z);
           if (m != 1) continue;
-          out.push_back(CoatCell{(uint32_t)i, CellDist(v, p)});
+          out.push_back(CoatCell{(uint32_t)i, CentreDist(v, p)});
           in[i] = 1;
           break;
         }
@@ -167,7 +167,7 @@ std::vector<CoatCell> CoatWoundWall(const StainLattice& L,
     if (isGone(v.x - 1, v.y, v.z) || isGone(v.x + 1, v.y, v.z) ||
         isGone(v.x, v.y - 1, v.z) || isGone(v.x, v.y + 1, v.z) ||
         isGone(v.x, v.y, v.z - 1) || isGone(v.x, v.y, v.z + 1))
-      out.push_back(CoatCell{(uint32_t)i, CellDist(v, p)});
+      out.push_back(CoatCell{(uint32_t)i, CentreDist(v, p)});
   }
   SortCells(out);
   return out;
