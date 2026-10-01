@@ -9547,6 +9547,326 @@ Status GateSnake(Ctx& c, std::string& detail) {
     check(false, "a humanoid def to bite");
   }
   cleanup();
+
+  // ---- PASS C: ITS OWN HUNT, BESIDE A WALL, TO A WOUND THAT BURNS OUT -------
+  //
+  // Normal play rather than a lined-up fixture (owner, 2026-10-01: "prove the
+  // snake's OWN AI bites a human"). The snake is spawned facing AWAY from the
+  // man (-X, the man is off its right flank, 22 voxels), lying beside a stone
+  // wall three voxels high that runs along its LEFT flank -- where the
+  // footprint that was an unrotated 1.6 x 18 box read that wall as inside its
+  // body and refused every step (DESIGN.md "The snake", known limits, now
+  // fixed: Mob::FootprintFooting / SenseGround / BodyCapsule turn with the
+  // body). Nothing is pinned on the snake; it must turn, close, strike and
+  // bite on its own profile.
+  //
+  // The bite must leave the INFECTION in soft tissue and the venom SMEAR on
+  // the wound (sidecar bite.infect / bite.stain), and then -- with the snake
+  // taken away so it cannot re-bite -- the infection must run its own course
+  // and BURN OUT: envenomed back to 0 inside `snake.burnOutTicks`, at the
+  // material's rates x `snake.venomTimeScale` (the venom-wound gate's fast
+  // table, for the run time; R = spread / eat is unchanged by the scale), with
+  // hp booked to the infection's cause and not one cell of skin or bone
+  // converted by its spread.
+  if (humanDef >= 0 && sd.bite.infectMat != 0) {
+    const uint32_t envMat = sd.bite.infectMat;
+    const uint32_t venomMat = sd.bite.infectStain;
+    const float kScale = (float)BaselineNumber("snake.venomTimeScale", 8.0);
+    std::vector<MaterialDef> fast = c.mats;
+    if (envMat < fast.size() && fast[envMat].infect) {
+      fast[envMat].infectSpread *= kScale;
+      fast[envMat].infectEat *= kScale;
+    }
+    c.mobs.OnMaterialsReloaded(fast, c.reactions);
+    const MobDef& hd = c.mobs.Defs()[humanDef];
+    // Snake centre on the pad's axis; facing -X (heading -pi/2) its right is
+    // (cos h, 0, -sin h) = +Z, where the man stands. The wall runs along its
+    // LEFT (-Z) flank on EXACTLY the row the old unrotated box sampled for its
+    // "tail" (z - (worldSize.z / 2 - 0.5)): that box read the wall as inside
+    // the body and refused every step; the oriented one is 0.3 voxels wide
+    // across and never touches it -- until the snake turns right and its
+    // tail swings into it (Footing::wallMask: the turn is not a trap).
+    const float sx = (float)spot.x + 0.5f, sz = (float)spot.z - 10.0f;
+    const int wallZ = (int)std::floor(sz - (sd.worldSize.z * 0.5f - 0.5f));
+    {
+      std::vector<CellOp> wall;
+      for (int wx = padX0; wx <= padX1; wx++)
+        for (int y = padTop + 1; y <= padTop + 3; y++) {
+          const IVec3 cell{wx, y, wallZ};
+          if (!c.world.CellInWindow(cell)) continue;
+          const uint32_t stone = [&] {
+            for (size_t i = 0; i < c.mats.size(); i++)
+              if (c.mats[i].name == "stone") return (uint32_t)i;
+            return 1u;
+          }();
+          wall.push_back(CellOp{World::SlotCellIndex(cell), stone});
+        }
+      tick({}, wall);
+      for (int i = 0; i < 60; i++) {
+        bool seen = true;
+        for (int wx = padX0; wx <= padX1; wx += 4) {
+          const IVec3 cell{wx, padTop + 2, wallZ};
+          if (cachedSolid(cell)) continue;
+          seen = false;
+          c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+        }
+        if (seen) break;
+        tick();
+      }
+    }
+    const float px = sx, pz = sz + 22.0f;
+    const uint64_t prey = c.mobs.Spawn(
+        humanDef, {(int)std::lround(px - hd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround(pz - hd.worldSize.z * 0.5f)});
+    const uint64_t hunter = c.mobs.Spawn(
+        snakeDef, {(int)std::lround(sx - sd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround(sz - sd.worldSize.z * 0.5f)});
+    if (prey == 0 || hunter == 0 ||
+        !c.mobs.SetMobBehavior(prey, "training_dummy")) {
+      check(false, "the hunt fixture spawned (a man, a snake)");
+    } else {
+      c.mobs.SetHeading(hunter, -1.5707963f);
+      const Vec3 hc0 = AiMobCentre(c.mobs, hunter, sd);
+      const int maxTicks = (int)BaselineNumber("snake.huntTicks", 400.0);
+      int bitTick = -1, strikes = 0;
+      float moved60 = -1.0f, strikeGap = 0.0f;
+      NpcStroke lastCut;
+      bool wasCutting = false;
+      uint32_t env = 0;
+      std::vector<int> intents((size_t)ai::Intent::Count, 0);
+      for (int t = 0; t < maxTicks && bitTick < 0; t++) {
+        tick();
+        if (t == 60)
+          moved60 = AiPlanar(AiMobCentre(c.mobs, hunter, sd), hc0);
+        if (const ai::Brain* br = c.mobs.MobBrain(hunter))
+          intents[std::min((size_t)br->intent, intents.size() - 1)]++;
+        const NpcStroke* s = c.mobs.MobStroke(hunter);
+        const bool cutting = s != nullptr && s->Cutting();
+        if (cutting && !wasCutting) {
+          strikes++;
+          strikeGap = AiPlanar(AiMobCentre(c.mobs, hunter, sd),
+                               AiMobCentre(c.mobs, prey, hd));
+        }
+        if (cutting) lastCut = *s;
+        // EACH STRIKE, ONE LINE (rule 6): what it went for, from how far,
+        // where the head ended, and what the probes met.
+        if (!cutting && wasCutting) {
+          Vec3 head{};
+          const Mob* hm = c.mobs.FindMobById(hunter);
+          const bool haveHead =
+              hm != nullptr && !chain.empty() &&
+              hm->LimbCentreWorld(chain.front(), head);
+          const int tl = lastCut.targetLimb;
+          std::printf(
+              "snake hunt strike %d: aimed at %s (y %.1f), centre gap %.1f | "
+              "head ended %.1f vox from the aim | probes %d cast, %d body, "
+              "bitten %d\n",
+              strikes,
+              tl >= 0 && (size_t)tl < hd.limbs.size() ? hd.limbs[(size_t)tl].name.c_str()
+                                                      : "(chest)",
+              lastCut.targetPoint.y, strikeGap,
+              haveHead ? (head - lastCut.targetPoint).len() : -1.0f,
+              lastCut.probesCast, lastCut.probesBody, lastCut.bitten ? 1 : 0);
+        }
+        wasCutting = cutting;
+        env = 0;
+        for (size_t li = 0; li < hd.limbs.size(); li++)
+          env += c.mobs.LimbMaterialCount(prey, (int)li, envMat);
+        if (env > 0) bitTick = t;
+      }
+      // Bitten inside the first 60 ticks: how far it had come by then.
+      if (moved60 < 0.0f)
+        moved60 = AiPlanar(AiMobCentre(c.mobs, hunter, sd), hc0);
+      uint32_t smeared = 0;
+      for (size_t li = 0; li < hd.limbs.size(); li++)
+        smeared += c.mobs.LimbCoatMatCount(prey, (int)li, venomMat, 1);
+      std::string hist;
+      for (size_t k = 0; k < intents.size(); k++)
+        if (intents[k] > 0)
+          hist += Format(" %s %d", ai::IntentName((ai::Intent)k), intents[k]);
+      check(moved60 >= (float)BaselineNumber("snake.huntMoveVox", 3.0),
+            Format("beside a wall it is not refused: it moved %.1f vox in its "
+                   "first 60 ticks",
+                   moved60));
+      check(bitTick >= 0,
+            Format("its own AI turned, closed and bit within %d ticks (%d "
+                   "strike(s), %u envenomed, intents:%s)",
+                   maxTicks, strikes, env, hist.c_str()));
+      check(venomMat == 0 || smeared > 0,
+            Format("the wound wears the venom smear (%u cells)", smeared));
+      // ---- ...AND THE VENOM RUNS ITS COURSE --------------------------------
+      c.mobs.RemoveMob(hunter);
+      const int burnCap = (int)BaselineNumber("snake.burnOutTicks", 2400.0);
+      int burnt = -1;
+      uint32_t peak = env;
+      const float hpInf0 = [&] {
+        const Mob* pm = c.mobs.FindMobById(prey);
+        return pm ? pm->HpLostBy(DamageCause::Infection) : 0.0f;
+      }();
+      for (int t = 0; t < burnCap && bitTick >= 0; t++) {
+        tick();
+        uint32_t now = 0;
+        for (size_t li = 0; li < hd.limbs.size(); li++)
+          now += c.mobs.LimbMaterialCount(prey, (int)li, envMat);
+        peak = std::max(peak, now);
+        if (now == 0) {
+          burnt = t;
+          break;
+        }
+      }
+      const Mob::InfectStat is = c.mobs.InfectStatsOf(prey, envMat);
+      const uint32_t skinMat = c.mobs.MaterialIdNamed("skin");
+      const uint32_t boneMat = c.mobs.MaterialIdNamed("bone");
+      auto took = [&](uint32_t m) -> uint32_t {
+        auto it = is.took.find(m);
+        return it == is.took.end() ? 0u : it->second;
+      };
+      const float hpInf = [&] {
+        const Mob* pm = c.mobs.FindMobById(prey);
+        return pm ? pm->HpLostBy(DamageCause::Infection) : 0.0f;
+      }() - hpInf0;
+      check(bitTick < 0 || burnt >= 0,
+            Format("the venom burns out within %d ticks (x%.0f rates): "
+                   "envenomed %u at the bite, peak %u, 0 at tick %d",
+                   burnCap, kScale, env, peak, burnt));
+      check(took(skinMat) == 0 && took(boneMat) == 0,
+            Format("its spread converted no skin (%u) and no bone (%u)",
+                   took(skinMat), took(boneMat)));
+      check(bitTick < 0 || is.eaten == 0 || hpInf > 0.0f,
+            Format("what it ate cost hp on the infection's ledger (%.2f hp "
+                   "for %u cells eaten)",
+                   hpInf, is.eaten));
+      RecordObserved("snake.huntBiteTickObserved", (double)bitTick);
+      RecordObserved("snake.burnOutTickObserved", (double)burnt);
+      std::printf("snake hunt: moved %.1f vox in 60 ticks beside the wall | "
+                  "bit at tick %d after %d strike(s): %u envenomed, %u venom-"
+                  "smeared | intents:%s | burn-out at tick %d (peak %u; "
+                  "spread %u, eaten %u, hp %.2f) | took skin %u bone %u\n",
+                  moved60, bitTick, strikes, env, smeared, hist.c_str(), burnt,
+                  peak, is.spread, is.eaten, hpInf, took(skinMat),
+                  took(boneMat));
+    }
+    cleanup();
+    c.mobs.OnMaterialsReloaded(c.mats, c.reactions);
+  }
+
+  // ---- PASS D: NOTHING TO HUNT, SO IT WANDERS -------------------------------
+  //
+  // Alone on the pad (no player actor, no prey), on its own profile: the
+  // `movement.wander` block must take it on legs round where it was born with
+  // rests between them -- the wander intent wins, it covers ground, it STOPS
+  // (a rest lying coiled is a rest), it stays near its anchor, and the body
+  // is still a wave while it strolls (slip, as pass A measures it).
+  {
+    const float sx = (float)spot.x + 0.5f, sz = (float)spot.z - 2.0f;
+    const uint64_t idle = c.mobs.Spawn(
+        snakeDef, {(int)std::lround(sx - sd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround(sz - sd.worldSize.z * 0.5f)});
+    if (idle == 0) {
+      check(false, "the wander fixture spawned");
+    } else {
+      const int ticks = (int)BaselineNumber("snake.wanderTicks", 600.0);
+      const Vec3 a0 = AiMobCentre(c.mobs, idle, sd);
+      Vec3 last = a0;
+      float path = 0.0f, farthest = 0.0f;
+      int wanderTicks = 0, stillTicks = 0, movingTicks = 0, rests = 0;
+      bool wasStill = true;
+      for (int t = 0; t < ticks; t++) {
+        tick();
+        const Vec3 p = AiMobCentre(c.mobs, idle, sd);
+        const float step = AiPlanar(p, last);
+        last = p;
+        path += step;
+        farthest = std::max(farthest, AiPlanar(p, a0));
+        const bool still = step < 0.02f;
+        if (still) stillTicks++;
+        else movingTicks++;
+        if (still && !wasStill) rests++;
+        wasStill = still;
+        if (const ai::Brain* br = c.mobs.MobBrain(idle))
+          if (br->intent == ai::Intent::Wander) wanderTicks++;
+      }
+      const ai::Profile* sp =
+          c.mobs.Behaviors().At(c.mobs.Behaviors().Find("snake"));
+      const float radius = sp != nullptr ? sp->movement.wanderRadius : 0.0f;
+      check(radius > 0.0f, "the snake profile asks to wander (movement.wander)");
+      check(wanderTicks >= ticks / 2,
+            Format("the wander intent holds the idle snake (%d of %d ticks)",
+                   wanderTicks, ticks));
+      check(path >= (float)BaselineNumber("snake.wanderMinPathVox", 15.0),
+            Format("it strolls (%.1f vox of path)", path));
+      check(rests >= 1 && stillTicks >= 30,
+            Format("and rests between legs (%d rest(s), %d still ticks)",
+                   rests, stillTicks));
+      check(farthest <= radius + sd.worldSize.z,
+            Format("near home (farthest %.1f vox from its anchor, radius "
+                   "%.0f + a body)",
+                   farthest, radius));
+      RecordObserved("snake.wanderPathObserved", (double)path);
+      std::printf("snake wander: %d/%d ticks wandering, path %.1f vox, %d "
+                  "moving / %d still ticks, %d rest(s), farthest %.1f vox "
+                  "(radius %.0f)\n",
+                  wanderTicks, ticks, path, movingTicks, stillTicks, rests,
+                  farthest, radius);
+
+      // ---- PASS E: SAVED AND LOADED, IT GOES ON BEING A SNAKE --------------
+      // Its MOBS record (Mob::SaveOne -> MobSystem::LoadOne, the save's and
+      // the park's one pair). The profile comes back with it (the brain is
+      // rebuilt from the def's `behavior`, never saved), it is a prone body
+      // again, and it goes on wandering from where it was saved: the wander
+      // anchor, the legs and the slither's odometer are presentation and
+      // brain state, rebuilt from nothing -- a loaded snake starts a new rest
+      // where it lies, and its wave picks up a new phase on its first metre.
+      std::vector<uint8_t> rec;
+      if (const Mob* im = c.mobs.FindMobById(idle)) {
+        ByteWriter w{rec};
+        im->SaveOne(w);
+      }
+      const Vec3 savedAt = AiMobCentre(c.mobs, idle, sd);
+      c.mobs.RemoveMob(idle);
+      ByteReader rd{rec.data(), rec.size()};
+      const Mob* back = rec.empty()
+                            ? nullptr
+                            : c.mobs.LoadOne(rd, MobSystem::kSaveVersion);
+      const uint64_t bid = back != nullptr ? back->Id() : 0;
+      check(bid != 0, "the snake's MOBS record loads back");
+      if (bid != 0) {
+        const Vec3 b0 = AiMobCentre(c.mobs, bid, sd);
+        float bpath = 0.0f;
+        Vec3 bl = b0;
+        for (int t = 0; t < 900; t++) {
+          tick();
+          const Vec3 p = AiMobCentre(c.mobs, bid, sd);
+          bpath += AiPlanar(p, bl);
+          bl = p;
+        }
+        const ai::Brain* bb = c.mobs.MobBrain(bid);
+        const int sl = c.mobs.LocoState(bid);
+        check(bb != nullptr &&
+                  bb->profile == c.mobs.Behaviors().Find("snake"),
+              "it comes back on its own `snake` profile");
+        check(sl >= 0 && sl < (int)sd.skel.states.size() &&
+                  sd.skel.states[sl].groundAlign > 0.0f,
+              "it comes back prone (its `always` state)");
+        check(AiPlanar(b0, savedAt) < 2.0f && bpath >= 5.0f,
+              Format("where it was saved (%.1f vox off), and it goes on "
+                     "wandering (%.1f vox in 900 ticks)",
+                     AiPlanar(b0, savedAt), bpath));
+        std::printf("snake save/load: %zu-byte record, back %.1f vox from "
+                    "where it was saved, %.1f vox of wander in 900 ticks\n",
+                    rec.size(), AiPlanar(b0, savedAt), bpath);
+      }
+    }
+    // THE POSE COST (Mob::ApplySlither): its own wall-clock, every call over
+    // the gate. Diagnostic -- printed, never asserted.
+    std::printf("snake pose: ApplySlither %llu calls, %.2f us a call\n",
+                (unsigned long long)SlitherPoseCalls(),
+                SlitherPoseCalls()
+                    ? (double)SlitherPoseNanos() / 1000.0 /
+                          (double)SlitherPoseCalls()
+                    : 0.0);
+    cleanup();
+  }
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
