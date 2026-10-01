@@ -616,10 +616,10 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
                          bc.top[k].sumAmt);
       // ...and what hurt it, by cause (a bruise saturates into a blood coat
       // with no blood lost: Mob::BruiseLimb).
-      static const char* kCause[] = {"other", "blade", "blunt", "bite", "beam", "blast", "unarmed", "burn", "spawnrot", "fall"};
-      for (int k = 0; k < (int)DamageCause::Count && k < 10; k++)
+      for (int k = 0; k < (int)DamageCause::Count; k++)
         if (body->HpLostBy((DamageCause)k) > 0.0f)
-          coat += Format(", hurt %s %.2f", kCause[k], body->HpLostBy((DamageCause)k));
+          coat += Format(", hurt %s %.2f", DamageCauseName((DamageCause)k),
+                         body->HpLostBy((DamageCause)k));
     }
     out.lines += Format("%s%s %d/%d rows, %u doors%s%s%s", out.lines.empty() ? "" : "; ",
                         n->id.substr(n->id.find('/') + 1).c_str(), tr.reached, tr.rows, rs.doorOpens,

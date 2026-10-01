@@ -90,7 +90,9 @@ struct CauseRow {
 // BLADE cuts through and only a blade is heard as one. Bite, Beam, Blast,
 // Fall and Burn are Other's rows: they differ in what callers do, not here.
 // (Burn is only ever eaten — FlushBurn is its one producer — and its struck
-// row is Other's struck row, which is what the old flags said.)
+// row is Other's struck row, which is what the old flags said.) Infection
+// (PLAN_weapon_coats B1) is Burn's rows under its own ledger name: an
+// infection other than the rot is only ever eaten, through FlushBurn.
 inline constexpr CauseRow kCauseRows[] = {
   // cause                eaten  impact bleed               cBleed brain  coll   kids   cut    joint                  hp0    sHeld  gore   shed   burnt  rotV   blade
   {DamageCause::Other,    false, true,  BleedRate::Full,    true,  true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
@@ -113,6 +115,8 @@ inline constexpr CauseRow kCauseRows[] = {
   {DamageCause::SpawnRot, true,  true,  BleedRate::Full,    false, false, true,  false, false, JointRule::Never,      true,  false, false, false, true,  false, false},
   {DamageCause::Fall,     false, true,  BleedRate::Full,    true,  true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
   {DamageCause::Fall,     true,  true,  BleedRate::Full,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
+  {DamageCause::Infection,false, true,  BleedRate::Full,    true,  true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
+  {DamageCause::Infection,true,  true,  BleedRate::Full,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
 };
 // clang-format on
 

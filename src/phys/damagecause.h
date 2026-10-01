@@ -33,8 +33,31 @@ enum class DamageCause : uint8_t {
   Burn,       // the body reaction evaluator ate it: fire, acid, rot, joint twins
   SpawnRot,   // the holes a creature was BORN with (Mob::RotAtSpawn)
   Fall,       // landing too hard (PlayerAvatar::ApplyFallDamage)
+  Infection,  // a material infection eating tissue (Mob::InfectStep; an
+              // `infect` block with "cause": "burn" -- the rot -- books Burn)
   Count
 };
+
+// The ledger's name for each cause: the death line, the gates' hp-by-cause
+// readouts. One table so a new cause cannot leave a caller indexing past a
+// fixed-size array of the old ones.
+constexpr const char* DamageCauseName(DamageCause c) {
+  switch (c) {
+    case DamageCause::Other: return "other";
+    case DamageCause::Blade: return "blade";
+    case DamageCause::Blunt: return "blunt";
+    case DamageCause::Bite: return "bite";
+    case DamageCause::Beam: return "beam";
+    case DamageCause::Blast: return "blast";
+    case DamageCause::Unarmed: return "unarmed";
+    case DamageCause::Burn: return "burn";
+    case DamageCause::SpawnRot: return "spawnrot";
+    case DamageCause::Fall: return "fall";
+    case DamageCause::Infection: return "infection";
+    case DamageCause::Count: break;
+  }
+  return "?";
+}
 
 constexpr bool IsBluntCause(DamageCause c) {
   return c == DamageCause::Blunt || c == DamageCause::Unarmed;

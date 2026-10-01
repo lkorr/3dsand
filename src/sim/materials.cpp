@@ -398,6 +398,89 @@ static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
     d.coatRestore = restore;
     d.coatRestoreRate = restoreRate;
   }
+  // A COAT THAT CARRIES AN INFECTION (materials.h coatInfects): by name,
+  // resolved once the whole table exists (LoadMaterials), because the
+  // infection is usually authored after the liquid that carries it.
+  if (co.contains("infects")) {
+    if (co["infects"].is_string())
+      d.coatInfectsName = co["infects"].get<std::string>();
+    else
+      errors += path + ": material \"" + d.name +
+                "\": coat infects must be a material name\n";
+  }
+  const int infectCost = co.value("infectCost", 5);
+  if (infectCost < 1 || infectCost > 15) {
+    errors += path + ": material \"" + d.name +
+              "\": coat infectCost must be 1..15 levels\n";
+  } else {
+    d.coatInfectCost = (uint32_t)infectCost;
+  }
+}
+
+// "infect": {...} -- this material IS an infection (materials.h `infect`).
+// Targets stay as authored here; LoadMaterials resolves them against the tag
+// registry and the material table once both are complete.
+static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
+                        std::string& errors) {
+  if (!m.contains("infect")) return;
+  const json& in = m["infect"];
+  if (!in.is_object()) {
+    errors += path + ": material \"" + d.name + "\": \"infect\" must be an object\n";
+    return;
+  }
+  if (d.gpu.klass != CLASS_SOLID) {
+    errors += path + ": material \"" + d.name +
+              "\": an infection is tissue gone wrong and must be class solid\n";
+    return;
+  }
+  auto rate = [&](const char* key, float& out) {
+    if (!in.contains(key)) return;  // absent: the gore knobs (sentinel < 0)
+    const float r = in.value(key, -1.0f);
+    if (!(r >= 0.0f) || r > 240.0f) {
+      errors += path + ": material \"" + d.name + "\": infect " + key +
+                " must be 0..240 world voxels/min\n";
+      return;
+    }
+    out = r;
+  };
+  rate("spread", d.infectSpread);
+  rate("eat", d.infectEat);
+  if ((d.infectSpread < 0.0f) != (d.infectEat < 0.0f))
+    errors += path + ": material \"" + d.name +
+              "\": infect spread and eat are authored together or not at all\n";
+  const int floor = in.value("floor", 0);
+  if (floor < 0 || floor > 64) {
+    errors += path + ": material \"" + d.name + "\": infect floor must be 0..64\n";
+  } else {
+    d.infectFloor = (uint32_t)floor;
+  }
+  if (in.contains("targets")) {
+    if (!in["targets"].is_array()) {
+      errors += path + ": material \"" + d.name +
+                "\": infect targets must be a list of names / \"tag:x\"\n";
+    } else {
+      for (const json& t : in["targets"])
+        if (t.is_string()) d.infectTargets.push_back(t.get<std::string>());
+      if (d.infectTargets.empty())
+        errors += path + ": material \"" + d.name +
+                  "\": infect targets is empty (omit it for the rotRate rule)\n";
+    }
+  }
+  const float hp = in.value("hp", 0.0f);
+  if (!(hp >= 0.0f) || hp > 100000.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": infect hp must be 0..100000 per world voxel\n";
+  } else {
+    d.infectHp = hp;
+  }
+  d.infectTurns = in.value("turns", false);
+  const std::string cause = in.value("cause", std::string("infection"));
+  if (cause != "burn" && cause != "infection")
+    errors += path + ": material \"" + d.name +
+              "\": infect cause must be \"burn\" or \"infection\"\n";
+  d.infectBooksBurn = cause == "burn";
+  d.infectDeath = in.value("death", std::string());
+  d.infect = true;
 }
 
 // Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
@@ -783,6 +866,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     // Only clamp the TOP: the negative sentinel has to survive.
     d.rotRate = m.value("rotRate", -1.0f);
     if (d.rotRate > 1.0f) d.rotRate = 1.0f;
+    ParseInfect(m, path, d, errors);  // after klass: it requires a solid
     d.bareBlood = std::clamp(m.value("bareBlood", 0.0f), 0.0f, 1.0f);
     if (!(d.bareBlood == d.bareBlood)) d.bareBlood = 0.0f;   // NaN
     d.bleed = std::clamp(m.value("bleed", 1.0f), 0.0f, 4.0f);
@@ -1774,6 +1858,40 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
     } else if (!d.rubble.empty()) {
       const int id = FindMaterial(m, d.rubble);
       if (id > 0 && m[id].gpu.klass == CLASS_LIQUID) d.bleedFluid = (uint32_t)id;
+    }
+  }
+  // INFECTIONS AND THE COATS THAT CARRY THEM (materials.h `infect`,
+  // `coatInfects`): names and tags resolved now that the table and the tag
+  // registry are both complete. A coat may only name a material that IS an
+  // infection, and a target tag must be one some material actually carries
+  // -- a typo there would otherwise be an infection that attacks nothing.
+  for (auto& d : m) {
+    d.coatInfects = 0;
+    if (!d.coatInfectsName.empty()) {
+      const int id = FindMaterial(m, d.coatInfectsName);
+      if (id <= 0 || !m[id].infect)
+        errors += materialsPath + ": material \"" + d.name + "\": coat infects \"" +
+                  d.coatInfectsName + "\" is not a material with an infect block\n";
+      else
+        d.coatInfects = (uint32_t)id;
+    }
+    d.infectTargetTags = 0;
+    d.infectTargetIds.clear();
+    for (const std::string& t : d.infectTargets) {
+      if (t.rfind("tag:", 0) == 0) {
+        const uint32_t bit = tags.MaskOf(t.substr(4), false);
+        if (bit == 0)
+          errors += materialsPath + ": material \"" + d.name + "\": infect target \"" +
+                    t + "\" names a tag no material carries\n";
+        d.infectTargetTags |= bit;
+      } else {
+        const int id = FindMaterial(m, t);
+        if (id <= 0)
+          errors += materialsPath + ": material \"" + d.name +
+                    "\": infect target \"" + t + "\" is not a material\n";
+        else
+          d.infectTargetIds.push_back((uint32_t)id);
+      }
     }
   }
   CheckPinnedMaterialIds(m, materialsPath, errors);
