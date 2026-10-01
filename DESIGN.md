@@ -16958,6 +16958,86 @@ that refuses still says why — `MoveResult::WrongKind` carries the sentence the
 tooltip shows. A move is always a **swap**, never an overwrite, and validates
 BOTH ends, so no mis-drop can destroy an item.
 
+### The item stage (2026-10-01; `docs/PLAN_weapon_coats.md` C; `game/itemstage.*`, `ui/item_stage.*`, gate `item-stage`)
+
+Double-click a weapon or a worn piece -- in the pack, on the hotbar or on the
+body -- and it opens ALONE on the **item stage**, in the spellbook's column the
+way the alchemy bench does (a vessel double-clicked still goes to the bench).
+It is turned by dragging, zoomed by the wheel, put back by `done`/Esc (Esc
+order: conversation, bench, stage, screen). With a filled vessel chosen on the
+FLASKS row the left button POURS: the vessel's top substance goes onto the
+voxels under the brush, as a coat (§7 "A coat is a substance"), exactly as the
+portrait brush pours onto the body. Owner's choice: an isolated stage, not the
+portrait -- the item is shown with nothing else in the picture, neutrally lit.
+
+**The picture is the CPU's, like the bench's.** `ui/item_stage.cpp` raymarches
+the item's own lattice (a few thousand cells) with an orthographic DDA per pixel
+into a 256x192 RGBA buffer, uploaded through a staging buffer only when what it
+shows changed (a hash over the coat words, the view, the shell and the dye) and
+drawn at the largest integer scale with nearest filtering, so it stays pixel art.
+It shades as `microbody.wgsl` does, restated on the CPU: art colour or the
+material's 3-variant palette keyed on the cell, the dye by luminance over
+`kDyeRef`, then the coat (`stainColor`, its authored opacity, the
+`render.stain*` knobs, a value-noise mottle, the coat's glow). Light is fixed to
+the CAMERA (a warm key, a cool fill, a rim), the key banded in four steps, and a
+one-pixel ink outline plus a darker pixel at depth jumps. No new GPU pipeline.
+The base view lays the longest axis across the screen and the thinnest toward
+the viewer (a sword shows its flat); the orbit is on top of that, and "reset
+view" returns to it.
+
+**The pick is the picture's ray.** `itemstage::Raycast` is the DDA the renderer
+draws with, so `itemstage::Pick(px, py)` -- public, for the crafting bench that
+comes next -- names the voxel drawn under that pixel, and the brush starts from
+that same hit. `BrushCells` is `PourOnBody`'s rule at the lattice's own pitch: a
+disc across the ray, binned into one-cell columns, and in each column only the
+face (the nearest cell and those within 1.5 cells behind it), so a pour coats
+what you see and not the far side of the blade.
+
+**The UI never touches the item (multiplayer authority).** main.cpp turns the
+cursor into a LATTICE-space ray (`StageCamera::Ray`) and writes it, the brush
+radius and the chosen vessel into `PlayerSession::itemStroke` every frame, held
+like `pourStroke`. The tick (`TickAuthority`, beside the portrait brush) calls
+`itemstage::ApplyStroke`:
+
+* the vessel pays at `PourBrushCellsPerSec` of the brush's WORLD radius (lattice
+  radius / `ItemDef::scale`) off its own milli-eighth accumulator, only on ticks
+  the ray meets the item; a stack of flasks or of swords is split first
+  (`ContainerIsolateOne`), because one flask pays and one sword is coated;
+* each covered voxel takes `+3` (`kStrokeAmount`, the portrait's rate) through
+  `AddBodyStain`, or `WashBodyStain` when the substance `washes` -- so
+  `stainPrecedence` decides everything: water rinses, a corrosive displaces oil,
+  the same rule as on skin. There is no "wipe" tool; washing is water. A
+  substance with no body coat (no `stain`) pours nothing;
+* the write goes to `ItemLatticeMut` (`game/itemcoat.h`). An item on the rig is
+  first brought up to date from the rig (`CaptureLimbToItem`) and afterwards
+  pushed back (`PushItemLatticeToLimb`), so the blade in the fist shows it at
+  once; a lattice washed spotless is settled back to "as authored"
+  (`ItemLatticeSettle`) and the stack is plain again.
+
+While the stage is open on a hand or worn slot the tick also captures the rig
+into the stack every tick (`PlayerSession::itemStageOpen`), so the stage shows a
+held blade's coat drying in the fist. In the bag nothing ticks it: the coat is
+frozen (§7 "A coat moves on contact").
+
+A worn piece is one lattice per cover entry; the stage shows one shell at a
+time with a part selector. The readout under the picture is the shell's coats,
+heaviest coverage first, the per-limb ledger's shape.
+
+**Gate `item-stage`** (selftest_itemstage.cpp) runs the game's own functions on
+a real creature's kit: the sword is drawn (pixels, centred), the centre pixel
+picks a voxel, a stroke with a full flask on the sword in the PACK coats voxels
+and spends exactly what it reports, the stack moved away and back gives a
+byte-identical lattice AND picture, a washer rinses the coat down, and in the
+fist the live slot's coat equals the item's lattice voxel for voxel. It writes
+`build/item_stage.bmp`.
+
+Not yet: a worn piece that was never captured off a wearer (an untouched
+garment) is coated in its AUTHORED cover coordinates; the push matches by
+position, so on a wearer whose fit resample moved the cells only the coincident
+ones change until the piece is captured once (any damage, any coat from the
+world). The stage has no undo, and the coat's pulse (`bodyCoatWave`) is drawn
+static.
+
 ## 8c. Armour and equippables (added 2026-08-29)
 
 ### A worn piece is a set of borrowed rig slots

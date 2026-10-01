@@ -1413,6 +1413,50 @@ struct UIState {
     bool wantToggle = false;     // a row clicked: on / off the table
     KitRef toggleRef{};
   } alchemy;
+  // ---- THE ITEM STAGE (ui/item_stage.h, game/itemstage.h) -------------------
+  // One weapon or armour piece, alone, turned in the hand: double-click it in
+  // the pack, the hotbar or on the body. It takes the spellbook's column like
+  // the bench. With a filled vessel chosen on the FLASKS row the left button
+  // splashes it onto the voxels under the brush (the tick does it, from the
+  // ray main.cpp builds; the panel only says where). Mirror in, intent out.
+  struct ItemStageUI {
+    // ---- mirror ----
+    bool open = false;
+    uint64_t tex = 0;            // ImTextureID of the picture
+    int texW = 0, texH = 0;      // the texture's full size
+    int imgW = 0, imgH = 0;      // the drawn picture (top-left of tex), stage pixels
+    bool texReady = false;
+    std::string name;            // "sword", "leather tunic"
+    std::string kindText;        // "melee", "worn: chest"
+    std::vector<std::string> shellNames;   // a worn piece's parts; empty for a held item
+    struct Coat {
+      std::string name;
+      uint32_t color = 0;        // 0xAABBGGRR
+      int voxels = 0;
+      float frac = 0.0f;         // of the item's voxels
+    };
+    std::vector<Coat> coats;     // heaviest coverage first
+    int voxels = 0;              // the shell's voxel count
+    std::string where;           // "in your right hand", "in the pack"
+    // The brush ring, in stage pixels, when the cursor is on the item.
+    bool cursorValid = false;
+    float cursorPx[2] = {0, 0};
+    float cursorR = 0.0f;
+    float cellPx = 1.0f;         // stage pixels per lattice cell
+    // ---- panel-owned ----
+    int shell = 0;
+    float yaw = 0.45f, pitch = -0.32f, zoom = 1.0f;   // itemstage::View
+    bool resetView = false;      // consumed by main.cpp (the defaults live there)
+    float radius = 2.0f;         // brush radius, lattice cells
+    // ---- input, written by the panel every frame ----
+    bool over = false;
+    float at[2] = {0, 0};        // stage pixels
+    bool paint = false;          // left button held with a vessel chosen
+    // ---- latches ----
+    bool wantOpen = false;
+    KitRef openRef{};
+    bool wantClose = false;      // "done", Esc, or the screen closing
+  } itemStage;
   // THE THROW'S WIND-UP, 0..1 while Q is held with a throwable vessel in
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.

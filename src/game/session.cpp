@@ -17,6 +17,7 @@
 #include "game/ai_behavior.h"
 #include "game/bodyreg.h"
 #include "game/dye.h"
+#include "game/itemcoat.h"
 #include "game/persist.h"
 #include "game/strokes.h"
 #include "game/worlditems.h"
@@ -3805,6 +3806,40 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 ui.kitMessageAge = 0.0f;
               }
               s.pourStrokeTicks++;
+            }
+          }
+        }
+        // ---- THE ITEM STAGE (game/itemstage.h; DESIGN.md §7 "The item stage")
+        //
+        // The stage open on a HAND or WORN slot reads the stack, and the rig
+        // is that item's truth while it is on (itemcoat.h): capture it every
+        // tick so the stage shows the coat drying in the fist. Then the brush:
+        // one tick of the stroke main.cpp built from the stage camera, spent
+        // from the FLASKS row's vessel at the portrait brush's rate, written
+        // through the body-coat writers and pushed back onto the rig slot.
+        {
+          if (s.itemStageOpen.space == KitSpace::Equip && avatar.Spawned())
+            CaptureLimbToItem(mobs, avatar.Id(), s.itemStageOpen);
+          const itemstage::Stroke& is = s.itemStroke;
+          if (!is.active) {
+            s.itemStageTicks = 0;
+            s.itemStageSpendMilli = 0;
+          } else {
+            const itemstage::StrokeResult r = itemstage::ApplyStroke(
+                kit, &mobs, avatar.Spawned() ? avatar.Id() : 0, items, mats, is,
+                s.itemStageSpendMilli);
+            if (r.hit) {
+              if (s.itemStageTicks == 0) {
+                const ItemStack* st = kit.Resolve(is.item);
+                ui.kitMessage = "you pour " +
+                                (r.mat < mats.size() ? mats[r.mat].name : std::string("it")) +
+                                " over the " + (st ? st->name : std::string("item"));
+                ui.kitMessageAge = 0.0f;
+              }
+              s.itemStageTicks++;
+            } else if (r.refused && s.itemStageTicks == 0) {
+              ui.kitMessage = r.refused;
+              ui.kitMessageAge = 0.0f;
             }
           }
         }

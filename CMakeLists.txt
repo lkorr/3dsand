@@ -540,6 +540,9 @@ add_library(sandvox_core OBJECT
   src/game/melee.cpp
   src/game/coattransfer.cpp
   src/game/itemcoat.cpp
+  # The item stage (game/itemstage.h): the lattice grid, pick, brush and the
+  # stroke the tick applies; its CPU picture is src/ui/item_stage.cpp.
+  src/game/itemstage.cpp
   src/game/container.cpp
   src/game/flasksim.cpp
   src/game/flaskchem.cpp
@@ -620,6 +623,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_solute.cpp
   src/test/selftest_impact.cpp
   src/test/selftest_coat.cpp
+  src/test/selftest_itemstage.cpp
   src/test/selftest_audio.cpp
   src/test/selftest_net.cpp
   src/test/selftest_dialogue.cpp
@@ -664,6 +668,8 @@ add_library(sandvox_core OBJECT
   # inventory_ui.cpp is a pure drawing function over UIState.
   src/ui/theme.cpp
   src/ui/inventory_ui.cpp
+  # The item stage's picture: a CPU DDA over one item's lattice (ui/item_stage.h).
+  src/ui/item_stage.cpp
   # The conversation panel (pixel art, ui/dialogue_ui.h).
   src/ui/dialogue_ui.cpp
   # F1 -> World -> References: the ref list + inspector (world/refs.h).

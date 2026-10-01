@@ -71,6 +71,7 @@ const std::vector<Gate>& DyeGates();
 const std::vector<Gate>& WoundGates();
 const std::vector<Gate>& ImpactGates();
 const std::vector<Gate>& CoatGates();
+const std::vector<Gate>& ItemStageGates();
 // ONE list for all six combat gates (two feel gates and four NPC ones), even
 // though kOrder splits them to opposite ends of the run: the registry is a
 // pool of every gate a TU offers and the ORDER is kOrder's business alone.
@@ -837,6 +838,11 @@ const char* const kOrder[] = {
     // spawns on pristine ground like blade-wounds; its last arm ticks the
     // world and it regenerates the ground on the way out.
     "coat-transfer",
+    // ...and the item STAGE coats the same lattices from a flask: its CPU
+    // picture, its pick, a stroke on an item in the pack and one in the fist
+    // (DESIGN.md §7 "The item stage"). Regenerates the ground like
+    // coat-transfer, poses one creature with direct phase calls, never ticks.
+    "item-stage",
     "wound-rebleed",
     // ...and a mace MARKS a corpse and leaves it crumbling, instead of boring
     // an instant sphere out of it: the same three-rung ladder the living
@@ -1092,7 +1098,7 @@ const std::vector<Gate>& Registry() {
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
-                          &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(),
+                          &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
                           &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &ClearingGates()})
       pool.insert(pool.end(), g->begin(), g->end());

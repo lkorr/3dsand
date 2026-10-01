@@ -80,6 +80,7 @@
 #include "game/equipment.h"
 #include "game/grab.h"
 #include "game/item.h"
+#include "game/itemstage.h"
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/persist.h"
@@ -548,6 +549,21 @@ struct PlayerSession {
   // depends on the brush size (PourBrushCellsPerSec), so it is paid off an
   // accumulator rather than a fixed per-tick clock.
   int64_t pourSpendMilli = 0;
+  // ---- THE ITEM STAGE (game/itemstage.h, ui/item_stage.h) ----
+  // The item the character screen's stage is open on, or none: while it is a
+  // HAND or WORN slot the tick brings the stack's lattice up to date from the
+  // rig every tick (CaptureLimbToItem), so the stage shows the blade as it is
+  // in the fist -- the coat drying on it included. Written by main.cpp every
+  // frame, like the pour stroke.
+  KitRef itemStageOpen{};
+  // ...and the brush on it: HELD, rewritten by main.cpp every frame from the
+  // stage camera's ray through the cursor (lattice cells), applied by the tick
+  // (itemstage::ApplyStroke) every tick it is `active`. The UI never touches
+  // the item. Its own accumulator, so the portrait brush and this never pay
+  // for each other.
+  itemstage::Stroke itemStroke;
+  int64_t itemStageSpendMilli = 0;
+  uint32_t itemStageTicks = 0;   // ticks this stroke has poured
   // APPLY MODE (TB_APPLY): the same brush, on whatever body the crosshair is
   // on -- another creature, a corpse -- with the vessel in the HAND. Its own
   // accumulator and stroke, so the portrait brush and this never pay for each
