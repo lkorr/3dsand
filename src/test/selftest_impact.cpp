@@ -2991,6 +2991,149 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   return Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// rot-clock -- HOW FAST A ROT WOUND ON AN ARM GOES ANYWHERE (a measurement)
+// ---------------------------------------------------------------------------
+//
+// The owner's per-voxel infection (PLAN_weapon_coats B, follow-up) changes the
+// rot from a per-limb clock to a branching process, and the rot's rates have
+// to be retuned so a bitten arm behaves on roughly the same timescale as
+// before. This is the ruler for that. It reports; it asserts only that the
+// rot was seeded and went somewhere.
+//
+// A human's upper arm gets a small pit (the venom gate's), and the pit is
+// soaked with ichor whose coat -- in a COPY of the material table, data only
+// -- infects `rotflesh`, so the seed is the generic coat path and identical
+// before and after the change. The tick runs at gore.infectMobMult x
+// rotClockCrank (every rate of the rot scales by it, so time scales by it
+// exactly) until the rot reaches a SECOND limb (the shoulder: what a bite has
+// to do before it can ever reach the torso and kill) or rotClockMaxTicks.
+// Reported: seeded cells, rot on the arm at checkpoints, the tick the rot
+// crossed, and that tick in real (uncranked) minutes.
+Status GateRotClock(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const int human = mobs.FindDef("human");
+  const uint32_t rot = mobs.MaterialIdNamed("rotflesh");
+  int ichorIdx = -1;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "ichor") ichorIdx = (int)i;
+  if (human < 0 || !rot || ichorIdx < 0) {
+    detail = "no `human`, `rotflesh` or `ichor`";
+    return Status::Skip;
+  }
+  const float kCrank = (float)BaselineNumber("rotClockCrank", 40.0);
+  const int kMaxTicks = (int)BaselineNumber("rotClockMaxTicks", 4000);
+  int armLimb = -1;
+  std::vector<std::string> names;
+  {
+    const MobDef& def = mobs.Defs()[human];
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      names.push_back(def.limbs[li].name);
+      const MobLimbDef& ld = def.limbs[li];
+      if (armLimb >= 0 || ld.tag != "arm") continue;
+      bool parentSame = false;
+      for (const MobLimbDef& p : def.limbs)
+        if (p.name == ld.parent && p.tag == ld.tag) parentSame = true;
+      if (!parentSame) armLimb = (int)li;
+    }
+  }
+  if (armLimb < 0) {
+    detail = "the human has no upper arm";
+    return Status::Fail;
+  }
+  const Tuning saved = CurrentTuning();
+  Tuning tt = saved;
+  tt.gore.infectMobMult = saved.gore.infectMobMult * kCrank;
+  SetCurrentTuning(tt);
+  mobs.Reset();
+  c.debris.Reset();
+  auto restore = [&]() {
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(saved);
+  };
+  const uint64_t id = mobs.Spawn(human, FixtureSite(c.world, 415));
+  if (!id) {
+    restore();
+    detail = "could not spawn a human";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, as SpawnTarget.
+  for (int i = 0; i < 8; i++) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> sp;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, sp);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  }
+  std::vector<ParticleSpawn> spawns;
+  {
+    const LimbAxis ax = MeasureLimb(mobs, id, armLimb);
+    Vec3 best = ax.anchor + ax.along * (ax.reach * 0.5f);
+    float bestR = -1.0f;
+    for (uint32_t k = 0; k < 96; k++) {
+      const Vec3 p = mobs.LimbVoxelPos(id, armLimb, k * 7919u + 13u);
+      const float t = (p - ax.anchor).dot(ax.along);
+      if (t < ax.reach * 0.33f || t > ax.reach * 0.66f) continue;
+      const float r = (p - ax.anchor - ax.along * t).len();
+      if (r > bestR) {
+        bestR = r;
+        best = p;
+      }
+    }
+    // A ZOMBIE'S BITE, through the real BiteHit (the tear, the rewrite of
+    // the flesh it exposed to rotflesh, the ichor smear), at full power.
+    BiteOnce(mobs, c.world, id, armLimb, best, 4.0f, (uint16_t)rot,
+             (uint16_t)ichorIdx, 1.0f, 0xB17E5EEDu, spawns);
+  }
+  const uint32_t bitten = mobs.LimbMaterialCount(id, armLimb, rot);
+  uint32_t tick = 43999;
+  const Vec3 fo = mobs.MobOrigin(id);
+  support::TickCursor ticker{
+      c, tick, IVec3{ifloor(fo.x) >> 4, ifloor(fo.y) >> 4, ifloor(fo.z) >> 4}};
+  uint32_t crossedAt = 0, ticks = 0, peakArm = 0, diedAt = 0;
+  std::string crossedTo, curve;
+  for (int i = 0; i < kMaxTicks; i++) {
+    ticker();
+    ticks = (uint32_t)i + 1;
+    Mob* m = mobs.FindMobById(id);
+    if (!m) break;
+    const uint32_t arm = mobs.LimbMaterialCount(id, armLimb, rot);
+    peakArm = std::max(peakArm, arm);
+    if (ticks % 250 == 0) curve += Format(" %u", arm);
+    if (!m->Alive() && !diedAt) diedAt = ticks;
+    if (!crossedAt)
+      for (int li = 0; li < m->LimbCount(); li++)
+        if (li != armLimb && mobs.LimbMaterialCount(id, li, rot)) {
+          crossedAt = ticks;
+          crossedTo = li < (int)names.size() ? names[li] : "?";
+          break;
+        }
+    if (crossedAt) break;
+  }
+  const Mob::InfectStat st = mobs.InfectStatsOf(id, rot);
+  const uint32_t armEnd = mobs.LimbMaterialCount(id, armLimb, rot);
+  restore();
+  const double realMin = (double)crossedAt * kCrank / 30.0 / 60.0;
+  RecordObserved("rotClockBitten", (double)bitten);
+  RecordObserved("rotClockCrossTicks", (double)crossedAt);
+  RecordObserved("rotClockCrossRealMinutes", realMin);
+  RecordObserved("rotClockPeakArm", (double)peakArm);
+  detail = Format(
+      "x%.0f crank: the bite left %u rot; spread %u, eaten %u; rot on the arm every 250 "
+      "ticks:%s (peak %u, end %u); crossed to %s at tick %u of %d = %.1f real "
+      "minutes%s",
+      kCrank, bitten, st.spread, st.eaten, curve.c_str(), peakArm, armEnd,
+      crossedAt ? crossedTo.c_str() : "NOTHING", crossedAt, kMaxTicks, realMin,
+      diedAt ? Format(" (DIED at tick %u)", diedAt).c_str() : "");
+  return bitten > 0 && (st.spread > 0 || st.eaten > 0) ? Status::Pass
+                                                       : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -3006,6 +3149,7 @@ const std::vector<Gate>& ImpactGates() {
       {"bleed-fluid", "mob", {}, false, GateBleedFluid, false},
       {"mob-race", "mob", {}, false, GateMobRace, false},
       {"venom-wound", "mob", {}, false, GateVenomWound, false},
+      {"rot-clock", "mob", {}, false, GateRotClock, false},
   };
   return g;
 }
