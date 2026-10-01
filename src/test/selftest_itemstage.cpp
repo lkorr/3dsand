@@ -1,4 +1,4 @@
-// selftest_itemstage.cpp — THE ITEM STAGE (DESIGN.md §7 "The item stage";
+// selftest_itemstage.cpp — THE ITEM STAGE (DESIGN.md §8b "The item stage";
 // docs/PLAN_weapon_coats.md package C)
 //
 // item-stage: the stage's picture, its pick and its brush, through the same

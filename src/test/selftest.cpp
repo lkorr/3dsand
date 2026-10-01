@@ -840,7 +840,7 @@ const char* const kOrder[] = {
     "coat-transfer",
     // ...and the item STAGE coats the same lattices from a flask: its CPU
     // picture, its pick, a stroke on an item in the pack and one in the fist
-    // (DESIGN.md §7 "The item stage"). Regenerates the ground like
+    // (DESIGN.md §8b "The item stage"). Regenerates the ground like
     // coat-transfer, poses one creature with direct phase calls, never ticks.
     "item-stage",
     "wound-rebleed",

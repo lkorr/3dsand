@@ -3809,7 +3809,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             }
           }
         }
-        // ---- THE ITEM STAGE (game/itemstage.h; DESIGN.md §7 "The item stage")
+        // ---- THE ITEM STAGE (game/itemstage.h; DESIGN.md §8b "The item stage")
         //
         // The stage open on a HAND or WORN slot reads the stack, and the rig
         // is that item's truth while it is on (itemcoat.h): capture it every

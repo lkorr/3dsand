@@ -1,5 +1,5 @@
 #pragma once
-// ---- THE ITEM STAGE'S PICTURE (DESIGN.md §7, "The item stage") ----------------
+// ---- THE ITEM STAGE'S PICTURE (DESIGN.md §8b, "The item stage") ----------------
 //
 // One item's voxel lattice drawn on the CPU into an RGBA8 buffer, the way the
 // alchemy bench draws its table: no GPU pipeline, a texture upload and an

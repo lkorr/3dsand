@@ -1,5 +1,5 @@
 #pragma once
-// ---- THE ITEM STAGE: ONE ITEM, ITS OWN VOXELS, AND A BRUSH (DESIGN.md §7,
+// ---- THE ITEM STAGE: ONE ITEM, ITS OWN VOXELS, AND A BRUSH (DESIGN.md §8b,
 //      "The item stage"; docs/PLAN_weapon_coats.md package C) ----------------
 //
 // The GAME half of the stage: the lattice as a grid you can shoot a ray into,
