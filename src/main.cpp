@@ -6997,7 +6997,10 @@ int main(int argc, char** argv) {
     for (const MobDef& d : mobs.Defs())
       // ...and not a random-human pool body a spawn built this session
       // (MobSystem::PoolDef): those are the "random human" button's.
-      if (d.FindSocket("held_right") >= 0 && d.effects.empty() &&
+      // ...or a body that fights with its own natural weapons and has no
+      // hand to arm (the snake): it lands under the race filter's "other".
+      if ((d.FindSocket("held_right") >= 0 || !d.natural.empty()) &&
+          d.effects.empty() &&
           !MobSystem::IsPoolName(d.name)) {
         ui.aiCreatureNames.push_back(d.name);
         ui.aiCreatureRaces.push_back(d.race);   // the list's race filter

@@ -1421,7 +1421,11 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
         // (A random spawn that got a pool body skips the picker entirely; one
         // that did not falls through to it.)
         for (size_t i = 0; !(rnd && aiDef >= 0) && i < mobs.Defs().size(); i++) {
-          if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+          // The panel's eligibility (main.cpp rebuildAiCreatures): a body that
+          // can hold a weapon, or one that fights with its own (a snake).
+          if (mobs.Defs()[i].FindSocket("held_right") < 0 &&
+              mobs.Defs()[i].natural.empty())
+            continue;
           // Fall back to the old rule — first eligible def, preferring the
           // avatar's own species — if the pick names a def that has gone away
           // under an R reload. Never spawn nothing because a name went stale.
@@ -1573,8 +1577,15 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
             // THE SIDECAR'S OWN PROFILE when the button asked for it, and the
             // same `empty() ? "duelist" : behavior` fallback --shot-strike
             // uses, so a def that names none still gets something that fights.
+            // A body with no hand (a snake: natural weapons only) cannot fight
+            // the way a duelist profile drives it, so unless a profile was
+            // picked by name it keeps its own -- the default buttons are
+            // swordplay presets.
+            const bool handless = d.FindSocket("held_right") < 0;
             const std::string prof =
-                *profile != '\0' ? std::string(profile)
+                (handless && pickedProfile.empty() && !d.behavior.empty())
+                    ? d.behavior
+                : *profile != '\0' ? std::string(profile)
                 : d.behavior.empty() ? std::string("duelist")
                                      : d.behavior;
             if (!mobs.SetMobBehavior(nid, prof)) {
