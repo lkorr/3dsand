@@ -917,6 +917,10 @@ const char* const kOrder[] = {
     // because they all bite the one biggest severable limb: a bite has to infect
     // a forearm and a hand as well as a thigh (owner report 2026-09-19).
     "bite-limbs",
+    // ...and an infection that is a MATERIAL (PLAN_weapon_coats B): a venom
+    // coat seeds `envenomed` in an open wound, it spreads into soft tissue
+    // only and eats itself out at 3x its dose; on whole skin it does nothing.
+    "venom-wound",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

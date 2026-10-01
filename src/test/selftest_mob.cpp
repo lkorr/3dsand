@@ -9577,13 +9577,11 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
                 worstLayer, worstTick, worstAlive, worstOwn, worstBodies,
                 worstPending);
     {
-      static const char* const kCause[(int)DamageCause::Count] = {
-          "other", "blade", "blunt", "bite", "beam", "blast",
-          "unarmed", "burn", "spawnrot", "fall"};
       std::string ledger;
       for (int k = 0; k < (int)DamageCause::Count; k++) {
         const float v = avatar.HpLostBy((DamageCause)k);
-        if (v > 0.0f) ledger += Format(" %s %.1f", kCause[k], v);
+        if (v > 0.0f)
+          ledger += Format(" %s %.1f", DamageCauseName((DamageCause)k), v);
       }
       std::printf("    fate: %s at burn tick %d (cause \"%s\"); hp %.1f of %.1f "
                   "on the last living tick, burnt %.3f (cap %.3f), blood lost "

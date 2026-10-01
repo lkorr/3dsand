@@ -994,6 +994,58 @@ struct MaterialDef {
   // so it is not tissue, so before this the rot ate a limb down to a clean
   // skeleton and stopped.
   float rotRate = -1.0f;
+  // ---- THIS MATERIAL IS AN INFECTION ("infect", PLAN_weapon_coats B1) ------
+  //
+  // An infection is not a hardwired process any more: it is any material that
+  // carries an `infect` block. Mob::InfectStep spreads from each infected
+  // voxel using THAT voxel's material's block, so one limb can hold a zombie's
+  // rot and a snake's venom at once and each runs on its own clock:
+  //
+  //   "infect": { "spread": <world vox/min>, "eat": <world vox/min>,
+  //               "floor": <int>, "targets": ["tag:soft_tissue", "<name>"],
+  //               "hp": <hp per world voxel eaten>, "turns": <bool>,
+  //               "cause": "burn" | "infection", "death": "<text>" }
+  //
+  //   spread / eat  world voxels a MINUTE per infected limb, converted with the
+  //                 limb's own scale^3 (the rot's unit). ABSENT = the
+  //                 gore.infectSpreadRate / infectRotRate knobs times
+  //                 gore.infectMobMult -- which is how `rotflesh` keeps its
+  //                 numbers in tuning.json (the sentinel is < 0 here).
+  //   floor         infected voxels the eat may not take below (the rot's 4,
+  //                 Mob::InfectStep's note). 0 = it may eat itself out.
+  //   targets       what it may convert: "tag:<t>" or a material name. ABSENT
+  //                 = the creature's per-material rotRate admission (MobDef::
+  //                 RotRateOf), which is the rot's rule.
+  //   hp            FLAT hp the infected limb loses per world voxel the eat
+  //                 removes, on top of the ordinary volume charge. 0 = none.
+  //   turns         a body that dies with it in a limb rises (MobDef::turn).
+  //   cause         the ledger it books to: "burn" is the rot's historical
+  //                 account (DamageCause::Burn), anything else books to
+  //                 DamageCause::Infection.
+  //   death         the death cause it writes when its damage kills.
+  //
+  // CPU-only body state, never hashed (the infection pass is gore).
+  bool infect = false;
+  float infectSpread = -1.0f;
+  float infectEat = -1.0f;
+  uint32_t infectFloor = 0;
+  std::vector<std::string> infectTargets;   // as authored
+  uint32_t infectTargetTags = 0;            // resolved: gpu.tagMask bits
+  std::vector<uint32_t> infectTargetIds;    // resolved: material ids
+  float infectHp = 0.0f;
+  bool infectTurns = false;
+  bool infectBooksBurn = false;
+  std::string infectDeath;
+  // ...AND A COAT THAT CARRIES ONE ("coat": {"infects": "<material>",
+  // "infectCost": <levels>}, B2). Where a coat of this sits ON, or face-
+  // adjacent to an EXPOSED voxel the named infection targets, that voxel
+  // becomes the infection, and each conversion spends `infectCost` levels of
+  // the coat, so the dose is bounded by what was poured (rule 2). Skin is not
+  // a soft-tissue target and the flesh under intact skin is not exposed, so a
+  // coat on whole skin seeds nothing. 0 = carries no infection.
+  std::string coatInfectsName;
+  uint32_t coatInfects = 0;
+  uint32_t coatInfectCost = 5;
   // BARED TO THE AIR, BLOODIED (2026-09-23). The chance a voxel of this
   // material is left wearing the creature's blood when a body pass (acid,
   // fire, rot) takes the voxel beside it and so uncovers it -- the skeleton

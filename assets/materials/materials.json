@@ -2986,10 +2986,12 @@
         "#d08f7f",
         "#ebb0a0"
       ],
+      "//tags": "`soft_tissue` (with muscle, brain and venom_gland): what an infection that eats only SOFT tissue names as its diet -- envenomed's `infect.targets`. Skin and bone do not carry it, which is the whole of 'venom attacks flesh, not skin; bone stops it'.",
       "tags": [
         "flammable",
         "organic",
-        "dissolvable"
+        "dissolvable",
+        "soft_tissue"
       ],
       "molten": "fire"
     },
@@ -3008,7 +3010,8 @@
       "tags": [
         "flammable",
         "organic",
-        "dissolvable"
+        "dissolvable",
+        "soft_tissue"
       ],
       "molten": "fire",
       "//woundHp": "Twice skin's cost per voxel: a wound that has reached muscle is deeper than one that has not. See the note on `woundHp` in sim/materials.h -- these are RELATIVE weights normalised by the limb's own total, so raising this makes a deep wound cost more THAN A SHALLOW ONE without changing what it costs to destroy the limb outright.",
@@ -3097,7 +3100,8 @@
       "tags": [
         "flammable",
         "organic",
-        "dissolvable"
+        "dissolvable",
+        "soft_tissue"
       ],
       "//far": "MANDATORY, not decoration. The far-field cascade has exactly 128 palette slots and they are all owned; a 129th owner is a hard load error (sim/materials.cpp). Brain and flesh are the same colour at 50 m, so they share flesh's slot.",
       "far": "flesh",
@@ -3285,7 +3289,13 @@
         "dissolvable",
         "infectious"
       ],
-      "molten": "fire"
+      "molten": "fire",
+      "//infect": "THE ROT IS AN INFECTION BECAUSE OF THIS BLOCK (DESIGN.md 'Infection is a material'; sim/materials.h MaterialDef::infect). It carries the zombie's rot exactly as it ran before infections were data: `spread` and `eat` are NOT authored, so the rates stay the tuning knobs gore.infectSpreadRate / infectRotRate times gore.infectMobMult (world voxels a minute per infected limb); `targets` is not authored, so what it may take is each creature's per-material rotRate (flesh 1, bone 0.5); `floor` 4 is the old kInfectFloor (an infection may not eat its own seed out of existence); `cause` burn keeps its damage on the Burn ledger it has always booked to; `turns` is what makes a body that dies with it in a limb rise (sidecar `turn`).",
+      "infect": {
+        "floor": 4,
+        "cause": "burn",
+        "turns": true
+      }
     },
     {
       "//": "WHAT RUNS OUT OF A ROTTEN WOUND. `rotflesh`'s rubble, and the liquid whose STAIN a zombie's bite smears over the hole it tore (BiteHit::infectStain) -- the same pairing `blood` has with the flesh that crumbles to it. Stain type \"rot\" takes palette slot 3, after wet (1) and blood (2), which is why these rows are appended rather than inserted. It does NOT wash, unlike water's: rinsing an infection off in a stream is not a thing that should work. Everything else is blood's own numbers at a slower, thicker value (moveEvery 3 against 2), because ichor is blood that has been sitting. Far-aliased to `acid`, the other dark green liquid in the table.",
@@ -4779,6 +4789,94 @@
         "#262322"
       ],
       "tags": []
+    },
+    {
+      "//": "VENOM (docs/PLAN_weapon_coats.md B3). What a snake's gland leaks and its bite leaves in the wound, and what a blade can be coated with. On the ground it is only a thick (moveEvery 4), sickly yellow-green liquid -- no world reactions, no tags (tag:organic would let fungus eat a spilled flask). Its whole meaning is the COAT: a bodyOnly stain (the seven ground slots are spent) whose coat `infects` envenomed. A venom coat on whole skin does nothing but sit there and dry; where it touches OPEN soft tissue -- a wound wall, the flesh at a cut's rim -- each touched cell becomes `envenomed` and the coat pays `infectCost` 5 levels for it (a full coat, 15, seeds three cells; Mob::CoatInfectTick). decay 12 s per level: a coated blade carries it through a fight (a full coat is gone in a few minutes, DryOneLimb takes a level off half the coated cells each period), not through a week. opacity 0.8: it reads on a blade. contact 60: wading in it coats you, like the default liquid.",
+      "id": "venom",
+      "arcane": 8,
+      "class": "liquid",
+      "density": 1080,
+      "hardness": 4,
+      "moveEvery": 4,
+      "opacity": 210,
+      "far": "acid",
+      "molten": "steam",
+      "colors": [
+        "#8a9a18",
+        "#74841a",
+        "#9fb024"
+      ],
+      "stain": {
+        "type": "venom",
+        "color": "#a4bc2a",
+        "amount": 6,
+        "bodyOnly": true
+      },
+      "coat": {
+        "decay": 12,
+        "contact": 60,
+        "opacity": 0.8,
+        "shed": 150,
+        "effects": [],
+        "infects": "envenomed",
+        "infectCost": 5
+      },
+      "tags": []
+    },
+    {
+      "//": "ENVENOMED TISSUE (docs/PLAN_weapon_coats.md B3; DESIGN.md 'Infection is a material'). What venom turns soft tissue into, and the second infection after the zombie's rotflesh -- a DIFFERENT rot voxel, dark and bruise-purple where the rot is green. Tagged like rotflesh (flammable, organic, dissolvable, and `infectious`, so holy water and sunwater sear it out the way they sear the rot). Crumbles to blood, so it is still the creature's tissue to every wound rule. Its `infect` block is the venom: it spreads only into SOFT tissue (tag:soft_tissue: flesh, muscle, brain, glands -- never skin, never bone, so a wound to the bone stops there) and EATS 1.5x as fast as it spreads, so it always burns itself out (floor 0). THE ARITHMETIC, per infected limb, rates constant per limb: spread s = 0.03, eat e = 0.045 world voxels a minute; on a human (skinScale 8, 512 lattice cells a world voxel) that is 15.36 and 23.04 cells a minute. A dose of D cells shrinks at e - s = 7.68 cells a minute, so it is gone after D / 7.68 minutes -- a sword wound's dose of 8..15 cells lasts 62..117 s -- having spread s/(e-s) = 2 D more and eaten e/(e-s) = 3 D in all. `hp` 250 per world voxel eaten on top of the volume charge: a 12-cell dose eats 36 cells (0.07 world voxels) and costs the limb about 18 hp. Books to the Infection ledger and names the death `venom`; the dead do not rise from it.",
+      "id": "envenomed",
+      "class": "solid",
+      "density": 980,
+      "hardness": 5,
+      "rubble": "blood",
+      "far": "flesh",
+      "colors": [
+        "#3b2a3a",
+        "#2c1f2e",
+        "#4a3846"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "infectious"
+      ],
+      "molten": "fire",
+      "infect": {
+        "spread": 0.03,
+        "eat": 0.045,
+        "floor": 0,
+        "targets": [
+          "tag:soft_tissue"
+        ],
+        "hp": 250,
+        "cause": "infection",
+        "death": "venom",
+        "turns": false
+      }
+    },
+    {
+      "//": "A VENOM GLAND (docs/PLAN_weapon_coats.md B3, placed in the snake's head by package D). Organ tissue -- soft (tag:soft_tissue), crumbles to blood like the rest of the anatomy -- whose WOUND leaks venom (`bleedFluid`, the per-material bleed: the matter decides what comes out), so cutting a snake's head open spills venom you can scoop with a flask. ID NOTE: this row is appended (> 127), and a .vox palette index >= 128 is an art colour, so a mob .vox cannot paint it directly: the snake must paint a stand-in tissue and rewrite it at load (the way human.json's `garmentsBecome` turns linen into undercloth).",
+      "id": "venom_gland",
+      "class": "solid",
+      "density": 1030,
+      "hardness": 6,
+      "rubble": "blood",
+      "bleedFluid": "venom",
+      "far": "flesh",
+      "colors": [
+        "#c8b86a",
+        "#b5a65c",
+        "#d6c77a"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "soft_tissue"
+      ],
+      "molten": "fire"
     }
   ]
 }

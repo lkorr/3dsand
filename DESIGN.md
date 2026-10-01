@@ -6346,7 +6346,7 @@ cut leaves the creature's own blood, a punch leaves a bruise LEVEL on the skin
 biter's `ichor` — the victim's blood does not come into it. Because
 `StainWoundAs` only ever rewrites flesh-class cells (`MobDef::tissue`), a
 nonzero return IS "the tear exposed flesh", which is how an infection knows it
-landed; the material is latched on the limb (`MobLimb::infectMat`) so the heal
+landed; the material is latched on the limb (`MobLimb::infects`) so the heal
 path can tell a wound settling from a substance decaying. The rewrites dry
 BACK through `ReviveWoundVoxel` where `WoundsHeal()` says so, on their own
 clocks — blood at `gore.woundHealSlow`, rot at
@@ -6463,6 +6463,95 @@ some, per hit under the wound gates' own figure for one sword cut, which is what
 makes "caving a face in SLOWLY" mean something) and `bite-rot` (rotflesh > 0
 through skin, exactly 0 through iron). Every numeric row above is in the
 `combat-tuning` round-trip table, with a string probe for `bruiseMat`.
+
+### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectTick`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
+
+Until this the rot was the only infection and it was wired in: `MobLimb::infectMat`
+held one material, `Mob::InfectTick` ran it on the `gore.infect*` knobs, and
+what it could eat was each creature's `rotRate`. An infection is now **any
+material with an `infect` block**, and the voxel's own material is the
+infection's identity:
+
+```json
+"infect": { "spread": 0.03, "eat": 0.045, "floor": 0,
+            "targets": ["tag:soft_tissue"], "hp": 250,
+            "cause": "infection", "death": "venom", "turns": false }
+```
+
+- `spread` / `eat` — world voxels a minute per infected limb, converted with
+  the limb's scale³ exactly as the rot always was. ABSENT = the
+  `gore.infectSpreadRate` / `infectRotRate` knobs times `gore.infectMobMult`,
+  which is how `rotflesh` keeps its tuning rows.
+- `floor` — infected cells the eat may not take below. The rot authors 4 (the
+  old `kInfectFloor`); venom 0, so it can burn out.
+- `targets` — `tag:x` or a material name. ABSENT = the creature's per-material
+  `rotRate` admission (the rot's rule: flesh 1, bone 0.5).
+- `hp` — FLAT hp the infected limb loses per world voxel the eat removes, on
+  top of the volume charge the flush makes (which is a few tenths of an hp for a
+  few dozen lattice cells of a human arm — too little to be a poison).
+- `cause` — `"burn"` keeps the rot on the `Burn` ledger it has always booked
+  to; anything else books to the new `DamageCause::Infection` (Burn's sever
+  rows under its own name). `death` names the death when that damage kills
+  (`InternDeathCause`); `turns` is what makes a body with it in a limb rise
+  (`MobDef::turn` — dying of venom does not make a zombie).
+
+**Per limb, a few infections at once.** `MobLimb::infects[kInfectSlots = 3]`
+holds `{mat, stain}` pairs, packed; each runs on its own material's clock, so
+one arm can carry rot and venom together. A slot is dropped when its material
+has nothing left on the limb. The RNG keys are the rot's, with the SLOT mixed
+in (slot 0 mixes in nothing), so every zombie bite draws exactly what it drew
+before infections were data. The rot's behaviour did not change: `rotflesh`'s
+block is `{floor 4, cause burn, turns true}` and every number comes from the
+same knobs. A material the table has no block for (a legacy bite) runs the
+rot's rule (`RotSpec`).
+
+**A coat can seed one** (`coat.infects`, `coat.infectCost`). Where a coat that
+names an infection sits ON a voxel the infection targets, or is face-adjacent
+to an EXPOSED one (a free face in the limb's own lattice), that voxel becomes
+the infection and the coat pays `infectCost` levels for it — so the dose is
+the coat (rule 2). A coat on whole skin seeds nothing: skin is not soft tissue,
+and the flesh under it has no open face. A coat in a wound sits on the wall's
+flesh and muscle, and at the rim the skin's coat touches the flesh the cut laid
+open. `Mob::CoatInfectTick` runs only when `RecountCoat` found such a coat
+(`LimbCoat::infecting`, armed into `coatSeedDue_`), so its cost is what coat
+CHANGES cost. `SoakLimb` lays an infecting coat on the surface only, as it does
+acid. Nothing anywhere tests for venom.
+
+**Venom** is the second infection. `venom` (liquid, sickly yellow-green, a
+bodyOnly stain, `coat.decay` 12 s/level, `coat.infects: "envenomed"`,
+`infectCost` 5 — a full coat seeds three cells); `envenomed` (the dark,
+bruise-purple tissue it leaves, tagged like rotflesh so holy water and sunwater
+sear it; its block targets `tag:soft_tissue` — `flesh`, `muscle`, `brain`,
+`venom_gland` — never skin, never bone, so bone stops it); `venom_gland` (organ
+tissue whose wound leaks venom through `bleedFluid`). All three are appended
+(ids 204-206), so `venom_gland` (>127) cannot be painted into a `.vox`
+directly: a snake paints a stand-in and rewrites it at load, as `garmentsBecome`
+does.
+
+**The arithmetic.** Rates are constant per infected limb, so a dose of D cells
+changes by `s − e` a minute and is gone after `D / (e − s)` minutes, having
+spread `s·D/(e − s)` and eaten `e·D/(e − s)`. With `e = 1.5 s` that is **2 D
+spread and 3 D eaten, always**, whatever the rate. Venom's `s = 0.03`,
+`e = 0.045` world voxels a minute are 15.36 and 23.04 cells a minute on a human
+(skinScale 8, 512 cells a world voxel): it shrinks 7.68 cells a minute, so a
+sword wound's dose of 8..15 cells lasts 62..117 s and eats 24..45 cells, and
+`hp` 250 a world voxel charges a 12-cell dose's 36 eaten cells ≈ 18 hp. A cut
+reaching a joint seeds the neighbour at one cell, which adds its own small
+burn-out. When the last cell goes the slot is dropped and the pending
+tombstones are flushed at once (a finished infection never reaches the rebuild
+threshold on its own).
+
+**Remedies are data too.** `coat.effects` `"disinfect"` stops every infection
+on the limb (enchanted blood is a strong restorative: it stops venom as well as
+rot); `"disinfect:tag:<t>"` stops only those whose material carries `<t>`, and
+`"disinfect:<material>"` only that one. Stopped means the clock stops; the cells
+it already made stay until healing (`HealTick` mends any non-recipe cell) or a
+blade takes them.
+
+Gate `venom-wound` (`src/test/selftest_impact.cpp`): a carved hole in four
+human limbs, soaked with venom; envenomed appears, spreads and returns to 0;
+eaten / seeded within `baseline.json`'s band around 3; the limbs' hp fell;
+bone untouched; the same soak on a second, uncut human seeds nothing.
 
 ### Blood is health, and burns cap it (2026-09-02; `Mob::DrainBlood`, `Mob::RecountBurn`, `sim/tuning.h` §F/§G)
 
@@ -7446,7 +7535,7 @@ character) is read by `Mob::Die`, which books a rising — where it was, which
 way it faced, which limbs it had already lost, and the debris handles its
 remains became — and `MobSystem::PreTick` services it: the remains are
 destroyed and the creature stands up as `DefWithEffects(itself, {into})`. The
-test is `MobLimb::infectMat`, the rot a zombie's bite leaves in the flesh, so
+test is `MobLimb::infects` holding an infection whose `infect.turns` is set (the rot a zombie's bite leaves in the flesh, not venom), so
 what turns you is having the disease in you when you die and not what finally
 killed you. `MobSystem::TurnMob` is the same thing without the death, for a
 live creature. The zombie effect deletes `turn` (`"turn": null`), because a
@@ -17807,7 +17896,7 @@ write a live limb's `xf`. The old
 click-a-limb pour (`InspectApplyPicks`) is gone; `DouseLimb` stays as the
 whole-limb door for gates and tools. Vocabulary: `stanch` (the cauterise rule's
 three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
-infectMat/infectStain). `enchanted_blood` authors both (2026-09-27), plus the
+infection slots; `disinfect:tag:<t>` / `disinfect:<material>` stop only those -- "Infection is a material"). `enchanted_blood` authors both (2026-09-27), plus the
 third word, `restore` -- see "A coat that heals".
 
 **Apply mode: the same brush on somebody else** (2026-09-25; owner: "when
