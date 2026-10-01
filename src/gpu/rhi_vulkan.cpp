@@ -1,5 +1,6 @@
 #include "gpu/rhi_vulkan.h"
 
+#include <algorithm>  // std::sort — DecoratedBindings
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -181,6 +182,32 @@ VkShaderStageFlags ToVkStages(rhi::ShaderStage s) {
   if ((uint32_t)s & (uint32_t)rhi::ShaderStage::Fragment) f |= VK_SHADER_STAGE_FRAGMENT_BIT;
   if ((uint32_t)s & (uint32_t)rhi::ShaderStage::Compute) f |= VK_SHADER_STAGE_COMPUTE_BIT;
   return f;
+}
+
+// Every (set << 16 | binding) a SPIR-V module decorates, sorted. Only a variable
+// carrying BOTH decorations is a descriptor; Tint's single-entry-point output
+// contains only the globals the entry point reaches. A module too malformed to
+// walk yields what was read before the fault: the check it feeds can only
+// refuse a pipeline over a binding the SPIR-V really names.
+static std::vector<uint32_t> DecoratedBindings(const std::vector<uint32_t>& spirv) {
+  constexpr uint32_t kOpDecorate = 71, kDecBinding = 33, kDecDescriptorSet = 34;
+  std::unordered_map<uint32_t, uint32_t> set, binding;
+  for (size_t i = 5; i < spirv.size();) {
+    const uint32_t count = spirv[i] >> 16, op = spirv[i] & 0xffffu;
+    if (count == 0 || i + count > spirv.size()) break;
+    if (op == kOpDecorate && count >= 4) {
+      if (spirv[i + 2] == kDecDescriptorSet) set[spirv[i + 1]] = spirv[i + 3];
+      if (spirv[i + 2] == kDecBinding) binding[spirv[i + 1]] = spirv[i + 3];
+    }
+    i += count;
+  }
+  std::vector<uint32_t> out;
+  for (const auto& [id, b] : binding) {
+    auto s = set.find(id);
+    if (s != set.end()) out.push_back((s->second << 16) | (b & 0xffffu));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 // The shader_cache/ LRU sweep (kShaderCacheMaxAgeDays). Runs once per process
@@ -1465,7 +1492,8 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
                                         const std::string& entryPoint,
                                         uint32_t bodyLineOffset,
                                         std::string& diagnostics,
-                                        std::string* cacheKey) {
+                                        std::string* cacheKey,
+                                        std::vector<uint32_t>* bindings) {
   // THREAD-SAFE, AND CONCURRENT ACROSS KEYS. Threaded pipeline creation
   // (Simulation::BuildPipelines) reaches this from several threads at once.
   // The lock covers the CACHE ONLY, never the compile: the expensive middle —
@@ -1508,6 +1536,7 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
       auto it = moduleCache_.find(key);
       if (it != moduleCache_.end()) {
         it->second.refs++;  // the caller's reference (ReleaseShaderModule)
+        if (bindings) *bindings = it->second.bindings;
         return it->second.module;
       }
       if (!moduleInFlight_.count(key)) break;  // ours to compile
@@ -1519,6 +1548,7 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // Every early return has to hand the claim back, so the compile body is
   // wrapped in a lambda and there is exactly one exit path.
   VkShaderModule out = VK_NULL_HANDLE;
+  std::vector<uint32_t> decorated;  // DecoratedBindings, published with `out`
   auto compile = [&]() -> VkShaderModule {
 
   // SPIR-V disk cache: skip Tint entirely on subsequent launches when the
@@ -1612,6 +1642,7 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
     if (!wrote || rec) fs::remove(tmpPath, rec);
   }
 
+  decorated = DecoratedBindings(spirv);
   VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
   sci.codeSize = spirv.size() * sizeof(uint32_t);
   sci.pCode = spirv.data();
@@ -1635,9 +1666,10 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   {
     std::lock_guard<std::mutex> lock(shaderMutex_);
     moduleInFlight_.erase(key);
-    if (out != VK_NULL_HANDLE) moduleCache_[key] = CachedModule{out, 1};
+    if (out != VK_NULL_HANDLE) moduleCache_[key] = CachedModule{out, 1, decorated};
   }
   shaderCv_.notify_all();
+  if (bindings && out != VK_NULL_HANDLE) *bindings = std::move(decorated);
   return out;
 }
 

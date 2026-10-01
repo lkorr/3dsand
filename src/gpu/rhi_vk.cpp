@@ -181,6 +181,29 @@ struct VkrPipelineLayout final : PipelineLayoutImpl {
     if (st && st->be) st->be->DestroyPipelineLayoutDeferred(l);
   }
 };
+// The (set, binding) pairs a module names that `pl` does not provide, as
+// "@group(s) @binding(b)" text; empty when the layout covers the module.
+// Checked BEFORE the driver sees the pipeline: a binding the layout lacks is
+// invalid usage, and the NVIDIA driver null-dereferences inside
+// vkCreateComputePipelines on it instead of failing (crash.log 2026-09-27 and
+// 2026-09-30, both on a build-pool thread with no shader named). The usual
+// cause is a hot-loaded .wgsl that grew a binding ahead of the exe's layout.
+std::string LayoutMissing(const VkrPipelineLayout* pl, const std::vector<uint32_t>& used) {
+  std::string out;
+  for (uint32_t sb : used) {
+    const uint32_t set = sb >> 16, binding = sb & 0xffffu;
+    bool found = false;
+    if (set < pl->keepSets.size()) {
+      auto* g = static_cast<const VkrBindGroupLayout*>(pl->keepSets[set].get());
+      for (const BindGroupLayoutEntry& e : g->entries)
+        if (e.binding == binding) found = true;
+    }
+    if (!found)
+      out += (out.empty() ? "" : ", ") + std::string("@group(") + std::to_string(set) +
+             ") @binding(" + std::to_string(binding) + ")";
+  }
+  return out;
+}
 struct VkrComputePipeline final : ComputePipelineImpl {
   VkPipeline p = VK_NULL_HANDLE;
   std::shared_ptr<PipelineLayoutImpl> keepLayout;
@@ -550,12 +573,20 @@ struct VkrDevice final : DeviceImpl {
     auto* m = static_cast<VkrShaderModule*>(module.Get());
     auto* pl = static_cast<VkrPipelineLayout*>(layout.Get());
     std::string diag, key;
+    std::vector<uint32_t> used;
     VkShaderModule sm = st->be->GetShaderModule(m->source, m->label, entry,
-                                                /*bodyLineOffset=*/0, diag, &key);
+                                                /*bodyLineOffset=*/0, diag, &key, &used);
     if (sm != VK_NULL_HANDLE) m->Hold(std::move(key));
     if (sm == VK_NULL_HANDLE) {
       std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", m->label.c_str(),
                    entry, diag.c_str());
+      return {};
+    }
+    if (const std::string missing = LayoutMissing(pl, used); !missing.empty()) {
+      std::fprintf(stderr,
+                   "compute pipeline %s::%s refused: the shader declares %s, which its "
+                   "pipeline layout lacks (a .wgsl ahead of the exe? rebuild)\n",
+                   m->label.c_str(), entry, missing.c_str());
       return {};
     }
     VkPipeline p = st->be->CreateComputePipeline(pl->l, sm, entry, label);
@@ -578,21 +609,35 @@ struct VkrDevice final : DeviceImpl {
     if (!vm || !fm || !pl) return {};
     const char* label = d.label ? d.label : "renderPipeline";
     std::string diag, key;
-    VkShaderModule vs =
-        st->be->GetShaderModule(vm->source, vm->label, d.vertexEntry, 0, diag, &key);
+    std::vector<uint32_t> usedVs, usedFs;
+    VkShaderModule vs = st->be->GetShaderModule(vm->source, vm->label, d.vertexEntry, 0,
+                                                diag, &key, &usedVs);
     if (vs != VK_NULL_HANDLE) vm->Hold(std::move(key));
     if (vs == VK_NULL_HANDLE) {
       std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", vm->label.c_str(),
                    d.vertexEntry, diag.c_str());
       return {};
     }
-    VkShaderModule fs =
-        st->be->GetShaderModule(fm->source, fm->label, d.fragmentEntry, 0, diag, &key);
+    VkShaderModule fs = st->be->GetShaderModule(fm->source, fm->label, d.fragmentEntry, 0,
+                                                diag, &key, &usedFs);
     if (fs != VK_NULL_HANDLE) fm->Hold(std::move(key));
     if (fs == VK_NULL_HANDLE) {
       std::fprintf(stderr, "shader compile failed for %s::%s\n%s\n", fm->label.c_str(),
                    d.fragmentEntry, diag.c_str());
       return {};
+    }
+    // Same check as the compute path (LayoutMissing), per stage.
+    for (int s = 0; s < 2; s++) {
+      const VkrShaderModule* sm = s ? fm : vm;
+      const char* ep = s ? d.fragmentEntry : d.vertexEntry;
+      if (const std::string missing = LayoutMissing(pl, s ? usedFs : usedVs);
+          !missing.empty()) {
+        std::fprintf(stderr,
+                     "render pipeline '%s' refused: %s::%s declares %s, which its "
+                     "pipeline layout lacks (a .wgsl ahead of the exe? rebuild)\n",
+                     label, sm->label.c_str(), ep, missing.c_str());
+        return {};
+      }
     }
     VkPipeline p =
         st->be->CreateGraphicsPipeline(pl->l, vs, d.vertexEntry, fs, d.fragmentEntry, d,
