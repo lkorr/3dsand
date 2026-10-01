@@ -97,6 +97,7 @@ PIPE_TO_MEMBER = {
     "PIPE_COMPACT_NEXT": "compactNext_",
     "PIPE_STEP": "step_",
     "PIPE_REPOSE_SNAP": "reposeSnap_",
+    "PIPE_CA_MASK": "caMask_",
     "PIPE_OCCUPANCY": "occupancy_",
     "PIPE_OCCUPANCY_DIRTY": "occupancyDirty_",
     "PIPE_PICK": "pick_",
@@ -309,6 +310,8 @@ BUF_TO_WGSL = {
     # snapshot costs one binding, and the recorder wants exactly this
     # granularity anyway -- the prepass writes both and the CA reads both.
     "ReposeSnap": {"reposeSnap"},
+    "CaMask": {"caMask"},
+    "CaWind": {"caWind"},
     # The deferred streaming wake's act verdict, binding 30.
     "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
@@ -434,6 +437,9 @@ _SIM_GROUP0 = {
     # The wind-draft shelter volume + its meta words, bindings 46/47
     # (sim_draft.wgsl builds it before the CA; windAtQ reads it).
     "draftField", "draftMeta",
+    # The CA's air mask, binding 48 (sim_step.wgsl camask writes it before
+    # each gravity substep; main reads it).
+    "caMask", "caWind",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

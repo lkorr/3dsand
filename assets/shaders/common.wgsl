@@ -3670,6 +3670,15 @@ fn windPrimEntrainsQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> bool {
 // one evaluation per chunk per tick, the God of War shape — NOT a cheaper field.
 fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   if ((*T).windMode == WIND_MODE_OFF) { return vec3<i32>(0, 0, 0); }
+  return windAmbQ(p, T) + windPrimAtQ(p, T);
+}
+
+// The AMBIENT half of windAtQ: the weather field with the draft volume's
+// shelter applied, WITHOUT the primitives. Smooth at the draft cell's 0.4 m and
+// coarser, which is what lets the CA cache it per 4^3 block (sim_step.wgsl
+// caWindAt) while the primitives -- a fan's edge can be sharp -- stay exact per
+// cell. Callers gate on windMode themselves (windAtQ above does).
+fn windAmbQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   let rq = windRampQ(p, T);
   let alt = rq.ramp;
   let d = (*T).windDirQ;                 // unit XZ, downwind, Q16.16
@@ -3726,7 +3735,7 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   let amb = vec3<i32>(wq(dl.x, spd), 0, wq(dl.y, spd)) + extra +
             vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
             vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z));
-  return draftApplyQ(p, amb, T) + windPrimAtQ(p, T);
+  return draftApplyQ(p, amb, T);
 }
 
 // ============================ THE CURRENT FIELD =============================
@@ -5954,9 +5963,17 @@ fn windLateralStartK(c : vec3<i32>, base : u32, m : Material,
                      key : u32, substep : u32,
                      T : ptr<uniform, TickParams>) -> u32 {
   if ((*T).windMode == WIND_MODE_OFF) { return base; }
+  if (matWindResponse(m) == 0u) { return base; }   // most materials: one compare
+  return windLateralStartW(windAtQ(c, T), base, m, key, substep, T);
+}
+// The same with the wind at the cell already in hand (the CA's per-block
+// cache, sim_step.wgsl caWindAt). Same gates, so either entry is exact.
+fn windLateralStartW(w : vec3<i32>, base : u32, m : Material,
+                     key : u32, substep : u32,
+                     T : ptr<uniform, TickParams>) -> u32 {
+  if ((*T).windMode == WIND_MODE_OFF) { return base; }
   let resp = i32(matWindResponse(m));
-  if (resp == 0) { return base; }          // most materials: one compare
-  let w = windAtQ(c, T);
+  if (resp == 0) { return base; }
   let mag = max(abs(w.x), abs(w.z));
   if (mag == 0) { return base; }
   // Ramp to the cap over [0, WIND_DRIFT_REF], then scale by the authored
@@ -6086,6 +6103,18 @@ struct GasIntent {
 // so a windless world moves exactly as it did before this existed.
 fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
               substep : u32, T : ptr<uniform, TickParams>) -> GasIntent {
+  if ((*T).windMode == WIND_MODE_OFF || matWindResponse(m) == 0u) {
+    var g : GasIntent;
+    g.dir = vec3<i32>(0, 1, 0);
+    g.rise = true;
+    g.rot = base;
+    return g;
+  }
+  return gasIntentW(windAtQ(c, T), m, key, base, substep, T);
+}
+// The same with the wind at the cell already in hand (sim_step.wgsl caWindAt).
+fn gasIntentW(w : vec3<i32>, m : Material, key : u32, base : u32,
+              substep : u32, T : ptr<uniform, TickParams>) -> GasIntent {
   var g : GasIntent;
   g.dir = vec3<i32>(0, 1, 0);
   g.rise = true;
@@ -6093,7 +6122,6 @@ fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
   if ((*T).windMode == WIND_MODE_OFF) { return g; }
   let resp = i32(matWindResponse(m));
   if (resp == 0) { return g; }              // most materials: one compare
-  let w = windAtQ(c, T);
   let fy = windAxisFrac(w.y, resp, T);
   let fh = min(1024, max(abs(windAxisFrac(w.x, resp, T)),
                          abs(windAxisFrac(w.z, resp, T))));

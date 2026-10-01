@@ -46,7 +46,26 @@ class World;
 class Simulation;
 struct MaterialDef;
 
+struct CellOp;
+
 namespace sandvox {
+
+// ---- THE VILLAGE FIRE (owner report 2026-10-01: 10 fps) -------------------
+// Harrowby's three houses (the default map's refs/harrowby.json) with their
+// ground floors flooded `oilDepth` deep in oil and a match on the surface:
+// --perf village-fire builds it after moving the window onto the green, the
+// windowed `--burn-house` with SANDVOX_BURN_VILLAGE=1 after walking the
+// player there. Every op is IfAir. False + `why` when the map has no Harrowby.
+struct VillageFireOps {
+  std::vector<CellOp> oil, fire;
+  IVec3 green{};
+  int houses = 0;
+  uint32_t oilCells = 0;
+  std::vector<IVec3> solidSample;   // house cells that must be solid (alignment check)
+};
+bool VillageGreen(IVec3& green, std::string& why);
+bool BuildVillageFireOps(const World& world, const std::vector<MaterialDef>& mats,
+                         int oilDepth, VillageFireOps& out, std::string& why);
 
 struct PerfOptions {
   // Run only this scenario id (empty = all). Same shape as --gate.

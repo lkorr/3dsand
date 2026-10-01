@@ -644,7 +644,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
 
     f.CmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 
-    const bool caLoop = r.dyn == pass::Dyn::Ca;
+    const bool caLoop = r.dyn == pass::Dyn::Ca || r.dyn == pass::Dyn::Ca1;
     // NOTE: a SANDVOX_CA_REPEAT env knob once lived here, truncating the CA
     // row's 54 iterations so the per-dispatch floor could be read off a slope
     // (that is where ROADMAP_scale §3.2's 2.25 µs figure came from). It was
@@ -671,7 +671,9 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
       uint32_t dynCount = 0;
       if (r.groups == pass::Groups::Sim) {
         dynCount = 1;
-        dynOff = (r.dyn == pass::Dyn::Ca) ? k * pass::kPassStride : 0;
+        dynOff = r.dyn == pass::Dyn::Ca    ? k * pass::kPassStride
+                 : r.dyn == pass::Dyn::Ca1 ? (k + 27u) * pass::kPassStride
+                                           : 0;
       }
       // Skip a bind identical to the one already on the compute bind point
       // (ComputeBind, vk_record.h). Pure command-count saving: what is bound

@@ -124,7 +124,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Flat per-tick cost over kNumChunks. This is the pass that makes every "
      "row below it scale with activity."},
     {"caLoop", "CA (54 passes)", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "ca;reposeSnap",
+     "caMask;ca;caMask1;ca1;reposeSnap",
      "27 colours x 2 substeps over the dirty list. Divide by active chunks for "
      "the per-chunk number the compute budget is denominated in. `reposeSnap` "
      "is the prepass that takes the angle-of-repose occupancy snapshot for the "

@@ -5151,7 +5151,9 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       phys.Step(kTickDt);   // CPU physics overlaps the GPU tick
       tPhys1 = NowSeconds();
       debris.PostStep();
+      const double tPs1 = NowSeconds();
       mobs.PostStep();
+      const double tPs2 = NowSeconds();
       // A THROWN ROCK IS A BLOW (W2-H): this step's new contacts, read while
       // they are this step's. A contact blow neither dents nor breaks plate
       // (MobSystem::ApplyContactDamage), so it authors no particles; the
@@ -5160,9 +5162,24 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         std::vector<ParticleSpawn> contactGore;
         mobs.ApplyContactDamage(phys, world, contactGore);
       }
+      const double tPs3 = NowSeconds();
       // LAST: after every burn and carve of the tick, so the frame never draws
       // a hooded head with hair a hit just re-packed poking through the hood.
       mobs.SyncHairTuck();
+      // SANDVOX_POSTSTEP_PROF=<ms>: name the part of a slow post-step (the
+      // `postStep` scope is all four calls above plus the avatar's).
+      static const double postProfMs = [] {
+        const char* e = std::getenv("SANDVOX_POSTSTEP_PROF");
+        return e ? std::atof(e) : 0.0;
+      }();
+      if (postProfMs > 0.0) {
+        const double tPs4 = NowSeconds();
+        if ((tPs4 - tPhys1) * 1000.0 >= postProfMs)
+          std::printf("[poststep] tick %u: %.2f ms = debris %.2f mobs %.2f contact %.2f "
+                      "hair %.2f\n", tick, (tPs4 - tPhys1) * 1000.0,
+                      (tPs1 - tPhys1) * 1000.0, (tPs2 - tPs1) * 1000.0,
+                      (tPs3 - tPs2) * 1000.0, (tPs4 - tPs3) * 1000.0);
+      }
   }
 }
 
@@ -5354,13 +5371,41 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // — where the old body declared it, between the stream block and the brush
   // — and opened ONCE: it is the world's row on the Performance tab, not one
   // player's, and N sessions opening N spans would bill the row N times.
+  // SANDVOX_TICK_PROF=<ms>: a tick slower than that prints where it went, by
+  // phase (C..O; L holds the submit, N the physics step and post-step). The
+  // `gameLogic` row is C..K plus the start of L; this names which.
+  struct TickProf {
+    double ms = 0.0, t0 = 0.0, last = 0.0;
+    char buf[640];
+    int n = 0;
+    void Mark(const char* nm) {
+      if (ms <= 0.0) return;
+      const double t = NowSeconds();
+      if (n < 600) n += std::snprintf(buf + n, sizeof buf - (size_t)n, " %s %.2f", nm,
+                                      (t - last) * 1000.0);
+      last = t;
+    }
+  } tprof;
+  {
+    static const double kTickProfMs = [] {
+      const char* e = std::getenv("SANDVOX_TICK_PROF");
+      return e ? std::atof(e) : 0.0;
+    }();
+    tprof.ms = kTickProfMs;
+    tprof.t0 = tprof.last = NowSeconds();
+    tprof.buf[0] = 0;
+  }
   ws.spanGame.emplace(sandvox::PerfScope::GameLogic);
   for (size_t i = 0; i < players.size(); i++)
     PhaseC(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("C");
   PhaseD(w, ws, players, scratch, tick, out);
+  tprof.Mark("D");
   for (size_t i = 0; i < players.size(); i++)
     PhaseE(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("E");
   PhaseF(w, ws, players, scratch, tick, out);
+  tprof.Mark("F");
   // THE SCOOP LEDGER, read ONCE for every session (container.h
   // ContainerScoopLedger): the landing claims of all of them are counted
   // first, so the pot each PhaseG settle draws on is the whole world's and
@@ -5379,13 +5424,17 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   }
   for (size_t i = 0; i < players.size(); i++)
     PhaseG(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("G");
   // THE MAP'S REFERENCES (world/refs_game.h): activation against the window
   // and the use verb. Before phase H so a villager a ref spawns is stepped by
   // this tick's mobs.PreTick. Null in every harness but the refs-* gates.
   if (w.refs != nullptr) refs::TickRefs(w, players, tick, out);
+  tprof.Mark("refs");
   PhaseH(w, ws, players, scratch, tick, out);
+  tprof.Mark("H");
   for (size_t i = 0; i < players.size(); i++)
     PhaseI(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("I");
   // THE PEERS' AVATARS, IN PHASE I's SLOT, AFTER THE LOCAL SESSIONS'
   // (M9.2 package B). Here rather than inside PhaseI because a ghost is not a
   // session — it has no TickInput, no camera and no presentation seam — but
@@ -5398,20 +5447,29 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
     RemotePlayersPreTick(*w.remotes, tick, kTickDt, w.world, w.phys, w.mobs,
                          w.debris, w.mats, players[0].s->avatarDefName);
   PhaseJ(w, ws, players, scratch, tick, out);
+  tprof.Mark("J");
   for (size_t i = 0; i < players.size(); i++)
     PhaseK(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("K");
   PhaseL(w, ws, players, scratch, tick, out);
+  tprof.Mark("L");
   for (size_t i = 0; i < players.size(); i++)
     PhaseM(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("M");
   PhaseN(w, ws, players, scratch, tick, out);
+  tprof.Mark("N");
   for (size_t i = 0; i < players.size(); i++)
     PhaseO(w, ws, players[i], scratch[i], tick, out);
+  tprof.Mark("O");
   // The ghosts' post-solver settle, in phase O's slot. No ragdoll follow and
   // no push-out: those write a position, and a ghost's position is the
   // wire's (game/remoteplayer.h, RemotePlayersPostStep).
   if (w.remotes != nullptr && !w.remotes->list.empty())
     RemotePlayersPostStep(*w.remotes);
   PhaseP(w, ws, players, scratch, tick, out);
+  if (tprof.ms > 0.0 && (NowSeconds() - tprof.t0) * 1000.0 >= tprof.ms)
+    std::printf("[tickprof] tick %u: %.2f ms =%s\n", tick,
+                (NowSeconds() - tprof.t0) * 1000.0, tprof.buf);
 
   // The span is billed by phase L's Close(); releasing it here keeps the
   // optional's lifetime inside the tick that owns it.

@@ -60,6 +60,7 @@ namespace {
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
 #define PIPE_REPOSE_SNAP     Pipe::ReposeSnap
+#define PIPE_CA_MASK         Pipe::CaMask
 #define PIPE_OCCUPANCY       Pipe::Occupancy
 #define PIPE_OCCUPANCY_DIRTY Pipe::OccupancyDirty
 #define PIPE_PICK            Pipe::Pick
@@ -176,6 +177,7 @@ namespace {
 #define DYN_NONE Dyn::None
 #define DYN_ZERO Dyn::Zero
 #define DYN_CA   Dyn::Ca
+#define DYN_CA1  Dyn::Ca1
 
 #define C_ALWAYS    Cond::Always
 #define C_OPS       Cond::Ops

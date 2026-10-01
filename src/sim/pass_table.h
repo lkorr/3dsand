@@ -283,6 +283,15 @@ enum class Buf : uint8_t {
   Draft,
   DraftMeta,
   DraftArgs,
+  // ---- the CA's air mask (sim_step.wgsl camask), binding 48 ----
+  // One bit per cell of every dirty chunk, 128 words per SLOT: "this cell held
+  // matter when the substep began". Written by the caMask rows (one before
+  // each gravity substep), read by the 27 colour iterations after it, so a
+  // thread whose cell is air returns without touching the voxel buffer.
+  CaMask,
+  // The ambient wind per 4^3 block of every dirty chunk (sim_step.wgsl
+  // caWind), binding 49: written by the caMask rows, read by the colours.
+  CaWind,
   kCount,
 };
 
@@ -347,6 +356,8 @@ enum class Pipe : uint8_t {
   // sim_step.wgsl, not a new module, so it costs no bind-group layout and
   // cannot drift from the kernel that reads it.
   ReposeSnap,
+  // The CA's per-substep air mask: a third entry point of sim_step.wgsl.
+  CaMask,
   // MLS-MPM fluid. Inserted BEFORE FarDown deliberately: the
   // pipeline-copy loop in Simulation::RecordTable is bounded by
   // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
@@ -447,7 +458,10 @@ enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar, SlimFluid,
 //   Ca    k * kPassStride for iteration k: the colour phase + gravity substep.
 //         This is what makes each CA iteration a DIFFERENT colour, which is why
 //         the iterations must not overlap (pass_table.def header, §3.6/§7.1).
-enum class Dyn : uint8_t { None, Zero, Ca };
+//   Ca1   (k + 27) * kPassStride: the SECOND gravity substep's 27 colours, for
+//         the row that follows its own caMask row (the CA is two rows of 27,
+//         not one of 54, so the air mask can be rebuilt between them).
+enum class Dyn : uint8_t { None, Zero, Ca, Ca1 };
 
 // The passUBO slice stride Dyn::Ca steps by. It lives HERE rather than as a
 // file-static in simulation.cpp because it is a property of the TABLE's
@@ -716,6 +730,7 @@ enum class DispatchSel : uint32_t {
 // outbox, -> 17 uses. Four of headroom rather than one, for the reason the
 // page-table note above gives.
 // Raised 24 -> 28 by the wind drafts: `ca` gains R(Draft) -> 25 uses.
+// `ca` gains R(CaMask) -> 26 uses (2026-10-01).
 inline constexpr int kMaxUses = 28;
 
 struct Row {

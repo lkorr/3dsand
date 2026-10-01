@@ -39,9 +39,10 @@
 // read_write to match the shared layout entry (sim_compact writes it);
 // this shader only reads.
 @group(0) @binding(12) var<storage, read_write> dirtyList : array<u32>;
-// NOTE: binding 13 (dispatch args) must stay undeclared here — statically
-// unused bindings are excluded from the dispatch usage scope, which is what
-// makes the same buffer legal as the INDIRECT source in this compute pass.
+// Binding 13 is argsStage, NOT the indirect buffer (copy_argsStage_dispatchArgs
+// copies it into the never-bound dispatchArgs), so `main` reading the dirty
+// count from it (declared below, beside the air mask) is legal. The old note
+// here dated from Dawn, where the two were one buffer.
 // Per-chunk support-loss flags: set when a supporting voxel (solid/powder)
 // vacates or transforms next to a solid. Side-channel only — read back by the
 // CPU to queue island checks (debris.cpp), never fed back into voxel state,
@@ -1733,6 +1734,30 @@ fn seesSky(c : vec3<i32>) -> bool {
 // field through common.wgsl's WIND DRAFTS block, so the drift bias and the
 // entrainment test feel walls. Built by the draft rows before the CA.
 @group(0) @binding(46) var<storage, read> draftField : array<u32>;
+// THE AIR MASK (pass_table.def caMask): one bit per cell of every dirty chunk,
+// CA_MASK_WORDS words per SLOT, bit (local & 31) of word (local >> 5) where
+// local = x + 16y + 256z. Set = the cell held matter when this gravity substep
+// began. Written by `camask` below, read by `main`.
+@group(0) @binding(48) var<storage, read_write> caMask : array<u32>;
+const CA_MASK_WORDS : u32 = CHUNK_VOL / 32u;
+// Three bit planes per slot, CA_MASK_STRIDE words apart: [0] matter, [1] gas,
+// [2] inert solid (CLASS_SOLID, !matCanAct). Planes 1-2 only ORDER the work
+// (main's gather sorts by them so a warp runs one path); plane 0 decides it.
+const CA_MASK_STRIDE : u32 = 3u * CA_MASK_WORDS;
+// The dirty-chunk count `compact` appended (args[0]); the colour rows read it to
+// pack several chunks into one workgroup (see `main`).
+@group(0) @binding(13) var<storage, read> args : array<u32>;
+// THE AMBIENT WIND, CACHED PER 4^3 BLOCK (2026-10-01): windAmbQ at the block's
+// centre, 64 blocks x 3 words per SLOT, written by `camask` for every dirty
+// chunk before each substep and read by caWindAt. Measured on the village
+// fire: windAtQ evaluated per gas cell per substep (1-3 times: the intent and
+// the two lateral rotations) was ~40% of the CA -- terrain ramp, six integer
+// sine bands, the draft shelter -- for a field that is smooth at the draft
+// volume's own 0.4 m cell. One evaluation per block instead of per cell is
+// the per-chunk cache windAtQ's COST note asked for, at the draft resolution
+// so a doorway's shelter keeps its shape. The primitives stay per cell.
+@group(0) @binding(49) var<storage, read_write> caWind : array<i32>;
+const CA_WIND_BLOCKS : u32 = 64u;   // (CHUNK / 4)^3
 // sim_rain_expo.wgsl's lattice, byte for byte (and src/sim/rainexpo.h).
 const RX_TEX_SHIFT : u32 = 2u;
 const RX_OPEN : i32 = -2147483647 - 1;
@@ -3621,12 +3646,25 @@ fn windRndS(slotIdx : u32, stream : u32) -> u32 {
   return gasRndK(slotIdx, stream, P.substep, &T);
 }
 fn windRnd(slotIdx : u32) -> u32 { return windRndS(slotIdx, 0u); }
+// The wind at an ACTING cell: its 4^3 block's cached ambient (camask) plus
+// the primitives, exact. `c` must be in a dirty chunk -- every caller passes
+// the cell the colour thread is running, so it is.
+fn caWindAt(c : vec3<i32>) -> vec3<i32> {
+  if (T.windMode == WIND_MODE_OFF) { return vec3<i32>(0); }
+  let lo = (c & vec3<i32>(CHUNK_MASK)) >> vec3<u32>(2u);
+  let o = (voxSlotOfCell(c) * CA_WIND_BLOCKS + u32(lo.x + 4 * lo.y + 16 * lo.z)) * 3u;
+  return vec3<i32>(caWind[o], caWind[o + 1u], caWind[o + 2u]) + windPrimAtQ(c, &T);
+}
 fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
                     slotIdx : u32) -> u32 {
-  return windLateralStartK(c, base, m, slotIdx, P.substep, &T);
+  if (T.windMode == WIND_MODE_OFF || matWindResponse(m) == 0u) { return base; }
+  return windLateralStartW(caWindAt(c), base, m, slotIdx, P.substep, &T);
 }
 fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasIntent {
-  return gasIntentK(c, m, slotIdx, base, P.substep, &T);
+  if (T.windMode == WIND_MODE_OFF || matWindResponse(m) == 0u) {
+    return gasIntentK(c, m, slotIdx, base, P.substep, &T);   // calm: no wind read
+  }
+  return gasIntentW(caWindAt(c), m, slotIdx, base, P.substep, &T);
 }
 
 // ---- THE WINDOW EDGE IS A SINK (docs/PLAN_gas_particles.md §2.3) -----------
@@ -3852,7 +3890,7 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   // running a debug multiplier through a physical threshold would make the
   // slider silently retune every material's saltation point. The knob for
   // that is sim.windEntrainSpeed, which is what it is for.
-  let wv = windAtQ(c, &T);
+  let wv = caWindAt(c);
   var d = vec2<i32>(0, 0);
   // Only the horizontal axes are tested. A vertical component lifts nothing on
   // its own — a grain needs somewhere lateral to go, and an updraft that
@@ -3954,51 +3992,242 @@ fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
 // each side): CA 27.2 -> 27.9 ms/frame, frame p50 37.5 -> 38.0 ms, awake
 // chunks +0.3%.
 
-@compute @workgroup_size(6, 6, 6)
-fn main(@builtin(workgroup_id) wg : vec3<u32>,
-        @builtin(local_invocation_id) lid : vec3<u32>) {
-  // one workgroup per compacted dirty chunk (indirect dispatch). The list
-  // holds SLOT indices; reconstruct the world chunk from the window origin.
-  let ci = dirtyList[wg.x];
+// ---- camask: the air mask for one dirty chunk (pass_table.def caMask) ------
+// One workgroup per dirty chunk, recorded before EACH gravity substep's 27
+// colours. Thread t reads cells t, t+256, ... COALESCED and ORs its bit into a
+// workgroup word -- an OR is order-independent, so the mask is a pure function
+// of the voxels (rule 1) whatever the schedule. A sentinel page is uniform:
+// all air or all matter, no voxel read.
+var<workgroup> wgCaMask : array<atomic<u32>, 384>;   // 3 planes x CA_MASK_WORDS
 
-  // ---- A SENTINEL CHUNK WHOSE MATERIAL CANNOT ACT IS A WHOLE-CHUNK NO-OP ----
-  // Workgroup-uniform (one table load per workgroup), so the early return is
-  // uniform too. Two cases, and ONLY these two, are provably inert:
-  //   * PT_EMPTY: every cell is air, and main returns on air.
-  //   * UNIFORM / JITTER of a material with !matCanAct (a plain solid: no
-  //     reaction bucket, no stain, CLASS_SOLID). Every cell is that solid for
-  //     the whole dispatch — the table is read-only during it, and a store into
-  //     a sentinel is a dropped fault, never a write — so every cell has an
-  //     in-chunk face neighbour of the same solid, soloSolid() is false, and
-  //     main's `!matCanAct` return is the next thing it does. Nothing is written
-  //     and nothing is marked.
-  // What this does NOT skip, deliberately: a sentinel of any material that CAN
-  // act (sand, water, grass, anything with a rule or a stain). Rules that a
-  // NEIGHBOUR chunk's content triggers across the face (a PAIR, a stain, a
-  // flow into this chunk) are run by the neighbour's cells, which are in the
-  // neighbour's workgroup and untouched by this return.
+@compute @workgroup_size(256)
+fn camask(@builtin(workgroup_id) wg : vec3<u32>,
+          @builtin(local_invocation_index) li : u32) {
+  let ci = dirtyList[wg.x];
+  let e = pageEntryOf(ci);
+  // No early return for a sentinel: the barriers below need uniform control
+  // flow, and a storage load is not uniform to the compiler.
+  let sentinel = (e & PT_SENTINEL_BIT) != 0u;
+  for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) { atomicStore(&wgCaMask[k], 0u); }
+  workgroupBarrier();
+  if (!sentinel) {
+    let base = e * CHUNK_VOL;
+    for (var i = li; i < CHUNK_VOL; i += 256u) {
+      let mat = voxMat(voxels[base + i]);
+      if (mat != MAT_AIR) {
+        let bit = 1u << (i & 31u);
+        atomicOr(&wgCaMask[i >> 5u], bit);
+        let m = materials[mat];
+        if (m.klass == CLASS_GAS) {
+          atomicOr(&wgCaMask[CA_MASK_WORDS + (i >> 5u)], bit);
+        } else if (m.klass == CLASS_SOLID && !matCanAct(m)) {
+          atomicOr(&wgCaMask[2u * CA_MASK_WORDS + (i >> 5u)], bit);
+        }
+      }
+    }
+  }
+  workgroupBarrier();
+  for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) {
+    var word = atomicLoad(&wgCaMask[k]);
+    if (sentinel) {
+      let smat = e & PT_MAT_MASK;
+      let sm = materials[smat];
+      var on = smat != MAT_AIR;
+      if (k >= CA_MASK_WORDS) {
+        on = on && select(sm.klass == CLASS_SOLID && !matCanAct(sm), sm.klass == CLASS_GAS,
+                          k < 2u * CA_MASK_WORDS);
+      }
+      word = select(0u, 0xFFFFFFFFu, on);
+    }
+    caMask[ci * CA_MASK_STRIDE + k] = word;
+  }
+  // The wind cache (caWind above): one block per thread, the block's centre.
+  if (T.windMode != WIND_MODE_OFF && li < CA_WIND_BLOCKS) {
+    let b = vec3<i32>(i32(li & 3u), i32((li >> 2u) & 3u), i32(li >> 4u));
+    let w = windAmbQ(slotWorldChunk(ci, T.origin) * i32(CHUNK) + b * 4 + vec3<i32>(2), &T);
+    let o = (ci * CA_WIND_BLOCKS + li) * 3u;
+    caWind[o] = w.x;
+    caWind[o + 1u] = w.y;
+    caWind[o + 2u] = w.z;
+  }
+}
+
+// ---- THE COLOUR ROWS: GATHERED, SORTED CELLS, NOT ONE THREAD PER SITE -----
+//
+// (2026-10-01, the oil village fire: three houses burning, ~3,900 awake
+// chunks of smoke, CA 19 ms a tick.) The colour rows used to launch one 6x6x6
+// workgroup per dirty chunk per colour and give each thread one lattice site.
+// A smoke chunk holds ~300 non-air cells, so a colour visited ~11 cells a
+// chunk with 216 threads, and the few that worked were every kind at once --
+// a gas, a burning plank, an inert stone -- so each warp ran stepGas, the
+// reaction tail and the solid early-out one after another.
+//
+// Now a workgroup takes caPack(n) consecutive entries of the dirty list,
+// GATHERS the sites of this colour that the air mask says hold matter, SORTS
+// them by kind (gas | other | inert solid; camask's planes 1-2) and works
+// through the list CA_WG at a time, so a warp runs one path. Measured on
+// --perf village-fire, hash unmoved at every step: gather alone 0%, the sort
+// -17% (13.2 -> 10.9 ms), then the pack factor: 1 chunk a group 12.2 ms,
+// 2 10.45, 4 10.6, 8 10.9, 16 11.4. A fourth kind (liquids apart) measured
+// no better on this scene. The same cells run, through the same caCell, with
+// the same RNG keys; only which THREAD runs a cell changed, and the colour
+// lattice is what makes that irrelevant (same-colour cells are >= 3 apart and
+// write <= 1 away, so no two of them can touch the same word). The list order
+// is scheduling-dependent (shared atomicAdds), which is just as irrelevant,
+// for the same reason the dirty list's own order is (sim_compact.wgsl).
+//
+// Below CA_PACK_STEP dirty chunks it is one chunk a workgroup, so a small
+// world keeps its parallelism. Workgroups past the last group exit at once.
+const CA_WG : u32 = 128u;
+const CA_PACK_MAX : u32 = 2u;
+const CA_PACK_STEP : u32 = 512u;
+fn caPack(n : u32) -> u32 { return clamp(n / CA_PACK_STEP, 1u, CA_PACK_MAX); }
+// One entry per gathered cell: chunk-in-group (3 bits) << 12 | local index.
+var<workgroup> wgCaList : array<u32, 432>;   // CA_PACK_MAX * 216
+var<workgroup> wgCaCount : atomic<u32>;
+// Per segment (gas, other, inert): the count, then the write cursor.
+var<workgroup> wgCaSeg : array<atomic<u32>, 3>;
+
+// One lattice row of one chunk of the group: its sites of this colour split
+// into (gas, other, inert) bit sets, or zeros if the row is off the chunk.
+struct CaRow { ci : u32, rowBase : u32, b : vec3<u32> }
+fn caRow(first : u32, total : u32, t : u32) -> CaRow {
+  var o : CaRow;
+  o.b = vec3<u32>(0u);
+  let j = t / 36u;
+  let r = t % 36u;
+  if (first + j >= total) { return o; }
+  let ci = dirtyList[first + j];
+  o.ci = ci;
   let pe = pageEntryOf(ci);
   if ((pe & PT_SENTINEL_BIT) != 0u) {
     let smat = pe & PT_MAT_MASK;
-    if (smat == MAT_AIR || !matCanAct(materials[smat])) { return; }
+    if (smat == MAT_AIR || !matCanAct(materials[smat])) { return o; }
   }
-
-  // Workgroup-uniform, one scalar load, read only by the riser film step: did
-  // anything that is not itself a film step happen in this chunk last tick?
-  // FILM_LICENCE block — this is what stops a neutral rule from keeping a
-  // shoreline puddle awake forever.
-  gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
-  let wc = slotWorldChunk(ci, T.origin);
-  let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
+  let base = slotWorldChunk(ci, T.origin) * i32(CHUNK);
   // The color lattice is GLOBAL in WORLD coords: cell ≡ colorPhase (mod 3).
   // Coloring by slot coords would race at the toroidal wrap (world-adjacent
   // cells whose slots are WORLD_N apart would share a color); world coords
   // keep same-color cells >=3 apart in the space movement happens in.
   let bmod = ((base % vec3<i32>(3)) + vec3<i32>(3)) % vec3<i32>(3);
   let start = (vec3<i32>(P.colorPhase) + vec3<i32>(3) - bmod) % vec3<i32>(3);
-  let local = start + vec3<i32>(lid) * 3;
-  if (local.x >= i32(CHUNK) || local.y >= i32(CHUNK) || local.z >= i32(CHUNK)) { return; }
+  let y = start.y + 3 * i32(r % 6u);
+  let z = start.z + 3 * i32(r / 6u);
+  if (y >= i32(CHUNK) || z >= i32(CHUNK)) { return o; }
+  let wi = ci * CA_MASK_STRIDE + u32(y >> 1) + 8u * u32(z);
+  let sh = 16u * u32(y & 1);
+  var bits = caRowBits(start.x);
+  if (P.substep != 0u || fluidBlockMapS[ci] == 0u) {
+    bits &= (caMask[wi] >> sh) & 0xFFFFu;
+  }
+  let gas = bits & (caMask[wi + CA_MASK_WORDS] >> sh);
+  let inert = bits & ~gas & (caMask[wi + 2u * CA_MASK_WORDS] >> sh);
+  o.b = vec3<u32>(gas, bits & ~gas & ~inert, inert);
+  o.rowBase = (j << 12u) | (u32(y) * CHUNK + u32(z) * CHUNK * CHUNK);
+  return o;
+}
+
+// x positions of one colour in a 16-wide row: bits sx, sx+3, ... (0x9249 = 0,3,..,15).
+fn caRowBits(sx : i32) -> u32 { return (0x9249u << u32(sx)) & 0xFFFFu; }
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_index) li : u32) {
+  let total = args[0];
+  let pack = caPack(total);
+  let first = wg.x * pack;
+  if (li < 3u) { atomicStore(&wgCaSeg[li], 0u); }
+  workgroupBarrier();
+  // PASS 1: how many of each kind. The list is then laid out gas | other |
+  // inert, so a warp runs ONE path (stepGas, the reaction/liquid/powder tail,
+  // or the inert solid's early return) instead of all three in turn. Which
+  // thread runs a cell cannot change what the cell does (see above), so the
+  // sort is free of consequence -- only of cost.
+  for (var t = li; t < pack * 36u; t += CA_WG) {
+    let rw = caRow(first, total, t);
+    if (rw.b.x != 0u) { atomicAdd(&wgCaSeg[0], countOneBits(rw.b.x)); }
+    if (rw.b.y != 0u) { atomicAdd(&wgCaSeg[1], countOneBits(rw.b.y)); }
+    if (rw.b.z != 0u) { atomicAdd(&wgCaSeg[2], countOneBits(rw.b.z)); }
+  }
+  workgroupBarrier();
+  if (li == 0u) {
+    let ng = atomicLoad(&wgCaSeg[0]);
+    let no = atomicLoad(&wgCaSeg[1]);
+    let ni = atomicLoad(&wgCaSeg[2]);
+    atomicStore(&wgCaCount, ng + no + ni);
+    atomicStore(&wgCaSeg[0], 0u);
+    atomicStore(&wgCaSeg[1], ng);
+    atomicStore(&wgCaSeg[2], ng + no);
+  }
+  workgroupBarrier();
+
+  // ---- PASS 2, GATHER: up to 36 lattice rows a chunk, one mask word each --
+  // Row r of chunk j: y = sy + 3*(r % 6), z = sz + 3*(r / 6). A row past the
+  // chunk is skipped. In a chunk with an MPM block on substep 0 every site of
+  // the colour is taken, air included: excitedReact runs on air there.
+  // A sentinel chunk whose material cannot act is skipped whole (caCell would
+  // return on every one of its cells).
+  for (var t = li; t < pack * 36u; t += CA_WG) {
+    let rw = caRow(first, total, t);
+    for (var k = 0u; k < 3u; k++) {
+      var bits = rw.b[k];
+      if (bits == 0u) { continue; }
+      var at = atomicAdd(&wgCaSeg[k], countOneBits(bits));
+      while (bits != 0u) {
+        let x = firstTrailingBit(bits);
+        bits &= bits - 1u;
+        wgCaList[at] = rw.rowBase | x;
+        at += 1u;
+      }
+    }
+  }
+  workgroupBarrier();
+
+  // ---- WORK: the gathered cells, CA_WG at a time --------------------------
+  let n = atomicLoad(&wgCaCount);
+  for (var i = li; i < n; i += CA_WG) {
+    let e = wgCaList[i];
+    let lm = e & 0xFFFu;
+    caCell(dirtyList[first + (e >> 12u)],
+           vec3<i32>(i32(lm & 15u), i32((lm >> 4u) & 15u), i32(lm >> 8u)));
+  }
+}
+
+// ONE CELL of one colour (was main's body, one thread per lattice site).
+// `ci` is the chunk's slot, `local` the cell within it.
+fn caCell(ci : u32, local : vec3<i32>) {
+  // ---- A SENTINEL CHUNK WHOSE MATERIAL CANNOT ACT IS A NO-OP ----
+  // (main's gather already skips such a chunk; this is the per-cell guard.)
+  //   * PT_EMPTY: every cell is air, and main returns on air.
+  //   * UNIFORM / JITTER of a material with !matCanAct (a plain solid: no
+  //     reaction bucket, no stain, CLASS_SOLID). Every cell is that solid for
+  //     the whole dispatch — the table is read-only during it, and a store into
+  //     a sentinel is a dropped fault, never a write — so every cell has an
+  //     in-chunk face neighbour of the same solid, soloSolid() is false, and
+  //     the `!matCanAct` return is the next thing it does. Nothing is written
+  //     and nothing is marked.
+  // What this does NOT skip, deliberately: a sentinel of any material that CAN
+  // act (sand, water, grass, anything with a rule or a stain). Rules that a
+  // NEIGHBOUR chunk's content triggers across the face (a PAIR, a stain, a
+  // flow into this chunk) are run by the neighbour's cells.
+  let pe = pageEntryOf(ci);
+  if ((pe & PT_SENTINEL_BIT) != 0u) {
+    let smat = pe & PT_MAT_MASK;
+    if (smat == MAT_AIR || !matCanAct(materials[smat])) { return; }
+  }
+
+  // One scalar load, read only by the riser film step: did anything that is
+  // not itself a film step happen in this chunk last tick? FILM_LICENCE block —
+  // this is what stops a neutral rule from keeping a shoreline puddle awake
+  // forever. Set PER CELL now (a thread runs cells of several chunks).
+  gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
+  let wc = slotWorldChunk(ci, T.origin);
+  let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
   let c = base + local;  // world cell this thread acts on
+  // The previous cell this thread ran must not leak its self-cell cache into
+  // this one (tryMove re-resolves when src != gSelfCell or the index is unset).
+  gSelfCell = c;
+  gSelfIdx = PT_NO_WORD;
 
   // TWO BASES (§4.1). `slotIdx` is the SLOT cell index and keys the per-cell
   // RNG below; `idx` is the physical word index and is only a memory address.

@@ -815,7 +815,7 @@ class Simulation {
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
       fluidSeamPL_, shadowPL_, gasPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, worldgenCols_, mutate_, mutateCells_, compact_,
-      compactNext_, step_, reposeSnap_, occupancy_, occupancyDirty_, pick_;
+      compactNext_, step_, reposeSnap_, caMask_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
   // docs/RESEARCH_wind.md §4.3.
   rhi::ComputePipeline windWake_;
@@ -833,6 +833,8 @@ class Simulation {
       draftCoarseFaces_, draftCoarseSolve_, draftFineFirst_, draftFineMid_, draftFineMid2_,
       draftFineLast_;
   rhi::Buffer draftBuf_, draftMetaBuf_, draftArgsBuf_;
+  // The CA's air mask (pass_table.def caMask): 128 words per chunk slot.
+  rhi::Buffer caMaskBuf_, caWindBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;
   bool draftLastOn_ = false;
   int32_t draftOrigin_[3] = {0, 0, 0};

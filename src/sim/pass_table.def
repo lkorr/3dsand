@@ -455,12 +455,51 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 // sim_gas's resolve adds the parcels to the same box afterwards (WAW again),
 // both in this same command buffer. Leave it off and the clear is free to sink
 // past the splat, which reads as a plume that flickers out one frame in N.
-PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
+//
+// THE AIR MASK (2026-10-01, the oil village fire). The CA is TWO rows of 27
+// colours, one per gravity substep, each behind a caMask row that writes, for
+// every dirty chunk, one bit per cell ("held matter when the substep began")
+// plus a two-plane KIND code (gas / inert solid / other), and the ambient
+// wind of each 4^3 block (sim_step.wgsl camask). The colour rows GATHER the
+// sites of their colour whose bit is set and SORT them by kind before running
+// any (sim_step.wgsl main), so air costs a bit test and a warp runs one path.
+// On --perf village-fire (~3,900 awake chunks of smoke) the mask alone was
+// worth ~5%; the sort it enables -17%, the wind cache -30%.
+//
+// WHAT MOVES THE HASH is only the wind cache: a gas or powder reads the
+// ambient wind of its 4^3 block (the draft volume's own cell) instead of its
+// own cell's, primitives still exact. The mask and the sort are exact -- the
+// same cells run with the same keys -- and moved nothing when they landed.
+// Matter that ARRIVES mid-substep is not in the mask; it is stamped by its
+// mover (so it would only have probed or returned), which is why that is not
+// a behaviour change either. Air that HOLDS EXCITED FLUID keeps its substep-0
+// visit: in a chunk with an MPM block the mask is not consulted on substep 0.
+// read-only in practice: `voxels` is read_write for the module because `main`
+// writes it; `camask` only asks whether a cell holds matter.
+PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
+          U(TickUBO) R(Draft) W(CaWind) R(Materials)))
+// read-only in practice: `reposeSnap` and `caMask` are read_write for the
+// module because `reposesnap` / `camask` write them; `main` only reads both.
+PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 27,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
-          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft)))
+          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
+          R(ArgsStage) R(CaWind)))
+// read-only in practice: `voxels`, as for caMask above.
+PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
+          U(TickUBO) R(Draft) W(CaWind) R(Materials)))
+// read-only in practice: `reposeSnap` and `caMask`, as for ca above.
+PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 27,
+     USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
+          RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
+          R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
+          A(GasSpawn) A(GasOuter) R(ReposeSnap)
+          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
+          R(ArgsStage) R(CaWind)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //

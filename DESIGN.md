@@ -5469,6 +5469,63 @@ neighbors, so this needs an explicit connectivity pass:
   What is left per dressed body: the candidate loop ~1.4 ms (6k candidates
   at 0.23 µs, of the shared pot — it does not multiply), seeding ~0.7,
   cross-limb heat ~0.25.
+- **A village full of oil, burning (2026-10-01).** Owner report: "fill a house
+  with oil and light it -- at points ~10 fps"; then "all three houses in the
+  village at once, standing in the middle". Harnesses, one op builder
+  (`perfsuite.h BuildVillageFireOps`: Harrowby's three houses from the map's
+  refs, the ground floors flooded 8 deep in oil IfAir through each asset's own
+  frame, lit every 6th column):
+  `--perf --scenario village-fire` (deterministic, one tick a frame, the GPU
+  rows of two builds compare directly; the run's note carries a census of the
+  awake chunks in cells per material and an alignment check of the frames
+  against worldgen's stamp), `village-fire-paced` (the game's accumulator),
+  `--render-budget --budget-cams village`, and the windowed end-to-end
+  `--frames 100000 --burn-house` with `SANDVOX_BURN_VILLAGE=1` (debris, Jolt,
+  real pacing; `SANDVOX_BURN_OIL=<depth>` also floods the single stamped house).
+  The fire is ~3,900 awake chunks of black smoke: a chunk holds ~300 non-air
+  cells, ~100 of them gas. Measured before, deterministic scenario: 36.7 ms a
+  tick-frame, CA 19.0 ms; windowed: p95 34.6 / p99 36.6 ms, 10.6% of frames
+  over 33 ms. Four changes:
+  1. **The ambient wind is cached per 4^3 block** (`sim_step.wgsl caWind`,
+     `common.wgsl windAmbQ` / `gasIntentW` / `windLateralStartW`). Every gas
+     cell evaluated `windAtQ` -- the terrain ramp, six integer sine bands, the
+     draft shelter -- 1-3 times a substep; with wind off the CA was 11.3 ms
+     against 18.9. Now the caMask rows (below) evaluate the ambient field once
+     per block of every dirty chunk, at the draft volume's own 0.4 m cell;
+     primitives stay exact per cell. CA 18.9 -> 13.2 ms. The one change here
+     that moves the hash.
+  2. **The colour rows gather and SORT their cells** (`pass_table.def caMask`,
+     `sim_step.wgsl camask` / `main` / `caCell`). The CA is two rows of 27
+     colours, each behind a `caMask` row writing a bit per cell ("held matter
+     when this substep began") and a kind code (gas / inert solid / other).
+     A colour workgroup takes 2 dirty chunks (1 below 512), gathers the sites
+     whose bit is set, orders them gas | other | inert and runs them 128 at a
+     time through `caCell` (the old per-site body): a warp runs one path
+     instead of stepGas, the reaction tail and the solid early-out in turn.
+     Exact -- the same cells, keys and lattice; hash unmoved -- and
+     13.2 -> 10.45 ms. Measured and rejected on the way, all hash-identical:
+     the gather alone (0%), a fourth kind for liquids (worse), packs of
+     4/8/16 chunks (10.6/10.9/11.4), prefetching a blocked gas parcel's nine
+     candidates (+1.5 ms), pre-checking `dirtyOut` before its atomicOr (+0.8).
+  3. **Hair tuck keys its cover on the LATTICE, not the brick**
+     (`Mob::SyncHairTuck`, `tuckCover_`). A burning hood re-colours its brick
+     every tick, and the cover (64 samples a shell cell) plus a re-poke of
+     every hair cell was rebuilt each time: ~13 ms a tick for as long as one
+     hooded villager burned. The cover is now kept on the Mob and rebuilt when
+     a shell's or the head's count of live cells changes. Ticks over 3 ms in
+     the post-step: 246 at ~13 ms -> 35 at ~3.5 ms (those are the hair itself
+     burning).
+  4. **Instruments**: `SANDVOX_TICK_PROF=<ms>` (session.cpp: a slow tick's
+     time by phase C..O), `SANDVOX_POSTSTEP_PROF=<ms>` (the post-step's four
+     calls), the burn-house run prints `burnprof` and, with
+     `SANDVOX_BURN_PROBE=<ticks>`, the awake chunks' cells per material.
+  After: deterministic 25.9 ms a tick-frame (CA 10.5); windowed p50 12.9-16.8,
+  p95 21.6-27.9, p99 23.4-29.8, max 30.6-33.0 ms, 0 frames over 33 ms. What is
+  left, by the same instruments: the CA's real per-cell work (~370k gas cells
+  twice a tick), and on the CPU ~16 ms a tick of which the burning villagers
+  are ~9.5 (`burnprof`: 60k burn candidates queued a tick for 6.4k evaluated
+  under the shared front budget -- the queueing of the other 90% is the next
+  lever), debris 3.3 and the submit + Jolt step 3.4.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

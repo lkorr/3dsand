@@ -33,6 +33,7 @@
 #include "sim/world.h"
 #include "sim/worldmap.h"
 #include "test/support.h"
+#include "world/structures.h"
 
 namespace sandvox {
 namespace {
@@ -232,6 +233,12 @@ struct Scene {
   // warming driver localTick 0 on EVERY warm tick, so a scenario that must
   // act once (ignite) and then time things (the camera turn) counts itself.
   uint32_t fireTick = 0;
+
+  // village-fire: the oil and the fire seeds, fed
+  // kMaxCellOpsPerTick at a time, and the tick the fire went in.
+  std::vector<CellOp> stamp, fire;
+  size_t stampAt = 0, fireAt = 0;
+  uint32_t igniteAt = UINT32_MAX;
 
   // Notes the setup wants on the page ("great oak, 187 voxels of trunk").
   std::string note;
@@ -810,6 +817,118 @@ void DriveForestfire(Scene& s, uint32_t lt, TickOps& out) {
 }
 
 // ---------------------------------------------------------------------------
+// SCENARIO: village-fire -- the frame-rate complaint of 2026-10-01.
+//
+// "Burn all three houses in the village down at once and stand in the
+// middle": the default map's Harrowby (refs/harrowby.json -- longhouse,
+// smithy, alehouse round the green). The window is moved onto the village and
+// regenerated, so the houses are worldgen's own stamp, not a copy. Each
+// house's ground floor is then flooded kVillageOilDepth deep in oil (IfAir:
+// only the house's air takes it, through the asset's own frame transform) and
+// lit on the oil's surface; the viewer stands on the green and turns one full
+// circle over the recorded frames, so every house is in view for a third of
+// them. 450 warm ticks put the recording in the thick of it.
+// ---------------------------------------------------------------------------
+constexpr int kVillageOilDepth = 8;
+bool SetupVillageFire(Scene& s, std::string& why) {
+  IVec3 green{};
+  // The window onto the green first (the builder needs the houses resident):
+  // where the green is comes from the same refs the builder reads.
+  if (!VillageGreen(green, why)) return false;
+  // The window onto the green, regenerated and settled (SetupForestfire's
+  // order). Record() puts it back for the next scenario.
+  const int half = (int)kNChunk / 2;
+  s.stream.OnRegen();
+  s.world.SetWindowOrigin({(green.x >> 4) - half, 0, (green.z >> 4) - half});
+  SubmitWorldgen(s.ctx, s.world, s.sim, kDefaultSeed);
+  s.ctx.WaitIdle();
+  for (uint32_t t = 1; t <= 300; t++)
+    SubmitTick(s.ctx, s.world, s.sim, t, kDefaultSeed, {}, {}, {}, t % 15 == 0,
+               {half, 3, half}, false, false);
+  s.ctx.WaitIdle();
+
+  VillageFireOps v;
+  if (!BuildVillageFireOps(s.world, s.mats, kVillageOilDepth, v, why)) return false;
+  s.stamp = std::move(v.oil);
+  s.fire = std::move(v.fire);
+  // ALIGNMENT CHECK: worldgen's stamp vs the asset frames the oil was poured
+  // through, one chunk under each house's middle. A frame that disagrees
+  // would pour the oil into the yard and measure a different fire.
+  uint32_t checked = 0, matched = 0;
+  std::vector<uint32_t> buf(kChunkVol);
+  IVec3 loaded{INT32_MIN, 0, 0};
+  for (const IVec3& c : v.solidSample) {
+    const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
+    if (!s.world.ChunkInWindow(wc)) continue;
+    if (!(wc.x == loaded.x && wc.y == loaded.y && wc.z == loaded.z)) {
+      ReadVoxelsSync(s.ctx, s.world, World::SlotChunkIndex(wc), 1, buf.data(), "villageAlign");
+      loaded = wc;
+    }
+    checked++;
+    const uint32_t li = (uint32_t)((c.x & 15) + 16 * ((c.y & 15) + 16 * (c.z & 15)));
+    if ((buf[li] & 0xFFFu) != 0u) matched++;
+  }
+  const int g = World::TerrainHeight(green.x, green.z, kDefaultSeed);
+  s.eye = {(float)green.x + 0.5f, (float)(std::max(g, green.y) + 17), (float)green.z + 0.5f};
+  s.cam.pitch = 0.05f;
+  char note[256];
+  std::snprintf(note, sizeof note,
+                "Harrowby green (%d,%d), %d houses, %u oil cells %d deep, %zu fire "
+                "seeds | frame check %u/%u house cells solid in the world",
+                green.x, green.z, v.houses, v.oilCells, kVillageOilDepth,
+                s.fire.size(), matched, checked);
+  s.note = note;
+  return true;
+}
+void DriveVillageFire(Scene& s, uint32_t lt, TickOps& out) {
+  const uint32_t t = s.fireTick++;
+  while (s.stampAt < s.stamp.size() && out.cells.size() < kMaxCellOpsPerTick)
+    out.cells.push_back(s.stamp[s.stampAt++]);
+  if (s.stampAt == s.stamp.size() && s.igniteAt == UINT32_MAX) s.igniteAt = t + 30u;
+  if (t >= s.igniteAt)
+    while (s.fireAt < s.fire.size() && out.cells.size() < kMaxCellOpsPerTick)
+      out.cells.push_back(s.fire[s.fireAt++]);
+  s.cam.yaw = 6.2831853f * (float)(lt % 300u) / 300.0f;
+  out.particlesActive = true;
+}
+// WHAT the awake chunks hold, in cells per material: a CA cost per chunk is
+// a bare number without it (CLAUDE.md rule 6). A stride sample of up to 160
+// awake chunks from the last snapshot, read back after the run.
+void VerifyVillageFire(Scene& s) {
+  s.ctx.WaitIdle();
+  const WorldSnapshot& sn = s.world.Snap();
+  if (!sn.valid || sn.dirtyFlags.size() != kNumSlots) return;
+  std::vector<uint32_t> awake;
+  for (uint32_t i = 0; i < kNumSlots; i++)
+    if (sn.dirtyFlags[i]) awake.push_back(i);
+  if (awake.empty()) return;
+  const size_t stride = std::max<size_t>(1, awake.size() / 160);
+  std::vector<uint64_t> cells(s.mats.size() + 1, 0);
+  std::vector<uint32_t> buf(kChunkVol);
+  uint32_t got = 0;
+  for (size_t k = 0; k < awake.size(); k += stride) {
+    ReadVoxelsSync(s.ctx, s.world, awake[k], 1, buf.data(), "villageCensus");
+    got++;
+    for (uint32_t w : buf) {
+      const uint32_t m = w & 0xFFFu;
+      cells[m < s.mats.size() ? m : s.mats.size()]++;
+    }
+  }
+  std::vector<std::pair<uint64_t, size_t>> rows;
+  for (size_t m = 1; m < s.mats.size(); m++)
+    if (cells[m]) rows.push_back({cells[m], m});
+  std::sort(rows.rbegin(), rows.rend());
+  std::string line = "  |  " + std::to_string(awake.size()) + " awake; cells/chunk:";
+  char b[96];
+  for (size_t r = 0; r < rows.size() && r < 10; r++) {
+    std::snprintf(b, sizeof b, " %s %.0f", s.mats[rows[r].second].name.c_str(),
+                  (double)rows[r].first / got);
+    line += b;
+  }
+  s.note += line;
+}
+
+// ---------------------------------------------------------------------------
 // SCENARIO: flythrough
 //
 // A diagonal descent across the world, the traversal --autofly-hard uses for
@@ -1137,6 +1256,23 @@ const Scenario kScenarios[] = {
      "its worst. Deterministic twin of --frames N --forest-fire (no debris).",
      "caLoop;particleSys;compact;occupancy;farField;openness;glow;renderPass",
      600, 300, SetupForestfire, DriveForestfire},
+
+    {"village-fire", "Village fire (Harrowby, oil)",
+     "All three Harrowby houses flooded 8 deep in oil and lit together, the "
+     "viewer standing on the green between them turning one full circle. "
+     "The owner's 10 fps report (2026-10-01). One tick per frame: the GPU "
+     "rows of two builds compare directly (no debris, same hash every run).",
+     "caLoop;fluidSys;particleSys;compact;occupancy;farField;openness;glow;renderPass",
+     450, 300, SetupVillageFire, DriveVillageFire, VerifyVillageFire},
+
+    {"village-fire-paced", "Village fire, real-time paced",
+     "village-fire with the game's own tick accumulator (up to 4 ticks a "
+     "frame), so a slow tick is paid the way the game pays it: the frame "
+     "rate the player sees, minus debris and Jolt. Tick count, and so the "
+     "hash, depends on the machine.",
+     "caLoop;fluidSys;particleSys;compact;occupancy;farField;openness;glow;renderPass",
+     450, 300, SetupVillageFire, DriveVillageFire, VerifyVillageFire,
+     /*paced=*/true},
 
     {"flythrough", "Flythrough (streaming)",
      "A diagonal descent across the world at a fixed 1.5 voxels/tick. Lights "
@@ -2728,6 +2864,27 @@ const char* const kArmsFire[] = {
     "baseline", "noshadow", "nocache", "nogi",      "noglow", "noopenness",
     "nofar",    "halfres",  "primary256", "lod8",   "nospec", nullptr};
 
+// THE VILLAGE FIRE (2026-10-01): --perf village-fire's world 450 ticks in,
+// frozen, the eye on the green looking at the longhouse (-z) through the smoke.
+bool CamVillage(Scene& s, uint32_t& tick, std::string& why) {
+  if (!SetupVillageFire(s, why)) return false;
+  const IVec3 pc{(int)s.eye.x >> 4, (int)s.eye.y >> 4, (int)s.eye.z >> 4};
+  for (uint32_t t = 400; t < 850; t++) {
+    TickOps ops;
+    DriveVillageFire(s, 0, ops);
+    SubmitTick(s.ctx, s.world, s.sim, t, kDefaultSeed, {}, {}, ops.cells, t % 15 == 0, pc,
+               false, true);
+    if ((t & 31u) == 0u) s.ctx.WaitIdle();
+  }
+  s.ctx.WaitIdle();
+  RefillFarAround(s.ctx, s.world, s.sim, pc);
+  s.cam.yaw = 4.712389f;
+  s.cam.pitch = 0.05f;
+  s.note += "; burned 450 ticks, frame frozen, looking at the longhouse";
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+
 // THE LOD SEAM AT EYE HEIGHT (2026-09-28). The residency window's face is
 // where the fine march hands off to the far cascade, and at eye height it is a
 // visible line ~22-27 m ahead. Every camera above either looks down from well
@@ -2785,6 +2942,9 @@ const BudgetCam kBudgetCams[] = {
      CamCanopy, kArmsFoliage},
     {"fire", "inside a burning forest 20 s after ignition, looking level",
      CamFire, kArmsFire},
+    {"village", "the Harrowby green with all three houses burning in oil, looking "
+                "at the longhouse",
+     CamVillage, kArmsFire},
     {"seam", "eye height on the pad, window centred as in play, level at the "
              "window face (the LOD seam)",
      CamSeam, kArmsSeam},
@@ -3142,6 +3302,96 @@ class RenderBudgetRunner {
 };
 
 }  // namespace
+
+// ---- THE VILLAGE FIRE'S OPS (perfsuite.h) -------------------------------------
+bool VillageGreen(IVec3& green, std::string& why) {
+  std::vector<worldmap::StructurePlacement> ps;
+  std::vector<std::string> warn;
+  structures::ReadPlacements(AssetDir(), worldmap::CurrentWorldMap().name, ps, warn);
+  for (const worldmap::StructurePlacement& p : ps)
+    if (p.base == "harrowby_green") {
+      green = {p.x, p.y, p.z};
+      return true;
+    }
+  why = "no Harrowby green on map '" + worldmap::CurrentWorldMap().name + "'";
+  return false;
+}
+
+bool BuildVillageFireOps(const World& world, const std::vector<MaterialDef>& mats,
+                         int oilDepth, VillageFireOps& out, std::string& why) {
+  out = VillageFireOps{};
+  if (!VillageGreen(out.green, why)) return false;
+  std::vector<worldmap::StructurePlacement> ps;
+  std::vector<std::string> warn;
+  structures::ReadPlacements(AssetDir(), worldmap::CurrentWorldMap().name, ps, warn);
+  const uint32_t oil = MatId(mats, "oil"), fire = MatId(mats, "fire");
+  for (const worldmap::StructurePlacement& p : ps) {
+    if (p.id.rfind("harrowby/", 0) != 0) continue;
+    if (p.base == "harrowby_green" || p.base == "harrowby_field") continue;
+    structures::Asset a;
+    std::string err;
+    std::vector<std::string> w2;
+    if (!structures::LoadAsset(AssetDir(), p.base, true, a, err, w2)) {
+      why = err;
+      return false;
+    }
+    out.houses++;
+    const structures::Frame f = structures::MakeFrame(a, {p.x, p.y, p.z}, p.yaw);
+    const int nx = a.prefab.size.x, ny = a.prefab.size.y, nz = a.prefab.size.z;
+    std::vector<uint8_t> occ((size_t)nx * ny * nz, 0);
+    auto occAt = [&](int x, int y, int z) -> uint8_t& {
+      return occ[((size_t)z * ny + y) * nx + x];
+    };
+    for (const PrefabModel& m : a.prefab.models)
+      for (const PrefabVoxel& v : m.voxels) {
+        const int lx = v.x + m.offset.x, ly = v.y + m.offset.y, lz = v.z + m.offset.z;
+        if (lx < 0 || ly < 0 || lz < 0 || lx >= nx || ly >= ny || lz >= nz) continue;
+        occAt(lx, ly, lz) = 1;
+      }
+    // The alignment sample: the house's solid cells in the chunk under its middle.
+    {
+      const IVec3 mid = f.Cell({nx / 2, a.origin.y + 2, nz / 2});
+      for (int z = 0; z < nz; z++)
+        for (int y = 0; y < ny; y++)
+          for (int x = 0; x < nx; x++) {
+            if (!occAt(x, y, z)) continue;
+            const IVec3 c = f.Cell({x, y, z});
+            if ((c.x >> 4) == (mid.x >> 4) && (c.y >> 4) == (mid.y >> 4) &&
+                (c.z >> 4) == (mid.z >> 4))
+              out.solidSample.push_back(c);
+          }
+    }
+    // The ground floor flooded `oilDepth` deep, IfAir (only the house's own
+    // air takes it), lit on the surface every 6th column.
+    for (int z = 0; z < nz; z++)
+      for (int x = 0; x < nx; x++) {
+        int roof = -1, floorY = -1;
+        for (int ly = ny - 1; ly >= 0 && roof < 0; ly--)
+          if (occAt(x, ly, z)) roof = ly;
+        for (int ly = 0; ly + 1 < ny && floorY < 0; ly++)
+          if (occAt(x, ly, z) && !occAt(x, ly + 1, z)) floorY = ly + 1;
+        if (floorY < 0) continue;
+        for (int ly = floorY; ly < floorY + oilDepth && ly < roof; ly++) {
+          if (occAt(x, ly, z)) break;
+          const IVec3 c = f.Cell({x, ly, z});
+          if (!world.CellInWindow(c)) continue;
+          out.oil.push_back({World::SlotCellIndex(c), PackVoxNew(oil, 8u) | kCellOpIfAir});
+          out.oilCells++;
+          if (ly == floorY + oilDepth - 1 && x % 6 == 0 && z % 6 == 0) {
+            const IVec3 fc = f.Cell({x, ly + 1, z});
+            if (world.CellInWindow(fc))
+              out.fire.push_back({World::SlotCellIndex(fc), fire | kCellOpIfAir});
+          }
+        }
+      }
+  }
+  if (out.houses == 0) {
+    why = "no Harrowby houses on map '" + worldmap::CurrentWorldMap().name + "'";
+    return false;
+  }
+  return true;
+}
+
 
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
