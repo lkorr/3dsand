@@ -10594,17 +10594,31 @@ void Mob::SyncHairTuck() {
         shells.push_back((int)k);
     }
   }
+  // THE COVER'S SIGNATURE: what the cover below is a function of -- which
+  // shells, and which cells of each shell's and the head's LATTICE are alive
+  // (a burnt-away cell is a tombstone, material 0). NOT the shells' brick edit
+  // counters: a burning hood re-colours its brick every tick without moving a
+  // cell, and keying on that rebuilt the cover (64 samples a shell cell) and
+  // re-poked every hair cell, every tick, for as long as a hood burned. A live
+  // count is one pass over the lattice, microseconds.
+  auto liveCells = [](const MobLimb& s) -> uint64_t {
+    uint64_t n = 0;
+    if (s.HasFineSkin()) {
+      for (const PrefabVoxel& v : s.skinVoxels) n += (v.material & 0xFFFu) != 0u;
+    } else {
+      for (const DebrisVoxel& v : s.voxels) n += (v.payload & 0xFFFu) != 0u;
+    }
+    return n;
+  };
   uint64_t shellSig = 0x51u;
   for (int k : shells) {
     const MobLimb& s = limbs_[(size_t)k];
     shellSig = TuckMix(shellSig, (uint64_t)k);
     shellSig = TuckMix(shellSig, s.HasFineSkin() ? s.skinVoxels.size()
                                                  : s.voxels.size());
-    shellSig = TuckMix(shellSig, (uint64_t)(uint32_t)s.microModel);
-    if (s.microModel >= 0)
-      shellSig = TuckMix(shellSig,
-                         MicroBodyEditGen(*micro, (uint32_t)s.microModel));
+    shellSig = TuckMix(shellSig, liveCells(s));
   }
+  if (head >= 0) shellSig = TuckMix(shellSig, liveCells(limbs_[(size_t)head]));
   auto sigOf = [&](const MobLimb& l) -> uint64_t {
     uint64_t h = TuckMix(shellSig, (uint64_t)(uint32_t)l.microModel);
     h = TuckMix(h, MicroBodyEditGen(*micro, (uint32_t)l.microModel));
@@ -10627,13 +10641,16 @@ void Mob::SyncHairTuck() {
   //     not a mass of hair that would really be squashed under the cloth;
   //   * BELOW THE HEM, nothing hides: hair hanging out from under the hood
   //     (a ponytail, long hair down the back) is exactly what should show.
-  std::vector<uint8_t> cover;      // per bin: 1 = a shell cell lies that way
-  std::vector<float> rmax;         // per bin: the shell's outer radius
-  std::vector<float> rim;          // per bin, lazily: -1 = not asked yet
-  std::vector<int> coveredBins;
-  float hemY = 0.0f, margin = 0.0f;
-  bool coverBuilt = false;
-  Vec3 centre{};
+  // Kept on the Mob between calls (tuckCover_ & co.), rebuilt by buildCover
+  // only when shellSig says the lattices moved.
+  std::vector<uint8_t>& cover = tuckCover_;    // per bin: 1 = a shell cell lies that way
+  std::vector<float>& rmax = tuckRmax_;        // per bin: the shell's outer radius
+  std::vector<float>& rim = tuckRim_;          // per bin, lazily: -1 = not asked yet
+  std::vector<int>& coveredBins = tuckCoveredBins_;
+  float& hemY = tuckHemY_;
+  float& margin = tuckMargin_;
+  bool coverBuilt = tuckCoverSig_ == shellSig && shellSig != 0u;
+  Vec3& centre = tuckCentre_;
   const MobLimb* H = head >= 0 ? &limbs_[(size_t)head] : nullptr;
   const Quat headQ = H ? Quat{H->xf.quat[0], H->xf.quat[1], H->xf.quat[2],
                               H->xf.quat[3]}
@@ -10666,6 +10683,14 @@ void Mob::SyncHairTuck() {
   };
   auto buildCover = [&]() {
     coverBuilt = true;
+    tuckCoverSig_ = shellSig;
+    // A rebuild starts from nothing (the old early-out below left a stale
+    // cover in place when the head had no cells).
+    cover.clear();
+    rmax.clear();
+    rim.clear();
+    coveredBins.clear();
+    margin = 0.0f;
     // The head's centre: the centroid of its lattice. It sits on the skull's
     // axis a little low (the neck rows count), below the crown and behind the
     // face, which is where it has to be: every radial ray to the scalp leaves

@@ -5105,11 +5105,11 @@ int main(int argc, char** argv) {
           "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n"
           "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
           "  --perf-list           List the --perf scenarios and exit\n"
-          "  --scenario <id>       One --perf scenario (idle|treeburn|forestfire|flythrough|explosion|water)\n"
+          "  --scenario <id>       One --perf scenario (idle|treeburn|forestfire|village-fire|village-fire-paced|flythrough|explosion|water)\n"
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,seam,seamveg; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,village,seam,seamveg; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -8201,6 +8201,60 @@ int main(int argc, char** argv) {
         return e ? (uint32_t)std::max(60, std::atoi(e)) : 2400u;
       }();
       if (g_burnHouseDone) return;
+      // SANDVOX_BURN_VILLAGE=1: the owner's actual scene (2026-10-01) -- all
+      // three Harrowby houses flooded in oil (SANDVOX_BURN_OIL deep, default
+      // 8) and lit at once, the player standing on the green between them,
+      // the camera turning once every 600 ticks. Same op builder as --perf
+      // village-fire (perfsuite.h BuildVillageFireOps), so the two runs
+      // describe one fire: that one the GPU rows, this one the frame the
+      // player gets with debris, Jolt and the real pacing in it.
+      static const bool village = std::getenv("SANDVOX_BURN_VILLAGE") != nullptr;
+      static IVec3 green{};
+      if (village && phase == 0) {
+        if (tick < (uint32_t)g_burnHouseAt) return;
+        if (!sim.FarPipelinesReady()) {
+          g_burnHouseAt = (int)tick + 60;
+          return;
+        }
+        std::string why;
+        if (!sandvox::VillageGreen(green, why)) {
+          std::printf("--burn-house: %s\n", why.c_str());
+          g_burnHouseDone = true;
+          return;
+        }
+        const int g = World::TerrainHeight(green.x, green.z, kDefaultSeed);
+        player.pos = Vec3{(float)green.x + 0.5f, (float)(std::max(g, green.y) + 2),
+                          (float)green.z + 0.5f};
+        player.vel = Vec3{0, 0, 0};
+        t1 = tick;
+        phase = 10;
+        std::printf("--burn-house: VILLAGE: player to the green (%d,%d), tick %u\n",
+                    green.x, green.z, tick);
+        std::fflush(stdout);
+        return;
+      }
+      if (phase == 10) {
+        // The window follows the player; give the shift and its worldgen
+        // two seconds before the houses are asked for.
+        if (tick < t1 + 60u || !sim.FarPipelinesReady()) return;
+        static const int oilDepth = [] {
+          const char* e = std::getenv("SANDVOX_BURN_OIL");
+          return e ? std::max(1, std::atoi(e)) : 8;
+        }();
+        sandvox::VillageFireOps v;
+        std::string why;
+        if (!sandvox::BuildVillageFireOps(world, mats, oilDepth, v, why)) {
+          std::printf("--burn-house: %s\n", why.c_str());
+          g_burnHouseDone = true;
+          return;
+        }
+        stamp = std::move(v.oil);
+        fire = std::move(v.fire);
+        std::printf("--burn-house: VILLAGE %d houses, %u oil cells %d deep, %zu fire "
+                    "seeds, tick %u\n", v.houses, v.oilCells, oilDepth, fire.size(), tick);
+        std::fflush(stdout);
+        phase = 1;
+      }
       if (phase == 0) {
         if (tick < (uint32_t)g_burnHouseAt) return;
         if (!sim.FarPipelinesReady()) {
@@ -8257,20 +8311,46 @@ int main(int argc, char** argv) {
             stamp.push_back({World::SlotCellIndex(c),
                              PackVoxNew(v.material, (uint32_t)(lx * 7 + ly * 3 + lz) % 3u)});
           }
+        // SANDVOX_BURN_OIL=<voxels>: the "fill a house with oil and light it"
+        // arm (owner report 2026-10-01: ~10 fps). Every interior air cell (a
+        // house cell overhead, so not the yard) from the ground floor up to
+        // that depth is oil instead of air.
+        static const int oilDepth = [] {
+          const char* e = std::getenv("SANDVOX_BURN_OIL");
+          return e ? std::max(0, std::atoi(e)) : 0;
+        }();
+        const uint32_t oilMat = matByName("oil");
+        size_t oilCells = 0;
         for (int z = 0; z < nz; z++)
           for (int x = 0; x < nx; x++) {
             const int g = World::TerrainHeight(x0 + x, z0 + z, kDefaultSeed);
+            int roof = -1;
+            for (int ly = ny - 1; ly >= 0 && roof < 0; ly--)
+              if (occAt(x, ly, z)) roof = ly;
+            int floorY = -1;  // the first air above the lowest house cell
+            for (int ly = 0; ly + 1 < ny && floorY < 0; ly++)
+              if (occAt(x, ly, z) && !occAt(x, ly + 1, z)) floorY = ly + 1;
             for (int y = std::min(g, yBase - 1) - 2; y < yBase; y++) {
               const IVec3 c{x0 + x, y, z0 + z};
               if (world.CellInWindow(c))
                 stamp.push_back({World::SlotCellIndex(c), PackVoxNew(stone, 0)});
             }
-            for (int y = yBase; y <= std::min(g + 40, yBase + ny - 1); y++) {
-              if (occAt(x, y - yBase, z)) continue;
+            for (int y = yBase; y < yBase + ny; y++) {
+              const int ly = y - yBase;
+              if (occAt(x, ly, z)) continue;
               const IVec3 c{x0 + x, y, z0 + z};
-              if (world.CellInWindow(c)) stamp.push_back({World::SlotCellIndex(c), 0u});
+              if (!world.CellInWindow(c)) continue;
+              if (oilDepth > 0 && floorY >= 0 && ly >= floorY && ly < floorY + oilDepth &&
+                  ly < roof) {
+                stamp.push_back({World::SlotCellIndex(c), PackVoxNew(oilMat, 8u)});
+                oilCells++;
+              } else if (y <= g + 40) {
+                stamp.push_back({World::SlotCellIndex(c), 0u});
+              }
             }
           }
+        if (oilDepth > 0)
+          std::printf("--burn-house: OIL %zu cells, %d deep\n", oilCells, oilDepth);
         // Fire: on top of every third roof column (the topmost house cell)
         // and a lattice through the rooms. IfAir, so only air takes it.
         // SANDVOX_BURN_SEED=low lights only the ground floor instead: the
@@ -8339,12 +8419,15 @@ int main(int argc, char** argv) {
         mobs.ResetBurnStats();
         phys.ResetRunawayProbe();
         winFrame0 = 0;
+        burnprof::Get().on = true;   // the mob tick's own breakdown, printed at the end
+        burnprof::Reset();
         std::printf("--burn-house: IGNITE at tick %u, bodies before %u\n", tick,
                     debris.BodyCount());
         std::fflush(stdout);
       }
       while (fireAt < fire.size() && cellOps.size() < kMaxCellOpsPerTick)
         cellOps.push_back(fire[fireAt++]);
+      if (village) cam.yaw = 6.2831853f * (float)((tick - tIgnite) % 600u) / 600.0f;
       uint32_t vox = 0;
       for (uint32_t b = 0; b < debris.BodyCount(); b++) vox += debris.BodyVoxelCount(b);
       peakBodies = std::max(peakBodies, debris.BodyCount());
@@ -8388,6 +8471,38 @@ int main(int argc, char** argv) {
         winFrame0 = g_frameMs.size();
         std::fflush(stdout);
       }
+      // SANDVOX_BURN_PROBE=<ticks after ignition>: WHAT the awake chunks hold,
+      // in CELLS per material (a sample of ~190 awake chunks through the park
+      // probe's fetch), so a CA cost per chunk has a cause attached.
+      static const int probeAt = [] {
+        const char* e = std::getenv("SANDVOX_BURN_PROBE");
+        return e ? std::atoi(e) : -1;
+      }();
+      if (probeAt >= 0 && tick == tIgnite + (uint32_t)probeAt)
+        ParkSampleRequest(world, "burn");
+      if (probeAt >= 0 && tick == tIgnite + (uint32_t)probeAt + 40u) {
+        std::vector<uint64_t> cells(mats.size() + 1, 0);
+        uint32_t got = 0;
+        for (const IVec3& wc : g_parkActiveIds) {
+          const CachedChunk* cc = world.Cached(wc);
+          if (!cc || cc->voxels.size() != kChunkVol) continue;
+          got++;
+          for (uint32_t w : cc->voxels) {
+            const uint32_t m = w & 0xFFFu;
+            cells[m < mats.size() ? m : mats.size()]++;
+          }
+        }
+        std::vector<std::pair<uint64_t, size_t>> rows;
+        for (size_t m = 0; m < mats.size(); m++)
+          if (cells[m]) rows.push_back({cells[m], m});
+        std::sort(rows.rbegin(), rows.rend());
+        std::printf("--burn-house: PROBE %u awake chunks sampled, cells per chunk:", got);
+        for (size_t r = 0; r < rows.size() && r < 14; r++)
+          std::printf(" %s %.0f", mats[rows[r].second].name.c_str(),
+                      got ? (double)rows[r].first / got : 0.0);
+        std::printf("\n");
+        std::fflush(stdout);
+      }
       if (tick >= tIgnite + burnTicks) {
         {
           std::vector<double> v = allSteps;
@@ -8403,6 +8518,8 @@ int main(int argc, char** argv) {
                         v[(size_t)(0.95 * (v.size() - 1))],
                         v[(size_t)(0.99 * (v.size() - 1))], v.back(), over10, over20);
         }
+        std::printf("--burn-house: mob tick (burnprof): %s\n", burnprof::Report().c_str());
+        burnprof::Get().on = false;
         std::printf("--burn-house: peak bodies %u, peak body voxels %u, worst step "
                     "%.1f ms\n--burn-house: debris profile over the burn: %s\n",
                     peakBodies, peakVox, worstStep, debris.ProfileReport().c_str());

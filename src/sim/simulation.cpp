@@ -368,6 +368,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // / sim_fluid run on the slim layout -- one identifier, one number.
         entry(46, T::Storage),         // draft (masks | coarse | field)
         entry(47, T::Storage),         // draftMeta (atomic words)
+        // The CA's air mask (sim_step.wgsl camask): simBGL_ only.
+        entry(48, T::Storage),         // caMask (1 bit per cell, per slot)
+        entry(49, T::Storage),         // caWind (ambient wind per 4^3 block)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -782,6 +785,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   rainExpoBuf_ = CreateBuffer(
       device, (uint64_t)rainlat::kExpoMaxAxis * rainlat::kExpoMaxAxis * 4,
       rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc, "rainExpo");
+  // The CA's air mask (pass_table.def caMask): written before each substep
+  // for every dirty chunk and read only for those, so it needs no clear.
+  caMaskBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 3u * (kChunkVol / 32u) * 4u,
+                            rhi::BufferUsage::Storage, "caMask");
+  // ...and its ambient wind cache (sim_step.wgsl caWind): 64 blocks x 3 words.
+  caWindBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 64u * 3u * 4u,
+                            rhi::BufferUsage::Storage, "caWind");
   // The wind-draft volume (world.h kDraft*). ZEROED: the masks a solve
   // compares against start as an all-air box, and the field as "no wind"
   // until the first (forced) rebuild tick solves it -- the renderer does not
@@ -1206,6 +1216,8 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(45, rainExpoBuf_),
         b(46, draftBuf_),
         b(47, draftMetaBuf_),
+        b(48, caMaskBuf_),
+        b(49, caWindBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1989,6 +2001,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     reposeSnap_ =
         MakeComputePipeline(device, simPL_, mStep, "reposesnap", "reposeSnap");
   });
+  pool.Add([&] { caMask_ = MakeComputePipeline(device, simPL_, mStep, "camask", "caMask"); });
   pool.Add([&] { occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy"); });
   pool.Add([&] { occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty"); });
   pool.Add([&] { opennessDirty_ = MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty"); });
@@ -2415,6 +2428,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::Draft:               return draftBuf_;
     case B::DraftMeta:           return draftMetaBuf_;
     case B::DraftArgs:           return draftArgsBuf_;
+    case B::CaMask:              return caMaskBuf_;
+    case B::CaWind:              return caWindBuf_;
     case B::WindStreaks:         return windStreakBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
@@ -2485,6 +2500,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
     case P::ReposeSnap:     return reposeSnap_;
+    case P::CaMask:         return caMask_;
     case P::Occupancy:      return occupancy_;
     case P::OccupancyDirty: return occupancyDirty_;
     case P::Pick:           return pick_;

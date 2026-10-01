@@ -4374,6 +4374,18 @@ class Mob {
   bool alive_ = true;
   // ---- the dead state (Mob::Die, ReleaseRigToDebris, the sleep) ------------
   bool rigReleased_ = false;   // the rig went to DebrisSystem: a husk
+  // SyncHairTuck's COVER, kept between calls (2026-10-01): the hood's shadow
+  // over the head's directions, a pure function of the shells' and the head's
+  // LATTICES (which cells exist), rebuilt only when tuckCoverSig_ changes. It
+  // used to be rebuilt whenever a shell's render BRICK was edited, which a
+  // burning hood does every tick: ~13 ms a tick for one hooded villager on
+  // fire (--burn-house SANDVOX_BURN_VILLAGE=1, SANDVOX_POSTSTEP_PROF).
+  uint64_t tuckCoverSig_ = 0;
+  std::vector<uint8_t> tuckCover_;
+  std::vector<float> tuckRmax_, tuckRim_;
+  std::vector<int> tuckCoveredBins_;
+  float tuckHemY_ = 0.0f, tuckMargin_ = 0.0f;
+  Vec3 tuckCentre_{};
   bool deadAsleep_ = false;    // see DeadAsleep()
   uint16_t deadQuiet_ = 0;     // consecutive ticks DeadQuietNow() held
   // Asleep with a passive coat still drying: the tick of the next visit
