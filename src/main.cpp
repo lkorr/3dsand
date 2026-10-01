@@ -42,6 +42,8 @@
 #include "game/dye.h"
 #include "game/grab.h"
 #include "game/item.h"
+#include "game/itemcoat.h"
+#include "game/itemstage.h"
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/spell.h"
@@ -111,6 +113,7 @@
 #include "test/support.h"
 #include "test/tickrig.h"   // support::TickRig: the --shot-* harnesses tick TickAuthority
 #include "test/treefixture.h"
+#include "ui/item_stage.h"
 #include "ui/overlay.h"
 #include "world/refs.h"
 #include "world/refs_game.h"
@@ -6694,6 +6697,26 @@ int main(int argc, char** argv) {
   ui.alchemy.texH = (int)kBenchH;
   ui.alchemy.liftH = alchemy::AlchemyBench::kLiftH;
   ui.alchemy.minW = alchemy::AlchemyBench::kMinW;
+  // ---- THE ITEM STAGE'S PICTURE (ui/item_stage.h) ---------------------------
+  // The bench's arrangement again: drawn on the CPU (a DDA through the item's
+  // lattice), copied in through a staging buffer when it changes, sampled
+  // nearest at an integer scale. Small on purpose: it is pixel art.
+  constexpr uint32_t kStageW = 256, kStageH = 192;
+  rhi::Texture stageTexture = ctx.device.CreateTexture(
+      {kStageW, kStageH, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::CopyDst | rhi::TextureUsage::TextureBinding, "itemStage");
+  rhi::TextureView stageView = stageTexture.CreateView();
+  rhi::Buffer stageStaging = ctx.device.CreateBuffer(
+      (uint64_t)kStageW * kStageH * 4, rhi::BufferUsage::CopySrc | rhi::BufferUsage::CopyDst,
+      "itemStageStaging");
+  ui.itemStage.tex = overlay.RegisterTexture(stageView);
+  ui.itemStage.texW = (int)kStageW;
+  ui.itemStage.texH = (int)kStageH;
+  // What the stage last drew (the picture is redrawn only when this changes)
+  // and whether the upload owes a copy.
+  std::vector<uint8_t> stagePixels;
+  uint64_t stageKey = 0;
+  bool stageFresh = false;
   // ---- internal render scale (render.renderScale) --------------------------
   // The world's offscreen colour target when the scale is below 1, cached on
   // its size like the depth targets; the blit up to the swapchain and the
@@ -11023,6 +11046,9 @@ int main(int argc, char** argv) {
       // The bench first: Esc puts the vessels back and leaves the screen up.
       if (ui.alchemy.open) {
         ui.alchemy.wantClose = true;
+      } else if (ui.itemStage.open) {
+        // ...then the item stage: put the item back, keep the screen.
+        ui.itemStage.wantClose = true;
       } else if (ui.inventoryOpen) {
         ui.inventoryOpen = false;
         captured = captureBeforeUi;
@@ -15078,6 +15104,142 @@ int main(int argc, char** argv) {
         ui.alchemy.wantClose = false;
         if (bench.IsOpen()) finishBench();
       }
+      // ---- THE ITEM STAGE (ui/item_stage.h, game/itemstage.h) ----------------
+      // Open on a double-click, closed by "done", Esc, the screen closing, the
+      // bench opening or the item leaving the slot it was opened on. While it
+      // is open: the picture redrawn when anything it shows changed, the brush
+      // ring picked through the same camera, and the stroke handed to the
+      // tick (PlayerSession::itemStroke) -- the panel never touches the item.
+      {
+        static std::string stageItem;   // the name it was opened on
+        auto closeStage = [&]() {
+          ui.itemStage.open = false;
+          ui.itemStage.texReady = false;
+          stageItem.clear();
+          stageKey = 0;
+        };
+        if (ui.itemStage.wantOpen) {
+          ui.itemStage.wantOpen = false;
+          const ItemStack* st = kit.Resolve(ui.itemStage.openRef);
+          const ItemDef* d = st ? items.Of(*st) : nullptr;
+          if (d && itemstage::StageTakes(*d)) {
+            if (bench.IsOpen()) finishBench();
+            ui.itemStage.open = true;
+            ui.itemStage.texReady = false;
+            ui.itemStage.shell = 0;
+            ui.itemStage.resetView = true;
+            stageItem = st->name;
+            stageKey = 0;
+          }
+        }
+        if (ui.itemStage.wantClose || !ui.inventoryOpen || bench.IsOpen()) {
+          ui.itemStage.wantClose = false;
+          if (ui.itemStage.open) closeStage();
+        }
+        const ItemStack* sst = ui.itemStage.open ? kit.Resolve(ui.itemStage.openRef) : nullptr;
+        const ItemDef* sdef = sst ? items.Of(*sst) : nullptr;
+        if (ui.itemStage.open && (!sdef || sst->name != stageItem)) closeStage();
+        session.itemStroke.active = false;
+        session.itemStageOpen = KitRef{};
+        ui.itemStage.cursorValid = false;
+        if (ui.itemStage.open && sdef) {
+          UIState::ItemStageUI& T = ui.itemStage;
+          session.itemStageOpen = T.openRef;
+          if (T.resetView) {
+            const itemstage::View v0;
+            T.yaw = v0.yaw;
+            T.pitch = v0.pitch;
+            T.zoom = v0.zoom;
+            T.resetView = false;
+          }
+          const int nShell = ItemLatticeCount(*sdef);
+          T.shell = std::clamp(T.shell, 0, std::max(0, nShell - 1));
+          T.name = sdef->name;
+          T.kindText = sdef->cover.empty() ? std::string(ItemKindName(sdef->kind))
+                                           : std::string("worn: ") + ItemKindName(sdef->kind);
+          T.where = T.openRef.space == KitSpace::Equip   ? "on you"
+                    : T.openRef.space == KitSpace::Hotbar ? "on the hotbar"
+                                                          : "in the pack";
+          T.shellNames.clear();
+          if (!sdef->cover.empty())
+            for (int k = 0; k < nShell; k++) T.shellNames.push_back(itemstage::ShellName(*sdef, k));
+          static std::vector<PrefabVoxel> stageScratch;
+          const std::vector<PrefabVoxel>* lat =
+              itemstage::ViewLattice(*sst, *sdef, T.shell, stageScratch);
+          static itemstage::LatticeGrid grid;
+          if (lat) grid.Build(*lat);
+          else grid = itemstage::LatticeGrid{};
+          const itemstage::View view{T.yaw, T.pitch, T.zoom};
+          const itemstage::StageCamera scam =
+              itemstage::MakeCamera(grid, view, (int)kStageW, (int)kStageH);
+          T.imgW = (int)kStageW;
+          T.imgH = (int)kStageH;
+          T.cellPx = scam.PxPerCell();
+          // The readout: every coat on this shell, heaviest coverage first.
+          T.voxels = lat ? (int)lat->size() : 0;
+          T.coats.clear();
+          if (lat)
+            for (const itemstage::CoatShare& c : itemstage::CoatSummary(*lat)) {
+              UIState::ItemStageUI::Coat uc;
+              uc.name = c.mat < mats.size() ? mats[c.mat].name : std::string("?");
+              uc.color = c.mat < mats.size()
+                             ? (0xFF000000u | (mats[c.mat].gpu.stainColor & 0x00FFFFFFu))
+                             : 0xFF808080u;
+              uc.voxels = (int)c.voxels;
+              uc.frac = T.voxels ? (float)c.voxels / (float)T.voxels : 0.0f;
+              T.coats.push_back(uc);
+            }
+          // Redraw only when what it shows moved: the coats, the view, the
+          // shell, the dye.
+          uint64_t key = 0xcbf29ce484222325ull;
+          auto mixKey = [&](uint64_t v) { key = (key ^ v) * 0x100000001b3ull; };
+          if (lat)
+            for (const PrefabVoxel& v : *lat) mixKey(((uint64_t)v.stain << 16) ^ v.material);
+          uint32_t vb[3];
+          std::memcpy(&vb[0], &T.yaw, 4);
+          std::memcpy(&vb[1], &T.pitch, 4);
+          std::memcpy(&vb[2], &T.zoom, 4);
+          mixKey(vb[0]);
+          mixKey(vb[1]);
+          mixKey(vb[2]);
+          mixKey((uint64_t)T.shell + 1);
+          mixKey(sst->dye);
+          mixKey(lat ? lat->size() : 0);
+          if (key != stageKey && lat) {
+            itemstage::Look look;
+            look.mats = &mats;
+            look.artColors = mobs.MicroSet() ? &mobs.MicroSet()->artColors : nullptr;
+            look.dye = sst->dye;
+            look.scale = sdef->scale;
+            itemstage::Render(grid, *lat, scam, look, stagePixels);
+            stageKey = key;
+            stageFresh = true;
+          }
+          // The pick under the cursor: the ring, and the ray the tick pours on.
+          if (T.over && lat) {
+            Vec3 ro, rd;
+            scam.Ray(T.at[0], T.at[1], ro, rd);
+            const itemstage::Hit h = itemstage::Raycast(grid, ro, rd);
+            if (h.hit) {
+              T.cursorValid = true;
+              T.cursorPx[0] = T.at[0];
+              T.cursorPx[1] = T.at[1];
+              T.cursorR = T.radius * scam.PxPerCell();
+            }
+            if (T.paint) {
+              itemstage::Stroke& is = session.itemStroke;
+              is.active = true;
+              is.item = T.openRef;
+              is.shell = T.shell;
+              is.ro = ro;
+              is.rd = rd;
+              is.radius = T.radius;
+              is.vessel = ui.activeVessel;
+            }
+          }
+          T.over = T.paint = false;
+        }
+      }
       // ---- THE BENCH IN THE CHARACTER'S HANDS (session.h BenchHold) --------
       // One vessel on the table: held in one hand. Two or more: the one in
       // the bench's hand (or the one last touched) and its nearest
@@ -17070,6 +17232,22 @@ int main(int argc, char** argv) {
         bEnc.CopyBufferToTexture(src, dst, {tbW, tbH, 1});
         ctx.queue.Submit(bEnc.Finish());
         ui.alchemy.texReady = true;
+      }
+      // THE ITEM STAGE'S PICTURE, the same way, only when it was redrawn.
+      if (ui.itemStage.open && stageFresh &&
+          stagePixels.size() == (size_t)kStageW * kStageH * 4) {
+        stageFresh = false;
+        ctx.queue.WriteBuffer(stageStaging, 0, stagePixels.data(), stagePixels.size());
+        rhi::CommandEncoder sEnc = ctx.device.CreateCommandEncoder();
+        rhi::TexelCopyBuffer src;
+        src.buffer = stageStaging;
+        src.bytesPerRow = kStageW * 4;
+        src.rowsPerImage = kStageH;
+        rhi::TexelCopyTexture dst;
+        dst.texture = stageTexture;
+        sEnc.CopyBufferToTexture(src, dst, {kStageW, kStageH, 1});
+        ctx.queue.Submit(sEnc.Finish());
+        ui.itemStage.texReady = true;
       }
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
         // THE WHOLE BODY, ALWAYS — but only a mask that actually hides
