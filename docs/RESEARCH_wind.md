@@ -2,7 +2,8 @@
 
 Date: 2026-08-25. Status: **decided; phases 1, 2, 3, 4 and the flip landed —
 wind is ON (`sim.windMode` = 1) and PRIMITIVES ARE IN, which is what makes wind
-a gameplay tool and what makes entrainment safe. Phases 5 and 6 open.**
+a gameplay tool and what makes entrainment safe. Phase 6 (drafts: walls
+shelter the wind) landed 2026-09-30, §14. Phase 5 open.**
 §10 records what phase 4 found; DESIGN.md §9b is the binding summary. This is
 the plan of
 record for the wind system; DESIGN.md gets its section when phase 1 lands (same
@@ -303,7 +304,7 @@ integral curves of the slope field). Toggle = in-game key + tuner bool.
 | 2 | Primitive list + op plumbing (spell VM op, dev placement), footprint wake, viz shows primitives | none (empty list is an exact identity) | **DONE 2026-08-26** — the `wind-prim` gate: a licensed fan creeps a settled bed 12.65 cells downwind in a chamber that is ASLEEP, waking 10 chunks and losing no grains, with the suite's page-fault counter at 0. An unlicensed fan blows smoke and leaves the bed bitwise unmoved |
 | 4b | Flip `sim.windMode` to 1 | rebaseline | **DONE** — `882a30f3` → `47dd1520`; sleep still 0/32768 chunks active, dense reproduces the same hash, both smoke tables re-recorded with `worldgen` byte-identical |
 | 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline | fire columns loft smoke/embers; tornado lifts sand |
-| 6 | Draft volumes: local coarse relaxation so a room vents through its openings (§11) | rebaseline | smoke in a room with a door and a window finds the exits |
+| 6 | Draft volumes: local coarse relaxation so a room vents through its openings (§11) | rebaseline | **DONE 2026-09-30 (§14)** -- the `drafts` gate: sealed hut 0.037, door + leeward window 0.42 along +X, smoke leaves through the window; the pinned hash did not move |
 
 Phases 3 and 4 landed together, and in that order, because §4.6 is wrong about
 one thing: it has the particle and MPM consumers reading the f32 `windAt`. They
@@ -403,7 +404,7 @@ resting voxels move without a CPU-visible cause — not just wind — lands in t
 same hole. The tell is a non-zero page-fault count with no obvious lost voxel
 near the thing you were testing.
 
-## 11. Drafts through openings (planned "phase 6": the local refinement volume)
+## 11. Drafts through openings (planned "phase 6": the local refinement volume; REFINED by §14)
 
 Owner requirement (2026-08-25): a room with a door and a window should carry a
 draft; smoke inside should find the exits. This is the first requirement the
@@ -742,3 +743,307 @@ included), i.e. the streaks are the field, drawn. All knobs are live uniforms.
 block the tick ships (i32 wraps emulated) — the F1 readout and the
 `wind-field` gate read it. `check_invariants windmirror` holds its constants to
 the shader's; nothing compares the two bit for bit at run time.
+
+## 14. Drafts: the shelter volume (phase 6, 2026-09-30)
+
+Status: **LANDED 2026-09-30** (DESIGN.md §9b "Drafts" is the binding
+summary). §14.1-14.9 are the plan as written; **§14.10 records where the
+build departed from it, and why** -- read it before the solver sections. Refines §11. Owner requirement (restated
+2026-09-30): now that rain is blocked by roofs and walls (DESIGN.md §9.w
+"Where the rain lands"), the wind has to be too. Indoors the field should die
+down, air should move through a room only where it has a way in AND a way
+out, and smoke inside should find the exits. Today every consumer reads the
+ambient field straight through walls: smoke in a sealed hut leans at the
+full outdoor speed, embers inside drift with the storm, and the gust streaks
+fly through the walls of the room the camera stands in.
+
+### 14.1 What changes from §11, and why
+
+§11 planned a volume that relaxes the LIVE wind each tick (ambient boundary
+in, Jacobi iterations, field out) and exists only near active gas. Two
+problems surfaced while planning it against the engine as it stands now:
+
+1. **History.** A Jacobi solve that converges over several ticks carries its
+   iterate from tick to tick. The rain exposure map was designed to have no
+   history at all ("nothing to carry across a save, a load, a replay start or
+   a window move"), and the same constraint binds here: the sim reads this
+   field, so the field at tick t must be a pure function of the state at tick
+   t. A cold solve per tick satisfies that but has to converge from zero
+   every tick, which with plain Jacobi over a room-sized domain takes
+   hundreds of iterations.
+2. **Sleep.** The live wind changes every tick (gust bands, meander), so a
+   live-wind solve can never sleep while anything reads it, and the renderer
+   reads it every frame near the camera.
+
+**The fix is linearity.** The pressure projection is a linear operator, and
+the gust bands' shortest wavelength (8 m) is long next to a room. So the
+volume does not solve for the wind. It solves for the **transfer** of the
+wind: how a unit horizontal wind at infinity, along +X and along +Z, is
+redirected by the geometry. Those two responses are a function of geometry
+ALONE:
+
+```
+R_x(p), R_z(p) = P(e_x), P(e_z)        // 3-vectors per cell; P = projection
+windIn(p)      = R_x(p) * amb.x(p) + R_z(p) * amb.z(p)
+               + (0, amb.y(p) * open(p), 0)
+               + primitives(p)          // unprojected, as today
+```
+
+`amb` is today's ambient field (`windAtQ` without primitives), evaluated at
+the sample point, so the log profile, terrain exposure, meander, gusts and
+storm envelope all still apply. Only the GEOMETRY response is stored.
+`open(p)` scales the ambient's vertical component (thermals, band updraft) by
+the cell's mean |R|.
+
+What this buys:
+
+- **The volume sleeps.** R changes only when the solid geometry inside the
+  volume changes (a wall dug, a door opened, a house burning) or the volume
+  moves. A settled world costs a mask check over the active chunks inside the
+  volume and nothing else (rule 2).
+- **No history.** R is recomputed in full, from zero, inside the tick whose
+  geometry changed. A tick whose geometry did NOT change gets the same R by
+  purity. After a load, a replay start or a window move, the volume
+  rebuilds from what is there, exactly as the rain map does.
+- **One field.** `windAtQ` and `windAt` both apply R inside the volume, so
+  every consumer (CA drift, entrainment, particles, MPM nodes, streaks, the
+  debug arrows) stands in the same sheltered wind. That is invariant 2 held.
+
+What it costs in accuracy, accepted for v1:
+
+- Gusts indoors are the outdoor gust at the same point, redirected and
+  scaled. Indoor air has no gust pattern of its own.
+- **Potential flow, no turbulent wake.** Behind a wall the projection gives
+  a calm stagnation pocket about one obstacle size deep. A real wake runs
+  5-10 heights. A wall still shelters, just over a shorter distance.
+- Fans and spell gusts (primitives) are added on top, unprojected. A fan
+  inside a room is not confined by the room's walls.
+- **No stack effect.** Drafts come from wind pressure only. A fire in a
+  sealed room does not drive air through it; hot smoke still rises through
+  the CA's buoyancy. The heat term is phase 5 (§4.4), and it would enter as a
+  pressure source in this same solve.
+
+### 14.2 What happens physically, and what the gate checks
+
+The projection makes the wind divergence-free subject to no flow through
+solids, with the volume's outer faces open (phi = 0). The result:
+
+| geometry | result | real behaviour |
+|---|---|---|
+| sealed room | R = 0 inside: a uniform flow cannot exist in a closed box | still air |
+| one opening, windward | small recirculation inside the opening, near zero beyond it | weak pulsing only |
+| door windward + window leeward | flow threads door to window, speed set by the openings' areas | cross-ventilation draft |
+| small window, big room | interstitial speed = flux / porosity, so the jet through the gap is fast | wind whistles through gaps |
+| open pavilion (roof on posts) | flow passes under the roof, slightly accelerated | breezy shade |
+| gap between buildings | continuity speeds it up | venturi gusts in alleys |
+| cave | dies with depth past the mouth | still air |
+| lee of a wall | calm pocket about one wall height deep | shelter (shorter than real) |
+
+### 14.3 The grid
+
+- **Cells of 4 voxels (0.4 m)**, aligned to the 4^3 sub-occupancy blocks.
+  The volume is `kDraftNX x kDraftNY x kDraftNZ` cells, starting at
+  **64 x 32 x 64 = 131k cells (25.6 m x 12.8 m x 25.6 m)**. These are
+  `world.h` constants generated into the prelude, so measurement can grow
+  them. Centred on the CPU-mirror centre (`TickParams.mirrorBase` + 1 chunk,
+  i.e. the player), snapped to whole chunks. A window shift moves it, which
+  forces a full rebuild.
+- **Porosity per face, from voxel ROWS, not "any blocker in the cell."**
+  Testing "any blocker" at 4 voxels closes a 1-voxel wall, which is correct,
+  but it also closes an 8-voxel doorway to one cell column and a 4-voxel
+  window to nothing. Instead each cell stores three 16-bit row masks: bit
+  (u, v) of the axis-a mask is set if the 4-voxel row through the cell along
+  a, at cross-section (u, v), holds a blocker. Reading a cell's 64 voxels once
+  fills all three masks. The open fraction of the face between cells A and
+  B on axis a is `popcount(~(maskA_a | maskB_a) & 0xFFFF) / 16`. A one-voxel
+  wall blocks every row it crosses. A 2x2-voxel hole leaves 4/16 of a face
+  open. The solve's coefficient is beta = that fraction, which makes it
+  variable-coefficient (porous-media) Poisson.
+- **Which voxels block:** the CA's non-gas matter (solid, powder, liquid).
+  Air, gas and fire pass. Foliage materials (a material tag; check
+  `materials.json` for the leaf family) do NOT block in v1: a crown as a
+  solid lump would squeeze flow and speed it up underneath, which is worse
+  than letting the crown be transparent (today's behaviour). Porous foliage
+  is a follow-up.
+- **Door leaves are voxels**, so opening or closing a `refs` door is a
+  geometry change and switches a draft on or off. That falls out for free.
+
+### 14.4 The tick, in passes (all on the sim table, before the CA)
+
+1. **`draftMask`.** Recomputes the row masks for every cell of every ACTIVE
+   chunk (`dirtyList`) inside the volume, plus every chunk of the volume on a
+   rebuild tick (window shift, load, first tick, `draftEpoch` change). It
+   writes the masks and raises a "changed" word if any mask differs from the
+   stored one. Only active chunks can change geometry, since settled matter
+   writes nothing and every op dirty-marks what it touches, so the cost
+   tracks activity. The stored masks are a pure function of current geometry:
+   an untouched chunk's masks are unchanged because its voxels are.
+2. **`draftSolve`, only when changed.** The dispatches are indirect, with a
+   zero count when unchanged (the `rainExpo` pattern for conditional work).
+   This is a cold solve, from phi = 0, of both right-hand sides at once (one
+   vec2 of phi per cell), by **geometric multigrid with a FIXED V-cycle
+   count**. Levels: 64x32x64 down to 4x2x4. Coarse face beta = the mean of
+   the four fine faces it covers. Smoother: red-black Gauss-Seidel. The
+   coarse levels from 16x8x16 down fit in ONE workgroup and run in one
+   dispatch with `workgroupBarrier` between sweeps, which takes most of the
+   dispatch count off the bill.
+   **Integer fixed point throughout** (rule 1: the sim reads the output). phi
+   is i32 Q16, beta Q4 (sixteenths, exact from the popcount), and the per-cell
+   divide is integer. Do not use CG: it needs dot-product reductions, and an
+   i32-only reduction of Q16 products overflows.
+3. **`draftResolve`.** Converts phi to the per-cell transfer: face flux =
+   beta * (e - grad phi). Cell velocity = the mean of the opposite faces'
+   fluxes / max(the cell's open fraction, 1/16), so a gap's jet is
+   interstitial speed. The result is packed as 6 x i16 Q12 (R_x.xyz, R_z.xyz)
+   in 3 words per cell. Solid cells get 0. The outer two cells blend to
+   identity (R_x = e_x, R_z = e_z) so the volume edge has no seam.
+
+Record the dispatch count and the GPU time of a solve tick in `perfnodes.h`
+(`draftMask`, `draftSolve`). Target: under 1 ms per solve tick at 64x32x64 on
+the 3060 Ti, and about 0 on a settled tick.
+
+### 14.5 Readers
+
+- `common.wgsl`: `windAtQ` gains the volume term. The ambient part is
+  computed as today, then `draftApplyQ(p, amb)` applies R when p is inside
+  the volume. This needs a new **storage binding, `draftField`**: sim group
+  binding 46, plus a pass-table R on every consumer row (sim_step,
+  sim_particle, sim_fluid) and W on draftResolve. The volume origin and the
+  enable word ride TickParams (`draftOrigin[3]`, `draftMode`; the
+  `sim.windMode` gate shape: 0 = off, an exact identity, which keeps the old
+  hash reachable as a differential). Sim sampling is NEAREST cell (the drift
+  bias is a probability; 3 loads). Render sampling is trilinear.
+- Render: `windAt` gets the same term, with the binding added to the render
+  BGL for `wind_streak.wgsl` and `debug_wind.wgsl`. Streaks stop flying
+  through walls, and the F4 arrows show the draft. **raymarch.wgsl sway is
+  NOT wired in v1**: its fs has no register headroom (memory: raymarch
+  register cliff), and grass indoors is rare. Wire it only if
+  `--shader-stats` shows no spill growth. `cloud.wgsl` never needs it.
+- C++ mirror: `windfield::Probe` cannot see GPU geometry. The F1 readout
+  shows the volume's state instead (solves so far, last solve tick, ms, open
+  fraction at the camera). The gate reads `draftField` back.
+
+### 14.6 Tuning
+
+`tuning_params.def` rows, following the CLAUDE.md recipe:
+- `sim.draftMode` (0/1)
+- `sim.draftVCycles` (fixed count, default 3)
+- `sim.draftSmooth` (sweeps per level, default 2)
+- `wind.draftOpenVert` (the vertical component's scale)
+
+Grid size stays a `world.h` constant, because it sizes buffers.
+
+### 14.7 Gate `drafts` (`selftest_wind.cpp`, through `support::RunTicks`)
+
+On the harness map, pinned wind (weatherAuto off, 8 m/s along +X, gusts 0),
+four floating stone boxes (floating, so terrain stays out of it), interior
+3 m x 2.4 m x 3 m, walls 1 voxel thick:
+
+1. sealed: |windIn| at the centre < 5% of ambient;
+2. one 8x22-voxel doorway in the windward wall: < 20% at the centre;
+3. doorway windward + 6x6 window in the leeward wall: the centre-line flow
+   points door to window (dot with +X > 0.7) at >= 30% of ambient;
+4. the same box with the window on a SIDE wall: the flow turns toward it.
+
+Then the CA, end to end: release a smoke puff at the centre of boxes 1 and 3
+and run 150 ticks. Box 1 keeps >= 90% of its smoke cells inside. Box 3
+loses more than half through the window and less than 10% through the door.
+Then two more checks:
+
+- **Sleep:** 60 more ticks with nothing changing, and the solve counter does
+  not move.
+- **Purity:** force a rebuild (bump `draftEpoch`) and require the
+  `draftField` readback to be byte-identical.
+
+Expected pass/fail thresholds go in `tests/baseline.json`.
+`--gate determinism` covers twice-run equality. The hash MOVES (gas near any
+structure in the volume): rebaseline once at the end.
+
+### 14.8 Invariants this adds (DESIGN.md §9b, in the landing commit)
+
+- The draft field is the second stored field in the wind system, and it is
+  DERIVED: a pure function of (voxel geometry inside the volume, volume
+  origin, tuning), rebuilt in full on any change, never saved, never hashed
+  on its own.
+- It is geometry ONLY. No wind, weather or tick value enters it, which is
+  what lets it sleep.
+- The ambient field still never wakes a chunk. The volume reads the dirty
+  list and never marks it.
+
+### 14.9 Follow-ups (not v1)
+
+- Several volumes: put a second bounded volume where active gas meets
+  structure away from the player (a burning house 60 m off), budget-charged
+  like primitives.
+- Heat as a pressure source (phase 5): stack effect, burning rooms that vent.
+- Wake extension: an upwind-blockage shelter term for the lee beyond the
+  potential-flow pocket. Directional, so it needs 4 transfers or a sample-time
+  march.
+- Porous foliage (a beta per material); raymarch sway inside the volume;
+  primitives projected with the geometry.
+
+### 14.10 What shipped, and where it departed from the plan
+
+The model (the transfer, the row masks, geometry-only re-solves, the readers)
+shipped as planned. Building and measuring it changed the solver four times.
+Each change answered a measurement:
+
+1. **The slab rule.** The first `drafts` run read a sealed hut at 0.26 of the
+   outside wind. A 4-voxel cell holding a one-voxel floor or roof is ONE node,
+   so the room above the pad and the open air under it were the same air. A
+   cell with a complete slab on any axis is now solid. The cost is at most
+   0.3 m of air beside a thin slab, and a closed cell takes its open
+   neighbours' mean transfer, so smoke under a ceiling still drafts.
+2. **The pocket rule.** After the slab rule the sealed hut read 0.05 and a
+   one-door hut 0.3, and more iterations changed neither. A dump of the coarse
+   potential (`SANDVOX_DRAFT_DUMP=1`) showed a slope of 0.95 per cell where a
+   sealed room needs 1.0. The leak was the coarse cell at the roof/wall corner,
+   which held a fine cell inside the room and one diagonally outside it,
+   joined only through solid. Each coarse cell now keeps its largest air
+   pocket (min-label propagation over its fine cells, weighted by open rows)
+   and its faces count only fine faces between members. With that, the
+   one-door hut read 0.035.
+3. **The coarse grid moved from 8 voxels to the chunk (16), into workgroup
+   memory.** §14.4's coarse multigrid ran in one workgroup over 16k cells
+   through L2 and cost ~20 ms a solve in `--perf --scenario explosion`. It is
+   now 16 x 8 x 16 cells in one workgroup's memory, relaxed by integer
+   red-black SOR (omega 7/4, 1,024 threads). The pocket and face passes run
+   256 groups wide. Because the coarse grid is now too coarse to trust next to
+   a door, the fine pass became **four overlapping-tile (Schwarz) passes**,
+   each tile's halo ring held at the neighbours' previous answer, so the fine
+   field stands on its own. The fine faces are packed once per solve.
+4. **The solve is a pipeline**, one stage a tick (pocket + faces, coarse solve,
+   four fine passes). A solve starts only when none is in flight, and a burst
+   runs every stage at once when the box moves. Whole solves on every changing
+   tick cost 668 µs/frame in `explosion` and 2.4 ms in `forestfire`; pipelined
+   they cost 166 µs and 538 µs. The price is a lag of up to 6 ticks (0.2 s)
+   between a geometry change and the field, plus one piece of history: the
+   stage word of a solve in flight. A load or a replay start bursts instead,
+   so it sees the current geometry up to 6 ticks earlier than an uninterrupted
+   run would. Twice-run determinism is unaffected (`--gate determinism`), and
+   a burst reproduces a pipelined result bit for bit (`drafts`' purity check).
+
+Measured (`--gate drafts`):
+
+| Hut / point | Result |
+|---|---|
+| Sealed | 0.037 |
+| Windward door only | 0.035 |
+| Door + leeward window | 0.42 along +X |
+| Door + side window | turns toward it |
+| Alley | 1.27 |
+| Open air above the roofs | 1.05 |
+
+Smoke leaves the draft hut out of its leeward window (277 samples to 0), and
+smoke moving in the huts never triggers a solve. The pinned determinism hash
+did not move: the harness scenario's gas never meets a structure inside the
+box.
+
+Still open (§14.9 stands):
+
+- several volumes, for fires away from the player;
+- heat as a pressure source;
+- wake extension;
+- porous foliage;
+- grass sway inside the volume, which needs raymarch register headroom;
+- an F1 readout of the volume's state (solves, stage, last publish).

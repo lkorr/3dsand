@@ -148,6 +148,16 @@ namespace {
 #define PIPE_SOL_HASH        Pipe::SolHash
 #define PIPE_SOL_EVICT       Pipe::SolEvict
 #define PIPE_SOL_RESTORE     Pipe::SolRestore
+#define PIPE_DRAFT_MASK_ALL   Pipe::DraftMaskAll
+#define PIPE_DRAFT_MASK_DIRTY Pipe::DraftMaskDirty
+#define PIPE_DRAFT_ARGS       Pipe::DraftArgsP
+#define PIPE_DRAFT_CBUILD     Pipe::DraftCoarseBuild
+#define PIPE_DRAFT_CFACES     Pipe::DraftCoarseFaces
+#define PIPE_DRAFT_CSOLVE     Pipe::DraftCoarseSolve
+#define PIPE_DRAFT_FINE1      Pipe::DraftFineFirst
+#define PIPE_DRAFT_FINE2      Pipe::DraftFineMid
+#define PIPE_DRAFT_FINE2B     Pipe::DraftFineMid2
+#define PIPE_DRAFT_FINE3      Pipe::DraftFineLast
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -200,6 +210,9 @@ namespace {
 #define C_RAINMAP   Cond::RainMap
 #define C_RAINEXPO  Cond::RainExpo
 #define C_STREAKS   Cond::WindStreaks
+#define C_DRAFTALL   Cond::DraftAll
+#define C_DRAFTDIRTY Cond::DraftDirty
+#define C_DRAFT      Cond::Draft
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_RAINFALL  (uint32_t)DispatchSel::RainFallSel
@@ -235,6 +248,7 @@ namespace {
 #define D_RSGY            (uint32_t)DispatchSel::RayStartGy
 #define D_STREAKGX        (uint32_t)DispatchSel::StreakGx
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
+#define IND_DRAFTARGS     (uint32_t)DispatchSel::IndDraftArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

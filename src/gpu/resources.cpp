@@ -463,6 +463,21 @@ constexpr const char* kPageWriteEnd = ">>>PAGE_TABLE_WRITE_END<<<";
 constexpr const char* kSupportBlockBegin = ">>>SUPPORT_LOSS_BEGIN<<<";
 constexpr const char* kSupportBlockEnd = ">>>SUPPORT_LOSS_END<<<";
 
+// The WIND DRAFTS reader (common.wgsl's block of that name) reads
+// `draftField`, which only the shaders that consume the shelter volume declare
+// (sim_step, sim_particle, sim_fluid, sim_draft, wind_streak, debug_wind). Two
+// blocks, exactly one kept: BOUND (the real accessor) for a body that declares
+// it, UNBOUND (a constant-false gate and a stub) for every other shader, which
+// still compiles windAt/windAtQ. Same body-derived predicate as the page block.
+constexpr const char* kDraftBoundBegin = ">>>DRAFT_BOUND_BEGIN<<<";
+constexpr const char* kDraftBoundEnd = ">>>DRAFT_BOUND_END<<<";
+constexpr const char* kDraftUnboundBegin = ">>>DRAFT_UNBOUND_BEGIN<<<";
+constexpr const char* kDraftUnboundEnd = ">>>DRAFT_UNBOUND_END<<<";
+
+bool BodyReadsDrafts(const std::string& body) {
+  return body.find("> draftField") != std::string::npos;
+}
+
 bool BodyFlagsSupportLoss(const std::string& body) {
   return body.find("> supportOut") != std::string::npos;
 }
@@ -632,6 +647,11 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
   std::string ptSeed;
   if (!BodyFlagsSupportLoss(body)) {
     common = StripBlock(common, kSupportBlockBegin, kSupportBlockEnd);
+  }
+  if (BodyReadsDrafts(body)) {
+    common = StripBlock(common, kDraftUnboundBegin, kDraftUnboundEnd);
+  } else {
+    common = StripBlock(common, kDraftBoundBegin, kDraftBoundEnd);
   }
   if (!BodyAddressesVoxels(body)) {
     common = StripBlock(common, kPageBlockBegin, kPageBlockEnd);

@@ -359,6 +359,10 @@ const char* const kOrder[] = {
     // through windfield.h's mirror: reads the terrain table around the
     // window and changes no world state.
     "wind-field",
+    // The wind-draft shelter volume (docs/RESEARCH_wind.md §14): four huts on
+    // a pad, the transfer read back, smoke through the CA. Regenerates the
+    // world before returning.
+    "drafts",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-identity", "fluid-settle",
     "fluid-excite", "fluid-onwater", "debris-float", "fluid-stain", "fluid-react", "fluid-self-react", "far-fog",  "far-downsample",
     "far-persist", "far-surface",

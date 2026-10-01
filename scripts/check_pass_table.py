@@ -191,6 +191,17 @@ PIPE_TO_MEMBER = {
     "PIPE_SOL_HASH": "solHash_",
     "PIPE_SOL_EVICT": "solEvict_",
     "PIPE_SOL_RESTORE": "solRestore_",
+    # Wind drafts (sim_draft.wgsl, docs/RESEARCH_wind.md 14).
+    "PIPE_DRAFT_MASK_ALL": "draftMaskAll_",
+    "PIPE_DRAFT_MASK_DIRTY": "draftMaskDirty_",
+    "PIPE_DRAFT_ARGS": "draftArgs_",
+    "PIPE_DRAFT_CBUILD": "draftCoarseBuild_",
+    "PIPE_DRAFT_CFACES": "draftCoarseFaces_",
+    "PIPE_DRAFT_CSOLVE": "draftCoarseSolve_",
+    "PIPE_DRAFT_FINE1": "draftFineFirst_",
+    "PIPE_DRAFT_FINE2": "draftFineMid_",
+    "PIPE_DRAFT_FINE2B": "draftFineMid2_",
+    "PIPE_DRAFT_FINE3": "draftFineLast_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -220,6 +231,10 @@ BUF_TO_WGSL = {
     "RayStart": {"rayStart"},
     "RainMap": {"rainMap"},
     "RainExpo": {"rainExpo"},
+    # Wind drafts. DraftArgs is indirect-only and never bound, like SolArgs.
+    "Draft": {"draftField"},
+    "DraftMeta": {"draftMeta"},
+    "DraftArgs": set(),
     # The streak DRAW's read-only view (`streaksR`, renderBGL_ 33) is not a row.
     "WindStreaks": {"streaks"},
     "ShadowArgsStage": {"shadowArgs"},
@@ -414,6 +429,9 @@ _SIM_GROUP0 = {
     # The rain exposure map, binding 45 (sim_rain_expo.wgsl writes it before
     # the CA; sim_step's rainExposed reads it).
     "rainExpo",
+    # The wind-draft shelter volume + its meta words, bindings 46/47
+    # (sim_draft.wgsl builds it before the CA; windAtQ reads it).
+    "draftField", "draftMeta",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -447,7 +465,11 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 # biome sampler (farSurfaceMat -> treeCanopyAt -> treeInfoAt
                 # -> biomeAt), which reads the map, so binding 31 has to name
                 # the same buffer in every module that declares it.
-                "worldMap"}
+                "worldMap",
+                # draftField is in the SLIM group as well: windAtQ reads it
+                # through common.wgsl, and sim_particle / sim_fluid run on
+                # this layout, so binding 46 names the same buffer here.
+                "draftField"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch", "farSig",
@@ -780,7 +802,15 @@ def module_for(fname):
     if not body:
         _module_cache[fname] = None
         return None
-    # LoadShader prepends common.wgsl; the call graph spans both.
+    # LoadShader prepends common.wgsl; the call graph spans both. It also keeps
+    # exactly ONE of the WIND DRAFTS reader's two blocks (resources.cpp
+    # BodyReadsDrafts): both define draftWord, and parse_module keeps the LAST
+    # definition, which is the stub -- so without this strip every reader of
+    # the draft volume would look as if it never touched draftField, and a row
+    # that omitted R(Draft) would pass.
+    drop = "DRAFT_UNBOUND" if "> draftField" in body else "DRAFT_BOUND"
+    common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
+                    common, flags=re.S)
     _module_cache[fname] = parse_module(common + "\n" + body)
     return _module_cache[fname]
 

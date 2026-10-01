@@ -170,6 +170,12 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     // ...and only when the CA runs: its rainExposed is the one reader.
     case pass::Cond::RainExpo:      return cx.rainExpoGroups > 0 && cx.caActive;
     case pass::Cond::WindStreaks:   return cx.streakGx > 0;
+    // Wind drafts: the whole box on a rebuild tick, else its active chunks
+    // when the CA runs (the dirty list only exists then); the args + solve
+    // rows whenever either masks.
+    case pass::Cond::DraftAll:      return cx.draftOn && cx.draftRebuild;
+    case pass::Cond::DraftDirty:    return cx.draftOn && !cx.draftRebuild && cx.caActive;
+    case pass::Cond::Draft:         return cx.draftOn && (cx.draftRebuild || cx.caActive);
   }
   return false;
 }
@@ -682,6 +688,7 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
 
       if (r.kind == pass::Kind::ComputeIndirect) {
         Buffer* args;
+        uint64_t argsOff = 0;
         switch ((pass::DispatchSel)r.x) {
           case pass::DispatchSel::IndPDispatchArgs:
             args = bind_.buffers[(int)pass::Buf::PDispatchArgs];
@@ -701,11 +708,16 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
           case pass::DispatchSel::IndSolArgs:
             args = bind_.buffers[(int)pass::Buf::SolArgs];
             break;
+          case pass::DispatchSel::IndDraftArgs:
+            // Six stage records in one buffer; the row's y is its byte offset.
+            args = bind_.buffers[(int)pass::Buf::DraftArgs];
+            argsOff = r.y;
+            break;
           default:
             args = bind_.buffers[(int)pass::Buf::DispatchArgs];
             break;
         }
-        if (args && args->buf) f.CmdDispatchIndirect(cmd_, args->buf, 0);
+        if (args && args->buf) f.CmdDispatchIndirect(cmd_, args->buf, argsOff);
       } else {
         uint32_t x = Extent(r.x, cx), y = Extent(r.y, cx), z = Extent(r.z, cx);
         // A zero-extent dispatch is legal in Vulkan (it does nothing), and the

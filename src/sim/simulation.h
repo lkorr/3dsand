@@ -606,6 +606,25 @@ class Simulation {
   // The rain exposure map buffer, for a gate's readback (rain-lean) only.
   const rhi::Buffer& RainExpoBuffer() const { return rainExpoBuf_; }
 
+  // ---- WIND DRAFTS: the shelter volume (sim_draft.wgsl, world.h kDraft*) ----
+  // For the next EncodeTick: the gate (tuning sim.draftMode) and the box's
+  // origin (TickParams.draftOrigin, world voxels). A change of either, a
+  // material upload, or a fresh buffer makes that tick a REBUILD -- every
+  // chunk of the box re-masked -- and otherwise the box re-masks only its
+  // active chunks. SubmitTick calls it beside the TickParams upload.
+  void SetDraft(bool on, const int32_t origin[3]);
+  // What the renderer may read: the box's origin as last ENCODED, and whether
+  // a solve has been recorded for it (RenderParams.draftMode).
+  bool DraftValid() const { return draftValid_; }
+  // This tick re-masks the whole box and runs the whole solve (a BURST).
+  bool DraftRebuild() const { return draftRebuild_; }
+  const int32_t* DraftOrigin() const { return draftOrigin_; }
+  // The volume and its meta words, for a gate's readback (drafts) only.
+  const rhi::Buffer& DraftBuffer() const { return draftBuf_; }
+  const rhi::Buffer& DraftMetaBuffer() const { return draftMetaBuf_; }
+  // Force the next tick to re-mask the whole box (a gate's purity check).
+  void ForceDraftRebuild() { draftForce_ = true; }
+
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
   // FarField::FullRefill — the cascades are empty (nothing was ever recorded
@@ -807,6 +826,17 @@ class Simulation {
   // SetTickRain derives for the next EncodeTick.
   rhi::Buffer rainExpoBuf_;
   uint32_t rainFallGroups_ = 64, rainExpoGroups_ = 0;
+  // Wind drafts (sim_draft.wgsl): five entry points, the volume (46), its
+  // meta words (47) and the solve's indirect args. draftForce_ starts TRUE:
+  // the first tick after the buffer is made is a rebuild.
+  rhi::ComputePipeline draftMaskAll_, draftMaskDirty_, draftArgs_, draftCoarseBuild_,
+      draftCoarseFaces_, draftCoarseSolve_, draftFineFirst_, draftFineMid_, draftFineMid2_,
+      draftFineLast_;
+  rhi::Buffer draftBuf_, draftMetaBuf_, draftArgsBuf_;
+  bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;
+  bool draftLastOn_ = false;
+  int32_t draftOrigin_[3] = {0, 0, 0};
+  int32_t draftLastOrigin_[3] = {-2147483647 - 1, 0, 0};
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five

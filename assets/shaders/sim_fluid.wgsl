@@ -87,6 +87,9 @@
 @group(0) @binding(3) var<storage, read> materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
+// The wind-draft shelter volume: the surface-node wind (windAtScaledQ) feels
+// walls (common.wgsl WIND DRAFTS). Slim group, same number as simBGL_.
+@group(0) @binding(46) var<storage, read> draftField : array<u32>;
 
 @group(1) @binding(0) var<storage, read_write> fluidParticles : array<FluidParticle>;
 @group(1) @binding(2) var<storage, read_write> fluidBlockMap : array<atomic<u32>>;

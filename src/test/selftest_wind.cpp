@@ -50,6 +50,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <tuple>
 #include <string>
 #include <vector>
 
@@ -58,6 +60,7 @@
 #include "sim/windprim.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -167,6 +170,9 @@ Status GateWind(Ctx& c, std::string& detail) {
   auto run = [&](const WindArm& arm) -> WindResult {
     Tuning t = CurrentTuning();
     t.sim.windMode = arm.mode;
+    // Drafts off: this gate measures the wind COUPLING inside a chamber, and the
+    // draft volume (correctly) stills the air in a chamber. Shelter is `drafts`.
+    t.sim.draftMode = 0;
     // Pinned weather. An evolving field makes two runs incomparable, which is
     // the entire reason weatherAuto exists as a switch (sim/wind.h).
     t.wind.weatherAuto = false;
@@ -467,6 +473,9 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
     t.wind.weatherAuto = false;
     t.wind.windDirDeg = 90.0f;
     t.wind.windSpeed = 2.0f;      // ambient alone cannot entrain sand
+    // Drafts off: this gate measures the wind COUPLING inside a chamber, and the
+    // draft volume (correctly) stills the air in a chamber. Shelter is `drafts`.
+    t.sim.draftMode = 0;
     t.wind.gustStrength = 0.2f;
     const Tuning saved = CurrentTuning();
     SetCurrentTuning(t);
@@ -725,6 +734,9 @@ Status GateWindGas(Ctx& c, std::string& detail) {
     Tuning t = CurrentTuning();
     t.sim.windMode = mode;
     t.wind.weatherAuto = false;   // an evolving field makes arms incomparable
+    // Drafts off: this gate measures the wind COUPLING inside a chamber, and the
+    // draft volume (correctly) stills the air in a chamber. Shelter is `drafts`.
+    t.sim.draftMode = 0;
     t.wind.windDirDeg = dirDeg;
     t.wind.windSpeed = 20.0f;     // past sim.windDriftSpeed: the lean saturates
     // GUSTS TURNED DOWN, and not for convenience. The gust bands carry a
@@ -1102,6 +1114,372 @@ Status GateWindField(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- drafts: the shelter volume (docs/RESEARCH_wind.md §14) ----------------
+//
+// FOUR STONE HUTS ON ONE PAD, the wind pinned along +X, and the claims are the
+// ones the plan makes about what walls do to air:
+//
+//   1. sealed          the transfer at the centre is ~0: a uniform flow cannot
+//                      exist in a closed box.
+//   2. door only       a windward doorway and nothing else: little gets in.
+//   3. door + window   windward doorway, leeward window: a DRAFT threads the
+//                      room, pointing door -> window, at a real fraction of the
+//                      outside wind.
+//   4. door + side     the window on a side wall: the flow inside turns toward
+//                      it.
+//
+// Plus the open air above the roofs is unsheltered, and the alley between two
+// huts is reported (continuity speeds it up). Then the CA, end to end: a smoke
+// puff in hut 1 and in hut 3, the same ticks, and the draft hut must lose its
+// smoke faster and out of the leeward side. Then the two promises that make the
+// volume cheap and sound: a world whose blockers do not change never re-solves
+// (smoke moving is not a geometry change), and a forced rebuild of the same
+// geometry reproduces the field byte for byte (no history).
+//
+// THE TRANSFER IS READ DIRECTLY, not a wind: R_x at a cell is what a unit +X
+// wind becomes there, which is the quantity every claim above is about and the
+// one that does not move with the weather.
+Status GateDrafts(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  uint32_t mStone = 0, mSmoke = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "stone") mStone = (uint32_t)i;
+    else if (c.mats[i].name == "smoke") mSmoke = (uint32_t)i;
+  }
+  if (!mStone || !mSmoke) {
+    detail = "need materials stone and smoke";
+    return Status::Fail;
+  }
+  const Tuning saved = CurrentTuning();
+  Tuning t = saved;
+  t.sim.draftMode = 1;
+  t.sim.windMode = 1;
+  t.wind.weatherAuto = false;
+  t.wind.windDirDeg = 90.0f;   // downwind +X: into every hut's doorway
+  t.wind.windSpeed = (float)BaselineNumber("drafts.windSpeed", 12.0);
+  t.wind.gustStrength = 0.0f;
+  SetCurrentTuning(t);
+
+  // ---- the fixture ----
+  const int cx = 200;
+  const int kHuts = 4;
+  const int czs[kHuts] = {116, 172, 228, 284};
+  const int kHx = 16, kHz = 16, kH = 24;      // walls at +-16, interior 1..24
+  const int kDoorZ = 4, kDoorH = 18;          // doorway: 8 wide, 18 high
+  // Window rows: up to one below the ceiling, so smoke that has risen to the
+  // roof can still find it (6 wide, 7 high, its top row the ceiling's).
+  const int kWin0 = 18, kWin1 = 24;
+  const int y0 = FixtureYOver(cx - 40, czs[0] - 40, cx + 40, czs[kHuts - 1] + 40,
+                              kDefaultSeed, 24, 140);
+  std::map<std::tuple<int, int, int>, uint32_t> fx;
+  for (int x = cx - 40; x <= cx + 40; x++)
+    for (int z = czs[0] - 40; z <= czs[kHuts - 1] + 40; z++) {
+      fx[{x, y0, z}] = mStone;
+      for (int y = 1; y <= kH + 30; y++) fx[{x, y0 + y, z}] = 0u;
+    }
+  for (int h = 0; h < kHuts; h++) {
+    const int cz = czs[h];
+    for (int x = -kHx; x <= kHx; x++)
+      for (int z = -kHz; z <= kHz; z++) fx[{cx + x, y0 + kH + 1, cz + z}] = mStone;
+    for (int y = 1; y <= kH; y++) {
+      for (int z = -kHz; z <= kHz; z++) {
+        const bool door = h > 0 && z >= -kDoorZ && z < kDoorZ && y <= kDoorH;
+        const bool lwin = h == 2 && z >= -3 && z < 3 && y >= kWin0 && y <= kWin1;
+        if (!door) fx[{cx - kHx, y0 + y, cz + z}] = mStone;   // windward wall
+        if (!lwin) fx[{cx + kHx, y0 + y, cz + z}] = mStone;   // leeward wall
+      }
+      for (int x = -kHx; x <= kHx; x++) {
+        const bool swin = h == 3 && x >= -3 && x < 3 && y >= kWin0 && y <= kWin1;
+        fx[{cx + x, y0 + y, cz - kHz}] = mStone;
+        if (!swin) fx[{cx + x, y0 + y, cz + kHz}] = mStone;
+      }
+    }
+  }
+  std::vector<CellOp> build;
+  build.reserve(fx.size());
+  for (const auto& [k, w] : fx)
+    build.push_back({World::SlotCellIndex({std::get<0>(k), std::get<1>(k), std::get<2>(k)}), w});
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  uint32_t tick = 61000;
+  // The fixture chunk -- which the draft box centres on (support.cpp's box
+  // placement) -- is the middle of the row of huts, so all four sit well inside
+  // the box and clear of its 2-cell edge blend.
+  support::TickCursor ticker{c, tick, {cx >> 4, (y0 + 12) >> 4, 200 >> 4}};
+  // ~1M cells: fed in batches under the per-tick cell-op cap
+  // (kMaxCellOpsPerTick), or SubmitTick clamps the rest away.
+  for (size_t i = 0; i < build.size(); i += kMaxCellOpsPerTick) {
+    const size_t n = std::min<size_t>(kMaxCellOpsPerTick, build.size() - i);
+    ticker({}, std::vector<CellOp>(build.begin() + (long)i, build.begin() + (long)(i + n)));
+  }
+  // The solve is a pipeline of kDraftStages ticks; let the last one start and
+  // finish before reading.
+  for (int i = 0; i < 2 * (int)kDraftStages + 2; i++) ticker();
+  ctx.WaitIdle();
+
+  // ---- read the volume ----
+  auto readField = [&](std::vector<uint32_t>& f) {
+    f.assign((size_t)3 * kDraftCells, 0u);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftBuffer(),
+                          (uint64_t)kDraftFieldBase * 4, f.data(), f.size() * 4, "draftField");
+  };
+  auto readMeta = [&](uint32_t m[kDraftMetaWords]) {
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftMetaBuffer(), 0, m,
+                          kDraftMetaWords * 4, "draftMeta");
+  };
+  std::vector<uint32_t> field;
+  readField(field);
+  uint32_t meta0[kDraftMetaWords] = {};
+  readMeta(meta0);
+  const int32_t* o = sim.DraftOrigin();
+  struct R6 { float rx[3], rz[3]; bool in; };
+  auto at = [&](const std::vector<uint32_t>& f, int x, int y, int z) -> R6 {
+    R6 r{};
+    const int dx = (x - o[0]) >> 2, dy = (y - o[1]) >> 2, dz = (z - o[2]) >> 2;
+    if (dx < 0 || dy < 0 || dz < 0 || dx >= (int)kDraftNX || dy >= (int)kDraftNY ||
+        dz >= (int)kDraftNZ)
+      return r;
+    const size_t i = 3 * (size_t)(((uint32_t)dz * kDraftNY + (uint32_t)dy) * kDraftNX + (uint32_t)dx);
+    auto s16 = [](uint32_t v) { return (float)(int16_t)(uint16_t)(v & 0xFFFFu) / 4096.0f; };
+    r.rx[0] = s16(f[i]);
+    r.rx[1] = s16(f[i] >> 16);
+    r.rx[2] = s16(f[i + 1]);
+    r.rz[0] = s16(f[i + 1] >> 16);
+    r.rz[1] = s16(f[i + 2]);
+    r.rz[2] = s16(f[i + 2] >> 16);
+    r.in = true;
+    return r;
+  };
+  auto len3 = [](const float v[3]) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
+
+  std::string out;
+  char buf[512];
+  bool ok = true;
+  auto note = [&](const char* s) { if (!out.empty()) out += "\n  "; out += s; };
+
+  // The centre of each hut, averaged over a 3x3x3 block of cells so one cell's
+  // rounding is not the verdict.
+  auto mean = [&](int x, int y, int z, float rxOut[3]) {
+    rxOut[0] = rxOut[1] = rxOut[2] = 0.0f;
+    int n = 0;
+    for (int dz = -4; dz <= 4; dz += 4)
+      for (int dy = -4; dy <= 4; dy += 4)
+        for (int dx = -4; dx <= 4; dx += 4) {
+          const R6 r = at(field, x + dx, y + dy, z + dz);
+          if (!r.in) continue;
+          for (int a = 0; a < 3; a++) rxOut[a] += r.rx[a];
+          n++;
+        }
+    if (n) for (int a = 0; a < 3; a++) rxOut[a] /= (float)n;
+    return n > 0;
+  };
+  float hut[kHuts][3];
+  for (int h = 0; h < kHuts; h++) {
+    if (!mean(cx, y0 + 12, czs[h], hut[h])) {
+      detail = "the huts are outside the draft volume -- the box did not follow the fixture";
+      SetCurrentTuning(saved);
+      return Status::Fail;
+    }
+  }
+  const float sealedMax = (float)BaselineNumber("drafts.sealedMax", 0.05);
+  const float doorMax = (float)BaselineNumber("drafts.doorOnlyMax", 0.2);
+  const float crossMin = (float)BaselineNumber("drafts.crossMin", 0.3);
+  const float sealed = len3(hut[0]), doorOnly = len3(hut[1]), cross = len3(hut[2]);
+  const float crossDir = cross > 1e-4f ? hut[2][0] / cross : 0.0f;
+  {
+    const bool p = sealed < sealedMax;
+    std::snprintf(buf, sizeof buf, "sealed hut: R (%.3f, %.3f, %.3f), |R| %.3f (< %.2f) %s",
+                  hut[0][0], hut[0][1], hut[0][2], sealed, sealedMax, p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+  // SANDVOX_DRAFT_DUMP=1: R_x along the centre line of every hut, cell by
+  // cell, x then y -- where a residual flow sits says what is leaking.
+  if (std::getenv("SANDVOX_DRAFT_DUMP")) {
+    // The coarse (L1, 8-voxel) potential phi_x and K+ through the sealed hut.
+    std::vector<uint32_t> cw((size_t)kDraftCoarseWords * kDraftCoarseCells);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftBuffer(), (uint64_t)kDraftCoarseBase * 4,
+                          cw.data(), cw.size() * 4, "draftCoarse");
+    auto cAt = [&](int x, int y, int z, int f) -> int32_t {
+      const int X = ((x - o[0]) >> 4), Y = ((y - o[1]) >> 4), Z = ((z - o[2]) >> 4);
+      return (int32_t)cw[(size_t)kDraftCoarseWords * (size_t)((Z * (int)kDraftChunksY + Y) * (int)kDraftChunksX + X) + (size_t)f];
+    };
+    std::printf("drafts dump coarse hut 0 along x: ");
+    for (int x = cx - 24; x <= cx + 24; x += 8) {
+      const int32_t k = cAt(x, y0 + 12, czs[0], 2);
+      std::printf(" [%d phi %.3f K+ %d/%d/%d mem %08x%08x]", x - cx, cAt(x, y0 + 12, czs[0], 0) / 4096.0,
+                  k & 511, (k >> 9) & 511, (k >> 18) & 511,
+                  (uint32_t)cAt(x, y0 + 12, czs[0], 5), (uint32_t)cAt(x, y0 + 12, czs[0], 4));
+    }
+    std::printf("\ndrafts dump coarse hut 0 along y: ");
+    for (int y = -8; y <= kH + 8; y += 8)
+      std::printf(" [%d phi %.3f K+ y %d]", y, cAt(cx, y0 + y, czs[0], 0) / 4096.0,
+                  (cAt(cx, y0 + y, czs[0], 2) >> 9) & 511);
+    std::printf("\ndrafts dump origin %d %d %d, y0 %d\n", o[0], o[1], o[2], y0);
+    if (FILE* fd = std::fopen("build/draft_coarse.bin", "wb")) {
+      std::fwrite(cw.data(), 4, cw.size(), fd);
+      std::fclose(fd);
+    }
+    {
+      std::vector<uint32_t> masks((size_t)2 * kDraftCells);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftBuffer(), 0, masks.data(),
+                            masks.size() * 4, "draftMasks");
+      if (FILE* fd = std::fopen("build/draft_masks.bin", "wb")) {
+        std::fwrite(masks.data(), 4, masks.size(), fd);
+        std::fclose(fd);
+      }
+    }
+    for (int h = 0; h < kHuts; h++) {
+      std::printf("drafts dump hut %d along x (y0+12, cz):", h);
+      for (int x = cx - 24; x <= cx + 24; x += 4) {
+        const R6 r = at(field, x, y0 + 12, czs[h]);
+        std::printf(" [%d %.2f %.2f %.2f]", x - cx, r.rx[0], r.rx[1], r.rx[2]);
+      }
+      std::printf("\ndrafts dump hut %d along y (cx, cz):", h);
+      for (int y = -4; y <= kH + 8; y += 4) {
+        const R6 r = at(field, cx, y0 + y, czs[h]);
+        std::printf(" [%d %.2f %.2f %.2f]", y, r.rx[0], r.rx[1], r.rx[2]);
+      }
+      std::printf("\n");
+    }
+  }
+  {
+    const bool p = doorOnly < doorMax;
+    std::snprintf(buf, sizeof buf, "windward door only: |R| %.3f (< %.2f) %s", doorOnly, doorMax, p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+  {
+    const bool p = cross >= crossMin && crossDir > 0.7f;
+    std::snprintf(buf, sizeof buf,
+                  "door + leeward window: R (%.3f, %.3f, %.3f), |R| %.3f (>= %.2f), along +X %.2f (> 0.7) %s",
+                  hut[2][0], hut[2][1], hut[2][2], cross, crossMin, crossDir, p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+  {
+    // Inside hut 4, between the centre and its side (+Z) window.
+    float s[3];
+    mean(cx, y0 + 16, czs[3] + 8, s);
+    const bool p = s[2] > (float)BaselineNumber("drafts.sideTurnMin", 0.05);
+    std::snprintf(buf, sizeof buf, "door + side window: R toward the window (%.3f, %.3f, %.3f), +Z %s",
+                  s[0], s[1], s[2], p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+  {
+    const R6 top = at(field, cx, y0 + 52, 200);
+    const R6 alley = at(field, cx, y0 + 12, 200);
+    const float dev = std::sqrt((top.rx[0] - 1.0f) * (top.rx[0] - 1.0f) + top.rx[1] * top.rx[1] +
+                                top.rx[2] * top.rx[2]);
+    const bool p = top.in && dev < (float)BaselineNumber("drafts.openDevMax", 0.2);
+    std::snprintf(buf, sizeof buf,
+                  "open air 2.8 m over the roofs: R (%.3f, %.3f, %.3f) %s; alley between huts 2/3: R.x %.3f",
+                  top.rx[0], top.rx[1], top.rx[2], p ? "ok" : "FAIL", alley.rx[0]);
+    note(buf); ok = ok && p;
+  }
+
+  // ---- the CA: smoke in the sealed hut and in the draft hut ----
+  std::vector<CellOp> puff;
+  for (int h : {0, 2})
+    for (int y = 8; y <= 12; y++)
+      for (int z = -3; z < 3; z++)
+        for (int x = -3; x < 3; x++)
+          puff.push_back({World::SlotCellIndex({cx + x, y0 + y, czs[h] + z}), mSmoke});
+  const int kSmokeTicks = (int)BaselineNumber("drafts.smokeTicks", 90);
+  std::map<uint32_t, std::vector<uint32_t>> chunks;
+  auto matAt = [&](int x, int y, int z) -> uint32_t {
+    const uint32_t slot = World::SlotChunkIndex({x >> 4, y >> 4, z >> 4});
+    auto it = chunks.find(slot);
+    if (it == chunks.end()) {
+      std::vector<uint32_t> v((size_t)kChunkVol);
+      ReadVoxelsSync(ctx, world, slot, 1, v.data(), "draftsVox");
+      it = chunks.emplace(slot, std::move(v)).first;
+    }
+    return it->second[World::SlotCellIndex({x, y, z}) % kChunkVol] & 0xFFFu;
+  };
+  // Smoke in the open air just outside the draft hut, summed over samples
+  // every 3 ticks: smoke that leaves is carried off by the outside wind
+  // within a few ticks, so a count at the end would only ever see zero. The
+  // hut's z band +-24, up to 3 m over its roof, 2.2 m out from each wall.
+  uint32_t lee = 0, windward = 0;
+  auto sampleOutside = [&]() {
+    chunks.clear();
+    for (int y = 1; y <= kH + 28; y++)
+      for (int z = czs[2] - 24; z <= czs[2] + 24; z++)
+        for (int x = 1; x <= 22; x++) {
+          if (matAt(cx + kHx + x, y0 + y, z) == mSmoke) lee++;
+          if (matAt(cx - kHx - x, y0 + y, z) == mSmoke) windward++;
+        }
+  };
+  ticker({}, puff);
+  for (int i = 0; i < kSmokeTicks; i++) {
+    ticker();
+    if (i % 3 == 2) {
+      ctx.WaitIdle();
+      sampleOutside();
+    }
+  }
+  ctx.WaitIdle();
+  uint32_t meta1[kDraftMetaWords] = {};
+  readMeta(meta1);
+  chunks.clear();
+  uint32_t inside[2] = {};
+  for (int k = 0; k < 2; k++) {
+    const int cz = czs[k == 0 ? 0 : 2];
+    for (int y = 1; y <= kH; y++)
+      for (int z = -kHz + 1; z < kHz; z++)
+        for (int x = -kHx + 1; x < kHx; x++)
+          if (matAt(cx + x, y0 + y, cz + z) == mSmoke) inside[k]++;
+  }
+  const uint32_t placed = (uint32_t)puff.size() / 2;
+  {
+    // Smoke DECAYS (reactions.json), so the sealed hut's count is a control,
+    // not a sealing claim: it only has to keep enough for the ratio below to
+    // mean something. The claims are the RATIO -- the draft hut empties
+    // faster -- and WHERE it went: out of the leeward window, not the door.
+    const double keepMin = BaselineNumber("drafts.sealedKeepMin", 0.3);
+    const double ratioMax = BaselineNumber("drafts.draftKeepRatioMax", 0.6);
+    const bool p = inside[0] >= keepMin * placed &&
+                   inside[1] <= ratioMax * inside[0] && lee > windward;
+    std::snprintf(buf, sizeof buf,
+                  "smoke after %d ticks (%u placed each): sealed hut keeps %u, draft hut %u; "
+                  "smoke-cell samples outside the draft hut, lee %u vs windward %u %s",
+                  kSmokeTicks, placed, inside[0], inside[1], lee, windward, p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+  {
+    // Smoke moving is not a geometry change: no solve in all those ticks.
+    const bool p = meta1[kDraftMetaSolves] == meta0[kDraftMetaSolves];
+    std::snprintf(buf, sizeof buf, "sleep: solves %u -> %u across %d smoky ticks (last at tick %u) %s",
+                  meta0[kDraftMetaSolves], meta1[kDraftMetaSolves], kSmokeTicks,
+                  meta1[kDraftMetaLastTick], p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+  {
+    // No history: re-mask and re-solve the same geometry from scratch.
+    sim.ForceDraftRebuild();
+    ticker();
+    ctx.WaitIdle();
+    std::vector<uint32_t> again;
+    readField(again);
+    uint32_t meta2[kDraftMetaWords] = {};
+    readMeta(meta2);
+    size_t diff = 0;
+    for (size_t i = 0; i < field.size(); i++) diff += field[i] != again[i];
+    const bool p = meta2[kDraftMetaSolves] == meta1[kDraftMetaSolves] + 1 && diff == 0;
+    std::snprintf(buf, sizeof buf, "purity: forced rebuild solved %u time(s), %zu of %zu field words differ %s",
+                  meta2[kDraftMetaSolves] - meta1[kDraftMetaSolves], diff, field.size(), p ? "ok" : "FAIL");
+    note(buf); ok = ok && p;
+  }
+
+  SetCurrentTuning(saved);
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  detail = out;
+  std::printf("drafts: %s\n  %s\n", ok ? "PASS" : "FAIL", out.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WindGates() {
@@ -1110,6 +1488,7 @@ const std::vector<Gate>& WindGates() {
       {"wind-gas", "sim", {}, false, GateWindGas},
       {"wind-prim", "sim", {}, false, GateWindPrim},
       {"wind-field", "sim", {}, false, GateWindField},
+      {"drafts", "sim", {}, false, GateDrafts},
   };
   return g;
 }

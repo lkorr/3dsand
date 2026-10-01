@@ -1014,6 +1014,10 @@ struct TickParams {
   wfProf : array<vec4<i32>, 4>,
   // kWindTerrWords cells, four to a row: 1024 = 4096 / 4.
   wfTerr : array<vec4<u32>, 1024>,
+  // WIND DRAFTS (world.h kDraft*): the shelter volume's min corner, world
+  // voxels, and its gate (0 = windAtQ is the ambient field exactly).
+  draftOrigin : vec3<i32>,
+  draftMode : u32,
 };
 
 // ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------
@@ -1766,6 +1770,8 @@ struct RenderParams {
   wfThermalK : i32,
   wfProf : array<vec4<i32>, 4>,
   wfTerr : array<vec4<u32>, 1024>,
+  draftOrigin : vec3<i32>,
+  draftMode : u32,
 };
 
 // ---- THE CLOUDS: the shared half (cloud.wgsl, src/sim/weather.h) ----------
@@ -2951,13 +2957,130 @@ fn windPrimAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
   return acc;
 }
 
+// ============================ WIND DRAFTS ==================================
+// docs/RESEARCH_wind.md §14; DESIGN.md §9b "Drafts"; world.h kDraft*;
+// assets/shaders/sim_draft.wgsl builds what is read here.
+//
+// WHAT THIS IS. Inside a box of 4-voxel cells round the player the ambient
+// field is REDIRECTED by the geometry: a sealed room is still, a room with a
+// door to windward and a window to leeward carries a draft between them, a gap
+// between two walls speeds the wind up, a cave goes calm past its mouth. The
+// box does not store a wind. It stores, per cell, the TRANSFER of one: R_x =
+// what a unit horizontal wind along +X at infinity becomes here, R_z the same
+// for +Z (a potential-flow projection with no flow through blockers). The
+// projection is linear and the gust bands' shortest wavelength (8 m) is long
+// next to a room, so the wind inside is
+//     R_x * amb.x + R_z * amb.z + (0, amb.y * open, 0)
+// with `amb` the ambient field AT THE SAMPLE -- the log profile, the gusts, the
+// storm all still arrive, turned and scaled by what the walls let through.
+// Because the transfer is geometry ONLY it is re-solved only on a tick whose
+// blockers changed, so a settled world pays nothing for it (rule 2).
+//
+// THE PRIMITIVES ARE ADDED AFTER, unprojected (a fan indoors is not confined
+// by the room in v1; research doc §14.1).
+//
+// TWO BLOCKS, ONE OF WHICH IS STRIPPED. `draftField` is declared only by the
+// shaders that read the volume (sim_step, sim_particle, sim_fluid, sim_draft,
+// wind_streak, debug_wind); every other shader still compiles windAt/windAtQ,
+// and an identifier in an unreachable function must still resolve. LoadShader
+// (resources.cpp kDraftBound*) keeps the first block for a body that declares
+// `> draftField` and the second for one that does not, exactly as it does the
+// page block; scripts/check_shaders.sh does the same strip.
+// >>>DRAFT_BOUND_BEGIN<<<
+const DRAFT_BOUND : bool = true;
+fn draftWord(i : u32) -> u32 { return draftField[i]; }
+// >>>DRAFT_BOUND_END<<<
+// >>>DRAFT_UNBOUND_BEGIN<<<
+const DRAFT_BOUND : bool = false;
+fn draftWord(i : u32) -> u32 { return 0u; }
+// >>>DRAFT_UNBOUND_END<<<
+
+// Must match world.h kDraft* (check_invariants `drafts`).
+const DRAFT_CELL_SHIFT : u32 = 2u;
+const DRAFT_NX : i32 = 64;
+const DRAFT_NY : i32 = 32;
+const DRAFT_NZ : i32 = 64;
+const DRAFT_FIELD_BASE : u32 = 274432u;
+
+fn draftSext(v : u32) -> i32 { return bitcast<i32>(v << 16u) >> 16u; }
+
+// The transfer at volume cell d (in range), Q12: rx = response to unit +X,
+// rz = response to unit +Z.
+struct DraftR { rx : vec3<i32>, rz : vec3<i32> };
+fn draftAt(d : vec3<i32>) -> DraftR {
+  let i = DRAFT_FIELD_BASE + 3u * u32((d.z * DRAFT_NY + d.y) * DRAFT_NX + d.x);
+  let w0 = draftWord(i);
+  let w1 = draftWord(i + 1u);
+  let w2 = draftWord(i + 2u);
+  return DraftR(vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(w1)),
+                vec3<i32>(draftSext(w1 >> 16u), draftSext(w2), draftSext(w2 >> 16u)));
+}
+fn draftInside(d : vec3<i32>) -> bool {
+  return d.x >= 0 && d.y >= 0 && d.z >= 0 &&
+         d.x < DRAFT_NX && d.y < DRAFT_NY && d.z < DRAFT_NZ;
+}
+
+// THE SIM'S READ: the ambient field `amb` (Q16.16 cells/s, primitives NOT
+// included) at world cell p, sheltered. NEAREST cell: the CA's drift bias is a
+// probability and the particle tier's drag a rate, so a 0.4 m step in the
+// field is invisible to both. Integer end to end (rule 1): amb >> 12 times a
+// Q12 transfer is amb x R in amb's own units, and stays inside i32 for any
+// wind the field can make (|amb| < 2^26, |R| < 2^15).
+fn draftApplyQ(p : vec3<i32>, amb : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if (!DRAFT_BOUND || (*T).draftMode == 0u) { return amb; }
+  let d = (p - (*T).draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
+  if (!draftInside(d)) { return amb; }
+  let r = draftAt(d);
+  let ax = amb.x >> 12u;
+  let az = amb.z >> 12u;
+  var o = r.rx * ax + r.rz * az;
+  let open = min(4096, (abs(r.rx.x) + abs(r.rz.z)) >> 1u);
+  o.y += (amb.y >> 12u) * open;
+  return o;
+}
+
+// THE RENDER'S READ: the same transfer, TRILINEAR between cell centres, so a
+// streak crossing a doorway turns smoothly instead of in 0.4 m steps. A tap
+// outside the volume is the identity (no shelter), which with the solver's
+// own edge blend makes the box's face invisible.
+fn draftTapF(d : vec3<i32>, rx : ptr<function, vec3f>, rz : ptr<function, vec3f>, w : f32) {
+  if (draftInside(d)) {
+    let r = draftAt(d);
+    *rx += vec3f(r.rx) * (w / 4096.0);
+    *rz += vec3f(r.rz) * (w / 4096.0);
+  } else {
+    *rx += vec3f(w, 0.0, 0.0);
+    *rz += vec3f(0.0, 0.0, w);
+  }
+}
+fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if (!DRAFT_BOUND || (*R).draftMode == 0u) { return amb; }
+  let q = (p - vec3f((*R).draftOrigin)) * 0.25 - vec3f(0.5);
+  let b = vec3<i32>(floor(q));
+  if (b.x < -1 || b.y < -1 || b.z < -1 ||
+      b.x >= DRAFT_NX || b.y >= DRAFT_NY || b.z >= DRAFT_NZ) { return amb; }
+  let f = q - floor(q);
+  var rx = vec3f(0.0);
+  var rz = vec3f(0.0);
+  for (var k = 0u; k < 8u; k++) {
+    let o = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32(k >> 2u));
+    let wv = select(vec3f(1.0) - f, f, o == vec3<i32>(1));
+    draftTapF(b + o, &rx, &rz, wv.x * wv.y * wv.z);
+  }
+  let open = clamp((abs(rx.x) + abs(rz.z)) * 0.5, 0.0, 1.0);
+  return rx * amb.x + rz * amb.z + vec3f(0.0, amb.y * open, 0.0);
+}
+
 // THE FIELD. Everything above exists so that this and the per-blade path are
 // the same arithmetic. Call this unless you need per-instance decorrelation.
 fn windAt(p : vec3f, t : f32, R : ptr<uniform, RenderParams>) -> vec3f {
   let s = windSampleAt(p, t, 0.0, R);
-  return windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
-                       + windBandWS(s, s.b2) * WIND_BAND_W2
-                       + windPrimAt(p, R);
+  // The ambient part sheltered by the draft volume, then the primitives on
+  // top -- windAtQ's order, so the render and the sim agree on what a wall
+  // does to the weather and on what it does not do to a fan.
+  let amb = windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
+                          + windBandWS(s, s.b2) * WIND_BAND_W2;
+  return draftApplyF(p, amb, R) + windPrimAt(p, R);
 }
 
 // THE FIELD, scaled by a dev multiplier. Used by the PARTICLE TIER (ballistic
@@ -3597,10 +3720,13 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   // fan feel like it is blowing INTO weather instead of switching the weather
   // off inside a box — and it is why a gust bolt fired downwind carries further
   // than one fired upwind with no code saying so.
-  return vec3<i32>(wq(dl.x, spd), 0, wq(dl.y, spd)) + extra +
-         vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
-         vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z)) +
-         windPrimAtQ(p, T);
+  //
+  // THE DRAFT VOLUME shelters the ambient part only (the WIND DRAFTS block
+  // above): walls turn and stop the weather; a fan is added after, as before.
+  let amb = vec3<i32>(wq(dl.x, spd), 0, wq(dl.y, spd)) + extra +
+            vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
+            vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z));
+  return draftApplyQ(p, amb, T) + windPrimAtQ(p, T);
 }
 
 // ============================ THE CURRENT FIELD =============================

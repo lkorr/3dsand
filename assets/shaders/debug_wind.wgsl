@@ -24,6 +24,10 @@
 
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+// The wind-draft shelter volume (renderBGL_ 35, vertex): the F4 arrows call
+// windAt, so they draw the sheltered field -- the draft through a doorway is
+// what they are for.
+@group(0) @binding(35) var<storage, read> draftField : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,

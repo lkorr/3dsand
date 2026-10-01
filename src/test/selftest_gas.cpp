@@ -594,6 +594,9 @@ Status GateGasReenter(Ctx& c, std::string& detail) {
     t.wind.weatherAuto = false;
     t.wind.windDirDeg = 90.0f;
     t.wind.windSpeed = 20.0f;
+    // Drafts off: this gate measures the wind COUPLING inside a chamber, and the
+    // draft volume (correctly) stills the air in a chamber. Shelter is `drafts`.
+    t.sim.draftMode = 0;
     t.wind.gustStrength = 0.1f;
     SetCurrentTuning(t);
   }
@@ -942,6 +945,9 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
       t.sim.gasMode = (int)kGasModeWall;
       t.render.farPlumeStrength = 1.0f;
       t.sim.windMode = windEast ? (int)kWindModeDrift : (int)kWindModeOff;
+      // Drafts off: this gate measures the wind COUPLING inside a chamber, and the
+      // draft volume (correctly) stills the air in a chamber. Shelter is `drafts`.
+      t.sim.draftMode = 0;
       t.wind.weatherAuto = false;
       t.wind.windDirDeg = 90.0f;     // +x, as the `wind-gas` gate establishes
       t.wind.windSpeed = 20.0f;

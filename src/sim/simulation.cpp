@@ -361,6 +361,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // written by its own row, read by the CA. simBGL_ only. 45 is the
         // first free slot of this dense 0..44 layout.
         entry(45, T::Storage),         // rainExpo (per lattice texel)
+        // The wind-draft shelter volume (sim_draft.wgsl, world.h kDraft*):
+        // masks + coarse solver + transfer field, and its meta words (the
+        // changed flag, counters, the solve's args stage). 46 is ALSO in
+        // simSlimBGL_: windAtQ reads it through common.wgsl, and sim_particle
+        // / sim_fluid run on the slim layout -- one identifier, one number.
+        entry(46, T::Storage),         // draft (masks | coarse | field)
+        entry(47, T::Storage),         // draftMeta (atomic words)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -401,6 +408,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // `far`/`fardown` build on this layout and both reach genCellIn's biome
         // sampler, which reads the map.
         entry(31, T::ReadOnlyStorage), // worldMap
+        // Same binding number as in simBGL_: the particle and MPM wind sites
+        // reach windAtQ, which reads the draft volume (common.wgsl WIND DRAFTS).
+        entry(46, T::Storage),         // draft
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -670,6 +680,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // `wind_streak` row just advected, read by the ribbon draw's VERTEX
         // stage. BeginRendering's flush is the compute->vertex barrier.
         entry(33, T::ReadOnlyStorage, S::Vertex),                 // windStreaks
+        // THE WIND-DRAFT VOLUME (sim_draft.wgsl): the F4 arrows' vertex stage
+        // calls windAt, which shelters the ambient field by it. Written on the
+        // TICK command buffer, covered by the global barrier every command
+        // buffer opens with.
+        entry(35, T::ReadOnlyStorage, S::Vertex),                 // draft
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -766,6 +781,26 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   rainExpoBuf_ = CreateBuffer(
       device, (uint64_t)rainlat::kExpoMaxAxis * rainlat::kExpoMaxAxis * 4,
       rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc, "rainExpo");
+  // The wind-draft volume (world.h kDraft*). ZEROED: the masks a solve
+  // compares against start as an all-air box, and the field as "no wind"
+  // until the first (forced) rebuild tick solves it -- the renderer does not
+  // read it before then (DraftValid).
+  {
+    using U = rhi::BufferUsage;
+    draftBuf_ = CreateBuffer(device, (uint64_t)kDraftWords * 4,
+                             U::Storage | U::CopySrc | U::CopyDst, "draft");
+    draftMetaBuf_ = CreateBuffer(device, (uint64_t)kDraftMetaWords * 4,
+                                 U::Storage | U::CopySrc | U::CopyDst, "draftMeta");
+    draftArgsBuf_ = CreateBuffer(device, 16 * kDraftStages, U::Indirect | U::CopyDst, "draftArgs");
+    const std::vector<uint32_t> zero((size_t)kDraftWords, 0u);
+    device.GetQueue().WriteBuffer(draftBuf_, 0, zero.data(), zero.size() * 4);
+    device.GetQueue().WriteBuffer(draftMetaBuf_, 0, zero.data(), kDraftMetaWords * 4);
+    uint32_t args0[4 * kDraftStages] = {};
+    for (uint32_t s = 0; s < kDraftStages; s++) args0[4 * s + 1] = args0[4 * s + 2] = 1u;
+    device.GetQueue().WriteBuffer(draftArgsBuf_, 0, args0, sizeof(args0));
+    draftForce_ = true;
+    draftValid_ = false;
+  }
   BuildSimBindGroups(device);
   for (int page = 0; page < 2; page++) {
     rhi::BindGroupEntry pentries[] = {
@@ -930,6 +965,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The gust streaks' pool (wind_streak.wgsl `update`), read-modify-
         // written once a frame; the draw reads it at renderBGL_ 33.
         entry(22, T::Storage),         // windStreaks
+        // The wind-draft volume: the streak update advects by windAt, which
+        // reads it (written on the tick command buffer).
+        entry(24, T::ReadOnlyStorage), // draft
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1164,6 +1202,8 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(43, solSpecBuf_),
         b(44, world_->solStage),
         b(45, rainExpoBuf_),
+        b(46, draftBuf_),
+        b(47, draftMetaBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1180,6 +1220,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(24, world_->waterBodyState),
         b(26, treeAtlasBuf_),
         b(31, worldMapBuf_),
+        b(46, draftBuf_),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -1260,6 +1301,9 @@ void Simulation::UploadTables(const rhi::Queue& queue,
                               const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
   anyRepose_ = false;
+  // Which materials block the wind (sim_draft.wgsl draftBlocks) may have
+  // changed: the next tick re-masks the whole draft box.
+  draftForce_ = true;
   for (size_t i = 0; i < mats.size() && i < 4096; i++) {
     table[i] = mats[i].gpu;
     // Cond::ReposeActive. Latched HERE rather than tested per tick: it is a
@@ -1769,6 +1813,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mWorldgen, mMutate, mCompact, mStep, mOcc, mPick;
   // The rain exposure map (sim_rain_expo.wgsl): one tick entry on simPL_.
   rhi::ShaderModule mRainExpo;
+  rhi::ShaderModule mDraft;
   // The solute layer's allocator, diffusion, compaction and hash
   // (docs/PLAN_solutes.md). Its own module: the CA carries mass through its
   // liquid moves and this file does everything else.
@@ -1815,6 +1860,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mWorldgen, "worldgen.wgsl");
     mod(&mMutate, "sim_mutate.wgsl");
     mod(&mRainExpo, "sim_rain_expo.wgsl");
+    mod(&mDraft, "sim_draft.wgsl");
     mod(&mCompact, "sim_compact.wgsl");
     mod(&mStep, "sim_step.wgsl");
     mod(&mSolute, "sim_solute.wgsl");
@@ -1919,6 +1965,16 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake"); });
   pool.Add([&] { rainFall_ = MakeComputePipeline(device, simPL_, mMutate, "rainFall", "rainFall"); });
   pool.Add([&] { rainExpo_ = MakeComputePipeline(device, simPL_, mRainExpo, "build", "rainExpo"); });
+  pool.Add([&] { draftMaskAll_ = MakeComputePipeline(device, simPL_, mDraft, "maskAll", "draftMaskAll"); });
+  pool.Add([&] { draftMaskDirty_ = MakeComputePipeline(device, simPL_, mDraft, "maskDirty", "draftMaskDirty"); });
+  pool.Add([&] { draftArgs_ = MakeComputePipeline(device, simPL_, mDraft, "args", "draftArgs"); });
+  pool.Add([&] { draftCoarseBuild_ = MakeComputePipeline(device, simPL_, mDraft, "coarseBuild", "draftCoarseBuild"); });
+  pool.Add([&] { draftCoarseFaces_ = MakeComputePipeline(device, simPL_, mDraft, "coarseFaces", "draftCoarseFaces"); });
+  pool.Add([&] { draftCoarseSolve_ = MakeComputePipeline(device, simPL_, mDraft, "coarseSolve", "draftCoarseSolve"); });
+  pool.Add([&] { draftFineFirst_ = MakeComputePipeline(device, simPL_, mDraft, "fineFirst", "draftFineFirst"); });
+  pool.Add([&] { draftFineMid_ = MakeComputePipeline(device, simPL_, mDraft, "fineMid", "draftFineMid"); });
+  pool.Add([&] { draftFineMid2_ = MakeComputePipeline(device, simPL_, mDraft, "fineMid2", "draftFineMid2"); });
+  pool.Add([&] { draftFineLast_ = MakeComputePipeline(device, simPL_, mDraft, "fineLast", "draftFineLast"); });
   // The solute POUR (world.h CellOpSolute): in the mutate module because it
   // writes voxels (the powder a pour with no solvent leaves).
   pool.Add([&] { solPour_ = MakeComputePipeline(device, simPL_, mMutate, "solPour", "solPour"); });
@@ -2069,7 +2125,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // skipped far row is a missing horizon rather than a wrong sim. Their
   // verdict is checked where they are published (PublishFarPipelines).
   if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
-      !mutateCells_ || !windWake_ || !rainFall_ || !rainExpo_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !mutateCells_ || !windWake_ || !rainFall_ || !rainExpo_ ||
+      !draftMaskAll_ || !draftMaskDirty_ || !draftArgs_ || !draftCoarseBuild_ || !draftCoarseFaces_ ||
+      !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
@@ -2352,6 +2410,9 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::RayStart:            return rayStartBuf_;
     case B::RainMap:             return rainMapBuf_;
     case B::RainExpo:            return rainExpoBuf_;
+    case B::Draft:               return draftBuf_;
+    case B::DraftMeta:           return draftMetaBuf_;
+    case B::DraftArgs:           return draftArgsBuf_;
     case B::WindStreaks:         return windStreakBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
@@ -2407,6 +2468,16 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::WindWake:       return windWake_;
     case P::RainFall:       return rainFall_;
     case P::RainExpo:       return rainExpo_;
+    case P::DraftMaskAll:   return draftMaskAll_;
+    case P::DraftMaskDirty: return draftMaskDirty_;
+    case P::DraftArgsP:     return draftArgs_;
+    case P::DraftCoarseBuild: return draftCoarseBuild_;
+    case P::DraftCoarseFaces: return draftCoarseFaces_;
+    case P::DraftCoarseSolve: return draftCoarseSolve_;
+    case P::DraftFineFirst:   return draftFineFirst_;
+    case P::DraftFineMid:     return draftFineMid_;
+    case P::DraftFineMid2:    return draftFineMid2_;
+    case P::DraftFineLast:    return draftFineLast_;
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;
@@ -2696,6 +2767,37 @@ void Simulation::SetTickRain(uint32_t rainWord, int32_t slopeQx, int32_t slopeQz
   }
 }
 
+// The draft box's rebuild verdict for the next EncodeTick. A rebuild re-masks
+// every chunk of the box (maskAll) and always solves; otherwise only the
+// active chunks are re-masked and the solve runs if one of them changed. The
+// verdict must be a pure function of the tick input stream for the field to
+// be one: the box moved (its origin rides TickParams), the gate flipped, the
+// materials were re-uploaded, or the buffer is new -- each of which a replay
+// reproduces at the same tick.
+void Simulation::SetDraft(bool on, const int32_t origin[3]) {
+  static_assert(kDraftChunks == 2048, "pass_table.def draftMaskAll's literal extent");
+  static_assert(kDraftTiles == 256, "sim_draft.wgsl DRAFT_TILES");
+  static_assert(kDraftStages == 6 && kDraftMetaArgs == 8,
+                "pass_table.def copy_draftArgs (32, 96) and the rows' stage offsets");
+  draftOn_ = on;
+  const bool moved = origin[0] != draftLastOrigin_[0] || origin[1] != draftLastOrigin_[1] ||
+                     origin[2] != draftLastOrigin_[2];
+  draftRebuild_ = on && (draftForce_ || moved || !draftLastOn_);
+  if (on) {
+    for (int i = 0; i < 3; i++) {
+      draftOrigin_[i] = origin[i];
+      draftLastOrigin_[i] = origin[i];
+    }
+    if (draftRebuild_) {
+      draftForce_ = false;
+      draftValid_ = true;   // this tick records a solve for this origin
+    }
+  } else {
+    draftValid_ = false;
+  }
+  draftLastOn_ = on;
+}
+
 void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
   // The per-FRAME table carries two systems now: the voxel shadow cache and
   // the clouds. Each has its own row condition, so this records whichever of
@@ -2982,6 +3084,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // The rain lattice's extents (SetTickRain, from this tick's TickParams).
   cx.rainFallGroups = rainFallGroups_;
   cx.rainExpoGroups = rainExpoGroups_;
+  // Wind drafts (SetDraft): the gate and this tick's rebuild verdict.
+  cx.draftOn = draftOn_;
+  cx.draftRebuild = draftRebuild_;
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
   cx.expCount = expCount;
@@ -3290,6 +3395,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(32, rayStartBuf_),
         b(34, rainMapBuf_),
         b(33, windStreakBuf_),
+        b(35, draftBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3381,6 +3487,7 @@ void Simulation::BuildShadowBindGroup() {
       b(21, rayStartBuf_),
       b(23, rainMapBuf_),
       b(22, windStreakBuf_),
+      b(24, draftBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

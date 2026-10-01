@@ -190,13 +190,18 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Full-world on hash ticks, dirty-list only otherwise. The hash-tick "
      "spike every 15 ticks is this row."},
     {"wind", "Wind + Rain", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "windWake;rainFall;rainExpo",
+     "windWake;rainFall;rainExpo;"
+     "draftMaskAll;draftMaskDirty;draftArgs;draftCoarseBuild;draftCoarseFaces;"
+     "draftCoarseSolve;draftFineFirst;draftFineMid;draftFineMid2;draftFineLast",
      "windAt() is a pure function evaluated in the kernels that need it; only "
      "the wake pass is separately timed. rainFall is the rain-on-the-ground "
      "fall-line sampler (wets while it rains, dries top surfaces while it does "
      "not): every tick, one thread per 8x8 key tile of the slanted lattice. "
      "rainExpo is the rain exposure map the CA's douse and damp rules read: "
-     "only on rain or wet ticks, one fall line per 4x4 key texel."},
+     "only on rain or wet ticks, one fall line per 4x4 key texel. The draft* "
+     "rows are the shelter volume (sim_draft.wgsl): the row masks of the box "
+     "round the player (the active chunks inside it, or all of it when it "
+     "moves), then a solve that dispatches zero groups unless a mask moved."},
     {"readback", "Async Readback", "simTick", PerfSide::Cpu, PerfScope::Readback,
      "", "Map callbacks + the 3x3x3 CPU mirror rebuild. One tick latent, never "
      "blocking — if this is large the mirror copy is the reason. The blocking "

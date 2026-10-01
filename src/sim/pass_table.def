@@ -374,6 +374,49 @@ PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPAT
 PASS(rainExpo, "rainExpo", PT_TICK, PIPE_RAIN_EXPO, K_COMPUTE, D_RAINEXPO,1,1, GRP_SIM, DYN_ZERO, C_RAINEXPO, 1,
      USES(R(Materials) U(TickUBO) R(Voxels) R(PageTable) W(RainExpo)))
 
+// ---- WIND DRAFTS: the shelter volume (assets/shaders/sim_draft.wgsl) -------
+// docs/RESEARCH_wind.md 14. Before the CA, after every mutation of the tick:
+// the row masks of the box round the player (all of it on a rebuild tick,
+// else its ACTIVE chunks off the CA's own dispatch list), one thread that arms
+// the solve only if a mask moved, and the two solve rows -- indirect on that
+// thread's args, so they dispatch ZERO groups on a tick whose blockers did not
+// change. The field they write is a pure function of the masks (no history),
+// read by the CA, the particle and MPM wind sites, and the frame's streaks and
+// arrows. Nothing at all is recorded on a settled tick or at sim.draftMode 0.
+// D_DRAFTCHUNKS is a literal (pass_table.cpp does not see world.h):
+// kDraftChunks = 2048, static_assert-ed in simulation.cpp.
+PASS(draftMaskAll, "draft", PT_TICK, PIPE_DRAFT_MASK_ALL, K_COMPUTE, 2048,1,1, GRP_SIM, DYN_ZERO, C_DRAFTALL, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) RW(Draft) A(DraftMeta)))
+PASS(draftMaskDirty, "draft", PT_TICK, PIPE_DRAFT_MASK_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFTDIRTY, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) R(DirtyList) I(DispatchArgs) RW(Draft) A(DraftMeta)))
+PASS(draftArgs, "draft", PT_TICK, PIPE_DRAFT_ARGS, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(U(TickUBO) A(DraftMeta)))
+// kDraftMetaArgs * 4 = 32 bytes into draftMeta: six stage records of 16
+// bytes. Each solve row reads ITS stage's record: the y field of an
+// IND_DRAFTARGS row is the byte offset (vk_record.cpp).
+PASS(copy_draftArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 32,0,96, GRP_NONE, DYN_NONE, C_DRAFT, 1,
+     USES(TR(DraftMeta) TW(DraftArgs)))
+// The solve, a PIPELINE of six stages one tick apart (sim_draft.wgsl `args`):
+// each chunk's air pocket + the coarse faces between pockets; the coarse
+// potential (one workgroup, in workgroup memory); four overlapping-tile passes
+// over the fine grid, the last publishing the field. Every row is recorded
+// whenever C_DRAFT holds and reads its own stage's args, so all but (at most)
+// one stage dispatch zero groups -- except on a BURST tick, which runs them all.
+PASS(draftCoarseBuild, "draft", PT_TICK, PIPE_DRAFT_CBUILD, K_INDIRECT, IND_DRAFTARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftCoarseFaces, "draft", PT_TICK, PIPE_DRAFT_CFACES, K_INDIRECT, IND_DRAFTARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftCoarseSolve, "draft", PT_TICK, PIPE_DRAFT_CSOLVE, K_INDIRECT, IND_DRAFTARGS,16,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftFineFirst, "draft", PT_TICK, PIPE_DRAFT_FINE1, K_INDIRECT, IND_DRAFTARGS,32,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftFineMid, "draft", PT_TICK, PIPE_DRAFT_FINE2, K_INDIRECT, IND_DRAFTARGS,48,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftFineMid2, "draft", PT_TICK, PIPE_DRAFT_FINE2B, K_INDIRECT, IND_DRAFTARGS,64,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARGS,80,0, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
+     USES(I(DraftArgs) RW(Draft)))
+
 // ---- phase 3: the CA loop -------------------------------------------------
 // 27 colors x 2 gravity substeps, one workgroup per dirty chunk. A settled
 // world dispatches zero workgroups here (DESIGN.md §11). DYN_CA feeds iteration
@@ -417,7 +460,7 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
-          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo)))
+          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //
@@ -636,7 +679,7 @@ PASS(copy_pArgs_pDispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NO
 PASS(particleIntegrate, "particleIntegrate+args2", PT_TICK, PIPE_P_INTEGRATE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) RW(ParticlesRead) I(PDispatchArgs)
-          W(ParticlesWrite) A(ParticleCounts) A(Claim) R(PageTable)))
+          W(ParticlesWrite) A(ParticleCounts) A(Claim) R(PageTable) R(Draft)))
 PASS(particleArgs2, "particleIntegrate+args2", PT_TICK, PIPE_P_ARGS2, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
 // This second copy overwrites the args the integrate dispatch above FETCHED —
@@ -1239,7 +1282,7 @@ PASS(ray_start_trace, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_TRACE, K_COMPUT
 // BeginRendering's FlushForRenderDomain covers. C_STREAKS = streakAlpha > 0.
 PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_STREAKGX,1,1,
      GRP_SHADOW, DYN_NONE, C_STREAKS, 1,
-     USES(U(RenderUBO) RW(WindStreaks)))
+     USES(U(RenderUBO) RW(WindStreaks) R(Draft)))
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))
@@ -1452,7 +1495,7 @@ PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND
      GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) R(FluidBlockList)
           RW(FluidGrid) A(FluidBlockMap) A(FluidArgsStage)
-          I(FluidDispatchArgs)))
+          I(FluidDispatchArgs) R(Draft)))
 // Pure gather for the fluid itself: each thread writes only its own particle,
 // so g2p cannot race itself (the mark/apply split rule does not bite here).
 // The splash coupling adds two writes: fast free-surface particles append

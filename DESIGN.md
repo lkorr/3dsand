@@ -15015,7 +15015,13 @@ float ones by at most 1 LSB (3 on gust) over 30,770 sampled ticks.
    input a replay reproduces). It is WORLDGEN height: digging a pit or building
    a wall does not change the wind there. Accepted for now; a live-grid ground
    term would need the CPU mirror or a GPU reduction, and both are bigger than
-   the effect. The weather is still not stored anywhere.
+   the effect. The weather is still not stored anywhere. **Amended again 2026-09-30: the
+   DRAFT VOLUME is the second stored field** (`sim_draft.wgsl`, "Drafts" below):
+   a per-cell TRANSFER of the wind round the player, a function of the voxel
+   geometry inside the box and its origin -- never of the weather -- rebuilt
+   from the grid, never saved, not hashed on its own. The one piece of history
+   is its solve pipeline's stage word (a solve in flight); a load or a replay
+   start bursts a full solve instead.
 2. **One authoritative field implementation, in `common.wgsl`.** Every consumer
    samples it; none builds its own bands. This is why the debug overlay is
    evidence rather than decoration — it calls the same function the grass
@@ -15272,12 +15278,119 @@ makes resting voxels move without a CPU-visible cause lands in the same hole,
 and the tell is a non-zero page-fault count with no obvious lost voxel near the
 thing you were testing.
 
+### Drafts: the shelter volume (phase 6, landed 2026-09-30)
+
+`docs/RESEARCH_wind.md` §14 is the model; `assets/shaders/sim_draft.wgsl` the
+solver; common.wgsl's WIND DRAFTS block the reader; `world.h` kDraft* the
+layout; `--gate drafts` the proof.
+
+**What it does.** Inside a box round the player (64 x 32 x 64 cells of 4
+voxels = 25.6 x 12.8 x 25.6 m, chunk-aligned, snapped to even chunks so it
+moves every 3.2 m) the ambient field is redirected by geometry. A sealed room is
+still, a room with one opening barely stirs, a door to windward and a window to
+leeward carry a draft between them, a gap between two buildings speeds the wind
+up, and a cave goes calm past its mouth. Every sim consumer sees it (CA drift
+bias and entrainment, ballistic particles, MPM surface nodes, through `windAtQ`),
+and so do the gust streaks and the F4 arrows (through `windAt`). Grass sway does
+not, because the raymarch fragment shader has no register headroom. Neither do
+the clouds, which have no use for it.
+
+**What it stores is a TRANSFER, not a wind.** Per cell, R_x is what a unit
+horizontal wind along +X at infinity becomes there, and R_z the same for +Z.
+They come from a porous-media potential-flow projection: no flux through
+blockers, free stream on the box's faces. The reader applies them to the
+ambient field AT THE SAMPLE:
+`R_x * amb.x + R_z * amb.z + (0, amb.y * open, 0)`, then adds the primitives
+unprojected. The projection is linear, and the gust bands' shortest wavelength
+(8 m) is long next to a room, so the log profile, the gusts and the storm all
+still arrive, turned and scaled. Because the transfer depends on geometry only,
+it is re-solved only when a blocker inside the box changes.
+
+**The grid.** Each cell keeps three 16-bit ROW masks. The open fraction of a
+face is the share of 4-voxel rows that pass through both cells, so a one-voxel
+wall closes a face while an 8-voxel doorway or a 2x2 window stays partly open.
+The blockers are the ray blockers minus PASSABLE materials (leaves, vines).
+Two rules close the leaks that a cell being a single node otherwise opens:
+
+- **The slab rule.** A cell with every row on some axis blocked (a floor, a
+  roof, a wall) is solid. Without it, the air on the two sides of a thin slab
+  was one node.
+- **The pocket rule.** Each coarse cell keeps only its largest air pocket.
+  Without it, the coarse cell at a roof/wall corner joined the room to the air
+  diagonally outside, and every building leaked at its edges: a sealed hut
+  measured 5% of the outside wind, a one-door hut a quarter.
+
+A closed cell takes the mean of its open neighbours' transfer, so smoke pooled
+under a ceiling or a grain against a wall moves with the room rather than
+sitting in dead air.
+
+**The solve.** All integer: phi is Q12 in fine-cell units, a face coefficient is
+Q8, and the sweeps are red-black.
+
+1. `maskAll` / `maskDirty` compute the row masks: all of the box on a rebuild,
+   else only the CA's active chunks inside it.
+2. `args` drives the pipeline.
+3. `coarseBuild` finds each chunk's air pocket and packs the fine faces.
+4. `coarseFaces` sums the coarse faces between pockets.
+5. `coarseSolve` relaxes the 16 x 8 x 16 coarse potential by SOR, in ONE
+   workgroup's memory.
+6. `fineFirst/Mid/Mid2/Last` are four overlapping-tile (Schwarz) passes over
+   8³-cell tiles plus a 2-cell halo. The last pass publishes the field.
+
+**It is a pipeline, one stage a tick:** pocket and faces, coarse solve, then
+the four fine passes. A solve starts when a mask has moved and none is in
+flight, so a burning house costs one stage a tick, and the field it publishes
+lags its geometry by at most 6 ticks. **A BURST** (TickParams.draftMode bit 1)
+runs every stage in one tick. It fires when the box moved or when the gate, the
+materials or the buffer is new, because the field must match the box's new
+origin before anything reads it.
+
+**Cost** (RTX 3060 Ti, `--perf`, all draft rows summed, per frame):
+
+| Scene | Cost |
+|---|---|
+| Settled world | ~0 (C_DRAFT is false, nothing recorded) |
+| `explosion` (debris re-solving the box continuously) | 166 µs |
+| `forestfire` (a 22 ms frame) | 538 µs |
+| `flythrough` (bursts as the box follows) | 53 µs |
+
+Before the pipeline, a whole solve every changing tick cost 668 µs in
+`explosion` and 2.4 ms in `forestfire`. The first layout, a one-workgroup
+multigrid at 8 voxels, cost ~20 ms a solve: one SM walking 16k cells through
+L2.
+
+**Accuracy** (`--gate drafts`: four 3 m huts on a pad, wind along +X, the
+transfer read back):
+
+| Hut | Result |
+|---|---|
+| Sealed | 0.037 of the outside wind |
+| Windward door only | 0.035 |
+| Door + leeward window | 0.42, 98% along +X |
+| Door + side window | turns toward the window |
+| Alley between huts | 1.27 |
+| Open air 2.8 m over the roofs | 1.05 |
+
+A smoke puff run through the CA leaves the draft hut out of its leeward window
+(277 samples lee, 0 windward), while the sealed hut keeps its smoke. Not
+modelled: turbulent wakes (the calm pocket behind a wall is about one wall high,
+not ten), the stack effect (phase 5's heat term would enter as a pressure source
+in this solve), fans confined by walls, and structures outside the box. The
+wind-coupling gates (`wind`, `wind-gas`, `wind-prim`, `gas-reenter`,
+`gas-farplume`) pin `sim.draftMode 0`, because their chambers are, correctly,
+still air with drafts on.
+
+Knobs: `sim.draftMode` (the gate; 0 is an exact identity, nothing is recorded),
+`sim.draftCoarseSweeps`, `sim.draftFineSweeps`. Diagnose with
+`SANDVOX_DRAFT_DUMP=1 --gate drafts`, which prints per-hut profiles and writes
+`build/draft_coarse.bin` / `draft_masks.bin`.
+
 ### Phases remaining
 
 | # | Scope | Hash risk |
 |---|---|---|
 | 5 | Per-chunk hot-material counts → updraft term; violent wind promoting voxels to particles; capes when cloth exists | rebaseline |
-| 6 | **Drafts through openings** — a small, local, coarse, sleeping relaxation volume, so a room with a door and a window carries a draft and smoke finds the exits. The first requirement the pure function cannot satisfy, because the answer depends on geometry. RESEARCH_wind.md §11 | rebaseline |
+| 6 | ~~Drafts through openings~~ **LANDED 2026-09-30** -- see "Drafts: the shelter volume" above | -- |
 
 Phase 4b, the flip, is **done**: `882a30f3` -> `47dd1520`. What the rebaseline
 established, beyond the sim being self-consistent: `sleep` still reports **0 of

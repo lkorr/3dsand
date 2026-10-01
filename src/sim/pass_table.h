@@ -271,6 +271,15 @@ enum class Buf : uint8_t {
   SolSpec,
   SolArgs,
   SolStage,   // eviction / restore staging (world.h kSolStage*), binding 44
+  // ---- wind drafts: the shelter volume (sim_draft.wgsl, world.h kDraft*) ----
+  // Draft is the volume (row masks, coarse solver, transfer field), binding 46:
+  // written by the draft rows before the CA, read by the CA, the particle and
+  // MPM wind sites, and the streak update / F4 arrows in the frame. DraftMeta
+  // (binding 47) is the changed flag, counters and the args stage; DraftArgs
+  // is indirect-only and never bound, like SolArgs.
+  Draft,
+  DraftMeta,
+  DraftArgs,
   kCount,
 };
 
@@ -384,6 +393,10 @@ enum class Pipe : uint8_t {
   // The solute layer (sim_solute.wgsl). BEFORE ShadowResolve: RecordTable
   // hands the recorder pipelines up to that enumerator only.
   SolWant, SolArgsP, SolAlloc, SolDiffuse, SolCompact, SolScoop, SolPour, SolHash, SolEvict, SolRestore,
+  // Wind drafts (sim_draft.wgsl). BEFORE ShadowResolve for the copy loop's
+  // bound stated above.
+  DraftMaskAll, DraftMaskDirty, DraftArgsP, DraftCoarseBuild, DraftCoarseFaces,
+  DraftCoarseSolve, DraftFineFirst, DraftFineMid, DraftFineMid2, DraftFineLast,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.
@@ -579,6 +592,17 @@ enum class Cond : uint8_t {
   // rain or wetness in the tick's rain word, i.e. exactly the ticks on which
   // the CA's rainExposed can be asked).
   RainExpo,
+  // ---- wind drafts (RecordCtx::draftOn / draftRebuild) ----
+  // DraftAll: the volume moved, the gate or the materials changed, or the
+  //   buffer is new -- re-mask every chunk of the box.
+  // DraftDirty: otherwise, when the CA runs -- re-mask the active chunks
+  //   inside it (only an active chunk can have changed a voxel).
+  // Draft: either of the above -- the args row, its copy and the two solve
+  //   rows, which dispatch ZERO groups unless a mask moved. Nothing at all is
+  //   recorded on a settled tick or at sim.draftMode 0.
+  DraftAll,
+  DraftDirty,
+  Draft,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -673,6 +697,7 @@ enum class DispatchSel : uint32_t {
   // ---- the gust streaks: one 64-thread workgroup per 64 live slots ----
   StreakGx,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
+  IndDraftArgs,      // indirect: draftArgs @ the row's y (one 16-byte record per solve stage)
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile
@@ -687,7 +712,8 @@ enum class DispatchSel : uint32_t {
 // Raised 16 -> 20 by the gas package: `ca` gains A(GasSpawn), the window-edge
 // outbox, -> 17 uses. Four of headroom rather than one, for the reason the
 // page-table note above gives.
-inline constexpr int kMaxUses = 24;
+// Raised 24 -> 28 by the wind drafts: `ca` gains R(Draft) -> 25 uses.
+inline constexpr int kMaxUses = 28;
 
 struct Row {
   const char* name;
@@ -832,6 +858,10 @@ struct RecordCtx {
   uint32_t rainFallGroups = 64, rainExpoGroups = 0;
   // Workgroups over the live streak pool; 0 = streaks off (Cond::WindStreaks).
   uint32_t streakGx = 0;
+  // Wind drafts (Simulation::SetDraft): the gate, and "re-mask the whole box
+  // this tick" (it moved, the gate or the materials changed, or it is new).
+  bool draftOn = false;
+  bool draftRebuild = false;
 };
 
 }  // namespace pass

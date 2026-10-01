@@ -1729,6 +1729,10 @@ fn seesSky(c : vec3<i32>) -> bool {
 // Costs nothing while dry: both callers test T.weatherRain first, and the map
 // is built on exactly the ticks where that test can pass (rain or wetness).
 @group(0) @binding(45) var<storage, read> rainExpo : array<u32>;
+// The wind-draft shelter volume (sim_draft.wgsl): windAtQ reads its transfer
+// field through common.wgsl's WIND DRAFTS block, so the drift bias and the
+// entrainment test feel walls. Built by the draft rows before the CA.
+@group(0) @binding(46) var<storage, read> draftField : array<u32>;
 // sim_rain_expo.wgsl's lattice, byte for byte (and src/sim/rainexpo.h).
 const RX_TEX_SHIFT : u32 = 2u;
 const RX_OPEN : i32 = -2147483647 - 1;

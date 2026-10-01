@@ -2415,6 +2415,68 @@ constexpr uint32_t kWindStreakTrail = 16;
 constexpr uint32_t kWindStreakStride = 18;
 static_assert(kWindStreakStride == 2 + kWindStreakTrail, "streak row layout");
 
+// ---- WIND DRAFTS: the shelter volume (assets/shaders/sim_draft.wgsl) -------
+// docs/RESEARCH_wind.md §14; DESIGN.md §9b "Drafts". A box of 4-voxel cells
+// round the player in which the wind is REDIRECTED by geometry: what the volume
+// stores is not a wind but the TRANSFER of one -- per cell, the 3-vector a unit
+// horizontal wind along +X becomes there, and the one a unit wind along +Z
+// becomes (a porous-media potential-flow projection, solved by multigrid). A
+// pure function of the geometry inside the box and its origin, so it is
+// re-solved only on a tick whose blockers changed and is never saved or hashed.
+//
+// Buffer `draft` (sim group binding 46), in WORDS:
+//   [0, 2 cells)                    row masks per fine cell: w0 = X rows | Y
+//                                   rows << 16, w1 = Z rows (4x4 rows of 4
+//                                   voxels through the cell, bit = a blocker)
+//   [kDraftCoarseBase, ...)          the coarse grid, one cell per CHUNK of the
+//                                   box: phi x | phi z | K+ | K-bnd | pocket
+//                                   members (64 bits, 2 words)
+//   [kDraftFieldBase, + 3 cells)     THE FIELD: 6 x i16 Q12 per fine cell,
+//                                   R_x.xy | R_x.z R_z.x | R_z.yz
+//   [kDraftPhiA, + 2 cells), [kDraftPhiB, + 2 cells)
+//                                   the fine passes' scratch potentials
+//   [kDraftKBase, + 1 cell)          the fine faces' packed coefficients
+// Buffer `draftMeta` (binding 47, atomics): kDraftMeta* words below.
+// MIRRORED as DRAFT_* in common.wgsl (check_invariants `drafts`).
+constexpr uint32_t kDraftCellShift = 2;   // a cell is 4 voxels (0.4 m)
+constexpr uint32_t kDraftNX = 64, kDraftNY = 32, kDraftNZ = 64;  // fine cells
+constexpr uint32_t kDraftCells = kDraftNX * kDraftNY * kDraftNZ;  // 131,072
+constexpr uint32_t kDraftChunksX = (kDraftNX << kDraftCellShift) / kChunk;  // 16
+constexpr uint32_t kDraftChunksY = (kDraftNY << kDraftCellShift) / kChunk;  // 8
+constexpr uint32_t kDraftChunksZ = (kDraftNZ << kDraftCellShift) / kChunk;  // 16
+constexpr uint32_t kDraftChunks = kDraftChunksX * kDraftChunksY * kDraftChunksZ;
+// The coarse grid is one cell per chunk of the box (16 x 8 x 16).
+constexpr uint32_t kDraftCoarseCells = kDraftChunks;
+constexpr uint32_t kDraftCoarseWords = 6;
+constexpr uint32_t kDraftCoarseBase = 2 * kDraftCells;
+constexpr uint32_t kDraftFieldBase = kDraftCoarseBase + kDraftCoarseWords * kDraftCoarseCells;
+constexpr uint32_t kDraftPhiA = kDraftFieldBase + 3 * kDraftCells;
+constexpr uint32_t kDraftPhiB = kDraftPhiA + 2 * kDraftCells;
+// The fine faces' coefficients, packed per cell (K+x | K+y << 9 | K+z << 18),
+// computed once a solve so the four fine passes read one word a cell.
+constexpr uint32_t kDraftKBase = kDraftPhiB + 2 * kDraftCells;
+constexpr uint32_t kDraftWords = kDraftKBase + kDraftCells;
+// The fine pass works one 8^3-cell TILE per workgroup.
+constexpr uint32_t kDraftTiles = (kDraftNX / 8) * (kDraftNY / 8) * (kDraftNZ / 8);
+// draftMeta words.
+constexpr uint32_t kDraftMetaChanged = 0;   // a mask changed this tick (OR)
+constexpr uint32_t kDraftMetaSolves = 1;    // solves since the buffer was made
+constexpr uint32_t kDraftMetaLastTick = 2;  // tick of the last solve
+constexpr uint32_t kDraftMetaCells = 3;     // mask cells changed, summed
+constexpr uint32_t kDraftMetaStage = 4;     // the solve pipeline's stage (0 = idle)
+constexpr uint32_t kDraftMetaArgs = 8;      // 6 stages x 4 words: each stage's indirect args
+constexpr uint32_t kDraftStages = 6;
+constexpr uint32_t kDraftMetaWords = 32;
+static_assert(kDraftNX % 8 == 0 && kDraftNY % 8 == 0 && kDraftNZ % 8 == 0,
+              "the fine passes work whole 8^3-cell tiles (2 x 2 x 2 chunks)");
+static_assert((kChunk >> kDraftCellShift) == 4,
+              "sim_draft.wgsl's coarse cell is 4^3 fine cells");
+static_assert(((kDraftNX << kDraftCellShift) % kChunk) == 0 &&
+              ((kDraftNY << kDraftCellShift) % kChunk) == 0,
+              "the volume is a whole number of chunks");
+static_assert(kDraftChunksX <= kNChunk && kDraftChunksY <= kNChunk,
+              "the volume must fit inside the residency window");
+
 // ---- WATER BODIES (docs/PLAN_water_master.md; src/sim/waterbody.h) --------
 // Live still-water descriptors world-wide, and the rule-2 bound on the whole
 // subsystem. Here rather than in waterbody.h for the wind-primitive reason:
@@ -3250,6 +3312,15 @@ struct TickParams {
   int32_t wfThermalK = 0;      // thermal cell spatial frequency, BAM16/cell
   int32_t wfProf[kWindProfKnots] = {};  // profile at the knots, Q16
   uint32_t wfTerr[kWindTerrWords] = {}; // h i16 | exposure i8 | water u8
+
+  // ---- WIND DRAFTS (kDraft* above; sim_draft.wgsl) ----
+  // The shelter volume's minimum corner, WORLD voxels, chunk-aligned and
+  // inside the window (support.cpp's box placement), and its gate. draftMode 0
+  // = no draft row is recorded and windAtQ is the ambient field exactly; bit 0
+  // = on; bit 1 = BURST (run the whole solve this tick: the box moved, or the
+  // gate / materials / buffer is new -- sim_draft.wgsl `args`).
+  int32_t draftOrigin[3] = {0, 0, 0};
+  uint32_t draftMode = 0;
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -3661,6 +3732,11 @@ struct RenderParams {
   int32_t wfThermalK = 0;
   int32_t wfProf[kWindProfKnots] = {};
   uint32_t wfTerr[kWindTerrWords] = {};
+  // ---- WIND DRAFTS, the render copy: the origin of the LAST solved volume
+  // and whether its field is valid (Simulation::DraftValid). 0 = the render
+  // reads the ambient field, as the sim does at draftMode 0.
+  int32_t draftOrigin[3] = {0, 0, 0};
+  uint32_t draftMode = 0;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

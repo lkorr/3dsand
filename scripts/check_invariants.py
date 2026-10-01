@@ -1065,6 +1065,75 @@ def check_wind_streak():
                         f"{gt.group(1)}/{gs.group(1)} -- the pool's rows would misalign")
 
 
+def check_drafts():
+    """The wind-draft volume's layout lives in world.h AND as DRAFT_* consts.
+
+    world.h kDraft* sizes and zeroes the buffer and places the box; common.wgsl
+    indexes the transfer field with DRAFT_NX/NY/NZ and DRAFT_FIELD_BASE, and
+    sim_draft.wgsl builds it with DRAFT_COARSE_BASE, DRAFT_TILES, the box's
+    chunk extents and the DM_* meta words. A mismatch reads the coarse solver's
+    words as the field -- a wind that blows the wrong way indoors, silently.
+    """
+    wh = read("src/sim/world.h")
+    cw = read("assets/shaders/common.wgsl")
+    sd = read("assets/shaders/sim_draft.wgsl")
+    if not wh or not cw or not sd:
+        return
+
+    def cpp(name):
+        m = re.search(rf"\b{name}\s*=\s*(\d+)", wh)
+        return int(m.group(1)) if m else None
+
+    def wgsl(src, name):
+        m = re.search(rf"const\s+{name}\s*:\s*[iu]32\s*=\s*(\d+)u?\s*;", src)
+        return int(m.group(1)) if m else None
+
+    nx, ny, nz = cpp("kDraftNX"), cpp("kDraftNY"), cpp("kDraftNZ")
+    shift, chunk = cpp("kDraftCellShift"), cpp("kChunk")
+    if None in (nx, ny, nz, shift, chunk):
+        problems.append("drafts: could not parse kDraftNX/NY/NZ/kDraftCellShift/kChunk from world.h")
+        return
+    cells = nx * ny * nz
+    coarse_cells = ((nx << shift) // chunk) * ((ny << shift) // chunk) * ((nz << shift) // chunk)
+    coarse_base = 2 * cells
+    field_base = coarse_base + (cpp("kDraftCoarseWords") or 0) * coarse_cells
+    phi_a = field_base + 3 * cells
+    want = {
+        ("common", "DRAFT_NX"): nx, ("common", "DRAFT_NY"): ny,
+        ("common", "DRAFT_NZ"): nz, ("common", "DRAFT_CELL_SHIFT"): shift,
+        ("common", "DRAFT_FIELD_BASE"): field_base,
+        ("sim_draft", "DRAFT_COARSE_BASE"): coarse_base,
+        ("sim_draft", "DRAFT_COARSE_WORDS"): cpp("kDraftCoarseWords"),
+        ("sim_draft", "DRAFT_PHI_A"): phi_a,
+        ("sim_draft", "DRAFT_PHI_B"): phi_a + 2 * cells,
+        ("sim_draft", "DRAFT_KBASE"): phi_a + 4 * cells,
+        ("sim_draft", "DRAFT_CCELLS"): coarse_cells,
+        ("sim_draft", "DRAFT_TILES"): (nx // 8) * (ny // 8) * (nz // 8),
+        ("sim_draft", "DRAFT_CX"): (nx << shift) // chunk,
+        ("sim_draft", "DRAFT_CY"): (ny << shift) // chunk,
+        ("sim_draft", "DRAFT_CZ"): (nz << shift) // chunk,
+        ("sim_draft", "DM_CHANGED"): cpp("kDraftMetaChanged"),
+        ("sim_draft", "DM_SOLVES"): cpp("kDraftMetaSolves"),
+        ("sim_draft", "DM_LAST"): cpp("kDraftMetaLastTick"),
+        ("sim_draft", "DM_CELLS"): cpp("kDraftMetaCells"),
+        ("sim_draft", "DM_ARGS"): cpp("kDraftMetaArgs"),
+        ("sim_draft", "DM_STAGE"): cpp("kDraftMetaStage"),
+        ("sim_draft", "DRAFT_STAGES"): cpp("kDraftStages"),
+    }
+    checked.append("wind drafts")
+    for (where, name), v in want.items():
+        got = wgsl(cw if where == "common" else sd, name)
+        if got is None or v is None:
+            problems.append(f"drafts: {name} missing from {where}.wgsl or its world.h source")
+        elif got != v:
+            problems.append(f"drafts: {where}.wgsl {name} = {got} but world.h gives {v}")
+    # coarseSolve holds the whole coarse grid in workgroup memory (4 arrays of
+    # DRAFT_CCELLS words = 32 KiB at 2,048 cells); a bigger box needs a new plan.
+    if coarse_cells > 2048:
+        problems.append("drafts: the coarse grid exceeds 2,048 cells -- sim_draft.wgsl "
+                        "coarseSolve keeps it in workgroup memory")
+
+
 def check_water_ledger():
     """The water-body ledger's word map lives in THREE places, positionally.
 
@@ -2922,6 +2991,7 @@ ALL = {
     "windprim": check_wind_prims,
     "windmirror": check_wind_mirror,
     "windstreak": check_wind_streak,
+    "drafts": check_drafts,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,
     "counts": check_tick_counts,
@@ -2984,9 +3054,10 @@ RELEVANT = {
     "scripts/test_environment.mjs": ["envpred"],
     "src/sim/materials.h": ["reactgate", "coatflame", "reactfx"],
     "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx"],
-    "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror"],
+    "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror", "drafts"],
     "src/sim/windfield.cpp": ["windmirror"],
     "assets/shaders/wind_streak.wgsl": ["windstreak"],
+    "assets/shaders/sim_draft.wgsl": ["drafts"],
     "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],
 }

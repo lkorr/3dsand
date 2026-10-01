@@ -3100,6 +3100,21 @@ struct Tuning {
     float windEntrainPower = TPD(sim, windEntrainPower);
     float windEntrainSpan = TPD(sim, windEntrainSpan);
 
+    // ---- wind drafts: the shelter volume (docs/RESEARCH_wind.md 14) ----
+    // THE GATE. 1 = the ambient field is redirected by the geometry in a box
+    // round the player (sim_draft.wgsl): sealed rooms are still, a room with
+    // two openings carries a draft between them. 0 = no draft row recorded and
+    // every consumer reads the ambient field, an exact identity. Moves the
+    // world hash whenever gas or debris moves near a structure.
+    int draftMode = TPD(sim, draftMode);
+    // The solver's FIXED iteration counts: red-black SOR sweeps of the coarse
+    // grid (one cell per chunk, solved in workgroup memory), and sweeps per
+    // fine pass (three overlapping-tile passes over the 0.4 m grid). More =
+    // closer to the exact potential flow and a costlier solve tick (a solve
+    // runs only when blockers in the box change).
+    int draftCoarseSweeps = TPD(sim, draftCoarseSweeps);
+    int draftFineSweeps = TPD(sim, draftFineSweeps);
+
     // ---- dev force multipliers, one per TIER ----
     // NO_WGSL rows in tuning_params.def, and that is deliberate rather than
     // an omission: a WGSL row becomes a const-folded shader constant and

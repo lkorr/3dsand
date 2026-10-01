@@ -32,6 +32,10 @@
 // kWindStreakStride in src/sim/world.h (check_invariants `windstreak`).
 
 @group(0) @binding(3) var<uniform> R : RenderParams;
+// The wind-draft shelter volume (shadowBGL_ 24, the UPDATE's layout): a streak
+// advected by windAt stops at a wall and threads through a doorway. The draw
+// never reads it, so it is not in renderBGL_'s view of this module.
+@group(0) @binding(24) var<storage, read> draftField : array<u32>;
 // The update's view (shadowBGL_ binding 22, compute).
 @group(0) @binding(22) var<storage, read_write> streaks : array<vec4f>;
 // The draw's view of the same buffer (renderBGL_ binding 33, vertex).
@@ -79,7 +83,13 @@ fn update(@builtin(global_invocation_id) gid : vec3<u32>) {
     let m = windMeanWS(s);
     let ml = length(m.xz);
     var ex = length(windPrimAt(p, &R));
-    if (ml > 1e-3) { ex += dot(bands.xz, m.xz) / ml; }
+    // Sheltered by the draft volume like the advection below: indoors, in a
+    // cave or in the lee of a wall the gust excess shrinks with the wind, so
+    // a still room spawns nothing instead of streaks that hang in place.
+    let full = m + bands;
+    let fl = length(full.xz);
+    let shelter = select(1.0, length(draftApplyF(p, full, &R).xz) / fl, fl > 1e-3);
+    if (ml > 1e-3) { ex += dot(bands.xz, m.xz) / ml * min(shelter, 1.5); }
     let pr = smoothstep(R.streakA.y, R.streakA.y + max(R.streakA.z, 1e-3), ex);
     if (streakU01(5u, i) >= pr) { return; }
     h0 = vec4f(p, 0.0);

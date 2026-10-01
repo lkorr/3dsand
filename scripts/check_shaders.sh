@@ -476,19 +476,26 @@ for f in "${FILES[@]}"; do
   grep -q '> voxels' "$f" || { stripRead=1; stripWrite=1; }
   grep -q 'read_write> voxels' "$f" || stripWrite=1
   grep -q '> supportOut' "$f" || stripSupport=1
-  if [ "$stripRead" -eq 1 ] || [ "$stripWrite" -eq 1 ] || [ "$stripSupport" -eq 1 ]; then
-    commonSrc="$TMP/common_${name}"
-    awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport" '
-      /PAGE_TABLE_WRITE_BEGIN/ { print; s = sw; next }
-      /PAGE_TABLE_WRITE_END/   { print; s = 0;  next }
-      /PAGE_TABLE_BEGIN/       { print; s = sr; next }
-      /PAGE_TABLE_END/         { print; s = 0;  next }
-      /SUPPORT_LOSS_BEGIN/     { print; s = ss; next }
-      /SUPPORT_LOSS_END/       { print; s = 0;  next }
-      s                        { print ""; next }
-      { print }
-    ' "$COMMON" > "$commonSrc"
-  fi
+  # The WIND DRAFTS reader: exactly one of its two blocks survives, BOUND for
+  # a body that declares `> draftField`, UNBOUND otherwise (LoadShader's
+  # BodyReadsDrafts) -- so the strip below always runs.
+  stripDraftB=1; stripDraftU=0
+  if grep -q '> draftField' "$f"; then stripDraftB=0; stripDraftU=1; fi
+  commonSrc="$TMP/common_${name}"
+  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" '
+    /PAGE_TABLE_WRITE_BEGIN/ { print; s = sw; next }
+    /PAGE_TABLE_WRITE_END/   { print; s = 0;  next }
+    /PAGE_TABLE_BEGIN/       { print; s = sr; next }
+    /PAGE_TABLE_END/         { print; s = 0;  next }
+    /SUPPORT_LOSS_BEGIN/     { print; s = ss; next }
+    /SUPPORT_LOSS_END/       { print; s = 0;  next }
+    /DRAFT_UNBOUND_BEGIN/    { print; s = du; next }
+    /DRAFT_UNBOUND_END/      { print; s = 0;  next }
+    /DRAFT_BOUND_BEGIN/      { print; s = db; next }
+    /DRAFT_BOUND_END/        { print; s = 0;  next }
+    s                        { print ""; next }
+    { print }
+  ' "$COMMON" > "$commonSrc"
 
   # LoadShader also GENERATES the ptSeed()/ptOrigin() accessors for shaders
   # that address voxels (PtSeedAccessor, gpu/resources.cpp): the page block's

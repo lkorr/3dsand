@@ -1134,6 +1134,16 @@ TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f, 0.0f, 30.0f)
 // rate x min(excess / (threshold x span), 1)^power.
 TP_F(sim, windEntrainPower, TUNE_WIND_ENTRAIN_POWER, 3.0f, 1.0f, 6.0f)
 TP_F(sim, windEntrainSpan, TUNE_WIND_ENTRAIN_SPAN, 1.0f, 0.1f, 10.0f)
+// ---- wind drafts: the shelter volume (docs/RESEARCH_wind.md 14) ----
+// The gate: 0 = no draft row is recorded and windAtQ is the ambient field
+// exactly (the old hash is reachable); 1 = walls shelter the wind. Rides
+// TickParams.draftMode, so it needs no shader reload.
+TP_I(sim, draftMode, NO_WGSL, 1, 0, 1)
+// The solver's fixed iteration counts (sim_draft.wgsl). Fixed, never "until
+// converged", so a solve is a pure function of the geometry: SOR sweeps of the
+// chunk-sized coarse grid, and sweeps per fine (Schwarz) pass.
+TP_I(sim, draftCoarseSweeps, TUNE_DRAFT_COARSE_SWEEPS, 32, 4, 256)
+TP_I(sim, draftFineSweeps, TUNE_DRAFT_FINE_SWEEPS, 6, 1, 64)
 // ---- the CURRENT field's one sim coupling (PLAN_water_master.md comp 8)
 // The only current knob the SHADER reads. Everything else about the field is
 // resolved into primitives on the CPU, so this is the whole .def surface:

@@ -277,6 +277,11 @@ bool gGasRenderActive = false;
 // own variable rather than a second bit of the one above, because the two gate
 // different work and are true in different worlds.
 bool gGasFarRenderActive = false;
+// The wind-draft box the renderer may read (sim_draft.wgsl): its origin and
+// whether its field has been solved, published by SubmitTick from Simulation
+// right after SetDraft and read by WriteRenderParams.
+bool gDraftRenderValid = false;
+int32_t gDraftRenderOrigin[3] = {0, 0, 0};
 }
 const RenderSpec& LastRenderSpec() { return gRenderSpec; }
 void SetGasRenderActive(bool active) { gGasRenderActive = active; }
@@ -920,6 +925,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
       const int32_t o3[3] = {wo.x, wo.y, wo.z};
       windfield::FillWindField(rp, tun, rp.seed, tick, frameFrac, DayPhaseNow(tick), o3);
     }
+    // The wind-draft box the last tick solved (SubmitTick), so the streaks and
+    // the F4 arrows read the sheltered field the sim does.
+    rp.draftMode = gDraftRenderValid ? 1u : 0u;
+    for (int i = 0; i < 3; i++) rp.draftOrigin[i] = gDraftRenderOrigin[i];
   }
   // WIND PRIMITIVES (§4.3). The SAME resolved list SubmitTick shipped to the
   // sim this tick — WindPrims() is advanced there and read here, which is what
@@ -1679,6 +1688,31 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   IVec3 mb = world.MirrorBaseFor(
       {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
   tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
+  // ---- WIND DRAFTS: the shelter volume's box (world.h kDraft*) ----------
+  // A pure function of the player's chunk, snapped to EVEN chunks so the box
+  // moves (and re-solves) every 3.2 m of travel rather than every 1.6 m, and
+  // clamped inside the window. The player sits 7-8 chunks from its -X/-Z
+  // faces and 3-4 above its floor: more box overhead (a roof, an upper
+  // storey) than underfoot, where the ground is solid anyway.
+  {
+    const IVec3 w0 = world.WindowOrigin();
+    auto place = [](int pc, int half, int span, int wlo) {
+      int o = ((pc >> 1) << 1) - (half - 1);
+      const int hi = wlo + (int)kNChunk - span;
+      if (o < wlo) o = wlo;
+      if (o > hi) o = hi;
+      return o * (int)kChunk;
+    };
+    tp.draftOrigin[0] = place(playerChunk.x, (int)kDraftChunksX / 2, (int)kDraftChunksX, w0.x);
+    tp.draftOrigin[1] = place(playerChunk.y, (int)kDraftChunksY / 2, (int)kDraftChunksY, w0.y);
+    tp.draftOrigin[2] = place(playerChunk.z, (int)kDraftChunksZ / 2, (int)kDraftChunksZ, w0.z);
+    const bool on = CurrentTuning().sim.draftMode != 0;
+    sim.SetDraft(on, tp.draftOrigin);
+    // Bit 1: a BURST -- the whole solve this tick (sim_draft.wgsl `args`).
+    tp.draftMode = on ? (1u | (sim.DraftRebuild() ? 2u : 0u)) : 0u;
+    gDraftRenderValid = sim.DraftValid();
+    for (int i = 0; i < 3; i++) gDraftRenderOrigin[i] = sim.DraftOrigin()[i];
+  }
   tp.vizActive = vizActive ? 1u : 0u;
   // ---- UPLOAD: the MutationQueue op stream reaching the GPU ---------------
   // The second half of the Upload span (the first ran from function entry to
