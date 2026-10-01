@@ -6464,46 +6464,64 @@ makes "caving a face in SLOWLY" mean something) and `bite-rot` (rotflesh > 0
 through skin, exactly 0 through iron). Every numeric row above is in the
 `combat-tuning` round-trip table, with a string probe for `bruiseMat`.
 
-### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectTick`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
+### Infection is a material (2026-10-01; `docs/PLAN_weapon_coats.md` B; `Mob::InfectStep`, `Mob::CoatInfectTick`, `MaterialDef::infect`)
 
 Until this the rot was the only infection and it was wired in: `MobLimb::infectMat`
-held one material, `Mob::InfectTick` ran it on the `gore.infect*` knobs, and
-what it could eat was each creature's `rotRate`. An infection is now **any
-material with an `infect` block**, and the voxel's own material is the
-infection's identity:
+held one material and `Mob::InfectTick` ran it on a per-LIMB clock (world voxels
+a minute per infected limb). An infection is now **any material with an `infect`
+block, and the infection IS that material's voxels**, each running one simple
+rule every tick (owner, 2026-10-01: "it's the basic CA properties of rotflesh and
+the envenomed spreading to flesh that makes it an infection"):
+
+- **SPREAD** — with chance `pS` the voxel converts ONE face-neighbour its block
+  admits (drawn uniformly among the admitted ones) into its own material. A voxel
+  within √3 lattice cells of a joint also counts the rig neighbour across it as
+  one more candidate (`Mob::InfectAcrossJoint` seeds that limb at its own anchor,
+  unless the infection is already there).
+- **EAT** — independently, with chance `pE`, the voxel is eaten: tombstoned and
+  flushed as a carve (`FlushBurn`).
+
+Counter-based (`Hash3` of creature, limb, lattice POSITION, tick and material);
+cells act in storage order on the lattice as it stands, so nothing acts twice in
+a tick. There is no per-limb list and no slots: a limb carries one byte,
+`MobLimb::infected` ("has infectious voxels"), set by every writer that puts an
+infection material in (a bite, a coat seeding, a joint crossing, a twin copy, a
+graft) and cleared by the sweep that finds none — so a clean limb costs one byte
+test a tick, and any number of infection materials share a limb.
 
 ```json
-"infect": { "spread": 0.03, "eat": 0.045, "floor": 0,
-            "targets": ["tag:soft_tissue"], "hp": 250,
-            "cause": "infection", "death": "venom", "turns": false }
+"infect": { "spread": 0.006, "eat": 0.009, "floor": 0,
+            "targets": ["tag:soft_tissue"], "hp": 250, "cause": "infection",
+            "death": "venom", "turns": false, "cured": "flesh" }
 ```
 
-- `spread` / `eat` — world voxels a minute per infected limb, converted with
-  the limb's scale³ exactly as the rot always was. ABSENT = the
-  `gore.infectSpreadRate` / `infectRotRate` knobs times `gore.infectMobMult`,
-  which is how `rotflesh` keeps its tuning rows.
-- `floor` — infected cells the eat may not take below. The rot authors 4 (the
-  old `kInfectFloor`); venom 0, so it can burn out.
+- `spread` / `eat` — chances per voxel per SECOND, for a voxel one world voxel
+  across: `pS = spread · s / 30`, `pE = eat · s / 30` on a lattice of `s` cells
+  per world voxel at 30 Hz. Running a finer lattice's cells `s` times as often
+  keeps a front's PHYSICAL speed, and because both rates scale alike it keeps
+  the branching ratio `R = spread / eat` — so everything below is independent of
+  scale. ABSENT = the `gore.infectSpreadRate` / `infectRotRate` knobs (same units
+  since 2026-10-01) times `gore.infectMobMult`: that is `rotflesh`.
+- `floor` — a limb's cells of this material the eat may not take below. The rot
+  authors 4 (a small bite's seed is not eaten out before it can spread); venom 0.
 - `targets` — `tag:x` or a material name. ABSENT = the creature's per-material
   `rotRate` admission (the rot's rule: flesh 1, bone 0.5).
-- `hp` — FLAT hp the infected limb loses per world voxel the eat removes, on
-  top of the volume charge the flush makes (which is a few tenths of an hp for a
-  few dozen lattice cells of a human arm — too little to be a poison).
-- `cause` — `"burn"` keeps the rot on the `Burn` ledger it has always booked
-  to; anything else books to the new `DamageCause::Infection` (Burn's sever
-  rows under its own name). `death` names the death when that damage kills
-  (`InternDeathCause`); `turns` is what makes a body with it in a limb rise
-  (`MobDef::turn` — dying of venom does not make a zombie).
+- `hp` — FLAT hp the limb loses per world voxel of it eaten, on top of the volume
+  charge the flush makes (a few tenths of an hp for a few dozen lattice cells of
+  a human arm — too little to be a poison).
+- `cause` — `"burn"` keeps the rot on the `Burn` ledger it has always booked to;
+  anything else books to `DamageCause::Infection` (Burn's sever rows under its
+  own name). `death` names the death when its damage kills; `turns` makes a body
+  that dies holding a VOXEL of it rise (`MobDef::turn` reads "limbs with a voxel
+  of a turning material" — dying of venom does not make a zombie). All three are
+  read off the MATERIAL of the cells eaten or present, not off the limb.
+- `cured` — what a filtered remedy turns a cell of it into (below).
 
-**Per limb, a few infections at once.** `MobLimb::infects[kInfectSlots = 3]`
-holds `{mat, stain}` pairs, packed; each runs on its own material's clock, so
-one arm can carry rot and venom together. A slot is dropped when its material
-has nothing left on the limb. The RNG keys are the rot's, with the SLOT mixed
-in (slot 0 mixes in nothing), so every zombie bite draws exactly what it drew
-before infections were data. The rot's behaviour did not change: `rotflesh`'s
-block is `{floor 4, cause burn, turns true}` and every number comes from the
-same knobs. A material the table has no block for (a legacy bite) runs the
-rot's rule (`RotSpec`).
+**One number per infection, body and world.** The world-grid rot rules
+(`reactions.json`, `"infectSpread": true`) take their chance from the SAME
+`spread` — the self material's block, else the knob — spread over six faces
+(`c = spread · 1000 / 180` per-mille a face a tick, so a cell walled in by tissue
+converts at exactly the body rate).
 
 **A coat can seed one** (`coat.infects`, `coat.infectCost`). Where a coat that
 names an infection sits ON a voxel the infection targets, or is face-adjacent
@@ -6517,6 +6535,14 @@ open. `Mob::CoatInfectTick` runs only when `RecountCoat` found such a coat
 CHANGES cost. `SoakLimb` lays an infecting coat on the surface only, as it does
 acid. Nothing anywhere tests for venom.
 
+**Where a coat reaches.** The voxel it is on, and a face neighbour only round a
+corner of the SAME open space (some side across the step is open beside both):
+a wound's rim, where the skin's coat and the flesh wall face the same pit. The
+first version let a coat reach any neighbour with a free face, and a venom film
+on the skin then chased the infection along under the whole limb — the flesh
+under whole skin gets a free face the moment the venom beside it is eaten — and
+re-seeded it for ever (measured: never cleared in 3,000 ticks).
+
 **Venom** is the second infection. `venom` (liquid, sickly yellow-green, a
 bodyOnly stain, `coat.decay` 12 s/level, `coat.infects: "envenomed"`,
 `infectCost` 5 — a full coat seeds three cells); `envenomed` (the dark,
@@ -6528,45 +6554,55 @@ tissue whose wound leaks venom through `bleedFluid`). All three are appended
 directly: a snake paints a stand-in and rewrites it at load, as `garmentsBecome`
 does.
 
-**The arithmetic.** Rates are constant per infected limb, so a dose of D cells
-changes by `s − e` a minute and is gone after `D / (e − s)` minutes, having
-spread `s·D/(e − s)` and eaten `e·D/(e − s)`. With `e = 1.5 s` that is **2 D
-spread and 3 D eaten, always**, whatever the rate. Venom's `s = 0.03`,
-`e = 0.045` world voxels a minute are 15.36 and 23.04 cells a minute on a human
-(skinScale 8, 512 cells a world voxel): it shrinks 7.68 cells a minute, so a
-sword wound's dose of 8..15 cells lasts 62..117 s and eats 24..45 cells, and
-`hp` 250 a world voxel charges a 12-cell dose's 36 eaten cells ≈ 18 hp. A cut
-reaching a joint seeds the neighbour at one cell, which adds its own small
-burn-out. When the last cell goes the slot is dropped and the pending
-tombstones are flushed at once (a finished infection never reaches the rebuild
-threshold on its own).
+**The arithmetic: a branching process.** Each infectious cell lives until it
+is eaten (rate `μ = eat · s`) and spawns at rate `λ = spread · s` while it
+lives, so it has `R = λ / μ = spread / eat` offspring on average. `R < 1` is
+subcritical: a dose of D cells always dies out, and the expected number of
+cells there ever are — every one of which is eventually eaten — is
+`D / (1 − R)`. Venom authors `eat = 1.5 · spread` (`0.009` / `0.006` per voxel
+per second), so `R = 2/3` and it **eats 3 D in all, having spread 2 D more**,
+whatever the rate. The mean time to die out is `H(D, R) / μ` with
+`H(D, R) = Σ_{i=1..D} Σ_{j≥0} R^j / (i + j)` (the harmonic number H_D at R = 0);
+on a human (skinScale 8, `μ = 0.072` a second) that is 61 s for a dose of 5,
+89 s for 12 and 108 s for 20 — a little less in a wound that runs out of soft
+tissue to spread into, which also pulls the eaten ratio under 3 (measured 2.55).
+`hp` 250 a world voxel charges a 12-cell dose's ~36 eaten cells ≈ 18 hp. When
+the last cell goes the latch drops and the pending tombstones are flushed at
+once (a finished infection never reaches the rebuild threshold on its own).
 
-**Remedies are data too.** `coat.effects` `"disinfect"` stops every infection
-on the limb (enchanted blood is a strong restorative: it stops venom as well as
-rot); `"disinfect:tag:<t>"` stops only those whose material carries `<t>`, and
-`"disinfect:<material>"` only that one. Stopped means the clock stops; the cells
-it already made stay until healing (`HealTick` mends any non-recipe cell) or a
-blade takes them.
+**The rot, retuned per voxel.** Per voxel the rot is SUPERCRITICAL: knobs
+`infectSpreadRate` 0.00075, `infectRotRate` 0.000375 per voxel per second
+(`R = 2`), `infectMobMult` 1, floor 4. Measured with the `rot-clock` gate (a
+zombie bite on a human's upper arm, x40 crank, ticks until the rot reaches a
+second limb): the per-limb model it replaced bit 21 cells and reached the torso
+at tick 916 (20.4 real minutes; arm 21 → 30 → 47 cells at 250-tick steps); the
+per-voxel rot at these rates reaches the forearm at tick 898 (20.0 minutes; arm
+48 → 54 → 69). The bite-dependent gates (`bite-rot`, `bite-infect`,
+`joint-rot`) crank the knobs to their old per-limb values (6 / 2, 12 / 8), which
+are far past 1 a second per voxel now; they were red at clean main for an
+unrelated reason (the bite rewrites ~no flesh on their target) and still are.
 
-**Where a coat reaches.** The voxel it is on, and a face neighbour only round a
-corner of the SAME open space (some side across the step is open beside both):
-a wound's rim, where the skin's coat and the flesh wall face the same pit. The
-first version let a coat reach any neighbour with a free face, and a venom film
-on the skin then chased the infection along under the whole limb — the flesh
-under whole skin gets a free face the moment the venom beside it is eaten — and
-re-seeded it for ever (measured: never cleared in 3,000 ticks).
+**Remedies are data too.** `coat.effects` `"disinfect"` stops every infection on
+the limb (its latch drops; enchanted blood stops venom as well as rot);
+`"disinfect:tag:<t>"` / `"disinfect:<material>"` turn each matching infection
+cell into its material's `infect.cured` (both shipped infections cure to
+`flesh`, which `HealTick` then mends to the recipe). There is no per-limb list
+to strike a name from: the infection is its cells, so the cells change.
 
 Gate `venom-wound` (`src/test/selftest_impact.cpp`): a small carved hole in the
 first segment of each human arm and leg, all four soaked with venom, rates x8
 through a copy of the material table; envenomed appears, spreads and returns to
-0; eaten / seeded within `baseline.json`'s band round 3 (measured 3.63 over four
-limbs, joint re-seeds included); hp booked to `Infection`; not one cell of bone
-or skin converted (`Mob::InfectStat::took`, by source material — measured flesh
-82, muscle 71); the same soak on a second, uncut human seeds nothing. The bone
-CENSUS on those limbs does fall (364 -> 291): bone is never converted, but the
-carve's own tail (collider re-derive, connectivity split) drops bone cells
-stranded once the soft tissue round them is eaten — the wound model's business,
-the same as under the rot, and a follow-up if bone should stand alone.
+0 inside the `H(D, R) / μ` window; eaten / seeded within `baseline.json`'s band
+round 3; hp booked to `Infection`; not one cell of bone or skin converted
+(`Mob::InfectStat::took`, by source material); the same soak on a second, uncut
+human seeds nothing; a CONTROL human with the same pits and no venom, ticked
+alongside, gives the bone census to subtract — A's venom-attributable bone loss
+must be ≤ `venomWoundBoneLossMax` (measured 0 and 0; `Mob::FlushTailBone`
+attributes any bone a flush's carve tail drops, by cause); and a fifth human with
+a zombie bite AND the venom soak on one arm, where both infections must run.
+The 364 → 291 bone fall reported from the per-limb version did not reproduce
+with the control alongside (both arms 364 → 364): it is not attributable to the
+venom on this fixture.
 
 ### Blood is health, and burns cap it (2026-09-02; `Mob::DrainBlood`, `Mob::RecountBurn`, `sim/tuning.h` §F/§G)
 

@@ -997,32 +997,48 @@ struct MaterialDef {
   // ---- THIS MATERIAL IS AN INFECTION ("infect", PLAN_weapon_coats B1) ------
   //
   // An infection is not a hardwired process any more: it is any material that
-  // carries an `infect` block. Mob::InfectStep spreads from each infected
-  // voxel using THAT voxel's material's block, so one limb can hold a zombie's
-  // rot and a snake's venom at once and each runs on its own clock:
+  // carries an `infect` block, and the infection IS that material's voxels,
+  // each running one simple rule every tick (Mob::InfectStep):
   //
-  //   "infect": { "spread": <world vox/min>, "eat": <world vox/min>,
-  //               "floor": <int>, "targets": ["tag:soft_tissue", "<name>"],
+  //   SPREAD  with chance `spread`, convert one face-neighbour that matches
+  //           `targets` (drawn uniformly among them) to this material;
+  //   EAT     independently, with chance `eat`, be eaten (removed).
+  //
+  // So any number of infections coexist on one limb with no bookkeeping, and
+  // whether one grows or burns out is just spread against eat: each voxel
+  // has, on average, spread/eat offspring before it is eaten (the BRANCHING
+  // RATIO R). R < 1 dies out, having eaten dose / (1 - R) cells in all.
+  //
+  //   "infect": { "spread": <per voxel per second>, "eat": <per voxel per
+  //               second>, "floor": <int>, "targets": ["tag:x", "<name>"],
   //               "hp": <hp per world voxel eaten>, "turns": <bool>,
-  //               "cause": "burn" | "infection", "death": "<text>" }
+  //               "cause": "burn" | "infection", "death": "<text>",
+  //               "cured": "<material>" }
   //
-  //   spread / eat  world voxels a MINUTE per infected limb, converted with the
-  //                 limb's own scale^3 (the rot's unit). ABSENT = the
-  //                 gore.infectSpreadRate / infectRotRate knobs times
-  //                 gore.infectMobMult -- which is how `rotflesh` keeps its
-  //                 numbers in tuning.json (the sentinel is < 0 here).
-  //   floor         infected voxels the eat may not take below (the rot's 4,
-  //                 Mob::InfectStep's note). 0 = it may eat itself out.
+  //   spread / eat  chances per voxel per SECOND for a voxel one world voxel
+  //                 across. A limb whose lattice is `s` cells per world voxel
+  //                 runs both at x s (a finer lattice steps a front of the
+  //                 same physical speed), which keeps R -- the ratio -- and so
+  //                 the whole branching arithmetic independent of scale.
+  //                 ABSENT = the gore.infectSpreadRate / infectRotRate knobs
+  //                 (same units) times gore.infectMobMult: `rotflesh`. The
+  //                 world-grid rot rules (reactions.json `infectSpread`) read
+  //                 the same number, so there is one per infection.
+  //   floor         a limb's cells of this material the eat may not take
+  //                 below (the rot's 4: a small seed is not eaten to nothing
+  //                 before it can spread). 0 = it may eat itself out.
   //   targets       what it may convert: "tag:<t>" or a material name. ABSENT
   //                 = the creature's per-material rotRate admission (MobDef::
   //                 RotRateOf), which is the rot's rule.
-  //   hp            FLAT hp the infected limb loses per world voxel the eat
-  //                 removes, on top of the ordinary volume charge. 0 = none.
-  //   turns         a body that dies with it in a limb rises (MobDef::turn).
-  //   cause         the ledger it books to: "burn" is the rot's historical
-  //                 account (DamageCause::Burn), anything else books to
-  //                 DamageCause::Infection.
+  //   hp            FLAT hp the limb loses per world voxel of this eaten, on
+  //                 top of the ordinary volume charge. 0 = none.
+  //   turns         a body that dies with a voxel of it rises (MobDef::turn).
+  //   cause         the ledger its eating books to: "burn" is the rot's
+  //                 historical account (DamageCause::Burn), anything else
+  //                 books to DamageCause::Infection.
   //   death         the death cause it writes when its damage kills.
+  //   cured         what a FILTERED remedy (`disinfect:tag:x`) turns a cell of
+  //                 it into; absent = that remedy leaves it alone.
   //
   // CPU-only body state, never hashed (the infection pass is gore).
   bool infect = false;
@@ -1036,6 +1052,8 @@ struct MaterialDef {
   bool infectTurns = false;
   bool infectBooksBurn = false;
   std::string infectDeath;
+  std::string infectCuredName;              // as authored
+  uint32_t infectCured = 0;                 // resolved
   // ...AND A COAT THAT CARRIES ONE ("coat": {"infects": "<material>",
   // "infectCost": <levels>}, B2). Where a coat of this sits ON, or face-
   // adjacent to one the named infection targets that faces the same open space as the coat (a wound rim), that voxel

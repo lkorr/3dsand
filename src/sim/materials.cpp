@@ -436,9 +436,9 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
   auto rate = [&](const char* key, float& out) {
     if (!in.contains(key)) return;  // absent: the gore knobs (sentinel < 0)
     const float r = in.value(key, -1.0f);
-    if (!(r >= 0.0f) || r > 240.0f) {
+    if (!(r >= 0.0f) || r > 30.0f) {
       errors += path + ": material \"" + d.name + "\": infect " + key +
-                " must be 0..240 world voxels/min\n";
+                " must be 0..30 per voxel per second\n";
       return;
     }
     out = r;
@@ -480,6 +480,7 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
               "\": infect cause must be \"burn\" or \"infection\"\n";
   d.infectBooksBurn = cause == "burn";
   d.infectDeath = in.value("death", std::string());
+  d.infectCuredName = in.value("cured", std::string());
   d.infect = true;
 }
 
@@ -1510,9 +1511,14 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     }
     // infectSpread rules are dropped entirely when the rate is zero, same as
     // a weather switch that is off: the rot is turned off by the slider.
-    if (r.value("infectSpread", false) &&
-        CurrentTuning().gore.infectSpreadRate <= 0.0f)
-      continue;
+    // THE RATE IS THE SELF MATERIAL'S OWN (`infect.spread`, per voxel per
+    // second; absent = gore.infectSpreadRate, the rot's knob) -- the same
+    // number Mob::InfectStep runs on a body, so there is one per infection.
+    const float infectRate =
+        mats[selfId].infect && mats[selfId].infectSpread >= 0.0f
+            ? mats[selfId].infectSpread
+            : CurrentTuning().gore.infectSpreadRate;
+    if (r.value("infectSpread", false) && infectRate <= 0.0f) continue;
 
     ReactionGpu g{};
     g.nbrMat = kNbrAny;
@@ -1640,18 +1646,18 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
       if (chanceMille > 1000.0) chanceMille = 1000.0;
       if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
     }
-    // ---- "infectSpread": grid-side rot, driven by gore.infectSpreadRate -----
+    // ---- "infectSpread": a grid-side infection, at its body rate -----------
     //
-    // The mob-side infection (Mob::TickInfection) converts tissue at
-    // gore.infectSpreadRate world voxels per minute per limb. These grid rules
-    // are the same disease on world voxels. A grid cell at 30 Hz with chance c
-    // per-mille converts each of its 6 faces at c/1000 per tick, giving
-    // 6 * c/1000 * 1800 = 10.8c expected conversions per cell per minute. So
-    // c = infectSpreadRate / 10.8 to match the mob-side rate. The authored
-    // chance is a placeholder; the tuning value replaces it entirely.
+    // On a body (Mob::InfectStep) an infectious voxel converts ONE matching
+    // face-neighbour with chance `spread` per second. A grid cell is one world
+    // voxel and a rule is a per-face, per-tick chance, so the same rate is
+    // `spread` spread over the six faces: c per-mille a face a tick with
+    // 6 * c/1000 * 30 = spread, i.e. c = spread * 1000 / 180. A cell walled in
+    // by tissue on all six sides converts at exactly the body rate; one with
+    // k tissue faces at k/6 of it. The authored chance is a placeholder.
     // Rate == 0 is handled above (the rule is dropped).
     if (r.value("infectSpread", false)) {
-      chanceMille = (double)CurrentTuning().gore.infectSpreadRate / 10.8;
+      chanceMille = (double)infectRate * 1000.0 / 180.0;
       if (chanceMille > 1000.0) chanceMille = 1000.0;
       if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
     }
@@ -1874,6 +1880,15 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
                   d.coatInfectsName + "\" is not a material with an infect block\n";
       else
         d.coatInfects = (uint32_t)id;
+    }
+    d.infectCured = 0;
+    if (!d.infectCuredName.empty()) {
+      const int id = FindMaterial(m, d.infectCuredName);
+      if (id <= 0)
+        errors += materialsPath + ": material \"" + d.name +
+                  "\": infect cured \"" + d.infectCuredName + "\" is not a material\n";
+      else
+        d.infectCured = (uint32_t)id;
     }
     d.infectTargetTags = 0;
     d.infectTargetIds.clear();

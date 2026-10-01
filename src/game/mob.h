@@ -1616,77 +1616,27 @@ struct MobLimb {
     uint8_t color;   // the art slot StainWound zeroes
   };
   std::vector<WoundWas> woundWas;
-  // ---- WHAT IS INFECTING THIS LIMB (PLAN_weapon_coats B1) -------------------
+  // ---- IS ANYTHING ON THIS LIMB INFECTIOUS (PLAN_weapon_coats B) ----------
   //
-  // Up to kInfectSlots infections at once, each an infection MATERIAL (one
-  // with an `infect` block: a zombie's rotflesh, a snake's envenomed) and the
-  // liquid that came in with it. Each slot runs on its own material's clock
-  // (Mob::InfectTick), so one arm can hold rot and venom together. A slot is
-  // cleared when its material has nothing left on the limb; the slots stay
-  // packed (an empty slot is never followed by a full one).
-  //
-  // What follows is the note the single slot carried, and it holds per slot.
-  //
-  // The material a BITE rewrote this limb's exposed flesh to (0 = none). It is
-  // remembered on the limb rather than derived, because the wound-revert table
-  // has to know which materials on THIS limb are "a wound settling" as opposed
-  // to "a material decaying", and the only thing that knows a zombie's rot is
-  // in this arm is the bite that put it there. Latched: a second bite by
-  // something else overwrites it, which is the honest answer -- the table can
-  // only carry so many, and the freshest infection is the one still spreading.
-  //
-  // Read by Mob::ViewOf, which arms the revive for it at gore.infectHealSlow.
-  // Never saved: a loaded body's rot is already in its lattice, and it heals
-  // at the ordinary rate from then on rather than not at all.
-  // ...AND WHAT IT LOOKS LIKE WHERE IT HAS EATEN THROUGH TO THE BONE.
-  //
-  // The LIQUID the bite smeared over the hole (a zombie's `bite.stain`, i.e.
-  // ichor -- 0 = none / not a liquid the palette can draw). Latched beside
-  // `infectMat` for one reason: the rot EATS FLESH AND LEAVES BONE, and bone
-  // is the one thing in the lattice it can neither convert nor remove, so a
-  // limb rotted through used to end up as a white anatomical bone sitting in a
-  // green wound. The infection pass coats what it exposes (Mob::InfectStep),
-  // and the substance it coats it with is a mix of this and the victim's own
-  // blood. Without the latch the pass would have to guess, because by the time
-  // the rot reaches bone the bite that carried the stain is long gone.
-  struct Infection {
-    uint16_t mat = 0;     // the infection material (0 = empty slot)
-    uint16_t stain = 0;   // the liquid it came in (bone coat), 0 = none
-  };
-  static constexpr int kInfectSlots = 3;
-  Infection infects[kInfectSlots];
-  bool Infected() const { return infects[0].mat != 0; }
-  int InfectSlotOf(uint32_t mat) const {
-    for (int k = 0; k < kInfectSlots; k++)
-      if (infects[k].mat != 0 && infects[k].mat == mat) return k;
-    return -1;
-  }
-  // Latch an infection. Already present: the freshest stain wins (a second
-  // bite's liquid). Full: the LAST slot is overwritten -- the freshest
-  // infection is the one still spreading, the single slot's old rule.
-  void AddInfect(uint16_t mat, uint16_t stain) {
-    if (mat == 0) return;
-    const int at = InfectSlotOf(mat);
-    if (at >= 0) {
-      infects[at].stain = stain;
-      return;
-    }
-    for (int k = 0; k < kInfectSlots; k++)
-      if (infects[k].mat == 0) {
-        infects[k] = Infection{mat, stain};
-        return;
-      }
-    infects[kInfectSlots - 1] = Infection{mat, stain};
-  }
-  // Drop one slot and keep the rest packed, in order.
-  void ClearInfectSlot(int k) {
-    if (k < 0 || k >= kInfectSlots) return;
-    for (int j = k; j + 1 < kInfectSlots; j++) infects[j] = infects[j + 1];
-    infects[kInfectSlots - 1] = Infection{};
-  }
-  void ClearInfects() {
-    for (Infection& f : infects) f = Infection{};
-  }
+  // An infection is not a thing the limb carries; it is VOXELS whose material
+  // has an `infect` block (rotflesh, envenomed, ...), each running the same
+  // per-voxel rule (Mob::InfectStep). The limb holds only this flag, so a limb
+  // with no infectious voxels costs one byte test a tick (rule 2). Set by
+  // every writer that puts an infectious material into the lattice (a bite, a
+  // coat seeding, a joint crossing, a twin copy, a graft); cleared by
+  // InfectStep when a sweep finds none left, and by a bare `disinfect`
+  // remedy (which stops every clock on the limb). Any number of different
+  // infection materials may share a limb: the flag does not say which.
+  // Never saved: a loaded body's infectious cells lie inert until something
+  // re-latches the limb -- what the single latch always did.
+  uint8_t infected = 0;
+  bool Infected() const { return infected != 0; }
+  // ...AND WHAT A BITE REWROTE THE FLESH TO (0 = none). NOT an infection
+  // list: it exists only for the wound-revert table (Mob::ViewOf arms the
+  // revive for it at gore.infectHealSlow), which has to know which material
+  // on THIS limb is "a wound settling" rather than "a material decaying".
+  // Latched: a second bite overwrites it.
+  uint16_t biteRewrite = 0;
   // THE INFECTION CARRIES NO CLOCK STATE, deliberately. The first version held
   // two fractional accumulators here and spent them in BURSTS of ~32 lattice
   // voxels, to amortise the O(limb) sweep each conversion needs. That is a
@@ -1821,6 +1771,7 @@ struct InfectSpec {
   bool turns = false;                // the dead rise (MobDef::turn)
   DamageCause cause = DamageCause::Infection;
   std::string death;                 // death cause when its damage kills
+  uint32_t cured = 0;                // what a filtered disinfect turns it into
 };
 
 // ============================================================================
@@ -4348,16 +4299,15 @@ class Mob {
                   std::string* why = nullptr) const;
  protected:
   HealStats healStats_;
-  // One limb's infection in `slot` (MobLimb::infects), on a tick whose dice
-  // came up non-zero. Same return contract.
-  bool InfectStep(int limbIndex, int slot, uint32_t tick, uint32_t nSpread,
-                  uint32_t nRot, World& world,
+  // One tick of the per-voxel rule over one latched limb. Same return
+  // contract as InfectTick.
+  bool InfectStep(int limbIndex, uint32_t tick, World& world,
                   std::vector<ParticleSpawn>& spawns);
-  // Cross-joint infection: converts tissue voxels on `toLimb` that are
-  // world-space adjacent to the infected voxel positions in `srcWorld`.
-  // Returns the number of voxels converted (0 if nothing touched).
-  uint32_t InfectAcrossJoint(int fromLimb, int slot, uint32_t tick, int toLimb,
-                             const std::vector<Vec3>& srcWorld);
+  // A spread event of `mat` from `fromLimb`, at a voxel by the joint it
+  // shares with `toLimb`: seeds ONE target voxel of `toLimb` near its own
+  // anchor, unless `mat` is already there. Returns cells converted (0 or 1).
+  uint32_t InfectAcrossJoint(int fromLimb, uint32_t mat, uint32_t tick,
+                             int toLimb);
   // What infection `mat` does: its InfectSpec, or the rot's rule for a
   // material the table has no block for (a legacy bite).
   const InfectSpec& InfectSpecFor(uint32_t mat) const;
@@ -4531,13 +4481,11 @@ class Mob {
       if (s.mat == mat) return &s;
     return nullptr;
   }
-  // The infection material in one of a limb's slots (MobLimb::infects), 0 =
-  // none / out of range. For gates and the debugger.
-  uint16_t LimbInfectMat(int limbIndex, int slot) const {
-    if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || slot < 0 ||
-        slot >= MobLimb::kInfectSlots)
-      return 0;
-    return limbs_[limbIndex].infects[slot].mat;
+  // Is the limb latched as carrying infectious voxels (MobLimb::infected)?
+  // For gates and the debugger.
+  bool LimbInfected(int limbIndex) const {
+    return limbIndex >= 0 && limbIndex < (int)limbs_.size() &&
+           limbs_[limbIndex].Infected();
   }
   // LIVE cells a FlushBurn carve removed besides its own tombstones (the
   // connectivity split / collider re-derive in CarveLimb's tail), by the

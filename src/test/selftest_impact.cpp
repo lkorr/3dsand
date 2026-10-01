@@ -2711,11 +2711,12 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
     for (size_t li = 0; li < def.limbs.size(); li++) {
       const MobLimbDef& ld = def.limbs[li];
       limbName.push_back(ld.name);
+      // EVERY arm and leg segment (eight on a human): the eaten / seeded
+      // ratio is a sum of branching processes whose spread is ~0.6 of its
+      // mean at a 50-cell dose (offspring variance R / (1 - R)^3 = 18 a seed
+      // at R = 2/3), so the sample has to be large for a band to mean much.
       if (ld.tag != "arm" && ld.tag != "leg") continue;
-      bool parentSame = false;
-      for (const MobLimbDef& p : def.limbs)
-        if (p.name == ld.parent && p.tag == ld.tag) parentSame = true;
-      if (!parentSame) limbs.push_back((int)li);
+      limbs.push_back((int)li);
     }
   }
   if (limbs.empty()) {
@@ -2730,10 +2731,22 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   mobs.Reset();
   c.debris.Reset();
   mobs.OnMaterialsReloaded(fast, c.reactions);
+  // ...and the ROT, for the rot + venom arm: its rates are the gore knobs, so
+  // it is cranked through gore.infectMobMult (venomWoundRotCrank); at the
+  // shipped per-voxel rates a 20-cell seed acts about once in this window.
+  const Tuning savedTune = CurrentTuning();
+  {
+    Tuning tt = savedTune;
+    tt.gore.infectMobMult =
+        savedTune.gore.infectMobMult *
+        (float)BaselineNumber("venomWoundRotCrank", 100.0);
+    SetCurrentTuning(tt);
+  }
   auto restore = [&]() {
     mobs.Reset();
     c.debris.Reset();
     mobs.OnMaterialsReloaded(c.mats, c.reactions);
+    SetCurrentTuning(savedTune);
   };
 
   const uint64_t a = mobs.Spawn(human, FixtureSite(c.world, 415));
@@ -2741,7 +2754,11 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   // THE CONTROL (orchestrator, 2026-10-01): the same pits as A, no venom, the
   // same ticks. Whatever bone it loses is the wound model's, not the venom's.
   const uint64_t ctl = mobs.Spawn(human, FixtureSite(c.world, 435));
-  if (!a || !b || !ctl) {
+  // ROT AND VENOM ON ONE LIMB (owner, 2026-10-01): a zombie's bite and the
+  // venom soak on the same upper arm; both infections must run side by side
+  // on the per-voxel rule, with nothing on the limb saying which is there.
+  const uint64_t both = mobs.Spawn(human, FixtureSite(c.world, 445));
+  if (!a || !b || !ctl || !both) {
     restore();
     detail = "could not spawn three humans";
     return Status::Fail;
@@ -2749,6 +2766,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   mobs.SetMobBehavior(a, "dummy");
   mobs.SetMobBehavior(b, "dummy");
   mobs.SetMobBehavior(ctl, "dummy");
+  mobs.SetMobBehavior(both, "dummy");
   // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, not the subject --
   // SpawnTarget's eight settling steps, for two bodies at once.
   for (int i = 0; i < 8; i++) {
@@ -2791,6 +2809,37 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   };
   const uint32_t holes = carvePits(a);
   const uint32_t holesCtl = carvePits(ctl);
+  const uint32_t rotMat = mobs.MaterialIdNamed("rotflesh");
+  const uint32_t ichorMat = mobs.MaterialIdNamed("ichor");
+  const int bothLimb = limbs.front();
+  uint32_t bothBitten = 0;
+  if (rotMat) {
+    const LimbAxis ax = MeasureLimb(mobs, both, bothLimb);
+    if (ax.valid) {
+      Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+      float bestR = -1.0f;
+      for (uint32_t k = 0; k < 96; k++) {
+        const Vec3 p = mobs.LimbVoxelPos(both, bothLimb, k * 7919u + 13u);
+        const float t = (p - ax.anchor).dot(ax.along);
+        if (t < ax.reach * 0.33f || t > ax.reach * 0.66f) continue;
+        const float r = (p - ax.anchor - ax.along * t).len();
+        if (r > bestR) {
+          bestR = r;
+          at = p;
+        }
+      }
+      // Bitten until the rot took (a bite can rewrite no flesh at all and
+      // leave only its ichor smear; see the zombify fixture's note).
+      for (uint32_t k = 0; k < 6 && bothBitten < 8; k++) {
+        if (!mobs.LimbBody(both, bothLimb)) break;
+        const Vec3 p = k == 0 ? at
+                              : mobs.LimbVoxelPos(both, bothLimb, 977u * k + 5u);
+        BiteOnce(mobs, c.world, both, bothLimb, p, 4.0f, (uint16_t)rotMat,
+                 (uint16_t)ichorMat, 1.0f, 0xB0B0u + k, spawns);
+        bothBitten = mobs.LimbMaterialCount(both, bothLimb, rotMat);
+      }
+    }
+  }
 
   // Measured AFTER the carve and BEFORE the venom, so the deltas are the
   // venom's alone.
@@ -2829,6 +2878,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   for (int li : limbs) {
     soakedA += mobs.SoakLimb(a, li, venom, 15, tick);
     soakedB += mobs.SoakLimb(b, li, venom, 15, tick);
+    if (li == bothLimb) mobs.SoakLimb(both, li, venom, 15, tick);
   }
 
   const Vec3 fo = mobs.MobOrigin(a);
@@ -2856,6 +2906,8 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   }
   const Mob::InfectStat sa = mobs.InfectStatsOf(a, envenomed);
   const Mob::InfectStat sb = mobs.InfectStatsOf(b, envenomed);
+  const Mob::InfectStat bothRot = mobs.InfectStatsOf(both, rotMat);
+  const Mob::InfectStat bothVen = mobs.InfectStatsOf(both, envenomed);
   // WHERE IT IS STILL SITTING, when it did not burn out (rule 6: a bare count
   // is not a measurement): every limb still holding envenomed, with whether it
   // has a body and which infections its slots carry.
@@ -2867,7 +2919,7 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
         if (!n) continue;
         left += Format(" %s:%u%s[", li < (int)limbName.size() ? limbName[li].c_str() : "?",
                        n, mobs.LimbBody(a, li) ? "" : " NO BODY");
-        for (int s = 0; s < 3; s++) left += Format("%u,", m->LimbInfectMat(li, s));
+        left += m->LimbInfected(li) ? "latched" : "NOT latched";
         left += "]";
       }
     }
@@ -2910,13 +2962,25 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   const int boneLossVenom = boneLossA - boneLossC;
   restore();
 
-  // THE EXPECTED WINDOW, from the authored numbers at the scaled rate: the
-  // largest limb's dose divided by e - s in its own lattice cells a tick.
+  // THE EXPECTED WINDOW, from the authored numbers at the scaled rate. Per
+  // voxel the venom is a subcritical birth-death process: each cell is eaten
+  // at mu = eat * s per second (s = lattice cells per world voxel) and spawns
+  // at lambda = spread * s while it lives, R = lambda / mu. The mean time for
+  // a dose of D to die out is H(D, R) / mu with
+  //   H(D, R) = sum_{i=1..D} sum_{j>=0} R^j / (i + j),
+  // which is the harmonic number H_D at R = 0 (pure decay). Taken for the
+  // largest single-limb dose (the last of the four to clear sets the tick).
   const uint32_t scale = defSkinScale;
-  const double lat = (double)scale * scale * scale;
-  const double netPerTick =
-      (double)(envDef.infectEat - envDef.infectSpread) * kScale * lat / 1800.0;
-  const double expectTicks = netPerTick > 0.0 ? (double)doseMax / netPerTick : 0.0;
+  const double R = envDef.infectEat > 0.0f
+                       ? (double)envDef.infectSpread / (double)envDef.infectEat
+                       : 0.0;
+  double H = 0.0;
+  for (uint32_t i = 1; i <= doseMax; i++) {
+    double rj = 1.0;
+    for (int j = 0; j < 400 && rj > 1e-9; j++, rj *= R) H += rj / (double)(i + j);
+  }
+  const double muPerTick = (double)envDef.infectEat * kScale * scale / 30.0;
+  const double expectTicks = muPerTick > 0.0 ? H / muPerTick : 0.0;
   const double window = expectTicks > 0.0 && clearedAt
                             ? (double)(clearedAt - firstSeen + 1) / expectTicks
                             : 0.0;
@@ -2955,6 +3019,14 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   const bool boneKept = tookBone == 0 && tookSkin == 0;
   const bool skinStops = sb.seeded == 0 && sb.spread == 0 && bMax == 0 &&
                          hpInfB == 0.0f;
+  // ...AND THE BONE CENSUS, MINUS THE CONTROL: whatever A loses beyond the
+  // same pits without venom is the venom's, and that must be (about) none.
+  const int kBoneLossMax = (int)BaselineNumber("venomWoundBoneLossMax", 2);
+  const bool boneCensus = boneLossVenom <= kBoneLossMax;
+  // ROT AND VENOM TOGETHER: both ran on the one limb.
+  const bool coexist = !rotMat || bothBitten == 0 ||
+                       ((bothRot.spread + bothRot.eaten) > 0 &&
+                        (bothVen.seeded > 0 && bothVen.spread + bothVen.eaten > 0));
 
   detail = Format(
       "%u holes, venom on %u / %u cells (A / B) | A: seeded %u, spread %u, "
@@ -2975,17 +3047,25 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
                    bone0, bone1, boneLossA, holesCtl, boneC0, boneC1, boneLossC,
                    boneLossVenom, tailBoneA, tailA.c_str(), tailBoneC,
                    tailC.c_str());
+  detail += Format(" | ROT+VENOM on one arm: bite left %u rot; rot spread %u "
+                   "eaten %u, venom seeded %u spread %u eaten %u",
+                   bothBitten, bothRot.spread, bothRot.eaten, bothVen.seeded,
+                   bothVen.spread, bothVen.eaten);
+  RecordObserved("venomWoundBothRotActs", (double)(bothRot.spread + bothRot.eaten));
+  RecordObserved("venomWoundBothVenomActs", (double)(bothVen.spread + bothVen.eaten));
   if (!left.empty()) detail += " | still envenomed:" + left;
   if (seeded && spread && burntOut && threeX && onTime && hurt && boneKept &&
-      skinStops)
+      skinStops && boneCensus && coexist)
     return Status::Pass;
   const char* why = !seeded      ? "the coat seeded nothing in the wounds"
                     : !spread    ? "the venom never spread"
                     : !burntOut  ? "the venom did not burn itself out in the window"
                     : !threeX    ? "eaten / seeded is outside the band round 3"
-                    : !onTime    ? "the burn-out took far from D / (e - s)"
+                    : !onTime    ? "the burn-out took far from H(D, R) / mu"
                     : !hurt      ? "no hp was booked to Infection"
                     : !boneKept  ? "the venom converted bone or skin"
+                    : !boneCensus ? "A lost more bone than the control"
+                    : !coexist   ? "rot and venom did not both run on one limb"
                                  : "a venom coat on whole skin seeded or hurt";
   detail = std::string(why) + ": " + detail;
   return Status::Fail;

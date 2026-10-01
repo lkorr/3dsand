@@ -3233,23 +3233,23 @@ void Overlay::Draw(UIState& s) {
                   "longer. On undead whose wounds don't heal, rot never\n"
                   "goes away regardless.");
             ImGui::TextDisabled("the infection is alive");
-            f("infection spread (vox/min)", &g.infectSpreadRate, 0.0f, 20.0f,
-              "%.2f");
+            f("infection spread (/voxel/s)", &g.infectSpreadRate, 0.0f, 0.05f,
+              "%.5f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "How fast the rot GROWS, in world voxels a minute, per\n"
-                  "infected limb. It converts healthy tissue next to\n"
+                  "How fast the rot GROWS: per rotflesh voxel, the chance\n"
+                  "a second it converts a neighbour. It converts tissue next to\n"
                   "itself — soft tissue only, bone stays bone — so it\n"
                   "creeps out from the wound as a front. A limb with no\n"
                   "tissue left crosses a JOINT into the next limb, which\n"
                   "is how a bitten hand eventually reaches the torso.\n"
                   "0 = a bite is a static mark again.");
-            f("rot / disintegration (vox/min)", &g.infectRotRate, 0.0f, 20.0f,
-              "%.2f");
+            f("rot / disintegration (/voxel/s)", &g.infectRotRate, 0.0f, 0.05f,
+              "%.5f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "How fast the rot EATS you, in world voxels a minute,\n"
-                  "per infected limb. Infected voxels evaporate for good.\n"
+                  "How fast the rot EATS you: per rotflesh voxel, the\n"
+                  "chance a second it is eaten. Eaten voxels are gone.\n"
                   "Charged through the ordinary burn flush: hp falls with\n"
                   "the fraction of the limb that is gone, a limb eaten\n"
                   "past collapse comes off, a vital limb eaten through\n"
