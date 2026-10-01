@@ -1739,8 +1739,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
         const int pi = sk.FindPart(pn);
         const int mi = FindModel(def.prefab, pn);
         if (pi < 0 || mi < 0) {
-          log += jp + ": slither names unknown part \"" + pn + "\"
-";
+          log += jp + ": slither names unknown part \"" + pn + "\"\n";
           continue;
         }
         const PrefabModel& m = def.prefab.models[mi];
@@ -1770,8 +1769,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
         num("bendHalfLife", sd.bendHalfLife, 0.01f, 2.0f);
         def.slither = std::move(sd);
       } else {
-        log += jp + ": slither needs at least three parts laid along +Z
-";
+        log += jp + ": slither needs at least three parts laid along +Z\n";
       }
     }
 
