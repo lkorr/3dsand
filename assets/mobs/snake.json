@@ -1,0 +1,547 @@
+{
+  "//": "THE SNAKE (docs/PLAN_weapon_coats.md package D). A legless body of twelve segments laid straight along +Z, posed by the `slither` block (Mob::ApplySlither, game/pose.cpp) and laid on the ground by its always-on prone state. The .vox and every limb's `anchor` and the jaws' `edge` are WRITTEN by `node scripts/gen_snake.mjs`; edit the table there, not the numbers here. DESIGN.md 'The snake'.",
+  "root": "body5",
+  "artVoxelsPerMetre": 80,
+  "bleed": {
+    "material": "blood",
+    "perDamage": 2
+  },
+  "sounds": {
+    "dismember": "dismember",
+    "bleed": "bleed"
+  },
+  "//anatomy": "Skin, a flesh layer, a muscle layer and a bone core: in a body this thin the core IS the spine. The head is a thin skull over jaw muscle, with a brain at the back and the VENOM GLANDS either side of it. PLACEHOLDER: the gland is `flesh` until package B lands `venom_gland`; it is ONE string (limbs.head.carve[0].material) -- change it and re-run `node scripts/gen_snake.mjs` (the engine re-resolves the recipe at load anyway; the bake keeps anatomy-parity).",
+  "anatomy": {
+    "layers": [
+      {
+        "material": "skin",
+        "depth": 1,
+        "keep": true
+      },
+      {
+        "material": "flesh",
+        "depth": 1
+      },
+      {
+        "material": "muscle",
+        "depth": 1,
+        "speckle": {
+          "material": "blood",
+          "fraction": 0.05
+        }
+      },
+      {
+        "material": "bone"
+      }
+    ],
+    "limbs": {
+      "head": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "flesh",
+            "depth": 1
+          },
+          {
+            "material": "bone",
+            "depth": 1
+          },
+          {
+            "material": "muscle"
+          }
+        ],
+        "carve": [
+          {
+            "material": "flesh",
+            "where": "muscle",
+            "box": {
+              "y": [
+                0.15,
+                0.8
+              ],
+              "z": [
+                0.2,
+                0.62
+              ]
+            }
+          },
+          {
+            "material": "brain",
+            "where": "muscle",
+            "box": {
+              "x": [
+                0.34,
+                0.66
+              ],
+              "y": [
+                0.3,
+                1
+              ],
+              "z": [
+                0.05,
+                0.5
+              ]
+            }
+          }
+        ]
+      },
+      "tail": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "muscle",
+            "depth": 1
+          },
+          {
+            "material": "bone"
+          }
+        ]
+      }
+    }
+  },
+  "//speed": "World voxels per second: 0.8 m/s, a brisk snake. The wave's phase is the distance covered, so this is also what sets how fast the S travels down the body (frequency = speed / wavelength).",
+  "speed": 8,
+  "locomotion": {
+    "turnRate": 2.4,
+    "turnAccel": 12,
+    "turnRateMoving": 1.1,
+    "driveAlignFull": 0.5,
+    "driveAlignZero": 1.6
+  },
+  "//slither": "LATERAL UNDULATION (MobDef::SlitherDef). `parts` head first. Lengths are fractions of the chain's own rest length (1.8 m here): a wave every 0.55 of a body, swinging 0.09 of a body either side, the head held at 0.3 of that and reaching full swing 0.3 of the body back. A turn lays the chain on the turn's own arc (turnBend), capped at maxCurvature per voxel.",
+  "slither": {
+    "parts": [
+      "head",
+      "body1",
+      "body2",
+      "body3",
+      "body4",
+      "body5",
+      "body6",
+      "body7",
+      "body8",
+      "body9",
+      "body10",
+      "tail"
+    ],
+    "wavelength": 0.55,
+    "amplitude": 0.085,
+    "ampHead": 0.3,
+    "ampRamp": 0.3,
+    "turnBend": 1,
+    "maxCurvature": 0.18,
+    "bendHalfLife": 0.2
+  },
+  "//aim": "The jaws are an AIM effector (no chain owns the head). Nine spine-tagged segments share the yaw half; the cut carries the head only a voxel past its neck (aimLeanBodies x 18 voxels of body), because the lunge and the coil unwinding are what close the gap on a body this long.",
+  "aimSpineShare": 0.45,
+  "aimLeanBodies": 0.06,
+  "limbs": [
+    {
+      "name": "head",
+      "parent": "body1",
+      "joint": "ball",
+      "hp": 24,
+      "severable": true,
+      "vital": true,
+      "tag": "head",
+      "severImpactSpeed": 16,
+      "anchor": [
+        6.5,
+        3.5,
+        127
+      ]
+    },
+    {
+      "name": "body1",
+      "parent": "body2",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4,
+        117
+      ]
+    },
+    {
+      "name": "body2",
+      "parent": "body3",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4,
+        106
+      ]
+    },
+    {
+      "name": "body3",
+      "parent": "body4",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4.5,
+        95
+      ]
+    },
+    {
+      "name": "body4",
+      "parent": "body5",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4.5,
+        84
+      ]
+    },
+    {
+      "name": "body5",
+      "hp": 22,
+      "severable": false,
+      "vital": true,
+      "tag": "spine"
+    },
+    {
+      "name": "body6",
+      "parent": "body5",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4.5,
+        73
+      ]
+    },
+    {
+      "name": "body7",
+      "parent": "body6",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4,
+        62
+      ]
+    },
+    {
+      "name": "body8",
+      "parent": "body7",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        4,
+        51
+      ]
+    },
+    {
+      "name": "body9",
+      "parent": "body8",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        3.5,
+        40
+      ]
+    },
+    {
+      "name": "body10",
+      "parent": "body9",
+      "joint": "ball",
+      "hp": 16,
+      "severable": true,
+      "tag": "spine",
+      "severImpactSpeed": 12,
+      "anchor": [
+        6.5,
+        3.5,
+        29
+      ]
+    },
+    {
+      "name": "tail",
+      "parent": "body10",
+      "joint": "ball",
+      "hp": 10,
+      "severable": true,
+      "tag": "tail",
+      "severImpactSpeed": 10,
+      "anchor": [
+        6.5,
+        2.5,
+        18
+      ]
+    }
+  ],
+  "//natural": "FANGS, NOT A MOUTHFUL: `biteRadius` 0.5 of gore.biteRadius punctures a couple of art voxels in, and the bite block below is what the hole is filled with.",
+  "natural": [
+    {
+      "name": "jaws",
+      "part": "head",
+      "edge": {
+        "from": [
+          6.5,
+          3,
+          5
+        ],
+        "to": [
+          6.5,
+          3,
+          16
+        ],
+        "halfWidth": 7
+      },
+      "strike": {
+        "blunt": 0.5,
+        "bite": 4,
+        "biteRadius": 0.5
+      }
+    }
+  ],
+  "//bite": "WHAT THE FANGS CARRY. PLACEHOLDERS until package B: `infect` will be `envenomed` and `stain` will be `venom`; they are the zombie's rot for now so the bite path is exercised end to end.",
+  "bite": {
+    "infect": "rotflesh",
+    "stain": "ichor"
+  },
+  "behavior": "snake",
+  "//states": "A SNAKE IS PRONE BY NATURE: `always` matches unconditionally, so the body is laid on the fitted ground plane (SettleClipOwnedBody) and every segment follows its own stretch of it (ConformProneSegments), the same two stages a legless zombie's crawl uses.",
+  "states": [
+    {
+      "name": "slither",
+      "always": true,
+      "disableGait": true,
+      "groundAlign": 1,
+      "speedScale": 1,
+      "lungeScale": 1,
+      "bodyYOffset": 0
+    }
+  ],
+  "clips": {
+    "snake_strike": {
+      "durationMs": 760,
+      "loop": false,
+      "mode": "override",
+      "mask": [
+        "body1",
+        "body2",
+        "body3",
+        "body4"
+      ],
+      "blendInMs": 80,
+      "blendOutMs": 220,
+      "tracks": {
+        "body1": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 300,
+              "q": [
+                -0.1438,
+                -0.2685,
+                -0.0406,
+                0.9516
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 400,
+              "q": [
+                -0.045,
+                0,
+                0,
+                0.999
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 760,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        },
+        "body2": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 300,
+              "q": [
+                -0.0976,
+                0.4546,
+                0.0502,
+                0.8839
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 400,
+              "q": [
+                -0.033,
+                0,
+                0,
+                0.9995
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 760,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        },
+        "body3": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 300,
+              "q": [
+                0,
+                -0.4573,
+                0,
+                0.8893
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 400,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 760,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        },
+        "body4": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 300,
+              "q": [
+                0,
+                0.2715,
+                0,
+                0.9624
+              ],
+              "ease": "cubicIn"
+            },
+            {
+              "t": 400,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "cubicOut"
+            },
+            {
+              "t": 760,
+              "q": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "ease": "linear"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "flipbooks": {}
+}

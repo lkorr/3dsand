@@ -9136,6 +9136,277 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
   return done(ok ? Status::Pass : Status::Fail);
 }
 
+// ---- snake ------------------------------------------------------------------
+//
+// THE SNAKE SLITHERS, AND IT BITES (docs/PLAN_weapon_coats.md package D;
+// assets/mobs/snake.json, Mob::ApplySlither).
+//
+// PASS A, THE SLITHER. Spawned on flat ground with a target 34 voxels ahead,
+// the snake is driven by its own behaviour profile and four things are
+// measured over the run, each because a different fault produces it:
+//
+//   travel    planar distance the body's centre closed toward the target. A
+//             snake that poses beautifully and goes nowhere is a statue.
+//   clear     every live segment's lowest voxel against the ground under THAT
+//             voxel, worst case over the run, both ways (float and sink). The
+//             body is laid on the ground by the prone state and each segment
+//             conforms to its own stretch of it; a segment held off the floor
+//             reads as a plank, one inside it as broken.
+//   waves     the samples on which the segment centres, taken as offsets from
+//             the line fitted through them, change sign at least twice along
+//             the body. A rigid rod (or a wave too small to see) has none.
+//   slip      THE NO-SKATING CLAIM. For each interior segment, the part of its
+//             world displacement across its own length (perpendicular to the
+//             line through its neighbours), summed, over the summed
+//             displacement. A wave fixed in the BODY slides every segment
+//             sideways and measures near 1; a wave fixed in the WORLD (the
+//             odometer phase) has every segment travel along itself and
+//             measures near 0.
+//
+// PASS B, THE BITE. A human training dummy (faction quarry, never moves) is
+// placed in front of the snake. The snake must strike within `snake.biteTicks`
+// and leave its bite's infect material in the victim's flesh -- read off the
+// SNAKE'S OWN def (MobDef::bite), so the gate follows the sidecar when the
+// placeholder rot becomes venom.
+//
+// Thresholds live in tests/baseline.json (`snake.*`).
+Status GateSnake(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  int snakeDef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "snake") snakeDef = (int)i;
+  if (snakeDef < 0) {
+    detail = "no mob def named \"snake\" (assets/mobs/snake.json)";
+    return Status::Fail;
+  }
+  const MobDef& sd = c.mobs.Defs()[snakeDef];
+  if (!sd.slither.present || sd.slither.parts.size() < 5) {
+    detail = "snake.json has no usable `slither` chain";
+    return Status::Fail;
+  }
+  if (c.mobs.Behaviors().Find("snake") < 0 ||
+      c.mobs.Behaviors().Find("training_dummy") < 0) {
+    detail = "behaviors.json lacks the \"snake\" or \"training_dummy\" profile";
+    return Status::Fail;
+  }
+  const std::vector<int>& chain = sd.slither.parts;
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 30, kDefaultSeed, relief);
+  const int h0 = World::TerrainHeight(spot.x, spot.z, kDefaultSeed);
+  AiTicker tick{c, 9400, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+  auto groundTop = [&](float x, float z) {
+    return (float)(World::TerrainHeight(ifloor(x), ifloor(z), kDefaultSeed) + 1);
+  };
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("snake: FAILED %s\n", what.c_str());
+    }
+  };
+  auto cleanup = [&]() {
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+  };
+
+  // ---- PASS A: the slither -------------------------------------------------
+  const float startCz = (float)spot.z - 14.0f;
+  const Vec3 target{(float)spot.x + 0.5f, (float)(h0 + 1) + 8.0f,
+                    startCz + 34.0f};
+  c.mobs.SetPlayerActor(target, 3.0f, 17.0f, true);
+  const uint64_t id = c.mobs.Spawn(
+      snakeDef, {spot.x - (int)std::lround(sd.worldSize.x * 0.5f), h0 + 1,
+                 (int)std::lround(startCz - sd.worldSize.z * 0.5f)});
+  if (id == 0) {
+    cleanup();
+    detail = "Spawn refused the snake";
+    return Status::Fail;
+  }
+  for (int i = 0; i < 10; i++) tick();
+  const int loco = c.mobs.LocoState(id);
+  check(loco >= 0 && loco < (int)sd.skel.states.size() &&
+            sd.skel.states[loco].groundAlign > 0.0f,
+        "the snake is in a prone loco state at rest (its `always` state)");
+  auto centre = [&]() { return AiMobCentre(c.mobs, id, sd); };
+  const Vec3 c0 = centre();
+  const float gap0 = AiPlanar(c0, target);
+
+  const int ticks = (int)BaselineNumber("snake.travelTicks", 150.0);
+  float floatMax = -1e9f, sinkMax = -1e9f;
+  int samples = 0, waved = 0;
+  double slip = 0, moved = 0;
+  std::vector<Vec3> prev(chain.size()), now(chain.size());
+  std::vector<uint8_t> have(chain.size(), 0), havePrev(chain.size(), 0);
+  for (int t = 0; t < ticks; t++) {
+    tick();
+    Mob* m = c.mobs.FindMobById(id);
+    if (m == nullptr || !m->Alive()) break;
+    for (size_t k = 0; k < chain.size(); k++)
+      have[k] = m->LimbCentreWorld(chain[k], now[k]) ? 1 : 0;
+    // ---- slip, interior segments, from the tenth tick (the start-up turn)
+    if (t >= 10)
+      for (size_t k = 1; k + 1 < chain.size(); k++) {
+        if (!have[k] || !havePrev[k] || !have[k - 1] || !have[k + 1]) continue;
+        Vec3 d = now[k] - prev[k];
+        d.y = 0;
+        Vec3 tg = now[k - 1] - now[k + 1];
+        tg.y = 0;
+        const float tl = tg.len();
+        if (tl < 1e-3f) continue;
+        tg = tg * (1.0f / tl);
+        const float along = d.x * tg.x + d.z * tg.z;
+        const Vec3 across{d.x - tg.x * along, 0, d.z - tg.z * along};
+        slip += across.len();
+        moved += d.len();
+      }
+    prev = now;
+    havePrev = have;
+    // ---- clearance, every live segment, every fifth tick
+    if (t % 5 == 0) {
+      for (size_t k = 0; k < chain.size(); k++) {
+        const uint32_t n = c.mobs.LimbVoxelCount(id, chain[k]);
+        float lo = 1e9f;
+        Vec3 at{};
+        for (uint32_t v = 0; v < n; v++) {
+          const Vec3 p = c.mobs.LimbVoxelPos(id, chain[k], v);
+          if (p.y < lo) { lo = p.y; at = p; }
+        }
+        if (n == 0) continue;
+        const float clear = lo - groundTop(at.x, at.z);
+        floatMax = std::max(floatMax, clear);
+        sinkMax = std::max(sinkMax, -clear);
+      }
+    }
+    // ---- the wave, every fifth tick past the start-up
+    if (t >= 20 && t % 5 == 0) {
+      // Line through the segment centres (least squares, in the plane), then
+      // the signed offsets from it in head-to-tail order.
+      std::vector<Vec3> pts;
+      for (size_t k = 0; k < chain.size(); k++)
+        if (have[k]) pts.push_back(now[k]);
+      if (pts.size() >= 5) {
+        Vec3 mean{};
+        for (const Vec3& p : pts) mean += p;
+        mean = mean * (1.0f / (float)pts.size());
+        Vec3 axis = pts.front() - pts.back();
+        axis.y = 0;
+        axis = axis.len() > 1e-3f ? axis.normalized() : Vec3{0, 0, 1};
+        const Vec3 side{axis.z, 0, -axis.x};
+        int flips = 0;
+        float last = 0;
+        for (const Vec3& p : pts) {
+          const float off = (p - mean).dot(side);
+          if (std::fabs(off) < 0.05f) continue;
+          if (last != 0 && (off > 0) != (last > 0)) flips++;
+          last = off;
+        }
+        samples++;
+        if (flips >= 2) waved++;
+      }
+    }
+  }
+  const Vec3 c1 = centre();
+  const float closed = gap0 - AiPlanar(c1, target);
+  const float slipRatio = moved > 1e-3 ? (float)(slip / moved) : 1.0f;
+  const float minTravel = (float)BaselineNumber("snake.minTravelVox", 10.0);
+  const float maxFloat = (float)BaselineNumber("snake.maxFloatVox", 0.9);
+  const float maxSink = (float)BaselineNumber("snake.maxSinkVox", 0.9);
+  const float minWaveFrac = (float)BaselineNumber("snake.minWaveFrac", 0.8);
+  const float maxSlip = (float)BaselineNumber("snake.maxSlipRatio", 0.35);
+  check(closed > minTravel,
+        Format("it slithers toward the target (closed %.1f vox, floor %.1f)",
+               closed, minTravel));
+  check(floatMax <= maxFloat,
+        Format("no segment floats (worst %.2f vox above ground, cap %.2f)",
+               floatMax, maxFloat));
+  check(sinkMax <= maxSink,
+        Format("no segment sinks (worst %.2f vox below ground, cap %.2f)",
+               sinkMax, maxSink));
+  check(samples > 0 && (float)waved >= minWaveFrac * (float)samples,
+        Format("the body is a wave, not a rod (%d of %d samples alternate "
+               "sign twice, floor %.0f%%)",
+               waved, samples, minWaveFrac * 100.0f));
+  check(slipRatio <= maxSlip,
+        Format("the segments travel along themselves, not sideways (slip "
+               "%.2f of travel, cap %.2f)",
+               slipRatio, maxSlip));
+  RecordObserved("snake.travelObserved", (double)closed);
+  RecordObserved("snake.slipObserved", (double)slipRatio);
+  RecordObserved("snake.floatObserved", (double)floatMax);
+  RecordObserved("snake.sinkObserved", (double)sinkMax);
+  std::printf(
+      "snake slither: closed %.1f vox in %d ticks | worst float %.2f, sink "
+      "%.2f vox | wave on %d/%d samples | slip %.3f of %.1f vox moved "
+      "(relief %d)\n",
+      closed, ticks, floatMax, sinkMax, waved, samples, slipRatio,
+      (float)moved, relief);
+  cleanup();
+
+  // ---- PASS B: the bite ----------------------------------------------------
+  const int humanDef = AiHumanoidDef(c.mobs);
+  const uint32_t infect = sd.bite.infectMat;
+  check(infect != 0, "snake.json's bite names an infect material");
+  if (humanDef >= 0 && infect != 0) {
+    const MobDef& hd = c.mobs.Defs()[humanDef];
+    const float preyCz = (float)spot.z + 4.0f;
+    const uint64_t prey = c.mobs.Spawn(
+        humanDef, {spot.x - (int)std::lround(hd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround(preyCz - hd.worldSize.z * 0.5f)});
+    const float snakeCz = preyCz - (float)BaselineNumber("snake.biteGapVox", 12.0);
+    const uint64_t biter = c.mobs.Spawn(
+        snakeDef, {spot.x - (int)std::lround(sd.worldSize.x * 0.5f), h0 + 1,
+                   (int)std::lround(snakeCz - sd.worldSize.z * 0.5f)});
+    if (prey == 0 || biter == 0 ||
+        !c.mobs.SetMobBehavior(prey, "training_dummy")) {
+      check(false, "the bite fixture spawned (prey, snake, dummy profile)");
+    } else {
+      const int maxTicks = (int)BaselineNumber("snake.biteTicks", 300.0);
+      int took = -1, strikes = 0;
+      bool wasCutting = false;
+      uint32_t rot = 0;
+      for (int t = 0; t < maxTicks && took < 0; t++) {
+        tick();
+        const NpcStroke* s = c.mobs.MobStroke(biter);
+        const bool cutting = s != nullptr && s->Cutting();
+        if (cutting && !wasCutting) strikes++;
+        wasCutting = cutting;
+        rot = 0;
+        for (size_t li = 0; li < hd.limbs.size(); li++)
+          rot += c.mobs.LimbMaterialCount(prey, (int)li, infect);
+        if (rot > 0) took = t;
+      }
+      check(took >= 0,
+            Format("it strikes and leaves its bite's infect material in the "
+                   "victim within %d ticks (%d strike(s), %u voxels)",
+                   maxTicks, strikes, rot));
+      RecordObserved("snake.biteTickObserved", (double)took);
+      std::printf("snake bite: %d strike(s), first infected voxel at tick %d, "
+                  "%u infected voxels\n",
+                  strikes, took, rot);
+    }
+  } else if (humanDef < 0) {
+    check(false, "a humanoid def to bite");
+  }
+  cleanup();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  detail = Format("%d checks", checks);
+  std::printf("snake: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- LIVE RAGDOLL (DESIGN.md "A creature knocked down gets back up") --------
 //
 // Six claims, each a number this gate prints, so `--gate ragdoll` alone is
@@ -15246,6 +15517,9 @@ const std::vector<Gate>& MobGates() {
       // A body with no legs lies ON the slope and stops re-aiming every voxel.
       {"crawl-slope", "mob", {}, false, GateCrawlSlope, /*needsRender=*/false},
       {"crawl-still", "mob", {}, false, GateCrawlStill, /*needsRender=*/false},
+      // The snake: a legless body that slithers (a wave fixed in the world, laid
+      // on the ground segment by segment) and bites its infection in.
+      {"snake", "mob", {}, false, GateSnake, /*needsRender=*/false},
       // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
       {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
       // ...and what a limp landing COSTS. Its own gate rather than another
