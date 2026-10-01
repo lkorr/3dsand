@@ -938,6 +938,8 @@ const char* const kOrder[] = {
     // coat seeds `envenomed` in an open wound, it spreads into soft tissue
     // only and eats itself out at 3x its dose; on whole skin it does nothing.
     "venom-wound",
+    // ...and the ruler the rot was retuned against when it became per voxel.
+    "rot-clock",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

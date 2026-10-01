@@ -3290,11 +3290,12 @@
         "infectious"
       ],
       "molten": "fire",
-      "//infect": "THE ROT IS AN INFECTION BECAUSE OF THIS BLOCK (DESIGN.md 'Infection is a material'; sim/materials.h MaterialDef::infect). It carries the zombie's rot exactly as it ran before infections were data: `spread` and `eat` are NOT authored, so the rates stay the tuning knobs gore.infectSpreadRate / infectRotRate times gore.infectMobMult (world voxels a minute per infected limb); `targets` is not authored, so what it may take is each creature's per-material rotRate (flesh 1, bone 0.5); `floor` 4 is the old kInfectFloor (an infection may not eat its own seed out of existence); `cause` burn keeps its damage on the Burn ledger it has always booked to; `turns` is what makes a body that dies with it in a limb rise (sidecar `turn`).",
+      "//infect": "THE ROT IS AN INFECTION BECAUSE OF THIS BLOCK (DESIGN.md 'Infection is a material'; sim/materials.h MaterialDef::infect). Every rotflesh voxel runs the one per-voxel rule every infection runs: each second it converts one neighbouring tissue voxel with chance `spread` and is eaten with chance `eat`. `spread` and `eat` are NOT authored here, so they are the tuning knobs gore.infectSpreadRate / infectRotRate (per voxel per second since 2026-10-01; the world-grid rot rules in reactions.json read the same spread), times gore.infectMobMult on a body. Spread above eat (shipped 0.00075 / 0.000375, branching ratio 2) is a disease that grows; retuned against the `rot-clock` gate so a zombie bite on a human's upper arm reaches the torso on the same timescale as the per-limb model it replaced. `targets` is not authored, so what it may take is each creature's per-material rotRate (flesh 1, bone 0.5); `floor` 4: a limb's rot is never eaten below four cells (a small bite's seed is not eaten out before it can spread); `cause` burn keeps its damage on the Burn ledger it has always booked to; `turns`: a body that dies holding a voxel of it rises (sidecar `turn`); `cured`: what a filtered remedy (`disinfect:tag:infectious`) turns a cell of it into.",
       "infect": {
         "floor": 4,
         "cause": "burn",
-        "turns": true
+        "turns": true,
+        "cured": "flesh"
       }
     },
     {
@@ -4824,7 +4825,7 @@
       "tags": []
     },
     {
-      "//": "ENVENOMED TISSUE (docs/PLAN_weapon_coats.md B3; DESIGN.md 'Infection is a material'). What venom turns soft tissue into, and the second infection after the zombie's rotflesh -- a DIFFERENT rot voxel, dark and bruise-purple where the rot is green. Tagged like rotflesh (flammable, organic, dissolvable, and `infectious`, so holy water and sunwater sear it out the way they sear the rot). Crumbles to blood, so it is still the creature's tissue to every wound rule. Its `infect` block is the venom: it spreads only into SOFT tissue (tag:soft_tissue: flesh, muscle, brain, glands -- never skin, never bone, so a wound to the bone stops there) and EATS 1.5x as fast as it spreads, so it always burns itself out (floor 0). THE ARITHMETIC, per infected limb, rates constant per limb: spread s = 0.03, eat e = 0.045 world voxels a minute; on a human (skinScale 8, 512 lattice cells a world voxel) that is 15.36 and 23.04 cells a minute. A dose of D cells shrinks at e - s = 7.68 cells a minute, so it is gone after D / 7.68 minutes -- a sword wound's dose of 8..15 cells lasts 62..117 s -- having spread s/(e-s) = 2 D more and eaten e/(e-s) = 3 D in all. `hp` 250 per world voxel eaten on top of the volume charge: a 12-cell dose eats 36 cells (0.07 world voxels) and costs the limb about 18 hp. Books to the Infection ledger and names the death `venom`; the dead do not rise from it.",
+      "//": "ENVENOMED TISSUE (docs/PLAN_weapon_coats.md B3; DESIGN.md 'Infection is a material'). What venom turns soft tissue into, and the second infection after the zombie's rotflesh -- a DIFFERENT rot voxel, dark and bruise-purple where the rot is green. Tagged like rotflesh (flammable, organic, dissolvable, and `infectious`, so holy water and sunwater sear it out the way they sear the rot). Crumbles to blood, so it is still the creature's tissue to every wound rule. Its `infect` block is the venom: it spreads only into SOFT tissue (tag:soft_tissue: flesh, muscle, brain, glands -- never skin, never bone, so a wound to the bone stops there) and EATS 1.5x as fast as it spreads, so it always burns itself out (floor 0). THE ARITHMETIC, per voxel (the per-voxel rule every infection runs): each envenomed cell is eaten with chance e = 0.009 a second and converts a soft-tissue neighbour with chance s = 0.006 a second (per world-voxel cell; a human's skinScale-8 lattice runs its cells 8x as often, 0.072 and 0.048, so a front crosses an arm at the same physical speed and the RATIO is unchanged). So each cell has R = s / e = 2/3 offspring on average before it is eaten -- subcritical, it always burns out -- and a dose of D cells eats D / (1 - R) = 3 D in all, having spread 2 D more. How long that takes is a birth-death process: mean H(D, R) / mu with H = sum_{i=1..D} sum_{j>=0} R^j / (i + j) and mu = 0.072 a second on a human, i.e. 61 s for a dose of 5, 89 s for 12, 108 s for 20 (a little less where the wound runs out of soft tissue to spread into). `hp` 250 per world voxel eaten on top of the volume charge: a 12-cell dose eats 36 cells (0.07 world voxels) and costs the limb about 18 hp. Books to the Infection ledger and names the death `venom`; the dead do not rise from it.",
       "id": "envenomed",
       "class": "solid",
       "density": 980,
@@ -4844,8 +4845,8 @@
       ],
       "molten": "fire",
       "infect": {
-        "spread": 0.03,
-        "eat": 0.045,
+        "spread": 0.006,
+        "eat": 0.009,
         "floor": 0,
         "targets": [
           "tag:soft_tissue"
@@ -4853,7 +4854,8 @@
         "hp": 250,
         "cause": "infection",
         "death": "venom",
-        "turns": false
+        "turns": false,
+        "cured": "flesh"
       }
     },
     {

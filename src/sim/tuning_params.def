@@ -1777,8 +1777,8 @@ TP_F(gore, infectHealSlow, NO_WGSL, 6.0f, 1.0f, 512.0f)
 // human body's worth of voxels a minute stops being a disease and becomes a
 // dissolve, and the pass's per-burst work scales with it. 0 is meaningful on
 // either (see the note in tuning.h) so neither has a floor above it.
-TP_F(gore, infectSpreadRate, NO_WGSL, 1.0f, 0.0f, 240.0f)
-TP_F(gore, infectRotRate, NO_WGSL, 0.5f, 0.0f, 240.0f)
+TP_F(gore, infectSpreadRate, NO_WGSL, 0.00075f, 0.0f, 30.0f)
+TP_F(gore, infectRotRate, NO_WGSL, 0.000375f, 0.0f, 30.0f)
 TP_F(gore, infectMobMult, NO_WGSL, 1.0f, 0.0f, 50.0f)
 // The coat the rot lays on the bone it uncovers. All three are cosmetic
 // and all three are meaningful at their floor: 0 stain = white bone back,

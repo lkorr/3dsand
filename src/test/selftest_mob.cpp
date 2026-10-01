@@ -6115,19 +6115,42 @@ Status GateZombify(Ctx& c, std::string& detail) {
       }
       // ...and bitten, because what turns you is the rot in the flesh and not
       // the cuts.
+      //
+      // A FULL bite (the first arm's 4 hp at power 1), because since the rot
+      // became per-voxel (PLAN_weapon_coats B, 2026-10-01) what turns a body
+      // is a VOXEL of rot in it at death, not a latch: the 2 hp / 0.6 bite this
+      // arm used to throw rewrote no flesh at all on this pose (BiteHit's
+      // `took` counted only the ichor smear, and the old latch rose on that).
       ::BiteHit bt;
       bt.at = c.mobs.LimbVoxelPos(id, limb, 4441u);
-      bt.hp = 2.0f;
-      bt.power = 0.6f;
+      bt.hp = 4.0f;
+      bt.power = 1.0f;
       bt.infectMat = rotMat;
       bt.infectStain = c.mobs.Defs()[z2].bite.infectStain;
       bt.seed = 0x6017u;
-      if (c.mobs.LimbBody(id, limb))
+      // ...UNTIL THE ROT TOOK. Measured with the attribution below: on this
+      // carved pose one bite at 4441 rewrites NO flesh (its `took` was the ichor
+      // smear alone), and the old per-limb latch rose the body on that. A few
+      // tries at other surface points, each a real bite, until a voxel of rot
+      // is in it -- the premise of the arm, now stated as a fact it checks.
+      for (int tryN = 0; tryN < 8; tryN++) {
+        if (!c.mobs.LimbBody(id, limb)) break;
+        bt.at = c.mobs.LimbVoxelPos(id, limb, 4441u + 977u * (uint32_t)tryN);
+        bt.seed = 0x6017u + (uint32_t)tryN;
         c.mobs.BiteHit(c.mobs.LimbBody(id, limb), bt, c.world, spawns);
+        if (c.mobs.LimbMaterialCount(id, limb, rotMat) > 0) break;
+      }
       carvedVox = c.mobs.LimbArtVoxelCount(id, limb);
       const bool stillOn = c.mobs.LimbBody(id, limb) != 0;
+      // ATTRIBUTION (rule 6): the rot cells on the whole body at the death,
+      // and whether the death booked a rising at all.
+      uint32_t rotAtDeath = 0;
+      if (const Mob* mm = c.mobs.FindMobById(id))
+        for (int li = 0; li < mm->LimbCount(); li++)
+          rotAtDeath += c.mobs.LimbMaterialCount(id, li, rotMat);
       Mob* m = c.mobs.FindMobById(id);
       if (m != nullptr) m->Die();
+      const bool booked = c.mobs.RisingPending(id);
       c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
       uint64_t risen = 0;
       for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
@@ -6163,9 +6186,10 @@ Status GateZombify(Ctx& c, std::string& detail) {
              heldNow == heldWas && !gearWas.empty() && !heldWas.empty();
       if (!kept)
         keptWhy = Format(
-            "limb=%s on=%d risen=%llu full=%u carved=%u back=%u ctl=%u "
-            "worn=%s/%s held=%s/%s",
-            limbName.c_str(), stillOn ? 1 : 0, (unsigned long long)risen,
+            "limb=%s on=%d rotAtDeath=%u booked=%d risen=%llu full=%u "
+            "carved=%u back=%u ctl=%u worn=%s/%s held=%s/%s",
+            limbName.c_str(), stillOn ? 1 : 0, rotAtDeath, booked ? 1 : 0,
+            (unsigned long long)risen,
             fullVox, carvedVox, risenVox, ctlVox, gearWas.c_str(),
             gearNow.c_str(), heldWas.c_str(), heldNow.c_str());
     } else {

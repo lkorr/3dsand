@@ -1473,7 +1473,7 @@
       "selfBecomes": "flesh_cooked"
     },
     {
-      "note": "-------- rot: rotflesh spreads to adjacent living tissue in the world grid --------\nThe mob-side infection (gore.infectSpreadRate) converts tissue on limbs through Mob::TickInfection. These rules are the GRID-SIDE mirror: rotflesh that has settled into the world (a severed limb's remains, a corpse's puddle) infects any flesh, skin or muscle it touches. Chance 8 per-mille is deeply subcritical (~0.048 expected conversions per tick per cell), so it creeps rather than explodes and the chunk sleeps once the front runs out of tissue. Bone is deliberately immune."
+      "note": "-------- rot: rotflesh spreads to adjacent living tissue in the world grid --------\nThe body-side infection (Mob::InfectStep) runs every rotflesh voxel on one per-voxel rule at the rot's `spread` (gore.infectSpreadRate, per voxel per second). These rules are the GRID-SIDE mirror: rotflesh that has settled into the world (a severed limb's remains, a corpse's puddle) infects any flesh, skin or muscle it touches, and `infectSpread: true` makes the loader REPLACE the authored chance with that same number spread over six faces (c = spread * 1000 / 180 per-mille a face a tick, sim/materials.cpp) -- one rate for the rot, body and world. Bone is deliberately immune."
     },
     {
       "self": "rotflesh",

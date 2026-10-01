@@ -1742,9 +1742,18 @@ struct Tuning {
     // uniformly from the eligible rim, because a batched average of the right
     // size still looks like a machine (see the note above Mob::InfectTick for
     // the version that did, and what it looked like).
-    // world voxels/minute, per infected limb
+    // UNITS CHANGED 2026-10-01 (PLAN_weapon_coats B, owner follow-up): these
+    // are now the ROT's PER-VOXEL rates -- the chance per second that one
+    // rotflesh voxel (one world voxel across; a finer lattice runs its cells
+    // x scale as often) converts a neighbour / is eaten. Everything above about
+    // per-limb minutes describes the model these replaced (DESIGN.md
+    // "Infection is a material"). They are rotflesh's `infect` numbers
+    // (its block authors none) and the world-grid rot rules read the same
+    // spread (reactions.json `infectSpread`): one number, both places.
+    // Spread above rot (branching ratio > 1) is a disease that grows.
+    // per voxel per second
     float infectSpreadRate = TPD(gore, infectSpreadRate);
-    // world voxels/minute, per infected limb
+    // per voxel per second
     float infectRotRate = TPD(gore, infectRotRate);
     // multiplier on both rates for mob limbs only
     float infectMobMult = TPD(gore, infectMobMult);
