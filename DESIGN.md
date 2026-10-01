@@ -7130,6 +7130,79 @@ control limb loses 0, the acid is spent and the limb then holds. NOT covered:
 corpse contact does not ask a worn probe (corpses have no occlusion on the stain
 pass); the cube-path renderer (`debris.wgsl`) draws no coat at all.
 
+### A coat moves on contact (2026-10-01; `docs/PLAN_weapon_coats.md` A; `MobSystem::CoatOnContact` in `src/game/coattransfer.cpp`, `phys/coatcontact.*`, `game/itemcoat.h`, gate `coat-transfer`)
+
+Coat a blade, a mace, a gauntlet or a fist with any liquid and the coat goes
+where the blow goes. ONE rule for every striker and every material, with no
+material named in code: what a transferred coat DOES afterwards is whatever
+that material already does as a body coat (oil waits for a flame, acid eats,
+water rinses, a coat that seeds an infection seeds it). The exchange runs in
+`MeleeSweepDamage` after the cut, blunt and bite resolvers, for every
+creature-on-creature contact (NPC, player, corpse; loose debris is not done).
+
+- **Which striker voxels touched.** Not the probe's world point: the sweep's
+  contact lies ON its edge segment, so the contact is the fraction `edgeU`
+  along that segment, mapped onto the striking slot's own authored edge in its
+  own body frame (`Mob::StrikerEdgeLocal`: the strike hand's held item, its
+  haft for a haft sweep, else the natural weapon's part; a worn shell over that
+  part -- a gauntlet -- when its surface is within reach). The patch is every
+  exposed voxel within `max(carve radius, gear.coatContactRadius)` of the
+  nearest one, on the slot's authoritative lattice (`StainLattice`). A blade
+  coated only at the tip and struck with the base transfers nothing.
+- **Striker -> target.** A cut lays it on the WOUND WALL: the survivors
+  face-adjacent to the cells the kerf removed (`Mob::CutLimb` now hands back
+  its `CarveReport` cells). A blunt blow and a bite lay it on the surface patch
+  round the contact (the bruise footprint for blunt); it goes one cell deeper
+  only under skin that SPLIT (`kBruiseBroken`). A shell struck is coated on
+  its own surface. `gear.coatTransferFrac` of each material on the touched
+  voxels is offered, capped at `gear.coatTransferMax` levels per blow; the
+  nearest voxels get the most. Every write is `AddBodyStain` (`WashBodyStain`
+  for a washer), so `stainPrecedence` decides each voxel, and the striker
+  spends exactly what landed: amounts are conserved, a coat refused by a
+  corrosive one costs nothing.
+- **Target -> striker.** The struck patch's coat comes back the same way
+  (offers taken from both sides BEFORE either is written), and the wound's own
+  fluid (`Mob::WoundFluid`, only for a blow that opened anatomy) is SMEARED on
+  the voxels that went in at `gear.coatBleedPickup`: stainPrecedence's unpaid
+  branch, so it displaces only a weaker coat. A thick coat on a blade survives
+  one dirty hit and wears off under the next few. `StainWoundAs` still refuses
+  to make a held slot bleed; this is a coat ON the blade, not a wound in it.
+- **The item keeps it.** A held item's lattice is captured into its
+  `ItemInstance` (`Mob::CaptureHeld`, in the same `WornShellDamage` record
+  armour carries its holes in: one shell) whenever the hand's kit stack is read
+  without the body -- `KitFlushWorn` now covers the two hand slots, so every
+  move, take, shed and save brings it -- and put back by
+  `Mob::EquipItemAsWas` (coats only when the geometry is the authored one, the
+  whole lattice otherwise). `CaptureWorn` records a coated shell too, not only a
+  holed one. A clean whole item records nothing and stays a plain stack. Saved
+  in PLYR v10 / ITMS v7 (`PutCoats`: the coat words beside `PutDamage`'s
+  lattices); MOBS and the wire already carried `PrefabVoxel` whole. In the bag
+  NOTHING ticks it: a stored coat is frozen. Held or worn it dries at the
+  material's `coat.decay` through `StainTick`'s ordinary passes, which walk
+  every live slot (held and worn included). A same-named stack swapped into a
+  hand re-equips from the new stack (`Mob::HeldKitStale`).
+- **The item API** (`game/itemcoat.h`, for the item stage): `ItemLatticeMut`
+  (the instance's lattice, materialised as authored on first use),
+  `ItemLatticeIfAny`, `ItemLatticeDims` / `ItemAuthoredLattice` /
+  `ItemLatticeCount`, `ItemLatticeSettle` (a spotless lattice goes back to
+  "as authored"), `PushItemLatticeToLimb` (coats only, onto the held item or
+  the worn shells: `Mob::ApplyKitCoats`) and `CaptureLimbToItem`
+  (`KitFlushWorn`). A worn piece never worn has its AUTHORED cover lattice; a
+  lattice of that geometry put back on a wearer whose fit resampled the shell
+  gives only its coats where positions coincide (`WearOnRig`), never its
+  unfitted geometry.
+
+Knobs: `gear.coatTransferFrac` 0.5, `gear.coatTransferMax` 24 levels,
+`gear.coatContactRadius` 0.06 m, `gear.coatBleedPickup` 6. Gate
+`coat-transfer`: a tip-coated sword struck with its base leaves 0 coat; with
+its tip, coat on the wound wall (none buried), the tip's coat falls and the
+blade wears the target's fluid; a coated mace coats surface voxels only; a
+coated fist coats what it punches; the blade goes into the bag, the world
+ticks, it comes back voxel-for-voxel. NOT done: loose matter (a debris corpse
+piece, a dropped item) neither gives nor takes a coat on contact, and a
+dropped item's ground body draws the authored brick without its coat (the
+instance still carries it, so picking it up restores it).
+
 ### A coat that heals (2026-09-27, alchemy package D; `Mob::HealTick` / `HealLimbStep`, `MaterialDef::coatRestore`, gates `heal-restore` + `heal-wound`)
 
 Enchanted blood (strong) and enchanted water (gentle) HEAL the body they are

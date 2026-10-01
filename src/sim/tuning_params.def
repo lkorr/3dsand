@@ -1432,6 +1432,11 @@ TP_F(gear, biteThroughSoft, NO_WGSL, 14.0f, 0.0f, 200.0f)
 TP_F(gear, biteThroughHard, NO_WGSL, 60.0f, 1.0f, 400.0f)
 // A worn shell on a blast ray counts as this many terrain cells (W2-H).
 TP_F(gear, blastShellCells, NO_WGSL, 1.0f, 0.0f, 8.0f)
+// ---- a coat moves on contact (game/coattransfer.cpp, DESIGN.md section 7) ----
+TP_F(gear, coatTransferFrac, NO_WGSL, 0.5f, 0.0f, 1.0f)
+TP_I(gear, coatTransferMax, NO_WGSL, 24, 0, 512)
+TP_F(gear, coatContactRadius, NO_WGSL, 0.06f, 0.0f, 0.5f)
+TP_I(gear, coatBleedPickup, NO_WGSL, 6, 0, 15)
 
 
 // ==== avatar ====

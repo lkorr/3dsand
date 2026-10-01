@@ -1329,6 +1329,33 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         }
       }
       hitBodies.push_back(hb);
+      // ---- WHAT THE COAT EXCHANGE WILL NEED, TAKEN NOW (DESIGN.md §7) -----
+      // The struck slot by (creature, index, name) rather than by handle: any
+      // resolver below that carves rebuilds the body and the handle changes.
+      // Where on the striking edge the contact lies, as a fraction of it: the
+      // probe ran down the edge's own line (or, for a fist, along its travel
+      // from a point on it), so projecting onto this sub-step's segment says
+      // how far along the weapon the blow landed.
+      MobSystem::CoatContact coat;
+      if (kind != StruckKind::Debris) {
+        int cli = -1;
+        if (Mob* co = mobs.FindOwner(hb, &cli); co != nullptr && cli >= 0) {
+          coat.strikerId = wielder.Id();
+          coat.haft = s.haft;
+          const Vec3 ab = b - a;
+          const float ab2 = ab.dot(ab);
+          coat.edgeU = ab2 > 1e-8f
+                           ? std::clamp((at - a).dot(ab) / ab2, 0.0f, 1.0f)
+                           : 0.0f;
+          coat.radius = radius;
+          coat.targetId = co->Id();
+          coat.targetSlot = cli;
+          coat.targetSlotName = co->SlotName(cli);
+          coat.at = at;
+          coat.power = power;
+          coat.unarmed = s.selfMounted;
+        }
+      }
       // FIRST contact wins: a sweep that catches two limbs made one noise, and
       // it was made where the blade arrived first.
       if (!out.hasHitAt) {
@@ -1514,6 +1541,11 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // A weapon with no edge at all (a fist; a mace, very nearly) skips the
       // kerf outright rather than building a zero-depth slot and asking the
       // wound model to notice that it is nothing.
+      // What the coat exchange is told the blow was (the first part that
+      // actually resolved: a cut's wound wall beats a token blunt's bruise).
+      std::vector<IVec3> coatCells;
+      MobSystem::CoatHitKind coatKind = MobSystem::CoatHitKind::Blunt;
+      bool coatRan = false, biteLanded = false;
       if (s.strike.cut > 0.0f) {
         const float dmg = s.strike.cut * power * repeat;
         // Everything severed by these two calls is a BLADE cut, and gets the
@@ -1533,8 +1565,11 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         // has been cut through (game/mob.h BladeCut). The slot itself is
         // `parts.cut`, which a corpse is cut by too.
         if (mobs.Damage(hb, dmg, at, out.tipSpeed, blade) &&
-            (!parts.cut.stab || firstContact))
-          mobs.CutLimb(hb, parts.cut, world, spawns, power);
+            (!parts.cut.stab || firstContact)) {
+          mobs.CutLimb(hb, parts.cut, world, spawns, power, &coatCells);
+          coatKind = MobSystem::CoatHitKind::Cut;
+          coatRan = true;
+        }
       }
 
       // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever --------
@@ -1542,8 +1577,13 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // The struck kind is deliberately NOT handed down: Mob::BluntHit asks
       // IsWornSlot for itself, because it also has to find the limb UNDERNEATH
       // a shell to transmit through, and only the creature knows that.
-      if (s.strike.blunt > 0.0f && firstContact)
+      if (s.strike.blunt > 0.0f && firstContact) {
         mobs.BluntHit(hb, parts.blunt, world, spawns);
+        if (!coatRan) {
+          coatKind = MobSystem::CoatHitKind::Blunt;
+          coatRan = true;
+        }
+      }
 
       // ---- 3. THE BITE PART — a tear, and an infection armour refuses -----
       //
@@ -1558,8 +1598,27 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // on that would make a zombie miss for reasons nobody can see.
       if (s.strike.bite > 0.0f && firstContact && !wrongTarget &&
           !(s.bitten != nullptr && *s.bitten)) {
-        if (mobs.BiteHit(hb, parts.bite, world, spawns) && s.bitten != nullptr)
-          *s.bitten = true;
+        biteLanded = mobs.BiteHit(hb, parts.bite, world, spawns);
+        if (biteLanded && s.bitten != nullptr) *s.bitten = true;
+        if (biteLanded && coatKind != MobSystem::CoatHitKind::Cut) {
+          coatKind = MobSystem::CoatHitKind::Bite;
+          coatRan = true;
+        }
+      }
+
+      // ---- 4. THE COAT MOVES (DESIGN.md §7 "A coat moves on contact") -----
+      //
+      // AFTER all three parts, so the cut's wound wall exists and the bruise
+      // has split (or not) the skin the coat lands on. Every population that
+      // reaches this line is a creature struck by a creature: what the
+      // striker's voxels at the contact wear goes into the wound, what the
+      // wound wears and leaks comes back onto them. The material decides what
+      // happens next; nothing here knows which one it is.
+      if (coatRan && coat.strikerId != 0) {
+        coat.kind = coatKind;
+        coat.landed = coatKind != MobSystem::CoatHitKind::Bite || biteLanded;
+        coat.woundCells = &coatCells;
+        mobs.CoatOnContact(coat);
       }
     }
   }

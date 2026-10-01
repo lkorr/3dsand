@@ -115,7 +115,11 @@ struct PlayerKitRefs {
 // Version 9 (2026-09-27) appends each slot's vessel STOPPER (one word per
 // slot, the dyes' shape) and lets a portion carry the DISSOLVED bit
 // (composition.h kDissolvedBit); a v8 kit loads every vessel unstoppered.
-constexpr uint32_t kPlayerKitSaveVersion = 9;
+// Version 10 (2026-10-01) appends the COATS on every slot's recorded lattice
+// (one coat word per voxel, parallel to the v7 damage lattices): a held blade
+// or a worn piece put away coated comes back coated (DESIGN.md §7 "A coat
+// moves on contact"). A v9 kit loads its lattices clean.
+constexpr uint32_t kPlayerKitSaveVersion = 10;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -155,7 +159,9 @@ struct WorldItemRefs {
 // a v5 reader replaces the v3 word with it; a v4 flask loads as one portion.
 // v6 (2026-09-27) appends each entry's vessel STOPPER word after its
 // contents; a v5 ground flask loads unstoppered.
-constexpr uint32_t kWorldItemSaveVersion = 6;
+// v7 (2026-10-01) appends each entry's COATS on its recorded damage lattices
+// (persist.cpp PutCoats); a v6 ground item's record loads clean.
+constexpr uint32_t kWorldItemSaveVersion = 7;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove

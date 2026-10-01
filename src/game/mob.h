@@ -2194,8 +2194,13 @@ class Mob {
   // routes the dismemberment through the ordinary Sever(). Returns true when
   // the handle was one of this creature's live limbs. Always DamageCause::Blade;
   // `severity` is the audio's blade intensity (SeverEvent::severity).
+  // `woundCells`, when given, receives the cells the kerf REMOVED, in the
+  // limb's authoritative lattice (Mob::CarveReport::cells) -- empty when the
+  // cut took the limb off or found nothing. What a coat on the blade is laid
+  // against (MobSystem::CoatOnContact, the wound wall).
   bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-               std::vector<ParticleSpawn>& spawns, float severity = 1.0f);
+               std::vector<ParticleSpawn>& spawns, float severity = 1.0f,
+               std::vector<IVec3>* woundCells = nullptr);
   // ---- THE BLUNT PATH (game/impact.h, BluntHit above) ----------------------
   // Charge trauma to a live limb without opening it: hp, a bruise, at most a
   // shallow dent, and never a sever. On a WORN slot it breaks shell voxels and
@@ -2500,6 +2505,15 @@ class Mob {
       }
     return false;
   }
+  // A rig slot's NAME (its MobLimbDef's: "armL", "item:sword", a shell's
+  // part), or "" for no such slot. An index into the appended tail is not
+  // stable across a shell being shed; the name is how a caller holding one
+  // across a resolver checks it still means the same slot.
+  const std::string& SlotName(int slot) const {
+    static const std::string kNone;
+    return slot >= 0 && slot < (int)limbDefs_.size() ? limbDefs_[slot].name
+                                                     : kNone;
+  }
   bool HoldingAnything() const {
     return held_[0].slot >= 0 || held_[1].slot >= 0;
   }
@@ -2726,6 +2740,47 @@ class Mob {
   // it BEFORE UnwearItem: the shells are the only place the damage lives while
   // the piece is on, and they are destroyed with the slots.
   bool CaptureWorn(int equipSlot, WornDamage& out) const;
+  // ---- A HELD ITEM KEEPS ITS COAT (DESIGN.md §7 "A coat moves on contact") --
+  //
+  // The held item's lattice, captured the way CaptureWorn captures a shell's:
+  // one WornShellDamage in `out.shells[0]`, holding the exact lattice when it
+  // differs from the authored item -- a voxel lost, or a voxel wearing a coat
+  // -- and nothing at all (out.Empty()) when it does not, so a clean sword
+  // stays a PLAIN stack that merges with its twins. False when the hand holds
+  // nothing, or only a borrowed prop (SetHeldBorrowed). KitFlushWorn calls it
+  // for the two hand slots, which is how the coat rides into the bag, the
+  // save and the ground.
+  bool CaptureHeld(Hand h, WornDamage& out) const;
+  // EquipItem that puts the item back AS IT WAS: `was` (a stack's `damage`,
+  // as CaptureHeld wrote it) is restored onto the new slot -- coats copied
+  // voxel for voxel when the geometry is the authored one, the whole lattice
+  // otherwise (RestoreShellLattice). Null or empty = as authored.
+  bool EquipItemAsWas(const ItemDef* item, Hand h, const WornDamage* was);
+  // The kit's hand stack was REPLACED behind the rig's back (a KitMove/KitTake
+  // through a hand slot): the item in the fist may share the new stack's name
+  // and still be a different object, so the next dress re-equips it. Cleared
+  // by EquipItem.
+  bool HeldKitStale(Hand h) const { return held_[HandIndex(h)].kitStale; }
+  // Copy the COATS of `lat` onto rig slot `slot`'s authoritative lattice,
+  // voxel by voxel at matching positions (nothing else moves: no material, no
+  // geometry, no physics rebuild), poking the brick. Returns the voxels whose
+  // coat changed. The item stage's write path (game/itemcoat.h) and the
+  // held-item restore both come through here.
+  uint32_t ApplyLimbCoats(int slot, const std::vector<PrefabVoxel>& lat);
+  // The kit stack in `equipSlot` -> the rig, COATS ONLY: its recorded
+  // lattice's coats onto the held item (a hand slot) or onto every shell of
+  // the worn piece, and a shell or item whose stack records no lattice
+  // washed clean. -1 when that stack is not what the rig is holding/wearing
+  // (nothing to push to); else the voxels whose coat changed. The item
+  // stage's write path (game/itemcoat.h PushItemLatticeToLimb).
+  int ApplyKitCoats(int equipSlot);
+  // The slot's authoritative lattice as PrefabVoxels (skin, else the collider
+  // re-expressed) -- what CaptureWorn/CaptureHeld store.
+  void LatticeOfSlot(int slot, std::vector<PrefabVoxel>& out) const;
+  // WHICH SLOT STRUCK, and its edge in that slot's body frame: the strike
+  // hand's held item (its edge, or its haft when `haft`), else the natural
+  // weapon's part. False when nothing is armed. Read by CoatOnContact.
+  bool StrikerEdgeLocal(bool haft, int& slot, Vec3& from, Vec3& to) const;
   // The item name worn in a slot, or empty. By NAME because library indices
   // are file-order and die on an R reload (item.h's index hazard).
   const std::string& WornItem(int equipSlot) const;
@@ -4790,6 +4845,7 @@ class Mob {
     float aimWeight = 0;     // SetHeldAim
     Vec3 aimAxis{0, 1, 0};
     bool borrowed = false;   // SetHeldBorrowed: a prop, not the item
+    bool kitStale = false;   // HeldKitStale: the kit's stack was replaced
     void Clear() { *this = HeldHand{}; }
   };
   HeldHand held_[kHands];
@@ -5748,7 +5804,43 @@ class MobSystem {
   // plus the blood soak and the structural sever. See Mob::CutLimb and the
   // BladeCut struct above. Returns true when the handle was a live limb.
   bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-               std::vector<ParticleSpawn>& spawns, float severity = 1.0f);
+               std::vector<ParticleSpawn>& spawns, float severity = 1.0f,
+               std::vector<IVec3>* woundCells = nullptr);
+  // ---- A COAT MOVES ON CONTACT (game/coattransfer.cpp; DESIGN.md §7) -------
+  //
+  // One landed blow's coat exchange between the voxels that struck and the
+  // voxels that were struck. Called by MeleeSweepDamage after the cut, blunt
+  // and bite resolvers, for every creature-on-creature contact; no material is
+  // special-cased -- what a transferred coat DOES afterwards is whatever that
+  // material does as a body coat. See phys/coatcontact.h for the lattice half.
+  enum class CoatHitKind : uint8_t { Cut, Blunt, Bite };
+  struct CoatContact {
+    uint64_t strikerId = 0;
+    bool haft = false;         // the sweep was the held item's haft segment
+    float edgeU = 0.0f;        // 0..1 along the edge (or haft), base -> tip
+    float radius = 0.0f;       // the sweep's carve radius, world voxels
+    uint64_t targetId = 0;
+    int targetSlot = -1;       // resolved BEFORE the resolvers ran
+    std::string targetSlotName;  // ...and checked after (a slot can shift)
+    Vec3 at{};                 // the contact, world voxels (the probe's hit)
+    CoatHitKind kind = CoatHitKind::Cut;
+    float power = 1.0f;
+    bool unarmed = false;
+    bool landed = true;        // the resolver reported the blow landed
+    const std::vector<IVec3>* woundCells = nullptr;  // a cut's removed cells
+  };
+  struct CoatContactResult {
+    int strikerSlot = -1;      // which of the striker's slots touched
+    uint32_t strikerTouched = 0, targetTouched = 0;  // voxels in each patch
+    uint32_t toTarget = 0;     // coat levels laid on the target (= spent)
+    uint32_t toStriker = 0;    // coat levels laid on the striker (= spent)
+    uint32_t bled = 0;         // striker voxels the wound's fluid smeared
+    uint32_t bleedMat = 0;     // ...and which fluid it was
+    bool wounded = false;
+  };
+  CoatContactResult CoatOnContact(const CoatContact& c);
+  // The last contact's result (a gate's read-out; overwritten every call).
+  const CoatContactResult& LastCoatContact() const { return lastCoat_; }
   // Every live limb of every mob within the blast — the explosion entry point.
   // THE PLAYERS TOO (W1-F, 2026-09-24): every registered avatar is carved
   // after the NPCs, so a second player standing in the first player's blast is
@@ -7501,6 +7593,7 @@ class MobSystem {
   float worstSeverFrac_ = -1.0f;
   std::string worstSeverLimb_;
   CutBite cutBite_;  // written by Mob::CutLimb, see LastCutBite
+  CoatContactResult lastCoat_;  // written by CoatOnContact
   std::vector<BleedSource> bleeds_;
   std::vector<SplatterEvent> splatters_;
   std::vector<VoiceEvent> voices_;

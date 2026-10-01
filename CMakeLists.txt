@@ -538,6 +538,8 @@ add_library(sandvox_core OBJECT
   src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
+  src/game/coattransfer.cpp
+  src/game/itemcoat.cpp
   src/game/container.cpp
   src/game/flasksim.cpp
   src/game/flaskchem.cpp
@@ -617,6 +619,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_wound.cpp
   src/test/selftest_solute.cpp
   src/test/selftest_impact.cpp
+  src/test/selftest_coat.cpp
   src/test/selftest_audio.cpp
   src/test/selftest_net.cpp
   src/test/selftest_dialogue.cpp
@@ -649,6 +652,7 @@ add_library(sandvox_core OBJECT
   src/audio/xyzpan/src/SwarmMode.cpp
   src/phys/physics.cpp
   src/phys/bodystain.cpp
+  src/phys/coatcontact.cpp
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
   # net/: the multiplayer seam. debrissync.cpp is wire PODs + their codecs and

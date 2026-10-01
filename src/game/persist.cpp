@@ -156,6 +156,54 @@ bool GetDamage(Reader& rd, WornDamage& d) {
   return rd.ok;
 }
 
+// ...AND WHAT IT WEARS (PLYR v10, ITMS v7; DESIGN.md §7 "A coat moves on
+// contact"). PutDamage's voxel record predates the coat word and has no room
+// for it, so the coats ride BESIDE it, parallel to its lattices and appended
+// at the end of the payload (the tail-append shape every version since v2
+// has used: an older payload simply stops before them):
+//
+//   u32 shells  then per shell: u32 voxelCount, then per voxel: u32 coat
+//
+// A shell whose count no longer matches the lattice it was read with is
+// skipped rather than half-applied. Coat MATERIALS are ids in the table the
+// file was written under and are remapped like every other id.
+void PutCoats(std::vector<uint8_t>& out, const WornDamage& d) {
+  PutU32(out, (uint32_t)d.shells.size());
+  for (const WornShellDamage& sh : d.shells) {
+    PutU32(out, (uint32_t)sh.lattice.size());
+    for (const PrefabVoxel& v : sh.lattice) PutU32(out, v.stain);
+  }
+}
+
+bool GetCoats(Reader& rd, WornDamage& d) {
+  const uint32_t nsh = rd.U32();
+  if (!rd.ok || (size_t)nsh * 4u > rd.left) {
+    rd.ok = false;
+    return false;
+  }
+  const MatRemap* mr = ActiveLoadRemap();
+  for (uint32_t k = 0; k < nsh && rd.ok; k++) {
+    const uint32_t nv = rd.U32();
+    if (!rd.ok || (size_t)nv * 4u > rd.left) {
+      rd.ok = false;
+      return false;
+    }
+    std::vector<PrefabVoxel>* lat =
+        k < d.shells.size() && d.shells[k].lattice.size() == nv
+            ? &d.shells[k].lattice
+            : nullptr;
+    for (uint32_t vi = 0; vi < nv && rd.ok; vi++) {
+      const uint32_t w = rd.U32();
+      if (!rd.ok || !lat) continue;
+      uint32_t mat = BodyStainMat((uint16_t)w);
+      const uint32_t amt = BodyStainAmt((uint16_t)w);
+      if (mr && mat) mat = mr->Mat(mat);
+      (*lat)[vi].stain = PackBodyStain(mat, mat ? amt : 0u);
+    }
+  }
+  return rd.ok;
+}
+
 void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {
   // A worn piece's live holes are on its shells, not in its stack, until
   // something reads the stack without the body — and this is that something
@@ -342,6 +390,21 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   putStoppers(kit.hotbar.slots, kItemSlots);
   putStoppers(kit.bag.slots, Bag::kSlots);
   putStoppers(kit.equip.slots, kEquipSlotCount);
+  if (version < 10) return;
+
+  // ---- v10: COATS on every slot's recorded lattice (PutCoats) ---------------
+  //
+  //   u32 hotbarCount  then per slot: PutCoats
+  //   u32 bagCount     then per slot: PutCoats
+  //   u32 equipCount   then per slot: PutCoats
+  auto putCoats = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++)
+      PutCoats(out, v[i].Empty() ? WornDamage{} : v[i].damage);
+  };
+  putCoats(kit.hotbar.slots, kItemSlots);
+  putCoats(kit.bag.slots, Bag::kSlots);
+  putCoats(kit.equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -550,6 +613,20 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     getStoppers(kit.bag.slots, Bag::kSlots);
     getStoppers(kit.equip.slots, kEquipSlotCount);
   }
+  // ---- v10: coats on the recorded lattices --------------------------------------
+  if (version >= 10) {
+    auto getCoats = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        WornDamage scratch;
+        WornDamage& d = ((int)i < n && !v[i].Empty()) ? v[i].damage : scratch;
+        if (!GetCoats(rd, d)) return;
+      }
+    };
+    getCoats(kit.hotbar.slots, kItemSlots);
+    getCoats(kit.bag.slots, Bag::kSlots);
+    getCoats(kit.equip.slots, kEquipSlotCount);
+  }
   if (dropped > 0)
     std::fprintf(stderr,
                  "PLYR: %d saved entries name content that no longer exists; "
@@ -636,6 +713,8 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     }
     // v6: its stopper.
     PutU32(out, w.stoppered ? 1u : 0u);
+    // v7: the coats on its recorded lattices (PutCoats).
+    PutCoats(out, w.damage);
   }
 }
 
@@ -706,6 +785,8 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       inst.stoppered = rd.U32() != 0;
       if (!rd.ok) break;
     }
+    // v7: coats (GetCoats remaps its own ids).
+    if (version >= 7 && !GetCoats(rd, inst.damage)) break;
     // The lattice and the vessel's contents are ids in the table this record
     // was written under; running ids from here on (sim/mattable.h).
     if (const MatRemap* mr = ActiveLoadRemap()) {

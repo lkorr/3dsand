@@ -661,6 +661,11 @@ struct EdgeSweep {
   // EdgeSweepResult::power is reported UNSCALED (the speed ramp), so a caller
   // choosing a cue's loudness applies its own gain for the softer hit.
   float powerScale = 1.0f;
+  // THIS SWEEP IS THE HELD ITEM'S HAFT (item.h hasHaft), not its edge: which
+  // segment of the striker's own lattice the contact lies on, for the coat a
+  // blow carries (MobSystem::CoatOnContact). False for the edge and for every
+  // natural weapon.
+  bool haft = false;
   // Sim tick, for the wound's counter-based seed. The ragged rim and the blood
   // soak must replay identically from the same tick+probe, and nothing in the
   // kerf may key on a Jolt float (game/mob.h BladeCut::seed).

@@ -2924,7 +2924,15 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                            ? items.Named(bench.hand[hk].item)
                            : nullptr;
               const std::string wantName = want ? want->name : std::string();
-              if (avatar.HeldItem(h) != wantName) avatar.EquipItem(want, h);
+              // AS IT WAS (DESIGN.md §7 "A coat moves on contact"): the kit
+              // stack carries the item's lattice -- its coat -- and the fist
+              // puts it back on. Re-equipped also when the stack was REPLACED
+              // by one of the same name (HeldKitStale): two swords are two
+              // swords. A bench prop is not the item and has no stack here.
+              if (avatar.HeldItem(h) != wantName ||
+                  (want != nullptr && !bench.active && avatar.HeldKitStale(h)))
+                avatar.EquipItemAsWas(
+                    want, h, bench.active ? nullptr : &kit.equip.InHand(h).damage);
               // ...and it is the BENCH's, shown in the fist while the flask
               // itself stays in the bag (Mob::SetHeldBorrowed): never shed,
               // looted or saved as the item.
@@ -4554,6 +4562,7 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
               hs.halfWidth = hhw;
               hs.carveBonus = 0.0f;
               hs.powerScale = hPow;
+              hs.haft = true;
               hs.struck = &s.playerHaftStruck;
               hs.bitten = nullptr;
               const EdgeSweepResult hr = resolveSweep(hs, hDb, true);

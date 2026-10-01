@@ -3673,9 +3673,23 @@ std::vector<ItemInstance> Mob::Carried() const {
 // to do from outside.
 
 bool Mob::KitFlushWorn(int equipSlot) {
-  if (equipSlot < 0 || equipSlot >= kEquipSlotCount ||
-      !EquipSlotIsWorn(equipSlot))
-    return false;
+  if (equipSlot < 0 || equipSlot >= kEquipSlotCount) return false;
+  // A HAND IS FLUSHED THE SAME WAY (DESIGN.md §7, "A coat moves on contact"):
+  // the held item's lattice -- its coat, and anything it lost -- goes into
+  // the stack that realises it, at every moment a worn piece's would.
+  Hand hand = Hand::Right;
+  if (EquipSlotIsHand(equipSlot, &hand)) {
+    ItemStack& hs = kit_.equip.slots[equipSlot];
+    if (hs.Empty() || rigReleased_ || HeldItem(hand) != hs.name ||
+        held_[HandIndex(hand)].kitStale)
+      return false;
+    WornDamage d;
+    if (!CaptureHeld(hand, d)) return false;
+    if (d.Empty()) d.Clear();
+    hs.damage = std::move(d);
+    return true;
+  }
+  if (!EquipSlotIsWorn(equipSlot)) return false;
   ItemStack& st = kit_.equip.slots[equipSlot];
   // Only when the rig is wearing THIS stack's item: a slot whose piece was
   // refused, is not dressed yet, or belongs to a released husk has no shells
@@ -3733,6 +3747,13 @@ MoveResult Mob::KitMove(const KitRef& from, const KitRef& to,
     // though the name and the dye on the rig did not change.
     if (from.space == KitSpace::Equip) KitWornStale(from.index);
     if (to.space == KitSpace::Equip) KitWornStale(to.index);
+    // ...and two identical swords: the fist re-equips from the new stack,
+    // with its coat (HeldKitStale).
+    Hand h;
+    if (from.space == KitSpace::Equip && EquipSlotIsHand(from.index, &h))
+      held_[HandIndex(h)].kitStale = true;
+    if (to.space == KitSpace::Equip && EquipSlotIsHand(to.index, &h))
+      held_[HandIndex(h)].kitStale = true;
   }
   return r;
 }
@@ -3748,6 +3769,9 @@ ItemStack Mob::KitTake(const KitRef& r, int count) {
   st->count -= take;
   if (st->count <= 0) *st = ItemStack{};
   if (r.space == KitSpace::Equip) KitWornStale(r.index);
+  Hand h;
+  if (r.space == KitSpace::Equip && EquipSlotIsHand(r.index, &h))
+    held_[HandIndex(h)].kitStale = true;
   return out;
 }
 
@@ -6697,6 +6721,7 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       hs.halfWidth = hhw;
       hs.carveBonus = 0.0f;
       hs.powerScale = hPow;
+      hs.haft = true;
       hs.struck = &st.haftStruck;
       hs.bitten = nullptr;
       hs.cueGainDb = hDb;
@@ -8348,8 +8373,14 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
     shed.name = hh.item;
     if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
       shed.dye = limbs_[limbIndex].dye;
-    // A flask knocked from the hand still holds what it held.
+    // A flask knocked from the hand still holds what it held, and a blade
+    // still wears what it wore (CaptureHeld: the coat rides the instance
+    // into the ground registry, and back into the hand that picks it up).
     shed.contents = hh.contents;
+    if (!hh.borrowed) {
+      CaptureHeld(lostHand, shed.damage);
+      if (shed.damage.Empty()) shed.damage.Clear();
+    }
     // ...AND THE KIT'S HAND SLOT GIVES IT UP (dual wielding). The hand is a
     // kit slot now (EquipSlotId::HandR/HandL), and the player's rig is
     // dressed FROM it every tick: left holding the name, the next tick
@@ -12451,19 +12482,23 @@ uint32_t Mob::ReBloodWound(int limbIndex, Vec3 centreLocal, float wet,
 }
 
 bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-                        std::vector<ParticleSpawn>& spawns, float severity) {
+                        std::vector<ParticleSpawn>& spawns, float severity,
+                        std::vector<IVec3>* woundCells) {
   // AND THE PLAYER BLEEDS TOO (every creature, ForEachCreature's order).
   // Without the avatar in this walk an NPC's sweep found the avatar's arm,
   // failed to recognise it as live flesh, and fell through to
   // DebrisSystem::MeltBodyAt — the player was hittable only in the sense that
   // their limbs quietly evaporated with no wound, no stain and no sever.
   return FirstCreature([&](Mob& m) {
-           return m.CutLimb(bodyHandle, cut, world, spawns, severity);
+           return m.CutLimb(bodyHandle, cut, world, spawns, severity,
+                            woundCells);
          }) != nullptr;
 }
 
 bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-                  std::vector<ParticleSpawn>& spawns, float severity) {
+                  std::vector<ParticleSpawn>& spawns, float severity,
+                  std::vector<IVec3>* woundCells) {
+  if (woundCells) woundCells->clear();
   if (!phys_) return false;
   for (size_t i = 0; i < limbs_.size(); i++) {
     if (limbs_[i].body != bodyHandle) continue;
@@ -12689,6 +12724,10 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // "an edge did this": DamageCause::Blade, the one row with the cut-through
     // rule (game/severpolicy.h says why the other causes do not get it). An
     // argument, not a scope, so nothing CarveLimb re-enters can inherit it.
+    // The report is asked for only when the caller wants the wound's cells
+    // (a coat on the blade is laid against them); collecting them changes
+    // nothing about the carve.
+    CarveReport cutReport;
     const bool alive = CarveLimb(
         (int)i, DamageCtx(DamageCause::Blade, severity), world, spawns,
         /*eject=*/true,
@@ -12712,7 +12751,7 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                    d.dot(v) * nearSign <= 0.0f;
           };
         },
-        wantSpall ? &spall : nullptr);
+        wantSpall ? &spall : nullptr, woundCells ? &cutReport : nullptr);
 
     // SEVERED OR DEAD: `limb`, `limbs_` and possibly this whole creature are
     // gone. Nothing below may touch them — the same contract every other
@@ -12725,6 +12764,7 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
       Sever((int)i, DamageCtx(DamageCause::Blade, severity));
       return true;
     }
+    if (woundCells) *woundCells = std::move(cutReport.cells);
 
     // THE WOUND IS WHERE THE EDGE WENT IN (2026-09-26). Damage() left
     // woundLocal at the probe's hit on the Jolt collider, which is near the
@@ -26411,6 +26451,7 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
     MarkInstancesDirty();
   }
   if (!item) {
+    hh.kitStale = false;   // an empty fist is exactly what the kit says
     // The strike hand follows what is left: emptying the fist the driver
     // served while the other still holds something hands the driver over.
     if (whichHand == strikeHand_ &&
@@ -26689,6 +26730,7 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // the kind of agreement that stops being true without anybody noticing.
   p.ownSkinScale = item->scale ? item->scale : 1u;
   p.ownPhysScale = p.ownSkinScale;
+  hh.kitStale = false;
   MarkInstancesDirty();
   return true;
 }
@@ -27160,8 +27202,34 @@ bool Mob::WearOnRig(const ItemDef* item, int equipSlot,
     // one-armed goblin would get its sleeve's holes on its hood.
     const size_t coverIndex = (size_t)(&cv - item->cover.data());
     if (damage && coverIndex < damage->shells.size() &&
-        !damage->shells[coverIndex].Empty())
-      RestoreShellLattice(slot, damage->shells[coverIndex]);
+        !damage->shells[coverIndex].Empty()) {
+      // A LATTICE THAT IS ONLY COATED goes back as coats (ApplyLimbCoats):
+      // same geometry as the shell just built, so nothing is rebuilt. One
+      // whose geometry is the AUTHORED cover's but not this wearer's fitted
+      // shell (recorded off the body -- the item stage, game/itemcoat.h)
+      // also gives only its coats, where positions coincide: putting the
+      // unfitted lattice on would undo the fit. Anything else lost voxels and
+      // is restored whole.
+      const WornShellDamage& sh = damage->shells[coverIndex];
+      std::vector<PrefabVoxel> now;
+      LatticeOfSlot(slot, now);
+      auto sameGeom = [](const std::vector<PrefabVoxel>& a,
+                         const std::vector<PrefabVoxel>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++)
+          if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z ||
+              (a[i].material & 0xFFFu) != (b[i].material & 0xFFFu))
+            return false;
+        return true;
+      };
+      if (!sh.lattice.empty() &&
+          (sameGeom(now, sh.lattice) || sameGeom(cv.voxels, sh.lattice))) {
+        if (sh.hp >= 0.0f) limbs_[slot].hp = sh.hp;
+        ApplyLimbCoats(slot, sh.lattice);
+      } else {
+        RestoreShellLattice(slot, sh);
+      }
+    }
     piece.slots.push_back(slot);
     piece.index.push_back(WornPiece::ShellIndex{});
     piece.cover.push_back((int)coverIndex);
@@ -27232,8 +27300,11 @@ void Mob::RestoreShellLattice(int slot, const WornShellDamage& d) {
     L.voxels.reserve(d.lattice.size());
     for (const PrefabVoxel& v : d.lattice)
       L.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
-                          v.material});
+                          v.material, v.stain});
   }
+  // The restored lattice may be wearing a coat: the ledger owes a recount, or
+  // the decay sweep never sees it to dry it.
+  coatDirty_ = twinDirty_ = true;
   // `voxelsAtSpawn` is the DENOMINATOR damage fractions are measured against
   // and must stay the AUTHORED volume — resetting it to what is left would
   // make a half-destroyed piece read as pristine and take another full
@@ -27290,15 +27361,20 @@ bool Mob::CaptureWorn(int equipSlot, WornDamage& out) const {
       // untouched piece still costs nothing in the save.
       d.atSpawn = L.voxelsAtSpawn;
       d.live = (uint32_t)now;
-      if (now == (size_t)L.voxelsAtSpawn) continue;   // nothing lost
-      d.lattice.reserve(now);
+      // A COAT IS SOMETHING THE PIECE HAS BEEN THROUGH TOO (DESIGN.md §7, "A
+      // coat moves on contact"): a cuirass taken off soaked in oil goes into
+      // the pack soaked in oil. So a whole shell is still recorded when any
+      // voxel of it wears one; only a whole, CLEAN shell is left empty.
+      bool coated = false;
       if (L.HasFineSkin()) {
-        for (const PrefabVoxel& v : L.skinVoxels) d.lattice.push_back(v);
+        for (const PrefabVoxel& v : L.skinVoxels)
+          if (v.stain) { coated = true; break; }
       } else {
         for (const DebrisVoxel& v : L.voxels)
-          d.lattice.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y,
-                                          (int16_t)v.z, v.payload, v.color});
+          if (v.stain) { coated = true; break; }
       }
+      if (now == (size_t)L.voxelsAtSpawn && !coated) continue;  // as authored
+      LatticeOfSlot(slot, d.lattice);
     }
     return true;
   }

@@ -504,6 +504,23 @@ struct Tuning {
     // behind it is reached. 0 = shells do not occlude a blast (the pre-W2-H
     // behaviour).
     float blastShellCells = TPD(gear, blastShellCells);
+    // ---- A COAT MOVES ON CONTACT (game/coattransfer.cpp, DESIGN.md §7) ----
+    // The share of the coat on a striker's touched voxels that leaves them on
+    // one landed blow (and of the target's that comes back). 0 = coats never
+    // move by contact; 1 = everything touched goes.
+    float coatTransferFrac = TPD(gear, coatTransferFrac);
+    // ...capped at this many coat levels (the 0..15 scale, summed over
+    // voxels) per blow and per direction, so one dip does not empty into one
+    // wound.
+    int coatTransferMax = TPD(gear, coatTransferMax);
+    // The contact patch's reach in METRES: how far past where two surfaces
+    // met a voxel still counts as touching. A floor under the weapon's own
+    // carve radius (a blade's edge is a few millimetres; its flat is not).
+    float coatContactRadius = TPD(gear, coatContactRadius);
+    // The level of a wound's own fluid (Mob::WoundFluid) smeared on the
+    // striker voxels that went in. A smear, not a dip: it displaces only a
+    // weaker coat (phys/coatcontact.h CoatSmear). 0 = blades come out clean.
+    int coatBleedPickup = TPD(gear, coatBleedPickup);
   } gear;
 
   // ---- player avatar ----

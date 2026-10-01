@@ -107,7 +107,11 @@
     "biteOnShell": 0.300000012,
     "biteThroughSoft": 14,
     "biteThroughHard": 60,
-    "blastShellCells": 1
+    "blastShellCells": 1,
+    "coatTransferFrac": 0.5,
+    "coatTransferMax": 24,
+    "coatContactRadius": 0.06,
+    "coatBleedPickup": 6
   },
   "avatar": {
     "enabled": true,
