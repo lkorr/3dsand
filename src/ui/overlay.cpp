@@ -187,9 +187,19 @@ bool Overlay::WantsKeyboard() const {
   return ImGui::GetIO().WantCaptureKeyboard;
 }
 
+void Overlay::QueueMouse(void* iov, float x, float y, int button, bool down,
+                         float wheel, float dblClickSec) {
+  ImGuiIO& io = *static_cast<ImGuiIO*>(iov);
+  if (dblClickSec > 0.0f) io.MouseDoubleClickTime = dblClickSec;
+  io.AddMousePosEvent(x, y);
+  if (button >= 0) io.AddMouseButtonEvent(button, down);
+  if (wheel != 0.0f) io.AddMouseWheelEvent(0.0f, wheel);
+}
+
 void Overlay::BeginFrame() {
   ImGui_ImplVulkan_NewFrame();
   ImGui_ImplGlfw_NewFrame();
+  if (injectInput) injectInput(&ImGui::GetIO());
   ImGui::NewFrame();
   // AFTER NewFrame: ImGui may have created or resized its texture during font
   // baking, and the chrome rects have to be re-blitted when it does (ui/theme.h

@@ -254,13 +254,6 @@ float PanelChrome(ImDrawList* dl, ImVec2 wp, ImVec2 ws, const char* title,
 // panel never re-derives it, so the day ItemKind::ArmorHead exists this
 // function needs no change at all. Null for the bag and the hotbar, which are
 // containers rather than roles and take anything.
-// Does a double-click put this kind on the ITEM STAGE? Weapons and worn
-// pieces (the display words game/item.h ItemKindName writes: "melee",
-// "armor_*"). main.cpp asks the def again (itemstage::StageTakes) before it
-// opens anything, so this only decides whether the gesture is offered.
-bool StageableKind(const std::string& kind) {
-  return kind == "melee" || kind.rfind("armor_", 0) == 0;
-}
 
 void ItemSlot(UIState& s, const char* id, ImVec2 at,
               const UIState::KitSlotUI& item, KitRef ref,
@@ -271,6 +264,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
   ImGui::SetCursorScreenPos(at);
   ImGui::PushID(id);
   ImGui::InvisibleButton("##slot", ImVec2(kSlot, kSlot));
+  s.RecordRect(id, at.x, at.y, at.x + kSlot, at.y + kSlot);
   const bool hovered = ImGui::IsItemHovered();
   const bool filled = !item.name.empty();
 
@@ -345,6 +339,14 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
       dl->AddRect(ImVec2(at.x + 3, at.y + 3), ImVec2(at.x + 9, at.y + 9),
                   Fade(ui::ColInk(), 0.8f));
     }
+    if (item.coatSwatch) {
+      // A COATED piece wears a drop in the lower-left corner, the coat's own
+      // colour: a venomed blade must read as one before its tooltip is asked.
+      const float dx = at.x + 4, dy = at.y + kSlot - 12;
+      dl->AddRectFilled(ImVec2(dx + 2, dy), ImVec2(dx + 4, dy + 2), item.coatSwatch);
+      dl->AddRectFilled(ImVec2(dx, dy + 2), ImVec2(dx + 6, dy + 8), item.coatSwatch);
+      dl->AddRect(ImVec2(dx - 1, dy + 1), ImVec2(dx + 7, dy + 9), Fade(ui::ColInk(), 0.85f));
+    }
     if (item.count > 1) {
       char buf[16];
       std::snprintf(buf, sizeof buf, "%d", item.count);
@@ -401,7 +403,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
   }
   // ...AND A WEAPON OR A WORN PIECE: open it on the ITEM STAGE (ui/item_stage.h),
   // where it can be turned and coated. Same gesture, same no-conflict reason.
-  const bool stageable = filled && StageableKind(item.kind);
+  const bool stageable = filled && item.stageable;
   if (hovered && stageable && ref.space != KitSpace::Loot &&
       !ImGui::GetDragDropPayload() &&
       ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -441,6 +443,13 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
                            ImVec2(12, 12));
         ImGui::SameLine();
         ImGui::TextDisabled("dyed %s", item.dyeName.c_str());
+      }
+      if (!item.coatName.empty()) {
+        ImGui::ColorButton("##tipcoat",
+                           ImGui::ColorConvertU32ToFloat4(item.coatSwatch), 0,
+                           ImVec2(12, 12));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(("coated with " + item.coatName).c_str());
       }
       if (!item.tip.empty()) ImGui::TextUnformatted(item.tip.c_str());
       // CONDITION, and only for something that can be worn: a sword has no
@@ -2297,7 +2306,7 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
   }
   if (!A.message.empty()) {
     ImGui::SetCursorScreenPos(ImVec2(colX, colBottom - msgH));
-    ImGui::PushTextWrapPos(colX + colW);
+    ImGui::PushTextWrapPos(colX + colW - ImGui::GetWindowPos().x);  // window-local
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColEmber()));
     ImGui::TextUnformatted(A.message.c_str());
     ImGui::PopStyleColor();
@@ -2390,15 +2399,23 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
   float y = PanelChrome(dl, wp, ws, "ITEM STAGE", nullptr, st);
   const float contentTop = y;
   const float lineH = ImGui::GetTextLineHeight();
+  // The last widget's screen rectangle, by id, for a harness's mouse
+  // (UIState::uiRects; off in the game).
+  auto rec = [&](const char* id) {
+    const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    s.RecordRect(id, a.x, a.y, b.x, b.y);
+  };
   {
     const ImVec2 ts = ImGui::CalcTextSize("done");
     const float bw = std::max(96.0f, ts.x + 24);
     const float by = wp.y + kFrame + std::floor((ui::kHeaderH - ts.y - 8) * 0.5f);
-    if (ui::Button("##stagedone", ImVec2(wp.x + ws.x - kFrame - 10 - bw, by), "done", false, bw))
-      T.wantClose = true;
+    const bool done =
+        ui::Button("##stagedone", ImVec2(wp.x + ws.x - kFrame - 10 - bw, by), "done", false, bw);
+    rec("##stagedone");
+    if (done) T.wantClose = true;
     if (ImGui::IsItemHovered()) Tip("Put it back where it was. Whatever it wears stays on it.");
   }
-  const bool hasBrush = !s.applyText.empty() && !s.applyStoppered;
+  const bool hasBrush = !s.applyText.empty() && !s.applyStoppered && s.applyCoats;
 
   // ---- the left column ---------------------------------------------------------
   const float colX = wp.x + kFrame + kPad;
@@ -2414,20 +2431,38 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
     dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.55f), FitText(T.where, colW).c_str());
     y += lineH + 2;
   }
+  if (T.frozen && !T.coats.empty()) {
+    // Said where it matters: a coat put on a blade in the pack waits there.
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColGoldPale(), 0.75f),
+                FitText("won't dry until drawn", colW).c_str());
+    y += lineH + 2;
+  }
   y += 10;
   // A worn piece is one shell per part it covers; the stage shows one at a time.
   if (!T.shellNames.empty()) {
     const int n = (int)T.shellNames.size();
     T.shell = std::clamp(T.shell, 0, n - 1);
     const float bw = 40.0f;
-    if (ui::Button("##stageprev", ImVec2(colX, y), "<", false, bw)) T.shell = (T.shell + n - 1) % n;
-    if (ui::Button("##stagenext", ImVec2(colX + colW - bw, y), ">", false, bw)) T.shell = (T.shell + 1) % n;
-    char b[96];
-    std::snprintf(b, sizeof b, "%s  (%d/%d)", T.shellNames[(size_t)T.shell].c_str(), T.shell + 1, n);
-    const std::string lab = FitText(b, colW - 2 * bw - 16);
+    const bool prev = ui::Button("##stageprev", ImVec2(colX, y), "<", false, bw);
+    rec("##stageprev");
+    if (ImGui::IsItemHovered()) Tip("The previous part this piece covers.");
+    const bool next = ui::Button("##stagenext", ImVec2(colX + colW - bw, y), ">", false, bw);
+    rec("##stagenext");
+    if (ImGui::IsItemHovered()) Tip("The next part this piece covers.");
+    if (prev) T.shell = (T.shell + n - 1) % n;
+    if (next) T.shell = (T.shell + 1) % n;
+    // The part's name between the arrows, and "k / n" under it in the small
+    // font, so a long part name never pushes the count off the end.
+    const std::string lab = FitText(T.shellNames[(size_t)T.shell], colW - 2 * bw - 16);
     const ImVec2 ts = ImGui::CalcTextSize(lab.c_str());
-    dl->AddText(ImVec2(colX + (colW - ts.x) * 0.5f, y + 8), ui::ColParch(), lab.c_str());
-    y += 44;
+    dl->AddText(ImVec2(colX + (colW - ts.x) * 0.5f, y + 4), ui::ColParch(), lab.c_str());
+    char cnt[24];
+    std::snprintf(cnt, sizeof cnt, "%d / %d", T.shell + 1, n);
+    ImGui::PushFont(ui::FontSmall());
+    const ImVec2 cs = ImGui::CalcTextSize(cnt);
+    dl->AddText(ImVec2(colX + (colW - cs.x) * 0.5f, y + 4 + ts.y), Fade(ui::ColParch(), 0.6f), cnt);
+    ImGui::PopFont();
+    y += 50;
   }
   if (ui::Button("##stagereset", ImVec2(colX, y), "reset view", false, colW)) T.resetView = true;
   if (ImGui::IsItemHovered()) Tip("Back to the first view: the item laid across, seen from its side.");
@@ -2439,6 +2474,12 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
     dl->AddRectFilled(ImVec2(colX, y + 2), ImVec2(colX + 12, y + 14), s.applyColor | 0xFF000000u);
     dl->AddRect(ImVec2(colX, y + 2), ImVec2(colX + 12, y + 14), ui::ColInk());
     dl->AddText(ImVec2(colX + 20, y), ui::ColParch(), FitText(s.applyText, colW - 20).c_str());
+    y += lineH + 6;
+  } else if (!s.applyText.empty() && !s.applyStoppered) {
+    // A flask is chosen, but what pours from it does not coat anything.
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), FitText(s.applyText, colW).c_str());
+    y += lineH + 2;
+    dl->AddText(ImVec2(colX, y), ui::ColEmber(), "will not coat it");
     y += lineH + 6;
   } else {
     const char* why = s.applyStoppered ? "the chosen flask is stoppered"
@@ -2486,7 +2527,7 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
     const char* help = hasBrush ? "left: pour  .  right-drag: turn  .  wheel: zoom  .  shift+wheel: size"
                                 : "drag: turn  .  wheel: zoom";
     ImGui::SetCursorScreenPos(ImVec2(colX, colBottom - lineH * 2.4f));
-    ImGui::PushTextWrapPos(colX + colW);
+    ImGui::PushTextWrapPos(colX + colW - ImGui::GetWindowPos().x);  // window-local
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(Fade(ui::ColParch(), 0.55f)));
     ImGui::TextUnformatted(help);
     ImGui::PopStyleColor();
@@ -2498,6 +2539,10 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
   const float stripH = lineH * 2 + 14;
   const float ax0 = colX + colW + kColGap, ax1 = wp.x + ws.x - kFrame - kPad;
   const float ay0 = contentTop, ay1 = colBottom - stripH;
+  // The room, for main.cpp to size next frame's picture to (an integer
+  // scale of at least 2 that fills it).
+  T.areaW = std::max(0.0f, ax1 - ax0);
+  T.areaH = std::max(0.0f, ay1 - ay0);
   T.over = T.paint = false;
   if (T.imgW > 0 && T.imgH > 0 && ax1 > ax0 && ay1 > ay0) {
     const int sc = std::max(1, (int)std::floor(std::min((ax1 - ax0) / T.imgW, (ay1 - ay0) / T.imgH)));
@@ -2519,6 +2564,10 @@ void ItemStagePanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& s
     ImGui::SetCursorScreenPos(p0);
     ImGui::InvisibleButton("##stageimg", ImVec2(iw, ih),
                            ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    rec("##stageimg");
+    T.imgX = p0.x;
+    T.imgY = p0.y;
+    T.imgScale = (float)sc;
     const bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
     const ImGuiIO& io = ImGui::GetIO();
     const ImVec2 m = io.MousePos;

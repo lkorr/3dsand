@@ -920,6 +920,14 @@ struct UIState {
     // holds a second copy of the rule (game/equipment.h GearRuined).
     float condition = 1.0f;
     bool wearable = false;
+    // Does a double-click open it on the ITEM STAGE (itemstage::StageTakes,
+    // asked of the def by main.cpp): the gesture and its tooltip hint.
+    bool stageable = false;
+    // WHAT IT IS COATED WITH (DESIGN.md "A coat moves on contact"): the coat
+    // on most of its voxels, as a swatch (0xAABBGGRR, 0 = clean) and a name,
+    // so a venomed blade reads as one in the pack and in its tooltip.
+    uint32_t coatSwatch = 0;
+    std::string coatName;
     bool ruined = false;
     // ---- the DYE (game/dye.h) ------------------------------------------------
     // The item's colour as a 0xAABBGGRR swatch ImGui can draw directly, and 0
@@ -1349,6 +1357,9 @@ struct UIState {
   // The chosen flask is stoppered: the brush is up but pours nothing (the
   // pour refuses a stoppered vessel, session.cpp), so the portrait says why.
   bool applyStoppered = false;
+  // ...and whether what pours out of it COATS anything (a body-coat stain: the
+  // item stage pours only those; sand in a flask does not stick to a blade).
+  bool applyCoats = false;
   // ---- THE ALCHEMY BENCH (game/alchemy_bench.h) ----------------------------
   // A 2D cross-section of one vessel with its contents simulated; another
   // vessel can be brought in and tilted to pour, and a stick stirs. It takes
@@ -1438,6 +1449,7 @@ struct UIState {
     std::vector<Coat> coats;     // heaviest coverage first
     int voxels = 0;              // the shell's voxel count
     std::string where;           // "in your right hand", "in the pack"
+    bool frozen = false;         // in the pack/hotbar: its coat does not dry there
     // The brush ring, in stage pixels, when the cursor is on the item.
     bool cursorValid = false;
     float cursorPx[2] = {0, 0};
@@ -1456,7 +1468,33 @@ struct UIState {
     bool wantOpen = false;
     KitRef openRef{};
     bool wantClose = false;      // "done", Esc, or the screen closing
+    // ---- where it is on screen, for a harness's mouse (uiRects) ----
+    float imgX = 0, imgY = 0;    // the picture's top-left, screen pixels
+    float imgScale = 1;          // screen pixels per stage pixel
+    float areaW = 0, areaH = 0;  // the room the panel has for it, screen pixels
   } itemStage;
+  // ---- WHERE THINGS ARE DRAWN, for a look-iteration harness's mouse --------
+  // Off in the game. When `recordRects` is set (--shot-stage), every item slot
+  // and the stage's buttons record their screen rectangle here by widget id
+  // ("bag3", "eq1", "flask1_2", "##stagenext"), refreshed each frame, so the
+  // harness clicks where a hand would and drives the panels' own input.
+  struct UiRect {
+    std::string id;
+    float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  };
+  bool recordRects = false;
+  std::vector<UiRect> uiRects;
+  void RecordRect(const char* id, float x0, float y0, float x1, float y1) {
+    if (!recordRects) return;
+    for (UiRect& r : uiRects)
+      if (r.id == id) { r.x0 = x0; r.y0 = y0; r.x1 = x1; r.y1 = y1; return; }
+    uiRects.push_back(UiRect{id, x0, y0, x1, y1});
+  }
+  const UiRect* FindRect(const std::string& id) const {
+    for (const UiRect& r : uiRects)
+      if (r.id == id) return &r;
+    return nullptr;
+  }
   // THE THROW'S WIND-UP, 0..1 while Q is held with a throwable vessel in
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.
@@ -1541,6 +1579,20 @@ class Overlay {
   bool Init(GLFWwindow* window, const rhi::Device& device,
             rhi::TextureFormat format, const std::string& assetDir);
   void BeginFrame();
+  // A LOOK-ITERATION HARNESS'S MOUSE (--shot-stage). Called inside BeginFrame
+  // after the platform backend has queued the real input and before ImGui
+  // reads it, so whatever it queues is the last word this frame: the panels
+  // see a click exactly as a hand's click arrives -- hover, double-click
+  // timing and drag included -- and no panel has a test-only path. The
+  // argument is ImGuiIO*, untyped so this header stays imgui-free. Null in
+  // the game.
+  std::function<void(void* io)> injectInput;
+  // What an injector queues, on the ImGuiIO it was handed: the pointer at
+  // (x, y), then optionally one button edge (button 0 left / 1 right, -1 none)
+  // and a wheel step. `dblClickSec` > 0 widens the double-click window (a
+  // harness frame can be slower than a hand).
+  static void QueueMouse(void* io, float x, float y, int button, bool down,
+                         float wheel, float dblClickSec);
 
   // ---- handing a rendered texture to ImGui --------------------------------
   // Registers an offscreen colour view as an ImGui-drawable image and returns
