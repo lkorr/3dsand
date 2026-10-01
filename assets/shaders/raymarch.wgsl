@@ -9524,7 +9524,10 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   var fres = f0 + (graze - f0) *
              pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER);
   // Thin films are not mirrors — same reasoning as water's surfFull term.
-  fres *= mix(0.45, 1.0, surfFull);
+  // Blood's floor is far lower than water's: a 1/8 film of blood is a wet
+  // stain on the floor, and leaving it 45% of a mirror is what painted every
+  // thinning splash pale pink over the dark red stain beside it.
+  fres *= mix(mix(0.12, 0.45, oily), 1.0, surfFull);
   if (!upFacing) { fres *= 0.6; }
 
   // ---- body colour ----
@@ -9629,8 +9632,20 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     // than the sky itself. Damping the fallback on unpooled oil models that,
     // and it is what keeps a spray of droplets reading as dark specks of oil
     // rather than as holes in the world.
-    let sky = reflectionSky(reflect(rd, n));
-    reflection = sky * mix(1.0, mix(TUNE_OIL_DROP_REFLECT, 1.0, pool), oily);
+    let rr = reflect(rd, n);
+    let sky = reflectionSky(rr);
+    // BLOOD reflects the AMBIENT, not the sky. It is a rough suspension, so
+    // what its surface sends to the eye is the hemisphere around the reflected
+    // direction averaged, not a sharp image of it — and the raw sky lookup is
+    // unoccluded: no openness, no shadow. In the shade of a wall the body went
+    // near-black (it IS lit, above) while this term stayed at full daylight,
+    // so every thin splash in shadow read as a pale pink-grey blob next to its
+    // own dark-red stain. The same ambientOpen the body uses keeps the two in
+    // proportion wherever the light goes. Oil keeps the sharp sky: it is a
+    // smooth film and the mirror IS its look.
+    let rough = ambientOpen(ambientAt(rr), opennessScale(openRaw), openRaw);
+    reflection = mix(rough,
+                     sky * mix(TUNE_OIL_DROP_REFLECT, 1.0, pool), oily);
   }
   // Reflections off blood are TINTED by it — a dielectric this dark reflects a
   // dimmer, redder version of what a clean surface would.
@@ -9641,8 +9656,12 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Pushing blood's tint onto oil was a large part of what flattened the pool
   // into mud - it dragged the one term carrying real scene information back
   // toward the same beige as everything else.
-  let tintAmt = mix(0.5, TUNE_OIL_REFLECT_TINT, oily);
-  reflection = mix(reflection, reflection * (bright + vec3f(0.25)), tintAmt);
+  // Blood's tint is near-total and carries no grey offset: the old
+  // (bright + 0.25) at half strength left two thirds of the green and blue in,
+  // which is pink, not red.
+  let tintAmt = mix(0.9, TUNE_OIL_REFLECT_TINT, oily);
+  let tintCol = mix(bright * 1.6 + vec3f(0.04), bright + vec3f(0.25), oily);
+  reflection = mix(reflection, reflection * tintCol, tintAmt);
 
   var color = mix(refracted, reflection, fres);
 
@@ -9678,8 +9697,13 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let sheenAmt = mix(TUNE_BLOOD_SHEEN, TUNE_OIL_SHEEN, oily);
     // The key-lit lobe goes through the same sun shadow as the body: a sun
     // glint on a pool in the shade of a wall is a glint from nowhere.
+    // The ambient sheen goes through openness and, on blood, the blood's own
+    // hue: a neutral sky-blue rim on every droplet in shade is the same pale
+    // wash the reflection term above was fixed for.
+    let sheenHue = mix(bright * 1.6 + vec3f(0.04), vec3f(1.0), oily);
     color += tint * min(spec, 1.0) * sheenAmt * (0.35 + fres) * sunSh
-           + ambientAt(n) * ambientSheen;
+           + ambientOpen(ambientAt(n), opennessScale(openRaw), openRaw) *
+             sheenHue * ambientSheen;
 
     // ---- thin-film iridescence ----
     // The rainbow slick, and it ONLY appears where oil is floating on water.
