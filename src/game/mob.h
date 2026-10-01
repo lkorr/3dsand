@@ -3582,6 +3582,19 @@ class Mob {
     int groundY = 0;
     bool wall = false;
     bool fits = true;
+    // WHICH of the sampled columns are wall: one bit per column of the body-
+    // frame grid (row-major on a 7-wide grid; at most 7 x 7). A body that
+    // TURNS swings its oriented box (a snake's tail, a broad back's shoulder)
+    // and can end up with part of it already inside the rock. Since a move is
+    // a pure translation in the body's frame, the same bit is the same part
+    // of the body at both positions: the drive lets a move through when every
+    // walled column at the destination was ALREADY walled where it stands
+    // (MobSystem::MoveNoDeeper) -- nothing new goes into the rock, so a head
+    // still cannot enter a wall and a thin wall cannot be stepped through,
+    // but turning beside one is not a trap. The walk drive's form of
+    // BlockedByMob's "may always move apart".
+    int wallColumns = 0;
+    uint64_t wallMask = 0;
   };
   Footing FootprintFooting(World& world, const MobDef& def, float cx, float cz,
                            float fromY) const;
@@ -5808,9 +5821,12 @@ class MobSystem {
   // `attackerProne` is the ATTACKER's `Mob::LocoGroundAlign()` -- above 0 and
   // the style's `targetProne` table is drawn from instead of its `target` one,
   // so a crawler goes for what a crawler can reach. Pass 0 for "upright".
+  // `reachHeight` (world voxels above the victim's feet, 0 = no limit): only
+  // limbs whose centre is at or below it are drawn, unless none is -- a snake
+  // lying on the ground draws a foot, not a thigh it cannot rise to.
   static int PickTargetLimb(const AttackStyle& sty, const Mob& victim,
                             uint64_t attackerId, float attackerProne,
-                            uint32_t tick);
+                            uint32_t tick, float reachHeight = 0.0f);
   // The item library, so an NPC's sweep can read the damage, carve bonus and
   // HEFT of whatever is in its fist. By POINTER and not owned: items reload on
   // R and a copy here would be a second, stale library. The Mob stores its held
@@ -7495,6 +7511,27 @@ class MobSystem {
   // ART's bounding box, so a rig with its arms out would otherwise claim a
   // personal space the size of its wingspan.
   static float BodyRadius(const MobDef& def);
+  // ...AND A LONG BODY IS A CAPSULE, NOT A DISC (2026-10-01). The footprint
+  // as a segment along the body's long rest axis (`along`: +1 its facing,
+  // 0 across it) of half-length `halfLen`, swept by `radius`. A box up to
+  // twice as long as it is wide is the disc above exactly (halfLen 0, radius
+  // BodyRadius), so every upright creature keeps the spacing it always had;
+  // by three times as long it is the box itself (radius = half its width) --
+  // a snake 18 voxels long is not a 4.9-voxel disc that refuses a body two
+  // voxels from its flank. Linear between the two. Public: the harnesses
+  // place bodies by it (--shot-strike's stand-off).
+ public:
+  struct Capsule {
+    float radius = 0.25f;
+    float halfLen = 0.0f;
+    bool alongFacing = true;   // the long axis is the facing (z), else across
+  };
+  static Capsule BodyCapsule(const MobDef& def);
+  // The capsule's segment ends, in world xz, for a body centred at (cx, cz)
+  // facing `heading`.
+  static void CapsuleSegment(const Capsule& c, float cx, float cz,
+                             float heading, Vec3& a, Vec3& b);
+ private:
   // Centre of that footprint in world voxels (origin_ is the MIN CORNER).
   static Vec3 BodyCentre(const Mob& mob, const MobDef& def);
   // Sum of the crowding pushes from every other live mob inside the spacing
@@ -7515,6 +7552,11 @@ class MobSystem {
   // welding together, and nothing can ever be permanently stuck.
   bool BlockedByMob(const Mob& self, const MobDef& def, float cx,
                     float cz) const;
+  // A destination footing that is walled only where the body ALREADY is
+  // (Mob::Footing::wallMask, both taken at the current heading): true = the
+  // move puts nothing new into the rock and may go through.
+  bool MoveNoDeeper(const Mob& mob, const MobDef& def,
+                    const Mob::Footing& dest) const;
 
   // Apply the resulting motion: settle onto the ground and translate along the
   // ACTUAL facing (never the desired one — that is what makes a turn arc).
@@ -7967,3 +8009,9 @@ class MobSystem {
   // seam the avatar used to reach BurnOneLimb through, made symmetrical.
   friend class Mob;
 };
+
+// THE SLITHER'S OWN COST (Mob::ApplySlither, game/pose.cpp): calls and
+// wall-clock nanoseconds, process-wide, for the `snake` gate's readout.
+// Diagnostic only; never saved, never hashed.
+uint64_t SlitherPoseCalls();
+uint64_t SlitherPoseNanos();

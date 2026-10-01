@@ -14,6 +14,8 @@
 #include "game/mob.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -849,8 +851,27 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
 // ACTUALLY got, so the boundary does not kink.
 //
 // Presentation only (pose.h): CPU float, never hashed, never on the grid.
+namespace {
+std::atomic<uint64_t> g_slitherCalls{0}, g_slitherNanos{0};
+struct SlitherTimer {
+  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  ~SlitherTimer() {
+    g_slitherCalls.fetch_add(1, std::memory_order_relaxed);
+    g_slitherNanos.fetch_add(
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count(),
+        std::memory_order_relaxed);
+  }
+};
+}  // namespace
+
+uint64_t SlitherPoseCalls() { return g_slitherCalls.load(); }
+uint64_t SlitherPoseNanos() { return g_slitherNanos.load(); }
+
 void Mob::ApplySlither(const PoseInputs& in, float dt) {
   if (def_ == nullptr) return;
+  const SlitherTimer timer;   // the `snake` gate's cost readout
   const MobDef::SlitherDef& sd = def_->slither;
   const AnimSkeleton& sk = skel_;
   AnimState& st = anim_;

@@ -11732,9 +11732,12 @@ draws from: legs and feet.
 snake strike actually lands with (0.05..0.5 of the melee speed ramp) is a
 0.15..0.25-voxel hole, a couple of art voxels into the limb. The bite then runs the zombie's path untouched
 (`Mob::BiteHit` → `StainWoundAs`): the flesh the puncture exposed is rewritten
-to the sidecar's `bite.infect` and smeared with `bite.stain`. Until package B
-lands those are the zombie's `rotflesh` / `ichor`; switching them to
-`envenomed` / `venom` is two strings in `snake.json`.
+to the sidecar's `bite.infect` (`envenomed`) and smeared with `bite.stain`
+(`venom`). An infection with `targets` rewrites only its own diet, so the
+puncture's skin is not envenomed -- the flesh under it is -- and the venom
+smear on the wound wall seeds more of it (`coat.infects`). Measured in the
+gate's pass C: a few cells from the teeth, 11..21 at the peak once the smear
+has seeded, burnt out about 80 s later.
 
 **The venom gland is a stand-in, rewritten at load** (`anatomy.becomes`,
 beside `garmentsBecome` in `BuildMobDef`). A `.vox` palette index is a
@@ -11748,17 +11751,75 @@ voxel after the recipe resolves — outside `anatomy::Resolve`, so
 **Behaviour** (`behaviors.json` `snake`): faction monster, hostile, 360° sight
 to 30 voxels, a 9..12 voxel band (centre to centre — its fangs are nine voxels
 ahead of its centre), one style, a 45-tick cadence and a real disengage: it
-strikes and draws back. It spawns from the dev panel's Mob tool (Spawn →
-"place any mob def"); no biome spawns creatures yet, so there is no natural
-spawn.
+strikes and draws back. With nothing in sight it **wanders** (`movement.wander`,
+below): slow legs of slither to points within 24 voxels of where it was born,
+each followed by a 3..12 s rest lying in its S — the idle coil is the wave
+kept when the body stops. It spawns from the dev panel's Mob tool (Spawn →
+"place any mob def") and from F1 → Creatures (under "other": a body that
+fights with natural weapons and has no hand keeps its own profile); no biome
+spawns creatures yet, so there is no natural spawn. Far from the player it
+costs what every creature costs: out of the residency window it is PARKED
+(`MobParking`, its MOBS record in its region bucket) and unparked when the
+window returns; its pose stage (`ApplySlither`) measures 1.5–2.4 µs a call.
 
-**Known limits.** The walk drive's footprint (`FootprintFooting`) and the
-crowd radius are axis-aligned boxes from `worldSize`, which for a body 18
-voxels long and 1.6 wide is wrong whenever it does not face ±Z: it can be
-refused by a wall beside it rather than in front of it. Rotating the footprint
-by the heading is a change to every creature's walk and is left for its own
-package. `Wander` needs a schedule routine, so a snake with no target lies
-still (coiled) rather than roaming.
+**It bites what it can rise to** (`MobSystem::PickTargetLimb`'s
+`reachHeight`, 2026-10-01). A PRONE attacker (loco `groundAlign` > 0) draws
+only limbs whose centre is within its own lying height and a voxel of the
+victim's feet, unless none is (a victim lying down) — so on a standing man the
+snake goes for the feet. Before it drew from the whole `targetProne` table and
+four strikes in five went for a thigh 6.3 voxels up, ended 6.2 voxels from it
+and bit air. A crawling humanoid's box is its full rig height, so its draw is
+unchanged.
+
+**A body turns its footprint with it** (2026-10-01, every creature). The walk
+drive's footprint (`Mob::FootprintFooting`) was a 3×3 grid over the rest
+box's world-axis extents, the ground-sense fan an ellipse on world X/Z, and the
+personal-space test a disc of the mean half-extent — so a snake (1.6 × 18)
+facing ±X sampled an 18-voxel-wide footprint and a wall beside it refused it.
+Now: the grid is laid in the body frame (forward = heading), with more columns
+along an axis longer than 12 voxels (5 on a snake; every humanoid keeps its
+3×3); the fan's ellipse is the body's; and the crowd push and `BlockedByMob`
+measure between **capsules** (`MobSystem::BodyCapsule`): a box up to twice as
+long as wide is the old disc exactly, three times as long or more is a segment
+along its long axis swept by half its width, linear between — every upright
+creature spaces exactly as before. A body that TURNS can swing part of its
+oriented box into rock (a snake's tail beside a wall); `Footing::wallMask`
+records which columns are wall, and since a move is a translation in the body
+frame the drive lets one through when nothing NEW goes in
+(`MobSystem::MoveNoDeeper`): a head still cannot enter a wall, a thin wall
+still cannot be stepped through, and turning beside one is not a trap.
+
+**Idle wander is a profile field, not a resident** (`ai::Movement::wander*`,
+2026-10-01). `Wander` was only ever scored when the resident layer
+(`world/refs_npc.cpp`) put a schedule routine on the brain, so a creature with
+no schedule had nothing to do with no target. A profile's
+`movement.wander: {radius, speed, pauseMin, pauseMax, arrive}` now makes
+`ai::Think` write that routine itself when no resident owns one: a leg to a
+point drawn inside `radius` of the anchor (`Hash3(id, leg)`, uniform over the
+disc's area, at least 35% of it out), at `speed` of the walk, then a rest of
+`pauseMin..pauseMax` ticks; a leg that takes twice its walking time is given up
+like an arrival. A target takes the routine back at once (the fight's verbs
+win on their own scores); losing it hands it back. The intent's weight is the
+profile's `intents.wander`, so a resident's schedule, a fright or a fight
+outbid it with no special case. Brain state, never saved: a loaded or unparked
+creature starts a new rest where it lies.
+
+**`--shot-strike` stands the pair centre to centre.** Both bodies were spawned
+with their MIN CORNERS the style's reach apart; for two of a kind that is the
+centre gap, for an 18-voxel snake it put the victim's corner three voxels down
+its own body. The victim's centre is now placed `StyleReachOn` + the
+attacker's forward overhang (its capsule half-length along its facing, 0 for
+every upright creature) ahead of the attacker's centre, the strike is started
+with the victim's id so the style's own target table is drawn (as the AI
+does), and the `rot` column counts the attacker's own `bite.infect` material.
+`--shot-strike snake snake_strike human` now stands 11.3 apart, lunges 8
+voxels, draws a foot, and its jaws reach the near shin: 12 of 30 probes on the
+body, `legL.L` -7 voxels and +43 envenomed after the tail. That shin was
+being BRUISED and never bitten: the bite borrowed the impulse latch
+(`firstContact`, one bruise per limb per stroke), so a limb the jaws brushed
+while holding out for the drawn one could not be bitten when the holdout lifted
+on the last cut tick. With the stroke's own one-bite latch (`EdgeSweep::bitten`)
+present the bite no longer needs the impulse latch (`MeleeSweepDamage`).
 
 **Gate `snake`.** Pass A drives it 150 ticks at a target 27 voxels ahead and
 asserts it closes distance, every segment's lowest voxel stays within a voxel
@@ -11771,7 +11832,17 @@ every segment sideways and measures near 1). The fixture lays its own level
 stone pad: worldgen relief under an eighteen-voxel body measures the terrain,
 not the slither. Pass B puts a training
 dummy ahead and demands the snake's own `bite.infect` material in its flesh.
-Thresholds in `tests/baseline.json` (`snake.*`).
+Pass C is its OWN hunt: spawned facing away from a standing man 22 voxels off
+its flank, beside a wall on exactly the row the old unrotated footprint sampled
+for its tail, it must move (11 voxels in its first 60 ticks), turn, close and
+bite on its own profile, leave envenomed in soft tissue (never skin or bone)
+and the venom smear on the wound, and then — the snake removed — the infection
+must burn out at the material's rates ×8 with hp booked to the infection. One
+line per strike names what it went for, from how far, and what the probes met.
+Pass D leaves it alone: it must wander (path, rests, near its anchor). Pass E
+round-trips its MOBS record (`SaveOne` / `LoadOne`): it comes back where it
+was, prone, on its own profile, and goes on wandering. Thresholds in
+`tests/baseline.json` (`snake.*`).
 
 ### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
 

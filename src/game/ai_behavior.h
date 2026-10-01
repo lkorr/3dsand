@@ -255,6 +255,20 @@ struct Movement {
   // `false` forces driveScale to 0 no matter which intent wins, so a profile
   // author cannot accidentally give a training dummy a shuffle.
   bool mobile = false;
+  // ---- IDLE WANDER (2026-10-01; `movement.wander` in behaviors.json) -------
+  // A creature with nothing to fight strolls round where it was born: legs of
+  // a walk to a point drawn inside `wanderRadius` of its anchor (counter-based
+  // on its id and the leg number), each followed by a pause of
+  // `wanderPauseMin..Max` ticks standing still. Scored as the `wander` intent
+  // (its weight is the profile's `intents.wander`), so a target, a fright or a
+  // resident's schedule outbids it with no special case. 0 = off: the day
+  // verbs then come only from a resident routine (world/refs_npc.cpp), which
+  // always wins over this one.
+  float wanderRadius = 0.0f;      // world voxels from the anchor
+  float wanderSpeed = 0.5f;       // multiplier on the def's walk speed
+  uint32_t wanderPauseMin = 60;   // ticks
+  uint32_t wanderPauseMax = 180;  // ticks
+  float wanderArrive = 2.0f;      // world voxels, planar: "there"
   // ---- TACTICAL FOOTWORK (2026-09-27) --------------------------------------
   // Dodge's drive, as a multiplier on walk speed (split between a back-step
   // and a side-step). Above 1 is a burst — a dodge at walking pace is not one.
@@ -943,6 +957,16 @@ struct Brain {
 
   // ---- the schedule's ask (P7) ----
   Routine routine;
+  // ---- the profile's own idle wander (Movement::wanderRadius) ----
+  // `wanderOwned`: the routine above was written by Think's generic wander
+  // (not by a resident layer), so Think may also take it back.
+  bool wanderOwned = false;
+  bool wanderAnchorSet = false;
+  Vec3 wanderAnchor{};
+  Vec3 wanderGoal{};
+  uint32_t wanderLeg = 0;         // legs walked; the goal's hash key
+  uint32_t wanderPauseUntil = 0;  // standing still (coiled) until this tick
+  uint32_t wanderLegSince = 0;    // the tick this leg began (stuck guard)
 
   void Reset() {
     *this = Brain{profile};

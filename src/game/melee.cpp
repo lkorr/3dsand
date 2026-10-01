@@ -1643,8 +1643,19 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // false when the handle no longer resolves to a limb (it was severed by
       // the cut part a few lines up, say), and spending the stroke's one bite
       // on that would make a zombie miss for reasons nobody can see.
-      if (s.strike.bite > 0.0f && firstContact && !wrongTarget &&
-          !(s.bitten != nullptr && *s.bitten)) {
+      //
+      // ...AND A LIMB THE JAWS BRUSHED WHILE HOLDING OUT IS STILL BITEABLE
+      // (2026-10-01). `firstContact` is the IMPULSE latch (one bruise per limb
+      // per stroke), and the bite borrowed it -- so a limb touched on an
+      // earlier tick, when the bite was withheld for the drawn one, could
+      // never be bitten on the last tick when the holdout lifts: the snake's
+      // jaws brushed the near shin on their way to the far foot, missed the
+      // foot, and the stroke ended with a bruise and no bite. With the
+      // stroke's own one-bite latch (`s.bitten`) there to stop a second bite,
+      // the impulse latch is not needed for it; without that latch it still
+      // applies.
+      const bool biteFresh = s.bitten != nullptr ? !*s.bitten : firstContact;
+      if (s.strike.bite > 0.0f && biteFresh && !wrongTarget) {
         biteLanded = mobs.BiteHit(hb, parts.bite, world, spawns);
         if (biteLanded && s.bitten != nullptr) *s.bitten = true;
         if (biteLanded && coatKind != MobSystem::CoatHitKind::Cut) {
