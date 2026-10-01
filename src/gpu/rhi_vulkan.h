@@ -510,9 +510,19 @@ class Backend {
   // from it are in flight (a module is only read during pipeline creation), and
   // what stops an F5 reload, whose re-baked tuning prelude re-keys every
   // shader, from leaking every module it ever compiled.
+  //
+  // `bindings`, when non-null, receives every (set << 16 | binding) the
+  // module's SPIR-V decorates. Tint emits one entry point and drops the globals
+  // it does not reach, so this is what the pipeline layout must provide; the
+  // seam checks it before vkCreate*Pipelines (rhi_vk.cpp LayoutMissing). A
+  // shader naming a binding its layout lacks is invalid usage that the NVIDIA
+  // driver answers with a null dereference inside the compile, not an error
+  // code (crash.log 2026-09-27 and 2026-09-30: a hot-loaded sim_gas.wgsl that
+  // declared binding 13 against an exe whose gas layout stopped at 12).
   VkShaderModule GetShaderModule(const std::string& wgsl, const std::string& label,
                                  const std::string& entryPoint, uint32_t bodyLineOffset,
-                                 std::string& diagnostics, std::string* cacheKey);
+                                 std::string& diagnostics, std::string* cacheKey,
+                                 std::vector<uint32_t>* bindings = nullptr);
   void ReleaseShaderModule(const std::string& cacheKey);
 
   // ---- descriptors and pipelines ----
@@ -768,6 +778,7 @@ class Backend {
   struct CachedModule {
     VkShaderModule module = VK_NULL_HANDLE;
     uint32_t refs = 0;
+    std::vector<uint32_t> bindings;  // set << 16 | binding, see GetShaderModule
   };
   std::unordered_map<std::string, CachedModule> moduleCache_;
   // Keys some thread is compiling RIGHT NOW. A second asker for the same key
