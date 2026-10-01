@@ -456,7 +456,7 @@
   "snake.maxFloatVox": "0.6",
   "snake.maxSinkVox": "0.5",
   "snake.minWaveFrac": "0.8",
-  "snake.maxSlipRatio": "0.35",
+  "snake.maxSlipRatio": "0.4",
   "snake.biteGapVox": "12.0",
   "snake.biteTicks": "300",
   "crawlSlopeTicks": "1200",

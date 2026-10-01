@@ -11430,7 +11430,11 @@ asserts it closes distance, every segment's lowest voxel stays within a voxel
 of the ground under it, the segment centres change sign about their fitted
 line at least twice along the body (a wave, not a rod), and SLIP — the share
 of each interior segment's travel that goes across itself rather than along
-— stays small (a clock-phased wave measures near 1). Pass B puts a training
+— stays under 0.4 (measured 0.25..0.30, most of it the turn onto the target
+and the steadied head; a wave phased on a clock instead of the odometer slides
+every segment sideways and measures near 1). The fixture lays its own level
+stone pad: worldgen relief under an eighteen-voxel body measures the terrain,
+not the slither. Pass B puts a training
 dummy ahead and demands the snake's own `bite.infect` material in its flesh.
 Thresholds in `tests/baseline.json` (`snake.*`).
 
