@@ -213,7 +213,7 @@ std::vector<CoatParcel> CoatOffer(const StainLattice& L,
 
 uint32_t CoatLay(const StainLattice& L, const std::vector<CoatCell>& cells,
                  float reach, std::vector<CoatParcel>& parcels,
-                 MicroBodySet* micro, int model) {
+                 MicroBodySet* micro, int model, uint32_t layerMin) {
   const bool poke = Owned(micro, model);
   uint32_t changed = 0;
   const float near = cells.empty() ? 0.0f : cells.front().dist;
@@ -222,12 +222,18 @@ uint32_t CoatLay(const StainLattice& L, const std::vector<CoatCell>& cells,
     uint32_t left = p.levels;
     uint32_t written = 0;
     const bool washes = (BodyCoatClassOf(p.mat) & kBodyCoatWashes) != 0;
+    // The spread cap: at least `layerMin`, else an even share of the parcel.
+    const uint32_t share =
+        cells.empty() ? 0u
+                      : (uint32_t)((p.levels + cells.size() - 1) / cells.size());
+    const uint32_t cap = layerMin > 0 ? std::max(layerMin, share) : kBodyStainAmtMax;
     for (const CoatCell& c : cells) {
       if (left == 0) break;
       // Thickest at the contact, half of it at the patch's rim.
       const float t = std::clamp((c.dist - near) / span, 0.0f, 1.0f);
       uint32_t want = (uint32_t)std::lround((float)p.peak * (1.0f - 0.5f * t));
       want = std::clamp<uint32_t>(want, 1u, kBodyStainAmtMax);
+      want = std::min(want, cap);
       want = std::min(want, left);
       const uint16_t cur = L.Stain(c.idx);
       uint16_t next;

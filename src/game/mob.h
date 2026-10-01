@@ -775,6 +775,10 @@ struct BodyBurnState {
   // first step toward the unowned-diverging-representation failure.
   IVec3 min{}, dims{};
   std::vector<uint32_t> idx;
+  // Bumped by every drop and build of `idx`: a list of lattice POSITIONS
+  // taken under one generation (MobLimb::infectCells) is re-derived when the
+  // lattice it was taken from may have been reshaped or rebased.
+  uint32_t idxGen = 0;
   // Cells whose material carries a decay/emit rule — the voxels actually
   // alight. Spread is pushed OUTWARD from these to their six lattice
   // neighbours, never pulled by scanning candidates, which is what keeps the
@@ -1662,10 +1666,32 @@ struct MobLimb {
   // InfectStep when a sweep finds none left, and by a bare `disinfect`
   // remedy (which stops every clock on the limb). Any number of different
   // infection materials may share a limb: the flag does not say which.
-  // Never saved: a loaded body's infectious cells lie inert until something
-  // re-latches the limb -- what the single latch always did.
+  // Never saved: derived on load (Mob::RelatchInfections), so a loaded body's
+  // infections resume.
   uint8_t infected = 0;
   bool Infected() const { return infected != 0; }
+  // Every writer that puts an infection voxel in calls this: the latch, and
+  // the cell list below goes stale so the next step re-derives it.
+  void MarkInfected() {
+    infected = 1;
+    infectCellsValid = false;
+  }
+  // ---- WHERE THE INFECTIOUS CELLS ARE (2026-10-01, rule 2) -----------------
+  // The lattice POSITIONS of this limb's infection voxels, so Mob::InfectStep
+  // costs what the infection is, not what the limb is: it used to sweep the
+  // whole lattice every tick for every infected limb (a human torso is
+  // 31,456 skin cells). Positions, not indices -- a flush compacts the
+  // lattice and renumbers it; positions resolve through the burn index.
+  // Derived and disposable: `infectCellsValid` false means "re-derive with
+  // one sweep" (MarkInfected, a load, a reshape). Stale ENTRIES (eaten,
+  // cured, carved away) are dropped when the step resolves them, and the
+  // step appends what it converts itself. Never saved.
+  struct InfectCellPos {
+    int16_t x, y, z;
+  };
+  std::vector<InfectCellPos> infectCells;
+  bool infectCellsValid = false;
+  uint32_t infectCellsGen = 0;   // BodyBurnState::idxGen it was taken under
   // ...AND WHAT A BITE REWROTE THE FLESH TO (0 = none). NOT an infection
   // list: it exists only for the wound-revert table (Mob::ViewOf arms the
   // revive for it at gore.infectHealSlow), which has to know which material
@@ -1798,7 +1824,7 @@ struct InfectSpec {
   // spread / eat ABSENT in the JSON: gore.infectSpreadRate / infectRotRate
   // times gore.infectMobMult, read live (the rot's numbers stay tuning).
   bool goreRates = false;
-  float spread = 0.0f, eat = 0.0f;   // world voxels / min, per infected limb
+  float spread = 0.0f, eat = 0.0f;   // chance per voxel per SECOND (one world voxel across; InfectStep scales by the lattice)
   uint32_t floor = 0;
   // targets ABSENT: MobDef::RotRateOf (the rot's per-material admission).
   bool targeted = false;
@@ -1808,7 +1834,7 @@ struct InfectSpec {
   bool turns = false;                // the dead rise (MobDef::turn)
   DamageCause cause = DamageCause::Infection;
   std::string death;                 // death cause when its damage kills
-  uint32_t cured = 0;                // what a filtered disinfect turns it into
+  uint32_t cured = 0;                // what a disinfect (bare or filtered) turns it into
 };
 
 // ============================================================================
@@ -4335,6 +4361,13 @@ class Mob {
   // `infectMat != 0` test per limb on a creature nothing has bitten, which is
   // every creature in the world until a zombie gets its teeth into one.
   //
+  // ---- A LOADED BODY RESUMES ITS INFECTIONS (2026-10-01) -------------------
+  // MobLimb::infected and the infection cell lists are DERIVED (never saved):
+  // a lattice put back from a save or a handoff gets them re-derived here --
+  // every base limb holding a voxel of an infection material is latched, and
+  // the coat ledger is dirtied so a venom coat sitting in a wound arms its
+  // seeding again. Called at the end of MobSystem::OverlayMobRecord.
+  void RelatchInfections();
   // MAY RESHAPE limbs_: the rot's removals go out through FlushBurn, which
   // expresses itself as a carve and can sever the limb or kill the creature.
   // Returns false when that has happened and the caller must touch nothing.
@@ -5980,6 +6013,15 @@ class MobSystem {
     bool unarmed = false;
     bool landed = true;        // the resolver reported the blow landed
     const std::vector<IVec3>* woundCells = nullptr;  // a cut's removed cells
+    // LOOSE MATTER ON EITHER SIDE (2026-10-01). A debris body handle in place
+    // of a creature: `strikerBody` -- a thrown sword, a rock, a severed arm
+    // flung at someone (MobSystem::ApplyContactDamage) -- replaces strikerId
+    // and the edge; `targetBody` -- a corpse piece, a dropped item, a severed
+    // limb a blade or fist strikes -- replaces targetId / targetSlot. The
+    // contact patch is then the body's own voxels nearest `at`. Same rule,
+    // same writers, on whatever lattice the matter has.
+    uint64_t strikerBody = 0;
+    uint64_t targetBody = 0;
   };
   struct CoatContactResult {
     int strikerSlot = -1;      // which of the striker's slots touched
@@ -6882,6 +6924,11 @@ class MobSystem {
   // something to heal -- recipe cells missing or changed, or hp below its cap.
   static constexpr uint32_t kRemedyStanch = 1u, kRemedyDisinfect = 2u,
                             kRemedyRestore = 4u;
+  // The infection MATERIALS the last DouseLimb / PourOnBody's disinfect
+  // stopped, so the message can name them ("the venom stops spreading")
+  // rather than calling everything rot.
+  const std::vector<uint32_t>& LastCuredInfections() const { return lastCured_; }
+  std::vector<uint32_t> lastCured_;
   uint32_t DouseLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
                      uint32_t tick, uint32_t* marked = nullptr);
   // ---- THE POUR BRUSH (the health panel's portrait, game/container.h) -------
@@ -6986,7 +7033,8 @@ class MobSystem {
   static void TallyCoat(const BurnLimbView& v, LimbCoat& out,
                         const std::vector<uint8_t>* corrodes = nullptr,
                         bool sole = false,
-                        const std::vector<uint16_t>* infects = nullptr);
+                        const std::vector<uint16_t>* infects = nullptr,
+                        const std::vector<uint8_t>* infectCost = nullptr);
   // ---- SEVERED FLESH TAKES A COAT TOO (2026-09-22) --------------------------
   // Contact (blood stains, water rinses) and drying over every dead-flesh
   // DEBRIS body -- severed limbs and carved gobbets, the parts that have left
@@ -7221,6 +7269,26 @@ class MobSystem {
   };
   const BurnStats& Burn() const { return burnStats_; }
   void ResetBurnStats() { burnStats_ = BurnStats{}; }
+  // ---- THE INFECTION PASS'S COST (gate `infect-perf`) ---------------------
+  // Whole-lattice sweeps InfectStep made to (re)derive a limb's cell list,
+  // limb-steps run, and their wall-clock time. Diagnostic, never saved.
+  struct InfectCost {
+    uint64_t sweeps = 0, limbSteps = 0;
+    double ms = 0.0;
+  };
+  InfectCost InfectCostStats() const {
+    return InfectCost{infectSweeps_, infectLimbSteps_, infectMs_};
+  }
+  void ResetInfectCost() {
+    infectSweeps_ = infectLimbSteps_ = 0;
+    infectMs_ = 0.0;
+  }
+  uint64_t infectSweeps_ = 0, infectLimbSteps_ = 0;
+  double infectMs_ = 0.0;
+  // The pre-2026-10-01 cost model, for the A/B: every InfectStep re-derives
+  // its cell list with a whole-lattice sweep. Same outcome cell for cell.
+  bool infectFullSweep_ = false;
+  void SetInfectFullSweep(bool on) { infectFullSweep_ = on; }
 
   bool BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey, World& world,
                    std::vector<CellOp>& cellOps, uint32_t& frontBudget,
@@ -7251,6 +7319,11 @@ class MobSystem {
   // that wants to keep cutting (the selftest, a future aim assist) has to aim
   // at flesh that is actually still present.
   Vec3 LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const;
+  // ...the `n`th surviving voxel ON THE SURFACE (an empty face neighbour in
+  // the collider lattice), wrapped: where a probe -- teeth, a fist -- stops.
+  // LimbVoxelPos names any voxel, and an interior one is a point no blow can
+  // reach (a bite there is a closed cavity in the bone core).
+  Vec3 LimbSurfacePos(uint64_t mobId, int limbIndex, uint32_t n) const;
   // The limb's JOINT ANCHOR in world voxels, through its live pose. Invariant
   // across carves (see the impl), which is what a test that keeps cutting one
   // cross-section needs and LimbVoxelPos cannot give — that one names the nth

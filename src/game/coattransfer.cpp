@@ -277,6 +277,42 @@ bool Mob::StrikerEdgeLocal(bool haft, int& slot, Vec3& from, Vec3& to) const {
 // THE EXCHANGE
 // ============================================================================
 
+
+namespace {
+
+// ONE SIDE OF AN EXCHANGE: a lattice, its pitch, the contact in its own cells,
+// and its brick. A rig slot or a loose debris body -- the rule does not care
+// which, so a thrown sword, a corpse's arm and a dropped dagger trade coats by
+// exactly the creature's rule (2026-10-01).
+struct CoatParty {
+  StainLattice L;
+  float scale = 1.0f;
+  Vec3 cell{};                       // the contact, lattice cells
+  int model = -1;                    // the brick (an owned copy before a poke)
+  uint32_t* looseModel = nullptr;    // a loose body's brick field, written back
+  uint64_t looseId = 0;              // a loose body's global id (its ledger)
+};
+
+// A loose body's side: its authoritative lattice (FleshOf's choice) and the
+// world contact through the body's own transform.
+CoatParty LooseParty(DebrisSystem::FleshLattice& f, Vec3 atWorld) {
+  CoatParty p;
+  p.L.skin = f.skin;
+  p.L.coll = f.coll;
+  p.scale = (float)std::max(1u, f.scale);
+  const BodyTransform& xf = *f.xf;
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  p.cell = QuatRotateInv(q, atWorld - xf.pos) * p.scale;
+  p.model = f.microModel && *f.microModel != kMicroBodyNoModel
+                ? (int)*f.microModel
+                : -1;
+  p.looseModel = f.microModel;
+  p.looseId = f.id;
+  return p;
+}
+
+}  // namespace
+
 MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
   CoatContactResult r;
   lastCoat_ = r;
@@ -288,93 +324,113 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
       (uint32_t)std::clamp(gear.coatBleedPickup, 0, (int)kBodyStainAmtMax);
   if ((frac <= 0.0f || maxLevels == 0) && bleedAmt == 0) return r;
   if (phys_ == nullptr) return r;
-  Mob* striker = FindCreature(c.strikerId);
-  Mob* target = FindCreature(c.targetId);
-  if (!striker || !target || striker == target) return r;
-
-  // ---- THE STRUCK SLOT, STILL THE ONE THAT WAS STRUCK ----------------------
-  // Resolved by the caller before the resolvers ran (a carve rebuilds the
-  // body and changes its handle); checked by NAME after, because a severed
-  // shell erases its slot and renumbers the appended tail.
-  const int ts = c.targetSlot;
-  if (ts < 0 || ts >= (int)target->limbs_.size() ||
-      ts >= (int)target->limbDefs_.size() || !target->limbs_[ts].body ||
-      target->limbDefs_[ts].name != c.targetSlotName)
-    return r;
-
-  // ---- WHICH OF THE STRIKER'S VOXELS TOUCHED (plan A1) ---------------------
-  //
-  // NOT the probe's world point. The sweep's contact lies ON its edge
-  // segment (every probe runs down the blade's own axis), so the honest
-  // statement of "where on the weapon did it land" is how far along that
-  // segment -- `edgeU` -- and that maps straight onto the slot's own authored
-  // edge in its own body frame, with no world transform to disagree with the
-  // renderer's. A tip strike lands at the tip whatever pose the blade is in.
-  int es = -1;
-  Vec3 from, to;
-  if (!striker->StrikerEdgeLocal(c.haft, es, from, to)) return r;
-  if (es < 0 || es >= (int)striker->limbs_.size() || !striker->limbs_[es].body)
-    return r;
-  const float u = std::clamp(c.edgeU, 0.0f, 1.0f);
-  Vec3 sLocal = from + (to - from) * u;
-  int ss = es;
+  Mob* striker = c.strikerBody ? nullptr : FindCreature(c.strikerId);
+  Mob* target = c.targetBody ? nullptr : FindCreature(c.targetId);
+  if (!c.strikerBody && !striker) return r;
+  if (!c.targetBody && !target) return r;
+  if ((c.strikerBody || c.targetBody) && !debris_) return r;
+  if (striker && target && striker == target) return r;
+  if (c.strikerBody && c.strikerBody == c.targetBody) return r;
   const float rw =
       std::max(c.radius, MetresToCells(std::max(gear.coatContactRadius, 0.0f)));
 
-  // ...ON THE GAUNTLET, when there is one. A worn shell over the striking
-  // part is what actually meets the target (StrikeProfileFor already lets it
-  // decide the blow), so it is also what carries the coat: the shell hosted on
-  // the part whose surface comes nearest the contact, if it is within the
-  // contact's reach of it.
-  if (es < striker->baseLimbs_ && striker->LimbHasShells(es)) {
-    const MobLimb& pl = striker->limbs_[es];
-    const Quat pq{pl.xf.quat[0], pl.xf.quat[1], pl.xf.quat[2], pl.xf.quat[3]};
-    const Vec3 w = pl.xf.pos + QuatRotate(pq, sLocal);
-    float best = rw + 1.0f;
-    for (int s = striker->baseLimbs_; s < (int)striker->limbs_.size(); s++) {
-      MobLimb& sl = striker->limbs_[s];
-      if (sl.wornHost != es || !sl.body || !striker->IsWornSlot(s)) continue;
-      const Quat sq{sl.xf.quat[0], sl.xf.quat[1], sl.xf.quat[2], sl.xf.quat[3]};
-      const Vec3 loc = QuatRotateInv(sq, w - sl.xf.pos);
-      SlotLattice v;
-      const bool fine = sl.HasFineSkin();
-      v.L.skin = fine ? &sl.skinVoxels : nullptr;
-      v.L.coll = fine ? nullptr : &sl.voxels;
-      v.scale = (float)std::max(1u, fine ? striker->SkinScaleOf(sl)
-                                         : striker->PhysScaleOf(sl));
-      const LatticeOcc occ = BuildLatticeOcc(v.L);
-      const std::vector<CoatCell> near =
-          CoatContactCells(v.L, occ, loc * v.scale, 0.0f, false);
-      if (near.empty()) continue;
-      const float d = near.front().dist / v.scale;   // world voxels
-      if (d < best) {
-        best = d;
-        ss = s;
-        sLocal = loc;
+  CoatParty S, T;
+  // ---- THE STRUCK SIDE ------------------------------------------------------
+  // A creature's slot: resolved by the caller before the resolvers ran (a
+  // carve rebuilds the body and changes its handle), checked by NAME after,
+  // because a severed shell erases its slot and renumbers the appended tail.
+  int ts = -1;
+  if (target) {
+    ts = c.targetSlot;
+    if (ts < 0 || ts >= (int)target->limbs_.size() ||
+        ts >= (int)target->limbDefs_.size() || !target->limbs_[ts].body ||
+        target->limbDefs_[ts].name != c.targetSlotName)
+      return r;
+    MobLimb& tl = target->limbs_[ts];
+    phys_->GetTransform(tl.body, tl.xf);
+    const Quat tq{tl.xf.quat[0], tl.xf.quat[1], tl.xf.quat[2], tl.xf.quat[3]};
+    const bool fine = tl.HasFineSkin();
+    T.L.skin = fine ? &tl.skinVoxels : nullptr;
+    T.L.coll = fine ? nullptr : &tl.voxels;
+    T.scale = (float)std::max(1u, fine ? target->SkinScaleOf(tl)
+                                       : target->PhysScaleOf(tl));
+    T.cell = QuatRotateInv(tq, c.at - tl.xf.pos) * T.scale;
+    T.model = tl.microModel;
+  } else {
+    DebrisSystem::FleshLattice f;
+    if (!debris_->CoatLatticeOf(c.targetBody, f)) return r;
+    T = LooseParty(f, c.at);
+  }
+
+  // ---- WHICH OF THE STRIKER'S VOXELS TOUCHED (plan A1) ---------------------
+  //
+  // NOT the probe's world point, for a creature's weapon. The sweep's contact
+  // lies ON its edge segment (every probe runs down the blade's own axis), so
+  // the honest statement of "where on the weapon did it land" is how far along
+  // that segment -- `edgeU` -- and that maps straight onto the slot's own
+  // authored edge in its own body frame, with no world transform to disagree
+  // with the renderer's. A tip strike lands at the tip whatever pose the blade
+  // is in. A LOOSE striker has no edge: the patch is its voxels nearest the
+  // contact the physics reported.
+  int ss = -1;
+  if (striker) {
+    int es = -1;
+    Vec3 from, to;
+    if (!striker->StrikerEdgeLocal(c.haft, es, from, to)) return r;
+    if (es < 0 || es >= (int)striker->limbs_.size() ||
+        !striker->limbs_[es].body)
+      return r;
+    const float u = std::clamp(c.edgeU, 0.0f, 1.0f);
+    Vec3 sLocal = from + (to - from) * u;
+    ss = es;
+    // ...ON THE GAUNTLET, when there is one. A worn shell over the striking
+    // part is what actually meets the target (StrikeProfileFor already lets
+    // it decide the blow), so it is also what carries the coat: the shell
+    // hosted on the part whose surface comes nearest the contact, if it is
+    // within the contact's reach of it.
+    if (es < striker->baseLimbs_ && striker->LimbHasShells(es)) {
+      const MobLimb& pl = striker->limbs_[es];
+      const Quat pq{pl.xf.quat[0], pl.xf.quat[1], pl.xf.quat[2], pl.xf.quat[3]};
+      const Vec3 w = pl.xf.pos + QuatRotate(pq, sLocal);
+      float best = rw + 1.0f;
+      for (int s = striker->baseLimbs_; s < (int)striker->limbs_.size(); s++) {
+        MobLimb& sl = striker->limbs_[s];
+        if (sl.wornHost != es || !sl.body || !striker->IsWornSlot(s)) continue;
+        const Quat sq{sl.xf.quat[0], sl.xf.quat[1], sl.xf.quat[2], sl.xf.quat[3]};
+        const Vec3 loc = QuatRotateInv(sq, w - sl.xf.pos);
+        SlotLattice v;
+        const bool fine = sl.HasFineSkin();
+        v.L.skin = fine ? &sl.skinVoxels : nullptr;
+        v.L.coll = fine ? nullptr : &sl.voxels;
+        v.scale = (float)std::max(1u, fine ? striker->SkinScaleOf(sl)
+                                           : striker->PhysScaleOf(sl));
+        const LatticeOcc occ = BuildLatticeOcc(v.L);
+        const std::vector<CoatCell> near =
+            CoatContactCells(v.L, occ, loc * v.scale, 0.0f, false);
+        if (near.empty()) continue;
+        const float d = near.front().dist / v.scale;   // world voxels
+        if (d < best) {
+          best = d;
+          ss = s;
+          sLocal = loc;
+        }
       }
     }
+    MobLimb& sl = striker->limbs_[ss];
+    const bool fine = sl.HasFineSkin();
+    S.L.skin = fine ? &sl.skinVoxels : nullptr;
+    S.L.coll = fine ? nullptr : &sl.voxels;
+    S.scale = (float)std::max(1u, fine ? striker->SkinScaleOf(sl)
+                                       : striker->PhysScaleOf(sl));
+    S.cell = sLocal * S.scale;
+    S.model = sl.microModel;
+  } else {
+    DebrisSystem::FleshLattice f;
+    if (!debris_->CoatLatticeOf(c.strikerBody, f)) return r;
+    S = LooseParty(f, c.at);
   }
   r.strikerSlot = ss;
-
-  auto latticeOf = [](Mob& m, int slot) {
-    SlotLattice v;
-    MobLimb& l = m.limbs_[slot];
-    const bool fine = l.HasFineSkin();
-    v.L.skin = fine ? &l.skinVoxels : nullptr;
-    v.L.coll = fine ? nullptr : &l.voxels;
-    v.scale = (float)std::max(1u, fine ? m.SkinScaleOf(l) : m.PhysScaleOf(l));
-    return v;
-  };
-  SlotLattice S = latticeOf(*striker, ss);
-  SlotLattice T = latticeOf(*target, ts);
   if (S.L.Size() == 0 || T.L.Size() == 0) return r;
-
-  // The contact in the target's frame, off its live transform -- what every
-  // resolver measured its own wound in.
-  MobLimb& tl = target->limbs_[ts];
-  phys_->GetTransform(tl.body, tl.xf);
-  const Quat tq{tl.xf.quat[0], tl.xf.quat[1], tl.xf.quat[2], tl.xf.quat[3]};
-  const Vec3 tLocal = QuatRotateInv(tq, c.at - tl.xf.pos);
 
   // ---- THE TWO PATCHES ----------------------------------------------------
   const float sReach = rw * S.scale;
@@ -391,18 +447,18 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
   const float tReach = twr * T.scale;
   const LatticeOcc sOcc = BuildLatticeOcc(S.L);
   const std::vector<CoatCell> sCells =
-      CoatContactCells(S.L, sOcc, sLocal * S.scale, sReach, false);
+      CoatContactCells(S.L, sOcc, S.cell, sReach, false);
   std::vector<CoatCell> tCells;
   // A CUT puts it on the WOUND WALL (the kerf's survivors, face-adjacent to
   // what it took); a cut that took nothing, a bruise and a bite on the
   // surface patch -- one cell deeper only under skin that split.
-  const bool cutWall = c.kind == CoatHitKind::Cut && c.woundCells &&
+  const bool cutWall = target && c.kind == CoatHitKind::Cut && c.woundCells &&
                        !c.woundCells->empty();
   if (cutWall) {
-    tCells = CoatWoundWall(T.L, *c.woundCells, tLocal * T.scale);
+    tCells = CoatWoundWall(T.L, *c.woundCells, T.cell);
   } else {
     const LatticeOcc tOcc = BuildLatticeOcc(T.L);
-    tCells = CoatContactCells(T.L, tOcc, tLocal * T.scale, tReach,
+    tCells = CoatContactCells(T.L, tOcc, T.cell, tReach,
                               c.kind == CoatHitKind::Blunt);
   }
   r.strikerTouched = (uint32_t)sCells.size();
@@ -415,20 +471,28 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
   // ---- DID THE BLOW OPEN ANYTHING? -----------------------------------------
   // Only an opened wound has fluid to give, and only anatomy has any: a
   // garment's "wound" is a hole in the cloth (Mob::WoundFluid would answer
-  // with the WEARER's blood for it).
+  // with the WEARER's blood for it). A loose body answers for itself: a
+  // corpse piece cut or bitten open leaks its own fluid (DebrisSystem::
+  // BodyWoundFluid), a dropped sword leaks nothing.
   bool wounded = false;
-  if (ts < target->baseLimbs_ && !target->IsBloodless(ts)) {
-    if (c.kind == CoatHitKind::Cut) wounded = cutWall;
-    else if (c.kind == CoatHitKind::Bite) wounded = c.landed;
-    else
-      for (const CoatCell& cc : tCells)
-        if (BruiseBroken(T.L.Bruise(cc.idx))) { wounded = true; break; }
-  }
   uint32_t fluid = 0;
-  if (wounded && bleedAmt > 0) {
-    fluid = target->WoundFluid(ts);
-    if (fluid != 0 && StainTypeOf(fluid) == 0) fluid = target->SmearMatFor(fluid);
+  if (target) {
+    if (ts < target->baseLimbs_ && !target->IsBloodless(ts)) {
+      if (c.kind == CoatHitKind::Cut) wounded = cutWall;
+      else if (c.kind == CoatHitKind::Bite) wounded = c.landed;
+      else
+        for (const CoatCell& cc : tCells)
+          if (BruiseBroken(T.L.Bruise(cc.idx))) { wounded = true; break; }
+    }
+    if (wounded && bleedAmt > 0) fluid = target->WoundFluid(ts);
+  } else if (c.landed && c.kind != CoatHitKind::Blunt) {
+    fluid = debris_->BodyWoundFluid(c.targetBody);
+    wounded = fluid != 0;
   }
+  if (fluid != 0 && StainTypeOf(fluid) == 0) {
+    fluid = target ? target->SmearMatFor(fluid) : 0u;
+  }
+  if (bleedAmt == 0) fluid = 0;
   r.wounded = wounded;
 
   // ---- WHAT EACH SIDE OFFERS, taken BEFORE either side is written ---------
@@ -442,24 +506,30 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
   // Both bricks owned before anything is poked (copy-on-write: a poke on a
   // shared model would repaint every sword of that kind in the world).
   MicroBodySet* micro = microSet_;
-  auto own = [&](Mob& m, int slot) -> int {
-    MobLimb& l = m.limbs_[slot];
-    if (!micro || l.microModel < 0) return -1;
-    const int o = MicroBodyOwn(*micro, (uint32_t)l.microModel);
+  auto own = [&](CoatParty& p, Mob* m, int slot) -> int {
+    if (!micro || p.model < 0) return -1;
+    const int o = MicroBodyOwn(*micro, (uint32_t)p.model);
     if (o < 0) return -1;
-    l.microModel = o;
-    l.carved = true;
-    l.flipbookModel = -1;
+    p.model = o;
+    if (m) {
+      MobLimb& l = m->limbs_[slot];
+      l.microModel = o;
+      l.carved = true;
+      l.flipbookModel = -1;
+    } else if (p.looseModel) {
+      *p.looseModel = (uint32_t)o;
+    }
     return o;
   };
-  const int sModel = own(*striker, ss);
-  const int tModel = own(*target, ts);
+  const int sModel = own(S, striker, ss);
+  const int tModel = own(T, target, ts);
 
   // ---- STRIKER -> TARGET, then TARGET -> STRIKER (plan A2, A3) -------------
-  CoatLay(T.L, tCells, tReach, fromS, micro, tModel);
+  const uint32_t layerMin = (uint32_t)std::clamp(gear.coatLayerMin, 0, (int)kBodyStainAmtMax);
+  CoatLay(T.L, tCells, tReach, fromS, micro, tModel, layerMin);
   CoatSpend(S.L, sCells, fromS, micro, sModel);
   for (const CoatParcel& p : fromS) r.toTarget += p.levels;
-  CoatLay(S.L, sCells, sReach, fromT, micro, sModel);
+  CoatLay(S.L, sCells, sReach, fromT, micro, sModel, layerMin);
   CoatSpend(T.L, tCells, fromT, micro, tModel);
   for (const CoatParcel& p : fromT) r.toStriker += p.levels;
   // ...and what the wound LEAKS onto what went into it. A smear, not a
@@ -472,8 +542,18 @@ MobSystem::CoatContactResult MobSystem::CoatOnContact(const CoatContact& c) {
     r.bleedMat = fluid;
   }
   if (r.toTarget || r.toStriker || r.bled) {
-    striker->coatDirty_ = striker->twinDirty_ = true;
-    target->coatDirty_ = target->twinDirty_ = true;
+    // The ledgers owe a recount -- a rig's, or a loose body's (its coat pass
+    // entry; a body the pass has not met yet starts dirty anyway).
+    auto dirty = [&](Mob* m, const CoatParty& p) {
+      if (m) {
+        m->coatDirty_ = m->twinDirty_ = true;
+      } else if (p.looseId) {
+        auto it = fleshCoat_.find(p.looseId);
+        if (it != fleshCoat_.end()) it->second.dirty = true;
+      }
+    };
+    dirty(striker, S);
+    dirty(target, T);
   }
   lastCoat_ = r;
   return r;

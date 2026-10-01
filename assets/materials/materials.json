@@ -3290,12 +3290,13 @@
         "infectious"
       ],
       "molten": "fire",
-      "//infect": "THE ROT IS AN INFECTION BECAUSE OF THIS BLOCK (DESIGN.md 'Infection is a material'; sim/materials.h MaterialDef::infect). Every rotflesh voxel runs the one per-voxel rule every infection runs: each second it converts one neighbouring tissue voxel with chance `spread` and is eaten with chance `eat`. `spread` and `eat` are NOT authored here, so they are the tuning knobs gore.infectSpreadRate / infectRotRate (per voxel per second since 2026-10-01; the world-grid rot rules in reactions.json read the same spread), times gore.infectMobMult on a body. Spread above eat (shipped 0.00075 / 0.000375, branching ratio 2) is a disease that grows; retuned against the `rot-clock` gate so a zombie bite on a human's upper arm reaches the torso on the same timescale as the per-limb model it replaced. `targets` is not authored, so what it may take is each creature's per-material rotRate (flesh 1, bone 0.5); `floor` 4: a limb's rot is never eaten below four cells (a small bite's seed is not eaten out before it can spread); `cause` burn keeps its damage on the Burn ledger it has always booked to; `turns`: a body that dies holding a voxel of it rises (sidecar `turn`); `cured`: what a filtered remedy (`disinfect:tag:infectious`) turns a cell of it into.",
+      "//infect": "THE ROT IS AN INFECTION BECAUSE OF THIS BLOCK (DESIGN.md 'Infection is a material'; sim/materials.h MaterialDef::infect). Every rotflesh voxel runs the one per-voxel rule every infection runs: each second it converts one neighbouring tissue voxel with chance `spread` and is eaten with chance `eat`. `spread` and `eat` are NOT authored here, so they are the tuning knobs gore.infectSpreadRate / infectRotRate (per voxel per second since 2026-10-01; the world-grid rot rules in reactions.json read the same spread), times gore.infectMobMult on a body. Spread above eat (shipped 0.00075 / 0.000375, branching ratio 2) is a disease that grows; retuned against the `rot-clock` gate so a zombie bite on a human's upper arm reaches the torso on the same timescale as the per-limb model it replaced. `targets` is not authored, so what it may take is each creature's per-material rotRate (flesh 1, bone 0.5); `floor` 4: a limb's rot is never eaten below four cells (a small bite's seed is not eaten out before it can spread); `cause` burn keeps its damage on the Burn ledger it has always booked to; `turns`: a body that dies holding a voxel of it rises (sidecar `turn`); `cured`: what a remedy (`disinfect`, or a filtered `disinfect:tag:infectious`) turns a cell of it into; `label`: what the HUD's tissue row and a remedy's message call it.",
       "infect": {
         "floor": 4,
         "cause": "burn",
         "turns": true,
-        "cured": "flesh"
+        "cured": "flesh",
+        "label": "rot"
       }
     },
     {
@@ -4855,7 +4856,8 @@
         "cause": "infection",
         "death": "venom",
         "turns": false,
-        "cured": "flesh"
+        "cured": "flesh",
+        "label": "venom"
       }
     },
     {

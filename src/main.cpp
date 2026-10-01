@@ -1151,10 +1151,14 @@ TissueMats ResolveTissueMats(const MobSystem& mobs,
   t.muscle = mobs.MaterialIdNamed("muscle");
   t.bone   = mobs.MaterialIdNamed("bone");
   t.brain  = mobs.MaterialIdNamed("brain");
+  // EVERY INFECTION, by its `infect` block (2026-10-01): the rot AND venom
+  // AND whatever comes next. The legacy tag is honoured too, the rule
+  // MobSystem's matInfectious_ applies, so the readout and the mechanic agree.
   for (size_t i = 0; i < mats.size(); i++) {
-    for (const std::string& tag : mats[i].tags) {
-      if (tag == "infectious") { t.rot.push_back((uint32_t)i); break; }
-    }
+    bool is = mats[i].infect;
+    for (const std::string& tag : mats[i].tags)
+      if (tag == "infectious") is = true;
+    if (is) t.rot.push_back((uint32_t)i);
   }
   return t;
 };
@@ -1277,10 +1281,13 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   // frame. A MASK, not a bin index, so a material in two lists (a cooked id
   // that is also a named tissue) still counts into both, exactly as the
   // separate PartMaterialCount calls did.
+  // One bin PER INFECTION MATERIAL from kBinRot up (the mask is 16 bits: nine
+  // infections each get their own; any past that share the last bin).
   enum : int { kBinCooked, kBinCharred, kBinSkin, kBinFlesh, kBinMuscle,
-               kBinBone, kBinBrain, kBinRot, kBinCount };
+               kBinBone, kBinBrain, kBinRot, kBinCount = 16 };
   std::array<uint16_t, 4096> binMask{};
   auto mark = [&](uint32_t m, int bin) { binMask[m & 0xFFFu] |= (uint16_t)(1u << bin); };
+  const int nInfect = std::min((int)tissueMats.rot.size(), kBinCount - kBinRot);
   for (uint32_t m : burnMats.cooked) mark(m, kBinCooked);
   for (uint32_t m : burnMats.charred) mark(m, kBinCharred);
   if (tissueMats.skin)   mark(tissueMats.skin, kBinSkin);
@@ -1288,7 +1295,8 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   if (tissueMats.muscle) mark(tissueMats.muscle, kBinMuscle);
   if (tissueMats.bone)   mark(tissueMats.bone, kBinBone);
   if (tissueMats.brain)  mark(tissueMats.brain, kBinBrain);
-  for (uint32_t m : tissueMats.rot) mark(m, kBinRot);
+  for (size_t k = 0; k < tissueMats.rot.size(); k++)
+    mark(tissueMats.rot[k], kBinRot + std::min((int)k, kBinCount - kBinRot - 1));
   // Walk the DEF's limbs, not PartCount() — the latter includes the borrowed
   // held-item slot, which is not part of the body.
   const int limbCount = (int)def->limbs.size();
@@ -1343,7 +1351,31 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     // bitten arm's flesh bar shrinking with nothing taking its place was the
     // whole defect: the voxels are still in voxelTotal, they had just stopped
     // being anything the panel had a name for.
-    b.voxelRot = bins[kBinRot];
+    b.voxelRot = 0;
+    b.infectCount = 0;
+    for (int k = 0; k < nInfect; k++) {
+      const uint32_t cnt = bins[kBinRot + k];
+      if (cnt == 0) continue;
+      b.voxelRot += cnt;
+      // Insert sorted, heaviest first, keeping the top kInfectRows.
+      const uint32_t m = tissueMats.rot[(size_t)k];
+      UIState::BodyPartUI::InfectRow row;
+      row.count = cnt;
+      row.color = m < mats.size() ? (0xFF000000u | (mats[m].gpu.color0 & 0x00FFFFFFu))
+                                  : 0xFF50A078u;
+      const std::string& lbl = m < mats.size() && !mats[m].infectLabel.empty()
+                                   ? mats[m].infectLabel
+                                   : (m < mats.size() ? mats[m].name : std::string("infection"));
+      std::snprintf(row.label, sizeof row.label, "%s", lbl.c_str());
+      int at = b.infectCount;
+      while (at > 0 && b.infect[at - 1].count < cnt) at--;
+      if (at >= UIState::BodyPartUI::kInfectRows) continue;
+      for (int j = std::min(b.infectCount, UIState::BodyPartUI::kInfectRows - 1);
+           j > at; j--)
+        b.infect[j] = b.infect[j - 1];
+      b.infect[at] = row;
+      b.infectCount = std::min(b.infectCount + 1, UIState::BodyPartUI::kInfectRows);
+    }
     b.voxelBrainMax = avatar.PartBrainAtSpawn(i);
 
     // What is ON the limb. The ledger is recounted by the creature itself at
@@ -9273,7 +9305,16 @@ int main(int argc, char** argv) {
     // behaviour change: it just means the first tick after the handshake
     // gets the right closures instead of the second.
     entities.BindOwnership(mobs, debris);
-    debris.SetItemLookupFn(ground.LookupFn());
+    // The lookup a remote pickup reads brings the entry's coat up to date
+    // from its ground body first (SyncGroundCoat), as the local E does.
+    debris.SetItemLookupFn([&ground, &debris, &items](uint64_t h,
+                                                       ItemInstance& out) {
+      WorldItem* w = ground.FindMut(h);
+      if (!w) return false;
+      if (const ItemDef* d = items.Of(*w)) SyncGroundCoat(*w, h, *d, debris);
+      out = static_cast<const ItemInstance&>(*w);
+      return true;
+    });
     debris.SetItemTakeFn([&debris](uint64_t h) {
       // The same call the local E key makes. The registry entry is dropped by
       // the release hook when the body goes, so this is one call, not two.
@@ -11666,6 +11707,9 @@ int main(int argc, char** argv) {
         // back a grey tunic with nothing anywhere to say it had ever been red.
         // ...holding what it held when it went down, with the holes it had:
         // the registry entry IS an ItemInstance and it goes in whole.
+        // ...wearing the coat it wears NOW (it dried, or lay in a puddle).
+        if (WorldItem* wm = ground.FindMut(hit))
+          if (const ItemDef* d = items.Of(*wm)) SyncGroundCoat(*wm, hit, *d, debris);
         const int where = pocket(*w);
         if (where >= 0) {
           ui.kitMessage = "picked up " + w->name;

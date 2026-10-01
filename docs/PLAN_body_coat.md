@@ -16,10 +16,13 @@ material. `PrefabVoxel::stain` / `DebrisVoxel::stain` are `uint16_t`: 12-bit
 material id in the low bits, 4-bit amount above (`voxload.h` `BodyStain*`).
 Seven looks are not seven substances: a future nullifier and blood may share a
 ground colour and must still be told apart on a hand. The RENDER lattice in the
-micro brick stays one byte (`slot << 4 | amt`); `microbody.cpp` converts through
-`MicroBodySet::stainSlotOfMat`, filled at every materials load, so
-`microbody.wgsl` never changed and a material with no `stain` block simply
-renders nothing.
+micro brick holds the same 16-bit coat word per cell (`MicroBodyPokeStain`,
+`sim/microbody.h`), filtered through `drawsCoat` so a material with no `stain`
+look writes 0 (clean) and `microbody.wgsl` `bodyStainCover` reads the coat's
+own material colour and opacity. (It was one byte, `slot << 4 | amt`, at
+scaffolding time; that is superseded.) The bruise is the other half of the
+same cell (`MicroBodyPokeBruise`), so a coat goes on and off over a bruise
+without touching it.
 
 The body stain rides the limb's own voxel list, so it is SAVED with the MOBS and
 DBRS sections (raw `PodVec` of the lattices; `kSaveVersion` bumped once for the
@@ -36,13 +39,18 @@ a `stain` block so the substance has a look):
   removes it. Blood 20 (a splash is gone in ~5 min), water 4 (wet dries).
 - `shed` per-mille chance per footfall that a coated foot puts one droplet on
   the ground. Blood 400.
-- `effects` raw string tags. Parsed, stored on `MaterialDef::coatEffects`,
-  queryable, consumed by nothing yet.
+- `effects` raw string tags, stored on `MaterialDef::coatEffects` and consumed
+  by `MobSystem::CoatEffectsOn` (`stanch`, `disinfect`, `disinfect:tag:<t>`,
+  `disinfect:<material>`, `restore`). Later keys on the same block: `contact`,
+  `depth`, `restore`/`restoreRate`, `infects`/`infectCost` (DESIGN.md "A coat
+  that heals", "Infection is a material").
 
 **The ledger** (`Mob::RecountCoat`, every `coat.recountTicks` and only when a
-stain byte changed): per limb, amount-weighted sums by material and the live
-voxel count; body totals over the base rig (worn shells and held items
-excluded). Fraction = `sumAmt / (15 * voxels)`, so one splash cannot flip a
+coat word changed): per limb, the `kCoatTop` (4, `mob.h`) heaviest substances
+by amount-weighted sum, the live voxel count, and the counts of corrosive and
+infection-carrying cells (`LimbCoat::corrosive` / `infecting`, the latter only
+cells thick enough to pay `coat.infectCost`); body totals over the base rig
+(worn shells and held items excluded). Fraction = `sumAmt / (15 * voxels)`, so one splash cannot flip a
 threshold and a soaked limb reads 1.0. Queries on `MobSystem`, resolving the
 avatar by id: `LimbCoatOf`, `BodyCoat`, `CoatTagFraction(mob, tag, limbTag)`.
 
@@ -82,8 +90,13 @@ state kept where the effect lives.
 
 - Ground stains do not decay: `sim_step.wgsl`'s stain rule is monotone so a
   stained chunk can sleep; a drying rule would keep every stained chunk awake.
-- Corpses take no contact stain (no debris contact pass), and a dragged body
-  smears nothing (no ragdoll ground-contact event).
+- ~~Corpses take no contact stain (no debris contact pass)~~ -- superseded: a
+  corpse is a dead Mob (its limbs take the living's coat passes) and severed
+  flesh and DROPPED ITEMS take contact, rain, drying and splatter through
+  `MobSystem::StainDeadFlesh` / `DebrisSystem::ForEachCoatBody` (2026-09-22,
+  items 2026-10-01). A coat moves on contact between any two of them
+  (DESIGN.md "A coat moves on contact"). A dragged body still smears nothing
+  (no ragdoll ground-contact event).
 - A `washable` key: water's `washes` is the authored surface; a material that
   refuses washing would need a second rule in the rinse branch.
 - A hysteresis helper with no consumer.

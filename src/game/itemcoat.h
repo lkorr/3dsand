@@ -81,6 +81,22 @@ bool ItemLatticeSettle(ItemInstance& it, const ItemDef& def);
 int PushItemLatticeToLimb(Mob& wearer, const KitRef& ref);
 int PushItemLatticeToLimb(MobSystem& mobs, uint64_t mobId, const KitRef& ref);
 
+// ---- ON THE GROUND (2026-10-01) ---------------------------------------------
+// A dropped item is a debris body (worlditems.h DropItemToWorld) built from
+// ONE of its lattices: the held item's, or a worn piece's largest cover
+// panel. That body WEARS the instance's coat (DropItemToWorld copies it on and
+// pokes an owned brick), takes coats from what it lies in and dries like
+// severed flesh (DebrisSystem::ForEachCoatBody), and gives its coat back to
+// the instance when it is picked up or saved (CaptureGroundCoat).
+// Which lattice that is: 0 for a held item, the largest cover's index.
+int ItemGroundShell(const ItemDef& def);
+// The ground body's coats (its lattice, item cells) -> the instance's lattice
+// for ItemGroundShell, voxel for voxel where positions coincide. A clean body
+// leaves a plain instance plain (ItemLatticeSettle). Returns the recorded
+// coat words that changed.
+uint32_t CaptureGroundCoat(ItemInstance& it, const ItemDef& def,
+                           const std::vector<PrefabVoxel>& body);
+
 // The reverse: the live rig slot(s) -> the kit stack at `ref` (the held
 // item's or the worn piece's exact lattice, coats included; Mob::KitFlushWorn).
 // False when `ref` is not an equipment slot whose item is on the rig.

@@ -126,6 +126,55 @@ LimbAxis MeasureLimb(MobSystem& mobs, uint64_t id, int limb) {
   return a;
 }
 
+// ---- WHERE TEETH LAND: THE SKIN, NOT THE AXIS (2026-10-01) -----------------
+//
+// The cross-section `alongFrac` of the way down the limb, pushed out to the
+// furthest surviving voxel across the axis -- the surface a probe would have
+// stopped on (`bite-limbs`' "skin" aim, shared). A bite aimed at the AXIS is
+// a closed cavity in the middle of the limb, and since the anatomy recipe put
+// a bone core there (2026-09) that cavity is walled in bone: `bite-rot`,
+// `bite-infect` and `zombify` all aimed there, and all read "0 rotflesh"
+// because bone is not tissue -- a correct measurement of a bite nothing can
+// deliver. SANDVOX_BITE_DEBUG's WoundStats line names that cause directly
+// ("N not tissue").
+Vec3 SkinAim(MobSystem& mobs, uint64_t id, int li, const LimbAxis& ax,
+             float alongFrac = 0.5f) {
+  const Vec3 core = ax.anchor + ax.along * (ax.reach * alongFrac);
+  Vec3 bestDir{};
+  float bestLen = 0.0f;
+  for (uint32_t k = 0; k < 64; k++) {
+    const Vec3 p = mobs.LimbVoxelPos(id, li, k * 6151u);
+    const Vec3 rel = p - core;
+    const float t = rel.dot(ax.along);
+    // Near THIS cross-section only, so the push-out does not wander to the
+    // far end of a tapering limb.
+    if (std::fabs(t) > std::max(1.0f, ax.reach * 0.25f)) continue;
+    const Vec3 perp = rel - ax.along * t;
+    const float len = perp.len();
+    if (len > bestLen) {
+      bestLen = len;
+      bestDir = perp;
+    }
+  }
+  return bestLen > 1e-3f ? core + bestDir.normalized() * bestLen : core;
+}
+
+// The surface voxel of limb `li` nearest a world point (MobSystem::
+// LimbSurfacePos, sampled): where teeth close on a limb near a joint.
+Vec3 SurfaceNear(MobSystem& mobs, uint64_t id, int li, Vec3 p) {
+  Vec3 best = p;
+  float bestD = 1e30f;
+  for (uint32_t k = 0; k < 512; k++) {
+    const Vec3 q = mobs.LimbSurfacePos(id, li, k * 7919u + 3u);
+    const float d = (q - p).dot(q - p);
+    if (d < bestD) {
+      bestD = d;
+      best = q;
+    }
+  }
+  return best;
+}
+
 // Ground under a fixture column, anchored to the residency window. NEVER an
 // absolute x or z (selftest.h's ordering note): by the time these gates run,
 // `streaming` has walked the window origin ~20 chunks along x and a literal
@@ -1372,7 +1421,8 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
     }
     const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
     const uint32_t before = mobs.LimbArtVoxelCount(id, t.limb);
-    const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+    // On the SKIN at mid-limb, where teeth close (SkinAim): the axis is bone.
+    const Vec3 at = SkinAim(mobs, id, t.limb, ax);
     // ---- READ AFTER EVERY BITE, NOT AT THE END -----------------------------
     //
     // Because the limb is SUPPOSED to come off eventually: a bite severs by
@@ -1639,7 +1689,7 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     const uint64_t id = SpawnTarget(c, t, inset);
     if (!id) { SetCurrentTuning(saved); return r; }
     const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
-    const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+    const Vec3 at = SkinAim(mobs, id, t.limb, ax);  // the skin, not the bone core
     BiteOnce(mobs, c.world, id, t.limb, at, 4.0f, (uint16_t)rotMat,
              (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
     r.rot0 = mobs.LimbMaterialCount(id, t.limb, rotMat);
@@ -1898,10 +1948,22 @@ Status GateJointRot(Ctx& c, std::string& detail) {
     // generous bite radius because the anchor is a RIG POINT and may sit just
     // outside the torso's voxel cloud (Mob::SocketCentreInParent clamps for
     // exactly that reason); `rot0` below is what proves the teeth found flesh.
+    // THE LIMB'S OWN PARENT, on its SURFACE nearest the joint (2026-10-01).
+    // It bit `t.torso` -- the ROOT limb -- at the joint point, and the root is
+    // not the parent of every limb (zeus's arm hangs from the chest, the root
+    // is the hips): the bite landed in the air beside the hips, carved
+    // nothing, and the gate reported "the bite landed no infection".
     const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
-    BiteOnce(mobs, c.world, id, t.torso, ax.anchor, 5.0f, (uint16_t)rotMat,
-             (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
-    r.rot0 = mobs.LimbMaterialCount(id, t.torso, rotMat);
+    int parent = t.torso;
+    {
+      const MobDef& d = mobs.Defs()[(size_t)t.defIndex];
+      const std::string& pn = d.limbs[(size_t)t.limb].parent;
+      for (size_t li = 0; li < d.limbs.size(); li++)
+        if (d.limbs[li].name == pn) parent = (int)li;
+    }
+    BiteOnce(mobs, c.world, id, parent, SurfaceNear(mobs, id, parent, ax.anchor),
+             5.0f, (uint16_t)rotMat, (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
+    r.rot0 = mobs.LimbMaterialCount(id, parent, rotMat);
     // ...and every reading after this is about the ARM, which nothing has
     // touched. If it leaves, the socket is the only thing that can have taken
     // it.
@@ -2828,16 +2890,12 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
           at = p;
         }
       }
-      // Bitten until the rot took (a bite can rewrite no flesh at all and
-      // leave only its ichor smear; see the zombify fixture's note).
-      for (uint32_t k = 0; k < 6 && bothBitten < 8; k++) {
-        if (!mobs.LimbBody(both, bothLimb)) break;
-        const Vec3 p = k == 0 ? at
-                              : mobs.LimbVoxelPos(both, bothLimb, 977u * k + 5u);
-        BiteOnce(mobs, c.world, both, bothLimb, p, 4.0f, (uint16_t)rotMat,
-                 (uint16_t)ichorMat, 1.0f, 0xB0B0u + k, spawns);
-        bothBitten = mobs.LimbMaterialCount(both, bothLimb, rotMat);
-      }
+      // ONE real bite on the surface. (A loop re-bit "until the rot took"
+      // while StainWoundAs's mottle decided a whole bite on one noise value;
+      // with it recentred on the wound one bite infects -- 2026-10-01.)
+      BiteOnce(mobs, c.world, both, bothLimb, at, 4.0f, (uint16_t)rotMat,
+               (uint16_t)ichorMat, 1.0f, 0xB0B0u, spawns);
+      bothBitten = mobs.LimbMaterialCount(both, bothLimb, rotMat);
     }
   }
 
@@ -3214,6 +3272,157 @@ Status GateRotClock(Ctx& c, std::string& detail) {
                                                        : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// infect-perf -- THE INFECTION COSTS WHAT IT IS, NOT WHAT THE LIMB IS (rule 2)
+// ---------------------------------------------------------------------------
+//
+// A crowd of bitten humans (every arm, leg and the torso of each), the rot
+// cranked so it moves inside the window, ticked through the real tick twice in
+// one process: arm A with MobSystem::SetInfectFullSweep (every InfectStep
+// re-derives its cells with a whole-lattice sweep and the burn index is let go
+// on the idle grace -- the pre-2026-10-01 cost model), arm B with the limb's
+// cell list. Same creatures, same ids, same ticks.
+//
+// CLAIMS: the two arms end with EXACTLY the same infection (cells and eaten,
+// per material) -- the list is a cost change, not a behaviour change, because
+// it visits the cells in the sweep's storage order -- and B's InfectTick time
+// is at most infectPerfMaxRatio of A's. The times are wall clock and noisy;
+// the ratio is the claim, the absolute numbers are recorded.
+Status GateInfectPerf(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const int human = mobs.FindDef("human");
+  const uint32_t rot = mobs.MaterialIdNamed("rotflesh");
+  const uint32_t ichor = mobs.MaterialIdNamed("ichor");
+  if (human < 0 || !rot || !ichor) {
+    detail = "no `human`, `rotflesh` or `ichor`";
+    return Status::Skip;
+  }
+  const int kCrowd = (int)BaselineNumber("infectPerfCrowd", 8);
+  const int kTicks = (int)BaselineNumber("infectPerfTicks", 300);
+  const float kCrank = (float)BaselineNumber("infectPerfCrank", 1.0);
+  const float kIdCrank = (float)BaselineNumber("infectPerfIdentityCrank", 40.0);
+  const double kMaxRatio = BaselineNumber("infectPerfMaxRatio", 0.5);
+  std::vector<int> bitLimbs;
+  {
+    const MobDef& def = mobs.Defs()[human];
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      const std::string& tg = def.limbs[li].tag;
+      if (tg == "arm" || tg == "leg" || (int)li == def.rootLimb ||
+          def.limbs[li].name == "torso")
+        bitLimbs.push_back((int)li);
+    }
+  }
+  const Tuning saved = CurrentTuning();
+  struct Out {
+    double ms = 0.0;
+    uint64_t sweeps = 0, steps = 0;
+    uint32_t cells = 0, eaten = 0, spread = 0, bitten = 0;
+    int mobs = 0;
+  };
+  auto run = [&](bool full, float crank) -> Out {
+    Out o;
+    IdCounterScope ids(mobs);   // both arms number their creatures alike
+    mobs.Reset();
+    c.debris.Reset();
+    Tuning tt = saved;
+    tt.gore.infectMobMult = saved.gore.infectMobMult * crank;
+    SetCurrentTuning(tt);
+    mobs.SetInfectFullSweep(full);
+    std::vector<uint64_t> crowd;
+    for (int i = 0; i < kCrowd; i++) {
+      const uint64_t id = mobs.Spawn(human, FixtureSite(c.world, 300 + 12 * i));
+      if (!id) continue;
+      mobs.SetMobBehavior(id, "dummy");
+      crowd.push_back(id);
+    }
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, as SpawnTarget.
+    for (int i = 0; i < 8; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> sp;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, sp);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    std::vector<ParticleSpawn> spawns;
+    for (uint64_t id : crowd)
+      for (int li : bitLimbs) {
+        if (!mobs.LimbBody(id, li)) continue;
+        const LimbAxis ax = MeasureLimb(mobs, id, li);
+        if (!ax.valid) continue;
+        BiteOnce(mobs, c.world, id, li, SkinAim(mobs, id, li, ax), 4.0f,
+                 (uint16_t)rot, (uint16_t)ichor, 1.0f,
+                 0x9E7Fu + (uint32_t)li * 977u, spawns);
+      }
+    for (uint64_t id : crowd)
+      for (int li : bitLimbs) o.bitten += mobs.LimbMaterialCount(id, li, rot);
+    mobs.ResetInfectCost();
+    {
+      const IVec3 fc = FixtureSite(c.world, 300 + 6 * kCrowd);
+      support::TickRig rig(c, 52000u, IVec3{fc.x >> 4, fc.y >> 4, fc.z >> 4});
+      support::RunTicks(rig, kTicks);
+    }
+    const MobSystem::InfectCost cost = mobs.InfectCostStats();
+    o.ms = cost.ms;
+    o.sweeps = cost.sweeps;
+    o.steps = cost.limbSteps;
+    for (uint64_t id : crowd) {
+      const Mob* m = mobs.FindMobById(id);
+      if (!m) continue;
+      o.mobs++;
+      for (int li = 0; li < m->LimbCount(); li++)
+        o.cells += mobs.LimbMaterialCount(id, li, rot);
+      const Mob::InfectStat st = mobs.InfectStatsOf(id, rot);
+      o.eaten += st.eaten;
+      o.spread += st.spread;
+    }
+    mobs.SetInfectFullSweep(false);
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(saved);
+    return o;
+  };
+  // IDENTITY at a crank that makes the rot busy (spread, eat, flushes, joint
+  // crossings all happen), COST at the shipped rates (what a crowd of rotting
+  // creatures actually pays a tick).
+  const Out ia = run(true, kIdCrank);
+  const Out ib = run(false, kIdCrank);
+  const Out a = run(true, kCrank);
+  const Out b = run(false, kCrank);
+  RecordObserved("infectPerfFullMs", a.ms);
+  RecordObserved("infectPerfListMs", b.ms);
+  RecordObserved("infectPerfFullSweeps", (double)a.sweeps);
+  RecordObserved("infectPerfListSweeps", (double)b.sweeps);
+  const double perStepA = a.steps ? a.ms * 1000.0 / (double)a.steps : 0.0;
+  const double perStepB = b.steps ? b.ms * 1000.0 / (double)b.steps : 0.0;
+  auto sameOut = [](const Out& x, const Out& y) {
+    return x.cells == y.cells && x.eaten == y.eaten && x.spread == y.spread &&
+           x.bitten == y.bitten;
+  };
+  const bool same = sameOut(ia, ib) && sameOut(a, b);
+  const bool cheaper = b.ms <= a.ms * kMaxRatio;
+  const bool bit = a.bitten > 0 && a.steps > 0 && ia.eaten > 0;
+  detail = Format(
+      "%d humans x %zu bitten limbs (%u rot at the bite), %d ticks | AT x%.0f "
+      "(identity): full %u rot / %u eaten / %u spread, list %u / %u / %u, "
+      "%.1f -> %.1f ms | AT x%.0f (cost): FULL SWEEP %.2f ms over %llu "
+      "limb-steps (%.1f us each, %llu sweeps), CELL LIST %.2f ms (%.1f us "
+      "each, %llu sweeps) = %.0f%% | outcome %s",
+      a.mobs, bitLimbs.size(), a.bitten, kTicks, kIdCrank, ia.cells, ia.eaten,
+      ia.spread, ib.cells, ib.eaten, ib.spread, ia.ms, ib.ms, kCrank, a.ms,
+      (unsigned long long)a.steps, perStepA, (unsigned long long)a.sweeps, b.ms,
+      perStepB, (unsigned long long)b.sweeps,
+      a.ms > 0.0 ? 100.0 * b.ms / a.ms : 0.0, same ? "IDENTICAL" : "DIFFERS");
+  if (!bit) return (detail = "the crowd was not infected: " + detail, Status::Fail);
+  if (!same) return (detail = "the cell list changed the outcome: " + detail, Status::Fail);
+  if (!cheaper)
+    return (detail = "the cell list is not cheaper than the sweep: " + detail,
+            Status::Fail);
+  return Status::Pass;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ImpactGates() {
@@ -3230,6 +3439,7 @@ const std::vector<Gate>& ImpactGates() {
       {"mob-race", "mob", {}, false, GateMobRace, false},
       {"venom-wound", "mob", {}, false, GateVenomWound, false},
       {"rot-clock", "mob", {}, false, GateRotClock, false},
+      {"infect-perf", "mob", {}, false, GateInfectPerf, false},
   };
   return g;
 }

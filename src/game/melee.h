@@ -694,7 +694,9 @@ struct EdgeSweep {
   // its impulse to. Blunt and bite land on FIRST CONTACT and are then silent
   // for the rest of the stroke; the cut is untouched and still runs every tick.
   //
-  // BY BODY HANDLE, not by creature: a swing that crosses an arm and then the
+  // BY STRUCK SLOT (creature + slot name; a loose body by its global id --
+  // a carve rebuilds a limb under a new handle, so a handle was not stable
+  // across the stroke), not by creature: a swing that crosses an arm and then the
   // chest legitimately bruises both, and a mace that meets three plates of the
   // same cuirass legitimately dents three plates. What it may not do is dent
   // the same plate four times because the phase was four ticks long.

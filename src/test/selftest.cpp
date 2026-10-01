@@ -841,6 +841,11 @@ const char* const kOrder[] = {
     // spawns on pristine ground like blade-wounds; its last arm ticks the
     // world and it regenerates the ground on the way out.
     "coat-transfer",
+    // ...and the whole venom chain end to end: a sword brushed with venom on
+    // the item stage, a real cut, the wound seeded, the infection spreading
+    // and burning out at the shipped rates; plus a venom mace / fist on skin
+    // and into an open pit. Regenerates the ground on the way out.
+    "venom-blade",
     // ...and the item STAGE coats the same lattices from a flask: its CPU
     // picture, its pick, a stroke on an item in the pack and one in the fist
     // (DESIGN.md §8b "The item stage"). Regenerates the ground like
@@ -940,6 +945,10 @@ const char* const kOrder[] = {
     "venom-wound",
     // ...and the ruler the rot was retuned against when it became per voxel.
     "rot-clock",
+    // ...and what the infection pass COSTS: a bitten crowd ticked twice, the
+    // whole-lattice sweep against the limb's cell list -- identical outcome,
+    // a fraction of the time.
+    "infect-perf",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for

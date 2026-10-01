@@ -521,6 +521,11 @@ struct Tuning {
     // striker voxels that went in. A smear, not a dip: it displaces only a
     // weaker coat (phys/coatcontact.h CoatSmear). 0 = blades come out clean.
     int coatBleedPickup = TPD(gear, coatBleedPickup);
+    // THE DOSE IS SPREAD (2026-10-01): a transferred parcel is laid no thicker
+    // than max(this, an even share of it over the struck patch) per voxel, so
+    // one good cut coats a wound's wall rather than soaking two cells. 6 is
+    // one venom seeding's worth (`coat.infectCost` 5) with a level to dry.
+    int coatLayerMin = TPD(gear, coatLayerMin);
   } gear;
 
   // ---- player avatar ----
@@ -607,13 +612,6 @@ struct Tuning {
     // keeps the head from stepping with the raw mouse; the body's own
     // firstPersonTurnHalflife sits behind it.
     float headLookHalflife = TPD(avatar, headLookHalflife);
-    // UNUSED since 2026-09-25. Was the half-life of the first-person body
-    // easing back to the view while walking; ResolveAvatarHeading now faces
-    // the travel direction directly (clamped to the head-look cone), so there
-    // is no dead zone to recentre out of. The row stays because deleting a
-    // tuning_params.def row misses the SPIR-V cache for every shader; remove
-    // it alongside the next change that pays that anyway.
-    float headLookRecenterHalflife = TPD(avatar, headLookRecenterHalflife);
     // Half-life (seconds) of the leg IK fading in and out as the gait starts
     // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
     // body really does leave the surface cresting each bump — and switching the

@@ -6540,16 +6540,38 @@ the envenomed spreading to flesh that makes it an infection"):
 
 Counter-based (`Hash3` of creature, limb, lattice POSITION, tick and material);
 cells act in storage order on the lattice as it stands, so nothing acts twice in
-a tick. There is no per-limb list and no slots: a limb carries one byte,
-`MobLimb::infected` ("has infectious voxels"), set by every writer that puts an
-infection material in (a bite, a coat seeding, a joint crossing, a twin copy, a
-graft) and cleared by the sweep that finds none — so a clean limb costs one byte
-test a tick, and any number of infection materials share a limb.
+a tick. There are no slots: a limb carries one byte, `MobLimb::infected` ("has
+infectious voxels"), set by every writer that puts an infection material in (a
+bite, a coat seeding, a joint crossing, a twin copy, a graft:
+`MobLimb::MarkInfected`) and cleared by the step that finds none — so a clean
+limb costs one byte test a tick, and any number of infection materials share a
+limb.
+
+**The step costs the infection, not the limb (2026-10-01).** It used to sweep
+the whole lattice every tick for every infected limb (a human torso is 31,456
+skin cells, a 5-cell bite paid for all of them). Each limb now keeps the lattice
+POSITIONS of its infectious cells (`MobLimb::infectCells`, derived, never
+saved): a tick resolves them through the burn index, drops what is no longer
+infectious, sorts them into storage order -- so the cells act in exactly the
+order the sweep visited them, and the outcome is the sweep's cell for cell --
+and appends what it converts. A whole-lattice sweep re-derives the list only
+when a writer elsewhere marked it stale or the burn index was rebuilt
+(`BodyBurnState::idxGen`: a flush compacts, a carve may rebase). The index is
+kept warm while the infection runs instead of being let go on the burn pass's
+idle grace and rebuilt every 31 ticks. Gate `infect-perf` ticks a bitten crowd
+twice in one process (`MobSystem::SetInfectFullSweep` = the old cost model)
+and asserts an identical outcome at a fraction of the time.
+
+**A loaded body resumes.** The latch and the lists are derived:
+`Mob::RelatchInfections` re-derives them for every record a save load or a
+handoff overlays (`MobSystem::LoadOne` / `ApplyHandoff`), and dirties the coat
+ledger so a venom coat lying in a wound arms its seeding again.
 
 ```json
 "infect": { "spread": 0.006, "eat": 0.009, "floor": 0,
             "targets": ["tag:soft_tissue"], "hp": 250, "cause": "infection",
-            "death": "venom", "turns": false, "cured": "flesh" }
+            "death": "venom", "turns": false, "cured": "flesh",
+            "label": "venom" }
 ```
 
 - `spread` / `eat` — chances per voxel per SECOND, for a voxel one world voxel
@@ -6562,7 +6584,10 @@ test a tick, and any number of infection materials share a limb.
 - `floor` — a limb's cells of this material the eat may not take below. The rot
   authors 4 (a small bite's seed is not eaten out before it can spread); venom 0.
 - `targets` — `tag:x` or a material name. ABSENT = the creature's per-material
-  `rotRate` admission (the rot's rule: flesh 1, bone 0.5).
+  `rotRate` admission (the rot's rule: flesh 1, bone 0.5). A BITE that
+  carries a targeted infection rewrites only the wound cells it admits
+  (`Mob::StainWoundAs`): a snake's fangs leave envenomed flesh, not
+  envenomed skin.
 - `hp` — FLAT hp the limb loses per world voxel of it eaten, on top of the volume
   charge the flush makes (a few tenths of an hp for a few dozen lattice cells of
   a human arm — too little to be a poison).
@@ -6572,7 +6597,8 @@ test a tick, and any number of infection materials share a limb.
   that dies holding a VOXEL of it rise (`MobDef::turn` reads "limbs with a voxel
   of a turning material" — dying of venom does not make a zombie). All three are
   read off the MATERIAL of the cells eaten or present, not off the limb.
-- `cured` — what a filtered remedy turns a cell of it into (below).
+- `cured` — what a remedy turns a cell of it into (below).
+- `label` — what the HUD and the remedy messages call it ("rot", "venom"); absent = the material's name.
 
 **One number per infection, body and world.** The world-grid rot rules
 (`reactions.json`, `"infectSpread": true`) take their chance from the SAME
@@ -6589,7 +6615,9 @@ and the flesh under it has no open face. A coat in a wound sits on the wall's
 flesh and muscle, and at the rim the skin's coat touches the flesh the cut laid
 open. `Mob::CoatInfectTick` runs only when `RecountCoat` found such a coat
 (`LimbCoat::infecting`, armed into `coatSeedDue_`), so its cost is what coat
-CHANGES cost. `SoakLimb` lays an infecting coat on the surface only, as it does
+CHANGES cost; `infecting` counts only cells thick enough to pay `infectCost`,
+so the spent film a seeding leaves behind does not re-arm the sweep on every
+recount its own drying causes. `SoakLimb` lays an infecting coat on the surface only, as it does
 acid. Nothing anywhere tests for venom.
 
 **Where a coat reaches.** The voxel it is on, and a face neighbour only round a
@@ -6639,12 +6667,19 @@ per-voxel rot at these rates reaches the forearm at tick 898 (20.0 minutes; arm
 are far past 1 a second per voxel now; they were red at clean main for an
 unrelated reason (the bite rewrites ~no flesh on their target) and still are.
 
-**Remedies are data too.** `coat.effects` `"disinfect"` stops every infection on
-the limb (its latch drops; enchanted blood stops venom as well as rot);
-`"disinfect:tag:<t>"` / `"disinfect:<material>"` turn each matching infection
-cell into its material's `infect.cured` (both shipped infections cure to
-`flesh`, which `HealTick` then mends to the recipe). There is no per-limb list
-to strike a name from: the infection is its cells, so the cells change.
+**Remedies are data too.** `coat.effects` `"disinfect"` cures EVERY infection
+on the limb (enchanted blood stops venom as well as rot);
+`"disinfect:tag:<t>"` / `"disinfect:<material>"` only the matching ones. Both
+turn each such cell into its material's `infect.cured` (both shipped infections
+cure to `flesh`, which `HealTick` then mends to the recipe). There is no
+per-limb list to strike a name from: the infection is its cells, so the cells
+change. (A bare `disinfect` used to drop the latch and leave the cells inert --
+which the next bite, joint crossing or load re-latched, every old cell with it.
+Only an infection that authors no `cured` is still stopped that way.) The
+remedy's message names what it stopped by `infect.label` ("the venom stops
+spreading"; `MobSystem::LastCuredInfections`), and the health panel shows one
+tissue row per infection, labelled and coloured by its material ("VENOM",
+"ROT"), never everything as rot.
 
 Gate `venom-wound` (`src/test/selftest_impact.cpp`): a small carved hole in the
 first segment of each human arm and leg, all four soaked with venom, rates x8
@@ -7335,7 +7370,8 @@ material named in code: what a transferred coat DOES afterwards is whatever
 that material already does as a body coat (oil waits for a flame, acid eats,
 water rinses, a coat that seeds an infection seeds it). The exchange runs in
 `MeleeSweepDamage` after the cut, blunt and bite resolvers, for every
-creature-on-creature contact (NPC, player, corpse; loose debris is not done).
+creature-on-creature contact (NPC, player, corpse) and, since 2026-10-01, for
+loose matter on either side (below).
 
 - **Which striker voxels touched.** Not the probe's world point: the sweep's
   contact lies ON its edge segment, so the contact is the fraction `edgeU`
@@ -7395,10 +7431,31 @@ Knobs: `gear.coatTransferFrac` 0.5, `gear.coatTransferMax` 24 levels,
 its tip, coat on the wound wall (none buried), the tip's coat falls and the
 blade wears the target's fluid; a coated mace coats surface voxels only; a
 coated fist coats what it punches; the blade goes into the bag, the world
-ticks, it comes back voxel-for-voxel. NOT done: loose matter (a debris corpse
-piece, a dropped item) neither gives nor takes a coat on contact, and a
-dropped item's ground body draws the authored brick without its coat (the
-instance still carries it, so picking it up restores it).
+ticks, it comes back voxel-for-voxel.
+
+**Loose matter trades coats too (2026-10-01).** Either side of
+`CoatOnContact` may be a debris body instead of a creature
+(`CoatContact::strikerBody` / `targetBody`; `DebrisSystem::CoatLatticeOf`):
+a blade or fist striking a severed limb, a corpse piece or a dropped item
+(MeleeSweepDamage's loose-matter branch: the coat goes onto the voxels it met,
+theirs comes back, a cut-open corpse piece smears its own fluid), and a THROWN
+or flung body striking a creature (`MobSystem::ApplyContactDamage`, a blunt
+blow: the coat lands on the bruise). A loose side's patch is its voxels nearest
+the contact the physics reported; everything else is the creature rule.
+
+**A dropped item keeps its coat, on the ground.** `DropItemToWorld` copies the
+instance's coat words (`ItemGroundShell`: the held lattice, or a worn piece's
+largest panel) onto the ground body voxel for voxel and draws it through an
+OWNED copy of the brick with the coat poked in; the body is marked an item
+(`DebrisSystem::MarkItemBody`, also for a blade that falls out of a severed
+fist) and from then on wears its coat the way severed flesh does
+(`DebrisSystem::ForEachCoatBody` -> `StainDeadFlesh` / `SplatterDeadFlesh`):
+it DRIES at the material's `coat.decay`, picks a coat up from what it lies in,
+is splashed, rained on, rinsed. The rule is the body rule, not the bag's: the
+bag freezes a coat because nothing touches a stored item; on the ground the
+world does. Picking it up (local `E`, a remote grant) and saving it (ITMS)
+first bring the instance up to date from the body (`SyncGroundCoat` ->
+`CaptureGroundCoat`), so what you pick up is what was lying there.
 
 ### A coat that heals (2026-09-27, alchemy package D; `Mob::HealTick` / `HealLimbStep`, `MaterialDef::coatRestore`, gates `heal-restore` + `heal-wound`)
 

@@ -741,6 +741,18 @@ struct UIState {
     // it out. A separate number because it is the only tissue count that goes
     // UP when things get worse.
     uint32_t voxelRot = 0;
+    // ...BY INFECTION (2026-10-01): which infection materials those are, the
+    // heaviest first, named by their authored `infect.label` ("rot",
+    // "venom") and drawn in the material's own colour -- a snake bite reads
+    // as venom, not as rot. voxelRot is their sum.
+    struct InfectRow {
+      uint32_t count = 0;
+      uint32_t color = 0;   // ImU32, the material's palette colour 0
+      char label[16] = {};
+    };
+    static constexpr int kInfectRows = 3;
+    InfectRow infect[kInfectRows];
+    int infectCount = 0;
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
     // as the screen-space bounds of the limb's projected oriented box.

@@ -1339,23 +1339,25 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // from a point on it), so projecting onto this sub-step's segment says
       // how far along the weapon the blow landed.
       MobSystem::CoatContact coat;
+      {
+        const Vec3 ab = b - a;
+        const float ab2 = ab.dot(ab);
+        coat.haft = s.haft;
+        coat.edgeU = ab2 > 1e-8f
+                         ? std::clamp((at - a).dot(ab) / ab2, 0.0f, 1.0f)
+                         : 0.0f;
+        coat.radius = radius;
+        coat.at = at;
+        coat.power = power;
+        coat.unarmed = s.selfMounted;
+      }
       if (kind != StruckKind::Debris) {
         int cli = -1;
         if (Mob* co = mobs.FindOwner(hb, &cli); co != nullptr && cli >= 0) {
           coat.strikerId = wielder.Id();
-          coat.haft = s.haft;
-          const Vec3 ab = b - a;
-          const float ab2 = ab.dot(ab);
-          coat.edgeU = ab2 > 1e-8f
-                           ? std::clamp((at - a).dot(ab) / ab2, 0.0f, 1.0f)
-                           : 0.0f;
-          coat.radius = radius;
           coat.targetId = co->Id();
           coat.targetSlot = cli;
           coat.targetSlotName = co->SlotName(cli);
-          coat.at = at;
-          coat.power = power;
-          coat.unarmed = s.selfMounted;
         }
       }
       // FIRST contact wins: a sweep that catches two limbs made one noise, and
@@ -1434,12 +1436,32 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // another full depth. `parts` is therefore built first.
       StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
                                            power, out.tipSpeed, hitSeed);
+      // KEYED ON WHAT WAS STRUCK, NOT ON ITS BODY HANDLE (2026-10-01). A carve
+      // rebuilds a limb's collider under a NEW handle (Mob::RebuildLimbBody),
+      // so the stab that bored the limb on tick 1 met a "new" body on tick 2
+      // and stabbed it again -- `blade-wounds`' "held blade stabbed again
+      // (held +2)", red since the stab landed, and the same hole let a mace
+      // re-dent a plate its first dent had rebuilt. A creature's slot is keyed
+      // on (creature, slot NAME); loose matter on its global id (stable across
+      // DebrisSystem's rebuilds too).
+      auto strikeKey = [&](uint64_t body) -> uint64_t {
+        int sl = -1;
+        if (Mob* o = mobs.FindOwner(body, &sl); o != nullptr && sl >= 0) {
+          uint64_t h = 1469598103934665603ull;
+          for (char ch : o->SlotName(sl))
+            h = (h ^ (uint8_t)ch) * 1099511628211ull;
+          return ((o->Id() * 0x9E3779B97F4A7C15ull) ^ h) | (1ull << 63);
+        }
+        const uint64_t g = debris.GlobalIdOf(body);
+        return g != 0 ? (g & ~(1ull << 63)) : body;
+      };
       bool firstContact = true;
       if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f ||
                                   (s.strike.cut > 0.0f && parts.cut.stab))) {
+        const uint64_t key = strikeKey(hb);
         for (uint64_t h : *s.struck)
-          if (h == hb) firstContact = false;
-        if (firstContact) s.struck->push_back(hb);
+          if (h == key) firstContact = false;
+        if (firstContact) s.struck->push_back(key);
       }
 
       // ...and at most ONE bite for the whole stroke, landed on the limb the
@@ -1533,8 +1555,27 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         // by looking: a corpse fills neither the sever queue nor the voice
         // queue, which is what main.cpp infers the cue from.
         out.hitDeadFlesh |= debris.BodyIsDeadFlesh(hb);
+        // The body by its GLOBAL id across the resolve: a carve on loose
+        // matter may rebuild its collider under a new handle.
+        const uint64_t looseGid = debris.GlobalIdOf(hb);
         ResolveOnLooseMatter(hb, parts, s.strike, power, firstContact,
                              !wrongTarget, debris, world, spawns, s.bitten);
+        // ---- THE COAT MOVES ON LOOSE MATTER TOO (2026-10-01) --------------
+        // A corpse's arm, a severed hand, a dropped sword: the striker's coat
+        // goes onto the voxels it met, theirs comes back, a cut-open corpse
+        // piece smears its own fluid on the blade -- MobSystem::CoatOnContact
+        // with the loose body as the struck side. Only on first contact, as
+        // the parts above resolve.
+        if (firstContact && looseGid != 0) {
+          coat.strikerId = wielder.Id();
+          coat.targetBody = debris.HandleOfGlobalId(looseGid);
+          coat.at = at;
+          coat.kind = s.strike.cut > 0.0f   ? MobSystem::CoatHitKind::Cut
+                      : s.strike.bite > 0.0f ? MobSystem::CoatHitKind::Bite
+                                             : MobSystem::CoatHitKind::Blunt;
+          coat.landed = true;
+          if (coat.targetBody != 0) mobs.CoatOnContact(coat);
+        }
         continue;
       }
 

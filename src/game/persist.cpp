@@ -684,6 +684,16 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     std::vector<PrefabVoxel> lat;
     uint32_t latScale = 1;
     const ItemDef* d = r.items->Of(w);
+    // THE COAT THE BODY WEARS NOW (2026-10-01): a dropped item takes and loses
+    // coat on the ground, and the instance's record is what PutCoats writes,
+    // so the record is brought up to date from the body first (on a copy: a
+    // save does not mutate the world).
+    WornDamage damage = w.damage;
+    if (d) {
+      ItemInstance synced = w;
+      SyncGroundCoat(synced, w.body, *d, *r.debris);
+      damage = synced.damage;
+    }
     uint32_t authored = 0;
     if (d) {
       uint32_t s2 = 1;
@@ -704,7 +714,7 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     // v4 (W2-M): what the piece has BEEN THROUGH, every shell of it — the body
     // above is only its largest panel. A cut-loose cuirass picked up after a
     // reload goes back on with the holes it came off with.
-    PutDamage(out, w.damage);
+    PutDamage(out, damage);
     // v5: the mixture (game/composition.h), which replaces the v3 word.
     PutU32(out, (uint32_t)w.contents.n);
     for (int j = 0; j < w.contents.n; j++) {
@@ -714,7 +724,7 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     // v6: its stopper.
     PutU32(out, w.stoppered ? 1u : 0u);
     // v7: the coats on its recorded lattices (PutCoats).
-    PutCoats(out, w.damage);
+    PutCoats(out, damage);
   }
 }
 

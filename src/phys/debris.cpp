@@ -5786,13 +5786,34 @@ bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
     } else {
       outScale = b.physScale ? b.physScale : 1u;
       out.reserve(b.voxels.size());
-      for (const DebrisVoxel& v : b.voxels)
-        out.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                                  v.payload, v.color});
+      for (const DebrisVoxel& v : b.voxels) {
+        PrefabVoxel p{(int16_t)v.x, (int16_t)v.y, (int16_t)v.z, v.payload,
+                      v.color};
+        p.stain = v.stain;   // the coat too (a dropped item's, 2026-10-01)
+        out.push_back(p);
+      }
     }
     return true;
   }
   return false;
+}
+
+void DebrisSystem::MarkItemBody(uint64_t handle) {
+  const int i = IndexOfHandle(handle);
+  if (i >= 0) bodies_[i].item = true;
+}
+
+bool DebrisSystem::IsItemBody(uint64_t handle) const {
+  const int i = IndexOfHandle(handle);
+  return i >= 0 && bodies_[i].item;
+}
+
+bool DebrisSystem::CoatLatticeOf(uint64_t handle, FleshLattice& out) {
+  const int i = IndexOfHandle(handle);
+  if (i < 0 || !OwnedLocally(bodies_[i]) || bodies_[i].voxels.empty())
+    return false;
+  out = FleshOf(bodies_[i]);
+  return true;
 }
 
 void DebrisSystem::RefreshLocalBounds(Body& b) {

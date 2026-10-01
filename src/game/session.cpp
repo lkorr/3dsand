@@ -445,6 +445,29 @@ struct TickScratch {
 // one tilted over the other is IK'd so its mouth is above the other's.
 // Everything eases in and out, so opening the bench, lifting a flask and
 // setting it down never snaps an arm.
+// "; the venom stops spreading" / "; the rot and the venom stop spreading":
+// the remedy line names the infections the disinfect actually stopped, by
+// their authored `infect.label` (materials.json), never "the rot" for all.
+static std::string InfectionStoppedText(const MobSystem& mobs,
+                                        const std::vector<MaterialDef>& mats) {
+  std::vector<std::string> names;
+  for (uint32_t m : mobs.LastCuredInfections()) {
+    if (m >= mats.size()) continue;
+    const std::string& l =
+        mats[m].infectLabel.empty() ? mats[m].name : mats[m].infectLabel;
+    if (std::find(names.begin(), names.end(), l) == names.end())
+      names.push_back(l);
+  }
+  if (names.empty()) return "; the infection stops spreading";
+  std::string s = "; the ";
+  for (size_t i = 0; i < names.size(); i++) {
+    if (i > 0) s += i + 1 == names.size() ? " and the " : ", the ";
+    s += names[i];
+  }
+  s += names.size() > 1 ? " stop spreading" : " stops spreading";
+  return s;
+}
+
 static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   const PlayerSession::BenchHold& bh = s.benchHold;
   const float ease = 1.0f - std::exp(-kTickDt * 8.0f);
@@ -2496,7 +2519,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                   (mat < mats.size() ? mats[mat].name : std::string("it")) +
                                   " to " + who + part;
                 if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
-                if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+                if (did & MobSystem::kRemedyDisinfect) msg += InfectionStoppedText(mobs, mats);
                 if (did & MobSystem::kRemedyRestore) msg += "; the flesh begins to knit";
                 ui.kitMessage = msg;
                 ui.kitMessageAge = 0.0f;
@@ -3811,7 +3834,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                                   (mat < mats.size() ? mats[mat].name : std::string("it")) +
                                   " over your " + avatar.PartName(hit.limb);
                 if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
-                if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+                if (did & MobSystem::kRemedyDisinfect) msg += InfectionStoppedText(mobs, mats);
                 if (did & MobSystem::kRemedyRestore) msg += "; the flesh begins to knit";
                 ui.kitMessage = msg;
                 ui.kitMessageAge = 0.0f;

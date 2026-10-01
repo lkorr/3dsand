@@ -2,6 +2,8 @@
 
 #include "game/mob.h"
 
+#include <unordered_map>
+
 namespace {
 
 std::vector<PrefabVoxel>& NoLattice() {
@@ -86,6 +88,21 @@ bool ItemLatticeSettle(ItemInstance& it, const ItemDef& def) {
     bool clean = true;
     for (const PrefabVoxel& v : sh.lattice)
       if (v.stain) { clean = false; break; }
+    // ...AND UNCHANGED IN MATTER. A count match alone settled a blade whose
+    // edge had been charred or rusted voxel for voxel back to "as authored"
+    // (2026-10-01). Compared as a material histogram (masked: a held item's
+    // word carries its palette variant), because a worn piece's recorded
+    // lattice is the wearer's FITTED geometry and its positions are not the
+    // authored ones.
+    if (clean) {
+      const std::vector<PrefabVoxel>* a = ItemAuthoredLattice(def, (int)i);
+      std::unordered_map<uint32_t, int32_t> diff;
+      if (a)
+        for (const PrefabVoxel& v : *a) diff[v.material & 0xFFFu]++;
+      for (const PrefabVoxel& v : sh.lattice) diff[v.material & 0xFFFu]--;
+      for (const auto& kv : diff)
+        if (kv.second != 0) { clean = false; break; }
+    }
     if (clean) sh.lattice.clear();
   }
   if (it.damage.Empty()) {
@@ -93,6 +110,43 @@ bool ItemLatticeSettle(ItemInstance& it, const ItemDef& def) {
     return true;
   }
   return false;
+}
+
+int ItemGroundShell(const ItemDef& def) {
+  if (def.cover.empty()) return 0;
+  size_t best = 0;
+  for (size_t i = 1; i < def.cover.size(); i++)
+    if (def.cover[i].voxels.size() > def.cover[best].voxels.size()) best = i;
+  return (int)best;
+}
+
+uint32_t CaptureGroundCoat(ItemInstance& it, const ItemDef& def,
+                           const std::vector<PrefabVoxel>& body) {
+  const int shell = ItemGroundShell(def);
+  if (shell >= ItemLatticeCount(def)) return 0;
+  bool anyCoat = false;
+  for (const PrefabVoxel& v : body)
+    if (v.stain) { anyCoat = true; break; }
+  // A clean body on a plain instance: nothing to record, nothing to settle.
+  if (!anyCoat && !ItemLatticeIfAny(it, shell)) return 0;
+  auto key = [](int x, int y, int z) {
+    return ((uint64_t)(uint16_t)(int16_t)x << 32) |
+           ((uint64_t)(uint16_t)(int16_t)y << 16) | (uint64_t)(uint16_t)(int16_t)z;
+  };
+  std::unordered_map<uint64_t, uint16_t> coatAt;
+  coatAt.reserve(body.size());
+  for (const PrefabVoxel& v : body) coatAt.emplace(key(v.x, v.y, v.z), v.stain);
+  std::vector<PrefabVoxel>& lat = ItemLatticeMut(it, def, shell);
+  uint32_t changed = 0;
+  for (PrefabVoxel& v : lat) {
+    const auto f = coatAt.find(key(v.x, v.y, v.z));
+    const uint16_t s = f != coatAt.end() ? f->second : 0u;
+    if (v.stain == s) continue;
+    v.stain = s;
+    changed++;
+  }
+  ItemLatticeSettle(it, def);
+  return changed;
 }
 
 int PushItemLatticeToLimb(Mob& wearer, const KitRef& ref) {

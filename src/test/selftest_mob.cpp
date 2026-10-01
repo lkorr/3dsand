@@ -5958,7 +5958,7 @@ Status GateZombify(Ctx& c, std::string& detail) {
         if (c.mobs.Defs()[hi].limbs[i].name.rfind("armR", 0) == 0) limb = (int)i;
       const uint64_t body = c.mobs.LimbBody(id, limb);
       ::BiteHit bt;
-      bt.at = c.mobs.LimbVoxelPos(id, limb, 7919u);
+      bt.at = c.mobs.LimbSurfacePos(id, limb, 7919u);
       bt.hp = 4.0f;
       bt.power = 1.0f;
       bt.infectMat = rotMat;
@@ -6118,28 +6118,23 @@ Status GateZombify(Ctx& c, std::string& detail) {
       //
       // A FULL bite (the first arm's 4 hp at power 1), because since the rot
       // became per-voxel (PLAN_weapon_coats B, 2026-10-01) what turns a body
-      // is a VOXEL of rot in it at death, not a latch: the 2 hp / 0.6 bite this
-      // arm used to throw rewrote no flesh at all on this pose (BiteHit's
-      // `took` counted only the ichor smear, and the old latch rose on that).
+      // is a VOXEL of rot in it at death, not a latch.
+      //
+      // ONE bite, ON THE SKIN (MobSystem::LimbSurfacePos). The arm used to aim
+      // at LimbVoxelPos -- any voxel, here an interior one -- and a bite there
+      // is a closed cavity walled in the bone core, which rewrites no flesh;
+      // a workaround re-bit up to 8 times until rot appeared. With the bite at
+      // the surface and StainWoundAs's mottle recentred on the wound, one
+      // real bite infects, which is the arm's premise stated as a fact.
       ::BiteHit bt;
-      bt.at = c.mobs.LimbVoxelPos(id, limb, 4441u);
+      bt.at = c.mobs.LimbSurfacePos(id, limb, 4441u);
       bt.hp = 4.0f;
       bt.power = 1.0f;
       bt.infectMat = rotMat;
       bt.infectStain = c.mobs.Defs()[z2].bite.infectStain;
       bt.seed = 0x6017u;
-      // ...UNTIL THE ROT TOOK. Measured with the attribution below: on this
-      // carved pose one bite at 4441 rewrites NO flesh (its `took` was the ichor
-      // smear alone), and the old per-limb latch rose the body on that. A few
-      // tries at other surface points, each a real bite, until a voxel of rot
-      // is in it -- the premise of the arm, now stated as a fact it checks.
-      for (int tryN = 0; tryN < 8; tryN++) {
-        if (!c.mobs.LimbBody(id, limb)) break;
-        bt.at = c.mobs.LimbVoxelPos(id, limb, 4441u + 977u * (uint32_t)tryN);
-        bt.seed = 0x6017u + (uint32_t)tryN;
+      if (c.mobs.LimbBody(id, limb))
         c.mobs.BiteHit(c.mobs.LimbBody(id, limb), bt, c.world, spawns);
-        if (c.mobs.LimbMaterialCount(id, limb, rotMat) > 0) break;
-      }
       carvedVox = c.mobs.LimbArtVoxelCount(id, limb);
       const bool stillOn = c.mobs.LimbBody(id, limb) != 0;
       // ATTRIBUTION (rule 6): the rot cells on the whole body at the death,

@@ -481,6 +481,10 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
   d.infectBooksBurn = cause == "burn";
   d.infectDeath = in.value("death", std::string());
   d.infectCuredName = in.value("cured", std::string());
+  // What the UI calls it ("rot", "venom"): the HUD row and the remedy line
+  // name the infection by this, never by a hardcoded word. Absent = the
+  // material's own name.
+  d.infectLabel = in.value("label", d.name);
   d.infect = true;
 }
 

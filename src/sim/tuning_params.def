@@ -1434,9 +1434,12 @@ TP_F(gear, biteThroughHard, NO_WGSL, 60.0f, 1.0f, 400.0f)
 TP_F(gear, blastShellCells, NO_WGSL, 1.0f, 0.0f, 8.0f)
 // ---- a coat moves on contact (game/coattransfer.cpp, DESIGN.md section 7) ----
 TP_F(gear, coatTransferFrac, NO_WGSL, 0.5f, 0.0f, 1.0f)
-TP_I(gear, coatTransferMax, NO_WGSL, 24, 0, 512)
+TP_I(gear, coatTransferMax, NO_WGSL, 96, 0, 512)
 TP_F(gear, coatContactRadius, NO_WGSL, 0.06f, 0.0f, 0.5f)
 TP_I(gear, coatBleedPickup, NO_WGSL, 6, 0, 15)
+// The thinnest a transferred coat is laid per voxel when a dose is spread over
+// the struck patch (CoatLay); 0 = no spreading, the old peak taper.
+TP_I(gear, coatLayerMin, NO_WGSL, 6, 0, 15)
 
 
 // ==== avatar ====
@@ -1461,7 +1464,6 @@ TP_F(avatar, headLookPitchUp, NO_WGSL, 55.0f, 0.0f, 89.0f)
 TP_F(avatar, headLookPitchDown, NO_WGSL, 60.0f, 0.0f, 89.0f)
 TP_F(avatar, headLookSpine, NO_WGSL, 0.25f, 0.0f, 1.0f)
 TP_F(avatar, headLookHalflife, NO_WGSL, 0.07f, 0.0f, 1.0f)
-TP_F(avatar, headLookRecenterHalflife, NO_WGSL, 0.35f, 0.0f, 3.0f)
 TP_F(avatar, ikBlendHalflife, NO_WGSL, 0.08f, 0.0f, 0.4f)
 TP_F(avatar, airDebounce, NO_WGSL, 0.12f, 0.0f, 0.5f)
 TP_F(avatar, fallFlailDelay, NO_WGSL, 0.35f, 0.0f, 2.0f)

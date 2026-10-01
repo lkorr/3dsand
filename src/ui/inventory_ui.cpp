@@ -2913,6 +2913,8 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
       int present = 0, severed = 0, bleeders = 0;
       uint32_t burning = 0;
       float hp = 1.0f, vox = 1.0f, charred = 0.0f, rot = 0.0f;
+      char rotLabel[16] = "rot";
+      ImU32 rotColor = IM_COL32(150, 190, 100, 255);
     };
     auto fold = [](Agg& a, const UIState::BodyPartUI& b) {
       if (!b.present) return;
@@ -2927,8 +2929,17 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
       // inside an otherwise clean arm is the thing worth knowing; averaging it
       // against two healthy segments would report a calm 25% for an arm with a
       // dead hand on the end of it. Same rule charredFrac already uses.
-      if (b.voxelTotal > 0)
-        a.rot = std::max(a.rot, (float)b.voxelRot / (float)b.voxelTotal);
+      if (b.voxelTotal > 0) {
+        const float f = (float)b.voxelRot / (float)b.voxelTotal;
+        if (f > a.rot) {
+          a.rot = f;
+          // Named by the worst segment's HEAVIEST infection (its first row).
+          if (b.infectCount > 0) {
+            std::snprintf(a.rotLabel, sizeof a.rotLabel, "%s", b.infect[0].label);
+            a.rotColor = b.infect[0].color;
+          }
+        }
+      }
     };
     // Severity is the ORDER WITHIN a line as well as the line's own rank, so
     // the first words on it are always the worst news about that part.
@@ -2952,9 +2963,14 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
         // The floor is one part in fifty rather than zero because a single
         // grazing bite leaves a handful of voxels and a body that has fought
         // anything undead would otherwise wear "ROTTING 0%" on six rows.
-        if (a.rot > 0.02f)
-          add(r, 2, IM_COL32(150, 190, 100, 255), "ROTTING %.0f%%",
-              a.rot * 100.0f);
+        if (a.rot > 0.02f) {
+          char up[16];
+          size_t n = 0;
+          for (; n + 1 < sizeof up && a.rotLabel[n]; n++)
+            up[n] = (char)std::toupper((unsigned char)a.rotLabel[n]);
+          up[n] = '\0';
+          add(r, 2, a.rotColor, "%s %.0f%%", up, a.rot * 100.0f);
+        }
         if (a.hp < 0.35f)
           add(r, 3, ui::ColBloodHi(), "CRITICAL %.0f%%", a.hp * 100.0f);
         else if (a.hp < 0.8f)
@@ -3243,9 +3259,19 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
     // an uninfected body has no rot row at all, so the row's mere presence is
     // the alarm. Sick green, deliberately nothing like the two reds above it —
     // this bar growing while `flesh` shrinks is the whole story of a bite.
-    if (b.voxelRot > 0) {
-      tissueBar("ROT", b.voxelRot, total, IM_COL32(120, 155, 80, 255));
+    // ONE ROW PER INFECTION, named by its authored label and drawn in its
+    // material's colour: a venom wound says VENOM in bruise purple, the rot
+    // says ROT in sick green.
+    for (int k = 0; k < b.infectCount; k++) {
+      char up[16];
+      size_t n = 0;
+      for (; n + 1 < sizeof up && b.infect[k].label[n]; n++)
+        up[n] = (char)std::toupper((unsigned char)b.infect[k].label[n]);
+      up[n] = '\0';
+      tissueBar(up, b.infect[k].count, total, b.infect[k].color);
     }
+    if (b.infectCount == 0 && b.voxelRot > 0)
+      tissueBar("ROT", b.voxelRot, total, IM_COL32(120, 155, 80, 255));
     if (b.voxelBrain > 0 || b.voxelBrainMax > 0) {
       tissueBar("brain", b.voxelBrain, total, IM_COL32(225, 190, 195, 255));
       if (b.voxelBrainMax > 0 && b.voxelBrain < b.voxelBrainMax) {

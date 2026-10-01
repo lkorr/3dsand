@@ -300,6 +300,25 @@ class DebrisSystem {
       fn(f);
     }
   }
+  // ...and every body that WEARS A COAT through MobSystem's coat passes: dead
+  // flesh and dropped items (Body::item). A dropped coated sword keeps drawing
+  // its coat, dries on the ground, and picks a coat up from what it lies in.
+  template <class Fn>
+  void ForEachCoatBody(Fn&& fn) {
+    for (Body& b : bodies_) {
+      if (!(IsFlesh(b) || b.item) || !OwnedLocally(b) || b.voxels.empty())
+        continue;
+      FleshLattice f = FleshOf(b);
+      fn(f);
+    }
+  }
+  // A dropped item's body (Body::item). Called by DropItemToWorld after
+  // AdoptBody.
+  void MarkItemBody(uint64_t handle);
+  bool IsItemBody(uint64_t handle) const;
+  // ANY owned body's lattice view, by handle (the coat exchange's loose side:
+  // MobSystem::CoatOnContact). False for an unknown or ghost handle.
+  bool CoatLatticeOf(uint64_t handle, FleshLattice& out);
   // One burn tick over every dead-flesh body. `burn` gets them all at once
   // (so it can build a per-creature heat snapshot before any of them burns)
   // and fills one FleshBurn per lattice: how many voxels it tombstoned
@@ -1570,6 +1589,12 @@ class DebrisSystem {
     // flesh as FLESH rather than as a chip, and `GoreEvent` gives a corpse its
     // own species' wet noises.
     bool dead = false;
+    // A DROPPED ITEM'S BODY (MarkItemBody, from worlditems.h DropItemToWorld).
+    // It wears a coat as severed flesh does -- the contact, rain, drying and
+    // splatter passes walk it (ForEachCoatBody) -- and the coat goes back into
+    // the item's instance when it is picked up or saved. Not inherited by a
+    // fragment: a shard of a sword is not the sword.
+    bool item = false;
     // The mob this was part of (its id), stamped by Mob::Die and inherited by
     // fragments like `dead`. Groups a corpse's pieces for the heat that
     // crosses its joints (MobSystem::BurnDeadFlesh). 0 = no creature.

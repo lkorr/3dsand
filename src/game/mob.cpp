@@ -11369,9 +11369,32 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
     b.impactSpeed = 0.0f;
     b.seed = (uint32_t)(h.limb * 2654435761u) ^ (uint32_t)(h.other * 40503u) ^
              tick_;
+    // Who was struck, taken BEFORE the blow (BluntHit may sever the slot).
+    int coatSlot = -1;
+    Mob* coatMob = FindOwner(h.limb, &coatSlot);
+    const std::string coatSlotName =
+        coatMob && coatSlot >= 0 ? coatMob->SlotName(coatSlot) : std::string();
+    const uint64_t coatMobId = coatMob ? coatMob->Id() : 0u;
     // The first contact may have severed or killed; BluntHit re-resolves the
     // handle and returns false if it no longer names a limb.
-    if (BluntHit(h.limb, b, world, spawns)) billed++;
+    if (BluntHit(h.limb, b, world, spawns)) {
+      billed++;
+      // ...AND A COATED THING THROWN CARRIES ITS COAT (2026-10-01): a venom
+      // dagger, an oiled rock, a bloody severed arm flung at someone trades
+      // coats with what it hit by the melee rule (CoatOnContact), loose body
+      // as the striker. A blunt blow: the coat lands on the bruise.
+      if (coatMobId != 0) {
+        CoatContact cc;
+        cc.strikerBody = h.other;
+        cc.targetId = coatMobId;
+        cc.targetSlot = coatSlot;
+        cc.targetSlotName = coatSlotName;
+        cc.at = h.at;
+        cc.kind = CoatHitKind::Blunt;
+        cc.power = b.power;
+        CoatOnContact(cc);
+      }
+    }
   }
   contactHitsBilled_ += (uint32_t)billed;
   return billed;
@@ -12310,7 +12333,7 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
                                   : gt.stainCutRadius * scale) *
                       reach;
   const CellDist craterDist =
-      fromCrater ? BuildCellDist(*crater, (int)std::ceil(std::max(rimL, tintL)) + 1)
+      fromCrater ? BuildCellDist(*crater, (int)std::ceil(std::max(rimL + 1.0f, tintL)) + 1)
                  : CellDist{};
   const bool useCrater = fromCrater && !craterDist.Empty();
 
@@ -12441,9 +12464,14 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // over everything the blast searched.
     float tt;
     if (useCrater) {
-      const float dc = craterDist.At((int)lx, (int)ly, (int)lz);
+      // Measured from the WALL, not from the removed cells: every survivor is
+      // at least one cell from what the carve took, so `dc / rimL` put the
+      // wall itself at t = 2/3 and capped "near-certain at the cut" at 44%
+      // (2026-10-01, with the mottle recentred below). The wall is t = 0 and
+      // the soak reaches `rimL` past it.
+      const float dc = craterDist.At((int)lx, (int)ly, (int)lz) - 1.0f;
       if (dc >= rimL) return;
-      tt = dc / rimL;
+      tt = std::max(0.0f, dc) / rimL;
     } else {
       const Vec3 d{lx + 0.5f - c.x, ly + 0.5f - c.y, lz + 0.5f - c.z};
       const float d2 = d.dot(d);
@@ -13111,6 +13139,7 @@ const IVec3 kBurnDirs[6] = {{0, 1, 0}, {0, -1, 0}, {1, 0, 0},
 }  // namespace
 
 void Mob::DropBurnIndex(BodyBurnState& st) {
+  st.idxGen++;
   std::vector<uint32_t>().swap(st.idx);
   std::vector<uint32_t>().swap(st.front);
   std::vector<uint32_t>().swap(st.surface);
@@ -13390,6 +13419,7 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   burnprof::Scope bpScope(burnprof::kIndex);
   BodyBurnState& st = *v.burn;
   const size_t n = v.Size();
+  st.idxGen++;
   st.idx.clear();
   st.front.clear();
   st.surface.clear();
@@ -13745,7 +13775,7 @@ int Mob::RestoreVoxels(int limbIndex, uint32_t material, int count) {
   limb.carved = true;
   const uint32_t matId = material & 0xFFFu;
   if (sys_ && matId < sys_->matInfectious_.size() && sys_->matInfectious_[matId])
-    limb.infected = 1;
+    limb.MarkInfected();
   return placed;
 }
 
@@ -17932,6 +17962,27 @@ float Mob::InfectAdmits(const InfectSpec& s, uint32_t m) const {
   return 0.0f;
 }
 
+void Mob::RelatchInfections() {
+  if (!def_ || !sys_) return;
+  const int nl = std::min((int)limbs_.size(), baseLimbs_);
+  for (int li = 0; li < nl; li++) {
+    MobLimb& limb = limbs_[li];
+    limb.infected = 0;
+    limb.infectCells.clear();
+    limb.infectCellsValid = false;
+    if (!limb.body || IsBloodless(li)) continue;
+    BurnLimbView v = ViewOf(limb);
+    for (size_t i = 0; i < v.Size(); i++)
+      if (sys_->InfectSpecOf(v.Mat(i) & 0xFFFu)) {
+        limb.infected = 1;
+        break;
+      }
+  }
+  // The ledger is derived too: recount it, which re-arms a coat that carries
+  // an infection (coatSeedDue_) exactly as the coat's arrival did.
+  coatDirty_ = twinDirty_ = true;
+}
+
 bool Mob::InfectTick(uint32_t tick, World& world,
                      std::vector<ParticleSpawn>& spawns) {
   // THE ROT GOES ON IN A CORPSE: the disease eats what it is in whether or
@@ -17944,7 +17995,13 @@ bool Mob::InfectTick(uint32_t tick, World& world,
     // A GARMENT AND A HELD SWORD ARE NOT ANATOMY (both are past baseLimbs_),
     // and hair (IsBloodless) is not living tissue -- it does not rot, it burns.
     if (IsBloodless(li) || !limbs_[li].body) continue;
-    if (!InfectStep(li, tick, world, spawns)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool kept = InfectStep(li, tick, world, spawns);
+    sys_->infectMs_ += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+    sys_->infectLimbSteps_++;
+    if (!kept) return false;
   }
   return true;
 }
@@ -17989,36 +18046,52 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   auto specOf = [&](uint32_t m) -> const InfectSpec* {
     return m < specs.size() && specs[m].on ? &specs[m] : nullptr;
   };
-  // ---- ONE sweep: the infectious cells, and how many of each material ------
-  struct Cell {
-    uint32_t i;
-    uint32_t mat;
-  };
-  std::vector<Cell> cells;
-  std::vector<std::pair<uint32_t, uint32_t>> count;  // (material, cells)
-  auto countOf = [&](uint32_t m) -> uint32_t& {
-    for (auto& c : count)
-      if (c.first == m) return c.second;
-    count.push_back({m, 0u});
-    return count.back().second;
-  };
-  for (size_t i = 0; i < n; i++) {
-    const uint32_t m = v.Mat(i) & 0xFFFu;
-    if (m == 0 || !specOf(m)) continue;
-    cells.push_back({(uint32_t)i, m});
-    countOf(m)++;
-  }
-  if (cells.empty()) {
-    // NOTHING INFECTIOUS LEFT: the limb goes quiet and costs one byte test a
-    // tick again. Whatever crossed a joint is that limb's own business now.
-    limb.infected = 0;
-    return true;
-  }
+  // ---- THE INFECTIOUS CELLS: the limb's list, re-derived only when stale ----
+  //
+  // COST (rule 2, 2026-10-01). This used to be a sweep of the WHOLE lattice
+  // every tick for every infected limb -- a crowd of bitten humans paid for
+  // their torsos' 31k cells whether the rot was 5 cells or 500. The list
+  // (MobLimb::infectCells) makes a tick cost the infection: resolve each
+  // listed position through the burn index, drop what is no longer
+  // infectious, sort into STORAGE order -- so the cells act in exactly the
+  // order the sweep visited them and the outcome is the sweep's, cell for
+  // cell -- and append what this tick converts. A full sweep runs only when a
+  // writer elsewhere marked the list stale (MobLimb::MarkInfected).
+  // MobSystem::infectFullSweep_ forces it every tick: the before-arm of the
+  // `infect-perf` gate, in the same binary and the same process.
+  const bool kFullSweep = sys_->infectFullSweep_;
   sys_->EnsureBurnIndex(v);
   BodyBurnState& st = limb.burn;
   // Refused (an absurd bounding box, see BuildBurnIndex). Not a cure: the
   // next tick tries again.
   if (st.idx.empty()) return true;
+  // Positions are only good under the index generation they were taken in:
+  // a new index means the lattice may have been compacted or rebased.
+  if (kFullSweep || limb.infectCellsGen != st.idxGen)
+    limb.infectCellsValid = false;
+  if (!limb.infectCellsValid) {
+    limb.infectCells.clear();
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t m = v.Mat(i) & 0xFFFu;
+      if (m == 0 || !specOf(m)) continue;
+      const IVec3 p = v.At(i);
+      limb.infectCells.push_back({(int16_t)p.x, (int16_t)p.y, (int16_t)p.z});
+    }
+    limb.infectCellsValid = true;
+    limb.infectCellsGen = st.idxGen;
+    sys_->infectSweeps_++;
+  }
+  if (limb.infectCells.empty()) {
+    // NOTHING INFECTIOUS LEFT: the limb goes quiet and costs one byte test a
+    // tick again. Whatever crossed a joint is that limb's own business now.
+    limb.infected = 0;
+    return true;
+  }
+  // AN INFECTION IS ACTIVITY: the index stays warm while it runs, rather
+  // than being dropped by the burn pass's idle grace and rebuilt here every
+  // 31 ticks. Bounded by the infected limbs, and released by the grace once
+  // the infection is gone. (Not in the before-arm, which models the old cost.)
+  if (!kFullSweep) st.quiet = 0;
   const IVec3 bm = st.min, bd = st.dims;
   auto cellOf = [&](IVec3 p) -> uint32_t {
     const int lx = p.x - bm.x, ly = p.y - bm.y, lz = p.z - bm.z;
@@ -18031,6 +18104,56 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   auto voxAt = [&](uint32_t c) -> uint32_t {
     return c == kNoBurnCell ? 0u : (st.idx[c] & ~kBurnQueued);
   };
+  struct Cell {
+    uint32_t i;
+    uint32_t mat;
+  };
+  std::vector<Cell> cells;
+  cells.reserve(limb.infectCells.size());
+  std::vector<std::pair<uint32_t, uint32_t>> count;  // (material, cells)
+  auto countOf = [&](uint32_t m) -> uint32_t& {
+    for (auto& c : count)
+      if (c.first == m) return c.second;
+    count.push_back({m, 0u});
+    return count.back().second;
+  };
+  {
+    size_t keep = 0;
+    for (size_t k = 0; k < limb.infectCells.size(); k++) {
+      const MobLimb::InfectCellPos q = limb.infectCells[k];
+      const uint32_t j = voxAt(cellOf({q.x, q.y, q.z}));
+      if (j == 0) continue;   // eaten, carved away, or outside the index
+      const uint32_t m = v.Mat(j - 1) & 0xFFFu;
+      if (m == 0 || !specOf(m)) continue;   // cured, healed, converted out
+      limb.infectCells[keep++] = q;
+      cells.push_back({j - 1, m});
+      countOf(m)++;
+    }
+    limb.infectCells.resize(keep);
+    std::sort(cells.begin(), cells.end(),
+              [](const Cell& a, const Cell& b) { return a.i < b.i; });
+    // A position listed twice (two writers each appended it) acts once.
+    cells.erase(std::unique(cells.begin(), cells.end(),
+                            [](const Cell& a, const Cell& b) { return a.i == b.i; }),
+                cells.end());
+    if (cells.size() != keep) {
+      count.clear();
+      limb.infectCells.clear();
+      for (const Cell& c : cells) {
+        countOf(c.mat)++;
+        const IVec3 p = v.At(c.i);
+        limb.infectCells.push_back({(int16_t)p.x, (int16_t)p.y, (int16_t)p.z});
+      }
+    }
+  }
+  if (cells.empty()) {
+    limb.infected = 0;
+    limb.infectCells.clear();
+    return true;
+  }
+  // What this tick converts joins the list after the loop (a cell converted
+  // THIS tick does not act until the next one, the sweep's rule).
+  std::vector<MobLimb::InfectCellPos> born;
 
   // THE BRICK MUST BE OWNED BEFORE IT CAN BE POKED -- every instance of a def
   // shares one packed model until something damages a particular body. Same
@@ -18217,11 +18340,13 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
             // NOT recorded in `woundWas`: an infection that undoes itself is
             // the behaviour this pass replaced.
             v.Set(j, cur, (h3 >> 6) % 3u);
-            if (poke) {
-              const IVec3 q = v.At(j);
+            const IVec3 q = v.At(j);
+            if (poke)
               MicroBodyPoke(*micro, (uint32_t)limb.microModel, q.x, q.y, q.z,
                             (uint8_t)cur, 0);
-            }
+            // Listed already when it was ANOTHER infection's cell.
+            if (!specOf(was))
+              born.push_back({(int16_t)q.x, (int16_t)q.y, (int16_t)q.z});
             grown++;
           }
         } else {
@@ -18261,6 +18386,7 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
     }
   }
 
+  limb.infectCells.insert(limb.infectCells.end(), born.begin(), born.end());
   // THE LEDGER OWES A RECOUNT (mob.h LimbCoat): a stain written behind the
   // ledger's back is one the coat DECAY sweep never walks.
   if (coated) coatDirty_ = twinDirty_ = true;
@@ -18419,7 +18545,7 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t mat, uint32_t tick,
       MicroBodyPoke(*micro, (uint32_t)dst.microModel, p.x, p.y, p.z,
                     (uint8_t)infect, 0);
   }
-  dst.infected = 1;
+  dst.MarkInfected();
   MarkInstancesDirty();
   return 1;
 }
@@ -18561,7 +18687,7 @@ void Mob::CoatInfectTick(uint32_t tick) {
         MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
                            next);
       seededHere += (amt - left) / cost;
-      limb.infected = 1;
+      limb.MarkInfected();
       InfectStatFor(inf).seeded += (amt - left) / cost;
     }
     if (seededHere) {
@@ -18830,7 +18956,7 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
     // living in this limb too — RestoreVoxels' rule — or it would sit there
     // inert while its twin went on spreading.
     if (m < sys_->matInfectious_.size() && sys_->matInfectious_[m])
-      l.infected = 1;
+      l.MarkInfected();
     (void)fromLi;
     // ...and so did the fire: a burning cell copied without a place on the
     // front would never roll its decay again (BodyBurnState::alight's note).
@@ -19482,7 +19608,7 @@ void MobSystem::SplatterDeadFlesh(const SplatterEvent& e) {
   if (!debris_ || matGpu_.empty()) return;
   // Same stamp discipline as StainDeadFlesh: an entry made here for a body the
   // contact pass has not met yet is live until that pass's own sweep.
-  debris_->ForEachDeadFlesh([&](DebrisSystem::FleshLattice& f) {
+  debris_->ForEachCoatBody([&](DebrisSystem::FleshLattice& f) {
     FleshCoat& cc = fleshCoat_[f.id];
     int model = -1;
     BurnLimbView v = FleshView(f, cc, model);
@@ -19666,7 +19792,7 @@ void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
   if (!debris_ || matGpu_.empty()) return;
   // The stamp that marks an entry live this tick; 0 is "never", so skip it.
   const uint32_t stamp = tick + 1u;
-  debris_->ForEachDeadFlesh([&](DebrisSystem::FleshLattice& f) {
+  debris_->ForEachCoatBody([&](DebrisSystem::FleshLattice& f) {
     FleshCoat& cc = fleshCoat_[f.id];
     cc.seen = stamp;
     if (budget == 0) return;
@@ -20232,7 +20358,8 @@ static void RankCoat(CoatEntry (&top)[kCoatTop], const CoatEntry& en) {
 
 void MobSystem::TallyCoat(const BurnLimbView& v, LimbCoat& out,
                           const std::vector<uint8_t>* corrodes, bool sole,
-                          const std::vector<uint16_t>* infects) {
+                          const std::vector<uint16_t>* infects,
+                          const std::vector<uint8_t>* infectCost) {
   // Occupied voxels (tombstones excluded — a carved-away voxel is not clean,
   // it is absent, and counting it would make a dismembered limb read as
   // washed), how many carry anything, and the kCoatTop heaviest substances.
@@ -20273,7 +20400,13 @@ void MobSystem::TallyCoat(const BurnLimbView& v, LimbCoat& out,
     out.sumAmt += amt;
     const uint32_t mat = BodyStainMat(s);
     if (corrodes && mat < corrodes->size() && (*corrodes)[mat]) out.corrosive++;
-    if (infects && mat < infects->size() && (*infects)[mat]) out.infecting++;
+    // Only a coat THICK ENOUGH TO PAY for a conversion counts (rule 2): the
+    // film a seeding leaves behind (below `infectCost`) cannot seed again, and
+    // counting it re-armed CoatInfectTick's whole-limb sweep on every recount
+    // its own drying caused, until it was dry.
+    if (infects && mat < infects->size() && (*infects)[mat] &&
+        amt >= (infectCost && mat < infectCost->size() ? (*infectCost)[mat] : 5u))
+      out.infecting++;
     size_t at = nt;
     for (size_t t = 0; t < nt; t++)
       if (tally[t].mat == mat) { at = t; break; }
@@ -20319,7 +20452,7 @@ void Mob::RecountCoat(uint32_t tick, bool force) {
       BurnLimbView v = ViewOf(l);
       const bool foot = li < (int)limbDefs_.size() && limbDefs_[li].tag == "foot";
       MobSystem::TallyCoat(v, out, &sys_->matCorrodes_, foot,
-                           &sys_->coatInfects_);
+                           &sys_->coatInfects_, &sys_->coatInfectCost_);
     }
     l.coat = out;
     // A coat that carries an infection is on a living limb of ours: the
@@ -22009,7 +22142,7 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
       // bone with once it has eaten the flesh off it (MobLimb::infects).
       // The ichor smear is the infection material's own fluid now
       // (rotflesh -> ichor), so nothing about the stain is latched.
-      limbs_[li].infected = 1;
+      limbs_[li].MarkInfected();
       limbs_[li].biteRewrite = hit.infectMat;
     }
   } else {
@@ -23064,6 +23197,11 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // that body is, so `E` can pick it up (Mob::LostGear).
     if (!shedAs.name.empty() && sys_ && sys_->onItemShed_)
       sys_->onItemShed_(limb.holdBody, shedAs);
+    // ...and it is an ITEM body from here: it keeps, takes and dries its coat
+    // on the ground the way a dropped one does (DebrisSystem::ForEachCoatBody).
+    // Its lattice IS the item's (a held slot's own, coats included, adopted
+    // above), so nothing is copied.
+    if (!shedAs.name.empty() && debris_) debris_->MarkItemBody(limb.holdBody);
     // A GARMENT THAT HAS LEFT IS NOT A FOLLOWER. It is DebrisSystem's now and
     // has real dynamics of its own from the end of the sever hold; a shell that
     // kept its host would be teleported back onto a limb it has fallen off,
@@ -24645,6 +24783,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
 
 uint32_t MobSystem::DouseLimb(uint64_t mobId, int limb, uint32_t mat,
                               uint32_t amount, uint32_t tick, uint32_t* marked) {
+  lastCured_.clear();
   const uint32_t n = SoakLimb(mobId, limb, mat, amount, tick);
   if (marked) *marked = n;
   Mob* mob = FindCreature(mobId);
@@ -24679,14 +24818,20 @@ uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat,
       //                           (unauthored = left alone). There is no
       //                           per-limb list to strike a name from -- the
       //                           infection IS its cells, so the cells change.
+      // A BARE "disinfect" CURES TOO (2026-10-01). It used to drop the
+      // limb's latch and leave the cells inert -- which the next bite, joint
+      // crossing or LOAD (the latch is derived) re-latched, every old cell
+      // with it. The infection IS its cells, so every remedy changes cells:
+      // bare = every infection material on the limb that authors `cured`.
+      // One with no `cured` cannot be cured in place and is stopped the old
+      // way (the latch), which a later re-latch can undo -- no shipped
+      // infection is one.
       const std::string want = fx.size() > 10 ? fx.substr(10) : std::string();
-      if (want.empty()) {
-        if (l.Infected()) did |= kRemedyDisinfect;
-        l.infected = 0;
-        continue;
-      }
+      const bool all = want.empty();
       uint32_t tagBit = 0, nameId = 0;
-      if (want.rfind("tag:", 0) == 0) {
+      if (all) {
+        // every infection
+      } else if (want.rfind("tag:", 0) == 0) {
         const auto it = tagBits_.find(want.substr(4));
         tagBit = it != tagBits_.end() ? it->second : 0u;
         if (tagBit == 0) continue;  // a tag nothing carries stops nothing
@@ -24697,15 +24842,25 @@ uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat,
       if (!l.body) continue;
       BurnLimbView v = mob.ViewOf(l);
       bool owned = false;
-      uint32_t cured = 0;
+      uint32_t cured = 0, uncurable = 0;
       for (size_t i = 0; i < v.Size(); i++) {
         const uint32_t m = v.Mat(i) & 0xFFFu;
         const InfectSpec* sp = InfectSpecOf(m);
-        if (!sp || sp->cured == 0) continue;
+        if (!sp) continue;
         const bool hit =
-            (nameId != 0 && m == nameId) ||
+            all || (nameId != 0 && m == nameId) ||
             (tagBit != 0 && m < matGpu_.size() && (matGpu_[m].tagMask & tagBit));
         if (!hit) continue;
+        if (sp->cured == 0) {
+          uncurable++;
+          if (std::find(lastCured_.begin(), lastCured_.end(), m) ==
+              lastCured_.end())
+            lastCured_.push_back(m);
+          continue;
+        }
+        if (std::find(lastCured_.begin(), lastCured_.end(), m) ==
+            lastCured_.end())
+          lastCured_.push_back(m);
         v.Set(i, sp->cured, 0);
         if (!owned) owned = OwnForStain(v, microSet_);
         if (owned) {
@@ -24714,6 +24869,10 @@ uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat,
                         (uint8_t)sp->cured, 0);
         }
         cured++;
+      }
+      if (all && uncurable && l.Infected()) {
+        l.infected = 0;
+        did |= kRemedyDisinfect;
       }
       if (cured) {
         did |= kRemedyDisinfect;
@@ -24792,6 +24951,7 @@ MobSystem::BodyRayHit MobSystem::PickBody(uint64_t mobId, Vec3 ro, Vec3 rd,
 uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
                                float radius, uint32_t mat, uint32_t amount,
                                uint32_t tick, uint32_t* marked, uint32_t* drawn) {
+  lastCured_.clear();
   if (marked) *marked = 0;
   if (drawn) *drawn = 0;
   if (!hit.hit || mat == 0 || amount == 0 || radius <= 0.0f) return 0;
@@ -25005,6 +25165,44 @@ Vec3 MobSystem::LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const {
     Vec3 c{((float)v.x + 0.5f) * inv, ((float)v.y + 0.5f) * inv,
            ((float)v.z + 0.5f) * inv};
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+    return limb.xf.pos + Rotate(q, c);
+  }
+  return Vec3{};
+}
+
+Vec3 MobSystem::LimbSurfacePos(uint64_t mobId, int limbIndex,
+                               uint32_t n) const {
+  for (const Mob& mob : CreatureWithId(mobId)) {
+    if (mob.id_ != mobId) continue;
+    if (limbIndex < 0 || limbIndex >= (int)mob.limbs_.size()) break;
+    const MobLimb& limb = mob.limbs_[limbIndex];
+    if (limb.voxels.empty()) return limb.xf.pos;
+    std::unordered_set<uint64_t> occ;
+    occ.reserve(limb.voxels.size() * 2);
+    auto key = [](int x, int y, int z) {
+      return ((uint64_t)(uint16_t)(int16_t)x << 32) |
+             ((uint64_t)(uint16_t)(int16_t)y << 16) |
+             (uint64_t)(uint16_t)(int16_t)z;
+    };
+    for (const DebrisVoxel& v : limb.voxels)
+      if (v.payload != 0) occ.insert(key(v.x, v.y, v.z));
+    std::vector<uint32_t> surf;
+    for (uint32_t i = 0; i < (uint32_t)limb.voxels.size(); i++) {
+      const DebrisVoxel& v = limb.voxels[i];
+      if (v.payload == 0) continue;
+      if (!occ.count(key(v.x - 1, v.y, v.z)) || !occ.count(key(v.x + 1, v.y, v.z)) ||
+          !occ.count(key(v.x, v.y - 1, v.z)) || !occ.count(key(v.x, v.y + 1, v.z)) ||
+          !occ.count(key(v.x, v.y, v.z - 1)) || !occ.count(key(v.x, v.y, v.z + 1)))
+        surf.push_back(i);
+    }
+    if (surf.empty()) return LimbVoxelPos(mobId, limbIndex, n);
+    const DebrisVoxel& v = limb.voxels[surf[n % (uint32_t)surf.size()]];
+    const float inv =
+        1.0f / (float)std::max(1u, mob.def_ ? mob.def_->physScale : 1u);
+    const Vec3 c{((float)v.x + 0.5f) * inv, ((float)v.y + 0.5f) * inv,
+                 ((float)v.z + 0.5f) * inv};
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                 limb.xf.quat[3]};
     return limb.xf.pos + Rotate(q, c);
   }
   return Vec3{};
@@ -26088,6 +26286,7 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
   // author. (A living load keeps its rest pose unless the caller asked.)
   OverlayMobRecord(*m, rec, placeLimbs || rec.dead);
   m = FindMobById(id);
+  if (m != nullptr) m->RelatchInfections();
   if (m == nullptr || !rec.dead) return m;
   // A PLAYER'S CORPSE COMES BACK IN ITS OWN ID BAND (P3). Ids are not saved,
   // so Spawn just spent an NPC id on it; handing that back keeps nextId_ where
@@ -26659,6 +26858,7 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
   // re-enter this system.
   m = FindMobById(h.announce.id);
   if (m == nullptr) return nullptr;
+  m->RelatchInfections();
 
   // ---- IT IS MINE NOW -----------------------------------------------------
   m->owner_ = localPlayerId_;

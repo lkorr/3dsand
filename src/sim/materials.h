@@ -1053,6 +1053,7 @@ struct MaterialDef {
   bool infectBooksBurn = false;
   std::string infectDeath;
   std::string infectCuredName;              // as authored
+  std::string infectLabel;                  // UI name ("rot", "venom"); default = name
   uint32_t infectCured = 0;                 // resolved
   // ...AND A COAT THAT CARRIES ONE ("coat": {"infects": "<material>",
   // "infectCost": <levels>}, B2). Where a coat of this sits ON, or face-

@@ -4,7 +4,12 @@
 #include <string>
 #include <vector>
 
+#include <unordered_map>
+#include <utility>
+
 #include "game/item.h"
+#include "game/itemcoat.h"
+#include "sim/microbody.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
 
@@ -68,6 +73,11 @@ class WorldItems {
   }
   const WorldItem* Find(uint64_t body) const {
     for (const WorldItem& w : items_)
+      if (w.body == body) return &w;
+    return nullptr;
+  }
+  WorldItem* FindMut(uint64_t body) {
+    for (WorldItem& w : items_)
       if (w.body == body) return &w;
     return nullptr;
   }
@@ -168,7 +178,32 @@ inline uint64_t DropItemToWorld(const ItemDef& def, const ItemInstance& inst,
   for (const PrefabVoxel& v : *src) {
     const uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
     vox.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
-                   (uint16_t)(v.material | (variant << 12))});
+                   (uint16_t)((v.material & 0xFFFu) | (variant << 12))});
+  }
+  // ---- THE COAT GOES DOWN WITH IT (2026-10-01) ------------------------------
+  // The instance's recorded lattice for the panel the ground body is built
+  // from (itemcoat.h ItemGroundShell) carries the coat words; they land on the
+  // body voxel for voxel where positions coincide, and the brick below is an
+  // OWNED copy poked with them -- the shared item brick is every sword's.
+  // A venom-coated sword dropped in the grass is still drawn venom-coated.
+  std::vector<std::pair<size_t, uint16_t>> coats;
+  if (const std::vector<PrefabVoxel>* rec =
+          ItemLatticeIfAny(inst, ItemGroundShell(def))) {
+    std::unordered_map<uint64_t, uint16_t> at;
+    auto key = [](int x, int y, int z) {
+      return ((uint64_t)(uint16_t)(int16_t)x << 32) |
+             ((uint64_t)(uint16_t)(int16_t)y << 16) |
+             (uint64_t)(uint16_t)(int16_t)z;
+    };
+    for (const PrefabVoxel& v : *rec)
+      if (v.stain) at.emplace(key(v.x, v.y, v.z), v.stain);
+    if (!at.empty())
+      for (size_t i = 0; i < vox.size(); i++) {
+        const auto f = at.find(key(vox[i].x, vox[i].y, vox[i].z));
+        if (f == at.end()) continue;
+        vox[i].stain = f->second;
+        coats.push_back({i, f->second});
+      }
   }
   BodyTransform xf{};
   xf.pos = at;
@@ -205,7 +240,19 @@ inline uint64_t DropItemToWorld(const ItemDef& def, const ItemInstance& inst,
   } else if (micro && def.microModel >= 0) {
     mref = MicroBodyRef{(uint32_t)def.microModel, scale, dye};
   }
+  // A COATED item draws through its OWN copy of the brick (MicroBodyOwn: the
+  // body frees it with the body), with the coat poked in.
+  if (micro && mref.Valid() && !coats.empty()) {
+    const int own = MicroBodyOwn(*micro, mref.model);
+    if (own >= 0) {
+      mref.model = (uint32_t)own;
+      for (const auto& c : coats)
+        MicroBodyPokeStain(*micro, (uint32_t)own, vox[c.first].x,
+                           vox[c.first].y, vox[c.first].z, c.second);
+    }
+  }
   debris.AdoptBody(body, vox, xf, mref, scale);
+  debris.MarkItemBody(body);
   // The colour goes in BOTH places on purpose: on the ref so the thing on the
   // ground LOOKS right, and on the registry entry so picking it up gives you
   // back the garment you dropped. Neither is derivable from the other — the
@@ -214,4 +261,18 @@ inline uint64_t DropItemToWorld(const ItemDef& def, const ItemInstance& inst,
   it.name = def.name;
   reg.Add(body, it);
   return body;
+}
+
+// ---- THE COAT COMES BACK UP WITH IT (2026-10-01) ----------------------------
+// The ground body's coats -> the instance (`it`, the registry entry or a copy
+// of it), voxel for voxel: called before a pickup hands the instance over and
+// before a save writes it, so a dropped sword that lay in a puddle of oil
+// comes back oiled and one that dried on the ground comes back dry. Returns
+// the recorded coat words that changed; 0 for an unknown body.
+inline uint32_t SyncGroundCoat(ItemInstance& it, uint64_t body,
+                               const ItemDef& def, const DebrisSystem& debris) {
+  std::vector<PrefabVoxel> lat;
+  uint32_t scale = 1;
+  if (!body || !debris.BodyLatticeOf(body, lat, scale)) return 0;
+  return CaptureGroundCoat(it, def, lat);
 }

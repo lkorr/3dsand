@@ -109,9 +109,10 @@
     "biteThroughHard": 60,
     "blastShellCells": 1,
     "coatTransferFrac": 0.5,
-    "coatTransferMax": 24,
+    "coatTransferMax": 96,
     "coatContactRadius": 0.06,
-    "coatBleedPickup": 6
+    "coatBleedPickup": 6,
+    "coatLayerMin": 6
   },
   "avatar": {
     "enabled": true,
@@ -128,7 +129,6 @@
     "headLookPitchDown": 60,
     "headLookSpine": 0.25,
     "headLookHalflife": 0.07,
-    "headLookRecenterHalflife": 0.35,
     "ikBlendHalflife": 0.08,
     "airDebounce": 0.12,
     "fallFlailDelay": 0.35,

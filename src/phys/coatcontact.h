@@ -93,9 +93,14 @@ std::vector<CoatParcel> CoatOffer(const StainLattice& L,
 // precedence rule decides whether it lands. Each parcel's `levels` becomes
 // what was written. `micro`/`model`: poke the brick when it is OWNED (SoakCut's
 // contract). Returns the voxels whose coat changed.
+// `layerMin` (gear.coatLayerMin) SPREADS a parcel: no cell takes more than
+// max(layerMin, an even share of the parcel over the patch), so a dose covers
+// many cells at a working thickness instead of soaking the first two to 15
+// (2026-10-01: a venom cut put 24 levels on 2 of a wound's 38 wall cells).
+// 0 = the old peak taper only.
 uint32_t CoatLay(const StainLattice& L, const std::vector<CoatCell>& cells,
                  float reach, std::vector<CoatParcel>& parcels,
-                 MicroBodySet* micro, int model);
+                 MicroBodySet* micro, int model, uint32_t layerMin = 0);
 
 // Take exactly each parcel's `levels` of its material back off `cells`,
 // nearest first. Returns the levels actually removed.
