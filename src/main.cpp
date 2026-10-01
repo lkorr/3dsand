@@ -26,6 +26,7 @@
 #include "sim/plants.h"
 #include "game/bodyreg.h"
 #include "game/brush.h"
+#include "game/burnprof.h"
 #include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
@@ -775,6 +776,17 @@ bool g_forestFireDone = false;
 bool g_burnHouse = false;
 int g_burnHouseAt = 240;
 bool g_burnHouseDone = false;
+// `--burn-npc [tick]`: the "a clothed NPC catches fire and the game drops to
+// 4 fps" harness (owner report 2026-09-30). Spawns SANDVOX_BURN_NPCS (default
+// 1) humans 4 m ahead of the camera dressed in cloth (SANDVOX_BURN_NAKED=1 for
+// the bare control arm), lets them settle, then soaks a fire column round each
+// for SANDVOX_BURN_SOAK ticks (default 20: a walk through a burning room) and
+// prints a 30-tick timeline of frame p50/max beside the mob tick's own
+// breakdown (game/burnprof.h) until +SANDVOX_BURN_TICKS (default 600).
+//   bash scripts/run.sh ./build/Release/sandvox.exe --frames 100000 --burn-npc
+bool g_burnNpc = false;
+int g_burnNpcAt = 240;
+bool g_burnNpcDone = false;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
 // procedural surface route happens to stop.
 //
@@ -5253,6 +5265,10 @@ int main(int argc, char** argv) {
       g_burnHouse = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_burnHouseAt = std::atoi(argv[++i]);
     }
+    else if (a == "--burn-npc") {
+      g_burnNpc = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_burnNpcAt = std::atoi(argv[++i]);
+    }
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -8402,6 +8418,181 @@ int main(int argc, char** argv) {
       }
     };
   }
+  if (g_burnNpc && !g_burnHouse && !g_fellTree && !g_forestFire) {
+    // ---- --burn-npc (see g_burnNpc). Borrows the fell-tree slot too.
+    tickCtx.fellTree = [&world, &mats, &mobs, &player, &cam, &sim, &items](
+                           uint32_t tick, std::vector<CellOp>& cellOps) {
+      static std::vector<uint64_t> ids;
+      static int phase = 0;  // 0 wait, 1 settling, 2 burning
+      static uint32_t t1 = 0, tIgnite = 0;
+      static size_t winFrame0 = 0, winScope0 = 0;
+      auto envInt = [](const char* n, int d) {
+        const char* e = std::getenv(n);
+        return e ? std::atoi(e) : d;
+      };
+      static const int count = std::clamp(envInt("SANDVOX_BURN_NPCS", 1), 1, 16);
+      static const bool naked = envInt("SANDVOX_BURN_NAKED", 0) != 0;
+      static const uint32_t soak = (uint32_t)std::max(0, envInt("SANDVOX_BURN_SOAK", 20));
+      static const uint32_t burnTicks =
+          (uint32_t)std::max(60, envInt("SANDVOX_BURN_TICKS", 600));
+      if (g_burnNpcDone) return;
+      if (phase == 0) {
+        if (tick < (uint32_t)g_burnNpcAt) return;
+        if (!sim.FarPipelinesReady()) {
+          g_burnNpcAt = (int)tick + 60;
+          return;
+        }
+        int humanDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++)
+          if (mobs.Defs()[i].name == "human") humanDef = (int)i;
+        if (humanDef < 0) {
+          std::printf("--burn-npc: no human def\n");
+          g_burnNpcDone = true;
+          return;
+        }
+        const MobDef& d = mobs.Defs()[humanDef];
+        Vec3 fwd = cam.Forward();
+        fwd.y = 0;
+        fwd = fwd * (1.0f / std::max(1e-4f, fwd.len()));
+        const Vec3 right{fwd.z, 0.0f, -fwd.x};
+        // Cloth only: iron does not burn, and the report is about the shells
+        // that do. One per slot, first come.
+        static const char* kCloth[] = {"hood", "robe", "tunic", "trousers",
+                                       "shoes", "sash"};
+        for (int k = 0; k < count; k++) {
+          const float side = MetresToCells(1.5f) * ((float)k - (float)(count - 1) * 0.5f);
+          const Vec3 at = player.pos + fwd * MetresToCells(4.0f) + right * side;
+          const int sx = ifloor(at.x) - d.prefab.size.x / 2;
+          const int sz = ifloor(at.z) - d.prefab.size.z / 2;
+          const int sy = World::TerrainHeight(sx + d.prefab.size.x / 2,
+                                              sz + d.prefab.size.z / 2, kDefaultSeed) + 1;
+          const uint64_t id = mobs.Spawn(humanDef, {sx, sy, sz});
+          if (!id) continue;
+          int dressed = 0;
+          if (!naked) {
+            Equipment worn;
+            for (const char* nm : kCloth) {
+              const ItemDef* it = items.At(items.Find(nm));
+              if (it == nullptr) continue;
+              const int slot = EquipSlotFor(it->kind, worn);
+              if (slot < 0 || !worn.At(slot).Empty()) continue;
+              if (mobs.WearItem(id, it, slot)) {
+                worn.slots[slot] = ItemInstance{it->name};
+                dressed++;
+              }
+            }
+          }
+          ids.push_back(id);
+          std::printf("--burn-npc: human %llu at (%d,%d,%d) wearing %d piece(s)\n",
+                      (unsigned long long)id, sx, sy, sz, dressed);
+        }
+        std::fflush(stdout);
+        t1 = tick;
+        phase = 1;
+        return;
+      }
+      if (phase == 1) {
+        if (tick < t1 + 90u) return;
+        tIgnite = tick;
+        phase = 2;
+        g_frameMs.clear();
+        g_activeChunks.clear();
+        for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+          g_frameScopeSum[i] = 0;
+          g_frameScopeMax[i] = 0;
+          g_frameScopeSeries[i].clear();
+        }
+        for (int n = 0; n < sandvox::kPerfNodeCount; n++) g_frameGpuSeries[n].clear();
+        g_frameGpuPassSeries.clear();
+        g_frameGpuFrames = 0;
+        winFrame0 = winScope0 = 0;
+        mobs.ResetBurnStats();
+        burnprof::Get().on = true;
+        burnprof::Reset();
+        std::printf("--burn-npc: IGNITE at tick %u (%u-tick soak)\n", tick, soak);
+        std::fflush(stdout);
+      }
+      // The soak: the mob's own box, grown by two cells, filled with fire
+      // wherever the grid is air -- a creature standing in a burning room.
+      if (tick < tIgnite + soak) {
+        static uint32_t fm = 0;
+        if (fm == 0)
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == "fire") fm = (uint32_t)i;
+        for (uint64_t id : ids) {
+          Vec3 lo, hi;
+          if (!mobs.MobBodyBox(id, lo, hi)) continue;
+          for (int y = ifloor(lo.y) - 1; y <= ifloor(hi.y) + 2; y++)
+            for (int z = ifloor(lo.z) - 2; z <= ifloor(hi.z) + 2; z++)
+              for (int x = ifloor(lo.x) - 2; x <= ifloor(hi.x) + 2; x++) {
+                const IVec3 c{x, y, z};
+                if (!world.CellInWindow(c) || cellOps.size() >= kMaxCellOpsPerTick)
+                  continue;
+                cellOps.push_back({World::SlotCellIndex(c),
+                                   PackVoxNew(fm, 7u) | kCellOpIfAir});
+              }
+        }
+      }
+      if ((tick - tIgnite) % 30u == 29u) {
+        std::vector<double> w(
+            g_frameMs.begin() + (ptrdiff_t)std::min(winFrame0, g_frameMs.size()),
+            g_frameMs.end());
+        std::sort(w.begin(), w.end());
+        std::string fr;
+        for (uint64_t id : ids)
+        {
+          char b[48];
+          std::snprintf(b, sizeof b, " %s%.0f%%", mobs.IsAlive(id) ? "" : "dead:",
+                        100.0f * mobs.BurnFraction(id));
+          fr += b;
+        }
+        // The scopes that peaked in this window, worst first.
+        std::string sc;
+        {
+          int order[sandvox::kPerfScopeCount];
+          double mx[sandvox::kPerfScopeCount] = {};
+          for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+            order[i] = i;
+            const std::vector<double>& v = g_frameScopeSeries[i];
+            for (size_t f = std::min(winScope0, v.size()); f < v.size(); f++)
+              mx[i] = std::max(mx[i], v[f]);
+          }
+          std::sort(order, order + sandvox::kPerfScopeCount,
+                    [&](int a, int b) { return mx[a] > mx[b]; });
+          for (int k = 0; k < 4; k++)
+          {
+            char b[48];
+            std::snprintf(b, sizeof b, " %s %.1f", sandvox::kPerfScopeKeys[order[k]],
+                          mx[order[k]]);
+            sc += b;
+          }
+        }
+        std::printf("--burn-npc: +%4u frames %3zu p50 %6.1f max %6.1f | burnt%s | "
+                    "scope max:%s\n--burn-npc:        mob tick: %s\n",
+                    tick - tIgnite, w.size(), w.empty() ? 0.0 : w[w.size() / 2],
+                    w.empty() ? 0.0 : w.back(), fr.c_str(), sc.c_str(),
+                    burnprof::Report().c_str());
+        burnprof::Reset();
+        winFrame0 = g_frameMs.size();
+        winScope0 = g_frameScopeSeries[0].size();
+        std::fflush(stdout);
+      }
+      if (tick >= tIgnite + burnTicks) {
+        const MobSystem::BurnStats& bs = mobs.Burn();
+        std::printf("--burn-npc: body-reaction evaluator: %llu visits, %llu world "
+                    "cells walked, %llu index builds over %llu cells, %u "
+                    "candidates, %llu front skipped, %llu emits refused\n",
+                    (unsigned long long)bs.visits, (unsigned long long)bs.walkCells,
+                    (unsigned long long)bs.indexBuilds,
+                    (unsigned long long)bs.indexCells, bs.candidates,
+                    (unsigned long long)bs.frontSkipped,
+                    (unsigned long long)bs.emitRefused);
+        std::fflush(stdout);
+        burnprof::Get().on = false;
+        g_burnNpcDone = true;
+      }
+    };
+  }
   // Respawn out of an open inventory hands the cursor back to the window:
   // `captureBeforeUi`, glfwSetInputMode and the cursor-position reset are all
   // the WINDOW's, and there is no window on the authority side.
@@ -9745,6 +9936,7 @@ int main(int argc, char** argv) {
       static const bool noReload =
           std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire ||
           g_burnHouse ||
+          g_burnNpc ||
           g_shotDialogue ||  // the reload would wipe the listener it spawned
           g_shotEditor ||    // ...or the house it placed
           g_shotSpawn;       // (a picture, not a reload test: the compile would own the run)
@@ -9756,7 +9948,7 @@ int main(int argc, char** argv) {
     }
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
-    if (g_parkDone || g_forestFireDone || g_burnHouseDone)
+    if (g_parkDone || g_forestFireDone || g_burnHouseDone || g_burnNpcDone)
       glfwSetWindowShouldClose(window, 1);
 
     // --shot-jump: decide whether THIS frame is one of the four pictures.

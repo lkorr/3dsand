@@ -5427,6 +5427,39 @@ neighbors, so this needs an explicit connectivity pass:
   (p99 3.8), debris 1.1, Jolt step mean 1.75 / max 5.8; the frame is then
   GPU-bound on the fire itself (`rm_world` ~9 ms, `ca` ~7 ms a tick at ~4k
   awake chunks — the forest-fire smoke cost, not the bodies).
+- **A clothed body catching fire (2026-09-30).** Owner report: "when someone
+  with a bunch of clothes on catches fire the framerate plummets to ~4 fps for
+  a second or two". Harness `--frames 100000 --burn-npc` (main.cpp: spawns
+  `SANDVOX_BURN_NPCS` humans, default 1, 4 m ahead in hood/robe/trousers/
+  shoes/sash — `SANDVOX_BURN_NAKED=1` is the bare arm — soaks their boxes in
+  fire for `SANDVOX_BURN_SOAK` ticks, and prints a 30-tick timeline of frame
+  p50/max beside the mob tick's own breakdown, `game/burnprof.h`: the worst
+  tick, every burn phase, and the seeding counters). Measured: ONE dressed
+  human cost 8-10 ms of CPU a tick, 5.4 ms of it in `BurnOneLimb`'s
+  world-contact SEEDING — ~200,000 face samples a tick (27 ns each, a
+  quaternion apiece) that queued ~6k new candidates into a pool of ~28k of
+  which the front budget then evaluated 6k. The front budget is shared; the
+  seeding cap (`kBurnSeedProbes`, 32,768) was PER LIMB, so it multiplied with
+  every garment shell (a dressed human is ~30 burning limbs, a bare one ~15)
+  and every creature: four dressed humans 26-29 ms a tick, frames 91-159 ms in
+  the catch-up spiral. Three changes, all in the seeding: (1) the S×S samples
+  are an affine grid, so one rotation per face instead of one per sample;
+  (2) a face whose lattice-space footprint holds no voxel is skipped without
+  sampling (exact; 87% of samples were landing on air — a limb is a tube in a
+  box, a garment a skin around a hollow); (3) a limb seeds at most
+  `kBurnSeedPerFront` (8) samples per candidate its share of the front budget
+  can evaluate (floor `kBurnSeedFloor`, 256), from a tick-keyed rotation of
+  the hot-cell list so a bounded pass does not always light a limb bottom-up.
+  A limb with no burn weight of its own (acid contact, first ignition) is
+  offered the whole remaining pot by `BurnShareOf`, so its seeding is as
+  before; the armour march is skipped for a sample whose cell is already a
+  candidate (`queue` would refuse it anyway). After: one dressed human 3.5-4.5
+  ms a tick, four 6.5 ms, frames 13 ms p50 / ~20 max. The burn does not slow
+  (`mob-burn` subchecks identical to the old seeding in one binary; the
+  `burn terminates` front falls further, 1281 -> 447 vs 1267 -> 683).
+  What is left per dressed body: the candidate loop ~1.4 ms (6k candidates
+  at 0.23 µs, of the shared pot — it does not multiply), seeding ~0.7,
+  cross-limb heat ~0.25.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

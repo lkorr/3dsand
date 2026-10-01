@@ -7534,6 +7534,11 @@ class MobSystem {
   // contact faces — seeds its whole wetted surface in one tick instead of a
   // tenth of it, which is what it was doing while this shared kBurnScanCells.
   static constexpr uint32_t kBurnSeedProbes = 32768;
+  // ...but never more than kBurnSeedPerFront per candidate the limb's share
+  // of the front budget can evaluate this tick (floored so a limb handed a
+  // sliver still seeds a little). See BurnOneLimb's seeding note.
+  static constexpr uint32_t kBurnSeedPerFront = 8;
+  static constexpr uint32_t kBurnSeedFloor = 256;
   // Ticks a cold limb keeps its dense index before releasing it, so a limb
   // walking through a campfire does not rebuild the index every other tick.
   static constexpr uint32_t kBurnIndexGrace = 30;

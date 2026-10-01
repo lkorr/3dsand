@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/burnprof.h"
 #include "game/item.h"
 #include "game/anatomy_resolve.h"
 #include "game/dye.h"
@@ -7685,6 +7686,8 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
 void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                         std::vector<CellOp>& cellOps,
                         std::vector<ParticleSpawn>& spawns) {
+  burnprof::EndTick(tick);
+  burnprof::Scope bpScope(burnprof::kPreTick);
   const float dt = 1.0f / 30.0f;
   // The clock a rising is booked against (Mob::Die runs from inside a damage
   // path, which has no tick to hand).
@@ -10026,6 +10029,7 @@ uint32_t Mob::SurfaceCount(const MobLimb& limb,
 }
 
 void Mob::RecountBurn(uint32_t tick, bool force) {
+  burnprof::Scope bpScope(burnprof::kRecount);
   // A corpse's burnt fraction is still MEASURED (the gates and the HUD read
   // it); only the cap's consequence — ApplyBurnCap's hp clamp and death — is
   // the living's.
@@ -10829,10 +10833,12 @@ Mob::HairTuckProbe Mob::ProbeHairTuck() const {
 }
 
 void MobSystem::SyncHairTuck() {
+  burnprof::Scope bpScope(burnprof::kHairTuck);
   for (Mob& mob : mobs_) mob.SyncHairTuck();
 }
 
 void MobSystem::PostStep() {
+  burnprof::Scope bpScope(burnprof::kPostStep);
   for (Mob& mob : mobs_) {
     if (mob.rigReleased_) continue;   // a husk owns no bodies
     // AN ASLEEP CORPSE IS NOT READ BACK, clamped or re-dressed: nothing moved,
@@ -11044,6 +11050,7 @@ int Mob::ContactLimbNear(Vec3 worldVoxel) const {
 
 int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
                                   std::vector<ParticleSpawn>& spawns) {
+  burnprof::Scope bpScope(burnprof::kContact);
   const Tuning::Gore& gt = CurrentTuning().gore;
   if (gt.contactHpPerImpulse <= 0.0f || gt.contactMaxPerTick <= 0) return 0;
   struct Hit {
@@ -13021,6 +13028,7 @@ constexpr uint32_t kCrossHeatFrontPerLimb = 768;
 }  // namespace
 
 void Mob::BuildCrossLimbHeat(uint32_t tick) {
+  burnprof::Scope bpScope(burnprof::kCrossHeat);
   crossHeat_.clear();
   if (!sys_ || limbs_.size() < 2) return;  // one limb has nothing to cross to
   // Cheap exit before any view is built: nothing alight anywhere (rule 2).
@@ -13136,6 +13144,7 @@ void MobSystem::BuildCrossHeat(const std::vector<BurnLimbView*>& parts,
 }
 
 void MobSystem::BuildBurnIndex(BurnLimbView& v) {
+  burnprof::Scope bpScope(burnprof::kIndex);
   BodyBurnState& st = *v.burn;
   const size_t n = v.Size();
   st.idx.clear();
@@ -14254,6 +14263,7 @@ Physics::JointDesc Mob::RigJointDesc(int child, int parent, Vec3 anchorW) const 
 }
 
 bool Mob::RebuildLimbBody(int limbIndex) {
+  burnprof::Scope bpScope(burnprof::kRebuild);
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body || limb.voxels.empty()) return false;
   const MobDef& def = *def_;
@@ -14533,6 +14543,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                           std::vector<ParticleSpawn>& spawns, bool eject,
                           const LimbCarveFactory& carveAt,
                           const CarveSpall* spall, CarveReport* report) {
+  burnprof::Scope bpScope(burnprof::kCarve);
   if (report) *report = CarveReport{};
   // WHAT THIS CAUSE MAY DO TO THIS SLOT (game/severpolicy.h). Taken once: the
   // slot's tissue is a fact about the rig slot, which nothing below changes.
@@ -15395,6 +15406,7 @@ void Mob::StripBurnTombstones(MobLimb& limb) {
 
 bool Mob::FlushBurn(int limbIndex, const DamageCtx& ctx, World& world,
                           std::vector<ParticleSpawn>& spawns, bool force) {
+  burnprof::Scope bpScope(burnprof::kFlush);
   MobLimb& limb = limbs_[limbIndex];
   if (limb.burn.removed == 0) return true;
   const MobDef& def = *def_;
@@ -15594,6 +15606,7 @@ uint32_t Mob::Ignite(int limbIndex, uint32_t count, uint32_t onlyMat) {
 bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                             World& world, std::vector<CellOp>& cellOps,
                             uint32_t& frontBudget, uint32_t& opsBudget) {
+  burnprof::Scope bpScope(burnprof::kBurnOne);
   bool changed = false;
   if (!BurnTablesReady() || v.Size() == 0 || frontBudget == 0) return false;
   BodyBurnState& st = *v.burn;
@@ -15859,6 +15872,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   st.sleepKey = 0;
   scanHot.clear();
   {
+    burnprof::Scope bpWalk(burnprof::kWalk);
     uint32_t seen = 0;
     for (int y = lo.y; y <= hi.y && seen < kBurnScanCells; y++)
       for (int z = lo.z; z <= hi.z && seen < kBurnScanCells; z++)
@@ -16016,6 +16030,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // volume-exact: 64 independent rolls on 1/64-volume voxels remove the
   // same matter per tick as one roll on one grid voxel.
   if (!scanHot.empty()) {
+    burnprof::Scope bpSeed(burnprof::kSeed);
     const int S = std::min<int>((int)v.scale, kBurnFaceSamplesMax);
     // Its OWN budget, not the world-scan's. These count two different things —
     // kBurnScanCells bounds how many world CELLS are looked at, this bounds how
@@ -16024,8 +16039,29 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // catch this tick". With the face cull below in place a limb in acid spends
     // these on faces that really do touch it, so the ceiling is now reached
     // only by a body genuinely submerged.
-    uint32_t probes = kBurnSeedProbes;
-    for (const IVec3& c : scanHot) {
+    //
+    // ...AND NO MORE THAN THE LIMB CAN EVALUATE. Each seed is one candidate,
+    // and the loop below evaluates at most `frontBudget` of them (this limb's
+    // share of the shared pot). Measured on one burning dressed human: ~100k
+    // samples a tick queued ~6k new seeds into a pool of ~28k candidates of
+    // which 6k were evaluated -- three quarters of the seeding was for
+    // candidates the budget then skipped, and because the cap was PER LIMB
+    // the waste multiplied with every garment shell and every creature in the
+    // fire (rule 2: the pot bounded the work, not the search for it).
+    // kBurnSeedPerFront samples per evaluable candidate is ~0.4-0.8 new seeds
+    // per slot at the measured hit rate: enough to keep the window full.
+    uint32_t probes = (uint32_t)std::min<uint64_t>(
+        kBurnSeedProbes,
+        std::max<uint64_t>(kBurnSeedFloor, (uint64_t)frontBudget * kBurnSeedPerFront));
+    const uint32_t probes0 = probes;
+    // A bounded pass must not always spend itself on the same cells:
+    // scanHot is in world y-major order, so a fixed start would light a limb
+    // from the bottom up. Start at a tick-keyed rotation, as the candidate
+    // loop does (deterministic: tick and limb key only).
+    const size_t nHot = scanHot.size();
+    const size_t hot0 = (size_t)(Hash3(limbKey, tick, 0x5EED0u) % (uint32_t)nHot);
+    for (size_t hj = 0; hj < nHot; hj++) {
+      const IVec3& c = scanHot[(hot0 + hj) % nHot];
       if (!probes) break;
       for (const IVec3& d : kBurnDirs) {
         const IVec3 nb{c.x + d.x, c.y + d.y, c.z + d.z};
@@ -16055,20 +16091,64 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // lattice box entirely, none of them can seed anything. Conservative in
         // the safe direction — it can only ever admit a face that has no
         // voxels, never reject one that has.
+        const Vec3 lc = RotateInv(q, fc - v.xf->pos) * (float)v.scale;
         {
-          const Vec3 lc = RotateInv(q, fc - v.xf->pos) * (float)v.scale;
           const float r = (float)v.scale * 0.5f + 1.0f;
           if (lc.x < (float)bm.x - r || lc.x > (float)(bm.x + bd.x) + r ||
               lc.y < (float)bm.y - r || lc.y > (float)(bm.y + bd.y) + r ||
               lc.z < (float)bm.z - r || lc.z > (float)(bm.z + bd.z) + r)
             continue;
         }
+        // ---- THE SAMPLES ARE AN AFFINE GRID: ONE ROTATION, NOT S*S ----------
+        //
+        // Owner report 2026-09-30, "a clothed NPC catching fire drops the game
+        // to 4 fps": this loop was ~200,000 samples a tick for ONE burning
+        // human (body + garment shells, each to kBurnSeedProbes), 27 ns
+        // apiece, 5.4 of the tick's 8.4 ms (--burn-npc). Every sample paid a
+        // full quaternion RotateInv, but p is fc + u*s + w*t and RotateInv is
+        // linear, so the image is lc + U*s + W*t with U, W rotated once per
+        // face. Same lattice cell up to float rounding on a boundary.
+        const Vec3 U = RotateInv(q, u) * (float)v.scale;
+        const Vec3 W = RotateInv(q, w) * (float)v.scale;
+        // ---- AN EMPTY FOOTPRINT SEEDS NOTHING ------------------------------
+        //
+        // The box cull above passes every face inside the lattice's BOX, and
+        // most of a box is air: a limb is a rounded tube, and a garment shell
+        // is a thin skin around a hollow. 87% of samples landed on nothing.
+        // The samples all lie in the lattice-space box spanned by the face's
+        // four corners (+-U/2 +-W/2 about lc), so if no cell of that box (a
+        // ~(S+2)^2 x 2 slab) holds a voxel, none of them can seed anything --
+        // exact, and a few hundred index reads instead of S*S transforms.
+        {
+          const float ex = 0.5f * (std::fabs(U.x) + std::fabs(W.x));
+          const float ey = 0.5f * (std::fabs(U.y) + std::fabs(W.y));
+          const float ez = 0.5f * (std::fabs(U.z) + std::fabs(W.z));
+          const int x0 = std::max(ifloor(lc.x - ex) - bm.x, 0);
+          const int x1 = std::min(ifloor(lc.x + ex) - bm.x, bd.x - 1);
+          const int y0 = std::max(ifloor(lc.y - ey) - bm.y, 0);
+          const int y1 = std::min(ifloor(lc.y + ey) - bm.y, bd.y - 1);
+          const int z0 = std::max(ifloor(lc.z - ez) - bm.z, 0);
+          const int z1 = std::min(ifloor(lc.z + ez) - bm.z, bd.z - 1);
+          // A face turned well off every axis spans a fat box; past 4*S*S
+          // reads the test costs more than the samples, so just sample.
+          const int64_t vol = (int64_t)std::max(0, x1 - x0 + 1) *
+                              std::max(0, y1 - y0 + 1) * std::max(0, z1 - z0 + 1);
+          bool any = vol > 4 * S * S;
+          for (int zz = z0; zz <= z1 && !any; zz++)
+            for (int yy = y0; yy <= y1 && !any; yy++) {
+              const uint32_t* row =
+                  st.idx.data() + ((size_t)zz * bd.y + yy) * bd.x;
+              for (int xx = x0; xx <= x1; xx++)
+                if (row[xx] != 0) { any = true; break; }
+            }
+          if (!any) continue;
+        }
         for (int a = 0; a < S && probes; a++)
           for (int b = 0; b < S && probes; b++) {
             probes--;
-            const Vec3 p = fc + u * (((float)a + 0.5f) / (float)S - 0.5f) +
-                           w * (((float)b + 0.5f) / (float)S - 0.5f);
-            const Vec3 l = RotateInv(q, p - v.xf->pos) * (float)v.scale;
+            const float sa = ((float)a + 0.5f) / (float)S - 0.5f;
+            const float sb = ((float)b + 0.5f) / (float)S - 0.5f;
+            const Vec3 l = lc + U * sa + W * sb;
             const uint32_t seed = cellOf({ifloor(l.x), ifloor(l.y),
                                           ifloor(l.z)});
             // RESOLVE THE CELL FIRST. Most face samples land on nothing — the
@@ -16078,6 +16158,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             // below meaningless: 15,640 "passed" samples turned out to be
             // overwhelmingly samples that seeded nothing at all.
             if (seed == kNoBurnCell || st.idx[seed] == 0) continue;
+            burnprof::Count(burnprof::kSeedHits, 1);
+            // Already a candidate: queue() would refuse it, so whether a coat
+            // covers it is moot -- and the march was most of the cost of a
+            // dressed body's seeding.
+            if (st.idx[seed] & kBurnQueued) continue;
             // ARMOUR, half one: THE FIRE IS TOUCHING THE ROBE, NOT THE ARM.
             //
             // Asked BACKWARDS, from the sample point toward the hot cell,
@@ -16087,16 +16172,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             // limb it lands INSIDE the flesh, past a shell that is exactly
             // where it should be.
             if (v.occlude) {
+              const Vec3 p = fc + u * sa + w * sb;
               if (v.WornAlong(p, dv * -1.0f, kWornSeedReach)) {
                 wornStats_.seedsBlocked++;
                 continue;
               }
               wornStats_.seedsPassed++;
             }
+            burnprof::Count(burnprof::kSeedNew, 1);
             queue(seed);
           }
       }
     }
+    burnprof::Count(burnprof::kSeedProbes, probes0 - probes);
   }
 
   // ---- A CORROSIVE COAT SEEDS ITS OWN VOXELS -----------------------------
@@ -16305,8 +16393,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // only on the ticks the budget happened to reach them. Starting at a
   // tick-keyed offset spreads a short budget over the whole surface instead.
   const size_t nCand = cand.size();
+  burnprof::Count(burnprof::kCandidates, nCand);
+  const uint32_t frontAtLoop = frontBudget;
   const size_t cand0 =
       nCand ? (size_t)(Hash3(limbKey, tick, 0xCA2D0u) % (uint32_t)nCand) : 0;
+  burnprof::Scope bpCand(burnprof::kCandLoop);
   for (size_t cj = 0; cj < nCand; cj++) {
     const uint32_t cell = cand[(cand0 + cj) % nCand];
     if (frontBudget == 0) {
@@ -17081,6 +17172,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       }
     }
   }
+  bpCand.Stop();
+  burnprof::Count(burnprof::kEvaluated, frontAtLoop - frontBudget);
 
   // ---- WHAT A REMOVAL BARES IS BLOODY (materials.json `bareBlood`) --------
   //
@@ -17230,6 +17323,7 @@ static inline void BurnShareOf(uint32_t frontPot, uint32_t opsPot, uint64_t w,
 void MobSystem::BurnLimbs(uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns) {
+  burnprof::Scope bpScope(burnprof::kBurnLimbs);
   if (!BurnTablesReady() || mobs_.empty()) return;
   // Rotate the start creature by tick, for the reason Mob::BurnTick rotates
   // its start limb: a shared budget spent in a fixed order starves the tail.
@@ -19021,6 +19115,7 @@ uint32_t MobSystem::FleshWornAlong(
 void MobSystem::BurnDeadFlesh(uint32_t tick, World& world,
                               std::vector<CellOp>& cellOps,
                               std::vector<ParticleSpawn>& spawns) {
+  burnprof::Scope bpScope(burnprof::kDeadFlesh);
   if (!debris_ || !BurnTablesReady()) return;
   const uint32_t crossPct =
       (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
@@ -27275,6 +27370,7 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
 int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
                         float dist, int maxSteps, uint32_t* outMat,
                         Vec3* outAt) {
+  burnprof::Scope bpScope(burnprof::kWorn);
   if (outMat) *outMat = 0;
   if (worn_.empty() || bodyLimb < 0) return -1;
   for (WornPiece& piece : worn_) {
