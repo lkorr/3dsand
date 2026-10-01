@@ -269,6 +269,16 @@ std::vector<uint8_t> UnionDepth(const Prefab& prefab,
 
 // ---- the resolve ------------------------------------------------------------
 
+std::vector<bool> BodyModels(const Prefab& prefab, const nlohmann::json& recipe) {
+  std::vector<bool> include(prefab.models.size(), true);
+  for (size_t mi = 0; mi < prefab.models.size(); mi++) {
+    const std::vector<Layer> ls = LayersFor(recipe, prefab.models[mi].name);
+    include[mi] = ls.empty() || !std::all_of(ls.begin(), ls.end(),
+                                             [](const Layer& l) { return l.keep; });
+  }
+  return include;
+}
+
 Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
                const std::vector<MaterialDef>& mats, const std::string& where,
                std::string& log) {
@@ -294,12 +304,7 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
   const size_t sy = (size_t)dim.x, sz = (size_t)dim.x * dim.y;
   // A KEEP-ONLY LIMB IS NOT BODY (anatomy.js planAnatomy says why): hair
   // lying on the scalp would otherwise bury it and push the skull inward.
-  std::vector<bool> include(prefab.models.size(), true);
-  for (size_t mi = 0; mi < prefab.models.size(); mi++) {
-    const std::vector<Layer> ls = LayersFor(recipe, prefab.models[mi].name);
-    include[mi] = ls.empty() || !std::all_of(ls.begin(), ls.end(),
-                                             [](const Layer& l) { return l.keep; });
-  }
+  const std::vector<bool> include = BodyModels(prefab, recipe);
   const std::vector<uint8_t> depth = UnionDepth(prefab, &include);
 
   // GARMENTS: surface voxels that are CLOTHING, not body. The voxel directly

@@ -1095,6 +1095,30 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // One hit per body per swing tick: without this the same limb is carved once
   // per probe and a single cut removes a whole arm.
   std::vector<uint64_t> hitBodies;
+  // ...KEYED ON WHAT WAS STRUCK, NOT ON ITS HANDLE (2026-10-01). A carve
+  // rebuilds a limb's collider under a NEW handle (Mob::RebuildLimbBody), so
+  // the next probe down the same edge met a "new" body and cut the limb again
+  // in the same tick -- and moved the coat again (venom-blade measured three
+  // exchanges a swing). The same hole let a stab re-stab on the next tick of
+  // its stroke (EdgeSweep::struck; blade-wounds' "held +2"). A creature's slot
+  // is keyed on (creature, slot NAME), loose matter on its global id.
+  auto strikeKey = [&](uint64_t body) -> uint64_t {
+    int sl = -1;
+    if (Mob* o = mobs.FindOwner(body, &sl); o != nullptr && sl >= 0) {
+      uint64_t h = 1469598103934665603ull;
+      for (char ch : o->SlotName(sl)) h = (h ^ (uint8_t)ch) * 1099511628211ull;
+      return ((o->Id() * 0x9E3779B97F4A7C15ull) ^ h) | (1ull << 63);
+    }
+    const uint64_t g = debris.GlobalIdOf(body);
+    return g != 0 ? (g & ~(1ull << 63)) : body;
+  };
+  std::vector<uint64_t> hitKeys;
+  auto keySeen = [&](uint64_t body) {
+    const uint64_t k = strikeKey(body);
+    for (uint64_t h : hitKeys)
+      if (h == k) return true;
+    return false;
+  };
   // Every body the wielder still owns: its limbs, its worn shells and whatever
   // is in its fist. Handed to every probe so a ray that begins inside the
   // creature swinging it passes straight out (see the note in the loop).
@@ -1205,9 +1229,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         continue;
       }
       out.probesBody++;
-      bool seen = false;
-      for (uint64_t h : hitBodies) seen |= (h == hb);
-      if (seen) continue;
+      if (keySeen(hb)) continue;
       Vec3 at = p + dir * (frac * probe);
 
       // A PROBE THAT DID FIND A WEAPON. The geometric test above is what
@@ -1322,15 +1344,14 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
             shell >= 0 ? mobs.LimbBody(owner->Id(), shell) : 0ull;
         if (sb != 0ull) {
           out.probesCovered++;
-          bool shellSeen = false;
-          for (uint64_t h : hitBodies) shellSeen |= (h == sb);
-          if (shellSeen) continue;   // the plate already took this swing
+          if (keySeen(sb)) continue;   // the plate already took this swing
           hb = sb;
           at = coverAt;
           kind = StruckKind::Shell;
         }
       }
       hitBodies.push_back(hb);
+      hitKeys.push_back(strikeKey(hb));
       // ---- WHAT THE COAT EXCHANGE WILL NEED, TAKEN NOW (DESIGN.md §7) -----
       // The struck slot by (creature, index, name) rather than by handle: any
       // resolver below that carves rebuilds the body and the handle changes.
@@ -1436,25 +1457,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // another full depth. `parts` is therefore built first.
       StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
                                            power, out.tipSpeed, hitSeed);
-      // KEYED ON WHAT WAS STRUCK, NOT ON ITS BODY HANDLE (2026-10-01). A carve
-      // rebuilds a limb's collider under a NEW handle (Mob::RebuildLimbBody),
-      // so the stab that bored the limb on tick 1 met a "new" body on tick 2
-      // and stabbed it again -- `blade-wounds`' "held blade stabbed again
-      // (held +2)", red since the stab landed, and the same hole let a mace
-      // re-dent a plate its first dent had rebuilt. A creature's slot is keyed
-      // on (creature, slot NAME); loose matter on its global id (stable across
-      // DebrisSystem's rebuilds too).
-      auto strikeKey = [&](uint64_t body) -> uint64_t {
-        int sl = -1;
-        if (Mob* o = mobs.FindOwner(body, &sl); o != nullptr && sl >= 0) {
-          uint64_t h = 1469598103934665603ull;
-          for (char ch : o->SlotName(sl))
-            h = (h ^ (uint8_t)ch) * 1099511628211ull;
-          return ((o->Id() * 0x9E3779B97F4A7C15ull) ^ h) | (1ull << 63);
-        }
-        const uint64_t g = debris.GlobalIdOf(body);
-        return g != 0 ? (g & ~(1ull << 63)) : body;
-      };
+      // KEYED ON WHAT WAS STRUCK (strikeKey above), NOT ON ITS BODY HANDLE: a
+      // carve rebuilds the limb under a new handle, and the stab that bored it
+      // on tick 1 then met a "new" body on tick 2 and stabbed it again.
       bool firstContact = true;
       if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f ||
                                   (s.strike.cut > 0.0f && parts.cut.stab))) {
@@ -1542,11 +1547,10 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
                                                   back * -1.0f, kCoverReach, cf);
           if (cover != 0ull && cover != hb &&
               debris.WornHostOf(cover) == hb) {
-            bool coverSeen = false;
-            for (uint64_t h : hitBodies) coverSeen |= (h == cover);
-            if (coverSeen) continue;   // the plate already took this swing
+            if (keySeen(cover)) continue;   // the plate already took this swing
             out.probesCovered++;
             hitBodies.back() = cover;
+            hitKeys.back() = strikeKey(cover);
             hb = cover;
             at = at + back * (kCoverReach * (1.0f - cf));
           }

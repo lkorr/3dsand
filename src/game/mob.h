@@ -969,7 +969,22 @@ struct BurnLimbView {
   // The blood a voxel BARED by a removal here may be left wearing (materials
   // .json `bareBlood`: bone). The creature's smear material on a live limb, a
   // corpse piece's bleedMat; 0 = nothing bleeds here (debris, a bloodless def).
+  // Read through BareBlood(): on a creature's limb it is RESOLVED LAZILY
+  // (2026-10-01). The answer is Mob::LimbFluid, a walk of the whole lattice,
+  // and Mob::ViewOf computed it for every view it built -- every burn, stain,
+  // wet and infection visit of every limb, every tick -- for a value read
+  // only when a removal bares bone.
   uint32_t bareBloodMat = 0;
+  uint32_t (*bareFn)(const void* ctx, int limb) = nullptr;
+  const void* bareCtx = nullptr;
+  int bareLimb = -1;
+  uint32_t BareBlood() {
+    if (bareFn) {
+      bareBloodMat = bareFn(bareCtx, bareLimb);
+      bareFn = nullptr;
+    }
+    return bareBloodMat;
+  }
   // ---- WHAT A LEAVING VOXEL'S OWN MATTER LOOKS LIKE IN THE GRID -----------
   // The state nibble a non-solid product takes when this voxel's matter leaves
   // the body into the world (ash off a burning robe): given the product, the
@@ -7275,16 +7290,19 @@ class MobSystem {
   struct InfectCost {
     uint64_t sweeps = 0, limbSteps = 0;
     double ms = 0.0;
+    double selectMs = 0.0;   // finding the cells: the sweep, or the list
+    double ruleMs = 0.0;     // the per-cell rule over them
   };
   InfectCost InfectCostStats() const {
-    return InfectCost{infectSweeps_, infectLimbSteps_, infectMs_};
+    return InfectCost{infectSweeps_, infectLimbSteps_, infectMs_,
+                      infectSelectMs_, infectRuleMs_};
   }
   void ResetInfectCost() {
     infectSweeps_ = infectLimbSteps_ = 0;
-    infectMs_ = 0.0;
+    infectMs_ = infectSelectMs_ = infectRuleMs_ = 0.0;
   }
   uint64_t infectSweeps_ = 0, infectLimbSteps_ = 0;
-  double infectMs_ = 0.0;
+  double infectMs_ = 0.0, infectSelectMs_ = 0.0, infectRuleMs_ = 0.0;
   // The pre-2026-10-01 cost model, for the A/B: every InfectStep re-derives
   // its cell list with a whole-lattice sweep. Same outcome cell for cell.
   bool infectFullSweep_ = false;

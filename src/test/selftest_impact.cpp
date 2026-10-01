@@ -1693,7 +1693,7 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     BiteOnce(mobs, c.world, id, t.limb, at, 4.0f, (uint16_t)rotMat,
              (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
     r.rot0 = mobs.LimbMaterialCount(id, t.limb, rotMat);
-    r.vox0 = mobs.LimbArtVoxelCount(id, t.limb);
+    r.vox0 = LiveVoxels(mobs, id, t.limb);
     if (boneMat) r.bone0 = mobs.LimbStainedMatCount(id, t.limb, boneMat, 1);
     // SEEDED, not left at 0: the per-tick step below diffs against the previous
     // reading, and starting from zero would score the bite's own 65 voxels as
@@ -1714,7 +1714,8 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
       // `bite-rot`'s reason: reading after a collapse measures a stump.
       const uint32_t was = r.rot1;
       r.rot1 = mobs.LimbMaterialCount(id, t.limb, rotMat);
-      r.vox1 = mobs.LimbArtVoxelCount(id, t.limb);
+      // Tombstones excluded: a per-voxel eat is flushed in batches.
+      r.vox1 = LiveVoxels(mobs, id, t.limb);
       // Read every tick, for the reason the two above are: the last reading
       // taken while the limb was STILL ON is the one that means anything, and
       // a count taken after a collapse-sever is a count of a stump.
@@ -2896,6 +2897,26 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
       BiteOnce(mobs, c.world, both, bothLimb, at, 4.0f, (uint16_t)rotMat,
                (uint16_t)ichorMat, 1.0f, 0xB0B0u, spawns);
       bothBitten = mobs.LimbMaterialCount(both, bothLimb, rotMat);
+      // ...and the venom's own pit on the FAR side of the same limb, as arm A
+      // has. A bite's wall is rot now (the rewrite reaches the wall it tore,
+      // 2026-10-01), and rot is not soft tissue: venom poured into the bite
+      // itself finds nothing to seed, which is the infections' diets doing
+      // their job, not a failure to coexist.
+      Vec3 far = at;
+      float farD = -1.0f;
+      for (uint32_t k = 0; k < 96; k++) {
+        const Vec3 p = mobs.LimbVoxelPos(both, bothLimb, k * 7919u + 13u);
+        const float t = (p - ax.anchor).dot(ax.along);
+        if (t < ax.reach * 0.33f || t > ax.reach * 0.66f) continue;
+        const float d = (p - at).len();
+        if (d > farD) {
+          farD = d;
+          far = p;
+        }
+      }
+      mobs.CarveLimbRadial(mobs.LimbBody(both, bothLimb), far, kRadius, false,
+                           false, c.world, spawns,
+                           DamageCtx(DamageCause::SpawnRot));
     }
   }
 
@@ -3316,7 +3337,7 @@ Status GateInfectPerf(Ctx& c, std::string& detail) {
   }
   const Tuning saved = CurrentTuning();
   struct Out {
-    double ms = 0.0;
+    double ms = 0.0, selectMs = 0.0, ruleMs = 0.0;
     uint64_t sweeps = 0, steps = 0;
     uint32_t cells = 0, eaten = 0, spread = 0, bitten = 0;
     int mobs = 0;
@@ -3366,6 +3387,8 @@ Status GateInfectPerf(Ctx& c, std::string& detail) {
     }
     const MobSystem::InfectCost cost = mobs.InfectCostStats();
     o.ms = cost.ms;
+    o.selectMs = cost.selectMs;
+    o.ruleMs = cost.ruleMs;
     o.sweeps = cost.sweeps;
     o.steps = cost.limbSteps;
     for (uint64_t id : crowd) {
@@ -3402,19 +3425,24 @@ Status GateInfectPerf(Ctx& c, std::string& detail) {
            x.bitten == y.bitten;
   };
   const bool same = sameOut(ia, ib) && sameOut(a, b);
-  const bool cheaper = b.ms <= a.ms * kMaxRatio;
+  // THE PHASE THAT CHANGED is finding the cells; the rule over them and the
+  // flush are the same work in both arms (and the same outcome).
+  const bool cheaper = b.selectMs <= a.selectMs * kMaxRatio && b.ms <= a.ms;
   const bool bit = a.bitten > 0 && a.steps > 0 && ia.eaten > 0;
   detail = Format(
       "%d humans x %zu bitten limbs (%u rot at the bite), %d ticks | AT x%.0f "
       "(identity): full %u rot / %u eaten / %u spread, list %u / %u / %u, "
       "%.1f -> %.1f ms | AT x%.0f (cost): FULL SWEEP %.2f ms over %llu "
       "limb-steps (%.1f us each, %llu sweeps), CELL LIST %.2f ms (%.1f us "
-      "each, %llu sweeps) = %.0f%% | outcome %s",
+      "each, %llu sweeps) = %.0f%%; finding the cells %.2f -> %.2f ms "
+      "(%.0f%%), the rule %.2f -> %.2f ms | outcome %s",
       a.mobs, bitLimbs.size(), a.bitten, kTicks, kIdCrank, ia.cells, ia.eaten,
       ia.spread, ib.cells, ib.eaten, ib.spread, ia.ms, ib.ms, kCrank, a.ms,
       (unsigned long long)a.steps, perStepA, (unsigned long long)a.sweeps, b.ms,
       perStepB, (unsigned long long)b.sweeps,
-      a.ms > 0.0 ? 100.0 * b.ms / a.ms : 0.0, same ? "IDENTICAL" : "DIFFERS");
+      a.ms > 0.0 ? 100.0 * b.ms / a.ms : 0.0, a.selectMs, b.selectMs,
+      a.selectMs > 0.0 ? 100.0 * b.selectMs / a.selectMs : 0.0, a.ruleMs,
+      b.ruleMs, same ? "IDENTICAL" : "DIFFERS");
   if (!bit) return (detail = "the crowd was not infected: " + detail, Status::Fail);
   if (!same) return (detail = "the cell list changed the outcome: " + detail, Status::Fail);
   if (!cheaper)

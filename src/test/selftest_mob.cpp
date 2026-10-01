@@ -234,9 +234,21 @@ Status GateAnatomyParity(Ctx& c, std::string& detail) {
     if (surfaceId <= 0) continue;
     Prefab bare = disk;
     {
-      const std::vector<uint8_t> d = anatomy::UnionDepth(bare);
+      // ONLY WHAT THE RESOLVE TREATS AS BODY, over ITS depth field
+      // (2026-10-01). The strip used to run over every model with the
+      // all-models depth, so a KEEP-ONLY limb -- hair, which Resolve leaves as
+      // painted and keeps out of the union (anatomy::BodyModels) -- had its
+      // interior stripped to skin and nothing put it back, and the hair lying
+      // on a scalp buried scalp voxels the resolve treats as surface: 11,170
+      // "mismatches" (first brug/hair: rebuilt skin, baked hair_white) that
+      // were the GATE disagreeing with the recipe, not the two
+      // implementations disagreeing with each other.
+      const std::vector<bool> body = anatomy::BodyModels(bare, j["anatomy"]);
+      const std::vector<uint8_t> d = anatomy::UnionDepth(bare, &body);
       const IVec3 dim = bare.size;
-      for (PrefabModel& m : bare.models)
+      for (size_t mi = 0; mi < bare.models.size(); mi++) {
+        if (!body[mi]) continue;
+        PrefabModel& m = bare.models[mi];
         for (PrefabVoxel& v : m.voxels) {
           const int px = v.x + m.offset.x, py = v.y + m.offset.y,
                     pz = v.z + m.offset.z;
@@ -248,6 +260,7 @@ Status GateAnatomyParity(Ctx& c, std::string& detail) {
           if (d[i] != 0 && d[i] != anatomy::kDepthEmpty)
             v.material = (uint16_t)surfaceId;
         }
+      }
     }
     // Into a THROWAWAY log: Resolve reports a non-zero rewrite count as news,
     // and here a non-zero count is the entire point of the arm.

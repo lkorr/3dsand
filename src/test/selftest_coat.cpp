@@ -593,7 +593,7 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
   // the limb's middle, fraction `u` of it at the limb, one tick of travel.
   auto strike = [&](Pair& p, Mob& w, const StrikeProfile& prof, float halfW,
                     float carve, float heft, float u, float len,
-                    bool selfMounted, uint32_t tick)
+                    bool selfMounted, uint32_t tick, Vec3* hitAt = nullptr)
       -> MobSystem::CoatContactResult {
     const LimbAxis ax = MeasureLimb(mobs, p.id, t.limb);
     const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
@@ -613,29 +613,19 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
     sw.selfMounted = selfMounted;
     sw.valid = true;
     std::vector<ParticleSpawn> spawns;
-    MeleeSweepDamage(sw, mt, w, c.phys, mobs, c.debris, c.world, spawns);
+    const EdgeSweepResult er =
+        MeleeSweepDamage(sw, mt, w, c.phys, mobs, c.debris, c.world, spawns);
+    if (hitAt) *hitAt = er.hasHitAt ? er.hitAt : Vec3{};
     return mobs.LastCoatContact();
   };
   // An open pit where the sweep will arrive: the target's surface on the side
   // the blow comes from (-travel), at the limb's middle -- a wound's flesh
   // laid open, nothing coated.
-  auto openPit = [&](Pair& p) -> bool {
-    const LimbAxis ax = MeasureLimb(mobs, p.id, t.limb);
-    const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
-    Vec3 best = mid;
-    float bestD = 1e9f;
-    for (uint32_t k = 0; k < 256; k++) {
-      const Vec3 q = mobs.LimbSurfacePos(p.id, t.limb, k * 7919u + 3u);
-      const Vec3 rel = q - mid;
-      if (std::fabs(rel.dot(ax.along)) > std::max(1.0f, ax.reach * 0.15f)) continue;
-      const float d = rel.dot(ax.travel);
-      if (d < bestD) {
-        bestD = d;
-        best = q;
-      }
-    }
+  // ...where a FIRST, clean blow of the same weapon landed (EdgeSweepResult::
+  // hitAt), so the coated blow that follows arrives in the pit it opened.
+  auto openPitAt = [&](Pair& p, Vec3 at) -> bool {
     std::vector<ParticleSpawn> spawns;
-    return mobs.CarveLimbRadial(mobs.LimbBody(p.id, t.limb), best,
+    return mobs.CarveLimbRadial(mobs.LimbBody(p.id, t.limb), at,
                                 (float)BaselineNumber("venomBladePitRadius", 0.35),
                                 false, false, c.world, spawns,
                                 DamageCtx(DamageCause::SpawnRot));
@@ -651,6 +641,20 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
     const Mob* m = mobs.FindMobById(id);
     const Mob::InfectStat* s = m ? m->InfectStatOf(infect) : nullptr;
     return s ? s->seeded : 0u;
+  };
+  // Where a coat landed, for the read-out: on soft tissue (what the infection
+  // can seed) or elsewhere (skin, bone, a blood-rewritten wall).
+  std::vector<uint8_t> soft(c.mats.size(), 0);
+  for (size_t m = 0; m < c.mats.size(); m++)
+    for (const std::string& tg : c.mats[m].tags)
+      if (tg == "soft_tissue") soft[m] = 1;
+  auto coatOnSoft = [&](uint64_t id, uint32_t& onSoft, uint32_t& elsewhere) {
+    onSoft = elsewhere = 0;
+    for (const PrefabVoxel& v : mobs.LimbLattice(id, t.limb)) {
+      if (!v.stain || BodyStainMat(v.stain) != venom) continue;
+      const uint32_t m = v.material & 0xFFFu;
+      (m < soft.size() && soft[m] ? onSoft : elsewhere)++;
+    }
   };
   uint32_t tickBase = 90000u;
   auto tickFor = [&](int n) {
@@ -738,16 +742,21 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
 
   // ---- C: the same mace into an open pit ----------------------------------
   Pair C;
-  uint32_t cTo = 0, cSeeded = 0;
+  uint32_t cTo = 0, cSeeded = 0, cSoft = 0, cElse = 0;
   bool cPit = false;
   if (Mob* w = spawnPair(C, mace)) {
-    cPit = openPit(C);
+    Vec3 hit{};
+    strike(C, *w, mace->strike, mace->edgeHalfWidth, mace->carveBonus,
+           mace->HeftFactor(g.woundHeftRef, g.woundHeftMax), 0.5f, 12.0f, false,
+           7290u, &hit);
+    cPit = openPitAt(C, hit);
     stageCoat(*w, C.wid, *mace);
     const MobSystem::CoatContactResult r =
         strike(C, *w, mace->strike, mace->edgeHalfWidth, mace->carveBonus,
                mace->HeftFactor(g.woundHeftRef, g.woundHeftMax), 0.5f, 12.0f,
                false, 7300u);
     cTo = r.toTarget;
+    coatOnSoft(C.id, cSoft, cElse);
     tickFor(seedTicks);
     cSeeded = seededOf(C.id);
   } else {
@@ -758,20 +767,24 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
 
   // ---- D: a venom-soaked fist into an open pit ----------------------------
   Pair D;
-  uint32_t dTo = 0, dSeeded = 0;
+  uint32_t dTo = 0, dSeeded = 0, dSoft = 0, dElse = 0;
   if (Mob* w = spawnPair(D, nullptr)) {
-    openPit(D);
     const MobDef& def = mobs.Defs()[t.defIndex];
     const int ni = def.FindNatural("fist.R");
     const MobNaturalWeaponDef* nw = w->NaturalWeapon(ni);
     if (nw && nw->partIndex >= 0) {
-      mobs.SoakLimb(D.wid, nw->partIndex, venom, 15u, 7400u);
       w->SetStrikeEffector(nw->partIndex, StrikeEffectorMode::Chain, ni);
       const float hw = std::max(nw->edgeHalfWidth, MetresToCells(0.10f));
+      Vec3 hit{};
+      strike(D, *w, w->StrikeProfileFor(*nw), hw, 0.0f, 1.0f, 0.5f, 2.0f, true,
+             7390u, &hit);
+      openPitAt(D, hit);
+      mobs.SoakLimb(D.wid, nw->partIndex, venom, 15u, 7400u);
       const MobSystem::CoatContactResult r =
           strike(D, *w, w->StrikeProfileFor(*nw), hw, 0.0f, 1.0f, 0.5f, 2.0f,
                  true, 7400u);
       dTo = r.toTarget;
+      coatOnSoft(D.id, dSoft, dElse);
       tickFor(seedTicks);
       dSeeded = seededOf(D.id);
     }
@@ -799,10 +812,11 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
       "%s/%s | A sword: stage coat %u levels, cut sent %u levels onto %u wall "
       "cells, seeded %u, peak %u, eaten %u, burnt out %s (%.0f s), %.1f hp to "
       "infection | B mace on skin: sent %u, seeded %u | C mace into a pit: "
-      "sent %u, seeded %u | D venom fist into a pit: sent %u, seeded %u%s",
+      "sent %u (coat on %u soft / %u other cells), seeded %u | D venom fist into "
+      "a pit: sent %u (%u soft / %u other), seeded %u%s",
       t.defName.c_str(), t.limbName.c_str(), aCoat, aToTarget, aWall, aSeeded,
       aPeak, aEaten, aBurnTicks >= 0 ? "yes" : "NO", burnSec, aHp, bTo, bSeeded,
-      cTo, cSeeded, dTo, dSeeded, why.c_str());
+      cTo, cSoft, cElse, cSeeded, dTo, dSoft, dElse, dSeeded, why.c_str());
   std::printf("venom-blade: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

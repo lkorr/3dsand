@@ -12464,12 +12464,17 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // over everything the blast searched.
     float tt;
     if (useCrater) {
-      // Measured from the WALL, not from the removed cells: every survivor is
-      // at least one cell from what the carve took, so `dc / rimL` put the
-      // wall itself at t = 2/3 and capped "near-certain at the cut" at 44%
-      // (2026-10-01, with the mottle recentred below). The wall is t = 0 and
-      // the soak reaches `rimL` past it.
-      const float dc = craterDist.At((int)lx, (int)ly, (int)lz) - 1.0f;
+      // AN INFECTION IS MEASURED FROM THE WALL (2026-10-01). Every survivor
+      // is at least one cell from what the carve took, so `dc / rimL` puts the
+      // wall itself at t = 2/3: a blood rewrite there is a mottle with the
+      // anatomy showing through (the look this soak is tuned for, and the
+      // flesh a later venom coat needs to find). An INFECTION is a material
+      // the teeth carry, not a look -- "a bite that reaches flesh at all
+      // infects it" -- so for one the wall is t = 0 and the rewrite reaches
+      // `rimL` past it. Measured: from the removed cells a full bite left 0-6
+      // rot on a human arm; from the wall, 50-90.
+      const float dc =
+          craterDist.At((int)lx, (int)ly, (int)lz) - (rewriteInfect ? 1.0f : 0.0f);
       if (dc >= rimL) return;
       tt = std::max(0.0f, dc) / rimL;
     } else {
@@ -13171,7 +13176,13 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   v.flipbook = &limb.flipbookModel;
   v.burn = &limb.burn;
   // What a bared voxel is left wearing is what THIS limb bleeds.
-  v.bareBloodMat = SmearMatFor(LimbFluid((int)(&limb - limbs_.data())));
+  // Resolved only when a removal bares something (BurnLimbView::BareBlood).
+  v.bareFn = [](const void* ctx, int li) -> uint32_t {
+    const Mob* m = static_cast<const Mob*>(ctx);
+    return m->SmearMatFor(m->LimbFluid(li));
+  };
+  v.bareCtx = this;
+  v.bareLimb = (int)(&limb - limbs_.data());
   // ---- the wound revert (BurnLimbView's note) -----------------------------
   // Armed only on a creature's OWN limbs, which is all this view is ever built
   // for; a severed limb has become debris and gets DebrisSystem's view, with
@@ -16637,7 +16648,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // SANDVOX_COAT_TRACE: a body voxel LEAVING (what bares the blood).
         static const bool trace = std::getenv("SANDVOX_COAT_TRACE") != nullptr;
         static int traced = 0;
-        if (trace && traced < 32 && v.bareBloodMat) {
+        if (trace && traced < 32 && v.BareBlood()) {
           traced++;
           const Vec3 wv = worldOf(p);
           std::printf("coat trace: LIVE limb %d (key %08x) voxel mat %u leaves as %u by %s at world "
@@ -16655,7 +16666,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       v.SetStain(i, 0);
       st.idx[cell] = 0;  // gone NOW, so neighbours see through it
       st.removed++;
-      if (v.bareBloodMat) bared.push_back(cell);
+      if (v.BareBlood()) bared.push_back(cell);
       // For life, and for the burn cap (Mob::RecountBurn) — but only if what
       // left was BURNING. This pass also runs dissolution, and acid eating raw
       // skin off a body is not a burn: counted, it made a dressed creature in
@@ -17520,7 +17531,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const uint16_t cur = v.Stain(bi);
         const uint16_t base = BodyStainAmt(cur) && corrodes(BodyStainMat(cur))
                                   ? (uint16_t)0 : cur;
-        const uint16_t next = RaiseBodyStain(base, v.bareBloodMat, bareAmt);
+        const uint16_t next = RaiseBodyStain(base, v.BareBlood(), bareAmt);
         if (next == cur) continue;
         v.SetStain(bi, next);
         st.coatTouched = true;
@@ -18039,6 +18050,14 @@ bool Mob::InfectTick(uint32_t tick, World& world,
 // ============================================================================
 bool Mob::InfectStep(int li, uint32_t tick, World& world,
                      std::vector<ParticleSpawn>& spawns) {
+  // ATTRIBUTION (CLAUDE.md rule 6): where a step's time goes -- finding the
+  // cells (sweep or list), the rule over them, the flush -- so a cost is a
+  // named phase and not one number (MobSystem::InfectCost).
+  using Clock = std::chrono::steady_clock;
+  const auto tStart = Clock::now();
+  auto msSince = [](Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+  };
   MobLimb& limb = limbs_[li];
   BurnLimbView v = ViewOf(limb);
   const size_t n = v.Size();
@@ -18151,6 +18170,8 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
     limb.infectCells.clear();
     return true;
   }
+  sys_->infectSelectMs_ += msSince(tStart);
+  const auto tRule = Clock::now();
   // What this tick converts joins the list after the loop (a cell converted
   // THIS tick does not act until the next one, the sweep's rule).
   std::vector<MobLimb::InfectCellPos> born;
@@ -18215,7 +18236,17 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   // so the deepest single claim wins and the variation survives.
   const std::vector<uint8_t>& boneTissue = def_->tissue;
   const auto& gt = CurrentTuning().gore;
-  const uint32_t boneBloodMat = SmearMatFor(LimbFluid(li));
+  // LAZY: LimbFluid walks the whole lattice, and only an eat that bares
+  // bone needs it (2026-10-01; the step costs the infection, not the limb).
+  uint32_t boneBloodMatV = 0;
+  bool boneBloodKnown = false;
+  auto boneBlood = [&]() {
+    if (!boneBloodKnown) {
+      boneBloodMatV = SmearMatFor(LimbFluid(li));
+      boneBloodKnown = true;
+    }
+    return boneBloodMatV;
+  };
   const float boneBase = std::clamp(gt.infectBoneStain, 0.0f, 15.0f);
   const float boneVary = std::clamp(gt.infectBoneStainVary, 0.0f, 15.0f);
   const float boneIchorP = std::clamp(gt.infectBoneIchor, 0.0f, 1.0f);
@@ -18225,6 +18256,7 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
     const uint32_t fl = infectMat < sys_->matFluid_.size()
                             ? sys_->matFluid_[infectMat] : 0u;
     const uint32_t ichorMat = (fl && sys_->StainTypeOf(fl)) ? fl : 0u;
+    const uint32_t boneBloodMat = boneBlood();
     if (ichorMat == 0 && boneBloodMat == 0) return;
     for (const IVec3& d : kBurnDirs) {
       const uint32_t j = voxAt(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
@@ -18429,6 +18461,7 @@ bool Mob::InfectStep(int li, uint32_t tick, World& world,
   // `limb`, `v` and `st` are all dangling and the caller must touch nothing.
   // Forced when the charge was lethal, so the death happens HERE, under the
   // infection's name, and not at whatever flush comes next.
+  sys_->infectRuleMs_ += msSince(tRule);
   const bool wasAlive = alive_;
   const bool flushed =
       !(eaten && limbs_[li].burn.removed) ||

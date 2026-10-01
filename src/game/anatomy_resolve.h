@@ -83,5 +83,9 @@ constexpr uint8_t kDepthEmpty = 255;
 // override): Resolve passes it for keep-only limbs such as hair. Null = all.
 std::vector<uint8_t> UnionDepth(const Prefab& prefab,
                                 const std::vector<bool>* include = nullptr);
+// Which models the recipe treats as BODY: false for a keep-only limb (hair),
+// which Resolve leaves as painted and keeps out of the depth union. The one
+// rule, for Resolve and for any gate that asks what Resolve will touch.
+std::vector<bool> BodyModels(const Prefab& prefab, const nlohmann::json& recipe);
 
 }  // namespace anatomy
