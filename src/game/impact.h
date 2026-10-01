@@ -65,6 +65,13 @@ struct StrikeProfile {
   float armorBreak = 0.0f;  // 0..1 of gear.bluntDentRadius broken out of a WORN SHELL
                             // at full power (fist 0, sword 0.05, mace ~0.8)
   float bite = 0.0f;        // hp at full speed arriving as a TEAR
+  // HOW BIG A HOLE THE TEETH MAKE: a multiple of gore.biteRadius (1 = the
+  // shared tear every jaw had before 2026-10-01). A snake's fangs PUNCTURE --
+  // a couple of art voxels in, not a mouthful out -- and the venom they leave
+  // is what does the work; a wolf's jaws would sit above 1. The infection's
+  // reach follows the hole, because StainWoundAs rewrites the flesh the tear
+  // exposed and nothing else.
+  float biteRadius = 1.0f;
   uint16_t infectMat = 0;   // material the tear REWRITES exposed flesh to (0 = none)
   uint16_t infectStain = 0; // LIQUID whose stain the tear smears over the hole (0 = none)
 

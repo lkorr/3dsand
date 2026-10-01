@@ -172,6 +172,14 @@ struct PoseDrive {
   float climbRise = 0.0f;
   IVec3 climbLip{};
   Vec3 climbDir{1, 0, 0};
+  // ---- lateral undulation (Mob::ApplySlither) -----------------------------
+  // The odometer the wave's phase is (world voxels travelled along the
+  // facing), the heading last tick (for the turn rate the bend is read off)
+  // and the eased path curvature that bend is drawn at.
+  float slitherOdo = 0.0f;
+  float slitherHeading = 0.0f;
+  float slitherKappa = 0.0f;
+  bool slitherInit = false;
   // Has the drawn height ever been set by the pipeline? The feet-derived
   // height snaps to its target the first time and eases ever after.
   bool bodyPlaced = false;

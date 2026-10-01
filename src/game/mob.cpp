@@ -1132,6 +1132,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   }
   // How much of an AIM effector's yaw the spine takes (mob.h).
   def.aimSpineShare = std::clamp(j.value("aimSpineShare", 0.35f), 0.0f, 1.0f);
+  def.aimLeanBodies = std::clamp(j.value("aimLeanBodies", 1.25f), 0.0f, 4.0f);
   if (j.contains("eyeLocal") && j["eyeLocal"].size() == 3) {
     def.eyeLocal = {j["eyeLocal"][0].get<float>(),
                     j["eyeLocal"][1].get<float>(),
@@ -1716,6 +1717,64 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
                    : sk.parts[i].anchorLocal;
     }
 
+    // ---- LATERAL UNDULATION (mob.h MobDef::SlitherDef) -------------------
+    //
+    // The chain is named head-first. Its rest geometry is measured HERE, once,
+    // off the same prefab models the anchors above came from: the rig is
+    // authored lying straight along +Z (forward), so a point's arc length from
+    // the snout is simply how far behind the foremost voxel it sits. Per part
+    // that is the middle of its own model box; the root's joint gets its own
+    // number because the root is the one part the wave TRANSLATES (its joint
+    // is the rig's origin, so the lateral offset has to be put on it rather
+    // than inherited). Nothing here is per-creature code: any rig that names
+    // a chain gets the wave.
+    if (j.contains("slither") && j["slither"].is_object()) {
+      const json& sj = j["slither"];
+      MobDef::SlitherDef sd;
+      const float prefabInv = 1.0f / (float)def.skinScale;
+      float zTip = -1e9f, zTail = 1e9f;
+      std::vector<float> zMid;
+      for (const auto& nm : sj.value("parts", json::array())) {
+        const std::string pn = nm.is_string() ? nm.get<std::string>() : "";
+        const int pi = sk.FindPart(pn);
+        const int mi = FindModel(def.prefab, pn);
+        if (pi < 0 || mi < 0) {
+          log += jp + ": slither names unknown part \"" + pn + "\"
+";
+          continue;
+        }
+        const PrefabModel& m = def.prefab.models[mi];
+        const float z0 = (float)m.offset.z * prefabInv;
+        const float z1 = (float)(m.offset.z + m.size.z) * prefabInv;
+        zTip = std::max(zTip, z1);
+        zTail = std::min(zTail, z0);
+        sd.parts.push_back(pi);
+        zMid.push_back(0.5f * (z0 + z1));
+      }
+      if (sd.parts.size() >= 3 && zTip > zTail) {
+        sd.present = true;
+        sd.length = zTip - zTail;
+        for (float z : zMid) sd.sMid.push_back(zTip - z);
+        if (def.rootLimb >= 0 && def.rootLimb < (int)sk.parts.size())
+          sd.sRootJoint = zTip - sk.parts[def.rootLimb].anchorLocal.z;
+        sd.zTip = zTip;   // the pivot is stated at run time: worldSize is not yet known
+        auto num = [&](const char* k, float& v, float lo, float hi) {
+          v = std::clamp(sj.value(k, v), lo, hi);
+        };
+        num("wavelength", sd.wavelength, 0.1f, 4.0f);
+        num("amplitude", sd.amplitude, 0.0f, 0.5f);
+        num("ampHead", sd.ampHead, 0.0f, 1.0f);
+        num("ampRamp", sd.ampRamp, 0.0f, 1.0f);
+        num("turnBend", sd.turnBend, 0.0f, 2.0f);
+        num("maxCurvature", sd.maxCurvature, 0.0f, 2.0f);
+        num("bendHalfLife", sd.bendHalfLife, 0.01f, 2.0f);
+        def.slither = std::move(sd);
+      } else {
+        log += jp + ": slither needs at least three parts laid along +Z
+";
+      }
+    }
+
     // ---- sockets: where a held ITEM attaches (mob.h MobSocketDef) --------
     //
     // Parsed after the limbs because a socket names the part it rides and is
@@ -1821,6 +1880,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           nw.strike.bluntCarve = s2.value("bluntCarve", 0.0f);
           nw.strike.armorBreak = s2.value("armorBreak", 0.0f);
           nw.strike.bite = s2.value("bite", 0.0f);
+          nw.strike.biteRadius =
+              std::clamp(s2.value("biteRadius", 1.0f), 0.05f, 4.0f);
         }
         if (!nw.strike.Any())
           log += jp + ": natural weapon \"" + nw.name +
@@ -1937,6 +1998,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       partList("missingAny", rule.missingAnyOf);
       rule.minChainsLost = s.value("minChainsLost", 0);
       rule.activity = s.value("activity", "");
+      rule.always = s.value("always", false);
       rule.clip = s.value("clip", "");
       rule.speedScale = s.value("speedScale", 1.0f);
       // Read AFTER speedScale so its default can BE speedScale (anim.h).
@@ -1953,7 +2015,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
                "\" sets groundAlign without disableGait; the gait's foot "
                "plane will fight the ground fit\n";
       if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
-          rule.minChainsLost <= 0 && rule.activity.empty())
+          rule.minChainsLost <= 0 && rule.activity.empty() && !rule.always)
         log += jp + ": state \"" + rule.name +
                "\" has an empty predicate and will never match\n";
       sk.states.push_back(std::move(rule));
@@ -21487,7 +21549,8 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // a finger cannot be bitten from the far side. No authored field and no
   // per-limb table: it moves a thigh's hole half a voxel and changes nothing
   // there, and it is the entire bite on a hand.
-  const float biteR = gt.biteRadius * (0.4f + 0.6f * power);
+  const float biteR = gt.biteRadius * std::max(0.0f, hit.radiusScale) *
+                      (0.4f + 0.6f * power);
   Vec3 centre = local;
   {
     const MobLimb& lb = limbs_[li];
@@ -28550,7 +28613,7 @@ void Mob::ApplyStrikeAim(const AnimSkeleton& sk, AnimState& st) const {
           // (from 4.3 with no lean at all), and the probe reaches about 1.9
           // past the tip. A neck and a set of shoulders extending a quarter
           // past the chest is what the frames show and what closes it.
-          const float lean = def_->worldSize.z * 1.25f * prog;
+          const float lean = def_->worldSize.z * def_->aimLeanBodies * prog;
           st.local[effPart].pos =
               st.local[effPart].pos +
               QuatRotate(st.local[effPart].rot, edge.normalized()) * lean;
