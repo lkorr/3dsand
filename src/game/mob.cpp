@@ -1274,6 +1274,36 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           if (from.count((int)v.material)) v.material = (uint16_t)toId;
     }
   }
+  // ---- STAND-INS FOR WHAT A .VOX CANNOT PAINT (anatomy.becomes) -----------
+  // The same constraint as garmentsBecome, for any tissue rather than for
+  // clothes: a .vox palette index is a material id only up to 127, so a body
+  // material numbered above that (snake.json's venom gland) is baked as a
+  // STAND-IN the recipe can name and rewritten here, after Resolve, so the
+  // anatomy-parity gate still compares recipe against bake. `{"stand-in":
+  // "target"}`, every voxel of the stand-in on this body. A target this
+  // build's materials.json does not have is a loud line and the stand-in
+  // stays — the body still loads, with the stand-in tissue where the gland
+  // would be.
+  if (j.contains("anatomy") && j["anatomy"].is_object() &&
+      j["anatomy"].contains("becomes") && j["anatomy"]["becomes"].is_object()) {
+    for (auto it = j["anatomy"]["becomes"].begin();
+         it != j["anatomy"]["becomes"].end(); ++it) {
+      const int fromId = FindMaterialId(mats, it.key());
+      const int toId = it.value().is_string()
+                           ? FindMaterialId(mats, it.value().get<std::string>())
+                           : -1;
+      if (fromId <= 0 || toId <= 0) {
+        log += jp + ": anatomy.becomes \"" + it.key() + "\" -> " +
+               it.value().dump() +
+               " names a material materials.json does not have; the stand-in "
+               "stays\n";
+        continue;
+      }
+      for (PrefabModel& m : def.prefab.models)
+        for (PrefabVoxel& v : m.voxels)
+          if ((int)v.material == fromId) v.material = (uint16_t)toId;
+    }
+  }
 
   if (def.artUpsample > 1) {
     UpsamplePrefab(def.prefab, def.artUpsample);

@@ -11401,8 +11401,9 @@ draws from: legs and feet.
 
 **Fangs puncture, they do not tear** (`StrikeProfile::biteRadius`, natural
 `strike.biteRadius`). A multiple of `gore.biteRadius` on the weapon (default
-1, every existing jaw unchanged); the snake's is 0.5, a hole a couple of art
-voxels into the limb. The bite then runs the zombie's path untouched
+1, every existing jaw unchanged); the snake's is 0.9, which at the power a
+snake strike actually lands with (0.05..0.5 of the melee speed ramp) is a
+0.15..0.25-voxel hole, a couple of art voxels into the limb. The bite then runs the zombie's path untouched
 (`Mob::BiteHit` → `StainWoundAs`): the flesh the puncture exposed is rewritten
 to the sidecar's `bite.infect` and smeared with `bite.stain`. Until package B
 lands those are the zombie's `rotflesh` / `ichor` (and the gland is `flesh`);
@@ -11410,7 +11411,7 @@ switching them to `envenomed` / `venom` / `venom_gland` is three strings in
 `snake.json` plus a re-run of the generator for the bake.
 
 **Behaviour** (`behaviors.json` `snake`): faction monster, hostile, 360° sight
-to 30 voxels, a 9..13 voxel band (centre to centre — its fangs are nine voxels
+to 30 voxels, a 9..12 voxel band (centre to centre — its fangs are nine voxels
 ahead of its centre), one style, a 45-tick cadence and a real disengage: it
 strikes and draws back. It spawns from the dev panel's Mob tool (Spawn →
 "place any mob def"); no biome spawns creatures yet, so there is no natural
@@ -11424,7 +11425,7 @@ by the heading is a change to every creature's walk and is left for its own
 package. `Wander` needs a schedule routine, so a snake with no target lies
 still (coiled) rather than roaming.
 
-**Gate `snake`.** Pass A drives it 150 ticks at a target 34 voxels ahead and
+**Gate `snake`.** Pass A drives it 150 ticks at a target 27 voxels ahead and
 asserts it closes distance, every segment's lowest voxel stays within a voxel
 of the ground under it, the segment centres change sign about their fitted
 line at least twice along the body (a wave, not a rod), and SLIP — the share

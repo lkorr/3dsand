@@ -9141,7 +9141,7 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
 // THE SNAKE SLITHERS, AND IT BITES (docs/PLAN_weapon_coats.md package D;
 // assets/mobs/snake.json, Mob::ApplySlither).
 //
-// PASS A, THE SLITHER. Spawned on flat ground with a target 34 voxels ahead,
+// PASS A, THE SLITHER. Spawned on a flat pad with a target 27 voxels ahead (inside its 30-voxel sight),
 // the snake is driven by its own behaviour profile and four things are
 // measured over the run, each because a different fault produces it:
 //
@@ -9199,10 +9199,78 @@ Status GateSnake(Ctx& c, std::string& detail) {
   const IVec3 anchor = AiFixtureCentre(c.world);
   const IVec3 spot =
       AiFlatSpot(anchor.x, anchor.z, 96, 30, kDefaultSeed, relief);
-  const int h0 = World::TerrainHeight(spot.x, spot.z, kDefaultSeed);
   AiTicker tick{c, 9400, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+
+  // ---- THE FLOOR: a flat stone pad, written by the gate -------------------
+  // The claim is about the slither, not about hills: a body eighteen voxels
+  // long on worldgen relief (12 voxels over the best patch this search finds)
+  // measures the terrain, and the walk drive's axis-aligned footprint refuses
+  // a slope a short creature would climb (DESIGN.md "The snake", known
+  // limits). So the gate lays a level pad over the run, a voxel above the
+  // highest column under it, clears the air above it, and measures clearance
+  // against the surface IT wrote.
+  const int padX0 = spot.x - 10, padX1 = spot.x + 10;
+  const int padZ0 = spot.z - 32, padZ1 = spot.z + 26;
+  int padTop = INT32_MIN;
+  for (int wz = padZ0; wz <= padZ1; wz++)
+    for (int wx = padX0; wx <= padX1; wx++)
+      padTop = std::max(padTop,
+                        World::TerrainHeight(wx, wz, kDefaultSeed) + 1);
+  {
+    const uint32_t stone = [&] {
+      for (size_t i = 0; i < c.mats.size(); i++)
+        if (c.mats[i].name == "stone") return (uint32_t)i;
+      return 1u;
+    }();
+    std::vector<CellOp> ops;
+    for (int wz = padZ0; wz <= padZ1; wz++)
+      for (int wx = padX0; wx <= padX1; wx++) {
+        const int base = World::TerrainHeight(wx, wz, kDefaultSeed) - 2;
+        for (int y = base; y <= padTop + 10; y++) {
+          const IVec3 cell{wx, y, wz};
+          if (!c.world.CellInWindow(cell)) continue;
+          ops.push_back(
+              CellOp{World::SlotCellIndex(cell), y <= padTop ? stone : 0u});
+        }
+      }
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < ops.size(); i += kSlice) {
+      std::vector<CellOp> slice(
+          ops.begin() + (ptrdiff_t)i,
+          ops.begin() + (ptrdiff_t)std::min(i + kSlice, ops.size()));
+      tick({}, slice);
+    }
+  }
+  // ...and wait for it to reach the chunk cache the LOCOMOTION reads (the
+  // trap ai-approach, ai-slope and crawl-slope all document).
+  auto cachedSolid = [&](IVec3 cell) {
+    const CachedChunk* cc =
+        c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+    return (cc->voxels[(((uint32_t)cell.z & 15u) * kChunk +
+                        ((uint32_t)cell.y & 15u)) *
+                           kChunk +
+                       ((uint32_t)cell.x & 15u)] &
+            0xFFFu) != 0u;
+  };
+  for (int i = 0; i < 160; i++) {
+    bool all = true;
+    for (int wz = padZ0; wz <= padZ1; wz += 4)
+      for (int wx = padX0; wx <= padX1; wx += 5) {
+        const IVec3 cell{wx, padTop, wz};
+        if (cachedSolid(cell)) continue;
+        all = false;
+        c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+      }
+    if (all) break;
+    tick();
+  }
+  const int h0 = padTop;
   auto groundTop = [&](float x, float z) {
-    return (float)(World::TerrainHeight(ifloor(x), ifloor(z), kDefaultSeed) + 1);
+    const int wx = ifloor(x), wz = ifloor(z);
+    if (wx >= padX0 && wx <= padX1 && wz >= padZ0 && wz <= padZ1)
+      return (float)(padTop + 1);
+    return (float)(World::TerrainHeight(wx, wz, kDefaultSeed) + 1);
   };
   bool ok = true;
   int checks = 0;
@@ -9223,7 +9291,7 @@ Status GateSnake(Ctx& c, std::string& detail) {
   // ---- PASS A: the slither -------------------------------------------------
   const float startCz = (float)spot.z - 14.0f;
   const Vec3 target{(float)spot.x + 0.5f, (float)(h0 + 1) + 8.0f,
-                    startCz + 34.0f};
+                    startCz + 27.0f};
   c.mobs.SetPlayerActor(target, 3.0f, 17.0f, true);
   const uint64_t id = c.mobs.Spawn(
       snakeDef, {spot.x - (int)std::lround(sd.worldSize.x * 0.5f), h0 + 1,
@@ -9248,10 +9316,19 @@ Status GateSnake(Ctx& c, std::string& detail) {
   double slip = 0, moved = 0;
   std::vector<Vec3> prev(chain.size()), now(chain.size());
   std::vector<uint8_t> have(chain.size(), 0), havePrev(chain.size(), 0);
+  int targeted = 0, strikeTicks = 0, floatSeg = -1, sinkSeg = -1;
+  std::vector<int> intentTicks((size_t)ai::Intent::Count, 0);
   for (int t = 0; t < ticks; t++) {
     tick();
     Mob* m = c.mobs.FindMobById(id);
     if (m == nullptr || !m->Alive()) break;
+    // WHY IT DID OR DID NOT GO (CLAUDE.md rule 6): perception and the
+    // arbiter's choice, so "closed 0" names its cause on the same line.
+    if (const ai::Brain* br = c.mobs.MobBrain(id)) {
+      if (br->hasTarget) targeted++;
+      intentTicks[(size_t)br->intent < intentTicks.size() ? (size_t)br->intent
+                                                          : 0]++;
+    }
     for (size_t k = 0; k < chain.size(); k++)
       have[k] = m->LimbCentreWorld(chain[k], now[k]) ? 1 : 0;
     // ---- slip, interior segments, from the tenth tick (the start-up turn)
@@ -9272,8 +9349,13 @@ Status GateSnake(Ctx& c, std::string& detail) {
       }
     prev = now;
     havePrev = have;
-    // ---- clearance, every live segment, every fifth tick
-    if (t % 5 == 0) {
+    // ---- clearance, every live segment, every fifth tick -- WHILE IT
+    // SLITHERS. A strike raises the neck and lunges by design; the claim here
+    // is about the body lying on the ground as it travels.
+    const NpcStroke* stroke = c.mobs.MobStroke(id);
+    const bool striking = (stroke != nullptr && stroke->Active()) || m->Airborne();
+    if (striking) strikeTicks++;
+    if (t % 5 == 0 && !striking) {
       for (size_t k = 0; k < chain.size(); k++) {
         const uint32_t n = c.mobs.LimbVoxelCount(id, chain[k]);
         float lo = 1e9f;
@@ -9284,8 +9366,8 @@ Status GateSnake(Ctx& c, std::string& detail) {
         }
         if (n == 0) continue;
         const float clear = lo - groundTop(at.x, at.z);
-        floatMax = std::max(floatMax, clear);
-        sinkMax = std::max(sinkMax, -clear);
+        if (clear > floatMax) { floatMax = clear; floatSeg = (int)k; }
+        if (-clear > sinkMax) { sinkMax = -clear; sinkSeg = (int)k; }
       }
     }
     // ---- the wave, every fifth tick past the start-up
@@ -9351,6 +9433,23 @@ Status GateSnake(Ctx& c, std::string& detail) {
       "(relief %d)\n",
       closed, ticks, floatMax, sinkMax, waved, samples, slipRatio,
       (float)moved, relief);
+  {
+    std::string hist;
+    for (size_t k = 0; k < intentTicks.size(); k++)
+      if (intentTicks[k] > 0)
+        hist += Format(" %s %d", ai::IntentName((ai::Intent)k), intentTicks[k]);
+    auto segName = [&](int k) {
+      return k >= 0 && (size_t)k < chain.size() &&
+                     (size_t)chain[(size_t)k] < sd.limbs.size()
+                 ? sd.limbs[(size_t)chain[(size_t)k]].name.c_str()
+                 : "-";
+    };
+    std::printf("snake slither: targeted %d/%d ticks | intents:%s | pad top "
+                "y %d, gap at start %.1f | %d striking/airborne ticks not "
+                "measured for clearance | worst float on %s, sink on %s\n",
+                targeted, ticks, hist.c_str(), padTop, gap0, strikeTicks,
+                segName(floatSeg), segName(sinkSeg));
+  }
   cleanup();
 
   // ---- PASS B: the bite ----------------------------------------------------
@@ -9373,13 +9472,34 @@ Status GateSnake(Ctx& c, std::string& detail) {
     } else {
       const int maxTicks = (int)BaselineNumber("snake.biteTicks", 300.0);
       int took = -1, strikes = 0;
+      int sweeps = 0, hits = 0, pCast = 0, pAir = 0, pSelf = 0, pBody = 0;
+      int bitten = 0;
+      float topTip = 0, gapAtStrike = 0;
+      NpcStroke last;
       bool wasCutting = false;
       uint32_t rot = 0;
       for (int t = 0; t < maxTicks && took < 0; t++) {
         tick();
         const NpcStroke* s = c.mobs.MobStroke(biter);
         const bool cutting = s != nullptr && s->Cutting();
-        if (cutting && !wasCutting) strikes++;
+        if (cutting && !wasCutting) {
+          strikes++;
+          gapAtStrike += AiPlanar(AiMobCentre(c.mobs, biter, sd),
+                                  AiMobCentre(c.mobs, prey, hd));
+        }
+        // WHERE EACH STRIKE WENT (rule 6): the stroke's own tallies, read on
+        // its last cutting tick and summed when the cut ends.
+        if (cutting) last = *s;
+        if (!cutting && wasCutting) {
+          sweeps += last.sweeps;
+          hits += last.bodiesHit;
+          pCast += last.probesCast;
+          pAir += last.probesAir;
+          pSelf += last.probesSelf;
+          pBody += last.probesBody;
+          topTip = std::max(topTip, last.topTipSpeed);
+          bitten += last.bitten ? 1 : 0;
+        }
         wasCutting = cutting;
         rot = 0;
         for (size_t li = 0; li < hd.limbs.size(); li++)
@@ -9392,8 +9512,12 @@ Status GateSnake(Ctx& c, std::string& detail) {
                    maxTicks, strikes, rot));
       RecordObserved("snake.biteTickObserved", (double)took);
       std::printf("snake bite: %d strike(s), first infected voxel at tick %d, "
-                  "%u infected voxels\n",
-                  strikes, took, rot);
+                  "%u infected voxels | cut ticks swept %d, bodies hit %d, "
+                  "landed bites %d, top tip %.1f vox/s | probes cast %d air "
+                  "%d self %d body %d | mean centre gap at strike %.1f\n",
+                  strikes, took, rot, sweeps, hits, bitten, topTip, pCast,
+                  pAir, pSelf, pBody,
+                  strikes > 0 ? gapAtStrike / (float)strikes : 0.0f);
     }
   } else if (humanDef < 0) {
     check(false, "a humanoid def to bite");

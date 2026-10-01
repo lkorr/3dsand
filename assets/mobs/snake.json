@@ -10,7 +10,7 @@
     "dismember": "dismember",
     "bleed": "bleed"
   },
-  "//anatomy": "Skin, a flesh layer, a muscle layer and a bone core: in a body this thin the core IS the spine. The head is a thin skull over jaw muscle, with a brain at the back and the VENOM GLANDS either side of it. PLACEHOLDER: the gland is `flesh` until package B lands `venom_gland`; it is ONE string (limbs.head.carve[0].material) -- change it and re-run `node scripts/gen_snake.mjs` (the engine re-resolves the recipe at load anyway; the bake keeps anatomy-parity).",
+  "//anatomy": "Skin, a flesh layer, a muscle layer and a bone core: in a body this thin the core IS the spine. The head is a thin skull over jaw muscle, with a brain at the back and the VENOM GLANDS either side of it. The glands are painted as the STAND-IN `flesh_cooked` (limbs.head.carve[0]) because a .vox can only paint material ids up to 127 and `venom_gland` sits above that; `becomes` rewrites every stand-in voxel to the gland at load (mob.cpp, after the recipe resolves, beside garmentsBecome). `venom_gland` is that ONE string. A build whose materials.json lacks it logs a line and keeps the stand-in. Re-bake with `node scripts/gen_snake.mjs`.",
   "anatomy": {
     "layers": [
       {
@@ -56,16 +56,12 @@
         ],
         "carve": [
           {
-            "material": "flesh",
+            "material": "flesh_cooked",
             "where": "muscle",
             "box": {
-              "y": [
-                0.15,
-                0.8
-              ],
               "z": [
-                0.2,
-                0.62
+                0.1,
+                0.8
               ]
             }
           },
@@ -74,16 +70,16 @@
             "where": "muscle",
             "box": {
               "x": [
-                0.34,
-                0.66
+                0.36,
+                0.64
               ],
               "y": [
-                0.3,
+                0.4,
                 1
               ],
               "z": [
-                0.05,
-                0.5
+                0,
+                0.4
               ]
             }
           }
@@ -105,6 +101,9 @@
           }
         ]
       }
+    },
+    "becomes": {
+      "flesh_cooked": "venom_gland"
     }
   },
   "//speed": "World voxels per second: 0.8 m/s, a brisk snake. The wave's phase is the distance covered, so this is also what sets how fast the S travels down the body (frequency = speed / wavelength).",
@@ -307,7 +306,7 @@
       ]
     }
   ],
-  "//natural": "FANGS, NOT A MOUTHFUL: `biteRadius` 0.5 of gore.biteRadius punctures a couple of art voxels in, and the bite block below is what the hole is filled with.",
+  "//natural": "FANGS, NOT A MOUTHFUL: `biteRadius` 0.9 of gore.biteRadius, at the power a snake strike actually lands with (0.05..0.5 of the melee speed ramp), is a 0.15..0.25-voxel hole: a couple of art voxels into the limb. The bite block below is what the hole is filled with.",
   "natural": [
     {
       "name": "jaws",
@@ -328,7 +327,7 @@
       "strike": {
         "blunt": 0.5,
         "bite": 4,
-        "biteRadius": 0.5
+        "biteRadius": 0.9
       }
     }
   ],
@@ -338,7 +337,7 @@
     "stain": "ichor"
   },
   "behavior": "snake",
-  "//states": "A SNAKE IS PRONE BY NATURE: `always` matches unconditionally, so the body is laid on the fitted ground plane (SettleClipOwnedBody) and every segment follows its own stretch of it (ConformProneSegments), the same two stages a legless zombie's crawl uses.",
+  "//states": "A SNAKE IS PRONE BY NATURE: `always` matches unconditionally, so the body is laid on the fitted ground plane (SettleClipOwnedBody) and every segment follows its own stretch of it (ConformProneSegments), the same two stages a legless zombie's crawl uses. bodyYOffset -0.65 lays it INTO the fitted plane: the prone placement holds a body's lowest collider corner half a voxel proud (kProneEmbedVox), which on a body 1.1 voxels thick is a snake hovering a hand above the ground (the snake gate measured 0.62..0.92 voxels of clearance at 0).",
   "states": [
     {
       "name": "slither",
@@ -347,7 +346,7 @@
       "groundAlign": 1,
       "speedScale": 1,
       "lungeScale": 1,
-      "bodyYOffset": 0
+      "bodyYOffset": -0.65
     }
   ],
   "clips": {
