@@ -4539,7 +4539,19 @@ class Mob {
       return 0;
     return limbs_[limbIndex].infects[slot].mat;
   }
+  // LIVE cells a FlushBurn carve removed besides its own tombstones (the
+  // connectivity split / collider re-derive in CarveLimb's tail), by the
+  // flush's cause, and the non-tissue (bone) share of them. Diagnostic only
+  // (venom-wound's bone attribution); never saved, never hashed.
+  uint32_t FlushTailLost(DamageCause c) const {
+    return (int)c < (int)DamageCause::Count ? flushTailLost_[(int)c] : 0u;
+  }
+  uint32_t FlushTailBone(DamageCause c) const {
+    return (int)c < (int)DamageCause::Count ? flushTailBone_[(int)c] : 0u;
+  }
  protected:
+  uint32_t flushTailLost_[(int)DamageCause::Count] = {};
+  uint32_t flushTailBone_[(int)DamageCause::Count] = {};
   std::vector<InfectStat> infectStats_;
   InfectStat& InfectStatFor(uint32_t mat) {
     for (InfectStat& s : infectStats_)

@@ -2738,13 +2738,17 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
 
   const uint64_t a = mobs.Spawn(human, FixtureSite(c.world, 415));
   const uint64_t b = mobs.Spawn(human, FixtureSite(c.world, 425));
-  if (!a || !b) {
+  // THE CONTROL (orchestrator, 2026-10-01): the same pits as A, no venom, the
+  // same ticks. Whatever bone it loses is the wound model's, not the venom's.
+  const uint64_t ctl = mobs.Spawn(human, FixtureSite(c.world, 435));
+  if (!a || !b || !ctl) {
     restore();
-    detail = "could not spawn two humans";
+    detail = "could not spawn three humans";
     return Status::Fail;
   }
   mobs.SetMobBehavior(a, "dummy");
   mobs.SetMobBehavior(b, "dummy");
+  mobs.SetMobBehavior(ctl, "dummy");
   // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, not the subject --
   // SpawnTarget's eight settling steps, for two bodies at once.
   for (int i = 0; i < 8; i++) {
@@ -2761,26 +2765,32 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   // third, i.e. a surface cell -- so the wall exposes skin, flesh and muscle
   // the way a shallow cut does.
   std::vector<ParticleSpawn> spawns;
-  uint32_t holes = 0;
-  for (int li : limbs) {
-    const LimbAxis ax = MeasureLimb(mobs, a, li);
-    if (!ax.valid) continue;
-    Vec3 best = ax.anchor + ax.along * (ax.reach * 0.5f);
-    float bestR = -1.0f;
-    for (uint32_t k = 0; k < 96; k++) {
-      const Vec3 p = mobs.LimbVoxelPos(a, li, k * 7919u + 13u);
-      const float t = (p - ax.anchor).dot(ax.along);
-      if (t < ax.reach * 0.33f || t > ax.reach * 0.66f) continue;
-      const float r = (p - ax.anchor - ax.along * t).len();
-      if (r > bestR) {
-        bestR = r;
-        best = p;
+  auto carvePits = [&](uint64_t id) {
+    uint32_t n = 0;
+    for (int li : limbs) {
+      const LimbAxis ax = MeasureLimb(mobs, id, li);
+      if (!ax.valid) continue;
+      Vec3 best = ax.anchor + ax.along * (ax.reach * 0.5f);
+      float bestR = -1.0f;
+      for (uint32_t k = 0; k < 96; k++) {
+        const Vec3 p = mobs.LimbVoxelPos(id, li, k * 7919u + 13u);
+        const float t = (p - ax.anchor).dot(ax.along);
+        if (t < ax.reach * 0.33f || t > ax.reach * 0.66f) continue;
+        const float r = (p - ax.anchor - ax.along * t).len();
+        if (r > bestR) {
+          bestR = r;
+          best = p;
+        }
       }
+      if (mobs.CarveLimbRadial(mobs.LimbBody(id, li), best, kRadius, false,
+                               false, c.world, spawns,
+                               DamageCtx(DamageCause::SpawnRot)))
+        n++;
     }
-    if (mobs.CarveLimbRadial(mobs.LimbBody(a, li), best, kRadius, false, false,
-                             c.world, spawns, DamageCtx(DamageCause::SpawnRot)))
-      holes++;
-  }
+    return n;
+  };
+  const uint32_t holes = carvePits(a);
+  const uint32_t holesCtl = carvePits(ctl);
 
   // Measured AFTER the carve and BEFORE the venom, so the deltas are the
   // venom's alone.
@@ -2802,7 +2812,17 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
     return h;
   };
   const uint32_t bone0 = boneMat ? sumLimbs(a, boneMat) : 0u;
+  const uint32_t boneC0 = boneMat ? sumLimbs(ctl, boneMat) : 0u;
   const float hpA0 = hpOf(a);
+  // The flush-tail ledger at the start, so only this run's share is read.
+  uint32_t tailBoneA0[(int)DamageCause::Count] = {};
+  uint32_t tailBoneC0[(int)DamageCause::Count] = {};
+  if (Mob* m = mobs.FindMobById(a))
+    for (int k = 0; k < (int)DamageCause::Count; k++)
+      tailBoneA0[k] = m->FlushTailBone((DamageCause)k);
+  if (Mob* m = mobs.FindMobById(ctl))
+    for (int k = 0; k < (int)DamageCause::Count; k++)
+      tailBoneC0[k] = m->FlushTailBone((DamageCause)k);
 
   uint32_t tick = 41999;
   uint32_t soakedA = 0, soakedB = 0;
@@ -2866,6 +2886,28 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   if (Mob* m = mobs.FindMobById(b)) hpInfB = m->HpLostBy(DamageCause::Infection);
   const float hpA1 = hpOf(a);
   const uint32_t bone1 = boneMat ? sumLimbs(a, boneMat) : 0u;
+  const uint32_t boneC1 = boneMat ? sumLimbs(ctl, boneMat) : 0u;
+  // WHERE A's AND THE CONTROL's BONE WENT: the bone FlushBurn's carve tail
+  // (CarveLimb's connectivity split / collider re-derive) dropped, by the
+  // flush's cause. Venom converts no bone (`took`), so any bone A loses
+  // beyond the control's leaves by this door or by none.
+  std::string tailA, tailC;
+  uint32_t tailBoneA = 0, tailBoneC = 0;
+  if (Mob* m = mobs.FindMobById(a))
+    for (int k = 0; k < (int)DamageCause::Count; k++) {
+      const uint32_t d = m->FlushTailBone((DamageCause)k) - tailBoneA0[k];
+      if (d) tailA += Format(" %s %u", DamageCauseName((DamageCause)k), d);
+      tailBoneA += d;
+    }
+  if (Mob* m = mobs.FindMobById(ctl))
+    for (int k = 0; k < (int)DamageCause::Count; k++) {
+      const uint32_t d = m->FlushTailBone((DamageCause)k) - tailBoneC0[k];
+      if (d) tailC += Format(" %s %u", DamageCauseName((DamageCause)k), d);
+      tailBoneC += d;
+    }
+  const int boneLossA = (int)bone0 - (int)bone1;
+  const int boneLossC = (int)boneC0 - (int)boneC1;
+  const int boneLossVenom = boneLossA - boneLossC;
   restore();
 
   // THE EXPECTED WINDOW, from the authored numbers at the scaled rate: the
@@ -2892,6 +2934,9 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
   RecordObserved("venomWoundWindow", window);
   RecordObserved("venomWoundHpInfection", (double)hpInfA);
   RecordObserved("venomWoundControlSeeded", (double)sb.seeded);
+  RecordObserved("venomWoundBoneLossA", (double)boneLossA);
+  RecordObserved("venomWoundBoneLossControl", (double)boneLossC);
+  RecordObserved("venomWoundBoneLossVenom", (double)boneLossVenom);
 
   const bool seeded = sa.seeded > 0 && firstSeen > 0;
   const bool spread = sa.spread > 0;
@@ -2924,6 +2969,12 @@ Status GateVenomWound(Ctx& c, std::string& detail) {
       aliveA ? "" : " (A DIED)", sb.seeded, sb.spread, bMax, hpInfB);
   detail += conserved ? " | books balance" : " | books off (twin overlap)";
   detail += " | took:" + took;
+  detail += Format(" | BONE: A %u -> %u (-%d), control (same pits, no venom, "
+                   "%u pits) %u -> %u (-%d), venom-attributable %d; flush-tail "
+                   "bone A %u [%s ], control %u [%s ]",
+                   bone0, bone1, boneLossA, holesCtl, boneC0, boneC1, boneLossC,
+                   boneLossVenom, tailBoneA, tailA.c_str(), tailBoneC,
+                   tailC.c_str());
   if (!left.empty()) detail += " | still envenomed:" + left;
   if (seeded && spread && burntOut && threeX && onTime && hurt && boneKept &&
       skinStops)

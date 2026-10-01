@@ -15510,6 +15510,29 @@ bool Mob::FlushBurn(int limbIndex, const DamageCtx& ctx, World& world,
     return (*idx)[((size_t)lz * bdim.y + ly) * bdim.x + lx] != 0;
   };
 
+  // WHAT THE CARVE TAIL TAKES BESIDES THE TOMBSTONES (diagnostic; venom-wound's
+  // bone attribution). The predicate below removes only material-0 cells, so
+  // any LIVE cell that is gone afterwards left by CarveLimb's own tail -- the
+  // connectivity split dropping stranded pieces, the collider re-derive -- and
+  // that is counted here by cause, with the non-tissue (bone) share apart.
+  auto liveCount = [&](uint32_t& nonTissue) {
+    const MobLimb& L = limbs_[limbIndex];
+    const std::vector<uint8_t>& tis = def_->tissue;
+    uint32_t live = 0;
+    nonTissue = 0;
+    auto one = [&](uint32_t m) {
+      if (m == 0) return;
+      live++;
+      if (!tis.empty() && (m >= tis.size() || !tis[m])) nonTissue++;
+    };
+    if (L.HasFineSkin())
+      for (const PrefabVoxel& v : L.skinVoxels) one(v.material & 0xFFFu);
+    else
+      for (const DebrisVoxel& v : L.voxels) one(v.payload & 0xFFFu);
+    return live;
+  };
+  uint32_t nonTissue0 = 0;
+  const uint32_t live0 = liveCount(nonTissue0);
   // EATEN: the cause's per-voxel removals, expressed as one carve. That is
   // what cauterises it, consumes a garment and keeps fire's account of how a
   // limb comes apart (the eaten rows of game/severpolicy.h).
@@ -15523,6 +15546,13 @@ bool Mob::FlushBurn(int limbIndex, const DamageCtx& ctx, World& world,
         return [](int, int, int) { return true; };
       });
   if (!alive) return false;  // severed or the mob died: caller must not touch it
+  {
+    uint32_t nonTissue1 = 0;
+    const uint32_t live1 = liveCount(nonTissue1);
+    const int ci = std::min((int)ctx.cause, (int)DamageCause::Count - 1);
+    if (live0 > live1) flushTailLost_[ci] += live0 - live1;
+    if (nonTissue0 > nonTissue1) flushTailBone_[ci] += nonTissue0 - nonTissue1;
+  }
 
   // The carve compacted the lattice, so every index in the burn index moved.
   // Drop it; the next tick rebuilds it and re-seeds the front from whatever is
