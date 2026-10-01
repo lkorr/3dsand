@@ -123,7 +123,9 @@ class GrabHold {
     const float reach = tp.grabDistance / kVoxelMeters;
     dist_ = kCarryPull * std::clamp((com - handVoxel).len(), 0.35f * reach, reach);
     prevRole_ = phys.BodyRoleOf(body_);
+    owner_ = owner;
     phys.SetBodyRole(body_, Physics::BodyRole::Carried, owner);
+    CarryPiece(phys);
     phys.ActivateBody(body_);
     return true;
   }
@@ -135,18 +137,23 @@ class GrabHold {
     // Back to what it was before it was picked up. A dead Mob's limb
     // (GrabbableDeadLimb) is a corpse's again; anything else DebrisSystem owns
     // is loose debris. Both are loose roles, so both clear the player first.
-    phys.SetBodyRole(body_, prevRole_ == Physics::BodyRole::RigDead
-                                ? Physics::BodyRole::RigDead
-                                : Physics::BodyRole::Debris);
+    // The rest of the piece (CarryPiece) goes back the same way: a severed
+    // head's hair was debris like the head, a corpse head's hair a corpse's.
+    phys.SetBodyRole(body_, LooseRole());
     phys.ActivateBody(body_);
+    for (uint64_t h : piece_) Drop(phys, h);
+    piece_.clear();
     body_ = 0;
     massKg_ = 0.0f;
   }
 
   // The body vanished under us (burnt away, culled — a collider merely rebuilt
-  // under a new handle is followed instead, see Tick). No layer restore: there
-  // is nothing left to restore it on.
-  void Forget() {
+  // under a new handle is followed instead, see Tick). No layer restore on
+  // it: there is nothing left to restore it on. The rest of the piece may
+  // well still be there, and goes back to loose.
+  void Forget(Physics& phys) {
+    for (uint64_t h : piece_) Drop(phys, h);
+    piece_.clear();
     body_ = 0;
     massKg_ = 0.0f;
   }
@@ -218,17 +225,20 @@ class GrabHold {
       dropNote_ = std::string(buf) + chain;
       std::fprintf(stderr, "%s (held %llx)\n", dropNote_.c_str(),
                    (unsigned long long)held0);
-      Forget();
+      Forget(phys);
       return;
     }
     Vec3 com;
     if (!phys.BodyCenterOfMass(body_, com)) {
       dropNote_ = "grab lost: no centre of mass";
       std::fprintf(stderr, "%s\n", dropNote_.c_str());
-      Forget();
+      Forget(phys);
       return;
     }
     massKg_ = phys.BodyMass(body_);
+    // A carve can rebuild a piece member under a new handle (CarryLayer keeps
+    // its role) or cut a new one loose; re-asserting is a no-op otherwise.
+    CarryPiece(phys);
     const Vec3 target = handVoxel + fwd * dist_;
     const Vec3 err = target - com;
     // LET GO WHEN IT IS NO LONGER WITH YOU. The gap grows when the thing is
@@ -285,6 +295,67 @@ class GrabHold {
     const float excess = std::max(massKg_ - tp.grabFreeMass, 0.0f);
     return 1.0f / (1.0f + excess / slow);
   }
+  // THE REST OF THE PIECE IN YOUR HANDS (owner report 2026-09-30: "I
+  // decapitate thornwood, pick up his head, and a circle rotates around it
+  // really fast, spinning the head"). A severed part leaves as several bodies
+  // still jointed together (Mob::DetachLimb's keepJoint): a head with its
+  // `hair`, `hair.2` and sylvan `snout` Fixed to it. Only the body under the
+  // crosshair was made Carried, so the pieces welded to it stayed on the
+  // ordinary layer, held inside arm's reach, against the player's dynamic
+  // capsule — which shoves a body that light out of itself every tick, and
+  // through the Fixed joint that shove is a torque on the head. The servo
+  // overwrites the head's linear velocity but only damps its spin, so the
+  // head windmilled with its hair whipping round it.
+  //
+  // So everything rigidly part of the held thing is Carried too. A DEBRIS
+  // piece is one object whatever joins it (a cut forearm and its hand); a
+  // CORPSE limb only carries what is Fixed to it (a corpse head's hair) —
+  // dragging a body by the wrist must not make the rest of it pass through
+  // you.
+  std::vector<uint64_t> Piece(const Physics& phys) const {
+    std::vector<uint64_t> piece;
+    if (!body_) return piece;
+    const bool corpse = prevRole_ == Physics::BodyRole::RigDead;
+    piece.push_back(body_);
+    std::vector<Physics::BodyJoint> js;
+    for (size_t i = 0; i < piece.size() && piece.size() < kMaxPiece; i++) {
+      phys.JointsOn(piece[i], js);
+      for (const Physics::BodyJoint& j : js) {
+        if (!j.other) continue;  // world-anchored
+        if (corpse && j.type != Physics::JointType::Fixed) continue;
+        if (std::find(piece.begin(), piece.end(), j.other) == piece.end() &&
+            piece.size() < kMaxPiece)
+          piece.push_back(j.other);
+      }
+    }
+    return piece;
+  }
+  // Re-walked every tick: a member cut loose while held (a sword through
+  // the hair) is dropped, a member rebuilt under a new handle (CarryLayer
+  // kept its role) is picked up again under that one.
+  void CarryPiece(Physics& phys) {
+    std::vector<uint64_t> now = Piece(phys);
+    now.erase(now.begin());  // body_ itself is Begin/Release's
+    for (uint64_t h : piece_)
+      if (std::find(now.begin(), now.end(), h) == now.end()) Drop(phys, h);
+    for (uint64_t h : now)
+      if (phys.BodyRoleOf(h) != Physics::BodyRole::Carried)
+        phys.SetBodyRole(h, Physics::BodyRole::Carried, owner_);
+    piece_ = std::move(now);
+  }
+  Physics::BodyRole LooseRole() const {
+    return prevRole_ == Physics::BodyRole::RigDead ? Physics::BodyRole::RigDead
+                                                   : Physics::BodyRole::Debris;
+  }
+  // A dead handle answers BodyRoleOf with the default, never Carried.
+  void Drop(Physics& phys, uint64_t h) const {
+    if (phys.BodyRoleOf(h) != Physics::BodyRole::Carried) return;
+    phys.SetBodyRole(h, LooseRole());
+    phys.ActivateBody(h);
+  }
+  // One part cannot hold more bodies than a rig has; capped anyway.
+  static constexpr size_t kMaxPiece = 64;
+
   // Floor under the CARRY speed only (the player's floor is a tuned knob).
   // Without it the heaviest liftable thing is servo'd at a speed indis-
   // tinguishable from zero and reads as a bug rather than as weight.
@@ -299,6 +370,8 @@ class GrabHold {
   // What the body was before it was Carried, so Release can say what it is
   // again (a corpse limb stays a corpse's).
   Physics::BodyRole prevRole_ = Physics::BodyRole::Debris;
+  std::vector<uint64_t> piece_;  // the rest of the piece, Carried with it
+  uint64_t owner_ = Physics::kAnyPlayer;  // the capsule the piece is exempt from
   float dist_ = 0.0f;   // carry distance from the hand, voxels
   bool refusedHeavy_ = false;
 };

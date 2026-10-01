@@ -2253,6 +2253,7 @@ void Physics::JointsOn(uint64_t handle, std::vector<BodyJoint>& out) const {
     bj.joint = j;
     bj.other = isA ? e->second.bodyB : e->second.bodyA;
     bj.anchorLocalVox = Vec3{a.GetX() * inv, a.GetY() * inv, a.GetZ() * inv};
+    bj.type = e->second.desc.type;
     out.push_back(bj);
   }
 }

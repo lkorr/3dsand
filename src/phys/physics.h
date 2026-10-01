@@ -303,6 +303,7 @@ class Physics {
     uint64_t joint = 0;
     uint64_t other = 0;
     Vec3 anchorLocalVox{};
+    JointType type = JointType::Ball;
   };
   void JointsOn(uint64_t handle, std::vector<BodyJoint>& out) const;
   // How far body B currently sits from the REST direction its ball joint was
