@@ -7142,7 +7142,7 @@
     {
       "name": "snake_strike",
       "label": "Snake strike",
-      "//": "THE SNAKE'S ONE STYLE (assets/mobs/snake.json). The windup is the COIL: `clip` plays the sidecar's `snake_strike`, an override on the four neck segments that draws them back into an S with the head raised (the slither yields those segments to it, Mob::ApplySlither). The lunge fires at the CUT, not the windup -- the coil is the telegraph and the strike is the release -- and stays low (rise 0.3 m/s) because a snake strikes along the ground. It goes for the legs: the snake is prone by nature, so `targetProne` is the table it actually draws from.",
+      "//": "THE SNAKE'S ONE STYLE (assets/mobs/snake.json). The windup is the COIL: `clip` plays the sidecar's `snake_strike`, an override on the four neck segments that draws them back into an S with the head raised (the slither yields those segments to it, Mob::ApplySlither). The lunge fires at the CUT, not the windup -- the coil is the telegraph and the strike is the release -- and stays low (rise 0.3 m/s) because a snake strikes along the ground. It goes for the legs: the snake is prone by nature, so `targetProne` is the table it actually draws from -- narrowed by the engine to what a body lying on the ground can rise to (MobSystem::PickTargetLimb reachHeight: its own height and a voxel), which on a standing victim is the feet.",
       "weapon": "jaws",
       "reach": 0,
       "lunge": {

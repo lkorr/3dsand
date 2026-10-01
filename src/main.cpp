@@ -4143,10 +4143,31 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       gap = (p != nullptr && p->attack.reach > 0.0f) ? p->attack.reach : 9.0f;
     }
   }
-  const int gapZ = std::max(2, (int)std::lround(gap));
-
-  const int hB = World::TerrainHeight(spawnX, spawnZ + gapZ, kDefaultSeed);
-  const uint64_t idB = mobs.Spawn(defB, {spawnX, hB + 1, spawnZ + gapZ});
+  // ---- CENTRE TO CENTRE, AND FROM WHERE THE WEAPON IS (2026-10-01) -------
+  //
+  // StyleReachOn (and every reach the AI measures) is CENTRE-TO-CENTRE, but
+  // both bodies used to be spawned with their MIN CORNERS `gap` apart. For
+  // two of a kind that is the same thing; for a snake (18 voxels long) the
+  // victim's corner landed three voxels down the snake's own body, inside it.
+  // So the victim's centre is placed `gap` ahead of the attacker's centre on
+  // its facing (+Z), the x centres aligned.
+  //
+  // ...and a body that carries its weapon FORWARD of its centre (a long body:
+  // MobSystem::BodyCapsule's half-length along its facing, 0 for every
+  // upright creature) reaches that much further from its centre. That is the
+  // same overhang the AI's band adds (`ceiling = strikeReach + size.z / 2`),
+  // read off the capsule so a humanoid's stand-off is exactly what it was.
+  if (A.gap <= 0.0f) {
+    const MobSystem::Capsule capA = MobSystem::BodyCapsule(dA);
+    if (capA.alongFacing) gap += capA.halfLen;
+  }
+  const float centreAx = (float)spawnX + dA.worldSize.x * 0.5f;
+  const float centreAz = (float)spawnZ + dA.worldSize.z * 0.5f;
+  const int bx = (int)std::lround(centreAx - dB.worldSize.x * 0.5f);
+  const int bz = (int)std::lround(centreAz + std::max(2.0f, gap) -
+                                  dB.worldSize.z * 0.5f);
+  const int hB = World::TerrainHeight(bx, bz, kDefaultSeed);
+  const uint64_t idB = mobs.Spawn(defB, {bx, hB + 1, bz});
   if (!idA || !idB) {
     std::fprintf(stderr, "--shot-strike: spawn failed\n");
     return 1;
@@ -4232,7 +4253,11 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   };
 
   const uint32_t bruiseMat = mobs.MaterialIdNamed(CurrentTuning().gore.bruiseMat);
-  const uint32_t rotMat = mobs.MaterialIdNamed("rotflesh");
+  // The ATTACKER's infection (its sidecar `bite.infect`: a snake leaves
+  // envenomed, a zombie rotflesh); rotflesh for an attacker that names none.
+  const uint32_t rotMat = dA.bite.infectMat != 0
+                              ? (uint32_t)dA.bite.infectMat
+                              : mobs.MaterialIdNamed("rotflesh");
   Mob* mB = mobs.FindMobById(idB);
   Mob* mA = mobs.FindMobById(idA);
   if (mA == nullptr || mB == nullptr) {
@@ -4255,7 +4280,7 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   mobs.SetHeading(idB, 3.14159265f);
   const Vec3 aimAt = chestOf(idB, dB);
   const Vec3 fromA = mobs.MobOrigin(idA);
-  if (!mobs.ForceAttack(idA, styleName, aimAt, t, 0x5EED51UL)) {
+  if (!mobs.ForceAttack(idA, styleName, aimAt, t, 0x5EED51UL, idB)) {
     std::fprintf(stderr,
                  "--shot-strike: \"%s\" was refused — the attacker has no "
                  "weapon for it, or a stroke was already live. Styles this "
@@ -4526,7 +4551,7 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       "  weapon      %s\n"
       "  profile     cut %.1f  blunt %.1f  bluntCarve %.2f  armorBreak %.2f  "
       "bite %.1f  infect %u/%u\n"
-      "  stand-off   %d voxels%s (style reach %.0f)\n"
+      "  stand-off   %.1f voxels centre to centre%s (style reach %.0f)\n"
       "  behaviour   %s (both sides pinned to training_dummy for the shot: an\n"
       "              AI that keeps its range makes the stand-off unauthorable)\n"
       "  stroke      %d sweep ticks, %d cut ticks, %d bodies hit, top tip "
@@ -4536,7 +4561,7 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       attackerSpec.c_str(), styleName.c_str(),
       targetSpec.empty() ? "human" : targetSpec.c_str(), weaponName.c_str(),
       prof.cut, prof.blunt, prof.bluntCarve, prof.armorBreak, prof.bite,
-      (unsigned)prof.infectMat, (unsigned)prof.infectStain, gapZ,
+      (unsigned)prof.infectMat, (unsigned)prof.infectStain, std::max(2.0f, gap),
       A.gap > 0.0f ? " (@ override)" : "", sty.reach, profA.c_str(),
       sweeps, cutTicks, bodiesHit, topTipSpeed,
       arrested ? " (ARRESTED by a parry)" : "", edgeLen, edgeGap, chestGap);

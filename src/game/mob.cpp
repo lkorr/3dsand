@@ -4767,6 +4767,27 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
   // against a wall reports the wall as its own footing and shoves itself up it.
   const float hx = std::max(0.0f, def.worldSize.x * 0.5f - 0.5f);
   const float hz = std::max(0.0f, def.worldSize.z * 0.5f - 0.5f);
+  // ---- THE BOX TURNS WITH THE BODY (2026-10-01) ---------------------------
+  // `worldSize` is the rest pose's box -- x across the body, z along its
+  // facing -- and it was sampled AXIS-ALIGNED whatever way the creature
+  // faced. For a humanoid (a box not far from square) that was a small
+  // error; for a snake (1.6 x 18) facing +X it sampled an 18-voxel-wide,
+  // 1.6-deep footprint, so a wall BESIDE it refused it and a gap it lay
+  // along could not be entered. The grid is now laid in the body's own frame
+  // (forward = heading, the convention every probe here uses), and a long
+  // axis gets more columns so a nine-voxel half-length is not sampled only
+  // at its two ends and its middle: 3 per axis up to a 6-voxel half-extent
+  // (every humanoid: the grid it always had), 5 or more past that.
+  const Vec3 fwdAx{std::sin(heading_), 0, std::cos(heading_)};
+  const Vec3 rgtAx{std::cos(heading_), 0, -std::sin(heading_)};
+  const int kx = std::clamp((int)std::ceil(hx / 6.0f), 1, 3);
+  const int kz = std::clamp((int)std::ceil(hz / 6.0f), 1, 3);
+  auto column = [&](int ix, int iz, int& wx, int& wz) {
+    const float u = hx * (float)ix / (float)kx;   // across
+    const float v = hz * (float)iz / (float)kz;   // along
+    wx = ifloor(cx + rgtAx.x * u + fwdAx.x * v);
+    wz = ifloor(cz + rgtAx.z * u + fwdAx.z * v);
+  };
   // The probe starts above the body, never at it: a scan begun at the sole
   // cannot see the lip of the step in front of it.
   const int yFrom = ifloor(fromY) + kMobProbeLiftCells;
@@ -4779,10 +4800,10 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
 
   int best = INT32_MIN;
   int centreY = INT32_MIN;
-  for (int iz = -1; iz <= 1; iz++) {
-    for (int ix = -1; ix <= 1; ix++) {
-      const int wx = ifloor(cx + hx * (float)ix);
-      const int wz = ifloor(cz + hz * (float)iz);
+  for (int iz = -kz; iz <= kz; iz++) {
+    for (int ix = -kx; ix <= kx; ix++) {
+      int wx = 0, wz = 0;
+      column(ix, iz, wx, wz);
       int y = 0;
       bool blocked = false;
       if (!GroundHeightAt(world, wx, wz, yFrom, y, nullptr, nullptr,
@@ -4792,6 +4813,8 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
         if (blocked) {
           out.known = true;
           out.wall = true;
+          out.wallColumns++;
+          out.wallMask |= 1ull << ((iz + kz) * 7 + (ix + kx));
         }
         continue;
       }
@@ -4799,6 +4822,8 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
       if (ix == 0 && iz == 0) centreY = y;
       if ((float)y > standCeil) {
         out.wall = true;
+        out.wallColumns++;
+        out.wallMask |= 1ull << ((iz + kz) * 7 + (ix + kx));
         continue;
       }
       if (y > best) best = y;
@@ -4819,10 +4844,10 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
   // refuses everything under a canopy, a ledge or an arch that the mob would in
   // fact walk straight through. This rejects a crawlspace and nothing else, and
   // being looser than reality is the safe direction to be wrong in.
-  for (int iz = -1; iz <= 1 && out.fits; iz++) {
-    for (int ix = -1; ix <= 1 && out.fits; ix++) {
-      const int wx = ifloor(cx + hx * (float)ix);
-      const int wz = ifloor(cz + hz * (float)iz);
+  for (int iz = -kz; iz <= kz && out.fits; iz++) {
+    for (int ix = -kx; ix <= kx && out.fits; ix++) {
+      int wx = 0, wz = 0;
+      column(ix, iz, wx, wz);
       for (int k = 0; k < headroomCells_; k++) {
         if (!CellSupportsWeight(world, IVec3{wx, out.groundY + k, wz})) continue;
         out.fits = false;
@@ -5510,13 +5535,21 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
   // 20 cm of margin beyond the body box, in metres so the fan reaches the
   // same real distance past the mob at any voxel size.
   const float senseMargin = MetresToCells(0.2f);
-  const float reachX = def.worldSize.x * 0.5f + senseMargin;
-  const float reachZ = def.worldSize.z * 0.5f + senseMargin;
+  // ...AND THE ELLIPSE IS THE BODY'S, NOT THE WORLD'S (2026-10-01). It was
+  // taken on world X/Z, so a snake (1.6 x 18) facing +X probed nine voxels
+  // to its SIDES and under a voxel ahead of its own nose. Now laid in the
+  // body frame: `reachAcross` on its right/left, `reachAlong` fore and aft.
+  const float reachAcross = def.worldSize.x * 0.5f + senseMargin;
+  const float reachAlong = def.worldSize.z * 0.5f + senseMargin;
+  const Vec3 fwdAx{std::sin(mob.heading_), 0, std::cos(mob.heading_)};
+  const Vec3 rgtAx{std::cos(mob.heading_), 0, -std::sin(mob.heading_)};
   for (int i = 0; i < GroundSense::kProbeCount; i++) {
-    const float yaw =
-        mob.heading_ + (6.2831853f * (float)i) / (float)GroundSense::kProbeCount;
-    const float px = cx + std::sin(yaw) * reachX;
-    const float pz = cz + std::cos(yaw) * reachZ;
+    const float th =
+        (6.2831853f * (float)i) / (float)GroundSense::kProbeCount;
+    const float along = std::cos(th) * reachAlong;
+    const float across = std::sin(th) * reachAcross;
+    const float px = cx + fwdAx.x * along + rgtAx.x * across;
+    const float pz = cz + fwdAx.z * along + rgtAx.z * across;
     int py = 0;
     if (!mob.GroundHeightAt(world, ifloor(px), ifloor(pz), yFrom, py)) {
       // Unknown footing is WALKABLE, and deliberately so. The probe reaches
@@ -5785,7 +5818,7 @@ void MobSystem::ReportNoStroke(const Mob& mob, const ai::Profile* pr,
 // nothing left returns -1, which every caller reads as today's chest.
 int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
                               uint64_t attackerId, float attackerProne,
-                              uint32_t tick) {
+                              uint32_t tick, float reachHeight) {
   // ---- WHICH TABLE: THE ATTACKER'S POSTURE PICKS IT (2026-09-17) ----------
   //
   // `attackerProne` is the attacker's active loco state's `groundAlign`
@@ -5804,6 +5837,30 @@ int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
       (attackerProne > 0.0f && !sty.targetProne.empty()) ? sty.targetProne
                                                          : sty.target;
   if (table.empty()) return -1;
+  // ---- ...AND ONLY WHAT IT CAN RISE TO (2026-10-01) ------------------------
+  // A body lying on the ground reaches a little above its own height. Drawn
+  // from limbs whose centre is at or below `reachHeight` over the victim's
+  // feet when the caller gives one; the whole table when none qualifies (a
+  // victim lying down, a giant), so the filter can narrow a draw and never
+  // empty it. Measured on the snake, before: four strikes in five went for a
+  // thigh 6.3 voxels up, ended 6.2 voxels from it and bit nothing.
+  auto reachable = [&](int i) {
+    if (!(reachHeight > 0.0f)) return true;
+    Vec3 cw{};
+    if (!victim.LimbCentreWorld(i, cw)) return true;
+    return cw.y - victim.Origin().y <= reachHeight;
+  };
+  bool useHeight = false;
+  if (reachHeight > 0.0f)
+    for (const StyleTargetWeight& w : table)
+      for (int i = 0; i < victim.AppendedBase() && !useHeight; i++)
+        if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag &&
+            reachable(i))
+          useHeight = true;
+  auto eligible = [&](int i, const std::string& tag) {
+    return victim.LimbAlive(i) && victim.LimbDefAt(i).tag == tag &&
+           (!useHeight || reachable(i));
+  };
   // Accumulate over (tag weight x that tag's live limbs), so a rig with two
   // arms does not make "arm" twice as likely as its authored weight says: the
   // tag's weight is split across the limbs that wear it.
@@ -5811,7 +5868,7 @@ int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
   for (const StyleTargetWeight& w : table) {
     int n = 0;
     for (int i = 0; i < victim.AppendedBase(); i++)
-      if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag) n++;
+      if (eligible(i, w.tag)) n++;
     if (n > 0) total += w.weight;
   }
   if (total <= 0.0f) return -1;
@@ -5821,8 +5878,7 @@ int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
   for (const StyleTargetWeight& w : table) {
     std::vector<int> hits;
     for (int i = 0; i < victim.AppendedBase(); i++)
-      if (victim.LimbAlive(i) && victim.LimbDefAt(i).tag == w.tag)
-        hits.push_back(i);
+      if (eligible(i, w.tag)) hits.push_back(i);
     if (hits.empty()) continue;
     acc += w.weight;
     if (roll > acc) continue;
@@ -6172,8 +6228,17 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
   // worth a draw: `--shot-strike` and the gates hand a target id when they have
   // one, and the limb choice is a fact about the STYLE, not about who asked.
   if (const Mob* victim = FindCombatantById(targetId)) {
+    // A PRONE attacker reaches about its own lying height and a voxel
+    // over the victim's feet (PickTargetLimb's `reachHeight`): a snake 1.6
+    // voxels high goes for a foot or an ankle. A crawling humanoid keeps its
+    // rig's full box height and so its whole `targetProne` table.
+    const float prone = mob.LocoGroundAlign();
+    const float reachH =
+        prone > 0.0f && mob.def_ != nullptr
+            ? mob.def_->worldSize.y + 1.0f
+            : 0.0f;
     st.targetLimb =
-        PickTargetLimb(sty, *victim, mob.id_, mob.LocoGroundAlign(), tick);
+        PickTargetLimb(sty, *victim, mob.id_, prone, tick, reachH);
     // ---- ...AND THE BLOW IS THEN AIMED AT IT (2026-09-19) -----------------
     //
     // UNTIL NOW THE DRAW STEERED NOTHING. `targetLimb` was recorded, reported
@@ -7373,7 +7438,7 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
       const Mob::Footing f =
           mob.FootprintFooting(*world_, def, nx + hx, nz + hz, ny);
       if (!f.known) return true;    // unknown footing is walkable (ai_nav.h)
-      if (f.wall) { why = "wall"; return false; }
+      if (f.wall && !MoveNoDeeper(mob, def, f)) { why = "wall"; return false; }
       if (!f.fits) { why = "overhang"; return false; }
       return true;
     };
@@ -7471,6 +7536,81 @@ float MobSystem::BodyRadius(const MobDef& def) {
   return std::max(0.25f, 0.25f * (def.worldSize.x + def.worldSize.z));
 }
 
+MobSystem::Capsule MobSystem::BodyCapsule(const MobDef& def) {
+  Capsule c;
+  const float hx = std::max(0.0f, def.worldSize.x * 0.5f);
+  const float hz = std::max(0.0f, def.worldSize.z * 0.5f);
+  const float a = std::max(hx, hz), b = std::min(hx, hz);
+  const float disc = BodyRadius(def);
+  c.alongFacing = hz >= hx;
+  const float ratio = b > 1e-3f ? a / b : 1e3f;
+  const float t = std::clamp(ratio - 2.0f, 0.0f, 1.0f);
+  c.radius = std::max(0.25f, disc + (b - disc) * t);
+  c.halfLen = std::max(0.0f, (a - b) * t);
+  return c;
+}
+
+void MobSystem::CapsuleSegment(const Capsule& c, float cx, float cz,
+                               float heading, Vec3& a, Vec3& b) {
+  const Vec3 axis = c.alongFacing
+                        ? Vec3{std::sin(heading), 0, std::cos(heading)}
+                        : Vec3{std::cos(heading), 0, -std::sin(heading)};
+  a = Vec3{cx - axis.x * c.halfLen, 0, cz - axis.z * c.halfLen};
+  b = Vec3{cx + axis.x * c.halfLen, 0, cz + axis.z * c.halfLen};
+}
+
+namespace {
+// Closest points of two segments in the xz plane (Ericson, Real-Time
+// Collision Detection 5.1.9), degenerate segments (points) included -- which
+// is the disc case, so two upright bodies reduce to their centres exactly.
+void ClosestSegSeg(const Vec3& p1, const Vec3& q1, const Vec3& p2,
+                   const Vec3& q2, Vec3& c1, Vec3& c2) {
+  const Vec3 d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+  const float a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+  float s = 0.0f, t = 0.0f;
+  if (a <= 1e-8f && e <= 1e-8f) {
+    c1 = p1;
+    c2 = p2;
+    return;
+  }
+  if (a <= 1e-8f) {
+    t = std::clamp(f / e, 0.0f, 1.0f);
+  } else {
+    const float c = d1.dot(r);
+    if (e <= 1e-8f) {
+      s = std::clamp(-c / a, 0.0f, 1.0f);
+    } else {
+      const float bb = d1.dot(d2);
+      const float denom = a * e - bb * bb;
+      s = denom > 1e-8f ? std::clamp((bb * f - c * e) / denom, 0.0f, 1.0f)
+                        : 0.0f;
+      t = (bb * s + f) / e;
+      if (t < 0.0f) {
+        t = 0.0f;
+        s = std::clamp(-c / a, 0.0f, 1.0f);
+      } else if (t > 1.0f) {
+        t = 1.0f;
+        s = std::clamp((bb - c) / a, 0.0f, 1.0f);
+      }
+    }
+  }
+  c1 = p1 + d1 * s;
+  c2 = p2 + d2 * t;
+}
+
+// Planar separation vector (from `other` to `self`, xz) between two bodies'
+// capsules: the closest points' difference. Equals the centre difference for
+// two discs, which is what keeps every humanoid crowd exactly as it was.
+Vec3 CapsuleGap(const MobSystem::Capsule& cs, float sx, float sz, float sh,
+                const MobSystem::Capsule& co, float ox, float oz, float oh) {
+  Vec3 a0, a1, b0, b1, ca, cb;
+  MobSystem::CapsuleSegment(cs, sx, sz, sh, a0, a1);
+  MobSystem::CapsuleSegment(co, ox, oz, oh, b0, b1);
+  ClosestSegSeg(a0, a1, b0, b1, ca, cb);
+  return Vec3{ca.x - cb.x, 0, ca.z - cb.z};
+}
+}  // namespace
+
 Vec3 MobSystem::BodyCentre(const Mob& mob, const MobDef& def) {
   return Vec3{mob.origin_.x + def.worldSize.x * 0.5f, mob.origin_.y,
               mob.origin_.z + def.worldSize.z * 0.5f};
@@ -7479,7 +7619,8 @@ Vec3 MobSystem::BodyCentre(const Mob& mob, const MobDef& def) {
 Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
   const LocomotionDef& lo = self.skel_.loco;
   if (lo.spacingMul <= 0.0f) return Vec3{};
-  const float rSelf = BodyRadius(selfDef);
+  const Capsule capSelf = BodyCapsule(selfDef);
+  const float rSelf = capSelf.radius;
   const Vec3 cSelf = BodyCentre(self, selfDef);
   Vec3 push{};
   // kMaxMobs is 16, so this is at most 120 pairs of two compares and a sqrt —
@@ -7498,10 +7639,15 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
     // and the walk drive steps over prone things rather than round them.
     if (other.ragdoll_ != Mob::RagdollPhase::None) return;
     const MobDef& od = *other.def_;
-    const float want = (rSelf + BodyRadius(od)) * lo.spacingMul;
+    const Capsule capOther = BodyCapsule(od);
+    const float want = (rSelf + capOther.radius) * lo.spacingMul;
     if (want <= 0.0f) return;
     const Vec3 cOther = BodyCentre(other, od);
-    float dx = cSelf.x - cOther.x, dz = cSelf.z - cOther.z;
+    // Between the two CAPSULES (BodyCapsule): the centres for two upright
+    // bodies, the nearest points of their spines for a long one.
+    const Vec3 gap = CapsuleGap(capSelf, cSelf.x, cSelf.z, self.heading_,
+                                capOther, cOther.x, cOther.z, other.heading_);
+    float dx = gap.x, dz = gap.z;
     // HEIGHT IS A SEPARATOR TOO. Two creatures on floors ten voxels apart are
     // not crowding each other, and without this a mob on a roof sidesteps away
     // from one in the cellar. `origin_.y` is the MIN corner, so this compares
@@ -7576,7 +7722,8 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
                              float cz) const {
   const LocomotionDef& lo = self.skel_.loco;
   if (lo.spacingMul <= 0.0f) return false;
-  const float rSelf = BodyRadius(def);
+  const Capsule capSelf = BodyCapsule(def);
+  const float rSelf = capSelf.radius;
   const Vec3 cNow = BodyCentre(self, def);
   // Every creature (CrowdPush's note): a player's body is a body.
   return FirstCreature([&](const Mob& other) -> bool {
@@ -7590,12 +7737,18 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
     // THE HARD FLOOR IS THE BODIES TOUCHING, not the spacing radius. Spacing is
     // a preference the push expresses; this is the geometry. Blocking at the
     // full spacing radius would fence creatures apart at arm's length and stop
-    // a duelist ever reaching its target.
-    const float minSep = rSelf + BodyRadius(od);
-    const float ndx = cx - cOther.x, ndz = cz - cOther.z;
+    // a duelist ever reaching its target. Between CAPSULES (BodyCapsule), so a
+    // long body is touched along its length, not inside a disc round it.
+    const Capsule capOther = BodyCapsule(od);
+    const float minSep = rSelf + capOther.radius;
+    const Vec3 ng = CapsuleGap(capSelf, cx, cz, self.heading_, capOther,
+                               cOther.x, cOther.z, other.heading_);
+    const float ndx = ng.x, ndz = ng.z;
     const float nd2 = ndx * ndx + ndz * ndz;
     if (nd2 >= minSep * minSep) return false;          // no overlap there
-    const float odx = cNow.x - cOther.x, odz = cNow.z - cOther.z;
+    const Vec3 og = CapsuleGap(capSelf, cNow.x, cNow.z, self.heading_,
+                               capOther, cOther.x, cOther.z, other.heading_);
+    const float odx = og.x, odz = og.z;
     // ALWAYS ALLOW A MOVE THAT SEPARATES. Without this an overlap is a TRAP:
     // two bodies that start inside each other (spawned on one column, shoved
     // together by terrain, teleported) would find every move refused and weld
@@ -7603,6 +7756,17 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
     if (nd2 > odx * odx + odz * odz) return false;
     return true;
   }) != nullptr;
+}
+
+bool MobSystem::MoveNoDeeper(const Mob& mob, const MobDef& def,
+                             const Mob::Footing& dest) const {
+  if (!dest.wall) return true;
+  if (world_ == nullptr) return false;
+  const Mob::Footing here = mob.FootprintFooting(
+      *world_, def, mob.origin_.x + def.worldSize.x * 0.5f,
+      mob.origin_.z + def.worldSize.z * 0.5f, mob.origin_.y);
+  if (!here.known || !here.wall) return false;
+  return (dest.wallMask & ~here.wallMask) == 0;
 }
 
 void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
@@ -7704,7 +7868,10 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
       outStandY = mob.origin_.y;
       return true;
     }
-    if (f.wall) return false;      // part of the box would be inside something
+    // Part of the box would be inside something -- refused, UNLESS that part
+    // already is (Footing::wallMask): a body that turned a corner of itself
+    // into the rock may move as long as nothing NEW goes in.
+    if (f.wall && !MoveNoDeeper(mob, def, f)) return false;
     if (!f.fits) return false;     // an overhang
     const float rise = (float)f.groundY - mob.origin_.y;
     // A drop past the step budget is not refused, it is DEFERRED: the body
