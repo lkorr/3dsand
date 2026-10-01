@@ -556,12 +556,28 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // The weather fields move a little slower than the clouds in them (the
   // "offset the coverage and texture movement" trick, plan §1c), and morph in
   // their own time.
-  cp.weatherOff[0] = (float)Wrap(-dx * 0.8 / weatherS, 4096.0);
-  cp.weatherOff[1] = (float)Wrap(-dz * 0.8 / weatherS, 4096.0);
+  //
+  // The weather map's noise (fbm2) is NOT periodic, so its wrap is a seam: the
+  // field on one side of it has nothing to do with the field on the other.
+  // Wrapped about 0 it was crossed every time the drift on an axis changed
+  // sign — it starts at 0, so a wind with a small or wandering x component
+  // did it within minutes — and the whole sky's coverage swapped for another
+  // one. Centred at 2048 the seam is 2048 units (~25,000 km at the default
+  // scale) of one-way drift away, which is days of play; and 2048 has half
+  // the f32 ulp of the 4095.9 a positive drift used to land on.
+  cp.weatherOff[0] = (float)Wrap(2048.0 - dx * 0.8 / weatherS, 4096.0);
+  cp.weatherOff[1] = (float)Wrap(2048.0 - dz * 0.8 / weatherS, 4096.0);
   cp.weatherEvolve = (float)Wrap(tSec / 1500.0, 4096.0);
-  cp.cirrusOff[0] = (float)Wrap(-dx * 1.8 / cirrusS, 1.0);
-  cp.cirrusOff[1] = (float)Wrap(-dz * 1.8 / cirrusS, 1.0);
-  cp.cirrusEvolve = (float)Wrap(tSec / 4000.0, 1.0);
+  // Period 100, not 1: cirrusField reads the shape volume at (q + off) * 0.21,
+  // so a wrap of 1 moved it by 0.21 of a tile — a cirrus pop every few
+  // minutes of drift. 100 * 0.21 = 21 whole tiles, seamless in both volumes.
+  cp.cirrusOff[0] = (float)Wrap(-dx * 1.8 / cirrusS, 100.0);
+  cp.cirrusOff[1] = (float)Wrap(-dz * 1.8 / cirrusS, 100.0);
+  // Period 2, not 1: cirrusField samples the detail volume at y = evolve and
+  // the SHAPE volume at y = evolve * 0.5, and both volumes tile at 1. Wrapped
+  // at 1 the shape sample jumped from 0.5 back to 0 every 4000 s and the
+  // cirrus sheet popped to a different one.
+  cp.cirrusEvolve = (float)Wrap(tSec / 4000.0, 2.0);
 
   // ---- the maps' footprints, snapped to their texel grids ----
   cp.weatherTexelM = 125.0f;
