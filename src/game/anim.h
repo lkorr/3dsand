@@ -239,6 +239,13 @@ struct AnimStateRule {
   // with the library's `sleep` clip); a rig with no such state simply keeps
   // standing, which is the harmless answer.
   std::string activity;
+  // A BODY WHOSE ORDINARY POSTURE IS THIS STATE (2026-10-01, the snake). A
+  // rule with `always` matches unconditionally at its place in the authored
+  // order, so a legless rig that lies on the ground by NATURE states that as
+  // its base state (prone, gait off) and lists any damage states above it.
+  // Every other rule's predicate is about what is missing; a snake is missing
+  // nothing and still never stands up.
+  bool always = false;
   std::string clip;               // looping loco clip, crossfaded on entry
   float speedScale = 1.0f;        // walk-drive speed multiplier
   // ...and the same multiplier for a BALLISTIC opening (strokes.h StyleLunge).

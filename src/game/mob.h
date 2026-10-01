@@ -689,6 +689,41 @@ struct MobDef {
   // avatar's head-look keeps its own `avatar.headLookSpine` slider — a
   // player's idle glance is a FEEL question and belongs in tuning.json.
   float aimSpineShare = 0.35f;
+  // HOW FAR THE NECK CARRIES AN AIM EFFECTOR'S PART FORWARD THROUGH A CUT, in
+  // BODY DEPTHS (worldSize.z). Mob::ApplyStrikeAim translates the jaws along
+  // their own aim by this times the cut's progress, because a rotation cannot
+  // close the gap between a biter's teeth and a victim its chest is touching
+  // (the measured 1.25 is what closes it on an upright biped). A creature that
+  // is long rather than deep — a snake is eighteen voxels from nose to tail and
+  // its head is already at the front — would throw its head a body length off
+  // its neck at 1.25, so it states its own. Sidecar `aimLeanBodies`.
+  float aimLeanBodies = 1.25f;
+  // ---- LATERAL UNDULATION (Mob::ApplySlither, game/pose.cpp) -------------
+  // A legless body travels by a wave of YAW along a chain of segments, and
+  // the wave stands still IN THE WORLD: its phase is the distance the body
+  // has covered (an odometer), not the time, so every point of the body
+  // follows the same path the head took and nothing skates sideways. That
+  // single choice is what ties forward speed to wave frequency (f = v / λ)
+  // and why a creature that stops keeps its curve rather than straightening.
+  // Sidecar `slither`; absent on every legged rig, where it costs one test.
+  // Lengths are FRACTIONS OF THE CHAIN'S OWN REST LENGTH, so one block reads
+  // the same on an adder and a python.
+  struct SlitherDef {
+    bool present = false;
+    std::vector<int> parts;     // head first, tail last (sidecar `parts`)
+    std::vector<float> sMid;    // per part: rest arc length of its middle
+    float sRootJoint = 0;       // arc length of the root's joint, if in chain
+    float zTip = 0;             // model z of the snout (arc length 0)
+    float length = 0;           // chain rest length, world voxels
+    float wavelength = 0.55f;   // body lengths per wave
+    float amplitude = 0.09f;    // peak lateral offset, body lengths
+    float ampHead = 0.35f;      // fraction of the amplitude at the snout...
+    float ampRamp = 0.3f;       // ...rising to full over this much body
+    float turnBend = 1.0f;      // share of the turn's path curvature bent in
+    float maxCurvature = 0.25f; // 1/vox ceiling on that bend
+    float bendHalfLife = 0.2f;  // seconds; the bend eases, a turn is a sweep
+  };
+  SlitherDef slither;
   // Where the eyes sit, as an offset from the head limb's ANCHOR (neck joint)
   // in art voxels, engine frame. Authored in the sidecar's top-level "eyeLocal"
   // array; converted to world voxels at load by ArtToWorld(). The camera rides
@@ -1793,6 +1828,8 @@ struct BiteHit {
   Vec3 at{};           // contact point, world voxels
   float hp = 0.0f;     // damage to charge, ALREADY scaled by swing power
   float power = 0.0f;  // 0..1, scales the tear's radius
+  float radiusScale = 1.0f;  // StrikeProfile::biteRadius: the weapon's own
+                             // multiple of gore.biteRadius (fangs < 1)
   uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
   uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
   uint32_t seed = 0;         // tear + stain draw key
@@ -3683,6 +3720,13 @@ class Mob {
   // segment ends up following its own ground. Presentation only; reset when
   // the body is not prone.
   void ConformProneSegments(World& world, float dt);
+  // LATERAL UNDULATION (MobDef::SlitherDef; game/pose.cpp). Writes a yaw per
+  // segment of the def's `slither` chain into the PRE-FLATTEN locals, plus the
+  // root's lateral offset, so the posed chain lies on a sine path that is
+  // fixed in the world while the body moves along it. A part an OVERRIDE clip
+  // owns (the strike's coil) is handed to the clip by its blend weight. No-op
+  // on a def with no `slither` block.
+  void ApplySlither(const PoseInputs& in, float dt);
 
   // Does this cell carry a body's weight? THE definition of "solid" for
   // locomotion, shared by the ground probe, the footprint collider and the

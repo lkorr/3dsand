@@ -424,6 +424,14 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // ---- stages 1-3: sample active clips, blend, apply additives ----
   AnimSampleAndBlend(sk, st, dt);
 
+  // ---- the legless body's locomotion: lateral undulation -------------------
+  // Straight after the clips, so a clip that OWNS a segment (the strike's
+  // coil) is read from the blend it just made, and before everything that
+  // rotates a part about its joint (aim, hit react) so those compose on top
+  // of the wave rather than being overwritten by it. Data-gated on the def's
+  // `slither` block: one test on every other rig.
+  if (def.slither.present) ApplySlither(in, dt);
+
   // ---- procedural layer: the legacy phase swing ----------------------------
   // dummy.json has swingAmp/swingPhase and no chains; running it HERE rather
   // than as a separate code path means the fallback and the new rig share one
@@ -801,6 +809,144 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       st.flipbook.book = -1;
   }
 }
+
+// ---- LATERAL UNDULATION -------------------------------------------------------
+//
+// THE WAVE IS FIXED IN THE WORLD, NOT IN THE BODY. A travelling sine of yaw
+// along the chain, if its phase ran on a clock, would be a wave sliding along
+// a body that slides along the ground: the curve would move sideways under
+// every segment and the creature would skate, which is exactly what reads as
+// fake. So the phase is the ODOMETER -- the distance covered along the facing
+// -- times the wavenumber. A point `s` voxels behind the snout then sits at
+// lateral offset A*sin(k*(d - s)), where d - s is (to first order) the world
+// distance along the path at which that point is standing: every segment
+// passes through the same S the head drew, nothing slips sideways, and forward
+// speed and wave frequency are tied by construction (f = v / lambda). A body
+// that stops keeps its curve, which is what a resting snake does.
+//
+// THE CURVE IS POSED, NOT SIMULATED. Each segment is yawed to the path's
+// tangent at its own middle (psi = atan(dX/dz), dz = -ds along a body laid out
+// along +Z), as a delta on its parent's yaw so the flatten builds the polyline;
+// the root, whose joint is the rig's origin, is also SHIFTED to the path's
+// lateral offset at its joint, because a rotation alone cannot move the point
+// the rig hangs from.
+//
+// A TURN BENDS THE WAVE. A body turning at w while moving at v is on a path of
+// curvature kappa = w / v; laying the whole chain on that arc
+// (X += kappa/2 * (s - sPivot)^2, a parabola about the yaw pivot) means the
+// tail follows the head round the corner instead of being swung sideways by
+// the yaw. A floored speed and a ceiling on kappa keep a turn on the spot from
+// coiling the body into a knot, and the bend eases on its own half-life.
+//
+// THE HEAD STEADIES. A real snake holds its head nearly on line while the body
+// swings behind it; the envelope runs from `ampHead` at the snout to full
+// amplitude `ampRamp` of the body back. It costs a little exactness at the
+// front, which is where a real head slips too.
+//
+// A CLIP THAT OWNS A SEGMENT WINS IT. The strike's coil is an override clip on
+// the front segments; the wave yields to it there by the clip's blended weight,
+// and the child of a yielded segment is laid relative to what that segment
+// ACTUALLY got, so the boundary does not kink.
+//
+// Presentation only (pose.h): CPU float, never hashed, never on the grid.
+void Mob::ApplySlither(const PoseInputs& in, float dt) {
+  if (def_ == nullptr) return;
+  const MobDef::SlitherDef& sd = def_->slither;
+  const AnimSkeleton& sk = skel_;
+  AnimState& st = anim_;
+  const size_t n = std::min(sk.parts.size(), st.local.size());
+  if (!sd.present || sd.length <= 0.0f || n == 0) return;
+
+  // ---- the odometer and the turn -----------------------------------------
+  const Vec3 fwd{std::sin(heading_), 0, std::cos(heading_)};
+  const float vFwd = in.velocity.x * fwd.x + in.velocity.z * fwd.z;
+  if (!pose_.slitherInit) {
+    pose_.slitherInit = true;
+    pose_.slitherHeading = heading_;
+    pose_.slitherKappa = 0.0f;
+  }
+  const float lambda = std::max(0.5f, sd.wavelength * sd.length);
+  const float k = 6.2831853f / lambda;
+  pose_.slitherOdo += vFwd * dt;
+  // Wrapped to keep the float precise over a long life; the wave is periodic.
+  if (std::fabs(pose_.slitherOdo) > 64.0f * lambda)
+    pose_.slitherOdo = std::fmod(pose_.slitherOdo, lambda);
+  float dh = heading_ - pose_.slitherHeading;
+  while (dh > 3.14159265f) dh -= 6.28318531f;
+  while (dh <= -3.14159265f) dh += 6.28318531f;
+  pose_.slitherHeading = heading_;
+  {
+    const float vRef =
+        std::max(std::fabs(vFwd), 0.5f * std::max(def_->speed, 0.5f));
+    float want = (dh / std::max(dt, 1e-4f)) / vRef * sd.turnBend;
+    want = std::clamp(want, -sd.maxCurvature, sd.maxCurvature);
+    pose_.slitherKappa +=
+        (want - pose_.slitherKappa) * HalfLifeK(dt, sd.bendHalfLife);
+  }
+
+  const float A = sd.amplitude * sd.length;
+  const float phase = k * pose_.slitherOdo;
+  const float ramp = std::max(1e-3f, sd.ampRamp * sd.length);
+  const float sPivot = sd.zTip - def_->worldSize.z * 0.5f;
+  const float kappa = pose_.slitherKappa;
+  auto lateral = [&](float s) {
+    float t = std::clamp(s / ramp, 0.0f, 1.0f);
+    t = t * t * (3.0f - 2.0f * t);
+    const float env = sd.ampHead + (1.0f - sd.ampHead) * t;
+    const float u = s - sPivot;
+    return env * A * std::sin(phase - k * s) + 0.5f * kappa * u * u;
+  };
+  // psi(s) = atan(dX/dz) = atan(-dX/ds): the yaw that takes the segment's +Z
+  // onto the path's forward tangent (a positive turn about +Y takes +Z toward
+  // +X, scripts/geometry.py).
+  auto yawAt = [&](float s) {
+    const float h = 0.25f;
+    return std::atan(-(lateral(s + h) - lateral(s - h)) / (2.0f * h));
+  };
+
+  // ---- how much of each part the wave may have ----------------------------
+  // 1 minus the blended weight of every live OVERRIDE clip whose mask names
+  // it. Additive clips compose with the wave and take nothing from it.
+  static thread_local std::vector<float> own;
+  own.assign(n, 1.0f);
+  for (const ClipInstance& inst : st.clips) {
+    if (inst.clip < 0 || inst.clip >= (int)sk.clips.size()) continue;
+    const AnimClip& clip = sk.clips[inst.clip];
+    if (clip.mode != ClipMode::Override) continue;
+    const float w = std::clamp(inst.weight * inst.fade, 0.0f, 1.0f);
+    if (w <= 0.0f) continue;
+    for (size_t i = 0; i < n; i++)
+      if (clip.mask.empty() || (i < clip.mask.size() && clip.mask[i]))
+        own[i] = std::max(0.0f, own[i] - w);
+  }
+
+  // ---- target yaw per chain part, then deltas down the hierarchy ----------
+  static thread_local std::vector<float> yawAbs;
+  static thread_local std::vector<uint8_t> inChain;
+  yawAbs.assign(n, 0.0f);
+  inChain.assign(n, 0);
+  for (size_t c = 0; c < sd.parts.size() && c < sd.sMid.size(); c++) {
+    const int p = sd.parts[c];
+    if (p < 0 || (size_t)p >= n) continue;
+    inChain[(size_t)p] = 1;
+    yawAbs[(size_t)p] = own[(size_t)p] * yawAt(sd.sMid[c]);
+  }
+  // Parents are stored before children, so one ascending pass sees every
+  // parent's absolute yaw before its child is laid relative to it.
+  for (size_t i = 0; i < n; i++) {
+    if (!inChain[i]) continue;
+    const int par = sk.parts[i].parent;
+    const float parentYaw =
+        (par >= 0 && inChain[(size_t)par]) ? yawAbs[(size_t)par] : 0.0f;
+    const float delta = yawAbs[i] - parentYaw;
+    if (std::fabs(delta) > 1e-5f)
+      st.local[i].rot = QuatNormalize(
+          QuatMul(AxisAngle({0, 1, 0}, delta), st.local[i].rot));
+    if ((int)i == def_->rootLimb)
+      st.local[i].pos.x += own[i] * lateral(sd.sRootJoint);
+  }
+}
+
 
 // ---- THE GAIT ----------------------------------------------------------------
 //

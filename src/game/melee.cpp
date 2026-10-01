@@ -833,6 +833,7 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   p.bite.at = at;
   p.bite.hp = s.strike.bite * power;
   p.bite.power = power;
+  p.bite.radiusScale = s.strike.biteRadius;
   // THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16): whether teeth REACH flesh
   // depends on what the garment in the way is made of and which limb is under
   // it, and only the thing that was struck knows either.
@@ -903,7 +904,8 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
   // would leave in living tissue has nothing to progress through.
   if (profile.bite > 0.0f && firstContact && biteAllowed &&
       !(bitten != nullptr && *bitten)) {
-    debris.BluntBody(body, p.bite.at, goreT.biteRadius * power, p.bite.seed,
+    debris.BluntBody(body, p.bite.at,
+                     goreT.biteRadius * profile.biteRadius * power, p.bite.seed,
                      world, spawns, DebrisSystem::DamageCause::Bite);
     if (bitten != nullptr) *bitten = true;
   }

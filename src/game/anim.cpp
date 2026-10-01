@@ -271,6 +271,7 @@ int AnimSelectState(const AnimSkeleton& sk, const AnimState& st) {
   for (size_t r = 0; r < sk.states.size(); r++) {
     const AnimStateRule& rule = sk.states[r];
     if (!rule.activity.empty()) continue;   // matched above or not at all
+    if (rule.always) return (int)r;         // the body's own base posture
     // an empty predicate would shadow every rule after it — never match it
     if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
         rule.minChainsLost <= 0)

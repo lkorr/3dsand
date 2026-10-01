@@ -7140,6 +7140,66 @@
       "release": 6
     },
     {
+      "name": "snake_strike",
+      "label": "Snake strike",
+      "//": "THE SNAKE'S ONE STYLE (assets/mobs/snake.json). The windup is the COIL: `clip` plays the sidecar's `snake_strike`, an override on the four neck segments that draws them back into an S with the head raised (the slither yields those segments to it, Mob::ApplySlither). The lunge fires at the CUT, not the windup -- the coil is the telegraph and the strike is the release -- and stays low (rise 0.3 m/s) because a snake strikes along the ground. It goes for the legs: the snake is prone by nature, so `targetProne` is the table it actually draws from.",
+      "weapon": "jaws",
+      "reach": 0,
+      "lunge": {
+        "ticks": 5,
+        "speed": 6,
+        "rise": 0.3,
+        "at": "cut"
+      },
+      "target": {
+        "leg": 0.6,
+        "foot": 0.25,
+        "hand": 0.1,
+        "arm": 0.05
+      },
+      "targetProne": {
+        "leg": 0.6,
+        "foot": 0.25,
+        "hand": 0.1,
+        "arm": 0.05
+      },
+      "jitter": {
+        "az": 0.12,
+        "el": 0.08,
+        "tempo": 0.15
+      },
+      "clip": "snake_strike",
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 10,
+          "az": 0,
+          "el": 0.55,
+          "reach": -0.2,
+          "ease": "chase"
+        },
+        {
+          "name": "cut",
+          "ticks": 4,
+          "az": 0,
+          "el": -0.35,
+          "reach": 0.15,
+          "cuts": true
+        },
+        {
+          "name": "recover",
+          "ticks": 9,
+          "az": 0,
+          "el": 0.05,
+          "reach": 0,
+          "from": "body",
+          "ease": "chase",
+          "lean": "hold"
+        }
+      ],
+      "release": 6
+    },
+    {
       "name": "punch_thrust",
       "label": "Two-handed drive",
       "weapon": "fist.R",

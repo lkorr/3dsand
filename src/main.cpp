@@ -3858,6 +3858,11 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
           : std::max(18.0f, 2.4f * std::max(def.worldSize.y,
                                             std::max(def.worldSize.x,
                                                      def.worldSize.z)));
+  // A body LYING ALONG the ground (a snake: 18 voxels long, 1 tall) gets a
+  // fourth view from above, below. Every upright rig is taller than a
+  // quarter of its footprint, so none of them takes it.
+  const bool longAndLow =
+      def.worldSize.y < 0.25f * std::max(def.worldSize.x, def.worldSize.z);
   for (uint64_t b : droppedBodies) {
     BodyTransform bx{};
     const bool live = phys.GetTransform(b, bx);
@@ -3870,6 +3875,13 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
         "screenshot_mob_quarter.bmp");
   shoot(fwd + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_front.bmp");
+  // ...and a body that lies along the ground is READ from above: the three
+  // views above are near-level and see a snake end-on or as a line.
+  // Closer than the others: from above nothing stands between the camera and
+  // the body, and the length now lies across the frame instead of into it.
+  if (longAndLow)
+    shoot(right * 0.5f - fwd * 0.35f + Vec3{0, 1.2f, 0}, 0.7f * shotDist,
+          "screenshot_mob_top.bmp");
   // ...a close-up of what is in the fist: at the body's framing a sword is a
   // few dozen pixels, which cannot show whether its art reads (a bevel, a
   // wrap, a guard). Aimed at the held part's own body, so it follows the arm.
