@@ -11406,9 +11406,17 @@ snake strike actually lands with (0.05..0.5 of the melee speed ramp) is a
 0.15..0.25-voxel hole, a couple of art voxels into the limb. The bite then runs the zombie's path untouched
 (`Mob::BiteHit` → `StainWoundAs`): the flesh the puncture exposed is rewritten
 to the sidecar's `bite.infect` and smeared with `bite.stain`. Until package B
-lands those are the zombie's `rotflesh` / `ichor` (and the gland is `flesh`);
-switching them to `envenomed` / `venom` / `venom_gland` is three strings in
-`snake.json` plus a re-run of the generator for the bake.
+lands those are the zombie's `rotflesh` / `ichor`; switching them to
+`envenomed` / `venom` is two strings in `snake.json`.
+
+**The venom gland is a stand-in, rewritten at load** (`anatomy.becomes`,
+beside `garmentsBecome` in `BuildMobDef`). A `.vox` palette index is a
+material id only up to 127 and `venom_gland` sits above that, so the recipe
+carves the gland pocket as `flesh_cooked` (a tissue the snake uses nowhere
+else) and `"becomes": {"flesh_cooked": "venom_gland"}` rewrites every such
+voxel after the recipe resolves — outside `anatomy::Resolve`, so
+`anatomy-parity` still compares recipe against bake. A build whose
+`materials.json` lacks the target logs one line and keeps the stand-in.
 
 **Behaviour** (`behaviors.json` `snake`): faction monster, hostile, 360° sight
 to 30 voxels, a 9..12 voxel band (centre to centre — its fangs are nine voxels
