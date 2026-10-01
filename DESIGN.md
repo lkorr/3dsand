@@ -6662,10 +6662,28 @@ zombie bite on a human's upper arm, x40 crank, ticks until the rot reaches a
 second limb): the per-limb model it replaced bit 21 cells and reached the torso
 at tick 916 (20.4 real minutes; arm 21 → 30 → 47 cells at 250-tick steps); the
 per-voxel rot at these rates reaches the forearm at tick 898 (20.0 minutes; arm
-48 → 54 → 69). The bite-dependent gates (`bite-rot`, `bite-infect`,
-`joint-rot`) crank the knobs to their old per-limb values (6 / 2, 12 / 8), which
-are far past 1 a second per voxel now; they were red at clean main for an
-unrelated reason (the bite rewrites ~no flesh on their target) and still are.
+48 → 54 → 69). With the bite fixed (below) it reaches the forearm at tick 926
+(20.6 minutes; the bite leaves 36-54 rot).
+
+**Why bites infected nothing, and the fix (2026-10-01).** "0 rotflesh, 1232
+stained" had three causes, named by the attribution `Mob::StainWoundAs` now
+keeps (`Mob::WoundStats`, printed by `SANDVOX_BITE_DEBUG`: in reach / not
+tissue / not the infection's diet / lost the mottle draw / rewritten):
+(1) the rewrite's blotch noise (`woundStainBlob`, 4 skin cells) is as big as a
+whole bite, so one noise value decided the WHOLE bite -- 7 of 10 bites at one
+spot rewrote nothing; it is now recentred on the wound (BlobCarveFactory's
+fix). (2) A wall cell is a cell from the hole, so `dc / rimL` put the wall at
+t = 2/3 and capped the rewrite at 44% before the noise; an INFECTION is now
+measured from the wall (a blood rewrite keeps its mottled look, so the flesh a
+later venom coat needs is still there). (3) The gates aimed at a limb's AXIS or
+a rig anchor -- a closed cavity in the bone core, or air beside the wrong limb
+(`joint-rot` bit the root, not the arm's parent) -- and now aim at the skin
+(`SkinAim`, `MobSystem::LimbSurfacePos`, the parent's surface by the joint).
+The bite gates tick the per-voxel rates (`bite-infect` 0.04 / 0.02,
+`joint-rot` 0.2 / 0.16 per voxel per second) instead of the old per-limb
+cranks, and `zombify` and `venom-wound` bite ONCE (their re-bite-until-it-took
+loops are gone). A bite that carries a TARGETED infection rewrites only cells
+the infection admits (venom: soft tissue).
 
 **Remedies are data too.** `coat.effects` `"disinfect"` cures EVERY infection
 on the limb (enchanted blood stops venom as well as rot);
@@ -7425,8 +7443,33 @@ loose matter on either side (below).
   gives only its coats where positions coincide (`WearOnRig`), never its
   unfitted geometry.
 
-Knobs: `gear.coatTransferFrac` 0.5, `gear.coatTransferMax` 24 levels,
-`gear.coatContactRadius` 0.06 m, `gear.coatBleedPickup` 6. Gate
+Knobs: `gear.coatTransferFrac` 0.5, `gear.coatTransferMax` 72 levels,
+`gear.coatContactRadius` 0.06 m, `gear.coatBleedPickup` 6, `gear.coatLayerMin`
+6 levels.
+
+**The dose (2026-10-01).** One cut used to move 24 levels and lay them at the
+parcel's peak (15) on the nearest cells: two wound voxels, a few envenomed
+cells. A parcel is now SPREAD (`CoatLay`'s cap: no voxel takes more than
+`max(coatLayerMin, an even share)`), and up to 72 levels move: one good venom
+cut coats ~12 wall cells at a seeding's thickness and seeds 10-20 cells, which
+spread and burn out over ~50-110 s (gate `venom-blade`, below, measured 20
+seeded, 26 eaten, 53 s, 14 hp). Blunt on intact skin seeds nothing; blunt or a
+fist into an open wound seeds a little (the patch is mostly the rim's skin).
+
+**One contact per struck slot per sweep.** `MeleeSweepDamage` deduplicated hits
+by BODY HANDLE, and a carve rebuilds a limb's collider under a new handle, so a
+later probe of the same sweep cut the limb again and moved its coat again (three
+exchanges a swing), and a stab re-stabbed on the next tick of its stroke. Both
+lists are keyed on the struck slot now (creature + slot name, a loose body's
+global id). Measured on `blade-wounds`: a sword slash's first blow 73 -> 13
+voxels, a stab 26 -> 24, the dagger's stab 13 -> 9 -- the old numbers were two
+or more cuts. Gate `venom-blade`: a sword brushed with venom on the item stage
+(itemstage::ApplyStroke), one tip cut through MeleeSweepDamage, the wound seeded
+inside the baseline band, spreading, burnt out inside its window, hp booked to
+Infection; a venom mace on intact skin seeds nothing; a mace and a fist into an
+open pit seed.
+
+Gate
 `coat-transfer`: a tip-coated sword struck with its base leaves 0 coat; with
 its tip, coat on the wound wall (none buried), the tip's coat falls and the
 blade wears the target's fluid; a coated mace coats surface voxels only; a
