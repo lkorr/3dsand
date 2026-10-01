@@ -12246,6 +12246,7 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
                            uint32_t smearMat,
                            const std::vector<IVec3>* crater, float rimCells,
                            float wetness) {
+  lastWoundStats_ = WoundStats{};
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   {
     // SANDVOX_COAT_TRACE: a wound stain is a coat that no bleeding paid for.
@@ -12343,12 +12344,17 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
     occ[(size_t)(x - lo[0]) + (size_t)(y - lo[1]) * dx +
         (size_t)(z - lo[2]) * dx * dy] = 1;
   };
-  if (fine)
+  // BRACED (2026-10-01): written unbraced, the `else` bound to the inner `if`,
+  // so a FINE limb ran the collider loop once per tombstone (marking collider
+  // coordinates as occupied skin cells) and a COARSE limb marked nothing at
+  // all -- every voxel of it read "exposed".
+  if (fine) {
     for (const PrefabVoxel& v : limb.skinVoxels)
       if (v.material != 0) occSet(v.x, v.y, v.z);
-  else
+  } else {
     for (const DebrisVoxel& v : limb.voxels)
       if (v.payload != 0) occSet(v.x, v.y, v.z);
+  }
   auto exposed = [&](int x, int y, int z) -> bool {
     return !occAt(x - 1, y, z) || !occAt(x + 1, y, z) || !occAt(x, y - 1, z) ||
            !occAt(x, y + 1, z) || !occAt(x, y, z - 1) || !occAt(x, y, z + 1);
@@ -12393,12 +12399,42 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // "which of my voxels are near the cut" can only be answered by whoever owns
   // the voxel list. The sphere test rejects before the hash, so a limb the cut
   // did not reach costs one distance compare per voxel and no draws.
+  // ---- AN INFECTION TAKES ONLY ITS OWN DIET (2026-10-01) -------------------
+  // When the rewrite material is an infection with an authored `targets` list
+  // (venom: soft tissue only), the wound becomes that infection only where
+  // the infection could have spread itself -- a snake's fangs leave envenomed
+  // FLESH under the puncture, not envenomed skin. An untargeted infection (the
+  // rot) keeps the tissue rule below, which is its own admission.
+  const InfectSpec* rewriteInfect =
+      sys_ ? sys_->InfectSpecOf(stain & 0xFFFu) : nullptr;
+  const bool infectTargeted = rewriteInfect && rewriteInfect->targeted;
+  // ---- THE BLOTCH FIELD IS RECENTRED ON THE WOUND (2026-10-01) -------------
+  // The same defect, and the same fix, as BlobCarveFactory's "EACH BITE IS
+  // RECENTRED ON ITS OWN NOISE". The blotch (`woundStainBlob`, 4 skin cells
+  // on a human) is as big as a bite's whole hole, so the coherent field barely
+  // varies across one wound: it sampled ONE value and the rewrite came out all
+  // or nothing. For blood that was a look; for a BITE it decided whether the
+  // victim was infected at all. Measured (SANDVOX_BITE_DEBUG, `bite-limbs`):
+  // one surface bite in three on a limb rewrote no flesh, and 7 of 10 bites at
+  // one spot of zeus's upper arm rewrote none. Subtracting the field's value
+  // at the wound's own centre keeps its gradient (the blotchy edge) and takes
+  // away its vote on whether there is a wound at all.
+  Vec3 noiseCentre = c;
+  if (useCrater) {
+    Vec3 sum{};
+    for (const IVec3& q : *crater)
+      sum += Vec3{(float)q.x + 0.5f, (float)q.y + 0.5f, (float)q.z + 0.5f};
+    noiseCentre = sum * (1.0f / (float)crater->size());
+  }
+  const float noiseBias =
+      coherence > 0.0f
+          ? 0.5f - ValueNoise3(seed ^ 0xB100Du, noiseCentre.x / blobL,
+                               noiseCentre.y / blobL, noiseCentre.z / blobL)
+          : 0.0f;
+  WoundStats& ws = lastWoundStats_;
   auto consider = [&](float lx, float ly, float lz, uint32_t mat,
                       auto&& apply) {
     if (mat == 0 || mat == (stain & 0xFFFu)) return;  // tombstone, or already
-    // Bone stays bone (MobDef::tissue): the hole shows it, the blood is
-    // around it.
-    if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) return;
     // 0 at the cut, 1 at the rim. A KERF is a ball round a point; a CRATER is
     // a distance to the cells the carve actually took (phys/bodystain.h
     // CellDist), which is the difference between blood on the hole and blood
@@ -12413,6 +12449,17 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
       const float d2 = d.dot(d);
       if (d2 >= r2) return;
       tt = std::sqrt(d2 / r2);
+    }
+    ws.inRange++;
+    // Bone stays bone (MobDef::tissue): the hole shows it, the blood is
+    // around it.
+    if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) {
+      ws.notTissue++;
+      return;
+    }
+    if (infectTargeted && !(InfectAdmits(*rewriteInfect, mat) > 0.0f)) {
+      ws.notTarget++;
+      return;
     }
     // Mottled, not repainted. A uniform swap over the sphere reads as a red
     // limb; a hash-selected fraction weighted toward the cut reads as meat
@@ -12442,12 +12489,17 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
     float draw = white;
     if (coherence > 0.0f) {
       const float smooth = ValueNoise3(seed ^ 0xB100Du, lx / blobL, ly / blobL,
-                                       lz / blobL);
+                                       lz / blobL) +
+                           noiseBias;
       draw = white + (smooth - white) * coherence;
     }
-    if (draw >= chance) return;
+    if (draw >= chance) {
+      ws.drawMiss++;
+      return;
+    }
     apply();
     stained++;
+    ws.rewritten++;
   };
 
   if (fine) {
@@ -21938,12 +21990,20 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
     // nonzero return IS "the tear exposed flesh". Latching the material on the
     // limb is what lets the heal path know this rot is a wound settling rather
     // than a substance decaying (MobLimb::infectMat).
-    const uint32_t took =
-        StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u,
-                     hit.infectMat, hit.infectStain, &rep.cells, rim);
+    StainWoundAs(li, rep.centreLocal, 0.0f, seed ^ 0x120FEC7u, hit.infectMat,
+                 hit.infectStain, &rep.cells, rim);
+    // The REWRITE count, not StainWoundAs's return: that also counts the
+    // smear (one more for any coat laid), so a bite that infected nothing
+    // used to latch the limb and print "1 cell rewritten".
+    const WoundStats ws = lastWoundStats_;
+    const uint32_t took = ws.rewritten;
     if (kBiteDebug)
-      std::printf("     ...the hole exposed %u cells of FLESH (rewritten)%s\n",
-                  took, took == 0 ? " — NOTHING: all bone, garment or air" : "");
+      std::printf("     ...%u cells in the wound's reach: %u not tissue, %u "
+                  "not the infection's diet, %u lost the mottle draw, %u "
+                  "REWRITTEN%s\n",
+                  ws.inRange, ws.notTissue, ws.notTarget, ws.drawMiss,
+                  ws.rewritten,
+                  took == 0 ? " -- NOTHING infected" : "");
     if (took > 0) {
       // ...with the liquid it came in, which is what the rot will paint the
       // bone with once it has eaten the flesh off it (MobLimb::infects).

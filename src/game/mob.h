@@ -4121,6 +4121,16 @@ class Mob {
                         uint32_t seed, uint32_t rewriteMat, uint32_t smearMat,
                         const std::vector<IVec3>* crater = nullptr,
                         float rimCells = 0.0f, float wetness = 1.0f);
+  // WHAT THE LAST StainWoundAs DID WITH THE CELLS IN ITS REACH (CLAUDE.md rule
+  // 6: "the bite left no rot" has four causes and one zero). In range of the
+  // wound; refused as not tissue (bone, a garment); refused as not the
+  // rewrite infection's diet (`infect.targets`); lost the mottle draw;
+  // rewritten. Diagnostic, overwritten by every call, never saved.
+  struct WoundStats {
+    uint32_t inRange = 0, notTissue = 0, notTarget = 0, drawMiss = 0,
+             rewritten = 0;
+  };
+  const WoundStats& LastWoundStats() const { return lastWoundStats_; }
   // ---- A WOUND THAT IS STILL BLEEDING KEEPS ITSELF BLOODY (2026-09-26) ------
   //
   // StainWound's SMEAR half alone -- no material rewrite, so it can run again
@@ -4609,6 +4619,7 @@ class Mob {
     return (int)c < (int)DamageCause::Count ? flushTailBone_[(int)c] : 0u;
   }
  protected:
+  WoundStats lastWoundStats_;
   uint32_t flushTailLost_[(int)DamageCause::Count] = {};
   uint32_t flushTailBone_[(int)DamageCause::Count] = {};
   std::vector<InfectStat> infectStats_;
