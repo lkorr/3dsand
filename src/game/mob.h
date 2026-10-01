@@ -2834,6 +2834,14 @@ class Mob {
   // The slot's authoritative lattice as PrefabVoxels (skin, else the collider
   // re-expressed) -- what CaptureWorn/CaptureHeld store.
   void LatticeOfSlot(int slot, std::vector<PrefabVoxel>& out) const;
+  // The LIVE lattice the kit stack in `equipSlot` has on this rig for its
+  // shell `shell` (itemcoat.h's numbering: 0 for a held item, the cover index
+  // for a worn piece): the fitted geometry a worn piece really has on THIS
+  // wearer, which its authored cover lattice is not. False when that stack is
+  // not what the rig holds/wears, or the cover entry found no limb here.
+  // Defined in itemcoat.cpp (the item stage's materialisation).
+  bool KitShellLattice(int equipSlot, int shell,
+                       std::vector<PrefabVoxel>& out) const;
   // WHICH SLOT STRUCK, and its edge in that slot's body frame: the strike
   // hand's held item (its edge, or its haft when `haft`), else the natural
   // weapon's part. False when nothing is armed. Read by CoatOnContact.

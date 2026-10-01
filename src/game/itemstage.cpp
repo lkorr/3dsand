@@ -248,13 +248,35 @@ StrokeResult ApplyStroke(Kit& kit, MobSystem* mobs, uint64_t wearerId,
   // date first, so a coat that dried in the hand is not painted back.
   const bool onRig = s.item.space == KitSpace::Equip && mobs && wearerId;
   if (onRig) CaptureLimbToItem(*mobs, wearerId, s.item);
+  // A piece on the rig that records nothing is CLEAN, but its geometry is the
+  // rig's, not the authored one: a worn shell is resampled to fit its wearer,
+  // so the authored cover lattice's cells do not sit where the shell's do and
+  // a coat painted on them reached only the coincident ones when pushed. The
+  // live lattice is what the stage shows and what the stroke coats.
+  const WornDamage before = st->damage;   // to undo a materialisation that coats nothing
+  if (onRig && !ItemLatticeIfAny(*st, s.shell)) {
+    const Mob* wearer = mobs->FindCreature(wearerId);
+    std::vector<PrefabVoxel> live;
+    if (wearer && wearer->KitShellLattice(s.item.index, s.shell, live)) {
+      const int n = ItemLatticeCount(*def);
+      if (st->damage.shells.size() < (size_t)n) st->damage.shells.resize((size_t)n);
+      WornShellDamage& sh = st->damage.shells[(size_t)s.shell];
+      // Untouched: whole as it sits on THIS wearer (the rig's count, not the
+      // authored one, or the condition would read the fit as wear).
+      if (sh.atSpawn == 0) sh.atSpawn = (uint32_t)live.size();
+      sh.live = (uint32_t)live.size();
+      sh.lattice = std::move(live);
+    }
+  }
   std::vector<PrefabVoxel>& lat = ItemLatticeMut(*st, *def, s.shell);
   LatticeGrid g;
   g.Build(lat);
   std::vector<int32_t> cells;
   BrushCells(g, lat, s.ro, s.rd, s.radius, cells);
   if (cells.empty()) {
-    ItemLatticeSettle(*st, *def);   // the materialised copy was not needed
+    // The materialised copy was not needed: the stack goes back exactly as
+    // it was (a plain stack stays plain).
+    st->damage = before;
     return r;
   }
   r.hit = true;

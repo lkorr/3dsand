@@ -296,6 +296,70 @@ Status GateItemStage(Ctx& c, std::string& detail) {
   if (fMismatch) fail(Format("F: %u live voxels disagree with the item", fMismatch));
   if (fCoated == 0) fail("F: the blade in the fist wears no coat");
 
+  // ---- G: a worn piece nothing has touched yet ------------------------------------
+  // Its stack records no lattice, and its shells on the body are RESAMPLED to
+  // fit the wearer, so the authored cover is not where the cells are. The
+  // stroke must coat the live shell (Mob::KitShellLattice), and every coated
+  // cell of the record must be a coated cell on the body -- the stage used to
+  // paint authored coordinates and push only the coincident ones.
+  uint32_t gRec = 0, gLive = 0, gMismatch = 0;
+  int gShell = -1;
+  std::string gWhy;
+  {
+    const ItemDef* armour = nullptr;
+    for (const char* nm : {"iron_cuirass", "jerkin", "tunic"})
+      if ((armour = c.items.Named(nm)) != nullptr) break;
+    const int chest = (int)EquipSlotId::Chest;
+    if (!armour || !EquipSlotAccepts(chest, armour->kind)) {
+      gWhy = "no chest piece in the library";
+    } else {
+      kit.equip.slots[chest] = ItemStack{armour->name, 1};
+      if (!w->WearItem(armour, chest)) {
+        gWhy = "the creature could not wear it";
+      } else {
+        // The LARGEST shell, so the stroke surely lands.
+        std::vector<PrefabVoxel> live, best;
+        for (int k = 0; k < ItemLatticeCount(*armour); k++)
+          if (w->KitShellLattice(chest, k, live) && live.size() > best.size()) {
+            best = live;
+            gShell = k;
+          }
+        if (gShell < 0) {
+          gWhy = "no shell of it is on the body";
+        } else {
+          itemstage::LatticeGrid gg;
+          gg.Build(best);
+          const itemstage::StageCamera gc = itemstage::MakeCamera(gg, itemstage::View{}, W, H);
+          itemstage::Stroke sg = sk;
+          sg.item = KitRef{KitSpace::Equip, chest};
+          sg.shell = gShell;
+          gc.Ray(W * 0.5f, H * 0.5f, sg.ro, sg.rd);
+          for (int t = 0; t < ticks; t++)
+            itemstage::ApplyStroke(kit, &mobs, wid, c.items, c.mats, sg, milli);
+          std::vector<PrefabVoxel> after;
+          w->KitShellLattice(chest, gShell, after);
+          const std::vector<PrefabVoxel>* rec = ItemLatticeIfAny(kit.equip.slots[chest], gShell);
+          std::map<std::tuple<int, int, int>, uint16_t> at;
+          for (const PrefabVoxel& v : after) {
+            at[{v.x, v.y, v.z}] = v.stain;
+            if (v.stain) gLive++;
+          }
+          if (rec)
+            for (const PrefabVoxel& v : *rec) {
+              if (!v.stain) continue;
+              gRec++;
+              auto it = at.find({v.x, v.y, v.z});
+              if (it == at.end() || it->second != v.stain) gMismatch++;
+            }
+        }
+      }
+    }
+  }
+  if (!gWhy.empty()) fail("G: " + gWhy);
+  else if (gRec == 0) fail("G: the stroke coated nothing on the worn piece");
+  else if (gMismatch) fail(Format("G: %u coated cells of the record are not on the body", gMismatch));
+  else if (gLive != gRec) fail(Format("G: body shows %u coated, record %u", gLive, gRec));
+
   // ---- the picture for a person -------------------------------------------------------
   {
     std::vector<uint8_t> px;
@@ -328,11 +392,11 @@ Status GateItemStage(Ctx& c, std::string& detail) {
       "liquid %s, washer %s | A %u px, centre (%.0f,%.0f) of %dx%d | B centre pick voxel %d "
       "| C %d/%d ticks hit, %u voxels coated (sum %u), flask %u -> %u (stroke spent %u) "
       "| D %u differ | E coat sum %u -> %u | F pushed %d, %u compared, %u coated, %u "
-      "disagree%s",
+      "disagree | G shell %d: %u coated on the body, %u in the record, %u apart%s",
       liqName ? liqName->c_str() : "oil",
       washer ? c.mats[washer].name.c_str() : "none", drawn, cx, cy, W, H, pickC, (int)hits,
       ticks, coatedC, sumC, vBefore, vAfter, spent, dDiff, sumC, sumE, fPushed, fCompared,
-      fCoated, fMismatch, why.c_str());
+      fCoated, fMismatch, gShell, gLive, gRec, gMismatch, why.c_str());
   std::printf("item-stage: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
