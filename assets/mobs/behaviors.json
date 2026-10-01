@@ -140,7 +140,7 @@
       }
     },
     {
-      "comment": "THE SNAKE (assets/mobs/snake.json, docs/PLAN_weapon_coats.md package D). An ambusher: it lies still (idle is the coiled rest -- the slither keeps its curve when the body stops), closes on anything of another faction that comes within sight, holds off at striking distance and throws `snake_strike`, its one style. Ranges are centre-to-centre and a snake's centre is nine voxels behind its own fangs, which is why the band (9..12) looks wide for a creature this small.",
+      "comment": "THE SNAKE (assets/mobs/snake.json, docs/PLAN_weapon_coats.md package D). An ambusher: with nothing in sight it WANDERS (`movement.wander`: legs of a slow slither to points within 24 voxels of where it was born, each followed by a 3..12 s rest lying coiled -- the slither keeps its curve when the body stops), closes on anything of another faction that comes within sight, holds off at striking distance and throws `snake_strike`, its one style. Ranges are centre-to-centre and a snake's centre is nine voxels behind its own fangs, which is why the band (9..12) looks wide for a creature this small.",
       "//character": "STRIKE AND DRAW BACK. A 45-tick cadence, a short commit and a real disengage: a snake bites and recoils rather than standing in the fight, and the venom (the bite block in the sidecar) is what does the work afterwards. Sight 30 with the full 360: it feels you coming through the ground.",
       "name": "snake",
       "label": "Snake",
@@ -148,10 +148,11 @@
       "faction": "monster",
       "hysteresis": 0.3,
       "perception": { "sightRange": 30, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 200, "keepRangeScale": 1.5 },
-      "movement": { "mobile": true, "rangeMin": 9, "rangeMax": 12, "bandSlack": 2.0, "approachSpeed": 1.0, "strafeSpeed": 0.0, "retreatSpeed": 0.4, "circleTendency": 0.0, "circleHoldTicks": 40, "repathTicks": 14, "navRadius": 30 },
+      "movement": { "mobile": true, "rangeMin": 9, "rangeMax": 12, "bandSlack": 2.0, "approachSpeed": 1.0, "strafeSpeed": 0.0, "retreatSpeed": 0.4, "circleTendency": 0.0, "circleHoldTicks": 40, "repathTicks": 14, "navRadius": 30, "wander": { "radius": 24, "speed": 0.6, "pauseMin": 90, "pauseMax": 360, "arrive": 3 } },
       "attack": { "styles": ["snake_strike"], "reach": 12, "aimTolerance": 0.7, "cadenceTicks": 45, "jitterTicks": 15, "commitTicks": 10, "disengageTicks": 20, "pursueSpeed": 0.7, "leadTicks": 8 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "wander": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },
         "approach": { "weight": 1.4, "cooldownTicks": 0, "minDwellTicks": 8 },
         "holdRange": { "weight": 0.6, "cooldownTicks": 0, "minDwellTicks": 8 },

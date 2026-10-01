@@ -444,6 +444,15 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.movement.dodgeSpeed = q.value("dodgeSpeed", 1.3f);
       pr.movement.flank = std::clamp(q.value("flank", 0.0f), 0.0f, 1.0f);
       pr.movement.keepOut = q.value("keepOut", -1.0f);
+      if (q.contains("wander") && q["wander"].is_object()) {
+        const auto& w = q["wander"];
+        pr.movement.wanderRadius = std::max(0.0f, w.value("radius", 0.0f));
+        pr.movement.wanderSpeed = std::max(0.0f, w.value("speed", 0.5f));
+        pr.movement.wanderPauseMin = w.value("pauseMin", 60u);
+        pr.movement.wanderPauseMax =
+            std::max(pr.movement.wanderPauseMin, w.value("pauseMax", 180u));
+        pr.movement.wanderArrive = std::max(0.5f, w.value("arrive", 2.0f));
+      }
     }
     if (p.contains("attack")) {
       const auto& q = p["attack"];
@@ -621,7 +630,14 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"headroom\": " << p.movement.headroom
       << ", \"dodgeSpeed\": " << num(p.movement.dodgeSpeed)
       << ", \"flank\": " << num(p.movement.flank)
-      << ", \"keepOut\": " << num(p.movement.keepOut) << " },\n";
+      << ", \"keepOut\": " << num(p.movement.keepOut);
+    if (p.movement.wanderRadius > 0.0f)
+      o << ", \"wander\": { \"radius\": " << num(p.movement.wanderRadius)
+        << ", \"speed\": " << num(p.movement.wanderSpeed)
+        << ", \"pauseMin\": " << p.movement.wanderPauseMin
+        << ", \"pauseMax\": " << p.movement.wanderPauseMax
+        << ", \"arrive\": " << num(p.movement.wanderArrive) << " }";
+    o << " },\n";
     o << "      \"attack\": { \"styles\": [";
   for (size_t i = 0; i < p.attack.styles.size(); i++)
     o << (i ? ", " : "") << "\"" << p.attack.styles[i] << "\"";
@@ -1620,6 +1636,83 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // flat 1, while the resident layer has a routine on this brain. Everything
   // about WHEN it loses -- to a fight, to a fright -- is the profile's
   // weights and rules, like every other verb.
+  // ---- THE PROFILE'S OWN IDLE WANDER (Movement::wanderRadius) -------------
+  // A routine written HERE when no resident layer has one on this brain: a
+  // leg to a point round the anchor, then a pause. A target takes it back at
+  // once (the routine goes inactive, so `wander` scores 0 and the fight's
+  // verbs win on their own scores); losing the target hands it back on the
+  // next tick. Counter-based on (id, leg), so a replay walks the same legs.
+  if (pr.movement.wanderRadius > 0.0f && pr.movement.mobile &&
+      (!brain.routine.active || brain.wanderOwned)) {
+    Routine& r = brain.routine;
+    if (brain.hasTarget) {
+      if (brain.wanderOwned) {
+        r.active = false;
+        brain.wanderOwned = false;
+      }
+      // The current leg is abandoned: on the way back to idling the creature
+      // first rests where the fight left it.
+      brain.wanderPauseUntil = 0;
+      brain.wanderLegSince = 0;
+    } else {
+      const Vec3 foot = self.Foot();
+      const Movement& mv = pr.movement;
+      if (!brain.wanderAnchorSet) {
+        brain.wanderAnchorSet = true;
+        brain.wanderAnchor = foot;
+        brain.wanderLegSince = 0;
+      }
+      auto pauseDraw = [&]() {
+        const uint32_t span = mv.wanderPauseMax - mv.wanderPauseMin + 1u;
+        return mv.wanderPauseMin +
+               rng::Hash3((uint32_t)self.id ^ 0x3A11D3u, brain.wanderLeg, 7u) %
+                   std::max(1u, span);
+      };
+      auto newGoal = [&]() {
+        brain.wanderLeg++;
+        const uint32_t h =
+            rng::Hash3((uint32_t)self.id ^ 0x3A11D3u, brain.wanderLeg, 3u);
+        const float ang = (float)(h & 0xFFFFu) * (6.2831853f / 65536.0f);
+        const float u = (float)((h >> 16) & 0xFFFFu) / 65535.0f;
+        // sqrt: uniform over the disc's AREA; floored so a leg is a walk.
+        const float d = mv.wanderRadius * std::max(0.35f, std::sqrt(u));
+        brain.wanderGoal = Vec3{brain.wanderAnchor.x + std::cos(ang) * d,
+                                foot.y,
+                                brain.wanderAnchor.z + std::sin(ang) * d};
+        brain.wanderLegSince = tick;
+      };
+      // Rest, then walk the next leg; the leg's clock starts when the rest
+      // ends, so the stuck guard below never counts standing still.
+      auto restThenWalk = [&]() {
+        newGoal();
+        brain.wanderPauseUntil = tick + pauseDraw();
+        brain.wanderLegSince = brain.wanderPauseUntil;
+      };
+      // First idle tick, or the first after a fight.
+      if (brain.wanderLegSince == 0) restThenWalk();
+      const float dist = PlanarDist(foot, brain.wanderGoal);
+      // A leg that has taken twice its walking time is not getting there (a
+      // wall, a drop, a crowd): give it up like an arrival.
+      const float legSpeed =
+          std::max(0.5f, self.speed * std::max(0.05f, mv.wanderSpeed));
+      const uint32_t legBudget =
+          (uint32_t)(2.0f * 30.0f * (2.0f * mv.wanderRadius) / legSpeed) + 60u;
+      const bool resting = tick < brain.wanderPauseUntil;
+      if (!resting && (dist <= mv.wanderArrive ||
+                       tick - brain.wanderLegSince > legBudget))
+        restThenWalk();
+      r.active = true;
+      r.verb = Intent::Wander;
+      r.goal = brain.wanderGoal;
+      r.final = true;
+      r.arriveRadius = mv.wanderArrive;
+      r.speed = mv.wanderSpeed;
+      r.hold = tick < brain.wanderPauseUntil;
+      r.faceHeadingSet = false;
+      r.facePointSet = false;
+      brain.wanderOwned = true;
+    }
+  }
   brain.routine.arrived = false;
   if (brain.routine.active && (int)brain.routine.verb >= (int)Intent::Sleep &&
       (int)brain.routine.verb <= (int)Intent::Goto)
