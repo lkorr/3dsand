@@ -1123,6 +1123,25 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
 
   // ---- what is in flight ----------------------------------------------------
   const ImGuiPayload* live = ImGui::GetDragDropPayload();
+  // LOOK-ITERATION ONLY: `SANDVOX_UI_FAKE_DRAG=<glyph>` draws the page as if
+  // that glyph were held, so `--shot-spellpage` can photograph the candidate
+  // layer without a scripted mouse. Never delivered: a fake payload reaches
+  // `judge` and the markers, and no ImGui target ever accepts it.
+  {
+    static const char* fakeName = std::getenv("SANDVOX_UI_FAKE_DRAG");
+    static ImGuiPayload fake;
+    static char fakeBuf[64];
+    if (!live && fakeName && *fakeName) {
+      fake.Clear();
+      std::snprintf(fakeBuf, sizeof fakeBuf, "%s", fakeName);
+      std::snprintf(fake.DataType, sizeof fake.DataType, "%s", kPayloadGlyph);
+      fake.Data = fakeBuf;
+      fake.DataSize = (int)sizeof fakeBuf;
+      // IsDataType() is false on a payload with no frame stamp (Clear sets -1).
+      fake.DataFrameCount = ImGui::GetFrameCount();
+      live = &fake;
+    }
+  }
   const bool copyMod = ImGui::GetIO().KeyCtrl;
   const bool full = (int)s.grimoireEditWords.size() >= s.grimoireMaxWords;
   // Set by whichever target is under the cursor; drawn after every node, so a
@@ -1153,135 +1172,155 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
     return p >= 0 ? p : nodeIdx;
   };
 
-  // THE ONE DROP ROUTINE. Every target on the canvas calls it: it peeks at the
-  // payload, decides which tree op the gesture means, describes it to the
-  // marker layer, and only latches the intent on the actual release. The UI
-  // never applies an op — main.cpp does, from game/spellgraph.h, and answers a
-  // refusal on the status line.
-  enum class Tgt { Bar, Bus, Socket, Split, Body, PipL, PipR, Cell, Ahead };
-  auto offer = [&](Tgt tgt, int nodeIdx, ImVec2 a, ImVec2 b) {
-    if (!ImGui::BeginDragDropTarget()) return;
-    const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGraphNode, kPeekFlags);
-    const bool fromGraph = p != nullptr;
-    bool page = false;
-    if (!p) p = ImGui::AcceptDragDropPayload(kPayloadGlyph, kPeekFlags);
-    if (!p) {
-      p = ImGui::AcceptDragDropPayload(kPayloadPage, kPeekFlags);
-      page = p != nullptr;
+  // WHICH BOX AN ITEM STANDS IN (2026-10-01). A word cell carries its `lane`
+  // but not the box it is in, and the drop that matters most - "put this next
+  // to THAT word" - needs both. The edges know: every item's FIRST outgoing
+  // stroke runs toward its box (into the bus, a socket, the anchor, or the
+  // operator it is an operand of, which is itself an item), so the box is the
+  // first piece of box furniture up that chain. `up` is built once a frame.
+  std::vector<int> up(g.nodes.size(), -1);
+  for (const UIState::SpellGraphUI::Edge& e : g.edges)
+    if (e.from >= 0 && e.from < (int)up.size() && e.to >= 0 &&
+        e.to < (int)g.nodes.size() && up[(size_t)e.from] < 0)
+      up[(size_t)e.from] = e.to;
+  auto itemBox = [&](int idx) {
+    int cur = primaryOf(idx);
+    for (int step = 0; step < 64 && cur >= 0; step++) {
+      const int to = up[(size_t)cur];
+      if (to < 0) return -1;
+      const int k = g.nodes[(size_t)to].kind;
+      if (k == kBus || k == kSocket || k == kSplit) {
+        const int o = boxOf(to);
+        return o >= 0 ? primaryOf(o) : -1;
+      }
+      if (k == kJoin || k == kRoot) return primaryOf(to);
+      cur = to;
     }
-    if (!p) {
-      ImGui::EndDragDropTarget();
-      return;
-    }
-    const bool deliver = p->IsDelivery();
+    return -1;
+  };
+  // Is box `inner` the box `outer` or anywhere inside it? A branch moved into
+  // its own contents has nowhere to be, and the candidate layer must not offer
+  // the drop only for main.cpp to refuse it after the release.
+  auto boxWithin = [&](int inner, int outer) {
+    for (int b = inner, step = 0; b >= 0 && step < 64; b = itemBox(b), step++)
+      if (b == outer) return true;
+    return false;
+  };
+
+  // THE ONE DROP DECISION. Pure: given a target and a payload, which tree op
+  // the gesture means and what to say about it - or why not. Called by the
+  // hovered target (which latches the op on release) AND by every other
+  // target on the page while a drag is in flight, which is what lets the page
+  // mark EVERY place the held thing could go instead of only the one under
+  // the cursor. The UI never applies an op — main.cpp does, from
+  // game/spellgraph.h, and answers a refusal on the status line.
+  //
+  // `say == nullptr` on a refusal means SILENT: a drop that would change
+  // nothing (a word onto itself), which deserves neither a marker nor a
+  // sentence.
+  enum class Tgt { Bar, Bus, Socket, Split, Body, PipL, PipR, Cell, Ahead, Beside };
+  struct Verdict {
+    bool ok = false;
+    const char* say = nullptr;
+    UIState::GraphEditIntent e;
+  };
+  auto judge = [&](Tgt tgt, int nodeIdx, const ImGuiPayload* p) -> Verdict {
+    Verdict v;
+    auto no = [&](const char* why) {
+      v.ok = false;
+      v.say = why;
+      return v;
+    };
+    if (!p || nodeIdx < 0 || nodeIdx >= (int)g.nodes.size()) return no(nullptr);
+    const bool fromGraph = p->IsDataType(kPayloadGraphNode);
+    const bool page = p->IsDataType(kPayloadPage);
+    if (!fromGraph && !page && !p->IsDataType(kPayloadGlyph)) return no(nullptr);
     const UIState::SpellGraphUI::Node& n = g.nodes[(size_t)nodeIdx];
-    auto refuse = [&](const char* why) {
-      refuseA = a;
-      refuseB = b;
-      hasRefuse = true;
-      sNote = why;
-      res.refused = true;
-    };
-    auto accept = [&](const char* what) {
-      acceptA = a;
-      acceptB = b;
-      hasAccept = true;
-      if (sNote.empty()) sNote = what;
-    };
-    if (readOnly) {
-      refuse("an authored page cannot be changed - copy it to make one of your own");
-      ImGui::EndDragDropTarget();
-      return;
-    }
+    if (readOnly)
+      return no("an authored page cannot be changed - copy it to make one of your own");
 
     const char* name = fromGraph ? nullptr : (const char*)p->Data;
     const int srcGraph = fromGraph ? *(const int*)p->Data : -1;
+    if (fromGraph && (srcGraph < 0 || srcGraph >= (int)g.nodes.size() ||
+                      g.nodes[(size_t)srcGraph].treeNode < 0))
+      return no(nullptr);
     const int sort = fromGraph ? -2 : PayloadSort(s, page, name);
-    if (sort == kSeparator) {
-      refuse("`lane` and `end` are structure, not items - drop onto a socket "
-             "instead");
-      ImGui::EndDragDropTarget();
-      return;
-    }
-    if (!fromGraph && full) {
-      refuse("this page is full - remove a word to make room");
-      ImGui::EndDragDropTarget();
-      return;
-    }
+    if (sort == kSeparator)
+      return no("`lane` and `end` are structure, not items - drop onto a socket "
+                "instead");
+    if (!fromGraph && full) return no("this page is full - remove a word to make room");
 
-    UIState::GraphEditIntent e;
+    UIState::GraphEditIntent& e = v.e;
     const char* say = nullptr;
+    // Which BOX, and which LANE of it, for every target that puts something
+    // INTO a box's pile; resolved by the cases below, then shared.
+    int boxIdx = -1, lane = 0;
     switch (tgt) {
       case Tgt::Cell: {
         // The body of an operator: fill the first EMPTY slot, left before
         // right. Left is "the word before it", which is the one a player
         // dragging at a hollow pip is usually aiming for; the pips themselves
         // are still there to say "the other one".
-        if (fromGraph) {
-          refuse("drop a branch on a socket or a bus, not into an operator");
-          ImGui::EndDragDropTarget();
-          return;
-        }
+        if (fromGraph) return no("drop a branch on a socket or a bus, not into an operator");
         const int side = (n.hasLeft && !n.leftFilled) ? 0
                        : (n.hasRight && !n.rightFilled) ? 1 : -1;
-        if (side < 0) {
-          refuse("both of this operator's slots are filled");
-          ImGui::EndDragDropTarget();
-          return;
-        }
+        if (side < 0) return no("both of this operator's slots are filled");
         e.op = UIState::GraphEditIntent::FillSlot;
         e.treeNode = n.treeNode;
         e.side = side;
         e.glyphId = name;
-        say = side == 0 ? "fill this operator's left slot"
-                        : "fill this operator's right slot";
-        break;
+        v.ok = true;
+        v.say = side == 0 ? "fill this operator's left slot"
+                          : "fill this operator's right slot";
+        return v;
       }
       case Tgt::PipL:
       case Tgt::PipR: {
-        if (fromGraph) {
-          refuse("a slot takes a word from the arsenal, not a branch");
-          ImGui::EndDragDropTarget();
-          return;
-        }
+        if (fromGraph) return no("a slot takes a word from the arsenal, not a branch");
         e.op = UIState::GraphEditIntent::FillSlot;
         e.treeNode = n.treeNode;
         e.side = tgt == Tgt::PipL ? 0 : 1;
         e.glyphId = name;
-        say = tgt == Tgt::PipL ? "fill this operator's left slot"
-                               : "fill this operator's right slot";
-        break;
+        v.ok = true;
+        v.say = tgt == Tgt::PipL ? "fill this operator's left slot"
+                                 : "fill this operator's right slot";
+        return v;
       }
       case Tgt::Ahead: {
         // The empty slot off the top of the page: the whole sentence goes in
         // this delivery. `nodeIdx` is the HAND, and `WrapInBox` on a box with
         // no parent is exactly "a delivery word at the end of a sentence".
-        if (fromGraph || sort != kDelivery) {
-          refuse("only a delivery goes here - it boxes the whole spell");
-          ImGui::EndDragDropTarget();
-          return;
-        }
+        if (fromGraph || sort != kDelivery)
+          return no("only a delivery goes here - it boxes the whole spell");
         e.op = UIState::GraphEditIntent::Wrap;
         e.treeNode = n.treeNode;
         e.glyphId = name;
-        say = "box the WHOLE spell in this delivery";
-        break;
+        v.ok = true;
+        v.say = "box the WHOLE spell in this delivery";
+        return v;
       }
       case Tgt::Body: {
-        if (fromGraph) {
-          refuse("drop a branch on a socket or a bus, not on another word");
-          ImGui::EndDragDropTarget();
-          return;
-        }
-        if (sort != kDelivery) {
-          refuse("only a delivery boxes a branch - drop a word on the bus");
-          ImGui::EndDragDropTarget();
-          return;
-        }
+        if (fromGraph) return no(nullptr);
+        if (sort != kDelivery)
+          return no("only a delivery boxes a branch - drop a word on the bus");
         e.op = UIState::GraphEditIntent::Wrap;
         e.treeNode = n.treeNode;
         e.glyphId = name;
-        say = "box this branch in a delivery of its own";
+        v.ok = true;
+        v.say = "box this branch in a delivery of its own";
+        return v;
+      }
+      case Tgt::Beside: {
+        // ONTO ANOTHER WORD = BESIDE IT (2026-10-01). A word cell used to
+        // refuse everything but a delivery, so most of a drawing was dead
+        // ground under a drag and "put it next to fire" meant hunting for the
+        // bus fire hangs off. The obvious reading of dropping one word on
+        // another is "into the same pile", and that is what it does: the box
+        // and lane the target word stands in.
+        if (fromGraph && primaryOf(srcGraph) == primaryOf(nodeIdx)) return no(nullptr);
+        boxIdx = itemBox(nodeIdx);
+        if (boxIdx < 0) return no("that word stands in no box");
+        lane = n.lane;
         break;
       }
       case Tgt::Bar:
@@ -1292,8 +1331,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // segment (lane 0); a socket is instance i's own lane, and a socket
         // with no lane yet OPENS the next one (spellgraph.h: lane ==
         // laneCount + 1 opens, anything past that is refused).
-        int boxIdx = primaryOf(nodeIdx);
-        int lane = 0;
+        boxIdx = primaryOf(nodeIdx);
         if (tgt == Tgt::Bar) {
           // A SPLIT DELIVERY IS DRAWN ONCE PER BRANCH, and a drop on branch k's
           // cell is a drop on branch k — which is a 64 px target for the
@@ -1306,11 +1344,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           // cell that owns them. The junction is a SHARED target (lane 0), like
           // the bus - it is the one line every branch comes out of.
           boxIdx = boxOf(nodeIdx);
-          if (boxIdx < 0) {
-            refuse("that mark has no box");
-            ImGui::EndDragDropTarget();
-            return;
-          }
+          if (boxIdx < 0) return no("that mark has no box");
           if (tgt == Tgt::Socket) {
             // EVERY SOCKET IS A TARGET. This used to refuse any socket past
             // `laneCount + 1` with "give the sockets before this one a payload
@@ -1323,13 +1357,20 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
             lane = n.lane > 0 ? n.lane : n.instance + 1;
           }
         }
+        break;
+      }
+    }
+    {
         const UIState::SpellGraphUI::Node& bn = g.nodes[(size_t)boxIdx];
         if (fromGraph) {
-          if (srcGraph < 0 || srcGraph >= (int)g.nodes.size() ||
-              g.nodes[(size_t)srcGraph].treeNode < 0) {
-            ImGui::EndDragDropTarget();
-            return;
-          }
+          const int src = primaryOf(srcGraph);
+          // NOWHERE TO GO: already in this pile (a move that is no move), or
+          // into its own contents.
+          if (!copyMod && itemBox(src) == boxIdx &&
+              g.nodes[(size_t)src].lane == lane)
+            return no(nullptr);
+          if ((g.nodes[(size_t)src].kind == kJoin) && boxWithin(boxIdx, src))
+            return no("a branch cannot go inside itself");
           e.op = UIState::GraphEditIntent::Move;
           e.treeNode = g.nodes[(size_t)srcGraph].treeNode;
           e.boxTreeNode = bn.treeNode;
@@ -1385,20 +1426,59 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           say = lane > 0 ? "this word rides that instance alone"
                          : "this word joins the shared payload";
         }
-        break;
-      }
     }
-    accept(say);
+    v.ok = true;
+    v.say = say;
+    return v;
+  };
+
+  // EVERY TARGET ON THE PAGE, this frame, so the candidate layer can ask
+  // `judge` about each of them once the drawing is done.
+  struct Target {
+    Tgt tgt;
+    int node;
+    ImVec2 a, b;
+  };
+  std::vector<Target> targets;
+
+  // THE HOVERED TARGET: peek at the payload, ask `judge`, describe the answer
+  // to the marker layer, and only latch the intent on the actual release.
+  auto offer = [&](Tgt tgt, int nodeIdx, ImVec2 a, ImVec2 b) {
+    targets.push_back({tgt, nodeIdx, a, b});
+    if (!ImGui::BeginDragDropTarget()) return;
+    const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGraphNode, kPeekFlags);
+    if (!p) p = ImGui::AcceptDragDropPayload(kPayloadGlyph, kPeekFlags);
+    if (!p) p = ImGui::AcceptDragDropPayload(kPayloadPage, kPeekFlags);
+    if (!p) {
+      ImGui::EndDragDropTarget();
+      return;
+    }
+    Verdict v = judge(tgt, nodeIdx, p);
+    if (!v.ok) {
+      if (v.say) {
+        refuseA = a;
+        refuseB = b;
+        hasRefuse = true;
+        sNote = v.say;
+        res.refused = true;
+      }
+      ImGui::EndDragDropTarget();
+      return;
+    }
+    acceptA = a;
+    acceptB = b;
+    hasAccept = true;
+    if (sNote.empty() && v.say) sNote = v.say;
     // The ghost: where the node will land. A socket's whole column, a pip's
     // ring, a bar's own rect - the marker layer draws the same shape as the
     // thing that is coming.
     ghostA = a;
     ghostB = b;
     hasGhost = true;
-    if (deliver) {
+    if (p->IsDelivery()) {
       PushGrimoireUndo(s);
-      e.pending = true;
-      s.graphEdit = e;
+      v.e.pending = true;
+      s.graphEdit = v.e;
     }
     ImGui::EndDragDropTarget();
   };
@@ -1947,6 +2027,9 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           s.graphEdit.op = UIState::GraphEditIntent::Remove;
           s.graphEdit.treeNode = n.treeNode;
         }
+        // A bead is in its box's pile like any word, so a drop on it lands
+        // beside it - one less dead patch on the trunk under a drag.
+        if (!readOnly && n.treeNode >= 0 && live) offer(Tgt::Beside, (int)i, a, b);
         break;
       }
       case kHole: {
@@ -2035,12 +2118,17 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         //                  and that is the one a player is usually aiming at.
         // The pips are submitted AFTER this and so still win where they
         // overlap, which is what keeps "that slot, specifically" sayable.
+        //   anything else, anywhere else -> BESIDE this word, in its pile.
         if (!readOnly && n.treeNode >= 0 && live) {
           const bool deliveryDrag = live->IsDataType(kPayloadGlyph) &&
                                     PayloadSort(s, false, (const char*)live->Data) == kDelivery;
+          const bool fromGraph = live->IsDataType(kPayloadGraphNode);
           if (deliveryDrag) offer(Tgt::Body, (int)i, a, b);
-          else if (op && ((n.hasLeft && !n.leftFilled) || (n.hasRight && !n.rightFilled)))
+          else if (!fromGraph && op &&
+                   ((n.hasLeft && !n.leftFilled) || (n.hasRight && !n.rightFilled)))
             offer(Tgt::Cell, (int)i, a, b);
+          else
+            offer(Tgt::Beside, (int)i, a, b);
         }
         if (!readOnly && n.treeNode >= 0 && ImGui::BeginDragDropSource()) {
           int idx = (int)i;
@@ -2143,6 +2231,73 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
       ImGui::InvisibleButton("##ahead", ImVec2(h, h));
       offer(Tgt::Ahead, rootIdx, a, b);
       ImGui::PopID();
+    }
+  }
+
+  // ---- THE CANDIDATE LAYER: every place the held thing can go -----------------
+  //
+  // (2026-10-01, asked for.) A drop target used to be invisible until the
+  // cursor was already on it, so placing a word was a hunt: sweep the drawing
+  // and wait for a ring to appear. Now the moment a drag is in flight, EVERY
+  // target `judge` would accept is marked at once - a faint minium wash and
+  // four pulsing corner ticks - and the one under the cursor keeps its full
+  // marker below. Targets that would refuse are left alone: the page shows
+  // where you CAN go, and only the spot you are actually on explains a "no".
+  // When nothing on the page can take the payload, the reason the hand (the
+  // one target every page has) gives is put on the status line instead, so a
+  // drag with nowhere to land still says why.
+  int candidates = 0;
+  const char* noWhere = nullptr;
+  if (live && !readOnly) {
+    const float pulse =
+        0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f);
+    for (const Target& t : targets) {
+      const Verdict v = judge(t.tgt, t.node, live);
+      if (!v.ok) {
+        if (!noWhere && v.say && g.nodes[(size_t)t.node].kind == kRoot) noWhere = v.say;
+        continue;
+      }
+      candidates++;
+      if (hasAccept && t.a.x == acceptA.x && t.a.y == acceptA.y &&
+          t.b.x == acceptB.x && t.b.y == acceptB.y)
+        continue;   // the hovered one gets the full marker below
+      if (t.tgt == Tgt::Socket) {
+        // A SOCKET'S TARGET IS ITS WHOLE COLUMN, and the columns tile, so
+        // marking each one's rect drew the socket row as one long smudge. The
+        // pip is what the eye is looking for: ring it.
+        const ImVec2 c(std::floor((t.a.x + t.b.x) * 0.5f), std::floor((t.a.y + t.b.y) * 0.5f));
+        const float r = std::max(7.0f, std::floor((t.b.y - t.a.y) * 0.5f) - 2.0f);
+        PixelDisc(dl, c, r, Fade(ColRubricHi(), 0.10f + 0.08f * pulse));
+        PixelRing(dl, c, r, Fade(ColRubric(), 0.55f + 0.4f * pulse), 2.0f);
+        continue;
+      }
+      const ImVec2 a(std::floor(t.a.x) - 2, std::floor(t.a.y) - 2);
+      const ImVec2 b(std::floor(t.b.x) + 2, std::floor(t.b.y) + 2);
+      dl->AddRectFilled(a, b, Fade(ColRubricHi(), 0.08f + 0.06f * pulse));
+      const ImU32 c = Fade(ColRubric(), 0.55f + 0.4f * pulse);
+      const float tl = std::max(4.0f, std::min(10.0f, std::floor((b.x - a.x) * 0.25f)));
+      for (int k = 0; k < 4; k++) {
+        const float x = (k & 1) ? b.x - tl : a.x;
+        const float y = (k & 2) ? b.y - 2 : a.y;
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + tl, y + 2), c);
+        const float vx = (k & 1) ? b.x - 2 : a.x;
+        const float vy = (k & 2) ? b.y - tl : a.y;
+        dl->AddRectFilled(ImVec2(vx, vy), ImVec2(vx + 2, vy + tl), c);
+      }
+    }
+    // Off every target: say what the marks mean, or why there are none. Only
+    // while the cursor is over the sheet - the canvas speaks first on the
+    // status line, and over the word row it is the row's turn.
+    const ImVec2 m = ImGui::GetIO().MousePos;
+    const bool overSheet = m.x >= viewMin.x && m.x < viewMax.x && m.y >= viewMin.y &&
+                           m.y < viewMax.y;
+    if (overSheet && !hasAccept && !hasRefuse) {
+      if (candidates > 0) {
+        sNote = "drop it on any marked place";
+      } else if (noWhere) {
+        sNote = noWhere;
+        res.refused = true;
+      }
     }
   }
 

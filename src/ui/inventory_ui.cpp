@@ -1179,6 +1179,26 @@ float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
       std::snprintf(k, sizeof k, bank ? "S%d" : "%d", (col + 1) % 10);
       ui::KeyBadge(dl, ImVec2(gx + 2, gy + 2), k);
     }
+    // EVERY KEY IS A PLACE IT CAN GO (2026-10-01): while a word, a page or a
+    // bound key is held, each key that would take it wears a pulsing gold
+    // rim, so binding is aiming at a lit row rather than at a guess. The key
+    // the drag came from is the one place it cannot go.
+    if (const ImGuiPayload* lp = ImGui::GetDragDropPayload()) {
+      const bool fromKey = lp->IsDataType(kPayloadBound);
+      const bool bindable = fromKey || lp->IsDataType(kPayloadGlyph) ||
+                            lp->IsDataType(kPayloadPage);
+      if (bindable && !(fromKey && *(const int*)lp->Data == i)) {
+        const float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f);
+        // Mouse-in-rect, not IsItemHovered: the drag source is the active
+        // item, and a plain hover test is blocked by it.
+        const ImVec2 m = ImGui::GetIO().MousePos;
+        const bool over = m.x >= gx && m.x < gx + kSlot && m.y >= gy && m.y < gy + kSlot;
+        const float o = over ? 3.0f : 1.0f;
+        dl->AddRect(ImVec2(gx - o, gy - o), ImVec2(gx + kSlot + o, gy + kSlot + o),
+                    Fade(ui::ColGoldHi(), over ? 1.0f : 0.35f + 0.4f * pulse), 0.0f, 0,
+                    2.0f);
+      }
+    }
     // A bound key is a drag SOURCE as well as a target: dragging one onto
     // another moves the binding there and swaps with whatever that key held.
     // Rearranging the row used to mean finding both words in the table again
@@ -1867,6 +1887,28 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         ImGui::EndDragDropTarget();
       }
       ImGui::PopID();
+    }
+    // EVERY SEAM A DROP COULD LAND IN, while a word or a page is in flight
+    // (2026-10-01): a faint caret at each one, so the row says where it can
+    // take the thing before the cursor gets there. The seam under the cursor
+    // gets the full gold caret below. A held row word skips the two seams
+    // beside its own cell - dropping it there would put it where it already is.
+    {
+      const bool rowDrag = live && !readOnly &&
+                           (dragWord || live->IsDataType(kPayloadGlyph) ||
+                            live->IsDataType(kPayloadPage));
+      const bool canGrow = !full || (dragWord && !copyMod);
+      if (rowDrag && canGrow) {
+        const float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f);
+        const ImU32 c = Fade(ui::ColGold(), 0.35f + 0.35f * pulse);
+        for (int k = 0; k <= nWords && k < cells; k++) {
+          if (k == caretAt) continue;
+          if (dragWord && !copyMod && (k == dragFrom || k == dragFrom + 1)) continue;
+          const ImVec2 cp = cellAt(k);
+          const float x = std::floor(k % perRow == 0 ? cp.x + 1 : cp.x - 3);
+          cd->AddRectFilled(ImVec2(x + 1, cp.y + 4), ImVec2(x + 3, cp.y + kWSlot - 4), c);
+        }
+      }
     }
     // THE MARKER LAYER, over the whole row so a marker at a cell's edge is
     // never buried by the next cell's recess.
