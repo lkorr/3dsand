@@ -492,9 +492,9 @@ for f in "${FILES[@]}"; do
   stripDraftB=1; stripDraftU=0
   if grep -q '> draftField' "$f"; then stripDraftB=0; stripDraftU=1; fi
   # THE TICKET PROBE (LoadShader's BodyResolvesTickets): BOUND for a body that
-  # declares `> pageTable` and no `uniform> R :`, UNBOUND otherwise.
+  # declares `>` + optional whitespace + `pageTable` and no `uniform> R :`.
   stripTicketB=1; stripTicketU=0
-  if grep -qE '>[[:space:]]+pageTable' "$f" && ! grep -q 'uniform> R :' "$f"; then
+  if grep -qE '>[[:space:]]*pageTable' "$f" && ! grep -q 'uniform> R :' "$f"; then
     stripTicketB=0; stripTicketU=1
   fi
   commonSrc="$TMP/common_${name}"

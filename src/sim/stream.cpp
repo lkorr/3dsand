@@ -1263,10 +1263,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake,
   // Whatever dissolved mass is kept for the chunks now in these slots goes
   // back onto the GPU (after the voxels, so the solvent it rides is there).
   RestoreSolutes(slots);
-  // Far landings parked on a chunk that just became resident are re-thrown
-  // (P2, tickets.h): the window arriving is one of the two ways a landing
-  // materializes; a ticket activating over it is the other.
-  for (uint32_t s : slots) tickets_.OnChunkResident(world_->SlotToWorldChunk(s));
+  // (Far landings parked on a chunk that just became resident are re-thrown by
+  // the next ticket step, which asks residency directly: Tickets::
+  // QueueResidentLandings. The window arriving and a ticket are both doors.)
 }
 
 // ---- the deferred wake's second half -------------------------------------

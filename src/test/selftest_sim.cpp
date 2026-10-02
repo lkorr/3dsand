@@ -4859,14 +4859,61 @@ uint32_t MatAt(GpuContext& ctx, World& world, IVec3 cell) {
   return chunk[k] & 0xFFFu;
 }
 
+// THE TICKET ARM (chunk tickets, docs/PLAN_chunk_tickets.md): a ticket 40
+// chunks past the window's +X face, requested at kTicketReqTick by the gate
+// (an EXTERNAL request: the replay re-queues it from the recorded activation)
+// and poured into at kTicketPourTick by cell ops (recorded like any other).
+// Everything after — the pile settling, the idle release, the store decision —
+// the replay re-derives by running the same ticket step, and the world hash
+// covers the ticket's slots while it is live.
+constexpr uint32_t kTicketReqTick = 10, kTicketPourTick = 12;
+IVec3 TicketCentre(const World& world, uint32_t seed) {
+  const IVec3 wo = world.WindowOrigin();
+  const int cx = wo.x + (int)kNChunk - 1 + 40, cz = wo.z + (int)kNChunk / 2;
+  const int g = World::TerrainHeight(cx * (int)kChunk + 8, cz * (int)kChunk + 8, seed);
+  return {cx, (g + 6) >> 4, cz};
+}
+std::vector<CellOp> TicketPour(const World& world, IVec3 centre, uint32_t seed) {
+  std::vector<CellOp> pour;
+  const int g = World::TerrainHeight(centre.x * (int)kChunk + 8,
+                                     centre.z * (int)kChunk + 8, seed);
+  for (int y = g + 3; y < g + 7; y++)
+    for (int z = 0; z < (int)kChunk; z++)
+      for (int x = 0; x < (int)kChunk; x++) {
+        const uint32_t ci = world.ResidentCellIndex(
+            {centre.x * (int)kChunk + x, y, centre.z * (int)kChunk + z});
+        if (ci != World::kTicketSlotNone)
+          pour.push_back({ci, PackVoxNew(kMatSand, 0) | kCellOpIfAir});
+      }
+  return pour;
+}
+
 // Drive one pass of the scene, collecting a hash every kProbeEvery ticks.
-void RunScene(Ctx& c, const Scene& sc, std::vector<uint32_t>& hashes) {
+// `ticketPour`: how many sand cells the ticket arm poured.
+void RunScene(Ctx& c, const Scene& sc, std::vector<uint32_t>& hashes,
+              uint32_t& ticketPour) {
+  // The store starts empty (and every ticket dropped): pass B must not find
+  // pass A's released pile in it — that would be the store working, not a
+  // replay reproducing.
+  c.stream.OnRegen();
   SubmitWorldgen(c.ctx, c.world, c.sim, sc.seed);
   c.ctx.WaitIdle();
   hashes.clear();
+  const IVec3 tc = TicketCentre(c.world, sc.seed);
+  ticketPour = 0;
   for (uint32_t t = 1; t <= (uint32_t)kTicks; t++) {
+    if (t == kTicketReqTick) c.stream.TicketSet().Request(tc, TicketReason::Gate, t);
+    // The between-ticks ticket step (Stream::Update's, which this harness
+    // does not run), before the tick's submit as in the game.
+    c.stream.TicketTick(t);
+    std::vector<CellOp> cells = sc.Cells(t);
+    if (t == kTicketPourTick) {
+      const std::vector<CellOp> pour = TicketPour(c.world, tc, sc.seed);
+      ticketPour = (uint32_t)pour.size();
+      cells.insert(cells.end(), pour.begin(), pour.end());
+    }
     SubmitTick(c.ctx, c.world, c.sim, t, sc.seed, sc.Ops(t), sc.Exps(t),
-               sc.Cells(t), true, {8, 3, 8}, false, t >= 60);
+               cells, true, {8, 3, 8}, false, t >= 60);
     if (t % kProbeEvery == 0 || t == (uint32_t)kTicks)
       hashes.push_back(ReadHashSync(c.ctx, c.world));
   }
@@ -4901,7 +4948,10 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
 
   // ---- pass A: play the scene with the recorder on ------------------------
   std::vector<uint32_t> hashA;
-  RunScene(c, sc, hashA);
+  uint32_t ticketPour = 0;
+  const uint64_t act0 = c.stream.TicketSet().Stats().activated;
+  RunScene(c, sc, hashA, ticketPour);
+  const uint64_t ticketActA = c.stream.TicketSet().Stats().activated - act0;
   const uint32_t matBrushA = MatAt(c.ctx, c.world, sc.BrushProbe());
   const uint32_t matCtrlA = MatAt(c.ctx, c.world, sc.BrushControl());
   const uint32_t matCellA = MatAt(c.ctx, c.world, sc.CellProbe());
@@ -4926,10 +4976,18 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
     ~ReplayArm() { ops::SetReplay(nullptr); }
   } arm(&log);
 
+  c.stream.OnRegen();  // as pass A: an empty store, no ticket
   SubmitWorldgen(c.ctx, c.world, c.sim, log.header.seed);
   c.ctx.WaitIdle();
   std::vector<uint32_t> hashB;
+  uint32_t ticketOpsRecorded = 0;
+  for (const ops::Frame& f : log.frames) ticketOpsRecorded += (uint32_t)f.tickets.size();
   for (const ops::Frame& f : log.frames) {
+    // THE TICKET STEP, re-derived (oprecord.h InjectTicketRequestsIfReplaying):
+    // the gate's own request comes back from the recorded activation, and
+    // every later decision is the policy's, compared op by op in NoteTicketOp.
+    ops::InjectTicketRequestsIfReplaying(f.in.tick, c.stream.TicketSet());
+    c.stream.TicketTick(f.in.tick);
     // ---- M9.3-C: THE PHASE-B POSITION OF THIS DRIVE LOOP ----------------
     //
     // A chunk resync is a per-tick INPUT that is not an op (oprecord.h's
@@ -4951,6 +5009,8 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
   const uint32_t matBrushB = MatAt(c.ctx, c.world, sc.BrushProbe());
   const uint32_t matCellB = MatAt(c.ctx, c.world, sc.CellProbe());
   const uint32_t paramMiss = ops::ReplayParamMismatches();
+  const uint32_t ticketMiss = ops::ReplayTicketMismatches();
+  const uint32_t ticketOpsReplayed = ops::ReplayTicketOps();
 
   // ---- the verdict --------------------------------------------------------
   std::string fails;
@@ -4975,6 +5035,15 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
                 "input stream",
                 paramMiss, ops::ReplayFirstMismatchTick(),
                 ops::ReplayFirstMismatchWord()));
+  // THE TICKET ARM: the recording opened one, poured into it, and the replay
+  // took the same decisions (none different, none missing).
+  if (ticketActA == 0 || ticketPour == 0)
+    fail(Format("ticket arm never ran (%llu activations, %u pour cells)",
+                (unsigned long long)ticketActA, ticketPour));
+  if (ticketMiss != 0 || ticketOpsReplayed != ticketOpsRecorded)
+    fail(Format("ticket decisions diverged on replay: %u differed, %u taken vs %u "
+                "recorded",
+                ticketMiss, ticketOpsReplayed, ticketOpsRecorded));
   // L5: the contested brush cell belongs to op index 0 (stone), not op 1
   // (wood), and it says so on BOTH runs.
   if (matCtrlA != kMatStone)
@@ -5009,13 +5078,15 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
     std::snprintf(note, sizeof(note), ", record %llu B", (unsigned long long)bytes);
 
   const ops::StreamCounts& sccount = ops::Counts();
-  char buf[640];
+  char buf[960];
   std::snprintf(buf, sizeof(buf),
                 "%s (%u frames, %zu hash probes reproduced%s | contested brush "
-                "cell -> mat %u on both runs | cell dupes dropped %u over %u "
-                "ticks | clamps b%u e%u c%u s%u f%u%s%s)",
+                "cell -> mat %u on both runs | ticket: %u decisions recorded, %u "
+                "replayed, %u differed, %u sand poured | cell dupes dropped %u "
+                "over %u ticks | clamps b%u e%u c%u s%u f%u%s%s)",
                 fails.empty() ? "PASS" : "FAIL", frames, hashA.size(), note,
-                matBrushA, sccount.cellDupes, sccount.ticksWithDupes,
+                matBrushA, ticketOpsRecorded, ticketOpsReplayed, ticketMiss,
+                ticketPour, sccount.cellDupes, sccount.ticksWithDupes,
                 sccount.brushTrunc, sccount.expTrunc, sccount.cellTrunc,
                 sccount.spawnTrunc, sccount.fluidTrunc,
                 fails.empty() ? "" : " | ", fails.c_str());

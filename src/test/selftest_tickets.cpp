@@ -503,6 +503,9 @@ struct LandRun {
   int particlesGoneAt = -1;
   // arm B: the cap is full, the stone deposits and comes back later
   uint64_t refusedCap = 0, deposited = 0, respawned = 0;
+  // Re-thrown while the gate had asked for nothing: the landing asked for a
+  // ticket itself the moment an index freed (Tickets::AskForLandings).
+  uint64_t respawnedUnasked = 0;
   uint32_t parkedAtFull = 0, landedLater = 0;
   IVec3 landingChunk{};
   bool landingHeld = false, landingGranted = false;
@@ -599,12 +602,23 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
   R.refusedCap = T.Stats().refusedCap - refused0;
   R.deposited = T.Stats().landingsDeposited - dep0;
   R.parkedAtFull = T.Stats().landingsParked;
-  // Free the cap the way the world does (they idle out), then ask for the
-  // chunk the landing is waiting on (the one its deposit named, which is
-  // what a granted particle request would have named); it re-throws the
-  // tick that chunk is resident.
-  for (int i = 0; i < 120 && c.stream.TicketSet().LiveCount() > 0; i++) tick();
+  // Free the cap the way the world does (they idle out). The landing does
+  // not wait for the window: the step an index is free it asks for a ticket
+  // over its own chunk (Tickets::AskForLandings), is re-thrown, lands, and
+  // that ticket idles out in turn — all with no request from this gate.
+  // Then the gate asks for the chunk the landing was waiting on, and the
+  // stone must be in it (decoded back from the store).
+  for (int i = 0; i < 200 && c.stream.TicketSet().LiveCount() > 0; i++) tick();
   R.capLiveAfter = c.stream.TicketSet().LiveCount();
+  // A released index is RELEASING until its store decision lands
+  // (kSnapshotLatency ticks); the landing asks the step one is Free.
+  for (int i = 0; i < 2 * (int)World::kSnapshotLatency + 4 &&
+                  T.Stats().landingsRespawned == resp0;
+       i++)
+    tick();
+  R.respawnedUnasked = T.Stats().landingsRespawned - resp0;
+  // ...and its ticket idles out in turn.
+  for (int i = 0; i < 200 && c.stream.TicketSet().LiveCount() > 0; i++) tick();
   // A released index stays RELEASING (not reusable) until its store decision
   // lands, kSnapshotLatency ticks on: wait that out before asking again.
   for (int i = 0; i < (int)World::kSnapshotLatency + 2; i++) tick();
@@ -649,7 +663,7 @@ Status GateTicketLand(Ctx& c, std::string& detail) {
   const bool stored = A.released && A.inStore == 2;
   const bool refused = B.refusedCap > 0 && A.refusedCap > 0;
   const bool deposited = A.deposited == 1 && A.parkedAtFull >= 1;
-  const bool cameBack = A.respawned == 1 && A.landedLater == 1;
+  const bool cameBack = A.respawned == 1 && A.landedLater == 1 && A.respawnedUnasked == 1;
   const bool same = A.landTick == B.landTick && A.activateTick == B.activateTick &&
                     A.storeHash == B.storeHash && A.inStore == B.inStore &&
                     A.landedLater == B.landedLater;
@@ -663,15 +677,17 @@ Status GateTicketLand(Ctx& c, std::string& detail) {
       "%s, %u stone voxel(s) in the store after (want 2) [particles peak %u, all "
       "gone at t+%d, far-box kills %u]; arm B (cap full): %llu request(s) "
       "refused, %llu deposited, %u parked on the CPU (waiting on chunk "
-      "(%d,%d,%d)%s), cap tickets still live after 120 ticks %u, its ticket %s, "
-      "%llu re-thrown, %u landed (want 1); page faults %u/%u; run twice: %s",
+      "(%d,%d,%d)%s), tickets still live after the cap idled out %u, %llu re-thrown "
+      "by its own request once an index freed (want 1), its chunk's ticket %s, "
+      "%llu re-thrown in all, %u landed (want 1); page faults %u/%u; run twice: %s",
       A.landTick, A.activateTick, A.activateTick - A.landTick, maxLatency,
       (unsigned long long)A.activations, A.boxLo.x, A.boxLo.y, A.boxLo.z,
       A.released ? "released" : "NEVER RELEASED", A.inStore, A.particlesMax,
       A.particlesGoneAt, A.farKilled, (unsigned long long)A.refusedCap,
       (unsigned long long)A.deposited, A.parkedAtFull, A.landingChunk.x,
-      A.landingChunk.y, A.landingChunk.z, A.landingHeld ? "" : " - NONE HELD",
-      A.capLiveAfter, A.landingGranted ? "granted" : "NOT GRANTED",
+      A.landingChunk.y, A.landingChunk.z, A.landingHeld ? " - STILL HELD" : "",
+      A.capLiveAfter, (unsigned long long)A.respawnedUnasked,
+      A.landingGranted ? "granted" : "NOT GRANTED",
       (unsigned long long)A.respawned, A.landedLater, A.faults, B.faults,
       same ? "IDENTICAL" : "DIVERGED");
   std::printf("ticket-land: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
@@ -1010,6 +1026,158 @@ Status GateTicketRender(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---------------------------------------------------------------------------
+// ticket-look (audit 2026-10-02)
+// ---------------------------------------------------------------------------
+// What a PLAYER sees of a ticket, which ticket-render cannot say: it leaves the
+// far cascade EMPTY so only traceTickets can draw. Here the cascade is FILLED
+// (DrainFullRefill, as the game's horizon is) and a ticket sits on real
+// terrain 4 chunks past the window's +X face, looked at from inside the window
+// from NEAR (~9 m) and FAR (~40 m, past the LOD handoff). Four frames each:
+//   0  before the ticket exists (cascade only)
+//   1  the ticket live, nothing changed in it (procgen terrain, fine voxels)
+//   2  a stone pillar + a sand pile built in it and settled
+//   3  after it released and the cascade was refilled (the store's copy)
+// Claims: (a) ACTIVATION DOES NOT POP — frame 1 vs 0, the mean RGB change over
+// the box's screen region is small (same terrain, fine geometry vs cascade
+// cells, far-path lighting both); (b) the pillar is DRAWN — frame 2 vs 1 in the
+// centre region; (c) the release keeps it — frame 3 still differs from frame 0
+// there (the edit survived into the store and the cascade). Every
+// number is printed; SANDVOX_TICKET_SHOTS=<prefix> writes the eight frames as
+// <prefix>_{near,far}_{0..3}.bmp to look at.
+// The largest per-pixel change in the central (2 half) x (2 half) region: the
+// pillar is a few pixels wide and need not sit on the exact centre pixel.
+int RegionMaxDelta(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
+                   uint32_t w, uint32_t h, uint32_t half) {
+  int m = 0;
+  for (uint32_t y = h / 2 - half; y < h / 2 + half; y++)
+    for (uint32_t x = w / 2 - half; x < w / 2 + half; x++)
+      m = std::max(m, PixelDelta(a, b, w, x, y));
+  return m;
+}
+double RegionDelta(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
+                   uint32_t w, uint32_t h, uint32_t half) {
+  uint64_t sum = 0, n = 0;
+  for (uint32_t y = h / 2 - half; y < h / 2 + half; y++)
+    for (uint32_t x = w / 2 - half; x < w / 2 + half; x++) {
+      sum += (uint64_t)PixelDelta(a, b, w, x, y);
+      n++;
+    }
+  return n ? (double)sum / (double)n : 0.0;
+}
+
+Status GateTicketLook(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  const int mStone = MatId(c, "stone"), mSand = MatId(c, "sand");
+  if (mStone < 0 || mSand < 0) { detail = "no stone/sand"; return Status::Fail; }
+  Regenerate(c);
+  const IVec3 o = c.world.WindowOrigin();
+  DrainFullRefill(c.ctx, c.world, c.sim,
+                  IVec3{o.x + (int)kNChunk / 2, o.y + (int)kNChunk / 2, o.z + (int)kNChunk / 2});
+  const int faceX = (o.x + (int)kNChunk) * (int)kChunk;
+  const int zMid = (o.z + (int)kNChunk / 2) * (int)kChunk + 8;
+  const int sx = faceX + 4 * (int)kChunk + 8;
+  const int gy = World::TerrainHeight(sx, zMid, kDefaultSeed);
+  const IVec3 centre{sx >> 4, (gy + 4) >> 4, zMid >> 4};
+  const uint32_t lightTick = (uint32_t)(0.40 * (double)TicksPerDay(CurrentTuning()));
+  const Vec3 at{(float)sx + 1.5f, (float)gy + 12.0f, (float)zMid + 1.5f};
+  auto eyeAt = [&](int back) {
+    const int ex = faceX - back;
+    int h = gy;
+    for (int x = ex; x <= sx; x += 4) h = std::max(h, World::TerrainHeight(x, zMid, kDefaultSeed));
+    return Vec3{(float)ex + 0.5f, (float)(h + 14) + 0.5f, (float)zMid + 0.5f};
+  };
+  const Vec3 eyeN = eyeAt(4 * (int)kChunk - 8 + 18), eyeF = eyeAt(4 * (int)kChunk - 8 + 340);
+  std::vector<uint8_t> nf[4], ff[4];
+  auto shoot = [&](int k) {
+    nf[k] = RenderView(c, eyeN, at, lightTick);
+    ff[k] = RenderView(c, eyeF, at, lightTick);
+  };
+
+  uint32_t t = 85000;
+  support::TickCursor tick{c, t, centre};
+  tick();
+  shoot(0);
+  c.stream.TicketSet().Request(centre, TicketReason::Gate, t + 1);
+  tick();
+  const uint32_t tk = c.stream.TicketSet().TicketHolding(centre);
+  if (tk >= kTicketMax) { detail = "no ticket over the look site"; Regenerate(c); return Status::Fail; }
+  const IVec3 lo = c.stream.TicketSet().BoxLo(tk);
+  tick();
+  shoot(1);
+  // A 3x3 stone pillar 24 tall from the ground, and 600 sand cells dropped
+  // beside it.
+  std::vector<CellOp> build;
+  for (int dz = 0; dz < 3; dz++)
+    for (int dx = 0; dx < 3; dx++) {
+      const int x = sx + dx, z = zMid + dz;
+      for (int y = World::TerrainHeight(x, z, kDefaultSeed) - 1; y < gy + 24; y++) {
+        const uint32_t ci = c.world.ResidentCellIndex({x, y, z});
+        if (ci != World::kTicketSlotNone) build.push_back({ci, PackVoxNew((uint32_t)mStone, 0)});
+      }
+    }
+  for (int y = gy + 6; y < gy + 12; y++)
+    for (int z = zMid - 6; z < zMid + 4; z++)
+      for (int x = sx - 12; x < sx - 2; x++) {
+        const uint32_t ci = c.world.ResidentCellIndex({x, y, z});
+        if (ci != World::kTicketSlotNone)
+          build.push_back({ci, PackVoxNew((uint32_t)mSand, 0) | kCellOpIfAir});
+      }
+  tick(std::vector<BrushOp>{}, build);
+  // Settled (the sand falls 6 cells), and well inside the idle release.
+  for (int i = 0; i < 20; i++) tick();
+  const bool liveAt2 = c.stream.TicketSet().StateOf(tk) == Tickets::State::Live;
+  shoot(2);
+  int releasedAt = -1;
+  for (int i = 1; i <= 600; i++) {
+    tick();
+    if (c.stream.TicketSet().StateOf(tk) != Tickets::State::Live) { releasedAt = i; break; }
+  }
+  for (int i = 0; i < 12; i++) tick();
+  c.ctx.WaitIdle();
+  DrainFullRefill(c.ctx, c.world, c.sim,
+                  IVec3{o.x + (int)kNChunk / 2, o.y + (int)kNChunk / 2, o.z + (int)kNChunk / 2});
+  shoot(3);
+  const uint32_t faults = c.world.Snap().pageFaults;
+  const bool stillLive = c.stream.TicketSet().LiveCount() != 0;
+  Regenerate(c);
+
+  if (const char* pre = std::getenv("SANDVOX_TICKET_SHOTS"); pre && *pre)
+    for (int k = 0; k < 4; k++) {
+      WriteBmpFile(Format("%s_near_%d.bmp", pre, k), nf[k], c.width, c.height);
+      WriteBmpFile(Format("%s_far_%d.bmp", pre, k), ff[k], c.width, c.height);
+    }
+  const uint32_t W = c.width, H = c.height;
+  const double popN = RegionDelta(nf[0], nf[1], W, H, 60);
+  const double popF = RegionDelta(ff[0], ff[1], W, H, 30);
+  const int drawnN = RegionMaxDelta(nf[1], nf[2], W, H, 120);
+  const int drawnF = RegionMaxDelta(ff[1], ff[2], W, H, 60);
+  const int keptN = RegionMaxDelta(nf[0], nf[3], W, H, 120);
+  const int keptF = RegionMaxDelta(ff[0], ff[3], W, H, 60);
+  const double relPopN = RegionDelta(nf[2], nf[3], W, H, 60);
+  const double popMax = BaselineNumber("ticketLook.activationPopMax", 40);
+  const int minDelta = (int)BaselineNumber("ticketRender.minDelta", 60);
+  RecordObserved("ticketLook.activationPopNear", popN);
+  RecordObserved("ticketLook.activationPopFar", popF);
+  const bool noPop = popN <= popMax && popF <= popMax;
+  const bool drawn = drawnN >= minDelta && drawnF >= minDelta;
+  const bool kept = keptN >= minDelta && keptF >= minDelta;
+  const bool ok = noPop && drawn && kept && liveAt2 && releasedAt > 0 && !stillLive &&
+                  faults == 0;
+  detail = Format(
+      "ticket #%u box (%d,%d,%d)+5 on the ground 4 chunks past the +X face, cascade "
+      "filled: activation changed the box region by %.1f (near) / %.1f (far) mean RGB "
+      "(allow %.0f); the pillar changed the centre region by up to %d / %d (want >= "
+      "%d); released after %d ticks, and after it the centre region still differs "
+      "from the pre-ticket frame by up to %d / %d (want >= %d: the edit survived the "
+      "store + cascade); near region change at the release %.1f; page faults %u",
+      tk, lo.x, lo.y, lo.z, popN, popF, popMax, drawnN, drawnF, minDelta, releasedAt,
+      keptN, keptF, minDelta, relPopN, faults);
+  std::printf("ticket-look: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& TicketGates() {
@@ -1019,6 +1187,7 @@ const std::vector<Gate>& TicketGates() {
       {"ticket-land", "sim", {}, false, GateTicketLand},
       {"ticket-decay", "sim", {}, false, GateTicketDecay},
       {"ticket-render", "render", {}, false, GateTicketRender, /*needsRender=*/true},
+      {"ticket-look", "render", {}, false, GateTicketLook, /*needsRender=*/true},
   };
   return g;
 }

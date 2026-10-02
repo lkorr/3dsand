@@ -1357,12 +1357,19 @@ constexpr uint64_t kGlowFieldBaseWord = kGlowSrcWords;
 // this tick's REFUSES. Nothing finer is needed: the window origin is constant
 // for the whole of one command buffer, so a slot cannot change occupant between
 // the prepass and the CA rows of the same tick.
-constexpr uint64_t kReposeSnapBitWords = kVoxelCount / 32;       // 16 MiB at 512^3
-constexpr uint64_t kReposeSnapTickBase = kReposeSnapBitWords;    // + kNumChunks stamps
-constexpr uint64_t kReposeSnapWords = kReposeSnapBitWords + kNumChunks;
-constexpr uint64_t kReposeSnapBytes = kReposeSnapWords * 4;      // 16.125 MiB
+//
+// SLOT space, not window volume (chunk tickets): a ticket's slots are
+// dispatched by the prepass and probed by the CA like window slots, so the
+// bitfield and the stamps cover kNumSlots (+1 MiB at kTicketSlots = 2,048).
+// Sized by the window alone, every ticket centre's ring decoded as window
+// coordinates and stamped arbitrary window slots (the audit of 2026-10-02).
+constexpr uint64_t kReposeSnapBitWords =
+    (uint64_t)kNumSlots * kChunkVol / 32;                        // 17 MiB at 512^3
+constexpr uint64_t kReposeSnapTickBase = kReposeSnapBitWords;    // + kNumSlots stamps
+constexpr uint64_t kReposeSnapWords = kReposeSnapBitWords + kNumSlots;
+constexpr uint64_t kReposeSnapBytes = kReposeSnapWords * 4;      // ~17 MiB
 // The WGSL side derives both from constants the prelude already emits
-// (NUM_CHUNKS * CHUNK_VOL / 32u), so this needs no new prelude constant; the
+// (NUM_SLOTS * CHUNK_VOL / 32u), so this needs no new prelude constant; the
 // mirrors exist for the allocation and for the gate's arithmetic.
 static_assert(kVoxelCount % 32 == 0, "repose snapshot is 1 bit per voxel");
 

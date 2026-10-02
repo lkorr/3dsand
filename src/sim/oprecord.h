@@ -387,6 +387,17 @@ void NoteTicketOp(uint32_t tick, const TicketOp& op);
 // Ticket ops that differed from the record (kind / reason / index / chunk),
 // or were missing / extra, since the last ResetReplayStats.
 uint32_t ReplayTicketMismatches();
+// Ticket decisions the replay took since the last ResetReplayStats. Against
+// the record's total, this is the half ReplayTicketMismatches cannot see: a
+// replay that took FEWER decisions than the recording.
+uint32_t ReplayTicketOps();
+// THE EXTERNAL HALF OF A TICKET REPLAY. A replay re-derives every ticket
+// decision by running the ticket step (Stream::TicketTick) before each
+// recorded tick's submit — except a request that came from OUTSIDE the sim (a
+// manual `--ticket`, a gate's fixture), which no replayed input carries. Those
+// are re-queued here from the recorded activation, at the box centre, before
+// that tick's ticket step. Returns how many; a no-op unless replaying.
+uint32_t InjectTicketRequestsIfReplaying(uint32_t tick, ::Tickets& tickets);
 
 // The player's command for this tick (main.cpp's frame layer, package N2).
 // Stashed the same way the gen list is and for the same reason: it is produced

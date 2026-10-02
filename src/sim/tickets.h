@@ -135,9 +135,6 @@ class Tickets {
   // emptied. Safe to call with no ticket live.
   void DropAll(const rhi::Queue& queue);
 
-  // Every chunk a FarLanding is waiting on that is now resident gets its
-  // particles queued for re-throw (P2). Stream calls this at each fill.
-  void OnChunkResident(IVec3 wc);
   // Pay out queued far-landing particles into the tick's spawn stream
   // (bounded by `max`). Returns how many.
   uint32_t DrainLandingSpawns(std::vector<ParticleSpawn>& out, uint32_t max);
@@ -252,9 +249,11 @@ class Tickets {
   struct Landing {
     IVec3 chunk;
     ParticleSpawn p;
+    uint32_t nextAsk = 0;  // tick it may next ask for a ticket (AskForLandings)
   };
   std::vector<Landing> landings_;   // in arrival (= snapshot tick) order
   std::vector<ParticleSpawn> spawnQueue_;
   void TakeDeposits();
   void QueueResidentLandings();
+  void AskForLandings(uint32_t tick);
 };

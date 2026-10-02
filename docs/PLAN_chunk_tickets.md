@@ -379,11 +379,26 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
    live box. Refused only when all 125 collide (counted as `refusedPlacement`).
 10. **The ops are recorded, not replayed from the record** — `Frame::tickets`
     (record version 7) carries every decision; a replay re-derives them (they
-    are a pure function of the recorded inputs and the fixed-latency snapshot,
-    exactly like `genList`) and COMPARES (`ReplayTicketMismatches`).
-11. **Regen / load / teleport DROP tickets** (`ReloadWindow`, `OnRegen`,
-    `SubmitWorldgen`): those paths discard in-flight evictions already, so the
-    tickets are forgotten with them. A SAVE includes live ticket slots.
+    are a pure function of the recorded inputs and the fixed-latency snapshot)
+    and COMPARES (`ReplayTicketMismatches`, `ReplayTicketOps`). *Audit
+    2026-10-02: as first landed, no replay loop ran the ticket step at all, so
+    the comparison was dead code and a recording with a ticket in it could
+    not reproduce.* Both replay loops (`--replay-ops`, the `ops-replay` gate)
+    now call `Stream::TicketTick` before each recorded tick's submit, after
+    `InjectTicketRequestsIfReplaying` re-queues the recording's EXTERNAL
+    requests (manual / gate activations — no replayed input carries them) at
+    the recorded box centre. `ops-replay` records a ticket, pours into it and
+    fails on any differing or missing decision. Like `genList`, this is a
+    replay of a FIXED window: window shifts are still not replayed.
+11. **Regen and load DROP tickets** (`OnRegen` / `SubmitWorldgen`, and
+    `ReloadWindow`, whose only callers are `LoadWorld` and the net late-join
+    re-pull — there is no teleport path that reloads the window). Both replace
+    the world, so the dropped ticket is the replaced world's, exactly as the
+    window's own unsaved state is. A SAVE includes live ticket slots
+    (`FlushResident`), and a releasing ticket's pending batch is drained by the
+    save keep-all. Not saved: the far landings held on the CPU (below, P2 3) —
+    in-flight particles are not saved either, but a landing can be held far
+    longer than a flight, which is why it now asks for a ticket itself.
 12. **`ticket-settle` proves "the window arriving finds the pile" through the
     store-hit door a second ticket takes** (FillSlots' store branch, the one a
     window shift uses) plus a direct `ChunkStore` decode, instead of shifting
@@ -425,6 +440,14 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
    (`faredits.h`: an edit shows at level k only if it changes a cell CENTRE), so
    a cascade patch would draw nothing; the landing is invisible until resident.
    Bounded: 65,536 held, oldest dropped and counted (`landingsDropped`).
+   *Audit 2026-10-02:* a deposited particle stopped requesting, so a landing
+   refused at the cap waited for the WINDOW — possibly forever, and a save
+   does not write it. `Tickets::AskForLandings` now has every waiting landing
+   ask for a ticket over its own chunk whenever an index is free (oldest
+   first, one request per distinct chunk, at most one per free index, at most
+   once per `kTicketIdleTicks`; never into a full cap, so no refusal op every
+   tick). `ticket-land` arm B asserts it is re-thrown with no request from the
+   gate.
 4. **Spray still ends at the window.** A micro particle leaving residency dies
    as before — it is an effect with a lifetime, not conserved matter.
 5. **Rule 2 for far flight**: a particle leaving the far box (two window edges
@@ -468,6 +491,93 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
    miss). Bound is `NUM_SLOTS * CHUNK_VOL`.
 3. **Far-landing re-throws are drained before the `particlesActive` latch** in
    `PhaseL`, so a re-thrown particle runs the tick it is spawned.
+
+### Found by the audit (2026-10-02)
+
+An adversarial review of P1-P4 after the gates above were green. Each is fixed
+on the branch. In a world with NO ticket every fix is an identity (a window
+cell's path is bit-identical, and the pinned `determinismHash` did not move);
+with a ticket live, fix 1 also stops ticket rings from stamping window slots,
+so window behaviour beside a live ticket changes (deterministically).
+
+1. **The repose snapshot decoded ticket slots as window coordinates.**
+   `sim_step.wgsl reposesnap` runs over the dirty list and split each centre
+   into `(cx, cy, cz)` by `% NCHUNK`; a ticket centre (>= `NUM_CHUNKS`) wrapped
+   onto arbitrary WINDOW slots, filling and stamping them, while the ticket's
+   own chunks were never snapshotted — and `reposeSnapOpen` read a ticket cell
+   at `cellIndexW`, the window cell 512 away. Angle of repose in a ticket read
+   another place in the world whenever that slot happened to be stamped (no
+   matter lost: the move still goes through `tryMove`). A third instance of the
+   P0 audit's "slot decomposition into window coordinates" class, this time in
+   WGSL. Fixed: a ticket centre resolves its ring in world chunks
+   (`reposeRingSlotT` / `reposeRingOwnedT`, owners must be ACTIVE dirty
+   chunks), the probe resolves a ticket cell at its ticket slot, and the
+   buffer covers `kNumSlots` (`world.h kReposeSnapBitWords`, +1 MiB).
+2. **`sim_explode.wgsl markBoth` used `chunkIndexW`** after an `inBounds` that
+   admits ticket cells: the shockwave woke the WINDOW chunk a ticket cell
+   aliases, and left the blasted ticket chunk asleep (its release could skip
+   keeping it). Now `chunkSlotOf`.
+3. **Particle claims keyed ticket cells on `cellIndexW`**, the window cell 512
+   away: a ticket landing and a window landing at the aliased cell shared a
+   claim, and a grain group's uniform key would merge both groups' mass into
+   whichever cell won. `sim_particle.wgsl claimCellId` is `cellIndexW` for a
+   window cell (unchanged) and a world-block-salted id for a ticket cell.
+   `flagLandedUnsupported` likewise flagged the aliased window chunk for an
+   island scan; it is window-only now, as `flagSupportLoss` always was.
+4. **`sim_openness.wgsl dirty` walked ticket slots as window slots.** It is a
+   render shader, so it keeps the ticket STUB, whose `slotWorldChunk` decodes
+   a ticket slot as a window slot: each dirty ticket chunk cost a walk of the
+   wrong chunk and stamped the touch plane round it. It skips ticket slots now
+   (a ticket draws through the far path, which reads no openness).
+5. **The probe selection had no second opinion.** Besides accepting zero
+   blanks (`read>pageTable`) in all three copies of the rule,
+   `AssembleShaderSource` now finds the declaration a second, independent way
+   (a non-comment line with `var` then the `pageTable` token) and REFUSES to
+   build a shader on which the two disagree — the silent-stub failure the gates
+   found once can no longer happen silently.
+6. **Replay never ran the ticket step** (P1 10 above), and **held far landings
+   never asked for a ticket** (P2 3 above).
+7. A dead no-op hook (`Tickets::OnChunkResident`, called per filled slot) is
+   gone; a stale comment on what triggers a re-centre is corrected.
+
+New gate `ticket-look`: what a player SEES, with the far cascade FILLED (which
+`ticket-render` leaves empty). A ticket on real terrain 4 chunks past the face,
+looked at from ~15 m and ~47 m: activation changes the box's screen region by
+a mean 2.0 / 1.2 RGB (no pop: fine voxels with far-path lighting against the
+cascade's cells of the same terrain), a pillar built in it is drawn, and after
+the release and a cascade refill it is still there. `SANDVOX_TICKET_SHOTS=
+<prefix>` writes the eight frames.
+
+**Measured idle cost against main fc8e451** (`--perf --scenario idle`,
+`SANDVOX_RUN_EXCLUSIVE=1`, RTX 3060 Ti, same world hash `4720e963` on both):
+frame p50 6.01 vs 6.02 ms; the sim-side GPU rows +11 us/frame (+3.5%), all of
+it the slot space being 6% larger — `readbackCopy` +11 us (the snapshot's
+per-slot arrays), `occupancyFull` +7 us on hash ticks — with `compact` flat
+(3.7 vs 3.5 us). The raymarch's `ticketCount > 0` test is one compare per sky
+ray and is inside noise.
+
+**Stated limitations that remain** (follow-ups, not fixed here):
+- A deposit TIE (two parked particles with bit-identical position and payload
+  in one deposit slot on one tick) hands over ONE record and kills both. Same
+  class as the claim system's equal-priority rule; needs a count word in the
+  record.
+- Far flight before the cascade first fills: `farBlocked` reads OPEN outside
+  the cascade, so a particle can fall until the far box kills it (counted) —
+  matter lost, and frame-timing dependent in the game (P2 1).
+- Window-edge cells now see an ADJACENT ticket's shell as resident (a box may
+  touch the window), so matter can move from the window into a ticket shell,
+  where it freezes until the box re-centres, releases, or the window covers it.
+  Deterministic, and nothing is lost, but the window edge stops being "solid
+  and inert" there.
+- Multiplayer: each peer's ticket set follows its own window and particles
+  (per-client residency, DESIGN.md §10); divergence between peers is the
+  existing per-chunk hash / authority resync's to repair, as for any chunk one
+  peer simulates and another does not.
+- Decay reactions with a reaction EFFECT (`reactFxNote`) are window-only; one
+  firing in a ticket has no effect.
+- `ticket-decay` has no in-window control arm proving the same fixture DOES
+  ignite in the window (re-breaking `gInTicket` makes it fail: 55 of 64 wood
+  cells burned, 33 fire cells — so it is sensitive today).
 
 ### P4
 

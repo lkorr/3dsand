@@ -363,17 +363,19 @@ void Tickets::ReleaseOverlapping(IVec3 newOrigin, uint32_t tick) {
 // ---- RE-CENTRING (P4, docs/PLAN_chunk_tickets.md §3) -----------------------
 //
 // Matter the interior pushes into the shell is frozen there (the shell is
-// never dispatched). When the latest published snapshot shows shell chunks on
-// one FACE of the box dirty, the box steps one chunk toward that face — at
-// most once per kTicketRecentreTicks per ticket. Because a box chunk lives at
-// its coordinate MOD 5, the plane the box leaves and the plane it enters use
-// the SAME 25 slots: the leaving plane is copied out (a two-phase keep batch,
+// never dispatched). When matter has CROSSED into shell chunks on one FACE of
+// the box (a shell chunk's snapshot occupancy changed since the last
+// re-centre: Ticket::shellHit, folded in Fold), the box steps one chunk toward
+// that face — at most once per kTicketRecentreTicks per ticket. Because a box
+// chunk lives at its coordinate MOD 5, the plane the box leaves and the plane
+// it enters use the SAME 25 slots: the leaving plane is copied out (a two-phase keep batch,
 // exactly as a release), the table moves, and the same slots are refilled
 // from the store or procgen for the entering plane — a window shift at the
 // box's scale, recorded as one TicketOp. The face is the one with the most
-// dirty shell chunks; ties go to the lower axis, then the negative side, so
+// hit shell chunks; ties go to the lower axis, then the negative side, so
 // the choice is a pure function of the snapshot. A step that would touch the
-// window or another live box is not taken.
+// window or another live box, or freeze an active interior plane, is not
+// taken (counted in recentreRefused) and the hits are forgotten.
 void Tickets::Recentre(uint32_t tick) {
   const int n = (int)kTicketBoxN;
   for (uint32_t i = 0; i < kTicketMax; i++) {
@@ -489,6 +491,7 @@ void Tickets::Tick(uint32_t tick) {
   FinalizeReleases(tick);
   ReleaseIdle(tick);
   TakeDeposits();
+  AskForLandings(tick);
   ApplyRequests(tick);
   Recentre(tick);
   QueueResidentLandings();
@@ -585,12 +588,33 @@ void Tickets::TakeDeposits() {
   }
 }
 
-// Kept as the named hook the refill paths call (Stream::FillSlots): the move
-// itself happens in QueueResidentLandings at the next ticket step, which
-// asks residency directly, so a landing whose deposit arrives AFTER its chunk
-// became resident is found the same way.
-void Tickets::OnChunkResident(IVec3 wc) {
-  (void)wc;
+// A FAR LANDING ASKS AGAIN. A deposited particle stopped requesting when it
+// handed itself to the CPU, so until this it waited for the WINDOW to arrive —
+// which may be never, and a landing held on the CPU is the one copy of matter
+// a save does not write. So whenever an index is FREE, each waiting landing
+// (oldest first, one request per distinct chunk, at most one per free index)
+// asks for a ticket over its chunk, at most once every kTicketIdleTicks:
+// granted, it is re-thrown this very step (QueueResidentLandings runs after
+// ApplyRequests); refused for placement, it asks again later. Never asks into
+// a full cap (no refusal op every tick). A pure function of the landing list,
+// the table and the tick, like everything else here.
+void Tickets::AskForLandings(uint32_t tick) {
+  if (landings_.empty()) return;
+  uint32_t freeIdx = 0;
+  for (const Ticket& t : t_) freeIdx += t.state == State::Free ? 1u : 0u;
+  std::vector<IVec3> asked;
+  for (Landing& l : landings_) {
+    if (asked.size() >= freeIdx) break;
+    if (tick < l.nextAsk) continue;
+    if (world_->ChunkResident(l.chunk)) continue;  // re-thrown this step anyway
+    bool dup = false;
+    for (const IVec3& a : asked)
+      dup = dup || (a.x == l.chunk.x && a.y == l.chunk.y && a.z == l.chunk.z);
+    l.nextAsk = tick + kTicketIdleTicks;
+    if (dup) continue;
+    asked.push_back(l.chunk);
+    Request(l.chunk, TicketReason::Particle, tick);
+  }
 }
 
 void Tickets::QueueResidentLandings() {

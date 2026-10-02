@@ -501,12 +501,43 @@ constexpr const char* kTicketUnboundEnd = ">>>TICKET_UNBOUND_END<<<";
 // "> pageTable" silently dropped worldgen, sim_step, sim_particle and
 // sim_mutate onto the stub (found by ticket-settle's pour probe: a ticket
 // generated as the window chunk its slot index aliased).
+//
+// Zero blanks count too (`read>pageTable`), and so does a line break: the
+// three copies of this rule (here, check_shaders.sh, check_pass_table.py)
+// all say "`>` then any run of whitespace, possibly empty".
 bool BodyDeclaresPageTable(const std::string& body) {
   for (size_t p = body.find("pageTable"); p != std::string::npos;
        p = body.find("pageTable", p + 1)) {
     size_t q = p;
-    while (q > 0 && (body[q - 1] == ' ' || body[q - 1] == '\t')) q--;
-    if (q > 0 && q < p && body[q - 1] == '>') return true;
+    while (q > 0 && std::isspace((unsigned char)body[q - 1])) q--;
+    if (q > 0 && body[q - 1] == '>') return true;
+  }
+  return false;
+}
+
+// THE SECOND OPINION (audit 2026-10-02). A shader the rule above misreads gets
+// the ticket STUB and simulates every ticket cell as its window alias with no
+// error anywhere -- the failure the gates found once already. So the
+// declaration is also found a second, independent way (a non-comment line
+// carrying `var` and then the `pageTable` token) and AssembleShaderSource
+// refuses to build a shader on which the two disagree.
+bool BodyDeclaresPageTableByLine(const std::string& body) {
+  size_t at = 0;
+  while (at < body.size()) {
+    size_t eol = body.find('\n', at);
+    if (eol == std::string::npos) eol = body.size();
+    std::string_view line(body.data() + at, eol - at);
+    const size_t cm = line.find("//");
+    if (cm != std::string_view::npos) line = line.substr(0, cm);
+    const size_t v = line.find("var");
+    const size_t t = line.find("pageTable");
+    if (v != std::string_view::npos && t != std::string_view::npos && v < t) {
+      const size_t e = t + 9;
+      const bool tokenEnd = e >= line.size() ||
+                            !(std::isalnum((unsigned char)line[e]) || line[e] == '_');
+      if (tokenEnd) return true;
+    }
+    at = eol + 1;
   }
   return false;
 }
@@ -694,6 +725,16 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     common = StripBlock(common, kDraftUnboundBegin, kDraftUnboundEnd);
   } else {
     common = StripBlock(common, kDraftBoundBegin, kDraftBoundEnd);
+  }
+  if (BodyDeclaresPageTable(body) != BodyDeclaresPageTableByLine(body)) {
+    std::fprintf(stderr,
+                 "%s: the two readings of \"declares pageTable\" disagree (binding "
+                 "rule %d, line rule %d) -- the chunk-ticket probe would be picked "
+                 "wrong and ticket cells would silently alias the window. Declare "
+                 "it on one line as `var<storage, read> pageTable : array<u32>;`.\n",
+                 name.c_str(), BodyDeclaresPageTable(body) ? 1 : 0,
+                 BodyDeclaresPageTableByLine(body) ? 1 : 0);
+    return false;
   }
   if (BodyResolvesTickets(body)) {
     common = StripBlock(common, kTicketUnboundBegin, kTicketUnboundEnd);

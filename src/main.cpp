@@ -6550,6 +6550,12 @@ int main(int argc, char** argv) {
       // applied here, before the submit, so the tick's CA runs on the
       // corrected chunk exactly as it did during the recording.
       replayReplaces += sandvox::opstream::ReplaceChunksIfReplaying(f.in.tick, stream);
+      // Chunk tickets: the recording's EXTERNAL requests (--ticket, a gate)
+      // re-queued from its activations, then the ticket step the game runs in
+      // Stream::Update, which re-derives every other decision and compares it
+      // against the record (oprecord.h NoteTicketOp).
+      sandvox::opstream::InjectTicketRequestsIfReplaying(f.in.tick, stream.TicketSet());
+      stream.TicketTick(f.in.tick);
       SubmitTick(ctx, world, sim, f.in.tick, f.in.seed, f.ops, f.exps, f.cells,
                  f.in.hashEnable != 0,
                  {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
@@ -6564,10 +6570,15 @@ int main(int argc, char** argv) {
     }
     ops::SetReplay(nullptr);
     const uint32_t miss = ops::ReplayParamMismatches();
+    uint32_t ticketRec = 0;
+    for (uint32_t k = 0; k < played && k < log.frames.size(); k++)
+      ticketRec += (uint32_t)log.frames[k].tickets.size();
     std::printf("replay: %u ticks, final hash %08x, TickParams words rebuilt "
-                "differently: %u, chunk resyncs re-applied: %u (refused %u)\n",
+                "differently: %u, chunk resyncs re-applied: %u (refused %u), "
+                "ticket decisions %u replayed / %u recorded (%u differed)\n",
                 played, lastHash, miss, replayReplaces,
-                sandvox::opstream::ReplayChunkReplaceRefusals());
+                sandvox::opstream::ReplayChunkReplaceRefusals(), ops::ReplayTicketOps(),
+                ticketRec, ops::ReplayTicketMismatches());
     if (miss) {
       // Rule 6: name the WORD, not the count. The word index is a u32 offset
       // into TickParams, so `offsetof(TickParams, field) / 4` in world.h reads

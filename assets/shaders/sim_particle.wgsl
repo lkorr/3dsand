@@ -40,6 +40,23 @@ const PT_KERNEL : u32 = PT_K_PARTICLE;
 
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
+// THE CLAIM IDENTITY OF A CELL: what every reinsertion / stain / grain claim in
+// this kernel keys on. For a window cell it is exactly cellIndexW (unchanged:
+// the window's claims and hash do not move). For a chunk TICKET's cell
+// (docs/PLAN_chunk_tickets.md) cellIndexW is the WINDOW cell 512 away on each
+// axis, so a ticket landing and a window landing at the aliased cell would
+// share one claim — and a grain group's uniform key, which would merge both
+// groups' mass into whichever cell won. Salted with the world coordinate's
+// window-sized block instead: still a pure function of the world cell (rule 1),
+// and distinct from the window's identity for the same slot.
+fn claimCellId(c : vec3<i32>) -> u32 {
+  let i = cellIndexW(c);
+  if (inWindow(c, T.origin)) { return i; }
+  let b = vec3<u32>(bitcast<u32>(c.x >> WORLD_SHIFT), bitcast<u32>(c.y >> WORLD_SHIFT),
+                    bitcast<u32>(c.z >> WORLD_SHIFT));
+  return i ^ (pcg(b.x ^ pcg(b.y ^ pcg(b.z ^ 0x7ACE7u))) | 0x80000000u);
+}
+
 // ---- FAR FLIGHT, PARKING, THE TICKET REQUEST (docs/PLAN_chunk_tickets.md P2) -
 //
 // A particle used to be DELETED the moment its flight left residency (the two
@@ -471,6 +488,12 @@ fn markDirtyNext(c : vec3<i32>) {
 // rigidbody, settles it back to the grid, and flags it again forever.
 fn flagLandedUnsupported(c : vec3<i32>, mat : u32) {
   if (materials[mat].klass != CLASS_SOLID) { return; }
+  // WINDOW cells only, as flagSupportLoss (common.wgsl): the island scan that
+  // consumes supportOut reads the CPU mirror, which never covers a chunk
+  // ticket, and chunkIndexW below would flag the window chunk a ticket cell
+  // aliases (a scan of the wrong place). Floating voxels in a ticket stay
+  // floating (docs/PLAN_chunk_tickets.md §2.5).
+  if (!inWindow(c, T.origin)) { return; }
   let b = c + vec3<i32>(0, -1, 0);
   if (!inBounds(b)) { return; }
   if (voxMat(voxWordAt(b)) != MAT_AIR) { return; }  // ground, powder or water
@@ -612,8 +635,8 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       p.flags |= PFLAG_PENDING;
       // A DRIP never claims (see the landing site below for why).
       if ((p.flags & PFLAG_DRIP) == 0u) {
-        atomicMax(&claim[claimSlot(cellIndexW(startCell))], microStainPriority(p));
-        publishForeign(claimSlot(cellIndexW(startCell)));
+        atomicMax(&claim[claimSlot(claimCellId(startCell))], microStainPriority(p));
+        publishForeign(claimSlot(claimCellId(startCell)));
       }
       append(p);
       return;
@@ -818,8 +841,8 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         // there was silently dropped. Not claiming at all is the deterministic
         // "drips always lose": the claim is decided among real droplets only.
         if ((p.flags & PFLAG_DRIP) == 0u) {
-          atomicMax(&claim[claimSlot(cellIndexW(cell))], microStainPriority(p));
-          publishForeign(claimSlot(cellIndexW(cell)));
+          atomicMax(&claim[claimSlot(claimCellId(cell))], microStainPriority(p));
+          publishForeign(claimSlot(claimCellId(cell)));
         }
         append(p);
         return;
@@ -902,11 +925,11 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
             break;
           }
         }
-        let slot = claimSlot(cellIndexW(landAt));
+        let slot = claimSlot(claimCellId(landAt));
         if (nf != 0xFFu) {
           p.payload = (p.payload & ~PPAY_GRAIN_MASK) | PPAY_GRAIN_BIT |
                       (nf << PPAY_GRAIN_NF_SHIFT);
-          publishKey(slot, grainKey(cellIndexW(landAt), myMat, nf));
+          publishKey(slot, grainKey(claimCellId(landAt), myMat, nf));
           atomicAdd(&claim[CLAIM_SUM + slot], myMass);
         } else {
           publishForeign(slot);
@@ -917,8 +940,8 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         return;
       }
       p.flags |= PFLAG_PENDING;
-      atomicMax(&claim[claimSlot(cellIndexW(tgt))], particlePriority(p));
-      publishForeign(claimSlot(cellIndexW(tgt)));
+      atomicMax(&claim[claimSlot(claimCellId(tgt))], particlePriority(p));
+      publishForeign(claimSlot(claimCellId(tgt)));
       append(p);
       return;
     }
@@ -946,8 +969,8 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       if (canOccupy(voxWordAt(here), myDensity, patient) &&
           (patient || settleSupported(here, myDensity))) {
         p.flags |= PFLAG_PENDING;
-        atomicMax(&claim[claimSlot(cellIndexW(here))], particlePriority(p));
-        publishForeign(claimSlot(cellIndexW(here)));
+        atomicMax(&claim[claimSlot(claimCellId(here))], particlePriority(p));
+        publishForeign(claimSlot(claimCellId(here)));
         append(p);
         return;
       }
@@ -999,7 +1022,8 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // it, or two particles targeting the same cell could hash to different
   // claim slots after a reallocation and both win. `tgt` is the physical word
   // index and is only ever a memory address.
-  let tgtSlot = cellIndexW(cell);
+  // (claimCellId: cellIndexW for a window cell, salted for a ticket cell.)
+  let tgtSlot = claimCellId(cell);
   let tgt = voxWordIndex(cell);
 
   // ---- micro particles: deposit a stain, never a voxel ----

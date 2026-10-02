@@ -827,7 +827,7 @@ def module_for(fname):
     # The TICKET PROBE's two blocks, for the same reason (resources.cpp
     # BodyResolvesTickets): BOUND reads the ticket table in pageTable's tail,
     # and the stub defined last would hide that read.
-    resolves = (re.search(r">[ \t]+pageTable", body) is not None
+    resolves = (re.search(r">\s*pageTable", body) is not None
                 and "uniform> R :" not in body)
     drop = "TICKET_UNBOUND" if resolves else "TICKET_BOUND"
     common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",

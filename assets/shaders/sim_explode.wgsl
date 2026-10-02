@@ -52,7 +52,13 @@ fn hardnessAt(c : vec3<i32>) -> i32 {
 }
 
 fn markBoth(c : vec3<i32>) {  // callers have bounds-checked c
-  let ci = chunkIndexW(c);
+  // chunkSlotOf, not chunkIndexW: inBounds admits a chunk TICKET's cells
+  // (cellResident), and chunkIndexW masks a ticket cell onto the WINDOW chunk
+  // 512 cells away — waking that one and leaving the blasted ticket chunk
+  // asleep, so its release would not keep the crater. Identical for a window
+  // cell (chunkSlotOf's window arm is the same mask).
+  let ci = chunkSlotOf(worldChunkOf(c), T.origin);
+  if (ci == SLOT_NONE) { return; }
   atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);
   atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);
 }

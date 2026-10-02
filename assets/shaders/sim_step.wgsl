@@ -1342,7 +1342,10 @@ fn tryFineRepose(c : vec3<i32>, w : u32, m : Material, r : u32) -> bool {
 // slot past the end. Both halves derive from constants the prelude already
 // emits, so this needs no new world constant.
 @group(0) @binding(35) var<storage, read_write> reposeSnap : array<u32>;
-const REPOSE_SNAP_TICK_BASE : u32 = NUM_CHUNKS * CHUNK_VOL / 32u;
+// NUM_SLOTS, not NUM_CHUNKS: a chunk TICKET's slots are dispatched by this
+// same prepass and probed by the same CA (docs/PLAN_chunk_tickets.md), so they
+// need bits and stamps of their own (world.h kReposeSnapBitWords).
+const REPOSE_SNAP_TICK_BASE : u32 = NUM_SLOTS * CHUNK_VOL / 32u;
 
 // Would a powder be able to drop into a cell holding this word? The snapshot's
 // predicate, in one place so the prepass and the assert in the gate agree.
@@ -1389,7 +1392,15 @@ fn reposeSnapStamp() -> u32 { return T.snapEpoch; }
 // ever leaves a grain where it is, and where it is, is a settled state.
 fn reposeSnapOpen(c : vec3<i32>) -> bool {
   if (!inBounds(c)) { return false; }
-  let idx = cellIndexW(c);
+  var idx = cellIndexW(c);
+  // A TICKET cell (resident outside the window) is snapshotted at its TICKET
+  // slot, not at the window slot its coordinate aliases 512 cells away: the
+  // alias holds another place in the world, and reading it handed ticket
+  // grains the window's bits whenever that slot happened to be stamped.
+  if (TICKET_PROBE && !inWindow(c, T.origin)) {
+    let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+    idx = voxSlotOfCell(c) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  }
   let slot = idx / CHUNK_VOL;
   if (reposeSnap[REPOSE_SNAP_TICK_BASE + slot] != reposeSnapStamp()) { return false; }
   return (reposeSnap[idx >> 5u] & (1u << (idx & 31u))) != 0u;
@@ -1489,6 +1500,31 @@ fn reposeRingOwned(cx : u32, cy : u32, cz : u32, k : u32) -> bool {
   return true;
 }
 
+// THE RING OF A TICKET CENTRE (chunk tickets, docs/PLAN_chunk_tickets.md).
+// The two functions above decode a centre as WINDOW slot coordinates and wrap
+// toroidally, which is meaningless for a ticket slot (>= NUM_CHUNKS): a ticket
+// centre's ring used to land on arbitrary window slots, stamping them and
+// leaving the ticket's own chunks unsnapshotted. A ticket ring is resolved in
+// WORLD chunks through the ticket table instead. The active interior is box
+// offset 1..3 and every ring offset is within one chunk, so a ticket ring
+// never leaves its own box; a window centre's toroidal ring never reaches a
+// ticket slot. Ownership is the window rule (the smallest j whose centre is a
+// DISPATCHED dirty chunk owns the member), where "dispatched" for a ticket slot
+// also means ACTIVE: a dirty shell chunk is never on the list (sim_compact.wgsl)
+// and must not claim a member it will not fill.
+fn reposeRingSlotT(cwc : vec3<i32>, k : u32) -> u32 {
+  return ticketSlotOf(cwc + reposeRingOffset(k));
+}
+fn reposeRingOwnedT(cwc : vec3<i32>, k : u32) -> bool {
+  let m = cwc + reposeRingOffset(k);
+  if (ticketSlotOf(m) == SLOT_NONE) { return false; }
+  for (var j = 0u; j < k; j++) {
+    let s = ticketSlotOf(m - reposeRingOffset(j));
+    if (s != SLOT_NONE && dirtyIn[s] != 0u && ticketSlotActive(s)) { return false; }
+  }
+  return true;
+}
+
 var<workgroup> wgReposeOwned : array<u32, REPOSE_RING>;
 var<workgroup> wgReposeEntry : u32;
 var<workgroup> wgReposeFlag : array<u32, 4224>;   // CHUNK_VOL + CHUNK_VOL / 32
@@ -1502,10 +1538,16 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
   let cy = (centre / NCHUNK) % NCHUNK;
   let cx = centre % NCHUNK;
   let wpc = CHUNK_VOL / 32u;   // 128 bitfield words per chunk
+  // A ticket centre resolves its ring in world chunks (reposeRingSlotT).
+  let isTicket = TICKET_PROBE && centre >= NUM_CHUNKS;
+  let cwc = slotWorldChunk(centre, T.origin);
 
   // PASS 0: which ring members are OURS (one thread each, then shared).
   if (li < REPOSE_RING) {
-    wgReposeOwned[li] = select(0u, 1u, reposeRingOwned(cx, cy, cz, li));
+    var owned = false;
+    if (isTicket) { owned = reposeRingOwnedT(cwc, li); }
+    else { owned = reposeRingOwned(cx, cy, cz, li); }
+    wgReposeOwned[li] = select(0u, 1u, owned);
   }
   workgroupBarrier();
 
@@ -1519,7 +1561,8 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
   for (var k = 0u; k < REPOSE_RING; k++) {
     // Another dirty chunk owns this member and fills it (reposeRingOwned).
     if (workgroupUniformLoad(&wgReposeOwned[k]) == 0u) { continue; }
-    let slot = reposeRingSlot(cx, cy, cz, k);
+    var slot = reposeRingSlot(cx, cy, cz, k);
+    if (isTicket) { slot = reposeRingSlotT(cwc, k); }
     let wordBase = slot * wpc;
     if (li == 0u) { wgReposeEntry = pageTable[slot]; }
     let e = workgroupUniformLoad(&wgReposeEntry);
@@ -1558,7 +1601,9 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
   // PASS 2: publish the members this workgroup owns and filled.
   for (var k = li; k < REPOSE_RING; k += 64u) {
     if (wgReposeOwned[k] == 0u) { continue; }
-    reposeSnap[REPOSE_SNAP_TICK_BASE + reposeRingSlot(cx, cy, cz, k)] = stamp;
+    var slot = reposeRingSlot(cx, cy, cz, k);
+    if (isTicket) { slot = reposeRingSlotT(cwc, k); }
+    reposeSnap[REPOSE_SNAP_TICK_BASE + slot] = stamp;
   }
 }
 

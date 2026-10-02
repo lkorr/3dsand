@@ -504,11 +504,21 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
 // not in common.wgsl, because only this shader reads it.
 const OPEN_SIG_BASE : u32 = 2u * NUM_SLOTS + NCHUNK * NCHUNK;
 var<workgroup> wgOpenSig : atomic<u32>;
+var<workgroup> wgOpenSlot : u32;
 
 @compute @workgroup_size(OPEN_WORDS_PER_CHUNK)
 fn dirty(@builtin(workgroup_id) wg : vec3<u32>,
          @builtin(local_invocation_index) li : u32) {
-  let slot = dirtyList[wg.x];
+  if (li == 0u) { wgOpenSlot = dirtyList[wg.x]; }
+  let slot = workgroupUniformLoad(&wgOpenSlot);
+  // A CHUNK TICKET's slot (docs/PLAN_chunk_tickets.md) is on the dirty list
+  // too, but openness is the WINDOW's render data and this shader keeps the
+  // ticket stub (a render shader: common.wgsl TICKET_UNBOUND), whose
+  // slotWorldChunk decodes a ticket slot as a window slot — a walk of the
+  // wrong chunk that also stamped the touch plane round it. A ticket draws
+  // through the far path (raymarch.wgsl traceTickets), which reads no
+  // openness. Uniform (workgroupUniformLoad), so the barriers below stay legal.
+  if (slot >= NUM_CHUNKS) { return; }
 
   // ---- SKIP A CHUNK WHOSE BLOCKERS DID NOT CHANGE --------------------------
   // Everything a walk computes is a function of ray blockers (this chunk's and

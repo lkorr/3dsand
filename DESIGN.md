@@ -235,12 +235,20 @@ of freezing; they are not a bigger window.
   common.wgsl's `TICKET_BOUND` block, kept for a body that declares
   `pageTable` and is not a render shader (`resources.cpp BodyResolvesTickets`);
   the renderer keeps the P0 stub (`TICKET_PROBE = false`, const-folded), so the
-  raymarch DDA is untouched by the sim half.
+  raymarch DDA is untouched by the sim half. The selection is cross-checked at
+  load: a body whose `pageTable` declaration the rule and an independent
+  line-scan read differently is REFUSED, never silently stubbed. A render
+  shader that walks the dirty list (`sim_openness dirty`) skips ticket slots,
+  and every kernel that splits a dirty-list slot into window coordinates must
+  either resolve a ticket slot through the table or skip it (the repose
+  snapshot did neither until the 2026-10-02 audit).
 - **The lifecycle is an op stream** (rule 3). `Tickets::Tick` runs between ticks
   (`Stream::Update`, or `Stream::TicketTick` for a harness that ticks with
   `SubmitTick` alone) and every decision — activate, release, refuse,
   re-centre — is a `TicketOp` recorded in the op record (v7, `Frame::tickets`;
-  a replay re-derives and COMPARES). Inputs: requests queued since the last
+  a replay runs the same ticket step, re-queues the recording's external
+  requests with `InjectTicketRequestsIfReplaying`, and COMPARES every decision;
+  `ops-replay` records a ticket and fails on any difference). Inputs: requests queued since the last
   tick (applied in `(tick, chunk)` order) and `World::Snap()`, the fixed-latency
   snapshot — so a release lands on the same tick in every run.
 - **Policy.** Capped at 16, refused past it and counted; a request inside the
@@ -264,7 +272,9 @@ of freezing; they are not a bigger window.
   resident and lands through the claim path. Refused (cap) or unserved for 16
   ticks, it DEPOSITS (a priority-won slot in the same record) and dies; the CPU
   holds it as a FAR LANDING and re-throws it, still, the tick its chunk is
-  resident again — a ticket, or the window arriving. Spray still ends at the
+  resident again — a ticket, or the window arriving. A held landing asks for a
+  ticket itself whenever an index is free (`AskForLandings`), so the cap
+  delays it rather than parking it until the window comes. Spray still ends at the
   edge; leaving the far box (two window edges) kills and counts. The cascade
   is render-derived and its first game-time fill waits on a pipeline compile,
   so far landings are frame-timing dependent in the game during that window
@@ -291,9 +301,13 @@ of freezing; they are not a bigger window.
 - **Rule 2.** `sleep` asserts `awake <= 32 AND tickets == 0` at rest, and runs
   the ticket step to get there. Observable in the F1 Stats section and in
   `build/last_run.json`'s `tickets` block. Gates: `ticket-settle`,
-  `ticket-land`, `ticket-decay`, `ticket-render`; `determinism` opens a ticket
-  and pours into it, so its twice-run and its `--residency dense` run cover
-  them. Limitations are listed in `docs/PLAN_chunk_tickets.md` §6.
+  `ticket-land`, `ticket-decay`, `ticket-render`, `ticket-look` (cascade
+  filled: no pop on activation, the edit survives the release); `determinism`
+  opens a ticket and pours into it, so its twice-run and its `--residency
+  dense` run cover them; `ops-replay` records and replays one. Idle cost with
+  no ticket against the pre-ticket build: +11 us/frame of GPU, the 6% larger
+  slot space in the snapshot readback and the hash pass. Limitations are
+  listed in `docs/PLAN_chunk_tickets.md` §6 (and its audit section).
 
 A GPU kernel cannot allocate, so every page a kernel might write is
 materialized from the CPU BEFORE the command buffer is submitted, driven by a

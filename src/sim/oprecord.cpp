@@ -56,6 +56,7 @@ uint32_t g_replayReplaceRefusals = 0;
 uint32_t g_ticketTick = 0xFFFFFFFFu;
 std::vector<TicketOp> g_tickets;
 uint32_t g_replayTicketMismatch = 0;
+uint32_t g_replayTicketOps = 0;   // decisions the replay took (compared or not)
 // The player's command for the tick named by g_cmdTick (package N2).
 uint32_t g_cmdTick = 0xFFFFFFFFu;
 TickInput g_cmd{};
@@ -330,6 +331,7 @@ void NoteTicketOp(uint32_t tick, const TicketOp& op) {
   const size_t at = g_tickets.size();
   g_tickets.push_back(op);
   if (!g_replay) return;
+  g_replayTicketOps++;
   // THE REPLAY HALF: the decision at this position must be the recorded one.
   for (const Frame& f : g_replay->frames) {
     if (f.in.tick != tick) continue;
@@ -344,6 +346,31 @@ void NoteTicketOp(uint32_t tick, const TicketOp& op) {
 }
 
 uint32_t ReplayTicketMismatches() { return g_replayTicketMismatch; }
+uint32_t ReplayTicketOps() { return g_replayTicketOps; }
+
+uint32_t InjectTicketRequestsIfReplaying(uint32_t tick, ::Tickets& tickets) {
+  if (!g_replay) return 0;
+  uint32_t n = 0;
+  for (const Frame& f : g_replay->frames) {
+    if (f.in.tick != tick) continue;
+    for (const TicketOp& op : f.tickets) {
+      // Only the activations nothing in the replay can re-derive: a particle's
+      // request comes back off the replay's own snapshot, and a release or a
+      // re-centre is the policy's. The box is re-requested at its CENTRE, the
+      // first offset PlaceBox tries, so it lands on the recorded lo exactly
+      // when the table matches the recording's (and NoteTicketOp says so when
+      // it does not).
+      if (op.kind != TicketOp::kActivate) continue;
+      if (op.reason == (uint32_t)TicketReason::Particle) continue;
+      const int h = (int)kTicketBoxN / 2;
+      tickets.Request({op.wc[0] + h, op.wc[1] + h, op.wc[2] + h}, (TicketReason)op.reason,
+                      tick);
+      n++;
+    }
+    return n;
+  }
+  return 0;
+}
 
 void NoteTickInput(uint32_t tick, const TickInput& cmd) {
   // Unlike NoteGenList this is NOT gated on a live recorder: the caller is the
@@ -490,6 +517,7 @@ void ResetReplayStats() {
   g_replayWords.clear();
   g_replayReplaceRefusals = 0;
   g_replayTicketMismatch = 0;
+  g_replayTicketOps = 0;
 }
 
 uint32_t ReplaceChunksIfReplaying(uint32_t tick, ::Stream& stream) {
