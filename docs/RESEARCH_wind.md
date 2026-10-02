@@ -171,7 +171,13 @@ evaluated analytically at any sample point like a point light.
 
 ### 4.4 Heat / updrafts — derived, not simulated (v1)
 
-There is no temperature anywhere in the sim today (fire is reaction-tag driven,
+**Update 2026-10-02:** a temperature layer now exists (`src/sim/heat.h`, `sim_heat.wgsl`,
+DESIGN.md §4 Heat, `docs/PLAN_temperature.md`): a sparse per-chunk heat pool with a
+per-block target that rises preferentially upward (`sim.heatUpGain`). Heat-driven updrafts
+should read that pool instead of the hot-material count below; this section is the v1
+design as written before it existed.
+
+At the time of writing there was no temperature anywhere in the sim (fire is reaction-tag driven,
 `tag:hot`). Do NOT introduce simulated heat state in v1. Instead: a per-chunk
 **hot-material count** maintained like the occupancy counts (recomputed when a
 chunk changes — fire chunks are active by definition while burning). The
