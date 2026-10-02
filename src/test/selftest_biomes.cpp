@@ -449,24 +449,18 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
   const int treeline = worldmap::CurrentTerrain().treeline;
   int cx = 0, cz = 0, ch = 0;
   biomes::BiomeDef* target = nullptr;
-  for (int i = 0; i < 12 && !target; i++) {
-    const int x = org.x * (int)kChunk + 40 + i * 52;
-    const int z = org.z * (int)kChunk + 400 + i * 13;
-    const int h = World::TerrainHeight(x, z, kDefaultSeed);
-    if (h >= treeline) continue;
-    if (!c.world.ChunkInWindow(IVec3{x >> 4, h >> 4, z >> 4})) continue;
-    const int b = (int)World::MapBiomeAt(x, z, kDefaultSeed);
-    for (biomes::BiomeDef& d : set.biomes)
-      if (d.index == b && d.skinId != 0) { target = &d; cx = x; cz = z; ch = h; }
-  }
-  if (!target) {
-    detail = "no in-window column with a skinned biome below the treeline";
-    std::printf("env-reload: FAIL (%s)\n", detail.c_str());
-    return Status::Fail;
-  }
-  // The swap material: the biome's own subsoil if it differs, else stone (1).
-  const uint32_t authored = target->skinId;
-  const uint32_t swapped = (target->subsoilId && target->subsoilId != authored) ? target->subsoilId : 1u;
+  // THE HARNESS WINDOW IS DESERT (the harness map is a copy of `default`,
+  // whose window cell has been desert since the world map landed, 2026-09-04),
+  // and desert authors `sandCap`: its y == h cell is the CAP's (worldgen.wgsl
+  // genCellIn, the WM_BF_SAND_CAP branch lays M_SAND -- or the firm skin on a
+  // step -- before the skin branch is reached). Swapping only the skin of a
+  // capped biome cannot show at ground level, which is why this gate read
+  // "skin sand -> uploaded sand" ever since: it measured the cap, not a stale
+  // table. So the in-memory edit is the biome's ground as a whole: the skin
+  // swapped AND the cap cleared (both are biome-table fields PackWorldMap
+  // writes into the record the kernel reads). A grid of probes, and the
+  // column must wear its authored skin in the pristine world (a step column
+  // wears the firm skin, 47ab2a6).
   auto name = [&](uint32_t id) { return id < c.mats.size() ? c.mats[id].name : std::string("?"); };
   auto skinAt = [&]() -> uint32_t {
     const IVec3 cc{cx >> 4, ch >> 4, cz >> 4};
@@ -475,11 +469,36 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
     const uint32_t local = ((uint32_t)(cz & 15) * kChunk + (uint32_t)(ch & 15)) * kChunk + (uint32_t)(cx & 15);
     return chunk[local] & 0xFFFu;
   };
+  uint32_t before = 0;
+  for (int i = 0; i < 81 && !target; i++) {
+    const int x = org.x * (int)kChunk + 40 + (i % 9) * 52;
+    const int z = org.z * (int)kChunk + 40 + (i / 9) * 52;
+    const int h = World::TerrainHeight(x, z, kDefaultSeed);
+    if (h >= treeline) continue;
+    if (!c.world.ChunkInWindow(IVec3{x >> 4, h >> 4, z >> 4})) continue;
+    const int b = (int)World::MapBiomeAt(x, z, kDefaultSeed);
+    for (biomes::BiomeDef& d : set.biomes) {
+      if (d.index != b || d.skinId == 0) continue;
+      cx = x; cz = z; ch = h;
+      // A. (read per candidate: the first column wearing its authored skin)
+      before = skinAt();
+      if (before == d.skinId) target = &d;
+      break;
+    }
+  }
+  if (!target) {
+    detail = "no in-window column below the treeline wearing its biome's authored skin";
+    std::printf("env-reload: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  // The swap material: the biome's own subsoil if it differs, else stone (1).
+  const uint32_t authored = target->skinId;
+  const uint32_t swapped = (target->subsoilId && target->subsoilId != authored) ? target->subsoilId : 1u;
+  const bool capped = target->sandCap;
 
-  // A.
-  const uint32_t before = skinAt();
   // B. In-memory edit, packed, uploaded, regenerated.
   target->skinId = swapped;
+  target->sandCap = false;
   std::vector<uint32_t> words;
   TreeAtlas atlas;
   if (!worldmap::PackWorldMap(set, m, words, log) ||
@@ -501,8 +520,8 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
   const bool ok = reloaded && before == authored && during == swapped && after == authored;
   char buf[400];
   std::snprintf(buf, sizeof buf,
-                "%s column (%d,%d) h %d: skin %s -> uploaded %s -> reloaded %s (authored %s, swap %s)%s%s",
-                target->name.c_str(), cx, cz, ch, name(before).c_str(), name(during).c_str(),
+                "%s%s column (%d,%d) h %d: skin %s -> uploaded %s -> reloaded %s (authored %s, swap %s)%s%s",
+                target->name.c_str(), capped ? " (sandCap cleared with the swap)" : "", cx, cz, ch, name(before).c_str(), name(during).c_str(),
                 name(after).c_str(), name(authored).c_str(), name(swapped).c_str(),
                 reloaded ? "" : "; ReloadEnvironment REFUSED: ", reloaded ? "" : log.c_str());
   detail = buf;

@@ -1253,7 +1253,15 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
         smp.held = false;
         m.Step(smp, dt, true, right, up, fwd);
         cur.phaseTick++;
-        if (--cur.releaseLeft <= 0) return StrokeStepResult::Finished;
+        // N + 1 DRIVER STEPS FOR AN N-TICK RELEASE (2026-10-01). The first
+        // released step is the driver's Guard/Wind -> Recover transition,
+        // which restarts its clock at 0 (weight 1, progress 0), so after N
+        // steps the hand-back had only reached (N-1)/N and the caller dropped
+        // the claim from there: a one-frame snap of smoothstep(1/N) — 0.074
+        // at the old default 6 ticks, 0.259 at the 3-tick releases the
+        // keyed-pose styles author (63a9e19). One more step lets the fade
+        // land on 1 before the claim drops (gate swing-smooth).
+        if (--cur.releaseLeft < 0) return StrokeStepResult::Finished;
         break;
       }
       if (sty == nullptr || sty->frames.empty() || cur.frame >= cur.frames) {

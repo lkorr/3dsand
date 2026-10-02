@@ -22,6 +22,7 @@
 #include "sim/farfeat.h"
 #include "sim/farfield.h"
 #include "sim/microvox.h"
+#include "sim/pass_table.h"
 #include "sim/plants.h"
 #include "sim/trample.h"
 #include "sim/weather.h"
@@ -1197,7 +1198,25 @@ Status GateFireDepth(Ctx& c, std::string& detail) {
   std::printf("fire depth: %s (block behind the flame paints %u px, same block "
               "in front paints %u px; behind must be under a tenth of front)\n",
               ok ? "PASS" : "FAIL", behindShown, frontShown);
-  detail = Format("behind %u px, front %u px", behindShown, frontShown);
+  // Attribution (CLAUDE.md rule 6): how much of the slab actually landed, and
+  // where it sits against the window, so a red line says whether the flame
+  // was thin (clipped / burnt out) or the render let the block through.
+  uint32_t fireNow = 0;
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cy = (y0 - 6) >> 4; cy <= (y0 + 6) >> 4; cy++)
+      for (int cz = (gz - 6) >> 4; cz <= (gz + 6) >> 4; cz++)
+        for (int cx = gx >> 4; cx <= (gx + 5) >> 4; cx++) {
+          if (!world.ChunkInWindow({cx, cy, cz})) continue;
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1, cbuf.data(), "fireDepthCensus");
+          for (uint32_t k = 0; k < kChunkVol; k++)
+            if ((cbuf[k] & 0xFFFu) == mFire) fireNow++;
+        }
+  }
+  const IVec3 wo = world.WindowOrigin();
+  detail = Format("behind %u px, front %u px | slab at (%d,%d,%d): %zu of 1014 fire cells placed, %u fire cells after the tick | window y %d..%d",
+                  behindShown, frontShown, gx, y0, gz, fireOps.size(), fireNow,
+                  wo.y * (int)kChunk, wo.y * (int)kChunk + (int)kNChunk * (int)kChunk - 1);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1476,6 +1495,38 @@ uint32_t IrradianceWordAt(GpuContext& ctx, World& world, IVec3 c, uint32_t face,
   return w;
 }
 
+// THE IRRADIANCE GRID IS NOT CLEARED BY STAMPING GEOMETRY OVER IT, and every
+// render gate builds its fixture around (300, 300): a face an earlier gate lit
+// (fire-depth's fire, shadow-cache's slab, ...) still holds that gate's light
+// when the next fixture lands on it, and the walk only discharges it a visit
+// at a time. Zero is the grid's own cold start (world.cpp: "the zeroed
+// allocation is the correct cold start"), the grid is derived and disposable
+// and never hashed, so a gate that asserts on bounce light starts from it.
+// Found 2026-10-01 in suite triage: gi-bounce and cave-time PASS standalone
+// and FAIL in the suite (cave-time's own "FIXTURE CONTAMINATED" verdict).
+static void ZeroIrradianceGrid(GpuContext& ctx, World& world) {
+  // vkCmdFillBuffer through the barrier tracker (48 MiB as a queue write
+  // overruns the staging ring in one unsubmitted batch).
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.FillTracked(pass::Buf::Irradiance, world.irradiance);
+  ctx.queue.Submit(enc.Finish());
+  ctx.WaitIdle();
+}
+
+// ...and the SHADOW CACHE, for the same reason: its slots are keyed on world
+// cell faces, a value stays VALID across a worldgen, and since the staggered
+// refresh (531f2de) a valid patch is re-cast only every 4th frame into a
+// 16-sample mean, so an earlier gate's blocker over (300, 300) (shadow-cache's
+// slab, fire-depth's block) keeps shading this gate's fixture for ~64 frames.
+// gi-bounce read its slab top at 22% of its standalone irradiance in the
+// suite prefix for exactly this (2026-10-01 triage). Zero is the reset value.
+static void ZeroShadowCache(GpuContext& ctx, World& world) {
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.FillTracked(pass::Buf::ShadowCache, world.shadowCache);
+  ctx.queue.Submit(enc.Finish());
+  ctx.WaitIdle();
+}
+
 // RGB9E5 decode, mirroring common.wgsl unpackRgb9e5 (bias 15, 9-bit mantissa).
 static void UnpackRgb9e5(uint32_t w, double out[3]) {
   const int e = (int)(w >> 27);
@@ -1510,6 +1561,22 @@ Status GateGiBounce(Ctx& c, std::string& detail) {
 
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
+  ZeroIrradianceGrid(ctx, world);
+  ZeroShadowCache(ctx, world);
+  // A CLEAR SKY, pinned AND SNAPPED. WriteRenderParams eases the renderer's
+  // sky toward its target in WALL time (support.cpp WriteCloudParams: dt is
+  // the real time between calls), so in the suite this gate inherited the
+  // previous gate's cloudier sky and eased out of it during its own frames:
+  // 'clear' at overcast 0.14 even with the pin, the slab at ~25% of its
+  // standalone irradiance, and the cloud shadow thinning across the
+  // 600-frame write-back arm kept the wall word climbing ("write-back
+  // DIVERGED", 2026-10-01 triage). Snap() makes the first frame land on the
+  // pin. The claim is the bounce, not the weather.
+  struct ClearSky {
+    std::string prev = weather::Override();
+    ClearSky() { weather::SetOverride("clear"); weather::Snap(); }
+    ~ClearSky() { weather::SetOverride(prev); weather::Snap(); }
+  } clearSky;
 
   const int gx = 300, gz = 300;
   const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
@@ -1696,10 +1763,21 @@ Status GateGiBounce(Ctx& c, std::string& detail) {
     WriteBmpFile("build/gi_bounce_on.bmp", onPx, W, H);
     WriteBmpFile("build/gi_bounce_off.bmp", offPx, W, H);
   }
+  // Attribution (CLAUDE.md rule 6): the inputs a suite-only red can inherit
+  // -- the sky this frame resolved to, the GI knobs, the window.
+  const weather::State& wx = weather::Last();
+  const IVec3 wo = world.WindowOrigin();
   detail = Format("delta R %+.2f G %+.2f B %+.2f (G >= %.2f, G-R >= %.2f); floor "
-                  "word (%.3f, %.3f, %.3f); write-back %s",
+                  "word (%.3f, %.3f, %.3f); write-back %s (wall %.4f -> %.4f) | "
+                  "sky '%s' overcast %.2f pin '%s', sunY %.3f, giStrength %.2f "
+                  "giFeedback %.2f, window chunk (%d,%d,%d)",
                   dR, dG, dB, minGreen, minOverRed, floorRgb[0], floorRgb[1],
-                  floorRgb[2], converged ? "converged" : "DIVERGED");
+                  floorRgb[2], converged ? "converged" : "DIVERGED",
+                  0.299 * wall500[0] + 0.587 * wall500[1] + 0.114 * wall500[2],
+                  0.299 * wall600[0] + 0.587 * wall600[1] + 0.114 * wall600[2],
+                  wx.mix.name.c_str(), wx.overcast, weather::Override().c_str(),
+                  ComputeSky(base, (double)noonTick).sunDir[1],
+                  base.render.giStrength, base.render.giFeedback, wo.x, wo.y, wo.z);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1938,6 +2016,7 @@ Status GateCaveTime(Ctx& c, std::string& detail) {
 
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
+  ZeroIrradianceGrid(ctx, world);
 
   // Well clear of the ground so worldgen cannot poke a wall, and block-aligned
   // so the interior faces line up with the openness grid's 4^3 cells.
@@ -2556,6 +2635,19 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
+  // A COLD CACHE, like the standalone gate gets. fire-depth runs just before
+  // this in kOrder with a block over the same (300, 300) site, and its shadow
+  // values stay VALID in their slots after the worldgen: since the staggered
+  // refresh (531f2de) a valid patch is re-cast only every 4th frame and its
+  // value is a 16-sample mean, so a stale one takes ~64 frames to flip and
+  // the walk below read fire-depth's shadows (suite-only red, 2026-10-01
+  // triage). Zero is the buffer's own reset value (world.cpp).
+  {
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    enc.FillTracked(pass::Buf::ShadowCache, world.shadowCache);
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+  }
 
   // A slab floating over open ground. Terrain alone would probably cast usable
   // shadows, but "probably" is how a gate becomes a coin flip on the next
@@ -3589,7 +3681,7 @@ Status GateUnderwaterBody(Ctx& c, std::string& detail) {
   }
 
   auto render = [&](uint32_t bodyInstances, bool withMicro,
-                    std::vector<uint8_t>& out) -> bool {
+                    std::vector<uint8_t>& out, uint32_t frames = 4) -> bool {
     rhi::Buffer shot =
         CreateBuffer(ctx.device, (uint64_t)W * H * 4,
                      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
@@ -3597,8 +3689,14 @@ Status GateUnderwaterBody(Ctx& c, std::string& detail) {
     const uint32_t microCount =
         withMicro ? sim.UploadMicroBodyInsts(ctx.queue, micro) : 0u;
     // Four frames, grab the last: body-shade's warm-shadow-cache reason.
-    for (uint32_t f = 0; f < 4; f++) {
-      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+    for (uint32_t f = 0; f < frames; f++) {
+      // SUN SHADOWS OFF. The claim is the depth/veil contract; a pixel is
+      // "body" iff drawing the body changed it, and with shadows on that
+      // includes the body's cast shadow, whose 16-sample window fills over
+      // 64 frames (531f2de) -- so the dry/wet counts were partly a shadow
+      // fill race (MICRO 0.86 / 0.73 between runs, 2026-10-01 triage).
+      // body-shade owns the body-shadow claim.
+      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, false, 0.0f,
                         kFarFogDensity, (float)H, noonTick);
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       sim.EncodeShadowResolve(enc);
@@ -3608,7 +3706,7 @@ Status GateUnderwaterBody(Ctx& c, std::string& detail) {
       sim.DrawBodies(rp, bodyInstances);
       sim.DrawMicroBodies(rp, microCount);
       rp.End();
-      if (f == 3) {
+      if (f + 1 == frames) {
         rhi::TexelCopyTexture srcT{};
         srcT.texture = c.offscreen;
         rhi::TexelCopyBuffer dstB{};
@@ -3622,6 +3720,15 @@ Status GateUnderwaterBody(Ctx& c, std::string& detail) {
     out.assign((size_t)W * H * 4, 0);
     return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
   };
+  // THE WARM-UP IS THE SHADOW WINDOW'S FILL TIME. Since the staggered refresh
+  // (531f2de, 2026-09-28) a patch's 16-sample penumbra window fills over
+  // 16 x 4 frames, not 16, so after a fixture edit the TERRAIN keeps changing
+  // for ~64 frames: two 4-frame warm-ups left the dry arm's sand terraces and
+  // basin floor drifting by > 10 between the no-body reference and the body
+  // frame, and the dry "body" mask counted ~120k terrain pixels (0.52 visible
+  // with the pillar itself 100% visible wet; 2026-10-01 suite triage). 68 =
+  // 16 x 4 + 4, the shadow-cache gate's number for the same reason.
+  constexpr uint32_t kWarmFrames = 68;
 
   const uint32_t n = (uint32_t)inst.size();
   const bool haveMicro = !micro.empty();
@@ -3631,14 +3738,14 @@ Status GateUnderwaterBody(Ctx& c, std::string& detail) {
   // counted that drift as body (a limb measured at 3x its own footprint).
   std::vector<uint8_t> dryNo, dryBody, dryNoM, dryMicro;
   std::vector<uint8_t> wetNo, wetBody, wetNoM, wetMicro;
-  if (!render(0, false, dryNo) || !render(0, false, dryNo) ||
+  if (!render(0, false, dryNo, kWarmFrames) || !render(0, false, dryNo) ||
       !render(n, false, dryBody) ||
       (haveMicro && (!render(0, false, dryNoM) || !render(0, true, dryMicro)))) {
     detail = "render/readback failed (dry)";
     return Status::Fail;
   }
   settle(water, 20);
-  if (!render(0, false, wetNo) || !render(0, false, wetNo) ||
+  if (!render(0, false, wetNo, kWarmFrames) || !render(0, false, wetNo) ||
       !render(n, false, wetBody) ||
       (haveMicro && (!render(0, false, wetNoM) || !render(0, true, wetMicro)))) {
     detail = "render/readback failed (wet)";
@@ -3647,6 +3754,10 @@ Status GateUnderwaterBody(Ctx& c, std::string& detail) {
   if (haveMicro) WriteBmpFile("underwater_body_micro.bmp", wetMicro, W, H);
   WriteBmpFile("underwater_body_dry.bmp", dryBody, W, H);
   WriteBmpFile("underwater_body_wet.bmp", wetBody, W, H);
+  if (std::getenv("SANDVOX_UW_DEBUG")) {
+    WriteBmpFile("underwater_body_dry_no.bmp", dryNo, W, H);
+    WriteBmpFile("underwater_body_wet_no.bmp", wetNo, W, H);
+  }
 
   // A pixel is body iff drawing the body moved any channel by more than 10.
   // Returns the count, and the mean (blue - red) over those pixels.
@@ -4139,7 +4250,19 @@ Status GateDenoise(Ctx& c, std::string& detail) {
   auto luma = [](const std::vector<uint8_t>& img, size_t p) -> double {
     return 0.299 * img[p * 4] + 0.587 * img[p * 4 + 1] + 0.114 * img[p * 4 + 2];
   };
-  constexpr float kNearM = 10.0f, kMidLoM = 30.0f, kMidHiM = 400.0f;
+  // THE NEAR BAND IS WHERE THE FILTER'S OWN STRENGTH IS ZERO: one fine voxel
+  // spans at least render.denoisePxStart pixels (denoise.wgsl `s`), i.e.
+  // z <= fpx / pxStart voxels. It was a literal 10 m, which was that distance
+  // at camera.fovY 1.2; a411808 (2026-09-29) widened the shipped fov to 1.35,
+  // which moved the filter's zero point in to ~8.4 m, so the 8.4-10 m ring
+  // was being filtered (correctly, at ~5% strength) and counted as "near"
+  // (max diff 32-52 against a pin of 0). Derived, so the next fov or ramp
+  // retune moves the band with it.
+  const float kNearM =
+      std::min(10.0f, (float)H / (2.0f * thf) /
+                          std::max(base.render.denoisePxStart, 0.1f) *
+                          kVoxelMeters);
+  constexpr float kMidLoM = 30.0f, kMidHiM = 400.0f;
 
   // A. near + sky: bit-identical.
   int nearMaxDiff = 0;

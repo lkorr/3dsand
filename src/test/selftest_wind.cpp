@@ -358,6 +358,12 @@ Status GateWind(Ctx& c, std::string& detail) {
 struct PrimResult {
   uint32_t hash = 0;
   uint32_t sandCount = 0;
+  // MASS in eighths, not cells. Since the powder-mass work (706c6b3 / decb125,
+  // 2026-09-26) wind entrainment splits a grain off a cell -- a conserved
+  // split into partial-mass sand voxels (state 0..2 = full, 3..9 = 1..7
+  // eighths) -- so a blown bed has MORE sand voxels and the same sand. A cell
+  // count read "72 / 113 / 93 grains" as a lost voxel that was not lost.
+  uint32_t sandMass = 0;
   double sandX = 0.0;
   int sandMaxX = 0;
   uint32_t wakeMax = 0;    // largest per-tick wake list this arm produced
@@ -534,8 +540,22 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
             const uint32_t mat = cbuf[k] & 0xFFFu;
             if (mat != sandId && mat != smokeId) continue;
             const int x = (int)(k % 16) + cx * 16;
+            // THE CHAMBER'S INTERIOR ONLY. These chunks also hold whatever
+            // worldgen put around the box, and the fan's cone (radius 8 about
+            // z = bz + 2) reaches through the side walls: on the harness map
+            // there is terrain sand out there, the licensed fan blew it, and
+            // whole-chunk counts read "72 / 113 / 93 grains" -- a lost voxel
+            // inside a sealed box that never happened (the bed is 72 grains).
+            const int y = (int)((k / 16) % 16) + cy * 16;
+            const int z = (int)(k / 256) + cz * 16;
+            if (x < x0 || x > x1 || z < z0 || z > z1 || y <= yF || y >= yT)
+              continue;
             if (mat == smokeId) { r.smokeCount++; mxSum += x; continue; }
             r.sandCount++;
+            {
+              const uint32_t st = (cbuf[k] >> 12) & 0xFu;
+              r.sandMass += st <= 2u ? 8u : (st <= 9u ? st - 2u : 8u);
+            }
             sxSum += x;
             if (x > r.sandMaxX) r.sandMaxX = x;
             r.sandCells.push_back(slot * kChunkVol + k);
@@ -592,9 +612,9 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
   //    no licence and no wake.
   const bool quietBlows = (quiet.smokeX - none.smokeX) > 0.5;
   // 5. Mass. A lost grain is the §10 symptom.
-  const bool massOk = east.sandCount == none.sandCount &&
-                      west.sandCount == none.sandCount &&
-                      quiet.sandCount == none.sandCount;
+  const bool massOk = east.sandMass == none.sandMass &&
+                      west.sandMass == none.sandMass &&
+                      quiet.sandMass == none.sandMass;
   // 6. Twice-run equality with a fan blowing.
   const bool stable = twice.hash == east.hash &&
                       twice.sandCells == east.sandCells;
@@ -615,7 +635,7 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
   //
   // What the claim actually needs is that the fan wakes MORE than the control,
   // which is the comparison the rest of this gate is built on.
-  const bool wakes = dDry > 0.5 && dry.sandCount == dryNone.sandCount &&
+  const bool wakes = dDry > 0.5 && dry.sandMass == dryNone.sandMass &&
                      dry.wakeActive > dryNone.wakeActive;
 
   detail = Format(
@@ -629,15 +649,16 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
       // control.
       "| ASLEEP chamber, no smoke: %u chunks awake (%u with no fan), bed "
       "creeps %+.2f "
-      "| grains %u/%u/%u (dry %u vs %u) "
+      "| sand eighths %u/%u/%u (dry %u vs %u; voxels %u/%u/%u) "
       "| wake %u of %u chunks (%u without the licence) "
       "| hash none %08x, fan %08x, repeat %s",
       dEast, mEast, dWest, quietHeld ? "unmoved bitwise" : "MOVED",
       quietBlows ? "blowing" : "STILL",
       east.smokeX - none.smokeX, quiet.smokeX - none.smokeX, dry.wakeActive,
       dryNone.wakeActive, dDry,
-      none.sandCount, east.sandCount,
-      west.sandCount, dry.sandCount, dryNone.sandCount,
+      none.sandMass, east.sandMass,
+      west.sandMass, dry.sandMass, dryNone.sandMass,
+      none.sandCount, east.sandCount, west.sandCount,
       east.wakeMax, budget, quiet.wakeMax, none.hash, east.hash,
       stable ? "identical" : "DIFFERS");
 

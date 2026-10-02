@@ -4778,8 +4778,22 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
   // axis gets more columns so a nine-voxel half-length is not sampled only
   // at its two ends and its middle: 3 per axis up to a 6-voxel half-extent
   // (every humanoid: the grid it always had), 5 or more past that.
-  const Vec3 fwdAx{std::sin(heading_), 0, std::cos(heading_)};
-  const Vec3 rgtAx{std::cos(heading_), 0, -std::sin(heading_)};
+  //
+  // ...ONLY FOR A LONG BODY (suite triage 2026-10-01). Turned for EVERY body,
+  // a humanoid's box -- not square, and sampled at its corners -- swung its
+  // corner columns into the jambs of a narrow hall whenever it walked it at a
+  // slant, and village-harrowby's Wat stood in the alehouse hall for the rest
+  // of the day ("no progress toward waynode_hall_w", 3 of 8 rows; the same
+  // tree with the grid axis-aligned: 8 of 8). The note above already meant
+  // humanoids to keep "the grid it always had", so the grid turns only when
+  // one half-extent is more than twice the other -- BodyCapsule's own test for
+  // a body that is a capsule rather than a disc (the snake: 1.6 x 18).
+  const float ex = def.worldSize.x * 0.5f, ez = def.worldSize.z * 0.5f;
+  const bool longBody = std::max(ex, ez) > 2.0f * std::min(ex, ez);
+  const Vec3 fwdAx = longBody ? Vec3{std::sin(heading_), 0, std::cos(heading_)}
+                              : Vec3{0, 0, 1};
+  const Vec3 rgtAx = longBody ? Vec3{std::cos(heading_), 0, -std::sin(heading_)}
+                              : Vec3{1, 0, 0};
   const int kx = std::clamp((int)std::ceil(hx / 6.0f), 1, 3);
   const int kz = std::clamp((int)std::ceil(hz / 6.0f), 1, 3);
   auto column = [&](int ix, int iz, int& wx, int& wz) {
@@ -26422,7 +26436,16 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
         RepaintLimbMicro(L, microSet_);
       else if (L.microModel >= 0)
         m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
+      // A same-shape repaint moves nothing, so the CPU transform the spawn
+      // built is still the exact one. RebuildLimbBody re-reads a kinematic
+      // limb's pose back out of Jolt, which rounds it (COM <-> origin in
+      // float) by an ulp that grows with the world coordinate: a soaked or
+      // burnt body re-saved one bit off its own record whenever the window
+      // sat far enough out (`mob-save-delta` C, red in the full suite only,
+      // 2026-10-01). The rig re-poses the body from this transform next tick.
+      const BodyTransform spawnXf = L.xf;
       m.RebuildLimbBody((int)i);
+      if (sameShape) L.xf = spawnXf;
       continue;
     }
     // ---- v3 (kSaveVersionMin): the overlay rule that format always had ----

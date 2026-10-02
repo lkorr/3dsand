@@ -12,6 +12,7 @@
 // one tick late"; two runs can.
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -436,6 +437,20 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
   uint32_t t = 30000;
   int quietAt = -1;
   uint32_t activeInBox = 0;
+  // Chunks held awake ONLY by the stain family (sim_step.wgsl). Since
+  // f039607 (2026-09-25, "wet dries") a wet cell with something over it holds
+  // its chunk awake until it has dried, one level at a time at water's
+  // `stain.dries` 15 per mille -- ~1000 ticks for a fully wet face. This box
+  // has a ROOF, so every stone face the pour ran over is such a cell. That
+  // wake is bounded by construction (at most 15 levels, monotone; the
+  // termination argument is stainDry's header) and it moves no water, which is
+  // what this gate's idle claim is about: the WATER has stopped. So the idle
+  // check ignores a chunk whose only reason is the stain/dry mark, and reports
+  // how many there were.
+  uint32_t stainOnlyInBox = 0;
+  // DIRTY_R_STAIN (4) and DIRTY_R_STAINW (1024, a drying cell's own write):
+  // the stain family, as the waterbody gate's pass A reads it.
+  constexpr uint32_t kStainFamily = 4u | 1024u;
   // The seam's per-tick event counters, accumulated. They are the ONLY way to
   // read a mass verdict: "LEAK" with no breakdown says a number did not add up
   // and nothing about which of the four sinks took it, and the four have
@@ -491,12 +506,51 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
                             flags.data(), kNumSlots * 4, "slopeActive");
       activeInBox = 0;
-      for (uint32_t ci : boxChunks)
-        if (flags[ci] != 0) activeInBox++;
+      stainOnlyInBox = 0;
+      for (uint32_t ci : boxChunks) {
+        if (flags[ci] != 0 && (flags[ci] & ~kStainFamily) == 0) stainOnlyInBox++;
+        else if (flags[ci] != 0) activeInBox++;
+      }
       if (activeInBox == 0 && quietAt < 0) quietAt = i;
     }
   }
   ctx.WaitIdle();
+
+  // ---- WHICH structure chunk is awake, and what is in it ------------------
+  // CLAUDE.md rule 6: "1 of 12 awake" is a bare count. Name the chunk and
+  // what it holds besides stone / air / water, and diff it over one more
+  // tick so a wake that moves nothing reads differently from one that does.
+  std::string awakeWhy;
+  if (activeInBox > 0) {
+    std::vector<uint32_t> flags(kNumSlots, 0);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                          flags.data(), kNumSlots * 4, "slopeActive2");
+    for (int cz = z0 >> 4; cz <= (z1 >> 4); cz++)
+      for (int cy = floorY >> 4; cy <= ((roofY + 1) >> 4); cy++)
+        for (int cx = x0 >> 4; cx <= (x1 >> 4); cx++) {
+          const uint32_t ci = World::SlotChunkIndex({cx, cy, cz});
+          if (flags[ci] == 0 || (flags[ci] & ~kStainFamily) == 0) continue;
+          std::vector<uint32_t> a((size_t)kChunkVol), b((size_t)kChunkVol);
+          ReadVoxelsSync(ctx, world, ci, 1, a.data(), "slopeAwakeA");
+          SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                     {6, 7, 6}, false, false);
+          ctx.WaitIdle();
+          ReadVoxelsSync(ctx, world, ci, 1, b.data(), "slopeAwakeB");
+          std::map<uint32_t, int> hist;
+          int changed = 0, matChanged = 0;
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const uint32_t m = a[k] & 0xFFFu;
+            if (m != 0 && m != kMatStone && m != waterId) hist[m]++;
+            if ((a[k] & ~0x00F80000u) != (b[k] & ~0x00F80000u)) changed++;
+            if ((a[k] & 0xFFFu) != (b[k] & 0xFFFu)) matChanged++;
+          }
+          awakeWhy += Format(" [chunk (%d,%d,%d) flag %08x, %d words / %d materials changed over 1 tick (stamp/excite bits ignored), other mats:",
+                             cx, cy, cz, flags[ci], changed, matChanged);
+          for (const auto& [m, n] : hist)
+            awakeWhy += Format(" %s x%d", m < c.mats.size() ? c.mats[m].name.c_str() : "?", n);
+          awakeWhy += "]";
+        }
+  }
 
   // ---- where did the water end up? ----------------------------------------
   sweepVoxels();
@@ -545,7 +599,8 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       "%llu binned, %llu eaten by reactions; ledger first parted at tick %d "
       "by %lld), live particles by quarter of the run %u/%u/%u/%u (flat means "
       "the residue is permanent, not slow), %u of "
-      "%zu structure chunks awake at tick %d (quiet from %d)",
+      "%zu structure chunks awake at tick %d (quiet from %d; %u more held "
+      "only by the bounded wet-drying mark)",
       (unsigned long long)poured, drain * 100.0,
       (unsigned long long)basinE, (unsigned long long)rampE,
       (unsigned long long)deckE, (unsigned long long)elseE,
@@ -556,7 +611,8 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       (unsigned long long)sumRefused,
       (unsigned long long)sumBinned, (unsigned long long)sumConsumed,
       divergeAt, divergeBy, liveAt[0], liveAt[1], liveAt[2], liveAt[3],
-      activeInBox, boxChunks.size(), kTicks, quietAt);
+      activeInBox, boxChunks.size(), kTicks, quietAt, stainOnlyInBox);
+  detail += awakeWhy;
   return ok ? Status::Pass : Status::Fail;
 }
 

@@ -2646,6 +2646,12 @@ FluidProbe ProbeBleedFluid(Ctx& c, int defIndex, int limb, uint32_t rewriteTo,
 Status GateBleedFluid(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
+  // ISOLATION (suite triage 2026-10-01): IdCounterScope only PUTS BACK the
+  // id counter; the gate used to START from whatever earlier gates left it at.
+  // A creature's gore profile and its bleed/stain rolls hash its id
+  // (Mob::MakeGoreProfile, BleedTick), so the same fixture bled differently by
+  // suite position -- red in the full suite, green in every subset. Pinned.
+  mobs.SetNextIdCounter(1);
   PrepareWorld(c);
   auto mat = [&](const char* n) -> uint32_t {
     for (size_t i = 0; i < c.mats.size(); i++)

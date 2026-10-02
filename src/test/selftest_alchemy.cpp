@@ -1103,7 +1103,14 @@ Status GateAlchemyEvaporate(Ctx& c, std::string& detail) {
   alchemy::FlaskSim s3(cfg);
   s3.SetSubstances(b.subs);
   s3.SetChemistry(b.chem);
-  const int v3 = s3.AddVessel(BenchFlask(16), {{240, 4}, 0}, one, true);
+  // 64 eighths of glass, not 16 (suite triage 2026-10-01). Since 1b00ae3
+  // (2026-09-29) liquid ether boils off as ~8 vapour per voxel, and ether
+  // evaporates ONLY at air (part (1) asserts exactly that). In the old
+  // 16-eighth flask (192 px) one eighth's vapour (~224 px) replaced all the
+  // air before the last particle went, so that particle stayed liquid by
+  // design and "evaporated wholly" could never hold. The claim here is the
+  // VOLUME of the vapour, so the flask now has the headspace to take it all.
+  const int v3 = s3.AddVessel(BenchFlask(64), {{240, 4}, 0}, one, true);
   for (int f = 0; f < 60 * 12 && s3.ParticleCount() > 0; f++) s3.Step(4);
   for (int f = 0; f < 60 * 3; f++) s3.Step(4);
   const int liquidPx = cfg.unitsPerEighth;   // one eighth of liquid covers this many pixels

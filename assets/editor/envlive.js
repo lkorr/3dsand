@@ -148,6 +148,9 @@ export const LIVE = {
     'oceanFadeCells': R('WM_H_OCEAN_FADE'),
     'warpAmpVox': R('the biome-edge warp'),
     'biomes': R('the palette: plane byte -> biome file'),
+    // map-overhaul P7 (b5359be) moved the edit layer from tuning.json world.editLayer
+    // to the map; 5e62edf first shipped a map that names one.
+    'editLayer': R('worldmap.cpp LoadWorldMap: the assets/worldedits/<name>.svedit layer applied over this map’s worldgen as an op-stream patch (DESIGN.md §9c.4)'),
     'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), kind "landform" DECLARED MOUNTAINS (P-G: peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed), and kind "tree" AUTHORED TREES (P6: a species at a column, near and far), kind "clearing" FOREST CLEARINGS (a box no crown reaches over) and kind "soften" SOFTENED GROUND (a box whose hills / bumps / grain are scaled, the village routes flatter still). Each is listed in the map cells its reach touches (at most four a cell) and keeps out by its own footprint'),
     // P-G: the terrain, per map (worldmap.h kHTerrain*), read by the height
     // mirror on both sides through the worldMap header. Every number that

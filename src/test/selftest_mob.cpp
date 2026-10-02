@@ -438,6 +438,8 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
 }
 
 // ---- mob ---------------------------------------------------------------
+IVec3 AiFlatSpot(int cx, int cz, int search, int half, uint32_t seed,
+                 int& outRelief);  // defined with the AI gates below
 Status GateMob(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
@@ -544,12 +546,24 @@ bool mobOk = false;
     };
     const int nLimbs = (int)dd.limbs.size();
     int h = World::TerrainHeight(140, 140, kDefaultSeed);
+    // THE DUMMY STANDS ON FLAT GROUND (suite triage 2026-10-01). Since
+    // 344758e (2026-09-10) a rig's step budgets are clamped to its own leg
+    // span, and the legacy dummy's is ONE cell up: on the raw procedural
+    // ground at (137,139) (+-6 voxels reads 216/219 around h 217) every bearing
+    // is a wall to it, so it never took a step ("walked 0.0", "crawled 0.0",
+    // and steering whenever its heading started boxed in). That is the
+    // intended locomotion; the fixture was standing a one-cell-stride body on
+    // a slope. The dummy fixtures move to the flattest patch near (140,140);
+    // the critter's, which pass where they are, do not.
+    int dRelief = 0;
+    const IVec3 dFlat = AiFlatSpot(140, 140, 40, 12, kDefaultSeed, dRelief);
+    const int dhx = dFlat.x, dhz = dFlat.z, dh = dFlat.y;
     uint32_t t = 6000;
     // THE REAL TICK (W2-O, test/tickrig.h), centred on the fixture's chunk.
-    support::TickCursor mobTicker{c, t, {8, h / 16, 8}};
+    support::TickCursor mobTicker{c, t, {dhx >> 4, dh / 16, dhz >> 4}};
     auto mobTick = [&](const std::vector<BrushOp>& ops) { mobTicker(ops); };
 
-    uint64_t id = mobs.Spawn(dummyDef, {137, h + 1, 139});
+    uint64_t id = mobs.Spawn(dummyDef, {dhx - 3, dh + 1, dhz - 1});
     Vec3 spawnPos = mobs.MobOrigin(id);
     // Same forward-locomotion invariant the critter is held to (below): the
     // legacy scale-1 rig must keep walking along its facing, so a fix aimed
@@ -567,6 +581,23 @@ bool mobOk = false;
     }
     bool dummyForward = dPath > 1.0f && dAlong > 0.5f * dPath;
     Vec3 walked = mobs.MobOrigin(id);
+    // ATTRIBUTION for a dummy that never moved (red since 344758e, 09-10):
+    // where it stands, which way it wants to go, and its step budget.
+    if (dPath <= 1.0f) {
+      const Mob* dm = mobs.FindMobById(id);
+      std::printf(
+          "  mob walk: spawn (%.1f,%.1f,%.1f) now (%.1f,%.1f,%.1f) heading "
+          "%.2f desired %.2f stepUp %d loco %d terrain h=%d (flat spot relief "
+          "%d) | ground +-6: %d %d %d %d\n",
+          (double)spawnPos.x, (double)spawnPos.y, (double)spawnPos.z,
+          (double)walked.x, (double)walked.y, (double)walked.z,
+          (double)mobs.MobHeading(id), (double)mobs.MobDesiredHeading(id),
+          dm ? dm->StepUpCells() : -1, mobs.LocoState(id), dh, dRelief,
+          World::TerrainHeight(dhx + 6, dhz, kDefaultSeed),
+          World::TerrainHeight(dhx - 6, dhz, kDefaultSeed),
+          World::TerrainHeight(dhx, dhz + 6, kDefaultSeed),
+          World::TerrainHeight(dhx, dhz - 6, kDefaultSeed));
+    }
     float dist = (walked - spawnPos).len();
     // The mob wanders ~20 voxels over these 120 ticks, and terrain averages
     // ~0.34 voxels of fall per voxel travelled, so a healthy mob legitimately
@@ -575,7 +606,7 @@ bool mobOk = false;
     // downhill — it was 6.0 when hills spanned 45 voxels and the mob grazed
     // it at exactly -6.0 once hills spanned 90.
     bool standing = mobs.IsAlive(id) && mobs.LimbBodyCount() == (uint32_t)nLimbs &&
-                    std::abs(walked.y - (float)(h + 1)) < 16.0f;
+                    std::abs(walked.y - (float)(dh + 1)) < 16.0f;
 
     // sever arm.L
     uint32_t debrisBefore = debris.BodyCount();
@@ -637,7 +668,7 @@ bool mobOk = false;
     // an unrelated failure in `mob` — a fixture must not perturb its
     // neighbours.
     {
-      uint64_t sid = mobs.Spawn(dummyDef, {137, h + 1, 139});
+      uint64_t sid = mobs.Spawn(dummyDef, {dhx - 3, dh + 1, dhz - 1});
       bool turnBounded = true, turnedFreely = false, turnArrived = false;
       bool turnCurved = false;
       const float startH = mobs.MobHeading(sid);
@@ -716,6 +747,7 @@ bool mobOk = false;
           if (cd.limbs[i].name == nm) return (int)i;
         return -1;
       };
+      mobTicker.chunk = {8, h / 16, 8};  // the critter's own ground
       uint64_t cid = mobs.Spawn(critterDef, {137, h + 1, 139});
       int maxSwing = 0, everSwung = 0, neverPlanted = 0;
       // FORWARD-LOCOMOTION CHECK. A mob must travel along the direction it
@@ -1264,7 +1296,8 @@ bool mobOk = false;
           tt.gore.bleedHpPerVoxel = 0.0f;
           SetCurrentTuning(tt);
         }
-        uint64_t did = mobs.Spawn(dummyDef, {137, h + 1, 139});
+        mobTicker.chunk = {dhx >> 4, dh / 16, dhz >> 4};
+        uint64_t did = mobs.Spawn(dummyDef, {dhx - 3, dh + 1, dhz - 1});
         for (int i = 0; i < 10; i++) mobTick({});
         int s0 = mobs.LocoState(did);
         mobs.Sever(did, limbIndex("leg.L"));
@@ -1314,6 +1347,7 @@ bool mobOk = false;
         // critter: one lost chain is the gait's own graceful degradation
         // (no rule fires); the second flips it to the crawl state, which
         // must silence the gait scheduler completely.
+        mobTicker.chunk = {8, h / 16, 8};  // back to the critter's ground
         uint64_t cid2 = mobs.Spawn(critterDef, {150, h + 1, 150});
         mobs.Sever(cid2, critterLimb("legU.FL"));
         for (int i = 0; i < 10; i++) mobTick({});
@@ -2338,8 +2372,20 @@ bool mobOk = false;
         // what makes this catch a discontinuity without pinning down what the
         // correct pose looks like.
         float worstJump = 0.0f, worstJumpFlat = 0.0f;
+        // BOTH PASSES WALK THE SAME GROUND (suite triage 2026-10-01). The A/B
+        // below rests on "both runs contain identical stride motion", but the
+        // ragged pass used to start where the flat one ended, ~84 voxels
+        // further along z, over different terrain under a body held at a
+        // fixed y. Since 344758e (2026-09-10) the foot probe climbs OUT of
+        // matter instead of reporting the ground inside it, so a foot whose
+        // column rises above the held body now jumps to the surface (61-137
+        // degree leg snaps on grounded ticks, t54+ of the ragged pass) -- the
+        // terrain differing between the arms, not the raggedness. Rewind z so
+        // the only difference between the arms is the `grounded` flicker.
+        const float walkZ0 = pl.pos.z;
         for (int pass = 0; pass < 2; pass++) {
           const bool kBumpyRagged = (pass == 1);
+          pl.pos.z = walkZ0;
           pl.grounded = true;
           const int watch[4] = {avatar.PartIndex("armU.L"),
                                 avatar.PartIndex("armU.R"),
@@ -2619,15 +2665,38 @@ bool mobOk = false;
         const char* ladder[] = {"foot.R", "legL.R", "legU.L"};
         float prevSpeed = avatar.Locomotion().speedScale;
         bool monotone = prevSpeed == 1.0f;
+        float prevState = prevSpeed;
         int statesSeen = 0;
+        // ATTRIBUTION for monotone=0 (red since 09-16..09-19): the speed scale
+        // at each rung, so "not monotone" names the rung (or the start).
+        std::string ladderTrace = Format("start %.3f", (double)prevSpeed);
         for (const char* nm : ladder) {
-          if (!avatar.SeverByName(nm)) continue;
+          if (!avatar.SeverByName(nm)) {
+            ladderTrace += Format(" | %s: no sever", nm);
+            continue;
+          }
           for (int i = 0; i < 12; i++) avTick();
           float s = avatar.Locomotion().speedScale;
-          monotone = monotone && s <= prevSpeed + 1e-4f;
+          // THE LADDER IS ABOUT THE STATES. Since the stump drag (d69dae7,
+          // 2026-09-19) Locomotion() multiplies the state's authored speed by
+          // an EASED drag cost (1 - dragW * 2/3, avatar.cpp kDragSpeedPenalty)
+          // that rises and falls with the pose, so one sample 12 ticks after a
+          // sever can read below the NEXT rung's (measured: -foot.R 0.398 with
+          // the drag mid-ease, -legL.R 0.530, same state). Divide the drag back
+          // out so "damage never makes you faster" is asked of the states;
+          // `slowed` below still reads the real, dragged speed.
+          const float dw = avatar.StumpDragWeight();
+          const float stateS =
+              s / std::max(1e-3f, 1.0f - dw * (1.0f - 1.0f / 3.0f));
+          ladderTrace += Format(" | -%s: %.3f (drag %.2f, state speed %.3f) state %d",
+                                nm, (double)s, (double)dw, (double)stateS,
+                                avatar.LocoState());
+          monotone = monotone && stateS <= prevState + 1e-3f;
+          prevState = stateS;
           prevSpeed = s;
           if (avatar.LocoState() >= 0) statesSeen++;
         }
+        if (!monotone) std::printf("  avatar speed ladder: %s\n", ladderTrace.c_str());
         bool slowed = prevSpeed < 1.0f;
         // both legs unusable -> no jump. This is derived from leg liveness
         // rather than authored, so it must hold whatever the rules say.
@@ -3547,7 +3616,34 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
           moved++;
           if ((ra[i].packed & 3u) == kReactEmit) emitMoved++;
           const uint32_t want = (ra[i].chance + 1u) / 2u;
-          if (rb[i].chance + 1u < want || rb[i].chance > want + 1u) wrongFactor++;
+          // A rule ALREADY CERTAIN at 100% (chance == kReactChanceDen) was
+          // clamped there, so its halving is of the unclamped value and lands
+          // anywhere between half of certainty and certainty. Since ether's
+          // ignition (1b00ae3, 2026-09-29: authored 600 per mille, compiled to
+          // certainty at 100%) one rule is: 2,000,000 -> 1,200,000 at 50%. Held to
+          // "moved down, by no more than half", which a wrong factor fails.
+          const bool saturated = ra[i].chance >= kReactChanceDen;
+          const bool factorOk =
+              saturated ? (rb[i].chance + 1u >= want && rb[i].chance < ra[i].chance)
+                        : !(rb[i].chance + 1u < want || rb[i].chance > want + 1u);
+          if (!factorOk) {
+            // ATTRIBUTION: name the rule (its owner material's bucket) and
+            // both chances, so "1 by the wrong factor" is a finding.
+            if (wrongFactor < 3) {
+              std::string owner = "?";
+              for (size_t mi = 0; mi < ma.size(); mi++)
+                if (i >= ma[mi].gpu.reactOffset &&
+                    i < (size_t)ma[mi].gpu.reactOffset + ma[mi].gpu.reactCount)
+                  owner = ma[mi].name;
+              const uint32_t pS = ra[i].prodSelf & 0xFFFu, pN = ra[i].prodNbr & 0xFFFu;
+              std::printf("    spread knob wrong factor: rule %zu (%s -> self %s / nbr %s) "
+                          "chance %u at 100%% -> %u at 50%% (want ~%u)\n",
+                          i, owner.c_str(), pS < ma.size() ? ma[pS].name.c_str() : "?",
+                          pN < ma.size() ? ma[pN].name.c_str() : "?", ra[i].chance,
+                          rb[i].chance, want);
+            }
+            wrongFactor++;
+          }
         }
         // Nothing the OTHER knob owns may move with this one. Taken by
         // re-compiling at a different burnDurationPct and checking the rules
@@ -3980,6 +4076,27 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       settleTicks++;
       if (burning(id) == 0) break;
     }
+    // TERMINATION IS CONVERGENCE, NOT A DEADLINE -- subtest H's rule, applied
+    // here too (suite triage 2026-10-01). Since the human replaced the wizard
+    // as the fixture (2026-09-19) and grew a hair mass (2026-09-24, 8b73865),
+    // a 150-tick blaze leaves a front that is still falling at 400 ticks
+    // (measured 1253 -> 572), and since a corpse is a dead Mob (e7a0c85,
+    // 2026-09-24) a creature that dies in the settle keeps its burning limbs in
+    // this census. The claim is that the burn ENDS: keep giving it quiet ticks
+    // while the front strictly falls, and fail on a plateau or the cap.
+    {
+      const int kRound = 200, kRounds = 8;
+      uint32_t prev = burning(id);
+      for (int rd = 0; rd < kRounds && prev > 0; rd++) {
+        for (int i = 0; i < kRound && burning(id) > 0; i++) {
+          burnTick(id, 0, 0);
+          settleTicks++;
+        }
+        const uint32_t now = burning(id);
+        if (now >= prev) break;  // plateau: a relight loop at gain 1
+        prev = now;
+      }
+    }
     const uint32_t finalFront = burning(id);
     // The mob may already have burned to death, in which case the front is
     // trivially zero — say so, so a vacuous pass is visible rather than
@@ -3988,7 +4105,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     std::printf(
         "  burn terminates: %s (peak front %u -> %u after %u ticks, %s)\n",
         fOk ? "PASS" : "FAIL", peakFront, finalFront, settleTicks,
-        aliveTicks >= kBlaze ? "creature survived" : "creature was consumed");
+        aliveTicks < kBlaze ? "creature was consumed"
+        : mobs.IsAlive(id) ? "creature survived"
+                           : "creature survived the blaze, died in the settle");
     ok = ok && fOk;
     mobs.Reset();
     debris.Reset();
@@ -5827,6 +5946,12 @@ Status GateZombify(Ctx& c, std::string& detail) {
   c.debris.Reset();
   c.mobs.Reset();
   c.mobs.ClearRisings();
+  // ISOLATION (suite triage 2026-10-01): runtime defs are a session CACHE
+  // (2026-09-25, MobSystem::EvictUnusedDefs), and earlier gates (undead, the
+  // pool gates) leave compositions and blanked slots behind. Arm B asserts
+  // "the one nobody wrote" is built HERE, so start from no unheld runtime def
+  // at all; with nothing alive after the Reset above, every one is unheld.
+  c.mobs.EvictUnusedDefs(-1, 0);
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
@@ -5862,8 +5987,15 @@ Status GateZombify(Ctx& c, std::string& detail) {
     return n ? sum / n : 0.0;
   };
   const size_t defsBefore = c.mobs.Defs().size();
+  // GREW = one more LIVE runtime def, and it was not there before. Not
+  // "Defs().size() + 1": an evicted slot is blanked for reuse (2026-09-25),
+  // so a composition after an earlier gate's eviction fills a hole and the
+  // list does not lengthen -- which read as "not built" in the full suite.
+  const uint32_t runtimeBefore = c.mobs.RuntimeDefCount();
+  const bool absentBefore = c.mobs.FindDef("newcomer+zombie") < 0;
   const int made = c.mobs.DefWithEffects("newcomer", fx, nullptr);
-  const bool grew = made >= 0 && c.mobs.Defs().size() == defsBefore + 1;
+  const bool grew = made >= 0 && absentBefore &&
+                    c.mobs.RuntimeDefCount() == runtimeBefore + 1;
   bool composed = false;
   std::string composeWhy = "not built";
   double baseChroma = 0, newChroma = 0;
@@ -6224,7 +6356,7 @@ Status GateZombify(Ctx& c, std::string& detail) {
       ctlVox, gearNow.empty() ? "-" : gearNow.c_str(),
       heldNow.empty() ? "-" : heldNow.c_str());
   RecordObserved("zombifyComposedDefs",
-                 (double)(c.mobs.Defs().size() - defsBefore));
+                 (double)c.mobs.Defs().size() - (double)defsBefore);
 
   c.debris.Reset();
   c.mobs.Reset();
@@ -6898,6 +7030,23 @@ Status GateAiFace(Ctx& c, std::string& detail) {
 // (9.0) already sits on what a sword lands at, and a fix that "improved" the
 // armed case would be retuning every other NPC gate behind this one's back.
 Status GateAiReach(Ctx& c, std::string& detail) {
+  // THE SHIPPED ITEM LIBRARY, for this gate only (suite triage 2026-10-01).
+  // MobSystem::StartStroke resolves a held weapon's FORM (strokes.h WEAPON
+  // FORMS) only when the system has an item library; main.cpp always hands it
+  // one, the harness does not, and several earlier gates (corpse-save,
+  // mob-handoff, net-corpse, net-player-corpse) set it and never clear it. So
+  // whether the fixture's fighters swung their weapons' `long` form or the base
+  // frames depended on which gates ran first: the full suite measured the
+  // weapon forms, a --verify subset the base frames. Pinned here to
+  // what the game ships, and put back on the way out.
+  struct ItemsScope {
+    MobSystem& m;
+    const ItemLibrary* prev;
+    ItemsScope(MobSystem& mm, const ItemLibrary* now) : m(mm), prev(mm.Items()) {
+      m.SetItems(now);
+    }
+    ~ItemsScope() { m.SetItems(prev); }
+  } itemsScope(c.mobs, &c.items);
   c.debris.Reset();
   c.mobs.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -9765,6 +9914,61 @@ Status GateSnake(Ctx& c, std::string& detail) {
   // rests between them -- the wander intent wins, it covers ground, it STOPS
   // (a rest lying coiled is a rest), it stays near its anchor, and the body
   // is still a wave while it strolls (slip, as pass A measures it).
+  //
+  // THE FLOOR UNDER THE WHOLE WANDER, and nothing standing on it. The run pad
+  // above is 21 voxels across x with pass C's 3-voxel wall still across it,
+  // and the wander disc is `wanderRadius` (24) round the anchor -- round a NEW
+  // anchor after pass E's load, so up to twice that from the spawn. Most legs
+  // were drawn off the pad's edge (a drop the walk refuses: MoveNoDeeper) or
+  // behind the wall, and each such leg stood still until the stuck guard gave
+  // it up (2 x 30 x diameter / speed + 60 = 660 ticks for the snake). Measured
+  // at c7a5109 standalone: pass D 1434 still ticks of 1800, pass E 3.0 vox in
+  // 900 ticks; in the suite pass D moved 54 ticks of 1800. Levelled here, at
+  // the pad's own height, out to two radii and a body from the anchor.
+  {
+    const ai::Profile* wp =
+        c.mobs.Behaviors().At(c.mobs.Behaviors().Find("snake"));
+    const int reach =
+        (int)std::ceil(2.0f * (wp != nullptr ? wp->movement.wanderRadius : 24.0f) +
+                       sd.worldSize.z);
+    const int ax = spot.x, az = spot.z - 2;
+    const uint32_t stone = [&] {
+      for (size_t i = 0; i < c.mats.size(); i++)
+        if (c.mats[i].name == "stone") return (uint32_t)i;
+      return 1u;
+    }();
+    std::vector<CellOp> ops;
+    for (int wz = az - reach; wz <= az + reach; wz++)
+      for (int wx = ax - reach; wx <= ax + reach; wx++) {
+        const int th = World::TerrainHeight(wx, wz, kDefaultSeed);
+        const int top = std::max(th, padTop) + 10;
+        for (int y = std::min(th, padTop) - 2; y <= top; y++) {
+          const IVec3 cell{wx, y, wz};
+          if (!c.world.CellInWindow(cell)) continue;
+          ops.push_back(
+              CellOp{World::SlotCellIndex(cell), y <= padTop ? stone : 0u});
+        }
+      }
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < ops.size(); i += kSlice) {
+      std::vector<CellOp> slice(
+          ops.begin() + (ptrdiff_t)i,
+          ops.begin() + (ptrdiff_t)std::min(i + kSlice, ops.size()));
+      tick({}, slice);
+    }
+    for (int i = 0; i < 160; i++) {
+      bool all = true;
+      for (int wz = az - reach; wz <= az + reach; wz += 4)
+        for (int wx = ax - reach; wx <= ax + reach; wx += 5) {
+          const IVec3 cell{wx, padTop, wz};
+          if (cachedSolid(cell)) continue;
+          all = false;
+          c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+        }
+      if (all) break;
+      tick();
+    }
+  }
   {
     const float sx = (float)spot.x + 0.5f, sz = (float)spot.z - 2.0f;
     const uint64_t idle = c.mobs.Spawn(
@@ -9777,7 +9981,8 @@ Status GateSnake(Ctx& c, std::string& detail) {
       const Vec3 a0 = AiMobCentre(c.mobs, idle, sd);
       Vec3 last = a0;
       float path = 0.0f, farthest = 0.0f;
-      int wanderTicks = 0, stillTicks = 0, movingTicks = 0, rests = 0;
+      int wanderTicks = 0, stillTicks = 0, movingTicks = 0, rests = 0,
+          stuckTicks = 0;
       bool wasStill = true;
       for (int t = 0; t < ticks; t++) {
         tick();
@@ -9791,8 +9996,11 @@ Status GateSnake(Ctx& c, std::string& detail) {
         else movingTicks++;
         if (still && !wasStill) rests++;
         wasStill = still;
-        if (const ai::Brain* br = c.mobs.MobBrain(idle))
+        if (const ai::Brain* br = c.mobs.MobBrain(idle)) {
           if (br->intent == ai::Intent::Wander) wanderTicks++;
+          // STILL WITH NO REST ASKED: a leg that is not getting anywhere.
+          if (still && !br->routine.hold) stuckTicks++;
+        }
       }
       const ai::Profile* sp =
           c.mobs.Behaviors().At(c.mobs.Behaviors().Find("snake"));
@@ -9812,10 +10020,10 @@ Status GateSnake(Ctx& c, std::string& detail) {
                    farthest, radius));
       RecordObserved("snake.wanderPathObserved", (double)path);
       std::printf("snake wander: %d/%d ticks wandering, path %.1f vox, %d "
-                  "moving / %d still ticks, %d rest(s), farthest %.1f vox "
-                  "(radius %.0f)\n",
-                  wanderTicks, ticks, path, movingTicks, stillTicks, rests,
-                  farthest, radius);
+                  "moving / %d still ticks (%d of them on a leg, not a rest), "
+                  "%d rest(s), farthest %.1f vox (radius %.0f)\n",
+                  wanderTicks, ticks, path, movingTicks, stillTicks,
+                  stuckTicks, rests, farthest, radius);
 
       // ---- PASS E: SAVED AND LOADED, IT GOES ON BEING A SNAKE --------------
       // Its MOBS record (Mob::SaveOne -> MobSystem::LoadOne, the save's and
@@ -9841,12 +10049,16 @@ Status GateSnake(Ctx& c, std::string& detail) {
       if (bid != 0) {
         const Vec3 b0 = AiMobCentre(c.mobs, bid, sd);
         float bpath = 0.0f;
+        int bstuck = 0;
         Vec3 bl = b0;
         for (int t = 0; t < 900; t++) {
           tick();
           const Vec3 p = AiMobCentre(c.mobs, bid, sd);
-          bpath += AiPlanar(p, bl);
+          const float st = AiPlanar(p, bl);
+          bpath += st;
           bl = p;
+          if (const ai::Brain* br = c.mobs.MobBrain(bid))
+            if (st < 0.02f && !br->routine.hold) bstuck++;
         }
         const ai::Brain* bb = c.mobs.MobBrain(bid);
         const int sl = c.mobs.LocoState(bid);
@@ -9861,8 +10073,9 @@ Status GateSnake(Ctx& c, std::string& detail) {
                      "wandering (%.1f vox in 900 ticks)",
                      AiPlanar(b0, savedAt), bpath));
         std::printf("snake save/load: %zu-byte record, back %.1f vox from "
-                    "where it was saved, %.1f vox of wander in 900 ticks\n",
-                    rec.size(), AiPlanar(b0, savedAt), bpath);
+                    "where it was saved, %.1f vox of wander in 900 ticks "
+                    "(%d still on a leg)\n",
+                    rec.size(), AiPlanar(b0, savedAt), bpath, bstuck);
       }
     }
     // THE POSE COST (Mob::ApplySlither): its own wall-clock, every call over
@@ -10164,10 +10377,26 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
     const ExplosionOp e2{ifloor(w1.x) - 6, ifloor(w1.y) + 2, ifloor(w1.z),
                          tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
     const float peak2 = flight(wid, 40, e2);
-    const float travel2 = (lastAlive - w1).len();
-    const bool repeatOk = wid != 0 && phase1 == 1 && mobs.IsAlive(wid) &&
+    // A CORPSE IS STILL THE RIG (suite triage 2026-10-01). Since e7a0c85 /
+    // bf55757 (2026-09-24) a dead creature stays a Mob with its rig, takes one
+    // capped launch through BlastRadial, and MobRootPos answers from its root
+    // body -- the "husk leaves mobs_" reason for lastAlive above is gone. The
+    // human (the subject since the wizard was deleted, 2026-09-19) is killed
+    // by the SECOND charge at flight tick 0 (red since 09-12, "vital limb
+    // destroyed"), which is the blast's lethality and not this arm's claim:
+    // the claim is the push CEILINGS on a rig that is already limp, and a
+    // corpse is exactly such a rig. So survival is reported, not required,
+    // and the travel is measured on the corpse's root when it died.
+    const int wizRoot = mobs.Defs()[wizDef].rootLimb;
+    const bool rigLeft =
+        wid != 0 && wizRoot >= 0 && mobs.LimbBody(wid, wizRoot) != 0;
+    const Vec3 endPos =
+        mobs.IsAlive(wid) ? lastAlive : (rigLeft ? mobs.MobRootPos(wid) : lastAlive);
+    const float travel2 = (endPos - w1).len();
+    const bool repeatOk = wid != 0 && phase1 == 1 &&
+                          (mobs.IsAlive(wid) || rigLeft) &&
                           peak1 <= (float)maxSpeed && peak2 <= (float)maxSpeed &&
-                          travel2 <= (float)maxTravel;
+                          peak2 > 0.0f && travel2 <= (float)maxTravel;
     std::printf("  ragdoll repeat blast: %s (fastest limb %.1f m/s standing, %.1f m/s "
                 "already limp, ceiling %.0f; second blast moved the pelvis %.1f vox "
                 "in 1.3 s, band ..%.0f; phase after first %d, alive %d, died at flight "
@@ -13962,6 +14191,10 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
+  // ATTRIBUTION for claim G: how full the merged art palette already is
+  // before this gate builds anything (the shipped cast + whatever earlier
+  // gates composed), so a full palette names who filled it.
+  const size_t art0 = c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
   const std::vector<std::string> names = c.mobs.PoolNames();
   std::string fem, mal;
   for (const std::string& n : names) {
@@ -14037,11 +14270,12 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
 
   const bool ok = built && cached && spawned && zombie && refused && palette;
   detail = Format("pool %zu bodies | built %s + %s %s%s | cached %s | spawned %s | "
-                  "%s+zombie %s | bad names refused %s | art palette %zu/%d",
+                  "%s+zombie %s | bad names refused %s | art palette %zu/%d "
+                  "(%zu before this gate built anything)",
                   names.size(), fem.c_str(), mal.c_str(), built ? "ok" : "FAIL",
                   builtWhy.c_str(), cached ? "ok" : "FAIL",
                   spawned ? "ok" : "FAIL", fem.c_str(), zombie ? "ok" : "FAIL",
-                  refused ? "ok" : "FAIL", art, (int)kArtPaletteSlotsGpu);
+                  refused ? "ok" : "FAIL", art, (int)kArtPaletteSlotsGpu, art0);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -14549,11 +14783,13 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
     uint32_t billed = 0;
     float torsoHp = 0.0f, shellHp = 0.0f, mass = 0.0f;
     bool ran = false;
+    // WHERE the hp went (rule 6): every slot that lost any, by name.
+    std::string bySlot;
   };
   std::vector<float> density(c.mats.size(), 1000.0f);
   for (size_t i = 0; i < c.mats.size(); i++)
     density[i] = std::max(1.0f, (float)c.mats[i].gpu.density);
-  auto throwArm = [&](bool armoured, float mps) {
+  auto throwArm = [&](bool armoured, float mps, bool firstOnly) {
     Throw t;
     const uint64_t id = spawnFixture(armoured);
     if (!id || !mobs.LimbBody(id, torso)) return t;
@@ -14570,12 +14806,20 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
       for (int8_t y = 0; y < 3; y++)
         for (int8_t x = 0; x < 3; x++)
           vox.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
-    const IVec3 at0{(int)std::floor(tc.x) + 6, (int)std::floor(tc.y) - 1,
-                    (int)std::floor(tc.z) - 1};
+    // ALONG THE BODY'S FACING AXIS (z), not across it. The block used to come
+    // in along x, the axis the arms hang on, and by 2026-09-29 (adbc47d, the
+    // first recorded red) the rest pose put the left HAND in its path: bare,
+    // the stone billed hand.L alone; plated, it billed the cuirass's sleeve
+    // (worn:iron_cuirass:armL.L -36, transmitted armL.L -33) AND the bare hand
+    // (-52.7), so the dressed body lost more hp than the bare one for a reason
+    // that has nothing to do with armour. From the front it meets the torso
+    // (bare) or the cuirass over it (plated), which is the claim.
+    const IVec3 at0{(int)std::floor(tc.x) - 1, (int)std::floor(tc.y) - 1,
+                    (int)std::floor(tc.z) + 6};
     const uint64_t bh = c.phys.CreateDebrisBody(vox, at0, density);
     if (bh == 0) return t;
     t.mass = c.phys.BodyMass(bh);
-    c.phys.SetBodyVelocities(bh, Vec3{-mps / kVoxelMeters, 0.0f, 0.0f},
+    c.phys.SetBodyVelocities(bh, Vec3{0.0f, 0.0f, -mps / kVoxelMeters},
                              Vec3{});
     // The WHOLE body's hp and the whole garment's: a block thrown at the
     // torso meets whatever is in front of it first (an arm, a sleeve).
@@ -14588,6 +14832,10 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
     };
     const float torso0 = mobs.TotalHp(id);
     const float shell0 = shellHp();
+    std::vector<float> slotHp0;
+    if (Mob* m = mobs.FindMobById(id))
+      for (int li = 0; li < m->LimbCount(); li++)
+        slotHp0.push_back(m->LimbHpAt(li));
     (void)shell;
     const uint32_t n0 = mobs.ContactHitsBilled();
     std::vector<ParticleSpawn> spawns;
@@ -14597,29 +14845,46 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
     for (int i = 0; i < 20; i++) {
       c.phys.Step(kTickDt);
       mobs.ApplyContactDamage(c.phys, c.world, spawns);
+      // THE FIRST BLOW ONLY, for the armour comparison: what a stone does
+      // after it has bounced off one body part (onto the legs, the hands) is
+      // the geometry of the fixture, not what the plate did with the blow.
+      if (firstOnly && mobs.ContactHitsBilled() != n0) break;
     }
     t.billed = mobs.ContactHitsBilled() - n0;
     t.torsoHp = torso0 - mobs.TotalHp(id);
     t.shellHp = shell0 - shellHp();
+    if (Mob* m = mobs.FindMobById(id))
+      for (int li = 0; li < m->LimbCount() && li < (int)slotHp0.size(); li++)
+        if (m->LimbHpAt(li) < slotHp0[(size_t)li])
+          t.bySlot += Format(" %s -%.1f", m->LimbDefAt(li).name.c_str(),
+                             (double)(slotHp0[(size_t)li] - m->LimbHpAt(li)));
     c.phys.RemoveBody(bh);
     t.ran = true;
     return t;
   };
-  const Throw fast = throwArm(false, 15.0f);
-  const Throw slow = throwArm(false, 1.5f);
-  const Throw plated = throwArm(true, 15.0f);
-  std::printf("  thrown stone (%.1f kg): 15 m/s bare billed %u, body -%.1f hp | "
-              "1.5 m/s billed %u, body -%.1f | 15 m/s in the cuirass billed "
-              "%u, plate -%.1f, body -%.1f (pre-W2-H: never billed)\n",
-              fast.mass, fast.billed, fast.torsoHp, slow.billed, slow.torsoHp,
-              plated.billed, plated.shellHp, plated.torsoHp);
+  // THE SLOW ARM IS HALF THE THRESHOLD, not 1.5 m/s: f422437 (2026-09-29)
+  // made gore.contactMinSpeed (15 vox/s = exactly 1.5 m/s) the line a blow
+  // must cross, so a 1.5 m/s stone sat ON the line and billed or not by the
+  // rounding of its approach speed (0 along x, 1 from the front).
+  const float slowMps = 0.5f * tune.gore.contactMinSpeed * kVoxelMeters;
+  const Throw fast = throwArm(false, 15.0f, true);
+  const Throw slow = throwArm(false, slowMps, false);
+  const Throw plated = throwArm(true, 15.0f, true);
+  std::printf("  thrown stone (%.1f kg): 15 m/s bare, first blow: billed %u, "
+              "body -%.1f hp | %.2f m/s billed %u, body -%.1f | 15 m/s in the "
+              "cuirass, first blow: billed %u, plate -%.1f, body -%.1f "
+              "(pre-W2-H: never billed)\n",
+              fast.mass, fast.billed, fast.torsoHp, slowMps, slow.billed,
+              slow.torsoHp, plated.billed, plated.shellHp, plated.torsoHp);
+  std::printf("  thrown stone by slot: bare [%s ] | plated [%s ]\n",
+              fast.bySlot.c_str(), plated.bySlot.c_str());
   RecordObserved("damageSourcesThrownHp", (double)fast.torsoHp);
   if (!fast.ran || !slow.ran || !plated.ran)
     fail("a thrown-stone fixture did not run");
   else if (fast.billed == 0 || !(fast.torsoHp > 0.0f))
     fail("a 15 m/s stone into a body was not a blow");
   else if (slow.billed != 0 || slow.torsoHp != 0.0f)
-    fail("a 1.5 m/s stone hurt somebody");
+    fail("a stone at half gore.contactMinSpeed hurt somebody");
   else if (plated.billed == 0 || !(plated.shellHp > 0.0f) ||
            !(plated.torsoHp < fast.torsoHp))
     fail("the cuirass did not take the stone");

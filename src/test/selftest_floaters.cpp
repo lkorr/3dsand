@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "sim/weather.h"  // SetOverride: tree-fell burns under a clear sky
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/treefixture.h"
@@ -761,6 +762,20 @@ namespace {
 Status GateTreeFell(Ctx& c, std::string& detail) {
   World& world = c.world;
   DebrisSystem& debris = c.debris;
+  // THE SKY IS PINNED CLEAR (suite triage 2026-10-01). Since 9a0a702
+  // (2026-09-23, "rain touches the sim") the weather schedule rains on the
+  // world at its tick: `rain` douses embers back to wood and `rainDamped` cuts
+  // every combustion ignition by max(rain, ground wetness). This gate's ticks
+  // (~94,000) fall in a rainy stretch of the weather.autoCycle schedule, so
+  // the tree stopped burning (wood 3677 -> 2820..3103, under half needed) and
+  // `tree-actually-burned` failed. The subject here is the floater handoff
+  // after a burn, not rain on fire (rain-fire / rain-lean own that), so the
+  // fixture burns in dry weather. Measured with the pin: wood 3677 -> 260.
+  struct ClearSky {
+    std::string prev = weather::Override();
+    ClearSky() { weather::SetOverride("clear"); }
+    ~ClearSky() { weather::SetOverride(prev); }
+  } clearSky;
 
   auto matId = [&](const char* n) -> uint32_t {
     for (size_t i = 0; i < c.mats.size(); i++)

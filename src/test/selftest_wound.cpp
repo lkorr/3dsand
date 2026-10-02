@@ -284,7 +284,7 @@ void PrepareWorld(Ctx& c) {
 // and the piece is still on the creature at the end.
 // The biggest bloodless (hair) limb, measured by spawning -- ChooseTarget's
 // method, with its hair exclusion inverted. Invalid if nothing has hair.
-Target ChooseHairTarget(Ctx& c) {
+Target ChooseHairTarget(Ctx& c, bool brainHeadOnly = false) {
   MobSystem& mobs = c.mobs;
   // Hair lives on the random-human POOL bodies (MobSystem::PoolDef), which no
   // startup load lists, so the candidates are the loaded defs plus the first
@@ -311,6 +311,16 @@ Target ChooseHairTarget(Ctx& c) {
     if (!id) continue;
     for (size_t li = 0; li < def.limbs.size(); li++) {
       if (!def.limbs[li].bloodless || !mobs.LimbBody(id, (int)li)) continue;
+      // Optionally: hair whose PARENT holds a brain (see corpse-head-laser).
+      if (brainHeadOnly) {
+        const uint32_t brain = mobs.MaterialIdNamed("brain");
+        int pi = -1;
+        for (size_t k = 0; k < def.limbs.size(); k++)
+          if (def.limbs[k].name == def.limbs[li].parent) pi = (int)k;
+        if (brain == 0 || pi < 0 ||
+            mobs.LimbMaterialCount(id, pi, brain) == 0)
+          continue;
+      }
       const uint32_t n = mobs.LimbVoxelsAtSpawn(id, (int)li);
       if (n <= t.atSpawn) continue;
       t.defIndex = d;
@@ -469,8 +479,22 @@ Status GateHairRooted(Ctx& c, std::string& detail) {
 Status GateCorpseHeadLaser(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
+  // The gate's own ids (head-cleave's reason): the neck transient is keyed on
+  // the creature id through the carve noise, and read 0.37 and 0.55 on two
+  // gate lists with the counter inherited. SpawnTarget resets the mobs, so no
+  // live creature shares an id; the scope restores the suite's counter.
+  mobs.SetNextIdCounter(1);
   PrepareWorld(c);
-  Target t = ChooseHairTarget(c);
+  // A HEAD WITH A BRAIN IN IT. The laser kills through gore.brainHpPerVoxel,
+  // and the claim (the head stays on its neck, the hair on the head, through
+  // that kill and the corpse after it) was measured at adbc47d (2026-09-29
+  // 11:29) on a human: head-neck 0.33 vox transient against the 0.6 cap.
+  // a411808 (the same day, 17:08) added the sylvan `deku`, whose leafy crown
+  // is now the biggest hair piece loaded, so the pick moved onto a wooden,
+  // brainless head that dies by volume 49 ticks in -- and its neck transient
+  // (0.51 in one suite, 0.61 / 0.67 in others) straddled a cap set for the
+  // creature the report was about. The same correction laser-head needed.
+  Target t = ChooseHairTarget(c, /*brainHeadOnly=*/true);
   if (!t.valid()) {
     detail = "no loaded or pool mob def has a hair (bloodless) limb with a body";
     return Status::Fail;
@@ -1247,8 +1271,13 @@ Status GateBurnCap(Ctx& c, std::string& detail) {
   // THE REAL TICK (W2-O, test/tickrig.h); the bonfire is the gate's own cell
   // ops, pushed at the top of each tick.
   support::TickCursor fireTicker{c, simTick, pchunk};
+  // How long the bonfire burns: a ceiling, not a target -- the loop ends at
+  // the death. 1,200 was the burn rate's own margin on 2026-09-02 and had
+  // shrunk to nothing by 10-01 (died at 1184 and 1152 in two runs, survived
+  // to 1200 at 66% in a third), so the window is a baseline row.
+  const int fireTicks = (int)BaselineNumber("burnCapFireTicks", 1200);
   if (mFire && rootLimb >= 0) {
-    for (int i = 0; i < 1200; i++) {
+    for (int i = 0; i < fireTicks; i++) {
       support::TickOps pre;
       std::vector<CellOp>& cellOps = pre.cells;
       if (mobs.LimbBody(id, rootLimb)) {
@@ -1265,18 +1294,26 @@ Status GateBurnCap(Ctx& c, std::string& detail) {
         // not air, so the flag never put flame there. Every cell above the
         // terrain is overwritten with fire instead; the terrain itself is
         // left alone so the body has something to stand on.
-        for (int dy = -8; dy <= 20; dy++)
-          for (int dz = -6; dz <= 6; dz++)
-            for (int dx = -6; dx <= 6; dx++) {
-              const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+        // ...DOWN TO THE GROUND under each column, not to a fixed 8 below
+        // the hips' first voxel: that sat at the ankles, so the feet and shins
+        // were never in the fire (raw skin foot 573/610, legL 706/1068 after
+        // 1,200 ticks) and the burnt fraction levelled off just under the
+        // death knot -- 69.9% at tick 1184 in one suite, 66.0% in the next,
+        // the same fixture passing or failing on the ground it stood on.
+        for (int dz = -6; dz <= 6; dz++)
+          for (int dx = -6; dx <= 6; dx++) {
+            const int th =
+                World::TerrainHeight(b.x + dx, b.z + dz, kDefaultSeed);
+            for (int y = std::min(b.y - 8, th); y <= b.y + 20; y++) {
+              const IVec3 cc{b.x + dx, y, b.z + dz};
               if (!c.world.CellInWindow(cc)) continue;
               if (cellOps.size() >= kMaxCellOpsPerTick) break;
-              const bool aboveGround =
-                  cc.y > World::TerrainHeight(cc.x, cc.z, kDefaultSeed);
+              const bool aboveGround = cc.y > th;
               cellOps.push_back(
                   {World::SlotCellIndex(cc),
                    PackVoxNew(mFire, 7u) | (aboveGround ? 0u : kCellOpIfAir)});
             }
+          }
       }
       fireTicker(pre);
       if (!mobs.IsAlive(id)) {
@@ -1521,7 +1558,38 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   // Where the swing crosses the torso: mid-limb, measured off the live body
   // before it dies, while it still stands in its rest shape.
   const LimbAxis ax = MeasureLimb(mobs, id, root);
-  const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
+  // WHERE ON THE ROOT, and why not its middle any more. The claim is that a
+  // REBUILT root keeps every joint, not that a hip survives losing its socket:
+  // since c7a5109 (2026-10-01) every socket is measured (snapped to the
+  // parent's nearest voxel) and the joint rule detaches a child whose socket
+  // flesh is carved away (Mob::JointAttached) -- a corpse's leg falls off a
+  // hip cut through, by design. The 1-voxel melt at the human hips' middle
+  // takes ~2/3 of them (3200 -> ~990 skin voxels) and with it the left hip
+  // socket, so legU.L dropped and the rig counted 15 joints of 16. The carve
+  // now lands on the sampled root voxel FARTHEST from every child socket,
+  // which still rebuilds the root (the subject) without cutting a socket out.
+  Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
+  {
+    std::vector<Vec3> sockets;
+    for (int li = 0; li < nLimbs; li++) {
+      Vec3 s{};
+      if (li != root && def.limbs[li].parent == def.limbs[root].name &&
+          mobs.LimbSocketWorld(id, li, s))
+        sockets.push_back(s);
+    }
+    const uint32_t n = mobs.LimbVoxelCount(id, root);
+    float best = -1.0f;
+    for (uint32_t k = 0; k < n && !sockets.empty();
+         k += std::max(1u, n / 512u)) {
+      const Vec3 p = mobs.LimbVoxelPos(id, root, k);
+      float dmin = 1e30f;
+      for (const Vec3& s : sockets) dmin = std::min(dmin, (p - s).len());
+      if (dmin > best) {
+        best = dmin;
+        mid = p;
+      }
+    }
+  }
 
   // The killing blow. The root limb at zero hp is a death, not an amputation
   // (Mob::HpZeroSevers), and the corpse keeps every joint (Mob::Die).
@@ -1569,6 +1637,20 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
     cur = mobs.LimbBody(id, root);
   }
   const uint32_t jointsCarved = c.phys.JointCount();
+  // WHICH joint a carve lost (CLAUDE.md rule 6: "31 -> 30" names nothing):
+  // every limb's own joint count against the rig's, with its socket hold.
+  std::string jointLoss;
+  if (jointsCarved != jointsDead)
+    for (int li = 0; li < nLimbs; li++) {
+        const uint64_t h = mobs.LimbBody(id, li);
+        float sock = 0.0f, neck = 0.0f;
+        mobs.LimbJointHold(id, li, sock, neck);
+        if (li != root && h && def.limbs[li].parent == def.limbs[root].name)
+          jointLoss += Format(" %s(j%u sock %.2f neck %.2f)",
+                              def.limbs[li].name.c_str(),
+                              c.phys.JointCount(h), (double)sock,
+                              (double)neck);
+      }
   const uint32_t vox1 = cur ? mobs.LimbArtVoxelCount(id, root) : 0;
   const bool rebuilt = cur != torso && cur != 0;
 
@@ -1615,6 +1697,7 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
       t.defName.c_str(), cause.c_str(), attached, nLimbs, jointsAlive, melts,
       vox0, vox1, rebuilt ? 1 : 0, jointsDead, jointsCarved, jointsSettled,
       jointed, bodies, spread);
+  if (!jointLoss.empty()) detail += " | root's children after the carve:" + jointLoss;
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -2578,8 +2661,13 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // this set is what lets the peak below say "it was a shell" instead of "it
   // was body 67108874" -- the difference between a finding and a number.
   std::unordered_set<uint64_t> shellBodies;
+  // ...and WHICH shell each handle is, for the strap attribution below.
+  std::unordered_map<uint64_t, std::string> shellName;
   for (int sIdx = bareLimbs; sIdx < mob->LimbCount(); sIdx++)
-    if (const uint64_t h = mobs.LimbBody(id, sIdx)) shellBodies.insert(h);
+    if (const uint64_t h = mobs.LimbBody(id, sIdx)) {
+      shellBodies.insert(h);
+      shellName[h] = mob->LimbDefAt(sIdx).name;
+    }
 
   // TAKE IT OFF THE LIVE CREATURE, through the geometry (hp <= 0 no longer
   // dismembers — see the three-instant-severs note in Mob::Damage), which
@@ -2629,7 +2717,10 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // the rig to be re-read. Union, so "was that peak armour?" stays right for
   // both.
   for (int sIdx = bareLimbs; sIdx < mob->LimbCount(); sIdx++)
-    if (const uint64_t h = mobs.LimbBody(id, sIdx)) shellBodies.insert(h);
+    if (const uint64_t h = mobs.LimbBody(id, sIdx)) {
+      shellBodies.insert(h);
+      shellName[h] = mob->LimbDefAt(sIdx).name;
+    }
   std::unordered_set<uint64_t> mine = shellBodies;
   for (int li = 0; li < mob->LimbCount(); li++)
     if (const uint64_t h = mobs.LimbBody(id, li)) mine.insert(h);
@@ -2793,12 +2884,49 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       if (dead->WornHostOf(sIdx) >= 0) shellsStrapped++;
     }
   }
+  // A RAG IS NOT A ROPE. Mob::ShedGearBeforeDetach: when a piece's IDENTITY
+  // shell leaves (here, the left gauntlet's, on the severed hand) the item is
+  // shed and its other shells "fall as rags" -- the right gauntlet comes off
+  // the right hand as loose debris, which is the behaviour armor-wear asserts
+  // ("every shell of the robe has left the body"). Such a shell has no host by
+  // design, so it is counted apart: still in `mine` (speed, spin and spread
+  // bound it like every other piece), still held to zero joints, and NOT a
+  // strap failure. Recognised by its item no longer being worn by the corpse.
+  // Seen once the hand actually came off -- 9 strokes from 2026-10-01; in the
+  // suite before that the gauntlet held for all 120 and this path never ran.
+  auto itemOf = [](const std::string& shell) {
+    // "worn:<item>:<limb>"
+    const size_t a = shell.find(':');
+    const size_t b = a == std::string::npos ? a : shell.find(':', a + 1);
+    return (a == std::string::npos || b == std::string::npos)
+               ? std::string()
+               : shell.substr(a + 1, b - a - 1);
+  };
+  auto stillWorn = [&](const std::string& item) {
+    const Mob* dead = mobs.FindMobById(id);
+    if (!dead || item.empty()) return false;
+    for (int p = 0; p < dead->WornPieceCount(); p++)
+      for (int sl : dead->WornSlotsAt(p))
+        if (itemOf(dead->LimbDefAt(sl).name) == item) return true;
+    return false;
+  };
+  uint32_t shellRags = 0;
+  std::string unstrapped;
   for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
     const uint64_t h = c.debris.BodyHandle(b);
     if (!shellBodies.count(h)) continue;
     shellsLeft++;
     shellJoints += c.phys.JointCount(h);
-    if (c.debris.WornHostOf(h)) shellsStrapped++;
+    if (c.debris.WornHostOf(h)) {
+      shellsStrapped++;
+      continue;
+    }
+    const std::string nm = shellName.count(h) ? shellName[h] : std::string("?");
+    const bool rag = !stillWorn(itemOf(nm));
+    if (rag) shellRags++;
+    unstrapped += Format(" %s(debris, %u vox, %s)", nm.c_str(),
+                         c.debris.BodyVoxelCount(b),
+                         rag ? "a shed piece's rag" : "ROPED");
   }
   // A strapped shell must ALSO still be on its corpse: a follower whose host
   // was culled unstraps and falls, and one that never moved would pass the
@@ -2806,7 +2934,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // that, over every piece including these.
   const bool strapsHold =
       shellsStrapped == 0 ||
-      (shellJoints == 0 && shellsStrapped == shellsLeft);
+      (shellJoints == 0 && shellsStrapped + shellRags == shellsLeft);
   RecordObserved("corpseArmorShellJoints", (double)shellJoints);
   RecordObserved("corpseArmorShellsStrapped", (double)shellsStrapped);
 
@@ -2944,6 +3072,9 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       lastHotTick, net.damped, net.cut, net.repaired, worstStepMs,
       worstStepTick, drivenTicks, drivenDamped, drivenCut, drivenJointsBefore,
       drivenJointsAfter, (double)endSpin, netHeld ? "held" : "DID NOT HOLD");
+  if (!unstrapped.empty()) detail += " | unstrapped shells:" + unstrapped;
+  if (!unstrapped.empty())
+    std::printf("corpse-armor: unstrapped shells:%s\n", unstrapped.c_str());
   mobs.Reset();
   c.debris.Reset();
   return ok ? Status::Pass : Status::Fail;
@@ -3067,7 +3198,21 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
   auto neckOn = [&]() { return mobs.LimbBody(id, neck) != 0; };
   const int hi0 = indexOf(headBody);
   const bool ni0 = neckOn();
-  const bool headOff = hi0 >= 0 && c.phys.JointCount(headBody) == 0 &&
+  // "No joint left" means no joint back to the CORPSE. Since the head grew a
+  // jointed hair limb (8b73865, 2026-09-24; rooted hair d34c3ba/f268330) the
+  // severed head legitimately keeps the joint to its own hair, which leaves
+  // with it -- so a joint whose far end is still one of the corpse's limbs is
+  // what fails, not any joint at all (was JointCount(headBody) == 0).
+  uint32_t headJointsToCorpse = 0;
+  {
+    std::vector<Physics::BodyJoint> hj;
+    c.phys.JointsOn(headBody, hj);
+    for (const Physics::BodyJoint& j : hj)
+      for (size_t li = 0; li < def.limbs.size(); li++)
+        if (j.other != 0 && mobs.LimbBody(id, (int)li) == j.other)
+          headJointsToCorpse++;
+  }
+  const bool headOff = hi0 >= 0 && headJointsToCorpse == 0 &&
                        mobs.LimbBody(id, head) == 0;
   const bool bothWounded = hi0 >= 0 && ni0 &&
                            c.debris.BodyWoundOpen((uint32_t)hi0) &&
@@ -5179,6 +5324,12 @@ Status GateRainOil(Ctx& c, std::string& detail) {
 Status GateBodyCoat(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
+  // ISOLATION (suite triage 2026-10-01): IdCounterScope only PUTS BACK the
+  // id counter; the gate used to START from whatever earlier gates left it at.
+  // A creature's gore profile and its bleed/stain rolls hash its id
+  // (Mob::MakeGoreProfile, BleedTick), so the same fixture bled differently by
+  // suite position -- red in the full suite, green in every subset. Pinned.
+  mobs.SetNextIdCounter(1);
   PrepareWorld(c);
   constexpr int kInset = 300;
   const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
@@ -5299,13 +5450,64 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   // ---- 1. the cut, and the ledger it leaves --------------------------------
   const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
   bool hit = false;
+  // ATTRIBUTION (rule 6, suite triage 2026-10-01): the ledger claim failed
+  // only at suite scope with "top = oil, frac 0" -- i.e. the cut left no
+  // smear. Say what the cut did and what was on the limb before it.
+  const uint32_t cutVox0 = mobs.LimbArtVoxelCount(id, t.limb);
+  LimbCoat preCut{};
+  if (const LimbCoat* lc = mobs.LimbCoatOf(id, t.limb)) preCut = *lc;
+  const Vec3 cutAnchor = ax.anchor;
+  // Which limbs carry what, and what is around the body in the CPU mirror the
+  // contact pass reads: the material or stain the coat could have come from.
+  std::string preCoats;
+  if (const Mob* pm = mobs.FindMobById(id))
+    for (int li = 0; li < pm->LimbCount(); li++)
+      if (const LimbCoat* lc = mobs.LimbCoatOf(id, li))
+        for (const CoatEntry& e : lc->top)
+          if (e.mat != 0 && e.sumAmt != 0)
+            preCoats += Format(" L%d:%u/%u", li, e.mat, e.sumAmt);
+  std::string around;
+  {
+    const uint32_t mOilA = mobs.MaterialIdNamed("oil");
+    const uint32_t oilType = mOilA ? mobs.StainTypeOf(mOilA) : 0u;
+    uint32_t oilCells = 0, oilStained = 0, uncached = 0, liquid = 0;
+    IVec3 firstAt{0, 0, 0};
+    for (int z = -10; z <= 10; z++)
+      for (int y = -20; y <= 8; y++)
+        for (int x = -10; x <= 10; x++) {
+          const IVec3 cc{ifloor(cutAnchor.x) + x, ifloor(cutAnchor.y) + y,
+                         ifloor(cutAnchor.z) + z};
+          const CachedChunk* k =
+              c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+          if (!k || k->voxels.size() != kChunkVol) { uncached++; continue; }
+          const uint32_t w = k->voxels[(((uint32_t)cc.z & 15u) * kChunk +
+                                        ((uint32_t)cc.y & 15u)) * kChunk +
+                                       ((uint32_t)cc.x & 15u)];
+          const uint32_t m = w & 0xFFFu;
+          if (m == mOilA && m) { if (!oilCells) firstAt = cc; oilCells++; }
+          if (m < c.mats.size() && c.mats[m].gpu.klass == CLASS_LIQUID) liquid++;
+          if (oilType && VoxStainType(w) == oilType && VoxStainAmt(w) > 0) {
+            if (!oilCells && !oilStained) firstAt = cc;
+            oilStained++;
+          }
+        }
+    around = Format(" mirror: oil cells %u, oil-stained %u, liquid %u, uncached %u, first (%d,%d,%d)",
+                    oilCells, oilStained, liquid, uncached, firstAt.x, firstAt.y, firstAt.z);
+  }
   {
     std::vector<ParticleSpawn> spawns;
     hit = CutOnce(mobs, c.world, id, t.limb, ax, ax.reach * 0.5f, 0.9f, 1.0f,
                   0x5C0A7u, spawns);
   }
+  const uint32_t cutVox1 = mobs.LimbArtVoxelCount(id, t.limb);
   poseTick();  // the first recount runs the moment anything is dirty
   const bool attached = mobs.LimbBody(id, t.limb) != 0;
+  const std::string cutWhy = Format(
+      " [cut: hit=%d valid=%d reach %.2f, art %u -> %u, anchor (%.1f,%.1f,%.1f), "
+      "pre-cut top mat %u sum %u, mob %llu, coats%s;%s]",
+      hit ? 1 : 0, ax.valid ? 1 : 0, ax.reach, cutVox0, cutVox1, cutAnchor.x,
+      cutAnchor.y, cutAnchor.z, preCut.top[0].mat, preCut.sumAmt,
+      (unsigned long long)id, preCoats.c_str(), around.c_str());
   LimbCoat limbLedger{}, bodyLedger{};
   if (const LimbCoat* lc = mobs.LimbCoatOf(id, t.limb)) limbLedger = *lc;
   bodyLedger = mobs.BodyCoat(id);
@@ -5663,6 +5865,7 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
       VoxStainType(depAfter), VoxStainAmt(depAfter), footName.c_str(),
       footPainted, footSumPainted, shedDroplets, shedTries, printCells, printY,
       printAmt, footSumBefore, footSumAfter);
+  if (!ledgerOk) detail += cutWhy;
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -6018,6 +6221,13 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
   // The fixture: the LARGEST vital, severable limb that bleeds — a head, by
   // property rather than by name. Largest for ChooseTarget's reason: a tiny
   // head is mostly neck, and a bore through it is a bore through the joint.
+  // ...AND THAT HOLDS A BRAIN. The death half of the claim is the brain's
+  // (gore.brainHpPerVoxel); a head with none is bored straight through
+  // without dying. a411808 (2026-09-29) added the sylvan `deku`, whose wooden
+  // head is the largest vital severable limb that bleeds (syrup) and has no
+  // brain, so the property pick moved onto it and the gate measured a head
+  // the claim was never about (10 hits, bored through at tick 10, alive).
+  const uint32_t brainMat = mobs.MaterialIdNamed("brain");
   Target t;
   for (size_t d = 0; d < mobs.Defs().size(); d++) {
     const MobDef& def = mobs.Defs()[d];
@@ -6029,6 +6239,8 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
       if ((int)li == def.rootLimb) continue;
       if (!def.limbs[li].vital || !def.limbs[li].severable) continue;
       if (!mobs.LimbBody(sid, (int)li)) continue;
+      if (brainMat && mobs.LimbMaterialCount(sid, (int)li, brainMat) == 0)
+        continue;
       const uint32_t n = mobs.LimbVoxelsAtSpawn(sid, (int)li);
       if (n <= t.atSpawn) continue;
       t.defIndex = (int)d;
@@ -6594,25 +6806,75 @@ Status GateAcidCoat(Ctx& c, std::string& detail) {
   // laid" from "blood the soak laid". Exposed bone is counted before and after
   // (the joint faces at the lattice's ends are exposed from the start), and of
   // what the acid newly bared about bone's `bareBlood` share must be bloody.
+  //
+  // SEVERAL POURS, each bone cell judged ONCE, the pour that bared it (suite
+  // triage 2026-10-01). Since acid dries off in a few seconds and eats flesh
+  // at half its first rate (owner, 2026-09-23: coat.decay 0.15, acid +
+  // tag:organic 250 -> 125) one 6-level pour on the arm bares 2-4 bone cells
+  // -- under the 10 the ratio needs -- so the fixture pours again until
+  // enough bone is bared, as a player would. A later pour lays acid over the
+  // blood on bone bared earlier (CoatBeneath) and that acid then dries off,
+  // so a single before/after count would undercount the blood: instead every
+  // newly exposed bone cell is recorded, with its coat, right after the pour
+  // that exposed it, and never re-read.
   uint32_t bare0 = 0, bareBlood0 = 0, bare1 = 0, bareBlood1 = 0;
+  uint32_t baredN = 0, baredBlood = 0, pours = 0;
   bool bareRan = false;
   const float bareOdds = c.mats[mBone].bareBlood;
   if (const uint64_t id2 = SpawnTarget(c, t, kInset, pchunk)) {
     mobs.SetMobBehavior(id2, "dummy");
     for (int i = 0; i < 10; i++) poseTick();
     bare0 = mobs.LimbExposedMatCount(id2, t.limb, mBone, mBlood, &bareBlood0);
-    mobs.SoakLimb(id2, t.limb, mAcid, kAmt, simTick);
-    for (int i = 0; i < 400 && mobs.LimbBody(id2, t.limb); i++) {
-      poseTick();
-      if (mobs.LimbCoatMatCount(id2, t.limb, mAcid, 1) == 0) break;
-    }
-    if (mobs.LimbBody(id2, t.limb)) {
-      bare1 = mobs.LimbExposedMatCount(id2, t.limb, mBone, mBlood, &bareBlood1);
+    auto cellKey = [](int x, int y, int z) {
+      return ((uint64_t)(uint16_t)x << 32) | ((uint64_t)(uint16_t)y << 16) |
+             (uint64_t)(uint16_t)z;
+    };
+    // Exposed bone cells of the limb now, with whether each wears blood.
+    auto exposedBone = [&](std::unordered_map<uint64_t, bool>& out) {
+      out.clear();
+      const std::vector<PrefabVoxel> lat = mobs.LimbLattice(id2, t.limb);
+      std::unordered_set<uint64_t> occ;
+      occ.reserve(lat.size() * 2);
+      for (const PrefabVoxel& v : lat) occ.insert(cellKey(v.x, v.y, v.z));
+      static const int kD[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                   {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+      for (const PrefabVoxel& v : lat) {
+        if ((v.material & 0xFFFu) != (mBone & 0xFFFu)) continue;
+        bool open = false;
+        for (const auto& d : kD)
+          if (!occ.count(cellKey(v.x + d[0], v.y + d[1], v.z + d[2]))) {
+            open = true;
+            break;
+          }
+        if (open)
+          out[cellKey(v.x, v.y, v.z)] =
+              BodyStainAmt(v.stain) && BodyStainMat(v.stain) == mBlood;
+      }
+    };
+    std::unordered_map<uint64_t, bool> seen, now;
+    exposedBone(seen);  // the joint faces, exposed before any acid
+    const int kMaxPours = (int)BaselineNumber("acidCoatBarePours", 6);
+    for (int pour = 0; pour < kMaxPours && mobs.LimbBody(id2, t.limb); pour++) {
+      pours++;
+      mobs.SoakLimb(id2, t.limb, mAcid, kAmt, simTick);
+      for (int i = 0; i < 400 && mobs.LimbBody(id2, t.limb); i++) {
+        poseTick();
+        if (mobs.LimbCoatMatCount(id2, t.limb, mAcid, 1) == 0) break;
+      }
+      if (!mobs.LimbBody(id2, t.limb)) break;
+      exposedBone(now);
+      for (const auto& kv : now) {
+        if (seen.count(kv.first)) continue;
+        seen.emplace(kv.first, kv.second);
+        baredN++;
+        if (kv.second) baredBlood++;
+      }
       bareRan = true;
+      if (baredN >= 10) break;
     }
+    if (mobs.LimbBody(id2, t.limb))
+      bare1 = mobs.LimbExposedMatCount(id2, t.limb, mBone, mBlood, &bareBlood1);
   }
-  const uint32_t baredN = bare1 > bare0 ? bare1 - bare0 : 0u;
-  const uint32_t baredBlood = bareBlood1 > bareBlood0 ? bareBlood1 - bareBlood0 : 0u;
   const float baredFrac = baredN ? (float)baredBlood / (float)baredN : 0.0f;
   const bool boneBloodied = bareRan && baredN >= 10 &&
                             std::fabs(baredFrac - bareOdds) <= 0.2f;
@@ -6622,12 +6884,12 @@ Status GateAcidCoat(Ctx& c, std::string& detail) {
                 "%s.%s: wired %d | acid over blood %u marked, %u coated, "
                 "ledger corrosive %u | voxels %u -> %u in 90 ticks%s | control "
                 "%s %u -> %u | acid spent after %u more ticks, then %u -> %u | "
-                "clean pour: exposed bone %u -> %u, bloody %u -> %u (%.0f%% of "
-                "the newly bared, bareBlood %.0f%%)%s",
+                "clean pours x%u: exposed bone %u -> %u, newly bared %u of "
+                "which %u bloody (%.0f%%, bareBlood %.0f%%)%s",
                 t.defName.c_str(), t.limbName.c_str(), wired ? 1 : 0, acidOn,
                 acidCoat, corrosive, n0, n90, severed ? " (severed)" : "",
                 ctl >= 0 ? def.limbs[ctl].name.c_str() : "-", c0, c90, spentAt,
-                nSpent, nAfter, bare0, bare1, bareBlood0, bareBlood1,
+                nSpent, nAfter, pours, bare0, bare1, baredN, baredBlood,
                 100.0f * baredFrac, 100.0f * bareOdds,
                 bareRan ? "" : " (did not run)");
   detail = std::string(buf) + residue + " | trace " + trace;
@@ -7822,6 +8084,7 @@ Status GateCorpseCap(Ctx& c, std::string& detail) {
   const uint64_t evicted0 = mobs.DeadEvictedTotal();
   std::vector<uint64_t> order;               // in death order
   std::vector<std::vector<uint64_t>> handles;  // each one's limbs at death
+  std::vector<std::vector<int>> handleLimb;    // ...and which slot each was
   const int root = mobs.Defs()[t.defIndex].rootLimb;
   for (int k = 0; k < kills; k++) {
     const IVec3 site = FixtureSite(c.world, 200 + (k % 8) * 16);
@@ -7829,13 +8092,18 @@ Status GateCorpseCap(Ctx& c, std::string& detail) {
         mobs.Spawn(t.defIndex, {site.x, site.y, site.z + (k / 8) * 16});
     if (!id) break;
     std::vector<uint64_t> hs;
+    std::vector<int> hl;
     for (int li = 0; li < (int)mobs.Defs()[t.defIndex].limbs.size(); li++)
-      if (const uint64_t h = mobs.LimbBody(id, li)) hs.push_back(h);
+      if (const uint64_t h = mobs.LimbBody(id, li)) {
+        hs.push_back(h);
+        hl.push_back(li);
+      }
     const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
     if (torso) mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, root), 0.0f);
     if (mobs.IsAlive(id)) break;
     order.push_back(id);
     handles.push_back(std::move(hs));
+    handleLimb.push_back(std::move(hl));
   }
   const bool fixtureOk = (int)order.size() == kills;
   // One tick: the cap is enforced at the top of PreTick (MobSystem::EvictDead).
@@ -7878,10 +8146,36 @@ Status GateCorpseCap(Ctx& c, std::string& detail) {
   // ...and what went is DEBRIS now, not deleted: its limb bodies are loose dead
   // flesh the debris cull will finish.
   uint32_t decayedBodies = 0, decayedExpected = 0;
+  // WHICH handles did not become loose dead flesh, and what they are now
+  // (rule 6): limb slot, then "gone" (no debris body), "kept" (still a
+  // creature's), or "debris-not-flesh".
+  std::string notFlesh;
   for (int k = 0; k < goneOldest; k++)
-    for (uint64_t h : handles[(size_t)k]) {
+    for (size_t j = 0; j < handles[(size_t)k].size(); j++) {
+      const uint64_t h = handles[(size_t)k][j];
       decayedExpected++;
-      if (c.debris.HasBody(h) && c.debris.BodyIsDeadFlesh(h)) decayedBodies++;
+      // HAIR IS NOT FLESH. A bloodless slot (zeus's `hair` and `mane`, which
+      // the human prototypes grew with d5ed2cb, 2026-09-25) goes to the debris
+      // as loose matter like the rest, but it was never flesh and the debris
+      // system rightly does not call it dead flesh. The claim for it is the
+      // one that matters: it was handed over, not deleted.
+      const bool bloodless =
+          mobs.Defs()[t.defIndex].limbs[(size_t)handleLimb[(size_t)k][j]]
+              .bloodless;
+      if (c.debris.HasBody(h) && (bloodless || c.debris.BodyIsDeadFlesh(h))) {
+        decayedBodies++;
+        continue;
+      }
+      int slot = -1;
+      std::string where = "gone";
+      if (c.debris.HasBody(h)) where = "debris-not-flesh";
+      else if (mobs.FindOwner(h, &slot) != nullptr) where = "kept";
+      if (notFlesh.size() < 400)
+        notFlesh += Format(
+            " #%d %s:%s", k,
+            mobs.Defs()[t.defIndex].limbs[(size_t)handleLimb[(size_t)k][j]]
+                .name.c_str(),
+            where.c_str());
     }
   const bool decayed = goneOldest >= extra && decayedExpected > 0 &&
                        decayedBodies == decayedExpected;
@@ -7914,6 +8208,7 @@ Status GateCorpseCap(Ctx& c, std::string& detail) {
       deadBodies, MobSystem::kMaxDeadBodies, (unsigned long long)evicted,
       goneOldest, extra, decayedBodies, decayedExpected, orderly ? 1 : 0,
       newestKept ? 1 : 0, live, MobSystem::MaxLiveMobs(), refusedAtCap ? 1 : 0);
+  if (!notFlesh.empty()) detail += " | not loose dead flesh:" + notFlesh;
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -7994,6 +8289,14 @@ bool LandCleave(MobSystem& mobs, World& world, uint64_t id, int head,
 Status GateHeadCleave(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
+  // THE IDS ARE THE GATE'S OWN, not whatever the gates before it left. C's
+  // ragged rim is keyed on the creature id (the note at `pooled` below), so
+  // with the counter inherited the same tree measured mean 8.5 chops in the
+  // suite and 8.3 in a --verify subset (2026-10-01, HEAD 11413bc) -- a pooled
+  // claim whose sample moved with the gate list. Every spawn here goes through
+  // SpawnTarget's Reset, so no live creature can share a pinned id; the scope
+  // above puts the suite's counter back on the way out.
+  mobs.SetNextIdCounter(1);
   PrepareWorld(c);
   constexpr int kInset = 260;
   // THE HUMAN, by name: the claim is about a man's neck, and the fallback of

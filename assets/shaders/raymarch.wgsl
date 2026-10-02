@@ -12648,7 +12648,23 @@ fn fs(in : VSOut) -> FSOut {
           sh = sunShadowFar(hitP, n, h.t);
         }
       } else {
-        sh = sunShadowAt(hitP, n, in.pos.xy, h.t, true);
+        // GRAINS answer from their cell's TOP here too, for the reason the
+        // cache branch above gives: a partial powder cell's side face lies
+        // INSIDE its cell, so a ray started a bias off that face starts in
+        // occupied space, hits its own cell and paints every grain riser
+        // hard black. The cache got the top-patch rule with the grains
+        // (02a1fa7, 2026-09-26); this per-pixel path did not, and the
+        // shadow-cache gate (which uses this path as its REFERENCE) went red
+        // on the harness desert's sand terraces: cache vs reference |dL|
+        // 5.69 -> 1.38 with this rule (2026-10-01 suite triage).
+        let grainsR = !isMicro && m.klass == CLASS_POWDER &&
+                      powderIsPartial(h.word);
+        if (grainsR) {
+          sh = sunShadowAt(vec3f(hitP.x, f32(h.cell.y) + 1.0, hitP.z),
+                           vec3f(0.0, 1.0, 0.0), in.pos.xy, h.t, true);
+        } else {
+          sh = sunShadowAt(hitP, n, in.pos.xy, h.t, true);
+        }
       }
       // Shading LOD: contact shadows lift with projected size (see
       // lodShadeFade); a real cast shadow is already above the lift.

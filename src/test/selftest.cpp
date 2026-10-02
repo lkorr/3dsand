@@ -21,6 +21,7 @@
 #include "sim/oprecord.h"   // op-stream clamp counters + SANDVOX_RECORD_OPS
 #include "sim/pagetable.h"  // PagesHighWater for the pool-margin report
 #include "sim/tuningstamp.h"  // the tuning/materials/reactions desync stamp
+#include "sim/weather.h"     // leak reporter: the pinned weather preset
 #include "test/support.h"
 
 using namespace sandvox;
@@ -1166,6 +1167,55 @@ std::string Format(const char* fmt, ...) {
 
 namespace {
 
+// Every tuning_params.def row as "group.member=value;" -- the leak reporter's
+// view of the live Tuning. A gate that edits CurrentTuning() and forgets to
+// put it back changes what every later gate measures (suite triage
+// 2026-10-01). Vec3 and string rows are skipped: none is a per-gate knob.
+std::string TuningFingerprint() {
+  const Tuning& t = CurrentTuning();
+  std::string s;
+  char buf[96];
+#define TP_F(g, m, n, d, lo, hi)   std::snprintf(buf, sizeof buf, #g "." #m "=%.9g;", (double)t.g.m); s += buf;
+#define TP_I(g, m, n, d, lo, hi)   std::snprintf(buf, sizeof buf, #g "." #m "=%lld;", (long long)t.g.m); s += buf;
+#define TP_U(g, m, n, d, lo, hi) TP_I(g, m, n, d, lo, hi)
+#define TP_B(g, m, n, d)   std::snprintf(buf, sizeof buf, #g "." #m "=%d;", t.g.m ? 1 : 0); s += buf;
+#define TP_S(g, m, n, d)
+#define TP_V3(g, m, n, x, y, z)
+#include "sim/tuning_params.def"
+#undef TP_V3
+#undef TP_S
+#undef TP_B
+#undef TP_U
+#undef TP_I
+#undef TP_F
+  return s;
+}
+
+// The rows that differ between two fingerprints, "name a -> b", at most 6.
+std::string TuningDiff(const std::string& a, const std::string& b) {
+  auto split = [](const std::string& x) {
+    std::unordered_map<std::string, std::string> m;
+    size_t i = 0;
+    while (i < x.size()) {
+      const size_t e = x.find(';', i), q = x.find('=', i);
+      if (e == std::string::npos || q == std::string::npos || q > e) break;
+      m[x.substr(i, q - i)] = x.substr(q + 1, e - q - 1);
+      i = e + 1;
+    }
+    return m;
+  };
+  const auto ma = split(a), mb = split(b);
+  std::string out;
+  int n = 0;
+  for (const auto& kv : ma) {
+    auto it = mb.find(kv.first);
+    if (it == mb.end() || it->second == kv.second) continue;
+    if (n++ < 6) out += " " + kv.first + " " + kv.second + " -> " + it->second;
+  }
+  if (n > 6) out += Format(" (+%d more)", n - 6);
+  return out;
+}
+
 const Gate* Find(const std::string& name) {
   for (const Gate& g : Registry())
     if (name == g.name) return &g;
@@ -1645,7 +1695,59 @@ int Run(Ctx& c, const Options& opt) {
       std::string detail;
       g_observed.clear();
       g_pinnedOnly = false;
+      // WHAT A GATE LEAVES BEHIND (suite triage 2026-10-01, CLAUDE.md rule
+      // 7): a gate that fails in the suite and passes alone inherited state
+      // from one that ran earlier. Bisecting that with prefix runs costs one
+      // 25-minute run per hypothesis; naming the state each gate changed and
+      // did not put back costs one line here. Shared-World state only, read
+      // on the CPU (no sync, no GPU work).
+      // THE AUTHORITY'S PER-TICK INPUTS START CLEAR. TickAuthority hands the
+      // tick's rain word, rain slope and day phase to MobSystem (session.cpp)
+      // and nothing takes them back, so a gate that ran the REAL tick left
+      // them latched -- and the next gate's direct PreTick calls (fixture
+      // settling, SpawnTarget) rained on its fresh creatures with a word from
+      // another world and another clock: coat-transfer's arm E ends on a wet
+      // tick 80000, and body-coat's zeus arrived water-coated, so its cut
+      // waited out the coat recount cadence (suite triage 2026-10-01). A gate
+      // that wants rain or a day phase sets it, as the rain gates already do.
+      c.mobs.SetWeatherRain(0u);
+      c.mobs.SetRainSlope(0, 0);
+      c.mobs.SetDayPhase(0u);
+      const IVec3 leakWo = c.world.WindowOrigin();
+      const uint32_t leakMobs = c.mobs.MobCount();
+      const uint32_t leakDebris = c.debris.BodyCount();
+      const size_t leakDefs = c.mobs.Defs().size();
+      const uint32_t leakRtDefs = c.mobs.RuntimeDefCount();
+      const std::string leakTune = TuningFingerprint();
+      const std::string leakWeather = weather::Override();
       r.status = g->fn(c, detail);
+      {
+        const IVec3 wo = c.world.WindowOrigin();
+        std::string leak;
+        if (wo.x != leakWo.x || wo.y != leakWo.y || wo.z != leakWo.z)
+          leak += Format(" window origin (%d,%d,%d) -> (%d,%d,%d);", leakWo.x,
+                         leakWo.y, leakWo.z, wo.x, wo.y, wo.z);
+        if (c.mobs.MobCount() != leakMobs)
+          leak += Format(" mobs %u -> %u;", leakMobs, c.mobs.MobCount());
+        if (c.debris.BodyCount() != leakDebris)
+          leak += Format(" debris bodies %u -> %u;", leakDebris,
+                         c.debris.BodyCount());
+        if (c.mobs.Defs().size() != leakDefs ||
+            c.mobs.RuntimeDefCount() != leakRtDefs)
+          leak += Format(" defs %zu (%u runtime) -> %zu (%u runtime);",
+                         leakDefs, leakRtDefs, c.mobs.Defs().size(),
+                         c.mobs.RuntimeDefCount());
+        if (weather::Override() != leakWeather)
+          leak += " weather pin '" + leakWeather + "' -> '" +
+                  weather::Override() + "';";
+        {
+          const std::string tuneNow = TuningFingerprint();
+          if (tuneNow != leakTune)
+            leak += " tuning" + TuningDiff(leakTune, tuneNow) + ";";
+        }
+        if (!leak.empty())
+          std::printf("selftest leak: %s left%s\n", g->name, leak.c_str());
+      }
       r.seconds = NowSeconds() - t0;
       r.detail = detail;
       r.observed = std::move(g_observed);

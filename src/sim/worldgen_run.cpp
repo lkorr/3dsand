@@ -52,6 +52,16 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // staleness fallback at once, and the unsnapshotted mirror dilated a ring
   // per tick through the pool.
   world.InvalidateSnapshot();
+  // THE WIND-DRAFT FIELD DESCRIBES THE OLD WORLD as well: its blocker mask and
+  // shelter solve are derived from the voxels (sim_draft.wgsl), and the
+  // rebuild verdict (Simulation::SetDraft) only fires when the box moves, the
+  // gate flips or the materials re-upload. A world replaced under a box that
+  // did not move kept the old world's shelter and re-masked only its active
+  // chunks -- and the verdict depended on what ran BEFORE the replace, so a
+  // replay of the same input stream rebuilt TickParams.draftMode differently
+  // on its first tick (the ops-replay gate, word 6715, since d3b050f). The
+  // first tick on a fresh world re-masks the whole box.
+  sim.ForceDraftRebuild();
   TickParams tp{0, seed, 0, 0};
   IVec3 wo = world.WindowOrigin();
   tp.origin[0] = wo.x; tp.origin[1] = wo.y; tp.origin[2] = wo.z;

@@ -127,6 +127,20 @@ class FarPlumes {
   // gets — they have no camera, and a fixture's weight should not depend on
   // where a notional one stands.
   void SetEye(IVec3 absVox) { eye_ = absVox; hasEye_ = true; }
+  // Back to the eye-less (window-centre) weights, and forget the wide slew.
+  // For gates: since W2-O (2026-09-24) every gate that runs the real tick
+  // (support::RunTicks -> TickAuthority) leaves the selftest player's eye set
+  // on the shared World's FarPlumes, so a fixture that assumes "no camera"
+  // must say so instead of inheriting it (gas-farplume / gas-farplume2 went
+  // red in the suite only, 11413bc's eye-gated slew made it visible).
+  void ClearEye() {
+    if (hasEye_) dirty_ = true;
+    hasEye_ = false;
+    builtEye_ = {INT32_MIN, INT32_MIN, INT32_MIN};
+    wideSlew_.clear();
+    wideSlewNext_.clear();
+    slewing_ = false;
+  }
 
   // Emitters in each section of the list Build() last produced.
   uint32_t Count() const { return count_; }

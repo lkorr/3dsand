@@ -1984,7 +1984,15 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       // Edge-on: the flat's normal is square to the travel. Flat-on: the normal
       // points along the travel, which is the blade going through sideways.
       sw.flatNow = edgeOn ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
-      sw.dt = kTickDt;
+      // AT FULL SPEED, not at "3 voxels in a tick" (2026-10-01). The tip
+      // speed is travel / dt and the damage ramps from melee.minSpeedMps to
+      // melee.fullSpeedMps; the owner's retune of fullSpeedMps 3.4 -> 20
+      // (b48fb4d, 2026-09-14) left this 9 m/s reference cut at ~0.4 power,
+      // which carves nothing, and "the edge-on cut removed real voxels"
+      // went red on a fixture whose premise ("a sword this fast severs
+      // whatever it touches") no longer held. Same geometry; dt is chosen
+      // so the cut is a full-power one under whatever the tuning ships.
+      sw.dt = travel.len() / std::max(melee.tuning.fullSpeed, 1e-3f);
       sw.halfWidth = sword->edgeHalfWidth;
       sw.strike = sword->strike;
       sw.carveBonus = sword->carveBonus;
@@ -2447,8 +2455,17 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     // sword itself moved -- sweeping, or reaching -- and the head clearance.
     const bool keyed = sty.Keyed();
     const float posedDr = prMax > prMin ? prMax - prMin : 0.0f;
-    check(azArc + elArc > minSweep || (keyed && posedDr > minReach),
-          "style " + n + ": the SWORD moved, not just the stroke");
+    // ONLY FOR A HELD-WEAPON STROKE (2026-10-01). A natural-weapon style
+    // (`weapon` "fist.L" etc.) drives the FIST's arm, not the sword hand this
+    // fixture measures, and is `fallback` -- never thrown with a sword in the
+    // fist (attack_styles.json). Since the punches became keyed pose frames
+    // (63a9e19) a LEFT punch leaves the right-hand sword nearly still, so the
+    // claim failed on a combination the game cannot produce. The fist's own
+    // travel is player-unarmed's subject.
+    const bool heldStroke = sty.weapon.empty() || sty.weapon == "held";
+    if (heldStroke)
+      check(azArc + elArc > minSweep || (keyed && posedDr > minReach),
+            "style " + n + ": the SWORD moved, not just the stroke");
     if (keyed) {
       // (nothing authored to classify)
     } else if (wantR > wantAz && wantR > wantEl) {
@@ -3081,6 +3098,25 @@ Status GateSwingSmooth(Ctx& c, std::string& detail) {
     // ones the owner's report is about and the ones with a blade to spin.
     if (!(sty.weapon.empty() || sty.weapon == "held")) continue;
     styles++;
+    // THE CLAIM CEILING IS THE STYLE'S OWN RELEASE (2026-10-01). The
+    // hand-back is a smoothstep over the style's authored `release` ticks
+    // (strokes.cpp SetRecoverTime), whose largest per-tick step is the
+    // curve's middle: 0.241 at the old default 6 ticks (where the flat 0.25
+    // came from), 0.296 at 5, 0.344 at 4, 0.482 at 3. The keyed-pose styles
+    // and their forms author 3..5 (63a9e19 and the tuner pose commits after
+    // it), so the flat ceiling called every one of those a snap. The
+    // ceiling is now the larger of the baseline value and that curve's own
+    // peak (+0.01): a release that FOLLOWS its authored curve passes, a
+    // 1 -> 0 drop (a real snap) still fails for any release of 2+ ticks.
+    float styleMaxWeight = maxWeight;
+    {
+      const int n = std::max(1, sty.release);
+      auto ss = [](float t) { return t * t * (3.0f - 2.0f * t); };
+      float peak = 0.0f;
+      for (int k = 1; k <= n; k++)
+        peak = std::max(peak, ss((float)k / n) - ss((float)(k - 1) / n));
+      styleMaxWeight = std::max(maxWeight, peak + 0.01f);
+    }
 
     MeleeState m;
     ApplyMeleeTuning(m.tuning);
@@ -3197,9 +3233,9 @@ Status GateSwingSmooth(Ctx& c, std::string& detail) {
           hitRoll = true;
           check(false, where("the blade rolled", dRoll, maxRoll));
         }
-        if (dW > maxWeight && !hitW) {
+        if (dW > styleMaxWeight && !hitW) {
           hitW = true;
-          check(false, where("the arm claim stepped", dW, maxWeight));
+          check(false, where("the arm claim stepped", dW, styleMaxWeight));
         }
       }
       prevHand = p.hand;
@@ -3218,14 +3254,14 @@ Status GateSwingSmooth(Ctx& c, std::string& detail) {
         // ceiling above because the step happens OUTSIDE the driver and no
         // amount of smoothing inside it can cover one.
         checks++;
-        if (p.weight > maxWeight) {
+        if (p.weight > styleMaxWeight) {
           ok = false;
           std::printf(
               "swing-smooth: FAILED %s: the program finished while the arm "
               "was still claimed at %.3f (limit %.3f) — the caller drops the "
               "claim on this tick, so that is a one-frame snap to the walk "
               "pose\n",
-              sty.name.c_str(), p.weight, maxWeight);
+              sty.name.c_str(), p.weight, styleMaxWeight);
         }
         break;
       }

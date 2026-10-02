@@ -925,6 +925,18 @@ uint32_t FleshVoxels(MobSystem& mobs, uint64_t id) {
   return n;
 }
 
+// The same body limbs counted in ART (skin) voxels: the resolution the kerf
+// is carved at. The collider count above is a downsample and only drops when
+// a whole collider cell empties, so a shallow cut can read 0 there.
+uint32_t FleshArtVoxels(MobSystem& mobs, uint64_t id) {
+  Mob* m = mobs.FindMobById(id);
+  if (m == nullptr) return 0;
+  uint32_t n = 0;
+  for (int i = 0; i < m->AppendedBase(); i++)
+    if (mobs.LimbBody(id, i)) n += mobs.LimbArtVoxelCount(id, i);
+  return n;
+}
+
 // ...and the hp of whatever is in the fist, which is what a parry charges.
 float HeldHp(MobSystem& mobs, uint64_t id) {
   Mob* m = mobs.FindMobById(id);
@@ -1025,6 +1037,23 @@ void CloseStage(Ctx& c) {
 // =============================================================================
 Status GateNpcStrike(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
+  // THE SHIPPED ITEM LIBRARY, for this gate only (suite triage 2026-10-01).
+  // MobSystem::StartStroke resolves a held weapon's FORM (strokes.h WEAPON
+  // FORMS) only when the system has an item library; main.cpp always hands it
+  // one, the harness does not, and several earlier gates (corpse-save,
+  // mob-handoff, net-corpse, net-player-corpse) set it and never clear it. So
+  // whether the fixture's swordsman swung the sword's `long` form or the base
+  // frames depended on which gates ran first: the full suite measured an
+  // 8-tick long-form windup, a --verify subset the base 12. Pinned here to
+  // what the game ships, and put back on the way out.
+  struct ItemsScope {
+    MobSystem& m;
+    const ItemLibrary* prev;
+    ItemsScope(MobSystem& mm, const ItemLibrary* now) : m(mm), prev(mm.Items()) {
+      m.SetItems(now);
+    }
+    ~ItemsScope() { m.SetItems(prev); }
+  } itemsScope(c.mobs, &c.items);
   bool ok = true;
   int checks = 0;
   auto check = [&](bool cond, const char* what) {
@@ -1036,6 +1065,12 @@ Status GateNpcStrike(Ctx& c, std::string& detail) {
   };
 
   Stage st = OpenStage(c);
+  // A FIXED ID COUNTER (suite triage 2026-10-01). Every stroke's variation
+  // is seeded on the creature ids, and IdCounterScope only RESTORES the
+  // counter on the way out -- the ids this gate handed out still depended on
+  // how many mobs every earlier gate had spawned, so the same three strikes
+  // drew differently under --gate, a --verify list and the full suite.
+  c.mobs.SetNextIdCounter(1);
   if (!st.ok) {
     detail = st.why;
     std::printf("npc-strike: SKIP (%s)\n", detail.c_str());
@@ -1175,6 +1210,7 @@ Status GateNpcStrike(Ctx& c, std::string& detail) {
     }
     for (int i = 0; i < 14; i++) tick();
     const uint32_t before = FleshVoxels(c.mobs, victim);
+    const uint32_t beforeArt = FleshArtVoxels(c.mobs, victim);
     check(before > 0, "the target has flesh to lose before the strike");
     FaceAt(c.mobs, attacker, Chest(c.mobs, victim, *st.def));
     for (int i = 0; i < 6; i++) tick();   // let the turn finish before aiming
@@ -1216,13 +1252,18 @@ Status GateNpcStrike(Ctx& c, std::string& detail) {
       elSpan = elMax - elMin;
     }
     const uint32_t after = FleshVoxels(c.mobs, victim);
-    lostEach[k] = before > after ? before - after : 0;
+    const uint32_t afterArt = FleshArtVoxels(c.mobs, victim);
+    // MEASURED IN ART VOXELS since 2026-10-01 (npcStrike.lostArtVoxMin's note in
+    // tests/baseline.json): the shipped kerf (b48fb4d) is carved at skin
+    // resolution and is small enough that the collider count, a downsample,
+    // often does not move at all for a real cut.
+    lostEach[k] = beforeArt > afterArt ? beforeArt - afterArt : 0;
     if (hits > 0 && lostEach[k] > 0) landed++;
     // WHY THE STRIKE DID OR DID NOT LAND, next to the number it produced.
     std::printf(
         "npc-strike strike %d: %d sweeps, %d bodies hit, top tip speed %.1f "
-        "vox/s, flesh %u -> %u\n",
-        k, sweeps, hits, topSpeed, before, after);
+        "vox/s, flesh %u -> %u (art %u -> %u)\n",
+        k, sweeps, hits, topSpeed, before, after, beforeArt, afterArt);
   }
 
   // A WINDUP IS THE TELEGRAPH, so its LENGTH is the assertion: an attack that
@@ -1234,7 +1275,7 @@ Status GateNpcStrike(Ctx& c, std::string& detail) {
   check(cutSeen >= 2 * strikes, "...and real time cutting");
   check(finished == strikes, "every stroke ran to completion");
 
-  const uint32_t lostMin = (uint32_t)BaselineNumber("npcStrike.lostVoxMin", 20);
+  const uint32_t lostMin = (uint32_t)BaselineNumber("npcStrike.lostArtVoxMin", 24);
   uint32_t lostWorst = 0xFFFFFFFFu, lost = 0;
   for (int k = 0; k < strikes; k++) {
     lost += lostEach[k];
@@ -1262,7 +1303,7 @@ Status GateNpcStrike(Ctx& c, std::string& detail) {
   RecordObserved("npcStrike.lostVoxObserved", (double)lost);
   RecordObserved("npcStrike.azSpanObserved", azSpan);
   std::printf(
-      "npc-strike: %d of %d strikes landed, %u flesh voxels total (weakest "
+      "npc-strike: %d of %d strikes landed, %u flesh ART voxels total (weakest "
       "%u, min %u); windup %d ticks, cut %d ticks; first cut swept az %.2f "
       "el %.2f rad\n",
       landed, strikes, lost, lostWorst, lostMin, windupSeen, cutSeen, azSpan,
@@ -2762,7 +2803,38 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
   uint32_t firstFaultTick = 0;
   const int ticks = (int)BaselineNumber("limbAlias.ticks", 900);
   std::vector<MicroBodyInstGpu> insts;
+  // THE DEATH IS SUPPLIED IF THE FIGHT DOES NOT SUPPLY IT. The duels are
+  // armed, faced and real, and since the NPC fighting layer (guard / dodge /
+  // parry, 2026-09-27), the per-creature falloff of repeat strikes (b84305b,
+  // 09-28) and one hit per struck slot per sweep (4689af6, 10-01) they maim
+  // and disarm but did not KILL inside the window: 0 of 6 dead in 900 ticks
+  // and again in 1800 (hp 185..882 left, two swords knocked away). The
+  // subject is a brick record recycled from a corpse to a survivor who is
+  // still carving, so at a third of the run the most-wounded fighter is
+  // killed outright (root at zero hp, a blade death like any other) if
+  // nobody has died yet, and the survivors fight on through its cull.
+  const int killAt = ticks / 3;
   for (int i = 0; i < ticks; i++) {
+    if (i == killAt) {
+      bool anyDead = false;
+      for (uint64_t id : fighters) anyDead = anyDead || !c.mobs.IsAlive(id);
+      uint64_t weakest = 0;
+      float weakestHp = 1e30f;
+      for (uint64_t id : fighters)
+        if (c.mobs.IsAlive(id) && c.mobs.TotalHp(id) < weakestHp) {
+          weakestHp = c.mobs.TotalHp(id);
+          weakest = id;
+        }
+      const int rootLimb = st.def->rootLimb;
+      if (!anyDead && weakest != 0 && rootLimb >= 0) {
+        if (const uint64_t rb = c.mobs.LimbBody(weakest, rootLimb))
+          c.mobs.Damage(rb, 1.0e6f, c.mobs.LimbAnchorPos(weakest, rootLimb),
+                        0.0f, DamageCtx(DamageCause::Blade, 1.0f));
+        std::printf("limb-alias: nobody dead at tick %d; killed fighter %llu "
+                    "(hp %.0f) to supply the corpse\n",
+                    i, (unsigned long long)weakest, (double)weakestHp);
+      }
+    }
     tick();
     BodyRegistry reg(c.debris, c.mobs, nullptr, mset);
     // BOTH halves, every tick: BuildMicroInsts carries the slot-space checks
@@ -2784,6 +2856,15 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
   }
   for (uint64_t id : fighters)
     if (!c.mobs.IsAlive(id)) deaths++;
+  // WHY NOBODY DIED, when nobody did (rule 6): each fighter's hp, what it
+  // still holds and how many of its parts are still on it.
+  if (deaths == 0)
+    for (uint64_t id : fighters)
+      if (const Mob* m = c.mobs.FindMobById(id))
+        std::printf("limb-alias: fighter %llu hp %.0f, holding '%s', %u parts "
+                    "on\n",
+                    (unsigned long long)id, (double)c.mobs.TotalHp(id),
+                    m->HeldItem().c_str(), m->LimbBodyCount());
 
   // A CORPSE IS THE PRECONDITION, not the subject. The fault needs a death to
   // put a record back on the free list and a survivor to take it, so a run

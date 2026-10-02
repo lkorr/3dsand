@@ -790,6 +790,10 @@ Status GateGasFarPlume(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   FarPlumes& plumes = *world.farPlumes;
+  // NO CAMERA: a gate that ran TickAuthority before this one left the
+  // selftest player's eye on the shared index (FarPlumes::ClearEye). The
+  // fixture's weights are measured from the window centre.
+  plumes.ClearEye();
 
   // WHAT COUNTS AS FROZEN FIRE IS DATA, and the fixture proves it rather than
   // assuming it: the material is the first NON-GAS one the compiled reaction
@@ -1249,6 +1253,10 @@ Status GateGasFarPlume2(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   FarPlumes& plumes = *world.farPlumes;
+  // NO CAMERA: a gate that ran TickAuthority before this one left the
+  // selftest player's eye on the shared index (FarPlumes::ClearEye). The
+  // fixture's weights are measured from the window centre.
+  plumes.ClearEye();
 
   // The same fixture material gas-farplume derives: the first non-gas smoke
   // source in the compiled reaction table (materials.h SmokeSourceTable).

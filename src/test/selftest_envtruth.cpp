@@ -178,6 +178,7 @@ struct BiomeStat {
   int treesMeasured = 0;
   double treesPerHa = 0;
   int skinOk = 0, subOk = 0, unauthored = 0, treeGround = 0, tilePlant = 0;
+  int firmTop = 0;           // of skinOk: the authored cover.firmSkin at y == h (47ab2a6)
   bool flora = false, cacti = false;
   double tGen = 0, tTwin = 0, tRead = 0;   // seconds: pack+upload+worldgen, the CPU twins, the readback
   std::vector<RowStat> rows;
@@ -373,6 +374,17 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
     // The biome record and its cover rows, as the shader reads them.
     const uint32_t* R = words.data() + words[worldmap::kHBiomeRecords] + static_cast<size_t>(b.index) * worldmap::kBiomeRecWords;
     const uint32_t skinId = R[worldmap::kB_Skin], subsoilId = R[worldmap::kB_Subsoil];
+    // The authored cover.firmSkin (kB_FirmCover; desert and ocean say
+    // `sandstone`). Since 47ab2a6 (2026-09-23, "worldgen leaves terrain at
+    // rest") a POWDER skin is laid loose only up to its lowest axis
+    // neighbour's ground + 1 and the author's firm skin above that, so a
+    // column on a detail-octave step wears the firm skin at y == h -- that
+    // commit measured it as -3.8% sand-surfaced columns. That is the biome
+    // wearing what it authored, so the skin claim counts it (and reports the
+    // share); anything else at y == h is still a miss.
+    const uint32_t firmId = R[worldmap::kB_FirmCover];
+    const bool skinSplits = firmId != 0 && skinId != 0 && skinId < c.mats.size() &&
+                            c.mats[skinId].gpu.klass == CLASS_POWDER;
     const int skinDepth = std::max(1, static_cast<int>(R[worldmap::kB_SkinDepth]));
     const int bThresh = static_cast<int>(R[worldmap::kB_PatchThreshold]);
     const uint32_t pLog2 = R[worldmap::kB_PatchCellLog2];
@@ -546,7 +558,9 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
                 if (wordAt(x, h + 1 + tb.first, z) == tb.second) { st.treesMeasured++; break; }
             }
             if (!elig[idx]) continue;
-            if (wordAt(x, h, z) == skinId) st.skinOk++;
+            const uint32_t top = wordAt(x, h, z);
+            if (top == skinId) st.skinOk++;
+            else if (skinSplits && top == firmId) { st.skinOk++; st.firmTop++; }
             if (wordAt(x, h - skinDepth, z) == subsoilId) st.subOk++;
             const uint32_t above = wordAt(x, h + 1, z);
             if (above == 0) continue;
@@ -630,10 +644,10 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
   std::string js = "{\n  \"treeTileVox\": " + std::to_string(T) + ",\n  \"biomes\": {\n";
   for (size_t bi = 0; bi < stats.size(); bi++) {
     const BiomeStat& st = stats[bi];
-    std::printf("env-truth: %-7s %6d cols %5.2f ha | trees %3d / %3d sites, exp %5.1f..%5.1f (+-%.1f) = %6.1f/ha (page %6.1f) | skin %s sub %s | tree-ground %s tile-plant %s unauthored %s | gen %.2f twin %.2f read %.2f s%s\n",
+    std::printf("env-truth: %-7s %6d cols %5.2f ha | trees %3d / %3d sites, exp %5.1f..%5.1f (+-%.1f) = %6.1f/ha (page %6.1f) | skin %s (firm %d) sub %s | tree-ground %s tile-plant %s unauthored %s | gen %.2f twin %.2f read %.2f s%s\n",
                 st.name.c_str(), st.columns, st.areaHa, st.treesMeasured, st.sites, st.treeLo, st.treeHi, st.treeSigma,
                 st.treesPerHa, st.nominalTreesPerHa,
-                Pct(st.columns ? static_cast<double>(st.skinOk) / st.columns : 0).c_str(),
+                Pct(st.columns ? static_cast<double>(st.skinOk) / st.columns : 0).c_str(), st.firmTop,
                 Pct(st.columns ? static_cast<double>(st.subOk) / st.columns : 0).c_str(),
                 Pct(st.columns ? static_cast<double>(st.treeGround) / st.columns : 0).c_str(),
                 Pct(st.columns ? static_cast<double>(st.tilePlant) / st.columns : 0).c_str(),

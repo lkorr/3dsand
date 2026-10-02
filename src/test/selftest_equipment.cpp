@@ -1118,6 +1118,17 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     // enough — it is not a reason for the gate to report the plate as
     // dissolved.
     uint32_t liveSkinA = a0, liveSkinB = b0, liveShell = shellStart;
+    // EVERY SLOT'S VOXELS on both creatures, carried forward like the rest,
+    // so a death names WHERE each body was eaten (CLAUDE.md rule 6).
+    auto slotVox = [&](uint64_t id) {
+      std::vector<uint32_t> v;
+      if (Mob* m = mobs.FindMobById(id))
+        for (int li = 0; li < m->LimbCount(); li++)
+          v.push_back(mobs.LimbArtVoxelCount(id, li));
+      return v;
+    };
+    const std::vector<uint32_t> slotA0 = slotVox(a), slotB0 = slotVox(b);
+    std::vector<uint32_t> slotA = slotA0, slotB = slotB0;
     diedDressed = diedBare = -1;
     for (int i = 0; i < ticks; i++) {
       soakTick(a, soakMat, soakUp);
@@ -1147,6 +1158,8 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
       liveSkinB = limbMat(b, controlIdx, mSkin);
       liveVoxA = mobs.LimbArtVoxelCount(a, coveredIdx);
       liveShell = limbMat(a, shell, shellMat);
+      slotA = slotVox(a);
+      slotB = slotVox(b);
       // "First loss" is the first tick past ONE PERCENT of the limb's skin,
       // not the first voxel. The first-voxel reading was an artefact of the
       // burn pass's fixed order: the dressed creature spawned second and was
@@ -1162,6 +1175,23 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
       if (shellGoneAt < 0 && shell >= 0 && shellStart &&
           liveShell * 4 < shellStart)
         shellGoneAt = i;
+    }
+    {
+      auto losses = [&](uint64_t id, const std::vector<uint32_t>& v0,
+                        const std::vector<uint32_t>& v1) {
+        std::string out;
+        Mob* m = mobs.FindMobById(id);
+        for (size_t li = 0; li < v0.size() && li < v1.size(); li++)
+          if (v1[li] < v0[li])
+            out += Format(" %s -%u",
+                          m ? m->LimbDefAt((int)li).name.c_str() : "?",
+                          v0[li] - v1[li]);
+        return out;
+      };
+      std::printf("    voxels lost by slot (last live tick): dressed [%s ] | "
+                  "bare [%s ]\n",
+                  losses(a, slotA0, slotA).c_str(),
+                  losses(b, slotB0, slotB).c_str());
     }
     lostDressed = a0 - liveSkinA;
     lostBare = b0 - liveSkinB;

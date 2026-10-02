@@ -366,6 +366,9 @@ Status GateChemElectrolysis(Ctx& c, std::string& detail) {
   tick(std::vector<BrushOp>{}, fillA);
   tick(std::vector<BrushOp>{}, fillB);
   uint32_t moltenA = 0, sodiumB = 0, chlorineB = 0;
+  // Attribution for a B that never splits: was the pool there, did the
+  // sparks land, and what did the pool turn into instead.
+  uint32_t moltenB = 0, sparkB = 0, saltB = 0, moltenB2 = 0;
   const int kTicks = 160;
   for (int i = 1; i <= kTicks; i++) {
     std::vector<CellOp> zap;
@@ -382,6 +385,10 @@ Status GateChemElectrolysis(Ctx& c, std::string& detail) {
       const std::vector<uint32_t> hb = Census(c, bWatch);
       sodiumB = std::max(sodiumB, hb[mSodium]);
       chlorineB = std::max(chlorineB, hb[mCl]);
+      if (i == 2) moltenB2 = hb[mMolten];
+      moltenB = std::max(moltenB, hb[mMolten]);
+      sparkB = std::max(sparkB, hb[mSpark]);
+      saltB = std::max(saltB, hb[mSalt]);
     }
   }
   Regenerate(c);
@@ -390,9 +397,11 @@ Status GateChemElectrolysis(Ctx& c, std::string& detail) {
   const bool ok = melts && splits;
   detail = Format(
       "A salt on lava: molten salt peak %u cells (%s); B molten salt + sparks: "
-      "sodium peak %u, chlorine peak %u (%s)",
+      "sodium peak %u, chlorine peak %u (%s) [B pool: molten %u at tick 2, "
+      "peak %u; spark peak %u; salt peak %u; site (%d,%d,%d)]",
       moltenA, melts ? "melts" : "NEVER MELTED", sodiumB, chlorineB,
-      splits ? "split" : "NO ELECTROLYSIS");
+      splits ? "split" : "NO ELECTROLYSIS", moltenB2, moltenB, sparkB, saltB,
+      s.x, s.y, s.z);
   std::printf("chem-electrolysis: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

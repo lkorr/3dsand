@@ -997,13 +997,45 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // the pass that owes the cleanup — CLAUDE.md rule 7's "gates share one
     // World", applied inside a gate.
     tick = RunQuietTicks(c, tick, 60);
-    const uint32_t awakeAfterDrain = ReadActiveChunksSync(c.ctx, world, c.sim);
+    // WHY each chunk is awake, not only how many (CLAUDE.md rule 6): the dirty
+    // reason bits, world.h kDirtyReasonName.
+    //
+    // A chunk held ONLY by the stain family -- stain-idle (DIRTY_R_STAIN, 4)
+    // and STAIN-WROTE (DIRTY_R_STAINW, 1024) -- is the drained bank DRYING,
+    // and it is not counted against the budget. Since f039607 (2026-09-25,
+    // "wet dries") a wet cell no longer touched by the water that wetted it
+    // dries one level at a time at water's stain.dries (15 per mille per
+    // tick), and a covered one (a bank face with ground over it) holds its
+    // chunk awake until it is dry: bounded by construction (at most 15
+    // levels, monotone; sim_step.wgsl stainDry's header). Measured here: 33
+    // awake = stain-idle 32 / STAIN-WROTE 8, nothing else -- on ab29366 too.
+    // The claim is that the WATER settles, and anything else awake still
+    // counts.
+    std::vector<uint32_t> fl(kNumSlots, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0,
+                          fl.data(), kNumSlots * 4, "wbAwakeWhy");
+    constexpr uint32_t kStainFamily = 4u | 1024u;
+    uint32_t why[kDirtyReasonBits] = {};
+    uint32_t awakeAfterDrain = 0, dryingOnly = 0;
+    for (uint32_t ci = 0; ci < kNumSlots; ci++) {
+      if (fl[ci] == 0) continue;
+      if ((fl[ci] & ~kStainFamily) == 0) { dryingOnly++; continue; }
+      awakeAfterDrain++;
+      for (int b = 0; b < kDirtyReasonBits; b++)
+        if (fl[ci] & (1u << b)) why[b]++;
+    }
     RecordObserved("waterbodyAwakeAfterDrain", (double)awakeAfterDrain);
+    RecordObserved("waterbodyDryingAfterDrain", (double)dryingOnly);
     awakeAfterDrainOut = awakeAfterDrain;
-    if ((double)awakeAfterDrain > awakeMax)
-      fail(Format("%u chunks still awake 60 ticks after the drain stopped, "
-                  "over the budget of %.0f — a drained lake does not settle",
-                  awakeAfterDrain, awakeMax));
+    if ((double)awakeAfterDrain > awakeMax) {
+      std::string reasons;
+      for (int b = 0; b < kDirtyReasonBits; b++)
+        if (why[b]) reasons += Format(" %s %u", kDirtyReasonName[b], why[b]);
+      fail(Format("%u chunks still awake 60 ticks after the drain stopped "
+                  "(plus %u only drying), over the budget of %.0f — a drained "
+                  "lake does not settle (by reason:%s)",
+                  awakeAfterDrain, dryingOnly, awakeMax, reasons.c_str()));
+    }
 
     RecordObserved("waterbodyDrainedEighths", (double)consDrained);
     RecordObserved("waterbodyConsErrEighths", (double)consErr);
@@ -2011,12 +2043,38 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
             nLevel = lv.At(nSlot, WBS_LEVEL);
             nAdoptTick = lv.At(nSlot, WBS_ADOPTTICK);
             if (nState != WB_ADOPTED) {
+              // WHY it never measured (CLAUDE.md rule 6): a candidate measures
+              // only after sim.waterBodyQuietTicks ticks in which no chunk of
+              // its footprint was dirty (sim_waterbody.wgsl wbQuiet / wbLedger),
+              // so name the dirty reasons of the chunks around the pit.
+              std::vector<uint32_t> fl(kNumSlots, 0);
+              rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue,
+                                    c.sim.DirtyActive(), 0, fl.data(),
+                                    kNumSlots * 4, "wbPitWhy");
+              uint32_t why[kDirtyReasonBits] = {};
+              uint32_t pitAwake = 0, pitChunks = 0;
+              for (int cz = (nz - nHalf - 8) >> 4; cz <= (nz + nHalf + 8) >> 4; cz++)
+                for (int cy = (nWaterBot - 2) >> 4; cy <= (gyMax + 2) >> 4; cy++)
+                  for (int cx = (nx - nHalf - 8) >> 4; cx <= (nx + nHalf + 8) >> 4; cx++) {
+                    if (!world.ChunkInWindow({cx, cy, cz})) continue;
+                    pitChunks++;
+                    const uint32_t f = fl[World::SlotChunkIndex({cx, cy, cz})];
+                    if (f == 0) continue;
+                    pitAwake++;
+                    for (int b = 0; b < kDirtyReasonBits; b++)
+                      if (f & (1u << b)) why[b]++;
+                  }
+              std::string reasons;
+              for (int b = 0; b < kDirtyReasonBits; b++)
+                if (why[b]) reasons += Format(" %s %u", kDirtyReasonName[b], why[b]);
               fail(Format(
                   "pass N arm 1: the created body is %s, not adopted, %u ticks "
                   "after %lld eighths were poured into it (measured volume %d, "
-                  "measured surface %d cells against a floor of %d, level %d)",
+                  "measured surface %d cells against a floor of %d, level %d; "
+                  "%u of %u chunks around the pit dirty, by reason:%s)",
                   LedgerStateName(nState), nSettle, (long long)nPoured, nVolume,
-                  nRArea, nt.sim.waterAdoptMinArea, nLevel));
+                  nRArea, nt.sim.waterAdoptMinArea, nLevel, pitAwake, pitChunks,
+                  reasons.c_str()));
             } else {
               // WITHIN TOLERANCE, not exact, and the tolerance is the honest
               // part: the CA settles the pour, the top layer levels out and the
@@ -2903,6 +2961,15 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       WaterBodies().Reset();
       SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
       SetCurrentTuning(armTuning(0, 0, knob, 512));
+      // sim.waveDrainSink is a KERNEL CONST (TUNE_WAVE_DRAIN_SINK, baked into
+      // the shader prelude), unlike the blast / swim knobs above, which the
+      // CPU emitter reads. Without a reload both arms ran the shipped 1024 and
+      // the "differential" compared two identical sinks: it passed or failed
+      // on run-to-run noise in the rest of the state (16030532 vs 15695081 in
+      // one run, 15896380 vs 15935203 in the next). The prelude filter
+      // (resources.cpp ReferencedTuningBlock) re-keys only the shaders that
+      // read the const, so this costs sim_waterbody, not the world.
+      c.sim.ReloadShaders(c.ctx.device);
       tick = RunQuietTicks(c, tick, 130);
       const WaterBodyDesc* wd = WaterBodies().Find(LakeId());
       if (!wd || wd->gpuSlot >= kWaterBodyCap) {
@@ -2979,6 +3046,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
 
     // Leave the world settled and pristine for the passes that hash it.
     SetCurrentTuning(t);
+    c.sim.ReloadShaders(c.ctx.device);   // the shipped sink const back (pass T)
     WaterBodies().Reset();
     SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
     tick = RunQuietTicks(c, tick, 60);

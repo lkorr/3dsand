@@ -465,6 +465,11 @@ Status GateCoatTransfer(Ctx& c, std::string& detail) {
 Status GateVenomBlade(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
+  // ISOLATION (suite triage 2026-10-01): start from a pinned id, not from
+  // whatever earlier gates left the counter at. A creature's per-voxel rolls
+  // hash its id, and arm C (mace into a pit) seeded after `mob` but not after
+  // `mob-burn` -- the order dependence bleed-fluid and body-coat also had.
+  mobs.SetNextIdCounter(1);
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
   const Target t = ChooseTarget(mobs, FixtureSite(c.world, 170));
@@ -648,12 +653,19 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
   for (size_t m = 0; m < c.mats.size(); m++)
     for (const std::string& tg : c.mats[m].tags)
       if (tg == "soft_tissue") soft[m] = 1;
-  auto coatOnSoft = [&](uint64_t id, uint32_t& onSoft, uint32_t& elsewhere) {
+  // `amts` (optional): the coat amount on each soft cell, for attribution --
+  // a coat thinner than the material's infectCost cannot seed.
+  auto coatOnSoft = [&](uint64_t id, uint32_t& onSoft, uint32_t& elsewhere,
+                        std::string* amts = nullptr) {
     onSoft = elsewhere = 0;
     for (const PrefabVoxel& v : mobs.LimbLattice(id, t.limb)) {
       if (!v.stain || BodyStainMat(v.stain) != venom) continue;
       const uint32_t m = v.material & 0xFFFu;
-      (m < soft.size() && soft[m] ? onSoft : elsewhere)++;
+      const bool isSoft = m < soft.size() && soft[m];
+      (isSoft ? onSoft : elsewhere)++;
+      if (amts && isSoft)
+        *amts += Format("%s%u:%s", amts->empty() ? "" : ",", BodyStainAmt(v.stain),
+                        c.mats[m].name.c_str());
     }
   };
   uint32_t tickBase = 90000u;
@@ -744,6 +756,7 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
   Pair C;
   uint32_t cTo = 0, cSeeded = 0, cSoft = 0, cElse = 0;
   bool cPit = false;
+  std::string cAmts, cAmtsLater;
   if (Mob* w = spawnPair(C, mace)) {
     Vec3 hit{};
     strike(C, *w, mace->strike, mace->edgeHalfWidth, mace->carveBonus,
@@ -756,14 +769,19 @@ Status GateVenomBlade(Ctx& c, std::string& detail) {
                mace->HeftFactor(g.woundHeftRef, g.woundHeftMax), 0.5f, 12.0f,
                false, 7300u);
     cTo = r.toTarget;
-    coatOnSoft(C.id, cSoft, cElse);
+    coatOnSoft(C.id, cSoft, cElse, &cAmts);
     tickFor(seedTicks);
     cSeeded = seededOf(C.id);
+    uint32_t s2 = 0, e2 = 0;
+    coatOnSoft(C.id, s2, e2, &cAmtsLater);
   } else {
     fail("C: fixture refused");
   }
   if (!cPit) fail("C: the pit could not be opened");
-  if (cSeeded == 0) fail(Format("C: venom into exposed flesh seeded nothing (coat sent %u)", cTo));
+  if (cSeeded == 0)
+    fail(Format("C: venom into exposed flesh seeded nothing (coat sent %u; soft "
+                "cells amount:material at the blow [%s], %d ticks later [%s])",
+                cTo, cAmts.c_str(), seedTicks, cAmtsLater.c_str()));
 
   // ---- D: a venom-soaked fist into an open pit ----------------------------
   Pair D;

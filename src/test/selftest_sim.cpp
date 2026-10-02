@@ -1219,6 +1219,15 @@ bool fullOk = false;
     s.flags = kPFlagAlive;
     drops.push_back(s);
   }
+  // THE BIRTH, not the 40th tick. The well's floor layer is read EVERY tick
+  // and the fullest blood cell ever seen there is what the claim is about:
+  // a drop that rejoined the grid full and then lost an eighth to an authored
+  // sink (blood dries; since the rule-unification W1-B1 matter rules a liquid
+  // pays for staining the floor it wets) is still a drop born full. Reading
+  // only tick 40 made the claim "born full AND nothing has touched it since".
+  uint32_t maxEver = 0;
+  int maxEverTick = -1;
+  std::vector<uint32_t> wellBuf((size_t)kChunkVol);
   uint32_t ft = 20000;
   for (int i = 0; i < 40; i++) {
     SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {},
@@ -1227,6 +1236,18 @@ bool fullOk = false;
                i == 1 ? drops : std::vector<ParticleSpawn>{});
     ctx.WaitIdle();
     ctx.ProcessEvents();
+    for (int cz = (pz - 2) >> 4; cz <= (pz + 2) >> 4; cz++)
+      for (int cy = (py + 1) >> 4; cy <= (py + 3) >> 4; cy++)
+        for (int cx = (px - 2) >> 4; cx <= (px + 2) >> 4; cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         wellBuf.data(), "fullWell");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const uint32_t w = wellBuf[k];
+            if ((w & 0xFFFu) != (uint32_t)bloodMat) continue;
+            const uint32_t st = (w >> 12) & 0xFu;
+            if (st > maxEver) { maxEver = st; maxEverTick = i; }
+          }
+        }
   }
 
   std::vector<uint32_t> fv(kNumSlots * (size_t)kChunkVol);
@@ -1244,10 +1265,14 @@ bool fullOk = false;
     landed++;
     maxState = std::max(maxState, (fv[i] >> 12) & 0xFu);
   }
-  fullOk = bloodMat > 0 && landed > 0 && maxState == 7;
-  std::printf("flung liquid fullness: %s (%u blood voxels landed, max "
-              "fullness %u/7 - 0 would render as gelatin cubes)\n",
-              fullOk ? "PASS" : "FAIL", landed, maxState);
+  fullOk = bloodMat > 0 && landed > 0 && maxEver == 7;
+  std::printf("flung liquid fullness: %s (%u blood voxels landed, fullest "
+              "ever %u/7 at tick %d, %u/7 at tick 40 - 0 would render as "
+              "gelatin cubes)\n",
+              fullOk ? "PASS" : "FAIL", landed, maxEver, maxEverTick, maxState);
+  detail = Format("%u blood voxels landed, fullest ever %u/7 at tick %d, "
+                  "fullest at tick 40 %u/7", landed, maxEver, maxEverTick,
+                  maxState);
 }
 
   // Verdict: the flag the moved body already computed.
@@ -3182,6 +3207,20 @@ Status GateFluidSelfReact(Ctx& c, std::string& detail) {
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   sim.ReloadShaders(ctx.device);
+  // WET DOES NOT DRY during the arms. Since f039607 (2026-09-25) water's wet
+  // stain comes off the ground by itself (stain.dries, 15 per mille per tick
+  // per level, sim_step.wgsl stainDry) whenever no water VOXEL touches the
+  // cell -- and in arm C every eighth is an excited particle, so nothing
+  // touches it and the roofed fixture's floor dries while it drinks: measured
+  // 893 drunk vs 831 levels standing, ~60 levels dried over 75 cells in 60
+  // ticks. The claim here is the ABSORB ledger (each eighth drunk is one level
+  // of wet), so the drying is parked for the gate, exactly as the dawn pin
+  // parks evaporation; drying has its own gate (rain-stain, "wet dries").
+  {
+    std::vector<MaterialDef> noDry = c.mats;
+    noDry[waterId].stainDries = 0;
+    sim.UploadTables(ctx.queue, noDry, c.reactions);
+  }
 
   const int px = 96, pz = 96, RB = 7;
   const int floorY = 109, roofY = 126, padY = floorY + 1;
@@ -3301,6 +3340,7 @@ Status GateFluidSelfReact(Ctx& c, std::string& detail) {
       arms[run][a] = runArm(a, 80000u + 1000u * (uint32_t)a);
   SetCurrentTuning(saved);
   sim.ReloadShaders(ctx.device);
+  sim.UploadTables(ctx.queue, c.mats, c.reactions);
 
   bool det = true;
   for (int a = 0; a < 3; a++)

@@ -847,6 +847,20 @@ bool streamOk = false;
               crossed ? 1 : 0, stream.Store().Count());
 }
 
+  // PUT THE WINDOW BACK (suite triage 2026-10-01). The player flight above
+  // leaves the window wherever the flight ended -- (20,-2,-7) in chunks -- and
+  // every later gate that builds a fixture at harness coordinates without
+  // regenerating at the origin itself then built it across the window's
+  // edge: rain-lean's CPU-vs-GPU mirror sampled 0/0 cells, the solute boxes
+  // lost their water off the window (0 full cells, 0 scoop ticks, 0 pour
+  // ops), all red in the suite and green in any subset that skipped this
+  // gate. Named by the selftest runner's "selftest leak:" line. The harness
+  // window lives at the origin; every other gate that moves it restores it.
+  stream.OnRegen();
+  world.SetWindowOrigin({0, 0, 0});
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
   // Verdict: the flag the moved body already computed.
   return streamOk ? Status::Pass : Status::Fail;
 }

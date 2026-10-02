@@ -986,7 +986,14 @@ Status GateSoluteLook(Ctx& c, std::string& detail) {
                                   "soluteLookShot");
   const int kFrames = 8;
   for (int f = 0; f < kFrames; f++) {
-    WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, true, 0.0f,
+    // SUN SHADOWS OFF: the claim is the TINT, and the pools' own rims cast a
+    // staircase shadow across each pool that the centre sample straddles. It
+    // landed (713dacf, 2026-09-27) just clear of that edge; the shadow-path
+    // changes of 09-28 (staggered 16x4 refresh 531f2de, nearest patch below
+    // 4 px 65d5992) moved the edge onto the far-row vitriol pool's centre
+    // and read it as 'vitriol bluer by -8' against a lit near-row water pool.
+    // With the key light's shadow term off every pool is lit alike.
+    WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, false, 0.0f,
                       kFarFogDensity, (float)H, noonTick);
     rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
     c.sim.EncodeShadowResolve(enc);
