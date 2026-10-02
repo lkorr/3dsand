@@ -6764,6 +6764,35 @@ function wmatFields(m){
   f('repose',bindNum(m,'repose','mat',{min:18,max:72,ph:'45',oninput:()=>renderWikiPage()}),
     'POWDERS ONLY: degrees of slope a pile of this rests at. 45 (blank) is one-down-one-across, the angle every powder had before this field; 34 is dry sand, 40 angular gravel, 30 fine dust, 63 a packed snow drift. Quantised to 3:1 / 2:1 / 1:1 / 1:2 / 1:3 run:rise tiers with the in-between mixed per grain. CAUTION on a FLATTER value for a powder WORLDGEN places as ground (sand, gravel, dirt): worldgen still decides "too steep for a powder bed" against a hardcoded 45, so a flatter value puts the generated skin over its own repose and the window creeps for minutes. A STEEPER value is always safe - it can only refuse moves 45 allowed');
 
+  // THE TEMPERATURE LAYER (docs/PLAN_temperature.md; materials.json "thermal").
+  // Same PROXY pattern as the wind block below: absent means "no heat", so
+  // binding straight at m.thermal would grow an empty "thermal": {} on every
+  // material anyone opened. The transitions (melt / ignite / freeze) are shown,
+  // edited in materials.json: each is {above|below, full, chance, into}.
+  const tp={emit:m.thermal&&m.thermal.emit,inertia:m.thermal&&m.thermal.inertia};
+  const tsync=()=>{
+    const e=tp.emit,k=tp.inertia;
+    const keep=m.thermal?Object.assign({},m.thermal):{};
+    if(e===undefined)delete keep.emit;else keep.emit=e;
+    if(k===undefined)delete keep.inertia;else keep.inertia=k;
+    if(Object.keys(keep).length===0)delete m.thermal;else m.thermal=keep;
+    touch('mat');renderWikiPage();
+  };
+  f('heat emit',bindNum(tp,'emit','mat',{min:0,max:255,ph:'0',oninput:tsync}),
+    '0-255 heat units: a 2x2x2 block holding this is a heat SOURCE at this temperature. The blocks around it, out to sim.heatRadius, warm toward a coverage-weighted mix of every source in reach and the ambient -- never past the hottest source. Fire 110, embers 140, lava 230.');
+  f('heat inertia',bindNum(tp,'inertia','mat',{min:0,max:7,ph:'auto',oninput:tsync}),
+    '0-7: how slowly a block holding this follows its target temperature (each tick it closes 1/2^inertia of the gap). Blank = by class: gas 1, powder and solid 3, liquid 4.');
+  if(m.thermal&&(m.thermal.melt||m.thermal.ignite||m.thermal.freeze)){
+    const txt=['melt','ignite','freeze'].filter(k=>m.thermal[k]).map(k=>{
+      const t=m.thermal[k];
+      return k+' '+(t.above!==undefined?'above '+t.above:'below '+t.below)+' (full '+t.full+', '+
+             t.chance+'‰) → '+t.into+(t.partialInto?' / partial → '+t.partialInto:'')+
+             (t.surface?', surface only':'');
+    }).join('; ');
+    f('heat transitions',el('span',{class:'cell'},txt),
+      'Thermal transitions, authored in materials.json "thermal". A cell turns into `into` while its temperature (ambient + local heat, 0 = water freezes) is past the threshold, at a chance ramping to `chance` per mille per tick at `full`. A melt or freeze needs a face of something else, an ignition an air face; a freeze only fires with air directly above, so ice is one cell thick.');
+  }
+
   const opq=bindCheck(m,'opaque','mat');
   opq.addEventListener('change',()=>renderWikiPage());
   f('opaque',opq,'liquid renders as a surface, not media');
@@ -8424,7 +8453,7 @@ const ARCH_NODES={
     tst:['determinism','sleep'],
     rule:2,
     details:'<b>Recorded order (pass_table.def, PT_TICK rows):</b><ol><li>clears — dirtyOut, argsStage, claim, expMask, hash</li><li><code>mutate</code> + <code>mutateCells</code> — MutationQueue</li><li><code>explodeMark</code> / <code>explodeApply</code></li><li><code>particleSpawn</code></li><li><code>compact</code> -> dispatchArgs</li><li><code>ca</code> x54 (indirect)</li><li>particle args / integrate / resolve (indirect)</li><li><code>occupancyFull</code>+<code>pick</code> on hash ticks, else <code>compactNext</code>+<code>occupancyDirty</code></li><li><code>farDown</code></li></ol>Then, only while fluid is live: the seam table, <code>kFluidSubsteps</code> x the fluid table, the settle table.<br><br><b>The settled skip:</b> 54 indirect dispatches with (0,1,1) args cost 141.7 us/tick for provably zero work. <code>NoteTickInputs</code> maintains a CONSERVATIVE CPU mirror of "could anything dirty a chunk" — a wrong "active" costs 141 us, a wrong "idle" loses world state, so every uncertain case resolves to active.',
-    children:['mutQueue','explode','compact','caLoop','soluteSys','particleSys','gasSys','fluidSys','waterBodies','occupancy','readback']},
+    children:['mutQueue','explode','compact','caLoop','soluteSys','heatSys','particleSys','gasSys','fluidSys','waterBodies','occupancy','readback']},
 
   mutQueue:{label:'MutationQueue',tag:'gpu',
     desc:'The ONLY write path to the voxel grid. Brush edits, spells, explosions, prefab stamping, debris settle-back and worldgen fills all become typed ops uploaded once per tick. The op stream is simultaneously the save format, the replay log and the future network stream.',
@@ -8470,6 +8499,15 @@ const ARCH_NODES={
     doc:['docs/PLAN_solutes.md','DESIGN.md'],
     rule:1,
     details:'<b>Storage.</b> Per chunk slot a table entry: EMPTY, UNIFORM(value) or a page of 4,096 16-bit cells (species, mass 0..255 at a full cell). The table and page indices are GPU-owned: <code>solWant</code>/<code>solAlloc</code> give a page to every chunk within one chunk of a dirty chunk whose neighbourhood carries solute, BEFORE the CA, and <code>solCompact</code> hands it back the same tick if the chunk turned uniform. Whether a slot is a page is deterministic; which page index it got is not and nothing keys on it.<br><br><b>Behaviour.</b> A powder named as a species <code>from</code> dissolves into a listed solvent it touches (eighths at a time); liquid moves carry mass proportionally; a solvent turned into a non-solvent pushes its mass into neighbours or precipitates it; a solvent past a <code>converts</code> row becomes that material (fairy dust in water to 48 is enchanted water); brine sinks under fresh water (<code>densityPerUnit</code>).<br><br><b>Diffusion.</b> Pair exchange at strides 1/2/4/8, three axis dispatches a tick, <code>sim.soluteDiffusion</code> scales every species; a chunk idle for 24 dispatches is stalled and the dilution floor discards what is below it.<br><br><b>Conditions.</b> A reactions.json rule with <code>"solute"</code>/<code>cMin</code>/<code>cMax</code> fires only on a liquid self carrying that species in range (brine electrolysis). Side array by GPU rule index.<br><br><b>Seams.</b> The MPM seam refuses to excite a solute cell. A vessel scooping brine is paid a dissolved portion (<code>solScoop</code> -> per-species ledger -> <code>ContainerSoluteLedger</code>). Streaming evicts/restores per chunk; saves write <code>solutes.svs</code>.<br><br><b>Look (2026-09-27, package H).</b> <code>raymarch.wgsl solLookAt</code> reads the layer (render bindings 28-30) once per liquid-surface pixel at the cell the ray entered, and <code>shadeWater</code> folds the species <code>tint</code> into the body: the complement is absorbed, the in-scatter moves toward the tint, and <code>glow</code> adds light, all scaled by concentration over the most this liquid can hold (saturation, or a lower <code>converts</code> cMin). Brine is faintly milky, vitriol blue, ink dark, fairy water violet, lumen water glows. Render-only; the fragment shader stays at 128 registers. Gate <code>solute-look</code> writes <code>build/solute_look.bmp</code>.'},
+  heatSys:{label:'Temperature',tag:'gpu',
+    desc:'Heat as a sparse per-chunk side layer (docs/PLAN_temperature.md). Hot materials (fire, embers, lava, molten metal) warm the 2x2x2-voxel blocks within a fixed reach; every block relaxes toward that target at its own inertia; each biome has an ambient with a day/night swing. Snow and ice melt, fuel catches without touching a flame, a frozen surface skins over -- all as thermal transitions authored in materials.json.',
+    files:['assets/shaders/sim_heat.wgsl','assets/shaders/sim_step.wgsl','src/sim/heat.h','src/sim/heat.cpp','src/sim/biomes.cpp','assets/shaders/worldgen.wgsl'],
+    sym:['pass heatBegin','pass heatShift','pass heatWant','pass heatAlloc','pass heatSrc','pass heatTent','pass heatRelax','heatReact','heatAmbient','heatX','PackHeatMaterial','Simulation::PrepareHeat'],
+    cst:['heat.h  kHeatPoolPages','heat.h  kHeatRadiusMax','heat.h  kHmWords','heat.h  kHpWords'],
+    tst:['heat-melt','heat-ignite','heat-bound','heat-freeze','heat-ambient','heat-idle','sleep','determinism'],
+    doc:['docs/PLAN_temperature.md','DESIGN.md'],
+    rule:2,
+    details:'<b>Field.</b> T = ambient + X per 2x2x2 block. The target X* is the coverage-weighted mixture of the ambient and every emitter within sim.heatRadius blocks (a separable tent filter, three passes): several sources add, and X* can never exceed the hottest source in reach. X relaxes toward X* by max(1, |gap| >> inertia) -- gradual, exact, never overshooting.<br><br><b>Storage.</b> A page (6 KiB) per window chunk within one chunk of a heat source, allocated on demand in slot order (a refusal is counted, never a crash), freed when it is all zero. Not hashed, not saved: a chunk that becomes resident with an emitter in it is woken by its fill and rebuilds its field within ~40 ticks.<br><br><b>Ambient.</b> Analytic, never stored per cell: biome climate (climate.ambient) of the column, base +/- swing, switching on the daylight wake tick the world already pays. biomes.cpp REFUSES a climate that straddles a freeze point, reaches an ignition point, or melts what the biome generates; worldgen ices every water surface in a frozen biome.<br><br><b>Transitions.</b> materials.json thermal.melt / ignite / freeze, run by sim_step heatReact after the reaction bucket through reactWriteSelf: frontier-scaled (melt and freeze need a face of something else, ignition an air face), freeze surface-only (ice at most one cell thick a column).'},
   particleSys:{label:'Particles',tag:'gpu',
     desc:'Ballistic voxels in flight, entirely GPU-side: 24.8 fixed-point position, sub-voxel DDA collision against the grid, and atomicMax claim-based reinsertion so two particles landing in one cell resolve by priority rather than by scheduling order.',
     files:['assets/shaders/sim_particle.wgsl','src/sim/materials.h','src/phys/debris.cpp'],
@@ -10959,6 +10997,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'Temperature: heat, melting, ignition, climate, freezing',desc:'2026-10-02 (docs/PLAN_temperature.md, DESIGN.md &sect;4 Heat). T = ambient + local excess. The excess is a sparse per-chunk side layer (2x2x2 blocks): a tent filter over every emitter within <code>sim.heatRadius</code> sets a target that can never exceed the hottest source, and the block walks to it at its inertia. Snow and ice melt, oil / foliage / cloth / wood catch at their own thresholds (flames light nothing but oil; lava lights wood across a gap), water at the surface of a frozen biome skins over one cell thick. Per-biome climate with a day/night swing, validated at load (no freeze-thaw cycle, no igniting climate, no self-melting biome); frozen water is born frozen. Not saved: rebuilt from the emitters a fill wakes. Gates <code>heat-idle</code>, <code>heat-melt</code>, <code>heat-ignite</code>, <code>heat-freeze</code>, <code>heat-ambient</code>, <code>heat-bound</code>; F1 &rarr; Temperature.'},
     {label:'Ground items no longer multiply across a save',desc:'2026-10-01 (ITMS v8, <code>src/game/persist.cpp</code>). A dropped item is one debris body plus its identity; DBRS saved the body and the ITMS load re-dropped the item as a second one, so every save/load doubled what lay on the ground. ITMS now records the body&rsquo;s DBRS index and re-attaches to the restored body (rotation, exact lattice, coats and a shed helm&rsquo;s strap to its severed head all kept); older saves match by position and load without the duplicate. Gate <code>save-items</code>.'},
     {label:'Weapon coats follow-up: bites infect, venom blades seed, coats on the ground, the snake hunts',desc:'2026-10-01. Zombie bites rewrote no flesh (one mottle value per bite; gate fixtures biting bone) and now infect; one venom cut seeds 10-20 cells (gate <code>venom-blade</code>); infection costs its cells, not the limb (<code>infect-perf</code>, and a whole-lattice <code>LimbFluid</code> walk removed from every limb view); one hit per struck slot per sweep; dropped items and loose debris trade coats; the item stage driven end to end in the live UI (<code>--shot-stage</code>); the snake&rsquo;s own AI bites, wanders, and every creature&rsquo;s footprint is oriented; HUD and remedies name the infection.'},
     {label:'Weapon coats, venom, the item stage, the snake: a coated blade carries its coat into the wound it cuts',desc:'2026-10-01, owner request (<code>docs/PLAN_weapon_coats.md</code>). A blow exchanges coat between the two surfaces that met: only the part of the blade that hit gives, the wound wall receives, the victim&rsquo;s blood comes back onto the blade; blunt and fists splash the bruise. Infection became a per-voxel CA rule on any material with an <code>infect</code> block; venom (<code>envenomed</code>) eats 1.5&times; as fast as it spreads, so a dose eats ~3&times; itself and stops. Double-click a weapon or armour piece for the item stage (rotate, paint from a flask). The snake slithers and bites venom in. Gates: coat-transfer, venom-wound, rot-clock, item-stage, snake.'},
@@ -11280,7 +11319,7 @@ function renderEngine(){
     {label:'Async compute overlap',badge:'planned',desc:'Sim overlaps render on a second queue (Vulkan port phase 8)'},
     {label:'Cross-vendor determinism',badge:'needed',desc:'Only one GPU vendor tested (RTX 3060 Ti) &mdash; DESIGN.md risk #3 remains open. M9 two-player shipped without it (both peers on the same vendor), so it now gates play across different GPUs rather than M9 itself.'},
     {label:'GI: the rest of PLAN_gi',badge:'planned',desc:'The openness grid, the irradiance grid with its gather cache, and the baked glow field for point lights have landed (docs/PLAN_gi.md P0&ndash;P3, 2026-09-02/05, plus the W2-B glow bake; sim_openness.wgsl, sim_glow.wgsl; DESIGN.md DESIGN.md &sect;9.y)sect;9.x/9.y). Open: body emitters (a burning limb, a glowing coat) do not feed the glow field &mdash; <code>sim_glow</code> reads grid voxels only &mdash; and PLAN_gi &sect;6 &ldquo;Later&rdquo; (rough reflections, a reprojection history buffer, sparse irradiance) is not started.'},
-    {label:'Temperature layer',badge:'planned',desc:'Sparse auxiliary layer keyed by chunk — heat propagation, melting, freezing'},
+    {label:'Temperature: the next uses (data, not engine)',badge:'planned',desc:'The layer landed 2026-10-02 (docs/PLAN_temperature.md). What it was built to carry next, each a materials.json <code>thermal</code> edit plus at most a consumer: boiling (water <code>thermal</code> transition to steam), heat damage to creatures (a body reading <code>heatAmbient + heatX</code> at its limbs), heat-driven updrafts (the wind field reading the pool), metal glowing / melting, lava cooling to stone away from its own heat. Open: heat does not run in ticket chunks; a chunk refused a heat wake keeps its excess until something wakes it.'},
   ];
   for(const p of plannedItems){
     const item=el('div',{class:'eng-status-item'});

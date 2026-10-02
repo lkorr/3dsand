@@ -142,6 +142,7 @@ const M_GRAVEL : u32 = 4u;
 const M_WATER : u32 = 5u;
 const M_OIL   : u32 = 6u;
 const M_LAVA  : u32 = 12u;
+const M_ICE   : u32 = 14u;
 const M_SNOW  : u32 = 15u;
 const M_CACTUS       : u32 = 70u;   // saguaro/barrel flesh: SOLID, blocking
 const M_CACTUS_RIB   : u32 = 71u;   // ribbed skin + spines: SOLID, blocking
@@ -1455,6 +1456,7 @@ const WM_BF_GROUND_FLORA : u32 = 1u;
 const WM_BF_CACTI        : u32 = 2u;
 const WM_BF_SAND_CAP     : u32 = 4u;
 const WM_BF_CANOPY_ROWS  : u32 = 8u;    // a cover row bounds the canopy cover; scan the trees once per column
+const WM_BF_FROZEN       : u32 = 16u;   // water freezes here day and night: ice on every water surface
 // the water preset table (worldmap.h kW_* / kP_*): the FLORA half of
 // assets/water/<name>.json and, from word 22, the GEOMETRY half.
 // Depths are voxels of water over the bed, heights cells from the bed
@@ -4378,6 +4380,19 @@ fn genCellIn(col : ptr<function, Col>,
     }
   } else if (fluidTop >= 0 && y <= fluidTop) {
     mat = fluid;
+    // FROZEN WATER IS BORN FROZEN (docs/PLAN_temperature.md §8). Where the
+    // climate keeps water below its freeze point day AND night -- a biome
+    // biomes.cpp derived as frozen (WM_BF_FROZEN), or anything at or above the
+    // snowline, where the snow caps begin -- the TOP cell of every water column
+    // is ice. The CA's thermal freeze would skin the surface over anyway; doing
+    // it here keeps every cold lake from freezing over on its first tick, a
+    // one-time wake of every pond in the biome. The same biome read (seeded
+    // map, column centre) and the same snowline the CA's ambient uses
+    // (heatParams), so the two cannot disagree about which water is frozen.
+    if (mat == M_WATER && y == fluidTop &&
+        (wmFlag(biome, WM_BF_FROZEN) || y >= treeline() - 1)) {
+      mat = M_ICE;
+    }
   }
 
   // ---- pond life: kelp, reeds, lilypads ----

@@ -3,6 +3,10 @@
   "displayName": "Desert",
   "index": 3,
   "climate": {
+    "ambient": {
+      "base": 24,
+      "swing": 20
+    },
     "temperature": 0.9,
     "moisture": 0.1,
     "notes": "Biome noise above desertThreshold."

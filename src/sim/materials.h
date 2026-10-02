@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "sim/heat.h"
+
 // Material classes — must match common.wgsl.
 enum MatClass : uint32_t {
   CLASS_SOLID = 0,
@@ -1140,6 +1142,20 @@ struct MaterialDef {
   // event registry, a body's inbound pass) is responsible for its own
   // determinism. docs/PLAN_alchemy_chemistry.md "Reaction effects".
   std::vector<RuleFx> ruleFx;
+  // ---- THE TEMPERATURE LAYER (materials.json "thermal", 2026-10-02) --------
+  // What heat does to and with this material (docs/PLAN_temperature.md §6):
+  //   "thermal": { "emit": 230, "inertia": 4,
+  //                "melt":   {"above": 0,   "full": 64,  "chance": 20, "into": "water"},
+  //                "ignite": {"above": 150, "full": 230, "chance": 15, "into": "ember"},
+  //                "freeze": {"below": 0,   "full": -24, "chance": 3,  "into": "ice",
+  //                           "partialInto": "snow", "surface": true} }
+  // The ONE authoring surface for thermal transitions (there is no
+  // reactions.json heat condition). Packed per material into heatParams by
+  // Simulation::UploadTables (PackHeatMaterial) and run by sim_step.wgsl
+  // heatReact AFTER the material's reaction bucket -- so no CPU rule
+  // evaluator (bodies, the bench, gas parcels) ever sees one, and no authored
+  // rule's index or RNG stream moves.
+  ThermalDef thermal;
 };
 
 // Loads materials.json + reactions.json and compiles them into GPU tables:

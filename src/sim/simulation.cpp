@@ -23,6 +23,7 @@
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
 #include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
 #include "sim/solutes.h"     // LoadSolutes: the species table UploadTables packs
+#include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
@@ -129,6 +130,17 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   solSpecBuf_ = CreateBuffer(device, (uint64_t)kSolSpecWords * 4,
                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                              "solSpec");
+  // The temperature layer's parameters (heat.h kHp*): the per-material words
+  // are filled by UploadTables, the header and the column table by
+  // PrepareHeat; zeroed once here so an unwritten region reads as "nothing".
+  heatParamsBuf_ = CreateBuffer(device, (uint64_t)kHpWords * 4,
+                                rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                "heatParams");
+  {
+    static const std::vector<uint32_t> zeros(kHpWords, 0u);
+    queue.WriteBuffer(heatParamsBuf_, 0, zeros.data(), zeros.size() * 4);
+    heatColValid_ = false;
+  }
   UploadTables(queue, mats, reactions);
   // The solute layer's free stack and empty table, before any tick can
   // allocate (a zeroed meta record would read as an EMPTY STACK, and the first
@@ -371,6 +383,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The CA's air mask (sim_step.wgsl camask): simBGL_ only.
         entry(48, T::Storage),         // caMask (1 bit per cell, per slot)
         entry(49, T::Storage),         // caWind (ambient wind per 4^3 block)
+        // The temperature layer (src/sim/heat.h, sim_heat.wgsl): the pool and
+        // the meta record are GPU-owned (the CA reads the pool and raises
+        // flags / counters in the meta); the params are CPU-written.
+        // simBGL_ only.
+        entry(50, T::Storage),         // heatPool (per-block X / X* / sources)
+        entry(51, T::Storage),         // heatMeta (table, flags, lists, stack)
+        entry(52, T::ReadOnlyStorage), // heatParams (climate, transitions, columns)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1225,6 +1244,9 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(47, draftMetaBuf_),
         b(48, caMaskBuf_),
         b(49, caWindBuf_),
+        b(50, world_->heatPool),
+        b(51, world_->heatMeta),
+        b(52, heatParamsBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1349,6 +1371,27 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     const std::vector<uint32_t> catchForm = CatchFormTable(mats, reactions);
     for (size_t i = 0; i < catchForm.size() && i < kStainPaletteBase; i++)
       table[i]._r2 = catchForm[i] & 0xFFFu;
+  }
+  // THE TEMPERATURE LAYER (src/sim/heat.h): each material's emit, inertia and
+  // transition count ride the rest of `_r2` (bits 12..24; what caMask, heatSrc
+  // and the CA's heatReact read), and its transitions go to heatParams at
+  // kHpMat + id * kHpMatStride. Inertia defaults by class: a gas answers in a
+  // tick or two, water slowest.
+  {
+    std::vector<uint32_t> words((size_t)kHpMatStride * kHeatMatMax, 0u);
+    for (size_t i = 0; i < mats.size() && i < kStainPaletteBase && i < kHeatMatMax; i++) {
+      const ThermalDef& t = mats[i].thermal;
+      int k = t.inertia;
+      if (k < 0) {
+        const uint32_t kl = mats[i].gpu.klass;
+        k = kl == CLASS_GAS ? 1 : kl == CLASS_LIQUID ? 4 : 3;
+      }
+      const uint32_t n = (uint32_t)std::min<size_t>(t.transitions.size(), kHeatMaxTransitions);
+      table[i]._r2 |= ((t.emit & 0xFFu) << kHeatR2EmitShift) |
+                      (((uint32_t)k & 7u) << kHeatR2InertiaShift) | ((n & 3u) << kHeatR2TransShift);
+      PackHeatMaterial(t, words.data() + i * kHpMatStride);
+    }
+    queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpMat * 4, words.data(), words.size() * 4);
   }
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
@@ -1839,6 +1882,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // (docs/PLAN_solutes.md). Its own module: the CA carries mass through its
   // liquid moves and this file does everything else.
   rhi::ShaderModule mSolute;
+  // The temperature layer (sim_heat.wgsl, src/sim/heat.h): pages, sources,
+  // targets and relaxation, after the CA on its dirty list.
+  rhi::ShaderModule mHeat;
   // The openness grid's writer (docs/PLAN_gi.md §2). A RENDER-path module among
   // the sim ones for shadow_resolve.wgsl's reason: BuildPipelines is the single
   // place F5 recompiles, and the pass and the raymarch's reader must be
@@ -1885,6 +1931,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mCompact, "sim_compact.wgsl");
     mod(&mStep, "sim_step.wgsl");
     mod(&mSolute, "sim_solute.wgsl");
+    mod(&mHeat, "sim_heat.wgsl");
     mod(&mOcc, "sim_occupancy.wgsl");
     mod(&mPick, "sim_pick.wgsl");
     mod(&mOpenness, "sim_openness.wgsl");
@@ -1911,7 +1958,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDenoise, "denoise.wgsl");
     loads.Run(buildThreads);
   }
-  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mSolute || !mOcc || !mPick ||
+  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mSolute || !mHeat || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
@@ -2028,6 +2075,15 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { solHash_ = MakeComputePipeline(device, simPL_, mSolute, "solHash", "solHash"); });
   pool.Add([&] { solEvict_ = MakeComputePipeline(device, simPL_, mSolute, "solEvict", "solEvict"); });
   pool.Add([&] { solRestore_ = MakeComputePipeline(device, simPL_, mSolute, "solRestore", "solRestore"); });
+  // The temperature layer (sim_heat.wgsl). On simPL_: bindings 50..52.
+  pool.Add([&] { heatBegin_ = MakeComputePipeline(device, simPL_, mHeat, "heatBegin", "heatBegin"); });
+  pool.Add([&] { heatShift_ = MakeComputePipeline(device, simPL_, mHeat, "heatShift", "heatShift"); });
+  pool.Add([&] { heatWant_ = MakeComputePipeline(device, simPL_, mHeat, "heatWant", "heatWant"); });
+  pool.Add([&] { heatArgs_ = MakeComputePipeline(device, simPL_, mHeat, "heatArgs", "heatArgs"); });
+  pool.Add([&] { heatAlloc_ = MakeComputePipeline(device, simPL_, mHeat, "heatAlloc", "heatAlloc"); });
+  pool.Add([&] { heatSrc_ = MakeComputePipeline(device, simPL_, mHeat, "heatSrc", "heatSrc"); });
+  pool.Add([&] { heatTent_ = MakeComputePipeline(device, simPL_, mHeat, "heatTent", "heatTent"); });
+  pool.Add([&] { heatRelax_ = MakeComputePipeline(device, simPL_, mHeat, "heatRelax", "heatRelax"); });
 
   pool.Add([&] { explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark"); });
   pool.Add([&] { explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply"); });
@@ -2152,6 +2208,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
+      !heatBegin_ || !heatShift_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
       !fluidSpawn_ ||
@@ -2458,6 +2515,10 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::SolSpec:             return solSpecBuf_;
     case B::SolArgs:             return world_->solArgs;
     case B::SolStage:            return world_->solStage;
+    case B::HeatPool:            return world_->heatPool;
+    case B::HeatMeta:            return world_->heatMeta;
+    case B::HeatParams:          return heatParamsBuf_;
+    case B::HeatArgs:            return world_->heatArgs;
     case B::GasParticlesRead:    return world_->gasParticles[page_];
     case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
     case B::GasCounts:           return world_->gasCounts;
@@ -2595,6 +2656,14 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::SolHash:        return solHash_;
     case P::SolEvict:       return solEvict_;
     case P::SolRestore:     return solRestore_;
+    case P::HeatBegin:      return heatBegin_;
+    case P::HeatShift:      return heatShift_;
+    case P::HeatWant:       return heatWant_;
+    case P::HeatArgsP:      return heatArgs_;
+    case P::HeatAlloc:      return heatAlloc_;
+    case P::HeatSrc:        return heatSrc_;
+    case P::HeatTent:       return heatTent_;
+    case P::HeatRelax:      return heatRelax_;
     default:                return step_;
   }
 }
@@ -2909,6 +2978,89 @@ void Simulation::EncodeSoluteRestore(const rhi::CommandEncoder& enc, uint32_t co
   RecordCtx cx{};
   cx.genCount = count;
   RecordTable(enc, pass::Table::SolRestore, &cx);
+}
+
+// ---- THE TEMPERATURE LAYER'S CPU HALF (src/sim/heat.h) --------------------
+// The header every tick (it is 32 words), the biome climates every tick (128),
+// and the window's column biome table only when what it describes moved: the
+// origin, the seed, the map, a climate or a test pin. The table is keyed by
+// the WORLD column held in each window column (x & 511, z & 511), so a shift
+// recomputes just the new strip on the CPU; the upload is then the whole
+// 256 KiB (an x shift touches every row), on a shift tick only.
+void Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed) {
+  const Tuning& tn = CurrentTuning();
+  uint32_t hdr[kHpHdrWords] = {};
+  hdr[kHpMode] = tn.sim.heatMode != 0 ? 1u : 0u;
+  hdr[kHpRadius] = (uint32_t)std::clamp(tn.sim.heatRadius, 1, (int)kHeatRadiusMax);
+  const HeatClimate snow = HeatSnowlineClimate();
+  hdr[kHpSnowlineY] = (uint32_t)HeatSnowlineY();
+  hdr[kHpSnowBase] = (uint32_t)snow.base;
+  hdr[kHpSnowSwing] = (uint32_t)snow.swing;
+  hdr[kHpProbe + 0] = (uint32_t)heatProbe_[0];
+  hdr[kHpProbe + 1] = (uint32_t)heatProbe_[1];
+  hdr[kHpProbe + 2] = (uint32_t)heatProbe_[2];
+  hdr[kHpProbeOn] = heatProbeOn_ ? 1u : 0u;
+  hdr[kHpGain] = (uint32_t)std::clamp(tn.sim.heatGain, 1, 64);
+  queue.WriteBuffer(heatParamsBuf_, 0, hdr, sizeof(hdr));
+  uint32_t bio[2 * kHeatBiomesMax];
+  uint64_t key = 1469598103934665603ull ^ seed;
+  auto mix = [&key](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+  for (uint32_t b = 0; b < kHeatBiomesMax; b++) {
+    HeatClimate c = HeatBiomeClimate(b);
+    const uint32_t pin = kHeatBiomesMax - 1 - b;
+    if (pin < heatPins_.size()) { c.base = heatPins_[pin].base; c.swing = heatPins_[pin].swing; }
+    bio[2 * b] = (uint32_t)c.base;
+    bio[2 * b + 1] = (uint32_t)c.swing;
+    mix(bio[2 * b]);
+    mix(bio[2 * b + 1]);
+  }
+  queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpBiome * 4, bio, sizeof(bio));
+  mix(worldmap::CurrentWorldMap().contentHash);
+  for (const HeatColumnPin& p : heatPins_) {
+    mix((uint32_t)p.x0); mix((uint32_t)p.z0); mix((uint32_t)p.x1); mix((uint32_t)p.z1);
+  }
+  const uint32_t n = kWorldN;
+  if (!heatColValid_ || key != heatColKey_ || heatCol_.size() != (size_t)n * n) {
+    heatCol_.assign((size_t)n * n, 0);
+    heatColX_.assign(n, -0x7FFFFFFF);
+    heatColZ_.assign(n, -0x7FFFFFFF);
+    heatColKey_ = key;
+    heatColValid_ = true;
+  }
+  const int x0 = origin[0] * (int)kChunk, z0 = origin[2] * (int)kChunk;
+  auto pinned = [&](int x, int z, uint32_t& b) {
+    for (size_t k = 0; k < heatPins_.size(); k++) {
+      const HeatColumnPin& p = heatPins_[k];
+      if (x >= p.x0 && x <= p.x1 && z >= p.z0 && z <= p.z1) {
+        b = kHeatBiomesMax - 1 - (uint32_t)k;
+        return true;
+      }
+    }
+    return false;
+  };
+  auto biomeAt = [&](int x, int z) -> uint8_t {
+    uint32_t b = 0;
+    if (!pinned(x, z, b)) b = World::MapBiomeAt(x, z, seed);
+    return (uint8_t)std::min<uint32_t>(b, kHeatBiomesMax - 1);
+  };
+  bool changed = false;
+  std::vector<int> wantX(n), wantZ(n);
+  for (uint32_t k = 0; k < n; k++) {
+    // The world column window index k holds: x in [x0, x0 + n) with x & (n-1) == k.
+    wantX[k] = x0 + (int)((k - (uint32_t)x0) & (n - 1));
+    wantZ[k] = z0 + (int)((k - (uint32_t)z0) & (n - 1));
+  }
+  for (uint32_t i = 0; i < n; i++) {
+    const bool colX = heatColX_[i] != wantX[i];
+    for (uint32_t j = 0; j < n; j++) {
+      if (!colX && heatColZ_[j] == wantZ[j]) continue;
+      heatCol_[(size_t)j * n + i] = biomeAt(wantX[i], wantZ[j]);
+      changed = true;
+    }
+  }
+  for (uint32_t k = 0; k < n; k++) { heatColX_[k] = wantX[k]; heatColZ_[k] = wantZ[k]; }
+  if (changed)
+    queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpCol * 4, heatCol_.data(), heatCol_.size());
 }
 
 void Simulation::EncodeWakeAll(const rhi::Queue& queue) {

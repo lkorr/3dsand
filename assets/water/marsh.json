@@ -46,8 +46,7 @@
   },
   "fill": {
     "material": "water",
-    "level": 0,
-    "surfaceMaterial": ""
+    "level": 0
   },
   "berm": {
     "height": 0.2,

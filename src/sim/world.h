@@ -458,7 +458,7 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // standing argument against two lists (tuning_params.def, pass_table.def).
 //
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
-constexpr int kDirtyReasonBits = 28;
+constexpr int kDirtyReasonBits = 29;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "write",      "react-idle", "stain-idle", "flow",
     "viscous",    "seam",       "part",       "wbody",
@@ -477,7 +477,11 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "solute",
     // ...and its back-check: a pair the -axis neighbour owns has work, so the
     // owner is woken for a whole phase cycle (sim_solute.wgsl DIRTY_R_SOLBACK).
-    "solute-back"};
+    "solute-back",
+    // docs/PLAN_temperature.md: the chunk's local temperature moved this tick
+    // (sim_heat.wgsl heatRelax DIRTY_R_HEAT), so the CA re-reads its cells'
+    // heat. Not in FILM_LICENCE: heat moving is not liquid progress.
+    "heat"};
 
 // The bit for a reason NAME, resolved from the one table above rather than
 // written down as a number a second time -- 22/24/25 in a header is exactly
@@ -4364,6 +4368,10 @@ struct WorldSnapshot {
   // the mass ledger the solute gates balance (dissolved - precipitated -
   // discarded - converted + poured - scooped == mass now).
   uint32_t solFree = 0;
+  // ---- the temperature layer (heatMeta's header, heat.h kHm*, words 0..31) --
+  // List counts, the free-stack depth, the monotonic firing / alloc / refusal
+  // counters and the F1 probe -- as of `tick`. Zeroed by a worldgen / load.
+  uint32_t heat[32] = {};
   uint32_t solFaults = 0;
   uint32_t solExhausted = 0;
   uint32_t solHighWater = 0;
@@ -5297,6 +5305,12 @@ class World {
   // Deferred queue writes, so they land at the head of the next submit -- the
   // same ordering every other reset here relies on.
   void ResetSolutes(const rhi::Queue& queue);
+  // THE TEMPERATURE LAYER (src/sim/heat.h). GPU-owned; all zero = an empty
+  // layer, which is what the worldgen and load-reset fill rows leave. Not
+  // hashed, not saved: rebuilt from the emitters standing in the world.
+  rhi::Buffer heatPool;    // kHeatPoolPages * kHeatPageWords u32
+  rhi::Buffer heatMeta;    // kHmWords u32
+  rhi::Buffer heatArgs;    // kHeatArgsBytes -- indirect-only copy of heatMeta[kHmArgs..]
   rhi::Buffer dirty[2];    // kNumChunks u32
   rhi::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
   rhi::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)

@@ -2442,6 +2442,19 @@ struct Tuning {
     // Percent scale on each species' solutes.json `diffusivity`: 0 freezes the
     // pair exchange, 100 is the authored rate. The --sweep reach knob.
     int soluteDiffusion = TPD(sim, soluteDiffusion);
+    // THE TEMPERATURE LAYER (docs/PLAN_temperature.md). 0 = off: the layer
+    // releases its pages and no heat transition (melt, ignite, freeze) fires.
+    int heatMode = TPD(sim, heatMode);
+    // How far a heat source reaches, in 2x2x2-voxel blocks (6 = 12 voxels).
+    int heatRadius = TPD(sim, heatRadius);
+    // How strongly coverage counts: a block's sources reach their own
+    // temperature once they fill 1/heatGain of its surroundings.
+    int heatGain = TPD(sim, heatGain);
+    // The climate above the snowline (the map's treeline - 1), in heat units
+    // where 0 is water's freezing point: base +- swing by day / night. Kept
+    // below 0 by day (LoadTuning) so the snow caps never melt by themselves.
+    int heatSnowlineBase = TPD(sim, heatSnowlineBase);
+    int heatSnowlineSwing = TPD(sim, heatSnowlineSwing);
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
     // advances sim state and the droplets can stain, so these are integers in

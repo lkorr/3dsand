@@ -133,7 +133,7 @@ bits 12–15: state nibble — meaning is per-material:
 ```
 Material ID 0 = air/empty. If we ever need more per-voxel state (temperature,
 velocity fields), add an *optional sparse auxiliary layer* keyed by chunk — do not
-grow the base voxel. 16 bpv is what makes 100M+ resident voxels affordable.
+grow the base voxel. (Temperature is one now: §4 "Heat", per 2³ block.) 16 bpv is what makes 100M+ resident voxels affordable.
 
 ### Paged residency: the voxel buffer is a page POOL, not a dense array
 
@@ -1720,11 +1720,140 @@ rather than a WGSL trick: fewer call SITES of tryMove / reactWriteSelf in the
 CA itself (a step function that picks a target and moves once), which would
 shrink the pipeline with or without solutes.
 
+### Heat: temperature as a sparse side layer (2026-10-02; `sim_heat.wgsl`, `src/sim/heat.*`, sim_step.wgsl `heatReact`, docs/PLAN_temperature.md, gates `heat-*`)
+
+Hot things warm what is near them; snow and ice melt, fuel catches without
+touching a flame, water at the surface of a frozen climate skins over; every
+biome has a climate with a day/night swing. All of it is DATA: materials.json
+`thermal` (emit, inertia, melt / ignite / freeze) and biomes' `climate.ambient`.
+
+**The temperature of a cell** is `T = A + X`, heat units, 0 = water freezes.
+`A` is the AMBIENT: the climate of the cell's column (the biome the seeded map
+puts there, read through a CPU-built 512 x 512 window column table in
+`heatParams`, refilled only for the strip a window shift brings in) or, at and
+above the snowline (map treeline - 1), the snowline climate (`sim.heatSnowline*`),
+`base + swing` by day and `base - swing` by night. It is evaluated, never
+stored per cell and never diffused, and it is TWO-LEVEL on purpose: it changes
+only on the tick daylight switches, which is the tick `SubmitTick` already
+re-dirties the whole world on for the light-gated rules — so it adds no wake of
+its own and cannot miss a crossing.
+
+`X` is the LOCAL EXCESS, one u8 per 2³ block, stored only in chunks within one
+chunk of a heat source. Its target `X*` comes from a separable TENT filter over
+the emitters within `sim.heatRadius` blocks (three axis passes, each one
+dispatch, weights `R+1-|d|` normalised per axis): per block the coverage-
+weighted emitter sum `sE` and the coverage `sf`, then
+
+    c  = min(1, sim.heatGain x sf)
+    T* = A + c x (sE/sf - A)          X* = clamp(T* - A, 0, 255)
+
+a CONVEX combination of the ambient and a mean of emitters, so `T*` can never
+exceed the hottest source in reach (the ceiling, by construction), several
+sources add until the coverage saturates, and beyond R blocks a source adds
+exactly nothing (the radius, by construction). The gain is what lets a lava
+pool's face heat the blocks beside it to the lava's own temperature while one
+burning voxel only warms its neighbour by a fifth of the difference. `X` walks
+to `X*` by `max(1, |X* - X| >> k)` per tick, `k` the block's slowest
+`thermal.inertia` (water 5, liquids 4, solids and powders 3, gas and air 1):
+gradual, exact at the end, never past the target. No neighbour exchange: that
+would make the fixpoint something other than `X == X*` (the sleep test) and let
+a block be pushed past its target (the ceiling).
+
+**Storage** (`heat.h`). `heatPool`: 5,120 pages of 6 KiB (three planes of 512
+words: X / X* / E / n / k, and the tent's x and y partial sums). `heatMeta`:
+per window slot an entry, flags, a summary and the owning world chunk; a want
+bitset; three work lists; the free stack. All zero is an empty layer, which is
+what the worldgen and load-reset fill rows leave. `heatParams` (CPU-written):
+mode, radius, gain, snowline, the probe cell, per-biome climates,
+per-material transitions, the column table. 30 MiB + 1 MiB + 0.4 MiB.
+
+**The rows** (`pass_table.def`, all `C_CAACTIVE`: a settled world records none):
+`heatBegin` (counts, day flip, shift args) and `heatShift` (release every page
+whose owner left the window, ZERO groups unless the origin moved) before the CA;
+after it `heatWant` (per dirty chunk: list paged chunks; an emitting chunk —
+`caMask` raised its flag, or its last scan found a source — wants pages for its
+3x3x3), `heatAlloc` (ONE workgroup ranks the wanted slots in SLOT ORDER by a
+prefix sum: exhaustion is a deterministic, counted refusal, never a crash),
+`heatSrc` (re-read a listed chunk's voxels into E / n / k; a change queues its
+3x3x3 for a target recompute, a day flip queues itself), `heatTent` (three
+dispatches, x / y / z), `heatRelax` (step X, mark the chunk dirty while it
+moves, free an all-zero page with no source in its 3x3x3); `heatArgs` turns the
+list counts into indirect records four times a tick. Every pass writes only its
+own chunk's page and reads neighbours' output of the previous dispatch; atomics
+only on flags (set semantics), list cursors, counters and the free stack (which
+PAGE a slot gets is unobservable: pages are zero when handed out).
+
+**The dirty bound.** `heatRelax` marks a moving chunk dirty ONLY if a chunk of
+its 3x3x3 is dirty this tick, so every heat mark lies in the one-ring of
+`dirtyIn` — the CPU page-table mirror's bound (§3 paged residency, PLAN_page_table
+§3.2). A chunk refused the mark keeps its X until something wakes it: a lag,
+never a missing page.
+
+**Transitions** (sim_step.wgsl `heatReact`, after the material's reaction
+bucket, not on excited fluid, not in a ticket): melt and ignite fire when
+`T > above`, freeze when `T < below`, at a chance ramping linearly to `chance`
+at `full`, rolled off `hash3(rnd ^ salt, k, slot)`. FRONTIER: a melt or freeze
+needs a face of something else (a bank melts from its surface in), an ignition
+an AIR face (a buried log does not catch), more such faces faster. SURFACE
+(freeze): only with air directly above, so ice is at most ONE cell thick per
+water column — a lake skins over, never freezes solid. A transition that can
+fire holds its chunk awake (it consumes its input: the finite-process
+exception); one that cannot holds nothing. The write is `reactWriteSelf`, so
+mass carries exactly (3/8 snow -> 3/8 water; full water -> ice; partial water
+-> snow by its eighths), support-loss flags and solute follow. No heat kernel
+writes a voxel. The four dropped sun-melt / night-freeze rules in
+reactions.json are DELETED; the climate replaces them. The `weather.iceMelts` /
+`waterFreezes` switches are now read by nothing.
+
+**Shipped tiers** (materials.json): emit lava / molten iron 230, molten glass /
+salt 200, oil_burning 150, ember 140, burning leaves / cloth / flesh / hair 130,
+fire / ether_burning 110. Melt: snow above 0, ice above 4. Freeze: water below
+0 (full -> ice, partial -> snow). Ignite: oil above 100, foliage / grass / plants
+/ thatch / straw / dust above 135, cloth / linen above 135, wood / bark / plank
+/ timber / charcoal above 150. So flames cannot heat-ignite anything but oil,
+burning foliage cannot heat-ignite foliage and embers cannot heat-ignite wood
+(zero gain where a chain must not form); lava and molten metal light wood a few
+cells off. Raising or lowering any tier is a data edit; `heat-bound` is what
+says whether it stays bounded.
+
+**Climate checks** (biomes.cpp, REFUSED at load, and the `heat-ambient` gate
+re-checks them): no biome's day/night range straddles a freeze point (frozen
+day AND night, or never); no day reaches the lowest ignition point; no day
+melts anything the biome generates (skin, cover, water-preset materials). A
+frozen biome sets `kBF_Frozen` and worldgen lays ice on the top cell of every
+water column there (and at or above the snowline): frozen water is born
+frozen, so no cold lake freezes over on its first tick. Shipped: tundra -24±12
+(frozen), alpine 10±8, pine 8±6, forest 10±6, meadow 12±8, swamp 14±4, ocean
+10±3, desert 24±20 (day 44: melts snow and ice, lights nothing).
+
+**Not saved, not hashed.** The field is rebuilt from the emitters standing in
+the world. A chunk that becomes resident (load, a window shift, a store hit) is
+woken by its fill when it holds matter, `caMask` finds its emitters on the
+first CA tick, and its field is back within ~40 ticks: the `heat-ignite` gate
+saves and loads lava beside wood and asserts the wood still catches within the
+same bound. Ticket chunks carry no heat. The heat gates run each fixture twice
+and compare a slot-keyed hash of the pool as well as the voxels.
+
+**Cost** (measured 2026-10-02, `--perf`, same machine, main 6c55214 as the
+before arm): `heatSys` 0.76 ms/frame in forestfire (pool peak 1,704 pages),
+1.12 ms in village-fire (2,278 pages, 16 heat ignitions); the CA loop within
+noise in forestfire, +0.76 ms in village-fire (heat keeps the one-chunk halo
+of relaxing blocks awake: 3,770 vs 3,603 awake chunks). An active world with
+nothing hot: one `heatWant` group per dirty chunk returning after two loads
+(`heat-idle`). The next lever, if wanted: recompute a chunk's targets at most
+every Nth tick (the relaxation hides it).
+
+**F1 -> Temperature**: the ambient at your feet (biome, base, the day/night
+term), the local target and actual excess, the block's sources, pool use and
+the firing counters. last_run.json `heat`: pool peak, refusals, firings.
+
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
 The world runs a day/night cycle, and sunlight is a real input to the CA:
-exposed water evaporates in the sun, snow melts by day and water freezes at
-night, plants only grow in daylight, fungus prefers the dark. That makes the
+exposed water evaporates in the sun, plants only grow in daylight, fungus
+prefers the dark. (Snow melting by day and water freezing at night were sun
+rules too; since 2026-10-02 they are the CLIMATE's -- §4 "Heat" -- and the sun
+rules are deleted.) That makes the
 sun part of the *simulation*, not just the renderer, so it has to satisfy
 rule 1 (bit-determinism). Three decisions follow from that, and each of them
 is the reason a more obvious approach was rejected.
@@ -21851,8 +21980,8 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
   Steam networking, temperature layer, structural stress.
   *(Status 2026-10-02: GI/lighting is no longer "beyond" — the openness grid,
   irradiance grid and glow field of `docs/PLAN_gi.md` are built, §9.x; spell
-  crafting has the spell grammar and graph with lanes, §"The spell system". The rest of this
-  line is unbuilt.)*
+  crafting has the spell grammar and graph with lanes, §"The spell system"; the
+  temperature layer is built, §4 "Heat". The rest of this line is unbuilt.)*
 
 ## 14. Risks (ranked)
 

@@ -159,6 +159,14 @@ namespace {
 #define PIPE_DRAFT_FINE2      Pipe::DraftFineMid
 #define PIPE_DRAFT_FINE2B     Pipe::DraftFineMid2
 #define PIPE_DRAFT_FINE3      Pipe::DraftFineLast
+#define PIPE_HEAT_BEGIN       Pipe::HeatBegin
+#define PIPE_HEAT_SHIFT       Pipe::HeatShift
+#define PIPE_HEAT_WANT        Pipe::HeatWant
+#define PIPE_HEAT_ARGS        Pipe::HeatArgsP
+#define PIPE_HEAT_ALLOC       Pipe::HeatAlloc
+#define PIPE_HEAT_SRC         Pipe::HeatSrc
+#define PIPE_HEAT_TENT        Pipe::HeatTent
+#define PIPE_HEAT_RELAX       Pipe::HeatRelax
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -251,6 +259,7 @@ namespace {
 #define D_STREAKGX        (uint32_t)DispatchSel::StreakGx
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 #define IND_DRAFTARGS     (uint32_t)DispatchSel::IndDraftArgs
+#define IND_HEATARGS      (uint32_t)DispatchSel::IndHeatArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

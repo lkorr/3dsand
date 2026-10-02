@@ -73,6 +73,8 @@ export const LIVE = {
     'climate.temperature': N('later', 'the painted map decides the biome; climate coordinates select nothing (PLAN_environment_truth §4 keeps climate noise a non-goal)'),
     'climate.moisture': N('later', 'the painted map decides the biome; climate coordinates select nothing (PLAN_environment_truth §4 keeps climate noise a non-goal)'),
     'climate.notes': R('free text, never read; kept enabled as notes'),
+    'climate.ambient.base': R('the temperature layer: heatParams biome climate (heat.h kHpBiome), read by sim_step heatReact and sim_heat\u2019s target pass; validated at load (biomes.cpp)'),
+    'climate.ambient.swing': R('the temperature layer: the day/night swing around the base (switches on the daylight wake tick)'),
 
     'terrain.curve': R('P-G: WM_B_CURVE_KNOT0..8 — nine Q14 relief knots the height mirror blends over the four map cells around a column (biomeCurve); the identity is the map\u2019s relief unchanged'),
     'terrain.hill': R('P-G: WM_B_HILL_MUL — Q8 multiplier on the map\u2019s hill octave (256 = the map\u2019s amplitude)'),
@@ -209,7 +211,6 @@ export const LIVE = {
   add('bathymetry', ['floorNoise', 'floorNoiseFreq'], later, NOISE);
   add('fill', ['material'], geom, G + ' (WM_W_FILL; none = a dry bowl)');
   add('fill', ['level'], later, 'the waterline is the rim ground at the centre column; a part-full body has no package yet');
-  add('fill', ['surfaceMaterial'], later, 'no package yet; the fill is one material');
   add('berm', ['height', 'width'], geom, G + ' (WM_W_BERM_H / BERM_W: the core is width/4, at least 2)');
   add('berm', ['coreFrac'], later, 'the engine’s berm core is width/4 (at least 2 columns); an authored fraction has no package yet');
   add('bed', ['shallow', 'deep', 'shallowDepth', 'thickness', 'substrate'], geom,

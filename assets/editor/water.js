@@ -619,9 +619,6 @@ function buildPanel() {
                  'playa, a dust bowl, a drained tarn.');
   UI.matRow(C, s.body, {k: 'material', n: 'fluid', d: 'water, oil, lava, acid… or none.'},
             'fill', mats, {allowNone: true, filter: isLiquid});
-  UI.matRow(C, s.body, {k: 'surfaceMaterial', n: 'surface skin',
-                        d: 'An optional solid ON the surface — ice on a frozen tarn.'},
-            'fill', mats, {allowNone: true, filter: isSolid});
   FILL_ROWS.forEach(r => UI.row(C, s.body, r, 'fill'));
   col.append(s.wrap);
 

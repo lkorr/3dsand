@@ -1,4 +1,5 @@
 #include "sim/world.h"
+#include "sim/heat.h"
 
 #include <algorithm>
 #include <utility>
@@ -85,7 +86,11 @@ constexpr uint64_t kFetchOff = kFluidMirrorOff + kFluidMirrorBytes;
 // only. Out here it is one straight memcpy out of the mapped slot.
 constexpr uint64_t kChunkHashOff =
     kFetchOff + (uint64_t)World::kFetchPerTick * kChunkBytes;
-constexpr uint64_t kSlotBytes = kChunkHashOff + kChunkHashBytes;
+// The temperature layer's header (heat.h kHm*, words 0..kHeatSnapWords): 128 B
+// after the digest table, copied every tick.
+constexpr uint64_t kHeatSnapOff = kChunkHashOff + kChunkHashBytes;
+constexpr uint64_t kHeatSnapBytes = kHeatSnapWords * 4;
+constexpr uint64_t kSlotBytes = kHeatSnapOff + kHeatSnapBytes;
 
 // Every WorldSnapshot the pipeline hands around is pre-sized: the readback
 // callback memcpys straight into these arrays. One definition, so the published
@@ -129,6 +134,13 @@ void World::Init(const rhi::Device& device) {
   solArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "solArgs");
   solStage = CreateBuffer(device, (uint64_t)kSolStageWords * 4,
                           U::Storage | U::CopySrc | U::CopyDst, "solStage");
+  // The temperature layer (src/sim/heat.h). Zeroed by the worldgen / load
+  // fill rows before anything reads it; created here at its fixed size.
+  heatPool = CreateBuffer(device, (uint64_t)kHeatPoolPages * kHeatPageWords * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "heatPool");
+  heatMeta = CreateBuffer(device, (uint64_t)kHmWords * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "heatMeta");
+  heatArgs = CreateBuffer(device, kHeatArgsBytes, U::Indirect | U::CopyDst, "heatArgs");
 
   // The allocator + conservative dirty mirror + materialization rule. It
   // installs the initial table: the IDENTITY MAP in both modes, because
@@ -677,6 +689,7 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
     chunkHashForce_ = false;
   }
   enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
+  enc.CopyTracked(pass::Buf::HeatMeta, heatMeta, 0, s.buf, kHeatSnapOff, kHeatSnapBytes);
   enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // Gas: the live per-page counts and the 8-word counter header. Async and one
   // tick latent like every other row here — no gas path anywhere reads back
@@ -935,6 +948,8 @@ void World::KickReadback() {
         std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
         std::memcpy(&out.scoopRefused, p + kPageFaultOff + kPageFaultScoopRefused * 4, 4);
         {
+          static_assert(kHeatSnapWords == 32, "WorldSnapshot::heat holds 32 words");
+          std::memcpy(out.heat, p + kHeatSnapOff, kHeatSnapBytes);
           uint32_t sm[kSolMetaHdrWords] = {};
           std::memcpy(sm, p + kSolMetaSnapOff, kSolMetaSnapBytes);
           out.solFree = sm[kSolMFree];

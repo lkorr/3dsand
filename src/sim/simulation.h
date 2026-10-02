@@ -142,6 +142,33 @@ class Simulation {
   // different tick on another machine changes when reactions fire.
   void EncodeWakeAll(const rhi::Queue& queue);
 
+  // THE TEMPERATURE LAYER'S CPU HALF (src/sim/heat.h). Writes the heatParams
+  // header (mode, radius, snowline, the F1 probe cell) every tick, and the
+  // window's column biome table whenever the origin, seed or map moved since
+  // the last write -- a pure function of (map, seed, window), so a replay
+  // rebuilds the same table. Called by SubmitTick right after the TickParams
+  // upload; deferred queue writes, so it lands before the tick's commands.
+  void PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed);
+  // The cell the F1 readout asks about (the player's feet); heatRelax copies
+  // that block's X / X* / sources into heatMeta's probe words. Render-side
+  // input: it changes no heat value, only which one is reported.
+  void SetHeatProbe(bool on, int x, int y, int z) {
+    heatProbeOn_ = on; heatProbe_[0] = x; heatProbe_[1] = y; heatProbe_[2] = z;
+  }
+  // Forget the column table (a map or biome reload): the next PrepareHeat
+  // rewrites all of it.
+  void InvalidateHeatColumns() { heatColValid_ = false; }
+  // TEST ONLY: pin the CLIMATE of a rectangle of world columns (inclusive) --
+  // how a heat gate puts a frozen and a hot climate side by side in one
+  // sealed fixture, whatever biome the map has there. Pin k borrows climate
+  // slot kHeatBiomesMax - 1 - k (no map has that many biomes). Empty = the
+  // map's alone.
+  struct HeatColumnPin { int x0, z0, x1, z1; int base, swing; };
+  void SetHeatColumnPins(const std::vector<HeatColumnPin>& pins) {
+    heatPins_ = pins;
+    heatColValid_ = false;
+  }
+
   // One 30 Hz tick. Caller writes tickUBO/opsBuf/expOps and zeroes the write-
   // page particle count via queue.WriteBuffer first, then submits the encoder
   // produced here before encoding the next tick. particlesActive lets a
@@ -781,6 +808,20 @@ class Simulation {
   // table, and a reload of solutes.json alone rides the same key.
   rhi::Buffer solSpecBuf_;
   std::vector<SoluteDef> solutes_;
+  // The temperature layer's CPU-written parameters (heat.h kHp*, binding 52)
+  // and its pipelines (sim_heat.wgsl). PrepareHeat's column-table cache: the
+  // world column each table row/column currently describes.
+  rhi::Buffer heatParamsBuf_;
+  rhi::ComputePipeline heatBegin_, heatShift_, heatWant_, heatArgs_, heatAlloc_, heatSrc_,
+      heatTent_, heatRelax_;
+  std::vector<uint8_t> heatCol_;
+  std::vector<int> heatColX_, heatColZ_;
+  bool heatColValid_ = false;
+  uint32_t heatColSeed_ = 0;
+  uint64_t heatColKey_ = 0;
+  bool heatProbeOn_ = false;
+  int heatProbe_[3] = {0, 0, 0};
+  std::vector<HeatColumnPin> heatPins_;
   // The solute layer's pipelines (sim_solute.wgsl).
   rhi::ComputePipeline solWant_, solArgs_, solAlloc_, solDiffuse_, solCompact_, solScoop_, solPour_, solHash_,
       solEvict_, solRestore_;

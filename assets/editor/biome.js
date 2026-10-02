@@ -460,6 +460,10 @@ function buildPanel() {
                      d: '0 cold .. 1 hot. The planned climate field is seed-independent with a fixed compass: colder toward +Z.'}, 'climate');
   UI.row(C, s.body, {k: 'moisture', n: 'moisture', min: 0, max: 1, step: 0.01,
                      d: '0 arid .. 1 wet. Drier toward +X in the planned field. Also the natural knob for how FULL this biome’s basins are.'}, 'climate');
+  UI.row(C, s.body, {k: 'base', n: 'ambient', min: -64, max: 63, step: 1,
+                     d: 'The temperature the simulation uses here, in heat units where 0 is the freezing point of water. Day is this plus the swing, night this minus it. Snow and ice melt above 0; nothing a climate can reach ignites. The loader REFUSES a biome whose night is below 0 while its day is not (water would freeze at every dusk and thaw at every dawn) and one whose day melts something it generates.'}, 'climate.ambient');
+  UI.row(C, s.body, {k: 'swing', n: 'day/night swing', min: 0, max: 63, step: 1,
+                     d: 'How much warmer the day is and colder the night, in heat units. A desert swings wide; an ocean barely moves.'}, 'climate.ambient');
   const notes = el('textarea', {class: CLS + 'num', rows: '2', style: 'text-align:left;resize:vertical'});
   notes.value = biome.climate.notes || '';
   notes.addEventListener('change', () => { undo.snapshot(null); biome.climate.notes = notes.value; markDirty(); });

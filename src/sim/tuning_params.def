@@ -764,6 +764,25 @@ TP_U(sim, soluteMode, TUNE_SOLUTE_MODE, 1, 0, 1)
 // so one --sweep proves the pair exchange reaches the kernel. 0 freezes
 // dissolved mass where the current left it; 100 is the authored rate.
 TP_U(sim, soluteDiffusion, TUNE_SOLUTE_DIFFUSION, 100, 0, 400)
+// THE TEMPERATURE LAYER (docs/PLAN_temperature.md, DESIGN.md "Heat"). Every
+// heat knob is NO_WGSL on purpose: Simulation::PrepareHeat writes them into
+// the heatParams header, so a change reaches the kernels without touching the
+// shader prelude (a TUNE_ row would miss the SPIR-V cache of every shader).
+// heatMode 0 = the layer releases its pages and no heat rule fires.
+TP_I(sim, heatMode, NO_WGSL, 1, 0, 1)
+// R, the source reach in 2^3 blocks: the tent filter's half-width. <= 8 keeps
+// every contribution inside a chunk's 3x3x3 neighbourhood (heat.h).
+TP_I(sim, heatRadius, NO_WGSL, 6, 2, 8)
+// G: the effective coverage of a block's heat sources is min(1, G x the
+// fraction of its surroundings they fill). 8 = a lava pool's face (~15% of a
+// block's surroundings) heats a block beside it to the lava's own temperature,
+// while one burning block heats its neighbour by a fifth of the difference.
+TP_I(sim, heatGain, NO_WGSL, 8, 1, 64)
+// The climate above the snowline (map terrain.treeline - 1), in heat units
+// (0 = water freezes). Must stay below 0 by day: the snow caps are worldgen's.
+// + a hand-written rule in LoadTuning
+TP_I(sim, heatSnowlineBase, NO_WGSL, -20, -64, 63)
+TP_I(sim, heatSnowlineSwing, NO_WGSL, 8, 0, 63)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900, 0, 1000)
 // Both of these are packed into bit fields in Particle.flags; an
 // out-of-range value would wrap into the neighbouring field rather than

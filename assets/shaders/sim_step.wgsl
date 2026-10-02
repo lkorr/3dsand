@@ -301,6 +301,83 @@ fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
 }
 // MIRROR-END solute
 
+// ---- THE TEMPERATURE LAYER (sim_heat.wgsl, src/sim/heat.h) ------------------
+// The CA READS the local excess X of a cell's block (heatPool, written by last
+// tick's heatRelax, so stable for the whole colour loop) and the climate
+// (heatParams); it WRITES only two things into heatMeta, both order-free: the
+// caMask rows raise a chunk's "an emitter is here" flag (an OR), and a fired
+// thermal transition bumps its kind's counter (an ADD). A thermal transition
+// is run by heatReact, below, after the material's reaction bucket.
+@group(0) @binding(50) var<storage, read_write> heatPool : array<u32>;
+@group(0) @binding(51) var<storage, read_write> heatMeta : array<atomic<u32>>;
+@group(0) @binding(52) var<storage, read> heatParams : array<u32>;
+
+// MIRROR-BEGIN heat
+// ---- THE TEMPERATURE LAYER'S SHARED ACCESSORS (src/sim/heat.h) --------------
+// ONE block, pasted verbatim into sim_heat.wgsl and sim_step.wgsl and held
+// identical by scripts/check_invariants.py `heat`, which also checks every
+// constant against heat.h. Not in common.wgsl: an edit there misses the SPIR-V
+// cache of every shader, and only these two agree on the layout.
+const HEAT_BLOCKS : u32 = 512u;
+const HEAT_PAGE_WORDS : u32 = 1536u;
+const HEAT_POOL_PAGES : u32 = 5120u;
+const HEAT_ENTRY_HAS : u32 = 0x80000000u;
+const HEAT_ENTRY_PAGE : u32 = 0x00FFFFFFu;
+const HM_MELTS : u32 = 18u;
+const HM_ENTRY : u32 = 128u;
+const HM_FLAGS : u32 = 32896u;
+const HF_EMIT : u32 = 1u;
+const HP_MODE : u32 = 0u;
+const HP_SNOWLINE_Y : u32 = 2u;
+const HP_SNOW_BASE : u32 = 3u;
+const HP_SNOW_SWING : u32 = 4u;
+const HP_BIOME : u32 = 32u;
+const HP_MAT : u32 = 160u;
+const HP_MAT_STRIDE : u32 = 8u;
+const HP_COL : u32 = 32928u;
+const HEAT_THR_BIAS : i32 = 512;
+const HEAT_KIND_FREEZE : u32 = 3u;
+const HEAT_SCALE_AIR : u32 = 2u;
+const HEAT_R2_EMIT_SHIFT : u32 = 12u;
+const HEAT_R2_INERTIA_SHIFT : u32 = 20u;
+const HEAT_R2_TRANS_SHIFT : u32 = 23u;
+
+// The block (2^3 voxels) of world cell c inside its chunk, 0..511.
+fn heatBlockOf(c : vec3<i32>) -> u32 {
+  let b = vec3<u32>(c & vec3<i32>(CHUNK_MASK)) >> vec3<u32>(1u);
+  return (b.z * 8u + b.y) * 8u + b.x;
+}
+// The AMBIENT at world cell c, heat units (0 = water freezes): the climate of
+// the biome of c's column (heatParams' window column table, filled by the CPU
+// from the same seeded map read worldgen uses), or the snowline's at and above
+// the snowline; base + swing by day, base - swing by night. Two-level ON
+// PURPOSE: it changes only on the tick daylight switches, which is the tick
+// SubmitTick already wakes the whole world on (docs/PLAN_temperature.md §5).
+fn heatAmbient(c : vec3<i32>) -> i32 {
+  var base : i32;
+  var swing : i32;
+  if (c.y >= bitcast<i32>(heatParams[HP_SNOWLINE_Y])) {
+    base = bitcast<i32>(heatParams[HP_SNOW_BASE]);
+    swing = bitcast<i32>(heatParams[HP_SNOW_SWING]);
+  } else {
+    let col = u32(c.x & i32(WORLD_MASK)) + u32(c.z & i32(WORLD_MASK)) * WORLD_N;
+    let biome = (heatParams[HP_COL + (col >> 2u)] >> ((col & 3u) * 8u)) & 0xFFu;
+    base = bitcast<i32>(heatParams[HP_BIOME + 2u * biome]);
+    swing = bitcast<i32>(heatParams[HP_BIOME + 2u * biome + 1u]);
+  }
+  return select(base - swing, base + swing, isDaytime(T.dayPhase));
+}
+// The local excess X at world cell c: 0 outside the window (tickets carry no
+// heat), in a chunk with no page, or with the layer off.
+fn heatX(c : vec3<i32>) -> u32 {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, T.origin)) { return 0u; }
+  let e = atomicLoad(&heatMeta[HM_ENTRY + chunkSlotIndex(wc)]);
+  if ((e & HEAT_ENTRY_HAS) == 0u) { return 0u; }
+  return heatPool[(e & HEAT_ENTRY_PAGE) * HEAT_PAGE_WORDS + heatBlockOf(c)] & 0xFFu;
+}
+// MIRROR-END heat
+
 fn markVoxActive(idx : u32) {
   if (T.vizActive != 0u && idx != PT_NO_WORD) {
     atomicOr(&actVoxViz[idx >> 5u], 1u << (idx & 31u));
@@ -2777,8 +2854,88 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       }
     }
   }
+  // ---- THERMAL TRANSITIONS (materials.json "thermal"), after the bucket ----
+  // Not for excited fluid (in motion; the seam owns it) and not in a ticket
+  // (no heat there). A transition that CAN fire holds the chunk awake: it
+  // consumes its input (snow -> water, wood -> ember, water -> ice), so the
+  // hold is bounded by the matter present -- the finite-process exception the
+  // light-gate note allows. One that cannot is inert and holds nothing.
+  if (!synthSelf && !gInTicket && ((m._r2 >> HEAT_R2_TRANS_SHIFT) & 3u) != 0u) {
+    let hr = heatReact(c, idx, slotIdx, w, mat, m, rnd, probe, stamp);
+    if (hr == 2u) { return true; }
+    if (hr == 1u) { keepAwake = true; }
+  }
   if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }
   return false;
+}
+
+// ---- THE THERMAL TRANSITIONS (docs/PLAN_temperature.md §6) -----------------
+// Up to two per material, packed by heat.cpp PackHeatMaterial into heatParams
+// at HP_MAT + mat * 8: [w0 thresholds|kind|scale|surface, w1 chance, w2
+// product|partial product]. The cell's actual temperature is T = ambient + X.
+//   melt / ignite fire when T > threshold, freeze when T < threshold; the
+//   chance ramps linearly from 0 at the threshold to `chance` at `full`.
+//   FRONTIER: a melt or a freeze needs a face that is not this material (a
+//   bank melts from its surface in, a pond skins from its banks); an ignition
+//   needs an AIR face. More such faces, faster: x (count + 2) / 8.
+//   SURFACE (freeze): only with air directly above -- once a column's top is
+//   ice the water under it has ice above and can never freeze, so ice is at
+//   most one cell thick per column: a lake skins over, never freezes solid.
+// Reads at distance 1 only (the lattice's read bound). Returns 0 inert,
+// 1 could fire (keep awake), 2 fired (self rewritten).
+const HEAT_ROLL_SALT : u32 = 0x7E3A1D5u;
+fn heatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32, m : Material,
+             rnd : u32, probe : bool, stamp : u32) -> u32 {
+  if (heatParams[HP_MODE] == 0u) { return 0u; }
+  if (!inWindow(c, T.origin)) { return 0u; }
+  let t = heatAmbient(c) + i32(heatX(c));
+  let n = min((m._r2 >> HEAT_R2_TRANS_SHIFT) & 3u, 2u);
+  var awake = 0u;
+  for (var k = 0u; k < n; k++) {
+    let at = HP_MAT + mat * HP_MAT_STRIDE + 3u * k;
+    let w0 = heatParams[at];
+    let kind = (w0 >> 20u) & 3u;
+    let thr = i32(w0 & 1023u) - HEAT_THR_BIAS;
+    let full = i32((w0 >> 10u) & 1023u) - HEAT_THR_BIAS;
+    var num = 0;
+    var den = 1;
+    if (kind == HEAT_KIND_FREEZE) {
+      if (t >= thr) { continue; }
+      num = min(thr - t, thr - full);
+      den = max(thr - full, 1);
+    } else {
+      if (t <= thr) { continue; }
+      num = min(t - thr, full - thr);
+      den = max(full - thr, 1);
+    }
+    if (((w0 >> 24u) & 1u) != 0u) {
+      let up = c + vec3<i32>(0, 1, 0);
+      if (!inBounds(up) || voxMat(voxWordAt(up)) != MAT_AIR) { continue; }
+    }
+    let air = ((w0 >> 22u) & 3u) == HEAT_SCALE_AIR;
+    var faces = 0u;
+    for (var f = 0u; f < 6u; f++) {
+      let nb = c + faceDir(f);
+      if (!inBounds(nb)) { continue; }
+      let nm = voxMat(voxWordAt(nb));
+      if (select(nm != mat, nm == MAT_AIR, air)) { faces++; }
+    }
+    if (faces == 0u) { continue; }
+    let chance = (heatParams[at + 1u] / u32(den)) * u32(num) * (faces + 2u) / 8u;
+    if (chance == 0u) { continue; }
+    awake = 1u;
+    if (probe) { continue; }
+    let rr = hash3(rnd ^ HEAT_ROLL_SALT, k, slotIdx);  // SLOT index keys the dice
+    if ((rr % REACT_CHANCE_DEN) >= chance) { continue; }
+    let w2 = heatParams[at + 2u];
+    var prod = w2 & 0xFFFu;
+    let alt = (w2 >> 12u) & 0xFFFu;
+    if (alt != 0u && cellEighths(w) != 0u && cellEighths(w) < 8u) { prod = alt; }
+    atomicAdd(&heatMeta[HM_MELTS + kind - 1u], 1u);
+    reactWriteSelf(c, idx, false, m.klass, prod, rnd, stamp);
+    return 2u;
+  }
+  return awake;
 }
 
 // ---- staining (DESIGN.md §6) ------------------------------------------------
@@ -4063,6 +4220,7 @@ fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
 // of the voxels (rule 1) whatever the schedule. A sentinel page is uniform:
 // all air or all matter, no voxel read.
 var<workgroup> wgCaMask : array<atomic<u32>, 384>;   // 3 planes x CA_MASK_WORDS
+var<workgroup> wgCaEmit : atomic<u32>;
 
 @compute @workgroup_size(256)
 fn camask(@builtin(workgroup_id) wg : vec3<u32>,
@@ -4073,6 +4231,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // flow, and a storage load is not uniform to the compiler.
   let sentinel = (e & PT_SENTINEL_BIT) != 0u;
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) { atomicStore(&wgCaMask[k], 0u); }
+  if (li == 0u) { atomicStore(&wgCaEmit, 0u); }
   workgroupBarrier();
   if (!sentinel) {
     let base = e * CHUNK_VOL;
@@ -4082,6 +4241,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
         let bit = 1u << (i & 31u);
         atomicOr(&wgCaMask[i >> 5u], bit);
         let m = materials[mat];
+        if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { atomicOr(&wgCaEmit, 1u); }
         if (m.klass == CLASS_GAS) {
           atomicOr(&wgCaMask[CA_MASK_WORDS + (i >> 5u)], bit);
         } else if (m.klass == CLASS_SOLID && !matCanAct(m)) {
@@ -4091,6 +4251,16 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     }
   }
   workgroupBarrier();
+  // THE TEMPERATURE LAYER'S DOORBELL: this chunk holds something hot, so
+  // heatWant (after the CA) pages it and its 3x3x3. Window slots only -- heat
+  // does not run in a ticket. A sentinel chunk's one material is tested here.
+  if (li == 0u && ci < NUM_CHUNKS) {
+    var hot = atomicLoad(&wgCaEmit) != 0u;
+    if (sentinel) {
+      hot = ((materials[e & PT_MAT_MASK]._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u;
+    }
+    if (hot) { atomicOr(&heatMeta[HM_FLAGS + ci], HF_EMIT); }
+  }
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) {
     var word = atomicLoad(&wgCaMask[k]);
     if (sentinel) {

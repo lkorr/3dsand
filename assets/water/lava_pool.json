@@ -42,8 +42,7 @@
   },
   "fill": {
     "material": "lava",
-    "level": -0.4,
-    "surfaceMaterial": ""
+    "level": -0.4
   },
   "berm": {
     "height": 0.6,

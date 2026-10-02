@@ -24,6 +24,7 @@
 #include "measure/perfscope.h"
 #include "sim/celestial.h"
 #include "sim/farfield.h"
+#include "sim/heat.h"
 #include "sim/materials.h"
 #include "sim/microvox.h"
 #include "sim/pagetable.h"
@@ -4116,6 +4117,19 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
     if (!opt.only.empty() && opt.only != sc.id) continue;
     std::printf("\n[%s] %s\n", sc.id, sc.label);
     runs.push_back(runner.Record(sc));
+    // THE TEMPERATURE LAYER's pool high-water mark over this scenario (the
+    // header is zeroed by the scenario's own worldgen): what kHeatPoolPages
+    // is sized against (heat.h), and the refusals it must not have.
+    {
+      ctx.WaitIdle();
+      uint32_t hdr[kHeatSnapWords] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.heatMeta, 0, hdr, sizeof(hdr),
+                            "perfHeatHdr");
+      std::printf("[%s] heat: pool peak %u of %u pages, refused %u, ignitions %u, melts %u, "
+                  "source-list peak %u, recompute peak %u, relax peak %u\n",
+                  sc.id, hdr[kHmPagesPeak], kHeatPoolPages, hdr[kHmRefused], hdr[kHmIgnites],
+                  hdr[kHmMelts], hdr[kHmSrcPeak], hdr[kHmRecompPeak], hdr[kHmRelaxPeak]);
+    }
   }
   if (runs.empty()) {
     std::fprintf(stderr, "--perf: no scenario matched '%s'\n", opt.only.c_str());

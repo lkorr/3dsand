@@ -3,6 +3,10 @@
   "displayName": "Pine highland",
   "index": 2,
   "climate": {
+    "ambient": {
+      "base": 8,
+      "swing": 6
+    },
     "temperature": 0.3,
     "moisture": 0.55,
     "notes": "Biome noise between pineThreshold and desertThreshold."

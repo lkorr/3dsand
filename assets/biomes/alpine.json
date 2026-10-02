@@ -3,6 +3,10 @@
   "displayName": "Alpine",
   "index": 6,
   "climate": {
+    "ambient": {
+      "base": 10,
+      "swing": 8
+    },
     "temperature": 0.2,
     "moisture": 0.45,
     "notes": "Bare rock and scree above the treeline: a thin biome for the cover; the LANDFORM plane paints the relief."

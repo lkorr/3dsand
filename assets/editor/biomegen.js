@@ -87,6 +87,11 @@ export function defaultBiome() {
     climate: {
       temperature: 0.5,              // 0 cold .. 1 hot   (future climate grid)
       moisture: 0.5,                 // 0 arid .. 1 wet
+      // THE CLIMATE THE SIM READS (docs/PLAN_temperature.md §5): heat units,
+      // 0 = water freezes; day = base + swing, night = base - swing. The
+      // loader refuses a range that straddles 0, a day that reaches any
+      // ignition point, or a day that melts something this biome generates.
+      ambient: {base: 10, swing: 0},
       notes: ''
     },
     terrain: {

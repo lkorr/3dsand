@@ -81,6 +81,7 @@
 #include "phys/physics.h"
 #include "sim/farfield.h"
 #include "sim/celestial.h"
+#include "sim/heat.h"
 #include "sim/materials.h"
 #include "sim/solutes.h"
 #include "sim/oprecord.h"  // the op record carries the tick command (N2/N3)
@@ -14925,6 +14926,43 @@ int main(int argc, char** argv) {
             CurrentTuning(), world.WorldSeed(), tick, DayPhaseNow(tick), o3,
             (int32_t)std::floor(player.pos.x), (int32_t)std::floor(player.pos.y) + 15,
             (int32_t)std::floor(player.pos.z));
+        // ---- the temperature readout (docs/PLAN_temperature.md) ----
+        {
+          const int hx = (int)std::floor(player.pos.x), hy = (int)std::floor(player.pos.y),
+                    hz = (int)std::floor(player.pos.z);
+          sim.SetHeatProbe(true, hx, hy, hz);
+          UIState::HeatReadout& hr = ui.heat;
+          const bool day = DaylightStrengthCpu(DayPhaseNow(tick)) > 0;
+          hr.valid = true;
+          hr.day = day;
+          hr.snowline = hy >= HeatSnowlineY();
+          const uint32_t bi = World::MapBiomeAt(hx, hz, world.WorldSeed());
+          const HeatClimate cl = hr.snowline ? HeatSnowlineClimate() : HeatBiomeClimate(bi);
+          const std::vector<std::string>& pal = worldmap::CurrentWorldMap().palette;
+          hr.biome = hr.snowline ? std::string("snowline")
+                                 : (bi < pal.size() ? pal[bi] : std::to_string(bi));
+          hr.base = cl.base;
+          hr.swing = cl.swing;
+          hr.ambient = HeatAmbientCpu(hx, hy, hz, world.WorldSeed(), day);
+          const WorldSnapshot& hs = world.Snap();
+          if (hs.valid) {
+            const uint32_t px = hs.heat[kHmProbeX], pe = hs.heat[kHmProbeE];
+            hr.paged = (px & 0x10000u) != 0;
+            hr.x = (int)(px & 0xFFu);
+            hr.xTarget = (int)((px >> 8) & 0xFFu);
+            hr.emit = (int)(pe & 0xFFu);
+            hr.emitters = (int)((pe >> 8) & 0xFu);
+            hr.pages = hs.heat[kHmNextFresh] - hs.heat[kHmFreeTop];
+            hr.pagesPeak = hs.heat[kHmPagesPeak];
+            hr.pool = kHeatPoolPages;
+            hr.refused = hs.heat[kHmRefused];
+            hr.melts = hs.heat[kHmMelts];
+            hr.ignites = hs.heat[kHmIgnites];
+            hr.freezes = hs.heat[kHmFreezes];
+            hr.relaxChunks = hs.heat[kHmLastRelax];
+            hr.recompChunks = hs.heat[kHmLastRecomp];
+          }
+        }
         UIState::WindReadout& wr = ui.wind;
         const float toMs = (float)kVoxelMeters / 65536.0f;
         wr.valid = true;

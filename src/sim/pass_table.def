@@ -273,6 +273,23 @@ PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMP
 PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(ArgsStage) TW(DispatchArgs)))
 
+// ---- phase 2c: THE TEMPERATURE LAYER, BEFORE THE CA (src/sim/heat.h) --------
+// heatBegin (one thread) resets the tick's list counts, notes a day/night flip
+// and arms heatShift's record only if the window origin moved since the last
+// CA tick (or the layer was switched off with pages out); heatShift then
+// releases every page whose owner is no longer its slot's occupant, so the CA
+// never reads a departed chunk's heat as the new one's. Zero groups on every
+// other tick. C_CAACTIVE: a settled world records none of the heat rows.
+// The copy is heatMeta[kHmArgs..] (byte 128, 80 bytes) -> heatArgs.
+PASS(heatBegin, "heat(begin+shift)", PT_TICK, PIPE_HEAT_BEGIN, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) A(HeatMeta) R(HeatParams)))
+PASS(copy_heatArgs0, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(HeatMeta) TW(HeatArgs)))
+PASS(heatShift, "heat(begin+shift)", PT_TICK, PIPE_HEAT_SHIFT, K_INDIRECT, IND_HEATARGS,64,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) I(HeatArgs) RW(HeatPool) A(HeatMeta) R(HeatParams) R(PageTable)))
+
 // ---- phase 2a: THE SOLUTE LAYER'S PAGES (docs/PLAN_solutes.md, world.h kSol*)
 //
 // A kernel cannot allocate, and unlike the voxel page table the CPU cannot
@@ -486,7 +503,7 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 // writes it; `camask` only asks whether a cell holds matter.
 PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) R(Draft) W(CaWind) R(Materials)))
+          U(TickUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta)))
 // read-only in practice: `reposeSnap` and `caMask` are read_write for the
 // module because `reposesnap` / `camask` write them; `main` only reads both.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 27,
@@ -495,11 +512,11 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
-          R(ArgsStage) R(CaWind)))
+          R(ArgsStage) R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams)))
 // read-only in practice: `voxels`, as for caMask above.
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) R(Draft) W(CaWind) R(Materials)))
+          U(TickUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta)))
 // read-only in practice: `reposeSnap` and `caMask`, as for ca above.
 PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 27,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
@@ -507,7 +524,7 @@ PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCH
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
-          R(ArgsStage) R(CaWind)))
+          R(ArgsStage) R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //
@@ -542,6 +559,60 @@ PASS(solCompact, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_COMPACT, K_INDIREC
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(Materials) I(SolArgs) R(Voxels) R(PageTable)
           RW(SolTable) A(SolPool) A(SolMeta) R(SolSpec)))
+
+// ---- phase 3a2: THE TEMPERATURE LAYER AFTER THE CA (src/sim/heat.h) ---------
+// docs/PLAN_temperature.md. Over the CA's own dirty list:
+//   heatWant   paged dirty chunks -> the source list; an emitting chunk (caMask
+//              raised HF_EMIT, or its last scan found a source) wants a page
+//              for every unpaged window chunk of its 3x3x3
+//   heatAlloc  ONE workgroup: wanted slots ranked in slot order get pages
+//   heatSrc    the source list re-reads its voxels; a change queues a target
+//              recompute over its 3x3x3
+//   heatTent   x, y, z passes of the separable tent (DYN_CA: iteration k is
+//              axis k; the recorder's per-iteration barrier orders them)
+//   heatRelax  X steps toward X*; marks moving chunks dirty; frees zero pages
+// heatArgs (one thread) turns the list counts into the indirect records after
+// each list grows, and the copy rows stage them (heatMeta byte 128, 80 B ->
+// heatArgs); each indirect row reads ITS record at the row's y offset.
+// Every pass writes only its own chunk's page; neighbours are read from the
+// previous dispatch. No voxel is written here.
+PASS(heatWant, "heat", PT_TICK, PIPE_HEAT_WANT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(DirtyList) I(DispatchArgs) A(HeatMeta) R(HeatParams) R(PageTable)))
+PASS(heatArgs1, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(A(HeatMeta)))
+PASS(copy_heatArgs1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(HeatMeta) TW(HeatArgs)))
+PASS(heatAlloc, "heat", PT_TICK, PIPE_HEAT_ALLOC, K_INDIRECT, IND_HEATARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) I(HeatArgs) A(HeatMeta) R(PageTable)))
+PASS(heatArgs2, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(A(HeatMeta)))
+PASS(copy_heatArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(HeatMeta) TW(HeatArgs)))
+// read-only in practice: `voxels` is declared read for this module.
+PASS(heatSrc, "heat", PT_TICK, PIPE_HEAT_SRC, K_INDIRECT, IND_HEATARGS,16,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) I(HeatArgs) RW(HeatPool) A(HeatMeta)))
+PASS(heatArgs3, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(A(HeatMeta)))
+PASS(copy_heatArgs3, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(HeatMeta) TW(HeatArgs)))
+PASS(heatTent, "heat", PT_TICK, PIPE_HEAT_TENT, K_INDIRECT, IND_HEATARGS,32,0,
+     GRP_SIM, DYN_CA, C_CAACTIVE, 3,
+     USES(U(TickUBO) U(PassUBO) I(HeatArgs) RW(HeatPool) A(HeatMeta) R(HeatParams) R(PageTable)))
+PASS(heatArgs4, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(A(HeatMeta)))
+PASS(copy_heatArgs4, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(HeatMeta) TW(HeatArgs)))
+PASS(heatRelax, "heat", PT_TICK, PIPE_HEAT_RELAX, K_INDIRECT, IND_HEATARGS,48,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(DirtyIn) I(HeatArgs) RW(HeatPool) A(HeatMeta) R(HeatParams) A(DirtyOut)
+          R(PageTable)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //
@@ -1047,6 +1118,12 @@ PASS(wg_fill_hash, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN
 // full occupancy pass after it does.
 PASS(wg_fill_chunkHash, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(ChunkHash)))
+// The temperature layer does not survive a regen (src/sim/heat.h): all zero is
+// an empty layer -- no page out, every page on the (implicit) fresh run.
+PASS(wg_fill_heatMeta, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(HeatMeta)))
+PASS(wg_fill_heatPool, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(HeatPool)))
 PASS(wg_fill_support, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Support)))
 PASS(wg_fill_pCounts, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
@@ -1175,6 +1252,14 @@ PASS(lr_fill_fluidBlockMap, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP
      USES(TW(FluidBlockMap)))
 PASS(lr_fill_drawArgs, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(DrawArgs)))
+// A loaded world starts with an EMPTY temperature layer (heat is not saved):
+// the loader's refill wakes every restored chunk that holds matter, caMask
+// finds their emitters on the first CA tick, and heatWant pages them
+// (docs/PLAN_temperature.md §9).
+PASS(lr_fill_heatMeta, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(HeatMeta)))
+PASS(lr_fill_heatPool, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(HeatPool)))
 // The openness grid's per-slot STAMPS (world.h kOpenFaces). A load replaces
 // every chunk in the window, so every slot's 384 bytes now describe a world
 // that is gone. Zeroing the stamps is what makes the reader treat them as

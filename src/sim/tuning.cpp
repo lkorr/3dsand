@@ -392,6 +392,20 @@ bool LoadTuning(const std::string& path, Tuning& out) {
   // what a row cannot say.
   ReadDefRows(j, out);
 
+  {
+    // HAND-WRITTEN (sim.heatSnowline*): the snowline climate must be frozen
+    // by DAY too, or the snow caps worldgen lays above the treeline would melt
+    // at the first dawn and water there would freeze and thaw daily
+    // (docs/PLAN_temperature.md §5: no climate may straddle the freeze point).
+    auto& s = out.sim;
+    if (s.heatSnowlineBase + s.heatSnowlineSwing >= 0) {
+      out.warnings.push_back(
+          "sim.heatSnowlineBase + heatSnowlineSwing must stay below 0 (the snow "
+          "caps are frozen by day too); base lowered");
+      s.heatSnowlineBase = -1 - s.heatSnowlineSwing;
+    }
+  }
+
   if (const json* g = Find(j, "thirdPerson")) {
     // HAND-WRITTEN: the rules a tuning_params.def row cannot state (a
     // bound that depends on another field, a reset-to-default, an enum

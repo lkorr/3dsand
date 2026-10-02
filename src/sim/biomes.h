@@ -34,6 +34,8 @@
 #include <string>
 #include <vector>
 
+#include "sim/heat.h"
+
 #include "sim/materials.h"
 
 namespace biomes {
@@ -99,6 +101,14 @@ struct BiomeDef {
   std::string name, displayName;
   int index = -1;                        // worldgen id, -1 = not an engine biome
   float temperature = 0.5f, moisture = 0.5f;
+  // THE CLIMATE THE SIM READS (climate.ambient, docs/PLAN_temperature.md §5):
+  // heat units, 0 = water freezes; day = base + swing, night = base - swing.
+  // LoadBiomeSet REFUSES a biome whose range straddles a freeze point, whose
+  // day reaches any ignition point, or whose day melts something it
+  // generates. `frozen` (derived): water freezes here by day and night, so
+  // worldgen ices every water surface (worldmap.h kBF_Frozen).
+  HeatClimate ambient;
+  bool frozen = false;
   std::string skin, subsoil;
   uint32_t skinId = 0, subsoilId = 0;
   // The SOLID the loose part of this biome's cover becomes where the ground is

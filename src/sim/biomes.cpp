@@ -131,6 +131,11 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     const json& cl = Sub(j, "climate");
     b.temperature = Get<float>(cl, "temperature", 0.5f);
     b.moisture = Get<float>(cl, "moisture", 0.5f);
+    {
+      const json& am = Sub(cl, "ambient");
+      b.ambient.base = std::clamp(Get<int>(am, "base", 10), -64, 63);
+      b.ambient.swing = std::clamp(Get<int>(am, "swing", 0), 0, 63);
+    }
     const json& cv = Sub(j, "cover");
     b.skin = GetS(cv, "skin", "grass");
     b.subsoil = GetS(cv, "subsoil", "dirt");
@@ -241,7 +246,7 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
       w.materials.push_back(n);
       if (!matId(n)) w.unresolved.push_back(n);
     };
-    add(w.fill); add(GetS(fi, "surfaceMaterial"));
+    add(w.fill);
     const json& bd = Sub(j, "bed");
     add(GetS(bd, "shallow")); add(GetS(bd, "deep")); add(GetS(bd, "substrate"));
     const json& gr = Sub(j, "ground");
@@ -318,6 +323,74 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     band(Sub(aq, "floating"), w.floating);
     band(Sub(aq, "submerged"), w.submerged);
     out.water.push_back(std::move(w));
+  }
+
+  // ---- THE CLIMATE CHECKS (docs/PLAN_temperature.md §5) -----------------------
+  // Refuse, do not clamp: each of these is a world that would wake itself at
+  // every dawn or burn itself down, and a number nudged quietly would hide it.
+  {
+    int minIgnite = 1 << 20;
+    for (const MaterialDef& m : mats)
+      for (const HeatTransition& h : m.thermal.transitions)
+        if (h.kind == kHeatKindIgnite) minIgnite = std::min(minIgnite, h.threshold);
+    auto meltAbove = [&](uint32_t id, int& out) {
+      if (id == 0 || id >= mats.size()) return false;
+      for (const HeatTransition& h : mats[id].thermal.transitions)
+        if (h.kind == kHeatKindMelt) { out = h.threshold; return true; }
+      return false;
+    };
+    std::unordered_map<std::string, const WaterPresetDef*> presets;
+    for (const WaterPresetDef& w : out.water) presets[w.name] = &w;
+    for (BiomeDef& b : out.biomes) {
+      const int day = b.ambient.Day(), night = b.ambient.Night();
+      const std::string at = "heat: biome '" + b.name + "' (day " + std::to_string(day) +
+                             ", night " + std::to_string(night) + "): ";
+      // 1. no climate straddles a freeze point: frozen day and night, or never.
+      bool frozen = false, straddles = false;
+      for (const MaterialDef& m : mats)
+        for (const HeatTransition& h : m.thermal.transitions) {
+          if (h.kind != kHeatKindFreeze) continue;
+          if (night < h.threshold && day >= h.threshold) straddles = true;
+          if (day < h.threshold) frozen = true;
+        }
+      if (straddles) {
+        log += at + "freezes at night and thaws by day -- every pond would wake at every "
+                    "dusk; make the night warmer or the day colder\n";
+        ok = false;
+      }
+      b.frozen = frozen && !straddles;
+      // 2. no climate lights anything.
+      if (day >= minIgnite) {
+        log += at + "the day reaches an ignition point (" + std::to_string(minIgnite) + ")\n";
+        ok = false;
+      }
+      // 3. no climate melts what it generates.
+      std::vector<std::pair<std::string, uint32_t>> gen = {{b.skin, b.skinId},
+                                                           {b.subsoil, b.subsoilId},
+                                                           {b.firmSkin, b.firmSkinId}};
+      for (const CoverRow& c : b.cover) {
+        gen.push_back({c.material, c.materialId});
+        gen.push_back({c.head, c.headId});
+      }
+      for (const WaterRow& r : b.water) {
+        auto it = presets.find(r.preset);
+        if (it == presets.end()) continue;
+        for (const std::string& n : it->second->materials) {
+          uint32_t id = 0;
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == n) { id = static_cast<uint32_t>(i); break; }
+          gen.push_back({n, id});
+        }
+      }
+      for (const auto& [name, id] : gen) {
+        int above = 0;
+        if (meltAbove(id, above) && day > above) {
+          log += at + "generates '" + name + "', which melts above " + std::to_string(above) +
+                 " -- the biome would melt its own landscape at the first dawn\n";
+          ok = false;
+        }
+      }
+    }
   }
 
   // ---- species mirrors ----------------------------------------------------------------

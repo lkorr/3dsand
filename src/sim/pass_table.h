@@ -292,6 +292,15 @@ enum class Buf : uint8_t {
   // The ambient wind per 4^3 block of every dirty chunk (sim_step.wgsl
   // caWind), binding 49: written by the caMask rows, read by the colours.
   CaWind,
+  // ---- the temperature layer (src/sim/heat.h, sim_heat.wgsl), 50..52 ----
+  // HeatPool and HeatMeta are GPU-owned (the CA reads both: X from the pool,
+  // and raises flags / counters in the meta); HeatParams is CPU-written
+  // (Simulation::PrepareHeat / UploadTables). HeatArgs is indirect-only and
+  // never bound, like SolArgs.
+  HeatPool,
+  HeatMeta,
+  HeatParams,
+  HeatArgs,
   kCount,
 };
 
@@ -411,6 +420,9 @@ enum class Pipe : uint8_t {
   // bound stated above.
   DraftMaskAll, DraftMaskDirty, DraftArgsP, DraftCoarseBuild, DraftCoarseFaces,
   DraftCoarseSolve, DraftFineFirst, DraftFineMid, DraftFineMid2, DraftFineLast,
+  // The temperature layer (sim_heat.wgsl). BEFORE ShadowResolve for the copy
+  // loop's bound stated above.
+  HeatBegin, HeatShift, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatTent, HeatRelax,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.
@@ -715,6 +727,7 @@ enum class DispatchSel : uint32_t {
   StreakGx,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
   IndDraftArgs,      // indirect: draftArgs @ the row's y (one 16-byte record per solve stage)
+  IndHeatArgs,       // indirect: heatArgs @ the row's y (heat.h kHeatArg*: one 16-byte record per list)
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile
@@ -731,7 +744,9 @@ enum class DispatchSel : uint32_t {
 // page-table note above gives.
 // Raised 24 -> 28 by the wind drafts: `ca` gains R(Draft) -> 25 uses.
 // `ca` gains R(CaMask) -> 26 uses (2026-10-01).
-inline constexpr int kMaxUses = 28;
+// Raised 28 -> 32 by the temperature layer: `ca` gains R(HeatPool)
+// A(HeatMeta) R(HeatParams) -> 29 uses.
+inline constexpr int kMaxUses = 32;
 
 struct Row {
   const char* name;

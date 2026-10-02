@@ -1622,6 +1622,37 @@ void Overlay::DrawDevWorld(UIState& s) {
   // visuals. Every knob here is CPU-side (it rides the wf* block or
   // RenderParams) and applies on the next tick with no F5, EXCEPT the ones
   // marked (F5), which are compiled into the shaders.
+  // ---- the temperature layer (docs/PLAN_temperature.md) ----
+  // Ambient, target and actual, separately: T = ambient + X, and X walks
+  // toward its target X* at the block's inertia.
+  if (Section("Temperature")) {
+    const UIState::HeatReadout& h = s.heat;
+    if (h.valid) {
+      ImGui::Text("%s  %s  ambient %+d  (base %+d, %s %+d)", h.biome.c_str(),
+                  h.day ? "day" : "night", h.ambient, h.base, h.day ? "day" : "night",
+                  h.day ? h.swing : -h.swing);
+      ImGui::SetItemTooltip("The climate of the column you stand in (assets/biomes/<name>.json\n"
+                            "climate.ambient), or the snowline's above the treeline. Heat units:\n"
+                            "0 is the freezing point of water. Switches on the daylight tick.");
+      if (h.paged) {
+        ImGui::Text("local heat: target %+d  actual %+d  ->  T %+d", h.xTarget, h.x,
+                    h.ambient + h.x);
+        ImGui::Text("sources in your block: emit %d x %d cells", h.emit, h.emitters);
+      } else {
+        ImGui::TextDisabled("local heat: none (no page here)  ->  T %+d", h.ambient);
+      }
+      ImGui::SetItemTooltip("The local excess X over the ambient in the 2x2x2 block at your feet, and\n"
+                            "its target X*: the coverage-weighted mix of every heat source within\n"
+                            "sim.heatRadius blocks. X walks to X* over a few ticks (inertia).");
+      ImGui::TextDisabled("pages %u / %u (peak %u, refused %u)  relax %u  recompute %u",
+                          h.pages, h.pool, h.pagesPeak, h.refused, h.relaxChunks, h.recompChunks);
+      ImGui::TextDisabled("melts %u  ignitions %u  freezes %u (since the world loaded)", h.melts,
+                          h.ignites, h.freezes);
+    } else {
+      ImGui::TextDisabled("no readout yet");
+    }
+  }
+
   if (Section("Wind & weather")) {
     Tuning t = CurrentTuning();
     Tuning::Wind& w = t.wind;

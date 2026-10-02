@@ -153,8 +153,9 @@ export function defaultParams() {
     },
     fill: {
       material: 'water',           // '' or 'none' for a dry basin
-      level: 0.0,                  // metres relative to the rim ground; negative = part-full
-      surfaceMaterial: ''          // optional skin ON the surface (e.g. ice); '' = none
+      level: 0.0                   // metres relative to the rim ground; negative = part-full
+      // (no surface skin: ice on a frozen body is the CLIMATE's -- worldgen
+      // ices every water surface in a frozen biome, docs/PLAN_temperature.md §8)
     },
     berm: {
       height: 0.5,                 // forced lift of the bank above the waterline
@@ -393,7 +394,7 @@ export function paletteOf(P, names, idx) {
     return i;
   };
   const M = {
-    fill: nameId(P.fill.material), surfSkin: nameId(P.fill.surfaceMaterial),
+    fill: nameId(P.fill.material), surfSkin: 0,
     bedShallow: nameId(P.bed.shallow), bedDeep: nameId(P.bed.deep),
     substrate: nameId(P.bed.substrate), skin: nameId(P.ground.skin),
     soil: nameId(P.ground.soil), rock: nameId(P.ground.rock),

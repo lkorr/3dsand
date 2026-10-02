@@ -160,6 +160,19 @@ struct UIState {
   // Filled by the frame loop from windfield::Probe — the C++ mirror of the
   // sim's windAtQ — at the player's head, so "what is the wind here, and
   // why" has numbers: the regime, the ramp's pieces, the terms. Readout only.
+  // THE TEMPERATURE AT YOUR FEET (docs/PLAN_temperature.md), filled by the
+  // frame loop: the ambient the CPU computes the way the shader does
+  // (HeatAmbientCpu), and the local field's target and actual excess from the
+  // snapshot's probe words (the block under the feet, heatRelax). Readout only.
+  struct HeatReadout {
+    bool valid = false;
+    std::string biome;
+    int base = 0, swing = 0, ambient = 0;
+    bool day = true, snowline = false, paged = false;
+    int x = 0, xTarget = 0, emit = 0, emitters = 0;
+    uint32_t pages = 0, pagesPeak = 0, pool = 0, refused = 0;
+    uint32_t melts = 0, ignites = 0, freezes = 0, relaxChunks = 0, recompChunks = 0;
+  } heat;
   struct WindReadout {
     bool valid = false;
     int source = 0;

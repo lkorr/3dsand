@@ -710,6 +710,11 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
           case pass::DispatchSel::IndSolArgs:
             args = bind_.buffers[(int)pass::Buf::SolArgs];
             break;
+          case pass::DispatchSel::IndHeatArgs:
+            // Five list records in one buffer (heat.h kHeatArg*); y = byte offset.
+            args = bind_.buffers[(int)pass::Buf::HeatArgs];
+            argsOff = r.y;
+            break;
           case pass::DispatchSel::IndDraftArgs:
             // Six stage records in one buffer; the row's y is its byte offset.
             args = bind_.buffers[(int)pass::Buf::DraftArgs];

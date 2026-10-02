@@ -1,12 +1,46 @@
 # PLAN: the temperature layer — heat, melting, ignition, climate, freezing
 
-Status: PLAN, 2026-10-02, **revision 3**. Not implemented. Branch
+Status: **IMPLEMENTED 2026-10-02** (revision 3 + the deltas in the first section). Branch
 `worktree-agent-aa9fa70a928a593d7` (fast-forwarded to main 6c55214).
 Revision 3 folds in the owner's decisions: temperature changes GRADUALLY toward
 a capped target (several sources add up, bounded radius), per-biome ambient with
 a day/night swing, and FREEZING in scope (surface-limited, rate-bounded, with a
 load-time validation that no biome straddles the freeze point and worldgen that
 pre-ices permanently frozen water).
+
+## IMPLEMENTED (2026-10-02) -- what changed from revision 3 below
+
+The orchestrator approved revision 3 with these decisions, and the build
+differs from the text below where listed. DESIGN.md §4 "Heat" is the
+description of record for what shipped.
+
+- **Authoring: materials.json `thermal` is the ONE surface.** There is no
+  rule-level `heat` condition and no RCOND_HEAT bit: the transitions are run
+  by `heatReact` (sim_step.wgsl) after the material's reaction bucket, from a
+  per-material table in heatParams, so no CPU rule evaluator ever sees them.
+  The four dead sun/night rules and `fill.surfaceMaterial` are deleted.
+- **The target**: the tent filter carries the coverage-weighted emitter sum and
+  the coverage; `T* = A + min(1, G x sf) x (mean E - A)` with `G =
+  sim.heatGain` (8). A plain coverage mean made a lava pool's face reach only
+  ~40% of its temperature a block away; the saturating gain lets big sources
+  reach their own temperature a few blocks out while a lone burning voxel
+  barely warms its neighbour. Still a convex combination: the ceiling holds.
+- **Ignition tiers** in the shipped data: oil 100, foliage / grass / plants /
+  thatch / straw / dust 135, cloth 135, wood family 150 (all `above`); emit
+  fire 110, burning foliage / cloth / flesh 130, ember 140, oil_burning 150,
+  molten 200-230. Melt snow 0, ice 4; freeze water below 0.
+- **Pool**: 5,120 pages (30 MiB), > 2x the worst measured peak (village-fire
+  2,278; forestfire 1,704). heat-bound fails on any refusal.
+- **Persistence**: not saved; every resident chunk with matter is WOKEN by its
+  fill (genChunk's act set, the store-hit RefilledSlot path), caMask finds its
+  emitters and heatWant pages it -- one path for load, streaming and peers.
+  heat-ignite saves and loads lava beside wood and asserts the wood still
+  lights within the bound (it did: tick 20 after the load).
+- **Dirty bound**: heatRelax marks a chunk only when a chunk of its 3x3x3 is
+  dirty this tick, the CPU page-table mirror's one-ring bound.
+- **Gates** use climate PINS (Simulation::SetHeatColumnPins), CA-only water
+  (fluidExciteMode 0) for exact mass audits, and run melt / ignite / freeze
+  twice comparing cells AND a slot-keyed hash of the heat pool.
 
 **Scope**
 1. Snow and ice melt into water when made hot — by a local source, or by a warm

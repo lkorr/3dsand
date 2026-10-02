@@ -492,6 +492,72 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
 // the SUBSTRATE (grass, sand, dirt) rather than on the liquid — see the absorb
 // note in materials.h for why the ceiling and the per-contact step are separate
 // axes. Absent = never absorbs, which is every material that predates this.
+// ---- THE TEMPERATURE LAYER: materials.json "thermal" (docs/PLAN_temperature.md)
+// Names (`into`, `partialInto`) are resolved in LoadAssets once the whole table
+// exists (forward references). Thresholds are heat units, 0 = water freezes.
+static void ParseThermal(const json& m, const std::string& path, MaterialDef& d,
+                         std::string& errors) {
+  d.thermal = ThermalDef{};
+  if (!m.contains("thermal")) return;
+  const json& t = m["thermal"];
+  const std::string at = path + ": material \"" + d.name + "\": thermal";
+  if (!t.is_object()) {
+    errors += at + " must be an object\n";
+    return;
+  }
+  const int emit = t.value("emit", 0);
+  if (emit < 0 || emit > 255) errors += at + ".emit must be 0..255\n";
+  d.thermal.emit = (uint32_t)std::clamp(emit, 0, 255);
+  if (t.contains("inertia")) {
+    const int k = t.value("inertia", 3);
+    if (k < 0 || k > 7) errors += at + ".inertia must be 0..7\n";
+    d.thermal.inertia = std::clamp(k, 0, 7);
+  }
+  struct Key { const char* name; uint32_t kind; const char* thr; };
+  const Key keys[] = {{"melt", kHeatKindMelt, "above"},
+                      {"ignite", kHeatKindIgnite, "above"},
+                      {"freeze", kHeatKindFreeze, "below"}};
+  for (const Key& k : keys) {
+    if (!t.contains(k.name)) continue;
+    const json& r = t[k.name];
+    const std::string rat = at + "." + k.name;
+    if (!r.is_object() || !r.contains(k.thr) || !r.contains("full") ||
+        !r.contains("into") || !r["into"].is_string()) {
+      errors += rat + " needs \"" + k.thr + "\", \"full\" and \"into\"\n";
+      continue;
+    }
+    HeatTransition h;
+    h.kind = k.kind;
+    h.threshold = r.value(k.thr, 0);
+    h.full = r.value("full", 0);
+    h.chanceMille = r.value("chance", 10.0);
+    h.into = r["into"].get<std::string>();
+    h.partialInto = r.value("partialInto", std::string());
+    h.surface = r.value("surface", false);
+    const bool below = k.kind == kHeatKindFreeze;
+    if (h.threshold < -256 || h.threshold > 400 || h.full < -256 || h.full > 400)
+      errors += rat + ": thresholds must be -256..400 heat units\n";
+    if (below ? h.full >= h.threshold : h.full <= h.threshold)
+      errors += rat + ": \"full\" must be " + (below ? "below" : "above") + " \"" +
+                k.thr + "\"\n";
+    if (!(h.chanceMille >= kReactChanceMinMille) || h.chanceMille > 1000.0)
+      errors += rat + ": chance must be " + FormatMille(kReactChanceMinMille) +
+                "..1000 per-mille\n";
+    if (d.thermal.transitions.size() >= kHeatMaxTransitions) {
+      errors += rat + ": at most " + std::to_string(kHeatMaxTransitions) +
+                " transitions per material\n";
+      continue;
+    }
+    d.thermal.transitions.push_back(h);
+  }
+  for (auto& [key, v] : t.items()) {
+    (void)v;
+    if (key != "emit" && key != "inertia" && key != "melt" && key != "ignite" &&
+        key != "freeze" && key != "note")
+      errors += at + ": unknown key \"" + key + "\"\n";
+  }
+}
+
 static void ParseAbsorb(const json& m, const std::string& path, MaterialDef& d,
                         std::string& errors) {
   if (!m.contains("absorb")) return;
@@ -918,6 +984,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       ParseCoat(sm, path, d, errors);  // after ParseStain: it checks d.stain
     }
     ParseAbsorb(m, path, d, errors);
+    ParseThermal(m, path, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
       uint32_t bit = tagReg.MaskOf(t, true);
@@ -1912,6 +1979,41 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
           d.infectTargetIds.push_back((uint32_t)id);
       }
     }
+  }
+  // THE TEMPERATURE LAYER (materials.json "thermal"): transition products by
+  // NAME, now that the table is whole. An ignition's chance takes the same
+  // combustion.spreadPct every other ignition does (one fire-speed knob, not
+  // two). A material with transitions must be able to ACT, or the CA's
+  // inert-solid skip (common.wgsl matCanAct) would never visit it.
+  for (auto& d : m) {
+    for (HeatTransition& h : d.thermal.transitions) {
+      if (h.kind == kHeatKindIgnite) {
+        const int pct = CurrentTuning().combustion.spreadPct;
+        h.chanceMille = std::clamp(h.chanceMille * (double)(pct > 0 ? pct : 100) / 100.0,
+                                   kReactChanceMinMille, 1000.0);
+      }
+      const int id = FindMaterial(m, h.into);
+      if (id < 0)
+        errors += materialsPath + ": material \"" + d.name + "\": thermal into \"" +
+                  h.into + "\" is not a material\n";
+      h.intoId = id < 0 ? 0u : (uint32_t)id;
+      h.partialIntoId = 0;
+      if (!h.partialInto.empty()) {
+        const int pid = FindMaterial(m, h.partialInto);
+        if (pid <= 0)
+          errors += materialsPath + ": material \"" + d.name +
+                    "\": thermal partialInto \"" + h.partialInto + "\" is not a material\n";
+        else
+          h.partialIntoId = (uint32_t)pid;
+      }
+    }
+    if (!d.thermal.transitions.empty() && d.gpu.klass == CLASS_SOLID &&
+        d.gpu.reactCount == 0 && (d.gpu.stainPack & kStainPackTypeMask) == 0)
+      errors += materialsPath + ": material \"" + d.name +
+                "\": a solid with thermal transitions needs at least one reaction "
+                "rule (the CA skips inert solids)\n";
+    if (d.thermal.transitions.size() > kHeatMaxTransitions)
+      errors += materialsPath + ": material \"" + d.name + "\": too many thermal transitions\n";
   }
   CheckPinnedMaterialIds(m, materialsPath, errors);
   if (!errors.empty()) return false;

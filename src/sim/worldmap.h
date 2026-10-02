@@ -55,6 +55,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "sim/heat.h"
 
 namespace worldmap {
 
@@ -341,7 +342,11 @@ enum : uint32_t {
 inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the tile plants (fern banks, big toadstools)
 inline constexpr uint32_t kBF_Cacti = 1u << 1;        // the cactus proc shape
 inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under the skin (the old desert rule)
-inline constexpr uint32_t kBF_CanopyRows = 1u << 3;   // some cover row bounds the canopy cover (P-G): scan the trees once per column
+inline constexpr uint32_t kBF_CanopyRows = 1u << 3;
+// Water freezes here day and night (biomes::BiomeDef::frozen): worldgen lays
+// ice on every water surface, so a cold lake is never born liquid and does not
+// freeze over (a world-wide wake) on its first tick (docs/PLAN_temperature.md §8).
+inline constexpr uint32_t kBF_Frozen = 1u << 4;   // some cover row bounds the canopy cover (P-G): scan the trees once per column
 
 // ---- the water preset table (P-E) --------------------------------------------
 // One fixed-stride record per assets/water/<name>.json at kHWaterRecords, in
@@ -819,6 +824,8 @@ struct WorldMapData {
   TerrainParams terrain;
   uint32_t terrainWords[kTerrainWords] = {};
   std::vector<BiomeTerrainPacked> biomeTerrain;
+  // Each biome's climate by id (biomes::BiomeDef::ambient), for heat.cpp.
+  std::vector<HeatClimate> biomeClimate;
   std::vector<LandformSite> landformSites;
   // P5: the sculpt layer as the PACKED BLOCK both sides read (PackSculpt;
   // offsets relative to its first word). Empty = the map has no layer, and

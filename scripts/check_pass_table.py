@@ -203,6 +203,15 @@ PIPE_TO_MEMBER = {
     "PIPE_DRAFT_FINE2": "draftFineMid_",
     "PIPE_DRAFT_FINE2B": "draftFineMid2_",
     "PIPE_DRAFT_FINE3": "draftFineLast_",
+    # The temperature layer (sim_heat.wgsl, src/sim/heat.h).
+    "PIPE_HEAT_BEGIN": "heatBegin_",
+    "PIPE_HEAT_SHIFT": "heatShift_",
+    "PIPE_HEAT_WANT": "heatWant_",
+    "PIPE_HEAT_ARGS": "heatArgs_",
+    "PIPE_HEAT_ALLOC": "heatAlloc_",
+    "PIPE_HEAT_SRC": "heatSrc_",
+    "PIPE_HEAT_TENT": "heatTent_",
+    "PIPE_HEAT_RELAX": "heatRelax_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -312,6 +321,12 @@ BUF_TO_WGSL = {
     "ReposeSnap": {"reposeSnap"},
     "CaMask": {"caMask"},
     "CaWind": {"caWind"},
+    # The temperature layer, bindings 50..52 of simBGL_ (src/sim/heat.h).
+    # HeatArgs is indirect-only and never bound, like SolArgs.
+    "HeatPool": {"heatPool"},
+    "HeatMeta": {"heatMeta"},
+    "HeatParams": {"heatParams"},
+    "HeatArgs": set(),
     # The deferred streaming wake's act verdict, binding 30.
     "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
@@ -440,6 +455,8 @@ _SIM_GROUP0 = {
     # The CA's air mask, binding 48 (sim_step.wgsl camask writes it before
     # each gravity substep; main reads it).
     "caMask", "caWind",
+    # The temperature layer, bindings 50..52 (sim_heat.wgsl; the CA reads it).
+    "heatPool", "heatMeta", "heatParams",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

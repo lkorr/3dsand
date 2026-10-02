@@ -1752,6 +1752,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // dispatch and is therefore an ENCODE, not an upload.
   sandvox::PerfSpan spanUpload(PerfScope::Upload);
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+  // The temperature layer's per-tick params (mode, radius, snowline, climate,
+  // the window's column biomes): a pure function of tuning, map, seed and
+  // origin -- the same inputs a replay feeds this function.
+  sim.PrepareHeat(ctx.queue, tp.origin, seed);
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
   if (!exps.empty())

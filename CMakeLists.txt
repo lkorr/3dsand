@@ -476,6 +476,7 @@ add_library(sandvox_core OBJECT
   src/sim/pass_table.cpp
   src/sim/materials.cpp
   src/sim/solutes.cpp
+  src/sim/heat.cpp
   src/sim/tuning.cpp
   src/sim/celestial.cpp
   # Wind primitives: fans / spell gusts / vortices as op-stream parametric
@@ -627,6 +628,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_solute.cpp
+  src/test/selftest_heat.cpp
   src/test/selftest_impact.cpp
   src/test/selftest_coat.cpp
   src/test/selftest_itemstage.cpp

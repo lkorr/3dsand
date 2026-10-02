@@ -91,7 +91,7 @@ for (const n of presetNames) {
   const r = WG.generateWaterBody(P, 3);
   const m = r.meta;
   const wet = !!P.fill.material && P.fill.material !== 'none';
-  const names = [P.fill.material, P.fill.surfaceMaterial, P.bed.shallow, P.bed.deep, P.bed.substrate, P.ground.skin, P.ground.soil,
+  const names = [P.fill.material, P.bed.shallow, P.bed.deep, P.bed.substrate, P.ground.skin, P.ground.soil,
                  P.ground.rock, P.shore.mudMaterial, P.shore.mossMaterial, P.aquatic.emergent.material, P.aquatic.floating.material,
                  P.aquatic.floating.flower, P.aquatic.submerged.material, ...P.shore.plants.flatMap(pl => [pl.material, pl.head])]
       .filter(x => x && x !== 'none');

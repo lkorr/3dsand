@@ -3,6 +3,7 @@
 // The registry itself is assembled here from the per-domain translation units
 // so that adding a gate means touching one file plus one line in kGroups.
 
+#include "sim/heat.h"
 #include "test/selftest.h"
 
 #include <algorithm>
@@ -87,6 +88,7 @@ const std::vector<Gate>& NetGates();
 // The solute layer (docs/PLAN_solutes.md): conservation, the dilution floor,
 // the phase change. Each regenerates worldgen and builds its own stone box.
 const std::vector<Gate>& SoluteGates();
+const std::vector<Gate>& HeatGates();
 // Conversations (docs/PLAN_world_editor.md P3): the sample through the real
 // tick, and the flags + met set through a real save/load.
 const std::vector<Gate>& DialogueGates();
@@ -351,6 +353,10 @@ const char* const kOrder[] = {
     // A pool of oil alight: catches at once, burns ~10 s, pours black smoke.
     // Same pit neighbourhood and dim-dawn pinning.
     "oil-fire",
+    // THE TEMPERATURE LAYER (docs/PLAN_temperature.md). Sealed-room fixtures
+    // with their own worldgen and a pinned climate, like oil-fire; heat-ambient
+    // runs a real (one-minute) day and restores the tuning it changes.
+    "heat-idle", "heat-melt", "heat-ignite", "heat-freeze", "heat-ambient", "heat-bound",
     // Passable plants hold nothing up: sand, a lone chip and a grid particle
     // each crush the bramble they land on. Same sealed-box fixture.
     "plant-crush",
@@ -1137,7 +1143,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &ClearingGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &ClearingGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
@@ -1360,6 +1366,19 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
   // count per stream turns "the blood stopped showing up" into a number a
   // later reader can find without re-running anything, which is the whole
   // argument for build/last_run.json.
+  // ---- THE TEMPERATURE LAYER (docs/PLAN_temperature.md) --------------------
+  // Peaks and totals across every heat gate that ran (HeatNoteRun): the pool
+  // high-water mark is what kHeatPoolPages is sized against, and a refusal is
+  // a chunk that went without heat.
+  {
+    const HeatRunStats& hs = HeatRunTotals();
+    f << "  \"heat\": {\"runs\": " << hs.runs << ", \"pagesPeak\": " << hs.pagesPeak
+      << ", \"pool\": " << kHeatPoolPages << ", \"refused\": " << hs.refused
+      << ", \"melts\": " << hs.melts << ", \"ignitions\": " << hs.ignites
+      << ", \"freezes\": " << hs.freezes << ", \"srcPeak\": " << hs.srcPeak
+      << ", \"recomputePeak\": " << hs.recompPeak << ", \"relaxPeak\": " << hs.relaxPeak
+      << "},\n";
+  }
   {
     const sandvox::opstream::StreamCounts& oc = sandvox::opstream::Counts();
     f << "  \"opstream\": {\"brushTrunc\": " << oc.brushTrunc

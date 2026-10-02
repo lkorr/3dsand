@@ -3,6 +3,10 @@
   "displayName": "Tundra",
   "index": 4,
   "climate": {
+    "ambient": {
+      "base": -24,
+      "swing": 12
+    },
     "temperature": 0.1,
     "moisture": 0.35,
     "notes": "The snowy north of the world map: frozen ground under snow, sparse dead wood, ice-skinned tarns."

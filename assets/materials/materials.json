@@ -27,6 +27,7 @@
     },
     {
       "id": "wood",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "arcane": 2,
@@ -91,6 +92,7 @@
     },
     {
       "id": "water",
+      "thermal": {"inertia": 5, "freeze": {"below": 0, "full": -24, "chance": 4, "into": "ice", "partialInto": "snow", "surface": true}},
       "arcane": 1,
       "class": "liquid",
       "density": 1000,
@@ -135,6 +137,7 @@
     },
     {
       "id": "oil",
+      "thermal": {"ignite": {"above": 100, "full": 180, "chance": 60, "into": "oil_burning"}},
       "class": "liquid",
       "density": 900,
       "hardness": 4,
@@ -195,6 +198,7 @@
     },
     {
       "id": "fire",
+      "thermal": {"emit": 110},
       "arcane": 3,
       "class": "gas",
       "density": 3,
@@ -211,6 +215,7 @@
     },
     {
       "id": "ember",
+      "thermal": {"emit": 140},
       "class": "solid",
       "density": 550,
       "hardness": 20,
@@ -249,6 +254,7 @@
     },
     {
       "id": "lava",
+      "thermal": {"emit": 230, "inertia": 4},
       "arcane": 8,
       "class": "liquid",
       "density": 2800,
@@ -317,6 +323,7 @@
     },
     {
       "id": "ice",
+      "thermal": {"melt": {"above": 4, "full": 64, "chance": 25, "into": "water"}},
       "footstep": "path",
       "class": "solid",
       "density": 917,
@@ -335,6 +342,7 @@
     },
     {
       "id": "snow",
+      "thermal": {"melt": {"above": 0, "full": 48, "chance": 40, "into": "water"}},
       "footstep": "path",
       "class": "powder",
       "repose": 63,
@@ -374,6 +382,7 @@
     },
     {
       "id": "plant",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "footstep": "leaf",
       "class": "solid",
       "density": 400,
@@ -432,6 +441,7 @@
     },
     {
       "id": "stem",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "sounds": {
         "break": "branch"
       },
@@ -452,6 +462,7 @@
     },
     {
       "id": "flower",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "//passable": "Ground COVER, not ground. Worldgen sets these one voxel ABOVE the terrain skin, and a non-passable cover cell is a solid 10 cm step the player climbs onto while the tall grass and flowers beside it are walk-through -- the meadow floor alternated between h+1 and h+2 on a per-column hash with nothing visible to explain it. Every other plant in the file is already passable; these six are the originals, from before the flag existed. `grass` (the SKIN at y == h) is deliberately NOT among them: it is the ground, and flagging it would sink the player a voxel into the terrain everywhere. `flower` is here because reactions.json swaps petal <-> flower by daylight, so flagging only one of that pair puts the step back every morning.",
       "passable": true,
       "class": "solid",
@@ -471,6 +482,7 @@
     },
     {
       "id": "vine",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "class": "solid",
       "density": 350,
       "hardness": 8,
@@ -504,6 +516,7 @@
     },
     {
       "id": "dust",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "class": "powder",
       "repose": 30,
       "density": 1100,
@@ -521,6 +534,7 @@
     },
     {
       "id": "molten_glass",
+      "thermal": {"emit": 200, "inertia": 4},
       "class": "liquid",
       "density": 2200,
       "hardness": 6,
@@ -661,6 +675,7 @@
     {
       "comment": "Forest set (worldgen only). These are INERT on purpose: they carry the organic/flammable tags so fire, acid, mites and the laser treat them like the reactive garden, but no reaction in reactions.json uses them as `self` with an emit. Worldgen paints them by the million, and anything that grows would keep those chunks awake forever (CLAUDE.md rule 2).",
       "id": "grass",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "footstep": "path",
       "class": "solid",
       "density": 420,
@@ -684,6 +699,7 @@
     },
     {
       "id": "leaves",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "leaf_burning"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "footstep": "leaf",
@@ -706,6 +722,7 @@
     },
     {
       "id": "pine_needles",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "pine_burning"}},
       "footstep": "leaf",
       "class": "solid",
       "density": 300,
@@ -726,6 +743,7 @@
     },
     {
       "id": "autumn_leaves",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "autumn_burning"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "footstep": "leaf",
@@ -748,6 +766,7 @@
     },
     {
       "id": "birch_wood",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "sounds": {
@@ -771,6 +790,7 @@
     },
     {
       "id": "petal",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "fire"}},
       "passable": true,
       "class": "solid",
       "density": 290,
@@ -1042,6 +1062,7 @@
     },
     {
       "id": "cloth",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 30, "into": "cloth_burning"}},
       "class": "solid",
       "density": 320,
       "hardness": 5,
@@ -1078,6 +1099,7 @@
     {
       "//": "DEPRECATED ALIAS OF cloth. Kept only because this array is APPEND-ONLY -- a material's id IS its index and every .vox paints with those indices, so deleting this row would renumber the 65 materials after it. Nothing authored from 2026-08-30 should paint it: the gold is a TINT of cloth now, not a material. The one thing lost in the fold is `emission: 6`, a faint gilt glow that a tint cannot express; if that turns out to matter it wants a MATF flag, not a material.",
       "id": "robe_trim",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 30, "into": "cloth_burning"}},
       "class": "solid",
       "density": 330,
       "hardness": 6,
@@ -1098,6 +1120,7 @@
     {
       "//": "DEPRECATED ALIAS OF cloth, and the clearest case in the file: every physical field here -- class, density 320, hardness 5, rubble, molten, tags -- is byte-identical to cloth. It existed ONLY to be darker, which is a colour wearing a material's clothes and precisely the pollution the tint system removes. Kept because the array is append-only (see robe_trim above). Nothing new should paint it.",
       "id": "robe_shadow",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 30, "into": "cloth_burning"}},
       "class": "solid",
       "density": 320,
       "hardness": 5,
@@ -1196,6 +1219,7 @@
     },
     {
       "id": "staff_wood",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "sounds": {
@@ -2562,6 +2586,7 @@
     {
       "//": "Flesh actively on fire. tag:hot is the whole point: this voxel is now a heat SOURCE, so it ignites the flesh next to it, lights the grass the mob is standing in, and boils water -- through the ordinary reaction table, with no mob-specific fire code anywhere.",
       "id": "flesh_burning",
+      "thermal": {"emit": 130},
       "burnStage": 1,
       "class": "solid",
       "density": 900,
@@ -2612,6 +2637,7 @@
     {
       "//": "Cloth alight. Shared by every fabric (cloth/trim/shadow) and by leather, so the burn character is authored ONCE and a new fabric inherits it by naming this as its product.",
       "id": "cloth_burning",
+      "thermal": {"emit": 130},
       "burnStage": 1,
       "class": "solid",
       "density": 300,
@@ -2652,6 +2678,7 @@
     {
       "//": "Hair burns first, fast, and leaves nothing -- the visual read of 'that caught, briefly and violently' for one material and three rules.",
       "id": "hair_burning",
+      "thermal": {"emit": 130},
       "class": "solid",
       "density": 260,
       "hardness": 1,
@@ -2672,6 +2699,7 @@
     {
       "//": "TREE SHADE RAMPS (assets/editor/treegen.js). Each foliage and bark family is a THREE-material ramp -- dark, the plain material the rest of the game already knows, and lit -- and the tree voxelizer picks between them offline from a baked normal (part clump-sphere, part whole-canopy) plus depth into the clump. That is the entire Rundlett canopy trick, and it costs the renderer nothing: by the time a voxel exists its shade is already a material id. The three colours inside each material stay what they are everywhere else, per-cell palette jitter on the state nibble, so a crown has texture as well as form. Every one of these is INERT and carries exactly id 34's tag row, so fire, dissolve and the foliage rules treat a dark leaf as a leaf.",
       "id": "leaves_dark",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "leaf_burning"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "footstep": "leaf",
@@ -2694,6 +2722,7 @@
     },
     {
       "id": "leaves_lit",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "leaf_burning"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "footstep": "leaf",
@@ -2716,6 +2745,7 @@
     },
     {
       "id": "pine_dark",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "pine_burning"}},
       "footstep": "leaf",
       "class": "solid",
       "density": 300,
@@ -2736,6 +2766,7 @@
     },
     {
       "id": "pine_lit",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "pine_burning"}},
       "footstep": "leaf",
       "class": "solid",
       "density": 300,
@@ -2756,6 +2787,7 @@
     },
     {
       "id": "autumn_dark",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "autumn_burning"}},
       "footstep": "leaf",
       "class": "solid",
       "density": 320,
@@ -2776,6 +2808,7 @@
     },
     {
       "id": "autumn_lit",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "autumn_burning"}},
       "footstep": "leaf",
       "class": "solid",
       "density": 320,
@@ -2797,6 +2830,7 @@
     {
       "//": "Bark ramp. Same three-tier idea on the wood side: a bole with a shaded and a lit face reads as a cylinder, where one flat brown reads as a column of paint.",
       "id": "bark_dark",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "sounds": {
@@ -2820,6 +2854,7 @@
     },
     {
       "id": "bark_light",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "sounds": {
@@ -2845,6 +2880,7 @@
       "//": "APPEND ONLY BELOW THIS LINE. A material's id IS its index in this array, and every .vox in the project paints with those indices -- inserting a material anywhere but the end silently renumbers every model after it (see the treeatlas 'i+1' incident). Art palette slots start at 128 (kArtPaletteBase, sim/voxload.h), so this list may grow to 127 entries and no further.",
       "//2": "UNDERCLOTH. The linen the base human model wears, and the reason it is a material rather than a paint colour. Body voxels are 8 bits of material plus 8 bits of ART COLOUR, and every reaction that rewrites a body voxel CLEARS the colour byte (BurnLimbView::Set) -- deliberately, because the burn chain's whole visual account of itself is the material it turns into, and a nonzero art slot would paint straight over the char. So underwear painted onto skin voxels burned to flesh_cooked, lost its paint, and the wearer read as NAKED rather than as scorched. Giving the garment its own id costs nothing and puts the fix where the rest of the burn model already lives: its own chain, in JSON. Colour is the mid tone of the art layer it replaces, so an UNPAINTED use of this material still reads as undyed cloth.",
       "id": "linen",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 30, "into": "linen_burning"}},
       "class": "solid",
       "density": 320,
       "hardness": 4,
@@ -2875,6 +2911,7 @@
     {
       "//": "Linen alight. A near-copy of cloth_burning in linen's flame colours. Since 2026-09-25 it chars to cloth_charred exactly as cloth_burning does, so a burning smock blackens and then burns to nothing while still in the fire (reactions.json). It used to char to the inert linen_charred instead, because the base human's underwear was linen and burning it away undressed the character; the shorts are `undercloth` now.",
       "id": "linen_burning",
+      "thermal": {"emit": 130},
       "burnStage": 1,
       "class": "solid",
       "density": 300,
@@ -2940,6 +2977,7 @@
     {
       "//": "FOLIAGE ACTUALLY ALIGHT -- and the reason it has to be a material at all is that fire in this engine only ever moves UP. `fire` is a gas with rise probability 1024/1024 in calm air (gasIntent, sim_step.wgsl), and every emit rule in reactions.json is dir:up, so the world's whole flame budget migrates upward through the fuel. Wood survives that because it ignites to `ember`, a STATIONARY tag:hot solid that cooks all six of its faces for ~140 ticks -- which is why a trunk burns downward. Foliage went straight to `fire`, so a burnt leaf converted itself into the one thing that immediately floats away and left nothing behind to heat the leaf below it. Owner report: a lit tree cooks the top of the crown and leaves the bottom-most layer of leaves untouched. That is exactly the shape of a rising-only heat source.\n\nSo this is `ember` for leaves, and it is a separate id rather than a reuse of `ember` for the two reasons reactions.json already argues at the foliage ignition rules: it must not decay to ASH (a canopy that rained thousands of ash voxels through itself was the thing that authoring was written to avoid), and it must be light and short-lived rather than a dense smouldering log. It leaves NOTHING -- air and a little smoke -- so the burn is still bounded by the canopy consuming itself, which is the same subcriticality argument as before (CLAUDE.md rule 2); all that changed is that the heat now sits still long enough to be conducted sideways and DOWN.\n\nNot tagged flammable: it is already burning, and a second ignition rule reaching it would be a loop. hardness 1 and a low density because it is a leaf, not a coal -- a burning crown should still come apart at a touch.\n\nTHE COLOURS ARE THE LEAF'S, NOT THE FIRE'S (2026-09-03). `burnTint` tells the renderer that this palette is what the voxel looked like BEFORE it caught: each cell breathes between it and render.burnTintColor on a slow per-cell phase (common.wgsl burnTint), so a crown on fire still reads as the crown it was rather than as a heap of identical orange coals. That is also why there are now three of these -- `pine_burning` and `autumn_burning` at the end of this file carry the same numbers over their own family's palette, because the word has no bits to remember which leaf a burning one was. The green family's dark / lit shade tiers burn as this plain tier.",
       "id": "leaf_burning",
+      "thermal": {"emit": 130},
       "class": "solid",
       "density": 300,
       "hardness": 1,
@@ -3020,6 +3058,7 @@
     {
       "//": "leaf_burning for the pine family: pine_needles / pine_dark / pine_lit ignite to this. Same numbers as leaf_burning in every field and the same rules in reactions.json -- the only thing that differs is the palette, which is the plain needle tier's, because a burn-tinted material's colours are the leaf the renderer pulses back to. See leaf_burning's note.",
       "id": "pine_burning",
+      "thermal": {"emit": 130},
       "class": "solid",
       "density": 300,
       "hardness": 1,
@@ -3039,6 +3078,7 @@
     {
       "//": "leaf_burning for the autumn family: autumn_leaves / autumn_dark / autumn_lit ignite to this. Same numbers and rules as leaf_burning; only the palette differs. See leaf_burning's note.",
       "id": "autumn_burning",
+      "thermal": {"emit": 130},
       "class": "solid",
       "density": 320,
       "hardness": 1,
@@ -3435,6 +3475,7 @@
     {
       "//": "Undercloth alight: flesh_burning's twin (hot, emission 170, same body numbers) in linen_burning's flame colours.",
       "id": "undercloth_burning",
+      "thermal": {"emit": 130},
       "burnStage": 1,
       "class": "solid",
       "far": "flesh_burning",
@@ -3497,6 +3538,7 @@
     {
       "//": "Salt above 801 C. Real molten NaCl is ~1.55 g/cm3 and glows orange-white; electrolysed (tag:electric) it splits into sodium and chlorine -- the Downs cell, the one real way sodium is made.",
       "id": "molten_salt",
+      "thermal": {"emit": 200, "inertia": 4},
       "class": "liquid",
       "density": 1550,
       "hardness": 6,
@@ -3758,6 +3800,7 @@
     {
       "//": "REAL. Charcoal: the fuel in gunpowder. Black, and LIGHT (real lump charcoal is ~0.4 g/cm3, so it floats on water, which this does). Catches like wood does and smoulders as ember. Also what acid leaves of sugar (the carbon snake). Tagged dissolvable so acid eats it slowly like any char.",
       "id": "charcoal",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "far": "ash",
       "class": "powder",
@@ -3853,6 +3896,7 @@
     {
       "//": "REAL, TRANSIENT. Quicklime in the act of slaking: tag:hot for about a second (decay 40 per-mille), which is what does the boiling and the igniting -- every water and fuel rule already answers tag:hot -- then it is slaked_lime. A separate material because the voxel word has no bits for 'hot for a moment' and the material id is the memory (as the burning leaves are).",
       "id": "slaking_lime",
+      "thermal": {"emit": 40},
       "far": "snow",
       "class": "powder",
       "repose": 36,
@@ -3963,6 +4007,7 @@
     {
       "//": "REAL. Molten iron, what thermite leaves: white-orange, dense (7,000), hot. It burns what it touches like lava, sets glass from sand, QUENCHES to iron in water, and cuts through iron and steel plate by handing its heat on -- it freezes to iron as it melts the next cell, one-for-one, so the cut is bounded by the melt that made it (rule 2). Cools to iron from its skin inward when the heat is gone (the same inverted hot ramp molten salt uses).",
       "id": "molten_iron",
+      "thermal": {"emit": 230, "inertia": 4},
       "far": "molten_glass",
       "class": "liquid",
       "density": 7000,
@@ -4539,6 +4584,7 @@
     {
       "//": "BUILDING MATERIALS (PLAN_world_editor P2, assets/editor/housegen.js). Nine static solids a rural-medieval house is made of, each a MATERIAL rather than a paint colour because each behaves differently: the timbers burn, the stone and daub do not, the thatch goes up fast, a door leaf has to read as a door. Every one carries a `far` alias because the far-field palette was already full (128 slots owned). The flammable ones reuse the existing burn chain by PRODUCT (wood-kind ignites to `ember`, straw-kind to `leaf_burning`): reactions.json has one ignition rule per material, the only shape the compiler accepts (`self` is a material name, never a tag). PLANK: sawn boards, a weathered mid-brown lighter than `wood` so floors and weatherboards read as worked timber rather than a trunk.",
       "id": "plank",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "far": "wood",
       "sounds": {
@@ -4564,6 +4610,7 @@
     {
       "//": "TIMBER: the dark oak of a box frame -- posts, rails, braces, lintels, tie beams. Darker than plank so the frame reads against daub at any distance; slower to catch than boards (heavy section), same burn chain.",
       "id": "timber",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "far": "bark_dark",
       "sounds": {
@@ -4589,6 +4636,7 @@
     {
       "//": "THATCH: long straw laid thick on a roof, weathered from gold to grey-brown. Light, soft, and the most flammable thing a hamlet owns: it catches on the straw rule and burns away to nothing through leaf_burning, the way a roof fire actually goes.",
       "id": "thatch",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "leaf_burning"}},
       "arcane": 1,
       "far": "dry_tussock",
       "footstep": "leaf",
@@ -4694,6 +4742,7 @@
     {
       "//": "DOOR_WOOD: the leaf of a door, and ONLY that. A distinct material so a closed door reads as a door (redder and warmer than the frame around it), and so the door system can tell its own leaf cells from the wall they hang in: a door whose leaf box is no longer all door_wood has been burned or broken and stops being a door (PLAN_world_editor 2.4). Burns like plank.",
       "id": "door_wood",
+      "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
       "arcane": 2,
@@ -4721,6 +4770,7 @@
     {
       "//": "STRAW_BED: a straw-stuffed tick on a bed frame. Solid (you lie ON it), soft, pale, and catches faster than anything else in the house.",
       "id": "straw_bed",
+      "thermal": {"ignite": {"above": 135, "full": 220, "chance": 40, "into": "leaf_burning"}},
       "arcane": 1,
       "far": "dry_tussock",
       "footstep": "leaf",
@@ -4743,6 +4793,7 @@
     {
       "//": "ETHER VAPOUR ALIGHT (owner, 2026-09-29: 'each voxel burns and persists for a couple of seconds ... much more destructive than instantaneously annihilating'). What ether_vapour becomes near a flame or a spark, replacing the radius-2 blast it used to set off: a blast consumed the whole cloud in one tick and left nothing burning. This is a flame that STAYS -- ~2 s a cell at the shipped burnDurationPct -- and it keeps the vapour's gas_heavy, so a lit cloud still pools and creeps along the floor as a burning carpet, cooking whatever it rolls over. Tagged hot, so it lights the ether_vapour beside it through that material's own ignition rule (the flame front runs through the cloud) and everything flammable it touches at that fuel's usual rate. Bounded by the vapour it consumes (CLAUDE.md rule 2): not flammable, and it only ever becomes air or smoke.",
       "id": "ether_burning",
+      "thermal": {"emit": 110},
       "far": "fire",
       "class": "gas",
       "density": 4,
@@ -4761,6 +4812,7 @@
     {
       "//": "OIL ALIGHT (owner, 2026-09-30: 'like ether gas lights on fire for a while ... extremely flammable and then burn for a good 10ish seconds', with black smoke and much more of it than a normal fire). What a POOL of oil becomes near heat -- a LIQUID, so a burning spill stays a spill: it still flows (oil's moveEvery 2), still floats on water (oil's 900) as a burning slick, and carries its fullness through the ignition. Tagged hot, so it lights the oil beside it (oil's hot-gated decay, reactions.json), cooks whatever it touches and lights anything flammable at that fuel's own rate. Each cell burns ~10 s at the shipped burnDurationPct, throws fire up and pours black_smoke out of every open face. Water does NOT put it out (a grease fire): the water under a slick only simmers (water's heat rule is x0.05 against it). Rain and choke damp do. \"stain\": false -- a splash burns rather than coats. Bounded by the oil it consumes (rule 2): not flammable, and it only ever becomes air, black_smoke or oil.",
       "id": "oil_burning",
+      "thermal": {"emit": 150},
       "far": "lava",
       "class": "liquid",
       "density": 900,

@@ -3029,8 +3029,103 @@ def check_ticket_record():
             problems.append(f"ticket record: {name} ({v}) overlaps the life field")
 
 
+# ------------------------------------------------------ the temperature layer
+# assets/shaders/sim_heat.wgsl + sim_step.wgsl (MIRROR-BEGIN heat)  <->  each
+# other + src/sim/heat.h (docs/PLAN_temperature.md). The accessors are pasted
+# into the two shaders that bind the layer rather than living in common.wgsl,
+# so the copies must be TEXT-IDENTICAL; and every constant either shader
+# declares under a heat.h name must equal heat.h's value -- the CPU sizes,
+# resets, packs and reads the same buffers with those numbers.
+_HEAT_CONSTS = {
+    "HEAT_BLOCKS": "kHeatBlocks", "HEAT_PAGE_WORDS": "kHeatPageWords",
+    "HEAT_POOL_PAGES": "kHeatPoolPages", "HEAT_ENTRY_HAS": "kHeatEntryHas",
+    "HEAT_ENTRY_PAGE": "kHeatEntryPage", "HEAT_RADIUS_MAX": "kHeatRadiusMax",
+    "HM_WANT_COUNT": "kHmWantCount", "HM_FREE_TOP": "kHmFreeTop",
+    "HM_NEXT_FRESH": "kHmNextFresh", "HM_SRC_COUNT": "kHmSrcCount",
+    "HM_RECOMP_COUNT": "kHmRecompCount", "HM_RELAX_COUNT": "kHmRelaxCount",
+    "HM_LAST_DAY": "kHmLastDay", "HM_DAY_FLIP": "kHmDayFlip", "HM_ORIGIN": "kHmOrigin",
+    "HM_ORIGIN_SET": "kHmOriginSet", "HM_PAGES_PEAK": "kHmPagesPeak",
+    "HM_REFUSED": "kHmRefused", "HM_MELTS": "kHmMelts", "HM_SRC_PEAK": "kHmSrcPeak",
+    "HM_RECOMP_PEAK": "kHmRecompPeak", "HM_RELAX_PEAK": "kHmRelaxPeak",
+    "HM_RELAX_TICKS": "kHmRelaxTicks", "HM_FREES": "kHmFrees", "HM_ALLOCS": "kHmAllocs",
+    "HM_RELEASED": "kHmReleased", "HM_LAST_RELAX": "kHmLastRelax",
+    "HM_LAST_RECOMP": "kHmLastRecomp", "HM_PROBE_X": "kHmProbeX", "HM_PROBE_E": "kHmProbeE",
+    "HM_ARGS": "kHmArgs", "HM_ENTRY": "kHmEntry", "HM_FLAGS": "kHmFlags",
+    "HM_SUMMARY": "kHmSummary", "HM_OWNER": "kHmOwner", "HM_WANT": "kHmWant",
+    "HM_SRC_LIST": "kHmSrcList", "HM_RECOMP_LIST": "kHmRecompList",
+    "HM_RELAX_LIST": "kHmRelaxList", "HM_STACK": "kHmStack",
+    "HF_EMIT": "kHfEmit", "HF_SRC": "kHfSrc", "HF_RECOMP": "kHfRecomp",
+    "HF_RELAX": "kHfRelax", "HF_NEW": "kHfNew", "HS_SOURCE": "kHsSource",
+    "HS_NONZERO": "kHsNonzero", "HP_MODE": "kHpMode", "HP_RADIUS": "kHpRadius",
+    "HP_SNOWLINE_Y": "kHpSnowlineY", "HP_SNOW_BASE": "kHpSnowBase",
+    "HP_SNOW_SWING": "kHpSnowSwing", "HP_PROBE": "kHpProbe", "HP_PROBE_ON": "kHpProbeOn",
+    "HP_GAIN": "kHpGain", "HP_BIOME": "kHpBiome", "HP_MAT": "kHpMat",
+    "HP_MAT_STRIDE": "kHpMatStride", "HP_COL": "kHpCol",
+    "HEAT_KIND_FREEZE": "kHeatKindFreeze", "HEAT_SCALE_AIR": "kHeatScaleAir",
+    "HEAT_R2_EMIT_SHIFT": "kHeatR2EmitShift", "HEAT_R2_INERTIA_SHIFT": "kHeatR2InertiaShift",
+    "HEAT_R2_TRANS_SHIFT": "kHeatR2TransShift",
+    "HEAT_ARG_ALLOC": "kHeatArgAlloc", "HEAT_ARG_SRC": "kHeatArgSrc",
+    "HEAT_ARG_RECOMP": "kHeatArgRecomp", "HEAT_ARG_RELAX": "kHeatArgRelax",
+    "HEAT_ARG_SHIFT": "kHeatArgShift",
+}
+
+
+def check_heat_mirror():
+    files = {n: read("assets/shaders/" + n) or "" for n in ("sim_heat.wgsl", "sim_step.wgsl")}
+    if not files["sim_heat.wgsl"]:
+        return
+    checked.append("heat")
+    blocks = {n: _mirror_blocks(t, "heat") for n, t in files.items()}
+    for n, b in blocks.items():
+        if len(b) != 1:
+            problems.append(f"heat: {n} has {len(b)} `MIRROR-BEGIN heat` blocks; expected one")
+    if all(len(b) == 1 for b in blocks.values()) and \
+            blocks["sim_heat.wgsl"][0] != blocks["sim_step.wgsl"][0]:
+        a, c = blocks["sim_heat.wgsl"][0].splitlines(), blocks["sim_step.wgsl"][0].splitlines()
+        i = 0
+        while i < min(len(a), len(c)) and a[i] == c[i]:
+            i += 1
+        problems.append(f"heat: sim_step.wgsl's heat block differs from sim_heat.wgsl's at "
+                        f"line {i + 1} of the block -- the copies must be identical")
+    hh = read("src/sim/heat.h") or ""
+    wh = read("src/sim/world.h") or ""
+
+    def cpp_value(name, depth=0):
+        m = re.search(r"constexpr\s+u?int32_t\s+(?:[A-Za-z0-9_]+\s*=\s*[^,;]+,\s*)*" + name +
+                      r"\s*=\s*([^,;]+)[,;]", hh) or \
+            re.search(r"constexpr\s+u?int32_t\s+" + name + r"\s*=\s*([^;]+);", wh)
+        if not m or depth > 24:
+            return None
+        expr = re.sub(r"(0x[0-9A-Fa-f]+|\d+)u\b", r"\1", m.group(1).strip())
+
+        def sub(mm):
+            v = cpp_value(mm.group(0), depth + 1)
+            return str(v) if v is not None else mm.group(0)
+        expr = re.sub(r"\bk[A-Za-z0-9_]+\b", sub, expr).replace("/", "//")
+        try:
+            return int(eval(expr, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
+
+    for n, txt in files.items():
+        for w, c in _HEAT_CONSTS.items():
+            mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", txt, re.M)
+            if not mw:
+                continue
+            cv = cpp_value(c)
+            if cv is None:
+                problems.append(f"heat: cannot read {c} (src/sim/heat.h) for {n}'s {w}")
+            elif int(mw.group(1), 0) != cv:
+                problems.append(f"heat: {n} {w} = {mw.group(1)} but heat.h {c} = {cv}")
+    mt = re.search(r"const\s+HEAT_THR_BIAS\s*:\s*i32\s*=\s*(\d+)\s*;", files["sim_heat.wgsl"])
+    cv = cpp_value("kHeatThrBias")
+    if not mt or cv is None or int(mt.group(1)) != cv:
+        problems.append("heat: HEAT_THR_BIAS disagrees with heat.h kHeatThrBias")
+
+
 ALL = {
     "solute": check_solute_mirror,
+    "heat": check_heat_mirror,
     "ticket": check_ticket_record,
     "reactfx": check_react_fx,
     "coatrule": check_coat_rule,

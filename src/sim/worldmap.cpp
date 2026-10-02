@@ -441,6 +441,7 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     if (b.groundFlora) flags |= kBF_GroundFlora;
     if (b.cacti) flags |= kBF_Cacti;
     if (b.sandCap) flags |= kBF_SandCap;
+    if (b.frozen) flags |= kBF_Frozen;
     for (const biomes::CoverRow& c : b.cover)
       if (c.chance > 0 && c.materialId != 0 && (c.cond.canopyMin > 0 || c.cond.canopyMax < 255)) flags |= kBF_CanopyRows;
     r[kB_Flags] = flags;
@@ -1417,6 +1418,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   for (const biomes::BiomeDef& b : set.biomes)
     if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
       out.biomeTerrain[static_cast<size_t>(b.index)] = PackBiomeTerrain(b);
+  out.biomeClimate.assign(set.biomes.size(), {});
+  for (const biomes::BiomeDef& b : set.biomes)
+    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
+      out.biomeClimate[static_cast<size_t>(b.index)] = b.ambient;
 
   // ---- rules (P5b): seeded placement per biome ----------------------------------
   // "3 crypts per km2 of forest, never within 400 m of each other" is one

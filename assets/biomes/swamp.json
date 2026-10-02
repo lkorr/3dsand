@@ -3,6 +3,10 @@
   "displayName": "Swamp",
   "index": 5,
   "climate": {
+    "ambient": {
+      "base": 14,
+      "swing": 4
+    },
     "temperature": 0.6,
     "moisture": 0.95,
     "notes": "The wettest cell of the climate grid: mud underfoot, standing water everywhere, willows and reeds."

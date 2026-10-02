@@ -141,6 +141,14 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "solWant and nothing else; the rest scales with chunks that carry "
      "solute. solHash is a hash-tick sweep that returns at once for an EMPTY "
      "slot."},
+    {"heatSys", "Temperature", "simTick", PerfSide::Gpu, PerfScope::Count,
+     "heatBegin;heatShift;heatWant;heatArgs1;heatAlloc;heatArgs2;heatSrc;heatArgs3;heatTent;"
+     "heatArgs4;heatRelax",
+     "The temperature layer (docs/PLAN_temperature.md): pages, sources, the "
+     "tent-filter targets and the relaxation, over the CA's dirty list. With "
+     "nothing hot it is one group per dirty chunk that returns after two loads "
+     "(heatWant) and zero-group indirects; the rest scales with chunks within "
+     "one chunk of a heat source. heatShift runs only on a window-shift tick."},
     {"particleSys", "Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "
