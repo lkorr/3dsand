@@ -578,6 +578,19 @@ var<private> gFilmLicence : bool = false;
 var<private> gSelfCell : vec3<i32> = vec3<i32>(0);
 var<private> gSelfIdx : u32 = PT_NO_WORD;
 
+// ---- REACTIONS IN A TICKET (docs/PLAN_chunk_tickets.md §2.5, P3) ----------
+// Set per cell at the top of main: is the chunk this thread acts on a TICKET
+// slot (resident outside the window)? In a ticket only DECAY rules run. Decay
+// and movement TERMINATE — bounded by the matter present — while emit and pair
+// rules PROPAGATE, bounded only by fuel, and fuel runs past a ticket's edge:
+// fire spreading in a ticket would either grow the ticket without bound (rule
+// 2) or stop at a straight chunk-aligned wall. So an ember in a ticket burns
+// out to ash and does NOT light the wood beside it, smoke fades, and a ticket
+// holding only pair/emit-reactive matter sleeps and releases. A skipped rule
+// does not set keepAwake (it cannot fire here, so it is no reason to wake).
+// One compare against the slot index (ci >= NUM_CHUNKS), uniform per chunk.
+var<private> gInTicket : bool = false;
+
 // Is there more of this same liquid directly ABOVE c? Out of window reads as
 // "no": the residency edge is solid and inert, so a cell at the top of the
 // window counts as a free surface, which is the conservative direction — it may
@@ -2321,6 +2334,9 @@ fn coatSpend(c : vec3<i32>, idx : u32, w : u32, stamp : u32) -> u32 {
 fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
              m : Material, cm : u32, rnd : u32, probe : bool) -> vec2<u32> {
   let cmat = materials[cm];
+  // A coat's rules are PAIR rules (rules 1-3): none of them runs in a ticket
+  // (gInTicket). Nothing covered, nothing spent, no reason to wake.
+  if (gInTicket) { return vec2<u32>(0u, w); }
   let stamp = stampFor(T.tick, P.substep);
   var keepAwake = false;
   var covered = false;
@@ -2526,6 +2542,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     let rule = reactions[m.reactOffset + ri];
     let kind = rule.packed & 3u;
     let dmask = (rule.packed >> 2u) & 7u;
+    // In a ticket only DECAY runs (gInTicket, above): skipped before the roll
+    // and before keepAwake, exactly as a light-gated rule out of its phase is.
+    if (gInTicket && kind != RK_DECAY) { continue; }
     if (selfPartialPowder && rule.prodSelf != PROD_KEEP && rule.prodSelf != MAT_AIR &&
         materials[rule.prodSelf].klass == CLASS_SOLID) { continue; }
 
@@ -4221,6 +4240,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // this is what stops a neutral rule from keeping a shoreline puddle awake
   // forever. Set PER CELL now (a thread runs cells of several chunks).
   gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
+  gInTicket = ci >= NUM_CHUNKS;
   let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
   let c = base + local;  // world cell this thread acts on

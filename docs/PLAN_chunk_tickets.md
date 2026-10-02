@@ -8,7 +8,8 @@ what P1 inherits). **P1 IMPLEMENTED 2026-10-02** (`src/sim/tickets.{h,cpp}`,
 `kTicketMax = 16`, the ticket table in `pageTable`'s tail, ops in the op
 record, gate `ticket-settle`; deviations in §6). **P2 IMPLEMENTED 2026-10-02**
 (particles park outside residency on the far cascade and request tickets;
-refused ones deposit as far landings; gate `ticket-land`). Named "tickets" rather
+refused ones deposit as far landings; gate `ticket-land`). **P3 IMPLEMENTED
+2026-10-02** (only DECAY runs in a ticket; gate `ticket-decay`). Named "tickets" rather
 than "islands" because `docs/PLAN_rigidbody_islands.md` already owns that word
 for disconnected solid components. Companion: `docs/PLAN_gas_particles.md`
 (independent; phase 2 here can consume its `farVox` blocking).
@@ -431,3 +432,21 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
    clock reuses the float-patience bits (5..12), which a non-micro particle
    outside residency cannot be using. `check_invariants.py` `ticket record`
    pins the bits and the record layout.
+
+### P3
+
+1. **`gInTicket` is a per-cell private set at the top of `main`** (`ci >=
+   NUM_CHUNKS`, one compare), not a `let` threaded through: `doReactions`
+   skips every non-DECAY rule before its roll and before `keepAwake`, and
+   `coatReact` (a coat's rules are all PAIR rules) returns "nothing covered,
+   nothing spent" at its head. The same applies to `excitedReact`'s call,
+   which only exists where MPM fluid does — never in a ticket.
+2. **The gate places 32 embers on a wood slab**, not one ember beside one
+   wood voxel: a single ember becomes ash only 1 time in 8 (its authored decay
+   splits ash / smoke / air 1 : 4 : 3), so "the ember becomes ash" is asserted
+   as "every ember is gone within 9 authored mean lives and some ash is left",
+   with the bound computed from the compiled table.
+3. **Smoke an ember decays to rises into the shell and freezes there** — the
+   frozen-shell limitation (§5) applied to gas. P4's re-centre follows activity
+   into the shell, but a plume rising out of the top of the box is exactly the
+   case tickets do not cover (gas that LEAVES belongs to the gas particles).

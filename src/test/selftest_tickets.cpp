@@ -479,6 +479,166 @@ Status GateTicketLand(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// ticket-decay (P3)
+// ---------------------------------------------------------------------------
+// Embers on a wood slab inside a ticket. In the window this is a fire: wood's
+// PAIR rule (neighbour tag:hot) turns it to ember, and ember EMITs fire. In a
+// ticket only DECAY runs (sim_step.wgsl gInTicket), so every ember burns out on
+// its own authored decay — to ash, smoke or air — and not one wood cell
+// catches. The lifetime bound is read off the COMPILED table (the decay rules'
+// summed chance), so it follows reactions.json and tuning without a re-pin.
+struct DecayRun {
+  uint32_t embers = 0, wood0 = 0;
+  int goneAt = -1;               // ticks after placement the last ember went
+  uint32_t woodKept = 0;         // of the slab's cells, still wood at the end
+  uint32_t fireSeen = 0;         // fire / ember cells NOT placed by us, max over the run
+  uint32_t ash = 0;
+  uint32_t hash = 0;
+  bool released = false;
+  double meanLife = 0;
+};
+
+bool RunDecay(Ctx& c, DecayRun& R, std::string& why) {
+  const int mEmber = MatId(c, "ember"), mWood = MatId(c, "wood"), mAsh = MatId(c, "ash"),
+            mFire = MatId(c, "fire");
+  if (mEmber < 0 || mWood < 0 || mAsh < 0 || mFire < 0) {
+    why = "missing one of ember/wood/ash/fire";
+    return false;
+  }
+  // The authored lifetime: 1 / (sum of the ember's ungated DECAY chances).
+  {
+    const MaterialGpu& g = c.mats[(size_t)mEmber].gpu;
+    uint64_t sum = 0;
+    for (uint32_t k = 0; k < g.reactCount; k++) {
+      const ReactionGpu& r = c.reactions[g.reactOffset + k];
+      if ((r.packed & 3u) != kReactDecay) continue;
+      if ((r.cond & kCondGateMask) != 0u) continue;  // rain / light-gated
+      sum += r.chance;
+    }
+    if (sum == 0) { why = "ember has no ungated decay rule"; return false; }
+    R.meanLife = (double)kReactChanceDen / (double)sum;
+  }
+  Regenerate(c);
+  const IVec3 o = c.world.WindowOrigin();
+  // 40 chunks past the window's -Z face, half way along X.
+  const int cx = o.x + (int)kNChunk / 2, cz = o.z - 40;
+  const int x0 = cx * (int)kChunk + 4, z0 = cz * (int)kChunk + 4;
+  int ground = -1 << 30;
+  for (int z = z0; z < z0 + 8; z++)
+    for (int x = x0; x < x0 + 8; x++)
+      ground = std::max(ground, World::TerrainHeight(x, z, kDefaultSeed));
+  const IVec3 centre{cx, (ground + 4) >> 4, cz};
+
+  uint32_t t = 83000;
+  support::TickCursor tick{c, t, centre};
+  c.stream.TicketSet().Request(centre, TicketReason::Gate, t + 1);
+  tick();
+  const uint32_t tk = c.stream.TicketSet().TicketHolding(centre);
+  if (tk >= kTicketMax) { why = "no ticket over the decay site"; return false; }
+  // An 8 x 8 wood slab two cells over the highest ground (on a stone plinth
+  // down to the ground, so it is not an island), 32 embers on every other
+  // cell of its top.
+  std::vector<CellOp> build;
+  std::vector<IVec3> woodCells;
+  auto put = [&](int x, int y, int z, uint32_t w) {
+    const uint32_t ci = c.world.ResidentCellIndex({x, y, z});
+    if (ci != World::kTicketSlotNone) build.push_back({ci, w});
+  };
+  const int mStone = MatId(c, "stone");
+  for (int z = z0; z < z0 + 8; z++)
+    for (int x = x0; x < x0 + 8; x++) {
+      for (int y = World::TerrainHeight(x, z, kDefaultSeed) - 1; y <= ground; y++)
+        put(x, y, z, PackVoxNew((uint32_t)std::max(mStone, 0), 0));
+      put(x, ground + 1, z, PackVoxNew((uint32_t)mWood, 0));
+      woodCells.push_back({x, ground + 1, z});
+      if (((x - x0) + (z - z0)) % 2 == 0) {
+        put(x, ground + 2, z, PackVoxNew((uint32_t)mEmber, 0));
+        R.embers++;
+      }
+    }
+  tick(std::vector<BrushOp>{}, build);
+  R.wood0 = (uint32_t)woodCells.size();
+  auto census = [&](uint32_t& ember, uint32_t& fire, uint32_t& ash, uint32_t* hash) {
+    ember = fire = ash = 0;
+    uint32_t h = 2166136261u;
+    std::vector<uint32_t> buf(kChunkVol);
+    for (uint32_t l = 0; l < kTicketChunks; l++) {
+      ReadVoxelsSync(c.ctx, c.world, World::TicketSlotBase(tk) + l, 1, buf.data(), "ticketDecay");
+      for (uint32_t w : buf) {
+        const uint32_t m = w & 0xFFFu;
+        h = (h ^ (w & ~0x00FF0000u)) * 16777619u;
+        if (m == (uint32_t)mEmber) ember++;
+        else if (m == (uint32_t)mFire) fire++;
+        else if (m == (uint32_t)mAsh) ash++;
+      }
+    }
+    if (hash) *hash = h;
+  };
+  const int cap = (int)BaselineNumber("ticketDecay.ticks", 2000);
+  for (int i = 1; i <= cap; i++) {
+    tick();
+    if (c.stream.TicketSet().StateOf(tk) != Tickets::State::Live) break;
+    if (i % 10 == 0) {
+      c.ctx.WaitIdle();
+      uint32_t e = 0, f = 0, a = 0;
+      census(e, f, a, nullptr);
+      R.fireSeen = std::max(R.fireSeen, f);
+      if (e == 0 && R.goneAt < 0) {
+        R.goneAt = i;
+        R.ash = a;
+        // The slab: every wood cell must still be wood.
+        R.woodKept = 0;
+        std::vector<uint32_t> buf(kChunkVol);
+        for (const IVec3& wc : woodCells) {
+          const uint32_t ci = c.world.ResidentCellIndex(wc);
+          if (ci == World::kTicketSlotNone) continue;
+          ReadVoxelsSync(c.ctx, c.world, ci / kChunkVol, 1, buf.data(), "ticketDecayWood");
+          if ((buf[ci % kChunkVol] & 0xFFFu) == (uint32_t)mWood) R.woodKept++;
+        }
+        census(e, f, a, &R.hash);
+        break;
+      }
+    }
+  }
+  // ...and with nothing left that can act, the ticket idles out.
+  for (int i = 0; i < 120 && c.stream.TicketSet().StateOf(tk) == Tickets::State::Live; i++)
+    tick();
+  R.released = c.stream.TicketSet().StateOf(tk) != Tickets::State::Live;
+  return true;
+}
+
+Status GateTicketDecay(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  DecayRun A, B;
+  std::string why;
+  const bool okA = RunDecay(c, A, why);
+  const bool okB = okA && RunDecay(c, B, why);
+  Regenerate(c);
+  if (!okA || !okB) {
+    detail = why;
+    return Status::Fail;
+  }
+  const double mult = BaselineNumber("ticketDecay.lifetimeMult", 9);
+  const int bound = (int)(A.meanLife * mult + 0.5);
+  const bool burntOut = A.goneAt >= 0 && A.goneAt <= bound;
+  const bool noSpread = A.woodKept == A.wood0 && A.fireSeen == 0;
+  const bool someAsh = A.ash > 0;
+  const bool same = A.goneAt == B.goneAt && A.hash == B.hash && A.woodKept == B.woodKept;
+  RecordObserved("ticketDecay.goneAt", (double)A.goneAt);
+  const bool ok = burntOut && noSpread && someAsh && A.released && same;
+  detail = Format(
+      "%u embers on a %u-cell wood slab 40 chunks past the window: all decayed by "
+      "+%d ticks (authored mean life %.0f, allow %.0fx = %d); %u ash left; wood "
+      "still wood %u / %u; fire cells seen %u (want 0: pair and emit rules do not "
+      "run in a ticket); ticket %s; run twice: %s",
+      A.embers, A.wood0, A.goneAt, A.meanLife, mult, bound, A.ash, A.woodKept, A.wood0,
+      A.fireSeen, A.released ? "released by idle" : "STILL LIVE",
+      same ? "IDENTICAL" : "DIVERGED");
+  std::printf("ticket-decay: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& TicketGates() {
@@ -486,6 +646,7 @@ const std::vector<Gate>& TicketGates() {
   static const std::vector<Gate> g = {
       {"ticket-settle", "sim", {}, false, GateTicketSettle},
       {"ticket-land", "sim", {}, false, GateTicketLand},
+      {"ticket-decay", "sim", {}, false, GateTicketDecay},
   };
   return g;
 }
