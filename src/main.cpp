@@ -834,6 +834,12 @@ bool g_burnHouseDone = false;
 bool g_burnNpc = false;
 int g_burnNpcAt = 240;
 bool g_burnNpcDone = false;
+// `--ticket x,y,z` (repeatable): request a CHUNK TICKET whose box holds the
+// world VOXEL (x, y, z) on the first tick (docs/PLAN_chunk_tickets.md P1, the
+// manual op). The request goes through the same policy as every other — a
+// point inside the window is a no-op, past the cap it is refused and counted
+// — and the F1 panel's Tickets line shows what became of it.
+std::vector<IVec3> g_ticketRequests;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
 // procedural surface route happens to stop.
 //
@@ -5389,6 +5395,13 @@ int main(int argc, char** argv) {
       g_burnNpc = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_burnNpcAt = std::atoi(argv[++i]);
     }
+    else if (a == "--ticket" && i + 1 < argc) {
+      int tx = 0, ty = 0, tz = 0;
+      if (std::sscanf(argv[++i], "%d,%d,%d", &tx, &ty, &tz) == 3)
+        g_ticketRequests.push_back({tx, ty, tz});
+      else
+        std::fprintf(stderr, "--ticket wants x,y,z (world voxels), got '%s'\n", argv[i]);
+    }
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -6406,6 +6419,9 @@ int main(int argc, char** argv) {
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
+  // --ticket: queued now, applied at the first Stream::Update's ticket step.
+  for (const IVec3& v : g_ticketRequests)
+    stream.TicketSet().Request({v.x >> 4, v.y >> 4, v.z >> 4}, TicketReason::Manual, 0);
   FarField far;
   far.Init(&world);
   StartupMark("physics, debris, mobs, far-field init");
@@ -14322,6 +14338,17 @@ int main(int argc, char** argv) {
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;
+      {
+        const TicketStats& ts = stream.TicketSet().Stats();
+        ui.ticketsLive = ts.live;
+        ui.ticketsReleasing = ts.releasing;
+        ui.ticketsCap = kTicketMax;
+        ui.ticketsActivated = ts.activated;
+        ui.ticketsReleased = ts.released;
+        ui.ticketsRefused = ts.refusedCap + ts.refusedPlacement;
+        ui.ticketLandingsParked = ts.landingsParked;
+        ui.ticketLines = stream.TicketSet().Describe(tick);
+      }
       ui.totalChunks = kNumSlots;
       ui.voxelTotal = world.Snap().voxelTotal;
       ui.worldHash = world.Snap().worldHash;

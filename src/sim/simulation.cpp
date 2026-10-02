@@ -2709,8 +2709,11 @@ uint32_t Simulation::WriteGenList(const rhi::Queue& queue,
 }
 
 void Simulation::WriteDenseGenList(const rhi::Queue& queue) {
-  std::vector<uint32_t> all(kNumSlots);
-  for (uint32_t s = 0; s < kNumSlots; s++) all[s] = s;
+  // The WINDOW's slots. The dense `main` dispatch covers NUM_SLOTS workgroups,
+  // but a ticket slot returns before genChunk (worldgen.wgsl: no ticket
+  // survives a regen), so its list position is never read.
+  std::vector<uint32_t> all(kNumChunks);
+  for (uint32_t s = 0; s < kNumChunks; s++) all[s] = s;
   WriteGenList(queue, all);
 }
 

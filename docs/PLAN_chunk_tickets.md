@@ -4,7 +4,9 @@ Status: **P0 LANDED 2026-09-08 on branch `tickets-p0`** (slot space + the
 addressing audit, `kTicketMax = 0`, bit-identical: the per-site classification
 and the three site classes this plan did not anticipate are in
 `docs/tickets_p0_audit.md`, and its "Deviations" section is the short list of
-what P1 inherits). P1 onward is design. Named "tickets" rather
+what P1 inherits). **P1 IMPLEMENTED 2026-10-02** (`src/sim/tickets.{h,cpp}`,
+`kTicketMax = 16`, the ticket table in `pageTable`'s tail, ops in the op
+record, gate `ticket-settle`; deviations in §6). Named "tickets" rather
 than "islands" because `docs/PLAN_rigidbody_islands.md` already owns that word
 for disconnected solid components. Companion: `docs/PLAN_gas_particles.md`
 (independent; phase 2 here can consume its `farVox` blocking).
@@ -320,3 +322,67 @@ when the window arrives. Decide when P3 has been lived with.
   P5 or a bigger window (see the `kWorldN` discussion: 1024×512×1024 is 4x
   memory, fits both `static_assert`s). Tickets are for things that LEAVE the
   window, not for simulating a region continuously.
+
+## 6. Deviations from this plan (P1–P4, as implemented)
+
+Each is a choice the plan left open or made differently, taken the way that
+keeps rules 1–3 provable. The code comments beside each say the same thing.
+
+### P1
+
+1. **The ticket map rides `pageTable`'s tail, not a new binding** (§2.2 asked
+   for a bound `ticketMap`). Every kernel that resolves a cell already binds
+   `pageTable`, which is GPU-read-only everywhere; appending
+   `kTicketTableWords` (132) after the `kNumSlots` entries costs no binding, no
+   layout and no pass-table row beyond the ten rows that now genuinely read it
+   through `ticketSlotOf` (`check_pass_table.py` found them).
+2. **Box tests, not an open-addressed hash.** Tickets are 16 boxes of 5³, not
+   2,000 arbitrary chunks: `ticketSlotOf` scans the COMPACT live list (n box
+   tests; a world with no ticket pays one load) and the slot inside a box is
+   arithmetic. Ticket `i` owns slots `[kNumChunks + 125 i, +125)`, and a box
+   chunk sits at the slot its coordinate takes **mod 5** — the window's own
+   toroidal rule at the box's size — so P4's re-centre refills one plane.
+3. **The active bit is derived, not a `ticketActive[]` array**: inner 3³ = box
+   offset 1..3 on every axis, from the table. `sim_compact.wgsl`'s `main` skips
+   a dirty shell slot; `mainNext` keeps it (occupancy and digest update).
+4. **The renderer keeps the P0 stub.** The probe is compiled only into shaders
+   that declare `pageTable` and are not render shaders (`uniform> R :`):
+   common.wgsl's `TICKET_BOUND`/`TICKET_UNBOUND` blocks, selected by
+   `BodyResolvesTickets` (resources.cpp) and mirrored in `check_shaders.sh` /
+   `check_pass_table.py`. `TICKET_PROBE` is a const, so the raymarch DDA is
+   unchanged by P1; P4 draws tickets through its own box march.
+5. **A ticket miss falls back to the masked window slot** in `voxSlotOfCell`
+   (the pre-ticket aliased read), never `SLOT_NONE` as an index.
+6. **Every ticket slot holds a real page for its whole life** (paged). Nothing
+   materializes a ticket chunk on demand — the mirror's N26 ring is window
+   arithmetic — so a sentinel in a ticket would be a page fault on the first
+   write. The free path skips live ticket slots; release frees all 125 at once.
+   2 MiB per ticket, exactly the `kTicketSlots` the pool grew by.
+7. **The release is two-phase.** At tick T the box leaves the table and all
+   125 slots are copied out; which chunks the store KEEPS is decided when the
+   snapshot of T-1 is published (a chunk is kept iff some published snapshot
+   since activation showed it dirty). Deciding at T would miss a particle that
+   landed in the last `kSnapshotLatency` ticks. A fill that needs one of those
+   chunks first forces the batch and keeps all 125 — conservative, never lossy.
+8. **Idle = the 27 active chunks clean in `kTicketIdleTicks` (30) consecutive
+   published snapshots**; `kTicketMaxTicks` = 1,800 (60 s). Both read
+   `World::Snap()`, the fixed-latency view, so a release is tick-deterministic.
+9. **Placement slides the box** rather than refusing: up to 125 offsets that
+   keep the requested chunk inside the box are tried (interior first, nearest
+   the centre, then lexicographic), skipping any that touch the window or a
+   live box. Refused only when all 125 collide (counted as `refusedPlacement`).
+10. **The ops are recorded, not replayed from the record** — `Frame::tickets`
+    (record version 7) carries every decision; a replay re-derives them (they
+    are a pure function of the recorded inputs and the fixed-latency snapshot,
+    exactly like `genList`) and COMPARES (`ReplayTicketMismatches`).
+11. **Regen / load / teleport DROP tickets** (`ReloadWindow`, `OnRegen`,
+    `SubmitWorldgen`): those paths discard in-flight evictions already, so the
+    tickets are forgotten with them. A SAVE includes live ticket slots.
+12. **`ticket-settle` proves "the window arriving finds the pile" through the
+    store-hit door a second ticket takes** (FillSlots' store branch, the one a
+    window shift uses) plus a direct `ChunkStore` decode, instead of shifting
+    the window 40 chunks. paged == dense is the `determinism` gate run with
+    `--residency dense` — that gate now opens a ticket and pours into it.
+13. **P0 missed a literal**: `SOL_POOL_PAGES` (the solute pool, derived from
+    `kNumSlots` in C++) was `4096u` in four WGSL mirror blocks;
+    `check_invariants.py` caught it the moment `kNumSlots` moved.

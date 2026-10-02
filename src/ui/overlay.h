@@ -32,6 +32,13 @@ struct UIState {
   // file sees only its own header and ImGui — a fresh literal would just be the
   // same bug again, one window resize later.
   uint32_t totalChunks = 0;
+  // CHUNK TICKETS (src/sim/tickets.h): live / releasing / cap, the run's
+  // activations / releases / refusals, and one line per live ticket. Filled
+  // by main.cpp from Stream::TicketSet(); read-only here.
+  uint32_t ticketsLive = 0, ticketsReleasing = 0, ticketsCap = 0;
+  uint64_t ticketsActivated = 0, ticketsReleased = 0, ticketsRefused = 0;
+  uint32_t ticketLandingsParked = 0;
+  std::vector<std::string> ticketLines;
   uint64_t voxelTotal = 0;
   uint32_t worldHash = 0;
   uint32_t particleCount = 0;

@@ -109,7 +109,10 @@ void World::Init(const rhi::Device& device) {
   // pool size is decided, and PoolPages() is the ONLY reader of the mode.
   voxels = CreateBuffer(device, (uint64_t)PoolPages() * kChunkVol * 4,
                         U::Storage | U::CopySrc | U::CopyDst, "voxels");
-  pageTable = CreateBuffer(device, (uint64_t)kNumSlots * 4,
+  // kNumSlots entries plus the ticket table in the tail (world.h
+  // kTicketTable*): the ticket map rides this buffer because every kernel that
+  // resolves a cell already binds it.
+  pageTable = CreateBuffer(device, (uint64_t)kPageTableWords * 4,
                            U::Storage | U::CopySrc | U::CopyDst, "pageTable");
   pageFaults = CreateBuffer(device, kPageFaultBytes,
                             U::Storage | U::CopySrc | U::CopyDst, "pageFaults");
@@ -134,6 +137,10 @@ void World::Init(const rhi::Device& device) {
   // pre-paging code, which is why --residency dense is the phase's oracle.
   pages = new PageTable();
   pages->Init(device, *this);
+  // The ticket table starts EMPTY (no live box): CreateBuffer does not zero,
+  // and a garbage live count in the tail would send every out-of-window
+  // resolution through garbage boxes. Tickets re-uploads it on every change.
+  UploadTicketTable(device.GetQueue());
   dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
   dirty[1] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyB");
   dirtyList = CreateBuffer(device, kNumSlots * 4, U::Storage, "dirtyList");
@@ -711,6 +718,32 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                     kFluidMirrorOff, kFluidMirrorBytes);
   lastSlot_ = slot;
   return true;
+}
+
+// The ticket table's GPU image (world.h kTicketTable*), rebuilt from
+// tickets_ in full: 132 words, written only when Tickets changes a box. The
+// compact live list is in INDEX order, so its contents are a pure function of
+// the table (rule 1: the GPU's resolution order cannot depend on history).
+void World::UploadTicketTable(const rhi::Queue& queue) const {
+  uint32_t w[kTicketTableWords] = {};
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < kTicketMax; i++) {
+    const TicketBox& t = tickets_[i];
+    uint32_t* idx = &w[kTicketTableIdxOff + 4 * i];
+    idx[0] = (uint32_t)t.lo.x;
+    idx[1] = (uint32_t)t.lo.y;
+    idx[2] = (uint32_t)t.lo.z;
+    idx[3] = t.live ? 1u : 0u;
+    if (!t.live) continue;
+    uint32_t* l = &w[kTicketTableListOff + 4 * n];
+    l[0] = (uint32_t)t.lo.x;
+    l[1] = (uint32_t)t.lo.y;
+    l[2] = (uint32_t)t.lo.z;
+    l[3] = i;
+    n++;
+  }
+  w[0] = n;
+  queue.WriteBuffer(pageTable, (uint64_t)kTicketTableBase * 4, w, sizeof(w));
 }
 
 void World::EncodeDirtyCopy(const rhi::CommandEncoder& enc, const rhi::Buffer& dirtyNext) {

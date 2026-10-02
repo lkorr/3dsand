@@ -1393,6 +1393,14 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     const uint32_t s = i + scanStart >= kNumSlots ? i + scanStart - kNumSlots
                                                    : i + scanStart;
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
+    // A LIVE TICKET'S PAGES ARE NOT THE FREE PATH'S (docs/PLAN_chunk_tickets.md
+    // §2.4). A ticket holds a real page in every one of its 125 slots for its
+    // whole life — no sentinel, no Materialize ring, nothing for a probe to
+    // reclaim — and gives them back in one step when it releases. An all-air
+    // ticket chunk is still one the box's interior may write next tick, and
+    // the mirror's N26 ring never reaches a ticket slot (DilateN26 is window
+    // arithmetic), so freeing it here would be a dropped store, not a saving.
+    if (world_->TicketSlotLive(s)) { zeroStreak_[s] = 0; continue; }
     if (zeroStreak_[s] < 255) zeroStreak_[s]++;
     // The free DECISION iterates only slots whose counter just reached the
     // threshold, which in a settled world is ZERO slots after the first

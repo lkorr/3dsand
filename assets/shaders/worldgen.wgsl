@@ -5215,9 +5215,28 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
 
 // The whole slot space: NUM_SLOTS workgroups. Publishes no verdict (genAct is
 // sized for a list, and nothing classifies a dense whole-world dispatch).
+//
+// A TICKET SLOT IS NOT GENERATED HERE (chunk tickets P1). The whole-world
+// dispatch is a world RESET, and every ticket is dropped before one
+// (SubmitWorldgen -> Tickets::DropAll), so a ticket slot names no chunk at all:
+// it is written as AIR, with no occupancy and no wake, and stays that way until
+// a ticket activates it through `list`. Generating it would wake chunks no
+// window coordinate reaches, at whatever box the table last held. Workgroup-
+// uniform (wg.x), so the early return keeps genChunk's barriers in uniform
+// control flow.
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
+  if (wg.x >= NUM_CHUNKS && !ticketSlotLive(wg.x)) {
+    for (var i = li; i < CHUNK_VOL; i += 64u) { voxStore(voxWordInChunk(wg.x, i), 0u); }
+    if (li == 0u) {
+      occupancy[wg.x] = 0u;
+      storeSubOcc(wg.x, 0u, 0u, 0u, 0u);
+      atomicStore(&dirtyIn[wg.x], 0u);
+      atomicStore(&dirtyOut[wg.x], 0u);
+    }
+    return;
+  }
   genChunk(wg.x, li, wg.x, false);
 }
 

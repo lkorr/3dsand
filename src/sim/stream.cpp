@@ -193,6 +193,10 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // ...and the far fire-plume index beside it, for SubmitTick to build the
   // emitter list from (world.h's `farPlumes`).
   world_->farPlumes = &farPlumes_;
+  // ...and the chunk tickets (src/sim/tickets.h), for SubmitWorldgen to drop
+  // before a regen (world.h's `tickets`).
+  tickets_.Init(world_, this);
+  world_->tickets = &tickets_;
   modified_.assign(kNumSlots, 0);
   // The window is about to be generated from nothing: the delta save's
   // coverage proof starts here (FlushResident in stream.h).
@@ -227,8 +231,11 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
   // Update(IVec3, tick), not an accident to be tidied away later.
   const IVec3 playerChunk = interest.Primary();
   lastTick_ = tick;
-  // harvest evictions whose readback completed since last tick (non-blocking)
-  while (!pending_.empty() && pending_.front().map.Ready())
+  // harvest evictions whose readback completed since last tick (non-blocking).
+  // A ticket batch whose keep decision has not been made yet waits (it is
+  // made within kSnapshotLatency ticks; see Tickets, THE RELEASE IS TWO-PHASE).
+  while (!pending_.empty() && pending_.front().map.Ready() &&
+         !pending_.front().keepPending)
     CompleteOldest(/*discard=*/false);
   // harvest completed shift-demote batches (non-blocking; see HarvestDemotes)
   HarvestDemotes(tick);
@@ -241,6 +248,14 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
   // latent; see the accepted-race note in stream.h)
   FoldSnapshot();
   timing_.dirtyFoldMs += PtNowMs() - uT1;
+
+  // ---- CHUNK TICKETS (src/sim/tickets.h) ---------------------------------
+  // The between-ticks step: fold the published snapshot, finalize / release /
+  // activate / re-centre. Here, after the eviction harvest and before the
+  // deferred wakes and the shift, because a ticket's fill and release are
+  // submits of the same kind a shift makes, and the window-overlap release
+  // below must see the tickets this step left live.
+  TicketTick(tick);
 
   IVec3 o = world_->WindowOrigin();
   int half = (int)kNChunk / 2;
@@ -315,7 +330,18 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
   // R4: at most one shift per FRAME (see BeginFrame in stream.h). Ungated for
   // callers with no frame loop, where one Update is one tick anyway.
   if (best >= 0 && !(frameGated_ && shiftedThisFrame_)) {
-    ShiftAxis(best, d[best] > 0 ? 1 : -1);
+    // THE WINDOW-OVERLAP RULE (docs/PLAN_chunk_tickets.md §2.4). A ticket box
+    // the shifted window would cover is RELEASED first: its chunks go to the
+    // store (the batch is forced by the plane fill's drain, keep-all), so the
+    // plane decodes the ticket's state instead of regenerating over it, and
+    // no chunk is ever resident twice.
+    IVec3 no = o;
+    const int dir = d[best] > 0 ? 1 : -1;
+    if (best == 0) no.x += dir;
+    else if (best == 1) no.y += dir;
+    else no.z += dir;
+    tickets_.ReleaseOverlapping(no, tick);
+    ShiftAxis(best, dir);
     shiftedThisFrame_ = true;
   }
   timing_.totalMs += PtNowMs() - uT0;
@@ -636,6 +662,14 @@ void Stream::CompleteOldest(bool discard) {
           // the page-roundtrip gate asserts that equality against
           // SynthWordAt + RleEncodeChunk directly.
           const uint32_t e = i < p.sentinel.size() ? p.sentinel[i] : 0u;
+          // A TICKET batch whose keep decision was made: a chunk no published
+          // snapshot ever showed dirty is what procgen or the store already
+          // reproduces, so it is not put (EvictSlots' re-derivability
+          // argument, decided exactly). Forced before the decision, it keeps
+          // everything — never lossy.
+          if (p.keepHandle != 0 && !p.keepPending && i < p.keep.size() &&
+              p.keep[i] == 0)
+            continue;
           const double ts = dbg ? PtNowMs() : 0.0;
           if (e != 0u) {
             RleEncodeSentinelChunk(e, p.items[i].wc, seed_, rle);
@@ -698,6 +732,10 @@ void Stream::CompleteOldest(bool discard) {
   for (const PendingEvict::Item& it : p.items) {
     auto pc = pendingChunks_.find(World::PackChunkKey(it.wc));
     if (pc != pendingChunks_.end() && --pc->second == 0) pendingChunks_.erase(pc);
+    if (p.keepHandle != 0) {
+      auto tk = ticketKeys_.find(World::PackChunkKey(it.wc));
+      if (tk != ticketKeys_.end() && --tk->second == 0) ticketKeys_.erase(tk);
+    }
   }
   if (dbg)
     std::printf("[pt-time] evict harvest: %zu items total %.2f ms (wait %.2f, "
@@ -734,7 +772,13 @@ void Stream::InstallChunkWords(uint32_t s, IVec3 wc, const uint32_t* words) {
     // This is also the ONE place UNIFORM discovery lives (§3.6, with commit
     // 0's measurement behind it): the paths that already hold the words get
     // demotion, and the tick path does not get a GPU uniformity scan.
-    const uint32_t entry = world_->residency == World::Residency::Paged
+    //
+    // NOT for a ticket slot: a ticket holds a real page in every slot for its
+    // whole life (tickets.h), because nothing materializes a ticket chunk on
+    // demand — the mirror's N26 ring is window arithmetic — so a sentinel
+    // there would turn the first write into a page fault.
+    const uint32_t entry = world_->residency == World::Residency::Paged &&
+                                   World::IsWindowSlot(s)
                                ? world_->pages->Classify(s, words)
                                : PageTable::kNeedsPage;
     if (entry != PageTable::kNeedsPage) {
@@ -950,7 +994,8 @@ bool Stream::DeliverMiss(IVec3 wc) {
   return true;
 }
 
-void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
+void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake,
+                       bool ticket) {
   const double fT0 = PtNowMs();
   if (world_->residency == World::Residency::Paged)
     world_->pages->ResetStreaks(slots);
@@ -986,13 +1031,20 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     // first slot of every shift, because EvictSlots had just inserted all
     // 1,024 of them. This is the residency-INDEPENDENT half of the shift
     // hitch: it runs identically under dense and paged.
-    if (!(s < shiftEvicted_.size() && shiftEvicted_[s]))
-      while (pendingChunks_.count(World::PackChunkKey(wc)))
+    //
+    // ...UNLESS a TICKET batch holds the chunk (ticketKeys_): a ticket the
+    // shift released for overlapping this plane (Tickets::ReleaseOverlapping)
+    // is not this shift's eviction, and its bytes are the only copy of the
+    // chunk the plane is about to read. Forcing it keeps all 125 (stream.h).
+    const uint64_t key = World::PackChunkKey(wc);
+    if (!(s < shiftEvicted_.size() && shiftEvicted_[s]) || ticketKeys_.count(key))
+      while (pendingChunks_.count(key))
         CompleteOldest(/*discard=*/false);
     const std::vector<uint32_t>* rle = store_.Get(wc);
     if (rle && RleDecodeChunk(rle->data(), rle->size() / 2, data.data())) {
       InstallChunkWords(s, wc, data.data());
-    } else if (exchange_ && !fillIgnoresExchange_ && exchange_->Wanted(wc)) {
+    } else if (!ticket && exchange_ && !fillIgnoresExchange_ &&
+               exchange_->Wanted(wc)) {
       // THE REFILL HOOK (M9.5-A). My store has never seen this chunk, but the
       // exchange knows somebody else has a MODIFIED copy of it - so procgen
       // would be the wrong answer, not merely a slow one: it would paint
@@ -1053,7 +1105,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     // regenerated on this tick would rebuild different planes and diverge on
     // the first window shift. Stashed here, folded into this tick's frame by
     // SubmitTick. Free unless a record or a replay is armed.
-    sandvox::opstream::NoteGenList(lastTick_, genSlots);
+    // A TICKET fill is recorded as its TicketOp instead (tickets.h): stashing
+    // its list here would overwrite the same tick's shift plane.
+    if (!ticket) sandvox::opstream::NoteGenList(lastTick_, genSlots);
     // genList plus the column cache's chunk-column table, against the window
     // origin written into tickUBO below (Simulation::WriteGenList).
     sim_->WriteGenList(ctx_->queue, genSlots);
@@ -1127,7 +1181,15 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     // the only live differential oracle this system has.
     const uint64_t occBytes = (uint64_t)kNumSlots * 4;
     const uint64_t actBytes = (uint64_t)genSlots.size() * 4;
-    if (deferWake) {
+    if (ticket) {
+      // ---- A TICKET'S GEN: NO VERDICT, NO DEMOTE, NO READBACK -------------
+      // genChunk woke its act set in-kernel (genDeferWake 0), every slot has
+      // a page for the ticket's life (no sky demotion to undo), and the
+      // page-table mirror needs no act set: nothing it materializes reaches a
+      // ticket slot. What remains is the settled-skip latch's declaration —
+      // the one waking path here that is not an Encode* entry point.
+      sim_->NoteWakeAll();
+    } else if (deferWake) {
       // genAct is sized to ONE PLANE, which is the only thing that defers.
       if (genSlots.size() > (size_t)kNChunk * kNChunk) {
         std::fprintf(stderr,
@@ -1201,6 +1263,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
   // Whatever dissolved mass is kept for the chunks now in these slots goes
   // back onto the GPU (after the voxels, so the solvent it rides is there).
   RestoreSolutes(slots);
+  // Far landings parked on a chunk that just became resident are re-thrown
+  // (P2, tickets.h): the window arriving is one of the two ways a landing
+  // materializes; a ticket activating over it is the other.
+  for (uint32_t s : slots) tickets_.OnChunkResident(world_->SlotToWorldChunk(s));
 }
 
 // ---- the deferred wake's second half -------------------------------------
@@ -1814,6 +1880,13 @@ Stream::FlushReport Stream::FlushResident(bool forceFull) {
   FlushReport rep;
   std::vector<uint32_t> slots(kNumChunks);
   for (uint32_t i = 0; i < kNumChunks; i++) slots[i] = i;
+  // ...and every LIVE TICKET's slots (docs/PLAN_chunk_tickets.md §2.4): a
+  // ticket is resident world the window does not cover, and a save that
+  // skipped it would lose whatever settled there. The ticket keeps running;
+  // a load does not restore it (tickets are dropped on load), but its chunks
+  // come back from the store when the window or a new ticket reaches them.
+  for (uint32_t s = kNumChunks; s < kNumSlots; s++)
+    if (world_->TicketSlotLive(s)) slots.push_back(s);
   std::vector<uint8_t> mask;
   if (forceFull) {
     rep.why = "full flush forced by the caller";
@@ -1838,6 +1911,9 @@ void Stream::ReloadWindow(IVec3 origin) {
   DrainEvictions(/*discard=*/true);
   DiscardDemotes();  // same: old-world bytes must never classify the new one
   DiscardPendingShifts();  // and so do any un-enacted shift verdicts
+  // ...and the tickets: the evictions they would release into were just
+  // discarded with the rest, so they are dropped, not released (tickets.h).
+  DropTickets();
   // The solute layer's slots describe the window being replaced: keep what
   // they hold (a teleport must not delete the salt it leaves behind), then
   // clear the layer. The refill below restores whatever is kept for the
@@ -2094,4 +2170,119 @@ void Stream::CaptureResidentSolutes(SoluteMap& into) {
     }
     into[World::PackChunkKey(world_->SlotToWorldChunk(s))] = std::move(sc);
   }
+}
+
+// ============================================================================
+// CHUNK TICKETS: the four doors (src/sim/tickets.h, docs/PLAN_chunk_tickets.md)
+//
+// Tickets decides; these execute. Every one runs BETWEEN ticks (from
+// Tickets::Tick, inside Stream::Update or TicketTick), so each submit and
+// deferred write lands before the tick that first sees the new table.
+// ============================================================================
+void Stream::TicketTick(uint32_t tick) {
+  if (!ctx_ || !world_) return;
+  lastTick_ = tick;
+  tickets_.Tick(tick);
+}
+
+void Stream::DropTickets() {
+  if (ctx_) tickets_.DropAll(ctx_->queue);
+}
+
+void Stream::FillTicketSlots(const std::vector<uint32_t>& slots) {
+  if (slots.empty()) return;
+  // FillSlots' own store-hit and gen branches (one implementation of a
+  // refill), with `ticket` set: no exchange hold, no sentinel, no verdict.
+  FillSlots(slots, /*deferWake=*/false, /*ticket=*/true);
+}
+
+uint64_t Stream::EvictTicketSlots(const std::vector<uint32_t>& slots) {
+  if (slots.empty()) return 0;
+  // The dissolved mass leaves with the chunks, read back like a shift's.
+  EvictSolutes(slots);
+  // ALL of them, unfiltered: the keep decision needs snapshots that have not
+  // been published yet (tickets.h, THE RELEASE IS TWO-PHASE), and a copy taken
+  // later would see a slot the next ticket may already be refilling. One
+  // batch: a ticket is 125 slots, under kEvictBatch.
+  const uint64_t handle = ++evictHandleSeq_;
+  for (size_t off = 0; off < slots.size(); off += kEvictBatch) {
+    const size_t n = std::min(kEvictBatch, slots.size() - off);
+    PendingEvict p;
+    p.staging = AcquireStaging();
+    p.tick = lastTick_;
+    p.keepHandle = handle;
+    p.keepPending = true;
+    p.items.reserve(n);
+    rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t s = slots[off + i];
+      const IVec3 wc = world_->SlotToWorldChunk(s);
+      // `edited` true: a kept chunk is by construction one some snapshot saw
+      // written, which is exactly what the far-field edit index wants.
+      p.items.push_back({wc, true});
+      const uint64_t srcOff = world_->PageOffsetOfSlot(s);
+      p.sentinel.push_back(srcOff == World::kNoPage ? world_->PageEntryOfSlot(s) : 0u);
+      if (srcOff != World::kNoPage)
+        enc.CopyTracked(pass::Buf::Voxels, world_->voxels, srcOff, p.staging,
+                        i * kChunkBytes, kChunkBytes);
+      const uint64_t key = World::PackChunkKey(wc);
+      pendingChunks_[key]++;
+      ticketKeys_[key]++;
+    }
+    // Submitted EAGERLY, for EvictSlots' reason: the slots are cleared (or
+    // refilled, on a re-centre) by deferred writes queued after this, so the
+    // copy reads what the ticket held through the previous tick.
+    ctx_->queue.Submit(enc.Finish());
+    p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, n * kChunkBytes);
+    pending_.push_back(std::move(p));
+  }
+  return handle;
+}
+
+void Stream::SetEvictKeep(uint64_t handle, const std::vector<uint8_t>& keep) {
+  if (handle == 0) return;
+  size_t at = 0;
+  for (PendingEvict& p : pending_) {
+    if (p.keepHandle != handle) continue;
+    // Keep is parallel to the slot list across the handle's batches.
+    p.keep.assign(p.items.size(), 1u);
+    for (size_t i = 0; i < p.items.size() && at + i < keep.size(); i++)
+      p.keep[i] = keep[at + i];
+    at += p.items.size();
+    p.keepPending = false;
+  }
+  // Not found = already forced (a fill wanted the chunk first, a save drained
+  // it): it kept every item, which is the conservative answer.
+}
+
+void Stream::ClearTicketSlots(const std::vector<uint32_t>& slots) {
+  if (slots.empty()) return;
+  static const std::vector<uint32_t> kAir(kChunkVol, 0u);
+  const uint32_t zero = 0;
+  const uint32_t sub[kSubOccStride] = {};
+  for (uint32_t s : slots) {
+    if (world_->residency == World::Residency::Paged) {
+      // The page goes back to the free list. Safe against the eviction copy
+      // that just read it: that copy was submitted before any later write
+      // that reuses the page can be (queue order, EvictSlots' argument).
+      world_->pages->SetSentinel(s, kPtEmpty);
+    } else {
+      // Dense has no sentinel: the identity map's page must hold real air,
+      // or the whole-world hash would keep counting the departed chunk and
+      // paged == dense would fail (docs/PLAN_chunk_tickets.md §2.8).
+      const uint64_t off = world_->PageOffsetOfSlot(s);
+      if (off != World::kNoPage)
+        ctx_->queue.WriteBuffer(world_->voxels, off, kAir.data(), kChunkBytes);
+    }
+    ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &zero, 4);
+    ctx_->queue.WriteBuffer(world_->occupancy,
+                            ((uint64_t)kNumSlots + (uint64_t)s * kSubOccStride) * 4,
+                            sub, sizeof(sub));
+    ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &zero, 4);
+    ctx_->queue.WriteBuffer(world_->dirty[1], (uint64_t)s * 4, &zero, 4);
+    modified_[s] = 0;
+    world_->NoteSlotTouched(s);
+  }
+  if (world_->residency == World::Residency::Paged)
+    world_->pages->FlushTableWrites(ctx_->queue);
 }

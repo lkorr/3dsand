@@ -222,6 +222,14 @@ static std::string BuildShaderConstantPrelude() {
   // At kTicketMax = 0 they are equal, which is what makes P0 bit-identical.
   o << "const TICKET_SLOTS : u32 = " << kTicketSlots << "u;\n";
   o << "const NUM_SLOTS : u32 = " << kNumSlots << "u;\n";
+  // The ticket table in pageTable's tail (world.h kTicketTable*, P1). ADD ONE
+  // HERE, ADD IT TO scripts/check_shaders.sh TOO.
+  o << "const TICKET_MAX : u32 = " << kTicketMax << "u;\n";
+  o << "const TICKET_BOX_N : u32 = " << kTicketBoxN << "u;\n";
+  o << "const TICKET_CHUNKS : u32 = " << kTicketChunks << "u;\n";
+  o << "const TICKET_TABLE_BASE : u32 = " << kTicketTableBase << "u;\n";
+  o << "const TICKET_TABLE_LIST_OFF : u32 = " << kTicketTableListOff << "u;\n";
+  o << "const TICKET_TABLE_IDX_OFF : u32 = " << kTicketTableIdxOff << "u;\n";
   // Toroidal addressing masks/shifts (DESIGN.md §3) — sizes are powers of two,
   // so world->slot mapping is a bitmask even for negative world coords.
   uint32_t chunkShift = 0;
@@ -474,6 +482,25 @@ constexpr const char* kDraftBoundEnd = ">>>DRAFT_BOUND_END<<<";
 constexpr const char* kDraftUnboundBegin = ">>>DRAFT_UNBOUND_BEGIN<<<";
 constexpr const char* kDraftUnboundEnd = ">>>DRAFT_UNBOUND_END<<<";
 
+// THE TICKET PROBE (common.wgsl's TICKET_BOUND / TICKET_UNBOUND blocks,
+// chunk tickets P1). Exactly one survives. BOUND — the real resolver, reading
+// the ticket table in pageTable's tail — for a body that declares `pageTable`
+// and is not a render shader (`uniform> R :`): the kernels that simulate read
+// and write ticket cells like window cells. Every other body keeps the stub,
+// whose TICKET_PROBE = false const-folds every ticket arm away; the renderer
+// draws tickets through its own box march (raymarch.wgsl) and must not pay a
+// probe on every voxWordAt of its DDA. Same body-derived predicate as the
+// page block, so a new shader cannot desync a list.
+constexpr const char* kTicketBoundBegin = ">>>TICKET_BOUND_BEGIN<<<";
+constexpr const char* kTicketBoundEnd = ">>>TICKET_BOUND_END<<<";
+constexpr const char* kTicketUnboundBegin = ">>>TICKET_UNBOUND_BEGIN<<<";
+constexpr const char* kTicketUnboundEnd = ">>>TICKET_UNBOUND_END<<<";
+
+bool BodyResolvesTickets(const std::string& body) {
+  return body.find("> pageTable") != std::string::npos &&
+         body.find("uniform> R :") == std::string::npos;
+}
+
 bool BodyReadsDrafts(const std::string& body) {
   return body.find("> draftField") != std::string::npos;
 }
@@ -652,6 +679,11 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     common = StripBlock(common, kDraftUnboundBegin, kDraftUnboundEnd);
   } else {
     common = StripBlock(common, kDraftBoundBegin, kDraftBoundEnd);
+  }
+  if (BodyResolvesTickets(body)) {
+    common = StripBlock(common, kTicketUnboundBegin, kTicketUnboundEnd);
+  } else {
+    common = StripBlock(common, kTicketBoundBegin, kTicketBoundEnd);
   }
   if (!BodyAddressesVoxels(body)) {
     common = StripBlock(common, kPageBlockBegin, kPageBlockEnd);

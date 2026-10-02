@@ -93,6 +93,10 @@ W_TICKETCHUNKS=$((W_TICKETBOXN * W_TICKETBOXN * W_TICKETBOXN))
 W_TICKETSLOTS=$(( ((W_TICKETMAX * W_TICKETCHUNKS + 63) / 64) * 64 ))
 W_NUMCHUNKS=$((W_NCHUNK * W_NCHUNK * W_NCHUNK))
 W_NUMSLOTS=$((W_NUMCHUNKS + W_TICKETSLOTS))
+# The ticket table in pageTable's tail (world.h kTicketTable*): offsets are
+# expressions there, so redo them exactly as world.h does.
+W_TICKETLISTOFF=4
+W_TICKETIDXOFF=$((4 + 4 * W_TICKETMAX))
 
 # Sub-chunk occupancy bitmask (world.h kSubOccShift block). kSubOccDim and
 # kSubOccStride are expressions there, so scrape the two literals and redo the
@@ -311,6 +315,12 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const NUM_CHUNKS : u32 = ${W_NUMCHUNKS}u;" \
   "const TICKET_SLOTS : u32 = ${W_TICKETSLOTS}u;" \
   "const NUM_SLOTS : u32 = ${W_NUMSLOTS}u;" \
+  "const TICKET_MAX : u32 = ${W_TICKETMAX}u;" \
+  "const TICKET_BOX_N : u32 = ${W_TICKETBOXN}u;" \
+  "const TICKET_CHUNKS : u32 = ${W_TICKETCHUNKS}u;" \
+  "const TICKET_TABLE_BASE : u32 = ${W_NUMSLOTS}u;" \
+  "const TICKET_TABLE_LIST_OFF : u32 = ${W_TICKETLISTOFF}u;" \
+  "const TICKET_TABLE_IDX_OFF : u32 = ${W_TICKETIDXOFF}u;" \
   "const CHUNK_VOL : u32 = $((W_CHUNK * W_CHUNK * W_CHUNK))u;" \
   "const CHUNK_SHIFT : u32 = ${W_SHIFT}u;" \
   "const CHUNK_MASK : i32 = $((W_CHUNK - 1));" \
@@ -481,8 +491,14 @@ for f in "${FILES[@]}"; do
   # BodyReadsDrafts) -- so the strip below always runs.
   stripDraftB=1; stripDraftU=0
   if grep -q '> draftField' "$f"; then stripDraftB=0; stripDraftU=1; fi
+  # THE TICKET PROBE (LoadShader's BodyResolvesTickets): BOUND for a body that
+  # declares `> pageTable` and no `uniform> R :`, UNBOUND otherwise.
+  stripTicketB=1; stripTicketU=0
+  if grep -q '> pageTable' "$f" && ! grep -q 'uniform> R :' "$f"; then
+    stripTicketB=0; stripTicketU=1
+  fi
   commonSrc="$TMP/common_${name}"
-  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" '
+  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" '
     /PAGE_TABLE_WRITE_BEGIN/ { print; s = sw; next }
     /PAGE_TABLE_WRITE_END/   { print; s = 0;  next }
     /PAGE_TABLE_BEGIN/       { print; s = sr; next }
@@ -493,6 +509,10 @@ for f in "${FILES[@]}"; do
     /DRAFT_UNBOUND_END/      { print; s = 0;  next }
     /DRAFT_BOUND_BEGIN/      { print; s = db; next }
     /DRAFT_BOUND_END/        { print; s = 0;  next }
+    /TICKET_UNBOUND_BEGIN/   { print; s = tu; next }
+    /TICKET_UNBOUND_END/     { print; s = 0;  next }
+    /TICKET_BOUND_BEGIN/     { print; s = tb; next }
+    /TICKET_BOUND_END/       { print; s = 0;  next }
     s                        { print ""; next }
     { print }
   ' "$COMMON" > "$commonSrc"

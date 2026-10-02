@@ -292,12 +292,50 @@ std::vector<uint32_t> hashes[2];
 uint32_t gasDigest[2] = {}, gasLiveEnd[2] = {};
 const std::vector<uint32_t> probeTicks = DetProbeTicks("SANDVOX_DET_PROBE");
 std::map<uint32_t, DetProbe> probe[2];
+// ---- WITH A CHUNK TICKET LIVE (docs/PLAN_chunk_tickets.md §2.8) ----------
+// Rule 1 has to hold with tickets active, and this is the gate that says so:
+// a ticket 40 chunks past the window's +X face is requested at tick 20 and
+// 2,048 sand is poured into it at tick 22, so the hash series below covers a
+// box the CA simulates outside the window, its idle release and the store
+// decision the release makes. The ticket step runs through
+// Stream::TicketTick, the between-ticks half of Stream::Update, because this
+// gate ticks with SubmitTick and no Update. The store is cleared before each
+// run (OnRegen): run 2 finding run 1's released pile would be a different
+// world, which is the store working. `--residency dense` runs this same gate
+// for paged == dense.
+const int mSandDet = [&] {
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "sand") return (int)i;
+  return -1;
+}();
 for (int run = 0; run < 2; run++) {
+  c.stream.OnRegen();
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
+  const IVec3 wo = world.WindowOrigin();
+  const IVec3 tkCentre{wo.x + (int)kNChunk - 1 + 40,
+                       (World::TerrainHeight((wo.x + (int)kNChunk + 39) * (int)kChunk + 8,
+                                             (wo.z + (int)kNChunk / 2) * (int)kChunk + 8,
+                                             kDefaultSeed) + 6) >> 4,
+                       wo.z + (int)kNChunk / 2};
   for (uint32_t t = 1; t <= kTicks; t++) {
+    if (t == 20) c.stream.TicketSet().Request(tkCentre, TicketReason::Gate, t);
+    c.stream.TicketTick(t);
+    std::vector<CellOp> tkPour;
+    if (t == 22 && mSandDet >= 0) {
+      const int gy = World::TerrainHeight(tkCentre.x * (int)kChunk + 8,
+                                          tkCentre.z * (int)kChunk + 8, kDefaultSeed);
+      for (int y = gy + 3; y < gy + 11; y++)
+        for (int z = 0; z < (int)kChunk; z++)
+          for (int x = 0; x < (int)kChunk; x++) {
+            const uint32_t ci = world.ResidentCellIndex(
+                {tkCentre.x * (int)kChunk + x, y, tkCentre.z * (int)kChunk + z});
+            if (ci != World::kTicketSlotNone)
+              tkPour.push_back({ci, PackVoxNew((uint32_t)mSandDet, 0) | kCellOpIfAir});
+          }
+    }
     SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t, kDefaultSeed),
-               SelftestExps(t, kDefaultSeed), {}, true, {8, 3, 8}, false,
+               SelftestExps(t, kDefaultSeed), tkPour, true, {8, 3, 8}, false,
                SelftestParticlesActive(t));
     hashes[run].push_back(ReadHashSync(ctx, world));
     if (std::find(probeTicks.begin(), probeTicks.end(), t) != probeTicks.end()) {
@@ -483,6 +521,11 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     // simulation.h): the caller must derive it only from tick-deterministic
     // inputs, and "have we reached tick 30" is one.
     bool pactive = i >= 30;
+    // The chunk-ticket step (docs/PLAN_chunk_tickets.md §2.6): this gate
+    // ticks with SubmitTick, so the between-ticks half of Stream::Update is
+    // called here — every ticket the explosion's ejecta open must release by
+    // itself, and the verdict below asserts none is left.
+    c.stream.TicketTick(t + 1);
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, {8, 3, 8},
                false, pactive);
     if (i >= 500 && i % 100 == 0) {
@@ -497,9 +540,11 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
   ReadCountsSync(ctx, world, counts);
   particlesLeft = std::min(counts[sim.Page()], kParticleCap);
   double s0 = NowSeconds();  // settled-world cost: the whole point of dirty dispatch
-  for (int i = 0; i < 100; i++)
+  for (int i = 0; i < 100; i++) {
+    c.stream.TicketTick(t + 1);  // a settled world's ticket step is a no-op
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
                false, false);
+  }
   ctx.WaitIdle();
   std::printf("sim settled: %.3f ms/tick\n", (NowSeconds() - s0) * 1000.0 / 100.0);
 
@@ -536,6 +581,7 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     ReadFluidArgsSync(ctx, world, fa);
     faLive0 = fa[7];                    // FA_LIVE
     for (int i = 0; i < 20; i++) {
+      c.stream.TicketTick(t + 1);
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
                  {8, 3, 8}, false, false);
       ctx.WaitIdle();
@@ -666,9 +712,11 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
       before[i].assign(kChunkVol, 0);
       ReadVoxelsSync(ctx, world, awake[i], 1, before[i].data(), "sleepMove0");
     }
-    for (int i = 0; i < 20; i++)
+    for (int i = 0; i < 20; i++) {
+      c.stream.TicketTick(t + 1);
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
                  {8, 3, 8}, false, false);
+    }
     ctx.WaitIdle();
     uint32_t words = 0, matCh = 0, stateCh = 0, stainCh = 0, stampOnly = 0;
     std::vector<uint32_t> now(kChunkVol, 0);
@@ -859,13 +907,21 @@ std::printf("sleep: hydrostatic at the tarn: %llu of %llu submerged liquid "
 // COST, and a settled world that still holds particles pays the whole 9-substep
 // solver table every tick forever (measured 3.7 ms/frame at the authored
 // home_lake). `particlesLeft` is the EJECTA system; `faLive1` is the water.
-bool sleepOk = sleepActive < 32 && particlesEnd == 0 && faLive1 == 0;
+// ...and FOUR: no chunk ticket live (docs/PLAN_chunk_tickets.md §2.6). A ticket
+// can hold 27 awake chunks outside the window, so "awake <= 32" alone stops
+// being the rule-2 claim once tickets exist; "and every ticket released itself"
+// is what makes it one again.
+const uint32_t ticketsLive = c.stream.TicketSet().LiveCount();
+bool sleepOk = sleepActive < 32 && particlesEnd == 0 && faLive1 == 0 &&
+               ticketsLive == 0;
 std::printf("sleep: %s (%u / %u chunks active, %u particles alive (%u at "
-            "settle), %u MPM particles alive, quiet after ~%d settle ticks, "
-            "%llu/%llu submerged cells partial)\n",
+            "settle), %u MPM particles alive, %u tickets live (%llu opened this "
+            "run), quiet after ~%d settle ticks, %llu/%llu submerged cells "
+            "partial)\n",
             sleepOk ? "PASS" : "FAIL", sleepActive, kNumSlots, particlesEnd,
-            particlesLeft, faLive1, settled, (unsigned long long)subPartial,
-            (unsigned long long)subTotal);
+            particlesLeft, faLive1, ticketsLive,
+            (unsigned long long)c.stream.TicketSet().Stats().activated, settled,
+            (unsigned long long)subPartial, (unsigned long long)subTotal);
 
   // Verdict: the flag the moved body already computed.
   return sleepOk ? Status::Pass : Status::Fail;

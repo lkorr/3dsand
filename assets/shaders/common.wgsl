@@ -4582,42 +4582,103 @@ fn slotToWorldChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
 //                        that ten kernels had copy-pasted, because that decode
 //                        is simply WRONG for a slot >= NUM_CHUNKS.
 //
-// P0 SHIPS kTicketMax = 0. `TICKET_SLOTS != 0u` is a const-expression, so every
-// ticket branch below is dead code the compiler removes, chunkSlotOf collapses
-// to chunkSlotIndex, cellResident collapses to inWindow, and the emitted SPIR-V
-// is what it was before this block existed. That is deliberate: it is what lets
-// P0's acceptance be bit-identity AND keeps the raymarch DDA's register count
-// off the cliff in gotcha-raymarch-register-cliff. P1 fills in the two stubs.
+// TWO SPELLINGS OF THE PROBE, ONE KEPT PER SHADER (chunk tickets P1). The
+// ticket table lives in the tail of `pageTable` (world.h kTicketTable*), so the
+// real resolver needs that binding — and it is wanted only by the kernels that
+// SIMULATE: a sim kernel reads and writes ticket cells like window cells. The
+// RENDER shaders keep the stub: they draw tickets through their own box march
+// (raymarch.wgsl, P4) and must not pay a probe on every voxWordAt of the DDA
+// (gotcha-raymarch-register-cliff). LoadShader keeps TICKET_BOUND for a body
+// that declares `> pageTable` and no `uniform> R :`, TICKET_UNBOUND for every
+// other (resources.cpp BodyResolvesTickets; check_shaders.sh does the same).
+// TICKET_PROBE is a const, so in a stubbed shader every ticket arm below is
+// dead code the compiler removes — the P0 bit-identity argument, per shader.
 const SLOT_NONE : u32 = 0xFFFFFFFFu;
 
-// P0 STUB. P1 replaces this with the open-addressed probe of `ticketMap`
-// (2 * TICKET_SLOTS entries of (packed wc, slot), CPU-built, uploaded between
-// ticks, GPU read-only) and binds that map into every sim shader. Keeping the
-// binding out of P0 is why P0 touches no bind-group layout and no pass table.
+// A box chunk's slot inside its ticket's 125: the chunk coordinate MODULO the
+// box edge, the window's toroidal rule at TICKET_BOX_N. That is what lets a
+// ticket re-centre by refilling one plane (P4). C++ twin: World::TicketLocalIndex.
+fn ticketLocalIndex(wc : vec3<i32>) -> u32 {
+  let n = i32(TICKET_BOX_N);
+  let m = vec3<u32>(((wc % vec3<i32>(n)) + vec3<i32>(n)) % vec3<i32>(n));
+  return (m.z * TICKET_BOX_N + m.y) * TICKET_BOX_N + m.x;
+}
+
+// >>>TICKET_BOUND_BEGIN<<<
+const TICKET_PROBE : bool = true;
+fn ticketTableLo(at : u32) -> vec3<i32> {
+  return vec3<i32>(bitcast<i32>(pageTable[at]), bitcast<i32>(pageTable[at + 1u]),
+                   bitcast<i32>(pageTable[at + 2u]));
+}
+// The live ticket slot holding world chunk wc, or SLOT_NONE. Scans the COMPACT
+// live list (n box tests; a world with no ticket pays one load). The list is
+// in ticket-index order and boxes never overlap, so the answer is unique and
+// order-free. C++ twin: World::TicketSlotOfChunk.
 fn ticketSlotOf(wc : vec3<i32>) -> u32 {
+  let n = min(pageTable[TICKET_TABLE_BASE], TICKET_MAX);
+  for (var j = 0u; j < n; j++) {
+    let b = TICKET_TABLE_BASE + TICKET_TABLE_LIST_OFF + 4u * j;
+    let d = wc - ticketTableLo(b);
+    if (all(d >= vec3<i32>(0)) && all(d < vec3<i32>(i32(TICKET_BOX_N)))) {
+      return NUM_CHUNKS + pageTable[b + 3u] * TICKET_CHUNKS + ticketLocalIndex(wc);
+    }
+  }
   return SLOT_NONE;
 }
-// P0 STUB. P1 reads `ticketSlotWc[slot - NUM_CHUNKS]`, written beside the map.
+// The inverse: the world chunk a ticket slot holds (World::TicketSlotWorldChunk).
 fn ticketSlotWorldChunk(slot : u32) -> vec3<i32> {
-  return vec3<i32>(0);
+  let r = slot - NUM_CHUNKS;
+  let i = min(r / TICKET_CHUNKS, TICKET_MAX - 1u);
+  let l = r % TICKET_CHUNKS;
+  let lo = ticketTableLo(TICKET_TABLE_BASE + TICKET_TABLE_IDX_OFF + 4u * i);
+  let n = i32(TICKET_BOX_N);
+  let m = vec3<i32>(vec3<u32>(l % TICKET_BOX_N, (l / TICKET_BOX_N) % TICKET_BOX_N,
+                              l / (TICKET_BOX_N * TICKET_BOX_N)));
+  return lo + ((((m - lo) % vec3<i32>(n)) + vec3<i32>(n)) % vec3<i32>(n));
 }
+// Is this ticket slot's ticket live? (A dead ticket's slots hold air and are
+// never dirty; worldgen's dense `main` asks so it can leave them that way.)
+fn ticketSlotLive(slot : u32) -> bool {
+  if (slot < NUM_CHUNKS) { return false; }
+  let i = (slot - NUM_CHUNKS) / TICKET_CHUNKS;
+  if (i >= TICKET_MAX) { return false; }
+  return pageTable[TICKET_TABLE_BASE + TICKET_TABLE_IDX_OFF + 4u * i + 3u] != 0u;
+}
+// Is this ticket slot in its box's ACTIVE interior (the inner 3^3 of the 5^3,
+// docs/PLAN_chunk_tickets.md §2.3)? The shell is resident only: readable,
+// writable by reach-1 moves, never dispatched. sim_compact's `main` asks.
+fn ticketSlotActive(slot : u32) -> bool {
+  if (!ticketSlotLive(slot)) { return false; }
+  let i = (slot - NUM_CHUNKS) / TICKET_CHUNKS;
+  let d = ticketSlotWorldChunk(slot) -
+          ticketTableLo(TICKET_TABLE_BASE + TICKET_TABLE_IDX_OFF + 4u * i);
+  return all(d >= vec3<i32>(1)) && all(d < vec3<i32>(i32(TICKET_BOX_N) - 1));
+}
+// >>>TICKET_BOUND_END<<<
+// >>>TICKET_UNBOUND_BEGIN<<<
+const TICKET_PROBE : bool = false;
+fn ticketSlotOf(wc : vec3<i32>) -> u32 { return SLOT_NONE; }
+fn ticketSlotWorldChunk(slot : u32) -> vec3<i32> { return vec3<i32>(0); }
+fn ticketSlotLive(slot : u32) -> bool { return false; }
+fn ticketSlotActive(slot : u32) -> bool { return false; }
+// >>>TICKET_UNBOUND_END<<<
 
 fn chunkSlotOf(wc : vec3<i32>, o : vec3<i32>) -> u32 {
   if (chunkInWindow(wc, o)) { return chunkSlotIndex(wc); }
-  if (TICKET_SLOTS != 0u) { return ticketSlotOf(wc); }
+  if (TICKET_PROBE) { return ticketSlotOf(wc); }
   return SLOT_NONE;
 }
 fn chunkResident(wc : vec3<i32>, o : vec3<i32>) -> bool {
   if (chunkInWindow(wc, o)) { return true; }
-  return TICKET_SLOTS != 0u && ticketSlotOf(wc) != SLOT_NONE;
+  return TICKET_PROBE && ticketSlotOf(wc) != SLOT_NONE;
 }
 fn cellResident(c : vec3<i32>, o : vec3<i32>) -> bool {
   if (inWindow(c, o)) { return true; }
-  return TICKET_SLOTS != 0u && ticketSlotOf(worldChunkOf(c)) != SLOT_NONE;
+  return TICKET_PROBE && ticketSlotOf(worldChunkOf(c)) != SLOT_NONE;
 }
 // The inverse of chunkSlotOf: which world chunk lives in this LINEAR slot.
 fn slotWorldChunk(slot : u32, o : vec3<i32>) -> vec3<i32> {
-  if (TICKET_SLOTS != 0u && slot >= NUM_CHUNKS) {
+  if (TICKET_PROBE && slot >= NUM_CHUNKS) {
     return ticketSlotWorldChunk(slot);
   }
   let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
@@ -6309,10 +6370,18 @@ fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
 // kTicketMax = 0 this is exactly `chunkIndexOf(c & WORLD_MASK)` and the DDA
 // that calls it thousands of times a ray gains nothing to spill
 // (gotcha-raymarch-register-cliff).
+//
+// A ticket MISS falls back to the masked window slot — the pre-ticket aliased
+// read, never an out-of-range index. Every caller tested residency first (the
+// contract above), so the fallback is only ever reached by a caller that broke
+// it, and then it reads what it always read.
 fn voxSlotOfCell(c : vec3<i32>) -> u32 {
-  if (TICKET_SLOTS != 0u) {
+  if (TICKET_PROBE) {
     let wc = worldChunkOf(c);
-    if (!chunkInWindow(wc, ptOrigin())) { return ticketSlotOf(wc); }
+    if (!chunkInWindow(wc, ptOrigin())) {
+      let ts = ticketSlotOf(wc);
+      if (ts != SLOT_NONE) { return ts; }
+    }
   }
   return chunkIndexOf(vec3<u32>(c & vec3<i32>(WORLD_MASK)));
 }

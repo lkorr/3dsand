@@ -51,6 +51,11 @@ std::vector<uint32_t> g_genSlots;
 uint32_t g_replaceTick = 0xFFFFFFFFu;
 std::vector<Frame::ChunkReplace> g_replaces;
 uint32_t g_replayReplaceRefusals = 0;
+// This tick's chunk-ticket decisions (tickets P1), stashed like the replaces;
+// under replay, the position of the next one to compare and the mismatches.
+uint32_t g_ticketTick = 0xFFFFFFFFu;
+std::vector<TicketOp> g_tickets;
+uint32_t g_replayTicketMismatch = 0;
 // The player's command for the tick named by g_cmdTick (package N2).
 uint32_t g_cmdTick = 0xFFFFFFFFu;
 TickInput g_cmd{};
@@ -316,6 +321,30 @@ void NoteChunkReplace(uint32_t tick, IVec3 wc,
   g_replaces.push_back(std::move(cr));
 }
 
+void NoteTicketOp(uint32_t tick, const TicketOp& op) {
+  if (!g_rec && !g_replay) return;
+  if (g_ticketTick != tick) {
+    g_ticketTick = tick;
+    g_tickets.clear();
+  }
+  const size_t at = g_tickets.size();
+  g_tickets.push_back(op);
+  if (!g_replay) return;
+  // THE REPLAY HALF: the decision at this position must be the recorded one.
+  for (const Frame& f : g_replay->frames) {
+    if (f.in.tick != tick) continue;
+    if (at >= f.tickets.size()) { g_replayTicketMismatch++; return; }
+    const TicketOp& r = f.tickets[at];
+    if (r.kind != op.kind || r.reason != op.reason || r.ticket != op.ticket ||
+        r.wc[0] != op.wc[0] || r.wc[1] != op.wc[1] || r.wc[2] != op.wc[2])
+      g_replayTicketMismatch++;
+    return;
+  }
+  g_replayTicketMismatch++;  // a decision on a tick the record has no frame for
+}
+
+uint32_t ReplayTicketMismatches() { return g_replayTicketMismatch; }
+
 void NoteTickInput(uint32_t tick, const TickInput& cmd) {
   // Unlike NoteGenList this is NOT gated on a live recorder: the caller is the
   // frame loop's tick body and the cost is a 72-byte copy, while gating it
@@ -428,6 +457,11 @@ void RecordFrame(const TickInputs& in, const TickParams& tp,
       w.PodVec(cr.rle);
     }
   }
+  // ---- the chunk-ticket decisions of this tick (record version 7) ---------
+  {
+    const std::vector<TicketOp> none;
+    w.PodVec(g_ticketTick == in.tick ? g_tickets : none);
+  }
 
   std::vector<uint8_t> frame;
   ByteWriter fw{frame};
@@ -455,6 +489,7 @@ void ResetReplayStats() {
   g_replayFirstNow = 0;
   g_replayWords.clear();
   g_replayReplaceRefusals = 0;
+  g_replayTicketMismatch = 0;
 }
 
 uint32_t ReplaceChunksIfReplaying(uint32_t tick, ::Stream& stream) {
@@ -638,6 +673,7 @@ bool Log::Load(const std::string& path, const std::vector<MaterialDef>& mats,
         fr.ok = false;
       }
     }
+    fr.PodVec(f.tickets);
     if (!fr.ok) {
       err = "malformed frame payload";
       return false;

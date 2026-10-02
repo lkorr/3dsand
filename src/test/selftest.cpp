@@ -44,6 +44,9 @@ const std::vector<Gate>& CaGates();
 // both build a 50k-op mutation fixture that has nothing to do with the CA
 // gates' chambers.
 const std::vector<Gate>& GasGates();
+// Chunk tickets (docs/PLAN_chunk_tickets.md §4): resident boxes outside the
+// window. Own TU; each gate builds its own world and regenerates on the way out.
+const std::vector<Gate>& TicketGates();
 const std::vector<Gate>& WindGates();
 const std::vector<Gate>& WaterGates();
 const std::vector<Gate>& RenderGates();
@@ -701,6 +704,12 @@ const char* const kOrder[] = {
     // stated reason. It builds the same kind of fixture 200 m out and
     // regenerates on the way out, so it leaves the world as it found it.
     "gas-farplume2",
+    // CHUNK TICKETS (docs/PLAN_chunk_tickets.md §4), appended after the gas
+    // group for its reason: the same subject (matter that LEAVES the window)
+    // and the same discipline — each clears the store and drops every ticket
+    // first (Stream::OnRegen), builds its fixture outside the window, and
+    // regenerates on the way out, so nothing after it inherits a ticket.
+    "ticket-settle",
     // The swing's OTHER half. `swing` up top is MeleeState alone and costs
     // milliseconds; this one stands an avatar on real terrain with the blade
     // drawn, spawns a dummy to cut, and measures the sword's world trajectory
@@ -1117,7 +1126,7 @@ const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
     for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &GeneratorGates(), &ScaleGates(),
-                          &SimGates(), &CaGates(), &GasGates(), &WindGates(), &WaterGates(),
+                          &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &FloaterGates(),
@@ -1376,6 +1385,31 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"firstViolChunk\": [" << oc.firstViolChunk[0] << ", "
       << oc.firstViolChunk[1] << ", " << oc.firstViolChunk[2] << "]"
       << "},\n";
+  }
+  // ---- CHUNK TICKETS, ALWAYS (docs/PLAN_chunk_tickets.md) -----------------
+  // What the run's ticket system did, so "the pile never landed" has numbers
+  // beside it: how many tickets were live at the end (rule 2 says 0 at rest),
+  // the peak, every activation / release / refusal by kind, the release
+  // store decisions and the far landings parked for residency (P2).
+  {
+    const TicketStats& ts = LastTicketStats();
+    f << "  \"tickets\": {\"live\": " << ts.live << ", \"releasing\": " << ts.releasing
+      << ", \"cap\": " << kTicketMax << ", \"highWater\": " << ts.highWater
+      << ", \"requests\": " << ts.requests << ", \"activated\": " << ts.activated
+      << ", \"absorbed\": " << ts.absorbed << ", \"inWindow\": " << ts.inWindow
+      << ", \"refusedCap\": " << ts.refusedCap
+      << ", \"refusedPlacement\": " << ts.refusedPlacement
+      << ", \"released\": " << ts.released << ", \"releasedIdle\": " << ts.releasedIdle
+      << ", \"releasedTimeout\": " << ts.releasedTimeout
+      << ", \"releasedOverlap\": " << ts.releasedOverlap
+      << ", \"recentred\": " << ts.recentred << ", \"chunksKept\": " << ts.chunksKept
+      << ", \"chunksSkipped\": " << ts.chunksSkipped
+      << ", \"conservative\": " << ts.conservative
+      << ", \"activeTickSum\": " << ts.activeTickSum
+      << ", \"landingsDeposited\": " << ts.landingsDeposited
+      << ", \"landingsRespawned\": " << ts.landingsRespawned
+      << ", \"landingsDropped\": " << ts.landingsDropped
+      << ", \"landingsParked\": " << ts.landingsParked << "},\n";
   }
   // ---- WHAT THIS RUN'S SIM CONSTANTS WERE (PLAN_multiplayer_now N6) -------
   //

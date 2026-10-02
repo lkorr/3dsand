@@ -279,16 +279,19 @@ uint32_t WorldEdits::Drain(const World& world, std::vector<CellOp>& out,
   while (cursor_ < pending_.size() && n < max) {
     const IVec3 wc = pending_[cursor_];
     auto it = byChunk_.find(Key(wc));
-    if (it == byChunk_.end() || !world.ChunkInWindow(wc)) {
+    // RESIDENT, not merely in the window: a chunk a ticket generated (chunk
+    // tickets P1) is patched like a window chunk, or its eviction would store
+    // pristine procgen without the layer and the layer would be lost there.
+    if (it == byChunk_.end() || !world.ChunkResident(wc)) {
       // Scrolled out (or vanished under a reload) between queue and drain. A
-      // cell index is WINDOW RELATIVE, so applying it now would patch whichever
+      // cell index is a SLOT index, so applying it now would patch whichever
       // world chunk currently owns that slot — a hole punched a kilometre away.
       cursor_++;
       within_ = 0;
       continue;
     }
     const std::vector<Cell>& list = it->second;
-    const uint32_t base = World::SlotChunkIndex(wc) * kChunkVol;
+    const uint32_t base = world.ResidentSlotOfChunk(wc) * kChunkVol;
     if (touched && within_ < list.size()) {
       // The chunk and its 26 neighbours: sim_mutate's dirtyFanSlot marks the
       // neighbours of a face cell, and a neighbour that reports MUTATE-only
@@ -297,7 +300,8 @@ uint32_t WorldEdits::Drain(const World& world, std::vector<CellOp>& out,
         for (int dy = -1; dy <= 1; dy++)
           for (int dx = -1; dx <= 1; dx++) {
             const IVec3 nc{wc.x + dx, wc.y + dy, wc.z + dz};
-            if (world.ChunkInWindow(nc)) touched->push_back(World::SlotChunkIndex(nc));
+            const uint32_t ns = world.ResidentSlotOfChunk(nc);
+            if (ns != World::kTicketSlotNone) touched->push_back(ns);
           }
     }
     while (within_ < list.size() && n < max) {

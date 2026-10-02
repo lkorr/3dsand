@@ -12,6 +12,7 @@
 #include "sim/farplumes.h"
 #include "sim/interest.h"
 #include "sim/materials.h"
+#include "sim/tickets.h"
 #include "sim/world.h"
 
 class Simulation;
@@ -164,6 +165,38 @@ class Stream {
   // the dirty-flag snapshot is ticks latent and eviction can't wait for it.
   // lo/hi are world VOXEL coords (inclusive box).
   void MarkModifiedBox(IVec3 lo, IVec3 hi);
+
+  // ---- CHUNK TICKETS (src/sim/tickets.h, docs/PLAN_chunk_tickets.md) ------
+  //
+  // Owned here, beside the store they fill from and evict to. Update runs the
+  // ticket step every tick (before the deferred wakes and the shift, and the
+  // window-overlap release right before a shift); a harness that ticks with
+  // SubmitTick alone calls TicketTick itself, once per tick, before the submit.
+  Tickets& TicketSet() { return tickets_; }
+  const Tickets& TicketSet() const { return tickets_; }
+  void TicketTick(uint32_t tick);
+  // ---- the four doors Tickets uses (nothing else should) -----------------
+  // Fill `slots` (ticket slots, already in the table) from the store, or
+  // procgen on a miss — FillSlots' own store-hit and gen branches, minus the
+  // two things a ticket must not get: a sentinel (every ticket slot holds a
+  // real page for its whole life) and the act-set / demote verdict (no
+  // readback, no sky demotion; genChunk wakes the act set in-kernel).
+  void FillTicketSlots(const std::vector<uint32_t>& slots);
+  // Copy `slots` out for the store WITHOUT deciding which to keep: the batch
+  // is held until SetEvictKeep (Tickets decides once the snapshot of the tick
+  // before the copy is published). A fill that needs one of these chunks
+  // first forces the batch and keeps all of it. Returns the batch's handle.
+  uint64_t EvictTicketSlots(const std::vector<uint32_t>& slots);
+  // `keep` is parallel to the slots EvictTicketSlots was given. A handle that
+  // was already forced is ignored.
+  void SetEvictKeep(uint64_t handle, const std::vector<uint8_t>& keep);
+  // Return slots to "holds nothing": PT_EMPTY under paged (the page goes back
+  // to the free list), real air words under dense (the identity map has no
+  // sentinel), zero occupancy, both dirty pages cleared.
+  void ClearTicketSlots(const std::vector<uint32_t>& slots);
+  // Tickets::DropAll on this stream's queue (world replaced; see OnRegen).
+  void DropTickets();
+  GpuContext* Ctx() const { return ctx_; }
 
   // ---- REPLACE ONE RESIDENT CHUNK'S 4,096 WORDS (M9.3-C) -----------------
   //
@@ -355,6 +388,8 @@ class Stream {
     DrainEvictions(/*discard=*/true);
     DiscardDemotes();
     DiscardPendingShifts();  // the verdicts describe the REPLACED world
+    // ...and so does every ticket: forgotten, not stored (tickets.h DropAll).
+    DropTickets();
     store_.Clear();
     farEdits_.Clear();
     farPlumes_.Clear();
@@ -467,6 +502,12 @@ class Stream {
     // at eviction time and therefore had NO copy issued (§2.1a / §4.2). 0 means
     // a real copy landed in the staging buffer for that index.
     std::vector<uint32_t> sentinel;
+    // A TICKET batch (EvictTicketSlots): non-zero handle. While `keepPending`
+    // the non-blocking harvest leaves it alone; a forced completion before
+    // SetEvictKeep keeps every item. After, item i is put iff keep[i].
+    uint64_t keepHandle = 0;
+    bool keepPending = false;
+    std::vector<uint8_t> keep;
   };
 
   // One in-flight SHIFT-DEMOTE batch: voxel copies of the entering plane's
@@ -532,7 +573,10 @@ class Stream {
   // records the work owed at tick T + kWakeLatency. Only ShiftAxis passes
   // true. ReloadWindow passes false — it fills the WHOLE window (32,768 slots,
   // far past genAct's one-plane size) and a load has no frame to protect.
-  void FillSlots(const std::vector<uint32_t>& slots, bool deferWake);
+  // `ticket`: the slots are TICKET slots (FillTicketSlots) — no exchange hold,
+  // no sentinel classification, no verdict readback or demotion.
+  void FillSlots(const std::vector<uint32_t>& slots, bool deferWake,
+                 bool ticket = false);
   // THE STORE-HIT BRANCH, ONCE (see ReplaceChunk above for why it is one
   // function). `s` must be `World::SlotChunkIndex(wc)` and `words` must hold
   // kChunkVol entries. Everything it does is a deferred queue write or a CPU
@@ -598,6 +642,13 @@ class Stream {
   std::deque<PendingEvict> pending_;
   std::vector<rhi::Buffer> stagingPool_;
   std::unordered_map<uint64_t, uint32_t> pendingChunks_;  // packed wc -> count
+  // The subset of pendingChunks_ a TICKET batch holds. A window shift's fill
+  // may skip draining a slot THIS shift evicted (shiftEvicted_), but a ticket
+  // released for overlapping the incoming plane is not this shift's eviction:
+  // its bytes are the only copy of chunks the plane is about to read.
+  std::unordered_map<uint64_t, uint32_t> ticketKeys_;
+  uint64_t evictHandleSeq_ = 0;
+  Tickets tickets_;
   // The shift-demote occupancy prefilter's staging buffer and host copy, kept
   // alive across shifts. Both were re-created per shift by rhi::ReadbackBlocking
   // (a fresh 128 KiB buffer + a full queue drain), and shifts land on

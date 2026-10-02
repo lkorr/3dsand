@@ -80,13 +80,16 @@ constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
 // chunk's memory, which is the failure docs/PLAN_chunk_tickets.md §5 names as
 // the risk of this phase.
 //
-// P0 SHIPS kTicketMax = 0, so kTicketSlots is 0 and kNumSlots == kNumChunks
-// exactly. Every buffer is byte-identical, every dispatch is the same size, and
-// the acceptance for this phase is that the world hash and the smoke probes do
-// not move. What P0 buys is that the ~160 addressing sites are CLASSIFIED and
-// routed through named functions, so P1 turns tickets on by changing this one
-// constant plus the ticket map's contents, not by re-auditing 15 shaders.
-constexpr uint32_t kTicketMax = 0;          // concurrent tickets; P1 raises it
+// P0 shipped kTicketMax = 0 (bit-identical, the addressing audit only). P1
+// (docs/PLAN_chunk_tickets.md §3) raises it: 16 tickets x 125 slots = 2,000,
+// rounded to 2,048 ticket slots. Ticket i owns the FIXED slot range
+// [kNumChunks + i*kTicketChunks, +kTicketChunks); inside it a box chunk wc
+// lives at the slot its coordinate takes MODULO the box edge (the window's
+// own toroidal rule, at kTicketBoxN), so a ticket re-centres one plane at a
+// time exactly as the window shifts (P4). The live boxes are a CPU-built
+// table uploaded into the tail of `pageTable` (kTicketTable* below); see
+// src/sim/tickets.h for the lifecycle.
+constexpr uint32_t kTicketMax = 16;         // concurrent tickets (the cap)
 constexpr uint32_t kTicketBoxN = 5;         // 5^3 chunk box, inner 3^3 active
 constexpr uint32_t kTicketChunks = kTicketBoxN * kTicketBoxN * kTicketBoxN;  // 125
 // Rounded up to a multiple of 64 because sim_compact dispatches 64 slots per
@@ -94,9 +97,55 @@ constexpr uint32_t kTicketChunks = kTicketBoxN * kTicketBoxN * kTicketBoxN;  // 
 // 64; a ragged tail would need a second bound in the shader.
 constexpr uint32_t kTicketSlots =
     ((kTicketMax * kTicketChunks + 63u) / 64u) * 64u;          // 0 at kTicketMax=0
-constexpr uint32_t kNumSlots = kNumChunks + kTicketSlots;      // 32768 at P0
+constexpr uint32_t kNumSlots = kNumChunks + kTicketSlots;      // 34816 at P1
 static_assert(kNumSlots % 64 == 0,
               "sim_compact dispatches kNumSlots/64 workgroups of 64");
+static_assert(kTicketMax >= 1, "the ticket table and RenderParams size arrays by it");
+static_assert(kTicketBoxN >= 3, "a ticket needs an active interior inside its shell");
+
+// ---- THE TICKET TABLE: the tail of the `pageTable` buffer ------------------
+// docs/PLAN_chunk_tickets.md §2.2 asked for a separate GPU-read-only map bound
+// into every sim shader. It rides the page table's buffer instead, past the
+// kNumSlots entries: every kernel that resolves a cell already binds
+// `pageTable` (read-only on the GPU everywhere), so the map costs no binding,
+// no bind-group layout and no pass-table row. CPU-built by `Tickets`, uploaded
+// between ticks as one deferred write, GPU read-only (the plan's contract).
+//
+// Layout, in u32 words from kTicketTableBase (= kNumSlots):
+//   [0]                         live count n (the compact list's length)
+//   [1..3]                      reserved
+//   [4 + 4*j], j < n            the COMPACT LIVE LIST: box lo x, y, z (world
+//                               chunks), ticket index. What ticketSlotOf
+//                               scans: a resolution costs `n` box tests, so a
+//                               world with no ticket pays one load.
+//   [4 + 4*kTicketMax + 4*i]    PER INDEX i: box lo x, y, z, live (0/1). What
+//                               the inverse (slot -> world chunk) and the
+//                               active test read.
+// A box test rather than an open-addressed hash: 16 boxes, each a 5^3 of
+// chunks, so "is wc inside box j" is three compares and the slot inside the
+// box is arithmetic (mod 5). The plan's hash existed to map 2,000 arbitrary
+// chunks; tickets are never arbitrary chunks, they are 16 boxes.
+constexpr uint32_t kTicketTableBase = kNumSlots;
+constexpr uint32_t kTicketTableListOff = 4;
+constexpr uint32_t kTicketTableIdxOff = 4 + 4 * kTicketMax;
+constexpr uint32_t kTicketTableWords = 4 + 8 * kTicketMax;
+// The whole `pageTable` buffer: the per-slot entries plus the ticket table.
+constexpr uint32_t kPageTableWords = kNumSlots + kTicketTableWords;
+
+// THE TICKET POLICY'S TIME CONSTANTS (§2.4). In ticks, because the release
+// clock is the published snapshot (World::Snap(), a fixed kSnapshotLatency
+// behind), and both are pure functions of the tick: a release lands on the
+// same tick in every run.
+//   kTicketIdleTicks    all 27 ACTIVE chunks clean in this many consecutive
+//                       published snapshots -> release. 30 = 1 s.
+//   kTicketMaxTicks     released regardless after this long: the portal-ticket
+//                       shape, so a waterfall spraying debris into one cannot
+//                       pin it. 1,800 = 60 s.
+//   kTicketRecentreTicks a ticket re-centres (P4) at most this often.
+// Selftest thresholds that depend on these live in tests/baseline.json.
+constexpr uint32_t kTicketIdleTicks = 30;
+constexpr uint32_t kTicketMaxTicks = 1800;
+constexpr uint32_t kTicketRecentreTicks = 60;
 
 // ---- the per-chunk digest table (docs/PLAN_multiplayer_m9.md M9.3-A) ------
 // One word per slot, plus ONE trailing word carrying the `tick` of the pass
@@ -4470,12 +4519,102 @@ class World {
     return {origin_.x + ((s.x - origin_.x) & m), origin_.y + ((s.y - origin_.y) & m),
             origin_.z + ((s.z - origin_.z) & m)};
   }
-  // P0 STUB, the C++ half of common.wgsl's ticketSlotWorldChunk. P1 gives
-  // `Tickets` a slot -> wc vector and returns from it; until then no slot can
-  // reach here (kTicketSlots == 0) and the compiler drops the caller's branch.
+  // ---- THE TICKET TABLE, CPU HALF (docs/PLAN_chunk_tickets.md §2.2) ------
+  //
+  // The C++ twin of the table `Tickets` uploads into pageTable's tail
+  // (kTicketTable*). ONE writer: Tickets (src/sim/tickets.cpp), through
+  // SetTicketBox, at the between-ticks point its ops are applied. Everything
+  // here is a pure function of the table, so the CPU and the GPU resolve the
+  // same chunk to the same slot.
+  //
+  // Ticket i's slots are [kNumChunks + i*kTicketChunks, +kTicketChunks); a
+  // box chunk wc sits at the slot its coordinate takes MODULO kTicketBoxN
+  // (TicketLocalIndex), the window's toroidal rule at the box's size — which is
+  // what lets P4 re-centre a box by refilling one plane of 25 slots.
+  struct TicketBox {
+    IVec3 lo{0, 0, 0};   // box min corner, world chunks
+    bool live = false;
+  };
+  static uint32_t TicketLocalIndex(IVec3 wc) {
+    const int n = (int)kTicketBoxN;
+    const int x = ((wc.x % n) + n) % n, y = ((wc.y % n) + n) % n,
+              z = ((wc.z % n) + n) % n;
+    return (uint32_t)((z * n + y) * n + x);
+  }
+  static uint32_t TicketSlotBase(uint32_t i) { return kNumChunks + i * kTicketChunks; }
+  // The ticket index a slot belongs to, or kTicketMax for a window slot or a
+  // slot of the 64-rounding tail no ticket owns.
+  static uint32_t TicketOfSlot(uint32_t slotIdx) {
+    if (slotIdx < kNumChunks) return kTicketMax;
+    const uint32_t i = (slotIdx - kNumChunks) / kTicketChunks;
+    return i < kTicketMax ? i : kTicketMax;
+  }
+  const TicketBox& Ticket(uint32_t i) const { return tickets_[i]; }
+  void SetTicketBox(uint32_t i, IVec3 lo, bool live) {
+    tickets_[i].lo = lo;
+    tickets_[i].live = live;
+  }
+  // Push tickets_ into pageTable's tail (one deferred write, ordered before
+  // the next submit like every other between-ticks upload).
+  void UploadTicketTable(const rhi::Queue& queue) const;
+  bool TicketSlotLive(uint32_t slotIdx) const {
+    const uint32_t i = TicketOfSlot(slotIdx);
+    return i < kTicketMax && tickets_[i].live;
+  }
+  // The world chunk a ticket slot holds — the inverse of TicketSlotOfChunk.
+  // A dead ticket's slots name the box they last held (harmless: nothing
+  // dispatches, fills or evicts a dead slot).
   IVec3 TicketSlotWorldChunk(uint32_t slotIdx) const {
-    (void)slotIdx;
-    return {0, 0, 0};
+    const uint32_t i = TicketOfSlot(slotIdx);
+    if (i >= kTicketMax) return {0, 0, 0};
+    const uint32_t l = (slotIdx - kNumChunks) % kTicketChunks;
+    const int n = (int)kTicketBoxN;
+    const IVec3 m{(int)(l % kTicketBoxN), (int)((l / kTicketBoxN) % kTicketBoxN),
+                  (int)(l / (kTicketBoxN * kTicketBoxN))};
+    const IVec3 lo = tickets_[i].lo;
+    auto wrap = [n](int mm, int l0) { return l0 + ((((mm - l0) % n) + n) % n); };
+    return {wrap(m.x, lo.x), wrap(m.y, lo.y), wrap(m.z, lo.z)};
+  }
+  // The live ticket slot holding world chunk wc, or kTicketSlotNone.
+  static constexpr uint32_t kTicketSlotNone = 0xFFFFFFFFu;
+  uint32_t TicketSlotOfChunk(IVec3 wc) const {
+    for (uint32_t i = 0; i < kTicketMax; i++) {
+      const TicketBox& t = tickets_[i];
+      if (!t.live) continue;
+      const int n = (int)kTicketBoxN;
+      if (wc.x < t.lo.x || wc.y < t.lo.y || wc.z < t.lo.z || wc.x >= t.lo.x + n ||
+          wc.y >= t.lo.y + n || wc.z >= t.lo.z + n)
+        continue;
+      return TicketSlotBase(i) + TicketLocalIndex(wc);
+    }
+    return kTicketSlotNone;
+  }
+  // Is this slot in its ticket's ACTIVE interior (the inner 3^3 of the 5^3),
+  // i.e. dispatched by the CA? The shell is resident only (§2.3).
+  bool TicketSlotActive(uint32_t slotIdx) const {
+    if (!TicketSlotLive(slotIdx)) return false;
+    const IVec3 wc = TicketSlotWorldChunk(slotIdx);
+    const IVec3 lo = tickets_[TicketOfSlot(slotIdx)].lo;
+    const int hi = (int)kTicketBoxN - 1;
+    const IVec3 d{wc.x - lo.x, wc.y - lo.y, wc.z - lo.z};
+    return d.x >= 1 && d.y >= 1 && d.z >= 1 && d.x < hi && d.y < hi && d.z < hi;
+  }
+  // THE RESIDENT-SLOT RESOLVER, the C++ twin of common.wgsl's chunkSlotOf:
+  // the window slot, else a live ticket slot, else kTicketSlotNone.
+  uint32_t ResidentSlotOfChunk(IVec3 wc) const {
+    if (ChunkInWindow(wc)) return SlotChunkIndex(wc);
+    return TicketSlotOfChunk(wc);
+  }
+  bool ChunkResident(IVec3 wc) const { return ResidentSlotOfChunk(wc) != kTicketSlotNone; }
+  // The CellOp index of a RESIDENT cell (slot * kChunkVol + chunk-local), or
+  // kTicketSlotNone. SlotCellIndex's ticket-aware form, for the producers that
+  // must be able to target a ticket (the selftest's pours; the far landings).
+  uint32_t ResidentCellIndex(IVec3 c) const {
+    const uint32_t s = ResidentSlotOfChunk({c.x >> 4, c.y >> 4, c.z >> 4});
+    if (s == kTicketSlotNone) return kTicketSlotNone;
+    const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+                   lz = (uint32_t)(c.z & 15);
+    return s * kChunkVol + (lz * kChunk + ly) * kChunk + lx;
   }
   // Is this slot one the window's arithmetic can produce? Everything that
   // decomposes a slot into (x, y, z) window-chunk coords must ask first.
@@ -5345,6 +5484,12 @@ class World {
   // (no index = no emitters = exactly today's behaviour).
   class FarPlumes* farPlumes = nullptr;
 
+  // The chunk-ticket lifecycle (src/sim/tickets.h), owned by Stream beside the
+  // two indexes above. Forward-declared for their reason. Null before
+  // Stream::Init; SubmitWorldgen uses it to drop every ticket before a world
+  // is regenerated (a ticket of the old world must not survive into the new).
+  class Tickets* tickets = nullptr;
+
   // ---- THE SNAPSHOT READBACK RING, SIZED FROM THE PIPELINE (P2-D) ---------
   //
   // Public because it is the bound on how many deliveries a caller draining
@@ -5443,6 +5588,8 @@ class World {
   bool haveEncodeTick_ = false;
   SnapshotPipeStats snapPipe_;
   IVec3 origin_{0, 0, 0};
+  // The ticket boxes (see TicketBox). Written only by Tickets.
+  TicketBox tickets_[kTicketMax];
   // Drained into gasSpawnOps by SubmitTick, once, at the head of the tick.
   std::vector<GasSpawnOp> pendingGasSpawns_;
 

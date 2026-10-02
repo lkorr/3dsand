@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "sim/materials.h"
+#include "sim/tickets.h"
 #include "sim/tickinput.h"
 #include "sim/world.h"
 
@@ -299,6 +300,14 @@ struct Frame {
     std::vector<uint32_t> rle;  // (word, runLength) pairs, kPersistMask'd
   };
   std::vector<ChunkReplace> chunkReplaces;
+  // ---- THE FOURTH: CHUNK-TICKET DECISIONS (docs/PLAN_chunk_tickets.md) ---
+  // Every activate / release / refuse / re-centre Tickets took at this
+  // tick's between-ticks point, in the order it took them. Like `genList`,
+  // a replay re-derives them (they are a pure function of the recorded
+  // inputs and the fixed-latency snapshot) — and COMPARES: a replay whose
+  // tickets decided differently from the recording's is counted
+  // (ReplayTicketMismatches), because a ticket that moved is a world that did.
+  std::vector<TicketOp> tickets;
 };
 
 // The header, checked on load the way worldio's meta.svm is: a record made by
@@ -328,7 +337,8 @@ struct Header {
 //    editor.md P1); the frame's command POD grew with it.
 // 6: TickInput `talk` (the conversation command, PLAN_world_editor.md P3);
 //    same size, new meaning.
-constexpr uint32_t kRecordVersion = 6;
+// 7: Frame carries `tickets`, the chunk-ticket ops of the tick (tickets P1).
+constexpr uint32_t kRecordVersion = 7;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its
@@ -368,6 +378,15 @@ void NoteGenList(uint32_t tick, const std::vector<uint32_t>& slots);
 // accumulate; the stash is cleared when the tick number moves, exactly the way
 // the gen list's is, so a stale one cannot land in the wrong frame.
 void NoteChunkReplace(uint32_t tick, IVec3 wc, const std::vector<uint32_t>& rle);
+
+// ONE CHUNK-TICKET DECISION (src/sim/tickets.h), stashed into this tick's
+// frame like a chunk replace (several per tick accumulate; a new tick number
+// clears the stash). Under replay it is compared against the recorded frame's
+// op at the same position instead. A no-op unless recording or replaying.
+void NoteTicketOp(uint32_t tick, const TicketOp& op);
+// Ticket ops that differed from the record (kind / reason / index / chunk),
+// or were missing / extra, since the last ResetReplayStats.
+uint32_t ReplayTicketMismatches();
 
 // The player's command for this tick (main.cpp's frame layer, package N2).
 // Stashed the same way the gen list is and for the same reason: it is produced

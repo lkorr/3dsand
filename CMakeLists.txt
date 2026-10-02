@@ -463,6 +463,9 @@ add_library(sandvox_core OBJECT
   src/sim/worldgen_run.cpp
   src/sim/oprecord.cpp
   src/sim/stream.cpp
+  # Chunk tickets: resident 5^3 boxes outside the window, simulated by the
+  # same CA (docs/PLAN_chunk_tickets.md).
+  src/sim/tickets.cpp
   src/sim/farfield.cpp
   src/sim/faredits.cpp
   src/sim/farplumes.cpp
@@ -599,6 +602,9 @@ add_library(sandvox_core OBJECT
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
   src/test/selftest_gas.cpp
+  # Chunk tickets: ticket-settle / ticket-land / ticket-decay
+  # (docs/PLAN_chunk_tickets.md §4).
+  src/test/selftest_tickets.cpp
   src/test/selftest_wind.cpp
   src/test/selftest_water.cpp
   src/test/selftest_render.cpp

@@ -821,6 +821,13 @@ def module_for(fname):
     drop = "DRAFT_UNBOUND" if "> draftField" in body else "DRAFT_BOUND"
     common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
                     common, flags=re.S)
+    # The TICKET PROBE's two blocks, for the same reason (resources.cpp
+    # BodyResolvesTickets): BOUND reads the ticket table in pageTable's tail,
+    # and the stub defined last would hide that read.
+    resolves = "> pageTable" in body and "uniform> R :" not in body
+    drop = "TICKET_UNBOUND" if resolves else "TICKET_BOUND"
+    common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
+                    common, flags=re.S)
     _module_cache[fname] = parse_module(common + "\n" + body)
     return _module_cache[fname]
 

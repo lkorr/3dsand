@@ -9,6 +9,7 @@
 
 #include "gpu/rhi.h"
 #include "sim/pagetable.h"
+#include "sim/tickets.h"
 #include "sim/waterbody.h"
 #include "sim/worldedit.h"
 
@@ -21,6 +22,12 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // has fetched (spell.cpp, SpellSystem::Tick). Mirror seed only -- the page
   // table's seed stays as it was, so residency classification is untouched.
   world.SetMirrorSeed(seed);
+  // EVERY TICKET BELONGS TO THE WORLD BEING REPLACED (chunk tickets P1). Drop
+  // them before anything is generated: the dense `main` writes a dead ticket
+  // slot as air (worldgen.wgsl), the batched path below never lists one, and
+  // the table the GPU resolves through is empty from the first tick on. Not
+  // released, not stored: a regenerated world has no claim on their chunks.
+  if (world.tickets) world.tickets->DropAll(ctx.queue);
   // The authored edit layer patches whatever worldgen produces, so a fresh
   // world re-queues every edited chunk the window contains. Queue only — the
   // ops go out through the MutationQueue on the ticks that follow (rule 3), not
@@ -109,8 +116,11 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     std::vector<uint32_t> verdict(kGenBatch, 0u);
     std::vector<uint32_t> vox;   // words: only for the check / a fallback
     batch.reserve(kGenBatch);
-    for (uint32_t base = 0; base < kNumSlots; base += kGenBatch) {
-      const uint32_t n = std::min(kGenBatch, kNumSlots - base);
+    // THE WINDOW'S SLOTS ONLY. Ticket slots stay the PT_EMPTY ResetAllEmpty
+    // just gave them: no ticket survives a regen (DropAll above), so they name
+    // no chunk to generate.
+    for (uint32_t base = 0; base < kNumChunks; base += kGenBatch) {
+      const uint32_t n = std::min(kGenBatch, kNumChunks - base);
       batch.clear();
       for (uint32_t k = 0; k < n; k++) {
         batch.push_back(base + k);

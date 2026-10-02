@@ -2066,6 +2066,17 @@ void Overlay::DrawDevDebug(UIState& s) {
     ImGui::Text("hash %08x %s", s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
     ImGui::Text("debris bodies %u (%u awake)   mobs %u", s.bodyCount, s.activeBodyCount,
                 s.mobCount);
+    // CHUNK TICKETS (docs/PLAN_chunk_tickets.md): the boxes outside the
+    // window the CA is still running. At rest this reads 0 live — the rule-2
+    // claim the `sleep` gate asserts.
+    ImGui::Text("tickets %u / %u live (%u releasing)   run: %llu on, %llu off, %llu refused",
+                s.ticketsLive, s.ticketsCap, s.ticketsReleasing,
+                (unsigned long long)s.ticketsActivated,
+                (unsigned long long)s.ticketsReleased,
+                (unsigned long long)s.ticketsRefused);
+    if (s.ticketLandingsParked)
+      ImGui::Text("far landings parked %u (wait for residency)", s.ticketLandingsParked);
+    for (const std::string& line : s.ticketLines) ImGui::TextDisabled("  %s", line.c_str());
   }
   // The swing readout makes the input FALSIFIABLE: "the game misread my flick"
   // vs "I misjudged the distance" is answered by the phase and the speed the
