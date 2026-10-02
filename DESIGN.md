@@ -20985,6 +20985,30 @@ involved:
   partial step and is *unaffected* by this removal, since it plugs in below
   our host layer.
 
+**Update (2026-10-02): async compute (port phase 8) is built and OFF.**
+`docs/PLAN_async_compute.md` is the record. Measured first: the GPU is busy and
+serialised for the whole frame (forestfire 6.2 ms sim + 13.9 ms render, village
+fire 15.7 + 13.3), but the raymarch binds eighteen sim-written buffers, so the
+sim and the render cannot overlap without a second copy of the world (~1.7 GiB
+on an 8 GiB card). What CAN overlap is the tick's render-only derived passes
+(openness + glow, 1.8 ms) against the head of the next frame (sky top, ray
+start). Built that way: those five rows are `PT_DERIVED` in the pass table,
+recorded LAST in the tick (in its own command buffer, or on the async queue
+with `render.asyncCompute`), read the key light from a tick-end copy of
+RenderUBO (`RenderUBOTick`) so the next frame's upload does not conflict, and
+two timeline semaphores order the queues. `vk_record.cpp` places the join
+itself: every buffer touch already passes through its tracker, so an async
+recording collects its conflict set there and a main recording SPLITS its
+command buffer at the first access that conflicts (head runs beside the async
+work, tail waits). Sync validation is clean and the world hash is identical
+on and off. **It does not win on the RTX 3060 Ti**: a second queue of the main
+family measures +0.2..0.7 ms/frame (forestfire), NVIDIA's compute-only family
+costs ~4 ms (forestfire) to ~12 ms (village fire) a frame for the rest of the
+process once it has carried work (CA 5.2 -> 9.2 ms with identical work), and on
+village fire merely CREATING a second queue costs ~3.4 ms. Default OFF, and the
+queue is created only when the knob is on at boot; one flip re-asks the
+question on a GPU with real async compute.
+
 **The `rhi::` seam stays, including its polymorphic impl layer.** Confining the
 GPU API behind ~10 concepts is what made the port testable one phase at a time;
 an abstract impl with a single subclass costs one virtual hop on ~60 dispatches
@@ -21894,6 +21918,60 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
    phase 5 records the options (a CPU Vulkan ICD such as lavapipe/SwiftShader as
    a shader-compiler cross-check, or a second physical machine, which is the
    only one that truly closes it) with their costs.
+
+   *Status 2026-10-02: narrowed again, by a second SHADER COMPILER on the same
+   silicon, and made one command away from closed.* Everything one machine
+   allows was done:
+   - **Devices.** Mesa 26.2.3 (mesa-dist-win, user-local, added per process
+     with `VK_ADD_DRIVER_FILES`; no system state touched) adds three Vulkan
+     implementations to the RTX 3060 Ti: **Dozen on the 3060 Ti** (Vulkan
+     over D3D12: SPIR-V -> NIR -> DXIL -> NVIDIA's *D3D12* shader compiler,
+     a completely different back end from the Vulkan driver's), **Dozen on
+     WARP** (Microsoft's CPU D3D12 rasteriser) and **llvmpipe/lavapipe**. Pick
+     one with `--device <index|name substring>` / `SANDVOX_DEVICE`; every run
+     prints a `device:` line (name, driver, driver version, API version,
+     vendor:device, type, index, build commit) and records the same facts in
+     `build/last_run.json`'s `device` block.
+   - **Result.** Dozen on the 3060 Ti reproduces the native driver
+     **bit-for-bit**: all 200 per-tick world hashes of the determinism gate
+     (final `5dabc010`, the pinned baseline) and the gas digest, and **19/19**
+     `--vk-smoke-loud` probes (explosions, particles, eight window shifts,
+     eviction and store hits). It ran OUT OF SPEC — see the next point — so a
+     divergence would have proved nothing, but a match is evidence: a
+     truncated binding diverges, it does not coincide.
+   - **The hard minimum it found: `maxStorageBufferRange` >= 1 GiB.** The
+     page pool (576 MiB) and the far cascade (`farVox`, 1 GiB) are single
+     storage bindings. All three Mesa/Microsoft implementations advertise
+     128 MiB, so none can run the engine in spec; Intel's driver advertises
+     1-2 GiB and AMD's and NVIDIA's 4 GiB. `CreateDescriptorSet` now refuses a
+     binding over the limit by name (it used to be silent undefined
+     behaviour); `SANDVOX_ALLOW_OVERSIZE_BINDINGS=1` runs anyway and stamps
+     `outOfSpecBindings` into every record. A Vulkan 1.2 device with
+     `VK_KHR_synchronization2` + `VK_KHR_dynamic_rendering` (Dozen) is now
+     accepted alongside core 1.3; neither extension is optional.
+   - **lavapipe and WARP refuse to run at all**, independently of the limit:
+     llvmpipe dies with `STATUS_HEAP_CORRUPTION` (0xC0000374) during or just
+     after pipeline creation — with zero validation messages, with the bindings
+     clamped in spec, with serial pipeline creation, release and debug Mesa —
+     and Dozen-on-WARP with an access violation inside pipeline creation. Both
+     are fail-fast inside the driver; no root cause without a debugger.
+   - **A static audit of every sim-path shader** (Tint's robustness clamp,
+     div/mod and shift polyfills and workgroup zero-init are all ON, so the
+     classic vendor splits are defined; no runtime float reaches hashed
+     state) found the remaining risks are *races*, which differ run to run on
+     ONE vendor as much as across two. Two were fixed (the water-body shave's
+     two-workgroup column at `level % 16 == 0`; the rain-exposure write past
+     its buffer); the open ones are listed in `docs/PLAN_vulkan_port.md`'s
+     cross-vendor note and the 2026-10-02 audit table.
+   - **The test that closes it is now one command on the other machine:**
+     `sandvox.exe --fingerprint fp_<vendor>.json` writes the determinism
+     gate's 200 per-tick hashes, the gas digest and the per-slot voxel digests
+     at nine checkpoint ticks, with device, driver, build commit and asset
+     stamps; `python scripts/det_fingerprint_compare.py A.json B.json` names
+     the first divergent tick and, at the first checkpoint past it, the chunks
+     whose digests differ, which is exactly what `SANDVOX_DET_PROBE` /
+     `SANDVOX_DET_SLOTS` then need to diff the fields. Same source on both
+     machines (`buildCommit`, `tuningStamp` are compared and called out).
 4. **Scope** — every system above is the *simple* version of itself on purpose.
    The Noita lesson: they shipped on rules a beginner could write; the magic is
    sleeping, bounding, and content, not clever kernels.
