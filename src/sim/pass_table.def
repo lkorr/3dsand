@@ -128,6 +128,14 @@ PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_N
 // layout it describes.
 PASS(fill_reactFx, nullptr, PT_TICK, PIPE_NONE, K_FILL, 160,96,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(PageFaults)))
+// THE TICKET RECORD (world.h kPageFaultTicketBase; chunk tickets P2): pageFaults
+// words 64..127, byte offset 256, 256 bytes. Per tick, for fill_reactFx's
+// reason: the particle kernel's far-landing requests and deposits describe
+// THIS tick, and a tick whose particle rows do not run must publish an empty
+// record rather than the last active tick's requests a second time — a
+// deposit read twice would be a landing duplicated.
+PASS(fill_ticketRec, nullptr, PT_TICK, PIPE_NONE, K_FILL, 256,256,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(PageFaults)))
 // ---- gas particles (docs/PLAN_gas_particles.md stage 1) -------------------
 // Three fills, all under C_GAS, so a world with no plume and a settled CA
 // records none of them.
@@ -718,7 +726,8 @@ PASS(copy_pArgs_pDispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NO
 PASS(particleIntegrate, "particleIntegrate+args2", PT_TICK, PIPE_P_INTEGRATE, K_INDIRECT, IND_PDISPATCHARGS,0,0,
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) RW(ParticlesRead) I(PDispatchArgs)
-          W(ParticlesWrite) A(ParticleCounts) A(Claim) R(PageTable) R(Draft)))
+          W(ParticlesWrite) A(ParticleCounts) A(Claim) R(PageTable) R(Draft)
+          A(PageFaults) R(FarVox) U(FarUBO)))
 PASS(particleArgs2, "particleIntegrate+args2", PT_TICK, PIPE_P_ARGS2, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
 // This second copy overwrites the args the integrate dispatch above FETCHED —

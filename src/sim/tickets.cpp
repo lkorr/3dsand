@@ -240,6 +240,12 @@ void Tickets::Fold(uint32_t tick) {
     for (size_t k = 0; k < pk.slots.size(); k++)
       if (snap.dirtyFlags[pk.slots[k]] != 0) pk.bits[k] = 1;
   }
+  // ---- PARTICLE LANDINGS ASK FOR TICKETS (P2) ----------------------------
+  // The parked particles of the snapshot's tick, one request per bucket the
+  // kernel filled (sim_particle.wgsl farRequest). Once per published
+  // snapshot (this function's guard), stamped with the snapshot's tick so
+  // ApplyRequests orders them with everything else by (tick, chunk).
+  for (const IVec3& c : snap.ticketReq) Request(c, TicketReason::Particle, snap.tick);
 }
 
 void Tickets::FinalizeReleases(uint32_t tick) {
@@ -408,21 +414,57 @@ std::vector<std::string> Tickets::Describe(uint32_t tick) const {
 }
 
 // ---- far landings (P2) -------------------------------------------------------
-void Tickets::TakeDeposits() {}
+//
+// A deposited particle is dead on the GPU; World holds its state from the
+// published snapshot until this takes it (World::TakeTicketDeposits), and
+// this holds it until its chunk is resident. In arrival order, which is
+// snapshot-tick order then deposit-slot order: a pure function of the tick.
+void Tickets::TakeDeposits() {
+  const uint64_t dropped0 = world_->TicketDepositsDropped();
+  for (const ParticleSpawn& d : world_->TakeTicketDeposits()) {
+    Landing l;
+    l.chunk = {(d.px >> 8) >> 4, (d.py >> 8) >> 4, (d.pz >> 8) >> 4};
+    l.p = d;
+    l.p.vx = l.p.vy = l.p.vz = 0;
+    l.p.flags = 0;  // the spawn kernel forces ALIVE; nothing else survives
+    landings_.push_back(l);
+    stats_.landingsDeposited++;
+  }
+  stats_.landingsDropped += world_->TicketDepositsDropped() - dropped0;
+  if (landings_.size() > kFarLandingMax) {
+    const size_t over = landings_.size() - kFarLandingMax;
+    stats_.landingsDropped += over;
+    landings_.erase(landings_.begin(), landings_.begin() + (ptrdiff_t)over);
+  }
+}
 
+// Kept as the named hook the refill paths call (Stream::FillSlots): the move
+// itself happens in QueueResidentLandings at the next ticket step, which
+// asks residency directly, so a landing whose deposit arrives AFTER its chunk
+// became resident is found the same way.
 void Tickets::OnChunkResident(IVec3 wc) {
   (void)wc;
 }
 
-void Tickets::QueueResidentLandings() {}
+void Tickets::QueueResidentLandings() {
+  if (landings_.empty()) return;
+  size_t w = 0;
+  for (size_t i = 0; i < landings_.size(); i++) {
+    if (world_->ChunkResident(landings_[i].chunk)) {
+      spawnQueue_.push_back(landings_[i].p);
+    } else {
+      if (w != i) landings_[w] = landings_[i];
+      w++;
+    }
+  }
+  landings_.resize(w);
+}
 
 uint32_t Tickets::DrainLandingSpawns(std::vector<ParticleSpawn>& out, uint32_t max) {
-  uint32_t n = 0;
-  while (n < max && !spawnQueue_.empty()) {
-    out.push_back(spawnQueue_.front());
-    spawnQueue_.erase(spawnQueue_.begin());
-    n++;
-  }
+  const uint32_t n = (uint32_t)std::min<size_t>(max, spawnQueue_.size());
+  out.insert(out.end(), spawnQueue_.begin(), spawnQueue_.begin() + n);
+  spawnQueue_.erase(spawnQueue_.begin(), spawnQueue_.begin() + n);
   stats_.landingsRespawned += n;
+  Publish();
   return n;
 }

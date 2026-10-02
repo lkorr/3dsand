@@ -1707,7 +1707,38 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //          tick is a pure function of the set of firings -- never of the
 //          order threads ran in (rule 1: an order-free reduction, not an
 //          append cursor). ReactFxDecodeCell inverts the scramble.
-constexpr uint32_t kPageFaultWords = 64;
+//
+// [64..127] THE TICKET RECORD (chunk tickets P2, docs/PLAN_chunk_tickets.md):
+//          what the particle kernel tells the CPU about matter that came to
+//          rest OUTSIDE residency. Per tick: pass_table.def's fill_ticketRec
+//          zeroes [64..127] before the particles run. Same reasons as the
+//          reaction-effect record for living here (sim_particle already binds
+//          the record atomically; the snapshot ring copies it at the fixed
+//          latency). ORDER-FREE throughout (rule 1): atomicMax sets, never an
+//          append cursor.
+//   [64..95]  kTicketReqBuckets REQUEST buckets: a parked particle atomicMax's
+//          (its chunk, packed relative to the window origin, + 1) into the
+//          bucket its key hashes to. 0 = empty. The CPU decodes each into a
+//          ticket request (Tickets::Tick).
+//   [96..125] kTicketDepSlots DEPOSIT slots of kTicketDepStride words:
+//          priority (atomicMax by the bidders in integrate), then the winner's
+//          px, py, pz (24.8) and payload, written by it alone in resolve.
+//   [126]  particles killed for leaving the far box this tick (atomicAdd)
+//   [127]  particles parked this tick (atomicAdd)
+// sim_particle.wgsl's TK_* consts mirror these (check_invariants `ticket record`).
+constexpr uint32_t kPageFaultTicketBase = 64;    // fill_ticketRec starts here
+constexpr uint32_t kTicketReqBase = 64;
+constexpr uint32_t kTicketReqBuckets = 32;
+constexpr uint32_t kTicketDepBase = 96;
+constexpr uint32_t kTicketDepSlots = 6;
+constexpr uint32_t kTicketDepStride = 5;
+constexpr uint32_t kTicketFarKilled = 126;
+constexpr uint32_t kTicketParkedNow = 127;
+constexpr int32_t kTicketReqBias = 64;           // chunk offset bias, 7 bits a side
+static_assert(kTicketReqBase + kTicketReqBuckets <= kTicketDepBase, "ticket record overlap");
+static_assert(kTicketDepBase + kTicketDepSlots * kTicketDepStride <= kTicketFarKilled,
+              "ticket record overlap");
+constexpr uint32_t kPageFaultWords = 128;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
 constexpr uint32_t kPageFaultScoopEighths = 36;
 constexpr uint32_t kPageFaultScoopApplied = 37;
@@ -1718,12 +1749,12 @@ constexpr uint32_t kPageFaultReactFxOrigin = 41;  // 41..43
 constexpr uint32_t kPageFaultReactFxTick = 44;
 constexpr uint32_t kPageFaultReactFxSlot0 = 48;
 constexpr uint32_t kPageFaultReactFxSlots = 16;
-static_assert(kPageFaultReactFxSlot0 + kPageFaultReactFxSlots == kPageFaultWords,
-              "the reaction-effect slots end the pageFaults record; fill_reactFx "
-              "(pass_table.def, 160,96) clears [40..63]");
-// The snapshot ring gives this record a 256-byte slot (world.cpp
+static_assert(kPageFaultReactFxSlot0 + kPageFaultReactFxSlots == kPageFaultTicketBase,
+              "the reaction-effect slots end where the ticket record begins; "
+              "fill_reactFx (pass_table.def, 160,96) clears [40..63]");
+// The snapshot ring gives this record a 512-byte slot (world.cpp
 // kPageFaultOff .. kFluidArgsOff).
-static_assert(kPageFaultBytes <= 256, "pageFaults outgrew its snapshot slot");
+static_assert(kPageFaultBytes <= 512, "pageFaults outgrew its snapshot slot");
 
 // ---- fluidArgsStage: the FA_* word map -------------------------------------
 // The seam's counter block (common.wgsl's FA_* names, plus the two refusal-site
@@ -4338,6 +4369,15 @@ struct WorldSnapshot {
   // blasts": N slots, M firings).
   std::vector<ReactFxEvent> reactFx;
   uint32_t reactFxFires = 0;
+  // ---- the ticket record (pageFaults [64..127], kTicketReq* / kTicketDep*) --
+  // THIS snapshot's tick only. `ticketReq`: the world chunks parked particles
+  // asked a ticket for, decoded against `windowOrigin`, in BUCKET order (a
+  // fixed order). `ticketDeposits`: the particles that handed themselves to
+  // the CPU this tick (zero velocity; Tickets parks them as far landings).
+  std::vector<IVec3> ticketReq;
+  std::vector<ParticleSpawn> ticketDeposits;
+  uint32_t ticketFarKilled = 0;
+  uint32_t ticketParked = 0;
   // ---- MLS-MPM fluid (seam) ----
   // The GPU-owned live particle count and the fluidArgsStage event counters
   // (the FA_* map in common.wgsl) as of this snapshot's tick. fluidLive is
@@ -4825,6 +4865,19 @@ class World {
     out.swap(reactFxPending_);
     return out;
   }
+  // ---- FAR-LANDING DEPOSITS, EXACTLY ONCE (chunk tickets P2) ---------------
+  // Every published snapshot's deposits, in tick order, until Tickets takes
+  // them. Same discipline as TakeReactFx. Capped at kTicketDepositsPendingMax
+  // (oldest dropped and COUNTED — a deposit is matter, so a drop is a loss and
+  // must be a number) so a harness that never runs the ticket step cannot grow
+  // it; cleared by InvalidateSnapshot.
+  static constexpr size_t kTicketDepositsPendingMax = 4096;
+  std::vector<ParticleSpawn> TakeTicketDeposits() {
+    std::vector<ParticleSpawn> out;
+    out.swap(ticketDepositsPending_);
+    return out;
+  }
+  uint64_t TicketDepositsDropped() const { return ticketDepositsDropped_; }
 
   // ---- the per-chunk digest and the quiet counter (M9.3-A) ---------------
   //
@@ -5576,6 +5629,9 @@ class World {
   // kReactFxPendingMax (oldest dropped) so a harness that never drains cannot
   // grow it; cleared by InvalidateSnapshot (a dead world's blasts).
   std::vector<ReactFxEvent> reactFxPending_;
+  // Far-landing deposits (TakeTicketDeposits).
+  std::vector<ParticleSpawn> ticketDepositsPending_;
+  uint64_t ticketDepositsDropped_ = 0;
   // Bumped by InvalidateSnapshot and by a TICK REWIND (a harness scene
   // restarting its counter — see kOrder in test/selftest.cpp). Everything from
   // an older epoch is dropped rather than compared against the new tick base,

@@ -2966,8 +2966,72 @@ def check_react_fx():
                             f"{m.group(1)}")
 
 
+def check_ticket_record():
+    """The chunk-ticket record in pageFaults (docs/PLAN_chunk_tickets.md P2):
+    sim_particle.wgsl's TK_* constants <-> world.h kTicketReq* / kTicketDep* /
+    kTicketFarKilled / kTicketParkedNow / kTicketReqBias, and the far-flight
+    flag bits against every other PFLAG_* the particle kernels claim. A drifted
+    bucket base writes the reaction-effect slots; a drifted deposit stride
+    decodes every far landing into the wrong cell. Neither fails loud."""
+    part = read("assets/shaders/sim_particle.wgsl")
+    wh = read("src/sim/world.h")
+    common = read("assets/shaders/common.wgsl")
+    if not part or not wh:
+        return
+    checked.append("ticket record")
+
+    def num(txt, pat):
+        m = re.search(pat, txt)
+        return int(m.group(1), 0) if m else None
+
+    pairs = [
+        ("TK_REQ_BASE", r"kTicketReqBase\s*=\s*(\w+?)u?;"),
+        ("TK_REQ_BUCKETS", r"kTicketReqBuckets\s*=\s*(\w+?)u?;"),
+        ("TK_DEP_BASE", r"kTicketDepBase\s*=\s*(\w+?)u?;"),
+        ("TK_DEP_SLOTS", r"kTicketDepSlots\s*=\s*(\w+?)u?;"),
+        ("TK_DEP_STRIDE", r"kTicketDepStride\s*=\s*(\w+?)u?;"),
+        ("TK_FAR_KILLED", r"kTicketFarKilled\s*=\s*(\w+?)u?;"),
+        ("TK_PARKED", r"kTicketParkedNow\s*=\s*(\w+?)u?;"),
+    ]
+    for wname, pat in pairs:
+        want = num(wh, pat)
+        got = num(part, r"const\s+" + wname + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u")
+        if want is None or got is None:
+            problems.append(f"ticket record: cannot read {wname} (sim_particle.wgsl) "
+                            "or its world.h twin")
+        elif want != got:
+            problems.append(f"ticket record: sim_particle.wgsl {wname} = {got} but "
+                            f"world.h says {want}")
+    bias_w = num(wh, r"kTicketReqBias\s*=\s*(\d+);")
+    bias_g = num(part, r"const\s+TK_REQ_BIAS\s*:\s*i32\s*=\s*(\d+);")
+    if bias_w is None or bias_g is None or bias_w != bias_g:
+        problems.append(f"ticket record: TK_REQ_BIAS {bias_g} vs world.h "
+                        f"kTicketReqBias {bias_w}")
+    # The two far-flight flag bits must not collide with any other PFLAG.
+    mine = {}
+    for name in ("PFLAG_PARKED", "PFLAG_DEPOSIT"):
+        v = num(part, r"const\s+" + name + r"\s*:\s*u32\s*=\s*(\d+)u")
+        if v is None:
+            problems.append(f"ticket record: cannot read {name}")
+        else:
+            mine[name] = v
+    others = {}
+    for txt in (part, common):
+        for m in re.finditer(r"const\s+(PFLAG_\w+)\s*:\s*u32\s*=\s*(\d+)u", txt):
+            if m.group(1) not in mine:
+                others[m.group(1)] = int(m.group(2))
+    for name, v in mine.items():
+        for oname, ov in others.items():
+            if v & ov:
+                problems.append(f"ticket record: {name} ({v}) overlaps {oname} ({ov})")
+        # bits 5..12 are the micro life / float patience field
+        if v & (0xFF << 5):
+            problems.append(f"ticket record: {name} ({v}) overlaps the life field")
+
+
 ALL = {
     "solute": check_solute_mirror,
+    "ticket": check_ticket_record,
     "reactfx": check_react_fx,
     "coatrule": check_coat_rule,
     "stainprec": check_stain_prec,

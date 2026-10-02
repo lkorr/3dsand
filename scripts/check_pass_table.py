@@ -478,8 +478,11 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 # through common.wgsl, and sim_particle / sim_fluid run on
                 # this layout, so binding 46 names the same buffer here.
                 "draftField"}
+# farVox + farP since chunk tickets P2: a particle outside residency flies on
+# and blocks against the far cascade (sim_particle.wgsl FAR FLIGHT), exactly as
+# a gas parcel does (simulation.cpp particleBGL_ bindings 8 and 9).
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
-                    "expOps", "expMask", "spawnOps"}
+                    "expOps", "expMask", "spawnOps", "farVox", "farP"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch", "farSig",
                "farMap"}
 # Gas particles (docs/PLAN_gas_particles.md stage 1). farVox + farP are in this

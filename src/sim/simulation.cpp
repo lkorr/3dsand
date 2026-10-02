@@ -427,6 +427,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(5, T::ReadOnlyStorage),  // explosion ops
         entry(6, T::Storage),          // explosion destruction scratch
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
+        // Chunk tickets P2: a particle OUTSIDE residency flies on and blocks
+        // against the far cascade (sim_particle.wgsl FAR FLIGHT) — the same
+        // two buffers the gas group binds for gasFarBlocked.
+        entry(8, T::ReadOnlyStorage),  // farVox
+        entry(9, T::Uniform),          // FarParams (the cascade origins)
     };
     particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
 
@@ -823,6 +828,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(5, world_->expOps),
         b(6, world_->expMask),
         b(7, world_->spawnOps),
+        b(8, world_->farVox),
+        b(9, world_->farUBO),
     };
     particleBG_[page] =
         device.CreateBindGroup(particleBGL_, pentries, std::size(pentries), "particleBG");

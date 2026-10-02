@@ -6,7 +6,9 @@ and the three site classes this plan did not anticipate are in
 `docs/tickets_p0_audit.md`, and its "Deviations" section is the short list of
 what P1 inherits). **P1 IMPLEMENTED 2026-10-02** (`src/sim/tickets.{h,cpp}`,
 `kTicketMax = 16`, the ticket table in `pageTable`'s tail, ops in the op
-record, gate `ticket-settle`; deviations in §6). Named "tickets" rather
+record, gate `ticket-settle`; deviations in §6). **P2 IMPLEMENTED 2026-10-02**
+(particles park outside residency on the far cascade and request tickets;
+refused ones deposit as far landings; gate `ticket-land`). Named "tickets" rather
 than "islands" because `docs/PLAN_rigidbody_islands.md` already owns that word
 for disconnected solid components. Companion: `docs/PLAN_gas_particles.md`
 (independent; phase 2 here can consume its `farVox` blocking).
@@ -386,3 +388,46 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
 13. **P0 missed a literal**: `SOL_POOL_PAGES` (the solute pool, derived from
     `kNumSlots` in C++) was `4096u` in four WGSL mirror blocks;
     `check_invariants.py` caught it the moment `kNumSlots` moved.
+
+### P2
+
+1. **`farVox` blocking is standalone in `sim_particle.wgsl`** (`farBlocked`,
+   the gas kernel's `gasFarBlocked` verbatim; `particleBGL_` gained bindings 8
+   `farVox` and 9 `FarParams`). Outside the cascade reads OPEN, as for gas.
+   **Stated limitation, shared with gas stage 1:** the cascade is render-derived
+   data whose fill is budgeted per tick, and in the GAME its first fill waits on
+   a background pipeline compile — so where a particle comes down outside the
+   window before the horizon has filled is frame-timing dependent there. Every
+   selftest fills the cascade synchronously (`DrainFullRefill`) or not at all,
+   so the twice-run gates are unaffected; a replay of a game recording made
+   during the first seconds of a cold shader cache may differ in where far
+   debris parked. Making the far terrain a pure function of the tick needs a
+   sim-owned far blocker, which is out of scope here.
+2. **The `ticketReq` buffer is 32 atomicMax BUCKETS in the pageFaults record**,
+   not an append buffer (`world.h kTicketReq*`): an append cursor that
+   overflowed would refuse a scheduling-dependent subset. A parked particle
+   re-requests every tick, so a chunk that shares a bucket is served a tick
+   later. The record rides the fixed-latency snapshot, so a request becomes a
+   TicketOp exactly `kSnapshotLatency` ticks after the landing in every run;
+   the gate allows 8.
+3. **The FarEdit fallback is a FAR LANDING, not a cascade patch.** A parked
+   particle not resident within `PARK_DEPOSIT_TICKS` (16) — cap refused, or its
+   bucket lost every tick — DEPOSITS: it bids its `particlePriority` into one of
+   six deposit slots (atomicMax), the winner writes its state there in
+   `resolve` and dies, and the CPU (`Tickets` far landings, fed through
+   `World::TakeTicketDeposits` exactly once per published snapshot) re-throws it
+   with zero velocity the tick its chunk is resident again — a ticket, or the
+   window arriving. A single voxel is below every cascade level's resolution
+   (`faredits.h`: an edit shows at level k only if it changes a cell CENTRE), so
+   a cascade patch would draw nothing; the landing is invisible until resident.
+   Bounded: 65,536 held, oldest dropped and counted (`landingsDropped`).
+4. **Spray still ends at the window.** A micro particle leaving residency dies
+   as before — it is an effect with a lifetime, not conserved matter.
+5. **Rule 2 for far flight**: a particle leaving the far box (two window edges
+   centred on the window, the gas outer box's extent) dies and is counted
+   (`pageFaults[126]`); a parked particle lives at most 16 ticks before it
+   deposits.
+6. Two flag bits: `PFLAG_PARKED` (bit 17), `PFLAG_DEPOSIT` (bit 18); the park
+   clock reuses the float-patience bits (5..12), which a non-micro particle
+   outside residency cannot be using. `check_invariants.py` `ticket record`
+   pins the bits and the record layout.

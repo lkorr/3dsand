@@ -67,7 +67,9 @@ constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
 // (kFluidBlocks u32). Small enough to ride every snapshot; the block list
 // feeds PageTable::UpdateFluidChunks and the FA words feed the CPU's
 // conservative live count + the splash sound cue.
-constexpr uint64_t kFluidArgsOff = kPageFaultOff + 256;
+// The pageFaults record's slot: 512 bytes since it grew the ticket record
+// (world.h kPageFaultTicketBase; static_assert'd there).
+constexpr uint64_t kFluidArgsOff = kPageFaultOff + 512;
 constexpr uint64_t kFluidBlocksOff = kFluidArgsOff + 256;
 constexpr uint64_t kFluidBlocksBytes = kFluidBlocks * 4;
 // The excited-fluid mirror fold: one byte per mirror cell, packed 4/word.
@@ -973,6 +975,31 @@ void World::KickReadback() {
               out.reactFx.push_back(e);
             }
           }
+          // THE TICKET RECORD (world.h kTicketReq* / kTicketDep*): this
+          // tick's far-landing requests and deposits, in bucket / slot order.
+          out.ticketReq.clear();
+          out.ticketDeposits.clear();
+          for (uint32_t k = 0; k < kTicketReqBuckets; k++) {
+            const uint32_t key = at(kTicketReqBase + k);
+            if (key == 0) continue;
+            const uint32_t v = key - 1u;
+            out.ticketReq.push_back(
+                {sl.origin.x + (int)(v & 0x7Fu) - kTicketReqBias,
+                 sl.origin.y + (int)((v >> 7) & 0x7Fu) - kTicketReqBias,
+                 sl.origin.z + (int)((v >> 14) & 0x7Fu) - kTicketReqBias});
+          }
+          for (uint32_t k = 0; k < kTicketDepSlots; k++) {
+            const uint32_t b0 = kTicketDepBase + k * kTicketDepStride;
+            if (at(b0) == 0) continue;  // no bid this tick
+            ParticleSpawn d{};
+            d.px = (int32_t)at(b0 + 1);
+            d.py = (int32_t)at(b0 + 2);
+            d.pz = (int32_t)at(b0 + 3);
+            d.payload = at(b0 + 4);
+            out.ticketDeposits.push_back(d);
+          }
+          out.ticketFarKilled = at(kTicketFarKilled);
+          out.ticketParked = at(kTicketParkedNow);
         }
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
@@ -1101,6 +1128,8 @@ void World::InvalidateSnapshot() {
   std::fill(quietTicks_.begin(), quietTicks_.end(), (uint16_t)0);
   // Reaction effects the dead world published and nobody consumed yet.
   reactFxPending_.clear();
+  // ...and far-landing deposits of the dead world (chunk tickets P2).
+  ticketDepositsPending_.clear();
   // A regenerated window makes every cached chunk stale too: the fetch path's
   // version guard (`cc.version <= sl.tick`) would otherwise keep dead-world
   // contents for any later reader whose tick numbers are LOWER than the gate
@@ -1163,6 +1192,20 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
       if (reactFxPending_.size() > kReactFxPendingMax)
         reactFxPending_.erase(reactFxPending_.begin(),
                               reactFxPending_.end() - kReactFxPendingMax);
+    }
+    // Far-landing deposits (chunk tickets P2) ride the publish the same way:
+    // a deposited particle is DEAD on the GPU, so this queue is the only copy
+    // of it and must see every published tick (World::TakeTicketDeposits).
+    if (snap_.valid && !snap_.ticketDeposits.empty()) {
+      ticketDepositsPending_.insert(ticketDepositsPending_.end(),
+                                    snap_.ticketDeposits.begin(),
+                                    snap_.ticketDeposits.end());
+      if (ticketDepositsPending_.size() > kTicketDepositsPendingMax) {
+        const size_t over = ticketDepositsPending_.size() - kTicketDepositsPendingMax;
+        ticketDepositsDropped_ += over;
+        ticketDepositsPending_.erase(ticketDepositsPending_.begin(),
+                                     ticketDepositsPending_.begin() + (ptrdiff_t)over);
+      }
     }
     // ---- the quiet streak (M9.3-A) -------------------------------------
     // Here and not in the readback callback, because "quiet for N ticks" has

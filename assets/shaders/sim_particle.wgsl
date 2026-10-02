@@ -32,8 +32,166 @@ const PT_KERNEL : u32 = PT_K_PARTICLE;
 @group(1) @binding(3) var<storage, read_write> claim  : array<atomic<u32>>;
 @group(1) @binding(4) var<storage, read_write> pArgs  : array<u32>;
 @group(1) @binding(7) var<storage, read>       spawnOps : array<Particle>;
+// The far cascade's level-1 grid and its origins: what a particle OUTSIDE
+// residency blocks against (chunk tickets P2, the gas kernel's gasFarBlocked
+// verbatim). Same layout and the same two buffers sim_gas.wgsl binds.
+@group(1) @binding(8) var<storage, read>       farVox : array<u32>;
+@group(1) @binding(9) var<uniform>             farP : FarParams;
 
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
+
+// ---- FAR FLIGHT, PARKING, THE TICKET REQUEST (docs/PLAN_chunk_tickets.md P2) -
+//
+// A particle used to be DELETED the moment its flight left residency (the two
+// `!inBounds` kills below). Matter thrown past the window edge simply ceased to
+// exist. Now it keeps flying outside residency, blocking against the far
+// cascade (coarse, and right for "where on that hill did it come down"), and
+// where it comes to rest it PARKS: zero velocity, held in the ring, and every
+// tick it is parked it REQUESTS A TICKET for the chunk it rests in. The CPU
+// reads the requests off the fixed-latency snapshot and turns them into
+// TicketOps (src/sim/tickets.cpp); the tick the ticket's chunks are resident,
+// the particle's next integrate finds its cell resident, unparks and lands
+// through the ordinary claim path — falling the last few cells to the true
+// ground (the cascade is coarse), or rising out if the cascade put it inside a
+// hill (the burial rule).
+//
+// If no ticket arrives within PARK_DEPOSIT_TICKS (the cap refused it, or the
+// request lost its bucket every tick), the particle DEPOSITS: it hands its
+// state to the CPU through the deposit slots and dies. The CPU parks it as a
+// far landing and re-throws it, still, the tick its chunk is resident again —
+// a ticket, or the window arriving. Matter that leaves is paused, never lost.
+//
+// Rule 1: every choice here is a pure function of particle state and tick. The
+// request buckets and the deposit slots are atomicMax reductions (a set, not
+// an append cursor), and a deposit winner is decided by particlePriority, so
+// which particle hands over in a busy tick does not depend on thread order.
+// Rule 2: a parked particle lives at most PARK_DEPOSIT_TICKS; the far box is
+// bounded (FAR_KILL: two window edges centred on the window, the gas outer
+// box's extent) and leaving it kills, counted.
+const PFLAG_PARKED  : u32 = 131072u;  // bit 17: resting outside residency
+const PFLAG_DEPOSIT : u32 = 262144u;  // bit 18: bidding for a deposit slot
+// Request latency is kSnapshotLatency (4) + the between-ticks step: a granted
+// ticket is resident on the 5th tick after the first request. 16 leaves room
+// for a request that loses its bucket a few ticks running.
+const PARK_DEPOSIT_TICKS : u32 = 16u;
+// THE TICKET RECORD in pageFaults (world.h kPageFaultTicket* / kTicketReq* /
+// kTicketDep*; check_invariants.py `ticket record` pins these to it). Cleared
+// every tick by pass_table.def's fill_ticketRec.
+const TK_REQ_BASE    : u32 = 64u;   // kTicketReqBase: request buckets
+const TK_REQ_BUCKETS : u32 = 32u;   // kTicketReqBuckets
+const TK_DEP_BASE    : u32 = 96u;   // kTicketDepBase: deposit slots
+const TK_DEP_SLOTS   : u32 = 6u;    // kTicketDepSlots
+const TK_DEP_STRIDE  : u32 = 5u;    // kTicketDepStride: prio, px, py, pz, payload
+const TK_FAR_KILLED  : u32 = 126u;  // kTicketFarKilled: left the far box
+const TK_PARKED      : u32 = 127u;  // kTicketParkedNow: parked this tick
+// A request key packs the chunk RELATIVE to the window origin, 7 bits a side
+// biased by 64 (world.h kTicketReqBias); the far box is 2 windows wide, so the
+// offset is within [-16, 48) chunks and fits with room.
+const TK_REQ_BIAS : i32 = 64;
+
+// Outside the cascade reads OPEN (the gas kernel's argument: the particle is
+// already outside the simulated world, and a wall at the cascade boundary
+// would pin it against nothing).
+fn farBlocked(c : vec3<i32>) -> bool {
+  let cell = c >> vec3<u32>(farCellShift(1u));
+  if (!farInBox(cell, farP.origins[0].xyz)) { return false; }
+  let bi = farVoxByteIndex(1u, cell);
+  let b = (farVox[bi >> 2u] >> (8u * (bi & 3u))) & 0xFFu;
+  if (b == 0u) { return false; }
+  if ((b & FAR_BLOCKER_BIT) != 0u) { return true; }
+  return materials[farPalMat(&materials, b & FAR_PAL_MASK)].klass != CLASS_GAS;
+}
+
+// Two window edges centred on the window: the gas outer box's extent.
+fn farKilled(c : vec3<i32>) -> bool {
+  let lo = T.origin * i32(CHUNK) - vec3<i32>(i32(WORLD_N) / 2);
+  let d = c - lo;
+  let n = 2 * i32(WORLD_N);
+  return !(all(d >= vec3<i32>(0)) && all(d < vec3<i32>(n)));
+}
+
+// "I am parked in this chunk": one atomicMax into a bucket hashed from the
+// chunk. Order-free; a bucket two chunks share serves the larger key this
+// tick and the other next tick (its particles keep asking).
+fn farRequest(c : vec3<i32>) {
+  let r = worldChunkOf(c) - T.origin + vec3<i32>(TK_REQ_BIAS);
+  if (any(r < vec3<i32>(0)) || any(r >= vec3<i32>(2 * TK_REQ_BIAS))) { return; }
+  let key = (u32(r.x) | (u32(r.y) << 7u) | (u32(r.z) << 14u)) + 1u;
+  atomicMax(&pageFaults[TK_REQ_BASE + pcg(key) % TK_REQ_BUCKETS], key);
+}
+
+fn depositSlot(p : Particle) -> u32 {
+  return TK_DEP_BASE + TK_DEP_STRIDE *
+         (pcg(u32(p.px) ^ pcg(u32(p.pz) ^ pcg(u32(p.py)))) % TK_DEP_SLOTS);
+}
+
+// Come to rest at `at` (24.8) outside residency: park, and ask for a ticket.
+fn park(p : ptr<function, Particle>, at : vec3<i32>) {
+  (*p).px = at.x; (*p).py = at.y; (*p).pz = at.z;
+  (*p).vx = 0; (*p).vy = 0; (*p).vz = 0;
+  (*p).flags = withFloatTicks(((*p).flags | PFLAG_PARKED) & ~PFLAG_DEPOSIT, 0u);
+  farRequest(vec3<i32>(at.x >> 8u, at.y >> 8u, at.z >> 8u));
+}
+
+// One tick of a particle whose cell is NOT resident (see the block above).
+fn farIntegrate(pin : Particle) {
+  var p = pin;
+  let here = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+  if ((p.flags & PFLAG_PARKED) != 0u) {
+    atomicAdd(&pageFaults[TK_PARKED], 1u);
+    let ft = floatTicksOf(p.flags);
+    if (ft >= PARK_DEPOSIT_TICKS) {
+      // Bid for a deposit slot; `resolve` hands the winner to the CPU.
+      atomicMax(&pageFaults[depositSlot(p)], particlePriority(p));
+      p.flags |= PFLAG_DEPOSIT;
+      append(p);
+      return;
+    }
+    p.flags = withFloatTicks(p.flags, ft + 1u);
+    farRequest(here);
+    append(p);
+    return;
+  }
+  p.vy -= PART_GRAVITY;
+  p.vx = clamp(p.vx, -PART_MAX_VEL, PART_MAX_VEL);
+  p.vy = clamp(p.vy, -PART_MAX_VEL, PART_MAX_VEL);
+  p.vz = clamp(p.vz, -PART_MAX_VEL, PART_MAX_VEL);
+  let maxc = max(max(abs(p.vx), abs(p.vy)), abs(p.vz));
+  let n = max(1, (maxc + 127) / 128);
+  var lastAir = vec3<i32>(p.px, p.py, p.pz);
+  for (var k = 1; k <= n; k++) {
+    let sx = p.px + p.vx * k / n;
+    let sy = p.py + p.vy * k / n;
+    let sz = p.pz + p.vz * k / n;
+    let cell = vec3<i32>(sx >> 8u, sy >> 8u, sz >> 8u);
+    if (farKilled(cell)) {
+      atomicAdd(&pageFaults[TK_FAR_KILLED], 1u);
+      return;  // out of the far box: gone, and counted
+    }
+    if (inBounds(cell)) {
+      // Back into residency (the window, or a ticket) mid-step. Into a free
+      // cell it simply carries on next tick through the ordinary path; into
+      // matter it comes to rest just outside, against it.
+      if (blocksParticle(cell, false, false)) {
+        park(&p, lastAir);
+      } else {
+        p.px = sx; p.py = sy; p.pz = sz;
+      }
+      append(p);
+      return;
+    }
+    if (farBlocked(cell)) {
+      park(&p, lastAir);
+      append(p);
+      return;
+    }
+    lastAir = vec3<i32>(sx, sy, sz);
+  }
+  p.px += p.vx;
+  p.py += p.vy;
+  p.pz += p.vz;
+  append(p);
+}
 
 // ---- wind (docs/RESEARCH_wind.md §4.6, phase 3) -----------------------------
 // THE FIELD SCALE, shared by both fields this kernel reads. windAtQ and
@@ -399,7 +557,19 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   if ((p.flags & PFLAG_ALIVE) == 0u) { return; }
 
   let startCell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
-  if (!inBounds(startCell)) { return; }  // fell out of the world: gone
+  if (!inBounds(startCell)) {
+    // Outside residency. Spray is an effect and still just ends here; matter
+    // flies on, parks and asks for a ticket (FAR FLIGHT, above).
+    if (isMicro(p)) { return; }
+    farIntegrate(p);
+    return;
+  }
+  // Resident again — a ticket arrived over a parked particle, or the window
+  // did. It lands through everything below from here on; the park clock
+  // shares the float-patience bits, so it is zeroed with the flags.
+  if ((p.flags & (PFLAG_PARKED | PFLAG_DEPOSIT)) != 0u) {
+    p.flags = withFloatTicks(p.flags & ~(PFLAG_PARKED | PFLAG_DEPOSIT), 0u);
+  }
 
   // This particle's own material, read once: every fluid decision below is a
   // property of the stuff in flight, and re-indexing the table per test is the
@@ -617,8 +787,18 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     let sy = p.py + p.vy * k / n;
     let sz = p.pz + p.vz * k / n;
     let cell = vec3<i32>(sx >> 8u, sy >> 8u, sz >> 8u);
-    if (!inBounds(cell)) { return; }  // left the world: particle dies
-    if (blocksParticle(cell, inFluid, isMicro(p))) {
+    // Leaving residency mid-step: spray ends (as it always did); matter is
+    // tested against the far cascade and flies on (FAR FLIGHT, above).
+    let res = inBounds(cell);
+    if (!res && isMicro(p)) { return; }
+    if (!res && farKilled(cell)) {
+      atomicAdd(&pageFaults[TK_FAR_KILLED], 1u);
+      return;
+    }
+    var blocked = false;
+    if (res) { blocked = blocksParticle(cell, inFluid, isMicro(p)); }
+    else { blocked = farBlocked(cell); }
+    if (blocked) {
       // ---- micro: land ON the surface, stain it, and stop existing ----
       // The droplet is parked at the CONTACT point (first blocked sample), not
       // backed off to the last air cell the way a reinserting particle is. The
@@ -647,6 +827,13 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       // propose reinsertion at the last position it could legally be in
       p.px = lastAir.x; p.py = lastAir.y; p.pz = lastAir.z;
       let tgt = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+      // ...unless that position is outside residency: it cannot claim a cell
+      // no kernel may write, so it PARKS there and asks for a ticket.
+      if (!inBounds(tgt)) {
+        park(&p, lastAir);
+        append(p);
+        return;
+      }
       // ---- A FLOATER THAT BUMPED INTO A BERTH ALREADY TAKEN ---------------
       // Reinserting here is what used to build the tower: a chip blocked by the
       // chip that landed a tick earlier proposed the cell ABOVE it, and the
@@ -679,9 +866,11 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         // landing ~1 a tick; with the merge always preferred, a partial pile
         // top overflowed the same way). Spread over ten cells a tick's grains
         // fit, and a grain placed over a drop is just a CA grain that falls.
-        let bw = voxWordAt(cell);
+        // `cell` may be the far cascade's (blocked OUTSIDE residency while
+        // `tgt` is inside): there is no word to merge into there.
+        let bw = select(0u, voxWordAt(cell), res);
         var nf = 0xFFu;
-        let canMerge = voxMat(bw) == myMat && powderIsPartial(bw) &&
+        let canMerge = res && voxMat(bw) == myMat && powderIsPartial(bw) &&
                        powderMass(bw) + myMass <= POWDER_FULL;
         let hs = pcg(u32(sx) ^ pcg(u32(sz) ^ pcg(u32(sy) ^ p.payload)));
         for (var j = 0u; j < 10u; j++) {
@@ -778,6 +967,27 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveCount(1u - T.page)) { return; }
   var p = pWrite[gid.x];
+  // ---- THE DEPOSIT (FAR FLIGHT, at the top of the file) ------------------
+  // integrate bid this particle's priority into its deposit slot. The winner
+  // writes its state into the slot and dies — the snapshot carries it to the
+  // CPU, which parks it as a far landing (tickets.h) and re-throws it when its
+  // chunk is resident. A loser stays parked and bids again next tick. Two
+  // particles with the SAME priority hashed the same state: same position,
+  // same payload, so the record they both write is the same record.
+  if ((p.flags & PFLAG_DEPOSIT) != 0u && (p.flags & PFLAG_ALIVE) != 0u) {
+    let ds = depositSlot(p);
+    if (atomicLoad(&pageFaults[ds]) == particlePriority(p)) {
+      atomicStore(&pageFaults[ds + 1u], bitcast<u32>(p.px));
+      atomicStore(&pageFaults[ds + 2u], bitcast<u32>(p.py));
+      atomicStore(&pageFaults[ds + 3u], bitcast<u32>(p.pz));
+      atomicStore(&pageFaults[ds + 4u], p.payload);
+      p.flags = 0u;
+    } else {
+      p.flags &= ~PFLAG_DEPOSIT;
+    }
+    pWrite[gid.x] = p;
+    return;
+  }
   if ((p.flags & (PFLAG_ALIVE | PFLAG_PENDING)) != (PFLAG_ALIVE | PFLAG_PENDING)) {
     return;
   }

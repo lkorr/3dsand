@@ -4947,6 +4947,14 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
         WorldEditLayer().Drain(world, cellOps,
                                kMaxCellOpsPerTick - (uint32_t)cellOps.size(),
                                world.TicksEncoded() + 1u);
+      // ---- far landings coming home (chunk tickets P2, sim/tickets.h) ------
+      // Matter that came to rest outside residency and was parked on the CPU
+      // is re-thrown, still, on the tick its chunk is resident again (a ticket
+      // or the window). On the ordinary spawn stream, bounded by its cap like
+      // every other producer on it; what does not fit waits for the next tick.
+      if (stream.TicketSet().HasLandingSpawns() && spawns.size() < kMaxParticleSpawnsPerTick)
+        stream.TicketSet().DrainLandingSpawns(
+            spawns, kMaxParticleSpawnsPerTick - (uint32_t)spawns.size());
   }
 }
 
