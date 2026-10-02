@@ -1,6 +1,6 @@
 # World Map: an authored finite overworld — plan of record
 
-Status 2026-09-04: **P0–P5 BUILT** on branch `worktree-world-map-p1`
+Status 2026-09-04: **P0–P5 BUILT** (on main — audit 2026-10-02) on branch `worktree-world-map-p1`
 (P0 `ffa2c3f` on `worktree-world-map`; P1 `c61f928`, P2a `3693314`, P2b
 `48b5168`, P3 `907179f`, P4 `5e67077`, P5 `c76669d`). `DESIGN.md` §9d is the
 architecture truth for what shipped; this file is the plan and its
@@ -91,5 +91,15 @@ pdx*pdx + pdz*pdz` (overflow past 4.6 km) went with the pools.
 - Slope-gated rules; sites wider than 512 voxels; kelp/aquatic rows under
   the sea; moisture plane → lake fullness (`PLAN_biomes` §6); `contLog2`
   retirement; `meta.svm` recording map name + hash (save identity).
+  *(2026-10-02 audit: DONE — slope gates (`maxSlope` rows in
+  `assets/biomes/*.json`), `contLog2` retired (no hit in `src/` or
+  `assets/shaders/`), save identity via the SVM6 worldgen fingerprint, which
+  stamps the active map's `map.json`/`map.svmap`/sculpt layer
+  (`src/sim/worldio.cpp`); aquatic vegetation lives in `assets/water/` presets
+  (e.g. kelp in `crater_lake.json`). Not re-verified: sites > 512 voxels,
+  moisture → lake fullness.)*
 - The World map page: heightmap backdrop, PNG import/export, rules editor
-  (rules are JSON-only today).
+  (rules are JSON-only today). *(2026-10-02 audit: the heightmap backdrop
+  exists (`assets/editor/map.js` `--heightmap`); PNG import/export and a rules
+  editor do not. Dungeons above: still open, no `proc:` kind in
+  `src/sim/worldmap.cpp`.)*

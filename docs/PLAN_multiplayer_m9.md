@@ -3,7 +3,9 @@
 **Written:** 2026-09-20 against `54fe241` (main), the commit that landed
 `docs/PLAN_multiplayer_now.md` N1–N6. **Source audit:**
 `docs/RESEARCH_multiplayer_readiness.md` (finding ids L*/S*/A*/X* below refer to
-its §2). **Model of record:** DESIGN.md §10. **Status:** plan of record for M9.
+its §2). **Model of record:** DESIGN.md §10. **Status (2026-10-02 audit): COMPLETE — M9.1–M9.5 all
+LANDED 2026-09-21** (per-stage commits in each section's LANDED block; `--host`/`--join`
+in "Running two players"). Originally: plan of record for M9.
 One orchestrator (Fable 5.1) reviews, sequences and merges; **Opus 5 worktree
 agents implement**, one per package; integration branch `mp-two` (off `54fe241`),
 fast-forwarded to `main` at the end of each stage.

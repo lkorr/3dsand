@@ -3,7 +3,9 @@
 **Source:** `docs/RESEARCH_multiplayer_readiness.md` (the audit; finding ids
 L1…L11, S1…S7, A1…A5 below refer to its §2 tables).
 **Written:** 2026-09-10 against `d910f6f`.
-**Status:** plan of record. **One orchestrator (Claude Fable 5.1), Opus 5 agents
+**Status (2026-10-02 audit): COMPLETE — N1–N6 LANDED on main 2026-09-20 via `54fe241`
+("Merge mp-land"; hash re-pinned `d942634`); M9 (`docs/PLAN_multiplayer_m9.md`) was built
+on it.** Originally: plan of record. **One orchestrator (Claude Fable 5.1), Opus 5 agents
 per package, one worktree per package, integration branch `mp-now`.** Each
 package states its owner scope, verified facts to build on, its hash impact,
 and the ONE verification that closes it.

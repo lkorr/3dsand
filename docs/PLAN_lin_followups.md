@@ -2,7 +2,10 @@
 
 **Source:** `docs/RESEARCH_john_lin.md` §13.1–13.4 (and §14, the plain-words contract).
 **Written:** 2026-09-01, after re-verifying every §13 item against the tree at `73bc9c6`.
-**Status:** plan of record. One orchestrator, Opus agents per package, one worktree per
+**Status (2026-10-02 audit): COMPLETE, 2026-09-02** — `lin-followups` is merged to
+main (P0 `49bfce6`, T1–T3 `299d6f1`, T4 `c80850a`); §6 is the record, including
+the two targets NOT met (T5.2 god rays, W2-B submerged) and T5.3 removed.
+Originally: plan of record. One orchestrator, Opus agents per package, one worktree per
 package. Each package below states its owner scope, its hash impact, and the ONE
 verification that closes it.
 

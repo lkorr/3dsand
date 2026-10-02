@@ -92,7 +92,7 @@ quoting "interactive after X s / far ready after Y s".
    86 s. What it catches is worldgen quietly doubling, which is the P-F failure
    that shipped.
 
-### C — worldgen kernel restructure (DEFERRED, needs worldgen.wgsl claim)
+### C — worldgen kernel restructure (items 1 + 3 merged `319f81e`, 2026-09-08; item 2 skipped — see "Package C" below)
 Blocked behind env-pg-pi (agent-9ef45d). For whoever owns worldgen.wgsl next, in
 expected-payoff order; each item moves no behaviour, only compile time, but the WGSL↔C++
 mirror token-compare (`check_invariants.py`) and hash-neutrality must be re-verified per
@@ -122,16 +122,24 @@ Cold CWD (both caches wiped), renamed exe, RTX 3060 Ti:
   package B's opt-off control), so the pin is the worldgen owner's to move.
 
 Open follow-ups:
-- spirv-opt on the deferred pair runs ~3x slower than standalone (far 302-349 s
+- ~~spirv-opt on the deferred pair runs ~3x slower than standalone (far 302-349 s
   vs 98.6 s) from CPU contention with boot — the unmeasured `legal` recipe, or
-  a lower thread count for the deferred set, would shrink far-ready.
-- Package C (far split + main/list merge + by-value flattening) still applies
-  and now attacks both the driver time AND the spirv-opt time.
+  a lower thread count for the deferred set, would shrink far-ready.~~ DONE 2026-09-09: worldgen takes the legalization recipe
+  (`OptRecipe::kLegalization`, `src/gpu/vk_spirv.cpp`) and far is compiled lazily — see below.
+- ~~Package C (far split + main/list merge + by-value flattening) still applies
+  and now attacks both the driver time AND the spirv-opt time.~~ Far split +
+  flattening merged `319f81e` (2026-09-08); main/list merge still skipped.
 - `scripts/run.sh`'s stale-lock handling killed this session's wrapper shells
   three times while a long compile held sv-gpu-lock (the exes survived,
   orphaned). Long-run holders need a keepalive the reaper respects.
 
 ## Package C — WRITTEN 2026-09-07, NOT YET MEASURED (branch `worktree-agent-a665bf2ee69ebad8e`)
+
+> **2026-10-02 audit: items 1 and 2 ARE ON MAIN** (written `1e35e85`, merged `319f81e` 2026-09-08;
+> `worldgen.wgsl` has separate `far` and `farpatch` entries) and have shipped since
+> 2026-09-07; the 2026-09-09 section below measured the tree with them in it.
+> The one dedicated verification launch described here was never recorded.
+> Item 3 (`main`+`list` merge) remains skipped.
 
 Items 1 and 2 are implemented and compile-clean; item 3 is deliberately **not
 done** and the reason is a measurement, below. **Nothing here has been RUN yet.**

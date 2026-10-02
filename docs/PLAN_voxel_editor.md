@@ -1,6 +1,13 @@
 # PLAN: Voxel model editor, procedural animation, microvoxels
 
-Status: in progress (2026-08-20). This doc is the shared contract for the
+**Status (2026-10-02 audit): LANDED, all waves** (main `dd29abc`, `ec31c88`,
+`b47123d`, 2026-08-20): static micro-detail, the `src/game/anim.*` runtime,
+dynamic micro bodies and the tuner Models tab (`assets/editor/`); DESIGN.md has
+"Static micro-detail", "Dynamic microvoxel bodies" and "Animation pipeline"
+sections. The pose pipeline has since been unified (`src/game/pose.h`,
+2026-09-24). Kept as the original contract.
+
+Original status: in progress (2026-08-20). This doc is the shared contract for the
 feature; implementation agents build against it. When a decision here changes,
 update this file in the same commit. DESIGN.md gets a distilled section when
 each piece lands.

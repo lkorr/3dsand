@@ -7,6 +7,18 @@
 > `assets/shaders/worldgen.wgsl`; follow-through: `docs/PLAN_map_overhaul.md`.
 > Names below (`pondAt`, `pondInfo`, `surfHeightAt`, ruins, the arena) are the
 > code as it was.
+>
+> **2026-10-02 audit — packages E–H were NOT built as written; superseded.**
+> E (sine-of-contours `ridgeAt`), F (two-`vnoise3` 3D caves) and G
+> (`climateAt`/`CLIMATE_SEED` compass ramps) have no code in
+> `assets/shaders/`. Their jobs went to the map: mountains/basins are the
+> map's landform plane + range rung (`WM_H_TERRAIN_LANDFORM_RANGE` /
+> `RANGE_AMPLITUDE` in `worldgen.wgsl`) and the per-biome relief curve;
+> caves are per-biome cave bands (`caveBands()` in `worldgen.wgsl`);
+> climate is the map's painted biome / moisture planes
+> (`docs/PLAN_world_map.md`, `PLAN_environment_truth.md`,
+> `PLAN_map_overhaul.md`). The "Package D is next" line in the block below is
+> history — D landed.
 
 > **Status.** Package **A** landed `9c42a3c` (the `terrain` gate + baseline-value
 > plumbing). Package **B** landed `3fdcf5c` (foundations: Q14 log2-cell noise with

@@ -1,6 +1,11 @@
 # PLAN: fluid overhaul — flow, look, perf, and the fluid lab
 
-**Status: work queue, written 2026-08-24 from a research session (codebase audit +
+**Status (2026-10-02 audit): WP1–WP4 LANDED 2026-08-24 and WP5 (re-scoped) 2026-08-25 —
+see each WP's "results" block in §9. §8.2's leftovers are still open: the settle mass
+leak (`ca-slope-hybrid` is still `"fail"` in `tests/baseline.json`) and `fluid-react`'s
+settled-consumption ledger term.**
+
+Original status: work queue, written 2026-08-24 from a research session (codebase audit +
 reference-implementation study). This document extends `PLAN_mpm_fluids.md`,
 which remains the architecture of record for the hybrid settled/excited design —
 nothing here contradicts it; this is the concrete path through its Phases 3–7,

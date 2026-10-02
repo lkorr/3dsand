@@ -2,8 +2,14 @@
 
 Status: packages A, B, C, E and F LANDED 2026-09-23 (worktree
 `clouds-weather`), plus tier-1 rain/snow and lightning from D/G. DESIGN.md §9.w
-is what shipped and supersedes the sketches below where they differ. Still open:
-rain touching the SIM (§2.5 tier 2 wet stain + `RCOND_RAIN`, tier 3 water), a
+is what shipped and supersedes the sketches below where they differ. Still open
+(2026-10-02 audit: rain DOES touch the sim now — `RCOND_RAIN`/`RCOND_RAINDAMP`
+in `common.wgsl`, `TickParams.weatherRain`, `"rain"` douse and `"rainDamped"`
+ignition rules in `reactions.json` (main `9a0a702`, 2026-09-23), tier 2's
+per-voxel wet stain on exposed ground (`sim_mutate.wgsl` `rainFall`, drying,
+gate `rain-stain`, `f039607`, 2026-09-25) and the exposure map below; only
+tier 3 water placement is still missing from that item):
+~~rain touching the SIM (§2.5 tier 2 wet stain + `RCOND_RAIN`, tier 3 water)~~, a
 tuner PAGE for authoring presets (they are plain JSON; the Clouds and Sky
 weather tabs cover the knobs), thunder audio, cloud god-rays, biome-driven
 weather, and recovering the raymarch fs spill (16 -> 96 B/thread).

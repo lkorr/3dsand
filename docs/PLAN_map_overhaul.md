@@ -3,6 +3,10 @@
 Date: 2026-09-26. Orchestrated: one orchestrator session plans, reviews and
 merges; Opus worktree agents implement one package each.
 
+**Status (2026-10-02 audit): P1–P7 ALL LANDED on main 2026-09-26** — P1 `b570227`,
+P2 `1d5a51a`, P3 `51657b7`, P4 `0e9b59e`, P5 `5755e59`, P6 `86c19b2`, P7 `b5359be`
+(`map-overhaul` merged with main at `85b1118`).
+
 **Goal of the owner:** generate an interesting base terrain, paint biomes,
 then HAND-SHAPE the terrain and add stuff (structures, water, trees). The audit
 (2026-09-26) found the generator mostly sound but: no mid-scale sculpting tier,

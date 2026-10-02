@@ -1,5 +1,10 @@
 # PLAN: weapon coats, venom, the item stage, the snake (2026-10-01)
 
+**Status (2026-10-02 audit): A–D LANDED on main 2026-10-01** (`weapon-coats` merged;
+tuner/engine map `b673ca1`; follow-ups `7bceaa1`, `1ceafbd`, `4689af6`). Gates
+`coat-transfer`, `venom-blade`, `venom-wound`, `item-stage`, `snake`, `infect-perf`;
+`assets/mobs/snake.{json,vox}`.
+
 Owner request: coat weapons, armour and fists with any liquid and have the coat
 TRANSFER onto what they hit. A blade carries its coat into the wound it cuts. A
 blunt weapon splashes its coat onto the bruise. A fist works the same way. One

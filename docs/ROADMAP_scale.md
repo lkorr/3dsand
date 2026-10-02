@@ -604,6 +604,21 @@ independent (can run now):
 far-field extension (§4): independent, any time
 ```
 
+**Audit 2026-10-02 against the code:** `kWorldN` is still 512 and
+`kVoxelMeters` still 0.10 (`world.h`); growing the window is blocked by a
+`static_assert` until the voxel buffer is split (`kWorldN = 1024` is 4.03 GiB in
+one binding), and chunk tickets P0 (`e808931`, 2026-09-09) separated the slot
+space from the window as groundwork. Async compute (§3.6) and temporal rate LOD
+(§3.5) are not started (one queue in `src/gpu/`; no rate-LOD path in
+`sim_step.wgsl`/`simulation.cpp`). Bulk promotion (§3.2) is PARTIAL: large
+islands now become one rigid body (`PLAN_rigidbody_islands.md`, a cut tree falls
+as one 28k-voxel body, 2026-09-04/12), but there is no general "falling clump →
+body" policy. The far field's shift/fill bandwidth was worked by perf audit P3
+(`6c9c733`, column-hoisted far sieve, 2026-09-24). Note the "Rejected" list's
+"aggregate bulk solvers (hydrostatic per-chunk ponds)" — a still-water body
+system WAS later built (`PLAN_water_master.md`), as a CA overlay rather than a
+coarse solver.
+
 Constraints that outrank everything here, restated so no optimization erodes
 them: rule 1 (bit-determinism: integer sim, stateless RNG, ≤1-cell writes, no
 scheduling-dependent outcomes), rule 2 (cost scales with activity — every new

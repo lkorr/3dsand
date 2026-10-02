@@ -1,6 +1,12 @@
 # PLAN: a body of water finds its level — relevel first, then slosh
 
-> **Status: PLAN, amended after audit (2026-09-14, same day).** `sim.waterBodyMode`
+> **Status (2026-10-02 audit): ALL FOUR PACKAGES LANDED on main, 2026-09-14** —
+> W1 relevel `ba4de39` (checkpoint `c9d22b4`), W-D discovery `fcc639b`, W2
+> slosh `d0ce910`, W3 impulses + render read of `waterFlux` (`raymarch.wgsl`
+> binding 22) `fef39cb`, which also flipped `sim.waveMode` to 1. Gate:
+> `--gate waterbody` (passes R/S/N). §6's non-goals stand.
+>
+> Original status: PLAN, amended after audit (2026-09-14, same day). `sim.waterBodyMode`
 > was flipped to 1 the same day, so the M1–M5 body system (DESIGN.md §5b) now runs
 > in the shipped game. This document is what to build ON it. The audit fixed five
 > spec defects in place (histogram base address §3.2, ledger word aliasing §3.2,

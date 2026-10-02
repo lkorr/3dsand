@@ -1,5 +1,14 @@
 # PLAN: MLS-MPM fluid rewrite
 
+**Status (2026-10-02 audit):** Phases 0–2 LANDED (solver `sim_fluid.wgsl`, the
+excite/settle seam `sim_fluid_seam.wgsl`; `PLAN_fluid_overhaul.md` WP1–WP4
+2026-08-24, WP5 2026-08-25; DESIGN.md "MLS-MPM liquid"). **Phase 3 (delete the
+CA liquid rules) was REJECTED** by WP5's re-scope — the CA keeps settled
+water, and large still water went to the water-body system
+(`PLAN_water_master.md`). Phase 5's CPIC rigid coupling and Phase 7's per-material
+`"fluid"` block do not exist in the tree (no `CPIC`/fluid impulse code, no
+`"fluid": {` in `materials.json`); Phases 4 and 6 not re-audited here.
+
 **Status update 2026-08-24: `docs/PLAN_fluid_overhaul.md` is now the active
 work queue** — diagnosis of the goopy/clumpy look + perf strain, the fluid-lab
 test world, and the concrete path through this plan's Phases 3–7. This document

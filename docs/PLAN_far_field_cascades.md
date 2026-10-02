@@ -1,6 +1,13 @@
 # Plan: far-field cascades — kilometer view distance for the raymarcher
 
-Status: phase 1 in progress. Whoever implements this owns updating DESIGN.md in
+**Status (2026-10-02 audit): phases 1–7 LANDED** (phase 1 + 2–5 2026-08-19,
+phase 6 measured 2026-08-23, phase 7 edit persistence 2026-08-24,
+`src/sim/faredits.{h,cpp}`; DESIGN.md §9 is the binding summary). Of phase 8's
+"later" list the beam/depth prepass landed as the ray-start map
+(`assets/shaders/ray_start.wgsl`, main `b0ba179`, 2026-09-28); ray-guided fill
+priority and sieve water-surface flattening remain open.
+
+Original status: phase 1 in progress. Whoever implements this owns updating DESIGN.md in
 the same commits (CLAUDE.md: a change that contradicts DESIGN.md must update it
 or not happen).
 

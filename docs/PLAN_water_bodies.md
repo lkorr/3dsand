@@ -1,6 +1,14 @@
 # Water bodies: basin labels, pooled-level bookkeeping, and pressure drains
 
-> **Status: design, 2026-08-27. Nothing implemented.** Originated in an owner
+> **Status (2026-10-02 audit): SUPERSEDED and BUILT.** This design was
+> re-planned as `docs/PLAN_water_master.md` (which corrects five things in it)
+> and built from there as M1–M5 (main `681dd72`..`3d713ae`, 2026-08-29:
+> `src/sim/waterbody.{h,cpp}`, DESIGN.md §5b); `sim.waterBodyMode` flipped to 1
+> on 2026-09-14, and `docs/PLAN_water_relevel.md` (W1 relevel, W-D discovery,
+> W2 slosh, W3 impulses) landed on top the same day. Read this file for the
+> rationale only; open items live at the end of `PLAN_water_master.md` §1.5.
+>
+> Original status: design, 2026-08-27. Nothing implemented. Originated in an owner
 > conversation; the owner intends to implement soon and likes this direction
 > specifically. **§1–§12 are the sim half (packages A–F); §13–§16 are the look
 > half (packages G–J), written the same day and deliberately sequenced after,

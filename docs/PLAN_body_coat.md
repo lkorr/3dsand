@@ -1,6 +1,14 @@
 # PLAN: body coats — a stain on a body is a substance, not a look
 
-Status: scaffolding landed 2026-09-13 (branch `body-coat`). Substances beyond
+**Status (2026-10-02 audit): scaffolding AND effects landed.** Since the
+scaffolding: corrosive (acid), lava and oil fuel coats (2026-09-23), the coat
+rule unified for ground and body (W2-J2 `65804e3`, 2026-09-24), healing coats
+(alchemy package D, `Mob::HealTick`, 2026-09-27), every liquid coats
+(2026-09-29), weapon coats + venom infection (main `b673ca1`, 2026-10-01).
+Still NOT built: §2's nullifier (no `nullify` effect in `materials.json`) and
+§3's items. DESIGN.md's coat sections are the truth.
+
+Original status: scaffolding landed 2026-09-13 (branch `body-coat`). Substances beyond
 blood and water, and every EFFECT, are future work; this document records what
 the scaffolding is for and where an effect plugs in, so the first one is a data
 edit plus one read, not a redesign.
