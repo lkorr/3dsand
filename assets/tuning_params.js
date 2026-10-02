@@ -910,8 +910,6 @@ const TUNING_PARAMS = {
   'dayNight.moon2Node':{t:'f',def:95,min:0,max:360},
   'dayNight.moon2MeanAnomaly0':{t:'f',def:200,min:0,max:360},
   'dayNight.moon2AngularRadius':{t:'f',def:1.05,min:0.05,max:20},
-  'weather.waterFreezes':{t:'b',def:true},
-  'weather.iceMelts':{t:'b',def:true},
   'weather.clouds':{t:'b',def:true},
   'weather.autoCycle':{t:'b',def:true},
   'weather.preset':{t:'s',def:"fair"},

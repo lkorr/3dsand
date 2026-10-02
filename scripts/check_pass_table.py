@@ -206,6 +206,7 @@ PIPE_TO_MEMBER = {
     # The temperature layer (sim_heat.wgsl, src/sim/heat.h).
     "PIPE_HEAT_BEGIN": "heatBegin_",
     "PIPE_HEAT_SHIFT": "heatShift_",
+    "PIPE_HEAT_PEND": "heatPend_",
     "PIPE_HEAT_WANT": "heatWant_",
     "PIPE_HEAT_ARGS": "heatArgs_",
     "PIPE_HEAT_ALLOC": "heatAlloc_",

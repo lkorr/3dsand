@@ -14938,15 +14938,24 @@ int main(int argc, char** argv) {
           hr.snowline = hy >= HeatSnowlineY();
           const uint32_t bi = World::MapBiomeAt(hx, hz, world.WorldSeed());
           const HeatClimate cl = hr.snowline ? HeatSnowlineClimate() : HeatBiomeClimate(bi);
-          const std::vector<std::string>& pal = worldmap::CurrentWorldMap().palette;
+          // By biome ID (MapBiomeAt's answer), not by the map's palette slot.
+          const std::vector<std::string>& names = worldmap::CurrentWorldMap().biomeName;
           hr.biome = hr.snowline ? std::string("snowline")
-                                 : (bi < pal.size() ? pal[bi] : std::to_string(bi));
+                                 : (bi < names.size() && !names[bi].empty() ? names[bi]
+                                                                            : std::to_string(bi));
           hr.base = cl.base;
           hr.swing = cl.swing;
           hr.ambient = HeatAmbientCpu(hx, hy, hz, world.WorldSeed(), day);
           const WorldSnapshot& hs = world.Snap();
           if (hs.valid) {
             const uint32_t px = hs.heat[kHmProbeX], pe = hs.heat[kHmProbeE];
+            // heatBegin writes the probe every CA-active tick, tagged with
+            // the block it read: a different tag is a reading of where the
+            // player WAS (the world has been asleep since, or the probe moved
+            // a tick ago).
+            const uint32_t tag = ((uint32_t)(hx >> 1) & 31u) | (((uint32_t)(hy >> 1) & 31u) << 5) |
+                                 (((uint32_t)(hz >> 1) & 31u) << 10);
+            hr.current = (px >> kHeatProbeTagShift) == tag;
             hr.paged = (px & 0x10000u) != 0;
             hr.x = (int)(px & 0xFFu);
             hr.xTarget = (int)((px >> 8) & 0xFFu);

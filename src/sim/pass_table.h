@@ -422,7 +422,7 @@ enum class Pipe : uint8_t {
   DraftCoarseSolve, DraftFineFirst, DraftFineMid, DraftFineMid2, DraftFineLast,
   // The temperature layer (sim_heat.wgsl). BEFORE ShadowResolve for the copy
   // loop's bound stated above.
-  HeatBegin, HeatShift, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatTent, HeatRelax,
+  HeatBegin, HeatShift, HeatPend, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatTent, HeatRelax,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.

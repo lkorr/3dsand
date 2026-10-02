@@ -63,6 +63,17 @@ constexpr uint32_t kHmLastDay = 6;     // 1 night, 2 day, 0 unknown
 constexpr uint32_t kHmDayFlip = 7;
 constexpr uint32_t kHmOrigin = 8;      // 8..10 last origin, 11 = set
 constexpr uint32_t kHmOriginSet = 11;
+// Chunks that set their bit in the kHmPend bitset during the last heatRelax
+// (still relaxing, not woken for the CA): heatBegin arms heatPend from it and
+// zeroes it.
+constexpr uint32_t kHmPendCount = 12;
+// Why heatShift is armed this tick (bit set = do it): kHeatShiftRelease (the
+// window moved, or the layer is off), kHeatShiftDawn (the daylight switch to
+// DAY: every kept page's X and X* drop by the ambient step, so the actual
+// temperature T = ambient + X is continuous and never passes the hottest
+// source in reach -- the ceiling).
+constexpr uint32_t kHmShiftWhy = 13;
+constexpr uint32_t kHeatShiftRelease = 1u, kHeatShiftDawn = 2u;
 // Stats, words 16..31 -- the snapshot carries words 0..31 (kHeatSnapWords).
 constexpr uint32_t kHmPagesPeak = 16;
 constexpr uint32_t kHmRefused = 17;    // monotonic: wanted chunks the pool could not page
@@ -78,23 +89,42 @@ constexpr uint32_t kHmAllocs = 26;
 constexpr uint32_t kHmReleased = 27;   // pages released by heatShift
 constexpr uint32_t kHmLastRelax = 28;  // relax chunks THIS tick
 constexpr uint32_t kHmLastRecomp = 29; // recompute chunks THIS tick
-constexpr uint32_t kHmProbeX = 30;     // the probe cell: X | X* << 8 | 0x10000 if paged
+// The F1 probe, written by heatBegin every CA-active tick (so it follows the
+// player into a cold, unpaged chunk instead of keeping the last hot reading):
+// X | X* << 8 | 0x10000 if paged | the probe BLOCK's tag << 17 (HeatProbeTag),
+// so a reader can tell a reading of where it stands from a stale one.
+constexpr uint32_t kHmProbeX = 30;
 constexpr uint32_t kHmProbeE = 31;     // the probe block's plane-0 high half
+constexpr uint32_t kHeatProbeTagShift = 17;
 constexpr uint32_t kHeatSnapWords = 32;
-// Indirect args: five 16-byte records, copied to heatArgs by copy_heatArgs.
+// Indirect args: six 16-byte records, copied to heatArgs by copy_heatArgs.
 constexpr uint32_t kHmArgs = 32;
 constexpr uint32_t kHeatArgAlloc = 0, kHeatArgSrc = 1, kHeatArgRecomp = 2,
-                   kHeatArgRelax = 3, kHeatArgShift = 4, kHeatArgRecords = 5;
+                   kHeatArgRelax = 3, kHeatArgShift = 4, kHeatArgPend = 5, kHeatArgRecords = 6;
 constexpr uint32_t kHeatArgsBytes = kHeatArgRecords * 16;
 static_assert(kHmArgs * 4 == 128, "pass_table.def copy_heatArgs reads byte 128");
-static_assert(kHeatArgsBytes == 80, "pass_table.def copy_heatArgs copies 80 bytes");
+static_assert(kHeatArgsBytes == 96, "pass_table.def copy_heatArgs copies 96 bytes");
+static_assert(kHmArgs + kHeatArgRecords * 4 <= kHmHdrWords, "the args fit the header");
+// THE FIRING LOG (diagnostic, never read by the sim): the first
+// kHeatFireLogMax thermal transitions since the layer was last reset (a
+// worldgen or a load) record their cell and kind -- kHmFireLog counts every
+// firing, entry i at kHmFireLog + 1 + 4i is x, y, z, kind. A bare "1,538
+// freezes" names no lake; this names the cell. WHICH firings land in the log
+// depends on GPU scheduling; it is a report, so that is harmless.
+constexpr uint32_t kHmFireLog = 64;
+constexpr uint32_t kHeatFireLogMax = 8;
+static_assert(kHmFireLog + 1 + 4 * kHeatFireLogMax <= kHmHdrWords, "the log fits the header");
 
 constexpr uint32_t kHmEntry = kHmHdrWords;                     // HAS | page
 constexpr uint32_t kHmFlags = kHmEntry + kHeatWindowChunks;           // kHf* bits
 constexpr uint32_t kHmSummary = kHmFlags + kHeatWindowChunks;         // kHs* bits
 constexpr uint32_t kHmOwner = kHmSummary + kHeatWindowChunks;         // packed world chunk
 constexpr uint32_t kHmWant = kHmOwner + kHeatWindowChunks;            // bitset
-constexpr uint32_t kHmSrcList = kHmWant + kHeatWindowChunks / 32;
+// Still-relaxing chunks NOT woken for the CA (heatRelax sets, heatPend
+// consumes next tick): the field keeps walking to its target without running
+// the CA over the chunk, which is what the halo round a fire used to cost.
+constexpr uint32_t kHmPend = kHmWant + kHeatWindowChunks / 32;    // bitset
+constexpr uint32_t kHmSrcList = kHmPend + kHeatWindowChunks / 32;
 constexpr uint32_t kHmRecompList = kHmSrcList + kHeatWindowChunks;
 constexpr uint32_t kHmRelaxList = kHmRecompList + kHeatWindowChunks;
 constexpr uint32_t kHmStack = kHmRelaxList + kHeatWindowChunks;
@@ -104,6 +134,16 @@ constexpr uint32_t kHeatEntryHas = 0x80000000u;
 constexpr uint32_t kHeatEntryPage = 0x00FFFFFFu;
 constexpr uint32_t kHfEmit = 1u, kHfSrc = 2u, kHfRecomp = 4u, kHfRelax = 8u, kHfNew = 16u;
 constexpr uint32_t kHsSource = 1u, kHsNonzero = 2u;
+// The summary's TRIGGERS (heatSrc, from the chunk's cells): the lowest
+// melt / ignite threshold and the highest freeze threshold of any material
+// in the chunk, each + kHeatThrBias in 10 bits, 0 = none. heatRelax wakes the
+// CA over a chunk only where a transition-bearing block's temperature range
+// [T, T*] reaches one of them -- elsewhere a moving field cannot change a
+// cell, and the chunk relaxes on the pend list without the CA.
+constexpr uint32_t kHsTrigAboveShift = 2, kHsTrigBelowShift = 12, kHsTrigMask = 1023u;
+// Plane-0 bit 31 (above the inertia nibble): some cell of this block carries a
+// thermal transition (heatSrc).
+constexpr uint32_t kHeatBlockTrans = 0x80000000u;
 
 // ---- heatParams -------------------------------------------------------------
 constexpr uint32_t kHpHdrWords = 32;

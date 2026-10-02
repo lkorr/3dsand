@@ -2078,6 +2078,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The temperature layer (sim_heat.wgsl). On simPL_: bindings 50..52.
   pool.Add([&] { heatBegin_ = MakeComputePipeline(device, simPL_, mHeat, "heatBegin", "heatBegin"); });
   pool.Add([&] { heatShift_ = MakeComputePipeline(device, simPL_, mHeat, "heatShift", "heatShift"); });
+  pool.Add([&] { heatPend_ = MakeComputePipeline(device, simPL_, mHeat, "heatPend", "heatPend"); });
   pool.Add([&] { heatWant_ = MakeComputePipeline(device, simPL_, mHeat, "heatWant", "heatWant"); });
   pool.Add([&] { heatArgs_ = MakeComputePipeline(device, simPL_, mHeat, "heatArgs", "heatArgs"); });
   pool.Add([&] { heatAlloc_ = MakeComputePipeline(device, simPL_, mHeat, "heatAlloc", "heatAlloc"); });
@@ -2208,7 +2209,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
-      !heatBegin_ || !heatShift_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
+      !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
       !fluidSpawn_ ||
@@ -2658,6 +2659,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::SolRestore:     return solRestore_;
     case P::HeatBegin:      return heatBegin_;
     case P::HeatShift:      return heatShift_;
+    case P::HeatPend:       return heatPend_;
     case P::HeatWant:       return heatWant_;
     case P::HeatArgsP:      return heatArgs_;
     case P::HeatAlloc:      return heatAlloc_;

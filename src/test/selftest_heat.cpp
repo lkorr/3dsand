@@ -49,6 +49,7 @@
 #include "sim/stream.h"
 #include "sim/worldgen_run.h"
 #include "sim/worldio.h"
+#include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -192,6 +193,27 @@ struct HeatView {
     return h;
   }
 };
+
+// X of the block holding world cell (x, y, z), 0 if unpaged: two 4-byte
+// readbacks (the entry, then the one pool word), cheap enough to take every
+// tick round a boundary.
+uint32_t ProbeX(GpuContext& ctx, World& world, int x, int y, int z) {
+  ctx.WaitIdle();
+  const uint32_t slot = World::SlotChunkIndex({x >> 4, y >> 4, z >> 4});
+  uint32_t e = 0;
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.heatMeta, (uint64_t)(kHmEntry + slot) * 4, &e,
+                        4, "heatProbeEntry");
+  if ((e & kHeatEntryHas) == 0) return 0;
+  const uint32_t b = ((((uint32_t)z & 15) >> 1) * 8 + (((uint32_t)y & 15) >> 1)) * 8 +
+                     (((uint32_t)x & 15) >> 1);
+  uint32_t w = 0;
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.heatPool,
+                        ((uint64_t)(e & kHeatEntryPage) * kHeatPageWords + b) * 4, &w, 4,
+                        "heatProbeWord");
+  return w & 0xFFu;
+}
+
+int FloorDiv16(int v) { return v >= 0 ? v / 16 : -((-v + 15) / 16); }
 
 uint32_t AwakeIn(GpuContext& ctx, Simulation& sim, const std::vector<uint32_t>& chunks) {
   ctx.WaitIdle();
@@ -430,6 +452,10 @@ struct IgniteResult {
   uint32_t ignites = 0, refused = 0;
   std::vector<uint32_t> finalCells;
   uint64_t heatHash = 0;
+  // The F1 probe (heatBegin), pointed at a block beside the lava wall whose X
+  // has long settled: the readout must name that block and carry its X / X*.
+  bool probeOk = false;
+  uint32_t probeWord = 0, probeX = 0;
 };
 
 const Box kIgRoom{96, 120, 96, 147, 131, 119};
@@ -484,6 +510,8 @@ IgniteResult RunIgnite(Ctx& c, int kTicks) {
   const uint32_t near0 = count(kIgWood, wood);
   HeatView hv;
   int tMax = -999, tEmberMax = -999;
+  const int px = 105, py = 124, pz = 102;   // the air gap, beside the wall
+  sim.SetHeatProbe(true, px, py, pz);
   for (int i = 0; i < kTicks; i++) {
     Tick(c, t);
     if (i % 10 == 0) {
@@ -503,6 +531,16 @@ IgniteResult RunIgnite(Ctx& c, int kTicks) {
   r.tEmber = tEmberMax;
   hv.Read(ctx, world, true);
   hv.Note();
+  {
+    const uint32_t w = hv.meta[kHmProbeX];
+    const uint32_t tag = ((uint32_t)(px >> 1) & 31u) | (((uint32_t)(py >> 1) & 31u) << 5) |
+                         (((uint32_t)(pz >> 1) & 31u) << 10);
+    r.probeWord = w;
+    r.probeX = hv.X(px, py, pz);
+    r.probeOk = (w >> kHeatProbeTagShift) == tag && (w & 0x10000u) != 0 &&
+                (w & 0xFFu) == r.probeX && ((w >> 8) & 0xFFu) == hv.Xs(px, py, pz) && r.probeX > 0;
+  }
+  sim.SetHeatProbe(false, 0, 0, 0);
   r.ignites = hv.meta[kHmIgnites];
   r.refused = hv.meta[kHmRefused];
   r.heatHash = hv.Hash();
@@ -595,19 +633,20 @@ Status GateHeatIgnite(Ctx& c, std::string& detail) {
   const bool loadOk = litAfterLoad > 0 && litAfterLoad <= litMax && pagesAfterLoad > 0;
   const bool twice = a.finalCells == b.finalCells && a.heatHash == b.heatHash;
   const bool ok = lit && hotEnough && farKept && inertKept && emberCap && loadOk && twice &&
-                  a.refused == 0;
+                  a.refused == 0 && a.probeOk;
   detail = Format(
       "wood across a gap from lava lit at tick %u (max %.0f) %s, its block reached %d "
       "(wood ignites above %d) %s; far wood %u/%u kept %s; stone+glass %u/%u kept %s; "
       "wood beside embers peaked at %d (embers emit %d) %s; after save+load: %u pages by "
       "tick 10, lit at tick %u %s; run twice: cells %s, heat hash %016llx vs %016llx %s; "
-      "%u heat ignitions, refused %u",
+      "%u heat ignitions, refused %u; F1 probe word %08x (pool X %u) %s",
       a.lightTick, litMax, lit ? "OK" : "FAIL", a.tNear, woodAbove, hotEnough ? "OK" : "FAIL",
       a.farWood, a.farWood0, farKept ? "OK" : "FAIL", a.stoneGlass, a.stoneGlass0,
       inertKept ? "OK" : "FAIL", a.tEmber, emberEmit, emberCap ? "capped" : "OVER THE CAP",
       pagesAfterLoad, litAfterLoad, loadOk ? "OK" : "FAIL",
       a.finalCells == b.finalCells ? "same" : "DIFFER", (unsigned long long)a.heatHash,
-      (unsigned long long)b.heatHash, twice ? "OK" : "NONDETERMINISTIC", a.ignites, a.refused);
+      (unsigned long long)b.heatHash, twice ? "OK" : "NONDETERMINISTIC", a.ignites, a.refused,
+      a.probeWord, a.probeX, a.probeOk ? "OK" : "FAIL");
   std::printf("heat-ignite: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -922,6 +961,18 @@ Status GateHeatBound(Ctx& c, std::string& detail) {
 // (C) A fresh harness world fires no thermal transition in its first
 // heat.freshTicks ticks -- the worldgen ice rule and the climate checks are
 // what make that true (no cold lake freezes over on load, no snow melts).
+// (D) The same over the REAL map's frozen north: the harness window holds no
+// frozen climate at all, so (C) alone never sees the tundra's snow skin, its
+// iced tarns or a snow cap. The default map is loaded, the window centred on
+// its densest tundra, a day pinned (the warm phase, the one that would melt
+// what the biome generates) and heat.freshTicks ticked: zero firings, or a
+// biome melts its own landscape / a lake freezes over on load.
+// (E) THE CEILING THROUGH A DAWN: a lava pocket in a desert-pinned room (night
+// 4, day 44) behind a stone wall. Its neighbour block's X settles at night to
+// ~(230 - 4); were X carried unchanged into the day, the CA would read
+// 44 + 226 = 270 > 230 at dawn -- hotter than the hottest source in reach.
+// Sampled every tick round the dawn: ambient + X never passes the lava's emit,
+// and the night X was high enough that the check had teeth.
 Status GateHeatAmbient(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
@@ -947,6 +998,91 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
         tundraCols += HeatBiomeClimate(b).Day() < 0;
       }
   }
+  // ---- (D) the real map's frozen north ----
+  uint32_t northFires = 0, northCols = 0, northKind[3] = {0, 0, 0};
+  std::string northLog;
+  bool northFound = false;
+  std::string northWhy;
+  {
+    const std::string prevMap = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+    const IVec3 savedOrigin = world.WindowOrigin();
+    worldmap::SetMapOverride("default");
+    biomes::EnvironmentStamp stamp;
+    std::string log;
+    if (!ReloadEnvironment(ctx, sim, c.mats, stamp, log)) {
+      northWhy = "default map did not load: " + log;
+    } else {
+      const std::vector<std::string>& names = worldmap::CurrentWorldMap().biomeName;
+      int tundra = -1;
+      for (size_t i = 0; i < names.size(); i++)
+        if (names[i] == "tundra") tundra = (int)i;
+      // The window-sized box with the most tundra (8 x 8 samples a box).
+      int bestN = 0, bx = 0, bz = 0;
+      for (int z = -16384; tundra >= 0 && z <= 16384; z += 512)
+        for (int x = -16384; x <= 16384; x += 512) {
+          int n = 0;
+          for (int sz = 0; sz < 8; sz++)
+            for (int sx = 0; sx < 8; sx++)
+              n += (int)World::MapBiomeAt(x + sx * 64 + 32, z + sz * 64 + 32, kDefaultSeed) == tundra;
+          if (n > bestN) { bestN = n; bx = x; bz = z; }
+        }
+      northFound = bestN >= 32;
+      if (!northFound) northWhy = Format("no tundra-dominated box on the default map (best %d/64)", bestN);
+      if (northFound) {
+        DawnPin day;   // sunrise + 1024: the warm phase
+        c.stream.OnRegen();
+        world.SetWindowOrigin({FloorDiv16(bx), 0, FloorDiv16(bz)});
+        SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+        ctx.WaitIdle();
+        HeatView hv;
+        hv.Read(ctx, world, false);
+        const uint32_t f0 = hv.meta[kHmMelts] + hv.meta[kHmIgnites] + hv.meta[kHmFreezes];
+        const int kFresh = (int)BaselineNumber("heat.freshTicks", 150);
+        uint32_t t = 62000;
+        for (int i = 0; i < kFresh; i++) Tick(c, t);
+        const uint32_t k0[3] = {hv.meta[kHmMelts], hv.meta[kHmIgnites], hv.meta[kHmFreezes]};
+        hv.Read(ctx, world, false);
+        northFires = hv.meta[kHmMelts] + hv.meta[kHmIgnites] + hv.meta[kHmFreezes] - f0;
+        for (int k = 0; k < 3; k++) northKind[k] = hv.meta[kHmMelts + k] - k0[k];
+        // WHERE: the firing log's cells, and the column round the first one
+        // (what is above and below it), so a failure names its cause.
+        const uint32_t nLog = std::min(hv.meta[kHmFireLog], kHeatFireLogMax);
+        for (uint32_t i = 0; i < nLog; i++) {
+          const uint32_t* e = &hv.meta[kHmFireLog + 1 + 4 * i];
+          northLog += Format(" (%d,%d,%d k%u biome %u)", (int)e[0], (int)e[1], (int)e[2], e[3],
+                             World::MapBiomeAt((int)e[0], (int)e[2], kDefaultSeed));
+        }
+        if (nLog > 0) {
+          const int fx = (int)hv.meta[kHmFireLog + 1], fy = (int)hv.meta[kHmFireLog + 2],
+                    fz = (int)hv.meta[kHmFireLog + 3];
+          Vox col;
+          col.Read(ctx, world, {fx, fy - 4, fz, fx, fy + 4, fz});
+          northLog += " | column at the first, y-4..y+4:";
+          for (int y = fy - 4; y <= fy + 4; y++) {
+            const uint32_t w = col.At(fx, y, fz);
+            const uint32_t m = w & 0xFFFu;
+            northLog += Format(" %s/%u", m < c.mats.size() ? c.mats[m].name.c_str() : "?",
+                               (w >> 12) & 0xFu);
+          }
+          northLog += Format(" | window origin chunk (%d,%d,%d)", world.WindowOrigin().x,
+                             world.WindowOrigin().y, world.WindowOrigin().z);
+        }
+        const IVec3 o = world.WindowOrigin();
+        for (int z = 0; z < (int)kWorldN; z += 16)
+          for (int x = 0; x < (int)kWorldN; x += 16)
+            northCols += HeatBiomeClimate(World::MapBiomeAt(o.x * 16 + x, o.z * 16 + z,
+                                                            kDefaultSeed)).Day() < 0;
+      }
+    }
+    worldmap::SetMapOverride(prevMap);
+    biomes::EnvironmentStamp s2;
+    std::string l2;
+    ReloadEnvironment(ctx, sim, c.mats, s2, l2);
+    c.stream.OnRegen();
+    world.SetWindowOrigin(savedOrigin);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+  }
   // ---- (B) the climate checks refuse bad data ----
   auto refused = [&](int base, int swing, const char* what) {
     const std::string dir = sandvox::AssetDir();
@@ -968,6 +1104,9 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
   const bool shippedOk = biomes::LoadBiomeSet(sandvox::AssetDir(), c.mats, shipped, shippedLog);
   const bool refusesStraddle = refused(-2, 8, "freezes at night");
   const bool refusesIgnite = refused(63, 63, "ignition point");
+  // Day 3 / night 1: no freeze straddle, no ignition -- but the tundra's snow
+  // skin melts above 0, so the biome would melt its own landscape.
+  const bool refusesSelfMelt = refused(2, 1, "own landscape");
   // ---- (A) the cycle ----
   Tuning saved = CurrentTuning();
   Tuning tn = saved;
@@ -979,19 +1118,32 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
   const Box mid{117, 120, 96, 118, 127, 111};
   const Box wSnow{100, 120, 98, 105, 122, 103}, wIce{100, 120, 105, 105, 122, 109};
   const Box eSnow{124, 120, 98, 129, 122, 103}, eIce{124, 120, 105, 129, 122, 109};
+  // (E): its own sealed room south of the east half, inside the east pin.
+  // 26 cells (13 blocks) deep in z round the probe, so the tent covers the
+  // probe block's whole reach along z and its coverage saturates (c = 1): the
+  // night X is the full 230 - 4.
+  const Box room2{120, 120, 114, 139, 127, 139};
+  const Box lava2{120, 120, 114, 127, 127, 139}, wall2{128, 120, 114, 128, 127, 139};
+  const int probeX = 130, probeY = 121, probeZ = 126;
+  const int eDay = 24 + 20;   // the east pin: day 44, night 4
+  const int lavaEmit = (int)c.mats[MatId(c, "lava")].thermal.emit;
+  int dawnTMax = -999, nightX = 0;
   uint32_t wLeft = 0, w0 = 0, eLeft = 0, e0 = 0, awakeE = 0, maxAwakeBoundary = 0;
   uint32_t dusk = 0, dawn = 0, pagesEnd = 0;
   {
-    PinGuard pins(sim, {{90, 90, 117, 117, -24, 12}, {118, 90, 145, 117, 24, 20}});
+    PinGuard pins(sim, {{90, 90, 117, 117, -24, 12}, {118, 90, 145, 145, 24, 20}});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    std::vector<CellOp> shell, build;
+    std::vector<CellOp> shell, build, pour;
     Room(shell, room);
+    Room(shell, room2);
     Fill(build, mid, kMatStone);
     Fill(build, wSnow, snow);
     Fill(build, wIce, ice);
     Fill(build, eSnow, snow);
     Fill(build, eIce, ice);
+    Fill(build, wall2, kMatStone);
+    Fill(pour, lava2, MatId(c, "lava") | kFull);
     // Start just before dusk: the phase is a function of the tick.
     const uint32_t ticksPerDay = TicksPerDay(tn);
     uint32_t t = 0;
@@ -1000,6 +1152,7 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
       t += 10;
     Tick(c, t, shell);
     Tick(c, t, build);
+    Tick(c, t, pour);
     ctx.WaitIdle();
     Vox v;
     auto count = [&](const Box& b, uint32_t m) {
@@ -1016,13 +1169,24 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
     int sinceBoundary = -1;
     bool prevDay = DaylightStrengthCpu(DayPhaseForTick(t, ticksPerDay, false, 0)) > 0;
     const uint32_t kTicks = ticksPerDay + 600;
+    int sinceDawn = -1;
     for (uint32_t i = 0; i < kTicks; i++) {
       Tick(c, t);
       const bool day = DaylightStrengthCpu(DayPhaseForTick(t, ticksPerDay, false, 0)) > 0;
       if (day != prevDay) {
         (day ? dawn : dusk) = i;
         sinceBoundary = 0;
+        if (day) sinceDawn = 0;
       }
+      // (E): the night's X (every 10th tick), then every tick for 60 after
+      // the dawn. T = the ambient of the tick that produced X + X.
+      const bool nearDawn = sinceDawn >= 0 && sinceDawn < 60;
+      if (nearDawn || (!day && i % 10 == 0)) {
+        const int x = (int)ProbeX(ctx, world, probeX, probeY, probeZ);
+        if (!day) nightX = std::max(nightX, x);
+        else dawnTMax = std::max(dawnTMax, eDay + x);
+      }
+      if (sinceDawn >= 0) sinceDawn++;
       prevDay = day;
       if (sinceBoundary >= 0 && ++sinceBoundary == settle) {
         maxAwakeBoundary = std::max(maxAwakeBoundary, AwakeAll(ctx, sim));
@@ -1033,6 +1197,12 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
     wLeft = count(wSnow, snow) + count(wIce, ice);
     eLeft = count(eSnow, snow) + count(eIce, ice);
     awakeE = AwakeIn(ctx, sim, ChunksOf(east));
+    // The lava goes; every page must come back.
+    std::vector<CellOp> quench;
+    Fill(quench, lava2, kMatStone);
+    Tick(c, t, quench);
+    const int kCool = (int)BaselineNumber("heat.coolTicks", 400);
+    for (int i = 0; i < kCool; i++) Tick(c, t);
     HeatView hv;
     hv.Read(ctx, world, false);
     pagesEnd = hv.PagesInUse();
@@ -1043,21 +1213,32 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
   const bool coldKept = w0 > 0 && wLeft == w0;
   const bool hotMelted = e0 > 0 && eLeft == 0 && awakeE == 0;
   const bool settled = dusk > 0 && dawn > 0 && maxAwakeBoundary <= awakeMax;
-  const bool checks = shippedOk && refusesStraddle && refusesIgnite;
+  const bool checks = shippedOk && refusesStraddle && refusesIgnite && refusesSelfMelt;
   const bool fresh = freshFires == 0;
-  const bool ok = coldKept && hotMelted && settled && checks && fresh && pagesEnd == 0;
+  const bool north = northFound && northCols > 0 && northFires == 0;
+  // Teeth: without the dawn step the CA's first read would be day + night X.
+  const bool teeth = eDay + nightX > lavaEmit;
+  const bool ceiling = dawnTMax > -999 && dawnTMax <= std::max(lavaEmit, eDay) && teeth;
+  RecordObserved("heat.dawnTMaxObserved", (double)dawnTMax);
+  RecordObserved("heat.northFiresObserved", (double)northFires);
+  const bool ok = coldKept && hotMelted && settled && checks && fresh && north && ceiling &&
+                  pagesEnd == 0;
   detail = Format(
       "frozen side kept %u/%u snow+ice through dusk (tick %u) and dawn (tick %u) %s; hot "
       "side %u of %u left, %u chunks awake %s; window %u chunks awake %d ticks after a "
       "boundary (max %.0f) %s; shipped biomes %s, straddling climate %s, igniting climate "
-      "%s; fresh world fired %u thermal transitions (%u window columns frozen-climate) %s; "
-      "%u pages at the end",
+      "%s, self-melting climate %s; fresh world fired %u thermal transitions (%u window columns frozen-climate) %s; "
+      "%u pages at the end; default map's north: %s%u window columns frozen-climate, %u "
+      "thermal transitions on a fresh day (%u melts, %u ignitions, %u freezes) %s; dawn beside lava: night X %d, ambient + X "
+      "peaked at %d after the dawn (lava %d, night X + day would be %d) %s",
       wLeft, w0, dusk, dawn, coldKept ? "OK" : "FAIL", eLeft, e0, awakeE,
       hotMelted ? "melted+asleep" : "FAIL", maxAwakeBoundary,
       (int)BaselineNumber("heat.ambientSettleTicks", 120), awakeMax, settled ? "OK" : "FAIL",
       shippedOk ? "pass" : ("FAIL: " + shippedLog).c_str(), refusesStraddle ? "refused" : "ACCEPTED",
-      refusesIgnite ? "refused" : "ACCEPTED", freshFires, tundraCols, fresh ? "OK" : "FAIL",
-      pagesEnd);
+      refusesIgnite ? "refused" : "ACCEPTED", refusesSelfMelt ? "refused" : "ACCEPTED", freshFires, tundraCols, fresh ? "OK" : "FAIL",
+      pagesEnd, northWhy.empty() ? "" : (northWhy + "; ").c_str(), northCols, northFires,
+      northKind[0], northKind[1], northKind[2], (north ? "OK" : ("FAIL; logged:" + northLog).c_str()), nightX, dawnTMax, lavaEmit, eDay + nightX,
+      ceiling ? "ceiling held" : (teeth ? "OVER THE CEILING" : "NO TEETH (night X too low)"));
   std::printf("heat-ambient: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -1099,7 +1280,7 @@ Status GateHeatIdle(Ctx& c, std::string& detail) {
       std::vector<uint32_t> flags(kNumSlots, 0);
       rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
                             kNumSlots * 4, "heatIdleFlags");
-      for (uint32_t f : flags) heatMarks += (f & (1u << 28)) != 0;
+      for (uint32_t f : flags) heatMarks += (f & DirtyReasonBit("heat")) != 0;
     }
   }
   hv.Read(ctx, world, false);

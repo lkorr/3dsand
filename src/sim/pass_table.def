@@ -280,15 +280,23 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // releases every page whose owner is no longer its slot's occupant, so the CA
 // never reads a departed chunk's heat as the new one's. Zero groups on every
 // other tick. C_CAACTIVE: a settled world records none of the heat rows.
-// The copy is heatMeta[kHmArgs..] (byte 128, 80 bytes) -> heatArgs.
+// The copy is heatMeta[kHmArgs..] (byte 128, 96 bytes) -> heatArgs.
+// read-only in practice: `heatPool` (heatBegin only reads the F1 probe's
+// block; the module's other entry points write it).
 PASS(heatBegin, "heat(begin+shift)", PT_TICK, PIPE_HEAT_BEGIN, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
-     USES(U(TickUBO) A(HeatMeta) R(HeatParams)))
-PASS(copy_heatArgs0, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(U(TickUBO) A(HeatMeta) R(HeatParams) R(HeatPool)))
+PASS(copy_heatArgs0, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,96, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(HeatMeta) TW(HeatArgs)))
 PASS(heatShift, "heat(begin+shift)", PT_TICK, PIPE_HEAT_SHIFT, K_INDIRECT, IND_HEATARGS,64,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) I(HeatArgs) RW(HeatPool) A(HeatMeta) R(HeatParams) R(PageTable)))
+// heatPend: last tick's still-relaxing chunks (heatRelax's pend bitset) back
+// onto the relax list -- the field keeps walking without the CA. Zero groups
+// when nothing is pending.
+PASS(heatPend, "heat(begin+shift)", PT_TICK, PIPE_HEAT_PEND, K_INDIRECT, IND_HEATARGS,80,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(I(HeatArgs) A(HeatMeta)))
 
 // ---- phase 2a: THE SOLUTE LAYER'S PAGES (docs/PLAN_solutes.md, world.h kSol*)
 //
@@ -570,9 +578,10 @@ PASS(solCompact, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_COMPACT, K_INDIREC
 //              recompute over its 3x3x3
 //   heatTent   x, y, z passes of the separable tent (DYN_CA: iteration k is
 //              axis k; the recorder's per-iteration barrier orders them)
-//   heatRelax  X steps toward X*; marks moving chunks dirty; frees zero pages
+//   heatRelax  X steps toward X*; wakes the CA only where the walk can change
+//              a cell (else pends the chunk for next tick); frees zero pages
 // heatArgs (one thread) turns the list counts into the indirect records after
-// each list grows, and the copy rows stage them (heatMeta byte 128, 80 B ->
+// each list grows, and the copy rows stage them (heatMeta byte 128, 96 B ->
 // heatArgs); each indirect row reads ITS record at the row's y offset.
 // Every pass writes only its own chunk's page; neighbours are read from the
 // previous dispatch. No voxel is written here.
@@ -582,7 +591,7 @@ PASS(heatWant, "heat", PT_TICK, PIPE_HEAT_WANT, K_INDIRECT, IND_DISPATCHARGS,0,0
 PASS(heatArgs1, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(A(HeatMeta)))
-PASS(copy_heatArgs1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+PASS(copy_heatArgs1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,96, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(HeatMeta) TW(HeatArgs)))
 PASS(heatAlloc, "heat", PT_TICK, PIPE_HEAT_ALLOC, K_INDIRECT, IND_HEATARGS,0,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
@@ -590,16 +599,17 @@ PASS(heatAlloc, "heat", PT_TICK, PIPE_HEAT_ALLOC, K_INDIRECT, IND_HEATARGS,0,0,
 PASS(heatArgs2, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(A(HeatMeta)))
-PASS(copy_heatArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+PASS(copy_heatArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,96, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(HeatMeta) TW(HeatArgs)))
 // read-only in practice: `voxels` is declared read for this module.
 PASS(heatSrc, "heat", PT_TICK, PIPE_HEAT_SRC, K_INDIRECT, IND_HEATARGS,16,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
-     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) I(HeatArgs) RW(HeatPool) A(HeatMeta)))
+     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) I(HeatArgs) RW(HeatPool) A(HeatMeta)
+          R(HeatParams)))
 PASS(heatArgs3, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(A(HeatMeta)))
-PASS(copy_heatArgs3, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+PASS(copy_heatArgs3, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,96, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(HeatMeta) TW(HeatArgs)))
 PASS(heatTent, "heat", PT_TICK, PIPE_HEAT_TENT, K_INDIRECT, IND_HEATARGS,32,0,
      GRP_SIM, DYN_CA, C_CAACTIVE, 3,
@@ -607,7 +617,7 @@ PASS(heatTent, "heat", PT_TICK, PIPE_HEAT_TENT, K_INDIRECT, IND_HEATARGS,32,0,
 PASS(heatArgs4, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(A(HeatMeta)))
-PASS(copy_heatArgs4, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,80, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+PASS(copy_heatArgs4, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,96, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(HeatMeta) TW(HeatArgs)))
 PASS(heatRelax, "heat", PT_TICK, PIPE_HEAT_RELAX, K_INDIRECT, IND_HEATARGS,48,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,

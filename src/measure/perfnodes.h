@@ -142,7 +142,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "solute. solHash is a hash-tick sweep that returns at once for an EMPTY "
      "slot."},
     {"heatSys", "Temperature", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "heatBegin;heatShift;heatWant;heatArgs1;heatAlloc;heatArgs2;heatSrc;heatArgs3;heatTent;"
+     "heatBegin;heatShift;heatPend;heatWant;heatArgs1;heatAlloc;heatArgs2;heatSrc;heatArgs3;heatTent;"
      "heatArgs4;heatRelax",
      "The temperature layer (docs/PLAN_temperature.md): pages, sources, the "
      "tent-filter targets and the relaxation, over the CA's dirty list. With "

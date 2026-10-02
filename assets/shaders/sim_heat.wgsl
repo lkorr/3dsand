@@ -10,8 +10,13 @@
 // Temperature is T = ambient(column, day) + X; ambient is never stored.
 //
 // WHAT RUNS, after the CA every CA-active tick (pass_table.def "heat"):
-//   heatBegin   1 thread: reset list counts, day flip, window-shift args
-//   heatShift   (before the CA) release every page whose owner left the window
+//   heatBegin   1 thread: reset list counts, day flip, shift / pend args,
+//               the F1 probe
+//   heatShift   (before the CA) release every page whose owner left the
+//               window and re-target the kept edge; at dawn, lower X by the
+//               ambient step so T stays under the ceiling
+//   heatPend    (before the CA) last tick's still-relaxing chunks back onto
+//               the relax list
 //   heatWant    per dirty chunk: list paged chunks, want pages for N27 of an
 //               emitting chunk
 //   heatArgs    1 thread: indirect args from the counts (recorded 4x)
@@ -21,16 +26,19 @@
 //               a change queues a target recompute over N27
 //   heatTent    3 dispatches (x, y, z): the separable tent filter -- the
 //               coverage-weighted mean of emitters within R blocks -> X*
-//   heatRelax   per relax-list chunk: X steps toward X* (inertia k), marks the
-//               chunk dirty while it moves, frees an all-zero page
+//   heatRelax   per relax-list chunk: X steps toward X* (inertia k); wakes
+//               the CA only where the walk can change a cell, else pends the
+//               chunk for next tick; frees an all-zero page
 //
 // DETERMINISM (rule 1). Integer only. Every pass writes only its OWN chunk's
 // page; the passes that read a neighbour's page read words the PREVIOUS
 // dispatch wrote. Atomics only touch flags (an OR: order-free set semantics),
 // list cursors and counters (which list position a chunk got is unobservable:
 // every row treats its chunks independently) and the free stack (which PAGE a
-// slot got is unobservable: pages are zero when handed out). The allocation
-// RANK is a prefix sum over a slot-ordered bitset.
+// slot got is unobservable: a page is zero when handed out but for the top
+// nibble of plane 0, which heatSrc rewrites before anything reads it). The
+// allocation RANK is a prefix sum over a slot-ordered bitset; the pend list is
+// a bitset too (a set, consumed whole).
 //
 // COST (rule 2). A settled world records none of this (C_CAACTIVE). An active
 // world with no heat: heatWant returns after two loads per dirty chunk, and
@@ -125,6 +133,8 @@ const HM_LAST_DAY : u32 = 6u;
 const HM_DAY_FLIP : u32 = 7u;
 const HM_ORIGIN : u32 = 8u;
 const HM_ORIGIN_SET : u32 = 11u;
+const HM_PEND_COUNT : u32 = 12u;
+const HM_SHIFT_WHY : u32 = 13u;
 const HM_PAGES_PEAK : u32 = 16u;
 const HM_REFUSED : u32 = 17u;
 const HM_SRC_PEAK : u32 = 21u;
@@ -138,20 +148,30 @@ const HM_LAST_RELAX : u32 = 28u;
 const HM_LAST_RECOMP : u32 = 29u;
 const HM_PROBE_X : u32 = 30u;
 const HM_PROBE_E : u32 = 31u;
+const HEAT_PROBE_TAG_SHIFT : u32 = 17u;
 const HM_ARGS : u32 = 32u;
 const HM_SUMMARY : u32 = 65664u;
 const HM_OWNER : u32 = 98432u;
 const HM_WANT : u32 = 131200u;
-const HM_SRC_LIST : u32 = 132224u;
-const HM_RECOMP_LIST : u32 = 164992u;
-const HM_RELAX_LIST : u32 = 197760u;
-const HM_STACK : u32 = 230528u;
+const HM_PEND : u32 = 132224u;
+const HM_SRC_LIST : u32 = 133248u;
+const HM_RECOMP_LIST : u32 = 166016u;
+const HM_RELAX_LIST : u32 = 198784u;
+const HM_STACK : u32 = 231552u;
 const HF_SRC : u32 = 2u;
 const HF_RECOMP : u32 = 4u;
 const HF_RELAX : u32 = 8u;
 const HF_NEW : u32 = 16u;
 const HS_SOURCE : u32 = 1u;
 const HS_NONZERO : u32 = 2u;
+const HS_TRIG_ABOVE_SHIFT : u32 = 2u;
+const HS_TRIG_BELOW_SHIFT : u32 = 12u;
+const HS_TRIG_MASK : u32 = 1023u;
+const HEAT_BLOCK_TRANS : u32 = 0x80000000u;
+const HEAT_KIND_MELT : u32 = 1u;
+const HEAT_KIND_IGNITE : u32 = 2u;
+const HEAT_SHIFT_RELEASE : u32 = 1u;
+const HEAT_SHIFT_DAWN : u32 = 2u;
 const HP_RADIUS : u32 = 1u;
 const HP_PROBE : u32 = 5u;
 const HP_PROBE_ON : u32 = 8u;
@@ -161,6 +181,7 @@ const HEAT_ARG_SRC : u32 = 1u;
 const HEAT_ARG_RECOMP : u32 = 2u;
 const HEAT_ARG_RELAX : u32 = 3u;
 const HEAT_ARG_SHIFT : u32 = 4u;
+const HEAT_ARG_PEND : u32 = 5u;
 const HEAT_RADIUS_MAX : u32 = 8u;
 // Bit 28 of the dirty word (world.h kDirtyReasonName "heat"): a chunk whose
 // local temperature moved this tick. Not in sim_step's FILM_LICENCE: heat
@@ -219,7 +240,8 @@ fn heatBegin() {
   // (E - ambient) moves with the ambient.
   let day = select(1u, 2u, isDaytime(T.dayPhase));
   let last = atomicExchange(&heatMeta[HM_LAST_DAY], day);
-  atomicStore(&heatMeta[HM_DAY_FLIP], select(0u, 1u, last != day));
+  let flip = last != day;
+  atomicStore(&heatMeta[HM_DAY_FLIP], select(0u, 1u, flip));
   // The window moved (or the layer was switched off with pages out): release
   // what no longer belongs. 128 groups of 256 = every window slot.
   let o = T.origin;
@@ -228,36 +250,134 @@ fn heatBegin() {
               bitcast<i32>(atomicLoad(&heatMeta[HM_ORIGIN + 1u])) != o.y ||
               bitcast<i32>(atomicLoad(&heatMeta[HM_ORIGIN + 2u])) != o.z;
   let inUse = atomicLoad(&heatMeta[HM_NEXT_FRESH]) - atomicLoad(&heatMeta[HM_FREE_TOP]);
-  let release = inUse > 0u && (moved || !heatMode());
-  heatSetArgs(HEAT_ARG_SHIFT, select(0u, NUM_CHUNKS / 256u, release));
+  var why = 0u;
+  if (inUse > 0u && (moved || !heatMode())) { why |= HEAT_SHIFT_RELEASE; }
+  // DAWN (night -> day, with the layer on and a known previous phase): the
+  // ambient steps UP by 2 x swing while every stored X still holds the
+  // night's excess, so T = ambient + X would jump past the hottest source in
+  // reach (a lava pool's night X of ~226 plus a desert day of 44 is 270 > its
+  // 230) until the relaxation caught up -- long enough for embers to
+  // heat-ignite wood at a desert dawn. heatShift lowers every kept page's X
+  // and X* by the step first, so T is continuous and the ceiling holds.
+  if (inUse > 0u && flip && last == 1u && day == 2u && heatMode()) { why |= HEAT_SHIFT_DAWN; }
+  atomicStore(&heatMeta[HM_SHIFT_WHY], why);
+  heatSetArgs(HEAT_ARG_SHIFT, select(0u, NUM_CHUNKS / 256u, why != 0u));
   atomicStore(&heatMeta[HM_ORIGIN], bitcast<u32>(o.x));
   atomicStore(&heatMeta[HM_ORIGIN + 1u], bitcast<u32>(o.y));
   atomicStore(&heatMeta[HM_ORIGIN + 2u], bitcast<u32>(o.z));
   atomicStore(&heatMeta[HM_ORIGIN_SET], 1u);
+  // The pend list (heatRelax's still-relaxing chunks from last tick): four
+  // groups of 256 read the 1,024-word bitset, zero groups when it is empty.
+  let pend = atomicExchange(&heatMeta[HM_PEND_COUNT], 0u);
+  heatSetArgs(HEAT_ARG_PEND, select(0u, (NUM_CHUNKS / 32u) / 256u, pend != 0u && heatMode()));
+  // THE F1 PROBE, every CA-active tick: the block under the probe cell as
+  // last tick's heatRelax left it, or "no page" -- so the readout follows the
+  // player out of a warm chunk instead of keeping its last hot value. The
+  // block tag lets the CPU tell this reading from a stale one.
+  if (heatParams[HP_PROBE_ON] != 0u) {
+    let pc = vec3<i32>(bitcast<i32>(heatParams[HP_PROBE]), bitcast<i32>(heatParams[HP_PROBE + 1u]),
+                       bitcast<i32>(heatParams[HP_PROBE + 2u]));
+    let tag = (u32(pc.x >> 1) & 31u) | ((u32(pc.y >> 1) & 31u) << 5u) |
+              ((u32(pc.z >> 1) & 31u) << 10u);
+    var px = 0u;
+    var pe = 0u;
+    let q = heatSlotOf(worldChunkOf(pc));
+    if (q != SLOT_NONE) {
+      let pq = heatEntry(q);
+      if ((pq & HEAT_ENTRY_HAS) != 0u) {
+        let w = heatPool[heatPageBase(pq) + heatBlockOf(pc)];
+        px = (w & 0xFFFFu) | 0x10000u;
+        pe = w >> 16u;
+      }
+    }
+    atomicStore(&heatMeta[HM_PROBE_X], px | (tag << HEAT_PROBE_TAG_SHIFT));
+    atomicStore(&heatMeta[HM_PROBE_E], pe);
+  }
+}
+
+// The day - night step of the ambient at world cell c (2 x swing of its
+// column's climate, or the snowline's): what heatShift's dawn takes off X.
+fn heatAmbientStep(c : vec3<i32>) -> i32 {
+  if (c.y >= bitcast<i32>(heatParams[HP_SNOWLINE_Y])) {
+    return 2 * bitcast<i32>(heatParams[HP_SNOW_SWING]);
+  }
+  let col = u32(c.x & i32(WORLD_MASK)) + u32(c.z & i32(WORLD_MASK)) * WORLD_N;
+  let biome = (heatParams[HP_COL + (col >> 2u)] >> ((col & 3u) * 8u)) & 0xFFu;
+  return 2 * bitcast<i32>(heatParams[HP_BIOME + 2u * biome + 1u]);
 }
 
 // ============================================================================
 // heatShift: one thread per window slot, recorded indirect on heatBegin's
-// record (zero groups unless the origin moved or the layer was turned off).
-// A page whose owner is no longer the slot's occupant -- or every page, with
-// the layer off -- is zeroed and pushed. Heat is ephemeral: a chunk that
-// leaves and comes back starts at ambient (PLAN §9).
+// record (zero groups unless the origin moved, the layer was turned off, or
+// it is dawn). RELEASE: a page whose owner is no longer the slot's occupant --
+// or every page, with the layer off -- is zeroed and pushed. Heat is
+// ephemeral: a chunk that leaves and comes back starts at ambient (PLAN §9).
+// A KEPT page on the window's edge after a move is queued for a target
+// recompute: the chunks beyond the edge now read as cold, and a target built
+// from them would otherwise outlive them (an edge chunk beside a fire that
+// has left the window, or burnt out in a ticket, kept its warmth for good).
+// DAWN: a kept page's X and X* drop by the block's ambient step (see
+// heatBegin), clamped at 0.
 @compute @workgroup_size(256)
 fn heatShift(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
   if (slot >= NUM_CHUNKS) { return; }
   let e = heatEntry(slot);
   if ((e & HEAT_ENTRY_HAS) == 0u) { return; }
-  let owner = atomicLoad(&heatMeta[HM_OWNER + slot]);
-  if (heatMode() && owner == heatOwnerKey(slotWorldChunk(slot, T.origin))) { return; }
+  let why = atomicLoad(&heatMeta[HM_SHIFT_WHY]);
   let base = heatPageBase(e);
-  for (var i = 0u; i < HEAT_PAGE_WORDS; i++) { heatPool[base + i] = 0u; }
-  let at = atomicAdd(&heatMeta[HM_FREE_TOP], 1u);
-  atomicStore(&heatMeta[HM_STACK + at], e & HEAT_ENTRY_PAGE);
-  atomicStore(&heatMeta[HM_ENTRY + slot], 0u);
-  atomicStore(&heatMeta[HM_FLAGS + slot], 0u);
-  atomicStore(&heatMeta[HM_SUMMARY + slot], 0u);
-  atomicAdd(&heatMeta[HM_RELEASED], 1u);
+  let wc = slotWorldChunk(slot, T.origin);
+  let owner = atomicLoad(&heatMeta[HM_OWNER + slot]);
+  if ((why & HEAT_SHIFT_RELEASE) != 0u && (!heatMode() || owner != heatOwnerKey(wc))) {
+    for (var i = 0u; i < HEAT_PAGE_WORDS; i++) { heatPool[base + i] = 0u; }
+    let at = atomicAdd(&heatMeta[HM_FREE_TOP], 1u);
+    atomicStore(&heatMeta[HM_STACK + at], e & HEAT_ENTRY_PAGE);
+    atomicStore(&heatMeta[HM_ENTRY + slot], 0u);
+    atomicStore(&heatMeta[HM_FLAGS + slot], 0u);
+    atomicStore(&heatMeta[HM_SUMMARY + slot], 0u);
+    atomicAdd(&heatMeta[HM_RELEASED], 1u);
+    return;
+  }
+  if ((why & HEAT_SHIFT_DAWN) != 0u) {
+    let corner = wc * i32(CHUNK);
+    for (var b = 0u; b < HEAT_BLOCKS; b++) {
+      let bp = vec3<i32>(i32(b & 7u), i32((b >> 3u) & 7u), i32(b >> 6u)) * 2;
+      let step = heatAmbientStep(corner + bp);
+      let w = heatPool[base + b];
+      let x = max(i32(w & 0xFFu) - step, 0);
+      let xs = max(i32((w >> 8u) & 0xFFu) - step, 0);
+      heatPool[base + b] = (w & 0xFFFF0000u) | u32(x) | (u32(xs) << 8u);
+    }
+  }
+  if ((why & HEAT_SHIFT_RELEASE) != 0u) {
+    var edge = false;
+    for (var k = 0u; k < 27u; k++) {
+      if (!chunkInWindow(heatN27(wc, k), T.origin)) { edge = true; }
+    }
+    if (edge) { heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST); }
+  }
+}
+
+// ============================================================================
+// heatPend: four groups of 256 over the pend bitset, recorded indirect on
+// heatBegin's record (zero groups when last tick's heatRelax left nothing
+// pending). Every still-paged chunk whose bit is set goes back on the relax
+// list, so its X keeps walking to X* this tick WITHOUT the CA running over it
+// (heatRelax wakes the CA only where the walk can change a cell). Consumes
+// the bitset.
+@compute @workgroup_size(256)
+fn heatPend(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let wi = gid.x;
+  if (wi >= NUM_CHUNKS / 32u) { return; }
+  var bits = atomicExchange(&heatMeta[HM_PEND + wi], 0u);
+  while (bits != 0u) {
+    let b = firstTrailingBit(bits);
+    bits &= bits - 1u;
+    let slot = wi * 32u + b;
+    if ((heatEntry(slot) & HEAT_ENTRY_HAS) != 0u) {
+      heatListAdd(slot, HF_RELAX, HM_RELAX_COUNT, HM_RELAX_LIST);
+    }
+  }
 }
 
 // ============================================================================
@@ -384,12 +504,18 @@ fn heatAlloc(@builtin(local_invocation_index) li : u32) {
 // ============================================================================
 // heatSrc: one group per source-list chunk. Re-read the chunk's 4,096 voxels
 // into per-block sources: E the hottest `thermal.emit` among the block's 8
-// cells, n how many cells emit, k the slowest `thermal.inertia` (air 1). A
-// block whose sources changed -- or a page that is new -- queues a target
+// cells, n how many cells emit, k the slowest `thermal.inertia` (air 1), and
+// whether any cell carries a thermal transition (HEAT_BLOCK_TRANS). A block
+// whose sources changed -- or a page that is new -- queues a target
 // recompute of the WHOLE 3x3x3 around it (a source reaches at most one chunk);
 // the day flip queues only the chunk itself (X* moves with its own ambient).
+// The chunk's summary gets its TRIGGERS: the lowest melt / ignite threshold
+// and the highest freeze threshold among its cells (heat.h kHsTrig*), which
+// is what heatRelax compares a moving block's temperature range against.
 var<workgroup> wgSrcChanged : atomic<u32>;
 var<workgroup> wgSrcAny : atomic<u32>;
+var<workgroup> wgSrcAbove : atomic<u32>;
+var<workgroup> wgSrcBelow : atomic<u32>;
 var<workgroup> wgSrcMode : u32;
 
 @compute @workgroup_size(128)
@@ -399,18 +525,23 @@ fn heatSrc(@builtin(workgroup_id) wg : vec3<u32>,
   if (li == 0u) {
     atomicStore(&wgSrcChanged, 0u);
     atomicStore(&wgSrcAny, 0u);
+    atomicStore(&wgSrcAbove, HS_TRIG_MASK);
+    atomicStore(&wgSrcBelow, 0u);
   }
   workgroupBarrier();
   let e = heatEntry(slot);
   let base = heatPageBase(e);
   let wc = slotWorldChunk(slot, T.origin);
   let corner = wc * i32(CHUNK);
+  var above = HS_TRIG_MASK;
+  var below = 0u;
   for (var i = 0u; i < 4u; i++) {
     let b = li * 4u + i;
     let bp = vec3<i32>(i32(b & 7u), i32((b >> 3u) & 7u), i32(b >> 6u)) * 2;
     var eMax = 0u;
     var n = 0u;
     var k = 0u;
+    var trans = 0u;
     for (var j = 0u; j < 8u; j++) {
       let c = corner + bp + vec3<i32>(i32(j & 1u), i32((j >> 1u) & 1u), i32(j >> 2u));
       let mat = voxMat(voxWordAt(c));
@@ -420,10 +551,20 @@ fn heatSrc(@builtin(workgroup_id) wg : vec3<u32>,
         let em = (r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu;
         if (em != 0u) { n += 1u; eMax = max(eMax, em); }
         kk = (r2 >> HEAT_R2_INERTIA_SHIFT) & 7u;
+        let nt = min((r2 >> HEAT_R2_TRANS_SHIFT) & 3u, 2u);
+        for (var t = 0u; t < nt; t++) {
+          let w0 = heatParams[HP_MAT + mat * HP_MAT_STRIDE + 3u * t];
+          // The threshold is stored + HEAT_THR_BIAS already (heat.cpp
+          // PackHeatMaterial), which is the summary's encoding.
+          let thr = w0 & HS_TRIG_MASK;
+          if (((w0 >> 20u) & 3u) == HEAT_KIND_FREEZE) { below = max(below, thr); }
+          else { above = min(above, thr); }
+          trans = 1u;
+        }
       }
       k = max(k, kk);
     }
-    let hi = eMax | (n << 8u) | (k << 12u);
+    let hi = eMax | (n << 8u) | (k << 12u) | (trans << 15u);
     let old = heatPool[base + b];
     if ((old >> 16u) != hi) {
       heatPool[base + b] = (old & 0xFFFFu) | (hi << 16u);
@@ -431,12 +572,18 @@ fn heatSrc(@builtin(workgroup_id) wg : vec3<u32>,
     }
     if (eMax != 0u) { atomicOr(&wgSrcAny, 1u); }
   }
+  if (above != HS_TRIG_MASK) { atomicMin(&wgSrcAbove, above); }
+  if (below != 0u) { atomicMax(&wgSrcBelow, below); }
   workgroupBarrier();
   if (li == 0u) {
     let f = atomicAnd(&heatMeta[HM_FLAGS + slot], ~HF_NEW);
     let any = atomicLoad(&wgSrcAny);
     let sum = atomicLoad(&heatMeta[HM_SUMMARY + slot]);
-    atomicStore(&heatMeta[HM_SUMMARY + slot], (sum & ~HS_SOURCE) | select(0u, HS_SOURCE, any != 0u));
+    var trig = atomicLoad(&wgSrcAbove);
+    if (trig == HS_TRIG_MASK) { trig = 0u; }   // no melt / ignite here: none
+    atomicStore(&heatMeta[HM_SUMMARY + slot],
+                (sum & HS_NONZERO) | select(0u, HS_SOURCE, any != 0u) |
+                (trig << HS_TRIG_ABOVE_SHIFT) | (atomicLoad(&wgSrcBelow) << HS_TRIG_BELOW_SHIFT));
     var mode = 0u;
     if (atomicLoad(&wgSrcChanged) != 0u || (f & HF_NEW) != 0u) { mode = 2u; }
     else if (atomicLoad(&heatMeta[HM_DAY_FLIP]) != 0u) { mode = 1u; }
@@ -557,19 +704,31 @@ fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
 
 // ============================================================================
 // heatRelax: one group per relax-list chunk (every chunk whose sources were
-// re-read or whose target was recomputed). X steps toward X* by
-// max(1, |X* - X| >> k): gradual (k is the block's inertia -- water slow, air
-// fast), EXACT at the end (the step is never 0 while they differ), and never
-// past X* (the step is at most the gap). So X never exceeds the largest target
-// the block has had, and the target never exceeds the hottest source in
-// reach: the ceiling holds for the ACTUAL temperature, not only the target.
+// re-read, whose target was recomputed, or that was still relaxing last tick
+// -- the pend list). X steps toward X* by max(1, |X* - X| >> k): gradual (k is
+// the block's inertia -- water slow, air fast), EXACT at the end (the step is
+// never 0 while they differ), and never past X* (the step is at most the
+// gap). So X never exceeds the largest target the block has had, and the
+// target never exceeds the hottest source in reach: the ceiling holds for the
+// ACTUAL temperature, not only the target.
 //
-// A chunk whose X moved is marked dirty (DIRTY_R_HEAT) so the CA re-reads its
-// cells' heat next tick -- but ONLY if some chunk of its 3x3x3 is dirty this
-// tick: the CPU's page-table mirror bounds next tick's dirty set by the
-// one-ring of this tick's (docs/PLAN_page_table.md §3.2), and a mark outside
-// it would run the CA beside unmaterialised pages. A chunk refused the mark
-// keeps its X where it is until something wakes it; a lag, not a loss.
+// WAKING THE CA. A moving field matters to the CA only where it can change a
+// cell: a block holding a transition-bearing cell (HEAT_BLOCK_TRANS) whose
+// temperature range [T, T*] -- everything the walk can still visit -- reaches
+// the chunk's melt / ignite trigger or its freeze trigger (the summary, from
+// heatSrc). Only such a chunk is marked dirty (DIRTY_R_HEAT) so the CA
+// re-reads it next tick. Every other moving chunk -- the halo of air, stone
+// and smoke round a fire, foliage warming to 60 beside flames that cannot
+// light it -- goes on the PEND list instead: next tick heatPend puts it back
+// on this list and it keeps walking WITHOUT the CA running over it. The heat
+// never stops short of its target, so a stored X never outlives what made it.
+//
+// The mark is allowed only if some chunk of its 3x3x3 is dirty this tick: the
+// CPU's page-table mirror bounds next tick's dirty set by the one-ring of this
+// tick's (docs/PLAN_page_table.md §3.2), and a mark outside it would run the
+// CA beside unmaterialised pages. A chunk that needs the CA but may not mark
+// stays pending (its field still walks); the CA sees it the next time
+// anything wakes the neighbourhood -- a lag, never a phantom.
 //
 // A chunk whose page is entirely zero (no source, no excess, no partial sum)
 // and with no SOURCE in its 3x3x3 is freed (the page is already zero, so it
@@ -579,6 +738,21 @@ fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
 var<workgroup> wgRelaxMoved : atomic<u32>;
 var<workgroup> wgRelaxNonzero : atomic<u32>;
 var<workgroup> wgRelaxKeep : atomic<u32>;
+var<workgroup> wgRelaxWake : atomic<u32>;
+
+// The coldest and hottest ambient over the four columns and two rows of the
+// block at chunk-local block corner c (a block can straddle a biome border or
+// the snowline; the CA reads the ambient per cell).
+fn heatBlockAmbientRange(c : vec3<i32>) -> vec2<i32> {
+  var lo = 1 << 20;
+  var hi = -(1 << 20);
+  for (var j = 0u; j < 8u; j++) {
+    let a = heatAmbient(c + vec3<i32>(i32(j & 1u), i32((j >> 1u) & 1u), i32(j >> 2u)));
+    lo = min(lo, a);
+    hi = max(hi, a);
+  }
+  return vec2<i32>(lo, hi);
+}
 
 @compute @workgroup_size(128)
 fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
@@ -588,11 +762,15 @@ fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgRelaxMoved, 0u);
     atomicStore(&wgRelaxNonzero, 0u);
     atomicStore(&wgRelaxKeep, 0u);
+    atomicStore(&wgRelaxWake, 0u);
   }
   workgroupBarrier();
   let e = heatEntry(slot);
   let base = heatPageBase(e);
   let wc = slotWorldChunk(slot, T.origin);
+  let sum = atomicLoad(&heatMeta[HM_SUMMARY + slot]);
+  let trigAbove = (sum >> HS_TRIG_ABOVE_SHIFT) & HS_TRIG_MASK;
+  let trigBelow = (sum >> HS_TRIG_BELOW_SHIFT) & HS_TRIG_MASK;
   for (var i = 0u; i < 4u; i++) {
     let b = li * 4u + i;
     let w = heatPool[base + b];
@@ -606,23 +784,24 @@ fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
       nx = x + select(-step, step, d > 0);
       heatPool[base + b] = (w & 0xFFFFFF00u) | u32(nx);
       atomicOr(&wgRelaxMoved, 1u);
+      // Can this walk change a cell? Only a block with a transition-bearing
+      // cell, and only if [T, T*] reaches a trigger (both stored + bias).
+      if ((w & HEAT_BLOCK_TRANS) != 0u && (trigAbove != 0u || trigBelow != 0u)) {
+        let bp = vec3<i32>(i32(b & 7u), i32((b >> 3u) & 7u), i32(b >> 6u)) * 2;
+        let ar = heatBlockAmbientRange(wc * i32(CHUNK) + bp);
+        let tHi = ar.y + max(nx, xs) + HEAT_THR_BIAS;
+        let tLo = ar.x + min(nx, xs) + HEAT_THR_BIAS;
+        if ((trigAbove != 0u && tHi > i32(trigAbove)) || (trigBelow != 0u && tLo < i32(trigBelow))) {
+          atomicOr(&wgRelaxWake, 1u);
+        }
+      }
     }
-    // Every byte but X (rewritten above) and the inertia nibble (bits 28..31:
-    // set on every block heatSrc has scanned, air included, so it says
+    // Every byte but X (rewritten above) and the top nibble (inertia and the
+    // transition bit: set on every block heatSrc has scanned, so they say
     // nothing about heat): X*, E and n.
     if ((w & 0x0FFFFF00u) != 0u || nx != 0 ||
         heatPool[base + HEAT_BLOCKS + b] != 0u || heatPool[base + 2u * HEAT_BLOCKS + b] != 0u) {
       atomicOr(&wgRelaxNonzero, 1u);
-    }
-  }
-  // The probe (F1's readout at the player): the block under the probe cell.
-  if (li == 0u && heatParams[HP_PROBE_ON] != 0u) {
-    let pc = vec3<i32>(bitcast<i32>(heatParams[HP_PROBE]), bitcast<i32>(heatParams[HP_PROBE + 1u]),
-                       bitcast<i32>(heatParams[HP_PROBE + 2u]));
-    if (all(worldChunkOf(pc) == wc)) {
-      let w = heatPool[base + heatBlockOf(pc)];
-      atomicStore(&heatMeta[HM_PROBE_X], (w & 0xFFFFu) | 0x10000u);
-      atomicStore(&heatMeta[HM_PROBE_E], w >> 16u);
     }
   }
   // N27: is any neighbour dirty this tick (may we mark?) / holding a source
@@ -642,11 +821,11 @@ fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
   let moved = atomicLoad(&wgRelaxMoved) != 0u;
   let nonzero = atomicLoad(&wgRelaxNonzero) != 0u;
   let keep = atomicLoad(&wgRelaxKeep);
-  if (moved && (keep & 1u) != 0u) {
+  let marked = moved && atomicLoad(&wgRelaxWake) != 0u && (keep & 1u) != 0u;
+  if (marked) {
     atomicOr(&dirtyOut[slot], DIRTY_R_HEAT);
   }
   if (moved) { atomicAdd(&heatMeta[HM_RELAX_TICKS], 1u); }
-  let sum = atomicLoad(&heatMeta[HM_SUMMARY + slot]);
   if (!nonzero && (keep & 2u) == 0u) {
     // Free: the page is all zero, so it goes back as it is.
     let at = atomicAdd(&heatMeta[HM_FREE_TOP], 1u);
@@ -655,8 +834,15 @@ fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&heatMeta[HM_SUMMARY + slot], 0u);
     atomicStore(&heatMeta[HM_FLAGS + slot], 0u);
     atomicAdd(&heatMeta[HM_FREES], 1u);
-  } else {
-    atomicStore(&heatMeta[HM_SUMMARY + slot],
-                (sum & ~HS_NONZERO) | select(0u, HS_NONZERO, nonzero));
+    return;
+  }
+  atomicStore(&heatMeta[HM_SUMMARY + slot],
+              (sum & ~HS_NONZERO) | select(0u, HS_NONZERO, nonzero));
+  // Still walking and not handed to the CA: walk again next tick, alone. (A
+  // marked chunk is dirty next tick, so heatWant lists it anyway.)
+  if (moved && !marked) {
+    let bit = 1u << (slot & 31u);
+    let old = atomicOr(&heatMeta[HM_PEND + (slot >> 5u)], bit);
+    if ((old & bit) == 0u) { atomicAdd(&heatMeta[HM_PEND_COUNT], 1u); }
   }
 }

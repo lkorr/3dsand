@@ -1419,9 +1419,12 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
       out.biomeTerrain[static_cast<size_t>(b.index)] = PackBiomeTerrain(b);
   out.biomeClimate.assign(set.biomes.size(), {});
+  out.biomeName.assign(set.biomes.size(), std::string());
   for (const biomes::BiomeDef& b : set.biomes)
-    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
+    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size())) {
       out.biomeClimate[static_cast<size_t>(b.index)] = b.ambient;
+      out.biomeName[static_cast<size_t>(b.index)] = b.name;
+    }
 
   // ---- rules (P5b): seeded placement per biome ----------------------------------
   // "3 crypts per km2 of forest, never within 400 m of each other" is one

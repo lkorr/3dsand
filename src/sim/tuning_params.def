@@ -2181,8 +2181,6 @@ TP_F(dayNight, moon2AngularRadius, NO_WGSL, 1.05f, 0.05f, 20.0f)
 
 
 // ==== weather ====
-TP_B(weather, waterFreezes, NO_WGSL, true)
-TP_B(weather, iceMelts, NO_WGSL, true)
 // The sky half (weather.h). Clamped here, not trusted: a negative epoch or
 // a transition of 0 would divide by zero in weather::Resolve.
 TP_B(weather, clouds, NO_WGSL, true)

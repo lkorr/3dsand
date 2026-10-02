@@ -1104,8 +1104,6 @@
     "moon2AngularRadius": 1.05
   },
   "weather": {
-    "waterFreezes": false,
-    "iceMelts": false,
     "clouds": true,
     "autoCycle": true,
     "preset": "fair",

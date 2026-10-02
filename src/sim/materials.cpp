@@ -488,10 +488,6 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
   d.infect = true;
 }
 
-// Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
-// the SUBSTRATE (grass, sand, dirt) rather than on the liquid — see the absorb
-// note in materials.h for why the ceiling and the per-contact step are separate
-// axes. Absent = never absorbs, which is every material that predates this.
 // ---- THE TEMPERATURE LAYER: materials.json "thermal" (docs/PLAN_temperature.md)
 // Names (`into`, `partialInto`) are resolved in LoadAssets once the whole table
 // exists (forward references). Thresholds are heat units, 0 = water freezes.
@@ -558,6 +554,10 @@ static void ParseThermal(const json& m, const std::string& path, MaterialDef& d,
   }
 }
 
+// Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
+// the SUBSTRATE (grass, sand, dirt) rather than on the liquid — see the absorb
+// note in materials.h for why the ceiling and the per-contact step are separate
+// axes. Absent = never absorbs, which is every material that predates this.
 static void ParseAbsorb(const json& m, const std::string& path, MaterialDef& d,
                         std::string& errors) {
   if (!m.contains("absorb")) return;
@@ -1279,12 +1279,14 @@ static void ParseNeighborScale(const json& r, const std::vector<MaterialDef>& ma
 // load error instead of a rule that silently never compiles. Adding a switch
 // = a bool in Tuning::Weather, a row here, and a row in the tuner schema.
 //
+// THERE ARE NONE TODAY. The two that existed, `waterFreezes` and `iceMelts`,
+// gated the sun-melt / night-freeze rules the temperature layer replaced
+// (docs/PLAN_temperature.md); both rules and both switches are gone, so any
+// "requires" is an unknown-switch load error until a new switch is added.
+//
 // Returns false and sets `known` = false for an unrecognised name.
 static bool WeatherFlagEnabled(const std::string& name, bool& known) {
-  const auto& w = CurrentTuning().weather;
-  known = true;
-  if (name == "waterFreezes") return w.waterFreezes;
-  if (name == "iceMelts") return w.iceMelts;
+  (void)name;
   known = false;
   return false;
 }

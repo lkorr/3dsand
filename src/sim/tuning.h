@@ -3370,15 +3370,12 @@ struct Tuning {
   // not a divergence — but a lockstep session must agree on them, and toggling
   // one mid-session is a reload, not a live tweak. Booleans rather than ints
   // for exactly that reason: there is no half-on.
+  //
+  // NONE EXIST TODAY (2026-10-02): `waterFreezes` / `iceMelts` gated the
+  // sun-melt and night-freeze rules, and the temperature layer
+  // (docs/PLAN_temperature.md) replaced both rules and both switches. The
+  // "requires" mechanism stays for the next switch.
   struct Weather {
-    // Exposed water freezes to ice on clear nights (the shore-inward frontier
-    // rule in reactions.json). Off leaves ponds liquid through the night.
-    bool waterFreezes = TPD(weather, waterFreezes);
-    // Snow and ice in direct daylight melt back to water. Off makes winter
-    // permanent — note that leaving this off while waterFreezes is on means
-    // ice only ever accumulates, which is stable but one-way.
-    bool iceMelts = TPD(weather, iceMelts);
-
     // ---- the SKY's weather (src/sim/weather.h, cloud.wgsl) ----------------
     // Everything below is RENDER-ONLY: it picks which assets/weather/*.json
     // preset the sky is showing and how that drifts. None of it reaches the

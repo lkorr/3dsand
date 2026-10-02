@@ -2869,6 +2869,15 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
   return false;
 }
 
+// Is ground cell n below water's freezing point (T = ambient + X < 0)? The
+// staining rule's absorption skips frozen ground (doStaining). 0 is the
+// freeze threshold the climate checks hold every biome to (heat units, 0 =
+// water freezes); the layer off answers "no".
+fn heatGroundFrozen(n : vec3<i32>) -> bool {
+  if (heatParams[HP_MODE] == 0u || !inWindow(n, T.origin)) { return false; }
+  return heatAmbient(n) + i32(heatX(n)) < 0;
+}
+
 // ---- THE THERMAL TRANSITIONS (docs/PLAN_temperature.md §6) -----------------
 // Up to two per material, packed by heat.cpp PackHeatMaterial into heatParams
 // at HP_MAT + mat * 8: [w0 thresholds|kind|scale|surface, w1 chance, w2
@@ -2884,6 +2893,8 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 // Reads at distance 1 only (the lattice's read bound). Returns 0 inert,
 // 1 could fire (keep awake), 2 fired (self rewritten).
 const HEAT_ROLL_SALT : u32 = 0x7E3A1D5u;
+const HM_FIRE_LOG : u32 = 64u;
+const HEAT_FIRE_LOG_MAX : u32 = 8u;
 fn heatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32, m : Material,
              rnd : u32, probe : bool, stamp : u32) -> u32 {
   if (heatParams[HP_MODE] == 0u) { return 0u; }
@@ -2932,6 +2943,15 @@ fn heatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32, m : Ma
     let alt = (w2 >> 12u) & 0xFFFu;
     if (alt != 0u && cellEighths(w) != 0u && cellEighths(w) < 8u) { prod = alt; }
     atomicAdd(&heatMeta[HM_MELTS + kind - 1u], 1u);
+    // The firing log (heat.h kHmFireLog): diagnostic, never read by the sim.
+    let fl = atomicAdd(&heatMeta[HM_FIRE_LOG], 1u);
+    if (fl < HEAT_FIRE_LOG_MAX) {
+      let fo = HM_FIRE_LOG + 1u + 4u * fl;
+      atomicStore(&heatMeta[fo], bitcast<u32>(c.x));
+      atomicStore(&heatMeta[fo + 1u], bitcast<u32>(c.y));
+      atomicStore(&heatMeta[fo + 2u], bitcast<u32>(c.z));
+      atomicStore(&heatMeta[fo + 3u], kind);
+    }
     reactWriteSelf(c, idx, false, m.klass, prod, rnd, stamp);
     return 2u;
   }
@@ -3069,6 +3089,15 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // consumption of the marked voxel.
     let d = stainStep(stainType, addAmt, washes, nw, materials[nmat]);
     if ((d.y & STAIN_WORK) == 0u) { continue; }
+    // FROZEN GROUND DOES NOT SOAK (the temperature layer). A liquid absorbing
+    // into ground below water's freezing point is skipped -- that neighbour is
+    // inert for this rule, like stone. Without this a tundra tarn, born with
+    // ice on its top cell, drank ~3 cells of depth into its mud bed in its
+    // first hundred ticks; the air that opened under the lid was a fresh
+    // surface, the CA froze it, and the lake stacked lids (1,538 freezes in a
+    // fresh tundra window, heat-ambient part D). Read at distance 1 (the
+    // ground cell), off the field last tick's heatRelax left: deterministic.
+    if ((d.y & STAIN_SPEND) != 0u && selfIsLiquid && heatGroundFrozen(n)) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick
 

@@ -3066,7 +3066,14 @@ _HEAT_CONSTS = {
     "HEAT_R2_TRANS_SHIFT": "kHeatR2TransShift",
     "HEAT_ARG_ALLOC": "kHeatArgAlloc", "HEAT_ARG_SRC": "kHeatArgSrc",
     "HEAT_ARG_RECOMP": "kHeatArgRecomp", "HEAT_ARG_RELAX": "kHeatArgRelax",
-    "HEAT_ARG_SHIFT": "kHeatArgShift",
+    "HEAT_ARG_SHIFT": "kHeatArgShift", "HEAT_ARG_PEND": "kHeatArgPend",
+    "HM_PEND_COUNT": "kHmPendCount", "HM_SHIFT_WHY": "kHmShiftWhy", "HM_PEND": "kHmPend",
+    "HEAT_SHIFT_RELEASE": "kHeatShiftRelease", "HEAT_SHIFT_DAWN": "kHeatShiftDawn",
+    "HEAT_PROBE_TAG_SHIFT": "kHeatProbeTagShift",
+    "HS_TRIG_ABOVE_SHIFT": "kHsTrigAboveShift", "HS_TRIG_BELOW_SHIFT": "kHsTrigBelowShift",
+    "HS_TRIG_MASK": "kHsTrigMask", "HEAT_BLOCK_TRANS": "kHeatBlockTrans",
+    "HEAT_KIND_MELT": "kHeatKindMelt", "HEAT_KIND_IGNITE": "kHeatKindIgnite",
+    "HM_FIRE_LOG": "kHmFireLog", "HEAT_FIRE_LOG_MAX": "kHeatFireLogMax",
 }
 
 
@@ -3121,6 +3128,15 @@ def check_heat_mirror():
     cv = cpp_value("kHeatThrBias")
     if not mt or cv is None or int(mt.group(1)) != cv:
         problems.append("heat: HEAT_THR_BIAS disagrees with heat.h kHeatThrBias")
+    # DIRTY_R_HEAT is the bit world.h's kDirtyReasonName table names "heat"
+    # (its index is the bit): a row added before it there would silently
+    # re-label the heat marks (and heat-idle counts that bit).
+    md = re.search(r"const\s+DIRTY_R_HEAT\s*:\s*u32\s*=\s*(\d+)u\s*;", files["sim_heat.wgsl"])
+    mn = re.search(r"kDirtyReasonName\[kDirtyReasonBits\]\s*=\s*\{(.*?)\};", wh, re.S)
+    names = re.findall(r'"([^"]+)"', mn.group(1)) if mn else []
+    if not md or "heat" not in names or int(md.group(1)) != (1 << names.index("heat")):
+        problems.append("heat: sim_heat.wgsl DIRTY_R_HEAT is not 1 << the index of \"heat\" "
+                        "in world.h kDirtyReasonName")
 
 
 ALL = {

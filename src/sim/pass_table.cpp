@@ -161,6 +161,7 @@ namespace {
 #define PIPE_DRAFT_FINE3      Pipe::DraftFineLast
 #define PIPE_HEAT_BEGIN       Pipe::HeatBegin
 #define PIPE_HEAT_SHIFT       Pipe::HeatShift
+#define PIPE_HEAT_PEND        Pipe::HeatPend
 #define PIPE_HEAT_WANT        Pipe::HeatWant
 #define PIPE_HEAT_ARGS        Pipe::HeatArgsP
 #define PIPE_HEAT_ALLOC       Pipe::HeatAlloc

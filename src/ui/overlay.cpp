@@ -1634,16 +1634,20 @@ void Overlay::DrawDevWorld(UIState& s) {
       ImGui::SetItemTooltip("The climate of the column you stand in (assets/biomes/<name>.json\n"
                             "climate.ambient), or the snowline's above the treeline. Heat units:\n"
                             "0 is the freezing point of water. Switches on the daylight tick.");
-      if (h.paged) {
-        ImGui::Text("local heat: target %+d  actual %+d  ->  T %+d", h.xTarget, h.x,
-                    h.ambient + h.x);
+      if (!h.current) {
+        ImGui::TextDisabled("local heat: no reading for this block yet (the world here is asleep)");
+      } else if (h.paged) {
+        ImGui::Text("ambient %+d  target T* %+d (+%d)  actual T %+d (+%d)", h.ambient,
+                    h.ambient + h.xTarget, h.xTarget, h.ambient + h.x, h.x);
         ImGui::Text("sources in your block: emit %d x %d cells", h.emit, h.emitters);
       } else {
         ImGui::TextDisabled("local heat: none (no page here)  ->  T %+d", h.ambient);
       }
-      ImGui::SetItemTooltip("The local excess X over the ambient in the 2x2x2 block at your feet, and\n"
-                            "its target X*: the coverage-weighted mix of every heat source within\n"
-                            "sim.heatRadius blocks. X walks to X* over a few ticks (inertia).");
+      ImGui::SetItemTooltip("The 2x2x2 block at your feet. The actual temperature T is the ambient\n"
+                            "plus the local excess X; the target T* is the ambient plus X*, the\n"
+                            "coverage-weighted mix of every heat source within sim.heatRadius\n"
+                            "blocks. T walks to T* over a few ticks (inertia) and never passes the\n"
+                            "hottest source in reach.");
       ImGui::TextDisabled("pages %u / %u (peak %u, refused %u)  relax %u  recompute %u",
                           h.pages, h.pool, h.pagesPeak, h.refused, h.relaxChunks, h.recompChunks);
       ImGui::TextDisabled("melts %u  ignitions %u  freezes %u (since the world loaded)", h.melts,

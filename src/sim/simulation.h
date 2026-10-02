@@ -812,7 +812,7 @@ class Simulation {
   // and its pipelines (sim_heat.wgsl). PrepareHeat's column-table cache: the
   // world column each table row/column currently describes.
   rhi::Buffer heatParamsBuf_;
-  rhi::ComputePipeline heatBegin_, heatShift_, heatWant_, heatArgs_, heatAlloc_, heatSrc_,
+  rhi::ComputePipeline heatBegin_, heatShift_, heatPend_, heatWant_, heatArgs_, heatAlloc_, heatSrc_,
       heatTent_, heatRelax_;
   std::vector<uint8_t> heatCol_;
   std::vector<int> heatColX_, heatColZ_;

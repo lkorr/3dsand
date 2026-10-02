@@ -168,7 +168,7 @@ struct UIState {
     bool valid = false;
     std::string biome;
     int base = 0, swing = 0, ambient = 0;
-    bool day = true, snowline = false, paged = false;
+    bool day = true, snowline = false, paged = false, current = false;
     int x = 0, xTarget = 0, emit = 0, emitters = 0;
     uint32_t pages = 0, pagesPeak = 0, pool = 0, refused = 0;
     uint32_t melts = 0, ignites = 0, freezes = 0, relaxChunks = 0, recompChunks = 0;
