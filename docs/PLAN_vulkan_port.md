@@ -4,9 +4,11 @@
 since 2026-08-22 (`src/gpu/rhi_vk.cpp`, `vk_record.cpp`; Dawn kept for Tint
 only, `--backend dawn` refuses); phase 7 (software page table, not hardware
 sparse — see `docs/PLAN_page_table.md`) fully closed at `a5359a4` and paged
-streaming landed `d3dcb76` (2026-08-23). **Open:** phase 8 (async
-compute/transfer queues, subgroup ops in occupancy/compaction, explicit heap
-placement — none present in `src/gpu/`) and the phase-7 "DEFERRED follow-ups"
+streaming landed `d3dcb76` (2026-08-23). **Open:** phase 8 (async compute
+is built behind `render.asyncCompute` and OFF — measured slower on this GPU,
+`docs/PLAN_async_compute.md`; transfer queues, subgroup ops in
+occupancy/compaction and explicit heap placement are not present in
+`src/gpu/`) and the phase-7 "DEFERRED follow-ups"
 list (no ring-starvation or low-pool abort gate exists in `selftest.cpp`).
 Originally: proposed 2026-08-22 (phase 0 complete). Companion docs:
 `docs/vulkan_pass_map.md` (the measured pass/resource dependency map),
@@ -771,6 +773,76 @@ DESIGN.md risk #3, not closure, unless a second vendor is actually present.
 > two independent host layers on one vendor, and a second vendor's hash sequence
 > is what remains.
 
+> **[AS BUILT 2026-10-02] Phase 5 revisited — three more implementations on
+> this machine, one runs, one command closes the rest.** (DESIGN.md §14 risk 3
+> has the summary.)
+>
+> **Devices.** Mesa 26.2.3 release-msvc from mesa-dist-win, unpacked to
+> `C:/sv-deps/mesa`, added PER PROCESS with
+> `VK_ADD_DRIVER_FILES=C:\sv-deps\mesa\lvp_icd_abs.json;C:\sv-deps\mesa\dzn_icd_abs.json`
+> (the shipped manifests use a relative `.\vulkan_*.dll` that the loader
+> resolves against the CWD — error 87 / `VK_ERROR_OUT_OF_HOST_MEMORY` at
+> instance creation from anywhere else; the `_abs` copies name the DLL
+> absolutely). No system-wide state, no NVIDIA driver change. Selection:
+> `--device <i|substring>` / `SANDVOX_DEVICE` (`dozen`, `llvmpipe`,
+> `"Basic Render"`, `"Direct3D12 (NVIDIA"`); an explicitly selected device
+> gets its own pipeline-cache file (suffixed with its cache UUID) so a
+> foreign ICD never overwrites the native driver's blob.
+>
+> | device | driver / compiler path | ran? | determinism gate (200 ticks) | `--vk-smoke-loud` |
+> |---|---|---|---|---|
+> | RTX 3060 Ti, NVIDIA 610.47 | native Vulkan | yes | `5dabc010` (pin), gas `84606113` | pinned |
+> | RTX 3060 Ti via **Dozen** (Mesa 26.2.3, Vulkan 1.2 + KHR sync2/dynamic_rendering) | SPIR-V -> NIR -> DXIL -> NVIDIA's D3D12 compiler | yes, **out of spec** (bindings 576 MiB / 1 GiB > advertised 128 MiB) | **all 200 hashes identical**, gas identical | **19/19 MATCH** |
+> | WARP via Dozen | Microsoft CPU D3D12 | **no**: access violation inside pipeline creation (threaded or serial, bindings in or out of spec) | — | — |
+> | llvmpipe (lavapipe, LLVM 23.1.2; debug build LLVM 22.1.8 too) | Mesa CPU | **no**: `STATUS_HEAP_CORRUPTION` 0xC0000374 during/after pipeline creation; 0 validation messages, bindings clamped in spec, serial build — still dies | — | — |
+>
+> **Hard minimum found: `maxStorageBufferRange` >= 1 GiB** (`farVox`, the
+> pool is 576 MiB). Not something the engine can fall back from without
+> splitting both buffers; it is now a named refusal in
+> `Backend::CreateDescriptorSet` instead of undefined behaviour
+> (`SANDVOX_ALLOW_OVERSIZE_BINDINGS=1` runs anyway, recorded as
+> `outOfSpecBindings`; `=clamp` binds the first `maxStorageBufferRange` bytes
+> — the isolation arm that showed llvmpipe's death is not the binding).
+>
+> **Static audit of the sim path (2026-10-02).** Tint runs with its
+> defaults (`vk_spirv.cpp` sets only the entry point): robustness ON (every
+> storage index clamped), workgroup zero-init ON, integer div/mod polyfill
+> (x/0 = x, x%0 = 0), runtime shift amounts masked `& 31`, f32->int
+> conversion clamped. So the classic vendor splits are DEFINED here, no
+> runtime f32 reaches hashed state (MPM is Q16.16, wind/worldgen integer,
+> every sim float is a const-expression) and the hash mask
+> (`sim_occupancy.wgsl:336`) drops stamp + excite + bit 31 as it should. What
+> is left are RACES — scheduling-dependent on one vendor as much as across two:
+>
+> | # | where | what | status |
+> |---|---|---|---|
+> | 1 | `sim_mutate.wgsl` main (header :30-37 admitted it) | brush overlap dedupe read the occupant once per op thread; a lower op's store could land before that read (paint-into-air at op 0 + erase at op 1 on one air cell: sand or air by scheduling) | **FIXED (audit)** — one thread per cell: only the lowest op whose SPHERE covers it (geometry, no voxel read) touches it, reads the pre-dispatch occupant and applies the first op from its index up whose predicate holds. Same rule, no scratch buffer |
+> | 2 | `sim_waterbody.wgsl` `wbShaveColumn` | at `level % 16 == 0` the two-cell band straddles two chunk layers, so two workgroups owned one column and one read the cell the other was emptying | **FIXED** — the chunk holding `level` owns the column (`wbColumnLayer`, as relevel/surface do) |
+> | 3 | `sim_particle.wgsl` `flagLandedUnsupported` | read neighbour cells other particles land in this dispatch; the support flag summons the island scan, whose cooldown/drain then moves when islands drop (world state) | **FIXED (audit)** — a cell whose claim slot is 0 cannot change in resolve (claims are final after integrate), so only those are read; a claimed neighbour counts as solid (flag), a claimed cell below as support (no raft loop) |
+> | 4 | `sim_step.wgsl` `gasLeave`; particle/gas/MPM ring appends | `atomicAdd` slot past the pool cap refuses a scheduling-dependent subset | **open, saturation only** — count-then-refuse, or rank by `hash3` |
+> | 5 | `sim_particle.wgsl` `farBlocked`, `sim_gas.wgsl` `gasFarBlocked` | particles/gas outside the window collide with `farVox`, filled by frame-side passes whose first refill waits on a background pipeline compile (wall clock) | **open** — gates block on the compile so never see it; interactive/multiplayer can |
+> | 6 | `sim_rain_expo.wgsl` `build` | a slope past the CPU clamp would fold excess threads onto the last word | **FIXED** — guard on `RX_MAX_AXIS²` |
+> | 7 | `world.cpp` farVox / voxels bindings | no check against `maxStorageBufferRange` | **FIXED** — named refusal (above) |
+> | 8 | `sim_occupancy.wgsl` hash | stain on an AIR cell was not hashed | **FIXED (audit)** — stained air folds into the world hash and the per-chunk digest; clean air still folds nothing (sentinel twin identity kept, `chunk-hash` PASS). The pinned 5dabc010 did not move: no stained air in the gate's 200 ticks |
+> | 9 | `worldgen.wgsl` `fardown` stalk clear vs the downsample's byte write | **CONFIRMED (audit)**: the downsample rewrites a byte as two atomics (and, then or) from the workgroup that owns the cell, while the stalk clear — run by the workgroup of the chunk holding the stalk's MAP column, which can be another chunk below — loads the byte and clears it if it is the stalk's slot. Load before the and: stalk survives; between and/or: sees 0, no clear, stalk survives; after the or: cleared. Render-only, reaches the sim only through #5 after a window shift | open — fix: move the stalk clear to its own dispatch after the downsample (a pass-table row), or have each chunk's downsample consult the map for cut stalks in its own cells |
+> | 10 | `sim_mutate.wgsl` / `common.wgsl` `flagSupportLoss` | reads 6 neighbours the same dispatch may be storing (the same sphere's next cell, an overlapping op, an island removal's next cell); a flag that differs moves island-scan timing (cooldowns, drain), i.e. world state | **CONFIRMED (audit)**. Brush (`main`): **FIXED** — `flagSupportLossBrush` reads only neighbours no op covers (stable), and flags a covered neighbour's chunk unconditionally (superset). `cells` (exact-cell ops, island removal) and `sim_explode` apply: **open** — fix: record the old class per op in a scratch word and raise the flags in a second dispatch after the stores (reads then see the post-dispatch grid), or have the CPU flag the chunks of cell ops it knows remove solid |
+> | — | `rhi_vulkan.cpp` pipeline creation | `VkPipelineCreationFeedbackCreateInfo` chained on a Vulkan 1.2 device (Dozen) without `VK_EXT_pipeline_creation_feedback` — invalid usage | **FIXED (audit)** — chained only on 1.3 or with the EXT enabled (`Caps::creationFeedback`) |
+> | — | `rhi_vulkan.cpp` `--shader-stats` | set `CAPTURE_STATISTICS` on a device without the extension (validation on llvmpipe) | **FIXED** |
+>
+> Benign by construction (checked, not fixed): atomic reductions whose return
+> value is unused, the CA's per-workgroup gather cursor (colour lattice), the
+> dirty-list / solute page / MPM slot assignments (consumers key on slot or
+> use prefix scans), every runtime division and shift, the 256 B passUBO
+> stride, CPU `unordered_*` iteration (sorted before upload).
+>
+> **The fingerprint (one command per machine).** `sandvox --fingerprint fp.json`
+> = `--selftest --gate determinism` writing the per-tick hashes, gas digest and
+> per-slot voxel digests at ticks 1,2,5,10,20,50,100,150,200
+> (`SANDVOX_FINGERPRINT_TICKS`), device/driver/commit/asset stamps beside them;
+> `SANDVOX_DET_RUNS=1` skips the second run. `python
+> scripts/det_fingerprint_compare.py A.json B.json` prints MATCH or the first
+> divergent tick and the first chunks whose digests differ.
+
 **Phase 6 — switch default; update docs.**
 Default backend → Vulkan. CLAUDE.md build/verify sections updated in the same
 commit (DESIGN.md §12 was already updated when the plan was adopted). ~~Dawn is
@@ -1206,6 +1278,13 @@ subgroup ops in occupancy/compaction only (their output order provably cannot
 leak into sim state — but treat as sim-adjacent and hash-gate anyway); the
 settled-tick fixes (cheap empty dispatches, possibly skip-encode);
 explicit heap placement. Re-run `--measure` after each.
+
+> **[AS BUILT 2026-10-02] async compute: built, measured, OFF.**
+> `docs/PLAN_async_compute.md`. The tick's render-only derived rows
+> (openness + glow) run on a second queue behind `render.asyncCompute`;
+> the recorder splits main command buffers at the first access that conflicts
+> with outstanding async work. Correct (sync validation clean, hash identical)
+> and slower on the RTX 3060 Ti in every configuration measured.
 
 ## Working rules binding every implementation agent
 

@@ -122,6 +122,8 @@ void Queue::Submit(uint32_t count, const CommandBuffer* cmds) const {
   p_->Submit(count, cmds);
 }
 
+void Queue::SubmitAsyncCompute(const CommandBuffer& cmd) const { p_->SubmitAsyncCompute(cmd); }
+
 // -------------------------------------------------------------- Device ----
 
 BackendKind Device::Kind() const { return p_->Kind(); }
@@ -173,6 +175,15 @@ RenderPipeline Device::CreateRenderPipeline(const RenderPipelineDesc& d) const {
 
 CommandEncoder Device::CreateCommandEncoder(const char* label) const {
   return p_->CreateCommandEncoder(label);
+}
+
+bool Device::AsyncComputeAvailable() const { return p_ && p_->AsyncComputeAvailable(); }
+void Device::SetAsyncCompute(bool on) const {
+  if (p_) p_->SetAsyncCompute(on);
+}
+bool Device::AsyncComputeEnabled() const { return p_ && p_->AsyncComputeEnabled(); }
+CommandEncoder Device::CreateAsyncComputeEncoder(const char* label) const {
+  return p_ ? p_->CreateAsyncComputeEncoder(label) : CommandEncoder();
 }
 
 void Device::PushValidationScope() const { p_->PushValidationScope(); }

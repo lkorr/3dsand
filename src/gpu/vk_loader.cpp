@@ -191,7 +191,22 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(CmdWriteTimestamp2);
   VKL_D(CmdCopyQueryPoolResults);
   VKL_D(GetQueryPoolResults);
+  VKL_D(WaitSemaphores);
+  VKL_D(GetSemaphoreCounterValue);
 #undef VKL_D
+  // A VULKAN 1.2 DEVICE WITH THE KHR EXTENSIONS (cross-vendor determinism:
+  // Mesa's Dozen reports 1.2 and offers synchronization2 + dynamic_rendering
+  // as extensions). Core-1.3 names do not resolve there; the KHR aliases are
+  // the same functions with the same signatures (the PFN types are aliases in
+  // the headers). Backend::CreateLogicalDevice enables the extensions; on a
+  // 1.3 device the core names resolved above and these lines change nothing.
+#define VKL_KHR(name) \
+  if (!o.name) o.name = (PFN_vk##name)get("vk" #name "KHR")
+  VKL_KHR(CmdPipelineBarrier2);
+  VKL_KHR(CmdBeginRendering);
+  VKL_KHR(CmdEndRendering);
+  VKL_KHR(CmdWriteTimestamp2);
+#undef VKL_KHR
 }
 
 const char* ResultName(VkResult r) {

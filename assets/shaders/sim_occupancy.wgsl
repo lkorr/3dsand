@@ -347,6 +347,17 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
         block += 1u;
         if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
       }
+    }
+    // HASHED: every non-air cell, AND an air cell that carries stain
+    // (2026-10-02, cross-vendor audit item 8). The stain layer is state — the
+    // note above says so, and `stain` keeps an all-air stained chunk's page
+    // for exactly that reason — but the fold sat inside the non-air branch, so
+    // two runs that disagreed only about a stain left on air (a stained cell
+    // emptied without clearing the stain bits) hashed the same. Clean air
+    // still folds nothing, so a sentinel chunk and its materialized twin keep
+    // hashing identically (EMPTY = clean air = 0 either way), and so does the
+    // per-chunk digest, which folds exactly what `h` folds.
+    if (m != MAT_AIR || (w & STAIN_BITS) != 0u) {
       if (T.hashEnable != 0u) {
         h += pcg((hashBase + i) ^ (v * 0x9E3779B9u));
       }

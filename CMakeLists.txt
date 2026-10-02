@@ -772,6 +772,22 @@ target_link_libraries(sandvox_core PRIVATE ${SANDVOX_LINK_LIBS})
 # whose dependencies always are.
 add_custom_target(sandvox_compile)
 add_dependencies(sandvox_compile sandvox_core)
+# THE BUILD COMMIT, regenerated on every build (cmake/build_info.cmake). The
+# determinism fingerprint (--fingerprint) and every last_run.json device record
+# carry it, so a hash sequence sent back from another machine names the source
+# it came from. Rewritten only when the text changes: an unchanged commit is no
+# recompile.
+set(SV_BUILD_INFO_CPP "${CMAKE_BINARY_DIR}/generated/build_info.cpp")
+if(NOT EXISTS "${SV_BUILD_INFO_CPP}")
+  file(WRITE "${SV_BUILD_INFO_CPP}" "const char* SandvoxBuildCommit() { return \"unknown\"; }\n")
+endif()
+add_custom_target(sandvox_build_info
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${SV_BUILD_INFO_CPP}
+          -P ${CMAKE_SOURCE_DIR}/cmake/build_info.cmake
+  BYPRODUCTS "${SV_BUILD_INFO_CPP}"
+  COMMENT "build_info: stamping the build commit")
+target_sources(sandvox_core PRIVATE "${SV_BUILD_INFO_CPP}")
+add_dependencies(sandvox_core sandvox_build_info)
 # The tint CLI too: scripts/check_shaders.sh validates WGSL with it, it links
 # the Tint libraries the compile phase just built, and in the shared
 # dependency root it is built once for every worktree.

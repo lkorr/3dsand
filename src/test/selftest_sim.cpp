@@ -27,6 +27,7 @@
 #include "sim/rng_simd.h"  // rng::Pcg8 / JitterStateInRow8 (the simd gate)
 #include "sim/scan.h"      // scan::FirstIndexWhereMasked   (the simd gate)
 #include "sim/weather.h"  // SetOverride / SimRainWord (rain-fire gate)
+#include "sim/tuningstamp.h"  // the fingerprint records the asset stamps
 #include "sim/rainexpo.h"  // rain-lean: the fall-line lattice, CPU side
 #include "sim/stream.h"  // RleEncodeChunk / RleEncodeSentinelChunk (fusion gate)
 
@@ -292,6 +293,32 @@ std::vector<uint32_t> hashes[2];
 uint32_t gasDigest[2] = {}, gasLiveEnd[2] = {};
 const std::vector<uint32_t> probeTicks = DetProbeTicks("SANDVOX_DET_PROBE");
 std::map<uint32_t, DetProbe> probe[2];
+// ---- THE PORTABLE FINGERPRINT (--fingerprint <file>; DESIGN.md §14 risk 3) --
+// Rule 1 says "the same hash everywhere", and only ever had one machine to say
+// it on. SANDVOX_FINGERPRINT=<file> (what `--fingerprint` sets) writes run 1 of
+// THIS gate — the same 200 ticks, ops, explosions, ticket and pour — as a
+// self-describing JSON file: the per-tick world hash, the gas digest, and the
+// per-slot voxel digests (sim_occupancy's chunkHash) at a few checkpoint ticks,
+// with the device, driver, build commit and asset stamps beside them. Two such
+// files from two machines are compared by scripts/det_fingerprint_compare.py,
+// which names the first divergent tick and, at the first checkpoint at or past
+// it, the slots whose digests differ — the "WHERE" of CLAUDE.md's ladder in
+// one file, with no second run on the foreign machine.
+//
+// The checkpoints are blocking 128 KiB readbacks at a handful of ticks of run 1
+// only (SANDVOX_FINGERPRINT_TICKS overrides the list); none of them touches
+// sim state, so the hash sequence is the one the plain gate produces.
+// SANDVOX_DET_RUNS=1 skips run 2 — for a CPU device where each run is minutes
+// — and the file then says the twice-run check was not made rather than
+// claiming it passed.
+const char* fpEnv = std::getenv("SANDVOX_FINGERPRINT");
+const std::string fpPath = fpEnv ? fpEnv : "";
+std::vector<uint32_t> fpTicks = DetProbeTicks("SANDVOX_FINGERPRINT_TICKS");
+if (fpTicks.empty()) fpTicks = {1, 2, 5, 10, 20, 50, 100, 150, 200};
+std::map<uint32_t, std::vector<uint32_t>> fpChunk;  // tick -> chunkHash table
+const char* runsEnv = std::getenv("SANDVOX_DET_RUNS");
+const int runs = (runsEnv && std::atoi(runsEnv) == 1) ? 1 : 2;
+IVec3 fpOrigin{};
 // ---- WITH A CHUNK TICKET LIVE (docs/PLAN_chunk_tickets.md §2.8) ----------
 // Rule 1 has to hold with tickets active, and this is the gate that says so:
 // a ticket 40 chunks past the window's +X face is requested at tick 20 and
@@ -308,11 +335,12 @@ const int mSandDet = [&] {
     if (c.mats[i].name == "sand") return (int)i;
   return -1;
 }();
-for (int run = 0; run < 2; run++) {
+for (int run = 0; run < runs; run++) {
   c.stream.OnRegen();
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   const IVec3 wo = world.WindowOrigin();
+  if (run == 0) fpOrigin = wo;
   const IVec3 tkCentre{wo.x + (int)kNChunk - 1 + 40,
                        (World::TerrainHeight((wo.x + (int)kNChunk + 39) * (int)kChunk + 8,
                                              (wo.z + (int)kNChunk / 2) * (int)kChunk + 8,
@@ -338,6 +366,13 @@ for (int run = 0; run < 2; run++) {
                SelftestExps(t, kDefaultSeed), tkPour, true, {8, 3, 8}, false,
                SelftestParticlesActive(t));
     hashes[run].push_back(ReadHashSync(ctx, world));
+    if (run == 0 && !fpPath.empty() &&
+        std::find(fpTicks.begin(), fpTicks.end(), t) != fpTicks.end()) {
+      std::vector<uint32_t>& ch = fpChunk[t];
+      ch.assign(kChunkHashWords, 0u);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.chunkHash, 0, ch.data(),
+                            kChunkHashBytes, "fpChunkHash");
+    }
     if (std::find(probeTicks.begin(), probeTicks.end(), t) != probeTicks.end()) {
       DetProbeCapture(ctx, world, probe[run][t]);
       if (run == 1) DetProbeCompare(world, t, probe[0][t], probe[1][t]);
@@ -382,12 +417,68 @@ for (int run = 0; run < 2; run++) {
   gasDigest[run] = gs[kGasSpDigest];
   gasLiveEnd[run] = GasAliveSync(ctx, world, sim);
 }
+const bool twice = runs == 2;
 const bool gasSame =
-    gasDigest[0] == gasDigest[1] && gasLiveEnd[0] == gasLiveEnd[1];
-bool deterministic = hashes[0] == hashes[1] && gasSame;
+    !twice || (gasDigest[0] == gasDigest[1] && gasLiveEnd[0] == gasLiveEnd[1]);
+bool deterministic = (!twice || hashes[0] == hashes[1]) && gasSame;
 std::printf("determinism: gas %u parcels alive, digest %08x (%s)\n",
             gasLiveEnd[0], gasDigest[0],
-            gasSame ? "reproduced" : "DIVERGED between the two runs");
+            !twice ? "run 2 SKIPPED (SANDVOX_DET_RUNS=1)"
+            : gasSame ? "reproduced" : "DIVERGED between the two runs");
+if (!fpPath.empty()) {
+  int firstSelfDiv = 0;
+  if (twice)
+    for (int i = 0; i < kTicks && !firstSelfDiv; i++)
+      if (hashes[0][i] != hashes[1][i]) firstSelfDiv = i + 1;
+  std::string doc = "{\n  \"format\": \"sandvox-determinism-fingerprint/1\",\n";
+  doc += "  \"scenario\": \"selftest determinism gate (200 ticks: ops, explosions, "
+         "chunk ticket + pour)\",\n";
+  doc += "  \"device\": " + LastDeviceJson() + ",\n";
+  doc += "  \"buildCommit\": \"" + BuildCommit() + "\",\n";
+  doc += "  \"tuningStamp\": " + sandvox::StampTuning(AssetDir()).Json() + ",\n";
+  doc += Format("  \"residency\": \"%s\",\n  \"seed\": %u,\n  \"ticks\": %d,\n",
+                world.residency == World::Residency::Paged ? "paged" : "dense",
+                kDefaultSeed, kTicks);
+  doc += Format("  \"windowOrigin\": [%d, %d, %d],\n  \"nChunk\": %u,\n", fpOrigin.x,
+                fpOrigin.y, fpOrigin.z, kNChunk);
+  doc += "  \"worldHashes\": [";
+  for (size_t i = 0; i < hashes[0].size(); i++)
+    doc += Format("%s\"%08x\"", i ? (i % 10 ? ", " : ",\n    ") : "\n    ",
+                  hashes[0][i]);
+  doc += "\n  ],\n";
+  doc += Format("  \"gas\": {\"digest\": \"%08x\", \"alive\": %u},\n", gasDigest[0],
+                gasLiveEnd[0]);
+  doc += Format("  \"selfCheck\": {\"runs\": %d, \"reproduced\": %s, "
+                "\"firstDivergentTick\": %d},\n",
+                runs, twice ? (deterministic ? "true" : "false") : "null",
+                firstSelfDiv);
+  // Per-slot voxel digests at the checkpoints, nonzero entries only, keyed by
+  // SLOT (the window origin above makes a slot a world chunk; both machines
+  // run the same seed, so their windows agree unless worldgen itself
+  // diverged, which tick 1 would already show).
+  doc += "  \"chunkHashes\": {";
+  bool firstT = true;
+  for (const auto& kv : fpChunk) {
+    doc += Format("%s\n    \"%u\": [", firstT ? "" : ",", kv.first);
+    firstT = false;
+    bool firstE = true;
+    for (uint32_t s = 0; s < kNumSlots; s++) {
+      if (!kv.second[s]) continue;
+      doc += Format("%s[%u,\"%08x\"]", firstE ? "" : ",", s, kv.second[s]);
+      firstE = false;
+    }
+    doc += "]";
+  }
+  doc += "\n  }\n}\n";
+  if (FILE* f = std::fopen(fpPath.c_str(), "wb")) {
+    std::fwrite(doc.data(), 1, doc.size(), f);
+    std::fclose(f);
+    std::printf("fingerprint: wrote %s (%d ticks, %zu checkpoints, final %08x)\n",
+                fpPath.c_str(), kTicks, fpChunk.size(), hashes[0].back());
+  } else {
+    std::printf("fingerprint: CANNOT WRITE %s\n", fpPath.c_str());
+  }
+}
 
 // ---- THE TWO CHECKS ARE DIFFERENT CLAIMS. DO NOT CONFLATE THEM. ------------
 //
@@ -464,8 +555,9 @@ if (!goldenOk) {
                                                 golden +
                                                 " (determinism itself passed; "
                                                 "rebaseline if intended)";
-  detail = Format("final hash %s over %d ticks%s", got, kTicks,
-                  goldenNote.c_str());
+  detail = Format("final hash %s over %d ticks%s%s", got, kTicks,
+                  goldenNote.c_str(),
+                  twice ? "" : " (ONE run: twice-run check SKIPPED, SANDVOX_DET_RUNS=1)");
 
   // Verdict: self-consistent AND simulating the recorded world.
   //

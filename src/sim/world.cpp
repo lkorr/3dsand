@@ -183,7 +183,10 @@ void World::Init(const rhi::Device& device) {
   passUBO = CreateBuffer(device, 54 * 256, U::Uniform | U::CopyDst, "passUBO");
   opsBuf = CreateBuffer(device, kMaxOpsPerTick * sizeof(BrushOp),
                         U::Storage | U::CopyDst, "brushOps");
-  renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
+  // CopySrc: the tick copies it into Simulation's renderUBOTick
+  // (pass_table.def copy_renderUBOTick, docs/PLAN_async_compute.md).
+  renderUBO = CreateBuffer(device, sizeof(RenderParams),
+                           U::Uniform | U::CopyDst | U::CopySrc, "renderUBO");
   cloudUBO = CreateBuffer(device, sizeof(CloudParams), U::Uniform | U::CopyDst, "cloudUBO");
   dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
   actVoxViz = CreateBuffer(device, kActVoxVizBytes, U::Storage | U::CopyDst, "actVoxViz");

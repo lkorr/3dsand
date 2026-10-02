@@ -753,6 +753,7 @@
     "waveSimSlope": 0.03,
     "waveSimFoam": 0.55,
     "dbgCurrentField": false,
+    "asyncCompute": false,
     "dbgCurrentSpacing": 6,
     "dbgCurrentRadius": 40,
     "bloodTransmit": 0.35,

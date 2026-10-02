@@ -84,6 +84,10 @@ struct TickGpuSpan {
 
 
 void SetSubmitTickPassTimer(::PassTimer* t) { g_tickTimer = t; }
+namespace {
+int g_asyncOverride = -1;
+}  // namespace
+void SetAsyncComputeOverride(int v) { g_asyncOverride = v; }
 ::PassTimer* SubmitTickPassTimer() { return g_tickTimer; }
 
 
@@ -1065,6 +1069,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
                 uint32_t fluidLive,
                 bool vizActive) {
+  // ---- ASYNC COMPUTE: the switch (docs/PLAN_async_compute.md) -------------
+  // render.asyncCompute, or SANDVOX_ASYNC_COMPUTE=0/1 over it (the A/B arm).
+  // Applied per tick so an F5 reload or a --perf arm flips it between ticks;
+  // a device with no async queue refuses and stays single-queue. Scheduling
+  // only: what the tick records and in what order is the same either way.
+  {
+    static const int kEnvAsync = [] {
+      const char* e = std::getenv("SANDVOX_ASYNC_COMPUTE");
+      return e && *e ? std::atoi(e) : -1;
+    }();
+    const bool want = g_asyncOverride >= 0 ? g_asyncOverride != 0
+                      : kEnvAsync >= 0     ? kEnvAsync != 0
+                                           : CurrentTuning().render.asyncCompute;
+    if (want != ctx.device.AsyncComputeEnabled() &&
+        (!want || ctx.device.AsyncComputeAvailable()))
+      ctx.device.SetAsyncCompute(want);
+    static bool warned = false;
+    if (want && !ctx.device.AsyncComputeAvailable() && !warned) {
+      warned = true;
+      std::printf("render.asyncCompute: no async compute queue on this device/boot "
+                  "(the queue is created at device creation when the knob is on at "
+                  "boot); staying single-queue\n");
+    }
+  }
   // ---- THE CHOKE POINT, AND WHAT IT NOW OWES THE STREAM -------------------
   //
   // Three of the six op vectors were clamped here and three were not: `cells`,
@@ -2272,6 +2300,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // discharge row itself and what the ledger's rule-2 refusal compares against.
   const uint32_t fluidSpawnTotal =
       fluidSpawnCount + drainBodies * kWaterDrainOpsPerBody;
+  // ASYNC COMPUTE (docs/PLAN_async_compute.md): decided BEFORE EncodeTick,
+  // which records the derived rows inline (their pre-async position) unless
+  // the async queue is taking them. SANDVOX_ASYNC_DRYRUN=1 switches the
+  // timelines on (every main submit signals one) but keeps the rows on the
+  // main queue: the isolation arm that prices the semaphore traffic alone.
+  static const bool kAsyncDry = [] {
+    const char* e = std::getenv("SANDVOX_ASYNC_DRYRUN");
+    return e && *e == '1';
+  }();
+  const bool derivedAsync = ctx.device.AsyncComputeEnabled() && !kAsyncDry;
+  sim.SetDerivedDeferred(derivedAsync);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
                  fluidLive + fluidSpawnTotal, fluidSpawnTotal,
@@ -2329,6 +2368,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       g_stallStats.refusedArm++;
     }
   }
+  // ---- THE DERIVED ROWS ON THE ASYNC QUEUE (docs/PLAN_async_compute.md) ---
+  // Only when SetDerivedDeferred(true) above: the openness grid and the glow
+  // field (pass_table.def PT_DERIVED), render-only, read by nothing in the
+  // sim, recorded into an encoder for the async compute queue that is
+  // submitted right behind this one and waits for it. Recorded before
+  // FlipPage: the rows bind this tick's page of the sim bind group. If the
+  // async encoder cannot be made they record at the end of this buffer
+  // instead (EncodeDerived is a no-op when EncodeTick already recorded them).
+  rhi::CommandEncoder aenc;
+  if (derivedAsync) aenc = ctx.device.CreateAsyncComputeEncoder("derived");
+  if (aenc)
+    sim.EncodeDerived(aenc, /*asyncQueue=*/true);
+  else
+    sim.EncodeDerived(enc);
   spanEnc.Close();
   {
     // ---- SUBMIT, and now it really is only the submit ---------------------
@@ -2337,6 +2390,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // and both belong to the RHI; nothing else does.
     sandvox::PerfSpan spanSub(PerfScope::Submit);
     ctx.queue.Submit(enc.Finish());
+    if (aenc) ctx.queue.SubmitAsyncCompute(aenc.Finish());
     sim.FlipPage();
     if (doCopy) world.KickReadback();
   }

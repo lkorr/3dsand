@@ -6,6 +6,7 @@
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
 #include "gpu/resources.h"
+#include "sim/tuning.h"  // render.asyncCompute decides whether the async queue exists
 
 // After the Vulkan headers (via rhi_vulkan.h) so glfw3.h sees VK_VERSION_1_0
 // and declares glfwCreateWindowSurface / glfwGetRequiredInstanceExtensions.
@@ -23,6 +24,95 @@ vk::Backend* GpuContext::VkBackend() const { return back_ ? back_->vk.get() : nu
 std::string GpuContext::DeviceName() const {
   vk::Backend* be = VkBackend();
   return be ? be->GetCaps().deviceName : std::string();
+}
+
+const char* SandvoxBuildCommit();  // generated: cmake/build_info.cmake
+
+namespace {
+// The most recent Init's backend, for writers that hold no context (the
+// selftest's last_run.json, the fingerprint). One device per process in every
+// mode that writes one; a process that boots two (the two-player smoke)
+// records the last. WEAK and read at WRITE time, not at Init: one field
+// (oversizeBindings) is only known once the bind groups exist.
+std::weak_ptr<vk::Backend> g_lastBackend;
+std::string g_lastDeviceLine;
+
+std::string JsonEsc(const std::string& s) {
+  std::string o;
+  for (char c : s) {
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((unsigned char)c < 0x20) o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+std::string VkVersionString(uint32_t v) {
+  char b[32];
+  std::snprintf(b, sizeof b, "%u.%u.%u", VK_API_VERSION_MAJOR(v),
+                VK_API_VERSION_MINOR(v), VK_API_VERSION_PATCH(v));
+  return b;
+}
+
+std::string LineOf(const vk::Caps& c) {
+  char b[512];
+  std::snprintf(b, sizeof b, "%s | %s %s | vk %s | %04x:%04x %s [%u/%u] | build %s",
+                c.deviceName.c_str(), c.driverName.c_str(), c.driverInfo.c_str(),
+                VkVersionString(c.apiVersion).c_str(), c.vendorId, c.deviceId,
+                c.deviceType.c_str(), c.deviceIndex, c.deviceCount,
+                SandvoxBuildCommit());
+  return b;
+}
+
+std::string JsonOf(const vk::Backend& be) {
+  const vk::Caps& c = be.GetCaps();
+  const vk::Backend::AsyncStats& as = be.GetAsyncStats();
+  char b[1792];
+  std::snprintf(b, sizeof b,
+                "{\"name\": \"%s\", \"driverName\": \"%s\", \"driverInfo\": \"%s\", "
+                "\"driverId\": %u, \"driverVersion\": %u, \"apiVersion\": \"%s\", "
+                "\"vendorId\": %u, \"deviceId\": %u, \"type\": \"%s\", "
+                "\"index\": %u, \"count\": %u, \"pipelineCacheUuid\": \"%s\", "
+                "\"queueFamilies\": \"%s\", \"asyncCompute\": %s, "
+                "\"maxStorageBufferRange\": %llu, \"khr13Fallback\": %s, "
+                "\"outOfSpecBindings\": %s, \"outOfSpecMaxRange\": %llu, \"robustBufferAccess\": %s, "
+                "\"asyncComputeEnabled\": %s, \"asyncSubmits\": %llu, "
+                "\"asyncJoins\": %llu, \"asyncHeadJoins\": %llu, \"asyncSplits\": %llu, "
+                "\"buildCommit\": \"%s\"}",
+                JsonEsc(c.deviceName).c_str(), JsonEsc(c.driverName).c_str(),
+                JsonEsc(c.driverInfo).c_str(), c.driverId, c.driverVersion,
+                VkVersionString(c.apiVersion).c_str(), c.vendorId, c.deviceId,
+                c.deviceType.c_str(), c.deviceIndex, c.deviceCount,
+                c.pipelineCacheUuid.c_str(), JsonEsc(c.queueFamilies).c_str(),
+                c.asyncComputeAvailable ? "true" : "false",
+                (unsigned long long)c.maxStorageBufferRange,
+                c.khr13Fallback ? "true" : "false",
+                c.oversizeBindings ? "true" : "false",
+                (unsigned long long)c.oversizeMaxRange,
+                c.robustBufferAccessEnabled ? "true" : "false",
+                be.AsyncEnabled() ? "true" : "false",
+                (unsigned long long)as.submits, (unsigned long long)as.joins,
+                (unsigned long long)as.headJoins, (unsigned long long)as.splits,
+                JsonEsc(SandvoxBuildCommit()).c_str());
+  return b;
+}
+}  // namespace
+
+std::string LastDeviceJson() {
+  std::shared_ptr<vk::Backend> be = g_lastBackend.lock();
+  return be ? JsonOf(*be) : std::string("null");
+}
+const std::string& LastDeviceLine() { return g_lastDeviceLine; }
+std::string BuildCommit() { return SandvoxBuildCommit(); }
+
+std::string GpuContext::DeviceLine() const {
+  vk::Backend* be = VkBackend();
+  return be ? LineOf(be->GetCaps()) : std::string();
+}
+
+std::string GpuContext::DeviceJson() const {
+  vk::Backend* be = VkBackend();
+  return be ? JsonOf(*be) : std::string("null");
 }
 
 size_t GpuContext::ReportVkValidation(const char* tag) const {
@@ -68,6 +158,10 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
       return false;
     }
   }
+  // The async compute queue exists only if this boot's tuning asks for it
+  // (render.asyncCompute; env overrides live in CreateLogicalDevice). An
+  // unused second queue is not free on NVIDIA — docs/PLAN_async_compute.md.
+  vk::Backend::SetAsyncQueueWanted(CurrentTuning().render.asyncCompute);
   // Sync validation follows validation: it is the barrier document's primary
   // detector for a missing barrier (§6.2).
   if (!back_->vk->Init(lowPowerAdapter, vkValidation, vkValidation, err, glfwExts,
@@ -77,6 +171,19 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
   }
   const vk::Caps& caps = back_->vk->GetCaps();
   std::printf("adapter: %s (backend vulkan)\n", caps.deviceName.c_str());
+  // The facts a hash needs beside it (cross-vendor determinism): which driver
+  // and shader compiler, which API version, which of the loader's devices, and
+  // which source. One line, always, so any log of any run says what ran it.
+  g_lastDeviceLine = DeviceLine();
+  g_lastBackend = back_->vk;
+  std::printf("device: %s\n", g_lastDeviceLine.c_str());
+  std::printf("  queues: %s | async compute: %s | maxStorageBufferRange %llu%s\n",
+              caps.queueFamilies.c_str(),
+              caps.asyncComputeAvailable
+                  ? ("family " + std::to_string(caps.asyncComputeFamily)).c_str()
+                  : "none (single queue)",
+              (unsigned long long)caps.maxStorageBufferRange,
+              caps.khr13Fallback ? " | 1.2 + KHR sync2/dynamic_rendering" : "");
   // The shadow cache is the one fragment-stage storage write in the engine, and
   // it is compiled in or out rather than branched on (world.h). Tell the shader
   // prelude before anything loads a shader.

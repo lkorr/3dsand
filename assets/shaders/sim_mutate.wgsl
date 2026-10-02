@@ -28,14 +28,23 @@
 // `opWouldWrite` below is that predicate and `main` must keep agreeing with
 // it — the two are deliberately adjacent for that reason.
 //
-// WHAT THIS DOES NOT FIX, stated so nobody reads more into it than is there:
-// each thread evaluates the predicate against ONE read of the occupant, and a
-// lower op's store can still land between that read and this thread's
-// decision. Closing that last window needs the two-phase mark/apply
-// sim_explode uses (a per-op scratch buffer), which is a binding, a pass-table
-// row and a buffer — a separate change. What is closed here is the common
-// case: for overlaps where the ops disagree about a cell (paint vs melt, two
-// materials), exactly one invocation now writes it.
+// ONE THREAD PER CELL (2026-10-02, cross-vendor audit). Until then each op's
+// thread for a cell read the occupant itself and returned if a LOWER op would
+// write it — but a lower op's STORE could land before that read, and the
+// predicate then answered about the new occupant: paint-into-air at op 0 and
+// an erase at op 1 on one air cell left sand or air depending on which
+// invocation ran first. Now only the thread of the LOWEST op whose SPHERE
+// covers the cell (geometry alone: no voxel read, so no race) touches it; it
+// reads the occupant once and applies the first op, from its own index up,
+// whose full predicate holds against that read. Every other thread of every
+// other op returns without reading the cell. The read is therefore of the
+// cell as it stood before this dispatch (only the owner ever stores it), and
+// the rule is unchanged: the lowest op index that would write the cell wins.
+// No scratch buffer and no second pass — the mark/apply split sim_explode
+// needs is for a write REACH, and a brush op writes only the cell it covers.
+//
+// The support-loss flag at the bottom has the same shape of problem and the
+// same kind of answer: see flagSupportLossBrush.
 //
 // CELL OPS (the `cells` entry) dedupe on the CPU instead — an 8-byte op has no
 // room for a predicate a shader could re-derive, and the choke point can sort.
@@ -258,9 +267,14 @@ fn markBoth(c : vec3<i32>) {
 // predicate so the overlap dedupe can ask it about an EARLIER op. Any change
 // to main's gates has to land here in the same edit or the two disagree and
 // the dedupe starts shadowing writes that would never have happened.
-fn opWouldWrite(o : BrushOp, c : vec3<i32>, prevMat : u32) -> bool {
+fn opCovers(o : BrushOp, c : vec3<i32>) -> bool {
   let d = c - vec3<i32>(o.cx, o.cy, o.cz);
-  if (dot(d, d) > o.radius * o.radius) { return false; }
+  return dot(d, d) <= o.radius * o.radius;
+}
+const MUT_NO_OP : u32 = 0xFFFFFFFFu;  // "no op writes this cell"
+
+fn opWouldWrite(o : BrushOp, c : vec3<i32>, prevMat : u32) -> bool {
+  if (!opCovers(o, c)) { return false; }
   if (o.mode == 0u) { return prevMat == MAT_AIR; }  // paint fills air only
   // the spell transmute's from-filter (see the note in main)
   if (o._p0 != 0u && prevMat != o._p0) { return false; }
@@ -271,17 +285,65 @@ fn opWouldWrite(o : BrushOp, c : vec3<i32>, prevMat : u32) -> bool {
   return true;
 }
 
+// ---- THE BRUSH'S SUPPORT-LOSS FLAG (common.wgsl flagSupportLoss, made
+// order-free for this dispatch) ---------------------------------------------
+// flagSupportLoss reads the six neighbours to ask "is a solid resting on me?",
+// and inside THIS dispatch a neighbour can be a cell another invocation is
+// storing at that moment (the same sphere's next cell, or an overlapping op's):
+// read before the store it is one material, after it another, so whether the
+// neighbour's chunk got flagged depended on scheduling. The flag is a side
+// channel, but not an inert one — it queues an island scan, and the scan
+// queue has cooldowns and a per-tick drain (debris.cpp QueueSupportEvents), so
+// an extra or missing flag moves WHEN islands drop, which is world state.
+//
+// The fix keeps the read where it is stable and drops it where it is not: a
+// neighbour NO op covers is not written by this dispatch, so its read is the
+// pre-dispatch cell and is used as before; a neighbour SOME op covers may be
+// written, and is treated as solid — its chunk is flagged unconditionally, a
+// superset (an island scan that finds nothing) and a pure function of the op
+// list. Everything else is common.wgsl's rule verbatim; keep the two in step.
+fn flagSupportLossBrush(c : vec3<i32>, oldKlass : u32, newMat : u32) {
+  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
+  let nm = newMat & 0xFFFu;
+  var keepsAbove = false;
+  if (nm != MAT_AIR) {
+    let nk = materials[nm].klass;
+    if (nk == CLASS_SOLID) { return; }  // still supports everything
+    if (nk == CLASS_POWDER) { keepsAbove = true; }
+  }
+  for (var i = 0u; i < 6u; i++) {
+    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    if (keepsAbove && i == 1u) { continue; }
+    let n = c + faceDir(i);
+    if (!inWindow(n, ptOrigin())) { continue; }
+    var covered = false;
+    for (var k = 0u; k < T.opsCount; k++) {
+      if (opCovers(ops[k], n)) { covered = true; break; }
+    }
+    var solid = covered;
+    if (!covered) {
+      let nmat = voxMat(voxWordAt(n));
+      solid = nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID;
+    }
+    if (solid) { atomicStore(&supportOut[chunkIndexW(n)], 1u); }
+  }
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
   let opIdx = wg.x / 4u;
   if (opIdx >= T.opsCount) { return; }
-  let op = ops[opIdx];
+  let boxOp = ops[opIdx];
 
   let local = vec3<i32>(vec3<u32>((wg.x % 4u), wg.y, wg.z) * 4u + lid) - vec3<i32>(8, 8, 8);
-  if (dot(local, local) > op.radius * op.radius) { return; }
-  let c = vec3<i32>(op.cx, op.cy, op.cz) + local;
+  if (dot(local, local) > boxOp.radius * boxOp.radius) { return; }
+  let c = vec3<i32>(boxOp.cx, boxOp.cy, boxOp.cz) + local;
   if (!inBounds(c)) { return; }
+  // OWNERSHIP (the header): a lower op whose sphere covers this cell owns it.
+  for (var j = 0u; j < opIdx; j++) {
+    if (opCovers(ops[j], c)) { return; }
+  }
 
   // TWO BASES (§4.1): slotIdx keys the palette-variant RNG, idx addresses
   // memory. See the note in sim_step:main.
@@ -293,14 +355,18 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let iw = voxIndexAndWord(c);
   let idx = iw.x;
   let prevMat = voxMat(iw.y);
-  // OVERLAP DEDUPE (see the header): the lowest op index that covers this cell
-  // and would write it owns it. One read of the occupant feeds every decision
-  // in this thread, so the answer is a function of the op list and that read.
-  // opsCount <= 64 and the loop only runs for ops after the first, so a tick
-  // with one brush op pays a single compare.
-  for (var j = 0u; j < opIdx; j++) {
-    if (opWouldWrite(ops[j], c, prevMat)) { return; }
+  // THE WINNER (see the header): the lowest op index, from this thread's own
+  // up, that covers the cell AND would write it given the occupant read once
+  // above. The owner is the only thread that reads or stores this cell, so
+  // that read is the pre-dispatch occupant and the answer is a pure function
+  // of the op list and the grid. opsCount <= 64; a cell under one op pays one
+  // predicate.
+  var winner = MUT_NO_OP;
+  for (var k = opIdx; k < T.opsCount; k++) {
+    if (opWouldWrite(ops[k], c, prevMat)) { winner = k; break; }
   }
+  if (winner == MUT_NO_OP) { return; }
+  let op = ops[winner];
   if (op.mode == 0u && prevMat != MAT_AIR) { return; }  // paint fills air only
   // A spell's transmute (game/spell.cpp Convert) is an overwrite with a FROM
   // filter: _p0 names the only material it may replace (0 = any), and bit 0 of
@@ -341,7 +407,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // ledge was standing on. Air-into-air and paint-into-air cost one compare:
   // prevMat is MAT_AIR, whose class is neither SOLID nor POWDER, so the call
   // returns on its first line.
-  flagSupportLoss(c, materials[prevMat].klass, mat);
+  flagSupportLossBrush(c, materials[prevMat].klass, mat);
 }
 
 // Exact-cell writes (island removal / rubble handoff, DESIGN.md §7). Same

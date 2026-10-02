@@ -337,6 +337,10 @@ SnapshotStallStats TakeSnapshotStallStats();
 // timer does not, so an unqualified name here would declare a second, empty
 // sandvox::PassTimer that silently never matches the real one.
 void SetSubmitTickPassTimer(::PassTimer* t);
+// Async compute (docs/PLAN_async_compute.md): force render.asyncCompute for
+// the ticks that follow — 1 on, 0 off, -1 back to SANDVOX_ASYNC_COMPUTE /
+// the tuning knob. The --perf in-process A/B arms (SANDVOX_PERF_ASYNC_ARMS).
+void SetAsyncComputeOverride(int v);
 ::PassTimer* SubmitTickPassTimer();
 
 // Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE

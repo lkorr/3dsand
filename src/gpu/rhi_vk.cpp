@@ -237,10 +237,28 @@ struct VkrCommandBuffer final : CommandBufferImpl {
   // the same way if it dies unsubmitted.
   bool submitted = false;
   std::shared_ptr<VkrState> st;
+  // ---- ASYNC COMPUTE (docs/PLAN_async_compute.md) -------------------------
+  // `cmd2`: the TAIL of a main buffer the recorder split at its first access
+  // that conflicts with outstanding async work (submitted in the same batch,
+  // waiting the async timeline). `joinHead`: the whole buffer waits (an upload
+  // at its head conflicted). `epoch`: the async submit count when recording
+  // began — an async submit made AFTER it was never seen by the recorder, so
+  // Queue::Submit joins at the head for it. `async`: from
+  // CreateAsyncComputeEncoder; `touched` is its conflict set.
+  VkCommandBuffer cmd2 = VK_NULL_HANDLE;
+  bool joinHead = false;
+  uint64_t epoch = 0;
+  bool async = false;
+  std::vector<vk::Backend::AsyncTouch> touched;
   ~VkrCommandBuffer() override {
     // Finish() already ended it, so the backend must not end it again.
-    if (!submitted && st && cmd != VK_NULL_HANDLE)
-      st->be->AbandonCommands(cmd, /*ended=*/true);
+    if (submitted || !st || cmd == VK_NULL_HANDLE) return;
+    if (async) {
+      st->be->AbandonAsyncCommands(cmd, /*ended=*/true);
+      return;
+    }
+    st->be->AbandonCommands(cmd, /*ended=*/true);
+    if (cmd2 != VK_NULL_HANDLE) st->be->AbandonCommands(cmd2, /*ended=*/true);
   }
 };
 struct VkrQuerySet final : QuerySetImpl {
@@ -299,24 +317,46 @@ struct VkrEncoder final : CommandEncoderImpl {
   // Set by Finish(): from then on the CommandBuffer handle owns the upload
   // debt and this destructor must not settle it a second time.
   bool handedOff = false;
+  // ---- ASYNC COMPUTE (docs/PLAN_async_compute.md) -------------------------
+  // `cmd` is ALWAYS the buffer being recorded into; after a join split that is
+  // the tail, and `headCmd` is the buffer BeginCommands made (the one that owns
+  // the upload debt). `async`: an async-queue encoder.
+  VkCommandBuffer headCmd = VK_NULL_HANDLE;
+  bool split = false;
+  bool joinHead = false;
+  uint64_t epoch = 0;
+  bool async = false;
   ~VkrEncoder() override {
     // Dropped without Finish(): nothing recorded here will ever run, so give
     // back the uploads BeginCommands swallowed. The destructor is the one place
     // that KNOWS the buffer is dead - a "was the previous one submitted yet?"
     // test at the next BeginCommands cannot tell a dead encoder from a live
     // second one, and guessing wrong there double-writes the staging ring.
-    if (!handedOff && cmd != VK_NULL_HANDLE) st->be->AbandonCommands(cmd);
+    if (!handedOff && cmd != VK_NULL_HANDLE) {
+      if (async) {
+        st->be->AbandonAsyncCommands(cmd, /*ended=*/false);
+      } else if (split) {
+        st->be->AbandonCommands(headCmd, /*ended=*/true);
+        st->be->AbandonCommands(cmd, /*ended=*/false);
+      } else {
+        st->be->AbandonCommands(cmd);
+      }
+    }
     // The recorder goes back for the next encoder (VkrState::freeRecorders).
     if (rec) st->freeRecorders.push_back(std::move(rec));
   }
 
-  VkrEncoder(std::shared_ptr<VkrState> s, const char* label) : st(std::move(s)) {
+  VkrEncoder(std::shared_ptr<VkrState> s, const char* label, bool asyncQueue = false)
+      : st(std::move(s)), async(asyncQueue) {
     // BeginCommands flushes the pending uploads at the head of the command
     // buffer; Recorder::Begin then emits the §3.4 global barrier, which is what
     // makes those uploads (and every previous submit) visible to everything
     // recorded after it. Same order as phase 3c's RunTable — load-bearing.
-    cmd = st->be->BeginCommands(label ? label : "enc");
+    // An ASYNC encoder flushes nothing (BeginAsyncCommands says why).
+    cmd = async ? st->be->BeginAsyncCommands()
+                : st->be->BeginCommands(label ? label : "enc");
     if (cmd == VK_NULL_HANDLE) return;
+    headCmd = cmd;
     if (!st->freeRecorders.empty()) {
       rec = std::move(st->freeRecorders.back());
       st->freeRecorders.pop_back();
@@ -327,6 +367,33 @@ struct VkrEncoder final : CommandEncoderImpl {
     // the --measure timer a previous encoder attached — so a reused recorder
     // records exactly what a fresh one would.
     rec->Begin(cmd);
+    if (async) {
+      rec->SetAsyncRecording(true);
+      return;
+    }
+    // Async work the main queue has not joined yet: an upload that just
+    // flushed into the head conflicts -> the whole buffer waits; otherwise the
+    // recorder splits at the first conflicting command (or never).
+    epoch = st->be->AsyncSubmitted();
+    joinHead = st->be->LastBeginJoinAtHead();
+    if (st->be->AsyncOutstanding() && !joinHead)
+      rec->SetAsyncJoin([this]() -> VkCommandBuffer { return SplitForJoin(); });
+  }
+  // End the head, start the tail. Called once, by the recorder.
+  VkCommandBuffer SplitForJoin() {
+    if (st->be->Fns().EndCommandBuffer(cmd) != VK_SUCCESS) {
+      std::fprintf(stderr, "FATAL: vkEndCommandBuffer failed at an async join split\n");
+      std::abort();
+    }
+    VkCommandBuffer tail = st->be->BeginCommandsNoFlush();
+    if (tail == VK_NULL_HANDLE) {
+      std::fprintf(stderr, "FATAL: no command buffer for an async join split\n");
+      std::abort();
+    }
+    headCmd = cmd;
+    cmd = tail;
+    split = true;
+    return tail;
   }
   void CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
                           uint64_t dstOffset, uint64_t size) override {
@@ -382,6 +449,10 @@ struct VkrEncoder final : CommandEncoderImpl {
   bool presenting = false;  // set when a pass targets a swapchain image
 
   RenderPass BeginRenderPass(const RenderPassDesc& d) override {
+    if (async) {
+      std::fprintf(stderr, "FATAL: a render pass on an async compute encoder\n");
+      std::abort();
+    }
     vk::RenderAttachments att{};
     att.color = NI(d.color.view);
     if (att.color && att.color->presentable) presenting = true;
@@ -396,7 +467,9 @@ struct VkrEncoder final : CommandEncoderImpl {
     auto impl = std::make_shared<VkrRenderPass>();
     impl->st = st;
     impl->rec = rec.get();
-    impl->cmd = cmd;
+    // AFTER BeginRendering: it may have split the buffer to join async work,
+    // and the pass records into the tail.
+    impl->cmd = rec->Cmd();
     return RenderPass(std::move(impl));
   }
   CommandBuffer Finish() override {
@@ -409,9 +482,14 @@ struct VkrEncoder final : CommandEncoderImpl {
       return {};
     }
     auto impl = std::make_shared<VkrCommandBuffer>();
-    impl->cmd = cmd;
+    impl->cmd = split ? headCmd : cmd;
+    impl->cmd2 = split ? cmd : VK_NULL_HANDLE;
     impl->presenting = presenting;
     impl->st = st;
+    impl->joinHead = joinHead;
+    impl->epoch = epoch;
+    impl->async = async;
+    if (async) impl->touched = rec->AsyncTouched();
     handedOff = true;   // the CommandBuffer handle now owns the upload debt
     return CommandBuffer(std::move(impl));
   }
@@ -430,16 +508,45 @@ struct VkrQueue final : QueueImpl {
     for (uint32_t i = 0; i < count; i++) {
       if (!cmds[i]) continue;
       auto* c = static_cast<VkrCommandBuffer*>(cmds[i].Get());
+      if (c->async) {
+        std::fprintf(stderr, "FATAL: an async compute command buffer handed to Queue::Submit\n");
+        std::abort();
+      }
       c->submitted = true;
       std::string err;
-      VkFence f = c->presenting ? st->be->SubmitEndedPresenting(c->cmd, err)
-                                : st->be->SubmitEnded(c->cmd, err);
+      VkFence f = VK_NULL_HANDLE;
+      if (st->be->AsyncSubmitted() > 0 || c->cmd2 != VK_NULL_HANDLE) {
+        // Async compute has been used on this device: the timeline submit,
+        // with the join this buffer's recording decided — plus a head join for
+        // any async submit made after its recording began (the recorder never
+        // saw that work's conflict set).
+        const bool late = st->be->AsyncSubmitted() > c->epoch;
+        f = st->be->SubmitMainJoined(c->cmd, c->cmd2, c->joinHead || late,
+                                     c->cmd2 != VK_NULL_HANDLE, c->presenting, err);
+      } else {
+        f = c->presenting ? st->be->SubmitEndedPresenting(c->cmd, err)
+                          : st->be->SubmitEnded(c->cmd, err);
+      }
       if (f == VK_NULL_HANDLE) {
         std::fprintf(stderr, "vulkan submit failed: %s\n", err.c_str());
         continue;
       }
       st->lastFence = f;
     }
+  }
+  void SubmitAsyncCompute(const CommandBuffer& cb) override {
+    if (!cb) return;
+    auto* c = static_cast<VkrCommandBuffer*>(cb.Get());
+    if (!c->async) {
+      std::fprintf(stderr, "FATAL: a main-queue command buffer handed to SubmitAsyncCompute\n");
+      std::abort();
+    }
+    c->submitted = true;
+    std::string err;
+    // NOT st->lastFence: a map borrows the fence of the work that PRODUCED its
+    // contents, and every map in the engine reads main-queue output.
+    if (st->be->SubmitAsync(c->cmd, c->touched, err) == VK_NULL_HANDLE)
+      std::fprintf(stderr, "vulkan async submit failed: %s\n", err.c_str());
   }
 };
 
@@ -656,6 +763,16 @@ struct VkrDevice final : DeviceImpl {
 
   CommandEncoder CreateCommandEncoder(const char* label) override {
     auto impl = std::make_shared<VkrEncoder>(st, label);
+    if (impl->cmd == VK_NULL_HANDLE) return {};
+    return CommandEncoder(std::move(impl));
+  }
+
+  bool AsyncComputeAvailable() const override { return st->be->AsyncAvailable(); }
+  void SetAsyncCompute(bool on) override { st->be->SetAsyncEnabled(on); }
+  bool AsyncComputeEnabled() const override { return st->be->AsyncEnabled(); }
+  CommandEncoder CreateAsyncComputeEncoder(const char* label) override {
+    if (!st->be->AsyncEnabled()) return {};
+    auto impl = std::make_shared<VkrEncoder>(st, label, /*asyncQueue=*/true);
     if (impl->cmd == VK_NULL_HANDLE) return {};
     return CommandEncoder(std::move(impl));
   }

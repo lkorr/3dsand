@@ -1386,11 +1386,22 @@ fn wbShaveColumn(wgx : u32, li : vec3<u32>) -> vec4<i32> {
   let g = wbGeom(b);
   let seed = wbSeed(b);
   let wc = wbSlotWorldChunk(slot);
-  let cyLo = wc.y * i32(CHUNK);
-  let cyHi = cyLo + i32(CHUNK) - 1;
-  let y1 = min(level, cyHi);
-  let y0 = max(level - 1, cyLo);
-  if (y1 < y0) { return vec4<i32>(0); }   // this chunk is not in the band
+  // ONE WORKGROUP OWNS THE COLUMN: the chunk layer that holds `level`
+  // (wbColumnLayer, the rule relevel and surface already use). The band is two
+  // cells, [level-1, level], and when level % 16 == 0 those two cells sit in
+  // two chunk layers. Clipping the band to each chunk (what this did until
+  // 2026-10-02) put TWO threads on one column: the upper one could empty the
+  // cell at `level` while the lower one read that same cell as "the cell above
+  // me" to decide whether level-1 is free surface — so whether a draining lake
+  // lost one cell or two on that tick depended on which workgroup ran first, a
+  // scheduling-dependent outcome in hashed state (rule 1; found by the
+  // cross-vendor static audit). The lower cell is read and written through
+  // voxWordAt / voxWordIndex like any other, which resolve across the chunk
+  // boundary; the body's chunk list covers its water down to the floor, so
+  // that chunk is materialized.
+  if (!wbColumnLayer(wc.y, level)) { return vec4<i32>(0); }
+  let y1 = level;
+  let y0 = level - 1;
 
   let x = wc.x * i32(CHUNK) + i32(li.x);
   let z = wc.z * i32(CHUNK) + i32(li.z);

@@ -238,6 +238,10 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
 // ---------------------------------------------------------------------------
 void Recorder::Begin(VkCommandBuffer cmd) {
   cmd_ = cmd;
+  asyncJoin_ = nullptr;
+  asyncJoined_ = false;
+  asyncRecord_ = false;
+  asyncTouched_.clear();
   for (auto& s : state_) s = BufState{};
   extra_.clear();
   pending_.clear();
@@ -307,12 +311,73 @@ void Recorder::TouchBuffer(pass::Buf id, pass::Acc acc, Buffer* explicitBuf) {
   // through the bindings, exactly as before.
   Buffer* buf = explicitBuf ? explicitBuf : bind_.buffers[(int)id];
   if (!buf || !buf->buf) return;  // not bound in this configuration
+  NoteAsync(buf, acc);
   TouchState(state_[(int)id], buf->buf, acc);
+}
+
+// ---------------------------------------------------------------------------
+// ASYNC COMPUTE (rhi_vulkan.h's block; docs/PLAN_async_compute.md). Every
+// buffer touch passes through here BEFORE its barrier is derived, which makes
+// it the one place both halves of the scheme can see every access:
+//
+//   * an ASYNC recording (asyncRecord_) collects (buffer, written?) — the
+//     conflict set its submit hands the backend;
+//   * a MAIN recording made while async work is outstanding (asyncJoin_ set)
+//     asks the backend whether this access races that work, and at the FIRST
+//     one that does, splits the command buffer: everything recorded so far is
+//     the head (submitted without a wait, so it overlaps the async work) and
+//     this access and everything after it goes into the tail, which waits.
+//
+// The barrier state carries straight across the split: a pipeline barrier's
+// scopes are defined by SUBMISSION ORDER on the queue, not by command-buffer
+// boundaries, so a barrier in the tail orders against a write in the head
+// exactly as it would have inside one buffer.
+// ---------------------------------------------------------------------------
+void Recorder::NoteAsync(Buffer* buf, pass::Acc acc) {
+  if (asyncRecord_) {
+    const bool w = Map(acc).write;
+    for (auto& t : asyncTouched_)
+      if (t.buf == buf) {
+        t.write = t.write || w;
+        return;
+      }
+    asyncTouched_.push_back({buf, w});
+    return;
+  }
+  if (asyncJoin_ && !asyncJoined_ && !renderOpen_ && be_.AsyncConflict(buf, Map(acc).write))
+    JoinAsync();
+}
+
+void Recorder::JoinAsync() {
+  if (!asyncJoin_ || asyncJoined_ || renderOpen_) return;
+  VkCommandBuffer tail = asyncJoin_();
+  asyncJoined_ = true;
+  if (tail == VK_NULL_HANDLE) return;  // the encoder could not split: it joins at the head
+  cmd_ = tail;
+  // Binds do not cross command buffers: forget the cached descriptor-set bind
+  // so the next row binds again in the tail.
+  lastBind_ = ComputeBind{};
+  // Not required for correctness (the semaphore wait is a full memory
+  // dependency, and the tracker's barriers carry across), but it costs one
+  // barrier per split and makes the tail stand alone the way every command
+  // buffer's head does (§3.4).
+  VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+  mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+  VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  di.memoryBarrierCount = 1;
+  di.pMemoryBarriers = &mb;
+  be_.Fns().CmdPipelineBarrier2(cmd_, &di);
+  stats_.barrierCalls++;
+  stats_.globalBarriers++;
 }
 
 // §3.3 against a pointer-keyed side state, for buffers with no pass::Buf id.
 void Recorder::TouchExtra(Buffer* buf, pass::Acc acc) {
   if (!buf || !buf->buf) return;
+  NoteAsync(buf, acc);
   for (auto& e : extra_) {
     if (e.first == buf) {
       TouchState(e.second, buf->buf, acc);
@@ -546,7 +611,10 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         VkBufferCopy region{};
         region.srcOffset = r.x;
         region.dstOffset = r.y;
-        region.size = r.z;
+        // z == 0: the rest of the SOURCE from srcOffset (the seam's "size 0 =
+        // rest of the buffer"), for a row whose size is a C++ sizeof the .def
+        // cannot spell (copy_renderUBOTick).
+        region.size = r.z ? r.z : src->size - r.x;
         WarnCopySrc(src);
         f.CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
         if (dst->mapped) hostWritten_.push_back(dst);
@@ -562,6 +630,21 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
     // era — is purely a name here: the --measure timer's span key.
     VkPipeline pipe = bind_.pipelines[(int)r.pipe];
     if (pipe == VK_NULL_HANDLE) continue;
+
+    // ASYNC COMPUTE: decide the join BEFORE the pipeline is bound. A bound
+    // pipeline and descriptor sets are COMMAND-BUFFER state: a split inside
+    // ApplyUses below would leave this row's binds in the head and dispatch
+    // with nothing bound in the tail (found the first time the --perf arms
+    // ran: an access violation inside vkCmdDispatchIndirect).
+    if (asyncJoin_ && !asyncJoined_ && !renderOpen_) {
+      for (int u = 0; u < r.useCount; u++) {
+        Buffer* ub = bind_.buffers[(int)r.uses[u].buf];
+        if (ub && ub->buf && be_.AsyncConflict(ub, Map(r.uses[u].acc).write)) {
+          JoinAsync();
+          break;
+        }
+      }
+    }
 
     // --measure: the timestamp pair spans each run of rows sharing a `group`
     // label, the granularity the phase-0 baseline was measured at.
@@ -1082,6 +1165,11 @@ void Recorder::FlushPendingImages() {
 void Recorder::BeginRendering(const RenderAttachments& att) {
   if (!att.color || att.color->img == VK_NULL_HANDLE || renderOpen_) return;
   lastAtt_ = att;
+  // ASYNC COMPUTE: a draw's storage reads are descriptor reads, not table
+  // uses, so the tracker cannot say what a rendering scope touches. Join any
+  // outstanding async work BEFORE the scope opens (a scope cannot span the
+  // split): the raymarch reads exactly what the async passes write.
+  if (asyncJoin_ && !asyncJoined_ && be_.AsyncOutstanding()) JoinAsync();
 
   // 1. Resolve every buffer hazard BEFORE the rendering scope opens — barriers
   //    are illegal inside it. Sledgehammer mode uses its full barrier instead,

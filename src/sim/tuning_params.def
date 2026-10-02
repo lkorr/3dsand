@@ -2339,6 +2339,11 @@ TP_B(wind, dbgWindField, NO_WGSL, false)
 
 // ==== render: rows no shader reads ====
 TP_B(render, dbgCurrentField, NO_WGSL, false)
+// Async compute (docs/PLAN_async_compute.md): run the tick's render-only derived
+// passes (openness + glow) on the device's async compute queue, beside the next
+// frame's render. A scheduling switch, not a look: the sim's dispatches and
+// inputs are unchanged and the world hash is identical either way.
+TP_B(render, asyncCompute, NO_WGSL, false)
 TP_V3(render, sunDir, NO_WGSL, 0.50f, 0.55f, 0.38f)
 TP_F(render, fogOpticalDepths, NO_WGSL, 4.5f, 0.5f, 20.0f)
 TP_F(render, fogLerpPerFrame, NO_WGSL, 0.08f, 0.005f, 1.0f)

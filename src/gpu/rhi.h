@@ -464,6 +464,11 @@ class Queue {
   void WriteBuffer(const Buffer& b, uint64_t offset, const void* data, size_t size) const;
   void Submit(const CommandBuffer& cmd) const;
   void Submit(uint32_t count, const CommandBuffer* cmds) const;
+  // Submit a command buffer from Device::CreateAsyncComputeEncoder on the ASYNC
+  // COMPUTE queue (docs/PLAN_async_compute.md). It runs after everything this
+  // queue was handed before it; later main-queue work that conflicts with it
+  // waits for it, and work that does not overlaps it.
+  void SubmitAsyncCompute(const CommandBuffer& cmd) const;
 
  private:
   std::shared_ptr<struct QueueImpl> p_;
@@ -502,6 +507,17 @@ class Device {
   RenderPipeline CreateRenderPipeline(const RenderPipelineDesc& d) const;
 
   CommandEncoder CreateCommandEncoder(const char* label = nullptr) const;
+
+  // ---- ASYNC COMPUTE (docs/PLAN_async_compute.md) -----------------------
+  // Whether the device has a second queue the engine can use; the runtime
+  // switch (render.asyncCompute, refused when unavailable); whether it is on.
+  bool AsyncComputeAvailable() const;
+  void SetAsyncCompute(bool on) const;
+  bool AsyncComputeEnabled() const;
+  // An encoder for the async queue, or an empty handle when the switch is off.
+  // Compute rows and tracked copies only: no render pass, no uploads (pending
+  // WriteBuffers stay queued for the next MAIN encoder).
+  CommandEncoder CreateAsyncComputeEncoder(const char* label = nullptr) const;
 
   // Validation-error capture around a block of resource creation, used by the
   // F5 shader hot-reload to keep the old pipelines when the new WGSL is bad.

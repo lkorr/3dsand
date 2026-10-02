@@ -195,6 +195,25 @@ class Simulation {
                   // default and the state of every untouched lake.
                   uint32_t waterSweepSlot = 0xFFFFFFFFu);
 
+  // The tick's RENDER-ONLY derived passes (pass_table.def PT_DERIVED: openness
+  // + glow), recorded with the SAME counts, flags and bind-group page the last
+  // EncodeTick used — so call it before FlipPage. docs/PLAN_async_compute.md.
+  //
+  // WHERE THEY RECORD (audit 2026-10-02): with SetDerivedDeferred(false) — the
+  // default, render.asyncCompute OFF — EncodeTick records them itself, right
+  // after the tick table, which is exactly where they sat as PT_TICK rows
+  // before the async work: the command stream with the switch off is the
+  // pre-async one plus the one 256-byte RenderUBOTick copy. They must NOT move
+  // to the end of the tick in that mode: the MLS-MPM seam's settle writes
+  // voxels after the tick table, and the derived walk would then read voxels
+  // newer than the occupancy it skips empty bricks by (a render-visible change
+  // for a switch that is meant to be scheduling only). With
+  // SetDerivedDeferred(true) EncodeTick leaves them out and SubmitTick calls
+  // EncodeDerived on the async encoder; `asyncQueue` drops the pass timer,
+  // whose query pool belongs to the main queue.
+  void SetDerivedDeferred(bool deferred) { derivedDeferred_ = deferred; }
+  void EncodeDerived(const rhi::CommandEncoder& enc, bool asyncQueue = false);
+
   // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
   //
   // A fully settled world still recorded 54 `DispatchWorkgroupsIndirect` calls
@@ -776,6 +795,12 @@ class Simulation {
   const rhi::ComputePipeline& PassPipeline(pass::Pipe p) const;
 
   PassTimer* passTimer_ = nullptr;  // not owned; measurement harness only
+  // EncodeDerived (async compute): the last EncodeTick's record context, and
+  // "record without the pass timer" while an async encoder is being recorded.
+  pass::RecordCtx lastTickCx_{};
+  bool lastTickCxValid_ = false;
+  bool recordNoTimer_ = false;
+  bool derivedDeferred_ = false;  // SetDerivedDeferred
 
   World* world_ = nullptr;
   rhi::Device device_;
@@ -876,6 +901,8 @@ class Simulation {
   rhi::Buffer draftBuf_, draftMetaBuf_, draftArgsBuf_;
   // The CA's air mask (pass_table.def caMask): 128 words per chunk slot.
   rhi::Buffer caMaskBuf_, caWindBuf_;
+  // pass::Buf::RenderUBOTick (docs/PLAN_async_compute.md).
+  rhi::Buffer renderUBOTickBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;
   bool draftLastOn_ = false;
   int32_t draftOrigin_[3] = {0, 0, 0};

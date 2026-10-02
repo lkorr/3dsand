@@ -46,6 +46,7 @@ namespace {
 #define PT_SHADOWCACHE Table::ShadowCache
 #define PT_SOLEVICT   Table::SolEvict
 #define PT_SOLRESTORE Table::SolRestore
+#define PT_DERIVED    Table::Derived
 
 #define PIPE_NONE            Pipe::None
 #define PIPE_WORLDGEN        Pipe::Worldgen

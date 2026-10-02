@@ -301,6 +301,13 @@ enum class Buf : uint8_t {
   HeatMeta,
   HeatParams,
   HeatArgs,
+  // The RenderParams the tick's derived passes read (sim_openness.wgsl `RT`,
+  // simBGL_ binding 53; docs/PLAN_async_compute.md). A COPY of RenderUBO made
+  // at the end of the tick (copy_renderUBOTick), so the openness rows read
+  // exactly the bytes RenderUBO held there — and the NEXT frame's RenderUBO
+  // upload, which lands while those rows may still be running on the async
+  // queue, writes a different buffer.
+  RenderUBOTick,
   kCount,
 };
 
@@ -647,7 +654,12 @@ enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFi
                              // Per-FRAME, not per-tick: recorded by
                              // EncodeShadowResolve immediately before the
                              // render pass that consumes it.
-                             ShadowCache, SolEvict, SolRestore };
+                             ShadowCache, SolEvict, SolRestore,
+                             // The tick's RENDER-ONLY derived passes (openness +
+                             // glow): recorded by EncodeDerived at the END of the
+                             // tick, into the tick's own command buffer or onto
+                             // the async compute queue (docs/PLAN_async_compute.md).
+                             Derived };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put
