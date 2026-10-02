@@ -1738,6 +1738,27 @@ only on the tick daylight switches, which is the tick `SubmitTick` already
 re-dirties the whole world on for the light-gated rules — so it adds no wake of
 its own and cannot miss a crossing.
 
+**The dawn step keeps the ceiling.** At the switch to day the ambient steps UP
+by `2 x swing` while every stored `X` still holds the night's excess, so
+`T = A + X` would jump past the hottest source in reach (a lava pool's night X
+of 226 plus a desert day of 44 is 270 > its 230) for the ticks the relaxation
+takes to catch up -- long enough for embers (140) to heat-ignite wood (150) at a
+desert or meadow dawn, which the zero-gain tiers exist to forbid. So at dawn
+`heatShift` lowers every kept page's `X` and `X*` by the block's own step
+(clamped at 0): `T` is continuous through the dawn and never passes the
+ceiling. (Dusk needs nothing: the step is down.) `heat-ambient` part E holds it
+beside lava in a desert-pinned room, every tick round a real dawn: ambient + X
+peaks at exactly 230, against 270 without the step (gate run with it disabled:
+"OVER THE CEILING").
+
+**Frozen ground does not soak.** The staining rule's absorption (a liquid
+spending an eighth into absorbent ground) skips ground whose `T < 0`
+(sim_step.wgsl `heatGroundFrozen`). Without it a tundra tarn, born with ice on
+its top cell, drank ~3 cells of depth into its mud bed in its first hundred
+ticks; the air that opened under the lid was a fresh surface, the CA froze it,
+and the lake stacked lids -- 1,538 freezes in a fresh tundra window of the
+default map (`heat-ambient` part D, which now asserts zero).
+
 `X` is the LOCAL EXCESS, one u8 per 2³ block, stored only in chunks within one
 chunk of a heat source. Its target `X*` comes from a separable TENT filter over
 the emitters within `sim.heatRadius` blocks (three axis passes, each one
@@ -1760,34 +1781,57 @@ would make the fixpoint something other than `X == X*` (the sleep test) and let
 a block be pushed past its target (the ceiling).
 
 **Storage** (`heat.h`). `heatPool`: 5,120 pages of 6 KiB (three planes of 512
-words: X / X* / E / n / k, and the tent's x and y partial sums). `heatMeta`:
-per window slot an entry, flags, a summary and the owning world chunk; a want
-bitset; three work lists; the free stack. All zero is an empty layer, which is
+words: X / X* / E / n / k / "a cell here has a thermal transition", and the
+tent's x and y partial sums). `heatMeta`: per window slot an entry, flags, a
+summary (source bit, and the chunk's lowest melt / ignite and highest freeze
+threshold: its TRIGGERS) and the owning world chunk; a want bitset; the PEND
+bitset; three work lists; the free stack; a diagnostic firing log (the first 8
+transitions since a reset, by cell -- a report, never read by the sim). All zero is an empty layer, which is
 what the worldgen and load-reset fill rows leave. `heatParams` (CPU-written):
 mode, radius, gain, snowline, the probe cell, per-biome climates,
 per-material transitions, the column table. 30 MiB + 1 MiB + 0.4 MiB.
 
 **The rows** (`pass_table.def`, all `C_CAACTIVE`: a settled world records none):
-`heatBegin` (counts, day flip, shift args) and `heatShift` (release every page
-whose owner left the window, ZERO groups unless the origin moved) before the CA;
+`heatBegin` (counts, day flip, shift and pend args, the F1 probe), `heatShift`
+(release every page whose owner left the window and queue the kept EDGE for a
+target recompute -- the chunks past it now read cold, and a target built from
+them would outlive them; at dawn, the step above; ZERO groups otherwise) and
+`heatPend` (last tick's still-relaxing chunks back onto the relax list) before
+the CA;
 after it `heatWant` (per dirty chunk: list paged chunks; an emitting chunk —
 `caMask` raised its flag, or its last scan found a source — wants pages for its
 3x3x3), `heatAlloc` (ONE workgroup ranks the wanted slots in SLOT ORDER by a
 prefix sum: exhaustion is a deterministic, counted refusal, never a crash),
 `heatSrc` (re-read a listed chunk's voxels into E / n / k; a change queues its
 3x3x3 for a target recompute, a day flip queues itself), `heatTent` (three
-dispatches, x / y / z), `heatRelax` (step X, mark the chunk dirty while it
-moves, free an all-zero page with no source in its 3x3x3); `heatArgs` turns the
-list counts into indirect records four times a tick. Every pass writes only its
+dispatches, x / y / z), `heatRelax` (step X; wake the CA or pend the chunk, below;
+free an all-zero page with no source in its 3x3x3); `heatArgs` turns the list
+counts into indirect records four times a tick. Every pass writes only its
 own chunk's page and reads neighbours' output of the previous dispatch; atomics
 only on flags (set semantics), list cursors, counters and the free stack (which
-PAGE a slot gets is unobservable: pages are zero when handed out).
+PAGE a slot gets is unobservable: a page is zero when handed out but for plane
+0's top nibble, which `heatSrc` rewrites before anything reads it).
 
-**The dirty bound.** `heatRelax` marks a moving chunk dirty ONLY if a chunk of
-its 3x3x3 is dirty this tick, so every heat mark lies in the one-ring of
-`dirtyIn` — the CPU page-table mirror's bound (§3 paged residency, PLAN_page_table
-§3.2). A chunk refused the mark keeps its X until something wakes it: a lag,
-never a missing page.
+**Waking the CA, and the pend list (2026-10-02 audit).** A moving field
+matters to the CA only where it can change a cell. `heatRelax` marks a chunk
+dirty (`DIRTY_R_HEAT`) only when some block holding a transition-bearing cell
+has a temperature range `[T, T*]` that reaches the chunk's melt / ignite
+trigger or its freeze trigger. Every other moving chunk -- the halo of air,
+stone and smoke round a fire, foliage warming to 60 beside flames that cannot
+light it -- sets its bit in the PEND bitset instead, and next tick `heatPend`
+puts it back on the relax list: the field keeps walking to its target without
+the CA running over the chunk, and a stored X never stops short of what made
+it. Before this, every moving chunk was kept awake for the CA: measured on
+`--perf village-fire` (same boot state, back to back), the CA's four rows
+30.1 -> 28.7 ms/frame and mean awake chunks 4,086 -> 3,876 (main without heat:
+3,868); `heatSys` unchanged at 2.3 ms.
+
+**The dirty bound.** A mark is allowed only if a chunk of its 3x3x3 is dirty
+this tick, so every heat mark lies in the one-ring of `dirtyIn` — the CPU
+page-table mirror's bound (§3 paged residency, PLAN_page_table §3.2). A chunk
+that needs the CA but may not mark stays PENDING -- its field still walks --
+and the CA sees it the next time anything wakes the neighbourhood: a lag in a
+transition, never a missing page and never a frozen stale excess.
 
 **Transitions** (sim_step.wgsl `heatReact`, after the material's reaction
 bucket, not on excited fluid, not in a ticket): melt and ignite fire when
@@ -1796,14 +1840,20 @@ at `full`, rolled off `hash3(rnd ^ salt, k, slot)`. FRONTIER: a melt or freeze
 needs a face of something else (a bank melts from its surface in), an ignition
 an AIR face (a buried log does not catch), more such faces faster. SURFACE
 (freeze): only with air directly above, so ice is at most ONE cell thick per
-water column — a lake skins over, never freezes solid. A transition that can
+water column — a lake skins over, never freezes solid — for as long as the
+water under the lid stays put. Water drained out from under a lid (a dug
+outlet, a breach) leaves an air pocket whose new surface skins over too, one
+more cell per drop: bounded by the water that left. (The worldgen case of that,
+a fresh tarn soaking into its bed, is what frozen ground not soaking closes.)
+A transition that can
 fire holds its chunk awake (it consumes its input: the finite-process
 exception); one that cannot holds nothing. The write is `reactWriteSelf`, so
 mass carries exactly (3/8 snow -> 3/8 water; full water -> ice; partial water
 -> snow by its eighths), support-loss flags and solute follow. No heat kernel
 writes a voxel. The four dropped sun-melt / night-freeze rules in
-reactions.json are DELETED; the climate replaces them. The `weather.iceMelts` /
-`waterFreezes` switches are now read by nothing.
+reactions.json are DELETED; the climate replaces them, and so are the
+`weather.iceMelts` / `waterFreezes` switches that gated them (the `requires`
+mechanism stays, with no switch defined).
 
 **Shipped tiers** (materials.json): emit lava / molten iron 230, molten glass /
 salt 200, oil_burning 150, ember 140, burning leaves / cloth / flesh / hair 130,
@@ -1817,9 +1867,14 @@ cells off. Raising or lowering any tier is a data edit; `heat-bound` is what
 says whether it stays bounded.
 
 **Climate checks** (biomes.cpp, REFUSED at load, and the `heat-ambient` gate
-re-checks them): no biome's day/night range straddles a freeze point (frozen
-day AND night, or never); no day reaches the lowest ignition point; no day
-melts anything the biome generates (skin, cover, water-preset materials). A
+re-checks them -- part B builds a straddling, an igniting and a self-melting
+tundra in-process and asserts each is refused): no biome's day/night range
+straddles a freeze point (frozen day AND night, or never); no day reaches the
+lowest ignition point; no day melts anything the biome generates (skin, cover,
+water-preset materials). The snow caps are the snowline climate's, kept below
+0 by day by LoadTuning. Part D loads the DEFAULT map, centres the window on its
+densest tundra and asserts a fresh day fires no transition at all (the harness
+window holds no frozen climate). A
 frozen biome sets `kBF_Frozen` and worldgen lays ice on the top cell of every
 water column there (and at or above the snowline): frozen water is born
 frozen, so no cold lake freezes over on its first tick. Shipped: tundra -24±12
@@ -1834,18 +1889,24 @@ saves and loads lava beside wood and asserts the wood still catches within the
 same bound. Ticket chunks carry no heat. The heat gates run each fixture twice
 and compare a slot-keyed hash of the pool as well as the voxels.
 
-**Cost** (measured 2026-10-02, `--perf`, same machine, main 6c55214 as the
-before arm): `heatSys` 0.76 ms/frame in forestfire (pool peak 1,704 pages),
-1.12 ms in village-fire (2,278 pages, 16 heat ignitions); the CA loop within
-noise in forestfire, +0.76 ms in village-fire (heat keeps the one-chunk halo
-of relaxing blocks awake: 3,770 vs 3,603 awake chunks). An active world with
-nothing hot: one `heatWant` group per dirty chunk returning after two loads
-(`heat-idle`). The next lever, if wanted: recompute a chunk's targets at most
-every Nth tick (the relaxation hides it).
+**Cost** (re-measured by the 2026-10-02 audit, `--perf village-fire`,
+`SANDVOX_RUN_EXCLUSIVE=1`, before/after back to back): `heatSys` 2.3 ms/frame
+(heatTent 1.53, heatSrc 0.50, heatRelax 0.12, heatPend 0.05; pool peak 2,290
+pages) -- the build's own 1.12 ms figure did not reproduce, and a first boot
+read 3.9 (heatSrc 2.1: boot noise). The CA no longer pays for the halo (above).
+An active world with nothing hot: one `heatWant` group per dirty chunk
+returning after two loads (`heat-idle`). The levers left, in size order:
+`heatTent` (recompute a chunk's targets at most every Nth tick, slot-phased --
+the relaxation hides it) and `heatSrc` (fold its per-block E / n / k scan into
+`caMask`, which already reads every cell of every dirty chunk).
 
-**F1 -> Temperature**: the ambient at your feet (biome, base, the day/night
-term), the local target and actual excess, the block's sources, pool use and
-the firing counters. last_run.json `heat`: pool peak, refusals, firings.
+**F1 -> Temperature**: the ambient at your feet (biome by ID, base, the
+day/night term), the target T* and actual T (and their excess over the
+ambient), the block's sources, pool use and the firing counters. The probe is
+written by `heatBegin` every CA-active tick, tagged with the block it read, so
+the readout follows you out of a warm chunk and says so when the world under
+you is asleep (`heat-ignite` asserts the word names its block and matches the
+pool). last_run.json `heat`: pool peak, refusals, firings.
 
 ### Day/night, and sunlight as a sim input (2026-08-20)
 

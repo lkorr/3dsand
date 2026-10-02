@@ -8,6 +8,36 @@ a day/night swing, and FREEZING in scope (surface-limited, rate-bounded, with a
 load-time validation that no biome straddles the freeze point and worldgen that
 pre-ices permanently frozen water).
 
+## AUDIT (2026-10-02, after the build) -- what it found and changed
+
+DESIGN.md §4 "Heat" carries each of these as shipped.
+
+- **The ceiling broke at dawn (fixed).** X is an excess over the ambient and
+  survived the dawn's ambient step: T read day ambient + night X for the ticks
+  the relaxation took (lava's neighbour: 44 + 226 = 270 > 230; embers could
+  heat-ignite wood at a desert or meadow dawn). heatShift now lowers every kept
+  page's X and X* by the block's step at dawn. `heat-ambient` part E asserts it
+  every tick round a real dawn (and fails with the step disabled).
+- **Tundra lakes stacked ice lids (fixed).** A fresh tarn soaked ~3 cells into
+  its mud bed under its worldgen ice; each new surface froze: 1,538 freezes in
+  a fresh default-map tundra window (the harness has no frozen climate, so no
+  gate looked). Absorption now skips ground below 0 (frozen ground does not
+  soak). `heat-ambient` part D asserts zero firings there.
+- **The halo (fixed).** heatRelax woke the CA over EVERY moving chunk. It now
+  wakes it only where a transition-bearing block's [T, T*] reaches the chunk's
+  trigger; every other moving chunk relaxes on a PEND list without the CA. The
+  limitation "a chunk refused the mark keeps its X" is gone with it: the field
+  always reaches its target. Village fire: CA 30.1 -> 28.7 ms, awake 4,086 ->
+  3,876 (no-heat main: 3,868).
+- **Window edge (fixed).** After a shift the kept edge chunks are re-targeted,
+  so a target cannot outlive sources that left the window.
+- **F1 (fixed).** The probe was written only when the player's chunk relaxed,
+  so it froze on the last warm reading; it is now heatBegin's, tagged with its
+  block. The biome name was looked up by palette slot with a biome ID.
+- **Dead switches removed** (`weather.iceMelts` / `waterFreezes`).
+- **Instruments**: the heatMeta firing log (first 8 transitions by cell) and
+  the check_invariants DIRTY_R_HEAT check.
+
 ## IMPLEMENTED (2026-10-02) -- what changed from revision 3 below
 
 The orchestrator approved revision 3 with these decisions, and the build
