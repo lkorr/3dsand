@@ -38,6 +38,46 @@ DESIGN.md §4 "Heat" carries each of these as shipped.
 - **Instruments**: the heatMeta firing log (first 8 transitions by cell) and
   the check_invariants DIRTY_R_HEAT check.
 
+## HEAT RISES (2026-10-02, after the audit) -- directional falloff
+
+Owner: "a campfire must NOT scorch a bush beside it, but SHOULD ignite a bush
+directly above it." The isotropic tent could not: flames emitted 110 against
+foliage's 135, and with the ceiling no source lifts anything past itself.
+
+- **Flames emit 140** (materials.json `fire`; ether_burning stays 110). Still
+  under wood's 150, so flames never heat-ignite wood.
+- **Direction gains**, one factor per axis on the tent weight (sim_heat.wgsl
+  heatTent): y gives `sim.heatUpGain` to a source below the block,
+  `sim.heatDownGain` to one above, 1 level; x and z give `sim.heatSideGain`
+  off the block's column, 1 on it. Diagonals are products. Chosen over a
+  dominant-axis classification (a cone edge at 45 degrees) and over a true
+  angular blend (not separable: 13^3 taps a block). The gain weights the sum
+  and the coverage alike: the ceiling is untouched.
+- **Defaults: up 20, side 0.5, down 0.25.** The owner proposed 2 / 0.5 / 0.25;
+  2 cannot work. A 4x4x4 flame covers ~2% of a block's 13-block surroundings
+  (G x sf = 0.13 directly over it), so saturating the block 3-4 cells above
+  takes ~8x before any margin; 20 gives 1.22 there, 0.82 for the block 1-2
+  above and 2 cells beside (T 116), 0.47 for the bush 2 cells to the side at
+  flame height (T 63-71). 24 would light that diagonal (T 138).
+- **Passes reordered x, z, y** so the large up gain lands in the last pass
+  (u32 registers) and the 16-bit planes only ever carry side <= 1 sums; the
+  final mean is floored exactly from the raw sums (three-step division).
+- **Knobs** are TP_F NO_WGSL rows converted to x16 fixed point in PrepareHeat
+  (no prelude miss). Ranges: up 0..32, side 0..1, down 0..4.
+- **What moved.** heat-ignite: wood across the gap from lava still lights (tick
+  21) -- through its upper blocks; the bottom block, level with the pool's
+  floor, now reads ~40 (the probe takes the post's hottest block). heat-ambient
+  part E's probe moved to the lava's top row (the bottom row read night X 32:
+  no teeth). heat-bound: unchanged (0 heat ignitions, ratios 1.00).
+- **Gate `heat-plume`** (TickCursor; thresholds `heat.plume*`): above 3-4 cells
+  lights at tick 150 (max 300), peaks 140; side 2 cells peaks 63, below 2
+  cells 12, both never light over 900 ticks; burning leaves with foliage above
+  peak 132 (their burn rule turns a little of the chamber to flame each tick)
+  and never light it; the firing log names only the plate above.
+- **Open**: `--sweep sim.heatUpGain=...` reports identical hashes -- the sweep
+  scenario has no thermal transition in its 100 ticks and the heat pool is not
+  hashed; reach is proven by tuning-reach (load) and heat-plume (kernel).
+
 ## IMPLEMENTED (2026-10-02) -- what changed from revision 3 below
 
 The orchestrator approved revision 3 with these decisions, and the build

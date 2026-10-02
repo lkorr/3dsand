@@ -155,6 +155,12 @@ constexpr uint32_t kHpSnowSwing = 4;   // i32
 constexpr uint32_t kHpProbe = 5;       // 5..7 probe cell (i32), 8 = probe on
 constexpr uint32_t kHpProbeOn = 8;
 constexpr uint32_t kHpGain = 9;        // sim.heatGain: coverage saturates at 1/G
+// HEAT RISES: sim.heatUpGain / heatSideGain / heatDownGain in x16 fixed point
+// (kHeatGainOne = 1.0), the per-axis direction factors of heatTent.
+constexpr uint32_t kHpUpGain = 10;
+constexpr uint32_t kHpSideGain = 11;
+constexpr uint32_t kHpDownGain = 12;
+constexpr uint32_t kHeatGainOne = 16;
 constexpr uint32_t kHeatBiomesMax = 64;
 constexpr uint32_t kHpBiome = kHpHdrWords;                     // base, swing (i32) per biome
 constexpr uint32_t kHpMat = kHpBiome + 2 * kHeatBiomesMax;     // 8 words per material

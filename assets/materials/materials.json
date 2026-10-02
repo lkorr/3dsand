@@ -198,7 +198,7 @@
     },
     {
       "id": "fire",
-      "thermal": {"emit": 110},
+      "thermal": {"emit": 140},
       "arcane": 3,
       "class": "gas",
       "density": 3,

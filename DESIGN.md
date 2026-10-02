@@ -1773,7 +1773,35 @@ exceed the hottest source in reach (the ceiling, by construction), several
 sources add until the coverage saturates, and beyond R blocks a source adds
 exactly nothing (the radius, by construction). The gain is what lets a lava
 pool's face heat the blocks beside it to the lava's own temperature while one
-burning voxel only warms its neighbour by a fifth of the difference. `X` walks
+burning voxel only warms its neighbour by a fifth of the difference.
+
+**Heat rises** (2026-10-02, owner: "a campfire must not scorch the bush beside
+it, but should ignite a bush directly above it"). Each source's tent weight is
+scaled by a DIRECTION gain, one factor per axis: the y pass gives
+`sim.heatUpGain` (20) to a source BELOW the block, `sim.heatDownGain` (0.25) to
+one above and 1 to one level with it; the x and z passes each give
+`sim.heatSideGain` (0.5) to a source off the block's own column and 1 on it.
+Straight up is the up gain, straight across the side gain, a diagonal the
+product. A product of per-axis factors needs no "which direction dominates"
+test, so the field has no cone edge -- the gain changes only where an axis
+offset leaves zero, the lattice the tent already steps on -- and it keeps the
+filter separable (a true angular blend would be a 13^3-tap gather per block).
+The gain weights `sE` and `sf` alike, so it moves how close a block gets to the
+mean source temperature, never the mean: the ceiling holds at any gain. Up is
+large because a campfire is small: a 4x4x4 flame fills ~2% of a block's
+13-block surroundings, so the block 3-4 cells over it needs ~20x to saturate
+(gate `heat-plume`: 140, it lights at tick 150), while the bush 2 cells to its
+side reads 63 and the ground 2 cells under it 12. The cost is that a broad
+source's LOWER neighbours cool: wood beside a lava pool's bottom row (every
+lava block level with it or above) now reads ~40, not 230 -- the post still
+catches through its upper blocks, which have lava below them (`heat-ignite`
+lights at tick 21, as before), and `heat-ambient` part E probes the lava's top
+row. The passes run x, z, Y LAST: with side <= 1 the x / z sums stay inside the
+16-bit planes, and the y pass's (up to 32x) never leave registers; its mean is
+floored exactly from the raw sums. The gains are floats converted to x16 fixed
+point on the CPU (`PrepareHeat`, `std::lround`), NO_WGSL like every heat knob.
+
+`X` walks
 to `X*` by `max(1, |X* - X| >> k)` per tick, `k` the block's slowest
 `thermal.inertia` (water 5, liquids 4, solids and powders 3, gas and air 1):
 gradual, exact at the end, never past the target. No neighbour exchange: that
@@ -1782,7 +1810,7 @@ a block be pushed past its target (the ceiling).
 
 **Storage** (`heat.h`). `heatPool`: 5,120 pages of 6 KiB (three planes of 512
 words: X / X* / E / n / k / "a cell here has a thermal transition", and the
-tent's x and y partial sums). `heatMeta`: per window slot an entry, flags, a
+tent's x and z partial sums). `heatMeta`: per window slot an entry, flags, a
 summary (source bit, and the chunk's lowest melt / ignite and highest freeze
 threshold: its TRIGGERS) and the owning world chunk; a want bitset; the PEND
 bitset; three work lists; the free stack; a diagnostic firing log (the first 8
@@ -1804,7 +1832,7 @@ after it `heatWant` (per dirty chunk: list paged chunks; an emitting chunk —
 prefix sum: exhaustion is a deterministic, counted refusal, never a crash),
 `heatSrc` (re-read a listed chunk's voxels into E / n / k; a change queues its
 3x3x3 for a target recompute, a day flip queues itself), `heatTent` (three
-dispatches, x / y / z), `heatRelax` (step X; wake the CA or pend the chunk, below;
+dispatches, x / z / y), `heatRelax` (step X; wake the CA or pend the chunk, below;
 free an all-zero page with no source in its 3x3x3); `heatArgs` turns the list
 counts into indirect records four times a tick. Every pass writes only its
 own chunk's page and reads neighbours' output of the previous dispatch; atomics
@@ -1856,14 +1884,19 @@ reactions.json are DELETED; the climate replaces them, and so are the
 mechanism stays, with no switch defined).
 
 **Shipped tiers** (materials.json): emit lava / molten iron 230, molten glass /
-salt 200, oil_burning 150, ember 140, burning leaves / cloth / flesh / hair 130,
-fire / ether_burning 110. Melt: snow above 0, ice above 4. Freeze: water below
+salt 200, oil_burning 150, fire / ember 140, burning leaves / cloth / flesh /
+hair 130, ether_burning 110 (fire was 110 until "heat rises"). Melt: snow above 0, ice above 4. Freeze: water below
 0 (full -> ice, partial -> snow). Ignite: oil above 100, foliage / grass / plants
 / thatch / straw / dust above 135, cloth / linen above 135, wood / bark / plank
-/ timber / charcoal above 150. So flames cannot heat-ignite anything but oil,
-burning foliage cannot heat-ignite foliage and embers cannot heat-ignite wood
-(zero gain where a chain must not form); lava and molten metal light wood a few
-cells off. Raising or lowering any tier is a data edit; `heat-bound` is what
+/ timber / charcoal above 150. So flames and embers can heat-ignite foliage
+and cloth only where the plume puts them (above, within a few cells -- never
+beside or below), burning foliage cannot heat-ignite foliage and neither flames
+nor embers can heat-ignite wood (zero gain where a chain must not form); lava
+and molten metal light wood a few cells off. Flames are the one way round the
+foliage tier: a burning bush's OWN flames (140) can lift foliage above them
+past 135 where flame dominates the coverage -- bounded by `heat-bound` (the
+grove burns identically heat off and on, 0 heat ignitions) and by the rate at
+5 over the threshold (~1 per-mille a cell a tick). Raising or lowering any tier is a data edit; `heat-bound` is what
 says whether it stays bounded.
 
 **Climate checks** (biomes.cpp, REFUSED at load, and the `heat-ambient` gate

@@ -2450,6 +2450,13 @@ struct Tuning {
     // How strongly coverage counts: a block's sources reach their own
     // temperature once they fill 1/heatGain of its surroundings.
     int heatGain = TPD(sim, heatGain);
+    // HEAT RISES: a source's contribution scaled by direction, one factor per
+    // axis -- up when the source is below the block, down when it is above,
+    // side off the block's column (a diagonal is the product). Never lifts a
+    // block past the hottest source in reach. x16 fixed point in the kernel.
+    float heatUpGain = TPD(sim, heatUpGain);
+    float heatSideGain = TPD(sim, heatSideGain);
+    float heatDownGain = TPD(sim, heatDownGain);
     // The climate above the snowline (the map's treeline - 1), in heat units
     // where 0 is water's freezing point: base +- swing by day / night. Kept
     // below 0 by day (LoadTuning) so the snow caps never melt by themselves.

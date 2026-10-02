@@ -3003,6 +3003,14 @@ void Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   hdr[kHpProbe + 2] = (uint32_t)heatProbe_[2];
   hdr[kHpProbeOn] = heatProbeOn_ ? 1u : 0u;
   hdr[kHpGain] = (uint32_t)std::clamp(tn.sim.heatGain, 1, 64);
+  // The direction gains, x16 (the row clamps: up 0..32, side 0..1, down
+  // 0..4 -- side <= 1 is what keeps heatTent's x / z partial sums in 16 bits).
+  auto fx16 = [](float g, float hi) {
+    return (uint32_t)std::lround(std::clamp(g, 0.0f, hi) * (float)kHeatGainOne);
+  };
+  hdr[kHpUpGain] = fx16(tn.sim.heatUpGain, 32.0f);
+  hdr[kHpSideGain] = fx16(tn.sim.heatSideGain, 1.0f);
+  hdr[kHpDownGain] = fx16(tn.sim.heatDownGain, 4.0f);
   queue.WriteBuffer(heatParamsBuf_, 0, hdr, sizeof(hdr));
   uint32_t bio[2 * kHeatBiomesMax];
   uint64_t key = 1469598103934665603ull ^ seed;

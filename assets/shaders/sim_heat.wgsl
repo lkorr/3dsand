@@ -24,7 +24,7 @@
 //               sum), so who gets a page under exhaustion is deterministic
 //   heatSrc     per source-list chunk: re-read the voxels into E / n / k;
 //               a change queues a target recompute over N27
-//   heatTent    3 dispatches (x, y, z): the separable tent filter -- the
+//   heatTent    3 dispatches (x, z, y): the separable tent filter -- the
 //               coverage-weighted mean of emitters within R blocks -> X*
 //   heatRelax   per relax-list chunk: X steps toward X* (inertia k); wakes
 //               the CA only where the walk can change a cell, else pends the
@@ -176,6 +176,10 @@ const HP_RADIUS : u32 = 1u;
 const HP_PROBE : u32 = 5u;
 const HP_PROBE_ON : u32 = 8u;
 const HP_GAIN : u32 = 9u;
+const HP_UP_GAIN : u32 = 10u;
+const HP_SIDE_GAIN : u32 = 11u;
+const HP_DOWN_GAIN : u32 = 12u;
+const HEAT_GAIN_ONE : u32 = 16u;
 const HEAT_ARG_ALLOC : u32 = 0u;
 const HEAT_ARG_SRC : u32 = 1u;
 const HEAT_ARG_RECOMP : u32 = 2u;
@@ -604,16 +608,16 @@ fn heatSrc(@builtin(workgroup_id) wg : vec3<u32>,
 }
 
 // ============================================================================
-// heatTent: one group per recompute-list chunk, THREE dispatches (axis =
-// colorPhase.x: 0 x, 1 y, 2 z) with the recorder's barrier between them -- a
-// pass reads its NEIGHBOURS' output of the previous pass, so two axes can never
-// share a dispatch.
+// heatTent: one group per recompute-list chunk, THREE dispatches (pass =
+// colorPhase.x: 0, 1, 2 filter along x, z, y -- Y LAST, see "heat rises")
+// with the recorder's barrier between them -- a pass reads its NEIGHBOURS'
+// output of the previous pass, so two axes can never share a dispatch.
 //
 // The filter is a separable TENT of half-width R blocks, weights R+1-|d|,
 // normalised to 1 per axis: per block it carries the COVERAGE-WEIGHTED
 // emitter sum sE (each emitting cell counts E x 1/8 of its block) and the
 // coverage sf (1/8 per emitting cell), so after three passes
-//   sE = sum over sources of w * E * n/8,   sf = sum of w * n/8,   sum(w) = 1.
+//   sE = sum over sources of w * g * E * n/8,   sf = sum of w * g * n/8.
 // sE / sf is the coverage-weighted MEAN temperature of the emitters in reach;
 // sf is how much of the surroundings they fill. The target mixes that mean
 // with the ambient by an effective coverage that saturates:
@@ -628,21 +632,44 @@ fn heatSrc(@builtin(workgroup_id) wg : vec3<u32>,
 // single burning block barely warms the next one: a lone block covers ~2% of
 // its neighbour's surroundings, a pool's face ~15-40%.
 //
-// Plane 0 (x input) holds E and n; planes 1 and 2 hold the x and y passes'
-// sE (x64, bits 0..15) and sf (x4096, bits 16..31). A neighbour chunk outside
-// the window or without a page reads as zero, which is exact: every chunk
-// within reach of a source is paged (heatWant), so an unpaged chunk carries
-// no source and no partial sum.
+// HEAT RISES (2026-10-02, owner: "a campfire must not scorch the bush beside
+// it, but should ignite one directly above it"). g is a DIRECTION gain, one
+// factor per axis: the y pass gives sim.heatUpGain to a source BELOW the
+// block, sim.heatDownGain to one above and 1 to one level with it; the x and
+// z passes each give sim.heatSideGain to a source off the block's own column
+// and 1 on it. Straight up is the up gain, straight across the side gain, a
+// diagonal the product (up-and-across = up x side). A product of per-axis
+// factors has no classification boundary -- no "which direction dominates"
+// test, so no cone edge in the field: the gain changes only where an axis
+// offset leaves zero, which is the lattice the tent itself steps on. The gain
+// weights the coverage AND the emitter sum alike, so it moves how close a
+// block gets to the mean source temperature, never the mean: the ceiling
+// holds at any gain. Y runs LAST because the up gain is large (a campfire
+// fills ~2% of a block's surroundings, so reaching the flame's temperature
+// three cells above it takes ~20x): the x and z passes, with side <= 1, stay
+// inside the 16-bit planes, and the y pass's sums never leave registers.
+//
+// Plane 0 (the first pass's input) holds E and n; planes 1 and 2 hold the x
+// and z passes' sE (x64, bits 0..15) and sf (x4096, bits 16..31). A
+// neighbour chunk outside the window or without a page reads as zero, which
+// is exact: every chunk within reach of a source is paged (heatWant), so an
+// unpaged chunk carries no source and no partial sum.
 @compute @workgroup_size(128)
 fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
             @builtin(local_invocation_index) li : u32) {
   let slot = atomicLoad(&heatMeta[HM_RECOMP_LIST + wg.x]);
-  let axis = P.colorPhase.x;
+  let tpass = P.colorPhase.x;
+  // Pass 0 -> x, 1 -> z, 2 -> y.
+  let axis = select(select(1u, 2u, tpass == 1u), 0u, tpass == 0u);
   let e = heatEntry(slot);
   let base = heatPageBase(e);
   let wc = slotWorldChunk(slot, T.origin);
   let R = heatRadius();
-  let norm = u32((R + 1) * (R + 1));
+  // Every tap's weight is (R+1-|d|) x a gain in HEAT_GAIN_ONE units.
+  let norm = u32((R + 1) * (R + 1)) * HEAT_GAIN_ONE;
+  let gSide = min(heatParams[HP_SIDE_GAIN], HEAT_GAIN_ONE);
+  let gUp = min(heatParams[HP_UP_GAIN], 32u * HEAT_GAIN_ONE);
+  let gDown = min(heatParams[HP_DOWN_GAIN], 32u * HEAT_GAIN_ONE);
   var dir = vec3<i32>(0);
   dir[axis] = 1;
   // The two neighbour pages along this axis (-1, +1).
@@ -652,7 +679,7 @@ fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
   var ep = 0u;
   if (qm != SLOT_NONE) { em = heatEntry(qm); }
   if (qp != SLOT_NONE) { ep = heatEntry(qp); }
-  let inPlane = axis * HEAT_BLOCKS;
+  let inPlane = tpass * HEAT_BLOCKS;
   for (var i = 0u; i < 4u; i++) {
     let b = li * 4u + i;
     let bp = vec3<i32>(i32(b & 7u), i32((b >> 3u) & 7u), i32(b >> 6u));
@@ -667,8 +694,14 @@ fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
       let ql = q - dir * (select(0, -8, s < 0) + select(0, 8, s > 7));
       let qb = u32((ql.z * 8 + ql.y) * 8 + ql.x);
       let w = heatPool[heatPageBase(pe) + inPlane + qb];
-      let wt = u32(R + 1 - abs(d));
-      if (axis == 0u) {
+      // The direction gain of a source at offset d (source - block) on this
+      // axis: d < 0 on y is a source BELOW the block (heat rises to it).
+      var g = HEAT_GAIN_ONE;
+      if (d != 0) {
+        if (axis != 1u) { g = gSide; } else { g = select(gDown, gUp, d < 0); }
+      }
+      let wt = u32(R + 1 - abs(d)) * g;
+      if (tpass == 0u) {
         let ee = (w >> 16u) & 0xFFu;
         let nn = (w >> 24u) & 0xFu;
         sE += wt * ee * nn * (HEAT_SE_ONE / 8u);
@@ -678,26 +711,34 @@ fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
         sF += wt * (w >> 16u);
       }
     }
-    sE = min(sE / norm, 0xFFFFu);
-    sF = min(sF / norm, HEAT_SF_ONE);
-    if (axis < 2u) {
-      heatPool[base + (axis + 1u) * HEAT_BLOCKS + b] = sE | (sF << 16u);
+    if (tpass < 2u) {
+      // Side <= 1, so neither sum can tpass its 16 bits (a full surround is
+      // sE 255 x 64, sf 4096); the min is a guard, never a clamp.
+      let oE = min(sE / norm, 0xFFFFu);
+      let oF = min(sF / norm, 0xFFFFu);
+      heatPool[base + (tpass + 1u) * HEAT_BLOCKS + b] = oE | (oF << 16u);
     } else {
-      // X* = min(1, G sf) x (mean E - A), clamped to 0..255. sE is x64 and sF
-      // x4096, so sE * 64 / sF is the mean emitter temperature.
+      // X* = min(1, G sf) x (mean E - A), clamped to 0..255. The mean is
+      // 64 sE / sF on the RAW sums (the gains and the norm cancel), floored
+      // exactly in three steps so no product leaves u32 (sF < 2^28 at
+      // R 8 and up 32): a floor of a weighted mean of integers never exceeds
+      // the largest of them.
       let c = wc * i32(CHUNK) + bp * 2;
       let a = heatAmbient(c);
       var xs = 0;
       if (sF != 0u) {
-        let gap = (i32(sE) * i32(HEAT_SF_ONE / HEAT_SE_ONE)) / i32(sF) - a;
-        let eff = i32(min(sF * clamp(heatParams[HP_GAIN], 1u, 64u), HEAT_SF_ONE));
+        let r1 = sE % sF;
+        let r2 = (r1 * 8u) % sF;
+        let mean = (sE / sF) * 64u + ((r1 * 8u) / sF) * 8u + (r2 * 8u) / sF;
+        let gap = i32(mean) - a;
+        let eff = i32(min((sF / norm) * clamp(heatParams[HP_GAIN], 1u, 64u), HEAT_SF_ONE));
         xs = clamp(gap * eff / i32(HEAT_SF_ONE), 0, 255);
       }
       let old = heatPool[base + b];
       heatPool[base + b] = (old & 0xFFFF00FFu) | (u32(xs) << 8u);
     }
   }
-  if (axis == 2u && li == 0u) {
+  if (tpass == 2u && li == 0u) {
     heatListAdd(slot, HF_RELAX, HM_RELAX_COUNT, HM_RELAX_LIST);
   }
 }

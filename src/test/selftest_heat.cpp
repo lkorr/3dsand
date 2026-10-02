@@ -19,6 +19,9 @@
 //                 world settles after each boundary; bad climates are refused;
 //                 a fresh world fires nothing thermal on its first ticks.
 //   heat-idle     an active world with nothing hot: the layer does nothing.
+//   heat-plume    heat rises: a campfire lights foliage above it, never the
+//                 foliage beside or below it, and burning foliage never heats
+//                 foliage alight (ticked on THE tick: TickCursor).
 //
 // Every fixture is a SEALED STONE ROOM (floor, walls, roof): no sky, so no
 // sun rule touches it, and its climate is PINNED (Simulation::
@@ -52,6 +55,7 @@
 #include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -516,7 +520,12 @@ IgniteResult RunIgnite(Ctx& c, int kTicks) {
     Tick(c, t);
     if (i % 10 == 0) {
       hv.Read(ctx, world, true);
-      tMax = std::max(tMax, (int)hv.X(106, 121, 106) + 10);
+      // The post's HOTTEST block. Since heat rises (sim.heatUpGain), the
+      // post's bottom block -- level with the lava's floor, every lava
+      // block level with it or above -- reads far cooler than its top,
+      // which has lava below it: the claim is that the post catches.
+      for (int y = kIgWood.y0; y <= kIgWood.y1; y += 2)
+        tMax = std::max(tMax, (int)hv.X(106, y, 106) + 10);
       tEmberMax = std::max(tEmberMax, (int)hv.X(138, 121, 114) + 10);
       if (r.lightTick == 0) {
         v.Read(ctx, world, kIgRoom);
@@ -1121,10 +1130,13 @@ Status GateHeatAmbient(Ctx& c, std::string& detail) {
   // (E): its own sealed room south of the east half, inside the east pin.
   // 26 cells (13 blocks) deep in z round the probe, so the tent covers the
   // probe block's whole reach along z and its coverage saturates (c = 1): the
-  // night X is the full 230 - 4.
+  // night X is the full 230 - 4. The probe is on the lava's TOP row: heat
+  // rises (sim.heatUpGain), so the block with lava below it saturates, while
+  // the bottom row -- every lava block level with it or above -- reads ~30
+  // and the check would have no teeth.
   const Box room2{120, 120, 114, 139, 127, 139};
   const Box lava2{120, 120, 114, 127, 127, 139}, wall2{128, 120, 114, 128, 127, 139};
-  const int probeX = 130, probeY = 121, probeZ = 126;
+  const int probeX = 130, probeY = 127, probeZ = 126;
   const int eDay = 24 + 20;   // the east pin: day 44, night 4
   const int lavaEmit = (int)c.mats[MatId(c, "lava")].thermal.emit;
   int dawnTMax = -999, nightX = 0;
@@ -1296,6 +1308,203 @@ Status GateHeatIdle(Ctx& c, std::string& detail) {
   return idle ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// heat-plume
+// ---------------------------------------------------------------------------
+// HEAT RISES (owner, 2026-10-02: "a campfire must not scorch a bush beside
+// it, but should ignite a bush directly above it"). The direction gains
+// (sim.heatUpGain / heatSideGain / heatDownGain, sim_heat.wgsl heatTent).
+//
+// FIXTURE: three sealed stone rooms 48 cells apart in x (far past
+// sim.heatRadius, so no room's heat reaches another), each holding a sealed
+// stone CHAMBER of 4x4x4 cells (2x2x2 heat blocks, block-aligned) against the
+// room's back wall, refilled every tick through cell ops so the source never
+// flickers or burns out. Nothing burning can touch a plate (the chamber is
+// sealed), so every ignition here is the HEAT field's -- the firing log is
+// checked to say so.
+//   A  flames (the campfire); a 4x4 leaf plate two cells thick directly above
+//      it, `heat.plumeAboveCells` over the flame top: must ignite within
+//      `heat.plumeIgniteTicksMax`.
+//   B  flames; a 4x4 leaf wall `heat.plumeSideCells` to the side of the
+//      flame (its full height) and a 4x4 leaf plate `heat.plumeBelowCells`
+//      below the flame: neither may ever ignite over `heat.plumeRunTicks`.
+//   C  burning leaves (leaf_burning, emit 130 < foliage's 135); the same
+//      plate above as A: may never ignite (no foliage-to-foliage chain) and
+//      its block may never read past foliage's threshold. (Its burn rule
+//      turns some of the chamber to flame each tick before the heat pass
+//      reads it, so the source is a 130 / 140 mix, not a pure 130.)
+// Climate pinned at 10, dim dawn frozen. Ticked on THE tick (TickCursor). Run
+// twice from a fresh worldgen; the final cells and the heat pool must agree.
+struct PlumeResult {
+  uint32_t lightTick = 0, abovePlate0 = 0, aboveLeft = 0;
+  uint32_t side0 = 0, sideLeft = 0, below0 = 0, belowLeft = 0, chain0 = 0, chainLeft = 0;
+  int tAbove = -999, tSide = -999, tBelow = -999, tChain = -999;
+  uint32_t ignites = 0, refused = 0, logged = 0, loggedOutsideA = 0;
+  std::string log;
+  std::vector<uint32_t> finalCells;
+  uint64_t heatHash = 0;
+};
+
+constexpr int kPlCy = 120, kPlCz = 100;   // chamber interior y 120..123, z 100..103
+constexpr int kPlRoomX[3] = {104, 152, 200};
+constexpr int kPlAmbient = 10;
+Box PlChamber(int k) { return {kPlRoomX[k], kPlCy, kPlCz, kPlRoomX[k] + 3, kPlCy + 3, kPlCz + 3}; }
+// The room's back wall (z 99) is the chamber's back wall: everything inside
+// hangs off it.
+Box PlRoom(int k) {
+  return {kPlRoomX[k] - 6, kPlCy - 7, kPlCz, kPlRoomX[k] + 11, kPlCy + 11, kPlCz + 11};
+}
+
+PlumeResult RunPlume(Ctx& c, int kTicks, int above, int side, int below) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  const uint32_t leaves = MatId(c, "leaves"), fire = MatId(c, "fire"),
+                 leafBurning = MatId(c, "leaf_burning");
+  SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+  ctx.WaitIdle();
+  // The plates, in world cells (inclusive).
+  const Box chA = PlChamber(0), chB = PlChamber(1), chC = PlChamber(2);
+  const Box plA{chA.x0, chA.y1 + above, chA.z0, chA.x1, chA.y1 + above + 1, chA.z1};
+  const Box plSide{chB.x1 + side, chB.y0, chB.z0, chB.x1 + side, chB.y1, chB.z1};
+  const Box plBelow{chB.x0, chB.y0 - below, chB.z0, chB.x1, chB.y0 - below, chB.z1};
+  const Box plC{chC.x0, chC.y1 + above, chC.z0, chC.x1, chC.y1 + above + 1, chC.z1};
+  std::vector<CellOp> rooms, build;
+  for (int k = 0; k < 3; k++) {
+    Room(rooms, PlRoom(k));
+    // The chamber's shell only (its interior is the source, written each tick).
+    const Box ch = PlChamber(k);
+    for (int z = ch.z0 - 1; z <= ch.z1 + 1; z++)
+      for (int y = ch.y0 - 1; y <= ch.y1 + 1; y++)
+        for (int x = ch.x0 - 1; x <= ch.x1 + 1; x++)
+          if (!ch.Has(x, y, z))
+            build.push_back({World::SlotCellIndex({x, y, z}), (uint32_t)kMatStone});
+  }
+  Fill(build, plA, leaves);
+  Fill(build, plSide, leaves);
+  Fill(build, plBelow, leaves);
+  Fill(build, plC, leaves);
+  std::vector<CellOp> feed;
+  Fill(feed, chA, fire);
+  Fill(feed, chB, fire);
+  Fill(feed, chC, leafBurning);
+  uint32_t t = 58000;
+  support::TickCursor ticker{c, t, {kPlRoomX[1] >> 4, kPlCy >> 4, kPlCz >> 4}};
+  // Rooms in one tick, their contents in the next (two cell ops on one cell
+  // in one tick: the first wins, so a room's air would eat its contents).
+  ticker({}, rooms);
+  ticker({}, build);
+  PlumeResult r;
+  Vox v;
+  const Box all{PlRoom(0).x0 - 1, PlRoom(0).y0 - 1, PlRoom(0).z0 - 1, PlRoom(2).x1 + 1,
+                PlRoom(2).y1 + 1, PlRoom(2).z1 + 1};
+  auto count = [&](const Box& b) {
+    uint32_t n = 0;
+    for (int z = b.z0; z <= b.z1; z++)
+      for (int y = b.y0; y <= b.y1; y++)
+        for (int x = b.x0; x <= b.x1; x++) n += (v.At(x, y, z) & 0xFFFu) == leaves;
+    return n;
+  };
+  v.Read(ctx, world, all);
+  r.abovePlate0 = count(plA);
+  r.side0 = count(plSide);
+  r.below0 = count(plBelow);
+  r.chain0 = count(plC);
+  // The hottest block a plate spans (every block row of it), as T.
+  auto peak = [&](const Box& b) {
+    uint32_t m = 0;
+    for (int y = b.y0; y <= b.y1; y++) m = std::max(m, ProbeX(ctx, world, b.x0, y, b.z0));
+    return kPlAmbient + (int)m;
+  };
+  for (int i = 0; i < kTicks; i++) {
+    ticker({}, feed);
+    if (i % 10 == 9) {
+      r.tAbove = std::max(r.tAbove, peak(plA));
+      r.tSide = std::max(r.tSide, peak(plSide));
+      r.tBelow = std::max(r.tBelow, peak(plBelow));
+      r.tChain = std::max(r.tChain, peak(plC));
+      if (r.lightTick == 0) {
+        v.Read(ctx, world, plA);
+        if (count(plA) < r.abovePlate0) r.lightTick = (uint32_t)i + 1;
+      }
+    }
+  }
+  v.Read(ctx, world, all);
+  r.aboveLeft = count(plA);
+  r.sideLeft = count(plSide);
+  r.belowLeft = count(plBelow);
+  r.chainLeft = count(plC);
+  HeatView hv;
+  hv.Read(ctx, world, true);
+  hv.Note();
+  r.ignites = hv.meta[kHmIgnites];
+  r.refused = hv.meta[kHmRefused];
+  r.heatHash = hv.Hash();
+  // The firing log: every heat transition it caught must be a leaf of plate A.
+  r.logged = std::min(hv.meta[kHmFireLog], kHeatFireLogMax);
+  for (uint32_t i = 0; i < r.logged; i++) {
+    const uint32_t* e = &hv.meta[kHmFireLog + 1 + 4 * i];
+    const int x = (int)e[0], y = (int)e[1], z = (int)e[2];
+    if (!plA.Has(x, y, z)) {
+      r.loggedOutsideA++;
+      if (r.log.size() < 120) r.log += Format(" (%d,%d,%d kind %u)", x, y, z, e[3]);
+    }
+  }
+  for (int z = all.z0; z <= all.z1; z++)
+    for (int y = all.y0; y <= all.y1; y++)
+      for (int x = all.x0; x <= all.x1; x++) r.finalCells.push_back(v.At(x, y, z) & 0xFFFFu);
+  return r;
+}
+
+Status GateHeatPlume(Ctx& c, std::string& detail) {
+  DawnPin dawn;
+  PinGuard pins(c.sim, {{88, 92, 222, 120, kPlAmbient, 0}});
+  const int kTicks = (int)BaselineNumber("heat.plumeRunTicks", 900);
+  const double litMax = BaselineNumber("heat.plumeIgniteTicksMax", 300);
+  const int above = (int)BaselineNumber("heat.plumeAboveCells", 3);
+  const int side = (int)BaselineNumber("heat.plumeSideCells", 2);
+  const int below = (int)BaselineNumber("heat.plumeBelowCells", 2);
+  const PlumeResult a = RunPlume(c, kTicks, above, side, below);
+  const PlumeResult b = RunPlume(c, kTicks, above, side, below);
+  RecordObserved("heat.plumeIgniteTicksObserved", (double)a.lightTick);
+  RecordObserved("heat.plumeAboveTObserved", (double)a.tAbove);
+  RecordObserved("heat.plumeSideTObserved", (double)a.tSide);
+  int leafAbove = 135;
+  for (const HeatTransition& h : c.mats[MatId(c, "leaves")].thermal.transitions)
+    if (h.kind == kHeatKindIgnite) leafAbove = h.threshold;
+  const int burnEmit = (int)c.mats[MatId(c, "leaf_burning")].thermal.emit;
+  const int fireEmit = (int)c.mats[MatId(c, "fire")].thermal.emit;
+  const bool lit = a.lightTick > 0 && a.lightTick <= litMax && a.tAbove > leafAbove;
+  const bool sideKept = a.side0 > 0 && a.sideLeft == a.side0 && a.tSide <= leafAbove;
+  const bool belowKept = a.below0 > 0 && a.belowLeft == a.below0 && a.tBelow <= leafAbove;
+  // Not tChain <= burnEmit: leaf_burning's own burn rule turns some of the
+  // chamber to flame inside the CA before the heat pass reads it, so the
+  // source is a 130 / 140 mix (measured 132). The claim is the owner's: it
+  // never lifts the foliage above it past its threshold.
+  const bool chainKept = a.chain0 > 0 && a.chainLeft == a.chain0 && a.tChain <= leafAbove &&
+                         burnEmit < leafAbove;
+  const bool ceiling = a.tAbove <= fireEmit;
+  const bool onlyA = a.logged > 0 && a.loggedOutsideA == 0;
+  const bool twice = a.finalCells == b.finalCells && a.heatHash == b.heatHash;
+  const bool ok = lit && sideKept && belowKept && chainKept && ceiling && onlyA && twice &&
+                  a.refused == 0;
+  detail = Format(
+      "campfire (flames emit %d), foliage (ignites above %d): %d cells ABOVE peaked at %d, lit "
+      "at tick %u (max %.0f) %s; %d cells to the SIDE peaked at %d, %u/%u kept %s; %d cells "
+      "BELOW peaked at %d, %u/%u kept %s; burning leaves (emit %d) with foliage %d above: "
+      "peaked at %d, %u/%u kept %s; ceiling %s; %u heat ignitions, firing log %u entries, %u "
+      "outside the plate above%s %s; run twice: cells %s, heat hash %016llx vs %016llx %s; "
+      "refused %u",
+      fireEmit, leafAbove, above, a.tAbove, a.lightTick, litMax, lit ? "OK" : "FAIL", side,
+      a.tSide, a.sideLeft, a.side0, sideKept ? "OK" : "FAIL", below, a.tBelow, a.belowLeft,
+      a.below0, belowKept ? "OK" : "FAIL", burnEmit, above, a.tChain, a.chainLeft, a.chain0,
+      chainKept ? "OK" : "FAIL", ceiling ? "OK" : "OVER THE FLAME", a.ignites, a.logged,
+      a.loggedOutsideA, a.log.c_str(), onlyA ? "OK" : "FAIL",
+      a.finalCells == b.finalCells ? "same" : "DIFFER", (unsigned long long)a.heatHash,
+      (unsigned long long)b.heatHash, twice ? "OK" : "NONDETERMINISTIC", a.refused);
+  std::printf("heat-plume: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& HeatGates() {
@@ -1306,6 +1515,7 @@ const std::vector<Gate>& HeatGates() {
       {"heat-freeze", "sim", {}, false, GateHeatFreeze},
       {"heat-ambient", "sim", {}, false, GateHeatAmbient},
       {"heat-bound", "sim", {}, false, GateHeatBound},
+      {"heat-plume", "sim", {}, false, GateHeatPlume},
   };
   return g;
 }
