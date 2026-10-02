@@ -66,6 +66,41 @@ struct Caps {
   uint32_t driverVersion = 0;
   uint32_t vendorId = 0, deviceId = 0;
   bool discrete = false;
+  // --- WHICH IMPLEMENTATION (cross-vendor determinism, DESIGN.md §14 risk 3) ---
+  // Rule 1 promises the same hash on every machine, so every record of a hash
+  // must say which driver and shader compiler produced it: the device name
+  // alone does not (Dozen on an RTX 3060 Ti reports the same vendor/device id as
+  // the native NVIDIA driver and compiles through a completely different
+  // back end). Filled from VkPhysicalDeviceDriverProperties (core 1.2).
+  std::string driverName;       // "NVIDIA", "llvmpipe", "Dozen", ...
+  std::string driverInfo;       // "610.47", "Mesa 26.2.3 (LLVM 23.1.2)", ...
+  uint32_t driverId = 0;        // VkDriverId
+  std::string deviceType;       // "discrete" / "integrated" / "cpu" / "virtual" / "other"
+  uint32_t deviceIndex = 0;     // position in vkEnumeratePhysicalDevices order
+  uint32_t deviceCount = 0;     // how many the loader exposed
+  std::string pipelineCacheUuid;  // hex; a pipeline cache is valid only for this
+  // A Vulkan 1.2 device running on VK_KHR_synchronization2 +
+  // VK_KHR_dynamic_rendering instead of core 1.3 (Dozen).
+  bool khr13Fallback = false;
+  // A storage binding exceeded maxStorageBufferRange and ran anyway under
+  // SANDVOX_ALLOW_OVERSIZE_BINDINGS=1 (rhi_vulkan.cpp CreateDescriptorSet).
+  // OUT OF SPEC; every device record says so. Mutable because the check lives
+  // in a const-caps world and only ever latches.
+  bool oversizeBindings = false;
+  uint64_t oversizeMaxRange = 0;
+  // robustBufferAccess: offered / enabled (SANDVOX_ROBUST=1 only).
+  bool robustBufferAccessAvailable = false;
+  bool robustBufferAccessEnabled = false;
+
+  // --- queues (docs/PLAN_async_compute.md) ---
+  // "0:GCT x16, 1:T x2, 2:CT x8, ..." — every family, for the record.
+  std::string queueFamilies;
+  // The async compute queue's family (UINT32_MAX = none: single-queue only).
+  uint32_t asyncComputeFamily = UINT32_MAX;
+  // True when an async queue exists AND timeline semaphores are enabled —
+  // the precondition for render.asyncCompute to do anything.
+  bool asyncComputeAvailable = false;
+  bool timelineSemaphore = false;
 
   // --- phase 7 gates ---
   // Sparse binding at all, and specifically for buffers.
@@ -421,6 +456,88 @@ class Backend {
   // buffers. Non-blocking; this is ProcessEvents()' replacement.
   void PollFences();
 
+  // ---- ASYNC COMPUTE (docs/PLAN_async_compute.md) --------------------------
+  //
+  // One extra queue (Caps::asyncComputeFamily) that runs the tick's RENDER-ONLY
+  // derived passes (pass_table.def's PT_DERIVED rows: openness + glow) while
+  // the main queue starts the next frame's render. Two timeline semaphores do
+  // all the ordering:
+  //
+  //   * every main-queue submit (once async has been switched on) signals
+  //     mainTimeline_ = ++mainValue_, and an async submit WAITS for the latest
+  //     value — so the async work sees everything the main queue submitted
+  //     before it, exactly as if it had been recorded at the end of the tick's
+  //     command buffer (which is where it sits with the switch off);
+  //   * an async submit signals asyncTimeline_ = ++asyncSubmitted_, and the
+  //     main queue JOINS it (waits that value) before the first command that
+  //     CONFLICTS with what the async work touched — a write to anything it
+  //     reads or writes, or a read of anything it writes. Commands before that
+  //     point overlap it; commands that never conflict never wait.
+  //
+  // The conflict set is the async recording's own touched-buffer list (the
+  // recorder's tracker, the same uses that generate barriers), so it cannot
+  // drift from what the async work actually does. The JOIN is placed by the
+  // main-queue recorder at record time (Recorder::MaybeJoinAsync): it splits
+  // the command buffer at that command, and Queue::Submit sends the two halves
+  // as one batch — the head without a wait, the tail waiting asyncTimeline_.
+  // A pending UPLOAD to a conflicting buffer joins at the head (the flush runs
+  // first thing in the buffer).
+  //
+  // DETERMINISM: the sim's command stream, its inputs and its dispatch order
+  // are untouched. The async rows write only render-only buffers, read sim
+  // state nothing writes until the join, and run after everything the main
+  // queue submitted before them; so every hashed buffer sees the same writes
+  // in the same order with the switch on or off. --gate determinism, run both
+  // ways, is the check.
+  bool AsyncAvailable() const { return caps_.asyncComputeAvailable; }
+  // Create the async queue at the NEXT device creation (process-wide; set
+  // before GpuContext::Init). Off by default because the queue costs frame
+  // time on NVIDIA even unused (CreateLogicalDevice's note).
+  static void SetAsyncQueueWanted(bool on) { asyncQueueWanted_ = on; }
+  // Runtime switch (render.asyncCompute). Refused (stays false) when the device
+  // has no async queue or no timeline semaphores. Switching OFF while async
+  // work is outstanding is safe: joins are owed regardless of the switch.
+  void SetAsyncEnabled(bool on);
+  bool AsyncEnabled() const { return asyncEnabled_; }
+  // A command buffer for the ASYNC queue: from the async family's pool, and it
+  // does NOT flush pending uploads (they belong to the main queue's order).
+  VkCommandBuffer BeginAsyncCommands();
+  // An async encoder dropped (or finished) without a submit: its buffer goes
+  // back to the ASYNC pool's free list. No upload debt — it never flushed any.
+  void AbandonAsyncCommands(VkCommandBuffer cmd, bool ended);
+  // Submit an ENDED async command buffer. `touched` is every buffer the async
+  // recording used and whether it wrote it — the conflict set the main queue
+  // joins on. Returns the fence (an InFlight entry like any other submit).
+  struct AsyncTouch {
+    Buffer* buf = nullptr;
+    bool write = false;
+  };
+  VkFence SubmitAsync(VkCommandBuffer cmd, const std::vector<AsyncTouch>& touched,
+                      std::string& err);
+  // The last async submit's timeline value, and whether the main queue still
+  // owes a join on it.
+  uint64_t AsyncSubmitted() const { return asyncSubmitted_; }
+  bool AsyncOutstanding() const { return asyncSubmitted_ > asyncJoined_; }
+  // Would a main-queue access to `b` race the outstanding async work?
+  bool AsyncConflict(const Buffer* b, bool write) const;
+  // Set by BeginCommands: the upload flush it just recorded wrote a buffer the
+  // outstanding async work touches, so the WHOLE command buffer must join.
+  bool LastBeginJoinAtHead() const { return lastBeginJoinHead_; }
+  // The TAIL half of a split main command buffer: same pool, begun, NO flush.
+  VkCommandBuffer BeginCommandsNoFlush();
+  // Submit a main-queue command buffer, optionally split, with joins.
+  // `tail` may be null. `joinHead` makes the head wait the async timeline (and
+  // the tail with it); `joinTail` makes only the tail wait. `presenting`
+  // routes the swapchain semaphores (SubmitEndedPresenting's contract).
+  VkFence SubmitMainJoined(VkCommandBuffer head, VkCommandBuffer tail, bool joinHead,
+                           bool joinTail, bool presenting, std::string& err);
+  // Counters for the record (last_run.json / --perf): async submits, joins
+  // that made the main queue wait, split command buffers, head joins.
+  struct AsyncStats {
+    uint64_t submits = 0, joins = 0, splits = 0, headJoins = 0;
+  };
+  const AsyncStats& GetAsyncStats() const { return asyncStats_; }
+
   // ---- borrowed fences (barrier_graph §4.2) ------------------------------
   //
   // The readback ring and the eviction pool do not own fences: §4.2 says a
@@ -608,6 +725,10 @@ class Backend {
     uint64_t stagingLow = 0;
     uint64_t stagingHigh = 0;
     uint64_t serial = 0;  // submit order, for the buffer graveyard
+    // Async compute: the TAIL half of a split main command buffer (same pool,
+    // same fence), and whether `cmd` came from the ASYNC pool.
+    VkCommandBuffer cmd2 = VK_NULL_HANDLE;
+    bool asyncPool = false;
   };
 
   // A buffer whose seam handle was released while submits that might reference
@@ -674,6 +795,33 @@ class Backend {
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   uint32_t queueFamily_ = 0;
+  // The async compute queue (docs/PLAN_async_compute.md). Null when the
+  // device has no second queue; asyncFamily_ may equal queueFamily_ (a second
+  // queue of the main family, asyncIndex_ 1).
+  VkQueue asyncQueue_ = VK_NULL_HANDLE;
+  uint32_t asyncFamily_ = UINT32_MAX;
+  uint32_t asyncIndex_ = 0;
+  // Async-compute state (the block comment at SetAsyncEnabled). The two
+  // timelines are created on the first SetAsyncEnabled(true); until then every
+  // submit is exactly the single-queue submit it always was.
+  VkCommandPool asyncCmdPool_ = VK_NULL_HANDLE;
+  std::vector<VkCommandBuffer> freeAsyncCmds_;
+  VkSemaphore mainTimeline_ = VK_NULL_HANDLE;
+  VkSemaphore asyncTimeline_ = VK_NULL_HANDLE;
+  uint64_t mainValue_ = 0;       // last value a main submit signalled
+  uint64_t asyncSubmitted_ = 0;  // last value an async submit will signal
+  uint64_t asyncJoined_ = 0;     // last async value a main submit waited
+  bool asyncEnabled_ = false;
+  bool asyncUsed_ = false;       // timelines exist: main submits signal
+  static inline bool asyncQueueWanted_ = false;  // SetAsyncQueueWanted
+  bool lastBeginJoinHead_ = false;
+  // buffer -> written? for every async submit the main queue has not joined.
+  std::unordered_map<const Buffer*, bool> asyncTouch_;
+  AsyncStats asyncStats_{};
+  // Chain a timeline wait/signal onto a VkSubmitInfo (main queue). Shared by
+  // every main submit path once asyncUsed_.
+  VkFence SubmitMainImpl(VkCommandBuffer head, VkCommandBuffer tail, bool joinHead,
+                         bool joinTail, bool presenting, std::string& err);
   VkCommandPool cmdPool_ = VK_NULL_HANDLE;
   VkDescriptorPool descPool_ = VK_NULL_HANDLE;
   VmaAllocator allocator_ = nullptr;

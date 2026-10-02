@@ -5250,6 +5250,10 @@ int main(int argc, char** argv) {
           "  --join <ip[:port]>    Connect to a host and share its tick clock\n\n"
           "Misc:\n"
           "  --adapter low         Select low-power (iGPU) adapter\n"
+          "  --device <i|name>     Pick a Vulkan device by index or name/driver substring\n"
+          "                        (same as SANDVOX_DEVICE; the list prints at boot)\n"
+          "  --fingerprint <file>  Write the 200-tick determinism fingerprint and exit\n"
+          "                        (compare two with scripts/det_fingerprint_compare.py)\n"
           "  --noaudio             Disable audio\n"
           "  --telemetry           Enable telemetry\n"
           "  --telemetry-port <N>  Telemetry port (default 8080)\n"
@@ -5550,6 +5554,36 @@ int main(int argc, char** argv) {
     else if (a == "--adapter") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--adapter requires a value\n"); return 1; }
       lowPowerAdapter = std::string(argv[++i]) == "low";
+    }
+    // `--device <index|substring>` names ONE Vulkan physical device (index in
+    // the loader's order, or a case-insensitive substring of the device or
+    // driver name: "llvmpipe", "dozen"). It sets SANDVOX_DEVICE, which
+    // vk::Backend::PickPhysicalDevice reads, so every mode's GpuContext (the
+    // selftest, the smokes, --verify, --fingerprint) honours it without a
+    // parameter threaded through each. A selector that matches nothing is
+    // fatal at device creation, never a silent fall-back.
+    // `--fingerprint <file>`: the portable determinism fingerprint (DESIGN.md
+    // §14 risk 3). Exactly `--selftest --gate determinism` with
+    // SANDVOX_FINGERPRINT set, so the file holds THE gate's 200-tick sequence
+    // and nothing a second code path could drift from. Compare two files with
+    // scripts/det_fingerprint_compare.py.
+    else if (a == "--fingerprint") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--fingerprint requires a file\n"); return 1; }
+#ifdef _WIN32
+      _putenv_s("SANDVOX_FINGERPRINT", argv[++i]);
+#else
+      setenv("SANDVOX_FINGERPRINT", argv[++i], 1);
+#endif
+      selftest = true;
+      stOpt.only.push_back("determinism");
+    }
+    else if (a == "--device") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--device requires a value\n"); return 1; }
+#ifdef _WIN32
+      _putenv_s("SANDVOX_DEVICE", argv[++i]);
+#else
+      setenv("SANDVOX_DEVICE", argv[++i], 1);
+#endif
     }
     // `--vk-smoke` runs a quiet 50-tick world and compares its hashes against
     // the PINNED sequence (src/gpu/vk_smoke.cpp). It used to compare Dawn

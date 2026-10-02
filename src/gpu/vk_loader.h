@@ -186,6 +186,10 @@ struct DeviceFns {
   PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
   PFN_vkCreateSemaphore CreateSemaphore = nullptr;
   PFN_vkDestroySemaphore DestroySemaphore = nullptr;
+  // Timeline semaphores (core 1.2): the async-compute queue's cross-queue
+  // ordering (docs/PLAN_async_compute.md).
+  PFN_vkWaitSemaphores WaitSemaphores = nullptr;
+  PFN_vkGetSemaphoreCounterValue GetSemaphoreCounterValue = nullptr;
 
   // Timestamps (capability-gated).
   PFN_vkCreateQueryPool CreateQueryPool = nullptr;

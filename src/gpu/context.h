@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include "gpu/rhi.h"
 
@@ -19,6 +20,13 @@ class Backend;
 // src/ui/overlay.* reaches the native Vulkan objects through
 // rhi::vkr::NativeBackend()/NativeCmd() as the one sanctioned exception,
 // because imgui_impl_vulkan takes them directly.
+// The device record of the most recent GpuContext::Init in this process ("null"
+// / "" before any), and the commit this exe was built from. For writers that
+// hold no context: the selftest's and the smokes' build/last_run.json.
+std::string LastDeviceJson();
+const std::string& LastDeviceLine();
+std::string BuildCommit();
+
 class GpuContext {
  public:
   // lowPowerAdapter selects the LowPower adapter (typically the iGPU) — used
@@ -86,6 +94,16 @@ class GpuContext {
   // because a frame time with no GPU attached to it is not comparable to
   // anything — including the same number measured on this machine last month.
   std::string DeviceName() const;
+  // ---- WHICH IMPLEMENTATION PRODUCED A HASH (cross-vendor determinism) ----
+  // One line ("NVIDIA GeForce RTX 3060 Ti | NVIDIA 610.47 | vk 1.4.341 |
+  // 10de:2489 discrete [0/4]") and one JSON object with the same facts, plus
+  // the build commit. Every run that records a world hash records this beside
+  // it (selftest/smoke last_run.json, --fingerprint), because a hash with no
+  // driver attached cannot be compared across machines — Dozen on this RTX
+  // 3060 Ti reports the same vendor/device id as the native driver and
+  // compiles through an entirely different back end.
+  std::string DeviceLine() const;
+  std::string DeviceJson() const;
   // True only when Init was asked for timestamps AND the adapter supports them.
   bool timestampsEnabled = false;
   // GPU timestamp period in nanoseconds per tick, from

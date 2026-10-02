@@ -2,6 +2,7 @@
 
 #include <algorithm>  // std::sort — DecoratedBindings
 #include <atomic>
+#include <cctype>   // std::tolower / std::isdigit — SANDVOX_DEVICE matching
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>  // std::abort — the staging ring's unserviceable-write path
@@ -266,6 +267,18 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
     std::lock_guard<std::mutex> lock(be->validationMutex_);
     be->validationMsgs_.push_back(data->pMessage);
   }
+  // SANDVOX_VK_VALIDATION_ECHO=1: print as it arrives, not only at the end. A
+  // run that dies (a driver's heap corruption is a fail-fast no handler sees)
+  // never reaches the end-of-run report, and the message that explains the
+  // death is exactly the one that would be lost.
+  static const bool kEcho = [] {
+    const char* e = std::getenv("SANDVOX_VK_VALIDATION_ECHO");
+    return e && *e == '1';
+  }();
+  if (kEcho) {
+    std::fprintf(stderr, "[vk-validation live] %s\n", data->pMessage);
+    std::fflush(stderr);
+  }
   return VK_FALSE;  // never abort the call
 }
 
@@ -447,6 +460,15 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
       pipelineCachePath_ = env;
     else
       pipelineCachePath_ = "sandvox_pipeline_cache.bin";
+    // AN EXPLICITLY SELECTED DEVICE GETS ITS OWN CACHE FILE. A blob is valid
+    // only for the pipelineCacheUUID that wrote it; another ICD rejects it (one
+    // cold compile) and then — the expensive half — writes ITS blob over the
+    // shared file at shutdown, so the next native run pays the multi-minute
+    // worldgen compile again. Cross-vendor runs (SANDVOX_DEVICE) are exactly
+    // the ones that point a second implementation at the same machine-global
+    // path run.sh exports, so they are suffixed with the cache UUID.
+    if (const char* sel = std::getenv("SANDVOX_DEVICE"); sel && *sel)
+      pipelineCachePath_ += "." + caps_.pipelineCacheUuid.substr(0, 12);
     std::vector<uint8_t> blob;
     if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "rb")) {
       // _ftelli64, not ftell: the blob has been measured at 394 MB and a long
@@ -516,6 +538,83 @@ bool Backend::PickPhysicalDevice(bool lowPower, std::string& err) {
   }
   std::vector<VkPhysicalDevice> devs(n);
   ifn_.EnumeratePhysicalDevices(instance_, &n, devs.data());
+  devs.resize(n);
+  caps_.deviceCount = n;
+  const std::vector<VkPhysicalDevice> allDevs = devs;
+
+  // ---- EXPLICIT DEVICE SELECTION: SANDVOX_DEVICE (`--device` sets it) ------
+  //
+  // Cross-vendor determinism (DESIGN.md §14 risk 3) is checked by running the
+  // SAME build on a different Vulkan implementation, and on one machine that
+  // means picking among several ICDs: the native driver, a CPU rasteriser
+  // (Mesa lavapipe/llvmpipe), Dozen (Vulkan over D3D12, which compiles
+  // SPIR-V -> NIR -> DXIL -> the vendor's D3D compiler). The score below can
+  // only express "discrete first"; this names one. An index (enumeration
+  // order, printed below) or a case-insensitive substring of the device name
+  // or driver name ("llvmpipe", "dozen", "basic render"). A selector that
+  // matches nothing is FATAL, never a silent fall back to the default device:
+  // a fingerprint recorded on the wrong device is a false "match".
+  //
+  // An environment variable rather than an Init parameter because every
+  // headless mode (selftest, smokes, --verify, --voxserve, --fingerprint)
+  // constructs its own GpuContext, and the variable reaches all of them
+  // through this one function.
+  auto lower = [](std::string s) {
+    for (char& ch : s) ch = (char)std::tolower((unsigned char)ch);
+    return s;
+  };
+  auto describe = [&](VkPhysicalDevice d, std::string* drvName) {
+    VkPhysicalDeviceProperties p{};
+    ifn_.GetPhysicalDeviceProperties(d, &p);
+    std::string drv;
+    if (ifn_.GetPhysicalDeviceProperties2 && p.apiVersion >= VK_API_VERSION_1_2) {
+      VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+      VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      p2.pNext = &dp;
+      ifn_.GetPhysicalDeviceProperties2(d, &p2);
+      drv = std::string(dp.driverName) + " " + dp.driverInfo;
+    }
+    if (drvName) *drvName = drv;
+    return std::string(p.deviceName);
+  };
+  const char* sel = std::getenv("SANDVOX_DEVICE");
+  if (sel && *sel) {
+    std::printf("vk devices (%u):\n", n);
+    for (uint32_t i = 0; i < n; i++) {
+      std::string drv;
+      const std::string name = describe(devs[i], &drv);
+      std::printf("  [%u] %s | %s\n", i, name.c_str(), drv.c_str());
+    }
+    const std::string want = lower(sel);
+    bool numeric = !want.empty();
+    for (char ch : want)
+      if (!std::isdigit((unsigned char)ch)) numeric = false;
+    VkPhysicalDevice pick = VK_NULL_HANDLE;
+    uint32_t pickIdx = 0;
+    if (numeric) {
+      const uint32_t idx = (uint32_t)std::strtoul(want.c_str(), nullptr, 10);
+      if (idx < n) { pick = devs[idx]; pickIdx = idx; }
+    } else {
+      for (uint32_t i = 0; i < n && !pick; i++) {
+        std::string drv;
+        const std::string name = lower(describe(devs[i], &drv));
+        if (name.find(want) != std::string::npos ||
+            lower(drv).find(want) != std::string::npos) {
+          pick = devs[i];
+          pickIdx = i;
+        }
+      }
+    }
+    if (!pick) {
+      err = std::string("SANDVOX_DEVICE / --device '") + sel +
+            "' matches no Vulkan physical device (list above). A CPU or "
+            "second ICD is added per-process with VK_ADD_DRIVER_FILES=<icd.json>";
+      return false;
+    }
+    std::printf("vk device: SELECTED [%u] by '%s'\n", pickIdx, sel);
+    devs = {pick};
+    caps_.deviceIndex = pickIdx;
+  }
 
   // Prefer discrete, unless lowPower asked for the opposite. `--adapter low`
   // exists so the world hash can be compared across GPU vendors on one machine
@@ -556,6 +655,8 @@ bool Backend::PickPhysicalDevice(bool lowPower, std::string& err) {
     return false;
   }
   phys_ = best;
+  for (uint32_t i = 0; i < (uint32_t)allDevs.size(); i++)
+    if (allDevs[i] == best) caps_.deviceIndex = i;
 
   uint32_t qn = 0;
   ifn_.GetPhysicalDeviceQueueFamilyProperties(phys_, &qn, nullptr);
@@ -589,6 +690,30 @@ void Backend::QueryCaps() {
   caps_.vendorId = p.vendorID;
   caps_.deviceId = p.deviceID;
   caps_.discrete = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+  switch (p.deviceType) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: caps_.deviceType = "discrete"; break;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: caps_.deviceType = "integrated"; break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: caps_.deviceType = "virtual"; break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: caps_.deviceType = "cpu"; break;
+    default: caps_.deviceType = "other"; break;
+  }
+  {
+    static const char kHex[] = "0123456789abcdef";
+    caps_.pipelineCacheUuid.clear();
+    for (uint8_t b : p.pipelineCacheUUID) {
+      caps_.pipelineCacheUuid += kHex[b >> 4];
+      caps_.pipelineCacheUuid += kHex[b & 15];
+    }
+  }
+  if (ifn_.GetPhysicalDeviceProperties2 && p.apiVersion >= VK_API_VERSION_1_2) {
+    VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &dp;
+    ifn_.GetPhysicalDeviceProperties2(phys_, &p2);
+    caps_.driverName = dp.driverName;
+    caps_.driverInfo = dp.driverInfo;
+    caps_.driverId = (uint32_t)dp.driverID;
+  }
 
   const VkPhysicalDeviceLimits& L = p.limits;
   caps_.maxStorageBufferRange = L.maxStorageBufferRange;
@@ -616,6 +741,7 @@ void Backend::QueryCaps() {
   caps_.sparseBinding = f.sparseBinding != 0;
   caps_.sparseResidencyBuffer = f.sparseResidencyBuffer != 0;
   caps_.fragmentStoresAndAtomics = f.fragmentStoresAndAtomics != 0;
+  caps_.robustBufferAccessAvailable = f.robustBufferAccess != 0;
 
   // maxMemoryAllocationSize is a Vulkan 1.1 (maintenance3) property.
   if (ifn_.GetPhysicalDeviceProperties2) {
@@ -629,11 +755,78 @@ void Backend::QueryCaps() {
 }
 
 bool Backend::CreateLogicalDevice(std::string& err) {
-  float prio = 1.0f;
-  VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-  qci.queueFamilyIndex = queueFamily_;
-  qci.queueCount = 1;
-  qci.pQueuePriorities = &prio;
+  // ---- QUEUES: the main queue, and ON REQUEST an ASYNC COMPUTE queue
+  // (docs/PLAN_async_compute.md). The main family was chosen in
+  // PickPhysicalDevice (graphics+compute). The async queue is created ONLY when
+  // asked for (Backend::SetAsyncQueueWanted — main.cpp passes
+  // render.asyncCompute at boot — or SANDVOX_ASYNC_COMPUTE=1, or
+  // SANDVOX_ASYNC_QUEUE=family|same, or an `on` arm in SANDVOX_PERF_ASYNC_ARMS):
+  // MEASURED, merely creating a second queue on the RTX 3060 Ti costs the
+  // village-fire scenario ~3.4 ms a frame with nothing ever submitted to it
+  // (28.3 -> 31.7 ms p50; forestfire unaffected). A compute-only family is
+  // preferred (NVIDIA family 2, AMD's ACE queues), else a second queue of the
+  // main family. No async queue (or no device support: lavapipe, WARP) = the
+  // single-queue schedule the engine has always had.
+  uint32_t qn = 0;
+  ifn_.GetPhysicalDeviceQueueFamilyProperties(phys_, &qn, nullptr);
+  std::vector<VkQueueFamilyProperties> qs(qn);
+  ifn_.GetPhysicalDeviceQueueFamilyProperties(phys_, &qn, qs.data());
+  asyncFamily_ = UINT32_MAX;
+  asyncIndex_ = 0;
+  // SANDVOX_ASYNC_QUEUE=same: take the second queue of the MAIN family even
+  // when a compute-only family exists (the A/B for which hardware path the
+  // overlap rides; a same-family queue also keeps every buffer EXCLUSIVE).
+  // =none: create no async queue at all.
+  const char* aq = std::getenv("SANDVOX_ASYNC_QUEUE");
+  const bool aqSame = aq && std::strcmp(aq, "same") == 0;
+  const bool aqFamily = aq && std::strcmp(aq, "family") == 0;
+  const char* ac = std::getenv("SANDVOX_ASYNC_COMPUTE");
+  const char* arms = std::getenv("SANDVOX_PERF_ASYNC_ARMS");
+  const bool wanted = asyncQueueWanted_ || aqSame || aqFamily || (ac && *ac == '1') ||
+                      (arms && std::strstr(arms, "on") != nullptr);
+  const bool aqNone = !wanted || (aq && std::strcmp(aq, "none") == 0);
+  if (!aqSame && !aqNone)
+  for (uint32_t i = 0; i < qn; i++)
+    if (i != queueFamily_ && (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+        !(qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qs[i].queueCount > 0) {
+      asyncFamily_ = i;
+      break;
+    }
+  if (!aqNone && asyncFamily_ == UINT32_MAX && queueFamily_ < qn &&
+      qs[queueFamily_].queueCount >= 2) {
+    asyncFamily_ = queueFamily_;
+    asyncIndex_ = 1;
+  }
+  {
+    std::string fams;
+    for (uint32_t i = 0; i < qn; i++) {
+      char b[64];
+      std::snprintf(b, sizeof b, "%s%u:%s%s%s x%u", i ? ", " : "", i,
+                    (qs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) ? "G" : "",
+                    (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) ? "C" : "",
+                    (qs[i].queueFlags & VK_QUEUE_TRANSFER_BIT) ? "T" : "",
+                    qs[i].queueCount);
+      fams += b;
+    }
+    caps_.queueFamilies = fams;
+  }
+  caps_.asyncComputeFamily = asyncFamily_;
+  caps_.asyncComputeAvailable = asyncFamily_ != UINT32_MAX;
+
+  const float prios[2] = {1.0f, 1.0f};
+  VkDeviceQueueCreateInfo qcis[2]{};
+  uint32_t qciCount = 1;
+  qcis[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  qcis[0].queueFamilyIndex = queueFamily_;
+  qcis[0].queueCount = (asyncFamily_ == queueFamily_) ? 2 : 1;
+  qcis[0].pQueuePriorities = prios;
+  if (asyncFamily_ != UINT32_MAX && asyncFamily_ != queueFamily_) {
+    qcis[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qcis[1].queueFamilyIndex = asyncFamily_;
+    qcis[1].queueCount = 1;
+    qcis[1].pQueuePriorities = prios;
+    qciCount = 2;
+  }
 
   // Request only what is present. Sparse features are requested when available
   // so phase 7 does not need a device recreate; nothing uses them yet.
@@ -644,47 +837,18 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   // Requested when present rather than demanded: see the cap's note in
   // rhi_vulkan.h for why absence downgrades the renderer instead of failing it.
   want.fragmentStoresAndAtomics = caps_.fragmentStoresAndAtomics;
+  // SANDVOX_ROBUST=1: enable robustBufferAccess (cross-vendor diagnosis). OFF
+  // by default and deliberately so: Tint's robustness transform already clamps
+  // every runtime-array index (vk_spirv.cpp leaves disable_robustness false),
+  // so the driver-level feature buys nothing on a correct binding — but on a
+  // CPU implementation an access that escapes the clamp (an out-of-spec
+  // binding whose arrayLength the driver mis-derives) is a write into the HOST
+  // HEAP, and this turns that from heap corruption into a bounded access.
+  if (const char* rb = std::getenv("SANDVOX_ROBUST"); rb && *rb == '1')
+    want.robustBufferAccess = caps_.robustBufferAccessAvailable;
+  caps_.robustBufferAccessEnabled = want.robustBufferAccess != 0;
 
-  // SYNCHRONIZATION2 IS MANDATORY FOR PHASE 3b, and asking for it is not
-  // optional decoration: vkCmdPipelineBarrier2 is core in Vulkan 1.3, which
-  // makes the entry point RESOLVE, but calling it on a device that never
-  // enabled the feature is undefined behaviour. With no validation layer here
-  // that is an access violation inside the ICD, not an error return — the same
-  // class of failure that cost phase 3a a debugging session on pipeline
-  // layouts. Query first, enable explicitly, and refuse to run without it.
-  VkPhysicalDeviceVulkan13Features feat13{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-  if (ifn_.GetPhysicalDeviceFeatures2) {
-    VkPhysicalDeviceVulkan13Features probe{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.pNext = &probe;
-    ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
-    caps_.synchronization2 = probe.synchronization2 != 0;
-    caps_.dynamicRendering = probe.dynamicRendering != 0;
-  }
-  if (!caps_.synchronization2) {
-    err =
-        "device does not support VkPhysicalDeviceVulkan13Features::"
-        "synchronization2, which the generated-barrier recorder requires "
-        "(docs/vulkan_barrier_graph.md §3.2 is written in Flags2 scopes)";
-    return false;
-  }
-  feat13.synchronization2 = VK_TRUE;
-  // Dynamic rendering is the render path's ONE recording model (phase 4b) —
-  // like synchronization2 it is core-1.3 but must still be enabled, and a
-  // device without it would need a VkRenderPass-object code path nothing else
-  // exercises. Both features are MANDATORY in core 1.3, so a 1.3 device that
-  // lacks either is out of spec; refuse rather than fork the recording model.
-  if (!caps_.dynamicRendering) {
-    err =
-        "device does not support VkPhysicalDeviceVulkan13Features::"
-        "dynamicRendering, which the phase-4b render path requires";
-    return false;
-  }
-  feat13.dynamicRendering = VK_TRUE;
-
-  // The device extension list, enumerated ONCE. Both consumers below ask the
+  // The device extension list, enumerated ONCE. Every consumer below asks the
   // same question of the same array; the enumeration used to live inside the
   // swapchain branch, which meant a headless run never learned what the device
   // offers.
@@ -698,10 +862,122 @@ bool Backend::CreateLogicalDevice(std::string& err) {
       if (std::strcmp(p.extensionName, name) == 0) return true;
     return false;
   };
+  std::vector<const char*> devExts;
+
+  // SYNCHRONIZATION2 IS MANDATORY FOR PHASE 3b, and asking for it is not
+  // optional decoration: vkCmdPipelineBarrier2 is core in Vulkan 1.3, which
+  // makes the entry point RESOLVE, but calling it on a device that never
+  // enabled the feature is undefined behaviour. With no validation layer here
+  // that is an access violation inside the ICD, not an error return — the same
+  // class of failure that cost phase 3a a debugging session on pipeline
+  // layouts. Query first, enable explicitly, and refuse to run without it.
+  //
+  // TWO WAYS TO HAVE IT (2026-10-02, cross-vendor determinism): core 1.3, or a
+  // Vulkan 1.2 device that offers VK_KHR_synchronization2 and
+  // VK_KHR_dynamic_rendering as extensions — Mesa's Dozen (Vulkan over D3D12)
+  // reports 1.2, and it is the one second shader-compiler back end this
+  // machine can run on its own GPU. Same functions, same structs under KHR
+  // names (vk_loader resolves the aliases); the feature structs differ, and a
+  // VkPhysicalDeviceVulkan13Features in the chain of a 1.2 device is invalid.
+  const bool core13 = caps_.apiVersion >= VK_API_VERSION_1_3;
+  caps_.khr13Fallback = !core13;
+  VkPhysicalDeviceVulkan13Features feat13{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+  VkPhysicalDeviceSynchronization2Features featSync2{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+  VkPhysicalDeviceDynamicRenderingFeatures featDynR{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+  VkPhysicalDeviceTimelineSemaphoreFeatures featTimeline{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+  if (ifn_.GetPhysicalDeviceFeatures2) {
+    if (core13) {
+      VkPhysicalDeviceVulkan13Features probe{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+      VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      f2.pNext = &probe;
+      ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
+      caps_.synchronization2 = probe.synchronization2 != 0;
+      caps_.dynamicRendering = probe.dynamicRendering != 0;
+    } else if (haveExt(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) &&
+               haveExt(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) {
+      VkPhysicalDeviceSynchronization2Features ps{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+      VkPhysicalDeviceDynamicRenderingFeatures pd{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+      ps.pNext = &pd;
+      VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      f2.pNext = &ps;
+      ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
+      caps_.synchronization2 = ps.synchronization2 != 0;
+      caps_.dynamicRendering = pd.dynamicRendering != 0;
+    }
+    if (caps_.apiVersion >= VK_API_VERSION_1_2) {
+      VkPhysicalDeviceTimelineSemaphoreFeatures pt{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+      VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      f2.pNext = &pt;
+      ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
+      caps_.timelineSemaphore = pt.timelineSemaphore != 0;
+    }
+  }
+  if (!caps_.synchronization2) {
+    err = core13 ? "device does not support VkPhysicalDeviceVulkan13Features::"
+                   "synchronization2, which the generated-barrier recorder requires "
+                   "(docs/vulkan_barrier_graph.md §3.2 is written in Flags2 scopes)"
+                 : "Vulkan 1.2 device without VK_KHR_synchronization2 + "
+                   "VK_KHR_dynamic_rendering: the generated-barrier recorder needs "
+                   "Flags2 barriers (a HARD minimum: down-converting every scope "
+                   "to the 1.0 barrier is a silently weaker barrier)";
+    return false;
+  }
+  // Dynamic rendering is the render path's ONE recording model (phase 4b) —
+  // like synchronization2 it is core-1.3 but must still be enabled, and a
+  // device without it would need a VkRenderPass-object code path nothing else
+  // exercises. Both features are MANDATORY in core 1.3, so a 1.3 device that
+  // lacks either is out of spec; refuse rather than fork the recording model.
+  if (!caps_.dynamicRendering) {
+    err =
+        "device does not support dynamicRendering (core 1.3 or "
+        "VK_KHR_dynamic_rendering), which the phase-4b render path requires";
+    return false;
+  }
+  // The feature chain handed to vkCreateDevice. `chainTail` is the last
+  // struct's pNext, so optional features append without caring which of the
+  // two shapes above opened it.
+  void* chainHead = nullptr;
+  void** chainTail = &chainHead;
+  auto append = [&](auto* s) {
+    *chainTail = s;
+    chainTail = &s->pNext;
+  };
+  if (core13) {
+    feat13.synchronization2 = VK_TRUE;
+    feat13.dynamicRendering = VK_TRUE;
+    append(&feat13);
+  } else {
+    featSync2.synchronization2 = VK_TRUE;
+    featDynR.dynamicRendering = VK_TRUE;
+    append(&featSync2);
+    append(&featDynR);
+    devExts.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    devExts.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    // dynamic_rendering's own dependencies, core in 1.2 (named for a driver
+    // that checks the list literally).
+    if (haveExt(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME))
+      devExts.push_back(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+    if (haveExt(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME))
+      devExts.push_back(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+  }
+  // Timeline semaphores (core 1.2): the async queue's cross-queue ordering.
+  // Enabled when present; without them the async queue is simply not used.
+  if (caps_.timelineSemaphore) {
+    featTimeline.timelineSemaphore = VK_TRUE;
+    append(&featTimeline);
+  }
+  if (!caps_.timelineSemaphore) caps_.asyncComputeAvailable = false;
 
   // Windowed: VK_KHR_swapchain, verified present rather than assumed. A
   // headless run enables nothing — the device is unchanged from phase 3.
-  std::vector<const char*> devExts;
   if (swapchainRequested_) {
     if (!haveExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
       err = "device does not support VK_KHR_swapchain (windowed --backend vulkan)";
@@ -733,16 +1009,16 @@ bool Backend::CreateLogicalDevice(std::string& err) {
     if (probe.pipelineExecutableInfo) {
       caps_.pipelineExecutableProps = true;
       fePipeExec.pipelineExecutableInfo = VK_TRUE;
-      feat13.pNext = &fePipeExec;
+      append(&fePipeExec);
       devExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     }
   }
 
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-  dci.queueCreateInfoCount = 1;
-  dci.pQueueCreateInfos = &qci;
+  dci.queueCreateInfoCount = qciCount;
+  dci.pQueueCreateInfos = qcis;
   dci.pEnabledFeatures = &want;
-  dci.pNext = &feat13;
+  dci.pNext = chainHead;
   dci.enabledExtensionCount = (uint32_t)devExts.size();
   dci.ppEnabledExtensionNames = devExts.data();
 
@@ -753,10 +1029,19 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   }
   vkl::LoadDevice(ifn_, device_, dfn_);
   dfn_.GetDeviceQueue(device_, queueFamily_, 0, &queue_);
+  if (asyncFamily_ != UINT32_MAX)
+    dfn_.GetDeviceQueue(device_, asyncFamily_, asyncIndex_, &asyncQueue_);
   if (!dfn_.CmdPipelineBarrier2) {
     err = "vkCmdPipelineBarrier2 did not resolve despite synchronization2";
     return false;
   }
+  if (!dfn_.CmdBeginRendering || !dfn_.CmdEndRendering) {
+    err = "vkCmdBeginRendering/EndRendering did not resolve despite dynamicRendering";
+    return false;
+  }
+  if (caps_.asyncComputeAvailable &&
+      (!dfn_.WaitSemaphores || !dfn_.GetSemaphoreCounterValue || !asyncQueue_))
+    caps_.asyncComputeAvailable = false;
   return true;
 }
 
@@ -793,7 +1078,11 @@ bool Backend::InitAllocator(std::string& err) {
   aci.physicalDevice = phys_;
   aci.device = device_;
   aci.instance = instance_;
-  aci.vulkanApiVersion = VK_API_VERSION_1_3;
+  // The DEVICE version, capped at the 1.3 VMA was told to target: VMA calls
+  // 1.3-core entry points (vkGetDeviceBufferMemoryRequirements) when told 1.3,
+  // which a 1.2 device (Dozen) does not have.
+  aci.vulkanApiVersion = caps_.apiVersion >= VK_API_VERSION_1_3 ? VK_API_VERSION_1_3
+                                                               : VK_API_VERSION_1_2;
   aci.pVulkanFunctions = &vf;
 
   VkResult r = vmaCreateAllocator(&aci, &allocator_);
@@ -818,6 +1107,23 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
   bci.usage = ToVkUsage(usage) | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   b->usage = bci.usage;
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  // ASYNC COMPUTE on a SEPARATE queue family (docs/PLAN_async_compute.md):
+  // the async rows read and write ordinary engine buffers from the other
+  // family, and an EXCLUSIVE buffer used by a second family without a
+  // queue-family ownership transfer has undefined contents. CONCURRENT across
+  // the two families instead of transfers: the set of buffers the async rows
+  // touch is decided per tick by the recorder, and a transfer pair per buffer
+  // per tick would be a second barrier generator to keep honest. Buffers only
+  // (images never reach the async queue), and it changes nothing about the
+  // CONTENTS — a run that never turns render.asyncCompute on computes exactly
+  // what it did; on NVIDIA buffers carry no compression a sharing mode could
+  // switch off.
+  const uint32_t families[2] = {queueFamily_, asyncFamily_};
+  if (asyncFamily_ != UINT32_MAX && asyncFamily_ != queueFamily_) {
+    bci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    bci.queueFamilyIndexCount = 2;
+    bci.pQueueFamilyIndices = families;
+  }
 
   VmaAllocationCreateInfo aci{};
   const bool mapRead = rhi::Any(usage, rhi::BufferUsage::MapRead);
@@ -1176,6 +1482,278 @@ VkFence Backend::AcquireFence(std::string& err) {
   return f;
 }
 
+VkCommandBuffer Backend::BeginCommandsNoFlush() {
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (!freeCmds_.empty()) {
+    cmd = freeCmds_.back();
+    freeCmds_.pop_back();
+  } else {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (dfn_.AllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+  }
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn_.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+    freeCmds_.push_back(cmd);
+    return VK_NULL_HANDLE;
+  }
+  return cmd;
+}
+
+// ---------------------------------------------------------------------------
+// ASYNC COMPUTE (rhi_vulkan.h's block comment; docs/PLAN_async_compute.md).
+// ---------------------------------------------------------------------------
+void Backend::SetAsyncEnabled(bool on) {
+  if (!on || !caps_.asyncComputeAvailable) {
+    asyncEnabled_ = false;
+    return;
+  }
+  if (!asyncUsed_) {
+    // First switch-on: the async family's command pool and the two timeline
+    // semaphores. Created here rather than at Init so a run that never turns
+    // the switch on submits exactly what it always did — no timeline chained
+    // onto any submit, no second pool.
+    VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpi.queueFamilyIndex = asyncFamily_;
+    if (dfn_.CreateCommandPool(device_, &cpi, nullptr, &asyncCmdPool_) != VK_SUCCESS) {
+      std::fprintf(stderr, "async compute: vkCreateCommandPool failed; staying single-queue\n");
+      caps_.asyncComputeAvailable = false;
+      return;
+    }
+    VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    ti.initialValue = 0;
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    sci.pNext = &ti;
+    if (dfn_.CreateSemaphore(device_, &sci, nullptr, &mainTimeline_) != VK_SUCCESS ||
+        dfn_.CreateSemaphore(device_, &sci, nullptr, &asyncTimeline_) != VK_SUCCESS) {
+      std::fprintf(stderr, "async compute: timeline semaphore creation failed; staying single-queue\n");
+      caps_.asyncComputeAvailable = false;
+      return;
+    }
+    // Everything submitted to the main queue BEFORE the timeline existed must
+    // still be ordered before the first async submit. One empty submit that
+    // signals the timeline, behind all of it in queue order, says so.
+    VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    const uint64_t v = ++mainValue_;
+    tsi.signalSemaphoreValueCount = 1;
+    tsi.pSignalSemaphoreValues = &v;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &tsi;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &mainTimeline_;
+    dfn_.QueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    asyncUsed_ = true;
+  }
+  asyncEnabled_ = true;
+}
+
+VkCommandBuffer Backend::BeginAsyncCommands() {
+  if (!asyncUsed_) return VK_NULL_HANDLE;
+  PollFences();
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (!freeAsyncCmds_.empty()) {
+    cmd = freeAsyncCmds_.back();
+    freeAsyncCmds_.pop_back();
+  } else {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = asyncCmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (dfn_.AllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+  }
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn_.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+    freeAsyncCmds_.push_back(cmd);
+    return VK_NULL_HANDLE;
+  }
+  // NO FlushUploads: a pending upload belongs to the MAIN queue's order. An
+  // upload drained here would run concurrently with main-queue work that was
+  // queued after it — the issue-order contract (semantics 1 in this file's
+  // header) would stop holding across queues.
+  return cmd;
+}
+
+void Backend::AbandonAsyncCommands(VkCommandBuffer cmd, bool ended) {
+  if (cmd == VK_NULL_HANDLE) return;
+  if (!ended) dfn_.EndCommandBuffer(cmd);
+  freeAsyncCmds_.push_back(cmd);
+}
+
+VkFence Backend::SubmitAsync(VkCommandBuffer cmd, const std::vector<AsyncTouch>& touched,
+                             std::string& err) {
+  if (!asyncUsed_ || asyncQueue_ == VK_NULL_HANDLE) {
+    err = "SubmitAsync without an async queue";
+    return VK_NULL_HANDLE;
+  }
+  VkFence fence = AcquireFence(err);
+  if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+  // WAIT for every main-queue submit so far (the latest value signalled), at
+  // ALL_COMMANDS: the async work runs strictly after the tick that produced its
+  // inputs, as it would at the end of that tick's command buffer.
+  const uint64_t waitV = mainValue_;
+  const uint64_t sigV = asyncSubmitted_ + 1;
+  VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  tsi.waitSemaphoreValueCount = 1;
+  tsi.pWaitSemaphoreValues = &waitV;
+  tsi.signalSemaphoreValueCount = 1;
+  tsi.pSignalSemaphoreValues = &sigV;
+  const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.pNext = &tsi;
+  si.waitSemaphoreCount = 1;
+  si.pWaitSemaphores = &mainTimeline_;
+  si.pWaitDstStageMask = &waitStage;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  si.signalSemaphoreCount = 1;
+  si.pSignalSemaphores = &asyncTimeline_;
+  VkResult r = dfn_.QueueSubmit(asyncQueue_, 1, &si, fence);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkQueueSubmit (async) failed: ") + vkl::ResultName(r);
+    return VK_NULL_HANDLE;
+  }
+  asyncSubmitted_ = sigV;
+  // The conflict set ACCUMULATES until a join: two async submits with no main
+  // join between them (no conflicting main command in between) are both owed.
+  for (const AsyncTouch& t : touched) {
+    if (!t.buf) continue;
+    bool& w = asyncTouch_[t.buf];
+    w = w || t.write;
+  }
+  InFlight e{fence, cmd, stagingSubmitted_, stagingSubmitted_, ++submitSerial_};
+  e.asyncPool = true;
+  inFlight_.push_back(e);
+  asyncStats_.submits++;
+  return fence;
+}
+
+bool Backend::AsyncConflict(const Buffer* b, bool write) const {
+  if (!AsyncOutstanding() || !b) return false;
+  auto it = asyncTouch_.find(b);
+  if (it == asyncTouch_.end()) return false;
+  // A main-queue WRITE races any async access (WAR or WAW); a main-queue READ
+  // races only an async WRITE (RAW). Read/read is the overlap this exists for.
+  return write || it->second;
+}
+
+VkFence Backend::SubmitMainJoined(VkCommandBuffer head, VkCommandBuffer tail,
+                                  bool joinHead, bool joinTail, bool presenting,
+                                  std::string& err) {
+  return SubmitMainImpl(head, tail, joinHead, joinTail, presenting, err);
+}
+
+// The ONE main-queue submit once the timelines exist (asyncUsed_): every main
+// submit signals mainTimeline_, and a join waits asyncTimeline_. Before the
+// first SetAsyncEnabled(true) the old single-queue paths are used unchanged.
+VkFence Backend::SubmitMainImpl(VkCommandBuffer head, VkCommandBuffer tail,
+                                bool joinHead, bool joinTail, bool presenting,
+                                std::string& err) {
+  VkFence fence = AcquireFence(err);
+  if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+  const bool present = presenting && pendingAcquireSlot_ != nullptr &&
+                       acquiredIndex_ != UINT32_MAX;
+  const uint64_t joinV = asyncSubmitted_;
+  const bool needJoin = AsyncOutstanding();
+  joinHead = joinHead && needJoin;
+  // A head join waits in BOTH batches: a semaphore wait's second scope is its
+  // OWN batch only, so the tail would otherwise reach the async results only
+  // through a barrier chain — legal to reason about, easy to get wrong.
+  // Waiting one timeline value twice costs nothing.
+  joinTail = (joinTail || joinHead) && needJoin && tail != VK_NULL_HANDLE;
+
+  // Up to two VkSubmitInfo: [head] then [tail]. Semaphore arrays per info.
+  struct Part {
+    VkSemaphore waits[2];
+    uint64_t waitVals[2];
+    VkPipelineStageFlags waitStages[2];
+    uint32_t nWait = 0;
+    VkSemaphore sigs[2];
+    uint64_t sigVals[2];
+    uint32_t nSig = 0;
+    VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  } parts[2];
+  VkSubmitInfo si[2]{};
+  const uint32_t nParts = tail != VK_NULL_HANDLE ? 2u : 1u;
+  // The swapchain acquire wait goes on the FIRST part (it only gates the
+  // colour-attachment / transfer stages, which a compute head never reaches
+  // before the render pass anyway), the render-done signal on the LAST.
+  if (present) {
+    Part& p = parts[0];
+    p.waits[p.nWait] = pendingAcquireSlot_->sem;
+    p.waitVals[p.nWait] = 0;
+    p.waitStages[p.nWait] = kSwapchainAcquireWaitStages;
+    p.nWait++;
+  }
+  if (joinHead) {
+    Part& p = parts[0];
+    p.waits[p.nWait] = asyncTimeline_;
+    p.waitVals[p.nWait] = joinV;
+    p.waitStages[p.nWait] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    p.nWait++;
+  }
+  if (joinTail) {
+    Part& p = parts[1];
+    p.waits[p.nWait] = asyncTimeline_;
+    p.waitVals[p.nWait] = joinV;
+    p.waitStages[p.nWait] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    p.nWait++;
+  }
+  {
+    Part& p = parts[nParts - 1];
+    p.sigs[p.nSig] = mainTimeline_;
+    p.sigVals[p.nSig] = ++mainValue_;
+    p.nSig++;
+    if (present) {
+      p.sigs[p.nSig] = renderDone_[acquiredIndex_];
+      p.sigVals[p.nSig] = 0;
+      p.nSig++;
+    }
+  }
+  VkCommandBuffer cmds[2] = {head, tail};
+  for (uint32_t i = 0; i < nParts; i++) {
+    Part& p = parts[i];
+    p.tsi.waitSemaphoreValueCount = p.nWait;
+    p.tsi.pWaitSemaphoreValues = p.waitVals;
+    p.tsi.signalSemaphoreValueCount = p.nSig;
+    p.tsi.pSignalSemaphoreValues = p.sigVals;
+    si[i].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si[i].pNext = &p.tsi;
+    si[i].waitSemaphoreCount = p.nWait;
+    si[i].pWaitSemaphores = p.waits;
+    si[i].pWaitDstStageMask = p.waitStages;
+    si[i].commandBufferCount = 1;
+    si[i].pCommandBuffers = &cmds[i];
+    si[i].signalSemaphoreCount = p.nSig;
+    si[i].pSignalSemaphores = p.sigs;
+  }
+  VkResult r = dfn_.QueueSubmit(queue_, nParts, si, fence);
+  if (r != VK_SUCCESS) {
+    err = std::string("vkQueueSubmit (main, timeline) failed: ") + vkl::ResultName(r);
+    return VK_NULL_HANDLE;
+  }
+  NoteSubmit(fence, head);
+  inFlight_.back().cmd2 = tail;
+  if (joinHead || joinTail) {
+    asyncJoined_ = joinV;
+    asyncTouch_.clear();
+    asyncStats_.joins++;
+    if (joinHead) asyncStats_.headJoins++;
+  }
+  if (tail != VK_NULL_HANDLE) asyncStats_.splits++;
+  if (present) {
+    RetainFence(fence);
+    pendingAcquireSlot_->lastUse = fence;
+    pendingAcquireSlot_ = nullptr;
+  }
+  return fence;
+}
+
 VkCommandBuffer Backend::BeginCommands(const char* /*label*/) {
   PollFences();  // recycle anything already finished
   // Reuse a retired command buffer when there is one (PollFences and
@@ -1206,6 +1784,18 @@ VkCommandBuffer Backend::BeginCommands(const char* /*label*/) {
   // "deferred to the start of the next submit" — including the case where the
   // path that issued the writes submits nothing at all (Stream::FillSlots when
   // every slot hits the store), whose writes then belong to the next tick.
+  //
+  // ASYNC COMPUTE: an upload is a WRITE recorded at the very head of this
+  // buffer, so if it targets anything the outstanding async work touches, this
+  // whole command buffer must wait for that work (the seam reads the flag and
+  // joins at the head). Decided BEFORE the flush consumes the list.
+  lastBeginJoinHead_ = false;
+  if (AsyncOutstanding())
+    for (const Pending& p : pending_)
+      if (asyncTouch_.count(p.dst)) {
+        lastBeginJoinHead_ = true;
+        break;
+      }
   FlushUploads(cmd);
   return cmd;
 }
@@ -1219,6 +1809,10 @@ VkFence Backend::SubmitCommands(VkCommandBuffer cmd, std::string& err) {
 }
 
 VkFence Backend::SubmitEnded(VkCommandBuffer cmd, std::string& err) {
+  // Once the async timelines exist every main submit must signal the main
+  // timeline, and a caller that did not decide its own join (anything that is
+  // not the seam's Queue::Submit) joins conservatively at the head.
+  if (asyncUsed_) return SubmitMainImpl(cmd, VK_NULL_HANDLE, true, false, false, err);
   VkFence fence = AcquireFence(err);
   if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
@@ -1308,8 +1902,14 @@ void Backend::PollFences() {
     if (dfn_.GetFenceStatus(device_, inFlight_[i].fence) == VK_SUCCESS) {
       VkFence f = inFlight_[i].fence;
       // Retired: the GPU is done with it, so it goes back for reuse
-      // (BeginCommands) rather than to the pool.
-      freeCmds_.push_back(inFlight_[i].cmd);
+      // (BeginCommands) rather than to the pool. An async submit's buffer
+      // belongs to the async family's pool; a split main buffer's tail rides
+      // the same fence.
+      if (inFlight_[i].asyncPool)
+        freeAsyncCmds_.push_back(inFlight_[i].cmd);
+      else
+        freeCmds_.push_back(inFlight_[i].cmd);
+      if (inFlight_[i].cmd2 != VK_NULL_HANDLE) freeCmds_.push_back(inFlight_[i].cmd2);
       // A RETAINED fence must not go back to the pool: a borrower (a readback
       // slot, an eviction batch) still holds the handle and still needs
       // vkGetFenceStatus on it to mean THIS submit. Park it until the last
@@ -1483,6 +2083,16 @@ bool Backend::WaitIdle(std::string& err) {
   if (r != VK_SUCCESS) {
     err = std::string("vkQueueWaitIdle failed: ") + vkl::ResultName(r);
     return false;
+  }
+  // The async queue too, once it has ever been used: "all submitted GPU work"
+  // includes the derived passes, and a caller that reads a render-only buffer
+  // after WaitIdle (a gate's openness probe) must see them finished.
+  if (asyncUsed_ && asyncQueue_ != VK_NULL_HANDLE) {
+    r = dfn_.QueueWaitIdle(asyncQueue_);
+    if (r != VK_SUCCESS) {
+      err = std::string("vkQueueWaitIdle (async) failed: ") + vkl::ResultName(r);
+      return false;
+    }
   }
   PollFences();
   return true;
@@ -1755,7 +2365,10 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   ci.stage = stage;
   ci.layout = layout;
-  if (captureStats_) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  // Only with the extension enabled: the flag is invalid without it (found by
+  // validation on llvmpipe, which lacks it).
+  if (captureStats_ && caps_.pipelineExecutableProps)
+    ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
   // Did this create hit the on-disk cache? (NoteCreationFeedback.) One stage
   // feedback per shader stage: the count must be 0 or stageCount, and 0 is
   // only legal on drivers new enough to accept it.
@@ -1967,7 +2580,10 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
   ci.pDynamicState = &dstate;
   ci.layout = layout;
   ci.renderPass = VK_NULL_HANDLE;  // dynamic rendering
-  if (captureStats_) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  // Only with the extension enabled: the flag is invalid without it (found by
+  // validation on llvmpipe, which lacks it).
+  if (captureStats_ && caps_.pipelineExecutableProps)
+    ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
   // Cache hit/miss, as in the compute path; chained after the rendering info.
   VkPipelineCreationFeedback fb{}, stageFb[2]{};
   VkPipelineCreationFeedbackCreateInfo fbi{
@@ -2339,6 +2955,7 @@ Image* Backend::AcquireSwapchainImage() {
 VkFence Backend::SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err) {
   if (pendingAcquireSlot_ == nullptr || acquiredIndex_ == UINT32_MAX)
     return SubmitEnded(cmd, err);  // no acquire outstanding: plain submit
+  if (asyncUsed_) return SubmitMainImpl(cmd, VK_NULL_HANDLE, true, false, true, err);
   VkFence fence = AcquireFence(err);
   if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
@@ -2447,6 +3064,59 @@ VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
       if (layoutEntries[j].binding == entries[i].binding) {
         type = ToVkDescriptorType(layoutEntries[j].type, layoutEntries[j].hasDynamicOffset);
         break;
+      }
+    }
+    // A STORAGE RANGE OVER THE DEVICE'S LIMIT IS A HARD MINIMUM, NOT A HINT.
+    // The voxel page pool (576 MiB at a 512 window) and the far cascade are
+    // single bindings, and a device whose maxStorageBufferRange is smaller
+    // (Dozen maps storage buffers onto D3D12 raw views, whose element-count
+    // ceiling is far below the NVIDIA driver's 4 GiB) would bind a truncated
+    // view: reads past the end come back as the robustness behaviour of that
+    // implementation and writes vanish — a world hash that differs for a reason
+    // that is not a determinism bug at all. Refuse at the point of failure,
+    // naming the binding and both numbers.
+    if ((type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+         type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) &&
+        caps_.maxStorageBufferRange && infos[i].range != VK_WHOLE_SIZE &&
+        infos[i].range > caps_.maxStorageBufferRange) {
+      // SANDVOX_ALLOW_OVERSIZE_BINDINGS=1: run anyway, OUT OF SPEC, and say
+      // so in every record (Caps::oversizeBindings -> the device JSON and the
+      // fingerprint). This exists for ONE use: a CPU implementation whose
+      // advertised limit is a conservative cap rather than a real one (Mesa
+      // llvmpipe advertises 128 MiB; its bounds checks carry the real 32-bit
+      // binding size). A hash that then MATCHES the native driver's is still
+      // evidence — a truncated binding diverges, it does not coincide — but a
+      // hash that differs proves nothing until the binding is in spec.
+      // SANDVOX_ALLOW_OVERSIZE_BINDINGS=clamp: the DIAGNOSTIC arm — bind only
+      // the first maxStorageBufferRange bytes (in spec, wrong results). If a
+      // driver that dies with the oversize binding runs with this, the
+      // oversize binding is what killed it.
+      if (const char* ov = std::getenv("SANDVOX_ALLOW_OVERSIZE_BINDINGS");
+          ov && std::strcmp(ov, "clamp") == 0) {
+        caps_.oversizeBindings = true;
+        if (infos[i].range > caps_.oversizeMaxRange) caps_.oversizeMaxRange = infos[i].range;
+        infos[i].range = caps_.maxStorageBufferRange & ~(uint64_t)3;
+      } else if (const char* ov2 = std::getenv("SANDVOX_ALLOW_OVERSIZE_BINDINGS"); ov2 && *ov2 == '1') {
+        if (!caps_.oversizeBindings || infos[i].range > caps_.oversizeMaxRange)
+          std::fprintf(stderr,
+                       "WARNING (out of spec, SANDVOX_ALLOW_OVERSIZE_BINDINGS): storage "
+                       "binding %u '%s' covers %llu bytes > maxStorageBufferRange %llu\n",
+                       entries[i].binding, b->label.c_str(),
+                       (unsigned long long)infos[i].range,
+                       (unsigned long long)caps_.maxStorageBufferRange);
+        caps_.oversizeBindings = true;
+        if (infos[i].range > caps_.oversizeMaxRange) caps_.oversizeMaxRange = infos[i].range;
+      } else {
+      std::fprintf(stderr,
+                   "FATAL: storage binding %u covers %llu bytes (rhi::Buffer '%s') but "
+                   "this device's maxStorageBufferRange is %llu (%s). The engine needs "
+                   "one binding over the whole page pool / far cascade; this device "
+                   "cannot run it.\n",
+                   entries[i].binding, (unsigned long long)infos[i].range,
+                   b->label.c_str(), (unsigned long long)caps_.maxStorageBufferRange,
+                   caps_.deviceName.c_str());
+      std::fflush(stderr);
+      std::abort();
       }
     }
 
@@ -2586,6 +3256,14 @@ void Backend::Shutdown() {
   std::string err;
   WaitIdle(err);
   const double waitMs = msSince(tShut0);
+  if (asyncUsed_)
+    std::fprintf(stderr,
+                 "[shutdown] async compute: %llu async submits, %llu main-queue joins "
+                 "(%llu at a buffer head), %llu split command buffers\n",
+                 (unsigned long long)asyncStats_.submits,
+                 (unsigned long long)asyncStats_.joins,
+                 (unsigned long long)asyncStats_.headJoins,
+                 (unsigned long long)asyncStats_.splits);
 
   {
     std::lock_guard<std::mutex> lock(pipelineMutex_);
@@ -2630,10 +3308,22 @@ void Backend::Shutdown() {
                  waitMs, pipelineCachePath_.c_str());
 
   for (auto& f : inFlight_) {
-    dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &f.cmd);
+    dfn_.FreeCommandBuffers(device_, f.asyncPool ? asyncCmdPool_ : cmdPool_, 1, &f.cmd);
+    if (f.cmd2 != VK_NULL_HANDLE) dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &f.cmd2);
     dfn_.DestroyFence(device_, f.fence, nullptr);
   }
   inFlight_.clear();
+  if (asyncCmdPool_ != VK_NULL_HANDLE) {
+    if (!freeAsyncCmds_.empty())
+      dfn_.FreeCommandBuffers(device_, asyncCmdPool_, (uint32_t)freeAsyncCmds_.size(),
+                              freeAsyncCmds_.data());
+    freeAsyncCmds_.clear();
+    dfn_.DestroyCommandPool(device_, asyncCmdPool_, nullptr);
+    asyncCmdPool_ = VK_NULL_HANDLE;
+  }
+  if (mainTimeline_ != VK_NULL_HANDLE) dfn_.DestroySemaphore(device_, mainTimeline_, nullptr);
+  if (asyncTimeline_ != VK_NULL_HANDLE) dfn_.DestroySemaphore(device_, asyncTimeline_, nullptr);
+  mainTimeline_ = asyncTimeline_ = VK_NULL_HANDLE;
   // Pool destruction below frees these too; explicit so the list is not left
   // holding handles into a dead pool.
   if (!freeCmds_.empty())

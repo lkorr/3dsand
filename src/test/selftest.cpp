@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "gpu/context.h"    // LastDeviceJson — which implementation ran
 #include "gpu/resources.h"
 #include "sim/oprecord.h"   // op-stream clamp counters + SANDVOX_RECORD_OPS
 #include "sim/pagetable.h"  // PagesHighWater for the pool-margin report
@@ -1421,6 +1422,9 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
   // the result rather than printed only at boot, so the explanation is still
   // there when somebody reads last_run.json a day later.
   f << "  \"tuningStamp\": " << sandvox::StampTuning(AssetDir()).Json() << ",\n";
+  // WHICH IMPLEMENTATION produced the hashes above (cross-vendor determinism,
+  // DESIGN.md §14 risk 3): device, driver, API version, build commit.
+  f << "  \"device\": " << LastDeviceJson() << ",\n";
   // What the driver charged for each pipeline this run, always
   // (docs/PLAN_shader_compile.md package A item 4). A cold worldgen compile is
   // minutes and the entry point that took them is not otherwise recorded

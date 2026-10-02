@@ -156,6 +156,12 @@ fn build(@builtin(global_invocation_id) gid : vec3<u32>) {
   let d = rxDomain(n);
   let count = u32(d.z * d.w);
   if (gid.x >= count) { return; }
+  // The buffer holds RX_MAX_AXIS^2 words, sized for |slope| <= kRainSlopeMaxN,
+  // which weather.cpp clamps. A TickParams from anywhere else (an op record, a
+  // peer) is not clamped by that code, and past the end Tint's robustness
+  // clamp would fold every excess thread onto the LAST word — many writers,
+  // different values, a scheduling-dependent survivor (cross-vendor audit).
+  if (gid.x >= u32(RX_MAX_AXIS * RX_MAX_AXIS)) { return; }
   let t = vec2<i32>(i32(gid.x % u32(d.z)), i32(gid.x / u32(d.z)));
   let k = ((d.xy + t) << vec2<u32>(RX_TEX_SHIFT)) + vec2<i32>(RX_REP);
   rainExpo[gid.x] = bitcast<u32>(rxMarch(k, n));

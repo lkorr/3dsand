@@ -620,6 +620,8 @@ void WriteSmokeJson(const char* path, const char* scenario, const RunResult& run
     f << "  \"shifts\": " << run.shifts << ",\n"
       << "  \"storeCount\": " << run.storeCount << ",\n";
   f << "  \"pinnedCount\": " << pinnedCount << ",\n";
+  // Which implementation produced the probes (cross-vendor determinism).
+  f << "  \"device\": " << LastDeviceJson() << ",\n";
   // Per-pipeline driver compile ms + the two readiness milestones
   // (docs/PLAN_shader_compile.md package A item 4).
   f << PipelineTimingJson("  ") << "\n";
