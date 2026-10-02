@@ -4893,6 +4893,16 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
                       w.remoteBlastGore.end());
         w.remoteBlastGore.clear();
       }
+      // ---- far landings coming home (chunk tickets P2, sim/tickets.h) ------
+      // Matter that came to rest outside residency and was parked on the CPU
+      // is re-thrown, still, on the tick its chunk is resident again (a ticket
+      // or the window). On the ordinary spawn stream, bounded by its cap like
+      // every other producer on it; what does not fit waits for the next tick.
+      // HERE, before the keep-awake latch below, so a re-thrown particle keeps
+      // the particle passes alive until it has landed, like any other spawn.
+      if (stream.TicketSet().HasLandingSpawns() && spawns.size() < kMaxParticleSpawnsPerTick)
+        stream.TicketSet().DrainLandingSpawns(
+            spawns, kMaxParticleSpawnsPerTick - (uint32_t)spawns.size());
       // body-shatter spawns keep the particle passes alive exactly like
       // explosions do (a fragment must fly and land on later ticks too)
       if (!spawns.empty()) {
@@ -4947,14 +4957,6 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
         WorldEditLayer().Drain(world, cellOps,
                                kMaxCellOpsPerTick - (uint32_t)cellOps.size(),
                                world.TicksEncoded() + 1u);
-      // ---- far landings coming home (chunk tickets P2, sim/tickets.h) ------
-      // Matter that came to rest outside residency and was parked on the CPU
-      // is re-thrown, still, on the tick its chunk is resident again (a ticket
-      // or the window). On the ordinary spawn stream, bounded by its cap like
-      // every other producer on it; what does not fit waits for the next tick.
-      if (stream.TicketSet().HasLandingSpawns() && spawns.size() < kMaxParticleSpawnsPerTick)
-        stream.TicketSet().DrainLandingSpawns(
-            spawns, kMaxParticleSpawnsPerTick - (uint32_t)spawns.size());
   }
 }
 

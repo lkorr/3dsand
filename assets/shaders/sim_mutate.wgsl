@@ -359,7 +359,10 @@ const SCOOP_REFUSED_WORD : u32 = 38u;
 fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.cellCount) { return; }
   let op = cellOps[gid.x];
-  if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
+  // The SLOT space, not the window's volume (chunk tickets: a ticket cell's
+  // index is ticketSlot * CHUNK_VOL + local, past WORLD_N^3). A P0 miss —
+  // the bound is class (b), storage, and it read as class (c).
+  if (op.cellIdx >= NUM_SLOTS * CHUNK_VOL) { return; }
   var word = op.word;
   // cellIdx is a SLOT index, so under paging it is NOT a physical word index
   // (§5.5). Decompose it — which this entry point already did below, to

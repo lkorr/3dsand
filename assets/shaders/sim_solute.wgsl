@@ -670,7 +670,8 @@ const SOL_SCOOP_SPECIES : u32 = 8u;
 fn solScoop(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.cellCount) { return; }
   let op = cellOps[gid.x];
-  if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
+  // The slot space (chunk tickets), as sim_mutate.wgsl's `cells`.
+  if (op.cellIdx >= NUM_SLOTS * CHUNK_VOL) { return; }
   if ((op.word & CELLOP_IF_AIR) == 0u || (op.word & 0xFFFu) != MAT_AIR) { return; }
   // A SOLUTE POUR (world.h CellOpSolute) shares the IF_AIR-on-AIR spelling
   // with a clear; its species in bits 24..30 is what tells them apart (a

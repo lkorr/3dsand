@@ -1402,7 +1402,8 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"released\": " << ts.released << ", \"releasedIdle\": " << ts.releasedIdle
       << ", \"releasedTimeout\": " << ts.releasedTimeout
       << ", \"releasedOverlap\": " << ts.releasedOverlap
-      << ", \"recentred\": " << ts.recentred << ", \"chunksKept\": " << ts.chunksKept
+      << ", \"recentred\": " << ts.recentred << ", \"recentreRefused\": " << ts.recentreRefused
+      << ", \"chunksKept\": " << ts.chunksKept
       << ", \"chunksSkipped\": " << ts.chunksSkipped
       << ", \"conservative\": " << ts.conservative
       << ", \"activeTickSum\": " << ts.activeTickSum

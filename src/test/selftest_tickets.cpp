@@ -118,9 +118,12 @@ std::vector<uint64_t> PerChunkMass(Ctx& c, uint32_t ticket, uint32_t mat) {
 }
 
 // Are all 27 ACTIVE chunks of ticket `i` clean in the published snapshot?
-bool ActiveAsleep(Ctx& c, uint32_t i) {
+// `since`: the tick whose ops started the activity. A snapshot older than it
+// describes the box BEFORE the pour (kSnapshotLatency ticks of lag) and would
+// read as "asleep" the moment the gate starts looking.
+bool ActiveAsleep(Ctx& c, uint32_t i, uint32_t since) {
   const WorldSnapshot& s = c.world.Snap();
-  if (!s.valid || s.dirtyFlags.size() != kNumSlots) return false;
+  if (!s.valid || s.dirtyFlags.size() != kNumSlots || s.tick <= since + 1) return false;
   for (uint32_t l = 0; l < kTicketChunks; l++) {
     const uint32_t slot = World::TicketSlotBase(i) + l;
     if (c.world.TicketSlotActive(slot) && s.dirtyFlags[slot] != 0) return false;
@@ -141,9 +144,24 @@ struct SettleRun {
   uint32_t storedChunks = 0;
   int asleepAt = -1;            // ticks after the pour the snapshot went quiet
   int releasedAt = -1;          // ticks after the pour the ticket left the table
+  // ATTRIBUTION: the pour's tick, the snapshot tick the gate called asleep,
+  // and what the ticket did between the pour and its release.
+  uint32_t pourTick = 0, asleepSnapTick = 0;
+  uint64_t recentred = 0, relIdle = 0, relTimeout = 0;
+  // The last tick (after the pour) the box re-centred, -1 if it never did. A
+  // re-centre refills a plane and restarts the idle clock, so the release lag
+  // is measured from the later of this and asleepAt.
+  int lastRecentreAt = -1;
+  uint32_t recentredSeen = 0;
   uint32_t hashMid = 0, hashSettled = 0;
   std::vector<uint32_t> ops;    // the TicketOp kinds the run recorded (twice-run)
   uint32_t faults = 0;
+  // attribution for a pour that did not land
+  uint32_t pourOps = 0, probeSlot = 0, probeBefore = 0, probeAfter = 0;
+  uint32_t probeCpuEntry = 0, probeGpuEntry = 0, probeTable[8] = {};
+  uint32_t colNonAir[kTicketBoxN] = {};
+  int colTop = -1 << 30, ground = 0;
+  uint32_t colTopMat = 0;
 };
 
 bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
@@ -177,6 +195,28 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
   R.live = true;
   R.lo = c.stream.TicketSet().BoxLo(R.ticket);
   c.ctx.WaitIdle();
+  // ATTRIBUTION: non-air cells in each of the centre column's five chunks,
+  // bottom up, and the top non-air y of the column at the footprint's corner
+  // — what the ticket was FILLED with, against TerrainHeight's ground.
+  {
+    std::vector<uint32_t> buf(kChunkVol);
+    for (int k = 0; k < (int)kTicketBoxN; k++) {
+      const uint32_t s = c.world.TicketSlotOfChunk({cx, R.lo.y + k, cz});
+      if (s == World::kTicketSlotNone) continue;
+      ReadVoxelsSync(c.ctx, c.world, s, 1, buf.data(), "ticketColumn");
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < kChunkVol; i++) {
+        if ((buf[i] & 0xFFFu) == 0u) continue;
+        n++;
+        if (i % 16 == 0 && i / 256 == 0) {  // the (x0, z0) column
+          const int y = (R.lo.y + k) * 16 + (int)((i / 16) % 16);
+          if (y > R.colTop) { R.colTop = y; R.colTopMat = buf[i] & 0xFFFu; }
+        }
+      }
+      R.colNonAir[k] = n;
+    }
+    R.ground = ground;
+  }
   const std::vector<uint64_t> pristine = PerChunkMass(c, R.ticket, (uint32_t)mSand);
   for (uint64_t m : pristine) R.base += m;
 
@@ -193,8 +233,34 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
         }
         pour.push_back({ci, PackVoxNew((uint32_t)mSand, 0) | kCellOpIfAir});
       }
+  // ATTRIBUTION (CLAUDE.md rule 6): if the pour does not land, say WHERE it
+  // stopped — the first pour cell's word before and after, the slot's page
+  // on both sides of the table, and the GPU ticket table's head.
+  const uint32_t probeCi = pour.empty() ? 0u : pour[0].cellIdx;
+  const uint32_t probeSlot = probeCi / kChunkVol;
+  std::vector<uint32_t> probeBuf(kChunkVol);
+  c.ctx.WaitIdle();
+  ReadVoxelsSync(c.ctx, c.world, probeSlot, 1, probeBuf.data(), "ticketProbe0");
+  R.probeBefore = probeBuf[probeCi % kChunkVol];
+  const uint32_t pourTick = t;
+  R.pourTick = pourTick;
+  const TicketStats s0 = c.stream.TicketSet().Stats();
   tick(std::vector<BrushOp>{}, pour);
   c.ctx.WaitIdle();
+  ReadVoxelsSync(c.ctx, c.world, probeSlot, 1, probeBuf.data(), "ticketProbe1");
+  R.probeAfter = probeBuf[probeCi % kChunkVol];
+  R.probeSlot = probeSlot;
+  R.probeCpuEntry = c.world.PageEntryOfSlot(probeSlot);
+  {
+    uint32_t gpu[1 + 8] = {};
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.pageTable,
+                          (uint64_t)probeSlot * 4, gpu, 4, "ticketProbePt");
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.pageTable,
+                          (uint64_t)kTicketTableBase * 4, gpu + 1, 32, "ticketProbeTbl");
+    R.probeGpuEntry = gpu[0];
+    for (int k = 0; k < 8; k++) R.probeTable[k] = gpu[1 + k];
+  }
+  R.pourOps = (uint32_t)pour.size();
   R.mass0 = ReadTicket(c, R.ticket, (uint32_t)mSand).mass;
   R.poured = (uint32_t)((R.mass0 - R.base) / kPowderFull);
 
@@ -202,10 +268,16 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
   for (int i = 1; i <= kTicks; i++) {
     tick();
     const Tickets::State st = c.stream.TicketSet().StateOf(R.ticket);
-    if (st == Tickets::State::Live && R.asleepAt < 0 && ActiveAsleep(c, R.ticket))
+    if (st == Tickets::State::Live && R.asleepAt < 0 && ActiveAsleep(c, R.ticket, pourTick)) {
       R.asleepAt = i;
-    if (st == Tickets::State::Live && R.asleepAt < 0) {
-      // keep looking
+      R.asleepSnapTick = c.world.Snap().tick;
+    }
+    {
+      const uint32_t rc = (uint32_t)(c.stream.TicketSet().Stats().recentred - s0.recentred);
+      if (rc != R.recentredSeen) {
+        R.recentredSeen = rc;
+        R.lastRecentreAt = i;
+      }
     }
     if (i == 40) {
       c.ctx.WaitIdle();
@@ -213,6 +285,10 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
     }
     if (st != Tickets::State::Live && R.releasedAt < 0) {
       R.releasedAt = i;
+      const TicketStats& s1 = c.stream.TicketSet().Stats();
+      R.recentred = s1.recentred - s0.recentred;
+      R.relIdle = s1.releasedIdle - s0.releasedIdle;
+      R.relTimeout = s1.releasedTimeout - s0.releasedTimeout;
       break;
     }
     // The last look at the slots while the ticket still owns them.
@@ -266,8 +342,9 @@ Status GateTicketSettle(Ctx& c, std::string& detail) {
   const bool conserved = A.massSettled == A.mass0 && A.massStore == A.mass0 &&
                          A.massBack == A.mass0;
   const bool asleep = A.asleepAt >= 0 && A.asleepAt <= asleepMax;
+  const int quietFrom = std::max(A.asleepAt, A.lastRecentreAt);
   const bool released = A.releasedAt >= 0 && A.asleepAt >= 0 &&
-                        A.releasedAt - A.asleepAt <= releaseLagMax;
+                        A.releasedAt - quietFrom <= releaseLagMax;
   const bool stored = A.storedChunks > 0;
   const bool same = A.hashMid == B.hashMid && A.hashSettled == B.hashSettled &&
                     A.asleepAt == B.asleepAt && A.releasedAt == B.releasedAt &&
@@ -284,15 +361,34 @@ Status GateTicketSettle(Ctx& c, std::string& detail) {
       "poured %u sand cells (natural sand in box %llu eighths); mass %llu at pour, "
       "%llu settled, %llu from the store (%u chunks kept), %llu decoded back by a "
       "second ticket%s; active chunks asleep %d ticks after the pour (allow %d), "
-      "released %d ticks after (allow asleep + %d); page faults %u/%u; run twice: %s "
+      "re-centred last at +%d, released %d ticks after (allow max(asleep, re-centre) + %d); page faults %u/%u; run twice: %s "
       "(settled hash %08x vs %08x); live after regen %u",
       A.ticket, A.lo.x, A.lo.y, A.lo.z, A.centre.x, A.centre.y, A.centre.z, A.poured,
       (unsigned long long)A.base, (unsigned long long)A.mass0,
       (unsigned long long)A.massSettled, (unsigned long long)A.massStore, A.storedChunks,
       (unsigned long long)A.massBack, conserved ? " - CONSERVED" : " - MASS MOVED",
-      A.asleepAt, asleepMax, A.releasedAt, releaseLagMax, A.faults, B.faults,
+      A.asleepAt, asleepMax, A.lastRecentreAt, A.releasedAt, releaseLagMax, A.faults, B.faults,
       same ? "IDENTICAL" : "DIVERGED", A.hashSettled, B.hashSettled,
       c.stream.TicketSet().LiveCount());
+  if (!poured || !conserved)
+    detail += Format(
+        " | POUR PROBE: %u ops, first cell slot %u word %08x -> %08x, page entry "
+        "cpu %08x gpu %08x, GPU ticket table head [%u %u %u %u | %d %d %d %u]; "
+        "centre column chunks non-air bottom-up %u %u %u %u %u, corner column "
+        "top y %d (mat %u) vs TerrainHeight ground %d",
+        A.pourOps, A.probeSlot, A.probeBefore, A.probeAfter, A.probeCpuEntry,
+        A.probeGpuEntry, A.probeTable[0], A.probeTable[1], A.probeTable[2],
+        A.probeTable[3], (int)A.probeTable[4], (int)A.probeTable[5],
+        (int)A.probeTable[6], A.probeTable[7], A.colNonAir[0], A.colNonAir[1],
+        A.colNonAir[2], A.colNonAir[3], A.colNonAir[4], A.colTop, A.colTopMat,
+        A.ground);
+  if (!ok)
+    detail += Format(" | ATTRIBUTION: pour on tick %u, called asleep on snapshot tick %u; "
+                     "%llu re-centres, %llu idle / %llu timeout releases before release; "
+                     "last re-centre: %s",
+                     A.pourTick, A.asleepSnapTick, (unsigned long long)A.recentred,
+                     (unsigned long long)A.relIdle, (unsigned long long)A.relTimeout,
+                     c.stream.TicketSet().LastRecentreNote().c_str());
   std::printf("ticket-settle: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -337,9 +433,15 @@ struct LandRun {
   IVec3 boxLo{};
   uint32_t inStore = 0, storeHash = 0;
   bool released = false;
+  // arm A attribution: where did the stone go if it never parked?
+  uint32_t particlesMax = 0, farKilled = 0;
+  int particlesGoneAt = -1;
   // arm B: the cap is full, the stone deposits and comes back later
   uint64_t refusedCap = 0, deposited = 0, respawned = 0;
   uint32_t parkedAtFull = 0, landedLater = 0;
+  IVec3 landingChunk{};
+  bool landingHeld = false, landingGranted = false;
+  uint32_t capLiveAfter = 0;
   uint32_t faults = 0;
 };
 
@@ -355,7 +457,12 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
                   IVec3{o.x + (int)kNChunk / 2, o.y + (int)kNChunk / 2, o.z + (int)kNChunk / 2});
   const int faceX = (o.x + (int)kNChunk) * (int)kChunk;  // first cell past +X
   const int zMid = (o.z + (int)kNChunk / 2) * (int)kChunk;
-  const int hEdge = World::TerrainHeight(faceX - 6, zMid, kDefaultSeed);
+  // The throw clears the ground on BOTH sides of the face: the highest column
+  // within a chunk of it, then 20 cells of air.
+  int hEdge = -1 << 30;
+  for (int x = faceX - 16; x <= faceX + 16; x++)
+    hEdge = std::max(hEdge, World::TerrainHeight(x, zMid, kDefaultSeed));
+  hEdge += 8;
   const int vMax = (int)CurrentTuning().sim.partMaxVel;  // 6 voxels/tick, ~20 m/s
 
   uint32_t t = 82000;
@@ -364,7 +471,7 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
   // ---- ARM A: one stone off the +X face at full speed --------------------
   {
     support::TickOps ops;
-    ops.spawns.push_back(Stone({faceX - 6, hEdge + 12, zMid}, vMax, (uint32_t)mStone));
+    ops.spawns.push_back(Stone({faceX - 2, hEdge + 40, zMid}, vMax, (uint32_t)mStone));
     tick(ops);
   }
   bool second = false;
@@ -372,6 +479,12 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
     tick();
     const WorldSnapshot& s = c.world.Snap();
     if (R.landTick < 0 && s.valid && s.ticketParked > 0) R.landTick = (int)s.tick - 82000;
+    if (s.valid && s.tick > 82001) {
+      R.particlesMax = std::max(R.particlesMax, s.particleCount);
+      R.farKilled += s.ticketFarKilled;
+      if (R.particlesGoneAt < 0 && R.particlesMax > 0 && s.particleCount == 0)
+        R.particlesGoneAt = (int)s.tick - 82000;
+    }
     const uint64_t acts = c.stream.TicketSet().Stats().activated - act0;
     if (R.activateTick < 0 && acts > 0) {
       R.activateTick = (int)t - 82000;
@@ -383,7 +496,7 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
     // few cells over, it lands INSIDE the live box and must not open another.
     if (R.activateTick >= 0 && !second && (int)t - 82000 >= R.activateTick + 2) {
       support::TickOps ops;
-      ops.spawns.push_back(Stone({faceX - 6, hEdge + 12, zMid + 3}, vMax, (uint32_t)mStone));
+      ops.spawns.push_back(Stone({faceX - 2, hEdge + 40, zMid + 3}, vMax, (uint32_t)mStone));
       tick(ops);
       second = true;
     }
@@ -408,7 +521,9 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
     c.stream.TicketSet().Request({cx, (h + 6) >> 4, cz}, TicketReason::Gate, t + 1);
   }
   const int xB = faceX + 9 * (int)kChunk;   // 9 chunks past the face
-  const int zB = zMid + 2 * (int)kChunk;
+  // 12 chunks along Z from arm A's box: arm B's ticket must not overlap it,
+  // or arm A's two stored stones decode back into the count.
+  const int zB = zMid + 12 * (int)kChunk;
   const int hB = World::TerrainHeight(xB, zB, kDefaultSeed);
   {
     support::TickOps ops;
@@ -420,13 +535,23 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
   R.deposited = T.Stats().landingsDeposited - dep0;
   R.parkedAtFull = T.Stats().landingsParked;
   // Free the cap the way the world does (they idle out), then ask for the
-  // landing's chunk; the landing re-throws the tick it is resident.
+  // chunk the landing is waiting on (the one its deposit named, which is
+  // what a granted particle request would have named); it re-throws the
+  // tick that chunk is resident.
   for (int i = 0; i < 120 && c.stream.TicketSet().LiveCount() > 0; i++) tick();
-  const IVec3 landChunk{xB >> 4, (hB + 3) >> 4, zB >> 4};
+  R.capLiveAfter = c.stream.TicketSet().LiveCount();
+  // A released index stays RELEASING (not reusable) until its store decision
+  // lands, kSnapshotLatency ticks on: wait that out before asking again.
+  for (int i = 0; i < (int)World::kSnapshotLatency + 2; i++) tick();
+  const std::vector<IVec3> waiting = T.LandingChunks();
+  R.landingHeld = !waiting.empty();
+  const IVec3 landChunk = waiting.empty() ? IVec3{xB >> 4, (hB + 3) >> 4, zB >> 4} : waiting[0];
+  R.landingChunk = landChunk;
   c.stream.TicketSet().Request(landChunk, TicketReason::Gate, t + 1);
   for (int i = 0; i < 8; i++) tick();
   R.respawned = T.Stats().landingsRespawned - resp0;
   const uint32_t holder = c.stream.TicketSet().TicketHolding(landChunk);
+  R.landingGranted = holder < kTicketMax;
   if (holder < kTicketMax) {
     c.ctx.WaitIdle();
     std::vector<uint32_t> buf(kChunkVol);
@@ -470,16 +595,20 @@ Status GateTicketLand(Ctx& c, std::string& detail) {
   detail = Format(
       "arm A: stone off the +X face parked at t+%d, ticket live at t+%d (latency %d, "
       "allow %d), %llu ticket(s) opened for TWO stones (want 1), box (%d,%d,%d)+5 "
-      "%s, %u stone voxel(s) in the store after (want 2); arm B (cap full): %llu "
-      "request(s) refused, %llu deposited, %u parked on the CPU, %llu re-thrown "
-      "when its chunk was granted, %u landed (want 1); page faults %u/%u; run "
-      "twice: %s",
+      "%s, %u stone voxel(s) in the store after (want 2) [particles peak %u, all "
+      "gone at t+%d, far-box kills %u]; arm B (cap full): %llu request(s) "
+      "refused, %llu deposited, %u parked on the CPU (waiting on chunk "
+      "(%d,%d,%d)%s), cap tickets still live after 120 ticks %u, its ticket %s, "
+      "%llu re-thrown, %u landed (want 1); page faults %u/%u; run twice: %s",
       A.landTick, A.activateTick, A.activateTick - A.landTick, maxLatency,
       (unsigned long long)A.activations, A.boxLo.x, A.boxLo.y, A.boxLo.z,
-      A.released ? "released" : "NEVER RELEASED", A.inStore,
-      (unsigned long long)A.refusedCap, (unsigned long long)A.deposited,
-      A.parkedAtFull, (unsigned long long)A.respawned, A.landedLater, A.faults,
-      B.faults, same ? "IDENTICAL" : "DIVERGED");
+      A.released ? "released" : "NEVER RELEASED", A.inStore, A.particlesMax,
+      A.particlesGoneAt, A.farKilled, (unsigned long long)A.refusedCap,
+      (unsigned long long)A.deposited, A.parkedAtFull, A.landingChunk.x,
+      A.landingChunk.y, A.landingChunk.z, A.landingHeld ? "" : " - NONE HELD",
+      A.capLiveAfter, A.landingGranted ? "granted" : "NOT GRANTED",
+      (unsigned long long)A.respawned, A.landedLater, A.faults, B.faults,
+      same ? "IDENTICAL" : "DIVERGED");
   std::printf("ticket-land: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -502,6 +631,11 @@ struct DecayRun {
   uint32_t hash = 0;
   bool released = false;
   double meanLife = 0;
+  // ATTRIBUTION: when the ticket left the table during the run and why
+  // (deltas of the release counters over the run).
+  int leftAt = -1;
+  uint64_t relIdle = 0, relTimeout = 0, relOverlap = 0, recentred = 0, activated = 0;
+  uint32_t buildOps = 0;
 };
 
 bool RunDecay(Ctx& c, DecayRun& R, std::string& why) {
@@ -562,6 +696,8 @@ bool RunDecay(Ctx& c, DecayRun& R, std::string& why) {
         R.embers++;
       }
     }
+  const TicketStats s0 = c.stream.TicketSet().Stats();
+  R.buildOps = (uint32_t)build.size();
   tick(std::vector<BrushOp>{}, build);
   R.wood0 = (uint32_t)woodCells.size();
   auto census = [&](uint32_t& ember, uint32_t& fire, uint32_t& ash, uint32_t* hash) {
@@ -583,7 +719,7 @@ bool RunDecay(Ctx& c, DecayRun& R, std::string& why) {
   const int cap = (int)BaselineNumber("ticketDecay.ticks", 2000);
   for (int i = 1; i <= cap; i++) {
     tick();
-    if (c.stream.TicketSet().StateOf(tk) != Tickets::State::Live) break;
+    if (c.stream.TicketSet().StateOf(tk) != Tickets::State::Live) { R.leftAt = i; break; }
     if (i % 10 == 0) {
       c.ctx.WaitIdle();
       uint32_t e = 0, f = 0, a = 0;
@@ -610,6 +746,12 @@ bool RunDecay(Ctx& c, DecayRun& R, std::string& why) {
   for (int i = 0; i < 120 && c.stream.TicketSet().StateOf(tk) == Tickets::State::Live; i++)
     tick();
   R.released = c.stream.TicketSet().StateOf(tk) != Tickets::State::Live;
+  const TicketStats& s1 = c.stream.TicketSet().Stats();
+  R.relIdle = s1.releasedIdle - s0.releasedIdle;
+  R.relTimeout = s1.releasedTimeout - s0.releasedTimeout;
+  R.relOverlap = s1.releasedOverlap - s0.releasedOverlap;
+  R.recentred = s1.recentred - s0.recentred;
+  R.activated = s1.activated - s0.activated;
   return true;
 }
 
@@ -640,6 +782,15 @@ Status GateTicketDecay(Ctx& c, std::string& detail) {
       A.embers, A.wood0, A.goneAt, A.meanLife, mult, bound, A.ash, A.woodKept, A.wood0,
       A.fireSeen, A.released ? "released by idle" : "STILL LIVE",
       same ? "IDENTICAL" : "DIVERGED");
+  if (!ok)
+    detail += Format(
+        " | ATTRIBUTION: %u build ops; ticket left the table at +%d; over the run "
+        "%llu idle / %llu timeout / %llu overlap releases, %llu re-centres, %llu "
+        "activations; last re-centre: %s",
+        A.buildOps, A.leftAt, (unsigned long long)A.relIdle,
+        (unsigned long long)A.relTimeout, (unsigned long long)A.relOverlap,
+        (unsigned long long)A.recentred, (unsigned long long)A.activated,
+        c.stream.TicketSet().LastRecentreNote().c_str());
   std::printf("ticket-decay: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

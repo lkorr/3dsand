@@ -92,6 +92,7 @@ struct TicketStats {
   uint64_t released = 0;
   uint64_t releasedIdle = 0, releasedTimeout = 0, releasedOverlap = 0;
   uint64_t recentred = 0;
+  uint64_t recentreRefused = 0;  // a shell hit whose step was blocked (window, live box, active plane)
   uint64_t chunksKept = 0;     // release batches: chunks the store took
   uint64_t chunksSkipped = 0;  // ...and chunks never dirtied (procgen / store reproduce them)
   uint64_t conservative = 0;   // releases forced to keep all 125
@@ -144,6 +145,10 @@ class Tickets {
 
   uint32_t LiveCount() const;
   const TicketStats& Stats() const { return stats_; }
+  // ATTRIBUTION (CLAUDE.md rule 6): what the last re-centre / refused
+  // re-centre saw — the face, how many shell chunks were hit, and the first
+  // hit (chunk, occupancy before -> after, snapshot tick). Not hashed.
+  const std::string& LastRecentreNote() const { return recentreNote_; }
   // Human-readable one-liners for the dev panel (one per live ticket).
   std::vector<std::string> Describe(uint32_t tick) const;
   // A ticket's state, for gates.
@@ -154,6 +159,12 @@ class Tickets {
   uint32_t ReleasedTick(uint32_t i) const { return t_[i].releaseTick; }
   // The live ticket whose box holds `chunk`, or kTicketMax.
   uint32_t TicketHolding(IVec3 chunk) const;
+  // The chunks the far landings held right now are waiting on (gates).
+  std::vector<IVec3> LandingChunks() const {
+    std::vector<IVec3> v;
+    for (const Landing& l : landings_) v.push_back(l.chunk);
+    return v;
+  }
 
  private:
   struct Req {
@@ -161,6 +172,7 @@ class Tickets {
     uint32_t reason;
     uint32_t tick;
   };
+  static constexpr uint32_t kOccUnset = 0xFFFFFFFFu;
   struct Ticket {
     State state = State::Free;
     IVec3 lo{0, 0, 0};
@@ -174,8 +186,21 @@ class Tickets {
     // Per LOCAL index (World::TicketLocalIndex order): dirty in some
     // published snapshot since activation. The release keeps exactly these.
     std::vector<uint8_t> everDirty;
-    // Per LOCAL index: dirty in the most recent snapshot (P4's shell test).
+    // Per LOCAL index: dirty in the most recent snapshot.
     std::vector<uint8_t> lastDirty;
+    // Per LOCAL index, SHELL chunks only: matter crossed into or out of it
+    // since the last activation or re-centre (P4's shell test). Measured as a
+    // change of the chunk's non-air count (snapshot occupancy) against
+    // shellOcc, NOT as a dirty flag: an interior write on the face cell marks
+    // the shell dirty through the fan-out without moving anything into it,
+    // and a shell is dirty only the one tick an arrival lands, so neither
+    // "dirty" nor "dirty in the latest snapshot" says matter reached it.
+    // Cleared when Recentre acts on it or gives up.
+    std::vector<uint8_t> shellHit;
+    // Per LOCAL index: the shell chunk's occupancy at the last fold that saw
+    // it (kOccUnset until the first snapshot after its fill).
+    std::vector<uint32_t> shellOcc;
+    std::string firstHit;  // attribution: the first shell hit since the last re-centre
     // Per LOCAL index: the first tick whose snapshot describes THIS chunk in
     // the slot (activation, or the re-centre that refilled it). An older
     // snapshot is the previous occupant's and is not folded.
@@ -217,6 +242,7 @@ class Tickets {
   bool haveFold_ = false;
   uint32_t lastFoldTick_ = 0;
   TicketStats stats_;
+  std::string recentreNote_;
 
   // ---- far landings (P2) -------------------------------------------------
   // Keyed by world chunk; each entry is the particle as it was parked, to be

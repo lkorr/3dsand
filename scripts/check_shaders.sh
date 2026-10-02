@@ -494,7 +494,7 @@ for f in "${FILES[@]}"; do
   # THE TICKET PROBE (LoadShader's BodyResolvesTickets): BOUND for a body that
   # declares `> pageTable` and no `uniform> R :`, UNBOUND otherwise.
   stripTicketB=1; stripTicketU=0
-  if grep -q '> pageTable' "$f" && ! grep -q 'uniform> R :' "$f"; then
+  if grep -qE '>[[:space:]]+pageTable' "$f" && ! grep -q 'uniform> R :' "$f"; then
     stripTicketB=0; stripTicketU=1
   fi
   commonSrc="$TMP/common_${name}"

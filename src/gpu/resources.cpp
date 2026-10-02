@@ -496,8 +496,23 @@ constexpr const char* kTicketBoundEnd = ">>>TICKET_BOUND_END<<<";
 constexpr const char* kTicketUnboundBegin = ">>>TICKET_UNBOUND_BEGIN<<<";
 constexpr const char* kTicketUnboundEnd = ">>>TICKET_UNBOUND_END<<<";
 
+// "Declares pageTable" is read as `>` then any run of blanks then `pageTable`:
+// half the kernels align their binding names in a column, and a literal
+// "> pageTable" silently dropped worldgen, sim_step, sim_particle and
+// sim_mutate onto the stub (found by ticket-settle's pour probe: a ticket
+// generated as the window chunk its slot index aliased).
+bool BodyDeclaresPageTable(const std::string& body) {
+  for (size_t p = body.find("pageTable"); p != std::string::npos;
+       p = body.find("pageTable", p + 1)) {
+    size_t q = p;
+    while (q > 0 && (body[q - 1] == ' ' || body[q - 1] == '\t')) q--;
+    if (q > 0 && q < p && body[q - 1] == '>') return true;
+  }
+  return false;
+}
+
 bool BodyResolvesTickets(const std::string& body) {
-  return body.find("> pageTable") != std::string::npos &&
+  return BodyDeclaresPageTable(body) &&
          body.find("uniform> R :") == std::string::npos;
 }
 

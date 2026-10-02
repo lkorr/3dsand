@@ -39,6 +39,8 @@ void Tickets::Init(World* world, Stream* stream) {
     t = Ticket{};
     t.everDirty.assign(kTicketChunks, 0);
     t.lastDirty.assign(kTicketChunks, 0);
+    t.shellHit.assign(kTicketChunks, 0);
+    t.shellOcc.assign(kTicketChunks, kOccUnset);
     t.since.assign(kTicketChunks, 0);
   }
   Publish();
@@ -156,6 +158,9 @@ void Tickets::Activate(uint32_t i, IVec3 lo, uint32_t reason, uint32_t tick) {
   t.conservative = false;
   std::fill(t.everDirty.begin(), t.everDirty.end(), (uint8_t)0);
   std::fill(t.lastDirty.begin(), t.lastDirty.end(), (uint8_t)0);
+  std::fill(t.shellHit.begin(), t.shellHit.end(), (uint8_t)0);
+  std::fill(t.shellOcc.begin(), t.shellOcc.end(), kOccUnset);
+  t.firstHit.clear();
   std::fill(t.since.begin(), t.since.end(), tick);
   world_->SetTicketBox(i, lo, true);
   // NOW, not at Publish: the fill below dispatches genChunk, which resolves
@@ -224,13 +229,30 @@ void Tickets::Fold(uint32_t tick) {
       const uint8_t d = snap.dirtyFlags[base + l] != 0 ? 1 : 0;
       t.lastDirty[l] = d;
       t.everDirty[l] |= d;
-      if (!d) continue;
       // Active iff the chunk is in the box's interior. The slot holds chunk
       // lo + ((m - lo) mod 5); interior = offset 1..3 on every axis.
       const IVec3 wc = world_->TicketSlotWorldChunk(base + l);
       const IVec3 dd{wc.x - t.lo.x, wc.y - t.lo.y, wc.z - t.lo.z};
-      if (dd.x >= 1 && dd.y >= 1 && dd.z >= 1 && dd.x < hi && dd.y < hi && dd.z < hi)
-        activeDirty = true;
+      const bool interior =
+          dd.x >= 1 && dd.y >= 1 && dd.z >= 1 && dd.x < hi && dd.y < hi && dd.z < hi;
+      if (interior) {
+        if (d) activeDirty = true;
+        continue;
+      }
+      // SHELL: did matter cross its faces? (Not on the fill's own snapshot:
+      // the count is still settling from the copy-in.)
+      if (snap.tick <= t.since[l] + 1 || snap.occupancy.size() != kNumSlots) continue;
+      const uint32_t occ = snap.occupancy[base + l];
+      if (t.shellOcc[l] != kOccUnset && occ != t.shellOcc[l]) {
+        if (t.firstHit.empty()) {
+          char buf[128];
+          std::snprintf(buf, sizeof buf, "chunk (%d,%d,%d) occ %u->%u at snapshot %u",
+                        wc.x, wc.y, wc.z, t.shellOcc[l], occ, snap.tick);
+          t.firstHit = buf;
+        }
+        t.shellHit[l] = 1;
+      }
+      t.shellOcc[l] = occ;
     }
     t.idleSnaps = activeDirty ? 0 : t.idleSnaps + 1;
   }
@@ -278,7 +300,13 @@ void Tickets::ReleaseIdle(uint32_t tick) {
   for (uint32_t i = 0; i < kTicketMax; i++) {
     Ticket& t = t_[i];
     if (t.state != State::Live) continue;
-    if (t.idleSnaps >= kTicketIdleTicks)
+    // Matter that reached the shell is frozen there, not settled: a ticket
+    // with a shell arrival still pending its re-centre does not idle out.
+    // Bounded: Recentre clears every shellHit within kTicketRecentreTicks,
+    // whether it moves the box or finds the step blocked.
+    const bool shellPending =
+        std::find(t.shellHit.begin(), t.shellHit.end(), (uint8_t)1) != t.shellHit.end();
+    if (t.idleSnaps >= kTicketIdleTicks && !shellPending)
       Release(i, (uint32_t)TicketReason::Idle, tick);
     else if (tick >= t.activated && tick - t.activated >= kTicketMaxTicks)
       Release(i, (uint32_t)TicketReason::Timeout, tick);
@@ -358,7 +386,7 @@ void Tickets::Recentre(uint32_t tick) {
         const int off = side == 0 ? 0 : n - 1;
         int count = 0;
         for (uint32_t l = 0; l < kTicketChunks; l++) {
-          if (!t.lastDirty[l]) continue;
+          if (!t.shellHit[l]) continue;
           const IVec3 wc = world_->TicketSlotWorldChunk(World::TicketSlotBase(i) + l);
           const int d[3] = {wc.x - t.lo.x, wc.y - t.lo.y, wc.z - t.lo.z};
           if (d[a] == off) count++;
@@ -370,11 +398,46 @@ void Tickets::Recentre(uint32_t tick) {
         }
       }
     if (bestAxis < 0) continue;
+    // THE BOX FOLLOWS STRAY MATTER ONLY WHEN IT CAN LEAVE NOTHING BEHIND: the
+    // interior plane the step turns into shell (offset 1 stepping +, offset
+    // n-2 stepping -) must be quiet in the latest snapshot. Otherwise the
+    // ticket's own activity would freeze in the new shell to chase a grain at
+    // the old one (a pile spilling one cell over an edge, a leaf, a ripple).
+    {
+      const int freezeOff = bestDir > 0 ? 1 : n - 2;
+      bool busy = false;
+      for (uint32_t l = 0; l < kTicketChunks && !busy; l++) {
+        if (!t.lastDirty[l]) continue;
+        const IVec3 wc = world_->TicketSlotWorldChunk(World::TicketSlotBase(i) + l);
+        const int d[3] = {wc.x - t.lo.x, wc.y - t.lo.y, wc.z - t.lo.z};
+        bool inner = true;
+        for (int a = 0; a < 3; a++) inner = inner && d[a] >= 1 && d[a] <= n - 2;
+        if (inner && d[bestAxis] == freezeOff) busy = true;
+      }
+      if (busy) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "#%u REFUSED axis %d dir %+d (%d shell chunks hit, first %s): the "
+                      "plane it would freeze is active",
+                      i, bestAxis, bestDir, best, t.firstHit.c_str());
+        recentreNote_ = buf;
+        std::fill(t.shellHit.begin(), t.shellHit.end(), (uint8_t)0);
+        t.firstHit.clear();
+        stats_.recentreRefused++;
+        continue;
+      }
+    }
     IVec3 nlo = t.lo;
     if (bestAxis == 0) nlo.x += bestDir;
     else if (bestAxis == 1) nlo.y += bestDir;
     else nlo.z += bestDir;
-    if (BoxHitsWindow(nlo, world_->WindowOrigin()) || BoxHitsLive(nlo, i)) continue;
+    if (BoxHitsWindow(nlo, world_->WindowOrigin()) || BoxHitsLive(nlo, i)) {
+      // Not takeable: forget the arrivals, so the ticket can idle out.
+      std::fill(t.shellHit.begin(), t.shellHit.end(), (uint8_t)0);
+      t.firstHit.clear();
+      stats_.recentreRefused++;
+      continue;
+    }
     // The leaving plane: offset (n-1) on the axis when stepping -, 0 when +.
     const int leaveOff = bestDir > 0 ? 0 : n - 1;
     std::vector<uint32_t> slots, locals;
@@ -404,6 +467,16 @@ void Tickets::Recentre(uint32_t tick) {
       t.since[l] = tick;
     }
     stream_->FillTicketSlots(slots);
+    std::fill(t.shellHit.begin(), t.shellHit.end(), (uint8_t)0);
+    {
+      char buf[256];
+      std::snprintf(buf, sizeof buf, "#%u axis %d dir %+d (%d shell chunks hit, first %s)",
+                    i, bestAxis, bestDir, best, t.firstHit.c_str());
+      recentreNote_ = buf;
+    }
+    t.firstHit.clear();
+    // The interior/shell split moved with the box: every baseline is stale.
+    std::fill(t.shellOcc.begin(), t.shellOcc.end(), kOccUnset);
     t.lastRecentre = tick;
     t.idleSnaps = 0;
     stats_.recentred++;
