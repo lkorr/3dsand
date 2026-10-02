@@ -6671,7 +6671,7 @@ keeps (`Mob::WoundStats`, printed by `SANDVOX_BITE_DEBUG`: in reach / not
 tissue / not the infection's diet / lost the mottle draw / rewritten):
 (1) the rewrite's blotch noise (`woundStainBlob`, 4 skin cells) is as big as a
 whole bite, so one noise value decided the WHOLE bite -- 7 of 10 bites at one
-spot rewrote nothing; it is now recentred on the wound (BlobCarveFactory's
+spot rewrote nothing; for an infection it is now recentred on the wound (BlobCarveFactory's
 fix). (2) A wall cell is a cell from the hole, so `dc / rimL` put the wall at
 t = 2/3 and capped the rewrite at 44% before the noise; an INFECTION is now
 measured from the wall (a blood rewrite keeps its mottled look, so the flesh a
@@ -6680,10 +6680,19 @@ a rig anchor -- a closed cavity in the bone core, or air beside the wrong limb
 (`joint-rot` bit the root, not the arm's parent) -- and now aim at the skin
 (`SkinAim`, `MobSystem::LimbSurfacePos`, the parent's surface by the joint).
 The bite gates tick the per-voxel rates (`bite-infect` 0.04 / 0.02,
-`joint-rot` 0.2 / 0.16 per voxel per second) instead of the old per-limb
+`joint-rot` 0.6 / 0.3 per voxel per second, its bite at the arm's SOCKET) instead of the old per-limb
 cranks, and `zombify` and `venom-wound` bite ONCE (their re-bite-until-it-took
 loops are gone). A bite that carries a TARGETED infection rewrites only cells
 the infection admits (venom: soft tissue).
+
+**A rotted shoulder lets go (2026-10-01).** The joint rule's parent side
+(`Mob::JointAttached`) never ran for an ARM: its socket centre, clamped into
+the torso's box, landed in the air beside a tapered chest and measured empty
+(`kSocketUnmeasured`). It is now snapped once to the parent's nearest voxel
+and kept as an offset from the joint (`MobLimb::socketSnapped`), and the counts
+skip tombstones (an eaten socket used to read intact until the next flush).
+`joint-rot`: a rot bite at the shoulder takes the arm at tick 52 with the
+creature alive; with the neck measure off it holds until death.
 
 **Remedies are data too.** `coat.effects` `"disinfect"` cures EVERY infection
 on the limb (enchanted blood stops venom as well as rot);
@@ -7443,14 +7452,14 @@ loose matter on either side (below).
   gives only its coats where positions coincide (`WearOnRig`), never its
   unfitted geometry.
 
-Knobs: `gear.coatTransferFrac` 0.5, `gear.coatTransferMax` 72 levels,
+Knobs: `gear.coatTransferFrac` 0.5, `gear.coatTransferMax` 84 levels,
 `gear.coatContactRadius` 0.06 m, `gear.coatBleedPickup` 6, `gear.coatLayerMin`
 6 levels.
 
 **The dose (2026-10-01).** One cut used to move 24 levels and lay them at the
 parcel's peak (15) on the nearest cells: two wound voxels, a few envenomed
 cells. A parcel is now SPREAD (`CoatLay`'s cap: no voxel takes more than
-`max(coatLayerMin, an even share)`), and up to 72 levels move: one good venom
+`max(coatLayerMin, an even share)`), and up to 84 levels move: one good venom
 cut coats ~12 wall cells at a seeding's thickness and seeds 10-20 cells, which
 spread and burn out over ~50-110 s (gate `venom-blade`, below, measured 20
 seeded, 26 eaten, 53 s, 14 hp). Blunt on intact skin seeds nothing; blunt or a

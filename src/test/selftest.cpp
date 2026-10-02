@@ -945,10 +945,6 @@ const char* const kOrder[] = {
     "venom-wound",
     // ...and the ruler the rot was retuned against when it became per voxel.
     "rot-clock",
-    // ...and what the infection pass COSTS: a bitten crowd ticked twice, the
-    // whole-lattice sweep against the limb's cell list -- identical outcome,
-    // a fraction of the time.
-    "infect-perf",
     // ...and a corpse that died alight keeps burning: every piece advances
     // its embers, keeps emitting fire, and its brick agrees with its lattice
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
@@ -1091,6 +1087,13 @@ const char* const kOrder[] = {
     // a fly-mode camera that walks a few voxels in the control arm; it writes
     // no voxel.
     "dialogue-graph",
+    // What the infection pass COSTS: eight bitten humans ticked four times
+    // over (the whole-lattice sweep against the limb's cell list -- identical
+    // outcome, a fraction of the time). LATE on purpose: the crowd bleeds over
+    // the harness window for 1,200 ticks and the blood still in flight after
+    // its regenerate lands on later fixtures (measured: player-corpse's corpse
+    // at inset 360 never slept, picking the stains up by contact).
+    "infect-perf",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

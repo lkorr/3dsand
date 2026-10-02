@@ -518,7 +518,7 @@ const TUNING_PARAMS = {
   'gear.biteThroughHard':{t:'f',def:60,min:1,max:400},
   'gear.blastShellCells':{t:'f',def:1,min:0,max:8},
   'gear.coatTransferFrac':{t:'f',def:0.5,min:0,max:1},
-  'gear.coatTransferMax':{t:'i',def:96,min:0,max:512},
+  'gear.coatTransferMax':{t:'i',def:84,min:0,max:512},
   'gear.coatContactRadius':{t:'f',def:0.06,min:0,max:0.5},
   'gear.coatBleedPickup':{t:'i',def:6,min:0,max:15},
   'gear.coatLayerMin':{t:'i',def:6,min:0,max:15},

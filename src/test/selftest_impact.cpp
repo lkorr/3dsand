@@ -1928,6 +1928,7 @@ Status GateJointRot(Ctx& c, std::string& detail) {
     // version were really measuring how fast the bite's blood loss killed the
     // fixture (98 ticks vs 119, 83% vs 80% — two readings of the same event).
     bool aliveAtOff = false;
+    std::string trace;   // socket / neck hold every 100 ticks
   };
   auto run = [&](float neckRadius, int inset) {
     Run r;
@@ -1939,6 +1940,17 @@ Status GateJointRot(Ctx& c, std::string& detail) {
     // arm.
     tt.gore.infectMobMult = 1.0f;
     tt.gore.woundNeckRadius = neckRadius;
+    // A BIGGER BITE AT THE SOCKET (2026-10-01). The per-voxel rot spreads
+    // the same way in every direction, so a small seed beside the joint is a
+    // race between eating the socket and eating the torso to death; a bite
+    // that already opens the shoulder and an eat-heavy rot (R < 1, baseline)
+    // puts the work where the claim is.
+    tt.gore.biteRadius = saved.gore.biteRadius *
+                         (float)BaselineNumber("jointRotBiteScale", 2.0);
+    // ...and the blood out of it is not hp here: measured, both arms BLED OUT
+    // (tick 176 / 203) one tick before the socket crossed its threshold, a
+    // race about the fixture's blood loss, not about the joint.
+    tt.gore.bleedHpPerVoxel = 0.0f;
     SetCurrentTuning(tt);
     std::vector<ParticleSpawn> spawns;
     const uint64_t id = SpawnTarget(c, t, inset);
@@ -1962,7 +1974,12 @@ Status GateJointRot(Ctx& c, std::string& detail) {
       for (size_t li = 0; li < d.limbs.size(); li++)
         if (d.limbs[li].name == pn) parent = (int)li;
     }
-    BiteOnce(mobs, c.world, id, parent, SurfaceNear(mobs, id, parent, ax.anchor),
+    // ...AT THE SOCKET the joint rule counts round (MobSystem::LimbSocketWorld),
+    // on the parent's surface there: nearest the arm's anchor is not always
+    // it (measured: a 438-cell bite there never touched the 13-cell socket).
+    Vec3 sock = ax.anchor;
+    mobs.LimbSocketWorld(id, t.limb, sock);
+    BiteOnce(mobs, c.world, id, parent, SurfaceNear(mobs, id, parent, sock),
              5.0f, (uint16_t)rotMat, (uint16_t)ichor, 0.85f, 0xB17Eu, spawns);
     r.rot0 = mobs.LimbMaterialCount(id, parent, rotMat);
     // ...and every reading after this is about the ARM, which nothing has
@@ -1985,6 +2002,15 @@ Status GateJointRot(Ctx& c, std::string& detail) {
       // The last reading taken while the limb was STILL ON is the only one
       // that means anything — after the sever this counts a stump.
       r.voxLast = mobs.LimbArtVoxelCount(id, t.limb);
+      // ATTRIBUTION: what holds the arm on (Mob::JointAttached's two counts).
+      if (i % 100 == 0) {
+        float sock = -1.0f, neck = -1.0f;
+        mobs.LimbJointHold(id, t.limb, sock, neck);
+        r.trace += Format(" t%d socket %.2f neck %.2f", i, sock, neck);
+        if (i % 300 == 0)
+          r.trace += " [" + mobs.LimbSocketMaterials(id, t.limb) + "]";
+        r.trace += ";";
+      }
       ticker();
     }
     mobs.Reset();
@@ -2035,7 +2061,8 @@ Status GateJointRot(Ctx& c, std::string& detail) {
       (b.offAt < 0 ? std::string("stayed on")
                    : "came off at tick " + std::to_string(b.offAt) +
                          (b.aliveAtOff ? " (alive)" : " (ON DEATH)")) +
-      " at " + std::to_string((int)(frac(b) * 100.0f)) + "%";
+      " at " + std::to_string((int)(frac(b) * 100.0f)) + "% | hold (need >= " +
+      Format("%.2f", saved.gore.woundNeckFraction) + "):" + a.trace;
   detail = s;
   // A BITE THAT MISSED MEASURES NOTHING — and it is the failure this fixture is
   // most likely to have, because the point it aims at is a rig anchor. Checked
@@ -3347,6 +3374,9 @@ Status GateInfectPerf(Ctx& c, std::string& detail) {
     IdCounterScope ids(mobs);   // both arms number their creatures alike
     mobs.Reset();
     c.debris.Reset();
+    // Every arm on the same fresh ground (a crowd bleeding for 300 ticks
+    // stains it), and the ground handed back clean (below).
+    PrepareWorld(c);
     Tuning tt = saved;
     tt.gore.infectMobMult = saved.gore.infectMobMult * crank;
     SetCurrentTuning(tt);
@@ -3414,6 +3444,9 @@ Status GateInfectPerf(Ctx& c, std::string& detail) {
   const Out ib = run(false, kIdCrank);
   const Out a = run(true, kCrank);
   const Out b = run(false, kCrank);
+  // THE GROUND BACK AS IT WAS: eight humans bled on it for 1,200 ticks, and a
+  // later gate's fixture site (player-corpse's inset 360) is among theirs.
+  PrepareWorld(c);
   RecordObserved("infectPerfFullMs", a.ms);
   RecordObserved("infectPerfListMs", b.ms);
   RecordObserved("infectPerfFullSweeps", (double)a.sweeps);

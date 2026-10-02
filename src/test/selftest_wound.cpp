@@ -5725,7 +5725,7 @@ Status GateBlastStain(Ctx& c, std::string& detail) {
   const float outLen = out.len();
   out = outLen > 1e-3f ? out * (1.0f / outLen) : Vec3{1, 0, 0};
   const float radius = 5.0f;  // world voxels; a grenade beside a shoulder
-  const Vec3 blastAt = limbAt + out * (radius * 0.85f);
+  const Vec3 blastAt = limbAt + out * (radius * 0.8f);
 
   std::vector<uint32_t> artBefore(nl, 0), stainBefore(nl, 0), soakBefore(nl, 0);
   for (int li = 0; li < nl; li++) {

@@ -109,7 +109,7 @@
     "biteThroughHard": 60,
     "blastShellCells": 1,
     "coatTransferFrac": 0.5,
-    "coatTransferMax": 72,
+    "coatTransferMax": 84,
     "coatContactRadius": 0.06,
     "coatBleedPickup": 6,
     "coatLayerMin": 6

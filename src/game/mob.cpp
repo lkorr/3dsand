@@ -11849,12 +11849,16 @@ uint32_t Mob::NeckCountAt(const MobLimb& limb, Vec3 centreLimb,
     const Vec3 d{x + 0.5f - a.x, y + 0.5f - a.y, z + 0.5f - a.z};
     if (d.dot(d) < r2) n++;
   };
-  if (fine)
+  // TOMBSTONES ARE GONE (2026-10-01): a voxel the burn or an infection took
+  // is material 0 until FlushBurn's batched compaction, and counting it kept
+  // a socket the rot had eaten reading "intact" until the next flush.
+  if (fine) {
     for (const PrefabVoxel& v : limb.skinVoxels)
-      test((float)v.x, (float)v.y, (float)v.z);
-  else
+      if (v.material != 0) test((float)v.x, (float)v.y, (float)v.z);
+  } else {
     for (const DebrisVoxel& v : limb.voxels)
-      test((float)v.x, (float)v.y, (float)v.z);
+      if (v.payload != 0) test((float)v.x, (float)v.y, (float)v.z);
+  }
   return n;
 }
 
@@ -11910,6 +11914,9 @@ Vec3 Mob::SocketCentreInParent(const MobLimb& parent,
   // measured from the parent's own corner. (This is the construction
   // InfectAcrossJoint makes when it seeds a parent from a child.)
   const Vec3 j = child.anchorRoot - parent.restOffset;
+  // SNAPPED at the first measure (MobLimb::socketSnapped): the joint plus the
+  // offset to the parent voxel that was nearest it then.
+  if (child.socketSnapped) return j + child.socketDelta;
   // CLAMPED INTO THE PARENT'S BOX. An arm's shoulder anchor sits several cells
   // OUTSIDE the torso's voxel cloud — the rig hangs the limb off a point, not
   // off a cell — so an unclamped sphere of woundNeckRadius finds nothing there
@@ -11947,8 +11954,39 @@ void Mob::EnsureJointCounts(int limbIndex) {
     MobLimb& child = limbs_[k];
     if (child.socketAtSpawn != 0) continue;
     if (!child.body) continue;
-    const uint32_t n =
+    uint32_t n =
         NeckCountAt(limb, SocketCentreInParent(limb, child), gt.woundNeckRadius);
+    // EMPTY AT THE CLAMPED CENTRE: snap to the parent's nearest voxel (in
+    // storage order on a tie, so it is deterministic) and keep that offset.
+    if (n == 0) {
+      const Vec3 c = SocketCentreInParent(limb, child);
+      const bool fine = limb.HasFineSkin();
+      const float sc =
+          (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+      float best = 1e30f;
+      Vec3 at = c;
+      auto consider = [&](int x, int y, int z) {
+        const Vec3 p{((float)x + 0.5f) / sc, ((float)y + 0.5f) / sc,
+                     ((float)z + 0.5f) / sc};
+        const float d = (p - c).dot(p - c);
+        if (d < best) {
+          best = d;
+          at = p;
+        }
+      };
+      if (fine) {
+        for (const PrefabVoxel& v : limb.skinVoxels)
+          if (v.material != 0) consider(v.x, v.y, v.z);
+      } else {
+        for (const DebrisVoxel& v : limb.voxels)
+          if (v.payload != 0) consider(v.x, v.y, v.z);
+      }
+      if (best < 1e29f) {
+        child.socketDelta = at - (child.anchorRoot - limb.restOffset);
+        child.socketSnapped = true;
+        n = NeckCountAt(limb, at, gt.woundNeckRadius);
+      }
+    }
     // NO PARENT-SIDE SAMPLE means NO PARENT-SIDE TEST. A rig whose joint lands
     // in empty parent geometry even after the clamp (a tail on a hollow shell,
     // a borrowed item slot) must not be treated as "the socket is already
@@ -12209,6 +12247,86 @@ bool Mob::JointAttached(int limbIndex) const {
   const uint32_t now = NeckCountAt(parent, SocketCentreInParent(parent, limb),
                                    gt.woundNeckRadius);
   return (float)now >= gt.woundNeckFraction * (float)limb.socketAtSpawn;
+}
+
+bool MobSystem::LimbJointHold(uint64_t mobId, int limbIndex, float& socketFrac,
+                              float& neckFrac) const {
+  socketFrac = neckFrac = -1.0f;
+  const Mob* m = FindCreature(mobId);
+  if (!m || !m->def_ || limbIndex < 0 || limbIndex >= (int)m->limbs_.size())
+    return false;
+  const auto& gt = CurrentTuning().gore;
+  const MobLimb& limb = m->limbs_[limbIndex];
+  if (!limb.body) return false;
+  neckFrac = limb.neckAtSpawn > 0
+                 ? (float)m->NeckCount(limb, gt.woundNeckRadius) /
+                       (float)limb.neckAtSpawn
+                 : 1.0f;
+  // -2 = the socket was never measured (no carve of the parent yet), -3 =
+  // measured empty: both mean "the parent side is not tested".
+  socketFrac = limb.socketAtSpawn == 0 ? -2.0f
+               : limb.socketAtSpawn == MobLimb::kSocketUnmeasured ? -3.0f
+                                                                   : 1.0f;
+  const int p = m->ParentLimbIndex(limbIndex);
+  if (p >= 0 && m->limbs_[p].body && limb.socketAtSpawn != 0 &&
+      limb.socketAtSpawn != MobLimb::kSocketUnmeasured)
+    socketFrac = (float)m->NeckCountAt(m->limbs_[p],
+                                       m->SocketCentreInParent(m->limbs_[p], limb),
+                                       gt.woundNeckRadius) /
+                 (float)limb.socketAtSpawn;
+  return true;
+}
+
+bool MobSystem::LimbSocketWorld(uint64_t mobId, int limbIndex, Vec3& out) {
+  Mob* m = FindCreature(mobId);
+  if (!m || !m->def_ || limbIndex < 0 || limbIndex >= (int)m->limbs_.size())
+    return false;
+  const int p = m->ParentLimbIndex(limbIndex);
+  if (p < 0 || !m->limbs_[p].body || !m->limbs_[limbIndex].body) return false;
+  m->EnsureJointCounts(p);
+  const MobLimb& limb = m->limbs_[limbIndex];
+  if (limb.socketAtSpawn == 0 || limb.socketAtSpawn == MobLimb::kSocketUnmeasured)
+    return false;
+  MobLimb& par = m->limbs_[p];
+  if (phys_) phys_->GetTransform(par.body, par.xf);
+  const Quat q{par.xf.quat[0], par.xf.quat[1], par.xf.quat[2], par.xf.quat[3]};
+  out = par.xf.pos + Rotate(q, m->SocketCentreInParent(par, limb));
+  return true;
+}
+
+std::string MobSystem::LimbSocketMaterials(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindCreature(mobId);
+  if (!m || !m->def_ || limbIndex < 0 || limbIndex >= (int)m->limbs_.size())
+    return "";
+  const int p = m->ParentLimbIndex(limbIndex);
+  if (p < 0 || !m->limbs_[p].body) return "";
+  const MobLimb& par = m->limbs_[p];
+  const MobLimb& limb = m->limbs_[limbIndex];
+  const auto& gt = CurrentTuning().gore;
+  const bool fine = par.HasFineSkin();
+  const float sc = (float)std::max(1u, fine ? m->SkinScaleOf(par) : m->PhysScaleOf(par));
+  const Vec3 a = m->SocketCentreInParent(par, limb) * sc;
+  const float r = gt.woundNeckRadius * sc;
+  std::map<uint32_t, uint32_t> n;
+  auto test = [&](int x, int y, int z, uint32_t mat) {
+    const Vec3 d{(float)x + 0.5f - a.x, (float)y + 0.5f - a.y, (float)z + 0.5f - a.z};
+    if (mat != 0 && d.dot(d) < r * r) n[mat]++;
+  };
+  if (fine)
+    for (const PrefabVoxel& v : par.skinVoxels) test(v.x, v.y, v.z, v.material & 0xFFFu);
+  else
+    for (const DebrisVoxel& v : par.voxels) test(v.x, v.y, v.z, v.payload & 0xFFFu);
+  std::vector<std::pair<uint32_t, uint32_t>> v(n.begin(), n.end());
+  std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) {
+    return x.second != y.second ? x.second > y.second : x.first < y.first;
+  });
+  std::string out;
+  for (const auto& kv : v) {
+    if (!out.empty()) out += ", ";
+    out += (kv.first < matNames_.size() ? matNames_[kv.first] : std::to_string(kv.first)) +
+           " " + std::to_string(kv.second);
+  }
+  return out;
 }
 
 bool Mob::DropDisconnectedChildren(int parentIndex, const DamageCtx& ctx) {
@@ -12609,6 +12727,9 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // one spot of zeus's upper arm rewrote none. Subtracting the field's value
   // at the wound's own centre keeps its gradient (the blotchy edge) and takes
   // away its vote on whether there is a wound at all.
+  // FOR AN INFECTION ONLY: a blood rewrite is a look, tuned and gated as it
+  // was (`blast-stain`: on a 2,000-cell crater the recentre shifted the whole
+  // field and rewrote nothing), and a blast crater is many blotches wide.
   Vec3 noiseCentre = c;
   if (useCrater) {
     Vec3 sum{};
@@ -12617,7 +12738,7 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
     noiseCentre = sum * (1.0f / (float)crater->size());
   }
   const float noiseBias =
-      coherence > 0.0f
+      coherence > 0.0f && rewriteInfect != nullptr
           ? 0.5f - ValueNoise3(seed ^ 0xB100Du, noiseCentre.x / blobL,
                                noiseCentre.y / blobL, noiseCentre.z / blobL)
           : 0.0f;

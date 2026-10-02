@@ -1631,6 +1631,16 @@ struct MobLimb {
   // rather than being permanently satisfied.
   static constexpr uint32_t kSocketUnmeasured = 0xFFFFFFFFu;
   uint32_t socketAtSpawn = 0;
+  // ...and WHERE, when the box clamp alone found nothing (2026-10-01). A
+  // torso's box corner beside the shoulder is air on a tapered chest, so an
+  // ARM's socket measured empty on every humanoid and the parent-side test
+  // never ran: a bite that ate the shoulder out left the arm hanging (gate
+  // `joint-rot`, "socket unmeasured"). The centre is then snapped ONCE to the
+  // parent's nearest voxel and kept as an offset from the joint (rebase
+  // invariant, like the joint itself), so the socket stays where it was while
+  // the rot eats it instead of following the flesh that is left.
+  Vec3 socketDelta{};
+  bool socketSnapped = false;
   // ---- HOW MUCH SKIN THIS LIMB HAS ------------------------------------------
   // Burnable voxels with at least one open face, on the authoritative lattice,
   // taken lazily on the first burn recount (0 = not yet taken; floored at 1).
@@ -7378,6 +7388,19 @@ class MobSystem {
   // the two colliders, otherwise the poses the ART is drawn at (MobLimb::xf).
   // `relQuatOut` (optional, 4 floats) gets the limb's rotation in its parent's
   // frame, for a caller comparing it over time. -1 when either is gone.
+  // What holds a limb on, as Mob::JointAttached measures it: the parent's
+  // socket cells now / at its first carve (1 = unmeasured), and the limb's own
+  // neck the same way. -1 for an unknown limb. Diagnostic (`joint-rot`).
+  bool LimbJointHold(uint64_t mobId, int limbIndex, float& socketFrac,
+                     float& neckFrac) const;
+  // ...and what the parent's socket cells are made of now ("bone 30, flesh 4"),
+  // heaviest first: why a socket stops falling.
+  std::string LimbSocketMaterials(uint64_t mobId, int limbIndex) const;
+  // The WORLD point of a limb's socket in its parent (the centre the joint
+  // rule counts round), measuring the joint counts first if the parent has
+  // never been carved -- exactly what its first carve would measure. False
+  // for a root, an unknown limb or an unmeasurable socket.
+  bool LimbSocketWorld(uint64_t mobId, int limbIndex, Vec3& out);
   float LimbJointGap(uint64_t mobId, int limbIndex, bool jolt,
                      float* relQuatOut = nullptr) const;
   // |art pose - collider pose| of one limb, world voxels (-1 if no body).
