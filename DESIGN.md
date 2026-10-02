@@ -205,13 +205,89 @@ box"), and `slotWorldChunk(slot, o)` (the inverse, which replaced ten
 copy-pasted decodes that could not express a ticket slot). `voxWordAt`,
 `voxWordIndex` and `voxStore` resolve through one shared `voxSlotOfCell`.
 
-**P0 ships `kTicketMax = 0`**, so `kNumSlots == kNumChunks`, every ticket branch
-is a dead const-expression, and the world hash and both smoke probe tables are
-bit-identical — which is the whole acceptance criterion for a commit that
-touched 15 shaders and every per-slot buffer. The lifecycle (activation as a
-MutationQueue op, the cap, dedupe, timeout, release to `ChunkStore`) is P1; the
-per-site classification, and the three site classes the plan did not anticipate,
-are recorded in `docs/tickets_p0_audit.md`.
+**P0 shipped `kTicketMax = 0`** (bit-identical; the per-site classification,
+and the three site classes the plan did not anticipate, are in
+`docs/tickets_p0_audit.md`). **P1–P4 turned them on (2026-10-02)**, and the
+whole system is below.
+
+#### Chunk tickets: the CA outside the window (P1–P4, `src/sim/tickets.*`)
+
+A TICKET is a 5³ box of chunks outside the window, simulated by the SAME CA at
+the SAME tick rate. Its inner 3³ is ACTIVE (dispatched); the shell is RESIDENT
+ONLY — read by the interior, written by reach-1 moves out of it, never
+dispatched (`sim_compact.wgsl`'s `main` skips it; `mainNext` keeps it, so its
+occupancy and digest still update). Tickets are for matter that LEAVES the
+window — a thrown stone, a pile poured out of range — so it finishes instead
+of freezing; they are not a bigger window.
+
+- **Slots.** `kTicketMax = 16`, `kTicketSlots = 2,048`. Ticket `i` owns slots
+  `[kNumChunks + 125 i, +125)`; a box chunk sits at the slot its coordinate takes
+  **mod 5** (`World::TicketLocalIndex` / `ticketLocalIndex`), the window's own
+  toroidal rule at the box's size. Every ticket slot holds a REAL page for the
+  ticket's whole life (nothing materializes a ticket chunk on demand: the
+  mirror's N26 ring is window arithmetic), and the free path skips live ticket
+  slots. `kPoolPages = kNumSlots + kPageRetireCeiling` grew by the 2,048, the
+  exhaustion proof unchanged.
+- **The map** is the tail of `pageTable` (`world.h kTicketTable*`): a compact
+  list of live boxes + one record per index, CPU-built by `World::
+  UploadTicketTable`, GPU read-only. `ticketSlotOf` is n box tests (one load
+  with no ticket live). Only the SIM kernels compile the real probe —
+  common.wgsl's `TICKET_BOUND` block, kept for a body that declares
+  `pageTable` and is not a render shader (`resources.cpp BodyResolvesTickets`);
+  the renderer keeps the P0 stub (`TICKET_PROBE = false`, const-folded), so the
+  raymarch DDA is untouched by the sim half.
+- **The lifecycle is an op stream** (rule 3). `Tickets::Tick` runs between ticks
+  (`Stream::Update`, or `Stream::TicketTick` for a harness that ticks with
+  `SubmitTick` alone) and every decision — activate, release, refuse,
+  re-centre — is a `TicketOp` recorded in the op record (v7, `Frame::tickets`;
+  a replay re-derives and COMPARES). Inputs: requests queued since the last
+  tick (applied in `(tick, chunk)` order) and `World::Snap()`, the fixed-latency
+  snapshot — so a release lands on the same tick in every run.
+- **Policy.** Capped at 16, refused past it and counted; a request inside the
+  window is a no-op, one inside a live box is absorbed; the box slides (125
+  candidate offsets, interior first) to avoid the window and other boxes.
+  Released when the 27 active chunks are clean in `kTicketIdleTicks` (30)
+  consecutive published snapshots, after `kTicketMaxTicks` (1,800) regardless,
+  or when a window shift would cover the box (`ReleaseOverlapping`, before
+  `ShiftAxis`; the plane fill force-drains the ticket's batch).
+- **The release is two-phase and exact.** At tick T the box leaves the table and
+  all 125 slots are copied out (`Stream::EvictTicketSlots`); the store KEEPS a
+  chunk iff some published snapshot since activation showed it dirty, decided
+  once the snapshot of T-1 is published (`SetEvictKeep`). Deciding at T would
+  miss a particle that landed in the last `kSnapshotLatency` ticks. A fill that
+  needs one of the chunks first forces the batch and keeps all 125.
+- **Particles leave the window and land (P2).** `sim_particle.wgsl`'s FAR FLIGHT:
+  matter outside residency flies on, blocks against the far cascade's level-1
+  bytes (`farBlocked`, the gas kernel's test), PARKS where it comes to rest and
+  requests a ticket every tick (32 atomicMax buckets in the pageFaults record,
+  read off the snapshot). Granted, the particle unparks the tick its cell is
+  resident and lands through the claim path. Refused (cap) or unserved for 16
+  ticks, it DEPOSITS (a priority-won slot in the same record) and dies; the CPU
+  holds it as a FAR LANDING and re-throws it, still, the tick its chunk is
+  resident again — a ticket, or the window arriving. Spray still ends at the
+  edge; leaving the far box (two window edges) kills and counts. The cascade
+  is render-derived and its first game-time fill waits on a pipeline compile,
+  so far landings are frame-timing dependent in the game during that window
+  (shared with gas stage 1); every selftest fills it synchronously or not at all.
+- **Reactions (P3).** Only DECAY runs in a ticket (`sim_step.wgsl gInTicket`):
+  decay and movement terminate, pair and emit rules propagate past the box's
+  edge. An ember in a ticket burns out to ash / smoke / air and lights no wood.
+- **Rendering (P4).** `raymarch.wgsl traceTickets`: after a ray leaves the window
+  with no surface, at most `ticketCount` (16) AABB slab tests from the window
+  exit, and an ordinary DDA inside a hit box reading the ticket's slots
+  directly. The hit returns as a level-1 `FarHit` (`FAR_HIT_TICKET`) and takes
+  the far path's shading: GEOMETRY at full voxel resolution from any distance,
+  LIGHTING at the cascade's (no shadow cache, cascade AO and shadow march).
+- **Re-centring (P4).** Shell chunks dirty on one face → the box steps one chunk
+  toward it, at most once per `kTicketRecentreTicks` (60): the leaving plane and
+  the entering plane share their 25 slots (mod 5), so it is a window shift at
+  the box's scale — copy out, move the table, refill — recorded as one TicketOp.
+- **Rule 2.** `sleep` asserts `awake <= 32 AND tickets == 0` at rest, and runs
+  the ticket step to get there. Observable in the F1 Stats section and in
+  `build/last_run.json`'s `tickets` block. Gates: `ticket-settle`,
+  `ticket-land`, `ticket-decay`, `ticket-render`; `determinism` opens a ticket
+  and pours into it, so its twice-run and its `--residency dense` run cover
+  them. Limitations are listed in `docs/PLAN_chunk_tickets.md` §6.
 
 A GPU kernel cannot allocate, so every page a kernel might write is
 materialized from the CPU BEFORE the command buffer is submitted, driven by a

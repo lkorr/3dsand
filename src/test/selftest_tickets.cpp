@@ -14,11 +14,16 @@
 // the store working, not a determinism failure — and regenerates on the way
 // out, so the gates after it find pristine terrain at an unmoved origin.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "game/camera.h"
+#include "game/session.h"
+#include "gpu/resources.h"
 #include "sim/chunkstore.h"
 #include "sim/stream.h"
 #include "sim/tickets.h"
@@ -639,6 +644,156 @@ Status GateTicketDecay(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// ticket-render (P4)
+// ---------------------------------------------------------------------------
+// TWO P4 CLAIMS ON ONE TICKET in open sky past the window's +X face:
+//   DRAWN AT FULL RESOLUTION: a ONE-voxel-wide stone column in the ticket,
+//     12 m from a camera inside the window, changes the pixel it projects to
+//     and NOT the pixel a column-width beside it. The cascade is left unfilled
+//     here, so nothing but raymarch.wgsl's traceTickets can draw it — and a
+//     cascade cell is 4+ voxels, which is the resolution claim.
+//   RE-CENTRED: sand poured into the box falls into its bottom shell; the box
+//     steps one chunk down (the leaving top plane copied out, the entering
+//     bottom plane filled), the poured mass is all inside the new box, and
+//     the step is one TicketOp.
+std::vector<uint8_t> RenderView(Ctx& c, const Vec3& eye, const Vec3& at, uint32_t tick) {
+  const Vec3 d = at - eye;
+  const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+  Camera cam;
+  cam.yaw = std::atan2(d.z, d.x);
+  cam.pitch = std::asin(d.y / len);
+  for (int fr = 0; fr < 4; fr++) {
+    WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)c.width / c.height, true, 11.7f,
+                      kFarFogDensity, (float)c.height, tick);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp =
+        c.sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, c.width, c.height);
+    c.sim.DrawWorld(rp);
+    rp.End();
+    c.ctx.queue.Submit(enc.Finish());
+  }
+  c.ctx.WaitIdle();
+  rhi::Buffer shot = CreateBuffer(c.ctx.device, (uint64_t)c.width * c.height * 4,
+                                  rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                  "ticketShot");
+  rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+  rhi::TexelCopyTexture srcT{};
+  srcT.texture = c.offscreen;
+  rhi::TexelCopyBuffer dstB{};
+  dstB.buffer = shot;
+  dstB.bytesPerRow = c.width * 4;
+  dstB.rowsPerImage = c.height;
+  enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{c.width, c.height, 1});
+  c.ctx.queue.Submit(enc.Finish());
+  std::vector<uint8_t> px((size_t)c.width * c.height * 4, 0);
+  rhi::ReadBufferBlocking(c.ctx.device, shot, 0, px.data(), px.size());
+  return px;
+}
+
+int PixelDelta(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, uint32_t w,
+               uint32_t x, uint32_t y) {
+  const size_t i = ((size_t)y * w + x) * 4;
+  int d = 0;
+  for (int k = 0; k < 3; k++) d += std::abs((int)a[i + k] - (int)b[i + k]);
+  return d;
+}
+
+Status GateTicketRender(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  const int mStone = MatId(c, "stone"), mSand = MatId(c, "sand");
+  if (mStone < 0 || mSand < 0) { detail = "no stone/sand"; return Status::Fail; }
+  Regenerate(c);
+  const IVec3 o = c.world.WindowOrigin();
+  const int faceX = (o.x + (int)kNChunk) * (int)kChunk;
+  const int zMid = (o.z + (int)kNChunk / 2) * (int)kChunk + 8;
+  int ground = -1 << 30;
+  for (int x = faceX - 40; x < faceX + 120; x += 4)
+    ground = std::max(ground, World::TerrainHeight(x, zMid, kDefaultSeed));
+  // Open sky well over the highest ground on the line of sight, inside the
+  // window's vertical extent so the camera can stand at that height.
+  const int top = (o.y + (int)kNChunk) * (int)kChunk - 40;
+  const int hc = std::min(ground + 70, top);
+  const IVec3 colCell{faceX + 6 * (int)kChunk + 8, hc, zMid};
+  const IVec3 centre{colCell.x >> 4, colCell.y >> 4, colCell.z >> 4};
+
+  uint32_t t = 84000;
+  support::TickCursor tick{c, t, centre};
+  c.stream.TicketSet().Request(centre, TicketReason::Gate, t + 1);
+  tick();
+  const uint32_t tk = c.stream.TicketSet().TicketHolding(centre);
+  if (tk >= kTicketMax) { detail = "no ticket over the render site"; Regenerate(c); return Status::Fail; }
+  const IVec3 lo0 = c.stream.TicketSet().BoxLo(tk);
+
+  // ---- DRAWN AT FULL RESOLUTION ----------------------------------------
+  const Vec3 eye{(float)faceX - 20.0f + 0.5f, (float)hc + 0.5f, (float)zMid + 0.5f};
+  const Vec3 at{(float)colCell.x + 0.5f, (float)hc + 0.5f, (float)colCell.z + 0.5f};
+  const uint32_t lightTick = (uint32_t)(0.40 * (double)TicksPerDay(CurrentTuning()));
+  const std::vector<uint8_t> before = RenderView(c, eye, at, lightTick);
+  std::vector<CellOp> column;
+  for (int y = hc - 20; y < hc + 20; y++) {
+    const uint32_t ci = c.world.ResidentCellIndex({colCell.x, y, colCell.z});
+    if (ci != World::kTicketSlotNone) column.push_back({ci, PackVoxNew((uint32_t)mStone, 0)});
+  }
+  tick(std::vector<BrushOp>{}, column);
+  tick();
+  const std::vector<uint8_t> after = RenderView(c, eye, at, lightTick);
+  const uint32_t cx = c.width / 2, cy = c.height / 2;
+  // One voxel at ~12.6 m subtends ~14 px at the default FOV; 40 px off centre
+  // is three column-widths of sky.
+  const int dCentre = PixelDelta(before, after, c.width, cx, cy);
+  const int dSide = PixelDelta(before, after, c.width, cx + 40, cy);
+  const int minDelta = (int)BaselineNumber("ticketRender.minDelta", 60);
+  const int maxSide = (int)BaselineNumber("ticketRender.maxSideDelta", 12);
+  if (const char* sp = std::getenv("SANDVOX_TICKET_SHOT"); sp && *sp) c.Grab(sp);
+
+  // ---- RE-CENTRED --------------------------------------------------------
+  const uint64_t rec0 = c.stream.TicketSet().Stats().recentred;
+  std::vector<CellOp> pour;
+  const IVec3 boxMid{(lo0.x + 2) * 16 + 4, (lo0.y + 2) * 16 + 4, (lo0.z + 2) * 16 + 4};
+  for (int y = boxMid.y; y < boxMid.y + 4; y++)
+    for (int z = boxMid.z; z < boxMid.z + 8; z++)
+      for (int x = boxMid.x; x < boxMid.x + 8; x++) {
+        const uint32_t ci = c.world.ResidentCellIndex({x, y, z});
+        if (ci != World::kTicketSlotNone)
+          pour.push_back({ci, PackVoxNew((uint32_t)mSand, 0) | kCellOpIfAir});
+      }
+  tick(std::vector<BrushOp>{}, pour);
+  c.ctx.WaitIdle();
+  const uint64_t mass0 = ReadTicket(c, tk, (uint32_t)mSand).mass;
+  int recentredAt = -1;
+  for (int i = 1; i <= 240; i++) {
+    tick();
+    if (c.stream.TicketSet().Stats().recentred > rec0) { recentredAt = i; break; }
+  }
+  for (int i = 0; i < 10; i++) tick();
+  c.ctx.WaitIdle();
+  const IVec3 lo1 = c.stream.TicketSet().BoxLo(tk);
+  const bool live = c.stream.TicketSet().StateOf(tk) == Tickets::State::Live;
+  const uint64_t mass1 = live ? ReadTicket(c, tk, (uint32_t)mSand).mass : 0;
+  const uint32_t faults = c.world.Snap().pageFaults;
+  Regenerate(c);
+
+  const bool drawn = dCentre >= minDelta && dSide <= maxSide;
+  const bool moved = recentredAt >= 0 && live &&
+                     (lo1.x != lo0.x || lo1.y != lo0.y || lo1.z != lo0.z);
+  const bool conserved = mass1 == mass0 && mass0 > 0;
+  RecordObserved("ticketRender.centreDelta", (double)dCentre);
+  const bool ok = drawn && moved && conserved && faults == 0;
+  detail = Format(
+      "ticket #%u box (%d,%d,%d)+5 in open sky past the +X face: a 1-voxel stone "
+      "column 12 m off changed the centre pixel by %d (want >= %d) and the pixel "
+      "40 px beside it by %d (want <= %d); %llu sand eighths poured, the box "
+      "re-centred %d ticks later to (%d,%d,%d), %llu eighths inside it after "
+      "(%s); page faults %u",
+      tk, lo0.x, lo0.y, lo0.z, dCentre, minDelta, dSide, maxSide,
+      (unsigned long long)mass0, recentredAt, lo1.x, lo1.y, lo1.z,
+      (unsigned long long)mass1, conserved ? "conserved" : "MASS MOVED", faults);
+  std::printf("ticket-render: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& TicketGates() {
@@ -647,6 +802,7 @@ const std::vector<Gate>& TicketGates() {
       {"ticket-settle", "sim", {}, false, GateTicketSettle},
       {"ticket-land", "sim", {}, false, GateTicketLand},
       {"ticket-decay", "sim", {}, false, GateTicketDecay},
+      {"ticket-render", "render", {}, false, GateTicketRender, /*needsRender=*/true},
   };
   return g;
 }

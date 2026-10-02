@@ -1772,6 +1772,11 @@ struct RenderParams {
   wfTerr : array<vec4<u32>, 1024>,
   draftOrigin : vec3<i32>,
   draftMode : u32,
+  // Chunk tickets, the render copy (world.h RenderParams; P4): the live boxes'
+  // lo corners (world chunks) with the ticket index in .w, ticketCount valid.
+  ticketCount : u32,
+  pad_tk0 : u32, pad_tk1 : u32, pad_tk2 : u32,
+  ticketBox : array<vec4<i32>, TICKET_MAX>,
 };
 
 // ---- THE CLOUDS: the shared half (cloud.wgsl, src/sim/weather.h) ----------

@@ -709,7 +709,7 @@ const char* const kOrder[] = {
     // and the same discipline — each clears the store and drops every ticket
     // first (Stream::OnRegen), builds its fixture outside the window, and
     // regenerates on the way out, so nothing after it inherits a ticket.
-    "ticket-settle", "ticket-land", "ticket-decay",
+    "ticket-settle", "ticket-land", "ticket-decay", "ticket-render",
     // The swing's OTHER half. `swing` up top is MeleeState alone and costs
     // milliseconds; this one stands an avatar on real terrain with the blade
     // drawn, spawns a dummy to cut, and measures the sword's world trajectory

@@ -9,7 +9,10 @@ what P1 inherits). **P1 IMPLEMENTED 2026-10-02** (`src/sim/tickets.{h,cpp}`,
 record, gate `ticket-settle`; deviations in §6). **P2 IMPLEMENTED 2026-10-02**
 (particles park outside residency on the far cascade and request tickets;
 refused ones deposit as far landings; gate `ticket-land`). **P3 IMPLEMENTED
-2026-10-02** (only DECAY runs in a ticket; gate `ticket-decay`). Named "tickets" rather
+2026-10-02** (only DECAY runs in a ticket; gate `ticket-decay`). **P4
+IMPLEMENTED 2026-10-02** (the raymarch draws tickets at full voxel resolution;
+boxes re-centre toward their shell; gate `ticket-render`). P5 is not
+scheduled. Named "tickets" rather
 than "islands" because `docs/PLAN_rigidbody_islands.md` already owns that word
 for disconnected solid components. Companion: `docs/PLAN_gas_particles.md`
 (independent; phase 2 here can consume its `farVox` blocking).
@@ -450,3 +453,33 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
    frozen-shell limitation (§5) applied to gas. P4's re-centre follows activity
    into the shell, but a plume rising out of the top of the box is exactly the
    case tickets do not cover (gas that LEAVES belongs to the gas particles).
+
+### P4
+
+1. **A ticket hit is shaded by the FAR path.** `traceTickets` (raymarch.wgsl)
+   returns a level-1 `FarHit` with `FAR_HIT_TICKET`: geometry and depth at full
+   voxel resolution, lighting the cascade's (palette at the fine voxel, cascade
+   shadow march and AO at level-1 granularity, no shadow cache — §5's packing
+   limit stands). A second near-quality shade would be a second copy of the
+   window's shading in the fragment shader with no register headroom; the
+   march's state is all local to the call and dies before the shade.
+2. **The ticket boxes ride `RenderParams`** (`ticketCount` + 16 `vec4<i32>`),
+   filled from the same World table the sim resolves through. The slot inside
+   a hit box is arithmetic (base + chunk mod 5), so the render path needs no
+   probe and keeps P1's stub everywhere else.
+3. **The march starts at the WINDOW exit (`windowExitT`), not `h.tExit`**,
+   which the LOD handoff may have clamped well short of the window; and it is
+   not gated on the ray-start map, which summarizes the window and cascade.
+4. **Re-centring is a box shift**, not "release + activate": the leaving and
+   entering planes share their 25 slots (mod 5), so the leaving plane is copied
+   out as a two-phase keep batch (exactly as a release) and the same slots are
+   refilled — 25 chunks instead of 125, recorded as one `kRecentre` op. The
+   face is the one with the most dirty shell chunks in the latest published
+   snapshot (ties: lower axis, then the negative side), at most once per
+   `kTicketRecentreTicks` (60); a step that would touch the window or another
+   live box is not taken.
+5. **A fifth gate, `ticket-render`**, carries both P4 claims: a one-voxel
+   column in a ticket changes the pixel it projects to and not the one three
+   column-widths beside it (the cascade left empty, so only `traceTickets` can
+   draw it), and poured sand that falls into the bottom shell moves the box
+   with its mass conserved.

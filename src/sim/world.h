@@ -3838,6 +3838,15 @@ struct RenderParams {
   // reads the ambient field, as the sim does at draftMode 0.
   int32_t draftOrigin[3] = {0, 0, 0};
   uint32_t draftMode = 0;
+  // ---- CHUNK TICKETS, the render copy (docs/PLAN_chunk_tickets.md P4) -----
+  // The LIVE ticket boxes (world chunks, lo corner; .w = the ticket index,
+  // whose slot range the raymarch reads directly), compacted to the front;
+  // `ticketCount` of them are valid. The raymarch tests these AABBs after a
+  // ray leaves the window and runs a DDA inside a hit box, so a ticket draws
+  // at full voxel resolution from any distance. 0 = one compare per sky ray.
+  uint32_t ticketCount = 0;
+  uint32_t pad_tk[3] = {0, 0, 0};
+  int32_t ticketBox[kTicketMax][4] = {};
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

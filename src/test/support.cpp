@@ -946,6 +946,22 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     rp.draftMode = gDraftRenderValid ? 1u : 0u;
     for (int i = 0; i < 3; i++) rp.draftOrigin[i] = gDraftRenderOrigin[i];
   }
+  // CHUNK TICKETS (docs/PLAN_chunk_tickets.md P4): the live boxes, compacted,
+  // in ticket-index order — the same table the sim resolves through, so what
+  // is drawn at full resolution outside the window is exactly what is
+  // simulated there.
+  {
+    rp.ticketCount = 0;
+    for (uint32_t i = 0; i < kTicketMax; i++) {
+      const World::TicketBox& tb = world.Ticket(i);
+      if (!tb.live) continue;
+      int32_t* b = rp.ticketBox[rp.ticketCount++];
+      b[0] = tb.lo.x;
+      b[1] = tb.lo.y;
+      b[2] = tb.lo.z;
+      b[3] = (int32_t)i;
+    }
+  }
   // WIND PRIMITIVES (§4.3). The SAME resolved list SubmitTick shipped to the
   // sim this tick — WindPrims() is advanced there and read here, which is what
   // makes the grass lean in a fan's blast and the debug arrows agree with the

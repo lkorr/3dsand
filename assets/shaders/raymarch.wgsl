@@ -11943,6 +11943,98 @@ fn farWetness(n : vec3f, open : f32, covered : bool) -> f32 {
   return R.wetness * expo * mix(0.3, 1.0, clamp(n.y, 0.0, 1.0));
 }
 
+// ---- CHUNK TICKETS, DRAWN AT FULL RESOLUTION (docs/PLAN_chunk_tickets.md P4) -
+//
+// A ticket is resident world OUTSIDE the window, so the fine march (whose clip
+// is the window box: trace()'s wloI/wloHi, class (c) — unchanged) never sees
+// it, and until P4 it showed only through the far cascade's downsample. This
+// runs AFTER trace() for a ray that left the window without a surface: at most
+// R.ticketCount (<= TICKET_MAX) slab tests, and inside a box it hits, an
+// ordinary voxel DDA over that ticket's slots — the box test IS the residency
+// test, so no probe and no page-table search: the slot is the ticket's base
+// plus the chunk's index modulo the box (common.wgsl ticketLocalIndex).
+//
+// The hit is returned AS A FarHit at cascade level 1 with FAR_HIT_TICKET set,
+// so it takes the far field's shading path (palette at the fine voxel, the
+// cascade's shadow march and AO at level-1 granularity) and the far path's
+// depth: geometry at full voxel resolution, lighting at the cascade's. A
+// separate near-quality shade here would be a second copy of the window's
+// shading in the one shader with no register headroom
+// (gotcha-raymarch-fs-has-no-register-headroom); everything below is local to
+// this call and dies at its return, so nothing new lives across trace().
+//
+// Liquids are surfaces here (the far path shades them), gases and micro
+// plants are not (as for a shadow ray). `tMax` is the nearest thing already
+// found (the cascade's hit), so a ticket behind a hill draws nothing.
+const FAR_HIT_TICKET : u32 = 0x800u;     // FarHit.level flag: a ticket voxel
+const TICKET_MARCH_STEPS : i32 = 320;    // > 3 x 80 cells: any chord of a box
+
+fn traceTickets(ro : vec3f, rdIn : vec3f, tMin : f32, tMax : f32) -> FarHit {
+  var out : FarHit;
+  out.hit = false;
+  out.t = tMax;
+  out.axis = 1;
+  out.sgn = -1.0;
+  out.mat = 0u;
+  out.cell = vec3<i32>(0);
+  out.level = 1u | FAR_HIT_TICKET;
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  let stp = vec3<i32>(sign(rd));
+  let edge = i32(TICKET_BOX_N * CHUNK);
+  let n = min(R.ticketCount, TICKET_MAX);
+  for (var j = 0u; j < n; j++) {
+    let b = R.ticketBox[j];
+    let blo = b.xyz * i32(CHUNK);
+    let bhi = blo + vec3<i32>(edge);
+    let t0 = (vec3f(blo) - ro) * inv;
+    let t1 = (vec3f(bhi) - ro) * inv;
+    let tn = min(t0, t1);
+    let tf = max(t0, t1);
+    let tEnter = max(max(max(tn.x, tn.y), tn.z), tMin);
+    let tExit = min(min(tf.x, tf.y), tf.z);
+    if (tExit <= tEnter || tEnter >= out.t) { continue; }
+    let slotBase = NUM_CHUNKS + u32(b.w) * TICKET_CHUNKS;
+    var cell = clamp(vec3<i32>(floor(ro + rd * (tEnter + 1e-3))), blo, bhi - vec3<i32>(1));
+    var tSide = (vec3f(cell + max(stp, vec3<i32>(0))) - ro) * inv;
+    let tDelta = abs(inv);
+    // The face the ray entered through (the largest entry plane).
+    var axis = 0;
+    if (tn.y >= tn.x && tn.y >= tn.z) { axis = 1; }
+    else if (tn.z >= tn.x && tn.z >= tn.y) { axis = 2; }
+    var tCell = tEnter;
+    for (var s = 0; s < TICKET_MARCH_STEPS; s++) {
+      if (any(cell < blo) || any(cell >= bhi) || tCell >= out.t) { break; }
+      let e = pageTable[slotBase + ticketLocalIndex(cell >> vec3<u32>(CHUNK_SHIFT))];
+      let m = voxMat(voxWordAtEntry(e, cell));
+      if (m != MAT_AIR) {
+        let mm = materials[m];
+        if (mm.klass != CLASS_GAS && (mm.flags & MATF_MICRO) == 0u) {
+          out.hit = true;
+          out.t = tCell;
+          out.axis = axis;
+          out.sgn = f32(axisPickI(stp, axis));
+          out.mat = m;
+          out.cell = cell >> vec3<u32>(farCellShift(1u));
+          break;
+        }
+      }
+      // Step to the nearest cell boundary.
+      if (tSide.x <= tSide.y && tSide.x <= tSide.z) {
+        tCell = tSide.x; tSide.x += tDelta.x; cell.x += stp.x; axis = 0;
+      } else if (tSide.y <= tSide.z) {
+        tCell = tSide.y; tSide.y += tDelta.y; cell.y += stp.y; axis = 1;
+      } else {
+        tCell = tSide.z; tSide.z += tDelta.z; cell.z += stp.z; axis = 2;
+      }
+    }
+  }
+  return out;
+}
+
 @fragment
 fn fs(in : VSOut) -> FSOut {
   // No per-pixel "dry" clear: a veil record is live only when its w6 names
@@ -11987,6 +12079,15 @@ fn fs(in : VSOut) -> FSOut {
       // Rides the refine's knob: the feature plane is the refine levels' data,
       // and render.farRefineLevel 0 (the `norefine` budget arm) prices both.
       if (far.hit && TUNE_FAR_REFINE_LEVEL >= 1) { far = farFeatMarch(R.camPos, rd, far, h.tExit); }
+    }
+    // CHUNK TICKETS (traceTickets, above): from the WINDOW's exit — a ticket
+    // is never inside the window, and trace()'s tExit may be the LOD handoff
+    // well short of it — to whatever the cascade already found. Not gated on
+    // the ray-start map: a ticket is not part of the field it summarizes.
+    if (R.ticketCount > 0u) {
+      let tk = traceTickets(R.camPos, rd, windowExitT(R.camPos, rd),
+                            select(1e30, far.t, far.hit));
+      if (tk.hit) { far = tk; }
     }
   }
 

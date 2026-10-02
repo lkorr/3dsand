@@ -332,9 +332,83 @@ void Tickets::ReleaseOverlapping(IVec3 newOrigin, uint32_t tick) {
   if (any) Publish();
 }
 
+// ---- RE-CENTRING (P4, docs/PLAN_chunk_tickets.md §3) -----------------------
+//
+// Matter the interior pushes into the shell is frozen there (the shell is
+// never dispatched). When the latest published snapshot shows shell chunks on
+// one FACE of the box dirty, the box steps one chunk toward that face — at
+// most once per kTicketRecentreTicks per ticket. Because a box chunk lives at
+// its coordinate MOD 5, the plane the box leaves and the plane it enters use
+// the SAME 25 slots: the leaving plane is copied out (a two-phase keep batch,
+// exactly as a release), the table moves, and the same slots are refilled
+// from the store or procgen for the entering plane — a window shift at the
+// box's scale, recorded as one TicketOp. The face is the one with the most
+// dirty shell chunks; ties go to the lower axis, then the negative side, so
+// the choice is a pure function of the snapshot. A step that would touch the
+// window or another live box is not taken.
 void Tickets::Recentre(uint32_t tick) {
-  // P4 (tickets.cpp's re-centre is filled in with the render path).
-  (void)tick;
+  const int n = (int)kTicketBoxN;
+  for (uint32_t i = 0; i < kTicketMax; i++) {
+    Ticket& t = t_[i];
+    if (t.state != State::Live) continue;
+    if (tick < t.lastRecentre + kTicketRecentreTicks) continue;
+    int best = 0, bestAxis = -1, bestDir = 0;
+    for (int a = 0; a < 3; a++)
+      for (int side = 0; side < 2; side++) {
+        const int off = side == 0 ? 0 : n - 1;
+        int count = 0;
+        for (uint32_t l = 0; l < kTicketChunks; l++) {
+          if (!t.lastDirty[l]) continue;
+          const IVec3 wc = world_->TicketSlotWorldChunk(World::TicketSlotBase(i) + l);
+          const int d[3] = {wc.x - t.lo.x, wc.y - t.lo.y, wc.z - t.lo.z};
+          if (d[a] == off) count++;
+        }
+        if (count > best) {
+          best = count;
+          bestAxis = a;
+          bestDir = side == 0 ? -1 : 1;
+        }
+      }
+    if (bestAxis < 0) continue;
+    IVec3 nlo = t.lo;
+    if (bestAxis == 0) nlo.x += bestDir;
+    else if (bestAxis == 1) nlo.y += bestDir;
+    else nlo.z += bestDir;
+    if (BoxHitsWindow(nlo, world_->WindowOrigin()) || BoxHitsLive(nlo, i)) continue;
+    // The leaving plane: offset (n-1) on the axis when stepping -, 0 when +.
+    const int leaveOff = bestDir > 0 ? 0 : n - 1;
+    std::vector<uint32_t> slots, locals;
+    for (uint32_t l = 0; l < kTicketChunks; l++) {
+      const IVec3 wc = world_->TicketSlotWorldChunk(World::TicketSlotBase(i) + l);
+      const int d[3] = {wc.x - t.lo.x, wc.y - t.lo.y, wc.z - t.lo.z};
+      if (d[bestAxis] != leaveOff) continue;
+      slots.push_back(World::TicketSlotBase(i) + l);
+      locals.push_back(l);
+    }
+    PendingKeep pk;
+    pk.handle = stream_->EvictTicketSlots(slots);
+    pk.slots = slots;
+    for (uint32_t l : locals) pk.bits.push_back(t.everDirty[l]);
+    pk.until = tick;
+    pk.ticket = kTicketMax;   // the ticket stays live; nothing to free
+    pk.conservative = t.conservative;
+    keeps_.push_back(std::move(pk));
+    t.lo = nlo;
+    world_->SetTicketBox(i, nlo, true);
+    // Before the refill's genChunk resolves the entering chunks (Activate's
+    // reason for uploading at once).
+    world_->UploadTicketTable(stream_->Ctx()->queue);
+    for (uint32_t l : locals) {
+      t.everDirty[l] = 0;
+      t.lastDirty[l] = 0;
+      t.since[l] = tick;
+    }
+    stream_->FillTicketSlots(slots);
+    t.lastRecentre = tick;
+    t.idleSnaps = 0;
+    stats_.recentred++;
+    Record(TicketOp::kRecentre, (uint32_t)TicketReason::Recentre, i, tick, nlo);
+  }
 }
 
 void Tickets::Tick(uint32_t tick) {
