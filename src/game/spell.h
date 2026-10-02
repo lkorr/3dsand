@@ -1,6 +1,7 @@
 #pragma once
 #include <climits>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -498,10 +499,74 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
 
 // ---- the spoken stack -------------------------------------------------------
 
+// A PAGE USED AS ONE GLYPH (2026-10-02). A grimoire page named inside another
+// spell is not pasted in as its words any more: it is spoken as its words
+// between two MARKS, and the parser closes everything between them into ONE
+// item - a page call - before the surrounding sentence sees it. That is the
+// whole abstraction, and three consequences follow from it:
+//
+//   1. HYGIENE. The page's delivery boxes the page's own pile and nothing
+//      outside it; its operators cannot reach past the opening mark; nothing
+//      spoken after it can fall into it. `fire <bolt>` where `bolt` is
+//      `explosive projectile` is fire AND an exploding bolt, never a bolt
+//      that also sprays fire.
+//   2. ITS SHAPE IS INFERRED, NOT DECLARED. Every slot an operator inside the
+//      page left EMPTY is an INPUT of the page: a left slot takes the item
+//      spoken before the call (the last input the nearest item, postfix, the
+//      way `sand fire transmute` binds), a right slot the word after it. A page
+//      that is nothing but a delivery and its mods - `swift shotgun
+//      projectile` - is a CARRIER: it boxes the pile in front of it exactly as
+//      its delivery word would, and its mods ride along. Anything else is a
+//      VALUE: the items its pile holds, as one item of the sort they share.
+//   3. THE WORDS STAY THE SAVE FORMAT. A page on a page is still its NAME in
+//      the word list; the marks exist only in a spoken stack, the body is
+//      re-read from the book every time, and an edit to the inner page reaches
+//      every spell that names it.
+//
+// The marks are negative "glyph" values no library index can collide with:
+// `kSpokenPageOpen0 - k` opens the k-th page of the stack's `book`,
+// `kSpokenPageClose` closes the innermost one. Every consumer that resolves a
+// spoken value through `GlyphLibrary::At` already skips them (At(-n) is null).
+constexpr int kSpokenPageClose = -2;
+constexpr int kSpokenPageOpen0 = -16;
+inline bool SpokenIsPageOpen(int s) { return s <= kSpokenPageOpen0; }
+inline bool SpokenIsMark(int s) { return s == kSpokenPageClose || s <= kSpokenPageOpen0; }
+inline int SpokenPageIndex(int s) { return kSpokenPageOpen0 - s; }
+
+// The pages a stack (or a tree) names, each with its OWN word list as saved -
+// nested pages still by name. Carried beside the words so a tree can be
+// re-parsed from its words without the grimoire it came from (the editor's
+// round-trip proof does exactly that).
+struct PageBook {
+  std::vector<std::string> names;
+  std::vector<std::vector<std::string>> words;
+  int Find(const std::string& name) const {
+    for (size_t i = 0; i < names.size(); i++)
+      if (names[i] == name) return (int)i;
+    return -1;
+  }
+  // Same name = same page: the first definition wins.
+  int Add(const std::string& name, const std::vector<std::string>& w) {
+    const int at = Find(name);
+    if (at >= 0) return at;
+    names.push_back(name);
+    words.push_back(w);
+    return (int)names.size() - 1;
+  }
+  void Merge(const PageBook& o) {
+    for (size_t i = 0; i < o.names.size(); i++) Add(o.names[i], o.words[i]);
+  }
+  const std::vector<std::string>* WordsOf(const std::string& name) const {
+    const int at = Find(name);
+    return at >= 0 ? &words[(size_t)at] : nullptr;
+  }
+};
+
 // The typed stack the player speaks onto. Glyphs are functions on this stack;
 // the cast key applies "cast" to what is on top.
 struct SpellStack {
-  std::vector<int> spoken;   // glyph indices, in spoken order
+  std::vector<int> spoken;   // glyph indices (and page marks), in spoken order
+  PageBook book;             // the pages the marks in `spoken` name
   // Per-word MAGNITUDE (per-mille) and TIMING, parallel to `spoken`. Either
   // may be SHORTER than `spoken` - a missing magnitude is kMagUnset (the
   // glyph's default), a missing timing is the default - so every site that
@@ -513,8 +578,17 @@ struct SpellStack {
     spoken.clear();
     mags.clear();
     timing.clear();
+    book = PageBook{};
   }
   bool Empty() const { return spoken.empty(); }
+  // REAL words, marks excluded: what the stack cap and the page's word cap
+  // count, so a page named inside a spell costs the words it speaks and not
+  // two more for the marks around them.
+  int Words() const {
+    int n = 0;
+    for (int s : spoken) n += SpokenIsMark(s) ? 0 : 1;
+    return n;
+  }
   int32_t MagAt(size_t i) const { return i < mags.size() ? mags[i] : kMagUnset; }
   SpellTiming TimingAt(size_t i) const { return i < timing.size() ? timing[i] : SpellTiming{}; }
   void Push(int glyph, int32_t mag = kMagUnset, SpellTiming tm = {}) {
@@ -535,6 +609,31 @@ struct SpellStack {
 // effects each, a fan, a delivery and a mod is a sentence a player will want
 // to say.
 constexpr int kSpellStackMax = 32;
+
+// ---- speaking pages (see "A PAGE USED AS ONE GLYPH" above) -------------------
+//
+// Resolve a page NAME to its saved word list, or null. The grimoire supplies
+// one (caster.h), a tree's own `book` another (spellgraph.cpp); the expansion
+// below is the one piece of code both use, so a page reads the same wherever
+// it is spoken.
+using PageLookup = std::function<const std::vector<std::string>*(const std::string&)>;
+struct PageExpansionReport {
+  int dropped = 0;          // names that resolve to nothing
+  bool truncated = false;   // the word cap cut it short
+  bool tooDeep = false;     // a nest past maxMacroDepth, or a cycle
+  std::vector<std::string> readout;   // the real words, `?` for a dropped one
+};
+// Speak `words` onto `out`: glyph words as themselves, page names as their
+// bodies between marks, recursively, depth-capped by `budgets.maxMacroDepth`
+// and capped at `maxWords` REAL words on `out`. Total: a missing name drops
+// one word, a cycle or a too-deep nest speaks nothing for that name, and the
+// marks always balance (a page cut short is still closed).
+void SpeakWordsOnto(const GlyphLibrary& lib, const PageLookup& find,
+                    const std::vector<std::string>& words, int maxWords, SpellStack& out,
+                    PageExpansionReport& report);
+// `src` spoken after everything already on `dst`, its page marks renumbered
+// into `dst`'s book.
+void AppendStack(SpellStack& dst, const SpellStack& src);
 
 // ---- the parse tree (the three rules) ----------------------------------------
 
@@ -574,6 +673,26 @@ struct SpellNode {
   // position.
   int first = -1, last = -1;
   int at = -1;
+
+  // ---- a PAGE CALL (see "A PAGE USED AS ONE GLYPH" over SpellStack) ---------
+  // Non-empty: this node stands for the grimoire page of that name, spoken as
+  // ONE glyph. Two shapes:
+  //   * a VALUE call: `box` and `group` are false, `glyph` is -1, and `items` /
+  //     `laneAt` are the page's own pile exactly as the page parses alone (its
+  //     BODY). The node is one item of whatever sort its body shares.
+  //   * a CARRIER call: an ordinary box (`box`, `glyph` = the page's
+  //     delivery, `items` = the pile it closed out here) whose delivery word
+  //     was the page; `callItems` are the page's own mods, kept apart from the
+  //     pile so they never merge with a word the player spoke beside them.
+  // `LowerSpell` dissolves both (`FlattenCalls`) before it lowers, so nothing
+  // past the tree knows a page was there.
+  std::string call;
+  std::vector<int> callItems;
+  // A value call's INPUTS: every operator slot its body left empty, in spoken
+  // order, encoded `groupNode * 2 + side` (0 left, 1 right). The slot itself
+  // holds whatever filled it from outside - one source of truth, so `FillSlot`
+  // and `Remove` on an input are the ordinary ops on that group.
+  std::vector<int> holes;
 };
 
 // THE sentence. Since `also` was dropped for rule 4, a spoken sequence is
@@ -592,12 +711,30 @@ struct SpellClause {
 struct SpellTree {
   std::vector<SpellNode> nodes;
   std::vector<SpellClause> clauses;
+  // Every page a call node in this tree names, with its saved words: what the
+  // tree needs to be re-read from its own words (spellgraph's proof).
+  PageBook book;
   bool Empty() const { return clauses.empty(); }
 };
 
 // The three rules, left to right. Total: any sequence of valid glyph indices
-// parses.
+// parses, page marks included (an unbalanced mark is closed or ignored).
 SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack);
+
+// A copy of `t` with every page call DISSOLVED into the words it stands for:
+// a value call's body spliced into the pile it sits in (its own lanes become
+// new lanes of that box), a carrier's mods joined to its pile. NODE INDICES
+// ARE PRESERVED - only item lists and slots are rewired - so a lowering of the
+// flat tree prices the boxes of the original one.
+SpellTree FlattenCalls(const GlyphLibrary& lib, const SpellTree& t);
+// How many items a value call's body holds (its OUTPUTS). Only a call with
+// exactly one may stand in an operator's slot.
+int CallOutputs(const SpellTree& t, int node);
+// Is this node a value call (not a carrier)?
+inline bool IsValueCall(const SpellTree& t, int node) {
+  return node >= 0 && node < (int)t.nodes.size() && !t.nodes[(size_t)node].call.empty() &&
+         !t.nodes[(size_t)node].box;
+}
 
 // The sort an item denotes: a raw word's sort, or an operator's result sort.
 GlyphSort NodeSort(const GlyphLibrary& lib, const SpellTree& t, int node);

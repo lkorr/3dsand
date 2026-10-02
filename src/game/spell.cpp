@@ -1009,14 +1009,33 @@ GlyphSort NodeSort(const GlyphLibrary& lib, const SpellTree& t, int node) {
   // That is the whole trick: `explosive projectile` is a noun again, so it can
   // go back in the pile, be boxed again, or be taken by `echo`.
   if (n.box) return GlyphSort::Effect;
+  // A VALUE CALL is the sort its body's items share: a page that says `fire`
+  // is Matter, one that says `swift twin` is a Mod (it sticks to the next box
+  // like the words it holds), one that says a bolt is an Effect. A body of
+  // mixed sorts is an Effect - the sort a box's payload is.
+  if (!n.call.empty()) {
+    if (n.items.empty()) return GlyphSort::Effect;
+    const GlyphSort s0 = NodeSort(lib, t, n.items[0]);
+    for (int ii : n.items)
+      if (NodeSort(lib, t, ii) != s0) return GlyphSort::Effect;
+    return s0;
+  }
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return GlyphSort::Effect;
   return n.group ? g->result : g->sort;
 }
 
+int CallOutputs(const SpellTree& t, int node) {
+  if (!IsValueCall(t, node)) return 0;
+  return (int)t.nodes[(size_t)node].items.size();
+}
+
 namespace {
 
 bool SlotAccepts(const GlyphLibrary& lib, const SpellTree& t, uint8_t mask, int node) {
+  // A page with several outputs is several items, and a slot holds ONE: the
+  // operator sees a wall rather than half a page.
+  if (IsValueCall(t, node) && CallOutputs(t, node) != 1) return false;
   if (mask == kSortAny) return true;
   return (mask & (uint8_t)(1u << (int)NodeSort(lib, t, node))) != 0;
 }
@@ -1035,6 +1054,13 @@ std::vector<int> MergePile(const GlyphLibrary& lib, SpellTree& t,
   std::vector<int> outItems;
   std::vector<std::string> keys;
   for (int ni : pile) {
+    // A PAGE CALL NEVER MERGES. Two of them are two uses of the page, each with
+    // its own inputs; a multiplicity on a call has no meaning to give it.
+    if (IsValueCall(t, ni)) {
+      keys.push_back(std::string());
+      outItems.push_back(ni);
+      continue;
+    }
     const std::string k = NodeKey(lib, t, ni);
     bool merged = false;
     for (size_t j = 0; j < keys.size(); j++) {
@@ -1063,7 +1089,44 @@ struct ParseScope {
   std::vector<int> laneAt;               // two per lane: the `lane`, then `end`
   int openAt = -1;                       // the `lane` word that opened it
   int startPos = 0;                      // where its first item could be spoken
+  // >= 0: not a lane but a PAGE's body (the index into the stack's book). An
+  // `end` never closes it and a delivery inside it boxes only what is in it.
+  int page = -1;
 };
+
+// Every operator slot under `node` that is still EMPTY - the inputs of a page
+// whose body this is - appended as `group * 2 + side`. Walks into boxes and
+// into nested calls' bodies (an input nobody filled in the inner page is an
+// input of the outer one too), but not into an operand that was filled.
+void CollectHoles(const GlyphLibrary& lib, const SpellTree& t, int node,
+                  std::vector<int>& out) {
+  if (node < 0 || node >= (int)t.nodes.size()) return;
+  const SpellNode& n = t.nodes[(size_t)node];
+  if (n.group) {
+    const GlyphDef* g = lib.At(n.glyph);
+    CollectHoles(lib, t, n.left, out);
+    if (g && g->hasLeft && n.left < 0) out.push_back(node * 2);
+    if (g && g->hasRight && n.right < 0) out.push_back(node * 2 + 1);
+    CollectHoles(lib, t, n.right, out);
+    return;
+  }
+  for (int ii : n.items) CollectHoles(lib, t, ii, out);
+  for (int ii : n.callItems) CollectHoles(lib, t, ii, out);
+}
+
+uint8_t HoleMask(const GlyphLibrary& lib, const SpellTree& t, int hole) {
+  const GlyphDef* g = lib.At(t.nodes[(size_t)(hole / 2)].glyph);
+  if (!g) return 0;
+  return (hole & 1) ? g->rightMask : g->leftMask;
+}
+
+void SetHole(const GlyphLibrary& lib, SpellTree& t, int hole, int value) {
+  SpellNode& grp = t.nodes[(size_t)(hole / 2)];
+  if (hole & 1) grp.right = value;
+  else grp.left = value;
+  const GlyphDef* g = lib.At(grp.glyph);
+  grp.complete = g && (!g->hasLeft || grp.left >= 0) && (!g->hasRight || grp.right >= 0);
+}
 
 // RULE 2 + RULE 4: box a whole SCOPE under `deliveryGlyph` (-1 = the implicit
 // hand) — its shared items first, then one segment per closed lane. Returns
@@ -1123,8 +1186,20 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
   // silently drop a nesting. (A mark between two identical words is what makes
   // `fire lane fire end` two items in two segments rather than `fire×2`.)
   std::vector<int> items;
+  t.book = stack.book;
   for (size_t i = 0; i < stack.spoken.size(); i++) {
     const int gi = stack.spoken[i];
+    // A PAGE MARK is an item of the pass below (it opens or closes a scope)
+    // and never merges with anything, which is also what keeps `fire <fire>`
+    // from becoming `fire×2` across the page's edge.
+    if (SpokenIsMark(gi)) {
+      SpellNode m;
+      m.glyph = gi;
+      m.first = m.last = (int)i;
+      t.nodes.push_back(m);
+      items.push_back((int)t.nodes.size() - 1);
+      continue;
+    }
     const GlyphDef* gd = lib.At(gi);
     if (!gd) continue;
     const bool mergeable =
@@ -1185,8 +1260,123 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
     scopes[0] = ParseScope{};
   };
 
+  // THE CLOSING MARK OF A PAGE: its body becomes ONE item of the scope around
+  // it (see "A PAGE USED AS ONE GLYPH" in spell.h). `i` is the mark's index in
+  // `items` and may advance past words a right-hand input takes.
+  auto closePage = [&](int endPos, size_t& i) {
+    ParseScope sc = std::move(scopes.back());
+    scopes.pop_back();
+    ParseScope& outer = scopes.back();
+    const std::string name = sc.page >= 0 && sc.page < (int)stack.book.names.size()
+                                 ? stack.book.names[(size_t)sc.page]
+                                 : std::string("?");
+    const int openPos = sc.openAt;
+    // A CARRIER is a page that is one box and nothing else, whose pile holds
+    // only finished mods: a delivery with its settings, and no payload. It is
+    // a delivery word, spoken as a page.
+    bool carrier = false;
+    if (sc.lanes.empty() && sc.pile.size() == 1) {
+      const SpellNode& pb = t.nodes[(size_t)sc.pile[0]];
+      carrier = pb.box && pb.glyph >= 0 && pb.laneAt.empty() && pb.call.empty();
+      for (int ii : pb.items) {
+        std::vector<int> h;
+        CollectHoles(lib, t, ii, h);
+        carrier = carrier && NodeSort(lib, t, ii) == GlyphSort::Mod && h.empty();
+      }
+    }
+    if (carrier) {
+      const SpellNode pb = t.nodes[(size_t)sc.pile[0]];
+      const int b = CloseBox(lib, t, outer, pb.glyph, openPos, spokenEnd);
+      SpellNode& bn = t.nodes[(size_t)b];
+      bn.timing = pb.timing;
+      bn.call = name;
+      bn.callItems = pb.items;
+      bn.first = std::min(bn.first, openPos);
+      bn.last = std::max(bn.last, endPos);
+      outer.pile.clear();
+      outer.lanes.clear();
+      outer.laneAt.clear();
+      outer.pile.push_back(b);
+      return;
+    }
+    // A VALUE: the body as the page parses alone - its pile, its lanes - held
+    // by one node that is not a box (it delivers nothing) and not a group.
+    const int c = CloseBox(lib, t, sc, -1, openPos, spokenEnd);
+    {
+      SpellNode& cn = t.nodes[(size_t)c];
+      cn.box = false;
+      cn.glyph = -1;
+      cn.call = name;
+      cn.at = openPos;
+      cn.first = openPos;
+      cn.last = endPos;
+    }
+    // ITS INPUTS: every slot it left empty, in spoken order.
+    std::vector<int> holes;
+    for (int ii : t.nodes[(size_t)c].items) CollectHoles(lib, t, ii, holes);
+    std::stable_sort(holes.begin(), holes.end(), [&](int a, int b) {
+      const int pa = t.nodes[(size_t)(a / 2)].at, pb = t.nodes[(size_t)(b / 2)].at;
+      return pa != pb ? pa < pb : (a & 1) < (b & 1);
+    });
+    t.nodes[(size_t)c].holes = holes;
+    // LEFT INPUTS TAKE THE ITEMS SPOKEN BEFORE THE PAGE, postfix: the last
+    // left input takes the item nearest the page, the one before it the item
+    // before that, and the first item a slot refuses ends the binding. Only
+    // within this scope - a lane mark is a wall here as everywhere.
+    for (int k = (int)holes.size() - 1; k >= 0; k--) {
+      if (holes[(size_t)k] & 1) continue;
+      if (outer.pile.empty()) break;
+      const int top = outer.pile.back();
+      if (!SlotAccepts(lib, t, HoleMask(lib, t, holes[(size_t)k]), top)) break;
+      outer.pile.pop_back();
+      SetHole(lib, t, holes[(size_t)k], top);
+      t.nodes[(size_t)c].first = std::min(t.nodes[(size_t)c].first, t.nodes[(size_t)top].first);
+    }
+    outer.pile.push_back(c);
+    // RIGHT INPUTS TAKE THE WORDS AFTER IT, in order, exactly as an infix
+    // operator's right slot takes the next raw word.
+    for (int h : holes) {
+      if (!(h & 1)) continue;
+      if (i + 1 >= items.size()) break;
+      const int nx = items[i + 1];
+      if (t.nodes[(size_t)nx].glyph < 0) break;   // a mark: no word there
+      if (!SlotAccepts(lib, t, HoleMask(lib, t, h), nx)) break;
+      SetHole(lib, t, h, nx);
+      t.nodes[(size_t)c].last = std::max(t.nodes[(size_t)c].last, t.nodes[(size_t)nx].last);
+      i++;
+    }
+    bool complete = true;
+    for (int h : holes) {
+      const SpellNode& gn = t.nodes[(size_t)(h / 2)];
+      complete = complete && ((h & 1) ? gn.right : gn.left) >= 0;
+    }
+    t.nodes[(size_t)c].complete = complete;
+  };
+
   for (size_t i = 0; i < items.size(); i++) {
     const int ni = items[i];
+    // ---- a page mark ----------------------------------------------------------
+    if (SpokenIsMark(t.nodes[ni].glyph)) {
+      const int mark = t.nodes[ni].glyph;
+      if (SpokenIsPageOpen(mark)) {
+        ParseScope inner;
+        inner.page = SpokenPageIndex(mark);
+        inner.openAt = t.nodes[ni].first;
+        inner.startPos = t.nodes[ni].first + 1;
+        scopes.push_back(std::move(inner));
+      } else {
+        // Close any lane the page left open (implicitly, as the end of a
+        // sentence would), then the page. A close with no page open is a
+        // stray mark and changes nothing.
+        bool open = false;
+        for (const ParseScope& s : scopes) open = open || s.page >= 0;
+        if (open) {
+          while (scopes.back().page < 0) closeLane(-1);
+          closePage(t.nodes[ni].first, i);
+        }
+      }
+      continue;
+    }
     const GlyphDef& g = lib.glyphs[t.nodes[ni].glyph];
     ParseScope* sc = &scopes.back();
     switch (g.sort) {
@@ -1221,7 +1411,7 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
                                               ? sc->startPos
                                               : t.nodes[sc->pile.back()].last + 1);
         }
-        if (g.hasRight && i + 1 < items.size() &&
+        if (g.hasRight && i + 1 < items.size() && !SpokenIsMark(t.nodes[items[i + 1]].glyph) &&
             SlotAccepts(lib, t, g.rightMask, items[i + 1])) {
           grp.right = items[i + 1];
           grp.last = std::max(grp.last, t.nodes[grp.right].last);
@@ -1252,7 +1442,9 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
           inner.openAt = t.nodes[ni].first;
           inner.startPos = t.nodes[ni].first + 1;
           scopes.push_back(std::move(inner));
-        } else if (scopes.size() > 1) {
+        } else if (scopes.size() > 1 && scopes.back().page < 0) {
+          // ...and never a PAGE's scope: an `end` inside a page with no lane
+          // of its own open is the same charged no-op it is anywhere else.
           closeLane(t.nodes[ni].first);
         }
         // An `end` with nothing open is a charged no-op, like every other word
@@ -1267,7 +1459,14 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
   // clauses at all, not to an empty hand cast. Everything still open is closed
   // implicitly, innermost first.
   if (!stack.spoken.empty()) {
-    while (scopes.size() > 1) closeLane(-1);
+    while (scopes.size() > 1) {
+      if (scopes.back().page >= 0) {
+        size_t past = items.size();
+        closePage(spokenEnd - 1, past);
+      } else {
+        closeLane(-1);
+      }
+    }
     finishClause(spokenEnd);
   }
   return t;
@@ -1280,6 +1479,17 @@ std::string NodeKey(const GlyphLibrary& lib, const SpellTree& t, int node) {
   // items in two lanes and not `fire×2`. Only a non-shared lane is spelled,
   // so every sentence without a `lane` word keys exactly as it always did.
   const std::string lane = n.lane > 0 ? "@" + std::to_string(n.lane) : std::string();
+  // A PAGE CALL is its name and what fills its inputs - the body is the page's
+  // and is the same wherever the name is spoken.
+  if (!n.call.empty() && !n.box) {
+    std::string s = "{" + n.call;
+    for (int h : n.holes) {
+      const SpellNode& gn = t.nodes[(size_t)(h / 2)];
+      const int arg = (h & 1) ? gn.right : gn.left;
+      s += "|" + (arg >= 0 ? NodeKey(lib, t, arg) : std::string("_"));
+    }
+    return s + "}" + lane;
+  }
   if (n.box) {
     // A box's identity is its pile AND its delivery, multiplicities included:
     // two boxes are the same item only if they would fire the same thing the
@@ -1289,7 +1499,8 @@ std::string NodeKey(const GlyphLibrary& lib, const SpellTree& t, int node) {
       if (i) s += ",";
       s += NodeKey(lib, t, n.items[i]) + "#" + std::to_string(t.nodes[n.items[i]].n);
     }
-    return s + "|" + lib.Delivery(n.glyph).id + TimingSuffix(n.timing) + "]" + lane;
+    const std::string head = n.call.empty() ? lib.Delivery(n.glyph).id : "{" + n.call + "}";
+    return s + "|" + head + TimingSuffix(n.timing) + "]" + lane;
   }
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return "?";
@@ -1332,10 +1543,35 @@ std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
                      BracketStyle style) {
   if (node < 0 || node >= (int)t.nodes.size()) return "";
   const SpellNode& n = t.nodes[node];
+  // A PAGE is shown as its NAME, in angle quotes, with whatever fills its
+  // inputs on the side it was spoken: `(fire <seeker>)`. Its body is the
+  // page's own business, and the readout of the page itself shows it.
+  const std::string pageMark =
+      n.call.empty() ? std::string()
+                     : (style == BracketStyle::Oracle ? "\xE2\x80\xB9" + n.call + "\xE2\x80\xBA"
+                                                      : "<" + n.call + ">");
+  if (!n.call.empty() && !n.box) {
+    std::vector<std::string> l, r;
+    for (int h : n.holes) {
+      const SpellNode& gn = t.nodes[(size_t)(h / 2)];
+      const int arg = (h & 1) ? gn.right : gn.left;
+      if (arg >= 0) ((h & 1) ? r : l).push_back(ShowNode(lib, t, arg, style));
+    }
+    if (l.empty() && r.empty()) return pageMark;
+    std::string s;
+    for (const std::string& a : l) s += a + " ";
+    s += pageMark;
+    for (const std::string& a : r) s += " " + a;
+    return "(" + s + ")";
+  }
   if (n.box) {
     // `[ ... DELIVERY]`: the brackets ARE the nesting, so the HUD shows the
     // fold the way the sentence built it, with ` / ` where a lane opened.
     std::string s = ShowItems(lib, t, n.items, style, (int32_t)n.laneAt.size() / 2);
+    if (!n.call.empty()) {
+      if (!s.empty()) s += " ";
+      return "[" + s + pageMark + TimingSuffix(n.timing) + "]";
+    }
     const std::string id = lib.Delivery(n.glyph).id + TimingSuffix(n.timing);
     if (!s.empty()) s += " ";
     if (style == BracketStyle::Oracle) {
@@ -2306,12 +2542,166 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
 
 }  // namespace
 
+// ---- page calls dissolve before lowering ----------------------------------------
+
+namespace {
+
+// The single item a value call stands for in an operator's slot (the parser
+// only lets a one-output call in), flattened; -1 when it has none.
+int FlattenNode(const GlyphLibrary& lib, SpellTree& t, int node, int depth);
+
+int SlotItem(const GlyphLibrary& lib, SpellTree& t, int node, int depth) {
+  if (node < 0) return -1;
+  if (!IsValueCall(t, node)) return FlattenNode(lib, t, node, depth);
+  FlattenNode(lib, t, node, depth);
+  const SpellNode& c = t.nodes[(size_t)node];
+  return c.items.size() == 1 ? c.items[0] : -1;
+}
+
+// Rewire `node`'s children so no call is left under it. Returns `node`.
+int FlattenNode(const GlyphLibrary& lib, SpellTree& t, int node, int depth) {
+  if (node < 0 || node >= (int)t.nodes.size() || depth > 64) return node;
+  if (t.nodes[(size_t)node].group) {
+    const int l = SlotItem(lib, t, t.nodes[(size_t)node].left, depth + 1);
+    const int r = SlotItem(lib, t, t.nodes[(size_t)node].right, depth + 1);
+    t.nodes[(size_t)node].left = l;
+    t.nodes[(size_t)node].right = r;
+    if (l >= 0) t.nodes[(size_t)l].lane = 0;
+    if (r >= 0) t.nodes[(size_t)r].lane = 0;
+    return node;
+  }
+  // A box, a value call's body, or a leaf (no items: nothing to do).
+  std::vector<int> in = t.nodes[(size_t)node].items;
+  // A CARRIER's own mods join its pile as shared items.
+  if (t.nodes[(size_t)node].box && !t.nodes[(size_t)node].callItems.empty()) {
+    for (int ii : t.nodes[(size_t)node].callItems) {
+      t.nodes[(size_t)ii].lane = 0;
+      in.push_back(ii);
+    }
+    t.nodes[(size_t)node].callItems.clear();
+  }
+  std::vector<int> out;
+  for (int ii : in) {
+    if (!IsValueCall(t, ii)) {
+      out.push_back(FlattenNode(lib, t, ii, depth + 1));
+      continue;
+    }
+    // A VALUE CALL SPLICES ITS BODY into this pile. Standing in the shared
+    // segment, the body's own lanes become new lanes of this box (a page of
+    // two columns is two columns wherever it is spoken); standing in a lane,
+    // everything goes into that lane, which cannot hold lanes of its own.
+    FlattenNode(lib, t, ii, depth + 1);
+    const SpellNode c = t.nodes[(size_t)ii];
+    const int32_t at = c.lane;
+    const int32_t bodyLanes = (int32_t)c.laneAt.size() / 2;
+    const int32_t base = (int32_t)t.nodes[(size_t)node].laneAt.size() / 2;
+    if (at == 0 && bodyLanes > 0)
+      for (int32_t k = 0; k < bodyLanes; k++) {
+        t.nodes[(size_t)node].laneAt.push_back(-1);
+        t.nodes[(size_t)node].laneAt.push_back(-1);
+      }
+    for (int bi : c.items) {
+      const int32_t from = t.nodes[(size_t)bi].lane;
+      t.nodes[(size_t)bi].lane = at == 0 ? (from > 0 ? base + from : 0) : at;
+      out.push_back(bi);
+    }
+  }
+  t.nodes[(size_t)node].items = out;
+  return node;
+}
+
+}  // namespace
+
+SpellTree FlattenCalls(const GlyphLibrary& lib, const SpellTree& tree) {
+  SpellTree t = tree;
+  bool any = false;
+  for (const SpellNode& n : t.nodes) any = any || !n.call.empty();
+  if (!any) return t;
+  for (SpellClause& c : t.clauses) {
+    if (c.root < 0) continue;
+    FlattenNode(lib, t, c.root, 0);
+    c.bag = t.nodes[(size_t)c.root].items;
+  }
+  return t;
+}
+
+void SpeakWordsOnto(const GlyphLibrary& lib, const PageLookup& find,
+                    const std::vector<std::string>& words, int maxWords, SpellStack& out,
+                    PageExpansionReport& report) {
+  std::vector<std::string> trail;
+  std::function<void(const std::vector<std::string>&, int)> speak =
+      [&](const std::vector<std::string>& ws, int depth) {
+        for (const std::string& w : ws) {
+          if (out.Words() >= maxWords) {
+            report.truncated = true;
+            return;
+          }
+          int32_t mag = kMagOne;
+          SpellTiming tm;
+          const int gi = ParseWord(lib, w, mag, tm);
+          if (gi >= 0) {
+            out.Push(gi, mag, tm);
+            report.readout.push_back(w);
+            continue;
+          }
+          const std::vector<std::string>* body = find ? find(w) : nullptr;
+          if (!body) {
+            // Content removed or renamed: the word drops with a log line and
+            // the readout shows `?`; the page is not deleted (DESIGN §8b).
+            report.dropped++;
+            report.readout.push_back("?");
+            std::fprintf(stderr, "grimoire: \"%s\" names nothing that exists; dropped\n",
+                         w.c_str());
+            continue;
+          }
+          bool cycle = false;
+          for (const std::string& tr : trail) cycle = cycle || tr == w;
+          if (cycle || depth + 1 > lib.budgets.maxMacroDepth) {
+            // A cycle a save check missed (content edited under it), or a nest
+            // past the cap: the name speaks nothing rather than everything.
+            report.tooDeep = true;
+            report.readout.push_back("?");
+            continue;
+          }
+          // A COPY: a lookup may hand back a scratch buffer the next lookup
+          // (inside the recursion) overwrites.
+          const std::vector<std::string> said = *body;
+          const int k = out.book.Add(w, said);
+          out.Push(kSpokenPageOpen0 - k);
+          trail.push_back(w);
+          speak(said, depth + 1);
+          trail.pop_back();
+          // ALWAYS closed, even cut short: an unbalanced page would swallow the
+          // rest of the sentence into itself.
+          out.Push(kSpokenPageClose);
+          if (report.truncated) return;
+        }
+      };
+  speak(words, 0);
+}
+
+void AppendStack(SpellStack& dst, const SpellStack& src) {
+  for (size_t k = 0; k < src.spoken.size(); k++) {
+    int s = src.spoken[k];
+    if (SpokenIsPageOpen(s)) {
+      const int pi = SpokenPageIndex(s);
+      if (pi >= 0 && pi < (int)src.book.names.size())
+        s = kSpokenPageOpen0 - dst.book.Add(src.book.names[(size_t)pi], src.book.words[(size_t)pi]);
+    }
+    dst.Push(s, src.MagAt(k), src.TimingAt(k));
+  }
+}
+
 CastList LowerSpell(const GlyphLibrary& lib, const SpellTree& tree) {
   CastList list;
+  // THE TREE KEPT IS THE ONE THAT WAS SPOKEN, page calls and all - the page
+  // draws a call as one cell - and the one LOWERED is the same arena with the
+  // calls dissolved, so every box price is keyed by a node of both.
   list.tree = tree;
-  for (size_t ci = 0; ci < tree.clauses.size(); ci++) {
-    if (tree.clauses[ci].root < 0) continue;
-    SpellCast cast = LowerBox(lib, tree, tree.clauses[ci].root, &list.boxPrice);
+  const SpellTree flat = FlattenCalls(lib, tree);
+  for (size_t ci = 0; ci < flat.clauses.size(); ci++) {
+    if (flat.clauses[ci].root < 0) continue;
+    SpellCast cast = LowerBox(lib, flat, flat.clauses[ci].root, &list.boxPrice);
     cast.clause = (int)ci;
     list.wordCost = SatAdd(list.wordCost, cast.wordCost);
     list.tariff = SatAdd(list.tariff, cast.tariff);

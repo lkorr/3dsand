@@ -283,6 +283,15 @@ struct SpellGraphNode {
 
   // The spoken span this node covers, for the HUD word highlight.
   int spanFirst = -1, spanLast = -1;
+
+  // ---- a PAGE used as one glyph (spell.h, "A PAGE USED AS ONE GLYPH") --------
+  // Non-empty on the cell that stands for a page: a Word (no inputs), an
+  // Operator (its inputs are the slots in the row below), or a Join (a
+  // carrier page, whose `glyph` is the delivery it is). On a Hole it names
+  // the page whose input that is.
+  std::string page;
+  int32_t inputs = 0;     // how many inputs the page has, filled or not
+  int32_t outputs = 0;    // how many items its body holds
 };
 
 struct SpellGraphEdge {
@@ -325,8 +334,11 @@ std::vector<std::string> GlyphsToWords(const GlyphLibrary& lib,
 // unknown names dropped, magnitudes clamped to each glyph's range.
 SpellStack WordsToStack(const GlyphLibrary& lib, const std::vector<std::string>& words);
 // Parse a word list. `Linearize(ParseWords(lib, w))` is the canonical
-// respelling of `w`, magnitudes included.
+// respelling of `w`, magnitudes included. Without a book a page name is an
+// unknown word and drops; with one it is spoken as that page, ONE item.
 SpellTree ParseWords(const GlyphLibrary& lib, const std::vector<std::string>& words);
+SpellTree ParseWords(const GlyphLibrary& lib, const std::vector<std::string>& words,
+                     const PageBook& book);
 // A blank page: one clause whose root is the empty hand box. `ParseSpell` of
 // silence has no clause at all (silence is not a spell), so the editor needs
 // this to have something to drop the first word onto.
@@ -398,6 +410,20 @@ EditResult CloseLane(const GlyphLibrary& lib, const SpellTree& tree, int boxNode
 // the shared pile (lane 0), and fold into the lane otherwise.
 EditResult InsertWords(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
                        int32_t lane, const std::vector<std::string>& words);
+// ---- PAGES AS ONE GLYPH (spell.h, "A PAGE USED AS ONE GLYPH") ------------------
+// The three gestures a dragged PAGE makes, each the page-shaped twin of a word
+// op: into a pile (a value page as one item, a carrier page as an empty box -
+// the kinetic hit, as a bare delivery word is), into an operator's empty LEFT
+// slot (only a page with exactly one output fits a slot), and round a branch
+// (only a CARRIER page boxes anything). `find` resolves a page name to its
+// saved words - the grimoire, in the game. The tree keeps the pages it names
+// in its `book`, so every later op proves itself without the grimoire.
+EditResult InsertPage(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
+                      int32_t lane, const std::string& name, const PageLookup& find);
+EditResult FillSlotPage(const GlyphLibrary& lib, const SpellTree& tree, int groupNode,
+                        SlotSide side, const std::string& name, const PageLookup& find);
+EditResult WrapInPage(const GlyphLibrary& lib, const SpellTree& tree, int node,
+                      const std::string& name, const PageLookup& find);
 // SET A WORD'S MAGNITUDE (PLAN_spell_magnitude §2.5): the wheel over a cell.
 // `mag` is per-mille and is clamped and snapped to the glyph's range; refused
 // on a box, on an ungraded word, and when the clamp leaves it where it was

@@ -124,7 +124,11 @@ struct Grimoire {
 // place (DESIGN §8b). `truncated` is the 16-word stack bound (rule 2: no
 // unbounded expansion, ever).
 struct GrimoireExpansion {
+  // Glyph indices AND page marks (spell.h, "A PAGE USED AS ONE GLYPH"): a page
+  // named in the words is its body between two marks, `book` says which page
+  // each opening mark names. `StackOf` carries both onto a stack.
   std::vector<int> spoken;
+  PageBook book;
   // Per-word magnitude and timing, parallel to `spoken` (always the same
   // length): what `word@x!bounce+20` in the page said, resolved - the glyph's
   // default magnitude and on-hit timing where it said nothing.
@@ -154,6 +158,12 @@ const GrimoirePage* FindPage(const GlyphLibrary& lib, const Grimoire& g,
 // nest stops expanding at the cap.
 GrimoireExpansion ExpandWords(const GlyphLibrary& lib, const Grimoire& g,
                               const std::vector<std::string>& words, int maxWords);
+// ONE PAGE SPOKEN WHOLE - a key, a hand, a readied page: its own words, not a
+// call of it. The outermost page IS the spell rather than a glyph inside one,
+// so its marks would wall it off from nothing (and its readout would read
+// `<name>`); the pages it names inside itself keep theirs.
+GrimoireExpansion ExpandPage(const GlyphLibrary& lib, const Grimoire& g,
+                             const std::string& name, int maxWords);
 
 // Can a page be saved under `name` and still be REACHED by expansion? False
 // with `why` filled when the name contains the word syntax (`@` `!` `+`:
@@ -166,6 +176,19 @@ bool GrimoireNameUsable(const GlyphLibrary& lib, const std::string& name, std::s
 bool GrimoireWouldCycle(const GlyphLibrary& lib, const Grimoire& g,
                         const std::string& name,
                         const std::vector<std::string>& words, std::string& why);
+
+// WHAT SHAPE A PAGE HAS when it is used as one glyph inside another spell
+// (spell.h, "A PAGE USED AS ONE GLYPH"): a CARRIER boxes what is in front of
+// it like a delivery word; anything else is a VALUE of `sort`, with `inputs`
+// open slots (`leftInputs` of them taking the items before it) and `outputs`
+// items. `ok` false when the name is no page.
+struct PageShape {
+  bool ok = false;
+  bool carrier = false;
+  GlyphSort sort = GlyphSort::Effect;
+  int inputs = 0, leftInputs = 0, outputs = 0;
+};
+PageShape GrimoirePageShape(const GlyphLibrary& lib, const Grimoire& g, const std::string& name);
 
 // The page's auto-name from its expansion: `fire-trail-explosive-shotgun2`.
 std::string GrimoireAutoName(const GlyphLibrary& lib, const std::vector<int>& spoken);
@@ -232,17 +255,16 @@ struct PlayerCaster {
     if (inventory.KindAt(slot) == SlotKind::Page) return SpeakPage(lib, inventory.PageAt(slot));
     const int gi = inventory.At(slot);
     if (gi < 0) return false;
-    if ((int)stack.spoken.size() >= kSpellStackMax) return false;
+    if (stack.Words() >= kSpellStackMax) return false;
     stack.spoken.push_back(gi);
     Recompile(lib);
     return true;
   }
   bool SpeakPage(const GlyphLibrary& lib, const std::string& name) {
-    const int room = kSpellStackMax - (int)stack.spoken.size();
+    const int room = kSpellStackMax - stack.Words();
     if (room <= 0) return false;
-    const GrimoireExpansion ex = ExpandWords(lib, grimoire, {name}, room);
-    for (size_t k = 0; k < ex.spoken.size(); k++)
-      stack.Push(ex.spoken[k], ex.mags[k], ex.timing[k]);
+    const GrimoireExpansion ex = ExpandPage(lib, grimoire, name, room);
+    AppendStack(stack, StackOf(ex));
     if (ex.truncated) {
       note = "the stack is full: " + name + " was cut short";
       noteAge = 0.0f;
@@ -269,10 +291,25 @@ struct PlayerCaster {
     std::string base = p.name;
     for (int k = 2; grimoire.Find(p.name) >= 0 && k < 100; k++)
       p.name = base + "-" + std::to_string(k);
-    for (size_t k = 0; k < stack.spoken.size(); k++)
-      if (const GlyphDef* g = lib.At(stack.spoken[k]))
+    // A page spoken inside the stack is saved as its NAME, so the new page
+    // still uses it as one glyph (and follows it when it is edited).
+    for (size_t k = 0; k < stack.spoken.size(); k++) {
+      const int s = stack.spoken[k];
+      if (SpokenIsPageOpen(s)) {
+        const int pi = SpokenPageIndex(s);
+        if (pi >= 0 && pi < (int)stack.book.names.size())
+          p.words.push_back(stack.book.names[(size_t)pi]);
+        for (int depth = 1; depth > 0 && k + 1 < stack.spoken.size();) {
+          k++;
+          if (SpokenIsPageOpen(stack.spoken[k])) depth++;
+          else if (stack.spoken[k] == kSpokenPageClose) depth--;
+        }
+        continue;
+      }
+      if (const GlyphDef* g = lib.At(s))
         p.words.push_back(
             SerializeWord(*g, ClampMagnitude(*g, stack.MagAt(k)), stack.TimingAt(k)));
+    }
     if ((int)p.words.size() > lib.budgets.maxMacroWords)
       p.words.resize(lib.budgets.maxMacroWords);
     grimoire.pages.push_back(p);

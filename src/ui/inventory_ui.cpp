@@ -1474,6 +1474,22 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         ImGui::TextDisabled("%s", p.readout.c_str());
         if (p.priceUnknown) ImGui::TextDisabled("price %d + ?", p.price);
         else ImGui::TextDisabled("price %d", p.price);
+        // ITS SHAPE AS ONE GLYPH: what it does when it is named inside
+        // another spell (spell.h, "A PAGE USED AS ONE GLYPH").
+        if (p.shapeSort >= 0) {
+          const char* sorts[6] = {"matter", "an effect", "a delivery", "a mod", "an operator",
+                                  "a separator"};
+          const char* as = p.shapeSort < 6 ? sorts[p.shapeSort] : "?";
+          if (p.carrier)
+            ImGui::TextDisabled("as one glyph: a delivery - it carries what is before it");
+          else if (p.inputs > 0)
+            ImGui::TextDisabled("as one glyph: %s, taking %d input%s (%d before it, %d after)",
+                                as, p.inputs, p.inputs == 1 ? "" : "s", p.leftInputs,
+                                p.inputs - p.leftInputs);
+          else
+            ImGui::TextDisabled("as one glyph: %s%s", as,
+                                p.outputs > 1 ? " - several things at once" : "");
+        }
         ImGui::TextDisabled("click to open and ready it (then click a limb on your portrait to cast it there)");
         ImGui::TextDisabled("right-click to nest it in the open page  .  drag onto a key to bind it");
         EndTip();

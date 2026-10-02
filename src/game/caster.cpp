@@ -23,53 +23,6 @@ const GrimoirePage* FindPage(const GlyphLibrary& lib, const Grimoire& g,
   return nullptr;
 }
 
-namespace {
-
-void Expand(const GlyphLibrary& lib, const Grimoire& g, const std::vector<std::string>& words,
-            int depth, std::vector<std::string>& trail, GrimoireExpansion& out, int maxWords) {
-  for (const std::string& w : words) {
-    if ((int)out.spoken.size() >= maxWords) {
-      out.truncated = true;
-      return;
-    }
-    int32_t mag = kMagOne;
-    SpellTiming tm;
-    const int gi = ParseWord(lib, w, mag, tm);
-    if (gi >= 0) {
-      out.spoken.push_back(gi);
-      out.mags.push_back(mag);
-      out.timing.push_back(tm);
-      out.readout.push_back(w);
-      continue;
-    }
-    GrimoirePage scratch;
-    const GrimoirePage* p = FindPage(lib, g, w, scratch);
-    if (!p) {
-      // Content removed or renamed: the word drops with a log line and the
-      // readout shows `?`; the page is not deleted (DESIGN §8b).
-      out.dropped++;
-      out.readout.push_back("?");
-      std::fprintf(stderr, "grimoire: \"%s\" names nothing that exists; dropped\n", w.c_str());
-      continue;
-    }
-    bool cycle = false;
-    for (const std::string& t : trail) cycle = cycle || t == w;
-    if (cycle || depth + 1 > lib.budgets.maxMacroDepth) {
-      // A cycle a save check missed (content edited under it), or a nest past
-      // the cap: the word expands to nothing rather than to everything.
-      out.tooDeep = true;
-      out.readout.push_back("?");
-      continue;
-    }
-    trail.push_back(w);
-    Expand(lib, g, p->words, depth + 1, trail, out, maxWords);
-    trail.pop_back();
-    if (out.truncated) return;
-  }
-}
-
-}  // namespace
-
 GrimoireExpansion ExpandWords(const GlyphLibrary& lib, const Grimoire& g,
                               const std::vector<std::string>& words, int maxWords) {
   GrimoireExpansion out;
@@ -78,8 +31,65 @@ GrimoireExpansion ExpandWords(const GlyphLibrary& lib, const Grimoire& g,
     out.truncated = !words.empty();
     return out;
   }
-  std::vector<std::string> trail;
-  Expand(lib, g, words, 0, trail, out, maxWords);
+  // ONE EXPANSION FOR EVERY SPEAKER (spell.h, SpeakWordsOnto): a page named
+  // here is spoken as its body between page marks, so the parser closes it
+  // into ONE item - a page used as a glyph - rather than pasting its words
+  // into the sentence around it.
+  SpellStack st;
+  PageExpansionReport rep;
+  const PageLookup find = [&](const std::string& name) -> const std::vector<std::string>* {
+    static thread_local GrimoirePage scratch;
+    const GrimoirePage* p = FindPage(lib, g, name, scratch);
+    return p ? &p->words : nullptr;
+  };
+  SpeakWordsOnto(lib, find, words, maxWords, st, rep);
+  out.spoken = st.spoken;
+  out.mags.resize(st.spoken.size());
+  out.timing.resize(st.spoken.size());
+  for (size_t k = 0; k < st.spoken.size(); k++) {
+    const GlyphDef* d = lib.At(st.spoken[k]);
+    const int32_t m = st.MagAt(k);
+    out.mags[k] = m != kMagUnset ? m : (d ? d->magDefault : kMagOne);
+    out.timing[k] = st.TimingAt(k);
+  }
+  out.book = st.book;
+  out.dropped = rep.dropped;
+  out.truncated = rep.truncated;
+  out.tooDeep = rep.tooDeep;
+  out.readout = rep.readout;
+  return out;
+}
+
+GrimoireExpansion ExpandPage(const GlyphLibrary& lib, const Grimoire& g,
+                             const std::string& name, int maxWords) {
+  GrimoireExpansion ex = ExpandWords(lib, g, {name}, maxWords);
+  if (ex.spoken.size() >= 2 && SpokenIsPageOpen(ex.spoken.front()) &&
+      ex.spoken.back() == kSpokenPageClose) {
+    ex.spoken.erase(ex.spoken.end() - 1);
+    ex.spoken.erase(ex.spoken.begin());
+    ex.mags.erase(ex.mags.end() - 1);
+    ex.mags.erase(ex.mags.begin());
+    ex.timing.erase(ex.timing.end() - 1);
+    ex.timing.erase(ex.timing.begin());
+  }
+  return ex;
+}
+
+PageShape GrimoirePageShape(const GlyphLibrary& lib, const Grimoire& g,
+                           const std::string& name) {
+  PageShape out;
+  const GrimoireExpansion ex = ExpandWords(lib, g, {name}, kSpellStackMax);
+  const SpellTree t = ParseSpell(lib, StackOf(ex));
+  if (t.Empty() || t.clauses[0].root < 0) return out;
+  const std::vector<int>& items = t.nodes[(size_t)t.clauses[0].root].items;
+  if (items.size() != 1 || t.nodes[(size_t)items[0]].call != name) return out;
+  const SpellNode& c = t.nodes[(size_t)items[0]];
+  out.ok = true;
+  out.carrier = c.box;
+  out.sort = c.box ? GlyphSort::Delivery : NodeSort(lib, t, items[0]);
+  out.inputs = (int)c.holes.size();
+  for (int h : c.holes) out.leftInputs += (h & 1) ? 0 : 1;
+  out.outputs = c.box ? 1 : (int)c.items.size();
   return out;
 }
 
@@ -142,6 +152,7 @@ std::string GrimoireAutoName(const GlyphLibrary& lib, const std::vector<int>& sp
     if (run > 1) s += std::to_string(run);
   };
   for (int gi : spoken) {
+    if (SpokenIsMark(gi)) continue;   // a page's marks are not words
     if (gi == lastG) {
       run++;
       continue;
@@ -170,6 +181,7 @@ std::vector<std::string> ExpansionWords(const GlyphLibrary& lib, const GrimoireE
 
 SpellStack StackOf(const GrimoireExpansion& ex) {
   SpellStack st;
+  st.book = ex.book;
   for (size_t k = 0; k < ex.spoken.size(); k++)
     st.Push(ex.spoken[k], k < ex.mags.size() ? ex.mags[k] : kMagUnset,
             k < ex.timing.size() ? ex.timing[k] : SpellTiming{});

@@ -61,12 +61,23 @@ GlyphLibrary MakeLib() {
   return lib;
 }
 
+// What a spoken sequence CASTS: the brackets of the tree with every page call
+// dissolved (a page used as one glyph reads `<name>` until then), its price
+// and how many casts it makes.
 std::string Sig(const GlyphLibrary& lib, const std::vector<int>& spoken) {
   SpellStack st;
   st.spoken = spoken;
   const CastList l = CompileSpell(lib, st);
-  return BracketSpell(lib, l.tree) + "|" + std::to_string(l.manaCost) + "|" +
+  return BracketSpell(lib, FlattenCalls(lib, l.tree)) + "|" + std::to_string(l.manaCost) + "|" +
          std::to_string(l.casts.size());
+}
+
+// The WORDS an expansion speaks, its page marks left out.
+std::vector<int> Said(const std::vector<int>& spoken) {
+  std::vector<int> out;
+  for (int s : spoken)
+    if (!SpokenIsMark(s)) out.push_back(s);
+  return out;
 }
 
 Status GateGrimoire(Ctx& c, std::string& detail) {
@@ -89,12 +100,18 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
   g.pages.push_back({"hellfire", {"kit_fire", "kit_boom", "kit_fan", "kit_fan"}});
   {
     const GrimoireExpansion ex = ExpandWords(lib, g, {"hellfire"}, kSpellStackMax);
-    check(ex.spoken == std::vector<int>{gFire, gBoom, gFan, gFan} && ex.dropped == 0 &&
+    check(Said(ex.spoken) == std::vector<int>{gFire, gBoom, gFan, gFan} && ex.dropped == 0 &&
               !ex.truncated,
           "a page expands to its words");
+    check(ExpandPage(lib, g, "hellfire", kSpellStackMax).spoken ==
+              std::vector<int>{gFire, gBoom, gFan, gFan},
+          "and spoken WHOLE it is exactly its words, no marks");
     check(Sig(lib, ex.spoken) == Sig(lib, {gFire, gBoom, gFan, gFan}),
           "and compiles to the same cast list as speaking them");
     // A fragment: `hellfire kit_bolt` is a live sentence.
+    // ...and since 2026-10-02 the page is ONE item of it (spell.h, "A PAGE
+    // USED AS ONE GLYPH"), so the bolt boxes the page whole - and a page of
+    // nouns and mods lowers inside the bolt exactly as its words would.
     const GrimoireExpansion ex2 = ExpandWords(lib, g, {"hellfire", "kit_bolt"}, kSpellStackMax);
     check(Sig(lib, ex2.spoken) == Sig(lib, {gFire, gBoom, gFan, gFan, gBolt}),
           "a page is a fragment: a delivery after it closes the clause");
@@ -122,7 +139,7 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     const GrimoirePage* st = FindPage(lib, g, "kit_starter", scratch);
     check(st && st->readOnly && st->words.size() == 2, "an authored starter resolves as a read-only page");
     const GrimoireExpansion ex4 = ExpandWords(lib, g, {"kit_starter"}, kSpellStackMax);
-    check(ex4.spoken == std::vector<int>{gFire, gBolt}, "and expands");
+    check(Said(ex4.spoken) == std::vector<int>{gFire, gBolt}, "and expands");
   }
 
   // ---- 2. nesting expands to depth, and stops at the cap ---------------------
@@ -135,11 +152,11 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     n.pages.push_back({"e", {"d"}});
     n.pages.push_back({"f", {"e"}});
     const GrimoireExpansion ed = ExpandWords(lib, n, {"d"}, kSpellStackMax);
-    check(ed.spoken == std::vector<int>{gFire, gBoom, gFire, gBoom, gBolt} && !ed.tooDeep,
+    check(Said(ed.spoken) == std::vector<int>{gFire, gBoom, gFire, gBoom, gBolt} && !ed.tooDeep,
           "a nest four deep expands fully");
     const GrimoireExpansion ef = ExpandWords(lib, n, {"f"}, kSpellStackMax);
     // f -> e -> d -> c is four levels; b is the fifth and expands to nothing.
-    check(ef.tooDeep && ef.spoken == std::vector<int>{gBolt},
+    check(ef.tooDeep && Said(ef.spoken) == std::vector<int>{gBolt},
           "a nest past budgets.maxMacroDepth stops at the cap and says so");
   }
 
@@ -159,7 +176,7 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     // is bounded, not infinite.
     cy.pages[1].words = {"x"};
     const GrimoireExpansion ex = ExpandWords(lib, cy, {"x"}, kSpellStackMax);
-    check(ex.tooDeep && ex.spoken.empty(), "expanding a cycle stops rather than recursing");
+    check(ex.tooDeep && Said(ex.spoken).empty(), "expanding a cycle stops rather than recursing");
   }
 
   // ---- 3b. a name expansion cannot reach is refused at save --------------------
@@ -182,7 +199,7 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     std::vector<std::string> twenty((size_t)kSpellStackMax + 6, "kit_fire");
     big.pages.push_back({"twenty", twenty});
     const GrimoireExpansion ex = ExpandWords(lib, big, {"twenty"}, kSpellStackMax);
-    check(ex.truncated && (int)ex.spoken.size() == kSpellStackMax,
+    check(ex.truncated && (int)Said(ex.spoken).size() == kSpellStackMax,
           "a page past the stack bound speaks as much as fits and reports it");
     PlayerCaster pc;
     pc.grimoire = big;
@@ -199,7 +216,7 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     Grimoire m;
     m.pages.push_back({"holey", {"kit_fire", "gone_glyph", "kit_bolt"}});
     const GrimoireExpansion ex = ExpandWords(lib, m, {"holey"}, kSpellStackMax);
-    check(ex.dropped == 1 && ex.spoken == std::vector<int>{gFire, gBolt},
+    check(ex.dropped == 1 && Said(ex.spoken) == std::vector<int>{gFire, gBolt},
           "a word that names nothing drops, the rest speak");
     check(ex.readout.size() == 3 && ex.readout[1] == "?", "and the readout shows ? in its place");
     check(m.Find("holey") == 0 && m.pages[0].words.size() == 3, "the page itself is untouched");

@@ -6105,6 +6105,9 @@ int main(int argc, char** argv) {
     uint32_t epoch = 0;
     std::string grimoireKey;
     std::unordered_map<std::string, Entry> byWords;
+    // A page's SHAPE as one glyph (caster.h, PageShape), by name: what the
+    // canvas needs to treat a dragged page as the kind of word it is.
+    std::unordered_map<std::string, PageShape> shapes;
   } spellDesc;
 
   // items (assets/items/items.json — game/item.h). Content, same as glyphs,
@@ -11111,6 +11114,20 @@ int main(int argc, char** argv) {
         GrimoirePage p;
         p.name = "duststorm-mine";
         p.words = {"sand", "gust", "gust", "shotgun", "projectile"};
+        // SANDVOX_SHOT_PAGE_CALLS=1: the page is built out of OTHER pages
+        // instead (spell.h, "A PAGE USED AS ONE GLYPH") - a value page with an
+        // input filled, a value page with none, and a carrier page round both -
+        // so the one picture shows every shape a page cell can take.
+        if (const char* pc = std::getenv("SANDVOX_SHOT_PAGE_CALLS"); pc && *pc == '1') {
+          const std::vector<GrimoirePage> parts = {
+              {"seeker", {"trail", "projectile"}},
+              {"boom", {"explosive", "projectile"}},
+              {"triple", {"swift", "shotgun", "projectile"}}};
+          for (const GrimoirePage& q : parts)
+            if (caster.grimoire.Find(q.name) < 0) caster.grimoire.pages.push_back(q);
+          p.name = "pages-mine";
+          p.words = {"fire", "seeker", "boom", "triple"};
+        }
         if (caster.grimoire.Find(p.name) < 0) caster.grimoire.pages.push_back(p);
         ui.grimoireSelected = p.name;
         ui.grimoireEditName = p.name;
@@ -14628,6 +14645,7 @@ int main(int argc, char** argv) {
         }
         if (spellDesc.epoch != glyphEpoch || key != spellDesc.grimoireKey) {
           spellDesc.byWords.clear();
+          spellDesc.shapes.clear();
           spellDesc.epoch = glyphEpoch;
           spellDesc.grimoireKey = std::move(key);
         }
@@ -14644,7 +14662,12 @@ int main(int argc, char** argv) {
         // Bounded: every intermediate composer edit is a new key.
         if (spellDesc.byWords.size() >= 512) spellDesc.byWords.clear();
         SpellDescCache::Entry e;
-        const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
+        // One page name alone is that page SPOKEN WHOLE (its words, not a call
+        // of it), so its readout reads its brackets rather than `<name>`.
+        const GrimoireExpansion ex =
+            words.size() == 1 && glyphs.FindWord(words[0]) < 0
+                ? ExpandPage(glyphs, caster.grimoire, words[0], kSpellStackMax)
+                : ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
         SpellStack st = StackOf(ex);
         const CastList l = CompileSpell(glyphs, st);
         const SpellReadout r = DescribeSpell(glyphs, l);
@@ -16238,8 +16261,9 @@ int main(int argc, char** argv) {
       // either the new word list or a reason — so a refusal is a sentence on the
       // status line and never a malformed page.
       //
-      // The tree is built from the EXPANSION, so a nested page is edited as its
-      // words. That is the v1 compromise §5 names, and the composer says so.
+      // The tree is built from the EXPANSION, in which a page named in the
+      // words is ONE node (a page used as a glyph, spell.h) - so an edit
+      // writes it back as its name, never as its words.
       if (rearmAfterOp) {
         const std::string page = caster.armedPage;
         caster.ArmPage(glyphs, page);
@@ -16257,82 +16281,90 @@ int main(int argc, char** argv) {
         SpellTree gtree = ParseSpell(glyphs, gst);
         if (gtree.Empty()) gtree = EmptyTree();
         EditResult r;
-        // A PAGE DROPPED ON THE TREE IS ITS WORDS, one InsertItem each, the
-        // tree re-parsed between: the tree has no node kind for "a page", and
-        // refusing the gesture outright would make the page list useless up
-        // here. The first refusal stops the run and keeps what landed.
         std::vector<int> insert;
-        // A PAGE dropped on the tree lands as the SUBTREE its words parse to,
-        // magnitudes and timing included (`InsertWords`), not one word at a
-        // time - which lost both, and turned `fire projectile` into `fire`
-        // beside an empty bolt.
-        std::vector<std::string> pageWords;
-        if ((op.op == UIState::GraphEditIntent::Insert ||
-             op.op == UIState::GraphEditIntent::AttachMod) &&
-            glyphs.FindWord(op.glyphId) < 0 && !op.glyphId.empty()) {
-          const GrimoireExpansion pe =
-              ExpandWords(glyphs, caster.grimoire, {op.glyphId}, kSpellStackMax);
-          pageWords = ExpansionWords(glyphs, pe);
-          if (pageWords.empty()) say("[" + op.glyphId + "] says nothing");
-        } else if (!op.glyphId.empty()) {
-          insert.push_back(glyphs.Find(op.glyphId));
-        }
-        const int gi = insert.empty() ? -1 : insert[0];
-        switch (op.op) {
-          case UIState::GraphEditIntent::Insert:
-          case UIState::GraphEditIntent::AttachMod: {
-            if (!pageWords.empty()) {
-              r = InsertWords(glyphs, gtree, op.treeNode, op.lane, pageWords);
-              break;
-            }
-            SpellTree cur = gtree;
-            for (size_t k = 0; k < insert.size(); k++) {
-              r = op.op == UIState::GraphEditIntent::AttachMod
-                      ? AttachMod(glyphs, cur, op.treeNode, op.lane, insert[k])
-                      : InsertItem(glyphs, cur, op.treeNode, op.lane, insert[k]);
-              if (!r.ok) {
-                if (k > 0) r.ok = true;   // some of it landed; keep that
+        // A PAGE DROPPED ON THE TREE IS ONE GLYPH (spell.h, "A PAGE USED AS
+        // ONE GLYPH"): it lands as a single node shaped by what it holds - a
+        // value with its open slots as inputs, or a carrier that boxes what
+        // it is dropped round - and is written back as its NAME, so an edit
+        // to that page later reaches every spell that names it.
+        const bool pageDrop = !op.glyphId.empty() && glyphs.FindWord(op.glyphId) < 0;
+        const PageLookup findPage = [&](const std::string& name)
+            -> const std::vector<std::string>* {
+          static GrimoirePage scratch;
+          const GrimoirePage* p = FindPage(glyphs, caster.grimoire, name, scratch);
+          return p ? &p->words : nullptr;
+        };
+        // A PAGE MAY NOT NAME ITSELF, through any chain of pages.
+        std::string cycleWhy;
+        const bool cycled =
+            pageDrop && !ui.grimoireEditName.empty() &&
+            (op.glyphId == ui.grimoireEditName ||
+             GrimoireWouldCycle(glyphs, caster.grimoire, ui.grimoireEditName, {op.glyphId},
+                                cycleWhy));
+        if (cycled) r.why = cycleWhy.empty() ? "a page cannot contain itself" : cycleWhy;
+        if (!pageDrop && !op.glyphId.empty()) insert.push_back(glyphs.Find(op.glyphId));
+        if (!cycled) {
+          const int gi = insert.empty() ? -1 : insert[0];
+          switch (op.op) {
+            case UIState::GraphEditIntent::Insert:
+            case UIState::GraphEditIntent::AttachMod: {
+              if (pageDrop) {
+                r = InsertPage(glyphs, gtree, op.treeNode, op.lane, op.glyphId, findPage);
                 break;
               }
-              // RE-PARSE BETWEEN WORDS, because the node indices the next
-              // InsertItem needs are the new tree's, not the old one's. The box
-              // is found again by its position in the same place: the root.
-              if (k + 1 < insert.size()) {
-                cur = ParseWords(glyphs, r.words);
-                if (cur.Empty()) break;
+              SpellTree cur = gtree;
+              for (size_t k = 0; k < insert.size(); k++) {
+                r = op.op == UIState::GraphEditIntent::AttachMod
+                        ? AttachMod(glyphs, cur, op.treeNode, op.lane, insert[k])
+                        : InsertItem(glyphs, cur, op.treeNode, op.lane, insert[k]);
+                if (!r.ok) {
+                  if (k > 0) r.ok = true;   // some of it landed; keep that
+                  break;
+                }
+                // RE-PARSE BETWEEN WORDS, because the node indices the next
+                // InsertItem needs are the new tree's, not the old one's. The box
+                // is found again by its position in the same place: the root.
+                if (k + 1 < insert.size()) {
+                  cur = ParseWords(glyphs, r.words);
+                  if (cur.Empty()) break;
+                }
               }
+              break;
             }
-            break;
-          }
-          case UIState::GraphEditIntent::FillSlot:
-            r = FillSlot(glyphs, gtree, op.treeNode,
-                         op.side ? SlotSide::Right : SlotSide::Left, gi);
-            break;
-          case UIState::GraphEditIntent::Wrap:
-            r = WrapInBox(glyphs, gtree, op.treeNode, gi);
-            break;
-          case UIState::GraphEditIntent::Unbox:
-            r = Unbox(glyphs, gtree, op.treeNode);
-            break;
-          case UIState::GraphEditIntent::Remove:
-            r = Remove(glyphs, gtree, op.treeNode);
-            break;
-          case UIState::GraphEditIntent::Move:
-            r = Move(glyphs, gtree, op.treeNode, op.boxTreeNode, op.lane, op.copy);
-            break;
-          case UIState::GraphEditIntent::CloseLane:
-            r = CloseLane(glyphs, gtree, op.treeNode, op.lane);
-            break;
-          case UIState::GraphEditIntent::SetMagnitude:
-            r = SetMagnitude(glyphs, gtree, op.treeNode, op.mag);
-            break;
-          case UIState::GraphEditIntent::SetTiming: {
-            SpellTiming tm;
-            tm.trigger = (SpellTrigger)std::clamp(op.trigger, 0, kSpellTriggerCount - 1);
-            tm.every = op.every;
-            tm.delay = op.delay;
-            r = SetTiming(glyphs, gtree, op.treeNode, tm);
-            break;
+            case UIState::GraphEditIntent::FillSlot:
+              r = pageDrop ? FillSlotPage(glyphs, gtree, op.treeNode,
+                                          op.side ? SlotSide::Right : SlotSide::Left,
+                                          op.glyphId, findPage)
+                           : FillSlot(glyphs, gtree, op.treeNode,
+                                      op.side ? SlotSide::Right : SlotSide::Left, gi);
+              break;
+            case UIState::GraphEditIntent::Wrap:
+              r = pageDrop ? WrapInPage(glyphs, gtree, op.treeNode, op.glyphId, findPage)
+                           : WrapInBox(glyphs, gtree, op.treeNode, gi);
+              break;
+            case UIState::GraphEditIntent::Unbox:
+              r = Unbox(glyphs, gtree, op.treeNode);
+              break;
+            case UIState::GraphEditIntent::Remove:
+              r = Remove(glyphs, gtree, op.treeNode);
+              break;
+            case UIState::GraphEditIntent::Move:
+              r = Move(glyphs, gtree, op.treeNode, op.boxTreeNode, op.lane, op.copy);
+              break;
+            case UIState::GraphEditIntent::CloseLane:
+              r = CloseLane(glyphs, gtree, op.treeNode, op.lane);
+              break;
+            case UIState::GraphEditIntent::SetMagnitude:
+              r = SetMagnitude(glyphs, gtree, op.treeNode, op.mag);
+              break;
+            case UIState::GraphEditIntent::SetTiming: {
+              SpellTiming tm;
+              tm.trigger = (SpellTrigger)std::clamp(op.trigger, 0, kSpellTriggerCount - 1);
+              tm.every = op.every;
+              tm.delay = op.delay;
+              r = SetTiming(glyphs, gtree, op.treeNode, tm);
+              break;
+            }
           }
         }
         if (r.ok) {
@@ -16752,6 +16784,19 @@ int main(int argc, char** argv) {
           unknown = e.unknown;
           dropped = e.dropped;
         };
+        auto shapeOf = [&](UIState::GrimoirePageUI& p) {
+          auto it = spellDesc.shapes.find(p.name);
+          if (it == spellDesc.shapes.end())
+            it = spellDesc.shapes
+                     .emplace(p.name, GrimoirePageShape(glyphs, caster.grimoire, p.name))
+                     .first;
+          const PageShape& sh = it->second;
+          p.shapeSort = sh.ok ? (int)sh.sort : -1;
+          p.carrier = sh.carrier;
+          p.inputs = sh.inputs;
+          p.leftInputs = sh.leftInputs;
+          p.outputs = sh.outputs;
+        };
         for (const ConjoinedGlyph& cg : glyphs.conjoined) {
           UIState::GrimoirePageUI p;
           p.name = cg.id;
@@ -16759,6 +16804,7 @@ int main(int argc, char** argv) {
           for (int gi : cg.glyphs)
             if (const GlyphDef* d = glyphs.At(gi)) p.words.push_back(d->id);
           describeWords(p.words, p.readout, p.price, p.priceUnknown, p.dropped);
+          shapeOf(p);
           ui.grimoirePages.push_back(std::move(p));
         }
         for (const GrimoirePage& pg : caster.grimoire.pages) {
@@ -16766,6 +16812,7 @@ int main(int argc, char** argv) {
           p.name = pg.name;
           p.words = pg.words;
           describeWords(p.words, p.readout, p.price, p.priceUnknown, p.dropped);
+          shapeOf(p);
           ui.grimoirePages.push_back(std::move(p));
         }
         {
@@ -16795,15 +16842,8 @@ int main(int argc, char** argv) {
           ui.spellGraph = UIState::SpellGraphUI{};
           const GrimoireExpansion ex =
               ExpandWords(glyphs, caster.grimoire, ui.grimoireEditWords, kSpellStackMax);
-          // A NESTED PAGE IS EXPANDED TO ITS WORDS to draw, and an edit writes
-          // the expansion back — the tree has no node for "a page". Said on the
-          // status line rather than silently (v1; PLAN §5 notes it).
-          for (const std::string& w : ui.grimoireEditWords)
-            if (glyphs.FindWord(w) < 0 && !w.empty()) {
-              ui.spellGraph.expandedNote =
-                  "page " + w + " is drawn expanded; an edit writes out its words";
-              break;
-            }
+          // A page named in the words is drawn as ONE cell (a page used as a
+          // glyph) and written back as its name.
           SpellStack gst = StackOf(ex);
           SpellTree tree = ParseSpell(glyphs, gst);
           // A BLANK PAGE STILL HAS A HAND. `ParseSpell` of silence has no
@@ -16870,6 +16910,9 @@ int main(int argc, char** argv) {
             u.timingPhrase = n.timing.IsDefault() ? std::string() : TimingPhrase(n.timing);
             u.spanFirst = n.spanFirst;
             u.spanLast = n.spanLast;
+            u.page = n.page;
+            u.inputs = n.inputs;
+            u.outputs = n.outputs;
             // BY NAME, not by index (DESIGN §8b): the panel holds this across
             // a frame and an R reload renumbers every glyph.
             if (const GlyphDef* gd = glyphs.At(n.glyph)) {

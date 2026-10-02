@@ -9584,12 +9584,42 @@ small font, wrapped at 320 px; the screen's own 26 px face under the cursor
 covered a third of the panel it was describing. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
 are the acquisition loop's seam.
 
+**A PAGE NAMED INSIDE A SPELL IS ONE GLYPH (2026-10-02; `spell.h` "A PAGE
+USED AS ONE GLYPH", gate `spell-pages`).** This replaced the paste-in macro
+below for every page used *inside* another spell; a page spoken WHOLE (a key, a
+hand, a readied page: `ExpandPage`) is still exactly its words. `SpeakWordsOnto`
+speaks a named page as its body between two page MARKS (negative values in
+`SpellStack::spoken`, the page's words in `SpellStack::book`), and `ParseSpell`
+closes everything between them into ONE node before the sentence around it sees
+it. Its shape is INFERRED, never declared: (1) HYGIENE — the page's delivery
+boxes only the page, its operators cannot reach past its opening mark, nothing
+after it falls in (`fire <boom>` is fire AND an exploding bolt); (2) INPUTS —
+every operator slot the page left empty is an input, left slots taking the
+items before the name (postfix: the last input the nearest item), right slots
+the words after it (`sand <seeker>` with seeker = `trail projectile` is `sand
+trail projectile`); (3) a page that is one delivery box holding only finished
+mods is a CARRIER (`SpellNode::call` on a box, its mods in `callItems`) and
+boxes the pile before it as its delivery word would; anything else is a VALUE
+call (`call` on a non-box node, body in `items`, inputs in `holes` as
+`group*2+side` — the slot itself holds the argument) of the sort its items
+share; a body of several items splices in, its lanes becoming lanes of the box
+that takes it, and only a one-output page fits an operator's slot. Lowering
+never sees a call: `LowerSpell` lowers `FlattenCalls(tree)`, the same arena
+with calls dissolved, so box prices key the drawn tree. The words stay the save
+format — the linearizer writes a call back as its NAME (`LWord::page`), every
+edit op keeps it whole (`InsertPage` / `FillSlotPage` / `WrapInPage` for a
+dragged page; the tree's `book` is what the round-trip proof re-reads), the
+canvas draws one sealed cell with its inputs in the operand row, and an edit to
+the inner page reaches every spell that names it. The stack and page-word caps
+count the words pages SPEAK (`SpellStack::Words`), marks excluded.
+
 **The grimoire: macros as saved word lists (plan §12b; `Grimoire`,
 `ExpandWords`).** A page is a name and a list of glyph NAMES and page NAMES.
 Speaking it pushes its expansion onto the stack exactly as if you had spoken
 the words, and the six rules apply to the result — that sentence is the whole
-mechanic. Pages are fragments (`hellfire projectile` and `hellfire bomb` are
-both live sentences; `hellfire hellfire` merges by R1), they nest to
+mechanic (for a page spoken whole; a page named inside a spell is one glyph,
+above). Pages are fragments (`hellfire projectile` and `hellfire bomb` are
+both live sentences), they nest to
 `budgets.maxMacroDepth` (4) with a cycle check at save time that refuses with
 the reason shown (`GrimoireWouldCycle`), and an expansion is capped by the
 16-word stack: a page speaks as much as fits and the HUD says so (rule 2: no

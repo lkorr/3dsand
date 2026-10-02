@@ -411,12 +411,56 @@ const UIState::GlyphUI* FindGlyph(const UIState& s, const std::string& id) {
   return nullptr;
 }
 
-// What sort a payload denotes: a glyph's own sort, or -1 for a page (a page is
-// a noun as far as the tree is concerned — it expands to words).
+const UIState::GrimoirePageUI* FindPage(const UIState& s, const std::string& name) {
+  for (const UIState::GrimoirePageUI& p : s.grimoirePages)
+    if (p.name == name) return &p;
+  return nullptr;
+}
+
+// What sort a payload denotes: a glyph's own sort, or - for a PAGE, which is
+// one glyph on the tree (spell.h, "A PAGE USED AS ONE GLYPH") - the sort it
+// stands as: a delivery for a carrier page, else what its body holds. -1 for a
+// page that is no usable page.
 int PayloadSort(const UIState& s, bool page, const char* name) {
-  if (page) return -1;
+  if (page) {
+    const UIState::GrimoirePageUI* pg = FindPage(s, name ? name : "");
+    return pg ? pg->shapeSort : -1;
+  }
   const UIState::GlyphUI* g = FindGlyph(s, name ? name : "");
   return g ? g->type : -1;
+}
+// A payload that BOXES what it is dropped round: a delivery word, or a page
+// that is one (a carrier).
+bool DeliveryPayload(const UIState& s, const ImGuiPayload* p) {
+  if (!p) return false;
+  const bool page = p->IsDataType(kPayloadPage);
+  if (!page && !p->IsDataType(kPayloadGlyph)) return false;
+  return PayloadSort(s, page, (const char*)p->Data) == kDelivery;
+}
+
+// A PAGE'S SEAL: the cell that stands for a whole written spell wears the
+// page's name on a slip under it and a folded corner on it, so it can never
+// be mistaken for the one word its engraving shows. Not at the overview rung,
+// where the slip would be a smudge.
+void PageSeal(ImDrawList* dl, ImVec2 a, ImVec2 b, const std::string& name, float scale) {
+  // The folded corner: a stepped triangle in the top right, in gold leaf.
+  const float f = std::max(6.0f, std::floor((b.x - a.x) * 0.22f));
+  for (float k = 0; k < f; k += 2.0f)
+    dl->AddRectFilled(ImVec2(b.x - f + k, a.y), ImVec2(b.x, a.y + k + 2.0f),
+                      Fade(ColGoldHi(), 0.85f));
+  dl->AddRect(ImVec2(a.x - 2, a.y - 2), ImVec2(b.x + 2, b.y + 2), Fade(ColGoldHi(), 0.8f), 0.0f,
+              0, 2.0f);
+  if (scale < 0.5f || name.empty()) return;
+  std::string t = name;
+  if (t.size() > 16) t = t.substr(0, 15) + "~";
+  const ImVec2 ts = FontSmall()->CalcTextSizeA(13.0f, FLT_MAX, 0.0f, t.c_str());
+  const float cx = std::floor((a.x + b.x) * 0.5f);
+  const ImVec2 p(std::floor(cx - ts.x * 0.5f), std::floor(b.y - 2.0f));
+  dl->AddRectFilled(ImVec2(p.x - 3, p.y - 1), ImVec2(p.x + ts.x + 3, p.y + ts.y),
+                    Fade(ColVellumHi(), 0.97f));
+  dl->AddRect(ImVec2(p.x - 3, p.y - 1), ImVec2(p.x + ts.x + 3, p.y + ts.y),
+              Fade(ColGoldHi(), 0.95f));
+  dl->AddText(FontSmall(), 13.0f, p, ColIronGall(), t.c_str());
 }
 
 // A 2 px stepped ring, the panel's vocabulary for "this is where it goes" and
@@ -1884,9 +1928,23 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
                                                std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
         if (hov) LeafHover(dl, a, b);
+        if (!root && !n.page.empty()) PageSeal(dl, a, b, n.page, scale);
         if (!root) TimingTag(dl, a, b, n, scale);
-        if (!root) TimingClick(n, hov, readOnly, live != nullptr);
-        if (hov && !live) {
+        if (!root && n.page.empty()) TimingClick(n, hov, readOnly, live != nullptr);
+        if (hov && !live && !n.page.empty()) {
+          BeginTip();
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+          ImGui::Text("[%s]", n.page.c_str());
+          ImGui::PopStyleColor();
+          ImGui::TextDisabled("a written spell that is a DELIVERY, used as one glyph:");
+          ImGui::TextDisabled("it carries what stands under it, with its own mods");
+          if (n.hasPrice)
+            ImGui::TextDisabled("tariff %d + carry %d  x%d = %d", n.tariff, n.carryCost,
+                                n.priceInstances, n.subtotal);
+          ImGui::TextDisabled("right-click: take the carrier off, keep what it held");
+          EndTip();
+        } else if (hov && !live) {
           std::string caps = n.label;
           for (char& c : caps) c = (char)toupper((unsigned char)c);
           BeginTip();
@@ -1945,8 +2003,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // A delivery dropped on a bar NESTS the whole box; anything else joins
         // its shared pile. Both are `Tgt::Bar`, because which op it is depends
         // on the payload's sort and that is decided in one place.
-        if (!readOnly && !root && live && live->IsDataType(kPayloadGlyph) &&
-            PayloadSort(s, false, (const char*)live->Data) == kDelivery) {
+        if (!readOnly && !root && live && DeliveryPayload(s, live)) {
           offer(Tgt::Body, (int)i, a, b);
         } else {
           offer(Tgt::Bar, (int)i, a, b);
@@ -2043,7 +2100,22 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
                                                 std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
         if (hov) LeafHover(dl, a, b);
-        if (hov && !live) {
+        if (hov && !live && !n.page.empty()) {
+          BeginTip();
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+          ImGui::Text("an input of [%s]", n.page.c_str());
+          ImGui::PopStyleColor();
+          ImGui::TextDisabled(n.instance == 0
+                                  ? "`%s` inside the page left this slot empty, so the page "
+                                    "takes the word SPOKEN BEFORE it here."
+                                  : "`%s` inside the page left this slot empty, so the page "
+                                    "takes the word spoken AFTER it here.",
+                              n.glyphId.c_str());
+          ImGui::TextDisabled("Empty, that part of the page is charged and does nothing.");
+          ImGui::TextDisabled("Drop a word here to give it to the page.");
+          EndTip();
+        } else if (hov && !live) {
           BeginTip();
           ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
@@ -2097,14 +2169,34 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         if (hov) LeafHover(dl, a, b);
         MagnitudeNumeral(dl, a, b, n, scale);
         TimingTag(dl, a, b, n, scale);
-        if (hov && !live) {
+        if (!n.page.empty()) PageSeal(dl, a, b, n.page, scale);
+        if (hov && !live && !n.page.empty()) {
+          BeginTip();
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+          ImGui::Text("[%s]", n.page.c_str());
+          ImGui::PopStyleColor();
+          ImGui::TextDisabled("a whole written spell, used here as ONE glyph");
+          ImGui::TextDisabled("stands as: %s%s", SortLabel(n.sort),
+                              n.outputs > 1 ? "  (several things at once)" : "");
+          if (n.inputs > 0)
+            ImGui::TextDisabled("%d input%s: the slot%s in the row under it", n.inputs,
+                                n.inputs == 1 ? "" : "s", n.inputs == 1 ? "" : "s");
+          else
+            ImGui::TextDisabled("no inputs: it is complete as written");
+          if (!n.complete)
+            ImGui::TextDisabled("an input is empty: that part is charged and does nothing");
+          ImGui::TextDisabled("edit the page itself to change what it says");
+          ImGui::TextDisabled("right-click: take it off");
+          EndTip();
+        } else if (hov && !live) {
           std::string ml = MagnitudeLine(n);
           if (!n.timingPhrase.empty()) ml += (ml.empty() ? "" : "\n") + std::string("fires ") + n.timingPhrase;
           if (gu) GlyphInfoBox(*gu, SortLabel(n.sort), ml.c_str());
           else Tip("a word that no longer exists");
           WheelMagnitude(s, n, readOnly);
         }
-        TimingClick(n, hov, readOnly, live != nullptr);
+        if (n.page.empty()) TimingClick(n, hov, readOnly, live != nullptr);
         // THE CELL ITSELF TAKES A DROP (2026-09-21). It used to take none: a
         // word cell was a drag SOURCE and nothing else, and an operator's only
         // targets were its two hollow pips, so a glyph aimed anywhere at a
@@ -2120,8 +2212,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // overlap, which is what keeps "that slot, specifically" sayable.
         //   anything else, anywhere else -> BESIDE this word, in its pile.
         if (!readOnly && n.treeNode >= 0 && live) {
-          const bool deliveryDrag = live->IsDataType(kPayloadGlyph) &&
-                                    PayloadSort(s, false, (const char*)live->Data) == kDelivery;
+          const bool deliveryDrag = DeliveryPayload(s, live);
           const bool fromGraph = live->IsDataType(kPayloadGraphNode);
           if (deliveryDrag) offer(Tgt::Body, (int)i, a, b);
           else if (!fromGraph && op &&
@@ -2197,8 +2288,7 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // sentence. It exists only during that drag - an always-drawn empty socket
   // over every spell is a node the page does not have - and it is UI-only: no
   // graph node, no layout law, nothing for the gate to hold.
-  if (!readOnly && live && live->IsDataType(kPayloadGlyph) &&
-      PayloadSort(s, false, (const char*)live->Data) == kDelivery) {
+  if (!readOnly && live && DeliveryPayload(s, live)) {
     int rootIdx = -1, topIdx = -1;
     for (size_t i = 0; i < g.nodes.size(); i++) {
       const UIState::SpellGraphUI::Node& n = g.nodes[i];

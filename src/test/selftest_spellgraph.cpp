@@ -1683,10 +1683,16 @@ Status GateSpellMagnitude(Ctx& c, std::string& detail) {
     pg.name = "mag-test";
     pg.words = {"fire@2", "projectile"};
     gr.pages.push_back(pg);
-    const GrimoireExpansion ex = ExpandWords(lib, gr, {"mag-test"}, kSpellStackMax);
+    // Spoken WHOLE (a key, a hand): ExpandPage, its words with no page marks.
+    const GrimoireExpansion ex = ExpandPage(lib, gr, "mag-test", kSpellStackMax);
     check(ex.spoken.size() == 2 && ex.mags.size() == 2 && ex.mags[0] == 2000 &&
               ex.mags[1] == kMagOne,
           "ExpandWords carries a page's magnitudes");
+    // ...and named INSIDE a spell, the marks ride along without a magnitude of
+    // their own while the words keep theirs.
+    const GrimoireExpansion in = ExpandWords(lib, gr, {"mag-test"}, kSpellStackMax);
+    check(in.spoken.size() == 4 && SpokenIsPageOpen(in.spoken[0]) && in.mags[1] == 2000,
+          "a page named inside a spell keeps its magnitudes between its marks");
   }
 
   // 5. THE PAGE OP: the wheel's SetMagnitude is total and self-proving.
@@ -1728,6 +1734,274 @@ Status GateSpellMagnitude(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- spell-pages: a written spell used as ONE glyph (spell.h) -------------------
+//
+// Every claim the abstraction makes, against glyphs.json and a fixture book:
+// a page is HYGIENIC (its delivery boxes only itself), a carrier page boxes
+// what is before it, a page's empty slots are its INPUTS (left from before,
+// right from after), a page of several things splices them in, pages nest and
+// a cycle stops, the linearizer writes a page back as its NAME, and every edit
+// op keeps it whole. Equality is CastSignature: what the lowering produces, not
+// how the brackets read.
+Status GateSpellPages(Ctx& c, std::string& detail) {
+  GlyphLibrary lib;
+  std::string gerr;
+  if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, lib, gerr)) {
+    detail = "glyphs.json: " + gerr;
+    return Status::Fail;
+  }
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("spell-pages: FAILED %s\n", what.c_str());
+    }
+  };
+  PageBook book;
+  book.Add("boom", {"explosive", "projectile"});          // a value: an exploding bolt
+  book.Add("triple", {"swift", "shotgun", "projectile"}); // a carrier
+  book.Add("seeker", {"trail", "projectile"});            // one left input
+  book.Add("fuser", {"transmute"});                       // a left and a right input
+  book.Add("duo", {"lane", "fire", "end", "lane", "sand", "end"});   // two outputs
+  book.Add("outer", {"boom", "fire"});                    // a page on a page
+  book.Add("loop", {"loop2"});
+  book.Add("loop2", {"loop"});
+  book.Add("haste", {"swift", "twin"});                   // mods only
+  {
+    std::vector<std::string> big;
+    for (int i = 0; i < 20; i++) big.push_back("fire");
+    book.Add("bulk", big);
+  }
+  const PageLookup find = [&](const std::string& n) { return book.WordsOf(n); };
+  auto stackOf = [&](const std::vector<std::string>& w) {
+    SpellStack st;
+    PageExpansionReport rep;
+    SpeakWordsOnto(lib, find, w, kSpellStackMax, st, rep);
+    return st;
+  };
+  auto sig = [&](const std::vector<std::string>& w) {
+    return CastSignature(lib, CompileSpell(lib, stackOf(w)));
+  };
+  auto plain = [&](const std::vector<std::string>& w) {
+    return CastSignature(lib, CompileSpell(lib, WordsToStack(lib, w)));
+  };
+  auto treeOf = [&](const std::vector<std::string>& w) { return ParseWords(lib, w, book); };
+  auto firstCall = [&](const SpellTree& t) {
+    for (size_t i = 0; i < t.nodes.size(); i++)
+      if (!t.nodes[i].call.empty()) return (int)i;
+    return -1;
+  };
+
+  // ---- 1. hygiene: a page's delivery boxes the page and nothing else --------
+  check(sig({"fire", "boom"}) == plain({"explosive", "projectile", "fire"}),
+        "fire <boom> is fire AND an exploding bolt");
+  check(sig({"fire", "boom"}) != plain({"fire", "explosive", "projectile"}),
+        "...not a bolt that sprays fire (the pasted-in macro)");
+  check(sig({"boom", "fire"}) == sig({"fire", "boom"}), "a page is one item of an unordered pile");
+
+  // ---- 2. a carrier boxes what is before it -----------------------------------
+  check(sig({"fire", "triple"}) == plain({"fire", "swift", "shotgun", "projectile"}),
+        "fire <triple> is three swift bolts that spray fire");
+  check(sig({"triple"}) == plain({"swift", "shotgun", "projectile"}),
+        "a carrier alone is its kinetic hit");
+  {
+    const SpellTree t = treeOf({"fire", "triple"});
+    const int ci = firstCall(t);
+    check(ci >= 0 && t.nodes[(size_t)ci].box && !t.nodes[(size_t)ci].callItems.empty(),
+          "a carrier is a box wearing the page, its mods kept apart");
+  }
+
+  // ---- 3. inputs: the page's empty slots ---------------------------------------
+  check(sig({"sand", "seeker"}) == plain({"sand", "trail", "projectile"}),
+        "sand <seeker>: the left input takes the word before the page");
+  check(sig({"seeker"}) == plain({"trail", "projectile"}),
+        "an input nobody fills stays empty, charged, as it would in the words");
+  check(sig({"sand", "fuser", "water"}) == plain({"sand", "transmute", "water"}),
+        "an infix page takes one word each side");
+  {
+    const SpellTree t = treeOf({"sand", "seeker"});
+    const int ci = firstCall(t);
+    check(ci >= 0 && t.nodes[(size_t)ci].holes.size() == 1 && t.nodes[(size_t)ci].complete,
+          "seeker has one input and it is filled");
+    const SpellTree f = treeOf({"fuser"});
+    const int fi = firstCall(f);
+    check(fi >= 0 && f.nodes[(size_t)fi].holes.size() == 2 && !f.nodes[(size_t)fi].complete,
+          "fuser has two inputs, both open");
+    check(NodeSort(lib, treeOf({"burn"}), 0) == NodeSort(lib, treeOf({"burn"}), 0),
+          "an unknown page name is total");
+  }
+  // A lane is a wall for an input as for any operator.
+  check(sig({"sand", "lane", "seeker", "end"}) == plain({"sand", "lane", "trail", "projectile", "end"}),
+        "an input does not reach out of its lane");
+
+  // ---- 4. several outputs splice in; a slot refuses them -----------------------
+  check(sig({"duo", "projectile"}) ==
+            plain({"lane", "fire", "end", "lane", "sand", "end", "projectile"}),
+        "a two-column page is two columns of the box that takes it");
+  {
+    const SpellTree t = treeOf({"duo", "trail"});
+    bool trailOpen = false;
+    for (const SpellNode& n : t.nodes)
+      if (n.group && lib.At(n.glyph) && lib.At(n.glyph)->id == "trail")
+        trailOpen = n.left < 0;
+    check(trailOpen, "an operator cannot take a page of two things");
+  }
+  check(sig({"haste", "projectile"}) == plain({"swift", "twin", "projectile"}),
+        "a page of mods edits the box that closes it");
+
+  // ---- 5. nesting and cycles ---------------------------------------------------
+  check(sig({"outer"}) == plain({"explosive", "projectile", "fire"}),
+        "a page on a page is hygienic at every level");
+  {
+    SpellStack st;
+    PageExpansionReport rep;
+    SpeakWordsOnto(lib, find, {"loop"}, kSpellStackMax, st, rep);
+    int opens = 0, closes = 0;
+    for (int s : st.spoken) {
+      opens += SpokenIsPageOpen(s) ? 1 : 0;
+      closes += s == kSpokenPageClose ? 1 : 0;
+    }
+    check(rep.tooDeep && st.Words() == 0 && opens == closes, "a cycle stops, balanced");
+    SpellStack big;
+    PageExpansionReport br;
+    SpeakWordsOnto(lib, find, {"bulk", "bulk"}, kSpellStackMax, big, br);
+    int o2 = 0, c2 = 0;
+    for (int s : big.spoken) {
+      o2 += SpokenIsPageOpen(s) ? 1 : 0;
+      c2 += s == kSpokenPageClose ? 1 : 0;
+    }
+    check(br.truncated && big.Words() == kSpellStackMax && o2 == c2,
+          "the stack bound counts the words pages speak, and a cut page is still closed");
+  }
+
+  // ---- 6. the words: a page is written back as its NAME --------------------------
+  const std::vector<std::vector<std::string>> sentences = {
+      {"fire", "boom"},          {"sand", "seeker"},       {"fire", "triple"},
+      {"sand", "fuser", "water"}, {"duo", "projectile"},   {"outer", "boom"},
+      {"boom", "bomb"},          {"seeker"},               {"haste", "fire", "projectile"},
+      {"boom", "echo"},          {"lane", "boom", "end", "lane", "fire", "end", "triple"},
+  };
+  for (const std::vector<std::string>& w : sentences) {
+    const SpellTree t = treeOf(w);
+    std::string why;
+    const bool sp = Speakable(lib, t, why);
+    const std::vector<std::string> lw = Linearize(lib, t);
+    const SpellTree re = ParseWords(lib, lw, book);
+    check(sp, "speakable: " + Join(w) + (why.empty() ? "" : " (" + why + ")"));
+    check(GraphTreeKey(lib, re) == GraphTreeKey(lib, t), "round trip: " + Join(w) + " -> " + Join(lw));
+    check(CastSignature(lib, LowerSpell(lib, re)) == sig(w), "same cast after: " + Join(w));
+    int pagesIn = 0, pagesOut = 0;
+    for (const std::string& x : w) pagesIn += book.Find(x) >= 0 ? 1 : 0;
+    for (const std::string& x : lw) pagesOut += book.Find(x) >= 0 ? 1 : 0;
+    check(pagesIn == pagesOut, "pages stay names: " + Join(w) + " -> " + Join(lw));
+  }
+
+  // ---- 7. the ops keep a page whole ---------------------------------------------
+  {
+    const SpellTree blank = EmptyTree();
+    EditResult r = InsertPage(lib, blank, 0, 0, "boom", find);
+    check(r.ok && Join(r.words) == "boom", "InsertPage puts the NAME on the page: " + Join(r.words) + r.why);
+    r = InsertPage(lib, blank, 0, 0, "triple", find);
+    check(r.ok && Join(r.words) == "triple", "a carrier inserts as its kinetic hit");
+    r = InsertPage(lib, blank, 0, 0, "loop", find);
+    check(!r.ok, "a page that names itself is refused");
+
+    SpellTree t = treeOf({"seeker"});
+    const int ci = firstCall(t);
+    r = FillSlot(lib, t, ci, SlotSide::Left, lib.Find("fire"));
+    check(r.ok && Join(r.words) == "fire seeker", "a word dropped on a page fills its input: " + Join(r.words) + r.why);
+    {
+      // ...and the input, once filled, is removable on its own.
+      const SpellTree f = treeOf({"fire", "seeker"});
+      int arg = -1;
+      for (int h : f.nodes[(size_t)firstCall(f)].holes)
+        arg = (h & 1) ? f.nodes[(size_t)(h / 2)].right : f.nodes[(size_t)(h / 2)].left;
+      const EditResult rr = Remove(lib, f, arg);
+      check(rr.ok && Join(rr.words) == "seeker", "removing an input empties it: " + Join(rr.words) + rr.why);
+    }
+    const SpellTree e = ParseWords(lib, {"echo"});
+    int echoNode = -1;
+    for (size_t i = 0; i < e.nodes.size(); i++)
+      if (e.nodes[i].group) echoNode = (int)i;
+    r = FillSlotPage(lib, e, echoNode, SlotSide::Left, "boom", find);
+    check(r.ok && Join(r.words) == "boom echo", "a one-output page fills a slot: " + Join(r.words) + r.why);
+    r = FillSlotPage(lib, e, echoNode, SlotSide::Left, "duo", find);
+    check(!r.ok, "a two-output page does not");
+
+    const SpellTree fz = ParseWords(lib, {"fire"});
+    int fireNode = -1;
+    for (int ii : fz.nodes[(size_t)fz.clauses[0].root].items) fireNode = ii;
+    r = WrapInPage(lib, fz, fireNode, "triple", find);
+    check(r.ok && Join(r.words) == "fire triple", "a carrier page boxes a branch: " + Join(r.words) + r.why);
+    r = WrapInPage(lib, fz, fireNode, "boom", find);
+    check(!r.ok, "a value page boxes nothing");
+
+    const SpellTree tb = treeOf({"boom", "fire"});
+    const int bi = firstCall(tb);
+    r = Remove(lib, tb, bi);
+    check(r.ok && Join(r.words) == "fire", "a page comes off whole");
+    r = InsertItem(lib, tb, tb.clauses[0].root, 0, lib.Find("sand"));
+    check(r.ok && CountWord(r.words, "boom") == 1 && CountWord(r.words, "explosive") == 0,
+          "an edit beside a page leaves it a name: " + Join(r.words));
+    r = WrapInBox(lib, tb, bi, lib.Find("bomb"));
+    check(r.ok && CountWord(r.words, "boom") == 1, "a page can be boxed: " + Join(r.words) + r.why);
+    r = SetMagnitude(lib, tb, bi, 2000);
+    check(!r.ok, "a page has no magnitude of its own");
+
+    const SpellTree tbulk = treeOf({"bulk"});
+    r = InsertPage(lib, tbulk, tbulk.clauses[0].root, 0, "bulk", find);
+    check(!r.ok, "two pages that would speak past the stack bound are refused");
+  }
+
+  // ---- 8. the drawing: one cell per page, inputs in the row under it --------------
+  {
+    const SpellGraph g = BuildGraph(lib, LowerSpell(lib, treeOf({"seeker"})));
+    int cells = 0, holes = 0;
+    for (const SpellGraphNode& n : g.nodes) {
+      if (n.page == "seeker" && n.kind == GraphKind::Operator && n.inputs == 1) cells++;
+      if (n.kind == GraphKind::Hole && n.page == "seeker") holes++;
+    }
+    check(cells == 1 && holes == 1, "seeker draws as one cell with one open input");
+    const SpellGraph g2 = BuildGraph(lib, LowerSpell(lib, treeOf({"fire", "triple"})));
+    int joins = 0;
+    for (const SpellGraphNode& n : g2.nodes)
+      if (n.page == "triple" && n.kind == GraphKind::Join) joins++;
+    check(joins >= 1, "a carrier draws as its delivery, wearing the page");
+    bool explosiveDrawn = false;
+    for (const SpellGraphNode& n : BuildGraph(lib, LowerSpell(lib, treeOf({"boom"}))).nodes)
+      explosiveDrawn = explosiveDrawn || n.label == "explosive";
+    check(!explosiveDrawn, "a page's insides are not drawn on the spell that names it");
+  }
+
+  // ---- 9. the grimoire speaks pages the same way ----------------------------------
+  {
+    PlayerCaster pc;
+    pc.grimoire.pages.push_back({"boom", {"explosive", "projectile"}});
+    for (int i = 0; i < (int)lib.glyphs.size(); i++) pc.inventory.Grant(i);
+    const GrimoireExpansion ex = ExpandWords(lib, pc.grimoire, {"fire", "boom"}, kSpellStackMax);
+    check(CastSignature(lib, CompileSpell(lib, StackOf(ex))) == sig({"fire", "boom"}),
+          "ExpandWords speaks a page as one glyph");
+    const GrimoireExpansion whole = ExpandPage(lib, pc.grimoire, "boom", kSpellStackMax);
+    bool marks = false;
+    for (int s : whole.spoken) marks = marks || SpokenIsMark(s);
+    check(!marks && whole.spoken.size() == 2, "a page spoken WHOLE is its own words");
+    pc.stack = StackOf(ex);
+    const std::string name = pc.CaptureStack(lib);
+    const int pi = pc.grimoire.Find(name);
+    check(pi >= 0 && Join(pc.grimoire.pages[(size_t)pi].words) == "fire boom",
+          "capture keeps a page as its name");
+    const PageShape sh = GrimoirePageShape(lib, pc.grimoire, "boom");
+    check(sh.ok && !sh.carrier && sh.sort == GlyphSort::Effect && sh.inputs == 0,
+          "the shape of a value page");
+  }
+
+  detail = Format("%d checks", checks);
+  std::printf("spell-pages: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SpellGraphGates() {
@@ -1737,6 +2011,8 @@ const std::vector<Gate>& SpellGraphGates() {
       {"spell-graph", "spell", {}, false, GateSpellGraph},
       // CPU-only as well: magnitudes, over glyphs.json and its own fixtures.
       {"spell-magnitude", "spell", {}, false, GateSpellMagnitude},
+      // CPU-only too: pages used as one glyph, over glyphs.json and a book.
+      {"spell-pages", "spell", {}, false, GateSpellPages},
   };
   return g;
 }

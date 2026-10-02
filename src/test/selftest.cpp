@@ -170,6 +170,8 @@ const char* const kOrder[] = {
     // ...and `spell-magnitude` beside it (PLAN_spell_magnitude 2.6): the
     // same CPU-only footing, over the same glyph table.
     "spell-magnitude",
+    // ...and `spell-pages`: pages used as one glyph, same footing.
+    "spell-pages",
     // And with them, for the same reason: `swing` is MeleeState alone — no
     // world, no GPU, no assets, its own fixtures — so it costs milliseconds
     // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the

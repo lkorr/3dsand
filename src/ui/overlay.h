@@ -1058,6 +1058,14 @@ struct UIState {
     int32_t price = 0;          // lowered as if cast alone
     bool priceUnknown = false;  // depends on `anything`
     int dropped = 0;            // words that no longer resolve
+    // ITS SHAPE AS ONE GLYPH inside another spell (caster.h, PageShape):
+    // the sort it stands as (GlyphSort; 2 = delivery for a CARRIER page that
+    // boxes what is before it), -1 when it is no usable page; how many open
+    // slots it takes as inputs (`leftInputs` of them from the words before
+    // it); how many items it holds.
+    int shapeSort = -1;
+    bool carrier = false;
+    int inputs = 0, leftInputs = 0, outputs = 0;
   };
   std::vector<GrimoirePageUI> grimoirePages;
   int grimoireMaxPages = 32, grimoireMaxWords = 16;
@@ -1171,6 +1179,11 @@ struct UIState {
       int trigger = 0, every = 0, delay = 0;
       std::string timingPhrase;
       int spanFirst = -1, spanLast = -1;
+      // A PAGE used as one glyph (SpellGraphNode::page): its name on the cell
+      // that stands for it (and on a Hole that is one of its inputs), with
+      // how many inputs it takes and how many items it holds.
+      std::string page;
+      int inputs = 0, outputs = 0;
     };
     struct Edge {
       int from = -1, to = -1;
