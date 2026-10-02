@@ -4491,8 +4491,11 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   let tA = max(max(tExitW,
                    max(max(tminW.x - ext.x, tminW.y - ext.y),
                        max(tminW.z - ext.z, 0.0))), 0.0);
-  let tB = min(min(tmaxW.x + ext.x, min(tmaxW.y + ext.y, tmaxW.z + ext.z)),
-               tEnd);
+  // The fine box's own exit, before the hit clamp: the long-range segment
+  // below starts here (see the per-sample MAX in this segment).
+  let tFineExit = min(tmaxW.x + ext.x, min(tmaxW.y + ext.y, tmaxW.z + ext.z));
+  let tB = min(tFineExit, tEnd);
+  let farOn = (R.flags & RFLAG_GASFAR) != 0u;
   // `acc` is count x LENGTH, not a bare sum, because the two segments have
   // different step budgets and therefore different dt. Each loop multiplies in
   // its own.
@@ -4526,6 +4529,27 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
         let ramp = clamp((t - tA) * rampInv, 0.0, 1.0);
         c = gasErode(c, p, GAS_DETAIL_FINE_M, GAS_DETAIL_OCT_FINE, ramp,
                      GAS_CORE_COUNT);
+      }
+      // THE OVERLAP IS A MAX, NOT A SUM (2026-09-30). Across the crossfade
+      // shell both boxes now hold the SAME plume at weights that overlap
+      // (farplumes.cpp: the wide twin is whole by mid-shell, the fine plume
+      // stays whole until then and only fades over the second half), so at
+      // every point at least one of them is a full representation. Summing
+      // them would double the middle; summing COMPLEMENTARY halves, which is
+      // what this was, dipped it, because each half is eroded on its own and
+      // the erosion remap eats a half-mass plume far more than half. The max
+      // of the two eroded samples is the compressor: it holds the denser of
+      // the two, so visibility never drops while the look hands over.
+      // Same units in both boxes (a count over 512 is a volume fraction either
+      // way, see gasFarOuterCountAt), so the max is a like-for-like compare.
+      if (farOn) {
+        var cw = gasFarOuterCountAt(p);
+        if (cw > 0.0) {
+          let ramp = clamp((t - tA) * rampInv, 0.0, 1.0);
+          cw = gasErode(cw, p, GAS_DETAIL_WIDE_M, GAS_DETAIL_OCT_WIDE, ramp,
+                        GAS_CORE_COUNT_WIDE);
+          c = max(c, cw);
+        }
       }
       acc += c * dt;
       t += dt;
@@ -4576,19 +4600,18 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // The fires past the near box's ±51.2 m. It is a THIRD segment rather than a
   // wider version of the first because the two boxes are different GRIDS, not
   // because they hold different fires: since world.h kGasFarBlendVox became the
-  // whole fine band, every emitter outside the window is in BOTH lists with
-  // weights that sum to 255, so most of what this segment draws over the near
-  // band is the fading-in twin of something the first segment is also drawing.
-  // Nothing is counted twice because the SPLIT IS STILL IN THE DATA — it moved
-  // from a radius to a pair of weights — and the renderer still applies no
-  // distance term of its own to either.
+  // whole fine band, every emitter outside the window is in BOTH lists, with
+  // OVERLAPPING weights since 2026-09-30 -- so inside the fine box's span the
+  // twin is drawn by the first segment's per-sample max instead, and this one
+  // starts where the fine box ends. The renderer still applies no distance
+  // term of its own to either.
   //
   // Starts at the near box's exit, so the near field pays nothing for it beyond
   // the flag test. Its samples fold into the SAME accumulator with no scale
   // factor: a cell's count over 512 is a volume fraction in either box (see
   // gasFarOuterCountAt), so `count * dt` is voxel-lengths of gas at either
   // scale.
-  if ((R.flags & RFLAG_GASFAR) != 0u) {
+  if (farOn) {
     // Concentric with the window box like the other two, so the same six slab
     // distances serve it: push both of each axis's planes out by half the
     // difference of the two edges.
@@ -4604,8 +4627,13 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
     // half of the crossfade would simply have been missing. Same step count,
     // so the cost is a slightly longer dt over a segment that is mostly empty
     // this near anyway.
+    // From the FINE BOX'S EXIT again (2026-09-30), as it was before
+    // 2026-09-19: the wide twins that live inside the fine box's volume are
+    // now sampled by the fine segment above, max'd against the fine box, so
+    // this segment only has to cover what lies beyond it. Starting at the
+    // window face would add them a second time on top of that max.
     let tF0 = max(max(max(tminW.x - extF.x, tminW.y - extF.y),
-                      max(tminW.z - extF.z, 0.0)), tA);
+                      max(tminW.z - extF.z, 0.0)), max(tA, tFineExit));
     let tF1 = min(min(tmaxW.x + extF.x, min(tmaxW.y + extF.y, tmaxW.z + extF.z)),
                   tEnd);
     if (tF1 > tF0) {

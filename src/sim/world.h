@@ -593,10 +593,11 @@ constexpr uint32_t kGasFarEmitWeightShift = 24;
 // while the wide aggregate gained them, and the player saw the trail collapse
 // to a wisp before the coarse blob appeared. Now an emitter whose max-norm
 // distance is within this many voxels INSIDE the fine box's face feeds BOTH
-// lists, with complementary weights that the kernels multiply into the mass:
-// the fine plume fades out over the shell at full size, the wide one fades in
-// at full size, and the sum of what a ray collects is the same at every point
-// of the shell.
+// lists, with weights the kernels multiply into the mass: the wide twin fades
+// in over the first half of the shell at full size, the fine plume fades out
+// over the second, and the renderer takes the per-sample MAX of the two boxes,
+// so visibility never dips while the look hands over (2026-09-30; it used to
+// be complementary weights summed, which dipped -- each half is eroded alone).
 //
 // THE SHELL IS THE WHOLE FINE BAND (2026-09-19, second pass). It was one wide
 // cell (64 vox = 6.4 m) out of a 25.6 m band, which is a crossfade only in the

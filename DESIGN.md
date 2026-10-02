@@ -2269,6 +2269,17 @@ in wide cells inside the fine box's volume and the old start never sampled them.
 weights summing to one, and a ray through the shell collects the same total at
 every point of it.
 
+**Superseded 2026-09-30: overlapping weights + a per-sample MAX.** Equal total
+MASS still dipped visibly mid-shell, because the renderer erodes each box on
+its own (`gasErode` remaps count / core) and a half-mass plume loses far more
+than half its opacity. Now the wide twin fades IN over the first half of the
+shell while the fine plume stays whole, and the fine plume fades OUT over the
+second half while the wide one is whole (`Cand::wideIn`, independent of
+`wFine`). Inside the fine box's span `gasOuterFill` samples BOTH boxes at every
+step and keeps the larger eroded value; the long-range segment starts at the
+fine box's exit again. One representation is always at full strength, the max
+never doubles, so visibility holds while the texture hands over.
+
 What still steps: `hMul = sqrt(columns)` capped at 4 makes a LARGE fire's wide
 column taller than its fine columns, so a hillside fire gains height across the
 shell (a single tree, `cols < 1`, does not). Inherent to "many columns" vs "one

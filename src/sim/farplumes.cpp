@@ -264,7 +264,10 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
                         windowOriginChunks.y != builtOrigin_.y ||
                         windowOriginChunks.z != builtOrigin_.z ||
                         rangeVox != builtRange_;
-  if (!geoStale && !(eyeMoved && !byChunk_.empty())) return;
+  calls_++;
+  if (!geoStale && !(eyeMoved && !byChunk_.empty()) && !slewing_) return;
+  const uint64_t slewTicks = calls_ - builtCall_;
+  builtCall_ = calls_;
   dirty_ = false;
   builtOrigin_ = windowOriginChunks;
   builtRange_ = rangeVox;
@@ -281,10 +284,10 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // The handover distance, in the MAX NORM: the fine box's own half-extent.
   // Inside it a fire is drawn at 0.8 m cells, outside at 6.4 m. It is no longer
   // a strict split — an emitter within kGasFarBlendVox of it feeds BOTH lists
-  // with complementary weights, and since that shell is now the whole band the
-  // split is a crossfade everywhere rather than a bevelled edge at one radius.
-  // "No double-brightening" is still a property of the data: the two weights
-  // sum to 255 at every distance.
+  // with OVERLAPPING weights (one of the two is always 255; see the shell
+  // below), and since that shell is now the whole band the split is a
+  // crossfade everywhere rather than a bevelled edge at one radius. "No
+  // double-brightening" is the renderer's per-sample MAX over the two boxes.
   const int fineHalf = (int)kWorldN;
   // Where the wide list itself ends, and therefore where its outer fade lands:
   // the smaller of the authored range and the box's own x/z half-extent (the
@@ -316,9 +319,8 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
   // only exists past the window face measured from the CENTRE, but its weight
   // is measured from the EYE, which can be up to ~slack closer -- so starting
   // the fade before the face just means such an emitter is already a little
-  // wide when it appears. The weights still sum to 255, so nothing is drawn
-  // twice; the smoothstep's flat start keeps that first bit of coarse twin
-  // under ~15%. 48 = 30% of the 160-voxel ramp (2026-09-30: "make the medium
+  // wide when it appears (the renderer's per-sample max keeps that from
+  // drawing anything twice). 48 = 30% of the 160-voxel ramp (2026-09-30: "make the medium
   // and far LODs bleed into each other more, for longer"). No eye (gates,
   // headless) has no slack to recover and keeps the face as the start.
   const int fineLead = hasEye_ ? (kGasFarBlendVox - kGasFarEyeSlackVox) * 3 / 10
@@ -385,21 +387,37 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     const int dv = std::max(std::abs(e.x - ex),
                             std::max(std::abs(e.y - ey), std::abs(e.z - ez)));
     // THE CROSSFADE SHELL (world.h kGasFarBlendVox): inside the fine box's
-    // face by less than the shell, an emitter is in BOTH lists with weights
-    // that sum to one. Past the face it is wide only; deeper in, fine only.
+    // face by less than the shell, an emitter is in BOTH lists. Past the face
+    // it is wide only; deeper in, fine only.
+    //
+    // OVERLAPPING, NOT COMPLEMENTARY (2026-09-30). The weights used to sum to
+    // 255 and the renderer summed the two boxes, which is a constant total
+    // MASS -- and a visible dip in the middle of the shell, because each box
+    // is ERODED separately (raymarch.wgsl gasErode remaps count / core) and a
+    // half-mass plume loses well over half its opacity to that remap. Two
+    // half plumes drew noticeably less than one whole one. Now the wide twin
+    // fades IN over the first half of the shell while the fine plume stays
+    // whole, and the fine plume fades OUT over the second half while the wide
+    // one is whole: at every distance at least one representation is at full
+    // strength. The renderer takes the per-sample MAX of the two boxes inside
+    // the fine box's span (gasOuterFill), so the overlap never doubles.
+    const int fineMid = (fineFadeIn + fineFadeOut) / 2;
     uint32_t wFine = 0;
+    uint32_t wideIn = 255;
     if (g.inFine) {
-      wFine = dv > fineFadeIn
-                  ? 255u - Smooth255(dv - fineFadeIn, fineFadeOut - fineFadeIn)
+      wFine = dv > fineMid
+                  ? 255u - Smooth255(dv - fineMid, fineFadeOut - fineMid)
                   : 255u;
+      wideIn = dv < fineMid
+                   ? (dv > fineFadeIn ? Smooth255(dv - fineFadeIn, fineMid - fineFadeIn) : 0u)
+                   : 255u;
       if (wFine != 0) band = 2;
     } else if (g.nearFine) {
       band = 5;
     }
-    // ...and the WIDE side of the same emitter, which is the complement of
-    // that times its own outer fade. `outer` is kept SEPARATE from the
-    // complement because the promotion below raises the complement to 255
-    // and must not lose the fade along with it.
+    // ...and the WIDE side's own OUTER fade, kept SEPARATE from wideIn
+    // because the promotion below raises wideIn to 255 and must not lose the
+    // range fade along with it.
     uint32_t outer = 0;
     if (g.inWide) {
       // THE OUTER SHELL (world.h kGasFarRangeFadeVox): the wide list's own
@@ -416,7 +434,7 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     }
     if (PlumeDebug()) dbgBand_[g.key] = band;
     if (wFine == 0 && outer == 0) continue;
-    cand.push_back({e, g.d2, wFine, outer});
+    cand.push_back({e, g.d2, wFine, outer, wideIn});
   }
 
   if (PlumeDebug()) {
@@ -462,9 +480,43 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     std::vector<uint8_t> kept(cand.size(), 0);
     for (const Ranked& r : fine) kept[r.w8] = 1;
     for (size_t i = 0; i < cand.size(); i++)
-      if (cand[i].wFine != 0 && !kept[i]) { cand[i].wFine = 0; promoted++; }
+      if (cand[i].wFine != 0 && !kept[i]) {
+        cand[i].wFine = 0;
+        cand[i].wideIn = 255;   // promoted: the wide twin carries ALL of it
+        promoted++;
+      }
   }
   for (Ranked& r : fine) r.w8 = cand[r.w8].wFine;
+
+  // ---- THE WIDE SLEW: an attack/release on the far LOD's weight ------------
+  // AFTER the promotion (a promoted emitter's target is 255) and BEFORE the
+  // aggregation, so every downstream sum sees the slewed value. A new emitter
+  // starts at 0 and climbs; one that left the lists is forgotten, so coming
+  // back starts at 0 again. Walking at any normal speed the distance target
+  // moves far slower than this rate and the slew never engages; it only
+  // smooths the jumps: an emitter appearing at the window face already deep
+  // in the ramp, or a teleport. Eye runs only -- headless has no walking and
+  // every gate's fixture is measured a few ticks after it is placed.
+  slewing_ = false;
+  if (hasEye_) {
+    constexpr uint32_t kWideSlewPerTick = 3;   // 0 -> 255 in 85 ticks, ~1.4 s
+    const uint64_t maxStep64 = std::min<uint64_t>(slewTicks * kWideSlewPerTick, 255);
+    const int32_t maxStep = (int32_t)maxStep64;
+    wideSlewNext_.clear();
+    for (Cand& c : cand) {
+      if (c.outer == 0) continue;
+      const Key k{c.e.x, c.e.y, c.e.z};
+      auto it = wideSlew_.find(k);
+      const int32_t prev = it == wideSlew_.end() ? 0 : (int32_t)it->second;
+      const int32_t tgt = (int32_t)c.wideIn;
+      const int32_t now = tgt > prev ? std::min(tgt, prev + maxStep)
+                                     : std::max(tgt, prev - maxStep);
+      if (now != tgt) slewing_ = true;
+      c.wideIn = (uint32_t)now;
+      wideSlewNext_[k] = (uint8_t)now;
+    }
+    wideSlew_.swap(wideSlewNext_);
+  }
 
   // ---- THE WIDE AGGREGATION, and what OVERFLOWING *it* now means ----------
   // Bucket by the COARSE cell the emitter stands in. Strengths add and the
@@ -511,7 +563,12 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
     std::vector<uint32_t> order;
     order.reserve(cand.size());
     for (uint32_t i = 0; i < (uint32_t)cand.size(); i++)
-      if ((255u - cand[i].wFine) * cand[i].outer / 255u != 0) order.push_back(i);
+      // EVERY wide-eligible emitter, weight 0 included (2026-09-30). Clustering
+      // only the weighted ones made membership a function of the weights, so
+      // a member crossing zero could re-seed a cluster and move or resize a
+      // whole plume in one step. Clusters (and so record positions, which key
+      // sim_gas's plume tracks) are now a function of geometry alone.
+      if (cand[i].outer != 0) order.push_back(i);
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
       const Emitter& ea = cand[a].e;
       const Emitter& eb = cand[b].e;
@@ -534,7 +591,7 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
       if (taken[oi]) continue;
       const Emitter seed = cand[order[oi]].e;
       const Key sc = cellOf(seed);
-      uint64_t str = 0, sw = 0;
+      uint64_t str = 0, sw = 0, rawStr = 0;
       int64_t sx = 0, sz = 0;
       int32_t topY = seed.y;
       for (int dz = -1; dz <= 1; dz++)
@@ -549,17 +606,24 @@ void FarPlumes::Build(IVec3 windowOriginChunks, int32_t rangeVox) {
                   std::abs(c.e.z - seed.z) > rad)
                 continue;
               taken[mj] = 1;
-              const uint32_t w = (255u - c.wFine) * c.outer / 255u;
-              str += c.e.strength;
+              const uint32_t w = c.wideIn * c.outer / 255u;
+              // Position from RAW strength (stable); SIZE from strength scaled
+              // by min(1, 4w): a member fades its size in over the first
+              // quarter of its weight, while its mass (sw) is still small, so
+              // joining a cluster cannot step the plume's height.
+              rawStr += c.e.strength;
+              str += (uint64_t)c.e.strength * std::min<uint32_t>(255u, 4u * w) / 255u;
               sw += (uint64_t)c.e.strength * w;
               sx += (int64_t)c.e.x * c.e.strength;
               sz += (int64_t)c.e.z * c.e.strength;
               topY = std::max(topY, c.e.y);
             }
           }
+      // A cluster with no weight at all draws nothing and takes no record.
+      if (sw == 0 || str == 0) continue;
       Emitter e;
-      e.x = str ? (int32_t)(sx / (int64_t)str) : seed.x;
-      e.z = str ? (int32_t)(sz / (int64_t)str) : seed.z;
+      e.x = rawStr ? (int32_t)(sx / (int64_t)rawStr) : seed.x;
+      e.z = rawStr ? (int32_t)(sz / (int64_t)rawStr) : seed.z;
       e.y = topY;
       // Saturating at the 24 bits the record's strength field has.
       e.strength = (uint32_t)std::min<uint64_t>(str, (uint64_t)kGasFarEmitStrengthMask);

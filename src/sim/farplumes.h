@@ -100,10 +100,11 @@ class FarPlumes {
   //
   // The split is NOT strict: an emitter within world.h kGasFarBlendVox of the
   // fine box's face — which is the whole band, so every emitter outside the
-  // window — is in BOTH sections, with complementary weights in the top byte
-  // of its strength word. "No double-brightening" is those weights summing to
-  // 255, which is still a property of the DATA rather than of a blend the
-  // renderer has to get right. `rangeVox` is render.farPlumeRange in voxels;
+  // window — is in BOTH sections, with OVERLAPPING weights in the top byte of
+  // its strength word (one of the two is always 255). "No double-brightening"
+  // is the renderer's per-sample MAX over the two boxes (raymarch.wgsl
+  // gasOuterFill); a sum of complementary halves dipped, because each half is
+  // eroded on its own. `rangeVox` is render.farPlumeRange in voxels;
   // 0 produces an empty wide section, which is the feature's exact off switch
   // (no emitters, no row, no clear, no sampling).
   //
@@ -204,6 +205,7 @@ class FarPlumes {
     int64_t d2;
     uint32_t wFine;   // 0 = cannot be in the fine section at all
     uint32_t outer;   // 0..255 wide-list outer fade; 0 = not wide-eligible
+    uint32_t wideIn;  // 0..255 wide fade-IN across the shell (NOT 255 - wFine)
   };
   struct WideAgg { Emitter e; uint64_t sw; };
   std::vector<Cand> cand_;
@@ -248,6 +250,17 @@ class FarPlumes {
   IVec3 eye_{0, 0, 0};
   bool hasEye_ = false;
   IVec3 builtEye_{INT32_MIN, INT32_MIN, INT32_MIN};
+  // THE WIDE SLEW (2026-09-30; eye runs only). Each wide-eligible emitter's
+  // last emitted wideIn, keyed by its POSITION, so the weight the far LOD is
+  // drawn at moves at most kWideSlewPerTick per tick toward its distance
+  // target. List membership changes in whole-chunk steps (the window shifts
+  // 1.6 m at a time), and without this an emitter that entered the list
+  // already deep in the ramp popped its far plume in at that weight -- the
+  // "far smoke steps in intensity as I walk" report. `slewing_` forces the
+  // next Build while any weight is still travelling.
+  std::unordered_map<Key, uint8_t, KeyHash> wideSlew_, wideSlewNext_;
+  bool slewing_ = false;
+  uint64_t calls_ = 0, builtCall_ = 0;
   // The previous upload image, to decide whether this rebuild actually CHANGED
   // anything. The eye moves constantly, so Build now runs on most ticks of a
   // walking player; without this every one of them would bump version_ and
