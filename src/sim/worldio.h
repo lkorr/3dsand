@@ -196,7 +196,13 @@
 //     re-spawns into a fresh counter"), so creatures are independent. The id
 //     COUNTER is global state and lives in world.sve ('MOBG'), restored as a
 //     max() so a loaded world never re-issues an id it already handed out.
-//   - ITMS: name + dye + fill + position + lattice. Independent.
+//   - ITMS: name + dye + fill + position + lattice, independent of other
+//     ITMS records -- plus (v8) the index of its body in world.sve's 'DBRS',
+//     the ONE reference from a bucket into the global file. Sound because
+//     both are written by the same save and DBRS loads first (world.sve
+//     before regions), and GUARDED by position: a record left parked across
+//     saves names an index into an older DBRS, misses, and re-drops instead
+//     (game/persist.h "ONE BODY, ONE IDENTITY").
 //   - DBRS: a follower names its strap host BY INDEX INTO THE SECTION'S OWN
 //     LIST (debris.cpp SaveState). That link cannot be split, and there is no
 //     per-body entry point to split it with, so the whole section is one

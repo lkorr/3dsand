@@ -18,6 +18,9 @@
 
 #include "game/avatar.h"
 #include "game/brush.h"
+#include "game/equipment.h"
+#include "game/mob.h"
+#include "game/worlditems.h"
 #include "game/persist.h"
 #include "game/player.h"
 #include "gpu/rhi.h"
@@ -28,6 +31,7 @@
 #include "sim/worldio.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -1899,6 +1903,220 @@ Status GateSaveSplit(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- save-items ------------------------------------------------------------
+//
+// GROUND ITEMS DO NOT MULTIPLY ACROSS A SAVE (2026-10-01). A dropped item is a
+// debris body AND a registry entry, and the save wrote it twice: 'DBRS' as a
+// body and 'ITMS' as an item that the load RE-DROPPED as a second body -- so
+// every save/load cycle doubled what lay on the ground. save-split never saw
+// it: it counts registry entries, which stayed right, and only reports the
+// debris count. Since ITMS v8 the identity is re-attached to the body DBRS
+// restored (game/persist.h "ONE BODY, ONE IDENTITY"). Claims:
+//
+//  A. ROUND TRIP. Three items dropped and settled through THE tick, plus an
+//     iron helm SHED by a creature whose head was cut off (registered as the
+//     item AND strapped to the severed head). Save, wreck, load: exactly the
+//     same number of ground items, the same number of debris bodies, every
+//     item on a live body flagged as an item (Body::item is not in DBRS),
+//     no two items sharing a body, and the helm still strapped to its head.
+//  B. STABLE. Tick on, save and load again: still the same counts.
+//  C. MIGRATION. The same state written as ITMS v7 records (no body index)
+//     beside its DBRS -- what every pre-v8 save holds -- loads WITHOUT the
+//     duplicate (position match), and its next save/load is stable.
+Status GateSaveItems(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Stream& stream = c.stream;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  const char* kPath = "selftest_items.svd";
+  const uint64_t idCounterWas = mobs.NextIdCounter();
+
+  std::vector<const ItemDef*> drops;
+  for (const ItemDef& it : c.items.items) {
+    uint32_t sc = 1;
+    if (drops.size() < 3 && !ItemKindIsWorn(it.kind) && ItemGroundVoxels(it, sc))
+      drops.push_back(&it);
+  }
+  if (drops.empty()) {
+    detail = "no droppable item in the library";
+    return Status::Skip;
+  }
+  while (drops.size() < 3) drops.push_back(drops[0]);
+  const ItemDef* helm = nullptr;
+  for (const ItemDef& it : c.items.items)
+    if (it.name == "iron_helm") helm = &it;
+  int humanDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == "human") humanDef = (int)i;
+
+  stream.Store().Unbind();
+  std::filesystem::remove_all(kPath);
+  debris.Reset();
+  mobs.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  WorldItems ground;
+  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  mobs.SetOnItemShed(
+      [&ground](uint64_t h, const ItemInstance& it) { ground.Add(h, it); });
+  WorldItemRefs groundRefs{&ground, &c.phys, &debris, nullptr, &c.items};
+  EntityIO eio = MakeEntityIO(debris, mobs, nullptr, nullptr, &groundRefs);
+
+  const IVec3 wo = world.WindowOrigin();
+  const int sx = wo.x * (int)kChunk + 190, sz = wo.z * (int)kChunk + 190;
+  const int sh = World::TerrainHeight(sx, sz, kDefaultSeed);
+  for (size_t k = 0; k < drops.size(); k++)
+    DropItemToWorld(*drops[k], ItemInstance{drops[k]->name},
+                    Vec3{(float)sx + 5.0f * (float)k, (float)(sh + 3), (float)sz},
+                    Vec3{}, c.phys, debris, nullptr, ground);
+  const size_t dropped = ground.Count();
+
+  // The shed helm: worn, then its host limb (the head) cut off.
+  bool shedOk = false;
+  if (helm && humanDef >= 0) {
+    const int hx = sx, hz = sz + 12;
+    const int hh = World::TerrainHeight(hx, hz, kDefaultSeed);
+    const uint64_t id = mobs.Spawn(humanDef, {hx, hh + 1, hz});
+    Mob* m = mobs.FindMobById(id);
+    if (m && m->WearItem(helm, (int)EquipSlotId::Head)) {
+      int identity = -1;
+      for (int p = 0; p < m->WornPieceCount() && identity < 0; p++) {
+        const std::vector<int>& sl = m->WornSlotsAt(p);
+        if (!sl.empty() && m->LimbDefAt(sl[0]).name.find("iron_helm") !=
+                               std::string::npos)
+          identity = m->IdentityShellOf(p);
+      }
+      const int host = identity >= 0 ? m->WornHostOf(identity) : -1;
+      if (host >= 0) {
+        mobs.Sever(id, host);
+        shedOk = ground.Count() == dropped + 1;
+      }
+    }
+  }
+
+  support::TickRig rig(c, 70000u,
+                       IVec3{sx / (int)kChunk, (sh + 8) / (int)kChunk, sz / (int)kChunk});
+  rig.Authority().ground = &ground;
+  support::RunTicks(rig, 90);
+
+  auto helmBody = [&]() -> uint64_t {
+    for (const WorldItem& w : ground.All())
+      if (helm && w.name == helm->name) return w.body;
+    return 0;
+  };
+  const bool helmStrapped0 = shedOk && debris.WornHostOf(helmBody()) != 0;
+
+  struct Count {
+    size_t items = 0;
+    uint32_t bodies = 0;
+    size_t itemBodies = 0;   // registry entries on a live item-flagged body
+    bool distinct = true;    // no body is two items
+    bool strapped = false;
+  };
+  auto measure = [&]() {
+    Count n;
+    n.items = ground.Count();
+    n.bodies = debris.BodyCount();
+    std::vector<uint64_t> seen;
+    for (const WorldItem& w : ground.All()) {
+      if (debris.IsItemBody(w.body)) n.itemBodies++;
+      if (std::find(seen.begin(), seen.end(), w.body) != seen.end())
+        n.distinct = false;
+      seen.push_back(w.body);
+    }
+    n.strapped = debris.WornHostOf(helmBody()) != 0;
+    return n;
+  };
+  auto same = [&](const Count& a, const Count& b) {
+    return a.items == b.items && a.bodies == b.bodies &&
+           b.itemBodies == b.items && b.distinct &&
+           (!helmStrapped0 || b.strapped);
+  };
+  auto wreck = [&]() {
+    debris.Reset();   // fires OnBodyGone: the registry empties with it
+    mobs.Reset();
+    ground.Clear();
+  };
+  auto cycle = [&](Count& before, Count& after) {
+    before = measure();
+    const bool saved = SaveWorld(ctx, world, stream, kPath, c.mats, &eio);
+    wreck();
+    const bool loaded = LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio);
+    after = measure();
+    return saved && loaded && same(before, after);
+  };
+
+  // ---- A + B ----
+  Count a0, a1, b0, b1;
+  const bool okA = cycle(a0, a1) && a0.items == dropped + (shedOk ? 1u : 0u);
+  support::RunTicks(rig, 30);
+  const bool okB = cycle(b0, b1);
+
+  // ---- C: the pre-v8 save ----
+  bool okC = false;
+  Count c0, c1, c2, c3;
+  {
+    c0 = measure();
+    const EntitySection* dbrs = nullptr;
+    const EntitySection* itms = nullptr;
+    for (const EntitySection& s : eio.sections) {
+      if (s.id == (uint32_t)('D' | ('B' << 8) | ('R' << 16) | ((uint32_t)'S' << 24)))
+        dbrs = &s;
+      if (s.id == (uint32_t)('I' | ('T' << 8) | ('M' << 16) | ((uint32_t)'S' << 24)))
+        itms = &s;
+    }
+    if (dbrs && itms) {
+      std::vector<uint8_t> body;
+      dbrs->save(body);
+      std::vector<EntityRecord> recs;
+      itms->saveRecords(recs);
+      // v7 is v8 without the trailing body index on each entry.
+      for (EntityRecord& r : recs)
+        if (r.bytes.size() >= 4) r.bytes.resize(r.bytes.size() - 4);
+      // Only debris and the registry: the creatures stay as they are, so the
+      // counts below compare like with like.
+      debris.Reset();
+      ground.Clear();
+      const bool dOk = dbrs->load(body.data(), body.size(), DebrisSystem::kSaveVersion);
+      int applied = 0;
+      for (const EntityRecord& r : recs)
+        if (itms->loadRecord(r.bytes.data(), r.bytes.size(), 7u) == RecordLoad::Applied)
+          applied++;
+      c1 = measure();
+      const bool migrated = dOk && applied == (int)recs.size() &&
+                            c1.items == c0.items && c1.bodies == c0.bodies &&
+                            c1.itemBodies == c1.items && c1.distinct;
+      okC = migrated && cycle(c2, c3);
+    }
+  }
+
+  const bool ok = okA && okB && okC && (shedOk || !helm || humanDef < 0);
+  detail = Format(
+      "A roundtrip=%d (items %zu->%zu, bodies %u->%u, on item bodies %zu, "
+      "helm shed=%d strapped %d->%d) | B again=%d (items %zu->%zu, bodies "
+      "%u->%u) | C v7 migration=%d (items %zu->%zu, bodies %u->%u; resave "
+      "%zu->%zu, %u->%u)",
+      okA ? 1 : 0, a0.items, a1.items, a0.bodies, a1.bodies, a1.itemBodies,
+      shedOk ? 1 : 0, a0.strapped ? 1 : 0, a1.strapped ? 1 : 0, okB ? 1 : 0,
+      b0.items, b1.items, b0.bodies, b1.bodies, okC ? 1 : 0, c0.items, c1.items,
+      c0.bodies, c1.bodies, c2.items, c3.items, c2.bodies, c3.bodies);
+  std::printf("save-items: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+
+  // teardown: nothing of this gate survives into the next one
+  debris.Reset();
+  mobs.Reset();
+  ground.Clear();
+  debris.SetOnBodyGone(nullptr);
+  mobs.SetOnItemShed(nullptr);
+  mobs.SetNextIdCounter(idCounterWas);
+  stream.Store().Unbind();
+  std::filesystem::remove_all(kPath);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- save-material-remap -------------------------------------------------
 //
 // MATERIAL NAMES IN SAVES (rule-unification W1-D, sim/mattable.h). A material
@@ -2346,6 +2564,7 @@ const std::vector<Gate>& WorldIoGates() {
       {"save-load", "worldio", {}, false, GateSaveLoad},
       {"save-entities", "worldio", {}, false, GateSaveEntities},
       {"save-split", "worldio", {}, false, GateSaveSplit},
+      {"save-items", "worldio", {}, false, GateSaveItems},
       {"save-material-remap", "worldio", {}, false, GateSaveMaterialRemap},
       {"region-store", "worldio", {}, false, GateRegionStore},
       {"region-codec", "worldio", {}, false, GateRegionCodec},

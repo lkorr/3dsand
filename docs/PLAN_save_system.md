@@ -310,4 +310,15 @@ Details:
 ## Status (2026-09-23)
 
 ALL PACKAGES LANDED on main: S1+S2+S3 44a095c, S4+S5a 803d8cb, S2b 4c3af28, S5b f773ab6.
-Open follow-ups: neighbour-wake modified bit (cause 2), pond-bed stain at gen (cause 3, design call), DBRS per-body API + ground-item duplication bug (debris owner), parked NPCs do not tick, client-side unpark via host handoff, ground items do not park, stable authored NPC ids (npc:<name>), shipped-game policy for a changed worldgen fingerprint, pruning pristine chunks written by pre-S1 saves.
+Open follow-ups: neighbour-wake modified bit (cause 2), pond-bed stain at gen (cause 3, design call), DBRS per-body API (debris owner), parked NPCs do not tick, client-side unpark via host handoff, ground items do not park, stable authored NPC ids (npc:<name>), shipped-game policy for a changed worldgen fingerprint, pruning pristine chunks written by pre-S1 saves.
+
+**2026-10-01: ground-item duplication FIXED** (ITMS v8, gate `save-items`). DBRS
+saved every item's body and the ITMS load re-dropped each item as a second one,
+so every cycle doubled the ground. ITMS now records its body's index in DBRS
+and re-attaches the identity to the restored body; v1..v7 records match their
+DBRS body by position, so old saves load without the duplicate. Still open
+around it: an ITMS record parked across a save (outside the window at load)
+names an index into an older DBRS, misses, and re-drops -- while that older
+DBRS's copy of its body was restored as anonymous debris. Rare (the window at
+load is the window at save), and it goes away when DBRS gets its per-body API
+and buckets with ITMS.

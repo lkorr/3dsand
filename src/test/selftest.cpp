@@ -503,6 +503,11 @@ const char* const kOrder[] = {
     // globals it touches (the mob id counter and the celestial clock) on the
     // way out; the world it leaves behind is one chunk-exchange regenerates.
     "save-split",
+    // Ground items across a save (persist.h "ONE BODY, ONE IDENTITY"). The
+    // same shape as save-split: regenerates on entry, drops its own items and
+    // a helmed human, ticks them settled through the rig, saves/loads its own
+    // dir, and resets mobs + debris and the id counter on the way out.
+    "save-items",
     // W1-D material names in saves (sim/mattable.h). Regenerates on the way
     // in, saves and loads its own dir under a permuted material table, and
     // resets mobs + debris and regenerates at the origin on the way out --

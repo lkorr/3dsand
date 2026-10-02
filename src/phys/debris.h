@@ -1384,6 +1384,32 @@ class DebrisSystem {
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
 
+  // ---- WHICH SAVED BODY IS WHICH ITEM (game/persist.cpp 'ITMS' v8) ---------
+  //
+  // A dropped item IS a debris body, so 'DBRS' saves it with everything that
+  // makes it that body (pose, lattice, coats, the strap a shed helm keeps to
+  // the severed head it came off with). 'ITMS' carries only its IDENTITY and,
+  // since v8, the index its body was written at in THIS section, so the load
+  // re-attaches the identity to the restored body instead of dropping a second
+  // copy (the save/load duplication, PLAN_save_system.md follow-ups).
+  //
+  // SaveIndexOf: the position SaveState writes `handle` at -- its index in
+  // bodies_, because SaveState writes every body in order. 0xFFFFFFFF for an
+  // unknown handle. Valid only at the save instant (no tick between the two
+  // sections' writers, which SaveWorld guarantees).
+  uint32_t SaveIndexOf(uint64_t handle) const;
+  // After a LoadState: the body that saved index `savedIndex` became, if it
+  // was restored, is still alive, sits within `tol` voxels of `expectPos`
+  // (the stale-record guard: a record parked across saves names an index in
+  // an OLDER section) and nobody has claimed it yet. Claiming is one-shot.
+  // 0 otherwise -- the caller falls back to re-creating the item.
+  uint64_t ClaimLoadedBody(uint32_t savedIndex, Vec3 expectPos, float tol);
+  // The legacy form (ITMS v1..v7 named no index): the nearest unclaimed
+  // restored body within `tol` of `expectPos`. Both sections were written at
+  // the same instant from the same transform, so the match is exact in
+  // practice; the tolerance only absorbs a sleeping body's cached pose.
+  uint64_t ClaimLoadedBodyNear(Vec3 expectPos, float tol);
+
   // ---- break events -------------------------------------------------------
   // One entry per island that detached into a rigidbody this tick. Reported
   // rather than voiced here: this layer knows nothing about audio, the same
@@ -2011,6 +2037,11 @@ class DebrisSystem {
   std::unordered_map<uint64_t, uint8_t> supportLate_;
   uint32_t lastSupportSnapTick_ = 0;
   std::vector<Body> bodies_;
+  // The last LoadState's saved-index -> handle map (0 = not restored or
+  // already claimed), for ClaimLoadedBody. Cleared by Reset; an entry is
+  // zeroed when its body is released, so a Jolt handle reused by a later body
+  // can never be claimed as the item the saved one was.
+  std::vector<uint64_t> loadedFromSave_;
   // ---- handle -> index into bodies_, SELF-VALIDATING ------------------------
   // The first index whose Body::handle is `handle`, or -1 — exactly what a
   // `for (b : bodies_) if (b.handle == handle)` scan returns. `handleIdx_` is

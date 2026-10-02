@@ -650,9 +650,13 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
 //                              u32 latticeCount, then per voxel:
 //                                i32 x, i32 y, i32 z, u32 material, u32 colour
 //
-// Position only, no rotation: a ground item is re-dropped rather than restored
-// in place, and it settles again under the same physics that put it there. A
-// saved quaternion would be a pose the solver immediately overrides anyway.
+// (v2..v8 append dye, fill, damage, contents, stopper, coats and the DBRS
+// body index; see kWorldItemSaveVersion.)
+//
+// Position only, no rotation: the POSE is the DBRS body's, which this record
+// is re-attached to on load (v8; persist.h "ONE BODY, ONE IDENTITY"). The
+// position here keys the region bucket, guards the re-attach, and places the
+// fallback re-drop, which settles under the physics that put it there.
 //
 // THE LATTICE IS WRITTEN ONLY WHEN IT DIFFERS from what the library would
 // build — the owner's decision is that damage persists exactly, and a robe
@@ -725,6 +729,11 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     PutU32(out, w.stoppered ? 1u : 0u);
     // v7: the coats on its recorded lattices (PutCoats).
     PutCoats(out, damage);
+    // v8: WHICH 'DBRS' BODY this item is -- its index in that section, written
+    // at the same instant (DebrisSystem::SaveIndexOf). The load re-attaches
+    // this identity to the body DBRS restored instead of dropping a second
+    // one; 0xFFFFFFFF (an item whose body debris does not know) re-drops.
+    PutU32(out, r.debris->SaveIndexOf(w.body));
   }
 }
 
@@ -797,18 +806,50 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
     }
     // v7: coats (GetCoats remaps its own ids).
     if (version >= 7 && !GetCoats(rd, inst.damage)) break;
+    // v8: the body's index in 'DBRS'.
+    uint32_t savedBody = 0xFFFFFFFFu;
+    if (version >= 8) {
+      savedBody = rd.U32();
+      if (!rd.ok) break;
+    }
     // The lattice and the vessel's contents are ids in the table this record
     // was written under; running ids from here on (sim/mattable.h).
     if (const MatRemap* mr = ActiveLoadRemap()) {
       RemapPrefabVoxels(lat, *mr);
       RemapItemInstance(inst, *mr);
     }
+    // ---- ONE BODY PER ITEM (2026-10-01) ------------------------------------
+    // 'DBRS' already restored this item's body (it saves every debris body,
+    // and a ground item is one) -- with its rotation, its exact lattice and
+    // coats, and the strap a shed helm keeps to the head it came off with.
+    // Re-dropping here as well put TWO on the ground after every load and
+    // four after the next. So the identity is re-attached to that body; the
+    // re-drop below is only the fallback for a body DBRS could not restore
+    // (the body ceiling, a Jolt refusal, a section-only load).
+    //   v8+: by the saved index, guarded by position (a record parked across
+    //        saves names an index into an OLDER 'DBRS').
+    //   v1..v7 (MIGRATION): those saves hold the duplicate already -- their
+    //        DBRS has the item body too -- so the nearest unclaimed restored
+    //        body at the item's position is taken as it. Both sections were
+    //        written from the same transform at the same instant.
+    uint64_t body =
+        version >= 8 ? r.debris->ClaimLoadedBody(savedBody, at, 1.0f)
+                     : r.debris->ClaimLoadedBodyNear(at, 0.25f);
+    if (body && r.reg->Find(body)) body = 0;   // never two identities
     const ItemDef* d = r.items->Named(name);
     // Content legitimately disappears between saves. The item is dropped with
     // a log line rather than restored as something else, which is the same
-    // rule PLYR follows for a name it cannot resolve.
+    // rule PLYR follows for a name it cannot resolve -- and the body DBRS
+    // restored for it goes too, or it would lie there as a nameless shape.
     if (!d) {
+      if (body) r.debris->DestroyBody(body);
       dropped++;
+      continue;
+    }
+    if (body) {
+      inst.name = d->name;
+      r.debris->MarkItemBody(body);   // Body::item is not in DBRS
+      r.reg->Add(body, inst);
       continue;
     }
     DropItemToWorld(*d, inst, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,

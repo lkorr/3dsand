@@ -434,6 +434,7 @@
   "ragdoll-dress": "pass",
   "save-load": "pass",
   "save-split": "pass",
+  "save-items": "pass",
   "_saveLoad_about": "save-load gate (docs/PLAN_save_system.md S1). A save stores only the resident chunks something wrote since they entered the window (modified_ plus the delivered-but-unpublished snapshot tail); pristine chunks regenerate from seed + generator. saveUntouchedMaxBytes bounds the region bytes of one save of a fresh worldgen after 30 idle ticks -- measured 2026-09-22 at 18,091,632 B (1,485 of 32,768 chunks, all gen-settle activity: PLAN S2 attributes it) against 279,064,576 B for the pre-S1 full flush of the same world (SANDVOX_SAVE_MEASURE_FULL=1 prints both). A number near 279 MB means the delta path was refused and the gate should also have failed on delta=0. S3's zstd planes took it to 454,510 B (still 1,485 chunks); S2b (worldgen loose sand born at rest) to 94,582 B / 160 chunks on 2026-09-23, almost all pond-bed stain. The cap is ~2x that: 190,000 B.",
   "saveUntouchedMaxBytes": "190000",
   "saveUntouchedBytes": "94582",

@@ -406,14 +406,32 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   A load resets every system, applies `world.sve`, the player file, then
   every record the window's regions hold whose POSITION is inside the window
   (`ApplyRegionEntities`, also the entry point for later touches). Cross-
-  bucket references: `MOBS` and `ITMS` records name nothing outside
-  themselves; `DBRS` names strap hosts by index into its own list and has no
-  per-body entry point, so it stays one group in `world.sve`. Time of day is
+  bucket references: `MOBS` records name nothing outside themselves; `DBRS`
+  names strap hosts by index into its own list and has no per-body entry
+  point, so it stays one group in `world.sve`; `ITMS` (v8) names its body's
+  index in that `DBRS` -- see the next bullet. Time of day is
   the celestial clock plus meta's sim tick; weather is a pure function of
   (tuning, seed, sim tick) with no state of its own. The pre-S4
   `entities.sve` still loads (whole, every section through its whole-payload
   loader) and the next save distributes it and deletes it. Gate:
   `save-split`; `save-entities` asserts its old claims on the new layout.
+- **A ground item is ONE body with ONE identity across a save (ITMS v8,
+  2026-10-01).** A dropped item is a debris body plus a `WorldItems` entry,
+  and until v8 the save wrote it twice: `DBRS` saved the body (it saves every
+  debris body) and the `ITMS` load RE-DROPPED the item from the library as a
+  second body -- every save/load cycle doubled what lay on the ground. The
+  BODY is now `DBRS`'s alone (pose incl. rotation, exact lattice, coats, the
+  strap a shed helm keeps to the severed head it came off with) and `ITMS` is
+  the IDENTITY (name, dye, contents, damage, coats) plus the index the body
+  was written at in `DBRS` (`DebrisSystem::SaveIndexOf`). The load
+  re-attaches the identity to the restored body (`ClaimLoadedBody`, guarded by
+  position against a record parked across saves) and re-flags it
+  `Body::item`; the library re-drop is only the fallback for a body `DBRS`
+  did not restore. v1..v7 records are migrated by position
+  (`ClaimLoadedBodyNear`): their `DBRS` already holds the duplicate's body, so
+  an old save loads without it. Content that no longer exists takes its
+  restored body with it. Gate: `save-items` (three drops + a helm shed off a
+  severed head, two save/load cycles, and a v7 load).
 - **A whole body saves as its name (MOBS v4, 2026-09-23,
   `docs/PLAN_save_system.md` S5a).** The mob record is the terrain delta rule
   applied to a body: a limb that is field-for-field its def's authored limb

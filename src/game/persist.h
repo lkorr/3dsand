@@ -131,11 +131,16 @@ constexpr uint32_t kPlayerKitOldestLoadable = 3;
 // put an item concept inside the physics layer, which is the coupling
 // game/worlditems.h exists to avoid.
 //
-// The bodies themselves are RE-CREATED on load from the item library, not
-// restored from DBRS: a ground item is fully described by its name and its
-// transform, so re-dropping it is both simpler and immune to a DBRS format
-// change. The cost is that a ground item's carved lattice does not survive a
-// save — see the note in worlditems.h; it round-trips as authored.
+// ONE BODY, ONE IDENTITY (2026-10-01). The BODY is 'DBRS''s: it saves every
+// debris body, a ground item included, with its rotation, exact lattice and
+// coats, and the strap a shed helm keeps to the severed head it came off with.
+// This section saves the IDENTITY and (v8) the index the body was written at
+// in DBRS; the load re-attaches the identity to that restored body. Until v8
+// the load RE-DROPPED every item from the library as well, so each save/load
+// cycle doubled what lay on the ground (PLAN_save_system.md follow-ups). A
+// v1..v7 record is migrated by position: its DBRS holds the body too, and the
+// nearest unclaimed restored body at the item's position is taken as it. The
+// re-drop survives only as the fallback for a body DBRS did not restore.
 struct WorldItemRefs {
   WorldItems* reg = nullptr;
   Physics* phys = nullptr;
@@ -161,7 +166,10 @@ struct WorldItemRefs {
 // contents; a v5 ground flask loads unstoppered.
 // v7 (2026-10-01) appends each entry's COATS on its recorded damage lattices
 // (persist.cpp PutCoats); a v6 ground item's record loads clean.
-constexpr uint32_t kWorldItemSaveVersion = 7;
+// v8 (2026-10-01) appends each entry's BODY INDEX in 'DBRS'
+// (DebrisSystem::SaveIndexOf); see "ONE BODY, ONE IDENTITY" above. A v7 record
+// finds its body by position instead.
+constexpr uint32_t kWorldItemSaveVersion = 8;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove

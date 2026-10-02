@@ -589,6 +589,7 @@ void DebrisSystem::RecountBurn(Body& b) const {
 }
 
 void DebrisSystem::Reset() {
+  loadedFromSave_.clear();   // first: ReleaseBody would scan it per body
   for (Body& b : bodies_) ReleaseBody(b);
   bodies_.clear();
   for (auto& [ci, t] : terrain_)
@@ -3752,6 +3753,9 @@ void DebrisSystem::ReleaseBody(Body& b) {
   // what makes one notification enough (see SetOnBodyGone).
   if (b.handle && onBodyGone_) onBodyGone_(b.handle);
   if (b.handle) untunnelHold_.erase(b.handle);
+  if (b.handle)
+    for (uint64_t& h : loadedFromSave_)
+      if (h == b.handle) h = 0;
   if (b.handle) phys_->RemoveBody(b.handle);
   b.handle = 0;
 }
@@ -7146,6 +7150,42 @@ void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
   }
 }
 
+uint32_t DebrisSystem::SaveIndexOf(uint64_t handle) const {
+  const int i = IndexOfHandle(handle);
+  return i >= 0 ? (uint32_t)i : 0xFFFFFFFFu;
+}
+
+uint64_t DebrisSystem::ClaimLoadedBody(uint32_t savedIndex, Vec3 expectPos,
+                                       float tol) {
+  if (savedIndex >= loadedFromSave_.size()) return 0;
+  const uint64_t h = loadedFromSave_[savedIndex];
+  const int i = IndexOfHandle(h);
+  if (!h || i < 0) return 0;
+  const Vec3 d = bodies_[(size_t)i].xf.pos - expectPos;
+  if (d.x * d.x + d.y * d.y + d.z * d.z > tol * tol) return 0;
+  loadedFromSave_[savedIndex] = 0;
+  return h;
+}
+
+uint64_t DebrisSystem::ClaimLoadedBodyNear(Vec3 expectPos, float tol) {
+  size_t best = loadedFromSave_.size();
+  float bestD2 = tol * tol;
+  for (size_t k = 0; k < loadedFromSave_.size(); k++) {
+    const int i = IndexOfHandle(loadedFromSave_[k]);
+    if (!loadedFromSave_[k] || i < 0) continue;
+    const Vec3 d = bodies_[(size_t)i].xf.pos - expectPos;
+    const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+    if (d2 <= bestD2) {   // ties: the lowest index, deterministically
+      if (best == loadedFromSave_.size() || d2 < bestD2) best = k;
+      bestD2 = d2;
+    }
+  }
+  if (best == loadedFromSave_.size()) return 0;
+  const uint64_t h = loadedFromSave_[best];
+  loadedFromSave_[best] = 0;
+  return h;
+}
+
 bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
   if (version != kSaveVersion && version != 4u) {
     std::fprintf(stderr, "debris: unknown DBRS section version %u\n", version);
@@ -7260,6 +7300,9 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
     // pile reloads settled, and rule 2's sleep invariant holds from tick one.
     phys_->DeactivateBody(h);
   }
+  // Kept for 'ITMS' (ClaimLoadedBody): which restored body each saved index
+  // became.
+  loadedFromSave_ = handleOfSaved;
   // ---- second pass: tie the straps ----------------------------------------
   // The SAVED offset is restored, not re-derived from the loaded poses, for
   // the same reason StrapBody captures the live one: the pair's offset is a
