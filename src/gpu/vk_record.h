@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -324,7 +325,30 @@ class Recorder {
 
   const RecordStats& Stats() const { return stats_; }
 
+  // ---- ASYNC COMPUTE (docs/PLAN_async_compute.md; rhi_vulkan.h's block) ----
+  // The command buffer commands are recorded into NOW: after a join split it
+  // is the TAIL, not the buffer Begin() was handed.
+  VkCommandBuffer Cmd() const { return cmd_; }
+  // MAIN recording made while async work is outstanding: `split` ends the
+  // current buffer and returns a fresh one (the tail), or VK_NULL_HANDLE if it
+  // cannot (the caller then joins at the head). Called at most once, at the
+  // first access that conflicts with the async work (NoteAsync).
+  void SetAsyncJoin(std::function<VkCommandBuffer()> split) { asyncJoin_ = std::move(split); }
+  bool AsyncJoined() const { return asyncJoined_; }
+  // Join now, whatever comes next (BeginRendering: a draw's descriptor reads
+  // are not table uses, so a rendering scope is conservatively a conflict).
+  void JoinAsync();
+  // ASYNC recording: collect every touched buffer and whether it was written.
+  void SetAsyncRecording(bool on) { asyncRecord_ = on; }
+  const std::vector<Backend::AsyncTouch>& AsyncTouched() const { return asyncTouched_; }
+
  private:
+  void NoteAsync(Buffer* buf, pass::Acc acc);
+  std::function<VkCommandBuffer()> asyncJoin_;
+  bool asyncJoined_ = false;
+  bool asyncRecord_ = false;
+  std::vector<Backend::AsyncTouch> asyncTouched_;
+
   // --- the algorithm, barrier_graph §3.3 --------------------------------
   // Consult the tracker with one row's uses, emit the derived barriers, and
   // update state. `global` takes the §3.6 form: one VkMemoryBarrier2 over the

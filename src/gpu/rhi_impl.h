@@ -106,6 +106,9 @@ struct QueueImpl {
   virtual void WriteBuffer(const Buffer& b, uint64_t offset, const void* data,
                            size_t size) = 0;
   virtual void Submit(uint32_t count, const CommandBuffer* cmds) = 0;
+  // Async compute (docs/PLAN_async_compute.md). Default: there is no second
+  // queue, so an async command buffer cannot exist to be submitted.
+  virtual void SubmitAsyncCompute(const CommandBuffer& /*cmd*/) {}
 };
 
 struct MapTicketImpl {
@@ -138,6 +141,11 @@ struct DeviceImpl {
                                                 const char* entry, const char* label) = 0;
   virtual RenderPipeline CreateRenderPipeline(const RenderPipelineDesc& d) = 0;
   virtual CommandEncoder CreateCommandEncoder(const char* label) = 0;
+  // Async compute (docs/PLAN_async_compute.md); defaults = single queue.
+  virtual bool AsyncComputeAvailable() const { return false; }
+  virtual void SetAsyncCompute(bool /*on*/) {}
+  virtual bool AsyncComputeEnabled() const { return false; }
+  virtual CommandEncoder CreateAsyncComputeEncoder(const char* /*label*/) { return {}; }
   virtual void PushValidationScope() = 0;
   virtual bool PopValidationScopeBlocking() = 0;
   virtual void ProcessEvents() = 0;

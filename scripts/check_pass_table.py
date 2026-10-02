@@ -269,6 +269,9 @@ BUF_TO_WGSL = {
     # The far plumes' carried tracks, binding 13 of the GAS group only.
     "GasPlumeTrack": {"gasPlumeTrack"},
     "RenderUBO": {"R"},
+    # The tick's copy of it for the derived rows (sim_openness.wgsl, binding 50;
+    # docs/PLAN_async_compute.md).
+    "RenderUBOTick": {"RT"},
     "Reactions": {"reactions"},
     "DirtyList": {"dirtyList", "farDirty"},
     "ArgsStage": {"args"},
@@ -440,6 +443,9 @@ _SIM_GROUP0 = {
     # The CA's air mask, binding 48 (sim_step.wgsl camask writes it before
     # each gravity substep; main reads it).
     "caMask", "caWind",
+    # The tick's RenderParams copy for the derived rows, binding 50
+    # (sim_openness.wgsl `RT`; docs/PLAN_async_compute.md).
+    "RT",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

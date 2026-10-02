@@ -19,6 +19,7 @@
 #include "gpu/context.h"
 #include "gpu/passtimer.h"
 #include "gpu/resources.h"
+#include "gpu/rhi_vulkan.h"  // async-compute join counters for the A/B arms
 #include "math3d.h"
 #include "measure/perfnodes.h"
 #include "measure/perfscope.h"
@@ -4111,12 +4112,50 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
     return 1;
   }
 
+  // SANDVOX_PERF_ASYNC_ARMS=off,on,off,on: record every scenario once PER ARM,
+  // in this order, in THIS process, with render.asyncCompute forced off/on
+  // (docs/PLAN_async_compute.md). Boot-to-boot noise here is +-1 ms, larger
+  // than the lever, so the A/B has to live in one boot; repeating the off arm
+  // shows the drift. Each arm is a full Record(): same world, ops, frames.
+  std::vector<int> asyncArms;
+  if (const char* e = std::getenv("SANDVOX_PERF_ASYNC_ARMS"); e && *e) {
+    const std::string a = e;
+    size_t p = 0;
+    while (p <= a.size()) {
+      size_t q = a.find(',', p);
+      if (q == std::string::npos) q = a.size();
+      const std::string t = a.substr(p, q - p);
+      if (t == "on") asyncArms.push_back(1);
+      else if (t == "off") asyncArms.push_back(0);
+      p = q + 1;
+    }
+  }
+  if (asyncArms.empty()) asyncArms.push_back(-1);
   std::vector<Run> runs;
   for (const Scenario& sc : kScenarios) {
     if (!opt.only.empty() && opt.only != sc.id) continue;
-    std::printf("\n[%s] %s\n", sc.id, sc.label);
-    runs.push_back(runner.Record(sc));
+    for (int arm : asyncArms) {
+      SetAsyncComputeOverride(arm);
+      std::printf("\n[%s] %s%s\n", sc.id, sc.label,
+                  arm < 0 ? "" : arm ? "  (arm: async compute ON)" : "  (arm: async compute OFF)");
+      const vk::Backend* be = ctx.VkBackend();
+      const vk::Backend::AsyncStats a0 = be ? be->GetAsyncStats() : vk::Backend::AsyncStats{};
+      runs.push_back(runner.Record(sc));
+      if (be && be->GetAsyncStats().submits > a0.submits) {
+        const vk::Backend::AsyncStats& a1 = be->GetAsyncStats();
+        // WHERE the main queue waited for the async work: a split at a
+        // conflicting command (the overlap this exists for) or a join at the
+        // head of a command buffer (an upload or a late submit — no overlap).
+        std::printf("  async compute: %llu async submits, %llu joins (%llu at a buffer "
+                    "head), %llu split command buffers\n",
+                    (unsigned long long)(a1.submits - a0.submits),
+                    (unsigned long long)(a1.joins - a0.joins),
+                    (unsigned long long)(a1.headJoins - a0.headJoins),
+                    (unsigned long long)(a1.splits - a0.splits));
+      }
+    }
   }
+  SetAsyncComputeOverride(-1);
   if (runs.empty()) {
     std::fprintf(stderr, "--perf: no scenario matched '%s'\n", opt.only.c_str());
     return 1;

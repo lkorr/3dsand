@@ -929,6 +929,31 @@ PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,
           A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
           A(FarMap)))
 
+// ---- the derived rows' RenderParams (docs/PLAN_async_compute.md) ---------
+// LAST on the tick table: RenderUBO -> RenderUBOTick, the copy sim_openness
+// reads as `RT` (binding 50). The openness rows used to read RenderUBO itself,
+// which the frame uploads into at the head of its first command buffer; with
+// those rows on the async queue that upload would be a write to something the
+// async work reads, and the main queue would have to wait for it before
+// starting the frame at all. The copy holds exactly the bytes RenderUBO held
+// here, which is what the rows read before. Size 0 = the whole source (the
+// .def cannot spell sizeof(RenderParams); vk_record.cpp's copy-row note).
+PASS(copy_renderUBOTick, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,0, GRP_NONE, DYN_NONE, C_OPENNESS, 1,
+     USES(TR(RenderUBO) TW(RenderUBOTick)))
+
+// ---- PT_DERIVED (2026-10-02, docs/PLAN_async_compute.md) -----------------
+// The openness and glow rows below are tagged PT_DERIVED, not PT_TICK: the
+// tick's RENDER-ONLY derived data, recorded by Simulation::EncodeDerived AFTER
+// everything else the tick records (the MLS-MPM tables, the far fill, the
+// readback copies) — into the tick's own command buffer with
+// render.asyncCompute off, or onto the async compute queue with it on, which
+// is the SAME position in the stream either way. Nothing in the sim reads
+// Openness / OpennessGen / Irradiance / Glow; their inputs (Voxels, Occupancy,
+// DirtyList, DispatchArgs, PageTable, Materials, the UBOs) are read-only here.
+// That is what lets them run beside the next frame's render instead of in
+// front of it. They still use the tick's indirect args and dirty list, which
+// the NEXT tick rewrites — the recorder's async join orders that.
+//
 // ---- phase 5c: the openness (sky-visibility) grid -------------------------
 // docs/PLAN_gi.md §2. RENDER-ONLY DERIVED DATA written on the TICK table, which
 // is the same standing farDown above has and for the same two reasons:
@@ -954,9 +979,9 @@ PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,
 // face's openness byte now also decays its irradiance word and, for a face it
 // marches, blends in one coarse sun sample — the off-screen half of direct
 // injection. Its other writer is shadow_resolve on the per-frame table.
-PASS(opennessDirty, "openness", PT_TICK, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
+PASS(opennessDirty, "openness", PT_DERIVED, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBO) R(Occupancy) R(DirtyList)
+     USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBOTick) R(Occupancy) R(DirtyList)
           I(DispatchArgs) R(PageTable) W(Openness) W(OpennessGen) W(Irradiance)))
 // The rolling refresh: render.opennessChunksPerFrame slots per tick, round
 // robin from a cursor derived from T.tick, so the whole window revisits in
@@ -967,9 +992,9 @@ PASS(opennessDirty, "openness", PT_TICK, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DI
 // Deliberately NOT conditioned on C_DIRTYTICK: a hash tick takes the whole
 // world occupancy branch and compacts no dirty list, so the row above is
 // skipped, and this one is the only thing keeping the grid alive across it.
-PASS(opennessRefresh, "openness", PT_TICK, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_OPENCHUNKS,1,1,
+PASS(opennessRefresh, "openness", PT_DERIVED, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_OPENCHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBO) R(Occupancy) R(PageTable)
+     USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBOTick) R(Occupancy) R(PageTable)
           W(Openness) W(OpennessGen) W(Irradiance)))
 
 // ---- phase 5d: the glow field --------------------------------------------
@@ -999,7 +1024,7 @@ PASS(opennessRefresh, "openness", PT_TICK, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_O
 // READS the slot's previous word to decide whether it moved — the `changed`
 // flag stage 2 gates its expensive branch on. Declaring it W would omit the
 // hazard against the PREVIOUS tick's stage 2 read and against the refresh row.
-PASS(glowSrc, "glow", PT_TICK, PIPE_GLOW_SRC, K_INDIRECT, IND_DISPATCHARGS,0,0,
+PASS(glowSrc, "glow", PT_DERIVED, PIPE_GLOW_SRC, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_GLOW, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(DirtyList) I(DispatchArgs)
           R(PageTable) RW(Glow)))
@@ -1013,7 +1038,7 @@ PASS(glowSrc, "glow", PT_TICK, PIPE_GLOW_SRC, K_INDIRECT, IND_DISPATCHARGS,0,0,
 // No voxel, material or page-table use: everything this row needs is already in
 // the source words. That is the point of the two-stage split — the gather is
 // 27 taps of a 512 KiB region rather than a search over cells.
-PASS(glowField, "glow", PT_TICK, PIPE_GLOW_FIELD, K_INDIRECT, IND_DISPATCHARGS,0,0,
+PASS(glowField, "glow", PT_DERIVED, PIPE_GLOW_FIELD, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_GLOW, 1,
      USES(U(TickUBO) R(DirtyList) I(DispatchArgs) RW(Glow) R(PageTable)))
 // The rolling refresh: render.glowChunksPerFrame slots per tick, round robin,
@@ -1023,7 +1048,7 @@ PASS(glowField, "glow", PT_TICK, PIPE_GLOW_FIELD, K_INDIRECT, IND_DISPATCHARGS,0
 // away. Deliberately NOT conditioned on C_DIRTYTICK, for the openness refresh's
 // reason: a hash tick compacts no dirty list, so the two rows above it are
 // skipped and this is the only thing keeping the field alive across it.
-PASS(glowRefresh, "glow", PT_TICK, PIPE_GLOW_REFRESH, K_COMPUTE, D_GLOWCHUNKS,1,1,
+PASS(glowRefresh, "glow", PT_DERIVED, PIPE_GLOW_REFRESH, K_COMPUTE, D_GLOWCHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_GLOW, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) RW(Glow)))
 

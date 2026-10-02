@@ -997,6 +997,7 @@ const TUNING_PARAMS = {
   'wind.streakWidth':{t:'f',def:0.015,min:0.005,max:0.2},
   'wind.dbgWindField':{t:'b',def:false},
   'render.dbgCurrentField':{t:'b',def:false},
+  'render.asyncCompute':{t:'b',def:false},
   'render.sunDir':{t:'v3',def:[0.5,0.55,0.38]},
   'render.fogOpticalDepths':{t:'f',def:4.5,min:0.5,max:20},
   'render.fogLerpPerFrame':{t:'f',def:0.08,min:0.005,max:1},

@@ -371,6 +371,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The CA's air mask (sim_step.wgsl camask): simBGL_ only.
         entry(48, T::Storage),         // caMask (1 bit per cell, per slot)
         entry(49, T::Storage),         // caWind (ambient wind per 4^3 block)
+        // The tick's copy of RenderParams (pass::Buf::RenderUBOTick,
+        // docs/PLAN_async_compute.md): what the DERIVED rows (sim_openness's
+        // `RT`) read instead of RenderUBO, so a frame's RenderUBO upload never
+        // races them on the async queue. simBGL_ only.
+        entry(50, T::Uniform),         // RenderParams, as of the end of the tick
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -797,6 +802,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // ...and its ambient wind cache (sim_step.wgsl caWind): 64 blocks x 3 words.
   caWindBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 64u * 3u * 4u,
                             rhi::BufferUsage::Storage, "caWind");
+  // The tick's RenderParams copy (pass_table.def copy_renderUBOTick): same
+  // size as RenderUBO, written only by that copy row.
+  renderUBOTickBuf_ = CreateBuffer(device, sizeof(RenderParams),
+                                   rhi::BufferUsage::Uniform | rhi::BufferUsage::CopyDst,
+                                   "renderUBOTick");
   // The wind-draft volume (world.h kDraft*). ZEROED: the masks a solve
   // compares against start as an all-air box, and the field as "no wind"
   // until the first (forced) rebuild tick solves it -- the renderer does not
@@ -1225,6 +1235,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(47, draftMetaBuf_),
         b(48, caMaskBuf_),
         b(49, caWindBuf_),
+        b(50, renderUBOTickBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1672,7 +1683,18 @@ class PipelineBuildPool {
 
 // Six, matching scripts/build.sh's core cap: the driver compile is one busy
 // core per call and this machine has to stay usable while it runs.
-constexpr unsigned kBuildThreads = 6;
+constexpr unsigned kBuildThreadsDefault = 6;
+// SANDVOX_BUILD_THREADS=<n> overrides it. 1 = serial, no thread spawned: the
+// isolation arm for a driver whose concurrent vkCreateComputePipelines is
+// suspect (a CPU ICD on the cross-vendor runs; DESIGN.md §14 risk 3).
+unsigned BuildThreads() {
+  static const unsigned n = [] {
+    const char* e = std::getenv("SANDVOX_BUILD_THREADS");
+    const int v = e ? std::atoi(e) : 0;
+    return v > 0 ? (unsigned)v : kBuildThreadsDefault;
+  }();
+  return n;
+}
 }  // namespace
 
 // ---- the specialized raymarch variant (W2-A) -------------------------------
@@ -1822,7 +1844,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // and the executable-properties query it feeds reads per-pipeline driver
   // state, which is not a thing to interrogate from six threads at once.
   const unsigned buildThreads =
-      rhi::vkr::CaptureStats(device) ? 1u : kBuildThreads;
+      rhi::vkr::CaptureStats(device) ? 1u : BuildThreads();
 
   // ---- module loads, in parallel -----------------------------------------
   // LoadShader is a file read plus the generated preludes, and today that is
@@ -2437,6 +2459,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::DraftArgs:           return draftArgsBuf_;
     case B::CaMask:              return caMaskBuf_;
     case B::CaWind:              return caWindBuf_;
+    case B::RenderUBOTick:       return renderUBOTickBuf_;
     case B::WindStreaks:         return windStreakBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
@@ -2647,7 +2670,18 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.shadowSet = shadowBG_.Get();
 
   rhi::RecordTableVulkan(enc, which, cx, tb,
-                         passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
+                         passTimer_ && passTimer_->Valid() && !recordNoTimer_ ? passTimer_
+                                                                              : nullptr);
+}
+
+// The tick's derived rows (pass_table.def PT_DERIVED). See the header note.
+// No condition of its own: every row carries C_OPENNESS / C_GLOW against the
+// tick's context, so a tick with both off records nothing here.
+void Simulation::EncodeDerived(const rhi::CommandEncoder& enc, bool asyncQueue) {
+  if (!lastTickCxValid_) return;
+  recordNoTimer_ = asyncQueue;
+  RecordTable(enc, pass::Table::Derived, &lastTickCx_);
+  recordNoTimer_ = false;
 }
 
 void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
@@ -3325,6 +3359,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   sandvox::SetGasFarRenderActive(cx.gasFarWideCount > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
+  // The derived rows record LATER, from this same context (EncodeDerived).
+  lastTickCx_ = cx;
+  lastTickCxValid_ = true;
 
   // MLS-MPM fluid: seam front half (compaction, spawns, excite), the substep
   // table kFluidSubsteps times, then the seam back half (settle) — all into
@@ -3947,7 +3984,7 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   // lives in this scope until the pool joins.
   PipelineBuildPool pool;
   const unsigned buildThreads =
-      rhi::vkr::CaptureStats(device_) ? 1u : kBuildThreads;
+      rhi::vkr::CaptureStats(device_) ? 1u : BuildThreads();
 
   rhi::DepthState dsAlways{};
   dsAlways.format = kDepthFormat;

@@ -4128,6 +4128,16 @@ struct Tuning {
     // tuning.json and from a headless screenshot run, neither of which can
     // press anything.
     bool dbgCurrentField = TPD(render, dbgCurrentField);
+    // ---- async compute (docs/PLAN_async_compute.md) ---------------------
+    // Run the tick's RENDER-ONLY derived passes (pass_table.def PT_DERIVED:
+    // the openness grid and the glow field) on the device's async compute
+    // queue, so they overlap the next frame's render instead of running in
+    // front of it. Ignored (single queue) on a device without one. OFF by
+    // default: measured, it does not win on the RTX 3060 Ti (the plan has the
+    // numbers). SANDVOX_ASYNC_COMPUTE=0/1 overrides it for an A/B. READ AT
+    // DEVICE CREATION too: the async queue exists only if this is on at boot
+    // (an unused second queue costs frame time on NVIDIA).
+    bool asyncCompute = TPD(render, asyncCompute);
     float dbgCurrentSpacing = TPD(render, dbgCurrentSpacing);
     float dbgCurrentRadius = TPD(render, dbgCurrentRadius);
 

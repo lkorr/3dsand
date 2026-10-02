@@ -168,6 +168,14 @@ class Simulation {
                   // default and the state of every untouched lake.
                   uint32_t waterSweepSlot = 0xFFFFFFFFu);
 
+  // The tick's RENDER-ONLY derived passes (pass_table.def PT_DERIVED: openness
+  // + glow), recorded with the SAME counts, flags and bind-group page the last
+  // EncodeTick used — so call it before FlipPage. SubmitTick records it LAST in
+  // the tick's own command buffer, or (render.asyncCompute) into an encoder for
+  // the async compute queue; `asyncQueue` drops the pass timer, whose query
+  // pool belongs to the main queue. docs/PLAN_async_compute.md.
+  void EncodeDerived(const rhi::CommandEncoder& enc, bool asyncQueue = false);
+
   // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
   //
   // A fully settled world still recorded 54 `DispatchWorkgroupsIndirect` calls
@@ -749,6 +757,11 @@ class Simulation {
   const rhi::ComputePipeline& PassPipeline(pass::Pipe p) const;
 
   PassTimer* passTimer_ = nullptr;  // not owned; measurement harness only
+  // EncodeDerived (async compute): the last EncodeTick's record context, and
+  // "record without the pass timer" while an async encoder is being recorded.
+  pass::RecordCtx lastTickCx_{};
+  bool lastTickCxValid_ = false;
+  bool recordNoTimer_ = false;
 
   World* world_ = nullptr;
   rhi::Device device_;
@@ -835,6 +848,8 @@ class Simulation {
   rhi::Buffer draftBuf_, draftMetaBuf_, draftArgsBuf_;
   // The CA's air mask (pass_table.def caMask): 128 words per chunk slot.
   rhi::Buffer caMaskBuf_, caWindBuf_;
+  // pass::Buf::RenderUBOTick (docs/PLAN_async_compute.md).
+  rhi::Buffer renderUBOTickBuf_;
   bool draftOn_ = false, draftRebuild_ = false, draftForce_ = true, draftValid_ = false;
   bool draftLastOn_ = false;
   int32_t draftOrigin_[3] = {0, 0, 0};

@@ -50,10 +50,13 @@
 @group(0) @binding(7) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(12) var<storage, read> dirtyList : array<u32>;
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
-// The key light, for P1's off-screen injection (below): the same RenderParams
-// the sim group already carries for sim_pick.wgsl, so a compute pass on the
-// tick table can ask which way the sun points without a second uniform.
-@group(0) @binding(10) var<uniform> R : RenderParams;
+// The key light, for P1's off-screen injection (below). NOT RenderUBO (binding
+// 10, which sim_pick.wgsl reads): the TICK'S COPY of it, made by the
+// copy_renderUBOTick row at the end of the tick (docs/PLAN_async_compute.md).
+// Same bytes this pass used to read — RenderUBO as of that point in the
+// stream — but a different buffer, so the next frame's RenderUBO upload cannot
+// race this pass when it runs on the async compute queue.
+@group(0) @binding(50) var<uniform> RT : RenderParams;
 @group(0) @binding(27) var<storage, read_write> openness    : array<u32>;
 @group(0) @binding(28) var<storage, read_write> opennessGen : array<u32>;
 // P1 (docs/PLAN_gi.md §3; common.wgsl IRRADIANCE GRID): the same walk that
@@ -258,7 +261,7 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
 // yesterday's sun".
 fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
   let n = openFaceNormal(face);
-  let L = keyLightDirP(R);
+  let L = keyLightDirP(RT);
   let half = f32(SUBOCC_BLOCK) * 0.5;
   let centre = vec3f(blockMin) + vec3f(half);
   // The first blocker voxel under the face centre, stepping inward from the
@@ -319,7 +322,7 @@ fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
     // `open` is the openness this same visit just measured for the face.
     lit = shadowLiftCap(lit, open);
   }
-  return vec4f(irrSample(albedo, n, L, keyLightColorP(R), lit, emis), 1.0);
+  return vec4f(irrSample(albedo, n, L, keyLightColorP(RT), lit, emis), 1.0);
 }
 
 // ---- the touch plane (common.wgsl OPEN_TOUCH_BASE) -------------------------
