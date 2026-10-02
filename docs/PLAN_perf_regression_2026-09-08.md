@@ -2,6 +2,13 @@
 
 **Date:** 2026-09-08. **Tree:** main `3098128`. **Status:** measurement +
 diagnosis, no code changed.
+**Audit 2026-10-02 (current state of §7, checked against code):** P1's intent
+(sky chunks stop paying the per-column worldgen) is met by a different shape —
+the `cols` column-cache pre-pass and its block header (`CCH_TOP`, read once per
+chunk in `worldgen.wgsl` genChunk; map overhaul P4 `0e9b59e`, 2026-09-26). P4 is
+still open: `sim_glow.wgsl`'s backstop still walks `TUNE_GLOW_CHUNKS` slots every
+tick unconditionally. P6's fine-march work went on as the raymarch perf rounds
+(ray-start map `b0ba179`, 2026-09-28). P0a/P2/P3/P5 not re-audited here.
 **Question the owner asked:** "performance is pretty bad and fps is very
 stuttery, and low compared to a few days ago."
 

@@ -468,6 +468,9 @@ same voxel count, same holes, same hp. Ground-item lattices persist in
   geometric occlusion + material identity only.
 - Mob AI that chooses to wear/draw (the API supports it; nothing calls it).
 - `sheath_back` visual, `held_left`, shields — schema anticipates, no code.
+  *(2026-10-02 audit: `held_left` now EXISTS — dual wielding, main `9fc8a13`,
+  2026-09-26, derives a mirrored `held_left` socket in `mob.cpp`. `sheath_back`
+  and shields still have no code.)*
 - The remaining 4 slot contents (shoulders/hands/legs/trinket) — schema
   accepts kinds; content later.
 - Reconciling the two diverged mains (owner).

@@ -280,12 +280,14 @@ are the OTHER half of this frame; they are not additive with `nomicro`.
    `cachesub2` measured inside the noise and stays at 4. What is left of the
    shadow ray is the per-frame resolve of every visible patch
    (`shadowCache` node 0.6–1.5 ms), not its granularity.
-2. **Async compute queue for the sim** (ROADMAP_scale.md §3.6, never started).
+2. **Async compute queue for the sim** (ROADMAP_scale.md §3.6, never started — still true 2026-10-02: `src/gpu/` has one queue).
    Hides most of the ~13 ms tick side under the raymarch in flight; zero win
    standing still. Large: the barrier generator in `vk_record.cpp` is
    single-queue, and the render needs a stable read of sim buffers (timeline
    semaphores or a double buffer). RESEARCH_streaming_hitch.md R5 scopes it.
-3. **Worldgen column redundancy across the vertical stack.** `genChunk`
+3. **LANDED 2026-09-26 (audit 2026-10-02): the `cols` column-cache entry in
+   `worldgen.wgsl` (map overhaul P4, `0e9b59e`) evaluates each column once and
+   `main`/`list` read it back.** Original item: **Worldgen column redundancy across the vertical stack.** `genChunk`
    (worldgen.wgsl ~4389) computes `genColumn` once per (x,z) per CHUNK, and an
    X/Z shift plane is 32 chunks tall, so every column is rebuilt 32 times. The
    column half is the documented largest term (the fern-footprint second

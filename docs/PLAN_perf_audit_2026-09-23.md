@@ -1,5 +1,10 @@
 # Perf / tech-debt audit — implementation packages (2026-09-23)
 
+**Status (2026-10-02 audit): LANDED on main 2026-09-24** — P1–P7 merged into
+`perf-audit-int` (seven worktree merges, integration fix `5031f41`) and that onto
+main at `87fee29`. Items the packages marked "analysis only, no code" stay as
+written below.
+
 Orchestrated: one Opus worktree agent per package, the orchestrator reviews diffs,
 merges onto an integration branch, rebaselines ONCE at the end. Findings came from a
 read-only audit; every line number is from code reading at main `baa2e1b` and may

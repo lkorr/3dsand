@@ -1,5 +1,14 @@
 # PLAN: one rule, one place (rule-unification program, 2026-09-24)
 
+**Status (2026-10-02 audit): COMPLETE, 2026-09-24.** Wave 1 (W1-A `f9a32a9`,
+W1-B1 `c2b93d4`, W1-B2 `99f9d95`, W1-D `bb25b61`, W1-E `2bdaaea`, W1-F
+`7c5df1b`) and every wave-2 package (W2-G `2a4b68f`, W2-H `c881f05`, W2-I
+`c6d53a3`, W2-J1 `8dda85c`, W2-J2 `65804e3`, W2-K `874e9c2`, W2-L `bc76c8c`,
+W2-M `127396b`, W2-N `3c56f7c`, W2-O `7fc6887`, W2-Q `3941ac0`, W2-R `930ef03`)
+are on main; hash pinned `ec0b915`. W2-P was DROPPED by owner decision (see
+W2-Q). The "Wave 2 (remaining)" list at the end is the launch list, kept as
+history.
+
 Orchestrated from the main checkout; each package is one Opus worktree agent.
 Source: the six-domain audit of 2026-09-24 (duplicated rules / parallel entity
 kinds). The corpse refactor (`docs/PLAN_corpse_is_a_mob.md`, branch
@@ -503,7 +512,7 @@ loot, kit-instance, npc-block, damage-sources (+ a player contact-damage arm),
 mob, and a new `creature-reach` gate that applies each world effect once and
 asserts it reached an NPC AND the local avatar.
 
-## Wave 2 (remaining; launched as dependencies land)
+## Wave 2 (remaining; launched as dependencies land) — ALL LANDED 2026-09-24 except W2-P (dropped); see the status line at the top
 - W2-R stamp-skip sleep hole (above): make "matched but not fired" keep its
   chunk awake regardless of the substep stamp gate; gate that reproduces the
   stranded-cell case.

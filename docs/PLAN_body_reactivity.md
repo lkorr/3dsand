@@ -1,6 +1,13 @@
 # Per-voxel body reactivity — burning, dissolving, and the road to armour
 
-Status: **research / roadmap. No code landed.** Written 2026-08-27 against HEAD
+**Status (2026-10-02 audit): LANDED.** Packages A+B+C (`MicroBodyPoke`,
+`MobSystem::BurnLimbs`, per-voxel acid dissolution) in main `124c484`
+(2026-08-27); package D as `docs/PLAN_items_equipment.md` (`010feba`,
+2026-08-30); §10's combustion clock 2026-08-30. Gates `mob-burn`,
+`armor-react`, `acid-coat` in `src/test/selftest.cpp`. The rest of this file is
+the original roadmap, kept as history.
+
+Original status: **research / roadmap. No code landed.** Written 2026-08-27 against HEAD
 (`7b5e602`). Numbers below are measured from the repo, not estimated, unless
 marked otherwise.
 

@@ -5,6 +5,11 @@
 "re-light where matter changed" is not enough for us). **Written:** 2026-09-01 against
 `73bc9c6`. Each phase is judged by eye AND by `--render-budget` before the next starts.
 
+**Status (2026-10-02 audit): P0–P3 LANDED** (2026-09-02 on `lin-followups`,
+merged to main — P1 is `299d6f1`; DESIGN.md §9.y is binding), plus §8's gather
+cache and refresh skip (2026-09-05). §6 "Later" (rough reflections, a
+reprojection history buffer, sparse `irradiance`) is not started.
+
 ## 0. Why (and the look test)
 
 Shading today is `albedo * face * (ambientAt(n) * ao + sun)` (`raymarch.wgsl:6715`).

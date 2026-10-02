@@ -1,6 +1,11 @@
 # Plan: voxel art pipeline, articulated mobs, and a laser cutting tool
 
-Status: proposal, not yet reflected in DESIGN.md. Whoever implements this owns
+**Status (2026-10-02 audit): LANDED** — milestones A/B/C (`.vox` loader,
+prefabs, articulated mobs, laser) in main `3e7d499` (v0.5, 2026-08-19); direct
+body damage `aa78e60` (2026-08-20). The mob system has grown far past this plan
+(DESIGN.md is the truth). Kept as history.
+
+Original status: proposal, not yet reflected in DESIGN.md. Whoever implements this owns
 updating DESIGN.md in the same commits (CLAUDE.md: a change that contradicts
 DESIGN.md must update it or not happen).
 

@@ -311,6 +311,13 @@ Details:
 
 ALL PACKAGES LANDED on main: S1+S2+S3 44a095c, S4+S5a 803d8cb, S2b 4c3af28, S5b f773ab6.
 Open follow-ups: neighbour-wake modified bit (cause 2), pond-bed stain at gen (cause 3, design call), DBRS per-body API (debris owner), parked NPCs do not tick, client-side unpark via host handoff, ground items do not park, stable authored NPC ids (npc:<name>), shipped-game policy for a changed worldgen fingerprint, pruning pristine chunks written by pre-S1 saves.
+*(2026-10-02 audit: **stable authored NPC ids are DONE** — a mob spawned from an
+`npc` reference carries `Mob::RefId()` and saves/parking key on it (world editor
+P1, `b1c4454`, 2026-09-29; `src/world/refs.h`). The rest re-checked against the
+code and still open — `persist.h`'s `MobParking` still says parked creatures do
+not tick and ITMS does not park; DESIGN.md §3 still carries causes 2 and 3 as
+unbuilt; the DBRS per-body API does not exist (see the ITMS/DBRS duplication
+fix below).)*
 
 **2026-10-01: ground-item duplication FIXED** (ITMS v8, gate `save-items`). DBRS
 saved every item's body and the ITMS load re-dropped each item as a second one,

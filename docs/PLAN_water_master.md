@@ -7,6 +7,13 @@
 > component sections below are the design those milestones were built from and
 > are unchanged except where a §1.x block says otherwise.
 >
+> **2026-10-02 audit:** `assets/materials/tuning.json` has shipped
+> `sim.waterBodyMode: 1` since 2026-09-14 (the `tuning_params.def` default is
+> still 0), so the body system runs in the game. `docs/PLAN_water_relevel.md`
+> (W1/W-D/W2/W3, main `ba4de39`/`fcc639b`/`d0ce910`/`fef39cb`, 2026-09-14) is
+> built on top of it and closes §1.5's "a basin dug from FLAT GROUND is still
+> not a basin" item (W-D discovery). `sim.currentMode` still ships at 0.
+>
 > **What remains open** is listed at the end of §1.5. The §5 conveyor (sleeping
 > rivers) is a NAMED NON-GOAL and stays one: it is a real component, it is not in
 > this plan, and it should be built from its own document.
@@ -886,7 +893,7 @@ Two more, both about the FIXTURE rather than the code, and both worth keeping:
   a development tap sized past the surface it drains. The exact fix is a
   proportional transfer at the child's adoption and it needs both bodies'
   reduces on one tick.
-* **A basin dug from FLAT GROUND is still not a basin.** The registry knows two
+* **CLOSED 2026-09-14 by PLAN_water_relevel W-D discovery (`fcc639b`).** ~~**A basin dug from FLAT GROUND is still not a basin.**~~ The registry knows two
   kinds — the authored pools and `pondAt`'s tarns — and component 10 as built
   re-derives the container of a basin the player MODIFIED, which is what §10
   scopes it to ("a mutation touched a rim chunk of a LABELLED basin"). A hole dug

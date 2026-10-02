@@ -1,6 +1,6 @@
 # PLAN: one strike, three populations — struck matter
 
-Status 2026-09-20: **A, B, C and D landed** (uncommitted; see the board).
+Status 2026-09-20: **A, B, C and D landed** — committed to main as `1e55977` (2026-09-20; audit 2026-10-02).
 
 What a blow does is now authored once and answered by whatever it lands on. The
 five divergences this plan opened with are closed, and closing the last of them

@@ -1,6 +1,9 @@
 # PLAN: gas particles — voxel smoke inside the window, particle smoke outside it
 
-Status: **P1 stage 1 COMPLETE on branch `gas-stage1`**, rebased onto chunk
+**Status (2026-10-02 audit): P0, P1 (stage 1) and stage 1b are ON MAIN** (rebaselined
+`c747298`, crossfade `ec5769a`, 2026-09-09). P2 (stage 2) is still unstarted.
+
+Original status: **P1 stage 1 COMPLETE on branch `gas-stage1`**, rebased onto chunk
 tickets P0 (`e808931`) and finished with the one batched `common.wgsl` edit
 §2.2 always called for. The gas motion model — `gasRndK`, `windLateralStartK`,
 `windAxisFrac`, `gasLateralRot`, `GasIntent`, `gasIntentK`, `gasLadderStep` and

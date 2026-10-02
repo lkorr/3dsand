@@ -1,5 +1,11 @@
 # PLAN: the spell graph — lanes in the grammar, a tree on the page
 
+**Status (2026-10-02 audit): phases 1–3 LANDED** on main 2026-09-21 —
+lanes/`end` (package A), `src/game/spellgraph.{h,cpp}` + gate `spell-graph`
+(`92578a6`), the page (`src/ui/spellgraph_ui.cpp`, `cbd8b09`), reworked since
+(split-as-junction 2026-09-22, drag-and-drop `2e04262` 2026-10-01). Phase 4
+(HUD mini-graph, optional) is not built.
+
 2026-09-21. Design exploration, not yet scheduled. Read after DESIGN.md §8
 ("The spell system") and `docs/PLAN_magic_grammar.md`; this plan changes one
 rule there and adds a view over the rest.

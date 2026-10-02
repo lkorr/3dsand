@@ -1,6 +1,13 @@
 # PLAN: damage KINDS, natural weapons, unarmed attacks, the zombie's lunge + bite
 
-Status: APPROVED 2026-09-15. Orchestrated; packages land via worktree merges
+**Status (2026-10-02 audit): LANDED 2026-09-15..17** — `src/game/impact.h`
+(`c267617`), natural weapons / bite / lunge / player unarmed, `--shot-strike`
+(`src/main.cpp`), gates `impact-blunt`, `impact-armor`, `impact-fist`,
+`bite-rot`, `unarmed-attack`, `lunge`, `bite-target`, `player-unarmed`,
+`npc-styles` in `src/test/selftest.cpp`. Later reworked by rule unification
+W2-H (one damage event, `c881f05`).
+
+Original status: APPROVED 2026-09-15. Orchestrated; packages land via worktree merges
 off `a8a262a` on `lighting-cave-daylight`. Owner of this document: the
 orchestrator session. Workers: read the whole thing before touching a file.
 

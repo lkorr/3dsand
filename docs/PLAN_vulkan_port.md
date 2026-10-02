@@ -1,6 +1,14 @@
 # PLAN: WebGPU/Dawn → Vulkan port
 
-Status: proposed 2026-08-22 (phase 0 complete). Companion docs:
+**Status (2026-10-02 audit): phases 0–7 COMPLETE.** The engine is Vulkan-only
+since 2026-08-22 (`src/gpu/rhi_vk.cpp`, `vk_record.cpp`; Dawn kept for Tint
+only, `--backend dawn` refuses); phase 7 (software page table, not hardware
+sparse — see `docs/PLAN_page_table.md`) fully closed at `a5359a4` and paged
+streaming landed `d3dcb76` (2026-08-23). **Open:** phase 8 (async
+compute/transfer queues, subgroup ops in occupancy/compaction, explicit heap
+placement — none present in `src/gpu/`) and the phase-7 "DEFERRED follow-ups"
+list (no ring-starvation or low-pool abort gate exists in `selftest.cpp`).
+Originally: proposed 2026-08-22 (phase 0 complete). Companion docs:
 `docs/vulkan_pass_map.md` (the measured pass/resource dependency map),
 `docs/vulkan_barrier_graph.md` (to be authored in phase 1).
 

@@ -6,6 +6,14 @@ path + readbacks), one hand verification of the mutate-kernel race, and a survey
 of how shipped games of this type do it. Companion plan of record:
 `docs/PLAN_multiplayer_now.md` (the work that must happen before M9).
 
+**Status (2026-10-02 audit):** §6 "Now" was built as `PLAN_multiplayer_now.md`
+N1–N6 (main `54fe241`, 2026-09-20) and the core of §6 "Later" as
+`PLAN_multiplayer_m9.md` M9.1–M9.5 (transport, op exchange, per-chunk hash +
+resync, entity ownership, host chunk persistence/late join; 2026-09-21). The
+finding tables below are the 2026-09-10 state; individual "Later" items
+(hardening X1–X5, L9 hash over particle/fluid/gas buffers, Steam/WebRTC) were
+not re-audited here.
+
 **Verdict in one paragraph.** Nothing in the tree makes multiplayer impossible.
 The foundational bets hold: the GPU CA is integer-only with counter RNG and an
 order-independent hash, worldgen is a pure function of seed and world chunk,

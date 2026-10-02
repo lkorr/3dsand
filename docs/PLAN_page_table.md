@@ -4,8 +4,12 @@ Phase 7 of `docs/PLAN_vulkan_port.md`, rewritten per `docs/ROADMAP_scale.md` §1
 (user-reviewed): a **flat u32 software page table with `EMPTY` and
 `UNIFORM(material)` sentinels**, not `VK_KHR_sparse_binding`, not an octree.
 
-Status: design, 2026-08-22, **revision 2 — post adversarial review**. No code
-has been written. Companion docs: `docs/vulkan_barrier_graph.md` (the barrier
+**Status (2026-10-02 audit): LANDED.** Paged residency is the default
+(`src/sim/pagetable.{h,cpp}`; main `d3dcb76`, 2026-08-23), the JITTER sentinel
+(§9) merged at `f65aa2a` the same day, and `kPoolPages` is now derived
+(`kNumSlots + kPageRetireCeiling`, `world.h`; originally `kNumChunks + …` 2026-08-30). The body below is the
+design as reviewed (2026-08-22, revision 2 — post adversarial review) and is
+kept as history; §9 is as-built. Companion docs: `docs/vulkan_barrier_graph.md` (the barrier
 design this must extend), `docs/vulkan_pass_map.md` (the buffer inventory),
 `src/sim/pass_table.def` (the table this must add `uses` entries to).
 
@@ -3087,7 +3091,9 @@ fills, and a `pass_table.def` comment records the two new buffers.
    Tick-path uniformity discovery deferred pending
    commit 0's measurement; UNIFORM implemented only where the CPU already has
    the words. If the 2,338 full chunks turn out mostly single-word, that flips.
-3. **§3.7, `kPoolPages = 8192` (128 MiB, 1.65×).** Sized against one seed. Under
+3. **CLOSED (2026-08-30): `kPoolPages` is no longer a literal — it is derived
+   as `kNumSlots + kPageRetireCeiling` in `world.h` (see CLAUDE.md "Critical
+   invariants").** Original question: **§3.7, `kPoolPages = 8192` (128 MiB, 1.65×).** Sized against one seed. Under
    the fatal-abort policy this number is now safety-critical rather than
    advisory: too tight is a crash, too loose is wasted VRAM. The
    daylight-boundary and low-pool gates probe it, but the honest answer needs

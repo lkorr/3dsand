@@ -1,6 +1,12 @@
 # Alchemy chemistry: reactions in the bench, gases, stoppers, solutes — orchestration plan
 
-Status 2026-09-27: PLAN OF RECORD. Integration branch **`alchemy-chem`**
+**Status (2026-10-02 audit): LANDED on main 2026-09-27** (`alchemy-chem` is
+merged; through `713dacf`, rehashed `5b286c7`): packages A–E plus the
+alchemist's shelf, the solute seam (package G, `048cd51`) and look — gates
+`chem-*`, `heal-restore`/`heal-wound`, `solute-*` in `src/test/selftest.cpp`.
+The review and its "Not fixed, ranked" list are `docs/AUDIT_alchemy_chemistry.md`.
+
+Original status 2026-09-27: PLAN OF RECORD. Integration branch **`alchemy-chem`**
 (worktree `C:/Users/Luke/Desktop/programming/sv-chem`). Orchestrated; each
 package below is implemented by one worktree agent and merged by the
 orchestrator. This document IS the agents' brief — read all of it, then your

@@ -1,6 +1,7 @@
 # RESEARCH: flight hitches — the residency shift is a per-tick GPU fence
 
-**Date:** 2026-09-03. **Status:** research + measurement, no code changed.
+**Date:** 2026-09-03. **Status:** research + measurement, no code changed — then
+implemented: the `streaming-smooth` packages below are on main (audit 2026-10-02).
 **Question:** why does framerate collapse and stutter while flying, and what
 would make window shifts smooth (no stall) or at least spread across ticks?
 
@@ -47,7 +48,9 @@ tail is the RAYMARCH (68% of the worst-5% delta in `surface-sprint`; the
 owner's live game renders at 17.7 ms) — a renderer item, not streaming;
 (2) `worldgenList` 4.2 ms median per plane is 98% of the remaining streaming
 GPU bill — P4-G's "do not generate the sky" (needs a CPU mirror of worldgen's
-column top) is the lever, not spreading; (3) at a flight peak the resident set
+column top) is the lever, not spreading [2026-10-02 audit: met another way —
+the `cols` column-cache pre-pass, whose block header gives genChunk a one-load
+sky test, map overhaul P4 `0e9b59e`, 2026-09-26]; (3) at a flight peak the resident set
 is dirty 53% + ring 14% — the mirror's N26 dilation, not the free path, is the
 residency lever now; (4) paged vs dense hash SEQUENCES differ across shifts
 (P4-G's fold; P5-I bisecting); (5) the per-shift `demote` CPU term rose from

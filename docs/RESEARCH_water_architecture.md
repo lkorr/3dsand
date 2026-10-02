@@ -1,6 +1,13 @@
 # RESEARCH: water architecture — the bulk-transport question
 
-**Status: research + design conversation, 2026-08-24. Nothing implemented, nothing
+**Status (2026-10-02 audit): DECIDED and BUILT.** Question 2 was answered NO —
+`PLAN_fluid_overhaul.md` WP5 landed RE-SCOPED 2026-08-25 (the CA liquid rules were
+kept; `sim.fluidExciteMode` = 1, so the MPM handles excited water and the CA settled
+water), and bulk transport for still water went to the water-body system
+(`PLAN_water_master.md` M1–M5, 2026-08-29; `waterBodyMode` 1 since 2026-09-14). The
+body below is the 2026-08-24 conversation, kept as history.
+
+**Original status: research + design conversation, 2026-08-24. Nothing implemented, nothing
 decided. Written as a handoff for further consultation on an architectural
 decision that is larger than any single work package.** Read CLAUDE.md (the three
 inviolable rules) and DESIGN.md §4–§5 first. Every file:line and commit reference

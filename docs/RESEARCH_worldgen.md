@@ -1,6 +1,12 @@
 # RESEARCH: terrain and world generation for a 10 cm falling-sand voxel world
 
-Status: research only. No engine code changed, no hash moved. This is a decision
+**Status (2026-10-02 audit): acted on.** The worldgen pass this document fed was
+`docs/PLAN_terrain_overhaul.md` (packages A–D landed; its §1 lists six places this
+document is wrong — the revision-3 note that plan asked for was never written here),
+then `PLAN_world_map.md`, `PLAN_environment_truth.md` and `PLAN_map_overhaul.md`
+(the authored map). Its §8 finite-map recommendation is what shipped.
+
+Original status: research only. No engine code changed, no hash moved. This is a decision
 document for the next worldgen pass, written against `main` @ `2d35fd3`.
 
 Revision 2 (2026-08-26): every number in revision 1 was re-derived from source.

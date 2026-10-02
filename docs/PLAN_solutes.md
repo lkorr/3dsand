@@ -19,9 +19,13 @@ record disagree). What differs from the plan below:
   when the stream lands, applied by sim_mutate.wgsl `solPour`, precipitating
   as powder where there is no solvent). The bench evaluates concentration
   conditions against each particle's own mass.
-- **Not built:** render tint / glow (§4.3; the species table carries the
-  numbers, no shader reads them), multigrid (§3.4.1; the strides were enough at
-  pond scale), mixing of two species in one cell.
+- **Not built:** ~~render tint / glow (§4.3; the species table carries the
+  numbers, no shader reads them)~~ — BUILT after this line was written
+  (`raymarch.wgsl` "DISSOLVED MATTER TINTS AND LIGHTS ITS LIQUID", gate
+  `solute-look`, main `713dacf`, 2026-09-27; audit 2026-10-02), multigrid
+  (§3.4.1; the strides were enough at pond scale), mixing of two species in one
+  cell. P4 (reservoir + excess) is no longer blocked — `waterBodyMode=1` has
+  shipped in `tuning.json` since 2026-09-14 — but is unbuilt.
 
 Gates: `solute`, `solute-dilute`, `solute-evap`, `solute-seam`,
 `solute-electrolysis`, `solute-vessel`, `solute-pour`, `solute-payout` (all in
