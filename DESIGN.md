@@ -278,10 +278,16 @@ of freezing; they are not a bigger window.
   directly. The hit returns as a level-1 `FarHit` (`FAR_HIT_TICKET`) and takes
   the far path's shading: GEOMETRY at full voxel resolution from any distance,
   LIGHTING at the cascade's (no shadow cache, cascade AO and shadow march).
-- **Re-centring (P4).** Shell chunks dirty on one face → the box steps one chunk
-  toward it, at most once per `kTicketRecentreTicks` (60): the leaving plane and
-  the entering plane share their 25 slots (mod 5), so it is a window shift at
-  the box's scale — copy out, move the table, refill — recorded as one TicketOp.
+- **Re-centring (P4).** Matter crossing into the shell (a shell chunk's
+  snapshot occupancy changed, accumulated between re-centres — not its dirty
+  flag, which the fan-out sets without moving anything) → the box steps one
+  chunk toward the face with the most such chunks, at most once per
+  `kTicketRecentreTicks` (60): the leaving plane and the entering plane share
+  their 25 slots (mod 5), so it is a window shift at the box's scale — copy
+  out, move the table, refill — recorded as one TicketOp. Refused (counted,
+  `recentreRefused`) if it would touch the window or a live box, or turn an
+  active interior plane into shell; a pending shell hit holds the idle release
+  until Recentre has acted or refused.
 - **Rule 2.** `sleep` asserts `awake <= 32 AND tickets == 0` at rest, and runs
   the ticket step to get there. Observable in the F1 Stats section and in
   `build/last_run.json`'s `tickets` block. Gates: `ticket-settle`,

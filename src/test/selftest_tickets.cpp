@@ -23,6 +23,7 @@
 
 #include "game/camera.h"
 #include "game/session.h"
+#include "gpu/passtimer.h"
 #include "gpu/resources.h"
 #include "sim/chunkstore.h"
 #include "sim/stream.h"
@@ -164,6 +165,43 @@ struct SettleRun {
   uint32_t colTopMat = 0;
 };
 
+// ---- MEASUREMENT ONLY: SANDVOX_TICKET_COST=1 ---------------------------------
+// GPU time per tick (every timed pass, summed) over three windows of the
+// ticket-settle run: (a) the settled window with NO ticket, (b) a live ticket
+// whose interior is asleep, (c) the ticket while the pour settles. Off by
+// default: a timer changes no dispatch and no hash, but a per-tick WaitIdle +
+// readback is not what the gate measures otherwise.
+struct TicketCost {
+  bool on = false;
+  bool init = false;
+  ::PassTimer timer;
+  uint64_t ns[3] = {0, 0, 0};
+  uint32_t ticks[3] = {0, 0, 0};
+  uint64_t active[3] = {0, 0, 0};  // summed snapshot active chunks
+};
+TicketCost& Cost() {
+  static TicketCost tc;
+  return tc;
+}
+template <class F>
+void TimedTick(Ctx& c, int phase, F&& tickFn) {
+  TicketCost& tc = Cost();
+  if (!tc.on || phase < 0) { tickFn(); return; }
+  c.sim.SetPassTimer(&tc.timer);
+  SetSubmitTickPassTimer(&tc.timer);
+  tc.timer.ResetStats();
+  tickFn();
+  c.ctx.WaitIdle();
+  tc.timer.Collect(c.ctx);
+  c.sim.SetPassTimer(nullptr);
+  SetSubmitTickPassTimer(nullptr);
+  uint64_t ns = 0;
+  for (const auto& st : tc.timer.Stats()) ns += st.totalNs;
+  tc.ns[phase] += ns;
+  tc.ticks[phase]++;
+  tc.active[phase] += c.world.Snap().activeChunks;
+}
+
 bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
   const int mSand = MatId(c, "sand");
   if (mSand < 0) { why = "no `sand` material"; return false; }
@@ -181,6 +219,19 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
 
   uint32_t t = 81000;
   support::TickCursor tick{c, t, R.centre};
+  // MEASUREMENT (SANDVOX_TICKET_COST=1): let the window settle, then time the
+  // floor with no ticket at all. Both runs do it, so the twice-run compare
+  // still compares like with like.
+  {
+    TicketCost& tc = Cost();
+    const char* e = std::getenv("SANDVOX_TICKET_COST");
+    tc.on = e && e[0] == '1';
+    if (tc.on && !tc.init) tc.init = tc.timer.Init(c.ctx, 64), tc.on = tc.init;
+    if (tc.on) {
+      for (int i = 0; i < 400; i++) tick();
+      for (int i = 0; i < 60; i++) TimedTick(c, 0, [&] { tick(); });
+    }
+  }
   c.stream.TicketSet().Request(R.centre, TicketReason::Gate, t + 1);
   tick();  // the ticket step at the head of this tick activates it
   R.ticket = c.stream.TicketSet().TicketHolding(R.centre);
@@ -266,7 +317,11 @@ bool RunSettle(Ctx& c, SettleRun& R, std::string& why) {
 
   const int kTicks = (int)BaselineNumber("ticketSettle.ticks", 200);
   for (int i = 1; i <= kTicks; i++) {
-    tick();
+    // MEASUREMENT phases: (c) the pour settling, (b) the asleep live ticket
+    // before its first possible re-centre (activation + kTicketRecentreTicks).
+    const int phase = i <= 20 ? 2
+                      : (R.asleepAt >= 0 && i > R.asleepAt + 1 && i < 55) ? 1 : -1;
+    TimedTick(c, phase, [&] { tick(); });
     const Tickets::State st = c.stream.TicketSet().StateOf(R.ticket);
     if (st == Tickets::State::Live && R.asleepAt < 0 && ActiveAsleep(c, R.ticket, pourTick)) {
       R.asleepAt = i;
@@ -389,6 +444,16 @@ Status GateTicketSettle(Ctx& c, std::string& detail) {
                      A.pourTick, A.asleepSnapTick, (unsigned long long)A.recentred,
                      (unsigned long long)A.relIdle, (unsigned long long)A.relTimeout,
                      c.stream.TicketSet().LastRecentreNote().c_str());
+  if (Cost().on) {
+    const TicketCost& tc = Cost();
+    const char* name[3] = {"no ticket, window settled", "1 live ticket, interior asleep",
+                           "1 live ticket, pour settling"};
+    detail += " | GPU COST (SANDVOX_TICKET_COST, both runs):";
+    for (int k = 0; k < 3; k++)
+      detail += Format(" %s %.3f ms/tick over %u ticks (%.1f active chunks);", name[k],
+                       tc.ticks[k] ? (double)tc.ns[k] / 1e6 / tc.ticks[k] : 0.0, tc.ticks[k],
+                       tc.ticks[k] ? (double)tc.active[k] / tc.ticks[k] : 0.0);
+  }
   std::printf("ticket-settle: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

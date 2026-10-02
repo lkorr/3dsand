@@ -454,6 +454,21 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
    into the shell, but a plume rising out of the top of the box is exactly the
    case tickets do not cover (gas that LEAVES belongs to the gas particles).
 
+### Found by the gates (P1-P4)
+
+1. **The TICKET_BOUND selection read the binding declaration too literally.**
+   `BodyResolvesTickets` (resources.cpp; the same rule in `check_shaders.sh`
+   and `check_pass_table.py`) looked for `> pageTable`; worldgen, sim_step,
+   sim_particle, sim_mutate, sim_explode and the rest column-align their
+   bindings (`>   pageTable`), so they compiled the STUB and every ticket
+   chunk was generated as its window alias (solid stone 50 cells above the
+   real ground). Now: `>` followed by any run of spaces/tabs.
+2. **`sim_mutate`'s cell ops and `sim_solute`'s scoop bounded the cell index
+   by `WORLD_N^3`**, so every op into a ticket slot was dropped (a P0 audit
+   miss). Bound is `NUM_SLOTS * CHUNK_VOL`.
+3. **Far-landing re-throws are drained before the `particlesActive` latch** in
+   `PhaseL`, so a re-thrown particle runs the tick it is spawned.
+
 ### P4
 
 1. **A ticket hit is shaded by the FAR path.** `traceTickets` (raymarch.wgsl)
@@ -473,11 +488,27 @@ keeps rules 1–3 provable. The code comments beside each say the same thing.
 4. **Re-centring is a box shift**, not "release + activate": the leaving and
    entering planes share their 25 slots (mod 5), so the leaving plane is copied
    out as a two-phase keep batch (exactly as a release) and the same slots are
-   refilled — 25 chunks instead of 125, recorded as one `kRecentre` op. The
-   face is the one with the most dirty shell chunks in the latest published
-   snapshot (ties: lower axis, then the negative side), at most once per
-   `kTicketRecentreTicks` (60); a step that would touch the window or another
-   live box is not taken.
+   refilled — 25 chunks instead of 125, recorded as one `kRecentre` op.
+   **What counts as "activity in the shell" is matter crossing into it**,
+   measured as a change of the shell chunk's non-air count (snapshot
+   `occupancy`) and accumulated per chunk between re-centres (`shellHit`).
+   Not a dirty flag: an interior write on a face cell marks the neighbouring
+   shell dirty through the fan-out without moving anything into it, and an
+   arrival leaves the shell dirty for one tick, so "dirty in the latest
+   snapshot" missed every arrival that fell inside the cooldown (measured:
+   `ticket-render`'s sand reached the bottom shell at ~+20 and the box never
+   moved). The face is the one with the most hit shell chunks (ties: lower
+   axis, then the negative side), at most once per `kTicketRecentreTicks`
+   (60). Three refusals, each counted in `recentreRefused`: a step that would
+   touch the window, one that would touch another live box, and **one that
+   would turn an ACTIVE interior plane into shell** (the plane at offset 1
+   stepping +, n-2 stepping -, dirty in the latest snapshot) — without that
+   rule a decaying ember slab was chased out of its own box by a ripple at
+   the far face (`ticket-decay`, 4 re-centres, slab frozen in the shell). A
+   ticket with a pending shell hit does not idle out until Recentre has acted
+   on it or refused it (at most `kTicketRecentreTicks`), so the release lag
+   after a re-centre is idle + latency from the re-centre, not from the
+   moment the interior slept; `ticket-settle` measures it that way.
 5. **A fifth gate, `ticket-render`**, carries both P4 claims: a one-voxel
    column in a ticket changes the pixel it projects to and not the one three
    column-widths beside it (the cascade left empty, so only `traceTickets` can

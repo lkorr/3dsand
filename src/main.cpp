@@ -6199,7 +6199,8 @@ int main(int argc, char** argv) {
   // the TimestampQuery device feature (per-pass GPU timings).
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
                 /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
-                    budgetArms || telemetryEnabled || g_harnessFrames > 0,
+                    budgetArms || telemetryEnabled || g_harnessFrames > 0 ||
+                    std::getenv("SANDVOX_TICKET_COST") != nullptr,
                 backend, vkValidation,
                 sledgehammer))
     return 1;
