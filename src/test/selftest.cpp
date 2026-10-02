@@ -360,6 +360,7 @@ const char* const kOrder[] = {
     // with their own worldgen and a pinned climate, like oil-fire; heat-ambient
     // runs a real (one-minute) day and restores the tuning it changes.
     "heat-idle", "heat-melt", "heat-ignite", "heat-freeze", "heat-ambient", "heat-bound", "heat-plume",
+    "heat-live",
     // Passable plants hold nothing up: sand, a lone chip and a grid particle
     // each crush the bramble they land on. Same sealed-box fixture.
     "plant-crush",

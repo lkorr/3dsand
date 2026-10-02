@@ -1782,8 +1782,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   // The temperature layer's per-tick params (mode, radius, snowline, climate,
   // the window's column biomes): a pure function of tuning, map, seed and
-  // origin -- the same inputs a replay feeds this function.
-  sim.PrepareHeat(ctx.queue, tp.origin, seed);
+  // origin -- the same inputs a replay feeds this function. True on a tick a
+  // live heat knob moved (F1 Temperature): the wake below then fires too.
+  const bool heatKnobsMoved = sim.PrepareHeat(ctx.queue, tp.origin, seed);
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
   if (!exps.empty())
@@ -1915,8 +1916,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                          (uint32_t)dtun.dayNight.freezePhase);
     bool wasDay = DaylightStrengthCpu(prevPhase) > 0;
     bool isDay = DaylightStrengthCpu(tp.dayPhase) > 0;
-    if (wasDay != isDay) sim.EncodeWakeAll(ctx.queue);
+    if (wasDay != isDay || heatKnobsMoved) sim.EncodeWakeAll(ctx.queue);
+  } else if (heatKnobsMoved) {
+    sim.EncodeWakeAll(ctx.queue);
   }
+  // ^ A LIVE HEAT KNOB MOVED: the same wake, for the same reason as the
+  // daylight one -- heatBegin re-targets every live page this tick, and a
+  // chunk whose new target crosses a melt / ignite / freeze threshold may be
+  // marked for the CA only beside a dirty chunk (sim_heat.wgsl heatRelax), so
+  // a settled neighbourhood (a sealed lava pool) would never see the change.
+  // One wake per change: dragging a slider wakes once per tick it moved.
   spanUpload.Close();
 
   // ---- the page table: MATERIALIZE BEFORE THE ENCODER (§3) ----------------

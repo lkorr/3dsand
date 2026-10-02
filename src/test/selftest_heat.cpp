@@ -22,6 +22,9 @@
 //   heat-plume    heat rises: a campfire lights foliage above it, never the
 //                 foliage beside or below it, and burning foliage never heats
 //                 foliage alight (ticked on THE tick: TickCursor).
+//   heat-live     a live knob change (the F1 slider path) re-targets heat that
+//                 had settled, with no source changing: raising the side gain
+//                 lights foliage beside a sealed lava chamber.
 //
 // Every fixture is a SEALED STONE ROOM (floor, walls, roof): no sky, so no
 // sun rule touches it, and its climate is PINNED (Simulation::
@@ -201,7 +204,13 @@ struct HeatView {
 // X of the block holding world cell (x, y, z), 0 if unpaged: two 4-byte
 // readbacks (the entry, then the one pool word), cheap enough to take every
 // tick round a boundary.
+uint32_t ProbeWord(GpuContext& ctx, World& world, int x, int y, int z);
 uint32_t ProbeX(GpuContext& ctx, World& world, int x, int y, int z) {
+  return ProbeWord(ctx, world, x, y, z) & 0xFFu;
+}
+// The plane-0 word (X | X* << 8 | E << 16 | ...) of the block holding world
+// cell (x, y, z), 0 if unpaged.
+uint32_t ProbeWord(GpuContext& ctx, World& world, int x, int y, int z) {
   ctx.WaitIdle();
   const uint32_t slot = World::SlotChunkIndex({x >> 4, y >> 4, z >> 4});
   uint32_t e = 0;
@@ -214,7 +223,7 @@ uint32_t ProbeX(GpuContext& ctx, World& world, int x, int y, int z) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.heatPool,
                         ((uint64_t)(e & kHeatEntryPage) * kHeatPageWords + b) * 4, &w, 4,
                         "heatProbeWord");
-  return w & 0xFFu;
+  return w;
 }
 
 int FloorDiv16(int v) { return v >= 0 ? v / 16 : -((-v + 15) / 16); }
@@ -1505,6 +1514,192 @@ Status GateHeatPlume(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// heat-live
+// ---------------------------------------------------------------------------
+// LIVE KNOBS (the F1 Temperature sliders, 2026-10-02). A heat target is
+// rebuilt only when its SOURCES change, so before this a slider move never
+// reached heat that had already settled. Simulation::PrepareHeat now bumps a
+// knob epoch and the tick wakes the world when a knob word moves; heatBegin
+// re-targets every live page (sim_heat.wgsl heatShift, kHeatShiftRetarget).
+//
+// FIXTURE: heat-plume's first room (sealed stone, climate pinned at 10)
+// holding a sealed 4x4x4 chamber of LAVA -- a source that never changes:
+// full, walled in stone, nothing to react with -- and heat-plume's 4x4 leaf
+// wall `heat.liveSideCells` to its side.
+//   A  `heat.liveSettleTicks` under the shipped knobs: the wall stays whole;
+//      its top block's TARGET is below foliage's ignite threshold, the same at
+//      the half-way point as at the end (nothing re-targets it), and its X
+//      has reached it.
+//   B  sim.heatSideGain -> `heat.liveSideGain` through SetCurrentTuning (the
+//      slider's own path), nothing else touched: that target passes the
+//      threshold within `heat.liveRetargetTicksMax`, X follows, and the wall
+//      catches within `heat.liveIgniteTicksMax` -- the CA re-evaluated a chunk
+//      that nothing else woke. The lava is cell-for-cell what it was.
+// The knob is restored after each run. Run twice from a fresh worldgen: the
+// final cells and the heat pool must agree. Ticked on THE tick (TickCursor).
+struct LiveResult {
+  uint32_t wall0 = 0, wallSettled = 0, wallEnd = 0;
+  int xsHalf = -1, xsSettled = -1, xSettled = -1, xsAfter = -1;
+  uint32_t retargetTick = 0, xRiseTick = 0, lightTick = 0;
+  bool lavaSame = false, restored = false;
+  uint32_t ignites = 0, refused = 0;
+  std::vector<uint32_t> finalCells;
+  uint64_t heatHash = 0;
+  std::string trace;
+};
+
+LiveResult RunLive(Ctx& c, int settleTicks, int runTicks, int side, float sideGain,
+                   int threshold) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  const uint32_t leaves = MatId(c, "leaves"), lava = MatId(c, "lava");
+  SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const Box room = PlRoom(0), ch = PlChamber(0);
+  const Box wall{ch.x1 + side, ch.y0, ch.z0, ch.x1 + side, ch.y1, ch.z1};
+  std::vector<CellOp> rooms, build;
+  Room(rooms, room);
+  for (int z = ch.z0 - 1; z <= ch.z1 + 1; z++)
+    for (int y = ch.y0 - 1; y <= ch.y1 + 1; y++)
+      for (int x = ch.x0 - 1; x <= ch.x1 + 1; x++)
+        if (!ch.Has(x, y, z)) build.push_back({World::SlotCellIndex({x, y, z}), (uint32_t)kMatStone});
+  Fill(build, ch, lava | kFull);
+  Fill(build, wall, leaves);
+  uint32_t t = 62000;
+  support::TickCursor ticker{c, t, {ch.x0 >> 4, ch.y0 >> 4, ch.z0 >> 4}};
+  // Rooms in one tick, their contents in the next (first op on a cell wins).
+  ticker({}, rooms);
+  ticker({}, build);
+  LiveResult r;
+  Vox v;
+  const Box all{room.x0 - 1, room.y0 - 1, room.z0 - 1, room.x1 + 1, room.y1 + 1, room.z1 + 1};
+  auto count = [&](const Box& b) {
+    uint32_t n = 0;
+    for (int z = b.z0; z <= b.z1; z++)
+      for (int y = b.y0; y <= b.y1; y++)
+        for (int x = b.x0; x <= b.x1; x++) n += (v.At(x, y, z) & 0xFFFu) == leaves;
+    return n;
+  };
+  auto lavaCells = [&]() {
+    std::vector<uint32_t> out;
+    for (int z = ch.z0; z <= ch.z1; z++)
+      for (int y = ch.y0; y <= ch.y1; y++)
+        for (int x = ch.x0; x <= ch.x1; x++) out.push_back(v.At(x, y, z) & 0xFFFFu);
+    return out;
+  };
+  v.Read(ctx, world, all);
+  r.wall0 = count(wall);
+  // The wall's TOP block: the one heat rises into from the chamber's lower
+  // row (heat-plume's side reading peaks there too).
+  const int px = wall.x0, py = wall.y1, pz = wall.z0;
+  for (int i = 0; i < settleTicks; i++) {
+    ticker();
+    if (i == settleTicks / 2) r.xsHalf = (int)((ProbeWord(ctx, world, px, py, pz) >> 8) & 0xFFu);
+  }
+  uint32_t w = ProbeWord(ctx, world, px, py, pz);
+  r.xSettled = (int)(w & 0xFFu);
+  r.xsSettled = (int)((w >> 8) & 0xFFu);
+  v.Read(ctx, world, all);
+  r.wallSettled = count(wall);
+  const std::vector<uint32_t> lava0 = lavaCells();
+  // B: the slider's path. Nothing else changes from here on.
+  const Tuning saved = CurrentTuning();
+  Tuning tn = saved;
+  tn.sim.heatSideGain = sideGain;
+  SetCurrentTuning(tn);
+  for (int i = 0; i < runTicks; i++) {
+    ticker();
+    const bool sample = i < 20 || i % 10 == 9;
+    if (sample) {
+      w = ProbeWord(ctx, world, px, py, pz);
+      const int x = (int)(w & 0xFFu), xs = (int)((w >> 8) & 0xFFu);
+      r.xsAfter = std::max(r.xsAfter, xs);
+      // THE TRACE (first ticks after the change): X / X* of the top block,
+      // whether the wall's chunk is awake for the CA next tick, and how many
+      // chunks the window has awake -- what names a broken link of the
+      // re-target -> mark -> CA chain instead of a bare "never lit".
+      if (i < 8) {
+        const uint32_t awake =
+            AwakeIn(ctx, c.sim, {World::SlotChunkIndex({px >> 4, py >> 4, pz >> 4})});
+        r.trace += Format(" t%d:%d/%d%s(%u)", i + 1, x, xs, awake ? "*" : "", AwakeAll(ctx, c.sim));
+      }
+      if (r.retargetTick == 0 && kPlAmbient + xs > threshold) r.retargetTick = (uint32_t)i + 1;
+      if (r.xRiseTick == 0 && x > r.xSettled) r.xRiseTick = (uint32_t)i + 1;
+      if (r.lightTick == 0 && i % 10 == 9) {
+        v.Read(ctx, world, wall);
+        if (count(wall) < r.wallSettled) r.lightTick = (uint32_t)i + 1;
+      }
+    }
+  }
+  w = ProbeWord(ctx, world, px, py, pz);
+  r.trace += Format(" end:%u/%u", w & 0xFFu, (w >> 8) & 0xFFu);
+  SetCurrentTuning(saved);
+  r.restored = CurrentTuning().sim.heatSideGain == saved.sim.heatSideGain;
+  v.Read(ctx, world, all);
+  r.wallEnd = count(wall);
+  r.lavaSame = lavaCells() == lava0;
+  HeatView hv;
+  hv.Read(ctx, world, true);
+  hv.Note();
+  r.ignites = hv.meta[kHmIgnites];
+  r.refused = hv.meta[kHmRefused];
+  r.heatHash = hv.Hash();
+  for (int z = all.z0; z <= all.z1; z++)
+    for (int y = all.y0; y <= all.y1; y++)
+      for (int x = all.x0; x <= all.x1; x++) r.finalCells.push_back(v.At(x, y, z) & 0xFFFFu);
+  return r;
+}
+
+Status GateHeatLive(Ctx& c, std::string& detail) {
+  DawnPin dawn;
+  PinGuard pins(c.sim, {{88, 92, 222, 120, kPlAmbient, 0}});
+  const int settle = (int)BaselineNumber("heat.liveSettleTicks", 300);
+  const int run = (int)BaselineNumber("heat.liveRunTicks", 300);
+  const int side = (int)BaselineNumber("heat.liveSideCells", 2);
+  const float sideGain = (float)BaselineNumber("heat.liveSideGain", 1.0);
+  const double retargetMax = BaselineNumber("heat.liveRetargetTicksMax", 2);
+  const double igniteMax = BaselineNumber("heat.liveIgniteTicksMax", 200);
+  int leafAbove = 135;
+  for (const HeatTransition& h : c.mats[MatId(c, "leaves")].thermal.transitions)
+    if (h.kind == kHeatKindIgnite) leafAbove = h.threshold;
+  const float shipped = CurrentTuning().sim.heatSideGain;
+  const LiveResult a = RunLive(c, settle, run, side, sideGain, leafAbove);
+  const LiveResult b = RunLive(c, settle, run, side, sideGain, leafAbove);
+  RecordObserved("heat.liveTargetBeforeObserved", (double)(kPlAmbient + a.xsSettled));
+  RecordObserved("heat.liveTargetAfterObserved", (double)(kPlAmbient + a.xsAfter));
+  RecordObserved("heat.liveRetargetTicksObserved", (double)a.retargetTick);
+  RecordObserved("heat.liveIgniteTicksObserved", (double)a.lightTick);
+  const bool unlit = a.wall0 > 0 && a.wallSettled == a.wall0 &&
+                     kPlAmbient + a.xsSettled <= leafAbove;
+  const bool settled = a.xsSettled > 0 && a.xsHalf == a.xsSettled && a.xSettled == a.xsSettled;
+  const bool retarget = a.retargetTick > 0 && a.retargetTick <= retargetMax;
+  const bool follows = a.xRiseTick > 0;
+  const bool lit = a.lightTick > 0 && a.lightTick <= igniteMax;
+  const bool restored = a.restored && b.restored && CurrentTuning().sim.heatSideGain == shipped;
+  const bool twice = a.finalCells == b.finalCells && a.heatHash == b.heatHash;
+  const bool ok = unlit && settled && retarget && follows && lit && a.lavaSame && restored &&
+                  twice && a.refused == 0;
+  detail = Format(
+      "lava chamber, foliage wall %d cells to its side (ignites above %d): shipped side gain "
+      "%.2f -> top block target T* %d (half-way %d, X %d) %s, wall %u/%u kept %s; side gain "
+      "-> %.2f via SetCurrentTuning: T* past %d at tick %u (max %.0f) %s, peak T* %d, X rose "
+      "at tick %u %s, wall lit at tick %u (max %.0f) %s (%u/%u left); lava unchanged %s; knob "
+      "restored %s; run twice: cells %s, heat hash %016llx vs %016llx %s; %u heat ignitions, "
+      "refused %u; after the change, X/X* (* = wall chunk awake) (window awake):%s",
+      side, leafAbove, shipped, kPlAmbient + a.xsSettled, kPlAmbient + a.xsHalf,
+      kPlAmbient + a.xSettled, settled ? "settled" : "NOT SETTLED", a.wallSettled, a.wall0,
+      unlit ? "OK" : "FAIL", sideGain, leafAbove, a.retargetTick, retargetMax,
+      retarget ? "OK" : "NOT RE-TARGETED", kPlAmbient + a.xsAfter, a.xRiseTick,
+      follows ? "OK" : "FAIL", a.lightTick, igniteMax, lit ? "OK" : "FAIL", a.wallEnd,
+      a.wall0, a.lavaSame ? "OK" : "FAIL", restored ? "OK" : "FAIL",
+      a.finalCells == b.finalCells ? "same" : "DIFFER", (unsigned long long)a.heatHash,
+      (unsigned long long)b.heatHash, twice ? "OK" : "NONDETERMINISTIC", a.ignites, a.refused,
+      a.trace.c_str());
+  std::printf("heat-live: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& HeatGates() {
@@ -1516,6 +1711,7 @@ const std::vector<Gate>& HeatGates() {
       {"heat-ambient", "sim", {}, false, GateHeatAmbient},
       {"heat-bound", "sim", {}, false, GateHeatBound},
       {"heat-plume", "sim", {}, false, GateHeatPlume},
+      {"heat-live", "sim", {}, false, GateHeatLive},
   };
   return g;
 }

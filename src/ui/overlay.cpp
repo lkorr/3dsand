@@ -1655,6 +1655,64 @@ void Overlay::DrawDevWorld(UIState& s) {
     } else {
       ImGui::TextDisabled("no readout yet");
     }
+
+    // ---- the knobs (src/sim/tuning_params.def, sim.heat*) ----
+    // Ranges are the def rows' min/max, the load clamps. All live: a change
+    // re-targets every heat page and wakes the world on the next tick
+    // (Simulation::PrepareHeat), so settled heat follows the slider too.
+    // Moves the world hash like any sim.* knob.
+    Tuning t = CurrentTuning();
+    Tuning::Sim& hs = t.sim;
+    bool changed = false;
+    bool on = hs.heatMode != 0;
+    if (ImGui::Checkbox("heat on##heat", &on)) {
+      hs.heatMode = on ? 1 : 0;
+      changed = true;
+    }
+    ImGui::SetItemTooltip("Off: nothing warms anything -- no melting, no catching fire from\n"
+                          "nearby heat, no freezing -- and the layer frees its memory.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("reset to defaults##heat")) {
+      static const Tuning d{};   // the def rows' defaults (TPD)
+      hs.heatMode = d.sim.heatMode;
+      hs.heatRadius = d.sim.heatRadius;
+      hs.heatGain = d.sim.heatGain;
+      hs.heatUpGain = d.sim.heatUpGain;
+      hs.heatSideGain = d.sim.heatSideGain;
+      hs.heatDownGain = d.sim.heatDownGain;
+      hs.heatSnowlineBase = d.sim.heatSnowlineBase;
+      hs.heatSnowlineSwing = d.sim.heatSnowlineSwing;
+      changed = true;
+    }
+    ImGui::SetItemTooltip("Every heat knob back to its shipped value.");
+    changed |= EditableSliderFloat("rise (up)##heat", &hs.heatUpGain, 0.0f, 32.0f, "%.2fx");
+    ImGui::SetItemTooltip("How far heat carries UPWARD: campfires scorch what hangs over them.\n"
+                          "20 lights foliage 3-4 cells above a campfire.");
+    changed |= EditableSliderFloat("spread (side)##heat", &hs.heatSideGain, 0.0f, 1.0f, "%.2fx");
+    ImGui::SetItemTooltip("How much heat reaches things BESIDE a source. Low: a bush next to\n"
+                          "a campfire stays green. 1 = as much as straight across.");
+    changed |= EditableSliderFloat("sink (down)##heat", &hs.heatDownGain, 0.0f, 4.0f, "%.2fx");
+    ImGui::SetItemTooltip("How much heat reaches things BELOW a source: the ground under a\n"
+                          "fire, ice under a lava flow.");
+    changed |= EditableSliderInt("reach##heat", &hs.heatRadius, 2, 8);
+    ImGui::SetItemTooltip("How far any source reaches, in 2-voxel blocks (6 = 12 voxels).\n"
+                          "Past it, a source adds nothing at all.");
+    changed |= EditableSliderInt("intensity##heat", &hs.heatGain, 1, 64);
+    ImGui::SetItemTooltip("How little of its surroundings a source must fill to heat a spot to\n"
+                          "its own temperature (1/this). Higher: small fires heat harder,\n"
+                          "lava lights wood farther off. Never hotter than the source.");
+    changed |= EditableSliderInt("snowline base##heat", &hs.heatSnowlineBase, -64, 63);
+    ImGui::SetItemTooltip("The climate above the treeline (0 = water freezes). Kept below 0 by\n"
+                          "day (base + swing < 0) so the peaks keep their snow.");
+    changed |= EditableSliderInt("snowline swing##heat", &hs.heatSnowlineSwing, 0, 63);
+    ImGui::SetItemTooltip("Day / night swing of the snowline climate (day = base + swing).");
+    if (changed) {
+      // LoadTuning's hand-written rule (tuning_params.def above the row): the
+      // snowline must stay frozen by day.
+      if (hs.heatSnowlineBase + hs.heatSnowlineSwing >= 0)
+        hs.heatSnowlineBase = -1 - hs.heatSnowlineSwing;
+      SetCurrentTuning(t);
+    }
   }
 
   if (Section("Wind & weather")) {

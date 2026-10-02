@@ -14,7 +14,8 @@
 //               the F1 probe
 //   heatShift   (before the CA) release every page whose owner left the
 //               window and re-target the kept edge; at dawn, lower X by the
-//               ambient step so T stays under the ceiling
+//               ambient step so T stays under the ceiling; when a live
+//               knob moved (the knob epoch), re-target every kept page
 //   heatPend    (before the CA) last tick's still-relaxing chunks back onto
 //               the relax list
 //   heatWant    per dirty chunk: list paged chunks, want pages for N27 of an
@@ -172,6 +173,9 @@ const HEAT_KIND_MELT : u32 = 1u;
 const HEAT_KIND_IGNITE : u32 = 2u;
 const HEAT_SHIFT_RELEASE : u32 = 1u;
 const HEAT_SHIFT_DAWN : u32 = 2u;
+const HEAT_SHIFT_RETARGET : u32 = 4u;
+const HM_KNOB_EPOCH : u32 = 14u;
+const HP_KNOB_EPOCH : u32 = 13u;
 const HP_RADIUS : u32 = 1u;
 const HP_PROBE : u32 = 5u;
 const HP_PROBE_ON : u32 = 8u;
@@ -264,6 +268,15 @@ fn heatBegin() {
   // heat-ignite wood at a desert dawn. heatShift lowers every kept page's X
   // and X* by the step first, so T is continuous and the ceiling holds.
   if (inUse > 0u && flip && last == 1u && day == 2u && heatMode()) { why |= HEAT_SHIFT_DAWN; }
+  // A LIVE KNOB MOVED (the F1 Temperature sliders: radius, gain, the
+  // direction gains, the snowline): every kept page re-targets. A target is
+  // rebuilt only when its sources change, so without this a settled field
+  // would keep the old knobs' heat until something near it moved. The CPU
+  // bumps the epoch on the tick it uploads the change and wakes the world on
+  // that tick, so this runs, and every chunk may mark for the CA.
+  let epoch = heatParams[HP_KNOB_EPOCH];
+  let lastEpoch = atomicExchange(&heatMeta[HM_KNOB_EPOCH], epoch);
+  if (inUse > 0u && lastEpoch != epoch && heatMode()) { why |= HEAT_SHIFT_RETARGET; }
   atomicStore(&heatMeta[HM_SHIFT_WHY], why);
   heatSetArgs(HEAT_ARG_SHIFT, select(0u, NUM_CHUNKS / 256u, why != 0u));
   atomicStore(&heatMeta[HM_ORIGIN], bitcast<u32>(o.x));
@@ -312,8 +325,8 @@ fn heatAmbientStep(c : vec3<i32>) -> i32 {
 
 // ============================================================================
 // heatShift: one thread per window slot, recorded indirect on heatBegin's
-// record (zero groups unless the origin moved, the layer was turned off, or
-// it is dawn). RELEASE: a page whose owner is no longer the slot's occupant --
+// record (zero groups unless the origin moved, the layer was turned off, it
+// is dawn, or a live knob moved). RELEASE: a page whose owner is no longer the slot's occupant --
 // or every page, with the layer off -- is zeroed and pushed. Heat is
 // ephemeral: a chunk that leaves and comes back starts at ambient (PLAN §9).
 // A KEPT page on the window's edge after a move is queued for a target
@@ -321,7 +334,8 @@ fn heatAmbientStep(c : vec3<i32>) -> i32 {
 // from them would otherwise outlive them (an edge chunk beside a fire that
 // has left the window, or burnt out in a ticket, kept its warmth for good).
 // DAWN: a kept page's X and X* drop by the block's ambient step (see
-// heatBegin), clamped at 0.
+// heatBegin), clamped at 0. RETARGET: every kept page is queued for a target
+// recompute (one pass over the live pages per knob change, nothing after).
 @compute @workgroup_size(256)
 fn heatShift(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
@@ -352,6 +366,13 @@ fn heatShift(@builtin(global_invocation_id) gid : vec3<u32>) {
       let xs = max(i32((w >> 8u) & 0xFFu) - step, 0);
       heatPool[base + b] = (w & 0xFFFF0000u) | u32(x) | (u32(xs) << 8u);
     }
+  }
+  // RETARGET (a live knob moved): every kept page, once. The x / z / y passes
+  // read only paged neighbours, all of which are on the list too, so the new
+  // targets are exactly what a fresh field under the new knobs would hold.
+  if ((why & HEAT_SHIFT_RETARGET) != 0u) {
+    heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST);
+    return;
   }
   if ((why & HEAT_SHIFT_RELEASE) != 0u) {
     var edge = false;

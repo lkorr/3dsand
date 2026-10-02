@@ -148,7 +148,16 @@ class Simulation {
   // the last write -- a pure function of (map, seed, window), so a replay
   // rebuilds the same table. Called by SubmitTick right after the TickParams
   // upload; deferred queue writes, so it lands before the tick's commands.
-  void PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed);
+  //
+  // LIVE KNOBS: returns true on a tick where a knob word of the header (mode,
+  // radius, snowline, gain, the direction gains) differs from the last
+  // upload. It then bumps the knob epoch (heat.h kHpKnobEpoch), so heatBegin
+  // re-targets every live page, and the CALLER must wake the world this tick
+  // (EncodeWakeAll, the day-flip wake): a settled neighbourhood would
+  // otherwise neither run the heat rows nor be allowed to mark a chunk whose
+  // new target crosses a melt / ignite / freeze threshold. The first call
+  // after construction, a worldgen or a load only records the knobs.
+  bool PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed);
   // The cell the F1 readout asks about (the player's feet); heatRelax copies
   // that block's X / X* / sources into heatMeta's probe words. Render-side
   // input: it changes no heat value, only which one is reported.
@@ -846,6 +855,12 @@ class Simulation {
   uint64_t heatColKey_ = 0;
   bool heatProbeOn_ = false;
   int heatProbe_[3] = {0, 0, 0};
+  // The live-knob tracker (PrepareHeat): the knob words last uploaded, and the
+  // epoch heatBegin compares. Both restart (invalid / 0) on a worldgen or a
+  // load, whose fill rows zero heatMeta's copy of the epoch.
+  uint32_t heatKnobs_[kHpKnobEpoch] = {};
+  bool heatKnobsValid_ = false;
+  uint32_t heatKnobEpoch_ = 0;
   std::vector<HeatColumnPin> heatPins_;
   // The solute layer's pipelines (sim_solute.wgsl).
   rhi::ComputePipeline solWant_, solArgs_, solAlloc_, solDiffuse_, solCompact_, solScoop_, solPour_, solHash_,

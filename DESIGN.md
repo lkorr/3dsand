@@ -1801,6 +1801,50 @@ row. The passes run x, z, Y LAST: with side <= 1 the x / z sums stay inside the
 floored exactly from the raw sums. The gains are floats converted to x16 fixed
 point on the CPU (`PrepareHeat`, `std::lround`), NO_WGSL like every heat knob.
 
+**Live knobs** (2026-10-02; F1 → Temperature, gate `heat-live`). Every heat
+knob -- `sim.heatMode`, `heatRadius`, `heatGain`, the three direction gains, the
+snowline base / swing -- has a slider in the F1 panel (ranges = the def rows'
+load clamps, plus a reset to defaults), and every one is LIVE on settled heat.
+That needed a mechanism: a target is rebuilt only when its sources change, so a
+knob change would otherwise reach only fields something else was disturbing.
+`PrepareHeat` compares the knob words of the `heatParams` header (never the F1
+probe words) with its last upload; on a change it bumps a KNOB EPOCH
+(`kHpKnobEpoch`) and returns true, and `SubmitTick` wakes the world that tick
+(`EncodeWakeAll`, the day-flip wake). `heatBegin` compares the epoch with the one
+it last saw (`heatMeta kHmKnobEpoch`) and arms `heatShift` with
+`kHeatShiftRetarget`, which queues every kept page for a target recompute -- the
+edge-chunk re-target the window shift already used, applied to all pages. Cost:
+one wake-all tick (the CA over every non-empty chunk once, as at dawn and dusk)
+plus one recompute of every live page (<= 5,120, typically tens to a few
+hundred), ONCE per tick a knob moved; nothing runs while the knobs hold still,
+and dragging a slider pays it once per tick it moves. The wake is what makes a
+raised gain IGNITE things: a chunk whose new target crosses a melt / ignite /
+freeze trigger may mark itself for the CA only beside a dirty chunk (the dirty
+bound below), and the wake makes every chunk dirty on the re-target tick; from
+there the chunk keeps itself marked until X reaches X*. The epoch and the CPU
+tracker both restart at zero on a worldgen or load (whose fills zero
+`heatMeta`), so a fresh world never re-targets. DETERMINISM: the re-target is a
+function of the tuning each tick saw, so the same seed + ticks + inputs + tuning
+sequence reproduce it. Live tuning is OUTSIDE the replay / net contract, like
+every other live `sim.*` knob: the op record carries no tuning (a replay runs
+under the replaying process's tuning) and the net handshake compares the
+tuning FILE stamps only, so moving a slider mid-session desyncs a peer exactly
+as moving the wind sliders does. `heat-live` holds it: foliage two cells beside
+a sealed lava chamber settles at T* 114 (unlit) under the shipped knobs; side
+gain 0.5 -> 1.0 through `SetCurrentTuning`, nothing else touched, puts T* at
+230 on the next tick and the wall catches at tick 50, twice-run identical.
+
+**The settled-skip off-by-one it exposed** (fixed in `Simulation::NoteWakeAll`).
+`SubmitTick` calls `EncodeWakeAll` BEFORE `NoteTickInputs(tick)`, so the wake
+stamped `lastDirtyTick_` with the PREVIOUS tick, and that tick's settled
+snapshot, published `kSnapshotLatency` (4) ticks later, satisfied `snapTick >=
+lastDirtyTick_` and latched the world "settled" three ticks into the wake: the
+CA and every `C_CAACTIVE` row stopped while woken chunks were still marked
+(`heat-live`'s trace: X 104 -> 141 in three ticks, then frozen at T 151 for
+good, never lit). The day-flip wake had the same hole. The stamp is now
+`curTick_ + 1`: the next tick to encode when called between ticks or before
+`NoteTickInputs`, one tick conservative otherwise.
+
 `X` walks
 to `X*` by `max(1, |X* - X| >> k)` per tick, `k` the block's slowest
 `thermal.inertia` (water 5, liquids 4, solids and powders 3, gas and air 1):
@@ -1823,7 +1867,8 @@ per-material transitions, the column table. 30 MiB + 1 MiB + 0.4 MiB.
 `heatBegin` (counts, day flip, shift and pend args, the F1 probe), `heatShift`
 (release every page whose owner left the window and queue the kept EDGE for a
 target recompute -- the chunks past it now read cold, and a target built from
-them would outlive them; at dawn, the step above; ZERO groups otherwise) and
+them would outlive them; at dawn, the step above; on a knob-epoch change, a
+re-target of every kept page (live knobs, above); ZERO groups otherwise) and
 `heatPend` (last tick's still-relaxing chunks back onto the relax list) before
 the CA;
 after it `heatWant` (per dirty chunk: list paged chunks; an emitting chunk —

@@ -3070,6 +3070,8 @@ _HEAT_CONSTS = {
     "HEAT_ARG_SHIFT": "kHeatArgShift", "HEAT_ARG_PEND": "kHeatArgPend",
     "HM_PEND_COUNT": "kHmPendCount", "HM_SHIFT_WHY": "kHmShiftWhy", "HM_PEND": "kHmPend",
     "HEAT_SHIFT_RELEASE": "kHeatShiftRelease", "HEAT_SHIFT_DAWN": "kHeatShiftDawn",
+    "HEAT_SHIFT_RETARGET": "kHeatShiftRetarget", "HM_KNOB_EPOCH": "kHmKnobEpoch",
+    "HP_KNOB_EPOCH": "kHpKnobEpoch",
     "HEAT_PROBE_TAG_SHIFT": "kHeatProbeTagShift",
     "HS_TRIG_ABOVE_SHIFT": "kHsTrigAboveShift", "HS_TRIG_BELOW_SHIFT": "kHsTrigBelowShift",
     "HS_TRIG_MASK": "kHsTrigMask", "HEAT_BLOCK_TRANS": "kHeatBlockTrans",

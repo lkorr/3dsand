@@ -72,8 +72,15 @@ constexpr uint32_t kHmPendCount = 12;
 // DAY: every kept page's X and X* drop by the ambient step, so the actual
 // temperature T = ambient + X is continuous and never passes the hottest
 // source in reach -- the ceiling).
+// kHeatShiftRetarget: a LIVE KNOB moved (heatParams' kHpKnobEpoch differs from
+// kHmKnobEpoch, the epoch heatBegin last saw): every kept page is queued for a
+// target recompute -- a target is otherwise rebuilt only when its sources
+// change, so a settled field would keep the old knobs' heat for good.
 constexpr uint32_t kHmShiftWhy = 13;
-constexpr uint32_t kHeatShiftRelease = 1u, kHeatShiftDawn = 2u;
+constexpr uint32_t kHeatShiftRelease = 1u, kHeatShiftDawn = 2u, kHeatShiftRetarget = 4u;
+// The knob epoch heatBegin last saw (heatParams kHpKnobEpoch). Zero after a
+// worldgen or load reset -- which is also when the CPU restarts its epoch.
+constexpr uint32_t kHmKnobEpoch = 14;
 // Stats, words 16..31 -- the snapshot carries words 0..31 (kHeatSnapWords).
 constexpr uint32_t kHmPagesPeak = 16;
 constexpr uint32_t kHmRefused = 17;    // monotonic: wanted chunks the pool could not page
@@ -161,6 +168,14 @@ constexpr uint32_t kHpUpGain = 10;
 constexpr uint32_t kHpSideGain = 11;
 constexpr uint32_t kHpDownGain = 12;
 constexpr uint32_t kHeatGainOne = 16;
+// THE LIVE-KNOB EPOCH (the F1 Temperature sliders, 2026-10-02). PrepareHeat
+// bumps it on a tick where any KNOB word of this header (mode, radius,
+// snowline Y / base / swing, gain, the direction gains -- never the probe)
+// differs from the last upload, and wakes the world on that tick (the
+// day-flip wake). heatBegin compares it with heatMeta kHmKnobEpoch and arms
+// heatShift's kHeatShiftRetarget. A pure function of the tuning each tick
+// saw: replayed under the same tuning sequence it re-targets on the same tick.
+constexpr uint32_t kHpKnobEpoch = 13;
 constexpr uint32_t kHeatBiomesMax = 64;
 constexpr uint32_t kHpBiome = kHpHdrWords;                     // base, swing (i32) per biome
 constexpr uint32_t kHpMat = kHpBiome + 2 * kHeatBiomesMax;     // 8 words per material

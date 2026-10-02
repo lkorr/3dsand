@@ -2769,6 +2769,11 @@ void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   // A freshly generated world is maximally unsettled — the first hundreds of
   // ticks ARE the settling. Same self-declaration rule (§3.4).
   NoteWakeAll();
+  // The fill rows zeroed heatMeta (its knob epoch included): a new world is
+  // born under whatever knobs it starts with, so the next PrepareHeat only
+  // records them -- no re-target, no wake.
+  heatKnobsValid_ = false;
+  heatKnobEpoch_ = 0;
 }
 
 uint32_t Simulation::WriteGenList(const rhi::Queue& queue,
@@ -2996,6 +3001,9 @@ void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
   // written both dirty pages (worldio.cpp). Nothing the latch believed about
   // the previous world survives that (§3.4).
   NoteWakeAll();
+  // Heat is not saved and the fill rows zero heatMeta: as EncodeWorldgen.
+  heatKnobsValid_ = false;
+  heatKnobEpoch_ = 0;
 }
 
 void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
@@ -3024,7 +3032,7 @@ void Simulation::EncodeSoluteRestore(const rhi::CommandEncoder& enc, uint32_t co
 // the WORLD column held in each window column (x & 511, z & 511), so a shift
 // recomputes just the new strip on the CPU; the upload is then the whole
 // 256 KiB (an x shift touches every row), on a shift tick only.
-void Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed) {
+bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed) {
   const Tuning& tn = CurrentTuning();
   uint32_t hdr[kHpHdrWords] = {};
   hdr[kHpMode] = tn.sim.heatMode != 0 ? 1u : 0u;
@@ -3046,6 +3054,29 @@ void Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   hdr[kHpUpGain] = fx16(tn.sim.heatUpGain, 32.0f);
   hdr[kHpSideGain] = fx16(tn.sim.heatSideGain, 1.0f);
   hdr[kHpDownGain] = fx16(tn.sim.heatDownGain, 4.0f);
+  // LIVE KNOBS (the F1 Temperature sliders). A target is rebuilt only when its
+  // sources change, so a knob that moved would not reach a settled field: on
+  // the tick any knob word differs from the last upload, bump the epoch
+  // (heatBegin re-targets every live page) and tell the caller to wake the
+  // world. Words 5..8 are the probe -- the player's feet, which move every
+  // frame and change no heat -- and are not knobs.
+  bool knobsMoved = false;
+  {
+    auto isKnob = [](uint32_t i) { return i < kHpProbe || i > kHpProbeOn; };
+    bool differ = false;
+    for (uint32_t i = 0; i < kHpKnobEpoch; i++)
+      if (isKnob(i) && heatKnobs_[i] != hdr[i]) differ = true;
+    if (differ && heatKnobsValid_) {
+      heatKnobEpoch_++;
+      // Mode off -> off changes nothing anyone reads; every other move does
+      // (mode on -> off releases the pages, off -> on re-pages the emitters,
+      // which needs the wake for heatWant to see them).
+      knobsMoved = hdr[kHpMode] != 0 || heatKnobs_[kHpMode] != 0;
+    }
+    for (uint32_t i = 0; i < kHpKnobEpoch; i++) heatKnobs_[i] = hdr[i];
+    heatKnobsValid_ = true;
+  }
+  hdr[kHpKnobEpoch] = heatKnobEpoch_;
   queue.WriteBuffer(heatParamsBuf_, 0, hdr, sizeof(hdr));
   uint32_t bio[2 * kHeatBiomesMax];
   uint64_t key = 1469598103934665603ull ^ seed;
@@ -3106,6 +3137,7 @@ void Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   for (uint32_t k = 0; k < n; k++) { heatColX_[k] = wantX[k]; heatColZ_[k] = wantZ[k]; }
   if (changed)
     queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpCol * 4, heatCol_.data(), heatCol_.size());
+  return knobsMoved;
 }
 
 void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
@@ -3250,7 +3282,19 @@ void Simulation::NoteWakeAll() {
   // stamped BEFORE the wake can satisfy `snapTick >= lastDirtyTick_`, so the
   // wake's dirty flags can never be reasoned away, but a snapshot taken after
   // the woken chunks settle again can.
-  lastDirtyTick_ = curTick_;
+  //
+  // `curTick_ + 1`, NOT `curTick_` (2026-10-02, heat-live). curTick_ is set by
+  // NoteTickInputs, which SubmitTick calls AFTER its day-flip / heat-knob
+  // EncodeWakeAll -- and every other caller runs between ticks -- so here it
+  // is the LAST tick encoded, and the wake's dirty flags land on the NEXT one.
+  // Stamped with curTick_, the settled snapshot of the tick before the wake
+  // (published kSnapshotLatency ticks later) satisfied snapTick >=
+  // lastDirtyTick_ and latched the world "settled" three ticks into the wake:
+  // the CA and every C_CAACTIVE row stopped while woken chunks were still
+  // marked (heat-live: a re-targeted foliage wall reached T 151 at tick 3 and
+  // froze there, never lit). Called after NoteTickInputs in the same tick, +1
+  // is one tick conservative, which can only cost a skip, never license one.
+  lastDirtyTick_ = curTick_ + 1;
   settledProven_ = false;
 }
 

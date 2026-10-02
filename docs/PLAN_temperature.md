@@ -78,6 +78,43 @@ foliage's 135, and with the ceiling no source lifts anything past itself.
   scenario has no thermal transition in its 100 ticks and the heat pool is not
   hashed; reach is proven by tuning-reach (load) and heat-plume (kernel).
 
+## LIVE KNOBS (2026-10-02, after heat rises) -- F1 sliders that reach settled heat
+
+- **Panel.** F1 -> Temperature, under the readout: "heat on" (sim.heatMode),
+  "reset to defaults", rise (up) 0..32, spread (side) 0..1, sink (down) 0..4,
+  reach 2..8, intensity (gain) 1..64, snowline base -64..63 / swing 0..63 (the
+  base + swing < 0 rule applied as LoadTuning does). Ranges are the def rows'.
+  Same pattern as the wind / weather sections (CurrentTuning, sliders,
+  SetCurrentTuning).
+- **The mechanism.** Targets are rebuilt only when sources change, so a knob
+  move never reached a settled field. PrepareHeat diffs the header's knob words
+  (not the probe) against its last upload; on a change it bumps
+  `kHpKnobEpoch` and SubmitTick wakes the world that tick (EncodeWakeAll).
+  heatBegin sees the epoch differ from `heatMeta kHmKnobEpoch` and arms
+  heatShift with `kHeatShiftRetarget`: every kept page goes on the recompute
+  list (the edge re-target, applied to all pages). The wake lets a chunk whose
+  new target crosses a trigger mark itself for the CA (the dirty bound); it
+  stays marked until X reaches X*. Epoch and tracker restart on worldgen /
+  load, so a fresh world never re-targets. Cost: one wake-all tick + one
+  recompute of the live pages per tick a knob moved; nothing while idle.
+- **Replay / net.** Outside the contract, like every live sim.* knob: the op
+  record carries no tuning, the handshake compares tuning file stamps only.
+  Deterministic under the same tuning sequence.
+- **Found on the way: the wake was latched off after 3 ticks.** NoteWakeAll
+  stamped the previous tick (SubmitTick wakes before NoteTickInputs), so the
+  settled snapshot of the tick before the wake (4 ticks latent) proved the
+  world settled at wake + 3 and skipped every C_CAACTIVE row. Stamp is now
+  curTick_ + 1. The day-flip wake had the same hole.
+- **Gate `heat-live`** (TickCursor; thresholds `heat.live*`): lava chamber,
+  foliage wall 2 cells beside it settles at T* 114 unlit; side 0.5 -> 1.0 via
+  SetCurrentTuning: T* 230 at tick 1, X walks 104 -> 220, the wall lights at
+  tick 50 (max 200), lava unchanged, knob restored, twice-run identical. The
+  detail line carries a per-tick X / X* / awake trace of the first 8 ticks.
+- **Still open.** A field relaxing on the PEND list (no trigger in reach)
+  stops walking when the whole window is proven settled (the heat rows are
+  C_CAACTIVE): X can stall short of X* in a fully asleep world. Harmless to
+  the sim (no transition can fire there) but visible in the F1 readout.
+
 ## IMPLEMENTED (2026-10-02) -- what changed from revision 3 below
 
 The orchestrator approved revision 3 with these decisions, and the build
