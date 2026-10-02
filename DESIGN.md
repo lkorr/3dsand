@@ -86,13 +86,16 @@ controller and physics need to know what voxels are where) without stalls:
     still chunk snapshots (`sim/worldio.cpp` + `ChunkStore`); a record replays
     only from the worldgen seed its header names, so it is a debugging and
     validation artifact, not a save file.
-  - **Replication stream: not yet, but the gaps are closed.** Ops now have a
+  - **Replication stream: landed** (multiplayer-now N1–N6, 54fe241,
+    2026-09-20; M9 two-player, fe6145c, 2026-09-21). Ops have a
     defined winner when two land on one cell in one tick (lowest op index that
     would write it — `sim_mutate.wgsl` for brushes, a keep-first CPU
     canonicalization for cell ops), every stream is clamped at the choke point
     with the refusals counted into `build/last_run.json`, and every op can
-    carry an author. What is still missing is transport, host authority and
-    the input struct — see docs/PLAN_multiplayer_now.md.
+    carry an author. The transport, host authority and the input struct that
+    this line once listed as missing are `src/net/` (`link`, `opsync`,
+    `authority`, `chunksync`, `storesync`, ...) and `TickInput` — §10 is the
+    model of record and says what is still not multiplayer.
 
 **Second GPU consequence — determinism is a choice, not a casualty.** A naive GPU
 sim (scheduling-dependent atomics, float math, stateful RNG) is non-reproducible
@@ -737,8 +740,8 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
       ground materials by hand and has no `sandstone`, so the 330 columns of
       its 97x97 box whose surface is now sandstone read as "hollow". The box
       had 0 sandstone-topped columns before and exactly 330 after (raw-worldgen
-      probe). Fix is adding `"sandstone"` to `kBody` — a C++ line, left to the
-      next C++ package because this one does not build.
+      probe). Fixed the same day (2d544ef, 2026-09-23): `"sandstone"` is in
+      `kBody`.
   - Still open, ranked:
     2. **Neighbour wake (28 settle chunks, now 18% of what remains).**
        `modified_` is fed by the CA's NEXT-TICK dirty flag, which means
@@ -859,10 +862,12 @@ because that is the resolution the art is drawn at.
 
 ### Known-unscaled, on purpose or not yet
 
-Not fixed here, and none of it affects tree/player/mob size: worldgen's POI
-literals (the arena, wood platform and ruins in `worldgen.wgsl` never took
-`vlen()`), explosion and spell radii, `gore.*`, `debris.min*Voxels`, the `sim.*`
+Not fixed here, and none of it affects tree/player/mob size: explosion and
+spell radii, `gore.*`, `debris.min*Voxels`, the `sim.*`
 integer rows (determinism-critical, so their own change), and `.svedit` layers.
+(Worldgen's POI literals — the arena, wood platform and ruins that never took
+`vlen()` — were on this list until they were deleted from `worldgen.wgsl`
+outright: World map P2b, 48b5168, 2026-09-04; P2 map overhaul, 1d5a51a.)
 
 ## 4. The Simulation (GPU cellular automaton)
 
@@ -7203,8 +7208,12 @@ bodies that have actually been bloodied.
   every tick, so its underside never saw a contact (2026-09-13, pinned
   fixture: 16 -> 16 through a 30-tick flood).
 - **The corpse** carries whatever it died with; `DamageBody` soaks a fresh
-  cut on the corpse the same way. (A lying corpse does not yet take contact
-  stain from the pool under it -- the debris side has no contact pass.)
+  cut on the corpse the same way. A lying corpse takes contact stain from the
+  pool under it since corpses became Mobs (2026-09-24, §"Corpses are Mobs"):
+  `MobSystem::StainLimbs` runs `Mob::StainTick` -- the same `StainOneLimb`
+  contact pass as the living -- on every AWAKE corpse out of the dead's own
+  budget; an asleep one only gets its drying visit. Severed pieces are still
+  debris and take the same pass through `StainDeadFlesh`.
 
 Budgets in `mob.h` (`kStain*`): 2,048 world cells per limb walk, 6,144
 surface voxels per limb and 32,768 per tick for all creatures, start rotated
@@ -7237,8 +7246,10 @@ slot). The width change bumped the MOBS and DBRS save versions once.
 substance has a look): `decay` seconds per amount level lost while on a body
 (0 = washing only; blood 20, water 4 so wet dries), `shed` per-mille chance
 per footfall that a coated foot deposits (blood 400), `effects` raw string tags
-that nothing consumes yet. Behaviour is data (guideline 4): the first effect is
-a tag in JSON plus one read of the ledger.
+(nothing consumed them when this landed; since 2026-09-23, 9a0a702,
+`MobSystem::CoatEffectsOn` runs them per touched limb — pours, baths and
+`"disinfect"`, see below). Behaviour is data (guideline 4): an effect is a tag
+in JSON plus one read of the ledger.
 
 **The ledger** (`Mob::RecountCoat`): per limb, amount-weighted sums by material
 over the live voxels, body totals over the base rig only; fraction
@@ -7307,8 +7318,9 @@ a permanent trail. Water's `coat.decay` is 2: `DryOneLimb` drops half the
 voxels a level per period, so a soaked limb is dry in ~60 s. Gates: `vessel`
 (water poured over blood leaves the limb wet with no blood), `body-stain` /
 `corpse-wash` (the river judged on BLOOD left, 1496 -> 0, not on "any coat").
-Drips are not gated. Corpses wash and get wet but neither wick nor drip
-(StainDeadFlesh does not call `WetOneLimb` yet).
+Drips are not gated. Corpses wick and drip like the living: an awake corpse
+runs `Mob::StainTick` (corpses are Mobs since 2026-09-24) and the severed
+dead's `StainDeadFlesh` calls `WetOneLimb` too.
 
 **Wet vs fire, sun, and the look (2026-09-23).** A voxel whose coat is a
 washer does not catch: `BurnOneLimb` section 0 skips every rule whose product
@@ -8901,9 +8913,11 @@ events; on the hand, `self` and a beam every item fires at the resolve and
 `SetTiming` refuses anything but a delay there. `echo` gained a magnitude that
 scales its repeat count. On the page a plain click on a cell opens the "when
 does it fire?" menu, and a timed cell wears a tag where its stroke leaves.
-Known gap: a delayed or `every` child box is born from the echo queue at
-generation 0 rather than its parent's + 1 — still bounded (tree depth, the
-item's own fire count), but the generation cap does not see it.
+A delayed or `every` child box used to be born from the echo queue at
+generation 0 (and casterId 0, so it could home on its own caster); fixed
+2026-09-23 (55e6f9c): `SpellEcho::launchAt/launchDir/launchGen` carry the
+launch context the immediate path would have stamped (`StampEchoLaunches`,
+spell.cpp), so the generation cap sees delayed carriers too.
 
 **The reference interpreter is the oracle.** `scripts/magic_grammar.py`
 implements the same three rules over the same glyph table and generates
@@ -11584,10 +11598,12 @@ graze at most against the *total* loss `npc-strike` measures unblocked);
 the gate that keeps the content honest as it grows, and it names no style);
 `duel` (two AI duelists, opposed factions, both engaging and both cutting).
 
-Open, and the owner's calls: NPCs do not yet *choose* to parry, so blocking is
-luck of the stance; and a committed sword cut through a torso severs it, so
-whoever lands first usually ends the fight — measured, the duel is decided in
-one exchange.
+NPCs now *choose* to parry: the `guard` / `dodge` verbs of "The fighting
+layer" above (460a7a7, 2026-09-26) raise the weapon onto a blow the creature
+has read, and a stroke's Guard phase counts as a blocker in `FindParry` — so
+blocking is no longer luck of the stance. Still open, and the owner's call: a
+committed sword cut through a torso severs it, so whoever lands first usually
+ends the fight — measured, the duel is decided in one exchange.
 
 - **Bleeding:** wound budgets, capped per tick, emitted as radius-1 brush ops;
   blood is a real material (organic tags → burns/reacts for free) with a
@@ -13793,9 +13809,11 @@ flip measured a win on every `--render-budget` camera (the const's comment has
 the table); the ray-start map's prepass (`ray_start.wgsl`) uses the same
 TOTAL-class mask.
 
-Worldgen does not place these yet (Wave 1a deliberately does not touch it); the
-`--shot` harness paints a demo meadow, and they are brush-selectable like any
-other material.
+Worldgen places these: Wave 1a deliberately did not, but the per-biome cover
+stacks (`assets/biomes/*.json` `cover.plants[]`, rolled in `worldgen.wgsl`'s
+cover loop, §9 biomes) now lay grass, flowers, moss, ferns, shrubs and litter
+as ordinary micro cells. The `--shot` harness still paints a demo meadow, and
+they are brush-selectable like any other material.
 
 ### Analytic plants and the trample field (2026-09-04)
 
@@ -19508,8 +19526,9 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   five `worldgen.*` knobs are now rows in `desert.json`/`pine.json`; the four
   `treeChance*` knobs are gone. The alpine-cushion snowline block is still in
   the shader (it is an ALTITUDE rule, not a biome's; it moves when the
-  landform plane lands, P4). A cover row's `maxSlope` is packed but not yet
-  enforced (P4 gives `Col` a slope).
+  landform plane lands, P4). A cover row's `maxSlope` is enforced: `Col`
+  carries the landform slope (`col.slope = L.slope`, cached as `CCW_SLOPE`)
+  and the cover loop skips a row when `col.slope > WM_C_MAX_SLOPE`.
 * **LIVE: tree species and weights, WITHOUT the bake.** `LoadTreeAtlas` takes
   the biome set and builds the per-biome weight table from each biome file's
   `trees.species[]` by name; the `.svtree`'s baked weight words (12..15) are
@@ -20391,8 +20410,8 @@ record without changing the save format; `MobHandoff` carries record + brain
 kinematic, driven by the same `DriveKinematicTo` the straps use, skipped by
 every emitter and by the island scan of chunks the machine does not own;
 `ItemTake`/`ItemGrant` make pickup one path on both machines; gate
-`debris-ghost`). None of it is wired to the wire yet; that is M9.3-B/C and
-M9.4-D.
+`debris-ghost`). None of it was wired to the wire at the time; M9.3-B/C and
+M9.4-D, below, did that (2026-09-21).
 
 **M9.3-C — the convergence half (`src/net/chunksync.*`, landed 2026-09-21).**
 Determinism keeps two machines equal only for chunks BOTH hold and only while
@@ -20574,6 +20593,16 @@ is needed for two players. `TickInput` never goes on the wire; outcomes do
 (`PlayerState` per tick, ops applied at T+D under delayed lockstep, D=4). The
 plan's §4 records the adversarial review of that protocol and its rejected
 alternative (one shared window with a leash).
+
+*Status 2026-10-02: the list below is the 2026-09-20 plan and most of it has
+landed — M9.3–M9.5 above: TCP transport (`net/link`), the ops stream
+(`net/opsync`), per-chunk hash + re-send (`net/chunksync`), entity / mob /
+debris state sync (`net/entitysync`, `mobsync`, `debrissync`), late join from
+the host store (`net/storesync`), tick + seed in `meta.svm`, and a join
+handshake that REFUSES a mismatch in the tuning / materials / reactions /
+environment hashes (`net::Hello::FirstMismatch`, `net/protocol.cpp`). "What is
+still not multiplayer" above is the current list; read the one below as
+history.*
 
 **What M9 still needs** (the audit's "later" column, against the tree above):
 transport and lobby (Steam / WebRTC; browser builds have no raw UDP, and both
@@ -21184,7 +21213,15 @@ attack: the one `PlayClip("attack")` in the engine is a FLINCH on being hit.
 
 So `alert` needs the AI seam §"Mob steering: intent vs actuation" describes,
 `attack` needs a mob attack action to exist, and `idle` needs a per-mob timer
-and a notion of "unaware". Each says so in its own `fires:` field in
+and a notion of "unaware".
+
+*Status 2026-10-02:* the paragraph above is the 2026-08-24 audit. The AI seam
+and the attack action have since landed (`game/ai_behavior.*`, 2026-08-31:
+`ai::Aggro`, a target, `Intent::RequestAttack` driving real strokes), so there
+IS now an event to hang `alert` and `attack` on — but the slots are still not
+emitted: `Cues::MobEvent::Idle/Alert/Attack` exist in `audio/cues.h` and nothing
+outside `cues.cpp` raises them, and `sound_schema.js`'s `fires:` text still
+carries the old reasoning. Each says so in its own `fires:` field in
 `assets/sound_schema.js`, and the tuner shows it on the slot — so binding a
 sound to something nothing triggers tells you so at authoring time instead of
 leaving you wondering why it is silent.
@@ -21695,13 +21732,31 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
   > is the seam and it is already the only place that decides; adding a target
   > and a state enum there is where the `alert`/`attack` events, and the fight,
   > both come from.
+  >
+  > **Closed 2026-08-31 (9fababc), extended 2026-09-26 (460a7a7).** That layer
+  > is `game/ai_behavior.*`: `ai::Aggro`, a target, and a utility arbiter over
+  > named intents including `RequestAttack`, `Guard` and `Dodge` (§"NPC
+  > behaviour: a utility arbiter over named intents"); NPCs swing real strokes
+  > (§"NPCs swinging, and blades meeting blades"; gates `ai-*`, `npc-strike`,
+  > `npc-block`, `duel`, `ai-tactics`). What this paragraph says above is the
+  > 2026-08-24 state. Still open from it: the `idle` / `alert` / `attack`
+  > SOUND slots are not emitted (§12b).
 - **M9 — It's online (prototype)**: choose lockstep vs. server-authoritative (§10)
   based on measured determinism (per-tick hashes across two GPU vendors) and
   bandwidth data; headless build, 2–4 player LAN test. *Everything before this was
   built against the MutationQueue with deterministic kernels, so this milestone is
   plumbing, not surgery.*
+
+  > *Status 2026-10-02:* the model was chosen 2026-09-10 (host-authoritative
+  > op stream, §10) and two-player landed 2026-09-21 (`src/net/`, M9.5-B
+  > fe6145c, gate `store-sync`; docs/PLAN_multiplayer_m9.md). The two-vendor
+  > hash comparison is still not done (risk 3, §14).
 - **Beyond**: GI/lighting, wand/spell crafting depth, persistent meta-progression,
   Steam networking, temperature layer, structural stress.
+  *(Status 2026-10-02: GI/lighting is no longer "beyond" — the openness grid,
+  irradiance grid and glow field of `docs/PLAN_gi.md` are built, §9.x; spell
+  crafting has the spell grammar and graph with lanes, §"The spell system". The rest of this
+  line is unbuilt.)*
 
 ## 14. Risks (ranked)
 
