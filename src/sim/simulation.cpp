@@ -2679,6 +2679,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
 // tick's context, so a tick with both off records nothing here.
 void Simulation::EncodeDerived(const rhi::CommandEncoder& enc, bool asyncQueue) {
   if (!lastTickCxValid_) return;
+  lastTickCxValid_ = false;  // owed once
   recordNoTimer_ = asyncQueue;
   RecordTable(enc, pass::Table::Derived, &lastTickCx_);
   recordNoTimer_ = false;
@@ -3359,9 +3360,15 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   sandvox::SetGasFarRenderActive(cx.gasFarWideCount > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
-  // The derived rows record LATER, from this same context (EncodeDerived).
+  // The derived rows (openness + glow): HERE, at their pre-async position,
+  // unless the async queue is taking them (SetDerivedDeferred; the header
+  // says why the off path must not move them). Deferred, they record later
+  // from this same context (EncodeDerived).
+  // lastTickCxValid_ is "rows still owed": an EncodeDerived after an inline
+  // recording is a no-op, never a second dispatch of the same rows.
   lastTickCx_ = cx;
-  lastTickCxValid_ = true;
+  lastTickCxValid_ = derivedDeferred_;
+  if (!derivedDeferred_) RecordTable(enc, pass::Table::Derived, &cx);
 
   // MLS-MPM fluid: seam front half (compaction, spawns, excite), the substep
   // table kFluidSubsteps times, then the seam back half (settle) — all into

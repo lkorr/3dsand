@@ -2296,6 +2296,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // discharge row itself and what the ledger's rule-2 refusal compares against.
   const uint32_t fluidSpawnTotal =
       fluidSpawnCount + drainBodies * kWaterDrainOpsPerBody;
+  // ASYNC COMPUTE (docs/PLAN_async_compute.md): decided BEFORE EncodeTick,
+  // which records the derived rows inline (their pre-async position) unless
+  // the async queue is taking them. SANDVOX_ASYNC_DRYRUN=1 switches the
+  // timelines on (every main submit signals one) but keeps the rows on the
+  // main queue: the isolation arm that prices the semaphore traffic alone.
+  static const bool kAsyncDry = [] {
+    const char* e = std::getenv("SANDVOX_ASYNC_DRYRUN");
+    return e && *e == '1';
+  }();
+  const bool derivedAsync = ctx.device.AsyncComputeEnabled() && !kAsyncDry;
+  sim.SetDerivedDeferred(derivedAsync);
   sim.EncodeTick(enc, (uint32_t)ops.size(), hashEnable, (uint32_t)exps.size(),
                  particlesActive, cellCount, spawnCount,
                  fluidLive + fluidSpawnTotal, fluidSpawnTotal,
@@ -2353,24 +2364,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       g_stallStats.refusedArm++;
     }
   }
-  // ---- THE DERIVED ROWS, LAST (docs/PLAN_async_compute.md) ---------------
-  // The openness grid and the glow field (pass_table.def PT_DERIVED): render-
-  // only, read by nothing in the sim, fed by this tick's voxels and dirty list.
-  // At the END of the tick in both modes — into this command buffer, or into
-  // an encoder for the async compute queue that is submitted right behind it
-  // and waits for it — so the two schedules execute the same commands against
-  // the same inputs and differ only in what may run BESIDE them. Recorded
-  // before FlipPage: the rows bind this tick's page of the sim bind group.
+  // ---- THE DERIVED ROWS ON THE ASYNC QUEUE (docs/PLAN_async_compute.md) ---
+  // Only when SetDerivedDeferred(true) above: the openness grid and the glow
+  // field (pass_table.def PT_DERIVED), render-only, read by nothing in the
+  // sim, recorded into an encoder for the async compute queue that is
+  // submitted right behind this one and waits for it. Recorded before
+  // FlipPage: the rows bind this tick's page of the sim bind group. If the
+  // async encoder cannot be made they record at the end of this buffer
+  // instead (EncodeDerived is a no-op when EncodeTick already recorded them).
   rhi::CommandEncoder aenc;
-  // SANDVOX_ASYNC_DRYRUN=1: switch the timelines on (every main submit signals
-  // one) but keep the derived rows on the main queue — the isolation arm that
-  // prices the semaphore traffic apart from the second queue.
-  static const bool kAsyncDry = [] {
-    const char* e = std::getenv("SANDVOX_ASYNC_DRYRUN");
-    return e && *e == '1';
-  }();
-  if (ctx.device.AsyncComputeEnabled() && !kAsyncDry)
-    aenc = ctx.device.CreateAsyncComputeEncoder("derived");
+  if (derivedAsync) aenc = ctx.device.CreateAsyncComputeEncoder("derived");
   if (aenc)
     sim.EncodeDerived(aenc, /*asyncQueue=*/true);
   else

@@ -61,14 +61,24 @@ families (no ownership transfers: the set the async work touches is decided per
 tick); images never reach the async queue.
 
 **Which passes.** `pass_table.def` tags the five openness/glow rows
-`PT_DERIVED` (they were the last rows of `PT_TICK`). `Simulation::EncodeDerived`
-records them from the tick's own record context and bind-group page, and
-`SubmitTick` puts them at the END of the tick in both modes: into the tick's
-command buffer (switch off) or into an async-queue encoder submitted right
-behind it (switch on). Same commands, same inputs, same position in the
-stream; only what may run beside them differs. They now run after the MLS-MPM
-tables and the far fill rather than before (render-only; no hashed buffer
-reads them).
+`PT_DERIVED` (they were the last rows of `PT_TICK`). **Switch off:**
+`EncodeTick` records them itself, right after the tick table — exactly where
+they always were, so the off-mode command stream is the pre-async one plus the
+256-byte `copy_renderUBOTick` row. **Switch on:** `SubmitTick` sets
+`Simulation::SetDerivedDeferred(true)` before `EncodeTick`, which then leaves
+them out, and `EncodeDerived` records them from the tick's saved record
+context and bind-group page into an async-queue encoder submitted right behind
+the tick. On the async queue they therefore see the voxels AFTER the MLS-MPM
+seam's settle and the far fill (render-only either way; no hashed buffer reads
+them, and the async-on hash is the off hash).
+
+*Audit 2026-10-02:* as first built, the off path ALSO moved the rows to the
+end of the tick, behind the seam's settle — whose voxel writes then reached the
+openness walk a tick before the occupancy it skips empty bricks by. Render-only
+and small, but a behaviour change for a switch documented as scheduling only;
+the off path now records them in place (`--shot` matches main 6c55214's exe to
+within the shot's own run-to-run noise, and the village-fire perf hash is
+identical).
 
 One input had to move: the openness rows read the key light from RenderUBO,
 which every frame UPLOADS at the head of its first command buffer — a write to
@@ -127,6 +137,20 @@ reads; everything they read is written by nothing until the join.
   validation: 5dabc010, both gates PASS, 0 messages (404 async submits, 2
   splits, 402 head joins in the device record of `build/last_run.json`).
 * The perf arms below hold the scenario hash at 1d62bf26 in every arm.
+
+* **Audit (2026-10-02), after the off-path fix:** async ON,
+  `--vk-validation --verify determinism,gi-bounce,shadow-cache,openness,glow
+  --shot-frames screenshot` on the compute-only family (device picked by
+  name): 5dabc010, all PASS, 0 validation messages (415 async submits, 5
+  splits, 410 head joins). `--vk-validation --perf --scenario village-fire`,
+  async ON: 1350 async submits, 750 splits, hash d7633cb6 = off; the only 2
+  messages are the pass timer's `query not reset`, which main 6c55214's exe
+  reports identically (2) with no async code at all. Async OFF vs main's exe,
+  village-fire, exclusive: p50 30.70 vs 30.66 ms, CPU encode 0.333 / submit
+  0.055 ms both, every GPU row within noise, same hash. A window RESIZE with
+  async on was not exercised (not scriptable headless); the present path goes
+  through the same `SubmitMainImpl` and swapchain recreation waits both
+  queues idle.
 
 ## 4. Before / after (in-process arms, exclusive lock)
 

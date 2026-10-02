@@ -170,10 +170,21 @@ class Simulation {
 
   // The tick's RENDER-ONLY derived passes (pass_table.def PT_DERIVED: openness
   // + glow), recorded with the SAME counts, flags and bind-group page the last
-  // EncodeTick used — so call it before FlipPage. SubmitTick records it LAST in
-  // the tick's own command buffer, or (render.asyncCompute) into an encoder for
-  // the async compute queue; `asyncQueue` drops the pass timer, whose query
-  // pool belongs to the main queue. docs/PLAN_async_compute.md.
+  // EncodeTick used — so call it before FlipPage. docs/PLAN_async_compute.md.
+  //
+  // WHERE THEY RECORD (audit 2026-10-02): with SetDerivedDeferred(false) — the
+  // default, render.asyncCompute OFF — EncodeTick records them itself, right
+  // after the tick table, which is exactly where they sat as PT_TICK rows
+  // before the async work: the command stream with the switch off is the
+  // pre-async one plus the one 256-byte RenderUBOTick copy. They must NOT move
+  // to the end of the tick in that mode: the MLS-MPM seam's settle writes
+  // voxels after the tick table, and the derived walk would then read voxels
+  // newer than the occupancy it skips empty bricks by (a render-visible change
+  // for a switch that is meant to be scheduling only). With
+  // SetDerivedDeferred(true) EncodeTick leaves them out and SubmitTick calls
+  // EncodeDerived on the async encoder; `asyncQueue` drops the pass timer,
+  // whose query pool belongs to the main queue.
+  void SetDerivedDeferred(bool deferred) { derivedDeferred_ = deferred; }
   void EncodeDerived(const rhi::CommandEncoder& enc, bool asyncQueue = false);
 
   // ---- the settled-tick skip (ROADMAP_scale.md §3.4) ----------------------
@@ -762,6 +773,7 @@ class Simulation {
   pass::RecordCtx lastTickCx_{};
   bool lastTickCxValid_ = false;
   bool recordNoTimer_ = false;
+  bool derivedDeferred_ = false;  // SetDerivedDeferred
 
   World* world_ = nullptr;
   rhi::Device device_;

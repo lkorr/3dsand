@@ -20993,8 +20993,9 @@ sim and the render cannot overlap without a second copy of the world (~1.7 GiB
 on an 8 GiB card). What CAN overlap is the tick's render-only derived passes
 (openness + glow, 1.8 ms) against the head of the next frame (sky top, ray
 start). Built that way: those five rows are `PT_DERIVED` in the pass table,
-recorded LAST in the tick (in its own command buffer, or on the async queue
-with `render.asyncCompute`), read the key light from a tick-end copy of
+recorded in place at the end of the tick table with the switch off (the
+pre-async stream plus one 256-byte copy), or on the async queue behind the
+tick with `render.asyncCompute`, read the key light from a tick-end copy of
 RenderUBO (`RenderUBOTick`) so the next frame's upload does not conflict, and
 two timeline semaphores order the queues. `vk_record.cpp` places the join
 itself: every buffer touch already passes through its tracker, so an async
@@ -21959,10 +21960,16 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
      div/mod and shift polyfills and workgroup zero-init are all ON, so the
      classic vendor splits are defined; no runtime float reaches hashed
      state) found the remaining risks are *races*, which differ run to run on
-     ONE vendor as much as across two. Two were fixed (the water-body shave's
-     two-workgroup column at `level % 16 == 0`; the rain-exposure write past
-     its buffer); the open ones are listed in `docs/PLAN_vulkan_port.md`'s
-     cross-vendor note and the 2026-10-02 audit table.
+     ONE vendor as much as across two. Fixed: the water-body shave's
+     two-workgroup column at `level % 16 == 0`, the rain-exposure write past
+     its buffer, and (the branch audit) the brush-overlap dedupe's read race
+     (one thread per cell now), the particle landing support flag's reads of
+     cells other particles land in, the brush support flag's neighbour reads,
+     and stained AIR now folds into the hash. Open (each with its fix design
+     in `docs/PLAN_vulkan_port.md`'s 2026-10-02 audit table): pool-cap
+     refusal order at saturation, far-cascade fill timing, the fardown stalk
+     clear, and the support-flag neighbour reads of exact-cell ops and the
+     blast kernel.
    - **The test that closes it is now one command on the other machine:**
      `sandvox.exe --fingerprint fp_<vendor>.json` writes the determinism
      gate's 200 per-tick hashes, the gas digest and the per-slot voxel digests

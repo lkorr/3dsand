@@ -184,6 +184,10 @@ struct Caps {
   // optional: absent, `--shader-stats` prints one line saying so and exits 2,
   // and nothing else in the engine notices.
   bool pipelineExecutableProps = false;
+  // VkPipelineCreationFeedbackCreateInfo may be chained: core 1.3, or
+  // VK_EXT_pipeline_creation_feedback enabled on a 1.2 device (Dozen). Without
+  // either the struct is invalid in a create-info chain.
+  bool creationFeedback = false;
 };
 
 // One statistic the driver reports for one pipeline executable. Values are kept

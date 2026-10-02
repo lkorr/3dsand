@@ -486,6 +486,27 @@ fn markDirtyNext(c : vec3<i32>) {
 // floating at the waterline IS supported, and flagging it would hand it to
 // island detection, which counts liquid as empty, converts the raft to a
 // rigidbody, settles it back to the grid, and flags it again forever.
+//
+// ORDER-FREE (2026-10-02, cross-vendor audit). The cells this reads are the
+// cells OTHER particles land in during this same dispatch: two chips landing
+// side by side each saw the other as air or as solid depending on which
+// invocation stored first, so the flag — and the island scan it queues, whose
+// cooldown and drain then shift when islands drop — was scheduling-dependent.
+// A cell's MATERIAL can change in resolve only where some particle won its
+// claim slot, and every claim was published (atomicMax, order-free) by the
+// integrate pass before this one, so `claim[slot] == 0` proves the cell is not
+// written here and its read is stable. A claimed cell may or may not receive
+// a voxel, so it is not read at all. As a NEIGHBOUR it counts as solid (it
+// may be): flag more, never less. BELOW, it counts as support and no flag is
+// raised — the other choice would also be order-free, but it could hand a
+// raft whose waterline cell another chip aims at to island detection, the
+// loop the liquid rule above exists to prevent; and the chip that does land
+// below raises the flag itself if it is hanging (its UP neighbour is this
+// claimed cell, which reads as solid). Every input is fixed before the
+// dispatch starts. A claimSlot collision only makes a cell look claimed.
+fn landedCellStable(c : vec3<i32>) -> bool {
+  return atomicLoad(&claim[claimSlot(claimCellId(c))]) == 0u;
+}
 fn flagLandedUnsupported(c : vec3<i32>, mat : u32) {
   if (materials[mat].klass != CLASS_SOLID) { return; }
   // WINDOW cells only, as flagSupportLoss (common.wgsl): the island scan that
@@ -496,15 +517,20 @@ fn flagLandedUnsupported(c : vec3<i32>, mat : u32) {
   if (!inWindow(c, T.origin)) { return; }
   let b = c + vec3<i32>(0, -1, 0);
   if (!inBounds(b)) { return; }
-  if (voxMat(voxWordAt(b)) != MAT_AIR) { return; }  // ground, powder or water
+  // ground, powder or water; or a cell another particle may land in
+  if (!landedCellStable(b) || voxMat(voxWordAt(b)) != MAT_AIR) { return; }
   var off = array<vec3<i32>, 5>(
       vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0), vec3<i32>(0, 0, 1),
       vec3<i32>(0, 0, -1), vec3<i32>(0, 1, 0));
   for (var i = 0u; i < 5u; i = i + 1u) {
     let n = c + off[i];
     if (!inBounds(n)) { continue; }
-    let nm = voxMat(voxWordAt(n));
-    if (nm != MAT_AIR && materials[nm].klass == CLASS_SOLID) {
+    var solid = !landedCellStable(n);
+    if (!solid) {
+      let nm = voxMat(voxWordAt(n));
+      solid = nm != MAT_AIR && materials[nm].klass == CLASS_SOLID;
+    }
+    if (solid) {
       atomicStore(&supportOut[chunkIndexW(c)], 1u);
       return;
     }

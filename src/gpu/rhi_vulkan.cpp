@@ -967,7 +967,13 @@ bool Backend::CreateLogicalDevice(std::string& err) {
       devExts.push_back(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
     if (haveExt(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME))
       devExts.push_back(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+    // Pipeline creation feedback (the cache hit/miss record) is core 1.3; on
+    // 1.2 the struct is only legal in a create-info chain with the EXT on.
+    if (haveExt(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME))
+      devExts.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
   }
+  caps_.creationFeedback =
+      core13 || haveExt(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
   // Timeline semaphores (core 1.2): the async queue's cross-queue ordering.
   // Enabled when present; without them the async queue is simply not used.
   if (caps_.timelineSemaphore) {
@@ -2378,7 +2384,7 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   fbi.pPipelineCreationFeedback = &fb;
   fbi.pipelineStageCreationFeedbackCount = 1;
   fbi.pPipelineStageCreationFeedbacks = &stageFb;
-  ci.pNext = &fbi;
+  if (caps_.creationFeedback) ci.pNext = &fbi;  // else fb reads "not valid"
 
   VkPipeline p = VK_NULL_HANDLE;
   // A cache HIT hands back an object the driver did not compile this run, and
@@ -2591,7 +2597,7 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
   fbi.pPipelineCreationFeedback = &fb;
   fbi.pipelineStageCreationFeedbackCount = ci.stageCount;
   fbi.pPipelineStageCreationFeedbacks = stageFb;
-  ri.pNext = &fbi;
+  if (caps_.creationFeedback) ri.pNext = &fbi;  // else fb reads "not valid"
 
   VkPipeline p = VK_NULL_HANDLE;
   // See the compute path: the on-disk cache is bypassed under captureStats_
