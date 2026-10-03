@@ -68,6 +68,22 @@
 // cost, and it is deliberately not smuggled in here — it is written down
 // because the number that motivates it took one instrumented run to get and
 // would take a dozen elimination runs to guess.
+//
+// ---- AND THEN THE NUMBER WENT AWAY (re-measured 2026-10-03) ---------------
+// The sort was never built, because by the time anyone came to build it the
+// 3.9 ms it was aimed at no longer existed. STAGGERED REFRESH (each valid
+// patch re-cast once every SHADOW_REFRESH_PERIOD frames) and the nearest-patch
+// read below SHADOW_NEAREST_PX (raymarch.wgsl) cut the request list from
+// ~178k to ~90k on the overlook and the rays it holds to a quarter of that.
+// Measured with --render-budget in one process, the `pre` span with this
+// pass's ray zeroed (traceOpaque at 0 steps, no far continuation) against the
+// shipped pass: noon 0.09 ms, seam 0.05, meadow 0.09 — the WHOLE ray cost of
+// this pass, coherent or not. A Morton sort costs three dispatches and their
+// barriers before it saves anything, and the most it could save is a fraction
+// of 0.09 ms. Not worth a pass. If the request count ever climbs back toward
+// the cap (a lower PERIOD, a finer subdiv), re-measure before building it.
+// The shadow cost that IS left is the far cascade's (raymarch.wgsl
+// farShadowMarch, in the fragment shader): 0.6 ms noon, ~1 ms cascade.
 
 @group(0) @binding(0) var<storage, read> voxels    : array<u32>;
 @group(0) @binding(1) var<storage, read> occupancy : array<u32>;
@@ -238,6 +254,9 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
             let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
             vMax[a] = (boundary - roL[a]) * inv[a];
           }
+          // raymarch.wgsl farShadowMarch, THE ROW SKIP INSIDE THE CHUNK: a
+          // rising ray past the chunk's top row can meet nothing more in it.
+          let yTopRow = select(i32(0x7FFFFFFF), cLo.y + i32(top), top != 0u);
           for (var j = 0; j < 3 * i32(CHUNK); j++) {
             if (budget <= 0) { break; }
             budget -= 1;
@@ -250,6 +269,7 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
             }
             if (vCur >= tOut || vCur >= tExit) { break; }
+            if (stepv.y > 0 && vc.y >= yTopRow) { break; }
           }
         }
       }

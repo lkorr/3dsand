@@ -1065,6 +1065,35 @@ def check_wind_streak():
                         f"{gt.group(1)}/{gs.group(1)} -- the pool's rows would misalign")
 
 
+def check_godray_vis():
+    """The god-ray visibility volume's dimensions: pass_table.h, godray_vis.wgsl
+    and raymarch.wgsl must agree.
+
+    The C++ sizes the buffer and the row's dispatch from kGodVisNX/NY/NZ; the
+    kernel writes and godRays reads by GV_NX/GV_NY/GV_NZ. A mismatch reads
+    another block's answer -- god-ray shafts cut by rock that is not there,
+    with no error anywhere.
+    """
+    ph = read("src/sim/pass_table.h")
+    gk = read("assets/shaders/godray_vis.wgsl")
+    rm = read("assets/shaders/raymarch.wgsl")
+    if not ph or not gk or not rm:
+        return
+    m = re.search(r"kGodVisNX\s*=\s*(\d+),\s*kGodVisNY\s*=\s*(\d+),\s*kGodVisNZ\s*=\s*(\d+)", ph)
+    if not m:
+        problems.append("godray vis: could not find kGodVisNX/NY/NZ in pass_table.h")
+        return
+    want = m.groups()
+    for path, txt in (("godray_vis.wgsl", gk), ("raymarch.wgsl", rm)):
+        got = tuple((re.search(rf"const\s+GV_{a}\s*:\s*i32\s*=\s*(\d+)", txt) or [None, None])[1]
+                    for a in ("NX", "NY", "NZ"))
+        if got != want:
+            problems.append(f"godray vis: pass_table.h kGodVisNX/NY/NZ = {want} but {path} "
+                            f"GV_NX/NY/NZ = {got} -- blocks would be read from the wrong slots")
+            return
+    checked.append("godray vis volume")
+
+
 def check_drafts():
     """The wind-draft volume's layout lives in world.h AND as DRAFT_* consts.
 
@@ -3249,6 +3278,7 @@ ALL = {
     "windmirror": check_wind_mirror,
     "windstreak": check_wind_streak,
     "drafts": check_drafts,
+    "godrayvis": check_godray_vis,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,
     "counts": check_tick_counts,

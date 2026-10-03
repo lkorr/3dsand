@@ -2468,6 +2468,40 @@ bool CamSubmerged(Scene& s, uint32_t& tick, std::string& why) {
   return false;
 }
 
+// THE LAKE FROM ITS SHORE (2026-10-03, raymarch-shadow-water). Every other
+// camera here shows a few hundred water-surface pixels at most (rmPxWater ~0),
+// so nothing priced shadeWater: the fullness-gradient normal, the ripple field,
+// the caustic web on the bed, the traced reflection. The same authored lake
+// the submerged camera dives into, seen from 2 m above its surface over the
+// middle of its -x half, looking across it toward +x and down, so most of the
+// frame is water surface with the far shore beyond it. Declines for the same
+// reason the submerged camera does.
+bool CamLake(Scene& s, uint32_t& tick, std::string& why) {
+  for (int i = 0; i < World::WaterSiteCount(); i++) {
+    const World::PondDisc p = World::WaterSiteDisc(i, kDefaultSeed);
+    if (!p.present || p.fillId == 0u) continue;
+    const int ex = p.cx - p.r / 2;
+    const int ey = p.surf + 20;
+    if (!s.world.CellInWindow({ex, ey, p.cz}) ||
+        !s.world.CellInWindow({p.cx, p.surf, p.cz}))
+      continue;
+    s.eye = {(float)ex, (float)ey, (float)p.cz};
+    s.cam.yaw = 0.0f;     // +x, across the lake
+    s.cam.pitch = -0.45f; // down onto the water
+    char note[256];
+    std::snprintf(note, sizeof note,
+                  "ABOVE the authored lake: disc r=%d at (%d,%d), surface y=%d, "
+                  "eye (%d,%d,%d) — 2 m up over the -x half, looking across "
+                  "it and down", p.r, p.cx, p.cz, p.surf, ex, ey, p.cz);
+    s.note = note;
+    tick = FindNoonTick(CurrentTuning());
+    return true;
+  }
+  why = "no authored water pool inside the residency window (run with "
+        "SANDVOX_MAP=harness: the harness map's fixture lake is at (420,420))";
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // THE FOLIAGE CAMERAS (2026-09-05).
 //
@@ -2834,6 +2868,8 @@ const char* const kArmsCascade[] = {
 const char* const kArmsFoliage[] = {
     "baseline", "noshadow",  "nogi", "nofar",  "halfres", "nomicro",
     "micro1",   "plantlod4", "lod8", "fine2m", nullptr};
+const char* const kArmsLake[] = {
+    "baseline", "noshadow", "noreflect", "reflgate", "nofar", "halfres", nullptr};
 const char* const kArmsSubmerged[] = {
     "baseline", "noshadow", "nofar",       "noreflect",
     "halfres",  "nogodray", "godshadow0",  nullptr};
@@ -2937,6 +2973,8 @@ const BudgetCam kBudgetCams[] = {
     {"submerged",
      "eye inside the authored lake — god rays, caustics, Snell's window",
      CamSubmerged, kArmsSubmerged},
+    {"lake", "above the authored lake from its shore: the water surface shade",
+     CamLake, kArmsLake},
     {"meadow",
      "standing in the densest grass the window has — the plant march",
      CamMeadow, kArmsFoliage},

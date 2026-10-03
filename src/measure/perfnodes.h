@@ -253,11 +253,14 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "", "CPU here is draw-call encode and instance uploads only. The GPU cost "
      "of the frame is the raymarch row."},
     {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
-     PerfScope::Count, "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce",
+     PerfScope::Count,
+     "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce;godray_vis",
      "One media-blind shadow ray per visible surface PATCH, instead of one per "
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
-     "trade working (world.h kShadowCacheBuckets)."},
+     "trade working (world.h kShadowCacheBuckets). Also the under-water god-ray "
+     "sun visibility volume (godray_vis.wgsl): one coarse sun ray per 4^3 block "
+     "round a submerged eye, ~0 when the eye is dry."},
     // The clouds (cloud.wgsl): the noise bake (once), the weather / shadow /
     // env maps and the low-res march + temporal resolve, all per FRAME on the
     // ShadowCache table. Zero when weather.clouds is off or the sky is empty —

@@ -145,6 +145,7 @@ PIPE_TO_MEMBER = {
     "PIPE_RAY_START_MIN": "rayStartMin_",
     "PIPE_RAIN_MAP_PREP": "rainMapPrep_",
     "PIPE_RAIN_MAP_BUILD": "rainMapBuild_",
+    "PIPE_GODRAY_VIS": "godrayVis_",
     "PIPE_RAIN_EXPO": "rainExpo_",
     "PIPE_WIND_STREAK": "windStreak_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
@@ -246,6 +247,7 @@ BUF_TO_WGSL = {
     "ShadowHist": {"shadowHist"},
     "RayStart": {"rayStart"},
     "RainMap": {"rainMap"},
+    "GodVis": {"godVis"},
     "RainExpo": {"rainExpo"},
     # Wind drafts. DraftArgs is indirect-only and never bound, like SolArgs.
     "Draft": {"draftField"},
