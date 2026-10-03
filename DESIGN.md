@@ -2185,6 +2185,17 @@ Noita's "Bloody Zombies" technique, on GPU:
 - Particles integrate ballistically each tick, DDA-stepping through the grid;
   on hitting a non-empty voxel they **reinsert into the grid** at the last empty
   cell (waking that chunk).
+- **AT THE CAP, A WHOLE GROUP IS REFUSED, NEVER THE LATE ARRIVALS**
+  (2026-10-03, cross-vendor audit #4). Producers append with an atomicAdd
+  cursor; below `kParticleCap` the slot a particle gets is scheduling-dependent
+  and harmless (claims are state-keyed priorities), but at the cap the
+  survivors used to be the first arrivals — which ejecta flew, landed and
+  stained was workgroup order. Now `args1`/`args2` COMMIT each page:
+  everything appended since the page's last commit (MPM spray of the previous
+  tick, this tick's blast ejecta and grit, CPU spawns) is kept if the counter
+  — a sum, so order-free — fits, and otherwise rolled back to the committed
+  count and counted (`particleCounts` words 2..5). Invisible under the cap.
+  Gate: `particle-cap`.
 - **A LIQUID IS NOT A WALL** (2026-09-13, `docs/PLAN_debris_buoyancy.md`). It was
   one until then — "splash = plop onto the surface" — and that is what built
   rafts of exploded tree hanging over a pond: the first chip stopped on the
@@ -5251,6 +5262,21 @@ neighbors, so this needs an explicit connectivity pass:
   all-stone post astride a chunk boundary, one exact-cell erase between two
   solids; the CA cannot move stone, so the two flagged chunks it measures can
   only have come from the mutation path).
+- **A neighbour written by the SAME dispatch is read as it ENDS the dispatch
+  (2026-10-03, cross-vendor audit #10).** The flag looks at the vacated
+  cell's six neighbours, and inside one mutation dispatch a neighbour can be
+  another op's cell, stored by another invocation at that very moment — read
+  before the store it was solid (flag), after it air (none), so the island
+  scan's timing (cooldowns, drain = world state) depended on scheduling. Each
+  writer now answers for the post-dispatch grid: the brush (`main`) treats a
+  neighbour any op's sphere covers as solid (a superset); `cells`
+  (`flagSupportLossCells`) finds the neighbour's own op by binary search —
+  `SubmitTick` uploads the voxel ops sorted by `cellIdx` — and derives the
+  material it ends with from the op word and its read, whichever side of the
+  store that read fell (`cellOpPostMat`); the blast (`flagSupportLossBlast`)
+  skips a neighbour the mark mask says this dispatch destroys. Gate:
+  `support-flag-post` (a pillar's top cell and the cell above it, astride a
+  chunk face, erased in one dispatch: the upper chunk must NOT be flagged).
 - **Bounded 6-connected flood fill** outward from voxels adjacent to the removal.
   Meeting fronts merge. If a fill exceeds ~32,000 voxels (~8 chunks), abort and
   declare "not an island" — an unbounded check could collapse an entire dungeon
@@ -13357,8 +13383,15 @@ where you hear from either (§12b, "The ears are on the character").
   voxels — wider than a 16-voxel chunk for k ≥ 2 — neighboring chunks' byte
   writes collide, so `farVox`/`farOcc` are atomic in both far kernels
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
-  keeps it conservative: never falsely zero). Atomics are legal here precisely
-  because cascades carry no determinism requirement.
+  keeps it conservative: never falsely zero). Atomics are legal here because
+  each byte has ONE writer per dispatch (the chunk owning its centre sample)
+  and the and+or pair commutes with other bytes' — NOT because the cascade
+  carries no determinism requirement: particles outside residency collide
+  with level 1 (`sim_particle.wgsl farBlocked`), so a byte that depends on
+  scheduling is a landing that depends on it. That is why the downsample's
+  follow-up checks are three further dispatches (`fardownClaim`,
+  `fardownStalk`, `fardownFeat`; cross-vendor audit #9, 2026-10-03): inline,
+  the cut-stalk clear read a byte another chunk's downsample was rewriting.
   **A dirty chunk whose far-visible matter did not change is skipped
   (2026-09-22).** The dirty list says a chunk was WRITTEN, not that anything
   the cascade holds changed — and gas never reaches the cascade, so a burning
@@ -13765,7 +13798,13 @@ where you hear from either (§12b, "The ears are on the character").
     skips a cell whose slot is a sub-column's sub-skin (the stalk's own cell).
     Stalks shade, cast contact shadows and take AO as terrain. `fardown`
     checks a stalk entry's claim at the stalk's own fine column; a cut stalk
-    clears VALID and un-marks its cells (no ghost column).
+    clears VALID and un-marks its cells (no ghost column) — in `fardownStalk`,
+    a dispatch after every claim of the tick has settled, with one verdict per
+    cell: un-marked if it holds ANY of its level cell's stalks' slots and no
+    still-standing one passes through it, restored to the blocker iff its
+    floor is at or under the highest ground of its four sub-columns (so the
+    fill's first-wins mark and two cut stalks of different ground cannot make
+    the outcome depend on order).
   - **The FEATURE PLANE** (`sim/farfeat.h`; worldgen.wgsl `FAR_FEAT_*`): 8 MiB
     after the surface map in the same buffer (no new binding), levels 1-2, one
     word per sub-column: the tallest MICRO plant's top (mod 256), height,
@@ -22579,11 +22618,15 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
      its buffer, and (the branch audit) the brush-overlap dedupe's read race
      (one thread per cell now), the particle landing support flag's reads of
      cells other particles land in, the brush support flag's neighbour reads,
-     and stained AIR now folds into the hash. Open (each with its fix design
-     in `docs/PLAN_vulkan_port.md`'s 2026-10-02 audit table): pool-cap
-     refusal order at saturation, far-cascade fill timing, the fardown stalk
-     clear, and the support-flag neighbour reads of exact-cell ops and the
-     blast kernel.
+     and stained AIR now folds into the hash. Closed 2026-10-03 (the audit
+     table's rows #4/#9/#10): the particle ring refuses whole append groups at
+     its cap (`particle-cap`), the fardown stalk clear is its own dispatch,
+     and the exact-cell and blast support flags read the post-dispatch grid
+     (`support-flag-post`). Still open: far-cascade FILL TIMING (#5: the
+     level-1 bytes particles outside residency collide with are filled on a
+     wall-clock schedule — the deferred `far` compile and the per-frame bulk
+     slice — which needs an owner decision, options in the table) and the gas
+     pool's `gasLeave` cap (another package).
    - **The test that closes it is now one command on the other machine:**
      `sandvox.exe --fingerprint fp_<vendor>.json` writes the determinism
      gate's 200 per-tick hashes, the gas digest and the per-slot voxel digests

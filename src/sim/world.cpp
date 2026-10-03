@@ -267,7 +267,13 @@ void World::Init(const rhi::Device& device) {
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");
   particles[1] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesB");
-  particleCounts = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
+  // 8 u32, not the 4 world.h's member comment still says: [0]/[1] = live
+  // count per page, [2]/[3] = each page's COMMITTED count, [4]/[5] =
+  // particles / append groups refused at the cap (cumulative since the last
+  // worldgen or load reset, which clear the whole buffer), [6]/[7] spare. The
+  // commit rule that makes the cap's refusals order-free is
+  // sim_particle.wgsl's "THE RING'S CAP" note (cross-vendor audit #4).
+  particleCounts = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst,
                                 "particleCounts");
   claim = CreateBuffer(device, (uint64_t)kClaimWords * 4, U::Storage | U::CopyDst, "claim");
   pArgsStage = CreateBuffer(device, 32, U::Storage | U::CopySrc, "pArgsStage");

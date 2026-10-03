@@ -131,6 +131,48 @@ fn destroyedBy(opIdx : u32, c : vec3<i32>) -> u32 {
   return expMask[maskIndex(opIdx, local)];
 }
 
+// Is world cell `n` destroyed by THIS dispatch? `mark` wrote a non-zero mask
+// word for every cell some op destroys (and the mask was cleared at the top of
+// the tick, pass_table.def fill_expMask), and `apply` stores air into exactly
+// those cells — the overlap dedupe below picks one writer, never none. So the
+// answer is a pure function of the mask, which `apply` never writes.
+fn destroyedThisDispatch(n : vec3<i32>) -> bool {
+  if (!inBounds(n)) { return false; }
+  for (var j = 0u; j < T.expCount; j++) {
+    if (destroyedBy(j, n) != 0u) { return true; }
+  }
+  return false;
+}
+
+// ---- THE BLAST'S SUPPORT-LOSS FLAG (common.wgsl flagSupportLoss, made
+// order-free for this dispatch; cross-vendor audit #10, 2026-10-03) ----------
+// flagSupportLoss reads the six neighbours of the vacated cell, and inside
+// `apply` a neighbour can be a cell another invocation is zeroing at that
+// moment: read before its store it is solid (flag), after it air (no flag).
+// The flag is not inert -- it summons the island scan, whose cooldowns and
+// per-tick drain move WHEN islands drop -- so the race reached the world.
+//
+// Here it is answered EXACTLY rather than conservatively (the brush's
+// flagSupportLossBrush flags a covered neighbour unconditionally because a
+// brush op's write depends on the occupant): a neighbour this dispatch
+// destroys ends the dispatch as AIR, which never needs support, and every
+// other neighbour is not written by this dispatch, so its read is stable. The
+// outcome is the POST-dispatch grid's answer, a pure function of the mask and
+// the grid. newMat is always air here (apply only ever stores 0).
+fn flagSupportLossBlast(c : vec3<i32>, oldKlass : u32) {
+  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
+  for (var i = 0u; i < 6u; i++) {
+    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    let n = c + faceDir(i);
+    if (!inWindow(n, ptOrigin())) { continue; }
+    if (destroyedThisDispatch(n)) { continue; }  // air after this dispatch
+    let nmat = voxMat(voxWordAt(n));
+    if (nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID) {
+      atomicStore(&supportOut[chunkIndexW(n)], 1u);
+    }
+  }
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn apply(@builtin(workgroup_id) wg : vec3<u32>,
          @builtin(local_invocation_id) lid : vec3<u32>) {
@@ -165,7 +207,7 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   // same as noticing the loss. The flag is what reaches island detection.
   // Distinct from the shockwave's markBoth in `mark`: that one wakes chunks the
   // blast passed THROUGH without destroying anything, where nothing vacated.
-  flagSupportLoss(c, materials[voxMat(w)].klass, MAT_AIR);
+  flagSupportLossBlast(c, materials[voxMat(w)].klass);
 
   let m = materials[voxMat(w)];
   var ejectPerMille = TUNE_EJECT_SOLID;

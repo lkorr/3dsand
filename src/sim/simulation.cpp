@@ -2228,6 +2228,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   farMapFill_ = {};
   farPatchFill_ = {};
   farDown_ = {};
+  farDownClaim_ = {};
+  farDownStalk_ = {};
+  farDownFeat_ = {};
   farPublished_ = false;
   farStarted_ = false;
   farReady_.store(false, std::memory_order_release);
@@ -2329,6 +2332,11 @@ void Simulation::StartFarBuild(unsigned threads) {
       r.map = MakeComputePipeline(dev, layout, module, "farmap", "farMapFill");
     });
     r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    // fardown's follow-up phases: no procgen in them, so they compile in a
+    // fraction of fardown's time and share the fill's thread.
+    r.downClaim = MakeComputePipeline(dev, layout, module, "fardownClaim", "farDownClaim");
+    r.downStalk = MakeComputePipeline(dev, layout, module, "fardownStalk", "farDownStalk");
+    r.downFeat = MakeComputePipeline(dev, layout, module, "fardownFeat", "farDownFeat");
     map.join();
     patch.join();
     down.join();
@@ -2371,6 +2379,9 @@ void Simulation::StartFarBuild(unsigned threads) {
     farMapFill_ = std::move(r.map);
     farPatchFill_ = std::move(r.patch);
     farDown_ = std::move(r.down);
+    farDownClaim_ = std::move(r.downClaim);
+    farDownStalk_ = std::move(r.downStalk);
+    farDownFeat_ = std::move(r.downFeat);
     farPublished_ = true;
     farReady_.store(true, std::memory_order_release);
   } else {
@@ -2384,11 +2395,15 @@ void Simulation::PublishFarPipelines() {
   farMapFill_ = std::move(r.map);
   farPatchFill_ = std::move(r.patch);
   farDown_ = std::move(r.down);
+  farDownClaim_ = std::move(r.downClaim);
+  farDownStalk_ = std::move(r.downStalk);
+  farDownFeat_ = std::move(r.downFeat);
   farPublished_ = true;
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
-  if (!farFill_ || !farMapFill_ || !farPatchFill_ || !farDown_)
+  if (!farFill_ || !farMapFill_ || !farPatchFill_ || !farDown_ ||
+      !farDownClaim_ || !farDownStalk_ || !farDownFeat_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
                  "stay empty (worldgen.wgsl far/farmap/farpatch/fardown)\n");
@@ -2638,6 +2653,9 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FarPatchFill:   return farPatchFill_;
     case P::FarMapFill:     return farMapFill_;
     case P::FarDown:        return farDown_;
+    case P::FarDownClaim:   return farDownClaim_;
+    case P::FarDownStalk:   return farDownStalk_;
+    case P::FarDownFeat:    return farDownFeat_;
     case P::OpennessDirty:   return opennessDirty_;
     case P::OpennessRefresh: return opennessRefresh_;
     case P::GlowSrc:         return glowSrc_;

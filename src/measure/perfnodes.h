@@ -243,7 +243,8 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "EVERY tick over the window; GPU is the fills a sentinel chunk needs. Page "
      "FAULTS are a bug, not a cost — the page shows them as a red counter."},
     {"farField", "Far-Field Cascades", "worldStorage", PerfSide::Gpu,
-     PerfScope::Count, "farDown;farDownHash;farFill;farMapFill;farPatchFill",
+     PerfScope::Count, "farDown;farDownHash;farDownClaim;farDownHashClaim;farDownStalk;"
+     "farDownHashStalk;farDownFeat;farDownHashFeat;farFill;farMapFill;farPatchFill",
      "Downsample into the cascade pyramid. Flat per tick; the render-side cost "
      "of reading it is in raymarch."},
 

@@ -999,8 +999,29 @@ PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPU
 PASS(farDownHash, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
-          A(FarMap)))
+          R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig) A(FarVox) A(FarOcc)))
+// fardown's three follow-up phases, same list, same args, back to back
+// (cross-vendor audit #9: worldgen.wgsl's split note). The barrier between
+// each pair is the point -- each phase reads what the one before it finished
+// writing (farVox bytes, VALID bits, feature words) -- and the recorder emits
+// it from these uses: A(FarVox)/A(FarMap) on both sides of every edge.
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownHashClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
+// read-only in practice: `farSig` is read_write for the module because `fardown` writes it.
+PASS(farDownHashStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs) R(PageTable) R(FarSig)
+          A(FarVox) A(FarMap)))
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownHashFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -1038,8 +1059,25 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
-          A(FarMap)))
+          R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig) A(FarVox) A(FarOcc)))
+// The follow-up phases (see farDownHashClaim's note).
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
+// read-only in practice: `farSig` is read_write for the module because `fardown` writes it.
+PASS(farDownStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs) R(PageTable) R(FarSig)
+          A(FarVox) A(FarMap)))
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
 
 // ---- the derived rows' RenderParams (docs/PLAN_async_compute.md) ---------
 // LAST on the tick table: RenderUBO -> RenderUBOTick, the copy sim_openness

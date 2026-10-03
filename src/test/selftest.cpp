@@ -558,6 +558,11 @@ const char* const kOrder[] = {
     // neither inherits nor leaves anything the gates around it care
     // about.
     "support-flag",
+    // Cross-vendor audit #10 / #4 (2026-10-03): the cell ops' support flag
+    // reads the post-dispatch grid, and the particle ring refuses whole
+    // groups at its cap. Both regenerate the world on the way in AND out, so
+    // they inherit and leave nothing.
+    "support-flag-post", "particle-cap",
     // Per-voxel body reactivity. Late, and it must be: it lights real fires and
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
