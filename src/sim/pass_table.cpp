@@ -64,6 +64,7 @@ namespace {
 #define PIPE_STEP            Pipe::Step
 #define PIPE_REPOSE_SNAP     Pipe::ReposeSnap
 #define PIPE_CA_MASK         Pipe::CaMask
+#define PIPE_CA_LIST         Pipe::CaList
 #define PIPE_OCCUPANCY       Pipe::Occupancy
 #define PIPE_OCCUPANCY_DIRTY Pipe::OccupancyDirty
 #define PIPE_PICK            Pipe::Pick
@@ -269,6 +270,7 @@ namespace {
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 #define IND_DRAFTARGS     (uint32_t)DispatchSel::IndDraftArgs
 #define IND_HEATARGS      (uint32_t)DispatchSel::IndHeatArgs
+#define IND_CAARGS        (uint32_t)DispatchSel::IndCaArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

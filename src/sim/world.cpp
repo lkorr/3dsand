@@ -953,6 +953,38 @@ void World::KickReadback() {
           for (int bit = 0; bit < kDirtyReasonBits; bit++)
             if (hist[bit]) std::printf(" | %s %u", kDirtyReasonName[bit], hist[bit]);
           std::printf("\n");
+          // ...and the same fold over the awake chunks that hold NO matter
+          // (occupancy's non-air count is 0 after this tick): the CA has
+          // nothing to run in them next tick, so whichever rule asked is the
+          // rule-2 leak (ca-chunk-overhead, 2026-10-03). `sole` counts the
+          // ones a single reason holds, so a fan-out mark can be told from a
+          // chunk that has several.
+          // `stale`: also empty at the previous printed snapshot, i.e. nothing
+          // was emptied out of it -- a mark from OUTSIDE (a neighbour's
+          // fan-out), not the chunk's own last voxel leaving.
+          static std::vector<uint8_t> prevEmpty;
+          if (prevEmpty.size() != kNumSlots) prevEmpty.assign(kNumSlots, 0);
+          uint32_t ehist[kDirtyReasonBits] = {0}, esole[kDirtyReasonBits] = {0};
+          uint32_t empty = 0, stale = 0;
+          for (uint32_t i = 0; i < kNumSlots; i++) {
+            const uint32_t d = dirtyW[i];
+            const bool isEmpty = (occW[i] & 0xFFFFu) == 0;
+            const bool wasEmpty = prevEmpty[i] != 0;
+            prevEmpty[i] = isEmpty ? 1 : 0;
+            if (d == 0 || !isEmpty) continue;
+            empty++;
+            if (wasEmpty) stale++;
+            const bool sole = (d & (d - 1)) == 0;
+            for (int bit = 0; bit < kDirtyReasonBits; bit++)
+              if (d & (1u << bit)) { ehist[bit]++; if (sole) esole[bit]++; }
+          }
+          std::printf("dirty-reasons t%u: EMPTY awake %u (%u empty last print too)",
+                      out.tick, empty, stale);
+          for (int bit = 0; bit < kDirtyReasonBits; bit++)
+            if (ehist[bit])
+              std::printf(" | %s %u (sole %u)", kDirtyReasonName[bit], ehist[bit],
+                          esole[bit]);
+          std::printf("\n");
           std::fflush(stdout);
         }
         std::memcpy(&out.worldHash, b + kHashOff, 4);

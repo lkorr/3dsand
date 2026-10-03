@@ -1945,9 +1945,53 @@ const CA_MASK_WORDS : u32 = CHUNK_VOL / 32u;
 // [2] inert solid (CLASS_SOLID, !matCanAct). Planes 1-2 only ORDER the work
 // (main's gather sorts by them so a warp runs one path); plane 0 decides it.
 const CA_MASK_STRIDE : u32 = 3u * CA_MASK_WORDS;
-// The dirty-chunk count `compact` appended (args[0]); the colour rows read it to
-// pack several chunks into one workgroup (see `main`).
+// ---- THE COLOUR WORK LISTS (2026-10-03, ca-chunk-overhead) -----------------
+// The tail of the same buffer, past the NUM_SLOTS mask records. Rebuilt before
+// each gravity substep: `camask` writes, per DIRTY-LIST POSITION, which of the
+// 27 colours the chunk has any work in (CA_WORK_COL0); `calist` turns those
+// into one chunk list per colour (CA_WORK_LIST0, NUM_SLOTS entries each) with
+// its count (CA_WORK_N0) and the colour's indirect args (caArgs, binding 54).
+// The colour rows walk their colour's list instead of the whole dirty list, so
+// a chunk with nothing of colour k -- every colour, for an awake chunk that
+// holds no matter -- is not dispatched for it at all. src/sim/simulation.cpp
+// sizes the buffer from the same numbers (kCaPoolCap is CA_POOL_CAP).
+//
+// THE SPARSE HALF (same date): a (chunk, colour) holding at most CA_SPARSE_T
+// cells -- and in a chunk whose cells may run on their own, see camask -- is
+// NOT put on the chunk list. camask writes its cells straight into colour k's
+// two CELL POOLS (CA_POOL0 + (2k + kind) * CA_POOL_CAP; kind 0 = gas, 1 =
+// everything else), one u32 each, (slot << 13) | local. The colour row then
+// runs those 128 to a workgroup, so ~2,900 smoke chunks holding a few cells a
+// colour stop costing a workgroup's fixed cost apiece.
+// A POOL IS BOUNDED, AND FULL IS NOT AN ERROR: a (chunk, colour) whose
+// reservation does not fit in either pool goes on the dense list instead, and
+// whatever it reserved in the other pool is filled with CA_POOL_SKIP entries
+// that `main` passes over. Which (chunk, colour) overflows is arrival order --
+// and irrelevant, since either way the same cells run once each (THE COLOUR
+// ROWS' lattice argument). Per colour k, the header at CA_WORK_N0 + 4k is
+// (dense chunks, sparse gas entries, sparse other entries, dense workgroups),
+// written by calist.
+const CA_WORK_COL0 : u32 = NUM_SLOTS * CA_MASK_STRIDE;
+const CA_WORK_N0 : u32 = CA_WORK_COL0 + NUM_SLOTS;
+const CA_WORK_LIST0 : u32 = CA_WORK_N0 + 128u;
+const CA_SPARSE_T : u32 = 216u;
+const CA_POOL_CAP : u32 = 65536u;
+const CA_POOL0 : u32 = CA_WORK_LIST0 + 27u * NUM_SLOTS;
+const CA_POOL_SKIP : u32 = 0xFFFFFFFFu;
+const CA_ALL_COLOURS : u32 = 0x7FFFFFFu;   // 27 bits
+// caArgs words: 27 indirect records of 4, then the two sparse cursors of each
+// colour (camask reserves pool ranges from them; calist reads and re-zeroes).
+const CA_CUR_G : u32 = 128u;
+const CA_CUR_R : u32 = 160u;
+// The dirty-chunk count `compact` appended (args[0]): `calist` reads it to
+// know how many positions `camask` wrote.
 @group(0) @binding(13) var<storage, read> args : array<u32>;
+// The colour rows' indirect args, 27 records of (x, 1, 1, chunks): written by
+// `calist`, consumed by the recorder as the dispatch of colour k (pass_table
+// IND_CAARGS, offset 16 k). Never read by `main`, which takes its counts from
+// CA_WORK_N0 -- this buffer is the indirect-command source in that dispatch.
+// Words CA_CUR_G / CA_CUR_R + k are colour k's sparse pool cursors.
+@group(0) @binding(54) var<storage, read_write> caArgs : array<atomic<u32>>;
 // THE AMBIENT WIND, CACHED PER 4^3 BLOCK (2026-10-01): windAmbQ at the block's
 // centre, 64 blocks x 3 words per SLOT, written by `camask` for every dirty
 // chunk before each substep and read by caWindAt. Measured on the village
@@ -4185,7 +4229,7 @@ fn gasLeaveKey(local : u32) -> u32 {
 // resident -- the only way a primary step (a unit step) can leave -- count it
 // into GAS_SP_EDGECH. Every dirty chunk is initialised, edge or not, because
 // the CA reads the word of every chunk it runs.
-fn gasLeaveCount(ci : u32) {
+fn caChunkAtEdge(ci : u32) -> bool {
   let wc = slotWorldChunk(ci, T.origin);
   var edge = false;
   for (var dz = -1; dz <= 1; dz++) {
@@ -4195,6 +4239,10 @@ fn gasLeaveCount(ci : u32) {
       }
     }
   }
+  return edge;
+}
+fn gasLeaveCount(ci : u32) {
+  let edge = caChunkAtEdge(ci);
   atomicStore(&gasSpawn[GAS_SP_CHUNK0 + ci], select(0u, GAS_LV_COUNTED, edge));
   if (edge) { atomicAdd(&gasSpawn[GAS_SP_EDGECH], 1u); }
 }
@@ -4472,6 +4520,16 @@ fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
 // all air or all matter, no voxel read.
 var<workgroup> wgCaMask : array<atomic<u32>, 384>;   // 3 planes x CA_MASK_WORDS
 var<workgroup> wgCaEmit : atomic<u32>;
+var<workgroup> wgCaCol : atomic<u32>;   // the 27-colour work word (CA_WORK_COL0)
+// The SPARSE colours (THE COLOUR WORK LISTS): this chunk's cell count per
+// (colour, kind), the colours whose cells go to the pool, each such colour's
+// reserved pool range (gas, rest) and the scatter cursors into it.
+var<workgroup> wgColCnt : array<atomic<u32>, 81>;
+var<workgroup> wgCaSparse : atomic<u32>;
+var<workgroup> wgColBase : array<u32, 54>;
+var<workgroup> wgColCur : array<atomic<u32>, 54>;
+var<workgroup> wgCaEdge : u32;
+var<workgroup> wgCaSpCnt : array<atomic<u32>, 2>;   // diagnostic: sparse gas / other cells
 // The cost attribution (GAS_SP_GASONLY*): matter / gas cell counts of this chunk.
 var<workgroup> wgCaPop : array<atomic<u32>, 2>;
 
@@ -4484,11 +4542,35 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // flow, and a storage load is not uniform to the compiler.
   let sentinel = (e & PT_SENTINEL_BIT) != 0u;
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) { atomicStore(&wgCaMask[k], 0u); }
-  if (li == 0u) { atomicStore(&wgCaEmit, 0u); }
-  if (li < 2u) { atomicStore(&wgCaPop[li], 0u); }
+  if (li < 81u) { atomicStore(&wgColCnt[li], 0u); }
+  if (li < 54u) { atomicStore(&wgColCur[li], 0u); }
+  if (li == 0u) {
+    atomicStore(&wgCaEmit, 0u);
+    atomicStore(&wgCaCol, 0u);
+    atomicStore(&wgCaSparse, 0u);
+    // A chunk a gas voxel can LEAVE the window from keeps its cells together
+    // in one workgroup: the leave tail ranks a chunk's leavers against its
+    // share inside the workgroup (THE EDGE'S BUDGET), so it never goes sparse.
+    wgCaEdge = select(0u, 1u, T.gasMode != GAS_MODE_OFF && caChunkAtEdge(ci));
+  }
+  if (li < 2u) { atomicStore(&wgCaPop[li], 0u); atomicStore(&wgCaSpCnt[li], 0u); }
   workgroupBarrier();
+  // THE COLOURS OF THIS THREAD'S CELLS. Thread li reads cells li + 256 m:
+  // x = li & 15 and y = li >> 4 are fixed, z = m. A cell's colour is its WORLD
+  // coordinate mod 3 per axis (the global lattice, caRow's `start`),
+  // k = cx + 3 cy + 9 cz -- the passUBO slice order (simulation.cpp:
+  // colorPhase = (k % 3, k / 3 % 3, k / 9)). So only cz varies down the loop.
+  let wb = slotWorldChunk(ci, T.origin) * i32(CHUNK);
+  let bm = ((wb % vec3<i32>(3)) + vec3<i32>(3)) % vec3<i32>(3);
+  let cxy = u32((bm.x + i32(li & 15u)) % 3) + 3u * u32((bm.y + i32(li >> 4u)) % 3);
+  let cz0 = u32(bm.z);
   if (!sentinel) {
     let base = e * CHUNK_VOL;
+    // Per cz: gas | other << 8 | inert << 16 (at most 6 cells of one cz each).
+    var cnt0 = 0u;
+    var cnt1 = 0u;
+    var cnt2 = 0u;
+    var cz = cz0;
     for (var i = li; i < CHUNK_VOL; i += 256u) {
       let mat = voxMat(voxels[base + i]);
       if (mat != MAT_AIR) {
@@ -4496,15 +4578,123 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
         atomicOr(&wgCaMask[i >> 5u], bit);
         let m = materials[mat];
         if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { atomicOr(&wgCaEmit, 1u); }
+        var inc = 1u << 8u;
         if (m.klass == CLASS_GAS) {
           atomicOr(&wgCaMask[CA_MASK_WORDS + (i >> 5u)], bit);
+          inc = 1u;
         } else if (m.klass == CLASS_SOLID && !matCanAct(m)) {
           atomicOr(&wgCaMask[2u * CA_MASK_WORDS + (i >> 5u)], bit);
+          inc = 1u << 16u;
         }
+        if (cz == 0u) { cnt0 += inc; } else if (cz == 1u) { cnt1 += inc; } else { cnt2 += inc; }
+      }
+      cz = select(cz + 1u, 0u, cz == 2u);
+    }
+    for (var z = 0u; z < 3u; z++) {
+      let c = select(select(cnt2, cnt1, z == 1u), cnt0, z == 0u);
+      if (c == 0u) { continue; }
+      let k3 = (cxy + 9u * z) * 3u;
+      if ((c & 0xFFu) != 0u) { atomicAdd(&wgColCnt[k3], c & 0xFFu); }
+      if (((c >> 8u) & 0xFFu) != 0u) { atomicAdd(&wgColCnt[k3 + 1u], (c >> 8u) & 0xFFu); }
+      if ((c >> 16u) != 0u) { atomicAdd(&wgColCnt[k3 + 2u], c >> 16u); }
+    }
+  }
+  workgroupBarrier();
+  // DENSE OR SPARSE, per colour (one thread each). A colour with at most
+  // CA_SPARSE_T cells goes to the pool when its cells may run apart from the
+  // rest of the chunk: not a sentinel (every cell or none), not substep 0 of
+  // an MPM chunk (air runs there too), not an edge chunk (above). Otherwise a
+  // colour with any cell puts the chunk on that colour's dense list.
+  if (li < 27u) {
+    let g = atomicLoad(&wgColCnt[li * 3u]);
+    let o = atomicLoad(&wgColCnt[li * 3u + 1u]);
+    let r = o + atomicLoad(&wgColCnt[li * 3u + 2u]);
+    let tot = g + r;
+    if (tot != 0u) {
+      let mpm = P.substep == 0u && fluidBlockMapS[ci] != 0u;
+      var sparse = !sentinel && !mpm && wgCaEdge == 0u && tot <= CA_SPARSE_T;
+      if (sparse) {
+        // Reserve both kinds; if either does not fit, neither is used.
+        var bg = 0u;
+        var br = 0u;
+        if (g != 0u) { bg = atomicAdd(&caArgs[CA_CUR_G + li], g); }
+        if (r != 0u) { br = atomicAdd(&caArgs[CA_CUR_R + li], r); }
+        let fits = (g == 0u || bg + g <= CA_POOL_CAP) && (r == 0u || br + r <= CA_POOL_CAP);
+        if (fits) {
+          wgColBase[li * 2u] = bg;
+          wgColBase[li * 2u + 1u] = br;
+        } else {
+          // What did land inside a pool is counted by calist, so it must not
+          // be left holding a stale entry from an earlier substep.
+          let pg = CA_POOL0 + 2u * li * CA_POOL_CAP;
+          if (g != 0u) {
+            for (var j = bg; j < min(bg + g, CA_POOL_CAP); j++) { caMask[pg + j] = CA_POOL_SKIP; }
+          }
+          if (r != 0u) {
+            for (var j = br; j < min(br + r, CA_POOL_CAP); j++) {
+              caMask[pg + CA_POOL_CAP + j] = CA_POOL_SKIP;
+            }
+          }
+          sparse = false;
+        }
+      }
+      if (sparse) {
+        atomicOr(&wgCaSparse, 1u << li);
+        if (g != 0u) { atomicAdd(&wgCaSpCnt[0], g); }
+        if (o != 0u) { atomicAdd(&wgCaSpCnt[1], o); }
+      } else {
+        atomicOr(&wgCaCol, 1u << li);
       }
     }
   }
   workgroupBarrier();
+  // THE CHUNK'S COLOUR WORD (CA_WORK_COL0, read by `calist`): the colours
+  // whose DENSE list the chunk goes on -- exactly those for which `main`'s
+  // caRow would gather at least one cell of it and that did not go sparse,
+  // so leaving it off colour k's list skips nothing:
+  //   * a sentinel of air or of a material that cannot act: none (caRow
+  //     returns before looking at the mask);
+  //   * any other sentinel: all 27 (its mask is all ones);
+  //   * substep 0 in a chunk with an MPM block: all 27 (caRow takes every
+  //     site of the colour there, air included, for excitedReact);
+  //   * otherwise the colours of the cells the matter plane holds, less the
+  //     sparse ones.
+  if (li == 0u) {
+    var cols = atomicLoad(&wgCaCol);
+    if (sentinel) {
+      let smat = e & PT_MAT_MASK;
+      cols = select(CA_ALL_COLOURS, 0u, smat == MAT_AIR || !matCanAct(materials[smat]));
+    } else if (P.substep == 0u && fluidBlockMapS[ci] != 0u) {
+      cols = CA_ALL_COLOURS;
+    }
+    caMask[CA_WORK_COL0 + wg.x] = cols;
+    if (T.gasMode != GAS_MODE_OFF) {   // THE CA'S COST ATTRIBUTION, diagnostic
+      let sg = atomicLoad(&wgCaSpCnt[0]);
+      let so = atomicLoad(&wgCaSpCnt[1]);
+      if (sg != 0u) { atomicAdd(&gasSpawn[GAS_SP_CA_GAS], sg); }
+      if (so != 0u) { atomicAdd(&gasSpawn[GAS_SP_CA_OTHER], so); }
+    }
+  }
+  // THE SCATTER: each sparse cell into the range its colour reserved in the
+  // pool of its kind (gas, or the rest). Re-read from the mask planes
+  // just built, not the voxels. The order within a range is the shared
+  // cursors' arrival order -- scheduling-dependent and irrelevant, for the
+  // colour lattice's reason (THE COLOUR ROWS below).
+  let sparse = atomicLoad(&wgCaSparse);
+  if (sparse != 0u && !sentinel) {
+    var cz = cz0;
+    for (var i = li; i < CHUNK_VOL; i += 256u) {
+      let w5 = i >> 5u;
+      let bit = 1u << (i & 31u);
+      let k = cxy + 9u * cz;
+      cz = select(cz + 1u, 0u, cz == 2u);
+      if (((sparse >> k) & 1u) == 0u || (atomicLoad(&wgCaMask[w5]) & bit) == 0u) { continue; }
+      let kind = select(1u, 0u, (atomicLoad(&wgCaMask[CA_MASK_WORDS + w5]) & bit) != 0u);
+      let q = k * 2u + kind;
+      caMask[CA_POOL0 + q * CA_POOL_CAP + wgColBase[q] + atomicAdd(&wgColCur[q], 1u)] =
+          (ci << 13u) | i;
+    }
+  }
   // THE TEMPERATURE LAYER'S DOORBELL: this chunk holds something hot, so
   // heatWant (after the CA) pages it and its 3x3x3. Window slots only -- heat
   // does not run in a ticket. A sentinel chunk's one material is tested here.
@@ -4567,6 +4757,83 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }
 
+// ---- calist: one chunk list per colour (pass_table.def caList) -------------
+// (2026-10-03, ca-chunk-overhead.) Recorded after each caMask row, one
+// workgroup per COLOUR. It turns camask's per-chunk colour words into colour
+// k's list of chunks with work in k, its count, and the indirect args of
+// colour k's dispatch: ceil(count / pack) workgroups, so no workgroup of a
+// colour row starts past the end of its list either.
+//
+// WHY: `--perf village-fire` keeps ~300 awake chunks that hold NO matter
+// (dirty-reasons' EMPTY fold: a neighbour's MOVE / gas write fanned out across
+// the face, or the chunk's own last gas voxel leaving) and ~2,900 smoke chunks
+// holding 11..65 cells, which have nothing at all in many of the 27 colours.
+// Each such (chunk, colour) cost a full gather -- 36 mask rows, three
+// barriers -- and the dispatch was always sized for the WHOLE dirty list
+// (pack 2 left half the workgroups to return at once). The dirty flags are
+// untouched: the page table's materialisation ring and the heat layer's mark
+// licence read them, so a chunk is still awake; it is only not DISPATCHED for
+// a colour it has nothing in.
+//
+// EXACT (rule 1): a chunk is left off colour k's list only when caRow would
+// gather no cell of it for k (camask's colour word, above), and a workgroup's
+// effect is a pure function of the cells it runs -- the colour lattice makes
+// which workgroup runs a cell irrelevant, the same argument that lets the
+// dirty list's own order be scheduling-dependent. The list here is not even
+// that: a blocked prefix sum, in dirty-list order.
+var<workgroup> wgCaScan : array<u32, 256>;
+
+@compute @workgroup_size(256)
+fn calist(@builtin(workgroup_id) wg : vec3<u32>,
+          @builtin(local_invocation_index) li : u32) {
+  let k = wg.x;   // the colour, 0..26
+  let n = args[0];
+  let per = (n + 255u) / 256u;
+  let lo = min(li * per, n);
+  let hi = min(lo + per, n);
+  var cnt = 0u;
+  for (var p = lo; p < hi; p++) { cnt += (caMask[CA_WORK_COL0 + p] >> k) & 1u; }
+  // Inclusive scan of the 256 per-thread counts (Hillis-Steele).
+  wgCaScan[li] = cnt;
+  workgroupBarrier();
+  for (var s = 1u; s < 256u; s = s << 1u) {
+    var v = wgCaScan[li];
+    if (li >= s) { v += wgCaScan[li - s]; }
+    workgroupBarrier();
+    wgCaScan[li] = v;
+    workgroupBarrier();
+  }
+  let incl = wgCaScan[li];
+  var at = CA_WORK_LIST0 + k * NUM_SLOTS + incl - cnt;
+  for (var p = lo; p < hi; p++) {
+    if (((caMask[CA_WORK_COL0 + p] >> k) & 1u) != 0u) {
+      caMask[at] = dirtyList[p];
+      at += 1u;
+    }
+  }
+  if (li == 255u) {
+    // The sparse cells camask scattered into this colour's pool, and the
+    // cursors back to zero for the next substep's camask (nothing else reads
+    // them: colour k's cursors are this workgroup's alone).
+    // A cursor past CA_POOL_CAP is reservations that did not fit (camask
+    // sent those cells dense); the pool holds the first CA_POOL_CAP.
+    let sg = min(atomicLoad(&caArgs[CA_CUR_G + k]), CA_POOL_CAP);
+    let sr = min(atomicLoad(&caArgs[CA_CUR_R + k]), CA_POOL_CAP);
+    atomicStore(&caArgs[CA_CUR_G + k], 0u);
+    atomicStore(&caArgs[CA_CUR_R + k], 0u);
+    let pack = caPack(incl);
+    let dwg = (incl + pack - 1u) / pack;
+    caMask[CA_WORK_N0 + 4u * k] = incl;
+    caMask[CA_WORK_N0 + 4u * k + 1u] = sg;
+    caMask[CA_WORK_N0 + 4u * k + 2u] = sr;
+    caMask[CA_WORK_N0 + 4u * k + 3u] = dwg;
+    atomicStore(&caArgs[k * 4u], dwg + (sg + CA_WG - 1u) / CA_WG + (sr + CA_WG - 1u) / CA_WG);
+    atomicStore(&caArgs[k * 4u + 1u], 1u);
+    atomicStore(&caArgs[k * 4u + 2u], 1u);
+    atomicStore(&caArgs[k * 4u + 3u], incl);
+  }
+}
+
 // ---- THE COLOUR ROWS: GATHERED, SORTED CELLS, NOT ONE THREAD PER SITE -----
 //
 // (2026-10-01, the oil village fire: three houses burning, ~3,900 awake
@@ -4591,13 +4858,18 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
 // is scheduling-dependent (shared atomicAdds), which is just as irrelevant,
 // for the same reason the dirty list's own order is (sim_compact.wgsl).
 //
-// Below CA_PACK_STEP dirty chunks it is one chunk a workgroup, so a small
-// world keeps its parallelism. Workgroups past the last group exit at once.
+// Below CA_PACK_STEP listed chunks it is one chunk a workgroup, so a small
+// world keeps its parallelism. Since 2026-10-03 the entries are those of THIS
+// COLOUR's list (calist), not the dirty list, and the dispatch is sized to
+// ceil(count / pack) -- no workgroup starts past the end.
 const CA_WG : u32 = 128u;
 const CA_PACK_MAX : u32 = 2u;
 const CA_PACK_STEP : u32 = 512u;
 fn caPack(n : u32) -> u32 { return clamp(n / CA_PACK_STEP, 1u, CA_PACK_MAX); }
-// One entry per gathered cell: chunk-in-group (3 bits) << 12 | local index.
+// Where this dispatch's chunk list starts in caMask (CA_WORK_LIST0 + colour).
+var<private> gCaList : u32 = 0u;
+// One entry per gathered cell: slot << 13 | chunk-in-group (1 bit) << 12 |
+// local index -- a pool entry has the same shape with chunk-in-group 0.
 var<workgroup> wgCaList : array<u32, 432>;   // CA_PACK_MAX * 216
 var<workgroup> wgCaCount : atomic<u32>;
 // Per segment (gas, other, inert): the count, then the write cursor.
@@ -4612,7 +4884,7 @@ fn caRow(first : u32, total : u32, t : u32) -> CaRow {
   let j = t / 36u;
   let r = t % 36u;
   if (first + j >= total) { return o; }
-  let ci = dirtyList[first + j];
+  let ci = caMask[gCaList + first + j];
   o.ci = ci;
   let pe = pageEntryOf(ci);
   if ((pe & PT_SENTINEL_BIT) != 0u) {
@@ -4648,18 +4920,29 @@ fn caRowBits(sx : i32) -> u32 { return (0x9249u << u32(sx)) & 0xFFFFu; }
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
-  let total = args[0];
+  // This colour's work (calist): the workgroups below `dwg` take chunks of its
+  // DENSE list, pack at a time, and gather; the ones above take 128 cells of
+  // its sparse POOL (gas cells, then the rest). Same caCell either way.
+  let kc = P.colorPhase.x + 3u * P.colorPhase.y + 9u * P.colorPhase.z;
+  gCaList = CA_WORK_LIST0 + kc * NUM_SLOTS;
+  let hdr = CA_WORK_N0 + 4u * kc;
+  let total = caMask[hdr];
+  let dwg = caMask[hdr + 3u];
+  let dense = wg.x < dwg;
   let pack = caPack(total);
   let first = wg.x * pack;
   if (li < 3u) { atomicStore(&wgCaSeg[li], 0u); }
   // THE EDGE'S BUDGET: this dispatch's leaver list starts empty, and each
-  // chunk's unspent share is read once, before any cell can spend it.
+  // chunk's unspent share is read once, before any cell can spend it. (A
+  // sparse workgroup holds no edge chunk's cells -- camask -- so has none.)
   if (T.gasMode != GAS_MODE_OFF) {
     if (li == 0u) { atomicStore(&wgLvN, 0u); }
     if (li < CA_PACK_MAX) {
       atomicStore(&wgLvCnt[li], 0u);
       var allow = 0u;
-      if (li < pack && first + li < total) { allow = gasLeaveAllow(dirtyList[first + li]); }
+      if (dense && li < pack && first + li < total) {
+        allow = gasLeaveAllow(caMask[gCaList + first + li]);
+      }
       wgLvAllow[li] = allow;
     }
   }
@@ -4671,7 +4954,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // sort is free of consequence -- only of cost.
   var rw : CaRow;
   rw.b = vec3<u32>(0u);
-  if (li < pack * 36u) { rw = caRow(first, total, li); }
+  if (dense && li < pack * 36u) { rw = caRow(first, total, li); }
   {
     if (rw.b.x != 0u) { atomicAdd(&wgCaSeg[0], countOneBits(rw.b.x)); }
     if (rw.b.y != 0u) { atomicAdd(&wgCaSeg[1], countOneBits(rw.b.y)); }
@@ -4704,24 +4987,47 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       var bits = rw.b[k];
       if (bits == 0u) { continue; }
       var at = atomicAdd(&wgCaSeg[k], countOneBits(bits));
+      let rb = (rw.ci << 13u) | rw.rowBase;
       while (bits != 0u) {
         let x = firstTrailingBit(bits);
         bits &= bits - 1u;
-        wgCaList[at] = rw.rowBase | x;
+        wgCaList[at] = rb | x;
         at += 1u;
       }
     }
   }
+  // ---- ...OR TAKE 128 CELLS OF THE POOL (THE COLOUR WORK LISTS) -----------
+  // Gas workgroups first, then the rest's, so a warp runs one kind. An entry
+  // may be CA_POOL_SKIP (a reservation that overflowed the other pool, see
+  // camask); the work loop passes over it.
+  if (!dense) {
+    let sw = wg.x - dwg;
+    let sg = caMask[hdr + 1u];
+    let gw = (sg + CA_WG - 1u) / CA_WG;
+    var q = 2u * kc;
+    var j0 = sw * CA_WG;
+    var nk = sg;
+    if (sw >= gw) {
+      q += 1u;
+      j0 = (sw - gw) * CA_WG;
+      nk = caMask[hdr + 2u];
+    }
+    let cnt = min(CA_WG, nk - min(j0, nk));
+    if (li < cnt) { wgCaList[li] = caMask[CA_POOL0 + q * CA_POOL_CAP + j0 + li]; }
+    if (li == 0u) { atomicStore(&wgCaCount, cnt); }
+  }
   workgroupBarrier();
 
   // ---- WORK: the gathered cells, CA_WG at a time --------------------------
+  // An entry is (slot << 13) | (chunk-in-group << 12) | local; gCaEntry keeps
+  // the low 13 bits, the shape the leave deferral records.
   let n = atomicLoad(&wgCaCount);
   for (var i = li; i < n; i += CA_WG) {
     let e = wgCaList[i];
+    if (e == CA_POOL_SKIP) { continue; }
     let lm = e & 0xFFFu;
-    gCaEntry = e;
-    caCell(dirtyList[first + (e >> 12u)],
-           vec3<i32>(i32(lm & 15u), i32((lm >> 4u) & 15u), i32(lm >> 8u)));
+    gCaEntry = e & 0x1FFFu;
+    caCell(e >> 13u, vec3<i32>(i32(lm & 15u), i32((lm >> 4u) & 15u), i32(lm >> 8u)));
   }
 
   // ---- THE LEAVE-RESOLVE TAIL (THE EDGE'S BUDGET, step 3) -----------------
@@ -4754,7 +5060,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
         }
         ok = rank < allow;
       }
-      let ci = dirtyList[first + j];
+      let ci = caMask[gCaList + first + j];
       let c = slotWorldChunk(ci, T.origin) * i32(CHUNK) +
               vec3<i32>(i32(lm & 15u), i32((lm >> 4u) & 15u), i32(lm >> 8u));
       // caCell's per-cell context, exactly as it was when this cell deferred.
