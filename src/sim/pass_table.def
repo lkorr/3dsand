@@ -1558,6 +1558,36 @@ PASS(godray_vis, "godrayVis", PT_SHADOWCACHE, PIPE_GODRAY_VIS, K_COMPUTE, kGodVi
 PASS(gas_mask, "gasMask", PT_SHADOWCACHE, PIPE_GAS_MASK, K_COMPUTE, kGasMaskGroups,1,1,
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
      USES(U(RenderUBO) R(GasOuter) W(GasMask)))
+// ---- THE GI GATHER CACHE'S REFRESH (assets/shaders/gi_gather.wgsl) ---------
+// The one-bounce gather (nine coarse rays per block-face) used to run inside
+// raymarch.wgsl's fragment shader on a due face; now the fragment shader
+// appends the due faces to GiReq (bitmap-deduplicated) and these rows cast
+// the rays for last frame's list, the shadow cache's prepare/copy/indirect
+// shape. BEFORE shadow_resolve, and that is not cosmetic: the gather reads
+// irradiance plane 0, and with render.giFeedback on, plane 0 holds the
+// multi-bounce fixed point only AFTER the fragment shader's write-back — the
+// resolve's ~256 deposits a face at 1/16 pull it back to DIRECT light every
+// frame, and the write-back pushes the bounce in again. The fragment-shader
+// gather this replaced read it mid-frame, after the write-back; gathering
+// after the resolve read direct light only and drew the near field ~2/255
+// darker (meadow, 37% of pixels; measured 2026-10-03). Before the resolve,
+// the gather reads last frame's post-write-back plane, which is what the
+// inline gather saw. Writes plane 1 (the cache); W(Irradiance) then the
+// resolve's W(Irradiance) is the WAW the recorder orders. The fragment read
+// of plane 1 is BeginRendering's flush.
+// C_ALWAYS: with GI off, or nothing due, the fragment shader appended nothing
+// and the indirect dispatch is zero groups; a CPU condition would need the
+// count, which only the GPU knows.
+PASS(gi_prepare, "giGather", PT_SHADOWCACHE, PIPE_GI_PREPARE, K_COMPUTE, 1,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(A(GiReq)))
+// Header words 4..6 (kGiReqArgsByteOffset) -> the indirect-only args buffer.
+PASS(copy_giArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(GiReq) TW(GiArgs)))
+PASS(gi_gather, "giGather", PT_SHADOWCACHE, PIPE_GI_GATHER, K_INDIRECT, IND_GIARGS,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
+          A(GiReq) I(GiArgs) W(Irradiance) R(OpennessGen)))
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
      GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))

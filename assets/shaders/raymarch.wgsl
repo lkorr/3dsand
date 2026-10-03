@@ -203,6 +203,17 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 const GAS_MASK_SHIFT : u32 = 2u;
 const GAS_MASK_N : u32 = GAS_OUTER_N >> GAS_MASK_SHIFT;
 const GAS_MASK_ROW_WORDS : u32 = GAS_MASK_N / 32u;
+// ---- THE GI GATHER REQUESTS (gi_gather.wgsl) ---------------------------------
+// The one-bounce gather cache is refreshed by a compute pass, not here: a hit
+// on a block-face whose cache word is stale or due sets the face's bit and
+// appends it to this list (giRequest), and the ShadowCache table's gi_gather
+// row casts the nine rays for it before the next frame. The layout is
+// gi_gather.wgsl's header; the three constants below must agree with it
+// (scripts/check_invariants.py "gi request list").
+@group(0) @binding(39) var<storage, read_write> giReq : array<atomic<u32>>;
+const GI_REQ_HEADER : u32 = 8u;             // gi_gather.wgsl agrees
+const GI_REQ_CAP : u32 = 131072u;           // gi_gather.wgsl agrees
+const GI_REQ_BITS : u32 = GI_REQ_HEADER + GI_REQ_CAP;   // gi_gather.wgsl agrees
 const GV_NX : i32 = 72;                     // godray_vis.wgsl agrees
 const GV_NY : i32 = 40;                     // godray_vis.wgsl agrees
 const GV_NZ : i32 = 72;                     // godray_vis.wgsl agrees
@@ -6889,19 +6900,22 @@ fn ambientAt(n : vec3f) -> vec3f {
 // are paid only on a re-gather frame (giCachePeriod, doubled to 16 to pay for
 // them). There is no pyramid (see below): a distant hit is a point sample.
 //
-// REGISTERS. This sits in fs, which is at the 128-register cap and spills; the
-// loop state is kept to the accumulator, the direction and two block coords,
-// with no dynamic vector indexing (select chains only, common.wgsl axisVec).
-// The cost is measured by --render-budget's `nogi` arm.
-const GI_W_NORMAL : f32 = 0.25;
-const GI_W_RING : f32 = 0.09375;
+// WHERE IT RUNS (2026-10-03). The nine rays are cast by gi_gather.wgsl, a
+// compute pass on the ShadowCache table, and NOT in this fragment shader any
+// more: the fragment shader reads the cache and requests the faces that are
+// due (giBounceAt below). The function itself, giGatherRays, lives there and
+// only there. What follows stays here because it is the reasoning a reader of
+// the cache needs, and because both decisions it records were taken against
+// THIS shader's register budget.
+//
 // ---- WHY THERE IS NO MIP PYRAMID HERE, THOUGH THERE OBVIOUSLY SHOULD BE ----
 // The textbook companion to a long gather ray is a prefiltered pyramid: nine
 // rays standing for a hemisphere have footprints metres wide at 10 m, so
 // reading one 40 cm block-face out there is a point sample of an area, and the
 // fix is to read a coarser level as the hit gets further away. It was built
 // (three chunk-local levels, six faces each, reduced by sim_openness) and then
-// REMOVED on 2026-09-11, because of what it cost in this function:
+// REMOVED on 2026-09-11, because of what it cost when the gather was inlined
+// into this fragment shader:
 //
 //   raymarch fs registers, --shader-stats:  128 -> 168
 //
@@ -6917,217 +6931,106 @@ const GI_W_RING : f32 = 0.09375;
 // 14% of a leak term that a different fix then took to zero. That is not a
 // trade worth an occupancy cliff.
 //
-// If this is revisited, the thing to change is WHERE the gather runs, not what
-// it reads: a compute pass over block-faces has registers to spare and the
-// gather is already cached per block-face (giBounceAt), so it does not need to
-// be in the fragment shader at all. Adding taps to THIS loop will just find
-// the cliff again.
+// That objection is GONE now that the gather runs in gi_gather.wgsl, which has
+// registers to spare: a pyramid read there costs that pass, not every pixel.
+// It has not been rebuilt — the leak it addressed is closed — but if a long
+// gather ray's point sample ever shows, that is where it goes.
 //
-// ---- THE STEP BUDGET IS A COMPILE-TIME CONSTANT, AND MUST STAY ONE ---------
-// TUNE_GI_GATHER_BLOCKS is a module const, so `maxSteps` below folds and the
-// nine inlined traceOpaque loops keep no loop state. Making it depend on
-// anything per-pixel pushes this shader over the same cliff the pyramid did.
-// The obvious optimisation is to spend the reach only on ENCLOSED faces, since
-// an open one is mostly looking at sky that ambientAt() already delivers
-// analytically — it was written, and it measured 168 registers against 128 for
-// a constant budget of the same size. It is the DYNAMISM, not the count.
-//
-// If the outdoor waste ever needs addressing, skip the whole gather for an
-// open face at the CALL SITE (one branch on `openRaw`, which is already live
-// there) rather than varying this loop's bound.
-//
-// The nine rays from an origin already pushed clear of the receiver's block
-// (see giGather for the per-pixel origin and giBounceAt for the cached,
-// block-face-centre one).
-fn giGatherRays(ro : vec3f, n : vec3f, face : u32) -> vec3f {
-  let axis = i32(face >> 1u);
-  let t0 = vec3f(select(0.0, 1.0, axis == 1), select(0.0, 1.0, axis == 2),
-                 select(0.0, 1.0, axis == 0));
-  let t1 = vec3f(select(0.0, 1.0, axis == 2), select(0.0, 1.0, axis == 0),
-                 select(0.0, 1.0, axis == 1));
-  let maxSteps = TUNE_GI_GATHER_BLOCKS + 1;
-  var acc = vec3f(0.0);
-  for (var r = 0u; r < 9u; r++) {
-    // r = 0 the normal; 1..4 the tangent diagonals; 5..8 the corners.
-    let su = select(select(0.0, 1.0, r == 1u || r == 5u || r == 6u), -1.0,
-                    r == 2u || r == 7u || r == 8u);
-    let sv = select(select(0.0, 1.0, r == 3u || r == 5u || r == 7u), -1.0,
-                    r == 4u || r == 6u || r == 8u);
-    let d = normalize(n + t0 * su + t1 * sv);
-    let w = select(GI_W_RING, GI_W_NORMAL, r == 0u);
-    // Coarse from the first step: block steps over the blockers mask, the same
-    // march the openness pass and the shadow rays use, so a gather ray can
-    // never see through a wall the shadow ray cannot.
-    let s = traceOpaque(ro, d, maxSteps, 0.0, &occupancy, &materials);
-    if (!s.hit) { continue; }
-    let slot = chunkIndexW(s.cell);
-    // An emitter's light is only meaningful under a matching stamp.
-    if (opennessGen[slot] != opennessStamp(worldChunkOf(s.cell))) { continue; }
-    let lo = vec3<u32>(s.cell & vec3<i32>(i32(CHUNK) - 1));
-    let base = irrIndex(slot, subOccBitLocal(lo), 0u);
-    // EVERY FACE THE RAY LEANS ON, not the one it entered through. A 45-degree
-    // ray into a floor block enters through the block's SIDE as often as its
-    // top, and a floor block's side face holds no surface — the first version
-    // read the entry face alone and gathered exactly nothing from a floor.
-    // Each axis the direction has a component on names the face whose normal
-    // opposes it (face = axis*2 + (normal sign > 0)); they are weighted by the
-    // direction's share on that axis, so a face with no surface reads zero and
-    // drops out, and an inside corner contributes both of its faces.
-    let ax = abs(d.x);
-    let ay = abs(d.y);
-    let az = abs(d.z);
-    var e = vec3f(0.0);
-    if (ax > 0.1) { e += unpackRgb9e5(irradiance[base + 0u + select(0u, 1u, d.x < 0.0)]) * ax; }
-    if (ay > 0.1) { e += unpackRgb9e5(irradiance[base + 2u + select(0u, 1u, d.y < 0.0)]) * ay; }
-    if (az > 0.1) { e += unpackRgb9e5(irradiance[base + 4u + select(0u, 1u, d.z < 0.0)]) * az; }
-    acc += e * (w / (ax + ay + az));
-  }
-  return acc;
-}
-
-// The UNCACHED gather, per pixel: what every lit near hit paid before the
-// cache (render.giCachePeriod = 0 -- the `nogicache` --render-budget arm).
-fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
-  let face = openFaceOfNormal(n);
-  let axis = i32(face >> 1u);
-  // THE ORIGIN IS PUSHED CLEAR OF THE RECEIVER'S OWN BLOCK along the normal.
-  // traceOpaque's coarse march tests the block it starts in, and a wall's
-  // block column reaches up to three voxels in front of its face, so a ray
-  // starting on the face would report the wall itself as the first emitter on
-  // every direction that leans toward its column — the first version of this
-  // function lit a wall beside a sunlit floor at 6% of the floor, and that
-  // was why. Half a voxel past the block's far plane: the same "never start on
-  // a boundary" rule sim_openness.wgsl's rays follow.
-  let ci = axisPickI(cell, axis);
-  let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
-  let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
-  let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
-                    (face & 1u) != 0u) + 0.5;
-  return giGatherRays(p + n * dOut, n, face);
-}
+// ---- THE STEP BUDGET IS A COMPILE-TIME CONSTANT ------------------------------
+// TUNE_GI_GATHER_BLOCKS is a module const, so the nine inlined traceOpaque
+// loops keep no loop state. When this was fragment-shader code, making it
+// depend on anything per-pixel (spending the reach only on ENCLOSED faces)
+// measured 168 registers against 128 for a constant budget of the same size.
+// In the compute pass that argument no longer binds; it was not revisited.
 
 // ---- the gather CACHE (docs/PLAN_frame_perf.md §3 item 1) ------------------
-// The nine rays above ran on every lit near pixel every frame, reading a grid
-// that is itself an EMA over frames -- 1.2 ms of the overlook frame for a
-// signal that changes at the shadow cache's pace. The gather is a function of
-// the block-face and the geometry around it, not of the pixel, so it is cached
-// per block-face in the second plane of `irradiance` (common.wgsl
-// GI_CACHE_BASE) from the FACE'S CENTRE, and re-run for a chunk slot's faces
-// only on that slot's scheduled frame -- slots are staggered over
-// render.giCachePeriod frames, so 1/N of what is on screen re-gathers each
-// frame -- or for a word that reads 0, "never gathered" (a chunk just walked
-// or just arrived; the first frame that looks at it pays once). Per SLOT and
-// not per block-face on purpose: a warp of pixels lies within one chunk far
-// more often than within one block, so the re-gather branch stays uniform
-// across it instead of firing for the whole warp whenever one lane is due.
+// The nine rays ran on every lit near pixel every frame, reading a grid that is
+// itself an EMA over frames -- 1.2 ms of the overlook frame for a signal that
+// changes at the shadow cache's pace. The gather is a function of the
+// block-face and the geometry around it, not of the pixel, so it is cached per
+// block-face in the second plane of `irradiance` (common.wgsl GI_CACHE_BASE)
+// from the FACE'S CENTRE, and re-run for a chunk slot's faces only on that
+// slot's scheduled frame -- slots are staggered over render.giCachePeriod
+// frames, so 1/N of what is on screen re-gathers each frame -- or for a word
+// that is not FRESH.
+//
+// THE WORD: 0 = never gathered (a slot the window just reused, a block that
+// just grew a surface); low bit clear = STALE (the openness walk's full visit
+// keeps the old answer and clears the bit, sim_openness.wgsl); low bit set =
+// FRESH (gi_gather.wgsl writes every answer with it on, so a face in the dark
+// is a fresh zero and is never re-gathered for being dark).
+//
+// WHO GATHERS (2026-10-03): gi_gather.wgsl, nine compute lanes per requested
+// face, one frame after the request. This shader only requests (giRequest):
+// a bit per face in a bitmap, so a face is listed once however many pixels
+// see it, and the lane that sets the bit appends the record. Until then the
+// refresh ran HERE — every pixel of a due face, then (2d790af / b2e5883) an
+// elected pixel near the face centre plus a 1/32 lottery — and round 1
+// measured the remainder at 0.2-0.3 ms of rays plus ~0.1 ms of register
+// footprint on every pixel (the nine inlined traceOpaque loops). The cadence
+// is unchanged (a due face is refreshed once per period, one frame after the
+// frame that found it due) and every visible face of a due slot refreshes, not
+// only those whose centre pixel was on screen. A face seen for the first time
+// shades from its bilinear neighbours for that one frame (a 0 tap drops out),
+// where the inline version gathered it on the spot.
 //
 // READ BILINEAR across the four block-faces in the face plane, exactly as
 // opennessAt reads its bytes and for the same reason: a 40 cm block-constant
 // bounce tiles a wall visibly where the light has a gradient. Taps that read
-// 0 (a neighbour never gathered, or off the window) drop out; the pixel's own
-// tap never can, it was just filled. Every read and write is under the slot's
-// openness stamp; a slot the walk has not stamped yet gathers live, as it
-// always did.
+// 0 (a neighbour never gathered, or off the window) drop out. Every read is
+// under the slot's openness stamp. A slot the walk has not stamped yet has no
+// cache: a chunk that just streamed in waits for the rolling refresh (up to
+// kNumChunks / opennessChunksPerFrame ticks, ~4 s), and while moving it can
+// come inside the near/far handoff ring before then. The inline version
+// gathered per pixel there; this returns farGiIrradiance -- the closed form
+// the far field draws just past the ring, for the open terrain an unstamped
+// slot's openness ("no opinion") already shades as -- so the transient
+// matches its surroundings instead of going dark. Not on the settled budget
+// cameras (no near pixel in an unstamped slot on meadow or seam, 2026-10-03).
 //
-// The per-pixel origin varied with the hit point; the cached origin is the
-// face centre half a voxel past the block's far plane along the normal, the
-// same origin sim_openness.wgsl's own rays start from. Nothing here lives
-// across the DDA loop: it runs in the shade, after the hit.
+// Per SLOT and not per block-face on purpose: a warp of pixels lies within one
+// chunk far more often than within one block, so the request branch stays
+// uniform across it instead of firing for the whole warp whenever one lane is
+// due. Nothing here lives across the DDA loop: it runs in the shade, after the
+// hit.
 fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
   let slot = chunkIndexW(c);
   if (opennessGen[slot] != opennessStamp(worldChunkOf(c))) { return 0u; }
   return irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)];
 }
-// ---- ONE GATHER PER BLOCK-FACE, NOT ONE PER PIXEL (2026-10-03) ---------------
-// A slot's refresh frame used to re-gather in EVERY pixel of the slot that
-// landed on a stale face: a 4x4-voxel block-face is hundreds of pixels at a
-// few metres, every one of them casting the same nine rays from the same
-// face-centre origin and writing the same word. The gather is a function of
-// the FACE, so one pixel per face is enough: the pixels whose hit lies within
-// one pixel footprint of the face centre on both tangent axes (~2x2 of them),
-// plus a 1-in-32 per-pixel lottery so a face whose centre is hidden behind
-// something still refreshes (a face with N visible pixels: 1 - (31/32)^N
-// per due frame). The window is widened by 1/cos of the view angle, so a face
-// seen at a graze -- most of the ground from eye height -- still has its
-// centre pixel. Both were measured against the picture: with a fixed
-// one-footprint window and a 1/256 lottery the GI cache lagged on grazing and
-// half-hidden faces and the meadow camera moved 0.69% of its pixels by
-// >= 16/255 (block-shaped bounce differences); with the cosine and 1/256,
-// 0.15%; with both as shipped, 0.005% -- the re-run floor. A tile-coherent
-// lottery (whole 8x8 tiles, 1/8) was 0.05-0.1 ms cheaper and 0.19% off.
-// A face read for the first time (`own == 0`) still gathers in every pixel
-// that sees it, exactly as before -- one frame, then cached.
-//
-// And ONE CALL SITE: the unstamped-slot path (no cache, a per-pixel gather
-// from the hit) and the cache refresh used to be two inlined copies of the
-// nine-ray loop; they now pick an origin and share one.
-//
-// Measured, --render-budget 1080p (per-pixel-everywhere -> this, boots
-// alternated): noon 6.75 -> 6.67 ms, meadow 5.64 -> 5.52, seam 4.75 -> 4.61,
-// seamveg 7.60 -> 7.44. The 1/256 lottery bought twice that (noon -0.27,
-// meadow -0.39) and moved the picture; the ceiling -- no gather in fs at all
-// -- is noon 6.17 / meadow 4.85: the rest is the loop's register footprint
-// plus the warps that still gather, which only a compute pass over requested
-// faces removes (see giGatherRays).
-fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
-  if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
+
+// Ask gi_gather.wgsl for this block-face next frame. `pidx` is the face's
+// plane index (irrIndex, window-independent), which is also its bit. A plain
+// load first: after the first lane of a due face has set the bit, every other
+// pixel of it pays one cached read, not a read-modify-write.
+fn giRequest(blockMin : vec3<i32>, face : u32, pidx : u32) {
+  let bw = GI_REQ_BITS + (pidx >> 5u);
+  let bit = 1u << (pidx & 31u);
+  if ((atomicLoad(&giReq[bw]) & bit) != 0u) { return; }
+  if ((atomicOr(&giReq[bw], bit) & bit) != 0u) { return; }
+  let n = atomicAdd(&giReq[0], 1u);
+  if (n < GI_REQ_CAP) {
+    atomicStore(&giReq[GI_REQ_HEADER + n], shadowPackCell(blockMin, face));
+  } else {
+    // Refused (the list is full): release the bit so the face can ask again.
+    atomicAnd(&giReq[bw], ~bit);
+  }
+}
+
+fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>, albedo : vec3f) -> vec3f {
   let slot = chunkIndexW(cell);
-  let stamped = opennessGen[slot] == opennessStamp(worldChunkOf(cell));
+  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) { return farGiIrradiance(albedo, n); }
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
-  let idx = GI_CACHE_BASE + irrIndex(slot, subOccBitLocal(lo), face);
-  var own = irradiance[idx];
-  // max(.., 1): the early return above folds the period-0 arm away, but the
-  // modulo below is still compiled, and a const-evaluated `% 0u` is a Tint
-  // error that refuses the whole shader (the first `nogicache` measurement
-  // silently measured nothing for exactly that reason).
+  let pidx = irrIndex(slot, subOccBitLocal(lo), face);
+  let own = irradiance[GI_CACHE_BASE + pidx];
+  // The slot's scheduled frame. render.giCachePeriod 0 makes max(.., 1) = 1,
+  // so every visible face is requested every frame (the `nogicache` arm: the
+  // cache refreshed continuously, by the compute pass).
   let phase = (R.frameIdx + ((slot * 2654435761u) >> 24u)) %
               max(u32(TUNE_GI_CACHE_PERIOD), 1u);
-  let half = f32(SUBOCC_BLOCK) * 0.5;
-  let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
-  var due = own == 0u;
-  if (!due && phase == 0u) {
-    // The election (see above): this pixel's hit against the face centre on
-    // the two tangent axes, in pixel footprints at its distance.
-    let dc = abs(p - (vec3f(blockMin) + vec3f(half)));
-    let ax = face >> 1u;
-    let du = select(dc.x, dc.y, ax == 0u);
-    let dv = select(dc.z, dc.y, ax == 2u);
-    // One pixel's footprint on the face: its width at this distance, divided
-    // by the cosine of the view angle so a face seen at a graze (a floor from
-    // eye height, footprint stretched along the view) still has a pixel
-    // inside the window. Unclamped on purpose: a face seen so edge-on that
-    // the window outgrows the block elects every pixel on it, which is the
-    // old behaviour for a face that is only a few pixels tall anyway.
-    let toP = p - R.camPos;
-    let dist = length(toP);
-    let cosV = max(abs(dot(n, toP)) / max(dist, 1e-3), 1e-3);
-    let fp = max(dist * R.tanHalfFov * 2.0 / R.viewPx / cosV, 1e-3);
-    let lottery = (pcg(bitcast<u32>(p.x) ^ (bitcast<u32>(p.z) * 747796405u) ^
-                       (bitcast<u32>(p.y) * 2891336453u) ^ R.frameIdx) & 31u) == 0u;
-    due = (du < fp && dv < fp) || lottery;
-  }
-  // The origin: the face centre half a voxel past the block's far plane for
-  // the cache, or -- for a slot the openness walk has not stamped, which has
-  // no cache -- giGather's per-pixel origin off the hit.
-  var ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
-  if (!stamped) {
-    due = true;
-    let ci = axisPickI(cell, i32(face >> 1u));
-    let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
-    let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
-    let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
-                      (face & 1u) != 0u) + 0.5;
-    ro = p + n * dOut;
-  }
-  var g = vec3f(0.0);
-  if (due) { g = giGatherRays(ro, n, face); }
-  if (!stamped) { return g; }
-  if (due) {
-    // The low bit forced on: 0 must mean "never", and a face in the dark
-    // gathers a true zero.
-    own = packRgb9e5(g) | 1u;
-    irradiance[idx] = own;
+  if ((own & 1u) == 0u || phase == 0u) {
+    giRequest(cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u)), face, pidx);
   }
   if (TUNE_OPENNESS_BILINEAR == 0) { return unpackRgb9e5(own); }
   // The four taps, as opennessAt places them: block centres in the face
@@ -12199,6 +12102,18 @@ fn farGiBounce(albedo : vec3f, n : vec3f) -> vec3f {
                wrapDiffuse(keyLightDir().y, TUNE_DIFFUSE_WRAP);
   return albedo * ground * (frac * TUNE_GI_STRENGTH);
 }
+// The same closed form as IRRADIANCE (what farGiBounce multiplies by albedo x
+// giStrength): giBounceAt's answer for a near-field hit in a chunk slot the
+// openness walk has not stamped yet, which has no gather cache. Kept as its
+// own four lines rather than refactoring farGiBounce through it, so the far
+// path's arithmetic (and picture) stays bit-identical.
+fn farGiIrradiance(albedo : vec3f, n : vec3f) -> vec3f {
+  let frac = select(FAR_GI_SIDE_FRAC * (1.0 - clamp(n.y, 0.0, 1.0)), FAR_GI_UNDER_FRAC,
+                    n.y < -0.5);
+  let ground = albedo * keyLightColor() *
+               wrapDiffuse(keyLightDir().y, TUNE_DIFFUSE_WRAP);
+  return ground * frac;
+}
 
 // ---- far OPENNESS: the sky-visibility byte a face on open terrain reads ----
 // THE GI TERM ALONE MADE THE SEAM WORSE, and this is why (measured on
@@ -13364,7 +13279,7 @@ fn fs(in : VSOut) -> FSOut {
     // case gathers from the ground the tuft grows in, like the openness read.
     // TUNE_GI_STRENGTH = 0 folds the whole call away (the `nogi` arm).
     if (TUNE_GI_STRENGTH > 0.0) {
-      let bounce = albedo * ao * giBounceAt(hp, openN, openCell) * TUNE_GI_STRENGTH;
+      let bounce = albedo * ao * giBounceAt(hp, openN, openCell, albedo) * TUNE_GI_STRENGTH;
       color += bounce;
       // ---- P2 write-back (docs/PLAN_gi.md §4) ----
       // This pixel's OUTGOING radiance — the direct term it just computed plus

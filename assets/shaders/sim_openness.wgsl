@@ -474,9 +474,18 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
         }
         // The gather cache (common.wgsl GI_CACHE_BASE): a full walk means the
         // geometry around this face may have moved, so what its nine rays
-        // saw is void. 0 = "never gathered"; the raymarch refills it on the
-        // first frame it looks here. A skip visit leaves it be.
-        if (full) { irradiance[GI_CACHE_BASE + idx] = 0u; }
+        // saw is due again. STALE, not void (2026-10-03): the low bit is
+        // cleared and the answer kept, so the raymarch shades with it for the
+        // one frame gi_gather.wgsl takes to refill it, instead of shading a
+        // re-walked chunk without bounce for a frame (the refresh moved out of
+        // the fragment shader, which used to gather such a face inline). A
+        // slot the window reused (stamp mismatch) holds another chunk's
+        // answers: those ARE void, 0 = "never gathered". A skip visit leaves
+        // the word be.
+        if (full) {
+          let cw = irradiance[GI_CACHE_BASE + idx];
+          irradiance[GI_CACHE_BASE + idx] = select(0u, cw & ~1u, stampOk);
+        }
       }
     } else if (TUNE_GI_STRENGTH > 0.0) {
       // No surface in the block: no light leaves it. Zero, so a gather ray

@@ -741,6 +741,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // gas_mask row in the same command buffer, read by gasOuterFill's
         // sampler; BeginRendering's flush is the compute->fragment barrier.
         entry(40, T::ReadOnlyStorage, S::Fragment),               // gasMask
+        // THE GI GATHER REQUESTS (gi_gather.wgsl): the fragment shader appends
+        // the block-faces whose gather cache is due (atomics + a dedup
+        // bitmap); next frame's gi_prepare / gi_gather rows consume them.
+        // Written here, so Storage; read again by the ShadowCache table in the
+        // NEXT command buffer, which the frame-opening barrier orders.
+        entry(39, T::Storage, S::Fragment),                       // giReq
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -982,6 +988,21 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       const std::vector<uint32_t> zero((size_t)words, 0u);
       device.GetQueue().WriteBuffer(gasMaskBuf_, 0, zero.data(), words * 4);
     }
+    // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*):
+    // header + list + one bit per irradiance-plane word. The zero-initialized
+    // allocation is the cold state (empty list, no face pending), as for
+    // shadowReq. CopySrc for the stats words (--render-budget reads them).
+    {
+      static_assert(pass::kGiReqArgsByteOffset == 4 * 4, "gi_gather.wgsl giPrepare writes args at words 4..6");
+      const uint64_t planeWords =
+          (uint64_t)kNumSlots * kOpenBlocksPerChunk * kOpenFaces;
+      const uint64_t words = pass::kGiReqHeaderWords + pass::kGiReqCap +
+                             (planeWords + 31) / 32;
+      giReqBuf_ = CreateBuffer(device, words * 4,
+                               U::Storage | U::CopySrc | U::CopyDst, "giReq");
+      // Indirect ONLY, and out of every bind group, like shadowArgs.
+      giArgsBuf_ = CreateBuffer(device, 16, U::Indirect | U::CopyDst, "giArgs");
+    }
     // The gust streak pool: fixed, zeroed (lifetime 0 = never spawned).
     {
       const uint64_t words = (1ull + (uint64_t)kWindStreakCap * kWindStreakStride) * 4ull;
@@ -1070,6 +1091,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // (30), writes the mask (31) the raymarch reads at renderBGL_ 40.
         entry(30, T::ReadOnlyStorage), // gasOuter
         entry(31, T::Storage),         // gasMask
+        // The GI gather request list (gi_gather.wgsl): consumed (and its
+        // dedup bits released) by gi_prepare / gi_gather; appended by the
+        // raymarch at renderBGL_ 39.
+        entry(28, T::Storage),         // giReq
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1992,6 +2017,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mGodVis;
   // The gas empty-brick mask (gas_mask.wgsl): one per-frame entry on shadowPL_.
   rhi::ShaderModule mGasMask;
+  // The GI gather cache's refresh (gi_gather.wgsl): two per-frame entries on
+  // shadowPL_.
+  rhi::ShaderModule mGiGather;
   rhi::ShaderModule mWindStreak;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
@@ -2025,6 +2053,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mRainMap, "rain_map.wgsl");
     mod(&mGodVis, "godray_vis.wgsl");
     mod(&mGasMask, "gas_mask.wgsl");
+    mod(&mGiGather, "gi_gather.wgsl");
     mod(&mWindStreak, "wind_streak.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
@@ -2049,6 +2078,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
       !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGasMask) {
+      !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGiGather) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -2103,6 +2133,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { rainMapBuild_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapBuild", "rainMapBuild"); });
   pool.Add([&] { godrayVis_ = MakeComputePipeline(device, shadowPL_, mGodVis, "godrayVis", "godrayVis"); });
   pool.Add([&] { gasMask_ = MakeComputePipeline(device, shadowPL_, mGasMask, "gasMaskBuild", "gasMask"); });
+  pool.Add([&] { giPrepare_ = MakeComputePipeline(device, shadowPL_, mGiGather, "giPrepare", "giPrepare"); });
+  pool.Add([&] { giGather_ = MakeComputePipeline(device, shadowPL_, mGiGather, "giGather", "giGather"); });
   pool.Add([&] { windStreak_ = MakeComputePipeline(device, shadowPL_, mWindStreak, "update", "windStreak"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
@@ -2594,6 +2626,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::RainMap:             return rainMapBuf_;
     case B::GodVis:              return godVisBuf_;
     case B::GasMask:             return gasMaskBuf_;
+    case B::GiReq:               return giReqBuf_;
+    case B::GiArgs:              return giArgsBuf_;
     case B::RainExpo:            return rainExpoBuf_;
     case B::Draft:               return draftBuf_;
     case B::DraftMeta:           return draftMetaBuf_;
@@ -2721,6 +2755,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::WindStreak:     return windStreak_;
     case P::GodrayVis:      return godrayVis_;
     case P::GasMask:        return gasMask_;
+    case P::GiPrepare:      return giPrepare_;
+    case P::GiGather:       return giGather_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -3768,6 +3804,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(37, world_->heatMeta),
         b(38, godVisBuf_),
         b(40, gasMaskBuf_),
+        b(39, giReqBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3865,6 +3902,7 @@ void Simulation::BuildShadowBindGroup() {
       b(27, godVisBuf_),
       b(30, world_->gasOuter),
       b(31, gasMaskBuf_),
+      b(28, giReqBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

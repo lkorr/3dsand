@@ -39,6 +39,16 @@ inline constexpr uint32_t kGasMaskCellsN = 128;
 inline constexpr uint32_t kGasMaskShift = 2;
 inline constexpr uint32_t kGasMaskN = kGasMaskCellsN >> kGasMaskShift;
 inline constexpr uint32_t kGasMaskWords = kGasMaskN * kGasMaskN * kGasMaskN / 32;
+// THE GI GATHER REQUEST LIST (assets/shaders/gi_gather.wgsl): header words,
+// list capacity (one record per requested block-face per frame) and the
+// one-bit-per-face dedup bitmap over the irradiance grid's plane (world.h
+// kIrradianceBytes / kIrradiancePlanes words). The header and the cap MUST
+// AGREE with GI_REQ_HEADER / GI_REQ_CAP in gi_gather.wgsl and raymarch.wgsl
+// (scripts/check_invariants.py "gi request list"); the args the prepare entry
+// writes sit at header words 4..6, which copy_giArgs's byte offset 16 reads.
+inline constexpr uint32_t kGiReqHeaderWords = 8;
+inline constexpr uint32_t kGiReqCap = 131072;
+inline constexpr uint32_t kGiReqArgsByteOffset = 16;
 
 // ---------------------------------------------------------------- buffers --
 // Resolvable identities, NOT strings: a typo is a compile error, and the
@@ -250,6 +260,14 @@ enum class Buf : uint8_t {
   // the same command buffer. Render-private like GodVis: never hashed, never
   // saved, never bound by a sim kernel.
   GasMask,
+  // The GI gather request list (assets/shaders/gi_gather.wgsl): block-faces
+  // whose one-bounce gather cache is due, appended by raymarch.wgsl's fragment
+  // stage (with a dedup bitmap) and consumed by the next frame's gi_prepare /
+  // gi_gather rows on the ShadowCache table — the shadow cache's request/
+  // resolve shape. Render-private: never hashed, never saved, no sim binding.
+  // GiArgs is indirect-only and never bound, like ShadowArgs.
+  GiReq,
+  GiArgs,
   // The RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl, src/sim/
   // rainexpo.h): per 4-key texel of the tick's fall-line lattice, the level of
   // the first ray blocker. SIM state, unlike RainMap above: written by the
@@ -499,6 +517,9 @@ enum class Pipe : uint8_t {
   // The gas empty-brick mask (gas_mask.wgsl), one per-FRAME row on the
   // ShadowCache table.
   GasMask,
+  // The GI gather cache's refresh (gi_gather.wgsl), two per-FRAME rows on the
+  // ShadowCache table. Before ShadowResolve for the copy loop's bound.
+  GiPrepare, GiGather,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
@@ -789,6 +810,9 @@ enum class DispatchSel : uint32_t {
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
   IndDraftArgs,      // indirect: draftArgs @ the row's y (one 16-byte record per solve stage)
   IndHeatArgs,       // indirect: heatArgs @ the row's y (heat.h kHeatArg*: one 16-byte record per list)
+  // Indirect: giArgs @ 0. Same standing as IndShadowArgs: the count is what the
+  // fragment shader appended last frame, which nothing on the CPU knows.
+  IndGiArgs,
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

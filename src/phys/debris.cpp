@@ -22,6 +22,35 @@
 
 namespace {
 
+// SANDVOX_DEBRIS_TRACE=<file> (det-debris, 2026-10-03): the decision inputs of
+// every PreTick -- event queue, support queues, overlay, write ticks, bodies,
+// terrain patches -- as order-independent hashes, plus one line per event
+// probe and per island scan. The sibling of SANDVOX_PHYS_TRACE and
+// SANDVOX_FETCH_TRACE: two boots diffed name the first INPUT that differs,
+// not just the first decision. Off (one null test) unless set.
+FILE* DebrisTrace() {
+  static FILE* f = [] {
+    const char* e = std::getenv("SANDVOX_DEBRIS_TRACE");
+    return (e != nullptr && *e) ? std::fopen(e, "w") : (FILE*)nullptr;
+  }();
+  return f;
+}
+inline uint64_t TraceMix(uint64_t h, uint64_t v) {
+  v += 0x9E3779B97F4A7C15ull;
+  v = (v ^ (v >> 30)) * 0xBF58476D1CE4E5B9ull;
+  v = (v ^ (v >> 27)) * 0x94D049BB133111EBull;
+  v ^= v >> 31;
+  return (h ^ v) * 0x100000001B3ull + 0x51ED27ull;
+}
+inline uint64_t TraceIV(uint64_t h, const IVec3& c) {
+  return TraceMix(TraceMix(TraceMix(h, (uint32_t)c.x), (uint32_t)c.y), (uint32_t)c.z);
+}
+inline uint64_t TraceF(uint64_t h, float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return TraceMix(h, u);
+}
+
 // Local printf-to-string, for ProfileReport. selftest.h has one but this file
 // is engine code and must not include the harness.
 std::string Fmt(const char* fmt, ...) {
@@ -724,6 +753,15 @@ bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi,
 void DebrisSystem::QueueSupportEvents(const WorldSnapshot& snap) {
   if (!snap.valid || snap.tick == lastSupportSnapTick_) return;  // one pass per snapshot
   sandvox::PerfSpan span(sandvox::PerfScope::Debris, sandvox::PerfScope::GameLogic);
+  if (FILE* tf = DebrisTrace()) {
+    uint64_t h = 0;
+    uint32_t n = 0;
+    for (uint32_t ci = 0; ci < (uint32_t)snap.supportFlags.size(); ci++)
+      if (snap.supportFlags[ci]) { h = TraceMix(h, ci); n++; }
+    std::fprintf(tf, "F snap %u origin (%d,%d,%d) flags %u %016llx\n", snap.tick,
+                 snap.windowOrigin.x, snap.windowOrigin.y, snap.windowOrigin.z, n,
+                 (unsigned long long)h);
+  }
   lastSupportSnapTick_ = snap.tick;
   int m = (int)kNChunk - 1;
   for (uint32_t ci = 0; ci < (uint32_t)snap.supportFlags.size(); ci++) {
@@ -959,6 +997,8 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   std::vector<Want> wanted;
   std::unordered_map<uint64_t, uint8_t> wantedSet;
   int32_t curComp = -1;
+  const bool tracing = DebrisTrace() != nullptr;
+  uint64_t readHash = 0;  // every chunk switch the flood made, with what it found
   auto chunkOf = [&](int x, int y, int z) -> ChunkRef& {
     const IVec3 wc{x >> 4, y >> 4, z >> 4};
     if (wc.x == last.wc.x && wc.y == last.wc.y && wc.z == last.wc.z) return last;
@@ -984,6 +1024,11 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         else last.overlay = &ov->second.cells;
       }
     }
+    if (tracing)
+      readHash = TraceMix(TraceIV(readHash, wc),
+                          (last.cc ? (uint64_t)last.cc->version : 0xFFFFFFFFull) |
+                              ((uint64_t)last.usable << 32) |
+                              ((uint64_t)(last.overlay ? last.overlay->size() : 0) << 33));
     if (!last.usable && world.ChunkInWindow(wc)) {
       const uint64_t key = World::PackChunkKey(wc);
       if (!wantedSet.count(key)) {  // once per chunk, not once per re-entry
@@ -1368,6 +1413,26 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   if (!waitOnSet) waitOn = firstWait;
   needFetch = fetchMatters;
   bool deferEvent = needFetch || heldMatters || labelOverflow;
+  if (tracing) {
+    uint64_t hc = 0, hw = 0;
+    for (const Comp& cm : comps) {
+      hc = TraceMix(TraceMix(hc, cm.cells.size()),
+                    (uint32_t)cm.anchored | ((uint32_t)cm.boundaryAnchor << 1) |
+                        ((uint32_t)cm.unknownAnchor << 2) | ((uint32_t)cm.oversizeAnchor << 3) |
+                        ((uint32_t)cm.powderAnchor << 4) | ((uint32_t)cm.complete << 5) |
+                        ((uint32_t)cm.touchedUnfetched << 6) | ((uint32_t)cm.heldByEarlier << 7));
+      hc = TraceIV(TraceIV(hc, cm.waitChunk), cm.anchorAt);
+    }
+    for (const Want& w : wanted) hw = TraceMix(TraceIV(hw, w.wc), (uint32_t)w.comp);
+    std::fprintf(DebrisTrace(),
+                 "S %u ev t%u seed (%d,%d,%d)..(%d,%d,%d) comps %zu %016llx wanted %zu %016llx "
+                 "reads %016llx inh %d%d need %d held %d ovf %d waitOn (%d,%d,%d) labelBase %d\n",
+                 tick, e.tick, e.seedLo.x, e.seedLo.y, e.seedLo.z, e.seedHi.x, e.seedHi.y,
+                 e.seedHi.z, comps.size(), (unsigned long long)hc, wanted.size(),
+                 (unsigned long long)hw, (unsigned long long)readHash, inheritedWait ? 1 : 0,
+                 inheritedHeld ? 1 : 0, needFetch ? 1 : 0, heldMatters ? 1 : 0,
+                 labelOverflow ? 1 : 0, waitOn.x, waitOn.y, waitOn.z, labelBase);
+  }
 
   // ---- THE REQUESTS, after the verdicts -----------------------------------
   //
@@ -2023,6 +2088,49 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
   const auto profT0 = prof_.on ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
   for (int i = 0; i < kPhaseCount; i++) prof_.curUs[i] = 0.0;
+  if (FILE* tf = DebrisTrace()) {
+    // Ordered containers hash in order; hash maps hash as an order-free sum,
+    // so a rehash that only reorders iteration does not read as a difference
+    // (and one that changes an iteration-ORDER-DEPENDENT decision shows up
+    // in the probe / scan lines below, which are in decision order).
+    uint64_t he = 0;
+    for (const Event& e : events_) {
+      he = TraceIV(TraceIV(TraceIV(TraceIV(TraceMix(he, e.tick), e.lo), e.hi), e.seedLo), e.seedHi);
+      he = TraceIV(TraceMix(he, e.retries | (e.fetchRetries << 8) | ((uint32_t)e.waiting << 16)),
+                   e.waitChunk);
+    }
+    uint64_t hps = 0, hlq = 0, hcd = 0, hpv = 0, hcw = 0, hb = 0, ht = 0;
+    for (const IVec3& c : pendingSupport_) hps = TraceIV(hps, c);
+    for (const IVec3& c : supportLateQueue_) hlq = TraceIV(hlq, c);
+    for (const auto& kv : supportCooldown_) hcd += TraceMix(kv.first, kv.second);
+    for (const auto& kv : pendingVacate_) {
+      uint64_t c = TraceMix(TraceMix(kv.first, kv.second.tick), kv.second.stamp);
+      for (const auto& cw : kv.second.cells) c += TraceMix(cw.first, cw.second);
+      hpv += c;
+    }
+    for (const auto& kv : chunkWriteTick_) hcw += TraceMix(kv.first, kv.second);
+    for (const Body& b : bodies_) {
+      hb = TraceMix(TraceMix(TraceMix(hb, b.serial), b.handle), b.voxels.size());
+      hb = TraceMix(hb, b.inactiveTicks);
+      hb = TraceF(TraceF(TraceF(hb, b.xf.pos.x), b.xf.pos.y), b.xf.pos.z);
+      for (int k = 0; k < 4; k++) hb = TraceF(hb, b.xf.quat[k]);
+    }
+    for (const auto& kv : terrain_) {
+      uint64_t c = TraceMix(TraceMix(kv.first, kv.second.handle), kv.second.builtVersion);
+      c = TraceMix(TraceMix(TraceMix(c, kv.second.lastNeeded), kv.second.lastRefreshReq),
+                   kv.second.occHash ^ kv.second.vacateKey);
+      ht += c;
+    }
+    std::fprintf(tf,
+                 "T %u ev %zu %016llx ps %zu %016llx late %zu %016llx cd %zu %016llx pv %zu "
+                 "%016llx cw %zu %016llx bodies %zu %016llx terrain %zu %016llx\n",
+                 tick, events_.size(), (unsigned long long)he, pendingSupport_.size(),
+                 (unsigned long long)hps, supportLateQueue_.size(), (unsigned long long)hlq,
+                 supportCooldown_.size(), (unsigned long long)hcd, pendingVacate_.size(),
+                 (unsigned long long)hpv, chunkWriteTick_.size(), (unsigned long long)hcw,
+                 bodies_.size(), (unsigned long long)hb, terrain_.size(),
+                 (unsigned long long)ht);
+  }
   // Cheap and idempotent: an unchanged art palette early-outs on a stamp
   // compare. Here rather than at a load-time call site because the palette is
   // rebuilt by the mob loader, the item loader and every R hot-reload, and the
@@ -2117,6 +2225,13 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
         PhaseTimer pt(prof_, Phase::EventDrain);
         ready = EventReady(e, world, mayFetch);
       }
+      if (FILE* tf = DebrisTrace())
+        std::fprintf(tf, "P %u q%zu ev t%u seed (%d,%d,%d)..(%d,%d,%d) r%u f%u w%d (%d,%d,%d) ready %d "
+                     "may %d cells %u ops %zu\n",
+                     tick, qi, e.tick, e.seedLo.x, e.seedLo.y, e.seedLo.z, e.seedHi.x, e.seedHi.y,
+                     e.seedHi.z, e.retries, e.fetchRetries, e.waiting ? 1 : 0, e.waitChunk.x,
+                     e.waitChunk.y, e.waitChunk.z, ready ? 1 : 0, mayFetch ? 1 : 0, cellsLeft,
+                     cellOps.size());
       if (ready) {
         // The budget is spent by the scan that overruns it, not refused: a
         // wide scan must still be able to run on a tick whose budget is
@@ -6182,6 +6297,11 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   uint32_t builds = 0;
   uint32_t fetchesThisTick = 0;
   uint32_t gathers = 0;
+  if (FILE* tf = DebrisTrace()) {
+    uint64_t hn = 0;
+    for (const auto& nd : needed) hn = TraceF(TraceIV(hn, nd.first), nd.second);
+    std::fprintf(tf, "N %u needed %zu %016llx\n", tick, needed.size(), (unsigned long long)hn);
+  }
   if (prof_.on) {
     prof_.chunksNeeded += needed.size();
     if (needed.size() > prof_.maxNeededOneTick)

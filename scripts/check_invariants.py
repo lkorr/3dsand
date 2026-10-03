@@ -1127,6 +1127,36 @@ def check_gas_mask():
                         "-- the mask would be built on frames the raymarch does not read it, and stale on the ones it does")
         return
     checked.append("gas empty-brick mask")
+def check_gi_req():
+    """The GI gather request list's layout: pass_table.h, gi_gather.wgsl and
+    raymarch.wgsl must agree.
+
+    The C++ sizes the buffer from kGiReqHeaderWords / kGiReqCap; the fragment
+    shader appends records at GI_REQ_HEADER and sets bits at GI_REQ_BITS, and
+    the compute pass reads both at its own copies of the same constants. A
+    mismatch reads a bitmap word as a record (a face gathered into the wrong
+    block) or never releases a bit (a face that stops refreshing), with no
+    error anywhere.
+    """
+    ph = read("src/sim/pass_table.h")
+    gk = read("assets/shaders/gi_gather.wgsl")
+    rm = read("assets/shaders/raymarch.wgsl")
+    if not ph or not gk or not rm:
+        return
+    h = re.search(r"kGiReqHeaderWords\s*=\s*(\d+)", ph)
+    c = re.search(r"kGiReqCap\s*=\s*(\d+)", ph)
+    if not h or not c:
+        problems.append("gi request list: could not find kGiReqHeaderWords/kGiReqCap in pass_table.h")
+        return
+    want = (h.group(1), c.group(1))
+    for path, txt in (("gi_gather.wgsl", gk), ("raymarch.wgsl", rm)):
+        got = tuple((re.search(rf"const\s+GI_REQ_{a}\s*:\s*u32\s*=\s*(\d+)u", txt) or [None, None])[1]
+                    for a in ("HEADER", "CAP"))
+        if got != want:
+            problems.append(f"gi request list: pass_table.h header/cap = {want} but {path} "
+                            f"GI_REQ_HEADER/CAP = {got} -- records and dedup bits would be misread")
+            return
+    checked.append("gi request list")
 
 
 def check_drafts():
@@ -2558,6 +2588,10 @@ def check_gas_consts():
                          ("kGasSpBudget", "GAS_SP_BUDGET"),
                          ("kGasSpEdgeChunks", "GAS_SP_EDGECH"),
                          ("kGasSpOverrun", "GAS_SP_OVERRUN"),
+                         ("kGasSpCaGas", "GAS_SP_CA_GAS"),
+                         ("kGasSpCaOther", "GAS_SP_CA_OTHER"),
+                         ("kGasSpGasOnlyCells", "GAS_SP_GASONLY_CELLS"),
+                         ("kGasSpGasOnly", "GAS_SP_GASONLY"),
                          ("kGasOpsLeaveCap", "GAS_OPS_LEAVE_CAP"),
                          ("kGasSpHdr", "GAS_SP_HDR"),
                          ("kGasSpStride", "GAS_SP_STRIDE")]:
@@ -3319,6 +3353,7 @@ ALL = {
     "drafts": check_drafts,
     "godrayvis": check_godray_vis,
     "gasmask": check_gas_mask,
+    "gireq": check_gi_req,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,
     "counts": check_tick_counts,

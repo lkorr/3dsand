@@ -6165,6 +6165,59 @@ neighbors, so this needs an explicit connectivity pass:
   seeding probes at ~40 ns, the contact sweep's 32k samples at ~52 ns,
   cross-limb heat 0.8 ms -- each bounded by a pot, none multiplying with
   bodies.
+- **The fire's CA, attributed: smoke is a third of it, not the whole
+  (2026-10-03, fire-gpu).** The fire-perf entry above read the village's
+  ~11.5 ms CA as "~2,700 awake chunks of black smoke". New attribution says
+  how much of it is smoke. `gasSpawn` header words 12..15 (`kGasSpCa*`,
+  diagnostic, unhashed) count the cells the colour rows ran by kind and the
+  awake chunks holding gas and nothing else; they ride the snapshot into
+  `--perf` counters (`caGasCells`, `caOtherCells`, `gasOnlyChunks`,
+  `gasOnlyCells`) and the 60-tick lines of `--burn-house` / `--forest-fire`.
+  `--perf --scenario village-fire`: 3,802 awake chunks, 2,919 (77%) gas-only
+  -- but those hold 189k gas cells, 65 a chunk (1.6% full); the colour rows
+  run 936k gas and 454k other (non-inert) cells a tick. By the end of the
+  windowed burn the gas-only chunks are 1,756 holding 18.9k gas cells: 11 a
+  chunk. Per-class arms on substep 1 (the move-only half; behaviour-changing,
+  for attribution only): gas ~40% of `ca1`, liquids ~17%, other solids and
+  powders ~4%, and ~39% is the per-chunk floor (row gather, barriers, the
+  empty half of a pack-2 dispatch) that a chunk pays however few cells it
+  holds. The forest fire is not a smoke problem at all: 265k other (burning
+  foliage) against 96k gas cells a tick. So `PLAN_gas_particles` stage 2
+  (smoke off the grid in-window) is NOT the lever this was hoped to be -- it
+  could remove at most the gas third plus the floor of the gas-only chunks.
+  What changed:
+  1. **One gather row per thread, read once** (`sim_step.wgsl main`). pack x
+     36 <= CA_WG (const_assert), so the row a thread counts in pass 1 is the
+     row it gathers in pass 2: kept in registers across the barrier instead
+     of re-derived. Exact (hash unmoved, f7936a11 on the scenario, 0fa43063 on
+     `determinism` both sides). Village CA 13.06 -> 12.38 ms (perf), 11.59 ->
+     11.05 a tick-frame windowed, p50 18.9 -> 18.0; forest 5.58 -> 5.37 (perf),
+     8.08 -> 7.59 windowed, p50 26.5 -> 26.0.
+  2. **`sim.gasThinDecayMul` (default 1 = off, compiled out)**: a cold buoyant
+     gas voxel with at most `sim.gasThinNeighbors` (2) gas face-neighbours --
+     counted from camask's gas plane, a face in another chunk counts as gas --
+     rolls its own fade-to-air rules at that multiple. Plume cores are
+     untouched; the haze they shed goes sooner. At 3: village (perf) gas cells
+     run -32%, awake chunks 3,802 -> 3,497, CA 12.38 -> 11.52, raymarch 11.92
+     -> 10.60, frame p50 30.3 -> 27.5 ms; forest CA 5.37 -> 5.09, p50 20.2 ->
+     19.8 (its smoke was never the cost). On the `--render-budget` village and
+     fire cameras the frame differs in ~4% of pixels (embers and haze; the
+     raymarch on those frozen frames is unchanged, 6.3 / 10.8 ms). A look
+     decision, so it ships OFF: `oil-fire` still passes at 3 (black smoke
+     peak 9.1x the oil against 10.0x; min 2.0), as do `heat-updraft` and
+     `gas-leave`.
+  Measured and rejected, all on `--perf village-fire`, hash-identical unless
+  noted: gathering the dirty marks into a per-workgroup table flushed once
+  (+1.5 ms), merging a move's source and destination marks into one atomic
+  (+1.35), workgroups of 32 / 64 / 256 (+6.3 / +2.2 / +4.6), pack 4 at 128 or
+  256 threads (+1.0 / +0.7), dropping inert solids from substep 1's gather
+  (-0.2, and not exact for a lone solid). The step kernel is OCCUPANCY-bound
+  -- 72 registers and 13.9 KB of shared memory per 128-thread group, about 7
+  groups an SM on the 3060 Ti -- so a change that removes work but adds a
+  register or a branch loses more than it saves, and the "do it twice"
+  attribution arms (`dbldirty` +3.1 ms) overstate what removing that work
+  could win. The levers left are fewer awake chunks and fewer cells, not
+  cheaper ones.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
@@ -6267,6 +6320,27 @@ neighbors, so this needs an explicit connectivity pass:
   (15,16,15) and the other does not. So the remaining boot-to-boot leak is
   inside the debris event/scan decision — not a clock, not Jolt, not the
   fetch cache — and those two traces are the instrument for the next step.
+  **Attributed and closed (det-debris, 2026-10-03):** the decision's INPUT
+  was the GPU support-loss flag set, which is in no hash and no trace. A
+  third instrument, `SANDVOX_DEBRIS_TRACE=<file>`, writes every PreTick's
+  decision inputs (event queue, support / late queues, cooldowns, the
+  pending-vacate overlay, write ticks, bodies, terrain patches, as hashes),
+  every snapshot's flag set (`F`), every probe (`P`), every scan's
+  components / wants / chunk reads (`S`) and the terrain need list (`N`).
+  Three boots of det-cpu's own tree (03f46cd) diverge at ONE line, with
+  every state hash identical before it: `F snap 94258 flags 5` / `7` / `10`
+  — the tick the 28k-voxel island is erased into a body. That is
+  cross-vendor audit race #10: the `cells` kernel's support flag read
+  neighbours the same dispatch was erasing, before or after their store
+  landed. 15c3787 (sorted cell-op upload + `flagSupportLossCells` reading
+  the post-dispatch grid) closed it and was not in det-cpu's tree. On a tree
+  that has it the same snapshot flags 0 chunks in every boot, the debris
+  traces are byte-identical across boots, and `tree-fell` is identical at
+  gate and `--verify` scope (six boots: chunks needed 38,100, polygonizes
+  110, every count). The pre-fix `sim_mutate.wgsl` on the current tree does
+  not diverge either (the sorted upload makes the race land the same way on
+  this GPU), so a regression of this class would be silent here: support
+  flags are not in the twice-run hash.
   The survivors sit at ground+2 outside the gate's own forced-rescan tiling
   (which starts at `treeA.lo` while the sweep box reaches 2 cells beyond),
   and `SANDVOX_ISLAND_WATCH=x,y,z` / `ovHid`/`ovShow` are in place for the
@@ -15540,8 +15614,9 @@ not change to the eye, and the quadrature's 0.28 against a form factor of 0.5 is
 reason; 0 is an exact off switch — gather,
 resolve deposit and walk sample all const-fold, the `nogi` `--render-budget`
 arm), `giDecay` (0.25), `giFeedback` (0, P2; `LoadTuning` keeps it strictly
-below `giDecay`), `giGatherBlocks` (**12**), `giCachePeriod` (**16**; 0 is the
-uncached per-pixel gather, the `nogicache` `--render-budget` arm).
+below `giDecay`), `giGatherBlocks` (**12**), `giCachePeriod` (**16**; 0 re-gathers
+every visible block-face every frame in the compute pass, the `nogicache`
+`--render-budget` arm).
 
 **The gather reached 1.2 m, which is less than a room** (2026-09-11).
 `giGatherBlocks` is a STEP budget rather than a distance — `traceOpaque` jumps a
@@ -15576,26 +15651,69 @@ frames — so `irradiance` has a second plane (`kIrradiancePlanes`,
 `GI_CACHE_BASE`) at the same index holding the INCOMING irradiance gathered at
 the block-face's centre (the same origin `sim_openness.wgsl`'s own rays start
 from), RGB9E5 with its low bit forced on so that 0 means "never gathered".
-`giBounceAt` re-runs `giGatherRays` only on a chunk slot's scheduled frame —
-slots are staggered over `giCachePeriod` frames, per SLOT rather than per block
-so the branch stays uniform across a warp — or for a word that reads 0, and
-reads the four block-faces in the face plane bilinearly, as `opennessAt` reads
-its bytes. **On the scheduled frame only ELECTED pixels re-gather** (2026-10-03):
-those whose hit lies within one pixel footprint (widened by 1/cos of the view
-angle) of the face centre, plus a 1-in-32 per-pixel lottery for faces whose
-centre is hidden — before, every pixel of the slot re-gathered the same face
-from the same origin and wrote the same word. Measured -0.08..-0.16 ms on the
-near budget cameras with the picture at the re-run floor; the remaining
-refresh work is 0.2-0.3 ms (runtime-disabled refresh, code compiled in) and the
-loop's footprint ~0.1 ms (code removed), which a compute pass over requested
-faces would take out of the fragment shader. The openness walk zeroes the cache word on every full walk and for
-a reused slot, so moved geometry re-gathers on the next frame that looks at
-it; a slot the walk has not stamped gathers live, as before.
+A face is re-gathered only on its chunk slot's scheduled frame — slots are
+staggered over `giCachePeriod` frames, per SLOT rather than per block so the
+branch stays uniform across a warp — or when its word is not FRESH, and
+`giBounceAt` reads the four block-faces in the face plane bilinearly, as
+`opennessAt` reads its bytes.
+
+**The re-gather is a COMPUTE PASS, not fragment work** (2026-10-03,
+`assets/shaders/gi_gather.wgsl`, rows `gi_prepare` / `copy_giArgs` /
+`gi_gather` on the ShadowCache table, after `shadow_resolve`). The fragment
+shader only REQUESTS: a hit on a due or non-fresh face sets that face's bit in
+a one-bit-per-face bitmap and the lane that flips it appends one packed record
+(`shadowPackCell(block min, face)`) to `GiReq` (renderBGL 39, shadowBGL 28;
+`pass_table.h kGiReq*`, cap 131,072 a frame, a refused face releases its bit
+and asks again); the next frame's `gi_gather` casts the nine rays per record
+from the face centre and writes the word. That is the shadow cache's
+request/resolve shape and its one frame of latency: a due face refreshes one
+frame after the frame that found it due (the cadence is unchanged), and EVERY
+visible face of a due slot refreshes — the fragment-shader version before it
+re-gathered only faces whose centre pixel (or a 1-in-32 lottery winner) was on
+screen. `giGatherRays` exists only in `gi_gather.wgsl`. **The word has three
+states**: 0 = never gathered (a slot the window reused, a block that just grew
+a surface), low bit clear = STALE, low bit set = FRESH (every gathered answer,
+a dark one included). The openness walk's full visit now marks the word STALE
+instead of zeroing it, so a re-walked chunk shades from its previous answer for
+the one frame the refill takes; a never-gathered face shades from its bilinear
+neighbours (a 0 tap drops out) for that frame, where the inline version gathered
+it on the spot; a slot the walk has not stamped (a chunk that just streamed
+in waits up to ~4 s for the rolling refresh, and can come inside the handoff
+ring before then) has no cache and shades with `farGiIrradiance`, the closed
+form the far field draws just past the ring, where the inline version gathered
+per pixel. **The pass runs BEFORE `shadow_resolve`, on purpose**: with
+`giFeedback` on, plane 0 holds the multi-bounce fixed point only after the
+fragment write-back, and the resolve's deposits pull it back toward direct
+light every frame; gathered after the resolve the near field read ~2/255
+darker (meadow, 37% of pixels), gathered before it reads last frame's
+post-write-back plane — the order the P2 paragraph below describes — and lands
++0.37/255 brighter than the inline gather's mid-frame read (meadow: 0.21% of
+pixels ≥ 16/255, risers facing lit ground; re-run floor 0.0007%). Short
+captures converge faster than they did: `--shot` `screenshot` 0.07%,
+`screenshot_far` 2.1% of pixels ≥ 16/255 (risers and the bounce-lit valley
+wall a little brighter after the same frame count).
+`giCachePeriod 0` now means "every visible face, every frame, in the compute
+pass" (`nogicache`). The pass walks NINE LANES per face (one per ray, summed in
+ray order — bit-identical to one thread per face): one thread per face was
+latency-bound and cost 0.06-0.09 ms of `pre` for a few hundred faces.
+Measured (1080p, boots alternated, HEAD shaders vs this): raymarch noon
+6.07 → 5.80 ms, meadow 4.37 → 4.00, seam 3.76 → 3.50, seamveg 7.39 → 7.06,
+`pre` +0.00..0.02; `--shader-stats` fragment stage unchanged at 128 registers /
+96 B local (binary −17 KB): the nine inlined loops were not where the allocator
+spilled, the saving is the warps that no longer gather. History: before this, on the scheduled frame ELECTED
+pixels re-gathered inline (footprint window widened by 1/cos of the view angle,
+plus a 1-in-32 lottery, -0.08..-0.16 ms), and before that every pixel of the
+slot did.
 
 **Verified by** `--selftest --gate gi-bounce`: a white `bone` wall on the -X
 edge of a floating 41×41 `leaves` slab at noon; the wall's +X face rendered
-with `giStrength` at its default and at 0 differs by R +2.26, G +5.80,
-B +1.01 per 255 over the middle of the frame (G ≥ 2.0 and G − R ≥ 1.0 from
+with `giStrength` at its default and at 0 differs by R +17.3, G +33.4,
+B +9.5 per 255 over the middle of the frame (2026-10-03, compute-pass gather;
+the inline gather, HEAD shaders on the same exe, measured R +3.3, G +7.0: its first-sight
+gather read a plane the resolve had not yet deposited into and was then held
+until the slot's period came round, so six frames showed a fraction of the
+bounce the fixture converges to — the write-back word after 500 frames is
+within 2% between the two) (G ≥ 2.0 and G − R ≥ 1.0 from
 `tests/baseline.json`), and the slab's own +Y word reads green-led. The
 `shadow-cache` gate pins `giStrength = 0` for its arms: its reference arm has
 no resolve pass and so no injection, and the bounce would otherwise be the

@@ -255,15 +255,17 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
      PerfScope::Count,
      "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce;godray_vis;"
-     "gas_mask",
+     "gi_prepare;gi_gather;gas_mask",
      "One media-blind shadow ray per visible surface PATCH, instead of one per "
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
      "trade working (world.h kShadowCacheBuckets). Also the under-water god-ray "
      "sun visibility volume (godray_vis.wgsl): one coarse sun ray per 4^3 block "
-     "round a submerged eye, ~0 when the eye is dry. And the gas empty-brick "
-     "mask (gas_mask.wgsl), which lets the raymarch's coarse smoke fill skip "
-     "empty samples; an empty dispatch when no gas exists."},
+     "round a submerged eye, ~0 when the eye is dry. And the GI gather "
+     "cache's refresh (gi_gather.wgsl): the nine bounce rays per block-face the "
+     "raymarch found due last frame, moved out of the fragment shader. And the "
+     "gas empty-brick mask (gas_mask.wgsl), which lets the raymarch's coarse "
+     "smoke fill skip empty samples; an empty dispatch when no gas exists."},
     // The clouds (cloud.wgsl): the noise bake (once), the weather / shadow /
     // env maps and the low-res march + temporal resolve, all per FRAME on the
     // ShadowCache table. Zero when weather.clouds is off or the sky is empty —
@@ -462,6 +464,11 @@ enum class PerfCounter : uint8_t {
   PageFillsJitter,   // slots materialized by the `pagefill` DISPATCH (JITTER)
   PageFillBytes,     // bytes of voxel pool written by BOTH fill halves
   CpuDirtyChunks,    // the conservative mirror's size: materialize's denominator
+  // THE CA'S COST ATTRIBUTION (World::Snapshot caGasCells.., fire-gpu).
+  CaGasCells,        // gas cells the colour rows ran this tick (both substeps)
+  CaOtherCells,      // non-gas non-inert cells they ran
+  GasOnlyChunks,     // awake chunks holding gas and nothing else
+  GasOnlyCells,      // gas cells in those chunks
   // The raymarch's inside (RENDER_STATS). Order matches kPerfCounters below
   // AND the RS_* slot order in raymarch.wgsl: RmPixels is the shader's slot 0
   // (the sampled-pixel denominator, scaled back up to pixels), RmPrimarySteps
@@ -535,6 +542,11 @@ inline constexpr PerfCounterDef kPerfCounters[] = {
     {"pageFillsJitter", "page fills: JITTER dispatch", "pageTable", false},
     {"pageFillBytes", "page fill bytes", "pageTable", false},
     {"cpuDirtyChunks", "cpuDirty chunks (mirror)", "pageTable", false},
+    // ---- the CA's cost, by what it ran (fire-gpu, 2026-10-03) --------------
+    {"caGasCells", "CA gas cells run", "caLoop", false},
+    {"caOtherCells", "CA other cells run", "caLoop", false},
+    {"gasOnlyChunks", "awake chunks: gas only", "caLoop", false},
+    {"gasOnlyCells", "gas cells in gas-only chunks", "caLoop", false},
     // ---- the raymarch's INSIDE, from RENDER_STATS (raymarch.wgsl) ----------
     // Per-frame totals, already scaled up from the 1-in-16 pixel sample the
     // shader records on. A STEP is one DDA cell advance in the named trace; a
