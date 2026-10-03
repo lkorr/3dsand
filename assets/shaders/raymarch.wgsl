@@ -7458,6 +7458,47 @@ const WAVE_G : f32 = 9.81;
 // to the deep-water case — which is what "no depth information" should mean.
 const WAVE_DEEP_H : f32 = 8.0;
 
+// The impact-ring half of waveSlope (a bounded ring of recent splashes),
+// split out so rippleCurvature below adds exactly the same term.
+fn waveImpactSlope(pWorldM : vec2f, t : f32, shore : f32) -> vec2f {
+  var slope = vec2f(0.0);
+  {
+    let ik = 6.28318 / max(TUNE_WAVE_IMPACT_LEN, 0.05);
+    let n = min(R.waveImpactCount, WAVE_IMPACT_CAP);
+    for (var i = 0u; i < n; i = i + 1u) {
+      let e = R.waveImpacts[i];
+      if (e.w <= 0.0) { continue; }
+      let age = t - e.z;
+      if (age < 0.0 || age > TUNE_WAVE_IMPACT_DECAY * 3.0) { continue; }
+      // Ring radius grows linearly; the crest train rides it and the whole
+      // thing decays exponentially. Amplitude also falls as 1/sqrt(r), which
+      // is energy spreading round a growing circle, not an art choice.
+      let d = pWorldM - vec2f(e.x, e.y) * VOXEL_METERS;
+      let r = length(d);
+      if (r < 1e-4) { continue; }
+      let ringR = age * TUNE_WAVE_IMPACT_SPEED;
+      let widthM = max(TUNE_WAVE_IMPACT_LEN, 0.05) * 1.5;
+      let env = exp(-age / max(TUNE_WAVE_IMPACT_DECAY, 0.05)) *
+                exp(-((r - ringR) * (r - ringR)) / (widthM * widthM)) *
+                inverseSqrt(max(r, 0.25));
+      if (env < 1e-4) { continue; }
+      slope += (d / r) * (e.w * shore * ik * env * cos(ik * (r - ringR)));
+    }
+  }
+  return slope;
+}
+
+// THE WAVE TABLE, one copy for both evaluators (waveSlope, rippleCurvature).
+fn rippleWaves() -> array<Ripple, RIPPLE_BANDS> {
+  // len in metres, amp in metres of height — see waveSlope for the tuning.
+  return array<Ripple, RIPPLE_BANDS>(
+    Ripple(normalize(vec2f( 1.0,  0.35)), 2.60, 0.0230, 0.55),
+    Ripple(normalize(vec2f(-0.42, 1.0 )), 1.70, 0.0135, 0.73),
+    Ripple(normalize(vec2f( 0.78, -0.75)), 0.85, 0.0060, 1.15),
+    Ripple(normalize(vec2f(-0.85, -0.5)), 0.48, 0.0030, 1.60),
+    Ripple(normalize(vec2f( 0.30, -0.95)), 0.22, 0.0011, 2.30));
+}
+
 // THE FULL FIELD: a Gerstner sum with per-octave speed from the dispersion
 // relation, advected by the current field, faded at the shore.
 //
@@ -7512,12 +7553,7 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
   //                 reads as choppy corrugated metal and crawls when animated
   // The 0.22 m band exists purely to break the sun highlight into sparkle;
   // it carries almost no relief of its own.
-  var waves = array<Ripple, RIPPLE_BANDS>(
-    Ripple(normalize(vec2f( 1.0,  0.35)), 2.60, 0.0230, 0.55),
-    Ripple(normalize(vec2f(-0.42, 1.0 )), 1.70, 0.0135, 0.73),
-    Ripple(normalize(vec2f( 0.78, -0.75)), 0.85, 0.0060, 1.15),
-    Ripple(normalize(vec2f(-0.85, -0.5)), 0.48, 0.0030, 1.60),
-    Ripple(normalize(vec2f( 0.30, -0.95)), 0.22, 0.0011, 2.30));
+  var waves = rippleWaves();
   for (var i = 0; i < RIPPLE_BANDS; i++) {
     let w = waves[i];
     let k = 6.28318 / w.len;                 // angular wavenumber
@@ -7559,29 +7595,7 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
   // A ripple is the memory of an event, so this is the one part of the field
   // that reads state — a BOUNDED ring, evaluated as a pure function of
   // (eventList, t). See kWaveImpactCap and the note over WaveImpactRing.
-  if (R.waveImpactCount > 0u) {
-    let ik = 6.28318 / max(TUNE_WAVE_IMPACT_LEN, 0.05);
-    let n = min(R.waveImpactCount, WAVE_IMPACT_CAP);
-    for (var i = 0u; i < n; i = i + 1u) {
-      let e = R.waveImpacts[i];
-      if (e.w <= 0.0) { continue; }
-      let age = t - e.z;
-      if (age < 0.0 || age > TUNE_WAVE_IMPACT_DECAY * 3.0) { continue; }
-      // Ring radius grows linearly; the crest train rides it and the whole
-      // thing decays exponentially. Amplitude also falls as 1/sqrt(r), which
-      // is energy spreading round a growing circle, not an art choice.
-      let d = pWorldM - vec2f(e.x, e.y) * VOXEL_METERS;
-      let r = length(d);
-      if (r < 1e-4) { continue; }
-      let ringR = age * TUNE_WAVE_IMPACT_SPEED;
-      let widthM = max(TUNE_WAVE_IMPACT_LEN, 0.05) * 1.5;
-      let env = exp(-age / max(TUNE_WAVE_IMPACT_DECAY, 0.05)) *
-                exp(-((r - ringR) * (r - ringR)) / (widthM * widthM)) *
-                inverseSqrt(max(r, 0.25));
-      if (env < 1e-4) { continue; }
-      slope += (d / r) * (e.w * shore * ik * env * cos(ik * (r - ringR)));
-    }
-  }
+  if (R.waveImpactCount > 0u) { slope += waveImpactSlope(pWorldM, t, shore); }
   return slope;
 }
 
@@ -7590,6 +7604,73 @@ fn waveSlope(pWorldM : vec2f, t : f32, footM : f32, depthM : f32,
 // read as what they are rather than as waveSlope with two magic arguments.
 fn rippleSlope(pWorldM : vec2f, t : f32, footM : f32) -> vec2f {
   return waveSlope(pWorldM, t, footM, WAVE_DEEP_H, vec2f(0.0));
+}
+
+// THE CAUSTIC'S CURVATURE IN ONE PASS OVER THE BANDS (2026-10-03).
+// bedCaustic needs rippleSlope at three points — p, p + (e,0), p + (0,e) — for
+// a finite-difference divergence, and called it three times: fifteen band
+// evaluations, each a cos AND a sin, per lit god-ray sample (14 a submerged
+// pixel) and per caustic-lit bed pixel. The three phases of one band differ by
+// CONSTANTS (k * dir.x * e, k * dir.y * e), so the offset points' cos and sin
+// follow from the centre's by the angle-addition identities, and the whole
+// difference costs five cos/sin pairs instead of fifteen. Same field, same
+// Gerstner denominator per point, same impact rings: the result differs from
+// three rippleSlope calls only by float rounding in the phase.
+fn rippleCurvature(cp : vec2f, t : f32, e : f32, footM : f32) -> f32 {
+  let depthM = WAVE_DEEP_H;
+  let shore = smoothstep(0.0, max(TUNE_WAVE_SHORE_DEPTH, 1e-3), depthM);
+  if (shore <= 0.0) { return 0.0; }
+  var n0 = vec2f(0.0);
+  var nx = vec2f(0.0);
+  var nz = vec2f(0.0);
+  var h0 = 0.0;
+  var hx = 0.0;
+  var hz = 0.0;
+  var waves = rippleWaves();
+  for (var i = 0; i < RIPPLE_BANDS; i++) {
+    let w = waves[i];
+    let k = 6.28318 / w.len;
+    var amp = w.amp * TUNE_RIPPLE_AMP_SCALE * shore;
+    let omegaFlat = w.speed * k;
+    let th = tanh(clamp(k * depthM, 1e-3, 20.0));
+    let omegaDisp = sqrt(WAVE_G * k * th);
+    let omega = mix(omegaFlat, omegaDisp, TUNE_WAVE_DISPERSION) *
+                TUNE_RIPPLE_SPEED_SCALE;
+    amp *= mix(1.0, clamp(inverseSqrt(max(th, 0.02)), 1.0, 1.8),
+               TUNE_WAVE_DISPERSION);
+    let phase = dot(cp, w.dir) * k + t * omega;
+    var band = 1.0;
+    if (footM > 0.0) { band = 1.0 - smoothstep(w.len * 0.28, w.len * 0.85, footM); }
+    let c0 = cos(phase);
+    let s0 = sin(phase);
+    let dx = k * w.dir.x * e;
+    let dz = k * w.dir.y * e;
+    let cdx = cos(dx);
+    let sdx = sin(dx);
+    let cdz = cos(dz);
+    let sdz = sin(dz);
+    let cX = c0 * cdx - s0 * sdx;
+    let sX = s0 * cdx + c0 * sdx;
+    let cZ = c0 * cdz - s0 * sdz;
+    let sZ = s0 * cdz + c0 * sdz;
+    let g = amp * k * band;
+    n0 += w.dir * (g * c0);
+    nx += w.dir * (g * cX);
+    nz += w.dir * (g * cZ);
+    let q = TUNE_WAVE_STEEPNESS * g;
+    h0 += q * s0;
+    hx += q * sX;
+    hz += q * sZ;
+  }
+  var sl0 = n0 / max(1.0 - h0, 0.35);
+  var slx = nx / max(1.0 - hx, 0.35);
+  var slz = nz / max(1.0 - hz, 0.35);
+  if (R.waveImpactCount > 0u) {
+    sl0 += waveImpactSlope(cp, t, shore);
+    slx += waveImpactSlope(cp + vec2f(e, 0.0), t, shore);
+    slz += waveImpactSlope(cp + vec2f(0.0, e), t, shore);
+  }
+  return ((slx.x - sl0.x) + (slz.y - sl0.y)) / e;
 }
 
 // ---- surface normal ----
@@ -8113,10 +8194,16 @@ fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
   // length to reach a bed metres down.
   let e = 0.22;   // metres — finite-difference baseline
   let cf = 0.5;   // metres — band damping footprint
-  let s0 = rippleSlope(cp, R.time, cf);
-  let sx = rippleSlope(cp + vec2f(e, 0.0), R.time, cf);
-  let sz = rippleSlope(cp + vec2f(0.0, e), R.time, cf);
-  let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
+  // The two factors the result is MULTIPLIED by (see `focus` and `facing`
+  // below) are known before any wave is evaluated, and past
+  // bedCausticFade of depth — or on a face turned from the sun — they are
+  // exactly zero. Return before paying for the curvature then: the answer
+  // is the same 0 it always was.
+  let focusK = clamp(depthM * 1.5, 0.0, 1.4) *
+               (1.0 - smoothstep(0.0, TUNE_BED_CAUSTIC_FADE, depthM)) *
+               max(dot(n, kd), 0.0);
+  if (focusK <= 0.0) { return 0.0; }
+  let curv = rippleCurvature(cp, R.time, e, cf);
 
   // Only CONVERGING curvature makes a bright band; diverging is the dark gap
   // between bands, and it is already dark by being unlit.
@@ -8145,17 +8232,15 @@ fn bedCaustic(p : vec3f, n : vec3f, depthM : f32) -> f32 {
   // a surface right at the waterline gets full-strength caustics it physically
   // cannot have; no fade and the deepest water is the brightest, which is
   // backwards.
-  let focus = clamp(depthM * 1.5, 0.0, 1.4) *
-              (1.0 - smoothstep(0.0, TUNE_BED_CAUSTIC_FADE, depthM));
+  // (computed above as part of focusK, which is focus * facing)
 
   // Caustics land on a surface in proportion to how square-on it faces the
   // sun, exactly like any other direct light — a wall parallel to the incoming
   // shafts catches almost none. Without this the web wraps uniformly around
   // every face of a rock and reads as glowing paint rather than as projected
   // light.
-  let facing = max(dot(n, kd), 0.0);
-
-  return c * focus * facing;
+  // (also part of focusK above)
+  return c * focusK;
 }
 
 // ---- Henyey-Greenstein phase function ----
