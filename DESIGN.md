@@ -15383,7 +15383,7 @@ sequential `atomicLoad`s, and an atomic load is not served from the SM's L1, so
 every tap of every lit pixel paid several L2 round trips in series —
 `--render-budget` priced the near cache's taps (resolve included) at 0.55-1.0 ms
 on every camera. The fragment shader now also binds the cache READ-ONLY
-(`renderBGL_` 40, the same buffer as 14) and loads the set as four `vec4`s in
+(`renderBGL_` 41, the same buffer as 14) and loads the set as four `vec4`s in
 flight at once; claims and registrations still go through the atomic binding.
 The plain view can only be stale in the safe direction: it shows the cache as
 the resolve pass left it at the barrier before the draw, so a plain MISS falls

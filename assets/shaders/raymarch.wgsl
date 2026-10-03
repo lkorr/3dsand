@@ -45,9 +45,9 @@
 @group(0) @binding(14) var<storage, read_write> shadowCache : array<atomic<u32>>;
 @group(0) @binding(15) var<storage, read_write> shadowReq : array<atomic<u32>>;
 // The same buffer as 14, bound a second time READ-ONLY (simulation.cpp
-// renderBGL_ 40): shadowSlotRead's FIND reads a slot's whole 8-way set as one
+// renderBGL_ 41): shadowSlotRead's FIND reads a slot's whole 8-way set as one
 // cache line of plain loads. See THE FIND IS A PLAIN LOAD there.
-@group(0) @binding(40) var<storage, read> shadowCacheRO : array<vec4<u32>>;
+@group(0) @binding(41) var<storage, read> shadowCacheRO : array<vec4<u32>>;
 
 // ---- RENDER_STATS: where inside this shader the frame went ------------------
 //
@@ -7474,7 +7474,7 @@ fn shadowRefreshDue(key : u32) -> bool {
 // up to eight sequential ATOMIC loads, and an atomic load is not served from
 // the SM's L1: every tap of every lit pixel paid several L2 round trips in
 // series (--render-budget priced the near cache's taps, resolve included, at
-// 0.55-1.0 ms a frame on every camera). The read-only view (binding 40) loads
+// 0.55-1.0 ms a frame on every camera). The read-only view (binding 41) loads
 // the line as four vec4s, all in flight at once and shared through L1 by the
 // pixels of a patch, and the eight keys are compared in registers.
 //

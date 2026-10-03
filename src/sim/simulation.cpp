@@ -752,7 +752,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // storage so the fragment shader's slot FIND is one cache-line load
         // of the whole 8-way set instead of up to eight atomic loads. Claims
         // and registrations still go through 14's atomics.
-        entry(40, T::ReadOnlyStorage, S::Fragment),               // shadowCacheRO
+        entry(41, T::ReadOnlyStorage, S::Fragment),               // shadowCacheRO
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -3811,7 +3811,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(38, godVisBuf_),
         b(40, gasMaskBuf_),
         b(39, giReqBuf_),
-        b(40, world_->shadowCache),   // 14's read-only view (shadowSlotRead)
+        b(41, world_->shadowCache),   // 14's read-only view (shadowSlotRead)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
