@@ -117,6 +117,9 @@ class Simulation {
   // lacks fragmentStoresAndAtomics), which is the ONE place that is decided.
   void EncodeShadowResolve(const rhi::CommandEncoder& enc);
   bool ShadowCacheOn() const { return shadowCacheOn_; }
+  // The GI gather request list (gi_gather.wgsl), for --render-budget's stats
+  // read of its header words. Diagnostics only, never the frame path.
+  const rhi::Buffer& GiReqBuffer() const { return giReqBuf_; }
   // Standalone whole-world hash pass (save/load verification): caller writes
   // TickParams with hashEnable=1 first, reads world.hash after submit.
   void EncodeHashOnly(const rhi::CommandEncoder& enc);
@@ -999,6 +1002,8 @@ class Simulation {
   rhi::ComputePipeline windStreak_;
   // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
   rhi::ComputePipeline godrayVis_;
+  // The GI gather cache's refresh (gi_gather.wgsl `giPrepare` / `giGather`).
+  rhi::ComputePipeline giPrepare_, giGather_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -1155,6 +1160,12 @@ class Simulation {
   // kGodVis*): fixed size, made at Init. 27 in shadowBGL_ (compute, written),
   // 38 in renderBGL_ (fragment, read).
   rhi::Buffer godVisBuf_;
+  // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
+  // size, zeroed at Init (the dedup bitmap must start empty). 28 in
+  // shadowBGL_ (compute), 39 in renderBGL_ (fragment, appends). giArgsBuf_ is
+  // the indirect-only copy of its header's args words.
+  rhi::Buffer giReqBuf_;
+  rhi::Buffer giArgsBuf_;
   // The buffer EnsureRayStart last replaced, kept alive one growth longer
   // because the frame that grew it had already recorded the prepass against it.
   rhi::Buffer rayStartPrev_;
