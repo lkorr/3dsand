@@ -2958,6 +2958,7 @@ def check_react_fx():
         ("RFX_FIRES", wh, r"kPageFaultReactFxFires\s*=\s*(\w+?)u?;"),
         ("RFX_ORIGIN", wh, r"kPageFaultReactFxOrigin\s*=\s*(\w+?)u?;"),
         ("RFX_TICK", wh, r"kPageFaultReactFxTick\s*=\s*(\w+?)u?;"),
+        ("RFX_LIQ_EATEN", wh, r"kPageFaultReactLiquidEaten\s*=\s*(\w+?)u?;"),
         ("RFX_SLOT0", wh, r"kPageFaultReactFxSlot0\s*=\s*(\w+?)u?;"),
         ("RFX_SLOTS", wh, r"kPageFaultReactFxSlots\s*=\s*(\w+?)u?;"),
         ("RFX_CELL_BITS", wh, r"kReactFxCellBits\s*=\s*(\w+?)u?;"),

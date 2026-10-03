@@ -3086,6 +3086,9 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   const uint32_t kWaterEighths = 13u * 13u * 2u * 8u;  // 2 deep this time
   uint32_t worldHash[2] = {0, 0};
   uint32_t consumedSum = 0, standing = 0, liveEighths = 0, plantsEnd = 0;
+  uint32_t caEatenSum = 0;  // settled eighths eaten in the CA (see the loop)
+  uint32_t killHardSum = 0, settleKillSum = 0, excitedCumSum = 0,
+           setWroteSum = 0;  // seam mass-book deltas over the window
   // Attribution for a mass account that does not close — see the census below.
   uint32_t strayWater = 0, endParticles = 0;
   // THE SEAM LEDGER, which is what `ca-slope` and `fluid-excite` reach for when
@@ -3129,7 +3132,18 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
     uint32_t ft = 70000;
     uint32_t liveEst = 0;
     consumedSum = 0;
+    caEatenSum = 0;
     exExcited = exEmitted = exSettled = exDead = exBinned = exRefused = 0;
+    // THE SEAM'S MASS BOOKS (fluidArgs [34..39], CUMULATIVE): read before and
+    // after the window. KILLHARD is the one counted path by which live mass
+    // ends without becoming a voxel or a reaction product (g2p deleting a
+    // particle whose cell closed into hard matter under it -- e.g. a plant
+    // growing into a cell its excited water had just moved into). The others
+    // close the seam's own identity (excited in = settled out + killed +
+    // eaten + still live), which says whether a gap is seam-side or CA-side.
+    uint32_t books0[kFluidArgsWords] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
+                          books0, sizeof(books0), "reactBooks0");
     for (int i = 0; i < kMaxTicks; i++) {
       std::vector<CellOp> cops;
       if (i == 0) cops = box;
@@ -3152,6 +3166,15 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
                             128, "reactArgs");
       liveEst = std::min(fa[7], kFluidCap);
       consumedSum += fa[16];  // FA_CONSUMED
+      // The CA half of the same ledger: settled liquid eighths a reaction
+      // rewrote this tick (world.h kPageFaultReactLiquidEaten, zeroed per
+      // tick by fill_reactFx). Read straight off the record, not the
+      // snapshot ring, so it lines up with this tick's FA_* words.
+      uint32_t eaten = 0;
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.pageFaults,
+                            kPageFaultReactLiquidEaten * 4, &eaten, 4,
+                            "reactCaEaten");
+      caEatenSum += eaten;
       exDead += fa[8];        // FA_DEAD
       exEmitted += fa[9];     // FA_EMITTED
       exSettled += fa[10];    // FA_SETTLED
@@ -3163,9 +3186,13 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
 
     // Final live fullness for the mass equation.
     liveEighths = 0;
-    uint32_t fa[32] = {};
+    uint32_t fa[kFluidArgsWords] = {};
     rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
-                          128, "reactArgsEnd");
+                          sizeof(fa), "reactArgsEnd");
+    killHardSum = fa[34] - books0[34];     // FA_KILLHARD
+    settleKillSum = fa[35] - books0[35];   // FA_SETTLEKILL
+    excitedCumSum = fa[36] - books0[36];   // FA_EXCITEDCUM
+    setWroteSum = fa[39] - books0[39];     // FA_SETWROTE
     uint32_t live = std::min(fa[7], kFluidCap);
     if (live > 0) {
       std::vector<uint32_t> pbuf((size_t)live * kFluidParticleWords);
@@ -3221,69 +3248,67 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   bool det = worldHash[0] == worldHash[1];
   bool consumed = consumedSum > 0;
   bool grew = plantsEnd > kPlantsStart;
-  const int shortBy = (int)kWaterEighths - (int)(standing + liveEighths +
-                                                 consumedSum);
-
-  // THE ACCOUNT HAS FOUR DESTINATIONS, NOT THREE, and the fourth is the thing
-  // the gate is named after.
+  // THE ACCOUNT IS EXACT AGAIN (2026-10-03), with every destination named:
   //
-  // `standing + live + consumed == placed` was exact by construction only if
-  // every eighth a reaction eats passes through the seam. It does not.
-  // FA_CONSUMED is a fluidArgs counter: it records eighths eaten off EXCITED
-  // fluid, which is the specific claim this gate exists to make. But the
-  // authored rule is `{self: plant, neighbor: water, neighborBecomes: plant}`
-  // (assets/materials/reactions.json), and the CA runs it on SETTLED water
-  // voxels too — a water cell beside a plant simply becomes plant, in the
-  // grid, with no particle and no seam event. Those eighths are not lost; they
-  // are standing in the world as the 198 new plant cells the gate itself
-  // counts and calls a pass.
+  //   placed == standing + stray + live
+  //           + eaten while EXCITED (FA_CONSUMED)
+  //           + eaten while SETTLED (kPageFaultReactLiquidEaten)
+  //           + deleted inside hard matter (FA_KILLHARD)
   //
-  // Measured: 37 of 2704 (1.4%), and the seam ledger says it is not seam-side
-  // (2432 excited -> 2432 emitted, nothing refused). 37 eighths against 198
-  // new plants is under a quarter of an eighth per plant, which is what
-  // eating mostly-empty rim cells looks like.
+  // History, because the middle state is what made this gate weak. The
+  // three-term `standing + live + consumed == placed` was exact only if every
+  // eighth a reaction eats crosses the seam. It does not: FA_CONSUMED counts
+  // eighths eaten off EXCITED fluid, and the authored rule `{self: plant,
+  // neighbor: water, neighborBecomes: plant}` also runs in the CA on SETTLED
+  // water voxels -- a water cell beside a plant simply becomes plant, with no
+  // particle and no seam event. Nothing counted those, so from 2026-08-29 the
+  // gate asserted a tolerance instead (gap >= 0, <= 8 per new plant, <= a
+  // baseline percentage; measured 1.4% then 3.55%). A tolerance cannot tell a
+  // reaction from a leak of the same size.
   //
-  // So the assertion becomes the property that actually matters, and it is
-  // still a leak detector — it just knows about the fourth destination:
-  //   1. NO WATER IS CREATED. shortBy >= 0, unconditionally.
-  //   2. Everything missing is accounted for by plants that exist. A water
-  //      cell holds at most 8 eighths and each conversion consumes at most
-  //      one cell, so the gap can never exceed 8 * the plants that grew.
-  //   3. And it stays SMALL. Bound 2 alone is loose (8 * 198 = 1584), so the
-  //      fraction is pinned in baseline.json where a threshold belongs. Water
-  //      vanishing with no plants to show for it, or vanishing faster than the
-  //      plant bed can eat, fails here exactly as the equality used to.
-  const uint32_t newPlants =
-      plantsEnd > kPlantsStart ? plantsEnd - kPlantsStart : 0u;
-  const double gapPct = 100.0 * (double)shortBy / (double)kWaterEighths;
-  const double gapPctMax = BaselineNumber("fluidReactCaGapPctMax", 3.0);
-  bool massOk = shortBy >= 0 && (uint32_t)shortBy <= 8u * newPlants &&
-                gapPct <= gapPctMax;
-  RecordObserved("fluidReactCaGapPct", gapPct);
+  // The missing term is now counted where it happens: sim_step.wgsl's
+  // reactLiquidEaten adds a settled liquid voxel's fullness to the per-tick
+  // reaction record (world.h kPageFaultReactLiquidEaten) whenever a reaction
+  // rewrites it to another material, and the loop above sums it. FA_KILLHARD
+  // is the seam's own counted deletion (a particle whose cell became plant
+  // under it without the consume flag). Water outside the interior box (in or
+  // through the shell) is still water and is in the sum, reported separately.
+  // Zero slack.
+  const uint32_t accounted = standing + strayWater + liveEighths +
+                             consumedSum + caEatenSum + killHardSum;
+  const int shortBy = (int)kWaterEighths - (int)accounted;
+  // The seam's own identity over the window: everything excited either
+  // settled back, was killed in hard matter, was eaten, or is still live. A
+  // gap here is seam-side; a gap above with this at zero is CA-side.
+  const long long seamResid = (long long)excitedCumSum -
+                              ((long long)settleKillSum + killHardSum +
+                               consumedSum + liveEighths);
+  bool massOk = shortBy == 0;
+  RecordObserved("fluidReactMassGap", (double)shortBy);
   bool ok = consumed && grew && massOk && det;
   std::printf("  react seam: %u excited -> %u emitted, %u settled, %u dead, "
-              "%u refused, %u binned\n",
-              exExcited, exEmitted, exSettled, exDead, exRefused, exBinned);
+              "%u refused, %u binned; books: %u excited in, %u settle-killed,"
+              " %u killed hard, %u settle wrote, residual %lld\n",
+              exExcited, exEmitted, exSettled, exDead, exRefused, exBinned,
+              excitedCumSum, settleKillSum, killHardSum, setWroteSum,
+              seamResid);
   std::printf(
-      "fluid react: %s (%u eighths consumed by reactions, plants %u -> %u, "
-      "%u standing + %u live + %u consumed of %u placed"
-      " [gap %d = %.2f%% (allow %.2f%%), under the %u eighths %u new plants"
-      " could have eaten; %u stray outside the box, %u droplets in flight],"
-      " world hash %s)\n",
-      ok ? "PASS" : "FAIL", consumedSum, kPlantsStart, plantsEnd, standing,
-      liveEighths, consumedSum, kWaterEighths, shortBy, gapPct, gapPctMax,
-      8u * newPlants, newPlants, strayWater, endParticles,
+      "fluid react: %s (plants %u -> %u; %u standing + %u stray + %u live + "
+      "%u eaten excited + %u eaten settled + %u killed in hard matter = %u of"
+      " %u placed, mass %s by %d; %u droplets in flight, world hash %s)\n",
+      ok ? "PASS" : "FAIL", kPlantsStart, plantsEnd, standing, strayWater,
+      liveEighths, consumedSum, caEatenSum, killHardSum, accounted,
+      kWaterEighths, massOk ? "EXACT" : "OFF", shortBy, endParticles,
       det ? "matches" : "DIVERGED");
-  detail = Format("%u consumed, plants %u->%u, mass %u+%u+%u/%u (gap %d ="
-                  " %.2f%% of %.2f%% allowed, vs %u eighths %u new plants"
-                  " could eat; stray %u, droplets %u; seam %u excited -> %u"
-                  " emitted, %u settled, %u dead, %u refused, %u binned),"
+  detail = Format("plants %u->%u, mass %u+%u+%u+%u+%u+%u = %u/%u (%s by %d;"
+                  " droplets %u; seam %u excited -> %u emitted, %u settled,"
+                  " %u dead, %u refused, %u binned, books residual %lld),"
                   " det %s",
-                  consumedSum, kPlantsStart, plantsEnd, standing, liveEighths,
-                  consumedSum, kWaterEighths, shortBy, gapPct, gapPctMax,
-                  8u * newPlants, newPlants, strayWater, endParticles,
-                  exExcited, exEmitted, exSettled, exDead, exRefused, exBinned,
-                  det ? "ok" : "DIVERGED");
+                  kPlantsStart, plantsEnd, standing, strayWater, liveEighths,
+                  consumedSum, caEatenSum, killHardSum, accounted,
+                  kWaterEighths, massOk ? "EXACT" : "OFF", shortBy,
+                  endParticles, exExcited, exEmitted, exSettled, exDead,
+                  exRefused, exBinned, seamResid, det ? "ok" : "DIVERGED");
   return ok ? Status::Pass : Status::Fail;
 }
 

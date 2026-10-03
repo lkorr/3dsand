@@ -2083,6 +2083,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
     e = cellEighths(sw);
     selfPowder = matHasPowderMass(materials[voxMat(sw)]);
     sv = solCarried(c, sw);
+    reactLiquidEaten(sw, prod);  // the ledger's CA half (see its header)
   }
   // A solvent turning into something else: its mass moves on or precipitates
   // (evaporating brine concentrates, then leaves salt).
@@ -2627,6 +2628,29 @@ const RFX_COND_SHIFT: u32 = 24u;   // kCondFxShift
 const RFX_COND_MASK : u32 = 31u;   // kCondFxMask
 const RFX_CELL_BITS : u32 = 27u;   // kReactFxCellBits
 const RFX_SCRAMBLE  : u32 = 0x0B5AD4EBu;  // kReactFxScramble
+const RFX_LIQ_EATEN : u32 = 45u;   // kPageFaultReactLiquidEaten
+
+// ---- THE CA HALF OF THE REACTION LEDGER -------------------------------------
+// A reaction that rewrites a SETTLED liquid voxel to another material removes
+// that voxel's eighths from the liquid books. When the liquid is EXCITED the
+// seam counts it (FA_CONSUMED, via flagFluidConsume -> consumeApply); a voxel
+// never crosses the seam, so before this word nothing counted it and a
+// reaction gate's ledger (`fluid-react`: plants growing into the water they
+// drink) could only be asserted to within a tolerance. Called with the word
+// the cell held BEFORE the write and the material written over it; a write of
+// the same material (a no-op rewrite) eats nothing. A liquid PRODUCT carries
+// the eighths on (carriedState) -- they are still counted here, because the
+// question this word answers is "how much of the liquid that was there is
+// gone", per material, and a gate that wants mass across a liquid->liquid
+// transform adds the product back itself.
+// An order-free atomicAdd into the per-tick reaction record (world.h [45]);
+// nothing in the sim reads it (rule 1).
+fn reactLiquidEaten(oldWord : u32, prod : u32) {
+  let om = voxMat(oldWord);
+  if (om == MAT_AIR || om == prod) { return; }
+  if (materials[om].klass != CLASS_LIQUID) { return; }
+  atomicAdd(&pageFaults[RFX_LIQ_EATEN], voxState(oldWord) + 1u);
+}
 
 fn reactFxNote(rule : Reaction, c : vec3<i32>) {
   let fx = (rule.cond >> RFX_COND_SHIFT) & RFX_COND_MASK;
@@ -2800,7 +2824,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             // place (it cannot move on -- a neighbour's neighbour is past the
             // lattice's write reach). Boiling brine leaves its salt.
             var nsv = 0u;
-            if (!synthFluid) { nsv = solCarried(n, niw.y); }
+            if (!synthFluid) {
+              nsv = solCarried(n, niw.y);
+              reactLiquidEaten(niw.y, rule.prodNbr);  // settled neighbour eaten
+            }
             var rep = vec2<u32>(rule.prodNbr, 0u);
             if (nsv != 0u) { rep = solOnReplace(n, nsv, rule.prodNbr, false, 0u); }
             if (rep.y != 0u) {
