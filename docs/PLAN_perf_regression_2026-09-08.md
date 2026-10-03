@@ -289,6 +289,17 @@ session that measures.
 
 ### P6 (separate track). The fine 10 cm march — 8.06 ms of 13.52
 
+**Superseded 2026-10-03 (raymarch-core, re-measured, 1080p, RTX 3060 Ti, one
+process):** `lod8` now saves 0.41 ms of 6.83 at noon — the ray-start map
+(ee40bcb) took the fine march to ~3.7 primary steps a pixel, and it is no
+longer the lever. Where the noon frame (6.5 ms) goes now, by arm: the far
+field 3.6 (`nofar`; its sun-shadow march alone 0.80, the surface-map refine
+1.1), sun shadows 1.25 (`noshadow`), the deferred-detail resolve 0.57
+(`nomicro`; 1.3-1.85 on the desert cameras), GI 0.33 (`nogi`), the
+ray-start prepass itself 0.77 (`pre`). DESIGN.md's ray-start map paragraph
+has the 2026-10-03 change that matters most in play: the map was OFF in the
+game's 1600x900 window and under the sprint FOV.
+
 Unchanged in rank since 2026-09-05 and unrelated to this regression. Candidates
 are already ranked in memory `project-raymarch-accel-research` and
 `PLAN_frame_perf.md` §3. Do not start here: it is the biggest number but the
