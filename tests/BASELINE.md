@@ -1096,3 +1096,35 @@ Both stay `"fail"`; neither is a defect in the burn pass.
 - `tree-fell` passed at `--verify` scope on this tree (0 floating after the
   burn and the quench); its recorded status is red-world's to change.
 - `--gate determinism`: b2514936, matches the pin.
+
+
+
+
+## 2026-10-03 — det-debris: tree-fell's cut-half leak was race #10, already closed (no key changed)
+
+- Attributed with a new instrument, `SANDVOX_DEBRIS_TRACE=<file>` (debris
+  decision inputs per PreTick, every snapshot's support-flag set, every
+  probe / scan / terrain-need list). Three boots of det-cpu's tree 03f46cd:
+  chunks needed 38145 / 39067 / 39067, polygonizes 126 / 132 / 132, and the
+  traces differ at ONE line with every state hash equal before it:
+  `F snap 94258 flags 5` / `7` / `10`, the tick the 28k-voxel island is
+  erased. The `cells` kernel's support flag read neighbours the same
+  dispatch was erasing (cross-vendor audit #10), fixed by 15c3787, which
+  det-cpu's tree did not have. That snapshot now flags 0 chunks every boot.
+- On 2c8e285 + the trace: six `--gate tree-fell` boots and two
+  `--verify tree-fell,debris,floaters,determinism` boots give the same
+  `tree-fell` line apart from the wall-clock COST fields (chunks needed
+  38100, polygonizes 110), and the debris / phys / fetch traces are
+  byte-identical between boots. `tree-fell` PASS at gate and `--verify`
+  scope; its suite-scope `fail` is unchanged here (no suite run). Forced
+  rescan 0/0/0 on both trees; `eventQueueFullSpilled` 0 (the ~600 of the
+  plan note is now `drainBackpressure` ~730-790, a spill queue that waits,
+  not a loss).
+- `--verify` determinism: PIN MOVED 0fa43063 vs pinned b2514936, twice-run
+  reproduces, identical in both boots. That move came in with the repose
+  package (its entry above says it was left for the orchestrator to re-pin).
+  This package changes no hashed state and does not re-pin.
+- The pre-fix `sim_mutate.wgsl` run on the current tree does NOT diverge on
+  this GPU (the sorted upload makes the race land the same way), and support
+  flags are not in the twice-run hash. So a regression of this class would
+  currently go unseen; see DESIGN.md section 7.
