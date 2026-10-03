@@ -812,7 +812,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // bit 2 = short-range mode, bit 3 = gas may be present (the crossfade;
   // docs/PLAN_gas_particles.md stage 1b), bit 4 = short-range NEAR arm (the
   // 50 m ceiling instead of the 100 m one), bit 5 = the LONG-RANGE gas box has
-  // something in it (world.h kGasFarOuterN — a frozen fire past 51.2 m). Bits
+  // something in it (world.h kGasFarOuterN — a frozen fire past 51.2 m), bit
+  // 6 = the charge view (extraFlags; raymarch.wgsl RFLAG_ELECVIEW). Bits
   // 2, 3, 4 and 5 are OR'd in here rather than passed by the caller so that
   // every drawing path gets them — see ShortRangeMode above and
   // SetGasRenderActive / SetGasFarRenderActive in renderspec.h.
@@ -827,7 +828,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.
   gRenderSpec.fluid = rp.fluidCount > 0u;
-  gRenderSpec.debugViz = (rp.flags & 2u) != 0u;
+  // Bit 6 (the CHARGE VIEW, raymarch.wgsl RFLAG_ELECVIEW, passed in
+  // extraFlags like bit 1) is a SPEC_DEBUG_VIZ branch too, so either bit takes
+  // the universal pipeline; the lean one has the overlay deleted.
+  gRenderSpec.debugViz = (rp.flags & (2u | 64u)) != 0u;
   gRenderSpec.shortRange = (rp.flags & 4u) != 0u;
   // ---- the shadow cache's clock (world.h kShadowCacheBuckets) ----
   // ONE CALL HERE IS ONE RENDERED FRAME, which is exactly the clock the cache

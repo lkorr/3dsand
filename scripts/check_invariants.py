@@ -3409,7 +3409,12 @@ def check_elec_mirror():
         except Exception:
             return None
 
-    for n, txt in files.items():
+    # raymarch.wgsl (package E5b) reads the field read-only and declares its
+    # own subset of the constants -- no MIRROR block (that one needs elecMeta
+    # atomic), but every elec.h name it declares must still equal elec.h.
+    const_files = dict(files)
+    const_files["raymarch.wgsl"] = read("assets/shaders/raymarch.wgsl") or ""
+    for n, txt in const_files.items():
         for w, c in _ELEC_CONSTS.items():
             mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", txt, re.M)
             if not mw:

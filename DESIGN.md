@@ -2123,6 +2123,38 @@ after the sparks stop and the fixture sleeps; the field hash and arrival tick
 agree across the two runs. E3's strike targeting (`StrikeMats::Resolve`) now
 reads `electric.resist <= 8` as "a conductor a bolt prefers".
 
+**Render (package E5b, 2026-10-03; `raymarch.wgsl` `elecPAt` / `elecGlow`).**
+The raymarch binds `elecPool` / `elecMeta` READ-ONLY at renderBGL_ 42/43
+(heatPool's standing: written on the tick command buffer, read in the fragment
+stage, covered by the barrier every command buffer opens with; not a pass-table
+row, a fragment shader is not one) and reads half 0 -- last tick's settled
+field. A charged cell gets an emissive blue-white glow ADDED on top of its lit
+surface (before the fog), flickering per cell 24 times a second off `R.time`
+(render-only, so wall time is allowed; nothing here is hashed):
+`0.12 x (P / 200)^0.65`, a straight line in log P -- a spark's 200 is a faint
+shimmer on a copper bar (0.12), an arc's 2,000 0.55, lightning's 30,000 ~3.2
+(the tone map takes it to white); whiter as it climbs. A charged LIQUID glows
+at its surface cell (after shadeWater, faded by the surface's aerial fraction),
+which is what lights a charged pond. Not on micro hits (plants), the far
+cascade or raster bodies (E4's). Emission only: the glow does not light its
+neighbours (no glow-field / irradiance deposit) -- a later step if it is
+wanted. **Cost:** every pixel first reads two elecMeta header words (the live
+list's count, the same address frame-wide, a dynamically uniform branch) -- an
+empty field stops there; then one slot entry + owner key per hit (a chunk with
+no page stops there, and a slot still holding the chunk the window scrolled away
+from reads 0 until the next CA-active tick re-keys it); then one pool word.
+Measured (`--render-budget`, one process, 1080p, glow compiled in vs out with
+an empty field, 9 cameras): every difference inside the `base2` drift, mean
++0.01 ms.
+**Charge view** (F11 / dev panel "charge view"; RenderParams flag bit 6,
+`RFLAG_ELECVIEW`): every shaded surface in false colour by log2 P (blue a few
+units, yellow a spark, red an arc, white lightning), everything uncharged dim
+grey. A `SPEC_DEBUG_VIZ` branch -- `RenderSpec.debugViz` is bit 1 OR bit 6 -- so
+the lean pipeline deletes it. **Look harness:** `--shot-frames
+screenshot_elec,screenshot_elec_night,screenshot_elec_view` (RunShots' charge
+block: a lightning-fed and a spark-fed copper wire and an arc-fed pond on a
+levelled stone platform, sources re-laid every tick in stone pockets).
+
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
 The world runs a day/night cycle, and sunlight is a real input to the CA:
