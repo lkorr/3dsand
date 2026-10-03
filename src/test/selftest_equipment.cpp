@@ -31,8 +31,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "game/anim.h"
@@ -902,6 +904,7 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
     pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
     const uint64_t id = mobs.Spawn(avDef, {site.x, h + 1, site.z});
+    mobs.SetMobBehavior(id, "dummy");  // STANDING, as the claim says (below)
     Mob* m = mobs.FindMobById(id);
     if (m && m->WearItem(&cloak, cloakSlot)) {
       const int shell = shellSlotOf(m, "fixture_cloak");
@@ -1096,6 +1099,19 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     ctx.WaitIdle();
     const uint64_t a = mobs.Spawn(avDef, {sa.x, ha + 1, sa.z});
     const uint64_t b = mobs.Spawn(avDef, {sb.x, hb + 1, sb.z});
+    // PINNED (the authored `dummy` profile, mobile: false), as impact.cpp's
+    // dissolution arms were by W2-O. Unprofiled, both creatures took the
+    // legacy wander at ~2 voxels a tick and left the 17-voxel pad in a few
+    // ticks; the bath (poured around each root every tick) followed them, so
+    // the acid arm measured two different chases, not two baths. Measured
+    // 2026-10-03: the bare one walked z 264 -> 382 and outran its acid, the
+    // plated one lost a foot at t+20, went to a crawl state at z ~310 and lay
+    // in the pooled acid until it died at t+51 -- every slot eaten (head
+    // -1981, hips -2622), the plated torso losing its 9.6% through the neck
+    // and armholes of a body lying in the pool. That was the "plated torso
+    // loses 7-10% in acid" red since 2026-09-23.
+    mobs.SetMobBehavior(a, "dummy");
+    mobs.SetMobBehavior(b, "dummy");
     Mob* ma = mobs.FindMobById(a);
     if (!ma || !b || !ma->WearItem(&piece, slot)) return false;
     const int shell = shellSlotOf(ma, piece.name.c_str());
@@ -1129,19 +1145,48 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     };
     const std::vector<uint32_t> slotA0 = slotVox(a), slotB0 = slotVox(b);
     std::vector<uint32_t> slotA = slotA0, slotB = slotB0;
+    // WHERE ON THE COVERED LIMB the skin went (CLAUDE.md rule 6): its lattice
+    // at the start and at the last live tick, so a loss can be placed against
+    // the shell's openings (the waist below, the neck and armholes above)
+    // rather than read as one number.
+    const std::vector<PrefabVoxel> latA0 = mobs.LimbLattice(a, coveredIdx);
+    std::vector<PrefabVoxel> latA = latA0;
+    float torsoLoY = 1e30f, torsoHiY = -1e30f;
+    {
+      const uint32_t n = mobs.LimbVoxelCount(a, coveredIdx);
+      for (uint32_t k = 0; k < n; k++) {
+        const float y = mobs.LimbVoxelPos(a, coveredIdx, k).y;
+        torsoLoY = std::min(torsoLoY, y);
+        torsoHiY = std::max(torsoHiY, y);
+      }
+    }
+    const int bathTop =
+        ifloor(mobs.LimbVoxelPos(a, rootLimb, 0).y) + soakUp;
     diedDressed = diedBare = -1;
     for (int i = 0; i < ticks; i++) {
       soakTick(a, soakMat, soakUp);
       soakTick(b, soakMat, soakUp);
       // The two bodies' burn fraction / cap / root hp every 20 ticks, so a
       // death below is attributable to a mechanism rather than to "acid".
-      if (i % 20 == 0 && mobs.IsAlive(a) && mobs.IsAlive(b)) {
+      if (i % 10 == 0 && mobs.IsAlive(a) && mobs.IsAlive(b)) {
         const int root = mobs.Defs()[avDef].rootLimb;
-        std::printf("    t+%d: dressed burnt %.1f%% cap %.2f root hp %.1f | "
-                    "bare burnt %.1f%% cap %.2f root hp %.1f\n",
+        // WHERE each body is, beside how hurt it is: the acid only reaches
+        // what stands in it, so a creature that went down is in another bath.
+        int headIdx = -1;
+        for (size_t li = 0; li < mobs.Defs()[avDef].limbs.size(); li++)
+          if (mobs.Defs()[avDef].limbs[li].name == "head") headIdx = (int)li;
+        const Vec3 ra = mobs.LimbPosition(a, root), rb = mobs.LimbPosition(b, root);
+        const Vec3 ha = headIdx >= 0 ? mobs.LimbPosition(a, headIdx) : Vec3{};
+        const Vec3 hb = headIdx >= 0 ? mobs.LimbPosition(b, headIdx) : Vec3{};
+        std::printf("    t+%d: dressed burnt %.1f%% cap %.2f root hp %.1f "
+                    "root (%.1f,%.1f,%.1f) head y %.1f loco %d | "
+                    "bare burnt %.1f%% cap %.2f root hp %.1f "
+                    "root (%.1f,%.1f,%.1f) head y %.1f loco %d | pad %d\n",
                     i, 100.0f * mobs.BurnFraction(a), mobs.BurnHealthCap(a),
-                    mobs.LimbHp(a, root), 100.0f * mobs.BurnFraction(b),
-                    mobs.BurnHealthCap(b), mobs.LimbHp(b, root));
+                    mobs.LimbHp(a, root), ra.x, ra.y, ra.z, ha.y,
+                    mobs.LocoState(a), 100.0f * mobs.BurnFraction(b),
+                    mobs.BurnHealthCap(b), mobs.LimbHp(b, root), rb.x, rb.y,
+                    rb.z, hb.y, mobs.LocoState(b), padTop);
       }
       // WHAT killed it, at the point of failure (CLAUDE.md rule 6): four
       // mechanisms end in the same ragdoll and only the corpse knows which.
@@ -1158,6 +1203,7 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
       liveSkinB = limbMat(b, controlIdx, mSkin);
       liveVoxA = mobs.LimbArtVoxelCount(a, coveredIdx);
       liveShell = limbMat(a, shell, shellMat);
+      latA = mobs.LimbLattice(a, coveredIdx);
       slotA = slotVox(a);
       slotB = slotVox(b);
       // "First loss" is the first tick past ONE PERCENT of the limb's skin,
@@ -1192,6 +1238,49 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
                   "bare [%s ]\n",
                   losses(a, slotA0, slotA).c_str(),
                   losses(b, slotB0, slotB).c_str());
+      // The covered limb's lost SKIN by height band (5 bands of its lattice,
+      // 0 = bottom) and by the lattice face it is nearest (the opening it
+      // most likely came in through).
+      auto key = [](int x, int y, int z) {
+        return ((uint64_t)(uint16_t)x << 32) | ((uint64_t)(uint16_t)y << 16) |
+               (uint64_t)(uint16_t)z;
+      };
+      std::unordered_map<uint64_t, uint32_t> now;
+      now.reserve(latA.size() * 2);
+      for (const PrefabVoxel& v : latA) now[key(v.x, v.y, v.z)] = v.material & 0xFFFu;
+      int lo[3] = {INT32_MAX, INT32_MAX, INT32_MAX};
+      int hi[3] = {INT32_MIN, INT32_MIN, INT32_MIN};
+      for (const PrefabVoxel& v : latA0) {
+        const int p[3] = {v.x, v.y, v.z};
+        for (int ax = 0; ax < 3; ax++) {
+          lo[ax] = std::min(lo[ax], p[ax]);
+          hi[ax] = std::max(hi[ax], p[ax]);
+        }
+      }
+      uint32_t band[5] = {}, face[6] = {}, lostSkin = 0, skin0 = 0;
+      for (const PrefabVoxel& v : latA0) {
+        if ((v.material & 0xFFFu) != mSkin) continue;
+        skin0++;
+        const auto it = now.find(key(v.x, v.y, v.z));
+        if (it != now.end() && it->second == mSkin) continue;
+        lostSkin++;
+        const int span = std::max(1, hi[1] - lo[1] + 1);
+        band[std::min(4, (v.y - lo[1]) * 5 / span)]++;
+        const int p[3] = {v.x, v.y, v.z};
+        int best = 0, bestD = INT32_MAX;
+        for (int ax = 0; ax < 3; ax++) {
+          if (p[ax] - lo[ax] < bestD) { bestD = p[ax] - lo[ax]; best = ax * 2; }
+          if (hi[ax] - p[ax] < bestD) { bestD = hi[ax] - p[ax]; best = ax * 2 + 1; }
+        }
+        face[best]++;
+      }
+      std::printf("    covered limb skin lost %u of %u: by height band "
+                  "(bottom->top) %u %u %u %u %u | nearest face x- %u x+ %u "
+                  "y- %u y+ %u z- %u z+ %u | limb world y %.1f..%.1f, bath "
+                  "poured to y %d\n",
+                  lostSkin, skin0, band[0], band[1], band[2], band[3], band[4],
+                  face[0], face[1], face[2], face[3], face[4], face[5],
+                  torsoLoY, torsoHiY, bathTop);
     }
     lostDressed = a0 - liveSkinA;
     lostBare = b0 - liveSkinB;

@@ -827,6 +827,17 @@ bool mobOk = false;
 
         // Slot lists exactly as the frame loop builds them: through the ONE
         // slot walk in game/bodyreg.h.
+        // THE BRICKS, which this probe never sent (2026-10-03; the same hole
+        // main.cpp's RunMobShot had, memory: --shot-mob never uploads bricks).
+        // A brick is uploaded at boot and then only by the FRAME LOOP's
+        // `if (mbSet.dirty)`; this gate is not the frame loop, so every model
+        // built after boot -- the critter's own limbs and its severed leg,
+        // models 449..458 -- was marched from a GPU record that was never
+        // written and drew nothing at its transform. Measured: parked one at
+        // a time, each of those drew 0 px at the frame centre from every
+        // direction, and the one boot-time model (51) drew 1,900-2,900.
+        if (MicroBodySet* mbs = debris.MicroSet(); mbs != nullptr && mbs->dirty)
+          sim.UploadMicroBodies(ctx.queue, *mbs);
         BodyRegistry bodyReg(debris, mobs, nullptr);
         std::vector<BodyXformGpu> xf;
         bodyReg.BuildXforms(xf);
@@ -869,6 +880,52 @@ bool mobOk = false;
           if (!t.empty()) target = Vec3{t[0].pos[0], t[0].pos[1], t[0].pos[2]};
           else target = mobs.MobOrigin(cid);
         }
+        // A brick's extent in world voxels. A body transform's `pos` is the
+        // brick's MIN CORNER (microbody.wgsl vs: the box is local 0..extent),
+        // so the solo probe below aims at corner + extent / 2.
+        const MicroBodySet* mset = mobs.MicroSet();
+        auto brickExtent = [&](const MicroBodyInstGpu& mi) -> Vec3 {
+          if (mset == nullptr || mi.model >= mset->models.size()) return Vec3{};
+          const MicroBodyModelGpu& mm = mset->models[mi.model];
+          const float sc = (float)std::max(mm.scale, 1u);
+          return Vec3{(float)(mm.dims & 0x3FFu) / sc,
+                      (float)((mm.dims >> 10) & 0x3FFu) / sc,
+                      (float)((mm.dims >> 20) & 0x3FFu) / sc};
+        };
+        // WHAT STANDS BETWEEN AN EYE AND A POINT, off the CPU mirror (rule 6):
+        // the solid cells a straight segment crosses, the first one named, and
+        // how many samples fell in chunks the mirror does not hold.
+        auto occluders = [&](const Vec3& from, const Vec3& to) {
+          const Vec3 dv = to - from;
+          const float len = dv.len();
+          uint32_t solid = 0, uncached = 0;
+          int firstY = 0;
+          uint32_t firstMat = 0;
+          IVec3 last{INT32_MIN, 0, 0};
+          for (float s = 0.0f; s < len - 0.75f; s += 0.25f) {
+            const Vec3 p = from + dv * (s / len);
+            const IVec3 cell{ifloor(p.x), ifloor(p.y), ifloor(p.z)};
+            if (cell.x == last.x && cell.y == last.y && cell.z == last.z) continue;
+            last = cell;
+            const CachedChunk* cc =
+                world.Cached(IVec3{cell.x >> 4, cell.y >> 4, cell.z >> 4});
+            if (cc == nullptr || cc->voxels.size() != kChunkVol) {
+              uncached++;
+              continue;
+            }
+            const uint32_t mat =
+                cc->voxels[((uint32_t)(cell.z & 15) * kChunk +
+                            (uint32_t)(cell.y & 15)) * kChunk +
+                           (uint32_t)(cell.x & 15)] & 0xFFFu;
+            if (mat == 0) continue;
+            if (solid++ == 0) { firstMat = mat; firstY = cell.y; }
+          }
+          return Format("%u cells in the way%s%s (first y %d), %u uncached",
+                        solid, solid ? ": " : "",
+                        solid && firstMat < mats.size() ? mats[firstMat].name.c_str()
+                                                        : "",
+                        firstY, uncached);
+        };
 
         auto shoot = [&](bool withMicro, std::vector<uint8_t>& out) {
           rhi::Texture tex = ctx.device.CreateTexture(
@@ -919,7 +976,7 @@ bool mobOk = false;
         };
         const int kNumDirs = (int)(sizeof(kDirs) / sizeof(kDirs[0]));
         uint32_t minDiff = 0xFFFFFFFFu, maxDiff = 0;
-        int badDirs = 0, firstBad = -1;
+        int badDirs = 0, firstBad = -1, buriedDirs = 0;
         std::vector<uint8_t> withPix, withoutPix, keepPix;
         for (int d = 0; d < kNumDirs; d++) {
           // Normalize then push out to a fixed radius so every direction
@@ -949,9 +1006,29 @@ bool mobOk = false;
           // drew nothing — or drew entirely behind the terrain, i.e. got the
           // depth convention wrong — can fall under. Deliberately far below
           // the observed count so gait wander can never flake the test.
-          if (diff < 500) {
+          // AN EYE INSIDE THE GROUND IS NOT A VIEW. The critter stands on
+          // the terrain, so the below-octant eyes 8 voxels out sit in rock and
+          // the world pass correctly hides everything behind it. Those
+          // directions are reported, not asserted: the SOLO probe below asks
+          // the same octants the same question in open air.
+          const int eyeGround = World::TerrainHeight(ifloor(eye.x), ifloor(eye.z),
+                                                     kDefaultSeed);
+          if (eye.y < (float)eyeGround + 1.0f) {
+            buriedDirs++;
+            std::printf("  critter dir (%.0f,%.0f,%.0f): eye (%.1f,%.1f,%.1f) "
+                        "is under the ground (y %d), %u px -- not asserted\n",
+                        kDirs[d].x, kDirs[d].y, kDirs[d].z, eye.x, eye.y, eye.z,
+                        eyeGround, diff);
+          } else if (diff < 500) {
             badDirs++;
             if (firstBad < 0) firstBad = d;
+            std::printf("  critter dir (%.0f,%.0f,%.0f): %u px; eye (%.1f,%.1f,"
+                        "%.1f) ground y %d, critter at y %.1f; %s\n",
+                        kDirs[d].x, kDirs[d].y, kDirs[d].z, diff, eye.x, eye.y,
+                        eye.z,
+                        World::TerrainHeight(ifloor(eye.x), ifloor(eye.z),
+                                             kDefaultSeed),
+                        target.y, occluders(eye, target).c_str());
           }
           // keep the first diagonal's image as the visual artifact
           if (d == 0) keepPix = withPix;
@@ -988,8 +1065,10 @@ bool mobOk = false;
           std::vector<uint8_t> sWith, sWithout;
           for (int d = 0; d < kNumDirs; d++) {
             Vec3 dir = kDirs[d].normalized();
-            Vec3 eye = soloPos + dir * 6.0f;
-            Vec3 look = (soloPos - eye).normalized();
+            // The brick's CENTRE (identity rotation: corner + extent / 2).
+            const Vec3 soloCentre = soloPos + brickExtent(solo[0]) * 0.5f;
+            Vec3 eye = soloCentre + dir * 6.0f;
+            Vec3 look = (soloCentre - eye).normalized();
             Camera cam3;
             cam3.yaw = std::atan2(look.z, look.x);
             cam3.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
@@ -1028,17 +1107,37 @@ bool mobOk = false;
             };
             shootSolo(true, sWith);
             shootSolo(false, sWithout);
+            // COUNTED WHERE THE BODY IS AIMED: the central 128 x 128 px. A
+            // whole-frame count passed the views from above on ~4,000 pixels
+            // that changed ELSEWHERE between two otherwise identical draws
+            // while the parked body itself drew nothing (measured 2026-10-03,
+            // the bricks not uploaded: below), so "something changed" was not
+            // "the body drew".
             uint32_t sd = 0;
-            for (size_t p = 0; p + 3 < sWith.size(); p += 4)
-              if (sWith[p] != sWithout[p] || sWith[p + 1] != sWithout[p + 1] ||
-                  sWith[p + 2] != sWithout[p + 2])
-                sd++;
+            for (uint32_t yy = H / 2 - 64; yy < H / 2 + 64; yy++)
+              for (uint32_t xx = W / 2 - 64; xx < W / 2 + 64; xx++) {
+                const size_t p = ((size_t)yy * W + xx) * 4;
+                if (sWith[p] != sWithout[p] || sWith[p + 1] != sWithout[p + 1] ||
+                    sWith[p + 2] != sWithout[p + 2])
+                  sd++;
+              }
             if (sd < soloMin) soloMin = sd;
             // A single limb 6 voxels away fills hundreds of pixels; 50 is a
             // floor only "drew nothing at all" can fall under.
             if (sd < 50) {
               soloBad++;
               if (soloFirst < 0) soloFirst = d;
+              const size_t cpx = ((size_t)(H / 2) * W + W / 2) * 4;
+              std::printf("  solo dir (%.0f,%.0f,%.0f): %u px at the centre; eye "
+                          "(%.1f,%.1f,%.1f), ground y %d, pitch %.2f; %s; centre "
+                          "px with %u,%u,%u without %u,%u,%u\n",
+                          kDirs[d].x, kDirs[d].y, kDirs[d].z, sd, eye.x, eye.y,
+                          eye.z,
+                          World::TerrainHeight(ifloor(eye.x), ifloor(eye.z),
+                                               kDefaultSeed),
+                          cam3.pitch, occluders(eye, soloCentre).c_str(),
+                          sWith[cpx], sWith[cpx + 1], sWith[cpx + 2],
+                          sWithout[cpx], sWithout[cpx + 1], sWithout[cpx + 2]);
             }
           }
           // restore the real transforms for anything downstream
@@ -1056,11 +1155,13 @@ bool mobOk = false;
                       "takes the cube path and has no bricks to probe)\n",
                       kVoxelsPerMetre);
         else
-          std::printf("micro body render: %s (%zu micro slots, %d/%d views drew, "
+          std::printf("micro body render: %s (%zu micro slots, %d/%d views drew "
+                    "(%d eyes under the ground, not asserted), "
                     "%u..%u px changed of %u, solo body %d/%d views (min %u px), "
                     "%zu cube instances from micro limbs)\n",
                     microOk ? "PASS" : "FAIL", microInsts.size(),
-                    kNumDirs - badDirs, kNumDirs, minDiff, maxDiff, W * H,
+                    kNumDirs - badDirs - buriedDirs, kNumDirs - buriedDirs,
+                    buriedDirs, minDiff, maxDiff, W * H,
                     kNumDirs - soloBad, kNumDirs, soloMin, inst.size());
         if (badDirs > 0)
           std::printf("  critter INVISIBLE from %d view(s); first is dir "
@@ -14276,6 +14377,9 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
                   builtWhy.c_str(), cached ? "ok" : "FAIL",
                   spawned ? "ok" : "FAIL", fem.c_str(), zombie ? "ok" : "FAIL",
                   refused ? "ok" : "FAIL", art, (int)kArtPaletteSlotsGpu, art0);
+  // Leave no creature behind (the runner's leak line named this gate).
+  c.mobs.Reset();
+  c.debris.Reset();
   return ok ? Status::Pass : Status::Fail;
 }
 
