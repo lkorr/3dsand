@@ -68,6 +68,8 @@ const std::vector<Gate>& AlchemyGates();
 // World chemistry (docs/PLAN_alchemy_chemistry.md package A): reaction
 // effects (explode), the new materials in the grid, toxic gas on bodies.
 const std::vector<Gate>& ChemGates();
+// Electricity E3 (docs/PLAN_electricity.md section 3): the strike path.
+const std::vector<Gate>& ElecStrikeGates();
 const std::vector<Gate>& GrimoireGates();
 // The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
 // edit ops. CPU-only over glyphs.json and the generated oracle.
@@ -939,6 +941,9 @@ const char* const kOrder[] = {
     "chem-sodium", "chem-acid-fumes", "chem-electrolysis", "chem-toxic",
     // Package E (the creative expansion): same fixture discipline.
     "chem-gunpowder", "chem-thermite", "chem-frost", "chem-holy-water", "chem-recipes",
+    // Electricity E3: a forced weather strike on a rod-and-collar fixture,
+    // run twice; same fixture discipline (own pad, regenerates on the way out).
+    "elec-strike",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -1164,7 +1169,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),

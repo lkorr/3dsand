@@ -2237,6 +2237,13 @@ TP_F(weather, drySeconds, NO_WGSL, 240.0f, 5.0f, 36000.0f)
 TP_B(weather, rainShadowMap, NO_WGSL, true)
 TP_B(weather, rainTouchesWorld, NO_WGSL, true)
 TP_F(weather, rainIgniteDamp, NO_WGSL, 0.6f, 0.0f, 1.0f)
+// GROUND STRIKES (docs/PLAN_electricity.md E3, session.cpp WeatherStrikes):
+// the share of the sky's flash rate (a preset's `lightning`, flashes/min) that
+// strikes the ground near the player in the sim, and the radius (cells) of the
+// disc round the player they land in. Quantised to Q16 on the CPU (NO_WGSL);
+// 0 = no sim strikes, the render flashes stay.
+TP_F(weather, strikeRate, NO_WGSL, 0.3f, 0.0f, 10.0f)
+TP_I(weather, strikeRadius, NO_WGSL, 160, 16, 240)
 
 
 // ==== combustion ====

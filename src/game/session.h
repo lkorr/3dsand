@@ -87,6 +87,7 @@
 #include "game/player.h"
 #include "game/prefab.h"
 #include "game/remoteplayer.h"
+#include "game/lightning.h"
 #include "game/spell.h"
 #include "game/strike_pick.h"
 #include "game/thirdperson.h"
@@ -932,6 +933,55 @@ struct TickAuthorityCtx {
     std::vector<ExplosionOp> recent;  // the last kRecent blasts issued
     static constexpr size_t kRecent = 16;
   } reactFx;
+  // ---- STRIKES (docs/PLAN_electricity.md E3, game/lightning.h) ---------------
+  //
+  // Lightning in the sim: the `lightning` / `shock` glyphs (phase I) and a
+  // storm's ground strikes near the primary (phase K, WeatherStrikes) all go
+  // through LightningStrike -> CellOps, charged to ONE per-tick budget. The
+  // weather half is two-step: a strike is DECIDED on a hashed tick (the aim,
+  // its chunks requested from the fetch cache) and FIRED kStrikeLeadTicks
+  // later against the mirror + cache -- the stepped leader, and the time the
+  // cache needs to know the ground it lands on. Pending strikes are tick
+  // state like `reactFx.aftermath`: not hashed, not saved (a save mid-leader
+  // drops one bolt).
+  struct StrikeWorld {
+    StrikeMats mats;
+    const void* matsData = nullptr;   // mats.data() it was resolved for
+    StrikeBudget budget;
+    struct Pending {
+      IVec3 aim{};
+      uint32_t fireTick = 0;
+      uint32_t key = 0;
+      bool forced = false;
+    };
+    std::vector<Pending> pending;     // decided, not yet fired (bounded: kMaxPending)
+    static constexpr size_t kMaxPending = 4;
+    // FORCE A STRIKE (the gate, the dev key, SANDVOX_STRIKE_EVERY): the next
+    // tick decides a weather strike regardless of the sky -- at `forceAim`
+    // when `forceAimSet`, else in the usual disc round the primary.
+    bool forceNext = false;
+    bool forceAimSet = false;
+    IVec3 forceAim{};
+    // What fired, for the frame (flash + thunder: drained by main.cpp) and
+    // for the gates (`recent`, the last kRecent). Bounded.
+    struct Event {
+      uint32_t tick = 0;
+      IVec3 target{};    // the struck top
+      IVec3 foot{};      // the cell the bolt arrived in
+      bool weather = false;
+      bool conductive = false;
+      bool emitted = false;   // false = refused for budget
+      uint32_t cells = 0;
+    };
+    std::vector<Event> events;        // drained by the frame; capped at kMaxEvents
+    static constexpr size_t kMaxEvents = 16;
+    std::vector<Event> recent;
+    static constexpr size_t kRecent = 16;
+    // The last plan's whole CellOp list (the gate compares two runs of it).
+    StrikePlan lastPlan;
+    // Telemetry, monotonic.
+    uint64_t weatherDecided = 0, weatherFired = 0, spellStrikes = 0, forced = 0;
+  } strikes;
   // Each vessel body's velocity last tick, for the break test's "velocity
   // jump" witness. One entry per vessel lying or flying in the world.
   std::vector<std::pair<uint64_t, Vec3>> vesselVel;

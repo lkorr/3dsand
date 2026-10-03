@@ -224,6 +224,10 @@ bool gRainLatched = false;
 uint32_t gRainLatchTick = 0;
 TickRain gRainLatch;
 State gLast;
+// The last sim strike NoteStrike was handed (render-only).
+uint32_t gStrikeTick = 0;
+bool gStrikeSet = false;
+float gStrikeX = 0.0f, gStrikeY = 0.0f, gStrikeZ = 0.0f;
 Preset gEased;
 bool gEasedValid = false;
 
@@ -358,6 +362,7 @@ PresetQ ScheduledQ(const SimTuneQ& q, const std::vector<PresetQ>& ps, int pinned
   o.windI = LerpQ(ps[a].windI, ps[b].windI, t);
   o.windG = LerpQ(ps[a].windG, ps[b].windG, t);
   o.windC = LerpQ(ps[a].windC, ps[b].windC, t);
+  o.lightning = LerpQ(ps[a].lightning, ps[b].lightning, t);
   return o;
 }
 
@@ -486,6 +491,7 @@ void Library::EnsureLoaded() {
     q.windI = Q16(p.windIntensity);
     q.windG = Q16(p.windGale);
     q.windC = Q16(p.windConvective);
+    q.lightning = Q16(std::max(0.0f, p.lightning));
     presetsQ_.push_back(q);
   }
 }
@@ -620,6 +626,27 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, bool commit)
     }
     s.flash *= std::clamp(s.mix.coverage * 1.5f - 0.3f, 0.0f, 1.0f);
   }
+  // ---- a sim ground strike (NoteStrike): the near flash ---------------------
+  // The same stroke + re-strike envelope as the far flashes, on the sim clock
+  // from the strike's own tick, so it lights the deck over the bolt the frame
+  // the bolt's cells appear. Not scaled by coverage: the bolt is there.
+  if (gStrikeSet) {
+    const float age = (float)(ts - (double)gStrikeTick / (double)kTickHz);
+    if (age >= 0.0f && age <= 1.2f) {
+      float f = 0.0f;
+      for (uint32_t r = 0; r < 3; r++) {
+        const float off = r == 0 ? 0.0f : 0.05f + 0.09f * (float)r;
+        const float a = age - off;
+        if (a < 0.0f) continue;
+        const float amp = r == 0 ? 1.0f : 0.5f;
+        f = std::max(f, amp * std::exp(-a * 14.0f));
+      }
+      s.strikeFlash = f;
+      s.strikeXM = gStrikeX;
+      s.strikeYM = gStrikeY;
+      s.strikeZM = gStrikeZ;
+    }
+  }
   if (!s.enabled) {
     s.overcast = 0.0f;
     s.wetness = 0.0f;
@@ -630,6 +657,30 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, bool commit)
 }
 
 const State& Last() { return gLast; }
+
+void NoteStrike(uint32_t tick, float xM, float yM, float zM) {
+  gStrikeTick = tick;
+  gStrikeSet = true;
+  gStrikeX = xM;
+  gStrikeY = yM;
+  gStrikeZ = zM;
+}
+
+int64_t SimLightningQ(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  EnsureEnvPin();
+  if (!tn.weather.clouds) return 0;
+  const std::vector<Preset>& ps = Presets().Presets();
+  const std::vector<PresetQ>& pq = Presets().PresetsQ();
+  if (ps.empty()) return 0;
+  const SimTuneQ q = QuantiseTuning(tn);
+  int pinned = 0;
+  for (int i = 0; i < (int)ps.size(); i++)
+    if (ps[i].name == tn.weather.preset) pinned = i;
+  const Preset* ov = gOverride.empty() ? nullptr : Presets().Find(gOverride);
+  const PresetQ now = ov ? pq[(size_t)(ov - ps.data())]
+                         : ScheduledQ(q, pq, pinned, seed, (int64_t)tick);
+  return std::max<int64_t>(0, now.lightning);
+}
 
 uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
   return SimRain(tn, seed, tick).word;

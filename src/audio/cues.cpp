@@ -28,6 +28,12 @@ constexpr double kFlaskFillMinGap = 0.02;
 constexpr float kFlaskFillGain = 0.7f;
 constexpr float kFlaskFillRadius = 12.0f;  // metres
 
+// Thunder (Cues::Thunder): the speed of sound, how many claps may wait out
+// their delay at once, and how far a clap carries.
+constexpr float kSoundMs = 343.0f;
+constexpr size_t kMaxThunder = 8;
+constexpr float kThunderRadius = 600.0f;  // metres
+
 // ---- material ambience ------------------------------------------------------
 // The 3x3x3 mirror is 48 voxels on a side. Sampling every 4th cell on each axis
 // makes one scan 1728 reads and gives each sample a 4^3 = 64-voxel footprint,
@@ -150,6 +156,9 @@ const std::map<std::string, std::string> Cues::kSlotPrefix = {
     // Liquid landing in a flask (the `vessel` owner): set vessel/fill, fixed
     // in code like the combat sets. See Cues::FlaskFill.
     {"fill", "vessel"},
+    // Thunder (the `weather` owner): set weather/thunder, fixed in code like
+    // the combat sets. See Cues::Thunder.
+    {"thunder", "weather"},
 };
 
 namespace {
@@ -347,6 +356,7 @@ void Cues::Update(float dt, const Vec3& listenerPosVox, float yaw, float pitch,
                   World* world) {
   if (!enabled_) return;
   now_ += (double)dt;
+  PlayDueThunder();
   // The per-source voice map is keyed by mob handle, and mobs die. Drop entries
   // older than the gap they enforce: after that they can never suppress
   // anything, so keeping them is pure growth (CLAUDE.md rule 2 — bound every
@@ -645,6 +655,57 @@ void Cues::FlaskFill(const Vec3& posVox, float fill, int cells) {
   } else {
     stats_.dropped++;
   }
+}
+
+int Cues::ThunderSetId() const {
+  if (thunderSetId_ == -2) thunderSetId_ = lib_.Find("weather/thunder");
+  return thunderSetId_;
+}
+
+void Cues::Thunder(const Vec3& posVox, const Vec3& listenerPosVox) {
+  stats_.thunderStrikes++;
+  if (!enabled_) return;
+  if (thunder_.size() >= kMaxThunder) {
+    stats_.dropped++;
+    return;
+  }
+  const Vec3 d = posVox - listenerPosVox;
+  const float distM = d.len() * kVoxelMeters;
+  PendingThunder t;
+  t.at = now_ + (double)(distM / kSoundMs);
+  t.pos = posVox;
+  // Near: a full-gain crack, a touch high; far (a few hundred metres): a
+  // quieter, lower roll. The spatializer's own distance law does the rest.
+  const float near = std::clamp(1.0f - distM / 300.0f, 0.0f, 1.0f);
+  t.gain = 0.6f + 0.4f * near;
+  t.rate = 0.8f + 0.3f * near;
+  thunder_.push_back(t);
+}
+
+void Cues::PlayDueThunder() {
+  if (thunder_.empty()) return;
+  const int setId = ThunderSetId();
+  size_t w = 0;
+  for (size_t i = 0; i < thunder_.size(); i++) {
+    const PendingThunder& t = thunder_[i];
+    if (t.at > now_) {
+      thunder_[w++] = t;
+      continue;
+    }
+    if (setId < 0) continue;  // no weather/thunder recorded: silent
+    if ((int)lastVariant_.size() <= setId) lastVariant_.assign((size_t)lib_.Count(), -1);
+    const std::vector<float>* buf = PickStep(setId, lastVariant_[(size_t)setId]);
+    VoiceConfig cfg;
+    cfg.gain = t.gain;
+    cfg.audibleRadius = kThunderRadius;
+    cfg.verbWet = CurrentTuning().audio.reverbWet;
+    cfg.doppler = false;
+    cfg.rate = t.rate;
+    cfg.priority = true;
+    if (world_.PlayOneShot(buf, t.pos, cfg)) stats_.thunderVoices++;
+    else stats_.dropped++;
+  }
+  thunder_.resize(w);
 }
 
 int Cues::MobSetId(const MobDef& def, MobEvent ev) const {

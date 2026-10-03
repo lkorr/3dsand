@@ -1638,6 +1638,33 @@
       "becomes": "air"
     },
     {
+      "note": "-------- arc and lightning: the shock and the bolt (docs/PLAN_electricity.md section 3, package E3) --------\nThree strengths of one discharge, each authored from the discharge's side (neighborBecomes fire), so none is an ignition to the loader's spread knob. SPARK (above) lightly burns: 40 per-mille a tick over a ~2 tick life, under one contact in ten (the owner, 2026-10-03: sparks only sometimes set fire). ARC (the shock glyph's burst, a strike's splash) is a real crackle: 250 over a ~1.4 tick life, so most touches singe. LIGHTNING is the bolt: 900 over a ~2 tick life -- whatever burnable thing it touches goes up. All three are tag:electric, so every electrolysis / pop rule above fires off them alike; none is tag:hot, so a bolt does not melt the iron it lands on. Decays are fast and unconditional (rule 2): an arc 700 per-mille (about a tick), lightning 550 (one or two)."
+    },
+    {
+      "self": "arc",
+      "neighbor": "tag:flammable",
+      "chance": 250,
+      "neighborBecomes": "fire"
+    },
+    {
+      "self": "arc",
+      "decay": true,
+      "chance": 700,
+      "becomes": "air"
+    },
+    {
+      "self": "lightning",
+      "neighbor": "tag:flammable",
+      "chance": 900,
+      "neighborBecomes": "fire"
+    },
+    {
+      "self": "lightning",
+      "decay": true,
+      "chance": 550,
+      "becomes": "air"
+    },
+    {
       "note": "-------- chlorine and noxious gas: toxic --------\nBoth HURT BODIES through mob.cpp's inbound pass, which runs a world cell's pair rules onto the body voxels it touches (the way acid dissolves a limb): chlorine blisters skin and exposed flesh to flesh_cooked -- a chemical burn, which is a burn stage, so it counts into the burnt fraction that caps a creature's (and the player's) health (DESIGN.md \"Blood is health, and burns cap it\"). Noxious gas does the same, far more weakly. Neither touches anything a body is not made of.\n\nChlorine is gas_heavy (materials.h kMatFlagHeavyGas): it SINKS and creeps along the ground, pooling in hollows, instead of rising (sim_step.wgsl stepHeavyGas). It fades slowly (4 per-mille, ~8 s), and bleaches into water very slowly as a weak acid. Noxious gas rises like smoke and fades faster than it (12)."
     },
     {

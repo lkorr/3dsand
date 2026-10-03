@@ -932,6 +932,8 @@ const TUNING_PARAMS = {
   'weather.rainShadowMap':{t:'b',def:true},
   'weather.rainTouchesWorld':{t:'b',def:true},
   'weather.rainIgniteDamp':{t:'f',def:0.6,min:0,max:1},
+  'weather.strikeRate':{t:'f',def:0.3,min:0,max:10},
+  'weather.strikeRadius':{t:'i',def:160,min:16,max:240},
   'combustion.burnDurationPct':{t:'i',def:200,min:25,max:800},
   'combustion.spreadPct':{t:'i',def:12,min:1,max:400},
   'combustion.flamePct':{t:'i',def:100,min:0,max:800},
