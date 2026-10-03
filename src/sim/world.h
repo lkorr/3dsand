@@ -858,6 +858,12 @@ enum : uint32_t {
   kGasSpBudget = 9,      // conversions this tick may make, whole window
   kGasSpEdgeChunks = 10, // dirty chunks touching the residency edge this tick
   kGasSpOverrun = 11,    // MUST stay 0
+  // THE CA'S COST ATTRIBUTION (2026-10-03, fire-gpu): diagnostic, unhashed,
+  // written by sim_step.wgsl's colour rows and camask (substep 0).
+  kGasSpCaGas = 12,      // gas cells the colour rows ran, both substeps
+  kGasSpCaOther = 13,    // non-gas, non-inert cells they ran, both substeps
+  kGasSpGasOnlyCells = 14, // gas cells in gas-only awake chunks
+  kGasSpGasOnly = 15,    // lo16 gas-only awake chunks, hi16 matterless ones
   kGasSpHdr = 16,      // first record word
   kGasSpStride = 8,    // u32 per record (a 32-byte Particle)
   kGasSpHdrBytes = kGasSpHdr * 4,
@@ -4388,6 +4394,14 @@ struct WorldSnapshot {
   uint32_t gasReentered = 0;     // particles that became voxels again
   uint32_t gasDied = 0;          // decay / outer box / ceiling
   uint32_t gasAboveWindow = 0;   // live parcels above the window's top face
+  // THE CA'S COST ATTRIBUTION (kGasSpCa*): what the colour rows ran this tick
+  // by kind, and how many awake chunks are gas and nothing else (the share a
+  // gas-only fast path or a smoke rate LOD could touch).
+  uint32_t caGasCells = 0;       // gas cells run, both substeps
+  uint32_t caOtherCells = 0;     // non-gas non-inert cells run, both substeps
+  uint32_t gasOnlyChunks = 0;    // awake chunks holding gas and nothing else
+  uint32_t gasOnlyCells = 0;     // gas cells in those chunks
+  uint32_t emptyAwakeChunks = 0; // awake chunks holding no matter at all
   uint32_t tick = 0;                  // sim tick this snapshot was captured at
   // World::TicksEncoded() as of the tick that encoded this copy: one per tick,
   // gap-free, and immune to the harness restarting its tick numbers. The save

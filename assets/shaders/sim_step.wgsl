@@ -91,6 +91,14 @@ const GAS_SP_EDGE     : u32 = 2u;  // gas voxels whose intent pointed out of the
 const GAS_SP_BUDGET   : u32 = 9u;  // conversions this tick may make, whole window
 const GAS_SP_EDGECH   : u32 = 10u; // dirty chunks touching the residency edge
 const GAS_SP_OVERRUN  : u32 = 11u; // an accepted conversion found the list full: a BUG
+// Words 12..15: THE CA'S COST ATTRIBUTION (2026-10-03, fire-gpu). Diagnostic
+// counters, never read by the sim and never hashed: what the colour rows ran
+// this tick, by kind, and how many awake chunks hold gas and nothing else.
+// world.h kGasSpCa* (check_invariants.py compares).
+const GAS_SP_CA_GAS   : u32 = 12u; // gas cells the colour rows ran (both substeps)
+const GAS_SP_CA_OTHER : u32 = 13u; // non-gas, non-inert cells they ran (both substeps)
+const GAS_SP_GASONLY_CELLS : u32 = 14u; // gas cells in gas-only chunks (substep 0)
+const GAS_SP_GASONLY  : u32 = 15u; // lo16 gas-only chunks, hi16 matterless chunks (substep 0)
 const GAS_SP_HDR      : u32 = 16u; // first record word (words 8..15: sim_gas)
 const GAS_SP_STRIDE   : u32 = 8u;  // u32 per record (a 32-byte Particle)
 // kGasSpawnPerTick (src/sim/world.h). The size of the record list and the
@@ -685,6 +693,44 @@ const FILM_LICENCE : u32 =
 // moving path and the settled path MUST agree or a chunk either pins awake or
 // sleeps with work left.
 var<private> gFilmLicence : bool = false;
+// ---- THIN SMOKE DISSIPATES (2026-10-03, fire-gpu; sim.gasThinDecayMul) -----
+// A buoyant, cold gas voxel with at most sim.gasThinNeighbors gas voxels on
+// its six faces is THIN, and its fade-to-air rules (DECAY rules whose product
+// is air: smoke's 9, black smoke's 6 per mille) roll at gasThinDecayMul times
+// their authored chance. The dense core of a plume is untouched; the haze it
+// sheds -- most of a big fire's awake chunks, and most of what the raymarch
+// wades through -- fades sooner. Measured on --perf village-fire at x3: gas
+// cells run -32%, awake chunks -8%, CA -0.9 ms, raymarch -1.3 ms, frame p50
+// -2.8 ms (DESIGN.md, "The fire's CA, attributed").
+//
+// AT x1 (THE DEFAULT) THIS IS COMPILED OUT: GAS_THIN_ON is a const, so the
+// world, its hash and the shader's register count are today's.
+//
+// THE NEIGHBOUR COUNT READS THE AIR MASK, NOT THE VOXELS: camask's gas plane
+// for this chunk (gas at the start of this substep -- substep 0, which is when
+// reactions roll), one word per face. A face in ANOTHER chunk counts as gas,
+// so a cell on a chunk face is judged on its in-chunk faces only and can only
+// be called thin less often, never more. Deterministic (rule 1): the mask is
+// a pure function of the voxels at the substep's start, whatever the schedule.
+// Not hot (a flame is a gas: fire must not burn out faster at its fringe) and
+// not heavy (a pooled heavy gas is a hazard someone placed).
+const GAS_THIN_ON : bool = TUNE_GAS_THIN_DECAY_MUL > 1u;
+var<private> gThinMul : u32 = 1u;
+fn caMaskGasAt(ci : u32, l : vec3<i32>) -> bool {
+  let i = u32(l.x) + 16u * u32(l.y) + 256u * u32(l.z);
+  return ((caMask[ci * CA_MASK_STRIDE + CA_MASK_WORDS + (i >> 5u)] >> (i & 31u)) & 1u) != 0u;
+}
+fn gasThinMul(ci : u32, local : vec3<i32>, m : Material) -> u32 {
+  if ((m.flags & MATF_HEAVY_GAS) != 0u) { return 1u; }
+  if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { return 1u; }
+  var n = 0u;
+  for (var f = 0u; f < 6u; f++) {
+    let l = local + faceDir(f);
+    if (any(l < vec3<i32>(0)) || any(l >= vec3<i32>(i32(CHUNK)))) { n++; continue; }
+    if (caMaskGasAt(ci, l)) { n++; }
+  }
+  return select(1u, TUNE_GAS_THIN_DECAY_MUL, n <= TUNE_GAS_THIN_NEIGHBORS);
+}
 
 // The acting cell and its physical word index, set once at the top of main.
 // tryMove's source is always this cell, and re-resolving it through the page
@@ -2772,7 +2818,12 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       // Neighbour-count scaling (frontier rules — see scaledChance). Returns
       // rule.chance untouched for the ordinary unscaled case; 0 means the cell
       // has no qualifying neighbours and the rule is inert here this tick.
-      let chance = rainChance(rule, c, scaledChance(rule, c, coat, covered));
+      var chance = rainChance(rule, c, scaledChance(rule, c, coat, covered));
+      // THIN SMOKE DISSIPATES (sim.gasThinDecayMul, see gasThinMul): the
+      // gas's own fade-to-air rule, scaled -- same roll, so x1 is today.
+      if (GAS_THIN_ON && rule.prodSelf == MAT_AIR) {
+        chance = min(chance * gThinMul, REACT_CHANCE_DEN);
+      }
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if (!probe && (rr % REACT_CHANCE_DEN) < chance) {
@@ -4421,6 +4472,8 @@ fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
 // all air or all matter, no voxel read.
 var<workgroup> wgCaMask : array<atomic<u32>, 384>;   // 3 planes x CA_MASK_WORDS
 var<workgroup> wgCaEmit : atomic<u32>;
+// The cost attribution (GAS_SP_GASONLY*): matter / gas cell counts of this chunk.
+var<workgroup> wgCaPop : array<atomic<u32>, 2>;
 
 @compute @workgroup_size(256)
 fn camask(@builtin(workgroup_id) wg : vec3<u32>,
@@ -4432,6 +4485,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   let sentinel = (e & PT_SENTINEL_BIT) != 0u;
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) { atomicStore(&wgCaMask[k], 0u); }
   if (li == 0u) { atomicStore(&wgCaEmit, 0u); }
+  if (li < 2u) { atomicStore(&wgCaPop[li], 0u); }
   workgroupBarrier();
   if (!sentinel) {
     let base = e * CHUNK_VOL;
@@ -4477,6 +4531,22 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
       word = select(0u, 0xFFFFFFFFu, on);
     }
     caMask[ci * CA_MASK_STRIDE + k] = word;
+    if (k < 2u * CA_MASK_WORDS && word != 0u) {
+      atomicAdd(&wgCaPop[k / CA_MASK_WORDS], countOneBits(word));
+    }
+  }
+  // THE CA'S COST ATTRIBUTION (GAS_SP_GASONLY*), substep 0: is this awake
+  // chunk gas and nothing else, or nothing at all? Diagnostic only.
+  workgroupBarrier();
+  if (li == 0u && P.substep == 0u && T.gasMode != GAS_MODE_OFF) {
+    let nm = atomicLoad(&wgCaPop[0]);
+    let ng = atomicLoad(&wgCaPop[1]);
+    if (nm == 0u) {
+      atomicAdd(&gasSpawn[GAS_SP_GASONLY], 0x10000u);
+    } else if (ng == nm) {
+      atomicAdd(&gasSpawn[GAS_SP_GASONLY], 1u);
+      atomicAdd(&gasSpawn[GAS_SP_GASONLY_CELLS], ng);
+    }
   }
   // The wind cache (caWind above): one block per thread, the block's centre.
   // SUBSTEP 0 ONLY (2026-10-02, wind phase 5): the field is a function of the
@@ -4599,8 +4669,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // or the inert solid's early return) instead of all three in turn. Which
   // thread runs a cell cannot change what the cell does (see above), so the
   // sort is free of consequence -- only of cost.
-  for (var t = li; t < pack * 36u; t += CA_WG) {
-    let rw = caRow(first, total, t);
+  var rw : CaRow;
+  rw.b = vec3<u32>(0u);
+  if (li < pack * 36u) { rw = caRow(first, total, li); }
+  {
     if (rw.b.x != 0u) { atomicAdd(&wgCaSeg[0], countOneBits(rw.b.x)); }
     if (rw.b.y != 0u) { atomicAdd(&wgCaSeg[1], countOneBits(rw.b.y)); }
     if (rw.b.z != 0u) { atomicAdd(&wgCaSeg[2], countOneBits(rw.b.z)); }
@@ -4611,6 +4683,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     let no = atomicLoad(&wgCaSeg[1]);
     let ni = atomicLoad(&wgCaSeg[2]);
     atomicStore(&wgCaCount, ng + no + ni);
+    if (T.gasMode != GAS_MODE_OFF) {   // THE CA'S COST ATTRIBUTION, diagnostic
+      if (ng != 0u) { atomicAdd(&gasSpawn[GAS_SP_CA_GAS], ng); }
+      if (no != 0u) { atomicAdd(&gasSpawn[GAS_SP_CA_OTHER], no); }
+    }
     atomicStore(&wgCaSeg[0], 0u);
     atomicStore(&wgCaSeg[1], ng);
     atomicStore(&wgCaSeg[2], ng + no);
@@ -4623,8 +4699,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // the colour is taken, air included: excitedReact runs on air there.
   // A sentinel chunk whose material cannot act is skipped whole (caCell would
   // return on every one of its cells).
-  for (var t = li; t < pack * 36u; t += CA_WG) {
-    let rw = caRow(first, total, t);
+  {
     for (var k = 0u; k < 3u; k++) {
       var bits = rw.b[k];
       if (bits == 0u) { continue; }
@@ -4742,6 +4817,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // this one (tryMove re-resolves when src != gSelfCell or the index is unset).
   gSelfCell = c;
   gSelfIdx = PT_NO_WORD;
+  gThinMul = 1u;
 
   // TWO BASES (§4.1). `slotIdx` is the SLOT cell index and keys the per-cell
   // RNG below; `idx` is the physical word index and is only a memory address.
@@ -4891,10 +4967,15 @@ fn caCell(ci : u32, local : vec3<i32>) {
       wNow = cr.y;
       if (!voxStained(wNow)) { coatNow = 0u; }
     }
+    gThinMul = 1u;
+    if (GAS_THIN_ON && m.klass == CLASS_GAS && m.reactCount > 0u) {
+      gThinMul = gasThinMul(ci, local, m);
+    }
     if (m.reactCount > 0u &&
         doReactions(c, idx, slotIdx, wNow, mat, m, rnd, false, coatNow, covered, skip)) {
       return;
     }
+    gThinMul = 1u;
     if (spent) { return; }
   }
 

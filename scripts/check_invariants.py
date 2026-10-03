@@ -2490,6 +2490,10 @@ def check_gas_consts():
                          ("kGasSpBudget", "GAS_SP_BUDGET"),
                          ("kGasSpEdgeChunks", "GAS_SP_EDGECH"),
                          ("kGasSpOverrun", "GAS_SP_OVERRUN"),
+                         ("kGasSpCaGas", "GAS_SP_CA_GAS"),
+                         ("kGasSpCaOther", "GAS_SP_CA_OTHER"),
+                         ("kGasSpGasOnlyCells", "GAS_SP_GASONLY_CELLS"),
+                         ("kGasSpGasOnly", "GAS_SP_GASONLY"),
                          ("kGasOpsLeaveCap", "GAS_OPS_LEAVE_CAP"),
                          ("kGasSpHdr", "GAS_SP_HDR"),
                          ("kGasSpStride", "GAS_SP_STRIDE")]:

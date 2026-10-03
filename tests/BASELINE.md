@@ -1067,3 +1067,17 @@ Both stay `"fail"`; neither is a defect in the burn pass.
   re-point both checks at a material the human has. Not done here.
 - `fire-depth`: 22.9k of 99.0k px behind the flame (floor: a tenth). Render
   side, as recorded above; untouched by CPU burn work.
+
+## 2026-10-03 — fire-gpu: no key changed; `determinismHash` was already stale on main
+
+`--verify determinism` reports PIN MOVED (final hash `0fa43063`, pinned
+`b2514936`) on this branch -- and identically on HEAD 1f7f393 with its own
+exe (`_fg_base`: `0fa43063`, twice-run reproduces). Not this package: its
+default arm is hash-identical to HEAD (`--perf village-fire` f7936a11 and
+`forestfire` 8dd17ecf both sides). The move is upstream, most likely the
+repose entry above ("hash moves; NOT re-pinned here"). Not rebaselined here
+(package rule). With `sim.gasThinDecayMul` 3 the determinism hash is
+`a2f8e287`, also reproduced twice-run; `oil-fire`, `heat-updraft` and
+`gas-leave` pass at 3. At the default (1) these passed on this tree:
+determinism (twice-run), gas-leave, gas-reenter, gas-leave-overflow,
+gas-farplume, gas-farplume2, heat-updraft, oil-fire, draft-stack.

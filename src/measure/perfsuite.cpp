@@ -1750,6 +1750,13 @@ Run PerfRunner::Record(const Scenario& sc) {
           sn.valid ? (double)sn.pageFaults : 0.0;
       smp.counters[(int)PerfCounter::VoxelsNonAir] =
           sn.valid ? (double)sn.voxelTotal : 0.0;
+      smp.counters[(int)PerfCounter::CaGasCells] = sn.valid ? (double)sn.caGasCells : 0.0;
+      smp.counters[(int)PerfCounter::CaOtherCells] =
+          sn.valid ? (double)sn.caOtherCells : 0.0;
+      smp.counters[(int)PerfCounter::GasOnlyChunks] =
+          sn.valid ? (double)sn.gasOnlyChunks : 0.0;
+      smp.counters[(int)PerfCounter::GasOnlyCells] =
+          sn.valid ? (double)sn.gasOnlyCells : 0.0;
       if (world_.pages) {
         smp.counters[(int)PerfCounter::PagesResident] =
             (double)world_.pages->PagesInUse();

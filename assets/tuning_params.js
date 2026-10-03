@@ -370,6 +370,8 @@ const TUNING_PARAMS = {
   'sim.waterAdoptMinArea':{t:'i',def:64,min:0,max:100000,wgsl:'TUNE_WATER_ADOPT_MIN_AREA'},
   'sim.windMode':{t:'i',def:1,min:0,max:2,wgsl:'TUNE_WIND_MODE'},
   'sim.gasMode':{t:'i',def:1,min:0,max:1,wgsl:'TUNE_GAS_MODE'},
+  'sim.gasThinDecayMul':{t:'u',def:1,min:1,max:8,wgsl:'TUNE_GAS_THIN_DECAY_MUL'},
+  'sim.gasThinNeighbors':{t:'u',def:2,min:0,max:5,wgsl:'TUNE_GAS_THIN_NEIGHBORS'},
   'sim.windDrag':{t:'f',def:3,min:0,max:30,wgsl:'TUNE_WIND_DRAG'},
   'sim.windFluidGain':{t:'f',def:0.35,min:0,max:4,wgsl:'TUNE_WIND_FLUID_GAIN'},
   'sim.windFluidMass':{t:'f',def:0.5,min:0.02,max:4,wgsl:'TUNE_WIND_FLUID_MASS'},

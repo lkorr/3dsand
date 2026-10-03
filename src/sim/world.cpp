@@ -1052,6 +1052,11 @@ void World::KickReadback() {
           out.gasLeaveBudget = g[kGasSpBudget];
           out.gasLeaveEdgeChunks = g[kGasSpEdgeChunks];
           out.gasLeaveOverrun = g[kGasSpOverrun];
+          out.caGasCells = g[kGasSpCaGas];
+          out.caOtherCells = g[kGasSpCaOther];
+          out.gasOnlyCells = g[kGasSpGasOnlyCells];
+          out.gasOnlyChunks = g[kGasSpGasOnly] & 0xFFFFu;
+          out.emptyAwakeChunks = g[kGasSpGasOnly] >> 16;
         }
         // MLS-MPM fluid seam: live count, event counters, block list.
         {
