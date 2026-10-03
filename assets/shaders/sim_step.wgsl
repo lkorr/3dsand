@@ -1202,32 +1202,15 @@ fn tryPowderOnto(src : vec3<i32>, dst : vec3<i32>, myWord : u32, m : Material) -
 // reach-1 diagonal) -- the same boxes the diagonal move uses. All reads are
 // reach 1 and live, so no snapshot is needed.
 //
-// WORLDGEN IS A FIXED POINT OF THIS (worldgen.wgsl looseStepMass): generated
-// loose tops are 4/8 on an upper step edge, 6/8 on a staircase, whole on flats
-// and feet, so every upper/lower pair of columns has D <= 8 and a generated
-// dune does not move on tick 1.
-fn reposeTierEighths(code : u32) -> u32 {
-  switch (code) {
-    case REPOSE_3_1: { return 3u; }
-    case REPOSE_2_1: { return 4u; }
-    case REPOSE_1_2: { return 16u; }
-    case REPOSE_1_3: { return 24u; }
-    default: { return 8u; }
-  }
-}
-// The material's threshold, eighths of rise per cell. A BLENDED word mixes its
-// two tiers by the blend weight -- here as one per-MATERIAL number, never the
-// per-grain positional roll the whole-cell tiers use: two neighbouring columns
-// must agree on T or a surface could be at rest from one side and not the
-// other.
-fn reposeEighths(m : Material) -> u32 {
-  let a = (m.repose >> MAT_REPOSE_A_SHIFT) & MAT_REPOSE_A_MASK;
-  let blend = (m.repose >> MAT_REPOSE_BLEND_SHIFT) & MAT_REPOSE_BLEND_MASK;
-  let ta = reposeTierEighths(a);
-  if (blend == 0u) { return ta; }
-  let tb = reposeTierEighths((m.repose >> MAT_REPOSE_B_SHIFT) & MAT_REPOSE_B_MASK);
-  return (ta * (255u - blend) + tb * blend + 127u) / 255u;
-}
+// WORLDGEN IS A FIXED POINT OF THIS (worldgen.wgsl looseStep, same T):
+// generated loose tops are 4/8 on an upper step edge, 6/8 on a staircase
+// (T >= 8; for T < 8 a staircase top is the firm cover), whole on flats and
+// feet, so every upper/lower pair of columns has D <= T and a generated dune
+// does not move on tick 1.
+// The material's threshold, eighths of rise per cell: reposeEighthsOf in
+// common.wgsl, because worldgen.wgsl lays loose cover against the SAME number
+// (a generated dune is a fixed point of this rule only if both read it).
+fn reposeEighths(m : Material) -> u32 { return reposeEighthsOf(m.repose); }
 
 // Is the diagonal step from a surface cell of mass `f` onto a partial of mass
 // `nf` one level down steep enough to take? D = f + 8 - nf against T. The
