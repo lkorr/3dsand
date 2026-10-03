@@ -244,6 +244,8 @@ BUF_TO_WGSL = {
     # indirect-only and never bound, like DispatchArgs, so it maps to no WGSL
     # binding name -- the empty set is what says "declared, but nothing in a
     # shader should name it".
+    # The raymarch DRAW's read-only view (`shadowCacheRO`, renderBGL_ 40) is not
+    # a row: the draw's reads are BeginRendering's flush, like streaksR below.
     "ShadowCache": {"shadowCache"},
     "ShadowReq": {"shadowReq"},
     "ShadowHist": {"shadowHist"},

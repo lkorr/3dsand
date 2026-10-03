@@ -44,6 +44,10 @@
 // itself, invisible to the sim and to the world hash.
 @group(0) @binding(14) var<storage, read_write> shadowCache : array<atomic<u32>>;
 @group(0) @binding(15) var<storage, read_write> shadowReq : array<atomic<u32>>;
+// The same buffer as 14, bound a second time READ-ONLY (simulation.cpp
+// renderBGL_ 40): shadowSlotRead's FIND reads a slot's whole 8-way set as one
+// cache line of plain loads. See THE FIND IS A PLAIN LOAD there.
+@group(0) @binding(40) var<storage, read> shadowCacheRO : array<vec4<u32>>;
 
 // ---- RENDER_STATS: where inside this shader the frame went ------------------
 //
@@ -7218,19 +7222,60 @@ fn shadowRefreshDue(key : u32) -> bool {
   return ((R.frameIdx + shadowRefreshPhase(key)) % SHADOW_REFRESH_PERIOD) == 0u;
 }
 
+// ---- THE FIND IS A PLAIN LOAD (2026-10-03, raymarch-far) -------------------
+// A set is 8 slots x 2 words = one 64-byte line. The find used to walk it with
+// up to eight sequential ATOMIC loads, and an atomic load is not served from
+// the SM's L1: every tap of every lit pixel paid several L2 round trips in
+// series (--render-budget priced the near cache's taps, resolve included, at
+// 0.55-1.0 ms a frame on every camera). The read-only view (binding 40) loads
+// the line as four vec4s, all in flight at once and shared through L1 by the
+// pixels of a patch, and the eight keys are compared in registers.
+//
+// THE VIEW CAN BE STALE, and only in the safe direction. Plain loads see the
+// cache as the resolve pass left it at the barrier before this draw (values,
+// valid bits, verifiers: everything a read returns) but may miss what OTHER
+// pixels did to it during this draw — a claim, a registration stamp. So a
+// plain MISS is not trusted (the atomic find below runs and sees this frame's
+// claims), and a plain hit's `requested` stamp may be a frame old, which only
+// sends this pixel to the registration CAS, whose failure says the truth: our
+// verifier in the returned word = a sibling registered first (fine), anything
+// else = a thief took the slot this frame (no opinion, exactly as before).
+// What a pixel RETURNS is therefore what the atomic find returned.
+fn shadowFindPlain(key : u32, ver : u32, setBase : u32) -> vec2<u32> {
+  let q = setBase / 2u;   // two slots per vec4; setBase is a multiple of 8
+  let a = shadowCacheRO[q];
+  let b = shadowCacheRO[q + 1u];
+  let c = shadowCacheRO[q + 2u];
+  let d = shadowCacheRO[q + 3u];
+  // Lowest way wins, as the atomic walk's first match did.
+  var r = vec2<u32>(0xFFFFFFFFu, 0u);
+  if (d.z == key && shadowStateVerifier(d.w) == ver) { r = vec2<u32>(setBase + 7u, d.w); }
+  if (d.x == key && shadowStateVerifier(d.y) == ver) { r = vec2<u32>(setBase + 6u, d.y); }
+  if (c.z == key && shadowStateVerifier(c.w) == ver) { r = vec2<u32>(setBase + 5u, c.w); }
+  if (c.x == key && shadowStateVerifier(c.y) == ver) { r = vec2<u32>(setBase + 4u, c.y); }
+  if (b.z == key && shadowStateVerifier(b.w) == ver) { r = vec2<u32>(setBase + 3u, b.w); }
+  if (b.x == key && shadowStateVerifier(b.y) == ver) { r = vec2<u32>(setBase + 2u, b.y); }
+  if (a.z == key && shadowStateVerifier(a.w) == ver) { r = vec2<u32>(setBase + 1u, a.w); }
+  if (a.x == key && shadowStateVerifier(a.y) == ver) { r = vec2<u32>(setBase, a.y); }
+  return r;
+}
+
 fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let key = shadowPatchKey(packedCell, packedSub);
   let ver = shadowPatchVerifier(packedCell, packedSub);
   let setBase = shadowSetOf(key);
 
-  // ---- find ours ----
-  var slot = 0xFFFFFFFFu;
-  var state = 0u;
-  for (var w = 0u; w < SHADOW_WAYS; w++) {
-    let b = setBase + w;
-    if (atomicLoad(&shadowCache[b * 2u]) != key) { continue; }
-    let s = atomicLoad(&shadowCache[b * 2u + 1u]);
-    if (shadowStateVerifier(s) == ver) { slot = b; state = s; break; }
+  // ---- find ours (THE FIND IS A PLAIN LOAD, above; atomically on a miss) ----
+  let f = shadowFindPlain(key, ver, setBase);
+  var slot = f.x;
+  var state = f.y;
+  if (slot == 0xFFFFFFFFu) {
+    for (var w = 0u; w < SHADOW_WAYS; w++) {
+      let b = setBase + w;
+      if (atomicLoad(&shadowCache[b * 2u]) != key) { continue; }
+      let s = atomicLoad(&shadowCache[b * 2u + 1u]);
+      if (shadowStateVerifier(s) == ver) { slot = b; state = s; break; }
+    }
   }
 
   if (slot == 0xFFFFFFFFu) {

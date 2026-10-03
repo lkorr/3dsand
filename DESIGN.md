@@ -15346,6 +15346,23 @@ whole 8-way set on every lit pixel and that set is exactly one 64-byte cache
 line; widening the slot would put the hot path on two lines to carry state only
 the resolve pass touches. The reader is unchanged — it still reads one byte.
 
+**The find reads that line with PLAIN loads** (2026-10-03, raymarch-far;
+`raymarch.wgsl` `shadowFindPlain`). It used to walk the set with up to eight
+sequential `atomicLoad`s, and an atomic load is not served from the SM's L1, so
+every tap of every lit pixel paid several L2 round trips in series —
+`--render-budget` priced the near cache's taps (resolve included) at 0.55-1.0 ms
+on every camera. The fragment shader now also binds the cache READ-ONLY
+(`renderBGL_` 40, the same buffer as 14) and loads the set as four `vec4`s in
+flight at once; claims and registrations still go through the atomic binding.
+The plain view can only be stale in the safe direction: it shows the cache as
+the resolve pass left it at the barrier before the draw, so a plain MISS falls
+back to the atomic find (which sees this frame's claims) and a plain hit's
+stale `requested` stamp only sends the pixel to the registration CAS, whose
+returned word says whether a sibling registered first or a thief took the slot.
+What a pixel returns is what the atomic find returned. Measured in one process
+(1080p, RTX 3060 Ti): seam 3.45 -> 3.34 ms, meadow 4.07 -> 3.83, noon and
+cascade within noise.
+
 **The lift is refreshed from ONE deterministic ray**, the undeflected one, on
 the frame a patch's window wraps (plus immediately on a fresh slot, so a newly
 visible patch never spends a frame at the reset value of contact black). There
