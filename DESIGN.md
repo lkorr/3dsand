@@ -13478,6 +13478,13 @@ where you hear from either (§12b, "The ears are on the character").
   4.77; 1600x900 noon 5.64 -> 5.18, seam 3.82 -> 3.46; pictures at the
   run-to-run floor. The wide tier is NOT used where the shipped law holds
   (there it measured +0.13..0.26 ms against the 5x5).
+  The 5x5 (7x7) min runs SEPARABLE through workgroup memory since
+  2026-10-03 (raymarch-far): a workgroup stages its tile and apron once,
+  takes the row min then the column min — the same samples, a bit-identical
+  map, `pre` -0.03..0.04 ms everywhere. Measured and NOT kept: per-chunk-
+  column and 4x4-super-column height bounds over the cascade half (a ray above
+  a whole column skipped it in one probe) cost +0.1 ms of `pre` — the extra
+  probe on every chunk outweighed the skips.
   Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
@@ -13812,6 +13819,20 @@ where you hear from either (§12b, "The ears are on the character").
   reach — the owner's live flight measured 38 far-shadow steps per pixel
   against 136 far-march steps, on a frame that was 81% cascade — and a caster
   a cascade pixel can show is a canopy or a ridge within a few tens of metres.
+  **The far patch cache (2026-10-03, raymarch-far; `FAR_SHADOW_CACHE` in
+  raymarch.wgsl, SHIPPED OFF):** the march is ~0.6 ms of WORK at noon and on
+  the cascade camera (running it with the code present costs what compiling
+  it out saves; skipping it for top faces or side faces alone saves 0.07-0.2,
+  because a warp pays for its slowest lane). With the flag on, far pixels read
+  shadow-cache patches (level, cascade cell, face, 2x2 sub-patch — packedSub's
+  top bit marks a far key) that `shadow_resolve.wgsl` `resolveFarPatch`
+  resolves with this same march and law from the patch centre, and the march
+  leaves fs: noon -0.28 / cascade -0.36 ms at 1080p, -0.21 / -0.29 at
+  1600x900, -0.38 / -0.40 at the sprint FOV. It moves 0.3% of pixels by
+  >= 16/255 (thin lines at shadow and cell edges, where a pixel's own start and
+  its patch centre disagree) against a re-run floor of 0.001%, so it waits on
+  an owner decision; a bilinear blend of four patches cost 0.25 ms more and
+  moved the same pixels.
   **Since 2026-09-28 (LOD-seam package C) the reach is a DISTANCE test, the ray
   is a cone trace, the edge is soft and there is no per-level floor.** The old
   ray converted the reach to steps and clamped the count at 64, charged for
@@ -14084,6 +14105,13 @@ where you hear from either (§12b, "The ears are on the character").
     1.6 m behind it (a stand's crest edge, a sparse tussock's upper part).
     The cover tint now applies only where the features are gone
     (`1 - farFeatKeep`, 67-87 m).
+  - **Past the features' fade the march does not walk** (2026-10-03,
+    raymarch-far): every card's coverage is scaled by `farFeatKeep` of its
+    cell's entry t, which is never before the walk's start, and the keep only
+    falls with distance — so once it is 0 at the start (~87 m) no card can be
+    hit and `farFeatMarch` returns at once. Exact; it had been walking up to
+    16 cells for every far pixel out to level 2's box (-0.04..0.07 ms on the
+    far cameras).
   - **The line was the CONTACT SHADOW** (attributed, not guessed: a per-term
     debug frame — side, face class, distance bucket, shadow, AO, openness, GI
     per pixel — against the normal frame; tools in the package notes). Near
