@@ -1392,10 +1392,16 @@ struct Hit {
   // are the volume half; these are the surface half: where the ray first
   // crossed into the liquid, and which cell it entered, so fs() can build a
   // normal there and shade a real air/water interface instead of only tinting.
+  //
+  // PACKED (2026-10-03, raymarch-core): the entry cell is window-local 10 bits
+  // per axis (packWinCell) and the entry face is axis | negative-sign << 2
+  // (packFace). These fields are live from the moment the march records them
+  // to the end of fs() -- across the whole opaque shade, which is where this
+  // shader's spill lives -- so 8 scalars there became 2. Read them back with
+  // hitLiqCell / faceAxis / faceSgn.
   liqT     : f32,     // t of the first liquid entry (0 if none)
-  liqCell  : vec3<i32>,
-  liqAxis  : i32,     // face the ray entered the liquid through
-  liqSgn   : f32,
+  liqCell  : u32,     // packWinCell of the entry cell
+  liqFace  : u32,     // packFace of the face the ray entered the liquid through
   liqPath  : f32,     // total distance travelled INSIDE liquid, fine voxels —
                       // drives per-channel Beer-Lambert depth absorption
 
@@ -1409,10 +1415,8 @@ struct Hit {
   // accumulates depth, so whatever is behind is still shaded normally and the
   // slab tints it by how far the ray travelled inside.
   tsT      : f32,     // t of the first translucent-solid entry (0 if none)
-  tsCell   : vec3<i32>,
-  tsAxis   : i32,     // face the ray entered through
-  tsSgn    : f32,
-  tsMat    : u32,     // which translucent material (palette + absorption)
+  tsCell   : u32,     // packWinCell of the entry cell (fs re-reads its material)
+  tsFace   : u32,     // packFace of the face the ray entered through
   tsPath   : f32,     // distance travelled INSIDE it, in fine voxels
 
   // ---- static micro-detail (see traceMicro) ----
@@ -1427,6 +1431,26 @@ struct Hit {
 };
 
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, R.origin); }
+
+// Hit's packed liquid / translucent-solid entry (see the PACKED note in Hit).
+// A window cell is 0..WORLD_N-1 per axis and world.h refuses WORLD_N = 1024,
+// so 10 bits an axis always holds it (the deferred-detail records rely on the
+// same bound).
+fn packWinCell(c : vec3<i32>) -> u32 {
+  let lc = vec3<u32>(c - R.origin * i32(CHUNK)) & vec3<u32>(0x3FFu);
+  return lc.x | (lc.y << 10u) | (lc.z << 20u);
+}
+fn unpackWinCell(pc : u32) -> vec3<i32> {
+  return R.origin * i32(CHUNK) +
+         vec3<i32>(vec3<u32>(pc & 0x3FFu, (pc >> 10u) & 0x3FFu, (pc >> 20u) & 0x3FFu));
+}
+fn packFace(axis : i32, sgn : f32) -> u32 {
+  return u32(axis) | select(0u, 4u, sgn < 0.0);
+}
+fn faceAxis(f : u32) -> i32 { return i32(f & 3u); }
+fn faceSgn(f : u32) -> f32 { return select(1.0, -1.0, (f & 4u) != 0u); }
+// The +Y-entry default (axis 1, sign -1) the fields are initialised to.
+const FACE_DOWN_Y : u32 = 5u;
 
 fn chunkOcc(cell : vec3<i32>) -> u32 {
   return occupancy[chunkIndexW(cell)];
@@ -2964,15 +2988,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
   out.fireMat = 0u;
   out.gasHalfT = 0.0;
   out.liqT = 0.0;
-  out.liqCell = vec3<i32>(0);
-  out.liqAxis = 1;
-  out.liqSgn = -1.0;
+  out.liqCell = 0u;
+  out.liqFace = FACE_DOWN_Y;
   out.liqPath = 0.0;
   out.tsT = 0.0;
-  out.tsCell = vec3<i32>(0);
-  out.tsAxis = 1;
-  out.tsSgn = -1.0;
-  out.tsMat = 0u;
+  out.tsCell = 0u;
+  out.tsFace = FACE_DOWN_Y;
   out.tsPath = 0.0;
   out.micMat = 0u;
   out.micN = vec3f(0.0, 1.0, 0.0);
@@ -3492,10 +3513,8 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         cellTS = 1.0;
         if (out.tsT == 0.0) {
           out.tsT = tCur;
-          out.tsCell = cell;
-          out.tsAxis = axis;
-          out.tsSgn = sign(rd[axis]);
-          out.tsMat = mat;
+          out.tsCell = packWinCell(cell);
+          out.tsFace = packFace(axis, sign(rd[axis]));
         }
         // fall through and keep marching
       } else if (k == CLASS_POWDER && powderIsPartial(w)) {
@@ -3692,14 +3711,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
           // Entered above the fractional water surface — the interface is
           // at the Y plane where the ray descends to waterY.
           out.liqT = clamp((wy - ro.y) / rd.y, tPrev, tCur);
-          out.liqCell = marchCell;
-          out.liqAxis = 1;
-          out.liqSgn = -1.0;
+          out.liqCell = packWinCell(marchCell);
+          out.liqFace = FACE_DOWN_Y;
         } else {
           out.liqT = tPrev;
-          out.liqCell = marchCell;
-          out.liqAxis = marchAxis;
-          out.liqSgn = sign(rd[marchAxis]);
+          out.liqCell = packWinCell(marchCell);
+          out.liqFace = packFace(marchAxis, sign(rd[marchAxis]));
         }
       }
     }
@@ -3947,14 +3964,13 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       if (out.liqT >= tHit) {
         out.liqT = 0.0;
         out.liqPath = 0.0;
-        out.liqCell = vec3<i32>(0);
-        out.liqAxis = 1;
-        out.liqSgn = -1.0;
+        out.liqCell = 0u;
+        out.liqFace = FACE_DOWN_Y;
       }
       if (out.tsT >= tHit) {
         out.tsT = 0.0;
         out.tsPath = 0.0;
-        out.tsMat = 0u;
+        out.tsCell = 0u;
       }
       if (out.gasHalfT >= tHit) { out.gasHalfT = 0.0; }
       // ---- GRAINS UNDER WATER (docs/PLAN_powder_mass.md §3.4) --------------
@@ -4010,11 +4026,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         if (out.liqT >= fh.t) {
           out.liqT = 0.0;
           out.liqPath = 0.0;
-          out.liqCell = vec3<i32>(0);
-          out.liqAxis = 1;
-          out.liqSgn = -1.0;
+          out.liqCell = 0u;
+          out.liqFace = FACE_DOWN_Y;
         }
-        if (out.tsT >= fh.t) { out.tsT = 0.0; out.tsPath = 0.0; out.tsMat = 0u; }
+        if (out.tsT >= fh.t) { out.tsT = 0.0; out.tsPath = 0.0; out.tsCell = 0u; }
         if (out.gasHalfT >= fh.t) { out.gasHalfT = 0.0; }
       }
     }
@@ -12272,7 +12287,7 @@ fn fs(in : VSOut) -> FSOut {
   // they are near-opaque and their shade records no veil.
   if (h.liqT > 0.05 && (tDepth < 0.0 || h.liqT < tDepth)) {
     if (!WATER_VEIL ||
-        isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))])) {
+        isViscousLiquid(materials[voxMat(voxWordAt(unpackWinCell(h.liqCell)))])) {
       tDepth = h.liqT;
     }
   }
@@ -13178,7 +13193,8 @@ fn fs(in : VSOut) -> FSOut {
   // tests for one fact is what let a whole excited footprint get shaded twice.
   var caShadedLiquid = false;
   if (h.liqT > 0.0) {
-    let lm = voxMat(voxWordAt(h.liqCell));
+    let liqCell = unpackWinCell(h.liqCell);
+    let lm = voxMat(voxWordAt(liqCell));
     if (lm != MAT_AIR && materials[lm].klass == CLASS_LIQUID) {
       let hitP = R.camPos + rd * h.liqT;
       let underwater = h.liqT < 0.05;
@@ -13224,7 +13240,7 @@ fn fs(in : VSOut) -> FSOut {
         caShadedLiquid = true;
         veilT = 0.0;
       } else if (isViscousLiquid(materials[lm])) {
-        color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+        color = shadeViscous(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              h.liqT, underwater);
         // Dissolved matter in a viscous solvent (fairy dust or salt in
@@ -13232,7 +13248,7 @@ fn fs(in : VSOut) -> FSOut {
         // the shaded surface is pulled toward the tint at its own brightness,
         // plus the species' glow. After the shade, so nothing is live across
         // its reflection work.
-        let vsol = solLookAt(h.liqCell, lm);
+        let vsol = solLookAt(liqCell, lm);
         if (vsol.a > 0.0 || vsol.g > 0.0) {
           let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
           color = mix(color, vsol.tint * (lum * 2.2), vsol.a * 0.7) +
@@ -13242,7 +13258,7 @@ fn fs(in : VSOut) -> FSOut {
         caShadedLiquid = true;
       } else if (!mpmOwned) {
         rsAdd(RS_PX_WATER, 1u);
-        color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+        color = shadeWater(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
@@ -13259,7 +13275,7 @@ fn fs(in : VSOut) -> FSOut {
       // short sun ray; every other pixel in the frame pays nothing, and with
       // render.mistDensity at 0 so does this one.
       if (!underwater && caShadedLiquid) {
-        color = waterfallMist(color, hitP, rd, h.liqT, h.liqCell, lm);
+        color = waterfallMist(color, hitP, rd, h.liqT, liqCell, lm);
       }
       // After the mist, which hangs between the eye and the surface and so
       // covers a body under it exactly as it covers the bed.
@@ -13291,10 +13307,11 @@ fn fs(in : VSOut) -> FSOut {
     // Re-read defensively, exactly as the water path does: a hot material
     // reload between trace and shade would otherwise index the wrong
     // absorption.
-    let tm = voxMat(voxWordAt(h.tsCell));
+    let tsCell = unpackWinCell(h.tsCell);
+    let tm = voxMat(voxWordAt(tsCell));
     if (tm != MAT_AIR && isTranslucentSolid(materials[tm])) {
       let hitP = R.camPos + rd * h.tsT;
-      color = shadeTranslucent(hitP, rd, tm, h.tsCell, h.tsAxis, h.tsSgn,
+      color = shadeTranslucent(hitP, rd, tm, tsCell, faceAxis(h.tsFace), faceSgn(h.tsFace),
                                h.tsPath, color, h.tsT, in.pos.xy);
       // Fog from the ice surface, not from whatever is behind it.
       color = applyAerial(color, rd, h.tsT);
@@ -13327,7 +13344,7 @@ fn fs(in : VSOut) -> FSOut {
   //     surface. It cannot be a real interface: the ray was inside water before
   //     it got there, which is precisely what caShadedLiquid records.
   if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
-    let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(h.liqCell)), h.liqT > 0.0);
+    let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(unpackWinCell(h.liqCell))), h.liqT > 0.0);
     // caMatRaw IS the liquid cell's material whenever liqT > 0.05 > 0.
     let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
                         && isViscousLiquid(materials[caMatRaw]);
