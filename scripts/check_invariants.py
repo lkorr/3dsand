@@ -960,6 +960,34 @@ def check_fluid_substeps():
             f"the knob's default must agree")
 
 
+# ------------------------------------------------------------ CA colour pool
+def check_ca_pool():
+    """sim_step.wgsl CA_POOL_CAP must equal simulation.cpp's kCaPoolCap.
+
+    The colour work lists' sparse cell pools (sim_step.wgsl camask / calist /
+    main, 2026-10-03) are CA_POOL_CAP entries each, two per colour, at the
+    tail of caMaskBuf_; camask bounds every reservation by CA_POOL_CAP, and
+    simulation.cpp sizes the buffer from its own copy of the number. A WGSL
+    value larger than the C++ one would write past the buffer's end.
+    """
+    wg = read("assets/shaders/sim_step.wgsl")
+    cpp = read("src/sim/simulation.cpp")
+    if not wg or not cpp:
+        return
+    m = re.search(r"const\s+CA_POOL_CAP\s*:\s*u32\s*=\s*(\d+)u", wg)
+    c = re.search(r"constexpr\s+uint64_t\s+kCaPoolCap\s*=\s*(\d+)", cpp)
+    checked.append("CA colour pool")
+    if not m or not c:
+        problems.append("CA colour pool: CA_POOL_CAP (sim_step.wgsl) or kCaPoolCap "
+                        "(simulation.cpp) not found")
+        return
+    if m.group(1) != c.group(1):
+        problems.append(
+            f"sim_step.wgsl CA_POOL_CAP = {m.group(1)} but simulation.cpp "
+            f"kCaPoolCap = {c.group(1)} -- the caMask buffer's sparse pools are "
+            f"sized from the C++ one")
+
+
 # ------------------------------------------------------ wind primitive layout
 def check_wind_prims():
     """world.h's wind primitive ceilings must match common.wgsl's constants.
@@ -3338,6 +3366,7 @@ ALL = {
     "runword": check_run_word_layout,
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
+    "capool": check_ca_pool,
     "tuning": check_tuning_consts,
     "tuningreach": check_tuning_reach,
     "tuningused": check_tuning_consumers,
@@ -3402,7 +3431,7 @@ RELEVANT = {
     "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
     "src/sim/treeatlas.h": ["treeatlas"],
     "assets/editor/treegen.js": ["treeatlas"],
-    "src/sim/simulation.cpp": ["counts"],
+    "src/sim/simulation.cpp": ["counts", "capool"],
     "src/gpu/rhi_record.h": ["counts"],
     "src/gpu/vk_record.h": ["counts"],
     "src/gpu/rhi_vk.cpp": ["counts"],
@@ -3415,7 +3444,7 @@ RELEVANT = {
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
     "src/sim/materials.h": ["reactgate", "coatflame", "reactfx"],
-    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx"],
+    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx", "capool"],
     "assets/shaders/common.wgsl": ["stainprec", "powdermass", "windmirror", "drafts"],
     "src/sim/windfield.cpp": ["windmirror"],
     "assets/shaders/wind_streak.wgsl": ["windstreak"],

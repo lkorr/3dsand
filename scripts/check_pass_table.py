@@ -98,6 +98,7 @@ PIPE_TO_MEMBER = {
     "PIPE_STEP": "step_",
     "PIPE_REPOSE_SNAP": "reposeSnap_",
     "PIPE_CA_MASK": "caMask_",
+    "PIPE_CA_LIST": "caList_",
     "PIPE_OCCUPANCY": "occupancy_",
     "PIPE_OCCUPANCY_DIRTY": "occupancyDirty_",
     "PIPE_PICK": "pick_",
@@ -341,6 +342,7 @@ BUF_TO_WGSL = {
     "ReposeSnap": {"reposeSnap"},
     "CaMask": {"caMask"},
     "CaWind": {"caWind"},
+    "CaArgs": {"caArgs"},
     # The temperature layer, bindings 50..52 of simBGL_ (src/sim/heat.h).
     # HeatArgs is indirect-only and never bound, like SolArgs.
     "HeatPool": {"heatPool"},
@@ -475,6 +477,8 @@ _SIM_GROUP0 = {
     # The CA's air mask, binding 48 (sim_step.wgsl camask writes it before
     # each gravity substep; main reads it).
     "caMask", "caWind",
+    # The CA colour rows' indirect args, binding 54 (sim_step.wgsl calist).
+    "caArgs",
     # The temperature layer, bindings 50..52 (sim_heat.wgsl; the CA reads it).
     "heatPool", "heatMeta", "heatParams",
     # The tick's RenderParams copy for the derived rows, binding 53
@@ -958,6 +962,12 @@ def check_table_vs_wgsl():
                 problems.append(
                     f"row '{r['name']}' uses buffer id '{buf}', which is not in "
                     f"this script's BUF_TO_WGSL map (and may not exist)")
+                continue
+            # An INDIRECT read is the dispatch command reading its args, not
+            # the shader reading a binding -- so it says nothing about what the
+            # entry point reaches. Until CaArgs (2026-10-03) every indirect
+            # buffer was also unbound, which hid the distinction.
+            if acc == "I":
                 continue
             if acc in READ_ACCS or acc == "RW":
                 row_read |= names

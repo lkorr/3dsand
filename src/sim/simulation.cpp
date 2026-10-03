@@ -395,6 +395,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // `RT`) read instead of RenderUBO, so a frame's RenderUBO upload never
         // races them on the async queue. simBGL_ only.
         entry(53, T::Uniform),         // RenderParams, as of the end of the tick
+        // The CA colour rows' indirect args (sim_step.wgsl calist writes them;
+        // the recorder dispatches colour k from offset 16 k). simBGL_ only.
+        entry(54, T::Storage),         // caArgs
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -851,8 +854,33 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc, "rainExpo");
   // The CA's air mask (pass_table.def caMask): written before each substep
   // for every dirty chunk and read only for those, so it needs no clear.
-  caMaskBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 3u * (kChunkVol / 32u) * 4u,
+  // Its TAIL is the colour work lists (sim_step.wgsl CA_WORK_* / CA_POOL*):
+  // one colour word per dirty-list position, a 128-word header (4 per
+  // colour), 27 chunk lists of kNumSlots entries, then 54 sparse cell pools
+  // (two kinds per colour) of kCaPoolCap entries -- rebuilt by camask +
+  // calist before each substep. kCaPoolCap is sim_step.wgsl's CA_POOL_CAP
+  // (check_invariants.py "CA colour pool"); a full pool is not an error, the
+  // overflow runs on the dense path. 14.2 MiB.
+  constexpr uint64_t kCaPoolCap = 65536;
+  caMaskBuf_ = CreateBuffer(device,
+                            ((uint64_t)kNumSlots * 3u * (kChunkVol / 32u) +
+                             (uint64_t)kNumSlots + 128u + 27ull * kNumSlots +
+                             54ull * kCaPoolCap) * 4u,
                             rhi::BufferUsage::Storage, "caMask");
+  // The colour rows' indirect args: 27 records of (x, 1, 1, chunks), written
+  // by calist, consumed by the ca / ca1 rows at 16 bytes x colour; then the
+  // sparse pool cursors (CA_CUR_G = 128, CA_CUR_R = 160). ZEROED: the cursors
+  // must start at 0 (calist re-zeroes them after reading), and a CA row
+  // recorded before any calist ran (none is: both share C_CAACTIVE and calist
+  // precedes them) would dispatch nothing rather than garbage.
+  caArgsBuf_ = CreateBuffer(device, 192u * 4u,
+                            rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect |
+                                rhi::BufferUsage::CopyDst,
+                            "caArgs");
+  {
+    const uint32_t zero[192] = {};
+    device.GetQueue().WriteBuffer(caArgsBuf_, 0, zero, sizeof zero);
+  }
   // ...and its ambient wind cache (sim_step.wgsl caWind): 64 blocks x 3 words.
   caWindBuf_ = CreateBuffer(device, (uint64_t)kNumSlots * 64u * 3u * 4u,
                             rhi::BufferUsage::Storage, "caWind");
@@ -1343,6 +1371,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(51, world_->heatMeta),
         b(52, heatParamsBuf_),
         b(53, renderUBOTickBuf_),
+        b(54, caArgsBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -2181,6 +2210,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
         MakeComputePipeline(device, simPL_, mStep, "reposesnap", "reposeSnap");
   });
   pool.Add([&] { caMask_ = MakeComputePipeline(device, simPL_, mStep, "camask", "caMask"); });
+  pool.Add([&] { caList_ = MakeComputePipeline(device, simPL_, mStep, "calist", "caList"); });
   pool.Add([&] { occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy"); });
   pool.Add([&] { occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty"); });
   pool.Add([&] { opennessDirty_ = MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty"); });
@@ -2640,6 +2670,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::DraftArgs:           return draftArgsBuf_;
     case B::CaMask:              return caMaskBuf_;
     case B::CaWind:              return caWindBuf_;
+    case B::CaArgs:              return caArgsBuf_;
     case B::RenderUBOTick:       return renderUBOTickBuf_;
     case B::WindStreaks:         return windStreakBuf_;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
@@ -2716,6 +2747,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Step:           return step_;
     case P::ReposeSnap:     return reposeSnap_;
     case P::CaMask:         return caMask_;
+    case P::CaList:         return caList_;
     case P::Occupancy:      return occupancy_;
     case P::OccupancyDirty: return occupancyDirty_;
     case P::Pick:           return pick_;

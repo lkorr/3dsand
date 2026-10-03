@@ -801,6 +801,12 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
             args = bind_.buffers[(int)pass::Buf::HeatArgs];
             argsOff = r.y;
             break;
+          case pass::DispatchSel::IndCaArgs:
+            // The CA's colour rows (sim_step.wgsl calist): iteration k of a
+            // 27-iteration row is colour k, whose record is 16 bytes at 16 k.
+            args = bind_.buffers[(int)pass::Buf::CaArgs];
+            argsOff = 16ull * k;
+            break;
           case pass::DispatchSel::IndDraftArgs:
             // Six stage records in one buffer; the row's y is its byte offset.
             args = bind_.buffers[(int)pass::Buf::DraftArgs];

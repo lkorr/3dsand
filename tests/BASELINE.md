@@ -1150,3 +1150,21 @@ repose entry above ("hash moves; NOT re-pinned here"). Not rebaselined here
 `gas-leave` pass at 3. At the default (1) these passed on this tree:
 determinism (twice-run), gas-leave, gas-reenter, gas-leave-overflow,
 gas-farplume, gas-farplume2, heat-updraft, oil-fire, draft-stack.
+
+## 2026-10-03 — ca-chunk-overhead: no key changed; the CA is hash-identical
+
+The colour rows now dispatch per-colour chunk lists and sparse cell pools,
+and camask writes each dirty chunk's own repose snapshot (DESIGN.md "The CA
+dispatches cells, not chunks"). Every arm is exact against HEAD 8c3ca8e:
+`--perf village-fire` f7936a11 (and its caGasCells / caOtherCells counters),
+`forestfire` 8dd17ecf, `idle` e4f3ead0, `determinism` 0fa43063 twice-run
+reproduced (the pinned b2514936 is stale on main, see the fire-gpu entry),
+`repose` piles identical. The same 24-gate `--verify` list
+(determinism, sleep, ca-skip, stamp-sleep, repose, ca-slope, ca-level,
+ca-gutter, oil-fire, heat-plume, heat-updraft, heat-ignite, gas-leave,
+gas-reenter, gas-leave-overflow, fluid-excite, fluid-react, blood-stain,
+stain-react, evaporation, wind-gas, mob-burn, tree-fell, fire) gives the same
+result on HEAD's exe + assets and on this tree: `evaporation` FAILS on both
+(pond surface 11/289 after 2500 noon ticks -- not this package; recorded
+"pass" in baseline.json), `mob-burn` known-failing. `gas-leave` under
+`--vk-validation`: 0 messages. Not rebaselined here (package rule).

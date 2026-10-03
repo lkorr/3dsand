@@ -346,6 +346,12 @@ enum class Buf : uint8_t {
   // The ambient wind per 4^3 block of every dirty chunk (sim_step.wgsl
   // caWind), binding 49: written by the caMask rows, read by the colours.
   CaWind,
+  // The colour rows' indirect args (sim_step.wgsl caArgs), binding 54: 27
+  // records of (x, 1, 1, chunks), written by the caList rows (one after each
+  // caMask row) and read as the indirect command of colour k at offset 16 k.
+  // Bound AND indirect, which Vulkan allows; nothing reads it as storage in
+  // the dispatch it drives.
+  CaArgs,
   // ---- the temperature layer (src/sim/heat.h, sim_heat.wgsl), 50..52 ----
   // HeatPool and HeatMeta are GPU-owned (the CA reads both: X from the pool,
   // and raises flags / counters in the meta); HeatParams is CPU-written
@@ -431,6 +437,8 @@ enum class Pipe : uint8_t {
   ReposeSnap,
   // The CA's per-substep air mask: a third entry point of sim_step.wgsl.
   CaMask,
+  // ...and the colour lists built from it (sim_step.wgsl calist).
+  CaList,
   // MLS-MPM fluid. Inserted BEFORE FarDown deliberately: the
   // pipeline-copy loop in Simulation::RecordTable is bounded by
   // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
@@ -813,6 +821,7 @@ enum class DispatchSel : uint32_t {
   // Indirect: giArgs @ 0. Same standing as IndShadowArgs: the count is what the
   // fragment shader appended last frame, which nothing on the CPU knows.
   IndGiArgs,
+  IndCaArgs,         // indirect: caArgs @ 16 x the ITERATION (colour k of a CA row)
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

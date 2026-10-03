@@ -1145,7 +1145,10 @@ SSBO lists of chunk indices.
     So every probe reads `reposeSnap` (`world.h`'s `kReposeSnap*` block): **one
     bit per voxel, "a powder could drop into this cell", taken at TICK START**
     by the `reposesnap` prepass and read by the CA behind a barrier the pass
-    table generates. A snapshot bit is the same in every run of the same tick by
+    table generates. (Since 2026-10-03 a dirty chunk's OWN record is written
+    by `camask` on substep 0, from the voxels it reads anyway, and the prepass
+    fills only the ring members that are not themselves dirty -- §"The CA
+    dispatches cells, not chunks".) A snapshot bit is the same in every run of the same tick by
     construction. It is a side table per design guideline 2 — derived, not
     hashed, not saved — and it is deliberately **stale**: a drop that fills in mid-tick still
     reads open, the grain slides toward it, the ordinary `tryMove` refuses
@@ -6249,6 +6252,74 @@ neighbors, so this needs an explicit connectivity pass:
   attribution arms (`dbldirty` +3.1 ms) overstate what removing that work
   could win. The levers left are fewer awake chunks and fewer cells, not
   cheaper ones.
+- **The CA dispatches cells, not chunks (2026-10-03, ca-chunk-overhead).**
+  Two measurements started it. (1) WHY EMPTY CHUNKS ARE AWAKE:
+  `SANDVOX_DIRTY_REASONS=<n>` now also folds the reason bits over the awake
+  chunks whose occupancy is 0 ("EMPTY awake"). On `--perf village-fire` that
+  is ~250-300 chunks from tick ~550 on, and every one carries `MOVE` (+ `gas`
+  in ~90%): a gas voxel moving on a chunk FACE fans its mark into the
+  neighbour (markDirtyR's 8-way fan), or the chunk's own last gas voxel just
+  left. About half were empty at the previous print as well -- a plume's
+  empty shell, re-marked by the plume. Not a sleep leak: the marks stop when
+  the gas does, and the dirty flag is load-bearing where it is (the page
+  table's materialisation ring and heatRelax's mark licence both read it), so
+  the flag stays and the CA stops being DISPATCHED for such a chunk instead.
+  (2) The fixed per-(chunk, colour) cost: a smoke chunk holds 11..65 cells,
+  0.4..2.4 a colour, and paid a whole gather (36 mask rows, three barriers)
+  per colour; pack-2 workgroups ran ~15 cells on 128 threads; and the
+  dispatch was sized for the whole dirty list.
+  What changed (sim_step.wgsl `camask` / `calist` / `main` / `reposesnap`,
+  pass_table `caList` / `caList1` and the moved `reposeSnap`, `CaArgs` at
+  binding 54, the caMask buffer's tail):
+  1. **Per-colour work lists.** camask records which of the 27 colours a
+     chunk has any cell in; `calist` (27 workgroups, one blocked prefix sum
+     each) builds colour k's chunk list and its indirect args, and colour k's
+     row dispatches exactly ceil(chunks / pack) workgroups from them (the
+     recorder's `IND_CAARGS`: iteration k reads the record at 16 k). An
+     awake chunk holding nothing is dispatched for no colour.
+  2. **Sparse cells go to a pool.** For every (chunk, colour) whose cells may
+     run apart from the rest of the chunk -- not a sentinel, not substep 0 of
+     an MPM chunk (air runs there), not a chunk a gas voxel can leave the
+     window from (the leave tail ranks a chunk's leavers inside ONE
+     workgroup) -- camask writes the cells themselves into colour k's gas or
+     other pool, and `main` runs them 128 to a workgroup, kind-sorted across
+     the whole colour. A pool is bounded (`CA_POOL_CAP` 65,536 entries, two
+     per colour, 14.2 MiB); a reservation that does not fit sends that
+     (chunk, colour) to the dense list and pads what it took with skip
+     entries. `CA_SPARSE_T` caps the cells a (chunk, colour) may hold to go
+     sparse: measured 8 / 16 / 32 / 64 / 216 -> CA 10.24 / 9.61 / 9.02 /
+     8.37 / 7.55 ms, so it ships at 216 (every site of a colour).
+  EXACT: the same cells run once each through the same `caCell` with the
+  same keys -- only which workgroup runs a cell changed, which the colour
+  lattice makes irrelevant. `--perf village-fire` hash f7936a11 and its
+  caGasCells / caOtherCells counters are unchanged in every arm, including
+  a forced `CA_POOL_CAP` 1,024 (heavy overflow, all of it on the fallback),
+  and `forestfire` stays 8dd17ecf. Neither scene overflows the pool (an
+  overflow probe added 1e8 to caOtherCells per refusal: 0 in 300 frames).
+  Village fire (`--perf`, SANDVOX_RUN_EXCLUSIVE): CA 12.39 -> 11.32 (lists)
+  -> 7.55 ms (pool), frame p50 30.30 -> 25.61 ms. camask grew 1.04 -> 1.72
+  (both rows, per-frame us units of the pass table) for the counting and the
+  scatter; `calist` is 0.03 a row. With item 3 below, all three: village CA
+  12.39 -> 7.10 ms, p50 30.30 -> 25.08; `forestfire` CA 5.38 -> 3.41, p50
+  20.68 -> 18.31; `idle` (6.6 awake chunks) CA 2.41 -> 2.35, p50 9.18 -> 9.08
+  -- rest cost did not rise. Windowed (`SANDVOX_BURN_VILLAGE=1
+  SANDVOX_BURN_TICKS=1200 --frames 100000 --burn-house`, one run each, the
+  harness moves +-15%): frame p50 22.2 -> 16.7 ms, p95 34.3 -> 27.2, frames
+  over 33 ms 13.5% -> 2.0%, CA 8.65 -> 3.56 ms a frame.
+  3. **camask publishes each dirty chunk's own repose snapshot.** The
+     `reposeSnap` prepass (then ~12% of the CA rows) filled every dirty
+     chunk's ring, and ring member 0 -- the chunk itself, always its own
+     owner -- meant re-reading 4,096 voxels camask reads anyway. Substep 0's
+     camask now writes that record (a fourth shared plane: solid or powder =
+     blocker) and `reposesnap` skips member 0; the row moved after
+     `caMask` / `caList` (no voxel writer between its old place and the new
+     one). reposeSnap 2.07 -> 1.02, camask +0.04, CA 7.55 -> 7.10 ms, p50
+     25.08 ms, hash unchanged.
+  Not taken: skipping `reposeSnap` entirely for chunks with no
+  repose-carrying powder is NOT exact -- a reaction can make a powder mid-tick
+  (ash) that runs its repose probe on substep 1. Keeping each thread's cell
+  kinds in registers and reserving its pool run once (six shared atomics
+  instead of one per cell) measured no better (camask 1.72 -> 1.80).
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
