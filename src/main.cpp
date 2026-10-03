@@ -13980,6 +13980,23 @@ int main(int argc, char** argv) {
       // Interpolated for the same reason the camera above is: a listener
       // that teleports 30 times a second doppler-shifts every loop.
       const Vec3 earPos = player.RenderEyePos(tickAlpha);
+      // LIGHTNING IN THE SIM (docs/PLAN_electricity.md E3): every bolt the
+      // tick laid since the last frame -- a storm's ground strike, the
+      // lightning glyph -- lights the deck over it (weather::NoteStrike,
+      // render-only) and claps, delayed by distance (Cues::Thunder). A shock
+      // (no bolt) is too small for either. Bounded by the tick's own cap.
+      for (const auto& ev : tickCtx.strikes.events) {
+        if (!ev.emitted || ev.cells == 0) continue;
+        const Vec3 at{(float)ev.foot.x + 0.5f, (float)ev.foot.y + 0.5f,
+                      (float)ev.foot.z + 0.5f};
+        if (ev.weather || ev.foot.x != ev.target.x || ev.foot.y != ev.target.y ||
+            ev.foot.z != ev.target.z) {
+          weather::NoteStrike(ev.tick, at.x * kVoxelMeters, at.y * kVoxelMeters,
+                              at.z * kVoxelMeters);
+          audioCues.Thunder(at, earPos);
+        }
+      }
+      tickCtx.strikes.events.clear();
       if (audioCues.Enabled()) {
         // THE LISTENER IS PUBLISHED FIRST, BEFORE ANY CUE IS FIRED (2026-09-19).
         // Every trigger below is placed relative to the pose AudioWorld is

@@ -559,6 +559,8 @@ add_library(sandvox_core OBJECT
   # PlayerSession is one player; TickAuthority is one tick of gameplay, moved
   # out of the middle of main()'s frame loop. See src/game/session.h.
   src/game/session.cpp
+  # THE STRIKE PATH (docs/PLAN_electricity.md E3): lightning / shock as CellOps.
+  src/game/lightning.cpp
   # THE PEERS' BODIES (docs/PLAN_multiplayer_m9.md M9.2 package B). A ghost is
   # a PlayerAvatar driven from a peer's PlayerState OUTCOME, not a re-simulated
   # controller. See src/game/remoteplayer.h.
@@ -625,6 +627,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_equipment.cpp
   src/test/selftest_alchemy.cpp
   src/test/selftest_chem.cpp
+  src/test/selftest_elec_strike.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_solute.cpp

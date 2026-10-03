@@ -5082,6 +5082,38 @@
         "wet",
         "extinguisher"
       ]
+    },
+    {
+      "//": "ELECTRICITY E3 (docs/PLAN_electricity.md section 3). ARC: the short blue-white crackle a shock leaves -- the `shock` glyph's burst and the splash round a lightning strike's foot (game/strike.h). A transient gas that lives about a tick (reactions.json decay 700 per-mille): tag:electric, so every electric rule (hydrogen's pop, electrolysis, thermite, ether vapour) fires off it exactly as off a spark, and it lights what burns beside it more readily than a spark does (reactions.json arc + flammable). Appended at the END of the table on purpose: an id is the index, and inserting beside `spark` would renumber every later material. The charge-field `electric` block (resist / source) is package E1's and is added at merge.",
+      "id": "arc",
+      "class": "gas",
+      "density": 1,
+      "emission": 240,
+      "opacity": 110,
+      "colors": [
+        "#b8d8ff",
+        "#8fc0ff",
+        "#eaf4ff"
+      ],
+      "tags": [
+        "electric"
+      ]
+    },
+    {
+      "//": "ELECTRICITY E3. LIGHTNING: the bolt itself -- the jagged column the `lightning` glyph and a storm's ground strike lay from the sky down to the struck top (game/strike.h LightningStrike). The brightest thing in the world and the shortest-lived: decays in one or two ticks (reactions.json 550 per-mille). tag:electric like spark and arc; IGNITES through its own pair rule with tag:flammable at a high chance (reactions.json), not through tag:hot, so it does not melt or boil what it merely passes -- it is a discharge, and the heat it leaves is the fire it starts.",
+      "id": "lightning",
+      "class": "gas",
+      "density": 1,
+      "emission": 255,
+      "opacity": 200,
+      "colors": [
+        "#f4f8ff",
+        "#dbe8ff",
+        "#ffffff"
+      ],
+      "tags": [
+        "electric"
+      ]
     }
   ]
 }

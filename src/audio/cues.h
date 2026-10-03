@@ -202,6 +202,16 @@ class Cues {
   void FlaskFill(const Vec3& posVox, float fill, int cells = 1);
   int FlaskFillSetId() const;
 
+  // ---- thunder (the `weather` owner, docs/PLAN_electricity.md E3) ----------
+  // A lightning strike in the sim (a storm's ground strike, the lightning
+  // glyph's bolt) at `posVox`. The clap is DELAYED by the distance to the
+  // listener at the speed of sound (343 m/s), so a strike 70 m off flashes and
+  // then, a fifth of a second later, cracks; it is queued here and played by
+  // Update when its time comes. Closer is louder and higher; set weather/thunder,
+  // fixed in code like the combat sets. Silent when nothing is recorded.
+  void Thunder(const Vec3& posVox, const Vec3& listenerPosVox);
+  int ThunderSetId() const;
+
   // ---- bleeding -----------------------------------------------------------
   // A positioned wet loop for a creature losing a lot of blood, keyed by a
   // caller-chosen id (mob id, or a limb key) so several wounds can sound at
@@ -313,6 +323,9 @@ class Cues {
     // ask is "did the game ASK for this sound at the moment it should have",
     // and this is the field that answers it (--gate combat-cues).
     uint32_t combat = 0;
+    // Thunder: strikes reported (requests, counted like `combat`) and claps
+    // actually started once their sound delay ran out.
+    uint32_t thunderStrikes = 0, thunderVoices = 0;
   };
   const Stats& GetStats() const { return stats_; }
 
@@ -346,6 +359,17 @@ class Cues {
   std::map<uint64_t, double> lastMobVoice_;
   double lastFlaskFill_ = -1e9;  // now_ of the last FlaskFill voice
   mutable int flaskSetId_ = -2;  // memoised "vessel/fill"; -2 = not looked up
+  mutable int thunderSetId_ = -2;  // memoised "weather/thunder"
+  // Claps waiting out their sound delay (Thunder). Bounded: a storm strikes a
+  // few times a minute; anything past kMaxThunder is dropped, counted.
+  struct PendingThunder {
+    double at = 0.0;   // now_ to play at
+    Vec3 pos{};
+    float gain = 1.0f;
+    float rate = 1.0f;
+  };
+  std::vector<PendingThunder> thunder_;
+  void PlayDueThunder();
   double now_ = 0.0;
 
   // Last variant played per set, so a set never repeats a sample back to back.

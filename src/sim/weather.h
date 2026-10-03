@@ -105,6 +105,11 @@ struct State {
   float overcast = 0.0f;   // 0..1, how much of the dome is under cloud
   float flash = 0.0f;      // lightning brightness this frame (0 = none)
   float flashX = 0.0f, flashZ = 0.0f;  // flash position, metres from camera
+  // A SIM GROUND STRIKE near the player (NoteStrike): its flash, and where it
+  // struck in ABSOLUTE metres (the far flash above is camera-relative, because
+  // it is somewhere in the storm; this one is a place in the world). 0 = none.
+  float strikeFlash = 0.0f;
+  float strikeXM = 0.0f, strikeYM = 0.0f, strikeZM = 0.0f;
   bool enabled = true;     // render.clouds master switch
 };
 
@@ -127,6 +132,9 @@ struct PresetQ {
   int64_t windShare = 0, leanTan = 0;
   // The wind regime this sky blows (Preset::wind, resolved), Q16.
   int64_t windI = 0, windG = 0, windC = 0;
+  // Lightning, flashes a minute, Q16: what SimLightningQ schedules the sim's
+  // ground strikes from (docs/PLAN_electricity.md E3).
+  int64_t lightning = 0;
 };
 
 class Library {
@@ -250,6 +258,20 @@ bool SimWindRegime(const Tuning& t, uint32_t seed, uint32_t tick,
 // A fingerprint of everything SimWindRegime reads, so a cache of the wind's
 // history (windfield.h AdvPhase) can tell that the sky's schedule changed.
 uint64_t SimWindFingerprint(const Tuning& t);
+
+// THE SKY'S LIGHTNING FOR THE SIM: the scheduled (or pinned) preset's
+// `lightning`, flashes a minute, Q16, at `tick` -- the same integer ladder
+// SimRainWord walks, so a storm's ground strikes and its rain are one weather.
+// 0 when weather.clouds is off. A pure function of (tuning, presets, seed,
+// tick, the pin): session.cpp WeatherStrikes rolls a hash against it.
+int64_t SimLightningQ(const Tuning& t, uint32_t seed, uint32_t tick);
+
+// A SIM STRIKE HAPPENED (render-only): the frame hands every ground strike /
+// lightning glyph bolt here, and the next Resolve lights the clouds over it with
+// the same stroke-and-restrike envelope the far flashes use, aged on the sim
+// clock (`tick`, the strike's). World position in metres. Never read by the
+// sim; never hashed.
+void NoteStrike(uint32_t tick, float xM, float yM, float zM);
 
 // The last State Resolve returned, for the dev panel's readout and the gate.
 const State& Last();

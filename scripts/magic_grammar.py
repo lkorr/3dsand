@@ -78,8 +78,13 @@ glyph('gust', 'E', 5, 'A wind jet from the point along the aim. Repetition doubl
       verb='wind', axis='speed', tariff='footprint x ticks', says='blows a wind jet along the aim')
 glyph('implode', 'E', 5, 'A vacuum burst: pulls loose matter and bodies toward the point.',
       verb='wind(-)', axis='speed', tariff='footprint x ticks', says='pulls everything loose toward it')
-glyph('spark', 'E', 2, 'One ember. Ignites a flammable cell it touches, nothing more. The cheap way to light things.',
-      verb='place(fire,1)', axis='embers', tariff='1 voxel of fire', says='lays an ember')
+glyph('spark', 'E', 2, 'One spark: an electric crackle that lives a tick or two. Pops hydrogen, splits molten salt, and only sometimes lights what burns beside it. The cheapest electricity there is.',
+      verb='place(spark,1)', axis='sparks', tariff='1 voxel of spark', says='lays a spark')
+glyph('shock', 'E', 4, 'A crackle of arcs where it lands: short jagged discharges that run over what is there. Every electric reaction fires off it, and it sets dry things alight more readily than a spark.',
+      verb='strike(arc)', axis='arcs', tariff='arc cells x 0.3', says='goes off in a crackle of arcs')
+glyph('lightning', 'E', 9, 'Calls a bolt of lightning down on the point - or on the tallest conductor near it: a lightning rod draws it. Whatever burns where it lands goes up.',
+      verb='strike(lightning)', axis='bolt height / arcs', tariff='bolt cells x 0.25',
+      says='calls down a bolt of lightning on the tallest conductor near it')
 
 # ---- operators ----------------------------------------------------------------
 glyph('transmute', 'Op', 4, 'A transmute B: turns A into B where it resolves. Needs BOTH words; an empty side fizzles (charged).',
@@ -830,6 +835,8 @@ NAMED = [
     'slow float explosive orb',
     'implode gust projectile',
     'spark trail bolt',
+    'lightning projectile',
+    'shock projectile',
     'lava gust gust projectile',
     'projectile explosive',
     'explosive projectile fire bomb',

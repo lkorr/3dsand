@@ -182,6 +182,12 @@ enum class SpellVerb : uint8_t {
   Filter,    // (operator) an entry in the caster's op filter
   Repeat,    // (operator) the inner Effect again every few ticks, bounded
   Launch,    // (rule 2) a BOX: a DeliveryRec carrying `inner` as its payload
+  // A STRIKE (docs/PLAN_electricity.md E3): a lightning bolt or a shock's arc
+  // burst at the point. The VM only REPORTS it (SpellEmission::strikes); the
+  // owner plans and emits the CellOps through game/lightning.h LightningStrike,
+  // the same function a storm's ground strike uses. Appended LAST so no
+  // existing verb is renumbered.
+  Strike,
 };
 const char* SpellVerbName(SpellVerb v);
 bool ParseSpellVerb(const std::string& s, SpellVerb& out);
@@ -229,6 +235,25 @@ struct GlyphWind {
   float rise = 0.0f;               // vortex axial share of `speed`
   // Whether this gust may pull SETTLED powder loose inside its footprint.
   bool entrain = false;
+};
+
+// The strike a glyph authors (verb `strike`), read from the glyph's "strike"
+// block. Content, like GlyphWind: materials BY NAME (resolved at load), the
+// shape as numbers. game/lightning.h StrikeSpec is what the owner builds from it.
+struct GlyphStrike {
+  bool has = false;
+  uint32_t boltMat = 0;     // "bolt": the column's material (0 = no bolt)
+  uint32_t splashMat = 0;   // "splash": the arcs' material (0 = none)
+  int32_t height = 0;       // bolt height above the struck top (0 = the shock: splash only)
+  int32_t search = 0;       // XZ radius the bolt looks for a tall / conductive top in
+  int32_t splash = 2;       // splash walk half-length
+  int32_t arcs = 4;         // splash walks
+  int32_t forks = 2;        // short branches off the bolt
+  int32_t conductBonus = 6; // cells of height a conductive top is worth
+  // The tariff per cell, per-mille of a placed voxel of the bolt's matter: a
+  // bolt is ~70 short-lived cells, and pricing it as 70 placed voxels would
+  // put it out of reach of a 100-mana caster. Content, so it is tuned here.
+  int32_t tariffMille = 1000;
 };
 
 // How a CARRIER looks in flight. Render-only content, never authoritative:
@@ -287,6 +312,7 @@ struct GlyphDef {
   std::vector<uint32_t> nativeMats;
   int32_t foreignPenaltyMille = 1000;
   GlyphWind wind;
+  GlyphStrike strike;
 
   // ---- delivery record defaults ----
   DeliveryMech mech = DeliveryMech::Instant;
@@ -1231,6 +1257,19 @@ struct CasterHealth {
 
 // ---- emission --------------------------------------------------------------
 
+// A strike the payload asked for (verb `strike`): where, which glyph's shape,
+// and how hard. The VM cannot write the world, so the OWNER plans it against
+// the mirror and emits the CellOps (game/lightning.h LightningStrike), charged to
+// the tick's strike budget before emission. `scaleMille` is the effect's
+// repetition x magnitude (1000 = said once).
+struct SpellStrike {
+  int32_t x = 0, y = 0, z = 0;
+  int32_t glyph = -1;
+  int32_t scaleMille = 1000;
+  int32_t strengthMille = 1000;
+  uint32_t salt = 0;
+};
+
 // Everything a spell may emit, in one bundle. The VM appends here and NOWHERE
 // else — this struct IS thesis 1.
 struct SpellEmission {
@@ -1238,6 +1277,7 @@ struct SpellEmission {
   std::vector<ExplosionOp> explosions;
   std::vector<ParticleSpawn> spawns;
   std::vector<WindPrim> winds;
+  std::vector<SpellStrike> strikes;
   // Set when the effect should carve the caster's own body (a Fatal cast).
   bool carveCaster = false;
   Vec3 carveAt{};
@@ -1351,7 +1391,8 @@ class SpellSystem {
   // how many were refused. Carriers (projectiles, bombs) are absorbed inside
   // Tick() the same way.
   int FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
-                    std::vector<ParticleSpawn>& spawns, std::vector<WindPrim>& winds) const;
+                    std::vector<ParticleSpawn>& spawns, std::vector<WindPrim>& winds,
+                    std::vector<SpellStrike>* strikes = nullptr) const;
 
   void Clear() {
     live_.clear();

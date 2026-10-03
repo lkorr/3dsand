@@ -43,7 +43,7 @@ payload tariff, times the delivery's carry premium, plus the word costs; with
 lanes it is a SUM of one bracket per instance instead. Carry composes
 multiplicatively down a nest.
 
-## 1. The glyph table (46 glyphs)
+## 1. The glyph table (48 glyphs)
 
 Sorts: **matter** names a material; **effect** happens at a point; **delivery**
 boxes the pile and decides where and when; **mod** edits the record of the box
@@ -75,7 +75,9 @@ boxes what is in front of it.
 | `explosive` | effect | 6 | add | power |  | An explosion at the point. Power adds with repetition; radius follows the engine law; priced by volume. |
 | `gust` | effect | 5 | add | speed |  | A wind jet from the point along the aim. Repetition doubles speed, not size. |
 | `implode` | effect | 5 | add | speed |  | A vacuum burst: pulls loose matter and bodies toward the point. |
-| `spark` | effect | 2 | add | embers |  | One ember. Ignites a flammable cell it touches, nothing more. The cheap way to light things. |
+| `spark` | effect | 2 | add | sparks |  | One spark: an electric crackle that lives a tick or two. Pops hydrogen, splits molten salt, and only sometimes lights what burns beside it. The cheapest electricity there is. |
+| `shock` | effect | 4 | add | arcs |  | A crackle of arcs where it lands: short jagged discharges that run over what is there. Every electric reaction fires off it, and it sets dry things alight more readily than a spark. |
+| `lightning` | effect | 9 | add | bolt height / arcs |  | Calls a bolt of lightning down on the point - or on the tallest conductor near it: a lightning rod draws it. Whatever burns where it lands goes up. |
 | `transmute` | operator | 4 | add | volume | M ◂ transmute ▸ M → E | A transmute B: turns A into B where it resolves. Needs BOTH words; an empty side fizzles (charged). |
 | `mend` | operator | 6 | add | voxels per tick | M ◂ mend → E | M mend: draws matter M from the resolve point into the caster's missing anatomy cells, one voxel at a time. Needs a source word. |
 | `trail` | operator | 8 | add | budget | E/M ◂ trail → X | E trail: runs E at every marked voxel of the flight path. Takes the ONE item before it (a launch box included). Yields a MOD, so it is pending: it sticks to the next delivery spoken, and on anything that does not travel it is charged and does nothing. |
@@ -187,7 +189,7 @@ any other reading of the three rules.
 | `fire lane trail end projectile` | You fire a bolt; when it hits, it sprays fire; the first bolt carries only what they all carry. |
 | `fire lane fire end projectile` | You fire a bolt; when it hits, it sprays fire; the first bolt also sprays fire. |
 
-## 3. Every single word (46)
+## 3. Every single word (48)
 
 | spoken | parse | what happens | cost shape |
 |---|---|---|---|
@@ -209,7 +211,9 @@ any other reading of the three rules.
 | `explosive` | explosive | Explodes right in front of you. | [explosive] + words 6 |
 | `gust` | gust | Blows a wind jet along the aim right in front of you. | [gust] + words 5 |
 | `implode` | implode | Pulls everything loose toward it right in front of you. | [implode] + words 5 |
-| `spark` | spark | Lays an ember right in front of you. | [spark] + words 2 |
+| `spark` | spark | Lays a spark right in front of you. | [spark] + words 2 |
+| `shock` | shock | Goes off in a crackle of arcs right in front of you. | [shock] + words 4 |
+| `lightning` | lightning | Calls down a bolt of lightning on the tallest conductor near it right in front of you. | [lightning] + words 9 |
 | `transmute` | (_ ⋈ _) | Wastes `transmute` (a word it needed was missing) right in front of you. | [(|transmute|)] + words 4 |
 | `mend` | (_ ◂mend) | Wastes `mend` (a word it needed was missing) right in front of you. | [(|mend|)] + words 6 |
 | `trail` | (_ ◂trail) | Nothing happens; the words are charged. The trail is wasted: your hand does not travel anywhere. | [nothing] + words 8 |
@@ -238,7 +242,7 @@ any other reading of the three rules.
 | `end` | (empty) | Nothing happens; the words are charged. | [nothing] + words 0 |
 | `twin` | twin | Nothing happens; the words are charged. | 2×[nothing] + words 3 |
 
-## 4. The sentences from the brief (72)
+## 4. The sentences from the brief (74)
 
 | spoken | parse | what happens | cost shape |
 |---|---|---|---|
@@ -291,7 +295,9 @@ any other reading of the three rules.
 | `explosive fuse projectile` | [explosive fuse **projectile**] | You fire a bolt; when it hits it waits 30 ticks, then it explodes. | [[explosive]·carry(projectile 3.0)] + words 15 |
 | `slow float explosive orb` | [slow float explosive **orb**] | You fire a slow floating orb; when it hits or its life runs out, it explodes. | [[explosive]·carry(orb 2.5)] + words 19 |
 | `implode gust projectile` | [implode gust **projectile**] | You fire a bolt; when it hits, it pulls everything loose toward it and blows a wind jet along the aim. | [[implode + gust]·carry(projectile 3.0)] + words 16 |
-| `spark trail bolt` | [(spark ◂trail) **bolt**] | You fire a dart that lays an ember along its whole path; when it hits, it does nothing but knock what it hit. | [[kinetic]·trail[spark]·carry(bolt 4.0)] + words 18 |
+| `spark trail bolt` | [(spark ◂trail) **bolt**] | You fire a dart that lays a spark along its whole path; when it hits, it does nothing but knock what it hit. | [[kinetic]·trail[spark]·carry(bolt 4.0)] + words 18 |
+| `lightning projectile` | [lightning **projectile**] | You fire a bolt; when it hits, it calls down a bolt of lightning on the tallest conductor near it. | [[lightning]·carry(projectile 3.0)] + words 15 |
+| `shock projectile` | [shock **projectile**] | You fire a bolt; when it hits, it goes off in a crackle of arcs. | [[shock]·carry(projectile 3.0)] + words 10 |
 | `lava gust gust projectile` | [lava gust×2 **projectile**] | You fire a bolt; when it hits, it sprays lava and blows a wind jet along the aim x2. | [[lava + gust×2]·carry(projectile 3.0)] + words 17 |
 | `projectile explosive` | [**projectile**] explosive | Explodes right in front of you. You fire a bolt; when it hits, it does nothing but knock what it hit. | [[kinetic]·carry(projectile 3.0) + explosive] + words 12 |
 | `explosive projectile fire bomb` | [[explosive **projectile**] fire **bomb**] | You fire a bomb; when its fuse runs down, it fires a bolt; when that hits, it explodes and sprays fire. | [[[explosive]·carry(projectile 3.0) + fire]] + words 16 |

@@ -4487,6 +4487,103 @@ poison or healing salve (package D owns healing); the moon/sun waters and
 spores are not placed by worldgen, and no item or shop hands out reagents —
 they come from the brush and scooping; ink is a tint with no use yet.
 
+### Lightning: arcs, bolts and the strike path (2026-10-03; electricity package E3, `docs/PLAN_electricity.md` section 3; `game/lightning.*`, `materials.json` `arc` / `lightning`, glyphs `spark` / `shock` / `lightning`, `session.cpp` WeatherStrikes, gate `elec-strike`)
+
+**Three strengths of one discharge, all tag:electric, all transient gases**
+(appended at the END of `materials.json`: an id is the index, and inserting
+beside `spark` would renumber every later material):
+
+| material | lives | lights flammables (its own pair rule, `neighborBecomes fire`) | made by |
+|---|---|---|---|
+| `spark` | ~2 ticks (450) | 40 per-mille: only sometimes | the spark glyph, struck plating, the bench's Electrify |
+| `arc` | ~1.4 ticks (700) | 250: most touches singe | the shock glyph, a strike's splash |
+| `lightning` | 1-2 ticks (550) | 900: what it touches goes up | the lightning glyph, a storm's ground strike |
+
+None is tag:hot, so a bolt does not melt the iron it lands on; the fire it
+starts is its heat. Every tag:electric rule (hydrogen's pop, both
+electrolyses, thermite, ether vapour) fires off all three alike, so a shock
+into molten salt electrolyses it with no new JSON. The charge field (package
+E1) will give `arc` and `lightning` `electric.source` blocks at merge; nothing
+in the strike path changes for that -- the bolt's cells ARE the seeds.
+
+**ONE strike function, three callers.** `PlanStrike` + `EmitStrike`
+(`LightningStrike` = both) turn a `StrikeSpec` into CellOps: the `lightning`
+glyph, the `shock` glyph and a storm's ground strike all go through it, so the
+op record, ops-replay and the net need no change (rule 3).
+
+1. **Target.** Every column in an XZ disc (`searchRadius`) round the aim is
+   scanned down through `WorldStrikeProbe` -- the snapshot mirror, then the
+   on-demand fetch cache, never the analytic terrain (a bolt into a house must
+   stop at the roof) -- from `aim.y + 24` to its first non-gas cell, its TOP.
+   Score = top y + `conductBonus` (6) if the top conducts (`StrikeMats`:
+   tag `metal` / `conductive`, or iron / steel / gold / brass / copper / silver
+   by name until E1 fixes those tags), ties to the nearer column, then a hash.
+   So a strike PREFERS a tall thing and an iron rod over a taller post beside
+   it -- the lightning rod. A column the probe cannot see does not compete;
+   with none, the bolt lands at the aim.
+2. **Bolt.** A jagged column of `lightning` from `height` cells over the top
+   down to the cell above it: one cell a step, a hashed sideways kick on about
+   a third of the steps, pulled back so it always ARRIVES, plus up to three
+   short hashed forks. IfAir throughout (it passes through what the probe does
+   not know without overwriting a solid).
+3. **Splash.** `arcs` jagged walks of `arc` out of the foot, outward and down
+   -- the crackle that runs over the ground and lights what stands round the
+   rod. The shock glyph is this alone (`height` 0), at the aim.
+
+Pure: every position is a hash of (spec.key, step), and the probe reads
+fixed-latency stores, so two runs plan the same list (the gate compares two
+in-process runs op for op). Bounded: a plan is at most `kStrikeMaxCells` (256);
+every caller charges ONE per-tick `StrikeBudget` (512 cells, two full bolts)
+with the WHOLE plan BEFORE pushing an op, and a plan that does not fit -- there
+or in `kMaxCellOpsPerTick` -- is refused whole and counted
+(`TickAuthorityCtx::strikes.budget.refused`); a refused spell strike also
+counts into the HUD's spell overflow.
+
+**The glyphs** (`glyphs.json`, verb `strike` = `SpellVerb::Strike`, appended
+last): the VM only REPORTS a strike (`SpellEmission::strikes`, `SpellStrike`)
+-- it may not reach the mirror or the budget -- and the owner (phase I,
+`SpellStrikeToCells`) builds the spec from the glyph's `strike` block
+(`StrikeSpecFromGlyph`: `bolt`, `splash`, `height`, `search`, `splashRadius`,
+`arcs`, `forks`, `conductBonus`, `tariffMille`). Repetition raises the bolt and
+adds arcs, inside the caps. Tariff = cells x arcane(matter) x rate.place x
+`tariffMille` (a bolt is ~70 cells for a few ticks; at full price it would be
+out of a 100-mana caster's reach): `lightning projectile` costs ~66 mana. A
+ward (`lightning null`, `FilterRefuses` kind 6) refuses a strike at its aim.
+`spark` now places `spark`, not `fire`.
+
+**Storm ground strikes** (owner, 2026-10-03: yes, in the sim, near the player
+only). `WeatherStrikes`, in phase K's world slot beside the reactions'
+aftermath, in two steps:
+
+- DECIDE on a tick whose `Hash3(seed, tick)` rolls under the sky's lightning
+  rate (`weather::SimLightningQ`: the preset's `lightning`, flashes/min, Q16,
+  through the same integer schedule the rain word walks -- never the render
+  flash, which is frame-paced) x `weather.strikeRate` (0.3: a 7/min storm
+  strikes ~2/min) / 1800 ticks. The aim is a hashed point in the ring
+  `strikeRadius`/4 .. `strikeRadius` (160 cells) round the primary, on the
+  analytic ground, clamped into the window; every chunk the target search will
+  read is requested from the fetch cache NOW.
+- FIRE 8 ticks later (the stepped leader; the cache readback lands in 1 tick +
+  `kSnapshotLatency`) through `LightningStrike` with `WeatherStrikeSpec`
+  (search 8, height 56, 6 arcs of radius 3, 3 forks).
+
+Pending strikes are tick state like the reactions' aftermath: not hashed, not
+saved. FORCE one with `strikes.forceNext` (+ `forceAim`) -- what the gate does
+-- or `SANDVOX_STRIKE_EVERY=<ticks>` (a strike every N ticks whatever the sky).
+**Presentation** is the frame's: every emitted bolt lands in
+`strikes.events`, which `main.cpp` drains into `weather::NoteStrike` (the deck
+lights over the bolt with the far flashes' stroke-and-restrike envelope, aged
+on the sim clock; `State::strikeFlash`, outshining a far flash while it lasts)
+and `Cues::Thunder` (set `weather/thunder`, the `weather` owner in
+`sound_schema.js`; delayed by distance at 343 m/s, louder and higher close).
+Far flashes stay render-only and silent.
+
+**Not done:** the charge field (E1) -- a bolt into a pond or a copper wire does
+nothing past the cells it lays; mob shock/stun (E4); the target scan starts 24
+cells over the aim, so a tree taller than that is struck inside its canopy (the
+bolt above it is refused by the leaves, IfAir); no thunder sample is recorded
+yet (`weather/thunder` is silent until one is).
+
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
 - Reactions → per-material buckets: each material stores offset+count into a flat
@@ -9524,9 +9621,12 @@ one a word is, is content — `"scope": "open" | "close"` — and the enum value
 kept its name after `also` was dropped for rule 4). Nothing
 in C++ knows which words exist. The C++ vocabulary is the sort names, the verb
 names (`spray`, `place`, `convert`, `explode`, `wind`, `mend`, `trail`,
-`sustain`, `filter`, `repeat`, `launch`) and the record field names — each verb
+`sustain`, `filter`, `repeat`, `launch`, `strike`) and the record field names — each verb
 maps to ONE op type or ONE engine seam, and `ApplySpellEffect` switches on the
-verb and nothing else.
+verb and nothing else. (`strike`, 2026-10-03, is the one verb whose seam is
+not an op type: the VM reports a `SpellStrike` and the owner plans its CellOps
+through `game/lightning.h`, the storm's own strike path -- see "Lightning: arcs,
+bolts and the strike path".)
 
 **Four rules, and they are the whole grammar** (rewritten 2026-09-10, rule 4
 added 2026-09-21 from `docs/PLAN_spell_graph.md` §2–3; the 2026-09-04 six-rule
@@ -16308,6 +16408,15 @@ reaction flags read it (`materials.h`
   max(rain, wetness) × damp, so rain slows a spread at once and wet ground stays
   slow to catch for ~`weather.drySeconds` after. Only a rescale: it still holds
   its chunk awake, or a fire front would fall asleep mid-spread.
+
+**The second thing the sky does to the world is lightning** (2026-10-03,
+electricity E3; "Lightning: arcs, bolts and the strike path" above). Not
+through TickParams: a storm's GROUND STRIKES near the player are CellOps the
+authoritative tick authors (`session.cpp` WeatherStrikes), scheduled from
+`Hash3(seed, tick)` against `weather::SimLightningQ` (the preset's `lightning`
+on the same integer schedule as the rain word) x `weather.strikeRate`, so they
+are recorded, replayed and hashed like any other op. The far flashes stay a
+pure function of the sim clock and never touch the world.
 
 Rain-exposed (`sim_step.wgsl rainExposed`, since 2026-09-30) = the cell is not
 below the first ray blocker on its own FALL LINE, by the rain exposure map built

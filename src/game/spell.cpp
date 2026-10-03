@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/lightning.h"
 #include "sim/rng.h"
 
 using nlohmann::json;
@@ -179,6 +180,7 @@ const VerbName kVerbNames[] = {
     {"mend", SpellVerb::Mend},       {"trail", SpellVerb::Trail},
     {"sustain", SpellVerb::Sustain}, {"filter", SpellVerb::Filter},
     {"repeat", SpellVerb::Repeat},   {"launch", SpellVerb::Launch},
+    {"strike", SpellVerb::Strike},
 };
 
 bool ParseModField(const std::string& s, ModField& out) {
@@ -802,6 +804,36 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
           // the language's "every sequence does something" rule forbids.
           errors += where + "is a wind effect but has no \"wind\" block\n";
           return false;
+        }
+        if (d.verb == SpellVerb::Strike) {
+          // THE STRIKE BLOCK (docs/PLAN_electricity.md E3): what the bolt and
+          // its splash are made of, BY NAME, and the shape. Clamped to
+          // game/lightning.h's caps here so a plan can never exceed them.
+          const json sj = g.value("strike", json::object());
+          GlyphStrike& st = d.strike;
+          st.has = true;
+          const std::string bolt = sj.value("bolt", std::string());
+          const std::string splash = sj.value("splash", std::string());
+          if (!bolt.empty() && !resolveMat(bolt, st.boltMat)) {
+            errors += where + "strike bolt names unknown material \"" + bolt + "\"\n";
+            return false;
+          }
+          if (!splash.empty() && !resolveMat(splash, st.splashMat)) {
+            errors += where + "strike splash names unknown material \"" + splash + "\"\n";
+            return false;
+          }
+          st.height = ClampI(sj.value("height", 0), 0, kStrikeMaxHeight);
+          st.search = ClampI(sj.value("search", 0), 0, kStrikeMaxSearch);
+          st.splash = ClampI(sj.value("splashRadius", 2), 1, kStrikeMaxSplash);
+          st.arcs = ClampI(sj.value("arcs", 4), 0, kStrikeMaxArcs);
+          st.forks = ClampI(sj.value("forks", 2), 0, 3);
+          st.conductBonus = ClampI(sj.value("conductBonus", 6), 0, 64);
+          st.tariffMille = ClampI(sj.value("tariffMille", 1000), 1, 100000);
+          if ((st.boltMat == 0 || st.height == 0) && (st.splashMat == 0 || st.arcs == 0)) {
+            // Neither a bolt nor a splash: a word that does nothing.
+            errors += where + "is a strike with neither a bolt nor a splash\n";
+            return false;
+          }
         }
         break;
       }
@@ -1952,6 +1984,18 @@ int32_t RecBolts(const GlyphLibrary& lib, const DeliveryRec& d) {
   return ClampI(total, 1, lib.budgets.maxInstances);
 }
 
+// A strike's cells, as the tariff and the volume bound count them: the bolt
+// (height plus its forks) and the splash (arcs x 2 x splash), scaled by
+// repetition and capped at what one plan may ever hold (game/lightning.h).
+static int32_t StrikeVolume(const GlyphDef& g, int32_t scaleMille) {
+  if (!g.strike.has) return 0;
+  const GlyphStrike& s = g.strike;
+  int32_t cells = 0;
+  if (s.boltMat && s.height > 0) cells += s.height + s.forks * 6;
+  if (s.splashMat) cells += s.arcs * 2 * s.splash;
+  return ClampI(ScaleMille(cells, scaleMille, 1), 1, (int32_t)kStrikeMaxCells);
+}
+
 int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
   const SpellBudgets& b = lib.budgets;
   const GlyphDef* g = lib.At(e.glyph);
@@ -1970,6 +2014,7 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
       return SatMul(SatMul(r, r), g->wind.reach);
     }
     case SpellVerb::Mend: return g ? ScaleMille(g->perTick, e.Scale(), 1) : e.n;
+    case SpellVerb::Strike: return g ? StrikeVolume(*g, e.Scale()) : 0;
     case SpellVerb::Filter: return Cube(e.radius);
     case SpellVerb::Trail: {
       int32_t v = 0;
@@ -2068,6 +2113,15 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
       return SatMul(vol, per);
     }
     case SpellVerb::Filter: return std::max(1, vol / 1000);
+    case SpellVerb::Strike: {
+      // cells x arcane(what it lays) x rate.place: the bolt's matter priced as
+      // if it were placed, which it is (CellOps, IfAir).
+      if (!g || !g->strike.has) return 0;
+      const uint32_t m = g->strike.boltMat ? g->strike.boltMat : g->strike.splashMat;
+      const int32_t full = SatMul(vol, SatMul(std::max(1, lib.Arcane(m)), b.ratePlace));
+      return std::max<int32_t>(
+          1, (int32_t)(((int64_t)full * g->strike.tariffMille + 500) / 1000));
+    }
     case SpellVerb::Trail: {
       int32_t t = 0;
       for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariffIn(lib, i, withCarry));
@@ -2785,6 +2839,12 @@ std::string EffectPhraseBase(const GlyphLibrary& lib, const EffectInst& e) {
     }
     case SpellVerb::Explode: return "explodes" + times;
     case SpellVerb::Wind: return "blows a wind jet along the aim" + times;
+    case SpellVerb::Strike: {
+      const GlyphDef* sg = lib.At(e.glyph);
+      if (sg && sg->strike.height > 0 && sg->strike.boltMat != 0)
+        return "calls down a bolt of lightning on the tallest conductor near it" + times;
+      return "goes off in a crackle of arcs" + times;
+    }
     case SpellVerb::Mend:
       return "draws " + MatName(lib, e.glyphA, e.matA, e.anyA) +
              " into the caster's missing anatomy";
@@ -3385,6 +3445,23 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         out.winds.push_back(p);
         break;
       }
+      case SpellVerb::Strike: {
+        // THE VM REPORTS, THE OWNER STRIKES (thesis 1): the bolt needs the
+        // mirror (the target search) and the tick's strike budget, neither of
+        // which the VM may reach. session.cpp turns this into CellOps through
+        // game/lightning.h LightningStrike -- the storm's own strike path.
+        if (!g || !g->strike.has) break;
+        SpellStrike sk;
+        sk.x = cx;
+        sk.y = cy;
+        sk.z = cz;
+        sk.glyph = e.glyph;
+        sk.scaleMille = e.Scale();
+        sk.strengthMille = strengthMille;
+        sk.salt = Hash3(here, 0x5781CEu, (uint32_t)ei);
+        out.strikes.push_back(sk);
+        break;
+      }
       case SpellVerb::Launch: {
         // RULE 2 AT RUNTIME. A box does not reach into the system — it asks,
         // and the system adopts the request at the end of the call. The only
@@ -3958,7 +4035,7 @@ bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int3
                 dz = z - SpellFxFloor(f.at.z);
   if (dx * dx + dy * dy + dz * dz > (int64_t)f.radius * f.radius) return false;
   // kindMode: 0 = paint op, 1 = overwrite op, 2 = melt op, 3 = spawn,
-  //           4 = explosion, 5 = wind
+  //           4 = explosion, 5 = wind, 6 = strike
   switch (w->sort) {
     case GlyphSort::Matter:
       if (w->wildcard) return kindMode <= 3;   // `anything null`: all matter ops
@@ -3971,6 +4048,7 @@ bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int3
         case SpellVerb::Spray: return kindMode == 3;
         case SpellVerb::Explode: return kindMode == 4;
         case SpellVerb::Wind: return kindMode == 5;
+        case SpellVerb::Strike: return kindMode == 6;
         default: return false;
       }
     default:
@@ -3980,7 +4058,8 @@ bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int3
 
 int SpellSystem::FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
                                std::vector<ParticleSpawn>& spawns,
-                               std::vector<WindPrim>& winds) const {
+                               std::vector<WindPrim>& winds,
+                               std::vector<SpellStrike>* strikes) const {
   if (filters_.empty() || !lib_) return 0;
   int n = 0;
   auto sweep = [&](auto& v, auto pred) {
@@ -4010,6 +4089,12 @@ int SpellSystem::FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionO
   sweep(winds, [&](const SpellFilter& f, const WindPrim& o) {
     return FilterRefuses(f, o.x, o.y, o.z, 0, 5);
   });
+  // A strike is refused at its AIM (a `lightning null` ward over a village
+  // turns a bolt called on it away; the target search cannot reach past it).
+  if (strikes)
+    sweep(*strikes, [&](const SpellFilter& f, const SpellStrike& o) {
+      return FilterRefuses(f, o.x, o.y, o.z, 0, 6);
+    });
   return n;
 }
 
