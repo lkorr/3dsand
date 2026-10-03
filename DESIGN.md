@@ -1145,7 +1145,10 @@ SSBO lists of chunk indices.
     So every probe reads `reposeSnap` (`world.h`'s `kReposeSnap*` block): **one
     bit per voxel, "a powder could drop into this cell", taken at TICK START**
     by the `reposesnap` prepass and read by the CA behind a barrier the pass
-    table generates. A snapshot bit is the same in every run of the same tick by
+    table generates. (Since 2026-10-03 a dirty chunk's OWN record is written
+    by `camask` on substep 0, from the voxels it reads anyway, and the prepass
+    fills only the ring members that are not themselves dirty -- §"The CA
+    dispatches cells, not chunks".) A snapshot bit is the same in every run of the same tick by
     construction. It is a side table per design guideline 2 — derived, not
     hashed, not saved — and it is deliberately **stale**: a drop that fills in mid-tick still
     reads open, the grain slides toward it, the ordinary `tryMove` refuses
@@ -6234,8 +6237,9 @@ neighbors, so this needs an explicit connectivity pass:
   0.4..2.4 a colour, and paid a whole gather (36 mask rows, three barriers)
   per colour; pack-2 workgroups ran ~15 cells on 128 threads; and the
   dispatch was sized for the whole dirty list.
-  What changed (sim_step.wgsl `camask` / `calist` / `main`, pass_table
-  `caList` / `caList1`, `CaArgs` at binding 54, the caMask buffer's tail):
+  What changed (sim_step.wgsl `camask` / `calist` / `main` / `reposesnap`,
+  pass_table `caList` / `caList1` and the moved `reposeSnap`, `CaArgs` at
+  binding 54, the caMask buffer's tail):
   1. **Per-colour work lists.** camask records which of the 27 colours a
      chunk has any cell in; `calist` (27 workgroups, one blocked prefix sum
      each) builds colour k's chunk list and its indirect args, and colour k's
@@ -6265,9 +6269,20 @@ neighbors, so this needs an explicit connectivity pass:
   -> 7.55 ms (pool), frame p50 30.30 -> 25.61 ms. camask grew 1.04 -> 1.72
   (both rows, per-frame us units of the pass table) for the counting and the
   scatter; `calist` is 0.03 a row.
-  Not taken: skipping `reposeSnap` (now ~12% of the CA rows) for chunks with
-  no repose-carrying powder is NOT exact -- a reaction can make a powder
-  mid-tick (ash) that runs its repose probe on substep 1.
+  3. **camask publishes each dirty chunk's own repose snapshot.** The
+     `reposeSnap` prepass (then ~12% of the CA rows) filled every dirty
+     chunk's ring, and ring member 0 -- the chunk itself, always its own
+     owner -- meant re-reading 4,096 voxels camask reads anyway. Substep 0's
+     camask now writes that record (a fourth shared plane: solid or powder =
+     blocker) and `reposesnap` skips member 0; the row moved after
+     `caMask` / `caList` (no voxel writer between its old place and the new
+     one). reposeSnap 2.07 -> 1.02, camask +0.04, CA 7.55 -> 7.10 ms, p50
+     25.08 ms, hash unchanged.
+  Not taken: skipping `reposeSnap` entirely for chunks with no
+  repose-carrying powder is NOT exact -- a reaction can make a powder mid-tick
+  (ash) that runs its repose probe on substep 1. Keeping each thread's cell
+  kinds in registers and reserving its pool run once (six shared atomics
+  instead of one per cell) measured no better (camask 1.72 -> 1.80).
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

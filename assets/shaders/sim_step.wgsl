@@ -1686,9 +1686,13 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
   let cwc = slotWorldChunk(centre, T.origin);
 
   // PASS 0: which ring members are OURS (one thread each, then shared).
+  // Member 0 -- this chunk itself, always its own owner -- is published by
+  // camask (substep 0) from the voxels it reads anyway, so it is never ours
+  // here (THE CHUNK'S OWN REPOSE SNAPSHOT, 2026-10-03).
   if (li < REPOSE_RING) {
     var owned = false;
-    if (isTicket) { owned = reposeRingOwnedT(cwc, li); }
+    if (li == 0u) { owned = false; }
+    else if (isTicket) { owned = reposeRingOwnedT(cwc, li); }
     else { owned = reposeRingOwned(cx, cy, cz, li); }
     wgReposeOwned[li] = select(0u, 1u, owned);
   }
@@ -4521,6 +4525,10 @@ fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
 var<workgroup> wgCaMask : array<atomic<u32>, 384>;   // 3 planes x CA_MASK_WORDS
 var<workgroup> wgCaEmit : atomic<u32>;
 var<workgroup> wgCaCol : atomic<u32>;   // the 27-colour work word (CA_WORK_COL0)
+// The repose snapshot's BLOCKERS (solid or powder) of this chunk, one bit per
+// cell: substep 0 publishes ~this as the chunk's own reposeSnap record (see
+// "THE CHUNK'S OWN REPOSE SNAPSHOT" below).
+var<workgroup> wgCaBlk : array<atomic<u32>, 128>;
 // The SPARSE colours (THE COLOUR WORK LISTS): this chunk's cell count per
 // (colour, kind), the colours whose cells go to the pool, each such colour's
 // reserved pool range (gas, rest) and the scatter cursors into it.
@@ -4542,6 +4550,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // flow, and a storage load is not uniform to the compiler.
   let sentinel = (e & PT_SENTINEL_BIT) != 0u;
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) { atomicStore(&wgCaMask[k], 0u); }
+  if (li < CA_MASK_WORDS) { atomicStore(&wgCaBlk[li], 0u); }
   if (li < 81u) { atomicStore(&wgColCnt[li], 0u); }
   if (li < 54u) { atomicStore(&wgColCur[li], 0u); }
   if (li == 0u) {
@@ -4578,6 +4587,9 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
         atomicOr(&wgCaMask[i >> 5u], bit);
         let m = materials[mat];
         if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { atomicOr(&wgCaEmit, 1u); }
+        if (m.klass == CLASS_SOLID || m.klass == CLASS_POWDER) {
+          atomicOr(&wgCaBlk[i >> 5u], bit);
+        }
         var inc = 1u << 8u;
         if (m.klass == CLASS_GAS) {
           atomicOr(&wgCaMask[CA_MASK_WORDS + (i >> 5u)], bit);
@@ -4674,6 +4686,22 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
       if (sg != 0u) { atomicAdd(&gasSpawn[GAS_SP_CA_GAS], sg); }
       if (so != 0u) { atomicAdd(&gasSpawn[GAS_SP_CA_OTHER], so); }
     }
+  }
+  // THE CHUNK'S OWN REPOSE SNAPSHOT (2026-10-03, ca-chunk-overhead). The
+  // reposeSnap prepass fills, for every dirty chunk, the open bits of its
+  // ring -- the chunk itself and nine neighbours -- and the chunk ITSELF is
+  // always its own owner (ring offset 0), so it re-read all 4,096 voxels of
+  // every dirty chunk that this pass has just read. Substep 0 publishes that
+  // record here instead, from the same voxels (no row between the two writes
+  // a voxel; reposeSnap now runs after caMask) with the same predicate,
+  // reposeSnapOpenMat: open = not solid and not powder. reposesnap skips ring
+  // member 0. Written whether or not the prepass is recorded this tick: a
+  // valid snapshot nobody reads costs 512 bytes.
+  if (P.substep == 0u && li < CA_MASK_WORDS) {
+    var open = ~atomicLoad(&wgCaBlk[li]);
+    if (sentinel) { open = select(0u, 0xFFFFFFFFu, reposeSnapOpenMat(e & PT_MAT_MASK)); }
+    reposeSnap[ci * CA_MASK_WORDS + li] = open;
+    if (li == 0u) { reposeSnap[REPOSE_SNAP_TICK_BASE + ci] = reposeSnapStamp(); }
   }
   // THE SCATTER: each sparse cell into the range its colour reserved in the
   // pool of its kind (gas, or the rest). Re-read from the mask planes

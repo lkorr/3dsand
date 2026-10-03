@@ -400,10 +400,9 @@ PASS(solPour, "solute(want+alloc)", PT_TICK, PIPE_SOL_POUR, K_COMPUTE, 1,1,1,
 // writes it; `reposesnap` only asks what material a cell holds. No A(DirtyOut),
 // no A(PageFaults), no A(Support) -- it stores no voxel, which is what keeps
 // this row from adding a WAW edge to the 54 CA iterations behind it.
-PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPATCHARGS,0,0,
-     GRP_SIM, DYN_ZERO, C_REPOSE, 1,
-     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
-          R(PageTable) W(ReposeSnap)))
+// MOVED 2026-10-03 (ca-chunk-overhead): the row now runs AFTER caMask /
+// caList, just before the colour rows -- see the note there. No row between
+// its old place and this one writes a voxel, so it snapshots the same state.
 
 // ---- THE RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl) ----------
 // Before the CA, after every mutation of the tick: one thread per texel of the
@@ -530,7 +529,7 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
           U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
-          A(GasSpawn) R(FluidBlockMap) A(CaArgs)))
+          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap)))
 // THE COLOUR LISTS (2026-10-03, ca-chunk-overhead; sim_step.wgsl calist): one
 // workgroup per colour turns the caMask row's per-chunk colour words into
 // colour k's chunk list + count (caMask's tail) and colour k's indirect args
@@ -539,6 +538,18 @@ PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DI
 // dispatched at all. RW(CaMask): reads the colour words, writes the lists.
 PASS(caList, "ca(54 color x substep)", PT_TICK, PIPE_CA_LIST, K_COMPUTE, 27,1,1, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(RW(CaMask) R(ArgsStage) R(DirtyList) A(CaArgs)))
+// THE REPOSE SNAPSHOT'S PREPASS, here since 2026-10-03 (its description is at
+// its old place above, by the rain map). camask now publishes every dirty
+// chunk's OWN record on substep 0 from the voxels it already reads, so this
+// row fills only ring members that are not themselves dirty -- and has to run
+// after caMask for the two to divide the ring that way (W(ReposeSnap) on the
+// caMask rows below).
+// read-only in practice: `voxels` is read_write for the module because `main`
+// writes it; `reposesnap` only asks what material a cell holds.
+PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_REPOSE, 1,
+     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
+          R(PageTable) W(ReposeSnap)))
 // read-only in practice: `reposeSnap` and `caMask` are read_write for the
 // module because `reposesnap` / `camask` / `calist` write them; `main` only
 // reads both. I(CaArgs): iteration k dispatches from caList's record k.
@@ -553,7 +564,7 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
           U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
-          A(GasSpawn) R(FluidBlockMap) A(CaArgs)))
+          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap)))
 // Substep 1's colour lists, from caMask1's words (as caList above).
 PASS(caList1, "ca(54 color x substep)", PT_TICK, PIPE_CA_LIST, K_COMPUTE, 27,1,1, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(RW(CaMask) R(ArgsStage) R(DirtyList) A(CaArgs)))
