@@ -123,6 +123,9 @@ long-lived condition that skips `keepAwake` interacts with this. Reproduce in
 
 ### `mob`
 
+**RESOLVED 2026-10-03** (see that dated section): the probe never uploaded the
+micro bricks, so every model built after boot drew nothing. History below.
+
 ```
 micro body render: FAIL (10 micro slots, 7/14 views drew, ...,
                          0 cube instances from micro limbs)
@@ -906,3 +909,59 @@ because of intentional world/sim changes since then, and they were re-pinned
 here with `--vk-smoke --rebaseline` and `--vk-smoke-loud --rebaseline`. The final
 `--suite acceptance` (24.6 min) ran on this tree before the hand pins: 0
 page faults, 4 new reds recorded above, everything else green or known.
+
+## 2026-10-03 — red-bodies triage (worktree off c364516; `determinismHash` not touched)
+
+The bodies/gore reds from the 10-01 list, measured standalone (`--verify` of
+the seven) and in ONE kOrder-prefix `--verify` through `pool-human` (329 gates,
+27 min). Test-side changes only; no engine code moved, so no hash moved by it.
+
+- **`mob` FIXED (flipped to pass).** micro body render never called
+  `Simulation::UploadMicroBodies`: bricks go up at boot and then only from the
+  frame loop's dirty check, so every model built after boot (the critter's own
+  limbs, its severed leg) was marched from a GPU record nobody wrote. Parking
+  each instance alone: models 449..458 drew 0 px at the frame centre from every
+  direction, boot-time model 51 drew 1,900-2,900. The probe also had two holes:
+  the critter sweep's below eyes sit in the ground (now reported, not asserted;
+  the solo probe covers those octants), and the solo probe passed views from
+  above on ~4,000 pixels that changed elsewhere in the frame (it now aims at the
+  brick centre and counts the central 128x128). Now 11/11 + 3 underground,
+  solo 14/14 (min 1,762 px).
+- **`armor-react` still red, reclassified.** The bath's two creatures had no
+  behaviour profile and WALKED (legacy wander, ~2 vox/tick) off the 17-voxel
+  pad while the acid, poured around each root every tick, followed them; the
+  plated one lost a foot, crawled, lay in pooled acid and died at t+51. Pinned
+  with the `dummy` profile (W2-O's fix for the impact gates). Standing still,
+  the plate is untouched (6720 -> 6720) and the plated torso still loses 6.9%
+  (416 of 2038 skin): 283 in the bottom fifth, 116 in the top fifth, 17 in the
+  middle three, with the bath poured to y 198 against a torso at 194.4..198.6.
+  The acid enters at the waist and the neck/arm openings of a fully submerged
+  torso, and it is ~15x more potent on flesh than when the <1% bound was set
+  (the bare control loses 1,486 skin and dies at t+31; the gate's own note
+  measured 103 in 120 ticks). The bound encodes a rate that no longer holds;
+  NOT loosened. Owner call: shallower bath, a bound on the middle bands only,
+  or a plate that closes at the waist.
+- **`rig-clip` still red, authored content.** Every failing pair names
+  `item:sword` (in the torso, the hips, or the wielder's own forearm, 13-314
+  vox) and ikMiss/shoulderClamp/roundTrip read 0.00: keyed frames (63a9e19)
+  are slerped poses that no keep-out touches. Re-author the frames or add a
+  blade-vs-body keep-out to the keyed path — both owner decisions.
+- **`pool-human` still red at suite scope, passes standalone.** The runner's
+  leak line now reports the art palette: 222 after load, hair-tuck +14, undead
+  +5, zombify +14 -> 255 by gate 157. Also a capacity limit: the 20 pool
+  bodies hold 122 distinct colours (`bake_human_pool.mjs --dry`). Options in
+  `_poolHumanKnown_about`; no change. pool-human no longer leaves its spawn.
+- **`corpse-head-laser`, `player-corpse`: pass standalone AND in the kOrder
+  prefix** (hair turn 0.000; D woke 1), but the 10-01 reds were at `--suite
+  acceptance` scope (both vk smokes run first in the same process), which was
+  not re-run, so both stay recorded fail. The hair chooser now ignores runtime
+  defs (none were candidates in the prefix, so this is hardening, not the
+  cause).
+- **`corpse-bleed`: passes** standalone and in the prefix (head off=1); the
+  09-30 red is gone. It has no baseline entry, so nothing to flip.
+
+Seen in the prefix run and NOT in this package's scope (recorded `pass`, red at
+prefix scope at c364516): `evaporation`, `rain-stain` (OIL OVER: oil 0 at
+t120), `venom-blade` (arm C seeded nothing; passes standalone), `vessel-grid`,
+and the `determinism` pin (b2514936 -> 5c3ea9ad with the twice-run comparison
+passing — a moved pin, not a determinism failure).
