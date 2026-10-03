@@ -906,3 +906,26 @@ because of intentional world/sim changes since then, and they were re-pinned
 here with `--vk-smoke --rebaseline` and `--vk-smoke-loud --rebaseline`. The final
 `--suite acceptance` (24.6 min) ran on this tree before the hand pins: 0
 page faults, 4 new reds recorded above, everything else green or known.
+
+## 2026-10-03 — det-cpu: fetch cache at the fixed latency, deterministic Jolt ids
+
+- `village-twice` (new, `pass`): the Harrowby morning (harrowby.twiceTicks
+  = 900) twice in one process, every Jolt body paired across the runs by
+  creation ordinal. Before the fix it named the 2026-09-29 hinge divergence:
+  identical body states under other Jolt ids until the door leaf's first
+  contact solve (tick 422). After it: trace, states and handles identical.
+- `village-harrowby` -> `fail` (known): the fetch cache now lands at K=4
+  ticks, the day is perturbed, and Edric is left at the longhouse loft edge
+  walking straight at the stair-bottom waynode across a 16-voxel drop (13:00
+  and 17:00 rows). Cache vs grid around his feet: 0 stale cells; the fetch
+  FIFO is not starved. A navigation gap exposed by a different trajectory,
+  not a determinism bug. `SANDVOX_FETCH_LAND_EARLY=1` (the old arm) completes
+  the day. `harrowby.dayTrace` NOT re-pinned (the Jolt id change moves it
+  either way; the orchestrator pins). The day's trace came out the same first
+  in the process and after 1220 ticks of other gates (ee23c5d3bd817e04:15367
+  both): the "three scopes, three traces" leak was the Jolt id history.
+- The runner now calls `Physics::ResetBodyIdHistory()` before every gate, so
+  a gate's Jolt ids no longer depend on the gates before it (rule 7).
+- `tree-fell` passed at `--verify` scope on this tree (0 floating after the
+  burn and the quench); its recorded status is red-world's to change.
+- `--gate determinism`: b2514936, matches the pin.

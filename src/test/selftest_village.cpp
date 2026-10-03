@@ -548,8 +548,77 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
         for (size_t i = 0; i < rs.route.nodes.size(); i++)
           route += (i ? " > " : "") + (rs.route.nodes[i].empty() ? std::string("anchor") : rs.route.nodes[i]) +
                    (i == rs.cursor ? "*" : "");
+        // THE FETCH CACHE AROUND THE FEET vs THE GRID (det-cpu, rule 6): a
+        // walker's footing and the terrain collider read World::Cached, which
+        // is only as fresh as the last fetch of each chunk. A stuck villager
+        // standing on a stale cache is a different bug from one blocked by
+        // real matter, and this names which, with the first differing cell.
+        std::string stale;
+        {
+          const IVec3 fc{(int)std::floor(rs.foot.x), (int)std::floor(rs.foot.y),
+                         (int)std::floor(rs.foot.z)};
+          int compared = 0, missing = 0, staleChunks = 0, cells = 0;
+          std::string first;
+          std::vector<uint32_t> grid(kChunkVol);
+          for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+              for (int dx = -1; dx <= 1; dx++) {
+                const IVec3 wc{FloorDiv16(fc.x) + dx, FloorDiv16(fc.y) + dy, FloorDiv16(fc.z) + dz};
+                if (!c.world.ChunkInWindow(wc)) continue;
+                const CachedChunk* cc = c.world.Cached(wc);
+                if (cc == nullptr || cc->voxels.size() != kChunkVol) {
+                  missing++;
+                  continue;
+                }
+                compared++;
+                ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, grid.data(), "village-stale");
+                int n = 0;
+                for (uint32_t i = 0; i < kChunkVol; i++) {
+                  // durable bits only: the tick stamp / excite scratch move
+                  // every tick and are not what a walker stands on
+                  const uint32_t a = cc->voxels[i] & 0x7F00FFFFu, g = grid[i] & 0x7F00FFFFu;
+                  if ((a & 0xFFFu) == (g & 0xFFFu)) continue;
+                  if (n++ == 0 && first.empty())
+                    first = Format("first (%d,%d,%d) cached mat %u, grid mat %u, chunk v%u",
+                                   wc.x * 16 + (int)(i % 16), wc.y * 16 + (int)((i / 16) % 16),
+                                   wc.z * 16 + (int)(i / 256), a & 0xFFFu, g & 0xFFFu, cc->version);
+                }
+                if (n) staleChunks++;
+                cells += n;
+              }
+          stale = Format(" [cache vs grid around the feet at tick %u: %d chunks compared, %d uncached, %d stale, "
+                         "%d cells of other material%s%s] [%s]",
+                         c.world.TicksEncoded(), compared, missing, staleChunks, cells, first.empty() ? "" : "; ",
+                         first.c_str(), c.world.FetchReport().c_str());
+          // ...and the ground between the feet and the leg's goal, as the
+          // walker's probe sees it: one column per voxel step, feet-3..feet+3
+          // bottom to top ('.' air, '#' solid, 'p' powder, '~' liquid,
+          // 'g' gas, '?' uncached).
+          if (rs.cursor < rs.route.pts.size()) {
+            const Vec3 g = rs.route.pts[rs.cursor];
+            const float ddx = g.x - rs.foot.x, ddz = g.z - rs.foot.z;
+            const float len = std::sqrt(ddx * ddx + ddz * ddz);
+            std::string cols;
+            for (int s = 0; s <= 10 && len > 0.0f; s++) {
+              const float t = std::min((float)s, len) / len;
+              const int x = (int)std::floor(rs.foot.x + ddx * t), z = (int)std::floor(rs.foot.z + ddz * t);
+              cols += s ? " " : "";
+              for (int y = fc.y - 3; y <= fc.y + 3; y++) {
+                const CachedChunk* cc = c.world.Cached({FloorDiv16(x), FloorDiv16(y), FloorDiv16(z)});
+                if (cc == nullptr || cc->voxels.size() != kChunkVol) {
+                  cols += '?';
+                  continue;
+                }
+                const uint32_t m = cc->voxels[(size_t)(((z & 15) * 16 + (y & 15)) * 16 + (x & 15))] & 0xFFFu;
+                const uint32_t k = m == 0 || m >= c.mats.size() ? 0xFFu : c.mats[m].gpu.klass;
+                cols += m == 0 ? '.' : k == CLASS_SOLID ? '#' : k == CLASS_POWDER ? 'p' : k == CLASS_LIQUID ? '~' : 'g';
+              }
+            }
+            stale += Format(" [goal (%.1f,%.1f,%.1f) %.1f vox; columns %s]", g.x, g.y, g.z, len, cols.c_str());
+          }
+        }
         out.why.push_back(Format("%02d:%02d: %s never reached its '%s' anchor (%s at %.0f,%.0f,%.0f) "
-                                 "in %d ticks: phase %s, feet at (%.1f,%.1f,%.1f), %.0f vox away%s%s "
+                                 "in %d ticks: phase %s, feet at (%.1f,%.1f,%.1f), %.0f vox away%s%s%s "
                                  "[route %s] [notes %s]",
                                  (b % 1440) / 60, b % 60, n->id.c_str(), rs.activity.c_str(),
                                  rs.anchor.refId.c_str(), rs.anchor.foot.x, rs.anchor.foot.y,
@@ -557,7 +626,7 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
                                  rs.foot.x, rs.foot.y, rs.foot.z,
                                  std::sqrt((rs.foot.x - rs.anchor.foot.x) * (rs.foot.x - rs.anchor.foot.x) +
                                            (rs.foot.z - rs.anchor.foot.z) * (rs.foot.z - rs.anchor.foot.z)),
-                                 rs.note.empty() ? "" : " -- ", rs.note.c_str(), route.c_str(),
+                                 rs.note.empty() ? "" : " -- ", rs.note.c_str(), stale.c_str(), route.c_str(),
                                  [&] {
                                    std::string s;
                                    for (const std::string& x : track[n->id].notes) s += (s.empty() ? "" : " / ") + x;

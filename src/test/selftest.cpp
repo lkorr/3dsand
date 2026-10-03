@@ -1786,6 +1786,14 @@ int Run(Ctx& c, const Options& opt) {
       c.mobs.SetWeatherRain(0u);
       c.mobs.SetRainSlope(0, 0);
       c.mobs.SetDayPhase(0u);
+      // JOLT BODY IDS START FROM A FRESH PROCESS'S STATE (det-cpu 2026-10-03).
+      // Body ids order Jolt's contact solve, and every gate before this one
+      // bumped the per-slot sequence numbers, so the same gate solved its
+      // contacts in another order at suite scope than alone (village-twice
+      // attributed it). Physics allocates the lowest free index, so with the
+      // previous gate's bodies gone this makes the ids this gate gets the
+      // ones it gets standalone. Free slots only: a live body keeps its id.
+      c.phys.ResetBodyIdHistory();
       const IVec3 leakWo = c.world.WindowOrigin();
       const uint32_t leakMobs = c.mobs.MobCount();
       const uint32_t leakDebris = c.debris.BodyCount();
