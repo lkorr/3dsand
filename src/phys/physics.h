@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -753,6 +754,50 @@ class Physics {
   void ResetMeshStats() { meshStats_ = MeshStats{}; }
   void NoteShapeBuildUs(double us) { meshStats_.shapeUs += us; }
   void ResetRunawayProbe() { runaway_ = RunawayProbe{}; }
+  // ---- DETERMINISM ATTRIBUTION (village-twice, det-cpu 2026-10-03) ----------
+  // Every body in the Jolt system, in BodyID order, with the EXACT bits of its
+  // state. A twice-run gate compares two runs tick by tick and names the first
+  // body whose state (or whose handle -- Jolt's sequence number) differs,
+  // instead of reporting "the trace moved". Diagnostics only: a full walk of
+  // the body list under the no-lock interface, never on a frame path.
+  struct BodyStateBits {
+    uint64_t handle = 0;      // Jolt BodyID + 1 (index | sequence << 23)
+    uint16_t layer = 0;       // object layer
+    uint8_t motion = 0;       // EMotionType
+    uint8_t active = 0;
+    uint32_t pos[3] = {}, rot[4] = {}, lin[3] = {}, ang[3] = {};  // float bits
+    uint64_t user = 0;        // Jolt user data
+    // Creation ordinal since the last ResetBirthOrdinals (0 = born before
+    // it): the identity two runs' bodies are matched by, since their Jolt
+    // ids need not agree.
+    uint64_t birth = 0;
+  };
+  void DebugBodyStates(std::vector<BodyStateBits>& out) const;
+  void ResetBirthOrdinals() {
+    birthSeq_ = 0;
+    std::fill(birth_.begin(), birth_.end(), 0ull);
+  }
+  // ---- DETERMINISTIC JOLT BODY IDS (det-cpu 2026-10-03) ---------------------
+  // Jolt's contact constraints are ordered by a key hashed from the two
+  // BodyIDs (index AND sequence number), so the ids are simulation input. Jolt
+  // allocates them from a LIFO free list whose contents depend on the ORDER
+  // bodies were removed in, and bumps a per-slot sequence number forever: a
+  // second identical village morning in one process got the same bodies under
+  // other ids (sequence 2 where the first had 1) and its first door swing came
+  // out 0.014 rad different (gate village-twice). This class therefore picks
+  // every id itself (CreateBodyWithID): the LOWEST free index -- a function of
+  // which bodies are alive, not of removal order -- with a per-index sequence
+  // number that still distinguishes a stale handle from its slot's next body.
+  //
+  // ResetBodyIdHistory zeroes the sequence of every FREE index, so a harness
+  // that has torn every system down (no live handle survives, so none can
+  // alias) starts the next run from the id state a fresh process would have
+  // for the same live set. Never called on a game path.
+  void ResetBodyIdHistory();
+  struct BodyIdAlloc {
+    std::vector<uint8_t> used, seq;   // per Jolt body index
+    uint32_t lowestFree = 0;          // no free index below this
+  };
   // The ceilings every dynamic body this class creates is born with, so a test
   // can assert against the engine's number rather than a copy of it.
   static float MaxBodySpeedVox();
@@ -794,6 +839,16 @@ class Physics {
   // proxies (selftest_phys/selftest_mob do) does not grow this without bound.
   std::vector<uint64_t> playerBodies_;
   std::vector<uint64_t> pendingRelease_;
+  BodyIdAlloc ids_;   // see ResetBodyIdHistory
+  // Creation ordinals by Jolt body INDEX (DebugBodyStates' `birth`).
+  std::vector<uint64_t> birth_;
+  uint64_t birthSeq_ = 0;
+  void NoteBirth(uint32_t indexAndSeq) {
+    if (indexAndSeq == 0xFFFFFFFFu) return;   // BodyID::cInvalidBodyID
+    const uint32_t idx = indexAndSeq & 0x7FFFFFu;
+    if (birth_.size() <= idx) birth_.resize((size_t)idx + 1, 0ull);
+    birth_[idx] = ++birthSeq_;
+  }
   // CarryLayer's from -> to record (Successor). A ring, so it never grows:
   // 1024 rebuilds is far more than can happen between two grab servo ticks,
   // even with a forest fire rebuilding burning bodies.

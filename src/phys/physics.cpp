@@ -269,6 +269,39 @@ float VoxToM(float v) { return v * kVoxelMeters; }
 JPH::BodyID ToBodyID(uint64_t h) { return JPH::BodyID((uint32_t)(h - 1)); }
 uint64_t FromBodyID(JPH::BodyID id) { return (uint64_t)id.GetIndexAndSequenceNumber() + 1; }
 
+// ---- deterministic body ids (Physics::ResetBodyIdHistory, det-cpu) ----------
+// The max-bodies number Physics::Init hands Jolt; an index at or past it is
+// refused by CreateBodyWithID.
+constexpr uint32_t kMaxJoltBodies = 4096;
+// Every body this file creates goes through here instead of Jolt's own id
+// allocator: the lowest free index, its sequence number bumped.
+JPH::BodyID CreateAndAddDet(JPH::BodyInterface& bi, Physics::BodyIdAlloc& a,
+                            const JPH::BodyCreationSettings& bcs,
+                            JPH::EActivation act) {
+  if (a.used.size() < kMaxJoltBodies) {
+    a.used.resize(kMaxJoltBodies, 0);
+    a.seq.resize(kMaxJoltBodies, 0);
+  }
+  uint32_t idx = a.lowestFree;
+  while (idx < kMaxJoltBodies && a.used[idx]) idx++;
+  if (idx >= kMaxJoltBodies) return JPH::BodyID();   // out of bodies, as Jolt
+  const uint8_t s = (uint8_t)(a.seq[idx] + 1);
+  JPH::Body* b = bi.CreateBodyWithID(JPH::BodyID(idx, s), bcs);
+  if (b == nullptr) return JPH::BodyID();
+  a.seq[idx] = s;
+  a.used[idx] = 1;
+  a.lowestFree = idx + 1;
+  bi.AddBody(b->GetID(), act);
+  return b->GetID();
+}
+void FreeDet(Physics::BodyIdAlloc& a, JPH::BodyID id) {
+  const uint32_t idx = id.GetIndex();
+  if (idx >= a.used.size() || !a.used[idx] || a.seq[idx] != id.GetSequenceNumber())
+    return;   // not ours, or a stale handle: the slot's body is someone else
+  a.used[idx] = 0;
+  if (idx < a.lowestFree) a.lowestFree = idx;
+}
+
 // Joint friction, N*m, from the dimensionless JointDesc::friction.
 //
 // The authored number is a fraction of the torque this limb's OWN WEIGHT
@@ -551,7 +584,13 @@ bool Physics::Init() {
   return true;
 }
 
+void Physics::ResetBodyIdHistory() {
+  for (size_t i = 0; i < ids_.used.size(); i++)
+    if (!ids_.used[i]) ids_.seq[i] = 0;
+}
+
 void Physics::Shutdown() {
+  ids_ = BodyIdAlloc{};
   pendingRelease_.clear();
   playerBodies_.clear();
   motionRun_.clear();
@@ -1588,7 +1627,8 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
     bcs.mMotionQuality = JPH::EMotionQuality::LinearCast;  // see note above
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
+  JPH::BodyID id = CreateAndAddDet(bi, ids_, bcs, JPH::EActivation::Activate);
+  NoteBirth(id.GetIndexAndSequenceNumber());
   if (kProfile) {
     const Clock::time_point t3 = Clock::now();
     auto us = [](Clock::time_point a, Clock::time_point b) {
@@ -1653,7 +1693,8 @@ uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
     bcs.mMotionQuality = JPH::EMotionQuality::LinearCast;
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
+  JPH::BodyID id = CreateAndAddDet(bi, ids_, bcs, JPH::EActivation::Activate);
+  NoteBirth(id.GetIndexAndSequenceNumber());
   if (id.IsInvalid()) return 0;
   GuardBodyInertia(id.GetIndexAndSequenceNumber(), "sphere");
   uint64_t h = FromBodyID(id);
@@ -1715,7 +1756,8 @@ uint64_t Physics::AddTerrainShape(TerrainShapeJob& job) {
   bcs.mFriction = CurrentTuning().physics.terrainFriction;
   const auto t0 = std::chrono::steady_clock::now();
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::DontActivate);
+  JPH::BodyID id = CreateAndAddDet(bi, ids_, bcs, JPH::EActivation::DontActivate);
+  NoteBirth(id.GetIndexAndSequenceNumber());
   meshStats_.meshes++;
   meshStats_.tris += job.indices.size() / 3;
   meshStats_.addUs += std::chrono::duration<double, std::micro>(
@@ -1781,7 +1823,8 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   bcs.mFriction = CurrentTuning().physics.playerProxyFriction;
   bcs.mRestitution = 0.0f;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
+  JPH::BodyID id = CreateAndAddDet(bi, ids_, bcs, JPH::EActivation::Activate);
+  NoteBirth(id.GetIndexAndSequenceNumber());
   // NOT in dynamicBodies_: the proxy never despawns and must not receive
   // explosion impulses or WakeNear — the player controller owns its motion.
   if (id.IsInvalid()) return 0;
@@ -2347,6 +2390,46 @@ bool Physics::UsesLinearCast(uint64_t handle) const {
          mp->GetMotionQuality() == JPH::EMotionQuality::LinearCast;
 }
 
+void Physics::DebugBodyStates(std::vector<BodyStateBits>& out) const {
+  out.clear();
+  if (!system_) return;
+  JPH::BodyIDVector ids;
+  system_->GetBodies(ids);
+  std::sort(ids.begin(), ids.end());
+  const JPH::BodyLockInterfaceNoLock& li = system_->GetBodyLockInterfaceNoLock();
+  auto bits = [](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+  };
+  for (const JPH::BodyID& id : ids) {
+    JPH::BodyLockRead lock(li, id);
+    if (!lock.Succeeded()) continue;
+    const JPH::Body& b = lock.GetBody();
+    BodyStateBits s;
+    s.handle = (uint64_t)id.GetIndexAndSequenceNumber() + 1;
+    s.layer = (uint16_t)b.GetObjectLayer();
+    s.motion = (uint8_t)b.GetMotionType();
+    s.active = b.IsActive() ? 1 : 0;
+    const JPH::RVec3 p = b.GetPosition();
+    const JPH::Quat q = b.GetRotation();
+    const JPH::Vec3 lv = b.GetLinearVelocity(), av = b.GetAngularVelocity();
+    for (int k = 0; k < 3; k++) {
+      s.pos[k] = bits((float)p[k]);
+      s.lin[k] = bits(lv[k]);
+      s.ang[k] = bits(av[k]);
+    }
+    s.rot[0] = bits(q.GetX());
+    s.rot[1] = bits(q.GetY());
+    s.rot[2] = bits(q.GetZ());
+    s.rot[3] = bits(q.GetW());
+    s.user = b.GetUserData();
+    const uint32_t idx = id.GetIndex();
+    s.birth = idx < birth_.size() ? birth_[idx] : 0ull;
+    out.push_back(s);
+  }
+}
+
 bool Physics::IsBodyDynamic(uint64_t handle) const {
   if (!system_ || handle == 0) return false;
   const JPH::BodyInterface& bi = system_->GetBodyInterface();
@@ -2904,6 +2987,7 @@ void Physics::RemoveBody(uint64_t handle) {
   const auto tr0 = std::chrono::steady_clock::now();
   bi.RemoveBody(id);
   bi.DestroyBody(id);
+  FreeDet(ids_, id);
   meshStats_.removes++;
   meshStats_.removeUs += std::chrono::duration<double, std::micro>(
                              std::chrono::steady_clock::now() - tr0).count();

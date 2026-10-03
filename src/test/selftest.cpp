@@ -630,6 +630,10 @@ const char* const kOrder[] = {
     // reloads the environment and regenerates the window at the origin it
     // found (the structure gates' exit contract).
     "village-harrowby",
+    // The same morning twice in one process, compared bit for bit with Jolt
+    // body attribution (rule 1's in-process half; det-cpu 2026-10-03). Same
+    // exit contract as `village-harrowby`.
+    "village-twice",
     // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
     // exit contract: mobs and debris reset, id counter restored, park function
     // removed, store cleared, and worldgen regenerated at the origin the gate
