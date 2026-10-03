@@ -312,3 +312,7 @@ per step and move on — `feedback-hash-moves-are-not-regressions`.
   situation the game produces, but something in that path is creating floaters
   rather than clearing them, and that is worth knowing before §4 changes the
   same code.
+  **2026-10-03:** no longer reproduces at gate scope. `--gate tree-fell` at
+  c364516 reads `after a FORCED rescan 0/0/0 (0 vox)`, with the natural burn-out
+  at 0 floating by +1500 and the quench clean at +100. The suite-scope single
+  floater (BASELINE.md 2026-10-01) is still unexplained.
