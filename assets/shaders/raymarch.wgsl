@@ -6751,20 +6751,30 @@ fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
 // face-centre origin and writing the same word. The gather is a function of
 // the FACE, so one pixel per face is enough: the pixels whose hit lies within
 // one pixel footprint of the face centre on both tangent axes (~2x2 of them),
-// plus a 1-in-256 per-pixel lottery so a face whose centre is hidden behind
-// something still refreshes (a face with N visible pixels: 1 - (255/256)^N
-// per due frame). A face read for the first time (`own == 0`) still gathers
-// in every pixel that sees it, exactly as before -- one frame, then cached.
+// plus a 1-in-32 per-pixel lottery so a face whose centre is hidden behind
+// something still refreshes (a face with N visible pixels: 1 - (31/32)^N
+// per due frame). The window is widened by 1/cos of the view angle, so a face
+// seen at a graze -- most of the ground from eye height -- still has its
+// centre pixel. Both were measured against the picture: with a fixed
+// one-footprint window and a 1/256 lottery the GI cache lagged on grazing and
+// half-hidden faces and the meadow camera moved 0.69% of its pixels by
+// >= 16/255 (block-shaped bounce differences); with the cosine and 1/256,
+// 0.15%; with both as shipped, 0.005% -- the re-run floor. A tile-coherent
+// lottery (whole 8x8 tiles, 1/8) was 0.05-0.1 ms cheaper and 0.19% off.
+// A face read for the first time (`own == 0`) still gathers in every pixel
+// that sees it, exactly as before -- one frame, then cached.
 //
 // And ONE CALL SITE: the unstamped-slot path (no cache, a per-pixel gather
 // from the hit) and the cache refresh used to be two inlined copies of the
 // nine-ray loop; they now pick an origin and share one.
 //
-// Measured, --render-budget 1080p, one process (baseline -> this): noon
-// 6.66 -> 6.34 ms, meadow 5.58 -> 5.14, seam 4.61 -> 4.36, seamveg 7.38 ->
-// 7.13. The ceiling (no gather in fs at all) was 6.17 / 4.85 / 4.18 / 6.92:
-// the rest is the loop's register footprint, which only a compute pass over
-// requested faces removes (see giGatherRays).
+// Measured, --render-budget 1080p (per-pixel-everywhere -> this, boots
+// alternated): noon 6.75 -> 6.67 ms, meadow 5.64 -> 5.52, seam 4.75 -> 4.61,
+// seamveg 7.60 -> 7.44. The 1/256 lottery bought twice that (noon -0.27,
+// meadow -0.39) and moved the picture; the ceiling -- no gather in fs at all
+// -- is noon 6.17 / meadow 4.85: the rest is the loop's register footprint
+// plus the warps that still gather, which only a compute pass over requested
+// faces removes (see giGatherRays).
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
   let slot = chunkIndexW(cell);
@@ -6789,9 +6799,18 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
     let ax = face >> 1u;
     let du = select(dc.x, dc.y, ax == 0u);
     let dv = select(dc.z, dc.y, ax == 2u);
-    let fp = max(length(p - R.camPos) * R.tanHalfFov * 2.0 / R.viewPx, 1e-3);
+    // One pixel's footprint on the face: its width at this distance, divided
+    // by the cosine of the view angle so a face seen at a graze (a floor from
+    // eye height, footprint stretched along the view) still has a pixel
+    // inside the window. Unclamped on purpose: a face seen so edge-on that
+    // the window outgrows the block elects every pixel on it, which is the
+    // old behaviour for a face that is only a few pixels tall anyway.
+    let toP = p - R.camPos;
+    let dist = length(toP);
+    let cosV = max(abs(dot(n, toP)) / max(dist, 1e-3), 1e-3);
+    let fp = max(dist * R.tanHalfFov * 2.0 / R.viewPx / cosV, 1e-3);
     let lottery = (pcg(bitcast<u32>(p.x) ^ (bitcast<u32>(p.z) * 747796405u) ^
-                       (bitcast<u32>(p.y) * 2891336453u) ^ R.frameIdx) & 255u) == 0u;
+                       (bitcast<u32>(p.y) * 2891336453u) ^ R.frameIdx) & 31u) == 0u;
     due = (du < fp && dv < fp) || lottery;
   }
   // The origin: the face centre half a voxel past the block's far plane for
