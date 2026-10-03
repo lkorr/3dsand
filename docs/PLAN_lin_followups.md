@@ -242,6 +242,17 @@ shrink by the factor the arm predicted — state the number); `--gate shadow-cac
 `--shader-stats` local memory for the touched pipelines goes to zero or the site is reverted;
 `determinismHash` unmoved; a `--shot` under a tree canopy for the "heavier, calmer" claim.
 
+**Follow-up (2026-10-03, raymarch-shadow-water): the submerged criteria are now met.**
+Measured on the harness lake (`SANDVOX_MAP=harness --render-budget --budget-cams
+submerged`, one process each): the frame was 20.4 ms at c364516 with `godshadow0`
+6.35 ms. The bed caustic's three ripple evaluations became one pass over the bands
+(-0.94 ms), and the per-pixel occlusion rays became the god-ray sun visibility
+volume (`godray_vis.wgsl`, one coarse ray per 4^3 block round the eye, read per
+sample): 19.14 -> 13.04 ms, `godshadow0`'s saving ~0 (the row itself costs ~0.05
+ms). Submerged baseline 13.0 ms < 25, god-ray occlusion < 3 ms. What remains of
+`nogodray` (~2.7 ms) is the 14-sample march itself; the rest of the frame is the
+primary march through the water (67 media cells/px, trace()'s territory).
+
 ### W2-C · Waterfall mist (13.3.1) — WGSL + a shot fixture, no hash
 
 Runs in parallel with W2-B (different functions: `shadeWater`/`shadeSubmerged` region vs

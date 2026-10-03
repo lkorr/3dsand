@@ -13157,6 +13157,23 @@ where you hear from either (§12b, "The ears are on the character").
   body's own voxel payload inside the box to the exact voxel hit** — debris stays
   voxel-crisp instead of marching-cubes-smooth, and reuses the terrain shading
   path. Adopt once bodies carry their voxel payloads (M6).
+- **The god-ray sun visibility volume (2026-10-03; `assets/shaders/godray_vis.wgsl`).**
+  Under water, `godRays` marches 14 samples a pixel and asks at each whether
+  the sun reaches it — one coarse `traceOpaque` per 4^3 block the samples
+  visit, ~7 rays a pixel, which `--render-budget`'s `godshadow0` arm priced at
+  6.3 ms of a 20 ms submerged frame. One per-frame row on the ShadowCache table
+  (`godray_vis`) casts that same coarse ray ONCE per block for a 72x40x72-block
+  grid round the eye (28.8 x 16 x 28.8 m, covering `godRayRange` either side)
+  and `godRays` reads a word per block (render binding 38). The ray starts at
+  the block centre instead of at whichever sample first entered the block;
+  because the march is coarse from its first step that changes only grazing
+  rays, and neighbouring pixels no longer disagree about one block. A sample
+  outside the grid, or a frame the volume was not built (stamp word 0 !=
+  this frame — the kernel builds only when the eye's voxel is a liquid and
+  the sun is up), casts its own ray as before, so the volume is a cache and
+  never a clip. Measured, harness lake, in one process: 19.14 -> 13.04 ms;
+  the row costs ~0.05 ms submerged and one voxel read per thread when dry.
+  Render-only derived data, never hashed or saved.
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per

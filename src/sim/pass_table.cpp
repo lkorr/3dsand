@@ -26,6 +26,8 @@ static_assert(kRainFallGroupsFlat == 64, "RecordCtx::rainFallGroups' default");
 // occupancy word, 64 per group, and a group never straddles two levels.
 static_assert((kFarNumChunks % 64u) == 0u, "skyTopReduce groups straddle levels");
 constexpr uint32_t kSkyTopGroups = kFarLevels * kFarNumChunks / 64;
+// godray_vis.wgsl: one thread per block of its GV_NX x GV_NY x GV_NZ volume.
+constexpr uint32_t kGodVisGroups = (pass::kGodVisBlocks + 63) / 64;
 }  // namespace
 
 namespace pass {
@@ -95,6 +97,7 @@ namespace {
 #define PIPE_RAY_START_MIN   Pipe::RayStartMin
 #define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
 #define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
+#define PIPE_GODRAY_VIS      Pipe::GodrayVis
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn

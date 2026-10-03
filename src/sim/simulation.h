@@ -991,6 +991,8 @@ class Simulation {
   rhi::ComputePipeline rainMapPrep_, rainMapBuild_;
   // The gust streaks' update (wind_streak.wgsl `update`, per-frame table).
   rhi::ComputePipeline windStreak_;
+  // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
+  rhi::ComputePipeline godrayVis_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -1143,6 +1145,10 @@ class Simulation {
   rhi::Buffer rayStartBuf_;
   // The gust streaks' fixed particle pool (world.h kWindStreakCap).
   rhi::Buffer windStreakBuf_;
+  // The god-ray sun visibility volume (godray_vis.wgsl; pass_table.h
+  // kGodVis*): fixed size, made at Init. 27 in shadowBGL_ (compute, written),
+  // 38 in renderBGL_ (fragment, read).
+  rhi::Buffer godVisBuf_;
   // The buffer EnsureRayStart last replaced, kept alive one growth longer
   // because the frame that grew it had already recorded the prepass against it.
   rhi::Buffer rayStartPrev_;

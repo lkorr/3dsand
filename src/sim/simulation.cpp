@@ -731,6 +731,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // descriptors per render bind group (descriptor pool: rhi_vulkan.h).
         entry(36, T::ReadOnlyStorage, S::Vertex),                 // heatPool
         entry(37, T::ReadOnlyStorage, S::Vertex),                 // heatMeta
+        // THE GOD-RAY SUN VISIBILITY VOLUME (godray_vis.wgsl): per 4^3 block
+        // round the eye, does the sun reach it. Written by the ShadowCache
+        // table's godray_vis row in the same command buffer, read by godRays
+        // here; BeginRendering's flush is the compute->fragment barrier.
+        entry(38, T::ReadOnlyStorage, S::Fragment),               // godVis
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -955,6 +960,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       const std::vector<uint32_t> zero((size_t)words, 0u);
       device.GetQueue().WriteBuffer(rainMapBuf_, 0, zero.data(), words * 4);
     }
+    // The god-ray sun visibility volume: fixed, zeroed (a zero stamp is "not
+    // built this frame", so godRays casts its own rays until the row runs).
+    {
+      const uint64_t words = pass::kGodVisHeaderWords + pass::kGodVisBlocks;
+      godVisBuf_ = CreateBuffer(device, words * 4, U::Storage, "godVis");
+      const std::vector<uint32_t> zero((size_t)words, 0u);
+      device.GetQueue().WriteBuffer(godVisBuf_, 0, zero.data(), words * 4);
+    }
     // The gust streak pool: fixed, zeroed (lifetime 0 = never spawned).
     {
       const uint64_t words = (1ull + (uint64_t)kWindStreakCap * kWindStreakStride) * 4ull;
@@ -1036,6 +1049,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // R(HeatPool) R(HeatMeta), which orders it after the tick's writers.
         entry(25, T::ReadOnlyStorage), // heatPool
         entry(26, T::ReadOnlyStorage), // heatMeta
+        // The god-ray sun visibility volume (godray_vis.wgsl): written by its
+        // per-frame row, read by the raymarch at renderBGL_ 38.
+        entry(27, T::Storage),         // godVis
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1953,6 +1969,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mRayStart;
   // The rain shadow map (rain_map.wgsl): two per-frame entries on shadowPL_.
   rhi::ShaderModule mRainMap;
+  // The god-ray sun visibility volume (godray_vis.wgsl): one per-frame entry
+  // on shadowPL_.
+  rhi::ShaderModule mGodVis;
   rhi::ShaderModule mWindStreak;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
@@ -1984,6 +2003,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mSkyTop, "sky_top.wgsl");
     mod(&mRayStart, "ray_start.wgsl");
     mod(&mRainMap, "rain_map.wgsl");
+    mod(&mGodVis, "godray_vis.wgsl");
     mod(&mWindStreak, "wind_streak.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
@@ -2007,7 +2027,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart || !mRainMap || !mWindStreak) {
+      !mRayStart || !mRainMap || !mWindStreak || !mGodVis) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -2060,6 +2080,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
   pool.Add([&] { rainMapPrep_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapPrep", "rainMapPrep"); });
   pool.Add([&] { rainMapBuild_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapBuild", "rainMapBuild"); });
+  pool.Add([&] { godrayVis_ = MakeComputePipeline(device, shadowPL_, mGodVis, "godrayVis", "godrayVis"); });
   pool.Add([&] { windStreak_ = MakeComputePipeline(device, shadowPL_, mWindStreak, "update", "windStreak"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
@@ -2533,6 +2554,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowHist:          return world_->shadowHist;
     case B::RayStart:            return rayStartBuf_;
     case B::RainMap:             return rainMapBuf_;
+    case B::GodVis:              return godVisBuf_;
     case B::RainExpo:            return rainExpoBuf_;
     case B::Draft:               return draftBuf_;
     case B::DraftMeta:           return draftMetaBuf_;
@@ -2654,6 +2676,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::RainMapPrep:    return rainMapPrep_;
     case P::RainMapBuild:   return rainMapBuild_;
     case P::WindStreak:     return windStreak_;
+    case P::GodrayVis:      return godrayVis_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -3699,6 +3722,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(35, draftBuf_),
         b(36, world_->heatPool),
         b(37, world_->heatMeta),
+        b(38, godVisBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3793,6 +3817,7 @@ void Simulation::BuildShadowBindGroup() {
       b(24, draftBuf_),
       b(25, world_->heatPool),
       b(26, world_->heatMeta),
+      b(27, godVisBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

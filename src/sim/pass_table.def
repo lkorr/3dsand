@@ -1475,6 +1475,17 @@ PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))
+// ---- THE GOD-RAY SUN VISIBILITY VOLUME (assets/shaders/godray_vis.wgsl) ----
+// One coarse occlusion ray toward the sun per 4^3 block round the eye, so the
+// under-water god-ray march (raymarch.wgsl godRays) reads a word per block
+// instead of casting ~7 rays per pixel. Per FRAME (a function of the camera
+// and the sun); C_ALWAYS because the kernel itself decides whether the eye is
+// in a liquid and every thread returns after one voxel read when it is not —
+// a CPU condition would need a readback the frame path may not take. The
+// fragment read is BeginRendering's flush, as for RayStart.
+PASS(godray_vis, "godrayVis", PT_SHADOWCACHE, PIPE_GODRAY_VIS, K_COMPUTE, kGodVisGroups,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable) W(GodVis)))
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
      GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))

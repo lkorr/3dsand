@@ -189,6 +189,18 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 // drawn) and the near-field wet shading. Trusted only when its header is this
 // frame's (rainMapHeader) -- otherwise both fall back to the openness path.
 @group(0) @binding(34) var<storage, read> rainMap : array<u32>;
+// ---- THE GOD-RAY SUN VISIBILITY VOLUME (godray_vis.wgsl) ---------------------
+// Per 4^3 block round the eye, whether the sun reaches it: the occlusion ray
+// godRays used to cast per pixel, cast once per block by the ShadowCache
+// table's godray_vis row. Trusted only when its stamp is this frame's
+// (godVisLive) -- otherwise godRays casts its own rays as it always did.
+@group(0) @binding(38) var<storage, read> godVis : array<u32>;
+const GV_NX : i32 = 72;                     // godray_vis.wgsl agrees
+const GV_NY : i32 = 40;                     // godray_vis.wgsl agrees
+const GV_NZ : i32 = 72;                     // godray_vis.wgsl agrees
+const GV_HEADER : u32 = 1u;                 // godray_vis.wgsl agrees
+const GV_VALID : u32 = 0x80000000u;         // godray_vis.wgsl agrees
+const GV_DARK : u32 = 2u;                   // godray_vis.wgsl agrees
 // world.h's kSol* values (scripts/check_invariants.py `solute` checks these
 // against world.h too -- they are NOT the sim's MIRROR block, which needs
 // atomics and solMeta that a fragment stage must not bind).
@@ -8325,6 +8337,12 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
   // to band or crawl, just the same ray not cast again.
   var occBlock = vec3<i32>(0x7FFFFFFF);
   var occHit = false;
+  // The per-block answers, when this frame built them (godray_vis.wgsl). The
+  // volume's corner, as an offset subtracted from each block below; the
+  // stamp test folds into it so a frame without a volume tests one compare.
+  let gvLive = godVis[0] == ((R.frameIdx & 0x7FFFFFFFu) | GV_VALID);
+  let gvLo = (vec3<i32>(floor(R.camPos)) >> vec3<u32>(SUBOCC_SHIFT)) -
+             vec3<i32>(GV_NX / 2, GV_NY / 2, GV_NZ / 2);
 
   var acc = 0.0;
   for (var i = 0; i < steps; i++) {
@@ -8365,11 +8383,21 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     // which is a separate term and is not affected.
     let blk = c >> vec3<u32>(SUBOCC_SHIFT);
     if (any(blk != occBlock)) {
-      let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 0.0,
-                          &occupancy, &materials);
-      rsAdd(RS_GODRAY, s.steps);
+      // THE VOLUME FIRST (godray_vis.wgsl): the same coarse ray, cast once per
+      // block for every pixel instead of once per block per pixel. Outside the
+      // volume, or on a frame it was not built, the pixel casts it itself.
+      let lb = blk - gvLo;
+      if (gvLive && all(lb >= vec3<i32>(0)) &&
+          all(lb < vec3<i32>(GV_NX, GV_NY, GV_NZ))) {
+        occHit = godVis[GV_HEADER + u32((lb.z * GV_NY + lb.y) * GV_NX + lb.x)] ==
+                 GV_DARK;
+      } else {
+        let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 0.0,
+                            &occupancy, &materials);
+        rsAdd(RS_GODRAY, s.steps);
+        occHit = s.hit;
+      }
       occBlock = blk;
-      occHit = s.hit;
     }
     if (occHit) { continue; }
 
