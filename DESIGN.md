@@ -2057,9 +2057,9 @@ pool). last_run.json `heat`: pool peak, refusals, firings.
 **What it is.** A TRANSIENT potential `P` (u16) per conducting cell, in a
 sparse per-chunk page pool beside the voxels (design guideline 2: the word is
 full). Not hashed, not saved, not replicated: a pure function of the voxels and
-the tick inputs, so a replay reproduces it; worldgen and load zero it. E1 has
-NO consumer -- the world hash does not move -- and E2 (CA effects), E4 (mob
-shock) and E5 (the glow) read it.
+the tick inputs, so a replay reproduces it; worldgen and load zero it. The CA
+reads it (E2, "What charge does" below -- which is where the world hash moved),
+as do E4 (mob shock) and E5 (the glow).
 
 **Material data** (`materials.json "electric"`, `ParseElectric`): `resist`
 1..254 is the potential a cell costs to enter (no block = insulator), `source`
@@ -2122,6 +2122,89 @@ a water pool charges >= 300 cells and never its far corner; every page is freed
 after the sparks stop and the fixture sleeps; the field hash and arrival tick
 agree across the two runs. E3's strike targeting (`StrikeMats::Resolve`) now
 reads `electric.resist <= 8` as "a conductor a bolt prefers".
+
+**What charge does (2026-10-03, package E2; `sim_step.wgsl` "E2: WHAT CHARGE
+DOES IN THE CA", gates `elec-electrolysis` / `elec-ignite` /
+`elec-crackle-bounded`).** Three effects, every one reading only the cell's
+OWN settled P (last tick's field, stable over the whole CA) and writing the
+cell or one face, so the colour lattice's reach-1 argument covers them
+unchanged. The CA binds `elecParams` (57) for E2's header words and the
+per-material ignite / char words; the ca rows carry `R(ElecPool) A(ElecMeta)
+R(ElecParams)`.
+
+1. **The charge as partner** (doReactions, RK_PAIR, after the six faces and
+   the coat -- the coat's own position in the rule walk, and the same "one
+   roll per rule per tick"). A rule whose neighbour is `tag:electric` (any
+   material of the tag, gas allowed; the tag bit is derived from the table at
+   upload, `ElecTagMask`) that found no partner at a face or in the coat is
+   satisfied by the cell's own P when P >= `sim.elecReactMin` (16), at the
+   authored chance (weather-scaled as usual) x min(P, `sim.elecReactFull`) /
+   elecReactFull (1,000). The discharge side's product goes into the first AIR
+   face (RNG-rotated, the rule's direction mask) or is lost -- the bench's
+   Deposit; the self product is written as for any pair. Every authored
+   electric rule therefore fires INSIDE a charged pool with no JSON edit:
+   molten salt -> sodium + chlorine, brine -> lye / hydrogen + chlorine (the
+   solute gate still applies, so fresh water does nothing), thermite, ether
+   vapour, hydrogen's pop. Only a conductor (or a wet cell) reads the field;
+   gases and powders are insulators, so hydrogen, thermite and gunpowder still
+   need a real discharge beside them (a crackle spark will do). This is also
+   the fix for the pool-top parity miss (`selftest_chem.cpp`, "WHY THREE"): a
+   spark over a y = 2 (mod 3) pool rises before the pool cell's phase looks,
+   but its charge is already in the pool, and the pool cell reacts with that.
+   Not for a synthesized (excited-fluid) self -- air holds no charge -- and not
+   for a cell its quenching coat covers (rule 3 of the coat).
+2. **Ohmic ignition / char** (`elecReact`, after the bucket like heatReact; a
+   conductor with no bucket -- copper, iron -- reaches it from caCell, the one
+   exception to the inert-solid early return). E = P x the cell's resist (the
+   wet rule included: a wet plank conducts better and heats less); chance =
+   min(`electric.ignite.chance`, E x `sim.elecIgniteGain`), x (air faces +
+   2) / 8 as heatReact's frontier. With an air face the cell becomes
+   `ignite.into`; with none, its `char` product at 2/8 of the cap. Copper's
+   resist 1 makes E negligible: it never heats. Authored: every wood (wood,
+   birch, staff, both barks, plank, timber, door) ignites to `ember` (300
+   per-mille cap) or chars to `charcoal`; skin, bruised skin, flesh and muscle
+   to `flesh_cooked` (120) or `flesh_charred`. Leaves, grass, cloth and hay
+   carry no `resist` (dry, they do not conduct: giving them one would let one
+   bolt charge a meadow 250 cells wide), so they burn the ordinary way -- from
+   the arcs and sparks a strike and a crackle throw, and from the fire the wood
+   makes. Numbers at the default gain 0.35: dry wood beside a spark (P ~140)
+   ~2.5 per-mille a tick with five air faces, about 2% over a spark's charge;
+   beside lightning (P ~29,900) the cap at once.
+3. **Crackle** (`elecReact`). A charged conductor with an air face throws
+   `spark` into it (P >= `sim.elecCrackleSparkP`, 400) or `arc` (P >=
+   `sim.elecCrackleArcP`, 6,000) at (P - threshold) x `sim.elecCrackle` (0.6
+   per-mille per 1,000), capped at 100 per-mille a cell. Visible, and it lights
+   what burns beside it through the spark's / arc's own rules. **Bounded, by
+   construction:** each threshold is raised on upload to the emitted
+   material's own `source` + 1 (`ElecCrackleThreshold`), and the field is a
+   MAX, never a sum, so the most P a crackle can give any conductor is
+   source - 1 < the threshold that emitted it. A crackle can never sustain
+   crackling; it dies with the real source's charge (which falls
+   `sim.elecDecay` a tick), then the last arc's 1,999 (sparks only), then the
+   last spark's 199 (nothing). The gate proves it with lightning on a copper
+   bar: arcs while fed, nothing once the pages are back. Arc-tier crackle on a
+   lightning-struck conductor at the default decay 8 lasts ~3,000 ticks --
+   the field's own fade time, not the crackle's.
+
+4. **A discharge does not drift.** A gas that is an electric source (spark,
+   arc, lightning: `_r2` bit 25) never moves in the CA; it lives its tick or
+   two where it struck (its decay rule still runs). A spark does not float,
+   and a drifting one was the other half of the pool-top miss: laid on a
+   y = 2 (mod 3) pool it rose before the pool looked AND before the field
+   ran, so the pool neither saw it nor charged. `chem-electrolysis` (spark
+   laid over the pool) now splits at all three heights; `elec-electrolysis`
+   (charge only, through a buried electrode) at all three too. A bolt's
+   column now stands still for its life instead of creeping up a cell.
+
+**Sleep.** A cell holds its chunk awake (DIRTY_R_REACT) only while one of
+these rolls is possible, which is while P is high enough -- and P with no
+source falls to 0 in P / decay ticks; the field's own DIRTY_R_ELEC mark
+already kept those chunks awake for exactly as long.
+
+**Also authored with E2:** `gunpowder + tag:electric` (a spark sets it off;
+600 x spreadPct, last in its bucket). **Not done:** brine conducting better
+than fresh water (the field would need the solute layer's per-cell salt in
+sim_elec.wgsl; brine and water both use water's resist 6).
 
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
@@ -4462,13 +4545,16 @@ explode; sodium + steam fizzes, + heat burns; hydrogen + heat or spark →
 explode, + chlorine in daylight → acid + small blast, decays (escapes); salt +
 heat → molten salt (molten salt itself a 2% melter, so a pile cannot melt
 itself), molten salt cools on an inverted hot ramp, + water quenches, + spark
-(tag:electric) → sodium + chlorine (electrolysis) — **but not at every pool
-height** (open, 2026-10-03, `chem-electrolysis`): the rule is authored from
-the molten salt's side, a spark is a gas that rises in its OWN colour phase on
-substep 0, and the CA's phases run x, then y, then z, so a pool whose top is at
-y ≡ 2 (mod 3) never sees the spark above it (the spark's y ≡ 0 phase runs
-first and it has risen). The same bias applies to every rule that names a
-fast-moving gas as its NEIGHBOUR (hydrogen + spark, brine + spark); spark ignites flammables
+(tag:electric) → sodium + chlorine (electrolysis), at every pool height since
+electricity E2 (2026-10-03). It used to miss one height in three
+(`chem-electrolysis`): the rule is authored from the molten salt's side, a
+spark was a gas that rose in its OWN colour phase on substep 0, and the CA's
+phases run x, then y, then z, so a pool whose top is at y ≡ 2 (mod 3) never saw
+the spark above it (the spark's y ≡ 0 phase ran first and it had risen). Now a
+DISCHARGE DOES NOT DRIFT (an electric-source gas never moves; sim_step.wgsl,
+the gas tail) and a charged pool reacts with its own charge ("What charge
+does", section 4). The bias remains for any OTHER fast-moving gas named as a
+NEIGHBOUR; spark ignites flammables
 weakly and lives ~2 ticks; acid dissolves crystal now and FUMES noxious gas
 from every dissolution (~1 in 10 eaten voxels; ~1 in 3 since package E, below), is neutralized by lye (→ water/
 steam + salt) and sodium (→ hydrogen + salt), and still spares glass, steel,
@@ -4650,8 +4736,9 @@ and `Cues::Thunder` (set `weather/thunder`, the `weather` owner in
 `sound_schema.js`; delayed by distance at 343 m/s, louder and higher close).
 Far flashes stay render-only and silent.
 
-**Not done:** the charge field's EFFECTS (E2) -- since E1 a bolt into a pond or
-a copper wire charges it, but nothing reads the charge yet; mob shock/stun (E4); the target scan starts 24
+**Not done:** mob shock/stun (E4). (The charge field's CA effects -- a bolt
+into a pond electrolyses its brine, wood down a struck rod catches, the rod
+crackles -- are E2's, "What charge does" in section 4.) The target scan starts 24
 cells over the aim, so a tree taller than that is struck inside its canopy (the
 bolt above it is refused by the leaves, IfAir); no thunder sample is recorded
 yet (`weather/thunder` is silent until one is).

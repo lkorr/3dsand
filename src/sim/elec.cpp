@@ -31,6 +31,23 @@ uint32_t ElecWetResist(uint32_t wetResist, uint32_t amount) {
   return std::clamp<uint32_t>(r, 1u, kElecResistInsulator - 1);
 }
 
+uint32_t ElecTagMask(const std::vector<MaterialDef>& mats) {
+  uint32_t mask = 0xFFFFFFFFu;
+  bool any = false;
+  for (const MaterialDef& d : mats) {
+    const bool has = std::find(d.tags.begin(), d.tags.end(), "electric") != d.tags.end();
+    any = any || has;
+    mask &= has ? d.gpu.tagMask : ~d.gpu.tagMask;
+  }
+  return any ? mask : 0u;
+}
+
+uint32_t ElecCrackleThreshold(int knob, uint32_t emitMat, uint32_t emitSource) {
+  if (emitMat == 0) return kElecPOff;
+  const uint32_t k = (uint32_t)std::clamp(knob, 1, (int)kElecPMax);
+  return std::min<uint32_t>(std::max<uint32_t>(k, emitSource + 1u), kElecPOff);
+}
+
 namespace {
 ElecRunStats gRun;
 }

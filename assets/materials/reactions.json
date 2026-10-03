@@ -1979,6 +1979,23 @@
       "selfBecomes": "charcoal"
     },
     {
+      "note": "A spark sets gunpowder off (electricity E2, 2026-10-03: the gap the android package found -- the recipe card above always said 'heat or a spark', and only heat was authored). Appended LAST in gunpowder's bucket so no earlier rule's dice move. Its product is fire, so the loader scales it by combustion.spreadPct like the heat rule: 600 reads as ~175 per-mille a spark face -- a spark, alive a tick or two, sets a train off most of the time, an arc or a bolt always. Gunpowder does not conduct, so a charged pool cannot set it off from inside; a crackle spark beside it can."
+    },
+    {
+      "self": "gunpowder",
+      "neighbor": "tag:electric",
+      "chance": 600,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 130
+        }
+      ]
+    },
+    {
       "note": "Sulfur burns with a choking fume (real: sulfur dioxide) -- a share of its burn is noxious gas. Charcoal catches a little easier than wood (15 against 12) and smoulders as ember."
     },
     {

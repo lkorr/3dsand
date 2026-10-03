@@ -553,13 +553,17 @@ PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPAT
 // read-only in practice: `reposeSnap` and `caMask` are read_write for the
 // module because `reposesnap` / `camask` / `calist` write them; `main` only
 // reads both. I(CaArgs): iteration k dispatches from caList's record k.
+// R(ElecPool) A(ElecMeta) R(ElecParams): package E2 -- `main` reads the
+// settled charge field (last tick's, written by the elec rows after the CA)
+// and the E2 header / per-material words (sim_step.wgsl elecReact).
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 27,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) I(CaArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
-          R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams)))
+          R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams) R(ElecPool) A(ElecMeta)
+          R(ElecParams)))
 // read-only in practice: `voxels`, as for caMask above.
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
@@ -578,7 +582,8 @@ PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
           A(GasSpawn) A(GasOuter) R(ReposeSnap)
           R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) R(RainExpo) R(Draft) R(CaMask)
-          R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams)))
+          R(CaWind) R(HeatPool) A(HeatMeta) R(HeatParams) R(ElecPool) A(ElecMeta)
+          R(ElecParams)))
 
 // ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
 //

@@ -528,6 +528,9 @@ static void ParseElectric(const json& m, const std::string& path, MaterialDef& d
   if (t.contains("char")) {
     if (!t["char"].is_string()) errors += at + ".char must be a material name\n";
     else d.elec.charInto = t["char"].get<std::string>();
+    // E2: one chance caps both rolls (ignite with an air face, char without);
+    // a char-only block takes ignite's default.
+    if (d.elec.igniteChanceMille <= 0.0) d.elec.igniteChanceMille = 10.0;
   }
   for (auto& [key, v] : t.items()) {
     (void)v;

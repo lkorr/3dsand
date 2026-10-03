@@ -820,6 +820,30 @@ TP_I(sim, elecDecay, NO_WGSL, 8, 1, 4096)
 // 15). A thinner coat is proportionally worse (resist x 15 / amount). A wet
 // plank (60 dry) or wet stone (an insulator dry) carries charge through it.
 TP_I(sim, elecWetResist, NO_WGSL, 12, 1, 254)
+// WHAT CHARGE DOES IN THE CA (package E2, sim_step.wgsl; DESIGN.md
+// "Electricity -- charge field"). All NO_WGSL, uploaded by PrepareElec into
+// the elecParams header beside the field's own knobs.
+// A cell holding at least this P counts as touching a discharge: its rules
+// that want a tag:electric neighbour (electrolysis, a pop) can fire with no
+// spark beside it.
+TP_I(sim, elecReactMin, NO_WGSL, 16, 1, 65535)
+// The P at which such a rule fires at its full authored chance; below it the
+// chance falls linearly with P.
+TP_I(sim, elecReactFull, NO_WGSL, 1000, 1, 65535)
+// OHMIC IGNITION: per-mille a tick per 1,000 units of P x the cell's resist,
+// before the cap (the material's electric.ignite.chance) and the air-face
+// scaling. 0.35: dry wood beside a spark (P ~140) ~1 per-mille a tick, beside
+// lightning the full cap. Converted to x32 fixed point on the CPU.
+TP_F(sim, elecIgniteGain, NO_WGSL, 0.35f, 0.0f, 50.0f)
+// CRACKLE: per-mille a tick per 1,000 P above the tier's threshold that a
+// charged conductor with an air face throws a spark (or an arc) into it.
+TP_F(sim, elecCrackle, NO_WGSL, 0.6f, 0.0f, 50.0f)
+// The P a conductor needs to crackle SPARKS. Raised on upload to the spark's
+// own source + 1, so a crackle can never re-charge its emitter to the point of
+// crackling again (the boundedness argument; DESIGN.md).
+TP_I(sim, elecCrackleSparkP, NO_WGSL, 400, 1, 65535)
+// The P a conductor needs to crackle ARCS instead (raised to arc's source + 1).
+TP_I(sim, elecCrackleArcP, NO_WGSL, 6000, 1, 65535)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900, 0, 1000)
 // Both of these are packed into bit fields in Particle.flags; an
 // out-of-range value would wrap into the neighbouring field rather than

@@ -950,6 +950,11 @@ const char* const kOrder[] = {
     // a dry and a wet wood strip, a water pool), run twice; own worldgen,
     // regenerates on the way out.
     "elec-field",
+    // Electricity E2: what charge does in the CA -- electrolysis through a
+    // buried electrode at every pool-top parity, ohmic ignition / char and the
+    // spark-rarely bound, crackle dying with its source. Own worldgen each,
+    // regenerate on the way out.
+    "elec-electrolysis", "elec-ignite", "elec-crackle-bounded",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

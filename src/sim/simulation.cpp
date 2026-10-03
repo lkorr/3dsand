@@ -1554,6 +1554,22 @@ void Simulation::UploadTables(const rhi::Queue& queue,
       PackElecMaterial(e, words.data() + i * kEpMatStride);
     }
     queue.WriteBuffer(elecParamsBuf_, (uint64_t)kEpMat * 4, words.data(), words.size() * 4);
+    // E2's header facts from the table (PrepareElec uploads them): the
+    // "electric" tag bit the virtual-neighbour rules match, and what each
+    // crackle tier emits, BY NAME -- `spark` and `arc` -- with its source, so
+    // the threshold can be held above it (ElecCrackleThreshold).
+    elecTagMask_ = ElecTagMask(mats);
+    elecCrackleLoMat_ = elecCrackleLoSrc_ = elecCrackleHiMat_ = elecCrackleHiSrc_ = 0;
+    for (size_t i = 1; i < mats.size() && i < kStainPaletteBase; i++) {
+      if (mats[i].name == "spark") {
+        elecCrackleLoMat_ = (uint32_t)i;
+        elecCrackleLoSrc_ = mats[i].elec.source;
+      } else if (mats[i].name == "arc") {
+        elecCrackleHiMat_ = (uint32_t)i;
+        elecCrackleHiSrc_ = mats[i].elec.source;
+      }
+    }
+    elecHdrValid_ = false;
   }
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
@@ -3261,6 +3277,23 @@ void Simulation::PrepareElec(const rhi::Queue& queue) {
   hdr[kEpIterCap] = kElecIterCap;
   const uint32_t wet = (uint32_t)std::clamp(tn.sim.elecWetResist, 1, (int)kElecResistInsulator - 1);
   for (uint32_t a = 0; a < 16; a++) hdr[kEpWet + a] = ElecWetResist(wet, a);
+  // E2 (sim_step.wgsl). The two gains are per-mille per 1,000 units, i.e. x2
+  // in 1/kReactChanceDen per unit; uploaded x16 so the kernel's `>> 4` keeps
+  // a fraction (0.35 -> 11).
+  auto q4 = [](float g) {
+    return (uint32_t)std::clamp(std::lround((double)g * 2.0 * 16.0), 0l, 1l << 16);
+  };
+  hdr[kEpReactMin] = (uint32_t)std::clamp(tn.sim.elecReactMin, 1, (int)kElecPMax);
+  hdr[kEpReactFull] = (uint32_t)std::clamp(tn.sim.elecReactFull, 1, (int)kElecPMax);
+  hdr[kEpIgniteQ] = q4(tn.sim.elecIgniteGain);
+  hdr[kEpCrackleQ] = q4(tn.sim.elecCrackle);
+  hdr[kEpCrackleLoP] =
+      ElecCrackleThreshold(tn.sim.elecCrackleSparkP, elecCrackleLoMat_, elecCrackleLoSrc_);
+  hdr[kEpCrackleLoMat] = elecCrackleLoMat_;
+  hdr[kEpCrackleHiP] =
+      ElecCrackleThreshold(tn.sim.elecCrackleArcP, elecCrackleHiMat_, elecCrackleHiSrc_);
+  hdr[kEpCrackleHiMat] = elecCrackleHiMat_;
+  hdr[kEpElecTag] = elecTagMask_;
   elecRounds_ = hdr[kEpRounds];
   if (elecHdrValid_ && std::equal(hdr, hdr + kEpHdrWords, elecHdr_)) return;
   std::copy(hdr, hdr + kEpHdrWords, elecHdr_);

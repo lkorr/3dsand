@@ -470,6 +470,106 @@ fn elecAtCell(c : vec3<i32>) -> u32 {
 }
 // MIRROR-END elec
 
+// ---- E2: WHAT CHARGE DOES IN THE CA (docs/PLAN_electricity.md section 2) -----
+// Three effects, all reading the cell's OWN settled P (last tick's field,
+// stable for the whole colour loop) and writing only the cell or one face:
+//   1. THE VIRTUAL ELECTRIC NEIGHBOUR (doReactions, RK_PAIR): a cell holding
+//      P >= EP_REACT_MIN satisfies its rules whose neighbour is tag:electric
+//      with no spark beside it -- after the six faces and the coat, one roll
+//      per rule per tick as for any partner, at the authored chance ramped by
+//      P / EP_REACT_FULL. The neighbour-side product goes into an open (air)
+//      face, else it is lost (the bench's Deposit). This is what electrolyses a
+//      charged pool from inside, and at every pool-top height (the old y = 2
+//      mod 3 miss was a spark rising before the pool cell's phase looked).
+//   2. OHMIC IGNITION / CHAR (elecReact): a conductor with electric.ignite /
+//      char heats by P x resist; with an air face it becomes ignite.into, with
+//      none its char product, scaled by air faces like heatReact.
+//   3. CRACKLE (elecReact): a charged conductor with an air face throws a
+//      spark (P >= EP_CRACKLE_LO_P) or an arc (>= EP_CRACKLE_HI_P) into it.
+//      BOUNDED: each threshold is held above the emitted material's own source
+//      (Simulation::PrepareElec, ElecCrackleThreshold), and the field is a MAX
+//      (never a sum), so the P a crackle can give back to any conductor is at
+//      most source - 1 < the threshold that emitted it. A crackle can never
+//      sustain the crackling; it dies with the real source's charge, which
+//      falls by sim.elecDecay a tick.
+// Rule 1: integer, keyed on the SLOT index (its own salt), reads at distance
+// <= 1 plus the cell's own P. Rule 2: everything here consumes the cell or
+// costs the field nothing; a cell holds its chunk awake only while a roll is
+// possible, and P (with no source) falls to 0 in P / decay ticks.
+@group(0) @binding(57) var<storage, read> elecParams : array<u32>;
+const EP_MODE : u32 = 0u;
+const EP_WET : u32 = 16u;
+const EP_MAT : u32 = 32u;
+const EP_MAT_STRIDE : u32 = 4u;
+const EP_REACT_MIN : u32 = 4u;
+const EP_REACT_FULL : u32 = 5u;
+const EP_IGNITE_Q : u32 = 6u;
+const EP_CRACKLE_Q : u32 = 7u;
+const EP_CRACKLE_LO_P : u32 = 8u;
+const EP_CRACKLE_LO_MAT : u32 = 9u;
+const EP_CRACKLE_HI_P : u32 = 10u;
+const EP_CRACKLE_HI_MAT : u32 = 11u;
+const EP_ELEC_TAG : u32 = 12u;
+const ELEC_P_UNREAD : u32 = 0xFFFFFFFFu;
+const ELEC_IGNITE_SALT : u32 = 0x5E1EC7A1u;
+const ELEC_CRACKLE_SALT : u32 = 0x3C4A7B1Fu;
+// The most a cell crackles a tick: 100 per-mille (in 1/REACT_CHANCE_DEN).
+const ELEC_CRACKLE_CAP : u32 = 200000u;
+
+fn elecMatWord(m : u32) -> u32 { return elecParams[EP_MAT + (m & 0xFFFu) * EP_MAT_STRIDE]; }
+// The resist the field used for the cell holding w (sim_elec.wgsl
+// elecCellResist, the wet rule included), 0 for an insulator.
+fn elecResistOf(w : u32) -> u32 {
+  var r = elecMatWord(voxMat(w)) & 0xFFu;
+  if (voxStained(w)) {
+    let coat = materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
+    if ((elecMatWord(coat) & 0xFFu) != 0u) {
+      let wr = elecParams[EP_WET + voxStainAmt(w)];
+      r = select(wr, min(r, wr), r != 0u);
+    }
+  }
+  return r;
+}
+// The P a cell can hold: only a conductor (or a wet cell) is ever charged
+// short of being a source, so everything else skips the field read.
+fn elecCellCharge(c : vec3<i32>, w : u32, m : Material) -> u32 {
+  if (elecParams[EP_MODE] == 0u) { return 0u; }
+  if ((m._r2 & ELEC_R2_CONDUCTS) == 0u && !voxStained(w)) { return 0u; }
+  return elecAtCell(c);
+}
+// Is this PAIR rule's neighbour a discharge (tag:electric, any material of
+// it, a gas may be one)? Then charge at the cell can stand in for it.
+fn elecRuleWantsDischarge(rule : Reaction) -> bool {
+  let tag = elecParams[EP_ELEC_TAG];
+  if (tag == 0u || rule.nbrMat != NBR_ANY || (rule.nbrTags & tag) == 0u) { return false; }
+  return rule.nbrClass == 0u || ((1u << CLASS_GAS) & rule.nbrClass) != 0u;
+}
+// The authored chance (already weather-scaled), ramped by P up to
+// EP_REACT_FULL. base <= REACT_CHANCE_DEN (2e6) and q < 1024: no overflow.
+fn elecRampChance(base : u32, p : u32) -> u32 {
+  let full = max(elecParams[EP_REACT_FULL], 1u);
+  if (p >= full) { return base; }
+  let q = (p << 10u) / full;
+  return (base * q) >> 10u;
+}
+// The neighbour-side product of a rule fired through the virtual neighbour:
+// into the first AIR face (RNG-rotated, the rule's direction mask), or lost.
+fn elecDeposit(c : vec3<i32>, dmask : u32, rot : u32, prod : u32, rr : u32, stamp : u32) {
+  if (prod == PROD_KEEP || prod == MAT_AIR) { return; }
+  for (var i = 0u; i < 6u; i++) {
+    let di = (i + rot) % 6u;
+    if ((faceDirBit(di) & dmask) == 0u) { continue; }
+    let n = c + faceDir(di);
+    if (!inBounds(n) || voxMat(voxWordAt(n)) != MAT_AIR) { continue; }
+    let ni = voxWordIndex(n);
+    voxStore(ni, packVox(prod, productState(prod, rr >> 4u), stamp));
+    if (solIsLiquidMat(prod)) { solClearStale(n); }
+    markVoxActive(ni);
+    markDirtyR(n, DIRTY_R_REACTW);
+    return;
+  }
+}
+
 fn markVoxActive(idx : u32) {
   if (T.vizActive != 0u && idx != PT_NO_WORD) {
     atomicOr(&actVoxViz[idx >> 5u], 1u << (idx & 31u));
@@ -2860,6 +2960,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
   // whole sprout): such rules are skipped, not rolled, and do not hold the
   // chunk awake. Eight grains that merge into a full cell react normally.
   let selfPartialPowder = !synthSelf && matHasPowderMass(m) && powderIsPartial(w);
+  // The cell's charge (E2, THE CHARGE AS PARTNER below), read once, on the
+  // first rule that wants a discharge and found none at a face.
+  var eP = ELEC_P_UNREAD;
 
   for (var ri = 0u; ri < m.reactCount; ri++) {
     let rule = reactions[m.reactOffset + ri];
@@ -3042,12 +3145,14 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       // rule 2: one level spent, a flame product released into an open face
       // (none open = not a match), any other product not created. A self
       // product rewrites the cell, and the coat goes with it.
+      var partnered = faceMatched;
       if (!faceMatched && coat != 0u && nbrMatches(rule, coat, materials[coat]) &&
           !(rule.prodSelf == PROD_KEEP && rule.prodNbr == coat)) {
         let flame = isFlame(rule.prodNbr);
         var rf = 6u;
         if (flame) { rf = coatReleaseFace(c, dmask, rot, 6u); }
         if ((coatRuleVerdict(flame, rf < 6u) & COAT_VERDICT_MATCH) != 0u) {
+          partnered = true;
           keepAwake = keepAwake || !lightGated;
           if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
             reactFxNote(rule, c);
@@ -3058,6 +3163,31 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
               _ = coatSpend(c, idx, w, stamp);
             }
             return true;
+          }
+        }
+      }
+      // ---- THE CHARGE AS PARTNER (E2), after the faces and the coat --------
+      // A rule wanting a discharge (tag:electric) whose partner was not found
+      // at a face or in the coat: the cell's OWN charge stands in for it. One
+      // roll per rule per tick, as for any partner; the chance ramps with P.
+      // The discharge side's product goes into an open face or is lost; the
+      // self product is written as for any pair. Not for a synthesized self
+      // (air holds no charge) and not for a covered cell (rule 3: it sees its
+      // coat and nothing else). Only conductors (or wet cells) read the field.
+      if (!partnered && !synthSelf && !covered && elecRuleWantsDischarge(rule)) {
+        if (eP == ELEC_P_UNREAD) { eP = elecCellCharge(c, w, m); }
+        if (eP >= elecParams[EP_REACT_MIN]) {
+          keepAwake = keepAwake || !lightGated;
+          if (!probe && (rr % REACT_CHANCE_DEN) <
+                            elecRampChance(rainChance(rule, c, rule.chance), eP)) {
+            reactFxNote(rule, c);
+            elecDeposit(c, dmask, rot, rule.prodNbr, rr, stamp);
+            if (rule.prodSelf != PROD_KEEP) {
+              reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
+              return true;
+            }
+            markDirtyR(c, DIRTY_R_REACTW);
+            return false;
           }
         }
       }
@@ -3074,8 +3204,97 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     if (hr == 2u) { return true; }
     if (hr == 1u) { keepAwake = true; }
   }
+  // ---- CHARGE: OHMIC IGNITION AND CRACKLE (E2), after the bucket ----------
+  // Conductors only (the rest hold no P short of being a source). Same
+  // contract as heatReact: 2 = self rewritten, 1 = could fire (hold awake).
+  if (!synthSelf && !gInTicket && (m._r2 & ELEC_R2_CONDUCTS) != 0u) {
+    let er = elecReact(c, idx, slotIdx, w, mat, m, rnd, probe, stamp);
+    if (er == 2u) { return true; }
+    if (er == 1u) { keepAwake = true; }
+  }
   if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }
   return false;
+}
+
+// ---- E2: OHMIC IGNITION / CHAR AND CRACKLE ----------------------------------
+// (see "E2: WHAT CHARGE DOES IN THE CA" by the elec bindings). For a
+// conductor with charge P at its own cell:
+//   IGNITE / CHAR. E = P x resist (the cell's own, wet rule included: a wet
+//   plank conducts better and heats LESS). chance = min(cap, E x q / 16) with
+//   cap the material's electric.ignite.chance and q sim.elecIgniteGain (x32),
+//   then x (air faces + 2) / 8 as heatReact's frontier: a cell with an air
+//   face becomes ignite.into, a buried one its char product at 2/8 of the
+//   rate. Copper's resist 1 makes E tiny: it never heats.
+//   CRACKLE. With an air face, P at or over a tier's threshold throws that
+//   tier's material (spark, or arc for the strongly charged) into one air face
+//   (RNG-rotated) at chance (P - threshold) x q / 16, capped at
+//   ELEC_CRACKLE_CAP. The thresholds sit above the emitted material's own
+//   source, which is what bounds it (the header block above).
+// Returns 0 inert, 1 could fire (hold the chunk awake), 2 self rewritten.
+fn elecReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32, m : Material,
+             rnd : u32, probe : bool, stamp : u32) -> u32 {
+  if (elecParams[EP_MODE] == 0u) { return 0u; }
+  let p = elecAtCell(c);
+  if (p == 0u) { return 0u; }
+  // The air faces: how many, for the frontier scaling and the char/ignite
+  // choice. Distance-1 reads only.
+  var air = 0u;
+  for (var f = 0u; f < 6u; f++) {
+    let n = c + faceDir(f);
+    if (inBounds(n) && voxMat(voxWordAt(n)) == MAT_AIR) { air++; }
+  }
+  var awake = 0u;
+  let at = EP_MAT + (mat & 0xFFFu) * EP_MAT_STRIDE;
+  let w1 = elecParams[at + 1u];
+  let cap = elecParams[at + 2u];
+  let prod = select((w1 >> 12u) & 0xFFFu, w1 & 0xFFFu, air != 0u);
+  let q = elecParams[EP_IGNITE_Q];
+  let res = elecResistOf(w);
+  if (prod != 0u && cap != 0u && q != 0u && res != 0u) {
+    let e = p * res;                 // <= 65535 * 254
+    let lim = (cap << 4u) / q;       // cap <= 2e6
+    var ch = select(cap, (e * q) >> 4u, e < lim);
+    ch = ch * (air + 2u) / 8u;
+    if (ch != 0u) {
+      awake = 1u;
+      if (!probe) {
+        let rr = hash3(rnd ^ ELEC_IGNITE_SALT, mat, slotIdx);  // SLOT index keys the dice
+        if ((rr % REACT_CHANCE_DEN) < ch) {
+          reactWriteSelf(c, idx, false, m.klass, prod, rnd, stamp);
+          return 2u;
+        }
+      }
+    }
+  }
+  if (air == 0u) { return awake; }
+  var cm = 0u;
+  var thr = 0u;
+  if (p >= elecParams[EP_CRACKLE_HI_P]) {
+    cm = elecParams[EP_CRACKLE_HI_MAT];
+    thr = elecParams[EP_CRACKLE_HI_P];
+  } else if (p >= elecParams[EP_CRACKLE_LO_P]) {
+    cm = elecParams[EP_CRACKLE_LO_MAT];
+    thr = elecParams[EP_CRACKLE_LO_P];
+  }
+  if (cm == 0u) { return awake; }
+  let ch = min(((p - thr) * elecParams[EP_CRACKLE_Q]) >> 4u, ELEC_CRACKLE_CAP);
+  if (ch == 0u) { return awake; }
+  awake = 1u;
+  if (probe) { return awake; }
+  let rr = hash3(rnd ^ ELEC_CRACKLE_SALT, mat, slotIdx);
+  if ((rr % REACT_CHANCE_DEN) >= ch) { return awake; }
+  let rot = rr >> 12u;
+  for (var i = 0u; i < 6u; i++) {
+    let n = c + faceDir((i + rot) % 6u);
+    if (!inBounds(n) || voxMat(voxWordAt(n)) != MAT_AIR) { continue; }
+    let ni = voxWordIndex(n);
+    voxStore(ni, packVox(cm, productState(cm, rr >> 4u), stamp));
+    markVoxActive(ni);
+    markDirtyR(n, DIRTY_R_REACTW);
+    markDirtyR(c, DIRTY_R_REACTW);
+    break;
+  }
+  return awake;
 }
 
 // Is ground cell n below water's freezing point (T = ambient + X < 0)? The
@@ -5335,7 +5554,11 @@ fn caCell(ci : u32, local : vec3<i32>) {
       stainDry(c, idx, w, m, hash3(T.seed, T.tick * 2u, slotIdx), skip)) {
     return;
   }
-  if (!matCanAct(m) && coat == 0u) { return; }
+  // ...AND EXCEPT A CONDUCTOR (E2): an inert copper bar or iron plate holding
+  // charge crackles (elecReact). One `_r2` bit test; the field is read on
+  // substep 0 only, and only by a conductor.
+  let conducts = (m._r2 & ELEC_R2_CONDUCTS) != 0u;
+  if (!matCanAct(m) && coat == 0u && !conducts) { return; }
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
@@ -5367,6 +5590,13 @@ fn caCell(ci : u32, local : vec3<i32>) {
     if (m.reactCount > 0u &&
         doReactions(c, idx, slotIdx, wNow, mat, m, rnd, false, coatNow, covered, skip)) {
       return;
+    }
+    // A conductor with no reaction bucket (copper, iron, steel) still takes
+    // E2's after-bucket step; one with a bucket took it in doReactions.
+    if (m.reactCount == 0u && conducts && !gInTicket && !spent) {
+      let er = elecReact(c, idx, slotIdx, wNow, mat, m, rnd, skip, stampFor(T.tick, P.substep));
+      if (er == 2u) { return; }
+      if (er == 1u) { markDirtyR(c, DIRTY_R_REACT); }
     }
     gThinMul = 1u;
     if (spent) { return; }
@@ -5443,6 +5673,17 @@ fn caCell(ci : u32, local : vec3<i32>) {
     // clears the box, and a splat into an uncleared box would accumulate
     // forever. See gasOuterSplat.
     if (T.gasMode != GAS_MODE_OFF && P.substep == 0u) { gasOuterSplat(c); }
+    // A DISCHARGE DOES NOT DRIFT (E2, 2026-10-03). A gas that is an electric
+    // SOURCE (spark, arc, lightning: `_r2` bit 25) lives a tick or two where
+    // it struck and never moves. Two reasons, one physical: a spark does not
+    // float. The other is the pool-top parity miss (selftest_chem.cpp "WHY
+    // THREE"): a spark laid on a pool whose top is y = 2 (mod 3) used to rise
+    // in its own phase -- which runs before the pool cell's -- so the pool
+    // never saw it at a face, AND the charge field (run after the CA) found it
+    // a cell clear of the pool, so the pool never charged either. Held still,
+    // it is a face partner for its whole life and seeds the pool's charge.
+    // Its decay rule (doReactions above) still runs and holds the chunk awake.
+    if ((m._r2 & ELEC_R2_SOURCE) != 0u) { return; }
     stepGas(c, idx, w, m, slotIdx, rnd);
     return;
   }

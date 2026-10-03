@@ -27,7 +27,7 @@
     },
     {
       "id": "wood",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -773,7 +773,7 @@
     },
     {
       "id": "birch_wood",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -1147,7 +1147,7 @@
     },
     {
       "id": "skin",
-      "electric": {"resist": 20},
+      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
       "class": "solid",
       "density": 1010,
       "hardness": 8,
@@ -1228,7 +1228,7 @@
     },
     {
       "id": "staff_wood",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -2842,7 +2842,7 @@
     {
       "//": "Bark ramp. Same three-tier idea on the wood side: a bole with a shaded and a lit face reads as a cylinder, where one flat brown reads as a column of paint.",
       "id": "bark_dark",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -2867,7 +2867,7 @@
     },
     {
       "id": "bark_light",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -3028,7 +3028,7 @@
     {
       "//": "ANATOMY (assets/editor/anatomy.js; DESIGN.md §7 'What is under the skin'). The human is no longer skin all the way through: a sidecar recipe paints its interior by depth -- skin, then this, then muscle, then bone -- so a cut face, a burn-through or a peeled limb in the tuner shows layers instead of more skin. Subcutaneous flesh: the pale layer one voxel under the skin. Enters the SAME burn chain as skin (reactions.json, 'flesh + tag:hot -> flesh_cooked') so a body burns through its layers on one clock; bone has no fire rules and survives by construction.",
       "id": "flesh",
-      "electric": {"resist": 20},
+      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
       "arcane": 4,
       "class": "solid",
       "density": 950,
@@ -3051,7 +3051,7 @@
     {
       "//": "The red layer under the flesh and the bulk of a limb (see `flesh`). Denser and a little harder than skin so the derived collider's mass reads as meat, not fat; the anatomy recipe speckles it with `blood` so a cross-section is not one flat red.",
       "id": "muscle",
-      "electric": {"resist": 20},
+      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
       "class": "solid",
       "density": 1060,
       "hardness": 10,
@@ -3394,7 +3394,7 @@
     {
       "//": "A PUNCH LEAVES A MARK (docs/PLAN_impact_unarmed.md S6). gore.bruiseMat's default, and the material a BLUNT hit rewrites skin to -- the third thing a wound can turn flesh into, beside blood and rot. Skin's own hardness and density, because it IS skin: only the colour has changed, so it burns on the same clock through the same authored chain and crumbles to the same blood. The `tints` list is the one real difference and it is the whole feature: a bruise is not one colour but an AGE -- fresh red-purple, then deep purple, then the green and yellow of one a few days old -- and the art-colour quantization picks the nearest entry to whatever complexion the voxel was painted, so a green-fleshed mob bruises greenish rather than snapping to human purple (the same rule skin / flesh_cooked follow, in the same order). It reverts to the skin it covered as the wound closes (gore.woundHealSlow, MobLimb::woundWas). Far-aliased to `skin`: a bruise is not visible at cascade distance.",
       "id": "skin_bruised",
-      "electric": {"resist": 20},
+      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
       "class": "solid",
       "density": 1010,
       "hardness": 8,
@@ -4552,7 +4552,7 @@
     {
       "//": "BUILDING MATERIALS (PLAN_world_editor P2, assets/editor/housegen.js). Nine static solids a rural-medieval house is made of, each a MATERIAL rather than a paint colour because each behaves differently: the timbers burn, the stone and daub do not, the thatch goes up fast, a door leaf has to read as a door. Every one carries a `far` alias because the far-field palette was already full (128 slots owned). The flammable ones reuse the existing burn chain by PRODUCT (wood-kind ignites to `ember`, straw-kind to `leaf_burning`): reactions.json has one ignition rule per material, the only shape the compiler accepts (`self` is a material name, never a tag). PLANK: sawn boards, a weathered mid-brown lighter than `wood` so floors and weatherboards read as worked timber rather than a trunk.",
       "id": "plank",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "sounds": {
@@ -4578,7 +4578,7 @@
     {
       "//": "TIMBER: the dark oak of a box frame -- posts, rails, braces, lintels, tie beams. Darker than plank so the frame reads against daub at any distance; slower to catch than boards (heavy section), same burn chain.",
       "id": "timber",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "sounds": {
@@ -4705,7 +4705,7 @@
     {
       "//": "DOOR_WOOD: the leaf of a door, and ONLY that. A distinct material so a closed door reads as a door (redder and warmer than the frame around it), and so the door system can tell its own leaf cells from the wall they hang in: a door whose leaf box is no longer all door_wood has been burned or broken and stops being a door (PLAN_world_editor 2.4). Burns like plank.",
       "id": "door_wood",
-      "electric": {"resist": 60},
+      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",

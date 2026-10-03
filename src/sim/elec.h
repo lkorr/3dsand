@@ -62,6 +62,7 @@
 // tick inputs, reproduced by replaying them. Worldgen and load zero it.
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // ---- geometry ---------------------------------------------------------------
 // Restated so materials.h can include this header; elec.cpp static_asserts
@@ -148,6 +149,19 @@ constexpr uint32_t kEpMode = 0;        // sim.elecMode
 constexpr uint32_t kEpRounds = 1;      // sim.elecRounds (1..kElecRoundsMax; 1 when off)
 constexpr uint32_t kEpDecay = 2;       // sim.elecDecay
 constexpr uint32_t kEpIterCap = 3;     // kElecIterCap
+// E2 (sim_step.wgsl, what charge does in the CA), from the sim.elec* knobs and
+// the material table (Simulation::PrepareElec / UploadTables):
+constexpr uint32_t kEpReactMin = 4;        // P that makes a cell a virtual tag:electric neighbour
+constexpr uint32_t kEpReactFull = 5;       // P at which such a rule fires at full chance
+constexpr uint32_t kEpIgniteQ = 6;         // sim.elecIgniteGain, x32 fixed point (chance = E * q >> 4)
+constexpr uint32_t kEpCrackleQ = 7;        // sim.elecCrackle, the same scaling
+constexpr uint32_t kEpCrackleLoP = 8;      // P threshold of the low crackle tier (kElecPOff = never)
+constexpr uint32_t kEpCrackleLoMat = 9;    // what it emits (`spark`)
+constexpr uint32_t kEpCrackleHiP = 10;     // the high tier (`arc`)
+constexpr uint32_t kEpCrackleHiMat = 11;
+constexpr uint32_t kEpElecTag = 12;        // the tagMask bit(s) of "electric" (0 = no such tag)
+// A threshold no P reaches (P is a u16).
+constexpr uint32_t kElecPOff = kElecPMax + 1;
 // The wet table: the resist of a cell under a CONDUCTING COAT of stain amount
 // a (1..15), from sim.elecWetResist (the resist of a full coat):
 // min(254, ceil(wetResist * 15 / a)). Word 0 (amount 0) is the insulator.
@@ -188,6 +202,15 @@ struct ElecDef {
 void PackElecMaterial(const ElecDef& e, uint32_t out[kEpMatStride]);
 // The wet table entry for stain amount a (0..15) from sim.elecWetResist.
 uint32_t ElecWetResist(uint32_t wetResist, uint32_t amount);
+// The tagMask bit of the tag "electric": the bits every material carrying the
+// tag has and no other material has (tags are assigned one bit each, so this
+// is exactly that bit). 0 when no material carries it.
+struct MaterialDef;
+uint32_t ElecTagMask(const std::vector<MaterialDef>& mats);
+// A crackle tier's threshold as uploaded: the knob, raised to the emitted
+// material's own source + 1 (so a crackle cannot re-charge its emitter past
+// the threshold that emits it), or kElecPOff when there is no such material.
+uint32_t ElecCrackleThreshold(int knob, uint32_t emitMat, uint32_t emitSource);
 
 // What build/last_run.json's `elec` block reports: peaks and totals over every
 // elecMeta header a gate handed ElecNoteRun.
