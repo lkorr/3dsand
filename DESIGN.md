@@ -997,7 +997,10 @@ SSBO lists of chunk indices.
   The renderer draws a partial cell as a 2x2x2 arrangement DERIVED from its
   mass and its four lateral neighbours (`raymarch.wgsl tracePowder`: bottom
   layer first, quarter-cells beside the highest neighbours first, fixed
-  tie-break), in the deferred-detail second pass the micro bricks use; light
+  tie-break), in the deferred-detail second pass the micro bricks use (a
+  cell of <= 4 eighths whose ray segment stays above its mid-plane is passed
+  as air in the march and costs no record or neighbour read, 2026-10-03 —
+  on the harness desert that second pass is the frame's largest term); light
   (shadow rays, AO, occupancy's blocker count) treats a partial under
   `POWDER_BLOCK_MIN` = 5 eighths as open (`isRayBlockerW`), and the CPU mirror
   walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
@@ -15335,7 +15338,15 @@ from), RGB9E5 with its low bit forced on so that 0 means "never gathered".
 slots are staggered over `giCachePeriod` frames, per SLOT rather than per block
 so the branch stays uniform across a warp — or for a word that reads 0, and
 reads the four block-faces in the face plane bilinearly, as `opennessAt` reads
-its bytes. The openness walk zeroes the cache word on every full walk and for
+its bytes. **On the scheduled frame only ELECTED pixels re-gather** (2026-10-03):
+those whose hit lies within one pixel footprint (widened by 1/cos of the view
+angle) of the face centre, plus a 1-in-32 per-pixel lottery for faces whose
+centre is hidden — before, every pixel of the slot re-gathered the same face
+from the same origin and wrote the same word. Measured -0.08..-0.16 ms on the
+near budget cameras with the picture at the re-run floor; the remaining
+refresh work is 0.2-0.3 ms (runtime-disabled refresh, code compiled in) and the
+loop's footprint ~0.1 ms (code removed), which a compute pass over requested
+faces would take out of the fragment shader. The openness walk zeroes the cache word on every full walk and for
 a reused slot, so moved geometry re-gathers on the next frame that looks at
 it; a slot the walk has not stamped gathers live, as before.
 
