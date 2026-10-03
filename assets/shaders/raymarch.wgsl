@@ -5168,6 +5168,14 @@ const RS_FAR_REL : f32 = 0.02;
 // the map either (see the note there: below the law the prepass used to run
 // in full for a reader that ignored it).
 const RS_LAW_PX : f32 = 3.0;
+// The wide tier below that law (ray_start.wgsl THE LAW has the argument): a
+// staggered lattice and a 7x7 min hold it down to 2.5 px. The cascade half
+// needs k >= 2.5 * RS_FAR_MAX_CELLS; the fine half needs no global law,
+// because fs() caps every pixel's start at k / RS_LAW_WIDE_PX (RS_NEAR_CAP),
+// nearer than which every fine cell is >= 2.5 px; a frame whose cap is under
+// RS_NEAR_MIN_VOX builds no map at all.
+const RS_LAW_WIDE_PX : f32 = 2.5;
+const RS_NEAR_MIN_VOX : f32 = 32.0;
 const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
                                      TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
                                      TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
@@ -5198,13 +5206,16 @@ fn rayStartKey() -> u32 {
 // Called twice by fs() — before trace() and after it — rather than carried
 // across the fine march: a value live across trace()'s loop is the register
 // cliff (gotcha-raymarch-register-cliff).
-fn rayStartAt(px : vec2f) -> f32 {
+// `far` = the caller is the cascade start, which needs the cascade's law.
+fn rayStartAt(px : vec2f, far : bool) -> f32 {
   if (!RAY_START) { return 0.0; }
   let d = rayStartDims();
   let q = (d + vec2<u32>(1u)) / 2u;
   if (RS_HEADER + 2u * q.x * q.y > arrayLength(&rayStart)) { return 0.0; }
   let k = R.viewPx * 0.5 / R.tanHalfFov;   // px per fine voxel at t = 1
-  if (k < RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS)) { return 0.0; }
+  if (k < RS_LAW_WIDE_PX * RS_NEAR_MIN_VOX) { return 0.0; }
+  if (far && k < RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS) &&
+      k < RS_LAW_WIDE_PX * RS_FAR_MAX_CELLS) { return 0.0; }
   if (rayStart[0] != rayStartKey()) { return 0.0; }
   let i = min(u32(max(px.x, 0.0)) >> 1u, q.x - 1u);
   let j = min(u32(max(px.y, 0.0)) >> 1u, q.y - 1u);
@@ -12120,10 +12131,14 @@ fn fs(in : VSOut) -> FSOut {
   // conservative first hit says nothing can come sooner. Folded into trace's
   // start and dead before its loop; RS_NONE (nothing anywhere in reach) makes
   // the fine march one cell long and skips the cascade below.
-  let rs0 = rayStartAt(in.pos.xy);
-  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true,
-                select(max(rs0 * (1.0 - RS_NEAR_REL) - RS_NEAR_ABS, 0.0), RS_NONE,
-                       rs0 >= RS_NONE));
+  let rs0 = rayStartAt(in.pos.xy, false);
+  var tMin0 = select(max(rs0 * (1.0 - RS_NEAR_REL) - RS_NEAR_ABS, 0.0), RS_NONE,
+                     rs0 >= RS_NONE);
+  // RS_NEAR_CAP: nearer than k / 2.5 every fine cell is >= 2.5 px wide, which
+  // is all the per-pixel argument needs (rayStartAt). Inert in the shipped
+  // tier, where k / 2.5 >= 269 lies past the fine march's 205-voxel end.
+  tMin0 = min(tMin0, R.viewPx * 0.5 / R.tanHalfFov / RS_LAW_WIDE_PX);
+  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true, tMin0);
   rsAdd(RS_PRIMARY, gRsTraceSteps);
 
   // Rays that leave the window without a surface hit (and weren't absorbed by
@@ -12134,7 +12149,7 @@ fn fs(in : VSOut) -> FSOut {
     // Re-read, not carried across trace() (rayStartAt says why). The cascade
     // starts at the map's distance less RS_FAR_REL, never before the fine
     // march handed over.
-    let rs1 = rayStartAt(in.pos.xy);
+    let rs1 = rayStartAt(in.pos.xy, true);
     if (rs1 < RS_NONE) {
       // in.pos.xy is the fragment's pixel coordinate — the dither key (see
       // farDither: screen-space, time-free, stable per pixel)

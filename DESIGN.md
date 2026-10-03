@@ -13142,13 +13142,22 @@ where you hear from either (§12b, "The ears are on the character").
   resolution or wide FOV: `RS_LAW_PX`), within 2 samples of the screen edge,
   and whenever the key in word 0 is not this frame's camera, size and frame
   index — every refusal is the old march from the camera, never a skipped
-  surface. The PREPASS applies the same law (`rayStartLawOk`, 2026-10-03) and
-  marches nothing below it: until then it ran in full for a reader that threw
-  the map away, and the game's own 1600x900 window is below the law (k = 658
-  against the cascade's 672 at fovY 1.2) — measured at `--perf-w 1600
-  --perf-h 900`, noon 6.32 -> 5.63 ms, cascade 4.92 -> 4.31, seam 4.32 -> 3.79.
-  (A fine-half-only map at that size cost 0.22 ms of prepass and saved less
-  than that on every camera, so a sub-law frame takes no map at all.)
+  surface. **The shipped law barely holds where the game is played**
+  (2026-10-03): k = H / (2 tan(fovY/2)) px per voxel at t = 1 must reach
+  3 * 224 = 672, and at the shipped fovY 1.35 that is 675 at 1080p (by 0.4%),
+  562 in the game's own 1600x900 window, and 633 at 1080p as soon as the
+  sprint FOV (`thirdPerson.speedFov`) widens it — and below the law the
+  prepass still ran in full for a reader that ignored it. Now the prepass
+  obeys the law, and below it a WIDE TIER takes over (`ray_start.wgsl` THE
+  LAW): a staggered sample lattice (covering radius 1.25 px instead of 1.41)
+  and a 7x7 min hold the same argument down to 2.5 px; the cascade half is
+  trusted at k >= 2.5 * 224 = 560, and the fine half needs no global law at
+  all because fs() caps each pixel's start at k / 2.5, nearer than which every
+  fine cell is >= 2.5 px. Measured (one process, wide tier vs no map): 1080p
+  at the sprint FOV noon 7.67 -> 6.84 ms, cascade 5.80 -> 5.06, seam 5.30 ->
+  4.77; 1600x900 noon 5.64 -> 5.18, seam 3.82 -> 3.46; pictures at the
+  run-to-run floor. The wide tier is NOT used where the shipped law holds
+  (there it measured +0.13..0.26 ms against the 5x5).
   Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->

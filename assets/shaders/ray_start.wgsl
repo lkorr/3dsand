@@ -30,8 +30,9 @@
 // The samples sit on a 2-px lattice. The first cell C a pixel's ray meets
 // projects to a convex region of the screen at least `c` px across (the
 // inscribed sphere of the cube), with c >= 3 px guaranteed by rayStartLawOk()
-// in raymarch.wgsl — below that the reader ignores the map and marches from
-// the camera as before. A convex region that wide, containing the pixel, holds
+// (below it: the WIDE TIER, see THE LAW further down — a staggered lattice and
+// a 7x7 min that hold the same argument down to 2.5 px, the fine half capped
+// per pixel). A convex region that wide, containing the pixel, holds
 // a lattice point within ~3.5 px of it, and a sample through that point meets
 // C or something NEARER on its own ray. The 5x5 window reaches >= 3.5 px in
 // every direction, so its minimum is <= the entry t of C into the SAMPLE's
@@ -69,7 +70,7 @@
 // up, derived from RenderParams on both sides.
 const RS_HEADER : u32 = 8u;            // raymarch.wgsl agrees
 const RS_NONE : f32 = 1e30;            // "no sample saw anything"; raymarch.wgsl agrees
-const RS_MIN_RADIUS : i32 = 2;         // the 5x5 window
+const RS_MIN_RADIUS : i32 = 2;         // the 5x5 window (+1 in the wide tier)
 
 fn rayStartDims() -> vec2<u32> {
   return vec2<u32>(u32(round(R.viewPx * R.aspect)), u32(round(R.viewPx)));
@@ -371,32 +372,77 @@ fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {
   return RS_NONE;
 }
 
-// ---- THE LAW, applied on THIS side too (2026-10-03, raymarch-core) ---------
-// raymarch.wgsl's rayStartAt ignores the map unless every cell either march
-// can meet is >= RS_LAW_PX wide on screen. Until this, the prepass did not ask:
-// below the law it marched every sample in full for a reader that threw the
-// answer away. The game's own window is below it — 1600x900 at fovY 1.2 is
-// k = 658 px per voxel at t = 1 against the cascade's 3 * 224 = 672 — so the
-// window the game opens in paid 0.56 ms a frame (noon, --perf-w 1600
-// --perf-h 900, pre 0.91 vs 0.35 ms) for a map nobody read. Same constants,
-// same expression, so the two sides cannot disagree about which frames use
-// the map. Below the law thread 0 writes a key of 0, which no frame's key
-// equals (rayStartKey forces the low bit), so even a reader that somehow
-// disagreed about the law would fail the key check and march from the camera.
+// ---- THE LAW, AND THE WIDE TIER BELOW IT (2026-10-03, raymarch-core) -------
+// raymarch.wgsl's rayStartAt trusts this map only while every cell either
+// march can meet is wide enough on screen for the lattice argument above.
+// k = R.viewPx / (2 tan(fovY / 2)) is px per fine voxel at t = 1.
 //
-// (Trusting the FINE half alone below the cascade's law — its own law, 615,
-// holds at 900p — was tried the same night and measured: the fine-only map
-// cost 0.22 ms in `pre` and saved less than that on all five budget cameras,
-// so a sub-law frame is better off with no map at all.)
+// THE SHIPPED TIER (RS_LAW_PX = 3): k >= 3 * 224 = 672 — a 2-px square lattice,
+// one ray per 2x2 block through its corner, a 5x5 min. Exactly what landed
+// 2026-09-28, untouched. It holds at 1920x1080 and the shipped fovY 1.35 by
+// 0.4% (k = 675): the game's OWN 1600x900 window (k = 562) has never had it,
+// and neither has a 1080p frame once the sprint FOV widens (thirdPerson.
+// speedFov 0.06 -> fovY 1.41, k = 633). Until this change the prepass did not
+// even ask: below the law it marched every sample for a reader that threw the
+// map away (noon at 1600x900: 0.56 ms of `pre` for nothing).
+//
+// THE WIDE TIER, for every frame below that law. Two changes make the argument
+// hold down to 2.5 px:
+//   * A STAGGERED lattice: odd sample rows shift one pixel right, so the
+//     samples are (2i + 1 + (j & 1), 2j + 1). Its covering radius is 1.25 px
+//     (the circumradius of the (0,0),(2,0),(1,2) triangle) against the square
+//     lattice's sqrt(2) = 1.41, so a cell whose inscribed disc is >= 2.5 px
+//     across holds a sample (the square lattice needs 2.83).
+//   * A 7x7 min instead of 5x5. The pixel lies in the cell's projection, which
+//     contains the convex hull of the pixel and the inscribed disc (radius
+//     c/2, within sqrt(3) c / 2 of the pixel); at distance d from the pixel
+//     along the line to the disc centre that hull holds a disc of radius
+//     (c/2) d / |PO|, which reaches the covering radius by d = 2.17 px — so a
+//     sample lies within 2.17 + 1.25 = 3.42 px of the pixel for EVERY c >= 2.5,
+//     however big the cell. The 7x7 window reaches >= 4 px on every side of
+//     every pixel of the block with the stagger (5x5 reaches only 2 on one side
+//     of an odd row), so the bound holds with room.
+// And the two halves are trusted separately:
+//   * THE CASCADE HALF needs its cells >= 2.5 px everywhere: k >= 2.5 * 224 =
+//     560 (rayStartFarOk). Below that this pass does not march it, writes
+//     RS_NONE for "nothing fine", and the reader does not read rs1.
+//   * THE FINE HALF needs no global law at all: every fine cell a pixel skips
+//     lies nearer than its start, so capping the start at k / 2.5 (fs(),
+//     RS_NEAR_CAP) makes every skipped cell >= 2.5 px wide — the argument
+//     holds per pixel, at any size. A frame where even that cap is short
+//     (k / 2.5 < RS_NEAR_MIN_VOX) builds no map.
+// Measured, one process, wide tier vs no map (RTX 3060 Ti): at 1080p and the
+// sprint FOV 1.41, noon 7.67 -> 6.84 ms, cascade 5.80 -> 5.06, meadow 5.87 ->
+// 5.44, seam 5.30 -> 4.77, seamveg 8.14 -> 7.42; at 1600x900 and fovY 1.35,
+// noon 5.64 -> 5.18, cascade 4.28 -> 4.01, meadow 4.31 -> 4.09, seam 3.82 ->
+// 3.46, seamveg 6.15 -> 5.83 — the prepass included. The wide tier is NOT used
+// where the shipped law holds: there it measured +0.13..0.26 ms against the
+// 5x5 (a min over 49 samples starts every ray a little earlier).
+//
+// The reader (raymarch.wgsl rayStartAt) carries the same constants and the
+// same expressions. Where this pass builds no map, thread 0 writes a key of 0,
+// which no frame's key equals (rayStartKey forces the low bit), so even a
+// reader that disagreed would fail the key check and march from the camera.
 const RS_LAW_PX : f32 = 3.0;                // raymarch.wgsl agrees
+const RS_LAW_WIDE_PX : f32 = 2.5;           // raymarch.wgsl agrees
+const RS_NEAR_MIN_VOX : f32 = 32.0;         // raymarch.wgsl agrees
 const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
                                      TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
                                      TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
 const RS_FAR_MAX_CELLS : f32 =
     f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK));
+fn rayStartK() -> f32 { return R.viewPx * 0.5 / R.tanHalfFov; }
+// The shipped tier: both halves, square lattice, 5x5.
 fn rayStartLawOk() -> bool {
-  let k = R.viewPx * 0.5 / R.tanHalfFov;   // px per fine voxel at t = 1
-  return k >= RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS);
+  return rayStartK() >= RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS);
+}
+// The cascade half, in either tier.
+fn rayStartFarOk() -> bool {
+  return rayStartLawOk() || rayStartK() >= RS_LAW_WIDE_PX * RS_FAR_MAX_CELLS;
+}
+// Any map at all.
+fn rayStartAny() -> bool {
+  return rayStartK() >= RS_LAW_WIDE_PX * RS_NEAR_MIN_VOX;
 }
 
 // ---- pass 1: one ray per 2x2 block, through the block's shared corner ------
@@ -408,21 +454,27 @@ fn rayStartTrace(@builtin(global_invocation_id) gid : vec3<u32>) {
   let q = (dims + vec2<u32>(1u)) / 2u;
   let need = RS_HEADER + 2u * q.x * q.y;
   if (need > arrayLength(&rayStart)) { return; }
-  // Below the law: no march and NO KEY, so the reader's key check fails too.
-  if (!rayStartLawOk()) {
+  // No map at all: no march and NO KEY, so the reader's key check fails too.
+  if (!rayStartAny()) {
     if (all(gid.xy == vec2<u32>(0u))) { rayStart[0] = 0u; }
     return;
   }
+  let farOk = rayStartFarOk();
   if (all(gid.xy == vec2<u32>(0u))) { rayStart[0] = rayStartKey(); }
   if (gid.x >= q.x || gid.y >= q.y) { return; }
-  var rd = rayStartDir(vec2f(gid.xy * 2u) + vec2f(1.0), dims);
+  // The wide tier's staggered lattice (see THE LAW above).
+  let stag = select(f32(gid.y & 1u), 0.0, rayStartLawOk());
+  var rd = rayStartDir(vec2f(gid.xy * 2u) + vec2f(1.0 + stag, 1.0), dims);
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
   if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
   if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
   let inv = 1.0 / rd;
   let sp = rayStartSpan(R.camPos, inv);
   var t = rayStartFine(R.camPos, rd, inv, sp);
-  if (t < 0.0) {
+  if (t < 0.0 && !farOk) {
+    // The cascade half is not trusted at this size: "nothing fine".
+    t = RS_NONE;
+  } else if (t < 0.0) {
     // Nothing fine: the cascade from where fs() will start it (h.tExit is the
     // span's exit, or 0 for a ray that never enters the window).
     t = rayStartFar(R.camPos, rd, inv, select(0.0, sp.tExit, sp.tExit > sp.tEnter));
@@ -430,28 +482,29 @@ fn rayStartTrace(@builtin(global_invocation_id) gid : vec3<u32>) {
   rayStart[RS_HEADER + gid.y * q.x + gid.x] = bitcast<u32>(t);
 }
 
-// ---- pass 2: the 5x5 minimum (the reach the conservative argument needs) ----
+// ---- pass 2: the 5x5 (7x7) minimum (the reach the argument needs) ----------
 @compute @workgroup_size(8, 8)
 fn rayStartMin(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dims = rayStartDims();
   let q = (dims + vec2<u32>(1u)) / 2u;
   if (RS_HEADER + 2u * q.x * q.y > arrayLength(&rayStart)) { return; }
-  if (!rayStartLawOk()) { return; }
+  if (!rayStartAny()) { return; }
   if (gid.x >= q.x || gid.y >= q.y) { return; }
+  // 5x5 in the shipped tier, 7x7 in the wide one (see THE LAW).
+  let rad = select(RS_MIN_RADIUS + 1, RS_MIN_RADIUS, rayStartLawOk());
   // THE SCREEN EDGE: a cell the frame border cuts may show a sliver narrower
   // than the lattice with no sample of its own on screen, so a window the
   // border clips proves nothing. 0 = "march from the camera", the old path,
   // for a frame RS_MIN_RADIUS samples (~4 px) wide.
   let gi = vec2<i32>(gid.xy);
-  if (any(gi < vec2<i32>(RS_MIN_RADIUS)) ||
-      any(gi >= vec2<i32>(q) - vec2<i32>(RS_MIN_RADIUS))) {
+  if (any(gi < vec2<i32>(rad)) || any(gi >= vec2<i32>(q) - vec2<i32>(rad))) {
     rayStart[RS_HEADER + q.x * q.y + gid.y * q.x + gid.x] = 0u;
     return;
   }
   var m = RS_NONE;
-  for (var dy = -RS_MIN_RADIUS; dy <= RS_MIN_RADIUS; dy++) {
+  for (var dy = -rad; dy <= rad; dy++) {
     let y = u32(gi.y + dy);
-    for (var dx = -RS_MIN_RADIUS; dx <= RS_MIN_RADIUS; dx++) {
+    for (var dx = -rad; dx <= rad; dx++) {
       m = min(m, bitcast<f32>(rayStart[RS_HEADER + y * q.x + u32(gi.x + dx)]));
     }
   }
