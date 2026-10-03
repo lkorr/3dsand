@@ -269,6 +269,25 @@ float VoxToM(float v) { return v * kVoxelMeters; }
 JPH::BodyID ToBodyID(uint64_t h) { return JPH::BodyID((uint32_t)(h - 1)); }
 uint64_t FromBodyID(JPH::BodyID id) { return (uint64_t)id.GetIndexAndSequenceNumber() + 1; }
 
+// ---- SANDVOX_PHYS_TRACE=<file>: the boot-to-boot physics diff (det-cpu) ----
+// One line per body birth (B), removal (R), terrain patch (T, with a hash of
+// its triangles) and per Step the full body-state hash before (P) and after
+// (S) Update. Two boots of the same run, `diff`ed, name the first input or
+// step that differs -- the attribution village-twice gives in-process, for
+// the cross-process case. Off (one null test) unless the variable is set.
+FILE* PhysTrace() {
+  static FILE* f = [] {
+    const char* e = std::getenv("SANDVOX_PHYS_TRACE");
+    return (e != nullptr && *e) ? std::fopen(e, "w") : (FILE*)nullptr;
+  }();
+  return f;
+}
+uint64_t FnvBytes(uint64_t h, const void* p, size_t n) {
+  const uint8_t* b = (const uint8_t*)p;
+  for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+  return h;
+}
+
 // ---- deterministic body ids (Physics::ResetBodyIdHistory, det-cpu) ----------
 // The max-bodies number Physics::Init hands Jolt; an index at or past it is
 // refused by CreateBodyWithID.
@@ -292,6 +311,15 @@ JPH::BodyID CreateAndAddDet(JPH::BodyInterface& bi, Physics::BodyIdAlloc& a,
   a.used[idx] = 1;
   a.lowestFree = idx + 1;
   bi.AddBody(b->GetID(), act);
+  if (FILE* tf = PhysTrace()) {
+    const JPH::RVec3 p = b->GetPosition();
+    const float pf[3] = {(float)p.GetX(), (float)p.GetY(), (float)p.GetZ()};
+    uint32_t pb[3];
+    std::memcpy(pb, pf, sizeof pb);
+    std::fprintf(tf, "B %x layer %u motion %u pos %08x %08x %08x\n",
+                 b->GetID().GetIndexAndSequenceNumber(), (unsigned)b->GetObjectLayer(),
+                 (unsigned)b->GetMotionType(), pb[0], pb[1], pb[2]);
+  }
   return b->GetID();
 }
 void FreeDet(Physics::BodyIdAlloc& a, JPH::BodyID id) {
@@ -300,6 +328,7 @@ void FreeDet(Physics::BodyIdAlloc& a, JPH::BodyID id) {
     return;   // not ours, or a stale handle: the slot's body is someone else
   a.used[idx] = 0;
   if (idx < a.lowestFree) a.lowestFree = idx;
+  if (FILE* tf = PhysTrace()) std::fprintf(tf, "R %x\n", id.GetIndexAndSequenceNumber());
 }
 
 // Joint friction, N*m, from the dimensionless JointDesc::friction.
@@ -1291,9 +1320,26 @@ void Physics::Step(float dt) {
   // any line saying so. This may not change what the simulation does -- a
   // decision taken on wall clock is a decision that differs between machines
   // -- but it may say what it saw, with the two numbers that attribute it.
+  auto traceStates = [&](char tag) {
+    FILE* tf = PhysTrace();
+    if (tf == nullptr) return;
+    static uint64_t step = 0;
+    if (tag == 'P') step++;
+    std::vector<BodyStateBits> st;
+    DebugBodyStates(st);
+    uint64_t h = 1469598103934665603ull;
+    for (BodyStateBits& b : st) {
+      b.birth = 0;   // per-process diagnostic, not state
+      h = FnvBytes(h, &b, sizeof b);
+    }
+    std::fprintf(tf, "%c %llu n %zu h %016llx\n", tag, (unsigned long long)step, st.size(),
+                 (unsigned long long)h);
+  };
+  traceStates('P');
   const auto t0 = std::chrono::steady_clock::now();
   system_->Update(dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
                   jobs_.get());
+  traceStates('S');
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
@@ -1758,6 +1804,12 @@ uint64_t Physics::AddTerrainShape(TerrainShapeJob& job) {
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = CreateAndAddDet(bi, ids_, bcs, JPH::EActivation::DontActivate);
   NoteBirth(id.GetIndexAndSequenceNumber());
+  if (FILE* tf = PhysTrace()) {
+    uint64_t h = FnvBytes(1469598103934665603ull, job.verts.data(), job.verts.size() * 4);
+    h = FnvBytes(h, job.indices.data(), job.indices.size() * 4);
+    std::fprintf(tf, "T %x tris %zu h %016llx\n", id.GetIndexAndSequenceNumber(),
+                 job.indices.size() / 3, (unsigned long long)h);
+  }
   meshStats_.meshes++;
   meshStats_.tris += job.indices.size() / 3;
   meshStats_.addUs += std::chrono::duration<double, std::micro>(

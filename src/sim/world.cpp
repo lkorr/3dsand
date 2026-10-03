@@ -465,8 +465,23 @@ const char* World::FetchSourceName(FetchSource s) {
   }
 }
 
+// SANDVOX_FETCH_TRACE=<file> (det-cpu): one line per fetch request (Q), per
+// fetch a readback slot carries (E) and per fetched chunk landing in the cache
+// (L, with a hash of its words). Two boots diffed name the first fetch whose
+// timing or content differs. Off (one null test) unless set.
+static FILE* FetchTrace() {
+  static FILE* f = [] {
+    const char* e = std::getenv("SANDVOX_FETCH_TRACE");
+    return (e != nullptr && *e) ? std::fopen(e, "w") : (FILE*)nullptr;
+  }();
+  return f;
+}
+
 void World::RequestChunkFetch(IVec3 worldChunk, FetchSource src) {
   const int si = (int)src < FetchProbe::kSources ? (int)src : 0;
+  if (FILE* tf = FetchTrace())
+    std::fprintf(tf, "Q %u %d,%d,%d src %d%s\n", fetchTick_, worldChunk.x, worldChunk.y,
+                 worldChunk.z, si, fetchQueued_.count(PackChunkKey(worldChunk)) ? " dup" : "");
   if (!ChunkInWindow(worldChunk)) {  // not resident: nothing to read
     fetchProbe_.refused[si]++;
     return;
@@ -611,6 +626,9 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
     fetchProbe_.ageSum[si] += age;
     if (age > fetchProbe_.ageMax[si]) fetchProbe_.ageMax[si] = age;
     s.fetchIds.push_back(r.wc);
+    if (FILE* tf = FetchTrace())
+      std::fprintf(tf, "E %u %d,%d,%d page %llx\n", tick, r.wc.x, r.wc.y, r.wc.z,
+                   (unsigned long long)PageOffsetOfSlot(SlotChunkIndex(r.wc)));
   }
   // The stamp every request made from here until the next slot carries; a
   // request that rides the very next slot therefore ages exactly 1.
@@ -1123,6 +1141,13 @@ void World::LandFetches(WorldSnapshot& s) {
   // the tick whose post-sim state they hold
   for (size_t i = 0; i < s.fetchKeys.size(); i++) {
     CachedChunk& cc = cache_[s.fetchKeys[i]];
+    if (FILE* tf = FetchTrace()) {
+      uint64_t h = 1469598103934665603ull;
+      const uint32_t* w = s.fetchWords.data() + i * (size_t)kChunkVol;
+      for (uint32_t k = 0; k < kChunkVol; k++) h = (h ^ (w[k] & 0x7F00FFFFu)) * 1099511628211ull;
+      std::fprintf(tf, "L %u key %llx h %016llx was v%u\n", s.tick,
+                   (unsigned long long)s.fetchKeys[i], (unsigned long long)h, cc.version);
+    }
     if (cc.version <= s.tick) {
       cc.version = s.tick;
       const uint32_t* src = s.fetchWords.data() + i * (size_t)kChunkVol;

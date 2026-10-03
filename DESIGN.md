@@ -6073,8 +6073,19 @@ neighbors, so this needs an explicit connectivity pass:
   carried history from earlier runs in the process (see "Determinism" under
   the doors, gate `village-twice`). Neither is visible to a `--selftest`
   boot-to-boot comparison: the harness drain fixed the fetch latency at one
-  tick, and a boot starts with an empty free list. The
-  survivors sit at ground+2 outside the gate's own forced-rescan tiling
+  tick, and a boot starts with an empty free list. **Measured after both
+  fixes (2026-10-03, `--gate tree-fell` twice):** the BURN half is identical
+  boot to boot (every count, 1456 scans / 1,166,877 cells), but the CUT half
+  is not (chunks needed 40,068 vs 36,895, polygonizes 125 vs 117, also with
+  `SANDVOX_PHYS_THREADS=1`). `SANDVOX_PHYS_TRACE=<file>` (every body birth,
+  removal, terrain patch hash and pre/post-step state hash) and
+  `SANDVOX_FETCH_TRACE=<file>` (every fetch request, carry and landed-chunk
+  hash) diffed across the two boots: identical through tick 94264, where one
+  boot's DebrisSystem queues an island scan's fetch block around chunk
+  (15,16,15) and the other does not. So the remaining boot-to-boot leak is
+  inside the debris event/scan decision — not a clock, not Jolt, not the
+  fetch cache — and those two traces are the instrument for the next step.
+  The survivors sit at ground+2 outside the gate's own forced-rescan tiling
   (which starts at `treeA.lo` while the sweep box reaches 2 cells beyond),
   and `SANDVOX_ISLAND_WATCH=x,y,z` / `ovHid`/`ovShow` are in place for the
   next failing run.
