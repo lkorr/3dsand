@@ -6264,6 +6264,27 @@ neighbors, so this needs an explicit connectivity pass:
   (15,16,15) and the other does not. So the remaining boot-to-boot leak is
   inside the debris event/scan decision — not a clock, not Jolt, not the
   fetch cache — and those two traces are the instrument for the next step.
+  **Attributed and closed (det-debris, 2026-10-03):** the decision's INPUT
+  was the GPU support-loss flag set, which is in no hash and no trace. A
+  third instrument, `SANDVOX_DEBRIS_TRACE=<file>`, writes every PreTick's
+  decision inputs (event queue, support / late queues, cooldowns, the
+  pending-vacate overlay, write ticks, bodies, terrain patches, as hashes),
+  every snapshot's flag set (`F`), every probe (`P`), every scan's
+  components / wants / chunk reads (`S`) and the terrain need list (`N`).
+  Three boots of det-cpu's own tree (03f46cd) diverge at ONE line, with
+  every state hash identical before it: `F snap 94258 flags 5` / `7` / `10`
+  — the tick the 28k-voxel island is erased into a body. That is
+  cross-vendor audit race #10: the `cells` kernel's support flag read
+  neighbours the same dispatch was erasing, before or after their store
+  landed. 15c3787 (sorted cell-op upload + `flagSupportLossCells` reading
+  the post-dispatch grid) closed it and was not in det-cpu's tree. On a tree
+  that has it the same snapshot flags 0 chunks in every boot, the debris
+  traces are byte-identical across boots, and `tree-fell` is identical at
+  gate and `--verify` scope (six boots: chunks needed 38,100, polygonizes
+  110, every count). The pre-fix `sim_mutate.wgsl` on the current tree does
+  not diverge either (the sorted upload makes the race land the same way on
+  this GPU), so a regression of this class would be silent here: support
+  flags are not in the twice-run hash.
   The survivors sit at ground+2 outside the gate's own forced-rescan tiling
   (which starts at `treeA.lo` while the sweep box reaches 2 cells beyond),
   and `SANDVOX_ISLAND_WATCH=x,y,z` / `ovHid`/`ovShow` are in place for the
