@@ -360,6 +360,11 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
         // Hair is ROOTED (2026-09-25, severpolicy.h): the four whole-limb
         // severs an arm has are off for it, whatever the cause.
         const bool hair = t == Tissue::Bloodless;
+        // ELECTRIC (PLAN_electricity E4) is the one cause the old flags never
+        // knew: Other's rows with the blood taken out -- a shock opens no
+        // wound -- so its two bleed columns are None / off and the rest are
+        // Other's.
+        const bool shock = cz == DamageCause::Electric;
         // The old rate: `inBluntCarve_ ? (inUnarmedBlunt_ && unarmed >= 0 ?
         // unarmed : blunt) : 1`, as the kind of scale it picks (the >= 0
         // fallback is BleedRateScale's, and is not a property of the cause).
@@ -369,7 +374,7 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
         // Mob::Damage
         check(p.impactSevers == (!inBluntCarve && !worn && !hair), "impactSevers", cz,
               eaten, t);
-        check(p.hitBleed == (bloodless ? BleedRate::None : oldRate), "hitBleed",
+        check(p.hitBleed == (bloodless || shock ? BleedRate::None : oldRate), "hitBleed",
               cz, eaten, t);
         check(p.vitalHpZeroDetaches == !(!inBluntCarve || !undead),
               "vitalHpZeroDetaches", cz, eaten, t);
@@ -385,7 +390,7 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
         check(p.joint == (hair ? JointRule::Never : oldJoint), "joint", cz, eaten, t);
         // Mob::CarveLimb
         check(p.chargesBrain == !inSpawnRot, "chargesBrain", cz, eaten, t);
-        const bool oldBleeds = !inBurnFlush && !inSpawnRot && !bloodless;
+        const bool oldBleeds = !inBurnFlush && !inSpawnRot && !bloodless && !shock;
         check(p.carveBleeds == oldBleeds, "carveBleeds", cz, eaten, t);
         check(!oldBleeds || p.carveBleed == oldRate, "carveBleed", cz, eaten, t);
         check(p.shellStaysOn == (worn && !inBurnFlush), "shellStaysOn", cz,

@@ -163,6 +163,16 @@ strike path" is the as-built account.
 
 ### 4. Mobs and player (package E4)
 
+**Status (2026-10-03, worktree branch):** built. DESIGN.md "Electricity --
+shocks reach bodies" is the as-built account; `game/mob_shock.cpp`,
+`sim_elec.wgsl` elecQuery, `World::QueueElecQuery` / `TakeElecHits` /
+`ElecMayBeLive`, knobs `gore.shock*`, gates `elec-water-mob`, `elec-stun`,
+`elec-replay`. Differences from the sketch below: the answers ride the
+SNAPSHOT RING (K = World::kSnapshotLatency, consumed at T + K + 1), not a
+one-tick readback; the stun is `Mob::stunUntil_` (a tick); the ragdoll knob
+is `gore.shockRagdollP`; corpses do not ask. Open: `sim.elecDecay` is linear,
+so residual charge stays lethal for a long time (see DESIGN.md).
+
 - **Query kernel.** The CPU uploads up to N limb boxes for the
   nearby/visible bodies; the GPU writes max `P` and the conductive-contact
   count per box. The result is read back async and is one tick latent, the

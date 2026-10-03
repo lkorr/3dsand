@@ -2123,6 +2123,81 @@ after the sparks stop and the fixture sleeps; the field hash and arrival tick
 agree across the two runs. E3's strike targeting (`StrikeMats::Resolve`) now
 reads `electric.resist <= 8` as "a conductor a bolt prefers".
 
+### Electricity — shocks reach bodies (2026-10-03; package E4, `game/mob_shock.cpp`, `sim_elec.wgsl` elecQuery, docs/PLAN_electricity.md section 4, gates `elec-water-mob`, `elec-stun`, `elec-replay`)
+
+**The body asks; the GPU answers at the fixed latency.** The field lives on the
+GPU and bodies on the CPU, so a body learns what it stands in through a BODY
+QUERY: at the end of `MobSystem::PreTick` (tick T) every live base limb of every
+living, non-ghost body -- avatars first, then `mobs_` -- queues one world box
+(`World::QueueElecQuery`): its collider box under the current pose, dilated a
+cell so a foot ON a plate or IN water overlaps the charged cells, at most
+`kElecQueryAxisMax` (32) cells an axis. `kElecQueryMax` (128) boxes a tick; a
+refusal is counted (`ElecQueryCounters().refused`), never the player's (avatars
+queue first). `SubmitTick` uploads them to `elecParams`' tail
+(`Simulation::PrepareElecQueries`, before the encoder) and the pass row
+`elecQuery` (after `elecPurge`, condition `C_ELECQUERY` = boxes this tick,
+NOT C_CAACTIVE) answers each with one 64-thread group: max settled P, cells
+with P > 0, their P sum, cells scanned -- four words into `elecMeta`'s tail.
+`EncodeReadbacks` copies them onto THE SNAPSHOT RING with the tick's boxes as
+their CPU-side TAGS (the mob id and rig slot never reach the GPU), and the
+publish hands them over exactly once in tick order (`World::TakeElecHits`,
+`TakeReactFx`'s discipline). `ApplyShocks` at the top of `PreTick(T + K + 1)`
+therefore acts on the boxes of tick T, K = `World::kSnapshotLatency`: the same
+fixed-latency contract as every gameplay readback, so what a body takes is a
+pure function of the tick, never of when a fence retired.
+
+**Determinism and replay.** The query writes nothing a replay must reproduce;
+it is NOT on the op record and adds nothing to `TickParams` (the replay
+rebuilds and compares those). What a shock DOES reaches the world only as ops
+(fire a shock lit, blood -- none: Electric opens no wound), which ARE recorded;
+mob hp is CPU state, reproduced by a twice-run. `elec-replay` asserts both: a
+recorded shock scene replays every world-hash probe, and a second live run
+reproduces every mob probe (total hp, Electric hp, stun ticks left, the shock
+record) bit for bit.
+
+**Rule 2.** Bodies ask only while `World::ElecMayBeLive(T)`: an op of the last
+K + 2 ticks wrote a SOURCE material (`SubmitTick` scans cells, brush ops and
+particle spawns against the source table `Simulation::UploadTables` hands
+World) -- the K-tick gap before the snapshot can show the field it lit -- or the
+published snapshot's `elecMeta` header (now carried every tick:
+`WorldSnapshot::elec`) shows pages in use. A world with no charge records no
+row and uploads nothing; a group whose field has no page answers zeros after
+one load.
+
+**What a shock does** (`Tuning::Gore` section H, every number a knob,
+`gore.shock*`). EFFECTIVE P = the box's max P x (1 + `shockWetGain` x the limb's
+CONDUCTING coat fraction -- water, blood, brine: coat materials with
+`electric.resist`) x `shockArmourGain` when any worn shell holds a conductor
+(`resist <= shockArmourResistMax`; sampled from the shell lattices, a tick the
+body is in charge only). Nothing below `shockMinP` (x `shockArmourMinPScale`
+in metal). Each touching limb takes `shockHpPerKiloP` hp per 1000 effective P,
+`shockTorsoShare` of it routed to the vital core (the vital base limb with the
+most authored hp: the torso -- the current crosses the body, which is what
+kills), the body capped at `shockHpMaxPerTick`; `DamageCause::Electric`, whose
+`severpolicy.h` rows are Other's with the blood taken out (no bleed budget, no
+carve drip; the `damage-cause` gate knows). STUN: `Mob::stunUntil_` pushed to
+`tick + clamp(shockStunTicksPerKiloP x P/1000, min, max)`, never pulled in;
+`DecideIntent` holds a stunned body still (drive 0, heading held, a stroke in
+flight dropped, the AI's attack refused and counted, `ShockAttacksDropped`) but
+still runs `Think` (memory keeps up; `Fact::Shocked` = stun ticks left); a
+player's command is zeroed in `TickAuthority` (look kept). TWITCH:
+`Mob::HitReact` in a hashed direction every `shockTwitchTicks` while stunned
+(presentation only). At `shockRagdollP` (8,000: lightning-class)
+`StartRagdoll(shockRagdollSeconds, "shock")`. At `shockIgniteMinP` a hashed roll
+(`shockIgniteGain` per 1000 P) lights `shockIgniteVoxels` on the hair, the worn
+shells and the touching limbs through `Mob::Ignite` -- the burn pass's own door,
+so a WET voxel refuses the flame. Androids are bodies like any other (no
+special case). Corpses and ghosts do not ask.
+
+**Scale, at the defaults.** A spark (200) on a copper plate: ~0.3 hp a tick a
+foot, a 6-tick stun -- it barely hurts. A lightning-fed pond (~30,000): the cap,
+half of it on the torso, a knock-down and likely fire -- a wet human dies in
+well under a second. OPEN (E1's knob, not this package's): `sim.elecDecay` 8 a
+tick is a LINEAR decay, so an arc-charged plate stays over `shockMinP` ~240
+ticks and a struck pond ~2 minutes; at these shock numbers a body standing on
+either is killed by the residue. A proportional decay would fix it at the
+source.
+
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
 The world runs a day/night cycle, and sunlight is a real input to the CA:

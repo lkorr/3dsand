@@ -117,6 +117,14 @@ inline constexpr CauseRow kCauseRows[] = {
   {DamageCause::Fall,     true,  true,  BleedRate::Full,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
   {DamageCause::Infection,false, true,  BleedRate::Full,    true,  true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
   {DamageCause::Infection,true,  true,  BleedRate::Full,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
+  // ELECTRIC (docs/PLAN_electricity.md E4): Other's rows with the BLOOD taken
+  // out -- a current through a body opens no wound, so a shock's hp charges
+  // no bleed budget (bleed None) and nothing it charges carves (cBleed off).
+  // It never reaches a sever on its own: its impact speed is always 0, and
+  // hp 0 on a vital limb is the death Mob::Damage already calls. A shock that
+  // sets hair alight burns through FlushBurn, which books Burn, not this row.
+  {DamageCause::Electric, false, true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::Always,     false, true,  true,  true,  false, false, false},
+  {DamageCause::Electric, true,  true,  BleedRate::None,    false, true,  true,  true,  false, JointRule::IfInfected, true,  false, false, false, true,  false, false},
 };
 // clang-format on
 

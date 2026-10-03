@@ -777,6 +777,21 @@ PASS(copy_elecArgsTail, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE,
 PASS(elecPurge, "elec", PT_TICK, PIPE_ELEC_PURGE, K_INDIRECT, IND_ELECARGS,16,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(I(ElecArgs) W(ElecPool) A(ElecMeta)))
+// THE BODY QUERY (package E4: shocks reach bodies; sim_elec.wgsl elecQuery).
+// One group per box the CPU asked about (elecParams' tail, Simulation::
+// PrepareElecQueries), AFTER the settle / tail / purge so it reads the field
+// this tick left; its four answer words per box go to elecMeta's tail, which
+// World::EncodeReadbacks copies onto the snapshot ring (TR(ElecMeta) there).
+// Its own condition, NOT C_CAACTIVE: a body standing in charged water on a
+// tick the CA happened to skip still asks, and the answer is the settled field
+// either way. C_ELECQUERY = boxes this tick; the CPU queues none unless the
+// field can hold charge (World::ElecMayBeLive), so a world with no charge
+// records nothing.
+// read-only in practice: `elecPool` (the module declares it read_write for
+// the rounds; elecQuery only reads half 0 through elecAt).
+PASS(elecQuery, "elec", PT_TICK, PIPE_ELEC_QUERY, K_COMPUTE, D_ELECQUERY,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECQUERY, 1,
+     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //

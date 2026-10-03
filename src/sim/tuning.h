@@ -1900,6 +1900,49 @@ struct Tuning {
     float burnCapMidFraction = TPD(gore, burnCapMidFraction);
     float burnCapMidHealth = TPD(gore, burnCapMidHealth);
     float burnDeathFraction = TPD(gore, burnDeathFraction);
+    // ---- H. shocks reach bodies (docs/PLAN_electricity.md E4) ---------------
+    // The charge field's potential P where a body is (the body query,
+    // MobSystem::ApplyShocks, one tick of field per tick of hurt). EFFECTIVE
+    // P = the box's max P x (1 + shockWetGain x the limb's conducting-coat
+    // fraction -- water, blood, brine on the skin) x shockArmourGain when the
+    // body wears a shell of a conductor (electric.resist <=
+    // shockArmourResistMax: copper, iron, steel...).
+    //   - nothing below shockMinP (x shockArmourMinPScale in metal): faint
+    //     residual charge does not tick damage;
+    //   - each limb touching charge takes shockHpPerKiloP hp per 1000
+    //     effective P a tick, shockTorsoShare of it routed to the torso (the
+    //     current crosses the body; that is what kills), the body's total
+    //     capped at shockHpMaxPerTick a tick;
+    //   - STUN for shockStunTicksPerKiloP ticks per 1000 (clamped to
+    //     [shockStunMinTicks, shockStunMaxTicks], extended, never shortened):
+    //     no attack, no move, a twitch (Mob::HitReact of shockTwitchHp) every
+    //     shockTwitchTicks;
+    //   - at or above shockRagdollP the body goes LIMP for
+    //     shockRagdollSeconds (lightning-class);
+    //   - at or above shockIgniteMinP a chance of shockIgniteGain per 1000
+    //     a tick to set shockIgniteVoxels of the hair / the clothes / the
+    //     touching limb alight (Mob::Ignite -- the burn pass's own door; a
+    //     wet voxel refuses).
+    // A spark (200) barely hurts; a lightning-charged pool (~30000) kills a
+    // wet human in well under a second.
+    int shockMinP = TPD(gore, shockMinP);
+    float shockHpPerKiloP = TPD(gore, shockHpPerKiloP);
+    float shockHpMaxPerTick = TPD(gore, shockHpMaxPerTick);
+    float shockTorsoShare = TPD(gore, shockTorsoShare);
+    float shockWetGain = TPD(gore, shockWetGain);
+    float shockArmourGain = TPD(gore, shockArmourGain);
+    float shockArmourMinPScale = TPD(gore, shockArmourMinPScale);
+    int shockArmourResistMax = TPD(gore, shockArmourResistMax);
+    float shockStunTicksPerKiloP = TPD(gore, shockStunTicksPerKiloP);
+    int shockStunMinTicks = TPD(gore, shockStunMinTicks);
+    int shockStunMaxTicks = TPD(gore, shockStunMaxTicks);
+    int shockRagdollP = TPD(gore, shockRagdollP);
+    float shockRagdollSeconds = TPD(gore, shockRagdollSeconds);
+    int shockIgniteMinP = TPD(gore, shockIgniteMinP);
+    float shockIgniteGain = TPD(gore, shockIgniteGain);
+    int shockIgniteVoxels = TPD(gore, shockIgniteVoxels);
+    int shockTwitchTicks = TPD(gore, shockTwitchTicks);
+    float shockTwitchHp = TPD(gore, shockTwitchHp);
   } gore;
 
   // ---- coats: a substance ON a body, as opposed to in the ground -------------

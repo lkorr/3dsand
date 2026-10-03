@@ -3370,6 +3370,10 @@ _ELEC_CONSTS = {
     "EP_MODE": "kEpMode", "EP_ROUNDS": "kEpRounds", "EP_DECAY": "kEpDecay",
     "EP_ITER_CAP": "kEpIterCap", "EP_WET": "kEpWet", "EP_MAT": "kEpMat",
     "EP_MAT_STRIDE": "kEpMatStride",
+    # The body query (package E4): boxes in elecParams' tail, answers in elecMeta's.
+    "EM_QUERY": "kEmQuery", "EP_QUERY": "kEpQuery", "EP_QUERY_BOXES": "kEpQueryBoxes",
+    "ELEC_QUERY_MAX": "kElecQueryMax", "ELEC_QUERY_BOX_WORDS": "kElecQueryBoxWords",
+    "ELEC_QUERY_RES_WORDS": "kElecQueryResWords", "ELEC_QUERY_AXIS_MAX": "kElecQueryAxisMax",
 }
 
 

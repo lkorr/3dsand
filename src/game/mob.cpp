@@ -2396,6 +2396,10 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   // How burnt each material reads, for the body's burnt fraction (Gore §G).
   burnStage_.assign(mats.size(), 0u);
   burnable_.assign(mats.size(), 0u);
+  // The shock's view of the charge field's material data (mob_shock.cpp).
+  matElecResist_.assign(mats.size(), 0u);
+  for (size_t i = 0; i < mats.size(); i++)
+    matElecResist_[i] = (uint8_t)std::min<uint32_t>(mats[i].elec.resist, 254u);
   for (size_t i = 0; i < mats.size(); i++) {
     burnStage_[i] = mats[i].burnStage;  // authored (materials.h burnStage)
     bool flammable = burnStage_[i] != 0;
@@ -7178,6 +7182,18 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                              float dt) {
   mob.driveScale_ = 1.0f;
   mob.driveStrafe_ = 0.0f;
+  // ---- SHOCKED (docs/PLAN_electricity.md E4) --------------------------------
+  // A stunned body neither moves nor attacks: the drive is zeroed, the heading
+  // held, any stroke in flight dropped and any attack the AI asks for this
+  // tick discarded. The behaviour layer still THINKS (its memory of the
+  // target keeps up, and a rule can read Fact::Shocked), it just cannot act.
+  const bool stunned = mob.Stunned(tick);
+  auto holdStill = [&]() {
+    mob.driveScale_ = 0.0f;
+    mob.driveStrafe_ = 0.0f;
+    mob.desiredHeading_ = mob.heading_;
+    if (mob.stroke_.Active()) mob.stroke_.Reset();
+  };
 
   // ---- THE BEHAVIOUR LAYER ------------------------------------------------
   // A mob with an authored profile is driven by game/ai_behavior.cpp; one
@@ -7219,6 +7235,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // ...and what state the body is in, for the profile's rules
     // (ai_behavior.h "RULES"): the facts a creature's character can hinge on.
     mob.BodyFacts(self.hpFrac, self.burningFrac, self.limbsLost);
+    self.shocked = (float)mob.StunTicksLeft(tick);
     // What is in its hand: a held item arms it AND lets it guard (the parry
     // test is blade on blade — MobSystem::FindParry skips anything unarmed).
     self.armed = !mob.HeldItem().empty();
@@ -7244,6 +7261,11 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
 
     ai::IntentOut out;
     if (ai::Think(mob.ai_, behaviors_, self, gv, wv, tick, dt, out)) {
+      if (stunned) {
+        holdStill();
+        shockAttacksDropped_ += out.attack ? 1u : 0u;
+        return;
+      }
       // ...and turn its head toward whatever it decided to fight (plan §4's
       // closing note on ApplyAimPart). Read off the brain rather than passed
       // out of Think, because it is not an INTENT — the AI has no opinion
@@ -7263,6 +7285,10 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     }
   }
 
+  if (stunned) {
+    holdStill();
+    return;
+  }
   if (!sense.haveGround) return;
 
   // The forward probe is index 0 by construction of the fan.
@@ -8059,6 +8085,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // Runtime defs nothing has held for kDefIdleSweeps sweeps give their bricks
   // back (EvictUnusedDefs). After the risings, which may have composed.
   if (tick % kDefSweepTicks == 0) EvictUnusedDefs(-1, kDefIdleSweeps);
+  // SHOCKS (docs/PLAN_electricity.md E4, mob_shock.cpp): the body query's
+  // answers of tick T - K - 1, applied before the burn pass so a voxel a
+  // shock lit burns this tick; then the stunned twitch.
+  ApplyShocks(tick, world);
+  TickStuns(tick);
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
@@ -8443,6 +8474,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     burnprof::Scope bpStain(burnprof::kStain);
     StainLimbs(tick, world);
   }
+  // THE BODY QUERY for this tick (mob_shock.cpp): every limb where it stands
+  // after this tick's drive, asked of the field SubmitTick's elecQuery row
+  // reads; answered K + 1 ticks from now, at the fixed latency.
+  QueueShockQueries(tick, world);
   // Which corpses have gone quiet, now that every pass of the tick has had
   // its say (the burn pass's idle verdict, the coat's recount, the bleed).
   {

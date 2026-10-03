@@ -1547,12 +1547,18 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // `_r2` -- bit 25 SOURCE (caMask's doorbell) and bit 26 CONDUCTS (E2).
   {
     std::vector<uint32_t> words((size_t)kEpMatStride * kElecMatMax, 0u);
+    // ...and the CPU's copy of "which materials are sources", for the body
+    // query's latch (World::ElecMayBeLive: SubmitTick sees every op that
+    // writes one).
+    std::vector<uint8_t> sources(mats.size(), 0u);
     for (size_t i = 0; i < mats.size() && i < kStainPaletteBase && i < kElecMatMax; i++) {
       const ElecDef& e = mats[i].elec;
       if (e.source != 0) table[i]._r2 |= kElecR2Source;
       if (e.resist != 0) table[i]._r2 |= kElecR2Conducts;
+      if (e.source != 0) sources[i] = 1u;
       PackElecMaterial(e, words.data() + i * kEpMatStride);
     }
+    if (world_ != nullptr) world_->SetElecSourceMats(std::move(sources));
     queue.WriteBuffer(elecParamsBuf_, (uint64_t)kEpMat * 4, words.data(), words.size() * 4);
   }
 
@@ -2283,6 +2289,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { elecRound_ = MakeComputePipeline(device, simPL_, mElec, "elecRound", "elecRound"); });
   pool.Add([&] { elecSettle_ = MakeComputePipeline(device, simPL_, mElec, "elecSettle", "elecSettle"); });
   pool.Add([&] { elecPurge_ = MakeComputePipeline(device, simPL_, mElec, "elecPurge", "elecPurge"); });
+  pool.Add([&] { elecQuery_ = MakeComputePipeline(device, simPL_, mElec, "elecQuery", "elecQuery"); });
 
   pool.Add([&] { explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark"); });
   pool.Add([&] { explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply"); });
@@ -2412,7 +2419,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
-      !elecAlloc_ || !elecRound_ || !elecSettle_ || !elecPurge_ ||
+      !elecAlloc_ || !elecRound_ || !elecSettle_ || !elecPurge_ || !elecQuery_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ || !gLeavePrep_ ||
       !fluidSpawn_ ||
@@ -2904,6 +2911,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::ElecRound:      return elecRound_;
     case P::ElecSettle:     return elecSettle_;
     case P::ElecPurge:      return elecPurge_;
+    case P::ElecQuery:      return elecQuery_;
     default:                return step_;
   }
 }
@@ -3266,6 +3274,31 @@ void Simulation::PrepareElec(const rhi::Queue& queue) {
   std::copy(hdr, hdr + kEpHdrWords, elecHdr_);
   elecHdrValid_ = true;
   queue.WriteBuffer(elecParamsBuf_, 0, hdr, sizeof(hdr));
+}
+
+// THE BODY QUERY's boxes (package E4, elec.h kEpQuery). The count word and
+// the boxes go up only on a tick that has any; a tick with none records no
+// elecQuery row, so the stale boxes in the buffer are never read.
+uint32_t Simulation::PrepareElecQueries(const rhi::Queue& queue,
+                                        const std::vector<ElecQuery>& boxes) {
+  const uint32_t n = (uint32_t)std::min<size_t>(boxes.size(), kElecQueryMax);
+  elecQueries_ = n;
+  if (n == 0) return 0;
+  std::vector<uint32_t> w((size_t)4 + (size_t)n * kElecQueryBoxWords, 0u);
+  w[0] = n;
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t* o = w.data() + 4 + (size_t)i * kElecQueryBoxWords;
+    for (int a = 0; a < 3; a++) {
+      // Clamped to kElecQueryAxisMax cells an axis here as well as in the
+      // kernel: the box is the CPU's, and the kernel's clamp is the belt.
+      const int32_t lo = boxes[i].lo[a];
+      const int32_t hi = std::min(boxes[i].hi[a], lo + (int32_t)kElecQueryAxisMax - 1);
+      o[a] = (uint32_t)lo;
+      o[3 + a] = (uint32_t)hi;
+    }
+  }
+  queue.WriteBuffer(elecParamsBuf_, (uint64_t)kEpQuery * 4, w.data(), w.size() * 4);
+  return n;
 }
 
 bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed) {
@@ -3766,6 +3799,9 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // only while k < elecRounds (Cond::ElecR1..ElecR7), and every elec row only
   // when the CA runs.
   cx.elecRounds = elecRounds_;
+  // ...and the body query's boxes (PrepareElecQueries): the elecQuery row's
+  // extent, recorded only when there are any.
+  cx.elecQueries = elecQueries_;
 
   // ---- the repose snapshot prepass ----------------------------------------
   // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,

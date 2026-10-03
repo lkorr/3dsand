@@ -166,6 +166,12 @@ class Simulation {
   // tick sees. Uploaded only when a word changed. Also fixes the round count
   // EncodeTick records this tick.
   void PrepareElec(const rhi::Queue& queue);
+  // THE BODY QUERY's boxes for this tick (src/sim/elec.h kElecQuery*;
+  // package E4): the count and up to kElecQueryMax boxes to elecParams' tail,
+  // and the count EncodeTick records the elecQuery row with (0 = not
+  // recorded). Call before the tick's encoder exists (a deferred WriteBuffer
+  // drains at the head of the NEXT command buffer). Returns the count taken.
+  uint32_t PrepareElecQueries(const rhi::Queue& queue, const std::vector<ElecQuery>& boxes);
   // The cell the F1 readout asks about (the player's feet); heatRelax copies
   // that block's X / X* / sources into heatMeta's probe words. Render-side
   // input: it changes no heat value, only which one is reported.
@@ -881,7 +887,8 @@ class Simulation {
   // elecRounds_ the round count EncodeTick records (the SAME value the header
   // carries, so the GPU's phase arithmetic and the recorded rows agree).
   rhi::Buffer elecParamsBuf_;
-  rhi::ComputePipeline elecAlloc_, elecRound_, elecSettle_, elecPurge_;
+  rhi::ComputePipeline elecAlloc_, elecRound_, elecSettle_, elecPurge_, elecQuery_;
+  uint32_t elecQueries_ = 0;   // boxes this tick (PrepareElecQueries)
   uint32_t elecHdr_[kEpHdrWords] = {};
   bool elecHdrValid_ = false;
   uint32_t elecRounds_ = 1;

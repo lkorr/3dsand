@@ -162,6 +162,7 @@ inline ShellRow ShellRowOf(DamageCause cause, const Tuning::Gear& g) {
     case DamageCause::Burn:
     case DamageCause::SpawnRot:
     case DamageCause::Infection:
+    case DamageCause::Electric:
     case DamageCause::Count:
       r.carve = {ShellCurve::One};
       r.passed = {ShellCurve::Zero};

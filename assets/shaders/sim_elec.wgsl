@@ -569,3 +569,78 @@ fn elecPurge(@builtin(workgroup_id) wg : vec3<u32>,
   atomicStore(&elecMeta[EM_OWNER + slot], 0u);
   atomicAdd(&elecMeta[EM_FREES], 1u);
 }
+
+// ============================================================================
+// elecQuery: THE BODY QUERY (package E4, docs/PLAN_electricity.md section 4;
+// src/sim/elec.h kElecQuery*). One workgroup per box the CPU asked about this
+// tick (MobSystem::QueueShockQueries: one box per live limb of the bodies near
+// the window, dilated a cell so a foot ON a charged plate counts). It reads
+// the SETTLED field -- half 0, after this tick's settle / tail / purge -- and
+// writes four words per box into elecMeta's tail: the max P, the cells with
+// P > 0, their P summed and the cells scanned. The snapshot ring carries them
+// to the CPU at the fixed latency (World::kSnapshotLatency); the tag that says
+// WHOSE box it was never leaves the CPU (the readback slot holds it).
+//
+// DETERMINISM (rule 1): max and sum are order-independent, and each group
+// writes only its own box's four words. Read-only on the field.
+// COST (rule 2): recorded only on a tick with boxes (C_ELECQUERY), and the CPU
+// queues boxes only while the field can hold charge (World::ElecMayBeLive: a
+// source op in the last K + 2 ticks, or pages in use in the published
+// snapshot). A group whose field has no page in use writes zeros after one
+// load.
+const EM_QUERY : u32 = 72768u;
+const EP_QUERY : u32 = 16416u;
+const EP_QUERY_BOXES : u32 = 16420u;
+const ELEC_QUERY_MAX : u32 = 128u;
+const ELEC_QUERY_BOX_WORDS : u32 = 8u;
+const ELEC_QUERY_RES_WORDS : u32 = 4u;
+const ELEC_QUERY_AXIS_MAX : u32 = 32u;
+
+var<workgroup> wgqMax : atomic<u32>;
+var<workgroup> wgqCharged : atomic<u32>;
+var<workgroup> wgqSum : atomic<u32>;
+var<workgroup> wgqLive : u32;
+
+@compute @workgroup_size(64)
+fn elecQuery(@builtin(workgroup_id) wg : vec3<u32>,
+             @builtin(local_invocation_index) li : u32) {
+  let q = wg.x;
+  if (q >= min(elecParams[EP_QUERY], ELEC_QUERY_MAX)) { return; }
+  let b = EP_QUERY_BOXES + q * ELEC_QUERY_BOX_WORDS;
+  let lo = vec3<i32>(bitcast<i32>(elecParams[b]), bitcast<i32>(elecParams[b + 1u]),
+                     bitcast<i32>(elecParams[b + 2u]));
+  let hi = vec3<i32>(bitcast<i32>(elecParams[b + 3u]), bitcast<i32>(elecParams[b + 4u]),
+                     bitcast<i32>(elecParams[b + 5u]));
+  let dims = vec3<u32>(clamp(hi - lo + vec3<i32>(1), vec3<i32>(0),
+                             vec3<i32>(i32(ELEC_QUERY_AXIS_MAX))));
+  let total = dims.x * dims.y * dims.z;
+  if (li == 0u) {
+    atomicStore(&wgqMax, 0u);
+    atomicStore(&wgqCharged, 0u);
+    atomicStore(&wgqSum, 0u);
+    // Pages in use (handed out and not back on the stack): none = no charge
+    // anywhere, and the box is answered without a scan.
+    let fresh = atomicLoad(&elecMeta[EM_NEXT_FRESH]);
+    let top = atomicLoad(&elecMeta[EM_FREE_TOP]);
+    wgqLive = select(0u, 1u, fresh > top);
+  }
+  let live = workgroupUniformLoad(&wgqLive);
+  if (live != 0u) {
+    for (var i = li; i < total; i += 64u) {
+      let c = lo + vec3<i32>(vec3<u32>(i % dims.x, (i / dims.x) % dims.y, i / (dims.x * dims.y)));
+      let p = elecAtCell(c);
+      if (p != 0u) {
+        atomicMax(&wgqMax, p);
+        atomicAdd(&wgqCharged, 1u);
+        atomicAdd(&wgqSum, p);
+      }
+    }
+  }
+  workgroupBarrier();
+  if (li != 0u) { return; }
+  let o = EM_QUERY + q * ELEC_QUERY_RES_WORDS;
+  atomicStore(&elecMeta[o], atomicLoad(&wgqMax));
+  atomicStore(&elecMeta[o + 1u], atomicLoad(&wgqCharged));
+  atomicStore(&elecMeta[o + 2u], atomicLoad(&wgqSum));
+  atomicStore(&elecMeta[o + 3u], total);
+}

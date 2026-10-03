@@ -152,13 +152,15 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"elecSys", "Charge Field", "simTick", PerfSide::Gpu, PerfScope::Count,
      "elecAlloc0;elecRound0;elecAlloc1;elecRound1;elecAlloc2;elecRound2;elecAlloc3;elecRound3;"
      "elecAlloc4;elecRound4;elecAlloc5;elecRound5;elecAlloc6;elecRound6;elecAlloc7;elecRound7;"
-     "elecSettle;elecAllocTail;elecPurge",
+     "elecSettle;elecAllocTail;elecPurge;elecQuery",
      "The charge field (docs/PLAN_electricity.md, package E1): sim.elecRounds "
      "rounds of a max-plus potential over the chunks that hold charge, each "
      "relaxed to its fixpoint in shared memory, with one-workgroup page "
      "allocation between rounds. With no charge anywhere it is 1 + rounds "
      "single-group allocs that read the want bitset and zero-group indirects; "
-     "the rest scales with charged chunks x rounds."},
+     "the rest scales with charged chunks x rounds. elecQuery (package E4) "
+     "is one 64-thread group per limb box of the bodies near the window, "
+     "recorded only while the field can hold charge."},
     {"particleSys", "Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "

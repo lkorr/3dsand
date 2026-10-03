@@ -5633,6 +5633,19 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   if (w.talk)
     for (SessionTick& p : players)
       dialogue::TickSession(*w.talk, *p.s, p.ti, tick, &w.mobs);
+  // SHOCKED (docs/PLAN_electricity.md E4; MobSystem::ApplyShocks): a player
+  // whose body is stunned has its command zeroed the same way, before
+  // anything reads it -- no walking, no strike, no button -- and keeps only
+  // the look (the camera is the player's, not the body's). The stun is the
+  // creature's (Mob::Stunned), so an NPC and a player are held by one clock.
+  for (SessionTick& p : players)
+    if (p.s->avatar.Stunned(tick)) {
+      p.ti.forward = 0.0f;
+      p.ti.strafe = 0.0f;
+      p.ti.held = 0;
+      p.ti.pressed = 0;
+      p.ti.strikeStyle = -1;
+    }
   for (SessionTick& p : players) ResolveHands(w, p);
   for (size_t i = 0; i < players.size(); i++)
     PhaseA(w, ws, players[i], scratch[i], tick, out);

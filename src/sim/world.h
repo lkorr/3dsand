@@ -13,6 +13,7 @@
 
 #include "math3d.h"
 #include "sim/rng.h"   // rng::Hash3 — the JITTER palette-variant formula
+#include "sim/elec.h"  // the body query's ElecQuery / ElecHit (package E4)
 
 // World constants. These are the SINGLE source of truth: the matching WGSL
 // consts are generated from them by ShaderConstantPrelude() (gpu/resources.cpp)
@@ -4474,6 +4475,15 @@ struct WorldSnapshot {
   // List counts, the free-stack depth, the monotonic firing / alloc / refusal
   // counters and the F1 probe -- as of `tick`. Zeroed by a worldgen / load.
   uint32_t heat[32] = {};
+  // ---- the charge field (elecMeta's header, elec.h kEm*, words 0..31) ----
+  // As of `tick`: the list counts, the free-stack depth, the monotonic
+  // counters. Pages in use = elec[kEmNextFresh] - elec[kEmFreeTop], which is
+  // what World::ElecMayBeLive reads. Zeroed by a worldgen / load.
+  uint32_t elec[32] = {};
+  // ---- THE BODY QUERY's answers (package E4; elec.h ElecHit) ----
+  // The boxes asked on `tick` (World::QueueElecQuery), in the order they were
+  // asked, each with its answer. Empty on a tick that asked nothing.
+  std::vector<ElecHit> elecHits;
   uint32_t solFaults = 0;
   uint32_t solExhausted = 0;
   uint32_t solHighWater = 0;
@@ -5007,6 +5017,61 @@ class World {
   // must be a number) so a harness that never runs the ticket step cannot grow
   // it; cleared by InvalidateSnapshot.
   static constexpr size_t kTicketDepositsPendingMax = 4096;
+  // ---- THE BODY QUERY (package E4: shocks reach bodies; elec.h) -----------
+  //
+  // MobSystem asks, once a tick, about one box per live limb of the bodies
+  // near the window (QueueElecQuery, bounded at kElecQueryMax and every
+  // refusal counted); SubmitTick takes the list (TakeElecQueries), uploads it
+  // (Simulation::PrepareElecQueries) and hands it to the readback slot of the
+  // same tick (SetElecQueriesInFlight), where it rides as the TAG of the
+  // answers the GPU writes. The publish hands the answers over EXACTLY ONCE,
+  // in tick order (TakeElecHits, TakeReactFx's discipline): what a tick
+  // drains is the boxes of tick T - kSnapshotLatency - 1, never "whatever
+  // landed", so the shocks a creature takes are a pure function of the tick.
+  void QueueElecQuery(const ElecQuery& q) {
+    if (elecQueryQueue_.size() >= kElecQueryMax) {
+      elecQueryRefused_++;
+      return;
+    }
+    elecQueryQueue_.push_back(q);
+    elecQueriesAsked_++;
+  }
+  void TakeElecQueries(std::vector<ElecQuery>& out) {
+    out.clear();
+    out.swap(elecQueryQueue_);
+  }
+  void SetElecQueriesInFlight(std::vector<ElecQuery>&& q) { elecInFlight_ = std::move(q); }
+  std::vector<ElecHit> TakeElecHits() {
+    std::vector<ElecHit> out;
+    out.swap(elecHitsPending_);
+    return out;
+  }
+  static constexpr size_t kElecHitsPendingMax = 4 * kElecQueryMax;
+  // CAN THE FIELD HOLD CHARGE AT `tick`? The body query is recorded only
+  // when it can (rule 2: a world with no charge pays nothing). Two inputs,
+  // both pure functions of the tick stream: a SOURCE op (a material with
+  // electric.source, SubmitTick's NoteElecSourceOps) in the last
+  // kSnapshotLatency + 2 ticks, which covers the latency before the field it
+  // lit is visible -- or pages in use in the published snapshot.
+  bool ElecMayBeLive(uint32_t tick) const {
+    if (elecSourceSeen_ && tick <= elecSourceTick_ + kSnapshotLatency + 2u) return true;
+    return snap_.valid && snap_.elec[kEmNextFresh] > snap_.elec[kEmFreeTop];
+  }
+  // The material table's sources (Simulation::UploadTables) and the latch.
+  void SetElecSourceMats(std::vector<uint8_t> m) { elecSourceMat_ = std::move(m); }
+  bool IsElecSourceMat(uint32_t mat) const {
+    return mat < elecSourceMat_.size() && elecSourceMat_[mat] != 0;
+  }
+  void NoteElecSourceOp(uint32_t tick) {
+    elecSourceSeen_ = true;
+    elecSourceTick_ = tick;
+  }
+  struct ElecQueryStats {
+    uint64_t asked = 0, refused = 0, hits = 0, charged = 0;
+  };
+  ElecQueryStats ElecQueryCounters() const {
+    return {elecQueriesAsked_, elecQueryRefused_, elecHitsDelivered_, elecHitsCharged_};
+  }
   std::vector<ParticleSpawn> TakeTicketDeposits() {
     std::vector<ParticleSpawn> out;
     out.swap(ticketDepositsPending_);
@@ -5763,6 +5828,9 @@ class World {
     // snapshot's; a slot without the fold parses as no water.
     bool hashCopied = true;
     bool fluidCopied = true;
+    // The body query's boxes this tick (SetElecQueriesInFlight): the TAGS of
+    // the answers this slot carries. Empty = no answers copied.
+    std::vector<ElecQuery> elecQueries;
   };
   static constexpr int kSlots = kReadbackSlots;
   Slot slots_[kSlots];
@@ -5789,6 +5857,14 @@ class World {
   // Far-landing deposits (TakeTicketDeposits).
   std::vector<ParticleSpawn> ticketDepositsPending_;
   uint64_t ticketDepositsDropped_ = 0;
+  // The body query (QueueElecQuery .. TakeElecHits).
+  std::vector<ElecQuery> elecQueryQueue_, elecInFlight_;
+  std::vector<ElecHit> elecHitsPending_;
+  std::vector<uint8_t> elecSourceMat_;
+  bool elecSourceSeen_ = false;
+  uint32_t elecSourceTick_ = 0;
+  uint64_t elecQueriesAsked_ = 0, elecQueryRefused_ = 0;
+  uint64_t elecHitsDelivered_ = 0, elecHitsCharged_ = 0;
   // Bumped by InvalidateSnapshot and by a TICK REWIND (a harness scene
   // restarting its counter — see kOrder in test/selftest.cpp). Everything from
   // an older epoch is dropped rather than compared against the new tick base,

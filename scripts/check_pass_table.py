@@ -228,6 +228,7 @@ PIPE_TO_MEMBER = {
     "PIPE_ELEC_ROUND": "elecRound_",
     "PIPE_ELEC_SETTLE": "elecSettle_",
     "PIPE_ELEC_PURGE": "elecPurge_",
+    "PIPE_ELEC_QUERY": "elecQuery_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear

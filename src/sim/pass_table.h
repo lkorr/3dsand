@@ -510,6 +510,8 @@ enum class Pipe : uint8_t {
   HeatBegin, HeatShift, HeatPend, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatTent, HeatRelax,
   // The charge field (sim_elec.wgsl, src/sim/elec.h).
   ElecAlloc, ElecRound, ElecSettle, ElecPurge,
+  // The body query (package E4): one group per box a body asked about.
+  ElecQuery,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.
@@ -740,6 +742,9 @@ enum class Cond : uint8_t {
   ElecR5,
   ElecR6,
   ElecR7,
+  // The body query (package E4): RecordCtx::elecQueries > 0, whatever the CA
+  // did this tick.
+  ElecQuery,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -838,6 +843,8 @@ enum class DispatchSel : uint32_t {
   RainExpoSel,
   // ---- the gust streaks: one 64-thread workgroup per 64 live slots ----
   StreakGx,
+  // ---- the body query (package E4): one workgroup per box this tick ----
+  ElecQuerySel,
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
   IndDraftArgs,      // indirect: draftArgs @ the row's y (one 16-byte record per solve stage)
   IndHeatArgs,       // indirect: heatArgs @ the row's y (heat.h kHeatArg*: one 16-byte record per list)
@@ -1016,6 +1023,9 @@ struct RecordCtx {
   // The charge field's rounds this tick (Simulation::PrepareElec: sim.elecRounds,
   // or 1 with the layer off). Gates Cond::ElecR1..ElecR7.
   uint32_t elecRounds = 1;
+  // The body query's boxes this tick (Simulation::PrepareElecQueries): the
+  // elecQuery row's extent, and Cond::ElecQuery.
+  uint32_t elecQueries = 0;
 };
 
 }  // namespace pass

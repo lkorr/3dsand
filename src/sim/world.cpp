@@ -91,7 +91,12 @@ constexpr uint64_t kChunkHashOff =
 // after the digest table, copied every tick.
 constexpr uint64_t kHeatSnapOff = kChunkHashOff + kChunkHashBytes;
 constexpr uint64_t kHeatSnapBytes = kHeatSnapWords * 4;
-constexpr uint64_t kSlotBytes = kHeatSnapOff + kHeatSnapBytes;
+// The charge field's header (elec.h kEm*, words 0..31), every tick, and the
+// body query's answers (kElecQueryResWords per box) on a tick that asked.
+constexpr uint64_t kElecSnapOff = kHeatSnapOff + kHeatSnapBytes;
+constexpr uint64_t kElecSnapBytes = 32 * 4;
+constexpr uint64_t kElecQueryOff = kElecSnapOff + kElecSnapBytes;
+constexpr uint64_t kSlotBytes = kElecQueryOff + kElecQueryResBytes;
 
 // Every WorldSnapshot the pipeline hands around is pre-sized: the readback
 // callback memcpys straight into these arrays. One definition, so the published
@@ -728,6 +733,15 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   }
   enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
   enc.CopyTracked(pass::Buf::HeatMeta, heatMeta, 0, s.buf, kHeatSnapOff, kHeatSnapBytes);
+  // The charge field's header, and the body query's answers when this tick
+  // asked (elecQuery wrote them earlier in this command buffer). The tags go
+  // with the slot; the answers are only meaningful beside them.
+  enc.CopyTracked(pass::Buf::ElecMeta, elecMeta, 0, s.buf, kElecSnapOff, kElecSnapBytes);
+  s.elecQueries.clear();
+  s.elecQueries.swap(elecInFlight_);
+  if (!s.elecQueries.empty())
+    enc.CopyTracked(pass::Buf::ElecMeta, elecMeta, (uint64_t)kEmQuery * 4, s.buf, kElecQueryOff,
+                    (uint64_t)s.elecQueries.size() * kElecQueryResWords * 4);
   enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // Gas: the live per-page counts and the 8-word counter header. Async and one
   // tick latent like every other row here — no gas path anywhere reads back
@@ -1020,6 +1034,22 @@ void World::KickReadback() {
         {
           static_assert(kHeatSnapWords == 32, "WorldSnapshot::heat holds 32 words");
           std::memcpy(out.heat, p + kHeatSnapOff, kHeatSnapBytes);
+          std::memcpy(out.elec, p + kElecSnapOff, kElecSnapBytes);
+          // THE BODY QUERY's answers, tagged from the slot (package E4).
+          out.elecHits.clear();
+          for (size_t k = 0; k < sl.elecQueries.size(); k++) {
+            uint32_t r[kElecQueryResWords];
+            std::memcpy(r, p + kElecQueryOff + k * kElecQueryResWords * 4, sizeof(r));
+            ElecHit h;
+            h.mobId = sl.elecQueries[k].mobId;
+            h.limb = sl.elecQueries[k].limb;
+            h.tick = sl.tick;
+            h.maxP = r[0];
+            h.charged = r[1];
+            h.sumP = r[2];
+            h.cells = r[3];
+            out.elecHits.push_back(h);
+          }
           uint32_t sm[kSolMetaHdrWords] = {};
           std::memcpy(sm, p + kSolMetaSnapOff, kSolMetaSnapBytes);
           out.solFree = sm[kSolMFree];
@@ -1252,6 +1282,12 @@ void World::InvalidateSnapshot() {
   std::fill(quietTicks_.begin(), quietTicks_.end(), (uint16_t)0);
   // Reaction effects the dead world published and nobody consumed yet.
   reactFxPending_.clear();
+  // The body query: a dead world's answers and its source latch go with it.
+  // (Not elecInFlight_: a tick REWIND invalidates from inside EncodeReadbacks,
+  // and the boxes in flight are the CURRENT tick's.)
+  elecHitsPending_.clear();
+  elecQueryQueue_.clear();
+  elecSourceSeen_ = false;
   // ...and far-landing deposits of the dead world (chunk tickets P2).
   ticketDepositsPending_.clear();
   // A regenerated window makes every cached chunk stale too: the fetch path's
@@ -1323,6 +1359,19 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
     // Far-landing deposits (chunk tickets P2) ride the publish the same way:
     // a deposited particle is DEAD on the GPU, so this queue is the only copy
     // of it and must see every published tick (World::TakeTicketDeposits).
+    // The body query's answers (TakeElecHits), the same way: every published
+    // tick's, in tick order, exactly once.
+    if (snap_.valid && !snap_.elecHits.empty()) {
+      for (const ElecHit& h : snap_.elecHits) {
+        elecHitsDelivered_++;
+        if (h.maxP != 0) elecHitsCharged_++;
+      }
+      elecHitsPending_.insert(elecHitsPending_.end(), snap_.elecHits.begin(),
+                              snap_.elecHits.end());
+      if (elecHitsPending_.size() > kElecHitsPendingMax)
+        elecHitsPending_.erase(elecHitsPending_.begin(),
+                               elecHitsPending_.end() - kElecHitsPendingMax);
+    }
     if (snap_.valid && !snap_.ticketDeposits.empty()) {
       ticketDepositsPending_.insert(ticketDepositsPending_.end(),
                                     snap_.ticketDeposits.begin(),

@@ -2259,6 +2259,32 @@ class Mob {
   float HpLostBy(DamageCause c) const {
     return (int)c < (int)DamageCause::Count ? hpLostBy_[(int)c] : 0.0f;
   }
+  // ---- THE SHOCK (docs/PLAN_electricity.md E4; MobSystem::ApplyShocks) -----
+  // A stun is a TICK, not a timer: the creature is stunned while the sim tick
+  // is below stunUntil_, which a shock only ever pushes later. Honoured by
+  // MobSystem::DecideIntent (no move, no attack, a stroke in flight is
+  // dropped) and, for a player's body, by TickAuthority (the command is
+  // zeroed). Never saved, never hashed; a dead creature is never stunned.
+  bool Stunned(uint32_t tick) const { return alive_ && tick < stunUntil_; }
+  uint32_t StunTicksLeft(uint32_t tick) const {
+    return Stunned(tick) ? stunUntil_ - tick : 0u;
+  }
+  // What shocks did to this creature (gate readout, CLAUDE.md rule 6).
+  struct ShockRecord {
+    uint32_t ticks = 0;          // ticks a shock was applied
+    uint32_t limbHits = 0;       // limb-ticks over the threshold
+    uint32_t maxP = 0;           // the highest RAW box P seen (any limb)
+    float maxEffP = 0.0f;        // the highest effective P applied
+    float hp = 0.0f;             // hp charged as DamageCause::Electric
+    uint32_t firstTick = 0, lastTick = 0;
+    uint32_t stunTicks = 0;      // stun ticks granted (the extensions summed)
+    uint32_t ragdolls = 0;       // lightning-class knock-downs
+    uint32_t ignited = 0;        // voxels set alight
+    uint32_t twitches = 0;
+    float wetMax = 0.0f;         // the wettest touching limb's conducting coat
+    bool armour = false;         // wore a conductor on the last shocked tick
+  };
+  const ShockRecord& Shock() const { return shock_; }
   // Take `voxels` of blood out of the creature: charges
   // voxels * gore.bleedHpPerVoxel across the live authored limbs in proportion
   // to what each still has, and kills the creature through Die() when the
@@ -4653,6 +4679,9 @@ class Mob {
   // ---- blood loss and the burn cap (see the public block above) -----------
   float bloodLost_ = 0.0f;
   float hpLostBy_[(int)DamageCause::Count] = {};
+  // The shock (Stunned / Shock above).
+  uint32_t stunUntil_ = 0;
+  ShockRecord shock_;
   float burnFrac_ = 0.0f;
   float burnCap_ = 1.0f;
   // The lattice changed since burnFrac_ was taken. Set by the burn pass and by
@@ -6024,6 +6053,32 @@ class MobSystem {
   // on Layers::AVATAR, which the listener does not report.
   int ApplyContactDamage(const Physics& phys, World& world,
                          std::vector<ParticleSpawn>& spawns);
+  // ---- SHOCKS REACH BODIES (docs/PLAN_electricity.md E4; mob_shock.cpp) ----
+  //
+  // QueueShockQueries: one box per live base limb of every living body this
+  // machine steps (the avatars first, then mobs_), dilated by a cell, queued
+  // on the world's body query -- only while World::ElecMayBeLive says the
+  // field can hold charge, so a world with none asks nothing. End of PreTick.
+  //
+  // ApplyShocks: the answers of tick T - kSnapshotLatency - 1 (the fixed
+  // latency, World::TakeElecHits), applied per body: Electric hp on the
+  // touching limbs and the torso, the stun, a lightning-class knock-down, a
+  // chance of fire on hair / clothes. Then TickStuns: the twitch. Both at the
+  // top of PreTick, before the burn pass, so a voxel a shock lit burns this
+  // tick. Everything here is a pure function of (tick, the answers, the
+  // bodies): integer hashes for every roll.
+  void QueueShockQueries(uint32_t tick, World& world);
+  void ApplyShocks(uint32_t tick, World& world);
+  void TickStuns(uint32_t tick);
+  struct ShockCounters {
+    uint64_t queued = 0;       // boxes asked
+    uint64_t hitsRead = 0;     // answers drained
+    uint64_t hitsCharged = 0;  // ...with P > 0 in the box
+    uint64_t bodiesShocked = 0;  // body-ticks a shock was applied
+    uint64_t stale = 0;        // answers for a body no longer here / alive
+  };
+  const ShockCounters& ShockStats() const { return shockCounters_; }
+  uint64_t ShockAttacksDropped() const { return shockAttacksDropped_; }
   uint32_t ContactHitsBilled() const { return contactHitsBilled_; }
 
   // THE DIRECTIONAL HALF OF A LANDED BLOW (Mob::HitReact). By body handle for
@@ -7742,6 +7797,9 @@ class MobSystem {
   std::vector<MatBurst> matStruck_, matBurst_;
   std::vector<uint8_t> matShell_;
   std::vector<uint8_t> matHot_;         // carries tag:hot
+  // mat -> its electric.resist (0 = insulator), for the shock's wet coat and
+  // conducting armour (mob_shock.cpp). Rebuilt with the rest on a reload.
+  std::vector<uint8_t> matElecResist_;
   // IS AN INFECTION: carries an `infect` block (materials.json, materials.h
   // MaterialDef::infect). Was "carries tag:infectious" until the infection
   // became data (PLAN_weapon_coats B1); the tag still exists for the
@@ -7954,6 +8012,8 @@ class MobSystem {
   std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature
   uint32_t contactHitsBilled_ = 0;  // ApplyContactDamage: contacts billed
+  ShockCounters shockCounters_;      // QueueShockQueries / ApplyShocks
+  uint64_t shockAttacksDropped_ = 0;  // DecideIntent: attacks a stun refused
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------
   // All three are PROCESS state, not world state: none is hashed, none is

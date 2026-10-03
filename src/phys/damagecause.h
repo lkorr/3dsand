@@ -35,6 +35,8 @@ enum class DamageCause : uint8_t {
   Fall,       // landing too hard (PlayerAvatar::ApplyFallDamage)
   Infection,  // a material infection eating tissue (Mob::InfectStep; an
               // `infect` block with "cause": "burn" -- the rot -- books Burn)
+  Electric,   // a shock: the charge field through a body (MobSystem::ApplyShocks,
+              // docs/PLAN_electricity.md E4). Hp only -- no wound, no bleed
   Count
 };
 
@@ -54,6 +56,7 @@ constexpr const char* DamageCauseName(DamageCause c) {
     case DamageCause::SpawnRot: return "spawnrot";
     case DamageCause::Fall: return "fall";
     case DamageCause::Infection: return "infection";
+    case DamageCause::Electric: return "electric";
     case DamageCause::Count: break;
   }
   return "?";

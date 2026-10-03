@@ -187,6 +187,7 @@ namespace {
 #define PIPE_ELEC_ROUND       Pipe::ElecRound
 #define PIPE_ELEC_SETTLE      Pipe::ElecSettle
 #define PIPE_ELEC_PURGE       Pipe::ElecPurge
+#define PIPE_ELEC_QUERY       Pipe::ElecQuery
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -250,9 +251,11 @@ namespace {
 #define C_ELECR5     Cond::ElecR5
 #define C_ELECR6     Cond::ElecR6
 #define C_ELECR7     Cond::ElecR7
+#define C_ELECQUERY  Cond::ElecQuery
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_RAINFALL  (uint32_t)DispatchSel::RainFallSel
+#define D_ELECQUERY (uint32_t)DispatchSel::ElecQuerySel
 #define D_RAINEXPO  (uint32_t)DispatchSel::RainExpoSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
 #define D_CELLS     (uint32_t)DispatchSel::Cells

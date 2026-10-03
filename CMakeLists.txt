@@ -510,6 +510,7 @@ add_library(sandvox_core OBJECT
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  src/game/mob_shock.cpp
   # What one creature looks like on the wire: the four records mob ownership
   # exchanges (docs/PLAN_multiplayer_m9.md M9.4-B). Data and encode/decode
   # only — no sockets, no tick.
@@ -630,6 +631,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_chem.cpp
   src/test/selftest_elec_strike.cpp
   src/test/selftest_elec.cpp
+  src/test/selftest_elec_mob.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_solute.cpp

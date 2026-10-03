@@ -184,6 +184,8 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::ElecR5:        return cx.caActive && cx.elecRounds > 5;
     case pass::Cond::ElecR6:        return cx.caActive && cx.elecRounds > 6;
     case pass::Cond::ElecR7:        return cx.caActive && cx.elecRounds > 7;
+    // The body query (package E4): boxes this tick, whatever the CA did.
+    case pass::Cond::ElecQuery:     return cx.elecQueries > 0;
   }
   return false;
 }
@@ -230,6 +232,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::RainFallSel: return cx.rainFallGroups;
     case pass::DispatchSel::RainExpoSel: return cx.rainExpoGroups;
     case pass::DispatchSel::StreakGx: return cx.streakGx;
+    case pass::DispatchSel::ElecQuerySel: return cx.elecQueries;
     default:                          return v;
   }
 }

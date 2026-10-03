@@ -1839,6 +1839,34 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // The charge field's knobs (mode, rounds, decay, wet table): a pure function
   // of tuning, and the round count EncodeTick records this tick.
   sim.PrepareElec(ctx.queue);
+  // THE BODY QUERY (package E4; World::QueueElecQuery): the boxes the tick's
+  // bodies asked about go up with the tick, and their tags ride this tick's
+  // readback slot so the answers come back at the fixed snapshot latency.
+  // NOT on the op record: the query reads the field and writes nothing a
+  // replay has to reproduce -- what the bodies DO with the answers arrives
+  // here as ordinary ops a later tick, and those are recorded.
+  {
+    std::vector<ElecQuery> elecQ;
+    world.TakeElecQueries(elecQ);
+    sim.PrepareElecQueries(ctx.queue, elecQ);
+    if (elecQ.size() > kElecQueryMax) elecQ.resize(kElecQueryMax);
+    world.SetElecQueriesInFlight(std::move(elecQ));
+  }
+  // ...and the latch that decides whether bodies ask at all
+  // (World::ElecMayBeLive): did any op of this tick write a SOURCE material?
+  // Every author of a spark, an arc or a bolt comes through here, so the
+  // field the op lights is queried from the next tick on, not K ticks later
+  // when the snapshot would first show it.
+  {
+    bool src = false;
+    for (uint32_t i = 0; i < cellCount && !src; i++)
+      src = !IsSoluteCellOp(cells[i].word) && world.IsElecSourceMat(cells[i].word & 0xFFFu);
+    for (size_t i = 0; i < ops.size() && !src; i++)
+      src = world.IsElecSourceMat(ops[i].material & 0xFFFu);
+    for (size_t i = 0; i < spawns.size() && i < spawnCount && !src; i++)
+      src = world.IsElecSourceMat(spawns[i].payload & 0xFFFu);
+    if (src) world.NoteElecSourceOp(tick);
+  }
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
   if (!exps.empty())

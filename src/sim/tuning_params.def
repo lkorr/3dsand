@@ -1878,6 +1878,30 @@ TP_F(gore, burnCapMidHealth, NO_WGSL, 0.333f, 0.0f, 1.0f)
 // burnt), and the mid health inside [0, 1] so the cap is monotone.
 // + a hand-written rule in LoadTuning
 TP_F(gore, burnDeathFraction, NO_WGSL, 0.70f, 0.05f, 1.0f)
+// ---- H. shocks reach bodies (docs/PLAN_electricity.md E4) -----------------
+// CPU-only (MobSystem::ApplyShocks). P is the charge field's potential (u16,
+// elec.h); every P below is the EFFECTIVE P: the box's max P x (1 + shockWetGain
+// x the limb's conducting coat fraction) x shockArmourGain under a conducting
+// worn shell. Nothing happens below shockMinP (shockMinP x
+// shockArmourMinPScale in metal).
+TP_I(gore, shockMinP, NO_WGSL, 60, 0, 65535)
+TP_F(gore, shockHpPerKiloP, NO_WGSL, 1.5f, 0.0f, 100.0f)
+TP_F(gore, shockHpMaxPerTick, NO_WGSL, 40.0f, 0.0f, 1000.0f)
+TP_F(gore, shockTorsoShare, NO_WGSL, 0.5f, 0.0f, 1.0f)
+TP_F(gore, shockWetGain, NO_WGSL, 2.0f, 0.0f, 20.0f)
+TP_F(gore, shockArmourGain, NO_WGSL, 1.5f, 1.0f, 10.0f)
+TP_F(gore, shockArmourMinPScale, NO_WGSL, 0.5f, 0.05f, 1.0f)
+TP_I(gore, shockArmourResistMax, NO_WGSL, 8, 1, 254)
+TP_F(gore, shockStunTicksPerKiloP, NO_WGSL, 6.0f, 0.0f, 1000.0f)
+TP_I(gore, shockStunMinTicks, NO_WGSL, 6, 0, 600)
+TP_I(gore, shockStunMaxTicks, NO_WGSL, 90, 0, 3600)
+TP_I(gore, shockRagdollP, NO_WGSL, 8000, 0, 65535)
+TP_F(gore, shockRagdollSeconds, NO_WGSL, 2.5f, 0.0f, 30.0f)
+TP_I(gore, shockIgniteMinP, NO_WGSL, 1500, 0, 65535)
+TP_F(gore, shockIgniteGain, NO_WGSL, 0.05f, 0.0f, 1.0f)
+TP_I(gore, shockIgniteVoxels, NO_WGSL, 6, 0, 256)
+TP_I(gore, shockTwitchTicks, NO_WGSL, 4, 1, 60)
+TP_F(gore, shockTwitchHp, NO_WGSL, 12.0f, 0.0f, 200.0f)
 
 
 // ==== coat ====

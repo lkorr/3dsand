@@ -130,13 +130,33 @@ static_assert(kEmArgs * 4 == 128, "pass_table.def copy_elecArgs reads byte 128")
 static_assert(kElecArgsBytes == 32, "pass_table.def copy_elecArgs copies 32 bytes");
 static_assert(kEmArgs + kElecArgRecords * 4 <= kEmHdrWords, "the args fit the header");
 
+// ---- THE BODY QUERY (package E4: shocks reach bodies) -----------------------
+// Up to kElecQueryMax world-cell BOXES a tick (one per live limb of the bodies
+// near the window: MobSystem::QueueShockQueries), each answered by one
+// workgroup of sim_elec.wgsl elecQuery with the settled field's max P over the
+// box, the cells with P > 0, their P sum and the cells scanned. The boxes ride
+// elecParams' tail (CPU-written, Simulation::PrepareElecQueries), the answers
+// elecMeta's tail (GPU-written), and the answers reach the CPU on the
+// snapshot ring at World::kSnapshotLatency, exactly like every other gameplay
+// readback: a decision at tick T reads the boxes of tick T - K - 1, never
+// "whenever the copy landed". A box is inclusive and at most
+// kElecQueryAxisMax cells along each axis (the CPU clamps it).
+constexpr uint32_t kElecQueryMax = 128;
+constexpr uint32_t kElecQueryBoxWords = 8;   // lo.xyz, hi.xyz (i32, inclusive), 0, 0
+constexpr uint32_t kElecQueryResWords = 4;   // maxP, charged cells, sum P, cells scanned
+constexpr uint32_t kElecQueryAxisMax = 32;
+constexpr uint32_t kElecQueryResBytes = kElecQueryMax * kElecQueryResWords * 4;
+
 constexpr uint32_t kEmEntry = kEmHdrWords;                       // HAS | page
 constexpr uint32_t kEmOwner = kEmEntry + kElecWindowChunks;       // packed world chunk
 constexpr uint32_t kEmWant = kEmOwner + kElecWindowChunks;        // bitset
 constexpr uint32_t kEmList0 = kEmWant + kElecWindowChunks / 32;
 constexpr uint32_t kEmList1 = kEmList0 + kElecPoolPages;
 constexpr uint32_t kEmStack = kEmList1 + kElecPoolPages;
-constexpr uint32_t kEmWords = kEmStack + kElecPoolPages;
+// The body query's answers, kElecQueryResWords per box (elecQuery writes them;
+// the snapshot ring copies the first `count` boxes' worth on a tick that ran).
+constexpr uint32_t kEmQuery = kEmStack + kElecPoolPages;
+constexpr uint32_t kEmWords = kEmQuery + kElecQueryMax * kElecQueryResWords;
 
 constexpr uint32_t kElecEntryHas = 0x80000000u;
 constexpr uint32_t kElecEntryPage = 0x00FFFFFFu;
@@ -155,7 +175,11 @@ constexpr uint32_t kEpWet = 16;        // 16 words, 16..31
 constexpr uint32_t kEpMat = kEpHdrWords;   // 4 words per material
 constexpr uint32_t kEpMatStride = 4;
 constexpr uint32_t kElecMatMax = 4096;
-constexpr uint32_t kEpWords = kEpMat + kEpMatStride * kElecMatMax;
+// The body query's boxes (see kElecQueryMax): word 0 the box count, words
+// 1..3 zero, then kElecQueryBoxWords per box.
+constexpr uint32_t kEpQuery = kEpMat + kEpMatStride * kElecMatMax;
+constexpr uint32_t kEpQueryBoxes = kEpQuery + 4;
+constexpr uint32_t kEpWords = kEpQueryBoxes + kElecQueryMax * kElecQueryBoxWords;
 
 // One material = four words at kEpMat + mat * 4:
 //   w0  resist (bits 0..7; 0 = insulator) | source (bits 16..31)
@@ -197,6 +221,27 @@ struct ElecRunStats {
 };
 void ElecNoteRun(const uint32_t* header);   // elecMeta words 0..kEmSnapWords
 const ElecRunStats& ElecRunTotals();
+// ---- the body query, CPU side (World::QueueElecQuery, WorldSnapshot) --------
+// One box a body asked about: world cells, inclusive, and WHO asked (the
+// creature id and its rig slot) -- the tag stays on the CPU, in the readback
+// slot that carries the box's answer, so the GPU never sees an id.
+struct ElecQuery {
+  int32_t lo[3] = {0, 0, 0}, hi[3] = {-1, -1, -1};
+  uint64_t mobId = 0;
+  int32_t limb = -1;
+};
+// One answer, as the publish hands it over: the query's tag, the tick whose
+// field it read, and kElecQueryResWords of result.
+struct ElecHit {
+  uint64_t mobId = 0;
+  int32_t limb = -1;
+  uint32_t tick = 0;      // the tick the box was asked (and the field read) on
+  uint32_t maxP = 0;      // the highest settled P in the box
+  uint32_t charged = 0;   // cells with P > 0
+  uint32_t sumP = 0;      // their P, summed
+  uint32_t cells = 0;     // cells scanned (the box's volume inside the window)
+};
+
 // Packed world-chunk key for elecMeta's owner word (10 bits an axis, +1 so a
 // zero word is never a valid owner).
 inline uint32_t ElecOwnerKey(int x, int y, int z) {

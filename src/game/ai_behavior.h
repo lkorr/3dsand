@@ -529,6 +529,10 @@ enum class Fact : uint8_t {
   Hostiles,         // live actors of another faction within sightRange whose
                     // own profile is `aggro: "hostile"` (Actor::hostile): a
                     // villager runs from the zombie, not from the player
+  // ---- (2026-10-03, PLAN_electricity E4) ------------------------------------
+  Shocked,          // ticks of shock stun left (0 = not stunned). While > 0
+                    // the body's intent is overridden (no move, no attack);
+                    // a rule may still read it (e.g. flee the water after)
   Count,
 };
 const char* FactName(Fact f);
@@ -760,6 +764,8 @@ struct SelfView {
   float hpFrac = 1.0f;
   float burningFrac = 0.0f;
   int limbsLost = 0;
+  // Ticks of shock stun left (Mob::StunTicksLeft; Fact::Shocked). 0 = none.
+  float shocked = 0.0f;
   // Something is in this body's hand (Fact::Armed), and it can hold a guard
   // with it — a guard is a BLADE across a line, which is what the parry test
   // meets, so fists and teeth cannot.

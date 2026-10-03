@@ -169,6 +169,7 @@ const char* FactName(Fact f) {
     case Fact::EngagedAllies: return "engagedAllies";
     case Fact::PressRank: return "pressRank";
     case Fact::Hostiles: return "hostiles";
+    case Fact::Shocked: return "shocked";
     default: return "?";
   }
 }
@@ -1112,6 +1113,7 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   f[(int)Fact::Hp] = self.hpFrac;
   f[(int)Fact::Burning] = self.burningFrac;
   f[(int)Fact::LimbsLost] = (float)self.limbsLost;
+  f[(int)Fact::Shocked] = self.shocked;
   f[(int)Fact::SinceHurt] = b.everHurt ? (float)(tick - b.hurtTick) : kNever;
   f[(int)Fact::HasTarget] = b.hasTarget ? 1.0f : 0.0f;
   f[(int)Fact::Visible] = b.visible ? 1.0f : 0.0f;
