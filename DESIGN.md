@@ -15614,21 +15614,32 @@ light every frame; gathered after the resolve the near field read ~2/255
 darker (meadow, 37% of pixels), gathered before it reads last frame's
 post-write-back plane — the order the P2 paragraph below describes — and lands
 +0.37/255 brighter than the inline gather's mid-frame read (meadow: 0.21% of
-pixels ≥ 16/255, risers facing lit ground; re-run floor 0.0007%).
+pixels ≥ 16/255, risers facing lit ground; re-run floor 0.0007%). Short
+captures converge faster than they did: `--shot` `screenshot` 0.07%,
+`screenshot_far` 2.1% of pixels ≥ 16/255 (risers and the bounce-lit valley
+wall a little brighter after the same frame count).
 `giCachePeriod 0` now means "every visible face, every frame, in the compute
 pass" (`nogicache`). The pass walks NINE LANES per face (one per ray, summed in
 ray order — bit-identical to one thread per face): one thread per face was
 latency-bound and cost 0.06-0.09 ms of `pre` for a few hundred faces.
-Measured (1080p, one process: inline gather arm vs this): raymarch -0.21..-0.27
-ms on noon/meadow/seam/seamveg, `pre` +0.00..0.02; see the commit. History: before this, on the scheduled frame ELECTED
+Measured (1080p, boots alternated, HEAD shaders vs this): raymarch noon
+6.07 → 5.80 ms, meadow 4.37 → 4.00, seam 3.76 → 3.50, seamveg 7.39 → 7.06,
+`pre` +0.00..0.02; `--shader-stats` fragment stage unchanged at 128 registers /
+96 B local (binary −17 KB): the nine inlined loops were not where the allocator
+spilled, the saving is the warps that no longer gather. History: before this, on the scheduled frame ELECTED
 pixels re-gathered inline (footprint window widened by 1/cos of the view angle,
 plus a 1-in-32 lottery, -0.08..-0.16 ms), and before that every pixel of the
 slot did.
 
 **Verified by** `--selftest --gate gi-bounce`: a white `bone` wall on the -X
 edge of a floating 41×41 `leaves` slab at noon; the wall's +X face rendered
-with `giStrength` at its default and at 0 differs by R +2.26, G +5.80,
-B +1.01 per 255 over the middle of the frame (G ≥ 2.0 and G − R ≥ 1.0 from
+with `giStrength` at its default and at 0 differs by R +17.3, G +33.4,
+B +9.5 per 255 over the middle of the frame (2026-10-03, compute-pass gather;
+the inline gather, HEAD shaders on the same exe, measured R +3.3, G +7.0: its first-sight
+gather read a plane the resolve had not yet deposited into and was then held
+until the slot's period came round, so six frames showed a fraction of the
+bounce the fixture converges to — the write-back word after 500 frames is
+within 2% between the two) (G ≥ 2.0 and G − R ≥ 1.0 from
 `tests/baseline.json`), and the slab's own +Y word reads green-led. The
 `shadow-cache` gate pins `giStrength = 0` for its arms: its reference arm has
 no resolve pass and so no injection, and the bounce would otherwise be the
