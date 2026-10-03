@@ -238,6 +238,9 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
             let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
             vMax[a] = (boundary - roL[a]) * inv[a];
           }
+          // raymarch.wgsl farShadowMarch, THE ROW SKIP INSIDE THE CHUNK: a
+          // rising ray past the chunk's top row can meet nothing more in it.
+          let yTopRow = select(i32(0x7FFFFFFF), cLo.y + i32(top), top != 0u);
           for (var j = 0; j < 3 * i32(CHUNK); j++) {
             if (budget <= 0) { break; }
             budget -= 1;
@@ -250,6 +253,7 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
             }
             if (vCur >= tOut || vCur >= tExit) { break; }
+            if (stepv.y > 0 && vc.y >= yTopRow) { break; }
           }
         }
       }

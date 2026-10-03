@@ -5866,6 +5866,18 @@ fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
             let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
             vMax[a] = (boundary - roL[a]) * inv[a];
           }
+          // THE ROW SKIP, INSIDE THE CHUNK (2026-10-03). The entry test above
+          // only drops a ray that ENTERS a chunk above its top row. The ray a
+          // far receiver casts starts INSIDE its own surface chunk, below that
+          // row, and every level's first chunk is entered mid-air the same
+          // way — so it walked cell by cell to the chunk's exit face through
+          // rows the top word already says are empty. A rising ray that
+          // reaches row `top` can meet nothing more in this chunk, so the walk
+          // ends there and the chunk cursor carries on: exact (the row is
+          // conservative-high, FAR_OCC_TOP_SHIFT), and the same in
+          // shadow_resolve.wgsl's farShadowT. No upper bound when top is 0
+          // ("unknown, assume full").
+          let yTopRow = select(i32(0x7FFFFFFF), cLo.y + i32(top), top != 0u);
           for (var j = 0; j < 3 * i32(CHUNK); j++) {
             if (budget <= 0) { break; }
             rsAdd(RS_FAR_SHADOW, 1u);
@@ -5883,6 +5895,7 @@ fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
               vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; eAx = 2;
             }
             if (vCur >= tOut || vCur >= tExit) { break; }
+            if (stepv.y > 0 && vc.y >= yTopRow) { break; }
           }
         }
       }
