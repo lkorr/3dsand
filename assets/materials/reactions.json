@@ -2845,7 +2845,7 @@
       "becomes": "air"
     },
     {
-      "note": "coolant (an android's bleed, materials.json) dries away like blood so a spill goes back to sleep (rule 2). DRYING: the alchemy bench never fires it inside a vessel. Appended: re-rolls no earlier rule.",
+      "note": "coolant (an android's bleed until 2026-10-03; nothing bleeds it now, materials.json) dries away like blood so a spill goes back to sleep (rule 2). DRYING: the alchemy bench never fires it inside a vessel. Appended: re-rolls no earlier rule.",
       "self": "coolant",
       "decay": true,
       "becomes": "air",

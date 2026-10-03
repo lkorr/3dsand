@@ -1569,6 +1569,63 @@ Status GateAlchemyElectrolysis(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ELECTRIFY REACHES POWDER AND GAS (PLAN_electricity E5, 2026-10-03). The
+// virtual spark neighbour used to be offered to LIQUID particles only
+// (GatherParticleNbrs), so on the bench thermite and hydrogen ignored the
+// Electrify button their world rules answer to (`tag:electric`:
+// thermite -> molten_iron, hydrogen -> fire + pop). GatherPixelNbrs now offers
+// it to grains and gas pixels on the same gate. Two flasks, each run twice --
+// SHOCKED and a CONTROL never shocked -- with no burner: the shocked thermite
+// must make molten iron and the shocked hydrogen fire, and the controls
+// nothing (so the spark, not something else in the flask, is the cause).
+// NO fixture rules: the table must carry both world rules.
+Status GateAlchemyElectrifyPowder(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int th = SlotOfName(b, c, "thermite"), fe = SlotOfName(b, c, "molten_iron"),
+            h2 = SlotOfName(b, c, "hydrogen"), fire = SlotOfName(b, c, "fire");
+  if (th < 0 || fe < 0 || h2 < 0 || fire < 0) { detail = "missing materials"; return Status::Fail; }
+  if (!b.chem.spark.on) { detail = "no tag:electric in the table"; return Status::Fail; }
+  const bool rules = HasVirtualRule(b, th, b.chem.spark, fe) && HasVirtualRule(b, h2, b.chem.spark, fire);
+  if (!rules) {
+    detail = "the bench table lacks thermite/hydrogen + tag:electric (reactions.json)";
+    return Status::Fail;
+  }
+  // One flask of `slot` (amount eighths), stoppered for a gas so it cannot
+  // rise out of the mouth; electrify every half second for six seconds when
+  // `shock`. Returns produced[product]; the unit audit must stay exact.
+  auto run = [&](int slot, uint32_t amount, bool stopper, bool shock, int product, std::string& why,
+                 const char* shot) -> int64_t {
+    Composition in;
+    in.Add(b.subs[slot].mat, amount);
+    alchemy::FlaskSim s(ChemConfig());
+    s.SetSubstances(b.subs);
+    s.SetChemistry(b.chem);
+    const int v = s.AddVessel(BenchFlask(256), {{240, 4}, 0}, in);
+    if (stopper) s.SetStopper(v, true);
+    for (int f = 0; f < 60; f++) s.Step(4);   // settle
+    for (int f = 0; f < 60 * 6; f++) {
+      if (shock && f % 30 == 0) s.Shock(v);
+      s.Step(4);
+      if (f == 8 && shot) Shot(s, shot);
+    }
+    if (!s.AuditUnits(&why) && why.empty()) why = "audit failed";
+    return s.Produced()[product];
+  };
+  std::string wT, wTc, wH, wHc;
+  const int64_t ironOn = run(th, 60, false, true, fe, wT, "alchemy_electrify_thermite.bmp");
+  const int64_t ironOff = run(th, 60, false, false, fe, wTc, nullptr);
+  const int64_t fireOn = run(h2, 8, true, true, fire, wH, "alchemy_electrify_hydrogen.bmp");
+  const int64_t fireOff = run(h2, 8, true, false, fire, wHc, nullptr);
+  const bool audits = wT.empty() && wTc.empty() && wH.empty() && wHc.empty();
+  const bool ok = ironOn > 0 && ironOff == 0 && fireOn > 0 && fireOff == 0 && audits;
+  detail = Format("thermite 60: electrified -> %lld units molten iron, control %lld (must be 0); "
+                  "hydrogen 8 (stoppered): electrified -> %lld units fire, control %lld (must be 0); audit %s",
+                  (long long)ironOn, (long long)ironOff, (long long)fireOn, (long long)fireOff,
+                  audits ? "exact" : (wT + wTc + wH + wHc).c_str());
+  std::printf("alchemy-electrify-powder: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // BRINE ELECTROLYSIS AT THE BENCH (the chlor-alkali cell; package G). The
 // world's two water rules gated on DISSOLVED salt (reactions.json "solute":
 // "salt", "cMin": 24) are compiled onto the bench with their condition
@@ -2400,6 +2457,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},
       {"alchemy-brine-electrolysis", "player", {}, false, GateAlchemyBrineElectrolysis},
+      {"alchemy-electrify-powder", "player", {}, false, GateAlchemyElectrifyPowder},
       {"alchemy-explode", "player", {}, false, GateAlchemyExplode},
       {"alchemy-ether-fire", "player", {}, false, GateAlchemyEtherFire},
       // Package E: the creative expansion's recipes on the bench.

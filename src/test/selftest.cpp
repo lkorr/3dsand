@@ -930,7 +930,7 @@ const char* const kOrder[] = {
     "alchemy-lift", "alchemy-place", "alchemy-coherence",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
     "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-gas-vent", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode", "alchemy-ether-fire",
-    "alchemy-brine-electrolysis",
+    "alchemy-brine-electrolysis", "alchemy-electrify-powder",
     // Package E on the bench: every headline recipe through the world's table.
     "chem-bench",
     // World chemistry (docs/PLAN_alchemy_chemistry.md A): each builds its own
@@ -977,8 +977,9 @@ const char* const kOrder[] = {
     // ...and how much a wound bleeds by what it opened: wood a fifth of flesh.
     "wood-bleed", "bleed-fluid", "mob-race",
     // ...and what a machine is made of: plating turns the edge, the cut leaks
-    // oil or coolant, and death lets the boiler or the power cell go.
-    "robot-races",
+    // oil (an android leaks nothing and sparks), and death lets the boiler or
+    // the power cell go.
+    "robot-races", "android-sparks",
     // ...and the structural consequence the rot had none of until 2026-09-19:
     // a limb whose ATTACHMENT has been eaten comes off, whatever ate it.
     "joint-rot",

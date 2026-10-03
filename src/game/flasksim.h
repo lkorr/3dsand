@@ -455,7 +455,8 @@ class FlaskSim {
   bool Burner(int v) const { return VesselAlive(v) && vessels_[v].burner; }
   float Heat(int v) const { return VesselAlive(v) ? vessels_[v].heat : 0.0f; }
   bool Burning(int v) const;   // the flame is lit under it right now
-  // Electrify: its liquid sees a spark neighbour for cfg.shockSteps steps.
+  // Electrify: everything it holds (liquid, grains, gas) sees a spark
+  // neighbour for cfg.shockSteps steps.
   void Shock(int v);
   bool Shocked(int v) const { return VesselAlive(v) && vessels_[v].shock > 0; }
   // Gas inside a vessel, in GAS units (SimConfig::gasExpand to a unit of

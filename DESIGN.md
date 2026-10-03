@@ -5240,10 +5240,19 @@ The machine races' behaviour is ten materials.json rows and three new fields,
 no race code: brass plating, oily `clockwork`, an iron frame, a glowing
 `boiler` and a `cogitator` (brainHp) for the automaton; `synth_shell` panels,
 arcing `circuitry`, an `alloy` endoskeleton (hardness 180), a glowing
-`power_cell` and a `neural_core` (brainHp) for the android; `coolant` (cyan,
-faintly lit, an extinguisher, dries like blood) is what an android bleeds, and
-`oil` what an automaton bleeds -- flammable, so a holed automaton near a spark
-burns. None of the rows is flammable, organic or dissolvable, and every
+`power_cell` and a `neural_core` (brainHp) for the android; `oil` is what an
+automaton bleeds -- flammable, so a holed automaton near a spark burns.
+**An android bleeds NOTHING** (owner, 2026-10-03: "sparks only, no fluid"):
+its rows say `bleedFluid: false`, its wiring/cell/core crumble to `gravel`, and
+its sidecars carry `"bleed": null` (android.js `BLEED = null`), which the
+`extends` merge reads as deleting the human's blood -- a def with no bleed
+block, which is the existing "bleeds nothing at all" path (`Mob::FluidAt`,
+`BleedTick` and blunt pulp all stop at `bleedMat == 0`). Three holes in that
+path were closed with it: `Mob::Damage` and `Sever` no longer open a bleed
+budget nothing would ever drain, `Sever` throws no material-0 "droplets" (and
+charges no `DrainBlood` hp for them), and a carved gobbet takes no fluid from
+its matter on a bloodless creature. `coolant` (cyan, faintly lit, an
+extinguisher, dries like blood) stays a material; nothing bleeds it. None of the rows is flammable, organic or dissolvable, and every
 rotRate is 0: fire, acid, rot and venom find nothing to take.
 - **`shell`: a body of plate chips, it does not gash.** A blow whose struck
   voxel is `shell` on a BODY limb takes the worn-plate response
@@ -5259,8 +5268,12 @@ rotRate is 0: fire, acid, rot and venom find nothing to take.
   gear.cutHardnessRef for every id.
 - **`struck`: what a blow knocks out.** A living body struck ON such matter
   throws a small ball of it into the air at the hit, on a hash of (creature,
-  tick, slot, count): sparks off brass (0.2) and wiring (0.9), steam off the
-  boiler (0.8).
+  tick, slot, count): sparks off brass (0.2), steam off the boiler (0.8);
+  on the android (2026-10-03) the shell sparks on 0.8 of blows, the frame
+  0.7, wiring / cell / core on every one at radius 2. `struck.arcs` (0..1, or
+  `true`) is the chance a ball that fires is laid along the jagged arcs
+  instead (a second draw off the blow's hash): wiring and core 0.25, the cell
+  0.5. Still capped at 8 bursts a tick (`kBodyBurstsPerTick`).
 - **`burst`: what a breach or a death lets go.** The first wound that removes a
   voxel of burst matter lets it go once (`Mob::breachBurst_`), and `Mob::Die`
   lets it go again from the centre of all of it: a dead automaton's head of
@@ -5273,9 +5286,13 @@ IfAir cell ops the next tick (`ReactFxAftermath`, `arcs` = the jagged walks):
 through the op stream (rule 3), at hashed positions (rule 1), bounded twice
 (rule 2). Gate `robot-races`: plating loses a quarter of the voxels and half or
 less of the hp a human forearm does to the same two cuts, the cut plane costs
-2.5x (automaton) / 7x (android) to part, oil / coolant leak, steam / an arcing
-discharge at death -- and, through the real tick, an android's death lays 60
-spark cell ops.
+2.5x (automaton) / 7x (android) to part, oil leaks from the automaton and
+nothing from the android, steam / an arcing discharge at death -- and, through
+the real tick, an android's death lays 60 spark cell ops. Gate
+`android-sparks`: twelve blade / mace blows on a courier through THE tick
+queue a struck burst on most of them, come out as spark cell ops, and not one
+coolant (or any fluid) cell / particle / fluid op appears, no limb owes a
+bleed budget; the same blows on a tinker still leak oil.
 
 ### Large-scale destruction
 - **Explosions**: cast rays from the blast center to every voxel on the blast
@@ -20390,7 +20407,10 @@ what keeps ValidateBench a proof.
   how hot it is -- it answers to `tag:hot` plus every synthetic bit a
   `neighborChance` rule made of it (ExpandNeighborChance: "hot but not fire"),
   i.e. every bit only hot materials carry, since the glass is hot and not fire;
-  and Electrify's discharge, seen by the liquid for 0.6 s, which is the gas
+  and Electrify's discharge, seen by EVERYTHING in the vessel for 0.6 s --
+  liquid particles, grains and gas pixels alike (grains and gas only since
+  2026-10-03; before that thermite, hydrogen and ether vapour ignored the
+  button their world `tag:electric` rules answer to) -- which is the gas
   tagged `electric` (the contract's `spark`). A rule that rewrites a virtual
   neighbour MATERIALISES its product where it touched: the world's spark voxel
   becomes chlorine, so ours leaves chlorine. A heated vessel is a hot
@@ -20629,7 +20649,9 @@ water on the burner BURSTS; the stopper on the item record and its refusals),
 `alchemy-dissolve` (salt dissolves and the tally's dissolved portion matches,
 off and on again it goes back into solution; fairy dust makes enchanted
 water), `alchemy-electrolysis` (salt melts over the burner, electrify splits
-it into sodium and chlorine), `alchemy-explode` (sodium in water raises
+it into sodium and chlorine), `alchemy-electrify-powder` (electrified thermite
+makes molten iron and electrified hydrogen fire, never-shocked controls make
+neither; no fixture rules), `alchemy-explode` (sodium in water raises
 `explode`, the handler ejects/breaks/blasts at the hands, the broken flask
 empties exactly through the spill door, pocket sodium+water explodes). Each
 falls back to a FIXTURE rule, named in its detail line, when the table lacks

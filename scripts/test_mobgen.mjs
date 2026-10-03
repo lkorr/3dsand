@@ -1637,8 +1637,13 @@ section('P. the machine races: automaton and android on the SAME rig');
       for (const si of Object.values(M.STAND_INS))
         ok(c[si] > 0, `${k}: the bake holds ${si} (${M.STAND_INS ? Object.keys(M.STAND_INS).find(r => M.STAND_INS[r] === si) : ''})`,
            JSON.stringify(c));
-      ok(b.sidecar.bleed.material === M.BLEED.material,
-         `${k}: bleeds ${M.BLEED.material}`);
+      if (M.BLEED)
+        ok(b.sidecar.bleed && b.sidecar.bleed.material === M.BLEED.material,
+           `${k}: bleeds ${M.BLEED.material}`);
+      else
+        ok(b.sidecar.bleed === null,
+           `${k}: bleeds nothing (sidecar bleed is null)`,
+           JSON.stringify(b.sidecar.bleed));
       ok(b.sidecar.race === race, `${k}: the sidecar says ${race}`);
     }
     // 4. A HUMAN NEVER SEES THE RACE: none of its colour slots in a human's

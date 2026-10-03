@@ -2716,8 +2716,9 @@ Status GateBleedFluid(Ctx& c, std::string& detail) {
 // two blade cuts as wood-bleed:
 //   * the stand-ins were rewritten at load (anatomy.becomes): brass / synth
 //     shell on the forearm, no cactus_rib / mushroom_stem left;
-//   * the cut LEAKS what the matter says: oil from the automaton, coolant
-//     from the android;
+//   * the cut LEAKS what the matter says: oil from the automaton, NOTHING
+//     from the android (2026-10-03: "sparks only, no fluid"; android-sparks
+//     holds the sparks and the absence of coolant to the real tick);
 //   * plating TURNS THE EDGE: fewer voxels carved and less hp lost than the
 //     human (`shell`), and the cut plane costs far more to part (the kerf
 //     price is hardness over gear.cutHardnessRef, now for EVERY material id
@@ -2811,7 +2812,9 @@ Status GateRobotRaces(Ctx& c, std::string& detail) {
   }
   // THE DATA, by name, before any body: the rows resolved what they named.
   const bool data = c.mats[brass].shell && c.mats[brass].bleedFluid == oil &&
-                    c.mats[shell].bleedFluid == coolant &&
+                    // An android leaks NOTHING (owner 2026-10-03): its shell
+                    // has no fluid opinion and nothing crumbles to coolant.
+                    c.mats[shell].bleedFluid == 0 && c.mats[shell].bleedFluidOff &&
                     c.mats[cell].burstMat == spark && c.mats[cell].burstArcs &&
                     c.mats[boiler].burstMat == steam &&
                     c.mats[boiler].struckMat == steam;
@@ -2857,7 +2860,7 @@ Status GateRobotRaces(Ctx& c, std::string& detail) {
            p.deathMat == death && p.deathArcs == arcs;
   };
   const bool okA = robotOk(a, oil, steam, false);
-  const bool okD = robotOk(d, coolant, spark, true);
+  const bool okD = robotOk(d, 0u, spark, true);
   if (!okA) detail += "[automaton WRONG] ";
   if (!okD) detail += "[android WRONG] ";
   // The human is the control: it bleeds blood, carves, and dies quietly.
@@ -2898,6 +2901,151 @@ Status GateRobotRaces(Ctx& c, std::string& detail) {
   const bool okWorld = laidBursts >= 1 && laidCells >= 4;
   if (!okWorld) detail += " [discharge never reached the world]";
   return data && okA && okD && okH && okWorld ? Status::Pass : Status::Fail;
+}
+
+// ---- AN ANDROID SPARKS AND DOES NOT BLEED (2026-10-03, PLAN_electricity E5) --
+//
+// Owner decision: "androids: sparks only, no fluid". The shipped android
+// (courier) and the shipped automaton (tinker) each take the same kHits blows
+// on their limbs -- blade cuts (CutOnce) alternating with mace blows
+// (BluntOnce) -- through THE TICK (TickCursor), and the gate reads what the
+// tick submitted (TickRig::LastBatch: cell ops, particle spawns, fluid ops)
+// plus the spawns the blows threw directly:
+//   1. THE ANDROID SPARKS: its struck rows (shell 0.8, frame 0.7, wiring 1.0)
+//      queue a body burst on most blows (>= androidSparkMinRatio of them) and
+//      the bursts come out the other end as SPARK cell ops;
+//   2. IT LEAKS NOTHING: not one coolant cell op, particle, fluid op or drip
+//      (paint) op over the blows and androidSparkTailTicks after; no limb
+//      owes a bleed budget and none reports a wound fluid; its def has no
+//      bleed at all;
+//   3. THE AUTOMATON IS UNCHANGED: the same blows make it leak OIL (its def's
+//      blood and its matter's fluid), so (2) is the android's matter and not
+//      a harness that cannot see a bleed.
+Status GateAndroidSparks(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  mobs.SetNextIdCounter(1);
+  PrepareWorld(c);
+  const uint32_t oil = mobs.MaterialIdNamed("oil"), coolant = mobs.MaterialIdNamed("coolant"),
+                 spark = mobs.MaterialIdNamed("spark");
+  const int courier = mobs.FindDef("courier"), tinker = mobs.FindDef("tinker");
+  if (!oil || !coolant || !spark || courier < 0 || tinker < 0) {
+    detail = "missing oil / coolant / spark or the courier / tinker def";
+    return Status::Fail;
+  }
+  StrikeProfile mace;
+  const bool haveMace = MaceProfile(c.items, mace) && mace.blunt > 0.0f;
+  const int kHits = (int)BaselineNumber("androidSparkHits", 12);
+  const int kTail = (int)BaselineNumber("androidSparkTailTicks", 30);
+  const double kMinRatio = BaselineNumber("androidSparkMinRatio", 0.5);
+  static const char* kLimbs[] = {"armL.R", "armU.L", "legU.R", "torso",
+                                 "armL.L", "legL.L", "armU.R", "legU.L"};
+
+  struct Arm {
+    bool ok = false;
+    uint32_t bursts = 0;          // body bursts the blows queued
+    uint64_t laid = 0;            // body bursts the tick laid
+    uint32_t sparkCells = 0;      // spark cell ops submitted
+    uint32_t leaks[2] = {0, 0};   // [coolant, oil] in cells + spawns + fluid
+    float budget = 0.0f;          // summed limb bleed budget at the end
+    uint32_t woundFluids = 0;     // limbs reporting a wound fluid at the end
+    uint32_t defBleed = 0;        // the def's bleedMat
+    int blows = 0;
+  };
+  auto count = [&](uint32_t m, Arm& a) {
+    m &= 0xFFFu;
+    if (m == coolant) a.leaks[0]++;
+    if (m == oil) a.leaks[1]++;
+  };
+  auto run = [&](int def, Arm& a) {
+    mobs.Reset();
+    c.debris.Reset();
+    mobs.TakeBodyBursts();
+    a.defBleed = mobs.Defs()[def].bleedMat;
+    const uint64_t id = mobs.Spawn(def, FixtureSite(c.world, 445));
+    if (!id) return;
+    mobs.SetMobBehavior(id, "dummy");
+    const Vec3 o = mobs.MobOrigin(id);
+    uint32_t t = 53000;
+    support::TickCursor tick{c, t,
+                             IVec3{ifloor(o.x) >> 4, ifloor(o.y) >> 4, ifloor(o.z) >> 4}};
+    auto& rf = tick.Rig().Authority().reactFx;
+    auto scan = [&]() {
+      const OpBatch& b = tick.Rig().LastBatch();
+      for (const CellOp& op : b.cells) {
+        count(op.word, a);
+        if ((op.word & 0xFFFu) == spark) a.sparkCells++;
+      }
+      for (const ParticleSpawn& p : b.spawns) count(p.payload, a);
+      for (const FluidSpawnOp& f : b.fluid) count(f.mat, a);
+      // The wound's DRIP is a paint op (Mob::BleedTick), not a particle.
+      for (const BrushOp& o : b.ops) count(o.material, a);
+    };
+    for (int i = 0; i < 6; i++) tick();
+    const uint64_t laid0 = rf.bodyBursts;
+    const uint32_t issued0 = mobs.BodyBurstsIssued();
+    for (int k = 0; k < kHits; k++) {
+      const int limb = LimbNamed(mobs.Defs()[def], kLimbs[k % 8]);
+      support::TickOps ops;
+      if (limb >= 0 && mobs.LimbBody(id, limb)) {
+        const LimbAxis ax = MeasureLimb(mobs, id, limb);
+        const uint32_t seed = 0xA5C0u + (uint32_t)k * 2654435761u;
+        if ((k & 1) == 0 || !haveMace) {
+          CutOnce(mobs, c.world, id, limb, ax, ax.reach * 0.5f, 6.0f, 0.6f, seed, ops.spawns);
+        } else {
+          BluntOnce(mobs, c.world, id, limb, ax.anchor + ax.along * (ax.reach * 0.5f), mace, 0.6f,
+                    seed, ops.spawns);
+        }
+        a.blows++;
+      }
+      // What the blow threw goes in with the tick's own ops ("your ops go in
+      // first"), so LastBatch counts it with everything else.
+      tick(ops);
+      scan();
+    }
+    a.bursts = mobs.BodyBurstsIssued() - issued0;
+    for (int i = 0; i < kTail; i++) {
+      tick();
+      scan();
+    }
+    a.laid = rf.bodyBursts - laid0;
+    if (const Mob* m = mobs.FindMobById(id)) {
+      for (int li = 0; li < m->LimbCount(); li++) {
+        if (!mobs.LimbBody(id, li)) continue;
+        a.budget += std::max(0.0f, mobs.LimbBleedBudget(id, li));
+        a.woundFluids += mobs.LimbWoundFluid(id, li) != 0;
+      }
+    }
+    mobs.Reset();
+    c.debris.Reset();
+    a.ok = true;
+  };
+  Arm and_, aut;
+  run(courier, and_);
+  run(tinker, aut);
+  if (!and_.ok || !aut.ok) {
+    detail = "a spawn was refused";
+    return Status::Fail;
+  }
+  RecordObserved("androidSparkBursts", (double)and_.bursts);
+  RecordObserved("androidSparkCells", (double)and_.sparkCells);
+  auto line = [&](const char* label, const Arm& a) {
+    return Format("%s: %d blows -> %u bursts queued, %llu laid, %u spark cell ops; leaked %u coolant / "
+                  "%u oil; bleed budget %.2f, %u limbs with a wound fluid, def bleed %s; ",
+                  label, a.blows, a.bursts, (unsigned long long)a.laid, a.sparkCells, a.leaks[0],
+                  a.leaks[1], a.budget, a.woundFluids,
+                  a.defBleed && a.defBleed < c.mats.size() ? c.mats[a.defBleed].name.c_str() : "none");
+  };
+  detail = line("android", and_) + line("automaton", aut) + (haveMace ? "" : "(no mace: blade only) ");
+  const bool sparks = and_.blows > 0 && (double)and_.bursts >= kMinRatio * (double)and_.blows &&
+                      and_.laid >= 1 && and_.sparkCells >= 4;
+  const bool dry = and_.leaks[0] == 0 && and_.leaks[1] == 0 && and_.budget == 0.0f &&
+                   and_.woundFluids == 0 && and_.defBleed == 0;
+  const bool oily = aut.defBleed == oil && aut.leaks[1] > 0 && aut.leaks[0] == 0;
+  if (!sparks) detail += "[android did not SPARK] ";
+  if (!dry) detail += "[android LEAKED] ";
+  if (!oily) detail += "[automaton did not leak oil] ";
+  return sparks && dry && oily ? Status::Pass : Status::Fail;
 }
 
 // ---- EVERY DEF KNOWS ITS RACE (MobDef::race, the F1 spawn list's filter) ----
@@ -3698,6 +3846,7 @@ const std::vector<Gate>& ImpactGates() {
       {"bleed-fluid", "mob", {}, false, GateBleedFluid, false},
       {"mob-race", "mob", {}, false, GateMobRace, false},
       {"robot-races", "mob", {}, false, GateRobotRaces, false},
+      {"android-sparks", "mob", {}, false, GateAndroidSparks, false},
       {"venom-wound", "mob", {}, false, GateVenomWound, false},
       {"rot-clock", "mob", {}, false, GateRotClock, false},
       {"infect-perf", "mob", {}, false, GateInfectPerf, false},

@@ -924,8 +924,8 @@ export const GENE_SPECS = [
     hint: 'Human; sylvan, a wood spirit on the same frame (bark over ' +
           'sapwood, roots, a crown of leaves, glowing eyes); automaton, a ' +
           'clockwork man in riveted brass that bleeds oil and vents steam; ' +
-          'or android, synthetic panels over circuitry that bleeds coolant ' +
-          'and arcs when struck. The same limbs and proportions every time, ' +
+          'or android, synthetic panels over circuitry that throws sparks ' +
+          'and arcs when struck and bleeds nothing. The same limbs and proportions every time, ' +
           'so every armour piece and weapon fits all four.',
     kind: 'enum', choices: RACES, sigma: 0 },
   { path: 'body.sex', label: 'sex', group: 'body',
@@ -5160,10 +5160,11 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     // failure mob.cpp's legacy path warns about.
     sidecarVoxelsPerMetre: SIDECAR_VOXELS_PER_METRE,
     // A sylvan bleeds sap (sylvan.js SAP): less of it, and it soaks the cut.
-    // A machine bleeds what its race says (automaton.js oil, android.js
-    // coolant).
+    // A machine bleeds what its race says (automaton.js oil); a race whose
+    // BLEED is null bleeds NOTHING (android.js: sparks only) -- `null` here is
+    // the RFC 7396 delete of the human's blood, kept by thinSidecar.
     bleed: g.body.race === 'sylvan' ? { material: SY.SAP, perDamage: 1.5 }
-         : raceMod(g) ? { ...raceMod(g).BLEED }
+         : raceMod(g) ? (raceMod(g).BLEED ? { ...raceMod(g).BLEED } : null)
          : { material: 'blood', perDamage: 2.5 },
     anatomy,
     speed: pyRound(gait.refSpeed, 4),
@@ -5360,6 +5361,13 @@ export function inheritUnmodelled(full, base) {
       if (!k.startsWith('//') && !(k in body.clips))
         body.clips[k] = JSON.parse(JSON.stringify(v));
   }
+  // AN EXPLICIT `null` IS AN OPINION: "none of the base's" (an android's
+  // `bleed`, android.js BLEED). It was kept out of the fill above; here it
+  // leaves the body, which is what the resolved creature looks like once the
+  // merge has applied it -- so diffAgainst writes the RFC 7396 null for it
+  // and its self-check resolves back to this body.
+  for (const k of Object.keys(body))
+    if (body[k] === null) delete body[k];
   return body;
 }
 
