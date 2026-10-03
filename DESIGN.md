@@ -6268,7 +6268,10 @@ neighbors, so this needs an explicit connectivity pass:
   Village fire (`--perf`, SANDVOX_RUN_EXCLUSIVE): CA 12.39 -> 11.32 (lists)
   -> 7.55 ms (pool), frame p50 30.30 -> 25.61 ms. camask grew 1.04 -> 1.72
   (both rows, per-frame us units of the pass table) for the counting and the
-  scatter; `calist` is 0.03 a row.
+  scatter; `calist` is 0.03 a row. With item 3 below, all three: village CA
+  12.39 -> 7.10 ms, p50 30.30 -> 25.08; `forestfire` CA 5.38 -> 3.41, p50
+  20.68 -> 18.31; `idle` (6.6 awake chunks) CA 2.41 -> 2.35, p50 9.18 -> 9.08
+  -- rest cost did not rise.
   3. **camask publishes each dirty chunk's own repose snapshot.** The
      `reposeSnap` prepass (then ~12% of the CA rows) filled every dirty
      chunk's ring, and ring member 0 -- the chunk itself, always its own
