@@ -46,6 +46,33 @@ enum Phase : uint8_t {
   kSeed,
   kCandLoop,
   kWorn,
+  // The candidate list's construction from the front (the front cells and
+  // their lattice neighbours) and the post-loop sweep over every candidate
+  // that clears the queued bits and rebuilds the front. Both scale with the
+  // CANDIDATE count, not the evaluated count (rule 6: attribute before
+  // eliminating -- see BurnOneLimb's bounded-window note).
+  kQueue,
+  kFrontSweep,
+  // The rest of MobSystem::PreTick, so its total is attributed: the per-mob
+  // step (AI, animation, bleed, ...), the stain pass and the dead-sleep test.
+  kMobLoop,
+  kStain,
+  kDeadSleep,
+  // Inside kStain: the contact sweep (StainOneLimb, every population), the
+  // rain, drying and wet passes, and the severed-flesh share (StainDeadFlesh,
+  // which runs all four over debris flesh).
+  kStainContact,
+  kStainRain,
+  kStainDry,
+  kStainWet,
+  kStainFlesh,
+  // Inside kStainContact: the "is anything there" world walk, and the
+  // surface list's (re)build after the index was dropped.
+  kStainWalk,
+  kStainSurface,
+  // Inside kHairTuck: the hood's cover map rebuilt (a shell's lattice moved).
+  kHairCover,
+  kHairFull,    // ...a hair limb's whole tuck re-derived (not the fast path)
   kCount
 };
 
@@ -54,7 +81,11 @@ inline const char* Name(int p) {
                                   "burnLimbs", "burnOne", "flush", "carve",
                                   "rebuild", "index", "crossHeat", "tail",
                                   "recount", "deadFlesh", "walk", "seed",
-                                  "candLoop", "worn"};
+                                  "candLoop", "worn", "queue", "frontSweep",
+                                  "mobLoop", "stain", "deadSleep", "stainContact",
+                                  "stainRain", "stainDry", "stainWet",
+                                  "stainFlesh", "stainWalk", "stainSurface",
+                                  "hairCover", "hairFull"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 
@@ -65,11 +96,20 @@ enum Counter : uint8_t {
   kSeedNew,      // ...that queued a candidate not already queued
   kCandidates,   // candidates queued in total (front + neighbours + seeds)
   kEvaluated,    // ...of which the front budget let the loop evaluate
+  kFront,        // front cells held at the top of each BurnOneLimb visit
+  kWindowed,     // ...visits that expanded only a window of it (budget-bound)
+  kStainSamples, // surface voxels the contact sweep looked at
+  kStainSwept,   // contact-sweep visits that got past the world walk
+  kSeedHot,      // hot cells the seeding visited
+  kSeedFaces,    // ...faces of them past the box cull (footprint tested)
+  kSeedFootReads,// ...index reads the footprint tests made
   kNCount
 };
 inline const char* CounterName(int c) {
   static const char* k[kNCount] = {"seedProbes", "seedHits", "seedNew",
-                                   "cands", "evaluated"};
+                                   "cands", "evaluated", "front", "windowed",
+                                   "stainSamples", "stainSwept", "seedHot",
+                                   "seedFaces", "seedFootReads"};
   return c >= 0 && c < kNCount ? k[c] : "?";
 }
 

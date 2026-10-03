@@ -912,6 +912,7 @@ page faults, 4 new reds recorded above, everything else green or known.
 
 
 
+
 ## 2026-10-03 — `gas-leave-overflow` added, `"pass"` (det-gas package)
 
 New gate, new keys `gasOverflowCap` / `gasOverflowTicks` /
@@ -923,6 +924,7 @@ parcel digest). First run: converted 2365, refused 93317 on 53 ticks, twice-run
 identical over 56 snapshot ticks, digest c188e30d both arms. `gas-leave`'s
 "zero refusals" assertion is unchanged but is a throughput claim now, not a
 determinism one (DESIGN.md "The edge's refusals are a function of the world").
+
 
 
 ## 2026-10-03 — red-world: waterbody flipped to pass; chem-electrolysis attributed; tree-fell green at gate scope
@@ -949,6 +951,7 @@ determinism one (DESIGN.md "The edge's refusals are a function of the world").
   not reproduced, because this package ran no suite.
 
 
+
 ## 2026-10-03 — repose: worldgen reads each powder's own repose (hash moves; NOT re-pinned here)
 
 `sand` 34, `gravel` 40, `dirt` 40 are authored in materials.json, and worldgen's
@@ -960,6 +963,7 @@ tables move: intentional, left for the orchestrator's single re-pin.
 caps 126 / 112; travel 0.0 / 0.0 keeps its 0.5 caps). The control arm (same
 materials, old worldgen) measured 1499 / 1301 and FAILED, which is what this
 gate now guards.
+
 
 
 ## 2026-10-03 — `ca-slope-hybrid` flipped to `"pass"`; `fluid-react` exact again (fluid-gates)
@@ -987,6 +991,7 @@ seam fix above also drained this sealed box: live at the end 157 -> 4.
 
 `determinismHash` was not re-pinned on this branch (orchestrator pins once):
 the seam change moves any world with excited fluid.
+
 
 ## 2026-10-03 — red-bodies triage (worktree off c364516; `determinismHash` not touched)
 
@@ -1043,3 +1048,22 @@ prefix scope at c364516): `evaporation`, `rain-stain` (OIL OVER: oil 0 at
 t120), `venom-blade` (arm C seeded nothing; passes standalone), `vessel-grid`,
 and the `determinism` pin (b2514936 -> 5c3ea9ad with the twice-run comparison
 passing — a moved pin, not a determinism failure).
+
+## 2026-10-03 — fire-perf triage of `mob-burn` and `fire-depth` (no key changed)
+
+Both stay `"fail"`; neither is a defect in the burn pass.
+
+- `mob-burn`: the two red subchecks are the fixture, not fire. `cloth vs
+  flesh` censuses `cloth` on the spawned body and finds 0 (the stock `human`
+  wears undercloth, not a robe); `burn leaves char` lights `cloth` on `armU.L`
+  through `IgniteLimb(.., mCloth)` and lights 0 voxels, so nothing burns and
+  nothing chars. Both were written for wizard.vox (robe on every limb, deleted
+  2026-09-19). Every other subcheck passes, before and after the fire-perf
+  package (bounded front window: burn chain, fire into grid, terminates,
+  limbs sleep, heat across a joint, corpse, acid, player burns all PASS with
+  numbers in the same range). Making them green needs a fixture decision:
+  dress the human in a garment (the shells are separate limbs, so the ignite
+  and the census would have to address the sleeve shell, not `armU.L`) or
+  re-point both checks at a material the human has. Not done here.
+- `fire-depth`: 22.9k of 99.0k px behind the flame (floor: a tenth). Render
+  side, as recorded above; untouched by CPU burn work.
