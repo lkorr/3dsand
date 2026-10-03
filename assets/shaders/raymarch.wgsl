@@ -199,6 +199,14 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 // table's godray_vis row. Trusted only when its stamp is this frame's
 // (godVisLive) -- otherwise godRays casts its own rays as it always did.
 @group(0) @binding(38) var<storage, read> godVis : array<u32>;
+// THE GAS EMPTY-BRICK MASK (gas_mask.wgsl): one bit per 4^3-cell brick of
+// gasOuter, set when a sample's trilinear footprint there may be non-zero.
+// Rebuilt per frame on the ShadowCache table whenever RFLAG_GAS is set, and
+// read (gasMaskMay) only on such frames. Render-private.
+@group(0) @binding(40) var<storage, read> gasMask : array<u32>;
+const GAS_MASK_SHIFT : u32 = 2u;
+const GAS_MASK_N : u32 = GAS_OUTER_N >> GAS_MASK_SHIFT;
+const GAS_MASK_ROW_WORDS : u32 = GAS_MASK_N / 32u;
 // ---- THE GI GATHER REQUESTS (gi_gather.wgsl) ---------------------------------
 // The one-bounce gather cache is refreshed by a compute pass, not here: a hit
 // on a block-face whose cache word is stale or due sets the face's bit and
@@ -438,6 +446,27 @@ const RFLAG_GAS : u32 = 8u;
 // as bit 3 — the long-range box is only cleared on ticks its own row is
 // recorded, so with this off it is stale and must not be sampled.
 const RFLAG_GASFAR : u32 = 32u;
+
+// ---- GAS_RUN: crossing a run of one thin gas in trace()'s tight loop -------
+// IMPLEMENTED, EXACT, MEASURED, SHIPS OFF (2026-10-03, raymarch-smoke). With it
+// on, trace()'s liquid-run loop also takes runs of one non-emissive gas with
+// opacity under GAS_RUN_MAX_OP (see the run, in trace()). Bit-identical picture
+// either way. --render-budget, one process, base2 drift <= 0.16 ms:
+//
+//   smoke   (eye inside an ether-vapour slab)  9.89 -> 8.87 ms   (-1.0)
+//   fire    (burning forest, little gas in view) 10.09 -> 10.30 ms (+0.2)
+//   village (black smoke over the houses)       6.27 -> 6.42 ms   (+0.15)
+//   seam    (no gas)                            3.73 -> 3.77 ms   (noise)
+//
+// The fire / village cost is NOT the run doing work: an opacity gate of 0.1
+// (no steam) costs the same, and those frames' smoke is 70..220/255, which the
+// gate keeps out of the run. It is the code's presence on frames that march
+// dense gas, i.e. what the compiler makes of the media branch with the run
+// beside it. Two of the three gas cameras lose, so the default is off; it is
+// the lever for a thin cloud around the eye (the alchemy bench's ether
+// vapour), and flipping this const re-runs the comparison.
+const GAS_RUN : bool = false;
+const GAS_RUN_MAX_OP : f32 = 0.2;
 
 // ---- THE CROSSFADE WEIGHT (stage 1b) ---------------------------------------
 // 0 where gas is drawn as VOXELS and 1 where it is drawn from the coarse box,
@@ -3885,7 +3914,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
     // outer loop would. Not in the debug view, which tints per cell.
     // Measured (--render-budget, harness map, one process): lake 11.78 ->
     // 10.67 ms, submerged 13.29 -> 8.82; noon/seam +0.03..0.06 (code size).
-    if (cellLiq > 0.0 && cellFire == 0.0 && cellOp > 0.0 && waterFrac == 1.0 &&
+    if (!GAS_RUN && cellLiq > 0.0 && cellFire == 0.0 && cellOp > 0.0 && waterFrac == 1.0 &&
         voxState(w) == 7u && !(SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u)) {
       let runKey = w & 0xFFFFu;   // material + state
       var sat = false;
@@ -3916,6 +3945,91 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
           out.t = tCur;
           sat = true;
           break;
+        }
+        if (tCur >= tExit) { break; }
+      }
+      if (sat || tCur >= tExit) { break; }
+    }
+    // ---- ...AND, BEHIND GAS_RUN, A RUN OF ONE THIN GAS (2026-10-03) ----------
+    // The same loop, also taking a run of one non-emissive gas thinner than
+    // GAS_RUN_MAX_OP (ether vapour, hydrogen, steam: the gases a ray crosses
+    // for metres without saturating). Same arithmetic in the same order as the
+    // media branch above, so it is exact like the liquid run -- but ONLY where
+    // the crossfade leaves a voxel whole (gasCoarseW 0): the run precomputes
+    // the first t at which that can stop being true (`tFree`: the inner box's
+    // exit, the handoff ramp's start) and hands everything past it back to the
+    // outer loop, which fades the cell against the coarse box as it always has.
+    // See GAS_RUN for why it ships off.
+    let runGas = GAS_RUN && cellLiq == 0.0 && weight > 0.0 && cellOp < GAS_RUN_MAX_OP;
+    if (GAS_RUN && cellFire == 0.0 && cellOp > 0.0 &&
+        ((cellLiq > 0.0 && waterFrac == 1.0 && voxState(w) == 7u) || runGas) &&
+        !(SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u)) {
+      let keyMask = select(0xFFFFu, 0xFFFu, runGas);
+      let runKey = w & keyMask;
+      let gasFlag = runGas && (R.flags & RFLAG_GAS) != 0u;
+      // The run may cross only cells the crossfade leaves whole (gasCoarseW
+      // 0): nearer than the handoff ramp's start AND inside the inner box.
+      var tFree = 1e30;
+      if (gasFlag) {
+        let halfExt = f32(WORLD_N) * 0.5;
+        let ctr = vec3f(wloI) + vec3f(halfExt);
+        let ib = min(TUNE_GAS_BLEND_START, 0.99) * halfExt;
+        let e0 = (ctr - vec3f(ib) - ro) * inv;
+        let e1 = (ctr + vec3f(ib) - ro) * inv;
+        let ex = max(e0, e1);
+        tFree = min(ex.x, min(ex.y, ex.z)) - 0.5;
+        if (any(abs(ro - ctr) > vec3f(ib - 1.0))) { tFree = -1.0; }
+        if (TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS) {
+          tFree = min(tFree, min(TUNE_GAS_BLEND_START, 0.99) *
+                             TUNE_LOD_HANDOFF_DIST / VOXEL_METERS);
+        }
+      }
+      var sat = false;
+      loop {
+        if (i + 1 >= maxSteps) { break; }
+        if (any(cell < wloI) || any(cell >= wloHi)) { break; }
+        if (any((cell >> vec3<u32>(CHUNK_SHIFT)) != cchC)) { break; }
+        let w2 = voxWordAtEntry(cchPt, cell);
+        if ((w2 & keyMask) != runKey) { break; }
+        if (gasFlag) {
+          let tN = min(tMax.x, min(tMax.y, tMax.z));
+          if (tN >= tFree) { break; }
+        }
+        i += 1;
+        if (RENDER_STATS && gRsOn) { gRsTraceSteps += 1u; }
+        let tP = tCur;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+          cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+        } else if (tMax.y < tMax.z) {
+          cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+        } else {
+          cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+        }
+        let sg = tCur - tP;
+        let dT = sg * cellOp;
+        out.mediaTau += dT;
+        rsAdd(RS_MEDIA, 1u);
+        out.mediaTint += cellTint * dT;
+        if (runGas) {
+          gasTau += dT;
+          if (out.gasHalfT == 0.0 &&
+              gasTau * VOXEL_METERS * MEDIA_ABSORB > MEDIA_HALF_TAU) {
+            out.gasHalfT = tCur;
+          }
+          if (gasTau * VOXEL_METERS * MEDIA_ABSORB > MEDIA_TAU_MAX) {
+            out.saturated = true;
+            out.t = tCur;
+            sat = true;
+            break;
+          }
+        } else {
+          out.liqPath += sg;
+          if (out.liqPath * VOXEL_METERS > 24.0) {
+            out.saturated = true;
+            out.t = tCur;
+            sat = true;
+            break;
+          }
         }
         if (tCur >= tExit) { break; }
       }
@@ -4386,13 +4500,80 @@ fn gasOuterCell16(d : vec3<i32>) -> f32 {
 // The half-cell bias puts the samples on cell CENTRES. Without it the filter is
 // off by half a cell in each axis and a plume leans away from the fire that
 // made it.
+//
+// ---- AND WHY MOST SAMPLES NEVER FETCH (2026-10-03, raymarch-smoke) --------
+// gasOuterFill runs this 32 times on every pixel whose ray reaches ~10 m on any
+// frame with gas in it. Priced on --render-budget (fire / village cameras, one
+// process): the whole fill was 1.18 / 0.55 ms, and the same loops with the
+// fetches deleted and NOTHING else changed came in 1.37 / 0.55 ms cheaper --
+// the arithmetic is free, the eight loads are the cost. Two exact cuts:
+//
+//   * THE EMPTY-BRICK MASK (gas_mask.wgsl): one bit per 4^3-cell brick says
+//     whether this footprint can hold anything. A clear bit returns 0.0 before
+//     the smoothstep and before any fetch; it is exactly what the fetch would
+//     have produced (a trilinear blend of eight zeros), so the picture does not
+//     change. Consulted only on an RFLAG_GAS frame, the frames the mask is
+//     rebuilt on; otherwise the full sampler runs as it always did.
+//   * PAIRED LOADS: two cells share a u32, so where the 2x2x2 footprint is
+//     wholly inside the box (the common case) the four x-pairs come from one
+//     word each when d.x is even and two when it is odd, against eight bounds
+//     tests and eight loads. Same cells, same mixes, same order.
+//
+// Measured together against the old sampler (one process, baseline vs arm):
+// fire 10.90 -> 10.15 ms, village 6.44 -> 6.25. 2^3 and 1^3 bricks were tried
+// and skip no more of the samples that cost anything (the rest hold smoke);
+// the 1^3 mask costs ~0.15 ms more to build.
+fn gasMaskMay(d : vec3<i32>) -> bool {
+  if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_OUTER_N)))) {
+    return true;
+  }
+  let bk = vec3<u32>(d) >> vec3<u32>(GAS_MASK_SHIFT);
+  let wi = (bk.z * GAS_MASK_N + bk.y) * GAS_MASK_ROW_WORDS + (bk.x >> 5u);
+  return (gasMask[wi] & (1u << (bk.x & 31u))) != 0u;
+}
+
 fn gasOuterCountAt(p : vec3f) -> f32 {
   let g = (p - vec3f(gasOuterOriginVox())) *
           (1.0 / f32(1u << GAS_OUTER_SHIFT)) - vec3f(0.5);
   let b = floor(g);
+  let d = vec3<i32>(b);
+  if ((R.flags & RFLAG_GAS) != 0u && !gasMaskMay(d)) {
+    return 0.0;
+  }
   let f = g - b;
   let u = f * f * (3.0 - 2.0 * f);
-  let d = vec3<i32>(b);
+  // PAIRED LOADS (see above): the whole footprint is inside the box.
+  if (all(d >= vec3<i32>(0)) && all(d < vec3<i32>(i32(GAS_OUTER_N) - 1))) {
+    let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+    let sy = GAS_OUTER_N;
+    let sz = GAS_OUTER_N * GAS_OUTER_N;
+    var p00 : vec2f; var p10 : vec2f; var p01 : vec2f; var p11 : vec2f;
+    let wi = li >> 1u;
+    if ((li & 1u) == 0u) {
+      let w00 = gasOuter[wi];
+      let w10 = gasOuter[wi + (sy >> 1u)];
+      let w01 = gasOuter[wi + (sz >> 1u)];
+      let w11 = gasOuter[wi + ((sy + sz) >> 1u)];
+      p00 = vec2f(f32(w00 & 0xFFFFu), f32(w00 >> 16u));
+      p10 = vec2f(f32(w10 & 0xFFFFu), f32(w10 >> 16u));
+      p01 = vec2f(f32(w01 & 0xFFFFu), f32(w01 >> 16u));
+      p11 = vec2f(f32(w11 & 0xFFFFu), f32(w11 >> 16u));
+    } else {
+      let a00 = gasOuter[wi];                       let b00 = gasOuter[wi + 1u];
+      let a10 = gasOuter[wi + (sy >> 1u)];          let b10 = gasOuter[wi + (sy >> 1u) + 1u];
+      let a01 = gasOuter[wi + (sz >> 1u)];          let b01 = gasOuter[wi + (sz >> 1u) + 1u];
+      let a11 = gasOuter[wi + ((sy + sz) >> 1u)];   let b11 = gasOuter[wi + ((sy + sz) >> 1u) + 1u];
+      p00 = vec2f(f32(a00 >> 16u), f32(b00 & 0xFFFFu));
+      p10 = vec2f(f32(a10 >> 16u), f32(b10 & 0xFFFFu));
+      p01 = vec2f(f32(a01 >> 16u), f32(b01 & 0xFFFFu));
+      p11 = vec2f(f32(a11 >> 16u), f32(b11 & 0xFFFFu));
+    }
+    let y00 = mix(p00.x, p00.y, u.x);
+    let y10 = mix(p10.x, p10.y, u.x);
+    let y01 = mix(p01.x, p01.y, u.x);
+    let y11 = mix(p11.x, p11.y, u.x);
+    return mix(mix(y00, y10, u.y), mix(y01, y11, u.y), u.z);
+  }
   let x00 = mix(gasOuterCell16(d), gasOuterCell16(d + vec3<i32>(1, 0, 0)), u.x);
   let x10 = mix(gasOuterCell16(d + vec3<i32>(0, 1, 0)),
                 gasOuterCell16(d + vec3<i32>(1, 1, 0)), u.x);

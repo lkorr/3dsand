@@ -1543,6 +1543,21 @@ PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D
 PASS(godray_vis, "godrayVis", PT_SHADOWCACHE, PIPE_GODRAY_VIS, K_COMPUTE, kGodVisGroups,1,1,
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable) W(GodVis)))
+// ---- THE GAS EMPTY-BRICK MASK (assets/shaders/gas_mask.wgsl) ----
+// One bit per 4^3-cell brick of the gasOuter density box: "this brick (or the
+// one-cell rim the trilinear filter reaches past it) holds a count". The
+// raymarch's coarse gas fill (gasOuterFill) reads it before every sample and
+// skips the eight-word trilinear fetch where the answer is a known 0 -- the
+// samples that were most of the fill's ~1 ms on a burning-forest frame.
+// Per FRAME because it is a pure function of gasOuter, which the TICK command
+// buffer rewrites; C_ALWAYS because the kernel reads R.flags (RFLAG_GAS, the
+// same bit that licenses the raymarch to sample gasOuter at all) and every
+// group returns at once when it is clear, so a smokeless world pays an empty
+// dispatch. R(GasOuter) orders it after the tick's splats; the fragment read
+// is BeginRendering's flush, as for GodVis.
+PASS(gas_mask, "gasMask", PT_SHADOWCACHE, PIPE_GAS_MASK, K_COMPUTE, kGasMaskGroups,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(U(RenderUBO) R(GasOuter) W(GasMask)))
 // ---- THE GI GATHER CACHE'S REFRESH (assets/shaders/gi_gather.wgsl) ---------
 // The one-bounce gather (nine coarse rays per block-face) used to run inside
 // raymarch.wgsl's fragment shader on a due face; now the fragment shader

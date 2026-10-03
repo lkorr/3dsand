@@ -1094,6 +1094,39 @@ def check_godray_vis():
     checked.append("godray vis volume")
 
 
+def check_gas_mask():
+    """The gas empty-brick mask's brick size and gate: pass_table.h,
+    gas_mask.wgsl and raymarch.wgsl must agree.
+
+    The C++ sizes the buffer and the row's dispatch from kGasMaskShift; the
+    kernel writes one bit per (1 << GM_SHIFT)^3 cells and gasMaskMay reads by
+    GAS_MASK_SHIFT. A mismatch tests the wrong brick -- a sample skipped as
+    empty where there is smoke, i.e. holes in a plume, with no error anywhere.
+    RFLAG_GAS is the bit both sides gate on: the kernel builds the mask only
+    on frames the raymarch is allowed to read it.
+    """
+    ph = read("src/sim/pass_table.h")
+    gm = read("assets/shaders/gas_mask.wgsl")
+    rm = read("assets/shaders/raymarch.wgsl")
+    if not ph or not gm or not rm:
+        return
+    m = re.search(r"kGasMaskShift\s*=\s*(\d+)", ph)
+    if not m:
+        problems.append("gas mask: could not find kGasMaskShift in pass_table.h")
+        return
+    for path, txt in (("gas_mask.wgsl", gm), ("raymarch.wgsl", rm)):
+        g = re.search(r"const\s+GAS_MASK_SHIFT\s*:\s*u32\s*=\s*(\d+)u\s*;", txt)
+        if not g or g.group(1) != m.group(1):
+            problems.append(f"gas mask: pass_table.h kGasMaskShift = {m.group(1)} but {path} "
+                            f"GAS_MASK_SHIFT = {g.group(1) if g else None} -- the buffer would be sized "
+                            f"for one grid and the sampler would test another")
+            return
+    fl = [re.search(r"const\s+RFLAG_GAS\s*:\s*u32\s*=\s*(\d+)u", t) for t in (gm, rm)]
+    if not all(fl) or fl[0].group(1) != fl[1].group(1):
+        problems.append("gas mask: RFLAG_GAS differs between gas_mask.wgsl and raymarch.wgsl "
+                        "-- the mask would be built on frames the raymarch does not read it, and stale on the ones it does")
+        return
+    checked.append("gas empty-brick mask")
 def check_gi_req():
     """The GI gather request list's layout: pass_table.h, gi_gather.wgsl and
     raymarch.wgsl must agree.
@@ -2360,6 +2393,7 @@ def check_gas_consts():
     step = read(ROOT / "assets/shaders/sim_step.wgsl")
     common = read(ROOT / "assets/shaders/common.wgsl")
     raymarch = read(ROOT / "assets/shaders/raymarch.wgsl")
+    gasmask = read(ROOT / "assets/shaders/gas_mask.wgsl")
 
     def cxx(name):
         m = re.search(r"\b" + name + r"\s*=\s*(-?\d+)", wh)
@@ -2382,9 +2416,12 @@ def check_gas_consts():
         # would cost the whole SPIR-V cache. That is the right trade and this is
         # the price of it -- any two of the three disagreeing about the cell
         # size is a plume drawn in the wrong place, silently.
+        # ...and a FOURTH since 2026-10-03: gas_mask.wgsl scans the box per
+        # 4^3-cell brick for the sampler's empty-brick skip.
         ("kGasOuterN", "GAS_OUTER_N", [("sim_gas.wgsl", gas),
                                        ("sim_step.wgsl", step),
-                                       ("raymarch.wgsl", raymarch)]),
+                                       ("raymarch.wgsl", raymarch),
+                                       ("gas_mask.wgsl", gasmask)]),
         ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas),
                                                ("sim_step.wgsl", step),
                                                ("raymarch.wgsl", raymarch)]),
@@ -3315,6 +3352,7 @@ ALL = {
     "windstreak": check_wind_streak,
     "drafts": check_drafts,
     "godrayvis": check_godray_vis,
+    "gasmask": check_gas_mask,
     "gireq": check_gi_req,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,

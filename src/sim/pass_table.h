@@ -25,6 +25,20 @@ inline constexpr uint32_t kGodVisNX = 72, kGodVisNY = 40, kGodVisNZ = 72;
 inline constexpr uint32_t kGodVisBlocks = kGodVisNX * kGodVisNY * kGodVisNZ;
 inline constexpr uint32_t kGodVisHeaderWords = 1;
 
+// THE GAS EMPTY-BRICK MASK (assets/shaders/gas_mask.wgsl): one bit per
+// (1 << kGasMaskShift)^3-cell brick of the gasOuter box (world.h kGasOuterN =
+// 128 cells a side), set when the brick or the one-cell rim past its high
+// faces holds a non-zero count; packed 32 bricks along x to a u32. MUST AGREE
+// with GAS_MASK_SHIFT in gas_mask.wgsl and raymarch.wgsl
+// (scripts/check_invariants.py). 4^3 was measured against 2^3 and 1^3 (one
+// process, fire / village budget cameras): the finer masks skip no more of
+// the samples that cost anything, and one bit per cell costs ~0.15 ms more
+// to build. 128 = kGasOuterN, static_assert-ed in pass_table.cpp (this
+// header does not include world.h).
+inline constexpr uint32_t kGasMaskCellsN = 128;
+inline constexpr uint32_t kGasMaskShift = 2;
+inline constexpr uint32_t kGasMaskN = kGasMaskCellsN >> kGasMaskShift;
+inline constexpr uint32_t kGasMaskWords = kGasMaskN * kGasMaskN * kGasMaskN / 32;
 // THE GI GATHER REQUEST LIST (assets/shaders/gi_gather.wgsl): header words,
 // list capacity (one record per requested block-face per frame) and the
 // one-bit-per-face dedup bitmap over the irradiance grid's plane (world.h
@@ -240,6 +254,12 @@ enum class Buf : uint8_t {
   // raymarch.wgsl's godRays in the same command buffer. Render-private like
   // RayStart: never hashed, never saved, never bound by a sim kernel.
   GodVis,
+  // The gas empty-brick mask (assets/shaders/gas_mask.wgsl): per 4^3-cell
+  // brick of gasOuter, "may hold gas". WRITTEN by the per-frame `gas_mask`
+  // row on the ShadowCache table, READ by raymarch.wgsl's gasOuterCountAt in
+  // the same command buffer. Render-private like GodVis: never hashed, never
+  // saved, never bound by a sim kernel.
+  GasMask,
   // The GI gather request list (assets/shaders/gi_gather.wgsl): block-faces
   // whose one-bounce gather cache is due, appended by raymarch.wgsl's fragment
   // stage (with a dedup bitmap) and consumed by the next frame's gi_prepare /
@@ -494,6 +514,9 @@ enum class Pipe : uint8_t {
   // The god-ray sun visibility volume (godray_vis.wgsl), one per-FRAME row on
   // the ShadowCache table. Before ShadowResolve for the copy loop's bound.
   GodrayVis,
+  // The gas empty-brick mask (gas_mask.wgsl), one per-FRAME row on the
+  // ShadowCache table.
+  GasMask,
   // The GI gather cache's refresh (gi_gather.wgsl), two per-FRAME rows on the
   // ShadowCache table. Before ShadowResolve for the copy loop's bound.
   GiPrepare, GiGather,

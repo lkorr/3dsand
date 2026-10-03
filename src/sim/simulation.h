@@ -1002,6 +1002,8 @@ class Simulation {
   rhi::ComputePipeline windStreak_;
   // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
   rhi::ComputePipeline godrayVis_;
+  // The gas empty-brick mask (gas_mask.wgsl `gasMask`).
+  rhi::ComputePipeline gasMask_;
   // The GI gather cache's refresh (gi_gather.wgsl `giPrepare` / `giGather`).
   rhi::ComputePipeline giPrepare_, giGather_;
   rhi::ShaderModule shadowModule_;
@@ -1160,6 +1162,10 @@ class Simulation {
   // kGodVis*): fixed size, made at Init. 27 in shadowBGL_ (compute, written),
   // 38 in renderBGL_ (fragment, read).
   rhi::Buffer godVisBuf_;
+  // The gas empty-brick mask (gas_mask.wgsl; pass_table.h kGasMask*): fixed
+  // size, made at Init. 31 in shadowBGL_ (compute, written; gasOuter is read
+  // there at 30), 40 in renderBGL_ (fragment, read).
+  rhi::Buffer gasMaskBuf_;
   // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
   // size, zeroed at Init (the dedup bitmap must start empty). 28 in
   // shadowBGL_ (compute), 39 in renderBGL_ (fragment, appends). giArgsBuf_ is

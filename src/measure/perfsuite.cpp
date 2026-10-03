@@ -2922,6 +2922,55 @@ bool CamFire(Scene& s, uint32_t& tick, std::string& why) {
   tick = FindNoonTick(CurrentTuning());
   return true;
 }
+// INSIDE A THIN GAS CLOUD (2026-10-03, raymarch-smoke): the shape of the bench
+// ether-fire report ("the camera inside the cloud"), which only the live
+// --shot-bench harness reproduced and which moves +-0.5 ms run to run behind
+// the bench's own UI. Here it is deterministic: the overlook's settled world,
+// the eye at standing height over its centre column, and a slab of
+// ether_vapour (opacity 10/255, the thinnest authored gas, so every primary
+// ray marches it voxel by voxel to the LOD handoff without saturating) stamped
+// IfAir from the ground to 3 m up over +-48 voxels, ticked four times to land
+// it and then frozen. Prices the per-cell media march and the coarse gas fill
+// (gasOuterFill) on a frame where both are at their worst.
+bool CamSmoke(Scene& s, uint32_t& tick, std::string& why) {
+  const uint32_t vapour = MatId(s.mats, "ether_vapour");
+  if (vapour == 0) { why = "no ether_vapour material"; return false; }
+  const int px = 256, pz = 256;
+  const int g = World::TerrainHeight(px, pz, kDefaultSeed);
+  s.eye = {(float)px, (float)(g + 17), (float)pz};
+  s.cam.yaw = 0.785f;
+  s.cam.pitch = -0.05f;
+  std::vector<CellOp> cells;
+  for (int z = pz - 48; z <= pz + 48; z++)
+    for (int x = px - 48; x <= px + 48; x++) {
+      const int gy = World::TerrainHeight(x, z, kDefaultSeed);
+      for (int y = gy + 1; y <= gy + 30; y++) {
+        const IVec3 c{x, y, z};
+        if (!s.world.CellInWindow(c)) continue;
+        cells.push_back({World::SlotCellIndex(c), vapour | kCellOpIfAir});
+      }
+    }
+  const IVec3 pc{px >> 4, (g + 17) >> 4, pz >> 4};
+  size_t at = 0;
+  for (uint32_t t = 3000; t < 3008; t++) {
+    std::vector<CellOp> batch;
+    while (at < cells.size() && batch.size() < kMaxCellOpsPerTick)
+      batch.push_back(cells[at++]);
+    SubmitTick(s.ctx, s.world, s.sim, t, kDefaultSeed, {}, {}, batch, t % 15 == 0, pc,
+               false, true);
+    s.ctx.WaitIdle();
+  }
+  char note[160];
+  std::snprintf(note, sizeof note,
+                "eye 1.7 m over (%d,%d) inside %zu cells of ether_vapour, 8 ticks, "
+                "frame frozen", px, pz, cells.size());
+  s.note = note;
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+const char* const kArmsSmoke[] = {
+    "baseline", "noshadow", "nogi", "nofar", "halfres", "lod8", nullptr};
+
 const char* const kArmsFire[] = {
     "baseline", "noshadow", "nocache", "nogi",      "noglow", "noopenness",
     "nofar",    "halfres",  "primary256", "lod8",   "nospec", nullptr};
@@ -3004,6 +3053,8 @@ const BudgetCam kBudgetCams[] = {
      CamMeadow, kArmsFoliage},
     {"canopy", "under the largest crown, looking up through the leaves",
      CamCanopy, kArmsFoliage},
+    {"smoke", "standing inside a thin ether-vapour cloud on the overlook's ground",
+     CamSmoke, kArmsSmoke},
     {"fire", "inside a burning forest 20 s after ignition, looking level",
      CamFire, kArmsFire},
     {"village", "the Harrowby green with all three houses burning in oil, looking "
