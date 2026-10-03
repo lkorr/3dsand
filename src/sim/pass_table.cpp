@@ -28,6 +28,9 @@ static_assert((kFarNumChunks % 64u) == 0u, "skyTopReduce groups straddle levels"
 constexpr uint32_t kSkyTopGroups = kFarLevels * kFarNumChunks / 64;
 // godray_vis.wgsl: one thread per block of its GV_NX x GV_NY x GV_NZ volume.
 constexpr uint32_t kGodVisGroups = (pass::kGodVisBlocks + 63) / 64;
+// gas_mask.wgsl: one 32-thread group per mask word (32 bricks along x).
+static_assert(pass::kGasMaskCellsN == kGasOuterN, "gas mask sized for the gasOuter box");
+constexpr uint32_t kGasMaskGroups = pass::kGasMaskWords;
 }  // namespace
 
 namespace pass {
@@ -101,6 +104,7 @@ namespace {
 #define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
 #define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
 #define PIPE_GODRAY_VIS      Pipe::GodrayVis
+#define PIPE_GAS_MASK        Pipe::GasMask
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn

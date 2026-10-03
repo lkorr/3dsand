@@ -999,6 +999,8 @@ class Simulation {
   rhi::ComputePipeline windStreak_;
   // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
   rhi::ComputePipeline godrayVis_;
+  // The gas empty-brick mask (gas_mask.wgsl `gasMask`).
+  rhi::ComputePipeline gasMask_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -1155,6 +1157,10 @@ class Simulation {
   // kGodVis*): fixed size, made at Init. 27 in shadowBGL_ (compute, written),
   // 38 in renderBGL_ (fragment, read).
   rhi::Buffer godVisBuf_;
+  // The gas empty-brick mask (gas_mask.wgsl; pass_table.h kGasMask*): fixed
+  // size, made at Init. 31 in shadowBGL_ (compute, written; gasOuter is read
+  // there at 30), 40 in renderBGL_ (fragment, read).
+  rhi::Buffer gasMaskBuf_;
   // The buffer EnsureRayStart last replaced, kept alive one growth longer
   // because the frame that grew it had already recorded the prepass against it.
   rhi::Buffer rayStartPrev_;

@@ -25,6 +25,21 @@ inline constexpr uint32_t kGodVisNX = 72, kGodVisNY = 40, kGodVisNZ = 72;
 inline constexpr uint32_t kGodVisBlocks = kGodVisNX * kGodVisNY * kGodVisNZ;
 inline constexpr uint32_t kGodVisHeaderWords = 1;
 
+// THE GAS EMPTY-BRICK MASK (assets/shaders/gas_mask.wgsl): one bit per
+// (1 << kGasMaskShift)^3-cell brick of the gasOuter box (world.h kGasOuterN =
+// 128 cells a side), set when the brick or the one-cell rim past its high
+// faces holds a non-zero count; packed 32 bricks along x to a u32. MUST AGREE
+// with GAS_MASK_SHIFT in gas_mask.wgsl and raymarch.wgsl
+// (scripts/check_invariants.py). 4^3 was measured against 2^3 and 1^3 (one
+// process, fire / village budget cameras): the finer masks skip no more of
+// the samples that cost anything, and one bit per cell costs ~0.15 ms more
+// to build. 128 = kGasOuterN, static_assert-ed in pass_table.cpp (this
+// header does not include world.h).
+inline constexpr uint32_t kGasMaskCellsN = 128;
+inline constexpr uint32_t kGasMaskShift = 2;
+inline constexpr uint32_t kGasMaskN = kGasMaskCellsN >> kGasMaskShift;
+inline constexpr uint32_t kGasMaskWords = kGasMaskN * kGasMaskN * kGasMaskN / 32;
+
 // ---------------------------------------------------------------- buffers --
 // Resolvable identities, NOT strings: a typo is a compile error, and the
 // recorder maps an id to a live rhi::Buffer in exactly one switch
@@ -229,6 +244,12 @@ enum class Buf : uint8_t {
   // raymarch.wgsl's godRays in the same command buffer. Render-private like
   // RayStart: never hashed, never saved, never bound by a sim kernel.
   GodVis,
+  // The gas empty-brick mask (assets/shaders/gas_mask.wgsl): per 4^3-cell
+  // brick of gasOuter, "may hold gas". WRITTEN by the per-frame `gas_mask`
+  // row on the ShadowCache table, READ by raymarch.wgsl's gasOuterCountAt in
+  // the same command buffer. Render-private like GodVis: never hashed, never
+  // saved, never bound by a sim kernel.
+  GasMask,
   // The RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl, src/sim/
   // rainexpo.h): per 4-key texel of the tick's fall-line lattice, the level of
   // the first ray blocker. SIM state, unlike RainMap above: written by the
@@ -475,6 +496,9 @@ enum class Pipe : uint8_t {
   // The god-ray sun visibility volume (godray_vis.wgsl), one per-FRAME row on
   // the ShadowCache table. Before ShadowResolve for the copy loop's bound.
   GodrayVis,
+  // The gas empty-brick mask (gas_mask.wgsl), one per-FRAME row on the
+  // ShadowCache table.
+  GasMask,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
