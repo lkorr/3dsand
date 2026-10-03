@@ -914,6 +914,7 @@ page faults, 4 new reds recorded above, everything else green or known.
 
 
 
+
 ## 2026-10-03 — `gas-leave-overflow` added, `"pass"` (det-gas package)
 
 New gate, new keys `gasOverflowCap` / `gasOverflowTicks` /
@@ -925,6 +926,7 @@ parcel digest). First run: converted 2365, refused 93317 on 53 ticks, twice-run
 identical over 56 snapshot ticks, digest c188e30d both arms. `gas-leave`'s
 "zero refusals" assertion is unchanged but is a throughput claim now, not a
 determinism one (DESIGN.md "The edge's refusals are a function of the world").
+
 
 
 
@@ -955,6 +957,7 @@ determinism one (DESIGN.md "The edge's refusals are a function of the world").
 
 
 
+
 ## 2026-10-03 — repose: worldgen reads each powder's own repose (hash moves; NOT re-pinned here)
 
 `sand` 34, `gravel` 40, `dirt` 40 are authored in materials.json, and worldgen's
@@ -966,6 +969,7 @@ tables move: intentional, left for the orchestrator's single re-pin.
 caps 126 / 112; travel 0.0 / 0.0 keeps its 0.5 caps). The control arm (same
 materials, old worldgen) measured 1499 / 1301 and FAILED, which is what this
 gate now guards.
+
 
 
 
@@ -995,6 +999,7 @@ seam fix above also drained this sealed box: live at the end 157 -> 4.
 
 `determinismHash` was not re-pinned on this branch (orchestrator pins once):
 the seam change moves any world with excited fluid.
+
 
 
 
@@ -1055,6 +1060,7 @@ and the `determinism` pin (b2514936 -> 5c3ea9ad with the twice-run comparison
 passing — a moved pin, not a determinism failure).
 
 
+
 ## 2026-10-03 — fire-perf triage of `mob-burn` and `fire-depth` (no key changed)
 
 Both stay `"fail"`; neither is a defect in the burn pass.
@@ -1073,6 +1079,7 @@ Both stay `"fail"`; neither is a defect in the burn pass.
   re-point both checks at a material the human has. Not done here.
 - `fire-depth`: 22.9k of 99.0k px behind the flame (floor: a tenth). Render
   side, as recorded above; untouched by CPU burn work.
+
 
 ## 2026-10-03 — det-cpu: fetch cache at the fixed latency, deterministic Jolt ids
 
@@ -1096,3 +1103,50 @@ Both stay `"fail"`; neither is a defect in the burn pass.
 - `tree-fell` passed at `--verify` scope on this tree (0 floating after the
   burn and the quench); its recorded status is red-world's to change.
 - `--gate determinism`: b2514936, matches the pin.
+
+
+
+
+
+## 2026-10-03 — det-debris: tree-fell's cut-half leak was race #10, already closed (no key changed)
+
+- Attributed with a new instrument, `SANDVOX_DEBRIS_TRACE=<file>` (debris
+  decision inputs per PreTick, every snapshot's support-flag set, every
+  probe / scan / terrain-need list). Three boots of det-cpu's tree 03f46cd:
+  chunks needed 38145 / 39067 / 39067, polygonizes 126 / 132 / 132, and the
+  traces differ at ONE line with every state hash equal before it:
+  `F snap 94258 flags 5` / `7` / `10`, the tick the 28k-voxel island is
+  erased. The `cells` kernel's support flag read neighbours the same
+  dispatch was erasing (cross-vendor audit #10), fixed by 15c3787, which
+  det-cpu's tree did not have. That snapshot now flags 0 chunks every boot.
+- On 2c8e285 + the trace: six `--gate tree-fell` boots and two
+  `--verify tree-fell,debris,floaters,determinism` boots give the same
+  `tree-fell` line apart from the wall-clock COST fields (chunks needed
+  38100, polygonizes 110), and the debris / phys / fetch traces are
+  byte-identical between boots. `tree-fell` PASS at gate and `--verify`
+  scope; its suite-scope `fail` is unchanged here (no suite run). Forced
+  rescan 0/0/0 on both trees; `eventQueueFullSpilled` 0 (the ~600 of the
+  plan note is now `drainBackpressure` ~730-790, a spill queue that waits,
+  not a loss).
+- `--verify` determinism: PIN MOVED 0fa43063 vs pinned b2514936, twice-run
+  reproduces, identical in both boots. That move came in with the repose
+  package (its entry above says it was left for the orchestrator to re-pin).
+  This package changes no hashed state and does not re-pin.
+- The pre-fix `sim_mutate.wgsl` run on the current tree does NOT diverge on
+  this GPU (the sorted upload makes the race land the same way), and support
+  flags are not in the twice-run hash. So a regression of this class would
+  currently go unseen; see DESIGN.md section 7.
+
+## 2026-10-03 — fire-gpu: no key changed; `determinismHash` was already stale on main
+
+`--verify determinism` reports PIN MOVED (final hash `0fa43063`, pinned
+`b2514936`) on this branch -- and identically on HEAD 1f7f393 with its own
+exe (`_fg_base`: `0fa43063`, twice-run reproduces). Not this package: its
+default arm is hash-identical to HEAD (`--perf village-fire` f7936a11 and
+`forestfire` 8dd17ecf both sides). The move is upstream, most likely the
+repose entry above ("hash moves; NOT re-pinned here"). Not rebaselined here
+(package rule). With `sim.gasThinDecayMul` 3 the determinism hash is
+`a2f8e287`, also reproduced twice-run; `oil-fire`, `heat-updraft` and
+`gas-leave` pass at 3. At the default (1) these passed on this tree:
+determinism (twice-run), gas-leave, gas-reenter, gas-leave-overflow,
+gas-farplume, gas-farplume2, heat-updraft, oil-fire, draft-stack.

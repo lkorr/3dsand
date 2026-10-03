@@ -305,6 +305,10 @@ per step and move on — `feedback-hash-moves-are-not-regressions`.
   burning crown re-flags its chunks every 45 ticks. It clears within 100 ticks
   of the fire going out, so it is now latency during the fire, not after it;
   a forest fire will still be the case to measure.
+  **2026-10-03 (det-debris):** `--gate tree-fell` now reads spilled 0 and
+  `drainBackpressure` ~730-790 over the burn: the queue still runs full, but
+  what it refuses is the `pendingSupport_` drain waiting a tick, not an event
+  spilled. Same design question, smaller symptom; not changed here.
 - **The forced-rescan anomaly.** `tree-fell` pass A2 tiles the region with
   explicit destruction events, and after §3.3 that makes the residue *worse*
   (5/2/1 → 14/22/4) rather than better. It is reported and not asserted on.
