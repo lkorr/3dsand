@@ -361,6 +361,15 @@ enum class Buf : uint8_t {
   HeatMeta,
   HeatParams,
   HeatArgs,
+  // ---- the charge field (src/sim/elec.h, sim_elec.wgsl), 55..57 ----
+  // ElecPool and ElecMeta are GPU-owned (caMask raises want bits in the meta;
+  // the elec rows own the rest); ElecParams is CPU-written
+  // (Simulation::PrepareElec / UploadTables). ElecArgs is indirect-only and
+  // never bound, like HeatArgs.
+  ElecPool,
+  ElecMeta,
+  ElecParams,
+  ElecArgs,
   // The RenderParams the tick's derived passes read (sim_openness.wgsl `RT`,
   // simBGL_ binding 53; docs/PLAN_async_compute.md). A COPY of RenderUBO made
   // at the end of the tick (copy_renderUBOTick), so the openness rows read
@@ -499,6 +508,8 @@ enum class Pipe : uint8_t {
   // The temperature layer (sim_heat.wgsl). BEFORE ShadowResolve for the copy
   // loop's bound stated above.
   HeatBegin, HeatShift, HeatPend, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatTent, HeatRelax,
+  // The charge field (sim_elec.wgsl, src/sim/elec.h).
+  ElecAlloc, ElecRound, ElecSettle, ElecPurge,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.
@@ -717,6 +728,18 @@ enum class Cond : uint8_t {
   DraftAll,
   DraftDirty,
   Draft,
+  // ---- the charge field's extra rounds (RecordCtx::elecRounds) ------------
+  // ElecRk: the alloc / copy / round triple of round k (k >= 1) records only
+  // while k < elecRounds AND the CA runs. Round 0 and the head / settle / tail
+  // rows are CaActive. One condition per round rather than a parameterised
+  // one: a row carries no operand, and elec.h kElecRoundsMax bounds the list.
+  ElecR1,
+  ElecR2,
+  ElecR3,
+  ElecR4,
+  ElecR5,
+  ElecR6,
+  ElecR7,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -818,6 +841,7 @@ enum class DispatchSel : uint32_t {
   IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
   IndDraftArgs,      // indirect: draftArgs @ the row's y (one 16-byte record per solve stage)
   IndHeatArgs,       // indirect: heatArgs @ the row's y (heat.h kHeatArg*: one 16-byte record per list)
+  IndElecArgs,       // indirect: elecArgs @ the row's y (elec.h kElecArg*: rounds / purge)
   // Indirect: giArgs @ 0. Same standing as IndShadowArgs: the count is what the
   // fragment shader appended last frame, which nothing on the CPU knows.
   IndGiArgs,
@@ -989,6 +1013,9 @@ struct RecordCtx {
   // this tick" (it moved, the gate or the materials changed, or it is new).
   bool draftOn = false;
   bool draftRebuild = false;
+  // The charge field's rounds this tick (Simulation::PrepareElec: sim.elecRounds,
+  // or 1 with the layer off). Gates Cond::ElecR1..ElecR7.
+  uint32_t elecRounds = 1;
 };
 
 }  // namespace pass

@@ -422,6 +422,54 @@ fn heatX(c : vec3<i32>) -> u32 {
 }
 // MIRROR-END heat
 
+// ---- THE CHARGE FIELD (sim_elec.wgsl, src/sim/elec.h) ----------------------
+// The CA may READ the settled potential P (elecAt below: half 0 of a chunk's
+// page, written by last tick's elecSettle, so stable for the whole colour
+// loop). It WRITES one thing, order-free: the caMask rows set a chunk's bit of
+// the want bitset (an OR) when it holds a SOURCE material and has no page --
+// the doorbell that pages it after the CA (elecAlloc's head).
+@group(0) @binding(55) var<storage, read> elecPool : array<u32>;
+@group(0) @binding(56) var<storage, read_write> elecMeta : array<atomic<u32>>;
+
+// MIRROR-BEGIN elec
+// ---- THE CHARGE FIELD'S SHARED ACCESSORS (src/sim/elec.h) -------------------
+// ONE block, pasted verbatim into sim_elec.wgsl and sim_step.wgsl and held
+// identical by scripts/check_invariants.py `elec`, which also checks every
+// constant against elec.h. Not in common.wgsl: an edit there misses the SPIR-V
+// cache of every shader, and only these agree on the layout. A shader that
+// pastes it binds elecPool (55) and elecMeta (56, atomic).
+//
+// READING P (packages E2 / E4): elecAt(slot, local) is the SETTLED field --
+// half 0, what elecSettle left at the end of the LAST tick. The elec rows run
+// after the CA, so inside the CA it is stable for the whole tick (as heatPool
+// is). `slot` is a WINDOW slot (tickets carry no charge and read 0), `local`
+// the chunk-local cell index (z * 256 + y * 16 + x).
+const ELEC_POOL_PAGES : u32 = 2048u;
+const ELEC_PAGE_WORDS : u32 = 4096u;
+const ELEC_HALF_WORDS : u32 = 2048u;
+const ELEC_ENTRY_HAS : u32 = 0x80000000u;
+const ELEC_ENTRY_PAGE : u32 = 0x00FFFFFFu;
+const EM_ENTRY : u32 = 64u;
+const EM_WANT : u32 = 65600u;
+const ELEC_R2_SOURCE : u32 = 33554432u;
+const ELEC_R2_CONDUCTS : u32 = 67108864u;
+
+fn elecAt(slot : u32, local : u32) -> u32 {
+  if (slot >= NUM_CHUNKS) { return 0u; }
+  let e = atomicLoad(&elecMeta[EM_ENTRY + slot]);
+  if ((e & ELEC_ENTRY_HAS) == 0u) { return 0u; }
+  let w = elecPool[(e & ELEC_ENTRY_PAGE) * ELEC_PAGE_WORDS + (local >> 1u)];
+  return (w >> ((local & 1u) * 16u)) & 0xFFFFu;
+}
+// P at WORLD cell c: 0 outside the window.
+fn elecAtCell(c : vec3<i32>) -> u32 {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, T.origin)) { return 0u; }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  return elecAt(chunkSlotIndex(wc), (lo.z * CHUNK + lo.y) * CHUNK + lo.x);
+}
+// MIRROR-END elec
+
 fn markVoxActive(idx : u32) {
   if (T.vizActive != 0u && idx != PT_NO_WORD) {
     atomicOr(&actVoxViz[idx >> 5u], 1u << (idx & 31u));
@@ -4587,6 +4635,7 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
         atomicOr(&wgCaMask[i >> 5u], bit);
         let m = materials[mat];
         if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { atomicOr(&wgCaEmit, 1u); }
+        if ((m._r2 & ELEC_R2_SOURCE) != 0u) { atomicOr(&wgCaEmit, 2u); }
         if (m.klass == CLASS_SOLID || m.klass == CLASS_POWDER) {
           atomicOr(&wgCaBlk[i >> 5u], bit);
         }
@@ -4730,11 +4779,21 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // the same dirty list -- and before the CA's first colour by pass order.
   if (li == 0u && P.substep == 0u && T.gasMode != GAS_MODE_OFF) { gasLeaveCount(ci); }
   if (li == 0u && ci < NUM_CHUNKS) {
-    var hot = atomicLoad(&wgCaEmit) != 0u;
+    // wgCaEmit: bit 0 = a heat emitter, bit 1 = an electric source.
+    let emit = atomicLoad(&wgCaEmit);
+    var hot = (emit & 1u) != 0u;
+    var charged = (emit & 2u) != 0u;
     if (sentinel) {
-      hot = ((materials[e & PT_MAT_MASK]._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u;
+      let sm = materials[e & PT_MAT_MASK];
+      hot = ((sm._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u;
+      charged = (sm._r2 & ELEC_R2_SOURCE) != 0u;
     }
     if (hot) { atomicOr(&heatMeta[HM_FLAGS + ci], HF_EMIT); }
+    // THE CHARGE FIELD'S DOORBELL: a source here and no page yet -- elecAlloc
+    // pages it after the CA (src/sim/elec.h). Window slots only.
+    if (charged && (atomicLoad(&elecMeta[EM_ENTRY + ci]) & ELEC_ENTRY_HAS) == 0u) {
+      atomicOr(&elecMeta[EM_WANT + (ci >> 5u)], 1u << (ci & 31u));
+    }
   }
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) {
     var word = atomicLoad(&wgCaMask[k]);

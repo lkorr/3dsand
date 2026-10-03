@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "sim/elec.h"
 #include "sim/heat.h"
 
 // Material classes — must match common.wgsl.
@@ -1186,6 +1187,16 @@ struct MaterialDef {
   // evaluator (bodies, the bench, gas parcels) ever sees one, and no authored
   // rule's index or RNG stream moves.
   ThermalDef thermal;
+  // THE CHARGE FIELD (src/sim/elec.h, docs/PLAN_electricity.md): materials.json
+  //   "electric": { "resist": 1..254, "source": 1..65535,
+  //                 "ignite": { "into": "<mat>", "chance": per-mille },
+  //                 "char": "<mat>" }
+  // No block = an insulator. resist is the potential lost per cell entered;
+  // source the potential the cell holds every tick it exists. ignite / char
+  // are E2's (ohmic ignition and charring), parsed and packed here so E2 needs
+  // no repack. Packed into elecParams by Simulation::UploadTables
+  // (PackElecMaterial) and _r2 bits 25 (source) / 26 (conducts).
+  ElecDef elec;
 };
 
 // Loads materials.json + reactions.json and compiles them into GPU tables:

@@ -529,7 +529,7 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
           U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
-          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap)))
+          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap) A(ElecMeta)))
 // THE COLOUR LISTS (2026-10-03, ca-chunk-overhead; sim_step.wgsl calist): one
 // workgroup per colour turns the caMask row's per-chunk colour words into
 // colour k's chunk list + count (caMask's tail) and colour k's indirect args
@@ -564,7 +564,10 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
           U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
-          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap)))
+          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap) A(ElecMeta)))
+// A(ElecMeta) on both caMask rows: THE CHARGE FIELD'S DOORBELL -- a chunk
+// holding a source material and no page sets its bit of elecMeta's want
+// bitset (an OR), and the elec rows after the CA page it (src/sim/elec.h).
 // Substep 1's colour lists, from caMask1's words (as caList above).
 PASS(caList1, "ca(54 color x substep)", PT_TICK, PIPE_CA_LIST, K_COMPUTE, 27,1,1, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(RW(CaMask) R(ArgsStage) R(DirtyList) A(CaArgs)))
@@ -666,6 +669,114 @@ PASS(heatRelax, "heat", PT_TICK, PIPE_HEAT_RELAX, K_INDIRECT, IND_HEATARGS,48,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(DirtyIn) I(HeatArgs) RW(HeatPool) A(HeatMeta) R(HeatParams) A(DirtyOut)
           R(PageTable)))
+
+// ---- phase 3a3: THE CHARGE FIELD (src/sim/elec.h, sim_elec.wgsl) ----------
+// docs/PLAN_electricity.md section 1. After the CA and the heat rows, over the
+// field's own live list (every chunk with a page), never the world:
+//   elecAlloc   ONE workgroup; elecMeta's PHASE word says which call it is.
+//               The head (phase 0) re-keys pages whose slot changed owner and
+//               pages caMask's doorbell wants (a source in a dirty chunk);
+//               between rounds it pages the last round's face wants; the TAIL
+//               (phase = rounds) pages the last wants onto next tick's list
+//               and flips -- or, if elecSettle marked nothing, arms elecPurge.
+//               Ranks are a prefix sum over the slot-ordered want bitset, so
+//               who gets a page under exhaustion is deterministic.
+//   elecRound   one group per live chunk: fixpoint by axis sweeps in shared
+//               memory, the halo the neighbours' previous round (half r & 1
+//               read, the other half written).
+//   elecSettle  the last round into half 0; keep + mark DIRTY_R_ELEC (only
+//               when a chunk of the 3x3x3 is dirty: the page-table mirror's
+//               one-ring bound), or free an all-zero page.
+//   elecPurge   zero + free a field nothing could keep awake (record 1).
+// Each alloc publishes the args (elecMeta byte 128, 32 B -> elecArgs): record
+// 0 the live list (rounds, settle), record 1 the purge. Round k >= 1 is one
+// alloc / copy / round triple under C_ELECRk (k < sim.elecRounds). No voxel is
+// written here.
+// write-only in practice: `elecPool` (the head zeroes re-keyed pages).
+PASS(elecAlloc0, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs0, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound0, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc1, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR1, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR1, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound1, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR1, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc2, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR2, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR2, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound2, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR2, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc3, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR3, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs3, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR3, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound3, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR3, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc4, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR4, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs4, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR4, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound4, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR4, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc5, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR5, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs5, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR5, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound5, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR5, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc6, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR6, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs6, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR6, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound6, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR6, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecAlloc7, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_ELECR7, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgs7, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELECR7, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecRound7, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_ELECR7, 1,
+     USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
+          R(ElecParams)))
+PASS(elecSettle, "elec", PT_TICK, PIPE_ELEC_SETTLE, K_INDIRECT, IND_ELECARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) I(ElecArgs) R(DirtyIn) A(DirtyOut) RW(ElecPool) A(ElecMeta) R(ElecParams)
+          R(PageTable)))
+PASS(elecAllocTail, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
+PASS(copy_elecArgsTail, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(ElecMeta) TW(ElecArgs)))
+PASS(elecPurge, "elec", PT_TICK, PIPE_ELEC_PURGE, K_INDIRECT, IND_ELECARGS,16,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(I(ElecArgs) W(ElecPool) A(ElecMeta)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //
@@ -1251,6 +1362,11 @@ PASS(wg_fill_heatMeta, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE,
      USES(TW(HeatMeta)))
 PASS(wg_fill_heatPool, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(HeatPool)))
+// Nor does the charge field (src/sim/elec.h): all zero = no charge, no page.
+PASS(wg_fill_elecMeta, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ElecMeta)))
+PASS(wg_fill_elecPool, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ElecPool)))
 PASS(wg_fill_support, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Support)))
 PASS(wg_fill_pCounts, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
@@ -1387,6 +1503,13 @@ PASS(lr_fill_heatMeta, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE
      USES(TW(HeatMeta)))
 PASS(lr_fill_heatPool, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(HeatPool)))
+// A loaded world starts with NO charge (the field is transient and not
+// saved): a source standing in the world is found by caMask's doorbell the
+// first tick its chunk is dirty, which the loader's refill wake makes it.
+PASS(lr_fill_elecMeta, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ElecMeta)))
+PASS(lr_fill_elecPool, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(ElecPool)))
 // The openness grid's per-slot STAMPS (world.h kOpenFaces). A load replaces
 // every chunk in the window, so every slot's 384 bytes now describe a world
 // that is gone. Zeroing the stamps is what makes the reader treat them as

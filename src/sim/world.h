@@ -458,7 +458,7 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // standing argument against two lists (tuning_params.def, pass_table.def).
 //
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
-constexpr int kDirtyReasonBits = 31;
+constexpr int kDirtyReasonBits = 32;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "write",      "react-idle", "stain-idle", "flow",
     "viscous",    "seam",       "part",       "wbody",
@@ -487,7 +487,11 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     // 2026-10-03 because those also mean a liquid SOAKING IN, which spends
     // liquid; drying touches none, and sim_waterbody.wgsl wbQuiet must not
     // read a drying bank as a disturbed body (DIRTY_R_DRY / DIRTY_R_DRYW).
-    "dry", "DRY-WROTE"};
+    "dry", "DRY-WROTE",
+    // docs/PLAN_electricity.md: the chunk holds charge (sim_elec.wgsl
+    // elecSettle DIRTY_R_ELEC), so the CA -- and with it the charge field's
+    // own rows -- keeps running while any exists. Not in FILM_LICENCE.
+    "elec"};
 
 // The bit for a reason NAME, resolved from the one table above rather than
 // written down as a number a second time -- 22/24/25 in a header is exactly
@@ -519,6 +523,8 @@ static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
                   DirtyReasonBit("gas-edge") != 0,
               "a gas dirty-reason name was renamed in kDirtyReasonName without "
               "updating kDirtyGasMask");
+static_assert(DirtyReasonBit("elec") == (1u << 31),
+              "sim_elec.wgsl DIRTY_R_ELEC is bit 31; kDirtyReasonName must name it there");
 static_assert(DirtyReasonBit("dry") == (1u << 29) &&
                   DirtyReasonBit("DRY-WROTE") == (1u << 30),
               "sim_step.wgsl / sim_waterbody.wgsl DIRTY_R_DRY / DIRTY_R_DRYW are "
@@ -5426,6 +5432,12 @@ class World {
   rhi::Buffer heatPool;    // kHeatPoolPages * kHeatPageWords u32
   rhi::Buffer heatMeta;    // kHmWords u32
   rhi::Buffer heatArgs;    // kHeatArgsBytes -- indirect-only copy of heatMeta[kHmArgs..]
+  // THE CHARGE FIELD (src/sim/elec.h). GPU-owned, transient; all zero = no
+  // charge anywhere, which is what the worldgen and load-reset fill rows
+  // leave. Not hashed, not saved.
+  rhi::Buffer elecPool;    // kElecPoolPages * kElecPageWords u32
+  rhi::Buffer elecMeta;    // kEmWords u32
+  rhi::Buffer elecArgs;    // kElecArgsBytes -- indirect-only copy of elecMeta[kEmArgs..]
   rhi::Buffer dirty[2];    // kNumChunks u32
   rhi::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
   rhi::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)

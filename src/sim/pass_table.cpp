@@ -183,6 +183,10 @@ namespace {
 #define PIPE_HEAT_SRC         Pipe::HeatSrc
 #define PIPE_HEAT_TENT        Pipe::HeatTent
 #define PIPE_HEAT_RELAX       Pipe::HeatRelax
+#define PIPE_ELEC_ALLOC       Pipe::ElecAlloc
+#define PIPE_ELEC_ROUND       Pipe::ElecRound
+#define PIPE_ELEC_SETTLE      Pipe::ElecSettle
+#define PIPE_ELEC_PURGE       Pipe::ElecPurge
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -239,6 +243,13 @@ namespace {
 #define C_DRAFTALL   Cond::DraftAll
 #define C_DRAFTDIRTY Cond::DraftDirty
 #define C_DRAFT      Cond::Draft
+#define C_ELECR1     Cond::ElecR1
+#define C_ELECR2     Cond::ElecR2
+#define C_ELECR3     Cond::ElecR3
+#define C_ELECR4     Cond::ElecR4
+#define C_ELECR5     Cond::ElecR5
+#define C_ELECR6     Cond::ElecR6
+#define C_ELECR7     Cond::ElecR7
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_RAINFALL  (uint32_t)DispatchSel::RainFallSel
@@ -276,6 +287,7 @@ namespace {
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 #define IND_DRAFTARGS     (uint32_t)DispatchSel::IndDraftArgs
 #define IND_HEATARGS      (uint32_t)DispatchSel::IndHeatArgs
+#define IND_ELECARGS      (uint32_t)DispatchSel::IndElecArgs
 #define IND_GIARGS        (uint32_t)DispatchSel::IndGiArgs
 #define IND_CAARGS        (uint32_t)DispatchSel::IndCaArgs
 

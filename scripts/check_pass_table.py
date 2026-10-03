@@ -223,6 +223,11 @@ PIPE_TO_MEMBER = {
     "PIPE_HEAT_SRC": "heatSrc_",
     "PIPE_HEAT_TENT": "heatTent_",
     "PIPE_HEAT_RELAX": "heatRelax_",
+    # The charge field (sim_elec.wgsl, src/sim/elec.h).
+    "PIPE_ELEC_ALLOC": "elecAlloc_",
+    "PIPE_ELEC_ROUND": "elecRound_",
+    "PIPE_ELEC_SETTLE": "elecSettle_",
+    "PIPE_ELEC_PURGE": "elecPurge_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -349,6 +354,12 @@ BUF_TO_WGSL = {
     "HeatMeta": {"heatMeta"},
     "HeatParams": {"heatParams"},
     "HeatArgs": set(),
+    # The charge field, bindings 55..57 of simBGL_ (src/sim/elec.h).
+    # ElecArgs is indirect-only and never bound, like HeatArgs.
+    "ElecPool": {"elecPool"},
+    "ElecMeta": {"elecMeta"},
+    "ElecParams": {"elecParams"},
+    "ElecArgs": set(),
     # The deferred streaming wake's act verdict, binding 30.
     "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
@@ -481,6 +492,8 @@ _SIM_GROUP0 = {
     "caArgs",
     # The temperature layer, bindings 50..52 (sim_heat.wgsl; the CA reads it).
     "heatPool", "heatMeta", "heatParams",
+    # The charge field, bindings 55..57 (sim_elec.wgsl; caMask raises its doorbell).
+    "elecPool", "elecMeta", "elecParams",
     # The tick's RenderParams copy for the derived rows, binding 53
     # (sim_openness.wgsl `RT`; docs/PLAN_async_compute.md).
     "RT",

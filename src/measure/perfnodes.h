@@ -149,6 +149,16 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "nothing hot it is one group per dirty chunk that returns after two loads "
      "(heatWant) and zero-group indirects; the rest scales with chunks within "
      "one chunk of a heat source. heatShift runs only on a window-shift tick."},
+    {"elecSys", "Charge Field", "simTick", PerfSide::Gpu, PerfScope::Count,
+     "elecAlloc0;elecRound0;elecAlloc1;elecRound1;elecAlloc2;elecRound2;elecAlloc3;elecRound3;"
+     "elecAlloc4;elecRound4;elecAlloc5;elecRound5;elecAlloc6;elecRound6;elecAlloc7;elecRound7;"
+     "elecSettle;elecAllocTail;elecPurge",
+     "The charge field (docs/PLAN_electricity.md, package E1): sim.elecRounds "
+     "rounds of a max-plus potential over the chunks that hold charge, each "
+     "relaxed to its fixpoint in shared memory, with one-workgroup page "
+     "allocation between rounds. With no charge anywhere it is 1 + rounds "
+     "single-group allocs that read the want bitset and zero-group indirects; "
+     "the rest scales with charged chunks x rounds."},
     {"particleSys", "Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "

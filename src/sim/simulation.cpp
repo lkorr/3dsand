@@ -24,6 +24,7 @@
 #include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
 #include "sim/solutes.h"     // LoadSolutes: the species table UploadTables packs
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
+#include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
@@ -140,6 +141,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     static const std::vector<uint32_t> zeros(kHpWords, 0u);
     queue.WriteBuffer(heatParamsBuf_, 0, zeros.data(), zeros.size() * 4);
     heatColValid_ = false;
+  }
+  // The charge field's parameters (elec.h kEp*): the per-material words are
+  // filled by UploadTables, the header by PrepareElec; zeroed once here.
+  elecParamsBuf_ = CreateBuffer(device, (uint64_t)kEpWords * 4,
+                                rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                "elecParams");
+  {
+    static const std::vector<uint32_t> zeros(kEpWords, 0u);
+    queue.WriteBuffer(elecParamsBuf_, 0, zeros.data(), zeros.size() * 4);
+    elecHdrValid_ = false;
   }
   UploadTables(queue, mats, reactions);
   // The solute layer's free stack and empty table, before any tick can
@@ -398,8 +409,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The CA colour rows' indirect args (sim_step.wgsl calist writes them;
         // the recorder dispatches colour k from offset 16 k). simBGL_ only.
         entry(54, T::Storage),         // caArgs
+        // The charge field (src/sim/elec.h, sim_elec.wgsl): the pool and the
+        // meta record are GPU-owned (caMask raises the doorbell's want bits in
+        // the meta; E2's CA effects will read the pool); the params are
+        // CPU-written. simBGL_ only. 55..57, the first free slots of this
+        // dense 0..54 layout.
+        entry(55, T::Storage),         // elecPool (u16 P per cell, two halves)
+        entry(56, T::Storage),         // elecMeta (table, owners, wants, lists, stack)
+        entry(57, T::ReadOnlyStorage), // elecParams (knobs, wet table, per material)
     };
-    simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
+    simBGL_ =device.CreateBindGroupLayout(entries, std::size(entries));
 
     // slim group 0 for the particle/explosion/far pipelines: bindings 0..4
     // plus the two page buffers at 17/18, which must keep the SAME binding
@@ -1372,6 +1391,9 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(52, heatParamsBuf_),
         b(53, renderUBOTickBuf_),
         b(54, caArgsBuf_),
+        b(55, world_->elecPool),
+        b(56, world_->elecMeta),
+        b(57, elecParamsBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1519,6 +1541,19 @@ void Simulation::UploadTables(const rhi::Queue& queue,
       PackHeatMaterial(t, words.data() + i * kHpMatStride);
     }
     queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpMat * 4, words.data(), words.size() * 4);
+  }
+  // THE CHARGE FIELD (src/sim/elec.h): resist / source (and E2's ignite /
+  // char words) to elecParams at kEpMat + id * kEpMatStride, and two flags on
+  // `_r2` -- bit 25 SOURCE (caMask's doorbell) and bit 26 CONDUCTS (E2).
+  {
+    std::vector<uint32_t> words((size_t)kEpMatStride * kElecMatMax, 0u);
+    for (size_t i = 0; i < mats.size() && i < kStainPaletteBase && i < kElecMatMax; i++) {
+      const ElecDef& e = mats[i].elec;
+      if (e.source != 0) table[i]._r2 |= kElecR2Source;
+      if (e.resist != 0) table[i]._r2 |= kElecR2Conducts;
+      PackElecMaterial(e, words.data() + i * kEpMatStride);
+    }
+    queue.WriteBuffer(elecParamsBuf_, (uint64_t)kEpMat * 4, words.data(), words.size() * 4);
   }
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
@@ -2023,6 +2058,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The temperature layer (sim_heat.wgsl, src/sim/heat.h): pages, sources,
   // targets and relaxation, after the CA on its dirty list.
   rhi::ShaderModule mHeat;
+  // The charge field (sim_elec.wgsl, src/sim/elec.h): pages, rounds, settle.
+  rhi::ShaderModule mElec;
   // The openness grid's writer (docs/PLAN_gi.md §2). A RENDER-path module among
   // the sim ones for shadow_resolve.wgsl's reason: BuildPipelines is the single
   // place F5 recompiles, and the pass and the raymarch's reader must be
@@ -2078,6 +2115,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mStep, "sim_step.wgsl");
     mod(&mSolute, "sim_solute.wgsl");
     mod(&mHeat, "sim_heat.wgsl");
+    mod(&mElec, "sim_elec.wgsl");
     mod(&mOcc, "sim_occupancy.wgsl");
     mod(&mPick, "sim_pick.wgsl");
     mod(&mOpenness, "sim_openness.wgsl");
@@ -2107,7 +2145,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDenoise, "denoise.wgsl");
     loads.Run(buildThreads);
   }
-  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mSolute || !mHeat || !mOcc || !mPick ||
+  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mSolute || !mHeat || !mElec || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
@@ -2240,6 +2278,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { heatSrc_ = MakeComputePipeline(device, simPL_, mHeat, "heatSrc", "heatSrc"); });
   pool.Add([&] { heatTent_ = MakeComputePipeline(device, simPL_, mHeat, "heatTent", "heatTent"); });
   pool.Add([&] { heatRelax_ = MakeComputePipeline(device, simPL_, mHeat, "heatRelax", "heatRelax"); });
+  // The charge field (sim_elec.wgsl). On simPL_: bindings 55..57.
+  pool.Add([&] { elecAlloc_ = MakeComputePipeline(device, simPL_, mElec, "elecAlloc", "elecAlloc"); });
+  pool.Add([&] { elecRound_ = MakeComputePipeline(device, simPL_, mElec, "elecRound", "elecRound"); });
+  pool.Add([&] { elecSettle_ = MakeComputePipeline(device, simPL_, mElec, "elecSettle", "elecSettle"); });
+  pool.Add([&] { elecPurge_ = MakeComputePipeline(device, simPL_, mElec, "elecPurge", "elecPurge"); });
 
   pool.Add([&] { explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark"); });
   pool.Add([&] { explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply"); });
@@ -2369,6 +2412,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
+      !elecAlloc_ || !elecRound_ || !elecSettle_ || !elecPurge_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ || !gLeavePrep_ ||
       !fluidSpawn_ ||
@@ -2697,6 +2741,10 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::HeatMeta:            return world_->heatMeta;
     case B::HeatParams:          return heatParamsBuf_;
     case B::HeatArgs:            return world_->heatArgs;
+    case B::ElecPool:            return world_->elecPool;
+    case B::ElecMeta:            return world_->elecMeta;
+    case B::ElecParams:          return elecParamsBuf_;
+    case B::ElecArgs:            return world_->elecArgs;
     case B::GasParticlesRead:    return world_->gasParticles[page_];
     case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
     case B::GasCounts:           return world_->gasCounts;
@@ -2852,6 +2900,10 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::HeatSrc:        return heatSrc_;
     case P::HeatTent:       return heatTent_;
     case P::HeatRelax:      return heatRelax_;
+    case P::ElecAlloc:      return elecAlloc_;
+    case P::ElecRound:      return elecRound_;
+    case P::ElecSettle:     return elecSettle_;
+    case P::ElecPurge:      return elecPurge_;
     default:                return step_;
   }
 }
@@ -3195,6 +3247,27 @@ void Simulation::EncodeSoluteRestore(const rhi::CommandEncoder& enc, uint32_t co
 // the WORLD column held in each window column (x & 511, z & 511), so a shift
 // recomputes just the new strip on the CPU; the upload is then the whole
 // 256 KiB (an x shift touches every row), on a shift tick only.
+// ---- THE CHARGE FIELD'S CPU HALF (src/sim/elec.h) ---------------------------
+// The header's knobs. Off = ONE round that drains every page (sim_elec.wgsl
+// treats every cell as an insulator without a seed), so switching the layer
+// off releases its storage within a tick, as heat's mode does.
+void Simulation::PrepareElec(const rhi::Queue& queue) {
+  const Tuning& tn = CurrentTuning();
+  uint32_t hdr[kEpHdrWords] = {};
+  const bool on = tn.sim.elecMode != 0;
+  hdr[kEpMode] = on ? 1u : 0u;
+  hdr[kEpRounds] = on ? (uint32_t)std::clamp(tn.sim.elecRounds, 1, (int)kElecRoundsMax) : 1u;
+  hdr[kEpDecay] = (uint32_t)std::clamp(tn.sim.elecDecay, 0, (int)kElecPMax);
+  hdr[kEpIterCap] = kElecIterCap;
+  const uint32_t wet = (uint32_t)std::clamp(tn.sim.elecWetResist, 1, (int)kElecResistInsulator - 1);
+  for (uint32_t a = 0; a < 16; a++) hdr[kEpWet + a] = ElecWetResist(wet, a);
+  elecRounds_ = hdr[kEpRounds];
+  if (elecHdrValid_ && std::equal(hdr, hdr + kEpHdrWords, elecHdr_)) return;
+  std::copy(hdr, hdr + kEpHdrWords, elecHdr_);
+  elecHdrValid_ = true;
+  queue.WriteBuffer(elecParamsBuf_, 0, hdr, sizeof(hdr));
+}
+
 bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed) {
   const Tuning& tn = CurrentTuning();
   uint32_t hdr[kHpHdrWords] = {};
@@ -3687,6 +3760,12 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // CPU-side, so the knob is an exact off switch here too.
   cx.gasFarWideCount =
       CurrentTuning().render.farPlumeStrength > 0.0f ? farPlumeWideCount_ : 0u;
+
+  // ---- the charge field's rounds (src/sim/elec.h) --------------------------
+  // The count PrepareElec put in the header this tick: round k > 0 records
+  // only while k < elecRounds (Cond::ElecR1..ElecR7), and every elec row only
+  // when the CA runs.
+  cx.elecRounds = elecRounds_;
 
   // ---- the repose snapshot prepass ----------------------------------------
   // `anyRepose_` is a property of the MATERIAL TABLE, latched in UploadTables,

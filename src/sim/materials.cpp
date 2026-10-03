@@ -492,6 +492,50 @@ static void ParseInfect(const json& m, const std::string& path, MaterialDef& d,
   d.infect = true;
 }
 
+// ---- THE CHARGE FIELD: materials.json "electric" (docs/PLAN_electricity.md) --
+// Names (`ignite.into`, `char`) are resolved in LoadAssets once the whole table
+// exists (forward references).
+static void ParseElectric(const json& m, const std::string& path, MaterialDef& d,
+                          std::string& errors) {
+  d.elec = ElecDef{};
+  if (!m.contains("electric")) return;
+  const json& t = m["electric"];
+  const std::string at = path + ": material \"" + d.name + "\": electric";
+  if (!t.is_object()) {
+    errors += at + " must be an object\n";
+    return;
+  }
+  const int resist = t.value("resist", 0);
+  if (resist < 0 || resist > (int)kElecResistInsulator - 1)
+    errors += at + ".resist must be 0..254 (0 = insulator)\n";
+  d.elec.resist = (uint32_t)std::clamp(resist, 0, (int)kElecResistInsulator - 1);
+  const int source = t.value("source", 0);
+  if (source < 0 || source > (int)kElecPMax) errors += at + ".source must be 0..65535\n";
+  d.elec.source = (uint32_t)std::clamp(source, 0, (int)kElecPMax);
+  if (t.contains("ignite")) {
+    const json& g = t["ignite"];
+    if (!g.is_object() || !g.contains("into") || !g["into"].is_string()) {
+      errors += at + ".ignite needs \"into\"\n";
+    } else {
+      d.elec.igniteInto = g["into"].get<std::string>();
+      d.elec.igniteChanceMille = g.value("chance", 10.0);
+      if (!(d.elec.igniteChanceMille >= kReactChanceMinMille) ||
+          d.elec.igniteChanceMille > 1000.0)
+        errors += at + ".ignite: chance must be " + FormatMille(kReactChanceMinMille) +
+                  "..1000 per-mille\n";
+    }
+  }
+  if (t.contains("char")) {
+    if (!t["char"].is_string()) errors += at + ".char must be a material name\n";
+    else d.elec.charInto = t["char"].get<std::string>();
+  }
+  for (auto& [key, v] : t.items()) {
+    (void)v;
+    if (key != "resist" && key != "source" && key != "ignite" && key != "char" && key != "note")
+      errors += at + ": unknown key \"" + key + "\"\n";
+  }
+}
+
 // ---- THE TEMPERATURE LAYER: materials.json "thermal" (docs/PLAN_temperature.md)
 // Names (`into`, `partialInto`) are resolved in LoadAssets once the whole table
 // exists (forward references). Thresholds are heat units, 0 = water freezes.
@@ -1005,6 +1049,7 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     }
     ParseAbsorb(m, path, d, errors);
     ParseThermal(m, path, d, errors);
+    ParseElectric(m, path, d, errors);
     d.tags = m.value("tags", std::vector<std::string>{});
     for (auto& t : d.tags) {
       uint32_t bit = tagReg.MaskOf(t, true);
@@ -2045,6 +2090,21 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
                 "rule (the CA skips inert solids)\n";
     if (d.thermal.transitions.size() > kHeatMaxTransitions)
       errors += materialsPath + ": material \"" + d.name + "\": too many thermal transitions\n";
+  }
+  // THE CHARGE FIELD (materials.json "electric"): E2's products by NAME.
+  for (auto& d : m) {
+    auto resolve = [&](const std::string& name, const char* what, uint32_t& id) {
+      id = 0;
+      if (name.empty()) return;
+      const int r = FindMaterial(m, name);
+      if (r < 0)
+        errors += materialsPath + ": material \"" + d.name + "\": electric " + what + " \"" +
+                  name + "\" is not a material\n";
+      else
+        id = (uint32_t)r;
+    };
+    resolve(d.elec.igniteInto, "ignite.into", d.elec.igniteIntoId);
+    resolve(d.elec.charInto, "char", d.elec.charIntoId);
   }
   CheckPinnedMaterialIds(m, materialsPath, errors);
   if (!errors.empty()) return false;

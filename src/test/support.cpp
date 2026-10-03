@@ -1824,6 +1824,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // origin -- the same inputs a replay feeds this function. True on a tick a
   // live heat knob moved (F1 Temperature): the wake below then fires too.
   const bool heatKnobsMoved = sim.PrepareHeat(ctx.queue, tp.origin, seed);
+  // The charge field's knobs (mode, rounds, decay, wet table): a pure function
+  // of tuning, and the round count EncodeTick records this tick.
+  sim.PrepareElec(ctx.queue);
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
   if (!exps.empty())

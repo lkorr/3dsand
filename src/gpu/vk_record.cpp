@@ -176,6 +176,14 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::DraftAll:      return cx.draftOn && cx.draftRebuild;
     case pass::Cond::DraftDirty:    return cx.draftOn && !cx.draftRebuild && cx.caActive;
     case pass::Cond::Draft:         return cx.draftOn && (cx.draftRebuild || cx.caActive);
+    // The charge field's round k (k >= 1): only while k < this tick's rounds.
+    case pass::Cond::ElecR1:        return cx.caActive && cx.elecRounds > 1;
+    case pass::Cond::ElecR2:        return cx.caActive && cx.elecRounds > 2;
+    case pass::Cond::ElecR3:        return cx.caActive && cx.elecRounds > 3;
+    case pass::Cond::ElecR4:        return cx.caActive && cx.elecRounds > 4;
+    case pass::Cond::ElecR5:        return cx.caActive && cx.elecRounds > 5;
+    case pass::Cond::ElecR6:        return cx.caActive && cx.elecRounds > 6;
+    case pass::Cond::ElecR7:        return cx.caActive && cx.elecRounds > 7;
   }
   return false;
 }
@@ -799,6 +807,11 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
           case pass::DispatchSel::IndHeatArgs:
             // Five list records in one buffer (heat.h kHeatArg*); y = byte offset.
             args = bind_.buffers[(int)pass::Buf::HeatArgs];
+            argsOff = r.y;
+            break;
+          case pass::DispatchSel::IndElecArgs:
+            // Two records (elec.h kElecArg*: rounds, purge); y = byte offset.
+            args = bind_.buffers[(int)pass::Buf::ElecArgs];
             argsOff = r.y;
             break;
           case pass::DispatchSel::IndCaArgs:

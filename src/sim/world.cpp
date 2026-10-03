@@ -1,4 +1,5 @@
 #include "sim/world.h"
+#include "sim/elec.h"
 #include "sim/heat.h"
 
 #include <algorithm>
@@ -141,6 +142,13 @@ void World::Init(const rhi::Device& device) {
   heatMeta = CreateBuffer(device, (uint64_t)kHmWords * 4,
                           U::Storage | U::CopySrc | U::CopyDst, "heatMeta");
   heatArgs = CreateBuffer(device, kHeatArgsBytes, U::Indirect | U::CopyDst, "heatArgs");
+  // The charge field (src/sim/elec.h): zeroed by the worldgen / load fill
+  // rows before anything reads it.
+  elecPool = CreateBuffer(device, (uint64_t)kElecPoolPages * kElecPageWords * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "elecPool");
+  elecMeta = CreateBuffer(device, (uint64_t)kEmWords * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "elecMeta");
+  elecArgs = CreateBuffer(device, kElecArgsBytes, U::Indirect | U::CopyDst, "elecArgs");
 
   // The allocator + conservative dirty mirror + materialization rule. It
   // installs the initial table: the IDENTITY MAP in both modes, because

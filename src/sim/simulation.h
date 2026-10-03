@@ -161,6 +161,11 @@ class Simulation {
   // new target crosses a melt / ignite / freeze threshold. The first call
   // after construction, a worldgen or a load only records the knobs.
   bool PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed);
+  // THE CHARGE FIELD's per-tick knobs (src/sim/elec.h kEp* header: mode,
+  // rounds, decay, the wet resist table), a pure function of the tuning the
+  // tick sees. Uploaded only when a word changed. Also fixes the round count
+  // EncodeTick records this tick.
+  void PrepareElec(const rhi::Queue& queue);
   // The cell the F1 readout asks about (the player's feet); heatRelax copies
   // that block's X / X* / sources into heatMeta's probe words. Render-side
   // input: it changes no heat value, only which one is reported.
@@ -871,6 +876,15 @@ class Simulation {
   rhi::Buffer heatParamsBuf_;
   rhi::ComputePipeline heatBegin_, heatShift_, heatPend_, heatWant_, heatArgs_, heatAlloc_, heatSrc_,
       heatTent_, heatRelax_;
+  // The charge field's CPU-written parameters (elec.h kEp*, binding 57) and
+  // its pipelines (sim_elec.wgsl). elecHdr_ is the header last uploaded;
+  // elecRounds_ the round count EncodeTick records (the SAME value the header
+  // carries, so the GPU's phase arithmetic and the recorded rows agree).
+  rhi::Buffer elecParamsBuf_;
+  rhi::ComputePipeline elecAlloc_, elecRound_, elecSettle_, elecPurge_;
+  uint32_t elecHdr_[kEpHdrWords] = {};
+  bool elecHdrValid_ = false;
+  uint32_t elecRounds_ = 1;
   std::vector<uint8_t> heatCol_;
   std::vector<int> heatColX_, heatColZ_;
   bool heatColValid_ = false;

@@ -3346,9 +3346,93 @@ def check_heat_mirror():
                                 f"{row!r} in world.h kDirtyReasonName")
 
 
+# ---------------------------------------------------------- the charge field
+# assets/shaders/sim_elec.wgsl + sim_step.wgsl (MIRROR-BEGIN elec)  <->  each
+# other + src/sim/elec.h (docs/PLAN_electricity.md). Same contract as the heat
+# block above: the pasted accessor block is TEXT-IDENTICAL in both shaders, and
+# every constant either shader declares under an elec.h name equals elec.h's
+# value (the CPU sizes, resets, packs and reads the same buffers).
+_ELEC_CONSTS = {
+    "ELEC_POOL_PAGES": "kElecPoolPages", "ELEC_PAGE_WORDS": "kElecPageWords",
+    "ELEC_HALF_WORDS": "kElecHalfWords", "ELEC_ENTRY_HAS": "kElecEntryHas",
+    "ELEC_ENTRY_PAGE": "kElecEntryPage", "ELEC_ROUNDS_MAX": "kElecRoundsMax",
+    "ELEC_RES_INS": "kElecResistInsulator",
+    "ELEC_R2_SOURCE": "kElecR2Source", "ELEC_R2_CONDUCTS": "kElecR2Conducts",
+    "EM_CUR": "kEmCur", "EM_FREE_TOP": "kEmFreeTop", "EM_NEXT_FRESH": "kEmNextFresh",
+    "EM_PHASE": "kEmPhase", "EM_MARKED": "kEmMarked", "EM_COUNT0": "kEmCount0",
+    "EM_PAGES_PEAK": "kEmPagesPeak", "EM_REFUSED": "kEmRefused", "EM_ALLOCS": "kEmAllocs",
+    "EM_FREES": "kEmFrees", "EM_PURGES": "kEmPurges", "EM_STRANDED": "kEmStranded",
+    "EM_LIVE_PEAK": "kEmLivePeak", "EM_REKEYED": "kEmRekeyed", "EM_P_PEAK": "kEmPPeak",
+    "EM_ROUND_CHUNKS": "kEmRoundChunks", "EM_ARGS": "kEmArgs", "EM_ENTRY": "kEmEntry",
+    "EM_OWNER": "kEmOwner", "EM_WANT": "kEmWant", "EM_LIST0": "kEmList0",
+    "EM_LIST1": "kEmList1", "EM_STACK": "kEmStack",
+    "ELEC_ARG_ROUND": "kElecArgRound", "ELEC_ARG_PURGE": "kElecArgPurge",
+    "EP_MODE": "kEpMode", "EP_ROUNDS": "kEpRounds", "EP_DECAY": "kEpDecay",
+    "EP_ITER_CAP": "kEpIterCap", "EP_WET": "kEpWet", "EP_MAT": "kEpMat",
+    "EP_MAT_STRIDE": "kEpMatStride",
+}
+
+
+def check_elec_mirror():
+    names_ = ("sim_elec.wgsl", "sim_step.wgsl")
+    files = {n: read("assets/shaders/" + n) or "" for n in names_}
+    if not files["sim_elec.wgsl"]:
+        return
+    checked.append("elec")
+    blocks = {n: _mirror_blocks(t, "elec") for n, t in files.items()}
+    for n, b in blocks.items():
+        if len(b) != 1:
+            problems.append(f"elec: {n} has {len(b)} `MIRROR-BEGIN elec` blocks; expected one")
+    if all(len(b) == 1 for b in blocks.values()) and \
+            blocks["sim_elec.wgsl"][0] != blocks["sim_step.wgsl"][0]:
+        a, c = blocks["sim_elec.wgsl"][0].splitlines(), blocks["sim_step.wgsl"][0].splitlines()
+        i = 0
+        while i < min(len(a), len(c)) and a[i] == c[i]:
+            i += 1
+        problems.append(f"elec: sim_step.wgsl's elec block differs from sim_elec.wgsl's at "
+                        f"line {i + 1} of the block -- the copies must be identical")
+    eh = read("src/sim/elec.h") or ""
+
+    def cpp_value(name, depth=0):
+        m = re.search(r"constexpr\s+u?int32_t\s+(?:[A-Za-z0-9_]+\s*=\s*[^,;]+,\s*)*" + name +
+                      r"\s*=\s*([^,;]+)[,;]", eh)
+        if not m or depth > 24:
+            return None
+        expr = re.sub(r"(0x[0-9A-Fa-f]+|\d+)u\b", r"\1", m.group(1).strip())
+
+        def sub(mm):
+            v = cpp_value(mm.group(0), depth + 1)
+            return str(v) if v is not None else mm.group(0)
+        expr = re.sub(r"\bk[A-Za-z0-9_]+\b", sub, expr).replace("/", "//")
+        try:
+            return int(eval(expr, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
+
+    for n, txt in files.items():
+        for w, c in _ELEC_CONSTS.items():
+            mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", txt, re.M)
+            if not mw:
+                continue
+            cv = cpp_value(c)
+            if cv is None:
+                problems.append(f"elec: cannot read {c} (src/sim/elec.h) for {n}'s {w}")
+            elif int(mw.group(1), 0) != cv:
+                problems.append(f"elec: {n} {w} = {mw.group(1)} but elec.h {c} = {cv}")
+    # DIRTY_R_ELEC is the bit world.h's kDirtyReasonName table names "elec".
+    wh = read("src/sim/world.h") or ""
+    md = re.search(r"const\s+DIRTY_R_ELEC\s*:\s*u32\s*=\s*(\d+)u\s*;", files["sim_elec.wgsl"])
+    mn = re.search(r"kDirtyReasonName\[kDirtyReasonBits\]\s*=\s*\{(.*?)\};", wh, re.S)
+    rn = re.findall(r'"([^"]+)"', mn.group(1)) if mn else []
+    if not md or "elec" not in rn or int(md.group(1)) != (1 << rn.index("elec")):
+        problems.append("elec: sim_elec.wgsl DIRTY_R_ELEC is not 1 << the index of \"elec\" "
+                        "in world.h kDirtyReasonName")
+
+
 ALL = {
     "solute": check_solute_mirror,
     "heat": check_heat_mirror,
+    "elec": check_elec_mirror,
     "ticket": check_ticket_record,
     "reactfx": check_react_fx,
     "coatrule": check_coat_rule,
