@@ -16729,12 +16729,15 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // Candidates: the front, its lattice neighbours (spread is pushed
   // OUTWARD, never pulled by scanning for candidates), and whatever the
   // world is touching.
+  burnprof::Count(burnprof::kFront, st.front.size());
+  burnprof::Scope bpQueue(burnprof::kQueue);
   for (uint32_t c : st.front) queue(c);
   for (size_t k = 0, n0 = cand.size(); k < n0; k++) {
     const IVec3 p = posOf(cand[k]);
     for (const IVec3& d : kBurnDirs)
       queueNbr(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
   }
+  bpQueue.Stop();
 
   // ---- world contact: seed the exposed FACE ----------------------------
   // Probing the face CENTRE would seed 1 of the 64 skin voxels a world cell
@@ -17963,6 +17966,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // Clear the per-tick queued bits and rebuild the front from what is actually
   // alight now. Candidates skipped for budget keep their material, so an
   // exhausted budget slows the fire down rather than putting it out.
+  burnprof::Scope bpSweep(burnprof::kFrontSweep);
   st.front.clear();
   uint32_t hot = 0;
   for (uint32_t c : cand) {

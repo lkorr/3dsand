@@ -46,6 +46,13 @@ enum Phase : uint8_t {
   kSeed,
   kCandLoop,
   kWorn,
+  // The candidate list's construction from the front (the front cells and
+  // their lattice neighbours) and the post-loop sweep over every candidate
+  // that clears the queued bits and rebuilds the front. Both scale with the
+  // CANDIDATE count, not the evaluated count (rule 6: attribute before
+  // eliminating -- see BurnOneLimb's bounded-window note).
+  kQueue,
+  kFrontSweep,
   kCount
 };
 
@@ -54,7 +61,7 @@ inline const char* Name(int p) {
                                   "burnLimbs", "burnOne", "flush", "carve",
                                   "rebuild", "index", "crossHeat", "tail",
                                   "recount", "deadFlesh", "walk", "seed",
-                                  "candLoop", "worn"};
+                                  "candLoop", "worn", "queue", "frontSweep"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 
@@ -65,11 +72,12 @@ enum Counter : uint8_t {
   kSeedNew,      // ...that queued a candidate not already queued
   kCandidates,   // candidates queued in total (front + neighbours + seeds)
   kEvaluated,    // ...of which the front budget let the loop evaluate
+  kFront,        // front cells held at the top of each BurnOneLimb visit
   kNCount
 };
 inline const char* CounterName(int c) {
   static const char* k[kNCount] = {"seedProbes", "seedHits", "seedNew",
-                                   "cands", "evaluated"};
+                                   "cands", "evaluated", "front"};
   return c >= 0 && c < kNCount ? k[c] : "?";
 }
 
