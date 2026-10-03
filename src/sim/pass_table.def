@@ -421,8 +421,7 @@ PASS(rainExpo, "rainExpo", PT_TICK, PIPE_RAIN_EXPO, K_COMPUTE, D_RAINEXPO,1,1, G
 PASS(draftMaskAll, "draft", PT_TICK, PIPE_DRAFT_MASK_ALL, K_COMPUTE, 2048,1,1, GRP_SIM, DYN_ZERO, C_DRAFTALL, 1,
      USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) RW(Draft) A(DraftMeta)))
 PASS(draftMaskDirty, "draft", PT_TICK, PIPE_DRAFT_MASK_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_DRAFTDIRTY, 1,
-     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) R(DirtyList) I(DispatchArgs) RW(Draft) A(DraftMeta)
-          A(HeatMeta)))
+     USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) R(DirtyList) I(DispatchArgs) RW(Draft) A(DraftMeta)))
 PASS(draftArgs, "draft", PT_TICK, PIPE_DRAFT_ARGS, K_COMPUTE, 1,1,1, GRP_SIM, DYN_ZERO, C_DRAFT, 1,
      USES(U(TickUBO) A(DraftMeta) A(HeatMeta)))
 // kDraftMetaArgs * 4 = 32 bytes into draftMeta: six stage records of 16

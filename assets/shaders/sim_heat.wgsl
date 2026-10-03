@@ -151,6 +151,7 @@ const HM_PROBE_X : u32 = 30u;
 const HM_PROBE_E : u32 = 31u;
 const HEAT_PROBE_TAG_SHIFT : u32 = 17u;
 const HM_ARGS : u32 = 32u;
+const HM_DRAFT_HEAT_CLOCK : u32 = 56u;
 const HM_SUMMARY : u32 = 65664u;
 const HM_OWNER : u32 = 98432u;
 const HM_WANT : u32 = 131200u;
@@ -816,6 +817,16 @@ fn heatBlockAmbientRange(c : vec3<i32>) -> vec2<i32> {
   return vec2<i32>(lo, hi);
 }
 
+// World chunk wc is in the draft box (T.draftOrigin; DRAFT_N* cells of 4
+// voxels, so a chunk is 4 cells) or up to two chunks under it. False with the
+// volume off.
+fn heatInDraftReach(wc : vec3<i32>) -> bool {
+  if (T.draftMode == 0u) { return false; }
+  let v = wc - (T.draftOrigin >> vec3<u32>(CHUNK_SHIFT));
+  return v.x >= 0 && v.z >= 0 && v.y >= -2 &&
+         v.x < DRAFT_NX / 4 && v.y < DRAFT_NY / 4 && v.z < DRAFT_NZ / 4;
+}
+
 @compute @workgroup_size(128)
 fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
              @builtin(local_invocation_index) li : u32) {
@@ -888,7 +899,14 @@ fn heatRelax(@builtin(workgroup_id) wg : vec3<u32>,
     atomicOr(&dirtyOut[slot], DIRTY_R_HEAT);
   }
   if (moved) { atomicAdd(&heatMeta[HM_RELAX_TICKS], 1u); }
-  if (!nonzero && (keep & 2u) == 0u) {
+  let freeing = !nonzero && (keep & 2u) == 0u;
+  // The draft volume's heat clock (heat.h kHmDraftHeatClock): this chunk's X
+  // moved or its page goes back, and it lies in the draft box or within the
+  // updraft's two-chunk look-down under it.
+  if ((moved || freeing) && heatInDraftReach(wc)) {
+    atomicAdd(&heatMeta[HM_DRAFT_HEAT_CLOCK], 1u);
+  }
+  if (freeing) {
     // Free: the page is all zero, so it goes back as it is.
     let at = atomicAdd(&heatMeta[HM_FREE_TOP], 1u);
     atomicStore(&heatMeta[HM_STACK + at], e & HEAT_ENTRY_PAGE);

@@ -16611,7 +16611,13 @@ field.
   so a gale's gusts cannot boil chlorine out of a hollow): +30 cells over cold
   in 40 ticks. Particles feel the full velocity through their drag law: ember
   particles released at rest over lava are all still airborne at 40 ticks,
-  the cold ones all landed. Making hot smoke OUTRUN cold smoke would need cold
+  the cold ones all landed. A particle's response to the HEAT term alone is
+  bounded in time (`sim_particle.wgsl` HEAT-LIFT AGE, flags bits 19..26): full
+  for its first 60 ticks of flight in lift, withdrawn over the next 60, so it
+  falls out of the plume instead of hovering where lift balances gravity over
+  permanent heat (measured: without the fade 16/16 embers were still aloft
+  over lava at 300 ticks in calm air; with it, 0). Ambient wind, fans and the
+  draft shelter are not faded. Making hot smoke OUTRUN cold smoke would need cold
   smoke to climb slower than the ceiling, a global buoyancy change not made.
 - `wfThermal` (the regime's procedural thermal gusts) is unchanged and is not a
   double count: a zero-mean texture tied to the weather, not to anything hot.
@@ -16623,9 +16629,11 @@ reader adds it to the local lift, so inside the box the rising air respects the
 walls: a sealed room's column turns over in place, a hot room with a low and a
 high opening breathes (`draft-stack`: +3.6 m/s in at the low opening, -3.1 m/s
 out at the high, smoke leaves only by the high one). The volume is now a
-function of geometry AND heat: it re-solves when the box holds heat, the heat
-layer's activity counters moved and 16 ticks have passed; a cold box costs what
-it did, bit for bit.
+function of geometry AND heat: it re-solves when the BOX'S OWN heat moved
+(heatRelax counts chunk-ticks whose excess moved or whose page was freed, in the
+box or up to two chunks under it, into heat.h `kHmDraftHeatClock`) and 16 ticks
+have passed -- a fire outside the box does not re-solve it; a cold box costs
+what it did, bit for bit.
 
 **Cost** (`--perf`, main's exe vs this): forestfire GPU 30.8 -> 29.5 ms,
 village-fire 49.6 -> 49.6 ms; draft rows +0.17 ms; awake chunks -7% / -2%

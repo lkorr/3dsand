@@ -116,10 +116,7 @@
 @group(0) @binding(51) var<storage, read_write> heatMeta : array<atomic<u32>>;
 
 // src/sim/heat.h's monotonic activity counters (check_invariants `heat`).
-const HM_RELAX_TICKS : u32 = 24u;
-const HM_FREES : u32 = 25u;
-const HM_ALLOCS : u32 = 26u;
-const HM_RELEASED : u32 = 27u;
+const HM_DRAFT_HEAT_CLOCK : u32 = 56u;
 
 // world.h kDraftMeta* / kDraft*Base / kDraftTiles (check_invariants `drafts`
 // holds these to world.h).
@@ -139,7 +136,6 @@ const DRAFT_SC_BASE : u32 = 1323008u;   // per coarse cell: mean b | phi b
 const DRAFT_SB : u32 = 1327104u;        // b per fine cell, Q12 of the cap
 const DRAFT_SPHI_A : u32 = 1458176u;
 const DRAFT_SPHI_B : u32 = 1589248u;
-const DM_HEAT_SEEN : u32 = 32u;
 const DM_HEAT_CLOCK : u32 = 33u;
 const DM_BOX_HOT : u32 = 34u;
 const DM_HEAT_START : u32 = 35u;
@@ -192,23 +188,24 @@ fn tileOf(t : u32) -> vec3<i32> {
 // snapshot saw no heat (DM_BOX_HOT), so a cold box costs what it did.
 //
 // WHEN IT RE-SOLVES. b moves without any mask moving, so `args` also starts a
-// solve when the box holds heat (the last snapshot saw b != 0, or an active
-// chunk in the box has a heat page) AND the heat layer's activity counters
-// moved since the last solve began AND at least DRAFT_HEAT_PERIOD ticks have
-// passed -- a fire's field lags its heat by at most ~22 ticks (0.7 s), and a
-// box with no heat in it never solves for heat at all. Determinism: the
-// counters are the heat rows' own monotonic atomics, final before this row
-// reads them, so the verdict is a function of the tick's inputs.
+// solve when the BOX'S OWN heat moved since the last solve began -- heatRelax
+// counts every chunk-tick whose X moved or whose page was freed in the box or
+// up to two chunks under it (the updraft's look-down) into heat.h
+// kHmDraftHeatClock -- AND at least DRAFT_HEAT_PERIOD ticks have passed. A
+// fire's field lags its heat by at most ~22 ticks (0.7 s); a box with no heat
+// in or under it never solves for heat, and heat moving elsewhere in the
+// window (a fire outside the box) does not re-solve a box whose heat is
+// settled. The last move of a cooling box (its pages freed) still counts, so
+// the solve that publishes "no heat" (DRAFT_STACK_LIVE 0) is always reached.
+// Determinism: the clock is an order-free atomicAdd by the previous tick's
+// heatRelax, final before this row reads it.
 const DRAFT_HEAT_PERIOD : u32 = 16u;
 
 fn stackOn() -> bool { return T.draftStackQ > 0 && T.updraftGainQ > 0; }
 // Did this solve's snapshot see heat? Set by coarseBuild, read by the later
 // stages, reset by `args` only when a new solve starts.
 fn stackLive() -> bool { return atomicLoad(&draftMeta[DM_BOX_HOT]) != 0u; }
-fn heatClock() -> u32 {
-  return atomicLoad(&heatMeta[HM_RELAX_TICKS]) + atomicLoad(&heatMeta[HM_FREES]) +
-         atomicLoad(&heatMeta[HM_ALLOCS]) + atomicLoad(&heatMeta[HM_RELEASED]);
-}
+fn heatClock() -> u32 { return atomicLoad(&heatMeta[HM_DRAFT_HEAT_CLOCK]); }
 
 // ---- the masks --------------------------------------------------------------
 
@@ -300,10 +297,6 @@ fn maskDirty(@builtin(workgroup_id) wg : vec3<u32>,
   let vc = wc - (T.draftOrigin >> vec3<u32>(CHUNK_SHIFT));
   if (vc.x < 0 || vc.y < 0 || vc.z < 0 ||
       vc.x >= DRAFT_CX || vc.y >= DRAFT_CY || vc.z >= DRAFT_CZ) { return; }
-  // The stack effect's doorbell: an active chunk of the box holds heat.
-  if (li == 0u && stackOn() && windHeatEntry(wc, T.origin) != 0u) {
-    atomicOr(&draftMeta[DM_HEAT_SEEN], 1u);
-  }
   if (maskCell(vc, li)) {
     atomicOr(&draftMeta[DM_CHANGED], 1u);
     atomicAdd(&draftMeta[DM_CELLS], 1u);
@@ -351,13 +344,12 @@ fn args() {
     next = prev + 1u;
   } else {
     let masks = atomicExchange(&draftMeta[DM_CHANGED], 0u) != 0u;
-    // THE STACK EFFECT'S TRIGGER (block above): heat in the box, moved, due.
+    // THE STACK EFFECT'S TRIGGER (block above): the box's heat moved, due.
     var heat = false;
     if (stackOn()) {
-      let hot = atomicLoad(&draftMeta[DM_HEAT_SEEN]) != 0u || stackLive();
       let moved = heatClock() != atomicLoad(&draftMeta[DM_HEAT_CLOCK]);
       let due = T.tick - atomicLoad(&draftMeta[DM_HEAT_START]) >= DRAFT_HEAT_PERIOD;
-      heat = hot && moved && due;
+      heat = moved && due;
     }
     if (masks || heat) {
       next = 1u;
@@ -368,7 +360,6 @@ fn args() {
   // A solve begins: its snapshot (coarseBuild, this tick) re-decides whether
   // the box is hot, and the heat it sees is the heat as of now.
   if (start) {
-    atomicStore(&draftMeta[DM_HEAT_SEEN], 0u);
     atomicStore(&draftMeta[DM_BOX_HOT], 0u);
     atomicStore(&draftMeta[DM_HEAT_CLOCK], heatClock());
     atomicStore(&draftMeta[DM_HEAT_START], T.tick);

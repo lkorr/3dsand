@@ -299,6 +299,48 @@ fn withFloatTicks(flags : u32, t : u32) -> u32 {
          ((min(t, PMICRO_LIFE_MASK)) << PMICRO_LIFE_SHIFT);
 }
 
+// ---- HEAT-LIFT AGE: a plume carries an ember up, then lets it go ----------
+// (2026-10-02, the heat-wind audit.) The heat updraft (common.wgsl HEAT
+// UPDRAFTS) is a lift up to sim.windUpdraftCap over the hot ground that ends a
+// few cells past the 32-voxel look-down. A drag law pulls a light particle
+// toward it, so in calm air every wind-responsive particle in a plume over
+// PERMANENT heat (a lava pool) finds the height where the lift's drag equals
+// gravity and hovers there forever: above it the lift is weaker, below it
+// stronger -- a stable equilibrium, and inflow centres it sideways. Rule 2.
+//
+// The bound: bits 19..26 of `flags` count the ticks this particle has flown
+// with heat lift at its cell (saturating at 255). For the first
+// PART_HEAT_FULL_TICKS it answers to the whole heat term; over the next
+// PART_HEAT_FADE_TICKS that term is withdrawn linearly; after that it feels
+// only the ambient wind, the fans and the draft shelter, and falls out of the
+// column. 2 s of full lift + 2 s of fade at 30 Hz: sparks visibly climb
+// (heat-updraft's ember arm reads them at 40 ticks), and an ember over lava is
+// back on the ground within seconds of the fade (heat-updraft's settle phase).
+// Integer, a pure function of the particle and the tick's heat. A new particle
+// starts at 0 (spawnOp's keep mask does not admit these bits); a resting
+// particle that lost its claim restarts at 0 too (resolve's rest path).
+// Bits 17/18 are PARKED/DEPOSIT, 19..31 were spare.
+const PHEAT_AGE_SHIFT : u32 = 19u;
+const PHEAT_AGE_MASK : u32 = 0xFFu;
+const PART_HEAT_FULL_TICKS : i32 = 60;
+const PART_HEAT_FADE_TICKS : i32 = 60;
+
+fn heatLiftFade(p : ptr<function, Particle>, c : vec3<i32>, w : vec3<i32>) -> vec3<i32> {
+  // No heat page anywhere, or the term off: one compare and two shared loads.
+  if (windHeatUpQ(c, &T) <= 0) { return w; }
+  let age = min(((*p).flags >> PHEAT_AGE_SHIFT) & PHEAT_AGE_MASK, PHEAT_AGE_MASK - 1u) + 1u;
+  (*p).flags = ((*p).flags & ~(PHEAT_AGE_MASK << PHEAT_AGE_SHIFT)) | (age << PHEAT_AGE_SHIFT);
+  let gone = clamp(i32(age) - PART_HEAT_FULL_TICKS, 0, PART_HEAT_FADE_TICKS);
+  if (gone == 0) { return w; }
+  // The heat's share of w exactly as windAtScaledQ scaled it, then withdrawn
+  // in steps of 1/FADE (divide first: |h| up to a few x 2^24 stays in i32).
+  var h = windHeatQ(c, &T);
+  if (T.windPartScaleQ != WINDQ_SCALE_ONE) {
+    h = (h / WINDQ_SCALE_ONE) * T.windPartScaleQ;
+  }
+  return w - (h / PART_HEAT_FADE_TICKS) * gone;
+}
+
 // PASSABLE VEGETATION HOLDS NOTHING UP (2026-09-25). A bramble, a grass tuft,
 // a flower is one full CA cell drawn as a small micro-model, and it is a SOLID
 // to the grid -- so a chunk thrown off a carved body used to come to rest ON
@@ -785,7 +827,14 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     // Almost every material is 0 (stone chips do not blow around), so the
     // common case is one comparison and no field evaluation at all.
     if (resp > 0) {
-      let w = windAtScaledQ(startCell, &T, T.windPartScaleQ);
+      var w = windAtScaledQ(startCell, &T, T.windPartScaleQ);
+      // THE HEAT TERM FADES WITH TIME SPENT IN IT (heatLiftFade above): past
+      // PART_HEAT_FULL_TICKS of flight in rising air, the heat's share of w
+      // (common.wgsl windHeatQ: lift, inflow, stack) is withdrawn over
+      // PART_HEAT_FADE_TICKS, so an ember lofts and then falls OUT of a
+      // plume over permanent heat instead of hovering where lift = gravity.
+      // Ambient wind, fans and the draft shelter are untouched.
+      w = heatLiftFade(&p, startCell, w);
       // 0 in calm air, and 0 at a 0x dev multiplier — the same statement, which
       // is the point of ramping on the SCALED field. Tested before the gaps are
       // formed so a becalmed world pays a max and a divide, not six.

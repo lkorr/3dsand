@@ -112,6 +112,17 @@ constexpr uint32_t kHeatArgsBytes = kHeatArgRecords * 16;
 static_assert(kHmArgs * 4 == 128, "pass_table.def copy_heatArgs reads byte 128");
 static_assert(kHeatArgsBytes == 96, "pass_table.def copy_heatArgs copies 96 bytes");
 static_assert(kHmArgs + kHeatArgRecords * 4 <= kHmHdrWords, "the args fit the header");
+// THE DRAFT VOLUME'S HEAT CLOCK (wind phase 5; sim_draft.wgsl `args`): heatRelax
+// adds 1 per chunk-tick whose X moved or whose page was freed, for chunks
+// INSIDE the draft box or up to two chunks under it (the updraft looks 32 voxels
+// down, so heat there shapes the box's stack source). Monotonic, an order-free
+// atomicAdd: the stack field re-solves when THIS moved, so a fire outside the box
+// does not re-solve a box whose own heat is settled. Past the args records and
+// outside the snapshot words (a worldgen / load reset zeroes it, and either
+// forces a draft burst that re-reads it).
+constexpr uint32_t kHmDraftHeatClock = 56;
+static_assert(kHmDraftHeatClock >= kHmArgs + kHeatArgRecords * 4 && kHmDraftHeatClock < 64,
+              "the draft heat clock sits between the args and the firing log (kHmFireLog)");
 // THE FIRING LOG (diagnostic, never read by the sim): the first
 // kHeatFireLogMax thermal transitions since the layer was last reset (a
 // worldgen or a load) record their cell and kind -- kHmFireLog counts every

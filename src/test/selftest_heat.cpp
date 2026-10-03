@@ -2009,6 +2009,126 @@ Status GateHeatUpdraft(Ctx& c, std::string& detail) {
                 world.WindowOrigin().y, world.WindowOrigin().z));
     ok = ok && same;
   }
+
+  // ---- THE SETTLE CHECK: heat ON, calm air, then the heat taken away ----
+  // (2026-10-02 audit.) The cost check above is a world with NO heat; this is
+  // the real-game case. Two arms, the shipped gain and gain 0, each from a
+  // fresh world with the harness's own heat on and the air CALM (the
+  // adversarial case for a hover: no crosswind to carry anything out of a
+  // column). Hot rooms 0 (a smoke puff + a chlorine puff over the lid) and 2
+  // (emberCount embers released at rest), hotTicks of PERMANENT heat, then
+  // every slab overwritten with stone and up to coolTicksMax more ticks.
+  //   * awake growth: the shipped arm's peak awake count over the hot phase
+  //     at most hotAwakeExtraMax over the gain-0 arm's.
+  //   * no hover over permanent heat: every ember particle down (landed or
+  //     burnt out) by the end of the hot phase, with the lava still there
+  //     (sim_particle.wgsl HEAT-LIFT AGE -- the lift lets go after ~4 s).
+  //   * settle: with the heat gone, both rooms' chunks asleep and their heat
+  //     pages freed within coolTicksMax, in both arms.
+  {
+    const int hotTicks = (int)BaselineNumber("heatUpdraft.settleHotTicks", 300);
+    const int coolMax = (int)BaselineNumber("heatUpdraft.coolTicksMax", 2400);
+    const double extraMax = BaselineNumber("heatUpdraft.hotAwakeExtraMax", 16);
+    uint32_t peak[2] = {}, aloft[2] = {}, aloftMid[2] = {}, cool[2] = {}, pagesLeft[2] = {},
+             awakeLeft[2] = {};
+    std::vector<uint32_t> roomChunks = ChunksOf(UpRoom(0));
+    for (uint32_t s : ChunksOf(UpRoom(2))) roomChunks.push_back(s);
+    for (int arm = 0; arm < 2; arm++) {
+      Tuning t = CurrentTuning();
+      t.sim.windUpdraftGain = arm == 0 ? shippedGain : 0.0f;
+      t.sim.heatMode = 1;
+      t.wind.windSpeed = 0.0f;
+      SetCurrentTuning(t);
+      SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+      ctx.WaitIdle();
+      uint32_t tk = 66000;
+      support::TickCursor ticker{c, tk, {UpRoomX(1) >> 4, (gUpY[1] + 16) >> 4, kUpZ >> 4}};
+      UpBuild(ticker, {0, 2}, lava, true);
+      for (int i = 0; i < settle; i++) ticker();
+      uint32_t pcBase[2] = {};
+      ctx.WaitIdle();
+      ReadCountsSync(ctx, world, pcBase);
+      support::TickOps rel;
+      {
+        const Box p = UpPuff(0);
+        Fill(rel.cells, p, smoke);
+        Fill(rel.cells, {p.x0 + 6, p.y0, p.z0, p.x1 + 6, p.y1, p.z1}, chlorine);
+        const Box q = UpPuff(2);
+        for (int i = 0; i < emberCount; i++) {
+          ParticleSpawn s{};
+          s.px = (q.x0 + (i % 4)) * 256 + 128;
+          s.py = (q.y0 + (i / 16) % 4) * 256 + 128;
+          s.pz = (q.z0 + (i / 4) % 4) * 256 + 128;
+          s.payload = ember;
+          s.flags = kPFlagAlive;
+          rel.spawns.push_back(s);
+        }
+      }
+      ticker(rel);
+      auto inFlight = [&]() {
+        uint32_t pc[2] = {};
+        ctx.WaitIdle();
+        ReadCountsSync(ctx, world, pc);
+        const uint32_t n = std::max(pc[0], pc[1]), b = std::max(pcBase[0], pcBase[1]);
+        return n > b ? n - b : 0u;
+      };
+      for (int i = 1; i <= hotTicks; i++) {
+        ticker();
+        if (i % 20 == 0) peak[arm] = std::max(peak[arm], AwakeAll(ctx, c.sim));
+        if (i == 40) aloftMid[arm] = inFlight();
+      }
+      aloft[arm] = inFlight();
+      // The heat taken away: every slab and its rim (lid included) to stone.
+      std::vector<CellOp> quench;
+      for (int k : {0, 2}) {
+        const Box s = UpSlab(k);
+        for (int z = s.z0 - 1; z <= s.z1 + 1; z++)
+          for (int y = s.y0; y <= s.y1 + 1; y++)
+            for (int x = s.x0 - 1; x <= s.x1 + 1; x++)
+              quench.push_back({World::SlotCellIndex({x, y, z}), (uint32_t)kMatStone});
+      }
+      ticker({}, quench);
+      cool[arm] = 0;
+      HeatView hv;
+      auto roomPages = [&]() {
+        hv.Read(ctx, world, false);
+        uint32_t n = 0;
+        for (uint32_t s : roomChunks) n += (hv.meta[kHmEntry + s] & kHeatEntryHas) != 0;
+        return n;
+      };
+      for (int i = 1; i <= coolMax; i++) {
+        ticker();
+        if (i % 50 == 0 && AwakeIn(ctx, c.sim, roomChunks) == 0 && roomPages() == 0) {
+          cool[arm] = (uint32_t)i;
+          break;
+        }
+      }
+      awakeLeft[arm] = AwakeIn(ctx, c.sim, roomChunks);
+      pagesLeft[arm] = roomPages();
+    }
+    {
+      Tuning t = CurrentTuning();
+      t.sim.windUpdraftGain = shippedGain;
+      t.wind.windSpeed = (float)BaselineNumber("heatUpdraft.windSpeed", 3.0);
+      SetCurrentTuning(t);
+    }
+    RecordObserved("heatUpdraft.hotAwakePeakObserved", (double)peak[0]);
+    RecordObserved("heatUpdraft.hotAwakePeakGain0Observed", (double)peak[1]);
+    RecordObserved("heatUpdraft.coolTicksObserved", (double)cool[0]);
+    const bool growthOk = (double)peak[0] <= (double)peak[1] + extraMax;
+    const bool landOk = aloft[0] == 0;
+    const bool settleOk = cool[0] != 0 && cool[1] != 0;
+    note(Format("settle (heat on, calm air): peak awake over %d hot ticks gain %.1f %u vs gain 0 "
+                "%u (<= +%.0f) %s; embers in flight over the lava at tick 40 %u (gain 0: %u), at "
+                "tick %d %u (must be 0: the lift lets go) %s; heat removed: rooms asleep with no "
+                "heat page after %u ticks (gain 0: %u; 0 = not within %d, left awake %u/%u, "
+                "pages %u/%u) %s",
+                hotTicks, shippedGain, peak[0], peak[1], extraMax, growthOk ? "OK" : "FAIL",
+                aloftMid[0], aloftMid[1], hotTicks, aloft[0], landOk ? "OK" : "FAIL", cool[0],
+                cool[1], coolMax, awakeLeft[0], awakeLeft[1], pagesLeft[0], pagesLeft[1],
+                settleOk ? "OK" : "FAIL"));
+    ok = ok && growthOk && landOk && settleOk;
+  }
   SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
   ctx.WaitIdle();
   detail = out;

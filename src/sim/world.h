@@ -2599,10 +2599,10 @@ constexpr uint32_t kDraftMetaStage = 4;     // the solve pipeline's stage (0 = i
 constexpr uint32_t kDraftMetaArgs = 8;      // 6 stages x 4 words: each stage's indirect args
 constexpr uint32_t kDraftStages = 6;
 // The stack effect's re-solve trigger (sim_draft.wgsl `args`): heat moving is
-// not a mask change, so these say whether the box holds heat and when the heat
-// layer last moved. Past the args records, which end at word 31.
-constexpr uint32_t kDraftMetaHeatSeen = 32;   // an active chunk in the box has a heat page (OR)
-constexpr uint32_t kDraftMetaHeatClock = 33;  // the heat layer's activity clock at the last solve
+// not a mask change, so these say when the box's own heat last moved (heat.h
+// kHmDraftHeatClock) and what the last snapshot saw. Past the args records,
+// which end at word 31; word 32 is unused.
+constexpr uint32_t kDraftMetaHeatClock = 33;  // kHmDraftHeatClock at the last solve's start
 constexpr uint32_t kDraftMetaBoxHot = 34;     // the last snapshot saw b != 0 (OR)
 constexpr uint32_t kDraftMetaHeatStart = 35;  // tick the last solve started
 constexpr uint32_t kDraftMetaWords = 40;

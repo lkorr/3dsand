@@ -213,7 +213,11 @@ hot-material count unnecessary: the wind reads the heat pool directly.
   a gale's gust bands cannot lift a cellar of chlorine): +30 cells over cold in 40 ticks.
   Particles take the full velocity through their drag law: ember particles (wind response
   8) released at rest over lava are all still airborne at 40 ticks, the cold ones all on
-  the floor. Making smoke visibly outrun cold smoke would need cold smoke to climb SLOWER
+  the floor. The heat term's pull on a particle is AGED (sim_particle `heatLiftFade`,
+  flags bits 19..26): full for 60 ticks of flight in lift, withdrawn over the next 60.
+  Without it a light particle over permanent heat hovered forever at the height where
+  the lift's drag equals gravity (16/16 embers aloft over lava at 300 ticks, calm air);
+  with it all are down (heat-updraft's settle phase). Making smoke visibly outrun cold smoke would need cold smoke to climb SLOWER
   than the CA ceiling (a global buoyancy change); not done -- that is the owner's call.
 - **`wfThermal` is left alone.** It is the regime's procedural gust texture: a zero-mean
   sine pattern on a sunny calm day, not a mean updraft tied to anything hot. It does not
@@ -1117,10 +1121,13 @@ P(b): the rising air made to respect the walls. Reader: `draftStackAtQ`, inside
 `windHeatQ`, scaled by `sim.windStackGain` (1).
 
 **When it re-solves.** `b` moves without a mask moving, so `args` also starts a
-solve when the box holds heat (the last snapshot saw `b != 0`, or `maskDirty`
-saw an active chunk of the box with a heat page), the heat layer's activity
-counters (heat.h `kHmRelaxTicks + kHmFrees + kHmAllocs + kHmReleased`) moved
-since the last solve began, and `DRAFT_HEAT_PERIOD` (16) ticks have passed. A
+solve when the BOX'S OWN heat moved since the last solve began -- `heatRelax`
+adds one to heat.h `kHmDraftHeatClock` per chunk-tick whose excess moved or
+whose page was freed, for chunks in the box or up to two chunks under it (the
+lift's look-down) -- and `DRAFT_HEAT_PERIOD` (16) ticks have passed. (The first
+version keyed on the WHOLE layer's activity counters, so a box holding settled
+heat re-solved every 16 ticks while any fire elsewhere in the window burned;
+fixed in the 2026-10-02 audit, `draft-stack` numbers unchanged.) A
 box with no heat never solves for heat; a cold snapshot skips every `b` line of
 every pass (`DM_BOX_HOT`), so a cold box costs what it did, bit for bit (gate
 `drafts`: the transfer numbers did not move, purity 0 words differ). The field
