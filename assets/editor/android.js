@@ -10,15 +10,17 @@
  * back, a halo.
  *
  * WHAT IT IS MADE OF (materials.json, the robot rows). Panels are
- * `synth_shell` (hardness 45, `shell`); under them `circuitry` (soft, bleeds
- * COOLANT and ARCS -- almost every blow that reaches it throws a spark), an
+ * `synth_shell` (hardness 45, `shell`); under them `circuitry` (soft, and it
+ * ARCS -- every blow that reaches it throws a spark, some along arcs), an
  * `alloy` endoskeleton (hardness 180: a limb does not come off to a sword),
  * a `power_cell` in the chest and a `neural_core` (brainHp) in the head. The
  * lights are `gem_arcane` (emission; the art colour is the light's colour),
  * the visor `glass`, the joints `steel`. A breached power cell, or a dead
  * android, DISCHARGES: a spray of sparks along jagged arcs that lights what
- * burns and pops what explodes. It bleeds coolant -- cyan, faintly glowing,
- * and an extinguisher, where the automaton's oil is a fuel.
+ * burns and pops what explodes. IT DOES NOT BLEED (owner, 2026-10-03): a
+ * blow on an android throws sparks, never fluid -- shell and frame spark on
+ * most hits, wiring on every one. `coolant` stays a material, and nothing
+ * leaks it.
  *
  * synth_shell / alloy / circuitry / power_cell / neural_core are ids > 127,
  * painted as STAND-INS and rewritten at load (anatomy.becomes, mob.cpp).
@@ -37,8 +39,8 @@ export const RACE = 'android';
 export const FOLDER = 'android';
 export const NEW_NAME = 'unit';
 export const BLURB = 'an android: smooth synthetic panels over circuitry and ' +
-  'an alloy frame, light strips, a glowing power core. Bleeds coolant, arcs ' +
-  'when struck, discharges when it dies; its frame shrugs off a blade. Same ' +
+  'an alloy frame, light strips, a glowing power core. Sparks ' +
+  'when struck instead of bleeding, discharges when it dies; its frame shrugs off a blade. Same ' +
   'limbs and proportions, so armour and weapons still fit.';
 
 // =============================================================================
@@ -76,8 +78,12 @@ export const STAND_INS = {
   neural_core: 'petal_red',
 };
 
-/** Coolant: cyan, faintly lit, an extinguisher. */
-export const BLEED = { material: 'coolant', perDamage: 1.2 };
+/** NO BLEED (owner, 2026-10-03: "sparks only, no fluid"). `null` is the
+ *  explicit "bleeds nothing": mobgen writes `"bleed": null` into the sidecar,
+ *  which the `extends` merge reads as DELETE the human's blood (RFC 7396), so
+ *  the def has no bleed block and Mob::FluidAt / BleedTick have nothing to
+ *  leak. The sparks are the materials' `struck` rows (materials.json). */
+export const BLEED = null;
 
 export const ANATOMY = {
   layers: [

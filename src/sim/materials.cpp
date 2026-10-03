@@ -1007,6 +1007,13 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       d.struckChance = std::clamp(s.value("chance", 1.0f), 0.0f, 1.0f);
       if (!(d.struckChance == d.struckChance)) d.struckChance = 0.0f;
       d.struckRadius = std::clamp(s.value("radius", 1), 1, 4);
+      if (s.contains("arcs")) {
+        if (s["arcs"].is_boolean())
+          d.struckArcs = s["arcs"].get<bool>() ? 1.0f : 0.0f;
+        else if (s["arcs"].is_number())
+          d.struckArcs = std::clamp(s["arcs"].get<float>(), 0.0f, 1.0f);
+        if (!(d.struckArcs == d.struckArcs)) d.struckArcs = 0.0f;
+      }
     }
     if (m.contains("burst") && m["burst"].is_object()) {
       const auto& b = m["burst"];

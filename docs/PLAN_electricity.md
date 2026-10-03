@@ -130,6 +130,17 @@ cell.
 
 ### 3. Sources and spells (package E3)
 
+**Status (2026-10-03, worktree branch):** built, data-only to the field. The
+materials, glyphs, the strike function (`game/lightning.h`:
+`LightningStrike` / `PlanStrike` / `EmitStrike`, `StrikeSpecFromGlyph`,
+`WeatherStrikeSpec`), storm ground strikes (`session.cpp` WeatherStrikes,
+knobs `weather.strikeRate` / `strikeRadius`, `SANDVOX_STRIKE_EVERY`), the near
+flash and the thunder slot, and gate `elec-strike`. Iron, steel, gold and
+brass count as conductors BY NAME in `StrikeMats` until E1 fixes their tags.
+At merge with E1: add the `electric` blocks to `spark` / `arc` / `lightning`;
+nothing in the strike path changes. DESIGN.md "Lightning: arcs, bolts and the
+strike path" is the as-built account.
+
 - `spark` gets a small `source` (~200).
 - New materials:
   - `arc`: an air-class glowing transient, `source` mid, decays 1 tick.

@@ -674,6 +674,15 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   cp.flash[1] = w.baseM + w.thicknessM * 0.35f;
   cp.flash[2] = camZM + st.flashZ;
   cp.flashAmp = on ? st.flash : 0.0f;
+  // A SIM GROUND STRIKE near the player (weather::NoteStrike, a real bolt in
+  // the grid) outshines the far flash while it lasts: the deck lights over
+  // the bolt itself, at cloud base.
+  if (on && st.strikeFlash > st.flash) {
+    cp.flash[0] = st.strikeXM;
+    cp.flash[1] = w.baseM;
+    cp.flash[2] = st.strikeZM;
+    cp.flashAmp = st.strikeFlash;
+  }
 
   queue.WriteBuffer(world.cloudUBO, 0, &cp, sizeof(cp));
 
@@ -691,6 +700,9 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // The flash reaches the ground only as the part of it not lost in the deck;
   // a distant stroke is a glow on the clouds, a close one lights the field.
   rp.lightning = on ? st.flash * 0.9f : 0.0f;
+  // A near strike lights the field whether or not the sky drew a deck (a
+  // forced strike under a clear sky, the lightning glyph): the bolt is there.
+  if (st.enabled && !auxView) rp.lightning = std::max(rp.lightning, st.strikeFlash);
   // Mist: rain and fog thicken the air. A multiplier on the far-field fog
   // density the caller computed, so the horizon still dissolves where the
   // cascades end — mist only brings it closer.

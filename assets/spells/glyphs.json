@@ -224,11 +224,48 @@
       "sort": "effect",
       "word": 2,
       "verb": "place",
-      "material": "fire",
+      "material": "spark",
       "radius": 0,
       "example": "spark trail bolt",
-      "axis": "embers",
-      "desc": "One ember. Ignites a flammable cell it touches, nothing more. The cheap way to light things."
+      "axis": "sparks",
+      "desc": "One spark: an electric crackle that lives a tick or two. Pops hydrogen, splits molten salt, and only sometimes lights what burns beside it. The cheapest electricity there is."
+    },
+    {
+      "id": "shock",
+      "sort": "effect",
+      "word": 4,
+      "verb": "strike",
+      "strike": {
+        "comment": "No bolt: a burst of jagged arc walks out of the point (game/lightning.h, the storm's own strike function with height 0). Arc is tag:electric and lights what burns at a quarter chance a touch.",
+        "splash": "arc",
+        "splashRadius": 3,
+        "arcs": 5,
+        "tariffMille": 300
+      },
+      "example": "shock projectile",
+      "axis": "arcs",
+      "desc": "A crackle of arcs where it lands: short jagged discharges that run over what is there. Every electric reaction fires off it, and it sets dry things alight more readily than a spark."
+    },
+    {
+      "id": "lightning",
+      "sort": "effect",
+      "word": 9,
+      "verb": "strike",
+      "strike": {
+        "comment": "A bolt from 40 cells above the struck top, which is the TALLEST thing within 5 cells of the point, a conductor (iron, copper, water) counting 6 cells taller than it is. Same function a storm's ground strike uses. Repetition raises the bolt and adds arcs.",
+        "bolt": "lightning",
+        "height": 40,
+        "search": 5,
+        "conductBonus": 6,
+        "forks": 2,
+        "splash": "arc",
+        "splashRadius": 2,
+        "arcs": 4,
+        "tariffMille": 250
+      },
+      "example": "lightning projectile",
+      "axis": "bolt height / arcs",
+      "desc": "Calls a bolt of lightning down on the point - or on the tallest conductor near it: a lightning rod draws it. Whatever burns where it lands goes up."
     },
     {
       "id": "transmute",

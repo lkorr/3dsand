@@ -2498,7 +2498,8 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matBareBlood_.push_back(m.bareBlood);
     matBleed_.push_back(m.bleed);
     matFluid_.push_back(m.bleedFluid);
-    matStruck_.push_back({m.struckMat, m.struckChance, m.struckRadius, false});
+    matStruck_.push_back(
+        {m.struckMat, m.struckChance, m.struckRadius, false, m.struckArcs});
     matBurst_.push_back({m.burstMat, 1.0f, m.burstRadius, m.burstArcs});
     matShell_.push_back(m.shell ? 1 : 0);
     coatContact_.push_back(m.coatContact);
@@ -11783,8 +11784,13 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
         const uint32_t h = Hash3((uint32_t)id_ ^ 0x57A0C4u, sys_->tick_,
                                  (uint32_t)i * 977u +
                                      (uint32_t)sys_->bodyBursts_.size());
+        // ...and wiring sometimes ARCS (materials.h struckArcs): a second
+        // draw off the same blow's hash, so the shape is as pure as the roll.
         if (rng::Unit01(h) < sb->chance)
-          sys_->PushBodyBurst(hitWorldVoxel, sb->mat, sb->radius, false);
+          sys_->PushBodyBurst(
+              hitWorldVoxel, sb->mat, sb->radius,
+              sb->arcChance > 0.0f &&
+                  rng::Unit01(Hash3(h, 0xA2C5u, 0x57A0u)) < sb->arcChance);
       }
     }
     if (alive_) {
@@ -11825,7 +11831,10 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // bleeds a fifth of what flesh would from the same blow.
     // ...and it decides WHAT comes out (Mob::FluidAt): the struck voxel's
     // fluid, else the limb's -- a wooden arm on a man leaks syrup.
-    if (pol.hitBleed != BleedRate::None) {
+    // A creature with NO BLEED BLOCK (bleedMat 0: an android, "sparks only")
+    // opens no budget at all: BleedTick would never drain it, and a budget
+    // left standing reads as an open wound to every "is it bleeding" query.
+    if (pol.hitBleed != BleedRate::None && def_->bleedMat != 0) {
       const float add = amount * def_->bleedPerDamage *
                         BleedRateScale(pol.hitBleed) * BleedWeightOf(struck);
       NoteWoundFluid(limb, FluidAt((int)i, struck), add);
@@ -15211,7 +15220,9 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
   // ...and a lump leaks what IT is made of (materials.h bleedFluid), else what
   // the limb it came off leaks: a chip off a wooden arm oozes syrup.
   uint32_t fragBleed = 0;
-  if (!IsBloodless(srcLimb)) {
+  // ...and a creature with no bleed block hands it nothing, whatever the
+  // matter's own opinion (the same last rung Mob::FluidAt keeps).
+  if (!IsBloodless(srcLimb) && def_ && def_->bleedMat != 0) {
     FluidTally t;
     for (const DebrisVoxel& v : part)
       t.Add(OwnFluidOf(v.payload & 0xFFFu), BleedWeightOf(v.payload & 0xFFFu));
@@ -23618,8 +23629,10 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
           // ...and leaks what it is made of (Mob::LimbFluid).
           piece.woundFluid = LimbFluid(limbIndex);
         }
-        piece.bleedBudget = AddBleedBudget(piece.bleedBudget,
-                                           gt.severStumpBudget * piece.woundScale);
+        // (Nothing owed by a creature with no bleed block: Mob::Damage.)
+        if (def_->bleedMat != 0)
+          piece.bleedBudget = AddBleedBudget(
+              piece.bleedBudget, gt.severStumpBudget * piece.woundScale);
         // THE CUT FACE IS BLOODIED, on the piece, before it leaves: the kerf
         // soak in CutLimb runs only when the limb SURVIVES the carve, so a
         // limb that came off (and one severed outright, by hp or by
@@ -23662,9 +23675,10 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
           // ...scaled by what the STUMP is made of at the cut (the parent's
           // voxel nearest the joint): wood a fifth of flesh.
           parent.woundScale = BleedWeightOf(ShellMaterialAt((int)k, anchorW));
-          parent.bleedBudget =
-              AddBleedBudget(parent.bleedBudget,
-                             gore.severStumpBudget * parent.woundScale);
+          if (def_->bleedMat != 0)
+            parent.bleedBudget =
+                AddBleedBudget(parent.bleedBudget,
+                               gore.severStumpBudget * parent.woundScale);
           // ...and it never closes (BleedTick tops it up while
           // gore.stumpBleedsOpen), so the amputation bleeds the creature out.
           parent.stumpOpen = true;
@@ -23705,6 +23719,11 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
                                0x5EEDu, 0u);
           nVox = (int)std::lround((float)nVox * parent.woundScale);
           if (nVox < 0) nVox = 0;
+          // A stump with nothing to leak (a creature with no bleed block --
+          // an android -- or matter with no fluid) throws NOTHING: a droplet
+          // of material 0 is not a drop, and DrainBlood below would charge hp
+          // for blood that never existed.
+          if (WoundFluid((int)k) == 0) nVox = 0;
           // Gobbet size SUBDIVIDES the throw: severVoxels stays the total voxel
           // count and `gob` of them share one trajectory, so raising it makes
           // the cut throw fewer, fatter lumps without changing how much matter

@@ -726,6 +726,8 @@ const TUNING_SCHEMA = [
       {k:'rainShadowMap', n:'rain shadow map', d:'On: rain streaks and wet ground follow the lean of the fall (a per-frame shadow map along it), so a roof keeps its floor dry and a windward doorway lets a wedge of rain in. Off: the old openness gate, which does not know which way the rain falls. Render-only.', bool:true},
       {k:'rainTouchesWorld', n:'rain touches the world', d:'On: rain douses fire and damps ignition on rain-exposed cells, bodies and limbs (reactions authored "rain" / "rainDamped"). Off: the sim sees a dry sky whatever is drawn.', bool:true},
       {k:'rainIgniteDamp', n:'rain ignition damp', d:'How much of an exposed ignition chance full rain or soaked ground removes. 0.6 = soaked ground (a storm) keeps 40% of a dry ignition chance, a drizzle about 57%; the rain douse rules are what actually put a fire out.', step:0.05},
+      {k:'strikeRate', n:'ground strike share', d:'The share of the sky’s lightning flashes (a weather preset’s `lightning`, flashes a minute) that strike the ground NEAR THE PLAYER as a real bolt in the sim: a jagged column of `lightning` cells that prefers tall and conductive targets (iron, copper, water) and sets what burns alight. 0.3 in a storm (7/min) is about two strikes a minute; 0 keeps the render flashes only. Scheduled from hash(seed, tick), so a replay strikes the same places.', step:0.05},
+      {k:'strikeRadius', n:'ground strike radius', d:'Cells (10 cm each) round the player that a ground strike can land in; the inner quarter is kept clear. Strikes are near-player only by design: far lightning stays a render flash.', step:8},
     ],
   },
 

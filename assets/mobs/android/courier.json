@@ -4,10 +4,6 @@
   "model": "courier",
   "race": "android",
   "sidecarVoxelsPerMetre": 10,
-  "bleed": {
-    "material": "coolant",
-    "perDamage": 1.2
-  },
   "anatomy": {
     "layers": [
       {
@@ -204,6 +200,7 @@
       ]
     }
   },
+  "bleed": null,
   "genome": {
     "archetype": "humanoid",
     "name": "courier",

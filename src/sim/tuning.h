@@ -3454,6 +3454,15 @@ struct Tuning {
     // removes (0 = none, 1 = all of it). Scaled by max(rain, wetness), so a
     // drizzle already slows a fire and a field stays slow to catch after it.
     float rainIgniteDamp = TPD(weather, rainIgniteDamp);
+    // GROUND STRIKES (docs/PLAN_electricity.md E3). The share of the sky's
+    // flash rate (a preset's `lightning`, flashes a minute) that strikes the
+    // ground near the player as a real bolt (game/lightning.h): 0.3 in a storm
+    // of 7/min is about two strikes a minute. Scheduled from hash(seed, tick),
+    // never wall time, so it is part of the authoritative tick and replays.
+    float strikeRate = TPD(weather, strikeRate);
+    // The radius of the disc round the player they land in, cells (160 = 16 m).
+    // The inner quarter is kept clear, so a bolt never lands on your head.
+    int strikeRadius = TPD(weather, strikeRadius);
   } weather;
 
   // ---- combustion: how long anything in the world stays alight ----

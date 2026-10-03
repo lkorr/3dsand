@@ -960,6 +960,13 @@ void FlaskSim::GatherPixelNbrs(int x, int y, int hv, bool isGas, std::vector<Che
     const V2 p{x + 0.5f, y + 0.5f};
     if (v.heat > 0.02f && chem_.heat.on && v.Near(ToLocal(v.x, p)) == Vessel::kNear)
       out.push_back({NbHeat, hv, -1, kChemDown, p});
+    // ELECTRIFY REACHES GRAINS AND GAS TOO (2026-10-03, PLAN_electricity
+    // E5): the same virtual spark GatherParticleNbrs offers a liquid, on the
+    // same gate (the vessel is shocked). Without it the bench's thermite,
+    // hydrogen and ether vapour ignored the button that their world rules
+    // (`tag:electric`) answer to. Whole-vessel, like the particle's: the
+    // charge is in everything the glass holds.
+    if (v.shock > 0 && chem_.spark.on) out.push_back({NbSpark, hv, -1, kChemUp, p});
   }
 }
 

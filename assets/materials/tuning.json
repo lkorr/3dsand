@@ -1126,7 +1126,9 @@
     "drySeconds": 240,
     "rainShadowMap": true,
     "rainTouchesWorld": true,
-    "rainIgniteDamp": 0.6
+    "rainIgniteDamp": 0.6,
+    "strikeRate": 0.3,
+    "strikeRadius": 160
   },
   "combustion": {
     "burnDurationPct": 200,

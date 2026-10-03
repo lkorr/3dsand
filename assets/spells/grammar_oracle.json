@@ -20,6 +20,8 @@
   "gust",
   "implode",
   "spark",
+  "shock",
+  "lightning",
   "transmute",
   "mend",
   "trail",
@@ -758,6 +760,34 @@
      "weight": 1,
      "payload": [
       "[(spark|trail|)#1|bolt]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "lightning projectile",
+   "parse": "[lightning **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[lightning#1|projectile]"
+     ],
+     "mods": []
+    }
+   ]
+  },
+  {
+   "spoken": "shock projectile",
+   "parse": "[shock **projectile**]",
+   "clauses": [
+    {
+     "delivery": "hand",
+     "weight": 1,
+     "payload": [
+      "[shock#1|projectile]"
      ],
      "mods": []
     }

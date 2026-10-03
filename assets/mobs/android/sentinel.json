@@ -4,10 +4,6 @@
   "model": "sentinel",
   "race": "android",
   "sidecarVoxelsPerMetre": 10,
-  "bleed": {
-    "material": "coolant",
-    "perDamage": 1.2
-  },
   "anatomy": {
     "layers": [
       {
@@ -624,6 +620,7 @@
       "durationMs": 338
     }
   },
+  "bleed": null,
   "genome": {
     "archetype": "humanoid",
     "name": "sentinel",

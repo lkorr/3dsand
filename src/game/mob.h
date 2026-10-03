@@ -6627,6 +6627,9 @@ class MobSystem {
     float chance = 0.0f;
     int radius = 1;
     bool arcs = false;
+    // struck only: the chance a ball that fires goes along arcs instead
+    // (materials.h struckArcs). A burst uses `arcs`.
+    float arcChance = 0.0f;
   };
   const MatBurst* StruckOf(uint32_t mat) const {
     return mat < matStruck_.size() && matStruck_[mat].mat ? &matStruck_[mat]

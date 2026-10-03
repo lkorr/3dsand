@@ -1115,14 +1115,17 @@ struct MaterialDef {
   // until it existed every body limb carved as flesh whatever it was made of,
   // and the bark of a sylvan is tuned against that.
   bool shell = false;
-  // STRUCK ("struck": {"material", "chance", "radius"}): what a blow that
-  // lands ON this matter knocks out of it -- a ball of that material laid in
-  // the air at the hit the next tick (sparks off brass and wiring, steam off
-  // a boiler). `chance` 0..1 per blow, rolled on a counter hash of the blow
-  // (rule 1). 0 = none.
+  // STRUCK ("struck": {"material", "chance", "radius", "arcs"}): what a blow
+  // that lands ON this matter knocks out of it -- a ball of that material laid
+  // in the air at the hit the next tick (sparks off brass and wiring, steam
+  // off a boiler). `chance` 0..1 per blow, rolled on a counter hash of the
+  // blow (rule 1). 0 = none. `arcs` (2026-10-03, the android's wiring): the
+  // chance 0..1 that a ball which fires is laid along jagged ARCS instead
+  // (the `burst` arcs shape, session.cpp ReactFxAftermath); `true` = 1.
   uint32_t struckMat = 0;
   float struckChance = 0.0f;
   int struckRadius = 1;
+  float struckArcs = 0.0f;
   std::string struckName;
   // BURST ("burst": {"material", "radius", "arcs"}): what this matter lets go
   // ONCE when a wound BREACHES it (a carve removes a voxel of it) and ONCE

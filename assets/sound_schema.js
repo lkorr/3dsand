@@ -258,6 +258,23 @@ const SOUND_SCHEMA = {
        pitch:'an octave down empty, the sample’s own pitch half full, an octave up full'},
     ],
   },
+
+  // ---- weather ------------------------------------------------------------
+  // Owned like the combat sets (store 'none'): one set, fixed in code.
+  weather: {
+    store: 'none',
+    title: 'Weather',
+    icon: '\u{26A1}',
+    blurb: 'Thunder. One owner, so the set name is fixed in code.',
+    slots: [
+      {k:'thunder', n:'thunder (lightning strike)', prefix:'weather',
+       d:'The clap of a lightning strike IN THE SIM: a storm’s ground strike near the player (session.cpp WeatherStrikes, scheduled from hash(seed, tick) while the sky’s `lightning` is above 0) or the lightning glyph’s bolt. Delayed by the distance to the listener at 343 m/s, so a strike 70 m off flashes and then cracks a fifth of a second later. Far lightning (the render-only flashes kilometres out) makes no sound.',
+       fires:'audio::Cues::Thunder — main.cpp, draining TickAuthorityCtx::strikes.events',
+       fallback:'silent.',
+       gain:'full within a few metres, falling to 60% at 300 m; the spatializer’s distance law on top',
+       pitch:'a touch high when close (a crack), lower far off (a roll)'},
+    ],
+  },
 };
 
 // Every namespace a slot can bind into, for the set browser's grouping and for
