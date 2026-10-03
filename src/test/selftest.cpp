@@ -4,6 +4,7 @@
 // so that adding a gate means touching one file plus one line in kGroups.
 
 #include "sim/heat.h"
+#include "sim/microbody.h"  // leak reporter: merged art palette size
 #include "test/selftest.h"
 
 #include <algorithm>
@@ -1789,6 +1790,13 @@ int Run(Ctx& c, const Options& opt) {
       const uint32_t leakRtDefs = c.mobs.RuntimeDefCount();
       const std::string leakTune = TuningFingerprint();
       const std::string leakWeather = weather::Override();
+      // The merged ART PALETTE is append-only per process (MicroBodyMergeArt,
+      // rise-tint slots), so a gate that grows it shortens every later gate's
+      // headroom: pool-human's claim G was red only in the suite for this.
+      auto artCount = [&]() -> size_t {
+        return c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
+      };
+      const size_t leakArt = artCount();
       r.status = g->fn(c, detail);
       {
         const IVec3 wo = c.world.WindowOrigin();
@@ -1806,6 +1814,8 @@ int Run(Ctx& c, const Options& opt) {
           leak += Format(" defs %zu (%u runtime) -> %zu (%u runtime);",
                          leakDefs, leakRtDefs, c.mobs.Defs().size(),
                          c.mobs.RuntimeDefCount());
+        if (artCount() != leakArt)
+          leak += Format(" art palette %zu -> %zu;", leakArt, artCount());
         if (weather::Override() != leakWeather)
           leak += " weather pin '" + leakWeather + "' -> '" +
                   weather::Override() + "';";

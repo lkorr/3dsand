@@ -952,6 +952,13 @@ bool mobOk = false;
           if (diff < 500) {
             badDirs++;
             if (firstBad < 0) firstBad = d;
+            std::printf("  critter dir (%.0f,%.0f,%.0f): %u px; eye (%.1f,%.1f,"
+                        "%.1f) ground y %d, critter at y %.1f\n",
+                        kDirs[d].x, kDirs[d].y, kDirs[d].z, diff, eye.x, eye.y,
+                        eye.z,
+                        World::TerrainHeight(ifloor(eye.x), ifloor(eye.z),
+                                             kDefaultSeed),
+                        target.y);
           }
           // keep the first diagonal's image as the visual artifact
           if (d == 0) keepPix = withPix;
@@ -996,7 +1003,8 @@ bool mobOk = false;
             WriteRenderParams(ctx.queue, world, eye, cam3, (float)W / H, true, 0);
             // Draw ONLY the micro pass against the world, twice, so the diff
             // isolates this one body.
-            auto shootSolo = [&](bool withMicro, std::vector<uint8_t>& out) {
+            auto shootSolo = [&](bool withMicro, std::vector<uint8_t>& out,
+                                 bool withWorld = true) {
               // Upload BEFORE the render pass opens (barrier graph §4.6).
               uint32_t soloCount =
                   withMicro ? sim.UploadMicroBodyInsts(ctx.queue, solo) : 0u;
@@ -1007,7 +1015,7 @@ bool mobOk = false;
               rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
               rhi::RenderPass rp = sim.BeginRenderPass(
                   enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
-              sim.DrawWorld(rp);
+              if (withWorld) sim.DrawWorld(rp);
               sim.DrawMicroBodies(rp, soloCount);
               rp.End();
               rhi::Buffer shot = CreateBuffer(
@@ -1039,6 +1047,26 @@ bool mobOk = false;
             if (sd < 50) {
               soloBad++;
               if (soloFirst < 0) soloFirst = d;
+              // ATTRIBUTION (CLAUDE.md rule 6): the same body with NO world
+              // drawn behind it. Pixels here and none above = the world pass
+              // occludes it (depth); none here either = the micro pass itself
+              // produced nothing (raster / cull / the march).
+              std::vector<uint8_t> nWith, nWithout;
+              shootSolo(true, nWith, false);
+              shootSolo(false, nWithout, false);
+              uint32_t nd = 0;
+              for (size_t p = 0; p + 3 < nWith.size(); p += 4)
+                if (nWith[p] != nWithout[p] || nWith[p + 1] != nWithout[p + 1] ||
+                    nWith[p + 2] != nWithout[p + 2])
+                  nd++;
+              std::printf("  solo dir (%.0f,%.0f,%.0f): %u px over the world, "
+                          "%u px with no world; eye (%.1f,%.1f,%.1f) ground y "
+                          "%d, body at y %.1f, pitch %.2f\n",
+                          kDirs[d].x, kDirs[d].y, kDirs[d].z, sd, nd, eye.x,
+                          eye.y, eye.z,
+                          World::TerrainHeight(ifloor(eye.x), ifloor(eye.z),
+                                               kDefaultSeed),
+                          soloPos.y, cam3.pitch);
             }
           }
           // restore the real transforms for anything downstream

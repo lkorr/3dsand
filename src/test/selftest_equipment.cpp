@@ -1135,13 +1135,25 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
       soakTick(b, soakMat, soakUp);
       // The two bodies' burn fraction / cap / root hp every 20 ticks, so a
       // death below is attributable to a mechanism rather than to "acid".
-      if (i % 20 == 0 && mobs.IsAlive(a) && mobs.IsAlive(b)) {
+      if (i % 10 == 0 && mobs.IsAlive(a) && mobs.IsAlive(b)) {
         const int root = mobs.Defs()[avDef].rootLimb;
-        std::printf("    t+%d: dressed burnt %.1f%% cap %.2f root hp %.1f | "
-                    "bare burnt %.1f%% cap %.2f root hp %.1f\n",
+        // WHERE each body is, beside how hurt it is: the acid only reaches
+        // what stands in it, so a creature that went down is in another bath.
+        int headIdx = -1;
+        for (size_t li = 0; li < mobs.Defs()[avDef].limbs.size(); li++)
+          if (mobs.Defs()[avDef].limbs[li].name == "head") headIdx = (int)li;
+        const Vec3 ra = mobs.LimbPosition(a, root), rb = mobs.LimbPosition(b, root);
+        const Vec3 ha = headIdx >= 0 ? mobs.LimbPosition(a, headIdx) : Vec3{};
+        const Vec3 hb = headIdx >= 0 ? mobs.LimbPosition(b, headIdx) : Vec3{};
+        std::printf("    t+%d: dressed burnt %.1f%% cap %.2f root hp %.1f "
+                    "root (%.1f,%.1f,%.1f) head y %.1f loco %d | "
+                    "bare burnt %.1f%% cap %.2f root hp %.1f "
+                    "root (%.1f,%.1f,%.1f) head y %.1f loco %d | pad %d\n",
                     i, 100.0f * mobs.BurnFraction(a), mobs.BurnHealthCap(a),
-                    mobs.LimbHp(a, root), 100.0f * mobs.BurnFraction(b),
-                    mobs.BurnHealthCap(b), mobs.LimbHp(b, root));
+                    mobs.LimbHp(a, root), ra.x, ra.y, ra.z, ha.y,
+                    mobs.LocoState(a), 100.0f * mobs.BurnFraction(b),
+                    mobs.BurnHealthCap(b), mobs.LimbHp(b, root), rb.x, rb.y,
+                    rb.z, hb.y, mobs.LocoState(b), padTop);
       }
       // WHAT killed it, at the point of failure (CLAUDE.md rule 6): four
       // mechanisms end in the same ragdoll and only the corpse knows which.
