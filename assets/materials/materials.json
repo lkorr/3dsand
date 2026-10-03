@@ -55,6 +55,7 @@
       "arcane": 1,
       "footstep": "path",
       "class": "powder",
+      "repose": 34,
       "absorb": {
         "capacity": 6
       },
@@ -77,6 +78,7 @@
       "id": "gravel",
       "footstep": "path",
       "class": "powder",
+      "repose": 40,
       "density": 1800,
       "hardness": 18,
       "colors": [
@@ -363,6 +365,7 @@
       "arcane": 1,
       "footstep": "path",
       "class": "powder",
+      "repose": 40,
       "absorb": {
         "capacity": 10
       },

@@ -245,6 +245,16 @@ PASS(explodeApply, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_APPLY,K
 // args1 sizes the integrate dispatch — same page explosion ejecta uses.
 PASS(particleSpawn, "prep(mutate+explode+compact)", PT_TICK, PIPE_P_SPAWN,     K_COMPUTE, D_SPAWN,1,1,GRP_SLIM_PART, DYN_NONE, C_SPAWN, 1,
      USES(R(SpawnOps) U(TickUBO) A(ParticleCounts) W(ParticlesRead)))
+// THE WINDOW EDGE'S LEAVE BUDGET (sim_gas.wgsl gasLeavePrep; sim_step.wgsl
+// THE EDGE'S BUDGET). One thread, after fill_gasSpawn (WAW on the header) and
+// before caMask/ca, which read the budget it writes: the record list's cap
+// less the pool room the live parcels and this tick's CPU spawns take. It is
+// what lets every leave refusal be decided by a rule rather than by arrival
+// order. Reads the read page's live count, which nothing writes between last
+// tick's integrate and this tick's gasArgs1.
+PASS(gasLeavePrep, "prep(mutate+explode+compact)", PT_TICK, PIPE_GAS_LEAVE_PREP, K_COMPUTE, 1,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(U(TickUBO) A(GasSpawn) R(GasSpawnOps) A(GasCounts)))
 // compact dirtyIn -> dense chunk list + indirect args, AFTER mutate/explode so
 // freshly touched chunks simulate this tick.
 // C_CAACTIVE, not C_ALWAYS: this row exists ONLY to build the CA's dispatch
@@ -513,9 +523,14 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 // field cannot change between the substeps, and both rows walk one dirty
 // list. caMask1 therefore binds substep 1's pass slice (DYN_CA1, iteration 0
 // of the ca1 block) instead of slice 0.
+// A(GasSpawn): on substep 0 camask initialises each dirty chunk's leave-budget
+// word and counts the ones touching the residency edge (sim_step.wgsl
+// gasLeaveCount); the ca rows behind it read both. caMask1 does neither (its
+// P.substep is 1) but is the same entry point, so it carries the same use.
 PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)))
+          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
+          A(GasSpawn)))
 // read-only in practice: `reposeSnap` and `caMask` are read_write for the
 // module because `reposesnap` / `camask` write them; `main` only reads both.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 27,
@@ -528,7 +543,8 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
 // read-only in practice: `voxels`, as for caMask above.
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)))
+          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
+          A(GasSpawn)))
 // read-only in practice: `reposeSnap` and `caMask`, as for ca above.
 PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 27,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
@@ -851,10 +867,13 @@ PASS(gasSpawn, "gasSpawn+args1", PT_TICK, PIPE_GAS_SPAWN, K_COMPUTE, D_GASSPAWN,
      USES(U(TickUBO) A(GasSpawn) R(GasSpawnOps) A(GasCounts) W(GasParticlesRead)))
 // gasArgs1 also ZEROES the write page's cursor — the one point in the tick
 // after the last read of its old value and before the first append into it.
-// That is why there is no fill_gasCounts row above.
+// That is why there is no fill_gasCounts row above. It also PUBLISHES the read
+// page's new count (live + both spawn lists): gasSpawn places records by rank
+// and never touches the count, so A(GasSpawn) R(GasSpawnOps) for the two list
+// lengths.
 PASS(gasArgs1, "gasSpawn+args1", PT_TICK, PIPE_GAS_ARGS1, K_COMPUTE, 1,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
-     USES(U(TickUBO) A(GasCounts) W(GasArgsStage)))
+     USES(U(TickUBO) A(GasCounts) W(GasArgsStage) A(GasSpawn) R(GasSpawnOps)))
 PASS(copy_gasArgs_dispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_GAS, 1,
      USES(TR(GasArgsStage) TW(GasDispatchArgs)))
 // read-only in practice: `voxels` is read_write for the module because
@@ -980,8 +999,29 @@ PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPU
 PASS(farDownHash, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
-          A(FarMap)))
+          R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig) A(FarVox) A(FarOcc)))
+// fardown's three follow-up phases, same list, same args, back to back
+// (cross-vendor audit #9: worldgen.wgsl's split note). The barrier between
+// each pair is the point -- each phase reads what the one before it finished
+// writing (farVox bytes, VALID bits, feature words) -- and the recorder emits
+// it from these uses: A(FarVox)/A(FarMap) on both sides of every edge.
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownHashClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
+// read-only in practice: `farSig` is read_write for the module because `fardown` writes it.
+PASS(farDownHashStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs) R(PageTable) R(FarSig)
+          A(FarVox) A(FarMap)))
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownHashFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -1019,8 +1059,25 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)
-          A(FarMap)))
+          R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig) A(FarVox) A(FarOcc)))
+// The follow-up phases (see farDownHashClaim's note).
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownClaim, "farDown", PT_TICK, PIPE_FAR_DOWN_CLAIM, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
+// read-only in practice: `farSig` is read_write for the module because `fardown` writes it.
+PASS(farDownStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs) R(PageTable) R(FarSig)
+          A(FarVox) A(FarMap)))
+// read-only in practice: `voxels` is read_write for the module (genChunk
+// writes it) and `farSig` because `fardown` writes it; this phase reads both.
+PASS(farDownFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) R(FarSig) A(FarMap)))
 
 // ---- the derived rows' RenderParams (docs/PLAN_async_compute.md) ---------
 // LAST on the tick table: RenderUBO -> RenderUBOTick, the copy sim_openness
@@ -1475,6 +1532,17 @@ PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))
+// ---- THE GOD-RAY SUN VISIBILITY VOLUME (assets/shaders/godray_vis.wgsl) ----
+// One coarse occlusion ray toward the sun per 4^3 block round the eye, so the
+// under-water god-ray march (raymarch.wgsl godRays) reads a word per block
+// instead of casting ~7 rays per pixel. Per FRAME (a function of the camera
+// and the sun); C_ALWAYS because the kernel itself decides whether the eye is
+// in a liquid and every thread returns after one voxel read when it is not —
+// a CPU condition would need a readback the frame path may not take. The
+// fragment read is BeginRendering's flush, as for RayStart.
+PASS(godray_vis, "godrayVis", PT_SHADOWCACHE, PIPE_GODRAY_VIS, K_COMPUTE, kGodVisGroups,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable) W(GodVis)))
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
      GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))

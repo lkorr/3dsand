@@ -8154,6 +8154,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // the loop below sweeps in this same pass once its holds are over.
   EvictDead();
 
+  burnprof::Scope bpMobLoop(burnprof::kMobLoop);
   for (size_t mi = 0; mi < mobs_.size();) {
     Mob& mob = mobs_[mi];
     const MobDef& def = defs_[mob.defIndex_];
@@ -8436,10 +8437,17 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // Blood landing on bodies: from the world (contact) and from this tick's
   // bursts (splatter). After every wound has bled, so a gout reaches the
   // creature beside it on the tick it happens.
-  StainLimbs(tick, world);
+  bpMobLoop.Stop();
+  {
+    burnprof::Scope bpStain(burnprof::kStain);
+    StainLimbs(tick, world);
+  }
   // Which corpses have gone quiet, now that every pass of the tick has had
   // its say (the burn pass's idle verdict, the coat's recount, the bleed).
-  UpdateDeadSleep(world, tick);
+  {
+    burnprof::Scope bpDeadSleep(burnprof::kDeadSleep);
+    UpdateDeadSleep(world, tick);
+  }
   // ---- GRADUAL SKIN TINT (the 60-second corpse-to-zombie palette fade) ----
   //
   // Each dedicated palette entry lerps from the living colour to the undead
@@ -10897,6 +10905,8 @@ void Mob::UntuckHair(int limbIndex) {
   MobLimb& l = limbs_[(size_t)limbIndex];
   if (l.tuckSig == 0) return;
   l.tuckSig = 0;
+  l.tuckBase = 0;
+  l.tuckHidden.clear();
   MicroBodySet* micro = MicroSet();
   if (!micro || l.microModel < 0) return;
   const uint32_t model = (uint32_t)l.microModel;
@@ -10969,10 +10979,16 @@ void Mob::SyncHairTuck() {
     shellSig = TuckMix(shellSig, liveCells(s));
   }
   if (head >= 0) shellSig = TuckMix(shellSig, liveCells(limbs_[(size_t)head]));
-  auto sigOf = [&](const MobLimb& l) -> uint64_t {
+  // Everything the hide is a function of but the brick's edit counter (the
+  // fast path's key, MobLimb::tuckBase), and that plus the counter.
+  auto baseOf = [&](const MobLimb& l) -> uint64_t {
     uint64_t h = TuckMix(shellSig, (uint64_t)(uint32_t)l.microModel);
-    h = TuckMix(h, MicroBodyEditGen(*micro, (uint32_t)l.microModel));
     h = TuckMix(h, l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
+    return h == 0 ? 1u : h;
+  };
+  auto sigOf = [&](const MobLimb& l) -> uint64_t {
+    const uint64_t h =
+        TuckMix(baseOf(l), MicroBodyEditGen(*micro, (uint32_t)l.microModel));
     return h == 0 ? 1u : h;   // 0 means "not tucked"
   };
 
@@ -11016,23 +11032,34 @@ void Mob::SyncHairTuck() {
                            : Vec3{u, v, m};
     return d * (1.0f / d.len());
   };
+  // The covered bins' directions, built on the first rim lookup of a call
+  // (binDir is a normalisation per bin, and the brute search below used to
+  // recompute it for every covered bin for every open bin it was asked).
+  std::vector<Vec3> covDirs;
   auto rimOf = [&](int bin) {
     if (rim[(size_t)bin] >= 0.0f) return rim[(size_t)bin];
     // Nearest covered direction by angle. A brute search, but only for the
     // few open bins that hair actually lands in, and only when the tuck is
     // recomputed.
+    if (covDirs.size() != coveredBins.size()) {
+      covDirs.clear();
+      covDirs.reserve(coveredBins.size());
+      for (int cb : coveredBins) covDirs.push_back(binDir(cb));
+    }
     const Vec3 d = binDir(bin);
     float best = -2.0f, r = 0.0f;
-    for (int cb : coveredBins) {
-      const Vec3 e = binDir(cb);
+    for (size_t j = 0; j < covDirs.size(); j++) {
+      const Vec3& e = covDirs[j];
       const float dot = d.x * e.x + d.y * e.y + d.z * e.z;
-      if (dot > best) { best = dot; r = rmax[(size_t)cb]; }
+      if (dot > best) { best = dot; r = rmax[(size_t)coveredBins[j]]; }
     }
     rim[(size_t)bin] = r;
     return r;
   };
   auto buildCover = [&]() {
+    burnprof::Scope bpCover(burnprof::kHairCover);
     coverBuilt = true;
+    covDirs.clear();
     tuckCoverSig_ = shellSig;
     // A rebuild starts from nothing (the old early-out below left a stale
     // cover in place when the head had no cells).
@@ -11085,7 +11112,11 @@ void Mob::SyncHairTuck() {
               const int bin = TuckBin(p);
               if (bin < 0) continue;
               cover[(size_t)bin] = 1;
-              rmax[(size_t)bin] = std::max(rmax[(size_t)bin], p.len());
+              // The SQUARED radius here, rooted once per bin below: sqrt is
+              // monotone and correctly rounded, so the max of the roots is
+              // the root of the max, bit for bit -- and this loop is 64
+              // samples a shell cell (a burning hood rebuilds it often).
+              rmax[(size_t)bin] = std::max(rmax[(size_t)bin], p.dot(p));
               hemY = std::min(hemY, p.y);
             }
       };
@@ -11097,6 +11128,7 @@ void Mob::SyncHairTuck() {
           if (v.payload & 0xFFFu) splat(v.x, v.y, v.z);
       }
     }
+    for (float& r : rmax) r = std::sqrt(r);
     coveredBins.clear();
     for (size_t b = 0; b < bins; b++)
       if (cover[b]) coveredBins.push_back((int)b);
@@ -11109,7 +11141,36 @@ void Mob::SyncHairTuck() {
     if (!l.body || l.microModel < 0) continue;
     if (shells.empty()) { UntuckHair(i); continue; }
     if (l.tuckSig != 0 && l.tuckSig == sigOf(l)) continue;
+    // ---- FAST PATH: ONLY THE BRICK'S COUNTER MOVED ----------------------------
+    // Same cover, same brick, same lattice size: a burn (or anything else)
+    // repainted cells, and a repaint of a hidden cell shows it again. Which
+    // cells hide has not changed -- it is a function of the lattice and the
+    // cover, both keyed in tuckBase -- so re-hide the last full tuck's cells
+    // and stop. (The pose is not in the key, and never was: a mane is tucked
+    // for the pose it had when the tuck was last derived.)
+    if (l.tuckSig != 0 && l.tuckBase != 0 && l.tuckBase == baseOf(l)) {
+      const bool fineF = l.HasFineSkin();
+      const size_t nF = fineF ? l.skinVoxels.size() : l.voxels.size();
+      const uint32_t modelF = (uint32_t)l.microModel;
+      for (uint32_t k : l.tuckHidden) {
+        if (k >= nF) continue;
+        int x, y, z;
+        uint32_t mat;
+        if (fineF) {
+          const PrefabVoxel& v = l.skinVoxels[k];
+          x = v.x; y = v.y; z = v.z; mat = v.material & 0xFFFu;
+        } else {
+          const DebrisVoxel& v = l.voxels[k];
+          x = v.x; y = v.y; z = v.z; mat = v.payload & 0xFFFu;
+        }
+        if (mat == 0 || mat > 255) continue;   // a burn tombstone: not ours
+        MicroBodyPoke(*micro, modelF, x, y, z, 0, 0);
+      }
+      l.tuckSig = sigOf(l);
+      continue;
+    }
     if (!coverBuilt) buildCover();
+    burnprof::Scope bpFull(burnprof::kHairFull);
 
     // Which cells hide. Hair -> world by its own live transform -> the head's
     // frame. The mane swings on a spring, so a mane is tucked for the pose it
@@ -11121,6 +11182,13 @@ void Mob::SyncHairTuck() {
     std::vector<uint8_t> hide(n, 0);
     size_t hidden = 0;
     if (!cover.empty()) {
+      // Hair lattice -> the head's frame is ONE rigid transform: the relative
+      // rotation and the hair origin in head space, composed once, instead of
+      // a rotation into the world and another back out per cell. Not bit-equal
+      // to the two-step form (float rounding) and need not be: this decides
+      // which cells DRAW, nothing is hashed or simulated from it.
+      const Quat rel = QuatNormalize(Mul(QuatConj(headQ), hq));
+      const Vec3 org = RotateInv(headQ, l.xf.pos - H->xf.pos) - centre;
       for (size_t k = 0; k < n; k++) {
         int x, y, z;
         if (fine) {
@@ -11130,10 +11198,8 @@ void Mob::SyncHairTuck() {
           const DebrisVoxel& v = l.voxels[k];
           x = v.x; y = v.y; z = v.z;
         }
-        const Vec3 w = l.xf.pos + Rotate(hq, Vec3{(x + 0.5f) / ls,
-                                                  (y + 0.5f) / ls,
-                                                  (z + 0.5f) / ls});
-        const Vec3 p = RotateInv(headQ, w - H->xf.pos) - centre;
+        const Vec3 p = org + Rotate(rel, Vec3{(x + 0.5f) / ls, (y + 0.5f) / ls,
+                                              (z + 0.5f) / ls});
         if (p.y < hemY) continue;   // below the hem: hangs out, drawn
         const int bin = TuckBin(p);
         if (bin < 0) continue;
@@ -11149,6 +11215,7 @@ void Mob::SyncHairTuck() {
       // brick for nothing.
       UntuckHair(i);
       l.tuckSig = sigOf(l);
+      l.tuckBase = baseOf(l);   // nothing hidden: the fast path re-hides nothing
       continue;
     }
     // Poking needs a brick of our own, exactly as a burn does.
@@ -11176,6 +11243,10 @@ void Mob::SyncHairTuck() {
     // AFTER the pokes: they bumped the brick's edit counter, and the signature
     // must describe the brick as this left it.
     l.tuckSig = sigOf(l);
+    l.tuckBase = baseOf(l);
+    l.tuckHidden.clear();
+    for (size_t k = 0; k < n; k++)
+      if (hide[k]) l.tuckHidden.push_back((uint32_t)k);
   }
 }
 
@@ -16588,17 +16659,43 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   {
     burnprof::Scope bpWalk(burnprof::kWalk);
     uint32_t seen = 0;
+    // ONE CHUNK'S RUN OF A ROW AT A TIME. The window test, the chunk lookup
+    // and the fetch request are per chunk, so they are asked once per run of
+    // up to 16 cells and the cells are a pointer walk -- the same cells, in the
+    // same y/z/x order, against the same cap, as worldMatAt one by one (which
+    // asked for an uncached chunk once per CELL; the request coalesces). This
+    // walk is most of what a loose body costs the debris burn pass: a forest
+    // fire walks ~66k cells a tick (--forest-fire, 2026-10-03).
     for (int y = lo.y; y <= hi.y && seen < kBurnScanCells; y++)
       for (int z = lo.z; z <= hi.z && seen < kBurnScanCells; z++)
-        for (int x = lo.x; x <= hi.x && seen < kBurnScanCells; x++) {
-          seen++;
-          const uint32_t m = worldMatAt({x, y, z});
-          if (m == 0 || m >= matHot_.size()) continue;
-          // "Reactive" is two things, and both come out of the table: the
-          // cell is HOT (it can ignite me through my own rules) or it
-          // REWRITES ITS NEIGHBOUR (acid, which acts on me through its
-          // rules — see the inbound pass below).
-          if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({x, y, z});
+        for (int x = lo.x; x <= hi.x && seen < kBurnScanCells;) {
+          const int nRun = std::min<int>(std::min(hi.x, x | 15) - x + 1,
+                                         (int)(kBurnScanCells - seen));
+          seen += (uint32_t)nRun;
+          const int x0 = x;
+          x += nRun;
+          if (!world.CellInWindow({x0, y, z})) continue;  // reads as air
+          const IVec3 wc = ChunkOfCell(x0, y, z);
+          if (wc.x != memoChunk.x || wc.y != memoChunk.y || wc.z != memoChunk.z) {
+            memoChunk = wc;
+            memoCC = world.Cached(wc);
+          }
+          // Unknown reads as air, and is asked for (worldMatAt's note).
+          if (!memoCC || memoCC->voxels.size() != kChunkVol) {
+            world.RequestChunkFetch(wc, World::FetchSource::Mob);
+            continue;
+          }
+          const uint32_t* row = memoCC->voxels.data() +
+                                ((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk;
+          for (int xx = x0; xx < x; xx++) {
+            const uint32_t m = row[xx & 15] & 0xFFFu;
+            if (m == 0 || m >= matHot_.size()) continue;
+            // "Reactive" is two things, and both come out of the table: the
+            // cell is HOT (it can ignite me through my own rules) or it
+            // REWRITES ITS NEIGHBOUR (acid, which acts on me through its
+            // rules — see the inbound pass below).
+            if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({xx, y, z});
+          }
         }
     burnStats_.walkCells += seen;
   }
@@ -16729,12 +16826,64 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // Candidates: the front, its lattice neighbours (spread is pushed
   // OUTWARD, never pulled by scanning for candidates), and whatever the
   // world is touching.
-  for (uint32_t c : st.front) queue(c);
-  for (size_t k = 0, n0 = cand.size(); k < n0; k++) {
-    const IVec3 p = posOf(cand[k]);
-    for (const IVec3& d : kBurnDirs)
-      queueNbr(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
+  //
+  // ---- ONLY AS MUCH OF THE FRONT AS THE BUDGET CAN EVALUATE (2026-10-03) --
+  //
+  // The loop below evaluates at most `frontBudget` candidates (this limb's
+  // share of the shared pot), from a tick-rotated start, so on an engulfed
+  // body the evaluated set was always a random window of the list. But the
+  // list itself was built from the WHOLE front -- every front cell and its
+  // six neighbours -- and swept whole again after the loop: measured on the
+  // burning Harrowby villagers (--burn-house, SANDVOX_BURN_VILLAGE=1) 60k
+  // candidates queued a tick for 6.4k evaluated, so nine tenths of the
+  // queue-and-sweep was for cells the budget then skipped (rule 2: the pot
+  // bounded the evaluation, not the search for it).
+  //
+  // So when the front could produce more candidates than the share can
+  // evaluate (7 per front cell, the most it can queue), only a WINDOW of it
+  // is expanded: from a tick-keyed rotated start, front cell by front cell,
+  // each with its neighbours, until the list holds the share (plus an eighth
+  // of slack for the joint twins the loop hands back). The front cells past
+  // the window are not candidates this tick; they stay on the front (if
+  // still alight -- a neighbour's rule may have rewritten one) and take
+  // their turn as the rotation moves. A front that cannot overflow takes the
+  // old path, unchanged, so a small fire builds exactly the list it did.
+  //
+  // The world-contact seeding below is scaled by the same fraction of the
+  // front, so seeds and front cells keep the share of the evaluation they had
+  // when the whole list was built and a window of it evaluated: each kind's
+  // expected evaluations per tick are what they were, without paying for the
+  // nine tenths nobody evaluated.
+  burnprof::Count(burnprof::kFront, st.front.size());
+  burnprof::Scope bpQueue(burnprof::kQueue);
+  const size_t nFront = st.front.size();
+  const uint64_t candCap = (uint64_t)frontBudget + frontBudget / 8u + 16u;
+  const bool frontWindowed = (uint64_t)nFront * 7u > candCap;
+  size_t frontStart = 0, frontVisited = nFront;
+  if (!frontWindowed) {
+    for (uint32_t c : st.front) queue(c);
+    for (size_t k = 0, n0 = cand.size(); k < n0; k++) {
+      const IVec3 p = posOf(cand[k]);
+      for (const IVec3& d : kBurnDirs)
+        queueNbr(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
+    }
+  } else {
+    frontStart = (size_t)(Hash3(limbKey, tick, 0xF20E7u) % (uint32_t)nFront);
+    frontVisited = 0;
+    while (frontVisited < nFront && cand.size() < candCap) {
+      const uint32_t c = st.front[(frontStart + frontVisited) % nFront];
+      frontVisited++;
+      // Gone since it joined the front: not queued, not expanded (the old
+      // path's queue() refuses it the same way).
+      if (st.idx[c] == 0) continue;
+      queue(c);  // a no-op if an earlier front cell queued it as a neighbour
+      const IVec3 p = posOf(c);
+      for (const IVec3& d : kBurnDirs)
+        queueNbr(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
+    }
+    burnprof::Count(burnprof::kWindowed, 1);
   }
+  bpQueue.Stop();
 
   // ---- world contact: seed the exposed FACE ----------------------------
   // Probing the face CENTRE would seed 1 of the 64 skin voxels a world cell
@@ -16767,6 +16916,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     uint32_t probes = (uint32_t)std::min<uint64_t>(
         kBurnSeedProbes,
         std::max<uint64_t>(kBurnSeedFloor, (uint64_t)frontBudget * kBurnSeedPerFront));
+    // ...scaled by the share of the front the window above expanded, so the
+    // seeds' part of the evaluation is what it was (see the window's note).
+    if (frontVisited < nFront)
+      probes = (uint32_t)std::max<uint64_t>(
+          kBurnSeedFloor, (uint64_t)probes * frontVisited / nFront);
     const uint32_t probes0 = probes;
     // A bounded pass must not always spend itself on the same cells:
     // scanHot is in world y-major order, so a fixed start would light a limb
@@ -16774,9 +16928,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // loop does (deterministic: tick and limb key only).
     const size_t nHot = scanHot.size();
     const size_t hot0 = (size_t)(Hash3(limbKey, tick, 0x5EED0u) % (uint32_t)nHot);
+    uint64_t seedHot = 0, seedFaces = 0, seedFootReads = 0;
     for (size_t hj = 0; hj < nHot; hj++) {
       const IVec3& c = scanHot[(hot0 + hj) % nHot];
       if (!probes) break;
+      seedHot++;
       for (const IVec3& d : kBurnDirs) {
         const IVec3 nb{c.x + d.x, c.y + d.y, c.z + d.z};
         if (nb.x < lo.x || nb.x > hi.x || nb.y < lo.y || nb.y > hi.y ||
@@ -16848,12 +17004,15 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           const int64_t vol = (int64_t)std::max(0, x1 - x0 + 1) *
                               std::max(0, y1 - y0 + 1) * std::max(0, z1 - z0 + 1);
           bool any = vol > 4 * S * S;
+          seedFaces++;
           for (int zz = z0; zz <= z1 && !any; zz++)
             for (int yy = y0; yy <= y1 && !any; yy++) {
               const uint32_t* row =
                   st.idx.data() + ((size_t)zz * bd.y + yy) * bd.x;
-              for (int xx = x0; xx <= x1; xx++)
+              for (int xx = x0; xx <= x1; xx++) {
+                seedFootReads++;
                 if (row[xx] != 0) { any = true; break; }
+              }
             }
           if (!any) continue;
         }
@@ -16899,6 +17058,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       }
     }
     burnprof::Count(burnprof::kSeedProbes, probes0 - probes);
+    burnprof::Count(burnprof::kSeedHot, seedHot);
+    burnprof::Count(burnprof::kSeedFaces, seedFaces);
+    burnprof::Count(burnprof::kSeedFootReads, seedFootReads);
   }
 
   // ---- A CORROSIVE COAT SEEDS ITS OWN VOXELS -----------------------------
@@ -17106,6 +17268,16 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // through always cut off the same tail: those cells burned -- and emitted --
   // only on the ticks the budget happened to reach them. Starting at a
   // tick-keyed offset spreads a short budget over the whole surface instead.
+  // The six lattice steps and outward normals in world space, rotated ONCE
+  // per visit rather than per open face of every candidate (the same
+  // expressions the face gather used inline: bit-identical).
+  Vec3 faceStepW[6], faceOutW[6];
+  for (int k = 0; k < 6; k++) {
+    const IVec3& d = kBurnDirs[k];
+    faceStepW[k] = Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
+                                  (float)d.z * inv});
+    faceOutW[k] = Rotate(q, Vec3{(float)d.x, (float)d.y, (float)d.z});
+  }
   const size_t nCand = cand.size();
   burnprof::Count(burnprof::kCandidates, nCand);
   const uint32_t frontAtLoop = frontBudget;
@@ -17203,6 +17375,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // sibling limb was substituted for it: where a coat's released flame may
     // go (DESIGN.md §6 rule 2, "an open face of the cell").
     uint32_t nworld[6] = {};
+    // The voxel's world centre, computed once for all its open faces (the
+    // same expression each face used to recompute: bit-identical).
+    bool wvpSet = false;
+    Vec3 wvp{};
     for (int k = 0; k < 6; k++) {
       const IVec3& d = kBurnDirs[k];
       const uint32_t nc = cellOf({vp.x + d.x, vp.y + d.y, vp.z + d.z});
@@ -17212,9 +17388,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         nmat[k] = v.Mat(ni - 1);
         ncell[k] = nc;
       } else {
-        const Vec3 wv =
-            worldOf(vp) + Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
-                                        (float)d.z * inv});
+        if (!wvpSet) {
+          wvp = worldOf(vp);
+          wvpSet = true;
+        }
+        const Vec3 wv = wvp + faceStepW[k];
         // ARMOUR, half two: WHAT IS OUTSIDE ME MAY BE MY OWN COAT.
         //
         // Substituting the shell's material for the world's is the whole
@@ -17245,13 +17423,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                             ((wm < matHot_.size() && matHot_[wm]) ||
                              (wm < matAttacksBody_.size() &&
                               matAttacksBody_[wm]));
-        const Vec3 outward{(float)d.x, (float)d.y, (float)d.z};
         const uint32_t worn =
-            threat ? v.WornAlong(wv, Rotate(q, outward), kWornNbrReach) : 0u;
+            threat ? v.WornAlong(wv, faceOutW[k], kWornNbrReach) : 0u;
         if (threat && v.occlude) {
           wornStats_.nbrThreats++;
           if (worn) wornStats_.nbrSubstituted++;
-          else if (v.WornAlong(wv, Rotate(q, outward), kWornNbrReach * 4.0f))
+          else if (v.WornAlong(wv, faceOutW[k], kWornNbrReach * 4.0f))
             wornStats_.nbrMissInReach++;
         }
         nmat[k] = worn ? worn : wm;
@@ -17276,7 +17453,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // own pass decides whether the shell catches from it.
           if (xm) {
             const uint32_t wornX =
-                v.WornAlong(wv, Rotate(q, outward), kWornNbrReach);
+                v.WornAlong(wv, faceOutW[k], kWornNbrReach);
             if (wornX) {
               nmat[k] = wornX;
               xm = 0;
@@ -17963,18 +18140,38 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // Clear the per-tick queued bits and rebuild the front from what is actually
   // alight now. Candidates skipped for budget keep their material, so an
   // exhausted budget slows the fire down rather than putting it out.
-  st.front.clear();
+  burnprof::Scope bpSweep(burnprof::kFrontSweep);
   uint32_t hot = 0;
+  auto stillAlight = [&](uint32_t e) {
+    const uint32_t m = v.Mat(e - 1);
+    if (m && m < matHot_.size() && matHot_[m]) hot++;
+    return m && m < matSelfActive_.size() && matSelfActive_[m] &&
+           !(m < matSelfDryingOnly_.size() && matSelfDryingOnly_[m] &&
+             v.LivingKeeps(v.At(e - 1)));  // living blood: BuildBurnIndex's note
+  };
+  if (frontVisited < nFront) {
+    // THE FRONT PAST THE WINDOW (see the window's note above the seeding):
+    // never a candidate, so it is carried over -- in rotation order, before
+    // the candidates -- if it is still there and still alight; a pair rule's
+    // neighbour product may have rewritten it. One that ALSO became a
+    // candidate (a neighbour or a seed) is the candidate sweep's below.
+    std::vector<uint32_t> nf;
+    nf.reserve(nFront);
+    for (size_t j = frontVisited; j < nFront; j++) {
+      const uint32_t c = st.front[(frontStart + j) % nFront];
+      const uint32_t e = st.idx[c];
+      if (e == 0 || (e & kBurnQueued)) continue;
+      if (stillAlight(e)) nf.push_back(c);
+    }
+    st.front.swap(nf);
+  } else {
+    st.front.clear();
+  }
   for (uint32_t c : cand) {
     uint32_t& e = st.idx[c];
     e &= ~kBurnQueued;
     if (e == 0) continue;
-    const uint32_t m = v.Mat(e - 1);
-    if (m && m < matSelfActive_.size() && matSelfActive_[m] &&
-        !(m < matSelfDryingOnly_.size() && matSelfDryingOnly_[m] &&
-          v.LivingKeeps(v.At(e - 1))))  // living blood: BuildBurnIndex's note
-      st.front.push_back(c);
-    if (m && m < matHot_.size() && matHot_[m]) hot++;
+    if (stillAlight(e)) st.front.push_back(c);
   }
   // Only the CANDIDATES were re-tested, so an empty front here does not by
   // itself mean the limb is out — a budget-starved tick or a fire on the far
@@ -20223,6 +20420,7 @@ void MobSystem::RetireLooseBurn(uint32_t tick) {
 
 void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
                                uint32_t& rainBudget) {
+  burnprof::Scope bpScope(burnprof::kStainFlesh);
   if (!debris_ || matGpu_.empty()) return;
   // The stamp that marks an entry live this tick; 0 is "never", so skip it.
   const uint32_t stamp = tick + 1u;
@@ -20414,6 +20612,7 @@ bool MobSystem::CoatDriesAsleep(uint32_t mat) const {
 bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
                            uint32_t tick, uint32_t key, uint32_t& budget,
                            World* world) {
+  burnprof::Scope bpScope(burnprof::kStainDry);
   // Asked at most once per call, and only on a tick some substance's period
   // could fire on -- a wet creature pays one column walk a period, not a tick.
   int sun = -1;
@@ -20549,6 +20748,7 @@ static constexpr uint32_t kRainSatedRetry = 8;
 
 bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
                             uint32_t& budget, World* world) {
+  burnprof::Scope bpScope(burnprof::kStainRain);
   RainStats& rs = rainStats_;
   rs.calls++;
   const uint32_t rain = weatherRain_ & kRainAmountMask;
@@ -20679,6 +20879,7 @@ static constexpr uint32_t kWetDripMaxPerTick = 48;
 bool MobSystem::WetOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
                            uint32_t key, uint32_t& budget,
                            std::vector<ParticleSpawn>* drips) {
+  burnprof::Scope bpScope(burnprof::kStainWet);
   uint32_t wet = 0;
   bool foreign = false;
   for (const CoatEntry& en : led.top) {
@@ -21129,6 +21330,7 @@ uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
 
 bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                              World& world, uint32_t& budget) {
+  burnprof::Scope bpScope(burnprof::kStainContact);
   if (matGpu_.empty() || v.Size() == 0 || budget == 0) return false;
   const auto& gt = CurrentTuning().gore;
   if (gt.stainContactScale <= 0.0f && gt.stainWashPerContact <= 0) return false;
@@ -21241,6 +21443,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     }
     const IVec3 lo{ifloor(mn.x) - 1, ifloor(mn.y) - 1, ifloor(mn.z) - 1};
     const IVec3 hi{ifloor(mx.x) + 1, ifloor(mx.y) + 1, ifloor(mx.z) + 1};
+    burnprof::Scope bpWalk(burnprof::kStainWalk);
     bool any = false;
     uint32_t seen = 0;
     Contact probe;
@@ -21268,15 +21471,26 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     return st.idx[((size_t)lz * bd.y + ly) * bd.x + lx] & ~kBurnQueued;
   };
   if (st.surface.empty()) {
-    for (int lz = 0; lz < bd.z; lz++)
-      for (int ly = 0; ly < bd.y; ly++)
-        for (int lx = 0; lx < bd.x; lx++) {
-          if (!idxAt(lx, ly, lz)) continue;
-          if (!idxAt(lx - 1, ly, lz) || !idxAt(lx + 1, ly, lz) ||
-              !idxAt(lx, ly - 1, lz) || !idxAt(lx, ly + 1, lz) ||
-              !idxAt(lx, ly, lz - 1) || !idxAt(lx, ly, lz + 1))
-            st.surface.push_back((uint32_t)(((size_t)lz * bd.y + ly) * bd.x + lx));
-        }
+    // FROM THE VOXEL LIST, NOT THE BOX. The index is dropped on every carve
+    // and every burn flush, and a burning creature standing in a pool (the
+    // oil-flooded village, 2026-10-03) rebuilt this per limb several times a
+    // second; the box is mostly the air round a rounded limb. Every live index
+    // entry is exactly one voxel (entry == voxel + 1), so walking the voxels
+    // that own their entry visits the same cells, and sorting puts them back
+    // in the box's z-major order -- the same list, built from the voxels.
+    burnprof::Scope bpSurface(burnprof::kStainSurface);
+    const size_t n = v.Size();
+    st.surface.reserve(n / 2);
+    for (size_t i = 0; i < n; i++) {
+      const IVec3 p = v.At(i);
+      const int lx = p.x - bm.x, ly = p.y - bm.y, lz = p.z - bm.z;
+      if (idxAt(lx, ly, lz) != (uint32_t)i + 1u) continue;  // tombstone / gone
+      if (!idxAt(lx - 1, ly, lz) || !idxAt(lx + 1, ly, lz) ||
+          !idxAt(lx, ly - 1, lz) || !idxAt(lx, ly + 1, lz) ||
+          !idxAt(lx, ly, lz - 1) || !idxAt(lx, ly, lz + 1))
+        st.surface.push_back((uint32_t)(((size_t)lz * bd.y + ly) * bd.x + lx));
+    }
+    std::sort(st.surface.begin(), st.surface.end());
   }
   const size_t ns = st.surface.size();
   if (ns == 0) return false;
@@ -21289,34 +21503,75 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // a tick-keyed start so a limb larger than its budget is covered over a few
   // ticks rather than the same patch every tick.
   const uint32_t washAmt = (uint32_t)std::max(0, gt.stainWashPerContact);
+  const uint32_t budget0 = budget;
+  // WHAT A WORLD CELL MEANS, MEMOIZED. At skinScale 8 a world cell's face is
+  // 64 surface voxels, and the sweep below visits them in lattice order, so
+  // most samples ask about the cell the previous one asked about (or the
+  // cell one step out from it). Two entries -- the voxel's own cell and the
+  // stepped one -- answer those without the window test, the chunk memo and
+  // the classification again. Exact: the world does not change during the
+  // sweep, and classify is a pure function of the word.
+  IVec3 memoCell[2] = {{INT_MIN, INT_MIN, INT_MIN}, {INT_MIN, INT_MIN, INT_MIN}};
+  bool memoOk[2] = {false, false};
+  Contact memoC[2];
+  int memoNext = 0;
+  auto classifyAt = [&](IVec3 cc, Contact& out) -> bool {
+    for (int k = 0; k < 2; k++)
+      if (memoCell[k].x == cc.x && memoCell[k].y == cc.y &&
+          memoCell[k].z == cc.z) {
+        if (memoOk[k]) out = memoC[k];
+        return memoOk[k];
+      }
+    const int k = memoNext;
+    memoNext ^= 1;
+    memoCell[k] = cc;
+    memoOk[k] = classify(worldWordAt(cc), memoC[k]);
+    if (memoOk[k]) out = memoC[k];
+    return memoOk[k];
+  };
   uint32_t limbBudget = std::min(budget, kStainLatticePerLimb);
   bool changed = false, owned = false;
-  const size_t start = (size_t)(Hash3(rngKey, tick, 0x5F4CEu) % (uint32_t)ns);
+  // The outward normal is a sum of open faces, so each component is -1, 0 or
+  // +1: 27 possible vectors, rotated ONCE per visit here by the very call the
+  // sample used to make per voxel (bit-identical), and looked up below.
+  Vec3 outTab[27];
+  for (int t = 0; t < 27; t++)
+    outTab[t] = Rotate(q, Vec3{(float)(t % 3 - 1), (float)((t / 3) % 3 - 1),
+                               (float)(t / 9 - 1)});
+  const uint32_t ubx = (uint32_t)bd.x, uby = (uint32_t)bd.y;
+  // A wrapping cursor rather than `(start + k) % ns` per sample, and two
+  // divisions for the cell's coordinates rather than three: this loop is the
+  // contact pass's whole cost while a crowd stands in a pool (68 ns a sample
+  // measured in the oil-flooded village, 30k samples a tick).
+  size_t at = (size_t)(Hash3(rngKey, tick, 0x5F4CEu) % (uint32_t)ns);
   for (size_t k = 0; k < ns && limbBudget; k++) {
     limbBudget--;
-    const uint32_t cell = st.surface[(start + k) % ns];
+    const uint32_t cell = st.surface[at];
+    if (++at == ns) at = 0;
     const uint32_t e = st.idx[cell] & ~kBurnQueued;
     if (!e) continue;  // carved away since the surface was listed
-    const int lx = (int)(cell % (uint32_t)bd.x);
-    const int ly = (int)((cell / (uint32_t)bd.x) % (uint32_t)bd.y);
-    const int lz = (int)(cell / ((uint32_t)bd.x * (uint32_t)bd.y));
+    const uint32_t rowq = cell / ubx;
+    const uint32_t lzu = rowq / uby;
+    const int lx = (int)(cell - rowq * ubx);
+    const int ly = (int)(rowq - lzu * uby);
+    const int lz = (int)lzu;
     const Vec3 wp = v.xf->pos + Rotate(q, Vec3{((float)(lx + bm.x) + 0.5f) * inv,
                                                ((float)(ly + bm.y) + 0.5f) * inv,
                                                ((float)(lz + bm.z) + 0.5f) * inv});
     IVec3 cw{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
     // Outward: the sum of the open faces, in world.
     auto outward = [&]() {
-      Vec3 nL{0, 0, 0};
-      if (!idxAt(lx - 1, ly, lz)) nL.x -= 1.0f;
-      if (!idxAt(lx + 1, ly, lz)) nL.x += 1.0f;
-      if (!idxAt(lx, ly - 1, lz)) nL.y -= 1.0f;
-      if (!idxAt(lx, ly + 1, lz)) nL.y += 1.0f;
-      if (!idxAt(lx, ly, lz - 1)) nL.z -= 1.0f;
-      if (!idxAt(lx, ly, lz + 1)) nL.z += 1.0f;
-      return Rotate(q, nL);
+      int nx = 1, ny = 1, nz = 1;  // offset by one: the table index
+      if (!idxAt(lx - 1, ly, lz)) nx -= 1;
+      if (!idxAt(lx + 1, ly, lz)) nx += 1;
+      if (!idxAt(lx, ly - 1, lz)) ny -= 1;
+      if (!idxAt(lx, ly + 1, lz)) ny += 1;
+      if (!idxAt(lx, ly, lz - 1)) nz -= 1;
+      if (!idxAt(lx, ly, lz + 1)) nz += 1;
+      return outTab[nx + 3 * ny + 9 * nz];
     };
     Contact c;
-    if (!classify(worldWordAt(cw), c)) {
+    if (!classifyAt(cw, c)) {
       // ...stepped one cell along its dominant axis.
       const Vec3 nW = outward();
       const float ax = std::fabs(nW.x), ay = std::fabs(nW.y), az = std::fabs(nW.z);
@@ -21324,7 +21579,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       if (ax >= ay && ax >= az) cw.x += nW.x > 0.0f ? 1 : -1;
       else if (ay >= az) cw.y += nW.y > 0.0f ? 1 : -1;
       else cw.z += nW.z > 0.0f ? 1 : -1;
-      if (!classify(worldWordAt(cw), c)) continue;
+      if (!classifyAt(cw, c)) continue;
     }
     // A CORROSIVE contact must get past the ARMOUR first. Blood and water
     // have always soaked through a worn shell here (a cosmetic liberty); acid
@@ -21370,6 +21625,8 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     }
   }
   budget -= std::min(budget, kStainLatticePerLimb - limbBudget);
+  burnprof::Count(burnprof::kStainSwept, 1);
+  burnprof::Count(burnprof::kStainSamples, std::min(budget0, kStainLatticePerLimb) - limbBudget);
   return changed;
 }
 

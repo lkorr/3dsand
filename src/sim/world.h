@@ -458,7 +458,7 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // standing argument against two lists (tuning_params.def, pass_table.def).
 //
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
-constexpr int kDirtyReasonBits = 29;
+constexpr int kDirtyReasonBits = 31;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "write",      "react-idle", "stain-idle", "flow",
     "viscous",    "seam",       "part",       "wbody",
@@ -481,7 +481,13 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     // docs/PLAN_temperature.md: the chunk's local temperature moved this tick
     // (sim_heat.wgsl heatRelax DIRTY_R_HEAT), so the CA re-reads its cells'
     // heat. Not in FILM_LICENCE: heat moving is not liquid progress.
-    "heat"};
+    "heat",
+    // sim_step.wgsl stainDry: a wet stain DRYING (idle: covered, still wet),
+    // and a drying step that wrote. Split off stain-idle / STAIN-WROTE
+    // 2026-10-03 because those also mean a liquid SOAKING IN, which spends
+    // liquid; drying touches none, and sim_waterbody.wgsl wbQuiet must not
+    // read a drying bank as a disturbed body (DIRTY_R_DRY / DIRTY_R_DRYW).
+    "dry", "DRY-WROTE"};
 
 // The bit for a reason NAME, resolved from the one table above rather than
 // written down as a number a second time -- 22/24/25 in a header is exactly
@@ -513,6 +519,10 @@ static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
                   DirtyReasonBit("gas-edge") != 0,
               "a gas dirty-reason name was renamed in kDirtyReasonName without "
               "updating kDirtyGasMask");
+static_assert(DirtyReasonBit("dry") == (1u << 29) &&
+                  DirtyReasonBit("DRY-WROTE") == (1u << 30),
+              "sim_step.wgsl / sim_waterbody.wgsl DIRTY_R_DRY / DIRTY_R_DRYW are "
+              "bits 29 and 30; kDirtyReasonName must name them there");
 
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;
@@ -545,24 +555,24 @@ constexpr uint32_t kGasModeWall = 0;
 constexpr uint32_t kGasModeSink = 1;
 
 constexpr uint32_t kGasParticleCap = 262144;   // 8 MiB per page, 16 MiB paired
-// 65,536 and not the 8,192 this shipped with for one afternoon, and the reason
-// is RULE 1 rather than throughput. `gasLeave` charges a shared atomicAdd
-// cursor, so WHICH voxels are refused when the list fills is decided by which
-// workgroup arrived first — and a refused voxel STAYS IN THE GRID, so that
-// choice is visible in the world hash. (The same shape as sim_particle's
-// `append` at kParticleCap, which the engine has always had; the difference is
-// that a vaporized particle writes no voxel on the tick it is dropped.)
+// The size of the CA's outbox, and the CEILING on a tick's leave budget.
 //
-// Two ways out, and this is the cheap one: make the cap unreachable so the
-// binding constraint is the POOL instead, whose overflow drops a parcel that
-// is already outside the window and therefore cannot move a voxel. 65,536 is a
-// quarter of the window's top face in ONE tick, and four such ticks exhaust
-// kGasParticleCap anyway. The `gas-leave` gate asserts refusals == 0, so the
-// day this is not enough it is a printed number and not a silent divergence.
-//
-// The real fix, if that day comes, is mark+apply: the CA flags cells that want
-// to leave and a second pass converts them in a deterministic order, which is
-// the pattern sim_explode already uses for exactly this reason.
+// UNTIL 2026-10-03 this was sized to be unreachable, for RULE 1: a conversion
+// charged a shared atomicAdd cursor against it, so WHICH voxels were refused
+// when the list filled was decided by which workgroup arrived first -- and a
+// refused voxel STAYS IN THE GRID, where the world hash sees it. The pool's
+// overflow had the same shape one step later (which parcel vaporized was
+// whichever thread's atomicAdd came last, and a vaporized parcel can never
+// re-enter). Both are closed now and the cap is only a size:
+//   * sim_gas `gasLeavePrep` fixes the tick's budget BEFORE the CA:
+//     min(kGasSpawnPerTick, pool room after the live parcels and the CPU list);
+//   * sim_step `camask` counts the dirty chunks that touch the residency edge
+//     (kGasSpEdgeChunks) and each gets budget / count, spent in dispatch order
+//     (the per-chunk words at kGasSpChunkBase);
+//   * within one dispatch a chunk is one workgroup's, which collects its
+//     leavers and, over its share, accepts the lowest by a per-cell hash.
+// Every refusal is a function of the world. `gas-leave-overflow` forces the
+// overflow (kGasOpsLeaveCap) and checks the twice-run series agree.
 constexpr uint32_t kGasSpawnPerTick = 65536;   // window-edge conversions per tick
 constexpr uint32_t kGasCpuSpawnPerTick = 1024; // CPU-authored gas spawns per tick
 constexpr uint32_t kGasClaimSize = kClaimSize; // re-entry claim hash
@@ -842,10 +852,25 @@ enum : uint32_t {
   // (velocity is always zero). Outside the window a parcel touches no voxel,
   // so the world hash cannot see it and this is the only thing that can.
   kGasSpDigest = 8,
+  // THE EDGE'S LEAVE BUDGET (see kGasSpawnPerTick). 9 is written by sim_gas's
+  // gasLeavePrep before the CA, 10 by sim_step's camask (substep 0), 11 only if
+  // the accounting is broken -- an accepted conversion found the list full.
+  kGasSpBudget = 9,      // conversions this tick may make, whole window
+  kGasSpEdgeChunks = 10, // dirty chunks touching the residency edge this tick
+  kGasSpOverrun = 11,    // MUST stay 0
   kGasSpHdr = 16,      // first record word
   kGasSpStride = 8,    // u32 per record (a 32-byte Particle)
   kGasSpHdrBytes = kGasSpHdr * 4,
 };
+// Behind gasSpawn's record list: one budget word per SLOT (sim_step.wgsl
+// GAS_SP_CHUNK0). Bit 31 = counted into kGasSpEdgeChunks this tick, bits 0..30
+// = conversions made so far this tick. camask initialises the word of every
+// chunk on the dirty list and the CA reads no other, so it is never cleared.
+constexpr uint32_t kGasSpChunkBase = kGasSpHdr + kGasSpawnPerTick * kGasSpStride;
+// gasSpawnOps header word 1: a TEST-ONLY ceiling on the tick's leave budget,
+// 0 = none (World::SetGasLeaveCapForTest). NOT part of the replay record: only
+// `gas-leave-overflow` sets it, and it resets it before it returns.
+constexpr uint32_t kGasOpsLeaveCap = 1;
 
 // One CPU-authored gas spawn. Same 32-byte record the GPU list holds, so the
 // two streams are drained by one kernel: position is 24.8 with a ZERO fraction
@@ -1711,7 +1736,15 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [41..43] T.origin (chunks) the cells below are relative to (stored by
 //          every firing thread; all store the same value)
 //   [44]   T.tick + 1 (0 = nothing fired; the parse checks it)
-//   [45..47] reserved
+//   [45]   LIQUID EIGHTHS EATEN BY CA REACTIONS this tick (atomicAdd): every
+//          time a reaction (bucket rule, either side of a pair, or a thermal
+//          transition) rewrites a SETTLED liquid voxel to a different
+//          material, that voxel's fullness is added here. The CA-side twin
+//          of the seam's FA_CONSUMED, which counts only EXCITED fluid eaten;
+//          the two together close a reaction gate's mass ledger exactly
+//          (fluid-react). Diagnostic: nothing in the sim reads it. Zeroed
+//          with the rest of [40..63] by fill_reactFx.
+//   [46..47] reserved
 //   [48..63] kPageFaultReactFxSlots SLOTS, each an atomicMax of
 //          (fxId << 27) | scramble(slot cell = world cell mod kWorldN). A firing picks its
 //          slot by hash3(seed, tick, cell), so WHICH firings survive a busy
@@ -1758,6 +1791,7 @@ constexpr uint32_t kPageFaultReactFxBase = 40;    // the fill starts here
 constexpr uint32_t kPageFaultReactFxFires = 40;
 constexpr uint32_t kPageFaultReactFxOrigin = 41;  // 41..43
 constexpr uint32_t kPageFaultReactFxTick = 44;
+constexpr uint32_t kPageFaultReactLiquidEaten = 45;
 constexpr uint32_t kPageFaultReactFxSlot0 = 48;
 constexpr uint32_t kPageFaultReactFxSlots = 16;
 static_assert(kPageFaultReactFxSlot0 + kPageFaultReactFxSlots == kPageFaultTicketBase,
@@ -4345,7 +4379,10 @@ struct WorldSnapshot {
   // so "the plume is thin" is answered by a number that names WHICH bound bit.
   uint32_t gasCount = 0;         // live gas particles (post-resolve that tick)
   uint32_t gasLeaveAccepted = 0; // voxels converted at the window edge
-  uint32_t gasLeaveRefused = 0;  // conversions refused: the spawn list was full
+  uint32_t gasLeaveRefused = 0;  // conversions refused: the chunk's share was spent
+  uint32_t gasLeaveBudget = 0;   // the tick's leave budget (gasLeavePrep)
+  uint32_t gasLeaveEdgeChunks = 0; // dirty chunks it was split across
+  uint32_t gasLeaveOverrun = 0;  // accepted but the list was full: MUST be 0
   uint32_t gasEdgeHits = 0;      // gas voxels whose intent left the window
   uint32_t gasPoolRefused = 0;   // spawns dropped: the gas pool was full
   uint32_t gasReentered = 0;     // particles that became voxels again
@@ -5105,6 +5142,11 @@ class World {
   uint32_t QueueGasSpawns(const GasSpawnOp* ops, uint32_t n);
   void TakeGasSpawns(std::vector<GasSpawnOp>& out);
   uint32_t PendingGasSpawns() const { return (uint32_t)pendingGasSpawns_.size(); }
+  // TEST ONLY (kGasOpsLeaveCap): cap the tick's window-edge leave budget so a
+  // gate can force the overflow the budget decides. 0 = no cap. Rides the gas
+  // spawn header SubmitTick uploads every tick.
+  void SetGasLeaveCapForTest(uint32_t n) { gasLeaveCapTest_ = n; }
+  uint32_t GasLeaveCapForTest() const { return gasLeaveCapTest_; }
 
   void NoteFluidSpawnBounds(const FluidSpawnOp* ops, uint32_t n, uint32_t tick);
   // Inclusive world-voxel AABB of everything the fluid surface march can hit,
@@ -5723,6 +5765,7 @@ class World {
   TicketBox tickets_[kTicketMax];
   // Drained into gasSpawnOps by SubmitTick, once, at the head of the tick.
   std::vector<GasSpawnOp> pendingGasSpawns_;
+  uint32_t gasLeaveCapTest_ = 0;   // SetGasLeaveCapForTest
 
   // Recent CPU-side fluid spawn box (render bounds only — see
   // NoteFluidSpawnBounds). Held for kFluidSpawnBoundsTicks so a pour is

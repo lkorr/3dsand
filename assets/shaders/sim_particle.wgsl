@@ -589,10 +589,61 @@ fn liveCount(page : u32) -> u32 {
   return min(atomicLoad(&counts[page]), PARTICLE_CAP);
 }
 
+// ---- THE RING'S CAP, REFUSED DETERMINISTICALLY (cross-vendor audit #4) ------
+//
+// Every producer appends with `slot = atomicAdd(&counts[page], 1)` and keeps
+// the particle only if slot < PARTICLE_CAP. Below the cap WHICH slot a particle
+// gets is scheduling-dependent and harmless (nothing keys on slot order: claims
+// are state-keyed priorities, DESIGN.md §4). AT the cap it was not harmless:
+// the particles that got a slot were the first CAP arrivals, so WHICH ejecta,
+// fragments or spray drops survived -- and later landed, stained, rejoined the
+// grid -- depended on workgroup order. A run-to-run divergence of the world,
+// reachable only at saturation (no gate saw it).
+//
+// THE RULE: appends since the page was last COMMITTED are one group, kept
+// whole or refused whole. counts[2 + page] is the page's committed count. A
+// commit reads the counter, which after any set of appends is
+// committed + attempts (an atomicAdd SUM, order-free, so deterministic even
+// past the cap): if that fits, it becomes the new committed count; if it does
+// not, the counter is put back to the committed count and every particle of
+// the group is dropped (the ones that did get a slot sit past liveCount and
+// are never read). Either way the outcome is a function of the attempts, not
+// of who arrived first.
+//
+// The two commits are the two single-thread passes the ring already has:
+//   args2 (after integrate) commits the WRITE page: integrate appends at most
+//     one survivor per particle of a read page that is <= CAP, onto a page the
+//     CPU zeroed at the top of the tick, so this one always fits.
+//   args1 (before integrate) commits the READ page: the group it judges is
+//     everything appended since that page's args2 a tick ago -- MPM spray and
+//     foam (sim_fluid, recorded after the tick table), this tick's explosion
+//     ejecta and grit (sim_explode `apply`) and CPU spawns (`spawn`). At
+//     saturation all of those are refused together; the matter a blast
+//     destroyed is still destroyed (it vaporizes, as it always did past the
+//     cap), and spray is an effect.
+// counts[4] / counts[5]: particles refused / groups refused, cumulative since
+// the buffer was last cleared (worldgen / load reset) -- the gate's evidence
+// (selftest `particle-cap`) and a number instead of a missing voxel.
+const PC_COMMITTED : u32 = 2u;
+const PC_REFUSED : u32 = 4u;
+const PC_REFUSED_GROUPS : u32 = 5u;
+fn commitPage(page : u32) {
+  let f = atomicLoad(&counts[page]);
+  let c = atomicLoad(&counts[PC_COMMITTED + page]);
+  if (f > PARTICLE_CAP) {
+    atomicStore(&counts[page], c);
+    atomicAdd(&counts[PC_REFUSED], f - min(c, f));
+    atomicAdd(&counts[PC_REFUSED_GROUPS], 1u);
+  } else {
+    atomicStore(&counts[PC_COMMITTED + page], f);
+  }
+}
+
 // pArgs layout: [0..3] indirect draw {36, instances, 0, 0},
 //               [4..6] indirect dispatch {groups, 1, 1}
 @compute @workgroup_size(1)
 fn args1() {
+  commitPage(T.page);
   let n = liveCount(T.page);
   pArgs[4] = (n + 63u) / 64u;
   pArgs[5] = 1u;
@@ -601,6 +652,10 @@ fn args1() {
 
 @compute @workgroup_size(1)
 fn args2() {
+  // The write page's commit (the ring's cap note above). Integrate cannot
+  // overflow it, so in practice this only records the survivors as committed;
+  // the rule is the same rule so a future second appender here is covered.
+  commitPage(1u - T.page);
   let n = liveCount(1u - T.page);
   pArgs[0] = 36u;
   pArgs[1] = n;

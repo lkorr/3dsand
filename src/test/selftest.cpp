@@ -4,6 +4,7 @@
 // so that adding a gate means touching one file plus one line in kGroups.
 
 #include "sim/heat.h"
+#include "sim/microbody.h"  // leak reporter: merged art palette size
 #include "test/selftest.h"
 
 #include <algorithm>
@@ -558,6 +559,11 @@ const char* const kOrder[] = {
     // neither inherits nor leaves anything the gates around it care
     // about.
     "support-flag",
+    // Cross-vendor audit #10 / #4 (2026-10-03): the cell ops' support flag
+    // reads the post-dispatch grid, and the particle ring refuses whole
+    // groups at its cap. Both regenerate the world on the way in AND out, so
+    // they inherit and leave nothing.
+    "support-flag-post", "particle-cap",
     // Per-voxel body reactivity. Late, and it must be: it lights real fires and
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
@@ -718,6 +724,10 @@ const char* const kOrder[] = {
     // stated reason. It builds the same kind of fixture 200 m out and
     // regenerates on the way out, so it leaves the world as it found it.
     "gas-farplume2",
+    // ...and the edge's forced overflow (2026-10-03), appended last in the
+    // group for the same reason. It regenerates before each of its two runs
+    // and on the way out, and resets the test leave cap it sets.
+    "gas-leave-overflow",
     // CHUNK TICKETS (docs/PLAN_chunk_tickets.md §4), appended after the gas
     // group for its reason: the same subject (matter that LEAVES the window)
     // and the same discipline — each clears the store and drops every ticket
@@ -1789,6 +1799,13 @@ int Run(Ctx& c, const Options& opt) {
       const uint32_t leakRtDefs = c.mobs.RuntimeDefCount();
       const std::string leakTune = TuningFingerprint();
       const std::string leakWeather = weather::Override();
+      // The merged ART PALETTE is append-only per process (MicroBodyMergeArt,
+      // rise-tint slots), so a gate that grows it shortens every later gate's
+      // headroom: pool-human's claim G was red only in the suite for this.
+      auto artCount = [&]() -> size_t {
+        return c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
+      };
+      const size_t leakArt = artCount();
       r.status = g->fn(c, detail);
       {
         const IVec3 wo = c.world.WindowOrigin();
@@ -1806,6 +1823,8 @@ int Run(Ctx& c, const Options& opt) {
           leak += Format(" defs %zu (%u runtime) -> %zu (%u runtime);",
                          leakDefs, leakRtDefs, c.mobs.Defs().size(),
                          c.mobs.RuntimeDefCount());
+        if (artCount() != leakArt)
+          leak += Format(" art palette %zu -> %zu;", leakArt, artCount());
         if (weather::Override() != leakWeather)
           leak += " weather pin '" + leakWeather + "' -> '" +
                   weather::Override() + "';";

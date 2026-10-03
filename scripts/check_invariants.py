@@ -1065,6 +1065,35 @@ def check_wind_streak():
                         f"{gt.group(1)}/{gs.group(1)} -- the pool's rows would misalign")
 
 
+def check_godray_vis():
+    """The god-ray visibility volume's dimensions: pass_table.h, godray_vis.wgsl
+    and raymarch.wgsl must agree.
+
+    The C++ sizes the buffer and the row's dispatch from kGodVisNX/NY/NZ; the
+    kernel writes and godRays reads by GV_NX/GV_NY/GV_NZ. A mismatch reads
+    another block's answer -- god-ray shafts cut by rock that is not there,
+    with no error anywhere.
+    """
+    ph = read("src/sim/pass_table.h")
+    gk = read("assets/shaders/godray_vis.wgsl")
+    rm = read("assets/shaders/raymarch.wgsl")
+    if not ph or not gk or not rm:
+        return
+    m = re.search(r"kGodVisNX\s*=\s*(\d+),\s*kGodVisNY\s*=\s*(\d+),\s*kGodVisNZ\s*=\s*(\d+)", ph)
+    if not m:
+        problems.append("godray vis: could not find kGodVisNX/NY/NZ in pass_table.h")
+        return
+    want = m.groups()
+    for path, txt in (("godray_vis.wgsl", gk), ("raymarch.wgsl", rm)):
+        got = tuple((re.search(rf"const\s+GV_{a}\s*:\s*i32\s*=\s*(\d+)", txt) or [None, None])[1]
+                    for a in ("NX", "NY", "NZ"))
+        if got != want:
+            problems.append(f"godray vis: pass_table.h kGodVisNX/NY/NZ = {want} but {path} "
+                            f"GV_NX/NY/NZ = {got} -- blocks would be read from the wrong slots")
+            return
+    checked.append("godray vis volume")
+
+
 def check_drafts():
     """The wind-draft volume's layout lives in world.h AND as DRAFT_* consts.
 
@@ -2487,6 +2516,10 @@ def check_gas_consts():
     for cname, wname in [("kGasSpCount", "GAS_SP_COUNT"),
                          ("kGasSpRefused", "GAS_SP_REFUSED"),
                          ("kGasSpEdge", "GAS_SP_EDGE"),
+                         ("kGasSpBudget", "GAS_SP_BUDGET"),
+                         ("kGasSpEdgeChunks", "GAS_SP_EDGECH"),
+                         ("kGasSpOverrun", "GAS_SP_OVERRUN"),
+                         ("kGasOpsLeaveCap", "GAS_OPS_LEAVE_CAP"),
                          ("kGasSpHdr", "GAS_SP_HDR"),
                          ("kGasSpStride", "GAS_SP_STRIDE")]:
         want = cxx(cname)
@@ -2496,6 +2529,26 @@ def check_gas_consts():
                 problems.append(
                     f"gas: {fname} {wname} = {got} but world.h {cname} = "
                     f"{want} -- the header is read back by offset")
+    # The leave budget's words must EXIST in their readers, not merely agree
+    # when present: sim_step reads all three, sim_gas writes the budget.
+    for fname, txt, names in (("sim_step.wgsl", step, ("GAS_SP_BUDGET", "GAS_SP_EDGECH",
+                                                       "GAS_SP_OVERRUN")),
+                              ("sim_gas.wgsl", gas, ("GAS_SP_BUDGET", "GAS_OPS_LEAVE_CAP"))):
+        for wname in names:
+            if wgsl(txt, wname) is None:
+                problems.append(f"gas: {fname} does not declare {wname}")
+    # kGasSpChunkBase is DERIVED in world.h (header + the whole record list);
+    # sim_step's GAS_SP_CHUNK0 is a literal and must equal it, or the per-chunk
+    # leave-budget words land inside the last records.
+    hdr_w, cap_w, str_w = cxx("kGasSpHdr"), cxx("kGasSpawnPerTick"), cxx("kGasSpStride")
+    if None not in (hdr_w, cap_w, str_w):
+        want = hdr_w + cap_w * str_w
+        got = wgsl(step, "GAS_SP_CHUNK0")
+        if got != want:
+            problems.append(
+                f"gas: sim_step.wgsl GAS_SP_CHUNK0 = {got} but world.h derives "
+                f"kGasSpChunkBase = {want} (kGasSpHdr + kGasSpawnPerTick * "
+                "kGasSpStride)")
 
     # ---- ONE DEFINITION, and the checker's job is to keep it that way ------
     # These moved to common.wgsl when the gas particle kernel landed, because
@@ -2958,6 +3011,7 @@ def check_react_fx():
         ("RFX_FIRES", wh, r"kPageFaultReactFxFires\s*=\s*(\w+?)u?;"),
         ("RFX_ORIGIN", wh, r"kPageFaultReactFxOrigin\s*=\s*(\w+?)u?;"),
         ("RFX_TICK", wh, r"kPageFaultReactFxTick\s*=\s*(\w+?)u?;"),
+        ("RFX_LIQ_EATEN", wh, r"kPageFaultReactLiquidEaten\s*=\s*(\w+?)u?;"),
         ("RFX_SLOT0", wh, r"kPageFaultReactFxSlot0\s*=\s*(\w+?)u?;"),
         ("RFX_SLOTS", wh, r"kPageFaultReactFxSlots\s*=\s*(\w+?)u?;"),
         ("RFX_CELL_BITS", wh, r"kReactFxCellBits\s*=\s*(\w+?)u?;"),
@@ -3178,6 +3232,18 @@ def check_heat_mirror():
         problems.append("heat: sim_heat.wgsl DIRTY_R_HEAT is not 1 << the index of \"heat\" "
                         "in world.h kDirtyReasonName")
 
+    # DIRTY_R_DRY / DIRTY_R_DRYW (a wet stain drying, sim_step.wgsl stainDry)
+    # are declared in the writer and in its one reader, sim_waterbody.wgsl's
+    # wbQuiet, which ignores them; both must be the bits world.h names "dry" and
+    # "DRY-WROTE", or the quiescence test would ignore some other rule's marks.
+    dry_src = {f: read("assets/shaders/" + f) or "" for f in ("sim_step.wgsl", "sim_waterbody.wgsl")}
+    for row, const in (("dry", "DIRTY_R_DRY"), ("DRY-WROTE", "DIRTY_R_DRYW")):
+        for f in ("sim_step.wgsl", "sim_waterbody.wgsl"):
+            mc = re.search(r"const\s+" + const + r"\s*:\s*u32\s*=\s*(\d+)u\s*;", dry_src[f])
+            if not mc or row not in names or int(mc.group(1)) != (1 << names.index(row)):
+                problems.append(f"heat/drybits: {f} {const} is not 1 << the index of "
+                                f"{row!r} in world.h kDirtyReasonName")
+
 
 ALL = {
     "solute": check_solute_mirror,
@@ -3212,6 +3278,7 @@ ALL = {
     "windmirror": check_wind_mirror,
     "windstreak": check_wind_streak,
     "drafts": check_drafts,
+    "godrayvis": check_godray_vis,
     "curprim": check_current_prims,
     "waterledger": check_water_ledger,
     "counts": check_tick_counts,

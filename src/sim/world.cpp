@@ -267,7 +267,13 @@ void World::Init(const rhi::Device& device) {
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");
   particles[1] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesB");
-  particleCounts = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
+  // 8 u32, not the 4 world.h's member comment still says: [0]/[1] = live
+  // count per page, [2]/[3] = each page's COMMITTED count, [4]/[5] =
+  // particles / append groups refused at the cap (cumulative since the last
+  // worldgen or load reset, which clear the whole buffer), [6]/[7] spare. The
+  // commit rule that makes the cap's refusals order-free is
+  // sim_particle.wgsl's "THE RING'S CAP" note (cross-vendor audit #4).
+  particleCounts = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst,
                                 "particleCounts");
   claim = CreateBuffer(device, (uint64_t)kClaimWords * 4, U::Storage | U::CopyDst, "claim");
   pArgsStage = CreateBuffer(device, 32, U::Storage | U::CopySrc, "pArgsStage");
@@ -295,8 +301,9 @@ void World::Init(const rhi::Device& device) {
                            "gasCounts");
   gasClaim = CreateBuffer(device, (uint64_t)kGasClaimSize * 4,
                           U::Storage | U::CopyDst, "gasClaim");
+  // Header + records + one leave-budget word per slot (kGasSpChunkBase).
   gasSpawn = CreateBuffer(
-      device, (uint64_t)(kGasSpHdr + kGasSpawnPerTick * kGasSpStride) * 4,
+      device, (uint64_t)(kGasSpChunkBase + kNumSlots) * 4,
       U::Storage | U::CopySrc | U::CopyDst, "gasSpawn");
   gasSpawnOps = CreateBuffer(
       device, (uint64_t)(kGasSpHdr + kGasCpuSpawnPerTick * kGasSpStride) * 4,
@@ -365,8 +372,10 @@ void World::Init(const rhi::Device& device) {
                                     (uint64_t)(16 + 3 * kNumSlots) * 4,
                                     U::Storage | U::CopySrc | U::CopyDst,
                                     "fluidExciteScratch");
+  // CopySrc: the ca-slope gates read the per-slot calm/age words back to say
+  // WHY a block of particles never settles (CLAUDE.md rule 6).
   fluidCalm = CreateBuffer(device, (uint64_t)kNumSlots * 4,
-                           U::Storage | U::CopyDst, "fluidCalm");
+                           U::Storage | U::CopySrc | U::CopyDst, "fluidCalm");
   // ... + 2: SP_LIVEFLAG / SP_LIVEPREV, the settle half's sleep flags
   // (sim_fluid_seam.wgsl SP_SCRATCH_WORDS is the layout's truth).
   fluidSettleScratch = CreateBuffer(
@@ -1040,6 +1049,9 @@ void World::KickReadback() {
           out.gasReentered = g[kGasSpReenter];
           out.gasDied = g[kGasSpDied];
           out.gasAboveWindow = g[kGasSpAbove];
+          out.gasLeaveBudget = g[kGasSpBudget];
+          out.gasLeaveEdgeChunks = g[kGasSpEdgeChunks];
+          out.gasLeaveOverrun = g[kGasSpOverrun];
         }
         // MLS-MPM fluid seam: live count, event counters, block list.
         {

@@ -731,6 +731,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // descriptors per render bind group (descriptor pool: rhi_vulkan.h).
         entry(36, T::ReadOnlyStorage, S::Vertex),                 // heatPool
         entry(37, T::ReadOnlyStorage, S::Vertex),                 // heatMeta
+        // THE GOD-RAY SUN VISIBILITY VOLUME (godray_vis.wgsl): per 4^3 block
+        // round the eye, does the sun reach it. Written by the ShadowCache
+        // table's godray_vis row in the same command buffer, read by godRays
+        // here; BeginRendering's flush is the compute->fragment barrier.
+        entry(38, T::ReadOnlyStorage, S::Fragment),               // godVis
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -955,6 +960,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       const std::vector<uint32_t> zero((size_t)words, 0u);
       device.GetQueue().WriteBuffer(rainMapBuf_, 0, zero.data(), words * 4);
     }
+    // The god-ray sun visibility volume: fixed, zeroed (a zero stamp is "not
+    // built this frame", so godRays casts its own rays until the row runs).
+    {
+      const uint64_t words = pass::kGodVisHeaderWords + pass::kGodVisBlocks;
+      godVisBuf_ = CreateBuffer(device, words * 4, U::Storage, "godVis");
+      const std::vector<uint32_t> zero((size_t)words, 0u);
+      device.GetQueue().WriteBuffer(godVisBuf_, 0, zero.data(), words * 4);
+    }
     // The gust streak pool: fixed, zeroed (lifetime 0 = never spawned).
     {
       const uint64_t words = (1ull + (uint64_t)kWindStreakCap * kWindStreakStride) * 4ull;
@@ -1036,6 +1049,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // R(HeatPool) R(HeatMeta), which orders it after the tick's writers.
         entry(25, T::ReadOnlyStorage), // heatPool
         entry(26, T::ReadOnlyStorage), // heatMeta
+        // The god-ray sun visibility volume (godray_vis.wgsl): written by its
+        // per-frame row, read by the raymarch at renderBGL_ 38.
+        entry(27, T::Storage),         // godVis
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1953,6 +1969,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mRayStart;
   // The rain shadow map (rain_map.wgsl): two per-frame entries on shadowPL_.
   rhi::ShaderModule mRainMap;
+  // The god-ray sun visibility volume (godray_vis.wgsl): one per-frame entry
+  // on shadowPL_.
+  rhi::ShaderModule mGodVis;
   rhi::ShaderModule mWindStreak;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
@@ -1984,6 +2003,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mSkyTop, "sky_top.wgsl");
     mod(&mRayStart, "ray_start.wgsl");
     mod(&mRainMap, "rain_map.wgsl");
+    mod(&mGodVis, "godray_vis.wgsl");
     mod(&mWindStreak, "wind_streak.wgsl");
     mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
@@ -2007,7 +2027,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart || !mRainMap || !mWindStreak) {
+      !mRayStart || !mRainMap || !mWindStreak || !mGodVis) {
     if (err) *err = "shader file read failure";
     return false;
   }
@@ -2060,6 +2080,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
   pool.Add([&] { rainMapPrep_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapPrep", "rainMapPrep"); });
   pool.Add([&] { rainMapBuild_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapBuild", "rainMapBuild"); });
+  pool.Add([&] { godrayVis_ = MakeComputePipeline(device, shadowPL_, mGodVis, "godrayVis", "godrayVis"); });
   pool.Add([&] { windStreak_ = MakeComputePipeline(device, shadowPL_, mWindStreak, "update", "windStreak"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
@@ -2142,6 +2163,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { gIntegrate_ = MakeComputePipeline(device, gasPL_, mGas, "gasIntegrate", "gasIntegrate"); });
   pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
   pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
+  pool.Add([&] { gLeavePrep_ = MakeComputePipeline(device, gasPL_, mGas, "gasLeavePrep", "gasLeavePrep"); });
   pool.Add([&] { gFarPlume_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlume", "gasFarPlume"); });
   pool.Add([&] { gFarPlumeW_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlumeWide", "gasFarPlumeWide"); });
 
@@ -2227,6 +2249,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   farMapFill_ = {};
   farPatchFill_ = {};
   farDown_ = {};
+  farDownClaim_ = {};
+  farDownStalk_ = {};
+  farDownFeat_ = {};
   farPublished_ = false;
   farStarted_ = false;
   farReady_.store(false, std::memory_order_release);
@@ -2255,7 +2280,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
-      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
+      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ || !gLeavePrep_ ||
       !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
       !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
@@ -2328,6 +2353,11 @@ void Simulation::StartFarBuild(unsigned threads) {
       r.map = MakeComputePipeline(dev, layout, module, "farmap", "farMapFill");
     });
     r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    // fardown's follow-up phases: no procgen in them, so they compile in a
+    // fraction of fardown's time and share the fill's thread.
+    r.downClaim = MakeComputePipeline(dev, layout, module, "fardownClaim", "farDownClaim");
+    r.downStalk = MakeComputePipeline(dev, layout, module, "fardownStalk", "farDownStalk");
+    r.downFeat = MakeComputePipeline(dev, layout, module, "fardownFeat", "farDownFeat");
     map.join();
     patch.join();
     down.join();
@@ -2370,6 +2400,9 @@ void Simulation::StartFarBuild(unsigned threads) {
     farMapFill_ = std::move(r.map);
     farPatchFill_ = std::move(r.patch);
     farDown_ = std::move(r.down);
+    farDownClaim_ = std::move(r.downClaim);
+    farDownStalk_ = std::move(r.downStalk);
+    farDownFeat_ = std::move(r.downFeat);
     farPublished_ = true;
     farReady_.store(true, std::memory_order_release);
   } else {
@@ -2383,11 +2416,15 @@ void Simulation::PublishFarPipelines() {
   farMapFill_ = std::move(r.map);
   farPatchFill_ = std::move(r.patch);
   farDown_ = std::move(r.down);
+  farDownClaim_ = std::move(r.downClaim);
+  farDownStalk_ = std::move(r.downStalk);
+  farDownFeat_ = std::move(r.downFeat);
   farPublished_ = true;
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
-  if (!farFill_ || !farMapFill_ || !farPatchFill_ || !farDown_)
+  if (!farFill_ || !farMapFill_ || !farPatchFill_ || !farDown_ ||
+      !farDownClaim_ || !farDownStalk_ || !farDownFeat_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
                  "stay empty (worldgen.wgsl far/farmap/farpatch/fardown)\n");
@@ -2533,6 +2570,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowHist:          return world_->shadowHist;
     case B::RayStart:            return rayStartBuf_;
     case B::RainMap:             return rainMapBuf_;
+    case B::GodVis:              return godVisBuf_;
     case B::RainExpo:            return rainExpoBuf_;
     case B::Draft:               return draftBuf_;
     case B::DraftMeta:           return draftMetaBuf_;
@@ -2625,6 +2663,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GasIntegrate:   return gIntegrate_;
     case P::GasArgs2:       return gArgs2_;
     case P::GasResolve:     return gResolve_;
+    case P::GasLeavePrep:   return gLeavePrep_;
     case P::GasFarPlume:    return gFarPlume_;
     case P::GasFarPlumeWide: return gFarPlumeW_;
     case P::PArgs1:         return pArgs1_;
@@ -2636,6 +2675,9 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FarPatchFill:   return farPatchFill_;
     case P::FarMapFill:     return farMapFill_;
     case P::FarDown:        return farDown_;
+    case P::FarDownClaim:   return farDownClaim_;
+    case P::FarDownStalk:   return farDownStalk_;
+    case P::FarDownFeat:    return farDownFeat_;
     case P::OpennessDirty:   return opennessDirty_;
     case P::OpennessRefresh: return opennessRefresh_;
     case P::GlowSrc:         return glowSrc_;
@@ -2654,6 +2696,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::RainMapPrep:    return rainMapPrep_;
     case P::RainMapBuild:   return rainMapBuild_;
     case P::WindStreak:     return windStreak_;
+    case P::GodrayVis:      return godrayVis_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -3699,6 +3742,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(35, draftBuf_),
         b(36, world_->heatPool),
         b(37, world_->heatMeta),
+        b(38, godVisBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3793,6 +3837,7 @@ void Simulation::BuildShadowBindGroup() {
       b(24, draftBuf_),
       b(25, world_->heatPool),
       b(26, world_->heatMeta),
+      b(27, godVisBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

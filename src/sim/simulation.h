@@ -736,6 +736,9 @@ class Simulation {
     // waited on together: a cascade filled by the sweep alone would drop every
     // far-field edit, which is a WRONG horizon rather than a missing one.
     rhi::ComputePipeline fill, map, patch, down;
+    // fardown's follow-up phases (worldgen.wgsl fardownClaim / fardownStalk /
+    // fardownFeat; cross-vendor audit #9). Small entries: no procgen.
+    rhi::ComputePipeline downClaim, downStalk, downFeat;
   };
   // Move the future's result onto the three far pipeline members. Main thread only.
   void PublishFarPipelines();
@@ -946,6 +949,8 @@ class Simulation {
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five
   // entry points shaped like the ballistic five above.
   rhi::ComputePipeline gArgs1_, gSpawn_, gIntegrate_, gArgs2_, gResolve_;
+  // The window edge's leave budget, recorded before the CA (gasLeavePrep).
+  rhi::ComputePipeline gLeavePrep_;
   // Far fire plumes (world.h kGasFarEmitMax): a sixth gas entry point on the
   // same layout, whose only output is the render-only density box.
   rhi::ComputePipeline gFarPlume_;
@@ -954,6 +959,7 @@ class Simulation {
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farMapFill_, farPatchFill_, farDown_;
+  rhi::ComputePipeline farDownClaim_, farDownStalk_, farDownFeat_;
   // The background compile. Valid between BuildPipelines and the publish;
   // `farPublished_` and `deferFarOk_` are main-thread-only, `farReady_` is the
   // one field any other thread may observe.
@@ -991,6 +997,8 @@ class Simulation {
   rhi::ComputePipeline rainMapPrep_, rainMapBuild_;
   // The gust streaks' update (wind_streak.wgsl `update`, per-frame table).
   rhi::ComputePipeline windStreak_;
+  // The god-ray sun visibility volume (godray_vis.wgsl `godrayVis`).
+  rhi::ComputePipeline godrayVis_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the
@@ -1143,6 +1151,10 @@ class Simulation {
   rhi::Buffer rayStartBuf_;
   // The gust streaks' fixed particle pool (world.h kWindStreakCap).
   rhi::Buffer windStreakBuf_;
+  // The god-ray sun visibility volume (godray_vis.wgsl; pass_table.h
+  // kGodVis*): fixed size, made at Init. 27 in shadowBGL_ (compute, written),
+  // 38 in renderBGL_ (fragment, read).
+  rhi::Buffer godVisBuf_;
   // The buffer EnsureRayStart last replaced, kept alive one growth longer
   // because the frame that grew it had already recorded the prepass against it.
   rhi::Buffer rayStartPrev_;

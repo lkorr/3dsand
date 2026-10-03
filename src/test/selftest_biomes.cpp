@@ -288,7 +288,7 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   // C: the skin at ground level, at columns inside the window, off the
   // fixture pads / arena / pools (all near the x==z diagonal or past x 350).
   const IVec3 org = c.world.WindowOrigin();
-  int skinOk = 0, skinN = 0, skipped = 0;
+  int skinOk = 0, skinN = 0, skipped = 0, skinFirm = 0;
   std::string first;
   const int treeline = worldmap::CurrentTerrain().treeline;
   for (int i = 0; i < 6; i++) {
@@ -305,8 +305,16 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
     const uint32_t b = World::MapBiomeAt(x, z, kDefaultSeed);
     const biomes::BiomeDef* def = biomes::BiomeById(set, (int)b);
     const uint32_t want = def ? def->skinId : 0;
+    // A biome that authored a cover.firmSkin (desert, ocean: sandstone) lays
+    // it in place of its POWDER skin wherever the ground is steeper than that
+    // powder's own repose holds (worldgen.wgsl looseCoverDepth / looseStep;
+    // since 2026-10-03 against the material's authored angle, so sand at 34
+    // firms more columns than sand at 45 did). Still THIS biome's cover, so
+    // it is still the twin agreeing with the GPU about the biome.
+    const uint32_t firm = def ? def->firmSkinId : 0;
     skinN++;
     if (mat == want) skinOk++;
+    else if (firm != 0 && mat == firm) { skinOk++; skinFirm++; }
     else if (first.empty())
       first = " first mismatch at (" + std::to_string(x) + "," + std::to_string(z) + ") h " +
               std::to_string(h) + ": voxel " + (mat < c.mats.size() ? c.mats[mat].name : "?") +
@@ -320,9 +328,9 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   char buf[320];
   std::snprintf(buf, sizeof buf,
                 "map '%s' %dx%d @%d vox, %zu palette, content %08x; twin at cell centres %d/%d; "
-                "GPU skin == twin's biome skin %d/%d (%d skipped)%s",
+                "GPU skin == twin's biome skin %d/%d (%d as its firmSkin, %d skipped)%s",
                 mapName.c_str(), m.width, m.height, 1 << m.cellLog2, m.palette.size(),
-                m.contentHash, centreOk, centreN, skinOk, skinN, skipped, first.c_str());
+                m.contentHash, centreOk, centreN, skinOk, skinN, skinFirm, skipped, first.c_str());
   detail = std::string(buf) + "; " + p6;
   std::printf("worldmap: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;

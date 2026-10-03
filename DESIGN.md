@@ -1253,8 +1253,9 @@ SSBO lists of chunk indices.
     definitions, so neither `common.wgsl` nor `sim_step.wgsl` restates them, and
     `scripts/check_shaders.sh` scrapes `materials.h` so a shader edit still
     validates with no build.
-  - **THE FLATTER TIERS CANNOT BE GIVEN TO THE BULK TERRAIN POWDERS YET, and
-    that is measured rather than cautious.** `Land.slope` is documented as
+  - **THE FLATTER TIERS COULD NOT BE GIVEN TO THE BULK TERRAIN POWDERS UNTIL
+    WORLDGEN READ THEM (history; fixed 2026-10-03, see the end of this
+    item), and that was measured rather than cautious.** `Land.slope` is documented as
     "256 == 1 voxel/voxel == repose" (`src/sim/worldmap.h`), and every place
     worldgen decides whether ground is "too steep for a powder bed" — the biome
     skin in `genCellIn`, the sediment wedge's `sedSlope`, the pond bed's
@@ -1274,14 +1275,56 @@ SSBO lists of chunk indices.
     a steep tier only ever REFUSES a move the old rule allowed**, so it cannot
     wake anything 45° did not. That is why `snow` ships at 63° (a packed drift
     holds a steep face) while `sand`, `gravel` and `dirt` keep 45.
-    **Follow-up:** make those worldgen slope gates read the placed material's
-    own repose instead of the constant 45, then author sand 34 in the same
-    commit. That is a worldgen change with its own hash move and its own gates
-    (`terrain`, `waterbody`, `worldmap`, `settle-back`) and it is deliberately
-    not bundled here.
+    **DONE 2026-10-03: worldgen reads each powder's own repose, and sand 34 /
+    gravel 40 / dirt 40 are authored.** One source: worldgen reads the same
+    packed `materials[].repose` word the CA does, through the same
+    `reposeEighthsOf` (moved to `common.wgsl` because the two kernels must
+    agree on T; `sim_step.wgsl`'s `reposeEighths` is now a one-line wrapper).
+    What reads it (`worldgen.wgsl`):
+    - **the landform taper** (`looseCoverDepth`) ends at the MATERIAL's
+      `reposeCapQ8` = T·32 (sand T = 6 → 192) instead of the constant 256,
+      capped at 256 (a steep powder is laid as if 45: conservative). It runs in
+      `genCellIn`, so the far cascades and the near window agree on it;
+    - **the local step line** (`looseStep`, `cols` pre-pass, near only as
+      before) gains two exact rules. FLOWY tiers: a cell holds against stage
+      2b's slide iff per axis direction the first neighbour's ground reaches
+      it or the columns 2..run out reach one below — `reposeRunOf` takes the
+      FLATTER tier of a blended word, so no grain of the positional mixture
+      can find a slide. T < 8: a mid-staircase top cell would need its mass to
+      fall by 8 − T per step forever, so it goes to the firm cover; lips stay
+      4/8 (lip over foot or over a firm mid is D = 4 ≤ T; needs T ≥ 4, below
+      that the lip is firm too). Every T = 8, run 1 material takes the old
+      path bit for bit;
+    - **flowy pond beds**: under water a 2:1 grain still slides (the lateral
+      is water it sinks into; the snapshot reads water as open), so `cols`
+      draws the same line (no mass rule — tryFineRepose never sheds toward
+      water) for a submerged column whose bed powder (`pondBedMat`) has a
+      flowy tier, and `genCellIn` lays the preset's substrate above it. A
+      45-degree bed, and `bowlSteep`'s ring test with its KNOWN GAP, are
+      untouched.
+    - **not the sediment wedge**: `sed` is part of `h` and of the CPU height
+      mirror, and its `sedSlope` (96 Q8) is already under the 2:1 tier's 128;
+      measured, no dirt or gravel grain departs.
+    Measured, `--selftest --gate gen-settle` (harness map, 300 still ticks +
+    48-shift +X flight): authored repose on the OLD worldgen 1,499 modified /
+    1,301 changed chunks, 9,036 departed desert grains, travel 49.5 / 41.4 per
+    streamed plane (FAIL); with this change **120 / 106, 1 departed grain (the
+    treeline snow one), travel 0.0 / 0.0** — below the 45-degree baseline's
+    160 / 132, which is now 105 pond-bed stain chunks and nothing else.
+    Register budget (`--shader-stats`, RTX 3060 Ti, against the same exe on
+    the pre-change shaders): every worldgen entry keeps its register count
+    and spill bytes exactly (worldgen/worldgenList 128 + 800 B, worldgenCols
+    168 + 416 B, far* unchanged); `worldgenCols`' binary grows 1.65 -> 1.83
+    MB because each `colHeightAt` is inlined, which is why `looseStep` has one
+    call site for cover and bed and its far probes are one loop.
+    The `worldmap` gate's skin probe (`selftest_biomes.cpp`) now counts the
+    biome's own `cover.firmSkin` as its skin: its desert sample at (144,426)
+    is on ground steeper than 34° and is generated sandstone, which is the
+    same biome agreeing with its twin, not a mismatch.
   - **Authored:** `snow` 63 (steep), `ash` 40, `dust` 30, `seed` 30 (flowy);
-    `sand`, `gravel`, `dirt` keep the 45° default for the reason above. `mite`
-    keeps it too: it wanders, and its movement is not a pile.
+    `sand` 34, `gravel` 40, `dirt` 40 (the values of the 2026-09-13 A/B
+    above, landed with the worldgen that holds them). `mite` keeps 45: it
+    wanders, and its movement is not a pile.
 - **Liquid**: powder rule + try the four laterally adjacent cells on its own level.
   Plus **fullness equalization**: liquid voxels carry fullness in eighths (the state
   nibble); a cell flows into a lateral neighbor holding ≥ 2 eighths less, RNG on
@@ -2145,6 +2188,17 @@ Noita's "Bloody Zombies" technique, on GPU:
 - Particles integrate ballistically each tick, DDA-stepping through the grid;
   on hitting a non-empty voxel they **reinsert into the grid** at the last empty
   cell (waking that chunk).
+- **AT THE CAP, A WHOLE GROUP IS REFUSED, NEVER THE LATE ARRIVALS**
+  (2026-10-03, cross-vendor audit #4). Producers append with an atomicAdd
+  cursor; below `kParticleCap` the slot a particle gets is scheduling-dependent
+  and harmless (claims are state-keyed priorities), but at the cap the
+  survivors used to be the first arrivals — which ejecta flew, landed and
+  stained was workgroup order. Now `args1`/`args2` COMMIT each page:
+  everything appended since the page's last commit (MPM spray of the previous
+  tick, this tick's blast ejecta and grit, CPU spawns) is kept if the counter
+  — a sum, so order-free — fits, and otherwise rolled back to the committed
+  count and counted (`particleCounts` words 2..5). Invisible under the cap.
+  Gate: `particle-cap`.
 - **A LIQUID IS NOT A WALL** (2026-09-13, `docs/PLAN_debris_buoyancy.md`). It was
   one until then — "splash = plop onto the surface" — and that is what built
   rafts of exploded tree hanging over a pond: the first chip stopped on the
@@ -2344,19 +2398,44 @@ reaction system.
   scheduling-dependent by construction), which the `determinism` gate compares
   across its two runs alongside the hash series.
 
-**The open problem, recorded because sizing a cap is not the same as fixing
-it.** `gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are
-refused when the per-tick list fills is decided by which workgroup arrived
-first — and a refused voxel STAYS IN THE GRID, where the world hash can see it.
-That is scheduling-dependent output, i.e. a rule-1 hazard. It is held off by
-sizing `kGasSpawnPerTick` (65,536, a quarter of the window's top face in ONE
-tick) out of reach, which makes the POOL the binding constraint instead — and a
-dropped parcel is already outside the window and cannot move a voxel. The
-`gas-leave` gate asserts refusals == 0, so the day that is not enough it is a
-printed number rather than a silent divergence. **The real fix is mark+apply**:
-the CA flags cells that want to leave and a second pass converts them in a
-deterministic order, which is the pattern `sim_explode` already uses for exactly
-this reason.
+**The edge's refusals are a function of the world (closed 2026-10-03).** Until
+then a conversion charged a shared `atomicAdd` cursor, so WHICH voxels were
+refused when the per-tick list filled was decided by which workgroup arrived
+first — and a refused voxel stays in the grid, where the world hash sees it. It
+was held off by sizing `kGasSpawnPerTick` out of reach. The pool had the same
+hole one step later: which parcel a full pool vaporized was whichever thread's
+`atomicAdd` came last, and the doc's old claim that this "cannot move a voxel"
+was wrong — a parcel that is never dropped can blow back in and land. Now:
+
+1. **The tick's budget is fixed before the CA** (`sim_gas.wgsl gasLeavePrep`, a
+   one-thread pass after `fill_gasSpawn`): `min(kGasSpawnPerTick, pool room left
+   after the live parcels and this tick's CPU spawns)`. So `gasSpawnStep` can
+   never refuse a CA record, and it places every record at `live + rank` (CA
+   list first, CPU list in push order) instead of by cursor — a CPU spawn a full
+   pool refuses is the tail of the CPU's own list. `gasArgs1` publishes the new
+   count.
+2. **It is split evenly across the dirty chunks that touch the residency edge**:
+   `camask` on substep 0 initialises one word per slot behind the record list
+   (`kGasSpChunkBase`) and counts the edge chunks (`kGasSpEdgeChunks`, an
+   order-free count). A chunk's share is `budget / edgeChunks`, spent in
+   dispatch order, so the shares can never sum past the list.
+3. **Within one dispatch a chunk is one workgroup's.** A cell whose primary step
+   leaves the window DEFERS (`gasLeaveDefer`: it has written nothing yet — the
+   failed out-of-window `tryMove` is a no-op), and after a workgroup barrier
+   main's leave-resolve tail accepts all of a chunk's leavers if they fit its
+   unspent share, else the lowest by a per-cell `hash3` rank. Accepted ones
+   convert (`gasConvert`); refused ones resume their ladder at candidate 1,
+   exactly as at a wall. The deferral cannot change an outcome: everything the
+   cell does next is within reach 1, which no other thread of its colour can
+   touch.
+
+Rule 2: one `camask` thread per dirty chunk does 26 residency probes on substep
+0, one extra workgroup barrier per CA workgroup, and the ranking loop runs only
+for a chunk over its share. `gas-leave-overflow` forces the overflow (a test-only
+budget ceiling, `World::SetGasLeaveCapForTest`, word 1 of the `gasSpawnOps`
+header) and asserts refusals > 0, conversions > 0, no overrun, and a tick-for-
+tick identical twice-run (hash + per-tick leave counts + parcel digest).
+`gas-leave` still asserts zero refusals, as a THROUGHPUT claim now.
 
 **The settled-tick skip vs parcels in flight — FOUND BY THE GATE, FIXED IN
 `simulation.cpp`.** This section's own paragraph above states the obligation:
@@ -3100,9 +3179,17 @@ spares exactly their particles, so refused water stays particles and the ledger
 balances column by column. The hysteresis guarantee survives the split: a
 refused neighbour column keeps its particles, so `seamNeighbourState` reads its
 excited eighths instead of its settled fill — nonzero either way, so the
-predicate cannot tell "settled" from "refused". A block that loses columns to
-the veto halves its calm counter, as a fully refused one does, so an awkward
-pool gets a cooldown instead of re-running the whole window forever.
+predicate cannot tell "settled" from "refused". A fully REFUSED (infeasible)
+block halves its calm counter, so an awkward pool gets a cooldown instead of
+re-running the whole window forever. A block that only lost columns to the
+veto still commits, and `settleCommit` restarts its calm window from 0 (the
+halving `settleCheck` writes is overwritten there) but KEEPS its stuck age
+(2026-10-03): those columns still hold particles, so the force-settle backstop
+(`sim.fluidStuckTicks`, which skips the veto by design) must still be able to
+reach them. Zeroing the age at every partial commit starved the backstop
+forever — `ca-slope-hybrid` parked 127 particles on a tread lip at |v| = 0 for
+its whole run, 27 of 31 picks vetoed, 1 forced. A block that converted
+everything, or a forced one, restarts both counters.
 
 THE SOLVER'S FREE SURFACE IS NEVER AT REST, and every speed test in the seam
 corrects for it. Pressure comes from density ≥ rest, so the top layer of any
@@ -4213,7 +4300,13 @@ cannot run a blast, and must not decide one from append order:
    slots decodes it back to the one window cell it names. The survivors are a pure function of the SET of
    firings — order-free, never an append cursor (rule 1). The scramble is an odd
    multiply mod 2^27 so a slot's winner is spatially scattered, and it inverts
-   exactly (`ReactFxDecodeCell`).
+   exactly (`ReactFxDecodeCell`). Word `[45]` of the same block
+   (`kPageFaultReactLiquidEaten`, 2026-10-03) is the reaction LEDGER's CA
+   half: `reactLiquidEaten` adds the fullness of every SETTLED liquid voxel a
+   reaction rewrites to another material (either side of a pair, a decay, a
+   thermal transition). The seam's `FA_CONSUMED` counts the EXCITED half; the
+   two together are what lets `fluid-react` assert its mass account exactly.
+   Diagnostic only — nothing in the sim reads it.
 3. The record rides the snapshot ring (no new binding, no new readback — the scoop
    ledger's trick) and is parsed per snapshot; `PublishSnapshotsUpTo` queues each
    published snapshot's winners, so `World::TakeReactFx` at tick T returns the
@@ -4254,7 +4347,13 @@ explode; sodium + steam fizzes, + heat burns; hydrogen + heat or spark →
 explode, + chlorine in daylight → acid + small blast, decays (escapes); salt +
 heat → molten salt (molten salt itself a 2% melter, so a pile cannot melt
 itself), molten salt cools on an inverted hot ramp, + water quenches, + spark
-(tag:electric) → sodium + chlorine (electrolysis); spark ignites flammables
+(tag:electric) → sodium + chlorine (electrolysis) — **but not at every pool
+height** (open, 2026-10-03, `chem-electrolysis`): the rule is authored from
+the molten salt's side, a spark is a gas that rises in its OWN colour phase on
+substep 0, and the CA's phases run x, then y, then z, so a pool whose top is at
+y ≡ 2 (mod 3) never sees the spark above it (the spark's y ≡ 0 phase runs
+first and it has risen). The same bias applies to every rule that names a
+fast-moving gas as its NEIGHBOUR (hydrogen + spark, brine + spark); spark ignites flammables
 weakly and lives ~2 ticks; acid dissolves crystal now and FUMES noxious gas
 from every dissolution (~1 in 10 eaten voxels; ~1 in 3 since package E, below), is neutralized by lye (→ water/
 steam + salt) and sodium (→ hydrogen + salt), and still spares glass, steel,
@@ -4500,6 +4599,10 @@ about it are not obvious and both were measured:
 * With a **solid** grass skin at `y == h` the topmost grain sits at `h−1`, so it
   has a free down-diagonal exactly where a neighbouring column is 3+ voxels
   lower — which is the ground the gate has already taken the wedge to zero on.
+  Dirt and gravel are authored at 40° since 2026-10-03 (a 2:1/1:1 blend, so
+  some grains slide toward a drop two out); the wedge was left alone because
+  `sedSlope` 96 Q8 is already under the 2:1 tier's 128, and `gen-settle`
+  measured zero departed dirt or gravel grains.
 
 `terrain.sedSlope = 0` (map.json, P-G) turns the wedge off. It is a map word
 rather than a tuning row now, so `--sweep` cannot reach it; the `terrain`
@@ -4524,7 +4627,9 @@ never the water. It was the bank falling into it.
 keeps its authored depth on ground the wedge already calls flat
 (`terrain.sedSlope`), tapers to zero at the CA's own angle of repose
 (`CAP_REPOSE_Q8 = 256`, one voxel per column -- not a knob, it is the constant
-`sim_step`'s diagonal slide defines), and whatever the taper takes away becomes
+`sim_step`'s diagonal slide defines; since 2026-10-03 it is the CEILING and the
+taper ends at the loose material's own `reposeCapQ8` = T·32, T read from its
+authored `repose` -- §4 "PER-MATERIAL ANGLE OF REPOSE"), and whatever the taper takes away becomes
 the biome's `cover.firmSkin` (`WM_B_FIRM_COVER`; desert and ocean say
 `sandstone`, a material that far-aliases `sand` so it costs no palette slot).
 On flat ground the loose depth is the full authored 4 and nothing changes.
@@ -5174,6 +5279,21 @@ neighbors, so this needs an explicit connectivity pass:
   all-stone post astride a chunk boundary, one exact-cell erase between two
   solids; the CA cannot move stone, so the two flagged chunks it measures can
   only have come from the mutation path).
+- **A neighbour written by the SAME dispatch is read as it ENDS the dispatch
+  (2026-10-03, cross-vendor audit #10).** The flag looks at the vacated
+  cell's six neighbours, and inside one mutation dispatch a neighbour can be
+  another op's cell, stored by another invocation at that very moment — read
+  before the store it was solid (flag), after it air (none), so the island
+  scan's timing (cooldowns, drain = world state) depended on scheduling. Each
+  writer now answers for the post-dispatch grid: the brush (`main`) treats a
+  neighbour any op's sphere covers as solid (a superset); `cells`
+  (`flagSupportLossCells`) finds the neighbour's own op by binary search —
+  `SubmitTick` uploads the voxel ops sorted by `cellIdx` — and derives the
+  material it ends with from the op word and its read, whichever side of the
+  store that read fell (`cellOpPostMat`); the blast (`flagSupportLossBlast`)
+  skips a neighbour the mark mask says this dispatch destroys. Gate:
+  `support-flag-post` (a pillar's top cell and the cell above it, astride a
+  chunk face, erased in one dispatch: the upper chunk must NOT be flagged).
 - **Bounded 6-connected flood fill** outward from voxels adjacent to the removal.
   Meeting fronts merge. If a fill exceeds ~32,000 voxels (~8 chunks), abort and
   declare "not an island" — an unbounded check could collapse an entire dungeon
@@ -5976,6 +6096,65 @@ neighbors, so this needs an explicit connectivity pass:
   are ~9.5 (`burnprof`: 60k burn candidates queued a tick for 6.4k evaluated
   under the shared front budget -- the queueing of the other 90% is the next
   lever), debris 3.3 and the submit + Jolt step 3.4.
+- **The burning villagers, bounded (2026-10-03).** Same scene, windowed:
+  `SANDVOX_RUN_EXCLUSIVE=1 SANDVOX_BURN_VILLAGE=1 SANDVOX_BURN_TICKS=1200
+  bash scripts/run.sh <exe> --frames 100000 --burn-house`. `burnprof` was
+  extended until the mob tick had no unattributed term: spans for the
+  candidate build (`queue`), the post-loop front sweep (`frontSweep`), the
+  rest of `PreTick` (`mobLoop`, `stain` and its parts `stainContact` /
+  `stainWalk` / `stainSurface` / rain / dry / wet / flesh, `deadSleep`) and
+  the hair tuck (`hairCover`, `hairFull`); counters for the front, the
+  windowed visits, the contact samples and the seeding's hot cells / faces /
+  footprint reads. Before: mob tick 9.05 ms mean, `burnOne` 6.34 (queue
+  1.96, seed 1.41, candidate loop 2.15, walk 0.50), the contact sweep 2.0
+  (30k samples a tick, ~68 ns each, from the ~20 limb visits a tick that
+  find something staining against them -- which material was not
+  attributed), hair tuck 0.33 mean / 16 ms worst. Changes:
+  1. **Only the window of the front the share can evaluate is expanded**
+     (`BurnOneLimb`, "ONLY AS MUCH OF THE FRONT"). The candidate list was
+     built from every front cell and its six neighbours and swept whole after
+     the loop, while the budget evaluated a tick-rotated window of it: 64.7k
+     queued a tick for 6.4k evaluated. When a front can queue more than the
+     limb's share (+1/8 slack for the joint twins the loop hands back), a
+     tick-rotated window of it is expanded instead; the front past the window
+     is carried over if still alight (a pair rule's neighbour product may
+     have rewritten it), and the world-contact seeding is scaled by the same
+     fraction so seeds and front cells keep their expected share of the
+     evaluation. A front that cannot overflow takes the old path unchanged.
+     Candidates 64.7k -> 11.4k a tick, evaluated unchanged (6.4k), queue
+     1.96 -> 0.39 ms. The one change here that moves the hash.
+  2. **Exact speedups** (bit-identical): the cheap gate's world walk reads a
+     chunk's run of a row at a time (window test, chunk lookup and fetch
+     request once per run; a forest fire walks ~66k cells a tick through it,
+     `--forest-fire` debris `burnBodies` 1.27 -> 1.04 ms); the candidate
+     loop's six face steps and normals rotated once per visit; the contact
+     sweep memoizes the world cell's classification (64 surface voxels share
+     a cell face at skinScale 8), walks a wrapping cursor with two divisions
+     a sample, looks its outward normal up in a 27-entry table rotated once,
+     and builds the surface list from the voxel list (sorted back into the
+     box order) instead of the box.
+  3. **The hair tuck re-hides instead of re-deriving** on a repaint
+     (`MobLimb::tuckHidden` / `tuckBase`). A burn moves only the hair brick's
+     edit counter, and which cells hide is a function of the lattice and the
+     cover; the full path composes hair -> head as one transform. The 16-25
+     ms ticks were NOT the cover (`hairCover` 1.4 ms at worst): the rim
+     search re-normalised every covered bin's direction (up to 6,144) for
+     every open bin the hair landed in, after every cover rebuild; the
+     directions are now built once per call. Render-only.
+  After (three runs, same command): mob tick 7.3-7.6 ms mean (`burnOne`
+  4.55: candidate loop 2.1-2.3, seeding 1.1, walk 0.4, queue 0.4, front
+  sweep 0.3), contact sweep 1.6-1.9, hair tuck 0.22 mean with no spike;
+  ticks over 16 ms 8 -> 1, worst tick 24.3 -> 17.7 ms.
+  The FRAME did not move (p50 18.8 -> 18.1-18.8 ms): the village fire is
+  GPU-bound -- `caLoop` ~11.5 ms a tick-frame over ~2,700 awake chunks of
+  black smoke and `rm_world` ~6 ms. So is the forest fire (raymarch 10.6 +
+  CA ~7.5 a tick-frame, p50 26 ms) and the bench's ether fire (raymarch
+  ~10 ms with the camera in the cloud, CA ~2.8 over ~130 chunks; game frames
+  ~20 ms during the burn before and after). What is left on the CPU is the
+  budgets doing their job: 6k candidate evaluations at ~0.33 us, ~27k
+  seeding probes at ~40 ns, the contact sweep's 32k samples at ~52 ns,
+  cross-limb heat 0.8 ms -- each bounded by a pot, none multiplying with
+  bodies.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
@@ -13176,6 +13355,23 @@ where you hear from either (§12b, "The ears are on the character").
   body's own voxel payload inside the box to the exact voxel hit** — debris stays
   voxel-crisp instead of marching-cubes-smooth, and reuses the terrain shading
   path. Adopt once bodies carry their voxel payloads (M6).
+- **The god-ray sun visibility volume (2026-10-03; `assets/shaders/godray_vis.wgsl`).**
+  Under water, `godRays` marches 14 samples a pixel and asks at each whether
+  the sun reaches it — one coarse `traceOpaque` per 4^3 block the samples
+  visit, ~7 rays a pixel, which `--render-budget`'s `godshadow0` arm priced at
+  6.3 ms of a 20 ms submerged frame. One per-frame row on the ShadowCache table
+  (`godray_vis`) casts that same coarse ray ONCE per block for a 72x40x72-block
+  grid round the eye (28.8 x 16 x 28.8 m, covering `godRayRange` either side)
+  and `godRays` reads a word per block (render binding 38). The ray starts at
+  the block centre instead of at whichever sample first entered the block;
+  because the march is coarse from its first step that changes only grazing
+  rays, and neighbouring pixels no longer disagree about one block. A sample
+  outside the grid, or a frame the volume was not built (stamp word 0 !=
+  this frame — the kernel builds only when the eye's voxel is a liquid and
+  the sun is up), casts its own ray as before, so the volume is a cache and
+  never a clip. Measured, harness lake, in one process: 19.14 -> 13.04 ms;
+  the row costs ~0.05 ms submerged and one voxel read per thread when dry.
+  Render-only derived data, never hashed or saved.
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
@@ -13296,8 +13492,15 @@ where you hear from either (§12b, "The ears are on the character").
   voxels — wider than a 16-voxel chunk for k ≥ 2 — neighboring chunks' byte
   writes collide, so `farVox`/`farOcc` are atomic in both far kernels
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
-  keeps it conservative: never falsely zero). Atomics are legal here precisely
-  because cascades carry no determinism requirement.
+  keeps it conservative: never falsely zero). Atomics are legal here because
+  each byte has ONE writer per dispatch (the chunk owning its centre sample)
+  and the and+or pair commutes with other bytes' — NOT because the cascade
+  carries no determinism requirement: particles outside residency collide
+  with level 1 (`sim_particle.wgsl farBlocked`), so a byte that depends on
+  scheduling is a landing that depends on it. That is why the downsample's
+  follow-up checks are three further dispatches (`fardownClaim`,
+  `fardownStalk`, `fardownFeat`; cross-vendor audit #9, 2026-10-03): inline,
+  the cut-stalk clear read a byte another chunk's downsample was rewriting.
   **A dirty chunk whose far-visible matter did not change is skipped
   (2026-09-22).** The dirty list says a chunk was WRITTEN, not that anything
   the cascade holds changed — and gas never reaches the cascade, so a burning
@@ -13704,7 +13907,13 @@ where you hear from either (§12b, "The ears are on the character").
     skips a cell whose slot is a sub-column's sub-skin (the stalk's own cell).
     Stalks shade, cast contact shadows and take AO as terrain. `fardown`
     checks a stalk entry's claim at the stalk's own fine column; a cut stalk
-    clears VALID and un-marks its cells (no ghost column).
+    clears VALID and un-marks its cells (no ghost column) — in `fardownStalk`,
+    a dispatch after every claim of the tick has settled, with one verdict per
+    cell: un-marked if it holds ANY of its level cell's stalks' slots and no
+    still-standing one passes through it, restored to the blocker iff its
+    floor is at or under the highest ground of its four sub-columns (so the
+    fill's first-wins mark and two cut stalks of different ground cannot make
+    the outcome depend on order).
   - **The FEATURE PLANE** (`sim/farfeat.h`; worldgen.wgsl `FAR_FEAT_*`): 8 MiB
     after the surface map in the same buffer (no new binding), levels 1-2, one
     word per sub-column: the tallest MICRO plant's top (mod 256), height,
@@ -16826,7 +17035,7 @@ cell. Integer against integer; no scaling and no rounding anywhere.
 
 | pass | shape | what it does |
 |---|---|---|
-| `wbQuiet` | one thread per listed chunk | was this chunk disturbed this tick? |
+| `wbQuiet` | one thread per listed chunk | was this chunk disturbed this tick? (a bank DRYING — dirty bits `dry` / `DRY-WROTE` only — is not) |
 | `wbLedger` | one thread per body | the whole state machine and all arithmetic |
 | `wbReduce` | one workgroup per listed chunk | sums a candidate's voxel eighths |
 | `wbShave` | one workgroup per listed chunk | takes eighths off the free surface, and REPORTS what it took |
@@ -16854,7 +17063,14 @@ So authority is SPLIT rather than moved:
 * **The GPU decides everything that depends on what the world is DOING.**
   Quiescence is measured from `dirtyIn` and the MPM block map — the hashed
   world's own state — and the Candidate → Measuring → Adopted ladder, the level,
-  the area and the ledger all live in `waterBodyState`.
+  the area and the ledger all live in `waterBodyState`. `wbQuiet` ignores ONE
+  family of dirty reasons: `dry` / `DRY-WROTE` (bits 29/30, `sim_step.wgsl`
+  `stainDry`), a wet stain drying. Drying never touches a cell with its wetter
+  liquid on a face, so it cannot move an eighth of any body, and a dug-and-filled
+  pit's banks dry for ~1000 ticks; read as activity, that held every created body
+  CANDIDATE that long (`--gate waterbody` pass N, red 2026-09-25 → 2026-10-03).
+  Drying used to share `stain-idle` / `STAIN-WROTE` with `doStaining`, whose
+  soak-in DOES spend liquid and still counts.
 
 **That closes the M1 hazard** this section used to end with: the quiescence term
 read `World::Snap()`. Nothing in `waterbody.cpp` reads a snapshot now, and
@@ -22519,11 +22735,15 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
      its buffer, and (the branch audit) the brush-overlap dedupe's read race
      (one thread per cell now), the particle landing support flag's reads of
      cells other particles land in, the brush support flag's neighbour reads,
-     and stained AIR now folds into the hash. Open (each with its fix design
-     in `docs/PLAN_vulkan_port.md`'s 2026-10-02 audit table): pool-cap
-     refusal order at saturation, far-cascade fill timing, the fardown stalk
-     clear, and the support-flag neighbour reads of exact-cell ops and the
-     blast kernel.
+     and stained AIR now folds into the hash. Closed 2026-10-03 (the audit
+     table's rows #4/#9/#10): the particle ring refuses whole append groups at
+     its cap (`particle-cap`), the fardown stalk clear is its own dispatch,
+     and the exact-cell and blast support flags read the post-dispatch grid
+     (`support-flag-post`). Still open: far-cascade FILL TIMING (#5: the
+     level-1 bytes particles outside residency collide with are filled on a
+     wall-clock schedule — the deferred `far` compile and the per-frame bulk
+     slice — which needs an owner decision, options in the table) and the gas
+     pool's `gasLeave` cap (another package).
    - **The test that closes it is now one command on the other machine:**
      `sandvox.exe --fingerprint fp_<vendor>.json` writes the determinism
      gate's 200 per-tick hashes, the gas digest and the per-slot voxel digests

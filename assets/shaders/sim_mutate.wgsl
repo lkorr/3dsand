@@ -48,7 +48,9 @@
 //
 // CELL OPS (the `cells` entry) dedupe on the CPU instead — an 8-byte op has no
 // room for a predicate a shader could re-derive, and the choke point can sort.
-// See sim/oprecord.h's CanonicalizeCells.
+// See sim/oprecord.h's CanonicalizeCells. They also arrive SORTED by cellIdx
+// (support.cpp, at the upload), which `cells`' support flag relies on: see
+// flagSupportLossCells.
 
 @group(0) @binding(0) var<storage, read_write> voxels   : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dirtyIn  : array<atomic<u32>>;
@@ -421,6 +423,86 @@ const SCOOP_EIGHTHS_WORD : u32 = 36u;
 const SCOOP_APPLIED_WORD : u32 = 37u;
 const SCOOP_REFUSED_WORD : u32 = 38u;
 
+// ---- THE CELL OPS' SUPPORT-LOSS FLAG (common.wgsl flagSupportLoss, made
+// order-free for this dispatch; cross-vendor audit #10, 2026-10-03) ----------
+// flagSupportLoss reads the six neighbours of the cell an op just wrote, and
+// inside `cells` a neighbour can be ANOTHER op's cell, stored by another
+// invocation at that moment (island removal and the rubble handoff write whole
+// connected runs of cells in one tick). Read before that store the neighbour is
+// one material, after it another, so whether its chunk got flagged depended on
+// scheduling -- and the flag summons the island scan, whose cooldowns and
+// per-tick drain move WHEN islands drop, which is world state.
+//
+// The answer here is EXACT, the post-dispatch grid's: SubmitTick uploads the
+// voxel ops SORTED BY cellIdx (support.cpp, after the keep-first dedupe, so
+// there is at most one op per cell), which lets a neighbour find ITS op by a
+// binary search. A neighbour no op targets is not written by this dispatch and
+// its read is stable. A neighbour some op targets ends the dispatch holding
+// cellOpPostMat(op, read) whichever side of that op's store the read landed
+// on (the function's comment proves each case). Solute pours sit at the tail,
+// write no voxel here, and sort as +inf so they are never found.
+fn cellOpKey(i : u32) -> u32 {
+  let w = cellOps[i].word;
+  if (cellOpIsSolutePour(w)) { return 0xFFFFFFFFu; }
+  return cellOps[i].cellIdx;
+}
+// Index of the voxel op on slot-space cell `key`, or MUT_NO_OP.
+fn findCellOp(key : u32) -> u32 {
+  var lo = 0u;
+  var hi = T.cellCount;
+  while (lo < hi) {
+    let mid = (lo + hi) / 2u;
+    if (cellOpKey(mid) < key) { lo = mid + 1u; } else { hi = mid; }
+  }
+  if (lo < T.cellCount && cellOpKey(lo) == key) { return lo; }
+  return MUT_NO_OP;
+}
+// The material a cell targeted by op word `w` holds AFTER this dispatch, given
+// `cur`, a read of it taken at an unknown moment DURING the dispatch (before
+// or after the op's one store; only the op's own thread writes the cell).
+//   unconditional: the op's material, whatever was read.
+//   IF_AIR paint (fill air only): read AIR -> it was the pre-store occupant,
+//     air, so the op stores its material; read non-air -> either the occupant
+//     was matter and the op wrote nothing, or the store already landed --
+//     both times the read IS the final material.
+//   IF_AIR conditional clear of X (word material AIR): read X -> pre-store and
+//     it matched, so the cell ends air; read anything else -> either it never
+//     matched (no store, the read is final) or the store landed (air, final).
+fn cellOpPostMat(w : u32, cur : u32) -> u32 {
+  let m = w & 0xFFFu;
+  if ((w & CELLOP_IF_AIR) == 0u) { return m; }
+  if (m == MAT_AIR) {
+    if (cur == ((w >> 12u) & 0xFFFu)) { return MAT_AIR; }
+    return cur;
+  }
+  if (cur == MAT_AIR) { return m; }
+  return cur;
+}
+// common.wgsl's flagSupportLoss verbatim except for HOW a neighbour is read
+// (above). Keep the two in step.
+fn flagSupportLossCells(c : vec3<i32>, oldKlass : u32, newMat : u32) {
+  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
+  let nm = newMat & 0xFFFu;
+  var keepsAbove = false;
+  if (nm != MAT_AIR) {
+    let nk = materials[nm].klass;
+    if (nk == CLASS_SOLID) { return; }  // still supports everything
+    if (nk == CLASS_POWDER) { keepsAbove = true; }
+  }
+  for (var i = 0u; i < 6u; i++) {
+    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    if (keepsAbove && i == 1u) { continue; }
+    let n = c + faceDir(i);
+    if (!inWindow(n, ptOrigin())) { continue; }
+    var nmat = voxMat(voxWordAt(n));
+    let k = findCellOp(cellIndexW(n));
+    if (k != MUT_NO_OP) { nmat = cellOpPostMat(cellOps[k].word, nmat); }
+    if (nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID) {
+      atomicStore(&supportOut[chunkIndexW(n)], 1u);
+    }
+  }
+}
+
 @compute @workgroup_size(64)
 fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.cellCount) { return; }
@@ -517,7 +599,7 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // so prevMat is MAT_AIR and they never reach the neighbour walk — which is
   // what keeps DESIGN.md §7's "burn ops must not starve island detection"
   // property intact without a special case here.
-  flagSupportLoss(wc, materials[prevMat].klass, voxMat(word));
+  flagSupportLossCells(wc, materials[prevMat].klass, voxMat(word));
 }
 
 // ---- THE SOLUTE POUR (docs/PLAN_alchemy_chemistry.md contract 2.5) --------

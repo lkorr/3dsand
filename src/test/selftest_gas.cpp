@@ -57,6 +57,7 @@
 #include "sim/wind.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -395,13 +396,15 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
   // 5. The outer density box has something in it above the window top.
   const bool outerOk = a.outerSum > 0;
 
-  // 6. THE PER-TICK CAP WAS NEVER THE BOUND. kGasSpawnPerTick refusals are
-  //    scheduling-dependent in WHICH voxel gets refused (a shared atomicAdd
-  //    cursor), and a refused voxel STAYS IN THE GRID where the world hash can
-  //    see it — so a nonzero here is not a slow plume, it is a determinism
-  //    hazard. Summed over every tick the snapshot ring delivered; `coverage`
-  //    says how many that was, because "0 refusals over 12 of 400 ticks" and
-  //    "0 over 400" are different claims (CLAUDE.md rule 6).
+  // 6. THE LEAVE BUDGET WAS NEVER THE BOUND for a single plume. Since
+  //    2026-10-03 a refusal is no longer a determinism hazard -- which voxel
+  //    is refused is a function of the world (sim_step.wgsl THE EDGE'S
+  //    BUDGET; `gas-leave-overflow` forces it) -- so a nonzero here is a
+  //    THROUGHPUT finding: one 16^3 puff should not exhaust a 65,536 budget
+  //    split across the few edge chunks this fixture wakes. Summed over every
+  //    tick the snapshot ring delivered; `coverage` says how many that was,
+  //    because "0 refusals over 12 of 400 ticks" and "0 over 400" are
+  //    different claims (CLAUDE.md rule 6).
   const bool noRefusals = a.refused == 0 && a.poolFull == 0 &&
                           b.refused == 0 && b.poolFull == 0;
 
@@ -504,8 +507,9 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
                "window face is a hard edge again", splatTick);
   if (!noRefusals)
     detail +=
-        " -- spawn refusals are NONZERO: which voxel is refused is decided by "
-        "which workgroup arrived first, and a refused voxel stays in the grid";
+        " -- leave / pool refusals are NONZERO for one plume: the per-chunk "
+        "share of the leave budget bound (deterministically) where it should "
+        "not have";
   if (!stable)
     detail += divergedAt ? Format(" -- twice-run hash diverged at t%u", divergedAt)
                          : " -- the gas digest / population did not reproduce";
@@ -518,6 +522,193 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
   // pristine terrain (CLAUDE.md rule 7). The parcel pool drains on its own —
   // every parcel is bounded by its decay and the outer box — but say what is
   // left rather than assuming.
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ========================= gas-leave-overflow ===============================
+//
+// THE RULE-1 HOLE THE EDGE HAD, PROVEN CLOSED RATHER THAN MASKED (2026-10-03).
+// Until this date a window-edge conversion charged a shared atomicAdd cursor,
+// so when the per-tick list filled, WHICH voxels were refused was decided by
+// which workgroup arrived first -- and a refused voxel stays in the grid,
+// where the world hash sees it. The engine held that off by sizing the list
+// (65,536) out of reach, and `gas-leave` asserts it is never reached. That
+// proves the hole is not ENTERED; it says nothing about whether it is there.
+//
+// This gate enters it on purpose. World::SetGasLeaveCapForTest shrinks the
+// tick's leave budget (sim_gas.wgsl gasLeavePrep) to a few dozen, a 16^3 puff
+// of smoke four cells under the window's top face meets the ceiling within a
+// few ticks, and most of every tick's leavers are refused. Two runs of the
+// same fixture must then agree tick for tick on the world hash AND on the
+// per-tick accepted / refused / budget / edge-chunk counts, and on the parcel
+// digest at a probe tick -- the only quantity that can see which voxels left.
+//
+// WHAT THIS CAN AND CANNOT PROVE. A twice-run comparison on one GPU in one
+// process is evidence, not proof: the old cursor would often have produced
+// the same arrival order twice too. The proof is structural (sim_step.wgsl
+// THE EDGE'S BUDGET: every refusal is a function of the budget, the chunk's
+// edge-chunk share and a per-cell hash rank, none of which is an arrival
+// order). What the gate pins is that the structure is the one RUNNING: the
+// overflow genuinely happens (refused > 0), it is genuinely partial
+// (accepted > 0 -- a share of zero would refuse everything deterministically
+// and prove nothing), no accepted conversion ever found the list full
+// (kGasSpOverrun == 0), no tick accepted more than its budget, and the pool
+// never refused a parcel (the budget leaves it room by construction).
+//
+// Ticks THE tick (support::TickCursor). Thresholds in tests/baseline.json
+// (gasOverflow*).
+Status GateGasLeaveOverflow(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  const uint32_t smokeId = MatId(c.mats, "smoke");
+  if (!smokeId) {
+    detail = "need material smoke";
+    return Status::Fail;
+  }
+  const uint32_t cap = (uint32_t)BaselineNumber("gasOverflowCap", 64);
+  const uint32_t ticks = (uint32_t)BaselineNumber("gasOverflowTicks", 60);
+  const uint32_t probeTick = (uint32_t)BaselineNumber("gasOverflowProbeTick", 30);
+
+  const IVec3 wo = world.WindowOrigin();
+  const int topY = wo.y * (int)kChunk + (int)kWorldN;  // one past the top face
+  // The puff's top is four cells under the face, centred in x/z so it leaves
+  // through the CEILING. A shaft of air from its base to the face, four cells
+  // of margin, so nothing worldgen left there decides where it goes.
+  const int fy0 = topY - 20;
+  const int fx0 = wo.x * (int)kChunk + (int)kWorldN / 2 - 8;
+  const int fz0 = wo.z * (int)kChunk + (int)kWorldN / 2 - 8;
+  std::vector<CellOp> clear, puff;
+  for (int z = fz0 - 4; z < fz0 + 20; z++)
+    for (int x = fx0 - 4; x < fx0 + 20; x++)
+      for (int y = fy0; y < topY; y++)
+        clear.push_back({World::SlotCellIndex({x, y, z}), 0u});
+  for (int z = fz0; z < fz0 + 16; z++)
+    for (int x = fx0; x < fx0 + 16; x++)
+      for (int y = fy0; y < fy0 + 16; y++)
+        puff.push_back({World::SlotCellIndex({x, y, z}), smokeId & 0xFFFu});
+  const IVec3 fixtureChunk{fx0 >> 4, fy0 >> 4, fz0 >> 4};
+
+  struct Tick {
+    uint32_t hash = 0, accepted = 0, refused = 0, budget = 0, edgeCh = 0;
+    uint32_t overrun = 0, poolFull = 0, live = 0;
+    bool operator==(const Tick& o) const {
+      return hash == o.hash && accepted == o.accepted && refused == o.refused &&
+             budget == o.budget && edgeCh == o.edgeCh && overrun == o.overrun &&
+             poolFull == o.poolFull && live == o.live;
+    }
+  };
+  struct Run {
+    std::map<uint32_t, Tick> series;
+    uint64_t accepted = 0, refused = 0, overrun = 0, poolFull = 0;
+    uint32_t overBudgetTicks = 0, overCapTicks = 0, refusingTicks = 0;
+    uint32_t maxEdgeCh = 0;
+    uint32_t digest = 0, live = 0;
+  };
+
+  auto run = [&]() -> Run {
+    Run r;
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    world.SetGasLeaveCapForTest(cap);
+    uint32_t t = 0;
+    support::TickCursor tick{c, t, fixtureChunk};
+    for (uint32_t i = 1; i <= ticks; i++) {
+      tick(std::vector<BrushOp>{},
+           i == 1 ? clear : (i == 2 ? puff : std::vector<CellOp>{}));
+      const WorldSnapshot& sn = world.Snap();
+      if (sn.valid && r.series.find(sn.tick) == r.series.end()) {
+        Tick s;
+        s.hash = sn.worldHash;
+        s.accepted = sn.gasLeaveAccepted;
+        s.refused = sn.gasLeaveRefused;
+        s.budget = sn.gasLeaveBudget;
+        s.edgeCh = sn.gasLeaveEdgeChunks;
+        s.overrun = sn.gasLeaveOverrun;
+        s.poolFull = sn.gasPoolRefused;
+        s.live = sn.gasCount;
+        r.series[sn.tick] = s;
+        r.accepted += s.accepted;
+        r.refused += s.refused;
+        r.overrun += s.overrun;
+        r.poolFull += s.poolFull;
+        if (s.accepted > s.budget) r.overBudgetTicks++;
+        if (s.budget > cap) r.overCapTicks++;
+        if (s.refused > 0) r.refusingTicks++;
+        r.maxEdgeCh = std::max(r.maxEdgeCh, s.edgeCh);
+      }
+      if (i == probeTick) {
+        // A segment boundary, not a read inside the tick loop (the rig has
+        // already drained the tick; see gas-leave's probe).
+        ctx.WaitIdle();
+        ctx.ProcessEvents();
+        uint32_t gp[kGasSpHdr] = {};
+        ReadGasStatsSync(ctx, world, gp);
+        r.digest = gp[kGasSpDigest];
+        r.live = GasAliveSync(ctx, world, sim);
+      }
+    }
+    world.SetGasLeaveCapForTest(0);
+    return r;
+  };
+
+  const Run a = run();
+  const Run b = run();
+
+  uint32_t compared = 0, divergedAt = 0;
+  for (const auto& kv : a.series) {
+    const auto it = b.series.find(kv.first);
+    if (it == b.series.end()) continue;
+    compared++;
+    if (!(it->second == kv.second) && !divergedAt) divergedAt = kv.first;
+  }
+  const bool forced = a.refused > 0 && b.refused > 0;
+  const bool partial = a.accepted > 0;
+  const bool clean = a.overrun == 0 && b.overrun == 0 && a.poolFull == 0 &&
+                     b.poolFull == 0 && a.overBudgetTicks == 0 &&
+                     b.overBudgetTicks == 0 && a.overCapTicks == 0 &&
+                     b.overCapTicks == 0;
+  const bool same = compared > 0 && divergedAt == 0 && a.digest == b.digest &&
+                    a.live == b.live && a.live > 0;
+
+  RecordObserved("gasOverflow.refusedObserved", (double)a.refused);
+  RecordObserved("gasOverflow.acceptedObserved", (double)a.accepted);
+
+  detail = Format(
+      "leave budget forced to %u: converted %llu, REFUSED %llu on %u ticks "
+      "(edge chunks up to %u) | overrun %llu/%llu, pool refusals %llu/%llu, "
+      "ticks over budget %u/%u | twice-run %s over %u snapshot ticks, digest "
+      "at t%u %08x vs %08x over %u vs %u live parcels",
+      cap, (unsigned long long)a.accepted, (unsigned long long)a.refused,
+      a.refusingTicks, a.maxEdgeCh, (unsigned long long)a.overrun,
+      (unsigned long long)b.overrun, (unsigned long long)a.poolFull,
+      (unsigned long long)b.poolFull, a.overBudgetTicks, b.overBudgetTicks,
+      same ? "identical" : "DIVERGED", compared, probeTick, a.digest, b.digest,
+      a.live, b.live);
+  if (!forced)
+    detail += " -- the overflow was never ENTERED: nothing was refused, so "
+              "this run says nothing about how refusals are chosen";
+  if (!partial)
+    detail += " -- nothing was accepted: a share of zero refuses everything "
+              "deterministically and proves nothing about the ranking";
+  if (!clean)
+    detail += " -- the budget accounting is broken (an overrun, a pool "
+              "refusal, or a tick that converted more than its budget)";
+  if (!same)
+    detail += divergedAt
+                  ? Format(" -- twice-run DIVERGED at t%u (hash or per-tick "
+                           "leave counts): a refusal depended on scheduling",
+                           divergedAt)
+                  : " -- the parcel digest / population did not reproduce";
+
+  const bool ok = forced && partial && clean && same;
+  std::printf("gas-leave-overflow: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+
+  world.SetGasLeaveCapForTest(0);
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   return ok ? Status::Pass : Status::Fail;
@@ -1570,6 +1761,7 @@ const std::vector<Gate>& GasGates() {
   static const std::vector<Gate> g = {
       {"gas-leave", "sim", {}, false, GateGasLeave},
       {"gas-reenter", "sim", {}, false, GateGasReenter},
+      {"gas-leave-overflow", "sim", {}, false, GateGasLeaveOverflow},
       {"gas-farplume", "sim", {}, false, GateGasFarPlume},
       {"gas-farplume2", "sim", {}, false, GateGasFarPlume2},
   };

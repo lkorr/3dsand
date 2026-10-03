@@ -88,17 +88,20 @@ DESIGN.md §5 beside the code:
   population) and the dense arm is run the way `determinism`'s is, by giving
   the binary `--residency dense`.
 
-**The open rule-1 problem, and it is stated rather than closed.**
-`gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are refused
-when the per-tick list fills is decided by which workgroup arrived first — and
-a refused voxel STAYS IN THE GRID, where the world hash can see it. That is
-scheduling-dependent output. It is held off, not fixed, by sizing
-`kGasSpawnPerTick` (65,536, a quarter of the window's top face in one tick) out
-of reach so the POOL is the binding constraint instead — a dropped parcel is
-already outside the window and cannot move a voxel — and `gas-leave` asserts
-refusals == 0 so the day that is not enough is a printed number rather than a
-silent divergence. **The real fix is mark+apply**, the pattern `sim_explode`
-already uses for exactly this reason.
+**The rule-1 problem this section used to state is CLOSED (2026-10-03).**
+`gasLeave` charged a shared `atomicAdd` cursor, so WHICH voxels were refused
+when the per-tick list filled was decided by which workgroup arrived first, and
+a refused voxel stays in the grid. The pool's overflow had the same shape (and
+"a dropped parcel cannot move a voxel" was wrong: an undropped one can blow back
+in and land). The fix is not a separate mark pass over the grid — the voxel word
+has no spare bit to mark with — but a deterministic BUDGET: fixed before the CA
+(`gasLeavePrep`, pool room included), split evenly over the dirty chunks that
+touch the edge (counted by `camask`), and spent within a dispatch by a
+workgroup-local rank on a per-cell hash after the colour's cells have run
+(`gasLeaveDefer` + main's leave-resolve tail). The spawn pass places records by
+rank, not cursor. DESIGN.md "The edge's refusals are a function of the world"
+has the argument; `gas-leave-overflow` forces the overflow and checks the
+twice-run agrees tick for tick.
 
 **Revision 2 changelog.** Revision 1 moved smoke off the grid everywhere. The
 owner's requirement that gases stay full reaction participants (combine, fuse,

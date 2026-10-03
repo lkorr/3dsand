@@ -3845,13 +3845,53 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
 // reads `nearWater` and NOT `shore.onShore`, because the latter carries the
 // marsh fringe's BLUFF CUT -- off on a column standing well above the
 // waterline, which is exactly the tallest cut wall there is.
-// The CA's angle of repose in landform-gradient units: sim_step slides a
-// powder into any free down-diagonal, so the steepest pile it holds is one
-// voxel per column = 256 in the Q8 slope Land carries. Declared here and not
-// in common.wgsl: only this kernel reads it (the common.wgsl compile cliff).
+// The 1:1 angle of repose in landform-gradient units: sim_step slides a
+// powder into any free down-diagonal, so the steepest pile a 45-degree powder
+// holds is one voxel per column = 256 in the Q8 slope Land carries. It is the
+// CEILING of every material's taper end (reposeCapQ8): the step line below is
+// drawn for the 1:1 diagonal, so a STEEP powder is laid as if it were 45 --
+// conservative, since a steep tier only ever refuses a move 45 allowed.
+// Declared here and not in common.wgsl: only this kernel reads it (the
+// common.wgsl compile cliff).
 const CAP_REPOSE_Q8 : i32 = 256;
 
-fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
+// ---- EACH POWDER'S OWN REPOSE (one source: materials[].repose) -----------
+// Worldgen reads the SAME packed word the CA does, through the same
+// reposeEighthsOf (common.wgsl), so there is no second copy of any angle:
+// author `"repose": 34` on sand and the taper, the step line and the top
+// cell's grains all follow it.
+//
+// reposeCapQ8: where the landform taper ends -- T eighths per cell is T/8
+// voxels per column = T * 32 in Q8 (sand at 34 degrees: T = 6 -> 192; every
+// unauthored powder: 8 -> 256, the old constant exactly).
+fn reposeCapQ8(mat : u32) -> i32 {
+  return min(CAP_REPOSE_Q8, i32(reposeEighthsOf(materials[mat].repose)) * 32);
+}
+// reposeRunOf: the longest whole-cell RUN any grain of this material can
+// take toward a drop (sim_step.wgsl stage 2b): 3 if either tier code of the
+// word is 3:1, 2 if either is 2:1, else 1 (1:1 and the steep tiers never
+// slide). Conservative on a BLENDED word on purpose: the CA picks a grain's
+// tier by a positional hash, and laying cover against the flatter tier means
+// no grain of the mixture can find a slide, whichever tier it rolled.
+fn reposeRunOf(mat : u32) -> i32 {
+  let w = materials[mat].repose;
+  let a = (w >> MAT_REPOSE_A_SHIFT) & MAT_REPOSE_A_MASK;
+  var b = a;
+  if (((w >> MAT_REPOSE_BLEND_SHIFT) & MAT_REPOSE_BLEND_MASK) != 0u) {
+    b = (w >> MAT_REPOSE_B_SHIFT) & MAT_REPOSE_B_MASK;
+  }
+  if (a == REPOSE_3_1 || b == REPOSE_3_1) { return 3; }
+  if (a == REPOSE_2_1 || b == REPOSE_2_1) { return 2; }
+  return 1;
+}
+// Which powder a splitting cover lays loose: the sand cap's sand where the
+// biome has the cap (desert, ocean -- the cap branch of genCellIn is the one
+// that reaches the top cells), otherwise the powder skin.
+fn looseCoverMat(biome : u32) -> u32 {
+  return select(wmBiome(biome, WM_B_SKIN), M_SAND, wmFlag(biome, WM_BF_SAND_CAP));
+}
+
+fn looseCoverDepth(col : ptr<function, Col>, depth : i32, mat : u32) -> i32 {
   // Every AUTHORED discontinuity, none of which is in the noise field:
   //   nearWater -- a water body's bermed / excavated bank (see above)
   //   inRim     -- the fluid lab's slab (what the snow cap, the caves and
@@ -3864,10 +3904,11 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
   // sedSlope strips dunes that hold sand fine; one starting at 0 keeps a thin
   // loose voxel on rough near-repose faces. The start is the wedge's number
   // (one definition of "flat"); the end is not a knob, because repose is the
-  // CA's constant, not an aesthetic.
-  let flat = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
-  let span = max(CAP_REPOSE_Q8 - flat, 1);
-  return clamp((depth * (CAP_REPOSE_Q8 - (*col).slope)) / span, 0, depth);
+  // MATERIAL's authored angle (reposeCapQ8), not an aesthetic.
+  let cap = reposeCapQ8(mat);
+  let flat = min(wmTerrain(WM_H_TERRAIN_SED_SLOPE), cap);
+  let span = max(cap - flat, 1);
+  return clamp((depth * (cap - (*col).slope)) / span, 0, depth);
 }
 
 // ---- THE LOCAL STEP TEST: no loose grain above a free down-diagonal ------
@@ -3877,9 +3918,10 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
 // +-2-voxel steps the detail and grain octaves put on an otherwise gentle dune
 // face, and on every such step one loose voxel would slide on tick 1.
 //
-// This test is exact. sim_step moves a powder that authors no `repose` (sand
-// is 1:1) straight down or into one of the FOUR AXIS down-diagonals, nothing
-// else. A loose cell at y therefore rests iff every axis neighbour's cell at
+// This test is exact. sim_step moves a 1:1 powder (and the 1:1 grains of a
+// blended one) straight down or into one of the FOUR AXIS down-diagonals,
+// nothing else; a FLOWY grain's extra lateral slide is looseStep's second
+// rule, below. A loose cell at y therefore rests iff every axis neighbour's cell at
 // y-1 is ground, i.e. iff  y <= min(axis neighbour ground) + 1.  Cells above
 // that line go to the firm cover, exactly what the taper hands its steep
 // ground; the loose depth below the line is untouched. Corners do not matter
@@ -3893,32 +3935,63 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
 // left loose depth. genColumn is also the far entries' per-column call, where
 // sand vs sandstone is one far palette slot and four more ground evaluations
 // per sample would be pure cost.
-fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> i32 {
-  return looseStep(col, x, z, seed).x;
+fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32) -> i32 {
+  return looseStep(col, x, z, seed, mat, true).x;
 }
 
 // ---- THE TOP CELL'S GRAINS (docs/PLAN_powder_mass.md P5) -----------------
 //
 // With sim.powderFineRepose a resting powder is judged on column-top heights
 // in EIGHTHS (sim_step.wgsl tryFineRepose): a surface cell sheds when a
-// neighbour column's top is more than T eighths lower, and T is 8 for every
-// powder worldgen lays as loose cover. A loose top cell already satisfies the
-// step line above (every axis neighbour's ground is at least h - 1), so the
-// only pairs that could move are an UPPER column one cell above a LOWER one,
-// and they hold iff  upper's mass <= lower's mass.  So the mass is read off
-// the local step shape, never off a noise that knows nothing of its
+// neighbour column's top is more than T eighths lower (T = reposeEighthsOf,
+// 8 for a 45-degree powder). A loose top cell already satisfies the step
+// line above (every axis neighbour's ground is at least h - 1), so the only
+// pairs that could move are an UPPER column one cell above a LOWER one:
+// D = 8 + upper's mass - lower's mass, at rest iff D <= T. So the mass is
+// read off the local step shape, never off a noise that knows nothing of its
 // neighbours:
 //
 //   a lower neighbour and no higher one (the LIP of a step)   4/8
-//   both (a column in the middle of a staircase)              6/8
+//   both (a column in the middle of a staircase)              6/8   (T >= 8)
 //   a higher neighbour only (the FOOT), or flat               whole
 //
-// Every upper/lower pair then has upper in {4, 6} and lower in {6, 8}: at rest
-// by construction, and a 45-degree staircase of whole voxels becomes one of
-// half-voxel steps (the renderer leans a 6/8 cell's top grains uphill).
+// T >= 8: every upper/lower pair has upper in {4, 6} and lower in {6, 8}, so
+// D <= 8: at rest by construction, and a 45-degree staircase of whole voxels
+// becomes one of half-voxel steps (the renderer leans a 6/8 cell's top grains
+// uphill).
+//
+// T < 8 (a powder authored flatter than 45; sand at 34 is T = 6): a
+// MID-staircase pair would need upper <= lower - (8 - T) all the way down,
+// which no fixed mass can give a staircase of any length -- correctly: a run
+// of one-voxel steps IS steeper than the material holds. So a mid column's
+// top cell goes to the firm cover (looseTop = h - 1), and every pair left is
+// lip over foot or lip over a firm-topped mid, D = 4: at rest for T >= 4.
+// The lip also has to hold against the WHOLE flat cell beside it at its own
+// level (D = 8 - 4), T >= 4 again; below that (a pure 3:1 powder) no lip is
+// at rest and it is firm too.
+//
+// ---- AND THE SLIDE: a FLOWY tier (2:1, 3:1) looks further than one column.
+// sim_step.wgsl stage 2b moves a grain that could not descend one lateral
+// cell toward a drop seen `run` cells out: lateral (d, 0) open AND the
+// snapshot open at (k*d, -1) for k = 2 (and 3 for 3:1). Ground at (k*d, -1)
+// blocks it, so a loose cell at y holds iff, per axis direction d, the
+// neighbour's ground reaches y (lateral filled) or every column 2..run out
+// reaches y - 1. The step line already makes the first neighbour reach y - 1,
+// so this can only lower looseTop by one more cell -- and one cell lower,
+// every lateral is filled. The far columns are read only where the first
+// neighbour is exactly one down (the lateral open), i.e. on real steps.
+//
+// Every T >= 8, run == 1 material (all of them before sand/gravel/dirt were
+// authored) takes exactly the old path, bit for bit.
+//
+// `fine` is false for a SUBMERGED pond bed: tryFineRepose only sheds toward
+// AIR or a partial of its own powder, so under water the sub-voxel rule never
+// fires and only the step line and the slide apply.
+//
 // Returns (looseTop, mass); the four heights are the ones looseRestTop always
 // read, so the mass costs nothing extra.
-fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> vec2<i32> {
+fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
+             fine : bool) -> vec2<i32> {
   let h = (*col).h;
   let a = colHeightAt(x + 1, z, seed);
   let b = colHeightAt(x - 1, z, seed);
@@ -3926,11 +3999,39 @@ fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> vec2<i32
   let d = colHeightAt(x, z - 1, seed);
   let lo = min(min(a, b), min(c, d));
   let hi = max(max(a, b), max(c, d));
-  var mass = 8;
-  if (TUNE_POWDER_FINE_REPOSE != 0u && lo < h) {
-    mass = select(4, 6, hi > h);
+  var top = min(h, lo + 1);
+  let run = reposeRunOf(mat);
+  if (run >= 2) {
+    // A lateral (d, 0) at `top` is open only where that neighbour is exactly
+    // top - 1 (the step line forbids lower). Look past it.
+    var slides = false;
+    for (var i = 0; i < 4; i++) {
+      var dx = 0;
+      var dz = 0;
+      var g1 = a;
+      switch (i) {
+        case 0: { dx = 1; g1 = a; }
+        case 1: { dx = -1; g1 = b; }
+        case 2: { dz = 1; g1 = c; }
+        default: { dz = -1; g1 = d; }
+      }
+      if (g1 >= top) { continue; }
+      for (var k = 2; k <= run; k++) {
+        if (colHeightAt(x + k * dx, z + k * dz, seed) < top - 1) { slides = true; }
+      }
+    }
+    if (slides) { top = top - 1; }
   }
-  return vec2<i32>(min(h, lo + 1), mass);
+  var mass = 8;
+  if (TUNE_POWDER_FINE_REPOSE != 0u && fine && lo < h) {
+    let t = i32(reposeEighthsOf(materials[mat].repose));
+    if (t >= 8) {
+      mass = select(4, 6, hi > h);
+    } else if (top == h) {
+      if (hi > h || t < 4) { top = h - 1; } else { mass = 4; }
+    }
+  }
+  return vec2<i32>(top, mass);
 }
 
 // Does this column's cover get the loose/firm split at all? The same two opt-ins
@@ -4233,6 +4334,18 @@ fn coverRowPick(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   return cp;
 }
 
+// The bed a submerged column lays when its face can hold a powder: the
+// preset's bed.shallow (sand) where the water over it is shallower than
+// bed.shallowDepth, bed.deep (mud) below that; a preset naming none falls
+// back to sand. genCellIn's bed branch and `cols`' bed step line read this
+// one function, so they cannot disagree about which powder they judge.
+fn pondBedMat(col : ptr<function, Col>) -> u32 {
+  let wp = (*col).wp;
+  let bed = select(wmWater(wp, WM_W_BED_DEEP), wmWater(wp, WM_W_BED_SHALLOW),
+                   (*col).pond - (*col).h < wmWaterI(wp, WM_W_BED_SHALLOW_DEPTH));
+  return select(bed, M_SAND, bed == 0u);
+}
+
 // `canopyMemo` is the column's canopy cover when the caller computed it,
 // -1 to have the cover block scan on demand.
 fn genCellIn(col : ptr<function, Col>,
@@ -4273,10 +4386,14 @@ fn genCellIn(col : ptr<function, Col>,
       // face is steeper than a powder can hold (landColumnBare's bowlSteep),
       // so a steep tarn wall is stone with a sand bed only where it flattens.
       // A preset naming no material falls back to sand.
-      var bed = select(wmWater(wp, WM_W_BED_DEEP), wmWater(wp, WM_W_BED_SHALLOW),
-                       pond - h < wmWaterI(wp, WM_W_BED_SHALLOW_DEPTH));
-      if (bedSolid) { bed = wmWater(wp, WM_W_BED_SUBSTRATE); }
-      mat = select(bed, select(M_SAND, M_STONE, bedSolid), bed == 0u);
+      //
+      // And never above the local step line (looseTop, which `cols` lowers
+      // only for a FLOWY powder bed; h everywhere else): a bed cell that a
+      // 2:1 grain would slide off is the substrate too.
+      let firm = bedSolid || y > (*col).looseTop;
+      var bed = pondBedMat(col);
+      if (firm) { bed = wmWater(wp, WM_W_BED_SUBSTRATE); }
+      mat = select(bed, M_STONE, bed == 0u);
     } else if (wmFlag(biome, WM_BF_SAND_CAP) && y > h - 4) {
       // The loose cap, but only as deep as this column's ground can HOLD loose
       // matter (looseCoverDepth above). Flat desert: loose == 4 and every cell
@@ -4286,7 +4403,7 @@ fn genCellIn(col : ptr<function, Col>,
       // yet. In between the two split at the ramp.
       // And never above the local step line (looseRestTop): a cell with a
       // free down-diagonal is firm whatever the gradient said.
-      let loose = looseCoverDepth(col, 4);
+      let loose = looseCoverDepth(col, 4, M_SAND);
       mat = select(coverFirmMat(biome), M_SAND,
                    y > h - loose && y <= (*col).looseTop);
     } else if (shore.onShore && shore.past < wmWaterI(wp, WM_W_MUD_WIDTH) &&
@@ -4315,7 +4432,7 @@ fn genCellIn(col : ptr<function, Col>,
       // gate) for a settle transient tundra accepts.
       let skin = wmBiome(biome, WM_B_SKIN);
       let depth = i32(wmBiome(biome, WM_B_SKIN_DEPTH));
-      let loose = select(depth, looseCoverDepth(col, depth),
+      let loose = select(depth, looseCoverDepth(col, depth, skin),
                          skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
                          wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR);
       // looseTop is `h` for every column genChunk did not tighten, which
@@ -5412,11 +5529,34 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     // anything the prologue computes.
     let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
     var topMass = 8;
+    // ONE looseStep call site for both users (the cover and the bed): every
+    // colHeightAt it makes is inlined, so a second site doubled this entry's
+    // binary for nothing.
+    var lsMat = MAT_AIR;
+    var lsFine = true;
     if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
-        looseCoverDepth(&col, coverDepth) > 0) {
-      let ls = looseStep(&col, x, z, T.seed);
+        looseCoverDepth(&col, coverDepth, looseCoverMat(col.biome)) > 0) {
+      lsMat = looseCoverMat(col.biome);
+    } else if (col.pond >= 0 && !col.bedSolid && !col.inPoolFloor && yLo <= col.h &&
+               yHi + 1 > col.h - wmWaterI(col.wp, WM_W_BED_THICKNESS)) {
+      // THE SAME LINE FOR A FLOWY POND BED (pondBedMat). Under water a 2:1
+      // grain still slides -- the lateral is water, which it sinks into, and
+      // the snapshot reads water as open -- so a bowl face bowlSteep passed
+      // at one voxel per ring creeps unless every bed cell holds against a
+      // drop two out. Only for a bed powder that HAS a flowy tier, so every
+      // 45-degree bed (and bowlSteep's ring test, KNOWN GAP and all) is
+      // exactly as before. The mass is not used: a submerged top cell is
+      // never written partial (genChunk writes grains only under AIR).
+      let bm = pondBedMat(&col);
+      if (materials[bm].klass == CLASS_POWDER && reposeRunOf(bm) >= 2) {
+        lsMat = bm;
+        lsFine = false;
+      }
+    }
+    if (lsMat != MAT_AIR) {
+      let ls = looseStep(&col, x, z, T.seed, lsMat, lsFine);
       col.looseTop = ls.x;
-      topMass = ls.y;
+      if (lsFine) { topMass = ls.y; }
     }
     // THE TOP CELL'S GRAINS are written only under generated AIR (genChunk),
     // so the chunk holding the ground cell h also asks genCellIn about
@@ -5553,8 +5693,11 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 // (mat << 12) | cellIndexInLevelChunk. Read by the `farpatch` entry below.
 @group(1) @binding(5) var<storage, read> farPatch : array<u32>;
 // fardown's skip (world.h farSig): the far-visible matter signature each slot
-// had the last time it was downsampled.
+// had the last time it was downsampled. Bit 0 is FAR_SIG_RAN, not signature:
+// "fardown rewrote this slot in this tick's dispatch", read by its follow-up
+// entries (fardownClaim / fardownStalk / fardownFeat) to skip what it skipped.
 @group(1) @binding(6) var<storage, read_write> farSig : array<u32>;
+const FAR_SIG_RAN : u32 = 1u;
 // THE FAR SURFACE MAP (world.h kFarMap*, common.wgsl farMapWord). `farmap`
 // below fills it; `farpatch` and `fardown` only ever CLEAR its valid bit.
 // Atomic for fardown's sake: neighbouring dirty chunks clear bits in entries
@@ -6314,10 +6457,15 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
     // The world chunk coord stays in: a slot is REUSED by another chunk after a
     // window shift, and the same content in a different place writes
     // different cells.
-    var sig = pcg(hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount));
-    sig = max(sig, 1u);   // 0 is "never downsampled" (zeroed buffer)
-    let same = farSig[slot] == sig;
-    farSig[slot] = sig;
+    // Bit 0 is NOT signature: it is FAR_SIG_RAN, "this slot was downsampled
+    // in this tick's dispatch", which the two follow-up entries (fardownClaim,
+    // fardownFeat; see their header) read to skip exactly the chunks this one
+    // skipped. Bit 1 is forced so a signature is never 0 ("never downsampled",
+    // the zeroed buffer FarField's sigClear writes).
+    let sig = (pcg(hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount)) | 2u) &
+              ~FAR_SIG_RAN;
+    let same = (farSig[slot] & ~FAR_SIG_RAN) == sig;
+    farSig[slot] = sig | select(FAR_SIG_RAN, 0u, same);
     atomicStore(&wgFarCount, select(0u, 1u, same));
   }
   if (workgroupUniformLoad(&wgFarCount) != 0u) { return; }
@@ -6408,6 +6556,50 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
   }
+}
+
+// ---- THE DOWNSAMPLE'S TWO FOLLOW-UP CHECKS ARE THEIR OWN DISPATCHES ----------
+// (cross-vendor audit #9, 2026-10-03)
+//
+// The claim check (fardownClaim) and the feature check (fardownFeat) used to
+// run at the tail of `fardown`, in the same dispatch as the downsample, and
+// both crossed workgroups:
+//   * the claim check's STALK CLEAR loads a farVox byte and clears it if it
+//     still holds the cut stalk's slot -- run by the workgroup of the chunk
+//     holding the stalk's map column, which need not be the chunk that owns
+//     the byte. The owner's downsample rewrites the byte as two atomics (and,
+//     then or). Load before the and: cleared; between: sees 0, no clear;
+//     after the or: cleared or not by what the downsample wrote. The stalk
+//     survived or went by scheduling.
+//   * the feature check reads the map entry's VALID bit, which another
+//     chunk's claim check may be clearing in the same dispatch (the claim band
+//     and the feature's base voxel can lie in two chunks of one column), and
+//     the claim check reads the feature word, which another chunk's feature
+//     check may be zeroing -- so whether a stalk is treated as a stalk at all
+//     was a race too.
+// farVox is render data, but it is not ONLY render data: particles outside
+// residency collide with it (sim_particle farBlocked), so a byte that differs
+// is a landing that differs.
+//
+// Split into three dispatches over the same list, recorded back to back (the
+// pass table's barriers order them): downsample, then claims, then features.
+// Each phase reads only what earlier phases finished writing, and inside a
+// phase every write is idempotent and conditioned only on state no other
+// workgroup of that phase writes (the stalk clear's byte test reads a byte
+// that, mid-phase, is either the stalk's slot or already the `keep` value the
+// clear would write; a feature word is only ever zeroed). Same work, same
+// writes; only the interleaving is gone. The follow-ups skip a chunk the
+// downsample skipped by reading FAR_SIG_RAN, the flag `fardown` leaves in
+// bit 0 of the slot's signature.
+fn farDownRan(slot : u32) -> bool { return (farSig[slot] & FAR_SIG_RAN) != 0u; }
+
+@compute @workgroup_size(64)
+fn fardownClaim(@builtin(workgroup_id) wg : vec3<u32>,
+                @builtin(local_invocation_index) li : u32) {
+  let slot = farDirty[wg.x];
+  if (!farDownRan(slot)) { return; }
+  let wc = slotWorldChunk(slot, T.origin);
+  let base = wc * i32(CHUNK);
 
   // ---- THE SURFACE MAP'S CLAIM, CHECKED AGAINST THE LIVE GRID (package A) ----
   //
@@ -6470,7 +6662,10 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       // top, so that is the column checked (the sample column of a level-2
       // sub-column need not be it). If the claim fails, the cells the fill
       // marked with the stalk's slot go too, or a cut stalk would stand on at
-      // distance as a column of cells (the ghost this check exists to stop).
+      // distance as a column of cells (the ghost this check exists to stop) --
+      // in the NEXT dispatch, fardownStalk, which sees every claim this one
+      // settled. The feature word read here is only ever zeroed by
+      // fardownFeat, two dispatches later, so it is stable in this one.
       let fw = select(0u, atomicLoad(&farMap[FAR_FEAT_BASE + me]), level <= FAR_FEAT_LEVELS);
       let isStalk = (fw & FAR_FEAT_SOLID) != 0u && ((fw >> 8u) & 15u) != 0u;
       var qx = fx;
@@ -6490,33 +6685,126 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         let reskinned = solid && y == hTop && !isStalk && shift < 5u &&
                         matFarPal(&materials, wm) != ((e >> 16u) & 0x7Fu);
         if (solid != (y <= hTop) || reskinned) {
+          // The only write of this dispatch, and it commutes: a second chunk
+          // of the same column that read VALID before this cleared it reaches
+          // the same verdict or none, and clears the same bit.
           atomicAnd(&farMap[me], ~FAR_MAP_VALID);
-          if (isStalk) {
-            let body = (fw >> 16u) & 0x7Fu;
-            let head = (fw >> 23u) & 0x7Fu;
-            let c = m >> vec2<u32>(1u);
-            let sBase = hTop - i32((fw >> 8u) & 15u) + 1;
-            for (var cy = sBase >> shift; cy <= hTop >> shift; cy++) {
-              let cc = vec3<i32>(c.x, cy, c.y);
-              if (!farInBox(cc, origin)) { continue; }
-              let bi = farVoxByteIndex(level, cc);
-              let bsh = (bi & 3u) * 8u;
-              let sl = farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu);
-              if (sl != 0u && (sl == body || sl == head)) {
-                // Back to what the fill would have left: the blocker on the
-                // cell that holds the ground under the stalk (its floor at or
-                // below sBase - 1), air above it.
-                let keep = select(0u, FAR_PAL_BLOCKER, (cy << shift) <= sBase - 1);
-                atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
-                atomicOr(&farVox[bi >> 2u], keep << bsh);
-              }
-            }
-          }
           break;
         }
       }
     }
   }
+}
+
+// ---- A CUT STALK'S CELLS (package F; its own dispatch since audit #9) -------
+// A stalk sub-column whose claim no longer holds (VALID clear -- this tick's
+// fardownClaim, or a `farpatch`) still has its feature word until fardownFeat
+// zeroes it, one dispatch from now; this is the window in which the cells the
+// fill MARKED with a stalk slot are put back. Every chunk of the dirty list
+// whose x/z footprint holds the sub-column's sample column visits it, so a
+// cut stalk is cleared on the tick its claim fails, as before.
+//
+// ONE VERDICT PER CELL, whoever computes it. Three things made the old clear
+// (inline in the claim check) depend on scheduling, and each is gone:
+//   * WHICH stalk's slot a shared cell holds: the fill marks a level cell's
+//     cells by compare-exchange among its sub-columns' stalks, first wins. So
+//     a cell is "a stalk cell" here if it holds the body or head slot of ANY
+//     stalk of its level cell, and it is kept while ANY of those stalks still
+//     stands (VALID, final since fardownClaim finished) and passes through it.
+//   * the KEEP value: it was the blocker iff the cell's floor is at or under
+//     THIS stalk's ground, so two cut stalks of one cell with different
+//     ground could each write their own. Now it is the cell's: the blocker iff
+//     the floor is at or under the HIGHEST ground of its four sub-columns
+//     (the map top, less the stalk for a stalk sub-column) -- the
+//     conservative rule the fill's blocker flag already follows.
+//   * the interleaving: every writer of a cell writes that same value with the
+//     same and+or, so any interleaving ends on it, and a writer that reads it
+//     back (slot 0) does nothing.
+// Inputs, all fixed for the whole dispatch: farMap tops and VALID bits, the
+// feature words, and the farVox bytes as `fardown` left them.
+fn farSubGround(e : u32, fw : u32) -> i32 {
+  let isStalk = (fw & FAR_FEAT_SOLID) != 0u && ((fw >> 8u) & 15u) != 0u;
+  return farMapTop(e) - select(0, i32((fw >> 8u) & 15u), isStalk);
+}
+
+@compute @workgroup_size(64)
+fn fardownStalk(@builtin(workgroup_id) wg : vec3<u32>,
+                @builtin(local_invocation_index) li : u32) {
+  let slot = farDirty[wg.x];
+  if (!farDownRan(slot)) { return; }
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
+  for (var level = 1u; level <= FAR_FEAT_LEVELS; level++) {
+    let shift = farCellShift(level);
+    let wsh = shift - 1u;
+    let w = 1 << wsh;
+    let hw = w >> 1;
+    let fx0 = farFirstCenter(base.x, w, hw);
+    let fz0 = farFirstCenter(base.z, w, hw);
+    let nx = farCenterCount(base.x, fx0, w);
+    let nz = farCenterCount(base.z, fz0, w);
+    let origin = F.origins[level - 1u].xyz;
+    let cols = u32(max(nx * nz, 0));
+    for (var ci = li; ci < cols; ci += 64u) {
+      let fx = fx0 + (i32(ci) % nx) * w;
+      let fz = fz0 + (i32(ci) / nx) * w;
+      let m = vec2<i32>(fx >> wsh, fz >> wsh);
+      let c = m >> vec2<u32>(1u);
+      let d = c - origin.xz * i32(CHUNK);
+      if (any(d < vec2<i32>(0)) || any(d >= vec2<i32>(i32(FAR_N)))) { continue; }
+      let mw = farMapCell(level, c) * 4u;
+      let me = mw + u32(m.y & 1) * 2u + u32(m.x & 1);
+      let e = atomicLoad(&farMap[me]);
+      if ((e & FAR_MAP_VALID) != 0u) { continue; }       // the claim holds
+      let fw = atomicLoad(&farMap[FAR_FEAT_BASE + me]);
+      if ((fw & FAR_FEAT_SOLID) == 0u || ((fw >> 8u) & 15u) == 0u) { continue; }
+      // The level cell's four sub-columns: their ground, and which of their
+      // stalks still stand.
+      var eq : array<u32, 4>;
+      var fq : array<u32, 4>;
+      var maxGround = -2147483647;
+      for (var q = 0u; q < 4u; q++) {
+        eq[q] = atomicLoad(&farMap[mw + q]);
+        fq[q] = atomicLoad(&farMap[FAR_FEAT_BASE + mw + q]);
+        maxGround = max(maxGround, farSubGround(eq[q], fq[q]));
+      }
+      let hTop = farMapTop(e);
+      let sBase = hTop - i32((fw >> 8u) & 15u) + 1;
+      for (var cy = sBase >> shift; cy <= hTop >> shift; cy++) {
+        let cc = vec3<i32>(c.x, cy, c.y);
+        if (!farInBox(cc, origin)) { continue; }
+        let bi = farVoxByteIndex(level, cc);
+        let bsh = (bi & 3u) * 8u;
+        let sl = farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu);
+        if (sl == 0u) { continue; }
+        var marked = false;
+        var standing = false;
+        for (var q = 0u; q < 4u; q++) {
+          let f = fq[q];
+          if ((f & FAR_FEAT_SOLID) == 0u || ((f >> 8u) & 15u) == 0u) { continue; }
+          if (sl == ((f >> 16u) & 0x7Fu) || sl == ((f >> 23u) & 0x7Fu)) { marked = true; }
+          if ((eq[q] & FAR_MAP_VALID) != 0u) {
+            let qTop = farMapTop(eq[q]);
+            let qBase = qTop - i32((f >> 8u) & 15u) + 1;
+            if (cy >= (qBase >> shift) && cy <= (qTop >> shift)) { standing = true; }
+          }
+        }
+        if (!marked || standing) { continue; }
+        let keep = select(0u, FAR_PAL_BLOCKER, (cy << shift) <= maxGround);
+        atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+        atomicOr(&farVox[bi >> 2u], keep << bsh);
+      }
+    }
+  }
+}
+
+// ---- THE FEATURES (package F; their own dispatch since audit #9) ----------
+// After fardownStalk, which reads the feature words this zeroes.
+@compute @workgroup_size(64)
+fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
+               @builtin(local_invocation_index) li : u32) {
+  let slot = farDirty[wg.x];
+  if (!farDownRan(slot)) { return; }
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
 
   // ---- THE FEATURES, CHECKED AGAINST THE LIVE GRID (package F) -------------
   // A feature (FAR_FEAT_*) is drawn from the map alone, so the live grid has

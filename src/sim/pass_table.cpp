@@ -26,6 +26,8 @@ static_assert(kRainFallGroupsFlat == 64, "RecordCtx::rainFallGroups' default");
 // occupancy word, 64 per group, and a group never straddles two levels.
 static_assert((kFarNumChunks % 64u) == 0u, "skyTopReduce groups straddle levels");
 constexpr uint32_t kSkyTopGroups = kFarLevels * kFarNumChunks / 64;
+// godray_vis.wgsl: one thread per block of its GV_NX x GV_NY x GV_NZ volume.
+constexpr uint32_t kGodVisGroups = (pass::kGodVisBlocks + 63) / 64;
 }  // namespace
 
 namespace pass {
@@ -77,6 +79,9 @@ namespace {
 #define PIPE_FAR_PATCH_FILL  Pipe::FarPatchFill
 #define PIPE_FAR_MAP_FILL    Pipe::FarMapFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
+#define PIPE_FAR_DOWN_CLAIM  Pipe::FarDownClaim
+#define PIPE_FAR_DOWN_STALK  Pipe::FarDownStalk
+#define PIPE_FAR_DOWN_FEAT   Pipe::FarDownFeat
 #define PIPE_OPENNESS_DIRTY   Pipe::OpennessDirty
 #define PIPE_OPENNESS_REFRESH Pipe::OpennessRefresh
 #define PIPE_GLOW_SRC         Pipe::GlowSrc
@@ -95,6 +100,7 @@ namespace {
 #define PIPE_RAY_START_MIN   Pipe::RayStartMin
 #define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
 #define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
+#define PIPE_GODRAY_VIS      Pipe::GodrayVis
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
@@ -138,6 +144,7 @@ namespace {
 #define PIPE_GAS_INTEGRATE   Pipe::GasIntegrate
 #define PIPE_GAS_ARGS2       Pipe::GasArgs2
 #define PIPE_GAS_RESOLVE     Pipe::GasResolve
+#define PIPE_GAS_LEAVE_PREP  Pipe::GasLeavePrep
 #define PIPE_GAS_FARPLUME    Pipe::GasFarPlume
 #define PIPE_GAS_FARPLUMEW   Pipe::GasFarPlumeWide
 #define PIPE_SOL_WANT        Pipe::SolWant

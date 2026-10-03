@@ -113,6 +113,7 @@ PIPE_TO_MEMBER = {
     "PIPE_GAS_INTEGRATE": "gIntegrate_",
     "PIPE_GAS_ARGS2": "gArgs2_",
     "PIPE_GAS_RESOLVE": "gResolve_",
+    "PIPE_GAS_LEAVE_PREP": "gLeavePrep_",
     "PIPE_GAS_FARPLUME": "gFarPlume_",
     "PIPE_GAS_FARPLUMEW": "gFarPlumeW_",
     "PIPE_FAR_FILL": "farFill_",
@@ -121,6 +122,10 @@ PIPE_TO_MEMBER = {
     # The far SURFACE MAP fill (LOD-seam package A): worldgen.wgsl `farmap`.
     "PIPE_FAR_MAP_FILL": "farMapFill_",
     "PIPE_FAR_DOWN": "farDown_",
+    # fardown's follow-up phases (cross-vendor audit #9).
+    "PIPE_FAR_DOWN_CLAIM": "farDownClaim_",
+    "PIPE_FAR_DOWN_STALK": "farDownStalk_",
+    "PIPE_FAR_DOWN_FEAT": "farDownFeat_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
     "PIPE_GLOW_SRC": "glowSrc_",
@@ -140,6 +145,7 @@ PIPE_TO_MEMBER = {
     "PIPE_RAY_START_MIN": "rayStartMin_",
     "PIPE_RAIN_MAP_PREP": "rainMapPrep_",
     "PIPE_RAIN_MAP_BUILD": "rainMapBuild_",
+    "PIPE_GODRAY_VIS": "godrayVis_",
     "PIPE_RAIN_EXPO": "rainExpo_",
     "PIPE_WIND_STREAK": "windStreak_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
@@ -241,6 +247,7 @@ BUF_TO_WGSL = {
     "ShadowHist": {"shadowHist"},
     "RayStart": {"rayStart"},
     "RainMap": {"rainMap"},
+    "GodVis": {"godVis"},
     "RainExpo": {"rainExpo"},
     # Wind drafts. DraftArgs is indirect-only and never bound, like SolArgs.
     "Draft": {"draftField"},

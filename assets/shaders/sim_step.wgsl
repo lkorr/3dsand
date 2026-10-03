@@ -85,19 +85,55 @@ const PT_KERNEL : u32 = PT_K_STEP;
 const GAS_SP_COUNT    : u32 = 0u;  // gasLeave append cursor (may exceed the cap)
 const GAS_SP_REFUSED  : u32 = 1u;  // gasLeave refused: the per-tick list was full
 const GAS_SP_EDGE     : u32 = 2u;  // gas voxels whose intent pointed out of the window
+// Words 9..11: the DETERMINISTIC LEAVE BUDGET (2026-10-03, see THE EDGE'S
+// BUDGET below). 9 is written by sim_gas's gasLeavePrep before the CA, 10 by
+// camask on substep 0, 11 only on a broken invariant.
+const GAS_SP_BUDGET   : u32 = 9u;  // conversions this tick may make, whole window
+const GAS_SP_EDGECH   : u32 = 10u; // dirty chunks touching the residency edge
+const GAS_SP_OVERRUN  : u32 = 11u; // an accepted conversion found the list full: a BUG
 const GAS_SP_HDR      : u32 = 16u; // first record word (words 8..15: sim_gas)
 const GAS_SP_STRIDE   : u32 = 8u;  // u32 per record (a 32-byte Particle)
-// kGasSpawnPerTick (src/sim/world.h). The BUDGET on edge conversions, charged
-// before the write: a refused conversion leaves the voxel exactly where it was
-// and it takes today's lateral ladder, so the edge is a rate-limited sink and
-// never a hole that loses mass.
-//
-// AND IT IS SIZED TO BE UNREACHABLE, which is a rule-1 requirement and not a
-// throughput one — the long note beside kGasSpawnPerTick in world.h has it:
-// the cursor below is a shared atomicAdd, so WHICH voxels lose when it fills
-// is scheduling-dependent, and a loser stays in the grid where the world hash
-// can see it. `gas-leave` asserts the refusal count is zero.
+// kGasSpawnPerTick (src/sim/world.h). The size of the record list and the
+// ceiling on GAS_SP_BUDGET. A refused conversion leaves the voxel exactly
+// where it was and it takes the lateral ladder, so the edge is a rate-limited
+// sink and never a hole that loses mass.
 const GAS_SPAWN_CAP   : u32 = 65536u;
+// The per-chunk budget words (world.h kGasSpChunkBase): one u32 per SLOT
+// behind the record list. Bit 31 = "this chunk was counted into GAS_SP_EDGECH
+// this tick" (camask, substep 0), bits 0..30 = conversions it has made so far
+// this tick. Initialised by camask for every chunk on the dirty list, and read
+// only for chunks on that same list, so it needs no clear.
+const GAS_SP_CHUNK0   : u32 = 524304u; // GAS_SP_HDR + GAS_SPAWN_CAP * GAS_SP_STRIDE
+const GAS_LV_COUNTED  : u32 = 0x80000000u;
+
+// ---- THE EDGE'S BUDGET, AND WHY IT IS NOT A CURSOR (2026-10-03) -----------
+// Until this date a conversion charged a shared atomicAdd cursor against
+// GAS_SPAWN_CAP, so WHICH voxels were refused when the list filled was decided
+// by which workgroup got there first -- and a refused voxel stays in the grid,
+// where the world hash sees it. A rule-1 hole, held off by sizing the cap out
+// of reach. It is closed now by making every refusal a pure function of the
+// world:
+//
+//  1. THE TICK'S BUDGET is fixed before the CA (sim_gas gasLeavePrep): the
+//     record list's cap, less what the parcel POOL cannot take (live parcels +
+//     this tick's CPU spawns), so gasSpawnStep can never refuse one either.
+//  2. IT IS SPLIT EVENLY across the dirty chunks that touch the residency edge
+//     (camask counts them on substep 0 -- a count is order-free). A chunk's
+//     share is budget / edgeChunks, so the shares can never sum past the cap.
+//  3. WITHIN A CHUNK, across the 54 dispatches, the share is spent in dispatch
+//     order (the per-chunk word); within ONE dispatch a chunk belongs to ONE
+//     workgroup, which collects its leavers (gasLeaveDefer), and if there are
+//     more than its share left it accepts the lowest-ranked by a per-cell hash
+//     -- a total order on the cells, not on the threads.
+//
+// The deferral is free of consequence: a leaver has done nothing yet when it
+// defers (its primary tryMove failed out of window, which writes nothing),
+// and what it does after the workgroup barrier -- convert, or take the rest
+// of the ladder -- reads and writes only within reach 1, which no other
+// thread of this colour can touch. So the only thing that moved is WHEN in
+// the dispatch the cell finishes, never what it does.
+const GAS_LV_MAX      : u32 = 304u;   // CA_PACK_MAX * 152 boundary sites of one colour
+const GAS_LV_SALT     : u32 = 0x6A5C11F7u;
 // The outer density box's shape. MIRRORED FROM world.h's kGasOuterN /
 // kGasOuterShift, not imported through common.wgsl: a constant only a few
 // shaders read is declared in each of them, because a common.wgsl edit misses
@@ -418,7 +454,8 @@ fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 // that found no page this tick asks for one (SOLM_REQ_FLAG) and keeps only its
 // OWN chunk awake to take it next tick.
 const DIRTY_OWN_CHUNK_ONLY : u32 =
-    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE;
+    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE |
+    DIRTY_R_DRY;
 
 fn markDirtyR(c : vec3<i32>, reason : u32) {
   if ((reason & ~DIRTY_OWN_CHUNK_ONLY) == 0u) {
@@ -638,7 +675,7 @@ const DIRTY_M_GASEDGE   : u32 = 33554432u;  // gas wanted out of the window
 // itself through some other chunk's genuine work.
 const FILM_LICENCE : u32 =
     DIRTY_R_WRITE | DIRTY_R_SEAM | DIRTY_R_PARTICLE | DIRTY_R_WATERBODY |
-    DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_REACTW |
+    DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_DRYW | DIRTY_R_REACTW |
     DIRTY_M_DOWN | DIRTY_M_DIAG | DIRTY_M_EQUAL | DIRTY_M_SPLIT |
     DIRTY_M_BRIDGE | DIRTY_M_POWDER | DIRTY_M_GAS |
     DIRTY_M_SOLO;
@@ -1202,32 +1239,15 @@ fn tryPowderOnto(src : vec3<i32>, dst : vec3<i32>, myWord : u32, m : Material) -
 // reach-1 diagonal) -- the same boxes the diagonal move uses. All reads are
 // reach 1 and live, so no snapshot is needed.
 //
-// WORLDGEN IS A FIXED POINT OF THIS (worldgen.wgsl looseStepMass): generated
-// loose tops are 4/8 on an upper step edge, 6/8 on a staircase, whole on flats
-// and feet, so every upper/lower pair of columns has D <= 8 and a generated
-// dune does not move on tick 1.
-fn reposeTierEighths(code : u32) -> u32 {
-  switch (code) {
-    case REPOSE_3_1: { return 3u; }
-    case REPOSE_2_1: { return 4u; }
-    case REPOSE_1_2: { return 16u; }
-    case REPOSE_1_3: { return 24u; }
-    default: { return 8u; }
-  }
-}
-// The material's threshold, eighths of rise per cell. A BLENDED word mixes its
-// two tiers by the blend weight -- here as one per-MATERIAL number, never the
-// per-grain positional roll the whole-cell tiers use: two neighbouring columns
-// must agree on T or a surface could be at rest from one side and not the
-// other.
-fn reposeEighths(m : Material) -> u32 {
-  let a = (m.repose >> MAT_REPOSE_A_SHIFT) & MAT_REPOSE_A_MASK;
-  let blend = (m.repose >> MAT_REPOSE_BLEND_SHIFT) & MAT_REPOSE_BLEND_MASK;
-  let ta = reposeTierEighths(a);
-  if (blend == 0u) { return ta; }
-  let tb = reposeTierEighths((m.repose >> MAT_REPOSE_B_SHIFT) & MAT_REPOSE_B_MASK);
-  return (ta * (255u - blend) + tb * blend + 127u) / 255u;
-}
+// WORLDGEN IS A FIXED POINT OF THIS (worldgen.wgsl looseStep, same T):
+// generated loose tops are 4/8 on an upper step edge, 6/8 on a staircase
+// (T >= 8; for T < 8 a staircase top is the firm cover), whole on flats and
+// feet, so every upper/lower pair of columns has D <= T and a generated dune
+// does not move on tick 1.
+// The material's threshold, eighths of rise per cell: reposeEighthsOf in
+// common.wgsl, because worldgen.wgsl lays loose cover against the SAME number
+// (a generated dune is a fixed point of this rule only if both read it).
+fn reposeEighths(m : Material) -> u32 { return reposeEighthsOf(m.repose); }
 
 // Is the diagonal step from a surface cell of mass `f` onto a partial of mass
 // `nf` one level down steep enough to take? D = f + 8 - nf against T. The
@@ -2083,6 +2103,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
     e = cellEighths(sw);
     selfPowder = matHasPowderMass(materials[voxMat(sw)]);
     sv = solCarried(c, sw);
+    reactLiquidEaten(sw, prod);  // the ledger's CA half (see its header)
   }
   // A solvent turning into something else: its mass moves on or precipitates
   // (evaporating brine concentrates, then leaves salt).
@@ -2336,6 +2357,21 @@ fn coatMatOf(w : u32, sub : Material) -> u32 {
   return materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
 }
 
+// Bits 29 and 30 ("dry", "DRY-WROTE"): a WET STAIN DRYING (stainDry below).
+// They used to share DIRTY_R_STAIN / DIRTY_R_STAINW with doStaining, and that
+// made two different things one bit: a liquid soaking into the ground (which
+// SPENDS liquid -- a body's volume moves) and a bank the liquid has LEFT
+// drying (which touches no liquid at all: stainDry refuses any cell with its
+// wetter on a face). sim_waterbody.wgsl wbQuiet must tell them apart -- a
+// drained pit's banks dry for ~1000 ticks and, read as one bit, held every
+// created body CANDIDATE that long (`--gate waterbody` pass N). Same sleep and
+// licence semantics as the pair they replace: DRY is an own-chunk idle mark
+// (not in FILM_LICENCE), DRYW is a write (fans out, in FILM_LICENCE). Declared
+// here and in sim_waterbody.wgsl, its one reader; check_invariants.py `drybits`
+// pins both to world.h kDirtyReasonName.
+const DIRTY_R_DRY : u32 = 536870912u;
+const DIRTY_R_DRYW : u32 = 1073741824u;
+
 // ---- A WET STAIN DRIES (2026-09-25) -----------------------------------------
 // A stain type whose material authors `stain.dries` (water) comes off the
 // ground on its own: `dries` per mille per tick, one level at a time, the
@@ -2385,7 +2421,7 @@ fn stainDry(c : vec3<i32>, idx : u32, w : u32, m : Material, rnd : u32, probe : 
   // bounded by their 15 levels -- the same standing a wall a flow wetted has.
   let raining = (T.weatherRain & RAIN_AMOUNT_MASK) != 0u;
   if (!open && raining && rainMapExposedNear(c)) { open = true; }
-  if (!open) { markDirtyR(c, DIRTY_R_STAIN); }
+  if (!open) { markDirtyR(c, DIRTY_R_DRY); }
   // Nothing open to the sky dries while it rains: that is the rain's surface.
   // (Measured: drying through a storm left a third of a rained-on stone strip
   // CLEAN -- its 1-level wet mark dried between drops.)
@@ -2395,7 +2431,7 @@ fn stainDry(c : vec3<i32>, idx : u32, w : u32, m : Material, rnd : u32, probe : 
   var nw = w & ~STAIN_BITS;
   if (left > 0u) { nw = nw | packStain(voxStainType(w), left); }
   voxStore(idx, nw);
-  markDirtyR(c, DIRTY_R_STAINW);
+  markDirtyR(c, DIRTY_R_DRYW);
   return true;
 }
 
@@ -2627,6 +2663,29 @@ const RFX_COND_SHIFT: u32 = 24u;   // kCondFxShift
 const RFX_COND_MASK : u32 = 31u;   // kCondFxMask
 const RFX_CELL_BITS : u32 = 27u;   // kReactFxCellBits
 const RFX_SCRAMBLE  : u32 = 0x0B5AD4EBu;  // kReactFxScramble
+const RFX_LIQ_EATEN : u32 = 45u;   // kPageFaultReactLiquidEaten
+
+// ---- THE CA HALF OF THE REACTION LEDGER -------------------------------------
+// A reaction that rewrites a SETTLED liquid voxel to another material removes
+// that voxel's eighths from the liquid books. When the liquid is EXCITED the
+// seam counts it (FA_CONSUMED, via flagFluidConsume -> consumeApply); a voxel
+// never crosses the seam, so before this word nothing counted it and a
+// reaction gate's ledger (`fluid-react`: plants growing into the water they
+// drink) could only be asserted to within a tolerance. Called with the word
+// the cell held BEFORE the write and the material written over it; a write of
+// the same material (a no-op rewrite) eats nothing. A liquid PRODUCT carries
+// the eighths on (carriedState) -- they are still counted here, because the
+// question this word answers is "how much of the liquid that was there is
+// gone", per material, and a gate that wants mass across a liquid->liquid
+// transform adds the product back itself.
+// An order-free atomicAdd into the per-tick reaction record (world.h [45]);
+// nothing in the sim reads it (rule 1).
+fn reactLiquidEaten(oldWord : u32, prod : u32) {
+  let om = voxMat(oldWord);
+  if (om == MAT_AIR || om == prod) { return; }
+  if (materials[om].klass != CLASS_LIQUID) { return; }
+  atomicAdd(&pageFaults[RFX_LIQ_EATEN], voxState(oldWord) + 1u);
+}
 
 fn reactFxNote(rule : Reaction, c : vec3<i32>) {
   let fx = (rule.cond >> RFX_COND_SHIFT) & RFX_COND_MASK;
@@ -2800,7 +2859,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             // place (it cannot move on -- a neighbour's neighbour is past the
             // lattice's write reach). Boiling brine leaves its salt.
             var nsv = 0u;
-            if (!synthFluid) { nsv = solCarried(n, niw.y); }
+            if (!synthFluid) {
+              nsv = solCarried(n, niw.y);
+              reactLiquidEaten(niw.y, rule.prodNbr);  // settled neighbour eaten
+            }
             var rep = vec2<u32>(rule.prodNbr, 0u);
             if (nsv != 0u) { rep = solOnReplace(n, nsv, rule.prodNbr, false, 0u); }
             if (rep.y != 0u) {
@@ -3986,10 +4048,15 @@ fn gasOuterSplat(c : vec3<i32>) {
   atomicAdd(&gasOuter[word], 1u << sh);
 }
 
-fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
+// THE CONVERSION ITSELF: append the record, delete the voxel. Called only from
+// main's leave-resolve tail with a decision already made (THE EDGE'S BUDGET),
+// so the slot check below is an INVARIANT, not a budget: the shares sum to at
+// most GAS_SP_BUDGET <= GAS_SPAWN_CAP. If it ever fires the voxel stays put
+// and GAS_SP_OVERRUN says the accounting is broken.
+fn gasConvert(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
   let slot = atomicAdd(&gasSpawn[GAS_SP_COUNT], 1u);
   if (slot >= GAS_SPAWN_CAP) {
-    atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u);
+    atomicAdd(&gasSpawn[GAS_SP_OVERRUN], 1u);
     return false;
   }
   // Position is 24.8 with a ZERO FRACTION: a gas particle lives ON a cell and
@@ -4011,6 +4078,74 @@ fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
   markVoxActive(idx);
   markDirty(c);
   return true;
+}
+
+// The workgroup's leavers for THIS dispatch (THE EDGE'S BUDGET, step 3). An
+// entry is main's gather entry (chunk-in-group << 12 | local index) with the
+// primary direction coded into bits 16..20, plus the word the cell acted with.
+// GAS_LV_MAX is structural: a leaver's step goes out of residency, so it sits
+// on its chunk's boundary, and one colour has at most 152 boundary sites in a
+// chunk (6^3 sites less the 4^3 interior ones) -- times CA_PACK_MAX chunks.
+// The chunk-in-group index is ONE bit below (`& 1u`) and the per-chunk arrays
+// are 2 long: both are CA_PACK_MAX, and a wider pack must widen them.
+const_assert CA_PACK_MAX == 2u;
+const_assert GAS_LV_MAX == 152u * CA_PACK_MAX;
+var<workgroup> wgLvCell : array<u32, 304>;
+var<workgroup> wgLvWord : array<u32, 304>;
+var<workgroup> wgLvN : atomic<u32>;
+var<workgroup> wgLvCnt : array<atomic<u32>, 2>;   // CA_PACK_MAX: leavers per chunk
+var<workgroup> wgLvAllow : array<u32, 2>;         // CA_PACK_MAX: share left per chunk
+// main's gather entry of the cell this thread is running (set per cell).
+var<private> gCaEntry : u32 = 0u;
+
+// Record this cell as a leaver and finish it for now; main decides after the
+// barrier. False only if the list is full, which GAS_LV_MAX makes impossible.
+fn gasLeaveDefer(w : u32, d : vec3<i32>) -> bool {
+  let k = atomicAdd(&wgLvN, 1u);
+  if (k >= GAS_LV_MAX) { return false; }
+  let dc = u32((d.x + 1) + 3 * (d.y + 1) + 9 * (d.z + 1));
+  wgLvCell[k] = (gCaEntry & 0xFFFFu) | (dc << 16u);
+  wgLvWord[k] = w;
+  atomicAdd(&wgLvCnt[(gCaEntry >> 12u) & 1u], 1u);
+  return true;
+}
+
+// This chunk's share of the tick's budget that is still unspent, read ONCE per
+// dispatch at the top of main (nothing else touches the chunk's word during
+// the dispatch: a chunk is in exactly one workgroup).
+fn gasLeaveAllow(ci : u32) -> u32 {
+  let word = atomicLoad(&gasSpawn[GAS_SP_CHUNK0 + ci]);
+  if ((word & GAS_LV_COUNTED) == 0u) { return 0u; }
+  let share = atomicLoad(&gasSpawn[GAS_SP_BUDGET]) /
+              max(atomicLoad(&gasSpawn[GAS_SP_EDGECH]), 1u);
+  let used = word & ~GAS_LV_COUNTED;
+  return share - min(used, share);
+}
+
+// The rank key: a hash of the cell, the tick and the substep, so which of a
+// chunk's leavers lose when it is over its share is a pure function of the
+// cells and is not always the same corner of the chunk.
+fn gasLeaveKey(local : u32) -> u32 {
+  return hash3(T.seed ^ GAS_LV_SALT, T.tick * 2u + P.substep, local);
+}
+
+// THE CHUNK BUDGET'S DOORBELL (camask, substep 0, one thread per dirty chunk):
+// initialise the chunk's budget word and, if any of its 26 neighbours is not
+// resident -- the only way a primary step (a unit step) can leave -- count it
+// into GAS_SP_EDGECH. Every dirty chunk is initialised, edge or not, because
+// the CA reads the word of every chunk it runs.
+fn gasLeaveCount(ci : u32) {
+  let wc = slotWorldChunk(ci, T.origin);
+  var edge = false;
+  for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+      for (var dx = -1; dx <= 1; dx++) {
+        if (!chunkResident(wc + vec3<i32>(dx, dy, dz), T.origin)) { edge = true; }
+      }
+    }
+  }
+  atomicStore(&gasSpawn[GAS_SP_CHUNK0 + ci], select(0u, GAS_LV_COUNTED, edge));
+  if (edge) { atomicAdd(&gasSpawn[GAS_SP_EDGECH], 1u); }
 }
 
 // ---- THE GAS MOVEMENT TAIL -------------------------------------------------
@@ -4102,12 +4237,21 @@ fn stepHeavyGas(c : vec3<i32>, w : u32, m : Material, rnd : u32) -> bool {
 fn stepGas(c : vec3<i32>, idx : u32, w : u32, m : Material, slotIdx : u32,
            rnd : u32) -> bool {
   if ((m.flags & MATF_HEAVY_GAS) != 0u) { return stepHeavyGas(c, w, m, rnd); }
+  return stepGasFrom(c, idx, w, m, slotIdx, rnd, 0u);
+}
+
+// The buoyant ladder from candidate `i0` on. main's leave-resolve tail calls
+// it with i0 = 1 for a leaver that was REFUSED: candidate 0 was the step out
+// of the window, which wrote nothing, so resuming at 1 is exactly the voxel
+// "falling through and behaving as it does at a wall".
+fn stepGasFrom(c : vec3<i32>, idx : u32, w : u32, m : Material, slotIdx : u32,
+               rnd : u32, i0 : u32) -> bool {
   let g = gasIntent(c, m, slotIdx, rnd >> 10u);
 
   // Indices 0..5 need no lateral rotation. Split from the loop below so the
   // common case — a plume with open sky above it, returning at index 0 —
   // never evaluates the wind field for a ring it does not reach.
-  for (var i = 0u; i < GAS_LADDER_RING; i++) {
+  for (var i = i0; i < GAS_LADDER_RING; i++) {
     let s = gasLadderStep(g, 0u, 0u, i);
     if (s.w == 0) { continue; }
     let d = s.xyz;
@@ -4120,11 +4264,15 @@ fn stepGas(c : vec3<i32>, idx : u32, w : u32, m : Material, slotIdx : u32,
     // move the parcel actually wanted, it is what a plume at the top face
     // makes on every single tick, and confining the sink to it keeps a gas
     // that merely BRUSHES the edge on a fallback candidate inside the world.
+    // The conversion is DECIDED LATER, by main, after every cell of this
+    // colour in this workgroup has run (THE EDGE'S BUDGET).
     if (T.gasMode != GAS_MODE_OFF && i == 0u && !inBounds(c + d)) {
       atomicAdd(&gasSpawn[GAS_SP_EDGE], 1u);
       markDirtyR(c, DIRTY_M_GASEDGE);
-      if (gasLeave(c, idx, w, c + d)) { return true; }
-      // Refused: fall through and behave exactly as this voxel does today.
+      if (gasLeaveDefer(w, d)) { return true; }
+      // Unreachable (GAS_LV_MAX is structural). Refuse in place, loudly.
+      atomicAdd(&gasSpawn[GAS_SP_OVERRUN], 1u);
+      atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u);
     }
   }
 
@@ -4306,6 +4454,9 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // THE TEMPERATURE LAYER'S DOORBELL: this chunk holds something hot, so
   // heatWant (after the CA) pages it and its 3x3x3. Window slots only -- heat
   // does not run in a ticket. A sentinel chunk's one material is tested here.
+  // THE EDGE'S BUDGET (gasLeaveCount): substep 0 only -- both substeps run
+  // the same dirty list -- and before the CA's first colour by pass order.
+  if (li == 0u && P.substep == 0u && T.gasMode != GAS_MODE_OFF) { gasLeaveCount(ci); }
   if (li == 0u && ci < NUM_CHUNKS) {
     var hot = atomicLoad(&wgCaEmit) != 0u;
     if (sentinel) {
@@ -4431,6 +4582,17 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let pack = caPack(total);
   let first = wg.x * pack;
   if (li < 3u) { atomicStore(&wgCaSeg[li], 0u); }
+  // THE EDGE'S BUDGET: this dispatch's leaver list starts empty, and each
+  // chunk's unspent share is read once, before any cell can spend it.
+  if (T.gasMode != GAS_MODE_OFF) {
+    if (li == 0u) { atomicStore(&wgLvN, 0u); }
+    if (li < CA_PACK_MAX) {
+      atomicStore(&wgLvCnt[li], 0u);
+      var allow = 0u;
+      if (li < pack && first + li < total) { allow = gasLeaveAllow(dirtyList[first + li]); }
+      wgLvAllow[li] = allow;
+    }
+  }
   workgroupBarrier();
   // PASS 1: how many of each kind. The list is then laid out gas | other |
   // inert, so a warp runs ONE path (stepGas, the reaction/liquid/powder tail,
@@ -4482,8 +4644,65 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   for (var i = li; i < n; i += CA_WG) {
     let e = wgCaList[i];
     let lm = e & 0xFFFu;
+    gCaEntry = e;
     caCell(dirtyList[first + (e >> 12u)],
            vec3<i32>(i32(lm & 15u), i32((lm >> 4u) & 15u), i32(lm >> 8u)));
+  }
+
+  // ---- THE LEAVE-RESOLVE TAIL (THE EDGE'S BUDGET, step 3) -----------------
+  // Every cell of this colour in this workgroup has run; the ones whose
+  // primary step left the residency window are waiting in wgLvCell. Each is
+  // accepted if its chunk has share left for it -- all of them when the
+  // chunk's leavers fit, otherwise the lowest `allow` by gasLeaveKey -- and
+  // then either converts or resumes its ladder at candidate 1. T.gasMode is a
+  // uniform, so the barrier is in uniform control flow.
+  if (T.gasMode != GAS_MODE_OFF) {
+    workgroupBarrier();
+    let nl = min(atomicLoad(&wgLvN), GAS_LV_MAX);
+    for (var k = li; k < nl; k += CA_WG) {
+      let ent = wgLvCell[k];
+      let j = (ent >> 12u) & 1u;
+      let lm = ent & 0xFFFu;
+      let allow = wgLvAllow[j];
+      var ok = allow > 0u;
+      if (ok && atomicLoad(&wgLvCnt[j]) > allow) {
+        // Over the share: rank this leaver among its chunk's by (key, local).
+        // Only on the overflow tick of an overflowing chunk; <= 152 entries.
+        let key = gasLeaveKey(lm);
+        var rank = 0u;
+        for (var q = 0u; q < nl; q++) {
+          let o = wgLvCell[q];
+          if (((o >> 12u) & 1u) != j || q == k) { continue; }
+          let olm = o & 0xFFFu;
+          let okey = gasLeaveKey(olm);
+          if (okey < key || (okey == key && olm < lm)) { rank++; }
+        }
+        ok = rank < allow;
+      }
+      let ci = dirtyList[first + j];
+      let c = slotWorldChunk(ci, T.origin) * i32(CHUNK) +
+              vec3<i32>(i32(lm & 15u), i32((lm >> 4u) & 15u), i32(lm >> 8u));
+      // caCell's per-cell context, exactly as it was when this cell deferred.
+      gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
+      gInTicket = ci >= NUM_CHUNKS;
+      gSelfCell = c;
+      gSelfIdx = PT_NO_WORD;
+      gCaEntry = ent & 0xFFFFu;
+      let idx = voxWordIndex(c);
+      let w = wgLvWord[k];
+      let dc = i32(ent >> 16u);
+      let d = vec3<i32>(dc % 3 - 1, (dc / 3) % 3 - 1, dc / 9 - 1);
+      if (ok && gasConvert(c, idx, w, c + d)) {
+        atomicAdd(&gasSpawn[GAS_SP_CHUNK0 + ci], 1u);
+        continue;
+      }
+      // Refused (or the invariant broke, which gasConvert has counted): the
+      // voxel stays and takes the rest of its ladder, as it would at a wall.
+      if (!ok) { atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u); }
+      let slotIdx = cellIndexW(c);
+      stepGasFrom(c, idx, w, materials[voxMat(w)], slotIdx,
+                  hash3(T.seed, T.tick * 2u + P.substep, slotIdx), 1u);
+    }
   }
 }
 

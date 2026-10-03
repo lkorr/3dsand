@@ -102,6 +102,13 @@ const GAS_SP_LIVE      : u32 = 7u;  // live particles after integrate
 // window a parcel touches no voxel, so the world hash cannot see it and this
 // is the only thing that can — see the determinism gate.
 const GAS_SP_DIGEST    : u32 = 8u;
+// The edge's leave budget for THIS tick (gasLeavePrep below; sim_step.wgsl
+// THE EDGE'S BUDGET reads it, with words 10..11 that only sim_step writes).
+const GAS_SP_BUDGET    : u32 = 9u;
+// gasSpawnOps header word 1: a TEST-ONLY ceiling on the leave budget, 0 = none
+// (world.h kGasOpsLeaveCap). It exists so a gate can FORCE the overflow the
+// budget decides, rather than hope a fixture reaches 65,536 leavers a tick.
+const GAS_OPS_LEAVE_CAP: u32 = 1u;
 const GAS_SP_HDR       : u32 = 16u;
 const GAS_SP_STRIDE    : u32 = 8u;
 const GAS_SPAWN_CAP    : u32 = 65536u;   // kGasSpawnPerTick
@@ -702,10 +709,43 @@ fn gasArgs1() {
   // tick's integrate) — so the gas pool needs no per-tick buffer fill, and the
   // "who resets the count" question has one answer instead of a convention.
   atomicStore(&gasCounts[1u - T.page], 0u);
-  let n = gasLive(T.page);
+  // ...and PUBLISH THE READ PAGE'S NEW COUNT, which gasSpawnStep deliberately
+  // did not touch (it places records by rank, not by cursor): what was live
+  // before it, plus both spawn lists, at most the pool.
+  let n = min(gasLive(T.page) + gasSpawnN(), GAS_PARTICLE_CAP);
+  atomicStore(&gasCounts[T.page], n);
   gasArgs[4] = (n + 63u) / 64u;
   gasArgs[5] = 1u;
   gasArgs[6] = 1u;
+}
+
+// This tick's spawns, both lists: the CA's outbox (clamped, as gasSpawnStep
+// clamps it) then the CPU's.
+fn gasSpawnCaN() -> u32 { return min(atomicLoad(&gasSpawn[GAS_SP_COUNT]), GAS_SPAWN_CAP); }
+fn gasSpawnN() -> u32 {
+  return gasSpawnCaN() + min(gasSpawnOps[GAS_SP_COUNT], GAS_CPU_SPAWN_CAP);
+}
+
+// ---- THE EDGE'S LEAVE BUDGET (sim_step.wgsl THE EDGE'S BUDGET) ------------
+// One thread, recorded after fill_gasSpawn and before the CA. Fixes how many
+// window-edge conversions this tick may make, BEFORE any are attempted, so the
+// CA can split it into per-chunk shares and refuse by a rule instead of by
+// arrival order. It is the record list's cap, less what the POOL cannot take:
+// the parcels already live and this tick's CPU spawns are placed first, so
+// with this budget gasSpawnStep can never meet a full pool either -- the
+// second scheduling-dependent refusal this replaces (which parcel vaporized
+// was whichever thread's atomicAdd came last).
+//
+// gasCounts[T.page] is last tick's survivor count here: nothing writes it
+// between last tick's integrate and this tick's gasArgs1.
+@compute @workgroup_size(1)
+fn gasLeavePrep() {
+  var cap = GAS_SPAWN_CAP;
+  let test = gasSpawnOps[GAS_OPS_LEAVE_CAP];
+  if (test != 0u) { cap = min(cap, test); }
+  let taken = gasLive(T.page) + min(gasSpawnOps[GAS_SP_COUNT], GAS_CPU_SPAWN_CAP);
+  let room = GAS_PARTICLE_CAP - min(taken, GAS_PARTICLE_CAP);
+  atomicStore(&gasSpawn[GAS_SP_BUDGET], min(cap, room));
 }
 
 @compute @workgroup_size(1)
@@ -728,8 +768,19 @@ fn gasArgs2() {
 @compute @workgroup_size(64)
 fn gasSpawnStep(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p : Particle;
+  // RANK, NOT CURSOR (2026-10-03). A record's pool slot is the live count plus
+  // its place in the two lists -- the CA's first, then the CPU's in push
+  // order -- so which record a full pool refuses is a function of the lists,
+  // not of which thread arrived last. The CA's records are never refused (its
+  // budget was sized to the room left, gasLeavePrep), and their order among
+  // themselves cannot matter: every pass keys on parcel STATE, never on slot.
+  // gasArgs1 publishes the new count; nothing here writes it, so `live` is
+  // stable for the whole dispatch.
+  let live = gasLive(T.page);
+  let nCa = gasSpawnCaN();
+  var rank = gid.x;
   if (gid.x < GAS_SPAWN_CAP) {
-    if (gid.x >= min(atomicLoad(&gasSpawn[GAS_SP_COUNT]), GAS_SPAWN_CAP)) { return; }
+    if (gid.x >= nCa) { return; }
     let b = GAS_SP_HDR + gid.x * GAS_SP_STRIDE;
     p.px = bitcast<i32>(atomicLoad(&gasSpawn[b + 0u]));
     p.py = bitcast<i32>(atomicLoad(&gasSpawn[b + 1u]));
@@ -738,6 +789,7 @@ fn gasSpawnStep(@builtin(global_invocation_id) gid : vec3<u32>) {
   } else {
     let i = gid.x - GAS_SPAWN_CAP;
     if (i >= min(gasSpawnOps[GAS_SP_COUNT], GAS_CPU_SPAWN_CAP)) { return; }
+    rank = nCa + i;
     let b = GAS_SP_HDR + i * GAS_SP_STRIDE;
     p.px = bitcast<i32>(gasSpawnOps[b + 0u]);
     p.py = bitcast<i32>(gasSpawnOps[b + 1u]);
@@ -752,11 +804,13 @@ fn gasSpawnStep(@builtin(global_invocation_id) gid : vec3<u32>) {
   // forces them: a malformed op must not be able to inject a particle that is
   // already claiming a cell.
   p.flags = PFLAG_ALIVE | PFLAG_GAS;
-  let slot = atomicAdd(&gasCounts[T.page], 1u);
+  let slot = live + rank;
   if (slot >= GAS_PARTICLE_CAP) {
     // At the cap the parcel vaporizes. Degradation, not failure — and it is
     // counted, so "the pool was the bound" is a printed number rather than an
-    // inference from a plume that looks thin.
+    // inference from a plume that looks thin. Only a CPU spawn can land here
+    // (the CA's budget left room for the CPU list too), and which one is the
+    // tail of the CPU's own push order.
     atomicAdd(&gasSpawn[GAS_SP_POOLFULL], 1u);
     return;
   }

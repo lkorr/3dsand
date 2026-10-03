@@ -3086,6 +3086,9 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   const uint32_t kWaterEighths = 13u * 13u * 2u * 8u;  // 2 deep this time
   uint32_t worldHash[2] = {0, 0};
   uint32_t consumedSum = 0, standing = 0, liveEighths = 0, plantsEnd = 0;
+  uint32_t caEatenSum = 0;  // settled eighths eaten in the CA (see the loop)
+  uint32_t killHardSum = 0, settleKillSum = 0, excitedCumSum = 0,
+           setWroteSum = 0;  // seam mass-book deltas over the window
   // Attribution for a mass account that does not close — see the census below.
   uint32_t strayWater = 0, endParticles = 0;
   // THE SEAM LEDGER, which is what `ca-slope` and `fluid-excite` reach for when
@@ -3129,7 +3132,18 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
     uint32_t ft = 70000;
     uint32_t liveEst = 0;
     consumedSum = 0;
+    caEatenSum = 0;
     exExcited = exEmitted = exSettled = exDead = exBinned = exRefused = 0;
+    // THE SEAM'S MASS BOOKS (fluidArgs [34..39], CUMULATIVE): read before and
+    // after the window. KILLHARD is the one counted path by which live mass
+    // ends without becoming a voxel or a reaction product (g2p deleting a
+    // particle whose cell closed into hard matter under it -- e.g. a plant
+    // growing into a cell its excited water had just moved into). The others
+    // close the seam's own identity (excited in = settled out + killed +
+    // eaten + still live), which says whether a gap is seam-side or CA-side.
+    uint32_t books0[kFluidArgsWords] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0,
+                          books0, sizeof(books0), "reactBooks0");
     for (int i = 0; i < kMaxTicks; i++) {
       std::vector<CellOp> cops;
       if (i == 0) cops = box;
@@ -3152,6 +3166,15 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
                             128, "reactArgs");
       liveEst = std::min(fa[7], kFluidCap);
       consumedSum += fa[16];  // FA_CONSUMED
+      // The CA half of the same ledger: settled liquid eighths a reaction
+      // rewrote this tick (world.h kPageFaultReactLiquidEaten, zeroed per
+      // tick by fill_reactFx). Read straight off the record, not the
+      // snapshot ring, so it lines up with this tick's FA_* words.
+      uint32_t eaten = 0;
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.pageFaults,
+                            kPageFaultReactLiquidEaten * 4, &eaten, 4,
+                            "reactCaEaten");
+      caEatenSum += eaten;
       exDead += fa[8];        // FA_DEAD
       exEmitted += fa[9];     // FA_EMITTED
       exSettled += fa[10];    // FA_SETTLED
@@ -3163,9 +3186,13 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
 
     // Final live fullness for the mass equation.
     liveEighths = 0;
-    uint32_t fa[32] = {};
+    uint32_t fa[kFluidArgsWords] = {};
     rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
-                          128, "reactArgsEnd");
+                          sizeof(fa), "reactArgsEnd");
+    killHardSum = fa[34] - books0[34];     // FA_KILLHARD
+    settleKillSum = fa[35] - books0[35];   // FA_SETTLEKILL
+    excitedCumSum = fa[36] - books0[36];   // FA_EXCITEDCUM
+    setWroteSum = fa[39] - books0[39];     // FA_SETWROTE
     uint32_t live = std::min(fa[7], kFluidCap);
     if (live > 0) {
       std::vector<uint32_t> pbuf((size_t)live * kFluidParticleWords);
@@ -3221,69 +3248,67 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   bool det = worldHash[0] == worldHash[1];
   bool consumed = consumedSum > 0;
   bool grew = plantsEnd > kPlantsStart;
-  const int shortBy = (int)kWaterEighths - (int)(standing + liveEighths +
-                                                 consumedSum);
-
-  // THE ACCOUNT HAS FOUR DESTINATIONS, NOT THREE, and the fourth is the thing
-  // the gate is named after.
+  // THE ACCOUNT IS EXACT AGAIN (2026-10-03), with every destination named:
   //
-  // `standing + live + consumed == placed` was exact by construction only if
-  // every eighth a reaction eats passes through the seam. It does not.
-  // FA_CONSUMED is a fluidArgs counter: it records eighths eaten off EXCITED
-  // fluid, which is the specific claim this gate exists to make. But the
-  // authored rule is `{self: plant, neighbor: water, neighborBecomes: plant}`
-  // (assets/materials/reactions.json), and the CA runs it on SETTLED water
-  // voxels too — a water cell beside a plant simply becomes plant, in the
-  // grid, with no particle and no seam event. Those eighths are not lost; they
-  // are standing in the world as the 198 new plant cells the gate itself
-  // counts and calls a pass.
+  //   placed == standing + stray + live
+  //           + eaten while EXCITED (FA_CONSUMED)
+  //           + eaten while SETTLED (kPageFaultReactLiquidEaten)
+  //           + deleted inside hard matter (FA_KILLHARD)
   //
-  // Measured: 37 of 2704 (1.4%), and the seam ledger says it is not seam-side
-  // (2432 excited -> 2432 emitted, nothing refused). 37 eighths against 198
-  // new plants is under a quarter of an eighth per plant, which is what
-  // eating mostly-empty rim cells looks like.
+  // History, because the middle state is what made this gate weak. The
+  // three-term `standing + live + consumed == placed` was exact only if every
+  // eighth a reaction eats crosses the seam. It does not: FA_CONSUMED counts
+  // eighths eaten off EXCITED fluid, and the authored rule `{self: plant,
+  // neighbor: water, neighborBecomes: plant}` also runs in the CA on SETTLED
+  // water voxels -- a water cell beside a plant simply becomes plant, with no
+  // particle and no seam event. Nothing counted those, so from 2026-08-29 the
+  // gate asserted a tolerance instead (gap >= 0, <= 8 per new plant, <= a
+  // baseline percentage; measured 1.4% then 3.55%). A tolerance cannot tell a
+  // reaction from a leak of the same size.
   //
-  // So the assertion becomes the property that actually matters, and it is
-  // still a leak detector — it just knows about the fourth destination:
-  //   1. NO WATER IS CREATED. shortBy >= 0, unconditionally.
-  //   2. Everything missing is accounted for by plants that exist. A water
-  //      cell holds at most 8 eighths and each conversion consumes at most
-  //      one cell, so the gap can never exceed 8 * the plants that grew.
-  //   3. And it stays SMALL. Bound 2 alone is loose (8 * 198 = 1584), so the
-  //      fraction is pinned in baseline.json where a threshold belongs. Water
-  //      vanishing with no plants to show for it, or vanishing faster than the
-  //      plant bed can eat, fails here exactly as the equality used to.
-  const uint32_t newPlants =
-      plantsEnd > kPlantsStart ? plantsEnd - kPlantsStart : 0u;
-  const double gapPct = 100.0 * (double)shortBy / (double)kWaterEighths;
-  const double gapPctMax = BaselineNumber("fluidReactCaGapPctMax", 3.0);
-  bool massOk = shortBy >= 0 && (uint32_t)shortBy <= 8u * newPlants &&
-                gapPct <= gapPctMax;
-  RecordObserved("fluidReactCaGapPct", gapPct);
+  // The missing term is now counted where it happens: sim_step.wgsl's
+  // reactLiquidEaten adds a settled liquid voxel's fullness to the per-tick
+  // reaction record (world.h kPageFaultReactLiquidEaten) whenever a reaction
+  // rewrites it to another material, and the loop above sums it. FA_KILLHARD
+  // is the seam's own counted deletion (a particle whose cell became plant
+  // under it without the consume flag). Water outside the interior box (in or
+  // through the shell) is still water and is in the sum, reported separately.
+  // Zero slack.
+  const uint32_t accounted = standing + strayWater + liveEighths +
+                             consumedSum + caEatenSum + killHardSum;
+  const int shortBy = (int)kWaterEighths - (int)accounted;
+  // The seam's own identity over the window: everything excited either
+  // settled back, was killed in hard matter, was eaten, or is still live. A
+  // gap here is seam-side; a gap above with this at zero is CA-side.
+  const long long seamResid = (long long)excitedCumSum -
+                              ((long long)settleKillSum + killHardSum +
+                               consumedSum + liveEighths);
+  bool massOk = shortBy == 0;
+  RecordObserved("fluidReactMassGap", (double)shortBy);
   bool ok = consumed && grew && massOk && det;
   std::printf("  react seam: %u excited -> %u emitted, %u settled, %u dead, "
-              "%u refused, %u binned\n",
-              exExcited, exEmitted, exSettled, exDead, exRefused, exBinned);
+              "%u refused, %u binned; books: %u excited in, %u settle-killed,"
+              " %u killed hard, %u settle wrote, residual %lld\n",
+              exExcited, exEmitted, exSettled, exDead, exRefused, exBinned,
+              excitedCumSum, settleKillSum, killHardSum, setWroteSum,
+              seamResid);
   std::printf(
-      "fluid react: %s (%u eighths consumed by reactions, plants %u -> %u, "
-      "%u standing + %u live + %u consumed of %u placed"
-      " [gap %d = %.2f%% (allow %.2f%%), under the %u eighths %u new plants"
-      " could have eaten; %u stray outside the box, %u droplets in flight],"
-      " world hash %s)\n",
-      ok ? "PASS" : "FAIL", consumedSum, kPlantsStart, plantsEnd, standing,
-      liveEighths, consumedSum, kWaterEighths, shortBy, gapPct, gapPctMax,
-      8u * newPlants, newPlants, strayWater, endParticles,
+      "fluid react: %s (plants %u -> %u; %u standing + %u stray + %u live + "
+      "%u eaten excited + %u eaten settled + %u killed in hard matter = %u of"
+      " %u placed, mass %s by %d; %u droplets in flight, world hash %s)\n",
+      ok ? "PASS" : "FAIL", kPlantsStart, plantsEnd, standing, strayWater,
+      liveEighths, consumedSum, caEatenSum, killHardSum, accounted,
+      kWaterEighths, massOk ? "EXACT" : "OFF", shortBy, endParticles,
       det ? "matches" : "DIVERGED");
-  detail = Format("%u consumed, plants %u->%u, mass %u+%u+%u/%u (gap %d ="
-                  " %.2f%% of %.2f%% allowed, vs %u eighths %u new plants"
-                  " could eat; stray %u, droplets %u; seam %u excited -> %u"
-                  " emitted, %u settled, %u dead, %u refused, %u binned),"
+  detail = Format("plants %u->%u, mass %u+%u+%u+%u+%u+%u = %u/%u (%s by %d;"
+                  " droplets %u; seam %u excited -> %u emitted, %u settled,"
+                  " %u dead, %u refused, %u binned, books residual %lld),"
                   " det %s",
-                  consumedSum, kPlantsStart, plantsEnd, standing, liveEighths,
-                  consumedSum, kWaterEighths, shortBy, gapPct, gapPctMax,
-                  8u * newPlants, newPlants, strayWater, endParticles,
-                  exExcited, exEmitted, exSettled, exDead, exRefused, exBinned,
-                  det ? "ok" : "DIVERGED");
+                  kPlantsStart, plantsEnd, standing, strayWater, liveEighths,
+                  consumedSum, caEatenSum, killHardSum, accounted,
+                  kWaterEighths, massOk ? "EXACT" : "OFF", shortBy,
+                  endParticles, exExcited, exEmitted, exSettled, exDead,
+                  exRefused, exBinned, seamResid, det ? "ok" : "DIVERGED");
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -4685,6 +4710,235 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
                 fails.empty() ? "" : " |", fails.c_str());
   detail = buf;
   std::printf("support-flag: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------- support-flag-post
+// THE CELL OPS' SUPPORT FLAG READS THE POST-DISPATCH GRID (cross-vendor audit
+// #10, 2026-10-03).
+//
+// `cells` raises the flag from each written cell by looking at its six
+// neighbours, and a neighbour can be ANOTHER op of the same dispatch. Until
+// the audit fix it read that neighbour whenever its invocation got there:
+// before the other op's store (still solid -> flag) or after (air -> none).
+// Now sim_mutate.wgsl's flagSupportLossCells finds the neighbour's op in the
+// (sorted) upload and uses the material the cell ENDS the dispatch with.
+//
+// THE FIXTURE pins that answer down. A four-cell stone pillar whose top cell A
+// is the last layer of chunk K, plus one more cell B directly above it -- the
+// first layer of chunk K+1. One tick erases A and B together, pushed B FIRST
+// so the upload's sort is exercised. Post-dispatch, A's lower neighbour is
+// still stone (chunk K must be flagged) and B is air, so NOTHING in K+1 is
+// left unsupported: K+1 must not be flagged. The old read flagged K+1 whenever
+// A's invocation read B before B's store landed -- a scheduling choice. It
+// PINS the rule; it cannot force the interleaving: the pre-fix shader also
+// passed it on the RTX 3060 Ti (2026-10-03, run against c364516's
+// sim_mutate.wgsl), so on this GPU the read happened to land after the store.
+// A "must not" needs a quiet K+1: it is open air above the terrain, the
+// fixture's paint raises no flag (paint into air never does), and the
+// baseline window drains everything else before the erase.
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): this gate tests the mutation
+// dispatch's flag in isolation, and the real tick would hand the flag to
+// island detection (DebrisSystem), which would drop the floating pillar and
+// add flags of its own to the window being read.
+Status GateSupportFlagPost(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const int gx = 120, gz = 120;
+  const int gy = FixtureYOver(gx - 4, gz - 4, gx + 4, gz + 4, kDefaultSeed, 12);
+  const int ay = (gy + 3) | 15;           // A: the top layer of its chunk
+  const IVec3 kc{gx >> 4, ay >> 4, gz >> 4};
+  const IVec3 kc1{gx >> 4, (ay + 1) >> 4, gz >> 4};
+  const uint32_t chunkK = World::SlotChunkIndex(kc);
+  const uint32_t chunkK1 = World::SlotChunkIndex(kc1);
+
+  std::vector<CellOp> scene;
+  for (int y = ay - 3; y <= ay + 1; y++)
+    scene.push_back({World::SlotCellIndex({gx, y, gz}), kMatStone});
+  uint32_t t = 1;
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false, kc, false, false);
+  ctx.WaitIdle();
+
+  std::vector<uint8_t> seen(kNumSlots, 0);
+  auto collect = [&](int ticks) {
+    for (int i = 0; i < ticks; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, kc, true, false);
+      ctx.WaitIdle();
+      const WorldSnapshot& sn = world.Snap();
+      if (!sn.valid || sn.supportFlags.size() != kNumSlots) continue;
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
+        if (sn.supportFlags[ci]) seen[ci] = 1;
+    }
+  };
+  collect(12);  // drain worldgen's and the placement's flags
+
+  // Fixture census before the erase: both chunks, one readback each.
+  std::vector<uint32_t> vk(kChunkVol), vk1(kChunkVol);
+  ReadVoxelsSync(ctx, world, chunkK, 1, vk.data(), "supportPostK");
+  ReadVoxelsSync(ctx, world, chunkK1, 1, vk1.data(), "supportPostK1");
+  auto local = [](int x, int y, int z) {
+    return (uint32_t)((((z & 15) * 16) + (y & 15)) * 16 + (x & 15));
+  };
+  bool fixtureOk = (vk1[local(gx, ay + 1, gz)] & 0xFFFu) == kMatStone;
+  for (int y = ay - 3; y <= ay; y++)
+    fixtureOk = fixtureOk && (vk[local(gx, y, gz)] & 0xFFFu) == kMatStone;
+
+  std::fill(seen.begin(), seen.end(), (uint8_t)0);
+  // B pushed before A: the upload is NOT in cell order, so SubmitTick's sort
+  // is what the shader's binary search relies on here.
+  std::vector<CellOp> erase{{World::SlotCellIndex({gx, ay + 1, gz}), 0u},
+                            {World::SlotCellIndex({gx, ay, gz}), 0u}};
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, erase, false, kc, true, false);
+  ctx.WaitIdle();
+  {
+    const WorldSnapshot& sn = world.Snap();
+    if (sn.valid && sn.supportFlags.size() == kNumSlots)
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
+        if (sn.supportFlags[ci]) seen[ci] = 1;
+  }
+  collect(12);
+  ReadVoxelsSync(ctx, world, chunkK, 1, vk.data(), "supportPostK");
+  ReadVoxelsSync(ctx, world, chunkK1, 1, vk1.data(), "supportPostK1");
+  const bool erased = (vk[local(gx, ay, gz)] & 0xFFFu) == 0u &&
+                      (vk1[local(gx, ay + 1, gz)] & 0xFFFu) == 0u;
+  const bool kFlag = seen[chunkK] != 0, k1Flag = seen[chunkK1] != 0;
+
+  std::string fails;
+  if (chunkK == chunkK1) fails += " fixture does not straddle a chunk face;";
+  if (!fixtureOk) fails += " the pillar never landed;";
+  if (!erased) fails += " the erase never landed;";
+  if (fixtureOk && erased) {
+    if (!kFlag) fails += " chunk K (stone still under the erased top) was not flagged;";
+    if (k1Flag)
+      fails += " chunk K+1 was flagged: a neighbour erased in the SAME dispatch was "
+               "read as solid (pre-store read, the audit #10 race);";
+  }
+  // Leave pristine terrain behind (the gates after this expect it).
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: erasing a pillar's top cell and the cell above it in one "
+                "dispatch flagged K=%d (want 1) K+1=%d (want 0); chunks %u/%u, "
+                "fixture %d, erased %d%s%s",
+                fails.empty() ? "PASS" : "FAIL", kFlag ? 1 : 0, k1Flag ? 1 : 0,
+                chunkK, chunkK1, fixtureOk ? 1 : 0, erased ? 1 : 0,
+                fails.empty() ? "" : " |", fails.c_str());
+  detail = buf;
+  std::printf("support-flag-post: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------- particle-cap
+// THE PARTICLE RING REFUSES AT ITS CAP AS A WHOLE GROUP (cross-vendor audit
+// #4, 2026-10-03; sim_particle.wgsl "THE RING'S CAP").
+//
+// Every producer appends with an atomicAdd cursor and keeps a particle only if
+// its slot is under kParticleCap, so at saturation WHICH ejecta survived was
+// the first-come set -- workgroup order. The fix commits each page's appends
+// as one group in args1/args2: a group that does not fit is refused whole, the
+// counter rolled back to the page's committed count, and the refusal counted
+// (particleCounts words 4/5).
+//
+// TWO ARMS, one blast each into a stone cube the gate paints itself:
+//   A  empty ring: the blast's ejecta all fly (survivors > 0, nothing
+//      refused) -- the commit is invisible under the cap.
+//   B  ring prefilled to kParticleCap - 1 (dead particles, committed): the
+//      same blast overflows, so ALL of its ejecta are refused -- survivors
+//      exactly 0, refused == what was attempted, one refused group. The
+//      first-come rule this replaces would have flown exactly one.
+// Forcing the cap is a buffer write a gate may make and the game may not: the
+// ring's two pages are zeroed (dead particles) and the count words set,
+// exactly as selftest_vessel.cpp resets the counts at a tick's head.
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): the claim is about one dispatch
+// sequence (explode -> args1 commit -> integrate) under a forced counter, and
+// the real tick's debris and mob phases would add producers to the page.
+Status GateParticleCap(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  struct Arm {
+    uint32_t survivors = 0, refused = 0, groups = 0, cursor = 0;
+    bool cubeOk = false;
+  };
+  uint32_t t = 1;
+  std::vector<uint8_t> zeroPage((size_t)kParticleCap * 32, 0);
+  auto runArm = [&](int ox, int oz, uint32_t prefill) {
+    Arm a;
+    const int cy = FixtureYOver(ox - 6, oz - 6, ox + 6, oz + 6, kDefaultSeed, 10) + 5;
+    const IVec3 pc{ox >> 4, cy >> 4, oz >> 4};
+    std::vector<CellOp> cube;
+    for (int z = -4; z <= 4; z++)
+      for (int y = -4; y <= 4; y++)
+        for (int x = -4; x <= 4; x++)
+          cube.push_back({World::SlotCellIndex({ox + x, cy + y, oz + z}), kMatStone});
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, cube, false, pc, false, false);
+    ctx.WaitIdle();
+    {
+      std::vector<uint32_t> v(kChunkVol);
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(pc), 1, v.data(), "pcapCube");
+      const uint32_t li = (uint32_t)((((oz & 15) * 16) + (cy & 15)) * 16 + (ox & 15));
+      a.cubeOk = (v[li] & 0xFFFu) == kMatStone;
+    }
+    // The ring, forced: both pages dead, the read page's count AND its
+    // committed count at `prefill`, the refusal counters at zero.
+    ctx.queue.WriteBuffer(world.particles[0], 0, zeroPage.data(), zeroPage.size());
+    ctx.queue.WriteBuffer(world.particles[1], 0, zeroPage.data(), zeroPage.size());
+    uint32_t words[8] = {};
+    const uint32_t P = sim.Page();
+    words[P] = prefill;
+    words[2 + P] = prefill;
+    ctx.queue.WriteBuffer(world.particleCounts, 0, words, sizeof words);
+    ctx.WaitIdle();
+    std::vector<ExplosionOp> exps{{ox, cy, oz, 4, 2000, 0, 0, 0}};
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, pc, false, true);
+    ctx.WaitIdle();
+    uint32_t got[8] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.particleCounts, 0, got,
+                          sizeof got, "pcapCounts");
+    // After the tick the page flipped: Page() is the page integrate wrote.
+    a.survivors = got[sim.Page()];
+    a.cursor = got[1 - sim.Page()];
+    a.refused = got[4];
+    a.groups = got[5];
+    return a;
+  };
+  const Arm A = runArm(152, 152, 0);
+  const Arm B = runArm(200, 152, kParticleCap - 1);
+
+  std::string fails;
+  if (!A.cubeOk || !B.cubeOk) fails += " a stone cube never landed;";
+  if (A.survivors == 0) fails += " arm A: the blast threw nothing (no ejecta to refuse);";
+  if (A.refused != 0 || A.groups != 0) fails += " arm A: refusals under the cap;";
+  if (B.survivors != 0)
+    fails += " arm B: ejecta survived an overflowing group (first-come refusal);";
+  if (B.groups != 1) fails += " arm B: not exactly one refused group;";
+  if (B.refused < 2) fails += " arm B: the overflow was not counted;";
+  if (B.cursor != kParticleCap - 1)
+    fails += " arm B: the read page's counter was not rolled back to its commit;";
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: empty ring -> %u ejecta flew, %u refused; ring at cap-1 -> "
+                "%u flew, %u refused in %u group(s), read page rolled back to %u "
+                "(want %u)%s%s",
+                fails.empty() ? "PASS" : "FAIL", A.survivors, A.refused, B.survivors,
+                B.refused, B.groups, B.cursor, kParticleCap - 1,
+                fails.empty() ? "" : " |", fails.c_str());
+  detail = buf;
+  std::printf("particle-cap: %s\n", buf);
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
@@ -6875,6 +7129,8 @@ const std::vector<Gate>& SimGates() {
       {"stamp-sleep", "sim", {}, false, GateStampSleep},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},
+      {"support-flag-post", "sim", {}, false, GateSupportFlagPost},
+      {"particle-cap", "sim", {}, false, GateParticleCap},
       {"snapshot-latency", "sim", {}, false, GateSnapshotLatency},
       // No draw of its own, but its verdict reads bestFrameMs, which only the
       // screenshots gate sets — so it needs the render path transitively.

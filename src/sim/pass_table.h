@@ -16,6 +16,15 @@
 
 namespace pass {
 
+// THE GOD-RAY SUN VISIBILITY VOLUME (assets/shaders/godray_vis.wgsl): blocks
+// per axis of the eye-centred 4^3-block grid, MUST AGREE with GV_NX/GV_NY/GV_NZ
+// in godray_vis.wgsl and raymarch.wgsl (scripts/check_invariants.py). Here and
+// not in world.h because only the buffer size (Simulation) and the row's
+// dispatch (pass_table.cpp) read them.
+inline constexpr uint32_t kGodVisNX = 72, kGodVisNY = 40, kGodVisNZ = 72;
+inline constexpr uint32_t kGodVisBlocks = kGodVisNX * kGodVisNY * kGodVisNZ;
+inline constexpr uint32_t kGodVisHeaderWords = 1;
+
 // ---------------------------------------------------------------- buffers --
 // Resolvable identities, NOT strings: a typo is a compile error, and the
 // recorder maps an id to a live rhi::Buffer in exactly one switch
@@ -214,6 +223,12 @@ enum class Buf : uint8_t {
   // overlay and wet shading in the same command buffer. Render-private like
   // RayStart: never hashed, never saved, never bound by a sim kernel.
   RainMap,
+  // The god-ray sun visibility volume (assets/shaders/godray_vis.wgsl): per
+  // 4^3 block round the eye, whether the sun reaches it. WRITTEN by the
+  // per-frame `godray_vis` row on the ShadowCache table, READ by
+  // raymarch.wgsl's godRays in the same command buffer. Render-private like
+  // RayStart: never hashed, never saved, never bound by a sim kernel.
+  GodVis,
   // The RAIN EXPOSURE MAP (assets/shaders/sim_rain_expo.wgsl, src/sim/
   // rainexpo.h): per 4-key texel of the tick's fall-line lattice, the level of
   // the first ray blocker. SIM state, unlike RainMap above: written by the
@@ -358,6 +373,9 @@ enum class Pipe : uint8_t {
   // reasons; GasArgs1 additionally zeroes the write page's cursor, which is
   // why the gas pool needs no per-tick fill.
   GasArgs1, GasSpawnP, GasIntegrate, GasArgs2, GasResolve,
+  // The window edge's leave budget for the tick (sim_gas.wgsl `gasLeavePrep`),
+  // one thread recorded BEFORE the CA, which splits it into per-chunk shares.
+  GasLeavePrep,
   // Far fire plumes: the frozen-fire density splat (sim_gas.wgsl
   // `gasFarPlume`). A sixth gas entry point, in the gas group, writing only
   // GasOuter — it is not part of the parcel pipeline and is recorded under its
@@ -407,6 +425,10 @@ enum class Pipe : uint8_t {
   // FarMapFill is the far SURFACE MAP's fill (worldgen.wgsl `farmap`), a third
   // row between the two: after the sweep, before the patch that invalidates it.
   FarFill, FarMapFill, FarPatchFill, FarDown,
+  // fardown's three follow-up dispatches (cross-vendor audit #9): the claim
+  // check, the cut-stalk clear and the feature check, each its own entry so
+  // no phase reads what another phase of the same dispatch is writing.
+  FarDownClaim, FarDownStalk, FarDownFeat,
   // The openness grid (sim_openness.wgsl). Two entry points: the dirty walk
   // (indirect on the compacted dirty list, exactly like occupancyDirty) and the
   // rolling refresh. BEFORE ShadowPrepare so the pipeline-copy loop's bound in
@@ -450,6 +472,9 @@ enum class Pipe : uint8_t {
   // table, after the clouds (the prep reads the env pass's wind probe).
   RainMapPrep, RainMapBuild,
   WindStreak,
+  // The god-ray sun visibility volume (godray_vis.wgsl), one per-FRAME row on
+  // the ShadowCache table. Before ShadowResolve for the copy loop's bound.
+  GodrayVis,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and

@@ -154,7 +154,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Scales with the live particle count, not the world. Integrate is the "
      "DDA; resolve is the atomicMax claim."},
     {"gasSys", "Gas Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume;gasFarPlumeWide",
+     "gasLeavePrep;gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume;gasFarPlumeWide",
      "Gas that has left the residency window (docs/PLAN_gas_particles.md). "
      "Scales with the live parcel count, not the world, and is recorded at all "
      "only while parcels exist or the CA has work. What it BUYS is on the "
@@ -243,7 +243,8 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "EVERY tick over the window; GPU is the fills a sentinel chunk needs. Page "
      "FAULTS are a bug, not a cost — the page shows them as a red counter."},
     {"farField", "Far-Field Cascades", "worldStorage", PerfSide::Gpu,
-     PerfScope::Count, "farDown;farDownHash;farFill;farMapFill;farPatchFill",
+     PerfScope::Count, "farDown;farDownHash;farDownClaim;farDownHashClaim;farDownStalk;"
+     "farDownHashStalk;farDownFeat;farDownHashFeat;farFill;farMapFill;farPatchFill",
      "Downsample into the cascade pyramid. Flat per tick; the render-side cost "
      "of reading it is in raymarch."},
 
@@ -252,11 +253,14 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "", "CPU here is draw-call encode and instance uploads only. The GPU cost "
      "of the frame is the raymarch row."},
     {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
-     PerfScope::Count, "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce",
+     PerfScope::Count,
+     "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce;godray_vis",
      "One media-blind shadow ray per visible surface PATCH, instead of one per "
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
-     "trade working (world.h kShadowCacheBuckets)."},
+     "trade working (world.h kShadowCacheBuckets). Also the under-water god-ray "
+     "sun visibility volume (godray_vis.wgsl): one coarse sun ray per 4^3 block "
+     "round a submerged eye, ~0 when the eye is dry."},
     // The clouds (cloud.wgsl): the noise bake (once), the weather / shadow /
     // env maps and the low-res march + temporal resolve, all per FRAME on the
     // ShadowCache table. Zero when weather.clouds is off or the sky is empty —
