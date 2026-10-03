@@ -5113,6 +5113,14 @@ fn farFeatMarch(ro : vec3f, rdIn : vec3f, far : FarHit, tStart : f32) -> FarHit 
   // extra value live here is one fs spills (it runs with trace()'s Hit
   // still held for the shading after it).
   let tCur = max(tStart, far.t - FAR_CARD_MILE);
+  // PAST THE FEATURES' FADE THERE IS NOTHING TO DRAW (2026-10-03,
+  // raymarch-far). farFeatCell scales every card's coverage by
+  // farFeatKeep(tA), tA >= tCur for every cell walked below, and the keep is
+  // non-increasing in t — so once it is 0 at tCur (past FAR_FEAT_END_M, ~87 m)
+  // no card can be hit (bladeCardHit refuses occ <= 0) and the walk is pure
+  // cost: up to FAR_FEAT_STEPS byte and feature-word loads for every far pixel
+  // between the fade and level 2's box. Exact.
+  if (farFeatKeep(tCur) <= 0.0) { return out; }
   let tHand1 = f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK)) *
                f32(1u << farCellShift(1u));
   let level = select(2u, 1u, far.t < tHand1);
