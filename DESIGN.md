@@ -1007,7 +1007,10 @@ SSBO lists of chunk indices.
   The renderer draws a partial cell as a 2x2x2 arrangement DERIVED from its
   mass and its four lateral neighbours (`raymarch.wgsl tracePowder`: bottom
   layer first, quarter-cells beside the highest neighbours first, fixed
-  tie-break), in the deferred-detail second pass the micro bricks use; light
+  tie-break), in the deferred-detail second pass the micro bricks use (a
+  cell of <= 4 eighths whose ray segment stays above its mid-plane is passed
+  as air in the march and costs no record or neighbour read, 2026-10-03 —
+  on the harness desert that second pass is the frame's largest term); light
   (shadow rays, AO, occupancy's blocker count) treats a partial under
   `POWDER_BLOCK_MIN` = 5 eighths as open (`isRayBlockerW`), and the CPU mirror
   walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
@@ -13354,7 +13357,23 @@ where you hear from either (§12b, "The ears are on the character").
   resolution or wide FOV: `RS_LAW_PX`), within 2 samples of the screen edge,
   and whenever the key in word 0 is not this frame's camera, size and frame
   index — every refusal is the old march from the camera, never a skipped
-  surface. Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
+  surface. **The shipped law barely holds where the game is played**
+  (2026-10-03): k = H / (2 tan(fovY/2)) px per voxel at t = 1 must reach
+  3 * 224 = 672, and at the shipped fovY 1.35 that is 675 at 1080p (by 0.4%),
+  562 in the game's own 1600x900 window, and 633 at 1080p as soon as the
+  sprint FOV (`thirdPerson.speedFov`) widens it — and below the law the
+  prepass still ran in full for a reader that ignored it. Now the prepass
+  obeys the law, and below it a WIDE TIER takes over (`ray_start.wgsl` THE
+  LAW): a staggered sample lattice (covering radius 1.25 px instead of 1.41)
+  and a 7x7 min hold the same argument down to 2.5 px; the cascade half is
+  trusted at k >= 2.5 * 224 = 560, and the fine half needs no global law at
+  all because fs() caps each pixel's start at k / 2.5, nearer than which every
+  fine cell is >= 2.5 px. Measured (one process, wide tier vs no map): 1080p
+  at the sprint FOV noon 7.67 -> 6.84 ms, cascade 5.80 -> 5.06, seam 5.30 ->
+  4.77; 1600x900 noon 5.64 -> 5.18, seam 3.82 -> 3.46; pictures at the
+  run-to-run floor. The wide tier is NOT used where the shipped law holds
+  (there it measured +0.13..0.26 ms against the 5x5).
+  Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
   13.49, the prepass's own 0.4-0.8 ms included; primary steps 20.4 -> 3.7 and
@@ -15561,7 +15580,15 @@ from), RGB9E5 with its low bit forced on so that 0 means "never gathered".
 slots are staggered over `giCachePeriod` frames, per SLOT rather than per block
 so the branch stays uniform across a warp — or for a word that reads 0, and
 reads the four block-faces in the face plane bilinearly, as `opennessAt` reads
-its bytes. The openness walk zeroes the cache word on every full walk and for
+its bytes. **On the scheduled frame only ELECTED pixels re-gather** (2026-10-03):
+those whose hit lies within one pixel footprint (widened by 1/cos of the view
+angle) of the face centre, plus a 1-in-32 per-pixel lottery for faces whose
+centre is hidden — before, every pixel of the slot re-gathered the same face
+from the same origin and wrote the same word. Measured -0.08..-0.16 ms on the
+near budget cameras with the picture at the re-run floor; the remaining
+refresh work is 0.2-0.3 ms (runtime-disabled refresh, code compiled in) and the
+loop's footprint ~0.1 ms (code removed), which a compute pass over requested
+faces would take out of the fragment shader. The openness walk zeroes the cache word on every full walk and for
 a reused slot, so moved geometry re-gathers on the next frame that looks at
 it; a slot the walk has not stamped gathers live, as before.
 

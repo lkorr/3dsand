@@ -1404,10 +1404,16 @@ struct Hit {
   // are the volume half; these are the surface half: where the ray first
   // crossed into the liquid, and which cell it entered, so fs() can build a
   // normal there and shade a real air/water interface instead of only tinting.
+  //
+  // PACKED (2026-10-03, raymarch-core): the entry cell is window-local 10 bits
+  // per axis (packWinCell) and the entry face is axis | negative-sign << 2
+  // (packFace). These fields are live from the moment the march records them
+  // to the end of fs() -- across the whole opaque shade, which is where this
+  // shader's spill lives -- so 8 scalars there became 2. Read them back with
+  // hitLiqCell / faceAxis / faceSgn.
   liqT     : f32,     // t of the first liquid entry (0 if none)
-  liqCell  : vec3<i32>,
-  liqAxis  : i32,     // face the ray entered the liquid through
-  liqSgn   : f32,
+  liqCell  : u32,     // packWinCell of the entry cell
+  liqFace  : u32,     // packFace of the face the ray entered the liquid through
   liqPath  : f32,     // total distance travelled INSIDE liquid, fine voxels —
                       // drives per-channel Beer-Lambert depth absorption
 
@@ -1421,10 +1427,8 @@ struct Hit {
   // accumulates depth, so whatever is behind is still shaded normally and the
   // slab tints it by how far the ray travelled inside.
   tsT      : f32,     // t of the first translucent-solid entry (0 if none)
-  tsCell   : vec3<i32>,
-  tsAxis   : i32,     // face the ray entered through
-  tsSgn    : f32,
-  tsMat    : u32,     // which translucent material (palette + absorption)
+  tsCell   : u32,     // packWinCell of the entry cell (fs re-reads its material)
+  tsFace   : u32,     // packFace of the face the ray entered through
   tsPath   : f32,     // distance travelled INSIDE it, in fine voxels
 
   // ---- static micro-detail (see traceMicro) ----
@@ -1439,6 +1443,26 @@ struct Hit {
 };
 
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, R.origin); }
+
+// Hit's packed liquid / translucent-solid entry (see the PACKED note in Hit).
+// A window cell is 0..WORLD_N-1 per axis and world.h refuses WORLD_N = 1024,
+// so 10 bits an axis always holds it (the deferred-detail records rely on the
+// same bound).
+fn packWinCell(c : vec3<i32>) -> u32 {
+  let lc = vec3<u32>(c - R.origin * i32(CHUNK)) & vec3<u32>(0x3FFu);
+  return lc.x | (lc.y << 10u) | (lc.z << 20u);
+}
+fn unpackWinCell(pc : u32) -> vec3<i32> {
+  return R.origin * i32(CHUNK) +
+         vec3<i32>(vec3<u32>(pc & 0x3FFu, (pc >> 10u) & 0x3FFu, (pc >> 20u) & 0x3FFu));
+}
+fn packFace(axis : i32, sgn : f32) -> u32 {
+  return u32(axis) | select(0u, 4u, sgn < 0.0);
+}
+fn faceAxis(f : u32) -> i32 { return i32(f & 3u); }
+fn faceSgn(f : u32) -> f32 { return select(1.0, -1.0, (f & 4u) != 0u); }
+// The +Y-entry default (axis 1, sign -1) the fields are initialised to.
+const FACE_DOWN_Y : u32 = 5u;
 
 fn chunkOcc(cell : vec3<i32>) -> u32 {
   return occupancy[chunkIndexW(cell)];
@@ -2976,15 +3000,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
   out.fireMat = 0u;
   out.gasHalfT = 0.0;
   out.liqT = 0.0;
-  out.liqCell = vec3<i32>(0);
-  out.liqAxis = 1;
-  out.liqSgn = -1.0;
+  out.liqCell = 0u;
+  out.liqFace = FACE_DOWN_Y;
   out.liqPath = 0.0;
   out.tsT = 0.0;
-  out.tsCell = vec3<i32>(0);
-  out.tsAxis = 1;
-  out.tsSgn = -1.0;
-  out.tsMat = 0u;
+  out.tsCell = 0u;
+  out.tsFace = FACE_DOWN_Y;
   out.tsPath = 0.0;
   out.micMat = 0u;
   out.micN = vec3f(0.0, 1.0, 0.0);
@@ -3504,10 +3525,8 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         cellTS = 1.0;
         if (out.tsT == 0.0) {
           out.tsT = tCur;
-          out.tsCell = cell;
-          out.tsAxis = axis;
-          out.tsSgn = sign(rd[axis]);
-          out.tsMat = mat;
+          out.tsCell = packWinCell(cell);
+          out.tsFace = packFace(axis, sign(rd[axis]));
         }
         // fall through and keep marching
       } else if (k == CLASS_POWDER && powderIsPartial(w)) {
@@ -3520,7 +3539,27 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         // POWDER_BLOCK_MIN eighths or more is a whole cube, less is air.
         // Both are bounded answers; on a settled surface the ray that passes
         // through a thin film hits the ground under it one cell later.
-        if (detN < detMax && tCur * VOXEL_METERS <= TUNE_MICRO_LOD_DIST) {
+        //
+        // OVER THE GRAINS (2026-10-03): a cell of 4 or fewer eighths holds
+        // grains in its BOTTOM half only (powderGrainMask fills the bottom
+        // layer first), so a ray whose segment through the cell stays above
+        // the cell's mid-plane cannot meet one. Such a cell is air
+        // here and spends no record: phase 2 would have read four neighbours
+        // to build the arrangement and missed. Measured at noon / meadow /
+        // seam (one process): -0.22 / -0.17 / -0.16 ms, with the phase-2
+        // reject below and the skipped re-read. A grazing ray over sand
+        // terraces crosses several such cells, so the record it saves can
+        // also go to a cell further on instead of the budget fallback.
+        var overGrains = false;
+        if (powderMass(w) <= 4u) {
+          overGrains = min(ro.y + rd.y * tCur,
+                           ro.y + rd.y * min(tMax.x, min(tMax.y, tMax.z))) >
+                       f32(cell.y) + 0.5;
+        }
+        let recordable = detN < detMax && tCur * VOXEL_METERS <= TUNE_MICRO_LOD_DIST;
+        if (recordable && overGrains) {
+          // air (see OVER THE GRAINS)
+        } else if (recordable) {
           let lc = vec3<u32>(cell - wloI);
           let packed = lc.x | (lc.y << 10u) | (lc.z << 20u);
           if (detN == 0) {
@@ -3704,14 +3743,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
           // Entered above the fractional water surface — the interface is
           // at the Y plane where the ray descends to waterY.
           out.liqT = clamp((wy - ro.y) / rd.y, tPrev, tCur);
-          out.liqCell = marchCell;
-          out.liqAxis = 1;
-          out.liqSgn = -1.0;
+          out.liqCell = packWinCell(marchCell);
+          out.liqFace = FACE_DOWN_Y;
         } else {
           out.liqT = tPrev;
-          out.liqCell = marchCell;
-          out.liqAxis = marchAxis;
-          out.liqSgn = sign(rd[marchAxis]);
+          out.liqCell = packWinCell(marchCell);
+          out.liqFace = packFace(marchAxis, sign(rd[marchAxis]));
         }
       }
     }
@@ -3813,6 +3850,62 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       break;
     }
     if (tCur >= tExit) { break; }
+    // ---- A RUN OF IDENTICAL FULL LIQUID: crossed in a tight loop (2026-10-03) --
+    // A primary ray in a lake spends its steps here: 37 water cells a pixel on
+    // the `lake` budget camera, 67 under water (raymarch-shadow-water's
+    // count), every one of them the whole loop above -- chunk test, sentinel
+    // and block tests, three material loads, the media branch, the partial-
+    // fill clip. For a FULL cell (state 7) of a clear liquid with no
+    // emission, every one of those is the same answer as the cell before, and
+    // the contribution is linear in the segment: liqPath += seg, mediaTau +=
+    // seg * opacity, mediaTint += tint * that. So once such a cell has been
+    // processed, the cells after it that hold the SAME material and state
+    // (stain and stamp may differ: neither enters the media sums) are crossed
+    // here with one voxel load and a DDA step each, in the same arithmetic,
+    // in the same order -- the picture is bit-identical (budget cameras lake,
+    // submerged, noon: 0 pixels >= 16/255). The run stops at anything else, at
+    // the chunk boundary (the outer loop owns the per-chunk caches; letting
+    // the run refill them measured worse on the lake camera), at the window,
+    // the step budget, the exit and the 24 m depth cap, exactly where the
+    // outer loop would. Not in the debug view, which tints per cell.
+    // Measured (--render-budget, harness map, one process): lake 11.78 ->
+    // 10.67 ms, submerged 13.29 -> 8.82; noon/seam +0.03..0.06 (code size).
+    if (cellLiq > 0.0 && cellFire == 0.0 && cellOp > 0.0 && waterFrac == 1.0 &&
+        voxState(w) == 7u && !(SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u)) {
+      let runKey = w & 0xFFFFu;   // material + state
+      var sat = false;
+      loop {
+        if (i + 1 >= maxSteps) { break; }
+        if (any(cell < wloI) || any(cell >= wloHi)) { break; }
+        if (any((cell >> vec3<u32>(CHUNK_SHIFT)) != cchC)) { break; }
+        let w2 = voxWordAtEntry(cchPt, cell);
+        if ((w2 & 0xFFFFu) != runKey) { break; }
+        i += 1;
+        if (RENDER_STATS && gRsOn) { gRsTraceSteps += 1u; }
+        let tP = tCur;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+          cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+        } else if (tMax.y < tMax.z) {
+          cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+        } else {
+          cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+        }
+        let sg = tCur - tP;
+        out.liqPath += sg;
+        let dT = sg * cellOp;
+        out.mediaTau += dT;
+        rsAdd(RS_MEDIA, 1u);
+        out.mediaTint += cellTint * dT;
+        if (out.liqPath * VOXEL_METERS > 24.0) {
+          out.saturated = true;
+          out.t = tCur;
+          sat = true;
+          break;
+        }
+        if (tCur >= tExit) { break; }
+      }
+      if (sat || tCur >= tExit) { break; }
+    }
   }
 
   // ======================== PHASE 2: resolve the detail =====================
@@ -3901,7 +3994,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       // not a hole in the plant, and falls back to the cell that was recorded.
       let hc = clamp(vec3<i32>(floor(ro + rd * tHit)), wloI,
                      wloHi - vec3<i32>(1));
-      let hw = voxWordAt(hc);
+      // Grains never use the re-read (hcOk below is false for them), so they
+      // do not pay its dependent load pair either.
+      var hw = 0u;
+      if (!isGrains) { hw = voxWordAt(hc); }
       let hm = voxMat(hw);
       // Grains are clipped to their own cell by construction (tracePowder
       // tests boxes inside it), so they always report the recorded cell.
@@ -3959,14 +4055,13 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       if (out.liqT >= tHit) {
         out.liqT = 0.0;
         out.liqPath = 0.0;
-        out.liqCell = vec3<i32>(0);
-        out.liqAxis = 1;
-        out.liqSgn = -1.0;
+        out.liqCell = 0u;
+        out.liqFace = FACE_DOWN_Y;
       }
       if (out.tsT >= tHit) {
         out.tsT = 0.0;
         out.tsPath = 0.0;
-        out.tsMat = 0u;
+        out.tsCell = 0u;
       }
       if (out.gasHalfT >= tHit) { out.gasHalfT = 0.0; }
       // ---- GRAINS UNDER WATER (docs/PLAN_powder_mass.md §3.4) --------------
@@ -4022,11 +4117,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         if (out.liqT >= fh.t) {
           out.liqT = 0.0;
           out.liqPath = 0.0;
-          out.liqCell = vec3<i32>(0);
-          out.liqAxis = 1;
-          out.liqSgn = -1.0;
+          out.liqCell = 0u;
+          out.liqFace = FACE_DOWN_Y;
         }
-        if (out.tsT >= fh.t) { out.tsT = 0.0; out.tsPath = 0.0; out.tsMat = 0u; }
+        if (out.tsT >= fh.t) { out.tsT = 0.0; out.tsPath = 0.0; out.tsCell = 0u; }
         if (out.gasHalfT >= fh.t) { out.gasHalfT = 0.0; }
       }
     }
@@ -4102,7 +4196,16 @@ fn tracePowder(dc : vec3<i32>, dw : u32, entry : vec3f, inv : vec3f) -> MicroHit
   mh.curved = false;
   mh.key = 0u;
   mh.n = vec3f(0.0);
-  let mask = powderGrainMask(dc, powderMass(dw));
+  let mass = powderMass(dw);
+  // The march's OVER THE GRAINS test, on the exact segment: 4 eighths or
+  // fewer sit in the bottom half, so a ray that never goes below the mid-plane
+  // inside the cell misses before the four neighbour reads.
+  if (mass <= 4u) {
+    let tEx = (select(vec3f(0.0), vec3f(1.0), inv > vec3f(0.0)) - entry) * inv;
+    let yEx = entry.y + min(tEx.x, min(tEx.y, tEx.z)) / inv.y;
+    if (min(entry.y, yEx) > 0.5) { return mh; }
+  }
+  let mask = powderGrainMask(dc, mass);
   var best = 1e30;
   var bestAxis = 1;
   for (var i = 0u; i < 8u; i++) {
@@ -5160,8 +5263,19 @@ const RS_FAR_REL : f32 = 0.02;
 // wide on screen. A fine voxel is narrowest at the far end of the fine march,
 // a cascade cell at its level's handoff sphere (the kFarN law: 3.5 px at
 // 1080p and camera.fovY 1.2). Below it — a low resolution, a wide FOV — the
-// map is not trusted at all and every ray marches from the camera.
+// map is not trusted at all and every ray marches from the camera — and
+// ray_start.wgsl, which applies the same law (rayStartLawOk), does not march
+// the map either (see the note there: below the law the prepass used to run
+// in full for a reader that ignored it).
 const RS_LAW_PX : f32 = 3.0;
+// The wide tier below that law (ray_start.wgsl THE LAW has the argument): a
+// staggered lattice and a 7x7 min hold it down to 2.5 px. The cascade half
+// needs k >= 2.5 * RS_FAR_MAX_CELLS; the fine half needs no global law,
+// because fs() caps every pixel's start at k / RS_LAW_WIDE_PX (RS_NEAR_CAP),
+// nearer than which every fine cell is >= 2.5 px; a frame whose cap is under
+// RS_NEAR_MIN_VOX builds no map at all.
+const RS_LAW_WIDE_PX : f32 = 2.5;
+const RS_NEAR_MIN_VOX : f32 = 32.0;
 const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
                                      TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
                                      TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
@@ -5192,13 +5306,16 @@ fn rayStartKey() -> u32 {
 // Called twice by fs() — before trace() and after it — rather than carried
 // across the fine march: a value live across trace()'s loop is the register
 // cliff (gotcha-raymarch-register-cliff).
-fn rayStartAt(px : vec2f) -> f32 {
+// `far` = the caller is the cascade start, which needs the cascade's law.
+fn rayStartAt(px : vec2f, far : bool) -> f32 {
   if (!RAY_START) { return 0.0; }
   let d = rayStartDims();
   let q = (d + vec2<u32>(1u)) / 2u;
   if (RS_HEADER + 2u * q.x * q.y > arrayLength(&rayStart)) { return 0.0; }
   let k = R.viewPx * 0.5 / R.tanHalfFov;   // px per fine voxel at t = 1
-  if (k < RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS)) { return 0.0; }
+  if (k < RS_LAW_WIDE_PX * RS_NEAR_MIN_VOX) { return 0.0; }
+  if (far && k < RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS) &&
+      k < RS_LAW_WIDE_PX * RS_FAR_MAX_CELLS) { return 0.0; }
   if (rayStart[0] != rayStartKey()) { return 0.0; }
   let i = min(u32(max(px.x, 0.0)) >> 1u, q.x - 1u);
   let j = min(u32(max(px.y, 0.0)) >> 1u, q.y - 1u);
@@ -6740,12 +6857,41 @@ fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
   if (opennessGen[slot] != opennessStamp(worldChunkOf(c))) { return 0u; }
   return irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)];
 }
+// ---- ONE GATHER PER BLOCK-FACE, NOT ONE PER PIXEL (2026-10-03) ---------------
+// A slot's refresh frame used to re-gather in EVERY pixel of the slot that
+// landed on a stale face: a 4x4-voxel block-face is hundreds of pixels at a
+// few metres, every one of them casting the same nine rays from the same
+// face-centre origin and writing the same word. The gather is a function of
+// the FACE, so one pixel per face is enough: the pixels whose hit lies within
+// one pixel footprint of the face centre on both tangent axes (~2x2 of them),
+// plus a 1-in-32 per-pixel lottery so a face whose centre is hidden behind
+// something still refreshes (a face with N visible pixels: 1 - (31/32)^N
+// per due frame). The window is widened by 1/cos of the view angle, so a face
+// seen at a graze -- most of the ground from eye height -- still has its
+// centre pixel. Both were measured against the picture: with a fixed
+// one-footprint window and a 1/256 lottery the GI cache lagged on grazing and
+// half-hidden faces and the meadow camera moved 0.69% of its pixels by
+// >= 16/255 (block-shaped bounce differences); with the cosine and 1/256,
+// 0.15%; with both as shipped, 0.005% -- the re-run floor. A tile-coherent
+// lottery (whole 8x8 tiles, 1/8) was 0.05-0.1 ms cheaper and 0.19% off.
+// A face read for the first time (`own == 0`) still gathers in every pixel
+// that sees it, exactly as before -- one frame, then cached.
+//
+// And ONE CALL SITE: the unstamped-slot path (no cache, a per-pixel gather
+// from the hit) and the cache refresh used to be two inlined copies of the
+// nine-ray loop; they now pick an origin and share one.
+//
+// Measured, --render-budget 1080p (per-pixel-everywhere -> this, boots
+// alternated): noon 6.75 -> 6.67 ms, meadow 5.64 -> 5.52, seam 4.75 -> 4.61,
+// seamveg 7.60 -> 7.44. The 1/256 lottery bought twice that (noon -0.27,
+// meadow -0.39) and moved the picture; the ceiling -- no gather in fs at all
+// -- is noon 6.17 / meadow 4.85: the rest is the loop's register footprint
+// plus the warps that still gather, which only a compute pass over requested
+// faces removes (see giGatherRays).
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
   let slot = chunkIndexW(cell);
-  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) {
-    return giGather(p, n, cell);
-  }
+  let stamped = opennessGen[slot] == opennessStamp(worldChunkOf(cell));
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
   let idx = GI_CACHE_BASE + irrIndex(slot, subOccBitLocal(lo), face);
@@ -6756,13 +6902,50 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   // silently measured nothing for exactly that reason).
   let phase = (R.frameIdx + ((slot * 2654435761u) >> 24u)) %
               max(u32(TUNE_GI_CACHE_PERIOD), 1u);
-  if (own == 0u || phase == 0u) {
-    let half = f32(SUBOCC_BLOCK) * 0.5;
-    let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
-    let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
+  let half = f32(SUBOCC_BLOCK) * 0.5;
+  let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
+  var due = own == 0u;
+  if (!due && phase == 0u) {
+    // The election (see above): this pixel's hit against the face centre on
+    // the two tangent axes, in pixel footprints at its distance.
+    let dc = abs(p - (vec3f(blockMin) + vec3f(half)));
+    let ax = face >> 1u;
+    let du = select(dc.x, dc.y, ax == 0u);
+    let dv = select(dc.z, dc.y, ax == 2u);
+    // One pixel's footprint on the face: its width at this distance, divided
+    // by the cosine of the view angle so a face seen at a graze (a floor from
+    // eye height, footprint stretched along the view) still has a pixel
+    // inside the window. Unclamped on purpose: a face seen so edge-on that
+    // the window outgrows the block elects every pixel on it, which is the
+    // old behaviour for a face that is only a few pixels tall anyway.
+    let toP = p - R.camPos;
+    let dist = length(toP);
+    let cosV = max(abs(dot(n, toP)) / max(dist, 1e-3), 1e-3);
+    let fp = max(dist * R.tanHalfFov * 2.0 / R.viewPx / cosV, 1e-3);
+    let lottery = (pcg(bitcast<u32>(p.x) ^ (bitcast<u32>(p.z) * 747796405u) ^
+                       (bitcast<u32>(p.y) * 2891336453u) ^ R.frameIdx) & 31u) == 0u;
+    due = (du < fp && dv < fp) || lottery;
+  }
+  // The origin: the face centre half a voxel past the block's far plane for
+  // the cache, or -- for a slot the openness walk has not stamped, which has
+  // no cache -- giGather's per-pixel origin off the hit.
+  var ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
+  if (!stamped) {
+    due = true;
+    let ci = axisPickI(cell, i32(face >> 1u));
+    let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
+    let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
+    let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
+                      (face & 1u) != 0u) + 0.5;
+    ro = p + n * dOut;
+  }
+  var g = vec3f(0.0);
+  if (due) { g = giGatherRays(ro, n, face); }
+  if (!stamped) { return g; }
+  if (due) {
     // The low bit forced on: 0 must mean "never", and a face in the dark
     // gathers a true zero.
-    own = packRgb9e5(giGatherRays(ro, n, face)) | 1u;
+    own = packRgb9e5(g) | 1u;
     irradiance[idx] = own;
   }
   if (TUNE_OPENNESS_BILINEAR == 0) { return unpackRgb9e5(own); }
@@ -12181,10 +12364,14 @@ fn fs(in : VSOut) -> FSOut {
   // conservative first hit says nothing can come sooner. Folded into trace's
   // start and dead before its loop; RS_NONE (nothing anywhere in reach) makes
   // the fine march one cell long and skips the cascade below.
-  let rs0 = rayStartAt(in.pos.xy);
-  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true,
-                select(max(rs0 * (1.0 - RS_NEAR_REL) - RS_NEAR_ABS, 0.0), RS_NONE,
-                       rs0 >= RS_NONE));
+  let rs0 = rayStartAt(in.pos.xy, false);
+  var tMin0 = select(max(rs0 * (1.0 - RS_NEAR_REL) - RS_NEAR_ABS, 0.0), RS_NONE,
+                     rs0 >= RS_NONE);
+  // RS_NEAR_CAP: nearer than k / 2.5 every fine cell is >= 2.5 px wide, which
+  // is all the per-pixel argument needs (rayStartAt). Inert in the shipped
+  // tier, where k / 2.5 >= 269 lies past the fine march's 205-voxel end.
+  tMin0 = min(tMin0, R.viewPx * 0.5 / R.tanHalfFov / RS_LAW_WIDE_PX);
+  let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true, tMin0);
   rsAdd(RS_PRIMARY, gRsTraceSteps);
 
   // Rays that leave the window without a surface hit (and weren't absorbed by
@@ -12195,7 +12382,7 @@ fn fs(in : VSOut) -> FSOut {
     // Re-read, not carried across trace() (rayStartAt says why). The cascade
     // starts at the map's distance less RS_FAR_REL, never before the fine
     // march handed over.
-    let rs1 = rayStartAt(in.pos.xy);
+    let rs1 = rayStartAt(in.pos.xy, true);
     if (rs1 < RS_NONE) {
       // in.pos.xy is the fragment's pixel coordinate — the dither key (see
       // farDither: screen-space, time-free, stable per pixel)
@@ -12348,7 +12535,7 @@ fn fs(in : VSOut) -> FSOut {
   // they are near-opaque and their shade records no veil.
   if (h.liqT > 0.05 && (tDepth < 0.0 || h.liqT < tDepth)) {
     if (!WATER_VEIL ||
-        isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))])) {
+        isViscousLiquid(materials[voxMat(voxWordAt(unpackWinCell(h.liqCell)))])) {
       tDepth = h.liqT;
     }
   }
@@ -13254,7 +13441,8 @@ fn fs(in : VSOut) -> FSOut {
   // tests for one fact is what let a whole excited footprint get shaded twice.
   var caShadedLiquid = false;
   if (h.liqT > 0.0) {
-    let lm = voxMat(voxWordAt(h.liqCell));
+    let liqCell = unpackWinCell(h.liqCell);
+    let lm = voxMat(voxWordAt(liqCell));
     if (lm != MAT_AIR && materials[lm].klass == CLASS_LIQUID) {
       let hitP = R.camPos + rd * h.liqT;
       let underwater = h.liqT < 0.05;
@@ -13300,7 +13488,7 @@ fn fs(in : VSOut) -> FSOut {
         caShadedLiquid = true;
         veilT = 0.0;
       } else if (isViscousLiquid(materials[lm])) {
-        color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+        color = shadeViscous(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              h.liqT, underwater);
         // Dissolved matter in a viscous solvent (fairy dust or salt in
@@ -13308,7 +13496,7 @@ fn fs(in : VSOut) -> FSOut {
         // the shaded surface is pulled toward the tint at its own brightness,
         // plus the species' glow. After the shade, so nothing is live across
         // its reflection work.
-        let vsol = solLookAt(h.liqCell, lm);
+        let vsol = solLookAt(liqCell, lm);
         if (vsol.a > 0.0 || vsol.g > 0.0) {
           let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
           color = mix(color, vsol.tint * (lum * 2.2), vsol.a * 0.7) +
@@ -13318,7 +13506,7 @@ fn fs(in : VSOut) -> FSOut {
         caShadedLiquid = true;
       } else if (!mpmOwned) {
         rsAdd(RS_PX_WATER, 1u);
-        color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
+        color = shadeWater(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
@@ -13335,7 +13523,7 @@ fn fs(in : VSOut) -> FSOut {
       // short sun ray; every other pixel in the frame pays nothing, and with
       // render.mistDensity at 0 so does this one.
       if (!underwater && caShadedLiquid) {
-        color = waterfallMist(color, hitP, rd, h.liqT, h.liqCell, lm);
+        color = waterfallMist(color, hitP, rd, h.liqT, liqCell, lm);
       }
       // After the mist, which hangs between the eye and the surface and so
       // covers a body under it exactly as it covers the bed.
@@ -13367,10 +13555,11 @@ fn fs(in : VSOut) -> FSOut {
     // Re-read defensively, exactly as the water path does: a hot material
     // reload between trace and shade would otherwise index the wrong
     // absorption.
-    let tm = voxMat(voxWordAt(h.tsCell));
+    let tsCell = unpackWinCell(h.tsCell);
+    let tm = voxMat(voxWordAt(tsCell));
     if (tm != MAT_AIR && isTranslucentSolid(materials[tm])) {
       let hitP = R.camPos + rd * h.tsT;
-      color = shadeTranslucent(hitP, rd, tm, h.tsCell, h.tsAxis, h.tsSgn,
+      color = shadeTranslucent(hitP, rd, tm, tsCell, faceAxis(h.tsFace), faceSgn(h.tsFace),
                                h.tsPath, color, h.tsT, in.pos.xy);
       // Fog from the ice surface, not from whatever is behind it.
       color = applyAerial(color, rd, h.tsT);
@@ -13403,7 +13592,7 @@ fn fs(in : VSOut) -> FSOut {
   //     surface. It cannot be a real interface: the ray was inside water before
   //     it got there, which is precisely what caShadedLiquid records.
   if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
-    let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(h.liqCell)), h.liqT > 0.0);
+    let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(unpackWinCell(h.liqCell))), h.liqT > 0.0);
     // caMatRaw IS the liquid cell's material whenever liqT > 0.05 > 0.
     let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
                         && isViscousLiquid(materials[caMatRaw]);
