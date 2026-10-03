@@ -723,6 +723,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // TICK command buffer, covered by the global barrier every command
         // buffer opens with.
         entry(35, T::ReadOnlyStorage, S::Vertex),                 // draft
+        // THE HEAT LAYER (sim_heat.wgsl), read-only: the F4 arrows' windAt
+        // adds the heat term (common.wgsl windHeatF, the BOUND_RO reader).
+        // Same standing and arrow as the draft at 35: written on the TICK
+        // command buffer, covered by the global barrier every command buffer
+        // opens with (and BeginRendering joins any async work). Two more
+        // descriptors per render bind group (descriptor pool: rhi_vulkan.h).
+        entry(36, T::ReadOnlyStorage, S::Vertex),                 // heatPool
+        entry(37, T::ReadOnlyStorage, S::Vertex),                 // heatMeta
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -950,7 +958,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     // The gust streak pool: fixed, zeroed (lifetime 0 = never spawned).
     {
       const uint64_t words = (1ull + (uint64_t)kWindStreakCap * kWindStreakStride) * 4ull;
-      windStreakBuf_ = CreateBuffer(device, words * 4ull, U::Storage | U::CopyDst, "windStreaks");
+      // CopySrc: the heat-updraft gate reads probe streaks back (test only).
+      windStreakBuf_ = CreateBuffer(device, words * 4ull, U::Storage | U::CopyDst | U::CopySrc,
+                                    "windStreaks");
       std::vector<uint32_t> zero((size_t)words, 0u);
       device.GetQueue().WriteBuffer(windStreakBuf_, 0, zero.data(), zero.size() * 4);
     }
@@ -1021,6 +1031,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The wind-draft volume: the streak update advects by windAt, which
         // reads it (written on the tick command buffer).
         entry(24, T::ReadOnlyStorage), // draft
+        // The heat layer, read-only: the streak update's windAt adds the heat
+        // term (common.wgsl windHeatF). The wind_streak row declares
+        // R(HeatPool) R(HeatMeta), which orders it after the tick's writers.
+        entry(25, T::ReadOnlyStorage), // heatPool
+        entry(26, T::ReadOnlyStorage), // heatMeta
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -3682,6 +3697,8 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(34, rainMapBuf_),
         b(33, windStreakBuf_),
         b(35, draftBuf_),
+        b(36, world_->heatPool),
+        b(37, world_->heatMeta),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -3774,6 +3791,8 @@ void Simulation::BuildShadowBindGroup() {
       b(23, rainMapBuf_),
       b(22, windStreakBuf_),
       b(24, draftBuf_),
+      b(25, world_->heatPool),
+      b(26, world_->heatMeta),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

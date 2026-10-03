@@ -414,6 +414,10 @@ class Simulation {
   // harness that pinned a windy regime and must not leave its streaks, frozen,
   // in the frames that follow.
   void ClearWindStreaks();
+  // The pool itself, for a gate that seeds probe streaks and reads back where
+  // one update moved them (heat-updraft: the render windAt over heat). Test
+  // only; the frame path never reads it back.
+  const rhi::Buffer& WindStreakBuffer() const { return windStreakBuf_; }
   // The current field's arrows (docs/PLAN_water_master.md component 8).
   void DrawCurrentField(const rhi::RenderPass& pass, uint32_t arrows);
   // Body cubes: vertices per instance (three camera-facing faces, see

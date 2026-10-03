@@ -864,11 +864,14 @@ PASS(copy_gasArgs_dispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_N
 // R(FarVox) + U(FarUBO): blocking outside the window, the cascade's level-1
 // byte. Dense toroidal array, direct index, NOT the page table.
 // R(Reactions): the material's own RK_DECAY bucket (§2.7).
+// R(HeatPool) A(HeatMeta): the heat term in a parcel's wind (windAtQ, and the
+// heavy-gas lift windHeatUpQ; sim_gas.wgsl THE HEAT TERM ON A PARCEL), read
+// after this tick's heat passes wrote them, as the particle row reads them.
 PASS(gasIntegrate, "gasIntegrate+args2", PT_TICK, PIPE_GAS_INTEGRATE, K_INDIRECT, IND_GASARGS,0,0,
      GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
      USES(R(Voxels) R(Materials) R(Reactions) U(TickUBO) U(FarUBO) R(FarVox)
           I(GasDispatchArgs) RW(GasParticlesRead) W(GasParticlesWrite)
-          A(GasCounts) A(GasClaim) A(GasSpawn) R(PageTable)))
+          A(GasCounts) A(GasClaim) A(GasSpawn) R(PageTable) R(HeatPool) A(HeatMeta)))
 PASS(gasArgs2, "gasIntegrate+args2", PT_TICK, PIPE_GAS_ARGS2, K_COMPUTE, 1,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
      USES(U(TickUBO) A(GasCounts) A(GasSpawn) W(GasArgsStage)))
@@ -910,9 +913,13 @@ PASS(gasResolve, "gasResolve", PT_TICK, PIPE_GAS_RESOLVE, K_INDIRECT, IND_GASARG
 // plume's lateral offsets, read and rewritten every tick (world.h
 // kGasPlumeTrackSlots); both rows touch it, so they serialize on it.
 // R(Materials): the plume names its gas by property for its wind response.
+// R(HeatPool) A(HeatMeta): plumeDrift reads windAtQ, whose heat term the
+// module now binds (gasIntegrate's reason). A far fire is outside the window,
+// where the pool has no page, so the term reads 0 there -- but it is read.
 PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAREMIT,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GASFAR, 1,
-     USES(U(TickUBO) R(Materials) R(GasFarEmit) A(GasOuter) A(GasPlumeTrack)))
+     USES(U(TickUBO) R(Materials) R(GasFarEmit) A(GasOuter) A(GasPlumeTrack)
+          R(HeatPool) A(HeatMeta)))
 // ...and the same kernel one LOD out, into the long-range box. Its own
 // condition, so a world whose only distant fire is 300 m away records THIS row
 // and not the one above it -- the two emitter lists are disjoint by
@@ -923,7 +930,8 @@ PASS(gasFarPlume, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUME, K_COMPUTE, D_GASFAR
 // R(GasFarEmit) for the list, A(GasFarOuter) for the only thing it produces.
 PASS(gasFarPlumeWide, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUMEW, K_COMPUTE, D_GASFARWIDE,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GASWIDE, 1,
-     USES(U(TickUBO) R(Materials) R(GasFarEmit) A(GasFarOuter) A(GasPlumeTrack)))
+     USES(U(TickUBO) R(Materials) R(GasFarEmit) A(GasFarOuter) A(GasPlumeTrack)
+          R(HeatPool) A(HeatMeta)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 // W(ChunkHash) and not A(ChunkHash): the digest is a PLAIN STORE per slot (one
@@ -1455,9 +1463,15 @@ PASS(ray_start_trace, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_TRACE, K_COMPUT
 // respawn dead slots where the gust excess is high. RW on its own buffer; the
 // streak DRAW reads it in the vertex stage of the same command buffer, which
 // BeginRendering's FlushForRenderDomain covers. C_STREAKS = streakAlpha > 0.
+// R(HeatPool) R(HeatMeta) (2026-10-02): windAt adds the heat term (common.wgsl
+// windHeatF, the BOUND_RO reader: plain loads, hence R and not A). The
+// recorder's tracker orders this read after the tick's heat writers (heatRelax
+// and friends, A(HeatMeta) RW(HeatPool)); nothing on the async queue touches
+// either buffer (the PT_DERIVED rows are openness and glow), so the read
+// never splits a command buffer for a join it does not need.
 PASS(wind_streak, "windStreaks", PT_SHADOWCACHE, PIPE_WIND_STREAK, K_COMPUTE, D_STREAKGX,1,1,
      GRP_SHADOW, DYN_NONE, C_STREAKS, 1,
-     USES(U(RenderUBO) RW(WindStreaks) R(Draft)))
+     USES(U(RenderUBO) RW(WindStreaks) R(Draft) R(HeatPool) R(HeatMeta)))
 PASS(ray_start_min, "rayStart", PT_SHADOWCACHE, PIPE_RAY_START_MIN, K_COMPUTE, D_RSGX,D_RSGY,1,
      GRP_SHADOW, DYN_NONE, C_RAYSTART, 1,
      USES(U(RenderUBO) RW(RayStart)))

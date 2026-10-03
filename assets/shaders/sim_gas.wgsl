@@ -44,6 +44,14 @@
 // debris lands through a DDA — and "which kernel dropped the store" is the
 // whole point of the per-kernel tally.
 const PT_KERNEL : u32 = PT_K_GAS;
+// THE HEAT LAYER (simSlimBGL_ 50/51, the numbers sim_particle binds them at).
+// Declaring heatPool is what keeps common.wgsl's BOUND heat reader in this
+// module (resources.cpp kHeatWindBound*), so a parcel's windAtQ carries the
+// heat term -- the lift and the inflow -- like every other sim consumer of the
+// field (2026-10-02; before, this module compiled the zero stub). heatMeta is
+// atomic in every sim module that names it. Read only.
+@group(0) @binding(50) var<storage, read> heatPool : array<u32>;
+@group(0) @binding(51) var<storage, read_write> heatMeta : array<atomic<u32>>;
 
 @group(1) @binding(0)  var<storage, read_write> gasRead : array<Particle>;
 @group(1) @binding(1)  var<storage, read_write> gasWrite : array<Particle>;
@@ -366,6 +374,99 @@ fn gasAppend(p : Particle) {
 // keys on gasKey (a hash of its cell and payload) and rolls once per TICK, so
 // every call below passes substep 0.
 
+// ---- THE HEAT TERM ON A PARCEL (2026-10-02) -------------------------------
+// WHERE IT REACHES. The heat pool is WINDOW-ONLY (sim_heat.wgsl): a chunk
+// outside residency has no page and reads X = 0. A parcel lives outside the
+// window (the CA's edge sink made it), so the term reaches only two kinds of
+// parcel: one within the lift's 32-voxel look-down ABOVE the window's top face,
+// over heat just under that face; and one still INSIDE the window -- a CPU
+// spawn (a bench's fumes, a broken flask) on its first tick, or a parcel whose
+// re-entry claim lost. Everywhere else windHeatQ costs its two shared loads and
+// returns zero, which is the same early-out every sim consumer pays.
+//
+// A LIGHT GAS gains nothing it can see in height: it already rises one cell a
+// tick in calm air, the ceiling, exactly as the CA's voxels do. The lift
+// STRAIGHTENS it (cancels a crosswind lean, gasIntentW's `fh - up`) and the
+// inflow draws it toward the column.
+//
+// A HEAVY GAS (MATF_HEAVY_GAS, common.wgsl) is where the lift shows, and it
+// takes the CA's rule verbatim (sim_step.wgsl stepHeavyGas): it reads the
+// heat's LIFT alone, never the whole field, and only past HEAVY_LIFT_FLOOR
+// (1 m/s) -- otherwise it sinks or creeps. Before this a heavy parcel took the
+// light-gas roll and ROSE, which the `gas_heavy` tag says it never does.
+//
+// THE HOVER, AND ITS BOUND. Over PERMANENT heat (lava) in calm air a heavy
+// parcel has a stable height: below it the lift carries it up, above it the
+// lift (which ends a few cells past the 32-voxel look-down) falls under the
+// floor and it sinks. Nothing but the material's authored decay ended that,
+// and a heavy gas authored without decay would hover forever (rule 2). So a
+// parcel keeps sim_particle.wgsl's HEAT-LIFT AGE: bits 19..26 of `flags` count
+// the ticks it has spent with lift at its cell; for GAS_HEAT_FULL_TICKS it
+// answers to the whole heat term, over the next GAS_HEAT_FADE_TICKS the term
+// is withdrawn linearly, and after that it moves by the ambient field alone.
+// Integer, a pure function of the parcel and the tick's heat; the non-heat
+// wind is never touched. A new parcel starts at 0 (gasSpawnStep writes the
+// flags whole); the age survives a lost claim (gasResolve) and a morph.
+// particlePriority does not read `flags`, so the claim order is unchanged.
+// Bits 0..2 and 13 are ALIVE / PENDING / MICRO and GAS; 19..26 are free here.
+const GHEAT_AGE_SHIFT : u32 = 19u;
+const GHEAT_AGE_MASK : u32 = 0xFFu;
+const GAS_HEAT_FULL_TICKS : i32 = 60;
+const GAS_HEAT_FADE_TICKS : i32 = 60;
+
+// One more tick in lift: advance the age and return how many FADE steps of the
+// heat term are withdrawn (0 for the first GAS_HEAT_FULL_TICKS).
+fn gasHeatAge(p : ptr<function, Particle>) -> i32 {
+  let age = min(((*p).flags >> GHEAT_AGE_SHIFT) & GHEAT_AGE_MASK, GHEAT_AGE_MASK - 1u) + 1u;
+  (*p).flags = ((*p).flags & ~(GHEAT_AGE_MASK << GHEAT_AGE_SHIFT)) | (age << GHEAT_AGE_SHIFT);
+  return clamp(i32(age) - GAS_HEAT_FULL_TICKS, 0, GAS_HEAT_FADE_TICKS);
+}
+
+// The wind a LIGHT parcel moves by: windAtQ at its cell, with the heat term's
+// share withdrawn by the age. Zero when the wind is off or the material does
+// not respond, so gasIntentW / windLateralStartW take their calm identity path
+// exactly as gasIntentK / windLateralStartK did.
+fn gasWindAt(p : ptr<function, Particle>, c : vec3<i32>, m : Material) -> vec3<i32> {
+  if (T.windMode == WIND_MODE_OFF || matWindResponse(m) == 0u) { return vec3<i32>(0); }
+  var w = windAtQ(c, &T);
+  if (windHeatUpQ(c, &T) > 0) {
+    let gone = gasHeatAge(p);
+    // Divide first: |h| reaches a few x 2^24, so h * gone could leave i32.
+    if (gone > 0) { w -= (windHeatQ(c, &T) / GAS_HEAT_FADE_TICKS) * gone; }
+  }
+  return w;
+}
+
+// A HEAVY parcel's move: stepHeavyGas's rule with the parcel's own blocking
+// test (gasBlocked: air, a gas, or open far cascade). The lift alone, past the
+// floor, as a chance ramped by windAxisFrac and the material's response; then
+// down or a lateral, then the other laterals. Same rnd bits as the CA's (22+
+// the lift roll, 9 the down/lateral pick, 12+ the rotation). Returns the cell
+// it moves to, or c when every candidate is blocked (it waits; the decay
+// bounds it).
+fn gasHeavyStep(p : ptr<function, Particle>, c : vec3<i32>, m : Material, rnd : u32) -> vec3<i32> {
+  if (T.windMode != WIND_MODE_OFF && matWindResponse(m) != 0u) {
+    var wy = windHeatUpQ(c, &T);
+    if (wy > 0) { wy -= (wy / GAS_HEAT_FADE_TICKS) * gasHeatAge(p); }
+    if (wy > HEAVY_LIFT_FLOOR) {
+      let pr = min(windAxisFrac(wy - HEAVY_LIFT_FLOOR, i32(matWindResponse(m)), &T), 1024);
+      let up = c + vec3<i32>(0, 1, 0);
+      if (i32((rnd >> 22u) & 1023u) < pr && !gasBlocked(up)) { return up; }
+    }
+  }
+  let rot = rnd >> 12u;
+  let lat0 = lateralDir(rot);
+  var first = vec3<i32>(lat0.x, 0, lat0.y);
+  if (((rnd >> 9u) & 1u) == 0u) { first = vec3<i32>(0, -1, 0); }
+  if (!gasBlocked(c + first)) { return c + first; }
+  for (var i = 1u; i < 5u; i++) {
+    let d = lateralDir(rot + i);
+    let n = c + vec3<i32>(d.x, 0, d.y);
+    if (!gasBlocked(n)) { return n; }
+  }
+  return c;
+}
+
 // ---- the outer box ---------------------------------------------------------
 // T.origin is in CHUNK units. The box edge is 2x the window's and centred on
 // it, so its min corner sits half a window below the window's min corner. The
@@ -575,7 +676,14 @@ fn gasDecayProduct(m : Material, key : u32) -> u32 {
     if ((rule.cond & RSCALE_ON) != 0u) { continue; }
     let chance = reactGate(rule.cond, rule.chance, day, T.weatherRain, true, true);
     if (chance == 0u) { continue; }
-    let rr = hash3(key, ri, GAS_DECAY_SALT);
+    // THE TICK IS IN THE ROLL (2026-10-02). gasKey is a function of the CELL
+    // and payload only, so without it a parcel that revisits the same few
+    // cells -- boxed in, or a heavy one hovering over heat, up one and back
+    // down -- re-rolled the same numbers forever: if they failed once they
+    // failed every tick, and "bounded by its authored decay" was false for
+    // exactly the parcels that do not travel. A rising parcel had a new key
+    // every tick anyway, so its expected lifetime is unchanged.
+    let rr = hash3(key, ri, GAS_DECAY_SALT ^ (T.tick * 0x9E3779B9u));
     if ((rr % REACT_CHANCE_DEN) < chance) { return rule.prodSelf; }
   }
   return 0xFFFFFFFFu;
@@ -715,21 +823,30 @@ fn gasIntegrate(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   // ---- motion: the grid model, verbatim (§2.2) -----------------------------
   let rnd = gasRndK(key, 2u, 0u, &T);
-  let g = gasIntentK(c, m, key, rnd >> 10u, 0u, &T);
   var tgt = c;
-  var found = false;
-  for (var i = 0u; i < GAS_LADDER_RING; i++) {
-    let s = gasLadderStep(g, 0u, 0u, i);
-    if (s.w == 0) { continue; }
-    let n = c + s.xyz;
-    if (!gasBlocked(n)) { tgt = n; found = true; break; }
-  }
-  if (!found) {
-    let rUp  = windLateralStartK(c, rnd >> 10u, m, key, 0u, &T);
-    let rLat = windLateralStartK(c, rnd >> 14u, m, key, 0u, &T);
-    for (var i = GAS_LADDER_RING; i < GAS_LADDER_N; i++) {
-      let n = c + gasLadderStep(g, rUp, rLat, i).xyz;
+  if ((m.flags & MATF_HEAVY_GAS) != 0u) {
+    // A heavy gas never takes the buoyant roll (THE HEAT TERM ON A PARCEL).
+    tgt = gasHeavyStep(&p, c, m, rnd);
+  } else {
+    // The wind is read ONCE, with the heat share aged (gasWindAt), and both
+    // the intent and the fallback ring use it: with no heat at the cell it is
+    // windAtQ exactly, which is what gasIntentK / windLateralStartK read.
+    let w = gasWindAt(&p, c, m);
+    let g = gasIntentW(w, m, key, rnd >> 10u, 0u, &T);
+    var found = false;
+    for (var i = 0u; i < GAS_LADDER_RING; i++) {
+      let s = gasLadderStep(g, 0u, 0u, i);
+      if (s.w == 0) { continue; }
+      let n = c + s.xyz;
       if (!gasBlocked(n)) { tgt = n; found = true; break; }
+    }
+    if (!found) {
+      let rUp  = windLateralStartW(w, rnd >> 10u, m, key, 0u, &T);
+      let rLat = windLateralStartW(w, rnd >> 14u, m, key, 0u, &T);
+      for (var i = GAS_LADDER_RING; i < GAS_LADDER_N; i++) {
+        let n = c + gasLadderStep(g, rUp, rLat, i).xyz;
+        if (!gasBlocked(n)) { tgt = n; found = true; break; }
+      }
     }
   }
   // Nowhere to go: stay put and try again next tick. Bounded by the decay.
@@ -779,8 +896,9 @@ fn gasResolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
     // Lost the claim, or the cell was taken between integrate and resolve.
     // Stay a parcel and retry next tick; it is not stuck, because next tick
-    // the cell reads non-air and the ladder routes it somewhere else.
-    p.flags = PFLAG_ALIVE | PFLAG_GAS;
+    // the cell reads non-air and the ladder routes it somewhere else. The
+    // heat-lift age rides along (a lost claim is not a fresh parcel).
+    p.flags = PFLAG_ALIVE | PFLAG_GAS | (p.flags & (GHEAT_AGE_MASK << GHEAT_AGE_SHIFT));
     gasWrite[gid.x] = p;
   }
 

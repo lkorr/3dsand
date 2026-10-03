@@ -2964,11 +2964,13 @@ def check_react_fx():
         ("RFX_SCRAMBLE", wh, r"kReactFxScramble\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?;"),
         ("RFX_COND_SHIFT", hpp, r"kCondFxShift\s*=\s*(\w+?)u?,"),
         ("RFX_COND_MASK", hpp, r"kCondFxMask\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?;"),
+        # In common.wgsl since 2026-10-02: sim_gas's parcels obey the rule too.
         ("MATF_HEAVY_GAS", hpp, r"kMatFlagHeavyGas\s*=\s*(\d+);"),
     ]
     for wname, src, pat in pairs:
         want = num(src, pat)
-        got = num(step, r"const\s+" + wname + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u")
+        got = num(common if wname == "MATF_HEAVY_GAS" else step,
+                  r"const\s+" + wname + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u")
         if want is None or got is None:
             problems.append(f"reaction-effect record: cannot read {wname} "
                             "(sim_step.wgsl) or its C++ twin")
@@ -2977,6 +2979,8 @@ def check_react_fx():
                             f"{got} but the C++ side says {want}")
     hg = num(hpp, r"kMatFlagHeavyGas\s*=\s*(\d+);")
     for m in re.finditer(r"const\s+(MATF_\w+)\s*:\s*u32\s*=\s*(\d+)u", common):
+        if m.group(1) == "MATF_HEAVY_GAS":
+            continue
         if hg is not None and int(m.group(2)) == hg:
             problems.append(f"heavy gas flag: bit {hg} is also common.wgsl's "
                             f"{m.group(1)}")

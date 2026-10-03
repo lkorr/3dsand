@@ -18,8 +18,10 @@
 // its strongest gusts, and a gale a sky full of them.
 //
 // THEY FOLLOW THE FIELD. Each streak is advected by windAt(p, t) — the same
-// function the grass sway and the debug arrows sample, primitives included —
-// so the streaks ARE the field, drawn. A trail is the last `trail` positions,
+// function the debug arrows sample, primitives and (since 2026-10-02) the heat
+// term included, so a streak over a fire rises — the streaks ARE the field,
+// drawn. (The grass sway samples it too, without the heat term: raymarch.wgsl
+// does not bind the pool.) A trail is the last `trail` positions,
 // pushed every `spacing` seconds into a ring, drawn as a camera-facing ribbon
 // tapering and fading from head to tail, fading in and out over the particle's
 // life, near the camera, at the pool's radius and into the fog.
@@ -36,6 +38,13 @@
 // advected by windAt stops at a wall and threads through a doorway. The draw
 // never reads it, so it is not in renderBGL_'s view of this module.
 @group(0) @binding(24) var<storage, read> draftField : array<u32>;
+// The heat layer (shadowBGL_ 25/26, the UPDATE's layout): a streak over a fire
+// or a lava pool rises with the heat term windAt adds (common.wgsl windHeatF,
+// the BOUND_RO reader). Read-only views of the sim's words, written on the
+// tick command buffer; the wind_streak row's R(HeatPool) R(HeatMeta) order it
+// after the tick's heat passes. The draw never reads them.
+@group(0) @binding(25) var<storage, read> heatPool : array<u32>;
+@group(0) @binding(26) var<storage, read> heatMeta : array<u32>;
 // The update's view (shadowBGL_ binding 22, compute).
 @group(0) @binding(22) var<storage, read_write> streaks : array<vec4f>;
 // The draw's view of the same buffer (renderBGL_ binding 33, vertex).

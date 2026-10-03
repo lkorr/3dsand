@@ -16591,13 +16591,42 @@ def rows' maxima are the kernels' i32 bounds). Gain 0 is the exact pre-phase-5
 field.
 
 **Invariants it adds.**
-- Only shaders that declare `> heatPool` (sim_step, sim_heat, sim_particle,
-  sim_draft) read heat; every other one compiles the `HEAT_WIND_UNBOUND` stubs
-  (resources.cpp `BodyReadsHeat`, mirrored in check_shaders.sh and
-  check_pass_table.py). sim_gas (parcels are outside the window, where there is
-  no heat), sim_fluid (MPM nodes), the renderer's `windAt` and windfield.cpp's
-  CPU mirror do not see it. **Rigidbodies -- debris, corpses, trees -- do not
-  feel updrafts**: the pool is GPU-only and a synchronous readback is banned.
+- Only shaders that declare `> heatPool` read heat; every other one compiles
+  the `HEAT_WIND_UNBOUND` stubs (resources.cpp `BodyReadsHeat`, mirrored in
+  check_shaders.sh and check_pass_table.py). THREE blocks since 2026-10-02:
+  `HEAT_WIND_BOUND` (atomic loads) for the sim readers -- sim_step, sim_heat,
+  sim_particle, sim_draft, sim_gas -- and `HEAT_WIND_BOUND_RO` (plain loads: a
+  vertex stage cannot bind a writable buffer) for the render readers, the F4
+  arrows (debug_wind, renderBGL_ 36/37) and the gust streaks (wind_streak,
+  shadowBGL_ 25/26). The render `windAt` adds `windHeatF`, which is `windHeatK`
+  -- the sim's integer term, one body over a `HeatWindK` value built from
+  TickParams or from RenderParams' copy of the last tick's four words -- so an
+  arrow over a fire leans exactly the way the sim's smoke is pushed
+  (`heat-updraft` reads the render field back through the streak pool: w.y
+  20.0 / 19.7 / 15.1 m/s at 0.6 / 1.2 / 2.0 m over a lava slab, within 0.044
+  m/s of the CPU recomputation of the sim's lift plus the ambient; |w.y| <=
+  0.06 m/s over the cold one). A GPU consumer needs no readback to see heat, only the
+  binding. **The CPU consumers are the ones that cannot**: rigidbodies (debris,
+  corpses, trees) and the F1 wind readout read windfield.cpp's CPU mirror, the
+  pool is GPU-only, a synchronous readback is banned, and they stay ambient.
+  Still stubbed by choice: sim_fluid (MPM nodes; an updraft over a pond is not
+  a current) and the grass sway in raymarch.wgsl (no register headroom).
+- Gas PARCELS (sim_gas.wgsl "THE HEAT TERM ON A PARCEL") bind it, but the pool
+  is window-only and a parcel lives outside the window, so the term reaches a
+  parcel within the lift's 32-voxel look-down over heat just under the window's
+  top face, or one still inside the window (a CPU spawn's first tick, a lost
+  re-entry claim). A light parcel cannot climb faster than its cell a tick (it
+  is straightened, as in the CA); a HEAVY parcel now obeys `stepHeavyGas`'s
+  rule (the lift alone, past 1 m/s, else sink or creep -- before, it took the
+  buoyant roll and rose). The parcel keeps the particle path's HEAT-LIFT AGE
+  (flags bits 19..26, 60 ticks full + 60 faded) so a heavy parcel cannot hover
+  over permanent heat, and its decay roll now carries the tick (a parcel that
+  revisits the same cells -- hovering, boxed in -- re-rolled the same numbers
+  forever before, so "bounded by its decay" was false for exactly those).
+  `heat-updraft`'s parcel arm (lava 36 cells under the top face, calm air):
+  chlorine parcels released just above the face rise +6.0 cells in 12 ticks
+  over the lava and sink back in over stone; with the age disabled 14 of 28
+  still hovered at tick 300, with it 0.
 - Nothing is stored and nothing is woken (rule 2): no heat page anywhere is two
   shared loads per sample, a column with no page in its chunk or the two below
   three more. `heat-updraft`: a heat-free world (layer off) is cell-for-cell

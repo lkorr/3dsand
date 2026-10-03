@@ -4040,12 +4040,9 @@ fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
 // Rule 2: a pool of heavy gas on flat ground random-walks until its authored
 // decay fades it (chlorine: reactions.json), so the chunk sleeps within that
 // lifetime; the walk itself creates nothing. Rule 1: every roll is from
-// `rnd`, the cell's own hash3 stream. Mirrored bit: check_invariants
-// `heavygas` holds MATF_HEAVY_GAS == kMatFlagHeavyGas.
-const MATF_HEAVY_GAS : u32 = 128u;
-
-// stepHeavyGas's lift floor: 1 m/s of heat updraft, Q16.16 cells/s.
-const HEAVY_LIFT_FLOOR : i32 = i32(round(1.0 * 65536.0 / VOXEL_METERS));
+// `rnd`, the cell's own hash3 stream. MATF_HEAVY_GAS and the lift floor
+// (1 m/s of heat updraft, Q16.16 cells/s) live in common.wgsl since sim_gas's
+// parcels obey the same rule (gasHeavyStep).
 
 fn heavyGasTarget(n : vec3<i32>, myDensity : i32) -> bool {
   if (!inBounds(n)) { return false; }

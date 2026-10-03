@@ -27,7 +27,10 @@
 //                 lights foliage beside a sealed lava chamber.
 //   heat-updraft  heat-driven wind (wind phase 5): smoke over hot rock stands
 //                 straight in a crosswind, a heavy gas is carried up, embers
-//                 loft; a heat-free world is bit-identical with the term off.
+//                 loft; a heat-free world is bit-identical with the term off;
+//                 the F4 arrows' render field rises over the heat by the sim's
+//                 own lift; heavy gas PARCELS over heat under the window top
+//                 rise, and come down within the heat-lift age.
 //   draft-stack   the stack effect: a hot hut with a low and a high opening
 //                 draws air in at one and vents at the other; cold, nothing.
 //
@@ -1814,6 +1817,122 @@ void UpBuild(support::TickCursor& ticker, const std::vector<int>& rooms, uint32_
   ticker({}, build);
 }
 
+// The heat term's integers as SubmitTick makes them (support.cpp, the HEAT
+// UPDRAFTS block): the gain per heat unit and the cap, Q16.16 cells/s. The
+// gate recomputes the lift the sim adds from ProbeX with these, to hold the
+// renderer's number to it.
+int32_t UpQ(double v, double hi) {
+  v = v < 0.0 ? 0.0 : (v > hi ? hi : v);
+  return (int32_t)(v + 0.5);
+}
+int32_t UpGainQ() {
+  return UpQ((double)CurrentTuning().sim.windUpdraftGain / 100.0 / (double)kVoxelMeters * 65536.0,
+             262144.0);
+}
+int32_t UpCapQ() {
+  return UpQ((double)CurrentTuning().sim.windUpdraftCap / (double)kVoxelMeters * 65536.0,
+             40.0 / (double)kVoxelMeters * 65536.0);
+}
+// common.wgsl windHeatLiftIn, on the CPU from the pool: the lift at cell p in
+// Q16.16 cells/s (the look-down 0/8/16/32 weighted 16/13/10/6 sixteenths).
+int64_t UpLiftQ(GpuContext& ctx, World& world, int x, int y, int z) {
+  const int dy[4] = {0, 8, 16, 32}, wt[4] = {16, 13, 10, 6};
+  int64_t best = 0;
+  for (int k = 0; k < 4; k++)
+    best = std::max<int64_t>(best, (int64_t)ProbeX(ctx, world, x, y - dy[k], z) * wt[k]);
+  return std::min<int64_t>(best * UpGainQ() / 16, UpCapQ());
+}
+
+// THE RENDERER'S WIND, read back (the F4 arrows' and the streaks' windAt, which
+// adds the heat term through common.wgsl windHeatF since 2026-10-02). The
+// arrows have no buffer -- the vertex shader derives each from its instance
+// index -- so the probe is the STREAK pool, whose update advects by the same
+// windAt with the same RenderParams: seed one live streak per point, run ONE
+// update with a known frame dt, and the displacement over dt is the field at
+// the point in world cells/s. The pool, the knobs and the frame clock are put
+// back afterwards. Test only: the frame path never reads the pool back.
+bool ProbeRenderWind(Ctx& c, const std::vector<Vec3>& pts, const Vec3& eye, uint32_t tick,
+                     std::vector<Vec3>& out) {
+  GpuContext& ctx = c.ctx;
+  const Tuning saved = CurrentTuning();
+  {
+    Tuning t = saved;
+    t.wind.streakAlpha = std::max(t.wind.streakAlpha, 0.3f);
+    t.wind.streakCount = (int)pts.size();
+    t.wind.streakTrail = 2;
+    t.wind.streakRadius = std::max(t.wind.streakRadius, 40.0f);
+    SetCurrentTuning(t);
+  }
+  const uint32_t stride = kWindStreakStride;
+  std::vector<float> pool((size_t)(1 + pts.size() * stride) * 4, 0.0f);
+  for (size_t i = 0; i < pts.size(); i++) {
+    float* r = pool.data() + (1 + i * stride) * 4;
+    r[0] = pts[i].x; r[1] = pts[i].y; r[2] = pts[i].z; r[3] = 0.0f;   // pos, age
+    r[4] = 100.0f; r[5] = 1.0f; r[6] = 0.0f; r[7] = 0.0f;             // life, strength
+    for (uint32_t k = 0; k < kWindStreakTrail; k++) {
+      float* q = r + (2 + k) * 4;
+      q[0] = pts[i].x; q[1] = pts[i].y; q[2] = pts[i].z; q[3] = 0.0f;
+    }
+  }
+  ctx.queue.WriteBuffer(c.sim.WindStreakBuffer(), 0, pool.data(), pool.size() * 4);
+  Camera cam;
+  cam.yaw = 0.0f;
+  cam.pitch = 0.0f;
+  // Two writes at two instants: the second measures dt = 0.05 s against the
+  // first (support.cpp's frame clock), and only the second is encoded.
+  const float t0 = 777.0f, dt = 0.05f;
+  WriteRenderParams(ctx.queue, c.world, eye, cam, 16.0f / 9.0f, true, t0, kFarFogDensity, 1080.0f,
+                    tick);
+  WriteRenderParams(ctx.queue, c.world, eye, cam, 16.0f / 9.0f, true, t0 + dt, kFarFogDensity,
+                    1080.0f, tick);
+  {
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    c.sim.EncodeShadowResolve(enc);
+    ctx.queue.Submit(enc.Finish());
+  }
+  ctx.WaitIdle();
+  std::vector<float> back(pool.size(), 0.0f);
+  const bool read = rhi::ReadbackBlocking(ctx.device, ctx.queue, c.sim.WindStreakBuffer(), 0,
+                                          back.data(), back.size() * 4, "heatUpdraftStreakProbe");
+  out.assign(pts.size(), Vec3{0.0f, 0.0f, 0.0f});
+  bool alive = read;
+  for (size_t i = 0; i < pts.size() && read; i++) {
+    const float* r = back.data() + (1 + i * stride) * 4;
+    if (!(r[4] > 0.0f && r[3] < r[4])) alive = false;   // killed: out of reach
+    out[i] = Vec3{(r[0] - pts[i].x) / dt, (r[1] - pts[i].y) / dt, (r[2] - pts[i].z) / dt};
+  }
+  SetCurrentTuning(saved);
+  c.sim.ClearWindStreaks();
+  return alive;
+}
+
+// The live gas parcels within `r` cells (XZ) of a column: how many, and their
+// mean height. The whole live page is read: a slot says nothing about where a
+// parcel is (rule 1).
+struct UpParcels {
+  uint32_t n = 0;
+  double y = 0;
+};
+UpParcels UpParcelsNear(Ctx& c, int cx, int cz, int r) {
+  UpParcels o;
+  c.ctx.WaitIdle();
+  const uint32_t n = GasAliveSync(c.ctx, c.world, c.sim);
+  if (n == 0) return o;
+  std::vector<uint32_t> p((size_t)n * 8, 0u);
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.gasParticles[c.sim.Page() & 1], 0,
+                        p.data(), (size_t)n * 32, "heatUpdraftParcels");
+  for (uint32_t i = 0; i < n; i++) {
+    const uint32_t* q = p.data() + (size_t)i * 8;
+    if ((q[7] & kPFlagAlive) == 0) continue;
+    const int x = (int32_t)q[0] >> 8, y = (int32_t)q[1] >> 8, z = (int32_t)q[2] >> 8;
+    if (std::abs(x - cx) > r || std::abs(z - cz) > r) continue;
+    o.n++;
+    o.y += y;
+  }
+  if (o.n) o.y /= o.n;
+  return o;
+}
+
 Status GateHeatUpdraft(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
@@ -1863,6 +1982,51 @@ Status GateHeatUpdraft(Ctx& c, std::string& detail) {
     for (int i = 0; i < settle; i++) ticker();
     const uint32_t xLid = ProbeX(ctx, world, UpRoomX(0) + kUpW / 2, UpLid(0) + 5, kUpZ + 8);
     const uint32_t xHigh = ProbeX(ctx, world, UpRoomX(0) + kUpW / 2, UpLid(0) + 20, kUpZ + 8);
+    // ---- THE F4 ARROWS' FIELD over the hot and the cold slab ----------------
+    // (2026-10-02.) The render windAt read back through the streak pool
+    // (ProbeRenderWind) at three heights over each slab's centre, the heat
+    // settled and nothing released yet. Asserted: over the hot slab the
+    // vertical is up (>= arrowUpMin m/s at the best height) and is the sim's
+    // own lift -- the CPU recomputation from the pool (UpLiftQ) plus the cold
+    // room's ambient vertical, to within arrowAgreeTol m/s; over the cold slab
+    // the vertical is ~0 (|w.y| <= arrowColdMax m/s).
+    {
+      const int hs[3] = {6, 12, 20};
+      std::vector<Vec3> pts;
+      for (int k : {0, 1})
+        for (int h : hs)
+          pts.push_back(Vec3{(float)(UpRoomX(k) + kUpW / 2) + 0.5f, (float)(UpLid(k) + h) + 0.5f,
+                             (float)(kUpZ + 8) + 0.5f});
+      const Vec3 eye{(float)(UpRoomX(0) + kUpW + 6), (float)(UpLid(0) + 12), (float)(kUpZ + 8)};
+      std::vector<Vec3> w;
+      const bool alive = ProbeRenderWind(c, pts, eye, t, w);
+      const double cps = 10.0;   // cells/s per m/s
+      double hotBest = -1e9, coldMax = 0.0, agree = 0.0, liftBest = 0.0;
+      for (int i = 0; i < 3; i++) {
+        const double hot = w[i].y / cps, cold = w[3 + i].y / cps;
+        const double lift = (double)UpLiftQ(ctx, world, UpRoomX(0) + kUpW / 2, UpLid(0) + hs[i],
+                                            kUpZ + 8) / 65536.0 / cps;
+        hotBest = std::max(hotBest, hot);
+        liftBest = std::max(liftBest, lift);
+        coldMax = std::max(coldMax, std::fabs(cold));
+        agree = std::max(agree, std::fabs(hot - (lift + cold)));
+      }
+      const double upMin = BaselineNumber("heatUpdraft.arrowUpMin", 1.0);
+      const double coldMaxT = BaselineNumber("heatUpdraft.arrowColdMax", 0.3);
+      const double agreeTol = BaselineNumber("heatUpdraft.arrowAgreeTol", 0.1);
+      RecordObserved("heatUpdraft.arrowUpObserved", hotBest);
+      RecordObserved("heatUpdraft.arrowColdObserved", coldMax);
+      RecordObserved("heatUpdraft.arrowAgreeObserved", agree);
+      const bool arrowOk = alive && hotBest >= upMin && coldMax <= coldMaxT && agree <= agreeTol;
+      note(Format("F4 arrows (render windAt via the streak pool) over the hot slab at lid+6/12/20: "
+                  "w.y %.2f / %.2f / %.2f m/s (best >= %.1f), the sim's lift there %.2f m/s at "
+                  "best, render - (lift + ambient) <= %.3f m/s (<= %.2f); over the cold slab "
+                  "|w.y| <= %.3f m/s (<= %.2f); w.x hot %.2f vs cold %.2f m/s at lid+6 %s",
+                  w[0].y / cps, w[1].y / cps, w[2].y / cps, upMin, liftBest, agree, agreeTol,
+                  coldMax, coldMaxT, w[0].x / cps, w[3].x / cps,
+                  arrowOk ? "OK" : (alive ? "FAIL" : "FAIL (a probe streak died)")));
+      ok = ok && arrowOk;
+    }
     support::TickOps rel;
     for (int k : {0, 1}) Fill(rel.cells, UpPuff(k), smoke);
     for (int k : {2, 3}) Fill(rel.cells, UpPuff(k), chlorine);
@@ -2128,6 +2292,111 @@ Status GateHeatUpdraft(Ctx& c, std::string& detail) {
                 cool[1], coolMax, awakeLeft[0], awakeLeft[1], pagesLeft[0], pagesLeft[1],
                 settleOk ? "OK" : "FAIL"));
     ok = ok && growthOk && landOk && settleOk;
+  }
+
+  // ---- THE GAS-PARCEL ARM (2026-10-02, sim_gas.wgsl THE HEAT TERM ON A PARCEL)
+  // The heat pool is window-only, so a parcel -- which lives OUTSIDE the
+  // window -- meets the heat term only within the lift's 32-voxel look-down
+  // above the window's top face, over heat just under it. So: two 4x4 stone
+  // PILLARS from the ground to a platform `parcelTopGap` cells under the top
+  // face (a fixture hung in the air would be an island, and the island scan
+  // turns it into a falling body), each carrying the slab and lid of UpSlab:
+  // lava on the hot one, stone on the cold one. Calm air, heat on, `settle`
+  // ticks, then 32 CHLORINE parcels (a heavy gas: the one kind the lift can
+  // visibly raise -- a light parcel already climbs a cell a tick, the ceiling)
+  // released 1..2 cells above the top face over each slab.
+  //   rise    after parcelRiseTicks the hot column's live parcels stand at
+  //           least parcelRiseMin cells higher on average than they were
+  //           released; the cold column's sank back into the window (a parcel
+  //           that re-enters becomes a voxel), or stand no higher.
+  //   hover   at parcelHoverTicks, with the lava still there, no hot parcel
+  //           is still above the top face: the heat-lift age lets go after
+  //           ~4 s and the parcel sinks back in (without it, the lift band
+  //           holds a heavy parcel at a fixed height until its decay rolls).
+  {
+    const int riseTicks = (int)BaselineNumber("heatUpdraft.parcelRiseTicks", 12);
+    const int hoverTicks = (int)BaselineNumber("heatUpdraft.parcelHoverTicks", 300);
+    const double riseMin = BaselineNumber("heatUpdraft.parcelRiseMin", 1.0);
+    const int gap = (int)BaselineNumber("heatUpdraft.parcelTopGap", 36);
+    {
+      Tuning t = CurrentTuning();
+      t.sim.heatMode = 1;
+      t.wind.windSpeed = 0.0f;
+      SetCurrentTuning(t);
+    }
+    SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const IVec3 wo = world.WindowOrigin();
+    const int yTop = wo.y * (int)kChunk + (int)kWorldN;   // first cell above the window
+    const int yP = yTop - gap;                             // the platform
+    const int colX[2] = {UpRoomX(0) + kUpW / 2, UpRoomX(3) + kUpW / 2};
+    const int colZ = kUpZ + 8;
+    uint32_t tk = 68000;
+    support::TickCursor ticker{c, tk, {colX[0] >> 4, yP >> 4, colZ >> 4}};
+    std::vector<CellOp> build;
+    for (int k = 0; k < 2; k++) {
+      const int x0 = colX[k] - 2, z0 = colZ - 2;
+      const int g = FixtureYOver(x0, z0, x0 + 3, z0 + 3, kDefaultSeed, 0, 0);
+      for (int y = g - 3; y < yP; y++)
+        for (int z = z0; z < z0 + 4; z++)
+          for (int x = x0; x < x0 + 4; x++)
+            build.push_back({World::SlotCellIndex({x, y, z}), (uint32_t)kMatStone});
+      // The platform, then the slab (y yP+1..yP+4) under a rim and a lid.
+      for (int z = colZ - 7; z <= colZ + 6; z++)
+        for (int x = colX[k] - 7; x <= colX[k] + 6; x++)
+          build.push_back({World::SlotCellIndex({x, yP, z}), (uint32_t)kMatStone});
+      const Box s{colX[k] - 5, yP + 1, colZ - 5, colX[k] + 4, yP + 4, colZ + 4};
+      for (int z = s.z0 - 1; z <= s.z1 + 1; z++)
+        for (int y = s.y0; y <= s.y1 + 1; y++)
+          for (int x = s.x0 - 1; x <= s.x1 + 1; x++)
+            build.push_back({World::SlotCellIndex({x, y, z}),
+                             s.Has(x, y, z) && k == 0 ? (lava | kFull) : (uint32_t)kMatStone});
+    }
+    for (size_t i = 0; i < build.size(); i += kMaxCellOpsPerTick) {
+      const size_t n = std::min<size_t>(kMaxCellOpsPerTick, build.size() - i);
+      ticker({}, std::vector<CellOp>(build.begin() + (long)i, build.begin() + (long)(i + n)));
+    }
+    for (int i = 0; i < settle; i++) ticker();
+    const uint32_t xLidTop = ProbeX(ctx, world, colX[0], yP + 6, colZ);
+    const double liftAt = (double)UpLiftQ(ctx, world, colX[0], yTop + 1, colZ) / 65536.0 / 10.0;
+    std::vector<GasSpawnOp> ops;
+    for (int k = 0; k < 2; k++)
+      for (int dy = 1; dy <= 2; dy++)
+        for (int dz = -2; dz <= 1; dz++)
+          for (int dx = -2; dx <= 1; dx++)
+            ops.push_back(MakeGasSpawn(colX[k] + dx, yTop + dy, colZ + dz, chlorine));
+    const uint32_t queued = world.QueueGasSpawns(ops.data(), (uint32_t)ops.size());
+    const double y0 = yTop + 1.5;
+    UpParcels pr[2], pm[2], ph[2];
+    for (int i = 1; i <= hoverTicks; i++) {
+      ticker();
+      if (i == riseTicks)
+        for (int k = 0; k < 2; k++) pr[k] = UpParcelsNear(c, colX[k], colZ, 12);
+      if (i == 60)
+        for (int k = 0; k < 2; k++) pm[k] = UpParcelsNear(c, colX[k], colZ, 12);
+    }
+    for (int k = 0; k < 2; k++) ph[k] = UpParcelsNear(c, colX[k], colZ, 12);
+    // A column with no live parcel left stood no higher than the top face.
+    const double riseHot = pr[0].n ? pr[0].y - y0 : (double)(yTop - 1) - y0;
+    const double riseCold = pr[1].n ? pr[1].y - y0 : (double)(yTop - 1) - y0;
+    RecordObserved("heatUpdraft.parcelRiseHotObserved", riseHot);
+    RecordObserved("heatUpdraft.parcelRiseColdObserved", riseCold);
+    RecordObserved("heatUpdraft.parcelHoverObserved", (double)ph[0].n);
+    const bool riseOk = queued == ops.size() && pr[0].n > 0 && riseHot >= riseMin &&
+                        riseCold <= 0.0;
+    const bool hoverOk = ph[0].n == 0;
+    note(Format("gas parcels (chlorine, %u queued) over a slab %d cells under the window top (X "
+                "over the lid %u, lift %.2f m/s at the top face +1): after %d ticks hot %u alive, "
+                "mean rise %+.1f cells (>= %.1f), cold %u alive, %+.1f (<= 0) %s; at tick 60 "
+                "hot %u alive (mean y %+.1f over the face); at tick %d hot %u above the face "
+                "(must be 0: the heat-lift age lets go), cold %u %s",
+                queued, gap, xLidTop, liftAt, riseTicks, pr[0].n, riseHot, riseMin, pr[1].n,
+                riseCold, riseOk ? "OK" : "FAIL", pm[0].n, pm[0].n ? pm[0].y - yTop : 0.0,
+                hoverTicks, ph[0].n, ph[1].n, hoverOk ? "OK" : "FAIL"));
+    ok = ok && riseOk && hoverOk;
+    Tuning t = CurrentTuning();
+    t.wind.windSpeed = (float)BaselineNumber("heatUpdraft.windSpeed", 3.0);
+    SetCurrentTuning(t);
   }
   SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
   ctx.WaitIdle();

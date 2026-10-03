@@ -78,6 +78,8 @@ std::string JsonOf(const vk::Backend& be) {
                 "\"outOfSpecBindings\": %s, \"outOfSpecMaxRange\": %llu, \"robustBufferAccess\": %s, "
                 "\"asyncComputeEnabled\": %s, \"asyncSubmits\": %llu, "
                 "\"asyncJoins\": %llu, \"asyncHeadJoins\": %llu, \"asyncSplits\": %llu, "
+                "\"descSets\": %u, \"descSetsMax\": %u, \"descStorage\": %u, "
+                "\"descStorageMax\": %u, "
                 "\"buildCommit\": \"%s\"}",
                 JsonEsc(c.deviceName).c_str(), JsonEsc(c.driverName).c_str(),
                 JsonEsc(c.driverInfo).c_str(), c.driverId, c.driverVersion,
@@ -93,6 +95,8 @@ std::string JsonOf(const vk::Backend& be) {
                 be.AsyncEnabled() ? "true" : "false",
                 (unsigned long long)as.submits, (unsigned long long)as.joins,
                 (unsigned long long)as.headJoins, (unsigned long long)as.splits,
+                vk::Backend::DescSetsUsed(), vk::kDescPoolMaxSets,
+                vk::Backend::DescStorageUsed(), vk::kDescPoolStorageBuffers,
                 JsonEsc(SandvoxBuildCommit()).c_str());
   return b;
 }

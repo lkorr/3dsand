@@ -854,9 +854,15 @@ def module_for(fname):
     # The HEAT UPDRAFTS reader's two blocks (resources.cpp BodyReadsHeat), for
     # the draft reader's reason: the stub defined last would hide the reads of
     # heatPool / heatMeta that windAtQ makes in a shader that binds them.
-    drop = "HEAT_WIND_UNBOUND" if "> heatPool" in body else "HEAT_WIND_BOUND"
-    common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
-                    common, flags=re.S)
+    # Three blocks since the render readers (debug_wind, wind_streak) bind the
+    # pool: BOUND (sim), BOUND_RO (a render body, `uniform> R :`), UNBOUND.
+    heat = "> heatPool" in body
+    render = "uniform> R :" in body
+    keep = ("HEAT_WIND_BOUND_RO" if render else "HEAT_WIND_BOUND") if heat else "HEAT_WIND_UNBOUND"
+    for drop in ("HEAT_WIND_BOUND", "HEAT_WIND_BOUND_RO", "HEAT_WIND_UNBOUND"):
+        if drop != keep:
+            common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
+                            common, flags=re.S)
     # The TICKET PROBE's two blocks, for the same reason (resources.cpp
     # BodyResolvesTickets): BOUND reads the ticket table in pageTable's tail,
     # and the stub defined last would hide that read.

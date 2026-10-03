@@ -286,6 +286,12 @@ bool gGasFarRenderActive = false;
 // right after SetDraft and read by WriteRenderParams.
 bool gDraftRenderValid = false;
 int32_t gDraftRenderOrigin[3] = {0, 0, 0};
+// The heat term's four TickParams words as the LAST tick used them
+// (updraftGainQ / CapQ / InflowQ / draftStackQ; gain 0 with the sim's wind
+// off), published by SubmitTick and copied into RenderParams by
+// WriteRenderParams, so the F4 arrows and the streaks add the heat term the
+// sim felt (common.wgsl windHeatF).
+int32_t gHeatRenderQ[4] = {0, 0, 0, 0};
 }
 const RenderSpec& LastRenderSpec() { return gRenderSpec; }
 void SetGasRenderActive(bool active) { gGasRenderActive = active; }
@@ -949,6 +955,11 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
     // the F4 arrows read the sheltered field the sim does.
     rp.draftMode = gDraftRenderValid ? 1u : 0u;
     for (int i = 0; i < 3; i++) rp.draftOrigin[i] = gDraftRenderOrigin[i];
+    // ...and the heat term the last tick added (HEAT UPDRAFTS, windHeatF).
+    rp.updraftGainQ = gHeatRenderQ[0];
+    rp.updraftCapQ = gHeatRenderQ[1];
+    rp.updraftInflowQ = gHeatRenderQ[2];
+    rp.draftStackQ = gHeatRenderQ[3];
   }
   // CHUNK TICKETS (docs/PLAN_chunk_tickets.md P4): the live boxes, compacted,
   // in ticket-index order — the same table the sim resolves through, so what
@@ -1441,6 +1452,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       // a change re-solves the whole volume (a burst), as a material reload
       // does. Live tuning, outside replay, like every live sim.* knob.
       sim.NoteDraftHeatKnobs(tp.updraftGainQ, tp.updraftCapQ, tp.draftStackQ);
+      // The render copy. The sim reads the term only through windAtQ, which
+      // windMode 0 switches off whole, so the arrows show none then either.
+      gHeatRenderQ[0] = tp.windMode != 0 ? tp.updraftGainQ : 0;
+      gHeatRenderQ[1] = tp.updraftCapQ;
+      gHeatRenderQ[2] = tp.updraftInflowQ;
+      gHeatRenderQ[3] = tp.draftStackQ;
     }
   }
   // ---- WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3) ------------------------

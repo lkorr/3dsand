@@ -491,10 +491,14 @@ for f in "${FILES[@]}"; do
   # BodyReadsDrafts) -- so the strip below always runs.
   stripDraftB=1; stripDraftU=0
   if grep -q '> draftField' "$f"; then stripDraftB=0; stripDraftU=1; fi
-  # The HEAT UPDRAFTS reader, the same shape (LoadShader's BodyReadsHeat):
-  # BOUND for a body that declares `> heatPool`, the stubs otherwise.
-  stripHeatB=1; stripHeatU=0
-  if grep -q '> heatPool' "$f"; then stripHeatB=0; stripHeatU=1; fi
+  # The HEAT UPDRAFTS reader, three blocks (LoadShader's BodyReadsHeat):
+  # BOUND for a sim body that declares `> heatPool`, BOUND_RO for a render
+  # body (`uniform> R :`) that does, the stubs otherwise.
+  stripHeatB=1; stripHeatR=1; stripHeatU=0
+  if grep -q '> heatPool' "$f"; then
+    stripHeatU=1
+    if grep -q 'uniform> R :' "$f"; then stripHeatR=0; else stripHeatB=0; fi
+  fi
   # THE TICKET PROBE (LoadShader's BodyResolvesTickets): BOUND for a body that
   # declares `>` + optional whitespace + `pageTable` and no `uniform> R :`.
   stripTicketB=1; stripTicketU=0
@@ -502,7 +506,9 @@ for f in "${FILES[@]}"; do
     stripTicketB=0; stripTicketU=1
   fi
   commonSrc="$TMP/common_${name}"
-  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" -v hb="$stripHeatB" -v hu="$stripHeatU" '
+  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" -v hb="$stripHeatB" -v hr="$stripHeatR" -v hu="$stripHeatU" '
+    /HEAT_WIND_BOUND_RO_BEGIN/ { print; s = hr; next }
+    /HEAT_WIND_BOUND_RO_END/   { print; s = 0;  next }
     /HEAT_WIND_UNBOUND_BEGIN/ { print; s = hu; next }
     /HEAT_WIND_UNBOUND_END/   { print; s = 0;  next }
     /HEAT_WIND_BOUND_BEGIN/   { print; s = hb; next }

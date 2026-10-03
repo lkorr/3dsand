@@ -28,6 +28,15 @@
 // windAt, so they draw the sheltered field -- the draft through a doorway is
 // what they are for.
 @group(0) @binding(35) var<storage, read> draftField : array<u32>;
+// The heat layer (renderBGL_ 36/37, vertex): declaring heatPool keeps
+// common.wgsl's BOUND_RO heat reader, so windAt adds the heat term (lift,
+// inflow, stack -- windHeatF) and an arrow over a fire or a lava pool leans up
+// and in exactly as the sim's wind does. Plain read-only views of the same
+// words the sim reads atomically: a vertex stage cannot name a writable buffer.
+// Written on the TICK command buffer, covered by the global barrier every
+// command buffer opens with; the draw's BeginRendering joins any async work.
+@group(0) @binding(36) var<storage, read> heatPool : array<u32>;
+@group(0) @binding(37) var<storage, read> heatMeta : array<u32>;
 
 struct VSOut {
   @builtin(position) pos : vec4f,

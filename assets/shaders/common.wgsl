@@ -50,6 +50,13 @@ const MATF_TINTED : u32 = 16u;
 // below). Render-only; mirrors kMatFlagBurnTint in sim/materials.h, which has
 // the rationale. leaf_burning / pine_burning / autumn_burning carry it.
 const MATF_BURNTINT : u32 = 32u;
+// HEAVY GAS (the `gas_heavy` tag, sim/materials.h kMatFlagHeavyGas): sinks and
+// creeps instead of rising, and only a heat updraft past HEAVY_LIFT_FLOOR (1 m/s)
+// carries it up. Two kernels move it -- sim_step.wgsl stepHeavyGas (the CA) and
+// sim_gas.wgsl gasHeavyStep (a parcel) -- so the rule's two constants live here.
+// check_invariants `reaction-effect record` holds the bit to the C++ one.
+const MATF_HEAVY_GAS : u32 = 128u;
+const HEAVY_LIFT_FLOOR : i32 = i32(round(1.0 * 65536.0 / VOXEL_METERS));
 // Start of this material's 16-entry tint run, packed into the free high half of
 // `flags` (bits 16..23) — see the wind note below for why `flags` and not a new
 // field. Mirrors kMatTintBaseShift / kMatTintBaseMask in sim/materials.h.
@@ -1785,6 +1792,13 @@ struct RenderParams {
   ticketCount : u32,
   pad_tk0 : u32, pad_tk1 : u32, pad_tk2 : u32,
   ticketBox : array<vec4<i32>, TICKET_MAX>,
+  // HEAT UPDRAFTS, the render copy (world.h RenderParams; windHeatF): the
+  // last tick's TickParams words of the same names, 0 gain with the sim's
+  // wind off. One whole std140 row.
+  updraftGainQ : i32,
+  updraftCapQ : i32,
+  updraftInflowQ : i32,
+  draftStackQ : i32,
 };
 
 // ---- THE CLOUDS: the shared half (cloud.wgsl, src/sim/weather.h) ----------
@@ -3123,14 +3137,25 @@ fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f 
 // shared loads; a column with no page in its chunk or the two below, three
 // more; only a paged column reads the pool.
 //
-// RIGIDBODIES DO NOT FEEL IT. The pool is GPU-only, and windfield.cpp's CPU
-// mirror (debris, corpses, trees, the F1 readout) cannot see it without a
-// synchronous readback, which is banned. It stays the ambient field.
+// RIGIDBODIES DO NOT FEEL IT, AND NEITHER DOES THE F1 READOUT: those are the
+// CPU's consumers. The pool is GPU-only, and windfield.cpp's CPU mirror
+// (debris, corpses, trees, the F1 wind readout) cannot see it without a
+// synchronous readback, which is banned. They stay the ambient field. Every
+// GPU consumer can simply BIND the pool -- no readback is involved -- and the
+// render ones do (2026-10-02): the F4 arrows and the gust streaks call windAt,
+// which adds windHeatF below, so arrow, streak and sim stand in one field.
+// The grass sway (raymarch.wgsl) does not bind it: no register headroom.
 //
-// TWO BLOCKS, ONE STRIPPED, for the WIND DRAFTS reason: only a body that
-// declares `> heatPool` (sim_step, sim_heat, sim_particle, sim_draft) keeps the
-// BOUND accessors (resources.cpp kHeatWindBound*); every other shader --
-// sim_gas and sim_fluid included -- compiles the stubs and sees no heat term.
+// THREE BLOCKS, TWO STRIPPED, for the WIND DRAFTS reason (resources.cpp
+// kHeatWindBound*, mirrored by check_shaders.sh and check_pass_table.py):
+//   BOUND     a SIM body that declares `> heatPool` (sim_step, sim_heat,
+//             sim_particle, sim_draft, sim_gas): heatMeta is atomic there.
+//   BOUND_RO  a RENDER body (`uniform> R :`) that declares `> heatPool`
+//             (debug_wind, wind_streak): plain read-only loads, because a
+//             vertex stage may not bind a writable buffer, so it cannot name
+//             an atomic. The values are the same words.
+//   UNBOUND   everyone else (sim_fluid, raymarch, cloud, ...): the stubs, and
+//             HEAT_WIND_BOUND false const-folds the whole term away.
 // The WH_* words must match src/sim/heat.h (check_invariants `heat`).
 const WH_ENTRY_HAS : u32 = 0x80000000u;
 const WH_ENTRY_PAGE : u32 = 0x00FFFFFFu;
@@ -3143,6 +3168,11 @@ const HEAT_WIND_BOUND : bool = true;
 fn windHeatMeta(i : u32) -> u32 { return atomicLoad(&heatMeta[i]); }
 fn windHeatPool(i : u32) -> u32 { return heatPool[i]; }
 // >>>HEAT_WIND_BOUND_END<<<
+// >>>HEAT_WIND_BOUND_RO_BEGIN<<<
+const HEAT_WIND_BOUND : bool = true;
+fn windHeatMeta(i : u32) -> u32 { return heatMeta[i]; }
+fn windHeatPool(i : u32) -> u32 { return heatPool[i]; }
+// >>>HEAT_WIND_BOUND_RO_END<<<
 // >>>HEAT_WIND_UNBOUND_BEGIN<<<
 const HEAT_WIND_BOUND : bool = false;
 fn windHeatMeta(i : u32) -> u32 { return 0u; }
@@ -3178,35 +3208,64 @@ fn windHeatXNear(c : vec3<i32>, wc : vec3<i32>, e0 : u32, o : vec3<i32>) -> i32 
   return windHeatX(c, o);
 }
 
+// THE TERM'S INPUTS, as values rather than a uniform pointer, so the sim
+// (TickParams) and the renderer (RenderParams, the same integers from the same
+// SubmitTick) run ONE body: windHeatK below. The window origin keys the slot
+// lookup; the four Q words are SubmitTick's conversions of the sim.wind*
+// heat rows; the draft gate and origin place the stack field.
+struct HeatWindK {
+  origin : vec3<i32>,
+  gainQ : i32,
+  capQ : i32,
+  inflowQ : i32,
+  stackQ : i32,
+  draftOn : u32,
+  draftOrigin : vec3<i32>,
+};
+fn heatWindKT(T : ptr<uniform, TickParams>) -> HeatWindK {
+  return HeatWindK((*T).origin, (*T).updraftGainQ, (*T).updraftCapQ, (*T).updraftInflowQ,
+                   (*T).draftStackQ, (*T).draftMode, (*T).draftOrigin);
+}
+// The render copy: RenderParams carries the last tick's four Q words
+// (support.cpp WriteRenderParams), and draftMode there is "a solved volume
+// exists", the render's own gate for draftApplyF.
+fn heatWindKR(R : ptr<uniform, RenderParams>) -> HeatWindK {
+  return HeatWindK((*R).origin, (*R).updraftGainQ, (*R).updraftCapQ, (*R).updraftInflowQ,
+                   (*R).draftStackQ, (*R).draftMode, (*R).draftOrigin);
+}
+
 // THE LIFT at world cell p, Q16.16 cells/s in [0, cap]. Also what
 // sim_draft.wgsl samples per fine cell as the stack effect's source, so the
 // two cannot disagree about where air rises. INTEGER: X <= 255 and the weights
 // <= 16, and SubmitTick clamps the gain to <= 2^18 per heat unit (the def
 // row's 40 m/s), so the product stays under 2^31.
 fn windHeatUpQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> i32 {
-  if (!HEAT_WIND_BOUND || (*T).updraftGainQ <= 0 || !windHeatAny()) { return 0; }
-  let o = (*T).origin;
+  return windHeatUpK(p, heatWindKT(T));
+}
+fn windHeatUpK(p : vec3<i32>, k : HeatWindK) -> i32 {
+  if (!HEAT_WIND_BOUND || k.gainQ <= 0 || !windHeatAny()) { return 0; }
   let wc = worldChunkOf(p);
-  return windHeatLiftIn(p, wc, windHeatEntry(wc, o), windHeatEntry(wc - vec3<i32>(0, 1, 0), o),
-                        windHeatEntry(wc - vec3<i32>(0, 2, 0), o), T);
+  return windHeatLiftIn(p, wc, windHeatEntry(wc, k.origin),
+                        windHeatEntry(wc - vec3<i32>(0, 1, 0), k.origin),
+                        windHeatEntry(wc - vec3<i32>(0, 2, 0), k.origin), k);
 }
 // The lift given the entries of p's chunk (e0) and the two under it (e1, e2):
-// windHeatQ looks them up once and shares e0 with the inflow. The entries are
-// atomic loads (the pool's table is atomic in every module), the term's cost.
+// windHeatK looks them up once and shares e0 with the inflow. The entries are
+// table loads (atomic in a sim module), the term's cost.
 fn windHeatLiftIn(p : vec3<i32>, wc : vec3<i32>, e0 : u32, e1 : u32, e2 : u32,
-                  T : ptr<uniform, TickParams>) -> i32 {
+                  k : HeatWindK) -> i32 {
   if ((e0 | e1 | e2) == 0u) { return 0; }
   var best = 0;
-  for (var k = 0u; k < 4u; k++) {
-    let dy = select(select(select(32, 16, k == 2u), 8, k == 1u), 0, k == 0u);
-    let wt = select(select(select(6, 10, k == 2u), 13, k == 1u), 16, k == 0u);
+  for (var i = 0u; i < 4u; i++) {
+    let dy = select(select(select(32, 16, i == 2u), 8, i == 1u), 0, i == 0u);
+    let wt = select(select(select(6, 10, i == 2u), 13, i == 1u), 16, i == 0u);
     let c = p - vec3<i32>(0, dy, 0);
     // p - 32 is at most two chunks under p's, so e0..e2 cover every sample.
     let dc = wc.y - worldChunkOf(c).y;
     let e = select(select(e2, e1, dc == 1), e0, dc == 0);
     if (e != 0u) { best = max(best, windHeatXIn(e, c) * wt); }
   }
-  return min((best * (*T).updraftGainQ) / 16, (*T).updraftCapQ);
+  return min((best * k.gainQ) / 16, k.capQ);
 }
 
 // The draft volume's stack correction at p: the published S = P(b) - b (Q12
@@ -3216,43 +3275,60 @@ fn windHeatLiftIn(p : vec3<i32>, wc : vec3<i32>, e0 : u32, e1 : u32, e2 : u32,
 // projected onto what the walls allow -- a sealed room's column turns over in
 // place, a room with a low and a high opening breathes through them.
 fn draftStackAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
-  if (!DRAFT_BOUND || (*T).draftMode == 0u || (*T).draftStackQ <= 0) { return vec3<i32>(0); }
+  return draftStackAtK(p, heatWindKT(T));
+}
+fn draftStackAtK(p : vec3<i32>, k : HeatWindK) -> vec3<i32> {
+  if (!DRAFT_BOUND || k.draftOn == 0u || k.stackQ <= 0) { return vec3<i32>(0); }
   if (draftWord(DRAFT_STACK_LIVE) == 0u) { return vec3<i32>(0); }
-  let d = (p - (*T).draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
+  let d = (p - k.draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
   if (!draftInside(d)) { return vec3<i32>(0); }
   let i = DRAFT_STACK_FIELD + 2u * u32((d.z * DRAFT_NY + d.y) * DRAFT_NX + d.x);
   let w0 = draftWord(i);
   let s = vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(draftWord(i + 1u)));
   // |s| < 2^15 and cap >> 12 <= 6,400 (40 m/s), then / 256 x a share <= 4x.
-  let unit = (*T).updraftCapQ >> 12u;
-  return ((s * unit) / 256) * (*T).draftStackQ;
+  let unit = k.capQ >> 12u;
+  return ((s * unit) / 256) * k.stackQ;
 }
 
 // THE WHOLE HEAT TERM at p (windAmbQ adds it): lift, the inflow toward the
 // column, and inside the draft box the stack correction. One compare with the
 // gain at 0, which is what keeps sim.windUpdraftGain 0 an exact identity.
 fn windHeatQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
-  if (!HEAT_WIND_BOUND || (*T).updraftGainQ <= 0 || !windHeatAny()) { return vec3<i32>(0); }
-  let o = (*T).origin;
+  return windHeatK(p, heatWindKT(T));
+}
+fn windHeatK(p : vec3<i32>, k : HeatWindK) -> vec3<i32> {
+  if (!HEAT_WIND_BOUND || k.gainQ <= 0 || !windHeatAny()) { return vec3<i32>(0); }
+  let o = k.origin;
   let wc = worldChunkOf(p);
   let e0 = windHeatEntry(wc, o);
   var w = vec3<i32>(0, windHeatLiftIn(p, wc, e0, windHeatEntry(wc - vec3<i32>(0, 1, 0), o),
-                                      windHeatEntry(wc - vec3<i32>(0, 2, 0), o), T), 0);
+                                      windHeatEntry(wc - vec3<i32>(0, 2, 0), o), k), 0);
   // THE INFLOW: toward the hotter side, at the sample's own level, where the
   // heat field's sideways gradient lives -- strongest beside a source and ~0
   // straight over it (the tent is symmetric there). Only in a paged chunk: a
   // sample outside every page is outside the heat's reach. A neighbour in p's
   // own chunk reuses e0 (every one but an edge block's).
-  if ((*T).updraftInflowQ > 0 && e0 != 0u) {
+  if (k.inflowQ > 0 && e0 != 0u) {
     let gx = windHeatXNear(p + vec3<i32>(4, 0, 0), wc, e0, o) -
              windHeatXNear(p - vec3<i32>(4, 0, 0), wc, e0, o);
     let gz = windHeatXNear(p + vec3<i32>(0, 0, 4), wc, e0, o) -
              windHeatXNear(p - vec3<i32>(0, 0, 4), wc, e0, o);
-    let lim = wq((*T).updraftCapQ, (*T).updraftInflowQ);
-    w.x = clamp(wq(gx * (*T).updraftGainQ, (*T).updraftInflowQ), -lim, lim);
-    w.z = clamp(wq(gz * (*T).updraftGainQ, (*T).updraftInflowQ), -lim, lim);
+    let lim = wq(k.capQ, k.inflowQ);
+    w.x = clamp(wq(gx * k.gainQ, k.inflowQ), -lim, lim);
+    w.z = clamp(wq(gz * k.gainQ, k.inflowQ), -lim, lim);
   }
-  return w + draftStackAtQ(p, T);
+  return w + draftStackAtK(p, k);
+}
+
+// THE HEAT TERM FOR THE RENDERER, world cells/s: windHeatK on the cell under
+// p with the render copy of the inputs -- the SAME integers the sim's windAmbQ
+// adds, so an F4 arrow over a lava pool leans exactly the way the sim's smoke
+// is pushed (to the frame's sub-tick: the pool is the last tick's). windAt
+// adds it; in every render module that does not bind the pool (raymarch's
+// grass, cloud's rain probe) HEAT_WIND_BOUND is false and this folds to zero.
+fn windHeatF(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if (!HEAT_WIND_BOUND || (*R).updraftGainQ <= 0) { return vec3f(0.0); }
+  return vec3f(windHeatK(vec3<i32>(floor(p)), heatWindKR(R))) * (1.0 / 65536.0);
 }
 
 // THE FIELD. Everything above exists so that this and the per-blade path are
@@ -3264,7 +3340,8 @@ fn windAt(p : vec3f, t : f32, R : ptr<uniform, RenderParams>) -> vec3f {
   // does to the weather and on what it does not do to a fan.
   let amb = windMeanWS(s) + windBandWS(s, s.b1) * WIND_BAND_W1
                           + windBandWS(s, s.b2) * WIND_BAND_W2;
-  return draftApplyF(p, amb, R) + windPrimAt(p, R);
+  // ...plus the heat term after the shelter, windAmbQ's order (windHeatF).
+  return draftApplyF(p, amb, R) + windPrimAt(p, R) + windHeatF(p, R);
 }
 
 // THE FIELD, scaled by a dev multiplier. Used by the PARTICLE TIER (ballistic

@@ -199,11 +199,20 @@ hot-material count unnecessary: the wind reads the heat pool directly.
   pair read 58 / 63 awake chunks: where heat exists the lift does move gas, and the fire
   scenes' `--perf` runs are what price it (§14.11).
 - **Readers that do NOT get it**: shaders that do not bind the pool compile a stub
-  (`HEAT_WIND_UNBOUND`, resources.cpp `BodyReadsHeat`) -- sim_gas (parcels live outside
-  the window, where there is no heat), sim_fluid (an updraft over a pond is not a thing
-  MPM nodes should feel), the renderer's `windAt` (streaks, F4 arrows, grass) and the
-  CPU mirror (`windfield::Probe`): **debris, corpses and trees do not feel updrafts** --
-  the pool is GPU-only and a synchronous readback is banned.
+  (`HEAT_WIND_UNBOUND`, resources.cpp `BodyReadsHeat`) -- sim_fluid (an updraft over a
+  pond is not a thing MPM nodes should feel) and the grass sway in raymarch.wgsl (no
+  register headroom) -- and the CPU mirror (`windfield::Probe`): **debris, corpses,
+  trees and the F1 wind readout do not feel updrafts** -- the pool is GPU-only and a
+  synchronous readback is banned. Only these CPU consumers would need a readback.
+- **GPU readers added 2026-10-02**: the F4 arrows and the gust streaks (render
+  `windAt` adds `windHeatF`, the sim's integer `windHeatK` on the last tick's
+  TickParams words copied into RenderParams; the `HEAT_WIND_BOUND_RO` block, plain
+  loads, because a vertex stage cannot bind a writable buffer) and the gas parcels
+  (sim_gas). A parcel lives outside the window and the pool is window-only, so it
+  meets the term only within the 32-voxel look-down over heat just under the top face
+  (or inside the window: a CPU spawn's first tick, a lost re-entry claim); a heavy
+  parcel now takes `stepHeavyGas`'s rule, and parcels carry the particle HEAT-LIFT AGE
+  so nothing hovers over permanent heat.
 - **What it does in the CA, honestly.** A light gas already climbs one cell a substep in
   calm air -- the CA's ceiling -- so the lift CANNOT make smoke rise faster; it straightens
   it (`gasIntentW`'s `lean = fh - up` cancels a crosswind lean and any downdraft) and draws
@@ -1165,6 +1174,7 @@ wind-cache change and the `windHeatQ` refactor, which is the proof both are
 exact.
 
 Still open: several volumes (a burning house far from the player breathes
-only through its local lift); the renderer's `windAt` (streaks, arrows, grass)
-does not see the heat term or the stack field; rigidbodies (the CPU mirror)
-do not feel updrafts.
+only through its local lift); the grass sway does not see the heat term or the
+stack field (raymarch has no register headroom; the streaks and the F4 arrows
+do since 2026-10-02); rigidbodies and the F1 readout (the CPU mirror) do not
+feel updrafts -- the only consumers that would need a readback.

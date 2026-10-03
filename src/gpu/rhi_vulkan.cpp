@@ -3003,6 +3003,16 @@ void Backend::PresentAcquired() {
   acquiredIndex_ = UINT32_MAX;
 }
 
+// THE POOL'S DRAW-DOWN, measured (2026-10-02): every set allocated and every
+// STORAGE descriptor written over the process, against kDescPoolMaxSets /
+// kDescPoolStorageBuffers. Printed at shutdown, so a binding added to a
+// group that is rebuilt often (the render and shadow groups grow with the
+// target) is a number, not a guess.
+static uint32_t g_descSets = 0;
+static uint32_t g_descStorage = 0;
+uint32_t Backend::DescSetsUsed() { return g_descSets; }
+uint32_t Backend::DescStorageUsed() { return g_descStorage; }
+
 VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
                                              const rhi::BindGroupLayoutEntry* layoutEntries,
                                              const rhi::BindGroupEntry* entries,
@@ -3031,6 +3041,7 @@ VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
     std::abort();
   }
   setsAllocated++;
+  g_descSets = setsAllocated;
 
   std::vector<VkDescriptorBufferInfo> infos(count);
   std::vector<VkWriteDescriptorSet> writes(count);
@@ -3072,6 +3083,7 @@ VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
         break;
       }
     }
+    if (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) g_descStorage++;
     // A STORAGE RANGE OVER THE DEVICE'S LIMIT IS A HARD MINIMUM, NOT A HINT.
     // The voxel page pool (576 MiB at a 512 window) and the far cascade are
     // single bindings, and a device whose maxStorageBufferRange is smaller
@@ -3262,6 +3274,10 @@ void Backend::Shutdown() {
   std::string err;
   WaitIdle(err);
   const double waitMs = msSince(tShut0);
+  std::fprintf(stderr,
+               "[shutdown] descriptor pool: %u of %u sets, %u of %u storage descriptors "
+               "(never refilled; rhi_vulkan.h kDescPool*)\n",
+               g_descSets, kDescPoolMaxSets, g_descStorage, kDescPoolStorageBuffers);
   if (asyncUsed_)
     std::fprintf(stderr,
                  "[shutdown] async compute: %llu async submits, %llu main-queue joins "

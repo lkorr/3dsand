@@ -484,11 +484,17 @@ constexpr const char* kDraftUnboundEnd = ">>>DRAFT_UNBOUND_END<<<";
 
 // The HEAT UPDRAFTS reader (common.wgsl's block of that name, wind phase 5)
 // reads `heatPool` / `heatMeta`, which only the temperature layer's consumers
-// declare (sim_step, sim_heat, sim_particle, sim_draft). Same two-block shape
-// and the same body-derived predicate as the draft reader above: BOUND for a
-// body that declares `> heatPool`, the zero stubs for every other shader.
+// declare (sim_step, sim_heat, sim_particle, sim_draft, sim_gas, and the two
+// render readers debug_wind and wind_streak). THREE blocks, exactly one kept,
+// by the same body-derived predicates as the draft reader above and the ticket
+// probe below: BOUND (atomic loads) for a sim body that declares `> heatPool`,
+// BOUND_RO (plain loads: a vertex stage cannot bind a writable buffer, so it
+// cannot name an atomic) for a render body (`uniform> R :`) that does, and the
+// zero stubs for every other shader.
 constexpr const char* kHeatWindBoundBegin = ">>>HEAT_WIND_BOUND_BEGIN<<<";
 constexpr const char* kHeatWindBoundEnd = ">>>HEAT_WIND_BOUND_END<<<";
+constexpr const char* kHeatWindBoundRoBegin = ">>>HEAT_WIND_BOUND_RO_BEGIN<<<";
+constexpr const char* kHeatWindBoundRoEnd = ">>>HEAT_WIND_BOUND_RO_END<<<";
 constexpr const char* kHeatWindUnboundBegin = ">>>HEAT_WIND_UNBOUND_BEGIN<<<";
 constexpr const char* kHeatWindUnboundEnd = ">>>HEAT_WIND_UNBOUND_END<<<";
 
@@ -740,10 +746,12 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
   } else {
     common = StripBlock(common, kDraftBoundBegin, kDraftBoundEnd);
   }
-  if (BodyReadsHeat(body)) {
-    common = StripBlock(common, kHeatWindUnboundBegin, kHeatWindUnboundEnd);
-  } else {
-    common = StripBlock(common, kHeatWindBoundBegin, kHeatWindBoundEnd);
+  {
+    const bool heat = BodyReadsHeat(body);
+    const bool render = body.find("uniform> R :") != std::string::npos;
+    if (!heat || render) common = StripBlock(common, kHeatWindBoundBegin, kHeatWindBoundEnd);
+    if (!heat || !render) common = StripBlock(common, kHeatWindBoundRoBegin, kHeatWindBoundRoEnd);
+    if (heat) common = StripBlock(common, kHeatWindUnboundBegin, kHeatWindUnboundEnd);
   }
   if (BodyDeclaresPageTable(body) != BodyDeclaresPageTableByLine(body)) {
     std::fprintf(stderr,

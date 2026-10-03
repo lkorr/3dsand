@@ -3894,6 +3894,15 @@ struct RenderParams {
   uint32_t ticketCount = 0;
   uint32_t pad_tk[3] = {0, 0, 0};
   int32_t ticketBox[kTicketMax][4] = {};
+  // ---- HEAT UPDRAFTS, the render copy (common.wgsl windHeatF) -------------
+  // The LAST tick's TickParams words of the same names (SubmitTick converts
+  // the sim.wind* heat rows), so the F4 arrows and the gust streaks add the
+  // heat term the sim felt, from the same integers. Gain 0 when the sim's
+  // wind is off (sim.windMode 0): the sim feels no heat term then either.
+  int32_t updraftGainQ = 0;
+  int32_t updraftCapQ = 0;
+  int32_t updraftInflowQ = 0;
+  int32_t draftStackQ = 0;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

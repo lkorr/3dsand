@@ -541,6 +541,11 @@ class Backend {
     uint64_t submits = 0, joins = 0, splits = 0, headJoins = 0;
   };
   const AsyncStats& GetAsyncStats() const { return asyncStats_; }
+  // The descriptor pool's draw-down so far (it is never refilled): sets
+  // allocated and STORAGE descriptors written, process-wide. In the device
+  // record (last_run.json) beside kDescPoolMaxSets / kDescPoolStorageBuffers.
+  static uint32_t DescSetsUsed();
+  static uint32_t DescStorageUsed();
 
   // ---- borrowed fences (barrier_graph §4.2) ------------------------------
   //
