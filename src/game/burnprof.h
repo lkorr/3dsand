@@ -53,6 +53,25 @@ enum Phase : uint8_t {
   // eliminating -- see BurnOneLimb's bounded-window note).
   kQueue,
   kFrontSweep,
+  // The rest of MobSystem::PreTick, so its total is attributed: the per-mob
+  // step (AI, animation, bleed, ...), the stain pass and the dead-sleep test.
+  kMobLoop,
+  kStain,
+  kDeadSleep,
+  // Inside kStain: the contact sweep (StainOneLimb, every population), the
+  // rain, drying and wet passes, and the severed-flesh share (StainDeadFlesh,
+  // which runs all four over debris flesh).
+  kStainContact,
+  kStainRain,
+  kStainDry,
+  kStainWet,
+  kStainFlesh,
+  // Inside kStainContact: the "is anything there" world walk, and the
+  // surface list's (re)build after the index was dropped.
+  kStainWalk,
+  kStainSurface,
+  // Inside kHairTuck: the hood's cover map rebuilt (a shell's lattice moved).
+  kHairCover,
   kCount
 };
 
@@ -61,7 +80,11 @@ inline const char* Name(int p) {
                                   "burnLimbs", "burnOne", "flush", "carve",
                                   "rebuild", "index", "crossHeat", "tail",
                                   "recount", "deadFlesh", "walk", "seed",
-                                  "candLoop", "worn", "queue", "frontSweep"};
+                                  "candLoop", "worn", "queue", "frontSweep",
+                                  "mobLoop", "stain", "deadSleep", "stainContact",
+                                  "stainRain", "stainDry", "stainWet",
+                                  "stainFlesh", "stainWalk", "stainSurface",
+                                  "hairCover"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 
@@ -73,11 +96,15 @@ enum Counter : uint8_t {
   kCandidates,   // candidates queued in total (front + neighbours + seeds)
   kEvaluated,    // ...of which the front budget let the loop evaluate
   kFront,        // front cells held at the top of each BurnOneLimb visit
+  kWindowed,     // ...visits that expanded only a window of it (budget-bound)
+  kStainSamples, // surface voxels the contact sweep looked at
+  kStainSwept,   // contact-sweep visits that got past the world walk
   kNCount
 };
 inline const char* CounterName(int c) {
   static const char* k[kNCount] = {"seedProbes", "seedHits", "seedNew",
-                                   "cands", "evaluated", "front"};
+                                   "cands", "evaluated", "front", "windowed",
+                                   "stainSamples", "stainSwept"};
   return c >= 0 && c < kNCount ? k[c] : "?";
 }
 
