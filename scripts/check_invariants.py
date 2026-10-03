@@ -3370,6 +3370,12 @@ _ELEC_CONSTS = {
     "EP_MODE": "kEpMode", "EP_ROUNDS": "kEpRounds", "EP_DECAY": "kEpDecay",
     "EP_ITER_CAP": "kEpIterCap", "EP_WET": "kEpWet", "EP_MAT": "kEpMat",
     "EP_MAT_STRIDE": "kEpMatStride",
+    # E2's header words (sim_step.wgsl).
+    "EP_REACT_MIN": "kEpReactMin", "EP_REACT_FULL": "kEpReactFull",
+    "EP_IGNITE_Q": "kEpIgniteQ", "EP_CRACKLE_Q": "kEpCrackleQ",
+    "EP_CRACKLE_LO_P": "kEpCrackleLoP", "EP_CRACKLE_LO_MAT": "kEpCrackleLoMat",
+    "EP_CRACKLE_HI_P": "kEpCrackleHiP", "EP_CRACKLE_HI_MAT": "kEpCrackleHiMat",
+    "EP_ELEC_TAG": "kEpElecTag",
     # The body query (package E4): boxes in elecParams' tail, answers in elecMeta's.
     "EM_QUERY": "kEmQuery", "EP_QUERY": "kEpQuery", "EP_QUERY_BOXES": "kEpQueryBoxes",
     "ELEC_QUERY_MAX": "kElecQueryMax", "ELEC_QUERY_BOX_WORDS": "kElecQueryBoxWords",

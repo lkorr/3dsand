@@ -2514,6 +2514,18 @@ struct Tuning {
     int elecDecay = TPD(sim, elecDecay);
     // Resist of a cell under a full conducting coat (water); thinner = worse.
     int elecWetResist = TPD(sim, elecWetResist);
+    // E2 (sim_step.wgsl): P at which a cell counts as touching a discharge for
+    // its tag:electric rules, and the P at which those fire at full chance.
+    int elecReactMin = TPD(sim, elecReactMin);
+    int elecReactFull = TPD(sim, elecReactFull);
+    // Ohmic ignition: per-mille a tick per 1,000 of P x resist (before caps).
+    float elecIgniteGain = TPD(sim, elecIgniteGain);
+    // Crackle: per-mille a tick per 1,000 P above the tier threshold.
+    float elecCrackle = TPD(sim, elecCrackle);
+    // Crackle tier thresholds (sparks / arcs); raised past the emitted
+    // material's own source on upload so crackle cannot sustain itself.
+    int elecCrackleSparkP = TPD(sim, elecCrackleSparkP);
+    int elecCrackleArcP = TPD(sim, elecCrackleArcP);
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
     // advances sim state and the droplets can stain, so these are integers in

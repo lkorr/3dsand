@@ -892,6 +892,12 @@ class Simulation {
   uint32_t elecHdr_[kEpHdrWords] = {};
   bool elecHdrValid_ = false;
   uint32_t elecRounds_ = 1;
+  // E2's material-table facts for the header (UploadTables latches them, a
+  // reload re-latches and invalidates elecHdr_): the "electric" tag bit, and
+  // the crackle tiers' materials (`spark`, `arc`) with their own sources.
+  uint32_t elecTagMask_ = 0;
+  uint32_t elecCrackleLoMat_ = 0, elecCrackleLoSrc_ = 0;
+  uint32_t elecCrackleHiMat_ = 0, elecCrackleHiSrc_ = 0;
   std::vector<uint8_t> heatCol_;
   std::vector<int> heatColX_, heatColZ_;
   bool heatColValid_ = false;
