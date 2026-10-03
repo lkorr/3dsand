@@ -3527,7 +3527,27 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
         // POWDER_BLOCK_MIN eighths or more is a whole cube, less is air.
         // Both are bounded answers; on a settled surface the ray that passes
         // through a thin film hits the ground under it one cell later.
-        if (detN < detMax && tCur * VOXEL_METERS <= TUNE_MICRO_LOD_DIST) {
+        //
+        // OVER THE GRAINS (2026-10-03): a cell of 4 or fewer eighths holds
+        // grains in its BOTTOM half only (powderGrainMask fills the bottom
+        // layer first), so a ray whose segment through the cell stays above
+        // the cell's mid-plane cannot meet one. Such a cell is air
+        // here and spends no record: phase 2 would have read four neighbours
+        // to build the arrangement and missed. Measured at noon / meadow /
+        // seam (one process): -0.22 / -0.17 / -0.16 ms, with the phase-2
+        // reject below and the skipped re-read. A grazing ray over sand
+        // terraces crosses several such cells, so the record it saves can
+        // also go to a cell further on instead of the budget fallback.
+        var overGrains = false;
+        if (powderMass(w) <= 4u) {
+          overGrains = min(ro.y + rd.y * tCur,
+                           ro.y + rd.y * min(tMax.x, min(tMax.y, tMax.z))) >
+                       f32(cell.y) + 0.5;
+        }
+        let recordable = detN < detMax && tCur * VOXEL_METERS <= TUNE_MICRO_LOD_DIST;
+        if (recordable && overGrains) {
+          // air (see OVER THE GRAINS)
+        } else if (recordable) {
           let lc = vec3<u32>(cell - wloI);
           let packed = lc.x | (lc.y << 10u) | (lc.z << 20u);
           if (detN == 0) {
@@ -3906,7 +3926,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       // not a hole in the plant, and falls back to the cell that was recorded.
       let hc = clamp(vec3<i32>(floor(ro + rd * tHit)), wloI,
                      wloHi - vec3<i32>(1));
-      let hw = voxWordAt(hc);
+      // Grains never use the re-read (hcOk below is false for them), so they
+      // do not pay its dependent load pair either.
+      var hw = 0u;
+      if (!isGrains) { hw = voxWordAt(hc); }
       let hm = voxMat(hw);
       // Grains are clipped to their own cell by construction (tracePowder
       // tests boxes inside it), so they always report the recorded cell.
@@ -4105,7 +4128,16 @@ fn tracePowder(dc : vec3<i32>, dw : u32, entry : vec3f, inv : vec3f) -> MicroHit
   mh.curved = false;
   mh.key = 0u;
   mh.n = vec3f(0.0);
-  let mask = powderGrainMask(dc, powderMass(dw));
+  let mass = powderMass(dw);
+  // The march's OVER THE GRAINS test, on the exact segment: 4 eighths or
+  // fewer sit in the bottom half, so a ray that never goes below the mid-plane
+  // inside the cell misses before the four neighbour reads.
+  if (mass <= 4u) {
+    let tEx = (select(vec3f(0.0), vec3f(1.0), inv > vec3f(0.0)) - entry) * inv;
+    let yEx = entry.y + min(tEx.x, min(tEx.y, tEx.z)) / inv.y;
+    if (min(entry.y, yEx) > 0.5) { return mh; }
+  }
+  let mask = powderGrainMask(dc, mass);
   var best = 1e30;
   var bestAxis = 1;
   for (var i = 0u; i < 8u; i++) {
