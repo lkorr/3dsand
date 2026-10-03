@@ -450,7 +450,10 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
   uint32_t stainOnlyInBox = 0;
   // DIRTY_R_STAIN (4) and DIRTY_R_STAINW (1024, a drying cell's own write):
   // the stain family, as the waterbody gate's pass A reads it.
-  constexpr uint32_t kStainFamily = 4u | 1024u;
+  // Since 2026-10-03 a DRYING cell marks "dry" / "DRY-WROTE" instead (bits
+  // 29/30, sim_step.wgsl stainDry), so the family is four bits.
+  constexpr uint32_t kStainFamily = 4u | 1024u | DirtyReasonBit("dry") |
+                                    DirtyReasonBit("DRY-WROTE");
   // The seam's per-tick event counters, accumulated. They are the ONLY way to
   // read a mass verdict: "LEAK" with no breakdown says a number did not add up
   // and nothing about which of the four sinks took it, and the four have

@@ -458,7 +458,7 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // standing argument against two lists (tuning_params.def, pass_table.def).
 //
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
-constexpr int kDirtyReasonBits = 29;
+constexpr int kDirtyReasonBits = 31;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "write",      "react-idle", "stain-idle", "flow",
     "viscous",    "seam",       "part",       "wbody",
@@ -481,7 +481,13 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     // docs/PLAN_temperature.md: the chunk's local temperature moved this tick
     // (sim_heat.wgsl heatRelax DIRTY_R_HEAT), so the CA re-reads its cells'
     // heat. Not in FILM_LICENCE: heat moving is not liquid progress.
-    "heat"};
+    "heat",
+    // sim_step.wgsl stainDry: a wet stain DRYING (idle: covered, still wet),
+    // and a drying step that wrote. Split off stain-idle / STAIN-WROTE
+    // 2026-10-03 because those also mean a liquid SOAKING IN, which spends
+    // liquid; drying touches none, and sim_waterbody.wgsl wbQuiet must not
+    // read a drying bank as a disturbed body (DIRTY_R_DRY / DIRTY_R_DRYW).
+    "dry", "DRY-WROTE"};
 
 // The bit for a reason NAME, resolved from the one table above rather than
 // written down as a number a second time -- 22/24/25 in a header is exactly
@@ -513,6 +519,10 @@ static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
                   DirtyReasonBit("gas-edge") != 0,
               "a gas dirty-reason name was renamed in kDirtyReasonName without "
               "updating kDirtyGasMask");
+static_assert(DirtyReasonBit("dry") == (1u << 29) &&
+                  DirtyReasonBit("DRY-WROTE") == (1u << 30),
+              "sim_step.wgsl / sim_waterbody.wgsl DIRTY_R_DRY / DIRTY_R_DRYW are "
+              "bits 29 and 30; kDirtyReasonName must name them there");
 
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;

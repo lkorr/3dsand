@@ -454,7 +454,8 @@ fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 // that found no page this tick asks for one (SOLM_REQ_FLAG) and keeps only its
 // OWN chunk awake to take it next tick.
 const DIRTY_OWN_CHUNK_ONLY : u32 =
-    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE;
+    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE |
+    DIRTY_R_DRY;
 
 fn markDirtyR(c : vec3<i32>, reason : u32) {
   if ((reason & ~DIRTY_OWN_CHUNK_ONLY) == 0u) {
@@ -674,7 +675,7 @@ const DIRTY_M_GASEDGE   : u32 = 33554432u;  // gas wanted out of the window
 // itself through some other chunk's genuine work.
 const FILM_LICENCE : u32 =
     DIRTY_R_WRITE | DIRTY_R_SEAM | DIRTY_R_PARTICLE | DIRTY_R_WATERBODY |
-    DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_REACTW |
+    DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_DRYW | DIRTY_R_REACTW |
     DIRTY_M_DOWN | DIRTY_M_DIAG | DIRTY_M_EQUAL | DIRTY_M_SPLIT |
     DIRTY_M_BRIDGE | DIRTY_M_POWDER | DIRTY_M_GAS |
     DIRTY_M_SOLO;
@@ -2372,6 +2373,21 @@ fn coatMatOf(w : u32, sub : Material) -> u32 {
   return materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
 }
 
+// Bits 29 and 30 ("dry", "DRY-WROTE"): a WET STAIN DRYING (stainDry below).
+// They used to share DIRTY_R_STAIN / DIRTY_R_STAINW with doStaining, and that
+// made two different things one bit: a liquid soaking into the ground (which
+// SPENDS liquid -- a body's volume moves) and a bank the liquid has LEFT
+// drying (which touches no liquid at all: stainDry refuses any cell with its
+// wetter on a face). sim_waterbody.wgsl wbQuiet must tell them apart -- a
+// drained pit's banks dry for ~1000 ticks and, read as one bit, held every
+// created body CANDIDATE that long (`--gate waterbody` pass N). Same sleep and
+// licence semantics as the pair they replace: DRY is an own-chunk idle mark
+// (not in FILM_LICENCE), DRYW is a write (fans out, in FILM_LICENCE). Declared
+// here and in sim_waterbody.wgsl, its one reader; check_invariants.py `drybits`
+// pins both to world.h kDirtyReasonName.
+const DIRTY_R_DRY : u32 = 536870912u;
+const DIRTY_R_DRYW : u32 = 1073741824u;
+
 // ---- A WET STAIN DRIES (2026-09-25) -----------------------------------------
 // A stain type whose material authors `stain.dries` (water) comes off the
 // ground on its own: `dries` per mille per tick, one level at a time, the
@@ -2421,7 +2437,7 @@ fn stainDry(c : vec3<i32>, idx : u32, w : u32, m : Material, rnd : u32, probe : 
   // bounded by their 15 levels -- the same standing a wall a flow wetted has.
   let raining = (T.weatherRain & RAIN_AMOUNT_MASK) != 0u;
   if (!open && raining && rainMapExposedNear(c)) { open = true; }
-  if (!open) { markDirtyR(c, DIRTY_R_STAIN); }
+  if (!open) { markDirtyR(c, DIRTY_R_DRY); }
   // Nothing open to the sky dries while it rains: that is the rain's surface.
   // (Measured: drying through a storm left a third of a rained-on stone strip
   // CLEAN -- its 1-level wet mark dried between drops.)
@@ -2431,7 +2447,7 @@ fn stainDry(c : vec3<i32>, idx : u32, w : u32, m : Material, rnd : u32, probe : 
   var nw = w & ~STAIN_BITS;
   if (left > 0u) { nw = nw | packStain(voxStainType(w), left); }
   voxStore(idx, nw);
-  markDirtyR(c, DIRTY_R_STAINW);
+  markDirtyR(c, DIRTY_R_DRYW);
   return true;
 }
 

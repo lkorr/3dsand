@@ -4276,7 +4276,13 @@ explode; sodium + steam fizzes, + heat burns; hydrogen + heat or spark →
 explode, + chlorine in daylight → acid + small blast, decays (escapes); salt +
 heat → molten salt (molten salt itself a 2% melter, so a pile cannot melt
 itself), molten salt cools on an inverted hot ramp, + water quenches, + spark
-(tag:electric) → sodium + chlorine (electrolysis); spark ignites flammables
+(tag:electric) → sodium + chlorine (electrolysis) — **but not at every pool
+height** (open, 2026-10-03, `chem-electrolysis`): the rule is authored from
+the molten salt's side, a spark is a gas that rises in its OWN colour phase on
+substep 0, and the CA's phases run x, then y, then z, so a pool whose top is at
+y ≡ 2 (mod 3) never sees the spark above it (the spark's y ≡ 0 phase runs
+first and it has risen). The same bias applies to every rule that names a
+fast-moving gas as its NEIGHBOUR (hydrogen + spark, brine + spark); spark ignites flammables
 weakly and lives ~2 ticks; acid dissolves crystal now and FUMES noxious gas
 from every dissolution (~1 in 10 eaten voxels; ~1 in 3 since package E, below), is neutralized by lye (→ water/
 steam + salt) and sodium (→ hydrogen + salt), and still spares glass, steel,
@@ -16824,7 +16830,7 @@ cell. Integer against integer; no scaling and no rounding anywhere.
 
 | pass | shape | what it does |
 |---|---|---|
-| `wbQuiet` | one thread per listed chunk | was this chunk disturbed this tick? |
+| `wbQuiet` | one thread per listed chunk | was this chunk disturbed this tick? (a bank DRYING — dirty bits `dry` / `DRY-WROTE` only — is not) |
 | `wbLedger` | one thread per body | the whole state machine and all arithmetic |
 | `wbReduce` | one workgroup per listed chunk | sums a candidate's voxel eighths |
 | `wbShave` | one workgroup per listed chunk | takes eighths off the free surface, and REPORTS what it took |
@@ -16852,7 +16858,14 @@ So authority is SPLIT rather than moved:
 * **The GPU decides everything that depends on what the world is DOING.**
   Quiescence is measured from `dirtyIn` and the MPM block map — the hashed
   world's own state — and the Candidate → Measuring → Adopted ladder, the level,
-  the area and the ledger all live in `waterBodyState`.
+  the area and the ledger all live in `waterBodyState`. `wbQuiet` ignores ONE
+  family of dirty reasons: `dry` / `DRY-WROTE` (bits 29/30, `sim_step.wgsl`
+  `stainDry`), a wet stain drying. Drying never touches a cell with its wetter
+  liquid on a face, so it cannot move an eighth of any body, and a dug-and-filled
+  pit's banks dry for ~1000 ticks; read as activity, that held every created body
+  CANDIDATE that long (`--gate waterbody` pass N, red 2026-09-25 → 2026-10-03).
+  Drying used to share `stain-idle` / `STAIN-WROTE` with `doStaining`, whose
+  soak-in DOES spend liquid and still counts.
 
 **That closes the M1 hazard** this section used to end with: the quiescence term
 read `World::Snap()`. Nothing in `waterbody.cpp` reads a snapshot now, and

@@ -341,67 +341,107 @@ Status GateChemElectrolysis(Ctx& c, std::string& detail) {
   Regenerate(c);
   const int half = 3;
   const IVec3 s = Site(c, 320, 12, 3);
-  // Two glass boxes side by side: A melts salt on lava, B electrolyses a pool
-  // of molten salt.
+  // A melts salt on lava. B electrolyses a pool of molten salt, THREE TIMES:
+  // pools whose floor sits at each of the three residues of world y mod 3.
+  //
+  // WHY THREE (2026-10-03, CLAUDE.md rule 6). This gate was red at origin and
+  // green only at the window `streaming` used to leave behind; a pool at site
+  // y 220/223 failed where 221/222 passed. That is the CA's colour lattice,
+  // not a missed cell: sim_step runs the 27 phases in the order x, then y,
+  // then z (simulation.cpp's phase table), and a SPARK is a gas that rises one
+  // cell in its OWN phase on substep 0, right after its reactions.
+  // Electrolysis is authored from the molten salt's side (`molten_salt` +
+  // tag:electric), so a pool cell sees the spark only if its phase runs
+  // BEFORE the spark's. With the pool at y = 2 (mod 3) the spark above it is
+  // at y = 0 (mod 3), whose phase runs first in every column: the spark has
+  // risen before the pool looks, every tick, at every cell. One pool height in
+  // three can never be electrolysed -- in the game, not just here -- and a
+  // fixture that tests one height measures where the site happened to land.
+  // The claim is "molten salt shocked with sparks splits", so it must hold at
+  // all three heights, and the detail names the one that does not.
   const Box aIn{{s.x - 10 - half, s.y + 1, s.z - half}, {s.x - 10 + half, s.y + 6, s.z + half}};
-  const Box bIn{{s.x + 4 - half, s.y + 1, s.z - half}, {s.x + 4 + half, s.y + 6, s.z + half}};
+  Box bIn[3];
+  for (int k = 0; k < 3; k++) {
+    const int bz = s.z + (k - 1) * 10;
+    bIn[k] = Box{{s.x + 4 - half, s.y + 1 + k, bz - half},
+                 {s.x + 4 + half, s.y + 6 + k, bz + half}};
+  }
   auto grow = [](const Box& b, int up) {
     return Box{{b.lo.x - 1, b.lo.y - 1, b.lo.z - 1}, {b.hi.x + 1, b.hi.y + up, b.hi.z + 1}};
   };
-  const Box aWatch = grow(aIn, 8), bWatch = grow(bIn, 8);
+  const Box aWatch = grow(aIn, 8);
   std::vector<CellOp> build, fillA, fillB;
   Vessel(build, aIn, aIn.hi.y, (uint32_t)mGlass, (uint32_t)mStone);
-  Vessel(build, bIn, bIn.hi.y, (uint32_t)mGlass, (uint32_t)mStone);
+  for (int k = 0; k < 3; k++)
+    Vessel(build, bIn[k], bIn[k].hi.y, (uint32_t)mGlass, (uint32_t)mStone);
   Fill(fillA, Box{{aIn.lo.x, aIn.lo.y, aIn.lo.z}, {aIn.hi.x, aIn.lo.y, aIn.hi.z}},
        (uint32_t)mLava, 7u);
   Fill(fillA, Box{{aIn.lo.x + 1, aIn.lo.y + 1, aIn.lo.z + 1},
                   {aIn.hi.x - 1, aIn.lo.y + 1, aIn.hi.z - 1}},
        (uint32_t)mSalt, 0);
-  Fill(fillB, Box{{bIn.lo.x, bIn.lo.y, bIn.lo.z}, {bIn.hi.x, bIn.lo.y, bIn.hi.z}},
-       (uint32_t)mMolten, 7u);
+  for (int k = 0; k < 3; k++)
+    Fill(fillB, Box{{bIn[k].lo.x, bIn[k].lo.y, bIn[k].lo.z},
+                    {bIn[k].hi.x, bIn[k].lo.y, bIn[k].hi.z}},
+         (uint32_t)mMolten, 7u);
 
   uint32_t t = 73000;
   support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
   tick(std::vector<BrushOp>{}, build);
   tick(std::vector<BrushOp>{}, fillA);
   tick(std::vector<BrushOp>{}, fillB);
-  uint32_t moltenA = 0, sodiumB = 0, chlorineB = 0;
-  // Attribution for a B that never splits: was the pool there, did the
-  // sparks land, and what did the pool turn into instead.
-  uint32_t moltenB = 0, sparkB = 0, saltB = 0, moltenB2 = 0;
+  uint32_t moltenA = 0;
+  // Per pool: what it made, and the attribution for one that never splits
+  // (was the pool there, did the sparks land, what did it turn into instead).
+  uint32_t sodiumB[3] = {}, chlorineB[3] = {}, moltenB[3] = {}, sparkB[3] = {},
+           saltB[3] = {}, moltenB2[3] = {};
   const int kTicks = 160;
   for (int i = 1; i <= kTicks; i++) {
     std::vector<CellOp> zap;
-    // Sparks over box B for ticks 2..8 (the bench's Electrify, done by hand):
-    // IfAir, one layer above the molten pool.
+    // Sparks over each B pool for ticks 2..8 (the bench's Electrify, done by
+    // hand): IfAir, one layer above the molten pool.
     if (i >= 2 && i <= 8)
-      for (int z = bIn.lo.z; z <= bIn.hi.z; z++)
-        for (int x = bIn.lo.x; x <= bIn.hi.x; x++)
-          zap.push_back({World::SlotCellIndex({x, bIn.lo.y + 1, z}),
-                         PackVoxNew((uint32_t)mSpark, 0) | kCellOpIfAir});
+      for (int k = 0; k < 3; k++)
+        for (int z = bIn[k].lo.z; z <= bIn[k].hi.z; z++)
+          for (int x = bIn[k].lo.x; x <= bIn[k].hi.x; x++)
+            zap.push_back({World::SlotCellIndex({x, bIn[k].lo.y + 1, z}),
+                           PackVoxNew((uint32_t)mSpark, 0) | kCellOpIfAir});
     tick(std::vector<BrushOp>{}, zap);
     if (i % 2 == 0) {
       moltenA = std::max(moltenA, Census(c, aWatch)[mMolten]);
-      const std::vector<uint32_t> hb = Census(c, bWatch);
-      sodiumB = std::max(sodiumB, hb[mSodium]);
-      chlorineB = std::max(chlorineB, hb[mCl]);
-      if (i == 2) moltenB2 = hb[mMolten];
-      moltenB = std::max(moltenB, hb[mMolten]);
-      sparkB = std::max(sparkB, hb[mSpark]);
-      saltB = std::max(saltB, hb[mSalt]);
+      for (int k = 0; k < 3; k++) {
+        const std::vector<uint32_t> hb = Census(c, grow(bIn[k], 8));
+        sodiumB[k] = std::max(sodiumB[k], hb[mSodium]);
+        chlorineB[k] = std::max(chlorineB[k], hb[mCl]);
+        if (i == 2) moltenB2[k] = hb[mMolten];
+        moltenB[k] = std::max(moltenB[k], hb[mMolten]);
+        sparkB[k] = std::max(sparkB[k], hb[mSpark]);
+        saltB[k] = std::max(saltB[k], hb[mSalt]);
+      }
     }
   }
   Regenerate(c);
   const bool melts = moltenA > 0;
-  const bool splits = sodiumB > 0 && chlorineB > 0;
+  bool splits = true;
+  std::string pools;
+  for (int k = 0; k < 3; k++) {
+    const int py = bIn[k].lo.y;
+    const int res = ((py % 3) + 3) % 3, sres = (res + 1) % 3;
+    const bool split = sodiumB[k] > 0 && chlorineB[k] > 0;
+    splits = splits && split;
+    // Same x and z column, so the spark's phase runs first exactly when its
+    // y residue is the smaller one.
+    pools += Format(
+        "%s pool y %d (y%%3 %d, spark %d: spark phase %s): sodium %u, chlorine "
+        "%u (%s) [molten %u at tick 2, peak %u; spark peak %u; salt peak %u]",
+        k ? " |" : "", py, res, sres, sres < res ? "FIRST" : "after", sodiumB[k],
+        chlorineB[k], split ? "split" : "NO ELECTROLYSIS", moltenB2[k], moltenB[k],
+        sparkB[k], saltB[k]);
+  }
   const bool ok = melts && splits;
   detail = Format(
-      "A salt on lava: molten salt peak %u cells (%s); B molten salt + sparks: "
-      "sodium peak %u, chlorine peak %u (%s) [B pool: molten %u at tick 2, "
-      "peak %u; spark peak %u; salt peak %u; site (%d,%d,%d)]",
-      moltenA, melts ? "melts" : "NEVER MELTED", sodiumB, chlorineB,
-      splits ? "split" : "NO ELECTROLYSIS", moltenB2, moltenB, sparkB, saltB,
-      s.x, s.y, s.z);
+      "A salt on lava: molten salt peak %u cells (%s); B molten salt + sparks at "
+      "three lattice heights:%s; site (%d,%d,%d)",
+      moltenA, melts ? "melts" : "NEVER MELTED", pools.c_str(), s.x, s.y, s.z);
   std::printf("chem-electrolysis: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

@@ -1014,7 +1014,11 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     std::vector<uint32_t> fl(kNumSlots, 0);
     rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0,
                           fl.data(), kNumSlots * 4, "wbAwakeWhy");
-    constexpr uint32_t kStainFamily = 4u | 1024u;
+    // ...and since 2026-10-03 the drying has bits of its own, "dry" /
+    // "DRY-WROTE" (sim_step.wgsl stainDry), split off so wbQuiet can ignore
+    // them: the family is the four.
+    constexpr uint32_t kStainFamily = 4u | 1024u | DirtyReasonBit("dry") |
+                                      DirtyReasonBit("DRY-WROTE");
     uint32_t why[kDirtyReasonBits] = {};
     uint32_t awakeAfterDrain = 0, dryingOnly = 0;
     for (uint32_t ci = 0; ci < kNumSlots; ci++) {
@@ -3200,7 +3204,13 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       areaAbove = lv.Area(pSlot, lakeGeo.floorY, wallTopY + 2);
       areaBelow = lv.Area(pSlot, lakeGeo.floorY, wallTopY - 2);
 
-      const WaterBodyDesc* cd = WaterBodies().FindChild(1);
+      // The child carries its PARENT's basin id. This read FindChild(1) -- the
+      // harness lake's id before 51657b7 made it the site-derived
+      // WaterSiteBasinId (0x40000000 | site) -- and nobody saw it: pass N was
+      // red from f039607 to 2026-10-03 and this pass is skipped behind any
+      // earlier failure, so it never ran against the new id and reported
+      // "child slot 4294967295 is unproposed" the first time it did.
+      const WaterBodyDesc* cd = WaterBodies().FindChild(LakeId());
       const uint32_t cSlot = cd ? cd->gpuSlot : kNoGpuSlot;
       if (lv.At(pSlot, WBS_STATE) == WB_ADOPTED) splitSlots++;
       if (cSlot < kWaterBodyCap && lv.At(cSlot, WBS_STATE) == WB_ADOPTED)

@@ -918,3 +918,25 @@ parcel digest). First run: converted 2365, refused 93317 on 53 ticks, twice-run
 identical over 56 snapshot ticks, digest c188e30d both arms. `gas-leave`'s
 "zero refusals" assertion is unchanged but is a throughput claim now, not a
 determinism one (DESIGN.md "The edge's refusals are a function of the world").
+## 2026-10-03 — red-world: waterbody flipped to pass; chem-electrolysis attributed; tree-fell green at gate scope
+
+- `waterbody` -> **pass**. Pass N: `sim_step.wgsl` `stainDry` now marks its own
+  dirty bits, `dry` / `DRY-WROTE` (29/30, world.h `kDirtyReasonName`), and
+  `sim_waterbody.wgsl` `wbQuiet` ignores exactly those. A bank drying touches
+  no liquid; `doStaining`'s soak-in (which spends water) keeps
+  `stain-idle` / `STAIN-WROTE` and still counts. The created body adopts at
+  tick 2092 (113256 poured, 109061 measured). That let pass B run for the first
+  time since 2026-09-25, and it failed on a gate bug: `FindChild(1)`, the lake's
+  basin id before 51657b7 made it `WaterSiteBasinId`. Now `LakeId()`: 2 adopted
+  descriptors, held 1886851 = voxel 1886851. Command:
+  `bash scripts/run.sh ./build/Release/sandvox_redworld.exe --selftest --gate waterbody`.
+- `chem-electrolysis` stays **fail**, cause now attributed (the 10-01 guess
+  "IfAir sparks not stepped" was wrong). The cause is colour-lattice order. A spark is a gas
+  that rises in its own phase on substep 0. Phases run x, then y, then z. The
+  rule is authored from the molten salt's side. So a pool at y ≡ 2 (mod 3)
+  never sees its spark. The gate now pools at all three residues: y 221
+  (≡2) sodium 0, y 222 sodium 41, y 223 sodium 44. The fix is a design
+  decision (spark-side rule, non-rising spark, or two-sided matching).
+- `tree-fell` stays **fail** (suite scope). It passes at gate scope at
+  c364516: 0/0/0 burn residue, forced rescan 0/0/0. The suite-scope floater was
+  not reproduced, because this package ran no suite.
