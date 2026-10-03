@@ -11032,17 +11032,26 @@ void Mob::SyncHairTuck() {
                            : Vec3{u, v, m};
     return d * (1.0f / d.len());
   };
+  // The covered bins' directions, built on the first rim lookup of a call
+  // (binDir is a normalisation per bin, and the brute search below used to
+  // recompute it for every covered bin for every open bin it was asked).
+  std::vector<Vec3> covDirs;
   auto rimOf = [&](int bin) {
     if (rim[(size_t)bin] >= 0.0f) return rim[(size_t)bin];
     // Nearest covered direction by angle. A brute search, but only for the
     // few open bins that hair actually lands in, and only when the tuck is
     // recomputed.
+    if (covDirs.size() != coveredBins.size()) {
+      covDirs.clear();
+      covDirs.reserve(coveredBins.size());
+      for (int cb : coveredBins) covDirs.push_back(binDir(cb));
+    }
     const Vec3 d = binDir(bin);
     float best = -2.0f, r = 0.0f;
-    for (int cb : coveredBins) {
-      const Vec3 e = binDir(cb);
+    for (size_t j = 0; j < covDirs.size(); j++) {
+      const Vec3& e = covDirs[j];
       const float dot = d.x * e.x + d.y * e.y + d.z * e.z;
-      if (dot > best) { best = dot; r = rmax[(size_t)cb]; }
+      if (dot > best) { best = dot; r = rmax[(size_t)coveredBins[j]]; }
     }
     rim[(size_t)bin] = r;
     return r;
@@ -11050,6 +11059,7 @@ void Mob::SyncHairTuck() {
   auto buildCover = [&]() {
     burnprof::Scope bpCover(burnprof::kHairCover);
     coverBuilt = true;
+    covDirs.clear();
     tuckCoverSig_ = shellSig;
     // A rebuild starts from nothing (the old early-out below left a stale
     // cover in place when the head had no cells).
@@ -11160,6 +11170,7 @@ void Mob::SyncHairTuck() {
       continue;
     }
     if (!coverBuilt) buildCover();
+    burnprof::Scope bpFull(burnprof::kHairFull);
 
     // Which cells hide. Hair -> world by its own live transform -> the head's
     // frame. The mane swings on a spring, so a mane is tucked for the pose it
@@ -16917,9 +16928,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // loop does (deterministic: tick and limb key only).
     const size_t nHot = scanHot.size();
     const size_t hot0 = (size_t)(Hash3(limbKey, tick, 0x5EED0u) % (uint32_t)nHot);
+    uint64_t seedHot = 0, seedFaces = 0, seedFootReads = 0;
     for (size_t hj = 0; hj < nHot; hj++) {
       const IVec3& c = scanHot[(hot0 + hj) % nHot];
       if (!probes) break;
+      seedHot++;
       for (const IVec3& d : kBurnDirs) {
         const IVec3 nb{c.x + d.x, c.y + d.y, c.z + d.z};
         if (nb.x < lo.x || nb.x > hi.x || nb.y < lo.y || nb.y > hi.y ||
@@ -16991,12 +17004,15 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           const int64_t vol = (int64_t)std::max(0, x1 - x0 + 1) *
                               std::max(0, y1 - y0 + 1) * std::max(0, z1 - z0 + 1);
           bool any = vol > 4 * S * S;
+          seedFaces++;
           for (int zz = z0; zz <= z1 && !any; zz++)
             for (int yy = y0; yy <= y1 && !any; yy++) {
               const uint32_t* row =
                   st.idx.data() + ((size_t)zz * bd.y + yy) * bd.x;
-              for (int xx = x0; xx <= x1; xx++)
+              for (int xx = x0; xx <= x1; xx++) {
+                seedFootReads++;
                 if (row[xx] != 0) { any = true; break; }
+              }
             }
           if (!any) continue;
         }
@@ -17042,6 +17058,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       }
     }
     burnprof::Count(burnprof::kSeedProbes, probes0 - probes);
+    burnprof::Count(burnprof::kSeedHot, seedHot);
+    burnprof::Count(burnprof::kSeedFaces, seedFaces);
+    burnprof::Count(burnprof::kSeedFootReads, seedFootReads);
   }
 
   // ---- A CORROSIVE COAT SEEDS ITS OWN VOXELS -----------------------------

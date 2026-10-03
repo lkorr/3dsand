@@ -72,6 +72,7 @@ enum Phase : uint8_t {
   kStainSurface,
   // Inside kHairTuck: the hood's cover map rebuilt (a shell's lattice moved).
   kHairCover,
+  kHairFull,    // ...a hair limb's whole tuck re-derived (not the fast path)
   kCount
 };
 
@@ -84,7 +85,7 @@ inline const char* Name(int p) {
                                   "mobLoop", "stain", "deadSleep", "stainContact",
                                   "stainRain", "stainDry", "stainWet",
                                   "stainFlesh", "stainWalk", "stainSurface",
-                                  "hairCover"};
+                                  "hairCover", "hairFull"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 
@@ -99,12 +100,16 @@ enum Counter : uint8_t {
   kWindowed,     // ...visits that expanded only a window of it (budget-bound)
   kStainSamples, // surface voxels the contact sweep looked at
   kStainSwept,   // contact-sweep visits that got past the world walk
+  kSeedHot,      // hot cells the seeding visited
+  kSeedFaces,    // ...faces of them past the box cull (footprint tested)
+  kSeedFootReads,// ...index reads the footprint tests made
   kNCount
 };
 inline const char* CounterName(int c) {
   static const char* k[kNCount] = {"seedProbes", "seedHits", "seedNew",
                                    "cands", "evaluated", "front", "windowed",
-                                   "stainSamples", "stainSwept"};
+                                   "stainSamples", "stainSwept", "seedHot",
+                                   "seedFaces", "seedFootReads"};
   return c >= 0 && c < kNCount ? k[c] : "?";
 }
 
