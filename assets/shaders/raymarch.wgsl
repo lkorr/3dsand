@@ -3850,6 +3850,62 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
       break;
     }
     if (tCur >= tExit) { break; }
+    // ---- A RUN OF IDENTICAL FULL LIQUID: crossed in a tight loop (2026-10-03) --
+    // A primary ray in a lake spends its steps here: 37 water cells a pixel on
+    // the `lake` budget camera, 67 under water (raymarch-shadow-water's
+    // count), every one of them the whole loop above -- chunk test, sentinel
+    // and block tests, three material loads, the media branch, the partial-
+    // fill clip. For a FULL cell (state 7) of a clear liquid with no
+    // emission, every one of those is the same answer as the cell before, and
+    // the contribution is linear in the segment: liqPath += seg, mediaTau +=
+    // seg * opacity, mediaTint += tint * that. So once such a cell has been
+    // processed, the cells after it that hold the SAME material and state
+    // (stain and stamp may differ: neither enters the media sums) are crossed
+    // here with one voxel load and a DDA step each, in the same arithmetic,
+    // in the same order -- the picture is bit-identical (budget cameras lake,
+    // submerged, noon: 0 pixels >= 16/255). The run stops at anything else, at
+    // the chunk boundary (the outer loop owns the per-chunk caches; letting
+    // the run refill them measured worse on the lake camera), at the window,
+    // the step budget, the exit and the 24 m depth cap, exactly where the
+    // outer loop would. Not in the debug view, which tints per cell.
+    // Measured (--render-budget, harness map, one process): lake 11.78 ->
+    // 10.67 ms, submerged 13.29 -> 8.82; noon/seam +0.03..0.06 (code size).
+    if (cellLiq > 0.0 && cellFire == 0.0 && cellOp > 0.0 && waterFrac == 1.0 &&
+        voxState(w) == 7u && !(SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u)) {
+      let runKey = w & 0xFFFFu;   // material + state
+      var sat = false;
+      loop {
+        if (i + 1 >= maxSteps) { break; }
+        if (any(cell < wloI) || any(cell >= wloHi)) { break; }
+        if (any((cell >> vec3<u32>(CHUNK_SHIFT)) != cchC)) { break; }
+        let w2 = voxWordAtEntry(cchPt, cell);
+        if ((w2 & 0xFFFFu) != runKey) { break; }
+        i += 1;
+        if (RENDER_STATS && gRsOn) { gRsTraceSteps += 1u; }
+        let tP = tCur;
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+          cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+        } else if (tMax.y < tMax.z) {
+          cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+        } else {
+          cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+        }
+        let sg = tCur - tP;
+        out.liqPath += sg;
+        let dT = sg * cellOp;
+        out.mediaTau += dT;
+        rsAdd(RS_MEDIA, 1u);
+        out.mediaTint += cellTint * dT;
+        if (out.liqPath * VOXEL_METERS > 24.0) {
+          out.saturated = true;
+          out.t = tCur;
+          sat = true;
+          break;
+        }
+        if (tCur >= tExit) { break; }
+      }
+      if (sat || tCur >= tExit) { break; }
+    }
   }
 
   // ======================== PHASE 2: resolve the detail =====================
