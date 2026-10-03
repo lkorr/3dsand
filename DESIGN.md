@@ -2393,6 +2393,35 @@ reaction system.
   window, so a raster body can stand behind coarse gas the depth raster does not
   know about. Bounded by the crossfade weight — zero at the inner edge, and only
   fully coarse at the face, 25 m away.
+- **The fill's sampler skips empty bricks (2026-10-03, raymarch-smoke).**
+  `gasOuterFill` takes 32 smoothstepped-trilinear samples per pixel on every
+  gas frame. Priced on `--render-budget` (fire / village cameras, one process),
+  the whole fill was 1.18 / 0.55 ms, and the same loops with the eight fetches
+  removed and nothing else changed were 1.37 / 0.55 ms cheaper: the loads are
+  the whole cost. A per-FRAME row on the ShadowCache table, `gas_mask`
+  (`assets/shaders/gas_mask.wgsl`, `pass::Buf::GasMask`, shadowBGL 30 reads
+  `gasOuter` / 31 writes, renderBGL 40 reads), builds one bit per 4³-cell brick
+  of the box — dilated by the one-cell rim the filter reaches past a brick's
+  high faces — on frames with `RFLAG_GAS` set (an empty dispatch otherwise).
+  `gasOuterCountAt` tests the bit before any fetch and returns 0.0 on a clear
+  one, which is exactly what eight zero corners blend to, so the picture is
+  unchanged. Where the 2×2×2 footprint lies inside the box, the four x-pairs
+  come from one `u32` each (d.x even) or two (odd) instead of eight
+  bounds-tested loads. Together vs the old sampler: fire 10.90 → 10.15 ms,
+  village 6.44 → 6.25; the row costs ~0.02 ms. 2³ and 1³ bricks were measured
+  and skip none of the samples that still cost anything (those hold smoke);
+  1³ costs ~0.15 ms more to build. After it, the band, the outside segment and
+  the erosion noise each price at ≤ 0.25 ms on those cameras.
+- **`GAS_RUN` (raymarch.wgsl const, OFF).** `trace()`'s liquid-run loop can also
+  cross a run of one non-emissive gas thinner than 0.2 opacity (ether vapour,
+  hydrogen, steam) with one voxel load and a DDA step per cell, exact, up to
+  the precomputed `tFree` where the crossfade could start fading a voxel.
+  `--render-budget`'s `smoke` camera (eye 1.7 m up inside an ether-vapour slab:
+  the alchemy-bench report's "camera inside the cloud", made deterministic)
+  goes 9.89 → 8.87 ms, but fire +0.2 and village +0.15 ms, with no thin gas
+  in their runs (an opacity gate of 0.1 costs the same) — the code's presence
+  on dense-gas frames. Two of three gas cameras lose, so it ships off; flip
+  the const to re-run the comparison.
 - **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
   `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
   CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the
