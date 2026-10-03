@@ -2142,6 +2142,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { gIntegrate_ = MakeComputePipeline(device, gasPL_, mGas, "gasIntegrate", "gasIntegrate"); });
   pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
   pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
+  pool.Add([&] { gLeavePrep_ = MakeComputePipeline(device, gasPL_, mGas, "gasLeavePrep", "gasLeavePrep"); });
   pool.Add([&] { gFarPlume_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlume", "gasFarPlume"); });
   pool.Add([&] { gFarPlumeW_ = MakeComputePipeline(device, gasPL_, mGas, "gasFarPlumeWide", "gasFarPlumeWide"); });
 
@@ -2255,7 +2256,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
-      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
+      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ || !gLeavePrep_ ||
       !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
       !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
@@ -2625,6 +2626,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GasIntegrate:   return gIntegrate_;
     case P::GasArgs2:       return gArgs2_;
     case P::GasResolve:     return gResolve_;
+    case P::GasLeavePrep:   return gLeavePrep_;
     case P::GasFarPlume:    return gFarPlume_;
     case P::GasFarPlumeWide: return gFarPlumeW_;
     case P::PArgs1:         return pArgs1_;

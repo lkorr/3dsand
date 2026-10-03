@@ -1864,6 +1864,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     opstream::ReplaceGasIfReplaying(tick, gas);
     std::vector<uint32_t> hdr(kGasSpHdr + gas.size() * kGasSpStride, 0u);
     hdr[kGasSpCount] = (uint32_t)gas.size();
+    // TEST ONLY: the leave-budget ceiling a gate can force (0 = none). See
+    // world.h kGasOpsLeaveCap; sim_gas's gasLeavePrep is the one reader.
+    hdr[kGasOpsLeaveCap] = world.GasLeaveCapForTest();
     if (!gas.empty())
       std::memcpy(hdr.data() + kGasSpHdr, gas.data(), gas.size() * sizeof(GasSpawnOp));
     ctx.queue.WriteBuffer(world.gasSpawnOps, 0, hdr.data(), hdr.size() * 4);

@@ -946,6 +946,8 @@ class Simulation {
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five
   // entry points shaped like the ballistic five above.
   rhi::ComputePipeline gArgs1_, gSpawn_, gIntegrate_, gArgs2_, gResolve_;
+  // The window edge's leave budget, recorded before the CA (gasLeavePrep).
+  rhi::ComputePipeline gLeavePrep_;
   // Far fire plumes (world.h kGasFarEmitMax): a sixth gas entry point on the
   // same layout, whose only output is the render-only density box.
   rhi::ComputePipeline gFarPlume_;

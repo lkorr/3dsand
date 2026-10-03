@@ -2341,19 +2341,44 @@ reaction system.
   scheduling-dependent by construction), which the `determinism` gate compares
   across its two runs alongside the hash series.
 
-**The open problem, recorded because sizing a cap is not the same as fixing
-it.** `gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are
-refused when the per-tick list fills is decided by which workgroup arrived
-first — and a refused voxel STAYS IN THE GRID, where the world hash can see it.
-That is scheduling-dependent output, i.e. a rule-1 hazard. It is held off by
-sizing `kGasSpawnPerTick` (65,536, a quarter of the window's top face in ONE
-tick) out of reach, which makes the POOL the binding constraint instead — and a
-dropped parcel is already outside the window and cannot move a voxel. The
-`gas-leave` gate asserts refusals == 0, so the day that is not enough it is a
-printed number rather than a silent divergence. **The real fix is mark+apply**:
-the CA flags cells that want to leave and a second pass converts them in a
-deterministic order, which is the pattern `sim_explode` already uses for exactly
-this reason.
+**The edge's refusals are a function of the world (closed 2026-10-03).** Until
+then a conversion charged a shared `atomicAdd` cursor, so WHICH voxels were
+refused when the per-tick list filled was decided by which workgroup arrived
+first — and a refused voxel stays in the grid, where the world hash sees it. It
+was held off by sizing `kGasSpawnPerTick` out of reach. The pool had the same
+hole one step later: which parcel a full pool vaporized was whichever thread's
+`atomicAdd` came last, and the doc's old claim that this "cannot move a voxel"
+was wrong — a parcel that is never dropped can blow back in and land. Now:
+
+1. **The tick's budget is fixed before the CA** (`sim_gas.wgsl gasLeavePrep`, a
+   one-thread pass after `fill_gasSpawn`): `min(kGasSpawnPerTick, pool room left
+   after the live parcels and this tick's CPU spawns)`. So `gasSpawnStep` can
+   never refuse a CA record, and it places every record at `live + rank` (CA
+   list first, CPU list in push order) instead of by cursor — a CPU spawn a full
+   pool refuses is the tail of the CPU's own list. `gasArgs1` publishes the new
+   count.
+2. **It is split evenly across the dirty chunks that touch the residency edge**:
+   `camask` on substep 0 initialises one word per slot behind the record list
+   (`kGasSpChunkBase`) and counts the edge chunks (`kGasSpEdgeChunks`, an
+   order-free count). A chunk's share is `budget / edgeChunks`, spent in
+   dispatch order, so the shares can never sum past the list.
+3. **Within one dispatch a chunk is one workgroup's.** A cell whose primary step
+   leaves the window DEFERS (`gasLeaveDefer`: it has written nothing yet — the
+   failed out-of-window `tryMove` is a no-op), and after a workgroup barrier
+   main's leave-resolve tail accepts all of a chunk's leavers if they fit its
+   unspent share, else the lowest by a per-cell `hash3` rank. Accepted ones
+   convert (`gasConvert`); refused ones resume their ladder at candidate 1,
+   exactly as at a wall. The deferral cannot change an outcome: everything the
+   cell does next is within reach 1, which no other thread of its colour can
+   touch.
+
+Rule 2: one `camask` thread per dirty chunk does 26 residency probes on substep
+0, one extra workgroup barrier per CA workgroup, and the ranking loop runs only
+for a chunk over its share. `gas-leave-overflow` forces the overflow (a test-only
+budget ceiling, `World::SetGasLeaveCapForTest`, word 1 of the `gasSpawnOps`
+header) and asserts refusals > 0, conversions > 0, no overrun, and a tick-for-
+tick identical twice-run (hash + per-tick leave counts + parcel digest).
+`gas-leave` still asserts zero refusals, as a THROUGHPUT claim now.
 
 **The settled-tick skip vs parcels in flight — FOUND BY THE GATE, FIXED IN
 `simulation.cpp`.** This section's own paragraph above states the obligation:

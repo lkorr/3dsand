@@ -245,6 +245,16 @@ PASS(explodeApply, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_APPLY,K
 // args1 sizes the integrate dispatch — same page explosion ejecta uses.
 PASS(particleSpawn, "prep(mutate+explode+compact)", PT_TICK, PIPE_P_SPAWN,     K_COMPUTE, D_SPAWN,1,1,GRP_SLIM_PART, DYN_NONE, C_SPAWN, 1,
      USES(R(SpawnOps) U(TickUBO) A(ParticleCounts) W(ParticlesRead)))
+// THE WINDOW EDGE'S LEAVE BUDGET (sim_gas.wgsl gasLeavePrep; sim_step.wgsl
+// THE EDGE'S BUDGET). One thread, after fill_gasSpawn (WAW on the header) and
+// before caMask/ca, which read the budget it writes: the record list's cap
+// less the pool room the live parcels and this tick's CPU spawns take. It is
+// what lets every leave refusal be decided by a rule rather than by arrival
+// order. Reads the read page's live count, which nothing writes between last
+// tick's integrate and this tick's gasArgs1.
+PASS(gasLeavePrep, "prep(mutate+explode+compact)", PT_TICK, PIPE_GAS_LEAVE_PREP, K_COMPUTE, 1,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(U(TickUBO) A(GasSpawn) R(GasSpawnOps) A(GasCounts)))
 // compact dirtyIn -> dense chunk list + indirect args, AFTER mutate/explode so
 // freshly touched chunks simulate this tick.
 // C_CAACTIVE, not C_ALWAYS: this row exists ONLY to build the CA's dispatch
@@ -513,9 +523,14 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 // field cannot change between the substeps, and both rows walk one dirty
 // list. caMask1 therefore binds substep 1's pass slice (DYN_CA1, iteration 0
 // of the ca1 block) instead of slice 0.
+// A(GasSpawn): on substep 0 camask initialises each dirty chunk's leave-budget
+// word and counts the ones touching the residency edge (sim_step.wgsl
+// gasLeaveCount); the ca rows behind it read both. caMask1 does neither (its
+// P.substep is 1) but is the same entry point, so it carries the same use.
 PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)))
+          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
+          A(GasSpawn)))
 // read-only in practice: `reposeSnap` and `caMask` are read_write for the
 // module because `reposesnap` / `camask` write them; `main` only reads both.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 27,
@@ -528,7 +543,8 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
 // read-only in practice: `voxels`, as for caMask above.
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)))
+          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
+          A(GasSpawn)))
 // read-only in practice: `reposeSnap` and `caMask`, as for ca above.
 PASS(ca1, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 27,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
@@ -851,10 +867,13 @@ PASS(gasSpawn, "gasSpawn+args1", PT_TICK, PIPE_GAS_SPAWN, K_COMPUTE, D_GASSPAWN,
      USES(U(TickUBO) A(GasSpawn) R(GasSpawnOps) A(GasCounts) W(GasParticlesRead)))
 // gasArgs1 also ZEROES the write page's cursor — the one point in the tick
 // after the last read of its old value and before the first append into it.
-// That is why there is no fill_gasCounts row above.
+// That is why there is no fill_gasCounts row above. It also PUBLISHES the read
+// page's new count (live + both spawn lists): gasSpawn places records by rank
+// and never touches the count, so A(GasSpawn) R(GasSpawnOps) for the two list
+// lengths.
 PASS(gasArgs1, "gasSpawn+args1", PT_TICK, PIPE_GAS_ARGS1, K_COMPUTE, 1,1,1,
      GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
-     USES(U(TickUBO) A(GasCounts) W(GasArgsStage)))
+     USES(U(TickUBO) A(GasCounts) W(GasArgsStage) A(GasSpawn) R(GasSpawnOps)))
 PASS(copy_gasArgs_dispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_GAS, 1,
      USES(TR(GasArgsStage) TW(GasDispatchArgs)))
 // read-only in practice: `voxels` is read_write for the module because

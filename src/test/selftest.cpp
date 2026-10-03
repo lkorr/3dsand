@@ -718,6 +718,10 @@ const char* const kOrder[] = {
     // stated reason. It builds the same kind of fixture 200 m out and
     // regenerates on the way out, so it leaves the world as it found it.
     "gas-farplume2",
+    // ...and the edge's forced overflow (2026-10-03), appended last in the
+    // group for the same reason. It regenerates before each of its two runs
+    // and on the way out, and resets the test leave cap it sets.
+    "gas-leave-overflow",
     // CHUNK TICKETS (docs/PLAN_chunk_tickets.md §4), appended after the gas
     // group for its reason: the same subject (matter that LEAVES the window)
     // and the same discipline — each clears the store and drops every ticket

@@ -2487,6 +2487,10 @@ def check_gas_consts():
     for cname, wname in [("kGasSpCount", "GAS_SP_COUNT"),
                          ("kGasSpRefused", "GAS_SP_REFUSED"),
                          ("kGasSpEdge", "GAS_SP_EDGE"),
+                         ("kGasSpBudget", "GAS_SP_BUDGET"),
+                         ("kGasSpEdgeChunks", "GAS_SP_EDGECH"),
+                         ("kGasSpOverrun", "GAS_SP_OVERRUN"),
+                         ("kGasOpsLeaveCap", "GAS_OPS_LEAVE_CAP"),
                          ("kGasSpHdr", "GAS_SP_HDR"),
                          ("kGasSpStride", "GAS_SP_STRIDE")]:
         want = cxx(cname)
@@ -2496,6 +2500,26 @@ def check_gas_consts():
                 problems.append(
                     f"gas: {fname} {wname} = {got} but world.h {cname} = "
                     f"{want} -- the header is read back by offset")
+    # The leave budget's words must EXIST in their readers, not merely agree
+    # when present: sim_step reads all three, sim_gas writes the budget.
+    for fname, txt, names in (("sim_step.wgsl", step, ("GAS_SP_BUDGET", "GAS_SP_EDGECH",
+                                                       "GAS_SP_OVERRUN")),
+                              ("sim_gas.wgsl", gas, ("GAS_SP_BUDGET", "GAS_OPS_LEAVE_CAP"))):
+        for wname in names:
+            if wgsl(txt, wname) is None:
+                problems.append(f"gas: {fname} does not declare {wname}")
+    # kGasSpChunkBase is DERIVED in world.h (header + the whole record list);
+    # sim_step's GAS_SP_CHUNK0 is a literal and must equal it, or the per-chunk
+    # leave-budget words land inside the last records.
+    hdr_w, cap_w, str_w = cxx("kGasSpHdr"), cxx("kGasSpawnPerTick"), cxx("kGasSpStride")
+    if None not in (hdr_w, cap_w, str_w):
+        want = hdr_w + cap_w * str_w
+        got = wgsl(step, "GAS_SP_CHUNK0")
+        if got != want:
+            problems.append(
+                f"gas: sim_step.wgsl GAS_SP_CHUNK0 = {got} but world.h derives "
+                f"kGasSpChunkBase = {want} (kGasSpHdr + kGasSpawnPerTick * "
+                "kGasSpStride)")
 
     # ---- ONE DEFINITION, and the checker's job is to keep it that way ------
     # These moved to common.wgsl when the gas particle kernel landed, because

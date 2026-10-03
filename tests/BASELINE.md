@@ -906,3 +906,15 @@ because of intentional world/sim changes since then, and they were re-pinned
 here with `--vk-smoke --rebaseline` and `--vk-smoke-loud --rebaseline`. The final
 `--suite acceptance` (24.6 min) ran on this tree before the hand pins: 0
 page faults, 4 new reds recorded above, everything else green or known.
+
+## 2026-10-03 — `gas-leave-overflow` added, `"pass"` (det-gas package)
+
+New gate, new keys `gasOverflowCap` / `gasOverflowTicks` /
+`gasOverflowProbeTick`. It forces the window edge's leave budget down to 64 (a
+test-only ceiling, `World::SetGasLeaveCapForTest`) under a 16^3 smoke puff and
+asserts refusals > 0, conversions > 0, no overrun / pool refusal / over-budget
+tick, and a tick-for-tick identical twice-run (hash + per-tick leave counts +
+parcel digest). First run: converted 2365, refused 93317 on 53 ticks, twice-run
+identical over 56 snapshot ticks, digest c188e30d both arms. `gas-leave`'s
+"zero refusals" assertion is unchanged but is a throughput claim now, not a
+determinism one (DESIGN.md "The edge's refusals are a function of the world").

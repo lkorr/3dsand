@@ -154,7 +154,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "Scales with the live particle count, not the world. Integrate is the "
      "DDA; resolve is the atomicMax claim."},
     {"gasSys", "Gas Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume;gasFarPlumeWide",
+     "gasLeavePrep;gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve;gasFarPlume;gasFarPlumeWide",
      "Gas that has left the residency window (docs/PLAN_gas_particles.md). "
      "Scales with the live parcel count, not the world, and is recorded at all "
      "only while parcels exist or the CA has work. What it BUYS is on the "

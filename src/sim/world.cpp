@@ -295,8 +295,9 @@ void World::Init(const rhi::Device& device) {
                            "gasCounts");
   gasClaim = CreateBuffer(device, (uint64_t)kGasClaimSize * 4,
                           U::Storage | U::CopyDst, "gasClaim");
+  // Header + records + one leave-budget word per slot (kGasSpChunkBase).
   gasSpawn = CreateBuffer(
-      device, (uint64_t)(kGasSpHdr + kGasSpawnPerTick * kGasSpStride) * 4,
+      device, (uint64_t)(kGasSpChunkBase + kNumSlots) * 4,
       U::Storage | U::CopySrc | U::CopyDst, "gasSpawn");
   gasSpawnOps = CreateBuffer(
       device, (uint64_t)(kGasSpHdr + kGasCpuSpawnPerTick * kGasSpStride) * 4,
@@ -1040,6 +1041,9 @@ void World::KickReadback() {
           out.gasReentered = g[kGasSpReenter];
           out.gasDied = g[kGasSpDied];
           out.gasAboveWindow = g[kGasSpAbove];
+          out.gasLeaveBudget = g[kGasSpBudget];
+          out.gasLeaveEdgeChunks = g[kGasSpEdgeChunks];
+          out.gasLeaveOverrun = g[kGasSpOverrun];
         }
         // MLS-MPM fluid seam: live count, event counters, block list.
         {

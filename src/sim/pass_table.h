@@ -358,6 +358,9 @@ enum class Pipe : uint8_t {
   // reasons; GasArgs1 additionally zeroes the write page's cursor, which is
   // why the gas pool needs no per-tick fill.
   GasArgs1, GasSpawnP, GasIntegrate, GasArgs2, GasResolve,
+  // The window edge's leave budget for the tick (sim_gas.wgsl `gasLeavePrep`),
+  // one thread recorded BEFORE the CA, which splits it into per-chunk shares.
+  GasLeavePrep,
   // Far fire plumes: the frozen-fire density splat (sim_gas.wgsl
   // `gasFarPlume`). A sixth gas entry point, in the gas group, writing only
   // GasOuter — it is not part of the parcel pipeline and is recorded under its

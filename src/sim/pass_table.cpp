@@ -138,6 +138,7 @@ namespace {
 #define PIPE_GAS_INTEGRATE   Pipe::GasIntegrate
 #define PIPE_GAS_ARGS2       Pipe::GasArgs2
 #define PIPE_GAS_RESOLVE     Pipe::GasResolve
+#define PIPE_GAS_LEAVE_PREP  Pipe::GasLeavePrep
 #define PIPE_GAS_FARPLUME    Pipe::GasFarPlume
 #define PIPE_GAS_FARPLUMEW   Pipe::GasFarPlumeWide
 #define PIPE_SOL_WANT        Pipe::SolWant
