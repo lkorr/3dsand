@@ -146,6 +146,7 @@ PIPE_TO_MEMBER = {
     "PIPE_RAIN_MAP_PREP": "rainMapPrep_",
     "PIPE_RAIN_MAP_BUILD": "rainMapBuild_",
     "PIPE_GODRAY_VIS": "godrayVis_",
+    "PIPE_GAS_MASK": "gasMask_",
     "PIPE_GI_PREPARE": "giPrepare_",
     "PIPE_GI_GATHER": "giGather_",
     "PIPE_RAIN_EXPO": "rainExpo_",
@@ -250,6 +251,7 @@ BUF_TO_WGSL = {
     "RayStart": {"rayStart"},
     "RainMap": {"rainMap"},
     "GodVis": {"godVis"},
+    "GasMask": {"gasMask"},
     # The GI gather request list; GiArgs is indirect-only and never bound.
     "GiReq": {"giReq"},
     "GiArgs": set(),
