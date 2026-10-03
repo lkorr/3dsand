@@ -483,15 +483,51 @@ fn rayStartTrace(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 
 // ---- pass 2: the 5x5 (7x7) minimum (the reach the argument needs) ----------
+// SEPARABLE, THROUGH WORKGROUP MEMORY (2026-10-03, raymarch-far). The window
+// min used to read its 25 (49) samples straight from the storage buffer, per
+// output: ~13M loads a 1080p frame. A workgroup now stages its 8x8 outputs'
+// tile plus a RS_MIN_PAD apron once (196 loads for 64 outputs), takes the row
+// min, then the column min. Same samples, same min: bit-identical output.
+// Measured (--render-budget, one process, the old loop as an in-process arm,
+// RTX 3060 Ti 1080p): the `pre` span 1.23 -> 1.19 ms noon, 0.93 -> 0.90
+// cascade, 0.84 -> 0.81 seam.
+const RS_MIN_PAD : i32 = RS_MIN_RADIUS + 1;               // the wide tier's radius
+const RS_MIN_TILE : u32 = 8u + 2u * u32(RS_MIN_PAD);      // 14
+var<workgroup> rsTile : array<f32, RS_MIN_TILE * RS_MIN_TILE>;
+var<workgroup> rsRowMin : array<f32, RS_MIN_TILE * 8u>;
 @compute @workgroup_size(8, 8)
-fn rayStartMin(@builtin(global_invocation_id) gid : vec3<u32>) {
+fn rayStartMin(@builtin(global_invocation_id) gid : vec3<u32>,
+               @builtin(local_invocation_id) lid : vec3<u32>,
+               @builtin(local_invocation_index) li : u32,
+               @builtin(workgroup_id) wid : vec3<u32>) {
   let dims = rayStartDims();
   let q = (dims + vec2<u32>(1u)) / 2u;
   if (RS_HEADER + 2u * q.x * q.y > arrayLength(&rayStart)) { return; }
   if (!rayStartAny()) { return; }
-  if (gid.x >= q.x || gid.y >= q.y) { return; }
   // 5x5 in the shipped tier, 7x7 in the wide one (see THE LAW).
   let rad = select(RS_MIN_RADIUS + 1, RS_MIN_RADIUS, rayStartLawOk());
+  // Stage the tile. Clamped at the frame edge: every output whose window the
+  // clamp could reach is within `rad` of the edge and writes 0 below anyway.
+  let org = vec2<i32>(wid.xy * 8u) - vec2<i32>(RS_MIN_PAD);
+  let qMax = vec2<i32>(q) - vec2<i32>(1);
+  for (var i = li; i < RS_MIN_TILE * RS_MIN_TILE; i += 64u) {
+    let p = clamp(org + vec2<i32>(i32(i % RS_MIN_TILE), i32(i / RS_MIN_TILE)),
+                  vec2<i32>(0), qMax);
+    rsTile[i] = bitcast<f32>(rayStart[RS_HEADER + u32(p.y) * q.x + u32(p.x)]);
+  }
+  workgroupBarrier();
+  // Row pass: every tile row, the 8 output columns.
+  for (var i = li; i < RS_MIN_TILE * 8u; i += 64u) {
+    let r = i / 8u;
+    let c = i32(i % 8u) + RS_MIN_PAD;
+    var m = RS_NONE;
+    for (var dx = -rad; dx <= rad; dx++) {
+      m = min(m, rsTile[r * RS_MIN_TILE + u32(c + dx)]);
+    }
+    rsRowMin[i] = m;
+  }
+  workgroupBarrier();
+  if (gid.x >= q.x || gid.y >= q.y) { return; }
   // THE SCREEN EDGE: a cell the frame border cuts may show a sliver narrower
   // than the lattice with no sample of its own on screen, so a window the
   // border clips proves nothing. 0 = "march from the camera", the old path,
@@ -503,10 +539,7 @@ fn rayStartMin(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   var m = RS_NONE;
   for (var dy = -rad; dy <= rad; dy++) {
-    let y = u32(gi.y + dy);
-    for (var dx = -rad; dx <= rad; dx++) {
-      m = min(m, bitcast<f32>(rayStart[RS_HEADER + y * q.x + u32(gi.x + dx)]));
-    }
+    m = min(m, rsRowMin[u32(i32(lid.y) + RS_MIN_PAD + dy) * 8u + lid.x]);
   }
   rayStart[RS_HEADER + q.x * q.y + gid.y * q.x + gid.x] = bitcast<u32>(m);
 }

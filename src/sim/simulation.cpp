@@ -747,6 +747,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // Written here, so Storage; read again by the ShadowCache table in the
         // NEXT command buffer, which the frame-opening barrier orders.
         entry(39, T::Storage, S::Fragment),                       // giReq
+        // THE SHADOW CACHE'S READ-ONLY VIEW (raymarch.wgsl shadowSlotRead):
+        // the same buffer as 14, bound a second time as plain read-only
+        // storage so the fragment shader's slot FIND is one cache-line load
+        // of the whole 8-way set instead of up to eight atomic loads. Claims
+        // and registrations still go through 14's atomics.
+        entry(41, T::ReadOnlyStorage, S::Fragment),               // shadowCacheRO
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -3805,6 +3811,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(38, godVisBuf_),
         b(40, gasMaskBuf_),
         b(39, giReqBuf_),
+        b(41, world_->shadowCache),   // 14's read-only view (shadowSlotRead)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

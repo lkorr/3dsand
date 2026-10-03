@@ -44,6 +44,10 @@
 // itself, invisible to the sim and to the world hash.
 @group(0) @binding(14) var<storage, read_write> shadowCache : array<atomic<u32>>;
 @group(0) @binding(15) var<storage, read_write> shadowReq : array<atomic<u32>>;
+// The same buffer as 14, bound a second time READ-ONLY (simulation.cpp
+// renderBGL_ 41): shadowSlotRead's FIND reads a slot's whole 8-way set as one
+// cache line of plain loads. See THE FIND IS A PLAIN LOAD there.
+@group(0) @binding(41) var<storage, read> shadowCacheRO : array<vec4<u32>>;
 
 // ---- RENDER_STATS: where inside this shader the frame went ------------------
 //
@@ -5305,6 +5309,14 @@ fn farFeatMarch(ro : vec3f, rdIn : vec3f, far : FarHit, tStart : f32) -> FarHit 
   // extra value live here is one fs spills (it runs with trace()'s Hit
   // still held for the shading after it).
   let tCur = max(tStart, far.t - FAR_CARD_MILE);
+  // PAST THE FEATURES' FADE THERE IS NOTHING TO DRAW (2026-10-03,
+  // raymarch-far). farFeatCell scales every card's coverage by
+  // farFeatKeep(tA), tA >= tCur for every cell walked below, and the keep is
+  // non-increasing in t — so once it is 0 at tCur (past FAR_FEAT_END_M, ~87 m)
+  // no card can be hit (bladeCardHit refuses occ <= 0) and the walk is pure
+  // cost: up to FAR_FEAT_STEPS byte and feature-word loads for every far pixel
+  // between the fade and level 2's box. Exact.
+  if (farFeatKeep(tCur) <= 0.0) { return out; }
   let tHand1 = f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK)) *
                f32(1u << farCellShift(1u));
   let level = select(2u, 1u, far.t < tHand1);
@@ -6243,6 +6255,72 @@ fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
 
 fn farShadowed(level : u32, roFine : vec3f) -> bool {
   return farShadowMarch(level, roFine, keyLightDir(), 0.0).t >= 0.0;
+}
+
+// ---- THE FAR PATCHES IN THE SHADOW CACHE (2026-10-03, raymarch-far) --------
+// SHIPPED OFF (FAR_SHADOW_CACHE): a visual trade-off, measured and kept wired.
+//
+// A far pixel's sun shadow is a function of where its ray starts, and that
+// start is the hit face lifted half a cell off it — so the ~12-50 pixels that
+// land on one face of one cascade cell (the kFarN law) cast nearly the same
+// ray. These are the shadow cache's FAR keys: a patch is (level, cascade
+// cell, face, refined, a FAR_SC_SUBDIV^2 sub-patch); shadow_resolve.wgsl
+// (resolveFarPatch) casts farShadowMarch's own ray from the patch centre —
+// the start fs() computes for a pixel there — and publishes fs()'s own
+// value, mix(1, shadowFromOpaqueHit(t), cov); the pixel reads its NEAREST
+// patch through the plain find, and the march is compiled out of fs().
+//
+// MEASURED (--render-budget, 1080p, RTX 3060 Ti, one process, vs the
+// per-pixel march): noon 5.75 -> 5.47 ms, cascade 4.45 -> 4.09, seam 3.34 ->
+// 3.27, meadow 3.83 -> 3.72; `pre` +0.08 (the resolve's far rays). Pictures:
+// >= 16/255 on 0.29-0.30% of pixels at noon and cascade (the same-shader
+// re-run floor there is 0.001% and 0%), max 39 — thin lines along cactus and
+// cell edges, where the pixel's own start and its patch's centre see a
+// shadow edge differently; side by side the crops were indistinguishable.
+// That is above the noise floor, so it ships OFF for an owner decision.
+//
+// TRIED AND NOT USED: the BILINEAR blend of the four nearest patches (as the
+// near field reads above 4 px) cost ~0.25 ms more than the nearest tap and
+// moved the same 0.3% of pixels — the error is the patch sampling at shadow
+// edges, which a blend of patch centres does not remove. A per-pixel fallback
+// march on a miss (the first prototype) kept the march's cost: a warp pays for
+// its slowest lane, and a few missing lanes march for the whole warp.
+//
+// THE KEY SPACE is the near cache's with one bit: packedSub's top bit marks a
+// far patch, so a far key can never equal a near one (both words feed the
+// key and the verifier). packedCell = the cell TOROIDAL in its level (FAR_N
+// per axis, like farVox) + the 3-bit face; packedSub = sub-patch, refined
+// bit, level - 1. MUST AGREE with shadow_resolve.wgsl's FAR_SC_* consts.
+const FAR_SHADOW_CACHE : bool = false;
+const FAR_SC_SUBDIV : u32 = 2u;            // shadow_resolve.wgsl agrees
+const FAR_SC_FLAG : u32 = 0x80000000u;     // shadow_resolve.wgsl agrees
+const FAR_SC_REFINED : u32 = 0x08000000u;  // shadow_resolve.wgsl agrees
+const FAR_SC_LEVEL_SHIFT : u32 = 28u;      // shadow_resolve.wgsl agrees
+const FAR_SC_AXIS_BITS : u32 = countTrailingZeros(FAR_N);
+const_assert FAR_SC_AXIS_BITS * 3u + 3u <= 32u;
+const_assert FAR_LEVELS <= 8u;
+fn farScPackCell(c : vec3<i32>, face : u32) -> u32 {
+  let m = vec3<u32>(c & vec3<i32>(i32(FAR_N) - 1));
+  return m.x | (m.y << FAR_SC_AXIS_BITS) | (m.z << (FAR_SC_AXIS_BITS * 2u)) |
+         (face << (FAR_SC_AXIS_BITS * 3u));
+}
+// The cached far shadow for the pixel at `hitP` (fine voxels) on face
+// (axis, sgn) of cell `cell` of `level`: its nearest patch's value, or 1 (lit)
+// while the patch has no opinion (its first frame on screen).
+fn farShadowCached(level : u32, cell : vec3<i32>, axis : i32, sgn : f32,
+                   refined : bool, hitP : vec3f) -> f32 {
+  rsAdd(RS_SC_TAPS, 1u);
+  let s = f32(1u << farCellShift(level));
+  let face = shadowFaceOf(axis, sgn < 0.0);
+  let tg = shadowFaceTangents(face);
+  let m = f32(FAR_SC_SUBDIV);
+  let f = clamp(hitP / s - vec3f(cell), vec3f(0.0), vec3f(1.0));
+  let ix = u32(min(floor(axisPick(f, i32(tg.x)) * m), m - 1.0));
+  let iy = u32(min(floor(axisPick(f, i32(tg.y)) * m), m - 1.0));
+  let sub = shadowPackSub(ix, iy) | select(0u, FAR_SC_REFINED, refined) | FAR_SC_FLAG |
+            ((level - 1u) << FAR_SC_LEVEL_SHIFT);
+  let r = farSlotRead(farScPackCell(cell, face), sub, R.frameIdx & 15u);
+  return select(1.0, r.x, r.y > 0.0);
 }
 
 // ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
@@ -7391,19 +7469,60 @@ fn shadowRefreshDue(key : u32) -> bool {
   return ((R.frameIdx + shadowRefreshPhase(key)) % SHADOW_REFRESH_PERIOD) == 0u;
 }
 
+// ---- THE FIND IS A PLAIN LOAD (2026-10-03, raymarch-far) -------------------
+// A set is 8 slots x 2 words = one 64-byte line. The find used to walk it with
+// up to eight sequential ATOMIC loads, and an atomic load is not served from
+// the SM's L1: every tap of every lit pixel paid several L2 round trips in
+// series (--render-budget priced the near cache's taps, resolve included, at
+// 0.55-1.0 ms a frame on every camera). The read-only view (binding 41) loads
+// the line as four vec4s, all in flight at once and shared through L1 by the
+// pixels of a patch, and the eight keys are compared in registers.
+//
+// THE VIEW CAN BE STALE, and only in the safe direction. Plain loads see the
+// cache as the resolve pass left it at the barrier before this draw (values,
+// valid bits, verifiers: everything a read returns) but may miss what OTHER
+// pixels did to it during this draw — a claim, a registration stamp. So a
+// plain MISS is not trusted (the atomic find below runs and sees this frame's
+// claims), and a plain hit's `requested` stamp may be a frame old, which only
+// sends this pixel to the registration CAS, whose failure says the truth: our
+// verifier in the returned word = a sibling registered first (fine), anything
+// else = a thief took the slot this frame (no opinion, exactly as before).
+// What a pixel RETURNS is therefore what the atomic find returned.
+fn shadowFindPlain(key : u32, ver : u32, setBase : u32) -> vec2<u32> {
+  let q = setBase / 2u;   // two slots per vec4; setBase is a multiple of 8
+  let a = shadowCacheRO[q];
+  let b = shadowCacheRO[q + 1u];
+  let c = shadowCacheRO[q + 2u];
+  let d = shadowCacheRO[q + 3u];
+  // Lowest way wins, as the atomic walk's first match did.
+  var r = vec2<u32>(0xFFFFFFFFu, 0u);
+  if (d.z == key && shadowStateVerifier(d.w) == ver) { r = vec2<u32>(setBase + 7u, d.w); }
+  if (d.x == key && shadowStateVerifier(d.y) == ver) { r = vec2<u32>(setBase + 6u, d.y); }
+  if (c.z == key && shadowStateVerifier(c.w) == ver) { r = vec2<u32>(setBase + 5u, c.w); }
+  if (c.x == key && shadowStateVerifier(c.y) == ver) { r = vec2<u32>(setBase + 4u, c.y); }
+  if (b.z == key && shadowStateVerifier(b.w) == ver) { r = vec2<u32>(setBase + 3u, b.w); }
+  if (b.x == key && shadowStateVerifier(b.y) == ver) { r = vec2<u32>(setBase + 2u, b.y); }
+  if (a.z == key && shadowStateVerifier(a.w) == ver) { r = vec2<u32>(setBase + 1u, a.w); }
+  if (a.x == key && shadowStateVerifier(a.y) == ver) { r = vec2<u32>(setBase, a.y); }
+  return r;
+}
+
 fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let key = shadowPatchKey(packedCell, packedSub);
   let ver = shadowPatchVerifier(packedCell, packedSub);
   let setBase = shadowSetOf(key);
 
-  // ---- find ours ----
-  var slot = 0xFFFFFFFFu;
-  var state = 0u;
-  for (var w = 0u; w < SHADOW_WAYS; w++) {
-    let b = setBase + w;
-    if (atomicLoad(&shadowCache[b * 2u]) != key) { continue; }
-    let s = atomicLoad(&shadowCache[b * 2u + 1u]);
-    if (shadowStateVerifier(s) == ver) { slot = b; state = s; break; }
+  // ---- find ours (THE FIND IS A PLAIN LOAD, above; atomically on a miss) ----
+  let f = shadowFindPlain(key, ver, setBase);
+  var slot = f.x;
+  var state = f.y;
+  if (slot == 0xFFFFFFFFu) {
+    for (var w = 0u; w < SHADOW_WAYS; w++) {
+      let b = setBase + w;
+      if (atomicLoad(&shadowCache[b * 2u]) != key) { continue; }
+      let s = atomicLoad(&shadowCache[b * 2u + 1u]);
+      if (shadowStateVerifier(s) == ver) { slot = b; state = s; break; }
+    }
   }
 
   if (slot == 0xFFFFFFFFu) {
@@ -7517,6 +7636,29 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   // with the resolve still to come) has no opinion. One that has is trusted
   // even if its value is a few frames old — see the state-word comment in
   // common.wgsl for why "lit until proven otherwise" was the sparkle.
+  return select(vec2f(0.0), vec2f(shadowStateValue(state), 1.0),
+                shadowStateValid(state));
+}
+
+// A far patch's slot read: shadowSlotRead without the per-frame
+// re-registration. Far patches are re-cast only every SHADOW_REFRESH_PERIOD
+// frames on their key's phase (or while unresolved), so only then does a
+// pixel stamp the slot and append; every other frame is the plain find alone.
+fn farSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
+  let key = shadowPatchKey(packedCell, packedSub);
+  let ver = shadowPatchVerifier(packedCell, packedSub);
+  let f = shadowFindPlain(key, ver, shadowSetOf(key));
+  let slot = f.x;
+  let state = f.y;
+  if (slot == 0xFFFFFFFFu) { return shadowSlotRead(packedCell, packedSub, curFrame); }
+  if ((!shadowStateValid(state) || shadowRefreshDue(key)) &&
+      shadowStateRequested(state) != curFrame) {
+    let r = atomicCompareExchangeWeak(
+        &shadowCache[slot * 2u + 1u], state,
+        shadowPackState(state & 0xFFu, shadowStateResolved(state), curFrame,
+                        shadowStateValid(state), ver));
+    if (r.exchanged) { shadowAppendRequest(key, slot, packedCell, packedSub); }
+  }
   return select(vec2f(0.0), vec2f(shadowStateValue(state), 1.0),
                 shadowStateValid(state));
 }
@@ -12846,10 +12988,17 @@ fn fs(in : VSOut) -> FSOut {
         // at any ordinary FOV it had lifted every contact shadow to 0.7 long
         // before level 3 begins (~102 m), so the floor was a no-op there and
         // a 0.3 step at 102 m under a zoomed FOV. One law, keyed on distance.
-        let fsh = farShadowMarch(flv, hp, keyLightDir(), 0.0);
         var sh = 1.0;
-        if (fsh.t >= 0.0) {
-          sh = mix(1.0, shadowFromOpaqueHit(true, fsh.t, 0u), fsh.cov);
+        if (SHADOW_CACHE && FAR_SHADOW_CACHE) {
+          // The far patch cache (FAR_SHADOW_CACHE, shipped off): the march
+          // is compiled out of fs. A card reads its cell's top patch, lifted
+          // as a refined hit's is.
+          sh = farShadowCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);
+        } else {
+          let fsh = farShadowMarch(flv, hp, keyLightDir(), 0.0);
+          if (fsh.t >= 0.0) {
+            sh = mix(1.0, shadowFromOpaqueHit(true, fsh.t, 0u), fsh.cov);
+          }
         }
         // THE CONTACT SHADOW THE CELL MARCH GAVE UP (package F): a refined
         // hit's own cell, and the steps of the heightfield round it, on the
