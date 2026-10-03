@@ -6271,7 +6271,10 @@ neighbors, so this needs an explicit connectivity pass:
   scatter; `calist` is 0.03 a row. With item 3 below, all three: village CA
   12.39 -> 7.10 ms, p50 30.30 -> 25.08; `forestfire` CA 5.38 -> 3.41, p50
   20.68 -> 18.31; `idle` (6.6 awake chunks) CA 2.41 -> 2.35, p50 9.18 -> 9.08
-  -- rest cost did not rise.
+  -- rest cost did not rise. Windowed (`SANDVOX_BURN_VILLAGE=1
+  SANDVOX_BURN_TICKS=1200 --frames 100000 --burn-house`, one run each, the
+  harness moves +-15%): frame p50 22.2 -> 16.7 ms, p95 34.3 -> 27.2, frames
+  over 33 ms 13.5% -> 2.0%, CA 8.65 -> 3.56 ms a frame.
   3. **camask publishes each dirty chunk's own repose snapshot.** The
      `reposeSnap` prepass (then ~12% of the CA rows) filled every dirty
      chunk's ring, and ring member 0 -- the chunk itself, always its own
