@@ -3097,6 +3097,14 @@ struct Tuning {
     // branch is never reached, so this is an exact identity in the windMode /
     // waterBodyMode sense rather than merely a cheap path.
     int gasMode = TPD(sim, gasMode);
+    // THIN SMOKE DISSIPATES (sim_step.wgsl gThinMul). A buoyant gas voxel that
+    // emits no heat and has at most gasThinNeighbors gas voxels on its six
+    // faces is THIN; its decay-to-air rules roll at gasThinDecayMul x their
+    // authored chance. The plume's core is untouched, the haze it sheds fades
+    // sooner -- which is most of a big fire's awake chunks and raymarch media.
+    // 1 = off, compiled out: today's world and hash.
+    int gasThinDecayMul = TPD(sim, gasThinDecayMul);
+    int gasThinNeighbors = TPD(sim, gasThinNeighbors);
     // Ballistic debris and spray: fraction of the gap between a particle's
     // velocity and the local wind that closes per SECOND, at a material's full
     // windResponse of 15. A drag law rather than a push, because drag is

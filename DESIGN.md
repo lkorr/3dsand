@@ -6165,6 +6165,59 @@ neighbors, so this needs an explicit connectivity pass:
   seeding probes at ~40 ns, the contact sweep's 32k samples at ~52 ns,
   cross-limb heat 0.8 ms -- each bounded by a pot, none multiplying with
   bodies.
+- **The fire's CA, attributed: smoke is a third of it, not the whole
+  (2026-10-03, fire-gpu).** The fire-perf entry above read the village's
+  ~11.5 ms CA as "~2,700 awake chunks of black smoke". New attribution says
+  how much of it is smoke. `gasSpawn` header words 12..15 (`kGasSpCa*`,
+  diagnostic, unhashed) count the cells the colour rows ran by kind and the
+  awake chunks holding gas and nothing else; they ride the snapshot into
+  `--perf` counters (`caGasCells`, `caOtherCells`, `gasOnlyChunks`,
+  `gasOnlyCells`) and the 60-tick lines of `--burn-house` / `--forest-fire`.
+  `--perf --scenario village-fire`: 3,802 awake chunks, 2,919 (77%) gas-only
+  -- but those hold 189k gas cells, 65 a chunk (1.6% full); the colour rows
+  run 936k gas and 454k other (non-inert) cells a tick. By the end of the
+  windowed burn the gas-only chunks are 1,756 holding 18.9k gas cells: 11 a
+  chunk. Per-class arms on substep 1 (the move-only half; behaviour-changing,
+  for attribution only): gas ~40% of `ca1`, liquids ~17%, other solids and
+  powders ~4%, and ~39% is the per-chunk floor (row gather, barriers, the
+  empty half of a pack-2 dispatch) that a chunk pays however few cells it
+  holds. The forest fire is not a smoke problem at all: 265k other (burning
+  foliage) against 96k gas cells a tick. So `PLAN_gas_particles` stage 2
+  (smoke off the grid in-window) is NOT the lever this was hoped to be -- it
+  could remove at most the gas third plus the floor of the gas-only chunks.
+  What changed:
+  1. **One gather row per thread, read once** (`sim_step.wgsl main`). pack x
+     36 <= CA_WG (const_assert), so the row a thread counts in pass 1 is the
+     row it gathers in pass 2: kept in registers across the barrier instead
+     of re-derived. Exact (hash unmoved, f7936a11 on the scenario, 0fa43063 on
+     `determinism` both sides). Village CA 13.06 -> 12.38 ms (perf), 11.59 ->
+     11.05 a tick-frame windowed, p50 18.9 -> 18.0; forest 5.58 -> 5.37 (perf),
+     8.08 -> 7.59 windowed, p50 26.5 -> 26.0.
+  2. **`sim.gasThinDecayMul` (default 1 = off, compiled out)**: a cold buoyant
+     gas voxel with at most `sim.gasThinNeighbors` (2) gas face-neighbours --
+     counted from camask's gas plane, a face in another chunk counts as gas --
+     rolls its own fade-to-air rules at that multiple. Plume cores are
+     untouched; the haze they shed goes sooner. At 3: village (perf) gas cells
+     run -32%, awake chunks 3,802 -> 3,497, CA 12.38 -> 11.52, raymarch 11.92
+     -> 10.60, frame p50 30.3 -> 27.5 ms; forest CA 5.37 -> 5.09, p50 20.2 ->
+     19.8 (its smoke was never the cost). On the `--render-budget` village and
+     fire cameras the frame differs in ~4% of pixels (embers and haze; the
+     raymarch on those frozen frames is unchanged, 6.3 / 10.8 ms). A look
+     decision, so it ships OFF: `oil-fire` still passes at 3 (black smoke
+     peak 9.1x the oil against 10.0x; min 2.0), as do `heat-updraft` and
+     `gas-leave`.
+  Measured and rejected, all on `--perf village-fire`, hash-identical unless
+  noted: gathering the dirty marks into a per-workgroup table flushed once
+  (+1.5 ms), merging a move's source and destination marks into one atomic
+  (+1.35), workgroups of 32 / 64 / 256 (+6.3 / +2.2 / +4.6), pack 4 at 128 or
+  256 threads (+1.0 / +0.7), dropping inert solids from substep 1's gather
+  (-0.2, and not exact for a lone solid). The step kernel is OCCUPANCY-bound
+  -- 72 registers and 13.9 KB of shared memory per 128-thread group, about 7
+  groups an SM on the 3060 Ti -- so a change that removes work but adds a
+  register or a branch loses more than it saves, and the "do it twice"
+  attribution arms (`dbldirty` +3.1 ms) overstate what removing that work
+  could win. The levers left are fewer awake chunks and fewer cells, not
+  cheaper ones.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

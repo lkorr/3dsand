@@ -1146,6 +1146,12 @@ TP_I(sim, windMode, TUNE_WIND_MODE, 1, kWindModeOff, kWindModeEntrain)
 // The gas edge is a two-state gate; anything else is a typo, and silently
 // treating a 2 as "on" would hide the day someone means to add a mode.
 TP_I(sim, gasMode, TUNE_GAS_MODE, 1, kGasModeWall, kGasModeSink)
+// THIN SMOKE DISSIPATES (sim_step.wgsl gThinMul, 2026-10-03 fire-gpu): a cold
+// buoyant gas voxel with at most gasThinNeighbors gas face neighbours rolls
+// its fade-to-air rules at gasThinDecayMul x their chance. 1 = today (the
+// branch compiles out). Bounded above so a thin cell still lives a few ticks.
+TP_U(sim, gasThinDecayMul, TUNE_GAS_THIN_DECAY_MUL, 1, 1, 8)
+TP_U(sim, gasThinNeighbors, TUNE_GAS_THIN_NEIGHBORS, 2, 0, 5)
 // The rest are const-eval'd into integers by the kernels that read them
 // (sim_particle, sim_fluid, sim_step), so these bounds are the fixed-point
 // bounds written in the human unit — the same discipline as the fluid rows

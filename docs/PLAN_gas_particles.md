@@ -369,6 +369,15 @@ in one dispatch versus the CA's `O(chunks touched) × 4,096 × 2`.
 
 ### 2.10 Stage 2 — smoke off the grid everywhere (optional)
 
+**Attributed 2026-10-03 (fire-gpu, DESIGN.md "The fire's CA, attributed"):
+not the fire's lever.** On `--perf village-fire` gas cells are about a third
+of the CA (substep-1 arm: ~40% of the move pass) and the per-chunk floor of
+the gas-only chunks is most of the rest that smoke costs; on the forest fire
+burning foliage outnumbers gas ~3:1. Taking in-window smoke off the grid could
+remove that third and the gas-only chunks' floor, not the whole CA. The
+cheaper lever measured instead is `sim.gasThinDecayMul` (thin smoke fades
+sooner; off by default, a look decision).
+
 Kept from revision 1, unchanged in substance, none of it required by stage 1:
 - `"particle": true` on a material → `MATF_PARTICLE`; every product write in
   `doReactions` (~6 `voxStore` sites), `sim_mutate`, `sim_explode`, the

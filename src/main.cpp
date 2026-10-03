@@ -8343,9 +8343,12 @@ int main(int argc, char** argv) {
         cellOps.push_back(seed[seedAt++]);
       if (tick % 60u == 0u) {
         const WorldSnapshot& sn = world.Snap();
-        std::printf("--forest-fire: tick %u (+%u) active %u particles %u bodies %u\n",
+        std::printf("--forest-fire: tick %u (+%u) active %u particles %u bodies %u | "
+                    "gas-only %u (%u gas cells) empty %u | CA ran gas %u other %u\n",
                     tick, tick - t0, sn.valid ? sn.activeChunks : 0u,
-                    sn.valid ? sn.particleCount : 0u, debris.BodyCount());
+                    sn.valid ? sn.particleCount : 0u, debris.BodyCount(),
+                    sn.gasOnlyChunks, sn.gasOnlyCells, sn.emptyAwakeChunks,
+                    sn.caGasCells, sn.caOtherCells);
         std::fflush(stdout);
       }
       // The fire has had 20 s. Every --frames series starts over here, so the
@@ -8673,11 +8676,13 @@ int main(int argc, char** argv) {
         std::sort(w.begin(), w.end());
         const WorldSnapshot& sn = world.Snap();
         std::printf("--burn-house: +%4u frames %3zu p50 %6.1f max %6.1f | bodies %u vox "
-                    "%u | jolt worst %.1f ms, manifolds dyn %u static %u | active %u\n",
+                    "%u | jolt worst %.1f ms, manifolds dyn %u static %u | active %u | "
+                    "gas-only %u (%u gas cells) empty %u | CA ran gas %u other %u\n",
                     tick - tIgnite, w.size(), w.empty() ? 0.0 : w[w.size() / 2],
                     w.empty() ? 0.0 : w.back(), debris.BodyCount(), vox,
                     phys.Runaway().worstStepMs, worstMan, worstManS,
-                    sn.valid ? sn.activeChunks : 0u);
+                    sn.valid ? sn.activeChunks : 0u, sn.gasOnlyChunks, sn.gasOnlyCells,
+                    sn.emptyAwakeChunks, sn.caGasCells, sn.caOtherCells);
         phys.ResetRunawayProbe();
         worstMan = worstManS = 0;
         winFrame0 = g_frameMs.size();
