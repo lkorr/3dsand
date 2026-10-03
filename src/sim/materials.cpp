@@ -12,6 +12,10 @@
 #include "sim/tuning.h"
 #include "sim/world.h"
 
+static_assert(kMatFarPalSlots == kFarPalBlocker && kFarPalBlocker < kFarPaletteSlotsGpu &&
+                  kMatFarPalMask == 0xFFu,
+              "far slots are 0..254 of one byte; 255 is the blocker-only cell");
+
 using nlohmann::json;
 
 std::string FormatMille(double mille) {
@@ -1041,26 +1045,18 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
   if (mats.size() > 4096) errors += path + ": more than 4095 materials (12-bit ID limit)\n";
 
   // ---- assign FAR PALETTE SLOTS (sim/materials.h kMatFarPalShift) ----------
-  // A far cascade cell is ONE byte: seven bits and one conservative "something
-  // is here" flag (common.wgsl FAR_PAL_MASK / FAR_BLOCKER_BIT, 13.2.2). Those
-  // seven bits USED to be a material id, and that is the only reason this
-  // loader ever refused a 129th material: the voxel word had room for 4096 and
-  // this byte had room for 128, and nothing in the engine would have noticed the
-  // difference -- the 129th material would simply have started painting the
-  // wrong colour at distance and claiming a blocker wherever bit 7 landed, with
-  // no crash and no failing gate to name it.
+  // A far cascade cell is ONE byte (common.wgsl FAR_PAL_BLOCKER): 0 air, 255
+  // "no material but the conservative blocker", and 1..254 an index into the
+  // FAR PALETTE (world.h kFarPaletteBaseGpu), which maps back to a material.
+  // Until 2026-10-02 it was seven bits of slot and a blocker flag: 128 slots
+  // for ~207 materials, so the table needed 79 `"far"` aliases just to load,
+  // and charcoal drew as white ash at distance, a thatch roof as pale tussock.
+  // With 255 slots every material owns one; `"far": "<material>"` is now only
+  // for two materials that should be indistinguishable at distance (sandstone
+  // is sand's colour, so a firmed sand skin does not change the far field).
   //
-  // They are now an index into the FAR PALETTE (world.h kFarPaletteBaseGpu), so
-  // the 128 bounds how many things may look DIFFERENT FROM EACH OTHER at
-  // cascade scale -- a far-field question -- instead of how many materials may
-  // exist, which is not one. Two materials that are indistinguishable at 50 m
-  // share a slot by authoring `"far": "<material>"`.
-  //
-  // IDENTITY FIRST, and that is load-bearing rather than tidy: while every
-  // material's id fits in seven bits, slot == id, so every far byte the
-  // worldgen writes is bit-for-bit the byte it wrote before the palette
-  // existed. Aliases only ever FREE slots, and pass 2 hands the freed ones to
-  // the ids that no longer fit.
+  // IDENTITY FIRST: while every material's id fits, slot == id. Aliases FREE
+  // slots, and pass 2 hands the freed ones to the ids that no longer fit.
   {
     std::vector<int> aliasOf(mats.size(), -1);
     for (size_t i = 0; i < mats.size(); i++) {
@@ -1106,8 +1102,8 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
                 " materials (including the implicit air at id 0) each want their"
                 " own colour in the far-field cascade, which has only " +
                 std::to_string(kMatFarPalSlots) +
-                " palette slots -- seven bits of a per-cell byte, whose eighth"
-                " bit is the conservative blocker flag. Give the ones that look"
+                " palette slots -- one per-cell byte, whose last value is the"
+                " blocker-only cell. Give the ones that look"
                 " alike at cascade distance a `\"far\": \"<existing material>\"`"
                 " in materials.json so they share a slot, or widen the far cell"
                 " (farVox is already 1 GiB).\n";

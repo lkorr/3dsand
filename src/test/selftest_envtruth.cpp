@@ -966,7 +966,7 @@ static Status GateSculpt(Ctx& c, std::string& detail) {
       const int cyD = ((eD + hd) / 2) >> sh;
       if ((cyD << sh) > eD && (cyD << sh) + s <= hd) {
         tried++;
-        const uint32_t b = FarVoxByte(c.ctx, c.world, level, {domeX >> sh, cyD, domeZ >> sh}) & 0x7Fu;
+        const uint32_t b = FarCellSlot(FarVoxByte(c.ctx, c.world, level, {domeX >> sh, cyD, domeZ >> sh}));
         if (b != 0) good++;
         else if (why.empty()) why = Format("level %u dome cell y%d..%d reads air", level, cyD << sh, (cyD << sh) + s - 1);
       }
@@ -975,7 +975,7 @@ static Status GateSculpt(Ctx& c, std::string& detail) {
       const int cyP = ((eP + hp) / 2) >> sh;
       if ((cyP << sh) > hp && (cyP << sh) + s <= eP) {
         tried++;
-        const uint32_t b = FarVoxByte(c.ctx, c.world, level, {pitX >> sh, cyP, pitZ >> sh}) & 0x7Fu;
+        const uint32_t b = FarCellSlot(FarVoxByte(c.ctx, c.world, level, {pitX >> sh, cyP, pitZ >> sh}));
         if (b == 0) good++;
         else if (why.empty()) why = Format("level %u pit cell y%d..%d reads matter", level, cyP << sh, (cyP << sh) + s - 1);
       }

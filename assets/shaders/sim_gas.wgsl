@@ -414,11 +414,11 @@ fn gasFarBlocked(c : vec3<i32>) -> bool {
   // it carries no material of its own. (This used to fall out of indexing the
   // material table with the whole byte: 128..255 are unwritten entries, whose
   // zeroed klass is CLASS_SOLID. Same answer, said on purpose.)
-  if ((b & FAR_BLOCKER_BIT) != 0u) { return true; }
+  if (b == FAR_PAL_BLOCKER) { return true; }
   // A gas does not block a gas — smoke downsampled into the cascade must not
   // wall its own plume off. The byte is a far PALETTE SLOT, so translate it
-  // back to a material first (common.wgsl FAR_PAL_MASK).
-  return materials[farPalMat(&materials, b & FAR_PAL_MASK)].klass != CLASS_GAS;
+  // back to a material first (common.wgsl farCellSlot).
+  return materials[farPalMat(&materials, b)].klass != CLASS_GAS;
 }
 
 // Can this parcel enter cell `c`? Inside the window the grid answers (and the

@@ -81,41 +81,32 @@ void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim,
 namespace {
 
 // ---- the conservative blocker flag, bit 7 of the far cell byte -----------
-// (13.2.2 / W2-D; common.wgsl FAR_BLOCKER_BIT)
+// (13.2.2 / W2-D; common.wgsl FAR_PAL_BLOCKER)
 //
 // This rides on `far-fog` rather than on `far-downsample` for one reason: this
 // gate does its own `FullRefill` and drains it, so it is the only far gate
 // whose cascade data is real when run as `--gate far-fog` alone. `farVox` is
-// zero-initialised, so a flag check against an UNFILLED cascade reads "no flag
+// zero-initialised, so a check against an UNFILLED cascade reads "no blocker
 // anywhere" and passes for the wrong reason forever.
 //
-// Two claims, and neither is the trivial one:
+//   RECOVERY. At least one column has a BLOCKER-ONLY cell (kFarPalBlocker: no
+//   material, but the surface reaches into it). That cell is the entire point
+//   of the feature: the half of every surface cell whose ground landed in its
+//   lower half, which the centre sample calls air. Without this line the
+//   blocker could be a synonym for `mat != 0` and nothing would say so.
 //
-//   ORDER. In every column, the highest cell carrying the flag is at or above
-//   the highest cell carrying MATERIAL. The flag is "the surface reaches into
-//   this cell" and the material byte is "the cell's centre sample was solid",
-//   and the centre is half a cell above the floor — so the flag can only ever
-//   extend the column upward. A flag BELOW the material top would mean the two
-//   writers disagree about where the ground is.
-//
-//   RECOVERY. At least one column has a cell with the flag and NO material.
-//   That cell is the entire point of the feature: the half of every surface
-//   cell whose ground landed in its lower half, which the centre sample calls
-//   air. Without this line the flag could be a synonym for `mat != 0` and
-//   nothing would say so.
+// There used to be an ORDER claim too (the topmost flagged cell at or above
+// the topmost material cell). It could only be asked while the flag was a BIT
+// that a material cell also carried; since 2026-10-02 a material cell is
+// just its slot (the flag said nothing there: every reader takes the union),
+// so a material cell's flag is not stored and the claim has nothing to read.
 //
 // The knob (`render.farBlockerHitLevel`) ships at 0, so NOTHING ELSE in the
 // suite or in any screenshot would notice if the writers stopped emitting the
-// flag: the shadow half is a shading difference no assertion covers.
+// blocker: the shadow half is a shading difference no assertion covers.
 static bool CheckFarBlockerFlag(GpuContext& ctx, World& world) {
-  constexpr uint32_t kBlockerBit = 0x80u;
-  // The low seven bits are a far PALETTE SLOT, not a material id
-  // (common.wgsl FAR_PAL_MASK). Both claims below only ask whether the
-  // cell HAS a material, and slot 0 is air in both directions, so this
-  // gate never needs the reverse table.
-  constexpr uint32_t kMatMask = 0x7Fu;
   const int shift1 = (int)(1 + kFarShiftBase);
-  int columns = 0, recovered = 0, disordered = 0;
+  int columns = 0, recovered = 0;
   // Eight columns spread across the level-1 box, well inside it (its
   // half-extent is kFarN/2 cells) and away from the two paint sites the other
   // far gates use.
@@ -125,26 +116,20 @@ static bool CheckFarBlockerFlag(GpuContext& ctx, World& world) {
     const int cx = wx >> shift1, cz = wz >> shift1;
     // twelve cells straddling the surface: eight below it, four above
     const int cy0 = ((h - 8 * (1 << shift1)) >> shift1);
-    int topMat = INT32_MIN, topFlag = INT32_MIN;
-    bool flagOnly = false;
+    bool any = false, flagOnly = false;
     for (int k = 0; k < 12; k++) {
       const uint32_t b = FarVoxByte(ctx, world, 1, {cx, cy0 + k, cz});
-      if ((b & kMatMask) != 0) topMat = cy0 + k;
-      if ((b & kBlockerBit) != 0) {
-        topFlag = cy0 + k;
-        if ((b & kMatMask) == 0) flagOnly = true;
-      }
+      if (b != 0) any = true;
+      if (b == kFarPalBlocker) flagOnly = true;
     }
-    if (topMat == INT32_MIN && topFlag == INT32_MIN) continue;  // all sky
+    if (!any) continue;  // all sky
     columns++;
-    if (topFlag < topMat) disordered++;
     if (flagOnly) recovered++;
   }
-  const bool ok = columns >= 4 && disordered == 0 && recovered >= 1;
-  std::printf("far blocker flag: %s (%d columns sampled, %d with a flagged cell "
-              "the centre sample called air, %d where the flag sits below the "
-              "material top)\n",
-              ok ? "PASS" : "FAIL", columns, recovered, disordered);
+  const bool ok = columns >= 4 && recovered >= 1;
+  std::printf("far blocker flag: %s (%d columns sampled, %d with a blocker-only "
+              "cell the centre sample called air)\n",
+              ok ? "PASS" : "FAIL", columns, recovered);
   return ok;
 }
 
@@ -535,6 +520,12 @@ Status GateFarPersist(Ctx& c, std::string& detail) {
 //       an EMPTY edit index the crater's entry comes back valid (pristine
 //       procgen, and the cells are pristine too — consistent); refilled with
 //       the edited chunks indexed, `farpatch` must clear it again.
+//   (d) THE FEATURE PLANE (below, at a desert site).
+//   (e) A FLUSH RE-SKIN. A yard of glass laid AT the ground voxel, no height
+//       change (the edit layer's gravel tracks, a flagstone yard): the surface
+//       cell over it must read the yard and the entry must have lost VALID,
+//       live and again after an indexed refill. Before 2026-10-02 neither
+//       held, and every village path was grass past the LOD handoff.
 namespace {
 uint32_t FarMapEntry(GpuContext& ctx, World& world, uint32_t level, int mx, int mz) {
   rhi::Buffer staging =
@@ -577,8 +568,11 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   const IVec3 crater{232, World::TerrainHeight(232, 172, seed), 172};
   const IVec3 build{176, World::TerrainHeight(176, 236, seed), 236};
   const IVec3 control{260, World::TerrainHeight(260, 250, seed), 250};
+  // (e)'s flush re-skin: a 7x7 yard of glass laid AT the ground voxel, no
+  // height change -- a gravel track, a flagstone yard.
+  const IVec3 reskin{204, World::TerrainHeight(204, 204, seed), 204};
   const IVec3 playerChunk{crater.x >> 4, crater.y >> 4, crater.z >> 4};
-  for (const IVec3& s : {crater, build, control}) {
+  for (const IVec3& s : {crater, build, control, reskin}) {
     if (s.y < 8 || s.y >= (int)kWorldN - 8) {
       detail = Format("site (%d,%d,%d) outside the window", s.x, s.y, s.z);
       std::printf("far surface: FAIL (%s)\n", detail.c_str());
@@ -588,6 +582,13 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
 
   FarEdits& edits = c.stream.Edits();
   edits.Clear();
+  // A REAL WINDOW FIRST. Run as `--gate far-surface` alone, nothing before
+  // this has generated the window, and an empty live grid under a map that
+  // claims procgen ground makes every live arm vacuous: ANY downsample over
+  // it clears VALID (the claim says solid, the grid says air), so (b) passed
+  // without testing anything and (e) read air under its yard (2026-10-02).
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
   DrainFullRefill(ctx, world, sim, playerChunk);
 
   // ---- (a) pristine agreement --------------------------------------------
@@ -608,7 +609,7 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
     // The sieve's cell holding `top`: centre sample 2cy+1 <= top < 2cy+3.
     const int cy = (top - 1) >> shift1;
     const uint32_t b = FarVoxByte(ctx, world, 1, {wx >> shift1, cy, wz >> shift1});
-    const bool agree = (b & 0x7Fu) == skin && skin != 0;
+    const bool agree = FarCellSlot(b) == skin && skin != 0;
     if (agree) cellAgree++;
     if (top == h) exact++;
     else if (top > h && agree) fluid++;   // standing fluid over the ground
@@ -616,7 +617,7 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
       wrong++;
       if (firstWrong.empty())
         firstWrong = Format(" first (%d,%d): top %d h %d skin %u cell %u", wx, wz,
-                            top, h, skin, b & 0x7Fu);
+                            top, h, skin, FarCellSlot(b));
     }
   }
   int coarse = 0, coarseExact = 0;
@@ -643,14 +644,23 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   const bool preCrater = validAt(crater.x, crater.z);
   const bool preBuild = validAt(build.x, build.z);
   const bool preControl = validAt(control.x, control.z);
+  // ---- (e) setup: the yard, one CellOp per column at that column's ground --
+  std::vector<CellOp> yard;
+  for (int dz = -3; dz <= 3; dz++)
+    for (int dx = -3; dx <= 3; dx++) {
+      const int x = reskin.x + dx, z = reskin.z + dz;
+      yard.push_back(CellOp{World::SlotCellIndex({x, World::TerrainHeight(x, z, seed), z}),
+                            kMatGlass});
+    }
+  const bool preYard = validAt(reskin.x + 1, reskin.z + 1);
   for (uint32_t t = 1; t <= 4; t++) {
     std::vector<BrushOp> ops;
     if (t == 1) {
       ops.push_back({crater.x, crater.y, crater.z, 3, kMatAir, 1u, 0, 0});
       ops.push_back({build.x, build.y + 2, build.z, 2, kMatGlass, 1u, 0, 0});
     }
-    SubmitTick(ctx, world, sim, t, seed, ops, {}, {}, false, playerChunk, false,
-               false);
+    SubmitTick(ctx, world, sim, t, seed, ops, {}, t == 1 ? yard : std::vector<CellOp>{},
+               false, playerChunk, false, false);
   }
   ctx.WaitIdle();
   const bool postCrater = validAt(crater.x, crater.z);
@@ -665,13 +675,62 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   const bool bOk = preCrater && preBuild && preControl && !postCrater &&
                    !postBuild && postControl && !postCrater2;
 
+  // ---- (e) a FLUSH re-skin reaches the far field ----------------------------
+  // The village-path bug (2026-10-02): a surface whose MATERIAL changed but
+  // whose HEIGHT did not -- the edit layer's gravel tracks, a flagstone yard --
+  // read as procgen's skin past the LOD handoff, twice over: the cells (the
+  // skin rule painted the pristine skin over whatever lay at y == h) and the
+  // surface map (its claim was checked for SOLIDITY only, so a flush yard
+  // left it valid, and a refined hit is painted with the claim's skin slot).
+  // Every level-1 sample column inside the yard must read the yard in its
+  // surface cell AND have stopped vouching for the old skin -- live
+  // (`fardown`), then again after a refill with the chunks indexed
+  // (`farpatch`). Odd coordinates are the level-1 sample columns.
+  const uint32_t yardSlot = c.mats[kMatGlass].farPalSlot;
+  std::string yardWhy;
+  std::vector<uint32_t> yardWords(kChunkVol);
+  auto liveMat = [&](int x, int y, int z) -> uint32_t {
+    const IVec3 wc{x >> 4, y >> 4, z >> 4};
+    if (!world.ChunkInWindow(wc)) return 0xFFFu;
+    ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, yardWords.data(), "farYard");
+    return yardWords[((z & 15) * kChunk + (y & 15)) * kChunk + (x & 15)] & 0xFFFu;
+  };
+  auto yardRead = [&](int& cellsYard, int& mapsInvalid, const char* arm) {
+    cellsYard = mapsInvalid = 0;
+    for (int dz = -1; dz <= 1; dz += 2)
+      for (int dx = -1; dx <= 1; dx += 2) {
+        const int x = reskin.x + dx, z = reskin.z + dz;
+        const int h = World::TerrainHeight(x, z, seed);
+        const int cy = (h - 1) >> shift1;
+        const uint32_t b = FarVoxByte(ctx, world, 1, {x >> shift1, cy, z >> shift1});
+        const uint32_t e = FarMapEntry(ctx, world, 1, x, z);
+        const bool cellOk = FarCellSlot(b) == yardSlot;
+        const bool mapOk = !(e & kFarMapValid);
+        cellsYard += cellOk;
+        mapsInvalid += mapOk;
+        // Attribution, not a count: which column, what the cell and the claim
+        // hold, and what the live grid has at and under the ground.
+        if (!cellOk || !mapOk)
+          yardWhy += Format(" [%s (%d,%d) h %d cell y%d byte %u, map %s top %d skin %u, "
+                            "live h %u h-1 %u]",
+                            arm, x, z, h, cy << shift1, b, (e & kFarMapValid) ? "valid" : "off",
+                            FarMapTopOf(e), (e >> 16) & 0x7Fu, liveMat(x, h, z),
+                            liveMat(x, h - 1, z)) +
+                     Format(" col h-4..h+2: %u %u %u %u %u %u %u", liveMat(x, h - 4, z),
+                            liveMat(x, h - 3, z), liveMat(x, h - 2, z), liveMat(x, h - 1, z),
+                            liveMat(x, h, z), liveMat(x, h + 1, z), liveMat(x, h + 2, z));
+      }
+  };
+  int yardCellsLive = 0, yardMapsLive = 0;
+  yardRead(yardCellsLive, yardMapsLive, "live");
+
   // ---- (c) a refill does not resurrect ----------------------------------
   edits.Clear();
   DrainFullRefill(ctx, world, sim, playerChunk);
   const bool healed = validAt(crater.x, crater.z);   // pristine arm: valid again
   std::vector<uint32_t> words(kChunkVol);
   uint32_t noted = 0;
-  for (const IVec3& s : {crater, build}) {
+  for (const IVec3& s : {crater, build, reskin}) {
     for (int dz = -1; dz <= 1; dz++)
       for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++) {
@@ -687,6 +746,10 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
   const bool keptCrater = !validAt(crater.x, crater.z);
   const bool keptBuild = !validAt(build.x, build.z);
   const bool cOk = healed && keptCrater && keptBuild;
+  int yardCellsIdx = 0, yardMapsIdx = 0;
+  yardRead(yardCellsIdx, yardMapsIdx, "indexed");
+  const bool eOk = preYard && yardCellsLive == 4 && yardMapsLive == 4 &&
+                   yardCellsIdx == 4 && yardMapsIdx == 4;
 
   // ---- (d) THE FEATURE PLANE (sim/farfeat.h, LOD-seam package F) -----------
   // Pristine: every level-1 feature in the window describes the plant the
@@ -819,7 +882,7 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
     if (cutSolid) {
       // The level-1 cell over the cut must not still wear the stalk.
       const uint32_t cb = FarVoxByte(ctx, world, 1, {t.x >> 1, (t.top + 2) >> 1, t.z >> 1});
-      noGhost = (cb & 0x7Fu) != FarFeatBody(t.w) || (cb & 0x7Fu) == 0;
+      noGhost = FarCellSlot(cb) != FarFeatBody(t.w) || FarCellSlot(cb) == 0;
     }
     dOk = cutCleared && (cutSolid ? !cutMapValid : cutMapValid) && ctlKept && noGhost;
   }
@@ -833,13 +896,16 @@ Status GateFarSurface(Ctx& c, std::string& detail) {
              nSolid, nMicro, nL2, agree, checked, cutSolid ? "stalk" : "card", cutCleared,
              cutMapValid, !noGhost, ctlKept);
 
-  const bool ok = aOk && bOk && cOk && dOk;
+  const bool ok = aOk && bOk && cOk && dOk && eOk;
   detail = Format("L1 %d/%d valid, %d exact + %d fluid, %d cell/skin agree, %d wrong; "
-                  "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d; %s",
+                  "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d; %s; "
+                  "flush re-skin (pre %d): live %d/4 cells %d/4 maps off, indexed %d/4 "
+                  "cells %d/4 maps off%s",
                   valid, sampled, exact, fluid, cellAgree, wrong, coarseExact, coarse,
                   preCrater, preBuild, preControl, postCrater, postBuild,
                   postControl, postCrater2, healed, keptCrater, keptBuild,
-                  dDetail.c_str());
+                  dDetail.c_str(), preYard, yardCellsLive, yardMapsLive, yardCellsIdx,
+                  yardMapsIdx, yardWhy.c_str());
   std::printf("far surface: %s (%s%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
               detail.c_str(), firstWrong.c_str(), firstBad.c_str(), noted);
   // Leave the cascades as the next gate expects to find them: pristine + the

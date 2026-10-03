@@ -4,6 +4,7 @@
 
 #include "sim/chunkstore.h"
 #include "sim/stream.h"  // RleDecodeChunk
+#include "sim/world.h"   // World::TerrainHeight, the ground slot's h
 
 namespace {
 // Floor division, mirroring worldgen.wgsl's fdiv: C++ `/` truncates toward
@@ -63,6 +64,70 @@ void FarEdits::Sweep(IVec3 wc,
     const IVec3 lc = LevelChunkOf(wc, level);
     Append({lc.x, lc.y, lc.z, level}, scratch_);
   }
+
+  // ---- the GROUND words (kGroundShift): every sample column of this chunk
+  // whose ground voxel lies in it. Separate from the centre sweep above
+  // because the ground needs the XZ columns only -- a chunk can hold a column's
+  // ground while holding no cell centre at a coarse level.
+  if (groundSlot_.empty() || !groundWorld_) return;
+  std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash> ground;
+  for (uint32_t level = 1; level <= kFarLevels; level++) {
+    const int shift = (int)(level + kFarShiftBase);
+    if (shift >= (int)kGroundMaxShift) break;
+    const int step = 1 << shift;
+    const int half = 1 << (shift - 1);
+    const int fx = FirstCenter(base[0], step, half);
+    const int fz = FirstCenter(base[2], step, half);
+    for (int z = fz; z < base[2] + (int)kChunk; z += step)
+      for (int x = fx; x < base[0] + (int)kChunk; x += step) {
+        const int h = GroundHeight(x, z);
+        if (h < base[1] || h >= base[1] + (int)kChunk) continue;
+        GroundWord((uint32_t)level, x, h, z,
+                   sample(x - base[0], h - base[1], z - base[2]), ground);
+      }
+  }
+  for (auto& kv : ground) {
+    std::sort(kv.second.begin(), kv.second.end(),
+              [](uint32_t a, uint32_t b) { return ColumnKey(a) < ColumnKey(b); });
+    Append(kv.first, kv.second);
+  }
+}
+
+int FarEdits::GroundHeight(int x, int z) {
+  const uint32_t seed = groundWorld_->WorldSeed();
+  const uint64_t key = ((uint64_t)seed << 40) ^ ((uint64_t)(uint32_t)x << 20) ^
+                       (uint64_t)(uint32_t)z ^ ((uint64_t)(uint32_t)z << 52);
+  auto it = groundH_.find(key);
+  if (it != groundH_.end()) return it->second;
+  if (groundH_.size() > (1u << 20)) groundH_.clear();
+  const int h = World::TerrainHeight(x, z, seed);
+  groundH_.emplace(key, h);
+  return h;
+}
+
+void FarEdits::GroundWord(uint32_t level, int x, int h, int z, uint32_t mat,
+                          std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out) const {
+  const int shift = (int)(level + kFarShiftBase);
+  const int step = 1 << shift;
+  const int half = 1 << (shift - 1);
+  // The cell worldgen's farSurfaceMat colours from this ground: its centre is
+  // the highest one at or below h (centre <= h < centre + step).
+  const int cyFine = FDiv(h - half, step) * step + half;
+  const int cx = x >> shift, cy = cyFine >> shift, cz = z >> shift;
+  const uint32_t ci = (uint32_t)(((cz & 15) * (int)kChunk + (cy & 15)) * (int)kChunk + (cx & 15));
+  out[LKey{cx >> 4, cy >> 4, cz >> 4, level}].push_back(
+      (GroundSlotOf(mat & 0xFFFu) << kGroundShift) | (kMatUntouched << kCellBits) | ci);
+}
+
+uint32_t FarEdits::CombineCell(const uint32_t* w, size_t n) {
+  uint32_t mat = kMatUntouched, gs = kGroundUnknown;
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t m = (w[i] >> kCellBits) & 0xFFFu;
+    const uint32_t g = w[i] >> kGroundShift;
+    if (m != kMatUntouched) mat = m;
+    if (g != kGroundUnknown) gs = g;
+  }
+  return (gs << kGroundShift) | (mat << kCellBits) | (w[0] & kCellMask);
 }
 
 void FarEdits::NoteChunk(IVec3 wc, const uint32_t* words) {
@@ -113,13 +178,14 @@ void FarEdits::Compact(Chunk& c) {
   std::stable_sort(c.words.begin(), c.words.end(), [](uint32_t a, uint32_t b) {
     return ColumnKey(a) < ColumnKey(b);
   });
+  // Each run of one cell COMBINES (CombineCell): its centre and its ground
+  // can come from different fine chunks, so "the last word" would drop one.
   size_t w = 0;
-  for (size_t r = 0; r < c.words.size(); r++) {
-    // last of each run of equal cell indices
-    if (r + 1 < c.words.size() &&
-        (c.words[r] & kCellMask) == (c.words[r + 1] & kCellMask))
-      continue;
-    c.words[w++] = c.words[r];
+  for (size_t r = 0; r < c.words.size();) {
+    size_t e = r + 1;
+    while (e < c.words.size() && (c.words[e] & kCellMask) == (c.words[r] & kCellMask)) e++;
+    c.words[w++] = CombineCell(&c.words[r], e - r);
+    r = e;
   }
   cells_ -= c.words.size() - w;
   c.words.resize(w);
@@ -152,8 +218,9 @@ const std::vector<uint32_t>* FarEdits::Lookup(uint32_t level,
     } else if (i >= a.size() || ColumnKey(b[j]) < ColumnKey(a[i])) {
       m.push_back(b[j++]);
     } else {
-      m.push_back(b[j++]);   // the same cell: the noted edit is newer
-      i++;
+      // The same cell: the noted edit is newer, field by field.
+      const uint32_t pair[2] = {a[i++], b[j++]};
+      m.push_back(CombineCell(pair, 2));
     }
   }
   return &m;
@@ -179,6 +246,22 @@ void FarEdits::SetBase(const std::vector<BaseCell>& cells) {
       const uint32_t ci = (cz * kChunk + cy) * kChunk + cx;
       const LKey key{c.x >> (shift + 4), c.y >> (shift + 4), c.z >> (shift + 4), level};
       base_[key].push_back(((c.mat & 0xFFFu) << kCellBits) | ci);
+    }
+  }
+  // The layer's cells AT the ground of a sample column also speak for the
+  // ground slot (kGroundShift): a flush track is exactly the case the centre
+  // rule above cannot see.
+  if (!groundSlot_.empty() && groundWorld_) {
+    for (const BaseCell& c : cells) {
+      for (uint32_t level = 1; level <= kFarLevels; level++) {
+        const int shift = (int)(level + kFarShiftBase);
+        if (shift >= (int)kGroundMaxShift) break;
+        const int step = 1 << shift;
+        const int half = 1 << (shift - 1);
+        if (((c.x - half) & (step - 1)) != 0 || ((c.z - half) & (step - 1)) != 0) continue;
+        if (c.y != GroundHeight(c.x, c.z)) continue;
+        GroundWord(level, c.x, c.y, c.z, c.mat, base_);
+      }
     }
   }
   for (auto& kv : base_) {

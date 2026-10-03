@@ -12509,6 +12509,13 @@ int main(int argc, char** argv) {
         loaded = false;
       }
       if (loaded) {
+        // A far cascade cell stores a FAR PALETTE SLOT, not a material id
+        // (materials.cpp, the slot assignment), so an edit that moves slots --
+        // a `"far"` alias added or removed, a material inserted -- leaves every
+        // cell already in the cascades naming a different material. Refill.
+        bool farSlotsMoved = newMats.size() != mats.size();
+        for (size_t i = 0; !farSlotsMoved && i < mats.size(); i++)
+          farSlotsMoved = newMats[i].farPalSlot != mats[i].farPalSlot;
         mats = std::move(newMats);
         reactions = std::move(newReactions);
         {
@@ -12716,6 +12723,11 @@ int main(int argc, char** argv) {
         FillUiMaterials(mats, ui);
         std::printf("materials reloaded (%zu, %zu reactions)\n", mats.size(),
                     reactions.size());
+        if (farSlotsMoved) {
+          far.FullRefill(IVec3{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
+                               ifloor(player.pos.z) >> 4});
+          std::printf("far palette slots moved: far field refilled\n");
+        }
       } else if (!ui.reloadMaterials) {   // (deferred for the bench: not a failure)
         std::fprintf(stderr, "asset reload failed:\n%s\n", errors.c_str());
       }

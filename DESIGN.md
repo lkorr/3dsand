@@ -13064,7 +13064,7 @@ where you hear from either (§12b, "The ears are on the character").
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
-  cell (7 bits of FAR PALETTE SLOT + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
+  cell (a FAR PALETTE SLOT 1..254, 0 air, 255 the conservative blocker with no material; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -13697,8 +13697,40 @@ where you hear from either (§12b, "The ears are on the character").
   table every far byte is bit-for-bit the byte the same worldgen wrote before
   the palette existed, which is why introducing the whole indirection moved
   neither the world hash nor a single smoke probe.
-  **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
-  far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
+  **Re-packed to 8 bits, 2026-10-02 — every material paints itself.** 128
+  slots for ~207 materials meant 79 `"far"` aliases chosen to fit, not to
+  match: past the LOD handoff (`render.lodHandoffDist`, 20.5 m, where the
+  in-window surface switches to the cascade) a thatch roof turned pale
+  tussock, red roof tiles brown bark, charcoal white ash. The blocker FLAG only
+  ever carried information on a cell with NO material (every reader takes
+  "flag OR material"), so it became one reserved VALUE: the byte is 0 air,
+  1..254 a slot, `FAR_PAL_BLOCKER` (255) blocker-only. Readers go through
+  `farCellSlot` (common.wgsl) / `FarCellSlot` (world.h), writers through
+  `farCellByte`; the flags field is bits 24..31 (bit 31 was the word's last
+  free bit). 255 slots, identity-first, so every material owns one and the
+  aliases are gone except `sandstone` → `sand` (a firmed sand skin must not
+  change the far field). The surface map and the feature words keep 7-bit
+  slot fields: a skin whose slot is past 127 (a stamp's flagstone floor)
+  invalidates its entry instead of truncating, and the renderer draws the
+  cells.
+  **The ground is the ground, not procgen's skin (2026-10-02).**
+  `farSurfaceMat` used to colour every cell straddling `h` with procgen's
+  skin, so anything laid FLUSH on the ground — the edit layer's gravel tracks,
+  a flagstone yard — was grass at every distance past the handoff and popped
+  in at 20 m. Now each producer says what it can see of the voxel at `h`:
+  `fardown` reads the live voxel (when it lies in the chunk being
+  downsampled), `farpatch` takes the GROUND SLOT the edit index records for
+  that voxel (faredits.h `kGroundShift`, bits 24..31 of a patch word, from
+  `World::TerrainHeight`), the sieve keeps procgen. Ground and skin compare
+  by far slot, so untouched ground writes exactly the sieve's byte (the
+  `far-downsample` agreement holds). The surface map's live check
+  (`fardown`) compares the top voxel's MATERIAL as well as its solidity,
+  because a refined hit is painted with the claim's skin slot. Pinned by
+  `far-surface` arm (e), a flush yard checked live and after an indexed
+  refill.
+  **The far cell byte WAS 7 + 1 (13.2.2, 2026-09-01; since 2026-10-02 the
+  flag is the reserved value 255, see above):** bit 7 of every
+  far cell was a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
   ray would stop on somewhere inside this cell's fine footprint" — and the low
   seven are a FAR PALETTE SLOT (`FAR_PAL_MASK` / `FAR_BLOCKER_BIT`,
   common.wgsl; every reader masks). The flag is a pure function of (coords, seed)

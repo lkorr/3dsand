@@ -264,11 +264,11 @@ fn rayStartFarByte(level : u32, c : vec3<i32>) -> u32 {
 // stopping there left the far march 30 of its 47 steps a pixel (measured).
 fn rayStartFarCandidate(level : u32, c : vec3<i32>) -> bool {
   let b = rayStartFarByte(level, c);
-  if ((b & FAR_PAL_MASK) != 0u) { return true; }
+  if (farCellSlot(b) != 0u) { return true; }
   if (b == 0u) { return false; }
   return i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL ||
          (i32(level) <= TUNE_FAR_REFINE_LEVEL &&
-          (rayStartFarByte(level, c - vec3<i32>(0, 1, 0)) & FAR_PAL_MASK) != 0u);
+          farCellSlot(rayStartFarByte(level, c - vec3<i32>(0, 1, 0))) != 0u);
 }
 
 fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {

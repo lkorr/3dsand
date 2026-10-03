@@ -2345,23 +2345,26 @@ constexpr uint32_t kTintPaletteBaseGpu = kArtPaletteBaseGpu - kTintPaletteSlotsG
 // Fourth reserved run, same trick as the three above and for the same reason:
 // the renderer needs index -> material for something that is not a material id.
 //
-// A far cascade cell is ONE byte: seven bits and a conservative blocker flag
-// (common.wgsl FAR_SLOT_MASK / FAR_BLOCKER_BIT). Those seven bits used to BE a
-// material id, which is why `LoadMaterials` refused a 129th material — the far
-// field would have started painting the wrong colour at distance and claiming
-// a blocker wherever bit 7 landed, with nothing to say so. They are now a FAR
-// SLOT: an index into this run, where entry `kFarPaletteBaseGpu + slot` holds
-// (in its `flags` word) the material id that slot paints. Materials that look
-// alike at cascade distance share a slot by authoring `"far": "<material>"` in
-// materials.json, so the 128 is now a budget on DISTINGUISHABLE FAR COLOURS
-// rather than on the material table.
+// A far cascade cell is ONE byte (common.wgsl FAR_PAL_BLOCKER): 0 is air,
+// kFarPalBlocker is "no material, but the conservative blocker", and every
+// other value is a FAR SLOT: an index into this run, where entry
+// `kFarPaletteBaseGpu + slot` holds (in its `flags` word) the material id that
+// slot paints. Until 2026-10-02 the byte was seven bits of slot plus a blocker
+// FLAG, and 128 slots for ~207 materials meant 79 of them painted somebody
+// else's colour at distance; the flag only ever said anything on a cell with
+// no material, so it became one reserved value instead of a bit.
 //
-// Slots are assigned identity-first (material i takes slot i while i < 128), so
-// a table with no aliases writes byte-for-byte what it wrote before this run
-// existed. See LoadMaterials' slot assignment for the aliasing rules.
+// Slots are assigned identity-first (material i takes slot i), so with fewer
+// than kFarPalBlocker materials every material paints itself; `"far":
+// "<material>"` in materials.json makes two share one. See LoadMaterials' slot
+// assignment for the aliasing rules.
 //
-// 128 entries exactly fills the 7-bit field; a bigger run would be unreachable.
-constexpr uint32_t kFarPaletteSlotsGpu = 128;
+// 256 entries exactly fills the byte; entry kFarPalBlocker is never a slot.
+constexpr uint32_t kFarPaletteSlotsGpu = 256;
+constexpr uint32_t kFarPalBlocker = 0xFFu;
+// A far cell byte's palette slot: 0 for air and for a blocker-only cell
+// (common.wgsl farCellSlot).
+constexpr uint32_t FarCellSlot(uint32_t b) { return b == kFarPalBlocker ? 0u : b; }
 constexpr uint32_t kFarPaletteBaseGpu = kTintPaletteBaseGpu - kFarPaletteSlotsGpu;
 static_assert(kFarPaletteBaseGpu > 1024,
               "reserved palette runs have grown down into the material id "

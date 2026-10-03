@@ -4181,10 +4181,10 @@ struct FarHit {
   level : u32,         // which cascade level the hit lives in (shadow march)
 };
 
-// The raw far cell byte: 7 bits of far PALETTE SLOT plus the conservative
-// blocker flag (common.wgsl FAR_BLOCKER_BIT). EVERY reader of farVox goes
-// through one of the four functions below — an unmasked byte read would treat a
-// flagged air cell as slot 128, which does not exist.
+// The raw far cell byte: a far PALETTE SLOT, or the conservative blocker
+// (common.wgsl FAR_PAL_BLOCKER). EVERY reader of farVox goes through one of the
+// four functions below — a raw byte read would treat a blocker-only cell as
+// slot 255, which no material owns.
 fn farByteAt(level : u32, c : vec3<i32>) -> u32 {
   let bi = farVoxByteIndex(level, c);
   return (farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
@@ -4193,7 +4193,7 @@ fn farByteAt(level : u32, c : vec3<i32>) -> u32 {
 // here" tests want: slot 0 is air and NOTHING ELSE maps to material 0, so
 // `farPalAt(..) != 0` is exactly `farMatAt(..) != 0` without the table read.
 fn farPalAt(level : u32, c : vec3<i32>) -> u32 {
-  return farByteAt(level, c) & FAR_PAL_MASK;
+  return farCellSlot(farByteAt(level, c));
 }
 // The cell's MATERIAL, translated through the far palette (common.wgsl
 // farPalMat). Everything downstream — shading, the palette jitter, the blocker
@@ -5427,7 +5427,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
             // plus the blocker and refine predicates. Air has no material, no
             // flag and no refine candidacy (all three read a non-zero byte).
             if (cellByte != 0u) {
-              var mat = farPalMat(&materials, cellByte & FAR_PAL_MASK);
+              var mat = farPalMat(&materials, farCellSlot(cellByte));
               // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
               //
               // Shadows take the flag at every level (farShadowMarch) because a
@@ -5439,7 +5439,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
               // becomes the staircase 13.2.2 predicted, which is why this is a
               // level cap and not a boolean. 0 is exactly the behaviour before
               // this flag existed and const-folds the block away.
-              if (mat == 0u && (cellByte & FAR_BLOCKER_BIT) != 0u &&
+              if (cellByte == FAR_PAL_BLOCKER &&
                   i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL) {
                 // The flag carries no material of its own, so take the nearest
                 // one below in this column. NEVER shade air: an unbacked flag (a
@@ -5478,7 +5478,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                     // worldgen.wgsl farmap): its slot is a sub-column's
                     // sub-skin there, and the stalk IS that sub-column.
                     let stalkCell = any(((e >> vec4<u32>(23u)) & vec4<u32>(0x7Fu)) ==
-                                        vec4<u32>(cellByte & FAR_PAL_MASK));
+                                        vec4<u32>(farCellSlot(cellByte)));
                     let hc = select(maxH, hq.w, level == 1u && !stalkCell);
                     if (mat == 0u || y0 + (si >> 1) <= hc) {
                       let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,

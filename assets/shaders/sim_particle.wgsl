@@ -115,8 +115,8 @@ fn farBlocked(c : vec3<i32>) -> bool {
   let bi = farVoxByteIndex(1u, cell);
   let b = (farVox[bi >> 2u] >> (8u * (bi & 3u))) & 0xFFu;
   if (b == 0u) { return false; }
-  if ((b & FAR_BLOCKER_BIT) != 0u) { return true; }
-  return materials[farPalMat(&materials, b & FAR_PAL_MASK)].klass != CLASS_GAS;
+  if (b == FAR_PAL_BLOCKER) { return true; }
+  return materials[farPalMat(&materials, b)].klass != CLASS_GAS;
 }
 
 // Two window edges centred on the window: the gas outer box's extent.
