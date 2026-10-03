@@ -787,6 +787,9 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
           case pass::DispatchSel::IndShadowArgs:
             args = bind_.buffers[(int)pass::Buf::ShadowArgs];
             break;
+          case pass::DispatchSel::IndGiArgs:
+            args = bind_.buffers[(int)pass::Buf::GiArgs];
+            break;
           case pass::DispatchSel::IndGasDispatchArgs:
             args = bind_.buffers[(int)pass::Buf::GasDispatchArgs];
             break;

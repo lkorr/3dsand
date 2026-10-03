@@ -101,6 +101,8 @@ namespace {
 #define PIPE_RAIN_MAP_PREP   Pipe::RainMapPrep
 #define PIPE_RAIN_MAP_BUILD  Pipe::RainMapBuild
 #define PIPE_GODRAY_VIS      Pipe::GodrayVis
+#define PIPE_GI_PREPARE      Pipe::GiPrepare
+#define PIPE_GI_GATHER       Pipe::GiGather
 #define PIPE_WIND_STREAK     Pipe::WindStreak
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
@@ -269,6 +271,7 @@ namespace {
 #define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 #define IND_DRAFTARGS     (uint32_t)DispatchSel::IndDraftArgs
 #define IND_HEATARGS      (uint32_t)DispatchSel::IndHeatArgs
+#define IND_GIARGS        (uint32_t)DispatchSel::IndGiArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

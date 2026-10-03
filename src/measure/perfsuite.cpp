@@ -2165,17 +2165,17 @@ const RenderArm kRenderArms[] = {
      [](Tuning& t) { t.render.giStrength = 0.0f; }, true, 1,
      "the irradiance gather at every near-field hit plus both injection "
      "paths"},
-    // The gather CACHE (PLAN_frame_perf.md §3 item 1). giCachePeriod = 0
-    // const-folds the cache read away and puts the nine-ray gather back on
-    // every lit near pixel every frame -- the pre-cache shader, exactly -- so
-    // baseline - nogicache is what caching the gather per block-face is worth
-    // on this world. Only meaningful once the openness walk has stamped the
-    // visible slots (the cache is keyed under the openness stamp); the warm-up
-    // ticks below cover that.
-    {"nogicache", "giCachePeriod 8 -> 0 (per-pixel gather every frame)",
+    // The gather CACHE (PLAN_frame_perf.md §3 item 1). Since the refresh
+    // moved to gi_gather.wgsl (2026-10-03), giCachePeriod = 0 makes every
+    // visible block-face due every frame: the compute pass re-gathers all of
+    // them each frame instead of 1/16 of them, so baseline - nogicache is what
+    // the STAGGER saves (read it in the `pre` column, where the pass's time
+    // is). The pre-cache per-pixel gather in the fragment shader no longer
+    // exists to measure.
+    {"nogicache", "giCachePeriod 16 -> 0 (all visible faces, every frame)",
      [](Tuning& t) { t.render.giCachePeriod = 0; }, true, 1,
-     "the gather cache: nine block rays per lit pixel per frame, less one "
-     "cached word per hit"},
+     "the staggered refresh: every on-screen block-face's nine rays every "
+     "frame (gi_gather pass), not 1/16 of them"},
     // ---- the glow field (src/sim/world.h kGlowBytes) ----
     // glowStrength = 0 makes C_GLOW false, so none of the three producer rows
     // is recorded, AND const-folds the sampled term out of every consumer -- so
@@ -2293,6 +2293,18 @@ const RenderArm kExtraArms[] = {
     {"exp3", "debug.perfExp 0 -> 3",
      [](Tuning& t) { t.debug.perfExp = 3; }, true, 1,
      "whatever experiment 3 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp4", "debug.perfExp 0 -> 4",
+     [](Tuning& t) { t.debug.perfExp = 4; }, true, 1,
+     "whatever experiment 4 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp5", "debug.perfExp 0 -> 5",
+     [](Tuning& t) { t.debug.perfExp = 5; }, true, 1,
+     "whatever experiment 5 in the shaders is — see TUNE_PERF_EXP",
+     false, false, /*anyCamera=*/true},
+    {"exp6", "debug.perfExp 0 -> 6",
+     [](Tuning& t) { t.debug.perfExp = 6; }, true, 1,
+     "whatever experiment 6 in the shaders is — see TUNE_PERF_EXP",
      false, false, /*anyCamera=*/true},
     {"nogodray", "godRaySteps 14 -> 0",
      [](Tuning& t) { t.render.godRaySteps = 0; }, true, 1,
@@ -3593,6 +3605,17 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
         "refused\n            %.2f patches per 100 px — under 100 is real "
         "dedup, at the cap it is truncation\n",
         w[2], w[1], kShadowReqCap, w[3], 100.0 * (double)w[2] / px);
+    // The GI gather cache's refresh list (gi_gather.wgsl): what the frame's
+    // raymarch asked to be re-gathered, deduplicated per block-face.
+    if (sim.GiReqBuffer()) {
+      rhi::CommandEncoder genc = ctx.device.CreateCommandEncoder();
+      genc.CopyBufferToBuffer(sim.GiReqBuffer(), 0, stage, 0, 16);
+      ctx.queue.Submit(genc.Finish());
+      uint32_t g[4] = {0, 0, 0, 0};
+      if (rhi::ReadBufferBlocking(ctx.device, stage, 0, g, sizeof(g)))
+        std::printf("  gi cache: %u block-faces re-gathered last frame (cap %u), %u "
+                    "refused\n", g[2], pass::kGiReqCap, g[3]);
+    }
   };
 
   // One camera's whole pass: set it up, run its arms, print its table, shoot
