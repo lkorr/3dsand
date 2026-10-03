@@ -5553,8 +5553,11 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 // (mat << 12) | cellIndexInLevelChunk. Read by the `farpatch` entry below.
 @group(1) @binding(5) var<storage, read> farPatch : array<u32>;
 // fardown's skip (world.h farSig): the far-visible matter signature each slot
-// had the last time it was downsampled.
+// had the last time it was downsampled. Bit 0 is FAR_SIG_RAN, not signature:
+// "fardown rewrote this slot in this tick's dispatch", read by its follow-up
+// entries (fardownClaim / fardownStalk / fardownFeat) to skip what it skipped.
 @group(1) @binding(6) var<storage, read_write> farSig : array<u32>;
+const FAR_SIG_RAN : u32 = 1u;
 // THE FAR SURFACE MAP (world.h kFarMap*, common.wgsl farMapWord). `farmap`
 // below fills it; `farpatch` and `fardown` only ever CLEAR its valid bit.
 // Atomic for fardown's sake: neighbouring dirty chunks clear bits in entries
@@ -6314,10 +6317,15 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
     // The world chunk coord stays in: a slot is REUSED by another chunk after a
     // window shift, and the same content in a different place writes
     // different cells.
-    var sig = pcg(hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount));
-    sig = max(sig, 1u);   // 0 is "never downsampled" (zeroed buffer)
-    let same = farSig[slot] == sig;
-    farSig[slot] = sig;
+    // Bit 0 is NOT signature: it is FAR_SIG_RAN, "this slot was downsampled
+    // in this tick's dispatch", which the two follow-up entries (fardownClaim,
+    // fardownFeat; see their header) read to skip exactly the chunks this one
+    // skipped. Bit 1 is forced so a signature is never 0 ("never downsampled",
+    // the zeroed buffer FarField's sigClear writes).
+    let sig = (pcg(hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount)) | 2u) &
+              ~FAR_SIG_RAN;
+    let same = (farSig[slot] & ~FAR_SIG_RAN) == sig;
+    farSig[slot] = sig | select(FAR_SIG_RAN, 0u, same);
     atomicStore(&wgFarCount, select(0u, 1u, same));
   }
   if (workgroupUniformLoad(&wgFarCount) != 0u) { return; }
@@ -6408,6 +6416,50 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
   }
+}
+
+// ---- THE DOWNSAMPLE'S TWO FOLLOW-UP CHECKS ARE THEIR OWN DISPATCHES ----------
+// (cross-vendor audit #9, 2026-10-03)
+//
+// The claim check (fardownClaim) and the feature check (fardownFeat) used to
+// run at the tail of `fardown`, in the same dispatch as the downsample, and
+// both crossed workgroups:
+//   * the claim check's STALK CLEAR loads a farVox byte and clears it if it
+//     still holds the cut stalk's slot -- run by the workgroup of the chunk
+//     holding the stalk's map column, which need not be the chunk that owns
+//     the byte. The owner's downsample rewrites the byte as two atomics (and,
+//     then or). Load before the and: cleared; between: sees 0, no clear;
+//     after the or: cleared or not by what the downsample wrote. The stalk
+//     survived or went by scheduling.
+//   * the feature check reads the map entry's VALID bit, which another
+//     chunk's claim check may be clearing in the same dispatch (the claim band
+//     and the feature's base voxel can lie in two chunks of one column), and
+//     the claim check reads the feature word, which another chunk's feature
+//     check may be zeroing -- so whether a stalk is treated as a stalk at all
+//     was a race too.
+// farVox is render data, but it is not ONLY render data: particles outside
+// residency collide with it (sim_particle farBlocked), so a byte that differs
+// is a landing that differs.
+//
+// Split into three dispatches over the same list, recorded back to back (the
+// pass table's barriers order them): downsample, then claims, then features.
+// Each phase reads only what earlier phases finished writing, and inside a
+// phase every write is idempotent and conditioned only on state no other
+// workgroup of that phase writes (the stalk clear's byte test reads a byte
+// that, mid-phase, is either the stalk's slot or already the `keep` value the
+// clear would write; a feature word is only ever zeroed). Same work, same
+// writes; only the interleaving is gone. The follow-ups skip a chunk the
+// downsample skipped by reading FAR_SIG_RAN, the flag `fardown` leaves in
+// bit 0 of the slot's signature.
+fn farDownRan(slot : u32) -> bool { return (farSig[slot] & FAR_SIG_RAN) != 0u; }
+
+@compute @workgroup_size(64)
+fn fardownClaim(@builtin(workgroup_id) wg : vec3<u32>,
+                @builtin(local_invocation_index) li : u32) {
+  let slot = farDirty[wg.x];
+  if (!farDownRan(slot)) { return; }
+  let wc = slotWorldChunk(slot, T.origin);
+  let base = wc * i32(CHUNK);
 
   // ---- THE SURFACE MAP'S CLAIM, CHECKED AGAINST THE LIVE GRID (package A) ----
   //
@@ -6470,7 +6522,10 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       // top, so that is the column checked (the sample column of a level-2
       // sub-column need not be it). If the claim fails, the cells the fill
       // marked with the stalk's slot go too, or a cut stalk would stand on at
-      // distance as a column of cells (the ghost this check exists to stop).
+      // distance as a column of cells (the ghost this check exists to stop) --
+      // in the NEXT dispatch, fardownStalk, which sees every claim this one
+      // settled. The feature word read here is only ever zeroed by
+      // fardownFeat, two dispatches later, so it is stable in this one.
       let fw = select(0u, atomicLoad(&farMap[FAR_FEAT_BASE + me]), level <= FAR_FEAT_LEVELS);
       let isStalk = (fw & FAR_FEAT_SOLID) != 0u && ((fw >> 8u) & 15u) != 0u;
       var qx = fx;
@@ -6490,33 +6545,126 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         let reskinned = solid && y == hTop && !isStalk && shift < 5u &&
                         matFarPal(&materials, wm) != ((e >> 16u) & 0x7Fu);
         if (solid != (y <= hTop) || reskinned) {
+          // The only write of this dispatch, and it commutes: a second chunk
+          // of the same column that read VALID before this cleared it reaches
+          // the same verdict or none, and clears the same bit.
           atomicAnd(&farMap[me], ~FAR_MAP_VALID);
-          if (isStalk) {
-            let body = (fw >> 16u) & 0x7Fu;
-            let head = (fw >> 23u) & 0x7Fu;
-            let c = m >> vec2<u32>(1u);
-            let sBase = hTop - i32((fw >> 8u) & 15u) + 1;
-            for (var cy = sBase >> shift; cy <= hTop >> shift; cy++) {
-              let cc = vec3<i32>(c.x, cy, c.y);
-              if (!farInBox(cc, origin)) { continue; }
-              let bi = farVoxByteIndex(level, cc);
-              let bsh = (bi & 3u) * 8u;
-              let sl = farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu);
-              if (sl != 0u && (sl == body || sl == head)) {
-                // Back to what the fill would have left: the blocker on the
-                // cell that holds the ground under the stalk (its floor at or
-                // below sBase - 1), air above it.
-                let keep = select(0u, FAR_PAL_BLOCKER, (cy << shift) <= sBase - 1);
-                atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
-                atomicOr(&farVox[bi >> 2u], keep << bsh);
-              }
-            }
-          }
           break;
         }
       }
     }
   }
+}
+
+// ---- A CUT STALK'S CELLS (package F; its own dispatch since audit #9) -------
+// A stalk sub-column whose claim no longer holds (VALID clear -- this tick's
+// fardownClaim, or a `farpatch`) still has its feature word until fardownFeat
+// zeroes it, one dispatch from now; this is the window in which the cells the
+// fill MARKED with a stalk slot are put back. Every chunk of the dirty list
+// whose x/z footprint holds the sub-column's sample column visits it, so a
+// cut stalk is cleared on the tick its claim fails, as before.
+//
+// ONE VERDICT PER CELL, whoever computes it. Three things made the old clear
+// (inline in the claim check) depend on scheduling, and each is gone:
+//   * WHICH stalk's slot a shared cell holds: the fill marks a level cell's
+//     cells by compare-exchange among its sub-columns' stalks, first wins. So
+//     a cell is "a stalk cell" here if it holds the body or head slot of ANY
+//     stalk of its level cell, and it is kept while ANY of those stalks still
+//     stands (VALID, final since fardownClaim finished) and passes through it.
+//   * the KEEP value: it was the blocker iff the cell's floor is at or under
+//     THIS stalk's ground, so two cut stalks of one cell with different
+//     ground could each write their own. Now it is the cell's: the blocker iff
+//     the floor is at or under the HIGHEST ground of its four sub-columns
+//     (the map top, less the stalk for a stalk sub-column) -- the
+//     conservative rule the fill's blocker flag already follows.
+//   * the interleaving: every writer of a cell writes that same value with the
+//     same and+or, so any interleaving ends on it, and a writer that reads it
+//     back (slot 0) does nothing.
+// Inputs, all fixed for the whole dispatch: farMap tops and VALID bits, the
+// feature words, and the farVox bytes as `fardown` left them.
+fn farSubGround(e : u32, fw : u32) -> i32 {
+  let isStalk = (fw & FAR_FEAT_SOLID) != 0u && ((fw >> 8u) & 15u) != 0u;
+  return farMapTop(e) - select(0, i32((fw >> 8u) & 15u), isStalk);
+}
+
+@compute @workgroup_size(64)
+fn fardownStalk(@builtin(workgroup_id) wg : vec3<u32>,
+                @builtin(local_invocation_index) li : u32) {
+  let slot = farDirty[wg.x];
+  if (!farDownRan(slot)) { return; }
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
+  for (var level = 1u; level <= FAR_FEAT_LEVELS; level++) {
+    let shift = farCellShift(level);
+    let wsh = shift - 1u;
+    let w = 1 << wsh;
+    let hw = w >> 1;
+    let fx0 = farFirstCenter(base.x, w, hw);
+    let fz0 = farFirstCenter(base.z, w, hw);
+    let nx = farCenterCount(base.x, fx0, w);
+    let nz = farCenterCount(base.z, fz0, w);
+    let origin = F.origins[level - 1u].xyz;
+    let cols = u32(max(nx * nz, 0));
+    for (var ci = li; ci < cols; ci += 64u) {
+      let fx = fx0 + (i32(ci) % nx) * w;
+      let fz = fz0 + (i32(ci) / nx) * w;
+      let m = vec2<i32>(fx >> wsh, fz >> wsh);
+      let c = m >> vec2<u32>(1u);
+      let d = c - origin.xz * i32(CHUNK);
+      if (any(d < vec2<i32>(0)) || any(d >= vec2<i32>(i32(FAR_N)))) { continue; }
+      let mw = farMapCell(level, c) * 4u;
+      let me = mw + u32(m.y & 1) * 2u + u32(m.x & 1);
+      let e = atomicLoad(&farMap[me]);
+      if ((e & FAR_MAP_VALID) != 0u) { continue; }       // the claim holds
+      let fw = atomicLoad(&farMap[FAR_FEAT_BASE + me]);
+      if ((fw & FAR_FEAT_SOLID) == 0u || ((fw >> 8u) & 15u) == 0u) { continue; }
+      // The level cell's four sub-columns: their ground, and which of their
+      // stalks still stand.
+      var eq : array<u32, 4>;
+      var fq : array<u32, 4>;
+      var maxGround = -2147483647;
+      for (var q = 0u; q < 4u; q++) {
+        eq[q] = atomicLoad(&farMap[mw + q]);
+        fq[q] = atomicLoad(&farMap[FAR_FEAT_BASE + mw + q]);
+        maxGround = max(maxGround, farSubGround(eq[q], fq[q]));
+      }
+      let hTop = farMapTop(e);
+      let sBase = hTop - i32((fw >> 8u) & 15u) + 1;
+      for (var cy = sBase >> shift; cy <= hTop >> shift; cy++) {
+        let cc = vec3<i32>(c.x, cy, c.y);
+        if (!farInBox(cc, origin)) { continue; }
+        let bi = farVoxByteIndex(level, cc);
+        let bsh = (bi & 3u) * 8u;
+        let sl = farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu);
+        if (sl == 0u) { continue; }
+        var marked = false;
+        var standing = false;
+        for (var q = 0u; q < 4u; q++) {
+          let f = fq[q];
+          if ((f & FAR_FEAT_SOLID) == 0u || ((f >> 8u) & 15u) == 0u) { continue; }
+          if (sl == ((f >> 16u) & 0x7Fu) || sl == ((f >> 23u) & 0x7Fu)) { marked = true; }
+          if ((eq[q] & FAR_MAP_VALID) != 0u) {
+            let qTop = farMapTop(eq[q]);
+            let qBase = qTop - i32((f >> 8u) & 15u) + 1;
+            if (cy >= (qBase >> shift) && cy <= (qTop >> shift)) { standing = true; }
+          }
+        }
+        if (!marked || standing) { continue; }
+        let keep = select(0u, FAR_PAL_BLOCKER, (cy << shift) <= maxGround);
+        atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+        atomicOr(&farVox[bi >> 2u], keep << bsh);
+      }
+    }
+  }
+}
+
+// ---- THE FEATURES (package F; their own dispatch since audit #9) ----------
+// After fardownStalk, which reads the feature words this zeroes.
+@compute @workgroup_size(64)
+fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
+               @builtin(local_invocation_index) li : u32) {
+  let slot = farDirty[wg.x];
+  if (!farDownRan(slot)) { return; }
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
 
   // ---- THE FEATURES, CHECKED AGAINST THE LIVE GRID (package F) -------------
   // A feature (FAR_FEAT_*) is drawn from the map alone, so the live grid has

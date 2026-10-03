@@ -77,6 +77,9 @@ namespace {
 #define PIPE_FAR_PATCH_FILL  Pipe::FarPatchFill
 #define PIPE_FAR_MAP_FILL    Pipe::FarMapFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
+#define PIPE_FAR_DOWN_CLAIM  Pipe::FarDownClaim
+#define PIPE_FAR_DOWN_STALK  Pipe::FarDownStalk
+#define PIPE_FAR_DOWN_FEAT   Pipe::FarDownFeat
 #define PIPE_OPENNESS_DIRTY   Pipe::OpennessDirty
 #define PIPE_OPENNESS_REFRESH Pipe::OpennessRefresh
 #define PIPE_GLOW_SRC         Pipe::GlowSrc

@@ -922,7 +922,8 @@ Status VesselRoundTrip(Ctx& c, std::string& detail, bool mpm) {
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
   {
-    const uint32_t zeros[2] = {0u, 0u};
+    // Counts AND the committed words (sim_particle.wgsl THE RING'S CAP).
+    const uint32_t zeros[4] = {0u, 0u, 0u, 0u};
     c.ctx.queue.WriteBuffer(c.world.particleCounts, 0, zeros, sizeof zeros);
     const uint32_t zero = 0u;
     c.ctx.queue.WriteBuffer(c.world.fluidArgsStage, 7 * 4, &zero, 4);

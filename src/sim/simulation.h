@@ -736,6 +736,9 @@ class Simulation {
     // waited on together: a cascade filled by the sweep alone would drop every
     // far-field edit, which is a WRONG horizon rather than a missing one.
     rhi::ComputePipeline fill, map, patch, down;
+    // fardown's follow-up phases (worldgen.wgsl fardownClaim / fardownStalk /
+    // fardownFeat; cross-vendor audit #9). Small entries: no procgen.
+    rhi::ComputePipeline downClaim, downStalk, downFeat;
   };
   // Move the future's result onto the three far pipeline members. Main thread only.
   void PublishFarPipelines();
@@ -954,6 +957,7 @@ class Simulation {
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farMapFill_, farPatchFill_, farDown_;
+  rhi::ComputePipeline farDownClaim_, farDownStalk_, farDownFeat_;
   // The background compile. Valid between BuildPipelines and the publish;
   // `farPublished_` and `deferFarOk_` are main-thread-only, `farReady_` is the
   // one field any other thread may observe.

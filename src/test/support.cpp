@@ -1828,8 +1828,36 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
   if (!exps.empty())
     ctx.queue.WriteBuffer(world.expOps, 0, exps.data(), exps.size() * sizeof(ExplosionOp));
-  if (cellCount > 0)
-    ctx.queue.WriteBuffer(world.cellOps, 0, cells.data(), cellCount * sizeof(CellOp));
+  if (cellCount > 0) {
+    // VOXEL OPS GO UP SORTED BY CELL (cross-vendor audit #10, 2026-10-03).
+    // The `cells` kernel's support-loss flag asks, for each neighbour of a
+    // cell it wrote, "does another op of this dispatch write that cell, and
+    // with what?" -- the only way to read the neighbour's POST-dispatch
+    // material instead of whatever its store had or had not reached
+    // (sim_mutate.wgsl flagSupportLossCells) -- and answers by binary search.
+    // Only the UPLOAD is permuted: `cells` itself (what every CPU consumer
+    // above and the op record below see) keeps push order, and a replay
+    // re-sorts here identically. A pure permutation of a list the keep-first
+    // dedupe left with one op per cell, on a dispatch with no order of its
+    // own, so it changes nothing the stores do. Pours stay contiguous at the
+    // tail (solPour walks them from the end). stable_sort only so
+    // SANDVOX_OPS_NO_DEDUPE's duplicates keep a defined order. A tick whose
+    // ops are already ordered costs one linear check and no copy.
+    static std::vector<CellOp> sortedCells;  // reused: frame path
+    size_t nv = 0;
+    while (nv < cellCount && !IsSoluteCellOp(cells[nv].word)) nv++;
+    bool ordered = true;
+    for (size_t i = 1; i < nv && ordered; i++)
+      ordered = cells[i - 1].cellIdx <= cells[i].cellIdx;
+    const CellOp* up = cells.data();
+    if (!ordered) {
+      sortedCells.assign(cells.begin(), cells.begin() + cellCount);
+      std::stable_sort(sortedCells.begin(), sortedCells.begin() + (ptrdiff_t)nv,
+                       [](const CellOp& a, const CellOp& b) { return a.cellIdx < b.cellIdx; });
+      up = sortedCells.data();
+    }
+    ctx.queue.WriteBuffer(world.cellOps, 0, up, cellCount * sizeof(CellOp));
+  }
   if (spawnCount > 0)
     ctx.queue.WriteBuffer(world.spawnOps, 0, spawns.data(),
                           spawnCount * sizeof(ParticleSpawn));

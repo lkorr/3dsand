@@ -4688,6 +4688,232 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------- support-flag-post
+// THE CELL OPS' SUPPORT FLAG READS THE POST-DISPATCH GRID (cross-vendor audit
+// #10, 2026-10-03).
+//
+// `cells` raises the flag from each written cell by looking at its six
+// neighbours, and a neighbour can be ANOTHER op of the same dispatch. Until
+// the audit fix it read that neighbour whenever its invocation got there:
+// before the other op's store (still solid -> flag) or after (air -> none).
+// Now sim_mutate.wgsl's flagSupportLossCells finds the neighbour's op in the
+// (sorted) upload and uses the material the cell ENDS the dispatch with.
+//
+// THE FIXTURE pins that answer down. A four-cell stone pillar whose top cell A
+// is the last layer of chunk K, plus one more cell B directly above it -- the
+// first layer of chunk K+1. One tick erases A and B together, pushed B FIRST
+// so the upload's sort is exercised. Post-dispatch, A's lower neighbour is
+// still stone (chunk K must be flagged) and B is air, so NOTHING in K+1 is
+// left unsupported: K+1 must not be flagged. The old read flagged K+1 whenever
+// A's invocation read B before B's store landed -- a scheduling choice.
+// A "must not" needs a quiet K+1: it is open air above the terrain, the
+// fixture's paint raises no flag (paint into air never does), and the
+// baseline window drains everything else before the erase.
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): this gate tests the mutation
+// dispatch's flag in isolation, and the real tick would hand the flag to
+// island detection (DebrisSystem), which would drop the floating pillar and
+// add flags of its own to the window being read.
+Status GateSupportFlagPost(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const int gx = 120, gz = 120;
+  const int gy = FixtureYOver(gx - 4, gz - 4, gx + 4, gz + 4, kDefaultSeed, 12);
+  const int ay = (gy + 3) | 15;           // A: the top layer of its chunk
+  const IVec3 kc{gx >> 4, ay >> 4, gz >> 4};
+  const IVec3 kc1{gx >> 4, (ay + 1) >> 4, gz >> 4};
+  const uint32_t chunkK = World::SlotChunkIndex(kc);
+  const uint32_t chunkK1 = World::SlotChunkIndex(kc1);
+
+  std::vector<CellOp> scene;
+  for (int y = ay - 3; y <= ay + 1; y++)
+    scene.push_back({World::SlotCellIndex({gx, y, gz}), kMatStone});
+  uint32_t t = 1;
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false, kc, false, false);
+  ctx.WaitIdle();
+
+  std::vector<uint8_t> seen(kNumSlots, 0);
+  auto collect = [&](int ticks) {
+    for (int i = 0; i < ticks; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, kc, true, false);
+      ctx.WaitIdle();
+      const WorldSnapshot& sn = world.Snap();
+      if (!sn.valid || sn.supportFlags.size() != kNumSlots) continue;
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
+        if (sn.supportFlags[ci]) seen[ci] = 1;
+    }
+  };
+  collect(12);  // drain worldgen's and the placement's flags
+
+  // Fixture census before the erase: both chunks, one readback each.
+  std::vector<uint32_t> vk(kChunkVol), vk1(kChunkVol);
+  ReadVoxelsSync(ctx, world, chunkK, 1, vk.data(), "supportPostK");
+  ReadVoxelsSync(ctx, world, chunkK1, 1, vk1.data(), "supportPostK1");
+  auto local = [](int x, int y, int z) {
+    return (uint32_t)((((z & 15) * 16) + (y & 15)) * 16 + (x & 15));
+  };
+  bool fixtureOk = (vk1[local(gx, ay + 1, gz)] & 0xFFFu) == kMatStone;
+  for (int y = ay - 3; y <= ay; y++)
+    fixtureOk = fixtureOk && (vk[local(gx, y, gz)] & 0xFFFu) == kMatStone;
+
+  std::fill(seen.begin(), seen.end(), (uint8_t)0);
+  // B pushed before A: the upload is NOT in cell order, so SubmitTick's sort
+  // is what the shader's binary search relies on here.
+  std::vector<CellOp> erase{{World::SlotCellIndex({gx, ay + 1, gz}), 0u},
+                            {World::SlotCellIndex({gx, ay, gz}), 0u}};
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, erase, false, kc, true, false);
+  ctx.WaitIdle();
+  {
+    const WorldSnapshot& sn = world.Snap();
+    if (sn.valid && sn.supportFlags.size() == kNumSlots)
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
+        if (sn.supportFlags[ci]) seen[ci] = 1;
+  }
+  collect(12);
+  ReadVoxelsSync(ctx, world, chunkK, 1, vk.data(), "supportPostK");
+  ReadVoxelsSync(ctx, world, chunkK1, 1, vk1.data(), "supportPostK1");
+  const bool erased = (vk[local(gx, ay, gz)] & 0xFFFu) == 0u &&
+                      (vk1[local(gx, ay + 1, gz)] & 0xFFFu) == 0u;
+  const bool kFlag = seen[chunkK] != 0, k1Flag = seen[chunkK1] != 0;
+
+  std::string fails;
+  if (chunkK == chunkK1) fails += " fixture does not straddle a chunk face;";
+  if (!fixtureOk) fails += " the pillar never landed;";
+  if (!erased) fails += " the erase never landed;";
+  if (fixtureOk && erased) {
+    if (!kFlag) fails += " chunk K (stone still under the erased top) was not flagged;";
+    if (k1Flag)
+      fails += " chunk K+1 was flagged: a neighbour erased in the SAME dispatch was "
+               "read as solid (pre-store read, the audit #10 race);";
+  }
+  // Leave pristine terrain behind (the gates after this expect it).
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: erasing a pillar's top cell and the cell above it in one "
+                "dispatch flagged K=%d (want 1) K+1=%d (want 0); chunks %u/%u, "
+                "fixture %d, erased %d%s%s",
+                fails.empty() ? "PASS" : "FAIL", kFlag ? 1 : 0, k1Flag ? 1 : 0,
+                chunkK, chunkK1, fixtureOk ? 1 : 0, erased ? 1 : 0,
+                fails.empty() ? "" : " |", fails.c_str());
+  detail = buf;
+  std::printf("support-flag-post: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------- particle-cap
+// THE PARTICLE RING REFUSES AT ITS CAP AS A WHOLE GROUP (cross-vendor audit
+// #4, 2026-10-03; sim_particle.wgsl "THE RING'S CAP").
+//
+// Every producer appends with an atomicAdd cursor and keeps a particle only if
+// its slot is under kParticleCap, so at saturation WHICH ejecta survived was
+// the first-come set -- workgroup order. The fix commits each page's appends
+// as one group in args1/args2: a group that does not fit is refused whole, the
+// counter rolled back to the page's committed count, and the refusal counted
+// (particleCounts words 4/5).
+//
+// TWO ARMS, one blast each into a stone cube the gate paints itself:
+//   A  empty ring: the blast's ejecta all fly (survivors > 0, nothing
+//      refused) -- the commit is invisible under the cap.
+//   B  ring prefilled to kParticleCap - 1 (dead particles, committed): the
+//      same blast overflows, so ALL of its ejecta are refused -- survivors
+//      exactly 0, refused == what was attempted, one refused group. The
+//      first-come rule this replaces would have flown exactly one.
+// Forcing the cap is a buffer write a gate may make and the game may not: the
+// ring's two pages are zeroed (dead particles) and the count words set,
+// exactly as selftest_vessel.cpp resets the counts at a tick's head.
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): the claim is about one dispatch
+// sequence (explode -> args1 commit -> integrate) under a forced counter, and
+// the real tick's debris and mob phases would add producers to the page.
+Status GateParticleCap(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  struct Arm {
+    uint32_t survivors = 0, refused = 0, groups = 0, cursor = 0;
+    bool cubeOk = false;
+  };
+  uint32_t t = 1;
+  std::vector<uint8_t> zeroPage((size_t)kParticleCap * 32, 0);
+  auto runArm = [&](int ox, int oz, uint32_t prefill) {
+    Arm a;
+    const int cy = FixtureYOver(ox - 6, oz - 6, ox + 6, oz + 6, kDefaultSeed, 10) + 5;
+    const IVec3 pc{ox >> 4, cy >> 4, oz >> 4};
+    std::vector<CellOp> cube;
+    for (int z = -4; z <= 4; z++)
+      for (int y = -4; y <= 4; y++)
+        for (int x = -4; x <= 4; x++)
+          cube.push_back({World::SlotCellIndex({ox + x, cy + y, oz + z}), kMatStone});
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, cube, false, pc, false, false);
+    ctx.WaitIdle();
+    {
+      std::vector<uint32_t> v(kChunkVol);
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(pc), 1, v.data(), "pcapCube");
+      const uint32_t li = (uint32_t)((((oz & 15) * 16) + (cy & 15)) * 16 + (ox & 15));
+      a.cubeOk = (v[li] & 0xFFFu) == kMatStone;
+    }
+    // The ring, forced: both pages dead, the read page's count AND its
+    // committed count at `prefill`, the refusal counters at zero.
+    ctx.queue.WriteBuffer(world.particles[0], 0, zeroPage.data(), zeroPage.size());
+    ctx.queue.WriteBuffer(world.particles[1], 0, zeroPage.data(), zeroPage.size());
+    uint32_t words[8] = {};
+    const uint32_t P = sim.Page();
+    words[P] = prefill;
+    words[2 + P] = prefill;
+    ctx.queue.WriteBuffer(world.particleCounts, 0, words, sizeof words);
+    ctx.WaitIdle();
+    std::vector<ExplosionOp> exps{{ox, cy, oz, 4, 2000, 0, 0, 0}};
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, pc, false, true);
+    ctx.WaitIdle();
+    uint32_t got[8] = {};
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.particleCounts, 0, got,
+                          sizeof got, "pcapCounts");
+    // After the tick the page flipped: Page() is the page integrate wrote.
+    a.survivors = got[sim.Page()];
+    a.cursor = got[1 - sim.Page()];
+    a.refused = got[4];
+    a.groups = got[5];
+    return a;
+  };
+  const Arm A = runArm(152, 152, 0);
+  const Arm B = runArm(200, 152, kParticleCap - 1);
+
+  std::string fails;
+  if (!A.cubeOk || !B.cubeOk) fails += " a stone cube never landed;";
+  if (A.survivors == 0) fails += " arm A: the blast threw nothing (no ejecta to refuse);";
+  if (A.refused != 0 || A.groups != 0) fails += " arm A: refusals under the cap;";
+  if (B.survivors != 0)
+    fails += " arm B: ejecta survived an overflowing group (first-come refusal);";
+  if (B.groups != 1) fails += " arm B: not exactly one refused group;";
+  if (B.refused < 2) fails += " arm B: the overflow was not counted;";
+  if (B.cursor != kParticleCap - 1)
+    fails += " arm B: the read page's counter was not rolled back to its commit;";
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: empty ring -> %u ejecta flew, %u refused; ring at cap-1 -> "
+                "%u flew, %u refused in %u group(s), read page rolled back to %u "
+                "(want %u)%s%s",
+                fails.empty() ? "PASS" : "FAIL", A.survivors, A.refused, B.survivors,
+                B.refused, B.groups, B.cursor, kParticleCap - 1,
+                fails.empty() ? "" : " |", fails.c_str());
+  detail = buf;
+  std::printf("particle-cap: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 
 // ---- snapshot-latency ---------------------------------------------------
 //
@@ -6875,6 +7101,8 @@ const std::vector<Gate>& SimGates() {
       {"stamp-sleep", "sim", {}, false, GateStampSleep},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},
+      {"support-flag-post", "sim", {}, false, GateSupportFlagPost},
+      {"particle-cap", "sim", {}, false, GateParticleCap},
       {"snapshot-latency", "sim", {}, false, GateSnapshotLatency},
       // No draw of its own, but its verdict reads bestFrameMs, which only the
       // screenshots gate sets — so it needs the render path transitively.

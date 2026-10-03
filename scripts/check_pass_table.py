@@ -121,6 +121,10 @@ PIPE_TO_MEMBER = {
     # The far SURFACE MAP fill (LOD-seam package A): worldgen.wgsl `farmap`.
     "PIPE_FAR_MAP_FILL": "farMapFill_",
     "PIPE_FAR_DOWN": "farDown_",
+    # fardown's follow-up phases (cross-vendor audit #9).
+    "PIPE_FAR_DOWN_CLAIM": "farDownClaim_",
+    "PIPE_FAR_DOWN_STALK": "farDownStalk_",
+    "PIPE_FAR_DOWN_FEAT": "farDownFeat_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
     "PIPE_GLOW_SRC": "glowSrc_",

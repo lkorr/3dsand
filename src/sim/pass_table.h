@@ -407,6 +407,10 @@ enum class Pipe : uint8_t {
   // FarMapFill is the far SURFACE MAP's fill (worldgen.wgsl `farmap`), a third
   // row between the two: after the sweep, before the patch that invalidates it.
   FarFill, FarMapFill, FarPatchFill, FarDown,
+  // fardown's three follow-up dispatches (cross-vendor audit #9): the claim
+  // check, the cut-stalk clear and the feature check, each its own entry so
+  // no phase reads what another phase of the same dispatch is writing.
+  FarDownClaim, FarDownStalk, FarDownFeat,
   // The openness grid (sim_openness.wgsl). Two entry points: the dirty walk
   // (indirect on the compacted dirty list, exactly like occupancyDirty) and the
   // rolling refresh. BEFORE ShadowPrepare so the pipeline-copy loop's bound in
