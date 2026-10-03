@@ -112,6 +112,13 @@ constexpr uint32_t kEmLivePeak = 22;   // most chunks one tick's rounds ran over
 constexpr uint32_t kEmRekeyed = 23;    // pages zeroed because their slot changed owner
 constexpr uint32_t kEmPPeak = 24;      // the highest P any round wrote, monotonic
 constexpr uint32_t kEmRoundChunks = 25;  // chunk-rounds run, monotonic (the cost)
+// ATTRIBUTION (diagnostic, never read by the sim): the highest P any round
+// wrote into a CONDUCTING cell (as opposed to kEmPPeak, which a lone source
+// sets on its own), and chunk-rounds run per round index 0..3 (index 3 counts
+// every round past the third) -- "seeds seen, nothing conducted" and "only
+// round 0 ran" are different bugs, and a bare P peak cannot tell them apart.
+constexpr uint32_t kEmCondPeak = 26;
+constexpr uint32_t kEmRoundHist = 27;    // 27..30
 constexpr uint32_t kEmSnapWords = 32;
 // Indirect args: two 16-byte records, copied to elecArgs by copy_elecArgs.
 //   record 0: one group per live-list chunk (elecRound, elecSettle)

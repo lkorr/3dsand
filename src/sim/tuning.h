@@ -2462,6 +2462,15 @@ struct Tuning {
     // below 0 by day (LoadTuning) so the snow caps never melt by themselves.
     int heatSnowlineBase = TPD(sim, heatSnowlineBase);
     int heatSnowlineSwing = TPD(sim, heatSnowlineSwing);
+    // THE CHARGE FIELD (docs/PLAN_electricity.md). 0 = off: the field drains
+    // and no cell carries charge.
+    int elecMode = TPD(sim, elecMode);
+    // Rounds a tick; the field crosses one chunk (16 cells) per round.
+    int elecRounds = TPD(sim, elecRounds);
+    // Potential every charged cell loses per tick (the fade without a source).
+    int elecDecay = TPD(sim, elecDecay);
+    // Resist of a cell under a full conducting coat (water); thinner = worse.
+    int elecWetResist = TPD(sim, elecWetResist);
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
     // advances sim state and the droplets can stain, so these are integers in

@@ -801,6 +801,25 @@ TP_F(sim, heatDownGain, NO_WGSL, 0.25f, 0.0f, 4.0f)
 // + a hand-written rule in LoadTuning
 TP_I(sim, heatSnowlineBase, NO_WGSL, -20, -64, 63)
 TP_I(sim, heatSnowlineSwing, NO_WGSL, 8, 0, 63)
+// THE CHARGE FIELD (docs/PLAN_electricity.md, src/sim/elec.h). Every knob is
+// NO_WGSL on purpose, as heat's: Simulation::PrepareElec writes them into the
+// elecParams header, so a change reaches sim_elec.wgsl without touching the
+// shader prelude. elecMode 0 = the field drains its pages in one tick and no
+// cell carries charge.
+TP_I(sim, elecMode, NO_WGSL, 1, 0, 1)
+// Rounds a tick: each relaxes every charged chunk to its fixpoint and lets the
+// charge cross ONE chunk face, so the field advances elecRounds x 16 cells a
+// tick (4 = 64, the owner's visible fast pulse). The cost is linear in it.
+TP_I(sim, elecRounds, NO_WGSL, 4, 1, 8)
+// Potential lost by EVERY charged cell each tick, so a field without a source
+// fades in (its peak / elecDecay) ticks: a spark's 200 is gone ~25 ticks after
+// the spark. A held source loses ~elecDecay per elecRounds chunks of distance
+// (the far end is rebuilt only elecRounds chunks a tick).
+TP_I(sim, elecDecay, NO_WGSL, 8, 1, 4096)
+// The resist of a cell under a FULL conducting coat (water, blood: stain amount
+// 15). A thinner coat is proportionally worse (resist x 15 / amount). A wet
+// plank (60 dry) or wet stone (an insulator dry) carries charge through it.
+TP_I(sim, elecWetResist, NO_WGSL, 12, 1, 254)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900, 0, 1000)
 // Both of these are packed into bit fields in Particle.flags; an
 // out-of-range value would wrap into the neighbouring field rather than

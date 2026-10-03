@@ -2052,6 +2052,77 @@ the readout follows you out of a warm chunk and says so when the world under
 you is asleep (`heat-ignite` asserts the word names its block and matches the
 pool). last_run.json `heat`: pool peak, refusals, firings.
 
+### Electricity — charge field (2026-10-03; package E1, `sim_elec.wgsl`, `src/sim/elec.*`, docs/PLAN_electricity.md section 1, gate `elec-field`)
+
+**What it is.** A TRANSIENT potential `P` (u16) per conducting cell, in a
+sparse per-chunk page pool beside the voxels (design guideline 2: the word is
+full). Not hashed, not saved, not replicated: a pure function of the voxels and
+the tick inputs, so a replay reproduces it; worldgen and load zero it. E1 has
+NO consumer -- the world hash does not move -- and E2 (CA effects), E4 (mob
+shock) and E5 (the glow) read it.
+
+**Material data** (`materials.json "electric"`, `ParseElectric`): `resist`
+1..254 is the potential a cell costs to enter (no block = insulator), `source`
+1..65535 the potential a cell holds every tick it exists; `ignite` / `char`
+are E2's, parsed and packed now. Authored: drawn copper `copper_bar` 1 (the
+solid; `copper` FILINGS are a powder, 3), silver / gold 1, aluminium /
+quicksilver 2, iron / steel / brass / molten iron 3, lead / molten salt 4, lye 5,
+water 6, blood / coolant 8, flesh / skin / muscle 20, wood (every plank, log and
+bark) 60; `spark` 200, `arc` 2,000, `lightning` 30,000. Packed to `elecParams`
+(4 words a material: resist | source, ignite / char ids, ignite chance) and two
+`_r2` bits (25 source, 26 conducts). **Wet:** a cell under a coat whose
+material conducts takes `min(resist, sim.elecWetResist x 15 / stain amount)`,
+so a wet plank or wet stone carries charge.
+
+**Update**, every CA-active tick after the heat rows:
+`P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay)` clamped at 0, in a
+conducting cell; an insulator holds its seed (0 unless it is a source). Max-plus
+only RAISES values toward the unique least fixpoint over its inputs, so the
+answer does not depend on thread order. `sim.elecDecay` is taken once a tick off
+every stored value. `sim.elecRounds` rounds a tick (default 4): each relaxes
+every listed chunk to its fixpoint in shared memory by AXIS SWEEPS (256
+threads, one 16-cell line each, x then y then z, forward and back, until an
+iteration raises nothing; cap 12), with a halo of the six face neighbours'
+PREVIOUS round -- a page has two halves, round r reads half `r & 1` and writes
+the other, so a round is a pure function of its inputs. The charge crosses one
+chunk face per round: 64 cells a tick at 4 (the owner's "visible fast pulse").
+A source held in place loses ~decay per `elecRounds` chunks of distance (the
+far end is rebuilt only that many chunks a tick).
+
+**Pages.** 2,048 pages (32 MiB) of 4,096 u16 cells x 2 halves; `elecMeta`
+holds the entry and owner per window slot, a want bitset, two live lists and
+the free stack. A chunk is paged by caMask's DOORBELL (a source material in a
+dirty chunk with no page sets its want bit) or by a round's FACE WANT (its
+charge can enter a conductor across the face). `elecAlloc` -- one workgroup,
+called before round 0, between rounds and at the tail -- ranks the wants by
+SLOT (prefix sum over the bitset), so exhaustion is a counted refusal
+(`last_run.json elec.refused`), never an abort and never order-dependent.
+`elecSettle` copies the last round to half 0 and frees an all-zero page.
+Readers: `elecAt(slot, local)` / `elecAtCell(c)` (MIRROR-BEGIN elec, pasted in
+`sim_step.wgsl` and held identical by check_invariants `elec`) read half 0 --
+LAST tick's settled field, stable over the whole CA.
+
+**Staying awake (rule 2 and rule 1 together).** A charged chunk is marked dirty
+(bit 31, "elec") only when a chunk of its 3x3x3 is dirty this tick -- the CPU
+page-table mirror's one-ring bound, the heat layer's rule -- and that mark is
+what keeps the CA, and with it every elec row, running while charge exists.
+The charge front outruns the dirty ring (4 chunks a tick vs 1), so a tick can
+end with charge and nothing markable; the TAIL then PURGES the whole field
+(`elecPurge`), because charge the CA does not run over would evolve for as many
+ticks as the CPU takes to prove the world settled -- a readback-timing outcome.
+In practice the source's own chunk is always dirty and the purge is the rare
+backstop (`elec.purges`, gate asserts 0). With no charge: 1 + rounds
+one-workgroup allocs reading the want bitset, zero-group indirects; a settled
+world records nothing (C_CAACTIVE).
+
+**`elec-field`** (three sealed rooms, run twice): a 160-cell copper wire
+charges its far end within the chunk-hop bound, P falls along it, the air and
+stone beside it stay 0; wet wood carries further than dry (dry <= 4 cells);
+a water pool charges >= 300 cells and never its far corner; every page is freed
+after the sparks stop and the fixture sleeps; the field hash and arrival tick
+agree across the two runs. E3's strike targeting (`StrikeMats::Resolve`) now
+reads `electric.resist <= 8` as "a conductor a bolt prefers".
+
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
 The world runs a day/night cycle, and sunlight is a real input to the CA:
@@ -4503,8 +4574,9 @@ None is tag:hot, so a bolt does not melt the iron it lands on; the fire it
 starts is its heat. Every tag:electric rule (hydrogen's pop, both
 electrolyses, thermite, ether vapour) fires off all three alike, so a shock
 into molten salt electrolyses it with no new JSON. The charge field (package
-E1) will give `arc` and `lightning` `electric.source` blocks at merge; nothing
-in the strike path changes for that -- the bolt's cells ARE the seeds.
+E1, "Electricity — charge field" in section 4) gives `arc` `electric.source`
+2,000 and `lightning` 30,000; nothing in the strike path changed for that --
+the bolt's cells ARE the seeds.
 
 **ONE strike function, three callers.** `PlanStrike` + `EmitStrike`
 (`LightningStrike` = both) turn a `StrikeSpec` into CellOps: the `lightning`
@@ -4578,8 +4650,8 @@ and `Cues::Thunder` (set `weather/thunder`, the `weather` owner in
 `sound_schema.js`; delayed by distance at 343 m/s, louder and higher close).
 Far flashes stay render-only and silent.
 
-**Not done:** the charge field (E1) -- a bolt into a pond or a copper wire does
-nothing past the cells it lays; mob shock/stun (E4); the target scan starts 24
+**Not done:** the charge field's EFFECTS (E2) -- since E1 a bolt into a pond or
+a copper wire charges it, but nothing reads the charge yet; mob shock/stun (E4); the target scan starts 24
 cells over the aim, so a tree taller than that is struck inside its canopy (the
 bolt above it is refused by the leaves, IfAir); no thunder sample is recorded
 yet (`weather/thunder` is silent until one is).

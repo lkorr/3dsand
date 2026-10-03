@@ -109,6 +109,8 @@ const EM_LIVE_PEAK : u32 = 22u;
 const EM_REKEYED : u32 = 23u;
 const EM_P_PEAK : u32 = 24u;
 const EM_ROUND_CHUNKS : u32 = 25u;
+const EM_COND_PEAK : u32 = 26u;
+const EM_ROUND_HIST : u32 = 27u;
 const EM_ARGS : u32 = 32u;
 const EM_OWNER : u32 = 32832u;
 const EM_LIST0 : u32 = 66624u;
@@ -303,6 +305,7 @@ var<workgroup> wgHalo : array<u32, 1536>;
 var<workgroup> wgChanged : atomic<u32>;
 var<workgroup> wgFaces : atomic<u32>;
 var<workgroup> wgMax : atomic<u32>;
+var<workgroup> wgCondMax : atomic<u32>;
 var<workgroup> wgGo : u32;
 var<workgroup> wgCap : u32;
 
@@ -381,6 +384,7 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgChanged, 0u);
     atomicStore(&wgFaces, 0u);
     atomicStore(&wgMax, 0u);
+    atomicStore(&wgCondMax, 0u);
     wgCap = clamp(elecParams[EP_ITER_CAP], 1u, 64u);
   }
   // THE CELLS: seed, resist, and last round's P (this tick's decay in round 0).
@@ -437,13 +441,19 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
   }
   // OUT: this round's half, and the peak.
   var lmax = 0u;
+  var cmax = 0u;
   for (var j = li; j < ELEC_HALF_WORDS; j += 256u) {
-    let lo = wgP[2u * j] & 0xFFFFu;
-    let hi = wgP[2u * j + 1u] & 0xFFFFu;
+    let c0 = wgP[2u * j];
+    let c1 = wgP[2u * j + 1u];
+    let lo = c0 & 0xFFFFu;
+    let hi = c1 & 0xFFFFu;
     elecPool[dst + j] = lo | (hi << 16u);
     lmax = max(lmax, max(lo, hi));
+    if ((c0 >> 16u) != ELEC_RES_INS) { cmax = max(cmax, lo); }
+    if ((c1 >> 16u) != ELEC_RES_INS) { cmax = max(cmax, hi); }
   }
   if (lmax != 0u) { atomicMax(&wgMax, lmax); }
+  if (cmax != 0u) { atomicMax(&wgCondMax, cmax); }
   // THE FACE WANTS: an unpaged window neighbour whose cell across a face can
   // take charge from this side (it conducts, and P here exceeds its resist).
   // Only those -- a chunk of air or stone beside a charged one is never paged.
@@ -470,7 +480,9 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
     atomicOr(&elecMeta[EM_WANT + (q >> 5u)], 1u << (q & 31u));
   }
   atomicMax(&elecMeta[EM_P_PEAK], atomicLoad(&wgMax));
+  atomicMax(&elecMeta[EM_COND_PEAK], atomicLoad(&wgCondMax));
   atomicAdd(&elecMeta[EM_ROUND_CHUNKS], 1u);
+  atomicAdd(&elecMeta[EM_ROUND_HIST + min(r, 3u)], 1u);
 }
 
 // ============================================================================

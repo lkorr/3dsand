@@ -3363,7 +3363,7 @@ _ELEC_CONSTS = {
     "EM_PAGES_PEAK": "kEmPagesPeak", "EM_REFUSED": "kEmRefused", "EM_ALLOCS": "kEmAllocs",
     "EM_FREES": "kEmFrees", "EM_PURGES": "kEmPurges", "EM_STRANDED": "kEmStranded",
     "EM_LIVE_PEAK": "kEmLivePeak", "EM_REKEYED": "kEmRekeyed", "EM_P_PEAK": "kEmPPeak",
-    "EM_ROUND_CHUNKS": "kEmRoundChunks", "EM_ARGS": "kEmArgs", "EM_ENTRY": "kEmEntry",
+    "EM_ROUND_CHUNKS": "kEmRoundChunks", "EM_COND_PEAK": "kEmCondPeak", "EM_ROUND_HIST": "kEmRoundHist", "EM_ARGS": "kEmArgs", "EM_ENTRY": "kEmEntry",
     "EM_OWNER": "kEmOwner", "EM_WANT": "kEmWant", "EM_LIST0": "kEmList0",
     "EM_LIST1": "kEmList1", "EM_STACK": "kEmStack",
     "ELEC_ARG_ROUND": "kElecArgRound", "ELEC_ARG_PURGE": "kElecArgPurge",

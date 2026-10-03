@@ -27,6 +27,7 @@
     },
     {
       "id": "wood",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -94,6 +95,7 @@
     },
     {
       "id": "water",
+      "electric": {"resist": 6},
       "thermal": {"inertia": 5, "freeze": {"below": 0, "full": -24, "chance": 4, "into": "ice", "partialInto": "snow", "surface": true}},
       "arcane": 1,
       "class": "liquid",
@@ -573,6 +575,7 @@
     },
     {
       "id": "source_water",
+      "electric": {"resist": 6},
       "class": "solid",
       "density": 3000,
       "hardness": 255,
@@ -644,6 +647,7 @@
     {
       "comment": "Blood. The `stain` block is what marks what it touches: at 300 per-mille a pool soaks into absorbent ground (dirt, grass, sand) one level per contact, paid in its own mass, up to `amount` 12 or the ground’s capacity — so a spilled flask DRINKS INTO the ground and leaves a dark patch, instead of drying away first (it decays at 8 per-mille, a ~3 s half-life, which at the old 90 / amount 5 left grass at 3-5 of 15: scattered flecks). Stone (capacity 0) still takes only the free one-level mark by design (stainStep). `consume` 3 means roughly one stained voxel in 330 is eaten away per stain event (halved when the depth went 5 -> 12, so the pitting under a pool stays where it was), so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves. The `coat` block is what blood does once it is ON A BODY rather than on the ground (`contact` 90 pins the body’s wading rate where it was before the ground chance went to 300): a level of it dries off a voxel every 20 seconds (it never comes off entirely on its own — that takes water), and a bloodied foot tracks prints on 400 per-mille of its footfalls.",
       "id": "blood",
+      "electric": {"resist": 8},
       "arcane": 3,
       "class": "liquid",
       "density": 1050,
@@ -769,6 +773,7 @@
     },
     {
       "id": "birch_wood",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -1142,6 +1147,7 @@
     },
     {
       "id": "skin",
+      "electric": {"resist": 20},
       "class": "solid",
       "density": 1010,
       "hardness": 8,
@@ -1222,6 +1228,7 @@
     },
     {
       "id": "staff_wood",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -1304,6 +1311,7 @@
     },
     {
       "id": "steel",
+      "electric": {"resist": 3},
       "arcane": 12,
       "footstep": "stone",
       "class": "solid",
@@ -1327,7 +1335,8 @@
         "#6a7a86"
       ],
       "tags": [
-        "mineral"
+        "mineral",
+        "metal"
       ],
       "molten": "lava"
     },
@@ -2833,6 +2842,7 @@
     {
       "//": "Bark ramp. Same three-tier idea on the wood side: a bole with a shaded and a lit face reads as a cylinder, where one flat brown reads as a column of paint.",
       "id": "bark_dark",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -2857,6 +2867,7 @@
     },
     {
       "id": "bark_light",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -3017,6 +3028,7 @@
     {
       "//": "ANATOMY (assets/editor/anatomy.js; DESIGN.md §7 'What is under the skin'). The human is no longer skin all the way through: a sidecar recipe paints its interior by depth -- skin, then this, then muscle, then bone -- so a cut face, a burn-through or a peeled limb in the tuner shows layers instead of more skin. Subcutaneous flesh: the pale layer one voxel under the skin. Enters the SAME burn chain as skin (reactions.json, 'flesh + tag:hot -> flesh_cooked') so a body burns through its layers on one clock; bone has no fire rules and survives by construction.",
       "id": "flesh",
+      "electric": {"resist": 20},
       "arcane": 4,
       "class": "solid",
       "density": 950,
@@ -3039,6 +3051,7 @@
     {
       "//": "The red layer under the flesh and the bulk of a limb (see `flesh`). Denser and a little harder than skin so the derived collider's mass reads as meat, not fat; the anatomy recipe speckles it with `blood` so a cross-section is not one flat red.",
       "id": "muscle",
+      "electric": {"resist": 20},
       "class": "solid",
       "density": 1060,
       "hardness": 10,
@@ -3101,6 +3114,7 @@
     {
       "//": "WROUGHT IRON: the plate set's material (scripts/gen_stock_armor.py iron_helm/cuirass/greaves/sabatons). A SECOND metal, not a tint of steel, because it carries a rule steel does not: reactions.json's `acid + iron -> air` at 10 per-mille a tick. Steel has no tag:dissolvable and no rule of its own, so acid cannot touch a sword at all and armor-react measures 0 voxels lost under a steel plate; a suit that acid eats SLOWLY (against 250 for flesh and cloth, 45 for the generic dissolvable tag) is a different fact, and here a fact is a material. Not flammable and not organic, so fire has nothing on it to catch and the burn pass never lists it -- a limb under it reads its neighbour as iron rather than as fire (mob.cpp WornAlong). Hardness under steel's 200: a blade beats it in sooner than it would a blade. Never placed by worldgen, so the nibble is free for the metal finishes below.",
       "id": "iron",
+      "electric": {"resist": 3},
       "footstep": "stone",
       "class": "solid",
       "density": 7600,
@@ -3122,7 +3136,8 @@
         "#6a7a86"
       ],
       "tags": [
-        "mineral"
+        "mineral",
+        "metal"
       ],
       "molten": "lava"
     },
@@ -3274,6 +3289,7 @@
     {
       "comment": "The dearest common matter (docs/PLAN_magic_grammar.md): the top of the arcane tariff, so making it is what kills alchemists. Never placed by worldgen; exists so the tongue has the word.",
       "id": "gold",
+      "electric": {"resist": 1},
       "arcane": 40,
       "footstep": "stone",
       "class": "solid",
@@ -3286,7 +3302,8 @@
         "#e8bd45"
       ],
       "tags": [
-        "mineral"
+        "mineral",
+        "metal"
       ]
     },
     {
@@ -3377,6 +3394,7 @@
     {
       "//": "A PUNCH LEAVES A MARK (docs/PLAN_impact_unarmed.md S6). gore.bruiseMat's default, and the material a BLUNT hit rewrites skin to -- the third thing a wound can turn flesh into, beside blood and rot. Skin's own hardness and density, because it IS skin: only the colour has changed, so it burns on the same clock through the same authored chain and crumbles to the same blood. The `tints` list is the one real difference and it is the whole feature: a bruise is not one colour but an AGE -- fresh red-purple, then deep purple, then the green and yellow of one a few days old -- and the art-colour quantization picks the nearest entry to whatever complexion the voxel was painted, so a green-fleshed mob bruises greenish rather than snapping to human purple (the same rule skin / flesh_cooked follow, in the same order). It reverts to the skin it covered as the wound closes (gore.woundHealSlow, MobLimb::woundWas). Far-aliased to `skin`: a bruise is not visible at cascade distance.",
       "id": "skin_bruised",
+      "electric": {"resist": 20},
       "class": "solid",
       "density": 1010,
       "hardness": 8,
@@ -3532,6 +3550,7 @@
     {
       "//": "Salt above 801 C. Real molten NaCl is ~1.55 g/cm3 and glows orange-white; electrolysed (tag:electric) it splits into sodium and chlorine -- the Downs cell, the one real way sodium is made.",
       "id": "molten_salt",
+      "electric": {"resist": 4},
       "thermal": {"emit": 200, "inertia": 4},
       "class": "liquid",
       "density": 1550,
@@ -3615,6 +3634,7 @@
     {
       "//": "Lye (sodium hydroxide in water): what is left in the water after sodium burns in it. Caustic, slippery, clear with a faint blue.",
       "id": "lye",
+      "electric": {"resist": 5},
       "class": "liquid",
       "density": 1100,
       "hardness": 4,
@@ -3730,6 +3750,7 @@
     {
       "//": "An electric discharge: a transient, brilliant gas that lives a tick or two (reactions.json decay). The bench's electrify button makes it at a vessel's contents; a lightning spell can make it in the world. tag:electric is what electrolysis rules match.",
       "id": "spark",
+      "electric": {"source": 200},
       "class": "gas",
       "density": 1,
       "emission": 255,
@@ -3944,6 +3965,7 @@
     {
       "//": "REAL. Aluminium powder: silver-white and light. The fuel half of thermite; and acid on it gives off HYDROGEN (real: 2Al + 6HCl -> 2AlCl3 + 3H2), which then goes off beside a flame. Bulk density of a fine powder (~1.1), not the metal's 2.7.",
       "id": "aluminium",
+      "electric": {"resist": 2},
       "arcane": 6,
       "class": "powder",
       "repose": 34,
@@ -3978,6 +4000,7 @@
     {
       "//": "REAL. Molten iron, what thermite leaves: white-orange, dense (7,000), hot. It burns what it touches like lava, sets glass from sand, QUENCHES to iron in water, and cuts through iron and steel plate by handing its heat on -- it freezes to iron as it melts the next cell, one-for-one, so the cut is bounded by the melt that made it (rule 2). Cools to iron from its skin inward when the heat is gone (the same inverted hot ramp molten salt uses).",
       "id": "molten_iron",
+      "electric": {"resist": 3},
       "thermal": {"emit": 230, "inertia": 4},
       "class": "liquid",
       "density": 7000,
@@ -3998,6 +4021,7 @@
     {
       "//": "REAL. Copper filings. Acid turns it into blue vitriol (copper sulfate); aqua fortis dissolves it in a brown-green fume. The warm metal colour is linear light (it looks darker in a picker).",
       "id": "copper",
+      "electric": {"resist": 3},
       "arcane": 8,
       "class": "powder",
       "repose": 34,
@@ -4033,6 +4057,7 @@
     {
       "//": "REAL. Quicksilver (mercury). A liquid metal at 13,540 kg/m3 -- In life everything but gold floats on it, lead included. Here gold_dust floats on it too: it is a loose powder at 9,000, and a powder only sinks into a liquid less dense than itself (canDisplace). Flows freely (moveEvery 1). With sulfur it makes cinnabar; heated it gives off a poisonous vapour (noxious_gas).",
       "id": "quicksilver",
+      "electric": {"resist": 2},
       "arcane": 20,
       "class": "liquid",
       "density": 13540,
@@ -4290,6 +4315,7 @@
     {
       "//": "REAL metal, LORE use. Silver dust: Luna, the moon's metal. Steeped in water under the NIGHT SKY it gives up its virtue into it -- moonwater (reactions.json: needsSky + when night). By day, or under a roof, the dust simply dissolves away for nothing (it is spent at 3 per-mille either way, so a pinch makes a handful of moonwater and is gone). Aqua fortis dissolves it.",
       "id": "silver",
+      "electric": {"resist": 1},
       "arcane": 20,
       "class": "powder",
       "repose": 34,
@@ -4326,6 +4352,7 @@
     {
       "//": "REAL metal, LORE use. Gold dust: Sol, the sun's metal. Steeped in water under a HIGH SUN (needsSky, day, minLight 160) it makes sunwater; spent at 3 per-mille like silver. What the philosopher's stone makes of lead. Dissolves in aqua regia (and only there) as the `aurum` solute.",
       "id": "gold_dust",
+      "electric": {"resist": 3},
       "arcane": 40,
       "class": "powder",
       "repose": 32,
@@ -4380,6 +4407,7 @@
     {
       "//": "REAL. Lead filings: Saturn's metal, the base one. Dense (11,340 -- it sinks in water and FLOATS ON QUICKSILVER, as real lead does). Aqua fortis dissolves it; the philosopher's stone turns it to gold.",
       "id": "lead",
+      "electric": {"resist": 4},
       "arcane": 10,
       "class": "powder",
       "repose": 32,
@@ -4524,6 +4552,7 @@
     {
       "//": "BUILDING MATERIALS (PLAN_world_editor P2, assets/editor/housegen.js). Nine static solids a rural-medieval house is made of, each a MATERIAL rather than a paint colour because each behaves differently: the timbers burn, the stone and daub do not, the thatch goes up fast, a door leaf has to read as a door. Every one carries a `far` alias because the far-field palette was already full (128 slots owned). The flammable ones reuse the existing burn chain by PRODUCT (wood-kind ignites to `ember`, straw-kind to `leaf_burning`): reactions.json has one ignition rule per material, the only shape the compiler accepts (`self` is a material name, never a tag). PLANK: sawn boards, a weathered mid-brown lighter than `wood` so floors and weatherboards read as worked timber rather than a trunk.",
       "id": "plank",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "sounds": {
@@ -4549,6 +4578,7 @@
     {
       "//": "TIMBER: the dark oak of a box frame -- posts, rails, braces, lintels, tie beams. Darker than plank so the frame reads against daub at any distance; slower to catch than boards (heavy section), same burn chain.",
       "id": "timber",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "sounds": {
@@ -4675,6 +4705,7 @@
     {
       "//": "DOOR_WOOD: the leaf of a door, and ONLY that. A distinct material so a closed door reads as a door (redder and warmer than the frame around it), and so the door system can tell its own leaf cells from the wall they hang in: a door whose leaf box is no longer all door_wood has been burned or broken and stops being a door (PLAN_world_editor 2.4). Burns like plank.",
       "id": "door_wood",
+      "electric": {"resist": 60},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -4862,6 +4893,7 @@
     {
       "//": "THE ROBOT RACES (assets/editor/automaton.js, assets/editor/android.js; DESIGN.md 'Robots are matter'). Ten rows, appended (ids > 127), so a mob .vox paints each solid as a STAND-IN and the sidecar's anatomy.becomes rewrites it at load, exactly as the snake's venom gland. What a robot DOES is these rows and nothing else: `shell` (a blow carves this matter the way it carves a worn plate -- gear.cutHardnessRef over its hardness, game/shellresponse.h -- so plating takes a chip where flesh takes a gash), `bleedFluid` (what a wound in it leaks), `struck` (what a blow knocks out of it: a ball of that matter laid in the air at the hit), `burst` (what it lets go when a wound breaches it or its body dies). No row here is flammable, organic or dissolvable, so fire, acid, rot and venom have nothing to take hold of; every rotRate is 0. BRASS: the automaton's plating. Hardness 70 (a sword takes a ninth of a kerf; cut through, it costs nine times skin to part), it leaks a little oil where it is holed and throws the odd spark when an edge rings off it.",
       "id": "brass",
+      "electric": {"resist": 3},
       "footstep": "stone",
       "class": "solid",
       "density": 8500,
@@ -4878,7 +4910,9 @@
         "#9c7726",
         "#c99d3a"
       ],
-      "tags": [],
+      "tags": [
+        "metal"
+      ],
       "molten": "lava"
     },
     {
@@ -5063,6 +5097,7 @@
     {
       "//": "COOLANT: what an android USED to bleed -- since 2026-10-03 (owner: 'sparks only, no fluid') nothing bleeds it and no android material crumbles to it; it stays a material for the brush, the bench and the coolant drying rule. A thin (moveEvery 1), faintly glowing cyan liquid -- the glow is how you know it is not water. Wet and an extinguisher: an android bleeding on a fire helps put it out, where an automaton's oil feeds it. Dries away like blood (reactions.json) so a spill goes back to sleep (rule 2). Coats a body as its own bodyOnly stain, a cyan sheen.",
       "id": "coolant",
+      "electric": {"resist": 8},
       "arcane": 3,
       "class": "liquid",
       "density": 1070,
@@ -5086,6 +5121,7 @@
     {
       "//": "ELECTRICITY E3 (docs/PLAN_electricity.md section 3). ARC: the short blue-white crackle a shock leaves -- the `shock` glyph's burst and the splash round a lightning strike's foot (game/strike.h). A transient gas that lives about a tick (reactions.json decay 700 per-mille): tag:electric, so every electric rule (hydrogen's pop, electrolysis, thermite, ether vapour) fires off it exactly as off a spark, and it lights what burns beside it more readily than a spark does (reactions.json arc + flammable). Appended at the END of the table on purpose: an id is the index, and inserting beside `spark` would renumber every later material. The charge-field `electric` block (resist / source) is package E1's and is added at merge.",
       "id": "arc",
+      "electric": {"source": 2000},
       "class": "gas",
       "density": 1,
       "emission": 240,
@@ -5102,6 +5138,7 @@
     {
       "//": "ELECTRICITY E3. LIGHTNING: the bolt itself -- the jagged column the `lightning` glyph and a storm's ground strike lay from the sky down to the struck top (game/strike.h LightningStrike). The brightest thing in the world and the shortest-lived: decays in one or two ticks (reactions.json 550 per-mille). tag:electric like spark and arc; IGNITES through its own pair rule with tag:flammable at a high chance (reactions.json), not through tag:hot, so it does not melt or boil what it merely passes -- it is a discharge, and the heat it leaves is the fire it starts.",
       "id": "lightning",
+      "electric": {"source": 30000},
       "class": "gas",
       "density": 1,
       "emission": 255,
@@ -5113,6 +5150,24 @@
       ],
       "tags": [
         "electric"
+      ]
+    },
+    {
+      "//": "ELECTRICITY E1. DRAWN COPPER: wire, bar, sheet -- the solid form of `copper` (which is FILINGS, a powder, and would slump). The best conductor in the world (electric.resist 1: a spark's 200 runs ~200 cells of it) and what the elec-field gate's wire is made of. Hard enough to stand as a rod; broken, it falls to filings.",
+      "id": "copper_bar",
+      "electric": {"resist": 1},
+      "footstep": "stone",
+      "class": "solid",
+      "density": 8960,
+      "hardness": 60,
+      "rubble": "copper",
+      "colors": [
+        "#b8653a",
+        "#a0552e",
+        "#cc7646"
+      ],
+      "tags": [
+        "metal"
       ]
     }
   ]

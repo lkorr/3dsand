@@ -11,12 +11,11 @@
 
 namespace {
 
-// The metals a strike prefers even where materials.json has not (yet) tagged
-// them `metal` -- iron, steel, gold and brass are solids tagged `mineral`
-// today, and the tag fix is the charge field's (package E1). By NAME, resolved
-// at load, so a renamed or missing one simply does not count.
-const char* const kNamedConductors[] = {"iron", "steel", "gold", "brass", "copper",
-                                        "silver", "molten_iron", "quicksilver"};
+// A strike prefers a GOOD conductor: materials.json `electric.resist` at or
+// under this (the charge field's own number, src/sim/elec.h -- metals 1..4,
+// water 6, blood / coolant 8). Wood (60) and flesh (20) carry charge but are
+// not what a bolt seeks out.
+constexpr uint32_t kStrikeConductMaxResist = 8;
 
 // -1, 0 or +1 from two bits of a hash: 1/4 each way, 1/2 none.
 int Kick(uint32_t h) {
@@ -75,10 +74,7 @@ void StrikeMats::Resolve(const std::vector<MaterialDef>& mats) {
     if (m.name == "lightning") lightning = (uint32_t)i;
     if (m.name == "arc") arc = (uint32_t)i;
     if (i == 0 || m.gpu.klass == CLASS_GAS) passable[i] = 1;
-    for (const std::string& t : m.tags)
-      if (t == "metal" || t == "conductive") conductive[i] = 1;
-    for (const char* n : kNamedConductors)
-      if (m.name == n) conductive[i] = 1;
+    if (m.elec.resist != 0 && m.elec.resist <= kStrikeConductMaxResist) conductive[i] = 1;
   }
   resolvedFor = mats.size();
 }

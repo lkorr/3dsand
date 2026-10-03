@@ -70,6 +70,8 @@ const std::vector<Gate>& AlchemyGates();
 const std::vector<Gate>& ChemGates();
 // Electricity E3 (docs/PLAN_electricity.md section 3): the strike path.
 const std::vector<Gate>& ElecStrikeGates();
+// Electricity E1 (docs/PLAN_electricity.md section 1): the charge field.
+const std::vector<Gate>& ElecGates();
 const std::vector<Gate>& GrimoireGates();
 // The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
 // edit ops. CPU-only over glyphs.json and the generated oracle.
@@ -944,6 +946,10 @@ const char* const kOrder[] = {
     // Electricity E3: a forced weather strike on a rod-and-collar fixture,
     // run twice; same fixture discipline (own pad, regenerates on the way out).
     "elec-strike",
+    // Electricity E1: the charge field in three sealed rooms (a copper wire,
+    // a dry and a wet wood strip, a water pool), run twice; own worldgen,
+    // regenerates on the way out.
+    "elec-field",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -1170,7 +1176,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
@@ -1409,6 +1415,17 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"freezes\": " << hs.freezes << ", \"srcPeak\": " << hs.srcPeak
       << ", \"recomputePeak\": " << hs.recompPeak << ", \"relaxPeak\": " << hs.relaxPeak
       << "},\n";
+  }
+  // ---- THE CHARGE FIELD (docs/PLAN_electricity.md) --------------------------
+  // Peaks and totals across every gate that handed ElecNoteRun a header: the
+  // pool high-water mark is what kElecPoolPages is sized against; a refusal
+  // is a chunk the charge could not enter; a purge a field nothing kept awake.
+  {
+    const ElecRunStats& es = ElecRunTotals();
+    f << "  \"elec\": {\"runs\": " << es.runs << ", \"pagesPeak\": " << es.pagesPeak
+      << ", \"pool\": " << kElecPoolPages << ", \"refused\": " << es.refused
+      << ", \"purges\": " << es.purges << ", \"stranded\": " << es.stranded
+      << ", \"livePeak\": " << es.livePeak << ", \"pPeak\": " << es.pPeak << "},\n";
   }
   {
     const sandvox::opstream::StreamCounts& oc = sandvox::opstream::Counts();

@@ -14,7 +14,7 @@
 //      (SpellProbe: World::Snap(), one tick latent, fixed latency) to its
 //      first non-gas cell -- its TOP. The bolt takes the column whose top
 //      scores highest: top y, plus `conductBonus` cells if the top conducts
-//      (StrikeMats::conductive: tag `metal` / `conductive`, or a named metal),
+//      (StrikeMats::conductive: materials.json `electric.resist` 1..8),
 //      ties to the nearer column, then to a hash. So a strike PREFERS a tall
 //      thing and an iron rod over the ground beside it -- the lightning-rod
 //      behaviour -- and never searches past what the mirror knows. A column
