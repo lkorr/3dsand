@@ -720,6 +720,18 @@ Ranked, for whoever picks this up:
    identified: `noshadow` went from -2.29 ms to -0.42 ms, i.e. the fragment
    shader has essentially stopped caring about shadows at all.
 
+   **The Morton sort was NOT built, and the measurement is why (2026-10-03,
+   raymarch-shadow-water).** By the time it was picked up, staggered refresh
+   (each valid patch re-cast once every 4 frames) and the nearest-patch read
+   below 4 px had cut the overlook's list to ~90k requests and the rays to a
+   quarter of that. `--render-budget`, one process, the resolve's ray zeroed
+   against the shipped pass, `pre` span: noon 0.09 ms, seam 0.05, meadow 0.09
+   — the WHOLE ray cost of the pass, coherent or not, against three extra
+   dispatches for the sort. The shadow cost that is left is the FAR cascade's
+   march in the fragment shader (0.6 ms noon, ~1 ms cascade before the in-chunk
+   row skip, `farShadowMarch`); see the note at the head of
+   `shadow_resolve.wgsl`.
+
 1. ~~**Part A (renderer).** A2's sub-chunk occupancy bitmask and A6's column-probe
    hoist, against a ~9-10 ms offscreen budget.~~ **PART A IS CLOSED — see Correction 6.**
    The offscreen budget is ~6 ms, not 9-10; the entire in-window fine primary march is
