@@ -2012,6 +2012,11 @@ void Overlay::DrawDevView(UIState& s) {
     ImGui::Checkbox("active voxels", &s.showDirtyVoxels);
     ImGui::SetItemTooltip("Red wireframe on every voxel the CA wrote this tick.\n"
                           "Combine with F6 (dirty chunks) to see cause and effect.");
+    ImGui::Checkbox("charge view (F11)", &s.showChargeView);
+    ImGui::SetItemTooltip("The charge field's P in false colour, log scale:\n"
+                          "blue = a few units, yellow = a spark (200),\n"
+                          "red = an arc (2,000), white = lightning (30,000).\n"
+                          "Uncharged surfaces are dim grey. Render-only.");
     static constexpr const char* kFieldVizTip =
         "An arrow per lattice point around you, coloured by speed.\n"
         "WIND samples the same windAt() the grass sway does (full scale 24 m/s).\n"
