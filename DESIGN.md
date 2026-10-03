@@ -1308,6 +1308,12 @@ SSBO lists of chunk indices.
     streamed plane (FAIL); with this change **120 / 106, 1 departed grain (the
     treeline snow one), travel 0.0 / 0.0** — below the 45-degree baseline's
     160 / 132, which is now 105 pond-bed stain chunks and nothing else.
+    Register budget (`--shader-stats`, RTX 3060 Ti, against the same exe on
+    the pre-change shaders): every worldgen entry keeps its register count
+    and spill bytes exactly (worldgen/worldgenList 128 + 800 B, worldgenCols
+    168 + 416 B, far* unchanged); `worldgenCols`' binary grows 1.65 -> 1.83
+    MB because each `colHeightAt` is inlined, which is why `looseStep` has one
+    call site for cover and bed and its far probes are one loop.
     The `worldmap` gate's skin probe (`selftest_biomes.cpp`) now counts the
     biome's own `cover.firmSkin` as its skin: its desert sample at (144,426)
     is on ground steeper than 34° and is generated sandstone, which is the

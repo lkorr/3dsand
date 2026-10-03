@@ -4016,8 +4016,9 @@ fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
         default: { dz = -1; g1 = d; }
       }
       if (g1 >= top) { continue; }
-      if (colHeightAt(x + 2 * dx, z + 2 * dz, seed) < top - 1) { slides = true; }
-      if (run >= 3 && colHeightAt(x + 3 * dx, z + 3 * dz, seed) < top - 1) { slides = true; }
+      for (var k = 2; k <= run; k++) {
+        if (colHeightAt(x + k * dx, z + k * dz, seed) < top - 1) { slides = true; }
+      }
     }
     if (slides) { top = top - 1; }
   }
@@ -5528,11 +5529,14 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     // anything the prologue computes.
     let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
     var topMass = 8;
+    // ONE looseStep call site for both users (the cover and the bed): every
+    // colHeightAt it makes is inlined, so a second site doubled this entry's
+    // binary for nothing.
+    var lsMat = MAT_AIR;
+    var lsFine = true;
     if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
         looseCoverDepth(&col, coverDepth, looseCoverMat(col.biome)) > 0) {
-      let ls = looseStep(&col, x, z, T.seed, looseCoverMat(col.biome), true);
-      col.looseTop = ls.x;
-      topMass = ls.y;
+      lsMat = looseCoverMat(col.biome);
     } else if (col.pond >= 0 && !col.bedSolid && !col.inPoolFloor && yLo <= col.h &&
                yHi + 1 > col.h - wmWaterI(col.wp, WM_W_BED_THICKNESS)) {
       // THE SAME LINE FOR A FLOWY POND BED (pondBedMat). Under water a 2:1
@@ -5545,8 +5549,14 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
       // never written partial (genChunk writes grains only under AIR).
       let bm = pondBedMat(&col);
       if (materials[bm].klass == CLASS_POWDER && reposeRunOf(bm) >= 2) {
-        col.looseTop = looseStep(&col, x, z, T.seed, bm, false).x;
+        lsMat = bm;
+        lsFine = false;
       }
+    }
+    if (lsMat != MAT_AIR) {
+      let ls = looseStep(&col, x, z, T.seed, lsMat, lsFine);
+      col.looseTop = ls.x;
+      if (lsFine) { topMass = ls.y; }
     }
     // THE TOP CELL'S GRAINS are written only under generated AIR (genChunk),
     // so the chunk holding the ground cell h also asks genCellIn about
