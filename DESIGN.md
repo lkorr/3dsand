@@ -2408,7 +2408,9 @@ reaction system.
   unchanged. Where the 2×2×2 footprint lies inside the box, the four x-pairs
   come from one `u32` each (d.x even) or two (odd) instead of eight
   bounds-tested loads. Together vs the old sampler: fire 10.90 → 10.15 ms,
-  village 6.44 → 6.25; the row costs ~0.02 ms. 2³ and 1³ bricks were measured
+  village 6.44 → 6.25; re-measured on main 4d5d5ea (GI as a compute pass):
+  smoke 10.03 → 9.59, fire 10.19 → 9.48, village 6.12 → 5.93 (in-process,
+  base2 drift ≤ 0.04). The row costs ~0.02 ms. 2³ and 1³ bricks were measured
   and skip none of the samples that still cost anything (those hold smoke);
   1³ costs ~0.15 ms more to build. After it, the band, the outside segment and
   the erosion noise each price at ≤ 0.25 ms on those cameras.
