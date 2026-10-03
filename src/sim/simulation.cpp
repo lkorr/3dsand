@@ -2077,8 +2077,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGasMask) {
-      !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGiGather) {
+      !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGiGather ||
+      !mGasMask) {
     if (err) *err = "shader file read failure";
     return false;
   }
