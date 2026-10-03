@@ -252,6 +252,10 @@ sample): 19.14 -> 13.04 ms, `godshadow0`'s saving ~0 (the row itself costs ~0.05
 ms). Submerged baseline 13.0 ms < 25, god-ray occlusion < 3 ms. What remains of
 `nogodray` (~2.7 ms) is the 14-sample march itself; the rest of the frame is the
 primary march through the water (67 media cells/px, trace()'s territory).
+**Then (2026-10-03, raymarch-core, 8eba8ab):** trace() crosses a run of identical
+full clear-liquid cells in a tight loop (one voxel load and a DDA step each, same
+media arithmetic): submerged 13.29 -> 8.82 ms, lake 11.78 -> 10.67, picture
+bit-identical at the >= 16/255 threshold.
 
 ### W2-C · Waterfall mist (13.3.1) — WGSL + a shot fixture, no hash
 
