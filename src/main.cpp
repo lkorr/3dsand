@@ -6313,13 +6313,41 @@ int main(int argc, char** argv) {
   };
 
   GLFWwindow* window = nullptr;
+  // SANDVOX_UI_SIZE=WxH: the window's size at creation (default 1600x900). It
+  // exists so the --shot-* UI harnesses can photograph the screens at the shape
+  // of a player's monitor -- 1024x1024, 1280x1024, a 21:9 strip -- without a
+  // human dragging a window edge (ui::Layout in ui/theme.h is what reflows for
+  // them). The window is undecorated when it is set, so the client area is the
+  // number asked for and not the number minus a title bar; the OS may still
+  // refuse a window taller than the desktop, so the size actually granted is
+  // printed and is what the pictures are taken at.
+  int winReqW = 1600, winReqH = 900;
+  bool winSizeOverride = false;
+  if (const char* us = std::getenv("SANDVOX_UI_SIZE")) {
+    int w = 0, h = 0;
+    if (std::sscanf(us, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240) {
+      winReqW = w;
+      winReqH = h;
+      winSizeOverride = true;
+    } else {
+      std::fprintf(stderr, "SANDVOX_UI_SIZE=\"%s\" ignored (want WxH, e.g. 1024x1024)\n", us);
+    }
+  }
   if (!selftest && !shot && !shotWaterfall && !shotDebrisPond && !measure && !perf &&
       !fluidBench && !shaderStats &&
       shotMob.empty() && voxdumpArgs.empty() && !voxserve && exportEdits.empty()) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
+    if (winSizeOverride) glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+    window = glfwCreateWindow(winReqW, winReqH, "sandvox", nullptr, nullptr);
     if (!window) return 1;
+    if (winSizeOverride) {
+      glfwSetWindowPos(window, 0, 0);
+      int gw = 0, gh = 0;
+      glfwGetFramebufferSize(window, &gw, &gh);
+      std::printf("SANDVOX_UI_SIZE: asked %dx%d, window framebuffer %dx%d\n", winReqW,
+                  winReqH, gw, gh);
+    }
   }
   StartupMark("assets loaded (materials, micro, trees), window created");
 
@@ -6334,7 +6362,10 @@ int main(int argc, char** argv) {
   GpuContext ctx;
   // Timestamps: --measure and --fluid-bench are the only modes that request
   // the TimestampQuery device feature (per-pass GPU timings).
-  if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
+  int initW = winReqW, initH = winReqH;
+  if (window && winSizeOverride) glfwGetFramebufferSize(window, &initW, &initH);
+  if (initW <= 0 || initH <= 0) initW = winReqW, initH = winReqH;
+  if (!ctx.Init(window, (uint32_t)initW, (uint32_t)initH, lowPowerAdapter,
                 /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
                     budgetArms || telemetryEnabled || g_harnessFrames > 0 ||
                     std::getenv("SANDVOX_TICKET_COST") != nullptr,

@@ -804,6 +804,18 @@ void Tip(const char* text) {
   EndTip();
 }
 
+void KeepWindowOnScreen(float margin) {
+  const ImVec2 d = ImGui::GetIO().DisplaySize;
+  if (d.x <= 0.0f || d.y <= 0.0f) return;
+  const ImVec2 p = ImGui::GetWindowPos(), z = ImGui::GetWindowSize();
+  const ImVec2 nz(std::min(z.x, std::max(64.0f, d.x - 2.0f * margin)),
+                  std::min(z.y, std::max(64.0f, d.y - 2.0f * margin)));
+  if (nz.x != z.x || nz.y != z.y) ImGui::SetWindowSize(nz);
+  const ImVec2 np(std::floor(std::max(margin, std::min(p.x, d.x - margin - nz.x))),
+                  std::floor(std::max(margin, std::min(p.y, d.y - margin - nz.y))));
+  if (np.x != p.x || np.y != p.y) ImGui::SetWindowPos(np);
+}
+
 // THE CALLIGRAPHIC STROKE (PLAN_spell_graph §4). Twelve segments of a cubic,
 // each drawn as its own un-antialiased line at a width quantised to a whole
 // 2 px step. The quantisation is the whole trick: a smoothly tapering spline

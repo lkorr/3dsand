@@ -2104,6 +2104,15 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
 // reason (a thing put on a corpse would have no body in the world).
 // ---- THE ALCHEMY BENCH -------------------------------------------------------
 constexpr float kBenchColW = 340.0f;   // the bench panel's left column
+// ...narrowed (down to 300) when the panel is too narrow to give the table
+// two vessels at 2x beside it (AlchemyBench::kMinW = 300 grid px, so 600
+// screen px): on a 1024 px wide monitor the full 340 left the table 576 px
+// and the bench drew at 1x. The column's text is FitText'd and tooltipped,
+// so 40 px narrower costs a few characters on the longest vessel rows only.
+// The ONE rule for both the panel and the table sizing in DrawInventoryScreen.
+float BenchColW(float panelW) {
+  return std::clamp(panelW - 2 * (kFrame + kPad) - kColGap - 600.0f, 300.0f, kBenchColW);
+}
 //
 // The spellbook's column while a vessel is open on the bench: tools and
 // readouts down the left, the bench's picture (game/alchemy_bench.h, drawn by
@@ -2189,7 +2198,7 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
 
   // ---- the left column: tools, the vessel in hand, every vessel you carry --
   const float colX = wp.x + kFrame + kPad;
-  const float colW = kBenchColW;
+  const float colW = BenchColW(ws.x);
   const float colBottom = wp.y + ws.y - kFrame - kPad;
   {
     const float bw = (colW - 8) * 0.5f;
@@ -3530,17 +3539,64 @@ void DrawInventoryScreen(UIState& s) {
   // which are worth reading before you have chosen anything, and a panel that
   // changed width on every limb click would shove the arsenal and the pack
   // sideways twice a second.
-  const bool showDetail = s.inspectMode;
   const float leftBase = kPad * 2 + kSlot * 2 + kSlotGap * 2 + kPortraitW + 8;
+  // ---- FITTING THE MONITOR (2026-10-03) --------------------------------------
+  // Everything below was laid out for 16:9 and 1600 px across. On an almost
+  // square monitor (1024x1024, 1280x1024, 1200x1200) the side-by-side columns
+  // do not fit, and squeezing them is worse than any reflow: the bound keys
+  // are a fixed row of ten, the pack a fixed grid of eight, the portrait a
+  // 1:1 image. So the screen REFLOWS at breakpoints measured from those fixed
+  // things - every one a sum of the same constants the panels draw with - and
+  // nothing is ever scaled (the chrome and the pixel font stay at their pixel
+  // sizes). A wide window meets none of the breakpoints and is laid out
+  // exactly as before.
+  //
+  //   right column minimum  = the bound row / the pack's hand strip (508 px)
+  //   edge 28 -> 12         when character + that minimum do not fit at 28
+  //   HEALTH beside -> over when character + health + that minimum do not
+  //                         fit: the column takes the right-hand column's
+  //                         place (the book / pack / loot step aside for it)
+  //                         instead of widening the character panel off the
+  //                         screen
+  //   OPEN BOOK full width  when the room beside the character panel cannot
+  //                         hold the page AND the EVERY WORD column (784 px):
+  //                         the book covers the desk, character panel too,
+  //                         rather than fold away the drag source
+  //   BENCH / STAGE full    when that room cannot hold the bench's tool
+  //                         column and a two-vessel table at 2x (1024 px)
+  const float kRightMin = kPad * 2 + (kKeyCols - 1) * kCell + kSlot;
+  const float kBookOpenMin = kPad * 2 + ((kKeyCols - 1) * kCell + kSlot) + 20.0f +
+                             (kGutter + 4.0f * kCell - (kCell - kSlot));
+  const float kBenchMin = 1024.0f;
+  const float leftX =
+      disp.x >= 28.0f + leftBase + kColGap + kRightMin + 28.0f ? 28.0f : 12.0f;
+  const float edgeR = leftX;  // the right margin matches the left
+  const float room0 = disp.x - edgeR - (leftX + leftBase + kColGap);
+  const bool healthFits =
+      leftX + leftBase + kDetailW + kColGap * 2 + kRightMin + edgeR <= disp.x;
+  // THE WHOLE COLUMN, for as long as the health view is on — not only once a
+  // limb is picked. The column leads with the body's pools and its triage,
+  // which are worth reading before you have chosen anything, and a panel that
+  // changed width on every limb click would shove the arsenal and the pack
+  // sideways twice a second.
+  const bool showDetail = s.inspectMode && healthFits;
+  // A corpse being looted keeps the right-hand column on a narrow screen: the
+  // loot is the reason the screen is open.
+  const bool benchUp = s.alchemy.open || (s.itemStage.open && !s.alchemy.open);
+  const bool healthOver = s.inspectMode && !healthFits && !s.lootOpen && !benchUp;
+  const bool fullWide =
+      !healthOver && ((s.spellbookOpen && !benchUp && room0 < kBookOpenMin) ||
+                      (benchUp && room0 < kBenchMin));
   const float leftW = leftBase + (showDetail ? kDetailW + kColGap : 0.0f);
   const float top = 28.0f;
   // Room under the panels for the footer hint's tab.
   const float bottom = std::max(top + 200.0f, disp.y - 46.0f);
-  const float leftX = 28.0f;
   // The arsenal is exactly as wide as its table: a gutter of sort labels and
   // nine cells. Ten bound keys at the same pitch fit inside that too.
   const float arsenalW = kPad * 2 + kGutter + (kTableCols - 1) * kCell + kSlot;
-  const float midX = leftX + leftW + kColGap;
+  // The right-hand column starts here, or at the left edge when it takes the
+  // whole desk (the character panel is then not drawn).
+  const float midX = fullWide ? leftX : leftX + leftW + kColGap;
   // THE SPELLBOOK IS ONE WINDOW (2026-09-21). The grimoire and the arsenal were
   // two panels in two columns, which meant the composer — the screen's only
   // authoring surface — got a 508 px column of which the page list took 160,
@@ -3550,7 +3606,7 @@ void DrawInventoryScreen(UIState& s) {
   // full width of the panel), the bindings and every word you know under it.
   // The tree went from ~300 px wide to ~850 and stopped scrolling sideways.
   const float bookX = midX;
-  const float bookRoom = disp.x - 28.0f - bookX;
+  const float bookRoom = disp.x - edgeR - bookX;
   // Ten cells of page + the arsenal's nine-cell table and its gutter, when the
   // window has it; whatever is there otherwise, down to the table's own width.
   // There is no narrow/wide FORK any more — one panel that is as wide as it can
@@ -3565,7 +3621,7 @@ void DrawInventoryScreen(UIState& s) {
   // width the drawing spends on being half the size it could be.
   const float bookW = s.spellbookOpen
                           ? std::max(360.0f, bookRoom)
-                          : std::max(360.0f, std::min(bookRoom, bookIdeal));
+                          : std::max(std::min(360.0f, bookRoom), std::min(bookRoom, bookIdeal));
   // The pack is exactly as tall as its grid and its hotbar; whatever column
   // it shares gives it that and keeps the rest.
   const float lineH = ImGui::GetTextLineHeight();
@@ -3639,7 +3695,7 @@ void DrawInventoryScreen(UIState& s) {
   const bool bench = s.alchemy.open;
   // ...and so does the ITEM STAGE (ui/item_stage.h), the bench's sibling.
   const bool stage = s.itemStage.open && !bench;
-  const bool packShown = !s.spellbookOpen && !bench && !stage;
+  const bool packShown = !s.spellbookOpen && !bench && !stage && !healthOver;
   // The bench's room, measured whether or not it is open: the table is sized
   // from it at the moment a vessel first goes on, which is before the bench
   // panel has ever been drawn. Must match AlchemyPanel's own layout. Measured
@@ -3647,10 +3703,10 @@ void DrawInventoryScreen(UIState& s) {
   // double-clicked while the column was open used to get a table sized to
   // the narrower room.
   {
-    const float benchX = leftX + leftBase + kColGap;
-    const float panelW = std::max(360.0f, disp.x - 28.0f - benchX);
+    const float benchX = room0 < kBenchMin ? leftX : leftX + leftBase + kColGap;
+    const float panelW = std::max(360.0f, disp.x - edgeR - benchX);
     const float panelH = bottom - top;
-    s.alchemy.areaW = std::max(0.0f, panelW - 2 * (kFrame + kPad) - kBenchColW - kColGap);
+    s.alchemy.areaW = std::max(0.0f, panelW - 2 * (kFrame + kPad) - BenchColW(panelW) - kColGap);
     s.alchemy.areaH = std::max(0.0f, panelH - (kFrame + ui::kHeaderH + 14) - (kFrame + kPad));
     // The picture's bottom edge, from the top of the screen: all the room a
     // lifted flask has, since the panel draws the sim's headroom ABOVE its
@@ -3702,6 +3758,7 @@ void DrawInventoryScreen(UIState& s) {
   // ==========================================================================
   // LEFT: the character panel
   // ==========================================================================
+  if (!fullWide) {
   ImGui::SetNextWindowPos(ImVec2(leftX, top));
   ImGui::SetNextWindowSize(ImVec2(leftW, bottom - top));
   ImGui::Begin("##character", nullptr, kPanelFlags);
@@ -3818,12 +3875,17 @@ void DrawInventoryScreen(UIState& s) {
       ItemSlot(s, id, ImVec2(sx, sy), SlotOr(s.equipSlots, idx),
                KitRef{KitSpace::Equip, idx}, d.icon.c_str(), d.acceptsAnything,
                d.why.c_str(), false, &d.accepts);
+      // "R hand" is six small-face characters (42 px) and fits over the 44 px
+      // slot; the key it answers to is a badge in the slot's corner, the way
+      // the hotbar marks its number row. (It was "R hand  (E)", 77 px centred
+      // on a 44 px slot: the left one ran off the panel's edge.)
       ImGui::PushFont(ui::FontSmall());
-      const char* tag = side ? "L hand  (Q)" : "R hand  (E)";
+      const char* tag = side ? "L hand" : "R hand";
       const ImVec2 ts = ImGui::CalcTextSize(tag);
       ui::ShadowText(dl, ImVec2(std::floor(sx + (kSlot - ts.x) * 0.5f), sy - ts.y - 2),
                      Fade(ui::ColParch(), 0.8f), tag);
       ImGui::PopFont();
+      ui::KeyBadge(dl, ImVec2(sx + 2, sy + 2), side ? "Q" : "E");
     }
     y = portY + kPortraitH + 16;
 
@@ -3954,7 +4016,7 @@ void DrawInventoryScreen(UIState& s) {
       y += ImGui::GetTextLineHeight() + 10;
     }
 
-    if (showDetail) {
+    if (s.inspectMode) {
       // The foot of this column answers the question the health column cannot:
       // how much of this body is behind metal at all, and what state that
       // metal is in.
@@ -3996,13 +4058,42 @@ void DrawInventoryScreen(UIState& s) {
       // portrait to the bottom rule. It never draws health or mana: those are
       // above, in both views, and one screen saying "142 / 200" in two places
       // invites the two to disagree the day one of them is changed.
-      const float detailX = wp.x + leftBase + kColGap;
-      VitalsColumn(s, ImVec2(detailX, portY),
-                   ImVec2(wp.x + ws.x - kPad - detailX,
-                          wp.y + ws.y - kPad - portY));
+      // (On a narrow screen it is not here at all: it stands in the
+      // right-hand column instead - see `healthOver` below.)
+      if (showDetail) {
+        const float detailX = wp.x + leftBase + kColGap;
+        VitalsColumn(s, ImVec2(detailX, portY),
+                     ImVec2(wp.x + ws.x - kPad - detailX,
+                            wp.y + ws.y - kPad - portY));
+      }
     }
   }
   ImGui::End();
+  }  // !fullWide
+
+  // THE HEALTH COLUMN ON A NARROW SCREEN: not beside the gear (that would push
+  // the character panel's right edge off the monitor) but in the right-hand
+  // column's place, as a panel of its own. The book, the pack and the loot
+  // step aside while it is open; the "health" toggle brings them back.
+  if (healthOver) {
+    ui::PanelStyle stHealth;
+    stHealth.darkMix = 0.32f;
+    stHealth.sheenPeak = 0.40f;
+    stHealth.bronzeAlpha = 0.12f;
+    const float hw = std::max(kDetailW + 2 * (kFrame + kPad) - 2 * kPad, bookRoom);
+    ImGui::SetNextWindowPos(ImVec2(bookX, top));
+    ImGui::SetNextWindowSize(ImVec2(hw, bottom - top));
+    ImGui::Begin("##healthcol", nullptr, kPanelFlags);
+    {
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      const ImVec2 wp = ImGui::GetWindowPos();
+      const ImVec2 ws = ImGui::GetWindowSize();
+      const float y = PanelChrome(dl, wp, ws, "HEALTH", nullptr, stHealth);
+      VitalsColumn(s, ImVec2(wp.x + kFrame + kPad, y),
+                   ImVec2(ws.x - 2 * (kFrame + kPad), wp.y + ws.y - kFrame - kPad - y));
+    }
+    ImGui::End();
+  }
 
   // ==========================================================================
   // THE SPELLBOOK: one panel, grimoire over arsenal (plan §12a, §12b)
@@ -4082,7 +4173,9 @@ void DrawInventoryScreen(UIState& s) {
                                  : bookShutH;
     colBottom = bookTall > 0.0f ? bookTop + bookTall : top + lootH;
   }
-  if (bookTall > 0.0f) {   // zero only when a corpse took the whole rect
+  // zero only when a corpse took the whole rect (or the narrow-screen health
+  // column has the right-hand column)
+  if (bookTall > 0.0f && !healthOver) {
   ImGui::SetNextWindowPos(ImVec2(bookX, bookTop));
   ImGui::SetNextWindowSize(ImVec2(bookW, bookTall));
   ImGui::Begin("##spellbook", nullptr, kPanelFlags);
@@ -4343,7 +4436,10 @@ void DrawInventoryScreen(UIState& s) {
     float hy = y;
     if (!side && packRows > 0) hy += packRows * (kSlot + kSlotGap) + 10;
 
-    hy = ui::Subheading(dl, ImVec2(handX, hy), side ? handInner : contentW,
+    // Stacked, the strip is centred, so its rule runs to the panel's inner
+    // edge from wherever the strip starts - not a whole content width past it.
+    hy = ui::Subheading(dl, ImVec2(handX, hy),
+                        side ? handInner : contentW - (handX - (wp.x + kPad)),
                         "IN HAND  1-0");
     hy += 2;
     for (int i = 0; i < (int)s.hotbarSlots.size(); i++) {
@@ -4433,6 +4529,10 @@ void DrawInventoryScreen(UIState& s) {
         : "I or Esc to close   |   drag out to drop";
     const char* text = fresh ? s.kitMessage.c_str() : idle;
     const float a = fresh ? std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f) : 0.85f;
+    // A line wider than the screen (the loot instruction is ~1330 px in the
+    // display face) drops to the small face rather than off both edges.
+    const bool smallFace = ImGui::CalcTextSize(text).x > disp.x - 40.0f;
+    if (smallFace) ImGui::PushFont(ui::FontSmall());
     const ImVec2 ts = ImGui::CalcTextSize(text);
     const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), disp.y - ts.y - 8);
     bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 2), ImVec2(tp.x + ts.x + 12, disp.y),
@@ -4440,6 +4540,7 @@ void DrawInventoryScreen(UIState& s) {
     bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 2), ImVec2(tp.x + ts.x + 12, tp.y),
                       Fade(fresh ? ui::ColEmber() : ui::ColGoldDim(), 0.5f));
     ui::ShadowText(bg, tp, Fade(fresh ? ui::ColEmber() : ui::ColParchDim(), a), text);
+    if (smallFace) ImGui::PopFont();
   }
 }
 

@@ -228,7 +228,21 @@ void Overlay::DrawHUD(const UIState& s) {
   const float x = pad;
   // Anchored to the BOTTOM edge: y is derived from display height so the HUD
   // stays put when the window is resized.
-  const float yMana = disp.y - pad - h;
+  //
+  // ...UNLESS THE HOTBAR IS IN THE WAY. The strip is centred (inventory_ui.cpp
+  // DrawHudHotbar: n slots at a 48 px pitch, and a hand slot 18 px off each
+  // end with its 6 px backing), so on a window narrower than ~1300 px (an
+  // almost square monitor) its left hand reaches under these bars. Then the
+  // bars, and everything stacked on them, stand on the strip's shoulder
+  // instead: above its hand captions, still at the left edge.
+  const float stripHalf =
+      0.5f * ((float)s.hotbarSlots.size() * 48.0f - 4.0f) + 18.0f + 44.0f + 6.0f;
+  const float barsRight = x + w + (s.strikeCompass ? 14.0f + 116.0f : 0.0f);
+  const bool overStrip =
+      !s.hotbarSlots.empty() && barsRight + 12.0f > disp.x * 0.5f - stripHalf;
+  // 14 + 44 = the strip's bottom margin and slot; 30 = its backing and the
+  // RMB/LMB caption over a hand slot.
+  const float yMana = overStrip ? disp.y - (14.0f + 44.0f + 30.0f) - h : disp.y - pad - h;
   const float yHealth = yMana - gap - h;
 
   // One bar: backdrop, fill, and an optional brighter "this is about to be
@@ -2413,6 +2427,7 @@ void Overlay::Draw(UIState& s) {
     ImGui::SetNextWindowPos(ImVec2(sPanelW + 12, 12), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340, 600), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("MPM Fluid Tuning", &s.fluidWindowOpen)) {
+      ui::KeepWindowOnScreen(4.0f);  // a saved position may be off this monitor
       if (ImGui::Button("Apply")) s.fluidTuningDirty = true;
       ImGui::SameLine();
       ImGui::TextDisabled("recompiles shaders");
@@ -2541,6 +2556,7 @@ void Overlay::Draw(UIState& s) {
     ImGui::SetNextWindowPos(ImVec2(sPanelW + 12, 12), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(400, 720), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("NPC AI", &s.aiWindowOpen)) {
+      ui::KeepWindowOnScreen(4.0f);  // a saved position may be off this monitor
       if (ImGui::BeginTabBar("##aitabs")) {
         // ---- Mobs --------------------------------------------------------
         if (ImGui::BeginTabItem("Mobs")) {
@@ -2725,6 +2741,7 @@ void Overlay::Draw(UIState& s) {
     ImGui::SetNextWindowPos(ImVec2(sPanelW + 12, 40), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(420, 720), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Combat", &s.combatWindowOpen)) {
+      ui::KeepWindowOnScreen(4.0f);  // a saved position may be off this monitor
       Tuning t = CurrentTuning();
       bool moved = false;
       // The AI panel's idiom exactly: the slider's own return value is the

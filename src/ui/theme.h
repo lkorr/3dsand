@@ -250,6 +250,17 @@ void BeginTip();
 void EndTip();
 void Tip(const char* text);
 
+// ---- fitting the monitor ----------------------------------------------------
+//
+// Call right after Begin() on a window the player can move or resize (or that
+// imgui.ini remembers): pulls it back inside the display, `margin` px from
+// every edge, and shrinks it if it is bigger than the display. Every frame,
+// not only on first use - a window placed on a 1600x900 session must not be
+// left hanging off a 1024x1024 one, and a window resized while the game runs
+// must follow. Sizes only ever shrink here (nothing is scaled: the chrome and
+// the pixel font keep their pixel sizes), so a window that fits is untouched.
+void KeepWindowOnScreen(float margin = 0.0f);
+
 // ---- the quill stroke (PLAN_spell_graph) ------------------------------------
 //
 // A cubic from `from` to `to` with the control points straight DOWN out of the

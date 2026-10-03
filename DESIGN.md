@@ -19046,6 +19046,41 @@ The sim keeps running while it is open. This is WoW, not single-player
 Minecraft: the engine is real-time and the MutationQueue is a future network
 stream (§10), so a pause would be a lie the moment a second player existed.
 
+### Fitting the monitor: reflow at breakpoints, never scale (2026-10-03)
+
+The screen was laid out on 1600x900. On an almost square monitor (1024x1024,
+1280x1024, 1200x1200) the side-by-side columns do not fit, and the panels are
+made of FIXED things - the 10-key bound row, the 8-wide pack grid, the 1:1
+portrait, the 2x pixel chrome and the ProggyClean faces - so the screen
+REFLOWS instead of shrinking. Nothing is ever scaled. The breakpoints are sums
+of the constants the panels draw with (`DrawInventoryScreen`, `ui/inventory_ui.cpp`):
+
+* **right column minimum = 508 px** (the bound row / the pack's in-hand strip
+  plus pads). The outer margin drops 28 -> 12 when character + 508 do not fit.
+* **health column BESIDE -> OVER**: when character + health + 508 do not fit,
+  the health column becomes its own `HEALTH` panel in the right-hand column's
+  place (book, pack step aside; the toggle brings them back; a corpse being
+  looted keeps the column).
+* **open book FULL WIDTH** when the room beside the character panel cannot hold
+  the page AND the EVERY WORD column (784 px): the book covers the desk rather
+  than fold the drag source away (owner rule: the arsenal's word table is never
+  hidden behind a mode toggle).
+* **bench / item stage FULL WIDTH** below 1024 px of room (the bench's tool
+  column + two vessels at 2x), and the bench's tool column narrows 340 -> 300
+  (`BenchColW`) so a 1000 px panel still draws the table at 2x.
+
+A wide window meets none of them and is laid out as before (verified against
+before/after pictures at 1600x900). The HUD's hp/mp bars stand on the hotbar's
+shoulder when the centred strip would reach under them (`Overlay::DrawHUD`);
+the footer line drops to the small face when it is wider than the screen; the
+F1 sidebar's floating windows (fluid, NPC AI, combat) are pulled back inside
+the display every frame by `ui::KeepWindowOnScreen` (imgui.ini remembers
+positions from wider sessions). **Check a layout at a monitor's shape with
+`SANDVOX_UI_SIZE=WxH`** on any windowed `--shot-*` harness (`--shot-inventory`,
+`--shot-bench`, `--shot-devpanel`, `--shot-dialogue`, `--shot-editor`, ...):
+the window is created undecorated at that client size. Known limit: a window
+SHORTER than ~800 px still clips the foot of the character column.
+
 ### The portrait is the avatar, not a picture of one
 
 `src/main.cpp` renders a **second camera** at the player's own rig into a

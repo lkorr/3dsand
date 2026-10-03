@@ -2283,9 +2283,15 @@ void EditorMode::Frame(UIState& ui, float dt, float fovY) {
     if (!p.msg.empty()) {
       ImGui::SameLine();
       const float x0 = ImGui::GetCursorPosX() + 24;
-      const float tw = ImGui::CalcTextSize(p.msg.c_str()).x;
+      // Cut to the room left on the row (a narrow window, a long refusal):
+      // the whole message is the tooltip.
+      std::string shown = p.msg;
+      while (shown.size() > 4 && x0 + ImGui::CalcTextSize(shown.c_str()).x > W - 16)
+        shown = shown.substr(0, shown.size() - 4) + "..";
+      const float tw = ImGui::CalcTextSize(shown.c_str()).x;
       ImGui::SameLine(std::max(x0, W - tw - 16));
-      ImGui::TextColored(V4(p.msgBad ? ui::ColBloodHi() : IM_COL32(150, 220, 150, 255)), "%s", p.msg.c_str());
+      ImGui::TextColored(V4(p.msgBad ? ui::ColBloodHi() : IM_COL32(150, 220, 150, 255)), "%s", shown.c_str());
+      if (shown != p.msg) ImGui::SetItemTooltip("%s", p.msg.c_str());
     }
     const char* hint = "";
     switch (p.tool) {
@@ -2300,7 +2306,14 @@ void EditorMode::Frame(UIState& ui, float dt, float fovY) {
       case kLink: hint = "click node, click node | Shift unlink"; break;
       default: break;
     }
-    ImGui::TextColored(V4(ui::ColParchDim()), "keys: %s   |   F8 leave   H all keys   Ctrl+Z undo   Ctrl+S save", hint);
+    // The global keys trail the tool's; on a narrow window (an almost square
+    // monitor) the box tool's line alone is most of the width, so the trail
+    // is dropped rather than run off the edge - H lists them all anyway.
+    char keys[320];
+    std::snprintf(keys, sizeof keys, "keys: %s   |   F8 leave   H all keys   Ctrl+Z undo   Ctrl+S save", hint);
+    if (ImGui::CalcTextSize(keys).x > W - 2 * ImGui::GetStyle().WindowPadding.x)
+      std::snprintf(keys, sizeof keys, "keys: %s   |   H all keys", hint);
+    ImGui::TextColored(V4(ui::ColParchDim()), "%s", keys);
   }
   ImGui::End();
 
