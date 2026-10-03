@@ -6718,12 +6718,31 @@ fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
   if (opennessGen[slot] != opennessStamp(worldChunkOf(c))) { return 0u; }
   return irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)];
 }
+// ---- ONE GATHER PER BLOCK-FACE, NOT ONE PER PIXEL (2026-10-03) ---------------
+// A slot's refresh frame used to re-gather in EVERY pixel of the slot that
+// landed on a stale face: a 4x4-voxel block-face is hundreds of pixels at a
+// few metres, every one of them casting the same nine rays from the same
+// face-centre origin and writing the same word. The gather is a function of
+// the FACE, so one pixel per face is enough: the pixels whose hit lies within
+// one pixel footprint of the face centre on both tangent axes (~2x2 of them),
+// plus a 1-in-256 per-pixel lottery so a face whose centre is hidden behind
+// something still refreshes (a face with N visible pixels: 1 - (255/256)^N
+// per due frame). A face read for the first time (`own == 0`) still gathers
+// in every pixel that sees it, exactly as before -- one frame, then cached.
+//
+// And ONE CALL SITE: the unstamped-slot path (no cache, a per-pixel gather
+// from the hit) and the cache refresh used to be two inlined copies of the
+// nine-ray loop; they now pick an origin and share one.
+//
+// Measured, --render-budget 1080p, one process (baseline -> this): noon
+// 6.66 -> 6.34 ms, meadow 5.58 -> 5.14, seam 4.61 -> 4.36, seamveg 7.38 ->
+// 7.13. The ceiling (no gather in fs at all) was 6.17 / 4.85 / 4.18 / 6.92:
+// the rest is the loop's register footprint, which only a compute pass over
+// requested faces removes (see giGatherRays).
 fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
   let slot = chunkIndexW(cell);
-  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) {
-    return giGather(p, n, cell);
-  }
+  let stamped = opennessGen[slot] == opennessStamp(worldChunkOf(cell));
   let face = openFaceOfNormal(n);
   let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
   let idx = GI_CACHE_BASE + irrIndex(slot, subOccBitLocal(lo), face);
@@ -6734,13 +6753,41 @@ fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
   // silently measured nothing for exactly that reason).
   let phase = (R.frameIdx + ((slot * 2654435761u) >> 24u)) %
               max(u32(TUNE_GI_CACHE_PERIOD), 1u);
-  if (own == 0u || phase == 0u) {
-    let half = f32(SUBOCC_BLOCK) * 0.5;
-    let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
-    let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
+  let half = f32(SUBOCC_BLOCK) * 0.5;
+  let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
+  var due = own == 0u;
+  if (!due && phase == 0u) {
+    // The election (see above): this pixel's hit against the face centre on
+    // the two tangent axes, in pixel footprints at its distance.
+    let dc = abs(p - (vec3f(blockMin) + vec3f(half)));
+    let ax = face >> 1u;
+    let du = select(dc.x, dc.y, ax == 0u);
+    let dv = select(dc.z, dc.y, ax == 2u);
+    let fp = max(length(p - R.camPos) * R.tanHalfFov * 2.0 / R.viewPx, 1e-3);
+    let lottery = (pcg(bitcast<u32>(p.x) ^ (bitcast<u32>(p.z) * 747796405u) ^
+                       (bitcast<u32>(p.y) * 2891336453u) ^ R.frameIdx) & 255u) == 0u;
+    due = (du < fp && dv < fp) || lottery;
+  }
+  // The origin: the face centre half a voxel past the block's far plane for
+  // the cache, or -- for a slot the openness walk has not stamped, which has
+  // no cache -- giGather's per-pixel origin off the hit.
+  var ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
+  if (!stamped) {
+    due = true;
+    let ci = axisPickI(cell, i32(face >> 1u));
+    let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
+    let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
+    let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
+                      (face & 1u) != 0u) + 0.5;
+    ro = p + n * dOut;
+  }
+  var g = vec3f(0.0);
+  if (due) { g = giGatherRays(ro, n, face); }
+  if (!stamped) { return g; }
+  if (due) {
     // The low bit forced on: 0 must mean "never", and a face in the dark
     // gathers a true zero.
-    own = packRgb9e5(giGatherRays(ro, n, face)) | 1u;
+    own = packRgb9e5(g) | 1u;
     irradiance[idx] = own;
   }
   if (TUNE_OPENNESS_BILINEAR == 0) { return unpackRgb9e5(own); }
