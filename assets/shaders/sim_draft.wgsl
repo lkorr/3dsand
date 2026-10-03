@@ -27,8 +27,10 @@
 // between big volumes jets (the interstitial speed is the flux over the open
 // fraction). Two walls with an alley speed the wind up by continuity. What it
 // does NOT do: no turbulent wake (the calm pocket behind a wall is about one
-// wall high, not ten), no stack effect (heat is phase 5), and fans are added
-// after, unprojected.
+// wall high, not ten), and fans are added after, unprojected. HEAT is a third
+// right-hand side since wind phase 5 (THE STACK EFFECT below): the volume is
+// then a function of geometry AND the heat in it, and re-solves when either
+// moves.
 //
 // WHY THE TRANSFER AND NOT THE WIND. The wind changes every tick (gusts,
 // meander); the geometry does not. Solving for the transfer makes the volume
@@ -106,6 +108,18 @@
 // common.wgsl's BOUND reader.
 @group(0) @binding(46) var<storage, read_write> draftField : array<u32>;
 @group(0) @binding(47) var<storage, read_write> draftMeta : array<atomic<u32>>;
+// THE TEMPERATURE LAYER (sim_heat.wgsl), for the STACK EFFECT: the snapshot
+// samples the heat updraft per fine cell through common.wgsl's windHeatUpQ
+// (declaring `> heatPool` is what keeps that reader BOUND here), and `args`
+// reads the layer's activity counters to know when the heat moved.
+@group(0) @binding(50) var<storage, read> heatPool : array<u32>;
+@group(0) @binding(51) var<storage, read_write> heatMeta : array<atomic<u32>>;
+
+// src/sim/heat.h's monotonic activity counters (check_invariants `heat`).
+const HM_RELAX_TICKS : u32 = 24u;
+const HM_FREES : u32 = 25u;
+const HM_ALLOCS : u32 = 26u;
+const HM_RELEASED : u32 = 27u;
 
 // world.h kDraftMeta* / kDraft*Base / kDraftTiles (check_invariants `drafts`
 // holds these to world.h).
@@ -119,6 +133,16 @@ const DRAFT_COARSE_WORDS : u32 = 6u;
 const DRAFT_PHI_A : u32 = 667648u;
 const DRAFT_PHI_B : u32 = 929792u;
 const DRAFT_KBASE : u32 = 1191936u;
+// The stack effect's regions (world.h kDraftStack*; the published field and
+// its live word are common.wgsl's DRAFT_STACK_FIELD / DRAFT_STACK_LIVE).
+const DRAFT_SC_BASE : u32 = 1323008u;   // per coarse cell: mean b | phi b
+const DRAFT_SB : u32 = 1327104u;        // b per fine cell, Q12 of the cap
+const DRAFT_SPHI_A : u32 = 1458176u;
+const DRAFT_SPHI_B : u32 = 1589248u;
+const DM_HEAT_SEEN : u32 = 32u;
+const DM_HEAT_CLOCK : u32 = 33u;
+const DM_BOX_HOT : u32 = 34u;
+const DM_HEAT_START : u32 = 35u;
 const DRAFT_TILES : u32 = 256u;
 // Chunks of the box per axis (kDraftChunks*) = the coarse grid.
 const DRAFT_CX : i32 = 16;
@@ -146,6 +170,44 @@ fn tileOf(t : u32) -> vec3<i32> {
   let ti = i32(t);
   return vec3<i32>(ti % (DRAFT_NX / 8), (ti / (DRAFT_NX / 8)) % (DRAFT_NY / 8),
                    ti / ((DRAFT_NX / 8) * (DRAFT_NY / 8)));
+}
+
+// ---- THE STACK EFFECT (wind phase 5, 2026-10-02) -----------------------------
+// Heat as a third right-hand side of the same projection. The heat updraft b
+// (common.wgsl windHeatUpQ: what the sim's wind adds over hot ground) is
+// sampled per fine cell at the solve's snapshot, and the solve finds phi_b
+// with div(beta (b e_y - grad phi_b)) = 0 -- the rising air made to respect
+// the walls. The published S = P(b) - b is the CORRECTION the readers add to
+// the local lift (draftStackAtQ), so inside the box lift + S = P(b):
+//   * a sealed room's hot column turns over in place (up over the fire, down
+//     the cold walls), and no air crosses its walls;
+//   * a room with a low and a high opening BREATHES: the column's lift has a
+//     path out through the high one, and continuity pulls air in at the low
+//     one -- the stack effect, a burning house venting through its window or
+//     roof while fresh air comes in at the door;
+//   * in open air S is the plume's own inflow at its base and spread at its
+//     top, little else.
+// Units: b and S in Q12 of sim.windUpdraftCap (4096 = the cap), phi_b in Q12
+// fine-cell units like phi x / z. Every pass skips the b work when the
+// snapshot saw no heat (DM_BOX_HOT), so a cold box costs what it did.
+//
+// WHEN IT RE-SOLVES. b moves without any mask moving, so `args` also starts a
+// solve when the box holds heat (the last snapshot saw b != 0, or an active
+// chunk in the box has a heat page) AND the heat layer's activity counters
+// moved since the last solve began AND at least DRAFT_HEAT_PERIOD ticks have
+// passed -- a fire's field lags its heat by at most ~22 ticks (0.7 s), and a
+// box with no heat in it never solves for heat at all. Determinism: the
+// counters are the heat rows' own monotonic atomics, final before this row
+// reads them, so the verdict is a function of the tick's inputs.
+const DRAFT_HEAT_PERIOD : u32 = 16u;
+
+fn stackOn() -> bool { return T.draftStackQ > 0 && T.updraftGainQ > 0; }
+// Did this solve's snapshot see heat? Set by coarseBuild, read by the later
+// stages, reset by `args` only when a new solve starts.
+fn stackLive() -> bool { return atomicLoad(&draftMeta[DM_BOX_HOT]) != 0u; }
+fn heatClock() -> u32 {
+  return atomicLoad(&heatMeta[HM_RELAX_TICKS]) + atomicLoad(&heatMeta[HM_FREES]) +
+         atomicLoad(&heatMeta[HM_ALLOCS]) + atomicLoad(&heatMeta[HM_RELEASED]);
 }
 
 // ---- the masks --------------------------------------------------------------
@@ -238,6 +300,10 @@ fn maskDirty(@builtin(workgroup_id) wg : vec3<u32>,
   let vc = wc - (T.draftOrigin >> vec3<u32>(CHUNK_SHIFT));
   if (vc.x < 0 || vc.y < 0 || vc.z < 0 ||
       vc.x >= DRAFT_CX || vc.y >= DRAFT_CY || vc.z >= DRAFT_CZ) { return; }
+  // The stack effect's doorbell: an active chunk of the box holds heat.
+  if (li == 0u && stackOn() && windHeatEntry(wc, T.origin) != 0u) {
+    atomicOr(&draftMeta[DM_HEAT_SEEN], 1u);
+  }
   if (maskCell(vc, li)) {
     atomicOr(&draftMeta[DM_CHANGED], 1u);
     atomicAdd(&draftMeta[DM_CELLS], 1u);
@@ -275,15 +341,37 @@ fn args() {
   let burst = (T.draftMode & 2u) != 0u;
   let prev = atomicLoad(&draftMeta[DM_STAGE]);
   var next = 0u;
+  var start = false;
   if (burst) {
     atomicStore(&draftMeta[DM_CHANGED], 0u);
     atomicAdd(&draftMeta[DM_SOLVES], 1u);
     atomicStore(&draftMeta[DM_LAST], T.tick);
+    start = true;
   } else if (prev != 0u && prev < DRAFT_STAGES) {
     next = prev + 1u;
-  } else if (atomicExchange(&draftMeta[DM_CHANGED], 0u) != 0u) {
-    next = 1u;
-    atomicAdd(&draftMeta[DM_SOLVES], 1u);
+  } else {
+    let masks = atomicExchange(&draftMeta[DM_CHANGED], 0u) != 0u;
+    // THE STACK EFFECT'S TRIGGER (block above): heat in the box, moved, due.
+    var heat = false;
+    if (stackOn()) {
+      let hot = atomicLoad(&draftMeta[DM_HEAT_SEEN]) != 0u || stackLive();
+      let moved = heatClock() != atomicLoad(&draftMeta[DM_HEAT_CLOCK]);
+      let due = T.tick - atomicLoad(&draftMeta[DM_HEAT_START]) >= DRAFT_HEAT_PERIOD;
+      heat = hot && moved && due;
+    }
+    if (masks || heat) {
+      next = 1u;
+      atomicAdd(&draftMeta[DM_SOLVES], 1u);
+      start = true;
+    }
+  }
+  // A solve begins: its snapshot (coarseBuild, this tick) re-decides whether
+  // the box is hot, and the heat it sees is the heat as of now.
+  if (start) {
+    atomicStore(&draftMeta[DM_HEAT_SEEN], 0u);
+    atomicStore(&draftMeta[DM_BOX_HOT], 0u);
+    atomicStore(&draftMeta[DM_HEAT_CLOCK], heatClock());
+    atomicStore(&draftMeta[DM_HEAT_START], T.tick);
   }
   if (next == DRAFT_STAGES) { atomicStore(&draftMeta[DM_LAST], T.tick); }
   atomicStore(&draftMeta[DM_STAGE], next);
@@ -358,6 +446,12 @@ var<workgroup> pbLab : array<array<u32, 512>, 2>;
 var<workgroup> pbWgt : array<atomic<u32>, 512>;
 var<workgroup> pbBest : array<atomic<u32>, 8>;
 var<workgroup> pbMem : array<atomic<u32>, 16>;
+// The stack effect's snapshot: b per fine cell, its pocket sum and member
+// count per coarse cell, and "any heat in this tile".
+var<workgroup> pbB : array<u32, 512>;
+var<workgroup> pbBs : array<atomic<u32>, 8>;
+var<workgroup> pbBn : array<atomic<u32>, 8>;
+var<workgroup> pbHot : atomic<u32>;
 
 fn tLocal(t : u32) -> vec3<i32> { return vec3<i32>(i32(t & 7u), i32((t >> 3u) & 7u), i32(t >> 6u)); }
 fn rowsOpen(m : vec2<u32>) -> u32 {
@@ -373,6 +467,8 @@ fn axisMask(m : vec2<u32>, a : u32) -> u32 {
 fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
                @builtin(local_invocation_index) li : u32) {
   let tile = tileOf(wg.x);
+  if (li == 0u) { atomicStore(&pbHot, 0u); }
+  workgroupBarrier();
   for (var k = 0u; k < 2u; k++) {
     let t = li + 256u * k;
     let g = tile * 8 + tLocal(t);
@@ -384,8 +480,24 @@ fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
     draftField[DRAFT_KBASE + fineIndex(g)] =
         fineFaceK(g, 0u) | (fineFaceK(g, 1u) << 9u) | (fineFaceK(g, 2u) << 18u);
     atomicStore(&pbWgt[t], 0u);
+    // THE STACK EFFECT'S SOURCE: the heat updraft at the cell's centre, Q12 of
+    // the cap -- the same function the sim's wind adds (windHeatUpQ), so the
+    // projection and the local lift agree. A cell with no open row holds no
+    // air and gets none.
+    var bq = 0u;
+    if (stackOn() && rowsOpen(m) != 0u) {
+      let up = windHeatUpQ(T.draftOrigin + g * 4 + vec3<i32>(2), &T);
+      bq = u32(clamp(up / max(T.updraftCapQ >> 12u, 1), 0, Q_ONE));
+    }
+    draftField[DRAFT_SB + fineIndex(g)] = bq;
+    pbB[t] = bq;
+    if (bq != 0u) { atomicOr(&pbHot, 1u); }
   }
-  if (li < 8u) { atomicStore(&pbBest[li], 0u); }
+  if (li < 8u) {
+    atomicStore(&pbBest[li], 0u);
+    atomicStore(&pbBs[li], 0u);
+    atomicStore(&pbBn[li], 0u);
+  }
   if (li < 16u) { atomicStore(&pbMem[li], 0u); }
   workgroupBarrier();
   for (var r = 0u; r < POCKET_ROUNDS; r++) {
@@ -438,6 +550,11 @@ fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
       let lc = lt & vec3<i32>(3);
       let bit = u32(lc.x + 4 * lc.y + 16 * lc.z);
       atomicOr(&pbMem[cs * 2u + (bit >> 5u)], 1u << (bit & 31u));
+      // The coarse cell's b is the mean over its POCKET, for the reason its
+      // faces count only pocket members: the sliver beyond a wall is not
+      // this cell's air.
+      atomicAdd(&pbBs[cs], pbB[t]);
+      atomicAdd(&pbBn[cs], 1u);
     }
   }
   workgroupBarrier();
@@ -445,7 +562,10 @@ fn coarseBuild(@builtin(workgroup_id) wg : vec3<u32>,
     let p = tile * 2 + vec3<i32>(i32(li & 1u), i32((li >> 1u) & 1u), i32(li >> 2u));
     draftField[cAddr(p, CW_MEM0)] = atomicLoad(&pbMem[li * 2u]);
     draftField[cAddr(p, CW_MEM1)] = atomicLoad(&pbMem[li * 2u + 1u]);
+    draftField[DRAFT_SC_BASE + 2u * cIndex(p)] =
+        atomicLoad(&pbBs[li]) / max(atomicLoad(&pbBn[li]), 1u);
   }
+  if (li == 0u && atomicLoad(&pbHot) != 0u) { atomicOr(&draftMeta[DM_BOX_HOT], 1u); }
 }
 
 // ---- coarseFaces: the coarse face coefficients, between pockets only ----------
@@ -514,7 +634,13 @@ fn coarseFaces(@builtin(workgroup_id) wg : vec3<u32>,
 var<workgroup> csPx : array<i32, 2048>;
 var<workgroup> csPz : array<i32, 2048>;
 var<workgroup> csKp : array<u32, 2048>;
-var<workgroup> csKb : array<u32, 2048>;
+// The stack effect's phi b and its per-cell source term. 40 KiB with the
+// three above: the boundary coefficients (CW_KB) are read from the buffer
+// instead of held here -- only the box's minus faces use them.
+var<workgroup> csPb : array<i32, 2048>;
+var<workgroup> csSb : array<i32, 2048>;
+
+fn scB(c : vec3<i32>) -> i32 { return i32(draftField[DRAFT_SC_BASE + 2u * cIndex(c)]); }
 
 @compute @workgroup_size(1024)
 fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
@@ -522,15 +648,40 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
   // Dispatched with the tile count (one args record for every solve row);
   // only the first group works.
   if (wg.x != 0u) { return; }
+  let live = stackLive();
   for (var i = li; i < DRAFT_CCELLS; i += 1024u) {
     let c = cCoord(i);
     csKp[i] = draftField[cAddr(c, CW_KP)];
-    csKb[i] = draftField[cAddr(c, CW_KB)];
     csPx[i] = 0;
     csPz[i] = 0;
+    csPb[i] = 0;
   }
   workgroupBarrier();
   let st = vec3<u32>(1u, u32(DRAFT_CX), u32(DRAFT_CX * DRAFT_CY));
+  // The b source per coarse cell, once: the y faces' flux of b at the face
+  // means (zero outside the box: the free stream is cold), times the spacing
+  // of 4 fine cells -- the stream's `4 (K+ - K-) Q_ONE` with b for Q_ONE.
+  for (var i = li; i < DRAFT_CCELLS; i += 1024u) {
+    var sb = 0;
+    if (live) {
+      let c = cCoord(i);
+      let bc = scB(c);
+      let kpy = kGet(csKp[i], 1u);
+      var kmy = 0;
+      var bd = 0;
+      if (c.y == 0) {
+        kmy = kGet(draftField[cAddr(c, CW_KB)], 1u);
+      } else {
+        kmy = kGet(csKp[i - st.y], 1u);
+        bd = scB(c - vec3<i32>(0, 1, 0));
+      }
+      var bu = 0;
+      if (cInside(c + vec3<i32>(0, 1, 0))) { bu = scB(c + vec3<i32>(0, 1, 0)); }
+      sb = -4 * (kpy * ((bc + bu) / 2) - kmy * ((bc + bd) / 2));
+    }
+    csSb[i] = sb;
+  }
+  workgroupBarrier();
   for (var it = 0; it < TUNE_DRAFT_COARSE_SWEEPS; it++) {
     for (var color = 0u; color < 2u; color++) {
       for (var i = li; i < DRAFT_CCELLS; i += 1024u) {
@@ -539,6 +690,7 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
         var sum = 0;
         var ax = 0;
         var az = 0;
+        var ab = 0;
         var sx = 0;
         var sz = 0;
         for (var a = 0u; a < 3u; a++) {
@@ -547,22 +699,27 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
           var kma = 0;
           var pmx = 0;
           var pmz = 0;
+          var pmb = 0;
           if (dot(c, e) == 0) {
-            kma = kGet(csKb[i], a);
+            kma = kGet(draftField[cAddr(c, CW_KB)], a);
           } else {
             kma = kGet(csKp[i - st[a]], a);
             pmx = csPx[i - st[a]];
             pmz = csPz[i - st[a]];
+            pmb = csPb[i - st[a]];
           }
           var ppx = 0;
           var ppz = 0;
+          var ppb = 0;
           if (cInside(c + e)) {
             ppx = csPx[i + st[a]];
             ppz = csPz[i + st[a]];
+            ppb = csPb[i + st[a]];
           }
           sum += kpa + kma;
           ax += kpa * ppx + kma * pmx;
           az += kpa * ppz + kma * pmz;
+          ab += kpa * ppb + kma * pmb;
           if (a == 0u) { sx = kpa - kma; }
           if (a == 2u) { sz = kpa - kma; }
         }
@@ -571,9 +728,14 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
           let gz = (az - 4 * sz * Q_ONE) / sum;
           csPx[i] += (7 * (gx - csPx[i])) / 4;
           csPz[i] += (7 * (gz - csPz[i])) / 4;
+          if (live) {
+            let gb = (ab + csSb[i]) / sum;
+            csPb[i] += (7 * (gb - csPb[i])) / 4;
+          }
         } else {
           csPx[i] = 0;
           csPz[i] = 0;
+          csPb[i] = 0;
         }
       }
       workgroupBarrier();
@@ -583,6 +745,7 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
     let c = cCoord(i);
     draftField[cAddr(c, CW_PX)] = bitcast<u32>(csPx[i]);
     draftField[cAddr(c, CW_PZ)] = bitcast<u32>(csPz[i]);
+    draftField[DRAFT_SC_BASE + 2u * cIndex(c) + 1u] = bitcast<u32>(csPb[i]);
   }
 }
 
@@ -601,6 +764,9 @@ fn coarseSolve(@builtin(workgroup_id) wg : vec3<u32>,
 const RG : i32 = 12;
 const RG3 : u32 = 1728u;
 var<workgroup> wfx : array<i32, 1728>;
+// The stack effect's phi b and b over the region (zero outside the box).
+var<workgroup> wfb : array<i32, 1728>;
+var<workgroup> wbb : array<i32, 1728>;
 var<workgroup> wfz : array<i32, 1728>;
 var<workgroup> wkp : array<u32, 1728>;
 
@@ -669,6 +835,43 @@ fn reconstruct(g : vec3<i32>) -> vec2<i32> {
   return vec2<i32>(ox, oz);
 }
 
+// phi b, reconstructed at fine cell g by reconstruct()'s rule with b for the
+// stream: across a CLOSED y face the gradient is the cell's mean b (no flux
+// means b - dphi/dy = 0 there), across a closed x or z face it is 0.
+fn cPhiB(c : vec3<i32>) -> i32 { return bitcast<i32>(draftField[DRAFT_SC_BASE + 2u * cIndex(c) + 1u]); }
+fn reconstructB(g : vec3<i32>) -> i32 {
+  var p = g >> vec3<u32>(2u);
+  if (!memberOf(p, g)) {
+    let l = g - p * 4;
+    for (var a = 0u; a < 3u; a++) {
+      let e = axisE(a);
+      if (dot(l, e) == 0 && cInside(p - e)) { p = p - e; break; }
+      if (dot(l, e) == 3 && cInside(p + e)) { p = p + e; break; }
+    }
+  }
+  let pb = cPhiB(p);
+  let bc = scB(p);
+  let kpp = draftField[cAddr(p, CW_KP)];
+  let off = (g - p * 4) * 2 - vec3<i32>(3);
+  var ob = pb;
+  for (var a = 0u; a < 3u; a++) {
+    let e = axisE(a);
+    let oa = dot(off, e);
+    var gb = select(0, bc, a == 1u);
+    if (oa > 0) {
+      if (kGet(kpp, a) > 0) {
+        if (cInside(p + e)) { gb = (cPhiB(p + e) - pb) / 4; } else { gb = -pb / 2; }
+      }
+    } else {
+      if (cKm(p, a) > 0) {
+        if (cInside(p - e)) { gb = (pb - cPhiB(p - e)) / 4; } else { gb = pb / 2; }
+      }
+    }
+    ob += (oa * gb) / 2;
+  }
+  return ob;
+}
+
 // The interstitial velocity along one axis at a cell, from its two faces on
 // that axis: the open-area-weighted mean of e - dphi across each.
 fn faceVel(kpa : i32, kma : i32, e : i32, pp : i32, pc : i32, pm : i32) -> i32 {
@@ -707,11 +910,45 @@ fn cellVel(r : u32) -> CellV {
   return v;
 }
 
+// THE STACK CORRECTION at region cell r: the face-flux velocity of
+// b e_y - grad phi_b (b on a y face = the mean of its two cells), minus the
+// cell's own b, so the reader's local lift plus this is the projected flow.
+// .w = the cell's open face area, as CellV.open. Bounds: K <= 256, |b| <=
+// 4096 and |phi_b| a few hundred thousand, so every product fits in i32.
+fn stackBase(scratch : u32) -> u32 {
+  return select(DRAFT_SPHI_B, DRAFT_SPHI_A, scratch == DRAFT_PHI_A);
+}
+fn cellStack(r : u32) -> vec4<i32> {
+  let sy = u32(RG);
+  let sz = u32(RG * RG);
+  let k = wkp[r];
+  let kpx = kGet(k, 0u);
+  let kpy = kGet(k, 1u);
+  let kpz = kGet(k, 2u);
+  let kmx = kGet(wkp[r - 1u], 0u);
+  let kmy = kGet(wkp[r - sy], 1u);
+  let kmz = kGet(wkp[r - sz], 2u);
+  let bp = (wbb[r] + wbb[r + sy]) / 2;
+  let bm = (wbb[r - sy] + wbb[r]) / 2;
+  var uy = 0;
+  if (kpy + kmy > 0) {
+    uy = (kpy * (bp - (wfb[r + sy] - wfb[r])) + kmy * (bm - (wfb[r] - wfb[r - sy]))) /
+         (kpy + kmy);
+  }
+  return vec4<i32>(faceVel(kpx, kmx, 0, wfb[r + 1u], wfb[r], wfb[r - 1u]),
+                   uy - wbb[r],
+                   faceVel(kpz, kmz, 0, wfb[r + sz], wfb[r], wfb[r - sz]),
+                   kpx + kmx + kpy + kmy + kpz + kmz);
+}
+
 // One fine pass. `src`: 0 = start from the coarse reconstruction, else the
 // scratch buffer at that word base. `dst`: the scratch base to store the tile
 // into, or 0 = write THE FIELD.
 fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
   let ro = tileOf(wgx) * 8 - vec3<i32>(2);
+  // The stack effect rides along only when this solve's snapshot saw heat;
+  // otherwise every b line below is skipped and the pass is what it was.
+  let live = stackLive();
   for (var r = li; r < RG3; r += 256u) {
     let ri = i32(r);
     let rc = vec3<i32>(ri % RG, (ri / RG) % RG, ri / (RG * RG));
@@ -740,6 +977,18 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
     }
     wfx[r] = ph.x;
     wfz[r] = ph.y;
+    var pb = 0;
+    var bb = 0;
+    if (live && inD) {
+      bb = i32(draftField[DRAFT_SB + fineIndex(g)]);
+      if (src == 0u) {
+        pb = reconstructB(g);
+      } else {
+        pb = bitcast<i32>(draftField[stackBase(src) + fineIndex(g)]);
+      }
+    }
+    wfb[r] = pb;
+    wbb[r] = bb;
   }
   workgroupBarrier();
 
@@ -768,9 +1017,19 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
                    kpz * wfz[r + sz] + kmz * wfz[r - sz] - (kpz - kmz) * Q_ONE;
           wfx[r] += (3 * (ax / sum - wfx[r])) / 2;
           wfz[r] += (3 * (az / sum - wfz[r])) / 2;
+          if (live) {
+            // The b right-hand side: the y faces' flux of b at the face means
+            // (the stream's (K+ - K-) Q_ONE with b for Q_ONE).
+            let bp = (wbb[r] + wbb[r + sy]) / 2;
+            let bm = (wbb[r - sy] + wbb[r]) / 2;
+            let ab = kpx * wfb[r + 1u] + kmx * wfb[r - 1u] + kpy * wfb[r + sy] + kmy * wfb[r - sy] +
+                     kpz * wfb[r + sz] + kmz * wfb[r - sz] - (kpy * bp - kmy * bm);
+            wfb[r] += (3 * (ab / sum - wfb[r])) / 2;
+          }
         } else {
           wfx[r] = 0;
           wfz[r] = 0;
+          wfb[r] = 0;
         }
       }
       workgroupBarrier();
@@ -787,6 +1046,7 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
       let o = dst + 2u * fineIndex(g);
       draftField[o] = bitcast<u32>(wfx[r]);
       draftField[o + 1u] = bitcast<u32>(wfz[r]);
+      if (live) { draftField[stackBase(dst) + fineIndex(g)] = bitcast<u32>(wfb[r]); }
       continue;
     }
     var v = cellVel(r);
@@ -832,6 +1092,32 @@ fn finePass(wgx : u32, li : u32, src : u32, dst : u32) {
     draftField[o] = pack16(rx.x, rx.y);
     draftField[o + 1u] = pack16(rx.z, rz.x);
     draftField[o + 2u] = pack16(rz.y, rz.z);
+    // THE STACK FIELD, by the transfer's rules: a closed cell takes its open
+    // neighbours' mean, and the outer two cells fade it to nothing (outside
+    // the box the reader adds no correction at all). Not written for a cold
+    // snapshot: the live word below tells the readers not to look.
+    if (live) {
+      var s = cellStack(r);
+      if (s.w == 0) {
+        var acc = vec3<i32>(0);
+        var n = 0;
+        for (var a = 0u; a < 6u; a++) {
+          let stp = select(1u, select(sy, sz, a >= 4u), a >= 2u);
+          let rn = select(r - stp, r + stp, (a & 1u) == 0u);
+          let sn = cellStack(rn);
+          if (sn.w != 0) {
+            acc += sn.xyz;
+            n++;
+          }
+        }
+        if (n > 0) { s = vec4<i32>(acc / n, 0); }
+      }
+      var sv = s.xyz;
+      if (dm < 2) { sv = (sv * dm) / 2; }
+      let so = DRAFT_STACK_FIELD + 2u * fineIndex(g);
+      draftField[so] = pack16(sv.x, sv.y);
+      draftField[so + 1u] = pack16(sv.z, 0);
+    }
   }
 }
 
@@ -854,4 +1140,8 @@ fn fineMid2(@builtin(workgroup_id) wg : vec3<u32>,
 fn fineLast(@builtin(workgroup_id) wg : vec3<u32>,
             @builtin(local_invocation_index) li : u32) {
   finePass(wg.x, li, DRAFT_PHI_A, 0u);
+  // Publish whether the stack field is live, with the field it describes.
+  if (wg.x == 0u && li == 0u) {
+    draftField[DRAFT_STACK_LIVE] = select(0u, 1u, stackLive());
+  }
 }

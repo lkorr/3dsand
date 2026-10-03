@@ -2548,6 +2548,17 @@ static_assert(kWindStreakStride == 2 + kWindStreakTrail, "streak row layout");
 //   [kDraftPhiA, + 2 cells), [kDraftPhiB, + 2 cells)
 //                                   the fine passes' scratch potentials
 //   [kDraftKBase, + 1 cell)          the fine faces' packed coefficients
+//   THE STACK EFFECT (wind phase 5, 2026-10-02): the same projection solved
+//   for a third right-hand side, the heat updraft b (common.wgsl
+//   windHeatUpQ, Q12 of sim.windUpdraftCap) sampled per fine cell at the
+//   solve's snapshot:
+//   [kDraftStackCoarse, + 2 coarse)  per coarse cell: mean b of its pocket |
+//                                   phi b
+//   [kDraftStackB, + 1 cell)         b per fine cell (Q12), the snapshot
+//   [kDraftStackPhiA / PhiB, + 1 cell each)  the fine passes' phi b scratch
+//   [kDraftStackField, + 2 cells)    THE STACK FIELD: S = P(b) - b, 3 x i16
+//                                   Q12 of the cap: S.x | S.y << 16, S.z
+//   [kDraftStackLive]                1 when the published solve saw heat
 // Buffer `draftMeta` (binding 47, atomics): kDraftMeta* words below.
 // MIRRORED as DRAFT_* in common.wgsl (check_invariants `drafts`).
 constexpr uint32_t kDraftCellShift = 2;   // a cell is 4 voxels (0.4 m)
@@ -2567,7 +2578,13 @@ constexpr uint32_t kDraftPhiB = kDraftPhiA + 2 * kDraftCells;
 // The fine faces' coefficients, packed per cell (K+x | K+y << 9 | K+z << 18),
 // computed once a solve so the four fine passes read one word a cell.
 constexpr uint32_t kDraftKBase = kDraftPhiB + 2 * kDraftCells;
-constexpr uint32_t kDraftWords = kDraftKBase + kDraftCells;
+constexpr uint32_t kDraftStackCoarse = kDraftKBase + kDraftCells;
+constexpr uint32_t kDraftStackB = kDraftStackCoarse + 2 * kDraftCoarseCells;
+constexpr uint32_t kDraftStackPhiA = kDraftStackB + kDraftCells;
+constexpr uint32_t kDraftStackPhiB = kDraftStackPhiA + kDraftCells;
+constexpr uint32_t kDraftStackField = kDraftStackPhiB + kDraftCells;
+constexpr uint32_t kDraftStackLive = kDraftStackField + 2 * kDraftCells;
+constexpr uint32_t kDraftWords = kDraftStackLive + 4;
 // The fine pass works one 8^3-cell TILE per workgroup.
 constexpr uint32_t kDraftTiles = (kDraftNX / 8) * (kDraftNY / 8) * (kDraftNZ / 8);
 // draftMeta words.
@@ -2578,7 +2595,14 @@ constexpr uint32_t kDraftMetaCells = 3;     // mask cells changed, summed
 constexpr uint32_t kDraftMetaStage = 4;     // the solve pipeline's stage (0 = idle)
 constexpr uint32_t kDraftMetaArgs = 8;      // 6 stages x 4 words: each stage's indirect args
 constexpr uint32_t kDraftStages = 6;
-constexpr uint32_t kDraftMetaWords = 32;
+// The stack effect's re-solve trigger (sim_draft.wgsl `args`): heat moving is
+// not a mask change, so these say whether the box holds heat and when the heat
+// layer last moved. Past the args records, which end at word 31.
+constexpr uint32_t kDraftMetaHeatSeen = 32;   // an active chunk in the box has a heat page (OR)
+constexpr uint32_t kDraftMetaHeatClock = 33;  // the heat layer's activity clock at the last solve
+constexpr uint32_t kDraftMetaBoxHot = 34;     // the last snapshot saw b != 0 (OR)
+constexpr uint32_t kDraftMetaHeatStart = 35;  // tick the last solve started
+constexpr uint32_t kDraftMetaWords = 40;
 static_assert(kDraftNX % 8 == 0 && kDraftNY % 8 == 0 && kDraftNZ % 8 == 0,
               "the fine passes work whole 8^3-cell tiles (2 x 2 x 2 chunks)");
 static_assert((kChunk >> kDraftCellShift) == 4,
@@ -3433,6 +3457,15 @@ struct TickParams {
   // gate / materials / buffer is new -- sim_draft.wgsl `args`).
   int32_t draftOrigin[3] = {0, 0, 0};
   uint32_t draftMode = 0;
+
+  // ---- HEAT UPDRAFTS + THE STACK EFFECT (wind phase 5; common.wgsl
+  // windHeatQ, sim_draft.wgsl). Converted from the sim.windUpdraft* /
+  // sim.windStackGain knobs in SubmitTick, so the kernels see integers.
+  // updraftGainQ 0 = no heat term at all (windAtQ is the field it was before).
+  int32_t updraftGainQ = 0;    // lift per heat unit of excess, Q16.16 cells/s
+  int32_t updraftCapQ = 0;     // the lift's ceiling, Q16.16 cells/s
+  int32_t updraftInflowQ = 0;  // the base inflow per unit of lift gradient, Q16
+  int32_t draftStackQ = 0;     // the stack field's share, Q8 (256 = 1x)
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in

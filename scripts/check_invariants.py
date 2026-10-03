@@ -1119,6 +1119,17 @@ def check_drafts():
         ("sim_draft", "DM_ARGS"): cpp("kDraftMetaArgs"),
         ("sim_draft", "DM_STAGE"): cpp("kDraftMetaStage"),
         ("sim_draft", "DRAFT_STAGES"): cpp("kDraftStages"),
+        # The stack effect (wind phase 5): its regions follow the K words.
+        ("sim_draft", "DRAFT_SC_BASE"): phi_a + 5 * cells,
+        ("sim_draft", "DRAFT_SB"): phi_a + 5 * cells + 2 * coarse_cells,
+        ("sim_draft", "DRAFT_SPHI_A"): phi_a + 6 * cells + 2 * coarse_cells,
+        ("sim_draft", "DRAFT_SPHI_B"): phi_a + 7 * cells + 2 * coarse_cells,
+        ("common", "DRAFT_STACK_FIELD"): phi_a + 8 * cells + 2 * coarse_cells,
+        ("common", "DRAFT_STACK_LIVE"): phi_a + 10 * cells + 2 * coarse_cells,
+        ("sim_draft", "DM_HEAT_SEEN"): cpp("kDraftMetaHeatSeen"),
+        ("sim_draft", "DM_HEAT_CLOCK"): cpp("kDraftMetaHeatClock"),
+        ("sim_draft", "DM_BOX_HOT"): cpp("kDraftMetaBoxHot"),
+        ("sim_draft", "DM_HEAT_START"): cpp("kDraftMetaHeatStart"),
     }
     checked.append("wind drafts")
     for (where, name), v in want.items():
@@ -3117,6 +3128,23 @@ def check_heat_mirror():
         except Exception:
             return None
 
+    # The heat updraft's readers (wind phase 5) name a few heat.h words too:
+    # sim_draft.wgsl under the same HM_* names, common.wgsl as WH_* (it is
+    # prepended to sim_step and sim_heat, which already define the HM_* ones).
+    sd = read("assets/shaders/sim_draft.wgsl") or ""
+    for w, c in _HEAT_CONSTS.items():
+        mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", sd, re.M)
+        if mw and int(mw.group(1), 0) != (cpp_value(c) or -1):
+            problems.append(f"heat: sim_draft.wgsl {w} = {mw.group(1)} but heat.h {c} = {cpp_value(c)}")
+    cw = read("assets/shaders/common.wgsl") or ""
+    for w, c in (("WH_ENTRY_HAS", "kHeatEntryHas"), ("WH_ENTRY_PAGE", "kHeatEntryPage"),
+                 ("WH_PAGE_WORDS", "kHeatPageWords"), ("WH_HM_FREE_TOP", "kHmFreeTop"),
+                 ("WH_HM_NEXT_FRESH", "kHmNextFresh"), ("WH_HM_ENTRY", "kHmEntry")):
+        mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", cw, re.M)
+        if not mw:
+            problems.append(f"heat: common.wgsl lost {w} (the heat updraft's reader)")
+        elif int(mw.group(1), 0) != (cpp_value(c) or -1):
+            problems.append(f"heat: common.wgsl {w} = {mw.group(1)} but heat.h {c} = {cpp_value(c)}")
     for n, txt in files.items():
         for w, c in _HEAT_CONSTS.items():
             mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", txt, re.M)

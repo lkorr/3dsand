@@ -624,7 +624,11 @@
     "windGasScale": 1,
     "windPartScale": 1,
     "windDragRef": 40,
-    "windWakeChunks": 96
+    "windWakeChunks": 96,
+    "windUpdraftGain": 10,
+    "windUpdraftCap": 20,
+    "windUpdraftInflow": 0.25,
+    "windStackGain": 1
   },
   "render": {
     "fluidParticleSize": 0.58,

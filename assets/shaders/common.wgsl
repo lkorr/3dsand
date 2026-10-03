@@ -1018,6 +1018,13 @@ struct TickParams {
   // voxels, and its gate (0 = windAtQ is the ambient field exactly).
   draftOrigin : vec3<i32>,
   draftMode : u32,
+  // HEAT UPDRAFTS + THE STACK EFFECT (world.h; windHeatQ below): lift per heat
+  // unit and its cap (Q16.16 cells/s), the inflow per unit of lift gradient
+  // (Q16), the stack field's share (Q8). updraftGainQ 0 = no heat term.
+  updraftGainQ : i32,
+  updraftCapQ : i32,
+  updraftInflowQ : i32,
+  draftStackQ : i32,
 };
 
 // ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------
@@ -3006,6 +3013,11 @@ const DRAFT_NX : i32 = 64;
 const DRAFT_NY : i32 = 32;
 const DRAFT_NZ : i32 = 64;
 const DRAFT_FIELD_BASE : u32 = 274432u;
+// THE STACK FIELD (sim_draft.wgsl's third right-hand side, world.h
+// kDraftStack*): S = P(b) - b per fine cell, 3 x i16 Q12 of the updraft cap,
+// and the word that says the published solve saw any heat at all.
+const DRAFT_STACK_FIELD : u32 = 1720320u;
+const DRAFT_STACK_LIVE : u32 = 1982464u;
 
 fn draftSext(v : u32) -> i32 { return bitcast<i32>(v << 16u) >> 16u; }
 
@@ -3074,6 +3086,172 @@ fn draftApplyF(p : vec3f, amb : vec3f, R : ptr<uniform, RenderParams>) -> vec3f 
   }
   let open = clamp((abs(rx.x) + abs(rz.z)) * 0.5, 0.0, 1.0);
   return rx * amb.x + rz * amb.z + vec3f(0.0, amb.y * open, 0.0);
+}
+
+// ============================ HEAT UPDRAFTS ==================================
+// Wind phase 5 (docs/RESEARCH_wind.md §4.4, DESIGN.md §9b "Heat updrafts").
+// The temperature layer (sim_heat.wgsl) keeps the local excess X over the
+// ambient per 2^3 block in a sparse per-chunk pool, and its target already
+// leans UP a source's column (sim.heatUpGain). The sim's wind reads it here,
+// at the ONE composition point (windAmbQ), so the CA's drift bias and gas
+// intent, the heavy-gas lift, the entrainment test and the particle drag all
+// stand in the same rising air:
+//
+//   lift   = min(G x max_k(w_k X(p - dy_k)), cap)        straight up
+//   inflow = G x f x (X(p + 4) - X(p - 4)) per axis      toward the hotter side
+//   stack  = the draft volume's S = P(b) - b             (sim_draft.wgsl)
+//
+// G = sim.windUpdraftGain, cap = sim.windUpdraftCap, f = sim.windUpdraftInflow
+// and the stack share sim.windStackGain, all integers by the time they get
+// here (SubmitTick). The look-down (0, 8, 16 and 32 voxels below, weighted
+// 16, 13, 10 and 6 sixteenths) carries the lift ~4 m over a source whose own
+// warm air reaches ~1.2 m: a plume is taller than its heat field, and X is a
+// temperature, not a flow.
+//
+// What the lift DOES depends on the consumer, and the CA's answer is the
+// surprising one: a light gas already rises one cell a substep in calm air,
+// the CA's ceiling, so the lift cannot make it climb faster -- it STRAIGHTENS
+// it (cancels the crosswind lean and any downdraft, gasIntentW's `fh - up`)
+// and draws smoke in at the base. A heavy gas, which never rose at all, is
+// lifted (sim_step.wgsl stepHeavyGas). Particles take the full velocity
+// through their drag law, so light ones loft and embers fall slower.
+//
+// COST (rule 2). Nothing is stored and nothing is woken: the term is read only
+// where the field already was (moving voxels of awake chunks, through the CA's
+// per-block cache; particles in flight). No heat page anywhere costs two
+// shared loads; a column with no page in its chunk or the two below, three
+// more; only a paged column reads the pool.
+//
+// RIGIDBODIES DO NOT FEEL IT. The pool is GPU-only, and windfield.cpp's CPU
+// mirror (debris, corpses, trees, the F1 readout) cannot see it without a
+// synchronous readback, which is banned. It stays the ambient field.
+//
+// TWO BLOCKS, ONE STRIPPED, for the WIND DRAFTS reason: only a body that
+// declares `> heatPool` (sim_step, sim_heat, sim_particle, sim_draft) keeps the
+// BOUND accessors (resources.cpp kHeatWindBound*); every other shader --
+// sim_gas and sim_fluid included -- compiles the stubs and sees no heat term.
+// The WH_* words must match src/sim/heat.h (check_invariants `heat`).
+const WH_ENTRY_HAS : u32 = 0x80000000u;
+const WH_ENTRY_PAGE : u32 = 0x00FFFFFFu;
+const WH_PAGE_WORDS : u32 = 1536u;
+const WH_HM_FREE_TOP : u32 = 1u;
+const WH_HM_NEXT_FRESH : u32 = 2u;
+const WH_HM_ENTRY : u32 = 128u;
+// >>>HEAT_WIND_BOUND_BEGIN<<<
+const HEAT_WIND_BOUND : bool = true;
+fn windHeatMeta(i : u32) -> u32 { return atomicLoad(&heatMeta[i]); }
+fn windHeatPool(i : u32) -> u32 { return heatPool[i]; }
+// >>>HEAT_WIND_BOUND_END<<<
+// >>>HEAT_WIND_UNBOUND_BEGIN<<<
+const HEAT_WIND_BOUND : bool = false;
+fn windHeatMeta(i : u32) -> u32 { return 0u; }
+fn windHeatPool(i : u32) -> u32 { return 0u; }
+// >>>HEAT_WIND_UNBOUND_END<<<
+
+// Any heat page out at all? Two loads every thread shares.
+fn windHeatAny() -> bool {
+  return windHeatMeta(WH_HM_NEXT_FRESH) != windHeatMeta(WH_HM_FREE_TOP);
+}
+// The heat page entry of world chunk wc, or 0 (no page, or outside the
+// window: heat is window-only, exactly as sim_heat.wgsl's heatX reads it).
+fn windHeatEntry(wc : vec3<i32>, o : vec3<i32>) -> u32 {
+  if (!chunkInWindow(wc, o)) { return 0u; }
+  let e = windHeatMeta(WH_HM_ENTRY + chunkSlotIndex(wc));
+  return select(0u, e, (e & WH_ENTRY_HAS) != 0u);
+}
+// X of world cell c's block, in the chunk whose (non-zero) entry is e.
+fn windHeatXIn(e : u32, c : vec3<i32>) -> i32 {
+  let b = vec3<u32>(c & vec3<i32>(CHUNK_MASK)) >> vec3<u32>(1u);
+  return i32(windHeatPool((e & WH_ENTRY_PAGE) * WH_PAGE_WORDS +
+                          (b.z * 8u + b.y) * 8u + b.x) & 0xFFu);
+}
+fn windHeatX(c : vec3<i32>, o : vec3<i32>) -> i32 {
+  let e = windHeatEntry(worldChunkOf(c), o);
+  if (e == 0u) { return 0; }
+  return windHeatXIn(e, c);
+}
+// windHeatX for a cell near p, reusing p's chunk entry e0 (non-zero) when the
+// cell lies in p's chunk wc: one atomic load saved per same-chunk neighbour.
+fn windHeatXNear(c : vec3<i32>, wc : vec3<i32>, e0 : u32, o : vec3<i32>) -> i32 {
+  if (all(worldChunkOf(c) == wc)) { return windHeatXIn(e0, c); }
+  return windHeatX(c, o);
+}
+
+// THE LIFT at world cell p, Q16.16 cells/s in [0, cap]. Also what
+// sim_draft.wgsl samples per fine cell as the stack effect's source, so the
+// two cannot disagree about where air rises. INTEGER: X <= 255 and the weights
+// <= 16, and SubmitTick clamps the gain to <= 2^18 per heat unit (the def
+// row's 40 m/s), so the product stays under 2^31.
+fn windHeatUpQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> i32 {
+  if (!HEAT_WIND_BOUND || (*T).updraftGainQ <= 0 || !windHeatAny()) { return 0; }
+  let o = (*T).origin;
+  let wc = worldChunkOf(p);
+  return windHeatLiftIn(p, wc, windHeatEntry(wc, o), windHeatEntry(wc - vec3<i32>(0, 1, 0), o),
+                        windHeatEntry(wc - vec3<i32>(0, 2, 0), o), T);
+}
+// The lift given the entries of p's chunk (e0) and the two under it (e1, e2):
+// windHeatQ looks them up once and shares e0 with the inflow. The entries are
+// atomic loads (the pool's table is atomic in every module), the term's cost.
+fn windHeatLiftIn(p : vec3<i32>, wc : vec3<i32>, e0 : u32, e1 : u32, e2 : u32,
+                  T : ptr<uniform, TickParams>) -> i32 {
+  if ((e0 | e1 | e2) == 0u) { return 0; }
+  var best = 0;
+  for (var k = 0u; k < 4u; k++) {
+    let dy = select(select(select(32, 16, k == 2u), 8, k == 1u), 0, k == 0u);
+    let wt = select(select(select(6, 10, k == 2u), 13, k == 1u), 16, k == 0u);
+    let c = p - vec3<i32>(0, dy, 0);
+    // p - 32 is at most two chunks under p's, so e0..e2 cover every sample.
+    let dc = wc.y - worldChunkOf(c).y;
+    let e = select(select(e2, e1, dc == 1), e0, dc == 0);
+    if (e != 0u) { best = max(best, windHeatXIn(e, c) * wt); }
+  }
+  return min((best * (*T).updraftGainQ) / 16, (*T).updraftCapQ);
+}
+
+// The draft volume's stack correction at p: the published S = P(b) - b (Q12
+// of the cap) in Q16.16 cells/s, times the stack share. NEAREST cell, as
+// draftApplyQ. Zero outside the box, with the volume off, or when the last
+// solve saw no heat (one load). Inside the box lift + S = P(b): the rising air
+// projected onto what the walls allow -- a sealed room's column turns over in
+// place, a room with a low and a high opening breathes through them.
+fn draftStackAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if (!DRAFT_BOUND || (*T).draftMode == 0u || (*T).draftStackQ <= 0) { return vec3<i32>(0); }
+  if (draftWord(DRAFT_STACK_LIVE) == 0u) { return vec3<i32>(0); }
+  let d = (p - (*T).draftOrigin) >> vec3<u32>(DRAFT_CELL_SHIFT);
+  if (!draftInside(d)) { return vec3<i32>(0); }
+  let i = DRAFT_STACK_FIELD + 2u * u32((d.z * DRAFT_NY + d.y) * DRAFT_NX + d.x);
+  let w0 = draftWord(i);
+  let s = vec3<i32>(draftSext(w0), draftSext(w0 >> 16u), draftSext(draftWord(i + 1u)));
+  // |s| < 2^15 and cap >> 12 <= 6,400 (40 m/s), then / 256 x a share <= 4x.
+  let unit = (*T).updraftCapQ >> 12u;
+  return ((s * unit) / 256) * (*T).draftStackQ;
+}
+
+// THE WHOLE HEAT TERM at p (windAmbQ adds it): lift, the inflow toward the
+// column, and inside the draft box the stack correction. One compare with the
+// gain at 0, which is what keeps sim.windUpdraftGain 0 an exact identity.
+fn windHeatQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if (!HEAT_WIND_BOUND || (*T).updraftGainQ <= 0 || !windHeatAny()) { return vec3<i32>(0); }
+  let o = (*T).origin;
+  let wc = worldChunkOf(p);
+  let e0 = windHeatEntry(wc, o);
+  var w = vec3<i32>(0, windHeatLiftIn(p, wc, e0, windHeatEntry(wc - vec3<i32>(0, 1, 0), o),
+                                      windHeatEntry(wc - vec3<i32>(0, 2, 0), o), T), 0);
+  // THE INFLOW: toward the hotter side, at the sample's own level, where the
+  // heat field's sideways gradient lives -- strongest beside a source and ~0
+  // straight over it (the tent is symmetric there). Only in a paged chunk: a
+  // sample outside every page is outside the heat's reach. A neighbour in p's
+  // own chunk reuses e0 (every one but an edge block's).
+  if ((*T).updraftInflowQ > 0 && e0 != 0u) {
+    let gx = windHeatXNear(p + vec3<i32>(4, 0, 0), wc, e0, o) -
+             windHeatXNear(p - vec3<i32>(4, 0, 0), wc, e0, o);
+    let gz = windHeatXNear(p + vec3<i32>(0, 0, 4), wc, e0, o) -
+             windHeatXNear(p - vec3<i32>(0, 0, 4), wc, e0, o);
+    let lim = wq((*T).updraftCapQ, (*T).updraftInflowQ);
+    w.x = clamp(wq(gx * (*T).updraftGainQ, (*T).updraftInflowQ), -lim, lim);
+    w.z = clamp(wq(gz * (*T).updraftGainQ, (*T).updraftInflowQ), -lim, lim);
+  }
+  return w + draftStackAtQ(p, T);
 }
 
 // THE FIELD. Everything above exists so that this and the per-blade path are
@@ -3679,7 +3857,8 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
 }
 
 // The AMBIENT half of windAtQ: the weather field with the draft volume's
-// shelter applied, WITHOUT the primitives. Smooth at the draft cell's 0.4 m and
+// shelter applied, plus the heat term (lift, inflow, stack -- windHeatQ),
+// WITHOUT the primitives. Smooth at the draft cell's 0.4 m and
 // coarser, which is what lets the CA cache it per 4^3 block (sim_step.wgsl
 // caWindAt) while the primitives -- a fan's edge can be sharp -- stay exact per
 // cell. Callers gate on windMode themselves (windAtQ above does).
@@ -3740,7 +3919,10 @@ fn windAmbQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
   let amb = vec3<i32>(wq(dl.x, spd), 0, wq(dl.y, spd)) + extra +
             vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
             vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z));
-  return draftApplyQ(p, amb, T);
+  // ...and THE HEAT TERM after the shelter (HEAT UPDRAFTS above): rising air
+  // is not weather the walls turn, it is made where it is; inside the draft
+  // box its own projection (the stack field) is what the walls do to it.
+  return draftApplyQ(p, amb, T) + windHeatQ(p, T);
 }
 
 // ============================ THE CURRENT FIELD =============================

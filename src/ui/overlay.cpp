@@ -1706,6 +1706,34 @@ void Overlay::DrawDevWorld(UIState& s) {
                           "day (base + swing < 0) so the peaks keep their snow.");
     changed |= EditableSliderInt("snowline swing##heat", &hs.heatSnowlineSwing, 0, 63);
     ImGui::SetItemTooltip("Day / night swing of the snowline climate (day = base + swing).");
+
+    // ---- heat-driven wind (wind phase 5; common.wgsl HEAT UPDRAFTS) ----
+    // Def-row ranges. Live: they ride TickParams, and a change re-solves the
+    // draft volume's stack field (Simulation::NoteDraftHeatKnobs).
+    ImGui::SeparatorText("updrafts (heat -> wind)");
+    changed |= EditableSliderFloat("updraft strength##heat", &hs.windUpdraftGain, 0.0f, 40.0f,
+                                   "%.1f m/s per 100");
+    ImGui::SetItemTooltip("Rising air over heat: m/s of lift per 100 heat units above ambient\n"
+                          "(the air over a fire ~100, over lava ~200). Smoke over a fire stands\n"
+                          "up in a crosswind, heavy gases are carried up, light particles loft.\n"
+                          "Debris, corpses and trees do NOT feel it (GPU only). 0 = off.");
+    changed |= EditableSliderFloat("updraft cap##heat", &hs.windUpdraftCap, 0.0f, 40.0f, "%.1f m/s");
+    ImGui::SetItemTooltip("The most lift any heat makes. ~16 m/s holds a falling ember up.");
+    changed |= EditableSliderFloat("inflow strength##heat", &hs.windUpdraftInflow, 0.0f, 4.0f, "%.2fx");
+    ImGui::SetItemTooltip("Air drawn in toward a hot column at its base, per unit of lift\n"
+                          "gradient: what pulls nearby smoke into a plume.");
+    changed |= EditableSliderFloat("stack effect##heat", &hs.windStackGain, 0.0f, 4.0f, "%.2fx");
+    ImGui::SetItemTooltip("Inside the draft volume round you, the lift is made to respect the\n"
+                          "walls: a hot room with a low and a high opening draws air in at one\n"
+                          "and vents at the other (a burning house breathes). 0 = local lift only.");
+    if (ImGui::SmallButton("reset updrafts##heat")) {
+      static const Tuning d{};
+      hs.windUpdraftGain = d.sim.windUpdraftGain;
+      hs.windUpdraftCap = d.sim.windUpdraftCap;
+      hs.windUpdraftInflow = d.sim.windUpdraftInflow;
+      hs.windStackGain = d.sim.windStackGain;
+      changed = true;
+    }
     if (changed) {
       // LoadTuning's hand-written rule (tuning_params.def above the row): the
       // snowline must stay frozen by day.

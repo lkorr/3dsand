@@ -2136,6 +2136,21 @@ TP_F(sim, windDragRef, NO_WGSL, 40.0f, 1.0f, 200.0f)
 // 0 is a legal "no primitive may wake anything", which is the switch that
 // turns entrainment off without turning the fans off.
 TP_I(sim, windWakeChunks, NO_WGSL, 96, 0, kWindWakeCap)
+// ---- heat updrafts + the stack effect (wind phase 5; common.wgsl HEAT
+// UPDRAFTS, sim_draft.wgsl THE STACK EFFECT). Metres per second, converted
+// to Q16.16 cells/s in SubmitTick, so no shader sees a float. The gain is
+// lift per 100 heat units of excess (a lava pool's column reads ~200, the
+// air over a fire ~100); 0 is no heat term at all, the exact identity. The
+// two maxima of 40 m/s are windHeatUpQ's and draftStackAtQ's i32 bounds.
+TP_F(sim, windUpdraftGain, NO_WGSL, 10.0f, 0.0f, 40.0f)
+TP_F(sim, windUpdraftCap, NO_WGSL, 20.0f, 0.0f, 40.0f)
+// The inflow toward a hot column per unit of lift gradient (the lift the
+// heat 4 voxels either side would make, differenced). 4x keeps windHeatQ's
+// inflow product inside i32.
+TP_F(sim, windUpdraftInflow, NO_WGSL, 0.25f, 0.0f, 4.0f)
+// The draft volume's stack correction: 1 = the projected flow (a room
+// breathes through its openings), 0 = the local lift alone.
+TP_F(sim, windStackGain, NO_WGSL, 1.0f, 0.0f, 4.0f)
 // The current field (plan component 8). CPU-side by design —
 // the shader reads resolved primitives, never a knob.
 // ---- the current field (plan component 8) ----

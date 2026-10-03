@@ -491,6 +491,10 @@ for f in "${FILES[@]}"; do
   # BodyReadsDrafts) -- so the strip below always runs.
   stripDraftB=1; stripDraftU=0
   if grep -q '> draftField' "$f"; then stripDraftB=0; stripDraftU=1; fi
+  # The HEAT UPDRAFTS reader, the same shape (LoadShader's BodyReadsHeat):
+  # BOUND for a body that declares `> heatPool`, the stubs otherwise.
+  stripHeatB=1; stripHeatU=0
+  if grep -q '> heatPool' "$f"; then stripHeatB=0; stripHeatU=1; fi
   # THE TICKET PROBE (LoadShader's BodyResolvesTickets): BOUND for a body that
   # declares `>` + optional whitespace + `pageTable` and no `uniform> R :`.
   stripTicketB=1; stripTicketU=0
@@ -498,7 +502,11 @@ for f in "${FILES[@]}"; do
     stripTicketB=0; stripTicketU=1
   fi
   commonSrc="$TMP/common_${name}"
-  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" '
+  awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport"       -v db="$stripDraftB" -v du="$stripDraftU" -v tb="$stripTicketB" -v tu="$stripTicketU" -v hb="$stripHeatB" -v hu="$stripHeatU" '
+    /HEAT_WIND_UNBOUND_BEGIN/ { print; s = hu; next }
+    /HEAT_WIND_UNBOUND_END/   { print; s = 0;  next }
+    /HEAT_WIND_BOUND_BEGIN/   { print; s = hb; next }
+    /HEAT_WIND_BOUND_END/     { print; s = 0;  next }
     /PAGE_TABLE_WRITE_BEGIN/ { print; s = sw; next }
     /PAGE_TABLE_WRITE_END/   { print; s = 0;  next }
     /PAGE_TABLE_BEGIN/       { print; s = sr; next }

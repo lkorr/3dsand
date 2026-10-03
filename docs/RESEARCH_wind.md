@@ -171,11 +171,57 @@ evaluated analytically at any sample point like a point light.
 
 ### 4.4 Heat / updrafts — derived, not simulated (v1)
 
-**Update 2026-10-02:** a temperature layer now exists (`src/sim/heat.h`, `sim_heat.wgsl`,
-DESIGN.md §4 Heat, `docs/PLAN_temperature.md`): a sparse per-chunk heat pool with a
-per-block target that rises preferentially upward (`sim.heatUpGain`). Heat-driven updrafts
-should read that pool instead of the hot-material count below; this section is the v1
-design as written before it existed.
+**BUILT 2026-10-02 (wind phase 5, parts 1 and 2) -- read this, not the v1 text below.**
+The temperature layer (`src/sim/heat.h`, `sim_heat.wgsl`, DESIGN.md "Heat") made the
+hot-material count unnecessary: the wind reads the heat pool directly.
+
+- **Where it enters.** common.wgsl HEAT UPDRAFTS, added at the one composition point:
+  `windAmbQ = draftApplyQ(p, amb) + windHeatQ(p)`. So the CA's per-4^3-block wind cache
+  (sim_step camask), the gas intent, the particle drag and the entrainment test all see
+  it; nothing else composes wind. `windHeatQ` = lift + inflow + (inside the draft box)
+  the stack correction.
+- **Lift**: `min(G x max_k(w_k X(p - dy_k)), cap)` -- the excess X of the sample's block
+  and of the blocks 8, 16 and 32 voxels under it, weighted 16/13/10/6 sixteenths, so a
+  plume stands ~4 m over a source whose warm air reaches ~1.2 m. `sim.windUpdraftGain`
+  10 m/s per 100 heat units (air over a fire reads ~100, over lava ~200),
+  `sim.windUpdraftCap` 20 m/s.
+- **Inflow**: `G x f x (X(p+4) - X(p-4))` per horizontal axis, toward the hotter side,
+  only in a paged chunk; `sim.windUpdraftInflow` 0.25. Strongest beside a source, ~0 over
+  it (the tent filter is symmetric there).
+- **Integers**: every knob is a `NO_WGSL` float row converted in SubmitTick into four
+  TickParams words (`updraftGainQ`, `updraftCapQ`, `updraftInflowQ`, `draftStackQ`); the
+  def rows' maxima are the kernels' i32 bounds. Gain 0 is the exact pre-phase-5 field.
+- **Rule 2**: nothing stored, nothing woken. A wind sample costs two shared loads when no
+  heat page exists anywhere, three more when its chunk and the two under it have none.
+  Gate `heat-updraft`'s cost arm: a heat-free world (`sim.heatMode` 0 -- the harness map
+  has hot things of its own) with the shipped gain and with gain 0 is cell-for-cell
+  identical with the same awake count (35 / 35). With the harness's own heat on, the same
+  pair read 58 / 63 awake chunks: where heat exists the lift does move gas, and the fire
+  scenes' `--perf` runs are what price it (§14.11).
+- **Readers that do NOT get it**: shaders that do not bind the pool compile a stub
+  (`HEAT_WIND_UNBOUND`, resources.cpp `BodyReadsHeat`) -- sim_gas (parcels live outside
+  the window, where there is no heat), sim_fluid (an updraft over a pond is not a thing
+  MPM nodes should feel), the renderer's `windAt` (streaks, F4 arrows, grass) and the
+  CPU mirror (`windfield::Probe`): **debris, corpses and trees do not feel updrafts** --
+  the pool is GPU-only and a synchronous readback is banned.
+- **What it does in the CA, honestly.** A light gas already climbs one cell a substep in
+  calm air -- the CA's ceiling -- so the lift CANNOT make smoke rise faster; it straightens
+  it (`gasIntentW`'s `lean = fh - up` cancels a crosswind lean and any downdraft) and draws
+  it in at the base. Gate `heat-updraft`: hot and cold smoke both rise ~32 cells in 16
+  ticks; the hot puff's downwind drift is what the lift removes. A HEAVY gas, which never
+  rose, is now carried up the column (sim_step `stepHeavyGas` reads `windHeatUpQ` alone, so
+  a gale's gust bands cannot lift a cellar of chlorine): +30 cells over cold in 40 ticks.
+  Particles take the full velocity through their drag law: ember particles (wind response
+  8) released at rest over lava are all still airborne at 40 ticks, the cold ones all on
+  the floor. Making smoke visibly outrun cold smoke would need cold smoke to climb SLOWER
+  than the CA ceiling (a global buoyancy change); not done -- that is the owner's call.
+- **`wfThermal` is left alone.** It is the regime's procedural gust texture: a zero-mean
+  sine pattern on a sunny calm day, not a mean updraft tied to anything hot. It does not
+  double-count with real heat (it is neither placed over fires nor scaled by them), and
+  removing it would change the weather of every heat-free day.
+- **Part 2, the stack effect**: §14.11.
+
+The v1 design as written before the temperature layer existed follows.
 
 At the time of writing there was no temperature anywhere in the sim (fire is reaction-tag driven,
 `tag:hot`). Do NOT introduce simulated heat state in v1. Instead: a per-chunk
@@ -309,7 +355,7 @@ integral curves of the slope field). Toggle = in-game key + tuner bool.
 | 4 | `windAtQ` + CA drift bias + entrainment, behind `sim.windMode=0` | none while gated | **DONE** — the `wind` gate: reversing the direction knob reverses the smoke, the settled bed is bitwise unmoved under drift, twice-run equality holds |
 | 2 | Primitive list + op plumbing (spell VM op, dev placement), footprint wake, viz shows primitives | none (empty list is an exact identity) | **DONE 2026-08-26** — the `wind-prim` gate: a licensed fan creeps a settled bed 12.65 cells downwind in a chamber that is ASLEEP, waking 10 chunks and losing no grains, with the suite's page-fault counter at 0. An unlicensed fan blows smoke and leaves the bed bitwise unmoved |
 | 4b | Flip `sim.windMode` to 1 | rebaseline | **DONE** — `882a30f3` → `47dd1520`; sleep still 0/32768 chunks active, dense reproduces the same hash, both smoke tables re-recorded with `worldgen` byte-identical |
-| 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline | fire columns loft smoke/embers; tornado lifts sand |
+| 5 | Heat counts → updraft term; violent-wind excite-to-particle; capes when cloth exists | rebaseline | **updraft + stack effect DONE 2026-10-02** (§4.4, §14.11; gates `heat-updraft`, `draft-stack`) -- reads the heat pool, not counts. Excite-to-particle and capes still open |
 | 6 | Draft volumes: local coarse relaxation so a room vents through its openings (§11) | rebaseline | **DONE 2026-09-30 (§14)** -- the `drafts` gate: sealed hut 0.037, door + leeward window 0.42 along +X, smoke leaves through the window; the pinned hash did not move |
 
 Phases 3 and 4 landed together, and in that order, because §4.6 is wrong about
@@ -981,7 +1027,8 @@ structure in the volume): rebaseline once at the end.
 - Several volumes: put a second bounded volume where active gas meets
   structure away from the player (a burning house 60 m off), budget-charged
   like primitives.
-- Heat as a pressure source (phase 5): stack effect, burning rooms that vent.
+- ~~Heat as a pressure source (phase 5): stack effect, burning rooms that vent.~~
+  **Done 2026-10-02, §14.11.**
 - Wake extension: an upwind-blockage shelter term for the lee beyond the
   potential-flow pocket. Directional, so it needs 4 transfers or a sample-time
   march.
@@ -1053,3 +1100,64 @@ Still open (§14.9 stands):
 - porous foliage;
 - grass sway inside the volume, which needs raymarch register headroom;
 - an F1 readout of the volume's state (solves, stage, last publish).
+
+### 14.11 The stack effect: heat as a third right-hand side (wind phase 5, 2026-10-02)
+
+The projection is linear, so heat enters the SAME solve as a third source: the
+heat updraft `b` (common.wgsl `windHeatUpQ`, the exact lift the sim's wind adds,
+in Q12 of `sim.windUpdraftCap`) is sampled per fine cell at the solve's snapshot
+(`coarseBuild`), and the solver finds `phi_b` with
+`div(beta (b e_y - grad phi_b)) = 0` beside `phi_x` / `phi_z` -- coarse mean `b`
+over each pocket, a closed y face's gradient is `b` itself in the reconstruction,
+the fine Schwarz passes relax it in workgroup memory (two more 1,728-word arrays;
+the coarse solve reads its boundary coefficients from the buffer to make room
+for two more, 40 KiB). The published field is the CORRECTION `S = P(b) - b`
+(3 x i16 per cell, world.h `kDraftStackField`), so a reader adds lift + S =
+P(b): the rising air made to respect the walls. Reader: `draftStackAtQ`, inside
+`windHeatQ`, scaled by `sim.windStackGain` (1).
+
+**When it re-solves.** `b` moves without a mask moving, so `args` also starts a
+solve when the box holds heat (the last snapshot saw `b != 0`, or `maskDirty`
+saw an active chunk of the box with a heat page), the heat layer's activity
+counters (heat.h `kHmRelaxTicks + kHmFrees + kHmAllocs + kHmReleased`) moved
+since the last solve began, and `DRAFT_HEAT_PERIOD` (16) ticks have passed. A
+box with no heat never solves for heat; a cold snapshot skips every `b` line of
+every pass (`DM_BOX_HOT`), so a cold box costs what it did, bit for bit (gate
+`drafts`: the transfer numbers did not move, purity 0 words differ). The field
+is now a function of geometry AND heat, still with no history beyond the
+pipeline's stage word. A change of the gain, cap or stack share forces a
+rebuild (Simulation::NoteDraftHeatKnobs).
+
+**Gate `draft-stack`** (selftest_heat.cpp): a 2 x 3 x 2 m hut on its own pad,
+a low and a high 8 x 8 opening in the same wall, calm air, a 6x3x6 lava slab
+under a lid. S.x at the low opening **+3.62 m/s (in)**, at the high one
+**-3.12 m/s (out)**; a smoke puff leaves by the high opening (47 samples) and
+never by the low one (0). The same hut cold: S = 0 (the field is not live).
+
+**Cost** (`--perf`, RTX 3060 Ti, `SANDVOX_RUN_EXCLUSIVE=1`, main f1169c4's exe
+against this tree, both fire scenarios; GPU per frame):
+
+| | forestfire main | forestfire heat | village-fire main | village-fire heat |
+|---|---|---|---|---|
+| frame wall p50 | 21.40 ms | 20.77 ms | 31.09 ms | 29.77 ms |
+| GPU total | 30.83 ms | 29.46 ms | 49.64 ms | 49.64 ms |
+| caLoop | 5.55 | 5.42 | 13.34 | 13.16 |
+| caMask (both substeps) | 0.51 | 0.50 | 1.09 | 1.12 |
+| draft rows | 0.51 | 0.69 | 0.42 | 0.58 |
+| awake chunks (mean) | 1,512 | 1,403 | 3,885 | 3,792 |
+
+The heat lookups made the CA's per-block wind cache 0.27 ms heavier in the
+village fire (1.36 ms); the cache is now written on substep 0 only (the field
+cannot change between substeps and both `camask` rows walk one dirty list --
+`caMask1` binds substep 1's pass slice to know which it is), which took it back
+to 1.12. The stack solve adds ~0.17 ms. Smoke does NOT spread to more chunks:
+straighter plumes leave the window top sooner, and the awake count fell 2-7%.
+Run-to-run noise on these scenarios is ~1-2 ms of GPU total (two boots of the
+same tree read 50.8 and 52.7 ms). The scenario hashes are identical across the
+wind-cache change and the `windHeatQ` refactor, which is the proof both are
+exact.
+
+Still open: several volumes (a burning house far from the player breathes
+only through its local lift); the renderer's `windAt` (streaks, arrows, grass)
+does not see the heat term or the stack field; rigidbodies (the CPU mirror)
+do not feel updrafts.

@@ -25,6 +25,11 @@
 //   heat-live     a live knob change (the F1 slider path) re-targets heat that
 //                 had settled, with no source changing: raising the side gain
 //                 lights foliage beside a sealed lava chamber.
+//   heat-updraft  heat-driven wind (wind phase 5): smoke over hot rock stands
+//                 straight in a crosswind, a heavy gas is carried up, embers
+//                 loft; a heat-free world is bit-identical with the term off.
+//   draft-stack   the stack effect: a hot hut with a low and a high opening
+//                 draws air in at one and vents at the other; cold, nothing.
 //
 // Every fixture is a SEALED STONE ROOM (floor, walls, roof): no sky, so no
 // sun rule touches it, and its climate is PINNED (Simulation::
@@ -40,6 +45,7 @@
 // depends on.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1700,6 +1706,529 @@ Status GateHeatLive(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// heat-updraft (wind phase 5: common.wgsl HEAT UPDRAFTS)
+// ---------------------------------------------------------------------------
+// SIX TALL SEALED ROOMS in a row, alternately HOT (a 10x4x10 lava slab under a
+// stone lid on the floor) and COLD (the same slab in stone), climate pinned,
+// dim dawn frozen, a pinned crosswind along +X (heat-updraft.windSpeed, no
+// gusts) and the draft volume OFF -- with sim.draftMode 0 the ambient field
+// passes the walls, so each room is a column of open-air weather that cannot
+// lose its contents, and only the LOCAL heat term is under test (draft-stack
+// tests the projected one). After `settleTicks` for the heat to relax, three
+// releases, the same cells in each pair:
+//   smoke     (rooms 0 / 1)  read after smokeTicks. The CA's light gas already
+//             climbs one cell a substep in calm air -- the ceiling -- so the
+//             lift cannot make it RISE faster; what it does is STRAIGHTEN it
+//             (gasIntentW's lean = fh - up). Asserted: the hot puff's rise is
+//             at least smokeRiseRatioMin of the cold one's (both are reported:
+//             "rises faster" is not a claim the CA can make), and its downwind
+//             drift at most smokeLeanRatioMax of the cold one's.
+//   chlorine (2 / 3)  a HEAVY gas, read after heavyTicks: cold it never rises;
+//             over heat the lift carries it (stepHeavyGas). Asserted: the hot
+//             cloud's centroid at least heavyRiseMin cells above the cold one's.
+//   embers   (4 / 5)  emberCount ember PARTICLES released at rest, read after
+//             emberTicks. Cold they fall onto the lid; hot the drag pulls them
+//             toward the rising air. Asserted: at least emberColdLandedMin of
+//             the cold ones lie on the lid (within 3 cells of it), at most
+//             emberHotLandedMax of the hot ones.
+// THE COST CHECK: the cold smoke room alone, from a fresh world with NO heat
+// anywhere (sim.heatMode 0: the harness map has hot things of its own, ~100
+// pages of them in this window), run with the shipped gain and with gain 0 --
+// the final cells must be identical and the window must hold the same number
+// of awake chunks. A heat-free world pays nothing for the term and wakes
+// nothing because of it. (With the harness's own heat ON the same pair read
+// 58 vs 63 awake chunks: where heat exists the lift does move gas into more
+// chunks -- the fire scenes' --perf runs measure what that costs.)
+// Each room stands on its own ground (the highest point of its footprint): a
+// room hung in the air is an island, which the island scan turns into a
+// falling rigid body, and a room sunk into a hillside stands below the wind
+// profile's reference height and sees almost no crosswind. Ticked on THE tick
+// (TickCursor).
+// The rooms' floor is set per run, 2 cells over the ground (FixtureYOver): the
+// wind's log profile is measured from the ground, and a room sunk in the
+// terrain would stand in the profile's floor rather than in a crosswind.
+int gUpY[6] = {120, 120, 120, 120, 120, 120};   // per room
+constexpr int kUpZ = 140;   // room interior z 140..155
+constexpr int kUpW = 28, kUpH = 64, kUpD = 16;
+constexpr int kUpRooms = 6;
+constexpr int kUpAmbient = 10;
+int UpRoomX(int k) { return 96 + 40 * k; }
+Box UpRoom(int k) {
+  return {UpRoomX(k), gUpY[k], kUpZ, UpRoomX(k) + kUpW - 1, gUpY[k] + kUpH - 1, kUpZ + kUpD - 1};
+}
+// The source slab (lava when hot, stone when cold) on the floor; a stone lid
+// and rim round it one cell thick.
+Box UpSlab(int k) {
+  const int cx = UpRoomX(k) + kUpW / 2;
+  return {cx - 5, gUpY[k], kUpZ + 3, cx + 4, gUpY[k] + 3, kUpZ + 12};
+}
+int UpLid(int k) { return gUpY[k] + 4; }
+// The release: 4x4x4, three cells over the lid, over the slab's centre.
+Box UpPuff(int k) {
+  const int cx = UpRoomX(k) + kUpW / 2;
+  return {cx - 2, UpLid(k) + 4, kUpZ + 6, cx + 1, UpLid(k) + 7, kUpZ + 9};
+}
+
+struct UpCloud {
+  uint32_t n = 0;
+  double x = 0, y = 0;
+};
+UpCloud UpCentroid(const Vox& v, const Box& b, uint32_t m0, uint32_t m1 = 0xFFFFFFFFu) {
+  UpCloud c;
+  for (int z = b.z0; z <= b.z1; z++)
+    for (int y = b.y0; y <= b.y1; y++)
+      for (int x = b.x0; x <= b.x1; x++) {
+        const uint32_t m = v.At(x, y, z) & 0xFFFu;
+        if (m != m0 && m != m1) continue;
+        c.n++;
+        c.x += x;
+        c.y += y;
+      }
+  if (c.n) {
+    c.x /= c.n;
+    c.y /= c.n;
+  }
+  return c;
+}
+
+// Rooms (batched under the per-tick cell-op cap), then their slabs and lids in
+// later ticks (two cell ops on one cell in one tick: the first wins).
+void UpBuild(support::TickCursor& ticker, const std::vector<int>& rooms, uint32_t lava,
+             bool hotRooms) {
+  std::vector<CellOp> shell, build;
+  for (int k : rooms) {
+    Room(shell, UpRoom(k));
+    const Box s = UpSlab(k);
+    const bool hot = hotRooms && (k % 2) == 0;
+    for (int z = s.z0 - 1; z <= s.z1 + 1; z++)
+      for (int y = s.y0; y <= s.y1 + 1; y++)
+        for (int x = s.x0 - 1; x <= s.x1 + 1; x++)
+          build.push_back({World::SlotCellIndex({x, y, z}),
+                           s.Has(x, y, z) && hot ? (lava | kFull) : (uint32_t)kMatStone});
+  }
+  for (size_t i = 0; i < shell.size(); i += kMaxCellOpsPerTick) {
+    const size_t n = std::min<size_t>(kMaxCellOpsPerTick, shell.size() - i);
+    ticker({}, std::vector<CellOp>(shell.begin() + (long)i, shell.begin() + (long)(i + n)));
+  }
+  ticker({}, build);
+}
+
+Status GateHeatUpdraft(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  const uint32_t lava = MatId(c, "lava"), smoke = MatId(c, "smoke"),
+                 chlorine = MatId(c, "chlorine"), ember = MatId(c, "ember"),
+                 ash = MatId(c, "ash");
+  if (!lava || !smoke || !chlorine || !ember || !ash) {
+    detail = "need materials lava, smoke, chlorine, ember and ash";
+    return Status::Fail;
+  }
+  const int settle = (int)BaselineNumber("heatUpdraft.settleTicks", 60);
+  const int smokeTicks = (int)BaselineNumber("heatUpdraft.smokeTicks", 16);
+  const int heavyTicks = (int)BaselineNumber("heatUpdraft.heavyTicks", 40);
+  const int emberTicks = (int)BaselineNumber("heatUpdraft.emberTicks", 40);
+  const int emberCount = (int)BaselineNumber("heatUpdraft.emberCount", 16);
+  // Each room's floor ON its own ground (the highest of its footprint): a
+  // fixture hung in the air is an island, and the island scan turns it into a
+  // falling rigid body.
+  for (int k = 0; k < kUpRooms; k++)
+    gUpY[k] = FixtureYOver(UpRoomX(k) - 1, kUpZ - 1, UpRoomX(k) + kUpW, kUpZ + kUpD, kDefaultSeed,
+                           0, kUpH + 8) + 1;
+  DawnPin dawn;
+  PinGuard pins(c.sim, {{UpRoomX(0) - 8, kUpZ - 8, UpRoomX(kUpRooms - 1) + kUpW + 8,
+                         kUpZ + kUpD + 8, kUpAmbient, 0}});
+  {
+    Tuning t = CurrentTuning();
+    t.sim.windMode = 1;
+    t.sim.draftMode = 0;
+    t.wind.weatherAuto = false;
+    t.wind.windDirDeg = 90.0f;   // downwind +X
+    t.wind.windSpeed = (float)BaselineNumber("heatUpdraft.windSpeed", 3.0);
+    t.wind.gustStrength = 0.0f;
+    SetCurrentTuning(t);   // DawnPin restores the original on the way out
+  }
+  const float shippedGain = CurrentTuning().sim.windUpdraftGain;
+  std::string out;
+  bool ok = true;
+  auto note = [&](const std::string& s) { out += (out.empty() ? "" : "; ") + s; };
+
+  // ---- the three hot / cold pairs, released on one tick ----
+  {
+    SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t t = 63000;
+    support::TickCursor ticker{c, t, {UpRoomX(2) >> 4, (gUpY[2] + 16) >> 4, kUpZ >> 4}};
+    UpBuild(ticker, {0, 1, 2, 3, 4, 5}, lava, true);
+    for (int i = 0; i < settle; i++) ticker();
+    const uint32_t xLid = ProbeX(ctx, world, UpRoomX(0) + kUpW / 2, UpLid(0) + 5, kUpZ + 8);
+    const uint32_t xHigh = ProbeX(ctx, world, UpRoomX(0) + kUpW / 2, UpLid(0) + 20, kUpZ + 8);
+    support::TickOps rel;
+    for (int k : {0, 1}) Fill(rel.cells, UpPuff(k), smoke);
+    for (int k : {2, 3}) Fill(rel.cells, UpPuff(k), chlorine);
+    for (int k : {4, 5}) {
+      const Box p = UpPuff(k);
+      for (int i = 0; i < emberCount; i++) {
+        ParticleSpawn s{};
+        s.px = (p.x0 + (i % 4)) * 256 + 128;
+        s.py = (p.y0 + (i / 16) % 4) * 256 + 128;
+        s.pz = (p.z0 + (i / 4) % 4) * 256 + 128;
+        s.vx = s.vy = s.vz = 0;
+        s.payload = ember;
+        s.flags = kPFlagAlive;
+        rel.spawns.push_back(s);
+      }
+    }
+    ticker(rel);
+    uint32_t pc0[2] = {}, pc1[2] = {};
+    ctx.WaitIdle();
+    ReadCountsSync(ctx, world, pc0);
+    UpCloud sm[2], cl[2];
+    uint32_t emLow[2] = {}, emAll[2] = {};
+    Vox v;
+    for (int i = 1; i <= std::max(smokeTicks, std::max(heavyTicks, emberTicks)); i++) {
+      if (i > 1) ticker();
+      if (i == smokeTicks) {
+        ctx.WaitIdle();
+        for (int k = 0; k < 2; k++) {
+          v.Read(ctx, world, UpRoom(k));
+          sm[k] = UpCentroid(v, UpRoom(k), smoke);
+        }
+      }
+      if (i == heavyTicks) {
+        ctx.WaitIdle();
+        for (int k = 0; k < 2; k++) {
+          v.Read(ctx, world, UpRoom(2 + k));
+          cl[k] = UpCentroid(v, UpRoom(2 + k), chlorine);
+        }
+      }
+      if (i == emberTicks) {
+        ctx.WaitIdle();
+        ReadCountsSync(ctx, world, pc1);
+        for (int k = 0; k < 2; k++) {
+          const Box r = UpRoom(4 + k);
+          v.Read(ctx, world, r);
+          for (int z = r.z0; z <= r.z1; z++)
+            for (int y = r.y0; y <= r.y1; y++)
+              for (int x = r.x0; x <= r.x1; x++) {
+                const uint32_t m = v.At(x, y, z) & 0xFFFu;
+                if (m != ember && m != ash) continue;
+                emAll[k]++;
+                if (y <= UpLid(4 + k) + 3) emLow[k]++;
+              }
+        }
+      }
+    }
+    // Rise and downwind drift of each room's smoke from its own puff's centre.
+    const Box p0 = UpPuff(0), p1 = UpPuff(1);
+    const double riseHot = sm[0].y - 0.5 * (p0.y0 + p0.y1);
+    const double riseCold = sm[1].y - 0.5 * (p1.y0 + p1.y1);
+    const double driftHot = sm[0].x - 0.5 * (p0.x0 + p0.x1);
+    const double driftCold = sm[1].x - 0.5 * (p1.x0 + p1.x1);
+    RecordObserved("heatUpdraft.smokeRiseHotObserved", riseHot);
+    RecordObserved("heatUpdraft.smokeRiseColdObserved", riseCold);
+    RecordObserved("heatUpdraft.smokeDriftHotObserved", driftHot);
+    RecordObserved("heatUpdraft.smokeDriftColdObserved", driftCold);
+    const double riseMin = BaselineNumber("heatUpdraft.smokeRiseRatioMin", 0.95);
+    const double leanMax = BaselineNumber("heatUpdraft.smokeLeanRatioMax", 0.5);
+    const bool smokeOk = sm[0].n > 0 && sm[1].n > 0 && riseCold > 0 &&
+                         riseHot >= riseMin * riseCold && driftCold > 1.0 &&
+                         driftHot <= leanMax * driftCold;
+    note(Format("floor y %d, heat over the lid X %u (lid+5) / %u (lid+20); smoke after %d ticks: rise hot "
+                "%.1f vs cold %.1f cells (>= %.2fx), downwind drift hot %.1f vs cold %.1f (<= "
+                "%.2fx) [%u / %u cells] %s",
+                gUpY[0], xLid, xHigh, smokeTicks, riseHot, riseCold, riseMin, driftHot, driftCold, leanMax,
+                sm[0].n, sm[1].n, smokeOk ? "OK" : "FAIL"));
+    const double heavyMin = BaselineNumber("heatUpdraft.heavyRiseMin", 4.0);
+    // Each cloud's height over its OWN lid (each room stands on its own ground).
+    const double heavyHot = cl[0].y - UpLid(2), heavyCold = cl[1].y - UpLid(3);
+    const double heavyGap = heavyHot - heavyCold;
+    RecordObserved("heatUpdraft.heavyRiseObserved", heavyGap);
+    const bool heavyOk = cl[0].n > 0 && cl[1].n > 0 && heavyGap >= heavyMin;
+    note(Format("chlorine after %d ticks: centroid over its lid hot %.1f vs cold %.1f, +%.1f "
+                "(>= %.0f) [%u / %u cells] %s",
+                heavyTicks, heavyHot, heavyCold, heavyGap, heavyMin, cl[0].n, cl[1].n,
+                heavyOk ? "OK" : "FAIL"));
+    const double coldMin = BaselineNumber("heatUpdraft.emberColdLandedMin", 0.75);
+    const double hotMax = BaselineNumber("heatUpdraft.emberHotLandedMax", 0.25);
+    RecordObserved("heatUpdraft.emberHotLandedObserved", (double)emLow[0]);
+    RecordObserved("heatUpdraft.emberColdLandedObserved", (double)emLow[1]);
+    const bool emberOk = emLow[1] >= coldMin * emberCount && emLow[0] <= hotMax * emberCount;
+    note(Format("%d embers released at rest, after %d ticks on the lid: hot %u (<= %.0f%%), cold "
+                "%u (>= %.0f%%); voxels anywhere hot %u, cold %u (the rest still flying: "
+                "particle counts %u/%u after the release, %u/%u at the read) %s",
+                emberCount, emberTicks, emLow[0], hotMax * 100, emLow[1], coldMin * 100,
+                emAll[0], emAll[1], pc0[0], pc0[1], pc1[0], pc1[1], emberOk ? "OK" : "FAIL"));
+    ok = ok && smokeOk && heavyOk && emberOk;
+  }
+
+  // ---- the cost check: no heat anywhere, the shipped gain against gain 0 ----
+  {
+    std::vector<uint32_t> cells[2];
+    uint32_t awake[2] = {}, pages[2] = {};
+    for (int arm = 0; arm < 2; arm++) {
+      Tuning t = CurrentTuning();
+      t.sim.windUpdraftGain = arm == 0 ? shippedGain : 0.0f;
+      // NO HEAT IN THE WINDOW means the layer off: the harness map has hot
+      // things of its own (~100 pages paged in this window), and a claim
+      // about "no heat" has to be about none.
+      t.sim.heatMode = 0;
+      SetCurrentTuning(t);
+      SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+      ctx.WaitIdle();
+      uint32_t tk = 64000;
+      support::TickCursor ticker{c, tk, {UpRoomX(1) >> 4, (gUpY[1] + 16) >> 4, kUpZ >> 4}};
+      UpBuild(ticker, {1}, lava, false);
+      for (int i = 0; i < 4; i++) ticker();
+      std::vector<CellOp> puff;
+      Fill(puff, UpPuff(1), smoke);
+      ticker({}, puff);
+      for (int i = 0; i < smokeTicks; i++) ticker();
+      Vox v;
+      v.Read(ctx, world, UpRoom(1));
+      const Box r = UpRoom(1);
+      for (int z = r.z0; z <= r.z1; z++)
+        for (int y = r.y0; y <= r.y1; y++)
+          for (int x = r.x0; x <= r.x1; x++) cells[arm].push_back(v.At(x, y, z) & 0xFFFFu);
+      awake[arm] = AwakeAll(ctx, c.sim);
+      HeatView hv;
+      hv.Read(ctx, world, false);
+      pages[arm] = hv.PagesInUse();
+    }
+    {
+      Tuning t = CurrentTuning();
+      t.sim.windUpdraftGain = shippedGain;
+      t.sim.heatMode = 1;
+      SetCurrentTuning(t);
+    }
+    const bool same = cells[0] == cells[1] && awake[0] == awake[1];
+    note(Format("no heat in the window (heat pages %u / %u): gain %.1f vs 0 -> cells %s, awake "
+                "chunks %u vs %u %s; window origin chunk (%d,%d,%d)",
+                pages[0], pages[1], shippedGain, cells[0] == cells[1] ? "identical" : "DIFFER",
+                awake[0], awake[1], same ? "OK" : "FAIL", world.WindowOrigin().x,
+                world.WindowOrigin().y, world.WindowOrigin().z));
+    ok = ok && same;
+  }
+  SubmitWorldgen(ctx, world, c.sim, kDefaultSeed);
+  ctx.WaitIdle();
+  detail = out;
+  std::printf("heat-updraft: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// draft-stack (wind phase 5: sim_draft.wgsl THE STACK EFFECT)
+// ---------------------------------------------------------------------------
+// A SEALED STONE HUT inside the draft volume (the fixture chunk it centres on),
+// interior 2 x 3 x 2 m, with TWO OPENINGS IN ONE WALL (-X): a low one at the
+// floor and a high one under the ceiling, each 8 x 8 voxels, standing on a
+// stone pad at the ground's highest point with open air carved round it (so
+// the openings lead into air, not into a hillside, and nothing floats).
+// Calm air (weatherAuto off, wind 0), climate pinned, dim dawn frozen. Two
+// arms from a fresh world each:
+//   H  a 6x3x6 lava slab on the floor under a stone lid, `settleTicks`
+//      for the heat to relax and the volume to re-solve. The STACK FIELD S
+//      (read back: the correction the readers add to the local lift) must
+//      blow IN at the low opening (S.x > +inMin m/s) and OUT at the high one
+//      (S.x < -outMin m/s): a hot room breathes. Then a smoke puff over the
+//      lid, `smokeTicks` ticks, sampled outside the wall every 3 ticks: what
+//      leaves must leave by the high opening (high > low).
+//   C  the same hut with the slab in stone: no flow -- |S.x| at both
+//      openings under quietMax m/s (S is zero, or the volume is not live).
+// The magnitudes are averaged over the opening's cells (2 x 2 draft cells).
+// Thresholds in tests/baseline.json (draftStack.*). Ticked on THE tick.
+constexpr int kDsX = 200, kDsZ = 200;   // hut interior min corner
+int gDsY = 120;                          // set per run, over the ground
+constexpr int kDsW = 20, kDsH = 30, kDsD = 20;
+constexpr int kDsAmbient = 10;
+Box DsHut() { return {kDsX, gDsY, kDsZ, kDsX + kDsW - 1, gDsY + kDsH - 1, kDsZ + kDsD - 1}; }
+Box DsSlab() {
+  const int cx = kDsX + kDsW / 2, cz = kDsZ + kDsD / 2;
+  return {cx - 3, gDsY, cz - 3, cx + 2, gDsY + 2, cz + 2};
+}
+// The openings, in the -X wall (x = kDsX - 1).
+Box DsLow() {
+  const int cz = kDsZ + kDsD / 2;
+  return {kDsX - 1, gDsY, cz - 4, kDsX - 1, gDsY + 7, cz + 3};
+}
+Box DsHigh() {
+  const int cz = kDsZ + kDsD / 2;
+  return {kDsX - 1, gDsY + kDsH - 8, cz - 4, kDsX - 1, gDsY + kDsH - 1, cz + 3};
+}
+
+struct StackResult {
+  float lowX = 0, highX = 0;   // mean S.x over each opening, m/s
+  uint32_t live = 0, solves = 0, low = 0, high = 0, placed = 0;
+  uint32_t xLid = 0, inside = 0, lava = 0, shell = 0;
+  float insideY = 0;
+  int32_t draftOrigin[3] = {};
+};
+
+StackResult RunStack(Ctx& c, bool hot, int settle, int smokeTicks) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t lava = MatId(c, "lava"), smoke = MatId(c, "smoke");
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const Box hut = DsHut(), slab = DsSlab(), lo = DsLow(), hi = DsHigh();
+  // THE YARD: a stone pad under the hut and open air round and over it, so the
+  // openings lead into air (not into a hillside) and what leaves is seen.
+  std::vector<CellOp> yard, shell, build;
+  for (int z = hut.z0 - 16; z <= hut.z1 + 16; z++)
+    for (int x = hut.x0 - 16; x <= hut.x1 + 16; x++) {
+      yard.push_back({World::SlotCellIndex({x, hut.y0 - 1, z}), (uint32_t)kMatStone});
+      for (int y = hut.y0; y <= hut.y1 + 32; y++)
+        yard.push_back({World::SlotCellIndex({x, y, z}), 0u});
+    }
+  Room(shell, hut);
+  // The openings: air through the -X wall (after the room, in the next tick).
+  Fill(build, lo, 0u);
+  Fill(build, hi, 0u);
+  for (int z = slab.z0 - 1; z <= slab.z1 + 1; z++)
+    for (int y = slab.y0; y <= slab.y1 + 1; y++)
+      for (int x = slab.x0 - 1; x <= slab.x1 + 1; x++)
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         slab.Has(x, y, z) && hot ? (lava | kFull) : (uint32_t)kMatStone});
+  uint32_t t = 65000;
+  support::TickCursor ticker{c, t, {(kDsX + kDsW / 2) >> 4, (gDsY + 8) >> 4, (kDsZ + kDsD / 2) >> 4}};
+  for (size_t i = 0; i < yard.size(); i += kMaxCellOpsPerTick) {
+    const size_t n = std::min<size_t>(kMaxCellOpsPerTick, yard.size() - i);
+    ticker({}, std::vector<CellOp>(yard.begin() + (long)i, yard.begin() + (long)(i + n)));
+  }
+  ticker({}, shell);
+  ticker({}, build);
+  for (int i = 0; i < settle; i++) ticker();
+  ctx.WaitIdle();
+  StackResult r;
+  r.xLid = ProbeX(ctx, world, kDsX + kDsW / 2, gDsY + 6, kDsZ + kDsD / 2);
+  {
+    // The fixture as built: lava cells in the slab, stone in the hut's wall.
+    Vox v;
+    const Box all{hut.x0 - 1, hut.y0 - 1, hut.z0 - 1, hut.x1 + 1, hut.y1 + 1, hut.z1 + 1};
+    v.Read(ctx, world, all);
+    for (int z = all.z0; z <= all.z1; z++)
+      for (int y = all.y0; y <= all.y1; y++)
+        for (int x = all.x0; x <= all.x1; x++) {
+          const uint32_t m = v.At(x, y, z) & 0xFFFu;
+          if (m == lava) r.lava++;
+          if (m == kMatStone && !hut.Has(x, y, z)) r.shell++;
+        }
+  }
+  // The stack field and its live word, and the meta's solve count.
+  std::vector<uint32_t> f((size_t)2 * kDraftCells + 4, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftBuffer(), (uint64_t)kDraftStackField * 4,
+                        f.data(), f.size() * 4, "draftStack");
+  uint32_t meta[kDraftMetaWords] = {};
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DraftMetaBuffer(), 0, meta,
+                        kDraftMetaWords * 4, "draftStackMeta");
+  r.live = f[2 * (size_t)kDraftCells];
+  r.solves = meta[kDraftMetaSolves];
+  const int32_t* o = sim.DraftOrigin();
+  for (int i = 0; i < 3; i++) r.draftOrigin[i] = o[i];
+  const float cap = CurrentTuning().sim.windUpdraftCap * CurrentTuning().sim.windStackGain;
+  // S.x at world cell (x, y, z) in m/s (0 outside the box or when not live).
+  auto sx = [&](int x, int y, int z) -> float {
+    const int dx = (x - o[0]) >> 2, dy = (y - o[1]) >> 2, dz = (z - o[2]) >> 2;
+    if (!r.live || dx < 0 || dy < 0 || dz < 0 || dx >= (int)kDraftNX || dy >= (int)kDraftNY ||
+        dz >= (int)kDraftNZ)
+      return 0.0f;
+    const size_t i = 2 * (size_t)(((uint32_t)dz * kDraftNY + (uint32_t)dy) * kDraftNX + (uint32_t)dx);
+    return (float)(int16_t)(uint16_t)(f[i] & 0xFFFFu) / 4096.0f * cap;
+  };
+  // Over the opening's face, one cell inside the wall.
+  auto mean = [&](const Box& b) {
+    float s = 0;
+    int n = 0;
+    for (int y = b.y0 + 2; y <= b.y1 - 1; y += 4)
+      for (int z = b.z0 + 2; z <= b.z1 - 1; z += 4) {
+        s += sx(b.x0 + 2, y, z);
+        n++;
+      }
+    return n ? s / n : 0.0f;
+  };
+  r.lowX = mean(lo);
+  r.highX = mean(hi);
+  if (smokeTicks > 0) {
+    std::vector<CellOp> puff;
+    const int cx = kDsX + kDsW / 2, cz = kDsZ + kDsD / 2;
+    Fill(puff, {cx - 2, gDsY + 6, cz - 2, cx + 1, gDsY + 9, cz + 1}, smoke);
+    r.placed = (uint32_t)puff.size();
+    ticker({}, puff);
+    Vox v;
+    // Outside the -X wall: the low band (floor to the low opening's top + 2)
+    // and the high band (the high opening's bottom - 2 up to 3 m over the roof).
+    const Box outside{kDsX - 14, gDsY, kDsZ - 4, kDsX - 2, gDsY + kDsH + 30, kDsZ + kDsD + 3};
+    for (int i = 0; i < smokeTicks; i++) {
+      ticker();
+      if (i % 3 != 2) continue;
+      v.Read(ctx, world, outside);
+      for (int z = outside.z0; z <= outside.z1; z++)
+        for (int y = outside.y0; y <= outside.y1; y++)
+          for (int x = outside.x0; x <= outside.x1; x++) {
+            if ((v.At(x, y, z) & 0xFFFu) != smoke) continue;
+            if (y <= lo.y1 + 2) r.low++;
+            else if (y >= hi.y0 - 2) r.high++;
+          }
+    }
+    // Where the rest is: inside the hut, and how high.
+    v.Read(ctx, world, hut);
+    const UpCloud in = UpCentroid(v, hut, smoke);
+    r.inside = in.n;
+    r.insideY = in.n ? (float)(in.y - hut.y0) : 0.0f;
+  }
+  return r;
+}
+
+Status GateDraftStack(Ctx& c, std::string& detail) {
+  if (!MatId(c, "lava") || !MatId(c, "smoke")) {
+    detail = "need materials lava and smoke";
+    return Status::Fail;
+  }
+  DawnPin dawn;
+  PinGuard pins(c.sim, {{kDsX - 40, kDsZ - 40, kDsX + kDsW + 40, kDsZ + kDsD + 40, kDsAmbient, 0}});
+  {
+    Tuning t = CurrentTuning();
+    t.sim.windMode = 1;
+    t.sim.draftMode = 1;
+    t.wind.weatherAuto = false;
+    t.wind.windSpeed = 0.0f;
+    t.wind.gustStrength = 0.0f;
+    SetCurrentTuning(t);   // DawnPin restores the original on the way out
+  }
+  const int settle = (int)BaselineNumber("draftStack.settleTicks", 160);
+  const int smokeTicks = (int)BaselineNumber("draftStack.smokeTicks", 60);
+  const float inMin = (float)BaselineNumber("draftStack.inMin", 0.2);
+  const float outMin = (float)BaselineNumber("draftStack.outMin", 0.2);
+  const float quietMax = (float)BaselineNumber("draftStack.quietMax", 0.05);
+  gDsY = FixtureYOver(kDsX - 17, kDsZ - 17, kDsX + kDsW + 17, kDsZ + kDsD + 17, kDefaultSeed, 0,
+                      kDsH + 48) + 1;
+  const StackResult h = RunStack(c, true, settle, smokeTicks);
+  const StackResult q = RunStack(c, false, settle, 0);
+  RecordObserved("draftStack.lowInObserved", h.lowX);
+  RecordObserved("draftStack.highOutObserved", -h.highX);
+  const bool breathes = h.live != 0 && h.lowX > inMin && h.highX < -outMin;
+  const bool exits = h.high > h.low;
+  const bool quiet = std::fabs(q.lowX) < quietMax && std::fabs(q.highX) < quietMax;
+  const bool ok = breathes && exits && quiet;
+  detail = Format(
+      "hot hut (lava under the lid, X %u over it; field live %u, %u solves): S.x at the low "
+      "opening %+.2f m/s (in > %.2f), at the high one %+.2f m/s (out > %.2f) %s; smoke (%u "
+      "cells) sampled outside: by the high opening %u, by the low one %u %s (%u left inside, "
+      "%.1f cells over the floor); cold hut (X %u, live %u): %+.3f / %+.3f m/s (|S| < %.2f) %s; "
+      "hut floor y %d (built: %u lava, %u wall stone), draft box at (%d,%d,%d), window chunk "
+      "(%d,%d,%d)",
+      h.xLid, h.live, h.solves, h.lowX, inMin, h.highX, outMin, breathes ? "OK" : "FAIL",
+      h.placed, h.high, h.low, exits ? "OK" : "FAIL", h.inside, h.insideY, q.xLid, q.live,
+      q.lowX, q.highX, quietMax, quiet ? "OK" : "FAIL", gDsY, h.lava, h.shell, h.draftOrigin[0],
+      h.draftOrigin[1], h.draftOrigin[2], c.world.WindowOrigin().x, c.world.WindowOrigin().y,
+      c.world.WindowOrigin().z);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  std::printf("draft-stack: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& HeatGates() {
@@ -1712,6 +2241,8 @@ const std::vector<Gate>& HeatGates() {
       {"heat-bound", "sim", {}, false, GateHeatBound},
       {"heat-plume", "sim", {}, false, GateHeatPlume},
       {"heat-live", "sim", {}, false, GateHeatLive},
+      {"heat-updraft", "sim", {}, false, GateHeatUpdraft},
+      {"draft-stack", "sim", {}, false, GateDraftStack},
   };
   return g;
 }

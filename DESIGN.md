@@ -1978,6 +1978,13 @@ returning after two loads (`heat-idle`). The levers left, in size order:
 the relaxation hides it) and `heatSrc` (fold its per-block E / n / k scan into
 `caMask`, which already reads every cell of every dirty chunk).
 
+**Heat drives the wind** (wind phase 5, 2026-10-02; §9b "Heat updrafts and the
+stack effect"). The sim's wind reads the pool: an updraft over any block with
+X > 0 (looked for up to 32 voxels below the sample), an inflow toward the hotter
+side, and inside the draft volume the stack effect. The layer itself is
+unchanged by it; the wind only reads `heatMeta`'s entry table and the pool's X
+bytes, never writes them.
+
 **F1 -> Temperature**: the ambient at your feet (biome by ID, base, the
 day/night term), the target T* and actual T (and their excess over the
 ambient), the block's sources, pool use and the firing counters. The probe is
@@ -16430,8 +16437,9 @@ transfer read back):
 A smoke puff run through the CA leaves the draft hut out of its leeward window
 (277 samples lee, 0 windward), while the sealed hut keeps its smoke. Not
 modelled: turbulent wakes (the calm pocket behind a wall is about one wall high,
-not ten), the stack effect (phase 5's heat term would enter as a pressure source
-in this solve), fans confined by walls, and structures outside the box. The
+not ten), fans confined by walls, and structures outside the box. (The stack
+effect IS modelled since phase 5 -- "Heat updrafts and the stack effect"
+below.) The
 wind-coupling gates (`wind`, `wind-gas`, `wind-prim`, `gas-reenter`,
 `gas-farplume`) pin `sim.draftMode 0`, because their chambers are, correctly,
 still air with drafts on.
@@ -16441,11 +16449,74 @@ Knobs: `sim.draftMode` (the gate; 0 is an exact identity, nothing is recorded),
 `SANDVOX_DRAFT_DUMP=1 --gate drafts`, which prints per-hut profiles and writes
 `build/draft_coarse.bin` / `draft_masks.bin`.
 
+### Heat updrafts and the stack effect (phase 5, landed 2026-10-02)
+
+`docs/RESEARCH_wind.md` §4.4 (the updraft) and §14.11 (the stack effect) are the
+record; common.wgsl HEAT UPDRAFTS the code; gates `heat-updraft` and
+`draft-stack`.
+
+**The updraft is read from the heat pool, at the one composition point.**
+`windAmbQ = draftApplyQ(p, amb) + windHeatQ(p)`, so the CA's per-block wind
+cache, the gas intent, the particle drag and the entrainment test all stand in
+the same rising air. `windHeatQ` = a LIFT `min(G x max_k(w_k X(p - dy_k)), cap)`
+(the block's excess X and the blocks 8 / 16 / 32 voxels under it, weighted
+16/13/10/6 sixteenths: a plume stands ~4 m over a source whose warm air reaches
+~1.2 m) + an INFLOW toward the hotter side `G x f x (X(p+4) - X(p-4))` per
+horizontal axis + inside the draft box the STACK correction. Knobs (F1 ->
+Temperature, "updrafts"): `sim.windUpdraftGain` 10 m/s per 100 heat units,
+`sim.windUpdraftCap` 20 m/s, `sim.windUpdraftInflow` 0.25, `sim.windStackGain`
+1 -- `NO_WGSL` floats SubmitTick converts into four TickParams integers (the
+def rows' maxima are the kernels' i32 bounds). Gain 0 is the exact pre-phase-5
+field.
+
+**Invariants it adds.**
+- Only shaders that declare `> heatPool` (sim_step, sim_heat, sim_particle,
+  sim_draft) read heat; every other one compiles the `HEAT_WIND_UNBOUND` stubs
+  (resources.cpp `BodyReadsHeat`, mirrored in check_shaders.sh and
+  check_pass_table.py). sim_gas (parcels are outside the window, where there is
+  no heat), sim_fluid (MPM nodes), the renderer's `windAt` and windfield.cpp's
+  CPU mirror do not see it. **Rigidbodies -- debris, corpses, trees -- do not
+  feel updrafts**: the pool is GPU-only and a synchronous readback is banned.
+- Nothing is stored and nothing is woken (rule 2): no heat page anywhere is two
+  shared loads per sample, a column with no page in its chunk or the two below
+  three more. `heat-updraft`: a heat-free world (layer off) is cell-for-cell
+  identical with the gain on or off, same awake count.
+- **The CA cannot make a light gas rise faster.** Calm smoke already climbs one
+  cell a substep, the CA's ceiling; the lift STRAIGHTENS it (`lean = fh - up`
+  cancels a crosswind lean or a downdraft) and draws it in at the base.
+  `heat-updraft`: hot and cold smoke both rise ~32 cells in 16 ticks; the hot
+  puff's downwind drift is ~0 against the cold one's 2.6. A HEAVY gas, which
+  never rose, is lifted (`stepHeavyGas` reads the heat lift alone, past 1 m/s,
+  so a gale's gusts cannot boil chlorine out of a hollow): +30 cells over cold
+  in 40 ticks. Particles feel the full velocity through their drag law: ember
+  particles released at rest over lava are all still airborne at 40 ticks,
+  the cold ones all landed. Making hot smoke OUTRUN cold smoke would need cold
+  smoke to climb slower than the ceiling, a global buoyancy change not made.
+- `wfThermal` (the regime's procedural thermal gusts) is unchanged and is not a
+  double count: a zero-mean texture tied to the weather, not to anything hot.
+
+**The stack effect is the draft solve's third right-hand side.** The lift `b`
+is sampled per fine cell at each solve's snapshot and projected like the wind
+(`div(beta (b e_y - grad phi_b)) = 0`); the volume stores `S = P(b) - b` and the
+reader adds it to the local lift, so inside the box the rising air respects the
+walls: a sealed room's column turns over in place, a hot room with a low and a
+high opening breathes (`draft-stack`: +3.6 m/s in at the low opening, -3.1 m/s
+out at the high, smoke leaves only by the high one). The volume is now a
+function of geometry AND heat: it re-solves when the box holds heat, the heat
+layer's activity counters moved and 16 ticks have passed; a cold box costs what
+it did, bit for bit.
+
+**Cost** (`--perf`, main's exe vs this): forestfire GPU 30.8 -> 29.5 ms,
+village-fire 49.6 -> 49.6 ms; draft rows +0.17 ms; awake chunks -7% / -2%
+(straight plumes leave the window top sooner). The CA wind cache is now built
+on substep 0 only (it cannot change between substeps), which paid for the heat
+lookups it gained.
+
 ### Phases remaining
 
 | # | Scope | Hash risk |
 |---|---|---|
-| 5 | Per-chunk hot-material counts → updraft term; violent wind promoting voxels to particles; capes when cloth exists | rebaseline |
+| 5 | ~~Heat -> updraft term~~ **LANDED 2026-10-02** (above; reads the heat pool, plus the stack effect); violent wind promoting voxels to particles; capes when cloth exists | rebaseline |
 | 6 | ~~Drafts through openings~~ **LANDED 2026-09-30** -- see "Drafts: the shelter volume" above | -- |
 
 Phase 4b, the flip, is **done**: `882a30f3` -> `47dd1520`. What the rebaseline

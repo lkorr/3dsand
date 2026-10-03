@@ -438,6 +438,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // Same binding number as in simBGL_: the particle and MPM wind sites
         // reach windAtQ, which reads the draft volume (common.wgsl WIND DRAFTS).
         entry(46, T::Storage),         // draft
+        // Same binding numbers as in simBGL_ (wind phase 5): the particle
+        // drag reaches windAtQ, which adds the heat updraft read from the
+        // temperature layer's pool (common.wgsl HEAT UPDRAFTS).
+        entry(50, T::Storage),         // heatPool
+        entry(51, T::Storage),         // heatMeta
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -1275,6 +1280,8 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(26, treeAtlasBuf_),
         b(31, worldMapBuf_),
         b(46, draftBuf_),
+        b(50, world_->heatPool),
+        b(51, world_->heatMeta),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");

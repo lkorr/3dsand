@@ -115,6 +115,23 @@ foliage's 135, and with the ceiling no source lifts anything past itself.
   C_CAACTIVE): X can stall short of X* in a fully asleep world. Harmless to
   the sim (no transition can fire there) but visible in the F1 readout.
 
+## NEXT USES -- what reads the layer besides its own transitions
+
+- **Heat-driven wind (LANDED 2026-10-02, wind phase 5;** docs/RESEARCH_wind.md
+  §4.4 / §14.11, DESIGN.md §9b "Heat updrafts and the stack effect", gates
+  `heat-updraft` and `draft-stack`). common.wgsl `windHeatQ` reads X (and
+  looks 8 / 16 / 32 voxels below the sample) into an updraft, an inflow toward
+  the hot side and, inside the draft volume, the stack effect solved as a third
+  right-hand side of the shelter projection. Read-only: the wind touches the
+  entry table and the X bytes and nothing else, so nothing here changed. The
+  layer's activity counters (`kHmRelaxTicks`, `kHmFrees`, `kHmAllocs`,
+  `kHmReleased`) are now ALSO the draft volume's "heat moved" signal -- keep
+  them monotonic. A side effect of note: X is a temperature, and the lift
+  reads it as one, so anything that changes the field's shape (radius, the
+  direction gains) changes the plumes too.
+- Still out (unchanged): boiling, heat damage to creatures, glowing metal, lava
+  cooling.
+
 ## IMPLEMENTED (2026-10-02) -- what changed from revision 3 below
 
 The orchestrator approved revision 3 with these decisions, and the build
@@ -158,7 +175,7 @@ description of record for what shipped.
 4. Water freezes to ice where the ACTUAL temperature is below its freeze point:
    surface only, so a lake skins over instead of freezing solid.
 
-**Out**: boiling, heat damage to creatures, updrafts, glowing/melting metal, lava
+**Out**: boiling, heat damage to creatures, glowing/melting metal, lava
 cooling. Each is meant to be a data edit later (a material's `thermal` block or
 a rule's `heat` condition), not a new kernel.
 

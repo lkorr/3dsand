@@ -361,6 +361,10 @@ const char* const kOrder[] = {
     // runs a real (one-minute) day and restores the tuning it changes.
     "heat-idle", "heat-melt", "heat-ignite", "heat-freeze", "heat-ambient", "heat-bound", "heat-plume",
     "heat-live",
+    // Heat-driven wind (wind phase 5): the local updraft in six sealed rooms
+    // with the draft volume off, then the stack effect through a hut's two
+    // openings. Both regenerate the world before returning.
+    "heat-updraft", "draft-stack",
     // Passable plants hold nothing up: sand, a lone chip and a grid particle
     // each crush the bramble they land on. Same sealed-box fixture.
     "plant-crush",

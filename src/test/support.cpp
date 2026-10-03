@@ -1420,6 +1420,28 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       if (r > 2147483000.0) r = 2147483000.0;
       tp.windDragRefQ = r < 65536.0 ? 65536 : (int32_t)r;
     }
+    // HEAT UPDRAFTS + THE STACK EFFECT (wind phase 5; common.wgsl windHeatQ),
+    // metres -> integers here for the windDragRef reason. Gain: m/s per 100
+    // heat units -> Q16.16 cells/s per heat unit. The clamps restate the
+    // def rows' maxima, which are the kernels' i32 bounds (<= 2^18 per unit,
+    // cap <= 40 m/s, inflow <= 4x, stack <= 4x).
+    {
+      auto q = [](double v, double lo, double hi) {
+        v = v < lo ? lo : (v > hi ? hi : v);
+        return (int32_t)(v + 0.5);
+      };
+      const auto& s = wtun.sim;
+      tp.updraftGainQ = q((double)s.windUpdraftGain / 100.0 / (double)kVoxelMeters * 65536.0,
+                          0.0, 262144.0);
+      tp.updraftCapQ = q((double)s.windUpdraftCap / (double)kVoxelMeters * 65536.0, 0.0,
+                         40.0 / (double)kVoxelMeters * 65536.0);
+      tp.updraftInflowQ = q((double)s.windUpdraftInflow * 65536.0, 0.0, 4.0 * 65536.0);
+      tp.draftStackQ = q((double)s.windStackGain * 256.0, 0.0, 1024.0);
+      // The stack field is solved with the gain and the cap baked into its b:
+      // a change re-solves the whole volume (a burst), as a material reload
+      // does. Live tuning, outside replay, like every live sim.* knob.
+      sim.NoteDraftHeatKnobs(tp.updraftGainQ, tp.updraftCapQ, tp.draftStackQ);
+    }
   }
   // ---- WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3) ------------------------
   //

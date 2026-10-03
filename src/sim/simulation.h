@@ -679,6 +679,19 @@ class Simulation {
   const rhi::Buffer& DraftMetaBuffer() const { return draftMetaBuf_; }
   // Force the next tick to re-mask the whole box (a gate's purity check).
   void ForceDraftRebuild() { draftForce_ = true; }
+  // The stack effect's knobs as the kernels see them (TickParams
+  // updraftGainQ / updraftCapQ / draftStackQ): the stack field's b is solved
+  // with them, so a change forces a rebuild. SubmitTick calls it before
+  // SetDraft every tick; the first call only records.
+  void NoteDraftHeatKnobs(int32_t gainQ, int32_t capQ, int32_t stackQ) {
+    if (draftHeatKnobsSet_ && (gainQ != draftHeatKnobs_[0] || capQ != draftHeatKnobs_[1] ||
+                               stackQ != draftHeatKnobs_[2]))
+      draftForce_ = true;
+    draftHeatKnobs_[0] = gainQ;
+    draftHeatKnobs_[1] = capQ;
+    draftHeatKnobs_[2] = stackQ;
+    draftHeatKnobsSet_ = true;
+  }
 
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
@@ -922,6 +935,8 @@ class Simulation {
   bool draftLastOn_ = false;
   int32_t draftOrigin_[3] = {0, 0, 0};
   int32_t draftLastOrigin_[3] = {-2147483647 - 1, 0, 0};
+  int32_t draftHeatKnobs_[3] = {0, 0, 0};
+  bool draftHeatKnobsSet_ = false;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five

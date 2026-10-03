@@ -3213,6 +3213,24 @@ struct Tuning {
     // Clamped to kWindWakeCap, which is the TickParams array it fills.
     int windWakeChunks = TPD(sim, windWakeChunks);
 
+    // ---- HEAT UPDRAFTS + THE STACK EFFECT (wind phase 5) ----------------
+    // docs/RESEARCH_wind.md §4.4; common.wgsl HEAT UPDRAFTS. Where the
+    // temperature layer's excess X is above zero the sim's wind gains a lift
+    // of windUpdraftGain m/s per 100 heat units (looked for up to 32 voxels
+    // below the sample, so a plume stands ~4 m over its fire), capped at
+    // windUpdraftCap, plus an inflow toward the hotter side of
+    // windUpdraftInflow per unit of lift gradient. Inside the draft volume the
+    // lift is projected onto what the walls allow (sim_draft.wgsl's third
+    // right-hand side) and windStackGain scales that correction: a room with a
+    // low and a high opening draws air in at one and vents at the other.
+    // GPU only -- debris, corpses and trees (the CPU wind mirror) do not feel
+    // it. NO_WGSL: SubmitTick converts them into TickParams integers, so the
+    // F1 sliders are live. Gain 0 is the exact pre-phase-5 field.
+    float windUpdraftGain = TPD(sim, windUpdraftGain);
+    float windUpdraftCap = TPD(sim, windUpdraftCap);
+    float windUpdraftInflow = TPD(sim, windUpdraftInflow);
+    float windStackGain = TPD(sim, windStackGain);
+
     // ---- THE CURRENT FIELD (docs/PLAN_water_master.md component 8) --------
     //
     // ALL OF THESE ARE CPU-SIDE, and that is not the windGasScale exception —

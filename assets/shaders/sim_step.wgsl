@@ -4044,6 +4044,9 @@ fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
 // `heavygas` holds MATF_HEAVY_GAS == kMatFlagHeavyGas.
 const MATF_HEAVY_GAS : u32 = 128u;
 
+// stepHeavyGas's lift floor: 1 m/s of heat updraft, Q16.16 cells/s.
+const HEAVY_LIFT_FLOOR : i32 = i32(round(1.0 * 65536.0 / VOXEL_METERS));
+
 fn heavyGasTarget(n : vec3<i32>, myDensity : i32) -> bool {
   if (!inBounds(n)) { return false; }
   let tm = voxMat(voxWordAt(n));
@@ -4053,6 +4056,29 @@ fn heavyGasTarget(n : vec3<i32>, myDensity : i32) -> bool {
 }
 
 fn stepHeavyGas(c : vec3<i32>, w : u32, m : Material, rnd : u32) -> bool {
+  // HEAT LIFTS A HEAVY GAS (wind phase 5): a heavy gas never rises on its
+  // own, but the updraft over a fire or a lava pool carries it -- hot choke
+  // damp goes up the column like the smoke beside it. It reads the heat's
+  // LIFT alone (common.wgsl windHeatUpQ), not the whole field: a storm's gust
+  // bands have a vertical component of a few m/s, and a cellar of chlorine
+  // must not boil out of its hollow in a gale. Only a lift past
+  // HEAVY_LIFT_FLOOR counts, so faint warmth does not make it seep; the
+  // chance ramps from 0 there to certainty a drift-saturation
+  // (sim.windDriftSpeed) above it, scaled by the material's wind response.
+  // One cell up into air or a lighter gas: reach 1, the ordinary tryMove.
+  // Costs two shared loads per heavy-gas cell where no heat page exists.
+  if (T.windMode != WIND_MODE_OFF && matWindResponse(m) != 0u) {
+    let wy = windHeatUpQ(c, &T);
+    if (wy > HEAVY_LIFT_FLOOR) {
+      let p = min(windAxisFrac(wy - HEAVY_LIFT_FLOOR, i32(matWindResponse(m)), &T), 1024);
+      let up = c + vec3<i32>(0, 1, 0);
+      if (i32((rnd >> 22u) & 1023u) < p && heavyGasTarget(up, m.density) &&
+          tryMove(c, up, w, -1, true)) {
+        markDirtyR(c, DIRTY_M_GAS);
+        return true;
+      }
+    }
+  }
   let rot = rnd >> 12u;
   var cand : array<vec3<i32>, 5>;
   let lat0 = lateralDir(rot);
@@ -4305,7 +4331,15 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     caMask[ci * CA_MASK_STRIDE + k] = word;
   }
   // The wind cache (caWind above): one block per thread, the block's centre.
-  if (T.windMode != WIND_MODE_OFF && li < CA_WIND_BLOCKS) {
+  // SUBSTEP 0 ONLY (2026-10-02, wind phase 5): the field is a function of the
+  // tick (TickParams), the draft volume (built before the CA) and the heat
+  // pool (written after it) -- nothing the CA's first substep changes -- and
+  // both camask rows walk the same dirty list, so substep 1's cache would be
+  // the same words written again. caMask1 is recorded at substep 1's pass
+  // slice (pass_table.def DYN_CA1) to say which one it is. Halves the cache's
+  // cost, which the heat term made heavier (village fire: caMask 1.09 ->
+  // 1.36 ms with the heat lookups, both substeps).
+  if (P.substep == 0u && T.windMode != WIND_MODE_OFF && li < CA_WIND_BLOCKS) {
     let b = vec3<i32>(i32(li & 3u), i32((li >> 2u) & 3u), i32(li >> 4u));
     let w = windAmbQ(slotWorldChunk(ci, T.origin) * i32(CHUNK) + b * 4 + vec3<i32>(2), &T);
     let o = (ci * CA_WIND_BLOCKS + li) * 3u;

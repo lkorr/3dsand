@@ -501,7 +501,10 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 # draftField is in the SLIM group as well: windAtQ reads it
                 # through common.wgsl, and sim_particle / sim_fluid run on
                 # this layout, so binding 46 names the same buffer here.
-                "draftField"}
+                "draftField",
+                # heatPool / heatMeta (50/51) too, since wind phase 5: the
+                # particle drag reads the heat updraft through windAtQ.
+                "heatPool", "heatMeta"}
 # farVox + farP since chunk tickets P2: a particle outside residency flies on
 # and blocks against the far cascade (sim_particle.wgsl FAR FLIGHT), exactly as
 # a gas parcel does (simulation.cpp particleBGL_ bindings 8 and 9).
@@ -846,6 +849,12 @@ def module_for(fname):
     # the draft volume would look as if it never touched draftField, and a row
     # that omitted R(Draft) would pass.
     drop = "DRAFT_UNBOUND" if "> draftField" in body else "DRAFT_BOUND"
+    common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
+                    common, flags=re.S)
+    # The HEAT UPDRAFTS reader's two blocks (resources.cpp BodyReadsHeat), for
+    # the draft reader's reason: the stub defined last would hide the reads of
+    # heatPool / heatMeta that windAtQ makes in a shader that binds them.
+    drop = "HEAT_WIND_UNBOUND" if "> heatPool" in body else "HEAT_WIND_BOUND"
     common = re.sub(">>>" + drop + "_BEGIN<<<.*?>>>" + drop + "_END<<<", "",
                     common, flags=re.S)
     # The TICKET PROBE's two blocks, for the same reason (resources.cpp

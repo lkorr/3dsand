@@ -482,6 +482,16 @@ constexpr const char* kDraftBoundEnd = ">>>DRAFT_BOUND_END<<<";
 constexpr const char* kDraftUnboundBegin = ">>>DRAFT_UNBOUND_BEGIN<<<";
 constexpr const char* kDraftUnboundEnd = ">>>DRAFT_UNBOUND_END<<<";
 
+// The HEAT UPDRAFTS reader (common.wgsl's block of that name, wind phase 5)
+// reads `heatPool` / `heatMeta`, which only the temperature layer's consumers
+// declare (sim_step, sim_heat, sim_particle, sim_draft). Same two-block shape
+// and the same body-derived predicate as the draft reader above: BOUND for a
+// body that declares `> heatPool`, the zero stubs for every other shader.
+constexpr const char* kHeatWindBoundBegin = ">>>HEAT_WIND_BOUND_BEGIN<<<";
+constexpr const char* kHeatWindBoundEnd = ">>>HEAT_WIND_BOUND_END<<<";
+constexpr const char* kHeatWindUnboundBegin = ">>>HEAT_WIND_UNBOUND_BEGIN<<<";
+constexpr const char* kHeatWindUnboundEnd = ">>>HEAT_WIND_UNBOUND_END<<<";
+
 // THE TICKET PROBE (common.wgsl's TICKET_BOUND / TICKET_UNBOUND blocks,
 // chunk tickets P1). Exactly one survives. BOUND — the real resolver, reading
 // the ticket table in pageTable's tail — for a body that declares `pageTable`
@@ -549,6 +559,10 @@ bool BodyResolvesTickets(const std::string& body) {
 
 bool BodyReadsDrafts(const std::string& body) {
   return body.find("> draftField") != std::string::npos;
+}
+
+bool BodyReadsHeat(const std::string& body) {
+  return body.find("> heatPool") != std::string::npos;
 }
 
 bool BodyFlagsSupportLoss(const std::string& body) {
@@ -725,6 +739,11 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
     common = StripBlock(common, kDraftUnboundBegin, kDraftUnboundEnd);
   } else {
     common = StripBlock(common, kDraftBoundBegin, kDraftBoundEnd);
+  }
+  if (BodyReadsHeat(body)) {
+    common = StripBlock(common, kHeatWindUnboundBegin, kHeatWindUnboundEnd);
+  } else {
+    common = StripBlock(common, kHeatWindBoundBegin, kHeatWindBoundEnd);
   }
   if (BodyDeclaresPageTable(body) != BodyDeclaresPageTableByLine(body)) {
     std::fprintf(stderr,

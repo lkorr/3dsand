@@ -20,6 +20,12 @@
 // particle is dragged toward (common.wgsl WIND DRAFTS). Slim group, same
 // binding number as simBGL_.
 @group(0) @binding(46) var<storage, read> draftField : array<u32>;
+// The temperature layer (sim_heat.wgsl): windAtScaledQ -> windAtQ adds the
+// heat updraft (common.wgsl HEAT UPDRAFTS), so an ember over a fire is
+// dragged toward rising air. Slim group, simBGL_'s numbers. Read only:
+// heatMeta is atomic in every module that names it, so it is declared so.
+@group(0) @binding(50) var<storage, read> heatPool : array<u32>;
+@group(0) @binding(51) var<storage, read_write> heatMeta : array<atomic<u32>>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
 // shader that declares `read_write> voxels` must define this: gPtKernel's
 // initializer references it, so omitting it is a compile error rather than
