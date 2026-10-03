@@ -294,9 +294,25 @@ Target ChooseHairTarget(Ctx& c, bool brainHeadOnly = false) {
       if (ld.bloodless) return true;
     return false;
   };
+  // THE AUTHORED CAST ONLY, never a RUNTIME def (a composed pool body, a
+  // "+zombie" an earlier gate built). Which runtime defs exist when this runs
+  // is the SUITE's history, so a candidate list that included them picked a
+  // different creature in the full run than alone -- corpse-head-laser read a
+  // dead hair turn of 0.037 in the suite against 0.000 standalone (suite triage
+  // 2026-10-01). The pool below is the fallback for a cast with no hair at all.
   std::vector<int> cands;
-  for (size_t d = 0; d < mobs.Defs().size(); d++)
-    if (hasHair((int)d)) cands.push_back((int)d);
+  std::string skipped;
+  for (size_t d = 0; d < mobs.Defs().size(); d++) {
+    if (mobs.Defs()[d].name.empty() || !hasHair((int)d)) continue;
+    if (d >= mobs.LoadedDefCount()) {
+      skipped += " " + mobs.Defs()[d].name;
+      continue;
+    }
+    cands.push_back((int)d);
+  }
+  if (!skipped.empty())
+    std::printf("hair target: skipped runtime defs with hair:%s\n",
+                skipped.c_str());
   for (const std::string& n : mobs.PoolNames()) {
     if (!cands.empty()) break;
     const int d = mobs.PoolDef(n, nullptr);
