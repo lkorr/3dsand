@@ -10905,6 +10905,8 @@ void Mob::UntuckHair(int limbIndex) {
   MobLimb& l = limbs_[(size_t)limbIndex];
   if (l.tuckSig == 0) return;
   l.tuckSig = 0;
+  l.tuckBase = 0;
+  l.tuckHidden.clear();
   MicroBodySet* micro = MicroSet();
   if (!micro || l.microModel < 0) return;
   const uint32_t model = (uint32_t)l.microModel;
@@ -10977,10 +10979,16 @@ void Mob::SyncHairTuck() {
     shellSig = TuckMix(shellSig, liveCells(s));
   }
   if (head >= 0) shellSig = TuckMix(shellSig, liveCells(limbs_[(size_t)head]));
-  auto sigOf = [&](const MobLimb& l) -> uint64_t {
+  // Everything the hide is a function of but the brick's edit counter (the
+  // fast path's key, MobLimb::tuckBase), and that plus the counter.
+  auto baseOf = [&](const MobLimb& l) -> uint64_t {
     uint64_t h = TuckMix(shellSig, (uint64_t)(uint32_t)l.microModel);
-    h = TuckMix(h, MicroBodyEditGen(*micro, (uint32_t)l.microModel));
     h = TuckMix(h, l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
+    return h == 0 ? 1u : h;
+  };
+  auto sigOf = [&](const MobLimb& l) -> uint64_t {
+    const uint64_t h =
+        TuckMix(baseOf(l), MicroBodyEditGen(*micro, (uint32_t)l.microModel));
     return h == 0 ? 1u : h;   // 0 means "not tucked"
   };
 
@@ -11123,6 +11131,34 @@ void Mob::SyncHairTuck() {
     if (!l.body || l.microModel < 0) continue;
     if (shells.empty()) { UntuckHair(i); continue; }
     if (l.tuckSig != 0 && l.tuckSig == sigOf(l)) continue;
+    // ---- FAST PATH: ONLY THE BRICK'S COUNTER MOVED ----------------------------
+    // Same cover, same brick, same lattice size: a burn (or anything else)
+    // repainted cells, and a repaint of a hidden cell shows it again. Which
+    // cells hide has not changed -- it is a function of the lattice and the
+    // cover, both keyed in tuckBase -- so re-hide the last full tuck's cells
+    // and stop. (The pose is not in the key, and never was: a mane is tucked
+    // for the pose it had when the tuck was last derived.)
+    if (l.tuckSig != 0 && l.tuckBase != 0 && l.tuckBase == baseOf(l)) {
+      const bool fineF = l.HasFineSkin();
+      const size_t nF = fineF ? l.skinVoxels.size() : l.voxels.size();
+      const uint32_t modelF = (uint32_t)l.microModel;
+      for (uint32_t k : l.tuckHidden) {
+        if (k >= nF) continue;
+        int x, y, z;
+        uint32_t mat;
+        if (fineF) {
+          const PrefabVoxel& v = l.skinVoxels[k];
+          x = v.x; y = v.y; z = v.z; mat = v.material & 0xFFFu;
+        } else {
+          const DebrisVoxel& v = l.voxels[k];
+          x = v.x; y = v.y; z = v.z; mat = v.payload & 0xFFFu;
+        }
+        if (mat == 0 || mat > 255) continue;   // a burn tombstone: not ours
+        MicroBodyPoke(*micro, modelF, x, y, z, 0, 0);
+      }
+      l.tuckSig = sigOf(l);
+      continue;
+    }
     if (!coverBuilt) buildCover();
 
     // Which cells hide. Hair -> world by its own live transform -> the head's
@@ -11135,6 +11171,13 @@ void Mob::SyncHairTuck() {
     std::vector<uint8_t> hide(n, 0);
     size_t hidden = 0;
     if (!cover.empty()) {
+      // Hair lattice -> the head's frame is ONE rigid transform: the relative
+      // rotation and the hair origin in head space, composed once, instead of
+      // a rotation into the world and another back out per cell. Not bit-equal
+      // to the two-step form (float rounding) and need not be: this decides
+      // which cells DRAW, nothing is hashed or simulated from it.
+      const Quat rel = QuatNormalize(Mul(QuatConj(headQ), hq));
+      const Vec3 org = RotateInv(headQ, l.xf.pos - H->xf.pos) - centre;
       for (size_t k = 0; k < n; k++) {
         int x, y, z;
         if (fine) {
@@ -11144,10 +11187,8 @@ void Mob::SyncHairTuck() {
           const DebrisVoxel& v = l.voxels[k];
           x = v.x; y = v.y; z = v.z;
         }
-        const Vec3 w = l.xf.pos + Rotate(hq, Vec3{(x + 0.5f) / ls,
-                                                  (y + 0.5f) / ls,
-                                                  (z + 0.5f) / ls});
-        const Vec3 p = RotateInv(headQ, w - H->xf.pos) - centre;
+        const Vec3 p = org + Rotate(rel, Vec3{(x + 0.5f) / ls, (y + 0.5f) / ls,
+                                              (z + 0.5f) / ls});
         if (p.y < hemY) continue;   // below the hem: hangs out, drawn
         const int bin = TuckBin(p);
         if (bin < 0) continue;
@@ -11163,6 +11204,7 @@ void Mob::SyncHairTuck() {
       // brick for nothing.
       UntuckHair(i);
       l.tuckSig = sigOf(l);
+      l.tuckBase = baseOf(l);   // nothing hidden: the fast path re-hides nothing
       continue;
     }
     // Poking needs a brick of our own, exactly as a burn does.
@@ -11190,6 +11232,10 @@ void Mob::SyncHairTuck() {
     // AFTER the pokes: they bumped the brick's edit counter, and the signature
     // must describe the brick as this left it.
     l.tuckSig = sigOf(l);
+    l.tuckBase = baseOf(l);
+    l.tuckHidden.clear();
+    for (size_t k = 0; k < n; k++)
+      if (hide[k]) l.tuckHidden.push_back((uint32_t)k);
   }
 }
 
@@ -16602,17 +16648,43 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   {
     burnprof::Scope bpWalk(burnprof::kWalk);
     uint32_t seen = 0;
+    // ONE CHUNK'S RUN OF A ROW AT A TIME. The window test, the chunk lookup
+    // and the fetch request are per chunk, so they are asked once per run of
+    // up to 16 cells and the cells are a pointer walk -- the same cells, in the
+    // same y/z/x order, against the same cap, as worldMatAt one by one (which
+    // asked for an uncached chunk once per CELL; the request coalesces). This
+    // walk is most of what a loose body costs the debris burn pass: a forest
+    // fire walks ~66k cells a tick (--forest-fire, 2026-10-03).
     for (int y = lo.y; y <= hi.y && seen < kBurnScanCells; y++)
       for (int z = lo.z; z <= hi.z && seen < kBurnScanCells; z++)
-        for (int x = lo.x; x <= hi.x && seen < kBurnScanCells; x++) {
-          seen++;
-          const uint32_t m = worldMatAt({x, y, z});
-          if (m == 0 || m >= matHot_.size()) continue;
-          // "Reactive" is two things, and both come out of the table: the
-          // cell is HOT (it can ignite me through my own rules) or it
-          // REWRITES ITS NEIGHBOUR (acid, which acts on me through its
-          // rules — see the inbound pass below).
-          if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({x, y, z});
+        for (int x = lo.x; x <= hi.x && seen < kBurnScanCells;) {
+          const int nRun = std::min<int>(std::min(hi.x, x | 15) - x + 1,
+                                         (int)(kBurnScanCells - seen));
+          seen += (uint32_t)nRun;
+          const int x0 = x;
+          x += nRun;
+          if (!world.CellInWindow({x0, y, z})) continue;  // reads as air
+          const IVec3 wc = ChunkOfCell(x0, y, z);
+          if (wc.x != memoChunk.x || wc.y != memoChunk.y || wc.z != memoChunk.z) {
+            memoChunk = wc;
+            memoCC = world.Cached(wc);
+          }
+          // Unknown reads as air, and is asked for (worldMatAt's note).
+          if (!memoCC || memoCC->voxels.size() != kChunkVol) {
+            world.RequestChunkFetch(wc, World::FetchSource::Mob);
+            continue;
+          }
+          const uint32_t* row = memoCC->voxels.data() +
+                                ((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk;
+          for (int xx = x0; xx < x; xx++) {
+            const uint32_t m = row[xx & 15] & 0xFFFu;
+            if (m == 0 || m >= matHot_.size()) continue;
+            // "Reactive" is two things, and both come out of the table: the
+            // cell is HOT (it can ignite me through my own rules) or it
+            // REWRITES ITS NEIGHBOUR (acid, which acts on me through its
+            // rules — see the inbound pass below).
+            if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({xx, y, z});
+          }
         }
     burnStats_.walkCells += seen;
   }

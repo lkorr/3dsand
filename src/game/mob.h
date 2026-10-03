@@ -1548,6 +1548,15 @@ struct MobLimb {
   // the brick draws exactly its skinVoxels. RENDER-ONLY: skinVoxels/voxels,
   // the collider, burning and saving never see a tucked cell as missing.
   uint64_t tuckSig = 0;
+  // ...and what the last FULL tuck derived, for the fast path (SyncHairTuck):
+  // the lattice indices it hid, and the signature of everything the hide was a
+  // function of EXCEPT the brick's edit counter. A burn repainting the hair
+  // moves only the counter, and then re-hiding exactly these cells is the
+  // whole job -- not re-deriving them, two rotations a cell over a mane of
+  // tens of thousands (a 25 ms tick while a hooded villager's hair burned,
+  // 2026-10-03). Render-only, like tuckSig.
+  std::vector<uint32_t> tuckHidden;
+  uint64_t tuckBase = 0;
   // Voxel count the limb was authored with, so damage is a FRACTION of it.
   uint32_t voxelsAtSpawn = 0;
   // Voxel count the last carve already CHARGED to hp. `voxelsAtSpawn` is the
