@@ -142,8 +142,12 @@
 // costs every shader in the engine a recompile (CLAUDE.md). What holds it
 // honest: raymarch.wgsl's cache-off sunShadowAt runs the continuation through
 // farShadowMarch itself, and --gate shadow-cache compares that frame against
-// this pass's. The copy below drops only the penumbra estimate (the cone
-// jitter does that job here) and the render-stats counters.
+// this pass's. The copy below drops only the render-stats counters; the
+// penumbra estimate is there for the FAR PATCHES (below) and skipped for these
+// rays (withCov false: the cone jitter does that job here). Since 2026-10-03
+// it also clips to the per-level SKY BOUND as farShadowMarch does — the copy
+// had been missing it; exact (above that row there is only air), a rising
+// ray simply stops walking empty chunks sooner.
 //
 // COST lands only on rays that actually leave the window within
 // TUNE_FAR_SHADOW_REACH of their patch: a ray that exits through the top of
@@ -189,9 +193,45 @@ fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {
   let tmax = max(t0, t1);
   return max(min(tmax.x, min(tmax.y, tmax.z)), 0.0);
 }
-// raymarch.wgsl farShadowMarch minus the penumbra estimate: the blocker
-// distance in FINE voxels from `roFine`, or -1.
+// raymarch.wgsl farShadowCover, verbatim (the far patches below publish the
+// fragment shader's own penumbra estimate; see FAR PATCHES).
+const FAR_SHADOW_CONE_TAN : f32 = tan(TUNE_SHADOW_SUN_ANGLE * 0.017453292);
+fn farShadowCover(level : u32, vc : vec3<i32>, eAx : i32, tIn : f32,
+                  vMax : vec3f, rd : vec3f, stepv : vec3<i32>, s : f32) -> f32 {
+  if (FAR_SHADOW_CONE_TAN <= 0.0 || eAx < 0) { return 1.0; }
+  var xAx = 2;
+  var tOut = vMax.z;
+  if (vMax.x < vMax.y && vMax.x < vMax.z) { xAx = 0; tOut = vMax.x; }
+  else if (vMax.y < vMax.z) { xAx = 1; tOut = vMax.y; }
+  if (xAx == eAx) { return 1.0; }
+  let nb = vc + vec3<i32>(select(0, stepv.x, xAx == 0),
+                          select(0, stepv.y, xAx == 1),
+                          select(0, stepv.z, xAx == 2));
+  if (farInValid(nb, farBox(level)) && farShadowBlocked(level, nb)) { return 1.0; }
+  let a = abs(rd);
+  let ra = select(select(a.x, a.y, eAx == 1), a.z, eAx == 2);
+  let rx = select(select(a.x, a.y, xAx == 1), a.z, xAx == 2);
+  let margin = (tOut - tIn) * ra * rx * inverseSqrt(max(ra * ra + rx * rx, 1e-8)) * s;
+  let w = 2.0 * tIn * s * FAR_SHADOW_CONE_TAN;
+  return smoothstep(0.0, max(w, 1e-3), margin);
+}
+// raymarch.wgsl farSkyCeil (sky_top.wgsl's words at farOcc's tail).
+const SKY_TOP_BASE : u32 = FAR_LEVELS * FAR_NUM_CHUNKS;   // raymarch.wgsl agrees
+const SKY_TOP_BIAS : i32 = 1 << 24;                       // raymarch.wgsl agrees
+fn farSkyCeil(level : u32) -> f32 {
+  let w = farOcc[SKY_TOP_BASE + level - 1u];
+  return select(f32(i32(w) - SKY_TOP_BIAS), -1e30, w == 0u);
+}
+
+// raymarch.wgsl farShadowMarch: the blocker distance in FINE voxels from
+// `roFine` (x, or -1) and, when `withCov`, the sun-disc cover farShadowCover
+// estimates for it (y). The near patches' continuation passes false: their
+// cone jitter does the penumbra's job.
 fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f32 {
+  return farShadowTC(level0, roFine, rdIn, tStartFine, false).x;
+}
+fn farShadowTC(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32,
+               withCov : bool) -> vec2f {
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
   if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
@@ -212,8 +252,13 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
     let box = farBox(level);
     let tt0 = (vec3f(box.lo) - roL) * inv;
     let tt1 = (vec3f(box.hi) - roL) * inv;
-    let tExit = min(min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z))),
+    var tExit = min(min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z))),
                     tEndF / s);
+    // raymarch.wgsl farShadowMarch, THE SKY BOUND (exact: above the level's
+    // highest occupied cell there is only air).
+    if (rd.y > 0.0) {
+      tExit = min(tExit, (farSkyCeil(level) - roL.y) * inv.y + 1e-3);
+    }
     var tCur = tF / s;
     var cc = worldChunkOf(vec3<i32>(floor(roL + rd * tCur)));
     var cNext : vec3f;
@@ -221,6 +266,8 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
       let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
       cNext[a] = (b - roL[a]) * inv[a];
     }
+    // The chunk-crossing axis, for the penumbra estimate (farShadowMarch's cAx).
+    var cAx = -1;
     while (budget > 0) {
       budget -= 1;
       if (!farInValid(cc * i32(CHUNK), box)) { break; }
@@ -229,6 +276,7 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
       let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
       if (occ != 0u) {
         var tIn = tCur;
+        var eAx = cAx;
         var walk = true;
         let top = farOccTop(occ);
         if (top != 0u) {
@@ -240,7 +288,7 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
             } else {
               let tPlane = max((f32(yTop) - roL.y) * inv.y, tIn);
               if (tPlane + 1e-4 >= tOut) { walk = false; }
-              else { tIn = tPlane + 1e-4; }
+              else { tIn = tPlane + 1e-4; eAx = 1; }
             }
           }
         }
@@ -260,13 +308,19 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
           for (var j = 0; j < 3 * i32(CHUNK); j++) {
             if (budget <= 0) { break; }
             budget -= 1;
-            if (farShadowBlocked(level, vc)) { return vCur * s; }
+            if (farShadowBlocked(level, vc)) {
+              var cov = 1.0;
+              if (withCov) {
+                cov = farShadowCover(level, vc, eAx, vCur, vMax, rd, stepv, s);
+              }
+              return vec2f(vCur * s, cov);
+            }
             if (vMax.x < vMax.y && vMax.x < vMax.z) {
-              vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x;
+              vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x; eAx = 0;
             } else if (vMax.y < vMax.z) {
-              vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y;
+              vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y; eAx = 1;
             } else {
-              vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
+              vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; eAx = 2;
             }
             if (vCur >= tOut || vCur >= tExit) { break; }
             if (stepv.y > 0 && vc.y >= yTopRow) { break; }
@@ -274,19 +328,19 @@ fn farShadowT(level0 : u32, roFine : vec3f, rdIn : vec3f, tStartFine : f32) -> f
         }
       }
       if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
-        tCur = cNext.x; cc.x += stepv.x;
+        tCur = cNext.x; cc.x += stepv.x; cAx = 0;
         cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
       } else if (cNext.y <= cNext.z) {
-        tCur = cNext.y; cc.y += stepv.y;
+        tCur = cNext.y; cc.y += stepv.y; cAx = 1;
         cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
       } else {
-        tCur = cNext.z; cc.z += stepv.z;
+        tCur = cNext.z; cc.z += stepv.z; cAx = 2;
         cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
       }
     }
     tF = max(tF, min(tCur, tExit) * s);
   }
-  return -1.0;
+  return vec2f(-1.0, 0.0);
 }
 
 // ======================= THE SUN IS NOT A POINT ============================
@@ -442,6 +496,59 @@ fn prepare() {
   shadowArgs[2] = 1u;
 }
 
+// ======================= FAR PATCHES (2026-10-03, raymarch-far) =============
+// raymarch.wgsl FAR_SHADOW_CACHE has the why, the measurement, and why it
+// ships OFF (with it off, no far request is ever made and this never runs). A
+// request whose packedSub carries FAR_SC_FLAG is a CASCADE patch: (level, cell
+// toroidal in its level, face, sub-patch, refined). Its value is the fragment
+// shader's own far-pixel formula evaluated at the patch centre — `hp` below is
+// fs()'s `hp` for a pixel there (face + half a cell along the normal, lifted
+// over the cell top for a refined hit), the march is farShadowMarch's
+// (farShadowTC with the penumbra estimate), the law is shadowFromOpaqueHit's —
+// published whole: no cone jitter, no window, no glide, no GI deposit (a far
+// cell is not a window voxel). A BURIED start (the march stops in its first
+// cell) is "no opinion", as for the near patches. MUST AGREE with
+// raymarch.wgsl: FAR_SC_* and farScPackCell.
+const FAR_SC_SUBDIV : u32 = 2u;
+const FAR_SC_FLAG : u32 = 0x80000000u;
+const FAR_SC_REFINED : u32 = 0x08000000u;
+const FAR_SC_LEVEL_SHIFT : u32 = 28u;
+const FAR_SC_AXIS_BITS : u32 = countTrailingZeros(FAR_N);
+fn resolveFarPatch(key : u32, bucket : u32, packedCell : u32, packedSub : u32) {
+  let level = ((packedSub >> FAR_SC_LEVEL_SHIFT) & 7u) + 1u;
+  let ab = FAR_SC_AXIS_BITS;
+  let tor = vec3<i32>(vec3<u32>(packedCell, packedCell >> ab, packedCell >> (2u * ab)) &
+                      vec3<u32>(FAR_N - 1u));
+  let face = (packedCell >> (3u * ab)) & 7u;
+  let box = farBox(level);
+  // The unique representative of the toroidal cell inside the level's box
+  // (farVox's own aliasing, FAR_N per axis).
+  let cell = box.lo + ((tor - box.lo) & vec3<i32>(i32(FAR_N) - 1));
+  var valU = 255u;
+  var valid = false;
+  if (level <= FAR_LEVELS && farInValid(cell, box)) {
+    let s = f32(1u << farCellShift(level));
+    let n3 = shadowFaceNormal(face);
+    var hp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
+                               FAR_SC_SUBDIV) * s + n3 * (0.55 * s);
+    if ((packedSub & FAR_SC_REFINED) != 0u) {
+      hp.y = max(hp.y, f32(cell.y + 1) * s + 0.05 * s);
+    }
+    let r = farShadowTC(level, hp, keyLightDirP(R), 0.0, true);
+    var sh = 1.0;
+    if (r.x >= 0.0) { sh = mix(1.0, shadowFromOpaqueHit(true, r.x, 0u), r.y); }
+    valid = !(r.x >= 0.0 && r.x < 0.01);
+    valU = u32(clamp(sh, 0.0, 1.0) * 255.0 + 0.5);
+  }
+  let ver = shadowPatchVerifier(packedCell, packedSub);
+  if (atomicLoad(&shadowCache[bucket * 2u]) != key) { return; }
+  let old = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+  if (shadowStateVerifier(old) != ver) { return; }
+  atomicStore(&shadowCache[bucket * 2u + 1u],
+              shadowPackState(valU, R.frameIdx & 15u, shadowStateRequested(old),
+                              valid, ver));
+}
+
 // resolve: one media-blind shadow ray per requested patch.
 @compute @workgroup_size(64)
 fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -453,6 +560,10 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   let bucket = atomicLoad(&shadowReq[base + 1u]);
   let packedCell = atomicLoad(&shadowReq[base + 2u]);
   let packedSub = atomicLoad(&shadowReq[base + 3u]);
+  if ((packedSub & FAR_SC_FLAG) != 0u) {
+    resolveFarPatch(key, bucket, packedCell, packedSub);
+    return;
+  }
 
   // Reconstruct the patch's world-space centre and normal. The request stores
   // the cell TOROIDAL (9 bits per axis at WORLD_N 512), so it means the same
