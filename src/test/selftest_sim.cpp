@@ -4705,7 +4705,10 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
 // so the upload's sort is exercised. Post-dispatch, A's lower neighbour is
 // still stone (chunk K must be flagged) and B is air, so NOTHING in K+1 is
 // left unsupported: K+1 must not be flagged. The old read flagged K+1 whenever
-// A's invocation read B before B's store landed -- a scheduling choice.
+// A's invocation read B before B's store landed -- a scheduling choice. It
+// PINS the rule; it cannot force the interleaving: the pre-fix shader also
+// passed it on the RTX 3060 Ti (2026-10-03, run against c364516's
+// sim_mutate.wgsl), so on this GPU the read happened to land after the store.
 // A "must not" needs a quiet K+1: it is open air above the terrain, the
 // fixture's paint raises no flag (paint into air never does), and the
 // baseline window drains everything else before the erase.
