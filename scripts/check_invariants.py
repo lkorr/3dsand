@@ -3178,6 +3178,18 @@ def check_heat_mirror():
         problems.append("heat: sim_heat.wgsl DIRTY_R_HEAT is not 1 << the index of \"heat\" "
                         "in world.h kDirtyReasonName")
 
+    # DIRTY_R_DRY / DIRTY_R_DRYW (a wet stain drying, sim_step.wgsl stainDry)
+    # are declared in the writer and in its one reader, sim_waterbody.wgsl's
+    # wbQuiet, which ignores them; both must be the bits world.h names "dry" and
+    # "DRY-WROTE", or the quiescence test would ignore some other rule's marks.
+    dry_src = {f: read("assets/shaders/" + f) or "" for f in ("sim_step.wgsl", "sim_waterbody.wgsl")}
+    for row, const in (("dry", "DIRTY_R_DRY"), ("DRY-WROTE", "DIRTY_R_DRYW")):
+        for f in ("sim_step.wgsl", "sim_waterbody.wgsl"):
+            mc = re.search(r"const\s+" + const + r"\s*:\s*u32\s*=\s*(\d+)u\s*;", dry_src[f])
+            if not mc or row not in names or int(mc.group(1)) != (1 << names.index(row)):
+                problems.append(f"heat/drybits: {f} {const} is not 1 << the index of "
+                                f"{row!r} in world.h kDirtyReasonName")
+
 
 ALL = {
     "solute": check_solute_mirror,

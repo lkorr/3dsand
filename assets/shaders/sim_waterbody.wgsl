@@ -435,6 +435,21 @@ fn wbMarkDirty(c : vec3<i32>) {
 // quiescence continuously affordable, and it is why the expensive question
 // ("how much water is in there") is a separate pass that runs once.
 // ============================================================================
+// A WET BANK DRYING IS NOT A DISTURBANCE (2026-10-03). sim_step.wgsl's
+// stainDry marks its chunk with these two bits and nothing else, and it never
+// touches a cell with its wetter liquid on a face, so it cannot move one eighth
+// of any body. A pit that was dug, poured into and splashed keeps its banks
+// drying for ~1000 ticks (15 levels at water's 15 per mille); read as activity
+// that held the created body CANDIDATE the whole time and it was never
+// measured (`--gate waterbody` pass N, red since f039607 "wet dries"). Bits 29
+// and 30 of the dirty word, world.h kDirtyReasonName "dry" / "DRY-WROTE";
+// mirrored from sim_step.wgsl (check_invariants.py `drybits`). doStaining's
+// own marks (DIRTY_R_STAIN / DIRTY_R_STAINW: a liquid soaking in, which DOES
+// spend water) still count.
+const DIRTY_R_DRY : u32 = 536870912u;
+const DIRTY_R_DRYW : u32 = 1073741824u;
+const WB_QUIET_IGNORES : u32 = DIRTY_R_DRY | DIRTY_R_DRYW;
+
 @compute @workgroup_size(64)
 fn wbQuiet(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.waterChunkCount) { return; }
@@ -451,7 +466,7 @@ fn wbQuiet(@builtin(global_invocation_id) gid : vec3<u32>) {
   let st = wbGet(b, WBS_STATE);
   if (st != WB_CANDIDATE && st != WB_MEASURING) { return; }
   var disturbed = 0;
-  if (dirtyIn[slot] != 0u) { disturbed = 1; }
+  if ((dirtyIn[slot] & ~WB_QUIET_IGNORES) != 0u) { disturbed = 1; }
   if (fluidBlockMapS[slot] != 0u) { disturbed = 1; }
   if (disturbed != 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_RDIRTY], 1); }
 }
