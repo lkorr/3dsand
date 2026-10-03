@@ -365,8 +365,10 @@ void World::Init(const rhi::Device& device) {
                                     (uint64_t)(16 + 3 * kNumSlots) * 4,
                                     U::Storage | U::CopySrc | U::CopyDst,
                                     "fluidExciteScratch");
+  // CopySrc: the ca-slope gates read the per-slot calm/age words back to say
+  // WHY a block of particles never settles (CLAUDE.md rule 6).
   fluidCalm = CreateBuffer(device, (uint64_t)kNumSlots * 4,
-                           U::Storage | U::CopyDst, "fluidCalm");
+                           U::Storage | U::CopySrc | U::CopyDst, "fluidCalm");
   // ... + 2: SP_LIVEFLAG / SP_LIVEPREV, the settle half's sleep flags
   // (sim_fluid_seam.wgsl SP_SCRATCH_WORDS is the layout's truth).
   fluidSettleScratch = CreateBuffer(

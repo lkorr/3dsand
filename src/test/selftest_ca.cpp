@@ -467,6 +467,14 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
   // goes away". The count at four points does: falling means draining, flat
   // means stuck. fa[7] is already read every tick for the ledger.
   uint32_t liveAt[4] = {0, 0, 0, 0};
+  // WHY THE RESIDUE DOES NOT SETTLE. "127 particles, flat" says that it is
+  // stuck and nothing about which settle stage refuses it, and the stages have
+  // different fixes: never calm (the solver keeps it moving), picked and
+  // refused as infeasible (column geometry), picked and vetoed per column as
+  // excite-UNSTABLE (WP3's perch veto), or the force-settle backstop never
+  // reaching it. These are the seam's own per-tick counters, summed.
+  uint64_t sumSetBlocks = 0, sumSetRefused = 0, sumSetUnstable = 0;
+  uint64_t sumSetCeil = 0, sumSetFloor = 0, sumForced = 0, sumSealed = 0;
   for (int i = 0; i < kTicks; i++) {
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
                i == 0   ? build
@@ -474,9 +482,16 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
                         : std::vector<CellOp>{},
                false, {6, 7, 6}, false, false);
     {
-      uint32_t fa[32] = {};
+      uint32_t fa[kFluidArgsWords] = {};
       rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
                             sizeof(fa), "slopeTickArgs");
+      sumSetBlocks += fa[13];    // FA_SETBLOCKS: blocks picked (calm + forced)
+      sumSetRefused += fa[25];   // FA_SETREFUSED: whole block infeasible
+      sumSetUnstable += fa[26];  // FA_SETUNSTABLE: block lost columns to the veto
+      sumSetCeil += fa[30];      // FA_SETCEIL (columns)
+      sumSetFloor += fa[31];     // FA_SETFLOOR (columns)
+      sumForced += fa[32];       // FA_FORCED: backstop blocks that got out
+      sumSealed += fa[33];       // FA_SEALED: backstop blocks still sealed
       sumConsumed += fa[16];   // FA_CONSUMED: eighths eaten by CA reactions
       sumBinned += fa[15];     // FA_BINNED:   eighths settle could not place
       sumSettled += fa[10];
@@ -563,6 +578,7 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
   // water reached the basin" must not depend on whether it settled first.
   uint64_t liveE = 0, liveBasinE = 0;
   uint32_t liveCount = 0;
+  std::string residueWhy;
   {
     uint32_t fa[16] = {};
     rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
@@ -573,11 +589,47 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       rhi::ReadbackBlocking(ctx.device, ctx.queue,
                             world.fluidParticles[sim.Page()], 0, pbuf.data(),
                             pbuf.size() * 4, "slopeParts");
+      // Per chunk slot: how many live particles, their cell extent and the
+      // fastest one; then the slot's settle clock (fluidCalm: consecutive calm
+      // ticks in [0..15], stuck age in [16..31]). A residue that is never calm
+      // reads differently from one that is calm and keeps being refused, and
+      // an age that never reaches sim.fluidStuckTicks says the backstop is
+      // being starved rather than refusing.
+      struct SlotP {
+        uint32_t n = 0, e = 0;
+        int x0 = 1 << 30, x1 = -(1 << 30), y0 = 1 << 30, y1 = -(1 << 30);
+        uint64_t maxV2 = 0;
+      };
+      std::map<uint32_t, SlotP> bySlot;
       for (uint32_t k = 0; k < liveCount; k++) {
         const uint32_t* pw = pbuf.data() + (size_t)k * kFluidParticleWords;
         const uint64_t e = (pw[18] >> 12) & 0x7u;
         liveE += e;
         if (((int32_t)pw[0] >> 16) >= basinX0) liveBasinE += e;
+        if (e == 0) continue;
+        const int cx = (int32_t)pw[0] >> 16, cy = (int32_t)pw[1] >> 16,
+                  cz = (int32_t)pw[2] >> 16;
+        SlotP& sp = bySlot[World::SlotChunkIndex({cx >> 4, cy >> 4, cz >> 4})];
+        sp.n++;
+        sp.e += (uint32_t)e;
+        sp.x0 = std::min(sp.x0, cx); sp.x1 = std::max(sp.x1, cx);
+        sp.y0 = std::min(sp.y0, cy); sp.y1 = std::max(sp.y1, cy);
+        const int64_t vx = (int32_t)pw[3], vy = (int32_t)pw[4],
+                      vz = (int32_t)pw[5];
+        sp.maxV2 = std::max<uint64_t>(sp.maxV2,
+                                      (uint64_t)(vx * vx + vy * vy + vz * vz));
+      }
+      if (!bySlot.empty()) {
+        std::vector<uint32_t> calm(kNumSlots, 0);
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidCalm, 0,
+                              calm.data(), kNumSlots * 4, "slopeCalm");
+        for (const auto& [slot, sp] : bySlot)
+          residueWhy += Format(
+              " [slot %u: %u particles / %u eighths, x %d..%d y %d..%d, max |v| "
+              "%.3f vox/tick, calm %u age %u]",
+              slot, sp.n, sp.e, sp.x0, sp.x1, sp.y0, sp.y1,
+              std::sqrt((double)sp.maxV2) / 65536.0, calm[slot] & 0xFFFFu,
+              calm[slot] >> 16);
       }
     }
   }
@@ -612,6 +664,15 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       (unsigned long long)sumBinned, (unsigned long long)sumConsumed,
       divergeAt, divergeBy, liveAt[0], liveAt[1], liveAt[2], liveAt[3],
       activeInBox, boxChunks.size(), kTicks, quietAt, stainOnlyInBox);
+  detail += Format(
+      "; settle over the run: %llu picks, %llu refused infeasible (%llu ceil / "
+      "%llu floor columns), %llu lost columns to the perch veto, %llu forced "
+      "out, %llu forced-but-sealed",
+      (unsigned long long)sumSetBlocks, (unsigned long long)sumSetRefused,
+      (unsigned long long)sumSetCeil, (unsigned long long)sumSetFloor,
+      (unsigned long long)sumSetUnstable, (unsigned long long)sumForced,
+      (unsigned long long)sumSealed);
+  detail += residueWhy;
   detail += awakeWhy;
   return ok ? Status::Pass : Status::Fail;
 }
