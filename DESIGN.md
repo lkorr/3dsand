@@ -5076,6 +5076,48 @@ refuse matter that does not crumble to the creature's blood, so a wooden arm on
 a man is not rewritten to blood-meat, but a sylvan's flesh arm is not rewritten
 to blood-meat either (it gets the blood smear only).
 
+**Robots are matter** (2026-10-02, materials.h `shell` / `struck` / `burst`).
+The machine races' behaviour is ten materials.json rows and three new fields,
+no race code: brass plating, oily `clockwork`, an iron frame, a glowing
+`boiler` and a `cogitator` (brainHp) for the automaton; `synth_shell` panels,
+arcing `circuitry`, an `alloy` endoskeleton (hardness 180), a glowing
+`power_cell` and a `neural_core` (brainHp) for the android; `coolant` (cyan,
+faintly lit, an extinguisher, dries like blood) is what an android bleeds, and
+`oil` what an automaton bleeds -- flammable, so a holed automaton near a spark
+burns. None of the rows is flammable, organic or dissolvable, and every
+rotRate is 0: fire, acid, rot and venom find nothing to take.
+- **`shell`: a body of plate chips, it does not gash.** A blow whose struck
+  voxel is `shell` on a BODY limb takes the worn-plate response
+  (game/shellresponse.h): a blade's kerf is scaled by the Blade carve ratio
+  (gear.cutHardnessRef / hardness; the edge's REACH stays the blade's, so the
+  plane is still priced in full), a mace's mark by the Blunt ratio, and an edge
+  or teeth deliver sqrt(ratio) of their hp (floor 0.25) -- a mace or a blast
+  arrives whole: use a hammer on a machine. Opt-in, so the sylvan's bark (which
+  carves as flesh and is tuned against it) is untouched.
+- **The kerf is priced for every material id.** `Mob::CutLimb`'s resistance
+  table stopped at 128 and charged anything above as skin -- an android's
+  alloy frame, the snake's gland, a zombie's rotflesh. It is now hardness over
+  gear.cutHardnessRef for every id.
+- **`struck`: what a blow knocks out.** A living body struck ON such matter
+  throws a small ball of it into the air at the hit, on a hash of (creature,
+  tick, slot, count): sparks off brass (0.2) and wiring (0.9), steam off the
+  boiler (0.8).
+- **`burst`: what a breach or a death lets go.** The first wound that removes a
+  voxel of burst matter lets it go once (`Mob::breachBurst_`), and `Mob::Die`
+  lets it go again from the centre of all of it: a dead automaton's head of
+  steam (radius 4), a dead android's discharge -- sparks along 4-6 jagged ARCS
+  (radius 5) that light what burns, pop hydrogen and fire gunpowder through
+  spark's own rules.
+All three queue `MobSystem::BodyBurst`s (capped 8 a tick), drained by the
+session's reaction-effect pass into the flash aftermath, which lays them as
+IfAir cell ops the next tick (`ReactFxAftermath`, `arcs` = the jagged walks):
+through the op stream (rule 3), at hashed positions (rule 1), bounded twice
+(rule 2). Gate `robot-races`: plating loses a quarter of the voxels and half or
+less of the hp a human forearm does to the same two cuts, the cut plane costs
+2.5x (automaton) / 7x (android) to part, oil / coolant leak, steam / an arcing
+discharge at death -- and, through the real tick, an android's death lays 60
+spark cell ops.
+
 ### Large-scale destruction
 - **Explosions**: cast rays from the blast center to every voxel on the blast
   sphere's *surface*, DDA-traversing voxel by voxel. Compare each voxel's
@@ -8686,6 +8728,53 @@ and skipped by a human's mutate / roll / cross WITHOUT a random draw, so every
 seeded human litter is unchanged. `applyRace` moves the build by offsets (like
 `applySex`) and is reversible. A sylvan still `extends: human`; it is FILED in
 `assets/mobs/sylvan/`.
+
+**MACHINE RACES, AND THE RACE INTERFACE** (2026-10-02, `assets/editor/
+automaton.js`, `android.js`, shared toolbox `robotkit.js`). `body.race` may also
+be `automaton` (a steampunk clockwork man: riveted brass, gear windows, copper
+pipes, leather bellows, a furnace grate in the chest, lamp eyes behind glass,
+and off the body a chimney / top hat / gear crest / exhaust stacks / the wind-up
+key) or `android` (smooth synthetic panels with seams, light strips, circuit
+traces, a power core window, bare frame at the joints; a visor / faceplate /
+single scanner / speaker / near-human face; antennae, head fins, power packs, a
+halo). Same promise as the sylvan -- the human's boxes, anchors, sockets,
+chains, gait (`test_mobgen.mjs` §P) -- but reached through ONE interface instead
+of hooks: `mobgen.RACE_MODS` maps a race key to a module exporting its art
+SLOTS / COLOR_SLOTS / colours and colour SETS, `defaultGenes` (stored under the
+race key, `genome.automaton` / `genome.android`), GENE_GROUPS / GENE_SPECS
+(race-gated, so no human draw moves), named PICKERS (face, stacks, fittings:
+each a preset over genes, with its own dropdown on the Characters page),
+`surfacePass` (inside each part's box, never growing it), `extras` (head cells
+-> `snout` parts, torso cells -> `bough` parts, both FIXED joints), slot ->
+material names with a DEFAULT_MAT (no slot falls back to skin), STAND_INS, the
+ANATOMY, the BLEED, PRESETS, FOLDER. A new race of that shape is a module and a
+row. The sylvan predates it and keeps its own hooks.
+
+**Ids above 127 are painted as STAND-INS.** A .vox palette index is a material
+id only up to 127, and the robot materials are appended rows (207..216). A race
+names its real materials everywhere; `mobgen.raceStandIn` swaps each for its
+stand-in (an unused low id: `cactus_rib` -> `brass`, `mushroom_stem` ->
+`synth_shell`, ...) at .vox write and in the recipe, and the sidecar's
+`anatomy.becomes` maps them back at load (mob.cpp, after the recipe resolves --
+the snake's venom-gland mechanism), so `anatomy-parity` still compares recipe
+against bake. Examples: `assets/mobs/automaton/{tinker,boilerman,deepdiver}`,
+`assets/mobs/android/{courier,sentinel,replicant}`, all `extends: human`.
+
+**One art palette, and the wardrobe's share of it.** Every loaded body and item
+merges its art colours into ONE 255-entry run (`MicroBodyMergeArt`). The cast
+plus the wardrobe came to 264 colours with the robots (184 cast + 32 items
+before them), and a full run used to paint the overflow the raw MATERIAL colour
+(a madder hood went cloth-grey). Three rules now: a colour within
+`kArtMergeNear` (RGB distance squared 27 -- three levels a channel, invisible)
+of one already merged SHARES its slot (never a pure grey; the run drops to
+~215); an overflow takes the NEAREST merged colour; and the cast
+(`LoadMobDefs`) stops `kWardrobeArtReserve` (40) short of the run so the items
+that load after it keep exact colours -- the dyeable pieces are exact greys the
+dye multiplies (`dye` gate). Races also share colours on purpose: the machines'
+lamp colours are the sylvan's glow hexes, an android's strips / eyes / core
+burn one colour, an automaton's rivets are its polished plating and its gears
+its shaded plating, and both machines keep their nail / shadow / glass /
+bellows / frame / visor colours out of the roll sets.
 
 **EVERY HAIR PIECE HAS A COLLIDER.** A limb's collider is the majority fill of
 2x2x2 skin blocks (`phys/lattice.h`), counted in ENGINE axes (the loader's

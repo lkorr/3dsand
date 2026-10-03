@@ -1564,6 +1564,152 @@ section('O. the sylvan race: another surface on the SAME rig');
 }
 
 // =============================================================================
+// 9. the machine races (automaton.js, android.js)
+// =============================================================================
+
+section('P. the machine races: automaton and android on the SAME rig');
+{
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  const idOf = n => materials.findIndex(m => m.id === n) + 1;
+  for (const [race, M] of Object.entries(mg.RACE_MODS)) {
+    // 1. THE RIG IS THE HUMAN'S (section O's promise, for every machine): the
+    //    same boxes, anchors, sockets, chains, natural weapons and gait, and
+    //    every body part inside its own box -- so every helm, cuirass and
+    //    blade fits.
+    for (const [label, human] of [['default', mg.defaultGenome()],
+                                  ['brute', mg.presetGenome('brute')],
+                                  ['random 7', mg.randomGenome(mg.makeRng(7))]]) {
+      const rob = mg.applyRace(mg.normalizeGenome(human), race);
+      const a = mg.generateMob(human, 0, opts), b = mg.generateMob(rob, 0, opts);
+      const bodyNames = mg.ARCHETYPE.order;
+      const box = r => Object.fromEntries(bodyNames.map(n => [n, r.table.limbs[n]]));
+      ok(!diff(box(a), box(b), 'limbs'),
+         `${race} ${label}: the human's limb boxes`, diff(box(a), box(b), 'limbs'));
+      const rig = r => ({
+        limbs: r.sidecar.limbs.filter(l => l.tag !== 'hair'),
+        sockets: r.sidecar.sockets, chains: r.sidecar.chains,
+        natural: r.sidecar.natural, gait: r.sidecar.gait, speed: r.sidecar.speed,
+      });
+      const d = diff(rig(a), rig(b), label);
+      ok(!d, `${race} ${label}: the human's anchors, sockets, chains, natural ` +
+             'weapons and gait', d);
+      for (const p of b.parts.filter(p => !p.hair))
+        ok(p.cells.every(([x, y, z]) => x >= 0 && y >= 0 && z >= 0 &&
+                         x < p.size[0] && y < p.size[1] && z < p.size[2]),
+           `${race} ${label}: ${p.name} stays inside its box`);
+    }
+    // 2. THE SWITCH IS REVERSIBLE, through human and through the other races.
+    {
+      const g0 = mg.presetGenome('stocky');
+      const pick = g => ({ body: { ...g.body, race: undefined }, shape: g.shape,
+                           head: g.head });
+      for (const via of ['human', 'sylvan', ...Object.keys(mg.RACE_MODS)]) {
+        let g = mg.applyRace(mg.normalizeGenome(g0), race);
+        g = mg.applyRace(g, via);
+        g = mg.applyRace(g, 'human');
+        const d = diff(pick(mg.normalizeGenome(g0)), pick(mg.normalizeGenome(g)),
+                       'build');
+        ok(!d, `human -> ${race} -> ${via} -> human restores the build`, d);
+      }
+    }
+    // 3. EVERY PRESET builds, passes its own structural checks, is made only
+    //    of paintable ids (<= 127: the stand-ins) and bakes to the race's
+    //    inside; the sidecar names what it bleeds and how to rewrite each
+    //    stand-in at load.
+    for (const k of M.PRESET_ORDER) {
+      const g = mg.presetGenome(k);
+      ok(g.body.race === race, `${k} is a ${race}`);
+      const b = mg.generateMob(g, 0, opts);
+      ok(!mg.validateMob(b).length, `${k}: structurally sound`,
+         mg.validateMob(b).join('; '));
+      const baked = mg.bakeAnatomy(b, materials);
+      const c = baked.census;
+      ok(!c.skin && !c.flesh && !c.muscle && !c.bone && !c.brain && !c.blood,
+         `${k}: no flesh anywhere in a ${race}`, JSON.stringify(c));
+      const becomes = b.sidecar.anatomy.becomes || {};
+      for (const [real, si] of Object.entries(M.STAND_INS)) {
+        ok(becomes[si] === real, `${k}: stand-in ${si} becomes ${real}`,
+           JSON.stringify(becomes));
+        ok(idOf(si) > 0 && idOf(si) <= 127 && idOf(real) > 127,
+           `${k}: ${si} is paintable and ${real} is not`);
+      }
+      // The inside: every stand-in the recipe uses is present in the bake.
+      for (const si of Object.values(M.STAND_INS))
+        ok(c[si] > 0, `${k}: the bake holds ${si} (${M.STAND_INS ? Object.keys(M.STAND_INS).find(r => M.STAND_INS[r] === si) : ''})`,
+           JSON.stringify(c));
+      ok(b.sidecar.bleed.material === M.BLEED.material,
+         `${k}: bleeds ${M.BLEED.material}`);
+      ok(b.sidecar.race === race, `${k}: the sidecar says ${race}`);
+    }
+    // 4. A HUMAN NEVER SEES THE RACE: none of its colour slots in a human's
+    //    palette.
+    {
+      const b = mg.generateMob(mg.defaultGenome(), 0, opts);
+      const { palette } = readVox(b.vox);
+      const slots = Object.values(M.COLOR_SLOTS);
+      ok(slots.every(sl => palette[(sl - 1) * 4] === 0 &&
+                           palette[(sl - 1) * 4 + 1] === 0 &&
+                           palette[(sl - 1) * 4 + 2] === 0),
+         `a human writes none of the ${race} colours into its palette`);
+    }
+    // 5. RANDOM AND MUTANT machines are sound.
+    for (const s of [1, 2, 3, 5, 8, 21]) {
+      const g = mg.rollColors(mg.randomGenome(mg.makeRng(s), null, { race }),
+                              mg.makeRng(s ^ 77));
+      ok(g.body.race === race, `random ${race} seed ${s} is a ${race}`);
+      const b = mg.generateMob(g, 0, opts);
+      ok(!mg.validateMob(b).length, `random ${race} seed ${s}: sound`,
+         mg.validateMob(b).join('; '));
+      const m = mg.mutate(mg.presetGenome(M.PRESET_ORDER[s % M.PRESET_ORDER.length]),
+                          1.5, mg.makeRng(s));
+      const bm = mg.generateMob(m, 0, opts);
+      ok(!mg.validateMob(bm).length, `${race} mutant seed ${s}: sound`,
+         mg.validateMob(bm).join('; '));
+    }
+    // 6. EVERY PICKER STYLE builds sound, against every other picker's.
+    for (const pk of M.PICKERS)
+      for (const st of pk.order) {
+        const g = mg.applyRace(mg.defaultGenome(), race);
+        pk.apply(g, st);
+        for (const other of M.PICKERS.filter(o => o !== pk))
+          other.apply(g, other.order[other.order.length - 1]);
+        const b = mg.generateMob(g, 0, opts);
+        ok(!mg.validateMob(b).length, `${race} ${pk.key} ${st}: sound`,
+           mg.validateMob(b).join('; '));
+      }
+    // 7. EVERY NUMERIC GENE REACHES THE BODY on at least one face (a lens
+    //    bezel means nothing behind a porthole; a slider that moves nothing
+    //    on EVERY face is a slider nobody can trust). The second picker is
+    //    set to its busiest style so the extras' genes have something to move.
+    {
+      const busy = { automaton: 'works', android: 'sentinel' };
+      const bases = M.PICKERS[0].order.map(face => {
+        const g = mg.applyRace(mg.defaultGenome(), race);
+        M.PICKERS[0].apply(g, face);
+        if (M.PICKERS[1]) M.PICKERS[1].apply(g, busy[race] || M.PICKERS[1].order[1]);
+        return g;
+      });
+      const key = g => {
+        const b = mg.generateMob(g, 0, opts);
+        return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';'))
+          .join('|');
+      };
+      const k0 = bases.map(key);
+      for (const spec of mg.GENE_SPECS.filter(sp => sp.race === race && !sp.kind)) {
+        let moved = false;
+        for (let bi = 0; bi < bases.length && !moved; bi++) {
+          const g = mg.normalizeGenome(bases[bi]);
+          const v = mg.getPath(g, spec.path);
+          mg.setPath(g, spec.path, v > (spec.min + spec.max) / 2 ? spec.min : spec.max);
+          moved = key(g) !== k0[bi];
+        }
+        ok(moved, `${spec.path} changes the body`);
+      }
+    }
+  }
+}
+
+// =============================================================================
 
 if (fails) {
   console.log('\nThe standard is assets/mobs/human.json. If it moved on purpose, ' +

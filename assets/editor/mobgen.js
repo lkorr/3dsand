@@ -82,6 +82,24 @@ import { writeVox, readVox, tightenPrefab, prefabToVoxModels,
 import * as ANA from './anatomy.js';
 import * as SC from './sidecar.js';
 import * as SY from './sylvan.js';
+import * as AU from './automaton.js';
+import * as AN from './android.js';
+
+/** THE MACHINE RACES (automaton.js, android.js), by race key. Everything such
+ *  a race contributes reaches the generator through this table and ONE
+ *  interface (automaton.js documents its shape): art slots and colours, genes
+ *  and named pickers, a surface pass, extras off the body, what each slot is
+ *  made of (with stand-ins for ids a .vox cannot paint), the inside, the
+ *  bleed, presets and its folder. A new race of that shape is a module and a
+ *  row here. The sylvan predates the interface and keeps its own hooks. */
+export const RACE_MODS = { automaton: AU, android: AN };
+export const RACES = [...SY.RACES, ...Object.keys(RACE_MODS)];
+/** The machine race module a genome is, or null (human, sylvan). */
+export const raceMod = g =>
+  RACE_MODS[(g && g.body && g.body.race) || 'human'] || null;
+/** Which race OWNS a colour key: null for the human's own nine. */
+const colorOwner = k => (k in SY.COLOR_SLOTS) ? 'sylvan'
+  : (Object.keys(RACE_MODS).find(r => k in RACE_MODS[r].COLOR_SLOTS) || null);
 
 // =============================================================================
 // Python parity
@@ -268,6 +286,9 @@ export const ART = {
   // THE SYLVAN'S OWN SLOTS (sylvan.js): roots, moss, branches, flowers. Never
   // painted on a human and never written into a human's palette.
   ...SY.SLOTS,
+  // THE MACHINE RACES' SLOTS (automaton.js, android.js), likewise.
+  ...AU.SLOTS,
+  ...AN.SLOTS,
 };
 
 /** Coverage of each wisp tier, 0..255. The steps are even in how THIN they
@@ -319,6 +340,8 @@ export const COLOR_SLOTS = {
   clothShade: ART.CLOTH_SHADE,
   nail: ART.NAIL,
   ...SY.COLOR_SLOTS,
+  ...AU.COLOR_SLOTS,
+  ...AN.COLOR_SLOTS,
 };
 
 /**
@@ -634,12 +657,21 @@ export function defaultGenome() {
       leaf2: SY.DEFAULT_COLORS.leaf2,
       leaf3: SY.DEFAULT_COLORS.leaf3,
       leaf4: SY.DEFAULT_COLORS.leaf4,
+      // The machine races' own colours (automaton.js, android.js), likewise.
+      ...Object.fromEntries(Object.values(RACE_MODS).flatMap(M =>
+        Object.keys(M.COLOR_SLOTS).map(k => [k, M.DEFAULT_COLORS[k]]))),
     },
 
     /** The sylvan's genes: face, bark and crown (sylvan.js). Inert on a
      *  human, and skipped by a human's mutation, roll and cross loops without
      *  consuming a random draw. */
     sylvan: SY.defaultSylvan(),
+
+    /** Each machine race's genes, under its race key (automaton.js,
+     *  android.js). Inert on anyone else, and skipped by every other race's
+     *  mutation, roll and cross loops without a random draw. */
+    ...Object.fromEntries(Object.entries(RACE_MODS)
+      .map(([k, M]) => [k, M.defaultGenes()])),
   };
 }
 
@@ -830,6 +862,8 @@ export const GENE_GROUPS = [
           'style keeps it. Lengths are in voxels.' },
   // The sylvan's groups (sylvan.js). `race` hides them on a human's page.
   ...SY.GENE_GROUPS,
+  ...AU.GENE_GROUPS,
+  ...AN.GENE_GROUPS,
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
           'which way it faces, so the three skin tones want to be the same ' +
@@ -887,11 +921,13 @@ const COLOR_LABELS = {
  */
 export const GENE_SPECS = [
   { path: 'body.race', label: 'race', group: 'body', fixed: true,
-    hint: 'Human, or sylvan: a wood spirit on the same frame -- bark over ' +
-          'sapwood, roots wound round the limbs, a crown of leaves, ' +
-          'branches and flowers, glowing eyes. The same limbs and ' +
-          'proportions, so every armour piece and weapon fits both.',
-    kind: 'enum', choices: SY.RACES, sigma: 0 },
+    hint: 'Human; sylvan, a wood spirit on the same frame (bark over ' +
+          'sapwood, roots, a crown of leaves, glowing eyes); automaton, a ' +
+          'clockwork man in riveted brass that bleeds oil and vents steam; ' +
+          'or android, synthetic panels over circuitry that bleeds coolant ' +
+          'and arcs when struck. The same limbs and proportions every time, ' +
+          'so every armour piece and weapon fits all four.',
+    kind: 'enum', choices: RACES, sigma: 0 },
   { path: 'body.sex', label: 'sex', group: 'body',
     hint: 'Male or female. Switching moves the build sliders by the ' +
           'typical difference (shorter, narrower shoulders, narrower waist, ' +
@@ -1352,12 +1388,18 @@ export const GENE_SPECS = [
     path: 'colors.' + k, label, hint, group: 'colour', kind: 'color',
     sigma: 0.10, race: 'sylvan',
   })),
+  // ...and each machine race's.
+  ...Object.entries(RACE_MODS).flatMap(([race, M]) =>
+    M.COLOR_SPECS.map(([k, label, hint]) => ({
+      path: 'colors.' + k, label, hint, group: 'colour', kind: 'color',
+      sigma: 0.10, race,
+    }))),
 ];
 // The sylvan's face / bark / crown rows go in BEFORE the colours, so the page
 // stacks them under their own headings. Their place in the list moves no
 // human draw: a race-gated row is skipped without one (see `race` above).
 GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
-                  ...SY.GENE_SPECS);
+                  ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS);
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS) */
 export const specApplies = (spec, genome) =>
@@ -1368,6 +1410,11 @@ export function specText(spec, genome) {
   const race = (genome && genome.body && genome.body.race) || 'human';
   if (race === 'sylvan' && spec.path.startsWith('colors.')) {
     const t = SY.COLOR_LABELS[spec.path.slice(7)];
+    if (t) return { label: t[0], hint: t[1] };
+  }
+  const M = RACE_MODS[race];
+  if (M && spec.path.startsWith('colors.')) {
+    const t = M.COLOR_LABELS[spec.path.slice(7)];
     if (t) return { label: t[0], hint: t[1] };
   }
   return { label: spec.label, hint: spec.hint };
@@ -1419,7 +1466,7 @@ export function normalizeGenome(src) {
     for (const k of ['name', 'displayName', 'archetype'])
       if (typeof src[k] === 'string' && src[k]) g[k] = src[k];
     for (const k of ['body', 'shape', 'head', 'face', 'hair', 'colors',
-                     'sylvan']) {
+                     'sylvan', ...Object.keys(RACE_MODS)]) {
       if (!src[k] || typeof src[k] !== 'object') continue;
       for (const kk of Object.keys(g[k])) {
         if (!(kk in src[k])) continue;
@@ -1508,30 +1555,47 @@ export function applySex(genome, sex, locks) {
  * complexion and a plain hairstyle. `locks` holds pinned genes still.
  */
 export function applyRace(genome, race, locks) {
-  if (!SY.RACES.includes(race)) return genome;
-  const was = genome.body.race === 'sylvan' ? 'sylvan' : 'human';
+  if (!RACES.includes(race)) return genome;
+  const was = RACES.includes(genome.body.race) ? genome.body.race : 'human';
   genome.body.race = race;
   if (was === race) return genome;
-  const sign = race === 'sylvan' ? 1 : -1;
-  for (const [path, d] of Object.entries(SY.BUILD_DELTA)) {
-    if (isLocked(locks, path)) continue;
-    const spec = SPEC_BY_PATH.get(path);
-    let v = getPath(genome, path) + sign * d;
-    if (spec) v = clamp(v, spec.min, spec.max);
-    setPath(genome, path, v);
-  }
+  // Through human: the old race's build move undone exactly, then the new
+  // one's made, so any round trip lands where it started.
+  const deltaOf = r => r === 'sylvan' ? SY.BUILD_DELTA
+                     : RACE_MODS[r] ? RACE_MODS[r].BUILD_DELTA : {};
+  const moveBuild = (delta, sign) => {
+    for (const [path, d] of Object.entries(delta)) {
+      if (isLocked(locks, path)) continue;
+      const spec = SPEC_BY_PATH.get(path);
+      let v = getPath(genome, path) + sign * d;
+      if (spec) v = clamp(v, spec.min, spec.max);
+      setPath(genome, path, v);
+    }
+  };
+  moveBuild(deltaOf(was), -1);
+  moveBuild(deltaOf(race), 1);
   const setColors = set => {
     for (const [k, v] of Object.entries(set))
       if (!isLocked(locks, 'colors.' + k)) genome.colors[k] = v;
   };
+  const M = RACE_MODS[race];
   if (race === 'sylvan') {
     setColors(SY.DEFAULT_COLORS);
     if (!isLocked(locks, 'sylvan.face')) SY.applyFace(genome, genome.sylvan.face);
     if (!isLocked(locks, 'sylvan.crown')) applyCrown(genome, genome.sylvan.crown);
+  } else if (M) {
+    // A MACHINE puts on its race's look the way a sylvan does: its colours,
+    // every named picker re-applied (a face, the stacks), and what it does to
+    // the human genes (no hair, no beard: the plating is the scalp).
+    setColors(M.DEFAULT_COLORS);
+    for (const pk of M.PICKERS)
+      if (!isLocked(locks, pk.path)) pk.apply(genome, getPath(genome, pk.path));
+    M.onBecome(genome, { isLocked: path => isLocked(locks, path),
+                         applyHairStyle, applyBeardStyle });
   } else {
     const def = defaultGenome().colors;
     setColors(Object.fromEntries(Object.entries(def)
-      .filter(([k]) => !(k in SY.COLOR_SLOTS))));
+      .filter(([k]) => !colorOwner(k))));
     if (!isLocked(locks, 'hair.style'))
       applyHairStyle(genome, genome.body.sex === 'female' ? 'long' : 'swept');
   }
@@ -1744,6 +1808,13 @@ export function mutate(genome, sigma, rng, locks) {
         g.sylvan.branchStyle !== genome?.sylvan?.branchStyle)
       SY.applyBranches(g, g.sylvan.branchStyle);
   }
+  // ...and a machine race's named pickers (a face, the stacks), likewise.
+  const Mm = raceMod(g);
+  if (Mm)
+    for (const pk of Mm.PICKERS)
+      if (!isLocked(locks, pk.path) &&
+          getPath(g, pk.path) !== getPath(genome, pk.path))
+        pk.apply(g, getPath(g, pk.path));
   // ...and so does a sex flip (sigma 0 on the gene: mutation never flips it
   // today, but a genome edited to flip must still move the body).
   const sexWas = genome?.body?.sex === 'female' ? 'female' : 'male';
@@ -1909,6 +1980,11 @@ export function randomGenome(rng, locks, opts = {}) {
   if (opts.race === 'sylvan') {
     sylvanize(g, r, locks);
     rollColors(g, r);
+  } else if (RACE_MODS[opts.race]) {
+    // A MACHINE likewise: a random human, then the race's own roll on top.
+    applyRace(g, opts.race, locks);
+    RACE_MODS[opts.race].randomize(g, r, path => isLocked(locks, path));
+    rollColors(g, r);
   }
   return normalizeGenome(g);
 }
@@ -1985,6 +2061,13 @@ export function rollColors(genome, rng, opts = {}) {
   if (genome.body && genome.body.race === 'sylvan') {
     Object.assign(genome.colors, pick(SY.BARKS), pick(SY.LEAVES),
                   pick(SY.FLOWERS), { eye: pick(SY.GLOWS) });
+    return genome;
+  }
+  // A MACHINE picks one of each of its race's sets, whole, for the same
+  // reason (exact colours dedupe across bodies in the engine's palette).
+  const Mr = raceMod(genome);
+  if (Mr) {
+    for (const set of Mr.COLOR_SETS) Object.assign(genome.colors, pick(set));
     return genome;
   }
   const jitter = opts.jitter ?? 0.02;
@@ -3105,7 +3188,11 @@ function hairMass(g, parts, extra = {}) {
   // A FOURTH: the sylvan crown (sylvan.js crownExtras), which roots on bare
   // bark as happily as on leaf hair.
   const crownOn = g.body.race === 'sylvan' && SY.crownWants(g);
-  if (!massOn && !fuzzOn && !beardOn && !crownOn) return [];
+  // A FIFTH: a machine race's extras (a chimney, a hat, antennae, a key in
+  // the back), which root on bare plating.
+  const Mx = raceMod(g);
+  const extrasOn = !!(Mx && Mx.extrasWant(g));
+  if (!massOn && !fuzzOn && !beardOn && !crownOn && !extrasOn) return [];
   const U = SKIN_UPSCALE;
   const K = (x, y, z) => ((z + 512) * 2048 + (y + 1024)) * 2048 + (x + 1024);
   const P = {};
@@ -3136,7 +3223,8 @@ function hairMass(g, parts, extra = {}) {
       scalp.push([X, Y, Z]);
     else skin.add(K(X, Y, Z));
   }
-  if (!scalp.length && !fuzzOn && !beardOn && !crownOn) return [];  // bald: no roots
+  if (!scalp.length && !fuzzOn && !beardOn && !crownOn && !extrasOn)
+    return [];                                     // bald: no roots
   const C = [(c0[0] + c1[0] + 1) / 2, (c0[1] + c1[1] + 1) / 2,
              (c0[2] + c1[2] + 1) / 2];
   const halfW = (c1[0] - c0[0] + 1) / 2, halfD = (c1[1] - c0[1] + 1) / 2;
@@ -3773,6 +3861,16 @@ function hairMass(g, parts, extra = {}) {
     snoutCells = got.snout;
     boughCells = got.boughs;
   }
+  // ---- a machine race's extras ------------------------------------------------
+  // What rides the head goes with the snout (a fixed, small-piece group), what
+  // rides the torso with the boughs (fixed, and dropped unless it touches it).
+  if (extrasOn) {
+    const got = Mx.extras(g, { ART, K, body, head, torso: P.torso,
+                               face: extra.face, C, halfW, halfD, skullH,
+                               splitZ });
+    snoutCells = snoutCells.concat(got.head);
+    boughCells = boughCells.concat(got.torso);
+  }
 
   // ---- split by what it rides, then into connected pieces -------------------
   const groups = { hair: [], mane: [], snout: snoutCells, bough: boughCells };
@@ -4148,6 +4246,44 @@ const LIMB_BASE = {
   foot:  { hp: 36, severable: true, tag: 'foot', sever: 12.0 },
 };
 
+/** THE STAND-IN a machine race paints for a material the .vox cannot hold
+ *  (an id above 127), or the name itself. */
+export function raceStandIn(g, name) {
+  const M = raceMod(g);
+  return (M && M.STAND_INS && M.STAND_INS[name]) || name;
+}
+
+/** A machine recipe with every material above 127 swapped for its stand-in,
+ *  and a `becomes` block mapping each stand-in back (mob.cpp rewrites every
+ *  stand-in voxel of the body at load, after the recipe resolves, so the
+ *  anatomy-parity gate still compares recipe against bake). */
+function standInRecipe(M, recipe) {
+  const used = {};
+  const sub = n => {
+    const si = M.STAND_INS && M.STAND_INS[n];
+    if (!si) return n;
+    used[si] = n;
+    return si;
+  };
+  const layers = ls => (ls || []).forEach(L => {
+    if (L.material) L.material = sub(L.material);
+    if (L.speckle && L.speckle.material) L.speckle.material = sub(L.speckle.material);
+  });
+  layers(recipe.layers);
+  for (const lm of Object.values(recipe.limbs || {})) {
+    layers(lm.layers);
+    for (const c of lm.carve || []) {
+      if (c.material) c.material = sub(c.material);
+      if (c.where) c.where = sub(c.where);
+    }
+  }
+  // The SURFACE stand-ins are painted by slot, not named by the recipe's
+  // layers beyond the first; every one the race has goes in `becomes`.
+  for (const [n, si] of Object.entries(M.STAND_INS || {})) used[si] = n;
+  recipe.becomes = used;
+  return recipe;
+}
+
 /** The anatomy recipe a generated sidecar carries.
  *
  * THE RECIPE ITSELF IS `ANA.DEFAULT_ANATOMY`, and is not restated here. It was
@@ -4161,6 +4297,9 @@ export function anatomyRecipe(race = 'human') {
     const r = JSON.parse(JSON.stringify(SY.ANATOMY));
     return { ...SY.ANATOMY_NOTES, ...r };
   }
+  const M = RACE_MODS[race];
+  if (M) return standInRecipe(M, { ...M.ANATOMY_NOTES,
+                                   ...JSON.parse(JSON.stringify(M.ANATOMY)) });
   const r = JSON.parse(JSON.stringify(ANA.DEFAULT_ANATOMY));
   return {
     '//': 'What is under the skin, by depth from the surface, baked into the ' +
@@ -4472,7 +4611,8 @@ export function generateMob(genome, seed = 0, opts = {}) {
     }
     // THE SYLVAN SURFACE (sylvan.js barkPass): bark, grain, roots in relief,
     // knots, moss, and on the head the wooden face. Inside the part's own box.
-    if (sylvan) {
+    const Ms = raceMod(g);
+    if (sylvan || Ms) {
       const info = { ART, mn };
       if (ARCHETYPE.roles[nm] === 'head') {
         const eyeA = table.eyeZ - L[nm].mn[2] + g.face.eyeRow;
@@ -4482,7 +4622,10 @@ export function generateMob(genome, seed = 0, opts = {}) {
         info.mouthDx = g.face.mouthShift * SKIN_UPSCALE;
         info.neckTop = (neckA + 1) * SKIN_UPSCALE;
       }
-      cells = SY.barkPass(g, ARCHETYPE.roles[nm], nm, cells, size, info);
+      // THE MACHINE SURFACE (automaton.js / android.js surfacePass), the
+      // same contract: inside the part's own box.
+      cells = sylvan ? SY.barkPass(g, ARCHETYPE.roles[nm], nm, cells, size, info)
+                     : Ms.surfacePass(g, ARCHETYPE.roles[nm], nm, cells, size, info);
       if (info.face) sylFace = info.face;
     }
     const seen = new Set();
@@ -4536,16 +4679,29 @@ export function generateMob(genome, seed = 0, opts = {}) {
   // A SYLVAN IS SEVERAL MATERIALS, picked by art slot (sylvan.js
   // slotMaterialNames): bark, root bark, leaves, branch wood, glowing eyes.
   // Resolved by name, each held to the same <= 127 rule as FLESH_ID.
+  // A MACHINE likewise (its slotMaterialNames), with two differences: EVERY
+  // art slot is named (a slot the race does not list is its DEFAULT_MAT, so
+  // nothing on a robot falls back to skin), and a material above 127 is
+  // painted as its STAND-IN (raceStandIn), which the sidecar's
+  // anatomy.becomes rewrites at load.
   let slotMat = null;
-  if (sylvan && opts.materials) {
+  const Mm2 = raceMod(g);
+  if ((sylvan || Mm2) && opts.materials) {
     slotMat = {};
-    for (const [slot, nmMat] of Object.entries(SY.slotMaterialNames(g, ART))) {
+    const names = sylvan ? SY.slotMaterialNames(g, ART)
+                         : Mm2.slotMaterialNames(g, ART);
+    if (Mm2)
+      for (const slot of Object.values(ART))
+        if (!(slot in names)) names[slot] = Mm2.DEFAULT_MAT;
+    for (const [slot, nm0] of Object.entries(names)) {
+      const nmMat = raceStandIn(g, nm0);
       const id = opts.materials.findIndex(m => m.id === nmMat) + 1;
       if (id <= 0)
-        throw new Error(`materials.json has no "${nmMat}" material (sylvan)`);
+        throw new Error(`materials.json has no "${nmMat}" material ` +
+                        `(${g.body.race})`);
       if (id > 127)
         throw new Error(`"${nmMat}" is material ${id}; mob voxel material ids ` +
-                        `must stay <= 127`);
+                        `must stay <= 127 (give it a stand-in)`);
       slotMat[slot] = id;
     }
   }
@@ -4674,9 +4830,12 @@ export function paletteBytes(materials, colors, race = 'human') {
   // The sylvan's own slots are written for a sylvan only: the engine merges
   // every loaded body's art into ONE shared palette, and five colours no
   // human paints would cost it five slots per human.
-  for (const [k, slot] of Object.entries(COLOR_SLOTS))
-    if (colors[k] && (race === 'sylvan' || !(k in SY.COLOR_SLOTS)))
-      put(slot, colors[k]);
+  // Each machine race's likewise: a colour key a race owns is written only
+  // by that race.
+  for (const [k, slot] of Object.entries(COLOR_SLOTS)) {
+    const owner = colorOwner(k);
+    if (colors[k] && (!owner || owner === race)) put(slot, colors[k]);
+  }
   for (const [slot, hex] of Object.entries(wispColors(colors)))
     put(Number(slot), hex);
   return pal;
@@ -5001,8 +5160,11 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     // failure mob.cpp's legacy path warns about.
     sidecarVoxelsPerMetre: SIDECAR_VOXELS_PER_METRE,
     // A sylvan bleeds sap (sylvan.js SAP): less of it, and it soaks the cut.
+    // A machine bleeds what its race says (automaton.js oil, android.js
+    // coolant).
     bleed: g.body.race === 'sylvan' ? { material: SY.SAP, perDamage: 1.5 }
-                                    : { material: 'blood', perDamage: 2.5 },
+         : raceMod(g) ? { ...raceMod(g).BLEED }
+         : { material: 'blood', perDamage: 2.5 },
     anatomy,
     speed: pyRound(gait.refSpeed, 4),
     gait: {
@@ -5146,7 +5308,8 @@ export const BASE_MOB = 'human';
  *  `extends` BASE_MOB -- a sylvan is the human's rig with another surface --
  *  but a sylvan is filed beside its kin in assets/mobs/sylvan/. */
 export const raceFolder = genome =>
-  (genome && genome.body && genome.body.race === 'sylvan') ? 'sylvan' : BASE_MOB;
+  (genome && genome.body && genome.body.race === 'sylvan') ? 'sylvan'
+  : raceMod(genome) ? raceMod(genome).FOLDER : BASE_MOB;
 
 /**
  * A GENERATED CHARACTER IS A DIFF, NOT A BODY.
@@ -5233,9 +5396,17 @@ export function thinSidecar(full, base, name) {
   };
 }
 
+/** Every machine race's presets, by race (automaton.js / android.js
+ *  PRESETS), and the race a preset key belongs to. */
+export const RACE_PRESET_ORDER = Object.fromEntries(Object.entries(RACE_MODS)
+  .map(([r, M]) => [r, M.PRESET_ORDER]));
+const presetRace = key =>
+  Object.keys(RACE_MODS).find(r => RACE_MODS[r].PRESETS[key]) || null;
+
 export function presetGenome(key) {
   const sp = SYLVAN_PRESETS[key];
-  const p = PRESETS[key] || sp;
+  const mr = presetRace(key);
+  const p = PRESETS[key] || sp || (mr && RACE_MODS[mr].PRESETS[key]);
   if (!p) return defaultGenome();
   const g = defaultGenome();
   const merge = (dst, src) => {
@@ -5252,6 +5423,20 @@ export function presetGenome(key) {
     SY.applyFace(g, face);
     applyCrown(g, crown);
     SY.applyBranches(g, branches || 'sprigs');
+    merge(g, { body: bodyRest, ...rest });
+  } else if (mr) {
+    // A MACHINE preset: the race switched on, each named picker it names
+    // applied, the rest merged over -- the sylvan presets' shape.
+    const M = RACE_MODS[mr];
+    const { body, ...rest0 } = p;
+    const { sex, ...bodyRest } = body || {};
+    if (sex) applySex(g, sex);
+    applyRace(g, mr);
+    const rest = { ...rest0 };
+    for (const pk of M.PICKERS) {
+      if (rest[pk.key] !== undefined) pk.apply(g, rest[pk.key]);
+      delete rest[pk.key];
+    }
     merge(g, { body: bodyRest, ...rest });
   } else merge(g, p);
   g.name = key;

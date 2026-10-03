@@ -4855,6 +4855,230 @@
         "soft_tissue"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "THE ROBOT RACES (assets/editor/automaton.js, assets/editor/android.js; DESIGN.md 'Robots are matter'). Ten rows, appended (ids > 127), so a mob .vox paints each solid as a STAND-IN and the sidecar's anatomy.becomes rewrites it at load, exactly as the snake's venom gland. What a robot DOES is these rows and nothing else: `shell` (a blow carves this matter the way it carves a worn plate -- gear.cutHardnessRef over its hardness, game/shellresponse.h -- so plating takes a chip where flesh takes a gash), `bleedFluid` (what a wound in it leaks), `struck` (what a blow knocks out of it: a ball of that matter laid in the air at the hit), `burst` (what it lets go when a wound breaches it or its body dies). No row here is flammable, organic or dissolvable, so fire, acid, rot and venom have nothing to take hold of; every rotRate is 0. BRASS: the automaton's plating. Hardness 70 (a sword takes a ninth of a kerf; cut through, it costs nine times skin to part), it leaks a little oil where it is holed and throws the odd spark when an edge rings off it.",
+      "id": "brass",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 8500,
+      "hardness": 70,
+      "rubble": "gravel",
+      "woundHp": 3,
+      "rotRate": 0,
+      "bleed": 0.25,
+      "bleedFluid": "oil",
+      "shell": true,
+      "struck": {"material": "spark", "chance": 0.2, "radius": 1},
+      "colors": [
+        "#b38a2e",
+        "#9c7726",
+        "#c99d3a"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "CLOCKWORK: the gear train under an automaton's plating -- wheels, arbors, springs, all swimming in oil. Softer than the plate (30), so a blade that got through the brass bites into the works; it gushes oil (bleed 1.2) and crumbles TO oil (rubble), which is what makes it the automaton's `tissue` to every wound rule (MobDef::tissue: what crumbles to the creature's bleed). Ratchets throw sparks when struck.",
+      "id": "clockwork",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 7200,
+      "hardness": 30,
+      "rubble": "oil",
+      "woundHp": 2,
+      "rotRate": 0,
+      "bleed": 1.2,
+      "bleedFluid": "oil",
+      "shell": true,
+      "struck": {"material": "spark", "chance": 0.3, "radius": 1},
+      "colors": [
+        "#8a6a2a",
+        "#6e5420",
+        "#a07c34"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "BOILER: the firebox and drum in an automaton's chest, what drives it. Glows through any wound that opens it (emission). A blow that reaches it vents steam at the hit; a wound that BREACHES it, or the automaton's death, lets the whole head of steam go at once (`burst`, laid round the boiler the tick after, bounded like every reaction flash: game/session.cpp ReactFxAftermath). Leaks scalding water, not oil.",
+      "id": "boiler",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 7600,
+      "hardness": 60,
+      "rubble": "gravel",
+      "woundHp": 3,
+      "rotRate": 0,
+      "bleed": 0.6,
+      "bleedFluid": "water",
+      "shell": true,
+      "emission": 190,
+      "struck": {"material": "steam", "chance": 0.8, "radius": 2},
+      "burst": {"material": "steam", "radius": 4},
+      "colors": [
+        "#ff8a2a",
+        "#e0601a",
+        "#ffb048"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "COGITATOR: the automaton's mind, a difference engine of brass drums and pinned cams at the core of the head. brainHp, as the human's brain: every voxel of it destroyed by any cause also costs gore.brainHpPerVoxel, so a hit to the cogitator stops the machine. Sparks when struck.",
+      "id": "cogitator",
+      "class": "solid",
+      "density": 7000,
+      "hardness": 26,
+      "rubble": "oil",
+      "woundHp": 1,
+      "brainHp": true,
+      "rotRate": 0,
+      "bleed": 0.8,
+      "bleedFluid": "oil",
+      "shell": true,
+      "struck": {"material": "spark", "chance": 0.6, "radius": 1},
+      "colors": [
+        "#d4b04a",
+        "#b8963a",
+        "#e6c460"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "SYNTH SHELL: the android's outer panels, a sintered ceramic-polymer composite. Hardness 45 (a fifth of a kerf), light (1,800), and it does not burn, rot or dissolve. Holed, it weeps coolant and spits a spark from the wiring under it.",
+      "id": "synth_shell",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 1800,
+      "hardness": 45,
+      "rubble": "gravel",
+      "woundHp": 2,
+      "rotRate": 0,
+      "bleed": 0.35,
+      "bleedFluid": "coolant",
+      "shell": true,
+      "struck": {"material": "spark", "chance": 0.3, "radius": 1},
+      "colors": [
+        "#d8dce0",
+        "#c4c8cc",
+        "#e8ecf0"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "ALLOY: the android's endoskeleton, a titanium alloy. Hardness 180 -- within reach of steel's 200 -- so a blade that gets this far takes a twenty-second of a kerf and parting a limb through it costs 22 times skin: an android's arm does not come off to a sword, it has to be broken off or blown off. Barely bleeds (a frame member carries no coolant of its own).",
+      "id": "alloy",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 4500,
+      "hardness": 180,
+      "rubble": "gravel",
+      "woundHp": 4,
+      "rotRate": 0,
+      "bleed": 0.1,
+      "bleedFluid": "coolant",
+      "shell": true,
+      "struck": {"material": "spark", "chance": 0.25, "radius": 1},
+      "colors": [
+        "#7c848e",
+        "#646c76",
+        "#949ca6"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "CIRCUITRY: the android's wiring, actuators and coolant lines, the layer between the shell and the frame. Soft (20), it bleeds coolant freely and crumbles to it (rubble: the android's `tissue`), and almost every blow that reaches it ARCS -- a spark ball at the hit.",
+      "id": "circuitry",
+      "class": "solid",
+      "density": 2400,
+      "hardness": 20,
+      "rubble": "coolant",
+      "woundHp": 2,
+      "rotRate": 0,
+      "bleed": 1.0,
+      "bleedFluid": "coolant",
+      "shell": true,
+      "struck": {"material": "spark", "chance": 0.9, "radius": 2},
+      "colors": [
+        "#2a4a3a",
+        "#1e3a2c",
+        "#3a6a52"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "POWER CELL: the android's heart, a dense glowing cell in the chest. Breach it, or kill the android, and it DISCHARGES: a crackling spray of sparks along jagged arcs (`burst` with `arcs`) that lights what burns beside it, pops hydrogen and fires gunpowder (spark's own rules, reactions.json). Bounded: one discharge per breach, one per death, laid through the capped reaction-flash path.",
+      "id": "power_cell",
+      "class": "solid",
+      "density": 3000,
+      "hardness": 60,
+      "rubble": "coolant",
+      "woundHp": 3,
+      "rotRate": 0,
+      "bleed": 0.6,
+      "bleedFluid": "coolant",
+      "shell": true,
+      "emission": 230,
+      "struck": {"material": "spark", "chance": 1.0, "radius": 2},
+      "burst": {"material": "spark", "radius": 5, "arcs": true},
+      "colors": [
+        "#7ae8ff",
+        "#4ac8f0",
+        "#b0f4ff"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "NEURAL CORE: the android's mind, at the core of the head. brainHp: destroying it stops the machine as a brain wound stops a human. Arcs when struck, faintly lit.",
+      "id": "neural_core",
+      "class": "solid",
+      "density": 2600,
+      "hardness": 24,
+      "rubble": "coolant",
+      "woundHp": 1,
+      "brainHp": true,
+      "rotRate": 0,
+      "bleed": 0.8,
+      "bleedFluid": "coolant",
+      "shell": true,
+      "emission": 90,
+      "struck": {"material": "spark", "chance": 1.0, "radius": 2},
+      "colors": [
+        "#9a8aff",
+        "#7a6ae0",
+        "#bab0ff"
+      ],
+      "tags": [],
+      "molten": "lava"
+    },
+    {
+      "//": "COOLANT: what an android bleeds. A thin (moveEvery 1), faintly glowing cyan liquid -- the glow is how you know it is not water. Wet and an extinguisher: an android bleeding on a fire helps put it out, where an automaton's oil feeds it. Dries away like blood (reactions.json) so a spill goes back to sleep (rule 2). Coats a body as its own bodyOnly stain, a cyan sheen.",
+      "id": "coolant",
+      "arcane": 3,
+      "class": "liquid",
+      "density": 1070,
+      "hardness": 4,
+      "moveEvery": 1,
+      "opacity": 150,
+      "emission": 60,
+      "molten": "steam",
+      "colors": [
+        "#1a9ab8",
+        "#14809c",
+        "#28b4d2"
+      ],
+      "stain": {"type": "coolant", "color": "#2aa8c8", "amount": 6, "bodyOnly": true},
+      "coat": {"contact": 80, "decay": 15, "decayFloor": 0, "shed": 250, "effects": []},
+      "tags": [
+        "wet",
+        "extinguisher"
+      ]
     }
   ]
 }

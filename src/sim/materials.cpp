@@ -954,6 +954,22 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       else if (m["bleedFluid"].is_boolean() && !m["bleedFluid"].get<bool>())
         d.bleedFluidOff = true;
     }
+    // A body made of this under a blow (materials.h shell / struck / burst):
+    // names resolved after the whole table exists, like bleedFluid.
+    d.shell = m.value("shell", false);
+    if (m.contains("struck") && m["struck"].is_object()) {
+      const auto& s = m["struck"];
+      d.struckName = s.value("material", std::string{});
+      d.struckChance = std::clamp(s.value("chance", 1.0f), 0.0f, 1.0f);
+      if (!(d.struckChance == d.struckChance)) d.struckChance = 0.0f;
+      d.struckRadius = std::clamp(s.value("radius", 1), 1, 4);
+    }
+    if (m.contains("burst") && m["burst"].is_object()) {
+      const auto& b = m["burst"];
+      d.burstName = b.value("material", std::string{});
+      d.burstRadius = std::clamp(b.value("radius", 3), 1, 6);
+      d.burstArcs = b.value("arcs", false);
+    }
     // 0 intact / 1 half / 2 whole (materials.h burnStage). Clamped, like the
     // weights above: a silly number should misbehave visibly, not refuse.
     d.burnStage = (uint8_t)std::clamp(m.value("burnStage", 0), 0, 2);
@@ -1934,6 +1950,23 @@ bool LoadAssets(const std::string& materialsPath, const std::string& reactionsPa
       const int id = FindMaterial(m, d.rubble);
       if (id > 0 && m[id].gpu.klass == CLASS_LIQUID) d.bleedFluid = (uint32_t)id;
     }
+  }
+  // WHAT A BLOW KNOCKS OUT AND WHAT A BREACH LETS GO (materials.h struck /
+  // burst): by name, and only something that can be laid in the AIR -- a
+  // gas, a liquid or a powder. A solid ball round a body would entomb it.
+  for (auto& d : m) {
+    auto resolveAir = [&](const std::string& nm, const char* key) -> uint32_t {
+      if (nm.empty()) return 0u;
+      const int id = FindMaterial(m, nm);
+      if (id <= 0 || m[id].gpu.klass == CLASS_SOLID) {
+        errors += materialsPath + ": material \"" + d.name + "\": " + key +
+                  " \"" + nm + "\" is not a gas, liquid or powder material\n";
+        return 0u;
+      }
+      return (uint32_t)id;
+    };
+    d.struckMat = resolveAir(d.struckName, "struck.material");
+    d.burstMat = resolveAir(d.burstName, "burst.material");
   }
   // INFECTIONS AND THE COATS THAT CARRY THEM (materials.h `infect`,
   // `coatInfects`): names and tags resolved now that the table and the tag

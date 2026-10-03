@@ -1,6 +1,7 @@
 #include "sim/microbody.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <iterator>
 #include <unordered_set>
@@ -279,11 +280,57 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
     // share one slot, which is what keeps the merged palette small enough for a
     // whole cast plus its wardrobe.
     auto it = std::find(set.artColors.begin(), set.artColors.end(), rgb);
+    // NEAR ENOUGH IS THE SAME COLOUR (2026-10-02). Within kArtMergeNear (RGB
+    // distance squared; 27 is three levels a channel, invisible in 8-bit art)
+    // of a colour already merged, with the same transparency byte, a colour
+    // takes that slot instead of a new one. Jittered characters carry dozens of
+    // such near-twins, and the run was full; this alone frees ~50 slots. Never
+    // for a pure GREY: the wardrobe's dyeable pieces are exact greys that the
+    // dye multiplies (the `dye` gate), and a near match would tint a garment.
+    // Load order decides which twin survives, so the result is a pure function
+    // of it. Render-only: art colour never reaches a world cell.
+    if (it == set.artColors.end() &&
+        !(((rgb >> 16) & 255u) == ((rgb >> 8) & 255u) &&
+          ((rgb >> 8) & 255u) == (rgb & 255u))) {
+      int64_t bestNear = kArtMergeNear + 1;
+      for (auto k = set.artColors.begin(); k != set.artColors.end(); ++k) {
+        const uint32_t c = *k;
+        if ((c >> 24) != (rgb >> 24)) continue;
+        const int dr = (int)((c >> 16) & 255u) - (int)((rgb >> 16) & 255u);
+        const int dg = (int)((c >> 8) & 255u) - (int)((rgb >> 8) & 255u);
+        const int db = (int)(c & 255u) - (int)(rgb & 255u);
+        const int64_t d = (int64_t)dr * dr + (int64_t)dg * dg + (int64_t)db * db;
+        if (d < bestNear) { bestNear = d; it = k; }
+      }
+    }
     size_t at;
     if (it != set.artColors.end()) {
       at = (size_t)(it - set.artColors.begin());
+    } else if (set.artColors.size() >=
+               std::min(set.artCeiling, (size_t)kArtPaletteSlotsGpu)) {
+      // FULL: the NEAREST colour already merged, not the material's own
+      // (2026-10-02). The cast plus its wardrobe outgrew 255 colours when the
+      // robot races landed, and the old fallback painted a hood or a robe
+      // the raw colour of `cloth` -- a mid-grey where the art said madder.
+      // Nearest by RGB distance with the transparency byte equal first (a
+      // wisp must stay see-through); ties go to the lower index, so the
+      // answer is a pure function of load order. Render-only: art colour
+      // never reaches a world cell.
+      dropped++;
+      size_t best = 0;
+      int64_t bestD = INT64_MAX;
+      for (size_t k = 0; k < set.artColors.size(); k++) {
+        const uint32_t c = set.artColors[k];
+        const int dr = (int)((c >> 16) & 255u) - (int)((rgb >> 16) & 255u);
+        const int dg = (int)((c >> 8) & 255u) - (int)((rgb >> 8) & 255u);
+        const int db = (int)(c & 255u) - (int)(rgb & 255u);
+        const int64_t d = (int64_t)dr * dr + (int64_t)dg * dg +
+                          (int64_t)db * db +
+                          ((c >> 24) != (rgb >> 24) ? ((int64_t)1 << 40) : 0);
+        if (d < bestD) { bestD = d; best = k; }
+      }
+      at = best;
     } else {
-      if (set.artColors.size() >= (size_t)kArtPaletteSlotsGpu) { dropped++; continue; }
       at = set.artColors.size();
       set.artColors.push_back(rgb);
     }
@@ -295,7 +342,7 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
   if (dropped)
     log += label + ": art palette full (" + std::to_string(kArtPaletteSlotsGpu) +
            " colours across all loaded models); " + std::to_string(dropped) +
-           " colour(s) fall back to the material colour\n";
+           " colour(s) take the nearest merged colour\n";
   return remap;
 }
 

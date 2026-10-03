@@ -171,6 +171,14 @@ static_assert(sizeof(MicroBodyInstGpu) == 16,
 // to the ceiling anyway. Still never COMPACTED: a compaction would have to
 // rewrite every live model's `base` while the GPU may still be reading last
 // frame's upload. Splitting and merging never moves a live block.
+// The art palette slots the CAST leaves for the WARDROBE (MicroBodySet::
+// artCeiling). The shipped items paint 32 distinct colours; the rest of the
+// margin is for the next garment.
+constexpr size_t kWardrobeArtReserve = 40;
+// Two art colours this close (RGB distance squared) share one merged slot:
+// three levels a channel, below what 8-bit art can show (MicroBodyMergeArt).
+constexpr int64_t kArtMergeNear = 27;
+
 struct MicroBodySet {
   std::vector<MicroBodyModelGpu> models;
   std::vector<uint32_t> pool;
@@ -274,6 +282,15 @@ struct MicroBodySet {
   // read back by the shaders as materials[ART_PALETTE_BASE + i]. Bounded by
   // kArtPaletteSlotsGpu (world.h) = 255, the 1-based ceiling of that byte.
   std::vector<uint32_t> artColors;
+  // HOW FAR A MERGE MAY GROW artColors before it takes the NEAREST merged
+  // colour instead (MicroBodyMergeArt). The full run except while the CAST
+  // loads: LoadMobDefs holds it kWardrobeArtReserve short, so the wardrobe
+  // that loads after it (LoadItems) always finds room for its own colours --
+  // its dyeable pieces are painted in exact greys the dye multiplies, and a
+  // nearest match would tint every garment. The cast grows every week (the
+  // robot races filled the run on 2026-10-02); the wardrobe is shared by all
+  // of it.
+  size_t artCeiling = kArtPaletteSlotsGpu;
 
   // ---- which materials a body coat can be drawn in -------------------------
   //

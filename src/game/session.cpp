@@ -4257,6 +4257,35 @@ static void ReactFxAftermath(TickAuthorityCtx& w, uint32_t tick,
     const uint32_t key = (uint32_t)a.c.x * 73856093u ^ (uint32_t)a.c.y * 19349663u ^
                          (uint32_t)a.c.z * 83492791u;
     const int r = std::max(1, a.radius);
+    if (a.mat != 0 && a.arcs) {
+      // ARCS (a body burst with `arcs`: a power cell discharging). Four to
+      // six jagged walks out of the centre, each step one cell along its
+      // heading plus a hashed sideways kick, so the spray reads as lightning
+      // rather than a puff. Same purity and bound as the ball below: every
+      // position a hash of (cell, tick, arc, step), at most 6 x 2r cells.
+      const int nArc = 4 + (int)(rng::Hash3(key, a.tick, 0xA2C50000u) % 3u);
+      for (int k = 0; k < nArc; k++) {
+        const uint32_t hd = rng::Hash3(key, a.tick, 0xA2C60000u + (uint32_t)k);
+        // A heading on the unit cube's surface, from the hash.
+        int hx = (int)(hd % 3u) - 1, hy = (int)((hd >> 4) % 3u) - 1,
+            hz = (int)((hd >> 8) % 3u) - 1;
+        if (!hx && !hy && !hz) hy = 1;
+        IVec3 c = a.c;
+        for (int st = 0; st < 2 * r; st++) {
+          if (cellOps.size() >= kMaxCellOpsPerTick) break;
+          const uint32_t hs = rng::Hash3(key ^ (uint32_t)k * 0x9E3779B9u,
+                                         a.tick, 0xA2C70000u + (uint32_t)st);
+          c.x += hx + ((hs & 3u) == 0 ? 1 : (hs & 3u) == 1 ? -1 : 0);
+          c.y += hy + (((hs >> 2) & 3u) == 0 ? 1 : ((hs >> 2) & 3u) == 1 ? -1 : 0);
+          c.z += hz + (((hs >> 4) & 3u) == 0 ? 1 : ((hs >> 4) & 3u) == 1 ? -1 : 0);
+          if (!w.world.CellInWindow(c)) break;
+          cellOps.push_back({World::SlotCellIndex(c),
+                             PackVoxNew(a.mat, (hs >> 28) % 3u) | kCellOpIfAir});
+          rf.flashCells++;
+        }
+      }
+      continue;
+    }
     if (a.mat != 0) {
       // A FLASH (package E): a ball of the flash material -- `glare`, pure
       // light that decays in two or three ticks and reacts with nothing --
@@ -4311,6 +4340,21 @@ static void ReactFxToBlasts(TickAuthorityCtx& w, uint32_t tick,
   std::vector<ReactFxEvent> evs = w.world.TakeReactFx();
   std::vector<ReactFxEvent> body = w.mobs.TakeBodyReactFx();
   rf.bodyEvents += body.size();
+  // BODY BURSTS (materials.h struck / burst): sparks and steam off a struck
+  // machine, a breached boiler, a dead android's discharge. Already capped
+  // per tick by MobSystem::PushBodyBurst; laid the NEXT tick as a flash ball
+  // (or arcs) through the same aftermath as a reaction flash, so the write
+  // goes through the op stream (rule 3) and never merges with a reaction's.
+  for (const MobSystem::BodyBurst& b : w.mobs.TakeBodyBursts()) {
+    TickAuthorityCtx::ReactFxWorld::Aftermath a;
+    a.c = b.cell;
+    a.radius = b.radius;
+    a.tick = tick;
+    a.mat = b.mat;
+    a.arcs = b.arcs;
+    rf.aftermath.push_back(a);
+    rf.bodyBursts++;
+  }
   evs.insert(evs.end(), body.begin(), body.end());
   rf.events += evs.size();
   uint32_t issued = 0;

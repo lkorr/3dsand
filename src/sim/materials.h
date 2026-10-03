@@ -1101,6 +1101,36 @@ struct MaterialDef {
   uint32_t bleedFluid = 0;
   std::string bleedFluidName;   // as authored ("" = derive from rubble)
   bool bleedFluidOff = false;   // authored `false`
+  // ---- WHAT A BODY MADE OF THIS DOES UNDER A BLOW (the robot rows,
+  // 2026-10-02; DESIGN.md "Robots are matter"). All three are CPU-only body
+  // rules, read by game/mob.cpp; none reaches a shader or the world hash
+  // except through the ordinary op stream (a struck/burst ball is CellOps,
+  // laid like any reaction flash: game/session.cpp ReactFxAftermath).
+  //
+  // SHELL ("shell": true): a blow carves this matter on a LIVING BODY the way
+  // it carves a worn plate -- the Blade/Blunt carve ratio of
+  // game/shellresponse.h, gear.cutHardnessRef over this material's hardness
+  // -- so brass plating takes a chip where skin takes a gash. Opt-in, because
+  // until it existed every body limb carved as flesh whatever it was made of,
+  // and the bark of a sylvan is tuned against that.
+  bool shell = false;
+  // STRUCK ("struck": {"material", "chance", "radius"}): what a blow that
+  // lands ON this matter knocks out of it -- a ball of that material laid in
+  // the air at the hit the next tick (sparks off brass and wiring, steam off
+  // a boiler). `chance` 0..1 per blow, rolled on a counter hash of the blow
+  // (rule 1). 0 = none.
+  uint32_t struckMat = 0;
+  float struckChance = 0.0f;
+  int struckRadius = 1;
+  std::string struckName;
+  // BURST ("burst": {"material", "radius", "arcs"}): what this matter lets go
+  // ONCE when a wound BREACHES it (a carve removes a voxel of it) and ONCE
+  // when its body dies -- a boiler's head of steam, a power cell's discharge.
+  // `arcs` lays it along jagged lines out of the centre instead of a ball.
+  uint32_t burstMat = 0;
+  int burstRadius = 3;
+  bool burstArcs = false;
+  std::string burstName;
   // HOW BURNT A VOXEL OF THIS READS (materials.json "burnStage", W1-F
   // 2026-09-24): 0 = intact, 1 = half (cooked / seared / alight), 2 = whole
   // (charred / cinder / ash). A body's burnt fraction, its burn health cap,
