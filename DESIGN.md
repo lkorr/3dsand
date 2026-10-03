@@ -3176,9 +3176,17 @@ spares exactly their particles, so refused water stays particles and the ledger
 balances column by column. The hysteresis guarantee survives the split: a
 refused neighbour column keeps its particles, so `seamNeighbourState` reads its
 excited eighths instead of its settled fill — nonzero either way, so the
-predicate cannot tell "settled" from "refused". A block that loses columns to
-the veto halves its calm counter, as a fully refused one does, so an awkward
-pool gets a cooldown instead of re-running the whole window forever.
+predicate cannot tell "settled" from "refused". A fully REFUSED (infeasible)
+block halves its calm counter, so an awkward pool gets a cooldown instead of
+re-running the whole window forever. A block that only lost columns to the
+veto still commits, and `settleCommit` restarts its calm window from 0 (the
+halving `settleCheck` writes is overwritten there) but KEEPS its stuck age
+(2026-10-03): those columns still hold particles, so the force-settle backstop
+(`sim.fluidStuckTicks`, which skips the veto by design) must still be able to
+reach them. Zeroing the age at every partial commit starved the backstop
+forever — `ca-slope-hybrid` parked 127 particles on a tread lip at |v| = 0 for
+its whole run, 27 of 31 picks vetoed, 1 forced. A block that converted
+everything, or a forced one, restarts both counters.
 
 THE SOLVER'S FREE SURFACE IS NEVER AT REST, and every speed test in the seam
 corrects for it. Pressure comes from density ≥ rest, so the top layer of any
@@ -4289,7 +4297,13 @@ cannot run a blast, and must not decide one from append order:
    slots decodes it back to the one window cell it names. The survivors are a pure function of the SET of
    firings — order-free, never an append cursor (rule 1). The scramble is an odd
    multiply mod 2^27 so a slot's winner is spatially scattered, and it inverts
-   exactly (`ReactFxDecodeCell`).
+   exactly (`ReactFxDecodeCell`). Word `[45]` of the same block
+   (`kPageFaultReactLiquidEaten`, 2026-10-03) is the reaction LEDGER's CA
+   half: `reactLiquidEaten` adds the fullness of every SETTLED liquid voxel a
+   reaction rewrites to another material (either side of a pair, a decay, a
+   thermal transition). The seam's `FA_CONSUMED` counts the EXCITED half; the
+   two together are what lets `fluid-react` assert its mass account exactly.
+   Diagnostic only — nothing in the sim reads it.
 3. The record rides the snapshot ring (no new binding, no new readback — the scoop
    ledger's trick) and is parsed per snapshot; `PublishSnapshotsUpTo` queues each
    published snapshot's winners, so `World::TakeReactFx` at tick T returns the

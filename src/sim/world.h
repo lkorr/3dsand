@@ -1736,7 +1736,15 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [41..43] T.origin (chunks) the cells below are relative to (stored by
 //          every firing thread; all store the same value)
 //   [44]   T.tick + 1 (0 = nothing fired; the parse checks it)
-//   [45..47] reserved
+//   [45]   LIQUID EIGHTHS EATEN BY CA REACTIONS this tick (atomicAdd): every
+//          time a reaction (bucket rule, either side of a pair, or a thermal
+//          transition) rewrites a SETTLED liquid voxel to a different
+//          material, that voxel's fullness is added here. The CA-side twin
+//          of the seam's FA_CONSUMED, which counts only EXCITED fluid eaten;
+//          the two together close a reaction gate's mass ledger exactly
+//          (fluid-react). Diagnostic: nothing in the sim reads it. Zeroed
+//          with the rest of [40..63] by fill_reactFx.
+//   [46..47] reserved
 //   [48..63] kPageFaultReactFxSlots SLOTS, each an atomicMax of
 //          (fxId << 27) | scramble(slot cell = world cell mod kWorldN). A firing picks its
 //          slot by hash3(seed, tick, cell), so WHICH firings survive a busy
@@ -1783,6 +1791,7 @@ constexpr uint32_t kPageFaultReactFxBase = 40;    // the fill starts here
 constexpr uint32_t kPageFaultReactFxFires = 40;
 constexpr uint32_t kPageFaultReactFxOrigin = 41;  // 41..43
 constexpr uint32_t kPageFaultReactFxTick = 44;
+constexpr uint32_t kPageFaultReactLiquidEaten = 45;
 constexpr uint32_t kPageFaultReactFxSlot0 = 48;
 constexpr uint32_t kPageFaultReactFxSlots = 16;
 static_assert(kPageFaultReactFxSlot0 + kPageFaultReactFxSlots == kPageFaultTicketBase,

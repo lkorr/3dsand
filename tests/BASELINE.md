@@ -907,6 +907,7 @@ here with `--vk-smoke --rebaseline` and `--vk-smoke-loud --rebaseline`. The fina
 `--suite acceptance` (24.6 min) ran on this tree before the hand pins: 0
 page faults, 4 new reds recorded above, everything else green or known.
 
+
 ## 2026-10-03 — `gas-leave-overflow` added, `"pass"` (det-gas package)
 
 New gate, new keys `gasOverflowCap` / `gasOverflowTicks` /
@@ -918,6 +919,7 @@ parcel digest). First run: converted 2365, refused 93317 on 53 ticks, twice-run
 identical over 56 snapshot ticks, digest c188e30d both arms. `gas-leave`'s
 "zero refusals" assertion is unchanged but is a throughput claim now, not a
 determinism one (DESIGN.md "The edge's refusals are a function of the world").
+
 ## 2026-10-03 — red-world: waterbody flipped to pass; chem-electrolysis attributed; tree-fell green at gate scope
 
 - `waterbody` -> **pass**. Pass N: `sim_step.wgsl` `stainDry` now marks its own
@@ -940,6 +942,7 @@ determinism one (DESIGN.md "The edge's refusals are a function of the world").
 - `tree-fell` stays **fail** (suite scope). It passes at gate scope at
   c364516: 0/0/0 burn residue, forced rescan 0/0/0. The suite-scope floater was
   not reproduced, because this package ran no suite.
+
 ## 2026-10-03 — repose: worldgen reads each powder's own repose (hash moves; NOT re-pinned here)
 
 `sand` 34, `gravel` 40, `dirt` 40 are authored in materials.json, and worldgen's
@@ -951,3 +954,29 @@ tables move: intentional, left for the orchestrator's single re-pin.
 caps 126 / 112; travel 0.0 / 0.0 keeps its 0.5 caps). The control arm (same
 materials, old worldgen) measured 1499 / 1301 and FAILED, which is what this
 gate now guards.
+
+## 2026-10-03 — `ca-slope-hybrid` flipped to `"pass"`; `fluid-react` exact again (fluid-gates)
+
+`ca-slope-hybrid`: the "settle mass leak" entry above is history -- mass was
+already EXACT when this branch started (0 unaccounted, ledger never parted).
+The red was 127 particles parked at |v| = 0 on the last tread's lip, 80.3% in
+the basin against 90%. The gate now reports the settle stages (picks,
+infeasible ceil/floor columns, perch-veto losses, forced, sealed) and, per chunk
+slot holding live particles, the extent, max |v| and the `fluidCalm` calm/age
+words. Before: 31 picks, 27 lost columns to the veto, 1 forced, residue calm 19
+/ age 19. `settleCommitColumn` zeroed the stuck age at every commit, so a
+partially vetoed block never reached `sim.fluidStuckTicks` and the backstop
+never fired. Fixed in `sim_fluid_seam.wgsl` (a partial commit keeps the age).
+After: PASS, 96.9% in the basin, mass EXACT, box asleep from tick 120, 5 forced,
+1 sealed. Remaining: ~138 particles live in the basin at tick 400, calm 0 at
+max |v| 0.47 vox/tick -- never calm, so a solver question, not a settle one.
+
+`fluid-react`: the tolerance (`fluidReactCaGapPctMax`, 6.0) is gone. The CA
+side of reaction consumption is now counted (`sim_step.wgsl` reactLiquidEaten
+-> pageFaults [45], world.h `kPageFaultReactLiquidEaten`), and the gate adds
+`FA_KILLHARD`. Measured: 271 standing + 0 stray + 4 live + 2302 eaten excited +
+119 eaten settled + 8 killed hard = 2704 of 2704, seam books residual 0. The
+seam fix above also drained this sealed box: live at the end 157 -> 4.
+
+`determinismHash` was not re-pinned on this branch (orchestrator pins once):
+the seam change moves any world with excited fluid.

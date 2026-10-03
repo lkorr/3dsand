@@ -248,6 +248,20 @@ because the new per-column work is exactly what it stops paying on sky.
 
 ### P2. Make the MPM population settle
 
+**Status 2026-10-03 (fluid-gates branch): mostly recovered.** Re-measured with
+`--perf --scenario idle`, same exe, seam shader as at c364516 vs fixed:
+`fluidSys` median **1.072 -> 0.193 ms/frame** (fluidG2p 289 -> 31 us,
+fluidP2g2 220 -> 31 us). 8cd0775's force-settle backstop had already taken the
+original 3.26 ms down to ~1.07; what kept the rest alive was
+`settleCommitColumn` zeroing the stuck AGE at every commit, so a block whose
+perch columns the stability veto refused never reached `sim.fluidStuckTicks`
+and the backstop never drained it. A partial commit now keeps the age. The
+remaining ~0.19 ms is the seam's fixed per-tick passes plus a small live
+residue; the same residue shows in `ca-slope-hybrid` as ~138 basin particles
+that are never calm (max |v| 0.47 vox/tick) — a solver-dissipation question,
+not a settle refusal. Frame-time numbers from that night are not quotable
+(10 agents shared the GPU).
+
 1. **Reconcile the two harnesses first** (one run, no code): the `sleep` gate
    reports `0 particles alive` at the tarn; `--perf --scenario idle` reports
    7,680 in the same window. One of them is not measuring what it says.

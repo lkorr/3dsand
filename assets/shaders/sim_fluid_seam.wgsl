@@ -2691,7 +2691,10 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
     atomicAdd(&fluidArgs[FA_SETUNSTABLE], 1u);
     // A block that lost columns to the veto has NOT finished converting, so
     // it must not bank a fresh calm window against unchanged geometry
-    // (WP3 item 3's cooldown, same halving as a full refusal).
+    // (WP3 item 3's cooldown, same halving as a full refusal). NOTE: such a
+    // block is not refused, so settleCommit runs for it and writes the calm
+    // half again (to 0) -- that store is what actually takes effect. It
+    // keeps the AGE, which is the half that matters (see settleCommitColumn).
     seamSetCalm(ci, SEAM_CALM_TICKS / 2u);
   }
   // A forced block that got its water out. Counted separately from the calm
@@ -2764,7 +2767,31 @@ fn settleCommitColumn(wgx : u32, li : u32) {
   if (!seamColumnRefused(wgx, li)) {
     settleColumn(wgx, base, cx, cz, true, false, li, forced);
   }
-  if (li == 0u) { atomicStore(&fluidCalm[ci], 0u); }
+  // A PARTIAL COMMIT KEEPS THE STUCK AGE. This was an unconditional
+  // `atomicStore(&fluidCalm[ci], 0u)`, which also zeroed the age -- the exact
+  // bare-store bug seamSetCalm's header describes, at the one site that fix
+  // missed. A block that commits with some columns VETOED (settleCheck's
+  // per-column perch refusal) keeps those columns' water as particles, so it
+  // has NOT stopped holding particles and its age must keep counting. Zeroing
+  // it meant: calm for SEAM_CALM_TICKS -> picked -> perch column vetoed ->
+  // commit -> age 0, forever, so the age never reached SEAM_STUCK_TICKS and the
+  // backstop that exists to drain such water (fluidSolidReason's FSOLID_SUBM
+  // promise; the veto is a conservatism and forced picks skip it) never fired.
+  // Measured on ca-slope-hybrid before the fix: 31 picks, 27 of them losing
+  // columns to the veto, 1 forced, and 127 particles parked on the last
+  // tread's lip at |v| = 0 (calm 19 / age 19 at the end), flat for 400 ticks --
+  // a per-tick solver cost that never goes away (rule 2).
+  // A block that converted EVERYTHING (no vetoed column), or a forced one, has
+  // finished: both counters restart, exactly as before, so particles that
+  // stream in afterwards earn their own age instead of inheriting this one.
+  if (li == 0u) {
+    var vetoed = 0u;
+    for (var q = 0u; q < 8u; q++) {
+      vetoed |= atomicLoad(&settleScratch[SP_COLBAD + wgx * 8u + q]);
+    }
+    if (forced || vetoed == 0u) { atomicStore(&fluidCalm[ci], 0u); }
+    else { seamSetCalm(ci, 0u); }
+  }
 }
 
 // mirrorFold: pack excited-fluid occupancy (eighths per cell, from the last

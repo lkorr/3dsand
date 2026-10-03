@@ -1,9 +1,9 @@
 # PLAN: fluid overhaul — flow, look, perf, and the fluid lab
 
-**Status (2026-10-02 audit): WP1–WP4 LANDED 2026-08-24 and WP5 (re-scoped) 2026-08-25 —
-see each WP's "results" block in §9. §8.2's leftovers are still open: the settle mass
-leak (`ca-slope-hybrid` is still `"fail"` in `tests/baseline.json`) and `fluid-react`'s
-settled-consumption ledger term.**
+**Status (2026-10-03): WP1–WP4 LANDED 2026-08-24 and WP5 (re-scoped) 2026-08-25 —
+see each WP's "results" block in §9. §8.2's two leftovers are CLOSED (branch
+fluid-gates): `ca-slope-hybrid` passes and `fluid-react`'s ledger is exact again.
+See §8.2 for what each actually was.**
 
 Original status: work queue, written 2026-08-24 from a research session (codebase audit +
 reference-implementation study). This document extends `PLAN_mpm_fluids.md`,
@@ -508,11 +508,20 @@ narrowing of the excite predicate.
 
 ### 8.2 What is left
 
-* The settle mass leak `ca-slope-hybrid` found (~0.4 eighths per settle
-  commit, in `settleColumn`/`settleApply`). Diagnosed, not fixed.
-* `fluid-react`'s missing settled-consumption ledger term. The counter belongs
-  inside `doReactions` in `sim_step.wgsl`, which this branch was instructed
-  not to touch.
+* ~~The settle mass leak `ca-slope-hybrid` found~~ — CLOSED. The leak itself was
+  already gone by 2026-08-29 (mass EXACT, ledger never parts); what kept the gate
+  red was 127 particles PARKED on the last tread lip at |v| = 0, permanently.
+  Cause (2026-10-03, from the gate's new settle attribution): `settleCommitColumn`
+  zeroed the whole `fluidCalm` word after every commit, stuck AGE included, so a
+  block whose perch columns the stability veto refused restarted its age at every
+  pick and the force-settle backstop never fired. A partial commit now keeps the
+  age. 80.3% -> 96.9% in the basin, mass exact, box asleep; ~138 particles still
+  churn in the basin at |v| ~0.47 vox/tick (never calm — a solver-dissipation
+  residue, not a settle refusal).
+* ~~`fluid-react`'s missing settled-consumption ledger term~~ — CLOSED 2026-10-03:
+  `reactLiquidEaten` in `sim_step.wgsl` counts settled liquid eighths a reaction
+  rewrites into pageFaults `[45]` (world.h `kPageFaultReactLiquidEaten`); with
+  `FA_KILLHARD` the gate's account is exact with zero slack.
 * Persistence stays as designed (saves force-settle; excite reconstructs on
   disturbance). PLAN_mpm_fluids.md Phases 4-7 continue after, unchanged.
 
