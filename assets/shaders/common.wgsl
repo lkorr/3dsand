@@ -71,21 +71,22 @@ const MATF_TINT_BASE_MASK  : u32 = 0xFFu;
 const MATF_WIND_RESP_SHIFT : u32 = 8u;
 const MATF_WIND_FRIC_SHIFT : u32 = 12u;
 const MATF_WIND_NIBBLE     : u32 = 0xFu;
-// ---- FAR PALETTE SLOT, bits 24..30 of the same word ------------------------
-// Which of the far cascade's 128 palette slots this material paints at
-// distance (world.h kFarPaletteBaseGpu, FAR_PAL_MASK below). Assigned at load
-// by `LoadMaterials` — identity while the id fits, then whatever the `"far"`
-// aliases free up — and mirrored by kMatFarPalShift / kMatFarPalMask in
-// sim/materials.h.
+// ---- FAR PALETTE SLOT, bits 24..31 of the same word ------------------------
+// Which of the far cascade's 255 palette slots this material paints at
+// distance (world.h kFarPaletteBaseGpu, FAR_PAL_BLOCKER below). Assigned at
+// load by `LoadMaterials` — identity while the id fits, then whatever the
+// `"far"` aliases free up — and mirrored by kMatFarPalShift / kMatFarPalMask
+// in sim/materials.h.
 //
 // Only worldgen.wgsl reads it (the three sites that write a far cell byte), so
 // by the letter of the "declare a constant next to its consumer" rule it could
 // live there. It is here because this is where the `flags` word's BIT BUDGET is
 // written down, and a field whose extent is documented somewhere else is how
 // two fields end up overlapping — the exact failure the voxel word's own bit
-// table exists to prevent. Bit 31 is the last free bit in this word.
+// table exists to prevent. The slot took bit 31, the last free bit in this
+// word, when the far byte stopped spending a bit on the blocker flag.
 const MATF_FAR_PAL_SHIFT : u32 = 24u;
-const MATF_FAR_PAL_MASK  : u32 = 0x7Fu;
+const MATF_FAR_PAL_MASK  : u32 = 0xFFu;
 // This material's far palette slot. `mat` must be a real material id.
 fn matFarPal(mats : ptr<storage, array<Material>, read>, mat : u32) -> u32 {
   return ((*mats)[mat].flags >> MATF_FAR_PAL_SHIFT) & MATF_FAR_PAL_MASK;
@@ -4997,32 +4998,37 @@ fn farMapWord(level : u32, m : vec2<i32>) -> u32 {
 fn farMapTop(e : u32) -> i32 { return i32(e & 0xFFFFu) - FAR_MAP_H_BIAS; }
 
 // ---- THE FAR CELL BYTE: 7 bits of PALETTE SLOT + 1 CONSERVATIVE BLOCKER BIT -
-// (13.2.2, docs/PLAN_lin_followups.md W2-D)
+// (13.2.2, docs/PLAN_lin_followups.md W2-D; re-packed 2026-10-02)
 //
-// A far cell used to be a whole byte of raw material id, clamped to 255. It is
-// now SEVEN bits and one flag, because the byte is the only spare storage the
-// cascade has.
+// A far cell used to be a whole byte of raw material id, clamped to 255. Then
+// it was seven bits of slot and a blocker FLAG; it is now ONE 8-bit value:
 //
-// THOSE SEVEN BITS ARE NOT A MATERIAL ID. They are an index into the FAR
-// PALETTE — the fourth reserved run of the material table (world.h
-// kFarPaletteBaseGpu) — and `farPalMat` in raymarch.wgsl translates back.
-// While they WERE a material id, `LoadMaterials` had to refuse a 129th
-// material outright: the 12-bit voxel word had room for 4096 but this byte had
-// room for 128, and crossing the line would have silently painted the wrong
-// colour at distance AND claimed a blocker wherever bit 7 landed. The
-// indirection makes 128 a budget on how many things can look DIFFERENT from
-// each other at cascade scale, which is a far-field question, instead of a cap
-// on the material table, which is not. Materials that are indistinguishable at
-// 50 m share a slot by authoring `"far": "<material>"` in materials.json.
+//   0                 air
+//   1..254            a FAR PALETTE SLOT (a material, see below)
+//   FAR_PAL_BLOCKER   no material, but the conservative blocker (below)
 //
-// Slots are assigned identity-first (material i takes slot i while i < 128), so
-// an unaliased table writes byte-for-byte what it wrote before the palette
-// existed. WRITERS map material -> slot through `matFarPal` (the material's own
-// `flags` word, MATF_FAR_PAL_SHIFT); READERS map slot -> material through
-// `farPalMat`. Slot 0 is air in both directions and never aliases.
+// THE SLOT IS NOT A MATERIAL ID. It is an index into the FAR PALETTE — the
+// fourth reserved run of the material table (world.h kFarPaletteBaseGpu) — and
+// `farPalMat` translates back. Slots are assigned identity-first (material i
+// takes slot i), so with fewer than 255 materials every material paints
+// ITSELF at distance; `"far": "<material>"` in materials.json makes two share
+// one, which is now a deliberate look choice and not a budget. WRITERS map
+// material -> slot through `matFarPal` (the material's own `flags` word,
+// MATF_FAR_PAL_SHIFT); READERS map a cell byte -> slot through `farCellSlot`
+// and slot -> material through `farPalMat`. Slot 0 is air in both directions.
 //
-// The flag means: "somewhere inside this cell's fine-voxel footprint, pristine
-// worldgen puts something a ray would stop on." It is CONSERVATIVE — it may be
+// WHY THE FLAG COULD FOLD INTO THE VALUE. Seven bits were 128 slots for ~207
+// materials, so 79 of them painted somebody else's colour past the LOD handoff
+// (charcoal drew as white ash, a thatch roof as pale tussock, red roof tiles as
+// brown bark) and every new material made it worse. And the flag only ever
+// carried information of its own on a cell with NO material: every reader
+// asks "flag OR material" (farBlockerAt is `byte != 0`; sim_gas / sim_particle
+// "flag OR a non-gas material", and gases never reach the cascade), so a
+// material cell's flag was redundant. One reserved value says everything the
+// bit said.
+//
+// The blocker means: "somewhere inside this cell's fine-voxel footprint,
+// pristine worldgen puts something a ray would stop on." It is CONSERVATIVE —
 // set where the cell's own centre sample found air (that is the entire point:
 // the centre sample loses ridge crests, the top row of every terrace, and any
 // wall thinner than a cell) and it deliberately ignores caves, because a cell
@@ -5030,16 +5036,19 @@ fn farMapTop(e : u32) -> i32 { return i32(e & 0xFFFFu) - FAR_MAP_H_BIAS; }
 //
 // It is a pure function of (coords, seed) — see `farBlockerBitAt` in
 // worldgen.wgsl — which is what lets the sieve (`far`, pristine procgen) and
-// the downsample (`fardown`, live grid) write byte-identical flags at their
+// the downsample (`fardown`, live grid) write byte-identical cells at their
 // shared boundary, the same argument `farSurfaceMat` makes for the colour.
-// The corollary is that the flag knows nothing about EDITS: a player-built
-// wall in mid-air gets no blocker bit, only the material byte the downsample
-// writes for it.
+// The corollary is that it knows nothing about EDITS: a player-built wall in
+// mid-air gets only the material the downsample writes for it.
 // Named FAR_PAL_ and not FAR_SLOT_ because FAR_SLOT_MASK is already the far
 // field's LEVEL-CHUNK slot in the fill queue (see worldgen.wgsl `far`), and two
 // unrelated "far slots" one grep apart is how the wrong one gets used.
-const FAR_PAL_MASK    : u32 = 0x7Fu;   // far palette slot, 0 = air
-const FAR_BLOCKER_BIT : u32 = 0x80u;
+const FAR_PAL_BLOCKER : u32 = 0xFFu;
+// The palette slot of a cell byte: 0 for air AND for a blocker-only cell.
+fn farCellSlot(b : u32) -> u32 { return select(b, 0u, b == FAR_PAL_BLOCKER); }
+// The byte a writer stores: the material's slot, or the blocker when the
+// centre sample found none (`blocker` is FAR_PAL_BLOCKER or 0).
+fn farCellByte(slot : u32, blocker : u32) -> u32 { return select(blocker, slot, slot != 0u); }
 // Slot -> material id, the READ half of the indirection (the write half is
 // matFarPal, up with the `flags` bit layout). The far palette run holds no
 // materials: only each entry's `flags` word is written, and it holds the id

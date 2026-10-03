@@ -1224,12 +1224,16 @@ function tweakPane() {
       geneRows.push(el('div', { class: 'gh' }, (g && g.title) || group));
       if (g) geneRows.push(el('div', { class: 'gnote' }, g.note));
     }
-    // The stock-colour stepper sits directly above the swatch it drives.
-    if (spec.path === 'colors.hair') geneRows.push(hairStockRow());
+    // The stock-colour stepper sits directly above the swatch it drives (the
+    // hair, or on a machine its plating / shell: stockKind).
+    if (spec.path === 'colors.' + stockKind().base) geneRows.push(hairStockRow());
     geneRows.push(geneRow(spec));
   }
 
   const sylvan = S.genome.body.race === 'sylvan';
+  // A MACHINE RACE (automaton.js / android.js): its named pickers, its lamp
+  // swatches, its presets -- all read off the race module, no per-race code.
+  const machine = mg.raceMod(S.genome);
   const presetSel = el('select', {
     title: 'load a worked example — a build the generator can make, to start ' +
            'from rather than to keep',
@@ -1241,12 +1245,15 @@ function tweakPane() {
       }
       S.genome = mg.presetGenome(e.target.value);
       S.name = e.target.value === 'human' ? 'newcomer'
-             : e.target.value === 'sylvan' ? 'sprig' : e.target.value;
+             : e.target.value === 'sylvan' ? 'sprig'
+             : mg.RACE_MODS[e.target.value] ? mg.RACE_MODS[e.target.value].NEW_NAME
+             : e.target.value;
       setDirty(false);
       render();
     },
   }, el('option', { value: '' }, 'preset…'),
-     (sylvan ? mg.SYLVAN_PRESET_ORDER : mg.PRESET_ORDER)
+     (sylvan ? mg.SYLVAN_PRESET_ORDER
+             : machine ? machine.PRESET_ORDER : mg.PRESET_ORDER)
        .map(k => el('option', { value: k }, k)));
 
   const both = S.collapsed.pool && S.collapsed.litter;
@@ -1267,9 +1274,10 @@ function tweakPane() {
         el('div', { class: 'pcanv' }, big, side),
         el('div', {},
           el('div', { class: 'brow racerow' },
-            el('span', { title: 'the kind of person: human, or sylvan (a ' +
-                                'wood spirit on the same frame, so every ' +
-                                'armour piece and weapon fits both)' }, 'race'),
+            el('span', { title: 'the kind of person: human, sylvan (a wood ' +
+                                'spirit), automaton (clockwork) or android ' +
+                                '-- all on the same frame, so every armour ' +
+                                'piece and weapon fits every one' }, 'race'),
             raceToggle()),
           el('div', { class: 'brow' },
             el('input', { value: S.name, size: 12, placeholder: 'name',
@@ -1307,6 +1315,16 @@ function tweakPane() {
             listStyleControl('sb', mg.SYLVAN_BRANCHES,
                              S.genome.sylvan.branchStyle, pickSylvanBranches))
             : null,
+          ...(machine ? machine.PICKERS.map(pk => el('div', { class: 'brow' },
+            el('span', { title: pk.title }, pk.label),
+            listStyleControl('rp-' + pk.key, pk.order,
+                             mg.getPath(S.genome, pk.path),
+                             style => pickRace(pk, style)))) : []),
+          machine ? el('div', { class: 'brow' },
+            el('span', { title: 'stock eye colours. The eye swatch further ' +
+                                'down takes any colour -- lit eyes give light ' +
+                                'of their colour.' }, 'eye glow'),
+            glowControl(machine.GLOWS)) : null,
           el('div', { class: 'brow' },
             el('span', { title: 'a starting point for every hair setting ' +
                                 'further down; drag them afterwards and you ' +
@@ -1322,7 +1340,7 @@ function tweakPane() {
             el('span', { title: 'stock hair colours, darkest to lightest. ' +
                                 'The hair swatch further down still takes ' +
                                 'any colour.' },
-               sylvan ? 'leaf colour' : 'hair colour'),
+               stockKind().label),
             hairColorControl(),
             el('button', {
               title: 'picks a complexion, a hair colour and a cloth colour ' +
@@ -1365,26 +1383,30 @@ function tweakPane() {
 // sylvan is slighter) and dresses the body in the race's colours, face and
 // crown, and switching back undoes the build move exactly.
 function raceToggle() {
-  const cur = S.genome.body.race === 'sylvan' ? 'sylvan' : 'human';
+  const cur = mg.RACES.includes(S.genome.body.race) ? S.genome.body.race : 'human';
+  const defaultName = r => r === 'human' ? 'newcomer' : r === 'sylvan' ? 'sprig'
+                         : mg.RACE_MODS[r] ? mg.RACE_MODS[r].NEW_NAME : r;
+  const blurb = race =>
+    race === 'sylvan'
+      ? 'become a sylvan: bark over sapwood, roots round the limbs, a ' +
+        'crown of leaves, glowing eyes. Same limbs and proportions, so ' +
+        'armour and weapons still fit.'
+      : mg.RACE_MODS[race] ? 'become ' + mg.RACE_MODS[race].BLURB
+      : 'become a human again: skin, a stock complexion and a plain ' +
+        'hairstyle; the build moves back by exactly what it moved';
   const btn = race => el('button', {
     class: 'sexbtn racebtn' + (cur === race ? ' on' : ''),
-    title: race === cur ? 'this character is ' + race
-      : race === 'sylvan'
-        ? 'become a sylvan: bark over sapwood, roots round the limbs, a ' +
-          'crown of leaves, glowing eyes. Same limbs and proportions, so ' +
-          'armour and weapons still fit.'
-        : 'become a human again: skin, a stock complexion and a plain ' +
-          'hairstyle; the build moves back by exactly what it moved',
+    title: race === cur ? 'this character is ' + race : blurb(race),
     onclick: () => {
       if (race === cur) return;
       mg.applyRace(S.genome, race, S.locks);
-      if (S.name === 'newcomer' && race === 'sylvan') S.name = 'sprig';
-      else if (S.name === 'sprig' && race === 'human') S.name = 'newcomer';
+      // A stock name follows the race; a name you typed stays.
+      if (S.name === defaultName(cur)) S.name = defaultName(race);
       setDirty(true);
       render();
     },
   }, race);
-  return el('span', { class: 'sexctl' }, btn('human'), btn('sylvan'));
+  return el('span', { class: 'sexctl' }, mg.RACES.map(btn));
 }
 
 /** A dropdown + step slider over a named list, the hairstyle control's shape,
@@ -1407,6 +1429,17 @@ function syncListControl(cls, order, v) {
   root.querySelectorAll('.' + cls + '-rng').forEach(e => { e.value = String(i); });
   root.querySelectorAll('.' + cls + '-name').forEach(e => {
     e.textContent = (i + 1) + '/' + order.length; });
+}
+
+/** A machine race's named picker (automaton.js / android.js PICKERS): the
+ *  module applies every gene it governs, the page syncs the rows. */
+function pickRace(pk, style) {
+  pk.apply(S.genome, style);
+  setDirty(true);
+  syncListControl('rp-' + pk.key, pk.order, style);
+  const race = S.genome.body.race + '.';
+  syncRows(p => p.startsWith(race));
+  renderPreviewOnly();
 }
 
 function pickSylvanFace(style) {
@@ -1440,12 +1473,12 @@ function pickSylvanCrown(style) {
 
 /** A sylvan's eye glow as a row of stock swatches (mg.SYLVAN_GLOWS). One
  *  click sets `colors.eye`; the lit one is the colour the eyes have now. */
-function glowControl() {
+function glowControl(glows = mg.SYLVAN_GLOWS) {
   const cur = String(S.genome.colors.eye).toLowerCase();
-  const name = (Object.entries(mg.SYLVAN_GLOWS).find(([, h]) => h === cur) ||
+  const name = (Object.entries(glows).find(([, h]) => h === cur) ||
                 ['custom'])[0];
   return el('span', { class: 'glowctl' },
-    Object.entries(mg.SYLVAN_GLOWS).map(([k, hex]) => el('button', {
+    Object.entries(glows).map(([k, hex]) => el('button', {
       class: 'glowsw' + (hex === cur ? ' on' : ''), title: k,
       style: 'background:' + hex,
       onclick: () => {
@@ -1559,25 +1592,42 @@ function beardStyleControl() {
     el('span', { class: 'bs-name gv' }, (i + 1) + '/' + order.length));
 }
 
-/** The stock list the hair stepper walks: hair colours, or on a sylvan, leaf
- *  colours. */
-const stockList = () => S.genome.body.race === 'sylvan' ? mg.LEAF_STOCK
-                                                        : mg.HAIR_STOCK;
+/** A machine race's named picker that owns `path`, or null. */
+function machinePicker(path) {
+  const M = mg.raceMod(S.genome);
+  return (M && M.PICKERS.find(pk => pk.path === path)) || null;
+}
+
+/** WHAT THE STOCK STEPPER WALKS: hair colours; on a sylvan leaf colours; on a
+ *  machine its race's STOCK (platings, shells), which set every colour the
+ *  entry names and are matched by the base colour and its shade. */
+function stockKind() {
+  const M = mg.raceMod(S.genome);
+  if (M) return { list: M.STOCK, base: 'skin', shade: 'skinShade', all: true,
+                  label: M.STOCK_LABEL };
+  if (S.genome.body.race === 'sylvan')
+    return { list: mg.LEAF_STOCK, base: 'hair', shade: 'hairShade', all: false,
+             label: 'leaf colour' };
+  return { list: mg.HAIR_STOCK, base: 'hair', shade: 'hairShade', all: false,
+           label: 'hair colour' };
+}
+const stockList = () => stockKind().list;
 
 /** The stock entry whose colours the genome holds exactly, or -1 (custom). */
 function stockIndex() {
-  const c = S.genome.colors;
-  return stockList().findIndex(([, v]) => v.hair === c.hair &&
-                                            v.hairShade === c.hairShade);
+  const c = S.genome.colors, k = stockKind();
+  return k.list.findIndex(([, v]) => v[k.base] === c[k.base] &&
+                                     v[k.shade] === c[k.shade]);
 }
 
 /** Where to park the stepper's thumb for a custom colour: the nearest stock
  *  entry, so the next arrow press moves to a neighbour of what you have. */
 function nearestStock() {
-  const n = parseInt(S.genome.colors.hair.slice(1), 16);
+  const k = stockKind();
+  const n = parseInt(S.genome.colors[k.base].slice(1), 16);
   let best = 0, bd = Infinity;
-  stockList().forEach(([, v], i) => {
-    const m = parseInt(v.hair.slice(1), 16);
+  k.list.forEach(([, v], i) => {
+    const m = parseInt(v[k.base].slice(1), 16);
     const d = [16, 8, 0].reduce((s, sh) =>
       s + (((n >> sh) & 255) - ((m >> sh) & 255)) ** 2, 0);
     if (d < bd) { bd = d; best = i; }
@@ -1586,36 +1636,38 @@ function nearestStock() {
 }
 
 function syncHairColor() {
-  const i = stockIndex();
-  const name = i >= 0 ? stockList()[i][0] : 'custom';
+  const i = stockIndex(), k = stockKind();
+  const name = i >= 0 ? k.list[i][0] : 'custom';
   root.querySelectorAll('.hc-rng').forEach(e => {
     e.value = String(i >= 0 ? i : nearestStock()); });
   root.querySelectorAll('.hc-name').forEach(e => { e.textContent = name; });
   root.querySelectorAll('.hcsw').forEach(e => {
-    e.style.background = S.genome.colors.hair; });
+    e.style.background = S.genome.colors[k.base]; });
 }
 
 function hairColorControl() {
   const i = stockIndex();
-  const list = stockList();
+  const k = stockKind();
+  const list = k.list;
   return el('span', { class: 'hcctl' },
     el('input', { type: 'range', class: 'hc-rng', min: 0,
                   max: list.length - 1, step: 1,
                   value: i >= 0 ? i : nearestStock(),
                   title: 'stock colours, darkest to lightest: ' +
-                         list.map(([k]) => k).join(', '),
+                         list.map(([n]) => n).join(', '),
                   oninput: e => {
                     const [, v] = list[Number(e.target.value)];
                     // Base and shade together, as a stock pair: the shade is
                     // hand-matched per colour, which a carry cannot improve on.
-                    gset('colors.hair', v.hair);
-                    gset('colors.hairShade', v.hairShade);
+                    // A machine's entry is a whole plating: every colour it
+                    // names goes on together.
+                    const keys = k.all ? Object.keys(v) : [k.base, k.shade];
+                    for (const key of keys) gset('colors.' + key, v[key]);
                     syncHairColor();
-                    syncRows(p => p === 'colors.hair' ||
-                                  p === 'colors.hairShade');
+                    syncRows(p => keys.some(key => p === 'colors.' + key));
                     renderPreviewOnly();
                   } }),
-    el('span', { class: 'hcsw', style: 'background:' + S.genome.colors.hair }),
+    el('span', { class: 'hcsw', style: 'background:' + S.genome.colors[k.base] }),
     el('span', { class: 'hc-name gv', style: 'text-align:left' },
        i >= 0 ? list[i][0] : 'custom'));
 }
@@ -1623,9 +1675,11 @@ function hairColorControl() {
 /** The stock-colour stepper as a gene-list row, above the hair swatch. Not a
  *  gene: it writes two genes, and there is nothing of its own to pin. */
 function hairStockRow() {
-  const hint = 'Steps through ' + stockList().length + ' stock ' +
-               'colours, darkest to lightest, setting the hair and its shade ' +
-               'together. The swatches below still take any colour.';
+  const k = stockKind();
+  const hint = 'Steps through ' + k.list.length + ' stock ' +
+               'colours, darkest to lightest, setting ' +
+               (k.all ? 'every colour of the ' + k.label : 'the hair and its shade') +
+               ' together. The swatches below still take any colour.';
   return el('div', { class: 'grow', title: hint },
     el('span'), el('span', { class: 'gl' }, 'stock colour'),
     hairColorControl(), el('span'), el('div', { class: 'ghint' }, hint));
@@ -1713,6 +1767,10 @@ function geneRow(spec) {
     input = listStyleControl('sc', mg.SYLVAN_CROWNS, v, pickSylvanCrown);
   } else if (spec.path === 'sylvan.branchStyle') {
     input = listStyleControl('sb', mg.SYLVAN_BRANCHES, v, pickSylvanBranches);
+  } else if (machinePicker(spec.path)) {
+    const pk = machinePicker(spec.path);
+    input = listStyleControl('rp-' + pk.key, pk.order, v,
+                             style => pickRace(pk, style));
   } else if (spec.path === 'hair.style') {
     // The dropdown AND a slider that steps through every style, the same
     // control as the one under the preview (the two stay in step).

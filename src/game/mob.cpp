@@ -2234,6 +2234,14 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   // list, so carrying one across a reload would repaint every def with the
   // previous load's colours.
   micro.artColors.clear();
+  // THE WARDROBE'S SHARE OF THE ART PALETTE (MicroBodySet::artCeiling): the
+  // cast merges up to kWardrobeArtReserve short of the full run, so the items
+  // loaded after it keep exact colours. Restored on every way out.
+  struct CeilingGuard {
+    MicroBodySet& m;
+    ~CeilingGuard() { m.artCeiling = kArtPaletteSlotsGpu; }
+  } ceilingGuard{micro};
+  micro.artCeiling = kArtPaletteSlotsGpu - kWardrobeArtReserve;
   // ...and which materials the brick's stain lattice can draw a coat in (a
   // coat is drawn by its material, microbody.h). Published HERE as well as from
   // MobSystem::OnMaterialsReloaded because a set is handed to the system after
@@ -2378,6 +2386,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matBareBlood_.clear();
   matBleed_.clear();
   matFluid_.clear();
+  matStruck_.clear();
+  matBurst_.clear();
+  matShell_.clear();
   coatContact_.clear();
   for (uint32_t& m : matOfStainType_) m = 0;
   ignitedForm_.clear();
@@ -2487,6 +2498,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matBareBlood_.push_back(m.bareBlood);
     matBleed_.push_back(m.bleed);
     matFluid_.push_back(m.bleedFluid);
+    matStruck_.push_back({m.struckMat, m.struckChance, m.struckRadius, false});
+    matBurst_.push_back({m.burstMat, 1.0f, m.burstRadius, m.burstArcs});
+    matShell_.push_back(m.shell ? 1 : 0);
     coatContact_.push_back(m.coatContact);
     // Only a WEARABLE coat (a slot) can seed: nothing else can be on a body.
     coatInfects_.push_back(slot != 0 ? (uint16_t)m.coatInfects : (uint16_t)0);
@@ -11662,6 +11676,46 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // hp is LIFE: a corpse has none to lose, and a rising reads the hp its
     // limbs died with (MobSystem::ServiceRising), not what was hacked off the
     // body afterwards. The wound, the flash and the bleed still happen.
+    // WHAT THE BLOW STRUCK, once: the nearest live voxel to the hit. It
+    // decides how much the wound bleeds and what (below), whether an edge
+    // turns on it, and what the blow knocks out of it.
+    const uint32_t struck = ShellMaterialAt((int)i, hitWorldVoxel);
+    // ---- A SHELL BODY TURNS AN EDGE (materials.h shell) ----------------------
+    // Plating is not flesh: an edge or a set of teeth that meets a `shell`
+    // material on a body limb (not a worn slot -- those have their own rule in
+    // CutLimb / BiteHit) delivers the square root of the Blade row's carve
+    // ratio in hp (game/shellresponse.h: cutHardnessRef over the hardness),
+    // floored at kShellEdgeHpFloor. A sword on brass (70) lands about a third
+    // of its hp, on an android's shell (45) about two fifths; a mace (Blunt)
+    // and a blast arrive whole -- "use a hammer on a machine". Nothing that
+    // is not authored `shell` changes.
+    if (!IsWornSlot((int)i) && sys_ != nullptr && sys_->MatIsShell(struck) &&
+        (ctx.cause == DamageCause::Blade || ctx.cause == DamageCause::Bite)) {
+      const float k = ShellResponseOf(MaterialHardness(struck),
+                                      DamageCause::Blade, CurrentTuning().gear)
+                          .carve;
+      constexpr float kShellEdgeHpFloor = 0.25f;
+      amount *= std::max(std::sqrt(std::max(k, 0.0f)), kShellEdgeHpFloor);
+    }
+    // ---- WHAT THE BLOW KNOCKS OUT (materials.h struck) -----------------------
+    // Sparks off brass and wiring, steam off a boiler: a ball of the struck
+    // matter's `struck` material laid in the air at the hit. A living body
+    // only (a dead machine's power is out), and only a BLOW -- fire, rot, a
+    // landing and a creature's own birth holes are not one. Rolled on a hash
+    // of the creature, the tick, the slot and this tick's burst count.
+    if (alive_ && sys_ != nullptr &&
+        (ctx.cause == DamageCause::Blade || ctx.cause == DamageCause::Blunt ||
+         ctx.cause == DamageCause::Unarmed || ctx.cause == DamageCause::Bite ||
+         ctx.cause == DamageCause::Beam || ctx.cause == DamageCause::Blast ||
+         ctx.cause == DamageCause::Other)) {
+      if (const MobSystem::MatBurst* sb = sys_->StruckOf(struck)) {
+        const uint32_t h = Hash3((uint32_t)id_ ^ 0x57A0C4u, sys_->tick_,
+                                 (uint32_t)i * 977u +
+                                     (uint32_t)sys_->bodyBursts_.size());
+        if (rng::Unit01(h) < sb->chance)
+          sys_->PushBodyBurst(hitWorldVoxel, sb->mat, sb->radius, false);
+      }
+    }
     if (alive_) {
       limb.hp -= amount;
       hpLostBy_[(int)ctx.cause] += amount;
@@ -11701,7 +11755,6 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // ...and it decides WHAT comes out (Mob::FluidAt): the struck voxel's
     // fluid, else the limb's -- a wooden arm on a man leaks syrup.
     if (pol.hitBleed != BleedRate::None) {
-      const uint32_t struck = ShellMaterialAt((int)i, hitWorldVoxel);
       const float add = amount * def_->bleedPerDamage *
                         BleedRateScale(pol.hitBleed) * BleedWeightOf(struck);
       NoteWoundFluid(limb, FluidAt((int)i, struck), add);
@@ -13082,9 +13135,22 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     //
     // The scale is the Blade row of game/shellresponse.h (W2-H), read off the
     // voxel the edge STRUCK rather than the lattice's first voxel.
-    if (IsWornSlot((int)i) && sys_ != nullptr) {
+    //
+    // ...AND A BODY MADE OF PLATE CHIPS THE SAME WAY (materials.h shell, the
+    // robot rows): a body limb whose struck voxel is authored `shell` takes
+    // the worn plate's kerf, so a sword scores an automaton's brass instead
+    // of opening a gash in it. Nothing not authored `shell` changes.
+    const uint32_t cutStruck =
+        sys_ != nullptr ? ShellMaterialAt((int)i, cut.at) : 0u;
+    const bool bodyShell = sys_ != nullptr && !IsWornSlot((int)i) &&
+                           sys_->MatIsShell(cutStruck);
+    // The edge's REACH is the blade's, not the chip's: a plate body shrinks
+    // the slot below, and an unscaled copy is what the plane is priced over
+    // when the caller gave no edge (KerfBite's `edgeHalf`).
+    const float halfL0 = halfL;
+    if (sys_ != nullptr && (IsWornSlot((int)i) || bodyShell)) {
       const auto& gear = CurrentTuning().gear;
-      const float hard = MaterialHardness(ShellMaterialAt((int)i, cut.at));
+      const float hard = MaterialHardness(cutStruck);
       if (hard > 0.0f && gear.cutHardnessRef > 0.0f) {
         const float k =
             ShellResponseOf(hard, DamageCause::Blade, gear).carve;
@@ -13144,21 +13210,26 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                          (int)i < (int)limbDefs_.size() &&
                          (!def_ || (int)i != def_->rootLimb) &&
                          limbDefs_[i].severable && !limbDefs_[i].bloodless;
-    const float edgeHalf = cut.edgeHalf > 0.0f ? cut.edgeHalf : halfL;
+    const float edgeHalf = cut.edgeHalf > 0.0f ? cut.edgeHalf
+                         : bodyShell ? halfL0 : halfL;
     const float cleave = std::max(cut.cleave, 0.0f);
     const float budget = depth * 2.0f * halfL + cleave;
     KerfBiteResult bite;
     // A STAB IS A HOLE (phys/kerf.h KerfCut::stab): never priced, never through.
     if (!cut.stab && (mayPart || cleave > 0.0f)) {
-      // Resistance per material, relative to skin; unknown or art-palette
-      // matter (ids 128.., which are colours) is charged as skin.
+      // Resistance per material, relative to skin; unknown matter is charged
+      // as skin. EVERY material id: a body's voxels are not bounded by the
+      // .vox palette's 127 once a stand-in has been rewritten at load
+      // (anatomy.becomes -- the snake's gland, every robot's plating), and a
+      // table cut off at 128 charged an android's alloy frame as skin.
       const float ref = CurrentTuning().gear.cutHardnessRef;
-      float resist[128];
-      for (uint32_t m = 0; m < 128; m++) {
+      const size_t nMat = sys_ != nullptr ? sys_->matGpu_.size() : 0;
+      std::vector<float> resist(nMat, 1.0f);
+      for (uint32_t m = 0; m < (uint32_t)nMat; m++) {
         const float h = MaterialHardness(m);
         resist[m] = (h > 0.0f && ref > 0.0f) ? h / ref : 1.0f;
       }
-      auto costOf = [&](uint32_t m) { return m < 128 ? resist[m] : 1.0f; };
+      auto costOf = [&](uint32_t m) { return m < nMat ? resist[m] : 1.0f; };
       bite = KerfBite(slot, latScale, edgeHalf, mayPart ? budget : 0.0f, depth,
                       cleave, [&](auto&& probe) {
                         if (fineSkin)
@@ -15187,6 +15258,17 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // Only when asked: a burning limb carves itself dozens of times a second
   // and has no use for the list.
   std::vector<IVec3> skinLostCells;
+  // A BREACH (materials.h burst): the first voxel of burst matter this carve
+  // takes, in this lattice's units. Only while the body lives and has not
+  // let its burst go yet -- the death burst covers a corpse.
+  uint32_t breachMat = 0;
+  Vec3 breachAt{};
+  const bool wantBreach = alive_ && !breachBurst_ && sys_ != nullptr;
+  auto noteBreach = [&](uint32_t m, const Vec3& p) {
+    if (!wantBreach || breachMat || !sys_->BurstOf(m)) return;
+    breachMat = m;
+    breachAt = p;
+  };
   if (fine) {
     const auto keepSkin = carveAt((float)std::max(1u, SkinScaleOf(limb)));
     const size_t before = limb.skinVoxels.size();
@@ -15202,6 +15284,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                          skinLostFluid.Add(OwnFluidOf(v.material & 0xFFFu),
                                            BleedWeightOf(v.material & 0xFFFu));
                          if (report) skinLostCells.push_back({v.x, v.y, v.z});
+                         noteBreach(v.material & 0xFFFu, p);
                          return true;
                        }),
         limb.skinVoxels.end());
@@ -15484,6 +15567,22 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       for (const DebrisVoxel& v : removed)
         report->cells.push_back({v.x, v.y, v.z});
     }
+  }
+  // ...the collider path's breach (no fine skin: the removed cells ARE the
+  // matter), then the burst, before anything below can sever the limb.
+  if (wantBreach && !breachMat && !fine)
+    for (const DebrisVoxel& v : removed)
+      noteBreach(v.payload & 0xFFFu, Vec3{(float)v.x, (float)v.y, (float)v.z});
+  if (breachMat) {
+    const MobSystem::MatBurst* bb = sys_->BurstOf(breachMat);
+    const float sc =
+        (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+    const Quat bq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                  limb.xf.quat[3]};
+    const Vec3 w = limb.xf.pos +
+                   Rotate(bq, (breachAt + Vec3{0.5f, 0.5f, 0.5f}) * (1.0f / sc));
+    sys_->PushBodyBurst(w, bb->mat, bb->radius, bb->arcs);
+    breachBurst_ = true;
   }
   if (def.bleedMat && bleeds) {
     if (carveN) limb.woundLocal = carveC;
@@ -22189,11 +22288,21 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   //    goes is now the step's business, not the radius's.
   const uint32_t bruiseMat =
       sys_ != nullptr ? sys_->MaterialIdNamed(gt.bruiseMat) : 0u;
+  // A SHELL BODY (materials.h shell) is marked the way a worn plate is dented:
+  // the Blunt row's carve ratio off the struck voxel's hardness scales the
+  // mark's reach and weight, so a mace leaves an automaton a small dent where
+  // a man gets a broad bruise. The hp arrived whole (Damage, above).
+  float shellK = 1.0f;
+  if (sys_ != nullptr) {
+    const uint32_t m = ShellMaterialAt(li, hit.at);
+    if (sys_->MatIsShell(m))
+      shellK = ShellResponseOf(MaterialHardness(m), blunt, gear).carve;
+  }
   BruiseReport mark;
   if (bruiseMat != 0 && effBruiseRadius > 0.0f)
-    BruiseLimb(li, local, effBruiseRadius * (0.5f + 0.5f * power),
-               hit.seed ^ 0xB2015Eu, bruiseMat, power, hit.hp, &mark,
-               hit.unarmed);
+    BruiseLimb(li, local, effBruiseRadius * (0.5f + 0.5f * power) * shellK,
+               hit.seed ^ 0xB2015Eu, bruiseMat, power * shellK, hit.hp * shellK,
+               &mark, hit.unarmed);
 
   // 2. THE DENT -- EARNED AND NOW DISSOLVED (2026-09-19).
   //
@@ -23621,6 +23730,16 @@ void Mob::Die() {
   aimLookValid_ = false;
   // The rig is still whole and still posed HERE (see Mob::OnDying).
   OnDying();
+  // THE DEATH BURST (materials.h burst): a dead automaton lets its boiler's
+  // steam go, a dead android's power cell discharges. Where the burst matter
+  // IS in the body, read before the rig goes slack.
+  if (sys_ != nullptr) {
+    uint32_t bm = 0;
+    Vec3 bat{};
+    if (BurstCentre(bm, bat))
+      if (const MobSystem::MatBurst* bb = sys_->BurstOf(bm))
+        sys_->PushBodyBurst(bat, bb->mat, bb->radius, bb->arcs);
+  }
   // The death cry. The root limb's live transform is where the creature
   // actually is, and `mob.origin_` is only the spawn corner (the trap called
   // out in Sever()). Reported even if the mob binds no death take: the audio
@@ -28481,6 +28600,51 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
 }
 
 // ---- ONE SHELL RESPONSE (W2-H, game/shellresponse.h) -----------------------
+
+bool Mob::IsShellMat(uint32_t mat) const {
+  return sys_ != nullptr && sys_->MatIsShell(mat);
+}
+
+bool Mob::BurstCentre(uint32_t& mat, Vec3& at) const {
+  mat = 0;
+  if (sys_ == nullptr) return false;
+  Vec3 sum{};
+  uint32_t n = 0;
+  for (int li = 0; li < (int)limbs_.size() && li < baseLimbs_; li++) {
+    const MobLimb& L = limbs_[li];
+    if (!L.body) continue;
+    const bool fine = L.HasFineSkin();
+    const float sc = (float)std::max(1u, fine ? SkinScaleOf(L) : PhysScaleOf(L));
+    const Quat q{L.xf.quat[0], L.xf.quat[1], L.xf.quat[2], L.xf.quat[3]};
+    auto take = [&](int x, int y, int z, uint32_t m) {
+      if (!sys_->BurstOf(m) || (mat && m != mat)) return;
+      mat = m;
+      sum += L.xf.pos + Rotate(q, Vec3{(x + 0.5f) / sc, (y + 0.5f) / sc,
+                                       (z + 0.5f) / sc});
+      n++;
+    };
+    if (fine)
+      for (const PrefabVoxel& v : L.skinVoxels) take(v.x, v.y, v.z, v.material & 0xFFFu);
+    else
+      for (const DebrisVoxel& v : L.voxels) take(v.x, v.y, v.z, v.payload & 0xFFFu);
+  }
+  if (!n) return false;
+  at = sum * (1.0f / (float)n);
+  return true;
+}
+
+void MobSystem::PushBodyBurst(Vec3 atVoxel, uint32_t mat, int radius,
+                              bool arcs) {
+  if (mat == 0) return;
+  if (bodyBursts_.size() >= kBodyBurstsPerTick) {
+    bodyBurstsRefused_++;
+    return;
+  }
+  bodyBursts_.push_back(BodyBurst{
+      {ifloor(atVoxel.x), ifloor(atVoxel.y), ifloor(atVoxel.z)}, mat,
+      std::clamp(radius, 1, 6), arcs});
+  bodyBurstsIssued_++;
+}
 
 float Mob::BleedWeightOf(uint32_t mat) const {
   if (sys_ == nullptr || mat == 0 || mat >= sys_->matBleed_.size()) return 1.0f;

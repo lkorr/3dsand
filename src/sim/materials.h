@@ -144,26 +144,26 @@ constexpr uint32_t kMatWindRespShift = 8, kMatWindRespMask = 0xF;
 constexpr uint32_t kMatWindFricShift = 12, kMatWindFricMask = 0xF;
 constexpr uint32_t kMatWindMax = 15;
 
-// ---- far palette slot, bits 24..30 of the SAME flags word ----------------
-// Which of the far-field cascade's 128 palette slots this material paints at
-// distance. A far cell is one byte -- seven bits and a conservative blocker
-// flag (common.wgsl FAR_PAL_MASK / FAR_BLOCKER_BIT) -- and those seven bits
-// used to BE a material id, which is the only reason this loader ever refused
-// a 129th material. They are now an index into the far palette (world.h
-// kFarPaletteBaseGpu), so 128 bounds how many things can look DIFFERENT at
-// cascade scale rather than how many materials may exist.
+// ---- far palette slot, bits 24..31 of the SAME flags word ----------------
+// Which of the far-field cascade's 255 palette slots this material paints at
+// distance. A far cell is one byte (common.wgsl FAR_PAL_BLOCKER): 0 air, 255
+// the blocker-only value, and 1..254 an index into the far palette (world.h
+// kFarPaletteBaseGpu). It was seven bits until 2026-10-02 -- 128 slots for
+// ~207 materials, so 79 materials painted another's colour past the LOD
+// handoff.
 //
-// AssignFarSlots below hands them out identity-first, so a table whose
-// materials all fit in seven bits writes byte-for-byte what it wrote before
-// the palette existed. Materials that are indistinguishable at 50 m share a
-// slot by authoring `"far": "<material>"`. Mirrors MATF_FAR_PAL_SHIFT in
-// common.wgsl; worldgen's three far-cell writers read it through matFarPal().
+// The slot assignment in LoadMaterials hands them out identity-first, so
+// while the table has fewer than 255 materials each one paints itself.
+// Materials that should look identical at distance can still share a slot by
+// authoring `"far": "<material>"`. Mirrors MATF_FAR_PAL_SHIFT in common.wgsl;
+// worldgen's far-cell writers read it through matFarPal().
 //
 // Packed into `flags` for the reason the wind nibbles and the tint base give:
-// MaterialGpu is exactly 64 bytes with no spare word. Bit 31 is now the last
-// free bit in it.
-constexpr uint32_t kMatFarPalShift = 24, kMatFarPalMask = 0x7F;
-constexpr uint32_t kMatFarPalSlots = 128;   // == world.h kFarPaletteSlotsGpu
+// MaterialGpu is exactly 64 bytes with no spare word. The slot's eighth bit
+// took bit 31, the last free bit in it.
+constexpr uint32_t kMatFarPalShift = 24, kMatFarPalMask = 0xFF;
+// Slots 0..254: kFarPalBlocker (255) is the blocker-only cell value.
+constexpr uint32_t kMatFarPalSlots = 255;   // == world.h kFarPalBlocker
 
 // The default when a material authors no "wind" block, so that adding wind did
 // not mean editing 96 materials — and so that a NEW material is windy on the
@@ -1101,6 +1101,36 @@ struct MaterialDef {
   uint32_t bleedFluid = 0;
   std::string bleedFluidName;   // as authored ("" = derive from rubble)
   bool bleedFluidOff = false;   // authored `false`
+  // ---- WHAT A BODY MADE OF THIS DOES UNDER A BLOW (the robot rows,
+  // 2026-10-02; DESIGN.md "Robots are matter"). All three are CPU-only body
+  // rules, read by game/mob.cpp; none reaches a shader or the world hash
+  // except through the ordinary op stream (a struck/burst ball is CellOps,
+  // laid like any reaction flash: game/session.cpp ReactFxAftermath).
+  //
+  // SHELL ("shell": true): a blow carves this matter on a LIVING BODY the way
+  // it carves a worn plate -- the Blade/Blunt carve ratio of
+  // game/shellresponse.h, gear.cutHardnessRef over this material's hardness
+  // -- so brass plating takes a chip where skin takes a gash. Opt-in, because
+  // until it existed every body limb carved as flesh whatever it was made of,
+  // and the bark of a sylvan is tuned against that.
+  bool shell = false;
+  // STRUCK ("struck": {"material", "chance", "radius"}): what a blow that
+  // lands ON this matter knocks out of it -- a ball of that material laid in
+  // the air at the hit the next tick (sparks off brass and wiring, steam off
+  // a boiler). `chance` 0..1 per blow, rolled on a counter hash of the blow
+  // (rule 1). 0 = none.
+  uint32_t struckMat = 0;
+  float struckChance = 0.0f;
+  int struckRadius = 1;
+  std::string struckName;
+  // BURST ("burst": {"material", "radius", "arcs"}): what this matter lets go
+  // ONCE when a wound BREACHES it (a carve removes a voxel of it) and ONCE
+  // when its body dies -- a boiler's head of steam, a power cell's discharge.
+  // `arcs` lays it along jagged lines out of the centre instead of a ball.
+  uint32_t burstMat = 0;
+  int burstRadius = 3;
+  bool burstArcs = false;
+  std::string burstName;
   // HOW BURNT A VOXEL OF THIS READS (materials.json "burnStage", W1-F
   // 2026-09-24): 0 = intact, 1 = half (cooked / seared / alight), 2 = whole
   // (charred / cinder / ash). A body's burnt fraction, its burn health cap,

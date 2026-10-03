@@ -1230,12 +1230,17 @@ void Overlay::DrawDevSpawn(UIState& s) {
       // THE RACE FILTER: which kind of person the list below shows. The pick
       // stays an index into the FULL list (the spawn reads it that way); the
       // filtered view maps its rows back.
-      static const char* kRaces[] = {"all", "human", "sylvan", "other"};
+      // The machine races (automaton, android: assets/editor/automaton.js /
+      // android.js) each have their own button; "other" is everything else.
+      static const char* kRaces[] = {"all", "human", "sylvan", "automaton",
+                                     "android", "other"};
+      constexpr int kNamed = 6;
       Caption("race");
       {
-        const float w = CellWidth(4);
-        for (int r = 0; r < 4; r++) {
-          if (r) ImGui::SameLine();
+        const float w = CellWidth(3);
+        for (int r = 0; r < kNamed; r++) {
+          // Two rows of three: a fourth on one line would not fit the panel.
+          if (r % 3) ImGui::SameLine();
           if (ToggleButton((std::string(kRaces[r]) + "##airace").c_str(),
                            s.aiRaceFilter == r, w, 22))
             s.aiRaceFilter = r;
@@ -1249,11 +1254,12 @@ void Overlay::DrawDevSpawn(UIState& s) {
       std::vector<int> index;
       for (int i = 0; i < (int)s.aiCreatureNames.size(); i++) {
         const std::string r = raceOf(i);
+        bool named = false;
+        for (int k = 1; k < kNamed - 1; k++) named = named || r == kRaces[k];
         const bool keep =
             s.aiRaceFilter == 0 ||
-            (s.aiRaceFilter == 1 && r == "human") ||
-            (s.aiRaceFilter == 2 && r == "sylvan") ||
-            (s.aiRaceFilter == 3 && r != "human" && r != "sylvan");
+            (s.aiRaceFilter < kNamed - 1 && r == kRaces[s.aiRaceFilter]) ||
+            (s.aiRaceFilter == kNamed - 1 && !named);
         if (!keep) continue;
         shown.push_back(s.aiCreatureNames[i]);
         index.push_back(i);

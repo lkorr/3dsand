@@ -4689,12 +4689,35 @@ fn canopyOf(t : ptr<function, Tree>, x : i32, z : i32, seed : u32) -> u32 {
 // hillsides read as grey rock with green contour stripes.
 //
 // All three call this same pure function of (col, ponds, mat, coords, level,
-// seed), so downsampled and pristine regions agree exactly at their
+// seed, ground), so downsampled and pristine regions agree exactly at their
 // boundaries (the `far-downsample` gate). `col` and `ponds` must be
 // genColumn's answer at (fine.x, fine.z): reading `col.h` is what keeps the
 // far field on the height contract's own definition of ground.
+//
+// THE GROUND THE PRODUCER CAN SEE (`ground`, 2026-10-02). The skin rule above
+// is right for PRISTINE ground and wrong for anything laid on it: the edit
+// layer's gravel tracks, a flagstone yard, a dug hole. All of those sit at
+// y == h, where the rule used to substitute procgen's skin unconditionally, so
+// a village's paths were grass at every distance past the LOD handoff and
+// popped in at 20 m. Three producers, three amounts of knowledge:
+//   * the sieve (`far`) knows only procgen: FAR_GROUND_PROCGEN, the old rule;
+//   * `fardown` reads the LIVE voxel at (x, h, z) when it lies in the chunk it
+//     is downsampling (a voxel in another chunk may not be generated yet, and
+//     that chunk's own downsample does not rewrite this cell): that word;
+//   * `farpatch`, and `fardown` when the ground voxel is in another chunk,
+//     know only the centre sample: FAR_GROUND_SAMPLE, which keeps the sample's
+//     own material when it is not what procgen put there (an edit reached it).
+// Ground and skin are compared by FAR SLOT, not id: genChunk may firm a powder
+// skin into its cover material (looseTop), and those share a slot (sandstone
+// is `"far": "sand"`), so untouched ground writes exactly the sieve's byte.
+const FAR_GROUND_PROCGEN : u32 = 0xFFFFFFFFu;
+// A farpatch word whose centre was never edited: it carries only the ground
+// slot (faredits.h kMatUntouched / kGroundShift).
+const FAR_PATCH_UNTOUCHED : u32 = 0xFFFu;
+const FAR_GROUND_SAMPLE : u32 = 0xFFFFFFFEu;
 fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
-                 mat : u32, fine : vec3<i32>, shift : u32, seed : u32) -> u32 {
+                 mat : u32, fine : vec3<i32>, shift : u32, seed : u32,
+                 ground : u32) -> u32 {
   let k = materials[mat].klass;
   if (k != CLASS_SOLID && k != CLASS_POWDER) { return mat; }  // fluids keep their ID
   var h = (*col).h;
@@ -4715,9 +4738,36 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   // field, where the eye sees the skin between thin blades. A blade thinner
   // than a cascade cell contributes nothing to the far field (farCellIsSolid
   // drops the plant cell itself); the skin is what the far field paints.
-  let skin = genCellCol(col, ponds, vec3<i32>(fine.x, h, fine.z), seed) & 0xFFFu;
+  //
+  // ONE genCellCol body, two answers: the skin at h, and (FAR_GROUND_SAMPLE
+  // only) procgen's material at the sample. A second call site would inline a
+  // second copy into `far`/`farpatch`/`fardown`, whose compile time is the
+  // engine's worst (unrollFence).
+  var skin = MAT_AIR;
+  var pristine = mat;
+  let nq = select(1u, 2u, ground == FAR_GROUND_SAMPLE);
+  for (var q = unrollFenceU(); q < nq; q++) {
+    let y = select(h, fine.y, q == 1u);
+    let g = genCellCol(col, ponds, vec3<i32>(fine.x, y, fine.z), seed) & 0xFFFu;
+    if (q == 0u) { skin = g; } else { pristine = g; }
+  }
   // a stamp's hollow interior can be air at y == h; keep the body mat then
-  if (skin == MAT_AIR || materials[skin].klass == CLASS_GAS) { return mat; }
+  let skinOk = skin != MAT_AIR && materials[skin].klass != CLASS_GAS;
+  if (ground < FAR_GROUND_SAMPLE) {
+    // The live ground. Dug away, or holding gas / a plant: the cell's top is
+    // whatever the sample found under it. Something else than the skin's
+    // slot: that is what lies on the ground now.
+    if (!farCellIsSolid(ground)) { return mat; }
+    if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
+      return ground;
+    }
+    return skin;
+  }
+  if (ground == FAR_GROUND_SAMPLE &&
+      matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
+    return mat;
+  }
+  if (!skinOk) { return mat; }
   return skin;
 }
 
@@ -4740,7 +4790,7 @@ fn farCellIsSolid(mat : u32) -> bool {
 //
 // `farSurfaceMat` above decides a far cell's COLOUR; this decides whether the
 // cell counts as OCCUPIED even when its single centre sample missed. See the
-// FAR_BLOCKER_BIT block in common.wgsl for what the flag means and why it has
+// FAR_PAL_BLOCKER block in common.wgsl for what the flag means and why it has
 // to be a pure function of (coords, seed).
 //
 // THE TOP OF A COLUMN, as the far field sees it: the ground contract, plus
@@ -4808,9 +4858,9 @@ fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
 // scan only for a cell in the band (farBlockerBitAt). All three end in
 // farBlockerBand, so their bytes cannot drift (the `far-downsample` gate).
 fn farBlockerBand(y0 : i32, topC : i32, btop : i32, step : i32) -> u32 {
-  if (y0 <= topC) { return FAR_BLOCKER_BIT; }
+  if (y0 <= topC) { return FAR_PAL_BLOCKER; }
   if (y0 - topC >= step) { return 0u; }
-  return select(0u, FAR_BLOCKER_BIT, y0 <= btop);
+  return select(0u, FAR_PAL_BLOCKER, y0 <= btop);
 }
 // The surface band's bound: topC and the four corner columns of the level
 // cell at (ccx, ccz). One rolled loop, not four straight-line calls: each
@@ -5655,16 +5705,17 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       let mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
                           fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
       // The conservative flag first: it is what a cell keeps when the centre
-      // sample found nothing (common.wgsl FAR_BLOCKER_BIT), on the hoisted
+      // sample found nothing (common.wgsl FAR_PAL_BLOCKER), on the hoisted
       // topC/btop.
       var byteV = farBlockerBand(yRow, topC, btop, step);
       if (farCellIsSolid(mat)) {
         // shape from the center sample, color from the surface skin (phase 4).
         // What lands in the byte is the skin material's FAR PALETTE SLOT, not
-        // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
-        // fits in seven bits, so an unaliased material table writes exactly
-        // the byte this line wrote before the palette existed.
-        byteV |= matFarPal(&materials, farSurfaceMat(&col, &ponds, mat, fine, shift, T.seed));
+        // its id (common.wgsl farCellByte), and it replaces the blocker: a
+        // cell with a material blocks by having one.
+        byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&col, &ponds, mat, fine, shift,
+                                                                T.seed, FAR_GROUND_PROCGEN)),
+                            byteV);
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -5785,8 +5836,14 @@ fn farFeatWord(level : u32, m : vec2<i32>) -> u32 {
 // The far slot a feature may name: a plant with a far slot of its own.
 fn farFeatSlot(mat : u32) -> u32 {
   if (mat == MAT_AIR) { return 0u; }
-  return matFarPal(&materials, mat);
+  // Seven-bit fields (FAR_MAP_SLOT_MAX): a plant whose slot does not fit is
+  // not a feature, rather than a truncated slot naming some other material.
+  let s = matFarPal(&materials, mat);
+  return select(0u, s, s <= FAR_MAP_SLOT_MAX);
 }
+// The widest slot a surface-map entry or a feature word can hold: their slot
+// fields are seven bits, the cell byte's eight. Only worldgen packs them.
+const FAR_MAP_SLOT_MAX : u32 = 0x7Fu;
 
 // The feature of one map entry (sub-column `m` of a level with 2^wsh fine
 // columns per sub-column), whose sample column (fx, fz) the caller holds as
@@ -5915,14 +5972,23 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
       if (can != MAT_AIR) { skin = can; }
     }
     if (!farCellIsSolid(under)) { under = skin; }
+    // THE ENTRY'S SLOT FIELDS ARE SEVEN BITS (16..22, 23..29), the cell byte's
+    // are eight (common.wgsl FAR_PAL_BLOCKER). A skin whose slot does not fit
+    // -- a material past id 127 laid as ground: a flagstone yard, a stamp's
+    // floor -- gives up the refine here, and the renderer draws the plain
+    // cells, which carry the full slot. Never truncate: a masked slot is
+    // another material.
+    let sSkin = matFarPal(&materials, skin);
+    let sUnder = matFarPal(&materials, under);
+    if (max(sSkin, sUnder) > FAR_MAP_SLOT_MAX) { ok = false; }
     var e = u32(clamp(top + FAR_MAP_H_BIAS, 0, 0xFFFF)) |
-            (matFarPal(&materials, skin) << 16u) |
-            (matFarPal(&materials, under) << 23u);
+            ((sSkin & FAR_MAP_SLOT_MAX) << 16u) |
+            ((sUnder & FAR_MAP_SLOT_MAX) << 23u);
     // A plant on the ground (not on a fluid surface: a lily pad keeps the
     // fluid look) with a far slot of its own: the cover bit + its slot.
     if (cover != MAT_AIR && top == col.h && (materials[cover].flags & MATF_MICRO) != 0u) {
       let cs = matFarPal(&materials, cover);
-      if (cs != 0u) {
+      if (cs != 0u && cs <= FAR_MAP_SLOT_MAX) {
         e = (e & ~(0x7Fu << 23u)) | (cs << 23u) | FAR_MAP_COVER_BIT;
       }
     }
@@ -5956,9 +6022,15 @@ fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
           if (!farInBox(cc, origin)) { continue; }
           let bi = farVoxByteIndex(level, cc);
           let bsh = (bi & 3u) * 8u;
-          let cur = atomicLoad(&farVox[bi >> 2u]);
-          if (((cur >> bsh) & FAR_PAL_MASK) == 0u) {
-            atomicOr(&farVox[bi >> 2u], (body | FAR_BLOCKER_BIT) << bsh);
+          // Mark an air or blocker-only cell with the stalk's slot. A
+          // compare-exchange, not the and+or the other writers use: the four
+          // sub-columns of one level cell are four threads, and two stalks
+          // racing an and+or would OR their slots into a third material.
+          for (var tries = 0u; tries < 8u; tries++) {
+            let cur = atomicLoad(&farVox[bi >> 2u]);
+            if (farCellSlot((cur >> bsh) & 0xFFu) != 0u) { break; }
+            let nw = (cur & ~(0xFFu << bsh)) | (body << bsh);
+            if (atomicCompareExchangeWeak(&farVox[bi >> 2u], cur, nw).exchanged) { break; }
           }
           atomicMax(&farOcc[farOccIndex(level, cc)],
                     farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
@@ -6057,6 +6129,10 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
     let e = farPatch[FAR_PATCH_BASE + pOff + pi];
     let ci = e & 0xFFFu;                       // cell index in this level chunk
     let pmat = (e >> 12u) & 0xFFFu;            // raw material at the sample voxel
+    // The GROUND SLOT (faredits.h kGroundShift): what the voxel at the sample
+    // column's ground holds, for the one cell farSurfaceMat colours from it.
+    // 0 unknown, FAR_PAL_BLOCKER "nothing a cell keeps", else a far slot.
+    let gs = e >> 24u;
     let pl = vec3<i32>(vec3<u32>(ci % CHUNK, (ci / CHUNK) % CHUNK,
                                  ci / (CHUNK * CHUNK)));
     let pcc = base + pl;
@@ -6073,8 +6149,23 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
       haveCol = true;
     }
     var byteV = farBlockerBitAt(pTop, pcc, shift, T.seed);
-    if (farCellIsSolid(pmat)) {
-      byteV |= matFarPal(&materials, farSurfaceMat(&pcol, &pponds, pmat, pfine, shift, T.seed));
+    let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
+    let bsh = (bi & 3u) * 8u;
+    if (pmat == FAR_PATCH_UNTOUCHED) {
+      // Ground knowledge only: the centre voxel was never edited, so the
+      // sweep's byte for this cell stands -- unless it is a material cell and
+      // the ground now holds something else, which is the flush re-skin this
+      // word exists for (a gravel track's cell whose centre is under it).
+      let cur = (atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu;
+      byteV = cur;
+      if (farCellSlot(cur) != 0u && gs != 0u && gs != FAR_PAL_BLOCKER) { byteV = gs; }
+    } else if (farCellIsSolid(pmat)) {
+      var ground = FAR_GROUND_SAMPLE;
+      if (gs == FAR_PAL_BLOCKER) { ground = MAT_AIR; }
+      else if (gs != 0u) { ground = farPalMat(&materials, gs); }
+      byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&pcol, &pponds, pmat, pfine, shift,
+                                                              T.seed, ground)),
+                          byteV);
     }
     if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
     // THE SURFACE MAP STOPS VOUCHING FOR AN EDITED CELL'S COLUMN (package A).
@@ -6093,8 +6184,6 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
     if (level <= FAR_FEAT_LEVELS) {
       for (var q = 0u; q < 4u; q++) { atomicStore(&farMap[FAR_FEAT_BASE + mw + q], 0u); }
     }
-    let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
-    let bsh = (bi & 3u) * 8u;
     atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
     atomicOr(&farVox[bi >> 2u], byteV << bsh);
   }
@@ -6290,17 +6379,19 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         let mat = voxWordAt(fine) & 0xFFFu;
         if (farCellIsSolid(mat)) {
           // Same skin rule as the sieve — the skin is looked up from PRISTINE
-          // procgen (genColumn), so a pristine chunk downsamples bit-identically
-          // to the sieve's fill. An edited surface keeps its pristine skin
-          // color while the cell's center voxel survives; the moment the
-          // center voxel is dug away the cell empties for real. A slightly
-          // stale rim color is invisible at cascade distances; a seam between
-          // refilled planes and downsampled chunks is not.
-          // SAME CALL, SAME ARGUMENTS as the sieve — that identity is what
-          // keeps a downsampled chunk byte-identical to a refilled one at their
-          // shared boundary, and it is why farSurfaceMat takes the column
-          // rather than deriving a height of its own.
-          byteV |= matFarPal(&materials, farSurfaceMat(&pcol, &pponds, mat, fine, shift, T.seed));
+          // procgen (genColumn) — but told what the LIVE ground at (x, h, z)
+          // holds when that voxel is in this chunk (farSurfaceMat's `ground`).
+          // Untouched ground holds the skin's slot, so a pristine chunk still
+          // downsamples bit-identically to the sieve's fill; a gravel track,
+          // a yard or a dug hole now reaches the cascade instead of being
+          // painted over with procgen's grass. It is why farSurfaceMat takes
+          // the column rather than deriving a height of its own.
+          let gp = vec3<i32>(fine.x, pcol.h, fine.z);
+          var ground = FAR_GROUND_SAMPLE;
+          if (all((gp >> vec3<u32>(CHUNK_SHIFT)) == wc)) { ground = voxWordAt(gp) & 0xFFFu; }
+          byteV = farCellByte(matFarPal(&materials, farSurfaceMat(&pcol, &pponds, mat, fine,
+                                                                  shift, T.seed, ground)),
+                              byteV);
         }
         let bi = farVoxByteIndex(level, cc);
         let bsh = (bi & 3u) * 8u;
@@ -6369,7 +6460,11 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       for (var q = 0u; q < 4u; q++) { minH = min(minH, farMapTop(atomicLoad(&farMap[mw + q]))); }
       // The band, clipped to this chunk: from the floor of the level cell that
       // holds minH + 1 (the lowest partly-empty one) up to the voxel over top.
-      let lo = max(fdiv(minH + 1, step) * step, base.y);
+      // ...down to the TOP VOXEL itself, whose material the colour check below
+      // reads: for an odd top at level 1 the band's floor is top + 1, and a
+      // flush re-skin (a gravel track) was never looked at (the far-surface
+      // gate's (e), 2 of 4 columns).
+      let lo = max(min(fdiv(minH + 1, step) * step, hTop), base.y);
       let hi = min(hTop + 1, base.y + i32(CHUNK) - 1);
       // A STALK's entry (package F) claims ITS fine column to the stalk's
       // top, so that is the column checked (the sample column of a level-2
@@ -6385,8 +6480,16 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         qz = (m.y << wsh) + i32((fw >> 13u) & 1u);
       }
       for (var y = lo; y <= hi; y++) {
-        let solid = farCellIsSolid(voxWordAt(vec3<i32>(qx, y, qz)) & 0xFFFu);
-        if (solid != (y <= hTop)) {
+        let wm = voxWordAt(vec3<i32>(qx, y, qz)) & 0xFFFu;
+        let solid = farCellIsSolid(wm);
+        // ...and the claim's COLOUR (2026-10-02): a refined hit is painted
+        // with the entry's skin slot, so a top voxel that is solid but no
+        // longer the skin -- a gravel track, a flagstone yard laid flush --
+        // would be drawn as procgen's grass forever. Below level 5 only: from
+        // there the skin is the flattened canopy, not the voxel (farmap).
+        let reskinned = solid && y == hTop && !isStalk && shift < 5u &&
+                        matFarPal(&materials, wm) != ((e >> 16u) & 0x7Fu);
+        if (solid != (y <= hTop) || reskinned) {
           atomicAnd(&farMap[me], ~FAR_MAP_VALID);
           if (isStalk) {
             let body = (fw >> 16u) & 0x7Fu;
@@ -6398,9 +6501,14 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
               if (!farInBox(cc, origin)) { continue; }
               let bi = farVoxByteIndex(level, cc);
               let bsh = (bi & 3u) * 8u;
-              let sl = (atomicLoad(&farVox[bi >> 2u]) >> bsh) & FAR_PAL_MASK;
+              let sl = farCellSlot((atomicLoad(&farVox[bi >> 2u]) >> bsh) & 0xFFu);
               if (sl != 0u && (sl == body || sl == head)) {
-                atomicAnd(&farVox[bi >> 2u], ~(FAR_PAL_MASK << bsh));
+                // Back to what the fill would have left: the blocker on the
+                // cell that holds the ground under the stalk (its floor at or
+                // below sBase - 1), air above it.
+                let keep = select(0u, FAR_PAL_BLOCKER, (cy << shift) <= sBase - 1);
+                atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+                atomicOr(&farVox[bi >> 2u], keep << bsh);
               }
             }
           }

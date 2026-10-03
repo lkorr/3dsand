@@ -2707,6 +2707,199 @@ Status GateBleedFluid(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ROBOTS ARE MATTER (2026-10-02; materials.h shell / struck / burst) -----
+//
+// The automaton and the android are the human's rig in other matter, and
+// every difference they make is a materials.json row. This gate holds the
+// rows to what they promise, on the shipped examples (assets/mobs/automaton/
+// tinker, assets/mobs/android/courier) against the human, same forearm, same
+// two blade cuts as wood-bleed:
+//   * the stand-ins were rewritten at load (anatomy.becomes): brass / synth
+//     shell on the forearm, no cactus_rib / mushroom_stem left;
+//   * the cut LEAKS what the matter says: oil from the automaton, coolant
+//     from the android;
+//   * plating TURNS THE EDGE: fewer voxels carved and less hp lost than the
+//     human (`shell`), and the cut plane costs far more to part (the kerf
+//     price is hardness over gear.cutHardnessRef, now for EVERY material id
+//     -- it was cut off at 128, which charged a robot's frame as skin);
+//   * DEATH LETS THE BURST GO: steam from a dead automaton, an arcing spark
+//     discharge from a dead android (Mob::Die -> MobSystem::PushBodyBurst).
+// Thresholds in tests/baseline.json (robot*).
+struct RobotProbe {
+  bool ok = false;
+  uint32_t lost = 0;       // forearm skin voxels the two cuts took
+  float hpLost = 0.0f;     // forearm hp the two cuts took
+  float plane = 0.0f;      // the last cut's plane cost (world vox^2)
+  uint32_t fluid = 0;      // the forearm's wound fluid after the cuts
+  uint32_t struck = 0;     // bursts the cuts themselves threw
+  uint32_t deathMat = 0;   // the death burst's material (0 = none)
+  bool deathArcs = false;
+  uint32_t surface = 0;    // forearm voxels of the expected surface material
+  uint32_t standIn = 0;    // forearm voxels still the stand-in
+};
+
+RobotProbe ProbeRobot(Ctx& c, int defIndex, uint32_t surfaceMat,
+                      uint32_t standInMat, std::string& why) {
+  RobotProbe r;
+  MobSystem& mobs = c.mobs;
+  mobs.Reset();
+  c.debris.Reset();
+  mobs.TakeBodyBursts();
+  const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, 445));
+  if (!id) { why = "spawn refused"; return r; }
+  mobs.SetMobBehavior(id, "dummy");
+  const int limb = LimbNamed(mobs.Defs()[defIndex], "armL.R");
+  if (limb < 0) { why = "no armL.R"; return r; }
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, as WoodBleedArm.
+  for (int i = 0; i < 8; i++) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  }
+  if (surfaceMat) r.surface = mobs.LimbMaterialCount(id, limb, surfaceMat);
+  if (standInMat) r.standIn = mobs.LimbMaterialCount(id, limb, standInMat);
+  const uint32_t n0 = mobs.LimbSkinVoxelCount(id, limb);
+  const float h0 = mobs.LimbHp(id, limb);
+  mobs.TakeBodyBursts();
+  const LimbAxis ax = MeasureLimb(mobs, id, limb);
+  std::vector<ParticleSpawn> spawns;
+  mobs.ClearCutBites();
+  for (int k = 0; k < 2; k++)
+    CutOnce(mobs, c.world, id, limb, ax, ax.reach * 0.5f, 6.0f, 0.6f,
+            0x0B1EEDu + (uint32_t)k * 2654435761u, spawns);
+  if (!mobs.LimbBody(id, limb)) { why = "the forearm came off"; return r; }
+  r.lost = n0 - std::min(n0, mobs.LimbSkinVoxelCount(id, limb));
+  r.hpLost = h0 - mobs.LimbHp(id, limb);
+  r.plane = mobs.LastCutBite().planeCost;
+  r.fluid = mobs.LimbWoundFluid(id, limb);
+  r.struck = (uint32_t)mobs.TakeBodyBursts().size();
+  // The death: Die() directly, so the cause is nothing but dying.
+  if (Mob* m = mobs.FindMobById(id)) m->Die();
+  for (const MobSystem::BodyBurst& b : mobs.TakeBodyBursts())
+    if (!r.deathMat) { r.deathMat = b.mat; r.deathArcs = b.arcs; }
+  mobs.Reset();
+  c.debris.Reset();
+  r.ok = true;
+  return r;
+}
+
+Status GateRobotRaces(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  mobs.SetNextIdCounter(1);
+  PrepareWorld(c);
+  auto mat = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  auto name = [&](uint32_t m) {
+    return m && m < c.mats.size() ? c.mats[m].name : std::string("none");
+  };
+  const uint32_t oil = mat("oil"), coolant = mat("coolant"), steam = mat("steam"),
+                 spark = mat("spark"), brass = mat("brass"),
+                 shell = mat("synth_shell"), rib = mat("cactus_rib"),
+                 stem = mat("mushroom_stem"), cell = mat("power_cell"),
+                 boiler = mat("boiler");
+  if (!oil || !coolant || !steam || !spark || !brass || !shell || !cell ||
+      !boiler) {
+    detail = "a robot material is missing from materials.json";
+    return Status::Fail;
+  }
+  // THE DATA, by name, before any body: the rows resolved what they named.
+  const bool data = c.mats[brass].shell && c.mats[brass].bleedFluid == oil &&
+                    c.mats[shell].bleedFluid == coolant &&
+                    c.mats[cell].burstMat == spark && c.mats[cell].burstArcs &&
+                    c.mats[boiler].burstMat == steam &&
+                    c.mats[boiler].struckMat == steam;
+  const int human = mobs.FindDef("human");
+  const int tinker = mobs.FindDef("tinker");
+  const int courier = mobs.FindDef("courier");
+  if (human < 0 || tinker < 0 || courier < 0) {
+    detail = "missing a def (human / tinker / courier)";
+    return Status::Fail;
+  }
+  std::string why;
+  const RobotProbe h = ProbeRobot(c, human, 0, 0, why);
+  const RobotProbe a = ProbeRobot(c, tinker, brass, rib, why);
+  const RobotProbe d = ProbeRobot(c, courier, shell, stem, why);
+  if (!h.ok || !a.ok || !d.ok) {
+    detail = "a probe did not run: " + why;
+    return Status::Fail;
+  }
+  RecordObserved("robotHumanLost", (double)h.lost);
+  RecordObserved("robotAutomatonLost", (double)a.lost);
+  RecordObserved("robotAndroidLost", (double)d.lost);
+  RecordObserved("robotHumanPlane", h.plane);
+  RecordObserved("robotAutomatonPlane", a.plane);
+  RecordObserved("robotAndroidPlane", d.plane);
+  const double carveMax = BaselineNumber("robotCarveMaxRatio", 0.6);
+  const double hpMax = BaselineNumber("robotHpMaxRatio", 0.75);
+  const double planeMin = BaselineNumber("robotPlaneMinRatio", 3.0);
+  auto line = [&](const char* label, const RobotProbe& p) {
+    return Format("%s: lost %u vox / %.2f hp, plane %.2f, leaks %s, struck %u, "
+                  "death %s%s, surface %u stand-in %u; ", label, p.lost,
+                  p.hpLost, p.plane, name(p.fluid).c_str(), p.struck,
+                  name(p.deathMat).c_str(), p.deathArcs ? " (arcs)" : "",
+                  p.surface, p.standIn);
+  };
+  detail = (data ? "" : "[DATA: robot rows did not resolve] ") +
+           line("human", h) + line("automaton", a) + line("android", d);
+  auto robotOk = [&](const RobotProbe& p, uint32_t fluid, uint32_t death,
+                     bool arcs) {
+    return p.surface > 0 && p.standIn == 0 && p.fluid == fluid &&
+           (double)p.lost <= carveMax * (double)h.lost &&
+           (double)p.hpLost <= hpMax * (double)h.hpLost &&
+           (double)p.plane >= planeMin * (double)h.plane &&
+           p.deathMat == death && p.deathArcs == arcs;
+  };
+  const bool okA = robotOk(a, oil, steam, false);
+  const bool okD = robotOk(d, coolant, spark, true);
+  if (!okA) detail += "[automaton WRONG] ";
+  if (!okD) detail += "[android WRONG] ";
+  // The human is the control: it bleeds blood, carves, and dies quietly.
+  const bool okH = h.lost > 0 && h.hpLost > 0.0f && h.deathMat == 0 &&
+                   h.struck == 0;
+  if (!okH) detail += "[human control WRONG] ";
+  // ---- THE DISCHARGE REACHES THE WORLD (the real tick) ----------------------
+  // Everything above stops at the queue. Here an android dies inside
+  // TickAuthority and the burst must come out the other end: drained by the
+  // session's reaction-effect pass, laid the next tick as spark cell ops
+  // (ReactFxAftermath, arcs). Telemetry deltas, no readback.
+  uint64_t laidBursts = 0, laidCells = 0;
+  {
+    mobs.Reset();
+    c.debris.Reset();
+    mobs.TakeBodyBursts();
+    const uint64_t id = mobs.Spawn(courier, FixtureSite(c.world, 445));
+    if (id) {
+      mobs.SetMobBehavior(id, "dummy");
+      const Vec3 o = mobs.MobOrigin(id);
+      uint32_t t = 52000;
+      support::TickCursor tick{
+          c, t, IVec3{ifloor(o.x) >> 4, ifloor(o.y) >> 4, ifloor(o.z) >> 4}};
+      for (int i = 0; i < 6; i++) tick();
+      auto& rf = tick.Rig().Authority().reactFx;
+      const uint64_t b0 = rf.bodyBursts, f0 = rf.flashCells;
+      if (Mob* m = mobs.FindMobById(id)) m->Die();
+      for (int i = 0; i < 3; i++) tick();
+      laidBursts = rf.bodyBursts - b0;
+      laidCells = rf.flashCells - f0;
+    }
+    mobs.Reset();
+    c.debris.Reset();
+  }
+  RecordObserved("robotDischargeCells", (double)laidCells);
+  detail += Format("real tick: android death -> %llu burst(s), %llu spark cell op(s)",
+                   (unsigned long long)laidBursts, (unsigned long long)laidCells);
+  const bool okWorld = laidBursts >= 1 && laidCells >= 4;
+  if (!okWorld) detail += " [discharge never reached the world]";
+  return data && okA && okD && okH && okWorld ? Status::Pass : Status::Fail;
+}
+
 // ---- EVERY DEF KNOWS ITS RACE (MobDef::race, the F1 spawn list's filter) ----
 // The shipped human declares "human"; a generated character inherits it or
 // says its own (a sylvan's sidecar `race`, or its genome's body.race).
@@ -3504,6 +3697,7 @@ const std::vector<Gate>& ImpactGates() {
       {"wood-bleed", "mob", {}, false, GateWoodBleed, false},
       {"bleed-fluid", "mob", {}, false, GateBleedFluid, false},
       {"mob-race", "mob", {}, false, GateMobRace, false},
+      {"robot-races", "mob", {}, false, GateRobotRaces, false},
       {"venom-wound", "mob", {}, false, GateVenomWound, false},
       {"rot-clock", "mob", {}, false, GateRotClock, false},
       {"infect-perf", "mob", {}, false, GateInfectPerf, false},

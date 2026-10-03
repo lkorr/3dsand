@@ -1,0 +1,433 @@
+{
+  "//": "A CHARACTER, not a creature: tinker inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs tinker --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "tinker",
+  "race": "automaton",
+  "sidecarVoxelsPerMetre": 10,
+  "bleed": {
+    "material": "oil",
+    "perDamage": 1.4
+  },
+  "anatomy": {
+    "layers": [
+      {
+        "material": "cactus_rib",
+        "depth": 1,
+        "keep": true
+      },
+      {
+        "material": "cactus_flesh",
+        "depth": 2
+      },
+      {
+        "material": "iron"
+      }
+    ],
+    "garments": [],
+    "limbs": {
+      "head": {
+        "layers": [
+          {
+            "material": "cactus_rib",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "iron",
+            "depth": 1
+          },
+          {
+            "material": "cactus_flesh",
+            "depth": 1
+          },
+          {
+            "material": "cap_tan"
+          }
+        ],
+        "carve": null
+      },
+      "torso": {
+        "carve": [
+          {
+            "material": "cap_red",
+            "where": "cactus_flesh",
+            "box": {
+              "x": [
+                0.26,
+                0.74
+              ],
+              "y": [
+                0.4,
+                0.76
+              ],
+              "z": [
+                0.4,
+                1
+              ]
+            }
+          },
+          {
+            "material": "cap_red",
+            "where": "iron",
+            "box": {
+              "x": [
+                0.26,
+                0.74
+              ],
+              "y": [
+                0.4,
+                0.76
+              ],
+              "z": [
+                0.4,
+                1
+              ]
+            }
+          }
+        ]
+      },
+      "snout": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      },
+      "bough": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "becomes": {
+      "cactus_rib": "brass",
+      "cactus_flesh": "clockwork",
+      "cap_tan": "cogitator",
+      "cap_red": "boiler"
+    },
+    "garmentsBecome": null
+  },
+  "limbs": [
+    {
+      "name": "snout",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 40,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        22.5,
+        135,
+        9.5
+      ]
+    },
+    {
+      "name": "bough",
+      "parent": "torso",
+      "joint": "fixed",
+      "hp": 4,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        18.5,
+        94,
+        1.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        4,
+        61,
+        10
+      ]
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "walk": {
+      "mask": [
+        "armU.L",
+        "armL.L",
+        "armU.R",
+        "armL.R",
+        "torso"
+      ]
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "tinker",
+    "displayName": "Tinker",
+    "body": {
+      "race": "automaton",
+      "sex": "male",
+      "bust": 0,
+      "heightM": 1.7,
+      "hipWidth": 10,
+      "shoulderWidth": 12,
+      "bodyDepth": 8,
+      "headWidth": 10,
+      "headDepth": 10,
+      "limbWidth": 4,
+      "footDepth": 7,
+      "stack": {
+        "foot": 4,
+        "shin": 13,
+        "thigh": 14,
+        "hips": 10,
+        "torso": 18,
+        "head": 16
+      },
+      "armStack": {
+        "upper": 11,
+        "fore": 11,
+        "hand": 5
+      },
+      "armLengths": 1
+    },
+    "shape": {
+      "waist": 1.06,
+      "chest": 1.05,
+      "shoulder": 1,
+      "chestDepth": 1.05,
+      "seat": 1,
+      "armGirth": 1,
+      "legGirth": 1,
+      "upperArm": 1,
+      "bicep": 0,
+      "deltoid": 0,
+      "foreArm": 1,
+      "forearmMuscle": 0
+    },
+    "head": {
+      "jaw": 1.08,
+      "cheek": 1,
+      "crown": 1,
+      "skullBack": 0.6
+    },
+    "face": {
+      "eyeDx": 2.5,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0,
+      "browHeight": 0,
+      "browInner": 1,
+      "browOuter": 0,
+      "browThick": 1,
+      "browTilt": 0,
+      "browArch": 0,
+      "browSparse": 0,
+      "browTone": "shade",
+      "browProud": false,
+      "mouthCurve": 0,
+      "mouthSkew": 0,
+      "mouthShift": 0,
+      "mouthOpen": 0,
+      "mouthTone": "shade",
+      "lips": 0,
+      "nose": 0,
+      "noseWidth": 1,
+      "earSize": 1,
+      "earPoint": false,
+      "eyeWhites": false,
+      "eyeBags": 0,
+      "cheeks": 0,
+      "freckles": 0,
+      "wrinkles": 0,
+      "scar": 0,
+      "beardStyle": "clean",
+      "beardLip": 0,
+      "beardChin": 0,
+      "beardJaw": 0,
+      "beardCheek": 0,
+      "beardSide": 0,
+      "beardWidth": 0,
+      "beardDensity": 1,
+      "beardRagged": 0.45,
+      "beardTone": "shade",
+      "beardLen": 0,
+      "beardPoint": 0,
+      "beardFork": false
+    },
+    "hair": {
+      "style": "bald",
+      "back": 99,
+      "front": 99,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 0,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0,
+      "fuzz": 0,
+      "fuzzTop": 1,
+      "fuzzSide": 1,
+      "fuzzBack": 1,
+      "fuzzLow": 0.5,
+      "fuzzFray": 0.5
+    },
+    "colors": {
+      "skin": "#b8862a",
+      "skinShade": "#7a5418",
+      "skinLight": "#e8c060",
+      "hair": "#7a5418",
+      "hairShade": "#5a3c12",
+      "eye": "#ffc24a",
+      "cloth": "#5a5650",
+      "clothShade": "#3e3b37",
+      "nail": "#4a3a22",
+      "root": "#4a3a2b",
+      "moss": "#7f9a3e",
+      "branch": "#6b5540",
+      "flower": "#f2eee2",
+      "flowerEye": "#e8c34a",
+      "leaf2": "#a6c94a",
+      "leaf3": "#2f5a24",
+      "leaf4": "#7a5a2e",
+      "rivet": "#e8c060",
+      "pipe": "#b8673a",
+      "gear": "#7a5418",
+      "gearDark": "#2e2010",
+      "patina": "#5fa58a",
+      "glass": "#cfe6e0",
+      "fire": "#ff8a2a",
+      "joint": "#3a2a1e",
+      "light": "#6ae8ff",
+      "seam": "#5a6270",
+      "frame": "#6a727c",
+      "core": "#6ae8ff",
+      "visor": "#141a22",
+      "trace": "#2a8aa8"
+    },
+    "sylvan": {
+      "face": "hollow",
+      "crown": "leafy",
+      "glow": true,
+      "sockets": 0.65,
+      "eyeSize": 1,
+      "brow": 0.5,
+      "mouthHole": 0.3,
+      "snout": 0,
+      "warp": 0.35,
+      "grain": 0.6,
+      "knots": 0.3,
+      "roots": 0.55,
+      "rootTwist": 0.5,
+      "relief": 0.7,
+      "moss": 0.2,
+      "wrap": 0.45,
+      "wreath": 0.3,
+      "leaves": 0.55,
+      "leafSize": 0.5,
+      "branches": 0.2,
+      "branchLen": 0.4,
+      "branchFork": 0.5,
+      "branchStyle": "sprigs",
+      "shoulderBranches": 0,
+      "backBranches": 0,
+      "boughLen": 0.5,
+      "tufts": 0.6,
+      "flowers": 0.15,
+      "flowerSize": 0,
+      "leafMix": 0.35,
+      "leafPatch": 0.5,
+      "veil": 0
+    },
+    "automaton": {
+      "face": "gentleman",
+      "glow": true,
+      "lens": 0.8,
+      "bezel": 0.5,
+      "eyeDepth": 0.3,
+      "grille": 0.3,
+      "jaw": 0.35,
+      "brow": 0.6,
+      "monocle": 1,
+      "porthole": 0,
+      "furnace": 0,
+      "cyclops": false,
+      "plates": 0.5,
+      "rivets": 0.6,
+      "gears": 0.4,
+      "pipes": 0.3,
+      "joints": 0.6,
+      "boiler": 0.6,
+      "gauge": 0.8,
+      "patina": 0.15,
+      "wear": 0.2,
+      "polish": 0.4,
+      "stack": "tophat",
+      "stackHead": 0,
+      "hat": 0.8,
+      "crest": 0,
+      "stackBack": 0,
+      "key": 0.7
+    },
+    "android": {
+      "face": "visor",
+      "glow": true,
+      "eyeSize": 1,
+      "visor": 0.6,
+      "faceplate": 0,
+      "mono": false,
+      "grille": 0,
+      "mouthLight": 0,
+      "seams": 0.5,
+      "human": 0,
+      "ears": 0.4,
+      "panels": 0.5,
+      "lights": 0.5,
+      "traces": 0.25,
+      "core": 0.6,
+      "joints": 0.6,
+      "twoTone": 0.3,
+      "sheen": 0.5,
+      "gear": "none",
+      "antenna": 0,
+      "fins": 0,
+      "packs": 0,
+      "halo": 0
+    }
+  }
+}

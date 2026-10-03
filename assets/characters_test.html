@@ -382,7 +382,8 @@ var toasts = [], dirt = [];
     // are working on, and a save files the character in assets/mobs/sylvan/.
     breed.__test.preset('human');
     var raceBtns = [...host.querySelectorAll('.racerow .racebtn')];
-    say(raceBtns.length === 2, 'the race toggle is at the top of the pane',
+    say(raceBtns.length === mg.RACES.length && mg.RACES.length >= 4,
+        'the race toggle is at the top of the pane',
         raceBtns.length + ' buttons');
     var pre = host.querySelector('.prev canvas').toDataURL();
     var sylBtn = raceBtns.find(function(b){ return b.textContent === 'sylvan'; });
@@ -447,6 +448,78 @@ var toasts = [], dirt = [];
     if (humBtn) humBtn.click();
     say(st.genome.body.race === 'human' && !host.querySelector('.sf-sel'),
         'clicking human switches back and hides the sylvan rows');
+
+    mark('11. the machine races: automaton and android');
+    // ---- 11. the machine races ------------------------------------------------
+    // automaton.js / android.js reach the page through ONE interface (named
+    // pickers, glow swatches, a plating stock stepper), so the page has no
+    // per-race code: what it must show is that each race's pickers appear,
+    // reach the preview, a litter stays the race, and a save files it in the
+    // race's folder made of the race's matter (stand-ins, ids <= 127).
+    var machines = [
+      { race: 'automaton', picker: 'stack', style: 'tophat', row: 'gear windows',
+        save: '_harness_auto', surface: 'cactus_rib', inside: 'cap_red' },
+      { race: 'android', picker: 'gear', style: 'sentinel', row: 'light strips',
+        save: '_harness_andr', surface: 'mushroom_stem', inside: 'petal_pink' },
+    ];
+    for (var mi = 0; mi < machines.length; mi++) {
+      var M = machines[mi];
+      breed.__test.preset('human');
+      var mPre = host.querySelector('.prev canvas').toDataURL();
+      var mBtn = [...host.querySelectorAll('.racerow .racebtn')]
+        .find(function(b){ return b.textContent === M.race; });
+      if (mBtn) mBtn.click();
+      say(st.genome.body.race === M.race, 'clicking ' + M.race + ' makes one');
+      say(host.querySelector('.prev canvas').toDataURL() !== mPre,
+          'the preview repaints as an ' + M.race);
+      var faceSel = host.querySelector('.rp-face-sel');
+      var pickSel = host.querySelector('.rp-' + M.picker + '-sel');
+      say(!!faceSel && !!pickSel, 'the ' + M.race + ' face and ' + M.picker +
+          ' pickers appear');
+      var mLabels = [...host.querySelectorAll('.grow .gl')].map(function(e){
+        return e.textContent; });
+      say(mLabels.some(function(t){ return t.indexOf(M.row) === 0; }),
+          'the ' + M.race + ' rows (' + M.row + '...) are offered');
+      var mBefore = host.querySelector('.prev canvas').toDataURL();
+      if (pickSel) { pickSel.value = M.style; pickSel.dispatchEvent(new Event('change')); }
+      say(st.genome[M.race][M.picker] === M.style &&
+          host.querySelector('.prev canvas').toDataURL() !== mBefore,
+          'picking ' + M.picker + ' ' + M.style + ' reaches the preview');
+      var mBefore2 = host.querySelector('.prev canvas').toDataURL();
+      var faces = mg.RACE_MODS[M.race].FACE_ORDER;
+      if (faceSel) { faceSel.value = faces[2]; faceSel.dispatchEvent(new Event('change')); }
+      say(st.genome[M.race].face === faces[2] &&
+          host.querySelector('.prev canvas').toDataURL() !== mBefore2,
+          'picking the ' + faces[2] + ' face reaches the preview');
+      var mSw = [...host.querySelectorAll('.glowsw')];
+      say(mSw.length >= 6, 'eye-glow swatches are offered', mSw.length + '');
+      st.source = 'random';
+      breed.__test.rollLitter();
+      say(st.litter.length > 0 && st.litter.every(function(c){
+            return c.genome.body.race === M.race; }),
+          'a random litter stays ' + M.race);
+      st.name = M.save;
+      await breed.saveFromHost();
+      var mvox = await fetch('/api/model?path=mobs/' + M.race + '/' + M.save + '.vox',
+                             { cache: 'no-store' });
+      say(mvox.ok, 'an ' + M.race + ' saves into assets/mobs/' + M.race + '/');
+      if (mvox.ok) {
+        var mb2 = new Uint8Array(await mvox.arrayBuffer());
+        var mp = vox2.readVox(mb2).prefab;
+        var ms = new Set();
+        for (var m3 of mp.models) for (var v3 of m3.grid.data) if (v3) ms.add(v3);
+        var mnames = [...ms].map(function(id){ return materials[id - 1].id; });
+        say(mnames.indexOf(M.surface) >= 0 && mnames.indexOf(M.inside) >= 0 &&
+            mnames.indexOf('skin') < 0 && [...ms].every(function(id){ return id <= 127; }),
+            'the saved ' + M.race + ' is its own matter (stand-ins), no skin',
+            mnames.join(','));
+      }
+    }
+    var humBtn2 = [...host.querySelectorAll('.racerow .racebtn')]
+      .find(function(b){ return b.textContent === 'human'; });
+    if (humBtn2) humBtn2.click();
+    say(st.genome.body.race === 'human' && !host.querySelector('.rp-face-sel'),
+        'clicking human switches back and hides the machine rows');
   } catch (e) {
     say(false, 'harness threw: ' + (e && e.message || e),
         e && e.stack ? String(e.stack).split('\n')[1] : '');

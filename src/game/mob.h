@@ -2460,6 +2460,15 @@ class Mob {
   float MaterialHardness(uint32_t mat) const;
   // materials.json `bleed` of `mat`: how much a wound in it bleeds, 1 = flesh.
   float BleedWeightOf(uint32_t mat) const;
+  // ---- A BODY OF MATTER THAT IS NOT FLESH (materials.h shell / struck /
+  // burst; the robot rows, DESIGN.md "Robots are matter") ------------------
+  // True when `mat` is authored `"shell": true`: a blow carves it on this
+  // body the way it carves a worn plate (game/shellresponse.h).
+  bool IsShellMat(uint32_t mat) const;
+  // The burst material this body holds (the first base-limb voxel carrying a
+  // `burst`), and the world-space centre of every voxel of it. False when the
+  // body holds none. A scan of the lattices: called at a death, not a tick.
+  bool BurstCentre(uint32_t& mat, Vec3& at) const;
   // ---- WHAT A WOUND LEAKS (materials.h bleedFluid) -------------------------
   // ONE chain, and every emitter goes through it: the STRUCK MATTER's fluid,
   // else the LIMB's majority fluid (FluidTally over voxels with an opinion),
@@ -4593,6 +4602,10 @@ class Mob {
   int defIndex_ = -1;          // into MobSystem's def list (events, persistence)
   const MobDef* def_ = nullptr;
   bool alive_ = true;
+  // ONE BREACH BURST A LIFE (materials.h burst): the first wound that removes
+  // a voxel of burst matter lets it go; later wounds into the same cell do
+  // not. The death burst is its own, once (Die can only run once).
+  bool breachBurst_ = false;
   // ---- the dead state (Mob::Die, ReleaseRigToDebris, the sleep) ------------
   bool rigReleased_ = false;   // the rig went to DebrisSystem: a husk
   // SyncHairTuck's COVER, kept between calls (2026-10-01): the hood's shadow
@@ -6577,6 +6590,48 @@ class MobSystem {
     out.swap(bodyFx_);
     return out;
   }
+  // ---- BODY BURSTS (materials.h struck / burst) ----------------------------
+  // A ball of matter a body throws into the air: sparks off struck brass or
+  // wiring, steam off a struck boiler, a breached power cell's discharge, a
+  // dead automaton's head of steam. Queued here (capped per tick, rule 2),
+  // drained once a tick by game/session.cpp into the reaction-flash
+  // aftermath, which lays the ball as IfAir cell ops the NEXT tick -- through
+  // the mutation queue like every other write (rule 3), at positions hashed
+  // from the event (rule 1).
+  struct BodyBurst {
+    IVec3 cell;
+    uint32_t mat = 0;
+    int radius = 1;
+    bool arcs = false;     // jagged lines out of the centre, not a ball
+  };
+  std::vector<BodyBurst> TakeBodyBursts() {
+    std::vector<BodyBurst> out;
+    out.swap(bodyBursts_);
+    return out;
+  }
+  // Queue one; refused (and counted) past kBodyBurstsPerTick.
+  void PushBodyBurst(Vec3 atVoxel, uint32_t mat, int radius, bool arcs);
+  // What a blow knocks out of `mat`, and what a breach of it lets go
+  // (materials.h); mat 0 / chance 0 = nothing.
+  struct MatBurst {
+    uint32_t mat = 0;
+    float chance = 0.0f;
+    int radius = 1;
+    bool arcs = false;
+  };
+  const MatBurst* StruckOf(uint32_t mat) const {
+    return mat < matStruck_.size() && matStruck_[mat].mat ? &matStruck_[mat]
+                                                          : nullptr;
+  }
+  const MatBurst* BurstOf(uint32_t mat) const {
+    return mat < matBurst_.size() && matBurst_[mat].mat ? &matBurst_[mat]
+                                                        : nullptr;
+  }
+  bool MatIsShell(uint32_t mat) const {
+    return mat < matShell_.size() && matShell_[mat] != 0;
+  }
+  uint32_t BodyBurstsRefused() const { return bodyBurstsRefused_; }
+  uint32_t BodyBurstsIssued() const { return bodyBurstsIssued_; }
 
   // ---- hit flash ----------------------------------------------------------
   // Age every limb's hit flash. Called from PreTick, so it runs wherever the
@@ -7666,6 +7721,14 @@ class MobSystem {
   // should not queue hundreds); the session merges and caps again.
   std::vector<ReactFxEvent> bodyFx_;
   static constexpr size_t kBodyFxPerTick = 16;
+  // Body bursts this tick (PushBodyBurst), and the per-material specs they
+  // come from (materials.h struck / burst / shell). The cap is per TICK and
+  // is a second fence: the session merges and caps again with the flashes.
+  std::vector<BodyBurst> bodyBursts_;
+  static constexpr size_t kBodyBurstsPerTick = 8;
+  uint32_t bodyBurstsRefused_ = 0, bodyBurstsIssued_ = 0;
+  std::vector<MatBurst> matStruck_, matBurst_;
+  std::vector<uint8_t> matShell_;
   std::vector<uint8_t> matHot_;         // carries tag:hot
   // IS AN INFECTION: carries an `infect` block (materials.json, materials.h
   // MaterialDef::infect). Was "carries tag:infectious" until the infection

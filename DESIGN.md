@@ -5083,6 +5083,48 @@ refuse matter that does not crumble to the creature's blood, so a wooden arm on
 a man is not rewritten to blood-meat, but a sylvan's flesh arm is not rewritten
 to blood-meat either (it gets the blood smear only).
 
+**Robots are matter** (2026-10-02, materials.h `shell` / `struck` / `burst`).
+The machine races' behaviour is ten materials.json rows and three new fields,
+no race code: brass plating, oily `clockwork`, an iron frame, a glowing
+`boiler` and a `cogitator` (brainHp) for the automaton; `synth_shell` panels,
+arcing `circuitry`, an `alloy` endoskeleton (hardness 180), a glowing
+`power_cell` and a `neural_core` (brainHp) for the android; `coolant` (cyan,
+faintly lit, an extinguisher, dries like blood) is what an android bleeds, and
+`oil` what an automaton bleeds -- flammable, so a holed automaton near a spark
+burns. None of the rows is flammable, organic or dissolvable, and every
+rotRate is 0: fire, acid, rot and venom find nothing to take.
+- **`shell`: a body of plate chips, it does not gash.** A blow whose struck
+  voxel is `shell` on a BODY limb takes the worn-plate response
+  (game/shellresponse.h): a blade's kerf is scaled by the Blade carve ratio
+  (gear.cutHardnessRef / hardness; the edge's REACH stays the blade's, so the
+  plane is still priced in full), a mace's mark by the Blunt ratio, and an edge
+  or teeth deliver sqrt(ratio) of their hp (floor 0.25) -- a mace or a blast
+  arrives whole: use a hammer on a machine. Opt-in, so the sylvan's bark (which
+  carves as flesh and is tuned against it) is untouched.
+- **The kerf is priced for every material id.** `Mob::CutLimb`'s resistance
+  table stopped at 128 and charged anything above as skin -- an android's
+  alloy frame, the snake's gland, a zombie's rotflesh. It is now hardness over
+  gear.cutHardnessRef for every id.
+- **`struck`: what a blow knocks out.** A living body struck ON such matter
+  throws a small ball of it into the air at the hit, on a hash of (creature,
+  tick, slot, count): sparks off brass (0.2) and wiring (0.9), steam off the
+  boiler (0.8).
+- **`burst`: what a breach or a death lets go.** The first wound that removes a
+  voxel of burst matter lets it go once (`Mob::breachBurst_`), and `Mob::Die`
+  lets it go again from the centre of all of it: a dead automaton's head of
+  steam (radius 4), a dead android's discharge -- sparks along 4-6 jagged ARCS
+  (radius 5) that light what burns, pop hydrogen and fire gunpowder through
+  spark's own rules.
+All three queue `MobSystem::BodyBurst`s (capped 8 a tick), drained by the
+session's reaction-effect pass into the flash aftermath, which lays them as
+IfAir cell ops the next tick (`ReactFxAftermath`, `arcs` = the jagged walks):
+through the op stream (rule 3), at hashed positions (rule 1), bounded twice
+(rule 2). Gate `robot-races`: plating loses a quarter of the voxels and half or
+less of the hp a human forearm does to the same two cuts, the cut plane costs
+2.5x (automaton) / 7x (android) to part, oil / coolant leak, steam / an arcing
+discharge at death -- and, through the real tick, an android's death lays 60
+spark cell ops.
+
 ### Large-scale destruction
 - **Explosions**: cast rays from the blast center to every voxel on the blast
   sphere's *surface*, DDA-traversing voxel by voxel. Compare each voxel's
@@ -8693,6 +8735,53 @@ and skipped by a human's mutate / roll / cross WITHOUT a random draw, so every
 seeded human litter is unchanged. `applyRace` moves the build by offsets (like
 `applySex`) and is reversible. A sylvan still `extends: human`; it is FILED in
 `assets/mobs/sylvan/`.
+
+**MACHINE RACES, AND THE RACE INTERFACE** (2026-10-02, `assets/editor/
+automaton.js`, `android.js`, shared toolbox `robotkit.js`). `body.race` may also
+be `automaton` (a steampunk clockwork man: riveted brass, gear windows, copper
+pipes, leather bellows, a furnace grate in the chest, lamp eyes behind glass,
+and off the body a chimney / top hat / gear crest / exhaust stacks / the wind-up
+key) or `android` (smooth synthetic panels with seams, light strips, circuit
+traces, a power core window, bare frame at the joints; a visor / faceplate /
+single scanner / speaker / near-human face; antennae, head fins, power packs, a
+halo). Same promise as the sylvan -- the human's boxes, anchors, sockets,
+chains, gait (`test_mobgen.mjs` §P) -- but reached through ONE interface instead
+of hooks: `mobgen.RACE_MODS` maps a race key to a module exporting its art
+SLOTS / COLOR_SLOTS / colours and colour SETS, `defaultGenes` (stored under the
+race key, `genome.automaton` / `genome.android`), GENE_GROUPS / GENE_SPECS
+(race-gated, so no human draw moves), named PICKERS (face, stacks, fittings:
+each a preset over genes, with its own dropdown on the Characters page),
+`surfacePass` (inside each part's box, never growing it), `extras` (head cells
+-> `snout` parts, torso cells -> `bough` parts, both FIXED joints), slot ->
+material names with a DEFAULT_MAT (no slot falls back to skin), STAND_INS, the
+ANATOMY, the BLEED, PRESETS, FOLDER. A new race of that shape is a module and a
+row. The sylvan predates it and keeps its own hooks.
+
+**Ids above 127 are painted as STAND-INS.** A .vox palette index is a material
+id only up to 127, and the robot materials are appended rows (207..216). A race
+names its real materials everywhere; `mobgen.raceStandIn` swaps each for its
+stand-in (an unused low id: `cactus_rib` -> `brass`, `mushroom_stem` ->
+`synth_shell`, ...) at .vox write and in the recipe, and the sidecar's
+`anatomy.becomes` maps them back at load (mob.cpp, after the recipe resolves --
+the snake's venom-gland mechanism), so `anatomy-parity` still compares recipe
+against bake. Examples: `assets/mobs/automaton/{tinker,boilerman,deepdiver}`,
+`assets/mobs/android/{courier,sentinel,replicant}`, all `extends: human`.
+
+**One art palette, and the wardrobe's share of it.** Every loaded body and item
+merges its art colours into ONE 255-entry run (`MicroBodyMergeArt`). The cast
+plus the wardrobe came to 264 colours with the robots (184 cast + 32 items
+before them), and a full run used to paint the overflow the raw MATERIAL colour
+(a madder hood went cloth-grey). Three rules now: a colour within
+`kArtMergeNear` (RGB distance squared 27 -- three levels a channel, invisible)
+of one already merged SHARES its slot (never a pure grey; the run drops to
+~215); an overflow takes the NEAREST merged colour; and the cast
+(`LoadMobDefs`) stops `kWardrobeArtReserve` (40) short of the run so the items
+that load after it keep exact colours -- the dyeable pieces are exact greys the
+dye multiplies (`dye` gate). Races also share colours on purpose: the machines'
+lamp colours are the sylvan's glow hexes, an android's strips / eyes / core
+burn one colour, an automaton's rivets are its polished plating and its gears
+its shaded plating, and both machines keep their nail / shadow / glass /
+bellows / frame / visor colours out of the roll sets.
 
 **EVERY HAIR PIECE HAS A COLLIDER.** A limb's collider is the majority fill of
 2x2x2 skin blocks (`phys/lattice.h`), counted in ENGINE axes (the loader's
@@ -13071,7 +13160,7 @@ where you hear from either (§12b, "The ears are on the character").
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
-  cell (7 bits of FAR PALETTE SLOT + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
+  cell (a FAR PALETTE SLOT 1..254, 0 air, 255 the conservative blocker with no material; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -13704,8 +13793,40 @@ where you hear from either (§12b, "The ears are on the character").
   table every far byte is bit-for-bit the byte the same worldgen wrote before
   the palette existed, which is why introducing the whole indirection moved
   neither the world hash nor a single smoke probe.
-  **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
-  far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
+  **Re-packed to 8 bits, 2026-10-02 — every material paints itself.** 128
+  slots for ~207 materials meant 79 `"far"` aliases chosen to fit, not to
+  match: past the LOD handoff (`render.lodHandoffDist`, 20.5 m, where the
+  in-window surface switches to the cascade) a thatch roof turned pale
+  tussock, red roof tiles brown bark, charcoal white ash. The blocker FLAG only
+  ever carried information on a cell with NO material (every reader takes
+  "flag OR material"), so it became one reserved VALUE: the byte is 0 air,
+  1..254 a slot, `FAR_PAL_BLOCKER` (255) blocker-only. Readers go through
+  `farCellSlot` (common.wgsl) / `FarCellSlot` (world.h), writers through
+  `farCellByte`; the flags field is bits 24..31 (bit 31 was the word's last
+  free bit). 255 slots, identity-first, so every material owns one and the
+  aliases are gone except `sandstone` → `sand` (a firmed sand skin must not
+  change the far field). The surface map and the feature words keep 7-bit
+  slot fields: a skin whose slot is past 127 (a stamp's flagstone floor)
+  invalidates its entry instead of truncating, and the renderer draws the
+  cells.
+  **The ground is the ground, not procgen's skin (2026-10-02).**
+  `farSurfaceMat` used to colour every cell straddling `h` with procgen's
+  skin, so anything laid FLUSH on the ground — the edit layer's gravel tracks,
+  a flagstone yard — was grass at every distance past the handoff and popped
+  in at 20 m. Now each producer says what it can see of the voxel at `h`:
+  `fardown` reads the live voxel (when it lies in the chunk being
+  downsampled), `farpatch` takes the GROUND SLOT the edit index records for
+  that voxel (faredits.h `kGroundShift`, bits 24..31 of a patch word, from
+  `World::TerrainHeight`), the sieve keeps procgen. Ground and skin compare
+  by far slot, so untouched ground writes exactly the sieve's byte (the
+  `far-downsample` agreement holds). The surface map's live check
+  (`fardown`) compares the top voxel's MATERIAL as well as its solidity,
+  because a refined hit is painted with the claim's skin slot. Pinned by
+  `far-surface` arm (e), a flush yard checked live and after an indexed
+  refill.
+  **The far cell byte WAS 7 + 1 (13.2.2, 2026-09-01; since 2026-10-02 the
+  flag is the reserved value 255, see above):** bit 7 of every
+  far cell was a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
   ray would stop on somewhere inside this cell's fine footprint" — and the low
   seven are a FAR PALETTE SLOT (`FAR_PAL_MASK` / `FAR_BLOCKER_BIT`,
   common.wgsl; every reader masks). The flag is a pure function of (coords, seed)

@@ -162,7 +162,7 @@ fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
 // raymarch.wgsl farShadowBlocked: MATERIAL cells only, never the blocker flag.
 fn farShadowBlocked(level : u32, c : vec3<i32>) -> bool {
   let bi = farVoxByteIndex(level, c);
-  return ((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & FAR_PAL_MASK) != 0u;
+  return farCellSlot((farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu) != 0u;
 }
 // raymarch.wgsl shadowWindowExitT.
 fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {

@@ -962,6 +962,9 @@ const char* const kOrder[] = {
     "impact-blunt", "impact-armor", "impact-fist", "bite-rot", "bite-infect",
     // ...and how much a wound bleeds by what it opened: wood a fifth of flesh.
     "wood-bleed", "bleed-fluid", "mob-race",
+    // ...and what a machine is made of: plating turns the edge, the cut leaks
+    // oil or coolant, and death lets the boiler or the power cell go.
+    "robot-races",
     // ...and the structural consequence the rot had none of until 2026-09-19:
     // a limb whose ATTACHMENT has been eaten comes off, whatever ate it.
     "joint-rot",

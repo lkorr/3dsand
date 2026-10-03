@@ -1935,21 +1935,20 @@ def check_far_face_word():
 
 
 def check_far_material_bits():
-    """A far cascade cell is a 7-bit FAR PALETTE SLOT + 1 blocker flag (13.2.2).
+    """A far cascade cell is ONE byte: 0 air, FAR_PAL_BLOCKER (0xFF) the
+    blocker-only cell, 1..254 a FAR PALETTE SLOT (13.2.2, re-packed 2026-10-02).
 
-    Those seven bits used to be a material id outright, which is why the loader
-    refused a 129th material. They are now an index into the far palette (world.h
-    kFarPaletteBaseGpu), so the ceiling counts DISTINCT FAR COLOURS, not
-    materials: a look-alike shares a slot by authoring `"far": "<material>"`.
+    The slot is an index into the far palette (world.h kFarPaletteBaseGpu), so
+    the ceiling counts DISTINCT FAR COLOURS, not materials: a look-alike can
+    share a slot by authoring `"far": "<material>"`.
 
-    Four places have to agree about the width, and one about the contents:
-    common.wgsl FAR_PAL_MASK (what every reader masks with), common.wgsl
-    MATF_FAR_PAL_MASK (what every writer packs into the material flags word),
-    materials.h kMatFarPal* (the C++ mirror of that field), and world.h
-    kFarPaletteSlotsGpu (the size of the reverse run). Nothing crashes when they
-    stop agreeing -- the far field just paints the wrong material and claims a
-    blocker wherever a stray bit falls -- so this is the only thing that would
-    say so.
+    Places that have to agree about the width, and one about the contents:
+    common.wgsl FAR_PAL_BLOCKER (the reserved value; slots are 0..it-1),
+    common.wgsl MATF_FAR_PAL_MASK (what every writer packs into the material
+    flags word), materials.h kMatFarPal* (the C++ mirror of that field),
+    world.h kFarPalBlocker, and world.h kFarPaletteSlotsGpu (the size of the
+    reverse run). Nothing crashes when they stop agreeing -- the far field just
+    paints the wrong material -- so this is the only thing that would say so.
 
     materials.json is checked HERE and not only in the loader because adding a
     material is a data edit that needs no build, and a data edit that silently
@@ -1963,16 +1962,22 @@ def check_far_material_bits():
         return
     checked.append("far cell palette slot bits")
 
-    m = re.search(r"FAR_PAL_MASK\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
+    m = re.search(r"FAR_PAL_BLOCKER\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
     if not m:
         problems.append("far cell palette slot bits: common.wgsl has no "
-                        "FAR_PAL_MASK -- the 7-bit split cannot be checked")
+                        "FAR_PAL_BLOCKER -- the byte encoding cannot be checked")
         return
-    mask = int(m.group(1), 16)
-    want = mask + 1                       # slots 0..mask, so mask+1 of them
-    if mask != 0x7F:
-        problems.append(f"far cell palette slot bits: FAR_PAL_MASK is 0x{mask:X}, "
-                        "not 0x7F -- bit 7 is the blocker flag (FAR_BLOCKER_BIT)")
+    blocker = int(m.group(1), 16)
+    mask = 0xFF                           # the whole byte
+    want = blocker                        # slots 0..blocker-1
+    if blocker != 0xFF:
+        problems.append(f"far cell palette slot bits: FAR_PAL_BLOCKER is "
+                        f"0x{blocker:X}, not 0xFF -- the blocker-only value is the "
+                        "byte's last one so every other value is a slot")
+    cb = re.search(r"kFarPalBlocker\s*=\s*0x([0-9A-Fa-f]+)u", wh)
+    if not cb or int(cb.group(1), 16) != blocker:
+        problems.append("far cell palette slot bits: world.h kFarPalBlocker does "
+                        "not match common.wgsl FAR_PAL_BLOCKER")
 
     # The material -> slot direction rides in the flags word. Both sides of the
     # language boundary declare its shift and mask, and a disagreement would
@@ -2005,7 +2010,7 @@ def check_far_material_bits():
                         f"0x{wmk:X} but the cell byte holds 0x{mask:X} -- a slot "
                         "would survive one and be truncated by the other")
     # The flags word: bits 0..7 MATF_* booleans, 8..15 wind, 16..23 tint base,
-    # 24..30 far slot. A shift that let the slot run past bit 31 would drop it.
+    # 24..31 far slot. A shift that let the slot run past bit 31 would drop it.
     if wsh is not None and wmk is not None and wsh + wmk.bit_length() > 32:
         problems.append(f"far cell palette slot bits: a {wmk.bit_length()}-bit "
                         f"slot at shift {wsh} runs off the end of the 32-bit "
@@ -2013,14 +2018,15 @@ def check_far_material_bits():
 
     slots = num(wh, r"kFarPaletteSlotsGpu\s*=\s*(\d+)",
                 "world.h kFarPaletteSlotsGpu")
-    if slots is not None and slots != want:
+    if slots is not None and slots != mask + 1:
         problems.append(f"far cell palette slot bits: world.h reserves {slots} "
-                        f"far palette entries but FAR_PAL_MASK 0x{mask:X} can "
-                        f"only name {want} -- the extra ones are unreachable")
+                        f"far palette entries but the cell byte has {mask + 1} "
+                        "values")
     cslots = num(hpp, r"kMatFarPalSlots\s*=\s*(\d+)", "materials.h kMatFarPalSlots")
-    if None not in (slots, cslots) and slots != cslots:
-        problems.append(f"far cell palette slot bits: world.h reserves {slots} "
-                        f"far palette entries but materials.h hands out {cslots}")
+    if cslots is not None and cslots != want:
+        problems.append(f"far cell palette slot bits: materials.h hands out "
+                        f"{cslots} slots but the byte has {want} below "
+                        "FAR_PAL_BLOCKER")
 
     # The JSON does not list air; the loader prepends it at id 0 and it always
     # owns slot 0. Every material without a "far" alias needs a slot of its own.

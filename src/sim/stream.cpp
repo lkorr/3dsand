@@ -217,6 +217,17 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
                          (m.gpu.klass == CLASS_SOLID || m.gpu.klass == CLASS_POWDER ||
                           (m.gpu.klass == CLASS_LIQUID &&
                            (m.gpu.flags & kMatFlagOpaque) != 0)));
+  // The far index's GROUND SLOT source (faredits.h kGroundShift): each
+  // material's far slot when a cascade cell keeps it -- worldgen's
+  // farCellIsSolid: not a gas, not a micro plant -- else "not solid".
+  std::vector<uint8_t> groundSlot;
+  groundSlot.reserve(mats.size());
+  for (const auto& m : mats) {
+    const bool kept = m.gpu.klass != CLASS_GAS && (m.gpu.flags & kMatFlagMicro) == 0 &&
+                      m.farPalSlot != 0;
+    groundSlot.push_back((uint8_t)(kept ? m.farPalSlot : FarEdits::kGroundNotSolid));
+  }
+  farEdits_.SetGroundSource(std::move(groundSlot), world_);
 }
 
 void Stream::Update(const InterestSet& interest, uint32_t tick) {

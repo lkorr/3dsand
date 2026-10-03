@@ -222,7 +222,7 @@ W_TINTSLOTS="$(cpp_const kTintPaletteSlotsGpu)"
 W_TINTBASE=$((W_ARTBASE - W_TINTSLOTS))
 
 # Far slot palette - the fourth reserved run (world.h kFarPaletteBaseGpu),
-# mapping a far cascade cell's 7-bit FAR SLOT back to the material it paints.
+# mapping a far cascade cell's 8-bit FAR SLOT back to the material it paints.
 W_FARSLOTS="$(cpp_const kFarPaletteSlotsGpu)"
 [ -n "$W_FARSLOTS" ] || {
   echo "check_shaders: cannot parse kFarPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }

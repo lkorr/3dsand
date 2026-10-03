@@ -913,6 +913,9 @@ struct TickAuthorityCtx {
       // this material (the effect's `what`, default `glare`) laid IfAir
       // round the cell the tick after, and nothing else.
       uint32_t mat = 0;
+      // A flash laid along jagged ARCS out of the centre instead of a ball
+      // (a body burst with `arcs`: a power cell's discharge, materials.h).
+      bool arcs = false;
     };
     std::vector<Aftermath> aftermath;
     // Telemetry, monotonic; the chem-* gates read these.
@@ -923,6 +926,9 @@ struct TickAuthorityCtx {
     uint64_t aftermathCells = 0;  // fire + smoke cell ops laid
     uint64_t flashes = 0;         // flash effects issued (package E)
     uint64_t flashCells = 0;      // flash material cell ops laid
+    // Body bursts (MobSystem::TakeBodyBursts: sparks off struck plating, a
+    // breached boiler, a dead android's discharge) turned into flashes.
+    uint64_t bodyBursts = 0;
     std::vector<ExplosionOp> recent;  // the last kRecent blasts issued
     static constexpr size_t kRecent = 16;
   } reactFx;

@@ -63,6 +63,42 @@ class FarEdits {
   static_assert(kChunkVol <= (1u << kCellBits), "cell index must fit 12 bits");
   static_assert(kMaterialSlots <= (1u << 12), "material id must fit 12 bits");
 
+  // ---- THE GROUND SLOT, bits 24..31 of a patch word (2026-10-02) -----------
+  // The centre sample alone cannot carry a FLUSH re-skin: a gravel track laid
+  // at the ground voxel y == h, with the cell's centre one voxel under it,
+  // changes no sample, so the patch never heard of it and every village path
+  // beyond the window was grass. So the cell that worldgen's farSurfaceMat
+  // colours from the ground (the one whose centre is the highest at or below
+  // h) also carries the far slot of the voxel AT h on its sample column --
+  // h from World::TerrainHeight, the CPU twin of genColumn's (the `sculpt`
+  // gate pins the two together). The fine chunk that holds that voxel
+  // speaks for it, as the chunk holding a centre speaks for the centre.
+  //   kGroundUnknown    nothing known about the ground (a centre-only word)
+  //   kGroundNotSolid   the ground voxel holds nothing a cascade cell keeps
+  //   anything else     that voxel's far palette slot
+  // A cell with ground knowledge but no edited centre carries kMatUntouched
+  // in the material field: `farpatch` then keeps the sieve's byte and only
+  // swaps in the ground slot. Compaction COMBINES the two fields of one cell
+  // (newest known value of each) instead of keeping the last word.
+  // Not past shift 5 (3.2 m cells): there the far skin is the flattened
+  // canopy (farSurfaceMat), not the voxel.
+  static constexpr uint32_t kGroundShift = 24;
+  static constexpr uint32_t kGroundUnknown = 0, kGroundNotSolid = 0xFF;
+  static constexpr uint32_t kMatUntouched = 0xFFF;
+  static_assert(kFarPaletteBaseGpu <= kMatUntouched,
+                "kMatUntouched must not be a real material id: real ids sit "
+                "below the reserved palette runs");
+  static constexpr uint32_t kGroundMaxShift = 5;
+  // The ground source: per material id, its far slot when a cascade cell
+  // keeps it (worldgen farCellIsSolid: not gas, not micro) and
+  // kGroundNotSolid otherwise; and the world whose seed TerrainHeight uses.
+  // Until it is set the index records centres only, as it always did.
+  void SetGroundSource(std::vector<uint8_t> slotIfSolid, const World* world) {
+    groundSlot_ = std::move(slotIfSolid);
+    groundWorld_ = world;
+    groundH_.clear();
+  }
+
   // Forgets every NOTED edit. The BASE (SetBase) survives: it is the authored
   // edit layer, which belongs to the map, not to the store being replaced.
   void Clear() {
@@ -203,4 +239,22 @@ class FarEdits {
   size_t cells_ = 0;                // appended samples, before compaction
   uint64_t refused_ = 0;            // new level chunks refused at kMaxCells
   std::vector<uint32_t> scratch_;   // per-level `add` list
+
+  // The ground source (SetGroundSource) and a TerrainHeight cache, keyed on
+  // (seed, x, z): the same sample columns are asked for by every chunk of a
+  // column and every re-note of it. Bounded by a wholesale clear.
+  std::vector<uint8_t> groundSlot_;
+  const World* groundWorld_ = nullptr;
+  std::unordered_map<uint64_t, int> groundH_;
+  int GroundHeight(int x, int z);
+  uint32_t GroundSlotOf(uint32_t mat) const {
+    return mat < groundSlot_.size() ? groundSlot_[mat] : kGroundNotSolid;
+  }
+  // The ground word for sample column (x, z) at `level` whose ground voxel
+  // holds `mat`, filed into `out` under the level chunk of the cell it colours.
+  void GroundWord(uint32_t level, int x, int h, int z, uint32_t mat,
+                  std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out) const;
+  // Combine one cell's words (append order) into one: the newest known
+  // material, the newest known ground slot.
+  static uint32_t CombineCell(const uint32_t* w, size_t n);
 };
