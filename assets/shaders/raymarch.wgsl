@@ -7853,12 +7853,12 @@ fn waterCausticCurv(hitP : vec3f, rd : vec3f, pathVox : f32,
   // 1.7 m swell to drive the pattern.
   let e = 0.22;    // metres — finite-difference baseline for curvature
   let cf = 0.5;    // metres — band damping footprint
-  let s0 = rippleSlope(cp, R.time, cf);
-  let sx = rippleSlope(cp + vec2f(e, 0.0), R.time, cf);
-  let sz = rippleSlope(cp + vec2f(0.0, e), R.time, cf);
   // divergence of the slope field = Laplacian of the height field. Negative
   // curvature (a wave crest acting as a converging lens) is the bright case.
-  let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
+  // rippleCurvature is the three-point difference of rippleSlope at cp,
+  // cp + (e,0) and cp + (0,e), in one pass over the bands (bedCaustic has the
+  // same note).
+  let curv = rippleCurvature(cp, R.time, e, cf);
   // The focusing strength (growing with depth, then saturating) is
   // veilCaustic's half.
   return max(-curv, 0.0);
