@@ -5,7 +5,8 @@
 // A TRANSIENT per-cell potential P (u16) over the conducting cells of the
 // window, recomputed every CA-active tick by sim_elec.wgsl AFTER the CA:
 //
-//   P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay), clamped >= 0
+//   P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay(P)), clamped >= 0
+//   decay(P) = max(sim.elecDecay, P >> sim.elecDecayShift)
 //
 // only in cells whose material conducts (materials.json "electric".resist, or
 // a conducting coat on the cell -- the wet rule); an insulator holds P = 0
@@ -180,6 +181,9 @@ constexpr uint32_t kEpCrackleLoMat = 9;    // what it emits (`spark`)
 constexpr uint32_t kEpCrackleHiP = 10;     // the high tier (`arc`)
 constexpr uint32_t kEpCrackleHiMat = 11;
 constexpr uint32_t kEpElecTag = 12;        // the tagMask bit(s) of "electric" (0 = no such tag)
+// The proportional decay (sim.elecDecayShift; 0 = linear kEpDecay only): a
+// stored P loses max(kEpDecay, P >> shift) in round 0 of a tick.
+constexpr uint32_t kEpDecayShift = 13;
 // A threshold no P reaches (P is a u16).
 constexpr uint32_t kElecPOff = kElecPMax + 1;
 // The wet table: the resist of a cell under a CONDUCTING COAT of stain amount

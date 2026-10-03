@@ -68,6 +68,22 @@ uint32_t Tickets::TicketHolding(IVec3 c) const {
   return kTicketMax;
 }
 
+std::vector<uint32_t> Tickets::DirtyInteriorSlots(uint32_t i) const {
+  std::vector<uint32_t> out;
+  if (i >= kTicketMax || t_[i].state != State::Live) return out;
+  const Ticket& t = t_[i];
+  const int hi = (int)kTicketBoxN - 1;
+  const uint32_t base = World::TicketSlotBase(i);
+  for (uint32_t l = 0; l < kTicketChunks && l < t.lastDirty.size(); l++) {
+    if (!t.lastDirty[l]) continue;
+    const IVec3 wc = world_->TicketSlotWorldChunk(base + l);
+    const IVec3 d{wc.x - t.lo.x, wc.y - t.lo.y, wc.z - t.lo.z};
+    if (d.x >= 1 && d.y >= 1 && d.z >= 1 && d.x < hi && d.y < hi && d.z < hi)
+      out.push_back(base + l);
+  }
+  return out;
+}
+
 std::vector<uint32_t> Tickets::SlotsOf(uint32_t i) const {
   // Slot order IS local-index order: index k of the returned list is
   // TicketLocalIndex == k, which is what the keep bits are indexed by.

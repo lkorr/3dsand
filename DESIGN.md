@@ -2075,11 +2075,13 @@ material conducts takes `min(resist, sim.elecWetResist x 15 / stain amount)`,
 so a wet plank or wet stone carries charge.
 
 **Update**, every CA-active tick after the heat rows:
-`P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay)` clamped at 0, in a
+`P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay(P))` clamped at 0, in a
 conducting cell; an insulator holds its seed (0 unless it is a source). Max-plus
 only RAISES values toward the unique least fixpoint over its inputs, so the
-answer does not depend on thread order. `sim.elecDecay` is taken once a tick off
-every stored value. `sim.elecRounds` rounds a tick (default 4): each relaxes
+answer does not depend on thread order. `decay(P) = max(sim.elecDecay,
+P >> sim.elecDecayShift)` (8 and 3: an eighth a tick above P = 64, a flat 8
+below; shift 0 = the floor alone) is taken once a tick, in round 0, off every
+stored value. `sim.elecRounds` rounds a tick (default 4): each relaxes
 every listed chunk to its fixpoint in shared memory by AXIS SWEEPS (256
 threads, one 16-cell line each, x then y then z, forward and back, until an
 iteration raises nothing; cap 12), with a halo of the six face neighbours'
@@ -2088,6 +2090,27 @@ the other, so a round is a pure function of its inputs. The charge crosses one
 chunk face per round: 64 cells a tick at 4 (the owner's "visible fast pulse").
 A source held in place loses ~decay per `elecRounds` chunks of distance (the
 far end is rebuilt only that many chunks a tick).
+
+**Decay is PROPORTIONAL above a floor (endgame, 2026-10-03).** It was a flat
+`sim.elecDecay` 8 a tick, so lightning's 30,000 took 3,750 ticks (~1 minute)
+to fade and a struck pond or plate stayed lethal the whole time. Now, with no
+source: lightning 30,000 is gone in 55 ticks (under 6,000 -- the arc crackle
+tier -- after 13, under `gore.shockMinP` 60 after 47), an arc's 2,000 in 35
+(under 60 after 27), a spark's 200 in 17 (25 linear). The decay is applied to
+the WHOLE STORED FIELD -- each chunk's own cells and the halo it reads from its
+neighbours alike -- not to the self term only. A self-only decay (neighbour
+terms read undecayed) breaks the fade at every chunk face: chunk B's edge reads
+A's undecayed edge and keeps its value, A's edge reads B's undecayed edge minus
+one resist, so two faces hold each other up and a copper field crossing a face
+falls by ~1 resist a tick there instead of an eighth. Uniform decay of the
+stored field keeps the fade monotone: the tick's maximum is at most
+max(seeds, decay(old maximum)). What it costs a HELD source is only beyond the
+`elecRounds`-chunk rebuild horizon, where the far field compounds 7/8 per
+`elecRounds` chunks on top of the resist (a 1-D simulation of the kernel's
+rounds, copper, 150 ticks held): a held arc (2,000) still holds 1,937 / 1,631
+/ 1,130 / 452 at 64 / 128 / 256 / 512 cells (linear: 1,937 / 1,865 / 1,721 /
+1,433), a held spark reaches 174 cells (183 linear), held lightning 11,447 at
+512 -- copper still carries across the whole window.
 
 **Pages.** 2,048 pages (32 MiB) of 4,096 u16 cells x 2 halves; `elecMeta`
 holds the entry and owner per window slot, a want bitset, two live lists and
@@ -2180,11 +2203,13 @@ R(ElecParams)`.
    MAX, never a sum, so the most P a crackle can give any conductor is
    source - 1 < the threshold that emitted it. A crackle can never sustain
    crackling; it dies with the real source's charge (which falls
-   `sim.elecDecay` a tick), then the last arc's 1,999 (sparks only), then the
-   last spark's 199 (nothing). The gate proves it with lightning on a copper
-   bar: arcs while fed, nothing once the pages are back. Arc-tier crackle on a
-   lightning-struck conductor at the default decay 8 lasts ~3,000 ticks --
-   the field's own fade time, not the crackle's.
+   max(`sim.elecDecay`, P >> `sim.elecDecayShift`) a tick), then the last
+   arc's 1,999 (sparks only), then the last spark's 199 (nothing). The gate
+   proves it with lightning on a copper bar, at the game's own decay since
+   the endgame: arcs while fed, nothing once the pages are back. Arc-tier
+   crackle on a lightning-struck conductor lasts ~13 ticks after the source
+   (it was ~3,000 under the old linear decay) -- the field's own fade time,
+   not the crackle's.
 
 4. **A discharge does not drift.** A gas that is an electric source (spark,
    arc, lightning: `_r2` bit 25) never moves in the CA; it lives its tick or
@@ -2198,7 +2223,7 @@ R(ElecParams)`.
 
 **Sleep.** A cell holds its chunk awake (DIRTY_R_REACT) only while one of
 these rolls is possible, which is while P is high enough -- and P with no
-source falls to 0 in P / decay ticks; the field's own DIRTY_R_ELEC mark
+source falls to 0 in ~55 ticks from lightning's 30,000; the field's own DIRTY_R_ELEC mark
 already kept those chunks awake for exactly as long.
 
 **Also authored with E2:** `gunpowder + tag:electric` (a spark sets it off;
@@ -2238,7 +2263,7 @@ screenshot_elec,screenshot_elec_night,screenshot_elec_view` (RunShots' charge
 block: a lightning-fed and a spark-fed copper wire and an arc-fed pond on a
 levelled stone platform, sources re-laid every tick in stone pockets).
 
-### Electricity — shocks reach bodies (2026-10-03; package E4, `game/mob_shock.cpp`, `sim_elec.wgsl` elecQuery, docs/PLAN_electricity.md section 4, gates `elec-water-mob`, `elec-stun`, `elec-replay`)
+### Electricity — shocks reach bodies (2026-10-03; package E4, `game/mob_shock.cpp`, `sim_elec.wgsl` elecQuery, docs/PLAN_electricity.md section 4, gates `elec-water-mob`, `elec-stun`, `elec-player-stun`, `elec-replay`)
 
 **The body asks; the GPU answers at the fixed latency.** The field lives on the
 GPU and bodies on the CPU, so a body learns what it stands in through a BODY
@@ -2295,7 +2320,10 @@ carve drip; the `damage-cause` gate knows). STUN: `Mob::stunUntil_` pushed to
 `DecideIntent` holds a stunned body still (drive 0, heading held, a stroke in
 flight dropped, the AI's attack refused and counted, `ShockAttacksDropped`) but
 still runs `Think` (memory keeps up; `Fact::Shocked` = stun ticks left); a
-player's command is zeroed in `TickAuthority` (look kept). TWITCH:
+player's command is zeroed in `TickAuthority` (look kept; gate
+`elec-player-stun`, 2026-10-03: the tick rig's own session given a walking
+avatar on a spark-fed plate -- FORWARD held on every stunned tick moves it
+0.00 voxels, the same press walks 21 voxels in 40 ticks once the stun ends). TWITCH:
 `Mob::HitReact` in a hashed direction every `shockTwitchTicks` while stunned
 (presentation only). At `shockRagdollP` (8,000: lightning-class)
 `StartRagdoll(shockRagdollSeconds, "shock")`. At `shockIgniteMinP` a hashed roll
@@ -2307,11 +2335,11 @@ special case). Corpses and ghosts do not ask.
 **Scale, at the defaults.** A spark (200) on a copper plate: ~0.3 hp a tick a
 foot, a 6-tick stun -- it barely hurts. A lightning-fed pond (~30,000): the cap,
 half of it on the torso, a knock-down and likely fire -- a wet human dies in
-well under a second. OPEN (E1's knob, not this package's): `sim.elecDecay` 8 a
-tick is a LINEAR decay, so an arc-charged plate stays over `shockMinP` ~240
-ticks and a struck pond ~2 minutes; at these shock numbers a body standing on
-either is killed by the residue. A proportional decay would fix it at the
-source.
+well under a second. FIXED by the endgame's proportional decay
+(`sim.elecDecayShift`, 2026-10-03): `sim.elecDecay` 8 a tick was LINEAR, so an
+arc-charged plate stayed over `shockMinP` ~240 ticks and a struck pond ~1
+minute and a body standing on either was killed by the residue. Now the arc
+plate drops under `shockMinP` 27 ticks after its source, a struck pond 47.
 
 ### Day/night, and sunlight as a sim input (2026-08-20)
 

@@ -23,6 +23,16 @@
 //                      stun ending.
 //                   B. A dummy on a plate fed by LIGHTNING: lightning-class
 //                      charge must knock it down (StartRagdoll "shock").
+//   elec-player-stun  THE PLAYER (TickAuthority's SHOCKED block, session.cpp):
+//                   the rig's session gets a real walking avatar (fly off) on a
+//                   spark-fed copper_bar plate, the stun floor lifted to
+//                   elecPlayerStun.stunTicks. The avatar must take Electric hp
+//                   and be stunned; on every stunned tick the gate presses
+//                   FORWARD and the player must not move more than
+//                   elecPlayerStun.stillVoxelsMax (the command is zeroed); once
+//                   the stun is over, the same press must walk at least
+//                   elecPlayerStun.walkVoxelsMin within walkTicks (the control:
+//                   a fixture whose player cannot walk proves nothing).
 //   elec-replay     Plate + spark + a wet and a dry human under the op
 //                   recorder (oprecord.h, what SANDVOX_RECORD_OPS records):
 //                   the replay of the record must reproduce every world-hash
@@ -45,6 +55,7 @@
 #include <string>
 #include <vector>
 
+#include "game/avatar.h"
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/mob.h"
@@ -653,12 +664,139 @@ Status GateElecReplay(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// elec-player-stun
+// ============================================================================
+Status GateElecPlayerStun(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  if (c.mobs.FindDef(kAvatarDefName) < 0) {
+    detail = Format("no `%s` def", kAvatarDefName);
+    return Status::Skip;
+  }
+  const uint32_t mStone = MatId(c, "stone"), mCopper = MatId(c, "copper_bar"),
+                 mSpark = MatId(c, "spark");
+  const int stunTicks = (int)BaselineNumber("elecPlayerStun.stunTicks", 40);
+  const int feedTicks = (int)BaselineNumber("elecPlayerStun.feedTicks", 4);
+  const double stillMax = BaselineNumber("elecPlayerStun.stillVoxelsMax", 0.5);
+  const int walkTicks = (int)BaselineNumber("elecPlayerStun.walkTicks", 40);
+  const double walkMin = BaselineNumber("elecPlayerStun.walkVoxelsMin", 4.0);
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
+  };
+  const Tuning saved = CurrentTuning();
+  {
+    Tuning tt = saved;
+    tt.gore.shockStunMinTicks = stunTicks;
+    tt.gore.shockStunMaxTicks = std::max(tt.gore.shockStunMaxTicks, stunTicks);
+    SetCurrentTuning(tt);
+  }
+  Regenerate(c);
+  Fix f;
+  PadOps(c, f, 200, 22, 12, mStone);
+  // The plate: copper under the feet, x +-6, z from z-6 to z+2 (the player
+  // walks +z off its end once the stun is over, onto the stone pad).
+  for (int zz = f.z - 6; zz <= f.z + 2; zz++)
+    for (int xx = f.x - 6; xx <= f.x + 6; xx++) Put(f.build, xx, f.y - 1, zz, mCopper);
+  Pocket(f.build, mStone, f.x, f.y - 1, f.z - 7, 0, 0, 1);
+  Put(f.feed, f.x, f.y - 1, f.z - 7, mSpark);
+  float elecHp = 0.0f;
+  int stunned = 0, walkStart = -1;
+  float stillMoved = 0.0f, walked = 0.0f;
+  bool spawned = false, everStunned = false;
+  Mob::ShockRecord rec;
+  {
+    support::TickRig rig(c, 87000u, f.chunk);
+    BuildFix(rig, f);
+    // THE BODY: the rig's session leaves fly mode, so phase I spawns the
+    // avatar where the player stands (session.cpp `wantAvatar`), and the
+    // shock pass asks about its limbs like any body (avatars first).
+    PlayerSession& s = rig.Session();
+    s.avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+    s.avatar.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+    c.mobs.SetAvatar(&s.avatar);
+    s.player.fly = false;
+    s.player.grounded = true;
+    s.player.vel = Vec3{0, 0, 0};
+    s.player.pos = Vec3{(float)f.x + 0.5f, (float)f.y + Player::kHalfY + 0.05f, (float)f.z + 0.5f};
+    for (int i = 0; i < 20; i++) Tick(rig);
+    spawned = s.avatar.Spawned();
+    if (spawned) {
+      Vec3 anchor{};
+      bool haveAnchor = false;
+      Vec3 walk0{};
+      // The pulse, then: press FORWARD on every tick the body is stunned
+      // (the tick is told before it runs: Stunned(t) for the t about to
+      // run), and keep pressing for walkTicks once the stun is over.
+      const int budget = feedTicks + 30 + 2 * stunTicks + walkTicks;
+      for (int i = 0; i < budget; i++) {
+        const uint32_t next = rig.tick + 1;
+        const bool stun = s.avatar.Stunned(next);
+        const bool press = stun || walkStart >= 0;
+        support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+          if (i < feedTicks) o.cells = f.feed;
+          if (press) o.input.forward = 1.0f;
+        });
+        if (stun) {
+          everStunned = true;
+          stunned++;
+          if (!haveAnchor) {
+            anchor = s.player.pos;
+            haveAnchor = true;
+          } else {
+            const Vec3 d = s.player.pos - anchor;
+            stillMoved = std::max(stillMoved, std::sqrt(d.x * d.x + d.z * d.z));
+          }
+        } else if (everStunned && walkStart < 0) {
+          walkStart = i;
+          walk0 = s.player.pos;
+        }
+        if (walkStart >= 0) {
+          const Vec3 d = s.player.pos - walk0;
+          walked = std::max(walked, std::sqrt(d.x * d.x + d.z * d.z));
+          if (i - walkStart >= walkTicks) break;
+        }
+      }
+      elecHp = s.avatar.HpLostBy(DamageCause::Electric);
+      rec = s.avatar.Shock();
+    }
+    // The avatar's limbs are Jolt bodies the rig's session owns: gone before
+    // the rig is.
+    c.mobs.SetAvatar(nullptr);
+    if (s.avatar.Spawned()) s.avatar.Despawn();
+  }
+  SetCurrentTuning(saved);
+  Regenerate(c);
+  check(spawned, "the avatar never spawned (fly off, def set)");
+  check(elecHp > 0.0f, "no Electric hp on the player's body");
+  check(stunned >= stunTicks / 2,
+        Format("stunned %d ticks (want >= %d of the %d-tick floor)", stunned, stunTicks / 2,
+               stunTicks));
+  check(stillMoved <= stillMax,
+        Format("moved %.2f voxels with FORWARD held while stunned (max %.2f): the command was "
+               "not zeroed",
+               stillMoved, stillMax));
+  check(walkStart >= 0 && walked >= walkMin,
+        Format("after the stun, FORWARD walked %.2f voxels in %d ticks (min %.2f): the control "
+               "arm cannot walk, so the stunned stillness proves nothing",
+               walked, walkTicks, walkMin));
+  detail = Format("player on a spark-fed copper plate (%d ticks): %.2f Electric hp, stunned %d "
+                  "ticks (floor %d), moved %.2f voxels with FORWARD held while stunned (max "
+                  "%.2f), then walked %.2f in %d ticks (min %.2f); shock [%s]%s%s",
+                  feedTicks, elecHp, stunned, stunTicks, stillMoved, stillMax, walked, walkTicks,
+                  walkMin, RecNote(rec).c_str(), fails.empty() ? "" : " | FAILED: ",
+                  fails.c_str());
+  std::printf("elec-player-stun: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ElecMobGates() {
   static const std::vector<Gate> g = {
       {"elec-water-mob", "mob", {}, false, GateElecWaterMob},
       {"elec-stun", "mob", {}, false, GateElecStun},
+      {"elec-player-stun", "mob", {}, false, GateElecPlayerStun},
       {"elec-replay", "mob", {}, false, GateElecReplay},
   };
   return g;

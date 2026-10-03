@@ -387,6 +387,9 @@ void NoteTicketOp(uint32_t tick, const TicketOp& op);
 // Ticket ops that differed from the record (kind / reason / index / chunk),
 // or were missing / extra, since the last ResetReplayStats.
 uint32_t ReplayTicketMismatches();
+// The first four of those, as "tick T pos k: rec <kind/reason #ticket (lo) t>
+// / now <...>" ("rec none": the replay took a decision the record has not).
+const std::string& ReplayTicketMismatchNote();
 // Ticket decisions the replay took since the last ResetReplayStats. Against
 // the record's total, this is the half ReplayTicketMismatches cannot see: a
 // replay that took FEWER decisions than the recording.

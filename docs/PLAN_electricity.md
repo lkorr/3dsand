@@ -7,6 +7,56 @@ lightning is huge. Androids spark when hit instead of leaking coolant. A
 shocked pool shocks the mobs in it. Electrolysis (molten salt -> sodium +
 chlorine) happens in the world as on the bench.
 
+## STATUS (2026-10-03, endgame): COMPLETE
+
+Every package has landed on main; the endgame closed the decay and the
+player gate.
+
+| Package | What | Commits |
+|---|---|---|
+| E5a | Androids spark, no fluid; Electrify reaches powder and gas on the bench | 3eb7e51 |
+| E3 | `arc` / `lightning`, the spark / shock / lightning glyphs, the strike path, storm ground strikes, gate `elec-strike` | 6c55d94 (merge e9ddcfa) |
+| E1 | The charge field: `sim_elec.wgsl`, `src/sim/elec.*`, materials `electric`, gate `elec-field` | 859e40e, 8143b2d |
+| E5b | The charge glow in the raymarch, the F11 charge view | 2357be5 |
+| E4 | Shocks reach bodies: elecQuery, `DamageCause::Electric`, stun / twitch / knock-down / ignite, gates `elec-water-mob`, `elec-stun`, `elec-replay` | f376cd6 |
+| E2 | What charge does in the CA: charge as partner, ohmic ignition / char, crackle, gates `elec-electrolysis`, `elec-ignite`, `elec-crackle-bounded` | ecbfdd6 (main at e772227) |
+| Endgame | Proportional decay (`sim.elecDecayShift`), gate `elec-player-stun`, the ops-replay reporter fix | branch `worktree-agent-a73d261dd6db03139` |
+
+**Decay (endgame).** A stored P now loses `max(sim.elecDecay, P >>
+sim.elecDecayShift)` a tick (8 and 3), taken off the whole stored field --
+own cells and halo alike -- in round 0. With no source: lightning 30,000 is
+gone in 55 ticks (under `gore.shockMinP` 60 after 47), an arc's 2,000 in 35,
+a spark's 200 in 17. It was a flat 8: 3,750 / 250 / 25. A held source loses
+nothing within `sim.elecRounds` chunks and 7/8 per `elecRounds` chunks
+beyond that (a held arc still holds ~450 at the far end of a 512-cell copper
+wire). Why it is not applied to the self term only: DESIGN.md "Electricity
+-- charge field", "Decay is PROPORTIONAL above a floor".
+
+**Gates (endgame `--verify`, all PASS):** elec-field (fade 19 ticks, was
+~25), elec-electrolysis, elec-ignite, elec-crackle-bounded (now at the game's
+own decay: every page back 55 ticks after the source; `elecCrackle.decay` 0),
+elec-water-mob, elec-stun, elec-player-stun (new), elec-replay, elec-strike,
+android-sparks, ops-replay (after the reporter fix).
+
+**Open:**
+- Brine conducts no better than fresh water (the field does not read the
+  solute layer).
+- The glow is emission only (lights no neighbour) and does not reach plants,
+  raster bodies or the far cascade.
+- The strike's target scan starts 24 cells over the aim, so a tree taller
+  than that is struck inside its canopy; no thunder sample is recorded.
+- `ops-replay`'s ticket arm no longer reaches its release: the gate's poured
+  sand pile (1,024 cells, ticket chunk lo+(1,2,2)) still has grains moving
+  at tick 200 (MOVE+powder every snapshot; 3 sand words change in the last
+  tick), so the ticket never idles out and the record holds one decision
+  (the activation) where it held two. Not electricity: every charge path in
+  sim_step skips ticket slots (`gInTicket`) and no electricity commit touches
+  powder motion. It arrived between 716e8ba (02:31, release seen) and 3eb7e51
+  (the first electricity commit); the leading candidate is 1d5f52a ("Worldgen
+  lays each powder at its own repose; author sand 34"), the others in range
+  that touch the CA are 8414b13 (per-colour work lists, sparse cell pools)
+  and c2be48c (camask publishes the chunk's own repose snapshot).
+
 ## Owner decisions (2026-10-03)
 
 - **Speed: a visible fast pulse,** ~50-100 cells/tick (several chunk-hops
@@ -170,8 +220,9 @@ shocks reach bodies" is the as-built account; `game/mob_shock.cpp`,
 `elec-replay`. Differences from the sketch below: the answers ride the
 SNAPSHOT RING (K = World::kSnapshotLatency, consumed at T + K + 1), not a
 one-tick readback; the stun is `Mob::stunUntil_` (a tick); the ragdoll knob
-is `gore.shockRagdollP`; corpses do not ask. Open: `sim.elecDecay` is linear,
-so residual charge stays lethal for a long time (see DESIGN.md).
+is `gore.shockRagdollP`; corpses do not ask. (Was open: `sim.elecDecay` was
+linear, so residual charge stayed lethal for a long time -- closed by the
+endgame's proportional decay, see STATUS.)
 
 - **Query kernel.** The CPU uploads up to N limb boxes for the
   nearby/visible bodies; the GPU writes max `P` and the conductive-contact

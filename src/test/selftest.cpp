@@ -962,6 +962,9 @@ const char* const kOrder[] = {
     // Each spawns under an IdCounterScope, resets the mobs and regenerates
     // the world on the way out.
     "elec-water-mob", "elec-stun", "elec-replay",
+    // The endgame: the PLAYER stunned (TickAuthority zeroes its command), on
+    // the rig session's own avatar; despawned and regenerated on the way out.
+    "elec-player-stun",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

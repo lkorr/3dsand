@@ -2510,8 +2510,11 @@ struct Tuning {
     int elecMode = TPD(sim, elecMode);
     // Rounds a tick; the field crosses one chunk (16 cells) per round.
     int elecRounds = TPD(sim, elecRounds);
-    // Potential every charged cell loses per tick (the fade without a source).
+    // The decay floor: every charged cell loses at least this per tick.
     int elecDecay = TPD(sim, elecDecay);
+    // Proportional decay: a cell loses max(elecDecay, P >> elecDecayShift) a
+    // tick (0 = linear only). Taken off the whole stored field once a tick.
+    int elecDecayShift = TPD(sim, elecDecayShift);
     // Resist of a cell under a full conducting coat (water); thinner = worse.
     int elecWetResist = TPD(sim, elecWetResist);
     // E2 (sim_step.wgsl): P at which a cell counts as touching a discharge for

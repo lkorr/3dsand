@@ -3375,7 +3375,7 @@ _ELEC_CONSTS = {
     "EP_IGNITE_Q": "kEpIgniteQ", "EP_CRACKLE_Q": "kEpCrackleQ",
     "EP_CRACKLE_LO_P": "kEpCrackleLoP", "EP_CRACKLE_LO_MAT": "kEpCrackleLoMat",
     "EP_CRACKLE_HI_P": "kEpCrackleHiP", "EP_CRACKLE_HI_MAT": "kEpCrackleHiMat",
-    "EP_ELEC_TAG": "kEpElecTag",
+    "EP_ELEC_TAG": "kEpElecTag", "EP_DECAY_SHIFT": "kEpDecayShift",
     # The body query (package E4): boxes in elecParams' tail, answers in elecMeta's.
     "EM_QUERY": "kEmQuery", "EP_QUERY": "kEpQuery", "EP_QUERY_BOXES": "kEpQueryBoxes",
     "ELEC_QUERY_MAX": "kElecQueryMax", "ELEC_QUERY_BOX_WORDS": "kElecQueryBoxWords",

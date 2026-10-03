@@ -441,9 +441,10 @@ Status GateElecField(Ctx& c, std::string& detail) {
 //                      `elecIgnite.sparkIgnitedMax` of their wood cells may
 //                      catch (a spark lights wood rarely). Run twice: the
 //                      census hash of both rooms must agree.
-//   elec-crackle-bounded  lightning down a copper bar in a sealed room (with
-//                      sim.elecDecay raised to `elecCrackle.decay` so the fade
-//                      fits a gate; the bound does not depend on it): the bar
+//   elec-crackle-bounded  lightning down a copper bar in a sealed room (the
+//                      game's own decay since the endgame's proportional decay
+//                      fades 30,000 in ~55 ticks; `elecCrackle.decay` > 0 still
+//                      overrides the floor -- the bound does not depend on it): the bar
 //                      must crackle arcs while fed, and after the source stops
 //                      every page must be freed, no crackle cell may remain
 //                      and nothing may crackle after the field is gone, and
@@ -742,12 +743,15 @@ Status GateElecCrackleBounded(Ctx& c, std::string& detail) {
     std::printf("elec-crackle-bounded: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
-  const int decay = (int)BaselineNumber("elecCrackle.decay", 200);
+  // 0 = the game's own decay (floor + proportional); > 0 overrides the floor.
+  const int decay = (int)BaselineNumber("elecCrackle.decay", 0);
   const int hold = (int)BaselineNumber("elecCrackle.holdTicks", 15);
   const int fadeMax = (int)BaselineNumber("elecCrackle.fadeTicksMax", 260);
   const int settle = (int)BaselineNumber("elecCrackle.settleTicks", 90);
   const uint32_t awakeMax = (uint32_t)BaselineNumber("elecCrackle.awakeMax", 32);
   ElecFixtureTuning tune(decay);
+  const int decayFloor = CurrentTuning().sim.elecDecay;
+  const int decayShift = CurrentTuning().sim.elecDecayShift;
   Regenerate(c);
   // A sealed room, a 32-cell bar on its floor, the lightning pocket at x 39.
   constexpr int kY = 150, kZ = 130, kX0 = 40, kN = 32;
@@ -808,12 +812,12 @@ Status GateElecCrackleBounded(Ctx& c, std::string& detail) {
   const bool idle = awake <= awakeMax;
   const bool ok = crackled && faded && quiet && idle;
   detail = Format(
-      "lightning down a %d-cell copper bar for %d ticks (sim.elecDecay %d): crackle seen %u "
+      "lightning down a %d-cell copper bar for %d ticks (sim.elecDecay %d, shift %d): crackle seen %u "
       "arc / %u spark cell-ticks while fed %s; source gone: %u arc / %u spark cell-ticks, the "
       "last at fade tick %d, every page freed at tick %d (max %d) %s; %u crackle cell-ticks in "
       "the 20 after %s; %u chunks awake %d ticks later (max %u) %s; pages %u, P peak %u, "
       "purges %u",
-      kN, hold, decay, arcsHold, sparksHold, crackled ? "OK" : "NO CRACKLE", arcsFade,
+      kN, hold, decayFloor, decayShift, arcsHold, sparksHold, crackled ? "OK" : "NO CRACKLE", arcsFade,
       sparksFade, lastCrackle, fadeTick, fadeMax, faded ? "OK" : "NEVER FADED", lateCrackle,
       quiet ? "OK" : "SELF-SUSTAINING", awake, settle, awakeMax, idle ? "OK" : "FAIL",
       pagesEnd, hdr[kEmPPeak], hdr[kEmPurges]);

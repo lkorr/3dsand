@@ -3291,6 +3291,7 @@ void Simulation::PrepareElec(const rhi::Queue& queue) {
   hdr[kEpRounds] = on ? (uint32_t)std::clamp(tn.sim.elecRounds, 1, (int)kElecRoundsMax) : 1u;
   hdr[kEpDecay] = (uint32_t)std::clamp(tn.sim.elecDecay, 0, (int)kElecPMax);
   hdr[kEpIterCap] = kElecIterCap;
+  hdr[kEpDecayShift] = (uint32_t)std::clamp(tn.sim.elecDecayShift, 0, 15);
   const uint32_t wet = (uint32_t)std::clamp(tn.sim.elecWetResist, 1, (int)kElecResistInsulator - 1);
   for (uint32_t a = 0; a < 16; a++) hdr[kEpWet + a] = ElecWetResist(wet, a);
   // E2 (sim_step.wgsl). The two gains are per-mille per 1,000 units, i.e. x2

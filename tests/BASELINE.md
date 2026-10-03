@@ -1168,3 +1168,23 @@ result on HEAD's exe + assets and on this tree: `evaporation` FAILS on both
 (pond surface 11/289 after 2500 noon ticks -- not this package; recorded
 "pass" in baseline.json), `mob-burn` known-failing. `gas-leave` under
 `--vk-validation`: 0 messages. Not rebaselined here (package rule).
+
+## 2026-10-03 — electricity endgame: `determinismHash` b2514936 -> 0fa43063 (re-pinned)
+
+Recorded with `--selftest --gate determinism --rebaseline` on the endgame tree
+(main e772227 + the endgame branch); twice-run reproduces. The value was
+ALREADY 0fa43063 on main before any electricity package (the fire-gpu and
+ca-chunk-overhead entries above saw it on their trees and left it to the
+orchestrator). Electricity E1-E5 and the endgame's proportional charge decay
+(`sim.elecDecayShift`) leave it there: the determinism scene lays no electric
+source and the charge field is unhashed, so only what charge DOES in the CA
+could move it. This re-pin records the earlier upstream move (the repose
+package, per those entries), not an electricity change.
+
+Other keys changed in the same commit: `elecCrackle.decay` 200 -> 0 (the gate
+now runs the game's own proportional decay; every page is back 55 ticks after
+the source), new `elecPlayerStun.*` thresholds for gate `elec-player-stun`,
+and the `_elec_about` / `_elecE2_about` texts. `ops-replay` is green again:
+its red was a reporter artifact (the per-tick ticket stash carried from the
+recording into the replay); docs/PLAN_electricity.md STATUS has the
+attribution, including why its ticket no longer idles out (not electricity).

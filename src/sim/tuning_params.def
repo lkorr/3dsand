@@ -811,11 +811,21 @@ TP_I(sim, elecMode, NO_WGSL, 1, 0, 1)
 // charge cross ONE chunk face, so the field advances elecRounds x 16 cells a
 // tick (4 = 64, the owner's visible fast pulse). The cost is linear in it.
 TP_I(sim, elecRounds, NO_WGSL, 4, 1, 8)
-// Potential lost by EVERY charged cell each tick, so a field without a source
-// fades in (its peak / elecDecay) ticks: a spark's 200 is gone ~25 ticks after
-// the spark. A held source loses ~elecDecay per elecRounds chunks of distance
-// (the far end is rebuilt only elecRounds chunks a tick).
+// THE DECAY FLOOR: every charged cell loses at least this much potential a
+// tick. The decay is max(elecDecay, P >> elecDecayShift) -- proportional above
+// P = elecDecay << elecDecayShift (64 at 8 / 3), linear below it -- so a small
+// charge fades as a straight line and a big one geometrically.
 TP_I(sim, elecDecay, NO_WGSL, 8, 1, 4096)
+// THE PROPORTIONAL DECAY: a cell above the floor loses P >> elecDecayShift a
+// tick (3 = 1/8). 0 = off (linear elecDecay only, 30,000 lightning lethal
+// ~2 minutes). At 8 / 3 with no source: lightning 30,000 gone in 55 ticks, an
+// arc 2,000 in 35, a spark 200 in 17 (linear: 3,750 / 250 / 25). It is taken
+// off the whole stored field (own value AND halo) in round 0, never per hop: a
+// held source rebuilds elecRounds chunks a tick at full strength, and only
+// beyond that does the field compound 7/8 per elecRounds chunks (a held arc
+// still holds ~450 at the far side of a 512-cell copper wire). DESIGN.md
+// "Electricity -- charge field" has why it cannot be the self term only.
+TP_I(sim, elecDecayShift, NO_WGSL, 3, 0, 15)
 // The resist of a cell under a FULL conducting coat (water, blood: stain amount
 // 15). A thinner coat is proportionally worse (resist x 15 / amount). A wet
 // plank (60 dry) or wet stone (an insulator dry) carries charge through it.

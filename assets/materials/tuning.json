@@ -550,6 +550,7 @@
     "elecMode": 1,
     "elecRounds": 4,
     "elecDecay": 8,
+    "elecDecayShift": 3,
     "elecWetResist": 12,
     "elecReactMin": 16,
     "elecReactFull": 1000,

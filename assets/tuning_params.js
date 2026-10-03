@@ -301,6 +301,7 @@ const TUNING_PARAMS = {
   'sim.elecMode':{t:'i',def:1,min:0,max:1},
   'sim.elecRounds':{t:'i',def:4,min:1,max:8},
   'sim.elecDecay':{t:'i',def:8,min:1,max:4096},
+  'sim.elecDecayShift':{t:'i',def:3,min:0,max:15},
   'sim.elecWetResist':{t:'i',def:12,min:1,max:254},
   'sim.elecReactMin':{t:'i',def:16,min:1,max:65535},
   'sim.elecReactFull':{t:'i',def:1000,min:1,max:65535},

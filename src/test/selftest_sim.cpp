@@ -5234,10 +5234,25 @@ std::vector<CellOp> TicketPour(const World& world, IVec3 centre, uint32_t seed) 
   return pour;
 }
 
+// The DIRTY_R_* names of a reason word, "+"-joined.
+std::string ReasonNames(uint32_t w) {
+  std::string s;
+  for (int b = 0; b < kDirtyReasonBits; b++)
+    if (w & (1u << b)) {
+      if (!s.empty()) s += "+";
+      s += kDirtyReasonName[b];
+    }
+  return s.empty() ? "none" : s;
+}
+
 // Drive one pass of the scene, collecting a hash every kProbeEvery ticks.
-// `ticketPour`: how many sand cells the ticket arm poured.
+// `ticketPour`: how many sand cells the ticket arm poured. `ticketNote`:
+// ATTRIBUTION (CLAUDE.md rule 6) for a ticket that never idled out -- its
+// state at the end, its clean-snapshot streak, how many interior chunks the
+// last snapshot had dirty, and (World::SetDirtyWatch, kept on one of them)
+// every DIRTY_R_* reason that watched chunk showed after the pour.
 void RunScene(Ctx& c, const Scene& sc, std::vector<uint32_t>& hashes,
-              uint32_t& ticketPour) {
+              uint32_t& ticketPour, std::string* ticketNote = nullptr) {
   // The store starts empty (and every ticket dropped): pass B must not find
   // pass A's released pile in it — that would be the store working, not a
   // replay reproducing.
@@ -5247,11 +5262,33 @@ void RunScene(Ctx& c, const Scene& sc, std::vector<uint32_t>& hashes,
   hashes.clear();
   const IVec3 tc = TicketCentre(c.world, sc.seed);
   ticketPour = 0;
+  uint32_t watch = 0xFFFFFFFFu, watchOr = 0, watchLast = 0, watchLastTick = 0;
+  // The watched chunk's words on the last two ticks: progress or a cycle?
+  std::vector<uint32_t> wPrev(kChunkVol, 0u), wLast(kChunkVol, 0u);
+  bool haveWords = false;
   for (uint32_t t = 1; t <= (uint32_t)kTicks; t++) {
     if (t == kTicketReqTick) c.stream.TicketSet().Request(tc, TicketReason::Gate, t);
     // The between-ticks ticket step (Stream::Update's, which this harness
     // does not run), before the tick's submit as in the game.
     c.stream.TicketTick(t);
+    if (ticketNote && t > kTicketPourTick) {
+      // The watched slot's reasons, K ticks latent (readback only: no sim
+      // input). Keep watching one dirty interior chunk while it stays dirty.
+      const uint32_t w = c.world.Snap().watchReason;
+      if (watch != 0xFFFFFFFFu && w != 0) {
+        watchOr |= w;
+        watchLast = w;
+        watchLastTick = t;
+      }
+      const uint32_t ti = c.stream.TicketSet().TicketHolding(tc);
+      if (ti < kTicketMax) {
+        const std::vector<uint32_t> ds = c.stream.TicketSet().DirtyInteriorSlots(ti);
+        if (!ds.empty() && std::find(ds.begin(), ds.end(), watch) == ds.end()) {
+          watch = ds[0];
+          c.world.SetDirtyWatch(watch);
+        }
+      }
+    }
     std::vector<CellOp> cells = sc.Cells(t);
     if (t == kTicketPourTick) {
       const std::vector<CellOp> pour = TicketPour(c.world, tc, sc.seed);
@@ -5262,7 +5299,57 @@ void RunScene(Ctx& c, const Scene& sc, std::vector<uint32_t>& hashes,
                cells, true, {8, 3, 8}, false, t >= 60);
     if (t % kProbeEvery == 0 || t == (uint32_t)kTicks)
       hashes.push_back(ReadHashSync(c.ctx, c.world));
+    if (ticketNote && watch != 0xFFFFFFFFu && t + 1 >= (uint32_t)kTicks) {
+      wPrev = wLast;
+      ReadVoxelsSync(c.ctx, c.world, watch, 1, wLast.data(), "opsReplayWatch");
+      haveWords = t == (uint32_t)kTicks;
+    }
   }
+  if (!ticketNote) return;
+  c.world.SetDirtyWatch(0xFFFFFFFFu);
+  const uint32_t ti = c.stream.TicketSet().TicketHolding(tc);
+  if (ti >= kTicketMax) {
+    *ticketNote = "ticket gone by the end (released)";
+    return;
+  }
+  const std::vector<uint32_t> ds = c.stream.TicketSet().DirtyInteriorSlots(ti);
+  std::string chunk = "-";
+  if (watch != 0xFFFFFFFFu) {
+    const IVec3 wc = c.world.TicketSlotWorldChunk(watch);
+    const IVec3 lo = c.stream.TicketSet().BoxLo(ti);
+    chunk = Format("(%d,%d,%d) = lo+(%d,%d,%d)", wc.x, wc.y, wc.z, wc.x - lo.x, wc.y - lo.y,
+                   wc.z - lo.z);
+  }
+  // What the watched chunk holds and how much of it changed in the last tick
+  // (material ids; the stamp / excite scratch masked off).
+  std::string words = "";
+  if (haveWords) {
+    uint32_t sand = 0, water = 0, air = 0, other = 0, moved = 0, sandMoved = 0;
+    int sandY0 = 99, sandY1 = -1;
+    for (uint32_t k = 0; k < kChunkVol; k++) {
+      const uint32_t m = wLast[k] & 0xFFFu;
+      if (m == kMatSand) {
+        sand++;
+        sandY0 = std::min(sandY0, (int)((k >> 4) & 15u));
+        sandY1 = std::max(sandY1, (int)((k >> 4) & 15u));
+      } else if (m == kMatWater) water++;
+      else if (m == 0) air++;
+      else other++;
+      if ((wLast[k] & ~0x00FF0000u) != (wPrev[k] & ~0x00FF0000u)) {
+        moved++;
+        if (m == kMatSand || (wPrev[k] & 0xFFFu) == kMatSand) sandMoved++;
+      }
+    }
+    words = Format("; its last tick: sand %u (local y %d..%d), water %u, air %u, other %u; %u "
+                   "words changed, %u of them sand cells",
+                   sand, sandY0, sandY1, water, air, other, moved, sandMoved);
+  }
+  *ticketNote = Format(
+      "ticket #%u still LIVE at tick %d: idle %u/%u snapshots, %zu interior chunks dirty in "
+      "the last; watched %s: reasons seen %s, last %s at tick %u%s",
+      ti, kTicks, c.stream.TicketSet().IdleSnaps(ti), kTicketIdleTicks, ds.size(),
+      chunk.c_str(), ReasonNames(watchOr).c_str(), ReasonNames(watchLast).c_str(),
+      watchLastTick, words.c_str());
 }
 
 }  // namespace opsreplay
@@ -5296,7 +5383,8 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
   std::vector<uint32_t> hashA;
   uint32_t ticketPour = 0;
   const uint64_t act0 = c.stream.TicketSet().Stats().activated;
-  RunScene(c, sc, hashA, ticketPour);
+  std::string ticketNoteA;
+  RunScene(c, sc, hashA, ticketPour, &ticketNoteA);
   const uint64_t ticketActA = c.stream.TicketSet().Stats().activated - act0;
   const uint32_t matBrushA = MatAt(c.ctx, c.world, sc.BrushProbe());
   const uint32_t matCtrlA = MatAt(c.ctx, c.world, sc.BrushControl());
@@ -5327,7 +5415,14 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
   c.ctx.WaitIdle();
   std::vector<uint32_t> hashB;
   uint32_t ticketOpsRecorded = 0;
-  for (const ops::Frame& f : log.frames) ticketOpsRecorded += (uint32_t)f.tickets.size();
+  std::string ticketOpsList;
+  for (const ops::Frame& f : log.frames) {
+    ticketOpsRecorded += (uint32_t)f.tickets.size();
+    for (const TicketOp& o : f.tickets)
+      ticketOpsList += Format("%st%u kind %u %s #%u (%d,%d,%d)", ticketOpsList.empty() ? "" : ", ",
+                              f.in.tick, o.kind, TicketReasonName(o.reason), o.ticket, o.wc[0],
+                              o.wc[1], o.wc[2]);
+  }
   for (const ops::Frame& f : log.frames) {
     // THE TICKET STEP, re-derived (oprecord.h InjectTicketRequestsIfReplaying):
     // the gate's own request comes back from the recorded activation, and
@@ -5388,8 +5483,9 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
                 (unsigned long long)ticketActA, ticketPour));
   if (ticketMiss != 0 || ticketOpsReplayed != ticketOpsRecorded)
     fail(Format("ticket decisions diverged on replay: %u differed, %u taken vs %u "
-                "recorded",
-                ticketMiss, ticketOpsReplayed, ticketOpsRecorded));
+                "recorded [recorded: %s] [first mismatches: %s]",
+                ticketMiss, ticketOpsReplayed, ticketOpsRecorded, ticketOpsList.c_str(),
+                ops::ReplayTicketMismatchNote().c_str()));
   // L5: the contested brush cell belongs to op index 0 (stone), not op 1
   // (wood), and it says so on BOTH runs.
   if (matCtrlA != kMatStone)
@@ -5424,15 +5520,15 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
     std::snprintf(note, sizeof(note), ", record %llu B", (unsigned long long)bytes);
 
   const ops::StreamCounts& sccount = ops::Counts();
-  char buf[960];
+  char buf[2400];
   std::snprintf(buf, sizeof(buf),
                 "%s (%u frames, %zu hash probes reproduced%s | contested brush "
                 "cell -> mat %u on both runs | ticket: %u decisions recorded, %u "
-                "replayed, %u differed, %u sand poured | cell dupes dropped %u "
+                "replayed, %u differed, %u sand poured [%s] | cell dupes dropped %u "
                 "over %u ticks | clamps b%u e%u c%u s%u f%u%s%s)",
                 fails.empty() ? "PASS" : "FAIL", frames, hashA.size(), note,
                 matBrushA, ticketOpsRecorded, ticketOpsReplayed, ticketMiss,
-                ticketPour, sccount.cellDupes, sccount.ticksWithDupes,
+                ticketPour, ticketNoteA.c_str(), sccount.cellDupes, sccount.ticksWithDupes,
                 sccount.brushTrunc, sccount.expTrunc, sccount.cellTrunc,
                 sccount.spawnTrunc, sccount.fluidTrunc,
                 fails.empty() ? "" : " | ", fails.c_str());

@@ -156,6 +156,11 @@ class Tickets {
   uint32_t ReleasedTick(uint32_t i) const { return t_[i].releaseTick; }
   // The live ticket whose box holds `chunk`, or kTicketMax.
   uint32_t TicketHolding(IVec3 chunk) const;
+  // ATTRIBUTION (CLAUDE.md rule 6), for gates: why has a live ticket not idled
+  // out? Its consecutive clean snapshots, and the slots of the INTERIOR chunks
+  // dirty in the last folded snapshot (World::SetDirtyWatch names the reason).
+  uint32_t IdleSnaps(uint32_t i) const { return t_[i].idleSnaps; }
+  std::vector<uint32_t> DirtyInteriorSlots(uint32_t i) const;
   // The chunks the far landings held right now are waiting on (gates).
   std::vector<IVec3> LandingChunks() const {
     std::vector<IVec3> v;

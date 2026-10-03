@@ -23,7 +23,7 @@
 //               mark, or free an all-zero page
 //   elecPurge   one group per chunk of a field nothing kept awake (rare)
 //
-// THE UPDATE: P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay) >= 0 in
+// THE UPDATE: P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay(P)) >= 0 in
 // a conducting cell; an insulator holds its seed (0 unless it is a source).
 // The decay is taken once a tick, in round 0, off every stored value the
 // round reads (its own and its halo). Within a round the chunk iterates AXIS
@@ -124,6 +124,7 @@ const EP_MODE : u32 = 0u;
 const EP_ROUNDS : u32 = 1u;
 const EP_DECAY : u32 = 2u;
 const EP_ITER_CAP : u32 = 3u;
+const EP_DECAY_SHIFT : u32 = 13u;
 const EP_WET : u32 = 16u;
 const EP_MAT : u32 = 32u;
 const EP_MAT_STRIDE : u32 = 4u;
@@ -146,6 +147,18 @@ fn elecSetArgs(rec : u32, x : u32) {
   atomicStore(&elecMeta[o + 2u], 1u);
 }
 fn elecSub(a : u32, b : u32) -> u32 { return select(0u, a - b, a > b); }
+// THE DECAY of a stored value (round 0 only; `floor` is 0 in later rounds, and
+// so is the whole decay): max(floor, p >> shift), shift 0 = linear only.
+// Proportional above floor << shift, so lightning's 30,000 is gone in ~55
+// ticks, not 3,750. Applied to the OWN value and the HALO alike -- the whole
+// stored field decays before the rounds relax it (DESIGN.md: a self-only decay
+// lets two chunks hold each other up across their face).
+fn elecDecayed(p : u32, floor : u32, shift : u32) -> u32 {
+  if (floor == 0u) { return p; }
+  var d = floor;
+  if (shift != 0u) { d = max(d, p >> shift); }
+  return elecSub(p, d);
+}
 
 // The resist of the cell holding word w: 1..254, or ELEC_RES_INS. THE WET
 // RULE: a cell under a coat whose material conducts (water, blood, brine's
@@ -376,7 +389,8 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
   let r = atomicLoad(&elecMeta[EM_PHASE]) - 1u;   // the head alloc made it 1
   let src = page + (r & 1u) * ELEC_HALF_WORDS;
   let dst = page + (1u - (r & 1u)) * ELEC_HALF_WORDS;
-  let decay = select(0u, elecParams[EP_DECAY], r == 0u);
+  let decay = select(0u, max(elecParams[EP_DECAY], 1u), r == 0u);
+  let decayShift = min(elecParams[EP_DECAY_SHIFT], 15u);
   let mode = elecMode();
   let wc = slotWorldChunk(slot, T.origin);
   let pe = pageEntryOf(slot);
@@ -399,7 +413,7 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
     var p = seed;
     if (res != ELEC_RES_INS) {
       let old = (elecPool[src + (i >> 1u)] >> ((i & 1u) * 16u)) & 0xFFFFu;
-      p = max(p, elecSub(old, decay));
+      p = max(p, elecDecayed(old, decay, decayShift));
     }
     wgP[i] = p | (res << 16u);
   }
@@ -416,7 +430,7 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
           let nl = elecFaceCell(f, k & 15u, (k >> 4u) & 15u, false);
           let nsrc = (ne & ELEC_ENTRY_PAGE) * ELEC_PAGE_WORDS + (r & 1u) * ELEC_HALF_WORDS;
           let old = (elecPool[nsrc + (nl >> 1u)] >> ((nl & 1u) * 16u)) & 0xFFFFu;
-          v = elecSub(old, decay);
+          v = elecDecayed(old, decay, decayShift);
         }
       }
     }

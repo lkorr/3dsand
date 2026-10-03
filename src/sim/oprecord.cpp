@@ -57,6 +57,10 @@ uint32_t g_ticketTick = 0xFFFFFFFFu;
 std::vector<TicketOp> g_tickets;
 uint32_t g_replayTicketMismatch = 0;
 uint32_t g_replayTicketOps = 0;   // decisions the replay took (compared or not)
+// ATTRIBUTION (CLAUDE.md rule 6): "1 differed" is a bare count. The first few
+// mismatches, each as "t<tick>#<pos> rec <op> / now <op>", name the field.
+std::string g_replayTicketNote;
+uint32_t g_replayTicketNoted = 0;
 // The player's command for the tick named by g_cmdTick (package N2).
 uint32_t g_cmdTick = 0xFFFFFFFFu;
 TickInput g_cmd{};
@@ -262,6 +266,9 @@ uint32_t MaterialTableHash(const std::vector<MaterialDef>& mats) {
 
 bool StartRecording(const std::string& path, uint32_t seed,
                     const std::vector<MaterialDef>& mats, std::string& err) {
+  // A recording starts with an empty ticket stash too (see ResetReplayStats).
+  g_ticketTick = 0xFFFFFFFFu;
+  g_tickets.clear();
   StopRecording();
   g_rec = std::fopen(path.c_str(), "wb");
   if (!g_rec) {
@@ -332,20 +339,36 @@ void NoteTicketOp(uint32_t tick, const TicketOp& op) {
   g_tickets.push_back(op);
   if (!g_replay) return;
   g_replayTicketOps++;
+  auto note = [&](const TicketOp* r) {
+    g_replayTicketMismatch++;
+    if (g_replayTicketNoted++ >= 4) return;
+    auto fmt = [](const TicketOp& o, char* out, size_t n) {
+      static const char* kKind[] = {"?", "activate", "release", "refuse", "recentre"};
+      std::snprintf(out, n, "%s/%s #%u (%d,%d,%d) t%u", kKind[o.kind <= 4 ? o.kind : 0],
+                    TicketReasonName(o.reason), o.ticket, o.wc[0], o.wc[1], o.wc[2], o.tick);
+    };
+    char a[112] = "none", b[112], buf[280];
+    if (r) fmt(*r, a, sizeof a);
+    fmt(op, b, sizeof b);
+    std::snprintf(buf, sizeof buf, "%stick %u pos %zu: rec %s / now %s",
+                  g_replayTicketNote.empty() ? "" : ", ", tick, at, a, b);
+    g_replayTicketNote += buf;
+  };
   // THE REPLAY HALF: the decision at this position must be the recorded one.
   for (const Frame& f : g_replay->frames) {
     if (f.in.tick != tick) continue;
-    if (at >= f.tickets.size()) { g_replayTicketMismatch++; return; }
+    if (at >= f.tickets.size()) { note(nullptr); return; }
     const TicketOp& r = f.tickets[at];
     if (r.kind != op.kind || r.reason != op.reason || r.ticket != op.ticket ||
         r.wc[0] != op.wc[0] || r.wc[1] != op.wc[1] || r.wc[2] != op.wc[2])
-      g_replayTicketMismatch++;
+      note(&r);
     return;
   }
-  g_replayTicketMismatch++;  // a decision on a tick the record has no frame for
+  note(nullptr);  // a decision on a tick the record has no frame for
 }
 
 uint32_t ReplayTicketMismatches() { return g_replayTicketMismatch; }
+const std::string& ReplayTicketMismatchNote() { return g_replayTicketNote; }
 uint32_t ReplayTicketOps() { return g_replayTicketOps; }
 
 uint32_t InjectTicketRequestsIfReplaying(uint32_t tick, ::Tickets& tickets) {
@@ -518,6 +541,18 @@ void ResetReplayStats() {
   g_replayReplaceRefusals = 0;
   g_replayTicketMismatch = 0;
   g_replayTicketOps = 0;
+  g_replayTicketNote.clear();
+  g_replayTicketNoted = 0;
+  // THE PER-TICK STASH STARTS EMPTY. It is keyed by tick number and cleared
+  // only when a NEW tick number arrives, so without this a replay inherited
+  // the recording's last stash: when the recording's last ticket decision and
+  // the replay's first fell on the same tick number (ops-replay: the gate's
+  // activation at tick 10, and a pile that no longer idles out, so nothing
+  // after it), the replay's decision was compared at position 1, against
+  // "none" -- a mismatch the record never had (2026-10-03, electricity
+  // endgame: "1 recorded, 1 replayed, 1 differed").
+  g_ticketTick = 0xFFFFFFFFu;
+  g_tickets.clear();
 }
 
 uint32_t ReplaceChunksIfReplaying(uint32_t tick, ::Stream& stream) {
