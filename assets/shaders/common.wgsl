@@ -138,7 +138,8 @@ struct Material {
   // sim. Authored in materials.json as `"repose": 34`; see materials.h
   // kRepose* / kMatRepose* for the codes, the packing and the tier ladder.
   //
-  // READ BY sim_step.wgsl ONLY. The REPOSE_* codes and the shift/mask
+  // READ BY sim_step.wgsl (the CA) and worldgen.wgsl (which lays loose cover
+  // only where this angle holds it; reposeEighthsOf below). The REPOSE_* codes and the shift/mask
   // constants are EMITTED by ShaderConstantPrelude() from those same C++
   // definitions rather than restated in either file -- two places that must
   // agree is the bug this repo has checkers for, and scripts/check_shaders.sh
@@ -166,6 +167,38 @@ struct Material {
   _r2         : u32,
   _r3         : u32,
 };
+
+// ---- A POWDER'S REPOSE IN EIGHTHS (two shaders must agree on it) ----------
+// The material's threshold in eighths of rise per cell of run, from its packed
+// `repose` word: the number sim_step.wgsl's sub-voxel repose (tryFineRepose,
+// fineDiagSteep) compares a column-top drop against, AND the number
+// worldgen.wgsl lays loose cover against (looseStep, looseCoverDepth) so a
+// generated slope is already at rest under it. Here because those two must
+// agree: if they did not, a freshly generated dune would creep on tick 1.
+//
+// The tier codes' eighths: 3:1 -> 3, 2:1 -> 4, 1:1 -> 8 (the word 0, so every
+// material that authors no `repose` reads 8), 1:2 -> 16, 1:3 -> 24. A BLENDED
+// word mixes its two tiers by the blend weight as one per-MATERIAL number,
+// never the per-grain positional roll the whole-cell tiers use: two
+// neighbouring columns must agree on T or a surface could be at rest from one
+// side and not the other.
+fn reposeTierEighths(code : u32) -> u32 {
+  switch (code) {
+    case REPOSE_3_1: { return 3u; }
+    case REPOSE_2_1: { return 4u; }
+    case REPOSE_1_2: { return 16u; }
+    case REPOSE_1_3: { return 24u; }
+    default: { return 8u; }
+  }
+}
+fn reposeEighthsOf(repose : u32) -> u32 {
+  let a = (repose >> MAT_REPOSE_A_SHIFT) & MAT_REPOSE_A_MASK;
+  let blend = (repose >> MAT_REPOSE_BLEND_SHIFT) & MAT_REPOSE_BLEND_MASK;
+  let ta = reposeTierEighths(a);
+  if (blend == 0u) { return ta; }
+  let tb = reposeTierEighths((repose >> MAT_REPOSE_B_SHIFT) & MAT_REPOSE_B_MASK);
+  return (ta * (255u - blend) + tb * blend + 127u) / 255u;
+}
 
 // stainPack accessors — must match kStainPack* in src/sim/materials.h.
 fn matStainType(m : Material)    -> u32 { return m.stainPack & 0x7u; }

@@ -1250,8 +1250,9 @@ SSBO lists of chunk indices.
     definitions, so neither `common.wgsl` nor `sim_step.wgsl` restates them, and
     `scripts/check_shaders.sh` scrapes `materials.h` so a shader edit still
     validates with no build.
-  - **THE FLATTER TIERS CANNOT BE GIVEN TO THE BULK TERRAIN POWDERS YET, and
-    that is measured rather than cautious.** `Land.slope` is documented as
+  - **THE FLATTER TIERS COULD NOT BE GIVEN TO THE BULK TERRAIN POWDERS UNTIL
+    WORLDGEN READ THEM (history; fixed 2026-10-03, see the end of this
+    item), and that was measured rather than cautious.** `Land.slope` is documented as
     "256 == 1 voxel/voxel == repose" (`src/sim/worldmap.h`), and every place
     worldgen decides whether ground is "too steep for a powder bed" — the biome
     skin in `genCellIn`, the sediment wedge's `sedSlope`, the pond bed's
@@ -1271,14 +1272,56 @@ SSBO lists of chunk indices.
     a steep tier only ever REFUSES a move the old rule allowed**, so it cannot
     wake anything 45° did not. That is why `snow` ships at 63° (a packed drift
     holds a steep face) while `sand`, `gravel` and `dirt` keep 45.
-    **Follow-up:** make those worldgen slope gates read the placed material's
-    own repose instead of the constant 45, then author sand 34 in the same
-    commit. That is a worldgen change with its own hash move and its own gates
-    (`terrain`, `waterbody`, `worldmap`, `settle-back`) and it is deliberately
-    not bundled here.
+    **DONE 2026-10-03: worldgen reads each powder's own repose, and sand 34 /
+    gravel 40 / dirt 40 are authored.** One source: worldgen reads the same
+    packed `materials[].repose` word the CA does, through the same
+    `reposeEighthsOf` (moved to `common.wgsl` because the two kernels must
+    agree on T; `sim_step.wgsl`'s `reposeEighths` is now a one-line wrapper).
+    What reads it (`worldgen.wgsl`):
+    - **the landform taper** (`looseCoverDepth`) ends at the MATERIAL's
+      `reposeCapQ8` = T·32 (sand T = 6 → 192) instead of the constant 256,
+      capped at 256 (a steep powder is laid as if 45: conservative). It runs in
+      `genCellIn`, so the far cascades and the near window agree on it;
+    - **the local step line** (`looseStep`, `cols` pre-pass, near only as
+      before) gains two exact rules. FLOWY tiers: a cell holds against stage
+      2b's slide iff per axis direction the first neighbour's ground reaches
+      it or the columns 2..run out reach one below — `reposeRunOf` takes the
+      FLATTER tier of a blended word, so no grain of the positional mixture
+      can find a slide. T < 8: a mid-staircase top cell would need its mass to
+      fall by 8 − T per step forever, so it goes to the firm cover; lips stay
+      4/8 (lip over foot or over a firm mid is D = 4 ≤ T; needs T ≥ 4, below
+      that the lip is firm too). Every T = 8, run 1 material takes the old
+      path bit for bit;
+    - **flowy pond beds**: under water a 2:1 grain still slides (the lateral
+      is water it sinks into; the snapshot reads water as open), so `cols`
+      draws the same line (no mass rule — tryFineRepose never sheds toward
+      water) for a submerged column whose bed powder (`pondBedMat`) has a
+      flowy tier, and `genCellIn` lays the preset's substrate above it. A
+      45-degree bed, and `bowlSteep`'s ring test with its KNOWN GAP, are
+      untouched.
+    - **not the sediment wedge**: `sed` is part of `h` and of the CPU height
+      mirror, and its `sedSlope` (96 Q8) is already under the 2:1 tier's 128;
+      measured, no dirt or gravel grain departs.
+    Measured, `--selftest --gate gen-settle` (harness map, 300 still ticks +
+    48-shift +X flight): authored repose on the OLD worldgen 1,499 modified /
+    1,301 changed chunks, 9,036 departed desert grains, travel 49.5 / 41.4 per
+    streamed plane (FAIL); with this change **120 / 106, 1 departed grain (the
+    treeline snow one), travel 0.0 / 0.0** — below the 45-degree baseline's
+    160 / 132, which is now 105 pond-bed stain chunks and nothing else.
+    Register budget (`--shader-stats`, RTX 3060 Ti, against the same exe on
+    the pre-change shaders): every worldgen entry keeps its register count
+    and spill bytes exactly (worldgen/worldgenList 128 + 800 B, worldgenCols
+    168 + 416 B, far* unchanged); `worldgenCols`' binary grows 1.65 -> 1.83
+    MB because each `colHeightAt` is inlined, which is why `looseStep` has one
+    call site for cover and bed and its far probes are one loop.
+    The `worldmap` gate's skin probe (`selftest_biomes.cpp`) now counts the
+    biome's own `cover.firmSkin` as its skin: its desert sample at (144,426)
+    is on ground steeper than 34° and is generated sandstone, which is the
+    same biome agreeing with its twin, not a mismatch.
   - **Authored:** `snow` 63 (steep), `ash` 40, `dust` 30, `seed` 30 (flowy);
-    `sand`, `gravel`, `dirt` keep the 45° default for the reason above. `mite`
-    keeps it too: it wanders, and its movement is not a pile.
+    `sand` 34, `gravel` 40, `dirt` 40 (the values of the 2026-09-13 A/B
+    above, landed with the worldgen that holds them). `mite` keeps 45: it
+    wanders, and its movement is not a pile.
 - **Liquid**: powder rule + try the four laterally adjacent cells on its own level.
   Plus **fullness equalization**: liquid voxels carry fullness in eighths (the state
   nibble); a cell flows into a lateral neighbor holding ≥ 2 eighths less, RNG on
@@ -4528,6 +4571,10 @@ about it are not obvious and both were measured:
 * With a **solid** grass skin at `y == h` the topmost grain sits at `h−1`, so it
   has a free down-diagonal exactly where a neighbouring column is 3+ voxels
   lower — which is the ground the gate has already taken the wedge to zero on.
+  Dirt and gravel are authored at 40° since 2026-10-03 (a 2:1/1:1 blend, so
+  some grains slide toward a drop two out); the wedge was left alone because
+  `sedSlope` 96 Q8 is already under the 2:1 tier's 128, and `gen-settle`
+  measured zero departed dirt or gravel grains.
 
 `terrain.sedSlope = 0` (map.json, P-G) turns the wedge off. It is a map word
 rather than a tuning row now, so `--sweep` cannot reach it; the `terrain`
@@ -4552,7 +4599,9 @@ never the water. It was the bank falling into it.
 keeps its authored depth on ground the wedge already calls flat
 (`terrain.sedSlope`), tapers to zero at the CA's own angle of repose
 (`CAP_REPOSE_Q8 = 256`, one voxel per column -- not a knob, it is the constant
-`sim_step`'s diagonal slide defines), and whatever the taper takes away becomes
+`sim_step`'s diagonal slide defines; since 2026-10-03 it is the CEILING and the
+taper ends at the loose material's own `reposeCapQ8` = T·32, T read from its
+authored `repose` -- §4 "PER-MATERIAL ANGLE OF REPOSE"), and whatever the taper takes away becomes
 the biome's `cover.firmSkin` (`WM_B_FIRM_COVER`; desert and ocean say
 `sandstone`, a material that far-aliases `sand` so it costs no palette slot).
 On flat ground the loose depth is the full authored 4 and nothing changes.

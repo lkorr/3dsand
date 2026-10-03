@@ -940,3 +940,14 @@ determinism one (DESIGN.md "The edge's refusals are a function of the world").
 - `tree-fell` stays **fail** (suite scope). It passes at gate scope at
   c364516: 0/0/0 burn residue, forced rescan 0/0/0. The suite-scope floater was
   not reproduced, because this package ran no suite.
+## 2026-10-03 — repose: worldgen reads each powder's own repose (hash moves; NOT re-pinned here)
+
+`sand` 34, `gravel` 40, `dirt` 40 are authored in materials.json, and worldgen's
+loose-cover taper, local step line and flowy pond beds read the material's own
+`repose` word (DESIGN.md §4 "PER-MATERIAL ANGLE OF REPOSE"). Powder behaviour
+and the generated desert surface change, so `determinismHash` and the smoke
+tables move: intentional, left for the orchestrator's single re-pin.
+`genSettle.*` caps tightened to the new measurement +5% (settle 120 / 106 ->
+caps 126 / 112; travel 0.0 / 0.0 keeps its 0.5 caps). The control arm (same
+materials, old worldgen) measured 1499 / 1301 and FAILED, which is what this
+gate now guards.
