@@ -636,6 +636,10 @@ const char* const kOrder[] = {
     // reloads the environment and regenerates the window at the origin it
     // found (the structure gates' exit contract).
     "village-harrowby",
+    // The same morning twice in one process, compared bit for bit with Jolt
+    // body attribution (rule 1's in-process half; det-cpu 2026-10-03). Same
+    // exit contract as `village-harrowby`.
+    "village-twice",
     // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
     // exit contract: mobs and debris reset, id counter restored, park function
     // removed, store cleared, and worldgen regenerated at the origin the gate
@@ -1792,6 +1796,14 @@ int Run(Ctx& c, const Options& opt) {
       c.mobs.SetWeatherRain(0u);
       c.mobs.SetRainSlope(0, 0);
       c.mobs.SetDayPhase(0u);
+      // JOLT BODY IDS START FROM A FRESH PROCESS'S STATE (det-cpu 2026-10-03).
+      // Body ids order Jolt's contact solve, and every gate before this one
+      // bumped the per-slot sequence numbers, so the same gate solved its
+      // contacts in another order at suite scope than alone (village-twice
+      // attributed it). Physics allocates the lowest free index, so with the
+      // previous gate's bodies gone this makes the ids this gate gets the
+      // ones it gets standalone. Free slots only: a live body keeps its id.
+      c.phys.ResetBodyIdHistory();
       const IVec3 leakWo = c.world.WindowOrigin();
       const uint32_t leakMobs = c.mobs.MobCount();
       const uint32_t leakDebris = c.debris.BodyCount();

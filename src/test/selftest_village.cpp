@@ -303,13 +303,24 @@ struct DayResult {
   std::vector<CanopyCount> canopy;   // G, read right after worldgen
 };
 
+// `maxTicks` > 0 stops the day after that many traced ticks (village-twice
+// only needs the morning: the first door swings at ~tick 470). `phys`, when
+// given, receives every non-static Jolt body's exact state per traced tick
+// (Physics::DebugBodyStates) for the twice-run attribution.
+using PhysTrace = std::vector<std::vector<Physics::BodyStateBits>>;
 DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
-                 const std::string& shots, uint32_t tickBase) {
+                 const std::string& shots, uint32_t tickBase, int maxTicks = 0,
+                 PhysTrace* phys = nullptr) {
   DayResult out;
+  auto stopped = [&] { return maxTicks > 0 && out.ticks >= maxTicks; };
   c.stream.Store().Clear();
   c.debris.Reset();
   c.mobs.Reset();
   c.mobs.SetNextIdCounter(6000);   // both runs spawn the same ids (hash salts)
+  c.phys.ResetBirthOrdinals();     // village-twice matches bodies by creation order
+  // Everything that held a body was reset above, so no handle can alias: the
+  // day's bodies get the ids a fresh process would give them (det-cpu).
+  c.phys.ResetBodyIdHistory();
   refs::ResetResidents();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
@@ -403,6 +414,25 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
       out.samples.push_back(s);
     }
     out.perTick.push_back(out.trace);
+    if (phys != nullptr) {
+      std::vector<Physics::BodyStateBits> all, keep;
+      c.phys.DebugBodyStates(all);
+      // Static bodies are the terrain patches: their pose never changes, so
+      // only their identity matters -- folded into one pseudo-entry (handle 0)
+      // whose `user` is a hash of the static handle list.
+      uint64_t sh = 1469598103934665603ull;
+      for (const Physics::BodyStateBits& b : all) {
+        if (b.motion == 0) {
+          Mix(sh, (int64_t)b.handle);
+          continue;
+        }
+        keep.push_back(b);
+      }
+      Physics::BodyStateBits st0;
+      st0.user = sh;
+      keep.push_back(st0);
+      phys->push_back(std::move(keep));
+    }
   };
   // Has everyone whose row began since `since` got there? Updates `track`.
   auto settle = [&]() {
@@ -437,7 +467,7 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
   // 05:30: everyone appears (catch-up puts them in bed) and lies down.
   schedule::SetMinuteOverride(5 * 60 + 30);
   int waited = 0;
-  while (waited < 600) {
+  while (waited < 600 && !stopped()) {
     support::RunTicks(*rig, 1);
     traceTick();
     waited++;
@@ -492,7 +522,8 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
     schedule::SetMinuteOverride(b % 1440);
     int k = 0;
     bool all = false;
-    for (; k < maxArrive; k++) {
+    if (stopped()) break;
+    for (; k < maxArrive && !stopped(); k++) {
       support::RunTicks(*rig, 1);
       traceTick();
       if (k >= 2 && settle()) {
@@ -501,7 +532,7 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
       }
     }
     // A few more ticks at the anchor: doors swing shut behind.
-    for (int j = 0; j < 30; j++) {
+    for (int j = 0; j < 30 && !stopped(); j++) {
       support::RunTicks(*rig, 1);
       traceTick();
     }
@@ -517,8 +548,77 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
         for (size_t i = 0; i < rs.route.nodes.size(); i++)
           route += (i ? " > " : "") + (rs.route.nodes[i].empty() ? std::string("anchor") : rs.route.nodes[i]) +
                    (i == rs.cursor ? "*" : "");
+        // THE FETCH CACHE AROUND THE FEET vs THE GRID (det-cpu, rule 6): a
+        // walker's footing and the terrain collider read World::Cached, which
+        // is only as fresh as the last fetch of each chunk. A stuck villager
+        // standing on a stale cache is a different bug from one blocked by
+        // real matter, and this names which, with the first differing cell.
+        std::string stale;
+        {
+          const IVec3 fc{(int)std::floor(rs.foot.x), (int)std::floor(rs.foot.y),
+                         (int)std::floor(rs.foot.z)};
+          int compared = 0, missing = 0, staleChunks = 0, cells = 0;
+          std::string first;
+          std::vector<uint32_t> grid(kChunkVol);
+          for (int dz = -1; dz <= 1; dz++)
+            for (int dy = -1; dy <= 1; dy++)
+              for (int dx = -1; dx <= 1; dx++) {
+                const IVec3 wc{FloorDiv16(fc.x) + dx, FloorDiv16(fc.y) + dy, FloorDiv16(fc.z) + dz};
+                if (!c.world.ChunkInWindow(wc)) continue;
+                const CachedChunk* cc = c.world.Cached(wc);
+                if (cc == nullptr || cc->voxels.size() != kChunkVol) {
+                  missing++;
+                  continue;
+                }
+                compared++;
+                ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, grid.data(), "village-stale");
+                int n = 0;
+                for (uint32_t i = 0; i < kChunkVol; i++) {
+                  // durable bits only: the tick stamp / excite scratch move
+                  // every tick and are not what a walker stands on
+                  const uint32_t a = cc->voxels[i] & 0x7F00FFFFu, g = grid[i] & 0x7F00FFFFu;
+                  if ((a & 0xFFFu) == (g & 0xFFFu)) continue;
+                  if (n++ == 0 && first.empty())
+                    first = Format("first (%d,%d,%d) cached mat %u, grid mat %u, chunk v%u",
+                                   wc.x * 16 + (int)(i % 16), wc.y * 16 + (int)((i / 16) % 16),
+                                   wc.z * 16 + (int)(i / 256), a & 0xFFFu, g & 0xFFFu, cc->version);
+                }
+                if (n) staleChunks++;
+                cells += n;
+              }
+          stale = Format(" [cache vs grid around the feet at tick %u: %d chunks compared, %d uncached, %d stale, "
+                         "%d cells of other material%s%s] [%s]",
+                         c.world.TicksEncoded(), compared, missing, staleChunks, cells, first.empty() ? "" : "; ",
+                         first.c_str(), c.world.FetchReport().c_str());
+          // ...and the ground between the feet and the leg's goal, as the
+          // walker's probe sees it: one column per voxel step, feet-3..feet+3
+          // bottom to top ('.' air, '#' solid, 'p' powder, '~' liquid,
+          // 'g' gas, '?' uncached).
+          if (rs.cursor < rs.route.pts.size()) {
+            const Vec3 g = rs.route.pts[rs.cursor];
+            const float ddx = g.x - rs.foot.x, ddz = g.z - rs.foot.z;
+            const float len = std::sqrt(ddx * ddx + ddz * ddz);
+            std::string cols;
+            for (int s = 0; s <= 10 && len > 0.0f; s++) {
+              const float t = std::min((float)s, len) / len;
+              const int x = (int)std::floor(rs.foot.x + ddx * t), z = (int)std::floor(rs.foot.z + ddz * t);
+              cols += s ? " " : "";
+              for (int y = fc.y - 3; y <= fc.y + 3; y++) {
+                const CachedChunk* cc = c.world.Cached({FloorDiv16(x), FloorDiv16(y), FloorDiv16(z)});
+                if (cc == nullptr || cc->voxels.size() != kChunkVol) {
+                  cols += '?';
+                  continue;
+                }
+                const uint32_t m = cc->voxels[(size_t)(((z & 15) * 16 + (y & 15)) * 16 + (x & 15))] & 0xFFFu;
+                const uint32_t k = m == 0 || m >= c.mats.size() ? 0xFFu : c.mats[m].gpu.klass;
+                cols += m == 0 ? '.' : k == CLASS_SOLID ? '#' : k == CLASS_POWDER ? 'p' : k == CLASS_LIQUID ? '~' : 'g';
+              }
+            }
+            stale += Format(" [goal (%.1f,%.1f,%.1f) %.1f vox; columns %s]", g.x, g.y, g.z, len, cols.c_str());
+          }
+        }
         out.why.push_back(Format("%02d:%02d: %s never reached its '%s' anchor (%s at %.0f,%.0f,%.0f) "
-                                 "in %d ticks: phase %s, feet at (%.1f,%.1f,%.1f), %.0f vox away%s%s "
+                                 "in %d ticks: phase %s, feet at (%.1f,%.1f,%.1f), %.0f vox away%s%s%s "
                                  "[route %s] [notes %s]",
                                  (b % 1440) / 60, b % 60, n->id.c_str(), rs.activity.c_str(),
                                  rs.anchor.refId.c_str(), rs.anchor.foot.x, rs.anchor.foot.y,
@@ -526,7 +626,7 @@ DayResult RunDay(Ctx& c, const std::string& mapName, IVec3 centreChunk,
                                  rs.foot.x, rs.foot.y, rs.foot.z,
                                  std::sqrt((rs.foot.x - rs.anchor.foot.x) * (rs.foot.x - rs.anchor.foot.x) +
                                            (rs.foot.z - rs.anchor.foot.z) * (rs.foot.z - rs.anchor.foot.z)),
-                                 rs.note.empty() ? "" : " -- ", rs.note.c_str(), route.c_str(),
+                                 rs.note.empty() ? "" : " -- ", rs.note.c_str(), stale.c_str(), route.c_str(),
                                  [&] {
                                    std::string s;
                                    for (const std::string& x : track[n->id].notes) s += (s.empty() ? "" : " / ") + x;
@@ -843,11 +943,189 @@ Status GateVillageHarrowby(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- village-twice: THE SAME MORNING, TWICE, IN ONE PROCESS -----------------------
+//
+// The determinism invariant (CLAUDE.md rule 1) asked of the village: two runs
+// of the same day in one process must be bit-identical. village-harrowby pins
+// one run against a boot-to-boot trace and documented (2026-09-29) that a
+// second in-process day diverged at the first door hinge swing. This gate is
+// that claim as a test, WITH ATTRIBUTION (CLAUDE.md rule 6): every tick it
+// records each non-static Jolt body's exact state bits and the static
+// (terrain) handle set, so a failure names the first tick, the first body
+// (by handle, layer and role/owner word) and which field differs -- and
+// separately whether only the HANDLES differ (Jolt's per-slot sequence
+// number, which a body created after a previous run's churn carries) while
+// the states still agree.
+//
+// Only the morning is run (harrowby.twiceTicks, default 900): the first door
+// swings at ~tick 470, and the claim is "identical", not "the day completes".
+Status GateVillageTwice(Ctx& c, std::string& detail) {
+  refs::RegisterAllKinds();
+  structures::TakeReapply();
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  const uint64_t idWas = c.mobs.NextIdCounter();
+  const std::string prevMap = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+  const std::string mapName = VillageMap();
+  worldmap::SetMapOverride(mapName);
+  biomes::EnvironmentStamp stamp;
+  std::string log;
+  auto restore = [&]() {
+    schedule::SetMinuteOverride(-1);
+    refs::ResetResidents();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.SetUnparkPlacer(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.SetNextIdCounter(idWas);
+    c.stream.Store().Clear();
+    worldmap::SetMapOverride(prevMap);
+    biomes::EnvironmentStamp s2;
+    std::string l2;
+    ReloadEnvironment(c.ctx, c.sim, c.mats, s2, l2);
+    c.stream.OnRegen();
+    c.world.SetWindowOrigin(savedOrigin);
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    structures::TakeReapply();
+  };
+  if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, log)) {
+    restore();
+    detail = "map '" + mapName + "' did not load: " + log;
+    return Status::Fail;
+  }
+  refs::RefStore st;
+  st.LoadMap(AssetDir(), mapName);
+  const Village v = Survey(st);
+  if (v.npcs.empty()) {
+    restore();
+    detail = "no villagers in refs/" + std::string(kGroup) + ".json";
+    return Status::Fail;
+  }
+  refs::ReloadSchedules();
+  const int cx = (v.lo.x + v.hi.x) / 2, cz = (v.lo.z + v.hi.z) / 2;
+  const IVec3 origin{FloorDiv16(cx - (int)kWorldN / 2), 0, FloorDiv16(cz - (int)kWorldN / 2)};
+  const IVec3 centreChunk{FloorDiv16(cx), FloorDiv16(v.lo.y), FloorDiv16(cz)};
+  c.stream.OnRegen();
+  c.world.SetWindowOrigin(origin);
+  const int maxTicks = (int)BaselineNumber("harrowby.twiceTicks", 900);
+  PhysTrace pa, pb;
+  const DayResult a = RunDay(c, mapName, centreChunk, "", 26000, maxTicks, &pa);
+  const DayResult b = RunDay(c, mapName, centreChunk, "", 26000, maxTicks, &pb);
+  restore();
+
+  // ---- attribution ----
+  // 1. the village trace (villager feet/heading bits, door phase + hinge angle)
+  const size_t per = v.npcs.size() + v.doors.size();
+  int traceTick = -1;
+  std::string traceWho;
+  const size_t ns = std::min(a.samples.size(), b.samples.size());
+  for (size_t i = 0; i < ns; i++)
+    if (!a.samples[i].Exact(b.samples[i])) {
+      traceTick = per ? (int)(i / per) + 1 : 0;
+      const DayResult::Sample &x = a.samples[i], &y = b.samples[i];
+      traceWho = Format("%s (phase %d/%d, origin %.9g,%.9g,%.9g / %.9g,%.9g,%.9g, heading-or-hinge %.9g / %.9g)",
+                        x.who.c_str(), x.phase, y.phase, x.ox, x.oy, x.oz, y.ox, y.oy, y.oz, x.hd, y.hd);
+      break;
+    }
+  // 2. Jolt. Bodies are paired across the runs by CREATION ORDINAL since the
+  // run began (Physics::ResetBirthOrdinals in RunDay), not by Jolt id: the
+  // id is part of what is being tested. Per tick: the first body whose HANDLE
+  // differs (same body, other Jolt id/sequence), and the first whose STATE
+  // bits differ, with the fields that do.
+  auto byBirth = [](std::vector<Physics::BodyStateBits> v) {
+    std::stable_sort(v.begin(), v.end(), [](const Physics::BodyStateBits& x, const Physics::BodyStateBits& y) {
+      return x.birth < y.birth;
+    });
+    return v;
+  };
+  auto idx = [](uint64_t h) { return (unsigned long long)((h - 1) & 0x7FFFFF); };
+  auto seq = [](uint64_t h) { return (unsigned long long)((h - 1) >> 23); };
+  int handleTick = -1, stateTick = -1, staticTick = -1;
+  std::string handleWhat, stateWhat;
+  size_t preA = 0, preB = 0;
+  if (!pa.empty())
+    for (const auto& s : pa[0]) preA += (s.birth == 0 && s.handle != 0) ? 1 : 0;
+  if (!pb.empty())
+    for (const auto& s : pb[0]) preB += (s.birth == 0 && s.handle != 0) ? 1 : 0;
+  const size_t nt = std::min(pa.size(), pb.size());
+  for (size_t t = 0; t < nt && (handleTick < 0 || stateTick < 0 || staticTick < 0); t++) {
+    const std::vector<Physics::BodyStateBits> A = byBirth(pa[t]), B = byBirth(pb[t]);
+    // the static pseudo-entry (handle 0) carries the terrain handle-set hash
+    uint64_t sa = 0, sb = 0;
+    for (const auto& s : A) if (s.handle == 0) sa = s.user;
+    for (const auto& s : B) if (s.handle == 0) sb = s.user;
+    if (staticTick < 0 && sa != sb) staticTick = (int)t + 1;
+    std::string hs, ss;
+    int hShown = 0, sShown = 0;
+    bool hDiff = A.size() != B.size(), sDiff = A.size() != B.size();
+    for (size_t i = 0; i < std::min(A.size(), B.size()); i++) {
+      const Physics::BodyStateBits &x = A[i], &y = B[i];
+      if (x.handle == 0 || y.handle == 0) continue;
+      if (x.birth != y.birth) {
+        hDiff = sDiff = true;
+        if (hShown++ < 3) hs += Format("; births %llu/%llu at rank %zu", (unsigned long long)x.birth,
+                                       (unsigned long long)y.birth, i);
+        continue;
+      }
+      if (x.handle != y.handle) {
+        hDiff = true;
+        if (hShown++ < 3)
+          hs += Format("; birth %llu user %llx: index %llu/%llu seq %llu/%llu", (unsigned long long)x.birth,
+                       (unsigned long long)x.user, idx(x.handle), idx(y.handle), seq(x.handle), seq(y.handle));
+      }
+      std::string f;
+      if (x.layer != y.layer) f += " layer";
+      if (x.motion != y.motion) f += " motion";
+      if (x.active != y.active) f += " active";
+      if (std::memcmp(x.pos, y.pos, sizeof x.pos)) f += " pos";
+      if (std::memcmp(x.rot, y.rot, sizeof x.rot)) f += " rot";
+      if (std::memcmp(x.lin, y.lin, sizeof x.lin)) f += " linvel";
+      if (std::memcmp(x.ang, y.ang, sizeof x.ang)) f += " angvel";
+      if (x.user != y.user) f += " user";
+      if (f.empty()) continue;
+      sDiff = true;
+      if (sShown++ < 4) {
+        float p[2][3];
+        std::memcpy(p[0], x.pos, sizeof p[0]);
+        std::memcpy(p[1], y.pos, sizeof p[1]);
+        ss += Format("; birth %llu user %llx layer %u motion %u index %llu/%llu:%s (pos %.9g,%.9g,%.9g / %.9g,%.9g,%.9g)",
+                     (unsigned long long)x.birth, (unsigned long long)x.user, x.layer, x.motion, idx(x.handle),
+                     idx(y.handle), f.c_str(), p[0][0], p[0][1], p[0][2], p[1][0], p[1][1], p[1][2]);
+      }
+    }
+    if (handleTick < 0 && hDiff) {
+      handleTick = (int)t + 1;
+      handleWhat = Format("%zu vs %zu bodies%s", A.size(), B.size(), hs.c_str());
+    }
+    if (stateTick < 0 && sDiff) {
+      stateTick = (int)t + 1;
+      stateWhat = Format("%zu vs %zu bodies%s%s", A.size(), B.size(), ss.c_str(), hs.c_str());
+    }
+  }
+  handleWhat += Format(" | %zu / %zu non-static bodies alive from before the run; terrain handle set first "
+                       "differs at tick %d", preA, preB, staticTick);
+  const bool same = a.ticks == b.ticks && traceTick < 0 && stateTick < 0;
+  RecordObserved("harrowby.twiceFirstTraceTick", (double)traceTick);
+  RecordObserved("harrowby.twiceFirstStateTick", (double)stateTick);
+  RecordObserved("harrowby.twiceFirstHandleTick", (double)handleTick);
+  detail = Format(
+      "two mornings of %d / %d ticks in one process (door opens %u / %u) | village trace %s | Jolt states %s | "
+      "Jolt handles %s",
+      a.ticks, b.ticks, a.opens, b.opens,
+      traceTick < 0 ? "identical" : Format("FIRST DIFFERS at tick %d: %s", traceTick, traceWho.c_str()).c_str(),
+      stateTick < 0 ? "identical" : Format("FIRST DIFFER at tick %d: %s", stateTick, stateWhat.c_str()).c_str(),
+      (handleTick < 0 ? "identical" + handleWhat
+                      : Format("first differ at tick %d: %s", handleTick, handleWhat.c_str())).c_str());
+  return same ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& VillageGates() {
   static const std::vector<Gate> g = {
       {"village-harrowby", "world", {}, false, GateVillageHarrowby, /*needsRender=*/false},
+      {"village-twice", "world", {}, false, GateVillageTwice, /*needsRender=*/false},
   };
   return g;
 }

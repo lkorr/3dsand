@@ -474,8 +474,23 @@ const char* World::FetchSourceName(FetchSource s) {
   }
 }
 
+// SANDVOX_FETCH_TRACE=<file> (det-cpu): one line per fetch request (Q), per
+// fetch a readback slot carries (E) and per fetched chunk landing in the cache
+// (L, with a hash of its words). Two boots diffed name the first fetch whose
+// timing or content differs. Off (one null test) unless set.
+static FILE* FetchTrace() {
+  static FILE* f = [] {
+    const char* e = std::getenv("SANDVOX_FETCH_TRACE");
+    return (e != nullptr && *e) ? std::fopen(e, "w") : (FILE*)nullptr;
+  }();
+  return f;
+}
+
 void World::RequestChunkFetch(IVec3 worldChunk, FetchSource src) {
   const int si = (int)src < FetchProbe::kSources ? (int)src : 0;
+  if (FILE* tf = FetchTrace())
+    std::fprintf(tf, "Q %u %d,%d,%d src %d%s\n", fetchTick_, worldChunk.x, worldChunk.y,
+                 worldChunk.z, si, fetchQueued_.count(PackChunkKey(worldChunk)) ? " dup" : "");
   if (!ChunkInWindow(worldChunk)) {  // not resident: nothing to read
     fetchProbe_.refused[si]++;
     return;
@@ -620,6 +635,9 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
     fetchProbe_.ageSum[si] += age;
     if (age > fetchProbe_.ageMax[si]) fetchProbe_.ageMax[si] = age;
     s.fetchIds.push_back(r.wc);
+    if (FILE* tf = FetchTrace())
+      std::fprintf(tf, "E %u %d,%d,%d page %llx\n", tick, r.wc.x, r.wc.y, r.wc.z,
+                   (unsigned long long)PageOffsetOfSlot(SlotChunkIndex(r.wc)));
   }
   // The stamp every request made from here until the next slot carries; a
   // request that rides the very next slot therefore ages exactly 1.
@@ -1087,44 +1105,75 @@ void World::KickReadback() {
         // "the queue is bounded because nobody does that" is not a bound. The
         // oldest goes back to the pool; it is older than anything a publish
         // could still be owed.
+        // ---- THE FETCHED CHUNKS RIDE THE SNAPSHOT, NOT THE CALLBACK --------
+        // (det-cpu 2026-10-03.) They are parsed into the holding snapshot and
+        // land in the cache when PublishSnapshotsUpTo walks it -- the same
+        // fixed K as Snap(). Writing cache_ here made every Cached() reader
+        // (ManageTerrain's Jolt patches, island scans, doors, the mob ground
+        // probe) see a chunk on whichever tick this fence happened to retire.
+        // The harness hid it: HarnessSnapshotDrain retires every fence each
+        // tick, so a --selftest saw a constant 1-tick fetch latency the game
+        // never ran at (finding L1', again).
+        out.fetchKeys.clear();
+        out.fetchWords.resize(sl.fetchIds.size() * (size_t)kChunkVol);
+        for (size_t i = 0; i < sl.fetchIds.size(); i++) {
+          out.fetchKeys.push_back(PackChunkKey(sl.fetchIds[i]));
+          uint32_t* dst = out.fetchWords.data() + i * (size_t)kChunkVol;
+          const uint32_t e =
+              i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
+          if (e != 0u) {
+            // The mirror's synthesis, from the same helper (world.h). (§2.1a)
+            SynthChunkWords(e, sl.fetchIds[i], mirrorSeed_, dst);
+          } else {
+            std::memcpy(dst, p + kFetchOff + i * kChunkBytes, kChunkBytes);
+          }
+        }
+        // SANDVOX_FETCH_LAND_EARLY=1: the pre-2026-10-03 arm, landing in the
+        // callback (GPU-timing latency). A/B in one binary only.
+        static const bool kLandEarly = [] {
+          const char* e = std::getenv("SANDVOX_FETCH_LAND_EARLY");
+          return e != nullptr && e[0] == '1';
+        }();
+        if (kLandEarly) LandFetches(out);
+
         if (ready_.size() >= (size_t)kReadbackSlots) {
           snapPipe_.dropped++;
+          // Not a path any caller takes (see BOUNDED above); if it ever is,
+          // keep the oldest snapshot's fetched chunks rather than lose them.
+          LandFetches(ready_.front());
           snapPool_.push_back(std::move(ready_.front()));
           ready_.pop_front();
         }
         ready_.push_back(std::move(out));
-
-        // fetched chunks land in the CPU cache keyed by WORLD chunk,
-        // stamped with their tick
-        for (size_t i = 0; i < sl.fetchIds.size(); i++) {
-          CachedChunk& cc = cache_[PackChunkKey(sl.fetchIds[i])];
-          if (cc.version <= sl.tick) {
-            cc.version = sl.tick;
-            const uint32_t e =
-                i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
-            if (e != 0u) {
-              // resize, not assign: every branch below writes all 4,096
-              // words, so assign's zero-fill was 16 KiB of memset thrown
-              // away immediately. (§2.1a)
-              cc.voxels.resize(kChunkVol);
-              // The mirror's synthesis, from the same helper (world.h).
-              SynthChunkWords(e, sl.fetchIds[i], mirrorSeed_,
-                              cc.voxels.data());
-            } else {
-              cc.voxels.assign(
-                  (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
-                  (const uint32_t*)(p + kFetchOff + (i + 1) * kChunkBytes));
-            }
-          }
-        }
-        // bound the cache (drop chunks far in the past)
-        if (cache_.size() > 1024) {
-          for (auto it = cache_.begin(); it != cache_.end();) {
-            if (it->second.version + 600 < sl.tick) it = cache_.erase(it);
-            else ++it;
-          }
-        }
       });
+}
+
+void World::LandFetches(WorldSnapshot& s) {
+  // fetched chunks land in the CPU cache keyed by WORLD chunk, stamped with
+  // the tick whose post-sim state they hold
+  for (size_t i = 0; i < s.fetchKeys.size(); i++) {
+    CachedChunk& cc = cache_[s.fetchKeys[i]];
+    if (FILE* tf = FetchTrace()) {
+      uint64_t h = 1469598103934665603ull;
+      const uint32_t* w = s.fetchWords.data() + i * (size_t)kChunkVol;
+      for (uint32_t k = 0; k < kChunkVol; k++) h = (h ^ (w[k] & 0x7F00FFFFu)) * 1099511628211ull;
+      std::fprintf(tf, "L %u key %llx h %016llx was v%u\n", s.tick,
+                   (unsigned long long)s.fetchKeys[i], (unsigned long long)h, cc.version);
+    }
+    if (cc.version <= s.tick) {
+      cc.version = s.tick;
+      const uint32_t* src = s.fetchWords.data() + i * (size_t)kChunkVol;
+      cc.voxels.assign(src, src + kChunkVol);
+    }
+  }
+  s.fetchKeys.clear();
+  // bound the cache (drop chunks far in the past)
+  if (cache_.size() > 1024) {
+    for (auto it = cache_.begin(); it != cache_.end();) {
+      if (it->second.version + 600 < s.tick) it = cache_.erase(it);
+      else ++it;
+    }
+  }
 }
 
 // ---- THE SOLUTE LAYER'S RESET (world.h kSol* block) ------------------------
@@ -1214,6 +1263,9 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
     snapPool_.push_back(std::move(ready_.front()));
     ready_.pop_front();
     got = true;
+    // The chunk fetches this snapshot carried join the cache NOW, one
+    // snapshot at a time in tick order (see the callback, det-cpu).
+    LandFetches(snap_);
     // Reaction effects ride the publish, one snapshot at a time, so a publish
     // that walks two snapshots delivers both ticks' firings (World::TakeReactFx).
     if (snap_.valid && !snap_.reactFx.empty()) {

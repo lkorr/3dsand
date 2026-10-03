@@ -913,6 +913,7 @@ page faults, 4 new reds recorded above, everything else green or known.
 
 
 
+
 ## 2026-10-03 — `gas-leave-overflow` added, `"pass"` (det-gas package)
 
 New gate, new keys `gasOverflowCap` / `gasOverflowTicks` /
@@ -924,6 +925,7 @@ parcel digest). First run: converted 2365, refused 93317 on 53 ticks, twice-run
 identical over 56 snapshot ticks, digest c188e30d both arms. `gas-leave`'s
 "zero refusals" assertion is unchanged but is a throughput claim now, not a
 determinism one (DESIGN.md "The edge's refusals are a function of the world").
+
 
 
 
@@ -952,6 +954,7 @@ determinism one (DESIGN.md "The edge's refusals are a function of the world").
 
 
 
+
 ## 2026-10-03 — repose: worldgen reads each powder's own repose (hash moves; NOT re-pinned here)
 
 `sand` 34, `gravel` 40, `dirt` 40 are authored in materials.json, and worldgen's
@@ -963,6 +966,7 @@ tables move: intentional, left for the orchestrator's single re-pin.
 caps 126 / 112; travel 0.0 / 0.0 keeps its 0.5 caps). The control arm (same
 materials, old worldgen) measured 1499 / 1301 and FAILED, which is what this
 gate now guards.
+
 
 
 
@@ -991,6 +995,7 @@ seam fix above also drained this sealed box: live at the end 157 -> 4.
 
 `determinismHash` was not re-pinned on this branch (orchestrator pins once):
 the seam change moves any world with excited fluid.
+
 
 
 ## 2026-10-03 — red-bodies triage (worktree off c364516; `determinismHash` not touched)
@@ -1049,6 +1054,7 @@ t120), `venom-blade` (arm C seeded nothing; passes standalone), `vessel-grid`,
 and the `determinism` pin (b2514936 -> 5c3ea9ad with the twice-run comparison
 passing — a moved pin, not a determinism failure).
 
+
 ## 2026-10-03 — fire-perf triage of `mob-burn` and `fire-depth` (no key changed)
 
 Both stay `"fail"`; neither is a defect in the burn pass.
@@ -1067,3 +1073,26 @@ Both stay `"fail"`; neither is a defect in the burn pass.
   re-point both checks at a material the human has. Not done here.
 - `fire-depth`: 22.9k of 99.0k px behind the flame (floor: a tenth). Render
   side, as recorded above; untouched by CPU burn work.
+
+## 2026-10-03 — det-cpu: fetch cache at the fixed latency, deterministic Jolt ids
+
+- `village-twice` (new, `pass`): the Harrowby morning (harrowby.twiceTicks
+  = 900) twice in one process, every Jolt body paired across the runs by
+  creation ordinal. Before the fix it named the 2026-09-29 hinge divergence:
+  identical body states under other Jolt ids until the door leaf's first
+  contact solve (tick 422). After it: trace, states and handles identical.
+- `village-harrowby` -> `fail` (known): the fetch cache now lands at K=4
+  ticks, the day is perturbed, and Edric is left at the longhouse loft edge
+  walking straight at the stair-bottom waynode across a 16-voxel drop (13:00
+  and 17:00 rows). Cache vs grid around his feet: 0 stale cells; the fetch
+  FIFO is not starved. A navigation gap exposed by a different trajectory,
+  not a determinism bug. `SANDVOX_FETCH_LAND_EARLY=1` (the old arm) completes
+  the day. `harrowby.dayTrace` NOT re-pinned (the Jolt id change moves it
+  either way; the orchestrator pins). The day's trace came out the same first
+  in the process and after 1220 ticks of other gates (ee23c5d3bd817e04:15367
+  both): the "three scopes, three traces" leak was the Jolt id history.
+- The runner now calls `Physics::ResetBodyIdHistory()` before every gate, so
+  a gate's Jolt ids no longer depend on the gates before it (rule 7).
+- `tree-fell` passed at `--verify` scope on this tree (0 floating after the
+  burn and the quench); its recorded status is red-world's to change.
+- `--gate determinism`: b2514936, matches the pin.

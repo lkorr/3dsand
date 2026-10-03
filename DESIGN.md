@@ -69,6 +69,16 @@ controller and physics need to know what voxels are where) without stalls:
   30 Hz sim, four ticks of latency on terrain collision is still invisible; the
   readback callbacks queue and `SubmitTick` publishes exactly one per tick,
   blocking (counted) rather than skipping if the one it is owed has not landed.
+  **The on-demand chunk fetches (`World::Cached`) ride the same publish**
+  (det-cpu, 2026-10-03): a fetch carried by tick T's readback lands in the
+  cache when tick T's snapshot is published, at T+K, never in the map
+  callback. Until then the callback wrote the cache directly, so what
+  `ManageTerrain` meshed for Jolt, what a door captured, what the island
+  scans flooded and what the mob ground probe stood on arrived on whichever
+  tick the fence retired — finding L1 on the one store N1 did not move, and
+  invisible to `--selftest` because `HarnessSnapshotDrain` retires every fence
+  each tick (a constant 1-tick fetch latency the game never ran at).
+  `SANDVOX_FETCH_LAND_EARLY=1` is the old arm, in one binary.
 - All CPU→GPU writes (spells, explosions, brush edits, worldgen) are accumulated
   into a per-frame **MutationQueue** and uploaded as one batched transfer.
   This queue is a load-bearing design element — and as of `sim/oprecord.h`
@@ -6228,10 +6238,33 @@ neighbors, so this needs an explicit connectivity pass:
   first support flag under a cut floods the terrain slab once (60k cells,
   the drop anchor needs the column below to land), and the burn pass's one
   stray leaf voxel is INTERMITTENT and not the wait's doing — the burn pass
-  is not run-to-run reproducible on one binary (5.0 M vs 11.7 M cells
-  visited; the traces diverge the tick the first burning bodies appear,
-  because the terrain-collider budget is wall-clock and feeds Jolt), the
-  survivors sit at ground+2 outside the gate's own forced-rescan tiling
+  was not run-to-run reproducible on one binary (5.0 M vs 11.7 M cells
+  visited; the traces diverge the tick the first burning bodies appear). The
+  cause given here at the time, "the terrain-collider budget is wall-clock
+  and feeds Jolt", was WRONG (audit, det-cpu 2026-10-03): every
+  `ManageTerrain` budget (`kTerrainBuildsPerTick`, `kTerrainFetchPerTick`,
+  `kTerrainGatherPerTick`, `kTerrainNeedCeiling`) is a count and was on
+  2026-09-12 too, and no clock in `src/` decides a sim or physics outcome
+  (they report). What did feed Jolt a non-reproducible input was the fetch
+  cache the patches are meshed from — written in the readback callback, on
+  the GPU's schedule, until it moved onto the fixed-latency publish (§2) —
+  and Jolt's body-id free list, whose ids order the contact solve and which
+  carried history from earlier runs in the process (see "Determinism" under
+  the doors, gate `village-twice`). Neither is visible to a `--selftest`
+  boot-to-boot comparison: the harness drain fixed the fetch latency at one
+  tick, and a boot starts with an empty free list. **Measured after both
+  fixes (2026-10-03, `--gate tree-fell` twice):** the BURN half is identical
+  boot to boot (every count, 1456 scans / 1,166,877 cells), but the CUT half
+  is not (chunks needed 40,068 vs 36,895, polygonizes 125 vs 117, also with
+  `SANDVOX_PHYS_THREADS=1`). `SANDVOX_PHYS_TRACE=<file>` (every body birth,
+  removal, terrain patch hash and pre/post-step state hash) and
+  `SANDVOX_FETCH_TRACE=<file>` (every fetch request, carry and landed-chunk
+  hash) diffed across the two boots: identical through tick 94264, where one
+  boot's DebrisSystem queues an island scan's fetch block around chunk
+  (15,16,15) and the other does not. So the remaining boot-to-boot leak is
+  inside the debris event/scan decision — not a clock, not Jolt, not the
+  fetch cache — and those two traces are the instrument for the next step.
+  The survivors sit at ground+2 outside the gate's own forced-rescan tiling
   (which starts at `treeA.lo` while the sweep box reaches 2 cells beyond),
   and `SANDVOX_ISLAND_WATCH=x,y,z` / `ovHid`/`ovShow` are in place for the
   next failing run.
@@ -22918,6 +22951,22 @@ the page's arc preview and the gates all call it.
   does not depend on how the body swung. The TICK of the close does depend on
   the Jolt step (home detection), exactly as debris settle-back does; the op
   stream records it, so `ops-replay` reproduces it.
+  **A second identical day in one process used to diverge at the first hinge
+  swing** (2026-09-29: longhouse back door, tick ~470, fifth decimal of the
+  angle). Gate `village-twice` runs the morning twice and pairs every Jolt
+  body across the runs by creation ordinal (`Physics::DebugBodyStates`), and
+  it named the cause on one line (det-cpu, 2026-10-03): with 0 bodies alive
+  before either run, every body had IDENTICAL state bits in both runs until
+  tick 422 — under other Jolt ids (birth 1 was index 0 sequence 1, then index
+  130 sequence 2: Jolt's LIFO free list and per-slot sequence numbers carry
+  the previous run's churn) — and the first body to differ was the door leaf
+  (layer DOOR, dynamic), the first body whose solve has contacts and a
+  constraint together. Jolt orders contact constraints by a key hashed from
+  the two BodyIDs, so the ids are simulation input. `Physics` now picks every
+  id itself (`CreateBodyWithID`): the lowest free index, a function of the
+  live set rather than of removal order, with its own per-index sequence;
+  `ResetBodyIdHistory()` (harness only: `RunDay` calls it after resetting
+  everything that holds a handle) zeroes the sequences of free indices.
 
 **Container** (`container`): a Bag owned by the ref. Contents = the delta
 (kind `container` v1: the non-empty slots, `WriteItemInstance` at

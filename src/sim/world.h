@@ -4482,6 +4482,15 @@ struct WorldSnapshot {
   // the CPU this tick (zero velocity; Tickets parks them as far landings).
   std::vector<IVec3> ticketReq;
   std::vector<ParticleSpawn> ticketDeposits;
+  // ---- the on-demand chunk fetches this readback carried (World::Cached) ----
+  // Parsed here and landed in the fetch cache by PublishSnapshotsUpTo, i.e. at
+  // the same FIXED latency as everything else on this ring. They used to be
+  // written into the cache straight from the map callback, which made what
+  // ManageTerrain meshed for Jolt, what a door captured and what the mob
+  // ground probe stood on a function of how fast the GPU came back (det-cpu,
+  // 2026-10-03): finding L1 again, on the one store N1 did not move.
+  std::vector<uint64_t> fetchKeys;    // PackChunkKey, request order
+  std::vector<uint32_t> fetchWords;   // kChunkVol words per key
   uint32_t ticketFarKilled = 0;
   uint32_t ticketParked = 0;
   // ---- MLS-MPM fluid (seam) ----
@@ -5063,6 +5072,11 @@ class World {
   // `snap_` ends holding the NEWEST of them. Anything newer stays queued for
   // the ticks that own it. Returns true if `snap_` describes exactly `target`.
   bool PublishSnapshotsUpTo(uint32_t target);
+  // Lands one snapshot's carried chunk fetches in the fetch cache (version
+  // guard + the cache's size bound), and empties its fetch lists. Called by
+  // the publish for every snapshot it walks, so Cached() at tick T holds
+  // exactly the fetches of ticks <= T - kSnapshotLatency.
+  void LandFetches(WorldSnapshot& s);
 
   // ---- THE FRESHEST DELIVERED SNAPSHOT: DERIVED DATA ONLY ----------------
   //
