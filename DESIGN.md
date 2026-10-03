@@ -5973,6 +5973,65 @@ neighbors, so this needs an explicit connectivity pass:
   are ~9.5 (`burnprof`: 60k burn candidates queued a tick for 6.4k evaluated
   under the shared front budget -- the queueing of the other 90% is the next
   lever), debris 3.3 and the submit + Jolt step 3.4.
+- **The burning villagers, bounded (2026-10-03).** Same scene, windowed:
+  `SANDVOX_RUN_EXCLUSIVE=1 SANDVOX_BURN_VILLAGE=1 SANDVOX_BURN_TICKS=1200
+  bash scripts/run.sh <exe> --frames 100000 --burn-house`. `burnprof` was
+  extended until the mob tick had no unattributed term: spans for the
+  candidate build (`queue`), the post-loop front sweep (`frontSweep`), the
+  rest of `PreTick` (`mobLoop`, `stain` and its parts `stainContact` /
+  `stainWalk` / `stainSurface` / rain / dry / wet / flesh, `deadSleep`) and
+  the hair tuck (`hairCover`, `hairFull`); counters for the front, the
+  windowed visits, the contact samples and the seeding's hot cells / faces /
+  footprint reads. Before: mob tick 9.05 ms mean, `burnOne` 6.34 (queue
+  1.96, seed 1.41, candidate loop 2.15, walk 0.50), the contact sweep 2.0
+  (30k samples a tick, ~68 ns each, from the ~20 limb visits a tick that
+  find something staining against them -- which material was not
+  attributed), hair tuck 0.33 mean / 16 ms worst. Changes:
+  1. **Only the window of the front the share can evaluate is expanded**
+     (`BurnOneLimb`, "ONLY AS MUCH OF THE FRONT"). The candidate list was
+     built from every front cell and its six neighbours and swept whole after
+     the loop, while the budget evaluated a tick-rotated window of it: 64.7k
+     queued a tick for 6.4k evaluated. When a front can queue more than the
+     limb's share (+1/8 slack for the joint twins the loop hands back), a
+     tick-rotated window of it is expanded instead; the front past the window
+     is carried over if still alight (a pair rule's neighbour product may
+     have rewritten it), and the world-contact seeding is scaled by the same
+     fraction so seeds and front cells keep their expected share of the
+     evaluation. A front that cannot overflow takes the old path unchanged.
+     Candidates 64.7k -> 11.4k a tick, evaluated unchanged (6.4k), queue
+     1.96 -> 0.39 ms. The one change here that moves the hash.
+  2. **Exact speedups** (bit-identical): the cheap gate's world walk reads a
+     chunk's run of a row at a time (window test, chunk lookup and fetch
+     request once per run; a forest fire walks ~66k cells a tick through it,
+     `--forest-fire` debris `burnBodies` 1.27 -> 1.04 ms); the candidate
+     loop's six face steps and normals rotated once per visit; the contact
+     sweep memoizes the world cell's classification (64 surface voxels share
+     a cell face at skinScale 8), walks a wrapping cursor with two divisions
+     a sample, looks its outward normal up in a 27-entry table rotated once,
+     and builds the surface list from the voxel list (sorted back into the
+     box order) instead of the box.
+  3. **The hair tuck re-hides instead of re-deriving** on a repaint
+     (`MobLimb::tuckHidden` / `tuckBase`). A burn moves only the hair brick's
+     edit counter, and which cells hide is a function of the lattice and the
+     cover; the full path composes hair -> head as one transform. The 16-25
+     ms ticks were NOT the cover (`hairCover` 1.4 ms at worst): the rim
+     search re-normalised every covered bin's direction (up to 6,144) for
+     every open bin the hair landed in, after every cover rebuild; the
+     directions are now built once per call. Render-only.
+  After (three runs, same command): mob tick 7.3-7.6 ms mean (`burnOne`
+  4.55: candidate loop 2.1-2.3, seeding 1.1, walk 0.4, queue 0.4, front
+  sweep 0.3), contact sweep 1.6-1.9, hair tuck 0.22 mean with no spike;
+  ticks over 16 ms 8 -> 1, worst tick 24.3 -> 17.7 ms.
+  The FRAME did not move (p50 18.8 -> 18.1-18.8 ms): the village fire is
+  GPU-bound -- `caLoop` ~11.5 ms a tick-frame over ~2,700 awake chunks of
+  black smoke and `rm_world` ~6 ms. So is the forest fire (raymarch 10.6 +
+  CA ~7.5 a tick-frame, p50 26 ms) and the bench's ether fire (raymarch
+  ~10 ms with the camera in the cloud, CA ~2.8 over ~130 chunks; game frames
+  ~20 ms during the burn before and after). What is left on the CPU is the
+  budgets doing their job: 6k candidate evaluations at ~0.33 us, ~27k
+  seeding probes at ~40 ns, the contact sweep's 32k samples at ~52 ns,
+  cross-limb heat 0.8 ms -- each bounded by a pot, none multiplying with
+  bodies.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

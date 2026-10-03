@@ -906,3 +906,22 @@ because of intentional world/sim changes since then, and they were re-pinned
 here with `--vk-smoke --rebaseline` and `--vk-smoke-loud --rebaseline`. The final
 `--suite acceptance` (24.6 min) ran on this tree before the hand pins: 0
 page faults, 4 new reds recorded above, everything else green or known.
+
+## 2026-10-03 — fire-perf triage of `mob-burn` and `fire-depth` (no key changed)
+
+Both stay `"fail"`; neither is a defect in the burn pass.
+
+- `mob-burn`: the two red subchecks are the fixture, not fire. `cloth vs
+  flesh` censuses `cloth` on the spawned body and finds 0 (the stock `human`
+  wears undercloth, not a robe); `burn leaves char` lights `cloth` on `armU.L`
+  through `IgniteLimb(.., mCloth)` and lights 0 voxels, so nothing burns and
+  nothing chars. Both were written for wizard.vox (robe on every limb, deleted
+  2026-09-19). Every other subcheck passes, before and after the fire-perf
+  package (bounded front window: burn chain, fire into grid, terminates,
+  limbs sleep, heat across a joint, corpse, acid, player burns all PASS with
+  numbers in the same range). Making them green needs a fixture decision:
+  dress the human in a garment (the shells are separate limbs, so the ignite
+  and the census would have to address the sleeve shell, not `armU.L`) or
+  re-point both checks at a material the human has. Not done here.
+- `fire-depth`: 22.9k of 99.0k px behind the flame (floor: a tenth). Render
+  side, as recorded above; untouched by CPU burn work.
