@@ -13142,7 +13142,14 @@ where you hear from either (§12b, "The ears are on the character").
   resolution or wide FOV: `RS_LAW_PX`), within 2 samples of the screen edge,
   and whenever the key in word 0 is not this frame's camera, size and frame
   index — every refusal is the old march from the camera, never a skipped
-  surface. Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
+  surface. The PREPASS applies the same law (`rayStartLawOk`, 2026-10-03) and
+  marches nothing below it: until then it ran in full for a reader that threw
+  the map away, and the game's own 1600x900 window is below the law (k = 658
+  against the cascade's 672 at fovY 1.2) — measured at `--perf-w 1600
+  --perf-h 900`, noon 6.32 -> 5.63 ms, cascade 4.92 -> 4.31, seam 4.32 -> 3.79.
+  (A fine-half-only map at that size cost 0.22 ms of prepass and saved less
+  than that on every camera, so a sub-law frame takes no map at all.)
+  Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
   13.49, the prepass's own 0.4-0.8 ms included; primary steps 20.4 -> 3.7 and

@@ -371,6 +371,34 @@ fn rayStartFar(ro : vec3f, rd : vec3f, inv : vec3f, tStart : f32) -> f32 {
   return RS_NONE;
 }
 
+// ---- THE LAW, applied on THIS side too (2026-10-03, raymarch-core) ---------
+// raymarch.wgsl's rayStartAt ignores the map unless every cell either march
+// can meet is >= RS_LAW_PX wide on screen. Until this, the prepass did not ask:
+// below the law it marched every sample in full for a reader that threw the
+// answer away. The game's own window is below it — 1600x900 at fovY 1.2 is
+// k = 658 px per voxel at t = 1 against the cascade's 3 * 224 = 672 — so the
+// window the game opens in paid 0.56 ms a frame (noon, --perf-w 1600
+// --perf-h 900, pre 0.91 vs 0.35 ms) for a map nobody read. Same constants,
+// same expression, so the two sides cannot disagree about which frames use
+// the map. Below the law thread 0 writes a key of 0, which no frame's key
+// equals (rayStartKey forces the low bit), so even a reader that somehow
+// disagreed about the law would fail the key check and march from the camera.
+//
+// (Trusting the FINE half alone below the cascade's law — its own law, 615,
+// holds at 900p — was tried the same night and measured: the fine-only map
+// cost 0.22 ms in `pre` and saved less than that on all five budget cameras,
+// so a sub-law frame is better off with no map at all.)
+const RS_LAW_PX : f32 = 3.0;                // raymarch.wgsl agrees
+const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
+                                     TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
+                                     TUNE_LOD_HANDOFF_DIST < WINDOW_HALF_EXTENT_METERS);
+const RS_FAR_MAX_CELLS : f32 =
+    f32((i32(FAR_NCHUNK) / 2 - FAR_SPHERE_MARGIN_CHUNKS) * i32(CHUNK));
+fn rayStartLawOk() -> bool {
+  let k = R.viewPx * 0.5 / R.tanHalfFov;   // px per fine voxel at t = 1
+  return k >= RS_LAW_PX * max(RS_NEAR_MAX_VOX, RS_FAR_MAX_CELLS);
+}
+
 // ---- pass 1: one ray per 2x2 block, through the block's shared corner ------
 // A FIXED grid (the buffer's capacity, pass_table.def); threads outside this
 // frame's target return on the bounds test, and thread 0 writes the key.
@@ -380,6 +408,11 @@ fn rayStartTrace(@builtin(global_invocation_id) gid : vec3<u32>) {
   let q = (dims + vec2<u32>(1u)) / 2u;
   let need = RS_HEADER + 2u * q.x * q.y;
   if (need > arrayLength(&rayStart)) { return; }
+  // Below the law: no march and NO KEY, so the reader's key check fails too.
+  if (!rayStartLawOk()) {
+    if (all(gid.xy == vec2<u32>(0u))) { rayStart[0] = 0u; }
+    return;
+  }
   if (all(gid.xy == vec2<u32>(0u))) { rayStart[0] = rayStartKey(); }
   if (gid.x >= q.x || gid.y >= q.y) { return; }
   var rd = rayStartDir(vec2f(gid.xy * 2u) + vec2f(1.0), dims);
@@ -403,6 +436,7 @@ fn rayStartMin(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dims = rayStartDims();
   let q = (dims + vec2<u32>(1u)) / 2u;
   if (RS_HEADER + 2u * q.x * q.y > arrayLength(&rayStart)) { return; }
+  if (!rayStartLawOk()) { return; }
   if (gid.x >= q.x || gid.y >= q.y) { return; }
   // THE SCREEN EDGE: a cell the frame border cuts may show a sliver narrower
   // than the lattice with no sample of its own on screen, so a window the

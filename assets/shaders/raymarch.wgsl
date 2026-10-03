@@ -5148,7 +5148,10 @@ const RS_FAR_REL : f32 = 0.02;
 // wide on screen. A fine voxel is narrowest at the far end of the fine march,
 // a cascade cell at its level's handoff sphere (the kFarN law: 3.5 px at
 // 1080p and camera.fovY 1.2). Below it — a low resolution, a wide FOV — the
-// map is not trusted at all and every ray marches from the camera.
+// map is not trusted at all and every ray marches from the camera — and
+// ray_start.wgsl, which applies the same law (rayStartLawOk), does not march
+// the map either (see the note there: below the law the prepass used to run
+// in full for a reader that ignored it).
 const RS_LAW_PX : f32 = 3.0;
 const RS_NEAR_MAX_VOX : f32 = select(f32(WORLD_N) * 0.8661,
                                      TUNE_LOD_HANDOFF_DIST / VOXEL_METERS,
