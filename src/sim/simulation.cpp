@@ -775,6 +775,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // of the whole 8-way set instead of up to eight atomic loads. Claims
         // and registrations still go through 14's atomics.
         entry(41, T::ReadOnlyStorage, S::Fragment),               // shadowCacheRO
+        // THE CHARGE FIELD (sim_elec.wgsl; src/sim/elec.h), read-only: the
+        // raymarch's glow and charge view (raymarch.wgsl elecPAt, package E5b).
+        // The same buffers the sim binds at 55/56. heatPool's standing (36/37):
+        // written on the TICK command buffer, read in the FRAGMENT stage,
+        // covered by the global barrier every command buffer opens with.
+        // Render-only; an empty field costs two header loads a pixel.
+        entry(42, T::ReadOnlyStorage, S::Fragment),               // elecPool
+        entry(43, T::ReadOnlyStorage, S::Fragment),               // elecMeta
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -3959,6 +3967,8 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(40, gasMaskBuf_),
         b(39, giReqBuf_),
         b(41, world_->shadowCache),   // 14's read-only view (shadowSlotRead)
+        b(42, world_->elecPool),      // the charge field (raymarch elecPAt)
+        b(43, world_->elecMeta),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

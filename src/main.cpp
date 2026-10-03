@@ -1691,7 +1691,8 @@ Vec3 SpawnPos() {
 // queue, settle briefly, write the three standard screenshots, exit — so
 // render/look changes can be judged in seconds instead of the full selftest.
 // Cameras deliberately match the selftest's so the two stay comparable.
-int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
+int RunShots(GpuContext& ctx, World& world, Simulation& sim,
+             const std::vector<MaterialDef>& mats) {
   // THE WHOLE WINDOW PER TICK for the openness/irradiance refresh, in this
   // harness only. The grid's rolling refresh covers 256 slots a tick and a
   // worldgen zeroes every stamp, so a section that re-runs worldgen and
@@ -1761,6 +1762,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // so a time of 0 would show every shot at the one phase where the ripples
   // happen to be flat. Constant, so shots stay reproducible frame to frame.
   const float kShotTime = 11.7f;
+  // RenderParams extraFlags for renderAt's frames: 0 for every frame but the
+  // charge view's (bit 64, raymarch.wgsl RFLAG_ELECVIEW), which sets it around
+  // its one render call.
+  uint32_t shotExtraFlags = 0;
   // Time of day for the shots. `--time 0..1` (0 = midnight, 0.5 = noon) maps
   // to the tick that lands on that phase, so the sky/sun/moon can be inspected
   // at any point in the cycle without waiting for the cycle to get there.
@@ -1801,7 +1806,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     const bool shotDenoise = CurrentTuning().render.denoise != 0;
     for (int f = 0; f < 4; f++) {
       WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
-                        kFarFogDensity, 1080.0f, frameTick);
+                        kFarFogDensity, 1080.0f, frameTick, 0u, 0.0f,
+                        shotExtraFlags);
       if (shotDenoise) {
         sim.EnsureDenoise(W, H);
         sim.WriteDenoiseParams(ctx.queue, W, H,
@@ -2745,6 +2751,99 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // sits 2 under the lowest rim sample, the centre TUNE_POND_DEPTH below it.
     render({(float)(kPx - 30), (float)(rim - 10), (float)(kPz - 30)}, 0.785f,
            0.04f, "screenshot_pond_sub.bmp");
+  }
+
+  // ---- THE CHARGE FIELD MADE VISIBLE (package E5b) ------------------------
+  // docs/PLAN_electricity.md section 5 (render). Nothing in the world holds
+  // charge on its own -- the sources are transient gases -- so the subject is
+  // built here, through the MutationQueue like every fixture in this harness,
+  // on a stone platform levelled over the ground (filled down to it, so no part
+  // of it is a floating island the debris scan would lift):
+  //   * a drawn-copper wire fed by LIGHTNING (30,000): blinding end to end
+  //   * a parallel wire fed by a SPARK (200): the faint shimmer
+  //   * a two-deep pond sunk in the platform, an ARC (2,000) into a copper
+  //     cell in its rim: the water carries it, fading at resist 6 a cell
+  // Each source sits in a stone pocket open only toward what it feeds (the
+  // elec-field gate's Pocket: a gas moves diagonally and would wander off)
+  // and is re-laid every tick, because all three decay within a tick or two.
+  //   screenshot_elec        mid-morning (--time)
+  //   screenshot_elec_night  the same view at night, where the glow carries
+  //   screenshot_elec_view   the charge view (F11): P in false colour
+  // Moves the window and regenerates, like the pond block above.
+  if (ShotWanted("screenshot_elec") || ShotWanted("screenshot_elec_night") ||
+      ShotWanted("screenshot_elec_view")) {
+    auto matId = [&](const char* name) {
+      for (size_t i = 0; i < mats.size(); i++)
+        if (mats[i].name == name) return (uint32_t)i;
+      return 0u;
+    };
+    const uint32_t copper = matId("copper_bar"), mLight = matId("lightning"),
+                   mSpark = matId("spark"), mArc = matId("arc");
+    const int gx = 120, gz = 140;
+    world.SetWindowOrigin({gx / (int)kChunk - 8, 0, gz / (int)kChunk - 8});
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int x0 = gx - 30, x1 = gx + 30, z0 = gz - 16, z1 = gz + 16;
+    int yP = INT32_MIN;
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++)
+        yP = std::max(yP, World::TerrainHeight(x, z, kDefaultSeed) + 1);
+    // The pond: water at yP - 1 and yP, flush with the platform top.
+    const int px0 = gx + 2, px1 = gx + 22, pz0 = gz - 2, pz1 = gz + 12;
+    auto inPond = [&](int x, int y, int z) {
+      return x >= px0 && x <= px1 && z >= pz0 && z <= pz1 && (y == yP || y == yP - 1);
+    };
+    std::vector<CellOp> site, build, feed;
+    auto put = [&](std::vector<CellOp>& v, int x, int y, int z, uint32_t w) {
+      if (world.CellInWindow({x, y, z})) v.push_back({World::SlotCellIndex({x, y, z}), w});
+    };
+    // Tick 1: the platform (stone from below the ground up to yP, the pond's
+    // water) and clear air over it. Tick 2: what stands on it -- two ops on one
+    // cell in one tick keep the first, so the air would eat the contents.
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++) {
+        const int h = World::TerrainHeight(x, z, kDefaultSeed);
+        for (int y = h - 2; y <= yP; y++)
+          put(site, x, y, z, inPond(x, y, z) ? PackVoxNew(kMatWater, 7u) : kMatStone);
+        for (int y = yP + 1; y <= yP + 14; y++) put(site, x, y, z, 0u);
+      }
+    // A pocket: stone on all 26 neighbours of the source but the open one.
+    auto pocket = [&](int x, int y, int z, int ox, int oy, int oz) {
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++) {
+            if ((dx == 0 && dy == 0 && dz == 0) || (dx == ox && dy == oy && dz == oz)) continue;
+            put(build, x + dx, y + dy, z + dz, kMatStone);
+          }
+    };
+    const int wx0 = gx - 24, wx1 = gx - 2, zL = gz - 6, zS = gz - 11;
+    for (int zw : {zL, zS}) {
+      pocket(wx0 - 1, yP + 1, zw, 1, 0, 0);
+      for (int x = wx0; x <= wx1; x++) put(build, x, yP + 1, zw, copper);
+      put(feed, wx0 - 1, yP + 1, zw, zw == zL ? mLight : mSpark);
+    }
+    // The pond's electrode: two copper cells IN the rim, the arc above them.
+    // The pocket's lower ring (y = yP) covers the rim AND the pond's edge
+    // cells beside the electrode with stone, so the copper reaches down to
+    // yP - 1, where its +x face is the pond's lower layer.
+    const int ex = px0 - 1, ez = pz0 + 6;
+    pocket(ex, yP + 1, ez, 0, -1, 0);
+    put(build, ex, yP, ez, copper);
+    put(build, ex, yP - 1, ez, copper);
+    put(feed, ex, yP + 1, ez, mArc);
+    uint32_t t = 1;
+    SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, site, false, {8, 3, 8}, false, false);
+    SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, build, false, {8, 3, 8}, false, false);
+    for (int i = 0; i < 40; i++)
+      SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, feed, false, {8, 3, 8}, false, false);
+    ctx.WaitIdle();
+    const Vec3 eye{(float)(gx - 2), (float)(yP + 18), (float)(gz - 46)};
+    render(eye, 1.5708f, -0.36f, "screenshot_elec.bmp");
+    const uint32_t nightTick = (uint32_t)(0.02 * (double)shotTicksPerDay) % shotTicksPerDay;
+    renderAt(eye, 1.5708f, -0.36f, "screenshot_elec_night.bmp", (int64_t)nightTick);
+    shotExtraFlags = 64u;
+    render(eye, 1.5708f, -0.36f, "screenshot_elec_view.bmp");
+    shotExtraFlags = 0u;
   }
 
   // ---- THE LOD SEAM AT EYE HEIGHT (2026-09-28, LOD-seam overhaul P0) ----
@@ -4883,7 +4982,7 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
   if (doShots) {
     std::printf("\n--- verify: %zu shot frame(s) ---\n", g_shotOnly.size());
     g_shotResults.clear();
-    if (RunShots(ctx, world, sim) != 0) failures++;
+    if (RunShots(ctx, world, sim, mats) != 0) failures++;
     for (const std::string& want : g_shotOnly) {
       bool seen = false;
       for (const ShotRecord& r : g_shotResults) {
@@ -6527,7 +6626,7 @@ int main(int argc, char** argv) {
     return RunVoxDump(ctx, world, sim, mats, voxdumpArgs, voxdumpOut);
   if (voxserve) return RunVoxServe(ctx, world, sim, mats);
   if (!exportEdits.empty()) return RunExportEdits(ctx, world, sim, mats, exportEdits);
-  if (shot) return RunShots(ctx, world, sim);
+  if (shot) return RunShots(ctx, world, sim, mats);
   if (shotWaterfall) return RunWaterfallShot(ctx, world, sim);
   if (shotDebrisPond) return RunDebrisPondShot(ctx, world, sim, mats);
   if (shotFluid || shotFluidPond)
@@ -7279,7 +7378,7 @@ int main(int argc, char** argv) {
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
 
-  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eF11, eR, eEsc, eLBracket, eRBracket, eJump,
       eJ, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
   // THE HANDS (dual wielding, 2026-09-27): Q puts the selected hotbar stack
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
@@ -11730,6 +11829,11 @@ int main(int argc, char** argv) {
       ui.reloadShaders = true;
       ui.regenWorld = true;
     }
+    // F11: the charge view (UIState::showChargeView; raymarch.wgsl
+    // RFLAG_ELECVIEW). Beside F3/F4/F6, the other views of something the world
+    // does invisibly.
+    if (devKeys && eF11.Pressed(key(GLFW_KEY_F11)))
+      ui.showChargeView = !ui.showChargeView;
     if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (devKeys && !edActive && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
@@ -14407,7 +14511,9 @@ int main(int argc, char** argv) {
                           (float)now, fogSmooth, viewPxThisFrame, tick,
                           fluidCount,
                           (float)(accumulator / kTickDt),
-                          ui.showDirtyVoxels ? 2u : 0u, renderW, renderH);
+                          (ui.showDirtyVoxels ? 2u : 0u) |
+                              (ui.showChargeView ? 64u : 0u),
+                          renderW, renderH);
       };
       writeMainRenderParams();
       // actVoxViz is filled GPU-side by sim_step.wgsl when vizActive is set;

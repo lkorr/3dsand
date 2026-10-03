@@ -115,6 +115,12 @@ struct UIState {
   bool showCornerReadout = true;
   bool showDirtyChunks = false;
   bool showDirtyVoxels = false;
+  // THE CHARGE VIEW (F11; package E5b): every surface the raymarch shades is
+  // drawn in false colour by the charge field's P (log scale: blue a few units,
+  // yellow a spark, red an arc, white lightning) and everything uncharged in
+  // dim grey. RenderParams flag bit 6 (raymarch.wgsl RFLAG_ELECVIEW), a
+  // SPEC_DEBUG_VIZ branch, so it costs nothing while off.
+  bool showChargeView = false;
   // Vector-field overlay (F4), a THREE-state cycle: off -> wind -> current.
   // One key rather than two because the two fields answer the same question in
   // the same picture and you almost always want to compare them, not composite

@@ -27,7 +27,7 @@ namespace sandvox {
 
 struct RenderSpec {
   bool fluid = true;       // R.fluidCount > 0
-  bool debugViz = true;    // R.flags bit 1 — the active-voxel highlight
+  bool debugViz = true;    // R.flags bit 1 or 6 — active-voxel highlight / charge view
   bool shortRange = true;  // R.flags bit 2 — the 100 m ray ceiling
   // The lean variant is legal exactly when every specialized branch is off.
   // Defaults say "all of them might be live", so a draw that somehow preceded

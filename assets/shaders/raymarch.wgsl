@@ -235,6 +235,99 @@ const SOLS_BASE : u32 = 16u;
 const SOLS_STRIDE : u32 = 16u;
 const SOLS_MAT_BASE : u32 = 4112u;
 
+// ---- THE CHARGE FIELD, read-only (package E5b; src/sim/elec.h) --------------
+// The sim's elecPool / elecMeta (simBGL_ 55/56), bound again at renderBGL_
+// 42/43 as plain read-only storage. Written on the TICK command buffer, read in
+// the FRAGMENT stage, covered by the global barrier every command buffer opens
+// with -- heatPool's standing (renderBGL_ 36/37). NOT the sim's MIRROR-BEGIN
+// elec block: that one needs elecMeta atomic, which a fragment stage must not
+// bind. The constants are elec.h's, held there by scripts/check_invariants.py
+// `elec` (which reads this file too). Render-only: nothing here is hashed.
+//
+// COST, in order of the tests a pixel meets (rule 2 for the render path):
+//   elecAnyCharge()  two header words, the SAME two for every pixel of the
+//                    frame (cache-resident, dynamically uniform branch): the
+//                    live-list count elecSettle left. An empty field -- every
+//                    frame of a world with no charge -- stops here.
+//   per chunk        the hit's slot entry (HAS | page) and owner key: a chunk
+//                    with no page stops here, before any per-cell read.
+//   per cell         one pool word.
+@group(0) @binding(42) var<storage, read> elecPool : array<u32>;
+@group(0) @binding(43) var<storage, read> elecMeta : array<u32>;
+const ELEC_PAGE_WORDS : u32 = 4096u;
+const ELEC_ENTRY_HAS : u32 = 0x80000000u;
+const ELEC_ENTRY_PAGE : u32 = 0x00FFFFFFu;
+const EM_CUR : u32 = 0u;
+const EM_COUNT0 : u32 = 5u;
+const EM_ENTRY : u32 = 64u;
+const EM_OWNER : u32 = 32832u;
+// R.flags bit 6: the dev panel's CHARGE VIEW (F11). A SPEC_DEBUG_VIZ branch:
+// RenderSpec.debugViz is set by bit 1 OR this bit (support.cpp), so the lean
+// variant deletes the overlay and a frame with it on draws the universal one.
+const RFLAG_ELECVIEW : u32 = 64u;
+// The glow curve: emission = ELEC_GLOW_K * (P / ELEC_GLOW_REF)^ELEC_GLOW_EXP,
+// a power law in P (a straight line in log P), so the authored sources land
+// where the owner asked: a spark's 200 is 0.12 (a faint shimmer on a copper
+// bar), an arc's 2,000 0.55, lightning's 30,000 ~3.2 (blinding; the tone map
+// takes it to white), and the few-unit tail of a wire's far end is nothing.
+const ELEC_GLOW_K : f32 = 0.12;
+const ELEC_GLOW_REF : f32 = 200.0;
+const ELEC_GLOW_EXP : f32 = 0.65;
+// The flicker's clock: a fresh per-cell level 24 times a second off R.time
+// (render-only, so wall time is allowed). Each cell holds a floor of 35% so a
+// charged run never reads as switched off between flashes.
+const ELEC_FLICKER_HZ : f32 = 24.0;
+
+fn elecAnyCharge() -> bool {
+  return elecMeta[EM_COUNT0 + (elecMeta[EM_CUR] & 1u)] != 0u;
+}
+// P (0..65535) at world cell c: last tick's settled field (page half 0). 0
+// outside the window, in a chunk with no page, and in a slot whose page still
+// belongs to the chunk the window just scrolled away from (the owner key; the
+// next CA-active tick's head re-keys it).
+fn elecPAt(c : vec3<i32>) -> u32 {
+  let wc = worldChunkOf(c);
+  if (!chunkInWindow(wc, R.origin)) { return 0u; }
+  let slot = chunkSlotIndex(wc);
+  let e = elecMeta[EM_ENTRY + slot];
+  if ((e & ELEC_ENTRY_HAS) == 0u) { return 0u; }
+  let u = vec3<u32>(wc & vec3<i32>(1023));
+  if (elecMeta[EM_OWNER + slot] != (u.x | (u.y << 10u) | (u.z << 20u)) + 1u) { return 0u; }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  let local = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  let w = elecPool[(e & ELEC_ENTRY_PAGE) * ELEC_PAGE_WORDS + (local >> 1u)];
+  return (w >> ((local & 1u) * 16u)) & 0xFFFFu;
+}
+// The emitted light of a cell holding P > 0: blue-white, whiter as it climbs,
+// flickering per cell. Added on top of the lit surface (an arc is its own light
+// source, not a colour of the thing it runs through).
+fn elecGlow(c : vec3<i32>, p : u32) -> vec3f {
+  let e = ELEC_GLOW_K * pow(f32(p) / ELEC_GLOW_REF, ELEC_GLOW_EXP);
+  let tq = u32(R.time * ELEC_FLICKER_HZ);
+  let hs = pcg(cellIndexW(c) ^ (tq * 0x9E3779B9u));
+  let fl = 0.35 + 0.65 * f32(hs & 0xFFu) / 255.0;
+  let col = mix(vec3f(0.45, 0.65, 1.0), vec3f(1.0), clamp(e * 0.3, 0.0, 1.0));
+  return col * (e * fl);
+}
+// The charge view's false colour over log2 P (0..16): blue (a few units) ->
+// cyan -> green -> yellow (a spark, ~2^8) -> red (an arc, ~2^11) -> white
+// (lightning, ~2^15). Uncharged surfaces are drawn as dim grey by the caller.
+fn elecFalseColour(p : u32) -> vec3f {
+  let t = clamp(log2(f32(p)) / 16.0, 0.0, 1.0) * 5.0;
+  let k = vec3f(0.0, 0.2, 1.0);
+  if (t < 1.0) { return mix(k, vec3f(0.0, 0.9, 1.0), t); }
+  if (t < 2.0) { return mix(vec3f(0.0, 0.9, 1.0), vec3f(0.1, 1.0, 0.2), t - 1.0); }
+  if (t < 3.0) { return mix(vec3f(0.1, 1.0, 0.2), vec3f(1.0, 0.95, 0.1), t - 2.0); }
+  if (t < 4.0) { return mix(vec3f(1.0, 0.95, 0.1), vec3f(1.0, 0.15, 0.05), t - 3.0); }
+  return mix(vec3f(1.0, 0.15, 0.05), vec3f(1.0), t - 4.0);
+}
+// The charge view's treatment of one shaded surface pixel at cell c.
+fn elecViewShade(color : vec3f, c : vec3<i32>) -> vec3f {
+  let p = elecPAt(c);
+  if (p != 0u) { return elecFalseColour(p); }
+  return vec3f(dot(color, vec3f(0.2126, 0.7152, 0.0722)) * 0.3);
+}
+
 // What the liquid shades (shadeWater / shadeSubmerged / shadeMpmFluid) leave
 // for fs() to write into the veil. Private globals rather than a returned
 // struct for gRsTraceSteps' reason: those functions are inlined into fs() and
@@ -13572,6 +13665,13 @@ fn fs(in : VSOut) -> FSOut {
       let flick = TUNE_EMISSIVE_FLICKER_BASE + TUNE_EMISSIVE_FLICKER_AMP * sin(R.time * TUNE_EMISSIVE_FLICKER_RATE + f32(ch & 0xFFu) * 0.0245);
       color += albedo * emis * TUNE_EMISSIVE_STRENGTH * flick;
     }
+    // ---- charge glow (E5b; elecPAt above) ----
+    // Before the fog, so a charged wire hazes with distance like everything
+    // else. A micro hit is a plant part, which the field does not reach.
+    if (!isMicro && elecAnyCharge()) {
+      let ep = elecPAt(h.cell);
+      if (ep != 0u) { color += elecGlow(h.cell, ep); }
+    }
     // (heatSpill, the four-tap molten-light stand-in that used to live here,
     // was deleted by P3 of docs/PLAN_gi.md: lava and embers deposit their
     // emission into the irradiance grid through irrSample, and the gather above
@@ -13598,6 +13698,10 @@ fn fs(in : VSOut) -> FSOut {
       if (me < 0.08) {
         color = vec3f(1.0, 0.05, 0.05);
       }
+    }
+    // ---- the charge view (dev panel / F11; RFLAG_ELECVIEW) ----
+    if (SPEC_DEBUG_VIZ && (R.flags & RFLAG_ELECVIEW) != 0u) {
+      color = elecViewShade(color, h.cell);
     }
   }
 
@@ -13769,6 +13873,20 @@ fn fs(in : VSOut) -> FSOut {
       // render.mistDensity at 0 so does this one.
       if (!underwater && caShadedLiquid) {
         color = waterfallMist(color, hitP, rd, h.liqT, liqCell, lm);
+      }
+      // ---- a charged liquid's surface (E5b) ----
+      // The surface shade above already took its aerial fog, so the glow is
+      // faded by the same fraction rather than fogged a second time. The bed
+      // under the water is shaded by the opaque path (stone holds no charge).
+      if (!underwater && caShadedLiquid && elecAnyCharge()) {
+        let lp = elecPAt(liqCell);
+        if (lp != 0u) {
+          color += elecGlow(liqCell, lp) * (1.0 - aerialFrac(h.liqT));
+        }
+      }
+      if (SPEC_DEBUG_VIZ && (R.flags & RFLAG_ELECVIEW) != 0u && !underwater &&
+          caShadedLiquid) {
+        color = elecViewShade(color, liqCell);
       }
       // After the mist, which hangs between the eye and the surface and so
       // covers a body under it exactly as it covers the bed.
