@@ -1052,7 +1052,7 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
   // while mobs did (see Mob::RegisterTerrainAnchor).
   RegisterTerrainAnchor();
   // A separate budget from the mob pass's, and deliberately: the player is
-  // one creature out of up to sixteen, and sharing one pool would let a crowd
+  // one creature out of up to kMaxMobs (64), and sharing one pool would let a crowd
   // of burning NPCs starve the fire on the character the camera is pointed
   // at. The PASS underneath (Mob::BurnTick -> MobSystem::BurnOneLimb) is the
   // shared one.

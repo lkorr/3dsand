@@ -50,7 +50,7 @@
 // `packed` bit budget, and why it is laid out this way:
 //   0..11   material id (12 bits, the world-cell convention)
 //   12..15  state nibble — the cosmetic 3-variant palette index
-//   16..27  body slot (12 bits; kMaxBodySlots is 512, so 3 bits spare)
+//   16..27  body slot (12 bits; kMaxBodySlots is 2048, so 1 bit spare)
 //   28..31  ART COLOUR, 4 bits (0 = unpainted, 1..15 = art slot 1..15)
 // The art field is deliberately NARROW here. This is the coincident-skin path
 // (skinScale == 1) — plain debris and the one test mob; every real character

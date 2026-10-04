@@ -73,6 +73,20 @@ enum Phase : uint8_t {
   // Inside kHairTuck: the hood's cover map rebuilt (a shell's lattice moved).
   kHairCover,
   kHairFull,    // ...a hair limb's whole tuck re-derived (not the fast path)
+  // Inside kMobLoop, the living NPC's driver stage by stage (the mob-cap64
+  // crowd harness: which of them grows with the NUMBER of creatures).
+  kTerrainAnchor, // Mob::RegisterTerrainAnchor
+  kSense,       // MobSystem::SenseGround
+  kIntent,      // MobSystem::DecideIntent (perception, arbiter, path follow)
+  kCrowd,       // MobSystem::ApplyCrowdSpacing
+  kDrive,       // Steer + UpdateFall + DriveLocomotion
+  kStroke,      // BeginStroke + StepStroke (the blade sweep)
+  kAnim,        // MobSystem::UpdateAnimation
+  kSubmit,      // Mob::SubmitPose (model -> world, Jolt kinematic targets)
+  kBleed,       // Mob::BleedTick
+  kActors,      // the actor list the behaviour layer reads, built per tick
+  kShockQuery,  // MobSystem::QueueShockQueries
+  kSplatter,    // inside kStain: this tick's bursts replayed against every body
   kCount
 };
 
@@ -85,7 +99,10 @@ inline const char* Name(int p) {
                                   "mobLoop", "stain", "deadSleep", "stainContact",
                                   "stainRain", "stainDry", "stainWet",
                                   "stainFlesh", "stainWalk", "stainSurface",
-                                  "hairCover", "hairFull"};
+                                  "hairCover", "hairFull", "terrainAnchor",
+                                  "sense", "intent", "crowd", "drive",
+                                  "stroke", "anim", "submit", "bleed",
+                                  "actors", "shockQuery", "splatter"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 

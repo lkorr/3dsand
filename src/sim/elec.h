@@ -187,17 +187,20 @@ static_assert(kEmArgs + kElecArgRecords * 4 <= kEmHdrWords, "the args fit the he
 // copy landed". A box is inclusive and at most kElecQueryAxisMax cells along
 // each axis (the CPU clamps it).
 //
-// SIZED FROM THE CREATURE CAP. kElecQueryMax must hold every living creature
-// (MobSystem::kMaxMobs) plus the players' bodies; mob_shock.cpp
-// static_asserts kMaxMobs + kElecQueryPlayerReserve <= kElecQueryMax, so
-// raising the cap past it fails the build instead of silently refusing the
-// last bodies (the wave-1 query asked one box per LIMB and stopped at ~8
+// SIZED FROM THE CREATURE CAP. kElecQueryMax holds every living creature
+// (world.h kMaxLiveMobs = MobSystem::kMaxMobs, restated here as
+// kElecLiveMobs) plus the players' bodies; elec.cpp static_asserts the
+// restatement and mob_shock.cpp the sum, so raising the cap without this
+// fails the build instead of silently refusing the last bodies (the wave-1 query asked one box per LIMB and stopped at ~8
 // bodies). The grid budget, kElecQueryGridWordsMax, holds kElecQueryMax
 // human-sized boxes (a human's box is ~7 x 19 x 7 cells, ~470 words); a box
 // past the budget is refused and counted (World::ElecQueryCounters), the
 // players' never (they queue first).
+// world.h kMaxLiveMobs, restated (materials.h includes this header, so it
+// cannot include world.h) and static_asserted against it in elec.cpp.
+constexpr uint32_t kElecLiveMobs = 64;
 constexpr uint32_t kElecQueryPlayerReserve = 16;
-constexpr uint32_t kElecQueryMax = 96;
+constexpr uint32_t kElecQueryMax = kElecLiveMobs + kElecQueryPlayerReserve;   // 80
 constexpr uint32_t kElecQueryBoxWords = 8;   // lo.xyz, hi.xyz (i32, inclusive), grid word offset, 0
 constexpr uint32_t kElecQueryResWords = 4;   // maxP, charged cells, sum P, cells scanned
 constexpr uint32_t kElecQueryAxisMax = 32;

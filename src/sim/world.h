@@ -974,10 +974,36 @@ struct FluidSpawnOp {
                         // solver weighs it by materials[mat].density
 };
 
+// THE LIVE CREATURE CAP. MobSystem::kMaxMobs IS this constant; it lives here,
+// in the GPU-layout header, because the body render slots and the micro-body
+// model table below are sized from it, and so may anything in sim/ that sizes a
+// per-creature table (sim/ cannot include game/mob.h). 16 until 2026-10-04
+// (PLAN_electricity_wave2 package C). Counts the LIVING only: the dead have
+// their own caps (MobSystem::kMaxDeadMobs / kMaxDeadBodies).
+constexpr uint32_t kMaxLiveMobs = 64;
+// Body render slots ONE living creature may need: its base limbs, a held item
+// in each hand, worn garment shells and hair. The armed, dressed human is the
+// largest shipped body (the `mob-cap64` gate records the real peak per
+// creature as mobCap64.peakSlotsPerMob); a creature past this still renders up
+// to kMaxBodySlots, it just eats the slack below.
+constexpr uint32_t kBodySlotsPerLiveMob = 24;
+
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
 // slot in bits 16..27, so the hard ceiling is 4096). Debris bodies take slots
-// [0, debrisCount), mob limbs stack after them.
-constexpr uint32_t kMaxBodySlots = 512;
+// [0, debrisCount), the avatars' parts after them, then every mob limb (the
+// dead included). Every walk stops at this ceiling and the LAST walked (the
+// mobs) are who a crowded frame starves, so it is sized to the sum of:
+//   debris            kMaxBodies (200, phys/debris.h)
+//   the living        kMaxLiveMobs * kBodySlotsPerLiveMob (64 * 24 = 1536)
+//   the dead          MobSystem::kMaxDeadBodies (240)
+//   the avatars       a few dozen
+// = ~2000, so 2048. 512 until 2026-10-04 — sized for 16 creatures; 64 armed
+// humans alone are ~1100 limb bodies. VRAM: bodyXforms 32 B and
+// microBodyInsts 16 B per slot, 96 KiB in all (was 24 KiB).
+constexpr uint32_t kMaxBodySlots = 2048;
+static_assert(kMaxBodySlots >= 200 + kMaxLiveMobs * kBodySlotsPerLiveMob + 240,
+              "body render slots must cover debris + the living cap + the dead");
+static_assert(kMaxBodySlots <= 4096, "BodyVoxInst packs the slot in 12 bits");
 
 // CPU-authored render instance (grenades, markers) — must match Sprite in
 // debris.wgsl (32 bytes). Render-only: floats are fine here.
@@ -2466,7 +2492,12 @@ constexpr uint32_t kMicroPoolWordsWorld = 1u << 20;
 // (MobSystem::EvictUnusedDefs), so this is sized to what can be ALIVE, not to
 // what a session has ever spawned. Changing it misses the SPIR-V cache once
 // (MICRO_BODY_POOL_WORDS is in the constant prelude).
-constexpr uint32_t kMicroBodyPoolWordsWorld = 4u << 20;
+// 8 MiW = 32 MiB since 2026-10-04 (kMaxLiveMobs 16 -> 64). The clone term
+// scales with the creatures FIGHTING, and the `mob-cap64` brawl (64 mixed
+// creatures, 300 ticks) filled 4 MiW to the last word and was refused 269k
+// times: every new wound on a fresh limb left its skin stale. +16 MiB VRAM.
+// The gate records the peak live words it reaches (mobCap64.peakLivePoolWords).
+constexpr uint32_t kMicroBodyPoolWordsWorld = 8u << 20;
 // ---- THE MODEL TABLE IS SHARED RECORDS **PLUS** EVERY OWNED CLONE ----------
 //
 // Two populations, and sizing this to the first one is the bug it shipped with
@@ -2497,12 +2528,16 @@ constexpr uint32_t kMicroBodyPoolWordsWorld = 4u << 20;
 // body keeps a stale skin. What changed alongside this number is that the
 // refusal is no longer SILENT (MicroBodySet::refusals) — a cap whose only
 // symptom is "gore quietly stopped working" is a cap nobody can diagnose.
-static_assert(kMaxBodySlots <= 512, "micro-body model ceiling derived below");
 // 2048 since 2026-09-25: the random-human pool made SHARED records a runtime
 // population too -- every pool body built is ~30 more, held until nothing uses
 // it (MobSystem::EvictUnusedDefs) -- so the table now has to cover the load,
 // the pool bodies alive at once AND the owned clones their fights make. 32 KiB.
-constexpr uint32_t kMaxMicroBodyModels = 2048;
+// 4096 since 2026-10-04 (kMaxLiveMobs 16 -> 64): the owned term is bounded by
+// kMaxBodySlots, which went 512 -> 2048, so the shared ~1000 (load + every pool
+// body) plus 2048 owned no longer fit 2048. 64 KiB, +32 KiB of VRAM.
+constexpr uint32_t kMaxMicroBodyModels = 4096;
+static_assert(kMaxMicroBodyModels >= kMaxBodySlots + 1024,
+              "micro-body model table: shared records + one owned clone per slot");
 // A micro body's model has no micro model when its slot maps here.
 constexpr uint32_t kMicroBodyNoModel = 0xFFFFFFFFu;
 

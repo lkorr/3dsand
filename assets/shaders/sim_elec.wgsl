@@ -948,10 +948,10 @@ fn elecPurge(@builtin(workgroup_id) wg : vec3<u32>,
 // load (its grid is left unwritten: the CPU never reads the grid of a box
 // whose max P is 0 unless a charged body touches it, and then reads "no P").
 const EM_QUERY : u32 = 72768u;
-const EM_QUERY_GRID : u32 = 73152u;
+const EM_QUERY_GRID : u32 = 73088u;
 const EP_QUERY : u32 = 16416u;
 const EP_QUERY_BOXES : u32 = 16420u;
-const ELEC_QUERY_MAX : u32 = 96u;
+const ELEC_QUERY_MAX : u32 = 80u;
 const ELEC_QUERY_BOX_WORDS : u32 = 8u;
 const ELEC_QUERY_RES_WORDS : u32 = 4u;
 const ELEC_QUERY_AXIS_MAX : u32 = 32u;

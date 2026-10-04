@@ -11458,9 +11458,10 @@ Status GateMobSaveDelta(Ctx& c, std::string& detail) {
   for (int i = (int)hd.limbs.size() - 1; i >= 0 && severLimb < 0; i--)
     if (hd.limbs[i].severable && !hd.limbs[i].vital && i != hd.rootLimb)
       severLimb = i;
-  // 16 = MobSystem::kMaxMobs (private); a refused spawn fails loudly below.
+  // The living cap; a refused spawn fails loudly below.
   const int nPristine =
-      std::clamp((int)BaselineNumber("mobSaveDeltaCrowd", 11), 1, 16 - 4);
+      std::clamp((int)BaselineNumber("mobSaveDeltaCrowd", 11), 1,
+                 (int)MobSystem::MaxLiveMobs() - 4);
   const IVec3 o = c.world.WindowOrigin();
   const IVec3 base{(o.x + (int)kNChunk / 2) * (int)kChunk,
                    (o.y + (int)kNChunk / 2) * (int)kChunk,
