@@ -12,8 +12,8 @@
 //                         ref whose cell is matter, under the smithy floor;
 //                      B. THERE IS A CELLAR: air under the smithy's footprint,
 //                         at least cellar.minAirCells of it;
-//                      C. IT IS REACHABLE: a walker flood (a 5x5 footprint,
-//                         18 cells of headroom, up 6 / down 8 per step -- the
+//                      C. IT IS REACHABLE: a walker flood (the player's box,
+//                         7x7x17, resting on what is under it, up 6 / down 8 -- the
 //                         player's step) from the bedroom's waynode reaches
 //                         at least cellar.minReachableBelow standing cells
 //                         2 m or more under the floor;
@@ -318,7 +318,7 @@ Status GateHarrowbyCellar(Ctx& c, std::string& detail) {
   check((double)air >= minAir, Format("%lld air cells under the smithy floor, want >= %.0f", air, minAir));
 
   // C. the walker flood from the bedroom.
-  constexpr int kFoot = 2, kHead = 18, kUp = 6, kDown = 8;
+  constexpr int kFoot = 3, kHead = 17, kUp = 6, kDown = 8;
   const int NX = vb.n.x, NY = vb.n.y, NZ = vb.n.z;
   std::vector<uint8_t> upRun((size_t)NX * NY * NZ, 0);   // passable cells from here up (capped)
   for (int z = 0; z < NZ; z++)
@@ -331,15 +331,17 @@ Status GateHarrowbyCellar(Ctx& c, std::string& detail) {
     }
   auto standable = [&](int x, int y, int z) {   // box-local
     if (y < 1 || x < kFoot || z < kFoot || x >= NX - kFoot || z >= NZ - kFoot) return false;
-    if (!floorish(vb.mat[((size_t)z * NY + (y - 1)) * NX + x])) return false;
-    if (upRun[((size_t)z * NY + y) * NX + x] < kHead) return false;
-    // The body's width is clear from step height up (a capsule rides over
-    // the step it is standing beside; the stair's next tread is 2-4 higher).
-    if (y + kUp >= NY) return false;
+    // THE PLAYER'S BOX (Player::kHalfXZ 3, 2 x kHalfY = 17): every column of
+    // its footprint clear from its bottom to its top, and SOMETHING under the
+    // footprint to stand on -- on a stair the box rests on the highest tread
+    // it covers, which is what makes headroom at a ceiling's edge honest.
+    bool supported = false;
     for (int dz = -kFoot; dz <= kFoot; dz++)
-      for (int dx = -kFoot; dx <= kFoot; dx++)
-        if (upRun[((size_t)(z + dz) * NY + (y + kUp)) * NX + (x + dx)] < kHead - kUp) return false;
-    return true;
+      for (int dx = -kFoot; dx <= kFoot; dx++) {
+        if (upRun[((size_t)(z + dz) * NY + y) * NX + (x + dx)] < kHead) return false;
+        supported = supported || floorish(vb.mat[((size_t)(z + dz) * NY + (y - 1)) * NX + (x + dx)]);
+      }
+    return supported;
   };
   IVec3 start{room->pos.x - blo.x, -1, room->pos.z - blo.z};
   for (int y = room->pos.y - blo.y - 2; y <= room->pos.y - blo.y + 2; y++)
@@ -387,7 +389,18 @@ Status GateHarrowbyCellar(Ctx& c, std::string& detail) {
                room->pos.x, room->pos.y, room->pos.z, reachable, below, minBelow));
 
   // D. the ring, on the cellar floor (the deepest standing level reached).
-  const int ringY = below > 0 ? deepest : floorY - 32;
+  // The level under the house with the most salt (the ring's own row; not
+  // the walker's floor, so a broken stair still lets this part report).
+  int ringY = floorY - 32, ringRow = 0;
+  for (int y = blo.y; y <= floorY - 4; y++) {
+    int n = 0;
+    for (int z = hlo.z; z <= hhi.z; z++)
+      for (int x = hlo.x; x <= hhi.x; x++) n += vb.At(x, y, z) == kSalt ? 1 : 0;
+    if (n > ringRow) {
+      ringRow = n;
+      ringY = y;
+    }
+  }
   long long sx = 0, sz = 0, saltN = 0;
   std::vector<uint8_t> wall((size_t)NX * NZ, 0);
   for (int z = 0; z < NZ; z++)

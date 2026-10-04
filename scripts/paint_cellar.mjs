@@ -27,7 +27,10 @@
  *     house's own footing and floor (199, 200), three timber joists;
  *   - the STAIR: a steep cellar stair (rise 2, tread 2 voxels; the player
  *     steps 6) down the bedroom's back wall, 1 m wide (z 3494..3503), from
- *     the floor opening at x 680..700 down westward to the floor at x 670.
+ *     the floor opening at x 674..700 down westward to the floor at x 670.
+ *     The opening runs that far west for HEADROOM: the player is a 0.6 m box
+ *     (Player::kHalfXZ) resting on the highest tread under it, so its head
+ *     clears the ceiling edge (x 673) only from x 676 down.
  *     A timber rail along the opening's north edge; you step in from its
  *     east end (x 701), beside the bed;
  *   - the CIRCLE: a salt ring (centre 705, 3462; cells 14 <= r < 16, one
@@ -90,7 +93,7 @@ const X0 = 664, X1 = 733, Z0 = 3434, Z1 = 3503;   // air
 const WX0 = X0 - 1, WX1 = X1 + 1, WZ0 = Z0 - 1, WZ1 = Z1 + 1;   // walls
 // The stair: rise 2 per tread of 2, k = 0..15 (k 15 is the floor). Tread k
 // covers x [699 - 2k, 700 - 2k] and its top cell is 198 - 2k.
-const SZ0 = 3494, SZ1 = 3503, SX_TOP = 700, OPEN_X0 = 680;
+const SZ0 = 3494, SZ1 = 3503, SX_TOP = 700, OPEN_X0 = 674;
 const stepTop = x => {             // top solid cell of the stair at column x, or null
   if (x > SX_TOP) return null;
   const k = Math.floor((SX_TOP - x) / 2);
