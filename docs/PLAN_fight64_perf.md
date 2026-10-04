@@ -139,3 +139,94 @@ measurement says so. Package P owns `src/phys/`.
 6. **Do NOT change what creatures decide or how they fight** to save time,
    unless you name it as a trade-off. "Far creatures think every other tick"
    is a proposal, not a silent change.
+
+## Round 1 result (2026-10-04)
+
+P (39a8b56) and M (59b0750) landed.
+
+| Phase, 64 brawl | Before | After |
+|---|---|---|
+| Jolt step (same corpse count) | 26.5 | 10.5 |
+| Mob side | 29.6 | 18.8 |
+
+- The harness GPU wait (~11 ms) is harness-only: the game frame never blocks
+  on it.
+- **The real game still cannot hold 30 Hz with 64 creatures.** CPU is about
+  35 ms a tick, and the frame loop spirals: catch-up ticks take frames from
+  ~30 to ~180 ms over 300 ticks.
+
+## Round 2
+
+### Package R — regressions and determinism (do this first, it gates trust)
+
+1. **`corpse-splatter` fails** since P: "blood coat 0 -> 0". It passed at
+   5f5fce7 ("0 -> 9").
+   - Likely the corpse hull (P): the splatter flight or coat landing now
+     meets the hull instead of the detailed shape, or the "re-check against
+     the detailed shape" path misses for droplets.
+   - Fix it so blood lands on the corpse as before. A hull is a collider,
+     not the body's surface.
+2. **Possible scheduling-dependent physics.**
+   - P saw the old-collider corpse-heavy arm end with 9/10/11 alive across
+     different builds (same build: always the same).
+   - M saw run-to-run divergence in one build, first in the Jolt contact
+     count at tick 208, with creature inputs identical up to then.
+   - The contact-impact lists were already made order-independent
+     (DESIGN.md "the contact-impact lists are collected uncapped and capped
+     AFTER the step").
+   - Find out whether anything is still racy. Run the 64 brawl, natural and
+     `killEvery 4`, with `SANDVOX_MOBCAP_DIGEST=1`:
+     - 3+ times in one build;
+     - across `SANDVOX_MOB_THREADS=1` vs default;
+     - across Jolt worker thread counts (`PhysicsWorkerThreads()`).
+
+     Compare the per-tick digests.
+   - On a divergence, attribute it to its first differing tick and field
+     (add reporter detail rather than eliminate by toggling; CLAUDE.md
+     rule 6), then fix the cause.
+   - A cross-BUILD difference (different compiled code, same source) is
+     worth a sentence on the cause (LTO/inlining/fp contraction), but
+     run-to-run and thread-count determinism is the invariant.
+   - Make the twice-run digest comparison a permanent part of `mob-cap64`
+     (or a new gate), so this is gated from now on.
+
+### Package Q — round-2 performance (target: the real game holds 30 Hz at 64)
+
+**A moved world hash is FINE** (CLAUDE.md rule 1): rebaseline once at the
+end. Do not avoid a change because it moves the hash.
+
+Allowed, if deterministic:
+- a different but deterministic split of a shared per-tick budget;
+- a different voxel order inside a collider.
+
+Name each in the report.
+
+1. **CCD, 6–10 ms.** Dead flesh shoved by kinematic living limbs triggers
+   linear casts against the crowd's box compounds. Options:
+   - restrict CCD to bodies whose motion could tunnel through TERRAIN (a
+     speed relative to their own thickness), and cast against the terrain
+     layer only (Jolt object-layer filtering of the cast);
+   - cap the velocity a kinematic limb can impart to a corpse;
+   - use simpler living-limb shapes for the cast.
+
+   Keep "nothing tunnels through terrain" gated.
+2. **Blade carves, ~5 ms.** About 1.8 ms is `DownsampleSkin`'s hash map
+   (`src/phys/lattice.h`). Replace it with a dense/flat structure even if
+   the collider voxel order (and the hash) changes.
+3. **Burn under the shared budget (~3.6 ms) and the shock solve (~2.4 ms).**
+   Parallelise them with a deterministic per-creature budget split, e.g. a
+   prefix allocation in id order computed before the parallel pass.
+4. **The frame-loop spiral.** When the tick costs more than its period the
+   game must degrade gracefully, not climb to 180 ms frames.
+   - Cap catch-up ticks per frame.
+   - Let sim time slow (the tick count stays the authority, so determinism
+     is unaffected).
+   - Keep the GPU-snapshot deferral sane.
+
+   Measure with `--brawl` in the real windowed loop.
+5. Re-profile with `SANDVOX_SAMPLE_PROF=1` and take whatever is next.
+6. **Report:** the before/after table, plus `--brawl` real-frame p50/p95.
+
+R and Q may both touch `src/phys/physics.cpp`. R owns
+determinism/contact-report code and splatter; Q owns the CCD settings and
+`lattice.h`. Keep shared edits small.
