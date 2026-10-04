@@ -565,6 +565,19 @@ Content picked by the orchestrator (rename freely):
      -> honest;
    - deterministic.
 
+10. **Owner request 2026-10-04: a contained demon with no way to reach or
+    harm the summoner stays put.** It holds its arrival point / the circle's
+    centre (drifting back if displaced), facing and watching the summoner,
+    instead of pathing into the salt and grinding on the fence. "No way" = no
+    option the motive ladder can score: approach can't cross the fence (score
+    0 for goals outside the fill region, not a fence refusal), cast_out
+    severed or no permitted/affordable spell reaches, blink severed, no scheme
+    precondition holds. The moment any option opens (sulfur gone, ring
+    scuffed, player steps inside, blink open) it acts. In the scorer, not an
+    imp special case. Gate: sealed ring -> ends within ~1 m of its arrival
+    point and ~0 fence-refused moves; sulfur removed -> casts; player inside ->
+    attacks.
+
 ## Sequencing
 
 ```
