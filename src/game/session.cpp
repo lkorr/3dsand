@@ -18,6 +18,7 @@
 #include "game/bodyreg.h"
 #include "game/demon.h"
 #include "game/demon_lore.h"
+#include "game/demon_talk.h"
 #include "game/dye.h"
 #include "game/itemcoat.h"
 #include "game/persist.h"
@@ -4309,7 +4310,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               }
             }
           }
-          caster.mana.reserved = spells.ReservationFor(kPlayerCasterId);
+          // ...plus every bound demon's UPKEEP (demons D5, game/demon_talk.h).
+          caster.mana.reserved =
+              spells.ReservationFor(kPlayerCasterId) + demon::UpkeepFor(w, s.index);
         }
         // A sustained gravity mod on a body: the caster's own, or anyone
         // else's. The second half was missing until 2026-09-22 — the VM has
@@ -5812,6 +5815,10 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // command is applied, and a talking player's command is zeroed in place
   // before anything below reads it — so the controller, the hands and the op
   // record all see a player standing still.
+  // ...but FIRST the demon bits of the command (demons D5, game/demon_talk.h):
+  // the talk key, a presented contract, a dismissal and the conversation's
+  // gaze, which the zeroing below would otherwise drop.
+  demon::TalkPreTick(w, players, tick);
   if (w.talk)
     for (SessionTick& p : players)
       dialogue::TickSession(*w.talk, *p.s, p.ti, tick, &w.mobs);
@@ -5922,6 +5929,9 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // are re-read, the fence goes up or comes down. Before phase H for the
   // refs' reason: a demon that arrives is stepped by this tick's PreTick.
   DemonTick(w, players, tick);
+  // ...and the CONTRACTS (demons D5, game/demon_talk.h): the conversation's
+  // demon actions, expiry, duties written onto the brains PhaseH thinks with.
+  demon::ContractTick(w, players, tick, out);
   PhaseH(w, ws, players, scratch, tick, out);
   tprof.Mark("H");
   for (size_t i = 0; i < players.size(); i++)

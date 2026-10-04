@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "game/contract.h"     // contract::Page: the player's contract pages (D5)
 #include "game/demon_lore.h"   // demon::IsNameGlyph: which glyphs are names
 #include "game/spell.h"
 
@@ -210,6 +211,11 @@ std::string GrimoireAutoName(const GlyphLibrary& lib, const std::vector<int>& sp
 struct PlayerCaster {
   GlyphInventory inventory;
   Grimoire grimoire;
+  // THE CONTRACT PAGES (demons D5, game/contract.h): drafted in the contract
+  // editor, presented to a contained demon in conversation. The player's own;
+  // the stock pages are content (contract::GetContent). Saved by name and
+  // text in the player's file ('CNTR', game/demon_talk.h).
+  std::vector<contract::Page> contracts;
   SpellStack stack;
   CasterState mana;
 

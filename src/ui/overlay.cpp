@@ -23,6 +23,7 @@
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
 #include "sim/weather.h" // the weather row: preset pin + readout
 #include "sim/windfield.h" // the wind & weather section: regimes + readout
+#include "ui/contract_ui.h"
 #include "ui/dialogue_ui.h"
 #include "ui/inventory_ui.h"
 #include "ui/refs_ui.h"
@@ -602,7 +603,7 @@ void Overlay::DrawHUD(const UIState& s) {
     char str[48];
     std::snprintf(str, sizeof str, "CIRCLE %d / %d  ", s.demonStrength, s.demonPower);
     static const char kChan[4] = {'M', 'C', 'B', 'T'};
-    const char* keyHint = "  Y RELEASE";
+    const char* keyHint = "  T TALK  Y RELEASE";
     const bool showGaze = showBind && (s.demonStrain > 0.0f || s.demonGazeBroken);
     const char* gazeWord = s.demonGazeHold ? "MEET EYES " : "AVERT ";
     constexpr int kPips = 10;
@@ -665,6 +666,19 @@ void Overlay::DrawHUD(const UIState& s) {
                          i < lit ? gc : ui::ColDeep());
     }
     py += tabH + 14.0f;
+  }
+  // ---- the bound demons (demons D5, game/demon_talk.h): one tab each, ------
+  // the contract, the duty in hand, the term left and the mana it holds.
+  for (size_t i = 0; s.playerAlive && i < s.boundDemons.size() && i < 3; i++) {
+    const UIState::BoundDemonUI& b = s.boundDemons[i];
+    char term[32];
+    if (b.termLeftS < 0) std::snprintf(term, sizeof term, "no end");
+    else std::snprintf(term, sizeof term, "%d:%02d left", b.termLeftS / 60, b.termLeftS % 60);
+    char t[200];
+    std::snprintf(t, sizeof t, "%s  %s  %s  %s  -%d mana", b.name.c_str(), b.contract.c_str(),
+                  b.contained ? "in the circle" : b.duty.empty() ? "standing" : b.duty.c_str(),
+                  term, b.upkeep);
+    py += tab(t, py, ui::ColGoldDim(), ui::ColGoldPale(), 0.95f);
   }
   // ---- the throw's wind-up: a row of pixel pips under the crosshair --------
   //
@@ -2466,12 +2480,17 @@ void Overlay::Draw(UIState& s) {
   if (s.inventoryOpen) {
     ImGui::PushFont(ui::FontLarge());
     DrawInventoryScreen(s);
+    // demons D5: the contract editor, opened from the spellbook's header.
+    DrawContractEditor(s);
     ImGui::PopFont();
   } else if (s.talk.open) {
     // A CONVERSATION owns the frame the same way: the cursor is free for the
     // choice rows, so there is no crosshair (ui/dialogue_ui.h).
     ImGui::PushFont(ui::FontLarge());
     DrawDialoguePanel(s);
+    // demons D5: talking to a contained demon -- the circle, the gaze, the
+    // contract picker (ui/contract_ui.h).
+    DrawDemonTalkStrip(s);
     ImGui::PopFont();
   } else {
     ImDrawList* dl = ImGui::GetForegroundDrawList();

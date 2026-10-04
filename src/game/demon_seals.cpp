@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "game/demon.h"
+#include "game/demon_talk.h"
 #include "game/mob.h"
 #include "game/session.h"
 #include "sim/materials.h"
@@ -392,7 +393,7 @@ void SealsTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tic
     if (!p.ti.Pressed(TB_DEMON_RELEASE)) continue;
     for (auto it = d.live.rbegin(); it != d.live.rend(); ++it)
       if (it->session == p.s->index && it->state == DemonState::Contained) {
-        Release(w, players, it->mobId, 0, tick);   // contract weight: 0 until D5
+        Release(w, players, it->mobId, ContractWeight(*it), tick);   // D5: the bound contract's weight
         break;
       }
   }

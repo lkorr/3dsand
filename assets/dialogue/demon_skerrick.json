@@ -1,0 +1,68 @@
+{
+  "name": "demon_skerrick",
+  "speaker": "Skerrick",
+  "canLeave": true,
+  "notes": "Talking to Skerrick while he is CONTAINED (docs/PLAN_demons.md D5; game/demon_talk.h). T within 8 m of his circle opens it. The engine sets two flags before it opens: demon:present (1 the last contract was refused, 2 it bound him, 3 you could not carry the upkeep, 0 none) and demon:bound (1 while he is bound). {tell} is a line from assets/demons/tells.json for the current margin (circle strength - his power - the contract's weight; a refusal speaks for the refused page). The demon actions: present_contract opens the picker of your contract pages, release lets him out (the binding is weighed again with the contract's weight), dismiss sends him home.",
+  "entry": [
+    { "if": [ { "flag": "demon:present", "value": 2 } ], "goto": "bound_now" },
+    { "if": [ { "flag": "demon:present", "value": 1 } ], "goto": "refused" },
+    { "if": [ { "flag": "demon:present", "value": 3 } ], "goto": "cannot_hold" },
+    { "if": [ { "flag": "demon:bound" } ], "goto": "bound" },
+    { "goto": "greet" }
+  ],
+  "nodes": [
+    {
+      "id": "greet",
+      "text": "The imp squats on his heels inside the salt and grins up at you. \"{tell}\"",
+      "choices": [
+        { "text": "I have a contract for you.", "goto": "offer", "do": [ { "present_contract": true } ] },
+        { "text": "Go home, Skerrick.", "do": [ { "dismiss": true } ] },
+        { "text": "Nothing yet. Wait there." }
+      ]
+    },
+    {
+      "id": "offer",
+      "text": "\"Paper! Skerrick loves paper.\" He licks his claws. \"Show it, then. Show it.\"",
+      "choices": [
+        { "text": "Not yet.", "goto": "greet" }
+      ]
+    },
+    {
+      "id": "refused",
+      "text": "He reads it upside down and cackles. \"{tell}\"",
+      "choices": [
+        { "text": "Another contract, then.", "goto": "offer", "do": [ { "present_contract": true } ] },
+        { "text": "Go home, Skerrick.", "do": [ { "dismiss": true } ] },
+        { "text": "Wait there." }
+      ]
+    },
+    {
+      "id": "cannot_hold",
+      "text": "\"Master is too full already. Master cannot carry Skerrick as well.\" He pats his belly. Free your mana, or send another home first.",
+      "choices": [
+        { "text": "Another contract, then.", "goto": "offer", "do": [ { "present_contract": true } ] },
+        { "text": "Go home, Skerrick.", "do": [ { "dismiss": true } ] },
+        { "text": "Wait there." }
+      ]
+    },
+    {
+      "id": "bound_now",
+      "text": "The page flares and is gone. Skerrick hisses through his teeth: \"Bound. {contract}. Skerrick reads every word.\"",
+      "choices": [
+        { "text": "Out you come.", "do": [ { "release": true } ] },
+        { "text": "Stay in the ring for now.", "goto": "bound" },
+        { "text": "Go home, Skerrick.", "do": [ { "dismiss": true } ] }
+      ]
+    },
+    {
+      "id": "bound",
+      "text": "Bound by {contract}, he waits at the edge of the salt. \"{tell}\"",
+      "choices": [
+        { "text": "Out you come.", "do": [ { "release": true } ] },
+        { "text": "A different contract.", "goto": "offer", "do": [ { "present_contract": true } ] },
+        { "text": "Go home, Skerrick.", "do": [ { "dismiss": true } ] },
+        { "text": "Wait there." }
+      ]
+    }
+  ]
+}

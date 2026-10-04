@@ -395,7 +395,7 @@
       ]
     },
     {
-      "comment": "A RELEASED IMP (docs/PLAN_demons.md D3; assets/demons/skerrick.json `released`). The imp profile with aggro neutral: let out of a circle whose binding HELD, he wants nobody until struck. A stand-in for D5's contract, which will say what a released demon does. If the binding fails on release he keeps `imp` (hostile) instead.",
+      "comment": "A RELEASED IMP (docs/PLAN_demons.md D3; assets/demons/skerrick.json `released`). The imp profile with aggro neutral: let out of a circle whose binding HELD, he wants nobody until struck. D5: the floor a CONTRACT is layered on (game/demon_talk.h): its duties write this brain's routine (the `goto` verb, weight 1.0) and target every tick, and a bound demon strikes only what a guard duty names. If the binding fails on release he keeps `imp` (hostile) instead.",
       "name": "imp_bound",
       "label": "Imp (released)",
       "color": 3221233919,
@@ -487,6 +487,11 @@
           "weight": 2.6,
           "cooldownTicks": 8,
           "minDwellTicks": 6
+        },
+        "goto": {
+          "weight": 1.0,
+          "cooldownTicks": 0,
+          "minDwellTicks": 0
         }
       },
       "rules": [

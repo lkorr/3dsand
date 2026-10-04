@@ -56,6 +56,13 @@
 //     {"learn": "skerrick"}         sets the world flag "name:skerrick" = 1:
 //                                   the player KNOWS that name (a condition
 //                                   reads it as {"flag": "name:skerrick"}).
+//     {"present_contract": true}    (demons D5, game/demon_talk.h) a DEMON's
+//     {"release": true}             conversation only: open the contract
+//     {"dismiss": true}             picker / let it out of the circle / send
+//                                   it home. Queued on the store
+//                                   (Store::demonActs) and carried out by the
+//                                   demon tick the same tick; in any other
+//                                   conversation they do nothing.
 //
 // DETERMINISM. Nothing here writes a voxel. What it writes is flags (world
 // state, integer) and the player's kit (items by name), and it writes them
@@ -101,7 +108,10 @@ struct Cond {
 struct Act {
   // Grant and Learn (demons D2) are APPENDED: nothing persists an Act::Kind
   // value, but appending keeps every switch's existing arms where they were.
-  enum class Kind : uint8_t { Set, Add, Clear, Give, Take, End, Grant, Learn };
+  // PresentContract, Release, Dismiss (demons D5) likewise.
+  enum class Kind : uint8_t {
+    Set, Add, Clear, Give, Take, End, Grant, Learn, PresentContract, Release, Dismiss
+  };
   Kind kind = Kind::Set;
   std::string arg;  // flag, item, glyph (grant) or name (learn)
   int value = 1;    // set/add value, give/take count
@@ -222,8 +232,19 @@ class Store {
   // Telemetry the gates read.
   struct Stats {
     uint64_t begun = 0, ended = 0, choices = 0, refusedGives = 0;
-    uint64_t grants = 0, refusedGrants = 0, learned = 0;
+    uint64_t grants = 0, refusedGrants = 0, learned = 0, demonActs = 0;
   } stats;
+
+  // THE DEMON ACTIONS a conversation asked for this tick (present_contract,
+  // release, dismiss): who asked and what. The dialogue layer cannot reach
+  // the demon world, so it queues them; demon::ContractTick drains the queue
+  // in the same tick (game/demon_talk.h). Not saved: it never outlives a tick.
+  struct DemonAct {
+    int session = 0;
+    uint64_t speaker = 0;   // the conversation's speaker mob
+    Act::Kind kind = Act::Kind::Release;
+  };
+  std::vector<DemonAct> demonActs;
 
   // ---- persistence ('DLGF' in world.sve, game/persist.cpp) ----
   static constexpr uint32_t kSaveVersion = 1;

@@ -4220,6 +4220,18 @@ void DrawInventoryScreen(UIState& s) {
                   : "Every word you know, in one column beside the page: the "
                     "thing you drag onto the tree and onto a key.");
       }
+      // demons D5: the CONTRACT pages are kept with the spells (ui/contract_ui.h).
+      {
+        const char* label = "contracts";
+        const ImVec2 ts = ImGui::CalcTextSize(label);
+        const float bw = std::max(96.0f, ts.x + 24);
+        bx -= bw + 8;
+        if (ui::Button("##contracts", ImVec2(bx, by), label, s.contractEd.open, bw))
+          s.contractEd.open = !s.contractEd.open;
+        if (ImGui::IsItemHovered())
+          Tip("Draft the contracts you will present to a demon in its circle: what it must "
+              "do, what it may never do, and what it costs.");
+      }
     }
 
     // ---- THE COVER, when the book is shut ----------------------------------

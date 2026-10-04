@@ -1,0 +1,25 @@
+{
+  "//": "THE CONTRACT TARIFF (docs/PLAN_demons.md D5; game/contract.h Weigh). A contract's WEIGHT is added to the demon's power when it is presented and when the bound demon is released: it binds iff circle strength >= power + weight. Every number is an integer; the editor (ui/contract_ui.cpp) shows the sum live, one line per term. A plain 2-wide salt ring of radius 1.5 m is ~36 points and an imp is power 20, so the stock pages (contracts.json) weigh 8..13 and fit a plain ring with room.",
+  "//term": "The TERM, in game hours: a term of h hours costs the first bracket whose `hours` >= h (longer than the last: the last). `indefinite` (hours 0) is dear on purpose.",
+  "term": [
+    { "hours": 24,  "weight": 1 },
+    { "hours": 72,  "weight": 4 },
+    { "hours": 168, "weight": 8 }
+  ],
+  "indefinite": 30,
+  "//duty": "Each DUTY's base weight (follow / guard / goto / fetch / spin).",
+  "duty": { "follow": 1, "guard": 3, "goto": 1, "fetch": 3, "spin": 0 },
+  "//forbid": "Each PROHIBITION's base weight: a hard filter the binding enforces, so it is expensive.",
+  "forbid": { "attack": 3, "cast": 3, "leave": 2 },
+  "//penalty": "A PENALTY is cheap: the act it watches costs `penalty`, its consequence `then` (D6 makes the demon weigh it).",
+  "penalty": { "attack": 0, "cast": 0, "leave": 0 },
+  "then": { "none": 0, "dismiss": 0, "destroy": 1, "pain": 1 },
+  "//selector": "BREADTH points per selector term: a clause about everyone costs more than one about you. Multiplied by breadthPct (per clause kind, percent) into weight.",
+  "selector": { "me": 0, "self": 0, "all": 6, "attacked_by": 1, "attacking": 1, "hostile_to": 1, "faction": 2, "type": 1, "and": 0, "or": 1, "not": 2 },
+  "breadthPct": { "duty": 100, "forbid": 100, "penalty": 0 },
+  "//perCondition": "Each `when` condition and each named counter.",
+  "perCondition": 1,
+  "perCounter": 1,
+  "//upkeepPerPowerPct": "UPKEEP: a bound demon reserves power x this / 100 of its summoner's mana max for as long as it is bound (an imp, power 20: 20 of 100).",
+  "upkeepPerPowerPct": 100
+}

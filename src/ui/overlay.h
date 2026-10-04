@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "game/contract.h" // contract::Page: the contract editor's draft (demons D5)
 #include "game/kitref.h"   // KitRef: the one slot address the screen drags in
 #include "gpu/rhi.h"
 
@@ -1581,6 +1582,66 @@ struct UIState {
   uint8_t demonSevered = 0;
   float demonStrain = 0.0f;
   bool demonGazeHold = false, demonGazeBroken = false;
+  // D5 (game/demon_talk.h ContractTick): what the bound demons of this player
+  // are doing -- one row each for the HUD tab: name, contract, the duty in
+  // hand ("" = standing), the term left in seconds (-1 = indefinite) and the
+  // mana it reserves.
+  struct BoundDemonUI {
+    std::string name, contract, duty;
+    int termLeftS = -1;
+    int upkeep = 0;
+    bool contained = false;   // bound but not yet released
+  };
+  std::vector<BoundDemonUI> boundDemons;
+  // THE DEMON CONVERSATION'S STRIP (ui/contract_ui.cpp DrawDemonTalkStrip),
+  // drawn over the dialogue panel while the speaker is a contained demon.
+  // Written by the tick (ContractTick); the latches (`presentPick`,
+  // `lookAwayToggle`) are the panel's and main.cpp turns them into the
+  // command (TB_DEMON_PRESENT / TB_DEMON_LOOKAWAY).
+  struct DemonTalkUI {
+    bool active = false;
+    uint64_t mobId = 0;
+    std::string name;
+    int strength = 0, power = 0;
+    bool bound = false;           // bound under `contract` (weight `weight`)
+    std::string contract;
+    int weight = 0, upkeep = 0;
+    bool lookingAway = false;     // the command's gaze this tick
+    float strain = 0.0f;
+    bool gazeHold = false, gazeBroken = false;
+    bool pickerOpen = false;      // `present_contract` asked for the picker
+    struct Offer {
+      std::string name;
+      uint32_t hash = 0;
+      int weight = 0;
+      bool stock = false;
+      bool compiles = true;
+    };
+    std::vector<Offer> offers;    // what may be presented, with its weight
+    std::string lastResult;       // the last presentation's answer
+    uint32_t presentPick = 0;     // latch: a page's hash, 0 = none
+    bool lookAwayToggle = false;  // the strip's button: look away until clicked again
+    bool closePicker = false;     // latch: the picker's "back"
+  } demonTalk;
+  // THE CONTRACT EDITOR (ui/contract_ui.cpp DrawContractEditor), opened from
+  // the spellbook's header. A mirror of the player's pages and the stock
+  // ones (main.cpp copies them in while nothing is being edited), the draft
+  // being written, and one operation latch main.cpp applies to the player's
+  // PlayerCaster::contracts.
+  struct ContractEdUI {
+    bool open = false;
+    std::vector<contract::Page> pages;   // the player's own
+    std::vector<contract::Page> stock;   // read-only
+    int selected = -1;                   // index into pages, or -2 - stock index
+    contract::Page draft;
+    bool dirty = false;
+    bool advanced = false;               // selectors, triggers, counters shown
+    enum Op : uint8_t { None = 0, Save, Delete } op = None;
+    std::string opName;                  // Delete: the page; Save: the draft's old name
+    std::string status;                  // what the last op said
+    int upkeepPower = 20;                // the power the upkeep line is shown for
+    std::string upkeepFor = "an imp";
+  } contractEd;
   // A HELD VESSEL'S MODE, PER HAND (dual wielding; sim/tickinput.h
   // TB_SCOOP/TB_APPLY and their _L twins): 0 pour, 1 scoop, 2 apply. F
   // cycles the vessel in the hand last used; the hand's own button (LMB

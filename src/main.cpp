@@ -27,6 +27,7 @@
 #include "game/bodyreg.h"
 #include "game/demon.h"
 #include "game/demon_lore.h"
+#include "game/demon_talk.h"
 #include "game/brush.h"
 #include "game/burnprof.h"
 #include "game/persist.h"
@@ -469,6 +470,20 @@ float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
 bool g_shotDialogue = false;
 constexpr uint64_t kShotDlgSpawn = 90, kShotDlgBegin = 130, kShotDlgShot1 = 160,
                    kShotDlgChoose = 170, kShotDlgShot2 = 200, kShotDlgLast = 206;
+// `--shot-demon` (demons D5): the DEMON CONVERSATION and the CONTRACT EDITOR's
+// look harness, on the game's map. The player is stood in the Harrowby smithy
+// cellar beside the salt ring, Skerrick is summoned into it, T opens his
+// conversation (screenshot_demon_talk.bmp), "I have a contract" opens the
+// picker (screenshot_demon_picker.bmp), the stock servant is presented through
+// the command (screenshot_demon_bound.bmp); then the character screen and the
+// contract editor, simple (screenshot_contract_editor.bmp) and full
+// (screenshot_contract_editor_full.bmp).
+bool g_shotDemon = false;
+constexpr uint64_t kShotDmSummon = 240, kShotDmTalk = 300, kShotDmShot1 = 340,
+                   kShotDmOffer = 350, kShotDmShot2 = 380, kShotDmPresent = 390,
+                   kShotDmShot3 = 430, kShotDmLeave = 440, kShotDmEditor = 460,
+                   kShotDmShot4 = 500, kShotDmFull = 510, kShotDmShot5 = 550,
+                   kShotDmLast = 556;
 
 // `--shot-spawn`: WHAT A NEW GAME SEES. The real game on the real map
 // (world.mapLayer), started as a player starts it -- at the map's spawn site,
@@ -5556,6 +5571,10 @@ int main(int argc, char** argv) {
       g_shotDialogue = true;
       g_harnessFrames = kShotDlgLast;
     }
+    else if (a == "--shot-demon") {
+      g_shotDemon = true;
+      g_harnessFrames = kShotDmLast;
+    }
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
       g_harnessFrames = kShotInvDeathTurnShot;
@@ -7510,7 +7529,8 @@ int main(int argc, char** argv) {
   // that hotbar slot; an empty selected slot takes the hand's item back).
   KeyEdge eQ, eE;
   // RELEASE THE DEMON (demons D3): Y, while your demon is contained.
-  KeyEdge eY;
+  // TALK to it (demons D5): T. Shift+Y DISMISSES your demon from anywhere.
+  KeyEdge eY, eDemonTalk;
   // THE CONVERSATION KEYS (game/dialogue.h): 1-9 answer, Space/Enter
   // continue. Their own edges: the number row's other bindings are gated off
   // while the panel is up, and a held key must answer once.
@@ -10517,6 +10537,7 @@ int main(int argc, char** argv) {
           g_burnHouse ||
           g_burnNpc ||
           g_shotDialogue ||  // the reload would wipe the listener it spawned
+          g_shotDemon ||     // ...or the demon it summoned
           g_shotEditor ||    // ...or the house it placed
           g_shotSpawn;       // (a picture, not a reload test: the compile would own the run)
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
@@ -11085,6 +11106,78 @@ int main(int argc, char** argv) {
         hm.active = false;
         overlay.injectInput = nullptr;
       }
+    }
+    // --shot-demon's schedule (see g_shotDemon).
+    if (g_shotDemon) {
+      const uint64_t f = frameCounter;
+      // The smithy cellar (DESIGN.md section 17, D2): the ring is centred on
+      // (705, 3462), the floor's top cell is 168. Stand east of it, looking
+      // west across the salt.
+      const Vec3 at{728.5f, 169.0f + Player::kHalfY, 3462.5f};
+      if (f == 1) {
+        ui.fly = false;
+        player.fly = false;
+        ui.visible = false;
+      }
+      if (f >= 2 && f <= kShotDmTalk) {
+        player.pos = at;
+        player.vel = Vec3{0, 0, 0};
+        player.SnapRender();
+        cam.yaw = 3.14159265f;
+        cam.pitch = -0.25f;
+      }
+      if (f == kShotDmSummon) {
+        const int g = glyphs.Find("summon_skerrick");
+        SpellSummon su;
+        su.x = 705;
+        su.y = 171;
+        su.z = 3462;
+        su.glyph = g;
+        SessionTick st{&session, {}, {}};
+        if (g >= 0)
+          DemonQueueSummon(tickCtx, std::span<SessionTick>(&st, 1), session.index, su, glyphs,
+                           tick);
+        std::printf("--shot-demon: Skerrick summoned into the cellar ring (glyph %d)\n", g);
+      }
+      if (f == kShotDmTalk) feeder.Press(TB_DEMON_TALK);
+      if (f == kShotDmTalk + 10 && !captured) glfwSetCursorPos(window, 40.0, 40.0);
+      if (f == kShotDmShot1) g_shotJumpPath = "screenshot_demon_talk.bmp";
+      if (f == kShotDmOffer) feeder.Talk(1);
+      if (f == kShotDmShot2) g_shotJumpPath = "screenshot_demon_picker.bmp";
+      if (f == kShotDmPresent)
+        feeder.Present(contract::PageHash("Servant, one day"), 0);
+      if (f == kShotDmShot3) g_shotJumpPath = "screenshot_demon_bound.bmp";
+      if (f == kShotDmLeave) feeder.Talk(kTalkLeave);
+      if (f == kShotDmEditor) {
+        ui.inventoryOpen = true;
+        ui.contractEd.open = true;
+        ui.contractEd.stock = contract::GetContent().stock;
+        if (ui.contractEd.stock.size() > 1) {
+          ui.contractEd.selected = -3;   // the second stock page: the bodyguard
+          ui.contractEd.draft = ui.contractEd.stock[1];
+        }
+      }
+      if (f == kShotDmShot4) g_shotJumpPath = "screenshot_contract_editor.bmp";
+      if (f == kShotDmFull) {
+        contract::Page p;
+        std::string err;
+        contract::PageFromJson(
+            R"J({"name": "fetch me blood, then guard", "hours": 72, "counters": ["fetched"],
+                "clauses": [
+                  {"kind": "duty", "verb": "fetch", "arg": "blood", "into": "flask",
+                   "when": "fetched < 2", "on": "fetched+1"},
+                  {"kind": "duty", "verb": "guard", "who": "attacking(me) & !faction(harrowby)"},
+                  {"kind": "duty", "verb": "follow", "who": "me"},
+                  {"kind": "forbid", "verb": "attack", "who": "me | faction(harrowby)"},
+                  {"kind": "forbid", "verb": "leave", "who": "me", "arg": "16"},
+                  {"kind": "penalty", "verb": "attack", "who": "faction(harrowby)", "then": "pain"}]})J",
+            p, err);
+        ui.contractEd.selected = -1;
+        ui.contractEd.draft = p;
+        ui.contractEd.dirty = true;
+        ui.contractEd.advanced = true;
+      }
+      if (f == kShotDmShot5) g_shotJumpPath = "screenshot_contract_editor_full.bmp";
     }
     // --shot-dialogue's schedule (see g_shotDialogue).
     if (g_shotDialogue) {
@@ -11857,6 +11950,12 @@ int main(int argc, char** argv) {
       feeder.Talk(ui.talk.pick);
       ui.talk.pick = 0;
     }
+    // A contract picked on the demon strip (demons D5): presented by the tick.
+    if (ui.demonTalk.presentPick != 0) {
+      feeder.Present(ui.demonTalk.presentPick, (uint32_t)ui.demonTalk.mobId);
+      ui.demonTalk.presentPick = 0;
+    }
+    if (!ui.demonTalk.active) ui.demonTalk.lookAwayToggle = false;
     // The wheel, drained once per frame. Three claimants, in priority order:
     //
     //   1. THE UI. The character screen, or any dev-overlay window the cursor
@@ -11917,6 +12016,31 @@ int main(int argc, char** argv) {
       while (off < -3.14159265f) off += 6.2831853f;
       if (std::fabs(off) > lim)
         cam.yaw = 1.5707963f - (avatarHeading + std::copysign(lim, off));
+    }
+    // THE DEMON CONVERSATION LOCKS THE VIEW ON THE DEMON (demons D5,
+    // game/demon_talk.h): the camera turns to its head, or -- L held or the
+    // strip's toggle -- away from it and down. Presentation only: the tick
+    // takes the gaze from TB_DEMON_LOOKAWAY, not from this camera.
+    if (ui.demonTalk.active) {
+      if (const Mob* dm = mobs.FindMobById(ui.demonTalk.mobId); dm && dm->Def()) {
+        const Vec3 ws = dm->Def()->worldSize;
+        const Vec3 head = dm->Origin() + Vec3{ws.x * 0.5f, ws.y * 0.85f, ws.z * 0.5f};
+        Vec3 v = head - player.EyePos();
+        if (v.len() > 1e-3f) {
+          v = v.normalized();
+          float yawT = std::atan2(v.z, v.x);
+          float pitchT = std::asin(std::clamp(v.y, -1.0f, 1.0f));
+          if (key(GLFW_KEY_L) || ui.demonTalk.lookAwayToggle) {
+            yawT += 2.4f;
+            pitchT = -0.35f;
+          }
+          float dy = yawT - cam.yaw;
+          while (dy > 3.14159265f) dy -= 6.2831853f;
+          while (dy < -3.14159265f) dy += 6.2831853f;
+          cam.yaw += dy * 0.25f;
+          cam.pitch += (pitchT - cam.pitch) * 0.25f;
+        }
+      }
     }
     // The look delta is ACCUMULATED into the tick command (N2) rather than
     // delivered to a consumer here: the mouse is sampled per frame, and the
@@ -12399,8 +12523,19 @@ int main(int argc, char** argv) {
     if (captured && ui.devControls && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
     // Y lets your contained demon out of its circle (game/demon_seals.h): the
     // tick weighs the circle's strength against its power there and then.
-    if (eY.Pressed(key(GLFW_KEY_Y)) && captured && ui.demonState == 1)
-      feeder.Press(TB_DEMON_RELEASE);
+    // Shift+Y (demons D5) dismisses instead: your demon goes home, bound or
+    // contained, from anywhere (game/demon_talk.h).
+    {
+      const bool shift = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
+      if (eY.Pressed(key(GLFW_KEY_Y)) && captured) {
+        if (shift && (ui.demonState == 1 || !ui.boundDemons.empty())) feeder.Dismiss(0);
+        else if (!shift && ui.demonState == 1) feeder.Press(TB_DEMON_RELEASE);
+      }
+    }
+    // T talks to your contained demon (in reach of its circle).
+    if (eDemonTalk.Pressed(key(GLFW_KEY_T)) && captured && ui.demonState == 1 &&
+        !ui.talk.open && ui.tool != UIState::kToolPrefab)
+      feeder.Press(TB_DEMON_TALK);
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
     if (captured && ui.devControls && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
@@ -12602,6 +12737,10 @@ int main(int argc, char** argv) {
     feeder.SetAxes(pin.forward, pin.strafe);
     feeder.SetHeldMask(pin.held);
     if (pin.Pressed(TB_JUMP)) feeder.Press(TB_JUMP);
+    // While talking to a demon (demons D5): L held, or the strip's toggle,
+    // looks away from it -- HELD state, so it is re-sampled every frame.
+    feeder.Hold(TB_DEMON_LOOKAWAY,
+                ui.demonTalk.active && (key(GLFW_KEY_L) || ui.demonTalk.lookAwayToggle));
 
     if (ui.reloadShaders) {
       ui.reloadShaders = false;
@@ -12718,6 +12857,8 @@ int main(int argc, char** argv) {
     }
     if (ui.reloadMaterials) {
       ui.reloadMaterials = false;
+      // The contract tariff and the stock pages (demons D5) reload with R.
+      contract::GetContent(true);
       // The weather presets reload with the other R-reloaded content: they are
       // authored data next to materials, and a tuner edit of a sky should show
       // on the same keypress.
@@ -13092,6 +13233,7 @@ int main(int argc, char** argv) {
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs, &talkStore);
+      demon::AppendSaveSections(eio, tickCtx, session);   // demons D5: DMNS + CNTR
       // M9.5-B: the directory is `--load-world`'s, and the save now carries
       // the SIM TICK and the SEED (meta.svm's SVM5 pair). The tick is what a
       // reload has to resume above so that the per-chunk tick tags this
@@ -13106,6 +13248,7 @@ int main(int argc, char** argv) {
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs, tickCtx.refs, &talkStore);
+      demon::AppendSaveSections(eio, tickCtx, session);   // demons D5: DMNS + CNTR
       WorldStamp loaded{};
       if (LoadWorld(ctx, world, sim, stream, worldDir, mats, &eio, &loaded)) {
         mobParking.ResetWaits();
@@ -17254,13 +17397,61 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- THE CONTRACT EDITOR (demons D5, ui/contract_ui.h) --------------
+      // The panel writes one op; the player's pages change here, never in
+      // the panel. Then the mirror is refreshed from them.
+      {
+        UIState::ContractEdUI& E = ui.contractEd;
+        std::vector<contract::Page>& pages = session.caster.contracts;
+        if (E.op == UIState::ContractEdUI::Save) {
+          contract::Page p = E.draft;
+          p.stock = false;
+          std::vector<std::string> errs;
+          int at = -1, clash = -1;
+          for (int i = 0; i < (int)pages.size(); i++) {
+            if (pages[(size_t)i].name == E.opName) at = i;
+            if (pages[(size_t)i].name == p.name) clash = i;
+          }
+          if (!contract::Compile(p, errs)) {
+            E.status = errs.front();
+            E.dirty = true;
+          } else if (clash >= 0 && clash != at) {
+            E.status = "another page is called that";
+            E.dirty = true;
+          } else if (at < 0 && pages.size() >= 32) {
+            E.status = "the contract book is full (32 pages)";
+            E.dirty = true;
+          } else {
+            if (at >= 0) pages[(size_t)at] = p;
+            else pages.push_back(p);
+            E.selected = at >= 0 ? at : (int)pages.size() - 1;
+            E.opName = p.name;
+            E.status = "saved";
+          }
+        } else if (E.op == UIState::ContractEdUI::Delete) {
+          for (size_t i = 0; i < pages.size(); i++)
+            if (pages[i].name == E.opName) {
+              pages.erase(pages.begin() + (ptrdiff_t)i);
+              break;
+            }
+          E.selected = -1;
+          E.draft = contract::Page{};
+          E.dirty = false;
+          E.status = "deleted";
+        }
+        E.op = UIState::ContractEdUI::None;
+        E.pages = pages;
+        if (E.open) E.stock = contract::GetContent().stock;
+        if (!ui.inventoryOpen) E.open = false;
+      }
       // ---- THE CONVERSATION MIRROR + THE DEV HOOK (game/dialogue.h) -------
       {
         const dialogue::View v = dialogue::MakeView(talkStore, session.talk);
         ui.talk.open = v.open;
         ui.talk.dialogue = v.dialogue;
         ui.talk.speaker = v.speaker;
-        ui.talk.text = v.text;
+        // A demon's lines may say {tell} / {contract} (demons D5).
+        ui.talk.text = demon::TalkText(tickCtx, session.talk.speaker.mobId, v.text, v.steps);
         ui.talk.choices = v.choices;
         ui.talk.canContinue = v.canContinue;
         ui.talk.canLeave = v.canLeave;

@@ -236,6 +236,15 @@ bool ParseActs(const json& j, const Where& w, const std::string& field,
         } else {
           ac.arg = v.get<std::string>();
         }
+      } else if (k == "present_contract" || k == "release" || k == "dismiss") {
+        // demons D5: a demon conversation's own verbs (Store::demonActs).
+        ac.kind = k == "present_contract" ? Act::Kind::PresentContract
+                  : k == "release"        ? Act::Kind::Release
+                                          : Act::Kind::Dismiss;
+        if (!v.is_boolean() || !v.get<bool>()) {
+          w.Err(f + "." + k, "is true");
+          ok = false;
+        }
       } else if (k == "end") {
         ac.kind = Act::Kind::End;
         if (!v.is_boolean() || !v.get<bool>()) {
@@ -243,7 +252,8 @@ bool ParseActs(const json& j, const Where& w, const std::string& field,
           ok = false;
         }
       } else {
-        w.Err(f + "." + k, "unknown action (set, add, clear, give, take, end, grant, learn)");
+        w.Err(f + "." + k, "unknown action (set, add, clear, give, take, end, grant, learn, "
+                           "present_contract, release, dismiss)");
         ok = false;
       }
     }
@@ -263,7 +273,9 @@ bool ParseActs(const json& j, const Where& w, const std::string& field,
     if (a.contains(numKey)) {
       if (!a[numKey].is_number_integer() || ac.kind == Act::Kind::Clear ||
           ac.kind == Act::Kind::End || ac.kind == Act::Kind::Grant ||
-          ac.kind == Act::Kind::Learn || (items && a[numKey].get<int>() < 1)) {
+          ac.kind == Act::Kind::Learn || ac.kind == Act::Kind::PresentContract ||
+          ac.kind == Act::Kind::Release || ac.kind == Act::Kind::Dismiss ||
+          (items && a[numKey].get<int>() < 1)) {
         w.Err(f + "." + numKey, "is an integer (positive for give/take), not on clear/end");
         ok = false;
       } else {
@@ -515,7 +527,9 @@ void Library::Validate(const ItemLibrary* items, std::vector<Problem>& problems,
       problems.push_back(Problem{false, "(all dialogue)", "", "flag '" + f + "'",
                                  "is set (first in " + at + ") but no condition reads it"});
   for (const auto& [f, at] : read)
-    if (!written.count(f))
+    // `demon:*` flags are written by the ENGINE (demons D5, game/demon_talk.h
+    // sets demon:bound / demon:present before a demon's conversation opens).
+    if (!written.count(f) && f.rfind("demon:", 0) != 0)
       problems.push_back(Problem{false, "(all dialogue)", "", "flag '" + f + "'",
                                  "is read (first in " + at + ") but nothing sets it"});
   for (const auto& [n, at] : metRefs)
@@ -804,6 +818,13 @@ bool RunActs(Store& store, PlayerSession& s, const std::vector<Act>& acts) {
       case Act::Kind::Learn:
         store.flags["name:" + a.arg] = 1;
         store.stats.learned++;
+        break;
+      case Act::Kind::PresentContract:
+      case Act::Kind::Release:
+      case Act::Kind::Dismiss:
+        // demons D5: queued for the demon tick (Store::demonActs).
+        store.demonActs.push_back(Store::DemonAct{s.index, s.talk.speaker.mobId, a.kind});
+        store.stats.demonActs++;
         break;
     }
   }

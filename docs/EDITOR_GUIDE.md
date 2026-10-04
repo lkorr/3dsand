@@ -543,6 +543,9 @@ Run in order, on arriving at a node or on picking a choice (before it moves on).
 | `end` | the conversation ends after this |
 | `grant` glyph | the player now owns that spell glyph, by its glyphs.json id (`summon_skerrick`). Saved with the kit. A glyph that does not exist yet is a warning and does nothing |
 | `learn` name | the world now knows that name: sets the flag `name:<name>` (read it with `flag name:skerrick`) |
+| `present_contract` | a DEMON's conversation only: opens the picker of the player's contract pages (and the stock ones) over the panel. Picking one presents it; the conversation reopens on the demon's answer |
+| `release` | a demon's conversation only: lets it out of the circle, weighed with its contract (strength >= power + weight) |
+| `dismiss` | a demon's conversation only: sends the demon home |
 
 **Flags are world-wide.** A flag set in Wat's conversation is the same flag
 Osric's reads. That is how two NPCs talk about you: Wat's choice does `set
@@ -871,6 +874,33 @@ That script owns those columns: edit the plan at its top and run it again.
 Walk in through the smithy's door, go to the back of the bedroom past the
 bed, and take the stairs down beside the rail. The book is on the lectern
 west of the salt ring. `--selftest --gate harrowby-cellar` checks all of it.
+
+### 10.4 How do I write a demon's conversation?
+
+A demon's def (`assets/demons/<name>.json`) names its conversation with
+`"dialogue": "demon_skerrick"`; the file is an ordinary conversation in
+`assets/dialogue/` (§9), opened when the player presses **T** beside the
+demon while it is CONTAINED in a salt circle (and ended the moment it is
+not). Four things are special:
+
+- **The engine sets two flags before it opens**, so the `entry` list can pick
+  the right face: `demon:present` (1 = the last contract was refused, 2 = it
+  bound the demon, 3 = the player could not carry the upkeep, 0 = none) and
+  `demon:bound` (1 while bound). The checks know the engine writes `demon:*`.
+- **Text may say** `{tell}` (a line from `assets/demons/tells.json` for the
+  current margin), `{name}`, `{margin}`, `{weight}`, `{contract}`.
+- **Three actions** (§9's table): `present_contract`, `release`, `dismiss`.
+  `release` and `dismiss` end the conversation; give `present_contract` a
+  node to go to (the picker shows while it is up).
+- **The gaze**: while it runs the camera is locked on the demon; L looks away.
+
+`assets/dialogue/demon_skerrick.json` is the worked example.
+
+**Contracts** are not dialogue: the player drafts them in game (Tab → the
+spellbook's header → **contracts**). The STOCK pages everybody starts with
+are `assets/demons/contracts.json`, and what a clause costs is
+`assets/demons/contract_tariff.json` (both reload with R). The language is in
+`src/game/contract.h`'s header comment.
 
 ## 11. Buildings — the Structures page
 

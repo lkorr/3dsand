@@ -18,7 +18,11 @@ export const COND_KINDS = ['flag', '!flag', 'time', 'activity', '!activity',
                            'has', '!has', 'met', '!met'];
 // grant (a glyph by name) and learn (a demon's name -> flag name:<x>): demons D2,
 // game/dialogue.h. The tuner has no glyph list, so a grant is checked by the engine.
-export const ACT_KINDS = ['set', 'add', 'clear', 'give', 'take', 'end', 'grant', 'learn'];
+// present_contract / release / dismiss (value true): demons D5, a DEMON's
+// conversation only (game/demon_talk.h).
+export const ACT_KINDS = ['set', 'add', 'clear', 'give', 'take', 'end', 'grant', 'learn',
+                          'present_contract', 'release', 'dismiss'];
+const TRUE_ACTS = ['end', 'present_contract', 'release', 'dismiss'];
 export const ACTIVITIES = ['sleep', 'work', 'wander', 'socialize', 'eat', 'goto'];
 
 const FILE_KEYS = ['name', 'speaker', 'canLeave', 'notes', 'entry', 'nodes'];
@@ -119,10 +123,10 @@ export function validateAll(files, items) {
         const fi = `${field}[${i}]`;
         const k = actKind(a);
         if (!k || !ACT_KINDS.includes(k)) {
-          P(true, where, fi + (k ? '.' + k : ''), 'unknown action (set, add, clear, give, take, end, grant, learn)', node); return;
+          P(true, where, fi + (k ? '.' + k : ''), 'unknown action (set, add, clear, give, take, end, grant, learn, present_contract, release, dismiss)', node); return;
         }
         const v = a[k];
-        if (k === 'end') { if (v !== true) P(true, where, fi + '.end', 'is true', node); return; }
+        if (TRUE_ACTS.includes(k)) { if (v !== true) P(true, where, fi + '.' + k, 'is true', node); return; }
         if (typeof v !== 'string' || !v) { P(true, where, fi + '.' + k, (k === 'give' || k === 'take') ? 'names an item' : k === 'grant' ? 'names a glyph' : k === 'learn' ? 'names a name' : 'names a flag', node); return; }
         if (k === 'grant' || k === 'learn') {
           if (k === 'learn' && !written.has('name:' + v)) written.set('name:' + v, `${file} ${where}`);
@@ -188,7 +192,8 @@ export function validateAll(files, items) {
   for (const [f, at] of written)
     if (!read.has(f)) out.push({error: false, file: '(all dialogue)', where: '', node: '', field: `flag '${f}'`, msg: `is set (first in ${at}) but no condition reads it`});
   for (const [f, at] of read)
-    if (!written.has(f)) out.push({error: false, file: '(all dialogue)', where: '', node: '', field: `flag '${f}'`, msg: `is read (first in ${at}) but nothing sets it`});
+    // demon:* flags are set by the engine before a demon's conversation (demons D5).
+    if (!written.has(f) && !f.startsWith('demon:')) out.push({error: false, file: '(all dialogue)', where: '', node: '', field: `flag '${f}'`, msg: `is read (first in ${at}) but nothing sets it`});
   for (const [n, at] of metRefs)
     if (!names.has(n)) out.push({error: false, file: '(all dialogue)', where: '', node: '', field: `met '${n}'`, msg: `names no dialogue file (${at})`});
   return out;

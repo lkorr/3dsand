@@ -82,6 +82,20 @@ enum TickButton : uint32_t {
   // weighed there and then -- held iff circle strength >= power + contract
   // weight, else it overpowers the binding and is loose and hostile.
   TB_DEMON_RELEASE = 1u << 16,
+  // (bits 17..19 are left for D4.) THE DEMON CONVERSATION AND THE CONTRACT
+  // (docs/PLAN_demons.md D5, game/demon_talk.h):
+  //   TALK      an edge: open the conversation with the presser's most recent
+  //             CONTAINED demon (T).
+  //   PRESENT   an edge carried with `contractHash` (the page, by name hash)
+  //             and `demonRef` (the demon, low 32 bits of its mob id; 0 = the
+  //             one you are talking to): bind it under that contract.
+  //   DISMISS   an edge with `demonRef` (0 = your most recent): send it home.
+  //   LOOKAWAY  HELD: while talking to a demon, the summoner looks away from
+  //             it (the gaze rule, D3), else at it.
+  TB_DEMON_TALK = 1u << 20,
+  TB_DEMON_PRESENT = 1u << 21,
+  TB_DEMON_DISMISS = 1u << 22,
+  TB_DEMON_LOOKAWAY = 1u << 23,
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
@@ -90,7 +104,9 @@ enum TickButton : uint32_t {
 // 5: TB_USE + `useRef` (the use verb, PLAN_world_editor.md P1).
 // 6: `talk` (was pad0) — the conversation command (game/dialogue.h).
 // 7: TB_DEMON_RELEASE (demons D3).
-constexpr uint32_t kTickInputVersion = 7;   // 2: TB_THROW, 3: TB_APPLY
+// 8: TB_DEMON_TALK / PRESENT / DISMISS / LOOKAWAY + `contractHash`,
+//    `demonRef` (demons D5; 76 -> 84 bytes).
+constexpr uint32_t kTickInputVersion = 8;   // 2: TB_THROW, 3: TB_APPLY
 
 // THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
 // in the conversation panel is a player INPUT like a strike or a use, so it
@@ -143,6 +159,11 @@ struct TickInput {
   // because this is a fixed-size wire POD; the store detects collisions at
   // load. One-shot like the edge it rides with (TickInputFeeder::Consume).
   uint32_t useRef = 0;
+  // WHAT A TB_DEMON_PRESENT PRESS PRESENTS (demons D5): contract::PageHash of
+  // the page's name, and WHICH demon (low 32 bits of its mob id, 0 = the one
+  // the presser is talking to / its most recent). One-shot with their edges.
+  uint32_t contractHash = 0;
+  uint32_t demonRef = 0;
 
   // The camera basis AT TICK TIME. flatFwd is the horizontal walk forward,
   // right the horizontal strafe axis, lookFwd the full 3D aim (fly and swim).
@@ -160,7 +181,7 @@ struct TickInput {
   }
 };
 
-static_assert(sizeof(TickInput) == 76, "TickInput is a wire message");
+static_assert(sizeof(TickInput) == 84, "TickInput is a wire message");
 
 // ---- THE FRAME LAYER'S ACCUMULATOR ---------------------------------------
 //
@@ -204,6 +225,16 @@ struct TickInputFeeder {
     pend.pressed |= TB_USE;
     pend.useRef = refHash;
   }
+  // A contract presented to a demon / a demon dismissed (demons D5).
+  void Present(uint32_t pageHash, uint32_t demon) {
+    pend.pressed |= TB_DEMON_PRESENT;
+    pend.contractHash = pageHash;
+    pend.demonRef = demon;
+  }
+  void Dismiss(uint32_t demon) {
+    pend.pressed |= TB_DEMON_DISMISS;
+    pend.demonRef = demon;
+  }
   void SetSelection(int tool, int hotbarSlot) {
     pend.tool = (int16_t)tool;
     pend.hotbar = (int16_t)hotbarSlot;
@@ -220,6 +251,8 @@ struct TickInputFeeder {
     pend.strikeStyle = -1;
     pend.talk = kTalkNone;
     pend.useRef = 0;
+    pend.contractHash = 0;
+    pend.demonRef = 0;
     return out;
   }
 };

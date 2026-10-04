@@ -1,0 +1,25 @@
+{
+  "//": "STOCK CONTRACTS (docs/PLAN_demons.md D5; game/contract.h). Shipped with the game and read-only in the editor; every player can present them. Written to be safe against an imp: each forbids it attacking or casting at you, and each runs one day. The language is contract.h's: kind duty | forbid | penalty, a verb, `who` (a selector), `when` (a trigger), `arg`/`into`, `then`, `on`.",
+  "stock": [
+    { "name": "Servant, one day", "hours": 24,
+      "clauses": [
+        { "kind": "duty",   "verb": "follow", "who": "me" },
+        { "kind": "forbid", "verb": "attack", "who": "me" },
+        { "kind": "forbid", "verb": "cast",   "who": "me" }
+      ] },
+    { "name": "Bodyguard, one day", "hours": 24,
+      "clauses": [
+        { "kind": "duty",   "verb": "guard",  "who": "attacking(me) & hostile_to(me)" },
+        { "kind": "duty",   "verb": "follow", "who": "me" },
+        { "kind": "forbid", "verb": "attack", "who": "me" },
+        { "kind": "forbid", "verb": "cast",   "who": "me" }
+      ] },
+    { "name": "Fetch, one day", "hours": 24, "counters": ["fetched"],
+      "clauses": [
+        { "kind": "duty",   "verb": "fetch",  "arg": "water", "when": "fetched < 3", "on": "fetched+1" },
+        { "kind": "duty",   "verb": "follow", "who": "me" },
+        { "kind": "forbid", "verb": "attack", "who": "me" },
+        { "kind": "forbid", "verb": "cast",   "who": "me" }
+      ] }
+  ]
+}

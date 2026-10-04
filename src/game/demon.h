@@ -40,6 +40,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -54,6 +55,10 @@ struct SessionTick;
 struct SpellSummon;
 struct GlyphLibrary;
 class MobSystem;
+namespace demon {
+struct Pact;        // game/demon_talk.h (D5)
+struct TalkWorld;   // game/demon_talk.h (D5)
+}
 
 // ---- content -----------------------------------------------------------------
 
@@ -68,6 +73,7 @@ struct DemonDef {
   std::vector<std::pair<std::string, int32_t>> resist;  // channel -> resistance (D3)
   std::vector<std::string> schemes;                     // scheme names (D6)
   std::string released;    // behaviour profile after a HELD release (D3; D5's contract replaces it)
+  std::string dialogue;    // assets/dialogue/<name>.json: the conversation while contained (D5)
 };
 
 struct DemonCircleCfg {
@@ -117,6 +123,7 @@ struct LiveDemon {
   uint32_t movesRefused = 0, blowsRefused = 0;
   std::string why;          // why this state (the HUD / the gate)
   demon::Binding bind;      // seals, strength, gaze, release (D3)
+  std::shared_ptr<demon::Pact> pact;   // the contract it is BOUND under (D5), null = none
 };
 
 struct PendingSummon {
@@ -140,6 +147,8 @@ struct DemonWorld {
   std::string loadLog;
   std::vector<PendingSummon> pending;
   std::vector<LiveDemon> live;
+  // Conversations, contracts, restores (game/demon_talk.h, D5); created on use.
+  std::shared_ptr<demon::TalkWorld> talk;
   // The MobSystem whose fence points at this object (cleared on destruction:
   // a harness's MobSystem outlives the rig that owns this).
   MobSystem* fenced = nullptr;

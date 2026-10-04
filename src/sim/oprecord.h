@@ -338,7 +338,8 @@ struct Header {
 // 6: TickInput `talk` (the conversation command, PLAN_world_editor.md P3);
 //    same size, new meaning.
 // 7: Frame carries `tickets`, the chunk-ticket ops of the tick (tickets P1).
-constexpr uint32_t kRecordVersion = 7;
+// 8: TickInput grew `contractHash` + `demonRef` (76 -> 84 bytes, demons D5).
+constexpr uint32_t kRecordVersion = 8;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its

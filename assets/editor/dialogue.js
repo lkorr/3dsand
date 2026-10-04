@@ -526,7 +526,7 @@ function actRows(arr, set, title) {
     const row = h('div', {class: 'dlg-row'});
     const kindSel = h('select', {onchange: e => {
       const k = e.target.value, na = {};
-      na[k] = k === 'end' ? true : (k === 'give' || k === 'take') ? (st.items[0] || '') : (typeof a[kind] === 'string' && kind !== 'give' && kind !== 'take' ? a[kind] : 'my_flag');
+      na[k] = (k === 'end' || k === 'present_contract' || k === 'release' || k === 'dismiss') ? true : (k === 'give' || k === 'take') ? (st.items[0] || '') : (typeof a[kind] === 'string' && kind !== 'give' && kind !== 'take' ? a[kind] : 'my_flag');
       arr[i] = na; redraw();
     }}, ...dl.ACT_KINDS.map(k => h('option', {value: k}, k)));
     kindSel.value = kind;
@@ -548,6 +548,10 @@ function actRows(arr, set, title) {
         placeholder: kind === 'grant' ? 'glyph id' : 'demon name',
         oninput: e => { a[kind] = e.target.value; touch(); }}));
       row.append(h('span', {class: 'lbl'}, kind === 'grant' ? 'the player owns this glyph' : 'sets name:<name>'));
+    } else if (kind === 'present_contract' || kind === 'release' || kind === 'dismiss') {
+      // demons D5 (game/demon_talk.h): a demon's conversation only.
+      row.append(h('span', {class: 'lbl'}, kind === 'present_contract' ? 'opens the contract picker'
+        : kind === 'release' ? 'lets the demon out (the binding is weighed)' : 'sends the demon home'));
     } else {
       row.append(h('span', {class: 'lbl'}, 'ends the conversation after this'));
     }

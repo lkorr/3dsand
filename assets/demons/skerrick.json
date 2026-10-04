@@ -5,6 +5,8 @@
   "behavior": "imp",
   "//released": "The behaviour profile he takes when you let him out of the circle and the binding HOLDS (D3: strength >= power + contract weight). A placeholder for D5's contract: neutral -- he wants nobody until struck. If the binding does not hold he is loose under `behavior` instead.",
   "released": "imp_bound",
+  "//dialogue": "The conversation while he is contained (D5; assets/dialogue/<name>.json): T within 8 m of him opens it. Its nodes may say {tell} (a line from tells.json for the current margin), {name}, {margin}, {weight}, {contract}.",
+  "dialogue": "demon_skerrick",
   "//tier": "1 = an imp: weak, few tricks, simply leaves when a contract ends (D5/D6). Greater demons are 2..3.",
   "tier": 1,
   "//power": "Weighed against a circle's strength plus a contract's weight (D3/D5): binding holds iff strength >= power + weight. Low: a plain salt ring and a stock contract hold an imp.",

@@ -24814,3 +24814,174 @@ cast_out and touch open (blows through, none refused); staring at him fills
 the strain and costs the circle; looking away lowers it; his power raised to
 1000, a release is overpowered and he is unbound and hunting. C: the tell
 table answers by margin.
+
+### Demons — conversation, contracts, weight, upkeep (D5; `game/contract.*`, `game/demon_talk.*`, `ui/contract_ui.cpp`)
+
+A contained demon can be TALKED to and BOUND by a contract; a bound demon,
+released, SERVES under it. Everything is CPU gameplay state in the tick; every
+player action rides `TickInput`.
+
+**THE CONVERSATION.** A demon def names a dialogue file (`"dialogue":
+"demon_skerrick"`). **T** (`TB_DEMON_TALK`, bit 20) opens it with the
+presser's most recent CONTAINED demon within 8 m; the tick ends it the moment
+the demon is not contained (released, unbound, gone). Before it opens the
+engine writes two flags the file's `entry` reads: `demon:present` (1 refused,
+2 bound, 3 the summoner cannot carry the upkeep) and `demon:bound`; the
+validator treats `demon:*` as engine-written. Node text may say `{tell}` (D3's
+`TellFor` at the current margin -- strength - power - weight, or the refused
+page's margin), `{name}`, `{margin}`, `{weight}`, `{contract}`; main.cpp
+substitutes after `MakeView` (`demon::TalkText`, presentation only). Three
+dialogue actions, appended to `Act::Kind`: `present_contract`, `release`,
+`dismiss`. The dialogue layer cannot reach the demon world, so `RunActs`
+queues them on the store (`Store::demonActs`) and `demon::ContractTick`
+carries them out in the same tick.
+
+**THE GAZE IN CONVERSATION.** The camera is locked on the demon's head
+(main.cpp, presentation); **L** held or the strip's toggle sets
+`TB_DEMON_LOOKAWAY` (bit 23, HELD). `demon::TalkPreTick` -- which runs before
+`dialogue::TickSession` zeroes a talking player's command -- rewrites
+`TickInput::lookFwd` from that bit (at the head, or away and down), so D3's
+strain test reads the command, not the mouse. An `avert` demon stared at for
+3.3 s costs the circle a lapse, exactly as outside a conversation.
+
+**THE CONTRACT** (`game/contract.h`; its header is the language reference).
+A PAGE = name, term in game `hours` (0 = indefinite), up to 4 named counters,
+up to 12 CLAUSES. A clause = kind (duty | forbid | penalty) + verb + `who` (a
+SELECTOR) + `when` (a TRIGGER) + args (`arg`, `into`) + `then` (penalty:
+dismiss | destroy | pain) + `on` (an effect on a counter when the clause
+fires). Verbs: duties follow / guard / goto / fetch / spin; forbids attack /
+cast / leave; penalties watch attack / leave. Selectors are set expressions
+over ACTORS (the players and the live mobs): `me`, `self`, `all`,
+`attacked_by(S)` (actors a member of S is attacking -- a mob's brain target, a
+player's strike remembered for 300 ticks), `attacking(S)` (actors whose target
+is in S), `hostile_to(S)` (an aggro-hostile profile of another faction than a
+member of S, or attacking one), `faction(x)` (players: `player`), `type(x)`
+(the mob def stem), `& | !` and parentheses; at most 24 nodes. Triggers: `dist`
+(m to the summoner), `hp` / `demon_hp` (%), `term` (s left), `count(S)` (within
+24 m), a counter name; `<op> <int>`, joined by `&`, at most 4. BOUNDED: every
+selector visit is charged to a per-demon per-tick budget of 20,000; a duty's
+set that runs it out answers "not a member", a forbid's answers "a member"
+(fail closed).
+
+**THE WEIGHT** (`assets/demons/contract_tariff.json`, `contract::Weigh`): a
+term bracket (24 h 1, 72 h 4, 168 h 8, indefinite 30), each duty's verb
+(follow 1, guard 3, goto 1, fetch 3, spin 0), each forbid's (attack 3, cast 3,
+leave 2), a penalty's consequence (destroy 1, pain 1), selector BREADTH
+(points per node: all 6, faction 2, not 2, or 1, attacked_by / attacking /
+hostile_to / type 1, me / self / and 0) at 100% for duties and forbids, 0% for
+penalties, plus 1 per trigger condition and per counter. One line per term;
+the editor shows them live. Stock pages (`assets/demons/contracts.json`,
+read-only): **Servant, one day** (follow me; never attack / cast at me) 8;
+**Bodyguard, one day** (guard `attacking(me) & hostile_to(me)`; follow me;
+never attack / cast at me) 13; **Fetch, one day** (fetch water while `fetched <
+3`, `fetched+1`; follow; the two forbids) 13. Both files reload with R; the
+stock pages are parsed by the same `PageFromJson` a test page is.
+
+**BINDING.** `TB_DEMON_PRESENT` (bit 21) carries `TickInput::contractHash`
+(FNV-1a of the page NAME) and `demonRef` (low 32 bits of the mob id, 0 = the
+one you are talking to). The page resolves against the presser's own pages,
+then the stock ones; it is compiled and weighed, and BOUND iff the demon is
+contained, `strength >= power + weight`, and the summoner's effective mana max
+can carry its UPKEEP (`power x upkeepPerPowerPct / 100`, an imp 20). Bound: the
+`Pact` (a COPY of the page, weight, upkeep, bind tick, expiry, counters, the
+anchor "here") hangs on the `LiveDemon`; the demon takes the def's calm
+`released` profile at once (it stops prowling the ring) but stays CONTAINED.
+Refused: no pact, the conversation reopens at its refused entry.
+
+**RELEASE** is D3's `demon::Release(w, players, id, weight, tick)` with the
+pact's weight -- from the dialogue's `release` or the Y key (D3's SealsTick
+now passes `ContractWeight`). Held -> RELEASED and serving. Overpowered ->
+`DemonUnbind`, which now also VOIDS the pact (the upkeep is freed): loose is
+loose.
+
+**UPKEEP.** `session.cpp`: `caster.mana.reserved = spells.ReservationFor(...) +
+demon::UpkeepFor(w, s.index)` -- every bound demon of that player, contained
+or serving, for as long as it is bound. That is what limits how many you hold.
+
+**SERVING** (`demon::ContractTick`, after `DemonTick`, before the mobs
+think). The `imp_bound` profile is the floor (neutral, plus a `goto` weight of
+1.0 for the routine); the contract is layered on it every tick:
+- DUTIES, first whose `when` holds and that can act: follow (the nearest of
+  `who`, arrive 2 m, facing it), goto (`x y z` or the anchor), spin (hold,
+  heading on a 2 s turn), fetch (below) write `Brain::routine` (the resident
+  layer's seam, verb Goto); guard picks the nearest of `who` within 16 m of the
+  summoner that no forbid-attack holds and writes the brain's TARGET. No duty
+  that can act: routine cleared, target cleared, it stands.
+- THE TARGET IS THE DUTIES'. A bound demon in D5 has no motive of its own (D6
+  adds the ladder). The fence (`MobFence::Blow`, now installed while any pact
+  exists) asks `demon::PactAllowBlow` with the brain's target: refused if a
+  forbid-attack set holds it (`blowsForbidden`) or it is not this tick's guard
+  target (`blowsUnsanctioned`) -- so a provoked neutral floor that turns on
+  its summoner swings and lands nothing. A blow ASKED at a penalty's set
+  queues that penalty for the next tick.
+- forbid `leave(who, m)` tethers: past 0.8 x m it is walked back.
+- PENALTIES fire: dismiss / destroy (the demon departs), pain (15% of its
+  life to its first limb). No weighing (D6).
+- FETCH: the nearest cell of the material within 16 cells (dy +-4) in the T-4
+  snapshot mirror, re-scanned every 30 ticks; walk there; THE TAKE is the
+  summoner's own scoop path -- `ContainerScoop` into the summoner's first
+  single vessel (hotbar, then bag) that accepts it (`into` names an item, "" =
+  any), conditional clears through the queue, the claim filed on the
+  summoner's scoop memo and paid exactly by the ledger four ticks later. Then
+  back to the summoner: within 2.5 m the duty is done (`on` fires). The vessel
+  is credited as the demon takes the matter (the claim's tick), not when it
+  walks back: conservation through the one scoop path was worth more than the
+  theatre.
+- THE TERM: `hours` x (ticks per day / 24) from the binding; at its end the
+  demon DEPARTS (the mob leaves the world, `RemoveMob`) and the reservation is
+  freed. D6 adds the higher tiers' one free act.
+- DISMISS (`TB_DEMON_DISMISS`, bit 22, Shift+Y, or the dialogue's): your most
+  recent bound or contained demon, from anywhere, departs.
+
+**THE CAST-FILTER HOOK FOR D4.** `demon::AllowCastAt(w, demonId, targetId)`:
+false iff the demon is bound and a forbid `cast` clause's set holds that
+actor. D4's mob casting path must ask it before a demon's cast is emitted (D4
+was built in parallel; until it merges nothing casts, so nothing asks).
+
+**THE UI** (`ui/contract_ui.cpp`, pixel chrome, every string fitted with
+`Fit`). The CONTRACT EDITOR (spellbook header -> `contracts`): your pages and
+the stock ones on the left; the page on the right as CARDS -- MUST / NEVER /
+IF, then tokens (verb, who, argument, consequence) that step through their
+choices on a click; SIMPLE by default (a "start from" row of stock templates,
+`+ must`, `+ never`, `+ if .. then`), FULL shows the who / when / on / arg text
+fields and the counters. The WEIGHT panel: one line per term, the total, the
+upkeep for an imp and what the circle must reach, compile errors in ember. The
+only write is an op (save / delete) main.cpp applies to
+`PlayerCaster::contracts`. THE STRIP over the conversation panel: the circle
+against power (+ contract), the margin, the gaze rule, strain pips and a
+look-away toggle, the contract it is bound by, and after `present_contract`
+the PICKER (each page's weight and the margin it would leave, `present`
+buttons that become `TB_DEMON_PRESENT`). HUD: the D1 tab says `T TALK  Y
+RELEASE`; one tab per bound demon (name, contract, duty, term left, mana held).
+
+**SAVED.** 'DMNS' (world.sve, v1): every BOUND demon -- def, name, mob def,
+summoner, state, origin, its circle (contained ones), the page, weight, upkeep,
+the term LEFT in ticks, counters, anchor. Its reset clears the live list (the
+MOBS section brings the creatures back under FRESH ids); a loaded entry is
+matched over the first 300 ticks to a live mob of that def, untracked, nearest
+its origin within 24 voxels, and gets its pact back with the term restarted
+from what was left. 'CNTR' (players/<id>.svp, v1): the player's pages. NOT
+saved: contained-but-unbound demons (they load loose, as D1), the
+conversation (as P3), the picker.
+
+**TickInput v8**: bits 20..23 (TALK, PRESENT, DISMISS, LOOKAWAY), fields
+`contractHash` + `demonRef` (76 -> 84 bytes); op record v8. Bits 17..19 are
+left for D4.
+
+**GATE** `demon-contract` (thresholds `demonContract.*`): the language (the
+plan's selector parses to 8 nodes, a broken one names its fault, triggers and
+effects, the stock pages load and weigh); on D1's pad and ring (+2 candles),
+every action through TickInput: SERVANT -- T opens `demon_skerrick` at `greet`
+with `{tell}` filled; a 49-weight page is refused (still contained, no pact,
+the dialogue at `refused`); the stock servant binds (`bound_now`) and its
+upkeep is reserved; the dialogue's release lets him out on `imp_bound`; he
+follows the summoner across the pad to within `followNearM`; struck (his
+floor provoked) no blow at the summoner gets through; Shift+Y sends him home
+and frees the reservation; run twice, identical trace. BODYGUARD -- a page
+guarding `attacked_by(me) & hostile_to(me)`; the summoner strikes at a zombie,
+a villager stands by: he targets the zombie and nobody else and his blows
+land on it only. PERSISTENCE + EXPIRY -- the MOBS / DMNS / CNTR sections
+round-trip through their bytes: the servant comes back under a fresh id,
+released, same page, the same term left (+-2 ticks), the same upkeep
+reserved, the player's own page back; then the expiry tick is brought near
+(the one test seam) and he departs, the reservation freed.

@@ -555,6 +555,10 @@ add_library(sandvox_core OBJECT
   src/game/demon.cpp
   src/game/demon_circle.cpp
   src/game/demon_seals.cpp
+  # demons D5: contracts (the page, the language, the weight) and the
+  # conversation / binding / serving runtime (game/contract.h, demon_talk.h).
+  src/game/contract.cpp
+  src/game/demon_talk.cpp
   src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
@@ -648,6 +652,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_elec_strike.cpp
   src/test/selftest_demon.cpp
   src/test/selftest_demon_seals.cpp
+  src/test/selftest_demon_contract.cpp
   src/test/selftest_elec_play.cpp
   src/test/selftest_elec.cpp
   src/test/selftest_elec_mob.cpp
@@ -708,6 +713,8 @@ add_library(sandvox_core OBJECT
   src/ui/item_stage.cpp
   # The conversation panel (pixel art, ui/dialogue_ui.h).
   src/ui/dialogue_ui.cpp
+  # demons D5: the contract editor and the demon conversation's strip.
+  src/ui/contract_ui.cpp
   # F1 -> World -> References: the ref list + inspector (world/refs.h).
   src/ui/refs_ui.cpp
   src/ui/refs_npc_ui.cpp

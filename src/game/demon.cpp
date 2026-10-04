@@ -1,5 +1,6 @@
 // demon.cpp — summoning, the circle's hold, the goof. See demon.h.
 #include "game/demon.h"
+#include "game/demon_talk.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,6 +50,8 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
       demon::LoadSealFile(p.string(), p.stem().string(), out.seals, log);
       continue;
     }
+    // D5: the contract tariff and the stock pages (game/contract.h reads them).
+    if (p.stem() == "contract_tariff" || p.stem() == "contracts") continue;
     json j;
     try {
       std::ifstream f(p);
@@ -76,6 +79,7 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
     d.mob = j.value("mob", std::string());
     d.behavior = j.value("behavior", std::string());
     d.released = j.value("released", std::string());
+    d.dialogue = j.value("dialogue", std::string());
     d.tier = std::clamp(j.value("tier", 1), 1, 3);
     d.power = std::max(0, j.value("power", 10));
     d.gaze = j.value("gaze", std::string("avert"));
@@ -233,6 +237,11 @@ bool FenceAllow(void* ctx, uint64_t mobId, MobFence::Kind kind, float fromX, flo
   DemonWorld& d = *(DemonWorld*)ctx;
   for (LiveDemon& ld : d.live) {
     if (ld.mobId != mobId) continue;
+    // D5: a bound demon's blows answer to its contract (demon_talk.h).
+    if (kind == MobFence::Blow && ld.pact && ld.state == DemonState::Released && d.fenced) {
+      const ai::Brain* b = d.fenced->MobBrain(mobId);
+      return demon::PactAllowBlow(d, ld, b && b->hasTarget ? b->targetId : 0);
+    }
     if (ld.state != DemonState::Contained) return true;
     if (ld.circle.Inside(toX, toZ)) return true;
     // D3: a blow across the ring is the `touch` channel. Unsevered (not iron
@@ -267,6 +276,7 @@ void DemonUnbind(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon&
   ld.state = DemonState::Unbound;
   ld.stateTick = tick;
   ld.why = why;
+  ld.pact.reset();   // D5: loose is loose -- the contract is void, the upkeep freed
   // A released demon going loose gets its hostile profile back.
   if (const DemonDef* def = w.demons ? w.demons->lib.Find(ld.demon) : nullptr)
     if (!def->behavior.empty()) w.mobs.SetMobBehavior(ld.mobId, def->behavior);
@@ -465,7 +475,8 @@ void DemonTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tic
   // ---- D3: release presses, the seal band, the move loophole, gaze, strength --------
   demon::SealsTick(w, players, tick, probe);
   for (const LiveDemon& ld : d.live)
-    anyContained = anyContained || ld.state == DemonState::Contained;
+    anyContained = anyContained || ld.state == DemonState::Contained ||
+                   (ld.pact && ld.state == DemonState::Released);   // D5: a contract fences blows
   // ---- the fence -------------------------------------------------------------------
   if (anyContained) {
     MobFence f;
