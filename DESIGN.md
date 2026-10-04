@@ -12140,7 +12140,9 @@ mirror and the creature's own lattice:
   (brick pokes replayed in order, `MarkInstancesDirty`, the flush) and the
   recount serially in pot order. What moved: a sync now runs after the other
   creatures' heads, so a flush's particles and a brick's copy-on-write land
-  later in their lists (the world hash moves; the run is deterministic).
+  later in their lists -- a crowd fight takes a slightly different (and still
+  reproducible) course; the `determinism` gate's hash, which has no
+  creatures in it, is unmoved.
 - Splatter: one task per creature flies every burst at it (`SplatSink`); the
   brick copy-on-write, stain pokes and counters are replayed in the inline
   (burst, creature, limb, landing) order, each burst's severed-flesh pass where
