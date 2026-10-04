@@ -275,6 +275,29 @@ const SOUND_SCHEMA = {
        pitch:'a touch high when close (a crack), lower far off (a roll)'},
     ],
   },
+
+  // ---- electricity ----------------------------------------------------------
+  // Owned like the combat sets (store 'none'): two sets, fixed in code.
+  electric: {
+    store: 'none',
+    title: 'Electricity',
+    icon: '\u{1F50C}',
+    blurb: 'Zaps and shocks. One owner, so the set names are fixed in code. The shipped takes are PROCEDURAL PLACEHOLDERS (scripts/gen_elec_sounds.py) for recorded ones to replace.',
+    slots: [
+      {k:'zap', n:'zap (arc crackle)', prefix:'electric',
+       d:'The crackle of arcs where a strike lands: every emitted strike (a storm’s ground strike, the lightning glyph’s bolt, the shock glyph’s burst of arcs), at the foot of the bolt, at once (it is close, so no sound delay; the thunder carries the distance).',
+       fires:'audio::Cues::Zap — main.cpp, draining TickAuthorityCtx::strikes.events',
+       fallback:'silent.',
+       gain:'55% for a small strike up to full for a storm bolt',
+       pitch:'a touch higher for a bigger strike'},
+      {k:'shock', n:'shock (body takes current)', prefix:'electric',
+       d:'A body taking current: MobSystem::ApplyShocks applied a shock to a creature or the player this tick (standing in charged water, touching a live wire, struck). At the limb that took the most.',
+       fires:'audio::Cues::Shock — main.cpp, draining MobSystem::ShockCues',
+       fallback:'silent.',
+       gain:'45% for a tingle up to full at the knock-down current (gore.shockRagdollP); the player’s own shock always takes a voice, an NPC’s at most one per 0.12 s',
+       pitch:'rising with the current'},
+    ],
+  },
 };
 
 // Every namespace a slot can bind into, for the set browser's grouping and for

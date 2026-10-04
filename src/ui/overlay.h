@@ -1550,6 +1550,14 @@ struct UIState {
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.
   float throwCharge = -1.0f;
+  // THE SHOCK (MobSystem::ApplyShocks; wave 2 package E). Written by the tick
+  // (TickAuthority's stun pass) for the HUD's pixel cue under the crosshair:
+  // the stun's ticks left (0 = not stunned) and how many ticks ago this body
+  // last took current (-1 = never). The cue: a jagged pixel bolt, STUNNED and
+  // a pip per remaining half-second, plus an edge flash for a few ticks after
+  // a jolt.
+  int stunTicksLeft = 0;
+  int shockTicksAgo = -1;
   // A HELD VESSEL'S MODE, PER HAND (dual wielding; sim/tickinput.h
   // TB_SCOOP/TB_APPLY and their _L twins): 0 pour, 1 scoop, 2 apply. F
   // cycles the vessel in the hand last used; the hand's own button (LMB

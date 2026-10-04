@@ -4807,13 +4807,23 @@ op record, ops-replay and the net need no change (rule 3).
 1. **Target.** Every column in an XZ disc (`searchRadius`) round the aim is
    scanned down through `WorldStrikeProbe` -- the snapshot mirror, then the
    on-demand fetch cache, never the analytic terrain (a bolt into a house must
-   stop at the roof) -- from `aim.y + 24` to its first non-gas cell, its TOP.
+   stop at the roof) -- from THE REAL TOP, `aim.y + kStrikeScanUp` (272 cells:
+   the tallest generated tree, a redwood at 22 + 4 m, with room to spare;
+   clamped to the window), to its first non-gas cell, its TOP. A top counts
+   only under KNOWN air: a column whose first known cell is solid (a crown or
+   a roof whose upper chunks no store holds) was entered from inside and does
+   not compete (`StrikePlan::columnsHidden`) -- wave 2's fix for the bolt that
+   stopped in mid-air inside a canopy when the scan started 24 cells over the
+   aim. Knowledge is chunk-granular, so the scan skips an unknown chunk in one
+   step and reads a known one through one lookup (`StrikeChunkWords`).
    Score = top y + `conductBonus` (6) if the top conducts (`StrikeMats`:
-   tag `metal` / `conductive`, or iron / steel / gold / brass / copper / silver
-   by name until E1 fixes those tags), ties to the nearer column, then a hash.
-   So a strike PREFERS a tall thing and an iron rod over a taller post beside
-   it -- the lightning rod. A column the probe cannot see does not compete;
-   with none, the bolt lands at the aim.
+   `electric.resist` 1..8), ties to the nearer column, then a hash. So a
+   strike PREFERS a tall thing and an iron rod over a taller post beside it --
+   the lightning rod. With no column qualifying, the bolt lands at the aim.
+   Both callers make the stores know first (`StrikeSearchChunks`: the disc x
+   the scan span, in a fixed order): a storm strike requests them at DECIDE, a
+   spell strike whose search leaves the stores waits a stepped leader for them
+   (below).
 2. **Bolt.** A jagged column of `lightning` from `height` cells over the top
    down to the cell above it: one cell a step, a hashed sideways kick on about
    a third of the steps, pulled back so it always ARRIVES, plus up to three
@@ -4838,25 +4848,47 @@ last): the VM only REPORTS a strike (`SpellEmission::strikes`, `SpellStrike`)
 `SpellStrikeToCells`) builds the spec from the glyph's `strike` block
 (`StrikeSpecFromGlyph`: `bolt`, `splash`, `height`, `search`, `splashRadius`,
 `arcs`, `forks`, `conductBonus`, `tariffMille`). Repetition raises the bolt and
-adds arcs, inside the caps. Tariff = cells x arcane(matter) x rate.place x
+adds arcs, inside the caps, and the effect's STRENGTH (`SpellStrike::
+strengthMille`, a spent carrier or a lane's share) scales the same two -- a
+weak bolt is a shorter bolt with fewer arcs, so less charge reaches the field. Tariff = cells x arcane(matter) x rate.place x
 `tariffMille` (a bolt is ~70 cells for a few ticks; at full price it would be
 out of a 100-mana caster's reach): `lightning projectile` costs ~66 mana. A
-ward (`lightning null`, `FilterRefuses` kind 6) refuses a strike at its aim.
-`spark` now places `spark`, not `fire`.
+ward (`lightning null`, `FilterRefuses` kind 6) refuses a strike at its aim
+(`FilterStreams`) AND, because the search moves the bolt up to 12 cells, again
+at the cell it struck and the cell it arrives in (`SpellSystem::StrikeWarded`,
+asked by `session.cpp` `FireSpellStrike`): a bolt aimed outside a ward cannot
+reach in to a rod inside it. `spark` now places `spark`, not `fire`.
 
-**Storm ground strikes** (owner, 2026-10-03: yes, in the sim, near the player
-only). `WeatherStrikes`, in phase K's world slot beside the reactions'
-aftermath, in two steps:
+**Wave 2 (package E), the spell half.** *Beyond the mirror*: when
+`StrikeSearchKnown` says the search reads a chunk neither store holds, the
+spell strike requests those chunks and waits `kStrikeLeadTicks` (8) in
+`strikes.spellPending` (bounded 8; past that it fires at once on what is
+known), then fires from the casting session's phase I -- the storm's own
+stepped leader, and a pure function of the tick because both stores are. A
+search the stores already cover fires the tick it resolves, as before.
+*No mana for a refused strike*: the VM stamps each `SpellStrike` with its own
+tariff (`EffectTariffIn`, the number `PriceCast` summed) and a strike the
+budget refuses refunds it to the caster's mana (capped at the pool's max; the
+words are not refunded). A ward refusal is not refunded, like any warded op.
+Telemetry: `strikes.spellLeaders` / `spellWarded` / `spellRefunded`.
 
-- DECIDE on a tick whose `Hash3(seed, tick)` rolls under the sky's lightning
+**Storm ground strikes** (owner, 2026-10-03: yes, in the sim, near the
+players). Two steps, `session.cpp`:
+
+- DECIDE (`DecideWeatherStrike`), PER SESSION since wave 2 (it was the
+  primary's alone), keyed by the player's id (`strikes.playerIdBase` + session
+  index; the host and single player are id 0 and roll exactly the old hashes,
+  a net client is 1, so two machines no longer strike on the same ticks), on a
+  tick whose `Hash3(seed, tick, player)` rolls under the sky's lightning
   rate (`weather::SimLightningQ`: the preset's `lightning`, flashes/min, Q16,
   through the same integer schedule the rain word walks -- never the render
   flash, which is frame-paced) x `weather.strikeRate` (0.3: a 7/min storm
   strikes ~2/min) / 1800 ticks. The aim is a hashed point in the ring
-  `strikeRadius`/4 .. `strikeRadius` (160 cells) round the primary, on the
+  `strikeRadius`/4 .. `strikeRadius` (160 cells) round THAT player, on the
   analytic ground, clamped into the window; every chunk the target search will
-  read is requested from the fetch cache NOW.
-- FIRE 8 ticks later (the stepped leader; the cache readback lands in 1 tick +
+  read, up to the real top, is requested from the fetch cache NOW (~76 chunks;
+  the fetch queue's 64-a-tick cap spreads them).
+- FIRE (`FireWeatherStrikes`, once a tick in the primary's world slot) 8 ticks later (the stepped leader; the cache readback lands in 1 tick +
   `kSnapshotLatency`) through `LightningStrike` with `WeatherStrikeSpec`
   (search 8, height 56, 6 arcs of radius 3, 3 forks).
 
@@ -4869,14 +4901,32 @@ lights over the bolt with the far flashes' stroke-and-restrike envelope, aged
 on the sim clock; `State::strikeFlash`, outshining a far flash while it lasts)
 and `Cues::Thunder` (set `weather/thunder`, the `weather` owner in
 `sound_schema.js`; delayed by distance at 343 m/s, louder and higher close).
-Far flashes stay render-only and silent.
+Far flashes stay render-only and silent. Every emitted strike also CRACKLES
+at its foot (`Cues::Zap`, set `electric/zap`, the shock glyph's burst
+included), and a body taking current buzzes (`Cues::Shock`, set
+`electric/shock`, from `MobSystem::ShockCues`, one per body per tick
+`ApplyShocks` applied a shock; the player's own always takes a voice). A PEER's
+bolt flashes and claps too: its CellOps cross in the merge but its Event did
+not, so phase N reads the peer's kept cells (`OpDelayQueue::Merge`'s
+`remoteCellIdx`) and re-announces each run that lays `lightning` as an Event
+with `remote` set (`AnnounceRemoteStrikes`; presentation only). The thunder,
+zap and shock takes shipped are PROCEDURAL PLACEHOLDERS
+(`scripts/gen_elec_sounds.py`, deterministic, mono 16-bit 44.1 kHz) for
+recorded ones to replace.
+
+**Stunned** (wave 2): the tick zeroes the command's move, buttons, strike and
+use target (`TickAuthority`); the frame layer's physical kit verbs (Q / E
+equip, G take / grab / throw wind-up) refuse while `avatar.Stunned(tick)`;
+`hotbar` / `tool` stay as the record of the selection, and a conversation
+choice (`talk`) is kept on purpose (a menu pick, applied before the stun pass).
+The HUD's cue (`ui/overlay.cpp`, pixel art on the 2 px grid): a crackling
+pale-blue edge frame for six ticks after a jolt, and a STUNNED tab under the
+crosshair with a block lightning glyph and a pip per remaining half-second.
 
 **Not done:** mob shock/stun (E4). (The charge field's CA effects -- a bolt
 into a pond electrolyses its brine, wood down a struck rod catches, the rod
-crackles -- are E2's, "What charge does" in section 4.) The target scan starts 24
-cells over the aim, so a tree taller than that is struck inside its canopy (the
-bolt above it is refused by the leaves, IfAir); no thunder sample is recorded
-yet (`weather/thunder` is silent until one is).
+crackles -- are E2's, "What charge does" in section 4.) (Wave 2 fixed the 24-cell
+scan start and shipped placeholder thunder.)
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.

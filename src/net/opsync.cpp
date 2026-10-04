@@ -160,10 +160,12 @@ const OpBatch& OpDelayQueue::Outgoing(uint32_t label, IVec3* origin) const {
 
 OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
                             std::vector<uint32_t>* remoteBrushIdx,
-                            std::vector<uint32_t>* remoteExpIdx) {
+                            std::vector<uint32_t>* remoteExpIdx,
+                            std::vector<uint32_t>* remoteCellIdx) {
   st = MergeStats{};
   if (remoteBrushIdx) remoteBrushIdx->clear();
   if (remoteExpIdx) remoteExpIdx->clear();
+  if (remoteCellIdx) remoteCellIdx->clear();
   OpBatch out;
 
   auto it = labels_.find(label);
@@ -287,6 +289,7 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
           }
           continue;
         }
+        if (remoteCellIdx) remoteCellIdx->push_back((uint32_t)out.cells.size());
         out.cells.push_back(c);
         st.remoteCells++;
       }

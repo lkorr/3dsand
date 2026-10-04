@@ -212,6 +212,19 @@ class Cues {
   void Thunder(const Vec3& posVox, const Vec3& listenerPosVox);
   int ThunderSetId() const;
 
+  // ---- electricity (the `electric` owner, wave 2 package E) ----------------
+  // ZAP: the crackle of arcs at a strike's foot -- every emitted strike (a
+  // storm's bolt, the lightning glyph, the shock glyph's burst), at once (it
+  // is close: no sound delay). Set electric/zap. `power` 0..1.
+  // SHOCK: a body taking current (MobSystem::ShockCues, fired by
+  // ApplyShocks): a buzzing jolt at the limb; `onMe` takes a voice even from
+  // a saturated pool, as a blow on the player does. Set electric/shock.
+  // Both fixed in code like the combat sets; silent when nothing is recorded.
+  void Zap(const Vec3& posVox, float power);
+  void Shock(const Vec3& posVox, float intensity, bool onMe);
+  int ZapSetId() const;
+  int ShockSetId() const;
+
   // ---- bleeding -----------------------------------------------------------
   // A positioned wet loop for a creature losing a lot of blood, keyed by a
   // caller-chosen id (mob id, or a limb key) so several wounds can sound at
@@ -326,6 +339,9 @@ class Cues {
     // Thunder: strikes reported (requests, counted like `combat`) and claps
     // actually started once their sound delay ran out.
     uint32_t thunderStrikes = 0, thunderVoices = 0;
+    // Electricity: requests (counted like `combat`, before the device check)
+    // and voices started.
+    uint32_t zaps = 0, zapVoices = 0, shocks = 0, shockVoices = 0;
   };
   const Stats& GetStats() const { return stats_; }
 
@@ -360,6 +376,9 @@ class Cues {
   double lastFlaskFill_ = -1e9;  // now_ of the last FlaskFill voice
   mutable int flaskSetId_ = -2;  // memoised "vessel/fill"; -2 = not looked up
   mutable int thunderSetId_ = -2;  // memoised "weather/thunder"
+  mutable int zapSetId_ = -2;      // memoised "electric/zap"
+  mutable int shockSetId_ = -2;    // memoised "electric/shock"
+  double lastShockVoice_ = -1e9;   // now_ of the last NPC shock voice
   // Claps waiting out their sound delay (Thunder). Bounded: a storm strikes a
   // few times a minute; anything past kMaxThunder is dropped, counted.
   struct PendingThunder {

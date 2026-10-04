@@ -29,31 +29,45 @@ void Push(StrikePlan& p, const World& world, IVec3 c, uint32_t mat, uint32_t h) 
   p.cells.push_back({World::SlotCellIndex(c), PackVoxNew(mat, (h >> 28) % 3u) | kCellOpIfAir});
 }
 
-uint32_t StrikeMatAt(void* ctx, int32_t x, int32_t y, int32_t z, bool& known) {
-  const World& world = *(const World*)ctx;
-  known = false;
-  const IVec3 wc{x >> 4, y >> 4, z >> 4};
-  if (!world.ChunkInWindow(wc)) return 0;
-  const int lx = x & 15, ly = y & 15, lz = z & 15;
-  const size_t li = (size_t)((lz * (int)kChunk + ly) * (int)kChunk + lx);
+// The words of world chunk `wc` as the strike sees them: the snapshot mirror
+// (3x3x3 round the primary), else the fetch cache, else null (unknown). Both
+// stores are fed by the fixed-latency readback. Knowledge is CHUNK-granular:
+// a chunk is known whole or not at all, which is what lets the column scan
+// skip an unknown chunk in one step.
+const uint32_t* StrikeChunkWords(const World& world, IVec3 wc) {
+  if (!world.ChunkInWindow(wc)) return nullptr;
   const WorldSnapshot& s = world.Snap();
   if (s.valid) {
     const int cx = wc.x - s.mirrorBase.x, cy = wc.y - s.mirrorBase.y,
               cz = wc.z - s.mirrorBase.z;
     if (cx >= 0 && cy >= 0 && cz >= 0 && cx < 3 && cy < 3 && cz < 3) {
-      const size_t idx = (size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol + li;
-      if (idx < s.mirror.size()) {
-        known = true;
-        return s.mirror[idx] & 0xFFFu;
-      }
+      const size_t base = (size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol;
+      if (base + kChunkVol <= s.mirror.size()) return s.mirror.data() + base;
     }
   }
   const CachedChunk* cc = world.Cached(wc);
-  if (cc != nullptr && cc->voxels.size() == kChunkVol) {
-    known = true;
-    return cc->voxels[li] & 0xFFFu;
-  }
-  return 0;
+  if (cc != nullptr && cc->voxels.size() == kChunkVol) return cc->voxels.data();
+  return nullptr;
+}
+
+size_t LocalIndex(int32_t x, int32_t y, int32_t z) {
+  return (size_t)(((z & 15) * (int)kChunk + (y & 15)) * (int)kChunk + (x & 15));
+}
+
+uint32_t StrikeMatAt(void* ctx, int32_t x, int32_t y, int32_t z, bool& known) {
+  const World& world = *(const World*)ctx;
+  const uint32_t* w = StrikeChunkWords(world, IVec3{x >> 4, y >> 4, z >> 4});
+  known = w != nullptr;
+  return w ? w[LocalIndex(x, y, z)] & 0xFFFu : 0u;
+}
+
+// The scan's vertical span for an aim: kStrikeScanUp above to kStrikeScanDown
+// below, clamped to the residency window.
+void ScanSpan(const World& world, int32_t aimY, int32_t& yTop, int32_t& yBot) {
+  const int32_t wLo = world.WindowOrigin().y * (int32_t)kChunk;
+  const int32_t wHi = wLo + (int32_t)kWorldN - 1;
+  yTop = std::min(aimY + kStrikeScanUp, wHi);
+  yBot = std::max(aimY - kStrikeScanDown, wLo);
 }
 
 }  // namespace
@@ -80,8 +94,11 @@ void StrikeMats::Resolve(const std::vector<MaterialDef>& mats) {
 }
 
 StrikeSpec StrikeSpecFromGlyph(const GlyphStrike& gs, IVec3 aim, int32_t scaleMille,
-                               uint32_t key) {
-  const int64_t sc = std::max(scaleMille, 1);
+                               uint32_t key, int32_t strengthMille) {
+  // Repetition x strength, per-mille. Strength only ever SHRINKS the strike
+  // (0..1000); a strength-0 effect never reaches here (ApplySpellEffect).
+  const int64_t sc = std::max<int64_t>(
+      (int64_t)std::max(scaleMille, 1) * std::clamp(strengthMille, 0, 1000) / 1000, 1);
   StrikeSpec spec;
   spec.aim = aim;
   spec.searchRadius = gs.search;
@@ -96,6 +113,38 @@ StrikeSpec StrikeSpecFromGlyph(const GlyphStrike& gs, IVec3 aim, int32_t scaleMi
   spec.atAim = gs.height == 0 || gs.boltMat == 0;
   spec.key = key;
   return spec;
+}
+
+void StrikeSearchChunks(const StrikeSpec& spec, const World& world, std::vector<IVec3>& out) {
+  out.clear();
+  const IVec3 a = spec.aim;
+  if (spec.atAim) {
+    if (world.ChunkInWindow(IVec3{a.x >> 4, a.y >> 4, a.z >> 4}))
+      out.push_back(IVec3{a.x >> 4, a.y >> 4, a.z >> 4});
+    return;
+  }
+  const int r = std::clamp(spec.searchRadius, 0, kStrikeMaxSearch);
+  int32_t yTop = 0, yBot = 0;
+  ScanSpan(world, a.y, yTop, yBot);
+  if (yTop < yBot) return;
+  for (int cz = (a.z - r) >> 4; cz <= (a.z + r) >> 4; cz++)
+    for (int cy = yBot >> 4; cy <= yTop >> 4; cy++)
+      for (int cx = (a.x - r) >> 4; cx <= (a.x + r) >> 4; cx++)
+        if (world.ChunkInWindow(IVec3{cx, cy, cz})) out.push_back(IVec3{cx, cy, cz});
+}
+
+bool StrikeSearchKnown(const StrikeSpec& spec, const World& world, std::vector<IVec3>* missing) {
+  std::vector<IVec3> all;
+  StrikeSearchChunks(spec, world, all);
+  if (missing) missing->clear();
+  bool known = true;
+  for (const IVec3& wc : all)
+    if (StrikeChunkWords(world, wc) == nullptr) {
+      known = false;
+      if (!missing) break;
+      missing->push_back(wc);
+    }
+  return known;
 }
 
 StrikeSpec WeatherStrikeSpec(const StrikeMats& mats, IVec3 aim, uint32_t key) {
@@ -121,12 +170,19 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
   p.target = aim;
 
   // ---- 1. TARGET ------------------------------------------------------------
-  // Scan every column of the disc down through the mirror to its first
-  // non-gas cell. Column order is fixed (z then x), and the score's ties break
-  // on distance and then on a hash, so the choice is a pure function of the
-  // mirror and the key.
+  // Scan every column of the disc down from the real top through the stores
+  // to its first non-gas cell under known air. Column order is fixed (z then
+  // x), and the score's ties break on distance and then on a hash, so the
+  // choice is a pure function of the stores and the key.
   if (!spec.atAim && probe && probe->matAt) {
     const int r = std::clamp(spec.searchRadius, 0, kStrikeMaxSearch);
+    // THE WORLD'S OWN PROBE reads whole chunks (StrikeChunkWords): one lookup
+    // per 16 cells, and an unknown chunk skipped in one step. Any other probe
+    // is asked cell by cell, with the same rules.
+    const bool direct = probe->matAt == &StrikeMatAt;
+    const World& pw = direct ? *(const World*)probe->ctx : world;
+    int32_t yTop = 0, yBot = 0;
+    ScanSpan(pw, aim.y, yTop, yBot);
     bool any = false;
     int64_t best = INT64_MIN;
     for (int dz = -r; dz <= r; dz++)
@@ -135,23 +191,51 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
         const int x = aim.x + dx, z = aim.z + dz;
         int topY = INT32_MIN;
         uint32_t topMat = 0;
-        bool known = true;
-        for (int y = aim.y + kStrikeScanUp; y >= aim.y - kStrikeScanDown; y--) {
-          bool k = false;
-          const uint32_t m = probe->matAt(probe->ctx, x, y, z, k);
-          if (!k) {
-            // Above the mirror is unknown sky: keep descending. Below a known
-            // cell it means the column leaves the mirror before it hits
-            // anything, and the column does not compete.
-            if (y < aim.y) { known = false; break; }
-            continue;
+        bool hidden = false;
+        // `airAbove`: the cell just above the one being read is KNOWN air or
+        // gas. A solid cell only counts as the column's TOP under known air;
+        // reached any other way (from unknown, or the first cell of the
+        // span) the column was entered from inside and does not compete.
+        bool airAbove = false;
+        int y = yTop;
+        while (y >= yBot && topY == INT32_MIN && !hidden) {
+          const int yChunkLo = std::max(yBot, (int)(y & ~15));
+          const uint32_t* cw = nullptr;
+          if (direct) {
+            cw = StrikeChunkWords(pw, IVec3{x >> 4, y >> 4, z >> 4});
+            if (cw == nullptr) {  // unknown: the whole chunk, in one step
+              airAbove = false;
+              y = yChunkLo - 1;
+              continue;
+            }
           }
-          if (mats.Passable(m)) continue;
-          topY = y;
-          topMat = m;
-          break;
+          for (; y >= yChunkLo; y--) {
+            uint32_t m = 0;
+            if (direct) {
+              m = cw[LocalIndex(x, y, z)] & 0xFFFu;
+            } else {
+              bool k = false;
+              m = probe->matAt(probe->ctx, x, y, z, k);
+              if (!k) {
+                airAbove = false;
+                continue;
+              }
+            }
+            if (mats.Passable(m)) {
+              airAbove = true;
+              continue;
+            }
+            if (airAbove) {
+              topY = y;
+              topMat = m;
+            } else {
+              hidden = true;
+            }
+            break;
+          }
         }
-        if (!known || topY == INT32_MIN) continue;
+        if (hidden) p.columnsHidden++;
+        if (topY == INT32_MIN) continue;
         p.columnsScanned++;
         const bool cond = mats.Conductive(topMat);
         // Score: height in cells, the conductor bonus, then -distance, then a

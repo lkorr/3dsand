@@ -195,6 +195,7 @@ void MobSystem::ApplyShocks(uint32_t tick, World& world) {
     i = j;
     if (touch.empty()) continue;
     shockCounters_.bodiesShocked++;
+    PushShockCue(mob, touch.front().limb, peak);  // the sound + HUD cue (presentation)
     if (rec.ticks == 0) rec.firstTick = tick;
     rec.ticks++;
     rec.lastTick = tick;
@@ -290,4 +291,19 @@ void MobSystem::TickStuns(uint32_t tick) {
   for (Mob* av : avatars_)
     if (av != nullptr) twitch(*av);
   for (Mob& m : mobs_) twitch(m);
+}
+
+// The shock's cue for the frame (MobSystem::ShockCues): where it bit, how hard.
+// Intensity is the effective P against the knock-down P (gore.shockRagdollP),
+// so a lightning-class jolt is 1 and a tingle from wet ground is a fraction.
+void MobSystem::PushShockCue(const Mob& m, int limb, float peakP) {
+  constexpr size_t kMaxShockCues = 64;
+  if (shockCues_.size() >= kMaxShockCues) return;
+  const Tuning::Gore& g = CurrentTuning().gore;
+  ShockCue c;
+  c.mobId = m.id_;
+  c.posVoxel = limb >= 0 && limb < (int)m.limbs_.size() ? m.limbs_[limb].xf.pos : Vec3{};
+  const float ref = g.shockRagdollP > 0 ? (float)g.shockRagdollP : 30000.0f;
+  c.intensity = std::clamp(peakP / ref, 0.05f, 1.0f);
+  shockCues_.push_back(c);
 }
