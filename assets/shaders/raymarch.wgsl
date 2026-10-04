@@ -298,17 +298,339 @@ fn elecPAt(c : vec3<i32>) -> u32 {
   let w = elecPool[(e & ELEC_ENTRY_PAGE) * ELEC_PAGE_WORDS + (local >> 1u)];
   return (w >> ((local & 1u) * 16u)) & 0xFFFFu;
 }
-// The emitted light of a cell holding P > 0: blue-white, whiter as it climbs,
-// flickering per cell. Added on top of the lit surface (an arc is its own light
+// The emitted light of a cell holding P > 0 at surface point `hp`: blue-white,
+// whiter as it climbs. Added on top of the lit surface (an arc is its own light
 // source, not a colour of the thing it runs through).
-fn elecGlow(c : vec3<i32>, p : u32) -> vec3f {
+//
+// THE CREEP (electricity wave 2, package D). Not a uniform tint: a dim base
+// plus thin bright VEINS that crawl over the surface -- the ridge lines of two
+// octaves of value noise in world cells, drifting continuously (the crawl) and
+// re-seeded ELEC_CREEP_JUMP_HZ times a second (the crackle: the veins jump to
+// a new path the way a creeping discharge does). Continuous across cell faces
+// because it is a function of the world point, not of the cell. Per pixel it
+// is two vnoise() calls, and only on a pixel whose cell holds charge.
+const ELEC_CREEP_SCALE : f32 = 0.42;    // vein lattice: ~2.4 cells
+const ELEC_CREEP_JUMP_HZ : f32 = 7.0;
+const ELEC_CREEP_BASE : f32 = 0.22;     // the dim base, x the glow level
+const ELEC_CREEP_VEIN : f32 = 3.2;      // a vein's peak, x the glow level
+fn elecGlow(c : vec3<i32>, p : u32, hp : vec3f) -> vec3f {
   let e = ELEC_GLOW_K * pow(f32(p) / ELEC_GLOW_REF, ELEC_GLOW_EXP);
   let tq = u32(R.time * ELEC_FLICKER_HZ);
   let hs = pcg(cellIndexW(c) ^ (tq * 0x9E3779B9u));
-  let fl = 0.35 + 0.65 * f32(hs & 0xFFu) / 255.0;
+  let fl = 0.55 + 0.45 * f32(hs & 0xFFu) / 255.0;
+  let jq = u32(R.time * ELEC_CREEP_JUMP_HZ);
+  let jo = vec3f(f32(pcg(jq) & 0xFFu), f32(pcg(jq + 17u) & 0xFFu),
+                 f32(pcg(jq + 31u) & 0xFFu)) * 0.37;
+  let drift = vec3f(1.3, -0.9, 1.1) * R.time;
+  let q = hp * ELEC_CREEP_SCALE + jo + drift;
+  let r1 = 1.0 - abs(2.0 * vnoise(q) - 1.0);
+  let r2 = 1.0 - abs(2.0 * vnoise(q * 2.3 + vec3f(5.2, 1.3, 7.7) - drift * 1.7) - 1.0);
+  let vein = max(pow(r1, 22.0), 0.6 * pow(r2, 26.0));
   let col = mix(vec3f(0.45, 0.65, 1.0), vec3f(1.0), clamp(e * 0.3, 0.0, 1.0));
-  return col * (e * fl);
+  let veinCol = mix(vec3f(0.7, 0.8, 1.0), vec3f(1.0), clamp(e * 0.5, 0.0, 1.0));
+  return (col * ELEC_CREEP_BASE + veinCol * (ELEC_CREEP_VEIN * vein)) * (e * fl);
 }
+// A CHARGED LIQUID SEEN FROM INSIDE IT (wave 2 package D): the camera is
+// submerged, so there is no surface to glow -- the water round the eye does.
+// Samples the field at ELEC_UW_TAPS points along the first ELEC_UW_REACH
+// cells of the underwater path and adds each charged one's glow, dimmed by
+// the distance it came through the water. Called only when the field is
+// non-empty AND the eye is under a liquid surface.
+const ELEC_UW_TAPS : u32 = 8u;
+const ELEC_UW_REACH : f32 = 64.0;
+const ELEC_UW_GAIN : f32 = 0.05;      // per cell of charged path, x the glow level
+fn elecUnderwater(ro : vec3f, rd : vec3f, pathVox : f32) -> vec3f {
+  let reach = min(max(pathVox, 1.0), ELEC_UW_REACH);
+  let step = reach / f32(ELEC_UW_TAPS);
+  var acc = vec3f(0.0);
+  for (var k = 0u; k < ELEC_UW_TAPS; k++) {
+    let t = (f32(k) + 0.5) * step;
+    let c = vec3<i32>(floor(ro + rd * t));
+    let p = elecPAt(c);
+    if (p == 0u) { continue; }
+    let e = ELEC_GLOW_K * pow(f32(p) / ELEC_GLOW_REF, ELEC_GLOW_EXP);
+    let tq = u32(R.time * ELEC_FLICKER_HZ);
+    let fl = 0.5 + 0.5 * f32(pcg(cellIndexW(c) ^ (tq * 0x9E3779B9u)) & 0xFFu) / 255.0;
+    acc += mix(vec3f(0.35, 0.6, 1.0), vec3f(0.9, 0.95, 1.0), clamp(e * 0.3, 0.0, 1.0)) *
+           (e * fl * step * ELEC_UW_GAIN * exp(-t * VOXEL_METERS * 0.45));
+  }
+  return acc;
+}
+
+// ---- FILAMENTS: the shared line primitive of bolts and arcs ----------------
+// (electricity wave 2, package D.) A glowing line segment seen along a ray:
+// the ray's closest approach d to the segment, and where along the ray it is
+// (t, which must be nearer than whatever the ray hit). A hot CORE of radius w
+// (never thinner than ~0.6 px, brightness scaled down by how much it was
+// widened so a far bolt is a fine line, not a fat dim one) and a soft HALO.
+// MAX, not sum, over segments: two segments meeting at a joint must not bead.
+fn raySegClosest(ro : vec3f, rd : vec3f, a : vec3f, b : vec3f) -> vec2f {
+  let v = b - a;
+  let w0 = ro - a;
+  let bb = dot(rd, v);
+  let c = max(dot(v, v), 1e-8);
+  let d = dot(rd, w0);
+  let e = dot(v, w0);
+  let den = max(c - bb * bb, 1e-6);
+  var sp = clamp((e - d * bb) / den, 0.0, 1.0);
+  var t = sp * bb - d;
+  if (t < 0.0) { t = 0.0; sp = clamp(e / c, 0.0, 1.0); }
+  return vec2f(length(w0 + rd * t - v * sp), t);
+}
+// acc.x = core, acc.y = halo. `pixA` = one pixel's angle (radians).
+// `tight`: a Gaussian halo that is gone within ~2.5 haloR (an arc's, which
+// must die inside the discharge cell that draws it -- see arcFilaments), else
+// an exponential one with a long soft tail (the bolt's, which no cell clips).
+fn filamentAdd(acc : ptr<function, vec2f>, ro : vec3f, rd : vec3f, tMax : f32,
+               a : vec3f, b : vec3f, w : f32, inten : f32, haloR : f32,
+               pixA : f32, tight : bool) {
+  let r = raySegClosest(ro, rd, a, b);
+  if (r.y > tMax) { return; }
+  let px = pixA * max(r.y, 0.5);
+  let wc = max(w, px * 0.6);
+  let ic = inten * sqrt(w / wc);
+  let core = ic * exp(-(r.x * r.x) / (wc * wc));
+  var halo : f32;
+  if (tight) {
+    let hr = max(haloR, px * 1.2);
+    halo = inten * exp(-(r.x * r.x) / (hr * hr));
+  } else {
+    halo = inten * exp(-r.x / max(haloR, px * 2.5));
+  }
+  (*acc).x = max((*acc).x, core);
+  (*acc).y = max((*acc).y, halo);
+}
+fn pixelAngle() -> f32 { return 2.0 * R.tanHalfFov / max(R.viewPx, 1.0); }
+
+// ---- THE BOLT (electricity wave 2, package D; src/sim/boltfx.h) -----------
+// A strike's channel, forks, splash and sky branches as segments, CPU-written
+// while a bolt burns (boltfx::Upload, from WriteRenderParams): render-only.
+// Rows mirror boltfx.h (kRowGroups / kRowLights / kRowSegs; kMaxGroups 64,
+// kMaxLights 16). Row 0 = (segments, groups, lights, 0). Empty = row 0 all
+// zero: ONE dynamically uniform load a pixel, the whole cost of a frame with
+// no bolt (rule 2 for the render path).
+@group(0) @binding(44) var<storage, read> boltBuf : array<vec4f>;
+const BOLT_ROW_GROUPS : u32 = 1u;
+const BOLT_ROW_LIGHTS : u32 = 129u;
+const BOLT_ROW_SEGS : u32 = 145u;
+const BOLT_CORE_K : f32 = 7.0;        // core radiance at envelope 1 (HDR; the tone map whitens it)
+const BOLT_HALO_K : f32 = 1.1;
+const BOLT_HALO_MUL : f32 = 9.0;      // halo radius = core radius x this (fine voxels)
+const BOLT_LIGHT_K : f32 = 0.45;      // irradiance from one light point at envelope 1, near
+const BOLT_LIGHT_R : f32 = 70.0;      // the light points' falloff radius (fine voxels)
+fn boltLive() -> bool { return boltBuf[0].x != 0.0 || boltBuf[0].z != 0.0; }
+// The bolt seen along the view ray, nearer than tMax.
+fn boltEmit(ro : vec3f, rd : vec3f, tMax : f32) -> vec3f {
+  let nG = u32(boltBuf[0].y);
+  let pixA = pixelAngle();
+  var inv : vec3f;
+  inv.x = 1.0 / select(rd.x, select(-1e-6, 1e-6, rd.x >= 0.0), abs(rd.x) < 1e-6);
+  inv.y = 1.0 / select(rd.y, select(-1e-6, 1e-6, rd.y >= 0.0), abs(rd.y) < 1e-6);
+  inv.z = 1.0 / select(rd.z, select(-1e-6, 1e-6, rd.z >= 0.0), abs(rd.z) < 1e-6);
+  var acc = vec2f(0.0);
+  for (var g = 0u; g < nG; g++) {
+    let lo = boltBuf[BOLT_ROW_GROUPS + 2u * g];
+    let hi = boltBuf[BOLT_ROW_GROUPS + 2u * g + 1u];
+    // The halo's reach: its world radius near, a few pixels far.
+    let dc = length((lo.xyz + hi.xyz) * 0.5 - ro);
+    let m = 0.3 * BOLT_HALO_MUL * 6.0 + pixA * dc * 12.0;
+    let t0 = (lo.xyz - vec3f(m) - ro) * inv;
+    let t1 = (hi.xyz + vec3f(m) - ro) * inv;
+    let tn = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let tf = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    if (tf < max(tn, 0.0) || tn > tMax) { continue; }
+    let first = u32(lo.w);
+    let cnt = u32(hi.w);
+    for (var i = first; i < first + cnt; i++) {
+      let A = boltBuf[BOLT_ROW_SEGS + 2u * i];
+      let B = boltBuf[BOLT_ROW_SEGS + 2u * i + 1u];
+      filamentAdd(&acc, ro, rd, tMax, A.xyz, B.xyz, B.w, A.w, B.w * BOLT_HALO_MUL, pixA,
+                  false);
+    }
+  }
+  return vec3f(1.0, 0.98, 1.0) * (acc.x * BOLT_CORE_K) +
+         vec3f(0.55, 0.62, 1.0) * (acc.y * BOLT_HALO_K);
+}
+// The bolt AS A LIGHT on a surface at p with normal n: the light points along
+// its lower channel (boltfx.h), each a soft-falloff point light. Unshadowed --
+// it burns for a third of a second, and a shadow ray per point per pixel is
+// not what that is worth.
+fn boltLightAt(p : vec3f, n : vec3f) -> vec3f {
+  let nL = u32(boltBuf[0].z);
+  var e = 0.0;
+  for (var i = 0u; i < nL; i++) {
+    let L = boltBuf[BOLT_ROW_LIGHTS + i];
+    let dv = L.xyz - p;
+    let d2 = max(dot(dv, dv), 1e-4);
+    let ndl = max(dot(n, dv * inverseSqrt(d2)), 0.0);
+    e += L.w * (0.25 + 0.75 * ndl) / (1.0 + d2 / (BOLT_LIGHT_R * BOLT_LIGHT_R));
+  }
+  return vec3f(0.78, 0.84, 1.0) * (e * BOLT_LIGHT_K);
+}
+
+// ---- ARCS AND SPARKS: discharge cells as filaments ------------------------
+// (electricity wave 2, package D.) The march records the first discharge
+// cell on the ray (Hit.elecCell: a gas whose material is a charge SOURCE --
+// MaterialGpu._r2 bit 25, the bit the CA's doorbell reads -- spark, arc,
+// lightning, anything a modder authors with `electric.source`). Instead of a
+// glowing cube, that cell and every discharge cell of its 3x3x3 are drawn as
+// FILAMENTS, re-rolled ARC_HZ times a second.
+//
+// EVERYTHING A CELL DRAWS STAYS INSIDE THAT CELL. Only a ray that crossed a
+// discharge cell gets here, so a line (or a glow) that left the cell would
+// be cut off at the cell's silhouette -- a pale cube, which is the look this
+// replaces. So:
+//   * each cell has a jittered NODE well inside it;
+//   * a STRAND runs from the node to a point on the face / edge / corner
+//     shared with each of the 26 neighbours that is a discharge too (the
+//     neighbour's strand meets it there: the meeting point is a hash of the
+//     PAIR, so both cells agree and the arc is one continuous line) and to
+//     each face shared with a
+//     neighbour that CONDUCTS (bit 26) or, by chance, any solid -- the arc
+//     jumping to the copper, the water, the ground; that end gets a hot spot;
+//   * two strands a leg, each kinked once at a hashed point clamped inside the
+//     cell; a leg flickers off on some frames (the crackle);
+//   * a lone discharge with nothing to touch writhes inside its own cell;
+//   * a cell whose P (the field: its own source potential) is below
+//     ARC_SPARK_P is a SPARK: a short bright streak, twinkling.
+//   * the glow is a TIGHT Gaussian (filamentAdd `tight`), gone before the
+//     cell wall.
+// Strength from P on a log scale, so lightning's cells (30,000) burn hotter
+// than an arc's (2,000) with no material named. Cost: only pixels whose ray
+// crossed a discharge cell -- 27 voxel reads, plus 32 per discharge among them.
+const ELEC_R2_SOURCE : u32 = 33554432u;    // elec.h kElecR2Source
+const ELEC_R2_CONDUCTS : u32 = 67108864u;  // elec.h kElecR2Conducts
+const ARC_HZ : f32 = 20.0;
+const ARC_SPARK_P : u32 = 600u;
+const ARC_CORE_K : f32 = 6.0;
+const ARC_HALO_K : f32 = 2.0;
+fn isDischargeMat(m : u32) -> bool {
+  return m != MAT_AIR && materials[m].klass == CLASS_GAS &&
+         (materials[m]._r2 & ELEC_R2_SOURCE) != 0u;
+}
+fn h8(h : u32, sh : u32) -> f32 { return f32((h >> sh) & 0xFFu) / 255.0; }
+fn arcNode(c : vec3<i32>, fq : u32) -> vec3f {
+  let h = pcg(cellIndexW(c) ^ (fq * 0x9E3779B9u));
+  return vec3f(c) + vec3f(0.5) +
+         (vec3f(h8(h, 0u), h8(h, 8u), h8(h, 16u)) - vec3f(0.5)) * 0.5;
+}
+// Two kinked strands node -> e, kinks clamped inside cell c.
+fn arcLeg(acc : ptr<function, vec2f>, ro : vec3f, rd : vec3f, tMax : f32, c : vec3<i32>,
+          a : vec3f, e : vec3f, h : u32, w : f32, inten : f32, pixA : f32) {
+  let lo = vec3f(c) + vec3f(0.06);
+  let hi = vec3f(c) + vec3f(0.94);
+  let d = e - a;
+  let L = length(d);
+  // The second, fainter strand only on some legs and frames.
+  let strands = select(1u, 2u, (h & 0x300u) == 0u);
+  for (var s = 0u; s < strands; s++) {
+    let hs = pcg(h + s * 0x68E31DA4u);
+    let k = clamp(a + d * (0.3 + 0.4 * h8(hs, 0u)) +
+                  (vec3f(h8(hs, 8u), h8(hs, 16u), h8(hs, 24u)) - vec3f(0.5)) * (0.7 * L),
+                  lo, hi);
+    let ws = select(w * 0.55, w, s == 0u);
+    let is = select(inten * 0.45, inten, s == 0u);
+    filamentAdd(acc, ro, rd, tMax, a, k, ws, is, ws * 2.6, pixA, true);
+    filamentAdd(acc, ro, rd, tMax, k, e, ws, is, ws * 2.6, pixA, true);
+  }
+}
+fn arcFilaments(ro : vec3f, rd : vec3f, tMax : f32, c0 : vec3<i32>) -> vec3f {
+  let pixA = pixelAngle();
+  let fq = u32(R.time * ARC_HZ);
+  var acc = vec2f(0.0);
+  for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+      for (var dx = -1; dx <= 1; dx++) {
+        let c = c0 + vec3<i32>(dx, dy, dz);
+        if (!inBounds(c) || !isDischargeMat(voxMat(voxWordAt(c)))) { continue; }
+        var p = elecPAt(c);
+        if (p == 0u) { p = 1000u; }   // laid this tick: the field has not seen it yet
+        let lv = clamp(log2(f32(p)) / 15.0, 0.35, 1.0);
+        let inten = lv * lv;
+        let node = arcNode(c, fq);
+        let hc = pcg((cellIndexW(c) * 0x2C1B3C6Du) ^ fq);
+        if (p < ARC_SPARK_P) {
+          // A SPARK: a short bright streak, twinkling off one frame in four.
+          if ((hc & 3u) == 0u) { continue; }
+          let dir = normalize(vec3f(h8(hc, 4u), h8(hc, 12u), h8(hc, 20u)) - vec3f(0.5) +
+                              vec3f(0.0, 1e-3, 0.0));
+          filamentAdd(&acc, ro, rd, tMax, node - dir * 0.14, node + dir * 0.14, 0.022,
+                      inten * 2.2, 0.06, pixA, true);
+          continue;
+        }
+        let w = 0.018 + 0.03 * lv;
+        var legs = 0u;
+        let ic = cellIndexW(c);
+        // DISCHARGE TO DISCHARGE, all 26 neighbours: the strand meets the
+        // neighbour's at a point on the shared face, edge or corner (on the
+        // boundary along every axis the step moves on, a pair-hashed spot
+        // across the others), so a diagonal walk of arc cells -- a strike's
+        // splash, a crackle -- is one unbroken line, and each half stays in
+        // its own cell. The pair hash is symmetric (both cells roll the same).
+        for (var nz = -1; nz <= 1; nz++) {
+          for (var ny = -1; ny <= 1; ny++) {
+            for (var nx = -1; nx <= 1; nx++) {
+              let dv = vec3<i32>(nx, ny, nz);
+              if (all(dv == vec3<i32>(0))) { continue; }
+              let nc = c + dv;
+              if (!inBounds(nc) || !isDischargeMat(voxMat(voxWordAt(nc)))) { continue; }
+              let inb = cellIndexW(nc);
+              let hp = pcg(((ic ^ inb) + (ic + inb) * 0x9E3779B9u) ^ (fq * 0x85EBCA6Bu));
+              // Not every touching pair: a cluster would draw a web of
+              // triangles. Face pairs link most, corner pairs least; the roll
+              // is also the crackle (it changes every ARC_HZ frame).
+              let nAx = u32(abs(nx) + abs(ny) + abs(nz));
+              if (h8(hp, 0u) > select(select(0.2, 0.35, nAx == 2u), 0.6, nAx == 1u)) {
+                continue;
+              }
+              let jit = vec3f(c) + vec3f(0.15) + vec3f(h8(hp, 8u), h8(hp, 16u), h8(hp, 24u)) * 0.7;
+              let bnd = vec3f(c) + max(vec3f(dv), vec3f(0.0));
+              let fp = select(jit, bnd, dv != vec3<i32>(0));
+              legs += 1u;
+              arcLeg(&acc, ro, rd, tMax, c, node, fp, hp ^ ic, w, inten, pixA);
+            }
+          }
+        }
+        // DISCHARGE TO MATTER, the 6 faces: a neighbour that CONDUCTS (bit
+        // 26), or by chance any solid or liquid -- the arc jumping to the
+        // copper, the water, the ground. That end gets a hot spot.
+        for (var f = 0u; f < 6u; f++) {
+          let ax = i32(f >> 1u);
+          let sg = select(1, -1, (f & 1u) != 0u);
+          var dv = vec3<i32>(0);
+          dv[ax] = sg;
+          let nc = c + dv;
+          if (!inBounds(nc)) { continue; }
+          let nm = voxMat(voxWordAt(nc));
+          if (nm == MAT_AIR || materials[nm].klass == CLASS_GAS) { continue; }
+          let hp = pcg((ic * 0x9E3779B9u) ^ ((u32(f) + 1u) * 0x85EBCA6Bu) ^ fq);
+          let conducts = (materials[nm]._r2 & ELEC_R2_CONDUCTS) != 0u;
+          if (h8(hp, 0u) > select(0.3, 0.8, conducts)) { continue; }
+          var fp = vec3f(c) + vec3f(0.5) +
+                   (vec3f(h8(hp, 16u), h8(hp, 24u), h8(hp, 12u)) - vec3f(0.5)) * 0.7;
+          fp[ax] = f32(c[ax]) + select(0.0, 1.0, sg > 0);
+          legs += 1u;
+          arcLeg(&acc, ro, rd, tMax, c, node, fp, hp, w, inten, pixA);
+          // The hot spot where it lands.
+          filamentAdd(&acc, ro, rd, tMax, fp, fp + vec3f(1e-3, 0.0, 0.0), 0.05,
+                      inten * 1.4, 0.09, pixA, true);
+        }
+        if (legs == 0u) {
+          // Nothing to touch: a free filament writhing inside its cell.
+          let dir = normalize(vec3f(h8(hc, 4u), h8(hc, 12u), h8(hc, 20u)) - vec3f(0.5) +
+                              vec3f(0.0, 1e-3, 0.0));
+          let lo = vec3f(c) + vec3f(0.06);
+          let hi = vec3f(c) + vec3f(0.94);
+          arcLeg(&acc, ro, rd, tMax, c, clamp(node - dir * 0.35, lo, hi),
+                 clamp(node + dir * 0.35, lo, hi), hc >> 2u, w, inten, pixA);
+        }
+      }
+    }
+  }
+  return vec3f(0.92, 0.95, 1.0) * (acc.x * ARC_CORE_K) +
+         vec3f(0.5, 0.6, 1.0) * (acc.y * ARC_HALO_K);
+}
+
 // The charge view's false colour over log2 P (0..16): blue (a few units) ->
 // cyan -> green -> yellow (a spark, ~2^8) -> red (an arc, ~2^11) -> white
 // (lightning, ~2^15). Uncharged surfaces are drawn as dim grey by the caller.
@@ -1528,6 +1850,12 @@ struct Hit {
   mediaSurf: f32,     // fullness (0..1) of the first media cell — surface term
   fireGlow : f32,     // flicker- and transmittance-weighted emissive path
   fireMat  : u32,     // first emissive media material (palette for the ramp)
+  // The first DISCHARGE cell the ray crossed (a gas whose material is a charge
+  // SOURCE: spark / arc / lightning), packWinCell | 0x80000000, 0 = none.
+  // Such a cell adds no media (it is not a glowing cube); fs() draws it and
+  // its discharge neighbours as filaments (arcFilaments). One u32 live across
+  // the shade, which is the whole register cost of the feature.
+  elecCell : u32,
   // Where the GAS in front of the ray becomes half-opaque, or 0 if it never
   // does. This is the volume's best single depth: raster geometry beyond it is
   // more hidden by the plume than visible through it, and geometry in front of
@@ -3135,6 +3463,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
   out.mediaSurf = 0.0;
   out.fireGlow = 0.0;
   out.fireMat = 0u;
+  out.elecCell = 0u;
   out.gasHalfT = 0.0;
   out.liqT = 0.0;
   out.liqCell = 0u;
@@ -3618,7 +3947,14 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
             }
           }
         }
-        if (wantMedia && !liqInAir) {
+        // A DISCHARGE (electricity wave 2, package D): a gas that is a charge
+        // source is drawn by fs() as filaments, not as a glowing cube of
+        // media -- record the first one and march on as through air.
+        let discharge = k == CLASS_GAS &&
+                        (materials[mat]._r2 & ELEC_R2_SOURCE) != 0u;
+        if (wantMedia && discharge) {
+          if (out.elecCell == 0u) { out.elecCell = packWinCell(cell) | 0x80000000u; }
+        } else if (wantMedia && !liqInAir) {
           weight = 1.0;
           cellOp = f32(materials[mat].opacity) / 255.0;
           cellTint = (unpackColor(materials[mat].color0) +
@@ -13670,8 +14006,11 @@ fn fs(in : VSOut) -> FSOut {
     // else. A micro hit is a plant part, which the field does not reach.
     if (!isMicro && elecAnyCharge()) {
       let ep = elecPAt(h.cell);
-      if (ep != 0u) { color += elecGlow(h.cell, ep); }
+      if (ep != 0u) { color += elecGlow(h.cell, ep, hp); }
     }
+    // ---- the bolt as a light (wave 2 package D; boltLightAt above) ----
+    // A strike lights what it lands among for the third of a second it burns.
+    if (boltLive()) { color += albedo * boltLightAt(hp, n); }
     // (heatSpill, the four-tap molten-light stand-in that used to live here,
     // was deleted by P3 of docs/PLAN_gi.md: lava and embers deposit their
     // emission into the irradiance grid through irrSample, and the gather above
@@ -13834,6 +14173,9 @@ fn fs(in : VSOut) -> FSOut {
         rsAdd(RS_PX_SUB, 1u);
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
+        // A charged liquid round a submerged eye (wave 2 package D): the
+        // surface glow below needs a surface; from inside, the water glows.
+        if (elecAnyCharge()) { color += elecUnderwater(R.camPos, rd, h.liqPath); }
         caShadedLiquid = true;
         veilT = 0.0;
       } else if (isViscousLiquid(materials[lm])) {
@@ -13881,7 +14223,7 @@ fn fs(in : VSOut) -> FSOut {
       if (!underwater && caShadedLiquid && elecAnyCharge()) {
         let lp = elecPAt(liqCell);
         if (lp != 0u) {
-          color += elecGlow(liqCell, lp) * (1.0 - aerialFrac(h.liqT));
+          color += elecGlow(liqCell, lp, hitP) * (1.0 - aerialFrac(h.liqT));
         }
       }
       if (SPEC_DEBUG_VIZ && (R.flags & RFLAG_ELECVIEW) != 0u && !underwater &&
@@ -14034,6 +14376,21 @@ fn fs(in : VSOut) -> FSOut {
       else if (mf.t > 0.05 && (rainT < 0.0 || mf.t < rainT)) { rainT = mf.t; }
     }
     if (!eyeWet) { color = rainOverlay(color, rd, rainT); }
+  }
+
+  // ---- DISCHARGES: arcs, sparks and the bolt (wave 2 package D) ----
+  // Additive light along the view ray, nearer than whatever the ray stopped
+  // at (the opaque hit, the far field, a liquid surface seen from above).
+  // Each is skipped wholesale when there is nothing to draw: a pixel whose
+  // march crossed no discharge cell, a frame with no bolt.
+  {
+    var tB = 1e9;
+    if (h.hit) { tB = h.t; } else if (far.hit) { tB = far.t; }
+    if (h.liqT > 0.05) { tB = min(tB, h.liqT); }
+    if (h.elecCell != 0u) {
+      color += arcFilaments(R.camPos, rd, tB, unpackWinCell(h.elecCell & 0x7FFFFFFFu));
+    }
+    if (boltLive()) { color += boltEmit(R.camPos, rd, tB); }
   }
 
   // fire glow: additive, from the flicker-weighted emissive path. Intensity

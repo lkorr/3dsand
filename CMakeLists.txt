@@ -502,6 +502,8 @@ add_library(sandvox_core OBJECT
   # loaded and validated on the CPU; the table worldgen will read.
   src/sim/biomes.cpp
   src/sim/weather.cpp
+  # THE BOLT YOU SEE (docs/PLAN_electricity_wave2.md D): render-only bolt geometry.
+  src/sim/boltfx.cpp
   src/sim/worldmap.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
