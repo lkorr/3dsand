@@ -1813,6 +1813,16 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
              brain.visible) {
     raw[(int)Intent::Guard] = std::clamp(pr.defense.guardStance, 0.0f, 1.0f);
   }
+  // THE FENCE (demons D6 item 10; SelfView::targetFenced / castFenced): what
+  // the fence would refuse is not an option. A contained demon whose target
+  // is past its salt neither closes, keeps a band, circles nor swings at it
+  // -- it watches (FaceTarget, or the routine its owner writes) -- and does
+  // not cast what the ring would stop.
+  if (self.targetFenced) {
+    raw[(int)Intent::Approach] = raw[(int)Intent::HoldRange] = 0.0f;
+    raw[(int)Intent::CircleStrafe] = raw[(int)Intent::RequestAttack] = 0.0f;
+  }
+  if (self.castFenced) raw[(int)Intent::Cast] = 0.0f;
 
   // ---- arbitrate ----------------------------------------------------------
   // Weight, then the three dampers (see the header). The incumbent's bonus is

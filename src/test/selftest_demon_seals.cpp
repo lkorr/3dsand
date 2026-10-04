@@ -10,12 +10,14 @@
 //                   you), two cells of quicksilver inlaid in the floor (west:
 //                   below his blink resistance) and two lit candles in the
 //                   band.
+//                   0. IRON WEAKENS (D6): his effective power is his own
+//                      minus potency x ironSusceptibility / 100 (capped);
 //                   1. cast_out SEVERED: AllowCastOut to your position is
 //                      refused, to a point inside the circle allowed;
 //                   2. blink NOT severed (2 cells < resistance): AllowBlink
 //                      to a point inside is allowed and he stays contained;
-//                   3. touch SEVERED: over demonSeals.holdTicks the fence
-//                      refused his blows across the ring and let none through;
+//                   3. SALT BLOCKS BLOWS (D6): over demonSeals.holdTicks the
+//                      fence refused his blows across the ring;
 //                   4. THE WIND: all but two sulfur cells cleared through the
 //                      queue -> within demonSeals.flipTicksMax cast_out is
 //                      open and AllowCastOut to you is allowed;
@@ -26,8 +28,8 @@
 //                   state, severed mask, strength) must be identical.
 //                B. PLAIN RING, no piles:
 //                   1. cast_out open: AllowCastOut to you allowed;
-//                   2. touch open: blows across the ring let through (the
-//                      loophole), none refused;
+//                   2. no iron: no cut off his power -- and the salt alone
+//                      still refuses his blows across the ring (D6);
 //                   3. GAZE (Skerrick: avert): the summoner within range
 //                      staring at his head -> strain rises, a full meter costs
 //                      the circle strainPenalty; looking away lowers it;
@@ -120,7 +122,7 @@ SFix SBuild(Ctx& c, int r, bool sealed) {
       }
     SPut(f.piles, f.x, f.y + 1, f.z - pr, PackVoxNew(mSulfur, 0));
     f.sulfurAt.push_back({f.x, f.y + 1, f.z - pr});
-    // EAST, beside the player: iron, 3x3 + 1 (touch). Off the radial line
+    // EAST, beside the player: iron, 3x3 + 1 (D6: weakens him). Off the radial line
     // the player's reach crosses (z + 4).
     for (int dx = -1; dx <= 1; dx++)
       for (int dz = -1; dz <= 1; dz++)
@@ -161,8 +163,10 @@ struct SealsOut {
   // the hooks
   bool castOutToYou = true, castOutInside = false;
   bool blinkInside = false, stillContainedAfterBlink = false;
-  uint32_t blowsRefused = 0, blowsLoophole = 0;
+  uint32_t blowsRefused = 0;
+  bool blowAcrossRefused = false;   // D6: the salt refuses a blow across the ring
   int heldTicks = 0;
+  int basePower = 0, ironCut = 0;
   // the wind
   int flipAfter = -1;
   bool castOutAfterWind = false;
@@ -257,9 +261,15 @@ SealsOut RunSeals(Ctx& c, int r, bool sealed, int holdTicks, int flipMax, int ga
     }
     out.trace.push_back(row);
   };
+  // D6: this gate measures D3's seals. In the plain ring D6's malice would gust
+  // the ring open (demon-malice's G), so here Skerrick knows no schemes.
+  for (DemonDef& def : dw.lib.defs)
+    if (def.id == dw.live[0].demon) def.schemes.clear();
   out.reading = ld()->bind.reading;
   out.strength0 = ld()->bind.strength;
   out.power = ld()->bind.power;
+  out.basePower = ld()->bind.basePower;
+  out.ironCut = ld()->bind.ironCut;
   out.severed0 = ld()->bind.severed;
   // ---- the hooks D4 will call ----------------------------------------------------
   TickAuthorityCtx& w = rig.Authority();
@@ -279,7 +289,10 @@ SealsOut RunSeals(Ctx& c, int r, bool sealed, int holdTicks, int flipMax, int ga
   }
   if (const LiveDemon* d = ld()) {
     out.blowsRefused = d->blowsRefused;
-    out.blowsLoophole = d->bind.blowsLoophole;
+    // The blow rule, asked directly (D6: he no longer swings at the salt when
+    // he cannot reach -- plan item 10 -- so the fence is asked here).
+    if (d->state == DemonState::Contained)
+      out.blowAcrossRefused = !c.mobs.Fence().Allows(id, MobFence::Blow, inside.x, inside.z, you.x, you.z);
   }
   if (sealed) {
     // ---- the wind: all but two sulfur cells blown off, through the queue ------------
@@ -427,9 +440,9 @@ Status GateDemonSeals(Ctx& c, std::string& detail) {
   auto sev = [](uint8_t m, Channel ch) { return ((m >> (int)ch) & 1u) != 0; };
   const auto& ra = a.reading;
   const std::string readA = Format(
-      "salt %d/8, potency move %d cast_out %d blink %d touch %d, %d candles, %d cells read",
-      ra.saltEighths, ra.potency[0], ra.potency[1], ra.potency[2], ra.potency[3], ra.candlesLit,
-      ra.cellsRead);
+      "salt %d/8, potency move %d cast_out %d blink %d, iron %d, %d candles, %d cells read",
+      ra.saltEighths, ra.potency[0], ra.potency[1], ra.potency[2], ra.weakenPotency,
+      ra.candlesLit, ra.cellsRead);
   std::printf("demon-seals: A reading: %s; strength %d vs power %d\n", readA.c_str(), a.strength0,
               a.power);
   check(a.spawned && a.arrived == DemonState::Contained,
@@ -449,9 +462,20 @@ Status GateDemonSeals(Ctx& c, std::string& detail) {
         Format("A2: two cells of quicksilver (potency %d) leave blink open: a blink inside "
                "allowed, still contained",
                ra.potency[2]));
-  check(sev(a.severed0, Channel::Touch) && a.blowsRefused > 0 && a.blowsLoophole == 0,
-        Format("A3: iron severs touch (potency %d): %u blows refused, %u through", ra.potency[3],
-               a.blowsRefused, a.blowsLoophole));
+  {
+    // A0. IRON WEAKENS (D6): the cut is potency x susceptibility / 100, capped.
+    const DemonDef* sk = dl.Find("skerrick");
+    const int want = sk ? std::min(ra.weakenPotency * sk->ironSusceptibility / 100,
+                                   a.basePower * dl.seals.weakenCapPct / 100)
+                        : -1;
+    check(ra.weakenPotency > 0 && a.ironCut > 0 && a.ironCut == want &&
+              a.power == a.basePower - a.ironCut,
+          Format("A0: iron (potency %d) cuts his power %d -> %d (cut %d, expected %d)",
+                 ra.weakenPotency, a.basePower, a.power, a.ironCut, want));
+  }
+  check(a.blowAcrossRefused,
+        Format("A3: the salt refuses his blows across the ring (%u refused while held)",
+               a.blowsRefused));
   check(a.heldTicks >= hold, Format("A: contained %d of %d ticks", a.heldTicks, hold));
   check(a.flipAfter >= 0 && a.flipAfter <= flipMax && a.castOutAfterWind,
         Format("A4: the wind leaves two sulfur cells -> cast_out open after %d ticks (max %d; "
@@ -468,9 +492,10 @@ Status GateDemonSeals(Ctx& c, std::string& detail) {
 
   check(!sev(b.severed0, Channel::CastOut) && b.castOutToYou,
         "B1: no sulfur -> a cast at you is allowed");
-  check(!sev(b.severed0, Channel::Touch) && b.blowsLoophole > 0 && b.blowsRefused == 0,
-        Format("B2: no iron -> his blows reach across the ring (%u through, %u refused)",
-               b.blowsLoophole, b.blowsRefused));
+  check(b.ironCut == 0 && b.power == b.basePower && b.blowAcrossRefused,
+        Format("B2: no iron -> no cut (power %d of %d); the salt alone still refuses his blows "
+               "across the ring (%u refused)",
+               b.power, b.basePower, b.blowsRefused));
   check(b.lapses >= 1 && b.strengthAfterGaze < b.strengthBeforeGaze,
         Format("B3: staring at an avert demon fills the strain (%d lapses) and costs the circle "
                "(strength %d -> %d)",
@@ -487,15 +512,15 @@ Status GateDemonSeals(Ctx& c, std::string& detail) {
   RecordObserved("demonSeals.strengthPlain", b.strength0);
   RecordObserved("demonSeals.flipAfter", a.flipAfter);
   detail = Format(
-      "A sealed: %s; strength %d vs power %d; cast_out %s, blink %s, touch %s (%u blows refused); "
+      "A sealed: %s; strength %d vs power %d-%d; cast_out %s, blink %s, %u blows refused; "
       "wind -> cast_out open +%d; release %s (margin %d); trace %zu rows %s. B plain: strength "
-      "%d, %u blows through; gaze %d lapse(s), strength %d -> %d, strain %d -> %d looking away; "
+      "%d, %u blows refused; gaze %d lapse(s), strength %d -> %d, strain %d -> %d looking away; "
       "power 1000 release %s (margin %d)",
-      readA.c_str(), a.strength0, a.power, sev(a.severed0, Channel::CastOut) ? "severed" : "OPEN",
-      sev(a.severed0, Channel::Blink) ? "SEVERED" : "open",
-      sev(a.severed0, Channel::Touch) ? "severed" : "OPEN", a.blowsRefused, a.flipAfter,
+      readA.c_str(), a.strength0, a.basePower, a.ironCut,
+      sev(a.severed0, Channel::CastOut) ? "severed" : "OPEN",
+      sev(a.severed0, Channel::Blink) ? "SEVERED" : "open", a.blowsRefused, a.flipAfter,
       DemonStateName(a.afterRelease), a.releaseMargin, a.trace.size(),
-      a.trace == a2.trace ? "identical twice" : "DIFFERS", b.strength0, b.blowsLoophole, b.lapses,
+      a.trace == a2.trace ? "identical twice" : "DIFFERS", b.strength0, b.blowsRefused, b.lapses,
       b.strengthBeforeGaze, b.strengthAfterGaze, b.strainAfterStare, b.strainAfterAvert,
       DemonStateName(b.afterRelease), b.releaseMargin);
   if (!fails.empty()) detail += "; FAILED: " + fails;

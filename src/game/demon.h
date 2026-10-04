@@ -58,6 +58,8 @@ class MobSystem;
 namespace demon {
 struct Pact;        // game/demon_talk.h (D5)
 struct TalkWorld;   // game/demon_talk.h (D5)
+struct Mind;        // game/demon_malice.h (D6)
+struct MaliceWorld; // game/demon_malice.h (D6)
 }
 
 // ---- content -----------------------------------------------------------------
@@ -74,6 +76,14 @@ struct DemonDef {
   std::vector<std::string> schemes;                     // scheme names (D6)
   std::string released;    // behaviour profile after a HELD release (D3; D5's contract replaces it)
   std::string dialogue;    // assets/dialogue/<name>.json: the conversation while contained (D5)
+  // D6: iron in the band lowers the contained demon's power by its potency x
+  // this / 100 (capped by seals.json weakenCapPct).
+  int32_t ironSusceptibility = 100;
+  // D6: THE MOTIVES (0..100 each; game/demon_malice.h). malice: how much it
+  // wants you hurt; cunning: how much it prefers the indirect way; spite: how
+  // much being hurt sharpens the malice; literalism: how readily it takes a
+  // duty's loophole as compliance.
+  int32_t malice = 50, cunning = 50, spite = 50, literalism = 50;
 };
 
 struct DemonCircleCfg {
@@ -119,11 +129,13 @@ struct LiveDemon {
   int session = 0;          // the summoner (PlayerSession::index)
   DemonState state = DemonState::Unbound;
   CircleShape circle;       // the inside, while contained
+  Vec3 home{};              // D6: where it arrived (feet), where a held demon waits
   uint32_t spawnTick = 0, stateTick = 0, lastCheck = 0;
   uint32_t movesRefused = 0, blowsRefused = 0;
   std::string why;          // why this state (the HUD / the gate)
   demon::Binding bind;      // seals, strength, gaze, release (D3)
   std::shared_ptr<demon::Pact> pact;   // the contract it is BOUND under (D5), null = none
+  std::shared_ptr<demon::Mind> mind;   // its motives at work (D6), created on first think
 };
 
 struct PendingSummon {
@@ -149,6 +161,8 @@ struct DemonWorld {
   std::vector<LiveDemon> live;
   // Conversations, contracts, restores (game/demon_talk.h, D5); created on use.
   std::shared_ptr<demon::TalkWorld> talk;
+  // Schemes, twists, the motive ladder (game/demon_malice.h, D6); created on use.
+  std::shared_ptr<demon::MaliceWorld> malice;
   // The MobSystem whose fence points at this object (cleared on destruction:
   // a harness's MobSystem outlives the rig that owns this).
   MobSystem* fenced = nullptr;

@@ -26,7 +26,7 @@ namespace demon {
 
 namespace {
 
-constexpr const char* kChannelNames[kChannels] = {"move", "cast_out", "blink", "touch"};
+constexpr const char* kChannelNames[kChannels] = {"move", "cast_out", "blink"};
 
 LiveDemon* FindLive(TickAuthorityCtx& w, uint64_t id) {
   if (!w.demons) return nullptr;
@@ -88,7 +88,9 @@ std::vector<TellBand> ParseBands(const json& a, std::string& log, const std::str
 // Re-evaluate one contained demon's channels and strength from its reading.
 void Evaluate(LiveDemon& ld, const DemonDef* def, const SealLib& lib) {
   Binding& b = ld.bind;
-  b.power = def ? def->power : 0;
+  b.basePower = def ? def->power : 0;
+  b.power = b.basePower;
+  b.ironCut = 0;
   if (!b.reading.valid) {
     // Never read (its band out of every store at arrival): everything
     // severed, strength unknown -- D1's containment, nothing more.
@@ -99,6 +101,14 @@ void Evaluate(LiveDemon& ld, const DemonDef* def, const SealLib& lib) {
   b.severed = 0;
   for (int c = 0; c < kChannels; c++)
     if (b.reading.potency[(size_t)c] >= ResistOf(def, (Channel)c)) b.severed |= (uint8_t)(1u << c);
+  // IRON WEAKENS (D6): potency x susceptibility, capped at weakenCapPct of the
+  // demon's power -- iron alone never zeroes a greater demon.
+  if (def != nullptr && b.reading.weakenPotency > 0) {
+    const int64_t cut = (int64_t)b.reading.weakenPotency * std::max(0, def->ironSusceptibility) / 100;
+    const int64_t cap = (int64_t)b.basePower * std::clamp(lib.weakenCapPct, 0, 100) / 100;
+    b.ironCut = (int32_t)std::clamp<int64_t>(cut, 0, cap);
+    b.power = b.basePower - b.ironCut;
+  }
   b.strength = b.reading.sealPoints +
                std::min(b.reading.candlesLit, std::max(0, lib.candlesMax)) * lib.perCandle -
                b.strainLoss;
@@ -181,9 +191,10 @@ void LoadSealFile(const std::string& path, const std::string& stem, SealLib& out
     SealDef d;
     d.material = s.value("material", std::string());
     const std::string ch = s.value("severs", std::string());
-    if (d.material.empty() || !ChannelByName(ch, d.severs)) {
+    d.weakens = s.value("weakens", false);
+    if (d.material.empty() || (!d.weakens && !ChannelByName(ch, d.severs))) {
       log += "demons: seals.json: a seal needs `material` and `severs` (move | cast_out | "
-             "blink | touch), got \"" + d.material + "\" / \"" + ch + "\"\n";
+             "blink) or `weakens`, got \"" + d.material + "\" / \"" + ch + "\"\n";
       continue;
     }
     d.perCell = std::clamp(s.value("perCell", d.perCell), 0, 1000);
@@ -197,6 +208,7 @@ void LoadSealFile(const std::string& path, const std::string& stem, SealLib& out
     out.slabAbove = std::clamp(b.value("slabAbove", out.slabAbove), 0, 8);
     out.minEighths = std::clamp(b.value("minEighths", out.minEighths), 1, 8);
   }
+  out.weakenCapPct = std::clamp(j.value("weakenCapPct", out.weakenCapPct), 0, 100);
   if (j.contains("candles") && j["candles"].is_object()) {
     const json& c = j["candles"];
     out.candle = c.value("material", out.candle);
@@ -260,6 +272,12 @@ SealReading ScanSeals(const CircleProbe& probe, const SealLib& lib,
     }
   for (size_t i = 0; i < lib.seals.size(); i++) {
     const SealDef& s = lib.seals[i];
+    if (s.weakens) {
+      r.weakenEighths += (int32_t)perSeal[i];
+      r.weakenPotency += (int32_t)(perSeal[i] * s.perCell / 8);
+      if (s.cellsPerPoint > 0) r.sealPoints += (int32_t)(perSeal[i] / (8 * (int64_t)s.cellsPerPoint));
+      continue;
+    }
     const size_t c = (size_t)s.severs;
     r.eighths[c] += (int32_t)perSeal[i];
     r.potency[c] += (int32_t)(perSeal[i] * s.perCell / 8);
@@ -325,6 +343,7 @@ ReleaseResult Release(TickAuthorityCtx& w, std::span<SessionTick> players, uint6
     if (ai::Brain* br = w.mobs.MobBrainMut(ld->mobId)) {
       br->hasTarget = false;
       br->targetId = 0;
+      br->routine.active = false;   // D6: no longer waiting in the circle
     }
     std::printf("demons: %s %s\n", ld->name.c_str(), why);
     return ReleaseResult::Held;
@@ -403,7 +422,8 @@ void FillHud(UIState& ui, const LiveDemon& ld) {
   const Binding& b = ld.bind;
   ui.demonHasBinding = ld.state == DemonState::Contained && b.reading.valid;
   ui.demonStrength = b.strength;
-  ui.demonPower = b.power;
+  ui.demonPower = b.basePower;
+  ui.demonIronCut = b.ironCut;
   ui.demonSevered = b.severed;
   ui.demonStrain = std::clamp((float)b.strain / (float)std::max(1, b.strainMax), 0.0f, 1.0f);
   ui.demonGazeHold = b.gazeHold;

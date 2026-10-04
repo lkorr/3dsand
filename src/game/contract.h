@@ -28,15 +28,39 @@
 //                                vessel `into` (an item name; "" = any vessel
 //                                that takes it), then come back
 //             spin               turn on the spot
+//             return (who, arg)  D6: be back with the nearest of `who` when
+//                                `arg` seconds of the term are left (default
+//                                30) -- closes a greater demon's free act
 //   forbid    attack (who)       HARD FILTER: never targets / strikes `who`
 //             cast (who, arg)    HARD FILTER: no spell at `who` (D4's caster
 //                                asks demon::AllowCastAt); `arg` narrows it to
-//                                spells whose footprint tags match: direct,
-//                                affects_body, creates:<mat>, alters:<x>,
-//                                targets:<x> ("" = any spell)
+//                                spells whose FOOTPRINT matches (below; ""
+//                                = any spell)
 //             leave (who, arg)   never further than `arg` metres from `who`
+//             cause (who, arg)   D6: HARD FILTER on EVERY option a demon has
+//                                (spells, schemes, duty twists, blows): none
+//                                whose footprint matches `arg` with respect to
+//                                a member of `who` ("" who = anyone)
 //   penalty   attack (who) -> then      a blow ASKED at `who` fires `then`
 //             leave (who, arg) -> then  further than `arg` m from `who`
+//             harm (who, arg) -> then   D6, THE OUTCOME CLAUSE: a member of
+//                                       `who` hurt inside one of the demon's
+//                                       recent action footprints within `arg`
+//                                       seconds (default 10)
+//
+//   footprint a predicate over what an action does to the world (D4's kit
+//             tags, D6's schemes and twists), seen from one actor:
+//               direct                 aimed AT that actor
+//               affects_body           moves / burns / binds that actor's body
+//               creates(mat)           puts `mat` into the world
+//               alters(ground_under)   changes the ground under that actor
+//               alters(ring)           disturbs the demon's own salt ring
+//               region_near(N)         lands within N metres of that actor
+//               targets(body|ground|self|area)
+//             with ! & | ( ). An atom may name its actor, `alters(ground_under
+//             (me))`, `region_near(me, 6)` -- the clause's `who` decides who
+//             that is. D5's colon forms (creates:fire, alters:x, targets:x)
+//             still read.
 //
 //   selector  a set expression over ACTORS (the players and every live mob):
 //               me                the summoner
@@ -95,6 +119,10 @@ bool KindByName(const std::string& s, Kind& out);
 enum class Verb : uint8_t {
   Follow = 0, Guard, Goto, Fetch, Spin,   // duties
   Attack, Cast, Leave,                    // forbids (attack, leave also penalties)
+  // D6, appended (pages are saved by verb NUMBER; None is never saved):
+  Cause,                                  // forbid: no option whose footprint matches
+  Harm,                                   // penalty: the outcome clause
+  Return,                                 // duty: back with `who` before the term ends
   None,
 };
 const char* VerbName(Verb v);
@@ -147,6 +175,44 @@ bool ParseTrigger(const std::string& text, const std::vector<std::string>& count
                   std::vector<Cond>& out, std::string& err);
 bool CmpHolds(Cmp op, int32_t a, int32_t b);
 
+// ---- footprints (D6) ---------------------------------------------------------------
+
+enum class FpOp : uint8_t {
+  Direct = 0, AffectsBody, Creates, Alters, RegionNear, Targets, And, Or, Not,
+};
+struct FpNode {
+  FpOp op = FpOp::Direct;
+  int16_t a = -1, b = -1;
+  std::string name;      // Creates / Alters / Targets
+  float value = 0.0f;    // RegionNear, metres
+};
+struct FootPred {
+  std::vector<FpNode> nodes;
+  int root = -1;
+  bool Empty() const { return root < 0; }
+};
+// "" -> empty (matches everything: "any spell"). False with `err` on a fault.
+bool ParseFootPred(const std::string& text, FootPred& out, std::string& err);
+
+// One action's footprint seen from one actor (or from nobody: hasActor false,
+// for the actor-free atoms -- creates, alters(ring), targets).
+struct FootFacts {
+  const std::string* targets = nullptr;
+  bool direct = false;
+  const std::vector<std::string>* creates = nullptr;
+  const std::string* alters = nullptr;   // "ground_under_target" = under the TARGET
+  bool affectsBody = false;
+  bool hasActor = false;
+  bool isTarget = false;    // the actor is the action's target
+  float distM = 1e9f;       // metres from the footprint's edge to the actor (<= 0: inside)
+};
+// Does the predicate hold? An empty predicate holds (any action).
+bool FootHolds(const FootPred& p, const FootFacts& f);
+
+// A fetch's `arg` is "<material> [qualifier...]": the material, and whether the
+// clause qualified it (D6: a qualified fetch closes the harmful-state twist).
+std::string FetchMaterial(const std::string& arg);
+
 // ---- the page ---------------------------------------------------------------------
 
 struct Effect {
@@ -171,6 +237,8 @@ struct Clause {
   Selector sel;
   std::vector<Cond> conds;
   Effect effect;
+  FootPred fp;          // forbid cast / cause: the footprint predicate (`arg`)
+  int32_t argNum = 0;   // harm / return: seconds; leave / follow: metres (0 = unset)
 };
 
 struct Page {
@@ -196,9 +264,9 @@ struct Tariff {
   std::vector<std::pair<int32_t, int32_t>> term{{24, 1}, {72, 4}, {168, 8}};
   int32_t indefinite = 30;
   // Verb base weights, per kind.
-  int32_t duty[5] = {1, 3, 1, 3, 0};          // follow guard goto fetch spin
-  int32_t forbid[3] = {3, 3, 2};              // attack cast leave
-  int32_t penaltyAct[3] = {0, 0, 0};          // attack cast leave (watched act)
+  int32_t duty[6] = {1, 3, 1, 3, 0, 1};       // follow guard goto fetch spin return
+  int32_t forbid[4] = {3, 3, 2, 2};           // attack cast leave cause
+  int32_t penaltyAct[4] = {0, 0, 0, 0};       // attack cast leave harm (watched act)
   int32_t then[4] = {0, 0, 1, 1};             // none dismiss destroy pain
   // Selector breadth: points per node op (SelOp order).
   int32_t selOp[11] = {0, 0, 6, 1, 1, 1, 2, 1, 0, 1, 2};

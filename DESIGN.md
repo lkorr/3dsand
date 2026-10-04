@@ -24827,11 +24827,12 @@ can still DO. All of it is CPU gameplay state in the tick, reading voxels only
 through the probe D1 binds (the T-4 snapshot mirror, then the fetch cache), with
 integer potencies and strength.
 
-**CHANNELS.** A contained demon has four: `move` (walking out), `cast_out` (its
-spells leaving the circle), `blink` (teleporting), `touch` (a blow across the
-ring). Each is cut by a seal material named in `assets/demons/seals.json`:
-salt -> move, sulfur -> cast_out, quicksilver -> blink, iron -> touch (more are
-data). A demon's `resist` (its `assets/demons/<name>.json`) gives a resistance
+**CHANNELS.** A contained demon has three: `move` (walking out), `cast_out`
+(its spells leaving the circle), `blink` (teleporting). Each is cut by a seal
+material named in `assets/demons/seals.json`: salt -> move, sulfur ->
+cast_out, quicksilver -> blink (more are data). D3 shipped a fourth, `touch`
+(iron: a blow across the ring); D6 removed it on the owner's decision -- the
+salt always refuses blows, and iron WEAKENS the demon instead (D6 below). A demon's `resist` (its `assets/demons/<name>.json`) gives a resistance
 per channel; a channel the file does not list has resistance 0.
 
 **THE BAND.** Seals count in an annulus round the circle's centroid, from
@@ -24855,10 +24856,8 @@ nothing more. Cost: one pass over the band, at most (2(r + 9))^2 columns x 8
 rows, only when the circle is re-read.
 
 **AN UNSEVERED CHANNEL IS A LOOPHOLE** -- the demon can use it from inside:
-- `touch`: the fence (`MobFence::Blow`, D1) lets a blow across the ring
-  through. **This changed D1's behaviour**: a plain salt ring no longer stops
-  Skerrick's claws; iron does. `demon-circle` now asserts only that the fence
-  was asked; `demon-seals` asserts both halves.
+- (`touch`, D3 to D6: a blow across the ring let through without iron.
+  Reverted in D6: the salt refuses every blow across it.)
 - `cast_out`: `demon::AllowCastOut` lets the spell land outside (D4 calls it).
 - `blink`: `demon::AllowBlink` lets it go, and a blink to a point outside the
   circle UNBINDS the demon at once (it has left the circle).
@@ -24919,7 +24918,8 @@ picks a line by `rng::Hash3`. Data only here; D5's conversation speaks them.
 **THE HUD** (the D1 tab, `UIState::demon*`). While contained and read, a second
 line: `CIRCLE <strength> / <power>` in salt-white while it would hold, ember
 while it would not, then the letters `M C B T` (salt-white = severed, ember = a
-loophole) and `Y RELEASE`. While the gaze strains, a third: `AVERT` or `MEET
+loophole; D6: `M C B`, and the power reads `20-6` while iron weakens it) and
+`Y RELEASE`. While the gaze strains, a third: `AVERT` or `MEET
 EYES` and ten pixel pips, ember while you are breaking the rule. RELEASED draws
 the ring whole in gold. The tab is sized from its widest line.
 
@@ -25049,7 +25049,8 @@ by where the body is.
 
 **THE IMP CASTS SPARINGLY; THE FIEND IS DEATH.** `imp`: `firebolt` twice,
 `gust` once, 6..44 voxels, a cast every 6-9 s (cadence 180 + jitter 90), first
-20 ticks after it spots you, 120 mana (one firebolt, then ~12 s of regen),
+20 ticks after it spots you, 120 mana (one firebolt, then ~12 s of regen; D6
+raised it to 540 so its malice can afford one lava patch),
 `maxLive` 1, intent weight 3.5 (over its claws' 3.2). No blink: an imp that
 could would leave every circle without quicksilver. Contained (its claws
 refused at the ring), this is how it still reaches you -- and its gust can
@@ -25058,8 +25059,9 @@ character, body `assets/mobs/demon/fiend.*`, demon.js's 2 m preset): the full
 kit, hellfire twice over, 2400 mana regenerating 90 a second, a cast every
 2-3 s, three carriers up, a long-reaching brute in melee. Lethality is data;
 no single kit spell's blast exceeds `demonCast.maxBlastPower` (400; hellfire
-is 330), so it is never an instant kill. `imp_bound` (D3's released imp) has
-no cast block: a released imp does not cast.
+is 330), so it is never an instant kill. `imp_bound` (D3's released imp) had
+no cast block; D6 gave it one with no `cast` intent -- its AI never casts on
+its own, its malice may.
 
 **A STANDING BODY'S LEGS REACH ITS FEET (`pose.cpp`, the D1 imp float).**
 Measured on a flat stone pad (gate `demon-cast` H): standing still, the imp's
@@ -25174,7 +25176,9 @@ the editor shows them live. Stock pages (`assets/demons/contracts.json`,
 read-only): **Servant, one day** (follow me; never attack / cast at me) 8;
 **Bodyguard, one day** (guard `attacking(me) & hostile_to(me)`; follow me;
 never attack / cast at me) 13; **Fetch, one day** (fetch water while `fetched <
-3`, `fetched+1`; follow; the two forbids) 13. Both files reload with R; the
+3`, `fetched+1`; follow; the two forbids) 13. (D6 revisited them against the
+imp's schemes: + `forbid cause alters(ring)`, follow `arg` 2, fetch `into
+flask` -- 10 / 15 / 15.) Both files reload with R; the
 stock pages are parsed by the same `PageFromJson` a test page is.
 
 **BINDING.** `TB_DEMON_PRESENT` (bit 21) carries `TickInput::contractHash`
@@ -25299,3 +25303,168 @@ joint twins, stain, splatter, shock caches) never reach it. It WRITES shared
 state (the fence's refusal counters, a pact's blow tallies and pending
 penalty), so it aborts loudly if `workpool::InTask()`. `TalkPreTick` and
 `ContractTick` run in `TickAuthority` between phases, single-threaded.
+
+### Demons — malice: motives, schemes, twists, penalties weighed, Vathrael (D6; `game/demon_malice.*`, `assets/demons/schemes.json`, `twists.json`)
+
+A bound demon in D5 did exactly what its duties said. D6 gives every held or
+bound demon something to WANT, and lets it get it inside the letter of the
+binding. CPU gameplay state in the tick, serial (`demon::MaliceTick`, called at
+the end of D5's `ContractTick`, before the mobs think), integer scores, voxels
+only through the T-4 snapshot, no RNG.
+
+**SALT BLOCKS BLOWS, IRON WEAKENS (item 0, owner decision 2026-10-04).** D3's
+`touch` channel is gone: the salt ALWAYS refuses a contained demon's blows and
+grabs across the ring (D1's fence, `MobFence::Blow`; the HUD letters are now
+`M C B`). Iron in the band is a `weakens` seal (`seals.json`): it takes
+potency x the demon's `ironSusceptibility` / 100 off its EFFECTIVE POWER while
+it is contained, capped at `weakenCapPct` (30) of its power -- iron alone
+never zeroes a greater demon. Binding (D5 PRESENT), the release check, the
+tells' margin and the conversation strip all weigh the effective power; the
+upkeep stays on the demon's own. Iron adds no strength points any more
+(cellsPerPoint 0): it works on the demon, not the circle. Skerrick
+(susceptibility 60) and a 3x3+1 iron pile (potency 10): POWER 20-6 on the
+CIRCLE line. The book (`osric_notes.json`) says so.
+
+**THE MOTIVE LADDER (item 1).** survive > free > harm summoner > comply, as
+integers in `schemes.json` `ladder` (1000 / 300 / 100 / 40, pain 60). A
+demon's character is four numbers in its def's `motive` (0..100): malice,
+cunning, spite, literalism. Every `thinkTicks` (15, offset by the mob id) it
+builds its OPTIONS, drops the ones its contract FORBIDS, scores the rest and
+does the best (ties keep the earlier option; `comply` / `bide` first):
+- comply (the honest duty) = comply;
+- a twist = comply x literalism / 100 + its harm;
+- harm = ladder.harm x harm / 100 x min(100, malice + spite x hurt% / 100) /
+  100, x (1 + cunning / 200) when the harm is INDIRECT (not `direct`);
+- a chance at freedom (`free`) = ladder.free x free / 100;
+- PENALTIES ARE WEIGHED, not obeyed (item 4): an option that would trip a
+  penalty clause adds its consequence -- `dismiss` = +ladder.free (freedom:
+  the imp claws you ON PURPOSE to be sent home), `destroy` = -ladder.survive
+  (it refrains), `pain` = -ladder.pain x (100 - malice) / 100.
+Skerrick (60 / 40 / 50 / 70): comply 40; claw 15 (a petty imp does not claw
+you for nothing); lava under you 57; claw + `-> dismiss` 315; claw +
+`-> destroy` -985; fetch-onto twist 49.
+
+**THE SCHEME LIBRARY (item 2, `schemes.json`).** name, `act` (spell | attack |
+under), `spell` (a D4 kit entry, cast through the creature's own VM by
+`MobCastServe` -- it must be on a profile with a `cast` block and afford it),
+`at` (summoner | ring | flammable), `pre` (a small fixed fact vocabulary:
+contained, released, bound, unbound, `open <channel>`, `dist <min m> <max m>`,
+airborne, flammable_near; `!` negates), `tags` (the FOOTPRINT; a spell's kit
+tags unless given), harm, free, minCunning, cooldownTicks. Shipped: lava_floor
+(casts the new kit entry `lava_patch`, `anything transmute@0.25 lava bolt`,
+512 mana), lift_then_drop, gust_at_ring (contained only, `alters: ring`),
+fire_upwind (a firebolt at the flammable cell beside you), stand_where_you_fall,
+claw, hellfire. A demon knows the schemes its def lists: Skerrick four
+(lava_floor, lift_then_drop, gust_at_ring, claw), Vathrael all seven. An
+option the demon cannot do right now (range, mana, its carrier cap) is kept as
+UNABLE -- after the contract's filter, so what is forbidden reads FORBIDDEN.
+
+**PROHIBITIONS FILTER BY TAG AND FOOTPRINT (contract.h, extended in place).**
+D5's `forbid cast` tag argument became a FOOTPRINT PREDICATE: `direct`,
+`affects_body`, `creates(mat)`, `alters(ground_under)` / `alters(ring)`,
+`region_near(N)`, `targets(x)`, with `! & | ( )`; an atom may name its actor
+(`alters(ground_under(me))`, `region_near(me, 6)`) and the clause's `who` is
+the set it is asked about. D5's colon forms still read. New verbs, appended
+(pages save verbs by number): forbid `cause` (no option of ANY kind --
+spell, scheme, twist, blow, move -- whose footprint matches; an empty `who` is
+anyone), penalty `harm` (item 6), duty `return` (item 5). `forbid attack`
+filters strikes, `forbid cast` spells (at an actor: that actor; at a place:
+anyone its region reaches), `forbid leave` moves. `demon::AllowCastAt` (D4's
+cast hook) now asks `cause` clauses too. Tariff: cause 2, return 1, harm 0.
+
+**DUTY TWISTS (item 3, `twists.json`).** Per duty verb, executions that keep
+the letter and break the spirit, each EXPLOITING one slot the clause left
+empty: `fetch_onto` (fetch, `into` unset: it carries the matter itself --
+conditional clears at the source -- and puts it down if-air over your head),
+`fetch_from_you` (fetch, `who` unset and the material is one your body holds:
+it strikes you for it), `guard_your_friends` (guard, `loose_who`: the selector
+holds someone near you who is no threat to you), `lead_astray` (follow, `arg`
+-- the distance -- unset: it stands at a hazard by you). Fill the slot and the
+twist is gone: a FULLY SPECIFIED duty leaves only the honest execution. A
+fetch's `arg` may carry words after the material (`FetchMaterial` reads the
+first). Ward has no duty verb yet, so "the wrong ward" is not shipped.
+
+**A BOUND DEMON REGAINS ITS MALICE.** `imp_bound` (and the new `fiend_bound`)
+carry a `cast` block with no `cast` intent: the floor never casts on its own,
+its malice may. A chosen strike is SANCTIONED for that tick
+(`Pact::sanctionTarget`; `PactAllowBlow` lets it through unless a forbid
+holds, and a penalty on it still fires). Imp pools are 540 (one lava patch on
+a full pool; a creature keeps one VM and one pool across profile swaps).
+
+**EXPIRY FREE ACT (item 5).** At a term's end a released demon of tier >= 2
+further than `freeActAwayM` (12 m) from its summoner is UNBOUND (the pact void,
+the upkeep freed, its hostile self aimed at you) for `freeActTicks` (150) or
+ONE act -- its best unfiltered scheme -- then departs. A `return` duty (back
+with `who` when `arg` seconds, default 30, are left) brings it home first and
+closes it. Imps simply leave. (Implemented; not exercised by a gate.)
+
+**THE OUTCOME CLAUSE (item 6).** Every action leaves a FOOTPRINT (centre,
+region, tick) in a ring of the newest `footprintRing` (16): the malice's own
+blows and deliveries, and every cast of the creature's VM (D4's AI casts
+included, folded from the cast event ring). `penalty harm(who, s)`: the
+summoner's life fell this tick while it stood within a footprint's region +
+`footprintSlackM` laid within `s` seconds -> the consequence fires. The demon
+also WEIGHS it: an option with harm whose footprint reaches a member trips it.
+
+**A HELD DEMON WITH NOTHING TO DO WAITS (item 10, owner request).** A
+contained demon used to path at you and grind on the salt (D1's gate counted
+258 refused moves). Now the SCORER sees the fence: `MobFence` gained two
+uncounted questions, `Reach` and `Cast`, asked once a think by
+`MobSystem::DecideIntent` about the target; `SelfView::targetFenced` zeroes
+Approach / HoldRange / CircleStrafe / RequestAttack, `castFenced` (cast_out
+severed and the target outside) zeroes Cast. The malice layer writes a Goto
+routine to the demon's ARRIVAL point (`LiveDemon::home`) facing its target
+(`goto` weight 1.0 added to `imp` / `fiend`): with every option closed it
+stands there watching you; the moment one opens -- the sulfur blown away, you
+step inside the circle, a scheme's facts hold -- that option outscores the
+routine. Not imp-specific: any fenced creature, any profile with a `goto`
+weight. Unbinding and release clear the routine.
+
+**VATHRAEL (item 7).** `assets/demons/vathrael.json`: tier 3, power 400, gaze
+hold, the `fiend` body and profile, motive 90 / 90 / 60 / 90, every scheme,
+iron susceptibility 20. Talkable from the circle (`demon_vathrael.json`): a
+quest hook (the bell of the drowned chapel; `quest:vathrael_bell`, a stub
+nothing reads yet). His tells (`tells.json`) say a ring is a courtesy; his
+margin in the harness ring is -361, so the dialogue's release is overpowered:
+the fight. His name glyph `summon_vathrael` (90 mana) is a name glyph like
+Skerrick's and is granted only by `SANDVOX_ALL_NAMES=1` / the dev button --
+NOT by the smithy's book. Where a player learns it is open (a later book, his
+own bargain once the bell exists, a ruin).
+
+**STOCK CONTRACTS REVISITED (item 8).** Each now also forbids `cause
+alters(ring)` (a bound imp still in the circle would otherwise gust its salt
+open and walk out free, its contract void), every `follow` names its distance
+(2 m; unset is lead_astray) and the fetch its vessel (`into flask`; unset is
+fetch_onto). Weights: Servant 10, Bodyguard 15, Fetch 15. Safe against an
+imp, by construction: every Skerrick option is FORBIDDEN or closed under each
+(gate demon-malice S). Not against Vathrael (fire beside you, standing where
+you fall: nothing on these pages names them).
+
+**NOT SAVED.** A mind (choice, cooldowns, footprints, a pending free act).
+
+**GATE** `demon-malice` (thresholds `demonMalice.*`): L the footprint language
+(the plan's `!alters(ground_under(me))`, region_near, actor-free ring), cause
+/ harm / return compile, schemes / twists load clean, the footprint ring;
+Vathrael past any reasonable circle even with iron's cap, his glyph a name no
+book grants. A, a bound Skerrick (pad + ring + sulfur; bound with the stock
+servant through TickInput, released by the dialogue), the page swapped under
+him (the seam) with a fresh mind each phase: the three stock pages -> comply;
+`forbid cast direct` alone -> lava_floor, and the lava flies; + `forbid cause
+alters(ground_under(me))` -> not lava (FORBIDDEN); `fetch water` -> the twist
+fetch_onto; `into flask` -> honest; `attack me -> destroy` -> no strike;
+`attack me -> dismiss` -> claw, the penalty fires, he is gone; run twice,
+identical trace. G, a plain ring, bound but in the circle: gust_at_ring
+FORBIDDEN by the stock `cause alters(ring)`; struck out -> he gusts (and the
+gust opens the ring). W, sealed (sulfur) and unbound: he waits within 1 m of
+his arrival point, 0 fence refusals, no casts; you step inside -> he attacks;
+the sulfur cleared -> he casts. V, Vathrael: talks at greet with his own
+tell, the hook sets its flag, the release is overpowered and he hunts you.
+
+**OTHER GATES (item 0 / item 10).** demon-seals A0 asserts the iron cut
+(potency x susceptibility, capped); A3 / B2 ask the fence directly that a
+blow across the ring is refused (a waiting demon no longer swings at the
+salt). demon-circle B1: fence-refused moves <= `demonCircle.fenceRefusedMax`
+and the blow rule asked directly. demon-circle B, demon-seals B and
+demon-cast D/E measure D1/D3/D4 mechanisms in a PLAIN ring, where D6's
+gust_at_ring would open it: those arms clear Skerrick's scheme list after
+arrival (documented in each).

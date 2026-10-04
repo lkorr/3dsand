@@ -1573,12 +1573,14 @@ struct UIState {
   float demonRadiusM = 0.0f;
   // D3 (game/demon_seals.h FillHud): while CONTAINED with a band reading, the
   // circle's STRENGTH against the demon's POWER, which channels the seal piles
-  // sever (bit per demon::Channel: move, cast_out, blink, touch), and the gaze
+  // sever (bit per demon::Channel: move, cast_out, blink), the iron's cut off
+  // its power (D6: `demonPower` is the demon's own, the circle weighs
+  // demonPower - demonIronCut), and the gaze
   // strain (0..1; `demonGazeHold` = the demon wants your eyes, else averted;
   // `demonGazeBroken` = you are breaking that rule this tick). demonState 3 =
   // RELEASED (the binding held when you let it out).
   bool demonHasBinding = false;
-  int demonStrength = 0, demonPower = 0;
+  int demonStrength = 0, demonPower = 0, demonIronCut = 0;
   uint8_t demonSevered = 0;
   float demonStrain = 0.0f;
   bool demonGazeHold = false, demonGazeBroken = false;

@@ -24,7 +24,8 @@ namespace contract {
 namespace {
 constexpr const char* kKindNames[] = {"duty", "forbid", "penalty"};
 constexpr const char* kVerbNames[] = {"follow", "guard", "goto",  "fetch", "spin",
-                                      "attack", "cast",  "leave", "none"};
+                                      "attack", "cast",  "leave", "cause", "harm",
+                                      "return", "none"};
 constexpr const char* kThenNames[] = {"", "dismiss", "destroy", "pain"};
 constexpr const char* kSelNames[] = {"me",        "self",    "all",  "attacked_by",
                                      "attacking", "hostile_to", "faction", "type",
@@ -51,9 +52,9 @@ bool VerbByName(const std::string& s, Verb& out) {
 }
 const std::vector<Verb>& VerbsFor(Kind k) {
   static const std::vector<Verb> duty = {Verb::Follow, Verb::Guard, Verb::Goto, Verb::Fetch,
-                                         Verb::Spin};
-  static const std::vector<Verb> forbid = {Verb::Attack, Verb::Cast, Verb::Leave};
-  static const std::vector<Verb> penalty = {Verb::Attack, Verb::Leave};
+                                         Verb::Spin,   Verb::Return};
+  static const std::vector<Verb> forbid = {Verb::Attack, Verb::Cast, Verb::Leave, Verb::Cause};
+  static const std::vector<Verb> penalty = {Verb::Attack, Verb::Leave, Verb::Harm};
   return k == Kind::Duty ? duty : k == Kind::Forbid ? forbid : penalty;
 }
 bool VerbFits(Kind k, Verb v) {
@@ -250,6 +251,244 @@ bool ParseSelector(const std::string& text, Selector& out, std::string& err) {
   return true;
 }
 
+// ---- footprints (D6) ---------------------------------------------------------------------
+//
+//   fexpr  := fterm ('|' fterm)*
+//   fterm  := ffact ('&' ffact)*
+//   ffact  := '!' ffact | '(' fexpr ')' | atom
+//   atom   := direct | affects_body ['(' who ')'] | creates '(' mat ')' | creates:mat
+//           | alters '(' what ['(' who ')'] ')' | alters:what
+//           | region_near '(' [who ','] N ')' | targets '(' x ')' | targets:x
+//
+// An atom's own actor (`(me)`) is read and dropped: the clause's `who` is the
+// set the predicate is asked about.
+
+namespace {
+
+std::string NormAlters(std::string x) {
+  const std::string suf = "_target";
+  if (x.size() > suf.size() && x.compare(x.size() - suf.size(), suf.size(), suf) == 0)
+    x.resize(x.size() - suf.size());
+  return x;
+}
+
+struct FpParser {
+  Lexer lx;
+  FootPred& out;
+  std::string err;
+  int Add(FpNode n) {
+    if ((int)out.nodes.size() >= kMaxNodes) {
+      if (err.empty()) err = "more than " + std::to_string(kMaxNodes) + " terms";
+      return -1;
+    }
+    out.nodes.push_back(std::move(n));
+    return (int)out.nodes.size() - 1;
+  }
+  int Bin(FpOp op, int a, int b) {
+    FpNode n;
+    n.op = op;
+    n.a = (int16_t)a;
+    n.b = (int16_t)b;
+    return Add(n);
+  }
+  int Expr() {
+    int a = Term();
+    while (a >= 0 && lx.Eat('|')) {
+      const int b = Term();
+      if (b < 0) return -1;
+      a = Bin(FpOp::Or, a, b);
+    }
+    return a;
+  }
+  int Term() {
+    int a = Factor();
+    while (a >= 0 && lx.Eat('&')) {
+      const int b = Factor();
+      if (b < 0) return -1;
+      a = Bin(FpOp::And, a, b);
+    }
+    return a;
+  }
+  // An optional actor argument, `(me)` / `(self)` / `(all)`: read and dropped.
+  bool SkipActor() {
+    const size_t at = lx.i;
+    if (!lx.Eat('(')) return true;
+    const std::string w = lx.Word();
+    if (lx.Eat(')') && (w == "me" || w == "self" || w == "all" || w == "anyone")) return true;
+    lx.i = at;
+    return false;
+  }
+  int Factor() {
+    if (lx.Eat('!')) {
+      const int a = Factor();
+      if (a < 0) return -1;
+      FpNode n;
+      n.op = FpOp::Not;
+      n.a = (int16_t)a;
+      return Add(n);
+    }
+    if (lx.Eat('(')) {
+      const int a = Expr();
+      if (a < 0) return -1;
+      if (!lx.Eat(')')) {
+        if (err.empty()) err = "missing ')'";
+        return -1;
+      }
+      return a;
+    }
+    std::string w = lx.Word();
+    if (w.empty()) {
+      if (err.empty())
+        err = lx.AtEnd() ? "ends too soon" : std::string("unexpected '") + lx.s[lx.i] + "'";
+      return -1;
+    }
+    FpNode n;
+    // D5's colon forms.
+    const size_t colon = w.find(':');
+    if (colon != std::string::npos) {
+      const std::string k = w.substr(0, colon), v = w.substr(colon + 1);
+      if (v.empty()) {
+        if (err.empty()) err = "'" + w + "' names nothing";
+        return -1;
+      }
+      if (k == "creates") n.op = FpOp::Creates;
+      else if (k == "alters") n.op = FpOp::Alters;
+      else if (k == "targets") n.op = FpOp::Targets;
+      else {
+        if (err.empty()) err = "unknown tag '" + w + "'";
+        return -1;
+      }
+      n.name = n.op == FpOp::Alters ? NormAlters(v) : v;
+      return Add(n);
+    }
+    if (w == "direct") {
+      n.op = FpOp::Direct;
+      if (!SkipActor() && err.empty()) err = "direct( ) takes an actor";
+      return err.empty() ? Add(n) : -1;
+    }
+    if (w == "affects_body") {
+      n.op = FpOp::AffectsBody;
+      if (!SkipActor() && err.empty()) err = "affects_body( ) takes an actor";
+      return err.empty() ? Add(n) : -1;
+    }
+    if (w == "creates" || w == "targets" || w == "alters") {
+      n.op = w == "creates" ? FpOp::Creates : w == "targets" ? FpOp::Targets : FpOp::Alters;
+      if (!lx.Eat('(')) {
+        if (err.empty()) err = w + " needs (...)";
+        return -1;
+      }
+      n.name = lx.Word();
+      if (n.name.empty()) {
+        if (err.empty()) err = w + "( ) needs a name";
+        return -1;
+      }
+      if (n.op == FpOp::Alters) {
+        n.name = NormAlters(n.name);
+        if (!SkipActor()) {
+          if (err.empty()) err = "alters(" + n.name + "( )) takes an actor";
+          return -1;
+        }
+      }
+      if (!lx.Eat(')')) {
+        if (err.empty()) err = "missing ')' after " + w;
+        return -1;
+      }
+      return Add(n);
+    }
+    if (w == "region_near") {
+      n.op = FpOp::RegionNear;
+      if (!lx.Eat('(')) {
+        if (err.empty()) err = "region_near needs (metres)";
+        return -1;
+      }
+      auto num = [&]() {
+        lx.Skip();
+        size_t j = lx.i;
+        while (j < lx.s.size() && (std::isalnum((unsigned char)lx.s[j]) || lx.s[j] == '.' ||
+                                   lx.s[j] == '_'))
+          j++;
+        std::string w2 = lx.s.substr(lx.i, j - lx.i);
+        lx.i = j;
+        return w2;
+      };
+      std::string first = num();
+      if (lx.Eat(',')) first = num();   // region_near(me, 6)
+      char* endp = nullptr;
+      const double v = std::strtod(first.c_str(), &endp);
+      if (first.empty() || endp == nullptr || *endp != 0 || v < 0) {
+        if (err.empty()) err = "region_near( ) needs a distance in metres";
+        return -1;
+      }
+      n.value = (float)v;
+      if (!lx.Eat(')')) {
+        if (err.empty()) err = "missing ')' after region_near";
+        return -1;
+      }
+      return Add(n);
+    }
+    if (err.empty())
+      err = "unknown footprint '" + w +
+            "' (direct, affects_body, creates(x), alters(x), region_near(m), targets(x))";
+    return -1;
+  }
+};
+
+bool FpEval(const FootPred& p, int node, const FootFacts& f, int depth) {
+  if (node < 0 || node >= (int)p.nodes.size() || depth > kMaxNodes) return false;
+  const FpNode& n = p.nodes[(size_t)node];
+  switch (n.op) {
+    case FpOp::Direct: return f.direct && f.isTarget;
+    case FpOp::AffectsBody: return f.affectsBody && f.hasActor && (f.isTarget || f.distM <= 0.0f);
+    case FpOp::Creates:
+      if (f.creates)
+        for (const std::string& c : *f.creates)
+          if (c == n.name) return true;
+      return false;
+    case FpOp::Alters: {
+      if (f.alters == nullptr || f.alters->empty()) return false;
+      const std::string a = *f.alters;
+      const bool underTarget = NormAlters(a) != a;
+      if (NormAlters(a) != n.name) return false;
+      return !underTarget || f.isTarget;   // "under the target": about that actor
+    }
+    case FpOp::RegionNear: return f.hasActor && f.distM <= n.value;
+    case FpOp::Targets: return f.targets != nullptr && *f.targets == n.name;
+    case FpOp::And: return FpEval(p, n.a, f, depth + 1) && FpEval(p, n.b, f, depth + 1);
+    case FpOp::Or: return FpEval(p, n.a, f, depth + 1) || FpEval(p, n.b, f, depth + 1);
+    case FpOp::Not: return !FpEval(p, n.a, f, depth + 1);
+  }
+  return false;
+}
+
+}  // namespace
+
+bool ParseFootPred(const std::string& text, FootPred& out, std::string& err) {
+  out = FootPred{};
+  if (Trim(text).empty()) return true;
+  FpParser p{Lexer{text}, out, {}};
+  const int root = p.Expr();
+  if (root >= 0 && !p.lx.AtEnd() && p.err.empty())
+    p.err = std::string("unexpected '") + text[p.lx.i] + "'";
+  if (root < 0 || !p.err.empty()) {
+    err = p.err.empty() ? "cannot read it" : p.err;
+    out = FootPred{};
+    return false;
+  }
+  out.root = root;
+  return true;
+}
+
+bool FootHolds(const FootPred& p, const FootFacts& f) {
+  if (p.Empty()) return true;
+  return FpEval(p, p.root, f, 0);
+}
+
+std::string FetchMaterial(const std::string& arg) {
+  const std::string t = Trim(arg);
+  const size_t sp = t.find_first_of(" \t");
+  return sp == std::string::npos ? t : t.substr(0, sp);
+}
+
 // ---- triggers --------------------------------------------------------------------------
 
 bool CmpHolds(Cmp op, int32_t a, int32_t b) {
@@ -399,22 +638,29 @@ bool Compile(Page& p, std::vector<std::string>& errs) {
     e.clear();
     if (!ParseEffect(c.on, p.counters, c.effect, e)) errs.push_back(at + "on: " + e);
     const bool needsWho = c.verb == Verb::Follow || c.verb == Verb::Guard ||
-                          c.verb == Verb::Attack || c.verb == Verb::Cast || c.verb == Verb::Leave;
+                          c.verb == Verb::Attack || c.verb == Verb::Cast ||
+                          c.verb == Verb::Leave || c.verb == Verb::Harm || c.verb == Verb::Return;
     if (needsWho && c.sel.Empty()) errs.push_back(at + VerbName(c.verb) + " needs a who");
-    if (c.verb == Verb::Fetch && Trim(c.arg).empty())
+    if (c.verb == Verb::Fetch && FetchMaterial(c.arg).empty())
       errs.push_back(at + "fetch needs a material");
     if (c.kind == Kind::Penalty && c.then == Then::None)
       errs.push_back(at + "a penalty needs a consequence (dismiss, destroy, pain)");
-    if (c.kind == Kind::Forbid && c.verb == Verb::Cast && !Trim(c.arg).empty()) {
-      const std::string a = Trim(c.arg);
-      const bool ok = a == "direct" || a == "affects_body" || a.rfind("creates:", 0) == 0 ||
-                      a.rfind("alters:", 0) == 0 || a.rfind("targets:", 0) == 0;
-      if (!ok)
-        errs.push_back(at + "cast's tag is direct, affects_body, creates:<mat>, alters:<x> or "
-                            "targets:<x>");
+    c.fp = FootPred{};
+    c.argNum = 0;
+    if (c.verb == Verb::Cast || c.verb == Verb::Cause) {
+      e.clear();
+      if (!ParseFootPred(c.arg, c.fp, e)) errs.push_back(at + VerbName(c.verb) + ": " + e);
+      else if (c.verb == Verb::Cause && c.fp.Empty())
+        errs.push_back(at + "cause needs a footprint (alters(ground_under), creates(lava), ...)");
     }
     if (c.verb == Verb::Leave && std::atoi(c.arg.c_str()) <= 0)
       errs.push_back(at + "leave needs a distance in metres");
+    if (c.verb == Verb::Leave || c.verb == Verb::Follow) c.argNum = std::max(0, std::atoi(c.arg.c_str()));
+    if (c.verb == Verb::Harm || c.verb == Verb::Return) {
+      const int v = Trim(c.arg).empty() ? (c.verb == Verb::Harm ? 10 : 30) : std::atoi(c.arg.c_str());
+      if (v <= 0) errs.push_back(at + VerbName(c.verb) + " needs a time in seconds");
+      c.argNum = std::max(1, v);
+    }
   }
   return errs.empty();
 }
@@ -464,11 +710,16 @@ Weight Weigh(const Page& p, const Tariff& t) {
     const Clause& c = p.clauses[i];
     int32_t v = 0;
     const int vi = (int)c.verb;
-    if (c.kind == Kind::Duty && vi <= (int)Verb::Spin) v = t.duty[vi];
-    else if (c.kind == Kind::Forbid && vi >= (int)Verb::Attack && vi <= (int)Verb::Leave)
-      v = t.forbid[vi - (int)Verb::Attack];
-    else if (c.kind == Kind::Penalty && vi >= (int)Verb::Attack && vi <= (int)Verb::Leave)
-      v = t.penaltyAct[vi - (int)Verb::Attack] + t.then[(int)c.then];
+    // The tables' columns (contract_tariff.json): duty follow..spin, return;
+    // forbid / penalty attack cast leave, then cause (forbid) / harm (penalty).
+    const int dutyCol = vi <= (int)Verb::Spin ? vi : c.verb == Verb::Return ? 5 : -1;
+    const int actCol = (vi >= (int)Verb::Attack && vi <= (int)Verb::Leave) ? vi - (int)Verb::Attack
+                       : (c.verb == Verb::Cause || c.verb == Verb::Harm)  ? 3
+                                                                           : -1;
+    if (c.kind == Kind::Duty && dutyCol >= 0) v = t.duty[dutyCol];
+    else if (c.kind == Kind::Forbid && actCol >= 0) v = t.forbid[actCol];
+    else if (c.kind == Kind::Penalty && actCol >= 0)
+      v = t.penaltyAct[actCol] + t.then[(int)c.then];
     const int32_t breadth = SelectorBreadth(c.sel, t);
     v += (int32_t)(((int64_t)breadth * t.breadthPct[(int)c.kind]) / 100);
     v += (int32_t)c.conds.size() * t.perCondition;
@@ -489,12 +740,15 @@ std::string Describe(const Clause& c) {
   std::string s = KindName(c.kind);
   s += ": ";
   s += VerbName(c.verb);
-  if (!Trim(c.arg).empty() &&
-      (c.verb == Verb::Fetch || c.verb == Verb::Goto || c.verb == Verb::Cast))
+  if (!Trim(c.arg).empty() && (c.verb == Verb::Fetch || c.verb == Verb::Goto ||
+                                c.verb == Verb::Cast || c.verb == Verb::Cause))
     s += " " + Trim(c.arg);
   if (!Trim(c.into).empty() && c.verb == Verb::Fetch) s += " into " + Trim(c.into);
   if (!Trim(c.who).empty()) s += " " + Trim(c.who);
   if (c.verb == Verb::Leave && !Trim(c.arg).empty()) s += " > " + Trim(c.arg) + " m";
+  if (c.verb == Verb::Follow && !Trim(c.arg).empty()) s += " within " + Trim(c.arg) + " m";
+  if ((c.verb == Verb::Harm || c.verb == Verb::Return) && !Trim(c.arg).empty())
+    s += (c.verb == Verb::Harm ? " within " : " by ") + Trim(c.arg) + " s";
   if (c.kind == Kind::Penalty && c.then != Then::None) s += std::string(" -> ") + ThenName(c.then);
   if (!Trim(c.when).empty()) s += " when " + Trim(c.when);
   return s;
@@ -601,9 +855,9 @@ void LoadTariff(const json& j, Tariff& t) {
       i++;
     }
   };
-  table("duty", t.duty, {"follow", "guard", "goto", "fetch", "spin"});
-  table("forbid", t.forbid, {"attack", "cast", "leave"});
-  table("penalty", t.penaltyAct, {"attack", "cast", "leave"});
+  table("duty", t.duty, {"follow", "guard", "goto", "fetch", "spin", "return"});
+  table("forbid", t.forbid, {"attack", "cast", "leave", "cause"});
+  table("penalty", t.penaltyAct, {"attack", "cast", "leave", "harm"});
   table("then", t.then, {"none", "dismiss", "destroy", "pain"});
   table("selector", t.selOp,
         {"me", "self", "all", "attacked_by", "attacking", "hostile_to", "faction", "type", "and",

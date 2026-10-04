@@ -762,6 +762,20 @@
       "example": "summon_skerrick lob",
       "axis": "nothing: a name said twice is one imp",
       "desc": "The name of the imp Skerrick. Cast it into a closed ring of salt, from outside the ring, and he arrives held inside it. Cast it anywhere else and he arrives loose, and he remembers who called."
+    },
+    {
+      "id": "summon_vathrael",
+      "sort": "effect",
+      "word": 6,
+      "verb": "summon",
+      "summon": {
+        "comment": "A GREATER DEMON'S NAME (docs/PLAN_demons.md D6). NOT taught by the smithy cellar's book: today only the debug switches grant it (SANDVOX_ALL_NAMES=1, the dev panel's 'learn all demon names'). Where a player learns it is an open content question (a later book, Vathrael's own bargain, a ruin).",
+        "demon": "vathrael",
+        "mana": 90
+      },
+      "example": "summon_vathrael lob",
+      "axis": "nothing: a name said twice is one demon",
+      "desc": "The name of Vathrael, who is not an imp. Cast into a closed ring of salt he arrives held, and will talk. No ring you can pour will hold him if you let him out."
     }
   ],
   "conjoined": {

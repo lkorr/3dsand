@@ -74,9 +74,14 @@ int WhoIndex(const std::string& sel) {
 }
 const char* const kFetchMats[] = {"water", "blood", "sand", "salt", "oil", "sulfur"};
 const char* const kLeaveM[] = {"4", "8", "16", "32"};
-// A forbid-cast's footprint tag (D4's kit tags; contract.h): "" = any spell.
+// harm / return (D6): seconds.
+const char* const kSecs[] = {"10", "30", "60"};
+// A forbid-cast's / forbid-cause's FOOTPRINT predicate (contract.h; D4's kit
+// tags, D6's schemes): "" = any spell (cast only; a cause needs one).
 const char* const kCastTag[] = {"", "direct", "creates:fire", "creates:lava",
-                                "alters:ground_under_target", "affects_body"};
+                                "alters:ground_under_target", "affects_body",
+                                "alters(ring)", "region_near(3)"};
+constexpr int kCastTags = (int)(sizeof kCastTag / sizeof kCastTag[0]);
 const char* CastTagLabel(const std::string& t) {
   if (t.empty()) return "any spell";
   if (t == "direct") return "aimed at";
@@ -84,6 +89,8 @@ const char* CastTagLabel(const std::string& t) {
   if (t == "creates:lava") return "lava";
   if (t == "alters:ground_under_target") return "the ground under";
   if (t == "affects_body") return "on the body";
+  if (t == "alters(ring)") return "its own ring";
+  if (t == "region_near(3)") return "within 3 m";
   return nullptr;
 }
 
@@ -402,9 +409,14 @@ void DrawContractEditor(UIState& s) {
                                                     : c.arg),
               rest);
       } else {
-        const bool leave = c.verb == contract::Verb::Leave ||
-                           (c.verb == contract::Verb::Cast && c.kind == contract::Kind::Forbid);
-        const bool castTag = c.verb == contract::Verb::Cast;
+        // D6: harm / return carry seconds, cause a footprint like cast.
+        const bool secs = c.verb == contract::Verb::Harm || c.verb == contract::Verb::Return;
+        const bool castTag = c.verb == contract::Verb::Cast || c.verb == contract::Verb::Cause;
+        const bool leave = c.verb == contract::Verb::Leave || secs ||
+                           (castTag && c.kind == contract::Kind::Forbid);
+        const char* unit = secs ? " s" : " m";
+        const char* const* argSet = secs ? kSecs : kLeaveM;
+        const int argN = secs ? 3 : 4;
         const bool pen = c.kind == contract::Kind::Penalty;
         const float wWho = Snap(rest * (leave || pen ? 0.56f : 1.0f) - 3);
         const char* wl = WhoLabel(c.who);
@@ -420,32 +432,33 @@ void DrawContractEditor(UIState& s) {
           const char* tl = CastTagLabel(c.arg);
           if (Token("##tag", ImVec2(tx2, ty), tl ? std::string(tl) : c.arg, w2) && !ro) {
             int k = -1;
-            for (int m = 0; m < 6; m++)
+            for (int m = 0; m < kCastTags; m++)
               if (c.arg == kCastTag[m]) k = m;
-            c.arg = kCastTag[(k + 1) % 6];
+            c.arg = kCastTag[(k + 1) % kCastTags];
+            if (c.arg.empty() && c.verb == contract::Verb::Cause) c.arg = kCastTag[1];
             E.dirty = true;
           }
           if (ImGui::IsItemHovered())
             ui::Tip("Which spells: any, or only those whose footprint matches (the kit's tags).");
         } else if (leave && !pen) {
-          if (Token("##m", ImVec2(tx2, ty), "> " + (c.arg.empty() ? std::string("?") : c.arg) + " m",
-                    w2) &&
+          if (Token("##m", ImVec2(tx2, ty),
+                    (secs ? "by " : "> ") + (c.arg.empty() ? std::string("?") : c.arg) + unit, w2) &&
               !ro) {
             int k = -1;
-            for (int m = 0; m < 4; m++)
-              if (c.arg == kLeaveM[m]) k = m;
-            c.arg = kLeaveM[(k + 1) % 4];
+            for (int m = 0; m < argN; m++)
+              if (c.arg == argSet[m]) k = m;
+            c.arg = argSet[(k + 1) % argN];
             E.dirty = true;
           }
         } else if (pen) {
           const float wm = leave ? Snap(w2 * 0.4f) : 0.0f;
           if (leave &&
-              Token("##m", ImVec2(tx2, ty), (c.arg.empty() ? std::string("?") : c.arg) + " m", wm) &&
+              Token("##m", ImVec2(tx2, ty), (c.arg.empty() ? std::string("?") : c.arg) + unit, wm) &&
               !ro) {
             int k = -1;
-            for (int m = 0; m < 4; m++)
-              if (c.arg == kLeaveM[m]) k = m;
-            c.arg = kLeaveM[(k + 1) % 4];
+            for (int m = 0; m < argN; m++)
+              if (c.arg == argSet[m]) k = m;
+            c.arg = argSet[(k + 1) % argN];
             E.dirty = true;
           }
           if (leave) tx2 += wm + 6;
@@ -471,10 +484,12 @@ void DrawContractEditor(UIState& s) {
         ImGui::SetCursorScreenPos(ImVec2(a.x + 14, fy2));
         if (TextField("##ont", "on (counter+1)", c.on, fw, ro)) E.dirty = true;
         if (c.verb == contract::Verb::Fetch || c.verb == contract::Verb::Goto ||
-            c.verb == contract::Verb::Leave) {
+            c.verb == contract::Verb::Leave || c.verb == contract::Verb::Cast ||
+            c.verb == contract::Verb::Cause || c.verb == contract::Verb::Harm ||
+            c.verb == contract::Verb::Return || c.verb == contract::Verb::Follow) {
           ImGui::SetCursorScreenPos(ImVec2(a.x + 14 + fw + 12, fy2));
           if (TextField("##argt",
-                        c.verb == contract::Verb::Goto ? "x y z, or here" : c.verb == contract::Verb::Fetch ? "material" : c.verb == contract::Verb::Cast ? "tag (creates:fire)" : "metres",
+                        c.verb == contract::Verb::Goto ? "x y z, or here" : c.verb == contract::Verb::Fetch ? "material [how]" : (c.verb == contract::Verb::Cast || c.verb == contract::Verb::Cause) ? "footprint (alters(ground_under))" : (c.verb == contract::Verb::Harm || c.verb == contract::Verb::Return) ? "seconds" : "metres",
                         c.arg, fw, ro))
             E.dirty = true;
         }

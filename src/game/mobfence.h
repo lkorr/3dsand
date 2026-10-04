@@ -17,7 +17,15 @@
 #include <cstdint>
 
 struct MobFence {
-  enum Kind : uint8_t { Move = 0, Blow = 1 };
+  // Move / Blow: the walk drive and the attack seam ASK before acting (and a
+  // refusal is counted). Reach / Cast (demons D6 item 10) are the SCORER's
+  // questions, asked once per think by MobSystem::DecideIntent and never
+  // counted: could this body reach a point at all (a blow or a step there),
+  // and would a spell it cast at that point get out? A contained demon whose
+  // target is past its salt does not score Approach / HoldRange / Circle /
+  // Attack -- it would only grind on the ring -- and does not try a cast the
+  // seals stop at the ring (ai_behavior.h SelfView::targetFenced, castFenced).
+  enum Kind : uint8_t { Move = 0, Blow = 1, Reach = 2, Cast = 3 };
   // May mob `mobId`, at (fromX, fromZ), move its footprint centre to / aim a
   // blow at (toX, toZ)? World voxels. Null = no fence: always yes.
   bool (*allow)(void* ctx, uint64_t mobId, Kind kind, float fromX, float fromZ, float toX,

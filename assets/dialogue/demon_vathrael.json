@@ -1,0 +1,165 @@
+{
+  "name": "demon_vathrael",
+  "speaker": "Vathrael",
+  "canLeave": true,
+  "notes": "Talking to VATHRAEL while he is CONTAINED (docs/PLAN_demons.md D6; game/demon_talk.h). Same engine flags as Skerrick's (demon:present, demon:bound) and the same {tell} {name} {margin} {weight} {contract}. The QUEST HOOK is a stub: he names a task (the bell of the drowned chapel) and, if you listen, sets the world flag quest:vathrael_bell = 1; nothing reads it yet. Releasing him is the fight: his power is past any circle you can draw, and his tells say so.",
+  "entry": [
+    {
+      "if": [
+        {
+          "flag": "demon:present",
+          "value": 1
+        }
+      ],
+      "goto": "refused"
+    },
+    {
+      "if": [
+        {
+          "flag": "demon:present",
+          "value": 3
+        }
+      ],
+      "goto": "refused"
+    },
+    {
+      "if": [
+        {
+          "flag": "quest:vathrael_bell"
+        }
+      ],
+      "goto": "again"
+    },
+    {
+      "goto": "greet"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "greet",
+      "text": "The thing in the salt is taller than the cellar wants it to be. It folds itself down to look at you and smiles with too many teeth. \"{tell}\"",
+      "choices": [
+        {
+          "text": "What do you want?",
+          "goto": "hook"
+        },
+        {
+          "text": "I have a contract for you.",
+          "goto": "offer",
+          "do": [
+            {
+              "present_contract": true
+            }
+          ]
+        },
+        {
+          "text": "Go back where you came from.",
+          "do": [
+            {
+              "dismiss": true
+            }
+          ]
+        },
+        {
+          "text": "Out you come.",
+          "goto": "warn"
+        }
+      ]
+    },
+    {
+      "id": "hook",
+      "text": "\"Want? A bell. Under the drowned chapel past the marsh, a bell that was rung once to bind something like me. Bring me its tongue and I will teach you the names your smith never learned.\"",
+      "choices": [
+        {
+          "text": "I will think on it.",
+          "goto": "again",
+          "do": [
+            {
+              "set": "quest:vathrael_bell"
+            }
+          ]
+        },
+        {
+          "text": "No.",
+          "goto": "greet"
+        }
+      ]
+    },
+    {
+      "id": "again",
+      "text": "\"The bell, summoner. The chapel, the marsh, the tongue.\" He studies your salt as if it were writing. \"{tell}\"",
+      "choices": [
+        {
+          "text": "I have a contract for you.",
+          "goto": "offer",
+          "do": [
+            {
+              "present_contract": true
+            }
+          ]
+        },
+        {
+          "text": "Go back where you came from.",
+          "do": [
+            {
+              "dismiss": true
+            }
+          ]
+        },
+        {
+          "text": "Out you come.",
+          "goto": "warn"
+        },
+        {
+          "text": "Wait there."
+        }
+      ]
+    },
+    {
+      "id": "offer",
+      "text": "He does not take the page. He reads it where you hold it, and the ink curls.",
+      "choices": [
+        {
+          "text": "Not yet.",
+          "goto": "greet"
+        }
+      ]
+    },
+    {
+      "id": "refused",
+      "text": "The page blackens from the edges in. \"{tell}\"",
+      "choices": [
+        {
+          "text": "Go back where you came from.",
+          "do": [
+            {
+              "dismiss": true
+            }
+          ]
+        },
+        {
+          "text": "Wait there.",
+          "goto": "greet"
+        }
+      ]
+    },
+    {
+      "id": "warn",
+      "text": "\"You may. Look at your circle first, and then at me.\" {tell}",
+      "choices": [
+        {
+          "text": "Out you come.",
+          "do": [
+            {
+              "release": true
+            }
+          ]
+        },
+        {
+          "text": "No. Stay there.",
+          "goto": "greet"
+        }
+      ]
+    }
+  ]
+}

@@ -13,8 +13,12 @@
   "power": 20,
   "//gaze": "hold | avert: whether the summoner must meet his eyes or look away while he is in the circle (D3's strain meter).",
   "gaze": "avert",
-  "//resist": "Per channel, against a seal pile's potency (D3: a channel is severed iff potency >= resistance). `move` is the salt loop itself.",
-  "resist": { "move": 0, "cast_out": 12, "blink": 10, "touch": 8 },
-  "//schemes": "The tricks he knows (D6's assets/demons/schemes.json): an imp knows few.",
-  "schemes": ["lava_floor", "lift_then_drop", "gust_at_ring"]
+  "//resist": "Per channel, against a seal pile's potency (D3: a channel is severed iff potency >= resistance). `move` is the salt loop itself. There is no touch channel (D6): salt always stops his claws at the ring.",
+  "resist": { "move": 0, "cast_out": 12, "blink": 10 },
+  "//ironSusceptibility": "D6: iron in the band takes potency x this / 100 off his power while he is contained (seals.json weakenCapPct caps it). A 3x3+1 iron pile (potency 10) -> 6: power 20-6.",
+  "ironSusceptibility": 60,
+  "//motive": "D6 (game/demon_malice.h): 0..100 each. malice -- how much hurting you is worth to him; cunning -- how much more the indirect way is worth (and which schemes he thinks of: schemes.json minCunning); spite -- how much being hurt sharpens the malice; literalism -- how readily he counts a duty's loophole as doing it. A petty imp: he will not claw you for nothing (claw 15 < comply 40), he will put lava under you if nothing forbids it (57), and he will claw you happily if that gets him sent home.",
+  "motive": { "malice": 60, "cunning": 40, "spite": 50, "literalism": 70 },
+  "//schemes": "The tricks he knows (D6's assets/demons/schemes.json): an imp knows few -- the ground under you, a lift and a drop, a gust at his own ring while he is in it -- and his claws.",
+  "schemes": ["lava_floor", "lift_then_drop", "gust_at_ring", "claw"]
 }

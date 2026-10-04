@@ -131,6 +131,18 @@ struct Pact {
   bool gotoLatched = false;     // a goto's arrival fired this trip
   // ---- penalties found by the fence, applied next tick ----
   int pendingPenalty = -1;
+  // ---- D6: what the malice layer (demon_malice.h) asks of the duties ----
+  uint64_t sanctionTarget = 0;  // an actor the demon has CHOSEN to strike this tick (still
+                                // filtered by every forbid; a penalty still fires)
+  uint8_t fetchTwist = 0;       // 0 honest, 1 ONTO: deliver the fetched matter onto the summoner
+  int32_t carried = 0;          // ONTO: cells taken (conditional clears), to be put down
+  uint32_t carryWord = 0;       // ...as this word
+  // ONTO: cells cleared in the last few ticks (the snapshot is 4 ticks behind:
+  // a cell just cleared still reads full, and taking it twice would put down
+  // matter nobody picked up).
+  std::vector<std::pair<IVec3, uint32_t>> ontoTaken;
+  float summonerHp = -1.0f;     // the outcome clause: the summoner's life last tick
+  uint32_t harmFired = 0;       // outcome clauses fired
   // ---- telemetry (the gate, the HUD) ----
   uint32_t blowsAllowed = 0, blowsForbidden = 0, blowsUnsanctioned = 0;
   uint32_t blowsAtSummoner = 0;   // ASKED at the summoner (every one refused)
@@ -182,6 +194,7 @@ struct TalkWorld {
   struct Stats {
     uint64_t talks = 0, presented = 0, bound = 0, refused = 0, released = 0;
     uint64_t dismissed = 0, expired = 0, destroyed = 0, restored = 0, restoreLost = 0;
+    uint64_t penaltyDismissed = 0, freeActs = 0;   // D6
   } stats;
 };
 
@@ -198,6 +211,19 @@ void TalkPreTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t t
 // fetch (its scoop ops into `out`), the panel's mirror.
 void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick,
                   OpBatch& out);
+
+// ---- for the malice layer (D6, game/demon_malice.h) ------------------------------------
+
+// This tick's actors (ContractTick builds them whenever a demon is held or bound).
+const std::vector<ActorView>& ActorsOf(TickAuthorityCtx& w);
+// Is actor `a` in selector `sel`, evaluated for this demon (me = its summoner,
+// self = the demon)? `failClosed`: a selector the per-demon budget cannot
+// finish answers yes (a prohibition holds).
+bool InSet(TickAuthorityCtx& w, const LiveDemon& ld, const contract::Selector& sel,
+           const ActorView& a, bool failClosed);
+// The footprint facts a kit spell's tags give, seen from an actor that is (or
+// is not) the cast's target, `distM` metres from the footprint's edge.
+contract::FootFacts FactsOf(const KitTags& tags, bool hasActor, bool isTarget, float distM);
 
 // Mana the bound demons of `session` reserve (session.cpp adds it to the
 // spells' reservation).
@@ -219,7 +245,9 @@ bool PactAllowBlow(DemonWorld& d, LiveDemon& ld, uint64_t targetId);
 // predicate (fail closed). Not a demon / no pact: true.
 bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId,
                  const KitTags* tags = nullptr);
-// Does a forbid-cast clause's tag predicate hold for these tags?
+// Does a forbid-cast clause's tag predicate hold for these tags (seen from the
+// cast's target)? D5's colon forms and D6's footprint predicates (contract.h).
+// An unreadable predicate holds (fail closed).
 bool CastTagMatches(const std::string& pred, const KitTags* tags);
 
 // Bind attempt (what TB_DEMON_PRESENT runs; public for the gate).

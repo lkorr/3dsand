@@ -21,6 +21,17 @@
       "Open the circle, little summoner. Let us meet properly." ] }
   ],
   "demons": {
+    "vathrael": [
+      { "minMargin": 0, "lines": [
+        "Well drawn. It would not have mattered." ] },
+      { "minMargin": -200, "lines": [
+        "Your circle is a courtesy, summoner. I am observing it. For now.",
+        "Iron. Sulfur. Candles. You have read a book. I wrote the first one." ] },
+      { "minMargin": -100000, "lines": [
+        "Let me out and you will learn the difference between a ring and a wall.",
+        "Count your salt again. It will not come to me. Nothing you own comes to me.",
+        "Speak, and be brief. When you open this door, you will not close it." ] }
+    ],
     "skerrick": [
       { "minMargin": 30, "lines": [
         "Skerrick is good. Skerrick is very good. Look how good.",
