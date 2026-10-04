@@ -172,6 +172,11 @@ class Simulation {
   // recorded). Call before the tick's encoder exists (a deferred WriteBuffer
   // drains at the head of the NEXT command buffer). Returns the count taken.
   uint32_t PrepareElecQueries(const rhi::Queue& queue, const std::vector<ElecQuery>& boxes);
+  // THE FAST PATH (wave 2): can the field hold charge this tick
+  // (World::ElecMayBeLive)? False = no elec row records (Cond::Elec,
+  // Cond::ElecR1..7), whatever the CA does. SubmitTick sets it every tick,
+  // after it has seen the tick's op list.
+  void SetElecLive(bool live) { elecLive_ = live; }
   // The cell the F1 readout asks about (the player's feet); heatRelax copies
   // that block's X / X* / sources into heatMeta's probe words. Render-side
   // input: it changes no heat value, only which one is reported.
@@ -892,6 +897,7 @@ class Simulation {
   uint32_t elecHdr_[kEpHdrWords] = {};
   bool elecHdrValid_ = false;
   uint32_t elecRounds_ = 1;
+  bool elecLive_ = true;       // SetElecLive: the elec rows record this tick
   // E2's material-table facts for the header (UploadTables latches them, a
   // reload re-latches and invalidates elecHdr_): the "electric" tag bit, and
   // the crackle tiers' materials (`spark`, `arc`) with their own sources.

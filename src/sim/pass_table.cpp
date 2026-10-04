@@ -244,6 +244,7 @@ namespace {
 #define C_DRAFTALL   Cond::DraftAll
 #define C_DRAFTDIRTY Cond::DraftDirty
 #define C_DRAFT      Cond::Draft
+#define C_ELEC       Cond::Elec
 #define C_ELECR1     Cond::ElecR1
 #define C_ELECR2     Cond::ElecR2
 #define C_ELECR3     Cond::ElecR3

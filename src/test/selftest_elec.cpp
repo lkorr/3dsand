@@ -13,10 +13,13 @@
 //                  B  two wood strips behind a one-cell copper electrode, one
 //                     dry and one under a full water coat: the wet strip must
 //                     carry charge further than the dry one, and the dry one
-//                     at most `elec.dryReachMax` cells (resist 60 vs 200).
+//                     at most `elec.dryReachMax` cells (since wave 2 dry wood
+//                     is 1,500 against the spark's 200: none at all).
 //                  C  a 32 x 32 water pool two cells deep, the electrode in one
 //                     corner: at least `elec.waterChargedMin` water cells
-//                     charged, and the far corner (Manhattan 61) never.
+//                     charged, and the far corner (Manhattan 61) never (since
+//                     wave 2 the spreading loss holds a spark to ~a dozen
+//                     cells of a pool).
 //                Then the sparks stop: every page must be freed within
 //                `elec.fadeTicksMax` ticks, and after `elec.settleTicks` more
 //                at most `elec.awakeMax` chunks may be awake. No refusal, no
@@ -380,7 +383,7 @@ Status GateElecField(Ctx& c, std::string& detail) {
   const bool reached = a.arrival > 0 && a.arrival <= bound && a.farP > 0;
   const bool falls = a.nonMonotone == 0 && a.nearP > a.farP;
   const bool confined = a.airMax == 0 && a.floorMax == 0;
-  const bool wet = a.dryReach >= 1 && a.dryReach <= dryMax && a.wetReach > a.dryReach;
+  const bool wet = a.dryReach <= dryMax && a.wetReach > a.dryReach;
   const bool pool = a.waterCharged >= waterMin && a.cornerP == 0;
   const bool freed = a.fadeTick > 0;
   const bool idle = a.awake <= awakeMax;

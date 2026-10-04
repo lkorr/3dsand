@@ -1876,6 +1876,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       src = world.IsElecSourceMat(spawns[i].payload & 0xFFFu);
     if (src) world.NoteElecSourceOp(tick);
   }
+  // THE CHARGE FIELD'S FAST PATH (wave 2): the elec rows record only while
+  // the field can hold charge -- the same latch, now that it has seen this
+  // tick's ops (World::ElecMayBeLive; pass_table.h Cond::Elec).
+  sim.SetElecLive(world.ElecMayBeLive(tick));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
   if (!exps.empty())

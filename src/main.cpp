@@ -10419,6 +10419,10 @@ int main(int argc, char** argv) {
   if (netRoleBoot != NetRole::None) tickCtx.opsync = &opsync;
   // ...and the convergence half, which phase B drains before stream.Update.
   if (netRoleBoot != NetRole::None) tickCtx.chunksync = &chunksync;
+  // STORMS ROLL PER PLAYER (session.cpp DecideWeatherStrike): this machine's
+  // session 0 is the client's net player 1, so its rolls differ from the
+  // host's instead of striking on the same ticks.
+  tickCtx.strikes.playerIdBase = netRoleBoot == NetRole::Client ? 1u : 0u;
   // ---- M9.3-C: THE SMOKE'S DELIBERATE DIVERGENCE (NetSmokeDrift) --------
   //
   // Bound only when the switch is set AND this is a --frames harness run, so
@@ -12322,6 +12326,10 @@ int main(int argc, char** argv) {
     {
       const Tuning::Player& tp = CurrentTuning().player;
       const bool eDown = captured && key(GLFW_KEY_G);
+      // STUNNED (Mob::Stunned, the shock): the press is spent -- no take, no
+      // new grab, no throw wind-up -- the same way the tick zeroes the
+      // command's buttons. What is already carried stays carried.
+      if (avatar.Spawned() && avatar.Stunned(tick)) eGrabbed = true;
       const bool throwable = [&] {
         if (ui.tool != UIState::kToolMelee) return false;
         for (int hk = 0; hk < kHands; hk++) {
@@ -13577,7 +13585,11 @@ int main(int argc, char** argv) {
     {
       const bool qDown = captured && gameKeys && key(GLFW_KEY_Q);
       const bool eDown = captured && gameKeys && key(GLFW_KEY_E);
-      const bool qPress = eQ.Pressed(qDown), ePress = eE.Pressed(eDown);
+      // A stunned body equips nothing (the edge is still consumed, so the
+      // key does not fire the moment the stun ends).
+      const bool stunnedNow = avatar.Spawned() && avatar.Stunned(tick);
+      const bool qPress = eQ.Pressed(qDown) && !stunnedNow,
+                 ePress = eE.Pressed(eDown) && !stunnedNow;
       for (int pass = 0; pass < 2; pass++) {
         const bool press = pass == 0 ? ePress : qPress;
         if (!press) continue;
@@ -14211,22 +14223,35 @@ int main(int argc, char** argv) {
       // lightning glyph -- lights the deck over it (weather::NoteStrike,
       // render-only) and claps, delayed by distance (Cues::Thunder). A shock
       // (no bolt) is too small for either. Bounded by the tick's own cap.
+      // Every emitted strike also CRACKLES at its foot (Cues::Zap, the
+      // shock glyph's burst included); a peer's bolt (ev.remote, announced
+      // from the merged ops) flashes and claps like this machine's own.
       for (const auto& ev : tickCtx.strikes.events) {
         if (!ev.emitted || ev.cells == 0) continue;
         // THE BOLT ITSELF (sim/boltfx.h, electricity wave 2 package D): the
         // plan's channel, forks and splash drawn as a luminous branching bolt
         // that lights the scene, on the render clock. Render-only.
-        boltfx::NoteStrike(ev.paths, (float)now,
+        // A PEER's bolt (ev.remote) carries no plan: its channel is a column
+        // up from the foot, which the bolt jags like any other.
+        std::vector<StrikePath> remotePath;
+        if (ev.remote && ev.paths.empty()) {
+          StrikePath ch;
+          for (int k = 48; k >= 0; k--) ch.cells.push_back({ev.foot.x, ev.foot.y + k, ev.foot.z});
+          remotePath.push_back(std::move(ch));
+        }
+        boltfx::NoteStrike(remotePath.empty() ? ev.paths : remotePath, (float)now,
                            ev.tick * 0x9E3779B9u ^ (uint32_t)(ev.target.x * 73856093) ^
                                (uint32_t)(ev.target.z * 19349663));
         const Vec3 at{(float)ev.foot.x + 0.5f, (float)ev.foot.y + 0.5f,
                       (float)ev.foot.z + 0.5f};
-        if (ev.weather || ev.foot.x != ev.target.x || ev.foot.y != ev.target.y ||
-            ev.foot.z != ev.target.z) {
+        const bool bolt = ev.weather || ev.foot.x != ev.target.x ||
+                          ev.foot.y != ev.target.y || ev.foot.z != ev.target.z;
+        if (bolt) {
           weather::NoteStrike(ev.tick, at.x * kVoxelMeters, at.y * kVoxelMeters,
                               at.z * kVoxelMeters);
           audioCues.Thunder(at, earPos);
         }
+        audioCues.Zap(at, ev.weather ? 1.0f : bolt ? 0.8f : 0.5f);
       }
       tickCtx.strikes.events.clear();
       if (audioCues.Enabled()) {
@@ -14454,6 +14479,14 @@ int main(int argc, char** argv) {
                              ve.posVoxel, ve.intensity, ve.mobId);
         }
 
+        // Bodies that took current since the last frame (ApplyShocks): the
+        // buzz at the limb, the player's own never held back.
+        {
+          const uint64_t meId = avatar.Spawned() ? avatar.Id() : 0;
+          for (const MobSystem::ShockCue& sc : mobs.ShockCues())
+            audioCues.Shock(sc.posVoxel, sc.intensity, meId != 0 && sc.mobId == meId);
+        }
+
         // Wounds still pumping. Reported every frame while they bleed; the
         // audio layer starts, tracks and reaps the loop from that alone, so
         // nothing here has to remember a handle.
@@ -14502,6 +14535,7 @@ int main(int argc, char** argv) {
       debris.ClearImpactEvents();
       mobs.ClearSeverEvents();
       mobs.ClearVoiceEvents();
+      mobs.ClearShockCues();
       mobs.ClearStrikeEvents();
       debris.ClearGoreEvents();
       // OUTSIDE the audio block, exactly like the queues above and for the

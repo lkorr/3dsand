@@ -177,13 +177,15 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::DraftDirty:    return cx.draftOn && !cx.draftRebuild && cx.caActive;
     case pass::Cond::Draft:         return cx.draftOn && (cx.draftRebuild || cx.caActive);
     // The charge field's round k (k >= 1): only while k < this tick's rounds.
-    case pass::Cond::ElecR1:        return cx.caActive && cx.elecRounds > 1;
-    case pass::Cond::ElecR2:        return cx.caActive && cx.elecRounds > 2;
-    case pass::Cond::ElecR3:        return cx.caActive && cx.elecRounds > 3;
-    case pass::Cond::ElecR4:        return cx.caActive && cx.elecRounds > 4;
-    case pass::Cond::ElecR5:        return cx.caActive && cx.elecRounds > 5;
-    case pass::Cond::ElecR6:        return cx.caActive && cx.elecRounds > 6;
-    case pass::Cond::ElecR7:        return cx.caActive && cx.elecRounds > 7;
+    // Wave 2's fast path: none of it while the field cannot hold charge.
+    case pass::Cond::Elec:          return cx.caActive && cx.elecLive;
+    case pass::Cond::ElecR1:        return cx.caActive && cx.elecLive && cx.elecRounds > 1;
+    case pass::Cond::ElecR2:        return cx.caActive && cx.elecLive && cx.elecRounds > 2;
+    case pass::Cond::ElecR3:        return cx.caActive && cx.elecLive && cx.elecRounds > 3;
+    case pass::Cond::ElecR4:        return cx.caActive && cx.elecLive && cx.elecRounds > 4;
+    case pass::Cond::ElecR5:        return cx.caActive && cx.elecLive && cx.elecRounds > 5;
+    case pass::Cond::ElecR6:        return cx.caActive && cx.elecLive && cx.elecRounds > 6;
+    case pass::Cond::ElecR7:        return cx.caActive && cx.elecLive && cx.elecRounds > 7;
     // The body query (package E4): boxes this tick, whatever the CA did.
     case pass::Cond::ElecQuery:     return cx.elecQueries > 0;
   }

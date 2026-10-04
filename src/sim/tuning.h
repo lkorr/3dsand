@@ -2517,6 +2517,12 @@ struct Tuning {
     int elecDecayShift = TPD(sim, elecDecayShift);
     // Resist of a cell under a full conducting coat (water); thinner = worse.
     int elecWetResist = TPD(sim, elecWetResist);
+    // THE SPREADING LOSS (wave 2): a cell with more than elecSpreadFree
+    // conducting face neighbours loses (n - free) x elecSpreadLoss / 4096 of
+    // the potential it receives, so charge stays local in bulk (a pond, the
+    // sea, rain-wet ground) and still runs down a wire. src/sim/elec.h.
+    int elecSpreadLoss = TPD(sim, elecSpreadLoss);
+    int elecSpreadFree = TPD(sim, elecSpreadFree);
     // E2 (sim_step.wgsl): P at which a cell counts as touching a discharge for
     // its tag:electric rules, and the P at which those fire at full chance.
     int elecReactMin = TPD(sim, elecReactMin);

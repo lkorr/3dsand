@@ -5048,13 +5048,27 @@ class World {
   }
   static constexpr size_t kElecHitsPendingMax = 4 * kElecQueryMax;
   // CAN THE FIELD HOLD CHARGE AT `tick`? The body query is recorded only
-  // when it can (rule 2: a world with no charge pays nothing). Two inputs,
-  // both pure functions of the tick stream: a SOURCE op (a material with
-  // electric.source, SubmitTick's NoteElecSourceOps) in the last
-  // kSnapshotLatency + 2 ticks, which covers the latency before the field it
-  // lit is visible -- or pages in use in the published snapshot.
+  // when it can (rule 2: a world with no charge pays nothing), and since wave
+  // 2 so are the field's own rows (Simulation::SetElecLive, pass_table.h
+  // Cond::Elec: ~15 passes and their barriers on every CA-active tick of a
+  // world with no charge). Three inputs, all pure functions of the tick
+  // stream: a SOURCE op (a material with electric.source, SubmitTick's
+  // NoteElecSourceOps) in the last kSnapshotLatency + 2 ticks, which covers
+  // the latency before the field it lit is visible; pages in use in the
+  // published snapshot; or a DOORBELL RING (elecMeta kEmDoorbells moved) in a
+  // snapshot published in the last kSnapshotLatency + 2 ticks -- a source
+  // standing in the window that no op of the window's lifetime laid (a loaded
+  // save's spark, a chunk the pool refused). The snapshot is fixed-latency
+  // (Snap() is tick - kSnapshotLatency, exactly), so the latch is a pure
+  // function of the tick and the op list.
+  //
+  // What a false latch costs: nothing runs, and nothing is lost -- a want bit
+  // the doorbell set stays set until the rows next run, so a ring delays its
+  // page by at most kSnapshotLatency ticks (deterministically). A field with
+  // pages is always latched: they are in the snapshot.
   bool ElecMayBeLive(uint32_t tick) const {
     if (elecSourceSeen_ && tick <= elecSourceTick_ + kSnapshotLatency + 2u) return true;
+    if (elecRingSeen_ && tick <= elecRingTick_ + kSnapshotLatency + 2u) return true;
     return snap_.valid && snap_.elec[kEmNextFresh] > snap_.elec[kEmFreeTop];
   }
   // The material table's sources (Simulation::UploadTables) and the latch.
@@ -5500,7 +5514,7 @@ class World {
   // THE CHARGE FIELD (src/sim/elec.h). GPU-owned, transient; all zero = no
   // charge anywhere, which is what the worldgen and load-reset fill rows
   // leave. Not hashed, not saved.
-  rhi::Buffer elecPool;    // kElecPoolPages * kElecPageWords u32
+  rhi::Buffer elecPool;    // kElecPoolWords u32 (pages, then the cell cache + stamps)
   rhi::Buffer elecMeta;    // kEmWords u32
   rhi::Buffer elecArgs;    // kElecArgsBytes -- indirect-only copy of elecMeta[kEmArgs..]
   rhi::Buffer dirty[2];    // kNumChunks u32
@@ -5863,6 +5877,10 @@ class World {
   std::vector<uint8_t> elecSourceMat_;
   bool elecSourceSeen_ = false;
   uint32_t elecSourceTick_ = 0;
+  // The doorbell rings the publish has seen (snap_.elec[kEmDoorbells]) and the
+  // tick a new one was published on (ElecMayBeLive).
+  bool elecRingSeen_ = false;
+  uint32_t elecRingCount_ = 0, elecRingTick_ = 0;
   uint64_t elecQueriesAsked_ = 0, elecQueryRefused_ = 0;
   uint64_t elecHitsDelivered_ = 0, elecHitsCharged_ = 0;
   // Bumped by InvalidateSnapshot and by a TICK REWIND (a harness scene

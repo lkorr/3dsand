@@ -1266,8 +1266,15 @@ struct SpellStrike {
   int32_t x = 0, y = 0, z = 0;
   int32_t glyph = -1;
   int32_t scaleMille = 1000;
+  // The effect's strength (0..1000) where it resolved: scales the bolt
+  // (game/lightning.h StrikeSpecFromGlyph), so a spent carrier strikes weaker.
   int32_t strengthMille = 1000;
   uint32_t salt = 0;
+  // What this strike's effect added to the cast's price (EffectTariffIn, the
+  // same number PriceCast summed): refunded to the caster's mana when the
+  // tick's strike budget refuses the bolt (CLAUDE.md: a refused op costs
+  // nothing). The words are not refunded -- they were spoken.
+  int32_t tariff = 0;
 };
 
 // Everything a spell may emit, in one bundle. The VM appends here and NOWHERE
@@ -1393,6 +1400,11 @@ class SpellSystem {
   int FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
                     std::vector<ParticleSpawn>& spawns, std::vector<WindPrim>& winds,
                     std::vector<SpellStrike>* strikes = nullptr) const;
+  // Does a ward refuse a strike at this cell? FilterStreams asks at the AIM;
+  // the owner asks again at the cell the target search actually struck (and
+  // the cell the bolt arrives in), because the search moves the bolt up to
+  // kStrikeMaxSearch cells and a ward's edge may lie in between.
+  bool StrikeWarded(int32_t x, int32_t y, int32_t z) const;
 
   void Clear() {
     live_.clear();

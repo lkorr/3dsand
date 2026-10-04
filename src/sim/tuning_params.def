@@ -830,6 +830,16 @@ TP_I(sim, elecDecayShift, NO_WGSL, 3, 0, 15)
 // 15). A thinner coat is proportionally worse (resist x 15 / amount). A wet
 // plank (60 dry) or wet stone (an insulator dry) carries charge through it.
 TP_I(sim, elecWetResist, NO_WGSL, 12, 1, 254)
+// THE SPREADING LOSS (wave 2, 2026-10-04; src/sim/elec.h): the share of the
+// arriving potential a cell loses on entry, in 1/4096, per CONDUCTING face
+// neighbour past elecSpreadFree -- the current divides in bulk. 150 (~3.7%):
+// lightning into the sea charges ~33 cells out (P >= 20, a wet body's shock,
+// to ~31), rain-wet ground ~25, a spark ~a dozen cells of a pool; a wire loses
+// nothing, so copper still crosses the window. elec-bulk pins it.
+TP_I(sim, elecSpreadLoss, NO_WGSL, 150, 0, 1023)
+// The conducting neighbours a cell may have before it pays the spreading loss:
+// 2 = a wire (in and out) is free, a sheet (4) pays twice, bulk (6) four times.
+TP_I(sim, elecSpreadFree, NO_WGSL, 2, 0, 6)
 // WHAT CHARGE DOES IN THE CA (package E2, sim_step.wgsl; DESIGN.md
 // "Electricity -- charge field"). All NO_WGSL, uploaded by PrepareElec into
 // the elecParams header beside the field's own knobs.
