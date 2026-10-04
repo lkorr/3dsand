@@ -21,6 +21,7 @@ player gate.
 | E4 | Shocks reach bodies: elecQuery, `DamageCause::Electric`, stun / twitch / knock-down / ignite, gates `elec-water-mob`, `elec-stun`, `elec-replay` | f376cd6 |
 | E2 | What charge does in the CA: charge as partner, ohmic ignition / char, crackle, gates `elec-electrolysis`, `elec-ignite`, `elec-crackle-bounded` | ecbfdd6 (main at e772227) |
 | Endgame | Proportional decay (`sim.elecDecayShift`), gate `elec-player-stun`, the ops-replay reporter fix | branch `worktree-agent-a73d261dd6db03139` |
+| Wave 2 E | Gameplay (docs/PLAN_electricity_wave2.md E): strikes scan from the real top (aim + 272) and skip columns entered from inside; spell strikes seek past the mirror after an 8-tick stepped leader; wards re-checked at the struck cell; strength scales the bolt; a budget-refused strike refunds its tariff; storms roll per player id; peer bolts flash + clap; stun refuses Q/E/G (talk kept); `Cues::Zap` / `Cues::Shock` + PLACEHOLDER takes (`scripts/gen_elec_sounds.py`, incl. weather/thunder); pixel STUNNED cue; gate `elec-strike-play` | worktree branch (package E) |
 
 **Decay (endgame).** A stored P now loses `max(sim.elecDecay, P >>
 sim.elecDecayShift)` a tick (8 and 3), taken off the whole stored field --
