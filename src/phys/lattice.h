@@ -64,20 +64,62 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
     // look bloodied.
     uint16_t stain = 0;
   };
-  std::unordered_map<uint64_t, Blk> blocks;
+  // ---- A FLAT LATTICE, NOT A HASH MAP (PLAN_fight64_perf Q2) ---------------
+  //
+  // The blocks used to live in an unordered_map keyed on the packed block
+  // coordinate, and every blade carve re-derives a limb's collider through
+  // here: in the 64-creature brawl the map's node allocations and probes were
+  // ~1.8 ms of the ~5 ms carve. The block lattice is bounded (<= 128 a side,
+  // the DebrisVoxel range) and a limb's is small, so it is a dense index over
+  // the blocks' own bounding box -- one int32 per block cell, -1 = no block --
+  // pointing into a packed list of the blocks actually touched. Both live in
+  // thread-local scratch (carves run on the mob work pool), reused across
+  // calls, so the steady state allocates only the returned vector.
+  //
+  // THE OUTPUT ORDER IS NOW THE LATTICE'S (z, then y, then x), where it was the
+  // hash map's bucket order. Same voxel SET, same per-block answer; only the
+  // order of the collider list moved -- which reorders the greedy box merge's
+  // walk, so a carved limb's compound can come out as a different (equally
+  // exact) box set and the world hash moves with it. Lattice order is also the
+  // first order this list has had that is a property of the shape rather than
+  // of a container's internals.
+  struct Scratch {
+    std::vector<int32_t> at;   // dense block index -> blocks[], -1 = none
+    std::vector<Blk> blocks;
+  };
+  thread_local Scratch sc;
   bool over = false;
+  // Pass 1: the block bounding box (in-range blocks only).
+  int lo[3] = {128, 128, 128}, hi[3] = {-1, -1, -1};
   for (const PrefabVoxel& v : src) {
     const int bx = (int)v.x / s, by = (int)v.y / s, bz = (int)v.z / s;
     if (bx < 0 || by < 0 || bz < 0 || bx > 127 || by > 127 || bz > 127) {
       over = true;
       continue;
     }
-    // 21 bits per axis. The index is bounded at 127 above, but keeping the
-    // fields wide means a future bound change cannot alias two blocks onto one
-    // key the way a packed-byte key would.
-    uint64_t key = ((uint64_t)bx << 42) | ((uint64_t)by << 21) | (uint64_t)bz;
+    lo[0] = std::min(lo[0], bx); hi[0] = std::max(hi[0], bx);
+    lo[1] = std::min(lo[1], by); hi[1] = std::max(hi[1], by);
+    lo[2] = std::min(lo[2], bz); hi[2] = std::max(hi[2], bz);
+  }
+  if (overflow) *overflow = over;
+  std::vector<DebrisVoxel> out;
+  if (hi[0] < 0) return out;
+  const int ex = hi[0] - lo[0] + 1, ey = hi[1] - lo[1] + 1, ez = hi[2] - lo[2] + 1;
+  const size_t cells = (size_t)ex * ey * ez;
+  sc.at.assign(cells, -1);
+  sc.blocks.clear();
+  // Pass 2: vote.
+  for (const PrefabVoxel& v : src) {
+    const int bx = (int)v.x / s, by = (int)v.y / s, bz = (int)v.z / s;
+    if (bx < 0 || by < 0 || bz < 0 || bx > 127 || by > 127 || bz > 127) continue;
+    int32_t& slot =
+        sc.at[((size_t)(bz - lo[2]) * ey + (size_t)(by - lo[1])) * ex + (size_t)(bx - lo[0])];
+    if (slot < 0) {
+      slot = (int32_t)sc.blocks.size();
+      sc.blocks.emplace_back();
+    }
     const uint32_t pair = (uint32_t)v.material | ((uint32_t)v.color << 16);
-    Blk& blk = blocks[key];
+    Blk& blk = sc.blocks[(size_t)slot];
     blk.count++;
     int k = 0;
     for (; k < blk.n; k++)
@@ -86,19 +128,23 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
     if (k < kMaxDistinct) blk.hits[k]++;
     if (BodyStainAmt(v.stain) > BodyStainAmt(blk.stain)) blk.stain = v.stain;
   }
-  if (overflow) *overflow = over;
-
-  std::vector<DebrisVoxel> out;
-  out.reserve(blocks.size());
-  for (const auto& [key, blk] : blocks) {
-    if (blk.count * 2 < full) continue;  // majority-fill: mostly air -> air
-    int best = 0;
-    for (int k = 1; k < blk.n; k++)
-      if (blk.hits[k] > blk.hits[best]) best = k;
-    out.push_back({(int8_t)((key >> 42) & 0x1FF), (int8_t)((key >> 21) & 0x1FF),
-                   (int8_t)(key & 0x1FF), (uint8_t)(blk.pair[best] >> 16),
-                   (uint16_t)(blk.pair[best] & 0xFFFFu), blk.stain});
-  }
+  // Pass 3: emit in lattice order.
+  out.reserve(sc.blocks.size());
+  size_t i = 0;
+  for (int z = 0; z < ez; z++)
+    for (int y = 0; y < ey; y++)
+      for (int x = 0; x < ex; x++, i++) {
+        const int32_t slot = sc.at[i];
+        if (slot < 0) continue;
+        const Blk& blk = sc.blocks[(size_t)slot];
+        if (blk.count * 2 < full) continue;  // majority-fill: mostly air -> air
+        int best = 0;
+        for (int k = 1; k < blk.n; k++)
+          if (blk.hits[k] > blk.hits[best]) best = k;
+        out.push_back({(int8_t)(x + lo[0]), (int8_t)(y + lo[1]), (int8_t)(z + lo[2]),
+                       (uint8_t)(blk.pair[best] >> 16),
+                       (uint16_t)(blk.pair[best] & 0xFFFFu), blk.stain});
+      }
   return out;
 }
 

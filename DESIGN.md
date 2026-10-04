@@ -12185,11 +12185,20 @@ game falls behind 30 Hz into catch-up frames. Bodies are not the render cost:
 `drawMicro` ~1.3 ms GPU on frames it runs, the instance build ~0.1 ms CPU; the
 micro brick pool re-uploads ~0.5 MiB a frame in a fight.
 
-**Left** (serial floors): blade carves ~5 ms (`DownsampleSkin`'s hash map is
-~1.8 ms of it across carve, wound soak and re-blood -- its output ORDER is the
-map's, so a faster version moves the collider order and the hash: a
-phys/lattice.h decision), the burn head under its shared pot ~3.6 ms, the shock
-solve ~2.4 ms.
+**Left** (serial floors): blade carves ~5 ms, the burn head under its shared
+pot ~3.6 ms, the shock solve ~2.4 ms.
+
+**`DownsampleSkin` is a flat lattice (2026-10-04, fight64 package Q).** The
+skin -> collider majority fill (`phys/lattice.h`) kept its blocks in an
+`unordered_map`; it is now a dense int32 index over the blocks' own bounding
+box into a packed block list, both in thread-local scratch (carves run on the
+work pool). Same voxel set and per-block answer; the output is now in LATTICE
+order (z, y, x) instead of the map's bucket order, so a re-derived collider's
+greedy box merge can pick a different, equally exact box set -- a carved
+limb's collider order moved (the `determinism` gate's hash did not; the 64
+brawl's trajectory did). `mob-cap64`: carve 4.30 -> 2.78 ms a tick over the
+same ~3,090 carves. Everything else still open, ranked, is in
+docs/PLAN_fight64_perf.md "TBD: 64-body fight performance".
 
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
