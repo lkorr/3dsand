@@ -640,6 +640,12 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
     return o;
   }
   // ---- THE CAST: the player's own Cast(), from this body -------------------------
+  // D5 hook: a BOUND demon's contract may forbid casting at this target. When
+  // D5 (src/game/demon_talk.h) is on main, at exactly this spot:
+  //   if (!demon::AllowCastAt(w, req.mobId, req.targetId))
+  //     return refuse(MobCastOutcome::NothingInRange);   // or a `Forbidden` outcome
+  // Nothing has been emitted yet and no mana spent, so a refusal here costs the
+  // creature only the cadence the AI already spent on the request.
   const Aim a = AimFor(w, *cd.ks, req.mobId, req, cd.list);
   if (!a.ok) return refuse(MobCastOutcome::NothingInRange);
   ProbeCtx pc;

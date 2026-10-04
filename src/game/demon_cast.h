@@ -51,6 +51,10 @@
 // what an instant cast or a resolve would put outside it (its ops, blasts,
 // sprays, the far end of a wind, a push on a body out there).
 //
+// D5 HOOK: a bound demon's contract (demon::AllowCastAt, src/game/
+// demon_talk.h, not on main when this landed) is asked in MobCastServe just
+// before Cast(), at the line marked `// D5 hook`.
+//
 // DETERMINISM: CPU gameplay state in the 30 Hz tick (TickAuthority, right after
 // phase H's mobs.PreTick that issued the requests), integer spell VM, draws by
 // rng::Hash3 on (mob id, tick), voxels read only through the T-4 snapshot
