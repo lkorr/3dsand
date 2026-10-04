@@ -342,6 +342,13 @@ set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
 # replaced by GuardBodyInertia + SweepInsaneVelocities, which report from the
 # engine side and also catch the NaN that Jolt's clamp passes through.
 set(FLOATING_POINT_EXCEPTIONS_ENABLED OFF CACHE BOOL "" FORCE)
+# LINK-TIME OPTIMIZATION IS FOR RELEASES ONLY (2026-10-04). Jolt's option
+# INTERPROCEDURAL_OPTIMIZATION defaults ON: every Jolt TU compiles with /GL and
+# every sandvox.exe link re-runs LTCG codegen for all of Jolt, which is most of
+# a multi-minute link. Our own code never used /GL. `scripts/build.sh --lto`
+# turns it on for a shipping build; iteration builds leave it off.
+option(SANDVOX_LTO "Link-time optimization (Jolt /GL + /LTCG); release builds only" OFF)
+set(INTERPROCEDURAL_OPTIMIZATION ${SANDVOX_LTO} CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   JoltPhysics
