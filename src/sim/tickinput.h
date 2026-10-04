@@ -77,6 +77,11 @@ enum TickButton : uint32_t {
   // talk to a villager, search a chest. An edge, carried with its target so
   // the tick acts on what the HUD prompt promised, not on a re-aimed ray.
   TB_USE = 1u << 15,
+  // RELEASE THE DEMON (docs/PLAN_demons.md D3, game/demon_seals.h): an edge
+  // that lets the presser's most recent CONTAINED demon out of its circle,
+  // weighed there and then -- held iff circle strength >= power + contract
+  // weight, else it overpowers the binding and is loose and hostile.
+  TB_DEMON_RELEASE = 1u << 16,
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
@@ -84,7 +89,8 @@ enum TickButton : uint32_t {
 // 4: dual wielding — TB_ALT is the left hand, per-hand vessel modes.
 // 5: TB_USE + `useRef` (the use verb, PLAN_world_editor.md P1).
 // 6: `talk` (was pad0) — the conversation command (game/dialogue.h).
-constexpr uint32_t kTickInputVersion = 6;   // 2: TB_THROW, 3: TB_APPLY
+// 7: TB_DEMON_RELEASE (demons D3).
+constexpr uint32_t kTickInputVersion = 7;   // 2: TB_THROW, 3: TB_APPLY
 
 // THE CONVERSATION COMMAND (TickInput::talk, game/dialogue.h). A choice made
 // in the conversation panel is a player INPUT like a strike or a use, so it

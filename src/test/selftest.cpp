@@ -989,6 +989,9 @@ const char* const kOrder[] = {
     // containment and the goof. Own pads, IdCounterScope, a pinned clear sky,
     // regenerates on the way out.
     "demon-circle",
+    // Demons D3: seal piles cut channels, circle strength, release, gaze.
+    // Same discipline as demon-circle.
+    "demon-seals",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

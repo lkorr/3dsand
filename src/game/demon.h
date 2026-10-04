@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "game/demon_circle.h"
+#include "game/demon_seals.h"
 #include "math3d.h"
 
 struct TickAuthorityCtx;
@@ -66,6 +67,7 @@ struct DemonDef {
   std::string gaze = "avert";   // "hold" | "avert" (D3)
   std::vector<std::pair<std::string, int32_t>> resist;  // channel -> resistance (D3)
   std::vector<std::string> schemes;                     // scheme names (D6)
+  std::string released;    // behaviour profile after a HELD release (D3; D5's contract replaces it)
 };
 
 struct DemonCircleCfg {
@@ -82,6 +84,7 @@ struct DemonCircleCfg {
 struct DemonLibrary {
   std::vector<DemonDef> defs;
   DemonCircleCfg circle;
+  demon::SealLib seals;    // seals.json + tells.json (D3, game/demon_seals.h)
   const DemonDef* Find(const std::string& id) const {
     for (const DemonDef& d : defs)
       if (d.id == id) return &d;
@@ -98,7 +101,9 @@ bool DebugAllDemonNames();
 
 // ---- the world's demons ---------------------------------------------------------
 
-enum class DemonState : uint8_t { Contained = 0, Unbound };
+// Released (D3): let out of the circle by the summoner and the binding HELD
+// (strength >= power + weight). D5 makes that "serving under a contract".
+enum class DemonState : uint8_t { Contained = 0, Unbound, Released };
 const char* DemonStateName(DemonState s);
 
 struct LiveDemon {
@@ -111,6 +116,7 @@ struct LiveDemon {
   uint32_t spawnTick = 0, stateTick = 0, lastCheck = 0;
   uint32_t movesRefused = 0, blowsRefused = 0;
   std::string why;          // why this state (the HUD / the gate)
+  demon::Binding bind;      // seals, strength, gaze, release (D3)
 };
 
 struct PendingSummon {
@@ -171,6 +177,11 @@ void DemonQueueSummon(TickAuthorityCtx& w, std::span<SessionTick> players, int s
 // demons have their circle re-read, the fence is (re)installed, the HUD line
 // is written for each summoner.
 void DemonTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick);
+
+// UNBIND: the demon is loose and hostile, its brain on the summoner (the goof,
+// a broken circle, an overpowered release, a loophole used to leave).
+void DemonUnbind(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
+                 uint32_t tick, const std::string& why);
 
 // The summoning itself, with the stores already holding what it reads: the
 // floor, the circle, the spawn, the verdict. What DemonTick runs for a due

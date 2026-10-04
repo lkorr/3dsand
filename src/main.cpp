@@ -7509,6 +7509,8 @@ int main(int argc, char** argv) {
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
   // that hotbar slot; an empty selected slot takes the hand's item back).
   KeyEdge eQ, eE;
+  // RELEASE THE DEMON (demons D3): Y, while your demon is contained.
+  KeyEdge eY;
   // THE CONVERSATION KEYS (game/dialogue.h): 1-9 answer, Space/Enter
   // continue. Their own edges: the number row's other bindings are gated off
   // while the panel is up, and a held key must answer once.
@@ -12395,6 +12397,10 @@ int main(int argc, char** argv) {
     if (captured && ui.devControls && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
     if (captured && ui.devControls && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
     if (captured && ui.devControls && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
+    // Y lets your contained demon out of its circle (game/demon_seals.h): the
+    // tick weighs the circle's strength against its power there and then.
+    if (eY.Pressed(key(GLFW_KEY_Y)) && captured && ui.demonState == 1)
+      feeder.Press(TB_DEMON_RELEASE);
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
     if (captured && ui.devControls && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;

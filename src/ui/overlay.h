@@ -1570,6 +1570,17 @@ struct UIState {
   int demonState = 0;
   std::string demonName;
   float demonRadiusM = 0.0f;
+  // D3 (game/demon_seals.h FillHud): while CONTAINED with a band reading, the
+  // circle's STRENGTH against the demon's POWER, which channels the seal piles
+  // sever (bit per demon::Channel: move, cast_out, blink, touch), and the gaze
+  // strain (0..1; `demonGazeHold` = the demon wants your eyes, else averted;
+  // `demonGazeBroken` = you are breaking that rule this tick). demonState 3 =
+  // RELEASED (the binding held when you let it out).
+  bool demonHasBinding = false;
+  int demonStrength = 0, demonPower = 0;
+  uint8_t demonSevered = 0;
+  float demonStrain = 0.0f;
+  bool demonGazeHold = false, demonGazeBroken = false;
   // A HELD VESSEL'S MODE, PER HAND (dual wielding; sim/tickinput.h
   // TB_SCOOP/TB_APPLY and their _L twins): 0 pour, 1 scoop, 2 apply. F
   // cycles the vessel in the hand last used; the hand's own button (LMB

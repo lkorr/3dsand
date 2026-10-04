@@ -45,6 +45,10 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
     if (e.is_regular_file() && e.path().extension() == ".json") files.push_back(e.path());
   std::sort(files.begin(), files.end());   // file order is load order: deterministic
   for (const auto& p : files) {
+    if (demon::IsSealFile(p.stem().string())) {   // D3: seals.json, tells.json
+      demon::LoadSealFile(p.string(), p.stem().string(), out.seals, log);
+      continue;
+    }
     json j;
     try {
       std::ifstream f(p);
@@ -71,6 +75,7 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
     d.name = j.value("name", stem);
     d.mob = j.value("mob", std::string());
     d.behavior = j.value("behavior", std::string());
+    d.released = j.value("released", std::string());
     d.tier = std::clamp(j.value("tier", 1), 1, 3);
     d.power = std::max(0, j.value("power", 10));
     d.gaze = j.value("gaze", std::string("avert"));
@@ -93,7 +98,9 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
 }
 
 const char* DemonStateName(DemonState s) {
-  return s == DemonState::Contained ? "contained" : "unbound";
+  return s == DemonState::Contained ? "contained"
+         : s == DemonState::Released  ? "released"
+                                      : "unbound";
 }
 
 // ---- the stores ------------------------------------------------------------------
@@ -228,6 +235,12 @@ bool FenceAllow(void* ctx, uint64_t mobId, MobFence::Kind kind, float fromX, flo
     if (ld.mobId != mobId) continue;
     if (ld.state != DemonState::Contained) return true;
     if (ld.circle.Inside(toX, toZ)) return true;
+    // D3: a blow across the ring is the `touch` channel. Unsevered (not iron
+    // enough for this demon in the band) it is a LOOPHOLE: the claws reach.
+    if (kind == MobFence::Blow && !ld.bind.Severed(demon::Channel::Touch)) {
+      ld.bind.blowsLoophole++;
+      return true;
+    }
     // Knocked out of its circle while contained (a blast, a shove): it may
     // walk back TOWARD the inside, never further out.
     if (kind == MobFence::Move && !ld.circle.Inside(fromX, fromZ)) {
@@ -248,6 +261,18 @@ bool FenceAllow(void* ctx, uint64_t mobId, MobFence::Kind kind, float fromX, flo
 }
 
 }  // namespace
+
+void DemonUnbind(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
+                 uint32_t tick, const std::string& why) {
+  ld.state = DemonState::Unbound;
+  ld.stateTick = tick;
+  ld.why = why;
+  // A released demon going loose gets its hostile profile back.
+  if (const DemonDef* def = w.demons ? w.demons->lib.Find(ld.demon) : nullptr)
+    if (!def->behavior.empty()) w.mobs.SetMobBehavior(ld.mobId, def->behavior);
+  AimAtSummoner(w.mobs, players, ld, tick);
+  std::printf("demons: %s unbound at tick %u: %s\n", ld.name.c_str(), tick, why.c_str());
+}
 
 DemonWorld::~DemonWorld() {
   if (fenced != nullptr && fenced->Fence().ctx == this) fenced->SetFence(MobFence{});
@@ -427,20 +452,20 @@ void DemonTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tic
           ld.circle = std::move(c);
         } else {
           // BROKEN: unbound at once, and it remembers who called it.
-          ld.state = DemonState::Unbound;
-          ld.stateTick = tick;
-          ld.why = std::string("the circle broke (") + CircleVerdictName(c.verdict) + ")";
           d.stats.broken++;
-          AimAtSummoner(w.mobs, players, ld, tick);
-          std::printf("demons: %s's circle broke at tick %u: unbound\n", ld.name.c_str(), tick);
+          DemonUnbind(w, players, ld, tick,
+                      std::string("the circle broke (") + CircleVerdictName(c.verdict) + ")");
         }
       }
     }
-    anyContained = anyContained || ld.state == DemonState::Contained;
     if (keep != i) d.live[keep] = std::move(ld);
     keep++;
   }
   d.live.resize(keep);
+  // ---- D3: release presses, the seal band, the move loophole, gaze, strength --------
+  demon::SealsTick(w, players, tick, probe);
+  for (const LiveDemon& ld : d.live)
+    anyContained = anyContained || ld.state == DemonState::Contained;
   // ---- the fence -------------------------------------------------------------------
   if (anyContained) {
     MobFence f;
@@ -459,11 +484,14 @@ void DemonTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tic
     ui.demonName.clear();
     for (auto it = d.live.rbegin(); it != d.live.rend(); ++it)
       if (it->session == p.s->index) {
-        ui.demonState = it->state == DemonState::Contained ? 1 : 2;
+        ui.demonState = it->state == DemonState::Contained  ? 1
+                        : it->state == DemonState::Released ? 3
+                                                             : 2;
         ui.demonName = it->name;
         ui.demonRadiusM = it->state == DemonState::Contained
                               ? it->circle.radius / (float)kVoxelsPerMetre
                               : 0.0f;
+        demon::FillHud(ui, *it);
         break;
       }
   }
