@@ -16,7 +16,9 @@
 
 export const COND_KINDS = ['flag', '!flag', 'time', 'activity', '!activity',
                            'has', '!has', 'met', '!met'];
-export const ACT_KINDS = ['set', 'add', 'clear', 'give', 'take', 'end'];
+// grant (a glyph by name) and learn (a demon's name -> flag name:<x>): demons D2,
+// game/dialogue.h. The tuner has no glyph list, so a grant is checked by the engine.
+export const ACT_KINDS = ['set', 'add', 'clear', 'give', 'take', 'end', 'grant', 'learn'];
 export const ACTIVITIES = ['sleep', 'work', 'wander', 'socialize', 'eat', 'goto'];
 
 const FILE_KEYS = ['name', 'speaker', 'canLeave', 'notes', 'entry', 'nodes'];
@@ -117,12 +119,15 @@ export function validateAll(files, items) {
         const fi = `${field}[${i}]`;
         const k = actKind(a);
         if (!k || !ACT_KINDS.includes(k)) {
-          P(true, where, fi + (k ? '.' + k : ''), 'unknown action (set, add, clear, give, take, end)', node); return;
+          P(true, where, fi + (k ? '.' + k : ''), 'unknown action (set, add, clear, give, take, end, grant, learn)', node); return;
         }
         const v = a[k];
         if (k === 'end') { if (v !== true) P(true, where, fi + '.end', 'is true', node); return; }
-        if (typeof v !== 'string' || !v) { P(true, where, fi + '.' + k, (k === 'give' || k === 'take') ? 'names an item' : 'names a flag', node); return; }
-        if (k === 'give' || k === 'take') {
+        if (typeof v !== 'string' || !v) { P(true, where, fi + '.' + k, (k === 'give' || k === 'take') ? 'names an item' : k === 'grant' ? 'names a glyph' : k === 'learn' ? 'names a name' : 'names a flag', node); return; }
+        if (k === 'grant' || k === 'learn') {
+          if (k === 'learn' && !written.has('name:' + v)) written.set('name:' + v, `${file} ${where}`);
+          if (a.value !== undefined || a.count !== undefined) P(true, where, fi, k + ' takes no value or count', node);
+        } else if (k === 'give' || k === 'take') {
           if (itemSet && !itemSet.has(v)) P(true, where, fi, `'${v}' is not an item (assets/items/items.json)`, node);
           if (a.value !== undefined) P(true, where, fi + '.value', 'give/take use "count"', node);
           if (a.count !== undefined && (!Number.isInteger(a.count) || a.count < 1)) P(true, where, fi + '.count', 'is a positive integer', node);
@@ -204,6 +209,7 @@ export function knownFlags(files) {
   });
   const scanA = as => (Array.isArray(as) ? as : []).forEach(a => {
     const k = actKind(a); if (['set', 'add', 'clear'].includes(k) && typeof a[k] === 'string') s.add(a[k]);
+    if (k === 'learn' && typeof a[k] === 'string') s.add('name:' + a[k]);
   });
   for (const f of files) {
     const d = f.data; if (!d || d.__error) continue;

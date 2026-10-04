@@ -240,7 +240,8 @@ ImU32 KindColor(const std::string& k) {
   return ui::ColSteel();
 }
 
-const char* kPlaceKinds[] = {"npc", "door", "container", "bed", "marker", "waynode", "structure"};
+const char* kPlaceKinds[] = {"npc", "door", "container", "bed", "marker", "waynode", "structure", "readable"};
+constexpr int kPlaceKindCount = (int)(sizeof kPlaceKinds / sizeof kPlaceKinds[0]);
 const char* kSlotKinds[] = {"door", "bed", "container", "marker", "waynode"};
 
 std::string Tail(const std::string& id) {
@@ -1929,9 +1930,9 @@ void EditorMode::Frame(UIState& ui, float dt, float fovY) {
           ImGui::SetNextItemWidth(-FLT_MIN);
           ImGui::InputText("##grp", p.placeGroup, sizeof p.placeGroup);
           ImGui::SetItemTooltip("refs/<group>.json in this map; ids are <group>/<kind>_<n>");
-          for (int i = 0; i < 7; i++) {
+          for (int i = 0; i < kPlaceKindCount; i++) {
             ImGui::RadioButton(kPlaceKinds[i], &p.placeKind, i);
-            if (i % 3 != 2 && i != 6) ImGui::SameLine();
+            if (i % 3 != 2 && i != kPlaceKindCount - 1) ImGui::SameLine();
           }
           const std::string k = kPlaceKinds[p.placeKind];
           if (k == "npc") {

@@ -39,6 +39,7 @@ void RegisterP1Kinds() {
 
 void RegisterDoorKinds();       // world/refs_doors.cpp (P6)
 void RegisterResidentKinds();   // world/refs_npc.cpp (P7)
+void RegisterReadableKinds();   // world/refs_readable.cpp (demons D2)
 
 void RegisterAllKinds() {
   static bool done = false;
@@ -51,6 +52,7 @@ void RegisterAllKinds() {
   // P4 after P6: a structure derives door/container/bed CHILD refs
   structures::RegisterStructureKinds();   // P4: structure (world/structures.h)
   RegisterResidentKinds();       // P7: npc, waynode
+  RegisterReadableKinds();       // demons D2: readable (a book, a note)
 }
 
 }  // namespace refs

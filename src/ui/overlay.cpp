@@ -2251,6 +2251,15 @@ void Overlay::DrawDevMagic(UIState& s) {
     }
     ImGui::Checkbox("infinite (refill to max every tick)", &s.devManaInfinite);
   }
+  // demons D2 (docs/PLAN_demons.md): a demon's NAME is its summon glyph, and
+  // names are learned (the Harrowby cellar book), not granted at start. This
+  // is the shortcut. Requests only; the tick applies it (session.cpp).
+  if (Section("Dev: demon names", false)) {
+    if (ImGui::Button("learn all demon names", ImVec2(-FLT_MIN, 0))) s.devLearnDemonNames = true;
+    ImGui::SetItemTooltip("grants every summon_<demon> glyph in glyphs.json\n"
+                          "(saved with your kit, like a name read in a book)");
+    if (!s.devDemonNamesStatus.empty()) ImGui::TextWrapped("%s", s.devDemonNamesStatus.c_str());
+  }
   if (Section("Spell")) {
     // THE BRACKET TEXT STAYS: it is what the oracle compares and what a tree
     // is read off; the player-facing surface is the grimoire page's canvas.

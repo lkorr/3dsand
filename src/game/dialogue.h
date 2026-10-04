@@ -47,6 +47,15 @@
 //     {"set": "f"} (=1)  {"set": "f", "value": 3}  {"add": "f", "value": 1}
 //     {"clear": "f"}     {"give": "dagger", "count": 1}
 //     {"take": "dagger", "count": 1}     {"end": true}
+//     {"grant": "summon_skerrick"}  the player now OWNS that glyph (by name,
+//                                   GlyphInventory::Grant; saved with the kit).
+//                                   A name glyphs.json lacks is a load WARNING
+//                                   and a no-op at run time, never an error:
+//                                   a book may name a glyph another package
+//                                   has not shipped yet.
+//     {"learn": "skerrick"}         sets the world flag "name:skerrick" = 1:
+//                                   the player KNOWS that name (a condition
+//                                   reads it as {"flag": "name:skerrick"}).
 //
 // DETERMINISM. Nothing here writes a voxel. What it writes is flags (world
 // state, integer) and the player's kit (items by name), and it writes them
@@ -69,6 +78,7 @@
 
 struct Kit;
 struct ItemLibrary;
+struct GlyphLibrary;
 struct TickInput;
 struct PlayerSession;
 class MobSystem;
@@ -89,9 +99,11 @@ struct Cond {
 };
 
 struct Act {
-  enum class Kind : uint8_t { Set, Add, Clear, Give, Take, End };
+  // Grant and Learn (demons D2) are APPENDED: nothing persists an Act::Kind
+  // value, but appending keeps every switch's existing arms where they were.
+  enum class Kind : uint8_t { Set, Add, Clear, Give, Take, End, Grant, Learn };
   Kind kind = Kind::Set;
-  std::string arg;  // flag or item name
+  std::string arg;  // flag, item, glyph (grant) or name (learn)
   int value = 1;    // set/add value, give/take count
 };
 
@@ -147,9 +159,10 @@ class Library {
   // Every <dir>/*.json, sorted by name. Returns false only when the directory
   // could not be read; a malformed FILE is skipped with an error Problem and
   // the rest still load (one typo must not silence a whole village).
-  // `items`, when given, checks every give/take/has names a real item.
+  // `items`, when given, checks every give/take/has names a real item;
+  // `glyphs`, when given, every grant names a real glyph (a WARNING if not).
   bool Load(const std::string& dir, const ItemLibrary* items,
-            std::vector<Problem>& problems);
+            std::vector<Problem>& problems, const GlyphLibrary* glyphs = nullptr);
   // Parse one file's text (the gate and the tuner-mirror path use this).
   bool Parse(const std::string& name, const std::string& text,
              const std::string& file, Dialogue& out,
@@ -157,7 +170,8 @@ class Library {
   // The §2.7 checks over one dialogue (dangling goto, unreachable node,
   // unknown item/activity) and, library-wide, flags written but never read
   // and read but never written.
-  void Validate(const ItemLibrary* items, std::vector<Problem>& problems) const;
+  void Validate(const ItemLibrary* items, std::vector<Problem>& problems,
+                const GlyphLibrary* glyphs = nullptr) const;
 
   const Dialogue* Find(const std::string& name) const;
   const std::vector<Dialogue>& All() const { return all_; }
@@ -177,6 +191,9 @@ class Store {
   Library lib;
   std::string dir;                      // assets/dialogue, for Reload
   const ItemLibrary* items = nullptr;   // for validation and give/take
+  // For validation and `grant` (by glyph NAME). Null = a grant is refused at
+  // run time and counted in stats.refusedGrants (a headless store).
+  const GlyphLibrary* glyphs = nullptr;
   std::vector<Problem> problems;        // the last Reload's, for the dev panel
 
   // THE ACTIVITY HOOK (P7). Answers "what is this speaker doing now" (the
@@ -205,6 +222,7 @@ class Store {
   // Telemetry the gates read.
   struct Stats {
     uint64_t begun = 0, ended = 0, choices = 0, refusedGives = 0;
+    uint64_t grants = 0, refusedGrants = 0, learned = 0;
   } stats;
 
   // ---- persistence ('DLGF' in world.sve, game/persist.cpp) ----

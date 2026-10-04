@@ -541,6 +541,13 @@ function actRows(arr, set, title) {
       sel.value = a[kind]; row.append(sel);
       row.append(h('span', {class: 'lbl'}, 'x'), h('input', {type: 'number', min: 1, value: a.count ?? 1, oninput: e => {
         const n = parseInt(e.target.value, 10) || 1; a.count = n; touch(); }}));
+    } else if (kind === 'grant' || kind === 'learn') {
+      // demons D2: a glyph id (glyphs.json) the player now owns / a name the
+      // world now knows (flag name:<x>).
+      row.append(h('input', {type: 'text', value: a[kind], style: 'width:150px',
+        placeholder: kind === 'grant' ? 'glyph id' : 'demon name',
+        oninput: e => { a[kind] = e.target.value; touch(); }}));
+      row.append(h('span', {class: 'lbl'}, kind === 'grant' ? 'the player owns this glyph' : 'sets name:<name>'));
     } else {
       row.append(h('span', {class: 'lbl'}, 'ends the conversation after this'));
     }

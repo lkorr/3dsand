@@ -541,6 +541,8 @@ add_library(sandvox_core OBJECT
   # Branching conversations: content, flags store, the tick hook
   # (docs/PLAN_world_editor.md P3, game/dialogue.h).
   src/game/dialogue.cpp
+  # demons D2: which glyphs are demon NAMES, granting them (game/demon_lore.h).
+  src/game/demon_lore.cpp
   # Villager schedules (assets/schedules/*.json), game/schedule.h.
   src/game/schedule.cpp
   src/game/anim.cpp
@@ -594,6 +596,8 @@ add_library(sandvox_core OBJECT
   src/world/refs_doors.cpp
   # P7 NPC residents: the npc + waynode kinds, schedules, the day's routing.
   src/world/refs_npc.cpp
+  # demons D2: the `readable` kind (a book / note whose use opens a dialogue).
+  src/world/refs_readable.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
@@ -660,6 +664,8 @@ add_library(sandvox_core OBJECT
   src/test/selftest_structure.cpp
   src/test/selftest_editor.cpp
   src/test/selftest_village.cpp
+  # demons D2: the Harrowby smithy cellar + the book (gate harrowby-cellar).
+  src/test/selftest_demon_cellar.cpp
   src/test/selftest_clearing.cpp
   src/audio/device.cpp
   src/audio/library.cpp

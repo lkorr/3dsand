@@ -1188,3 +1188,19 @@ and the `_elec_about` / `_elecE2_about` texts. `ops-replay` is green again:
 its red was a reporter artifact (the per-tick ticket stash carried from the
 recording into the replay); docs/PLAN_electricity.md STATUS has the
 attribution, including why its ticket no longer idles out (not electricity).
+
+## 2026-10-04 — demons D2: the smithy cellar (default map only)
+
+- `harrowby-cellar` (new, `pass`): thresholds `cellar.*`.
+- `village-harrowby` `fail` -> `pass`, `harrowby.dayTrace` 353efa79c26da7cb:6333
+  -> ffdb3ea524fe8fb2:6443. Recorded with `--selftest --gate village-harrowby
+  --rebaseline` (the comparable scope). The trace was always going to move:
+  the cellar is in the default map's edit layer under Osric's house, and
+  the book is a new harrowby ref (kept out of the gate's survey box by
+  `Survey`). The day now completes: all five villagers reach every anchor and
+  Edric no longer stalls at the loft edge. That is NOT attributed. It may be
+  this tree's base (main 7bd0885) rather than D2, so whoever merges should
+  read it as an observation, not a fix.
+- `determinismHash` unmoved (0fa43063). The harness map names no layer, and
+  the two new materials (`tallow`, `candle_flame`) and the one appended
+  reaction appear nowhere in it.

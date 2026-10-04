@@ -125,6 +125,9 @@ Village Survey(const refs::RefStore& st) {
     if (r.kind == "npc") v.npcs.push_back(&r);
     if (r.kind == "door") v.doors.push_back(&r);
     if (r.kind == "structure") v.structures.push_back(&r);
+    // The cellar book (demons D2) lies 2 m under the smithy: kept out of the
+    // box, whose lo.y picks the chunk the day's CPU mirror centres on.
+    if (r.kind == "readable") continue;
     v.lo = {std::min(v.lo.x, r.pos.x), std::min(v.lo.y, r.pos.y), std::min(v.lo.z, r.pos.z)};
     v.hi = {std::max(v.hi.x, r.pos.x), std::max(v.hi.y, r.pos.y), std::max(v.hi.z, r.pos.z)};
   }

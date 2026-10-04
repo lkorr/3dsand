@@ -17,6 +17,7 @@
 #include "game/ai_behavior.h"
 #include "game/bodyreg.h"
 #include "game/demon.h"
+#include "game/demon_lore.h"
 #include "game/dye.h"
 #include "game/itemcoat.h"
 #include "game/persist.h"
@@ -3927,6 +3928,17 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           caster.mana.mana = caster.mana.EffectiveMax();
           caster.mana.regenAccum = 0;
           ui.devManaFill = false;
+        }
+        // demons D2: the dev panel's "learn all demon names" (game/demon_lore.h).
+        // Ownership is player state, not hashed sim state; applied here, in
+        // the tick, so the next cast this tick already sees the new glyphs.
+        if (ui.devLearnDemonNames) {
+          ui.devLearnDemonNames = false;
+          const int fresh = demon::GrantAllNames(caster.inventory, glyphs);
+          const int all = demon::CountNames(glyphs);
+          ui.devDemonNamesStatus =
+              all == 0 ? std::string("no demon names in glyphs.json yet")
+                       : std::to_string(fresh) + " new, " + std::to_string(all) + " known in all";
         }
         SpellEmission emit;
 

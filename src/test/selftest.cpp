@@ -114,6 +114,7 @@ const std::vector<Gate>& EditorGates();
 // Harrowby, the first hand-built village: a CONTENT gate over the game map
 // (docs/PLAN_world_editor.md P8, selftest_village.cpp).
 const std::vector<Gate>& VillageGates();
+const std::vector<Gate>& CellarGates();   // selftest_demon_cellar.cpp (demons D2)
 const std::vector<Gate>& ClearingGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
@@ -649,6 +650,10 @@ const char* const kOrder[] = {
     // body attribution (rule 1's in-process half; det-cpu 2026-10-03). Same
     // exit contract as `village-harrowby`.
     "village-twice",
+    // demons D2: the smithy cellar and the book, on the GAME's map like the
+    // two above and with their exit contract (switch back, reload the
+    // environment, regenerate the window at the origin it found).
+    "harrowby-cellar",
     // REFERENCES (PLAN_world_editor.md P1). After `corpse-save` for the same
     // exit contract: mobs and debris reset, id counter restored, park function
     // removed, store cleared, and worldgen regenerated at the origin the gate
@@ -1215,7 +1220,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &ClearingGates()})
+                          &NetGates(), &SoluteGates(), &HeatGates(), &DialogueGates(), &RefsGates(), &NpcGates(), &StructureGates(), &EditorGates(), &VillageGates(), &CellarGates(), &ClearingGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

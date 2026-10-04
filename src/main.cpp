@@ -26,6 +26,7 @@
 #include "sim/plants.h"
 #include "game/bodyreg.h"
 #include "game/demon.h"
+#include "game/demon_lore.h"
 #include "game/brush.h"
 #include "game/burnprof.h"
 #include "game/persist.h"
@@ -8040,6 +8041,10 @@ int main(int argc, char** argv) {
   dialogue::Store talkStore;
   talkStore.dir = assetDir + "/dialogue";
   talkStore.items = &items;
+  // demons D2: the `grant` action resolves a glyph by name (and its load check
+  // warns about a name glyphs.json lacks). `glyphs` is reassigned in place on
+  // R, so the pointer stays good.
+  talkStore.glyphs = &glyphs;
   auto reloadDialogue = [&]() {
     talkStore.Reload();
     ui.dialogueNames.clear();
@@ -12809,8 +12814,7 @@ int main(int argc, char** argv) {
           // by name like the bindings.
           std::vector<std::string> learnedNames;
           for (int gi : caster.inventory.owned)
-            if (gi >= 0 && gi < (int)glyphs.glyphs.size() &&
-                glyphs.glyphs[gi].verb == SpellVerb::Summon)
+            if (demon::IsNameGlyph(glyphs, gi))
               learnedNames.push_back(glyphs.glyphs[gi].id);
           if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
             glyphs = std::move(next);
