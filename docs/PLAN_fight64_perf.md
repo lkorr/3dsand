@@ -139,3 +139,223 @@ measurement says so. Package P owns `src/phys/`.
 6. **Do NOT change what creatures decide or how they fight** to save time,
    unless you name it as a trade-off. "Far creatures think every other tick"
    is a proposal, not a silent change.
+
+## Round 1 result (2026-10-04)
+
+P (39a8b56) and M (59b0750) landed.
+
+| Phase, 64 brawl | Before | After |
+|---|---|---|
+| Jolt step (same corpse count) | 26.5 | 10.5 |
+| Mob side | 29.6 | 18.8 |
+
+- The harness GPU wait (~11 ms) is harness-only: the game frame never blocks
+  on it.
+- **The real game still cannot hold 30 Hz with 64 creatures.** CPU is about
+  35 ms a tick, and the frame loop spirals: catch-up ticks take frames from
+  ~30 to ~180 ms over 300 ticks.
+
+## Round 2
+
+### Package R — regressions and determinism (do this first, it gates trust)
+
+1. **`corpse-splatter` fails** since P: "blood coat 0 -> 0". It passed at
+   5f5fce7 ("0 -> 9").
+   - Likely the corpse hull (P): the splatter flight or coat landing now
+     meets the hull instead of the detailed shape, or the "re-check against
+     the detailed shape" path misses for droplets.
+   - Fix it so blood lands on the corpse as before. A hull is a collider,
+     not the body's surface.
+2. **Possible scheduling-dependent physics.**
+   - P saw the old-collider corpse-heavy arm end with 9/10/11 alive across
+     different builds (same build: always the same).
+   - M saw run-to-run divergence in one build, first in the Jolt contact
+     count at tick 208, with creature inputs identical up to then.
+   - The contact-impact lists were already made order-independent
+     (DESIGN.md "the contact-impact lists are collected uncapped and capped
+     AFTER the step").
+   - Find out whether anything is still racy. Run the 64 brawl, natural and
+     `killEvery 4`, with `SANDVOX_MOBCAP_DIGEST=1`:
+     - 3+ times in one build;
+     - across `SANDVOX_MOB_THREADS=1` vs default;
+     - across Jolt worker thread counts (`PhysicsWorkerThreads()`).
+
+     Compare the per-tick digests.
+   - On a divergence, attribute it to its first differing tick and field
+     (add reporter detail rather than eliminate by toggling; CLAUDE.md
+     rule 6), then fix the cause.
+   - A cross-BUILD difference (different compiled code, same source) is
+     worth a sentence on the cause (LTO/inlining/fp contraction), but
+     run-to-run and thread-count determinism is the invariant.
+   - Make the twice-run digest comparison a permanent part of `mob-cap64`
+     (or a new gate), so this is gated from now on.
+
+#### Package R result (2026-10-04, cut short by owner directive)
+
+1. **`corpse-splatter`: fixed, and it was not the hull.** `SANDVOX_SPLAT_TRACE=1`
+   (new, permanent: every limb a burst is flown at, its trials, each landing)
+   showed the gate's burst landing on 9 of the corpse's 17 limbs and missing
+   only the one the gate counts. The flight is analytic against each limb's
+   voxel lattice; it never consults a collider, so the hull is not in its
+   path. What P changed is the pose the corpse settles in. The gate counts
+   the root limb (the pelvis), the one limb the corpse's own gout never
+   coats. The wide burst (cone 0.35) gave it ~5 of 24 trials, each with
+   ~30% odds of hitting, so roughly a 1-in-6 chance of no landing at all.
+   It was "0 -> 9" before P and "0 -> 0" after. The gate now throws a
+   focused splash (cone 0.12), which sends every trial at the root limb.
+   No engine behaviour changed.
+2. **Determinism soak: NOT DONE (TBD).** No digest runs were made before the
+   owner's wrap-up directive. Still open:
+   - the natural and `killEvery 4` arms with `SANDVOX_MOBCAP_DIGEST=1`, 3+
+     runs each;
+   - `SANDVOX_MOB_THREADS=1` vs default;
+   - `SANDVOX_PHYS_THREADS=1/2/7`.
+
+   Attribution tools already exist:
+   - `SANDVOX_PHYS_TRACE=<file>` writes per-step body-state hashes, before
+     (P) and after (S) `Update`. A differing S after a matching P means
+     Jolt's step itself. A differing P after a matching S means our code
+     between steps.
+   - `Physics::DebugBodyStates` gives per-body float bits (see
+     village-twice).
+
+   Hypothesis for M's tick-208 contact-count split: still unknown. No
+   permanent twice-run gate has landed.
+
+### Package Q — round-2 performance (target: the real game holds 30 Hz at 64)
+
+**A moved world hash is FINE** (CLAUDE.md rule 1): rebaseline once at the
+end. Do not avoid a change because it moves the hash.
+
+Allowed, if deterministic:
+- a different but deterministic split of a shared per-tick budget;
+- a different voxel order inside a collider.
+
+Name each in the report.
+
+1. **CCD, 6–10 ms.** Dead flesh shoved by kinematic living limbs triggers
+   linear casts against the crowd's box compounds. Options:
+   - restrict CCD to bodies whose motion could tunnel through TERRAIN (a
+     speed relative to their own thickness), and cast against the terrain
+     layer only (Jolt object-layer filtering of the cast);
+   - cap the velocity a kinematic limb can impart to a corpse;
+   - use simpler living-limb shapes for the cast.
+
+   Keep "nothing tunnels through terrain" gated.
+2. **Blade carves, ~5 ms.** About 1.8 ms is `DownsampleSkin`'s hash map
+   (`src/phys/lattice.h`). Replace it with a dense/flat structure even if
+   the collider voxel order (and the hash) changes.
+3. **Burn under the shared budget (~3.6 ms) and the shock solve (~2.4 ms).**
+   Parallelise them with a deterministic per-creature budget split, e.g. a
+   prefix allocation in id order computed before the parallel pass.
+4. **The frame-loop spiral.** When the tick costs more than its period the
+   game must degrade gracefully, not climb to 180 ms frames.
+   - Cap catch-up ticks per frame.
+   - Let sim time slow (the tick count stays the authority, so determinism
+     is unaffected).
+   - Keep the GPU-snapshot deferral sane.
+
+   Measure with `--brawl` in the real windowed loop.
+5. Re-profile with `SANDVOX_SAMPLE_PROF=1` and take whatever is next.
+6. **Report:** the before/after table, plus `--brawl` real-frame p50/p95.
+
+R and Q may both touch `src/phys/physics.cpp`. R owns
+determinism/contact-report code and splatter; Q owns the CCD settings and
+`lattice.h`. Keep shared edits small.
+
+### TBD: 64-body fight performance (2026-10-04, package Q wrap-up)
+
+Owner, 2026-10-04: 30 Hz at 64 bodies is unrealistic at the moment and is
+deferred. Package Q stopped after item 2. What landed, what was measured, and
+what is left, ranked.
+
+**Landed (Q2).** `DownsampleSkin` (`src/phys/lattice.h`) uses a dense block
+index over the blocks' bounding box instead of an `unordered_map`, in
+thread-local scratch. The output order is now the lattice order (z, y, x)
+instead of the map's bucket order. That changes a re-derived collider's box
+merge, and with it the 64-brawl's trajectory. The `determinism` gate's hash
+did not move. `tests/lattice_test.cpp` passes.
+
+**Current numbers.** `mob-cap64`, 300-tick natural fight, `SANDVOX_RUN_EXCLUSIVE=1`.
+Both arms are this worktree's non-LTO build: the before arm is 895e4fb, the
+after arm is 895e4fb + Q2.
+
+| Phase, ms per tick | Before | After |
+|---|---|---|
+| Tick wall mean / p95 | 54.29 / 81.18 | 35.53 / 45.44 |
+| Mob side (burnprof) | 22.00 | 17.66 |
+| ...carve | 4.30 (3,084 carves) | 2.78 (3,097 carves) |
+| ...stroke (contains most carves) | 6.52 | 4.42 |
+| ...burn | 4.49 | 3.59 |
+| ...stain (incl. splatter 0.63) | 3.00 | 2.72 |
+| ...shocks | 2.74 | 2.74 |
+| ...bleed | 1.13 | 0.66 |
+| ...recount, worst tick | 22.57 | 16.84 |
+| Jolt Update | 15.69 | 5.05 |
+| ...ccd, wall / cpu | 10.35 / 45.19 | 2.73 / 7.39 |
+| ...collide, wall | 3.69 | 1.61 |
+| Harness GPU drain (`readbackStall`, harness-only) | 12.37 | 9.57 |
+
+**Only the carve row is attributable to Q2.** It has the same carve count at
+-1.5 ms, which matches the ~1.8 ms estimate. The fight itself diverged: 52 vs
+55 alive at the end. In the before run 11.3 live ragdolls a tick were
+linear-casting box compounds (`rig-limp`); the after run had none. So the
+Jolt/CCD drop is mostly a different fight, not the change. Package R's
+run-to-run question sits under every Jolt number here as well. `--brawl` (the
+real windowed frame) was not re-measured. Its last number is round 1's:
+frames climb from ~30 to ~180 ms.
+
+**Remaining, ranked by expected gain:**
+
+1. **CCD: ~5–8 ms of Jolt wall in a ragdoll-heavy tick (10.35 ms wall, 45 ms
+   CPU in the before arm).** Who casts, per tick: rig-limp 11.3 (all box
+   compounds), rig-dead 18.4 (3.8 compound), debris 10.8, severed-hold 2.8.
+   - Jolt decides to cast when a step exceeds 0.75 × the shape's INNER RADIUS.
+     For a box compound that is the smallest sub-box, about half a voxel, so a
+     shoved limb casts at walking speeds.
+   - **"Cast against terrain only" cannot be done through Jolt's API.**
+     `JobFindCCDContacts` uses the body's own default broadphase/object-layer
+     filters, the same ones collision uses. `SimShapeFilter` cannot tell a cast
+     from the narrow phase. Doing it needs a Jolt patch, and Jolt sits in the
+     shared `C:/sv-deps` cache.
+   - **The doable version:** before each `Update`, set
+     `BodyInterface::SetMotionQuality` per CCD-eligible body. Use `LinearCast`
+     only when `|v|·dt > 0.375 × min(shape local-bounds extent)`. That is
+     Jolt's own ratio applied to the body's real thickness, which is the
+     terrain-tunnel criterion. Everything else stays `Discrete`.
+   - Also consider casting a living ragdoll as its hull, as corpses already do.
+   - Keep the gate that pins "nothing tunnels through terrain" (`selftest_phys`
+     big-body / CCD gates).
+2. **The frame-loop spiral, from 180 ms frames to about tick+render (~45 ms
+   at today's cost).** `main.cpp`'s tick loop has only the 4-tick cap and the
+   GPU-lag throttle. There is no CPU budget, so a 35 ms tick runs four times a
+   frame.
+   - Fix: after a frame's first tick, run another only if
+     `spentTickMs + lastTickMs <= kTickDt`. Otherwise drop the debt, as the
+     GPU throttle does (`accumulator = min(accumulator, kTickDt)`).
+   - This is pure pacing. Sim time slows (to ~75% at 35 ms a tick) and the tick
+     count stays the authority. Headless runs and `SANDVOX_TICKS_PER_FRAME`
+     never take this path.
+   - Add an env A/B arm and a dropped-tick counter beside `g_ticksThrottled`.
+   - It is cheap and the largest felt win. It needs a `--brawl` before/after.
+3. **Burn head under the shared pot: 3.6–4.5 ms, ~2.5 ms to gain.**
+   - Compute every creature's (front, ops) share up front, in pot order, from
+     the weights (`BurnShareOf`).
+   - Run `BurnTickHead`'s per-limb `BurnOneLimb` in parallel into per-creature
+     cell-op/spawn buffers.
+   - Defer `FlushBurn` (severs, Jolt rebuilds, kills) to a serial apply in pot
+     order.
+   - Budget shift to name: a creature no longer inherits the unspent remainder
+     of earlier creatures in the same tick, unless a second pass hands it on.
+     Flushes also move after all burns.
+4. **Shock solve: 2.7 ms, ~2 ms to gain.** The max-plus solve is global over
+   touching bodies. Split the parts into connected components by box contact,
+   solve the components in parallel, and emit their ops in part order. The
+   result is identical, because components do not interact.
+5. **The rest of carve (2.8 ms) and stroke (4.4 ms), ~0.5–1 ms, unmeasured.**
+   `SpallGrow` in the same header still rebuilds an `unordered_set` per round.
+   The carve's other containers are a sampler question
+   (`SANDVOX_SAMPLE_PROF=1 --gate mob-cap64`); not profiled in Q.
+6. **p95: `RecountBurn` spikes (worst tick 17–23 ms, one creature).** Amortise
+   the recount across ticks on a (tick, id) schedule.
+7. **Bleed 0.7–1.1 ms and stain 2.7 ms.** Already pooled by M. Small.

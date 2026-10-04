@@ -520,6 +520,8 @@ add_library(sandvox_core OBJECT
   src/game/prefab.cpp
   src/game/mob.cpp
   src/game/mob_shock.cpp
+  # Fork-join pool for the per-creature pure passes (PLAN_fight64_perf M).
+  src/game/workpool.cpp
   # What one creature looks like on the wire: the four records mob ownership
   # exchanges (docs/PLAN_multiplayer_m9.md M9.4-B). Data and encode/decode
   # only — no sockets, no tick.
@@ -642,6 +644,8 @@ add_library(sandvox_core OBJECT
   src/test/selftest_vessel.cpp
   src/test/selftest_swing.cpp
   src/test/selftest_combat.cpp
+  # In-process sampling profiler (SANDVOX_SAMPLE_PROF; mob-cap64 uses it).
+  src/test/sampleprof.cpp
   # One pose pipeline, whoever drives the body (W2-L): pose-parity.
   src/test/selftest_pose.cpp
   src/test/selftest_equipment.cpp

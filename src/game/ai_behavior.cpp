@@ -787,9 +787,10 @@ const Actor* FindActor(const WorldView& v, uint64_t id) {
 }
 
 // Can `self` perceive `a` right now? Distance, then cone, then (cheapest last,
-// because it is the expensive one) the line.
-bool Perceives(const SelfView& self, const Profile& pr, const WorldView& v,
-               const Actor& a, float range, float& outDist) {
+// because it is the expensive one) the line -- split at the line so Perceive
+// can rank the cheap survivors before it asks any line (its note).
+bool PerceivesNoLine(const SelfView& self, const Profile& pr, const Actor& a,
+                     float range, float& outDist) {
   outDist = PlanarDist(self.Centre(), a.centre);
   if (outDist > range) return false;
   if (pr.perception.fovDegrees < 359.9f) {
@@ -797,6 +798,10 @@ bool Perceives(const SelfView& self, const Profile& pr, const WorldView& v,
     const float err = std::abs(WrapPi(bearing - self.heading));
     if (err > pr.perception.fovDegrees * (kPi / 180.0f) * 0.5f) return false;
   }
+  return true;
+}
+bool PerceivesLine(const SelfView& self, const Profile& pr, const WorldView& v,
+                   const Actor& a) {
   if (pr.perception.requireLos && v.lineOfSight != nullptr)
     if (!v.lineOfSight(v.losCtx, EyeOf(self), EyeOf(a))) return false;
   return true;
@@ -831,26 +836,50 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
       b.everHurt && tick - b.hurtTick <= pr.perception.provokeTicks;
   const Actor* best = nullptr;
   float bestDist = 1e30f;
-  float bestScore = 1e30f;
+  // THE LINE OF SIGHT IS ASKED IN SCORE ORDER, AND ONLY UNTIL ONE ANSWERS
+  // (PLAN_fight64_perf M). The pick is the lowest score among the actors that
+  // pass all three tests (range, cone, line), earliest in the list on a tie.
+  // The line is the expensive test and the other two decide nothing about it,
+  // so the cheap survivors are ranked by (score, list order) and the line is
+  // walked down that ranking: the first that sees is exactly the actor the
+  // all-tests loop would have kept, and in a 64-creature brawl it is nearly
+  // always the first asked instead of every foe in range.
+  struct Cand {
+    float score, d;
+    const Actor* a;
+    uint32_t order;
+  };
+  thread_local std::vector<Cand> cands;
+  cands.clear();
+  uint32_t order = 0;
   for (const Actor& a : *v.actors) {
+    order++;
     if (!a.alive || a.id == self.id) continue;
     if (a.faction == self.faction) continue;
     float d = 0;
     const bool current = b.hasTarget && a.id == b.targetId;
     if (neutral && !current && !provoked) continue;
     const float range = current ? keep : acquire;
-    if (!Perceives(self, pr, v, a, range, d)) continue;
+    if (!PerceivesNoLine(self, pr, a, range, d)) continue;
     float score = d;
     if (current) score -= pr.perception.stickiness;
     // Whoever is fighting ME is the one a provoked neutral answers.
     if (neutral && a.targetId == self.id) score -= 1000.0f;
     score -= pr.perception.preferWeak *
              (1.0f - std::clamp(a.hpFrac, 0.0f, 1.0f));
-    if (score < bestScore) {
-      bestScore = score;
-      bestDist = d;
-      best = &a;
-    }
+    // The all-tests loop kept an actor only on `score < best` from 1e30: a
+    // NaN, or a score at or past 1e30, was never kept, so it is not a candidate.
+    if (!(score < 1e30f)) continue;
+    cands.push_back({score, d, &a, order});
+  }
+  std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
+    return x.score < y.score || (x.score == y.score && x.order < y.order);
+  });
+  for (const Cand& c : cands) {
+    if (!PerceivesLine(self, pr, v, *c.a)) continue;
+    best = c.a;
+    bestDist = c.d;
+    break;
   }
 
   if (best != nullptr) {
