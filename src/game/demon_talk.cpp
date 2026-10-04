@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "game/container.h"
+#include "game/demon_cast.h"
 #include "game/demon.h"
 #include "game/dialogue.h"
 #include "game/item.h"
@@ -723,7 +724,26 @@ bool PactAllowBlow(DemonWorld& d, LiveDemon& ld, uint64_t targetId) {
   return true;
 }
 
-bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId) {
+bool CastTagMatches(const std::string& pred, const KitTags* tags) {
+  if (pred.empty() || tags == nullptr) return true;
+  auto after = [&](const char* key) -> const char* {
+    const size_t n = std::strlen(key);
+    return pred.compare(0, n, key) == 0 ? pred.c_str() + n : nullptr;
+  };
+  if (pred == "direct") return tags->direct;
+  if (pred == "affects_body") return tags->affectsBody;
+  if (const char* m = after("creates:")) {
+    for (const std::string& c : tags->creates)
+      if (c == m) return true;
+    return false;
+  }
+  if (const char* a = after("alters:")) return tags->alters == a;
+  if (const char* t = after("targets:")) return tags->targets == t;
+  return true;   // an unknown predicate cannot be checked: the forbid holds
+}
+
+bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId,
+                 const KitTags* tags) {
   LiveDemon* ld = Live(w, demonId);
   if (ld == nullptr || !ld->pact || !w.demons) return true;
   TalkWorld& t = TW(*w.demons);
@@ -733,7 +753,9 @@ bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId) {
   if (a == nullptr) return true;   // not an actor: a point in the world
   Eval ev{t.actors, MeId(ld->session), ld->mobId};
   for (const Clause& c : ld->pact->page.clauses)
-    if (c.kind == Kind::Forbid && c.verb == Verb::Cast && ev.Forbidden(c.sel, *a)) return false;
+    if (c.kind == Kind::Forbid && c.verb == Verb::Cast && CastTagMatches(c.arg, tags) &&
+        ev.Forbidden(c.sel, *a))
+      return false;
   return true;
 }
 

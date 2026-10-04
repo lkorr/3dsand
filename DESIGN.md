@@ -24943,6 +24943,178 @@ the strain and costs the circle; looking away lowers it; his power raised to
 1000, a release is overpowered and he is unbound and hunting. C: the tell
 table answers by margin.
 
+### Demons that cast — the mob casting seam, blink, the kit, the stance (D4; `game/demon_cast.*`, `assets/demons/spells/`)
+
+**ANY CREATURE CAN CAST; THE SEAM IS NOT DEMON-SPECIFIC.** A behaviour profile
+with a `cast` block (`ai::CastTuning`: spell names, a "near enough to try" range,
+a cadence + jitter, a first-sight delay, the commit, its own mana pool and
+regen, `maxLive`) may win the new intent `Cast` (appended last in
+`ai::Intent`, before `Count`). Its scorer is the attack clock's shape on its
+own clock (`Brain::nextCastTick`, armed `firstDelayTicks` after a target is
+first held): target held and VISIBLE, the cadence due, the range met, the nose
+on. Its actuator faces the target, holds the facing `commitTicks`, spends the
+cadence and emits a `CastRequest` (target id, point, velocity, distance) --
+the `AttackRequest` seam's twin: `MobSystem::CastRequests()`, at most one per
+mob per tick, pushed in `DecideIntent` beside the attack request (a stunned
+body issues none). The arbiter does not know what a spell is.
+
+**THE CONSUMER (`MobCastTick`, TickAuthority right after phase H's
+`mobs.PreTick`).** Each casting creature gets its OWN `SpellSystem` and
+`CasterState` (`MobCastWorld::casters`, created on its first request, at most
+`kMaxCasters` 64): one VM per caster is what makes every per-caster number
+honest with no attribution code -- per-tick bills, the wildcard's bill on
+resolve, statuses, refusals. A request is served by DRAWING a kit spell from
+the profile's list (a repeat weighs the draw; `rng::Hash3(mob, tick)`),
+filtered to what the creature can do right now: in the entry's own range,
+affordable from MANA ALONE (`ResolveCast(mana, 0, cost) == Normal`: a creature
+never overcasts into its own body), under `maxLive` carriers in the air, a
+`once` entry not already sustained on itself, a blink off cooldown. Then the
+player's own `SpellSystem::Cast`, from the creature's upper chest (outside its
+collider) along the line to the aim point. Its emission is OWNED AND FILTERED
+like the player's: every ward in every VM (all players', all creatures')
+filters it; brush ops join the tick (`kOpsPerTick` 32 across all creature
+magic, the overflow counted); blasts go off in the PRIMARY's explosion slot
+(`pendingBlasts`, phase K: crater scan, body damage, carving, shove -- the
+grenade path); sprays join the spawns; winds join `WindPrims` owned by the mob
+id; a sustained lift on a body is that body's `AddBodyVelocity` (a player's
+avatar, `LiftMob` for a creature); a bomb is debris; bills come out of MANA
+only and a dry pool drops everything the creature sustains. The body probe the
+VM asks answers for every session at once and names a player by the AI's
+actor band (`kPlayerActorBase + index`), so the id a status rides is the id
+the creature targeted; a creature's flight ignores its own limbs, and a
+seeking bolt homes on what IT is fighting. `kCastsPerTick` (8) requests are
+served a tick. Each creature VM is ticked here (regen, the reservation, the
+bills), and wards act ACROSS VMs: `SpellSystem::AbsorbForeign` (your
+`projectile null` absorbs its bolts, and its yours), and after phase M
+`MobCastWardFilter` runs every creature's wards over the whole tick's streams.
+A dead caster's statuses drop at once; its bolts in flight still land; its VM
+is forgotten when it has drained. Creature bolts are drawn by the same
+projectile loop as yours (`MobCastAppendLive`, main.cpp). A strike or a
+summoning a creature's spell asks for is not served (counted `unsupported`);
+no kit entry uses one.
+
+**THE KIT (`assets/demons/spells/<name>.json`) is data.** An entry is a WORD
+LIST in the ordinary grammar (so a creature pays what the same words cost you,
+priced by the same tariff), how a creature AIMS it (`body`: the target's
+centre, led by its velocity over the flight time, capped at 8 voxels; `feet`:
+the floor under the target, read from the T-4 snapshot; `self`: `self`
+resolves at its own body), its range, `releaseAfterTicks` (a status it put on
+ANOTHER body is dropped that many ticks after it first held: lift, then drop),
+`once`, and its FOOTPRINT TAGS -- `targets` (body | ground | self | area),
+`direct`, `creates` (materials), `alters` (e.g. `ground_under_target`),
+`affectsBody`, `region` -- authored, not derived, because "aimed at you" is
+intent and not chemistry; D5's prohibitions and D6's schemes filter on them.
+Shipped: `firebolt` (`fire fire bolt`, 82 mana), `gust` (the bare `gust` on
+the hand: a jet that shoves a body and scatters loose powder -- salt
+included), `lava_floor` (`anything transmute lava bolt` at the feet: the
+wildcard turns matter, never the void, billed on resolve; 1387 mana; indirect,
+so a `direct` prohibition misses it and an `alters`/`creates` one does not),
+`lift` (`lift@0.5 aura bolt`, released after 12 ticks: ~12 voxels up, then the
+drop), `ward` (`fire null aura self`, once; NOT `projectile null`, which would
+absorb the caster's own outgoing bolts), `hellfire` (`fire fire explosive@1.5
+bolt`, 548 mana, the greater demon's), and `blink`. Re-read when a creature
+starts casting.
+
+**A CALIBRATION THE KIT HAD TO WORK AROUND (open, not changed here):** the VM
+turns a sustained gravity mod on a body into `-g x 0.012` voxels/s PER TICK
+(spell.cpp, the status loop), so `lift@1` -- "weightless" by its glyph's own
+description -- is ~12 vox/s a tick against gravity's 3.3 (9.81 m/s^2 at 30 Hz):
+a launch. `lift@0.5` is what the kit uses. Fixing the constant changes the
+player's `lift aura` spells and the `levitate` gate; an owner call.
+
+**BLINK is a locomotion verb, not a spell** (`"kind": "blink"`;
+`MobSystem::BlinkMob`): the whole body moves in one tick -- origin, every limb
+body TELEPORTED by the same offset (`SetBodyPosition`: a kinematic limb asked to
+cross the gap in one step would shove everything it touched), the drawn
+height, the feet re-planted where it lands, fall/launch state and the path
+dropped; refused for a body that is dead, limp or getting up. The hop goes
+`distance` toward (or away from) the target, stopping `standoff` short, onto a
+floor found in the T-4 snapshot with headroom for the body; `los` asks for a
+clear line chest to landing; `cooldownTicks` between hops; no mana. A landing
+outside the CPU mirror reads as no floor (refused). **The seals decide the rest
+(D3):** `demon::AllowBlink` is asked last, once the hop is otherwise certain --
+a contained demon whose quicksilver severs `blink` is refused; an UNSEVERED
+blink is the loophole, and a landing outside the circle UNBINDS the demon there
+and then. The walk fence (D1) still holds every step; only the teleport skips
+it, by design.
+
+**CAST_OUT AT THE RING (D3).** A contained demon's carrier is asked
+`demon::AllowCastOut` ONCE, the first tick it is outside the circle (its
+`SpellProjectile::seq` remembered once allowed): severed, it dies there
+(`SpellSystem::RefuseCarriers`), before anything it carries can land outside.
+What an instant cast or a resolve would put outside the ring while the channel
+is severed (`demon::ChannelSevered(CastOut)`) is filtered per element: ops,
+blasts and sprays by where they land, a wind by its far end, a push on a body
+by where the body is.
+
+**THE IMP CASTS SPARINGLY; THE FIEND IS DEATH.** `imp`: `firebolt` twice,
+`gust` once, 6..44 voxels, a cast every 6-9 s (cadence 180 + jitter 90), first
+20 ticks after it spots you, 120 mana (one firebolt, then ~12 s of regen),
+`maxLive` 1, intent weight 3.5 (over its claws' 3.2). No blink: an imp that
+could would leave every circle without quicksilver. Contained (its claws
+refused at the ring), this is how it still reaches you -- and its gust can
+scatter its own ring (D6 makes that a scheme). `fiend` (the greater demon's
+character, body `assets/mobs/demon/fiend.*`, demon.js's 2 m preset): the full
+kit, hellfire twice over, 2400 mana regenerating 90 a second, a cast every
+2-3 s, three carriers up, a long-reaching brute in melee. Lethality is data;
+no single kit spell's blast exceeds `demonCast.maxBlastPower` (400; hellfire
+is 330), so it is never an instant kill. `imp_bound` (D3's released imp) has
+no cast block: a released imp does not cast.
+
+**A STANDING BODY'S LEGS REACH ITS FEET (`pose.cpp`, the D1 imp float).**
+Measured on a flat stone pad (gate `demon-cast` H): standing still, the imp's
+lowest foot voxel stood 0.50 voxel off the floor and the HUMAN's 0.47 -- every
+generated body's `rideHeight` stance (~1.3 voxels absolute, `mobgen.js
+gaitNumbers`) lifts the min corner past the 0.75 its ankle overhang needs, the
+rest-pose legs are straight, and nothing asked whether they still reached. On
+rough ground the imp hovered a full voxel (`--shot-mob`: +1.05, feet +1.05 /
++1.22): its BOX rests on the highest column under its footprint
+(`SenseGround`), which for a 3.5 x 2.25 body on stepped terrain is often a step
+its feet do not stand on, and the authority clamp held the drawn body within
+`downAuthority` (0.5) of that column. NOT the ride height derived for a small
+body: the stance is ~1.3 voxels absolute on the imp and the human alike. Same
+rule at every size; a short leg simply has no slack to hide it in. The fix is
+general and only touches a STANDING body (every leg planted, `speedFactor` <=
+0.05): the feet-derived body height is capped at the highest min corner from
+which every planted ankle is reachable (`kStanceReachFrac` of the leg, from
+the chain's own hip anchor), and the clamp's floor yields to the same reach.
+Walking bodies are placed exactly as before (their planted feet can be a
+stride stale: the hill-sinking bug the clamp exists for). After: flat pad imp
+-0.01, human -0.08; a one-voxel step under the footprint imp -0.23..0.02,
+human -0.33..-0.01; `--shot-mob imp_skerrick` +0.06.
+
+**SPEED FOLLOWS SIZE, BELOW A MAN (`mobgen.js gaitNumbers`).** The imp walked at
+the human's 31.5 vox/s (its thin sidecar inherited it). Every body that could
+be the player's avatar -- at or above the shortest HUMAN height
+(`HEIGHT_BAND[0]`, 1.53 m) -- keeps the player's speeds (the speed contract
+`speed` exists for); a body smaller than any human runs and walks slower by
+dynamic similarity, speed x sqrt(height / 1.53) (equal Froude number), and its
+arm-swing clip periods are derived at those speeds. A rule about size, not
+race. The imp re-baked to 23.5 vox/s (walk clip 349 -> 468 ms; the .vox is
+byte-identical); no human-band body changes.
+
+**BOUNDS.** 64 creature VMs; 8 requests served a tick; 32 brush ops a tick
+across all creature magic; `maxLive` carriers per creature (and the glyph
+budgets' own caps per VM: live carriers, statuses per caster, generation).
+Nothing to do, and no world, until a creature first asks.
+
+**NOT SAVED.** The casters: mana, statuses, bolts in flight. A loaded world's
+creatures start with full pools and nothing sustained.
+
+**GATE** `demon-cast` (thresholds `demonCast.*`): A the kit loads clean, every
+entry's words are glyphs, compiles to a priced cast and carries tags; the imp's
+and fiend's lists name only kit entries; `cast` is an intent; the biggest blast
+is under the cap; A2 the rest of the kit casts through the real path (lava at
+the post's foot, the ward held on its caster). B Skerrick contained (the real
+tick, you outside): his brain issues cast requests and spells leave him while
+contained; run twice, identical trace. C a firebolt from a loose imp lands
+fire at a stone post. D cast_out open: the bolt crosses the ring and fire lands
+outside; D3's sulfur in the band: refused at the ring, nothing outside. E a
+loose blink moves ~20 voxels onto the pad; contained with quicksilver: refused;
+without: a hop inside keeps it contained, a hop out unbinds it. F `lift` from
+one imp at another raises it (+12), the status is released, it comes back
+down. G a 12-request burst from a bottomless pool casts once (`maxLive` 1). H
+the stance numbers above.
 ### Demons — conversation, contracts, weight, upkeep (D5; `game/contract.*`, `game/demon_talk.*`, `ui/contract_ui.cpp`)
 
 A contained demon can be TALKED to and BOUND by a contract; a bound demon,
@@ -25061,10 +25233,15 @@ think). The `imp_bound` profile is the floor (neutral, plus a `goto` weight of
 - DISMISS (`TB_DEMON_DISMISS`, bit 22, Shift+Y, or the dialogue's): your most
   recent bound or contained demon, from anywhere, departs.
 
-**THE CAST-FILTER HOOK FOR D4.** `demon::AllowCastAt(w, demonId, targetId)`:
-false iff the demon is bound and a forbid `cast` clause's set holds that
-actor. D4's mob casting path must ask it before a demon's cast is emitted (D4
-was built in parallel; until it merges nothing casts, so nothing asks).
+**THE CAST FILTER (wired into D4).** `demon_cast.cpp` `MobCastServe` asks
+`demon::AllowCastAt(w, demonId, targetId, &kitSpell.tags)` just before
+`Cast()`: false iff the demon is bound and a forbid `cast` clause's set holds
+that actor AND the clause's tag predicate (its `arg`: empty = any spell,
+`direct`, `affects_body`, `creates:<mat>`, `alters:<x>`, `targets:<x>`)
+matches the kit spell's footprint tags (null tags match: fail closed). A
+refusal is `MobCastOutcome::Forbidden` (`stats.forbidden`), before any mana
+is spent. So `never cast creates:fire at me` lets a bound demon gust you but
+not burn you. The editor's NEVER-cast card cycles the tag.
 
 **THE UI** (`ui/contract_ui.cpp`, pixel chrome, every string fitted with
 `Fit`). The CONTRACT EDITOR (spellbook header -> `contracts`): your pages and

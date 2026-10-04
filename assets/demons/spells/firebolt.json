@@ -1,0 +1,9 @@
+{
+  "//": "THE CREATURE SPELL KIT (docs/PLAN_demons.md D4; game/demon_cast.h). One file per spell a creature can cast; a behaviour profile's `cast.spells` names these stems (a repeat weighs the draw). `words` is the ordinary grammar of assets/spells/glyphs.json, so it costs the creature exactly what the same words cost you, and it is cast through the same VM. `aim` is how a creature points it: body (the target's centre, led by its velocity when `lead`), feet (the floor under the target), self. `range` is centre-to-centre, world voxels. `tags` are its FOOTPRINT, which D5's prohibitions and D6's schemes filter on: targets (body | ground | self | area), direct (aimed AT a body), creates (materials it puts in the world), alters (e.g. ground_under_target), affectsBody, region (footprint radius, voxels).",
+  "//this": "A FIREBOLT: two words of fire on a fast bolt. Sprays flame where it lands; on a body, the body catches.",
+  "words": "fire fire bolt",
+  "aim": "body",
+  "range": [6, 44],
+  "lead": true,
+  "tags": { "targets": "body", "direct": true, "creates": ["fire"], "alters": "", "affectsBody": true, "region": 3 }
+}

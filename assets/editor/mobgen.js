@@ -4368,13 +4368,24 @@ export function anatomyRecipe(race = 'human') {
  * legLength is measured from the RIG, for the same reason the runtime measures
  * it: the art moves and a hand-tuned constant rots silently when it does.
  */
-function gaitNumbers(table, opts) {
+function gaitNumbers(table, opts, heightM = DEFAULT_HEIGHT_M) {
   const av = { ...AVATAR_CONSTANTS, ...(opts.avatar || {}) };
-  const pl = { ...PLAYER_CONSTANTS, ...(opts.player || {}) };
   const L = table.limbs;
   const hipZ = L['legU.L'].mn[2] + L['legU.L'].size[2];
   const ankleZ = L['foot.L'].mn[2] + 3.0;
   const legLen = (hipZ - ankleZ) / ART_SCALE;               // world voxels
+  // SPEED FOLLOWS SIZE, BELOW A MAN (demons D4: the 0.85 m imp walked at a
+  // man's pace). Every body that could be the player's avatar -- anything at
+  // or above the shortest HUMAN height -- keeps the player's own speeds: that
+  // is the speed contract `speed` exists for (see the note above
+  // STEP_DURATION). A body SMALLER than any human walks and runs slower by
+  // dynamic similarity (equal Froude number: speed ~ sqrt(leg length), height
+  // standing in for the leg of a body of this proportion), so an imp's stride
+  // looks like its own and not a man's on short legs. A rule about size, not
+  // about any race: a small human-race body would get it too.
+  const sizeK = Math.min(1.0, Math.sqrt(Math.max(0.1, heightM) / HEIGHT_BAND[0]));
+  const pl0 = { ...PLAYER_CONSTANTS, ...(opts.player || {}) };
+  const pl = { ...pl0, sprintSpeed: pl0.sprintSpeed * sizeK, walkSpeed: pl0.walkSpeed * sizeK };
   const refSpeed = pl.sprintSpeed * SIDECAR_VOXELS_PER_METRE;
 
   const armCycleMs = vMps => {
@@ -5168,7 +5179,7 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     Object.assign(anatomy.limbs, hairAnatomy);
   }
 
-  const gait = gaitNumbers(table, opts);
+  const gait = gaitNumbers(table, opts, g.body.heightM);
   const clips = scaleClipPositions(buildClips(gait), SKIN_UPSCALE);
 
   return {

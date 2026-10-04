@@ -74,6 +74,18 @@ int WhoIndex(const std::string& sel) {
 }
 const char* const kFetchMats[] = {"water", "blood", "sand", "salt", "oil", "sulfur"};
 const char* const kLeaveM[] = {"4", "8", "16", "32"};
+// A forbid-cast's footprint tag (D4's kit tags; contract.h): "" = any spell.
+const char* const kCastTag[] = {"", "direct", "creates:fire", "creates:lava",
+                                "alters:ground_under_target", "affects_body"};
+const char* CastTagLabel(const std::string& t) {
+  if (t.empty()) return "any spell";
+  if (t == "direct") return "aimed at";
+  if (t == "creates:fire") return "fire";
+  if (t == "creates:lava") return "lava";
+  if (t == "alters:ground_under_target") return "the ground under";
+  if (t == "affects_body") return "on the body";
+  return nullptr;
+}
 
 const char* KindWord(contract::Kind k) {
   return k == contract::Kind::Duty ? "MUST" : k == contract::Kind::Forbid ? "NEVER" : "IF";
@@ -390,7 +402,9 @@ void DrawContractEditor(UIState& s) {
                                                     : c.arg),
               rest);
       } else {
-        const bool leave = c.verb == contract::Verb::Leave;
+        const bool leave = c.verb == contract::Verb::Leave ||
+                           (c.verb == contract::Verb::Cast && c.kind == contract::Kind::Forbid);
+        const bool castTag = c.verb == contract::Verb::Cast;
         const bool pen = c.kind == contract::Kind::Penalty;
         const float wWho = Snap(rest * (leave || pen ? 0.56f : 1.0f) - 3);
         const char* wl = WhoLabel(c.who);
@@ -402,7 +416,18 @@ void DrawContractEditor(UIState& s) {
         if (ImGui::IsItemHovered()) ui::Tip(c.who.c_str());
         float tx2 = tx + wWho + 6;
         const float w2 = rest - wWho - 6;
-        if (leave && !pen) {
+        if (castTag && !pen) {
+          const char* tl = CastTagLabel(c.arg);
+          if (Token("##tag", ImVec2(tx2, ty), tl ? std::string(tl) : c.arg, w2) && !ro) {
+            int k = -1;
+            for (int m = 0; m < 6; m++)
+              if (c.arg == kCastTag[m]) k = m;
+            c.arg = kCastTag[(k + 1) % 6];
+            E.dirty = true;
+          }
+          if (ImGui::IsItemHovered())
+            ui::Tip("Which spells: any, or only those whose footprint matches (the kit's tags).");
+        } else if (leave && !pen) {
           if (Token("##m", ImVec2(tx2, ty), "> " + (c.arg.empty() ? std::string("?") : c.arg) + " m",
                     w2) &&
               !ro) {
@@ -449,7 +474,7 @@ void DrawContractEditor(UIState& s) {
             c.verb == contract::Verb::Leave) {
           ImGui::SetCursorScreenPos(ImVec2(a.x + 14 + fw + 12, fy2));
           if (TextField("##argt",
-                        c.verb == contract::Verb::Goto ? "x y z, or here" : c.verb == contract::Verb::Fetch ? "material" : "metres",
+                        c.verb == contract::Verb::Goto ? "x y z, or here" : c.verb == contract::Verb::Fetch ? "material" : c.verb == contract::Verb::Cast ? "tag (creates:fire)" : "metres",
                         c.arg, fw, ro))
             E.dirty = true;
         }

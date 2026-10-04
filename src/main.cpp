@@ -26,6 +26,7 @@
 #include "sim/plants.h"
 #include "game/bodyreg.h"
 #include "game/demon.h"
+#include "game/demon_cast.h"
 #include "game/demon_lore.h"
 #include "game/demon_talk.h"
 #include "game/brush.h"
@@ -17957,7 +17958,13 @@ int main(int argc, char** argv) {
         };
         static const Vec3 kAxes[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                                       {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-        for (const SpellProjectile& p : spells.Live()) {
+        // ...and every CREATURE's (game/demon_cast.h, D4): its own VM, drawn
+        // exactly like yours.
+        std::vector<const SpellProjectile*> flights;
+        for (const SpellProjectile& p : spells.Live()) flights.push_back(&p);
+        MobCastAppendLive(tickCtx, flights);
+        for (const SpellProjectile* pp : flights) {
+          const SpellProjectile& p = *pp;
           const GlyphLook& lk = glyphs.Delivery(p.cast.delivery.glyph).look;
           const Vec3 at{SpellFxToFloat(p.pos.x), SpellFxToFloat(p.pos.y), SpellFxToFloat(p.pos.z)};
           const Vec3 v{SpellFxToFloat(p.vel.x), SpellFxToFloat(p.vel.y), SpellFxToFloat(p.vel.z)};

@@ -3709,6 +3709,7 @@ void MobSystem::Reset(bool rewindIds) {
   // the attack requests nobody has drained yet. Both are pure derived state, so
   // a Reset simply drops them (game/mob.h AttackRequests).
   attacks_.clear();
+  casts_.clear();   // D4
   actors_.clear();
   blocks_.clear();
   strikes_.clear();
@@ -7309,6 +7310,8 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
         out.attack = false;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
+      // D4: a cast request (game/demon_cast.h drains it after this phase).
+      if (out.cast && casts_.size() < kMaxMobs) casts_.push_back(out.castRequest);
       ApplyAiArm(mob, def, out);
       return;
     }
@@ -25962,6 +25965,40 @@ bool MobSystem::LiftMob(uint64_t mobId, Vec3 vps) {
       mob.AddBodyVelocity(vps);
       return true;
     }
+  return false;
+}
+
+// ---- BLINK (docs/PLAN_demons.md D4; game/demon_cast.h) ----------------------
+// A short teleport: the WHOLE body moves by one offset in one tick. The walk
+// drive places only `origin_`; the limbs are kinematic bodies the next
+// SubmitPose aims at targets derived from it, so moving `origin_` alone would
+// hand Jolt a limb asked to cross the gap in one step -- a kinematic body with
+// that velocity shoves everything it touches. So every limb is TELEPORTED by
+// the same offset (SetBodyPosition: no sweep, which is the point), the drawn
+// height follows, the feet re-plant where the body now stands (footInit_), and
+// any fall/launch state and the planned path are dropped. Refused for a body
+// that is dead, limp or getting up (Jolt owns those limbs).
+bool MobSystem::BlinkMob(uint64_t mobId, Vec3 newOrigin) {
+  for (Mob& m : mobs_) {
+    if (m.id_ != mobId) continue;
+    if (!m.alive_ || m.ragdoll_ != Mob::RagdollPhase::None) return false;
+    const Vec3 d = newOrigin - m.origin_;
+    m.origin_ = newOrigin;
+    m.bodyY_ += d.y;
+    for (MobLimb& L : m.limbs_) {
+      if (!L.body) continue;
+      BodyTransform xf;
+      if (phys_ != nullptr && phys_->GetTransform(L.body, xf))
+        phys_->SetBodyPosition(L.body, xf.pos + d);
+      L.xf.pos = L.xf.pos + d;
+    }
+    m.footInit_ = false;
+    m.fallVel_ = 0.0f;
+    m.airVel_ = Vec3{};
+    m.launched_ = false;
+    m.ai_.path.Clear();
+    return true;
+  }
   return false;
 }
 

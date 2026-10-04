@@ -4032,6 +4032,62 @@ bool SpellSystem::DropNewestStatus(uint64_t casterId) {
   return true;
 }
 
+bool SpellSystem::DropStatus(uint32_t id) {
+  for (size_t i = 0; i < statuses_.size(); i++)
+    if (statuses_[i].id == id) {
+      statuses_[i] = statuses_.back();
+      statuses_.pop_back();
+      return true;
+    }
+  return false;
+}
+
+// demons D4: another VM's ward absorbs THIS VM's carriers, by the same test
+// Tick() applies to its own (a delivery-word filter of the carrier's mech,
+// within the filter's radius).
+int SpellSystem::AbsorbForeign(const SpellSystem& wards) {
+  if (wards.filters_.empty() || !lib_) return 0;
+  auto absorbed = [&](int deliveryGlyph, SpellFxVec at) {
+    const GlyphDef& dg = lib_->Delivery(deliveryGlyph);
+    for (const SpellFilter& f : wards.filters_) {
+      const GlyphDef* w = lib_->At(f.glyph);
+      if (!w || w->sort != GlyphSort::Delivery || w->mech != dg.mech) continue;
+      const int64_t dx = SpellFxFloor(at.x) - SpellFxFloor(f.at.x),
+                    dy = SpellFxFloor(at.y) - SpellFxFloor(f.at.y),
+                    dz = SpellFxFloor(at.z) - SpellFxFloor(f.at.z);
+      if (dx * dx + dy * dy + dz * dz <= (int64_t)f.radius * f.radius) return true;
+    }
+    return false;
+  };
+  int n = 0;
+  for (size_t i = 0; i < live_.size();) {
+    if (absorbed(live_[i].cast.delivery.glyph, live_[i].pos)) {
+      refused_++;
+      n++;
+      live_[i] = live_.back();
+      live_.pop_back();
+    } else {
+      i++;
+    }
+  }
+  return n;
+}
+
+int SpellSystem::RefuseCarriers(bool (*refuse)(void* ctx, const SpellProjectile& p), void* ctx) {
+  int n = 0;
+  for (size_t i = 0; i < live_.size();) {
+    if (refuse(ctx, live_[i])) {
+      refused_++;
+      n++;
+      live_[i] = live_.back();
+      live_.pop_back();
+    } else {
+      i++;
+    }
+  }
+  return n;
+}
+
 void SpellSystem::DropAll(uint64_t casterId) {
   for (size_t i = 0; i < statuses_.size();) {
     if (statuses_[i].casterId == casterId) {

@@ -405,6 +405,14 @@ bool Compile(Page& p, std::vector<std::string>& errs) {
       errs.push_back(at + "fetch needs a material");
     if (c.kind == Kind::Penalty && c.then == Then::None)
       errs.push_back(at + "a penalty needs a consequence (dismiss, destroy, pain)");
+    if (c.kind == Kind::Forbid && c.verb == Verb::Cast && !Trim(c.arg).empty()) {
+      const std::string a = Trim(c.arg);
+      const bool ok = a == "direct" || a == "affects_body" || a.rfind("creates:", 0) == 0 ||
+                      a.rfind("alters:", 0) == 0 || a.rfind("targets:", 0) == 0;
+      if (!ok)
+        errs.push_back(at + "cast's tag is direct, affects_body, creates:<mat>, alters:<x> or "
+                            "targets:<x>");
+    }
     if (c.verb == Verb::Leave && std::atoi(c.arg.c_str()) <= 0)
       errs.push_back(at + "leave needs a distance in metres");
   }
@@ -481,7 +489,9 @@ std::string Describe(const Clause& c) {
   std::string s = KindName(c.kind);
   s += ": ";
   s += VerbName(c.verb);
-  if (!Trim(c.arg).empty() && (c.verb == Verb::Fetch || c.verb == Verb::Goto)) s += " " + Trim(c.arg);
+  if (!Trim(c.arg).empty() &&
+      (c.verb == Verb::Fetch || c.verb == Verb::Goto || c.verb == Verb::Cast))
+    s += " " + Trim(c.arg);
   if (!Trim(c.into).empty() && c.verb == Verb::Fetch) s += " into " + Trim(c.into);
   if (!Trim(c.who).empty()) s += " " + Trim(c.who);
   if (c.verb == Verb::Leave && !Trim(c.arg).empty()) s += " > " + Trim(c.arg) + " m";

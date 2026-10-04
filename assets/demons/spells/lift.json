@@ -1,0 +1,9 @@
+{
+  "//": "LIFT, THEN DROP: `lift@0.5 aura bolt` puts a sustained LIFT on whatever body the bolt strikes (the `aura` status rides the body: Mob::AddBodyVelocity for a creature, the controller's velocity for a player), billed to the caster every tick it holds. `releaseAfterTicks` is the drop: that many ticks after the status first held, the caster lets go and the body falls from wherever it got to. CALIBRATION, measured: the VM turns a sustained gravity mod into `-g x 0.012` voxels/s PER TICK (spell.cpp, the status loop), so `lift@1` is ~12 vox/s a tick against gravity's 3.3 -- a launch, not the weightlessness the glyph's description promises. @0.5 for 12 ticks nets ~2.7 vox/s a tick upward: about 7 voxels while held and 5 more coasting, a 1.2 m drop. Raise either for a greater demon.",
+  "words": "lift@0.5 aura bolt",
+  "aim": "body",
+  "range": [4, 40],
+  "lead": true,
+  "releaseAfterTicks": 12,
+  "tags": { "targets": "body", "direct": true, "creates": [], "alters": "", "affectsBody": true, "region": 3 }
+}

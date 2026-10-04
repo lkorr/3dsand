@@ -143,6 +143,12 @@ enum class Intent : uint8_t {
   Socialize,     // stand at a gathering place facing someone
   Eat,           // stand at home facing the hearth
   Goto,          // go there and stand
+  // ---- MAGIC (2026-10-04, docs/PLAN_demons.md D4) --------------------------
+  // Emit a CastRequest (CastTuning) and hold the facing through its commit,
+  // the RequestAttack shape. WHICH spell, and whether it can fly at all, is the
+  // owner's business (game/demon_cast.h, the creature spell kit): this layer
+  // only decides "near enough, facing, and the cadence says now".
+  Cast,
   Count,
 };
 // The activity verb for a schedule row's `do` ("sleep" -> Intent::Sleep), or
@@ -312,6 +318,38 @@ struct Defense {
   // Ticks a defence is held after the blow ends, so a guard does not drop in
   // the very tick the edge passes and eat the recoil.
   uint32_t holdTicks = 4;
+};
+
+// ---- HOW A CREATURE CASTS (2026-10-04, docs/PLAN_demons.md D4) -------------
+//
+// The `cast` block of a profile. Like AttackTuning::styles, the SPELL NAMES are
+// passed through untouched: they name entries of the creature spell kit
+// (assets/demons/spells/, game/demon_cast.h), and this layer must not know
+// what is in it. A repeated name weighs the draw. Defaults are a creature
+// that never casts (no spells, a zero range), so every older profile is
+// unchanged.
+struct CastTuning {
+  std::vector<std::string> spells;
+  // Centre-to-centre, world voxels: "near enough to try". Each kit spell then
+  // has its own range, checked by the owner when it draws one.
+  float rangeMin = 0.0f;
+  float rangeMax = 0.0f;
+  // Ticks between casts + a hash-RNG jitter in [0, jitter): SPARING by default.
+  uint32_t cadenceTicks = 150;
+  uint32_t jitterTicks = 60;
+  // Ticks after FIRST seeing a target before the first cast (a creature that
+  // opens with a fireball the tick it spots you is unfair, not cunning).
+  uint32_t firstDelayTicks = 45;
+  // Facing held for the cast, like AttackTuning::commitTicks.
+  uint32_t commitTicks = 8;
+  float aimTolerance = 0.6f;
+  // The creature's own mana pool (game/spell.h CasterState), read by the owner
+  // the first time this creature casts.
+  int32_t mana = 100;
+  int32_t regenPerMille = 220;   // per-mille of a mana point per tick
+  // Flight carriers this creature may have in the air at once (rule 2: 64
+  // casters stay bounded however eager their cadence).
+  int32_t maxLive = 2;
 };
 
 struct AttackTuning {
@@ -577,6 +615,7 @@ struct Profile {
   Movement movement;
   AttackTuning attack;
   Defense defense;
+  CastTuning cast;   // D4: magic (empty = never casts)
   IntentTuning intents[(int)Intent::Count];
   // Flat score bonus the current intent keeps. See the arbiter note above.
   float hysteresis = 0.22f;
@@ -804,6 +843,19 @@ struct AttackRequest {
   float distance = 0;       // centre-to-centre at the moment of the decision
 };
 
+// One NPC CAST request (D4): the attack seam's shape for magic. Drained by the
+// owner (game/demon_cast.h MobCastTick), which draws the spell from the
+// profile's CastTuning::spells, prices it against the creature's own mana and
+// casts it through the spell VM. Nothing here knows what a spell is.
+struct CastRequest {
+  uint64_t mobId = 0;
+  uint64_t targetId = 0;
+  Vec3 targetPoint{};       // the target's centre, world voxels, at the decision
+  Vec3 targetVel{};         // its low-passed velocity, voxels/sec (Brain::targetVel)
+  uint32_t tick = 0;
+  float distance = 0;       // centre-to-centre at the decision
+};
+
 // ---- THE ROUTINE: what the resident layer asks of the body (P7) -----------
 //
 // Written EVERY TICK by world/refs_npc.cpp (the resident controller, which
@@ -941,6 +993,12 @@ struct Brain {
   // ---- counters (diagnostics; the gates assert on them) ----
   uint32_t guards = 0, dodges = 0, feints = 0, ripostes = 0;
 
+  // ---- the cast clock (D4, CastTuning) ----
+  // 0 = not armed yet: the first tick with a target books firstDelayTicks.
+  uint32_t nextCastTick = 0;
+  uint32_t lastCastTick = 0;
+  uint32_t castsIssued = 0;
+
   // ---- footwork ----
   int circleSign = 0;            // -1 / +1, redrawn on a cadence
   uint32_t circleUntil = 0;
@@ -1008,6 +1066,9 @@ struct IntentOut {
   float guardReach = 0.85f;
   // A FEINT pulling out: abandon the live swing if it is still winding up.
   bool cancelSwing = false;
+  // ---- magic (D4) ----
+  bool cast = false;
+  CastRequest castRequest;
 };
 
 // One tick of AI for one creature. Returns false when the mob has no profile,

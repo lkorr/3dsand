@@ -1439,6 +1439,19 @@ class SpellSystem {
   // kStrikeMaxSearch cells and a ward's edge may lie in between.
   bool StrikeWarded(int32_t x, int32_t y, int32_t z) const;
 
+  // ---- ACROSS VMs (demons D4, game/demon_cast.h) ------------------------------
+  // A creature casts through ITS OWN SpellSystem (one per caster, beside each
+  // player's), so a ward in one system has to reach the carriers of another:
+  // kill this system's FLIGHT carriers (bombs are bodies) that sit inside a
+  // DELIVERY filter of `wards` -- the `projectile null aura self` rule Tick()
+  // applies to its own. Returns how many.
+  int AbsorbForeign(const SpellSystem& wards);
+  // Drop ONE status by its id (SpellStatus::id). False if no such status.
+  bool DropStatus(uint32_t id);
+  // Kill every flight carrier `refuse` says no to (a contained demon's bolt at
+  // its ring when its `cast_out` channel is severed). Returns how many.
+  int RefuseCarriers(bool (*refuse)(void* ctx, const SpellProjectile& p), void* ctx);
+
   void Clear() {
     live_.clear();
     bombs_.clear();

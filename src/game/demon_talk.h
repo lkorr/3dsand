@@ -92,6 +92,7 @@ struct EntityIO;
 struct LiveDemon;
 struct DemonWorld;
 struct UIState;
+struct KitTags;   // game/demon_cast.h (D4): a kit spell's footprint
 
 namespace demon {
 
@@ -209,10 +210,17 @@ int32_t ContractWeight(const LiveDemon& ld);
 // strike its brain's current target? Counts, and finds attack penalties.
 bool PactAllowBlow(DemonWorld& d, LiveDemon& ld, uint64_t targetId);
 
-// THE CAST-FILTER HOOK FOR D4: may demon `demonId` cast at actor `targetId`
-// (a mob id or ai::kPlayerActorBase + session)? False iff it is bound and a
-// forbid `cast` clause's set holds that actor. Not a demon / no pact: true.
-bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId);
+// THE CAST FILTER (D4's MobCastServe asks it before Cast()): may demon
+// `demonId` cast a spell with footprint `tags` at actor `targetId` (a mob id
+// or ai::kPlayerActorBase + session)? False iff it is bound and a forbid
+// `cast` clause's set holds that actor AND the clause's tag predicate (its
+// `arg`: "" any spell, `direct`, `affects_body`, `creates:<mat>`,
+// `alters:<x>`, `targets:<x>`) matches `tags` -- a null `tags` matches every
+// predicate (fail closed). Not a demon / no pact: true.
+bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId,
+                 const KitTags* tags = nullptr);
+// Does a forbid-cast clause's tag predicate hold for these tags?
+bool CastTagMatches(const std::string& pred, const KitTags* tags);
 
 // Bind attempt (what TB_DEMON_PRESENT runs; public for the gate).
 PresentInfo Present(TickAuthorityCtx& w, std::span<SessionTick> players, int session,

@@ -1098,6 +1098,11 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
   // The planted (not swinging) feet, for the FEET-DERIVED height below.
   float plantedSum = 0;
   int nPlanted = 0;
+  // ...and how HIGH the body may stand and still reach every one of them
+  // (the reach cap at the feet-derived height, below), and how many legs are
+  // walking at all.
+  float reachCeil = 1e9f;
+  int nLegs = 0;
   const Vec3 pivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
   const Quat yaw = AxisAngle({0, 1, 0}, heading_);
   // THE IK EFFECTOR IS THE ANKLE, NOT THE SOLE.
@@ -1278,6 +1283,14 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
           std::sqrt(std::max(reach * reach - (dx * dx + dz * dz), 0.0f));
       crouchNeed = std::max(crouchNeed, (restHipY_ - restSoleY_) - vert);
       crouchLegLength = std::max(crouchLegLength, f.legLength);
+      // The highest MIN CORNER from which THIS chain's hip still reaches its
+      // planted ankle (`planted` is the ankle point; the hip stands its own
+      // anchor height above the min corner). Planted feet only: a swinging
+      // foot is in the air on purpose.
+      nLegs++;
+      if (!f.swinging)
+        reachCeil = std::min(
+            reachCeil, f.planted.y + vert - sk.parts[ch.parts[0]].anchorLocal.y);
     }
   }
 
@@ -1375,8 +1388,34 @@ void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) 
     const float upAuthority =
         std::max(1.0f, legLen * std::max(0.15f, g.stepThreshold));
     const float downAuthority = std::max(0.5f, legLen * 0.08f);
-    targetY = std::clamp(targetY, groundTarget - downAuthority,
-                         groundTarget + upAuthority);
+    // ---- ...AND A STANDING BODY'S LEGS REACH ITS FEET (demons D4) ------------
+    //
+    // Measured on the imp (0.85 m, legs 3.07 voxels), and on the human too:
+    // standing still on a FLAT pad both stood ~0.5 voxel off the floor, feet
+    // dangling from straight legs -- the `rideHeight` stance (~1.3 voxels on
+    // every generated body) lifts the min corner past the 0.75 its ankle
+    // overhang needs, and nothing asked whether the legs still reached. On
+    // rough ground the imp then hovered a full voxel: its BOX rests on the
+    // highest column under it (MobSystem::SenseGround, the max over the
+    // footprint), which for a body that small is often a step its feet do not
+    // stand on, and `downAuthority` held the drawn body within half a voxel of
+    // that column. Same rule at every size; a short leg simply has no slack
+    // to hide it in.
+    //
+    // So, ONLY WHILE STANDING (no foot in the air, no stride under way): the
+    // body is drawn no higher than every planted foot is reachable from, and
+    // the floor on how low it may sit yields to the same reach. Standing, the
+    // feet were planted on the ground under them this very pose and are the
+    // truth; WALKING they can be a stride stale (the hill-sinking bug the
+    // authority clamp exists for), so a walking body is placed exactly as
+    // before.
+    float floorY = groundTarget - downAuthority;
+    const bool standing = nLegs > 0 && nPlanted == nLegs && speedFactor <= 0.05f;
+    if (standing && reachCeil < 1e8f) {
+      targetY = std::min(targetY, reachCeil);
+      floorY = std::min(floorY, reachCeil);
+    }
+    targetY = std::clamp(targetY, floorY, groundTarget + upAuthority);
     // THE GOOD KNEE PAYS FOR THE STUMP'S CLEARANCE here too, AFTER the
     // authority clamp on purpose: a deliberate crouch, not the stale-foot error
     // that clamp exists to bound.

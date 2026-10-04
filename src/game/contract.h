@@ -29,7 +29,11 @@
 //                                that takes it), then come back
 //             spin               turn on the spot
 //   forbid    attack (who)       HARD FILTER: never targets / strikes `who`
-//             cast (who)         HARD FILTER: no spell at `who` (D4's hook)
+//             cast (who, arg)    HARD FILTER: no spell at `who` (D4's caster
+//                                asks demon::AllowCastAt); `arg` narrows it to
+//                                spells whose footprint tags match: direct,
+//                                affects_body, creates:<mat>, alters:<x>,
+//                                targets:<x> ("" = any spell)
 //             leave (who, arg)   never further than `arg` metres from `who`
 //   penalty   attack (who) -> then      a blow ASKED at `who` fires `then`
 //             leave (who, arg) -> then  further than `arg` m from `who`

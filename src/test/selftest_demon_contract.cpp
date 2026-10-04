@@ -51,6 +51,7 @@
 #include "game/caster.h"
 #include "game/contract.h"
 #include "game/demon.h"
+#include "game/demon_cast.h"
 #include "game/demon_talk.h"
 #include "game/dialogue.h"
 #include "game/mob.h"
@@ -147,6 +148,7 @@ struct Out {
   std::string refusedNode, boundNode;
   int reservedBound = -1;
   bool released = false, releasedProfile = false;
+  bool castAtYouFire = true, castAtYouNoTags = true;
   float distBefore = 0, distAfter = 0;
   uint32_t blowsAtSummoner = 0, allowedAtSummoner = 0, blowsUnsanctioned = 0;
   bool dismissedGone = false;
@@ -333,6 +335,17 @@ Out RunContract(Ctx& c, Mode mode, int r, const GlyphLibrary& lib, int gSummon, 
   out.released = ld() && ld()->state == DemonState::Released && ld()->pact;
   if (const ai::Brain* b = c.mobs.MobBrain(id))
     out.releasedProfile = b->profile >= 0 && b->profile == c.mobs.Behaviors().Find("imp_bound");
+  {
+    // D4's cast hook (demon_cast.cpp MobCastServe asks exactly this): the
+    // servant's `never cast at me` refuses a firebolt at the summoner, and a
+    // cast whose footprint is unknown (no tags) fails closed.
+    KitTags fire;
+    fire.targets = "body";
+    fire.direct = true;
+    fire.creates = {"fire"};
+    out.castAtYouFire = demon::AllowCastAt(rig.Authority(), id, meId, &fire);
+    out.castAtYouNoTags = demon::AllowCastAt(rig.Authority(), id, meId, nullptr);
+  }
   if (!out.released) return out;
 
   if (mode == Mode::Servant) {
@@ -501,6 +514,29 @@ Status GateDemonContract(Ctx& c, std::string& detail) {
     e.clear();
     check(contract::ParseTrigger("count(hostile_to(me)) > 0 & dist < 6", {}, cs, e) && cs.size() == 2,
           "a trigger with a selector parses: " + e);
+    {
+      KitTags lava;
+      lava.targets = "ground";
+      lava.creates = {"lava"};
+      lava.alters = "ground_under_target";
+      KitTags fire;
+      fire.direct = true;
+      fire.creates = {"fire"};
+      check(demon::CastTagMatches("creates:fire", &fire) &&
+                !demon::CastTagMatches("creates:fire", &lava) &&
+                demon::CastTagMatches("alters:ground_under_target", &lava) &&
+                !demon::CastTagMatches("direct", &lava) && demon::CastTagMatches("", &lava) &&
+                demon::CastTagMatches("creates:fire", nullptr),
+            "a forbid-cast's tag predicate filters by the kit's footprint tags");
+      contract::Page tp;
+      std::string te;
+      check(contract::PageFromJson(R"J({"name": "t", "clauses": [{"kind": "forbid", "verb": "cast",
+                "who": "me", "arg": "creates:fire"}]})J", tp, te),
+            "a `never cast fire at me` page compiles: " + te);
+      check(!contract::PageFromJson(R"J({"name": "t", "clauses": [{"kind": "forbid", "verb": "cast",
+                "who": "me", "arg": "fireish"}]})J", tp, te),
+            "an unknown cast tag is refused");
+    }
     contract::Effect ef;
     e.clear();
     check(contract::ParseEffect("fetched+1", {"fetched"}, ef, e) && ef.counter == 0 && ef.value == 1,
@@ -557,6 +593,8 @@ Status GateDemonContract(Ctx& c, std::string& detail) {
   check(s1.reservedBound == s1.servant.upkeep && s1.servant.upkeep > 0,
         Format("S3: the upkeep is reserved out of the mana max (%d reserved, upkeep %d)",
                s1.reservedBound, s1.servant.upkeep));
+  check(!s1.castAtYouFire && !s1.castAtYouNoTags,
+        "S4: D4's cast hook refuses the bound servant a spell at you (fire, and untagged)");
   // S4. release
   check(s1.released && s1.releasedProfile,
         "S4: the dialogue's release lets him out, bound, on the imp_bound floor");
