@@ -15699,17 +15699,26 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       // What the collider lost across the whole carve, spall included. The
       // predicate-built `removed` is deliberately discarded here rather than
       // merged: on a fine skin it was only ever an approximation of this.
-      std::unordered_set<uint64_t> after;
-      after.reserve(limb.voxels.size() * 2);
-      auto ck = [](const DebrisVoxel& v) -> uint64_t {
-        return ((uint64_t)(uint32_t)(v.x + 32768) << 42) |
-               ((uint64_t)(uint32_t)(v.y + 32768) << 21) |
-               (uint64_t)(uint32_t)(v.z + 32768);
+      // A bit per cell of the int8 lattice's whole range (2 MiB of bits,
+      // zeroed ONCE per thread and handed back zeroed: only the bits set here
+      // are cleared) rather than a hash set: the same membership test, in the
+      // same before-order (PLAN_fight64_perf M).
+      static thread_local std::vector<uint64_t> after(
+          (256u * 256u * 256u) / 64u, 0ull);
+      auto ci = [](const DebrisVoxel& v) -> uint32_t {
+        return ((uint32_t)(v.z + 128) << 16) | ((uint32_t)(v.y + 128) << 8) |
+               (uint32_t)(v.x + 128);
       };
-      for (const DebrisVoxel& v : limb.voxels) after.insert(ck(v));
+      for (const DebrisVoxel& v : limb.voxels) {
+        const uint32_t k = ci(v);
+        after[k >> 6] |= 1ull << (k & 63u);
+      }
       removed.clear();
-      for (const DebrisVoxel& v : colliderBefore)
-        if (!after.count(ck(v))) removed.push_back(v);
+      for (const DebrisVoxel& v : colliderBefore) {
+        const uint32_t k = ci(v);
+        if (!(after[k >> 6] & (1ull << (k & 63u)))) removed.push_back(v);
+      }
+      for (const DebrisVoxel& v : limb.voxels) after[ci(v) >> 6] = 0ull;
     }
     LimbVoxelsToParticles(limb, PhysScaleOf(limb), removed, world, spawns);
   }
@@ -16020,13 +16029,45 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // the animation driving a stump that is no longer connected to anything.
   const uint32_t n = (uint32_t)limb.voxels.size();
   if (n >= 2) {
+    // A DENSE GRID over the collider's box rather than a hash map
+    // (PLAN_fight64_perf M: every blade carve of the 64-creature brawl paid
+    // the map). Same lookup -- the LAST voxel at a cell wins, as the map's
+    // `map[key] = i` did -- so the flood visits the same voxels in the same
+    // order. A box past 2^20 cells (never an authored limb) keeps the map.
+    IVec3 bmn{127, 127, 127}, bmx{-128, -128, -128};
+    for (const DebrisVoxel& v : limb.voxels) {
+      bmn = {std::min(bmn.x, (int)v.x), std::min(bmn.y, (int)v.y), std::min(bmn.z, (int)v.z)};
+      bmx = {std::max(bmx.x, (int)v.x), std::max(bmx.y, (int)v.y), std::max(bmx.z, (int)v.z)};
+    }
+    const IVec3 bd{bmx.x - bmn.x + 1, bmx.y - bmn.y + 1, bmx.z - bmn.z + 1};
+    const bool dense = (uint64_t)bd.x * bd.y * bd.z <= (1u << 20);
+    std::vector<uint32_t> grid;   // index + 1, 0 = none
     std::unordered_map<uint32_t, uint32_t> map;
-    map.reserve(n * 2);
     auto key = [](int x, int y, int z) {
       return (uint32_t)((x + 128) | ((y + 128) << 8) | ((z + 128) << 16));
     };
-    for (uint32_t i = 0; i < n; i++)
-      map[key(limb.voxels[i].x, limb.voxels[i].y, limb.voxels[i].z)] = i;
+    if (dense) {
+      grid.assign((size_t)bd.x * bd.y * bd.z, 0u);
+      for (uint32_t i = 0; i < n; i++) {
+        const DebrisVoxel& v = limb.voxels[i];
+        grid[((size_t)(v.z - bmn.z) * bd.y + (v.y - bmn.y)) * bd.x + (v.x - bmn.x)] = i + 1u;
+      }
+    } else {
+      map.reserve(n * 2);
+      for (uint32_t i = 0; i < n; i++)
+        map[key(limb.voxels[i].x, limb.voxels[i].y, limb.voxels[i].z)] = i;
+    }
+    // -1 = no voxel there.
+    auto at = [&](int x, int y, int z) -> int64_t {
+      if (dense) {
+        const int gx = x - bmn.x, gy = y - bmn.y, gz = z - bmn.z;
+        if (gx < 0 || gy < 0 || gz < 0 || gx >= bd.x || gy >= bd.y || gz >= bd.z)
+          return -1;
+        return (int64_t)grid[((size_t)gz * bd.y + gy) * bd.x + gx] - 1;
+      }
+      auto it = map.find(key(x, y, z));
+      return it == map.end() ? -1 : (int64_t)it->second;
+    };
     std::vector<int32_t> comp(n, -1);
     std::vector<uint32_t> compSize, stack;
     for (uint32_t seed = 0; seed < n; seed++) {
@@ -16043,10 +16084,10 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
         const int d[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                              {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
         for (auto& dd : d) {
-          auto it = map.find(key(v.x + dd[0], v.y + dd[1], v.z + dd[2]));
-          if (it != map.end() && comp[it->second] == -1) {
-            comp[it->second] = c;
-            stack.push_back(it->second);
+          const int64_t j = at(v.x + dd[0], v.y + dd[1], v.z + dd[2]);
+          if (j >= 0 && comp[(size_t)j] == -1) {
+            comp[(size_t)j] = c;
+            stack.push_back((uint32_t)j);
           }
         }
       }
@@ -16812,25 +16853,15 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // nothing interesting costs one walk over ~100 cached cells and exits
   // (PLAN §4.2).
   IVec3 lo{}, hi{};
-  {
-    const float sinv = 1.0f / (float)std::max(1u, v.physScale);
-    Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
-    for (int k = 0; k < 8; k++) {
-      // From `sizeMin`, not 0: a corpse piece's lattice is centred and runs
-      // negative (BurnLimbView::sizeMin), and a box from 0 left half of it
-      // unscanned -- no fire seen, no sibling's heat seen, on that half.
-      const Vec3 c{(float)((k & 1) ? v.size.x : v.sizeMin.x) * sinv,
-                   (float)((k & 2) ? v.size.y : v.sizeMin.y) * sinv,
-                   (float)((k & 4) ? v.size.z : v.sizeMin.z) * sinv};
-      const Vec3 w = v.xf->pos + Rotate(q, c);
-      mn.x = std::min(mn.x, w.x); mn.y = std::min(mn.y, w.y);
-      mn.z = std::min(mn.z, w.z);
-      mx.x = std::max(mx.x, w.x); mx.y = std::max(mx.y, w.y);
-      mx.z = std::max(mx.z, w.z);
-    }
-    lo = {ifloor(mn.x) - 1, ifloor(mn.y) - 1, ifloor(mn.z) - 1};
-    hi = {ifloor(mx.x) + 1, ifloor(mx.y) + 1, ifloor(mx.z) + 1};
-  }
+  BurnBoxOf(v, lo, hi);
+  // The world side taken ahead (BurnWalkPre), when it is for this very box.
+  const BurnWalkPre* pre =
+      (v.walkPre && v.walkPre->valid && v.walkPre->lo.x == lo.x &&
+       v.walkPre->lo.y == lo.y && v.walkPre->lo.z == lo.z &&
+       v.walkPre->hi.x == hi.x && v.walkPre->hi.y == hi.y &&
+       v.walkPre->hi.z == hi.z)
+          ? v.walkPre
+          : nullptr;
   // ---- ASLEEP? (BodyBurnState::sleepKey) ----------------------------------
   // Only when every OTHER input to the idle exit below already says idle --
   // nothing alight, no acid on it, no index held, no sibling's heat -- so the
@@ -16889,19 +16920,24 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const IVec3 c0 = ChunkOfCell(lo.x, lo.y, lo.z),
                 c1 = ChunkOfCell(hi.x, hi.y, hi.z);
     bool known = true;
-    for (int cz = c0.z; cz <= c1.z && known; cz++)
-      for (int cy = c0.y; cy <= c1.y && known; cy++)
-        for (int cx = c0.x; cx <= c1.x && known; cx++) {
-          const IVec3 wc{cx, cy, cz};
-          if (!world.ChunkInWindow(wc)) continue;  // reads as air, no fetch
-          const CachedChunk* cc = world.Cached(wc);
-          if (!cc || cc->voxels.size() != kChunkVol) {
-            known = false;
-            break;
+    if (pre) {
+      known = pre->known;
+      hw = pre->hw;
+    } else {
+      for (int cz = c0.z; cz <= c1.z && known; cz++)
+        for (int cy = c0.y; cy <= c1.y && known; cy++)
+          for (int cx = c0.x; cx <= c1.x && known; cx++) {
+            const IVec3 wc{cx, cy, cz};
+            if (!world.ChunkInWindow(wc)) continue;  // reads as air, no fetch
+            const CachedChunk* cc = world.Cached(wc);
+            if (!cc || cc->voxels.size() != kChunkVol) {
+              known = false;
+              break;
+            }
+            fnv(hw, (uint64_t)(uintptr_t)cc);
+            fnv(hw, cc->version);
           }
-          fnv(hw, (uint64_t)(uintptr_t)cc);
-          fnv(hw, cc->version);
-        }
+    }
     if (!known) {
       miss |= BodyBurnState::kMissUncached;
     } else {
@@ -16952,7 +16988,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   st.sleepMiss = miss;
   st.sleepKey = 0;
   scanHot.clear();
-  {
+  if (pre) {
+    // Taken ahead for this box (PrecomputeBurnWalks): the same cells, and the
+    // same fetch requests issued now, in the walk's order.
+    scanHot = pre->scanHot;
+    for (const IVec3& wc : pre->fetches)
+      world.RequestChunkFetch(wc, World::FetchSource::Mob);
+    burnStats_.walkCells += pre->seen;
+  } else {
     burnprof::Scope bpWalk(burnprof::kWalk);
     uint32_t seen = 0;
     // ONE CHUNK'S RUN OF A ROW AT A TIME. The window test, the chunk lookup
@@ -18527,11 +18570,129 @@ static inline void BurnShareOf(uint32_t frontPot, uint32_t opsPot, uint64_t w,
   wLeft -= w;
 }
 
+void MobSystem::BurnBoxOf(const BurnLimbView& v, IVec3& lo, IVec3& hi) {
+  const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
+  const float sinv = 1.0f / (float)std::max(1u, v.physScale);
+  Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
+  for (int k = 0; k < 8; k++) {
+    // From `sizeMin`, not 0: a corpse piece's lattice is centred and runs
+    // negative (BurnLimbView::sizeMin), and a box from 0 left half of it
+    // unscanned -- no fire seen, no sibling's heat seen, on that half.
+    const Vec3 c{(float)((k & 1) ? v.size.x : v.sizeMin.x) * sinv,
+                 (float)((k & 2) ? v.size.y : v.sizeMin.y) * sinv,
+                 (float)((k & 4) ? v.size.z : v.sizeMin.z) * sinv};
+    const Vec3 w = v.xf->pos + Rotate(q, c);
+    mn.x = std::min(mn.x, w.x); mn.y = std::min(mn.y, w.y);
+    mn.z = std::min(mn.z, w.z);
+    mx.x = std::max(mx.x, w.x); mx.y = std::max(mx.y, w.y);
+    mx.z = std::max(mx.z, w.z);
+  }
+  lo = {ifloor(mn.x) - 1, ifloor(mn.y) - 1, ifloor(mn.z) - 1};
+  hi = {ifloor(mx.x) + 1, ifloor(mx.y) + 1, ifloor(mx.z) + 1};
+}
+
+void MobSystem::BurnWalkOf(const BurnLimbView& v, const World& world,
+                           BurnWalkPre& out) const {
+  out.valid = false;
+  out.scanHot.clear();
+  out.fetches.clear();
+  if (v.xf == nullptr || v.Size() == 0) return;
+  BurnBoxOf(v, out.lo, out.hi);
+  const IVec3 lo = out.lo, hi = out.hi;
+  // The sleep key's world digest, exactly as BurnOneLimb takes it.
+  auto fnv = [](uint64_t& h, uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+  };
+  uint64_t hw = 1469598103934665603ull;
+  const IVec3 c0 = ChunkOfCell(lo.x, lo.y, lo.z), c1 = ChunkOfCell(hi.x, hi.y, hi.z);
+  bool known = true;
+  for (int cz = c0.z; cz <= c1.z && known; cz++)
+    for (int cy = c0.y; cy <= c1.y && known; cy++)
+      for (int cx = c0.x; cx <= c1.x && known; cx++) {
+        const IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) continue;  // reads as air, no fetch
+        const CachedChunk* cc = world.Cached(wc);
+        if (!cc || cc->voxels.size() != kChunkVol) {
+          known = false;
+          break;
+        }
+        fnv(hw, (uint64_t)(uintptr_t)cc);
+        fnv(hw, cc->version);
+      }
+  out.known = known;
+  out.hw = hw;
+  // ...and the walk, exactly as BurnOneLimb walks it, its fetches recorded.
+  IVec3 memoChunk{INT_MIN, INT_MIN, INT_MIN};
+  const CachedChunk* memoCC = nullptr;
+  uint32_t seen = 0;
+  for (int y = lo.y; y <= hi.y && seen < kBurnScanCells; y++)
+    for (int z = lo.z; z <= hi.z && seen < kBurnScanCells; z++)
+      for (int x = lo.x; x <= hi.x && seen < kBurnScanCells;) {
+        const int nRun = std::min<int>(std::min(hi.x, x | 15) - x + 1,
+                                       (int)(kBurnScanCells - seen));
+        seen += (uint32_t)nRun;
+        const int x0 = x;
+        x += nRun;
+        if (!world.CellInWindow({x0, y, z})) continue;  // reads as air
+        const IVec3 wc = ChunkOfCell(x0, y, z);
+        if (wc.x != memoChunk.x || wc.y != memoChunk.y || wc.z != memoChunk.z) {
+          memoChunk = wc;
+          memoCC = world.Cached(wc);
+        }
+        if (!memoCC || memoCC->voxels.size() != kChunkVol) {
+          out.fetches.push_back(wc);
+          continue;
+        }
+        const uint32_t* row = memoCC->voxels.data() +
+                              ((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk;
+        for (int xx = x0; xx < x; xx++) {
+          const uint32_t m = row[xx & 15] & 0xFFFu;
+          if (m == 0 || m >= matHot_.size()) continue;
+          if (matHot_[m] || matAttacksBody_[m]) out.scanHot.push_back({xx, y, z});
+        }
+      }
+  out.seen = seen;
+  out.valid = true;
+}
+
+// THE BURN PASS'S WORLD SIDE FOR THE WHOLE CROWD, AHEAD (BurnWalkPre). One task
+// per creature BurnLimbs may visit (the living; the dead that are awake), each
+// limb's box, digest and walk into the creature's own burnPre_. Reads the
+// world mirror and the tables only; nothing in BurnLimbs writes either.
+void MobSystem::PrecomputeBurnWalks(uint32_t tick, World& world) {
+  const World& cw = world;
+  workpool::ParallelFor(mobs_.size(), 1, [&](size_t i) {
+    Mob& m = mobs_[i];
+    if (m.rigReleased_ || m.IsGhost() || (!m.alive_ && m.deadAsleep_) || m.def_ == nullptr)
+      return;
+    m.burnPreTick_ = tick;
+    if (m.burnPre_.size() != m.limbs_.size()) m.burnPre_.resize(m.limbs_.size());
+    for (size_t li = 0; li < m.limbs_.size(); li++) {
+      BurnWalkPre& p = m.burnPre_[li];
+      p.valid = false;
+      if (!m.limbs_[li].body) continue;
+      // The fields BurnBoxOf and the walk read, as Mob::ViewOf sets them --
+      // built here rather than through ViewOf, which also arms the wound table
+      // through a shared memo (MaterialIdNamed) that a task must not write.
+      const MobLimb& L = m.limbs_[li];
+      BurnLimbView v;
+      v.skin = L.HasFineSkin() ? const_cast<std::vector<PrefabVoxel>*>(&L.skinVoxels) : nullptr;
+      v.coll = L.HasFineSkin() ? nullptr : const_cast<std::vector<DebrisVoxel>*>(&L.voxels);
+      v.xf = &L.xf;
+      v.size = L.size;
+      v.physScale = m.PhysScaleOf(L);
+      BurnWalkOf(v, cw, p);
+    }
+  });
+}
+
 void MobSystem::BurnLimbs(uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns) {
   burnprof::Scope bpScope(burnprof::kBurnLimbs);
   if (!BurnTablesReady() || mobs_.empty()) return;
+  PrecomputeBurnWalks(tick, world);
   // Rotate the start creature by tick, for the reason Mob::BurnTick rotates
   // its start limb: a shared budget spent in a fixed order starves the tail.
   const size_t nm = mobs_.size();
@@ -18692,6 +18853,10 @@ bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps
     const uint32_t front0 = front, ops0 = ops;
     BurnLimbView v = ViewOf(limbs_[li]);
     v.corrodeCoat = limbs_[li].coat.corrosive > 0;
+    // The world side taken ahead this tick (MobSystem::PrecomputeBurnWalks);
+    // BurnOneLimb uses it only if the box still matches.
+    if (burnPreTick_ == tick && li < (int)burnPre_.size() && burnPre_[li].valid)
+      v.walkPre = &burnPre_[li];
     TwinShadowInto(li, v);  // joint-twin cells: one copy rolls per tick
     if (!crossHeat_.empty()) {
       v.crossHeat = &crossHeat_;

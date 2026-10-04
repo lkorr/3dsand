@@ -940,6 +940,26 @@ inline uint64_t CrossHeatKey(IVec3 c) {
          (uint64_t)((uint32_t)c.z & 0x1FFFFFu);
 }
 
+// THE BURN PASS'S WORLD SIDE, TAKEN AHEAD (PLAN_fight64_perf M). What
+// MobSystem::BurnOneLimb reads of the WORLD for one limb is a pure function
+// of the world-cell box round the limb (`lo`..`hi`): the sleep key's world
+// digest (which chunks, their cache entries and versions) and the walk's hot
+// cells. The CPU mirror does not change during MobSystem::BurnLimbs, so
+// MobSystem::PrecomputeBurnWalks takes both for every limb across the work
+// pool before the pot runs, and BurnOneLimb uses them when the box it
+// computes is the same box (it always is unless the limb was carved this
+// tick). The walk's chunk-fetch requests -- a shared queue -- are recorded
+// and issued by BurnOneLimb when it uses the walk, in the walk's order.
+struct BurnWalkPre {
+  bool valid = false;
+  IVec3 lo{}, hi{};
+  bool known = false;     // every chunk of the box cached (the sleep key exists)
+  uint64_t hw = 0;        // the key's world digest
+  uint32_t seen = 0;      // cells walked (the kBurnScanCells cap)
+  std::vector<IVec3> scanHot;
+  std::vector<IVec3> fetches;   // RequestChunkFetch(Mob) calls, in order
+};
+
 struct BurnLimbView {
   std::vector<PrefabVoxel>* skin = nullptr;  // skinScale units, int16
   std::vector<DebrisVoxel>* coll = nullptr;  // physScale units, int8
@@ -962,6 +982,8 @@ struct BurnLimbView {
   const std::vector<CrossHeatCell>* crossHeat = nullptr;
   int selfLimb = -1;
   uint32_t crossPct = 0;
+  // The world side taken ahead for this limb this tick (BurnWalkPre), or null.
+  const BurnWalkPre* walkPre = nullptr;
   // The coat ledger says this lattice wears a CORROSIVE coat (LimbCoat::
   // corrosive), so BurnOneLimb must run even with nothing in the world around
   // it: the acid is ON the limb. Set by the caller from its ledger.
@@ -4231,6 +4253,10 @@ class Mob {
   };
   std::vector<CharredPre> charredPre_;
   uint32_t charredPreTick_ = 0;
+  // BurnWalkPre per limb, taken by MobSystem::PrecomputeBurnWalks for tick
+  // `burnPreTick_`; read only that tick.
+  std::vector<BurnWalkPre> burnPre_;
+  uint32_t burnPreTick_ = 0;
 
  protected:
   // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
@@ -8203,6 +8229,15 @@ class MobSystem {
   // loop (Mob::WoundCharredAt says what that costs: a carve this tick is
   // seen next tick).
   void PrecomputeWoundCharred(uint32_t tick);
+  // The burn pass's world side for every limb BurnLimbs may visit, across the
+  // pool (BurnWalkPre).
+  void PrecomputeBurnWalks(uint32_t tick, World& world);
+  // One limb's: the box BurnOneLimb would walk, its world digest and walk.
+  // Reads only the world mirror and the tables; writes only `out`.
+  void BurnWalkOf(const BurnLimbView& v, const World& world, BurnWalkPre& out) const;
+  // The box BurnOneLimb walks for `v` (its collider box in world cells, a
+  // cell of slack each way).
+  static void BurnBoxOf(const BurnLimbView& v, IVec3& lo, IVec3& hi);
   uint64_t deathSeq_ = 0;       // Mob::deathSeq_'s source
   uint64_t deadEvicted_ = 0;    // DeadEvictedTotal
   uint64_t adoptedAvatars_ = 0; // AdoptedAvatarsTotal
