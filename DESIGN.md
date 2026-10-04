@@ -7029,6 +7029,78 @@ neighbors, so this needs an explicit connectivity pass:
   (ash) that runs its repose probe on substep 1. Keeping each thread's cell
   kinds in registers and reserving its pool run once (six shared atomics
   instead of one per cell) measured no better (camask 1.72 -> 1.80).
+- **Dead flesh collides as one convex a body (2026-10-04, fight64 package
+  P).** Owner: "lets get corpses to have simpler colliders; lets try to
+  heavily optimize 64 creature fights". In `--gate mob-cap64` (64 creatures,
+  300 ticks) the Jolt step was 27-28 ms of a 74 ms tick: 2,768 body-body
+  manifolds a step, 1,497 of them living limbs against corpse limbs, because
+  a manifold is per SUB-SHAPE pair and both sides were greedy box compounds.
+  1. **The collider follows the role** (`Physics::ApplyCorpseCollider`). A
+     body whose role is `RigDead` or `SeveredHold`, or that is loose `Debris`
+     carrying the dead-flesh mark (`Physics::MarkDeadFlesh`, set by
+     `DebrisSystem::AdoptBody` for anything that came off a creature, bit 7 of
+     the user data's role byte, so it rides `CarryLayer` to every rebuilt or
+     split fragment), has its compound swapped for ONE convex hull of the
+     compound's box corners, wrapped in `OffsetCenterOfMassShape` so the
+     centre of mass is the compound's to the ulp, and set WITHOUT recomputing
+     mass properties: the body keeps its voxels' mass and inertia and only
+     what it touches changes. Any other role (a zombie rising, a corpse limb
+     grabbed or thrown) gets the stored compound back. No caller changes:
+     `SetBodyRole`, `CarryLayer` and `SettleBody` apply it.
+  2. **A hull, not a fitted box.** The first version fitted a box in the
+     limb's frame and `corpse-sleep`'s corpse fell 95 voxels into the ground:
+     rotated, a box's corner stands off the voxels, the swap at death put one
+     deep in the terrain sheet and the depenetration pushed it through the
+     back face. A hull's support in every direction is a voxel corner, so
+     against a plane it penetrates exactly as deep as the compound did. It
+     keeps the box's cost class (one GJK per pair, one inner radius for
+     Jolt's linear cast, which is now the limb's rather than its thinnest
+     box's) and only fills concavities. Build cost ~10-15 µs a corpse-limb
+     rebuild.
+  3. **Queries stay exact.** `CastRayBody` (blade probes, lasers, the look
+     ray) re-casts a hit on a convex-collider body against its stored
+     compound in the shared centre-of-mass frame, then skips that body for
+     the next closest hit (bounded: 8 skips), so a probe never lands in the
+     filled-in crook of a corpse's limb.
+  4. **Instruments.** `Physics::StepStats` now carries Jolt's step by job
+     phase (a `JobSystem` that forwards to the pool and times each job by
+     name: wall span and worker time for collide / solveVel / ccd / ...) and
+     the bodies about to linear-cast, by role; `mob-cap64` prints both, the
+     mean dead rigs, the corpse colliders, and the loose-body contact blows
+     billed. `SANDVOX_CORPSE_COMPOUND=1` is the A/B arm in one binary;
+     `mobCap64.killEvery` (baseline.json, default off) kills every k-th
+     creature at `mobCap64.killAt`, so two arms compare over the same corpses
+     -- without it the corpse count is whatever the fight produced, and a
+     physics change moves every later blow.
+  5. **A reachable drop closed on the way.** The contact listener collects
+     impacts uncapped and caps them after the step under a total order, but
+     its collection ceiling was 4,096 while the compound brawl peaked at
+     8,056 live manifolds; a step whose NEW manifolds passed it would have
+     kept the job threads' race. Raised to 16,384, the contact-constraint
+     capacity, which no step can exceed. Not shown to have fired. The step
+     also records Jolt's own overflow flags now (`StepStats::updateErrors`:
+     manifold / body-pair / constraint buffer full, each a dropped-contact
+     race), read 0 in every arm measured. Unattributed: the corpse-heavy
+     COMPOUND arm ended 9, 10 or 11 alive across builds with no change on its
+     path, while two runs of one build always agreed.
+  Measured (`SANDVOX_RUN_EXCLUSIVE=1`, one non-LTO binary, compound arm vs
+  hull; the compound arm reproduces main's exe exactly). Natural fight, 6.3
+  vs 6.1 dead rigs mean: Jolt 26.5 -> 10.5 ms a tick (collide 8.1 -> 2.8
+  wall, solveVel 2.9 -> 0.8, ccd 14.5 -> 6.4), body-body manifolds 2,768 ->
+  706, living-vs-corpse 1,497 -> 251; tick wall 84.2 -> 58.8 ms. Corpse-heavy
+  arm (`killEvery 4`, 11.0 vs 10.9 dead rigs mean): Jolt 32.4 -> 17.6 ms.
+  **Side effect, gameplay-visible:** `MobSystem::ApplyContactDamage` bills a
+  blow per listener report, i.e. per sub-shape pair, so a flying gib with a
+  box compound hit N times for one touch; as one convex it hits fewer.
+  Billed loose-body blows 407 -> 207 (natural), 796 -> 660 (corpse-heavy, 11
+  -> 30 alive at the end). Billing once per (limb, body) pair a step is the
+  principled fix and is a mob.cpp change, proposed rather than made. What is
+  left: the linear cast is now the largest phase (6.4 ms natural, 10.2
+  corpse-heavy) -- dead flesh shoved by living kinematic limbs past 0.75 x
+  its inner radius a step casts against the crowd's kinematic compounds;
+  CCD exists for the terrain sheet, but Jolt's cast cannot be told to skip
+  kinematic bodies. Hulls for LIMP living rigs too were measured (17.2 vs
+  17.6 ms, corpse-heavy) and are not worth the behaviour change.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

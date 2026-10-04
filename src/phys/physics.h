@@ -468,6 +468,42 @@ class Physics {
   // THE ONE MAPPING, pure. `ownerSlot`: -2 no owner, -1 any/unknown, else the
   // owning proxy's slot (PlayerSlotOf). Returns a Jolt object layer number.
   static int ResolveLayer(BodyRole role, int ownerSlot, bool clearing);
+  // ---- A CORPSE COLLIDES AS ONE CONVEX PER LIMB (fight64 package P) -------
+  //
+  // A RigDead body's box compound (CreateDebrisBodyXf's greedy merge) is
+  // swapped for ONE convex hull of the limb's voxels (the corners of the
+  // compound's boxes), with the body's mass, inertia and centre of mass left
+  // exactly as they were: only the collision geometry changes, so a corpse
+  // falls and tumbles as it did. A hull and not a fitted box because a hull
+  // never reaches past the voxels toward a plane in any orientation (the long
+  // note in ApplyCorpseCollider: a rotated box's corner pushed a corpse
+  // through the ground). Taking any other role puts the full compound back (a
+  // zombie rising, a corpse limb grabbed). A SHELL (hair, a mane, a worn
+  // plate: voxels filling under half their hull) keeps its compound, since its
+  // hull is the whole limb it wraps. Applied by SetBodyRole and
+  // CarryLayer, so every path that makes or rebuilds a corpse limb gets it
+  // with no caller involvement.
+  //
+  // WHY: in a 64-creature brawl living limbs (kinematic box compounds) lying
+  // on corpses were 1,500 manifolds a step -- one per SUB-BOX PAIR -- and
+  // corpse-on-corpse the next largest. One convex per corpse limb makes those
+  // one per (live sub-box, corpse limb) and one per corpse pair, and its inner
+  // radius (the threshold for Jolt's linear cast) is the limb's, not its
+  // thinnest box's, so far fewer of them pay for CCD.
+  //
+  // QUERIES STAY EXACT: CastRayBody re-tests a hit on a simplified body
+  // against the stored compound, so a blade probe, a laser or the look ray
+  // never hits the filled-in crook of a corpse's limb.
+  //
+  // SANDVOX_CORPSE_COMPOUND=1 keeps the compound (the A/B arm in one binary).
+  //
+  // The same holds for a limb in its SEVER HOLD and for loose DEBRIS that was
+  // once a creature (MarkDeadFlesh: a severed limb, a corpse's piece, a carved
+  // gobbet, and every fragment split from one -- the mark rides the user data
+  // through CarryLayer). Carried or thrown, such a piece has its compound.
+  void MarkDeadFlesh(uint64_t handle);
+  uint32_t CorpseColliderCount() const;
+  bool IsCorpseCollider(uint64_t handle) const;
   // The owner-scoping slot a player proxy was given (0..kMaxPlayerProxies-1),
   // or -1 for a dead handle or a proxy past the slot count (which then
   // behaves like the old single PLAYER layer: every OWNED body meets it).
@@ -745,11 +781,38 @@ class Physics {
   // column): [min(a,b) * kRoleCols + max(a,b)]. Diagnostic only.
   static constexpr int kRoleStatic = (int)BodyRole::Count;
   static constexpr int kRoleCols = kRoleStatic + 1;
+  // Where a step's time goes, by Jolt job name (physics.cpp JobProfiler):
+  // FindCollisions is the broadphase pair walk AND the narrow phase,
+  // SolvePosition includes the sleep test, Islands is the constraint islands
+  // built at the head of the step, FinalizeIslands the contact islands after
+  // the narrow phase. BroadPrepare runs BESIDE the narrow phase (its span is
+  // not on the critical path). Report only.
+  enum class StepPhase : uint8_t {
+    BroadPrepare, FindCollisions, Islands, Setup, FinalizeIslands,
+    SolveVelocity, Integrate, Ccd, SolvePosition, BroadFinalize, Other, Count
+  };
+  static const char* StepPhaseName(StepPhase p);
   struct StepStats {
     double ms = 0.0;
+    // Per phase: wall span (first job start to last job end) and summed
+    // worker time, ms. A solver phase's worker time includes workers spinning
+    // for an island, so the span is the number to compare with `ms`.
+    float phaseWallMs[(int)StepPhase::Count] = {};
+    float phaseCpuMs[(int)StepPhase::Count] = {};
     uint32_t manifoldsDyn = 0, pointsDyn = 0;        // body vs body
     uint32_t manifoldsStatic = 0, pointsStatic = 0;  // body vs terrain/static
     uint32_t rolePairs[kRoleCols * kRoleCols] = {};
+    // Bodies that entered this step about to LINEAR-CAST (dynamic, LinearCast,
+    // moving more than mLinearCastThreshold x their inner radius this step),
+    // by role -- measured before Update from the velocity they carry in: the
+    // attribution of the "ccd" phase above.
+    uint32_t ccdBodies[kRoleCols] = {};
+    uint32_t ccdCompound[kRoleCols] = {};   // ...of which box compounds
+    // JPH::EPhysicsUpdateError bits from this step's Update: 1 manifold
+    // cache full, 2 body-pair cache full, 4 contact constraints full. Any of
+    // them means Jolt dropped contacts, and the dropped set is scheduling-
+    // dependent.
+    uint32_t updateErrors = 0;
   };
   const StepStats& LastStep() const { return lastStep_; }
   // Where the terrain-collider and wake time goes (always on: a few clock
@@ -829,6 +892,17 @@ class Physics {
   std::vector<uint64_t> dynamicBodies_;  // handles of live debris bodies
   struct JointImpls;                     // Jolt constraint refs (impl detail)
   std::unique_ptr<JointImpls> joints_;
+  // body handle -> the full compound a corpse collider replaced (see
+  // CorpseColliderCount). Keyed lookups only, so its order reaches nothing.
+  struct CorpseShapes;
+  std::unique_ptr<CorpseShapes> corpse_;
+  struct JobProfiler;   // times Jolt's jobs by name (StepStats::phase*)
+  std::unique_ptr<JobProfiler> jobProf_;
+  void ApplyCorpseCollider(uint64_t handle);
+  // Both CastRayBody overloads: the closest hit, with a hit on a corpse
+  // collider re-tested against its stored compound (see CorpseColliderCount).
+  uint64_t CastRayImpl(Vec3 fromVoxel, Vec3 dirNormalized, float maxDistVoxels,
+                       float& fraction, const std::vector<uint64_t>* ignore) const;
   uint64_t nextJointId_ = 1;
   uint32_t nextCollisionGroup_ = 1;
   // EVERY live player proxy (CreatePlayerBody), so CLEARING can ask "is this

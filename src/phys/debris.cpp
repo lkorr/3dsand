@@ -3850,6 +3850,9 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
   body.owner = body.ownerAtCreate = localPlayerId_;
   body.bleedMat = bleedMat;
   body.dead = dead;
+  // Dead flesh collides as one box (Physics::MarkDeadFlesh); its fragments
+  // and rebuilds inherit the mark through CarryLayer.
+  if (dead) phys_->MarkDeadFlesh(body.handle);
   body.defIndex = defIndex;
   body.creature = creature;
   RecountBurn(body);
