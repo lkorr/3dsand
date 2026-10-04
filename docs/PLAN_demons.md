@@ -569,7 +569,7 @@ main's exe at the end.
 
 | Pkg | State | Commit | Notes |
 |---|---|---|---|
-| D1 | done (branch, awaiting merge) | see report | demon race + imp Skerrick, `summon_skerrick` (SpellVerb::Summon), salt circle by mass (minEighths 4), containment fence, gate `demon-circle` PASS |
+| D1 | done on branch worktree-agent-adac2802672e7977f (awaiting merge) | 2a938e4 | demon race + imp Skerrick, `summon_skerrick` (SpellVerb::Summon), salt circle by mass (minEighths 4), containment fence, gate `demon-circle` PASS. Final --verify: demon-circle, harrowby-cellar (now also runs D1's detector on the cellar ring: closed), anatomy-parity, sidecar-resolve, spells, spell-hands, ai-approach, determinism PASS (hash unmoved); `mob` FAILS "1 awake after settle" identically with every D1 asset removed (SANDVOX_ASSET_DIR control) and D1 code is inert there: inherited, not D1. |
 | D2 | MERGED main | 640834a | Cellar in the default edit layer (scripts/paint_cellar.mjs); `readable` ref kind; dialogue `grant` / `learn`; `game/demon_lore.h` (IsNameGlyph = id prefix `summon_`, GrantAllNames) + dev button "learn all demon names" (D1 owns `SANDVOX_ALL_NAMES` and the GrantAllAndBind exclusion; call demon::GrantAllNames / IsNameGlyph). New materials `tallow`, `candle_flame` appended: if D1 also appends materials, re-run `node scripts/paint_cellar.mjs` after the merge. Gate `harrowby-cellar` pass; village-harrowby rebaselined (now passes). |
 | D3 | planned | | |
 | D4 | planned | | |
