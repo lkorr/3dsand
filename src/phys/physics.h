@@ -85,6 +85,9 @@ class Physics {
   bool Init();
   void Shutdown();
   void Step(float dt);
+  // Bodies in the Jolt system right now, every kind (Init's ceiling is 4096).
+  // A diagnostic for crowd harnesses (mob-cap64), not a gameplay input.
+  uint32_t LiveBodyCount() const;
 
   // Debris body from island voxels (local coords relative to `originVoxel`).
   // Boxes are greedy-merged; mass comes from per-voxel material density
@@ -738,10 +741,15 @@ class Physics {
   };
   const RunawayProbe& Runaway() const { return runaway_; }
   // The last Update: its wall clock and what the narrow phase produced.
+  // Manifolds by the ROLE pair that made them (BodyRole, plus a static
+  // column): [min(a,b) * kRoleCols + max(a,b)]. Diagnostic only.
+  static constexpr int kRoleStatic = (int)BodyRole::Count;
+  static constexpr int kRoleCols = kRoleStatic + 1;
   struct StepStats {
     double ms = 0.0;
     uint32_t manifoldsDyn = 0, pointsDyn = 0;        // body vs body
     uint32_t manifoldsStatic = 0, pointsStatic = 0;  // body vs terrain/static
+    uint32_t rolePairs[kRoleCols * kRoleCols] = {};
   };
   const StepStats& LastStep() const { return lastStep_; }
   // Where the terrain-collider and wake time goes (always on: a few clock

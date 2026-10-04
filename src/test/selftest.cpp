@@ -1101,6 +1101,7 @@ const char* const kOrder[] = {
     // `voxregion`, which owns the residency window. Each restores the id
     // counter and regenerates worldgen on the way out.
     "unarmed-attack", "lunge", "bite-target", "zombie-draw", "limb-alias",
+    "mob-cap64",
     "player-unarmed",
     // ...and the directional flinch, appended by the same rule as the four
     // above and for the same reason: it spawns a creature. It is the most

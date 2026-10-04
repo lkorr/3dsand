@@ -2210,8 +2210,8 @@ void Overlay::DrawDevDebug(UIState& s) {
     ImGui::Text("tick %u   active chunks %u / %u", s.tick, s.activeChunks, s.totalChunks);
     ImGui::Text("voxels %.2f M   particles %u", s.voxelTotal / 1e6, s.particleCount);
     ImGui::Text("hash %08x %s", s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
-    ImGui::Text("debris bodies %u (%u awake)   mobs %u", s.bodyCount, s.activeBodyCount,
-                s.mobCount);
+    ImGui::Text("debris bodies %u (%u awake)   mobs %u / %u", s.bodyCount,
+                s.activeBodyCount, s.mobCount, kMaxLiveMobs);
     // CHUNK TICKETS (docs/PLAN_chunk_tickets.md): the boxes outside the
     // window the CA is still running. At rest this reads 0 live — the rule-2
     // claim the `sleep` gate asserts.

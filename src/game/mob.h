@@ -4331,6 +4331,11 @@ class Mob {
   // Replay one queued burst against this creature's limbs: each droplet that
   // would land on a limb marks the voxel where it lands.
   void ApplySplatter(const SplatterEvent& e);
+  // A sphere enclosing every limb's splatter bound (the box SplatterView
+  // tests), padded by a voxel so a reject against it is conservative. False
+  // when no limb has a body. MobSystem::StainLimbs culls whole creatures
+  // against a burst with it before ApplySplatter walks their limbs.
+  bool SplatterBound(Vec3& centre, float& radius) const;
   // Does hp reaching zero take this limb OFF, or merely kill the creature?
   // See the note at the call sites: geometry dismembers, damage kills.
   bool HpZeroSevers(int limbIndex, const DamageCtx& ctx) const;
@@ -6435,10 +6440,17 @@ class MobSystem {
   // decays to debris through Mob::ReleaseRigToDebris and from there falls
   // under DebrisSystem's own cull and settle-back, so the old corpse lifetime
   // is the tail of the new one and nothing is unbounded.
+  //
+  // NEITHER SCALED WITH kMaxMobs 16 -> 64 (2026-10-04), on purpose. These two
+  // bound the cost of what is LYING THERE -- a corpse is a Jolt ragdoll, a
+  // burn/stain/dead-sleep visit and a set of owned brick records -- and that
+  // cost does not care how many are still standing. A bigger fight only turns
+  // corpses over to debris faster (the oldest decays first), which is the
+  // documented tail. kMaxBodySlots (world.h) is sized with these as one term.
   static constexpr uint32_t kMaxDeadMobs = 12;
   // Bodies, not creatures: the render registry walks debris, the avatar, then
-  // mobs_ (living and dead together) into kMaxBodySlots (512); 240 leaves
-  // the living crowd and the debris the larger share.
+  // mobs_ (living and dead together) into kMaxBodySlots; 240 is the dead's
+  // term in that sum (world.h).
   static constexpr uint32_t kMaxDeadBodies = 240;
   // A dead Mob is asleep after this many consecutive quiet ticks
   // (Mob::DeadQuietNow); an asleep one re-registers its terrain anchor every
@@ -6496,6 +6508,9 @@ class MobSystem {
   // the gate asserts on the counter rather than on a position (CLAUDE.md rule
   // 6 — record it at the point of the decision, do not infer it later).
   uint64_t AiSteps() const { return aiSteps_; }
+  // Drips a wound wanted and the shared pot (gore.bleedOpsPerTick) refused,
+  // over the process. A diagnostic for crowd gates (mob-cap64).
+  uint64_t BleedStarved() const { return bleedStarved_; }
 
   // ---- MOB IDS ARE A PER-PLAYER BAND --------------------------------------
   //
@@ -8048,6 +8063,11 @@ class MobSystem {
   UnparkPlacer unparkPlacer_;   // P7 catch-up; null = come back where it froze
   uint64_t parkedTotal_ = 0;
   uint64_t aiSteps_ = 0;
+  // The drip pot taken in turns (Mob::BleedTick): creatures that wanted a
+  // drip this tick / last tick, and the refusals. Not hashed, not saved --
+  // derived each tick from the creatures' own wounds.
+  uint32_t bleedWantCur_ = 0, bleedWantPrev_ = 0;
+  uint64_t bleedStarved_ = 0;
   // Evaluated at the top of PreTick, before anything steps: one creature's
   // owner may not change halfway through its own tick.
   void RefreshOwnership();
@@ -8076,7 +8096,9 @@ class MobSystem {
   void PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
                  float intensity);
 
-  static constexpr uint32_t kMaxMobs = 16;
+  // The LIVING cap. The number lives in sim/world.h (kMaxLiveMobs) because the
+  // body render slots and the micro-body model table are sized from it.
+  static constexpr uint32_t kMaxMobs = kMaxLiveMobs;
   // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)
   // ---- per-voxel burning -----------------------------------------------------
   // Front voxels examined per tick across EVERY limb of EVERY mob. A fully

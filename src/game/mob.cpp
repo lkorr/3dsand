@@ -3691,6 +3691,8 @@ void MobSystem::Reset(bool rewindIds) {
   actors_.clear();
   blocks_.clear();
   strikes_.clear();
+  // The drip pot's demand is derived from wounds that no longer exist.
+  bleedWantCur_ = bleedWantPrev_ = 0;
   // The corpse coat's derived indices: their bodies belong to the world being
   // torn down (StainDeadFlesh).
   fleshCoat_.clear();
@@ -7678,10 +7680,12 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
   const float rSelf = capSelf.radius;
   const Vec3 cSelf = BodyCentre(self, selfDef);
   Vec3 push{};
-  // kMaxMobs is 16, so this is at most 120 pairs of two compares and a sqrt —
-  // cheaper than one ground probe, and it sleeps to nothing the moment bodies
-  // are apart. Not worth a spatial index at this bound, and a grid here would
-  // be a second source of truth about where creatures are.
+  // kMaxMobs is 64 (it was 16), so this is at most ~2000 pairs a tick, and
+  // each pair that is not close is rejected by two compares BEFORE the
+  // segment-segment closest point: measured 0.38 ms a tick for a 64-creature
+  // brawl (`mob-cap64`, before the early reject). Still not worth a spatial
+  // index at this bound, and a grid here would be a second source of truth
+  // about where creatures are.
   //
   // EVERY CREATURE, THE PLAYERS INCLUDED (W2-K): a player's body is a body in
   // the crowd, and an NPC that walked through it was the list-shaped bug this
@@ -7698,6 +7702,17 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
     const float want = (rSelf + capOther.radius) * lo.spacingMul;
     if (want <= 0.0f) return;
     const Vec3 cOther = BodyCentre(other, od);
+    // THE CHEAP REJECT (2026-10-04). The spines are at most halfLen either
+    // side of each centre, so the capsule gap is at least the centre distance
+    // minus both half-lengths: a pair that far apart cannot be inside `want`,
+    // and the closest-point solve below is skipped. Exact -- it only drops
+    // pairs the d2 test below would drop -- and it is what keeps a 64-strong
+    // crowd at a compare per pair. The height test is a pure reject as well.
+    {
+      const float ex = cSelf.x - cOther.x, ez = cSelf.z - cOther.z;
+      const float slack = want + capSelf.halfLen + capOther.halfLen;
+      if (ex * ex + ez * ez >= slack * slack) return;
+    }
     // Between the two CAPSULES (BodyCapsule): the centres for two upright
     // bodies, the nearest points of their spines for a long one.
     const Vec3 gap = CapsuleGap(capSelf, cSelf.x, cSelf.z, self.heading_,
@@ -8139,7 +8154,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // targeting path: nothing downstream asks what KIND of thing an entry is.
   // Rebuilt every tick for the same reason `bleeds_` is — a despawned creature
   // stops being a target by not being here.
+  burnprof::Scope bpActors(burnprof::kActors);
   actors_.clear();
+  // The drip pot's demand, last tick's (Mob::BleedTick's turn rule).
+  bleedWantPrev_ = bleedWantCur_;
+  bleedWantCur_ = 0;
   for (const ai::Actor& pa : playerActors_) actors_.push_back(pa);
   // The AI's own creatures: the players are in the list above, as ACTORS
   // (their ids live in the player-actor band), so a body a player drives is
@@ -8181,6 +8200,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     if (!av.alive_ || av.def_ == nullptr) continue;
     PublishCombatant(av, actors_[i]);
   }
+  bpActors.Stop();
 
   // THE DEAD CAP, before anybody steps: a corpse released here is a husk
   // the loop below sweeps in this same pass once its holds are over.
@@ -8367,7 +8387,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     }
 
     // terrain collision anchors for every live limb (ManageTerrain sweep)
-    mob.RegisterTerrainAnchor();
+    {
+      burnprof::Scope bp(burnprof::kTerrainAnchor);
+      mob.RegisterTerrainAnchor();
+    }
 
     // ---- LIMP: Jolt owns the body, the driver has nothing to say ----
     // No sense/intent/steer/drive, no animation, no submit: the limbs are
@@ -8402,25 +8425,33 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // change into a curved path instead of an instant change of direction.
       // THIS is the NPC driver — the block the avatar replaces with player
       // input; everything else in this loop is shared Mob mechanics.
+      burnprof::Scope bpSense(burnprof::kSense);
       GroundSense sense = SenseGround(mob, def, world);
+      bpSense.Stop();
       // THE ARBITER RAN. Counted here and nowhere else: a ghost gate that
       // measured "it did not move" would pass on a creature whose AI ran and
       // decided to stand still, and this is the only branch that decides
       // anything. Not hashed, not saved — a process diagnostic.
       aiSteps_++;
       const size_t attacksBefore = attacks_.size();
+      burnprof::Scope bpIntent(burnprof::kIntent);
       DecideIntent(mob, def, sense, tick, dt);
+      bpIntent.Stop();
       // PERSONAL SPACE, between the intent and the steer. The AI has had its
       // say about where to go; this is the body declining to walk through
       // another body on the way, and it deliberately edits the DRIVE and not
       // the heading — a fighter must keep facing what it is fighting.
+      burnprof::Scope bpCrowd(burnprof::kCrowd);
       ApplyCrowdSpacing(mob, def);
+      bpCrowd.Stop();
+      burnprof::Scope bpDrive(burnprof::kDrive);
       float align = Steer(mob, def, dt);
       // Gravity first: a falling creature does not walk. UpdateFall may flip
       // the mob into a ragdoll mid-air, in which case this tick's pose is the
       // last one the driver submits and the limbs are dynamic from the next.
       const bool falling = UpdateFall(mob, def, sense, dt);
       if (!falling) DriveLocomotion(mob, def, sense, align, dt);
+      bpDrive.Stop();
       if (mob.ragdoll_ == Mob::RagdollPhase::Limp) {
         mob.BleedTick(tick, world, ops, spawns, bleedOps);
         mi++;
@@ -8442,19 +8473,24 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // A GUARD is not a stroke in flight: an attack decided while the blade
       // is held across a line swings FROM the guard (the same take-over
       // ForceAttack has always allowed).
+      burnprof::Scope bpStroke(burnprof::kStroke);
       if (attacks_.size() > attacksBefore &&
           (!mob.stroke_.Active() ||
            mob.stroke_.phase == NpcStroke::Phase::Guard))
         BeginStroke(mob, attacks_.back(), tick);
       StepStroke(mob, tick, world, spawns);
       mob.swinging_ = mob.stroke_.Cutting();
+      bpStroke.Stop();
 
       // ---- stages 1-5: pose the rig (float presentation state) ----
+      burnprof::Scope bpAnim(burnprof::kAnim);
       UpdateAnimation(mob, def, world, dt, tick);
+      bpAnim.Stop();
 
       // ---- stages 6-7: model space -> world, submit to Jolt ----
       // writeXf=false: the NPC path keeps limb.xf as PostStep left it, so its
       // bleed positions are unchanged by the refactor (see Mob::SubmitPose).
+      burnprof::Scope bpSubmit(burnprof::kSubmit);
       mob.SubmitPose(dt, /*writeXf=*/false);
     }
 
@@ -8463,7 +8499,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     mob.GripFails(CurrentTuning().melee.injuredArmDrop);
 
     // ---- bleeding (PLAN §B5): decaying wound budget, bounded ops ----
-    mob.BleedTick(tick, world, ops, spawns, bleedOps);
+    {
+      burnprof::Scope bp(burnprof::kBleed);
+      mob.BleedTick(tick, world, ops, spawns, bleedOps);
+    }
     mi++;
   }
   // Blood landing on bodies: from the world (contact) and from this tick's
@@ -8477,7 +8516,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // THE BODY QUERY for this tick (mob_shock.cpp): every limb where it stands
   // after this tick's drive, asked of the field SubmitTick's elecQuery row
   // reads; answered K + 1 ticks from now, at the fixed latency.
-  QueueShockQueries(tick, world);
+  {
+    burnprof::Scope bp(burnprof::kShockQuery);
+    QueueShockQueries(tick, world);
+  }
   // Which corpses have gone quiet, now that every pass of the tick has had
   // its say (the burn pass's idle verdict, the coat's recount, the bleed).
   {
@@ -9749,6 +9791,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // the same measure. microScale is clamped to 2..6 at load.
   const int ms = std::max(2, gore.microScale);
   const float dropletVox = 1.0f / (float)(ms * ms * ms);
+  bool wantedDrip = false;   // counted once per creature (the turn rule below)
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
     // A GARMENT DOES NOT BLEED. Damage() tops up a bleed budget on whatever
@@ -9932,7 +9975,42 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           std::clamp(limb.bleedBudget / cap, 0.0f, 1.0f)});
     }
 
-    if (limb.bleedBudget < 1.0f || bleedOps >= gore.bleedOpsPerTick) continue;
+    if (limb.bleedBudget < 1.0f) continue;
+    // Drip period, tunable. Modulo rather than a mask because the tuner
+    // offers every period, not just powers of two; the divisor is clamped
+    // >= 1 at load so this cannot divide by zero. (Tested before the op
+    // budget since 2026-10-04 -- nothing between the two had a side effect --
+    // so a wound that WANTS to drip can be counted below.)
+    const uint32_t dripPeriod = (uint32_t)std::max(1, gore.bleedDripTicks);
+    if (tick % dripPeriod != 0) continue;
+    // ---- A SHARED BUDGET IS TAKEN IN TURNS (2026-10-04, the 64 cap) ------
+    // bleedOpsPerTick is ONE pot for every limb of every creature, spent in
+    // mobs_ order -- and with 64 creatures bleeding the first few in the
+    // list took it every drip tick while the rest never dripped, so never
+    // paid the hp the drip charges and never bled out. When last tick's
+    // demand (creatures that wanted a drip) overran the pot, each creature
+    // drips only on its turn: one drip period in ceil(demand / pot), its
+    // phase fixed by its id. Deterministic (a function of the previous
+    // tick's state and the id), and a no-op whenever the pot was enough,
+    // which at the old cap of 16 it nearly always was.
+    if (sys_) {
+      if (!wantedDrip) {
+        sys_->bleedWantCur_++;
+        wantedDrip = true;
+      }
+      const uint32_t pot = (uint32_t)std::max(1, gore.bleedOpsPerTick);
+      if (sys_->bleedWantPrev_ > pot) {
+        const uint32_t turns = (sys_->bleedWantPrev_ + pot - 1) / pot;
+        const uint32_t phase = (uint32_t)(id_ * 2654435761ull >> 7);
+        if ((phase + tick / dripPeriod) % turns != 0) continue;
+      }
+      if (bleedOps >= gore.bleedOpsPerTick) {
+        sys_->bleedStarved_++;
+        continue;
+      }
+    } else if (bleedOps >= gore.bleedOpsPerTick) {
+      continue;
+    }
     // Charge the clump BEFORE emitting it, and shrink it to what the wound
     // can still afford. The natural ordering (emit, then subtract) lets the
     // last drip overrun bleedBudgetCap by nearly a whole sphere — 123
@@ -9943,10 +10021,6 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     while (clumpR > 0 &&
            (float)BleedClumpVoxels(clumpR) > limb.bleedBudget)
       clumpR--;
-    // Drip period, tunable. Modulo rather than a mask because the tuner
-    // offers every period, not just powers of two; the divisor is clamped
-    // >= 1 at load so this cannot divide by zero.
-    if (tick % (uint32_t)std::max(1, gore.bleedDripTicks) != 0) continue;
     Vec3 w = limb.body
                  ? limb.xf.pos + Rotate(lq, limb.woundLocal)
                  : bodyFrame(limb.anchorRoot);  // stump on the parent
@@ -14102,7 +14176,16 @@ bool Mob::WoundCharred(const MobLimb& limb) const {
   // Bone and steel neither bleed nor burn and are not counted.
   const Vec3 w = limb.woundLocal * scale;
   const float r2 = 1.5f * 1.5f * scale * scale;
-  std::vector<uint64_t> occ;
+  // TWO PASSES, NO WHOLE-LIMB SORT (2026-10-04, PLAN_electricity_wave2 C).
+  // This runs every tick for every bleeding limb, and it used to push a key
+  // for EVERY voxel of the limb (tens of thousands at skinScale 8) and sort
+  // them: 1 ms a bleeding creature, 60 ms a tick for a 64-creature brawl.
+  // Pass 1 is a plain scan for the voxels inside the wound sphere; when none
+  // of them is charred the answer is already known (charred == 0 can never
+  // reach a third of a non-empty surface), which is every wound that has not
+  // been in a fire. Only then does pass 2 build the occupancy -- and only of
+  // the box one cell beyond the sphere, which is all a face test can reach.
+  // Same answer as before, bit for bit.
   auto key = [](int x, int y, int z) {
     return ((uint64_t)(uint32_t)(x + 32768) << 42) | ((uint64_t)(uint32_t)(y + 32768) << 21) |
            (uint64_t)(uint32_t)(z + 32768);
@@ -14111,19 +14194,40 @@ bool Mob::WoundCharred(const MobLimb& limb) const {
     int x, y, z;
     uint32_t mat;
   };
-  std::vector<Near> near;
+  static thread_local std::vector<Near> near;
+  static thread_local std::vector<uint64_t> occ;
+  near.clear();
+  occ.clear();
+  bool anyCharred = false;
   auto visit = [&](int vx, int vy, int vz, uint32_t mat) {
-    occ.push_back(key(vx, vy, vz));
     const float dx = (float)vx + 0.5f - w.x, dy = (float)vy + 0.5f - w.y,
                 dz = (float)vz + 0.5f - w.z;
-    if (dx * dx + dy * dy + dz * dz <= r2) near.push_back({vx, vy, vz, mat});
+    if (dx * dx + dy * dy + dz * dz <= r2) {
+      near.push_back({vx, vy, vz, mat});
+      anyCharred |= sys_->BurnStageOf(mat) == 2u;
+    }
   };
   if (fine) {
     for (const PrefabVoxel& v : limb.skinVoxels) visit(v.x, v.y, v.z, v.material & 0xFFFu);
   } else {
     for (const DebrisVoxel& v : limb.voxels) visit(v.x, v.y, v.z, v.payload & 0xFFFu);
   }
-  if (near.empty()) return false;
+  if (near.empty() || !anyCharred) return false;
+  // Pass 2: the occupancy a face test can reach -- a neighbour of a voxel
+  // inside the sphere lies within one cell of it.
+  const float reach = std::sqrt(r2) + 1.5f;
+  auto inBox = [&](int vx, int vy, int vz) {
+    return std::fabs((float)vx + 0.5f - w.x) <= reach &&
+           std::fabs((float)vy + 0.5f - w.y) <= reach &&
+           std::fabs((float)vz + 0.5f - w.z) <= reach;
+  };
+  if (fine) {
+    for (const PrefabVoxel& v : limb.skinVoxels)
+      if (inBox(v.x, v.y, v.z)) occ.push_back(key(v.x, v.y, v.z));
+  } else {
+    for (const DebrisVoxel& v : limb.voxels)
+      if (inBox(v.x, v.y, v.z)) occ.push_back(key(v.x, v.y, v.z));
+  }
   std::sort(occ.begin(), occ.end());
   static const int kDirs[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
   uint32_t surface = 0, charred = 0;
@@ -20203,13 +20307,34 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   StainDeadFlesh(tick, world, deadBudget, deadRain);
   // This tick's bursts, against every creature (the bleeder included: its
   // own gout lands on its own other limbs; only the bleeding limb is skipped).
+  burnprof::Scope bpSplatter(burnprof::kSplatter);
+  // WHOLE CREATURES OUT OF REACH ARE SKIPPED (2026-10-04). Bursts scale with
+  // the bleeders and receivers with the crowd, so this loop is quadratic in a
+  // battle; one padded sphere per creature (Mob::SplatterBound, taken once a
+  // tick -- nothing moves a limb between here and the end of the tick) turns
+  // ~22 limb tests per creature per burst into one. Conservative: every limb
+  // the sphere rejects SplatterView would have rejected too.
+  static thread_local std::vector<Vec3> boundC;
+  static thread_local std::vector<float> boundR;
+  bool boundsBuilt = false;
   for (SplatterEvent& e : splatters_) {
     if (e.doneMobs) continue;
     e.doneMobs = true;
+    if (!boundsBuilt) {
+      boundC.assign(mobs_.size(), Vec3{});
+      boundR.assign(mobs_.size(), -1.0f);
+      for (size_t i = 0; i < mobs_.size(); i++)
+        if (!mobs_[i].SplatterBound(boundC[i], boundR[i])) boundR[i] = -1.0f;
+      boundsBuilt = true;
+    }
     // Ghosts excluded, with the contact pass above: a splatter lands on SKIN,
     // and a ghost's skin is owned elsewhere (see Mob::StainTick).
-    for (Mob& mob : mobs_)
-      if (!mob.IsGhost()) mob.ApplySplatter(e);
+    for (size_t i = 0; i < mobs_.size(); i++) {
+      Mob& mob = mobs_[i];
+      if (mob.IsGhost() || boundR[i] < 0.0f) continue;
+      if ((boundC[i] - e.origin).len() - boundR[i] > e.reach) continue;
+      mob.ApplySplatter(e);
+    }
     // (Dead Mobs are in that loop: a corpse is a rig.) ...and severed flesh
     // lying in its way, the same replay per debris body (owner report
     // 2026-09-22: a body beside someone bleeding stayed clean).
@@ -20286,6 +20411,30 @@ void MobSystem::SplatterDeadFlesh(const SplatterEvent& e) {
   // Same stamp discipline as StainDeadFlesh: an entry made here for a body the
   // contact pass has not met yet is live until that pass's own sweep.
   debris_->ForEachCoatBody([&](DebrisSystem::FleshLattice& f) {
+    // THE REACH REJECT (2026-10-04, the 64-creature brawl): every burst was
+    // replayed against every severed piece, building its view first, and 200
+    // pieces on the ground made that a millisecond-scale loop per burst.
+    // Skipped ONLY when FleshView would have had no side effect -- the coat
+    // entry exists, its index matches the lattice, nothing to mark alight --
+    // and SplatterView's own out-of-reach test (same expressions, same
+    // inputs) would refuse it. So the skip changes nothing but the cost.
+    if (auto it = fleshCoat_.find(f.id); it != fleshCoat_.end() && f.xf) {
+      const FleshCoat& c0 = it->second;
+      const size_t n = f.skin ? f.skin->size() : f.coll->size();
+      if (n != 0 && n == c0.n && f.geomGen == c0.gen &&
+          !(f.selfActive && c0.burn.idx.empty())) {
+        const float sinv = 1.0f / (float)std::max(1u, f.physScale);
+        const Vec3 half{0.5f * (float)(f.hi.x - f.lo.x) * sinv,
+                        0.5f * (float)(f.hi.y - f.lo.y) * sinv,
+                        0.5f * (float)(f.hi.z - f.lo.z) * sinv};
+        const Vec3 mid{0.5f * (float)(f.hi.x + f.lo.x) * sinv,
+                       0.5f * (float)(f.hi.y + f.lo.y) * sinv,
+                       0.5f * (float)(f.hi.z + f.lo.z) * sinv};
+        const Quat q{f.xf->quat[0], f.xf->quat[1], f.xf->quat[2], f.xf->quat[3]};
+        const Vec3 toC = f.xf->pos + Rotate(q, mid) - e.origin;
+        if (toC.len() - half.len() > e.reach) return;
+      }
+    }
     FleshCoat& cc = fleshCoat_[f.id];
     int model = -1;
     BurnLimbView v = FleshView(f, cc, model);
@@ -22039,12 +22188,68 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
   return changed;
 }
 
+bool Mob::SplatterBound(Vec3& centre, float& radius) const {
+  // Each limb's sphere exactly as SplatterView builds it (a live limb's view
+  // has sizeMin zero), then one sphere round all of them.
+  Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+  struct S {
+    Vec3 c;
+    float r;
+  };
+  S s[64];
+  int n = 0;
+  bool overflow = false;
+  for (const MobLimb& limb : limbs_) {
+    if (!limb.body) continue;
+    const float sinv = 1.0f / (float)std::max(1u, PhysScaleOf(limb));
+    const Vec3 half{0.5f * (float)limb.size.x * sinv, 0.5f * (float)limb.size.y * sinv,
+                    0.5f * (float)limb.size.z * sinv};
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+    const Vec3 c = limb.xf.pos + Rotate(q, half);
+    const float r = half.len();
+    lo = Vec3{std::min(lo.x, c.x - r), std::min(lo.y, c.y - r), std::min(lo.z, c.z - r)};
+    hi = Vec3{std::max(hi.x, c.x + r), std::max(hi.y, c.y + r), std::max(hi.z, c.z + r)};
+    if (n < 64) s[n++] = {c, r};
+    else overflow = true;
+  }
+  if (n == 0) return false;
+  centre = (lo + hi) * 0.5f;
+  if (overflow) {
+    radius = (hi - lo).len() * 0.5f + 1.0f;  // the box's own sphere
+    return true;
+  }
+  float r = 0.0f;
+  for (int i = 0; i < n; i++) r = std::max(r, (s[i].c - centre).len() + s[i].r);
+  radius = r + 1.0f;
+  return true;
+}
+
 void Mob::ApplySplatter(const SplatterEvent& e) {
   if (!sys_) return;
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
     if (!limb.body) continue;
     if (e.sourceMob == id_ && e.sourceLimb == (int)li) continue;
+    // THE REACH REJECT, BEFORE THE VIEW IS BUILT (2026-10-04). Every burst is
+    // replayed against every limb of every creature, and building a view
+    // (ViewOf arms the wound table and the bare-blood callback) cost more
+    // than the test that then threw almost all of them away: 4 ms a tick of a
+    // 64-creature brawl. This is SplatterView's own out-of-reach test, the
+    // same expressions on the same inputs a live limb's view would carry
+    // (sizeMin zero), so it drops exactly the limbs SplatterView would.
+    {
+      const float sinv = 1.0f / (float)std::max(1u, PhysScaleOf(limb));
+      const Vec3 half{0.5f * (float)(limb.size.x - 0) * sinv,
+                      0.5f * (float)(limb.size.y - 0) * sinv,
+                      0.5f * (float)(limb.size.z - 0) * sinv};
+      const Vec3 mid{0.5f * (float)(limb.size.x + 0) * sinv,
+                     0.5f * (float)(limb.size.y + 0) * sinv,
+                     0.5f * (float)(limb.size.z + 0) * sinv};
+      const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                   limb.xf.quat[3]};
+      const Vec3 toC = limb.xf.pos + Rotate(q, mid) - e.origin;
+      if (toC.len() - half.len() > e.reach) continue;
+    }
     BurnLimbView v = ViewOf(limb);
     // Worn shells over this limb catch the splash (SplatterView); the probe
     // BurnTick and StainTick set up, and only on a limb that has any.

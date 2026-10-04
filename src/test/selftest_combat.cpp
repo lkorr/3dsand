@@ -71,10 +71,12 @@
 #include "audio/cues.h"
 #include "game/ai_behavior.h"
 #include "game/bodyreg.h"
+#include "game/burnprof.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/strokes.h"
+#include "measure/perfscope.h"
 #include "sim/scale.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
@@ -2931,6 +2933,397 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
 }
 
 // =============================================================================
+// mob-cap64 — the living cap is kMaxMobs (64): all of them spawn, tick, fight
+// and hold a render slot, and the next one is refused cleanly
+// =============================================================================
+//
+// PLAN_electricity_wave2 package C. Raising the cap is one constant; what this
+// gate is FOR is everything sized from it, which a cap change can silently
+// outgrow: the body render slots (world.h kMaxBodySlots), the micro-body
+// model table and brick pool (kMaxMicroBodyModels / kMaxMicroBodyPoolWords
+// World), and the Jolt body ceiling. Each one degrades by REFUSING -- a walk
+// that stops early draws the last creatures nowhere, a full table leaves a
+// skin stale -- and refusals are silent unless somebody counts them, so:
+//
+//   A. 64 MIXED creatures spawn (humans, a zombie per four, and every
+//      body-material race the content ships: android, automaton, sylvan),
+//      armed where they have a hand, in two opposed teams.
+//   B. THE 65TH IS REFUSED CLEANLY: Spawn returns 0, the living count stays
+//      at the cap, and no creature, no Jolt body and no brick record leaked.
+//   C. EVERY ONE HOLDS A SLOT: the registry walk emits a transform for every
+//      limb body (none cut off by the ceiling), no slot collides or runs out
+//      of range, every micro limb has its draw instance, the brick audit is
+//      clean, and the brick allocator refused nothing.
+//   D. EVERY ONE TICKS: the first tick after the settle ran the arbiter for
+//      all 64, and over the run the fight happened (attack requests issued,
+//      hp lost).
+//
+// AND IT IS THE CROWD PERF HARNESS: the tick's wall time and the mob side's
+// own breakdown (burnprof, stage by stage) are printed and recorded as
+// mobCap64.* observations. `mobCap64.count` in tests/baseline.json runs the
+// same fixture at a smaller crowd (16 = the old cap) for a before/after at one
+// binary. The only perf THRESHOLD is mobCap64.maxMobMsMean, the mob side's
+// mean per tick, and it is generous on purpose: the gate's subject is
+// correctness, the number is the report.
+Status GateMobCap64(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("mob-cap64: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("mob-cap64: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  MicroBodySet* mset = c.debris.MicroSet();
+  check(mset != nullptr, "the debris system publishes a MicroBodySet");
+  const uint32_t refusals0 = mset ? mset->refusals : 0;
+
+  const uint32_t cap = MobSystem::MaxLiveMobs();
+  const int want = std::clamp((int)BaselineNumber("mobCap64.count", (double)cap),
+                              1, (int)cap);
+  // ---- the mix ------------------------------------------------------------
+  // Every def that is a different BODY: different materials, different limb
+  // counts, different brick sizes. Missing ones are skipped (content moves),
+  // and the human is the floor.
+  std::vector<int> mix;
+  for (const char* n : {"human", "sentinel", "boilerman", "dryad", "brug",
+                        "replicant", "tinker", "thornwood"}) {
+    const int d = c.mobs.FindDef(n);
+    if (d >= 0) mix.push_back(d);
+  }
+  if (mix.empty()) mix.push_back(st.defIndex);
+  const int zombieDef = c.mobs.FindDef("zombie");
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+
+  // ---- A: spawn ------------------------------------------------------------
+  // Two teams of 8 x (want/16) in ranks 6 voxels apart, facing each other
+  // across an 18-voxel gap. Ground per column from the same height function
+  // the world is built from (FlatSpot's flat patch is narrower than the
+  // formation).
+  constexpr int kCols = 8;
+  constexpr int kPitch = 6;
+  std::vector<uint64_t> ids;
+  std::vector<uint8_t> team;
+  std::string why;
+  int spawnRefused = 0;
+  for (int k = 0; k < want; k++) {
+    const int t = k & 1;                  // interleaved, so the mix is even
+    const int slot = k >> 1;
+    const int col = slot % kCols, rank = slot / kCols;
+    const int x = st.spot.x + (col - kCols / 2) * kPitch + 2;
+    const int z = st.spot.z + (t == 0 ? -1 : 1) * (9 + rank * kPitch);
+    const int y = World::TerrainHeight(x, z, kDefaultSeed) + 1;
+    const bool zombie = t == 0 && zombieDef >= 0 && (slot % 4) == 3;
+    const int def = zombie ? zombieDef : mix[(size_t)(slot % mix.size())];
+    const uint64_t id = c.mobs.Spawn(def, {x, y, z});
+    if (id == 0) {
+      spawnRefused++;
+      continue;
+    }
+    c.mobs.SetMobBehavior(id, zombie ? "zombie"
+                                     : (t == 0 ? "duelist" : "duelist_blue"));
+    if (!zombie && sword != nullptr &&
+        c.mobs.Defs()[def].FindSocket("held_right") >= 0)
+      c.mobs.EquipItem(id, sword);
+    ids.push_back(id);
+    team.push_back((uint8_t)t);
+  }
+  check(spawnRefused == 0 && (int)ids.size() == want &&
+            c.mobs.LiveMobCount() == (uint32_t)want,
+        Format("all %d spawned (%zu did, %d refused, %u living)", want,
+               ids.size(), spawnRefused, c.mobs.LiveMobCount()));
+
+  // ---- B: the 65th ---------------------------------------------------------
+  // Only meaningful at the cap; a smaller `count` is the perf arm.
+  bool refusedClean = true;
+  if ((uint32_t)want == cap) {
+    const uint32_t mobs0 = c.mobs.MobCount();
+    const uint32_t bodies0 = c.phys.LiveBodyCount();
+    const size_t models0 = mset ? mset->models.size() - mset->freeModels.size() : 0;
+    const uint64_t extra = c.mobs.Spawn(
+        mix[0], {st.spot.x, World::TerrainHeight(st.spot.x, st.spot.z,
+                                                 kDefaultSeed) + 1, st.spot.z});
+    const size_t models1 = mset ? mset->models.size() - mset->freeModels.size() : 0;
+    refusedClean = extra == 0 && c.mobs.LiveMobCount() == cap &&
+                   c.mobs.MobCount() == mobs0 &&
+                   c.phys.LiveBodyCount() == bodies0 && models1 == models0;
+    check(refusedClean,
+          Format("the %uth spawn is refused cleanly (id %llu, living %u, mobs "
+                 "%u -> %u, Jolt bodies %u -> %u, brick records %zu -> %zu)",
+                 cap + 1, (unsigned long long)extra, c.mobs.LiveMobCount(),
+                 mobs0, c.mobs.MobCount(), bodies0, c.phys.LiveBodyCount(),
+                 models0, models1));
+  }
+
+  Ticker tick{c, 27400, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 4; i++) tick();   // rigs onto the ground
+  // Faced at the nearest foe (a creature spawned behind another never turns
+  // round: `limb-alias`'s note).
+  for (size_t a = 0; a < ids.size(); a++) {
+    float best = 1e30f;
+    Vec3 at{};
+    for (size_t b = 0; b < ids.size(); b++) {
+      if (team[a] == team[b]) continue;
+      const Vec3 pa = c.mobs.MobOrigin(ids[a]), pb = c.mobs.MobOrigin(ids[b]);
+      const float d = (pa.x - pb.x) * (pa.x - pb.x) + (pa.z - pb.z) * (pa.z - pb.z);
+      if (d < best) {
+        best = d;
+        at = pb;
+      }
+    }
+    if (best < 1e30f) FaceAt(c.mobs, ids[a], at);
+  }
+
+  // ---- C: every one holds a slot -------------------------------------------
+  uint32_t peakSlotsPerMob = 0, limbBodies = 0, microLimbs = 0;
+  for (uint64_t id : ids)
+    if (const Mob* m = c.mobs.FindMobById(id)) {
+      peakSlotsPerMob = std::max(peakSlotsPerMob, m->LimbBodyCount());
+      limbBodies += m->LimbBodyCount();
+    }
+  {
+    BodyRegistry reg(c.debris, c.mobs, nullptr, mset);
+    std::vector<BodyXformGpu> xf;
+    std::vector<uint64_t> handles;
+    std::vector<MicroBodyInstGpu> insts;
+    reg.BuildXforms(xf);
+    reg.BuildHandles(handles);
+    reg.BuildMicroInsts(insts);
+    const uint32_t faults = reg.AuditMicroModels();
+    const uint32_t expect = c.debris.SlotCount() + c.mobs.LimbBodyCount();
+    uint32_t zeroHandles = 0;
+    for (uint64_t h : handles) zeroHandles += h == 0;
+    for (const MicroBodyInstGpu& in : insts) microLimbs += in.model != kMicroBodyNoModel;
+    check(xf.size() == expect && handles.size() == expect &&
+              expect <= kMaxBodySlots && zeroHandles == 0,
+          Format("every limb body has a render slot (%zu transforms, %zu "
+                 "handles, %u expected = %u debris + %u mob limbs, ceiling %u, "
+                 "%u null handles)",
+                 xf.size(), handles.size(), expect, c.debris.SlotCount(),
+                 c.mobs.LimbBodyCount(), kMaxBodySlots, zeroHandles));
+    check(faults == 0, Format("brick audit clean (%u faults)", faults));
+    check(!insts.empty(), Format("micro limbs drawn (%zu instances)", insts.size()));
+    RecordObserved("mobCap64.slots", (double)expect);
+  }
+  check(!mset || mset->refusals == refusals0,
+        Format("the brick allocator refused nothing for the crowd (%u refusals; "
+               "%zu/%u records, %zu/%u pool words)",
+               mset ? mset->refusals - refusals0 : 0,
+               mset ? mset->models.size() : 0, kMaxMicroBodyModels,
+               mset ? mset->pool.size() : 0, kMicroBodyPoolWordsWorld));
+
+  // ---- D: every one ticks --------------------------------------------------
+  {
+    const uint64_t steps0 = c.mobs.AiSteps();
+    tick();
+    const uint64_t ran = c.mobs.AiSteps() - steps0;
+    check(ran == ids.size(),
+          Format("the first tick ran the arbiter for every creature (%llu of %zu)",
+                 (unsigned long long)ran, ids.size()));
+  }
+
+  // ---- the fight, timed ----------------------------------------------------
+  float hp0 = 0;
+  for (uint64_t id : ids) hp0 += c.mobs.TotalHp(id);
+  const bool prevScopes = PerfScopesOn();
+  PerfScopesEnable(true);
+  double scopeAcc[kPerfScopeCount] = {};
+  PerfScopesDrain(scopeAcc);
+  for (double& v : scopeAcc) v = 0;
+  burnprof::Get().on = true;
+  burnprof::Reset();
+  const int ticks = (int)BaselineNumber("mobCap64.ticks", 300);
+  const uint64_t starved0 = c.mobs.BleedStarved();
+  std::vector<double> tickMs, regMs;
+  tickMs.reserve(ticks);
+  regMs.reserve(ticks);
+  uint64_t requests = 0;
+  uint32_t peakSlots = 0, peakJolt = 0, peakRecords = 0;
+  uint32_t peakManifolds = 0;
+  double sumManDyn = 0, sumManStatic = 0, sumActive = 0;
+  std::vector<double> rolePairs(Physics::kRoleCols * Physics::kRoleCols, 0.0);
+  double joltMs = 0.0;
+  size_t peakLiveWords = 0;
+  size_t peakPool = 0;
+  std::vector<BodyXformGpu> xf;
+  std::vector<MicroBodyInstGpu> insts;
+  for (int i = 0; i < ticks; i++) {
+    const double t0 = NowSeconds();
+    tick();
+    const double t1 = NowSeconds();
+    requests += c.mobs.AttackRequests().size();
+    c.mobs.ClearAttackRequests();
+    // THE FRAME'S CPU SIDE OF THE BODIES: what the render loop builds every
+    // frame from the same registry (transforms + the compacted micro list +
+    // the audit main.cpp runs each tick).
+    BodyRegistry reg(c.debris, c.mobs, nullptr, mset);
+    reg.BuildXforms(xf);
+    reg.BuildMicroInsts(insts);
+    (void)reg.AuditMicroModels();
+    const double t2 = NowSeconds();
+    tickMs.push_back((t1 - t0) * 1000.0);
+    regMs.push_back((t2 - t1) * 1000.0);
+    peakSlots = std::max(peakSlots, reg.TotalSlots());
+    peakJolt = std::max(peakJolt, c.phys.LiveBodyCount());
+    joltMs += c.phys.LastStep().ms;
+    sumManDyn += c.phys.LastStep().manifoldsDyn;
+    sumManStatic += c.phys.LastStep().manifoldsStatic;
+    sumActive += c.phys.NumActiveBodies();
+    for (size_t k = 0; k < rolePairs.size(); k++)
+      rolePairs[k] += c.phys.LastStep().rolePairs[k];
+    peakManifolds = std::max(peakManifolds, c.phys.LastStep().manifoldsDyn +
+                                                c.phys.LastStep().manifoldsStatic);
+    if (mset) {
+      peakRecords = std::max<uint32_t>(
+          peakRecords, (uint32_t)(mset->models.size() - mset->freeModels.size()));
+      peakPool = std::max(peakPool, mset->pool.size());
+      size_t freeWords = 0;
+      for (const auto& fr : mset->freeRanges) freeWords += fr.second;
+      peakLiveWords = std::max(peakLiveWords, mset->pool.size() - freeWords);
+    }
+  }
+  burnprof::EndTick(0);
+  const burnprof::Profile prof = burnprof::Get();
+  const std::string profReport = burnprof::Report();
+  burnprof::Get().on = false;
+  PerfScopesDrain(scopeAcc);
+  PerfScopesEnable(prevScopes);
+
+  float hp1 = 0;
+  int alive = 0;
+  for (uint64_t id : ids) {
+    hp1 += c.mobs.TotalHp(id);
+    alive += c.mobs.IsAlive(id) ? 1 : 0;
+  }
+  check(requests > 0, Format("they fought (%llu attack requests)",
+                             (unsigned long long)requests));
+  check(hp1 < hp0, Format("blows landed (hp %.0f -> %.0f)", hp0, hp1));
+  check(!mset || mset->refusals == refusals0,
+        Format("the brick allocator refused nothing through the fight (%u "
+               "refusals; peak %u/%u records, %zu/%u pool words)",
+               mset ? mset->refusals - refusals0 : 0, peakRecords,
+               kMaxMicroBodyModels, peakPool, kMicroBodyPoolWordsWorld));
+  check(peakSlots <= kMaxBodySlots,
+        Format("peak body slots %u within %u", peakSlots, kMaxBodySlots));
+
+  auto stats = [](std::vector<double> v, double& mean, double& p95, double& worst) {
+    mean = p95 = worst = 0;
+    if (v.empty()) return;
+    for (double x : v) mean += x;
+    mean /= (double)v.size();
+    std::sort(v.begin(), v.end());
+    p95 = v[std::min(v.size() - 1, (size_t)((double)v.size() * 0.95))];
+    worst = v.back();
+  };
+  double tMean, tP95, tWorst, rMean, rP95, rWorst;
+  stats(tickMs, tMean, tP95, tWorst);
+  stats(regMs, rMean, rP95, rWorst);
+  const double n = prof.ticks ? (double)prof.ticks : 1.0;
+  const double mobMean = prof.sumTotal / n / 1000.0;
+  auto ph = [&](int p) { return prof.tot[p] / n / 1000.0; };
+  const double maxMobMs = BaselineNumber("mobCap64.maxMobMsMean", 1e9);
+  check(mobMean <= maxMobMs,
+        Format("the mob side's mean tick %.2f ms <= %.2f", mobMean, maxMobMs));
+
+  std::printf("mob-cap64: %zu creatures (%zu defs in the mix), %d ticks, %d "
+              "alive at the end, %llu attack requests, hp %.0f -> %.0f\n",
+              ids.size(), mix.size() + (zombieDef >= 0 ? 1 : 0), ticks, alive,
+              (unsigned long long)requests, hp0, hp1);
+  std::printf("mob-cap64: %llu drips refused by the shared pot "
+              "(gore.bleedOpsPerTick) over the fight\n",
+              (unsigned long long)(c.mobs.BleedStarved() - starved0));
+  std::printf("mob-cap64: slots %u limb bodies (peak %u per creature), %u "
+              "micro limbs; peak %u/%u slots, %u Jolt bodies, %u/%u brick "
+              "records, %zu/%u pool words\n",
+              limbBodies, peakSlotsPerMob, microLimbs, peakSlots, kMaxBodySlots,
+              peakJolt, peakRecords, kMaxMicroBodyModels, peakPool,
+              kMicroBodyPoolWordsWorld);
+  std::printf("mob-cap64: tick wall %.2f ms mean / %.2f p95 / %.2f worst; "
+              "body registry %.3f / %.3f / %.3f; mob side %.2f ms mean\n",
+              tMean, tP95, tWorst, rMean, rP95, rWorst, mobMean);
+  std::printf("mob-cap64: mob stages ms/tick: actors %.3f anchor %.3f sense %.3f "
+              "intent %.3f crowd %.3f drive %.3f stroke %.3f anim %.3f submit "
+              "%.3f bleed %.3f stain %.3f burn %.3f shockQ %.3f postStep %.3f "
+              "contact %.3f hairTuck %.3f deadSleep %.3f splatter %.3f\n",
+              ph(burnprof::kActors), ph(burnprof::kTerrainAnchor),
+              ph(burnprof::kSense), ph(burnprof::kIntent), ph(burnprof::kCrowd),
+              ph(burnprof::kDrive), ph(burnprof::kStroke), ph(burnprof::kAnim),
+              ph(burnprof::kSubmit), ph(burnprof::kBleed), ph(burnprof::kStain),
+              ph(burnprof::kBurnLimbs), ph(burnprof::kShockQuery),
+              ph(burnprof::kPostStep), ph(burnprof::kContact),
+              ph(burnprof::kHairTuck), ph(burnprof::kDeadSleep),
+              ph(burnprof::kSplatter));
+  std::printf("mob-cap64: Jolt Update %.2f ms/tick mean, peak %u manifolds "
+              "(mean %.0f body-body, %.0f body-static), %.0f active bodies "
+              "mean; at the end %u dead rigs, %u debris bodies; peak live pool "
+              "words %zu\n",
+              joltMs / std::max(1, ticks), peakManifolds,
+              sumManDyn / std::max(1, ticks), sumManStatic / std::max(1, ticks),
+              sumActive / std::max(1, ticks), c.mobs.DeadMobCount(),
+              c.debris.BodyCount(), peakLiveWords);
+  {
+    // Which ROLE pairs made the manifolds, largest first (rule 6).
+    std::vector<std::pair<double, int>> top;
+    for (int k = 0; k < (int)rolePairs.size(); k++)
+      if (rolePairs[k] > 0) top.push_back({rolePairs[k], k});
+    std::sort(top.rbegin(), top.rend());
+    auto roleName = [](int r) {
+      return r == Physics::kRoleStatic ? "static"
+                                       : Physics::RoleName((Physics::BodyRole)r);
+    };
+    std::string s = "mob-cap64: manifolds/tick by role pair:";
+    for (size_t k = 0; k < top.size() && k < 8; k++)
+      s += Format(" %s-%s %.0f", roleName(top[k].second / Physics::kRoleCols),
+                  roleName(top[k].second % Physics::kRoleCols),
+                  top[k].first / std::max(1, ticks));
+    std::printf("%s\n", s.c_str());
+  }
+  {
+    std::string s = "mob-cap64: CPU scopes ms/tick:";
+    for (int i = 0; i < kPerfScopeCount; i++) {
+      if (scopeAcc[i] <= 0.0) continue;
+      s += Format(" %s %.2f", kPerfScopeKeys[i], scopeAcc[i] / ticks);
+    }
+    std::printf("%s\n", s.c_str());
+  }
+  std::printf("mob-cap64: burnprof %s\n", profReport.c_str());
+
+  RecordObserved("mobCap64.count", (double)ids.size());
+  RecordObserved("mobCap64.tickMsMean", tMean);
+  RecordObserved("mobCap64.tickMsP95", tP95);
+  RecordObserved("mobCap64.tickMsWorst", tWorst);
+  RecordObserved("mobCap64.mobMsMean", mobMean);
+  RecordObserved("mobCap64.mobMsWorst", prof.worstTotal / 1000.0);
+  RecordObserved("mobCap64.registryMsMean", rMean);
+  RecordObserved("mobCap64.peakSlots", (double)peakSlots);
+  RecordObserved("mobCap64.peakSlotsPerMob", (double)peakSlotsPerMob);
+  RecordObserved("mobCap64.peakJoltBodies", (double)peakJolt);
+  RecordObserved("mobCap64.peakRecords", (double)peakRecords);
+  RecordObserved("mobCap64.peakPoolWords", (double)peakPool);
+  RecordObserved("mobCap64.peakLivePoolWords", (double)peakLiveWords);
+  RecordObserved("mobCap64.joltMsMean", joltMs / std::max(1, ticks));
+  RecordObserved("mobCap64.attackRequests", (double)requests);
+  RecordObserved("mobCap64.bleedStarved", (double)(c.mobs.BleedStarved() - starved0));
+
+  CloseStage(c);
+  detail = Format("%zu/%d spawned, 65th refused %d, %u slots peak, tick %.1f ms "
+                  "(mob %.2f), %llu requests",
+                  ids.size(), want, refusedClean ? 1 : 0, peakSlots, tMean,
+                  mobMean, (unsigned long long)requests);
+  std::printf("mob-cap64: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
 // unarmed-attack — a fist is a weapon, and losing one costs a style
 // =============================================================================
 Status GateUnarmedAttack(Ctx& c, std::string& detail) {
@@ -4315,6 +4708,11 @@ const std::vector<Gate>& CombatGates() {
       // fixture shape, same place in kOrder, but its subject is the render
       // bookkeeping the fight churns rather than the fight.
       {"limb-alias", "mob", {}, false, GateLimbAlias},
+      // The living cap (kMaxMobs 64): a 64-creature mixed brawl spawns, holds
+      // a render slot each, ticks, fights, and the 65th is refused cleanly.
+      // Also the crowd perf harness (mobCap64.* observations). Same exit
+      // contract as limb-alias: id scope in, worldgen regenerated out.
+      {"mob-cap64", "mob", {}, false, GateMobCap64},
       // ---- the directional flinch (mob.h Mob::HitReact) -------------------
       // Spawns one passive dummy and hits it twice through the ordinary
       // MobSystem entry point. Same shape as the ones above — id scope in,
