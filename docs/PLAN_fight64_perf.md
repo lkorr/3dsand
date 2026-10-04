@@ -190,6 +190,38 @@ P (39a8b56) and M (59b0750) landed.
    - Make the twice-run digest comparison a permanent part of `mob-cap64`
      (or a new gate), so this is gated from now on.
 
+#### Package R result (2026-10-04, cut short by owner directive)
+
+1. **`corpse-splatter`: fixed, and it was not the hull.** `SANDVOX_SPLAT_TRACE=1`
+   (new, permanent: every limb a burst is flown at, its trials, each landing)
+   showed the gate's burst landing on 9 of the corpse's 17 limbs and missing
+   only the one the gate counts. The flight is analytic against each limb's
+   voxel lattice; it never consults a collider, so the hull is not in its
+   path. What P changed is the pose the corpse settles in. The gate counts
+   the root limb (the pelvis), the one limb the corpse's own gout never
+   coats. The wide burst (cone 0.35) gave it ~5 of 24 trials, each with
+   ~30% odds of hitting, so roughly a 1-in-6 chance of no landing at all.
+   It was "0 -> 9" before P and "0 -> 0" after. The gate now throws a
+   focused splash (cone 0.12), which sends every trial at the root limb.
+   No engine behaviour changed.
+2. **Determinism soak: NOT DONE (TBD).** No digest runs were made before the
+   owner's wrap-up directive. Still open:
+   - the natural and `killEvery 4` arms with `SANDVOX_MOBCAP_DIGEST=1`, 3+
+     runs each;
+   - `SANDVOX_MOB_THREADS=1` vs default;
+   - `SANDVOX_PHYS_THREADS=1/2/7`.
+
+   Attribution tools already exist:
+   - `SANDVOX_PHYS_TRACE=<file>` writes per-step body-state hashes, before
+     (P) and after (S) `Update`. A differing S after a matching P means
+     Jolt's step itself. A differing P after a matching S means our code
+     between steps.
+   - `Physics::DebugBodyStates` gives per-body float bits (see
+     village-twice).
+
+   Hypothesis for M's tick-208 contact-count split: still unknown. No
+   permanent twice-run gate has landed.
+
 ### Package Q — round-2 performance (target: the real game holds 30 Hz at 64)
 
 **A moved world hash is FINE** (CLAUDE.md rule 1): rebaseline once at the
