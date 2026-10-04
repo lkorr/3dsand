@@ -4817,6 +4817,21 @@ Status GateCorpseWorn(Ctx& c, std::string& detail) {
 // body-stain's burst, aimed at a corpse's torso instead of a standing
 // creature's: a splash thrown at 6 m/s from a metre away must mark the dead
 // body it lands on.
+//
+// THE ROOT LIMB, AND A FOCUSED SPLASH (fight64 R, 2026-10-04). The coat is
+// counted on the root limb because it is the one limb the corpse's OWN gout
+// (it bleeds from there) never lands on -- SplatterView skips the bleeding
+// limb -- so any rise is this burst's. The burst used to be body-stain's wide
+// one (cone 0.35): from a metre that hands the root limb ~5 of the 24 trials
+// (its bounding disc over the burst's solid angle), each aimed at a random
+// point of that disc, and the pelvis fills ~30% of it -- about a 1-in-6
+// chance of no landing at all. Which pose the corpse settled in decided it:
+// "0 -> 9" before the corpse hull (fight64 P), "0 -> 0" after, while
+// SANDVOX_SPLAT_TRACE showed every OTHER limb of the same corpse taking that
+// burst (the flight is analytic against the voxel lattice and never meets a
+// collider, so the hull is not in its path). A focused splash (cone 0.12)
+// throws every trial at the root limb, and the claim -- blood thrown at a
+// corpse lands on it -- no longer rides on a coin flip.
 Status GateCorpseSplatter(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
   const uint32_t mBlood = MatIdOf(c, "blood");
@@ -4835,7 +4850,7 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
   SplatterEvent ev;
   ev.origin = at + Vec3{MetresToCells(1.0f), 0.3f, 0.0f};
   ev.axis = Vec3{-1.0f, 0.0f, 0.0f};
-  ev.cone = 0.35f;
+  ev.cone = 0.12f;   // focused: see the note above the gate
   ev.reach = MetresToCells(2.0f);
   ev.speed = MetresToCells(6.0f);
   ev.life = 70;
@@ -4853,7 +4868,7 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
   c.ctx.WaitIdle();
   RecordObserved("corpseSplatterMarked", (double)(after > before ? after - before : 0));
   const bool ok = after > before;
-  detail = Format("a 24-droplet burst at a dead torso from 1 m: blood coat %u -> %u",
+  detail = Format("a focused 24-droplet burst at a dead torso from 1 m: blood coat %u -> %u",
                   before, after);
   return ok ? Status::Pass : Status::Fail;
 }

@@ -853,6 +853,19 @@ bool g_burnHouseDone = false;
 bool g_burnNpc = false;
 int g_burnNpcAt = 240;
 bool g_burnNpcDone = false;
+// `--brawl [tick]`: THE 64-CREATURE FIGHT IN THE REAL FRAME LOOP
+// (docs/PLAN_fight64_perf.md package M, items 4 and 5). mob-cap64's crowd --
+// SANDVOX_BRAWL_N creatures (default 64) of the same mix, two armed teams
+// facing each other -- spawned 12 m ahead of the camera at `tick` (default
+// 240), settled 30 ticks, then fought for SANDVOX_BRAWL_TICKS (default 300)
+// with the frame series reset at the first blow, so the --frames exit report
+// (CPU scopes incl. readbackStall, GPU nodes and passes, body render) is the
+// fight's and nothing else's. A 30-tick timeline of frame p50/max and the mob
+// tick's burnprof breakdown is printed while it runs.
+//   bash scripts/run.sh ./build/Release/sandvox.exe --frames 100000 --brawl
+bool g_brawl = false;
+int g_brawlAt = 240;
+bool g_brawlDone = false;
 // `--ticket x,y,z` (repeatable): request a CHUNK TICKET whose box holds the
 // world VOXEL (x, y, z) on the first tick (docs/PLAN_chunk_tickets.md P1, the
 // manual op). The request goes through the same policy as every other — a
@@ -5612,6 +5625,10 @@ int main(int argc, char** argv) {
       g_burnNpc = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_burnNpcAt = std::atoi(argv[++i]);
     }
+    else if (a == "--brawl") {
+      g_brawl = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_brawlAt = std::atoi(argv[++i]);
+    }
     else if (a == "--ticket" && i + 1 < argc) {
       int tx = 0, ty = 0, tz = 0;
       if (std::sscanf(argv[++i], "%d,%d,%d", &tx, &ty, &tz) == 3)
@@ -9179,6 +9196,119 @@ int main(int argc, char** argv) {
       }
     };
   }
+  if (g_brawl && !g_burnNpc && !g_burnHouse && !g_fellTree && !g_forestFire) {
+    // ---- --brawl (see g_brawl). Borrows the fell-tree slot, as --burn-npc does.
+    tickCtx.fellTree = [&mobs, &player, &cam, &sim, &items](
+                           uint32_t tick, std::vector<CellOp>& cellOps) {
+      (void)cellOps;
+      static std::vector<uint64_t> ids;
+      static std::vector<uint8_t> team;
+      static int phase = 0;  // 0 wait, 1 settling, 2 fighting
+      static uint32_t t1 = 0, tFight = 0;
+      static size_t winFrame0 = 0;
+      auto envInt = [](const char* n, int d) {
+        const char* e = std::getenv(n);
+        return e ? std::atoi(e) : d;
+      };
+      static const int want =
+          std::clamp(envInt("SANDVOX_BRAWL_N", (int)MobSystem::MaxLiveMobs()), 1,
+                     (int)MobSystem::MaxLiveMobs());
+      static const uint32_t fightTicks =
+          (uint32_t)std::max(30, envInt("SANDVOX_BRAWL_TICKS", 300));
+      if (g_brawlDone) return;
+      if (phase == 0) {
+        if (tick < (uint32_t)g_brawlAt) return;
+        if (!sim.FarPipelinesReady()) {
+          g_brawlAt = (int)tick + 60;
+          return;
+        }
+        // mob-cap64's mix: every body-material race, a zombie per four on one
+        // side, swords where there is a hand.
+        std::vector<int> mix;
+        for (const char* n : {"human", "sentinel", "boilerman", "dryad", "brug",
+                              "replicant", "tinker", "thornwood"}) {
+          const int d = mobs.FindDef(n);
+          if (d >= 0) mix.push_back(d);
+        }
+        if (mix.empty()) {
+          std::printf("--brawl: no creature defs\n");
+          g_brawlDone = true;
+          return;
+        }
+        const int zombieDef = mobs.FindDef("zombie");
+        const ItemDef* sword = items.At(items.Find("sword"));
+        Vec3 fwd = cam.Forward();
+        fwd.y = 0;
+        fwd = fwd * (1.0f / std::max(1e-4f, fwd.len()));
+        const Vec3 c = player.pos + fwd * MetresToCells(12.0f);
+        constexpr int kCols = 8, kPitch = 6;
+        for (int k = 0; k < want; k++) {
+          const int t = k & 1;
+          const int slot = k >> 1;
+          const int col = slot % kCols, rank = slot / kCols;
+          const int x = ifloor(c.x) + (col - kCols / 2) * kPitch + 2;
+          const int z = ifloor(c.z) + (t == 0 ? -1 : 1) * (9 + rank * kPitch);
+          const int y = World::TerrainHeight(x, z, kDefaultSeed) + 1;
+          const bool zombie = t == 0 && zombieDef >= 0 && (slot % 4) == 3;
+          const int def = zombie ? zombieDef : mix[(size_t)(slot % mix.size())];
+          const uint64_t id = mobs.Spawn(def, {x, y, z});
+          if (id == 0) continue;
+          mobs.SetMobBehavior(id, zombie ? "zombie" : (t == 0 ? "duelist" : "duelist_blue"));
+          if (!zombie && sword != nullptr && mobs.Defs()[def].FindSocket("held_right") >= 0)
+            mobs.EquipItem(id, sword);
+          // Facing the other rank (heading 0 = +Z).
+          mobs.SetHeading(id, t == 0 ? 0.0f : 3.14159265f);
+          ids.push_back(id);
+          team.push_back((uint8_t)t);
+        }
+        std::printf("--brawl: %zu of %d creatures spawned at (%.0f, %.0f, %.0f)\n",
+                    ids.size(), want, c.x, c.y, c.z);
+        std::fflush(stdout);
+        t1 = tick;
+        phase = 1;
+        return;
+      }
+      if (phase == 1) {
+        if (tick < t1 + 30u) return;
+        tFight = tick;
+        phase = 2;
+        g_frameMs.clear();
+        g_activeChunks.clear();
+        for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+          g_frameScopeSum[i] = 0;
+          g_frameScopeMax[i] = 0;
+          g_frameScopeSeries[i].clear();
+        }
+        for (int n = 0; n < sandvox::kPerfNodeCount; n++) g_frameGpuSeries[n].clear();
+        g_frameGpuPassSeries.clear();
+        g_frameGpuFrames = 0;
+        winFrame0 = 0;
+        burnprof::Get().on = true;
+        burnprof::Reset();
+        std::printf("--brawl: FIGHT at tick %u for %u ticks\n", tick, fightTicks);
+        std::fflush(stdout);
+      }
+      if ((tick - tFight) % 30u == 29u) {
+        std::vector<double> w(
+            g_frameMs.begin() + (ptrdiff_t)std::min(winFrame0, g_frameMs.size()),
+            g_frameMs.end());
+        std::sort(w.begin(), w.end());
+        int alive = 0;
+        for (uint64_t id : ids) alive += mobs.IsAlive(id) ? 1 : 0;
+        std::printf("--brawl: +%4u frames %3zu p50 %6.1f max %6.1f | %d alive | mob "
+                    "tick: %s\n",
+                    tick - tFight, w.size(), w.empty() ? 0.0 : w[w.size() / 2],
+                    w.empty() ? 0.0 : w.back(), alive, burnprof::Report().c_str());
+        burnprof::Reset();
+        winFrame0 = g_frameMs.size();
+        std::fflush(stdout);
+      }
+      if (tick >= tFight + fightTicks) {
+        burnprof::Get().on = false;
+        g_brawlDone = true;
+      }
+    };
+  }
   // Respawn out of an open inventory hands the cursor back to the window:
   // `captureBeforeUi`, glfwSetInputMode and the cursor-position reset are all
   // the WINDOW's, and there is no window on the authority side.
@@ -10536,6 +10666,7 @@ int main(int argc, char** argv) {
           std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire ||
           g_burnHouse ||
           g_burnNpc ||
+          g_brawl ||
           g_shotDialogue ||  // the reload would wipe the listener it spawned
           g_shotDemon ||     // ...or the demon it summoned
           g_shotEditor ||    // ...or the house it placed
@@ -10548,7 +10679,8 @@ int main(int argc, char** argv) {
     }
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
-    if (g_parkDone || g_forestFireDone || g_burnHouseDone || g_burnNpcDone)
+    if (g_parkDone || g_forestFireDone || g_burnHouseDone || g_burnNpcDone ||
+        g_brawlDone)
       glfwSetWindowShouldClose(window, 1);
 
     // --shot-jump: decide whether THIS frame is one of the four pictures.
@@ -12030,6 +12162,12 @@ int main(int argc, char** argv) {
           v = v.normalized();
           float yawT = std::atan2(v.z, v.x);
           float pitchT = std::asin(std::clamp(v.y, -1.0f, 1.0f));
+          // FRAME THE EYES ABOVE THE PANEL: the conversation panel covers the
+          // lower ~37% of the screen and the strip the top ~25%, so the head
+          // is put a quarter of the half-height ABOVE the centre (the camera
+          // looks that much lower), which lands it in the clear band between
+          // them with the body under it.
+          pitchT -= std::atan(std::tan(fovNow * 0.5f) * 0.25f);
           if (key(GLFW_KEY_L) || ui.demonTalk.lookAwayToggle) {
             yawT += 2.4f;
             pitchT = -0.35f;

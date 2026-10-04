@@ -76,9 +76,11 @@
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/strokes.h"
+#include "gpu/passtimer.h"
 #include "measure/perfscope.h"
 #include "sim/scale.h"
 #include "sim/tuning.h"
+#include "test/sampleprof.h"
 #include "test/selftest.h"
 #include "test/support.h"
 #include "test/tickrig.h"
@@ -3144,6 +3146,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   const int ticks = (int)BaselineNumber("mobCap64.ticks", 300);
   const uint64_t starved0 = c.mobs.BleedStarved();
   const uint32_t contact0 = c.mobs.ContactHitsBilled();
+  const uint32_t contactDup0 = c.mobs.ContactPairDupsDropped();
   std::vector<double> tickMs, regMs;
   tickMs.reserve(ticks);
   regMs.reserve(ticks);
@@ -3164,6 +3167,20 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   size_t peakPool = 0;
   std::vector<BodyXformGpu> xf;
   std::vector<MicroBodyInstGpu> insts;
+  // The whole timed fight under the sampler (SANDVOX_SAMPLE_PROF; no-op
+  // otherwise): every function of the tick, not only the burnprof spans.
+  const MobSystem::ShockCounters shock0 = c.mobs.ShockStats();
+  sampleprof::Start("mob-cap64 fight");
+  // GPU SIDE OF THE CROWD TICK (SANDVOX_MOBCAP_GPU=1, measurement only): every
+  // 10th tick timed pass by pass. A timestamp changes no dispatch and no hash;
+  // the harness already drains the queue every tick, so Collect never waits on
+  // anything the tick did not.
+  static ::PassTimer gpuTimer;
+  const bool gpuTime = std::getenv("SANDVOX_MOBCAP_GPU") != nullptr &&
+                       (gpuTimer.Valid() || (gpuTimer.SetRowGranularity(true),
+                                             gpuTimer.Init(c.ctx, 256)));
+  if (gpuTime) gpuTimer.ResetStats();
+  int gpuTicks = 0;
   // THE CORPSE-HEAVY ARM (fight64 package P): mobCap64.killEvery = k kills
   // every k-th creature at timed tick mobCap64.killAt, so a before/after of
   // the corpse colliders is measured over the SAME number of corpses lying in
@@ -3177,9 +3194,49 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       for (size_t k = 0; k < ids.size(); k += (size_t)killEvery)
         if (Mob* m = c.mobs.FindMobById(ids[k]))
           if (m->Alive()) m->Die();
+    const bool timeThis = gpuTime && i % 10 == 5;
+    if (timeThis) {
+      c.sim.SetPassTimer(&gpuTimer);
+      SetSubmitTickPassTimer(&gpuTimer);
+    }
     const double t0 = NowSeconds();
     tick();
     const double t1 = NowSeconds();
+    // SANDVOX_MOBCAP_DIGEST=1: one line per tick digesting every creature's
+    // hp and origin (bits), so two runs that end differently can be diffed to
+    // the FIRST tick they part (a determinism probe; prints nothing otherwise).
+    static const bool digest = std::getenv("SANDVOX_MOBCAP_DIGEST") != nullptr;
+    if (digest) {
+      uint64_t hh = 1469598103934665603ull, hp = hh;
+      auto mix = [](uint64_t& h, uint64_t x) {
+        h ^= x;
+        h *= 1099511628211ull;
+      };
+      for (uint64_t id : ids) {
+        float hpv = c.mobs.TotalHp(id);
+        uint32_t u = 0;
+        std::memcpy(&u, &hpv, 4);
+        mix(hh, u);
+        const Vec3 o = c.mobs.MobOrigin(id);
+        uint32_t ox, oy, oz;
+        std::memcpy(&ox, &o.x, 4);
+        std::memcpy(&oy, &o.y, 4);
+        std::memcpy(&oz, &o.z, 4);
+        mix(hp, ox);
+        mix(hp, oy);
+        mix(hp, oz);
+      }
+      std::printf("mobcap-digest %d hp %016llx pos %016llx jolt %u %u\n", i,
+                  (unsigned long long)hh, (unsigned long long)hp,
+                  c.phys.LastStep().manifoldsDyn, c.phys.LastStep().manifoldsStatic);
+    }
+    if (timeThis) {
+      c.ctx.WaitIdle();
+      gpuTimer.Collect(c.ctx);
+      c.sim.SetPassTimer(nullptr);
+      SetSubmitTickPassTimer(nullptr);
+      gpuTicks++;
+    }
     requests += c.mobs.AttackRequests().size();
     c.mobs.ClearAttackRequests();
     // THE FRAME'S CPU SIDE OF THE BODIES: what the render loop builds every
@@ -3222,6 +3279,21 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       for (const auto& fr : mset->freeRanges) freeWords += fr.second;
       peakLiveWords = std::max(peakLiveWords, mset->pool.size() - freeWords);
     }
+  }
+  sampleprof::Stop();
+  if (gpuTime && gpuTicks > 0) {
+    std::vector<::PassTimer::Stat> st = gpuTimer.Stats();
+    std::sort(st.begin(), st.end(), [](const auto& a, const auto& b) {
+      return a.totalNs > b.totalNs;
+    });
+    double sum = 0;
+    for (const auto& x : st) sum += (double)x.totalNs;
+    std::string s = Format("mob-cap64: GPU ms/tick (%d timed ticks) total %.2f:",
+                           gpuTicks, sum / 1e6 / gpuTicks);
+    for (size_t k = 0; k < st.size() && k < 24; k++)
+      s += Format(" %s %.2f", st[k].name.c_str(),
+                  (double)st[k].totalNs / 1e6 / gpuTicks);
+    std::printf("%s\n", s.c_str());
   }
   burnprof::EndTick(0);
   const burnprof::Profile prof = burnprof::Get();
@@ -3272,9 +3344,11 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
               (unsigned long long)requests, hp0, hp1);
   std::printf("mob-cap64: %llu drips refused by the shared pot "
               "(gore.bleedOpsPerTick) over the fight; %u loose-body contact "
-              "blows billed\n",
+              "blows billed (%u more reports of an already-billed limb/striker "
+              "pair dropped)\n",
               (unsigned long long)(c.mobs.BleedStarved() - starved0),
-              c.mobs.ContactHitsBilled() - contact0);
+              c.mobs.ContactHitsBilled() - contact0,
+              c.mobs.ContactPairDupsDropped() - contactDup0);
   std::printf("mob-cap64: slots %u limb bodies (peak %u per creature), %u "
               "micro limbs; peak %u/%u slots, %u Jolt bodies, %u/%u brick "
               "records, %zu/%u pool words\n",
@@ -3287,7 +3361,8 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   std::printf("mob-cap64: mob stages ms/tick: actors %.3f anchor %.3f sense %.3f "
               "intent %.3f crowd %.3f drive %.3f stroke %.3f anim %.3f submit "
               "%.3f bleed %.3f stain %.3f burn %.3f shockQ %.3f postStep %.3f "
-              "contact %.3f hairTuck %.3f deadSleep %.3f splatter %.3f\n",
+              "contact %.3f hairTuck %.3f deadSleep %.3f splatter %.3f shocks "
+              "%.3f twinSync %.3f\n",
               ph(burnprof::kActors), ph(burnprof::kTerrainAnchor),
               ph(burnprof::kSense), ph(burnprof::kIntent), ph(burnprof::kCrowd),
               ph(burnprof::kDrive), ph(burnprof::kStroke), ph(burnprof::kAnim),
@@ -3295,7 +3370,8 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
               ph(burnprof::kBurnLimbs), ph(burnprof::kShockQuery),
               ph(burnprof::kPostStep), ph(burnprof::kContact),
               ph(burnprof::kHairTuck), ph(burnprof::kDeadSleep),
-              ph(burnprof::kSplatter));
+              ph(burnprof::kSplatter), ph(burnprof::kShocks),
+              ph(burnprof::kTwinSync));
   std::printf("mob-cap64: Jolt Update %.2f ms/tick mean, peak %u manifolds "
               "(mean %.0f body-body, %.0f body-static), %.0f active bodies "
               "mean; at the end %u dead rigs, %u debris bodies; peak live pool "
@@ -3328,6 +3404,22 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       s += Format(" %s %.2f", kPerfScopeKeys[i], scopeAcc[i] / ticks);
     }
     std::printf("%s\n", s.c_str());
+  }
+  {
+    // The shock solve's own denominators (rule 6: its ms wants them).
+    const MobSystem::ShockCounters& s1 = c.mobs.ShockStats();
+    const double tk = (double)std::max(1, ticks);
+    std::printf("mob-cap64: shocks per tick: %.1f charged answers, %.1f bodies "
+                "solved (%.1f linked), %.0f body cells, slot caches %.1f built / "
+                "%.1f re-accumulated / %.1f reused, %.1f bodies shocked\n",
+                (double)(s1.hitsCharged - shock0.hitsCharged) / tk,
+                (double)(s1.bodiesSolved - shock0.bodiesSolved) / tk,
+                (double)(s1.linked - shock0.linked) / tk,
+                (double)(s1.cellsSolved - shock0.cellsSolved) / tk,
+                (double)(s1.cacheBuilds - shock0.cacheBuilds) / tk,
+                (double)(s1.cacheAccums - shock0.cacheAccums) / tk,
+                (double)(s1.cacheHits - shock0.cacheHits) / tk,
+                (double)(s1.bodiesShocked - shock0.bodiesShocked) / tk);
   }
   {
     // WHERE THE JOLT STEP GOES (fight64 package P): per Jolt job phase, the

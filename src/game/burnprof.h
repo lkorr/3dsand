@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <string>
 
+#include "game/workpool.h"
+
 namespace burnprof {
 
 enum Phase : uint8_t {
@@ -87,6 +89,8 @@ enum Phase : uint8_t {
   kActors,      // the actor list the behaviour layer reads, built per tick
   kShockQuery,  // MobSystem::QueueShockQueries
   kSplatter,    // inside kStain: this tick's bursts replayed against every body
+  kShocks,      // MobSystem::ApplyShocks (the body solve; top of PreTick)
+  kTwinSync,    // Mob::SyncJointTwins (inside BurnTick)
   kCount
 };
 
@@ -102,7 +106,8 @@ inline const char* Name(int p) {
                                   "hairCover", "hairFull", "terrainAnchor",
                                   "sense", "intent", "crowd", "drive",
                                   "stroke", "anim", "submit", "bleed",
-                                  "actors", "shockQuery", "splatter"};
+                                  "actors", "shockQuery", "splatter",
+                                  "shocks", "twinSync"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 
@@ -169,8 +174,11 @@ inline double UsPerTick() {
 struct Scope {
   int ph;
   uint64_t t0 = 0;
+  // Main thread only: the accumulators are process-global, and a scope
+  // inside a workpool task would race them (a worker's span is still
+  // counted -- inside the enclosing main-thread scope that waited for it).
   explicit Scope(int phase) : ph(phase) {
-    if (Get().on) t0 = __rdtsc();
+    if (Get().on && !workpool::OnWorker()) t0 = __rdtsc();
   }
   ~Scope() { Stop(); }
   // Close early (a span that ends before its enclosing block does).
@@ -216,7 +224,7 @@ inline void EndTick(uint32_t tick) {
 }
 
 inline void Count(int c, uint64_t v) {
-  if (Get().on) Get().n[c] += v;
+  if (Get().on && !workpool::OnWorker()) Get().n[c] += v;
 }
 
 inline void Reset() {

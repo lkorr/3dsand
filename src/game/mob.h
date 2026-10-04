@@ -941,6 +941,26 @@ inline uint64_t CrossHeatKey(IVec3 c) {
          (uint64_t)((uint32_t)c.z & 0x1FFFFFu);
 }
 
+// THE BURN PASS'S WORLD SIDE, TAKEN AHEAD (PLAN_fight64_perf M). What
+// MobSystem::BurnOneLimb reads of the WORLD for one limb is a pure function
+// of the world-cell box round the limb (`lo`..`hi`): the sleep key's world
+// digest (which chunks, their cache entries and versions) and the walk's hot
+// cells. The CPU mirror does not change during MobSystem::BurnLimbs, so
+// MobSystem::PrecomputeBurnWalks takes both for every limb across the work
+// pool before the pot runs, and BurnOneLimb uses them when the box it
+// computes is the same box (it always is unless the limb was carved this
+// tick). The walk's chunk-fetch requests -- a shared queue -- are recorded
+// and issued by BurnOneLimb when it uses the walk, in the walk's order.
+struct BurnWalkPre {
+  bool valid = false;
+  IVec3 lo{}, hi{};
+  bool known = false;     // every chunk of the box cached (the sleep key exists)
+  uint64_t hw = 0;        // the key's world digest
+  uint32_t seen = 0;      // cells walked (the kBurnScanCells cap)
+  std::vector<IVec3> scanHot;
+  std::vector<IVec3> fetches;   // RequestChunkFetch(Mob) calls, in order
+};
+
 struct BurnLimbView {
   std::vector<PrefabVoxel>* skin = nullptr;  // skinScale units, int16
   std::vector<DebrisVoxel>* coll = nullptr;  // physScale units, int8
@@ -963,6 +983,8 @@ struct BurnLimbView {
   const std::vector<CrossHeatCell>* crossHeat = nullptr;
   int selfLimb = -1;
   uint32_t crossPct = 0;
+  // The world side taken ahead for this limb this tick (BurnWalkPre), or null.
+  const BurnWalkPre* walkPre = nullptr;
   // The coat ledger says this lattice wears a CORROSIVE coat (LimbCoat::
   // corrosive), so BurnOneLimb must run even with nothing in the world around
   // it: the acid is ON the limb. Set by the caller from its ledger.
@@ -1332,6 +1354,66 @@ struct SplatterEvent {
   uint32_t seed = 0;
   bool doneMobs = false;    // applied to MobSystem's creatures
   bool doneAvatar = false;  // applied to the player's avatar
+};
+
+// ONE LIMB'S CONTACT STAINING, PLANNED (PLAN_fight64_perf M). MobSystem::
+// StainOneLimb's walk and sweep read the world mirror and the limb's own
+// coat and nothing else that the passes before it in StainLimbs can change,
+// so every limb's is planned across the work pool at the top of StainLimbs:
+// the walk's answer and fetches, and for the full per-limb sample budget each
+// sample's coat write or chunk fetch, by sample index. The serial pass plays
+// a plan up to the count the SHARED budget leaves that limb in pot order --
+// the samples are independent, so that is the sweep that stopped there.
+struct StainEvt {
+  uint32_t k = 0;       // sample index
+  uint32_t vi = 0;      // voxel written
+  uint16_t next = 0;    // its new coat word
+  uint8_t fetch = 0;    // 1 = a chunk fetch (`chunk`), not a write
+  IVec3 chunk{};
+};
+struct StainPre {
+  bool valid = false;   // the walk below is this tick's
+  bool any = false;     // the walk found something against the limb
+  bool swept = false;   // `evts` holds the first `kPlanned` samples
+  uint32_t ns = 0;      // surface size (0 = none / refused)
+  uint32_t kPlanned = 0;
+  std::vector<IVec3> walkFetches;
+  std::vector<StainEvt> evts;
+  // The index + surface the plan sweeps over when the limb holds none of its
+  // own yet (built here, thrown away; the apply builds the real one).
+  bool useScratch = false;
+  BodyBurnState scratch;
+};
+
+// ONE CREATURE'S SPLATTER, DEFERRED (PLAN_fight64_perf M). MobSystem::
+// StainLimbs flies every burst at every creature across the work pool, one
+// task per creature; a task writes that creature's lattices and coat flags
+// itself and RECORDS what would touch shared state -- the micro-brick
+// copy-on-write and stain pokes (the pool is everybody's) and the diagnostic
+// counters -- for the serial replay, which then runs them in exactly the
+// (burst, creature, limb, landing) order the inline loop did.
+struct SplatSink {
+  struct Poke {
+    int16_t x = 0, y = 0, z = 0;
+    uint16_t stain = 0;
+  };
+  struct Group {          // one SplatterView call that changed a coat
+    uint32_t event = 0;   // index into the replayed burst list
+    int32_t limb = -1;
+    uint32_t begin = 0, end = 0;   // its pokes
+  };
+  std::vector<Poke> pokes;
+  std::vector<Group> groups;
+  uint32_t curEvent = 0;
+  int32_t curLimb = -1;
+  uint32_t splatBlocked = 0, splatPassed = 0;
+  uint64_t indexBuilds = 0, indexCells = 0;
+  void Clear() {
+    pokes.clear();
+    groups.clear();
+    splatBlocked = splatPassed = 0;
+    indexBuilds = indexCells = 0;
+  }
 };
 
 // Everything BuildMobDef reads that is not the sidecar in front of it: the mob
@@ -2629,6 +2711,15 @@ class Mob {
   void BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                 std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                 uint32_t& opsBudget);
+  // BurnTick in two halves (PLAN_fight64_perf M): the HEAD is everything up
+  // to the joint-twin sync -- the burn loop, the infection, the pulp, the
+  // heals -- and returns false where BurnTick returned early (a flush severed
+  // or killed); the tail is SyncJointTwins + RecountBurn. MobSystem::BurnLimbs
+  // runs every creature's head, then every tail, so the tails' sync can be
+  // prepared across the work pool (SyncJointTwinsPrepare).
+  bool BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                    std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
+                    uint32_t& opsBudget);
   // How much of the shared burn budgets limb `li` is owed this tick: 0 when it
   // has no burn work of its own (nothing alight, no front, no corrosive coat),
   // else its front size -- the burning surface, which is what both its
@@ -4178,6 +4269,30 @@ class Mob {
   // limb's voxel nearest its wound is at burn stage 2 (charred / ash), which
   // the bleed tick reads to close the wound for good.
   bool WoundCharred(const MobLimb& limb) const;
+  // ...as BleedTick asks it: the verdict MobSystem::PrecomputeWoundCharred
+  // took for this limb at the top of the tick's creature loop when there is
+  // one for this very body (PLAN_fight64_perf M: the crowd's scans run across
+  // the pool), else WoundCharred now. The only thing that can move a lattice
+  // between the two is another creature's blade this tick, so the verdict a
+  // carve changes is seen one tick late -- fire, the thing that chars, runs
+  // before the loop (BurnLimbs) and is always seen the same tick.
+  bool WoundCharredAt(int li, uint32_t tick) const;
+  struct CharredPre {
+    uint64_t body = 0;     // the limb's body when the verdict was taken
+    int8_t charred = -1;   // -1 = no verdict
+  };
+  std::vector<CharredPre> charredPre_;
+  uint32_t charredPreTick_ = 0;
+  // BurnWalkPre per limb, taken by MobSystem::PrecomputeBurnWalks for tick
+  // `burnPreTick_`; read only that tick.
+  std::vector<BurnWalkPre> burnPre_;
+  uint32_t burnPreTick_ = 0;
+  // StainPre per limb for tick `stainPreTick_` (MobSystem::StainLimbs).
+  std::vector<StainPre> stainPre_;
+  uint32_t stainPreTick_ = 0;
+  // Plan every limb's contact staining for this tick (a work-pool task: writes
+  // only stainPre_). StainTick plays the plans.
+  void PlanStainContact(uint32_t tick, World& world, int planMode);
 
  protected:
   // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
@@ -4389,7 +4504,10 @@ class Mob {
                  uint32_t& rainBudget);
   // Replay one queued burst against this creature's limbs: each droplet that
   // would land on a limb marks the voxel where it lands.
-  void ApplySplatter(const SplatterEvent& e);
+  // `sink` non-null: the work-pool form (SplatSink); `eventIndex` tags what it
+  // records.
+  void ApplySplatter(const SplatterEvent& e, SplatSink* sink = nullptr,
+                     uint32_t eventIndex = 0);
   // A sphere enclosing every limb's splatter bound (the box SplatterView
   // tests), padded by a voxel so a reject against it is conservative. False
   // when no limb has a body. MobSystem::StainLimbs culls whole creatures
@@ -4684,6 +4802,29 @@ class Mob {
   // Returns false when a flush severed a limb or killed the creature, with
   // InfectTick's contract: the caller must touch nothing afterwards.
   bool SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns);
+  // ...in two halves (PLAN_fight64_perf M). PREPARE is everything that
+  // touches only this creature -- the reconcile walk over every twin cell,
+  // the lattice writes it decides, the link rebuild -- and is safe to run for
+  // many creatures at once on the work pool. What touches SHARED state is
+  // recorded instead of done: the brick pokes (the micro pool owns and
+  // copies on write) and the flush of removed cells (a carve: Jolt, debris,
+  // particle spawns). FINISH replays those, in order, on the calling thread.
+  // SyncJointTwins == Prepare then Finish, bit for bit.
+  struct TwinPoke {
+    int16_t li = 0;
+    int16_t x = 0, y = 0, z = 0;
+    uint8_t kind = 0;      // 0 material + art, 1 stain, 2 removal
+    uint8_t art = 0;
+    uint16_t value = 0;    // material word, or stain word
+  };
+  struct TwinSyncOut {
+    bool ran = false;      // twinDirty_ was set: there is a Finish to run
+    bool matChanged = false, stainChanged = false, removed = false;
+    std::vector<TwinPoke> pokes;
+  };
+  void SyncJointTwinsPrepare(TwinSyncOut& out);
+  bool SyncJointTwinsFinish(TwinSyncOut& out, World& world,
+                            std::vector<ParticleSpawn>& spawns);
 
   // Shared services, borrowed from MobSystem (burn tables, micro pool,
   // material tables, event sinks). Never null on a spawned creature.
@@ -6206,6 +6347,9 @@ class MobSystem {
   void ClearShockCues() { shockCues_.clear(); }
   uint64_t ShockAttacksDropped() const { return shockAttacksDropped_; }
   uint32_t ContactHitsBilled() const { return contactHitsBilled_; }
+  // Second and later reports of one (limb, striker) pair in one tick that the
+  // one-blow-per-pair rule dropped (ApplyContactDamage), all ticks.
+  uint32_t ContactPairDupsDropped() const { return contactPairDups_; }
 
   // THE DIRECTIONAL HALF OF A LANDED BLOW (Mob::HitReact). By body handle for
   // the reason Damage is: the melee sweep knows a Jolt body and a travel
@@ -7290,8 +7434,15 @@ class MobSystem {
   void SplatterOnto(Mob& avatar);
   // The NPC driver for StainTick + splatter replay, under the shared budget.
   void StainLimbs(uint32_t tick, World& world);
+  // `pre`/`planOnly`: the contact pass in two halves (StainPre). planOnly
+  // fills `pre` and writes nothing (a work-pool task); a later call with the
+  // same `pre` plays it up to the budget's count.
+  // planMode 1: the walk and the surface size only; 2: the sweep of the first
+  // pre->kPlanned samples over what mode 1 left (MobSystem::StainLimbs runs 1
+  // for every limb, bounds each limb's possible share of the pot, then 2).
   bool StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
-                    World& world, uint32_t& budget);
+                    World& world, uint32_t& budget, StainPre* pre = nullptr,
+                    int planMode = 0);
   // The drying half of Mob::StainTick over a view: every substance in `led`
   // with an authored coat.decay loses a level on half its voxels once per
   // period. Shared by the living and the dead (StainDeadFlesh). In the SUN
@@ -7353,7 +7504,8 @@ class MobSystem {
   // One burst replayed against one lattice (Mob::ApplySplatter's per-limb
   // body): true when a voxel's coat changed. `salt` keys the draws — the limb
   // index on a rig, a hash of the body id on a severed part.
-  bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt);
+  bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt,
+                    SplatSink* sink = nullptr);
   // ...and that replay over every dead-flesh debris body -- severed limbs and
   // gobbets (StainLimbs' splatter loop; a corpse's limbs are a rig's).
   void SplatterDeadFlesh(const SplatterEvent& e);
@@ -7722,7 +7874,9 @@ class MobSystem {
   // Build the dense neighbour index over a limb's current lattice and seed the
   // front from whatever is already alight. O(voxels + boundingBox), paid once
   // when something reactive first comes near the limb.
-  void BuildBurnIndex(BurnLimbView& v);
+  // `sink` non-null: count into it rather than into burnStats_ (a work-pool
+  // task may not write the shared counters).
+  void BuildBurnIndex(BurnLimbView& v, SplatSink* sink = nullptr);
   // The material a voxel of `mat` becomes when it catches: the product of the
   // first rule in its bucket whose product carries tag:hot. 0 = cannot burn.
   // Resolved from the table at load, so no material id is ever named in code.
@@ -7917,6 +8071,9 @@ class MobSystem {
   std::vector<uint8_t> matSelfDryingOnly_;
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
+  // One per creature: StainLimbs' splatter tasks (SplatSink). Kept so the
+  // vectors keep their capacity across ticks.
+  std::vector<SplatSink> splatSinks_;
   BurnStats burnStats_{};
   // Reaction effects that fired ON a body this tick (BurnOneLimb's
   // noteBodyFx), drained by game/session.cpp's reaction-effect pass through
@@ -8118,6 +8275,20 @@ class MobSystem {
   void EvictDead();
   // Sleep bookkeeping for every awake corpse, after the tick's passes.
   void UpdateDeadSleep(World& world, uint32_t tick);
+  // The cauterise verdict (Mob::WoundCharred) of every open wound the
+  // creature loop is about to bleed, taken across the work pool before the
+  // loop (Mob::WoundCharredAt says what that costs: a carve this tick is
+  // seen next tick).
+  void PrecomputeWoundCharred(uint32_t tick);
+  // The burn pass's world side for every limb BurnLimbs may visit, across the
+  // pool (BurnWalkPre).
+  void PrecomputeBurnWalks(uint32_t tick, World& world);
+  // One limb's: the box BurnOneLimb would walk, its world digest and walk.
+  // Reads only the world mirror and the tables; writes only `out`.
+  void BurnWalkOf(const BurnLimbView& v, const World& world, BurnWalkPre& out) const;
+  // The box BurnOneLimb walks for `v` (its collider box in world cells, a
+  // cell of slack each way).
+  static void BurnBoxOf(const BurnLimbView& v, IVec3& lo, IVec3& hi);
   uint64_t deathSeq_ = 0;       // Mob::deathSeq_'s source
   uint64_t deadEvicted_ = 0;    // DeadEvictedTotal
   uint64_t adoptedAvatars_ = 0; // AdoptedAvatarsTotal
@@ -8183,6 +8354,7 @@ class MobSystem {
   std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature
   uint32_t contactHitsBilled_ = 0;  // ApplyContactDamage: contacts billed
+  uint32_t contactPairDups_ = 0;    // ...reports of an already-billed pair dropped
   ShockCounters shockCounters_;      // QueueShockQueries / ApplyShocks
   std::vector<ShockCue> shockCues_;  // ApplyShocks -> the frame's Cues::Shock
   void PushShockCue(const Mob& m, int limb, float peakP);

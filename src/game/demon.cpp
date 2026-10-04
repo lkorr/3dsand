@@ -14,6 +14,7 @@
 #include "game/mob.h"
 #include "game/session.h"
 #include "game/spell.h"
+#include "game/workpool.h"
 #include "sim/materials.h"
 #include "sim/scale.h"
 #include "sim/world.h"
@@ -234,6 +235,16 @@ void AimAtSummoner(MobSystem& mobs, std::span<SessionTick> players, const LiveDe
 // The fence MobSystem asks before a contained demon moves or strikes.
 bool FenceAllow(void* ctx, uint64_t mobId, MobFence::Kind kind, float fromX, float fromZ,
                 float toX, float toZ) {
+  // SERIAL ONLY (fight64 M's work pool): MobSystem asks the fence from
+  // DecideIntent / DriveLocomotion, which run in PreTick's serial creature
+  // loop, never inside a workpool::ParallelFor task. This answer WRITES the
+  // demon world's counters (moves/blows refused, a pact's blow tallies and
+  // pending penalty), so a call from a task would be a race and an order the
+  // replay cannot reproduce: refuse loudly rather than run one.
+  if (workpool::InTask()) {
+    std::fprintf(stderr, "demons: FATAL: the fence was asked from a work-pool task\n");
+    std::abort();
+  }
   DemonWorld& d = *(DemonWorld*)ctx;
   for (LiveDemon& ld : d.live) {
     if (ld.mobId != mobId) continue;
