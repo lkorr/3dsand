@@ -237,10 +237,15 @@ Status GateElecStrikePlay(Ctx& c, std::string& detail) {
       const uint64_t st0 = w.strikes.spellStrikes, ld0 = w.strikes.spellLeaders,
                      rf0 = w.strikes.spellRefunded, em0 = w.strikes.budget.emitted,
                      rj0 = w.strikes.budget.refused;
-      support::TickOps press;
-      press.input.SetPressed(TB_ATTACK, true);
-      press.input.SetHeld(TB_ATTACK, true);
-      tick(press);
+      // The press goes through RunTicks: TickCursor only forwards a TickOps
+      // that carries ops, so an input-only tick would arrive empty. The
+      // cursor's clock is re-synced after it.
+      rig.tick = t;
+      support::RunTicks(rig, 1, [](uint32_t, support::TickOps& o) {
+        o.input.SetPressed(TB_ATTACK, true);
+        o.input.SetHeld(TB_ATTACK, true);
+      });
+      t = rig.tick;
       for (int i = 0; i < 14 && w.strikes.spellStrikes == st0; i++) {
         tick();
         if (w.strikes.spellStrikes != st0) a.ticksToFire = i + 1;
