@@ -8124,7 +8124,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // SHOCKS (docs/PLAN_electricity.md E4, mob_shock.cpp): the body query's
   // answers of tick T - K - 1, applied before the burn pass so a voxel a
   // shock lit burns this tick; then the stunned twitch.
-  ApplyShocks(tick, world, cellOps);
+  {
+    burnprof::Scope bpShocks(burnprof::kShocks);
+    ApplyShocks(tick, world, cellOps);
+  }
   TickStuns(tick);
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
@@ -8231,6 +8234,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // THE DEAD CAP, before anybody steps: a corpse released here is a husk
   // the loop below sweeps in this same pass once its holds are over.
   EvictDead();
+
+  // The cauterise scans of every wound the loop will bleed, across the pool.
+  PrecomputeWoundCharred(tick);
 
   burnprof::Scope bpMobLoop(burnprof::kMobLoop);
   for (size_t mi = 0; mi < mobs_.size();) {
@@ -9930,7 +9936,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // rule — so any fire, from any delivery, on any bleeding part stops it,
     // and it costs the burn.
     if ((limb.bleedBudget >= 1.0f || limb.stumpOpen || limb.gushTicks > 0) &&
-        WoundCharred(limb)) {
+        WoundCharredAt((int)li, tick)) {
       limb.bleedBudget = 0.0f;
       limb.stumpOpen = false;
       limb.gushTicks = 0;
@@ -10140,7 +10146,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     MobLimb& stumpLimb = limbs_[dragStumpLimb_];
     const bool open = stumpLimb.stumpOpen || stumpLimb.bleedBudget >= 1.0f ||
                       stumpLimb.gushTicks > 0;
-    if (open && !IsBloodless(dragStumpLimb_) && !WoundCharred(stumpLimb) &&
+    if (open && !IsBloodless(dragStumpLimb_) && !WoundCharredAt(dragStumpLimb_, tick) &&
         world.CellInWindow({ifloor(dragContact_.x), ifloor(dragContact_.y),
                             ifloor(dragContact_.z)})) {
       dragTrailDist_ = 0.0f;
@@ -14225,7 +14231,20 @@ bool Mob::WoundCharred(const MobLimb& limb) const {
   near.clear();
   occ.clear();
   bool anyCharred = false;
+  // An INTEGER box round the sphere first, a cell wider than it on every side
+  // (so it can never refuse a voxel the float test below would take): almost
+  // every voxel of the limb is outside it, and three unsigned compares are
+  // what they then cost instead of the float distance (PLAN_fight64_perf M).
+  const float rr = std::sqrt(r2);
+  const int bx0 = (int)std::floor(w.x - rr) - 2, by0 = (int)std::floor(w.y - rr) - 2,
+            bz0 = (int)std::floor(w.z - rr) - 2;
+  const uint32_t bxs = (uint32_t)((int)std::floor(w.x + rr) + 2 - bx0),
+                 bys = (uint32_t)((int)std::floor(w.y + rr) + 2 - by0),
+                 bzs = (uint32_t)((int)std::floor(w.z + rr) + 2 - bz0);
   auto visit = [&](int vx, int vy, int vz, uint32_t mat) {
+    if ((uint32_t)(vx - bx0) > bxs || (uint32_t)(vy - by0) > bys ||
+        (uint32_t)(vz - bz0) > bzs)
+      return;
     const float dx = (float)vx + 0.5f - w.x, dy = (float)vy + 0.5f - w.y,
                 dz = (float)vz + 0.5f - w.z;
     if (dx * dx + dy * dy + dz * dz <= r2) {
@@ -14271,6 +14290,56 @@ bool Mob::WoundCharred(const MobLimb& limb) const {
     if (stage == 2u) charred++;
   }
   return surface > 0 && charred * 3 >= surface;
+}
+
+bool Mob::WoundCharredAt(int li, uint32_t tick) const {
+  if (li < 0 || li >= (int)limbs_.size()) return false;
+  const MobLimb& limb = limbs_[li];
+  if (charredPreTick_ == tick && li < (int)charredPre_.size()) {
+    const CharredPre& p = charredPre_[li];
+    if (p.charred >= 0 && p.body == limb.body && limb.body != 0) return p.charred != 0;
+  }
+  return WoundCharred(limb);
+}
+
+// THE CROWD'S CAUTERISE SCANS, IN PARALLEL (PLAN_fight64_perf M). WoundCharred
+// walks a bleeding limb's whole lattice, every tick, for every open wound: 2.8
+// ms of a 64-creature brawl's tick, serial. It reads only that limb (and the
+// material tables), so the verdicts for every wound the loop below will bleed
+// are taken here across the work pool, each written to its own slot, and
+// BleedTick reads them back (Mob::WoundCharredAt). A wound opened during the
+// loop (a sever's gout on the parent) has no verdict and is asked directly.
+void MobSystem::PrecomputeWoundCharred(uint32_t tick) {
+  struct Job {
+    Mob* m = nullptr;
+    int li = -1;
+    bool charred = false;
+  };
+  // A plain local, NOT a thread_local: the tasks below name it from the
+  // workers, and a thread_local there would be each worker's own empty one.
+  std::vector<Job> jobs;
+  for (Mob& m : mobs_) {
+    if (m.def_ == nullptr || m.def_->bleedMat == 0 || m.rigReleased_ ||
+        m.IsGhost() || m.deadAsleep_)
+      continue;
+    m.charredPreTick_ = tick;
+    m.charredPre_.assign(m.limbs_.size(), Mob::CharredPre{});
+    for (int li = 0; li < (int)m.limbs_.size(); li++) {
+      const MobLimb& l = m.limbs_[li];
+      if (!l.body) continue;
+      const bool open = l.bleedBudget >= 1.0f || l.stumpOpen || l.gushTicks > 0;
+      const bool drag = m.dragContactValid_ && m.alive_ && m.dragStumpLimb_ == li;
+      if (!open && !drag) continue;
+      if (m.IsBloodless(li)) continue;
+      jobs.push_back({&m, li, false});
+    }
+  }
+  workpool::ParallelFor(jobs.size(), 1, [&](size_t k) {
+    Job& j = jobs[k];
+    j.charred = j.m->WoundCharred(j.m->limbs_[j.li]);
+  });
+  for (const Job& j : jobs)
+    j.m->charredPre_[j.li] = {j.m->limbs_[j.li].body, (int8_t)(j.charred ? 1 : 0)};
 }
 
 namespace {
@@ -18471,6 +18540,21 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
   // creature's burning weight. Head-of-queue spending here pulsed exactly as
   // it did across limbs, one creature per tick, once there were two burning
   // bodies.
+  // ---- HEADS, THEN TAILS (PLAN_fight64_perf M) ----------------------------
+  // Each creature's BurnTick is its head (the burn loop under the shared pot,
+  // the infection, the pulp, the heals) and its tail (the joint-twin sync and
+  // the burn recount). The heads run first, in the pot's order, because the
+  // pot makes them order-dependent; then the tails, in the same order. A tail
+  // reads and writes only its own creature (a head writes the world through
+  // cell ops and nothing of another creature), so the expensive half of
+  // every sync -- the reconcile walk over each twin cell -- runs across the
+  // work pool (Mob::SyncJointTwinsPrepare), and what touches shared state
+  // (brick pokes, the flush of removed cells, the recount that may kill) is
+  // finished serially in pot order. What moved: a creature's sync now runs
+  // after the OTHER creatures' burns instead of before them, so a flush's
+  // particles and a brick's copy-on-write land later in their lists.
+  std::vector<size_t> tails;
+  std::vector<Mob::TwinSyncOut> twinOut;
   auto burnPot = [&](auto in) {
     uint32_t frontBudget = kBurnFrontPerTick;
     uint32_t opsBudget = kBurnOpsPerTick;
@@ -18478,15 +18562,26 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
     uint64_t wLeft = 0;
     for (size_t i = 0; i < nm; i++)
       if (in(i)) wLeft += (weight[i] = mobs_[i].BurnWeight());
+    tails.clear();
     for (size_t k = 0; k < nm && frontBudget; k++) {
       const size_t i = (start + k) % nm;
       if (!in(i)) continue;
       uint32_t front, ops;
       BurnShareOf(frontBudget, opsBudget, weight[i], wLeft, front, ops);
       const uint32_t front0 = front, ops0 = ops;
-      mobs_[i].BurnTick(tick, world, cellOps, spawns, front, ops);
+      if (mobs_[i].BurnTickHead(tick, world, cellOps, spawns, front, ops))
+        tails.push_back(i);
       frontBudget -= front0 - front;
       opsBudget -= ops0 - ops;
+    }
+    if (twinOut.size() < tails.size()) twinOut.resize(tails.size());
+    workpool::ParallelFor(tails.size(), 1, [&](size_t t) {
+      mobs_[tails[t]].SyncJointTwinsPrepare(twinOut[t]);
+    });
+    for (size_t t = 0; t < tails.size(); t++) {
+      Mob& m = mobs_[tails[t]];
+      if (!m.SyncJointTwinsFinish(twinOut[t], world, spawns)) continue;
+      m.RecountBurn(tick);
     }
   };
   // ---- THE LIVING ----
@@ -18506,17 +18601,28 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
 void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                    std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                    uint32_t& opsBudget) {
+  if (!BurnTickHead(tick, world, cellOps, spawns, frontBudget, opsBudget)) return;
+  if (!SyncJointTwins(world, spawns)) return;
+  // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
+  // is changing and not at all while it is not; may kill the creature, and is
+  // last here for the same reason FlushBurn returns above.
+  RecountBurn(tick);
+}
+
+bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                       std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
+                       uint32_t& opsBudget) {
   // THE DEAD BURN AS THEY LAY (PLAN_corpse_is_a_mob.md): a corpse's rig is
   // still its own, so fire, rot, the joint twins and the burn fraction all
   // run on it. Only a RELEASED rig (its limbs are DebrisSystem's) is refused,
   // and limb.body is zero there anyway.
-  if (!sys_ || !sys_->BurnTablesReady() || rigReleased_) return;
+  if (!sys_ || !sys_->BurnTablesReady() || rigReleased_) return false;
   // A GHOST DOES NOT BURN HERE. Its owner is running this same pass on the
   // same creature and authoring the fire ops; running it on both machines
   // would consume the limb's lattice twice and charge two sets of cell ops
   // for one fire. Returns BEFORE spending any of the shared front budget, so
   // a crowd of ghosts cannot starve the bodies this machine does own.
-  if (IsGhost()) return;
+  if (IsGhost()) return false;
   // Counter-based RNG stream. NO FLOAT TERM, deliberately: a limb's world
   // position and velocity are Jolt floats, and keying a roll on one would
   // inject physics float state into a HASHED grid write and make the world
@@ -18615,7 +18721,7 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
     // including the rest of this loop.
     if (limbs_[li].burn.removed &&
         !FlushBurn(li, DamageCtx(DamageCause::Burn), world, spawns, false))
-      return;
+      return false;
   }
   // WHAT A ZOMBIE LEFT IN YOU, one tick older. Here rather than in its own
   // caller so the player reaches it through the same seam an NPC does
@@ -18625,21 +18731,19 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // First a coat that CARRIES an infection seeds it where it touches open
   // tissue (venom in a wound; never reshapes limbs_, armed by RecountCoat).
   CoatInfectTick(tick);
-  if (!InfectTick(tick, world, spawns)) return;
+  if (!InfectTick(tick, world, spawns)) return false;
   // PULPED TISSUE DISSOLVES (the blunt counterpart of InfectTick). Same
   // position, same FlushBurn tail, same return contract.
-  if (!BluntPulpTick(tick, world, spawns)) return;
+  if (!BluntPulpTick(tick, world, spawns)) return false;
   // ...and a living creature's bruises fade (never reshapes limbs_).
   HealBruises(tick);
   // ...and a HEALING coat rebuilds what it is on (alchemy package D; never
   // reshapes limbs_, never kills). Before the twin sync so a mended joint
   // cell reaches its other copy this tick, and before the burn recount.
   HealTick(tick);
-  if (!SyncJointTwins(world, spawns)) return;
-  // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
-  // is changing and not at all while it is not; may kill the creature, and is
-  // last here for the same reason FlushBurn returns above.
-  RecountBurn(tick);
+  // The twin sync and the burn recount are the caller's (BurnTick, or
+  // MobSystem::BurnLimbs' tail pass).
+  return true;
 }
 
 // ============================================================================
@@ -19750,6 +19854,17 @@ void Mob::BuildJointTwins() {
 
 bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
   if (!twinDirty_) return true;
+  TwinSyncOut out;
+  SyncJointTwinsPrepare(out);
+  return SyncJointTwinsFinish(out, world, spawns);
+}
+
+void Mob::SyncJointTwinsPrepare(TwinSyncOut& out) {
+  out.ran = false;
+  out.matChanged = out.stainChanged = out.removed = false;
+  out.pokes.clear();
+  if (!twinDirty_) return;
+  burnprof::Scope bpTwins(burnprof::kTwinSync);   // main thread only (burnprof.h)
   twinDirty_ = false;
   // A SEVER, A DETACH OR A RESPAWN changes which limbs exist, and a twin whose
   // other half has left the body is no longer a twin: the severed hip keeps
@@ -19774,35 +19889,34 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
     rebuild = (limbs_[i].body ? 1 : 0) != twinAttached_[i];
   if (!sameShape || (rebuild && twins_.empty())) {
     BuildJointTwins();
-    return true;
+    return;
   }
-  if (twins_.empty()) return true;
+  if (twins_.empty()) return;
+  out.ran = true;
 
-  MicroBodySet* micro = MicroSet();
-  std::vector<uint8_t> owned(limbs_.size(), 0);   // 1 = brick owned, 2 = refused
-  auto ownBrick = [&](int li) -> bool {
-    MobLimb& l = limbs_[li];
-    if (owned[li]) return owned[li] == 1;
-    owned[li] = 2;
-    if (!micro || l.microModel < 0) return false;
-    const int own = MicroBodyOwn(*micro, (uint32_t)l.microModel);
-    if (own < 0) return false;  // pool full: the lattice agrees, the skin lags
-    l.microModel = own;
-    l.carved = true;
-    l.flipbookModel = -1;
-    owned[li] = 1;
-    return true;
+  // THE BRICK IS NOT TOUCHED HERE. Every write below is mirrored into the
+  // limb's micro brick, and the brick lives in the SHARED pool (owning it is
+  // a copy-on-write allocation), so each poke is recorded in order and
+  // SyncJointTwinsFinish replays it -- owning the brick at the first write to
+  // a limb, exactly where the inline version owned it.
+  auto poke = [&](int li, const IVec3& p, uint8_t kind, uint16_t value, uint8_t art) {
+    TwinPoke k;
+    k.li = (int16_t)li;
+    k.x = (int16_t)p.x;
+    k.y = (int16_t)p.y;
+    k.z = (int16_t)p.z;
+    k.kind = kind;
+    k.value = value;
+    k.art = art;
+    out.pokes.push_back(k);
   };
-  bool matChanged = false, stainChanged = false, removed = false;
 
   // Copy one side's material + art onto the other copy.
   auto writeMat = [&](int li, const BurnLimbView& v, size_t i, JointTwinSide src,
                       int fromLi) {
     v.SetWord(i, src.mat, src.art);
     const IVec3 p = v.At(i);
-    if (ownBrick(li))
-      MicroBodyPoke(*micro, (uint32_t)limbs_[li].microModel, p.x, p.y, p.z,
-                    (uint8_t)(src.mat & 0xFFFu), src.art);
+    poke(li, p, 0, src.mat, src.art);
     MobLimb& l = limbs_[li];
     const uint32_t m = src.mat & 0xFFFu;
     // THE ROT CAME ACROSS WITH IT. A copied rotflesh cell is the infection now
@@ -19824,18 +19938,16 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
               (uint32_t)(((size_t)z * st.dims.y + y) * st.dims.x + x));
       }
     }
-    matChanged = true;
+    out.matChanged = true;
   };
   auto writeStain = [&](int li, const BurnLimbView& v, size_t i, uint16_t s) {
     v.SetStain(i, s);
-    const IVec3 p = v.At(i);
-    if (ownBrick(li))
-      MicroBodyPokeStain(*micro, (uint32_t)limbs_[li].microModel, p.x, p.y,
-                         p.z, s);
-    stainChanged = true;
+    poke(li, v.At(i), 1, s, 0);
+    out.stainChanged = true;
   };
   // Tombstone, exactly as the rot's removal does (InfectStep): the index entry
-  // goes NOW so neighbours see through it, and FlushBurn below compacts it.
+  // goes NOW so neighbours see through it, and FlushBurn (in Finish) compacts
+  // it.
   auto remove = [&](int li, const BurnLimbView& v, size_t i) {
     const IVec3 p = v.At(i);
     v.Set(i, 0, 0);
@@ -19848,9 +19960,8 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
         st.idx[((size_t)z * st.dims.y + y) * st.dims.x + x] = 0;
     }
     st.removed++;
-    if (ownBrick(li))
-      MicroBodyPoke(*micro, (uint32_t)limbs_[li].microModel, p.x, p.y, p.z, 0, 0);
-    removed = true;
+    poke(li, p, 2, 0, 0);
+    out.removed = true;
   };
 
   for (JointTwinPair& tp : twins_) {
@@ -19877,41 +19988,86 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
       }
       const JointTwinSide ca = TwinSideOf(va, (size_t)ia);
       const JointTwinSide cb = TwinSideOf(vb, (size_t)ib);
+      // Which copy this cell WROTE, so only that side is read back below (the
+      // other is `ca` / `cb` as just read: nothing else touched it).
+      bool wroteA = false, wroteB = false;
       const bool aMat = ca.mat != c.a.mat || ca.art != c.a.art;
       const bool bMat = cb.mat != c.b.mat || cb.art != c.b.art;
       if ((aMat || bMat) && (ca.mat != cb.mat || ca.art != cb.art)) {
         // Both moved in one tick: the PARENT's answer stands.
-        if (aMat) writeMat(tp.b, vb, (size_t)ib, ca, tp.a);
-        else writeMat(tp.a, va, (size_t)ia, cb, tp.b);
+        if (aMat) {
+          writeMat(tp.b, vb, (size_t)ib, ca, tp.a);
+          wroteB = true;
+        } else {
+          writeMat(tp.a, va, (size_t)ia, cb, tp.b);
+          wroteA = true;
+        }
       }
       const bool aSt = ca.stain != c.a.stain;
       const bool bSt = cb.stain != c.b.stain;
       if ((aSt || bSt) && ca.stain != cb.stain) {
-        if (aSt) writeStain(tp.b, vb, (size_t)ib, ca.stain);
-        else writeStain(tp.a, va, (size_t)ia, cb.stain);
+        if (aSt) {
+          writeStain(tp.b, vb, (size_t)ib, ca.stain);
+          wroteB = true;
+        } else {
+          writeStain(tp.a, va, (size_t)ia, cb.stain);
+          wroteA = true;
+        }
       }
       c.hintA = (uint32_t)ia;
       c.hintB = (uint32_t)ib;
-      c.a = TwinSideOf(va, (size_t)ia);
-      c.b = TwinSideOf(vb, (size_t)ib);
+      c.a = wroteA ? TwinSideOf(va, (size_t)ia) : ca;
+      c.b = wroteB ? TwinSideOf(vb, (size_t)ib) : cb;
       tp.cells[w++] = c;
     }
     tp.cells.resize(w);
   }
 
-  if (matChanged || stainChanged || removed) {
-    MarkInstancesDirty();
-    burnFracDirty_ = true;
-  }
-  if (stainChanged) coatDirty_ = true;
-  // What this pass wrote is already reconciled; only a later writer (or the
-  // flush below, which compacts and so moves every hint) needs another pass.
-  twinDirty_ = false;
   // The divergence is reconciled; NOW the links may be re-baselined against
   // the new set of limbs (tombstones read as absent, so a removal just
   // copied across is simply not linked again).
   if (rebuild) BuildJointTwins();
-  if (!removed) return true;
+}
+
+bool Mob::SyncJointTwinsFinish(TwinSyncOut& out, World& world,
+                               std::vector<ParticleSpawn>& spawns) {
+  if (!out.ran) return true;
+  burnprof::Scope bpTwins(burnprof::kTwinSync);
+  MicroBodySet* micro = MicroSet();
+  std::vector<uint8_t> owned(limbs_.size(), 0);   // 1 = brick owned, 2 = refused
+  auto ownBrick = [&](int li) -> bool {
+    MobLimb& l = limbs_[li];
+    if (owned[li]) return owned[li] == 1;
+    owned[li] = 2;
+    if (!micro || l.microModel < 0) return false;
+    const int own = MicroBodyOwn(*micro, (uint32_t)l.microModel);
+    if (own < 0) return false;  // pool full: the lattice agrees, the skin lags
+    l.microModel = own;
+    l.carved = true;
+    l.flipbookModel = -1;
+    owned[li] = 1;
+    return true;
+  };
+  for (const TwinPoke& k : out.pokes) {
+    if (k.li < 0 || k.li >= (int)limbs_.size() || !ownBrick(k.li)) continue;
+    const uint32_t model = (uint32_t)limbs_[k.li].microModel;
+    if (k.kind == 0)
+      MicroBodyPoke(*micro, model, k.x, k.y, k.z, (uint8_t)(k.value & 0xFFFu), k.art);
+    else if (k.kind == 1)
+      MicroBodyPokeStain(*micro, model, k.x, k.y, k.z, k.value);
+    else
+      MicroBodyPoke(*micro, model, k.x, k.y, k.z, 0, 0);
+  }
+
+  if (out.matChanged || out.stainChanged || out.removed) {
+    MarkInstancesDirty();
+    burnFracDirty_ = true;
+  }
+  if (out.stainChanged) coatDirty_ = true;
+  // What this pass wrote is already reconciled; only a later writer (or the
+  // flush below, which compacts and so moves every hint) needs another pass.
+  twinDirty_ = false;
+  if (!out.removed) return true;
   // LAST, for InfectStep's reason: a flush may sever or kill.
   //
   // Batched, like every other removal: a receiver under FlushBurn's threshold
@@ -21714,11 +21870,41 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     bool any = false;
     uint32_t seen = 0;
     Contact probe;
+    // ONE CHUNK'S RUN OF A ROW AT A TIME (PLAN_fight64_perf M; BurnOneLimb's
+    // walk took the same change on 2026-10-03). The window test, the chunk
+    // lookup and the fetch request are per chunk, so they are asked once per
+    // run of up to 16 cells and the cells are a pointer walk: the same cells,
+    // in the same y/z/x order, against the same cap, stopping on the same
+    // cell as worldWordAt one by one. Air (word 0) is the common case and
+    // classify refuses it on its first test, so it is skipped inline.
     for (int y = lo.y; y <= hi.y && !any && seen < kStainScanCells; y++)
       for (int z = lo.z; z <= hi.z && !any && seen < kStainScanCells; z++)
-        for (int x = lo.x; x <= hi.x && !any && seen < kStainScanCells; x++) {
-          seen++;
-          any = classify(worldWordAt({x, y, z}), probe);
+        for (int x = lo.x; x <= hi.x && !any && seen < kStainScanCells;) {
+          const int nRun = std::min<int>(std::min(hi.x, x | 15) - x + 1,
+                                         (int)(kStainScanCells - seen));
+          seen += (uint32_t)nRun;
+          const int x0 = x;
+          x += nRun;
+          if (!world.CellInWindow({x0, y, z})) continue;  // reads as 0
+          const IVec3 wc = ChunkOfCell(x0, y, z);
+          if (wc.x != memoChunk.x || wc.y != memoChunk.y || wc.z != memoChunk.z) {
+            memoChunk = wc;
+            memoCC = world.Cached(wc);
+          }
+          if (!memoCC || memoCC->voxels.size() != kChunkVol) {
+            world.RequestChunkFetch(wc);  // as worldWordAt asks it
+            continue;
+          }
+          const uint32_t* row = memoCC->voxels.data() +
+                                ((uint32_t)(z & 15) * kChunk + (uint32_t)(y & 15)) * kChunk;
+          for (int xx = x0; xx < x; xx++) {
+            const uint32_t w = row[xx & 15];
+            if ((w & 0xFFFu) == 0u) continue;
+            if (classify(w, probe)) {
+              any = true;
+              break;
+            }
+          }
         }
     if (!any) return false;  // the walk was the whole cost
   }
@@ -22702,6 +22888,10 @@ uint32_t MobSystem::MaterialIdNamed(const std::string& name) const {
       id = (uint32_t)i;
       break;
     }
+  // Inside a work-pool task (Mob::ViewOf from SyncJointTwinsPrepare) the memo
+  // is READ only: several tasks may be here at once, and none of them may
+  // write what the others are reading. The answer is the same either way.
+  if (workpool::InTask()) return id;
   matNameLast_ = name;
   matNameLastId_ = id;
   return id;

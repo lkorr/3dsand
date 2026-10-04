@@ -2628,6 +2628,15 @@ class Mob {
   void BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                 std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                 uint32_t& opsBudget);
+  // BurnTick in two halves (PLAN_fight64_perf M): the HEAD is everything up
+  // to the joint-twin sync -- the burn loop, the infection, the pulp, the
+  // heals -- and returns false where BurnTick returned early (a flush severed
+  // or killed); the tail is SyncJointTwins + RecountBurn. MobSystem::BurnLimbs
+  // runs every creature's head, then every tail, so the tails' sync can be
+  // prepared across the work pool (SyncJointTwinsPrepare).
+  bool BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                    std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
+                    uint32_t& opsBudget);
   // How much of the shared burn budgets limb `li` is owed this tick: 0 when it
   // has no burn work of its own (nothing alight, no front, no corrosive coat),
   // else its front size -- the burning surface, which is what both its
@@ -4177,6 +4186,20 @@ class Mob {
   // limb's voxel nearest its wound is at burn stage 2 (charred / ash), which
   // the bleed tick reads to close the wound for good.
   bool WoundCharred(const MobLimb& limb) const;
+  // ...as BleedTick asks it: the verdict MobSystem::PrecomputeWoundCharred
+  // took for this limb at the top of the tick's creature loop when there is
+  // one for this very body (PLAN_fight64_perf M: the crowd's scans run across
+  // the pool), else WoundCharred now. The only thing that can move a lattice
+  // between the two is another creature's blade this tick, so the verdict a
+  // carve changes is seen one tick late -- fire, the thing that chars, runs
+  // before the loop (BurnLimbs) and is always seen the same tick.
+  bool WoundCharredAt(int li, uint32_t tick) const;
+  struct CharredPre {
+    uint64_t body = 0;     // the limb's body when the verdict was taken
+    int8_t charred = -1;   // -1 = no verdict
+  };
+  std::vector<CharredPre> charredPre_;
+  uint32_t charredPreTick_ = 0;
 
  protected:
   // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
@@ -4683,6 +4706,29 @@ class Mob {
   // Returns false when a flush severed a limb or killed the creature, with
   // InfectTick's contract: the caller must touch nothing afterwards.
   bool SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns);
+  // ...in two halves (PLAN_fight64_perf M). PREPARE is everything that
+  // touches only this creature -- the reconcile walk over every twin cell,
+  // the lattice writes it decides, the link rebuild -- and is safe to run for
+  // many creatures at once on the work pool. What touches SHARED state is
+  // recorded instead of done: the brick pokes (the micro pool owns and
+  // copies on write) and the flush of removed cells (a carve: Jolt, debris,
+  // particle spawns). FINISH replays those, in order, on the calling thread.
+  // SyncJointTwins == Prepare then Finish, bit for bit.
+  struct TwinPoke {
+    int16_t li = 0;
+    int16_t x = 0, y = 0, z = 0;
+    uint8_t kind = 0;      // 0 material + art, 1 stain, 2 removal
+    uint8_t art = 0;
+    uint16_t value = 0;    // material word, or stain word
+  };
+  struct TwinSyncOut {
+    bool ran = false;      // twinDirty_ was set: there is a Finish to run
+    bool matChanged = false, stainChanged = false, removed = false;
+    std::vector<TwinPoke> pokes;
+  };
+  void SyncJointTwinsPrepare(TwinSyncOut& out);
+  bool SyncJointTwinsFinish(TwinSyncOut& out, World& world,
+                            std::vector<ParticleSpawn>& spawns);
 
   // Shared services, borrowed from MobSystem (burn tables, micro pool,
   // material tables, event sinks). Never null on a spawned creature.
@@ -8112,6 +8158,11 @@ class MobSystem {
   void EvictDead();
   // Sleep bookkeeping for every awake corpse, after the tick's passes.
   void UpdateDeadSleep(World& world, uint32_t tick);
+  // The cauterise verdict (Mob::WoundCharred) of every open wound the
+  // creature loop is about to bleed, taken across the work pool before the
+  // loop (Mob::WoundCharredAt says what that costs: a carve this tick is
+  // seen next tick).
+  void PrecomputeWoundCharred(uint32_t tick);
   uint64_t deathSeq_ = 0;       // Mob::deathSeq_'s source
   uint64_t deadEvicted_ = 0;    // DeadEvictedTotal
   uint64_t adoptedAvatars_ = 0; // AdoptedAvatarsTotal
