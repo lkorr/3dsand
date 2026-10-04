@@ -570,7 +570,7 @@ main's exe at the end.
 | Pkg | State | Commit | Notes |
 |---|---|---|---|
 | D1 | planned | | |
-| D2 | done (branch, not merged) | see report | Cellar in the default edit layer (scripts/paint_cellar.mjs); `readable` ref kind; dialogue `grant` / `learn`; `game/demon_lore.h` (IsNameGlyph = id prefix `summon_`, GrantAllNames) + dev button "learn all demon names" (D1 owns `SANDVOX_ALL_NAMES` and the GrantAllAndBind exclusion; call demon::GrantAllNames / IsNameGlyph). New materials `tallow`, `candle_flame` appended: if D1 also appends materials, re-run `node scripts/paint_cellar.mjs` after the merge. Gate `harrowby-cellar` pass; village-harrowby rebaselined (now passes). |
+| D2 | MERGED main | 640834a | Cellar in the default edit layer (scripts/paint_cellar.mjs); `readable` ref kind; dialogue `grant` / `learn`; `game/demon_lore.h` (IsNameGlyph = id prefix `summon_`, GrantAllNames) + dev button "learn all demon names" (D1 owns `SANDVOX_ALL_NAMES` and the GrantAllAndBind exclusion; call demon::GrantAllNames / IsNameGlyph). New materials `tallow`, `candle_flame` appended: if D1 also appends materials, re-run `node scripts/paint_cellar.mjs` after the merge. Gate `harrowby-cellar` pass; village-harrowby rebaselined (now passes). |
 | D3 | planned | | |
 | D4 | planned | | |
 | D5 | planned | | |
