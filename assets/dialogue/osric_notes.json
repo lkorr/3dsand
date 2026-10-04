@@ -1,0 +1,40 @@
+{
+  "name": "osric_notes",
+  "speaker": "Osric's daybook",
+  "canLeave": true,
+  "notes": "The book on the lectern in the cellar under the smithy (docs/PLAN_demons.md D2): the `readable` ref harrowby/smithy_notes opens it. Four pages; the last GRANTS the glyph summon_skerrick (Skerrick's name, D1's summon glyph) and LEARNS the name (world flag name:skerrick, which the entry reads to open at the name page the second time). Osric's voice: short, flat, a soldier who became a smith.",
+  "entry": [
+    { "if": [ { "flag": "name:skerrick" } ], "goto": "again" },
+    { "goto": "tally" }
+  ],
+  "nodes": [
+    {
+      "id": "tally",
+      "text": "Hinges for Edric, paid. Nails for Maud, owing. Below the tally, in a smaller hand: What I learned on the ridge. Written so it is not lost with me. Burn this if I am dead.",
+      "goto": "ring"
+    },
+    {
+      "id": "ring",
+      "text": "THE RING. Salt and nothing else. Pour it from outside, one line, closed, no gap a mouse could pass. Not brine, not wet. Step over it, never on it. A broken ring is an open door.",
+      "goto": "piles"
+    },
+    {
+      "id": "piles",
+      "text": "THE PILES. Sulfur by the ring: its fire stays in. Iron: its hands stay in. Quicksilver, in a dish: it cannot slip out. Small piles, near the salt. Keep the sulfur from the quicksilver. A candle at each quarter.",
+      "goto": "name"
+    },
+    {
+      "id": "name",
+      "text": "THE NAME. A small one. Grey, mean as a stoat. SKERRICK. Speak it into the ring from outside. Talk. Bargain. Send it home. Never let it out on a promise. I did, once.",
+      "do": [ { "grant": "summon_skerrick" }, { "learn": "skerrick" } ]
+    },
+    {
+      "id": "again",
+      "text": "The last page. One word, cut in hard and underlined twice: SKERRICK.",
+      "choices": [
+        { "text": "Read it from the start.", "goto": "tally" },
+        { "text": "Close the book." }
+      ]
+    }
+  ]
+}

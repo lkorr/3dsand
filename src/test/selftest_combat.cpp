@@ -3145,6 +3145,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   burnprof::Reset();
   const int ticks = (int)BaselineNumber("mobCap64.ticks", 300);
   const uint64_t starved0 = c.mobs.BleedStarved();
+  const uint32_t contact0 = c.mobs.ContactHitsBilled();
   std::vector<double> tickMs, regMs;
   tickMs.reserve(ticks);
   regMs.reserve(ticks);
@@ -3154,6 +3155,13 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   double sumManDyn = 0, sumManStatic = 0, sumActive = 0;
   std::vector<double> rolePairs(Physics::kRoleCols * Physics::kRoleCols, 0.0);
   double joltMs = 0.0;
+  // Jolt's step by phase (Physics::StepPhase): wall span and worker time.
+  constexpr int kPh = (int)Physics::StepPhase::Count;
+  double phWall[kPh] = {}, phCpu[kPh] = {};
+  double sumCorpse = 0, sumDeadRigs = 0;
+  double ccdRole[Physics::kRoleCols] = {};
+  uint32_t joltOverflow[3] = {};   // steps with each EPhysicsUpdateError bit
+  double ccdCompound[Physics::kRoleCols] = {};
   size_t peakLiveWords = 0;
   size_t peakPool = 0;
   std::vector<BodyXformGpu> xf;
@@ -3172,7 +3180,19 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                                              gpuTimer.Init(c.ctx, 256)));
   if (gpuTime) gpuTimer.ResetStats();
   int gpuTicks = 0;
+  // THE CORPSE-HEAVY ARM (fight64 package P): mobCap64.killEvery = k kills
+  // every k-th creature at timed tick mobCap64.killAt, so a before/after of
+  // the corpse colliders is measured over the SAME number of corpses lying in
+  // the crowd. Without it the corpse count is whatever the fight produced,
+  // and any physics change (which moves every later blow) moves it. 0 = off,
+  // the gate's own default.
+  const int killEvery = (int)BaselineNumber("mobCap64.killEvery", 0);
+  const int killAt = (int)BaselineNumber("mobCap64.killAt", 30);
   for (int i = 0; i < ticks; i++) {
+    if (killEvery > 0 && i == killAt)
+      for (size_t k = 0; k < ids.size(); k += (size_t)killEvery)
+        if (Mob* m = c.mobs.FindMobById(ids[k]))
+          if (m->Alive()) m->Die();
     const bool timeThis = gpuTime && i % 10 == 5;
     if (timeThis) {
       c.sim.SetPassTimer(&gpuTimer);
@@ -3231,6 +3251,18 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
     peakSlots = std::max(peakSlots, reg.TotalSlots());
     peakJolt = std::max(peakJolt, c.phys.LiveBodyCount());
     joltMs += c.phys.LastStep().ms;
+    for (int p = 0; p < kPh; p++) {
+      phWall[p] += c.phys.LastStep().phaseWallMs[p];
+      phCpu[p] += c.phys.LastStep().phaseCpuMs[p];
+    }
+    sumCorpse += c.phys.CorpseColliderCount();
+    for (int b = 0; b < 3; b++)
+      joltOverflow[b] += (c.phys.LastStep().updateErrors >> b) & 1u;
+    sumDeadRigs += c.mobs.DeadMobCount();
+    for (int r = 0; r < Physics::kRoleCols; r++)
+      ccdRole[r] += c.phys.LastStep().ccdBodies[r];
+    for (int r = 0; r < Physics::kRoleCols; r++)
+      ccdCompound[r] += c.phys.LastStep().ccdCompound[r];
     sumManDyn += c.phys.LastStep().manifoldsDyn;
     sumManStatic += c.phys.LastStep().manifoldsStatic;
     sumActive += c.phys.NumActiveBodies();
@@ -3310,8 +3342,10 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
               ids.size(), mix.size() + (zombieDef >= 0 ? 1 : 0), ticks, alive,
               (unsigned long long)requests, hp0, hp1);
   std::printf("mob-cap64: %llu drips refused by the shared pot "
-              "(gore.bleedOpsPerTick) over the fight\n",
-              (unsigned long long)(c.mobs.BleedStarved() - starved0));
+              "(gore.bleedOpsPerTick) over the fight; %u loose-body contact "
+              "blows billed\n",
+              (unsigned long long)(c.mobs.BleedStarved() - starved0),
+              c.mobs.ContactHitsBilled() - contact0);
   std::printf("mob-cap64: slots %u limb bodies (peak %u per creature), %u "
               "micro limbs; peak %u/%u slots, %u Jolt bodies, %u/%u brick "
               "records, %zu/%u pool words\n",
@@ -3383,6 +3417,34 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                 (double)(s1.cacheAccums - shock0.cacheAccums) / tk,
                 (double)(s1.cacheHits - shock0.cacheHits) / tk,
                 (double)(s1.bodiesShocked - shock0.bodiesShocked) / tk);
+  }
+  {
+    // WHERE THE JOLT STEP GOES (fight64 package P): per Jolt job phase, the
+    // wall span / the summed worker time, ms per tick.
+    std::string s = "mob-cap64: Jolt phases ms/tick (wall/cpu):";
+    for (int p = 0; p < kPh; p++)
+      s += Format(" %s %.2f/%.2f",
+                  Physics::StepPhaseName((Physics::StepPhase)p),
+                  phWall[p] / std::max(1, ticks), phCpu[p] / std::max(1, ticks));
+    s += Format("; dead rigs %.1f mean, corpse colliders %.0f mean",
+                sumDeadRigs / std::max(1, ticks), sumCorpse / std::max(1, ticks));
+    s += Format("; Jolt overflow steps: manifold %u, body-pair %u, "
+                "constraint %u", joltOverflow[0], joltOverflow[1],
+                joltOverflow[2]);
+    s += "; linear-cast bodies/tick by role:";
+    for (int r = 0; r < Physics::kRoleCols; r++)
+      if (ccdRole[r] > 0)
+        s += Format(" %s %.1f (%.1f compound)",
+                    r == Physics::kRoleStatic
+                        ? "?"
+                        : Physics::RoleName((Physics::BodyRole)r),
+                    ccdRole[r] / std::max(1, ticks),
+                    ccdCompound[r] / std::max(1, ticks));
+    std::printf("%s\n", s.c_str());
+    RecordObserved("mobCap64.joltCollideMs",
+                   phWall[(int)Physics::StepPhase::FindCollisions] / std::max(1, ticks));
+    RecordObserved("mobCap64.joltSolveVelMs",
+                   phWall[(int)Physics::StepPhase::SolveVelocity] / std::max(1, ticks));
   }
   std::printf("mob-cap64: burnprof %s\n", profReport.c_str());
 

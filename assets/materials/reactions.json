@@ -2895,6 +2895,13 @@
       "becomes": "air",
       "chance": 8,
       "drying": true
+    },
+    {
+      "note": "DEMONS D2: a CANDLE FLAME (materials.json) is put out by water or any extinguisher touching it, leaving a wisp of smoke. Its only rule, so a dry candle never matches anything and its chunk sleeps (rule 2). Appended: re-rolls no earlier rule.",
+      "self": "candle_flame",
+      "neighbor": "tag:extinguisher",
+      "chance": 250,
+      "selfBecomes": "smoke"
     }
   ]
 }

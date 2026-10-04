@@ -7029,6 +7029,78 @@ neighbors, so this needs an explicit connectivity pass:
   (ash) that runs its repose probe on substep 1. Keeping each thread's cell
   kinds in registers and reserving its pool run once (six shared atomics
   instead of one per cell) measured no better (camask 1.72 -> 1.80).
+- **Dead flesh collides as one convex a body (2026-10-04, fight64 package
+  P).** Owner: "lets get corpses to have simpler colliders; lets try to
+  heavily optimize 64 creature fights". In `--gate mob-cap64` (64 creatures,
+  300 ticks) the Jolt step was 27-28 ms of a 74 ms tick: 2,768 body-body
+  manifolds a step, 1,497 of them living limbs against corpse limbs, because
+  a manifold is per SUB-SHAPE pair and both sides were greedy box compounds.
+  1. **The collider follows the role** (`Physics::ApplyCorpseCollider`). A
+     body whose role is `RigDead` or `SeveredHold`, or that is loose `Debris`
+     carrying the dead-flesh mark (`Physics::MarkDeadFlesh`, set by
+     `DebrisSystem::AdoptBody` for anything that came off a creature, bit 7 of
+     the user data's role byte, so it rides `CarryLayer` to every rebuilt or
+     split fragment), has its compound swapped for ONE convex hull of the
+     compound's box corners, wrapped in `OffsetCenterOfMassShape` so the
+     centre of mass is the compound's to the ulp, and set WITHOUT recomputing
+     mass properties: the body keeps its voxels' mass and inertia and only
+     what it touches changes. Any other role (a zombie rising, a corpse limb
+     grabbed or thrown) gets the stored compound back. No caller changes:
+     `SetBodyRole`, `CarryLayer` and `SettleBody` apply it.
+  2. **A hull, not a fitted box.** The first version fitted a box in the
+     limb's frame and `corpse-sleep`'s corpse fell 95 voxels into the ground:
+     rotated, a box's corner stands off the voxels, the swap at death put one
+     deep in the terrain sheet and the depenetration pushed it through the
+     back face. A hull's support in every direction is a voxel corner, so
+     against a plane it penetrates exactly as deep as the compound did. It
+     keeps the box's cost class (one GJK per pair, one inner radius for
+     Jolt's linear cast, which is now the limb's rather than its thinnest
+     box's) and only fills concavities. Build cost ~10-15 µs a corpse-limb
+     rebuild.
+  3. **Queries stay exact.** `CastRayBody` (blade probes, lasers, the look
+     ray) re-casts a hit on a convex-collider body against its stored
+     compound in the shared centre-of-mass frame, then skips that body for
+     the next closest hit (bounded: 8 skips), so a probe never lands in the
+     filled-in crook of a corpse's limb.
+  4. **Instruments.** `Physics::StepStats` now carries Jolt's step by job
+     phase (a `JobSystem` that forwards to the pool and times each job by
+     name: wall span and worker time for collide / solveVel / ccd / ...) and
+     the bodies about to linear-cast, by role; `mob-cap64` prints both, the
+     mean dead rigs, the corpse colliders, and the loose-body contact blows
+     billed. `SANDVOX_CORPSE_COMPOUND=1` is the A/B arm in one binary;
+     `mobCap64.killEvery` (baseline.json, default off) kills every k-th
+     creature at `mobCap64.killAt`, so two arms compare over the same corpses
+     -- without it the corpse count is whatever the fight produced, and a
+     physics change moves every later blow.
+  5. **A reachable drop closed on the way.** The contact listener collects
+     impacts uncapped and caps them after the step under a total order, but
+     its collection ceiling was 4,096 while the compound brawl peaked at
+     8,056 live manifolds; a step whose NEW manifolds passed it would have
+     kept the job threads' race. Raised to 16,384, the contact-constraint
+     capacity, which no step can exceed. Not shown to have fired. The step
+     also records Jolt's own overflow flags now (`StepStats::updateErrors`:
+     manifold / body-pair / constraint buffer full, each a dropped-contact
+     race), read 0 in every arm measured. Unattributed: the corpse-heavy
+     COMPOUND arm ended 9, 10 or 11 alive across builds with no change on its
+     path, while two runs of one build always agreed.
+  Measured (`SANDVOX_RUN_EXCLUSIVE=1`, one non-LTO binary, compound arm vs
+  hull; the compound arm reproduces main's exe exactly). Natural fight, 6.3
+  vs 6.1 dead rigs mean: Jolt 26.5 -> 10.5 ms a tick (collide 8.1 -> 2.8
+  wall, solveVel 2.9 -> 0.8, ccd 14.5 -> 6.4), body-body manifolds 2,768 ->
+  706, living-vs-corpse 1,497 -> 251; tick wall 84.2 -> 58.8 ms. Corpse-heavy
+  arm (`killEvery 4`, 11.0 vs 10.9 dead rigs mean): Jolt 32.4 -> 17.6 ms.
+  **Side effect, gameplay-visible:** `MobSystem::ApplyContactDamage` bills a
+  blow per listener report, i.e. per sub-shape pair, so a flying gib with a
+  box compound hit N times for one touch; as one convex it hits fewer.
+  Billed loose-body blows 407 -> 207 (natural), 796 -> 660 (corpse-heavy, 11
+  -> 30 alive at the end). Billing once per (limb, body) pair a step is the
+  principled fix and is a mob.cpp change, proposed rather than made. What is
+  left: the linear cast is now the largest phase (6.4 ms natural, 10.2
+  corpse-heavy) -- dead flesh shoved by living kinematic limbs past 0.75 x
+  its inner radius a step casts against the crowd's kinematic compounds;
+  CCD exists for the terrain sheet, but Jolt's cast cannot be told to skip
+  kinematic bodies. Hulls for LIMP living rigs too were measured (17.2 vs
+  17.6 ms, corpse-heavy) and are not worth the behaviour change.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
@@ -23258,7 +23330,10 @@ day, the speaker): `flag` / `!flag` (+ optional exact `value`), `time`
 P7 supplies; unset = false, silently), `has` / `!has` (bag + hotbar; worn gear
 does not count), `met`. Actions: `set` / `add` / `clear` a flag, `give` /
 `take` an item BY NAME through the kit's own merge rule (bag, then hotbar; a
-full pack refuses and counts `stats.refusedGives`), `end`. Nothing writes a
+full pack refuses and counts `stats.refusedGives`), `end`; and (demons D2,
+§17) `grant` a glyph BY NAME into the player's `GlyphInventory` (a name
+glyphs.json lacks is a load WARNING and a counted no-op, `stats.refusedGrants`)
+and `learn` a name (sets the world flag `name:<x>`). Nothing writes a
 voxel; the only world state touched is integer flags, so determinism is the
 tick's by construction.
 
@@ -24361,3 +24436,125 @@ the green is a structure precisely so its square levels the ground the houses'
 squares do not reach, and the spawn column must stay outside every square; two
 villagers sent to one marker shoulder each other off it all evening, so each
 regular has his own place (a prop naming a ref beats the tag).
+
+## 17. Demons (docs/PLAN_demons.md, added 2026-10-04)
+
+### Demons — the Harrowby cellar and the book (D2)
+
+The player learns the first demon's name from a book in a cellar under the
+Harrowby smithy. This subsection is CONTENT plus two small, general
+mechanisms: a `readable` ref kind and two dialogue actions. The only
+demon-specific code is the helper that says which glyphs are names.
+
+**The cellar is the map's edit layer, not the house.** A structure stamp
+cannot carve below ground (template air leaves the world alone,
+`kStampSinkMax` = 8). So the cellar is written into
+`assets/worldedits/default_ground.svedit` (§9c.4) by
+`scripts/paint_cellar.mjs`, which owns every column of its footprint and
+rewrites those columns on each run. The script resolves material ids by NAME
+on every run. The layer stores ids, so if a merge renumbers the materials
+tail, running the script again fixes it. Cells are ground-relative (SVED v2)
+with dy = y - 200. Every column is inside the smithy's levelled pad, whose top
+cell is the house's `pos.y - 1` (§9f), so the room is rigid. If the pad ever
+stops being flat there, the cellar shears and gate `harrowby-cellar` fails.
+Like any layer, it moves the default map's world hash. It does not move the
+harness map's hash, because only the content gates load the default map.
+
+What is down there, in world voxels. The smithy is at (700, 201, 3460),
+yaw 270, and its bedroom is x 670..731, z 3468..3503.
+- A 7 x 7 x 2.9 m room: air at x 664..733, z 3434..3503, y 169..197. It has
+  cobble walls, a flagstone floor (top 168), a stone ceiling at 198 under the
+  house's own footing and floor, and three timber joists.
+- A steep cellar stair along the bedroom's back wall (z 3494..3503, 1 m
+  wide), with rise 2 and tread 2 (the player steps 6). It goes down westward
+  from a floor opening at x 674..700. The opening is that long for HEADROOM:
+  the player is a 0.6 m box resting on the highest tread under it, so its
+  head only clears the ceiling edge from x 676 down. A timber rail runs along
+  the opening's north side, and you step in from its east end, beside the
+  bed. Osric's routes never cross it: they run from the partition door to the
+  room node at (700, 3486), then to the bed at x 713..731.
+- The circle: a salt annulus centred on (705, 3462), cells 14 <= r < 16, one
+  cell tall and two wide, so it is closed for a 4- or 8-connected flood. It
+  is a powder at rest on stone. Just outside it, at radius ~19-21:
+  - a 3x3+1 pile of sulfur (NE);
+  - a pile of iron (NW);
+  - quicksilver in a 5x5 cobble dish (SE). The quicksilver is a liquid and
+    would run otherwise. It is kept away from the sulfur because the two make
+    cinnabar where they touch.
+- Candles, each a column of `tallow` with a `candle_flame` on top: one at
+  each of the four cardinal points (radius 21), one in each of three corners,
+  and one on the lectern.
+- A lectern west of the ring with an open book. The `readable` ref
+  `harrowby/smithy_notes` sits on the book's page cell (676, 182, 3461).
+
+**Candles are light, not fire** (`materials.json`, appended: `tallow`,
+`candle_flame`). `candle_flame` is a static solid with emission 230. It is not
+tag:hot and has no burn rule, for two reasons:
+- A heat-spreading flame in a cellar of sulfur is a fuse.
+- A flame that never burns out never sleeps (rule 2).
+
+Its only reaction is `+ tag:extinguisher -> smoke` (250 per-mille). That rule
+fires only where wet matter touches the flame, so a dry candle matches nothing
+and its chunk sleeps. D3 counts lit candles by this material, and rain or a
+demon's splash puts one out for free.
+
+**The `readable` kind** (`src/world/refs_readable.cpp`, registered in
+`refs_kinds.cpp`, placeable from F8's Place tool). Props:
+- `dialogue` (required): the pages are that conversation's nodes.
+- `title`: the prompt ("Read <title>") and the header.
+- `verb`: replaces "Read" in the prompt.
+
+Using it is the ordinary use verb: G → `TickInput::useRef` → `TickRefs` →
+`dialogue::Begin`, with a speaker that has no mob, so the conversation is
+never ended for "speaker gone". The kind has no activation, no delta and no
+tick, so it costs nothing until read. A readable is voxels someone built plus
+a ref that says how they read. It is not an item: there is no `ItemKind` and
+nothing to pick up.
+
+**Two dialogue actions** (§12c):
+- `{"grant": "<glyph id>"}` resolves the glyph BY NAME when it runs (indices
+  die on R) and calls `GlyphInventory::Grant`. Ownership is already saved by
+  name in the kit section (`persist.cpp`), so a granted glyph survives
+  save/load. A name glyphs.json lacks is never an error: it is a load-time
+  WARNING (`Library::Validate` with the store's `glyphs`) and a counted no-op
+  when run (`stats.refusedGrants`). That is what lets the book ship before
+  D1's glyph does.
+- `{"learn": "<name>"}` sets the world flag `name:<name>` = 1. The book's
+  entry reads it to open at the last page the second time.
+
+Both are mirrored in the tuner's `dialoguelib.js` and on the Dialogue tab.
+
+**The book** (`assets/dialogue/osric_notes.json`, speaker "Osric's daybook")
+has four short pages in Osric's flat soldier's voice:
+1. A tally that turns into "what I learned on the ridge".
+2. The RING: salt only, closed, poured from outside.
+3. The PILES: sulfur keeps its fire in, iron its hands, and quicksilver in a
+   dish keeps it from slipping out. Candles at the quarters.
+4. The NAME. This page runs `grant summon_skerrick` + `learn skerrick`.
+
+**Which glyphs are names: `game/demon_lore.h`.** It provides
+`demon::IsNameGlyph` (today: an id starting `summon_`), `GrantAllNames` and
+`CountNames`. Keeping this in one place lets D1's `GrantAllAndBind`
+exclusion and its `SANDVOX_ALL_NAMES` read ask the same question the dev
+button does. The dev panel's "Dev: demon names → learn all demon names" sets
+`UIState::devLearnDemonNames`, which the tick applies beside the dev mana
+overrides (`session.cpp`). Glyph ownership is player state, not hashed sim.
+
+**Verify:** `--gate harrowby-cellar` (thresholds `cellar.*` in
+`tests/baseline.json`). It loads the game map, regenerates the window around
+the smithy, ticks THE tick until the layer has drained, and reads the voxels
+back. It then asserts:
+- the refs load clean, and the book is matter under the floor;
+- there is air under the house;
+- a walker flood reaches the cellar floor from
+  `harrowby/smithy/waynode_room_1`. The walker is the player's 7x7x17 box
+  resting on what is under it, stepping up 6 / down 8;
+- the salt ring is closed by a local 2D flood (D1's rule), its diameter is in
+  range, and the same ring with one band erased reads open;
+- there is a flame at each cardinal point, all three piles are present, and
+  the quicksilver is still in its dish;
+- USE on the book through `TickInput`, paged to the end, leaves the player
+  owning `summon_skerrick`. While that glyph is absent, the gate first proves
+  the fail-soft path, then grants against a stand-in of the same name.
+
+`SANDVOX_CELLAR_SHOT=<path>.bmp` writes two pictures.

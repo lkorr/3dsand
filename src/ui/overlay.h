@@ -652,6 +652,11 @@ struct UIState {
   int32_t devManaMaxRequest = -1;    // one-shot: set the pool's max to this
   bool devManaFill = false;          // one-shot: mana = effective max
   bool devManaInfinite = false;      // sticky: refill to the max every tick
+  // demons D2: "learn all demon names" (game/demon_lore.h). One-shot ask,
+  // applied in the tick beside the mana overrides; the tick writes back what
+  // it did for the line under the button.
+  bool devLearnDemonNames = false;
+  std::string devDemonNamesStatus;
   // What the caster is sustaining, newest last, for the HUD list and the
   // drop key. Each line is the status's readout and its per-tick price.
   std::vector<std::string> spellStatuses;
