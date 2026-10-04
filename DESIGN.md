@@ -7094,7 +7094,8 @@ neighbors, so this needs an explicit connectivity pass:
   box compound hit N times for one touch; as one convex it hits fewer.
   Billed loose-body blows 407 -> 207 (natural), 796 -> 660 (corpse-heavy, 11
   -> 30 alive at the end). Billing once per (limb, body) pair a step is the
-  principled fix and is a mob.cpp change, proposed rather than made. What is
+  principled fix; package M made it ("One blow per (limb, striker) pair per
+  tick", under "A thrown rock is a blow"). What is
   left: the linear cast is now the largest phase (6.4 ms natural, 10.2
   corpse-heavy) -- dead flesh shoved by living kinematic limbs past 0.75 x
   its inner radius a step casts against the crowd's kinematic compounds;
@@ -7851,6 +7852,19 @@ and the landing own them). The player is NOT reached: its limbs are on
 permanently inside your capsule). Measured (`damage-sources` F): a 70 kg stone
 block at 15 m/s costs a standing human 102 hp over 5 contacts; in the iron
 cuirass 66, with 36 on the plate; at 1.5 m/s nothing.
+
+**One blow per (limb, striker) pair per tick** (2026-10-04, fight64 package
+M). Jolt reports a contact per touching SUB-SHAPE pair, so a box-compound gib
+touching a limb billed one blow per box in contact, and how much a thrown thing
+hurt depended on how its collider happened to be built (package P's convex
+hulls billed 207 blows in the natural `mob-cap64` fight where the compounds
+billed 407). After the sort the hardest reading of each (limb, striker) pair is
+kept and every other reading of the same pair is dropped -- a sub-shape repeat,
+or a player's capsule AND the limb it resolves to (the W2-K rule this
+generalises). Gameplay-visible: the per-tick cap now fills with distinct
+pairs rather than repeats. `mob-cap64` prints both numbers: natural fight 272
+billed, 384 repeats dropped; corpse-heavy arm (`killEvery 4`) 589 billed, 335
+dropped.
 
 ### Damage kinds: cut, blunt, bite (2026-09-15; `game/impact.h`, `Mob::BluntHit` / `Mob::BiteHit`, `sim/tuning.h` §E6, `docs/PLAN_impact_unarmed.md`)
 
@@ -12071,6 +12085,111 @@ live damage is in the shells, a player's corpse wears pieces whose kit went
 back to the avatar, and the MOBS/wire gear order is rig-slot order. The HELD
 item is not a kit slot for anyone (the player's is the hotbar selection,
 re-equipped every tick; an NPC's is `EquipItem`).
+
+### The mob tick on a work pool (2026-10-04; fight64 package M, `docs/PLAN_fight64_perf.md`; `src/game/workpool.*`, gate `mob-cap64`)
+
+The 64-creature brawl's mob tick was ~30 ms, all on one thread, while the Jolt
+step used seven. It is now ~19 ms with the SAME fight, bit for bit: every
+change below either does exactly the old arithmetic in the old order or moves
+work whose order is unobservable.
+
+**Measure first.** `src/test/sampleprof.*` is an in-process sampler
+(`SANDVOX_SAMPLE_PROF=1`; `mob-cap64` wraps its timed fight in it): every ~1.5
+ms the main thread is suspended and unwound, and at the end the addresses are
+named from the .pdb into self / inclusive / source-line / caller->callee tables
+(the full edge list in `build/sampleprof.txt`). It found 7 ms a tick nobody had
+a scope round (`ApplyShocks`, now burnprof `shocks`). `SANDVOX_MOBCAP_GPU=1`
+(with `SANDVOX_TICKET_COST=1` for the timestamp feature) times every tenth
+tick's GPU passes; `SANDVOX_MOBCAP_DIGEST=1` prints a per-tick digest of every
+creature's hp and origin bits -- the tool that proved each change exact, and
+that found the first tick two runs part when one was not.
+
+**The pool** (`workpool::ParallelFor(n, grain, fn)`): fork-join over n items on
+`hardware_concurrency/2 - 1` workers (clamped 1..7, the physics budget -- the
+mob pass and the Jolt step never overlap) plus the caller. The contract is the
+plan's: `fn(i)` reads anything nobody writes during the call and writes only
+item i's state. `SANDVOX_MOB_THREADS=1` is the serial arm in one binary.
+burnprof scopes record on the main thread only; `MobSystem::MaterialIdNamed`'s
+memo is read-only inside a task (`workpool::InTask`). A thread_local the task
+names would be the WORKER's own -- tasks reach main-thread scratch through
+pointers captured by value (StainLimbs' bound arrays).
+
+**Plan, then apply.** Everything that touches shared state -- a pot spent in
+rotated order, the micro brick pool (copy-on-write allocation), the op and
+spawn streams, the chunk fetch queue, Jolt, a creature's death -- stays serial
+in its old order. What is split off is the part that only READS the world
+mirror and the creature's own lattice:
+
+- `ApplyShockTick`: every slot's `ElecSlotCache` refreshed across the pool
+  before the node list is built (a pure function of one lattice). The cell
+  lookup is an open-addressed hash over the sorted runs (was a binary search
+  per ask); the seeding skips shell tests on an unworn body, faces past the
+  grid's own maximum, and the own-cell scan unless the far cell offers more;
+  air faces only for cells that can roll ohmic or crackle.
+- Cauterise: `MobSystem::PrecomputeWoundCharred` takes `WoundCharred` for every
+  open wound before the creature loop, across the pool; `BleedTick` reads it
+  (`Mob::WoundCharredAt`) for the same body handle, else asks directly. THE ONE
+  SEMANTIC SHIFT IN THIS LIST: the verdict is the lattice at the top of the
+  loop, so a blade that carves a burnt wound this tick is seen next tick (fire,
+  which chars, runs before the loop and is always seen the same tick). The
+  brawl's fight did not move.
+- Joint twins: `BurnTick` is `BurnTickHead` (the burn under the pot, infection,
+  pulp, heals) + the tail (sync + `RecountBurn`). `BurnLimbs` runs every head in
+  pot order, then `SyncJointTwinsPrepare` (the reconcile walk and its lattice
+  writes, the link rebuild) across the pool, then `SyncJointTwinsFinish`
+  (brick pokes replayed in order, `MarkInstancesDirty`, the flush) and the
+  recount serially in pot order. What moved: a sync now runs after the other
+  creatures' heads, so a flush's particles and a brick's copy-on-write land
+  later in their lists -- a crowd fight takes a slightly different (and still
+  reproducible) course; the `determinism` gate's hash, which has no
+  creatures in it, is unmoved.
+- Splatter: one task per creature flies every burst at it (`SplatSink`); the
+  brick copy-on-write, stain pokes and counters are replayed in the inline
+  (burst, creature, limb, landing) order, each burst's severed-flesh pass where
+  it always ran.
+- Burn: `PrecomputeBurnWalks` takes each limb's sleep-key world digest and
+  hot-cell walk (`BurnWalkPre`); `BurnOneLimb` uses them only for the very box
+  it computes and issues the recorded chunk fetches in walk order.
+- Contact staining (`StainPre`): mode 1 is each limb's walk and surface size;
+  then both pots are spent in their exact order, contact only, to bound each
+  limb's possible share (the dry / wet passes only take more out, and a share
+  never shrinks as the pot grows); mode 2 sweeps that many samples, recording
+  each sample's coat write or chunk fetch. The serial `StainTick` plays a plan
+  up to the share the real pot gives -- the samples are independent (distinct
+  surface voxels reading the world and their own coat), so a plan cut at the
+  share is the sweep that stopped there. The pot is charged exactly as before,
+  including its old quirk (a share cut short by a nearly-empty pot takes the
+  rest of the pot). The first version billed `count` instead and moved the
+  fight at tick 24 -- the digest found it. `SANDVOX_STAIN_PLAN=0` is the inline
+  arm.
+
+**Exact single-thread fixes**: perception asks line of sight in score order
+and stops at the first that sees (the pick is the lowest score among actors
+passing all three tests, earliest on a tie -- the same actor); the stain walk
+reads a chunk row at a time; `WoundCharred` prefilters by an integer box; the
+carve's connectivity flood and collider delta use dense grids instead of hash
+containers.
+
+**Measured** (`mob-cap64`, `SANDVOX_RUN_EXCLUSIVE=1`, non-LTO, main 39a8b56 vs
+this branch, alternating boots, medians): mob side 29.6 -> 18.8 ms (stroke 5.7
+-> 5.4, shocks ~6 -> 2.4, stain 6.1 -> 2.7 incl. splatter 2.0 -> 0.6, burn 5.5
+-> 3.7, bleed 3.4 -> 0.9, intent 0.6 -> 0.3); tick wall 57.0 -> 47.9 (45.1
+with the old contact rule: the new rule's fight carries more contacts, Jolt
+11.1 -> 14.5). Corpse-heavy arm (`killEvery 4`): mob 22.0 -> 14.8.
+
+**The real frame** (`--brawl`, the same crowd in the windowed loop): the frame
+never waits on the GPU tick (0 snapshot stalls; the harness's ~11 ms
+`readbackStall` is `SetHarnessSnapshotDrain` and nothing else), but the throttle
+defers ticks when the GPU owes two snapshots, and at ~35 ms of CPU a tick the
+game falls behind 30 Hz into catch-up frames. Bodies are not the render cost:
+`drawMicro` ~1.3 ms GPU on frames it runs, the instance build ~0.1 ms CPU; the
+micro brick pool re-uploads ~0.5 MiB a frame in a fight.
+
+**Left** (serial floors): blade carves ~5 ms (`DownsampleSkin`'s hash map is
+~1.8 ms of it across carve, wound soak and re-blood -- its output ORDER is the
+map's, so a faster version moves the collider order and the hash: a
+phys/lattice.h decision), the burn head under its shared pot ~3.6 ms, the shock
+solve ~2.4 ms.
 
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
