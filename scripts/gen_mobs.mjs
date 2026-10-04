@@ -300,6 +300,12 @@ function write(name, genome) {
   // so the rig keeps tracking the human instead of freezing a copy of it (see
   // mobgen.thinSidecar). The .vox is still the whole body: art is art.
   const doc = mg.thinSidecar(built.sidecar, resolvedBase(), name);
+  // THE AI PROFILE IS NOT THE BODY'S, so the generator never derives it: a
+  // `--behavior` names one (behaviors.json), and a re-bake keeps whatever
+  // the file on disk already named (an imp stays an imp).
+  const prevBehavior = existsSync(jp) ? readJson(jp).behavior : undefined;
+  if (opt('behavior')) doc.behavior = opt('behavior');
+  else if (prevBehavior) doc.behavior = prevBehavior;
   writeFileSync(vp, built.vox);
   writeFileSync(jp, JSON.stringify(doc, null, 2) + '\n');
   console.log(`  wrote ${rel(vp)} (${built.vox.length} bytes) and ${rel(jp)} ` +

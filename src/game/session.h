@@ -815,6 +815,7 @@ struct FrameIntent {
 // groups below are ordered by what the language needs and labelled by what
 // they mean.
 struct TickScratch;  // session.cpp; see TickAuthorityCtx::tickScratch
+struct DemonWorld;   // game/demon.h; see TickAuthorityCtx::demons
 struct TickAuthorityCtx {
   // ---- A. the engine, by reference. One per process today; one per WORLD in
   // the shape this is heading for.
@@ -1032,6 +1033,11 @@ struct TickAuthorityCtx {
   // in a TU where the type is incomplete, and a shared_ptr's deleter is bound
   // where it is created (session.cpp), not where it is destroyed.
   std::shared_ptr<TickScratch> tickScratch;
+  // THE WORLD'S DEMONS (game/demon.h, docs/PLAN_demons.md D1): summonings in
+  // flight, the demons this world called up and the circles holding them.
+  // Created on the first summoning (null in a world that never had one, which
+  // is every harness but the demon gates); a shared_ptr for tickScratch's reason.
+  std::shared_ptr<DemonWorld> demons;
 
   // ---- E. THE SCRIPTED-FLIGHT / MEASUREMENT HARNESSES, AS HOOKS. Every one
   // of these is argv state the FRAME layer owns, supplied as a callback so

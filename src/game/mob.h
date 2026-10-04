@@ -14,6 +14,7 @@
 #include "game/pose.h"     // PoseInputs / PoseDrive: the one pose pipeline (W2-L)
 #include "game/equipment.h"
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
+#include "game/mobfence.h"  // MobFence: the demon circle's say over a move or a blow
 #include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
 #include "game/selfclip.h"  // ClipReport: is this pose inside itself
 #include "game/severpolicy.h"  // DamageCtx + the (cause, tissue) sever table
@@ -5598,6 +5599,11 @@ class MobSystem {
   // and the debug viz read the whole Brain rather than a dozen accessors —
   // it IS the introspection surface, and every field on it is already
   // presentation state.
+  // THE FENCE (game/mobfence.h): the demon system's say over where a
+  // creature may walk and what it may strike (a contained demon). One per
+  // world; `{}` removes it.
+  void SetFence(const MobFence& f) { fence_ = f; }
+  const MobFence& Fence() const { return fence_; }
   const ai::Brain* MobBrain(uint64_t mobId) const;
   // ...and the one writable seam into it: the resident layer (world/
   // refs_npc.h) writes Brain::routine every tick for an authored villager.
@@ -8138,6 +8144,10 @@ class MobSystem {
   // the field, which is what the mob-vs-mob fixtures want).
   std::vector<ai::Actor> playerActors_;
   std::vector<ai::AttackRequest> attacks_;
+  // THE FENCE (game/mobfence.h, docs/PLAN_demons.md D1): asked by the walk
+  // drive before a move and by the attack seam before a blow is queued.
+  // Installed by the demon system while a demon is contained; empty otherwise.
+  MobFence fence_;
   // ---- phase C: executing an attack ---------------------------------------
   // The authored style library, and the item library the swings resolve their
   // weapon against. Neither is owned by the creature: styles hot-reload with R

@@ -571,6 +571,48 @@ void Overlay::DrawHUD(const UIState& s) {
     }
     py += tabH + 14.0f;
   }
+  // ---- the summoner's demon (game/demon.h, docs/PLAN_demons.md D1) ---------
+  //
+  // A small tab: a pixel salt ring (2 px blocks, 7x7) and one line of text.
+  // CONTAINED draws the ring whole in salt-white with the circle's radius;
+  // UNBOUND draws it broken in ember red. The tab is sized from the text, so
+  // the words always fit their box.
+  if (s.playerAlive && s.demonState != 0 && !s.demonName.empty()) {
+    const bool held = s.demonState == 1;
+    const ImU32 ring = held ? IM_COL32(236, 232, 220, 255) : ui::ColEmber();
+    char line[96];
+    std::string up = s.demonName;
+    for (char& c : up) c = (char)std::toupper((unsigned char)c);
+    if (held)
+      std::snprintf(line, sizeof line, "%s  CONTAINED  %.1f m", up.c_str(), s.demonRadiusM);
+    else
+      std::snprintf(line, sizeof line, "%s  UNBOUND", up.c_str());
+    const ImVec2 ts = ImGui::CalcTextSize(line);
+    static const char* kRing[7] = {"..###..", ".#...#.", "#.....#", "#.....#",
+                                   "#.....#", ".#...#.", "..###.."};
+    const float b = 2.0f, gw = 7 * b, gh = 7 * b;
+    const float inner = gw + 8.0f + ts.x;
+    const float x0 = std::floor((disp.x - inner) * 0.5f);
+    const float y0 = py;
+    const float tabH = std::max(gh, ts.y);
+    d->AddRectFilled(ImVec2(x0 - 8, y0 - 4), ImVec2(x0 + inner + 8, y0 + tabH + 4),
+                     IM_COL32(0, 0, 0, 170));
+    d->AddRect(ImVec2(x0 - 8, y0 - 4), ImVec2(x0 + inner + 8, y0 + tabH + 4), ring, 0.0f, 0,
+               2.0f);
+    const float gy = y0 + std::floor((tabH - gh) * 0.5f);
+    for (int r = 0; r < 7; r++)
+      for (int c = 0; c < 7; c++) {
+        if (kRing[r][c] != '#') continue;
+        // Broken: the ring's right-hand cells are missing.
+        if (!held && c >= 5 && r >= 2 && r <= 4) continue;
+        d->AddRectFilled(ImVec2(x0 + c * b, gy + r * b), ImVec2(x0 + (c + 1) * b, gy + (r + 1) * b),
+                         ring);
+      }
+    const float tx = x0 + gw + 8.0f;
+    d->AddText(ImVec2(tx + 1, y0 + 1), IM_COL32(0, 0, 0, 190), line);
+    d->AddText(ImVec2(tx, y0), ring, line);
+    py += tabH + 14.0f;
+  }
   // ---- the throw's wind-up: a row of pixel pips under the crosshair --------
   //
   // Ten 6x8 cells on the 2 px grid, lit left to right in gold as Q is held,

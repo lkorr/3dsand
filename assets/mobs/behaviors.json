@@ -368,6 +368,31 @@
         { "note": "a monster in sight: run from it", "when": { "hostiles": ">0" }, "weight": { "flee": 2.0 } },
         { "note": "badly hurt in a fight: run", "when": { "hp": "<0.35", "hasTarget": 1 }, "weight": { "flee": 3.5 } }
       ]
+    },
+    {
+      "comment": "THE IMP (docs/PLAN_demons.md D1; assets/mobs/demon/imp_skerrick.json, assets/demons/skerrick.json). A summoned thing that wants its summoner dead: faction `demon`, aggro hostile, the full 360 (it was looking for you before it arrived). AGILE AND LIGHT: a short fast cadence of claw rakes and bites (the human's natural weapons; demon.js makes the fists cut), a close band it darts in and out of, a lot of circling and a quick dodge. Ranges are centre-to-centre in world voxels and an imp is under a metre tall, so every number is about half a man's. CONTAINMENT IS NOT HERE: a demon summoned into an intact salt circle keeps this profile and keeps wanting you; the circle (game/demon_circle.h) clamps its walk and refuses a blow across the ring.",
+      "name": "imp",
+      "label": "Imp",
+      "color": 3221233919,
+      "faction": "demon",
+      "hysteresis": 0.25,
+      "perception": { "sightRange": 44, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 400, "keepRangeScale": 1.4, "stickiness": 10, "preferWeak": 1 },
+      "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 5, "bandSlack": 1.2, "approachSpeed": 1.15, "strafeSpeed": 0.6, "retreatSpeed": 0.8, "fleeSpeed": 1.2, "circleTendency": 0.6, "circleHoldTicks": 20, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.6, "flank": 0.7, "keepOut": -1 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "bite"], "reach": 6, "aimTolerance": 0.8, "cadenceTicks": 22, "jitterTicks": 12, "commitTicks": 7, "disengageTicks": 10, "pursueSpeed": 1.0, "leadTicks": 10 },
+      "defense": { "skill": 0.45, "reactTicks": 5, "reactJitter": 5, "margin": 2.0, "guardStance": 0, "guardReach": 0.8, "holdTicks": 3 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "holdRange": { "weight": 0.8, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "circle": { "weight": 0.9, "cooldownTicks": 14, "minDwellTicks": 14 },
+        "attack": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "dodge": { "weight": 2.6, "cooldownTicks": 8, "minDwellTicks": 6 }
+      },
+      "rules": [
+        { "note": "it just swung: dart in", "when": { "targetRecovering": 1 }, "weight": { "attack": 3.8 }, "tune": { "cadence": 0.4 } },
+        { "note": "badly hurt: skitter off and come again", "when": { "hp": "<0.3" }, "tune": { "band": 3, "speed": 1.15 } }
+      ]
     }
   ]
 }

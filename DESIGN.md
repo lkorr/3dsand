@@ -24361,3 +24361,123 @@ the green is a structure precisely so its square levels the ground the houses'
 squares do not reach, and the spawn column must stay outside every square; two
 villagers sent to one marker shoulder each other off it all evening, so each
 regular has his own place (a prop naming a ref beats the tag).
+
+
+## 17. Demons — summoning, the salt circle, containment (added 2026-10-04, `game/demon.*`, `game/demon_circle.*`, docs/PLAN_demons.md)
+
+The owner's design (Bartimaeus): you cast a demon's NAME into a salt circle
+from outside it. Inside an intact circle the demon is CONTAINED (to talk and to
+bind, D3-D5); anywhere else -- no circle, a broken one, a missed cast -- it
+arrives UNBOUND and HOSTILE. The goof is deliberate. This section is kept
+current per package; D1 (below) is the body, the name, the circle and the hold.
+
+**THE BODY IS A RACE (D1).** `assets/editor/demon.js` is a race module in
+mobgen's `RACE_MODS` (the machine races' interface, §8 "MACHINE RACES") with
+three differences, each a flag the generator reads rather than a branch on the
+race's name:
+
+- `MACHINE = false`: a demon is FLESH. `ANATOMY = null` takes the human's
+  recipe (skin, flesh, muscle, bone, a skull round a brain), `BLEED` is blood,
+  and `DEFAULT_MAT = null` leaves every art slot the module does not name at
+  the human's answer (skin on the body, `hair_white` on the hair mass). Only
+  horns and claws (`bone`), lit eyes (`gem_arcane`, the sylvan's and the
+  android's light) and the hide-painted tail (`skin`) name a material. So a
+  demon walks, falls, burns, bleeds and dies exactly as a human does.
+  test_mobgen §P (the machines' promise) skips it; §Q is its own.
+- `HEIGHT_BAND = [0.85, 2.1]`: the race's own height band. Every height clamp
+  goes through `mobgen.specRange`, which returns it for a demon and the human
+  `HEIGHT_BAND` (1.53..1.87) for everyone else -- a 0.85 m human still clamps
+  to 1.53. 0.85 m is the smallest figure `validateMob` passes (8 world voxels)
+  with a margin; 2.1 is where the human reach contract starts to lie.
+- `extraStates` / `patchNatural`: a hunched genome appends a `hunch` loco
+  state (`always: true`, clip `hunch`) AFTER the human's ladder, so every
+  damage state still wins and the gait still walks under it (the snake's
+  base-state mechanism; `assets/anims/hunch.json`: spine 28 degrees forward,
+  head 22 back, arms 36 forward, additive). Claws give the fists a `cut`
+  (edges unchanged: the human's rig, weapon for weapon).
+
+Genes (`genome.demon`): horn style picker (none / nubs / goat / spikes / ram),
+horn length, curl and spread; tail; claws; mottling; lit eyes; posture
+(upright | hunched). Horns ride the head and the tail the torso as fixed-joint
+extras (hair-mass `snout` / `bough` parts). Presets: `demon`, `imp` (0.85 m,
+big head, long arms, hunched) and `fiend` (2.0 m, ram horns: the greater-demon
+size). Art slots 221..216 (below the android's).
+
+**THE IMP, SKERRICK.** `assets/mobs/demon/imp_skerrick.{vox,json}`
+(`node scripts/gen_mobs.mjs imp_skerrick --preset imp --behavior imp`; a
+re-bake keeps the file's `behavior`), behaviour profile `imp`
+(behaviors.json: faction `demon`, aggro hostile, a fast cadence of claw rakes
+and bites, a close band, circling, dodges). The demon def
+`assets/demons/skerrick.json` names the mob, the profile, tier, power, gaze,
+per-channel resistances and schemes (the last four are read from D3/D6 on).
+
+**THE NAME IS A GLYPH.** `SpellVerb::Summon` (appended last), glyph
+`summon_skerrick` (`"summon": {"demon": "skerrick", "mana": 40}`), an effect:
+`summon_skerrick lob` throws the name into the circle. The VM only REPORTS it
+(`SpellEmission::summons`; a ward `summon_skerrick null` refuses it, kindMode
+7); session.cpp phase I hands it to `DemonQueueSummon`. Tariff: the glyph's
+`mana`, flat (a name said twice is one demon); refunded when the owner refuses
+(unknown demon, no room, spawn failed). NOT GRANTED by `GrantAllAndBind`
+(name glyphs are appended after every other glyph, so excluding them moves no
+binding) unless `SANDVOX_ALL_NAMES=1` (`DebugAllDemonNames`, read once); the R
+reload carries learned names over by id. D2's book grants it by name.
+
+**THE CIRCLE** (`game/demon_circle.h`, `assets/demons/circle.json`). From the
+arrival column a 2D flood fill over a three-row slab (the floor row, the feet
+row, the row above) in which a column is a WALL iff a slab cell is salt --
+only salt: stone, wood and water are open, so a walled room or a moat is not a
+circle, and brine (dissolved salt is solute on a water cell) or molten salt
+does not count. 4-connected, so a ring drawn on the diagonal is closed and one
+missing cell is a gap. The fill escaping `radiusMaxM` (4 m) = OPEN; the start
+column itself salt = ON RING; a cell no store holds = UNKNOWN; otherwise
+CLOSED, and the fill region (a bitmask over its bounding box) is the inside.
+Floor: from two above the impact down `floorSearch` cells to the first
+passable cell over a non-passable one. Pure: it reads only through a probe the
+caller binds to the T-4 snapshot mirror then the fetch cache (the stores a
+spell's strike reads), so it is a function of the tick.
+
+**THE ARRIVAL.** A summoning is queued with the cast and arrives `leadTicks`
+(8) later -- the demon taking shape, and the time the fetch cache needs to
+deliver the chunks the scan may read (requested at the cast, at most 48, only
+those outside the mirror). Then: floor, circle, `MobSystem::Spawn` centred on
+the arrival column with its feet on the floor, the def's behaviour profile.
+CLOSED -> CONTAINED. Anything else -> UNBOUND at once, its brain pointed at
+the summoner (target id `kPlayerActorBase + session`).
+
+**CONTAINMENT IS NOT A WALL** (`game/mobfence.h`). While any demon is
+contained, the demon world installs a `MobFence` on MobSystem, asked (a) by the
+walk drive's `fits` before every move (refused if the footprint centre would
+leave the inside; a demon knocked out may only move back toward it) and (b) by
+the attack seam before a blow is queued (refused if the blow's target point is
+outside the inside -- melee reach across the ring). Nothing else is fenced:
+the player and items cross freely, and with no contained demon the fence is
+empty (one null test per move). Two lines in mob.cpp, one member in mob.h.
+
+**THE HOLD.** A contained demon's circle is re-read (from where it stands if
+inside, else from its arrival column) when a chunk the circle overlaps is awake
+in the snapshot, or every `recheckTicks` (15) regardless; never twice a tick;
+one bounded fill per demon. OPEN / ON RING -> UNBOUND that tick and aimed at
+the summoner (wind, rain, fire, a boot or the demon's own gust breaking the
+loop are all ordinary sim matter doing it). UNKNOWN (the circle out of every
+store) HOLDS the last answer and asks for the chunks again -- a demon left in
+a cellar stays held while you are away.
+
+**THE HUD.** Each summoner's most recent demon: a pixel tab under the
+crosshair, a salt ring and `SKERRICK  CONTAINED  1.4 m` in salt-white, or the
+ring broken and `SKERRICK  UNBOUND` in ember (`UIState::demonState`).
+
+**BOUNDS.** 8 summonings in flight, 16 live demons per world, 48 chunk
+requests per summoning; a fill is at most (2R + 1)^2 columns x 3 cells.
+
+**NOT SAVED (D1).** The live list, the circles and the pending queue. A
+contained demon in a save loads back as its creature with its hostile profile
+and no circle -- loose. Learned names are glyph ownership (D2's grant). D5
+(contracts) is where bound demons persist.
+
+**GATE** `demon-circle`: the name (glyph, VM report, tariff, not granted by
+default, granted by the switch, Skerrick resolves); on a harness pad a salt
+ring with the player's actor just outside: contained for 150 ticks and never
+out while targeting you, the fence refusing moves and blows; one ring cell
+cleared through the queue -> unbound within 40 ticks and out of the circle;
+the same run twice -> identical trace; no ring -> unbound; a one-cell gap ->
+unbound.

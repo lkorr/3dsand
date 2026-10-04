@@ -550,6 +550,8 @@ add_library(sandvox_core OBJECT
   src/game/pose.cpp
   src/game/thirdperson.cpp
   src/game/spell.cpp
+  src/game/demon.cpp
+  src/game/demon_circle.cpp
   src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
@@ -639,6 +641,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_alchemy.cpp
   src/test/selftest_chem.cpp
   src/test/selftest_elec_strike.cpp
+  src/test/selftest_demon.cpp
   src/test/selftest_elec_play.cpp
   src/test/selftest_elec.cpp
   src/test/selftest_elec_mob.cpp

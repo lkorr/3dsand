@@ -1,0 +1,55 @@
+{
+  "//": "THE HUNCH: an imp's carriage (docs/PLAN_demons.md D1, assets/editor/demon.js posture). An ADDITIVE hold played by a hunched body's `hunch` loco state (`always`, listed LAST so every damage state -- crawl, limp, squirm -- wins over it; the snake's base-state mechanism). The spine pitches about 28 degrees forward at the waist, the head counter-pitches 22 back so the eyes stay on what is ahead, and the upper arms swing 36 forward of the torso so they hang just in front of the body rather than trailing behind the lean, elbows a little bent. Additive, so the gait still walks and the walk's arm swing still swings underneath. Rotations are pure X, positive = backward/down for a hanging limb and FORWARD for the upright torso (anim.cpp's convention; reach.json's note). The slow counter-phased drift is breathing: a held pose that is perfectly still reads as a frozen rig.",
+  "name": "hunch",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 2400,
+  "loop": true,
+  "mode": "additive",
+  "blendInMs": 300,
+  "blendOutMs": 300,
+  "mask": ["torso", "head", "armU.L", "armL.L", "armU.R", "armL.R"],
+  "tracks": {
+    "torso": {
+      "rot": [
+        { "t": 0,    "q": [0.2419, 0, 0, 0.9703], "ease": "quadInOut" },
+        { "t": 1200, "q": [0.2250, 0, 0, 0.9744], "ease": "quadInOut" },
+        { "t": 2400, "q": [0.2419, 0, 0, 0.9703] }
+      ]
+    },
+    "head": {
+      "rot": [
+        { "t": 0,    "q": [-0.1908, 0, 0, 0.9816], "ease": "quadInOut" },
+        { "t": 1200, "q": [-0.1736, 0, 0, 0.9848], "ease": "quadInOut" },
+        { "t": 2400, "q": [-0.1908, 0, 0, 0.9816] }
+      ]
+    },
+    "armU.L": {
+      "rot": [
+        { "t": 0,    "q": [-0.3090, 0, 0, 0.9511], "ease": "quadInOut" },
+        { "t": 1200, "q": [-0.2924, 0, 0, 0.9563], "ease": "quadInOut" },
+        { "t": 2400, "q": [-0.3090, 0, 0, 0.9511] }
+      ]
+    },
+    "armU.R": {
+      "rot": [
+        { "t": 0,    "q": [-0.2924, 0, 0, 0.9563], "ease": "quadInOut" },
+        { "t": 1200, "q": [-0.3090, 0, 0, 0.9511], "ease": "quadInOut" },
+        { "t": 2400, "q": [-0.2924, 0, 0, 0.9563] }
+      ]
+    },
+    "armL.L": {
+      "rot": [
+        { "t": 0,    "q": [-0.1564, 0, 0, 0.9877], "ease": "quadInOut" },
+        { "t": 1200, "q": [-0.1392, 0, 0, 0.9903], "ease": "quadInOut" },
+        { "t": 2400, "q": [-0.1564, 0, 0, 0.9877] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0,    "q": [-0.1392, 0, 0, 0.9903], "ease": "quadInOut" },
+        { "t": 1200, "q": [-0.1564, 0, 0, 0.9877], "ease": "quadInOut" },
+        { "t": 2400, "q": [-0.1392, 0, 0, 0.9903] }
+      ]
+    }
+  }
+}

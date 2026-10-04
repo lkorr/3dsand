@@ -16,6 +16,7 @@
 #include "audio/cues.h"
 #include "game/ai_behavior.h"
 #include "game/bodyreg.h"
+#include "game/demon.h"
 #include "game/dye.h"
 #include "game/itemcoat.h"
 #include "game/persist.h"
@@ -4329,7 +4330,12 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // WARDS filter the spell's OWN emission too (a fire aura inside an
         // anti-fire ward is refused like anyone else's).
         ui.spellRefused = spells.FilterStreams(emit.ops, emit.explosions, emit.spawns, emit.winds,
-                                               &emit.strikes);
+                                               &emit.strikes, &emit.summons);
+        // SUMMONINGS (game/demon.h, docs/PLAN_demons.md D1): the VM reported a
+        // demon's name cast at a point; the demon world queues the arrival and
+        // asks the stores for what it will read.
+        for (const SpellSummon& su : emit.summons)
+          DemonQueueSummon(w, std::span<SessionTick>(&st, 1), s.index, su, glyphs, tick);
 
         // BOMBS ARE DEBRIS. The VM asked for a rigid body; this is the owner
         // making one through the same path a dropped item takes (a Jolt
@@ -5900,6 +5906,10 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // this tick's mobs.PreTick. Null in every harness but the refs-* gates.
   if (w.refs != nullptr) refs::TickRefs(w, players, tick, out);
   tprof.Mark("refs");
+  // THE DEMONS (game/demon.h): due arrivals spawn, contained demons' circles
+  // are re-read, the fence goes up or comes down. Before phase H for the
+  // refs' reason: a demon that arrives is stepped by this tick's PreTick.
+  DemonTick(w, players, tick);
   PhaseH(w, ws, players, scratch, tick, out);
   tprof.Mark("H");
   for (size_t i = 0; i < players.size(); i++)

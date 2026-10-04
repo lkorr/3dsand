@@ -25,6 +25,7 @@
 #include "sim/trample.h"
 #include "sim/plants.h"
 #include "game/bodyreg.h"
+#include "game/demon.h"
 #include "game/brush.h"
 #include "game/burnprof.h"
 #include "game/persist.h"
@@ -7586,7 +7587,9 @@ int main(int argc, char** argv) {
   SpellSystem& spells = session.spells;
   spells.SetLibrary(&glyphs);
   PlayerCaster& caster = session.caster;
-  caster.inventory.GrantAllAndBind(glyphs);   // placeholder acquisition
+  // Every glyph but the demons' NAMES, which SANDVOX_ALL_NAMES=1 adds
+  // (game/demon.h DebugAllDemonNames; D2's book is the real way).
+  caster.inventory.GrantAllAndBind(glyphs, DebugAllDemonNames());   // placeholder acquisition
   caster.Recompile(glyphs);
   // Health lives on PlayerAvatar's per-part hp, read through this indirection
   // so the VM never includes the avatar (thesis 4 in spell.h).
@@ -12801,10 +12804,19 @@ int main(int argc, char** argv) {
               boundNames[i] = glyphs.glyphs[gi].id;
             boundPages[i] = caster.inventory.PageAt(i);
           }
+          // ...and the demon NAMES the player has LEARNED (a book's `grant`):
+          // GrantAllAndBind does not hand those out, so they are carried over
+          // by name like the bindings.
+          std::vector<std::string> learnedNames;
+          for (int gi : caster.inventory.owned)
+            if (gi >= 0 && gi < (int)glyphs.glyphs.size() &&
+                glyphs.glyphs[gi].verb == SpellVerb::Summon)
+              learnedNames.push_back(glyphs.glyphs[gi].id);
           if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
             glyphs = std::move(next);
             spells.Clear();          // live projectiles hold stale glyph indices
-            caster.inventory.GrantAllAndBind(glyphs);   // acquisition placeholder
+            caster.inventory.GrantAllAndBind(glyphs, DebugAllDemonNames());   // acquisition placeholder
+            for (const std::string& nm : learnedNames) caster.inventory.Grant(glyphs.Find(nm));
             // Re-bind by name over the identity mapping GrantAllAndBind just
             // laid down. A name that no longer exists leaves the slot EMPTY
             // rather than pointing at whatever now occupies that index — the

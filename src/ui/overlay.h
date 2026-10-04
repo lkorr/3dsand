@@ -1558,6 +1558,13 @@ struct UIState {
   // a jolt.
   int stunTicksLeft = 0;
   int shockTicksAgo = -1;
+  // THE SUMMONER'S DEMON (game/demon.h DemonTick; docs/PLAN_demons.md D1):
+  // the most recent demon this player called up and whether a salt circle
+  // holds it -- 0 none, 1 CONTAINED (the circle's radius, metres), 2 UNBOUND.
+  // Written by the tick; the HUD draws a small pixel tab for it.
+  int demonState = 0;
+  std::string demonName;
+  float demonRadiusM = 0.0f;
   // A HELD VESSEL'S MODE, PER HAND (dual wielding; sim/tickinput.h
   // TB_SCOOP/TB_APPLY and their _L twins): 0 pour, 1 scoop, 2 apply. F
   // cycles the vessel in the hand last used; the hand's own button (LMB

@@ -7301,6 +7301,12 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       mob.desiredHeading_ = out.desiredHeading;
       mob.driveScale_ = out.driveScale;
       mob.driveStrafe_ = out.driveStrafe;
+      // A CONTAINED DEMON'S BLOW ACROSS ITS RING IS REFUSED (mobfence.h).
+      if (out.attack &&
+          !fence_.Allows(mob.id_, MobFence::Blow, mob.origin_.x + def.worldSize.x * 0.5f,
+                         mob.origin_.z + def.worldSize.z * 0.5f, out.request.targetPoint.x,
+                         out.request.targetPoint.z))
+        out.attack = false;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
       ApplyAiArm(mob, def, out);
@@ -7953,6 +7959,11 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
     // "may always move apart" escape in BlockedByMob is what stops this being
     // a trap for bodies that are already overlapped.
     if (BlockedByMob(mob, def, nx + hx, nz + hz)) return false;
+    // A CONTAINED DEMON may not walk out of its circle (mobfence.h). Not a
+    // wall: asked of this creature only, so nothing else is fenced.
+    if (!fence_.Allows(mob.id_, MobFence::Move, mob.origin_.x + hx, mob.origin_.z + hz,
+                       nx + hx, nz + hz))
+      return false;
     const Mob::Footing f =
         mob.FootprintFooting(*world_, def, nx + hx, nz + hz, mob.origin_.y);
     if (!f.known) {

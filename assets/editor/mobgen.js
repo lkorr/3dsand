@@ -84,6 +84,7 @@ import * as SC from './sidecar.js';
 import * as SY from './sylvan.js';
 import * as AU from './automaton.js';
 import * as AN from './android.js';
+import * as DM from './demon.js';
 
 /** THE MACHINE RACES (automaton.js, android.js), by race key. Everything such
  *  a race contributes reaches the generator through this table and ONE
@@ -92,7 +93,7 @@ import * as AN from './android.js';
  *  made of (with stand-ins for ids a .vox cannot paint), the inside, the
  *  bleed, presets and its folder. A new race of that shape is a module and a
  *  row here. The sylvan predates the interface and keeps its own hooks. */
-export const RACE_MODS = { automaton: AU, android: AN };
+export const RACE_MODS = { automaton: AU, android: AN, demon: DM };
 export const RACES = [...SY.RACES, ...Object.keys(RACE_MODS)];
 /** The machine race module a genome is, or null (human, sylvan). */
 export const raceMod = g =>
@@ -289,6 +290,8 @@ export const ART = {
   // THE MACHINE RACES' SLOTS (automaton.js, android.js), likewise.
   ...AU.SLOTS,
   ...AN.SLOTS,
+  // THE DEMON's (demon.js), likewise.
+  ...DM.SLOTS,
 };
 
 /** Coverage of each wisp tier, 0..255. The steps are even in how THIN they
@@ -342,6 +345,7 @@ export const COLOR_SLOTS = {
   ...SY.COLOR_SLOTS,
   ...AU.COLOR_SLOTS,
   ...AN.COLOR_SLOTS,
+  ...DM.COLOR_SLOTS,
 };
 
 /**
@@ -413,6 +417,17 @@ export const DEFAULT_EYE_M = 1.50;
  *  reach what the AI thinks they reach. +-10% moves a silhouette visibly and
  *  moves nothing else. */
 export const HEIGHT_BAND = [1.53, 1.87];
+/** The band THIS genome's height is held to: a race module may state its own
+ *  (demon.js HEIGHT_BAND: an imp is knee-high), every other genome -- every
+ *  human -- keeps HEIGHT_BAND exactly. Read through `specRange`, the one place
+ *  a numeric gene's range is asked for. */
+export const heightBand = g => {
+  const M = raceMod(g);
+  return (M && M.HEIGHT_BAND) || HEIGHT_BAND;
+};
+/** [min, max] of a numeric gene FOR THIS GENOME (only the height moves). */
+export const specRange = (spec, g) =>
+  spec.path === 'body.heightM' && g ? heightBand(g) : [spec.min, spec.max];
 
 /** The runtime constants the derived gait numbers are computed WITH. They
  *  live in src/game/avatar.cpp; restating them is a second source of truth,
@@ -864,6 +879,7 @@ export const GENE_GROUPS = [
   ...SY.GENE_GROUPS,
   ...AU.GENE_GROUPS,
   ...AN.GENE_GROUPS,
+  ...DM.GENE_GROUPS,
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
           'which way it faces, so the three skin tones want to be the same ' +
@@ -1399,7 +1415,8 @@ export const GENE_SPECS = [
 // stacks them under their own headings. Their place in the list moves no
 // human draw: a race-gated row is skipped without one (see `race` above).
 GENE_SPECS.splice(GENE_SPECS.findIndex(sp => sp.group === 'colour'), 0,
-                  ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS);
+                  ...SY.GENE_SPECS, ...AU.GENE_SPECS, ...AN.GENE_SPECS,
+                  ...DM.GENE_SPECS);
 
 /** Does this row apply to this genome? (race-gated rows, see GENE_SPECS) */
 export const specApplies = (spec, genome) =>
@@ -1438,7 +1455,7 @@ export function setPath(o, path, v) {
 
 const HEX = /^#[0-9a-f]{6}$/;
 
-function coerceGene(spec, v, fallback) {
+function coerceGene(spec, v, fallback, g) {
   if (spec.kind === 'color') {
     const s = String(v || '').trim().toLowerCase();
     return HEX.test(s) ? s : fallback;
@@ -1450,7 +1467,8 @@ function coerceGene(spec, v, fallback) {
   if (!Number.isFinite(n)) return fallback;
   if (spec.even) n = Math.max(2, Math.round(n / 2) * 2);
   else if (spec.int) n = Math.round(n);
-  return clamp(n, spec.min, spec.max);
+  const [lo, hi] = specRange(spec, g);
+  return clamp(n, lo, hi);
 }
 
 /**
@@ -1493,7 +1511,7 @@ export function normalizeGenome(src) {
   const def = defaultGenome();
   for (const spec of GENE_SPECS)
     setPath(g, spec.path, coerceGene(spec, getPath(g, spec.path),
-                                     getPath(def, spec.path)));
+                                     getPath(def, spec.path), g));
   return g;
 }
 
@@ -1534,7 +1552,7 @@ export function applySex(genome, sex, locks) {
     if (isLocked(locks, path)) continue;
     const spec = SPEC_BY_PATH.get(path);
     let v = getPath(genome, path) + sign * d;
-    if (spec) v = clamp(v, spec.min, spec.max);
+    if (spec) v = clamp(v, ...specRange(spec, genome));
     setPath(genome, path, v);
   }
   if (sex === 'female' && !isLocked(locks, 'face.beard') &&
@@ -1568,7 +1586,7 @@ export function applyRace(genome, race, locks) {
       if (isLocked(locks, path)) continue;
       const spec = SPEC_BY_PATH.get(path);
       let v = getPath(genome, path) + sign * d;
-      if (spec) v = clamp(v, spec.min, spec.max);
+      if (spec) v = clamp(v, ...specRange(spec, genome));
       setPath(genome, path, v);
     }
   };
@@ -4298,7 +4316,9 @@ export function anatomyRecipe(race = 'human') {
     return { ...SY.ANATOMY_NOTES, ...r };
   }
   const M = RACE_MODS[race];
-  if (M) return standInRecipe(M, { ...M.ANATOMY_NOTES,
+  // A race with no recipe of its own (demon.js: it is flesh) takes the
+  // human's, below.
+  if (M && M.ANATOMY) return standInRecipe(M, { ...M.ANATOMY_NOTES,
                                    ...JSON.parse(JSON.stringify(M.ANATOMY)) });
   const r = JSON.parse(JSON.stringify(ANA.DEFAULT_ANATOMY));
   return {
@@ -4690,7 +4710,9 @@ export function generateMob(genome, seed = 0, opts = {}) {
     slotMat = {};
     const names = sylvan ? SY.slotMaterialNames(g, ART)
                          : Mm2.slotMaterialNames(g, ART);
-    if (Mm2)
+    // A race whose DEFAULT_MAT is null (demon.js: flesh) names only its own
+    // slots; every other slot keeps the human's answer (`p.mat || flesh`).
+    if (Mm2 && Mm2.DEFAULT_MAT)
       for (const slot of Object.values(ART))
         if (!(slot in names)) names[slot] = Mm2.DEFAULT_MAT;
     for (const [slot, nm0] of Object.entries(names)) {
@@ -5076,6 +5098,10 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
     // jaws untouched and infects with them.
     strike: { blunt: 1.5, bite: 7.0 },
   });
+  // A race may sharpen what it is born with (demon.js: claws cut). The edges
+  // stay the human's; only the strike profile moves.
+  const Mn = raceMod(g);
+  if (Mn && Mn.patchNatural) Mn.patchNatural(g, natural);
 
   // ---- IK chains ----------------------------------------------------------
   const chains = [];
@@ -5187,7 +5213,10 @@ function buildSidecar(g, table, opts, name, hairParts = []) {
       rollAmp: 0.06, spineCounter: 0.75, phaseLag: 0.05,
     },
     limbs, sockets, natural, chains,
-    states: buildStates(),
+    // ...plus a race's base posture (demon.js extraStates: the hunch),
+    // appended AFTER every damage state so a crawl or a limp still wins.
+    states: [...buildStates(),
+             ...((raceMod(g) && raceMod(g).extraStates) ? raceMod(g).extraStates(g) : [])],
     clips,
     flipbooks: {},
     // What rolled this body. Not read by the engine; it is what lets the
@@ -5445,6 +5474,10 @@ export function presetGenome(key) {
       if (rest[pk.key] !== undefined) pk.apply(g, rest[pk.key]);
       delete rest[pk.key];
     }
+    // A race preset names a hairstyle by key (the module cannot reach
+    // HAIR_STYLES without an import cycle); applied whole, as a pick is.
+    if (rest.hairStyle) applyHairStyle(g, rest.hairStyle);
+    delete rest.hairStyle;
     merge(g, { body: bodyRest, ...rest });
   } else merge(g, p);
   g.name = key;

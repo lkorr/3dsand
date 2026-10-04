@@ -83,13 +83,21 @@ struct GlyphInventory {
   // THE DEBUG DEFAULT (plan §12a: ownership is real, the acquisition loop —
   // loot, tutors — is out of scope; Grant/Owns are its seam). Grants every
   // glyph and binds the first bank in library order.
-  void GrantAllAndBind(const GlyphLibrary& lib) {
+  //
+  // EXCEPT A DEMON'S NAME (verb `summon`, docs/PLAN_demons.md D1): a name is
+  // knowledge you have to FIND (a book, a teacher -- dialogue `grant`), so the
+  // placeholder never hands it out. `withNames` (game/demon.h
+  // DebugAllDemonNames: SANDVOX_ALL_NAMES=1) is the debug switch that does.
+  // Name glyphs are appended after every other glyph, so excluding them moves
+  // no binding in the first bank.
+  void GrantAllAndBind(const GlyphLibrary& lib, bool withNames = false) {
     owned.clear();
     for (int i = 0; i < kGlyphSlots; i++) {
       bound[i] = -1;
       page[i].clear();
     }
     for (int i = 0; i < (int)lib.glyphs.size(); i++) {
+      if (lib.glyphs[i].verb == SpellVerb::Summon && !withNames) continue;
       owned.push_back(i);
       if (i < kGlyphSlots) bound[i] = i;
     }
