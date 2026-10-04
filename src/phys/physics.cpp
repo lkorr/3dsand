@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <atomic>
+#include <unordered_set>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -31,7 +32,9 @@
 #include <Jolt/Physics/Body/AllowedDOFs.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
@@ -254,11 +257,17 @@ class PushLayerFilter final : public JPH::ObjectLayerFilter {
 // Role + owner packed into a Jolt body's user data (see Physics::BodyRole):
 // role in the low byte, owner handle above it. 0 = Debris, no owner, which is
 // what every freshly created body already carries.
+//
+// Bit 7 of the low byte is the DEAD-FLESH mark (Physics::MarkDeadFlesh): it
+// is not a role, it survives every role change (SetBodyRole and SettleBody
+// keep it) and it travels with the user data to a rebuilt or split body
+// (CarryLayer), exactly as the role does.
+constexpr uint64_t kDeadFleshBit = 0x80;
 uint64_t PackRole(Physics::BodyRole r, uint64_t owner) {
   return (uint64_t)r | ((owner & Physics::kAnyPlayer) << 8);
 }
 Physics::BodyRole UnpackRole(uint64_t ud) {
-  const uint64_t r = ud & 0xFF;
+  const uint64_t r = ud & 0x7F;
   return r < (uint64_t)Physics::BodyRole::Count ? (Physics::BodyRole)r
                                                 : Physics::BodyRole::Debris;
 }
@@ -500,7 +509,13 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     std::vector<ContactImpact>& dst = toBody ? bodyImpacts : impacts;
     if (dst.size() < kCollectCeiling) dst.push_back(ci);
   }
-  static constexpr size_t kCollectCeiling = 4096;
+  // ...and the ceiling must be one no step can reach, or the drop at it is
+  // the same race over again. It was 4096, and a 64-creature brawl with
+  // box-compound corpses (fight64 package P, before the corpse colliders)
+  // peaked at 8,056 live manifolds a step. Jolt cannot add more manifolds in
+  // a step than it has contact constraints (Physics::Init,
+  // kMaxContactConstraints), so that number makes the drop unreachable.
+  static constexpr size_t kCollectCeiling = 16384;
   // Game thread, after Update: strongest first, ties broken by every field,
   // then the per-step caps.
   void Finish() {
@@ -547,6 +562,13 @@ struct Physics::JointImpls {
   std::unordered_map<uint64_t, std::vector<uint64_t>> byBody; // body -> joints
 };
 
+// The full compounds corpse colliders replaced (Physics::CorpseColliderCount).
+struct Physics::CorpseShapes {
+  std::unordered_map<uint64_t, JPH::RefConst<JPH::Shape>> full;
+  // Bodies judged shells (ApplyCorpseCollider's fill test): keep the compound.
+  std::unordered_set<uint64_t> keep;
+};
+
 bool AntiTunnelOff(AntiTunnel part) {
   // 0 = all on. Bit 0 ccd, bit 1 lookahead, bit 2 clamp.
   static const unsigned mask = [] {
@@ -590,6 +612,116 @@ static int PhysicsWorkerThreads() {
   const int hw = (int)std::thread::hardware_concurrency();
   return std::clamp(hw / 2 - 1, 2, 7);
 }
+// ---- WHERE A JOLT STEP GOES (fight64 package P) ----------------------------
+//
+// Jolt's own profiler is a compile flag on every Jolt TU; this is the same
+// answer without one. PhysicsSystem::Update hands every unit of work to the
+// job system BY NAME ("FindCollisions", "SolveVelocityConstraints", ...), so a
+// JobSystem that forwards to the real pool and wraps each job function in two
+// clock reads attributes the whole step: per phase, the summed worker time
+// (cpu) and the span from its first job's start to its last job's end (wall).
+// The jobs a step makes are ~100, so this costs a few microseconds a step.
+//
+// REPORT ONLY: wall-clock never reaches the simulation. The job ORDER, the
+// worker count and every job's work are exactly the pool's; this only times
+// them. Jobs belong to the inner pool (Job::mJobSystem), so the protected
+// queue/free entry points of this class are never reached.
+namespace {
+int PhaseOfJob(const char* n) {
+  using P = Physics::StepPhase;
+  if (!n) return (int)P::Other;
+  auto is = [&](const char* s) { return std::strcmp(n, s) == 0; };
+  if (is("UpdateBroadPhasePrepare")) return (int)P::BroadPrepare;
+  if (is("FindCollisions")) return (int)P::FindCollisions;
+  if (is("BuildIslandsFromConstraints") || is("DetermineActiveConstraints"))
+    return (int)P::Islands;
+  if (is("ApplyGravity") || is("SetupVelocityConstraints"))
+    return (int)P::Setup;
+  if (is("FinalizeIslands") || is("BodySetIslandIndex"))
+    return (int)P::FinalizeIslands;
+  if (is("SolveVelocityConstraints")) return (int)P::SolveVelocity;
+  if (is("PreIntegrateVelocity") || is("IntegrateVelocity") ||
+      is("PostIntegrateVelocity"))
+    return (int)P::Integrate;
+  if (is("FindCCDContacts") || is("ResolveCCDContacts")) return (int)P::Ccd;
+  if (is("SolvePositionConstraints")) return (int)P::SolvePosition;
+  if (is("UpdateBroadPhaseFinalize")) return (int)P::BroadFinalize;
+  return (int)P::Other;
+}
+int64_t JobNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+struct Physics::JobProfiler final : public JPH::JobSystem {
+  explicit JobProfiler(JPH::JobSystem* inner) : inner_(inner) { Reset(); }
+  struct Slot {
+    std::atomic<int64_t> cpu{0}, first{0}, last{0};
+    std::atomic<uint32_t> jobs{0};
+  };
+  Slot slots[(int)StepPhase::Count];
+  void Reset() {
+    for (Slot& s : slots) {
+      s.cpu.store(0, std::memory_order_relaxed);
+      s.first.store(INT64_MAX, std::memory_order_relaxed);
+      s.last.store(INT64_MIN, std::memory_order_relaxed);
+      s.jobs.store(0, std::memory_order_relaxed);
+    }
+  }
+  int GetMaxConcurrency() const override { return inner_->GetMaxConcurrency(); }
+  JPH::JobHandle CreateJob(const char* name, JPH::ColorArg color,
+                           const JobFunction& fn, JPH::uint32 deps) override {
+    Slot* s = &slots[PhaseOfJob(name)];
+    return inner_->CreateJob(
+        name, color,
+        [s, fn]() {
+          const int64_t t0 = JobNowNs();
+          fn();
+          const int64_t t1 = JobNowNs();
+          s->cpu.fetch_add(t1 - t0, std::memory_order_relaxed);
+          s->jobs.fetch_add(1, std::memory_order_relaxed);
+          int64_t f = s->first.load(std::memory_order_relaxed);
+          while (t0 < f && !s->first.compare_exchange_weak(f, t0)) {
+          }
+          int64_t l = s->last.load(std::memory_order_relaxed);
+          while (t1 > l && !s->last.compare_exchange_weak(l, t1)) {
+          }
+        },
+        deps);
+  }
+  Barrier* CreateBarrier() override { return inner_->CreateBarrier(); }
+  void DestroyBarrier(Barrier* b) override { inner_->DestroyBarrier(b); }
+  void WaitForJobs(Barrier* b) override { inner_->WaitForJobs(b); }
+
+ protected:
+  // Never reached: every Job is the inner pool's and queues/frees through it.
+  void QueueJob(Job*) override { std::abort(); }
+  void QueueJobs(Job**, JPH::uint) override { std::abort(); }
+  void FreeJob(Job*) override { std::abort(); }
+
+ private:
+  JPH::JobSystem* inner_;
+};
+
+const char* Physics::StepPhaseName(StepPhase p) {
+  switch (p) {
+    case StepPhase::BroadPrepare: return "bpPrepare";
+    case StepPhase::FindCollisions: return "collide";
+    case StepPhase::Islands: return "islands";
+    case StepPhase::Setup: return "setup";
+    case StepPhase::FinalizeIslands: return "finalizeIslands";
+    case StepPhase::SolveVelocity: return "solveVel";
+    case StepPhase::Integrate: return "integrate";
+    case StepPhase::Ccd: return "ccd";
+    case StepPhase::SolvePosition: return "solvePos";
+    case StepPhase::BroadFinalize: return "bpFinalize";
+    case StepPhase::Other: return "other";
+    default: return "?";
+  }
+}
+
 constexpr JPH::uint kMaxBodyPairs = 16384;
 constexpr JPH::uint kMaxContactConstraints = 16384;
 
@@ -611,8 +743,10 @@ bool Physics::Init() {
   tempAlloc_ = std::make_unique<JPH::TempAllocatorImpl>(64 * 1024 * 1024);
   jobs_ = std::make_unique<JPH::JobSystemThreadPool>(
       JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, PhysicsWorkerThreads());
+  jobProf_ = std::make_unique<JobProfiler>(jobs_.get());
   layers_ = std::make_unique<LayerImpls>();
   joints_ = std::make_unique<JointImpls>();
+  corpse_ = std::make_unique<CorpseShapes>();
   contacts_ = std::make_unique<ContactImpls>();
 
   system_ = std::make_unique<JPH::PhysicsSystem>();
@@ -638,9 +772,11 @@ void Physics::Shutdown() {
   playerBodies_.clear();
   motionRun_.clear();
   joints_.reset();  // constraint refs drop before the system that owns bodies
+  corpse_.reset();
   system_.reset();  // ...and the system drops before the listener it points at
   contacts_.reset();
   layers_.reset();
+  jobProf_.reset();
   jobs_.reset();
   tempAlloc_.reset();
 }
@@ -1350,15 +1486,57 @@ void Physics::Step(float dt) {
                  (unsigned long long)h);
   };
   traceStates('P');
+  // CCD attribution (StepStats::ccdBodies), before Update moves anything.
+  {
+    for (uint32_t& v : lastStep_.ccdBodies) v = 0;
+    for (uint32_t& v : lastStep_.ccdCompound) v = 0;
+    const uint32_t n = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+    const JPH::BodyID* active =
+        n ? system_->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody) : nullptr;
+    const float thr = system_->GetPhysicsSettings().mLinearCastThreshold;
+    const JPH::BodyLockInterfaceNoLock& nl = system_->GetBodyLockInterfaceNoLock();
+    for (uint32_t i = 0; active && i < n; i++) {
+      JPH::BodyLockRead lock(nl, active[i]);
+      if (!lock.Succeeded()) continue;
+      const JPH::Body& body = lock.GetBody();
+      if (!body.IsDynamic() ||
+          body.GetMotionProperties()->GetMotionQuality() !=
+              JPH::EMotionQuality::LinearCast)
+        continue;
+      const float inner = body.GetShape()->GetInnerRadius();
+      const float step = body.GetLinearVelocity().Length() * dt;
+      if (!(step > thr * inner)) continue;
+      int r = (int)UnpackRole(body.GetUserData());
+      if (r < 0 || r >= kRoleCols) r = kRoleStatic;
+      lastStep_.ccdBodies[r]++;
+      if (body.GetShape()->GetSubType() == JPH::EShapeSubType::StaticCompound)
+        lastStep_.ccdCompound[r]++;
+    }
+  }
+  if (jobProf_) jobProf_->Reset();
   const auto t0 = std::chrono::steady_clock::now();
-  system_->Update(dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
-                  jobs_.get());
+  // Jolt's own overflow report: a full body-pair / manifold / constraint
+  // buffer DROPS contacts, and which ones is the job threads' race -- so a
+  // nonzero value here is a determinism hole as well as a physics one.
+  lastStep_.updateErrors = (uint32_t)system_->Update(
+      dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
+      jobProf_ ? static_cast<JPH::JobSystem*>(jobProf_.get())
+               : static_cast<JPH::JobSystem*>(jobs_.get()));
   traceStates('S');
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
   if (ms > runaway_.worstStepMs) runaway_.worstStepMs = ms;
   lastStep_.ms = ms;
+  for (int p = 0; p < (int)StepPhase::Count; p++) {
+    lastStep_.phaseWallMs[p] = lastStep_.phaseCpuMs[p] = 0.0f;
+    if (!jobProf_) continue;
+    const JobProfiler::Slot& sl = jobProf_->slots[p];
+    if (sl.jobs.load(std::memory_order_relaxed) == 0) continue;
+    lastStep_.phaseWallMs[p] =
+        (float)((double)(sl.last.load() - sl.first.load()) * 1e-6);
+    lastStep_.phaseCpuMs[p] = (float)((double)sl.cpu.load() * 1e-6);
+  }
   if (contacts_) contacts_->Finish();
   if (contacts_) {
     lastStep_.manifoldsDyn = contacts_->manifoldsDyn.load();
@@ -2301,6 +2479,9 @@ void Physics::CarryLayer(uint64_t from, uint64_t to) {
   // resolved to (and whether the body is still clearing, below).
   bi.SetUserData(toId, bi.GetUserData(fromId));
   bi.SetObjectLayer(toId, bi.GetObjectLayer(fromId));
+  // A rebuilt corpse limb (a carve, a burn) is born a fresh box compound;
+  // the role it just inherited says it collides as one convex hull.
+  ApplyCorpseCollider(to);
   bool fromPending = false, toPending = false;
   for (uint64_t h : pendingRelease_) {
     fromPending |= h == from;
@@ -2822,7 +3003,8 @@ void Physics::SettleBody(uint64_t handle) {
   // A throw that has cleared its thrower is a thing lying in the world.
   if (role == BodyRole::Thrown) {
     role = BodyRole::Debris;
-    bi.SetUserData(id, PackRole(role, owner));
+    bi.SetUserData(id, PackRole(role, owner) | (ud & kDeadFleshBit));
+    ApplyCorpseCollider(handle);
   }
   // Every layer maps to BP::MOVING, so no transition here needs a broadphase
   // rebuild.
@@ -2847,7 +3029,10 @@ void Physics::SetBodyRole(uint64_t handle, BodyRole role, uint64_t owner) {
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   const JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return;
-  bi.SetUserData(id, PackRole(role, owner));
+  bi.SetUserData(id, PackRole(role, owner) | (bi.GetUserData(id) & kDeadFleshBit));
+  // The collider follows the role (a corpse is one convex a limb), before any of
+  // the early returns below.
+  ApplyCorpseCollider(handle);
   const int slot = OwnerSlot(owner);
   auto pendingAt = std::find(pendingRelease_.begin(), pendingRelease_.end(), handle);
   const bool pending = pendingAt != pendingRelease_.end();
@@ -2995,27 +3180,30 @@ void Physics::ClearCollisionGroup(uint64_t handle) {
 
 uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
                               float maxDistVoxels, float& fraction) const {
-  fraction = 1.0f;
-  if (!system_) return 0;
-  JPH::RRayCast ray(JPH::RVec3(VoxToM(fromVoxel.x), VoxToM(fromVoxel.y),
-                               VoxToM(fromVoxel.z)),
-                    JPH::Vec3(dirNormalized.x, dirNormalized.y,
-                              dirNormalized.z) *
-                        VoxToM(maxDistVoxels));
-  JPH::RayCastResult hit;
-  // Both dynamic layers: the avatar's limbs sit on AVATAR rather than MOVING
-  // so they cannot shove the player proxy, but a laser must still be able to
-  // hit them — the split is about CONTACTS, not about visibility to queries.
-  DynamicLayerFilter dynamicOnly;
-  if (!system_->GetNarrowPhaseQuery().CastRay(ray, hit, {}, dynamicOnly))
-    return 0;
-  fraction = hit.mFraction;
-  return FromBodyID(hit.mBodyID);
+  return CastRayImpl(fromVoxel, dirNormalized, maxDistVoxels, fraction, nullptr);
 }
 
 uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
                               float maxDistVoxels, float& fraction,
                               const std::vector<uint64_t>& ignore) const {
+  return CastRayImpl(fromVoxel, dirNormalized, maxDistVoxels, fraction, &ignore);
+}
+
+// THE QUERY SEES THE CORPSE'S VOXELS, NOT ITS HULL. A corpse limb collides as
+// the convex hull of its compound (ApplyCorpseCollider), and a ray that
+// stopped at that hull would let a blade probe or a laser strike the filled-in
+// crook of an L-shaped limb -- a carve that finds no voxel, a cut that lands
+// on air. So a hit on a corpse collider is re-cast against the compound it
+// replaced, in the body's centre-of-mass frame (the two shapes share it), and
+// the body is then skipped for the next closest hit: the hull contains the
+// compound, so the true hit is never nearer than the hull's, and anything
+// lying between the two is found by the next pass. Bounded: each pass skips
+// one more corpse, and the loop stops the moment the next hit is no nearer
+// than the best exact one. A ray that meets no corpse costs exactly the one
+// cast it always did.
+uint64_t Physics::CastRayImpl(Vec3 fromVoxel, Vec3 dirNormalized,
+                              float maxDistVoxels, float& fraction,
+                              const std::vector<uint64_t>* ignore) const {
   fraction = 1.0f;
   if (!system_) return 0;
   JPH::RRayCast ray(JPH::RVec3(VoxToM(fromVoxel.x), VoxToM(fromVoxel.y),
@@ -3023,16 +3211,176 @@ uint64_t Physics::CastRayBody(Vec3 fromVoxel, Vec3 dirNormalized,
                     JPH::Vec3(dirNormalized.x, dirNormalized.y,
                               dirNormalized.z) *
                         VoxToM(maxDistVoxels));
-  JPH::RayCastResult hit;
+  // Both dynamic layers: the avatar's limbs sit on AVATAR rather than MOVING
+  // so they cannot shove the player proxy, but a laser must still be able to
+  // hit them — the split is about CONTACTS, not about visibility to queries.
   DynamicLayerFilter dynamicOnly;
   JPH::IgnoreMultipleBodiesFilter skip;
-  skip.Reserve((JPH::uint)ignore.size());
-  for (uint64_t h : ignore)
-    if (h) skip.IgnoreBody(ToBodyID(h));
-  if (!system_->GetNarrowPhaseQuery().CastRay(ray, hit, {}, dynamicOnly, skip))
-    return 0;
-  fraction = hit.mFraction;
-  return FromBodyID(hit.mBodyID);
+  skip.Reserve((JPH::uint)(ignore ? ignore->size() : 0) + 4);
+  if (ignore)
+    for (uint64_t h : *ignore)
+      if (h) skip.IgnoreBody(ToBodyID(h));
+  const JPH::NarrowPhaseQuery& npq = system_->GetNarrowPhaseQuery();
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  constexpr int kMaxCorpseSkips = 8;
+  float bestF = 2.0f;
+  uint64_t best = 0;
+  for (int pass = 0; pass <= kMaxCorpseSkips; pass++) {
+    JPH::RayCastResult hit;
+    if (!npq.CastRay(ray, hit, {}, dynamicOnly, skip) || hit.mFraction >= bestF)
+      break;
+    const uint64_t h = FromBodyID(hit.mBodyID);
+    const auto it = corpse_ ? corpse_->full.find(h)
+                            : std::unordered_map<uint64_t, JPH::RefConst<JPH::Shape>>::iterator{};
+    if (!corpse_ || it == corpse_->full.end()) {
+      bestF = hit.mFraction;
+      best = h;
+      break;
+    }
+    const JPH::RMat44 toLocal =
+        bi.GetCenterOfMassTransform(hit.mBodyID).InversedRotationTranslation();
+    const JPH::RayCast local = JPH::RayCast(ray).Transformed(toLocal);
+    JPH::RayCastResult exact;
+    if (it->second->CastRay(local, JPH::SubShapeIDCreator(), exact) &&
+        exact.mFraction < bestF) {
+      bestF = exact.mFraction;
+      best = h;
+    }
+    skip.IgnoreBody(hit.mBodyID);
+  }
+  if (best == 0) return 0;
+  fraction = bestF;
+  return best;
+}
+
+// ---- the corpse collider (physics.h, CorpseColliderCount) -----------------
+static bool CorpseCompoundKept() {
+  static const bool kKeep = [] {
+    const char* e = std::getenv("SANDVOX_CORPSE_COMPOUND");
+    return e && e[0] != '0';
+  }();
+  return kKeep;
+}
+void Physics::MarkDeadFlesh(uint64_t handle) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  bi.SetUserData(id, bi.GetUserData(id) | kDeadFleshBit);
+  ApplyCorpseCollider(handle);
+}
+
+uint32_t Physics::CorpseColliderCount() const {
+  return corpse_ ? (uint32_t)corpse_->full.size() : 0u;
+}
+
+bool Physics::IsCorpseCollider(uint64_t handle) const {
+  return corpse_ && corpse_->full.count(handle) != 0;
+}
+
+void Physics::ApplyCorpseCollider(uint64_t handle) {
+  if (!system_ || !corpse_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  // Dead flesh lying loose: a corpse's limbs (RigDead), a limb in its sever
+  // hold, and debris that was once a creature (MarkDeadFlesh) while it lies in
+  // the world -- not while somebody carries or throws it, where the grab and
+  // throw code meet the shape they were written against.
+  const uint64_t ud = bi.GetUserData(id);
+  const BodyRole role = UnpackRole(ud);
+  const bool want =
+      !CorpseCompoundKept() &&
+      (role == BodyRole::RigDead || role == BodyRole::SeveredHold ||
+       ((ud & kDeadFleshBit) != 0 && role == BodyRole::Debris));
+  auto it = corpse_->full.find(handle);
+  if (!want) {
+    // Leaving the dead (a zombie rising, a limb grabbed): the compound back,
+    // under the same untouched mass properties.
+    if (it == corpse_->full.end()) return;
+    bi.SetShape(id, it->second.GetPtr(), false, JPH::EActivation::DontActivate);
+    corpse_->full.erase(it);
+    return;
+  }
+  if (it != corpse_->full.end()) return;
+  if (corpse_->keep.count(handle)) return;   // a shell: judged once, below
+  JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
+  // A one-box limb is already convex (Jolt unwraps a one-shape compound).
+  if (!shape || shape->GetSubType() != JPH::EShapeSubType::StaticCompound)
+    return;
+  const auto* compound =
+      static_cast<const JPH::StaticCompoundShape*>(shape.GetPtr());
+  if (compound->GetNumSubShapes() < 2) return;
+  // THE CONVEX HULL OF THE LIMB'S VOXELS, built from the corners of the
+  // compound's own boxes, in the shape's creation space.
+  //
+  // A HULL, NOT A FITTED BOX (measured 2026-10-04, `corpse-sleep`). A hull's
+  // support in EVERY direction is a voxel corner, so it never reaches past the
+  // voxels toward a plane in any orientation -- against the ground it
+  // penetrates exactly as deep as the compound did. A box fitted in the limb's
+  // frame does not have that property: rotated, its corners stand off the
+  // voxels, and the moment a dying creature's limbs were swapped to boxes a
+  // corner of one sat deep in the terrain sheet, the depenetration pushed it
+  // through the back face, and the corpse fell 95 voxels into the ground. The
+  // hull keeps the box's cost class (one convex, one GJK per pair) and only
+  // fills the limb's concavities -- which is why a SHELL is refused below.
+  const JPH::Vec3 com = shape->GetCenterOfMass();
+  float radius = 0.0f;
+  JPH::Array<JPH::Vec3> pts;
+  pts.reserve((size_t)compound->GetNumSubShapes() * 8);
+  float boxVol = 0.0f;   // the voxels' own volume (boxes of a merge are disjoint)
+  for (JPH::uint i = 0; i < compound->GetNumSubShapes(); i++) {
+    const JPH::CompoundShape::SubShape& ss = compound->GetSubShape(i);
+    if (ss.mShape->GetSubType() != JPH::EShapeSubType::Box) return;
+    const auto* sb = static_cast<const JPH::BoxShape*>(ss.mShape.GetPtr());
+    if (i == 0) radius = sb->GetConvexRadius();
+    const JPH::Vec3 p = ss.GetPositionCOM() + com, h = sb->GetHalfExtent();
+    boxVol += 8.0f * h.GetX() * h.GetY() * h.GetZ();
+    for (int k = 0; k < 8; k++)
+      pts.push_back(p + JPH::Vec3(k & 1 ? h.GetX() : -h.GetX(),
+                                  k & 2 ? h.GetY() : -h.GetY(),
+                                  k & 4 ? h.GetZ() : -h.GetZ()));
+  }
+  // Shared corners of neighbouring boxes are exact duplicates (voxel lattice
+  // coordinates); drop them so the hull builder sees each point once. Sorted
+  // by value, so the input -- and the hull -- is a function of the boxes.
+  std::sort(pts.begin(), pts.end(), [](JPH::Vec3Arg a, JPH::Vec3Arg b) {
+    if (a.GetX() != b.GetX()) return a.GetX() < b.GetX();
+    if (a.GetY() != b.GetY()) return a.GetY() < b.GetY();
+    return a.GetZ() < b.GetZ();
+  });
+  pts.erase(std::unique(pts.begin(), pts.end(),
+                        [](JPH::Vec3Arg a, JPH::Vec3Arg b) { return a == b; }),
+            pts.end());
+  JPH::RefConst<JPH::Shape> convex;
+  {
+    JPH::ConvexHullShapeSettings hs(pts, radius);
+    JPH::ShapeSettings::ShapeResult hr = hs.Create();
+    if (hr.IsValid()) convex = hr.Get();
+  }
+  // A SHELL KEEPS ITS COMPOUND. Hair, a mane, a worn plate: a thin layer
+  // wrapped round another limb, whose hull is the whole head or torso it
+  // wraps, so as a hull it would meet the world everywhere the shell is not.
+  // Measured (`corpse-head-laser`): a dead human's hair cap as a hull drifted
+  // 0.354 vox on its Fixed joint against 0.031 as boxes (cap 0.05). The test
+  // is geometric -- the voxels fill less than kHullMinFill of their hull --
+  // so it needs no caller to say what a limb is. Judged once per body (a
+  // rebuilt body is a new handle and is judged again). Jolt refusing the hull
+  // is the same answer.
+  constexpr float kHullMinFill = 0.5f;
+  if (!convex || boxVol < kHullMinFill * convex->GetVolume()) {
+    corpse_->keep.insert(handle);
+    return;
+  }
+  // The centre of mass pinned back where the compound had it
+  // (OffsetCenterOfMass), so SetShape leaves the body where it is and -- mass
+  // properties NOT recomputed -- the body keeps the mass and inertia of its
+  // voxels: a corpse falls and tumbles as it did, only what it touches is
+  // simpler.
+  JPH::Ref<JPH::Shape> fitted = new JPH::OffsetCenterOfMassShape(
+      convex.GetPtr(), com - convex->GetCenterOfMass());
+  bi.SetShape(id, fitted.GetPtr(), false, JPH::EActivation::DontActivate);
+  corpse_->full.emplace(handle, shape);
 }
 
 void Physics::RemoveBody(uint64_t handle) {
@@ -3052,6 +3400,10 @@ void Physics::RemoveBody(uint64_t handle) {
   // to whatever is created next in its slot, and that body would be cut on its
   // fifth bad step instead of its forty-fifth.
   hotSteps_.erase(id.GetIndex());
+  if (corpse_) {
+    corpse_->full.erase(handle);
+    corpse_->keep.erase(handle);
+  }
   const auto tr0 = std::chrono::steady_clock::now();
   bi.RemoveBody(id);
   bi.DestroyBody(id);
@@ -3137,6 +3489,19 @@ size_t Physics::GetSubShapeBoxes(uint64_t handle,
     JPH::Vec3 half = box->GetHalfExtent();
     SubShapeBox b;
     b.center = Vec3{com.GetX() * inv, com.GetY() * inv, com.GetZ() * inv};
+    b.halfExtents = Vec3{half.GetX() * inv, half.GetY() * inv,
+                         half.GetZ() * inv};
+    b.quat[0] = 0; b.quat[1] = 0; b.quat[2] = 0; b.quat[3] = 1;
+    out.push_back(b);
+    return 1;
+  }
+
+  // A corpse collider (ApplyCorpseCollider) is one convex: its bounds.
+  if (shape->GetSubType() == JPH::EShapeSubType::OffsetCenterOfMass) {
+    const JPH::AABox lb = shape->GetLocalBounds();
+    const JPH::Vec3 c = lb.GetCenter() + com, half = lb.GetExtent();
+    SubShapeBox b;
+    b.center = Vec3{c.GetX() * inv, c.GetY() * inv, c.GetZ() * inv};
     b.halfExtents = Vec3{half.GetX() * inv, half.GetY() * inv,
                          half.GetZ() * inv};
     b.quat[0] = 0; b.quat[1] = 0; b.quat[2] = 0; b.quat[3] = 1;
