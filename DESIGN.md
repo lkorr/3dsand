@@ -2557,7 +2557,19 @@ held charge is SOLVED as the world would solve the same voxels:
 - *Cost.* Nothing when nothing is charged (no answers); a charged body pays a
   pass over its voxels every 4th tick (the binning only on a geometry change),
   a few hundred cells of solve and the rolls. `ShockStats()` carries the counts and the wall
-  time (`applyNanos`); `elec-crowd` reports it per tick.
+  time (`applyNanos`, `refreshNanos`); `elec-crowd` reports it per tick.
+- *For the renderer.* `Mob::ElecSlotCharge(slot, tick)`: the highest P any
+  cell of a rig slot reached in the last solve (0 when stale or uncharged) --
+  what a charged-body glow would read; the render side is not built.
+- *Gates.* `elec-crowd`: `MaxLiveMobs()` humans, the last two rows in a
+  lightning-fed basin -- every one in the water shocked, none on the pad,
+  nothing refused. `elec-body-matter` (clear sky pinned): barefoot shocked,
+  dry leather shoes insulate, iron sabatons conduct, a sylvan on a
+  LIGHTNING-fed plate feels nothing and chars (dry wood 1,500 takes nothing
+  from an arc plate, world or body), a soaked android's circuitry feels it.
+  With package A's spreading loss, `elec-stun` A is fed by an arc (a spark
+  plate is P ~50 under the zombie, below `shockMinP`) and `elec-water-mob` B's
+  armoured human wears iron SABATONS (metal counts where the current runs).
 
 **Scale, at the defaults.** A spark (200) on a copper plate: ~0.3 hp a tick a
 foot, a 6-tick stun -- it barely hurts. A lightning-fed pond (~30,000): the cap,

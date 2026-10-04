@@ -843,9 +843,14 @@ Status GateElecCrowd(Ctx& c, std::string& detail) {
         if (wall) Put(f.build, xx, yy, zz, mStone);
         else if (yy <= f.y + 2) Put(f.fill, xx, yy, zz, PackVoxNew(mWater, 7));
     }
-  // Bolts' feet along the basin floor, every eight cells (the charge reaches
-  // every wet body, whatever spreading loss the field grows).
-  for (int xx = bx0 + 1; xx <= bx1; xx += 8) Put(f.feed, xx, f.y, bz0, mLight);
+  // A bolt's foot on the basin floor two cells in front of EVERY wet body:
+  // this gate is about the QUERY answering the whole crowd, not about how
+  // far a basin carries charge (package A's spreading loss and the steam a
+  // bolt boils off decide that, and elec-bulk measures it), so each wet body
+  // gets charge within reach whatever the field does further out.
+  for (int row = rows - wetRows; row < rows; row++)
+    for (int col = 0; col < cols; col++)
+      Put(f.feed, colX(col), f.y, rowZ(row) - 2, mLight);
   uint32_t t = 88000;
   support::TickRig rig(c, t, f.chunk);
   BuildFix(rig, f);

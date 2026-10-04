@@ -117,6 +117,8 @@ constexpr uint16_t kIns = (uint16_t)kElecResistInsulator;   // 4095: no conducti
 // salts: a body cell's crackle and ignition roll as a world cell's do.
 constexpr uint32_t kElecCrackleCap = 200000u;
 constexpr uint32_t kOhmSalt = 0x0B0D1E5u, kCrackleSalt = 0x0C2AC1Eu;
+// The poses a body keeps for its answers in flight: K + 1 ticks and slack.
+constexpr uint32_t kElecPoseRing = World::kSnapshotLatency + 3;
 // Shell-lattice steps the cover ray may take: one world cell at the finest
 // art scale (8 a cell) and then some.
 constexpr int kCoverMarchMax = 24;
@@ -211,8 +213,18 @@ void MobSystem::QueueShockQueries(uint32_t tick, World& world) {
     BodyBox(mn, mx, q.lo, q.hi);
     q.mobId = m.id_;
     q.limb = -1;
-    if (world.QueueElecQuery(q, /*wantGrid=*/true)) shockCounters_.queued++;
-    else shockCounters_.refused++;
+    if (!world.QueueElecQuery(q, /*wantGrid=*/true)) {
+      shockCounters_.refused++;
+      return;
+    }
+    shockCounters_.queued++;
+    // The pose it asked with, for the answer K + 1 ticks from now.
+    if (m.elecPoses_.size() != kElecPoseRing) m.elecPoses_.resize(kElecPoseRing);
+    Mob::ElecPose& e = m.elecPoses_[tick % kElecPoseRing];
+    e.tick = tick;
+    e.valid = true;
+    e.xf.resize(m.limbs_.size());
+    for (size_t li = 0; li < m.limbs_.size(); li++) e.xf[li] = m.limbs_[li].xf;
   };
   // The players first: a crowd that fills the boxes or the grid budget
   // refuses NPCs (counted by World::QueueElecQuery), never the player.
@@ -326,6 +338,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     int32_t cell = -1;      // index into the slot's ElecSlotCache::cells
     IVec3 w{};              // the world cell it sits in, this pose
     Vec3 at{};              // ...and its centre, in world voxels
+    Vec3 atNow{};           // its centre under the CURRENT pose (the cover ray)
     uint16_t bulk = kIns, entry = kIns;
     uint16_t spreadQ = 0;   // the spreading loss of entering it, /4096 of what arrives
   };
@@ -335,6 +348,13 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     Mob& m = *p.m;
     if (m.elecCache_.size() != m.limbs_.size()) m.elecCache_.resize(m.limbs_.size());
     p.slotBase.assign(m.limbs_.size(), -1);
+    // The pose of the tick the box was asked on (Mob::elecPoses_), so the
+    // body's cells meet the grid where the body WAS; the current pose when
+    // that tick's is gone (a linked body never asked with a grid, a ring
+    // overrun).
+    const Mob::ElecPose* pose = nullptr;
+    for (const Mob::ElecPose& e : m.elecPoses_)
+      if (e.valid && p.hit && e.tick == p.hit->tick && e.xf.size() == m.limbs_.size()) pose = &e;
     for (int li = 0; li < (int)m.limbs_.size(); li++) {
       MobLimb& L = m.limbs_[li];
       if (!L.body) continue;
@@ -351,17 +371,20 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
                                          .count();
       if (c.cells.empty()) continue;
       p.slotBase[li] = (int32_t)nodes.size();
-      const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
+      const BodyTransform& xf = pose ? pose->xf[li] : *v.xf;
+      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+      const Quat qNow{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
       for (size_t ci = 0; ci < c.cells.size(); ci++) {
         const ElecBodyCell& e = c.cells[ci];
-        const Vec3 w = v.xf->pos + QuatRotate(q, Vec3{(float)e.c[0] + 0.5f, (float)e.c[1] + 0.5f,
-                                                      (float)e.c[2] + 0.5f});
+        const Vec3 local{(float)e.c[0] + 0.5f, (float)e.c[1] + 0.5f, (float)e.c[2] + 0.5f};
+        const Vec3 w = xf.pos + QuatRotate(q, local);
         Node nd;
         nd.part = pi;
         nd.slot = li;
         nd.cell = (int32_t)ci;
         nd.w = {ifloor(w.x), ifloor(w.y), ifloor(w.z)};
         nd.at = w;
+        nd.atNow = v.xf->pos + QuatRotate(qNow, local);
         nd.bulk = e.bulk;
         nd.entry = e.entry;
         nodes.push_back(nd);
@@ -453,7 +476,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       bool behind = body && shellAt(n);
       if (body && !behind && owner.LimbHasShells(nd.slot)) {
         uint32_t sm = 0;
-        behind = owner.WornShellAlong(nd.slot, nd.at, Vec3{(float)d.x, (float)d.y, (float)d.z},
+        behind = owner.WornShellAlong(nd.slot, nd.atNow, Vec3{(float)d.x, (float)d.y, (float)d.z},
                                       1.0f, kCoverMarchMax, &sm, nullptr) >= 0;
       }
       if (behind) owner.shock_.covered++;
@@ -495,6 +518,32 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
                     dc.cells[nd.cell].c[0], dc.cells[nd.cell].c[1], dc.cells[nd.cell].c[2], nd.w.x,
                     nd.w.y, nd.w.z, nd.entry, nd.bulk, wp, seed, mats.c_str());
       }
+    }
+  }
+  // SANDVOX_SHOCK_DEBUG=1: a CHARGED box whose body took no seed -- where the
+  // body sits in its box and what the grid holds under its lowest cell.
+  if (std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr) {
+    for (uint32_t pi = 0; pi < parts.size(); pi++) {
+      if (!parts[pi].charged) continue;
+      bool any = false;
+      int lowY = INT_MAX;
+      IVec3 low{};
+      for (uint32_t k = 0; k < nodes.size(); k++) {
+        if (nodes[k].part != pi) continue;
+        any = any || P[k] > 0;
+        if (nodes[k].w.y < lowY) {
+          lowY = nodes[k].w.y;
+          low = nodes[k].w;
+        }
+      }
+      if (any || parts[pi].m->shock_.ticks != 0) continue;
+      const ElecHit* h = parts[pi].hit;
+      std::printf("shock-debug: tick %u mob %llu UNSEEDED: box P %u, %u charged cells, sum %u, "
+                  "lo (%d,%d,%d) dims %dx%dx%d, grid %zu cells; lowest body cell (%d,%d,%d) "
+                  "grid there %04x, below %04x\n",
+                  tick, (unsigned long long)parts[pi].m->id_, h->maxP, h->charged, h->sumP,
+                  h->lo[0], h->lo[1], h->lo[2], h->dims[0], h->dims[1], h->dims[2], h->grid.size(),
+                  low.x, low.y, low.z, GridWord(h, low), GridWord(h, {low.x, low.y - 1, low.z}));
     }
   }
   while (!pq.empty()) {

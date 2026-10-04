@@ -4752,6 +4752,18 @@ class Mob {
   // cells reached, and the tick of that solve (ElecSlotCharge).
   std::vector<uint32_t> elecSlotP_;
   uint32_t elecSolveTick_ = 0;
+  // THE POSE THE BODY ASKED WITH: every rig slot's transform on each tick its
+  // box was queued, kept for the K + 1 ticks the answer takes
+  // (World::kSnapshotLatency). The conduction places the body's cells in the
+  // answer's grid with the pose of the SAME tick -- a body moving a cell a
+  // tick (falling, wading, knocked down) otherwise reads the field where it no
+  // longer is. A small ring, keyed by tick; derived, never saved.
+  struct ElecPose {
+    uint32_t tick = 0;
+    bool valid = false;
+    std::vector<BodyTransform> xf;
+  };
+  std::vector<ElecPose> elecPoses_;
   float burnFrac_ = 0.0f;
   float burnCap_ = 1.0f;
   // The lattice changed since burnFrac_ was taken. Set by the burn pass and by
