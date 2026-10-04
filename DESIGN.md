@@ -7083,21 +7083,24 @@ neighbors, so this needs an explicit connectivity pass:
      race), read 0 in every arm measured. Unattributed: the corpse-heavy
      COMPOUND arm ended 9, 10 or 11 alive across builds with no change on its
      path, while two runs of one build always agreed.
-  Measured (`SANDVOX_RUN_EXCLUSIVE=1`, same binary, compound arm vs hull):
-  natural fight Jolt 27.3 -> 1.7 ms a tick (tick wall 73.8 -> 44.2), but the
-  hull fight also had fewer corpses (6.3 vs 2.4 dead rigs mean), so the fair
-  number is the corpse-heavy arm (`killEvery 4`, 11.0 vs 10.9 dead rigs
-  mean): Jolt 34.5 -> 13.1 ms, collide 10.8 -> 4.4 wall, ccd 18.5 -> 7.3,
-  solveVel 3.6 -> 1.0; living-vs-corpse manifolds 933 -> 155. **Side effect,
-  gameplay-visible:** `MobSystem::ApplyContactDamage` bills a blow per
-  listener report, i.e. per sub-shape pair, so a flying gib with a box
-  compound hit N times for one touch; as one convex it hits fewer. Billed
-  loose-body blows in the corpse-heavy arm 790 -> 363, and 11 -> 34 alive at
-  the end. Billing once per (limb, body) pair a step is the principled fix
-  and is a mob.cpp change, proposed rather than made. What is left in that
-  arm: CCD (corpse limbs kicked faster than 0.75 × their inner radius a step,
-  ~55 a step, plus debris and limp living rigs), and living-vs-limp-living
-  contacts (limp rigs keep their compounds: they get up again).
+  Measured (`SANDVOX_RUN_EXCLUSIVE=1`, one non-LTO binary, compound arm vs
+  hull; the compound arm reproduces main's exe exactly). Natural fight, 6.3
+  vs 6.1 dead rigs mean: Jolt 26.5 -> 10.5 ms a tick (collide 8.1 -> 2.8
+  wall, solveVel 2.9 -> 0.8, ccd 14.5 -> 6.4), body-body manifolds 2,768 ->
+  706, living-vs-corpse 1,497 -> 251; tick wall 84.2 -> 58.8 ms. Corpse-heavy
+  arm (`killEvery 4`, 11.0 vs 10.9 dead rigs mean): Jolt 32.4 -> 17.6 ms.
+  **Side effect, gameplay-visible:** `MobSystem::ApplyContactDamage` bills a
+  blow per listener report, i.e. per sub-shape pair, so a flying gib with a
+  box compound hit N times for one touch; as one convex it hits fewer.
+  Billed loose-body blows 407 -> 207 (natural), 796 -> 660 (corpse-heavy, 11
+  -> 30 alive at the end). Billing once per (limb, body) pair a step is the
+  principled fix and is a mob.cpp change, proposed rather than made. What is
+  left: the linear cast is now the largest phase (6.4 ms natural, 10.2
+  corpse-heavy) -- dead flesh shoved by living kinematic limbs past 0.75 x
+  its inner radius a step casts against the crowd's kinematic compounds;
+  CCD exists for the terrain sheet, but Jolt's cast cannot be told to skip
+  kinematic bodies. Hulls for LIMP living rigs too were measured (17.2 vs
+  17.6 ms, corpse-heavy) and are not worth the behaviour change.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an

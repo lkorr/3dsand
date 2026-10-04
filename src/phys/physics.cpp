@@ -3261,19 +3261,6 @@ static bool CorpseCompoundKept() {
   }();
   return kKeep;
 }
-// SANDVOX_LIMP_HULL=1: a LIVING creature's limp limbs (RigLimp, knocked down,
-// will get up) collide as hulls too. OFF by default -- the owner asked for
-// corpses; this is the measured arm of a proposal (PLAN_fight64_perf.md
-// package P report): limp living rigs are the compound casters left in
-// Jolt's linear cast once the dead are convex.
-static bool LimpHullArm() {
-  static const bool kOn = [] {
-    const char* e = std::getenv("SANDVOX_LIMP_HULL");
-    return e && e[0] != '0';
-  }();
-  return kOn;
-}
-
 void Physics::MarkDeadFlesh(uint64_t handle) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
@@ -3305,8 +3292,7 @@ void Physics::ApplyCorpseCollider(uint64_t handle) {
   const bool want =
       !CorpseCompoundKept() &&
       (role == BodyRole::RigDead || role == BodyRole::SeveredHold ||
-       ((ud & kDeadFleshBit) != 0 && role == BodyRole::Debris) ||
-       (role == BodyRole::RigLimp && LimpHullArm()));
+       ((ud & kDeadFleshBit) != 0 && role == BodyRole::Debris));
   auto it = corpse_->full.find(handle);
   if (!want) {
     // Leaving the dead (a zombie rising, a limb grabbed): the compound back,
