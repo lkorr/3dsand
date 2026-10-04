@@ -419,12 +419,15 @@ Status GateElecStun(Ctx& c, std::string& detail) {
     const uint64_t dropped0 = c.mobs.ShockAttacksDropped();
     Vec3 anchor{};
     bool haveAnchor = false;
-    // The pulse (three ticks of spark), then watch until the stun has been
+    // The pulse (elecStun.pulseTicks of arc: an arc decays ~70% a tick in the
+    // CA, often before the field reads it, so three ticks of it can light
+    // nothing), then watch until the stun has been
     // over for recoverMax ticks.
-    const int budget = 3 + stunTicks + 60 + recoverMax;
+    const int pulse = (int)BaselineNumber("elecStun.pulseTicks", 6);
+    const int budget = pulse + stunTicks + 60 + recoverMax;
     for (int i = 0; i < budget; i++) {
       c.mobs.ClearAttackRequests();
-      Tick(rig, i < 3 ? f.feed : std::vector<CellOp>{});
+      Tick(rig, i < pulse ? f.feed : std::vector<CellOp>{});
       Mob* z = c.mobs.FindMobById(zombie);
       if (!z || !c.mobs.IsAlive(zombie)) break;
       ragdolledA |= z->Ragdolled();
@@ -499,7 +502,7 @@ Status GateElecStun(Ctx& c, std::string& detail) {
   RecordObserved("elecStun.stunnedTicks", stunned);
   RecordObserved("elecStun.recoverTicks", recoverAt);
   detail = Format(
-      "A zombie on a spark-fed plate: %d attacks in %d ticks before; stunned %d ticks (floor %d) "
+      "A zombie on an arc-fed plate: %d attacks in %d ticks before; stunned %d ticks (floor %d) "
       "with %d attacks, %llu refused by the stun, %d stroke ticks, moved %.2f vox, %u twitches, "
       "%s; attacked again %d ticks after (%d after in all) [%s] | B lightning-fed plate: [%s]%s%s",
       preAttacks, preTicks, stunned, stunTicks, stunAttacks, (unsigned long long)dropped,

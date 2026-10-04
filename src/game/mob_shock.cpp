@@ -119,9 +119,9 @@ constexpr uint32_t kElecCrackleCap = 200000u;
 constexpr uint32_t kOhmSalt = 0x0B0D1E5u, kCrackleSalt = 0x0C2AC1Eu;
 // The poses a body keeps for its answers in flight: K + 1 ticks and slack.
 constexpr uint32_t kElecPoseRing = World::kSnapshotLatency + 3;
-// Shell-lattice steps the cover ray may take: one world cell at the finest
+// Shell-lattice steps the cover ray may take: two world cells at the finest
 // art scale (8 a cell) and then some.
-constexpr int kCoverMarchMax = 24;
+constexpr int kCoverMarchMax = 40;
 
 // The world box of one rig slot's collider under its current pose. The stain
 // pass walks the same box (MobSystem::StainOneLimb's "IS ANYTHING THERE?").
@@ -465,22 +465,39 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       continue;
     }
     uint32_t wp = GridWord(parts[nd.part].hit, nd.w) & kElecQueryGridPMax;
+    // CONTACT: the six face cells, and -- across ONE air cell no part of this
+    // body fills -- the cell beyond. A body cell is a world-pitch BIN of
+    // voxels placed by its centre, so a sole resting on a plate can bin a
+    // cell above the one touching it (measured: elec-stun's zombie, every
+    // foot cell one air cell over the copper). Wave 1 dilated each limb box
+    // by a cell for the same reason; this is that slack, and no more.
     for (const IVec3& d : kFace6) {
-      const IVec3 n{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
-      const uint32_t pn = GridWord(parts[nd.part].hit, n) & kElecQueryGridPMax;
-      if (pn <= wp) continue;
-      // A shell cell in that world cell, or a shell met on the way there
-      // (Mob::WornShellAlong, the burn pass's ray: a limb is a rounded tube
-      // in a garment cut to its box, and the two lattices' world-pitch
-      // cells need not line up).
-      bool behind = body && shellAt(n);
-      if (body && !behind && owner.LimbHasShells(nd.slot)) {
-        uint32_t sm = 0;
-        behind = owner.WornShellAlong(nd.slot, nd.atNow, Vec3{(float)d.x, (float)d.y, (float)d.z},
-                                      1.0f, kCoverMarchMax, &sm, nullptr) >= 0;
+      const IVec3 n1{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
+      for (int step = 1; step <= 2; step++) {
+        const IVec3 n = step == 1 ? n1 : IVec3{n1.x + d.x, n1.y + d.y, n1.z + d.z};
+        if (step == 2) {
+          // Only across air, and not into the body's own cells.
+          if ((GridWord(parts[nd.part].hit, n1) & kElecQueryGridAir) == 0) break;
+          bool own = false;
+          const auto r = cellRange(n1);
+          for (auto it = r.first; it != r.second && !own; ++it) own = nodes[it->second].part == nd.part;
+          if (own) break;
+        }
+        const uint32_t pn = GridWord(parts[nd.part].hit, n) & kElecQueryGridPMax;
+        if (pn <= wp) continue;
+        // A shell cell in the way, or a shell met on the way there
+        // (Mob::WornShellAlong, the burn pass's ray: a limb is a rounded tube
+        // in a garment cut to its box, and the two lattices' world-pitch
+        // cells need not line up).
+        bool behind = body && (shellAt(n1) || (step == 2 && shellAt(n)));
+        if (body && !behind && owner.LimbHasShells(nd.slot)) {
+          uint32_t sm = 0;
+          behind = owner.WornShellAlong(nd.slot, nd.atNow, Vec3{(float)d.x, (float)d.y, (float)d.z},
+                                        (float)step, kCoverMarchMax, &sm, nullptr) >= 0;
+        }
+        if (behind) owner.shock_.covered++;
+        else wp = pn;
       }
-      if (behind) owner.shock_.covered++;
-      else wp = pn;
     }
     const int32_t seed =
         (int32_t)wp - (int32_t)nd.entry - (int32_t)(((uint64_t)wp * nd.spreadQ) >> 12);
@@ -522,7 +539,8 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
   }
   // SANDVOX_SHOCK_DEBUG=1: a CHARGED box whose body took no seed -- where the
   // body sits in its box and what the grid holds under its lowest cell.
-  if (std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr) {
+  static const bool shockDebug = std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr;
+  if (shockDebug) {
     for (uint32_t pi = 0; pi < parts.size(); pi++) {
       if (!parts[pi].charged) continue;
       bool any = false;
@@ -544,6 +562,53 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
                   tick, (unsigned long long)parts[pi].m->id_, h->maxP, h->charged, h->sumP,
                   h->lo[0], h->lo[1], h->lo[2], h->dims[0], h->dims[1], h->dims[2], h->grid.size(),
                   low.x, low.y, low.z, GridWord(h, low), GridWord(h, {low.x, low.y - 1, low.z}));
+      // Where the charge IS in the box, and the body cell nearest it.
+      IVec3 cmn{INT_MAX, INT_MAX, INT_MAX}, cmx{INT_MIN, INT_MIN, INT_MIN};
+      for (int z = 0; z < h->dims[2]; z++)
+        for (int y = 0; y < h->dims[1]; y++)
+          for (int x = 0; x < h->dims[0]; x++) {
+            const IVec3 cc{h->lo[0] + x, h->lo[1] + y, h->lo[2] + z};
+            if ((GridWord(h, cc) & kElecQueryGridPMax) == 0) continue;
+            cmn = {std::min(cmn.x, cc.x), std::min(cmn.y, cc.y), std::min(cmn.z, cc.z)};
+            cmx = {std::max(cmx.x, cc.x), std::max(cmx.y, cc.y), std::max(cmx.z, cc.z)};
+          }
+      int best = INT_MAX;
+      IVec3 bw{};
+      int bslot = -1;
+      for (uint32_t k = 0; k < nodes.size(); k++) {
+        if (nodes[k].part != pi) continue;
+        const IVec3 w = nodes[k].w;
+        const int dx = std::max({cmn.x - w.x, 0, w.x - cmx.x}), dy = std::max({cmn.y - w.y, 0, w.y - cmx.y}),
+                  dz = std::max({cmn.z - w.z, 0, w.z - cmx.z});
+        if (dx + dy + dz < best) {
+          best = dx + dy + dz;
+          bw = w;
+          bslot = nodes[k].slot;
+        }
+      }
+      std::printf("shock-debug:   charge spans (%d,%d,%d)..(%d,%d,%d); nearest body cell (%d,%d,%d) slot %d "
+                  "'%s' at %d cells; root xf (%.2f,%.2f,%.2f)\n",
+                  cmn.x, cmn.y, cmn.z, cmx.x, cmx.y, cmx.z, bw.x, bw.y, bw.z, bslot,
+                  parts[pi].m->SlotName(bslot).c_str(), best, parts[pi].m->limbs_[0].xf.pos.x,
+                  parts[pi].m->limbs_[0].xf.pos.y, parts[pi].m->limbs_[0].xf.pos.z);
+      // The layers under the body: P>0 '#', air '.', anything else 'o';
+      // body cells of this creature in the layer above marked 'B'.
+      for (int yy = low.y - 2; yy <= low.y; yy++) {
+        std::string row;
+        for (int z = 0; z < h->dims[2]; z++) {
+          for (int x = 0; x < h->dims[0]; x++) {
+            const IVec3 cc{h->lo[0] + x, yy, h->lo[2] + z};
+            const uint32_t gw = GridWord(h, cc);
+            char ch = (gw & kElecQueryGridPMax) ? '#' : ((gw & kElecQueryGridAir) ? '.' : 'o');
+            for (uint32_t k = 0; k < nodes.size(); k++)
+              if (nodes[k].part == pi && nodes[k].w.x == cc.x && nodes[k].w.y == yy && nodes[k].w.z == cc.z)
+                ch = 'B';
+            row += ch;
+          }
+          row += ' ';
+        }
+        std::printf("shock-debug:   y %d: %s\n", yy, row.c_str());
+      }
     }
   }
   while (!pq.empty()) {
