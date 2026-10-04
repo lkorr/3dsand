@@ -75,6 +75,8 @@ const std::vector<Gate>& ElecPlayGates();
 const std::vector<Gate>& ElecGates();
 // Electricity E4 (docs/PLAN_electricity.md section 4): shocks reach bodies.
 const std::vector<Gate>& ElecMobGates();
+// Demons D1 (docs/PLAN_demons.md): summoning, the salt circle, containment.
+const std::vector<Gate>& DemonGates();
 const std::vector<Gate>& GrimoireGates();
 // The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
 // edit ops. CPU-only over glyphs.json and the generated oracle.
@@ -983,6 +985,13 @@ const char* const kOrder[] = {
     // the body's MATERIAL decides (insulating soles, iron ones, a wooden body
     // that chars and feels nothing, an android's circuitry). Same discipline.
     "elec-crowd", "elec-body-matter",
+    // Demons D1 (docs/PLAN_demons.md): the summon glyph, the salt circle,
+    // containment and the goof. Own pads, IdCounterScope, a pinned clear sky,
+    // regenerates on the way out.
+    "demon-circle",
+    // Demons D3: seal piles cut channels, circle strength, release, gaze.
+    // Same discipline as demon-circle.
+    "demon-seals",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -1210,7 +1219,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecPlayGates(), &ElecGates(), &ElecMobGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecPlayGates(), &ElecGates(), &ElecMobGates(), &DemonGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),

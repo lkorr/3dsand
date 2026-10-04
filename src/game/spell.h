@@ -188,6 +188,14 @@ enum class SpellVerb : uint8_t {
   // the same function a storm's ground strike uses. Appended LAST so no
   // existing verb is renumbered.
   Strike,
+  // A SUMMONING (docs/PLAN_demons.md D1): a demon's NAME, cast at a point. The
+  // VM only REPORTS it (SpellEmission::summons); the owner (game/demon.h
+  // DemonWorld, via session.cpp) reads the salt circle at that point through
+  // the snapshot stores and spawns the demon there -- contained inside an
+  // intact circle, hostile anywhere else. One glyph per demon: the name IS
+  // the glyph (a glyph has no string arguments), so knowing a name is owning
+  // its glyph. Appended LAST so no existing verb is renumbered.
+  Summon,
 };
 const char* SpellVerbName(SpellVerb v);
 bool ParseSpellVerb(const std::string& s, SpellVerb& out);
@@ -275,6 +283,16 @@ struct GlyphLook {
   uint32_t color = 0xFFFFFFFFu;    // 0xAABBGGRR, used when the cast carries no matter
 };
 
+// The summoning a glyph authors (verb `summon`), read from the glyph's
+// "summon" block: WHICH demon, by its assets/demons/<name>.json stem (resolved
+// by the owner at the moment it summons, so the demon library hot-reloads on
+// its own), and the mana it costs on top of the words.
+struct GlyphSummon {
+  bool has = false;
+  std::string demon;     // assets/demons/<demon>.json
+  int32_t mana = 40;     // the tariff, in mana
+};
+
 struct GlyphDef {
   std::string id;
   std::string desc;
@@ -313,6 +331,7 @@ struct GlyphDef {
   int32_t foreignPenaltyMille = 1000;
   GlyphWind wind;
   GlyphStrike strike;
+  GlyphSummon summon;
 
   // ---- delivery record defaults ----
   DeliveryMech mech = DeliveryMech::Instant;
@@ -1277,6 +1296,18 @@ struct SpellStrike {
   int32_t tariff = 0;
 };
 
+// A summoning the payload asked for (verb `summon`): where it resolved and
+// which glyph (the glyph names the demon). The VM cannot spawn a body; the
+// OWNER does (session.cpp -> game/demon.h DemonSummonRequest), after reading
+// the salt circle at the arrival cell. `tariff` is what the effect added to
+// the cast's price, refunded when the owner refuses (no room, unknown demon).
+struct SpellSummon {
+  int32_t x = 0, y = 0, z = 0;
+  int32_t glyph = -1;
+  uint32_t salt = 0;
+  int32_t tariff = 0;
+};
+
 // Everything a spell may emit, in one bundle. The VM appends here and NOWHERE
 // else — this struct IS thesis 1.
 struct SpellEmission {
@@ -1285,6 +1316,7 @@ struct SpellEmission {
   std::vector<ParticleSpawn> spawns;
   std::vector<WindPrim> winds;
   std::vector<SpellStrike> strikes;
+  std::vector<SpellSummon> summons;
   // Set when the effect should carve the caster's own body (a Fatal cast).
   bool carveCaster = false;
   Vec3 carveAt{};
@@ -1399,7 +1431,8 @@ class SpellSystem {
   // Tick() the same way.
   int FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
                     std::vector<ParticleSpawn>& spawns, std::vector<WindPrim>& winds,
-                    std::vector<SpellStrike>* strikes = nullptr) const;
+                    std::vector<SpellStrike>* strikes = nullptr,
+                    std::vector<SpellSummon>* summons = nullptr) const;
   // Does a ward refuse a strike at this cell? FilterStreams asks at the AIM;
   // the owner asks again at the cell the target search actually struck (and
   // the cell the bolt arrives in), because the search moves the bolt up to

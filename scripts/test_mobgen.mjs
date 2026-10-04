@@ -1300,6 +1300,9 @@ section('M. every character on disk RESOLVES to the body its genome describes');
     const strip = o => {
       const r = JSON.parse(JSON.stringify(noNotes(o)));
       delete r.genome;
+      // The AI profile is not the body's: gen_mobs --behavior writes it and a
+      // re-bake keeps it, and the generator never derives it.
+      delete r.behavior;
       return r;
     };
     const d = diff(strip(onDisk), strip(thin), name);
@@ -1330,7 +1333,9 @@ section('M. every character on disk RESOLVES to the body its genome describes');
     // ...and the things the base contributes and the generator no longer
     // emits at all: the clip library is compiled by the loader, not by the
     // file, so `states` naming `crawl` has to keep meaning something.
-    const ds = diff(noNotes(resolved.states).map(fillState),
+    // A PREFIX: a race may append its own base posture AFTER the human's
+    // ladder (demon.js extraStates, the hunch; section Q checks it is last).
+    const ds = diff(noNotes(resolved.states).slice(0, shippedStates.length).map(fillState),
                     noNotes(shippedStates).map(fillState), `${name}.states`);
     ok(!ds, `${name} inherits the shipped human’s locomotion ladder`, ds);
     const reachable = { ...clipLibrary(), ...resolved.clips };
@@ -1571,7 +1576,11 @@ section('P. the machine races: automaton and android on the SAME rig');
 {
   const opts = { materials, player: tuning.player, avatar: avatarConstants() };
   const idOf = n => materials.findIndex(m => m.id === n) + 1;
-  for (const [race, M] of Object.entries(mg.RACE_MODS)) {
+  // The MACHINES only: a race module that says `MACHINE = false` (demon.js,
+  // flesh on the human rig) makes the opposite promises -- flesh inside,
+  // blood, claws that cut -- and is section Q's.
+  for (const [race, M] of Object.entries(mg.RACE_MODS)
+                            .filter(([, M]) => M.MACHINE !== false)) {
     // 1. THE RIG IS THE HUMAN'S (section O's promise, for every machine): the
     //    same boxes, anchors, sockets, chains, natural weapons and gait, and
     //    every body part inside its own box -- so every helm, cuirass and
@@ -1710,6 +1719,149 @@ section('P. the machine races: automaton and android on the SAME rig');
         }
         ok(moved, `${spec.path} changes the body`);
       }
+    }
+  }
+}
+
+// =============================================================================
+// 10. the demon race (demon.js, docs/PLAN_demons.md D1)
+// =============================================================================
+
+section('Q. the demon race: flesh on the SAME rig, its own height band');
+{
+  const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  const DM = mg.RACE_MODS.demon;
+  ok(!!DM && DM.MACHINE === false, 'demon is a race module, and not a machine');
+  // 1. THE RIG IS THE HUMAN'S at the human's own height: the same boxes,
+  //    anchors, sockets, chains and gait. The natural weapons keep their
+  //    EDGES; only the fists' strike profile moves (claws cut).
+  for (const [label, human] of [['default', mg.defaultGenome()],
+                                ['brute', mg.presetGenome('brute')],
+                                ['random 7', mg.randomGenome(mg.makeRng(7))]]) {
+    const dem = mg.applyRace(mg.normalizeGenome(human), 'demon');
+    const a = mg.generateMob(human, 0, opts), b = mg.generateMob(dem, 0, opts);
+    const box = r => Object.fromEntries(mg.ARCHETYPE.order.map(n => [n, r.table.limbs[n]]));
+    ok(!diff(box(a), box(b), 'limbs'), `demon ${label}: the human's limb boxes`,
+       diff(box(a), box(b), 'limbs'));
+    const rig = r => ({
+      limbs: r.sidecar.limbs.filter(l => l.tag !== 'hair'),
+      sockets: r.sidecar.sockets, chains: r.sidecar.chains,
+      edges: r.sidecar.natural.map(n => ({ name: n.name, part: n.part, edge: n.edge })),
+      gait: r.sidecar.gait, speed: r.sidecar.speed,
+    });
+    const d = diff(rig(a), rig(b), label);
+    ok(!d, `demon ${label}: the human's anchors, sockets, chains, weapon edges, gait`, d);
+    for (const p of b.parts.filter(p => !p.hair))
+      ok(p.cells.every(([x, y, z]) => x >= 0 && y >= 0 && z >= 0 &&
+                       x < p.size[0] && y < p.size[1] && z < p.size[2]),
+         `demon ${label}: ${p.name} stays inside its box`);
+  }
+  // 2. THE HEIGHT BAND IS THE RACE'S, and only the race's.
+  {
+    const h = mg.normalizeGenome({ body: { heightM: 0.85 } });
+    ok(h.body.heightM === mg.HEIGHT_BAND[0], 'a 0.85 m HUMAN still clamps to the human band',
+       `got ${h.body.heightM}`);
+    const imp = mg.presetGenome('imp');
+    ok(imp.body.race === 'demon' && imp.body.heightM === 0.85,
+       'the imp keeps its 0.85 m through normalizeGenome', `got ${imp.body.heightM}`);
+    const wild = mg.normalizeGenome({ body: { race: 'demon', heightM: 99 } });
+    ok(wild.body.heightM === DM.HEIGHT_BAND[1], 'a 99 m demon clamps to the demon band',
+       `got ${wild.body.heightM}`);
+    const m = mg.mutate(imp, 1.5, mg.makeRng(3));
+    ok(m.body.heightM >= DM.HEIGHT_BAND[0] && m.body.heightM <= DM.HEIGHT_BAND[1],
+       'a mutant imp stays inside the demon band', `got ${m.body.heightM}`);
+  }
+  // 3. EVERY PRESET builds sound, bakes FLESH (it bleeds and burns like a
+  //    human), names blood, carries claws that cut, and is filed in
+  //    assets/mobs/demon/. A hunched one carries the hunch as its LAST state.
+  for (const k of DM.PRESET_ORDER) {
+    const g = mg.presetGenome(k);
+    ok(g.body.race === 'demon', `${k} is a demon`);
+    const b = mg.generateMob(g, 0, opts);
+    ok(!mg.validateMob(b).length, `${k}: structurally sound`, mg.validateMob(b).join('; '));
+    const c = mg.bakeAnatomy(b, materials).census;
+    ok(c.skin > 0 && c.flesh > 0 && c.muscle > 0 && c.bone > 0 && c.brain > 0 && c.blood > 0,
+       `${k}: the human's inside (skin, flesh, muscle, bone, brain, blood)`, JSON.stringify(c));
+    ok(b.sidecar.bleed && b.sidecar.bleed.material === 'blood', `${k}: bleeds blood`);
+    ok(b.sidecar.race === 'demon', `${k}: the sidecar says demon`);
+    ok(mg.raceFolder(g) === 'demon', `${k}: filed in assets/mobs/demon/`);
+    const fist = b.sidecar.natural.find(n => n.name === 'fist.L');
+    ok(fist && fist.strike.cut > 0, `${k}: its claws cut`, JSON.stringify(fist && fist.strike));
+    const hunched = g.demon.posture === 'hunched';
+    const st = b.sidecar.states;
+    ok(hunched === st.some(s => s.name === 'hunch' && s.always && s.clip === 'hunch'),
+       `${k}: a hunch state iff hunched (${g.demon.posture})`);
+    ok(!hunched || st[st.length - 1].name === 'hunch',
+       `${k}: the hunch is the LAST state, so every damage state wins over it`);
+  }
+  // 4. THE IMP IS SMALL AND ITS LIMBS SURVIVE THE SCALE: under a metre, every
+  //    part has cells, and each has at least one 2x2x2 block half full (the
+  //    collider rule: a part with none is an empty collider and the engine
+  //    refuses the spawn).
+  {
+    const b = mg.generateMob(mg.presetGenome('imp'), 0, opts);
+    ok(b.table.worldH >= 8 && b.table.worldH <= 10, 'the imp is 8..10 world voxels tall',
+       `got ${b.table.worldH}`);
+    for (const p of b.parts) {
+      const at = new Set(p.cells.map(([x, y, z]) => x + ',' + y + ',' + z));
+      let solid = false;
+      for (const [x, y, z] of p.cells) {
+        const bx = x & ~1, by = y & ~1, bz = z & ~1;
+        let n = 0;
+        for (let d = 0; d < 8; d++)
+          if (at.has((bx + (d & 1)) + ',' + (by + ((d >> 1) & 1)) + ',' + (bz + (d >> 2)))) n++;
+        if (n >= 4) { solid = true; break; }
+      }
+      ok(p.cells.length > 0 && solid, `imp: ${p.name} has a collider block`,
+         `${p.cells.length} cells`);
+    }
+  }
+  // 5. A HUMAN NEVER SEES THE RACE: no demon colour in a human's demon art
+  //    slots. By colour, not by zero: paletteBytes writes every material's
+  //    colour at its own id first, and the material list has grown past the
+  //    low demon slots (that fill is ignored by the engine, which reads art
+  //    colour only from the .col models).
+  {
+    const b = mg.generateMob(mg.defaultGenome(), 0, opts);
+    const { palette } = readVox(b.vox);
+    const hex = sl => '#' + [0, 1, 2].map(i => palette[(sl - 1) * 4 + i]
+      .toString(16).padStart(2, '0')).join('');
+    const demonHexes = new Set(Object.keys(DM.COLOR_SLOTS).map(k => DM.DEFAULT_COLORS[k]));
+    ok(Object.values(DM.COLOR_SLOTS).every(sl => !demonHexes.has(hex(sl))),
+       'a human writes none of the demon colours into its palette');
+  }
+  // 6. RANDOM AND MUTANT demons are sound; every horn style builds.
+  for (const s of [1, 2, 3, 5, 8, 21]) {
+    const g = mg.rollColors(mg.randomGenome(mg.makeRng(s), null, { race: 'demon' }),
+                            mg.makeRng(s ^ 77));
+    ok(g.body.race === 'demon', `random demon seed ${s} is a demon`);
+    const b = mg.generateMob(g, 0, opts);
+    ok(!mg.validateMob(b).length, `random demon seed ${s}: sound`, mg.validateMob(b).join('; '));
+    const m = mg.mutate(mg.presetGenome(DM.PRESET_ORDER[s % DM.PRESET_ORDER.length]),
+                        1.5, mg.makeRng(s));
+    const bm = mg.generateMob(m, 0, opts);
+    ok(!mg.validateMob(bm).length, `demon mutant seed ${s}: sound`, mg.validateMob(bm).join('; '));
+  }
+  for (const st of DM.HORN_ORDER) {
+    const g = mg.applyRace(mg.defaultGenome(), 'demon');
+    DM.applyHorns(g, st);
+    const b = mg.generateMob(g, 0, opts);
+    ok(!mg.validateMob(b).length, `demon horns ${st}: sound`, mg.validateMob(b).join('; '));
+  }
+  // 7. EVERY NUMERIC GENE REACHES THE BODY.
+  {
+    const base = mg.applyRace(mg.defaultGenome(), 'demon');
+    DM.applyHorns(base, 'goat');
+    const key = g => {
+      const b = mg.generateMob(g, 0, opts);
+      return b.parts.map(p => p.name + ':' + p.cells.map(c => c.join(',')).join(';')).join('|');
+    };
+    const k0 = key(base);
+    for (const spec of mg.GENE_SPECS.filter(sp => sp.race === 'demon' && !sp.kind)) {
+      const g = mg.normalizeGenome(base);
+      const v = mg.getPath(g, spec.path);
+      mg.setPath(g, spec.path, v > (spec.min + spec.max) / 2 ? spec.min : spec.max);
+      ok(key(g) !== k0, `${spec.path} changes the body`);
     }
   }
 }

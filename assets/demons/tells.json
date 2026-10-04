@@ -1,0 +1,39 @@
+{
+  "//": "DEMON TELLS (docs/PLAN_demons.md D3; game/demon_seals.h TellFor). What a contained demon lets slip about how well it is held. MARGIN = circle strength - demon power - contract weight (0 until D5). A band speaks while margin >= its minMargin; below every band the lowest one speaks. Lines are picked by rng::Hash3, so the same tick says the same thing. Data only in D3; D5's conversation speaks them.",
+  "default": [
+    { "minMargin": 30, "lines": [
+      "...",
+      "You have done this before. Pity.",
+      "The salt is thick. I will wait." ] },
+    { "minMargin": 10, "lines": [
+      "Ask, then. Quickly.",
+      "Your ring is adequate. Adequate.",
+      "I have stood in worse circles. Not many." ] },
+    { "minMargin": 0, "lines": [
+      "Careful. Your salt is thin on the north side.",
+      "One candle fewer and we would be having a different talk.",
+      "Go on. Let me out. I promise to be good." ] },
+    { "minMargin": -10, "lines": [
+      "Oh, this ring? This ring is a suggestion.",
+      "Release me. I insist." ] },
+    { "minMargin": -100000, "lines": [
+      "Ha! You drew this with your foot.",
+      "Open the circle, little summoner. Let us meet properly." ] }
+  ],
+  "demons": {
+    "skerrick": [
+      { "minMargin": 30, "lines": [
+        "Skerrick is good. Skerrick is very good. Look how good.",
+        "So much sulfur. You must not like Skerrick." ] },
+      { "minMargin": 10, "lines": [
+        "What does the big one want? Skerrick fetches. Skerrick carries.",
+        "Nice ring. Nice ring. Skerrick hates it." ] },
+      { "minMargin": 0, "lines": [
+        "Your candle is guttering, master. Just saying.",
+        "Skerrick could stand a little to the left. Just a little." ] },
+      { "minMargin": -100000, "lines": [
+        "Hee. Hee hee. Let Skerrick out, master. Skerrick will be quick.",
+        "That is not a ring. That is a smudge." ] }
+    ]
+  }
+}

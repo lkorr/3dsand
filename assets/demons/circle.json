@@ -1,0 +1,16 @@
+{
+  "//": "THE SALT CIRCLE (docs/PLAN_demons.md D1; game/demon_circle.h). From where a summoning lands, a 2D flood fill over a three-row slab -- the floor row, the row the demon's feet stand in, the row above -- in which a column is a wall iff one of its slab cells is `material`. Only salt: stone, wood and water are open to the fill. The fill escaping `radiusMaxM` from the start = no circle; a fill that stops = the inside of a closed circle.",
+  "material": "salt",
+  "//radiusMaxM": "Metres. How far the fill may run before it counts as escaped. Bigger than any circle you mean to draw (a summoning circle is ~3 m across), small enough that the scan and its chunk requests stay cheap: at 4 m an arrival asks the fetch cache for up to ~100 chunks the mirror does not hold (DemonWorld::kMaxFetchPerSummon 128, nearest first). Past that, the far cells of an unringed fill read UNKNOWN, which is still not a circle.",
+  "radiusMaxM": 4.0,
+  "slabBelow": 1,
+  "slabAbove": 1,
+  "//recheckTicks": "While a demon is contained its circle is re-read when a chunk it overlaps is awake in the snapshot, and on this cadence regardless (30 ticks = 1 s).",
+  "recheckTicks": 15,
+  "//leadTicks": "Cast -> arrival. The demon takes shape over this many ticks, which is also how long the fetch cache gets to deliver the chunks the scan reads.",
+  "leadTicks": 8,
+  "//floorSearch": "Cells below the point the name landed on to look for the floor the demon stands on.",
+  "floorSearch": 12,
+  "//minEighths": "Salt is a powder whose cells carry their MASS in eighths. A cell walls its column only with at least this much salt in it: a poured band settles by shedding single eighths sideways, and those strays (or salt the wind has scattered) are a film, not a ring -- at 1 a one-cell gap closes itself with grains nobody poured. 4 = half a cell, the same line a creature's footing uses (kPowderMobSupportMin).",
+  "minEighths": 4
+}

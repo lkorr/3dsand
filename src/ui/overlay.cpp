@@ -571,6 +571,101 @@ void Overlay::DrawHUD(const UIState& s) {
     }
     py += tabH + 14.0f;
   }
+  // ---- the summoner's demon (game/demon.h, docs/PLAN_demons.md D1 + D3) ----
+  //
+  // A small tab: a pixel salt ring (2 px blocks, 7x7) and up to three lines.
+  //   1. the name and the state: CONTAINED (with the circle's radius) draws
+  //      the ring whole in salt-white; UNBOUND draws it broken in ember;
+  //      RELEASED draws it whole in gold.
+  //   2. (contained, D3) the circle's STRENGTH against the demon's POWER --
+  //      salt-white while it would hold, ember while it would not -- then the
+  //      four channels as letters (M move, C cast out, B blink, T touch):
+  //      salt-white = a seal severs it, ember = a loophole; then the key.
+  //   3. (contained, while the gaze strains) AVERT or MEET EYES and ten pixel
+  //      pips of strain, ember while you are breaking the rule.
+  // The tab is sized from the widest line, so the words always fit their box.
+  if (s.playerAlive && s.demonState != 0 && !s.demonName.empty()) {
+    const bool held = s.demonState == 1, released = s.demonState == 3;
+    const ImU32 salt = IM_COL32(236, 232, 220, 255);
+    const ImU32 ring = held ? salt : released ? ui::ColGold() : ui::ColEmber();
+    char line[96];
+    std::string up = s.demonName;
+    for (char& c : up) c = (char)std::toupper((unsigned char)c);
+    if (held)
+      std::snprintf(line, sizeof line, "%s  CONTAINED  %.1f m", up.c_str(), s.demonRadiusM);
+    else if (released)
+      std::snprintf(line, sizeof line, "%s  RELEASED", up.c_str());
+    else
+      std::snprintf(line, sizeof line, "%s  UNBOUND", up.c_str());
+    const bool showBind = held && s.demonHasBinding;
+    const bool holds = s.demonStrength >= s.demonPower;
+    char str[48];
+    std::snprintf(str, sizeof str, "CIRCLE %d / %d  ", s.demonStrength, s.demonPower);
+    static const char kChan[4] = {'M', 'C', 'B', 'T'};
+    const char* keyHint = "  Y RELEASE";
+    const bool showGaze = showBind && (s.demonStrain > 0.0f || s.demonGazeBroken);
+    const char* gazeWord = s.demonGazeHold ? "MEET EYES " : "AVERT ";
+    constexpr int kPips = 10;
+    const float pw = 4.0f, ph = 6.0f, pg = 2.0f;
+    const ImVec2 ts = ImGui::CalcTextSize(line);
+    const float chW = ImGui::CalcTextSize("M ").x;
+    const float l2w = showBind ? ImGui::CalcTextSize(str).x + 4 * chW + ImGui::CalcTextSize(keyHint).x
+                               : 0.0f;
+    const float l3w =
+        showGaze ? ImGui::CalcTextSize(gazeWord).x + kPips * (pw + pg) : 0.0f;
+    const float textW = std::max(ts.x, std::max(l2w, l3w));
+    const float lh = ts.y + 2.0f;
+    const int lines = 1 + (showBind ? 1 : 0) + (showGaze ? 1 : 0);
+    static const char* kRing[7] = {"..###..", ".#...#.", "#.....#", "#.....#",
+                                   "#.....#", ".#...#.", "..###.."};
+    const float b = 2.0f, gw = 7 * b, gh = 7 * b;
+    const float inner = gw + 8.0f + textW;
+    const float x0 = std::floor((disp.x - inner) * 0.5f);
+    const float y0 = py;
+    const float tabH = std::max(gh, lh * lines - 2.0f);
+    d->AddRectFilled(ImVec2(x0 - 8, y0 - 4), ImVec2(x0 + inner + 8, y0 + tabH + 4),
+                     IM_COL32(0, 0, 0, 170));
+    d->AddRect(ImVec2(x0 - 8, y0 - 4), ImVec2(x0 + inner + 8, y0 + tabH + 4), ring, 0.0f, 0,
+               2.0f);
+    const float gy = y0 + std::floor((tabH - gh) * 0.5f);
+    for (int r = 0; r < 7; r++)
+      for (int c = 0; c < 7; c++) {
+        if (kRing[r][c] != '#') continue;
+        // Broken: the ring's right-hand cells are missing.
+        if (!held && !released && c >= 5 && r >= 2 && r <= 4) continue;
+        d->AddRectFilled(ImVec2(x0 + c * b, gy + r * b), ImVec2(x0 + (c + 1) * b, gy + (r + 1) * b),
+                         ring);
+      }
+    const float tx = x0 + gw + 8.0f;
+    auto text = [&](float x, float y, ImU32 col, const char* t) {
+      d->AddText(ImVec2(x + 1, y + 1), IM_COL32(0, 0, 0, 190), t);
+      d->AddText(ImVec2(x, y), col, t);
+    };
+    text(tx, y0, ring, line);
+    float ly = y0 + lh;
+    if (showBind) {
+      text(tx, ly, holds ? salt : ui::ColEmber(), str);
+      float cx = tx + ImGui::CalcTextSize(str).x;
+      for (int i = 0; i < 4; i++) {
+        const char t[2] = {kChan[i], 0};
+        text(cx, ly, ((s.demonSevered >> i) & 1u) ? salt : ui::ColEmber(), t);
+        cx += chW;
+      }
+      text(cx, ly, ui::ColParchDim(), keyHint);
+      ly += lh;
+    }
+    if (showGaze) {
+      const ImU32 gc = s.demonGazeBroken ? ui::ColEmber() : ui::ColParch();
+      text(tx, ly, gc, gazeWord);
+      const float px = tx + ImGui::CalcTextSize(gazeWord).x;
+      const float pyy = ly + std::floor((ts.y - ph) * 0.5f);
+      const int lit = (int)std::ceil(s.demonStrain * kPips - 1e-4f);
+      for (int i = 0; i < kPips; i++)
+        d->AddRectFilled(ImVec2(px + i * (pw + pg), pyy), ImVec2(px + i * (pw + pg) + pw, pyy + ph),
+                         i < lit ? gc : ui::ColDeep());
+    }
+    py += tabH + 14.0f;
+  }
   // ---- the throw's wind-up: a row of pixel pips under the crosshair --------
   //
   // Ten 6x8 cells on the 2 px grid, lit left to right in gold as Q is held,

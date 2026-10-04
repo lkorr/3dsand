@@ -748,6 +748,20 @@
       },
       "axis": "strength: positive blows out from the point, negative pulls in",
       "desc": "A burst of wind at the point. Positive pushes loose matter and bodies away; negative is a vacuum that pulls them in."
+    },
+    {
+      "id": "summon_skerrick",
+      "sort": "effect",
+      "word": 6,
+      "verb": "summon",
+      "summon": {
+        "comment": "A DEMON'S NAME IS A GLYPH (docs/PLAN_demons.md D1): the demon is assets/demons/<demon>.json, called up where the spell resolves. Into an intact salt circle it arrives CONTAINED; anywhere else it arrives loose and comes for you. Never granted by the debug default (SANDVOX_ALL_NAMES=1 grants every name); learned from a book. Keep the id: D2's smithy book grants it by this name.",
+        "demon": "skerrick",
+        "mana": 40
+      },
+      "example": "summon_skerrick lob",
+      "axis": "nothing: a name said twice is one imp",
+      "desc": "The name of the imp Skerrick. Cast it into a closed ring of salt, from outside the ring, and he arrives held inside it. Cast it anywhere else and he arrives loose, and he remembers who called."
     }
   ],
   "conjoined": {

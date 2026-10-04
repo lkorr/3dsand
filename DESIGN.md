@@ -24554,7 +24554,140 @@ squares do not reach, and the spawn column must stay outside every square; two
 villagers sent to one marker shoulder each other off it all evening, so each
 regular has his own place (a prop naming a ref beats the tag).
 
+
 ## 17. Demons (docs/PLAN_demons.md, added 2026-10-04)
+
+### Demons — the race, the name, the salt circle, containment (D1; `game/demon.*`, `game/demon_circle.*`, `game/mobfence.h`)
+
+The owner's design (Bartimaeus): you cast a demon's NAME into a salt circle
+from outside it. Inside an intact circle the demon is CONTAINED (to talk and to
+bind, D3-D5); anywhere else -- no circle, a broken one, a missed cast -- it
+arrives UNBOUND and HOSTILE. The goof is deliberate. This section is kept
+current per package; D1 (below) is the body, the name, the circle and the hold.
+
+**THE BODY IS A RACE (D1).** `assets/editor/demon.js` is a race module in
+mobgen's `RACE_MODS` (the machine races' interface, §8 "MACHINE RACES") with
+three differences, each a flag the generator reads rather than a branch on the
+race's name:
+
+- `MACHINE = false`: a demon is FLESH. `ANATOMY = null` takes the human's
+  recipe (skin, flesh, muscle, bone, a skull round a brain), `BLEED` is blood,
+  and `DEFAULT_MAT = null` leaves every art slot the module does not name at
+  the human's answer (skin on the body, `hair_white` on the hair mass). Only
+  horns and claws (`bone`), lit eyes (`gem_arcane`, the sylvan's and the
+  android's light) and the hide-painted tail (`skin`) name a material. So a
+  demon walks, falls, burns, bleeds and dies exactly as a human does.
+  test_mobgen §P (the machines' promise) skips it; §Q is its own.
+- `HEIGHT_BAND = [0.85, 2.1]`: the race's own height band. Every height clamp
+  goes through `mobgen.specRange`, which returns it for a demon and the human
+  `HEIGHT_BAND` (1.53..1.87) for everyone else -- a 0.85 m human still clamps
+  to 1.53. 0.85 m is the smallest figure `validateMob` passes (8 world voxels)
+  with a margin; 2.1 is where the human reach contract starts to lie.
+- `extraStates` / `patchNatural`: a hunched genome appends a `hunch` loco
+  state (`always: true`, clip `hunch`) AFTER the human's ladder, so every
+  damage state still wins and the gait still walks under it (the snake's
+  base-state mechanism; `assets/anims/hunch.json`: spine 28 degrees forward,
+  head 22 back, arms 36 forward, additive). Claws give the fists a `cut`
+  (edges unchanged: the human's rig, weapon for weapon).
+
+Genes (`genome.demon`): horn style picker (none / nubs / goat / spikes / ram),
+horn length, curl and spread; tail; claws; mottling; lit eyes; posture
+(upright | hunched). Horns ride the head and the tail the torso as fixed-joint
+extras (hair-mass `snout` / `bough` parts). Presets: `demon`, `imp` (0.85 m,
+big head, long arms, hunched) and `fiend` (2.0 m, ram horns: the greater-demon
+size). Art slots 221..216 (below the android's).
+
+**THE IMP, SKERRICK.** `assets/mobs/demon/imp_skerrick.{vox,json}`
+(`node scripts/gen_mobs.mjs imp_skerrick --preset imp --behavior imp`; a
+re-bake keeps the file's `behavior`), behaviour profile `imp`
+(behaviors.json: faction `demon`, aggro hostile, a fast cadence of claw rakes
+and bites, a close band, circling, dodges). The demon def
+`assets/demons/skerrick.json` names the mob, the profile, tier, power, gaze,
+per-channel resistances and schemes (the last four are read from D3/D6 on).
+
+**THE NAME IS A GLYPH.** `SpellVerb::Summon` (appended last), glyph
+`summon_skerrick` (`"summon": {"demon": "skerrick", "mana": 40}`), an effect:
+`summon_skerrick lob` throws the name into the circle. The VM only REPORTS it
+(`SpellEmission::summons`; a ward `summon_skerrick null` refuses it, kindMode
+7); session.cpp phase I hands it to `DemonQueueSummon`. Tariff: the glyph's
+`mana`, flat (a name said twice is one demon); refunded when the owner refuses
+(unknown demon, no room, spawn failed). NOT GRANTED by `GrantAllAndBind`
+(name glyphs are appended after every other glyph, so excluding them moves no
+binding) unless `SANDVOX_ALL_NAMES=1` (`DebugAllDemonNames`, read once); the R
+reload carries learned names over by id. D2's book grants it by name.
+
+**THE CIRCLE** (`game/demon_circle.h`, `assets/demons/circle.json`). From the
+arrival column a 2D flood fill over a three-row slab (the floor row, the feet
+row, the row above) in which a column is a WALL iff a slab cell is salt
+with at least `minEighths` (4) of a cell of grains in it -- only salt: stone,
+wood and water are open, so a walled room or a moat is not a circle, and brine
+(dissolved salt is solute on a water cell) or molten salt does not count. BY
+MASS because salt is a powder: a poured band settles by shedding single
+eighths sideways (sub-voxel repose), and with every grain counted a one-line
+gap closed itself with strays nobody poured (measured: a 2-wide band left the
+gap cells holding 1/8 each and the full cells 7/8). The same strays are what
+wind leaves of a scattered ring. A one-wide digital ring does not survive
+settling at all (its diagonal steps are single grains touching at corners:
+22 of 88 gone in 30 ticks), so a ring wants to be two cells wide -- the
+cellar's is (D2). 4-connected, so a ring drawn on the diagonal is closed and one
+missing cell is a gap. The fill escaping `radiusMaxM` (4 m) = OPEN; the start
+column itself salt = ON RING; a cell no store holds = UNKNOWN; otherwise
+CLOSED, and the fill region (a bitmask over its bounding box) is the inside.
+Floor: from two above the impact down `floorSearch` cells to the first
+passable cell over a non-passable one. Pure: it reads only through a probe the
+caller binds to the T-4 snapshot mirror then the fetch cache (the stores a
+spell's strike reads), so it is a function of the tick.
+
+**THE ARRIVAL.** A summoning is queued with the cast and arrives `leadTicks`
+(8) later -- the demon taking shape, and the time the fetch cache needs to
+deliver the chunks the scan may read (requested at the cast, at most 48, only
+those outside the mirror). Then: floor, circle, `MobSystem::Spawn` centred on
+the arrival column with its feet on the floor, the def's behaviour profile.
+CLOSED -> CONTAINED. Anything else -> UNBOUND at once, its brain pointed at
+the summoner (target id `kPlayerActorBase + session`).
+
+**CONTAINMENT IS NOT A WALL** (`game/mobfence.h`). While any demon is
+contained, the demon world installs a `MobFence` on MobSystem, asked (a) by the
+walk drive's `fits` before every move (refused if the footprint centre would
+leave the inside; a demon knocked out may only move back toward it) and (b) by
+the attack seam before a blow is queued (refused if the blow's target point is
+outside the inside -- melee reach across the ring). Nothing else is fenced:
+the player and items cross freely, and with no contained demon the fence is
+empty (one null test per move). Two lines in mob.cpp, one member in mob.h.
+
+**THE HOLD.** A contained demon's circle is re-read (from where it stands if
+inside, else from its arrival column) when a chunk the circle overlaps is awake
+in the snapshot, or every `recheckTicks` (15) regardless; never twice a tick;
+one bounded fill per demon. OPEN / ON RING -> UNBOUND that tick and aimed at
+the summoner (wind, rain, fire, a boot or the demon's own gust breaking the
+loop are all ordinary sim matter doing it). UNKNOWN (the circle out of every
+store) HOLDS the last answer and asks for the chunks again -- a demon left in
+a cellar stays held while you are away.
+
+**THE HUD.** Each summoner's most recent demon: a pixel tab under the
+crosshair, a salt ring and `SKERRICK  CONTAINED  1.4 m` in salt-white, or the
+ring broken and `SKERRICK  UNBOUND` in ember (`UIState::demonState`).
+
+**BOUNDS.** 8 summonings in flight, 16 live demons per world, 48 chunk
+requests per summoning; a fill is at most (2R + 1)^2 columns x 3 cells.
+
+**NOT SAVED (D1).** The live list, the circles and the pending queue. A
+contained demon in a save loads back as its creature with its hostile profile
+and no circle -- loose. Learned names are glyph ownership (D2's grant). D5
+(contracts) is where bound demons persist.
+
+**GATE** `demon-circle`: the name (glyph, VM report, tariff, not granted by
+default, granted by the switch, Skerrick resolves); on a harness pad a 2-wide
+salt ring (r 14..15), settled 30 ticks, with the player's actor just outside:
+contained for 150 ticks and never out while targeting you, the fence refusing
+moves and blows (258 + 5 measured); you step back, the band's radial line is
+cleared through the queue -> unbound 6 ticks later and out of the circle the
+same tick; the same run twice -> identical trace; no ring -> unbound (open); a
+one-line gap -> unbound (open). Thresholds `demonCircle.*`. Attribution
+printed on the way: the ring's cells as the snapshot saw them at arrival and
+the radial line's words; an UNKNOWN verdict names the first unseen cell and
+what the stores held. The pad goes in in slices under kMaxCellOpsPerTick (a
+truncated pad is a floor with holes the ring's grains fall into).
 
 ### Demons — the Harrowby cellar and the book (D2)
 
@@ -24675,3 +24808,126 @@ back. It then asserts:
   the fail-soft path, then grants against a stand-in of the same name.
 
 `SANDVOX_CELLAR_SHOT=<path>.bmp` writes two pictures.
+
+### Demons — seals, channels, circle strength, release, gaze (D3; `game/demon_seals.*`)
+
+The salt ring CONTAINS (D1). The piles round it decide what a contained demon
+can still DO. All of it is CPU gameplay state in the tick, reading voxels only
+through the probe D1 binds (the T-4 snapshot mirror, then the fetch cache), with
+integer potencies and strength.
+
+**CHANNELS.** A contained demon has four: `move` (walking out), `cast_out` (its
+spells leaving the circle), `blink` (teleporting), `touch` (a blow across the
+ring). Each is cut by a seal material named in `assets/demons/seals.json`:
+salt -> move, sulfur -> cast_out, quicksilver -> blink, iron -> touch (more are
+data). A demon's `resist` (its `assets/demons/<name>.json`) gives a resistance
+per channel; a channel the file does not list has resistance 0.
+
+**THE BAND.** Seals count in an annulus round the circle's centroid, from
+`band.inM` (0.6 m) inside the inside's furthest column to `band.outM` (0.9 m)
+beyond it, over a slab from one row below the demon's feet to `slabAbove` (2)
+rows above. Inside or outside the ring both count; the Harrowby cellar's piles
+(D2) sit just outside it. Matter counts BY MASS in eighths -- powder grain
+mass, liquid fullness, a solid is a whole cell -- and a cell lighter than
+`minEighths` (2) is a film, not a pile (what the wind leaves of a scattered
+one). POTENCY of a channel = perCell x whole cells of its seals in the band. A
+channel is SEVERED iff potency >= resistance. Skerrick: cast_out 12, blink 10,
+touch 8; a 3x3+1 sulfur pile is 20, the cellar's 3x3 quicksilver dish 18, a
+3x3+1 iron pile 10.
+
+The band is re-read on the circle's own triggers (D1: a chunk it overlaps awake
+in the snapshot, or `recheckTicks`), so a pile the wind blows out of the band,
+rain dissolves or fire burns flips its channel at the next re-read. A band cell
+no store holds keeps the LAST reading (as the circle's verdict is held). A demon
+whose band has never been read has every channel severed: D1's containment and
+nothing more. Cost: one pass over the band, at most (2(r + 9))^2 columns x 8
+rows, only when the circle is re-read.
+
+**AN UNSEVERED CHANNEL IS A LOOPHOLE** -- the demon can use it from inside:
+- `touch`: the fence (`MobFence::Blow`, D1) lets a blow across the ring
+  through. **This changed D1's behaviour**: a plain salt ring no longer stops
+  Skerrick's claws; iron does. `demon-circle` now asserts only that the fence
+  was asked; `demon-seals` asserts both halves.
+- `cast_out`: `demon::AllowCastOut` lets the spell land outside (D4 calls it).
+- `blink`: `demon::AllowBlink` lets it go, and a blink to a point outside the
+  circle UNBINDS the demon at once (it has left the circle).
+- `move`: too little salt for its legs and it walks out -- unbound that tick.
+  (Skerrick's move resistance is 0, so any closed ring holds his legs.)
+
+**THE HOOKS D4 CALLS** (`game/demon_seals.h`, namespace `demon`):
+
+```cpp
+bool ChannelSevered(const TickAuthorityCtx& w, uint64_t demonId, Channel ch);
+bool AllowCastOut(TickAuthorityCtx& w, uint64_t demonId, Vec3 from, Vec3 to);
+bool AllowBlink(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t demonId,
+                Vec3 to, uint32_t tick);
+```
+
+`demonId` is the demon's mob id; positions are world voxels. Not a demon, or not
+contained: severed = false, allowed = true. `AllowCastOut` refuses iff contained,
+cast_out severed and `to` is outside the circle. `AllowBlink` refuses iff
+contained and blink severed, and unbinds the demon when it allows a blink out.
+Each counts on the demon's `LiveDemon::bind`.
+
+**CIRCLE STRENGTH** (points) = for each seal entry, its whole cells in the band
+/ `cellsPerPoint` (salt 5, the others 2) + lit candles x `perCandle` (3, up to
+`max` 8) - the gaze loss. A lit candle is a `candle_flame` cell in the band up
+to `candles.slabAbove` (6) rows over the feet (D2's candles are three tallow and
+a flame). A 2-wide ring of radius 1.5 m is ~180 cells, 36 points: a plain ring
+holds an imp (power 20) with room for a stock contract (D5). The cellar's
+circle, with its piles and the four cardinal candles, is ~60.
+
+**RELEASE** is an explicit player action: `TB_DEMON_RELEASE` (TickInput bit 16,
+`kTickInputVersion` 7), the **Y** key while the HUD shows your demon contained.
+The tick lets the presser's most recent contained demon out and weighs it there
+and then: held iff `strength >= power + contract weight` (weight 0 until D5).
+Held -> RELEASED: the fence lets it go, its brain drops its target, and it takes
+the def's `released` behaviour profile (Skerrick: `imp_bound`, the imp with
+aggro neutral -- a stand-in for D5's contract, which will say what a released
+demon does). Not held -> it OVERPOWERS the binding: UNBOUND, its hostile profile
+back, aimed at you. `demon::Release(w, players, demonId, weight, tick)` is the
+same check for D5's dialogue `release`. A circle that breaks while the demon is
+contained still unbinds it at once (D1).
+
+**GAZE** (`gaze`: hold | avert, per demon). Each tick a demon is contained and
+its summoner's eye is within `gaze.rangeM` (8 m) of its head, the camera's
+forward (`TickInput::lookFwd`, the basis the tick already carries) is tested
+against a `coneDeg` (18) cone at the head. Looking away from a `hold` demon or
+at an `avert` one adds `strainRise` (3) to a STRAIN meter; keeping the rule (or
+being out of range) takes `strainFall` (1) off. A full meter (`strainMax` 300,
+~3.3 s of staring) costs the circle `strainPenalty` (8) points, to at most
+`strainLossMax` (32) in all, and empties. Never an instant fail. Range is a
+straight distance, no line of sight. The camera lock and the look-away key are
+D5's.
+
+**TELLS** (`assets/demons/tells.json`): line bands by MARGIN (strength - power -
+weight), a default table and per-demon ones; a band speaks while the margin is
+at or over its `minMargin`, the lowest below every floor. `demon::TellFor`
+picks a line by `rng::Hash3`. Data only here; D5's conversation speaks them.
+
+**THE HUD** (the D1 tab, `UIState::demon*`). While contained and read, a second
+line: `CIRCLE <strength> / <power>` in salt-white while it would hold, ember
+while it would not, then the letters `M C B T` (salt-white = severed, ember = a
+loophole) and `Y RELEASE`. While the gaze strains, a third: `AVERT` or `MEET
+EYES` and ten pixel pips, ember while you are breaking the rule. RELEASED draws
+the ring whole in gold. The tab is sized from its widest line.
+
+**NOT SAVED** (as D1): the binding is the live demon's. D5 persists bound
+demons.
+
+**Content loading.** `LoadDemons` reads `seals.json` and `tells.json` through
+`demon::LoadSealFile` instead of as demon defs; all of it is re-read at every
+summoning, like the rest of `assets/demons/`.
+
+**GATE** `demon-seals` (thresholds `demonSeals.*`): on a harness pad, D1's
+2-wide ring with Skerrick cast into it and your actor just outside on +x.
+A, sealed (sulfur north, iron east, two quicksilver cells inlaid west, two
+candles): cast_out severed (a cast at you refused, inside allowed); blink open
+(a blink inside allowed, still contained); touch severed (blows refused, none
+through); the wind -- all but two sulfur cells cleared through the queue --
+opens cast_out within `flipTicksMax`; a release through TickInput holds
+(released, not targeting, `imp_bound`); run twice, identical trace. B, plain:
+cast_out and touch open (blows through, none refused); staring at him fills
+the strain and costs the circle; looking away lowers it; his power raised to
+1000, a release is overpowered and he is unbound and hunting. C: the tell
+table answers by margin.

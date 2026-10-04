@@ -10,11 +10,11 @@
 //     in the tick, session.cpp, next to the dev mana overrides);
 //   * SANDVOX_ALL_NAMES=1 (D1 owns that env read; it can call GrantDemonNames).
 //
-// ONE PLACE says which glyphs are names. Today: a glyph whose id starts with
-// "summon_" (the plan names them summon_<demon>). When D1's summon verb lands
-// the test can become "its program uses SpellVerb::Summon" HERE, and every
-// caller follows. GrantAllAndBind's exclusion of names (D1) should ask this
-// too, so the debug grant and the exclusion can never disagree.
+// ONE PLACE says which glyphs are names: a glyph whose verb is `summon`
+// (SpellVerb::Summon, D1; the ids are summon_<demon> by convention only).
+// GrantAllAndBind's exclusion of names (caster.h) and the R reload's carry of
+// learned names (main.cpp) ask this too, so the debug grant, the dev button
+// and the exclusion can never disagree.
 
 #pragma once
 

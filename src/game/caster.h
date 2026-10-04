@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "game/demon_lore.h"   // demon::IsNameGlyph: which glyphs are names
 #include "game/spell.h"
 
 // The PLAYER's side of the spell system: what glyphs they own, which are bound
@@ -83,13 +84,23 @@ struct GlyphInventory {
   // THE DEBUG DEFAULT (plan §12a: ownership is real, the acquisition loop —
   // loot, tutors — is out of scope; Grant/Owns are its seam). Grants every
   // glyph and binds the first bank in library order.
-  void GrantAllAndBind(const GlyphLibrary& lib) {
+  //
+  // EXCEPT A DEMON'S NAME (verb `summon`, docs/PLAN_demons.md D1): a name is
+  // knowledge you have to FIND (a book, a teacher -- dialogue `grant`), so the
+  // placeholder never hands it out (game/demon_lore.h IsNameGlyph says what
+  // a name is). `withNames` (game/demon.h DebugAllDemonNames:
+  // SANDVOX_ALL_NAMES=1) is the debug switch that does; the dev panel's
+  // "learn all demon names" (demon::GrantAllNames) is the other.
+  // Name glyphs are appended after every other glyph, so excluding them moves
+  // no binding in the first bank.
+  void GrantAllAndBind(const GlyphLibrary& lib, bool withNames = false) {
     owned.clear();
     for (int i = 0; i < kGlyphSlots; i++) {
       bound[i] = -1;
       page[i].clear();
     }
     for (int i = 0; i < (int)lib.glyphs.size(); i++) {
+      if (!withNames && demon::IsNameGlyph(lib, i)) continue;
       owned.push_back(i);
       if (i < kGlyphSlots) bound[i] = i;
     }

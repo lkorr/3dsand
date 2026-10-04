@@ -180,7 +180,7 @@ const VerbName kVerbNames[] = {
     {"mend", SpellVerb::Mend},       {"trail", SpellVerb::Trail},
     {"sustain", SpellVerb::Sustain}, {"filter", SpellVerb::Filter},
     {"repeat", SpellVerb::Repeat},   {"launch", SpellVerb::Launch},
-    {"strike", SpellVerb::Strike},
+    {"strike", SpellVerb::Strike},   {"summon", SpellVerb::Summon},
 };
 
 bool ParseModField(const std::string& s, ModField& out) {
@@ -832,6 +832,21 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
           if ((st.boltMat == 0 || st.height == 0) && (st.splashMat == 0 || st.arcs == 0)) {
             // Neither a bolt nor a splash: a word that does nothing.
             errors += where + "is a strike with neither a bolt nor a splash\n";
+            return false;
+          }
+        }
+        if (d.verb == SpellVerb::Summon) {
+          // THE SUMMON BLOCK (docs/PLAN_demons.md D1): which demon, by its
+          // assets/demons/<name>.json stem. Not resolved here -- the demon
+          // library is the owner's and hot-reloads on its own; an unknown
+          // name is refused (and the tariff refunded) at the summoning.
+          const json sj = g.value("summon", json::object());
+          GlyphSummon& su = d.summon;
+          su.has = true;
+          su.demon = sj.value("demon", std::string());
+          su.mana = ClampI(sj.value("mana", 40), 1, 100000);
+          if (su.demon.empty()) {
+            errors += where + "is a summon that names no demon\n";
             return false;
           }
         }
@@ -2015,6 +2030,8 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
     }
     case SpellVerb::Mend: return g ? ScaleMille(g->perTick, e.Scale(), 1) : e.n;
     case SpellVerb::Strike: return g ? StrikeVolume(*g, e.Scale()) : 0;
+    // One body, whatever the repetition: a name said twice is one demon.
+    case SpellVerb::Summon: return g && g->summon.has ? 1 : 0;
     case SpellVerb::Filter: return Cube(e.radius);
     case SpellVerb::Trail: {
       int32_t v = 0;
@@ -2122,6 +2139,10 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
       return std::max<int32_t>(
           1, (int32_t)(((int64_t)full * g->strike.tariffMille + 500) / 1000));
     }
+    case SpellVerb::Summon:
+      // The demon's own price (glyphs.json `summon.mana`), flat: a name
+      // repeated is not a bigger demon.
+      return g && g->summon.has ? g->summon.mana : 0;
     case SpellVerb::Trail: {
       int32_t t = 0;
       for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariffIn(lib, i, withCarry));
@@ -2845,6 +2866,11 @@ std::string EffectPhraseBase(const GlyphLibrary& lib, const EffectInst& e) {
         return "calls down a bolt of lightning on the tallest conductor near it" + times;
       return "goes off in a crackle of arcs" + times;
     }
+    case SpellVerb::Summon: {
+      const GlyphDef* sg = lib.At(e.glyph);
+      return "calls the demon " + (sg ? sg->summon.demon : std::string("?")) +
+             " up where it lands -- into a salt circle, or loose";
+    }
     case SpellVerb::Mend:
       return "draws " + MatName(lib, e.glyphA, e.matA, e.anyA) +
              " into the caster's missing anatomy";
@@ -3463,6 +3489,21 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         out.strikes.push_back(sk);
         break;
       }
+      case SpellVerb::Summon: {
+        // THE VM REPORTS, THE OWNER SUMMONS: a demon is a body, and reading
+        // the salt circle needs the snapshot stores -- neither of which the
+        // VM may reach. game/demon.h takes it from here (session.cpp).
+        if (!g || !g->summon.has) break;
+        SpellSummon su;
+        su.x = cx;
+        su.y = cy;
+        su.z = cz;
+        su.glyph = e.glyph;
+        su.salt = Hash3(here, 0x5D3A1u, (uint32_t)ei);
+        su.tariff = EffectTariffIn(lib, e, false);
+        out.summons.push_back(su);
+        break;
+      }
       case SpellVerb::Launch: {
         // RULE 2 AT RUNTIME. A box does not reach into the system — it asks,
         // and the system adopts the request at the end of the call. The only
@@ -4036,7 +4077,7 @@ bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int3
                 dz = z - SpellFxFloor(f.at.z);
   if (dx * dx + dy * dy + dz * dz > (int64_t)f.radius * f.radius) return false;
   // kindMode: 0 = paint op, 1 = overwrite op, 2 = melt op, 3 = spawn,
-  //           4 = explosion, 5 = wind, 6 = strike
+  //           4 = explosion, 5 = wind, 6 = strike, 7 = summon
   switch (w->sort) {
     case GlyphSort::Matter:
       if (w->wildcard) return kindMode <= 3;   // `anything null`: all matter ops
@@ -4050,6 +4091,9 @@ bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int3
         case SpellVerb::Explode: return kindMode == 4;
         case SpellVerb::Wind: return kindMode == 5;
         case SpellVerb::Strike: return kindMode == 6;
+        // `summon_X null`: a ward against that NAME (kindMode 7 carries the
+        // summon's glyph index in `material`).
+        case SpellVerb::Summon: return kindMode == 7 && material == (uint32_t)f.glyph;
         default: return false;
       }
     default:
@@ -4060,7 +4104,8 @@ bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int3
 int SpellSystem::FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
                                std::vector<ParticleSpawn>& spawns,
                                std::vector<WindPrim>& winds,
-                               std::vector<SpellStrike>* strikes) const {
+                               std::vector<SpellStrike>* strikes,
+                               std::vector<SpellSummon>* summons) const {
   if (filters_.empty() || !lib_) return 0;
   int n = 0;
   auto sweep = [&](auto& v, auto pred) {
@@ -4098,6 +4143,10 @@ int SpellSystem::FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionO
   if (strikes)
     sweep(*strikes, [&](const SpellFilter& f, const SpellStrike& o) {
       return FilterRefuses(f, o.x, o.y, o.z, 0, 6);
+    });
+  if (summons)
+    sweep(*summons, [&](const SpellFilter& f, const SpellSummon& o) {
+      return FilterRefuses(f, o.x, o.y, o.z, (uint32_t)o.glyph, 7);
     });
   return n;
 }

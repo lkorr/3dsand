@@ -25,6 +25,8 @@
 #include "sim/trample.h"
 #include "sim/plants.h"
 #include "game/bodyreg.h"
+#include "game/demon.h"
+#include "game/demon_lore.h"
 #include "game/brush.h"
 #include "game/burnprof.h"
 #include "game/persist.h"
@@ -7524,6 +7526,8 @@ int main(int argc, char** argv) {
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
   // that hotbar slot; an empty selected slot takes the hand's item back).
   KeyEdge eQ, eE;
+  // RELEASE THE DEMON (demons D3): Y, while your demon is contained.
+  KeyEdge eY;
   // THE CONVERSATION KEYS (game/dialogue.h): 1-9 answer, Space/Enter
   // continue. Their own edges: the number row's other bindings are gated off
   // while the panel is up, and a held key must answer once.
@@ -7603,7 +7607,9 @@ int main(int argc, char** argv) {
   SpellSystem& spells = session.spells;
   spells.SetLibrary(&glyphs);
   PlayerCaster& caster = session.caster;
-  caster.inventory.GrantAllAndBind(glyphs);   // placeholder acquisition
+  // Every glyph but the demons' NAMES, which SANDVOX_ALL_NAMES=1 adds
+  // (game/demon.h DebugAllDemonNames; D2's book is the real way).
+  caster.inventory.GrantAllAndBind(glyphs, DebugAllDemonNames());   // placeholder acquisition
   caster.Recompile(glyphs);
   // Health lives on PlayerAvatar's per-part hp, read through this indirection
   // so the VM never includes the avatar (thesis 4 in spell.h).
@@ -12523,6 +12529,10 @@ int main(int argc, char** argv) {
     if (captured && ui.devControls && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
     if (captured && ui.devControls && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
     if (captured && ui.devControls && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
+    // Y lets your contained demon out of its circle (game/demon_seals.h): the
+    // tick weighs the circle's strength against its power there and then.
+    if (eY.Pressed(key(GLFW_KEY_Y)) && captured && ui.demonState == 1)
+      feeder.Press(TB_DEMON_RELEASE);
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
     if (captured && ui.devControls && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
@@ -12937,10 +12947,18 @@ int main(int argc, char** argv) {
               boundNames[i] = glyphs.glyphs[gi].id;
             boundPages[i] = caster.inventory.PageAt(i);
           }
+          // ...and the demon NAMES the player has LEARNED (a book's `grant`):
+          // GrantAllAndBind does not hand those out, so they are carried over
+          // by name like the bindings.
+          std::vector<std::string> learnedNames;
+          for (int gi : caster.inventory.owned)
+            if (demon::IsNameGlyph(glyphs, gi))
+              learnedNames.push_back(glyphs.glyphs[gi].id);
           if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
             glyphs = std::move(next);
             spells.Clear();          // live projectiles hold stale glyph indices
-            caster.inventory.GrantAllAndBind(glyphs);   // acquisition placeholder
+            caster.inventory.GrantAllAndBind(glyphs, DebugAllDemonNames());   // acquisition placeholder
+            for (const std::string& nm : learnedNames) caster.inventory.Grant(glyphs.Find(nm));
             // Re-bind by name over the identity mapping GrantAllAndBind just
             // laid down. A name that no longer exists leaves the slot EMPTY
             // rather than pointing at whatever now occupies that index — the

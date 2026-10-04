@@ -57,6 +57,8 @@
 #include <vector>
 
 #include "game/bodyreg.h"
+#include "game/demon.h"
+#include "game/demon_circle.h"
 #include "game/dialogue.h"
 #include "game/mob.h"
 #include "game/schedule.h"
@@ -96,6 +98,9 @@ struct VoxBox {
   IVec3 lo{};      // world cell of index 0
   IVec3 n{};       // size in cells (multiples of 16)
   std::vector<uint16_t> mat;
+  // The low 16 bits of each word (material + the state nibble: a powder's
+  // MASS), for D1's detector, which weighs salt by mass.
+  std::vector<uint16_t> word;
   bool In(int x, int y, int z) const {
     return x >= lo.x && y >= lo.y && z >= lo.z && x < lo.x + n.x && y < lo.y + n.y && z < lo.z + n.z;
   }
@@ -109,6 +114,7 @@ bool ReadBox(Ctx& c, IVec3 lo, IVec3 n, VoxBox& b, std::string& why) {
   b.lo = lo;
   b.n = n;
   b.mat.assign((size_t)n.x * n.y * n.z, 0);
+  b.word.assign((size_t)n.x * n.y * n.z, 0);
   std::vector<uint32_t> w(kChunkVol);
   for (int cz = 0; cz < n.z / 16; cz++)
     for (int cy = 0; cy < n.y / 16; cy++)
@@ -122,8 +128,12 @@ bool ReadBox(Ctx& c, IVec3 lo, IVec3 n, VoxBox& b, std::string& why) {
         for (int z = 0; z < 16; z++)
           for (int y = 0; y < 16; y++)
             for (int x = 0; x < 16; x++)
-              b.mat[b.Idx(wc.x * 16 + x, wc.y * 16 + y, wc.z * 16 + z)] =
-                  (uint16_t)(w[((uint32_t)z * kChunk + (uint32_t)y) * kChunk + (uint32_t)x] & 0xFFFu);
+            {
+              const uint32_t wd = w[((uint32_t)z * kChunk + (uint32_t)y) * kChunk + (uint32_t)x];
+              const size_t i = b.Idx(wc.x * 16 + x, wc.y * 16 + y, wc.z * 16 + z);
+              b.mat[i] = (uint16_t)(wd & 0xFFFu);
+              b.word[i] = (uint16_t)(wd & 0xFFFFu);
+            }
       }
   return true;
 }
@@ -460,6 +470,35 @@ Status GateHarrowbyCellar(Ctx& c, std::string& detail) {
     gapOpens = !flood(cut).first;
     check(gapOpens, "a ring with one band erased still reads as closed: the check cannot fail");
   }
+  // ...AND D1'S OWN DETECTOR (game/demon_circle.h ScanCircle, the one a
+  // summoning runs, salt weighed by mass, assets/demons/circle.json) reads the
+  // same ring CLOSED from its centre, the feet on the ring's row.
+  bool d1Closed = false;
+  CircleShape d1;
+  if (closed) {
+    DemonLibrary dl;
+    std::string dlog;
+    LoadDemons(ad + "/demons", dl, dlog);
+    CircleParams cp;
+    cp.saltMat = kSalt;
+    cp.minEighths = (uint32_t)dl.circle.minEighths;
+    cp.radiusMax = std::max(1, (int)std::lround(MetresToCells(dl.circle.radiusMaxM)));
+    cp.slabBelow = dl.circle.slabBelow;
+    cp.slabAbove = dl.circle.slabAbove;
+    CircleProbe probe;
+    probe.ctx = &vb;
+    probe.wordAt = [](void* ctx, int32_t x, int32_t y, int32_t z, bool& known) -> uint32_t {
+      const VoxBox& b = *(const VoxBox*)ctx;
+      known = b.In(x, y, z);
+      return known ? b.word[b.Idx(x, y, z)] : 0u;
+    };
+    d1 = ScanCircle(probe, cp, ringCx + blo.x, ringY, ringCz + blo.z);
+    d1Closed = d1.Closed();
+    check(d1Closed, Format("D1's detector reads the cellar ring %s (%d inside, %d salt columns, "
+                           "unseen (%d,%d,%d))",
+                           CircleVerdictName(d1.verdict), d1.cells, d1.ringCells, d1.unknownAt.x,
+                           d1.unknownAt.y, d1.unknownAt.z));
+  }
 
   // E. candles at the cardinal points, the three piles, the dish.
   int quarter[4] = {0, 0, 0, 0};   // +x, -x, +z, -z
@@ -629,6 +668,8 @@ Status GateHarrowbyCellar(Ctx& c, std::string& detail) {
       closed ? "CLOSED" : "OPEN", innerD, gapOpens ? "yes" : "no", flames, quarter[0], quarter[1], quarter[2],
       quarter[3], pileN[kSulfur], pileN[kIron], pileN[kQuick], strayQuick, notesErrors, longest,
       grantLine.c_str());
+  detail += Format(" | D1 detector: %s (%d inside, %d salt columns)", CircleVerdictName(d1.verdict),
+                   d1.cells, d1.ringCells);
   if (!why.empty()) {
     detail += " | FAIL: " + why[0];
     for (size_t i = 1; i < why.size() && i < 6; i++) detail += " | " + why[i];

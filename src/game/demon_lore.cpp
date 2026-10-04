@@ -9,7 +9,9 @@ namespace demon {
 
 bool IsNameGlyph(const GlyphLibrary& lib, int index) {
   if (index < 0 || index >= (int)lib.glyphs.size()) return false;
-  return lib.glyphs[(size_t)index].id.rfind("summon_", 0) == 0;
+  // D1 landed: a name is a glyph whose verb is `summon` (spell.h
+  // SpellVerb::Summon), whatever its id.
+  return lib.glyphs[(size_t)index].verb == SpellVerb::Summon;
 }
 
 int GrantAllNames(GlyphInventory& inv, const GlyphLibrary& lib) {
