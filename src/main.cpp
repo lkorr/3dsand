@@ -2906,9 +2906,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     renderAt({(float)(gx - 11) + 0.5f, (float)(yP + 6), (float)(gz - 4)}, 1.5708f, -0.12f,
              "screenshot_elec_arc.bmp", (int64_t)duskTick);
     boltfx::Clear();
-    // Under the pond: the eye in its lower layer, looking along it.
-    render({(float)(px0 + 2) + 0.5f, (float)(yP - 1) + 0.45f, (float)(pz0 + 2) + 0.5f},
-           0.6f, -0.05f, "screenshot_elec_uw.bmp");
+    // Under the pond: the eye in its lower layer, looking back along it at
+    // the electrode (the most charged water, and the copper crawling).
+    render({(float)(px0 + 9) + 0.5f, (float)(yP - 1) + 0.45f, (float)ez + 0.5f},
+           3.1416f, -0.02f, "screenshot_elec_uw.bmp");
     // THE BOLT: a storm's ground strike planned onto the rod (no probe: the
     // shot has no mirror, so it lands at the aim -- the rod's top), emitted
     // through the queue like every strike, and handed to the frame's bolt

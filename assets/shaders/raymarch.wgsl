@@ -338,7 +338,7 @@ fn elecGlow(c : vec3<i32>, p : u32, hp : vec3f) -> vec3f {
 // non-empty AND the eye is under a liquid surface.
 const ELEC_UW_TAPS : u32 = 8u;
 const ELEC_UW_REACH : f32 = 64.0;
-const ELEC_UW_GAIN : f32 = 0.03;      // per cell of charged path, x the glow level
+const ELEC_UW_GAIN : f32 = 0.05;      // per cell of charged path, x the glow level
 fn elecUnderwater(ro : vec3f, rd : vec3f, pathVox : f32) -> vec3f {
   let reach = min(max(pathVox, 1.0), ELEC_UW_REACH);
   let step = reach / f32(ELEC_UW_TAPS);
