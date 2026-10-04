@@ -1333,6 +1333,37 @@ struct SplatterEvent {
   bool doneAvatar = false;  // applied to the player's avatar
 };
 
+// ONE CREATURE'S SPLATTER, DEFERRED (PLAN_fight64_perf M). MobSystem::
+// StainLimbs flies every burst at every creature across the work pool, one
+// task per creature; a task writes that creature's lattices and coat flags
+// itself and RECORDS what would touch shared state -- the micro-brick
+// copy-on-write and stain pokes (the pool is everybody's) and the diagnostic
+// counters -- for the serial replay, which then runs them in exactly the
+// (burst, creature, limb, landing) order the inline loop did.
+struct SplatSink {
+  struct Poke {
+    int16_t x = 0, y = 0, z = 0;
+    uint16_t stain = 0;
+  };
+  struct Group {          // one SplatterView call that changed a coat
+    uint32_t event = 0;   // index into the replayed burst list
+    int32_t limb = -1;
+    uint32_t begin = 0, end = 0;   // its pokes
+  };
+  std::vector<Poke> pokes;
+  std::vector<Group> groups;
+  uint32_t curEvent = 0;
+  int32_t curLimb = -1;
+  uint32_t splatBlocked = 0, splatPassed = 0;
+  uint64_t indexBuilds = 0, indexCells = 0;
+  void Clear() {
+    pokes.clear();
+    groups.clear();
+    splatBlocked = splatPassed = 0;
+    indexBuilds = indexCells = 0;
+  }
+};
+
 // Everything BuildMobDef reads that is not the sidecar in front of it: the mob
 // directory, the material table and the shared clip library. Defined in
 // mob.cpp, because a MobSource and a clip-library entry are the loader's own
@@ -4411,7 +4442,10 @@ class Mob {
                  uint32_t& rainBudget);
   // Replay one queued burst against this creature's limbs: each droplet that
   // would land on a limb marks the voxel where it lands.
-  void ApplySplatter(const SplatterEvent& e);
+  // `sink` non-null: the work-pool form (SplatSink); `eventIndex` tags what it
+  // records.
+  void ApplySplatter(const SplatterEvent& e, SplatSink* sink = nullptr,
+                     uint32_t eventIndex = 0);
   // A sphere enclosing every limb's splatter bound (the box SplatterView
   // tests), padded by a voxel so a reject against it is conservative. False
   // when no limb has a body. MobSystem::StainLimbs culls whole creatures
@@ -7393,7 +7427,8 @@ class MobSystem {
   // One burst replayed against one lattice (Mob::ApplySplatter's per-limb
   // body): true when a voxel's coat changed. `salt` keys the draws — the limb
   // index on a rig, a hash of the body id on a severed part.
-  bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt);
+  bool SplatterView(const SplatterEvent& e, BurnLimbView& v, uint32_t salt,
+                    SplatSink* sink = nullptr);
   // ...and that replay over every dead-flesh debris body -- severed limbs and
   // gobbets (StainLimbs' splatter loop; a corpse's limbs are a rig's).
   void SplatterDeadFlesh(const SplatterEvent& e);
@@ -7762,7 +7797,9 @@ class MobSystem {
   // Build the dense neighbour index over a limb's current lattice and seed the
   // front from whatever is already alight. O(voxels + boundingBox), paid once
   // when something reactive first comes near the limb.
-  void BuildBurnIndex(BurnLimbView& v);
+  // `sink` non-null: count into it rather than into burnStats_ (a work-pool
+  // task may not write the shared counters).
+  void BuildBurnIndex(BurnLimbView& v, SplatSink* sink = nullptr);
   // The material a voxel of `mat` becomes when it catches: the product of the
   // first rule in its bucket whose product carries tag:hot. 0 = cannot burn.
   // Resolved from the table at load, so no material id is ever named in code.
@@ -7957,6 +7994,9 @@ class MobSystem {
   std::vector<uint8_t> matSelfDryingOnly_;
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
+  // One per creature: StainLimbs' splatter tasks (SplatSink). Kept so the
+  // vectors keep their capacity across ticks.
+  std::vector<SplatSink> splatSinks_;
   BurnStats burnStats_{};
   // Reaction effects that fired ON a body this tick (BurnOneLimb's
   // noteBodyFx), drained by game/session.cpp's reaction-effect pass through

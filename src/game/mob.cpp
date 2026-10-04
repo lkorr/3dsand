@@ -14020,7 +14020,7 @@ void MobSystem::BuildCrossHeat(const std::vector<BurnLimbView*>& parts,
   burnStats_.crossCells += (uint32_t)w;
 }
 
-void MobSystem::BuildBurnIndex(BurnLimbView& v) {
+void MobSystem::BuildBurnIndex(BurnLimbView& v, SplatSink* sink) {
   burnprof::Scope bpScope(burnprof::kIndex);
   BodyBurnState& st = *v.burn;
   const size_t n = v.Size();
@@ -14044,8 +14044,13 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   // right: it makes the limb un-burnable this tick rather than spending the
   // memory, and no authored rig comes near the ceiling.
   if (cells > (1u << 20)) return;
-  burnStats_.indexBuilds++;
-  burnStats_.indexCells += cells;
+  if (sink) {
+    sink->indexBuilds++;
+    sink->indexCells += cells;
+  } else {
+    burnStats_.indexBuilds++;
+    burnStats_.indexCells += cells;
+  }
 
   st.min = mn;
   st.dims = dims;
@@ -20484,6 +20489,10 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
 // free and a replay should look the same.
 // ============================================================================
 
+namespace {
+bool OwnForStain(BurnLimbView& v, MicroBodySet* micro);  // below
+}  // namespace
+
 void MobSystem::StainLimbs(uint32_t tick, World& world) {
   if (matGpu_.empty()) return;
   // Contact, under the shared lattice budget, start creature rotated by tick.
@@ -20544,29 +20553,80 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   // the sphere rejects SplatterView would have rejected too.
   static thread_local std::vector<Vec3> boundC;
   static thread_local std::vector<float> boundR;
-  bool boundsBuilt = false;
+  static thread_local std::vector<SplatterEvent*> evs;
+  evs.clear();
   for (SplatterEvent& e : splatters_) {
     if (e.doneMobs) continue;
     e.doneMobs = true;
-    if (!boundsBuilt) {
-      boundC.assign(mobs_.size(), Vec3{});
-      boundR.assign(mobs_.size(), -1.0f);
-      for (size_t i = 0; i < mobs_.size(); i++)
-        if (!mobs_[i].SplatterBound(boundC[i], boundR[i])) boundR[i] = -1.0f;
-      boundsBuilt = true;
+    evs.push_back(&e);
+  }
+  if (evs.empty()) return;
+  boundC.assign(mobs_.size(), Vec3{});
+  boundR.assign(mobs_.size(), -1.0f);
+  for (size_t i = 0; i < mobs_.size(); i++)
+    if (!mobs_[i].SplatterBound(boundC[i], boundR[i])) boundR[i] = -1.0f;
+  // ---- EVERY BURST AT ONE CREATURE PER TASK (PLAN_fight64_perf M) ---------
+  // A creature's landings read and write only its own lattices (and its own
+  // coat flags), so the creatures run across the work pool, each taking the
+  // bursts in their order; what touches shared state -- the micro brick's
+  // copy-on-write and stain pokes, the diagnostic counters -- is recorded in
+  // the creature's SplatSink and replayed below in the inline loop's exact
+  // (burst, creature, limb, landing) order, with each burst's severed-flesh
+  // pass where it always ran. Ghosts excluded, with the contact pass above: a
+  // splatter lands on SKIN, and a ghost's skin is owned elsewhere (see
+  // Mob::StainTick). The task names main-thread storage through these
+  // pointers: the thread_locals above are the CALLER's, and a worker naming
+  // them would get its own empty ones.
+  if (splatSinks_.size() < mobs_.size()) splatSinks_.resize(mobs_.size());
+  SplatSink* sinks = splatSinks_.data();
+  const Vec3* bc = boundC.data();
+  const float* br = boundR.data();
+  SplatterEvent* const* ev = evs.data();
+  const uint32_t ne = (uint32_t)evs.size();
+  workpool::ParallelFor(mobs_.size(), 1, [&, sinks, bc, br, ev, ne](size_t i) {
+    SplatSink& s = sinks[i];
+    s.Clear();
+    Mob& mob = mobs_[i];
+    if (mob.IsGhost() || br[i] < 0.0f) return;
+    for (uint32_t ei = 0; ei < ne; ei++) {
+      const SplatterEvent& e = *ev[ei];
+      if ((bc[i] - e.origin).len() - br[i] > e.reach) continue;
+      mob.ApplySplatter(e, &s, ei);
     }
-    // Ghosts excluded, with the contact pass above: a splatter lands on SKIN,
-    // and a ghost's skin is owned elsewhere (see Mob::StainTick).
+  });
+  std::vector<size_t> gcur(mobs_.size(), 0);
+  for (uint32_t ei = 0; ei < ne; ei++) {
     for (size_t i = 0; i < mobs_.size(); i++) {
-      Mob& mob = mobs_[i];
-      if (mob.IsGhost() || boundR[i] < 0.0f) continue;
-      if ((boundC[i] - e.origin).len() - boundR[i] > e.reach) continue;
-      mob.ApplySplatter(e);
+      SplatSink& s = sinks[i];
+      size_t& g = gcur[i];
+      while (g < s.groups.size() && s.groups[g].event == ei) {
+        const SplatSink::Group& G = s.groups[g++];
+        MobLimb& L = mobs_[i].limbs_[(size_t)G.limb];
+        BurnLimbView v;   // OwnForStain reads these three and nothing else
+        v.microModel = &L.microModel;
+        v.carved = &L.carved;
+        v.flipbook = &L.flipbookModel;
+        bool owned = false;
+        for (uint32_t p = G.begin; p < G.end; p++) {
+          if (!owned) owned = OwnForStain(v, microSet_);
+          if (owned) {
+            const SplatSink::Poke& k = s.pokes[p];
+            MicroBodyPokeStain(*microSet_, (uint32_t)L.microModel, k.x, k.y, k.z,
+                               k.stain);
+          }
+        }
+      }
     }
     // (Dead Mobs are in that loop: a corpse is a rig.) ...and severed flesh
     // lying in its way, the same replay per debris body (owner report
     // 2026-09-22: a body beside someone bleeding stayed clean).
-    SplatterDeadFlesh(e);
+    SplatterDeadFlesh(*ev[ei]);
+  }
+  for (size_t i = 0; i < mobs_.size(); i++) {
+    wornStats_.splatBlocked += sinks[i].splatBlocked;
+    wornStats_.splatPassed += sinks[i].splatPassed;
+    burnStats_.indexBuilds += sinks[i].indexBuilds;
+    burnStats_.indexCells += sinks[i].indexCells;
   }
 }
 
@@ -22084,7 +22144,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
 }
 
 bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
-                             uint32_t salt) {
+                             uint32_t salt, SplatSink* sink) {
   if (e.count <= 0 || e.amount == 0 || e.mat == 0) return false;
   const Tuning& tune = CurrentTuning();
   const auto& gt = tune.gore;
@@ -22168,6 +22228,7 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
   };
 
   bool owned = false, changed = false;
+  bool sinkGroupOpen = false;   // this call's SplatSink::Group is pushed
   // ONE VIEW, one pass. A do/while(false) so every "this limb is out of
   // reach" exit below reads as the `continue` it was when this walked a
   // creature's limbs itself (Mob::ApplySplatter now does the walking, and
@@ -22237,7 +22298,7 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
 
     // Something will be thrown at it: the index, then one arc per trial.
     BodyBurnState& st = *v.burn;
-    if (st.idx.empty()) BuildBurnIndex(v);
+    if (st.idx.empty()) BuildBurnIndex(v, sink);
     if (st.idx.empty()) continue;
     st.quiet = 0;
     st.holdBy |= BodyBurnState::kHoldSplatter;
@@ -22283,6 +22344,23 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
       if (next == cur) return;
       v.SetStain(vi, next);
       changed = true;
+      if (sink) {
+        // The brick is the shared pool's: recorded, replayed in order by
+        // StainLimbs (SplatSink), with the copy-on-write at the first poke
+        // of this call exactly as below.
+        const IVec3 pp = v.At(vi);
+        if (!sinkGroupOpen) {
+          SplatSink::Group g;
+          g.event = sink->curEvent;
+          g.limb = sink->curLimb;
+          g.begin = g.end = (uint32_t)sink->pokes.size();
+          sink->groups.push_back(g);
+          sinkGroupOpen = true;
+        }
+        sink->pokes.push_back({(int16_t)pp.x, (int16_t)pp.y, (int16_t)pp.z, next});
+        sink->groups.back().end = (uint32_t)sink->pokes.size();
+        return;
+      }
       if (!owned) owned = OwnForStain(v, microSet_);
       if (owned) {
         const IVec3 pp = v.At(vi);
@@ -22429,10 +22507,12 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
               const float vl = vel.len();
               backW = vl > 1e-6f ? vel * (-1.0f / vl) : Vec3{0, 1, 0};
               if (shielded(lx, ly, lz)) {
-                wornStats_.splatBlocked++;
+                if (sink) sink->splatBlocked++;
+                else wornStats_.splatBlocked++;
                 continue;  // on the shell: `landed` ends this droplet
               }
-              wornStats_.splatPassed++;
+              if (sink) sink->splatPassed++;
+              else wornStats_.splatPassed++;
             }
             splat(lx, ly, lz, h);
           }
@@ -22482,8 +22562,10 @@ bool Mob::SplatterBound(Vec3& centre, float& radius) const {
   return true;
 }
 
-void Mob::ApplySplatter(const SplatterEvent& e) {
+void Mob::ApplySplatter(const SplatterEvent& e, SplatSink* sink,
+                        uint32_t eventIndex) {
   if (!sys_) return;
+  if (sink) sink->curEvent = eventIndex;
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
     if (!limb.body) continue;
@@ -22516,7 +22598,8 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
       v.occlude = &WornProbe::Call;
       v.occludeCtx = &probe;
     }
-    if (sys_->SplatterView(e, v, (uint32_t)li)) {
+    if (sink) sink->curLimb = (int32_t)li;
+    if (sys_->SplatterView(e, v, (uint32_t)li, sink)) {
       coatDirty_ = twinDirty_ = true;
       WakeDead();   // blood landing on a sleeping corpse wakes it
     }
