@@ -91,6 +91,9 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <queue>
 
 #include "game/anim.h"
@@ -109,11 +112,14 @@ static_assert(MobSystem::MaxLiveMobs() + kElecQueryPlayerReserve <= kElecQueryMa
 
 namespace {
 
-constexpr uint8_t kIns = 255;   // kElecResistInsulator as a body cell carries it
+constexpr uint16_t kIns = (uint16_t)kElecResistInsulator;   // 4095: no conduction
 // sim_step.wgsl ELEC_CRACKLE_CAP (200 per-mille of kReactChanceDen) and its
 // salts: a body cell's crackle and ignition roll as a world cell's do.
 constexpr uint32_t kElecCrackleCap = 200000u;
 constexpr uint32_t kOhmSalt = 0x0B0D1E5u, kCrackleSalt = 0x0C2AC1Eu;
+// Shell-lattice steps the cover ray may take: one world cell at the finest
+// art scale (8 a cell) and then some.
+constexpr int kCoverMarchMax = 24;
 
 // The world box of one rig slot's collider under its current pose. The stain
 // pass walks the same box (MobSystem::StainOneLimb's "IS ANYTHING THERE?").
@@ -160,11 +166,12 @@ int FloorDiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
 // Conductance of one voxel of resist r, 16.16-ish fixed point (0 = insulator),
 // and the resist of n voxels whose conductances sum to g: the voxels of a cell
 // in PARALLEL, n / sum(1 / r), rounded up, an insulator past 254.
-uint32_t Conductance(uint32_t r) { return (r == 0 || r >= kIns) ? 0u : 65535u / r; }
-uint8_t ParallelResist(uint64_t n, uint64_t g) {
+constexpr uint64_t kConductOne = 1ull << 24;
+uint32_t Conductance(uint32_t r) { return (r == 0 || r >= kIns) ? 0u : (uint32_t)(kConductOne / r); }
+uint16_t ParallelResist(uint64_t n, uint64_t g) {
   if (n == 0 || g == 0) return kIns;
-  const uint64_t r = (65535ull * n + g - 1) / g;
-  return r > 254 ? kIns : (uint8_t)std::max<uint64_t>(r, 1);
+  const uint64_t r = (kConductOne * n + g - 1) / g;
+  return r >= kIns ? kIns : (uint16_t)std::max<uint64_t>(r, 1);
 }
 
 uint64_t CellKey(IVec3 c) {
@@ -315,7 +322,9 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     int32_t slot = -1;
     int32_t cell = -1;      // index into the slot's ElecSlotCache::cells
     IVec3 w{};              // the world cell it sits in, this pose
-    uint8_t bulk = kIns, entry = kIns;
+    Vec3 at{};              // ...and its centre, in world voxels
+    uint16_t bulk = kIns, entry = kIns;
+    uint16_t spreadQ = 0;   // the spreading loss of entering it, /4096 of what arrives
   };
   std::vector<Node> nodes;
   for (uint32_t pi = 0; pi < parts.size(); pi++) {
@@ -330,7 +339,9 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       if (v.xf == nullptr || v.Size() == 0) continue;
       ElecSlotCache& c = m.elecCache_[li];
       const auto r0 = std::chrono::steady_clock::now();
-      if (RefreshElecSlotCache(v, wet, c)) shockCounters_.cacheBuilds++;
+      const int how = RefreshElecSlotCache(v, wet, tick, c);
+      if (how == 2) shockCounters_.cacheBuilds++;
+      else if (how == 1) shockCounters_.cacheAccums++;
       else shockCounters_.cacheHits++;
       shockCounters_.refreshNanos += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - r0)
@@ -347,6 +358,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
         nd.slot = li;
         nd.cell = (int32_t)ci;
         nd.w = {ifloor(w.x), ifloor(w.y), ifloor(w.z)};
+        nd.at = w;
         nd.bulk = e.bulk;
         nd.entry = e.entry;
         nodes.push_back(nd);
@@ -354,6 +366,29 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     }
   }
   if (nodes.empty()) return;
+  // THE SPREADING LOSS (wave 2 package A, sim_elec.wgsl elecEnter): a cell
+  // entered from a neighbour also loses prev x spreadQ(n) / 4096, n = its
+  // conducting face neighbours past sim.elecSpreadFree (a wire's two cost
+  // nothing; the current divides in bulk). n here counts the cell's own
+  // slot's neighbours -- the body's inside.
+  {
+    const uint32_t k = (uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 4095);
+    const uint32_t free = (uint32_t)std::clamp(tn.sim.elecSpreadFree, 0, 6);
+    for (Node& nd : nodes) {
+      if (k == 0 || nd.bulk == kIns) continue;
+      const ElecSlotCache& c = parts[nd.part].m->elecCache_[nd.slot];
+      const ElecBodyCell& e = c.cells[nd.cell];
+      uint32_t n = 0;
+      for (const IVec3& d : kFace6) {
+        const int x = e.c[0] + d.x - c.cmin.x, y = e.c[1] + d.y - c.cmin.y,
+                  z = e.c[2] + d.z - c.cmin.z;
+        if (x < 0 || y < 0 || z < 0 || x >= c.cdim.x || y >= c.cdim.y || z >= c.cdim.z) continue;
+        const int32_t ci = c.at[((size_t)z * c.cdim.y + y) * c.cdim.x + x];
+        if (ci >= 0 && c.cells[ci].bulk != kIns) n++;
+      }
+      if (n > free) nd.spreadQ = (uint16_t)std::min<uint32_t>((n - free) * k, 4095u);
+    }
+  }
   shockCounters_.bodiesSolved += parts.size();
   shockCounters_.cellsSolved += nodes.size();
   // World cell -> body cells there, sorted: contact between slots and bodies.
@@ -408,16 +443,55 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       const IVec3 n{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
       const uint32_t pn = GridWord(parts[nd.part].hit, n) & kElecQueryGridPMax;
       if (pn <= wp) continue;
-      if (body && shellAt(n)) owner.shock_.covered++;
+      // A shell cell in that world cell, or a shell met on the way there
+      // (Mob::WornShellAlong, the burn pass's ray: a limb is a rounded tube
+      // in a garment cut to its box, and the two lattices' world-pitch
+      // cells need not line up).
+      bool behind = body && shellAt(n);
+      if (body && !behind && owner.LimbHasShells(nd.slot)) {
+        uint32_t sm = 0;
+        behind = owner.WornShellAlong(nd.slot, nd.at, Vec3{(float)d.x, (float)d.y, (float)d.z},
+                                      1.0f, kCoverMarchMax, &sm, nullptr) >= 0;
+      }
+      if (behind) owner.shock_.covered++;
       else wp = pn;
     }
-    const int32_t seed = (int32_t)wp - (int32_t)nd.entry;
+    const int32_t seed =
+        (int32_t)wp - (int32_t)nd.entry - (int32_t)(((uint64_t)wp * nd.spreadQ) >> 12);
     if (seed > 0) {
       P[k] = seed;
       pq.push({seed, k});
       // ATTRIBUTION (CLAUDE.md rule 6): which rig slots took the world's
       // charge directly.
       owner.shock_.seededSlots |= 1ull << (nd.slot < 63 ? nd.slot : 63);
+      // SANDVOX_SHOCK_DEBUG=1: every seeded cell of a body's first seeded tick
+      // -- where it is, what it is made of, what it read (diagnostic only).
+      static const bool dbg = std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr;
+      if (dbg && owner.shock_.firstTick == 0 && owner.shock_.ticks == 0) {
+        std::string mats;
+        BurnLimbView dv = owner.ViewOf(owner.limbs_[nd.slot]);
+        const ElecSlotCache& dc = owner.elecCache_[nd.slot];
+        std::vector<uint32_t> seen;
+        for (size_t i = 0; i < dv.Size() && i < dc.vcell.size(); i++)
+          if (dc.vcell[i] == nd.cell && dc.vexp[i] &&
+              std::find(seen.begin(), seen.end(), dv.Mat(i)) == seen.end())
+            seen.push_back(dv.Mat(i));
+        for (uint32_t m : seen) mats += " " + std::to_string(m);
+        std::vector<uint32_t> coats;
+        for (size_t i = 0; i < dv.Size() && i < dc.vcell.size(); i++) {
+          const uint16_t st = dv.Stain(i);
+          if (dc.vcell[i] == nd.cell && dc.vexp[i] && BodyStainAmt(st) &&
+              std::find(coats.begin(), coats.end(), BodyStainMat(st)) == coats.end())
+            coats.push_back(BodyStainMat(st));
+        }
+        mats += " | coats";
+        for (uint32_t m : coats) mats += " " + std::to_string(m);
+        std::printf("shock-debug: tick %u mob %llu slot %d '%s' cell (%d,%d,%d) w (%d,%d,%d) "
+                    "entry %u bulk %u read P %u seed %d | exposed mats%s\n",
+                    tick, (unsigned long long)owner.id_, nd.slot, owner.SlotName(nd.slot).c_str(),
+                    dc.cells[nd.cell].c[0], dc.cells[nd.cell].c[1], dc.cells[nd.cell].c[2], nd.w.x,
+                    nd.w.y, nd.w.z, nd.entry, nd.bulk, wp, seed, mats.c_str());
+      }
     }
   }
   while (!pq.empty()) {
@@ -428,9 +502,10 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     const Node& nd = nodes[k];
     const Part& p = parts[nd.part];
     Mob& m = *p.m;
-    auto relax = [&](uint32_t j, uint8_t cost) {
+    auto relax = [&](uint32_t j, uint16_t cost) {
       if (cost == kIns) return;
-      const int32_t cand = pk - (int32_t)cost;
+      const int32_t cand =
+          pk - (int32_t)cost - (int32_t)(((uint64_t)(uint32_t)pk * nodes[j].spreadQ) >> 12);
       if (cand > P[j]) {
         P[j] = cand;
         pq.push({cand, j});
@@ -535,6 +610,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     }
     if (!touch.empty()) {
       shockCounters_.bodiesShocked++;
+      PushShockCue(mob, touch.front().limb, peak);  // the sound + HUD cue (presentation)
       if (rec.ticks == 0) rec.firstTick = tick;
       rec.ticks++;
       rec.lastTick = tick;
@@ -707,6 +783,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       shockCounters_.ohmicCells += ohm[li].size();
       shockCounters_.ohmicVoxels += n;
       rewrote = rewrote || n != 0;
+      if (n != 0) mob.elecCache_[li].fresh = false;   // its cells changed matter
     }
     if (rewrote) {
       mob.burnFracDirty_ = true;
@@ -729,9 +806,16 @@ uint64_t GeomMix(uint64_t h, uint64_t x) {
 }
 }  // namespace
 
-bool MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, ElecSlotCache& c) {
+int MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_t tick,
+                                    ElecSlotCache& c) {
   const size_t n = v.Size();
   const uint32_t s = std::max(1u, v.scale);
+  // REUSED AS IT STANDS within the cadence, when nothing a re-accumulation
+  // could not miss has moved: the lattice's size and scale, the table, the
+  // wet knob. Tick-keyed, so a pure function of the tick stream.
+  if (c.fresh && c.geomKey != 0 && c.vcell.size() == n && c.scale == s && c.gen == elecMatGen_ &&
+      c.wet == wet && tick - c.lastFull < kElecSlotRefreshTicks)
+    return 0;
   // ---- the geometry ---------------------------------------------------------
   auto buildGeometry = [&]() {
     c.cells.clear();
@@ -860,6 +944,10 @@ bool MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, ElecSl
     return h ? h : 1u;
   };
   bool rebuilt = false;
+  c.fresh = true;
+  c.gen = elecMatGen_;
+  c.wet = wet;
+  c.lastFull = tick;
   if (c.geomKey == 0 || c.vcell.size() != n || c.scale != s) {
     buildGeometry();
     rebuilt = true;
@@ -883,7 +971,7 @@ bool MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, ElecSl
         cell.ohmMat = e.om[j];
       }
   }
-  return rebuilt;
+  return rebuilt ? 2 : 1;
 }
 
 void MobSystem::TickStuns(uint32_t tick) {
@@ -905,4 +993,19 @@ void MobSystem::TickStuns(uint32_t tick) {
   for (Mob* av : avatars_)
     if (av != nullptr) twitch(*av);
   for (Mob& m : mobs_) twitch(m);
+}
+
+// The shock's cue for the frame (MobSystem::ShockCues): where it bit, how hard.
+// Intensity is the effective P against the knock-down P (gore.shockRagdollP),
+// so a lightning-class jolt is 1 and a tingle from wet ground is a fraction.
+void MobSystem::PushShockCue(const Mob& m, int limb, float peakP) {
+  constexpr size_t kMaxShockCues = 64;
+  if (shockCues_.size() >= kMaxShockCues) return;
+  const Tuning::Gore& g = CurrentTuning().gore;
+  ShockCue c;
+  c.mobId = m.id_;
+  c.posVoxel = limb >= 0 && limb < (int)m.limbs_.size() ? m.limbs_[limb].xf.pos : Vec3{};
+  const float ref = g.shockRagdollP > 0 ? (float)g.shockRagdollP : 30000.0f;
+  c.intensity = std::clamp(peakP / ref, 0.05f, 1.0f);
+  shockCues_.push_back(c);
 }

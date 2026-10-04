@@ -3459,6 +3459,7 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         sk.scaleMille = e.Scale();
         sk.strengthMille = strengthMille;
         sk.salt = Hash3(here, 0x5781CEu, (uint32_t)ei);
+        sk.tariff = EffectTariffIn(lib, e, false);
         out.strikes.push_back(sk);
         break;
       }
@@ -4089,13 +4090,23 @@ int SpellSystem::FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionO
   sweep(winds, [&](const SpellFilter& f, const WindPrim& o) {
     return FilterRefuses(f, o.x, o.y, o.z, 0, 5);
   });
-  // A strike is refused at its AIM (a `lightning null` ward over a village
-  // turns a bolt called on it away; the target search cannot reach past it).
+  // A strike is refused at its AIM here (a `lightning null` ward over a
+  // village turns a bolt called on it away). The target search can still move
+  // the bolt up to kStrikeMaxSearch cells, so the owner asks again at the cell
+  // it struck (StrikeWarded, session.cpp SpellStrikeToCells): a bolt aimed
+  // outside a ward's edge cannot reach in to a rod inside it.
   if (strikes)
     sweep(*strikes, [&](const SpellFilter& f, const SpellStrike& o) {
       return FilterRefuses(f, o.x, o.y, o.z, 0, 6);
     });
   return n;
+}
+
+bool SpellSystem::StrikeWarded(int32_t x, int32_t y, int32_t z) const {
+  if (!lib_) return false;
+  for (const SpellFilter& f : filters_)
+    if (FilterRefuses(f, x, y, z, 0, 6)) return true;
+  return false;
 }
 
 void SpellSystem::RequestBody(const SpellCast& cast, SpellFxVec originFx,

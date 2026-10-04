@@ -630,6 +630,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_alchemy.cpp
   src/test/selftest_chem.cpp
   src/test/selftest_elec_strike.cpp
+  src/test/selftest_elec_play.cpp
   src/test/selftest_elec.cpp
   src/test/selftest_elec_mob.cpp
   src/test/selftest_dye.cpp

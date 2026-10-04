@@ -33,6 +33,11 @@ constexpr float kFlaskFillRadius = 12.0f;  // metres
 constexpr float kSoundMs = 343.0f;
 constexpr size_t kMaxThunder = 8;
 constexpr float kThunderRadius = 600.0f;  // metres
+// Electricity (Cues::Zap / Cues::Shock): how far the crackle and the buzz
+// carry, and the least gap between two NPC shock voices.
+constexpr float kZapRadius = 90.0f;     // metres
+constexpr float kShockRadius = 40.0f;   // metres
+constexpr double kShockMinGap = 0.12;   // seconds
 
 // ---- material ambience ------------------------------------------------------
 // The 3x3x3 mirror is 48 voxels on a side. Sampling every 4th cell on each axis
@@ -159,6 +164,10 @@ const std::map<std::string, std::string> Cues::kSlotPrefix = {
     // Thunder (the `weather` owner): set weather/thunder, fixed in code like
     // the combat sets. See Cues::Thunder.
     {"thunder", "weather"},
+    // Electricity (the `electric` owner): sets electric/zap and
+    // electric/shock, fixed in code like the combat sets. See Cues::Zap and
+    // Cues::Shock.
+    {"zap", "electric"},       {"shock", "electric"},
 };
 
 namespace {
@@ -228,6 +237,7 @@ void Cues::RebuildMaterialTable(const std::vector<MaterialDef>& mats) {
   warnings_.clear();
   mobSetCache_.clear();  // a rescan may have added the set a mob asked for
   flaskSetId_ = -2;
+  thunderSetId_ = zapSetId_ = shockSetId_ = -2;
   const size_t n = mats.size();
   footstep_.assign(n, FootstepMapping{});
   land_.assign(n, FootstepMapping{});
@@ -706,6 +716,60 @@ void Cues::PlayDueThunder() {
     else stats_.dropped++;
   }
   thunder_.resize(w);
+}
+
+int Cues::ZapSetId() const {
+  if (zapSetId_ == -2) zapSetId_ = lib_.Find("electric/zap");
+  return zapSetId_;
+}
+
+int Cues::ShockSetId() const {
+  if (shockSetId_ == -2) shockSetId_ = lib_.Find("electric/shock");
+  return shockSetId_;
+}
+
+void Cues::Zap(const Vec3& posVox, float power) {
+  stats_.zaps++;
+  if (!enabled_) return;
+  const int setId = ZapSetId();
+  if (setId < 0) return;
+  if ((int)lastVariant_.size() <= setId) lastVariant_.assign((size_t)lib_.Count(), -1);
+  const std::vector<float>* buf = PickStep(setId, lastVariant_[(size_t)setId]);
+  const float p = std::clamp(power, 0.0f, 1.0f);
+  VoiceConfig cfg;
+  cfg.gain = 0.55f + 0.45f * p;
+  cfg.audibleRadius = kZapRadius;
+  cfg.verbWet = CurrentTuning().audio.reverbWet;
+  cfg.doppler = false;
+  cfg.rate = 0.9f + 0.2f * p;
+  if (world_.PlayOneShot(buf, posVox, cfg)) stats_.zapVoices++;
+  else stats_.dropped++;
+}
+
+void Cues::Shock(const Vec3& posVox, float intensity, bool onMe) {
+  stats_.shocks++;
+  if (!enabled_) return;
+  // A crowd standing in a charged pond is one buzz a beat, not twenty; the
+  // player's own jolt is never held back.
+  if (!onMe && now_ - lastShockVoice_ < kShockMinGap) return;
+  const int setId = ShockSetId();
+  if (setId < 0) return;
+  if ((int)lastVariant_.size() <= setId) lastVariant_.assign((size_t)lib_.Count(), -1);
+  const std::vector<float>* buf = PickStep(setId, lastVariant_[(size_t)setId]);
+  const float k = std::clamp(intensity, 0.0f, 1.0f);
+  VoiceConfig cfg;
+  cfg.gain = 0.45f + 0.55f * k;
+  cfg.audibleRadius = kShockRadius;
+  cfg.verbWet = CurrentTuning().audio.reverbWet;
+  cfg.doppler = false;
+  cfg.rate = 0.85f + 0.3f * k;
+  cfg.priority = onMe;
+  if (world_.PlayOneShot(buf, posVox, cfg)) {
+    stats_.shockVoices++;
+    if (!onMe) lastShockVoice_ = now_;
+  } else {
+    stats_.dropped++;
+  }
 }
 
 int Cues::MobSetId(const MobDef& def, MobEvent ev) const {

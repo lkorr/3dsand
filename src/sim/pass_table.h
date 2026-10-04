@@ -735,6 +735,9 @@ enum class Cond : uint8_t {
   // while k < elecRounds AND the CA runs. Round 0 and the head / settle / tail
   // rows are CaActive. One condition per round rather than a parameterised
   // one: a row carries no operand, and elec.h kElecRoundsMax bounds the list.
+  // Elec (wave 2): the head / round 0 / settle / tail / purge rows --
+  // CaActive AND RecordCtx::elecLive (World::ElecMayBeLive). ElecRk add both.
+  Elec,
   ElecR1,
   ElecR2,
   ElecR3,
@@ -1023,6 +1026,9 @@ struct RecordCtx {
   // The charge field's rounds this tick (Simulation::PrepareElec: sim.elecRounds,
   // or 1 with the layer off). Gates Cond::ElecR1..ElecR7.
   uint32_t elecRounds = 1;
+  // Can the field hold charge this tick (Simulation::SetElecLive, wave 2)?
+  // False = none of the elec rows records. Gates Cond::Elec / ElecR1..ElecR7.
+  bool elecLive = true;
   // The body query's boxes this tick (Simulation::PrepareElecQueries): the
   // elecQuery row's extent, and Cond::ElecQuery.
   uint32_t elecQueries = 0;

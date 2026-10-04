@@ -507,11 +507,17 @@ static void ParseElectric(const json& m, const std::string& path, MaterialDef& d
   }
   const int resist = t.value("resist", 0);
   if (resist < 0 || resist > (int)kElecResistInsulator - 1)
-    errors += at + ".resist must be 0..254 (0 = insulator)\n";
+    errors += at + ".resist must be 0..4094 (0 = insulator)\n";
   d.elec.resist = (uint32_t)std::clamp(resist, 0, (int)kElecResistInsulator - 1);
   const int source = t.value("source", 0);
   if (source < 0 || source > (int)kElecPMax) errors += at + ".source must be 0..65535\n";
   d.elec.source = (uint32_t)std::clamp(source, 0, (int)kElecPMax);
+  // Wave 2: the resist a conducting liquid falls to with this dissolved in
+  // it at saturation (salt -> brine). 0 = not an electrolyte.
+  const int dissolved = t.value("dissolved", 0);
+  if (dissolved < 0 || dissolved > (int)kElecResistInsulator - 1)
+    errors += at + ".dissolved must be 0..4094 (0 = not an electrolyte)\n";
+  d.elec.dissolved = (uint32_t)std::clamp(dissolved, 0, (int)kElecResistInsulator - 1);
   if (t.contains("ignite")) {
     const json& g = t["ignite"];
     if (!g.is_object() || !g.contains("into") || !g["into"].is_string()) {
@@ -539,8 +545,8 @@ static void ParseElectric(const json& m, const std::string& path, MaterialDef& d
   d.elec.shockMille = (uint32_t)std::clamp(shock, 0, 1000);
   for (auto& [key, v] : t.items()) {
     (void)v;
-    if (key != "resist" && key != "source" && key != "ignite" && key != "char" &&
-        key != "shock" && key != "note")
+    if (key != "resist" && key != "source" && key != "ignite" && key != "char" && key != "note" &&
+        key != "dissolved" && key != "shock")
       errors += at + ": unknown key \"" + key + "\"\n";
   }
 }

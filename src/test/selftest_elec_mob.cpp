@@ -62,6 +62,7 @@
 #include "sim/oprecord.h"
 #include "sim/tuning.h"
 #include "sim/voxload.h"   // kBodyStainAmtMax: a full coat
+#include "sim/weather.h"   // the dry sky elec-body-matter pins
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -891,7 +892,7 @@ Status GateElecCrowd(Ctx& c, std::string& detail) {
   detail = Format(
       "%zu humans (cap %d): %d/%d in the lightning-fed basin shocked (least %.1f Electric hp), "
       "%d/%d on the dry pad | query: %llu boxes asked, %llu refused | conduction: %llu body-ticks "
-      "(%llu linked), %llu cells, slot bins %llu built / %llu reused, ohmic %llu cells / %llu "
+      "(%llu linked), %llu cells, slot bins %llu built / %llu re-accumulated / %llu reused, ohmic %llu cells / %llu "
       "voxels (%llu refused), crackle %llu ops (%llu refused); ApplyShocks %.0f us a tick (%.0f of it re-binning "
       "the slots)%s%s",
       id.size(), n, wetHit, wetN, wetN ? wetHpMin : 0.0f, dryHit, dryN,
@@ -899,6 +900,7 @@ Status GateElecCrowd(Ctx& c, std::string& detail) {
       (unsigned long long)(s1.bodiesSolved - s0.bodiesSolved),
       (unsigned long long)(s1.linked - s0.linked), (unsigned long long)(s1.cellsSolved - s0.cellsSolved),
       (unsigned long long)(s1.cacheBuilds - s0.cacheBuilds),
+      (unsigned long long)(s1.cacheAccums - s0.cacheAccums),
       (unsigned long long)(s1.cacheHits - s0.cacheHits),
       (unsigned long long)(s1.ohmicCells - s0.ohmicCells),
       (unsigned long long)(s1.ohmicVoxels - s0.ohmicVoxels),
@@ -919,7 +921,9 @@ Status GateElecCrowd(Ctx& c, std::string& detail) {
 //   human in leather shoes  the sole is an insulator between foot and plate:
 //                           nothing (the worn shell covers the foot's cells)
 //   human in iron sabatons  iron conducts into the foot: Electric hp
-//   sylvan (dryad)          wood carries the charge and feels none of it: no
+//   sylvan (dryad), on a LIGHTNING-fed plate (dry wood, resist 1,500, takes
+//                           nothing from an arc-fed one, world or body)
+//                           wood carries the charge and feels none of it: no
 //                           Electric hp, no stun -- and it CHARS / ignites (the
 //                           ohmic rule on its body cells, wood's own data)
 //   android (courier), dry  reported (its panels are an insulator; whatever
@@ -936,9 +940,16 @@ Status GateElecBodyMatter(Ctx& c, std::string& detail) {
     return Status::Skip;
   }
   const uint32_t mStone = MatId(c, "stone"), mCopper = MatId(c, "copper_bar"),
-                 mArc = MatId(c, "arc"), mWater = MatId(c, "water");
+                 mArc = MatId(c, "arc"), mWater = MatId(c, "water"),
+                 mLight = MatId(c, "lightning");
   const int hold = (int)BaselineNumber("elecMatter.holdTicks", 16);
   const int observe = (int)BaselineNumber("elecMatter.observeTicks", 16);
+  // A DRY day: the scheduled sky can rain on the harness, and rain is a
+  // conducting coat -- the wet rule would (rightly) let a soaked leather
+  // sole conduct, which is not what this fixture measures. Restored on the
+  // way out.
+  const std::string weatherWas = weather::Override();
+  weather::SetOverride("clear");
   Regenerate(c);
   Fix f;
   PadOps(c, f, 200, 48, 10, mStone);
@@ -949,7 +960,9 @@ Status GateElecBodyMatter(Ctx& c, std::string& detail) {
     for (int zz = f.z - 6; zz <= f.z + 3; zz++)
       for (int xx = px[k] - 3; xx <= px[k] + 3; xx++) Put(f.build, xx, f.y - 1, zz, mCopper);
     Pocket(f.build, mStone, px[k], f.y - 1, f.z - 7, 0, 0, 1);
-    Put(f.feed, px[k], f.y - 1, f.z - 7, mArc);
+    // The sylvan's plate is fed by LIGHTNING: dry wood (resist 1,500) takes
+    // nothing from an arc-fed plate's ~1,200 -- in the world as on a body.
+    Put(f.feed, px[k], f.y - 1, f.z - 7, k == 3 ? mLight : mArc);
   }
   uint32_t t = 89000;
   support::TickRig rig(c, t, f.chunk);
@@ -1033,6 +1046,7 @@ Status GateElecBodyMatter(Ctx& c, std::string& detail) {
                    rec[k].ohmicVoxels, rec[k].crackles, rec[k].armour ? ", armour" : "",
                    seeded.c_str(), rec[k].covered);
   }
+  weather::SetOverride(weatherWas);
   RecordObserved("elecMatter.barefootHp", hp[0]);
   RecordObserved("elecMatter.sabatonHp", hp[2]);
   RecordObserved("elecMatter.sylvanOhmicVoxels", rec[3].ohmicVoxels);

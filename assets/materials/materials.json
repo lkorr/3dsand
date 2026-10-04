@@ -27,7 +27,7 @@
     },
     {
       "id": "wood",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -258,6 +258,7 @@
     },
     {
       "id": "lava",
+      "electric": {"resist": 10},
       "thermal": {"emit": 230, "inertia": 4},
       "arcane": 8,
       "class": "liquid",
@@ -296,6 +297,7 @@
     },
     {
       "id": "acid",
+      "electric": {"resist": 4},
       "arcane": 6,
       "class": "liquid",
       "density": 1200,
@@ -539,6 +541,7 @@
     },
     {
       "id": "molten_glass",
+      "electric": {"resist": 20},
       "thermal": {"emit": 200, "inertia": 4},
       "class": "liquid",
       "density": 2200,
@@ -773,7 +776,7 @@
     },
     {
       "id": "birch_wood",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -1228,7 +1231,7 @@
     },
     {
       "id": "staff_wood",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -2028,6 +2031,7 @@
     {
       "//": "SHORELINE SET (worldgen only). The wet fringe OUTSIDE a pond disc -- the band that used to go straight from water to the same plain grass as a hillside a kilometre inland. Like the aquatic set above, every one of these is an ORDINARY INERT SOLID with no reaction rule of its own: rule 2 says a settled shore has to sleep, and anything that spread or reacted on contact with the water it stands next to would keep every pond chunk awake forever. They are scenery.",
       "id": "shore_mud",
+      "electric": {"resist": 30},
       "footstep": "path",
       "class": "solid",
       "density": 1450,
@@ -2843,7 +2847,7 @@
     {
       "//": "Bark ramp. Same three-tier idea on the wood side: a bole with a shaded and a lit face reads as a cylinder, where one flat brown reads as a column of paint.",
       "id": "bark_dark",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -2868,7 +2872,7 @@
     },
     {
       "id": "bark_light",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",
@@ -3532,6 +3536,7 @@
     {
       "//": "ALCHEMY CHEMISTRY (2026-09-27, docs/PLAN_alchemy_chemistry.md). Table salt. Dissolves into water as the `salt` solute (assets/materials/solutes.json) rather than turning it into another material; melts to molten_salt over heat, which is what electrolysis wants.",
       "id": "salt",
+      "electric": {"dissolved": 2},
       "arcane": 4,
       "class": "powder",
       "repose": 34,
@@ -3572,6 +3577,7 @@
     {
       "//": "Metallic sodium. Soft, silvery and LIGHTER THAN WATER (0.97), so a lump floats on the water it is reacting with -- which is why it skates and bursts rather than sinking. Reacts violently with water (reactions.json: explode effect).",
       "id": "sodium",
+      "electric": {"resist": 2},
       "arcane": 12,
       "class": "powder",
       "repose": 40,
@@ -4554,7 +4560,7 @@
     {
       "//": "BUILDING MATERIALS (PLAN_world_editor P2, assets/editor/housegen.js). Nine static solids a rural-medieval house is made of, each a MATERIAL rather than a paint colour because each behaves differently: the timbers burn, the stone and daub do not, the thatch goes up fast, a door leaf has to read as a door. Every one carries a `far` alias because the far-field palette was already full (128 slots owned). The flammable ones reuse the existing burn chain by PRODUCT (wood-kind ignites to `ember`, straw-kind to `leaf_burning`): reactions.json has one ignition rule per material, the only shape the compiler accepts (`self` is a material name, never a tag). PLANK: sawn boards, a weathered mid-brown lighter than `wood` so floors and weatherboards read as worked timber rather than a trunk.",
       "id": "plank",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "sounds": {
@@ -4580,7 +4586,7 @@
     {
       "//": "TIMBER: the dark oak of a box frame -- posts, rails, braces, lintels, tie beams. Darker than plank so the frame reads against daub at any distance; slower to catch than boards (heavy section), same burn chain.",
       "id": "timber",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "arcane": 2,
       "sounds": {
@@ -4707,7 +4713,7 @@
     {
       "//": "DOOR_WOOD: the leaf of a door, and ONLY that. A distinct material so a closed door reads as a door (redder and warmer than the frame around it), and so the door system can tell its own leaf cells from the wall they hang in: a door whose leaf box is no longer all door_wood has been burned or broken and stops being a door (PLAN_world_editor 2.4). Burns like plank.",
       "id": "door_wood",
-      "electric": {"resist": 60, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
+      "electric": {"resist": 1500, "ignite": {"into": "ember", "chance": 300}, "char": "charcoal"},
       "thermal": {"ignite": {"above": 150, "full": 230, "chance": 30, "into": "ember"}},
       "bleed": 0.2,
       "bleedFluid": "syrup",

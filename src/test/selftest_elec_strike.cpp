@@ -13,7 +13,21 @@
 //                 identical (rule 1). Plus the glyph half, CPU-only: `spark`
 //                 places spark (not fire), `shock` / `lightning` are strike
 //                 effects whose emission reaches the VM's strike list, and the
-//                 lightning glyph's own spec targets the same rod.
+//                 lightning glyph's own spec targets the same rod. Wave 2:
+//                 the collar must BOTH show fire and lose wood (two checks,
+//                 not an OR), and after the bolt every charge page must come
+//                 back and the fixture must sleep (<= elecStrike.awakeMax).
+//
+//   elec-bulk     (wave 2, the spreading loss) the same forced weather strike
+//                 onto BULK conductors: a 128 x 128 basin of water (the sea)
+//                 and a 128 x 128 pad of rain-wet dirt. The charge must stay
+//                 LOCAL -- reach (P > 0) within elecBulk.reachMax cells of the
+//                 struck column, pages at most elecBulk.pagesMax, nothing
+//                 refused -- and still SHOCK nearby (P >= elecBulk.shockP, a
+//                 wet body's threshold, out to elecBulk.shockReachMin cells in
+//                 the water); then every page back and the fixture asleep.
+//                 Before the loss one bolt into water charged ~800 cells and
+//                 paged the window.
 //
 // Ticks THE tick (support::TickCursor -> TickAuthority): the strike lives in
 // session.cpp's phase K (WeatherStrikes), so a sim-only ticker would test
@@ -21,6 +35,7 @@
 // pad (FixtureYOver, never an absolute Y) and the world is regenerated on the
 // way out.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -28,6 +43,8 @@
 #include "game/lightning.h"
 #include "game/session.h"
 #include "game/spell.h"
+#include "gpu/resources.h"
+#include "sim/elec.h"
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -69,6 +86,52 @@ std::vector<uint32_t> Census(Ctx& c, const Box& b) {
         }
       }
   return h;
+}
+
+// The charge field's header (elec.h kEm*): one small readback.
+std::vector<uint32_t> ElecHeader(Ctx& c) {
+  c.ctx.WaitIdle();
+  std::vector<uint32_t> h(kEmSnapWords, 0);
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.elecMeta, 0, h.data(),
+                        kEmSnapWords * 4, "elecStrikeHeader");
+  return h;
+}
+uint32_t PagesInUse(const std::vector<uint32_t>& h) { return h[kEmNextFresh] - h[kEmFreeTop]; }
+// Chunks awake (the dirty set the next tick runs).
+uint32_t AwakeAll(Ctx& c) {
+  c.ctx.WaitIdle();
+  std::vector<uint32_t> flags(kNumSlots, 0);
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, flags.data(),
+                        kNumSlots * 4, "elecStrikeAwake");
+  uint32_t n = 0;
+  for (uint32_t f : flags) n += f != 0;
+  return n;
+}
+
+// The awake chunks with ATTRIBUTION: how many, how many of them the charge
+// field holds (dirty reason "elec", bit 31), and every reason that holds any.
+struct Awake {
+  uint32_t total = 0, elec = 0, reasons = 0;
+  std::string Names() const {
+    std::string out;
+    for (int i = 0; i < kDirtyReasonBits; i++)
+      if ((reasons >> i) & 1u) out += (out.empty() ? "" : "+") + std::string(kDirtyReasonName[i]);
+    return out.empty() ? std::string("none") : out;
+  }
+};
+Awake AwakeWhy(Ctx& c) {
+  c.ctx.WaitIdle();
+  std::vector<uint32_t> flags(kNumSlots, 0);
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.sim.DirtyActive(), 0, flags.data(),
+                        kNumSlots * 4, "elecBulkAwake");
+  Awake a;
+  for (uint32_t f : flags) {
+    if (f == 0) continue;
+    a.total++;
+    a.elec += (f & (1u << 31)) != 0;
+    a.reasons |= f;
+  }
+  return a;
 }
 
 void Regenerate(Ctx& c) {
@@ -149,11 +212,15 @@ struct RunOut {
   uint64_t decided = 0, firedCount = 0;
   bool eventEmitted = false;
   bool glyphTakesRod = false;
+  // After the bolt (wave 2): the tick every charge page was back (-1 never),
+  // the chunks awake `settle` ticks later, the field's pages peak.
+  int fadeTick = -1;
+  uint32_t awake = 0, pagesPeak = 0, pagesEnd = 0;
 };
 
 RunOut RunStrike(Ctx& c, uint32_t mStone, uint32_t mWood, uint32_t mIron, uint32_t mLightning,
                  uint32_t mArc, uint32_t mFire, Fixture& fx, int observeTicks,
-                 const GlyphStrike* glyph) {
+                 const GlyphStrike* glyph, int fadeMax = 0, int settle = 0) {
   RunOut r;
   Regenerate(c);
   std::vector<CellOp> build, posts;
@@ -216,6 +283,22 @@ RunOut RunStrike(Ctx& c, uint32_t mStone, uint32_t mWood, uint32_t mIron, uint32
     r.firePeak = std::max(r.firePeak, h[mFire]);
     if (r.goneAfter < 0 && h[mLightning] == 0 && h[mArc] == 0) r.goneAfter = sinceFire;
     r.woodEnd = h[mWood];
+  }
+  // THE FADE (wave 2): every charge page back, then the fixture asleep.
+  if (fadeMax > 0) {
+    for (int i = 0; i < fadeMax; i++) {
+      if (PagesInUse(ElecHeader(c)) == 0) {
+        r.fadeTick = i;
+        break;
+      }
+      tick();
+    }
+    for (int i = 0; i < settle; i++) tick();
+    r.awake = AwakeAll(c);
+    const std::vector<uint32_t> h = ElecHeader(c);
+    r.pagesPeak = h[kEmPagesPeak];
+    r.pagesEnd = PagesInUse(h);
+    ElecNoteRun(h.data());
   }
   r.budgetCells = w.strikes.budget.cells - cells0;
   r.budgetEmitted = w.strikes.budget.emitted - emitted0;
@@ -284,10 +367,13 @@ Status GateElecStrike(Ctx& c, std::string& detail) {
 
   // ---- B. the forced weather strike, twice --------------------------------------
   const int observe = (int)BaselineNumber("elecStrike.observeTicks", 60);
+  const int fadeMax = (int)BaselineNumber("elecStrike.fadeTicksMax", 120);
+  const int settle = (int)BaselineNumber("elecStrike.settleTicks", 150);
+  const uint32_t awakeMax = (uint32_t)BaselineNumber("elecStrike.awakeMax", 32);
   Fixture fx;
   const RunOut a = RunStrike(c, (uint32_t)mStone, (uint32_t)mWood, (uint32_t)mIron,
                              (uint32_t)mLightning, (uint32_t)mArc, (uint32_t)mFire, fx, observe,
-                             gLight >= 0 ? &lib.glyphs[gLight].strike : nullptr);
+                             gLight >= 0 ? &lib.glyphs[gLight].strike : nullptr, fadeMax, settle);
   Fixture fx2;
   const RunOut b = RunStrike(c, (uint32_t)mStone, (uint32_t)mWood, (uint32_t)mIron,
                              (uint32_t)mLightning, (uint32_t)mArc, (uint32_t)mFire, fx2, observe,
@@ -311,9 +397,17 @@ Status GateElecStrike(Ctx& c, std::string& detail) {
                                       a.lightningAtFire));
   check(a.goneAfter >= 0 && a.goneAfter <= goneMax,
         Format("lightning + arc gone within %d ticks (%d)", goneMax, a.goneAfter));
-  check(a.firePeak > 0 || a.woodEnd < a.wood0,
-        Format("the wooden collar caught (fire peak %u, wood %u -> %u)", a.firePeak, a.wood0,
-               a.woodEnd));
+  // Two claims, not an OR (wave 2): fire appeared AND wood was lost.
+  check(a.firePeak > 0, Format("the wooden collar caught fire (fire peak %u)", a.firePeak));
+  check(a.woodEnd < a.wood0, Format("the strike cost the fixture wood (%u -> %u)", a.wood0,
+                                    a.woodEnd));
+  check(a.fadeTick >= 0 && a.pagesEnd == 0,
+        Format("every charge page back after the bolt (%u left, freed %d ticks after the "
+               "watch, max %d; pages peak %u)",
+               a.pagesEnd, a.fadeTick, fadeMax, a.pagesPeak));
+  check(a.awake <= awakeMax, Format("the fixture sleeps %d ticks after the field is gone (%u "
+                                    "chunks awake, max %u)",
+                                    settle, a.awake, awakeMax));
   check(a.eventEmitted && a.budgetEmitted >= 1 && a.budgetCells >= a.plan.cells.size() &&
             a.plan.cells.size() > 0 && a.plan.cells.size() <= kStrikeMaxCells &&
             a.budgetRefused == 0,
@@ -339,16 +433,261 @@ Status GateElecStrike(Ctx& c, std::string& detail) {
 
   RecordObserved("elecStrike.goneTicks", (double)a.goneAfter);
   RecordObserved("elecStrike.planCells", (double)a.plan.cells.size());
+  RecordObserved("elecStrike.fadeTicksObserved", (double)a.fadeTick);
+  RecordObserved("elecStrike.awakeObserved", (double)a.awake);
+  RecordObserved("elecStrike.pagesPeakObserved", (double)a.pagesPeak);
   detail = Format(
       "struck (%d,%d,%d) %s [rod (%d,%d,%d)], plan %zu cells (bolt %d, splash %d), lightning "
       "%u / arc %u on the fire tick, gone after %d ticks, fire peak %u, wood %u -> %u, "
-      "lightning glyph tariff %d, replay %s%s%s",
+      "lightning glyph tariff %d, pages peak %u, freed %d, awake %u, replay %s%s%s",
       a.plan.target.x, a.plan.target.y, a.plan.target.z,
       a.plan.targetConductive ? "conductive" : "insulator", fx.rod.x, fx.rod.y, fx.rod.z,
       a.plan.cells.size(), a.plan.boltCells, a.plan.splashCells, a.lightningAtFire,
-      a.arcAtFire, a.goneAfter, a.firePeak, a.wood0, a.woodEnd, lightTariff,
-      same ? "identical" : "DIFFERS", fails.empty() ? "" : "; FAILED: ", fails.c_str());
+      a.arcAtFire, a.goneAfter, a.firePeak, a.wood0, a.woodEnd, lightTariff, a.pagesPeak,
+      a.fadeTick, a.awake, same ? "identical" : "DIFFERS", fails.empty() ? "" : "; FAILED: ",
+      fails.c_str());
   std::printf("elec-strike: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ============================================================================
+// elec-bulk (wave 2): a strike into BULK conductors stays local.
+//
+// The field and its pages, read whole after the queue drains (test-only).
+struct FieldSnap {
+  std::vector<uint32_t> meta, pool;
+  void Read(Ctx& c) {
+    c.ctx.WaitIdle();
+    meta.assign(kEmWords, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.elecMeta, 0, meta.data(),
+                          (uint64_t)kEmWords * 4, "elecBulkMeta");
+    pool.assign((size_t)kElecPoolPages * kElecPageWords, 0);
+    rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.elecPool, 0, pool.data(),
+                          pool.size() * 4, "elecBulkPool");
+  }
+  uint32_t P(int x, int y, int z) const {
+    const uint32_t e = meta[kEmEntry + World::SlotChunkIndex({x >> 4, y >> 4, z >> 4})];
+    if ((e & kElecEntryHas) == 0) return 0;
+    const uint32_t local = (((uint32_t)z & 15) * 16 + ((uint32_t)y & 15)) * 16 + ((uint32_t)x & 15);
+    const uint32_t w = pool[(size_t)(e & kElecEntryPage) * kElecPageWords + (local >> 1)];
+    return (w >> ((local & 1) * 16)) & 0xFFFFu;
+  }
+};
+
+enum class BulkKind { Sea, WetGround };
+
+struct BulkOut {
+  bool fired = false, conductive = false;
+  IVec3 target{};
+  int reach = 0;              // farthest cell with P > 0 from the struck column (cells, horizontal)
+  int shockReach = 0;         // farthest with P >= shockP
+  uint32_t charged = 0;       // cells with P > 0, at the widest tick read
+  uint32_t outsidePages = 0;  // most pages in use OUTSIDE the fixture's chunks at once
+  uint32_t pagesPeak = 0, refused = 0, purges = 0, pPeak = 0;
+  int fadeTick = -1;          // ticks after the watch until every page was back
+  uint32_t pagesEnd = 0;
+  Awake awake;
+};
+
+// THE FIXTURE: a 129 x 129 slab on a stone foundation down into the terrain
+// (a floating slab is an island the debris scan cuts loose), the air above it
+// cleared. Sea: a 3-deep basin of water inside a one-cell stone rim, flush
+// with the water. Wet ground: one layer of dirt under a rain-strength water
+// coat (stain amount elecBulk.wetStain) -- the dirt itself is an insulator,
+// so only the coat conducts, as on a rain-soaked field. The ops go in slices
+// (kMaxCellOpsPerTick), foundation first, then the clear, then the contents:
+// two ops on one cell in one TICK keep the first, so a slice never mixes them.
+BulkOut RunBulk(Ctx& c, BulkKind kind, int observe, int reachTicks, int fadeMax, int settle,
+                uint32_t shockP, uint32_t wetStain) {
+  BulkOut r;
+  const uint32_t mStone = (uint32_t)MatId(c, "stone"), mWater = (uint32_t)MatId(c, "water"),
+                 mDirt = (uint32_t)MatId(c, "dirt");
+  Regenerate(c);
+  const IVec3 o = c.world.WindowOrigin();
+  constexpr int kHalf = 64, kDepth = 3;
+  const int x = o.x * (int)kChunk + 256, z = o.z * (int)kChunk + 256;
+  const int y = FixtureYOver(x - kHalf - 2, z - kHalf - 2, x + kHalf + 2, z + kHalf + 2,
+                             kDefaultSeed, 3);
+  const int top = kind == BulkKind::Sea ? y + kDepth - 1 : y;   // the conducting surface
+  std::vector<CellOp> found, clear, fill;
+  const uint32_t wetDirt = PackVoxNew(mDirt, 0) |
+                           PackStain(c.mats[mWater].stainSlot, std::min(wetStain, kStainAmtMax));
+  for (int zz = z - kHalf; zz <= z + kHalf; zz++)
+    for (int xx = x - kHalf; xx <= x + kHalf; xx++) {
+      for (int yy = World::TerrainHeight(xx, zz, kDefaultSeed) - 2; yy < y; yy++)
+        found.push_back({World::SlotCellIndex({xx, yy, zz}), PackVoxNew(mStone, 0)});
+      for (int yy = y; yy <= y + 40; yy++) clear.push_back({World::SlotCellIndex({xx, yy, zz}), 0u});
+      const bool rim = xx == x - kHalf || xx == x + kHalf || zz == z - kHalf || zz == z + kHalf;
+      if (kind == BulkKind::Sea) {
+        for (int yy = y; yy < y + kDepth; yy++)
+          fill.push_back({World::SlotCellIndex({xx, yy, zz}),
+                          rim ? PackVoxNew(mStone, 0) : (mWater | (7u << 12))});
+      } else {
+        fill.push_back({World::SlotCellIndex({xx, y, zz}), wetDirt});
+      }
+    }
+  uint32_t t = 82000;
+  support::TickCursor tick{c, t, IVec3{x >> 4, y >> 4, z >> 4}};
+  for (const std::vector<CellOp>* list : {&found, &clear, &fill})
+    for (size_t at = 0; at < list->size(); at += 60000) {
+      const size_t n = std::min<size_t>(60000, list->size() - at);
+      tick(std::vector<BrushOp>{}, std::vector<CellOp>(list->begin() + (ptrdiff_t)at,
+                                                       list->begin() + (ptrdiff_t)(at + n)));
+    }
+  // Let the snapshot mirror publish the fixture (the strike scans it).
+  for (int i = 0; i < 10; i++) tick();
+  TickAuthorityCtx& w = tick.Rig().Authority();
+  w.strikes.forceNext = true;
+  w.strikes.forceAimSet = true;
+  w.strikes.forceAim = IVec3{x, top + 4, z};
+  const uint32_t decideTick = t + 1;
+  const int cx0 = (x - kHalf) >> 4, cx1 = (x + kHalf) >> 4, cz0 = (z - kHalf) >> 4,
+            cz1 = (z + kHalf) >> 4;
+  int sinceFire = -1;
+  FieldSnap f;
+  for (int i = 0; i < observe; i++) {
+    tick();
+    if (!r.fired) {
+      for (const auto& ev : w.strikes.recent)
+        if (ev.weather && ev.tick == t && ev.tick > decideTick) {
+          r.fired = true;
+          r.target = w.strikes.lastPlan.target;
+          r.conductive = w.strikes.lastPlan.targetConductive;
+        }
+      if (!r.fired) continue;
+      sinceFire = 0;
+    } else {
+      sinceFire++;
+    }
+    if (sinceFire > reachTicks) continue;
+    // THE REACH, each of the first reachTicks ticks after the fire: every
+    // fixture cell from the floor to a cell over the surface.
+    f.Read(c);
+    uint32_t charged = 0;
+    for (int zz = z - kHalf; zz <= z + kHalf; zz++)
+      for (int xx = x - kHalf; xx <= x + kHalf; xx++)
+        for (int yy = y - 1; yy <= top + 1; yy++) {
+          const uint32_t p = f.P(xx, yy, zz);
+          if (p == 0) continue;
+          charged++;
+          const int dx = xx - r.target.x, dz = zz - r.target.z;
+          const int d = (int)std::sqrt((double)(dx * dx + dz * dz));
+          r.reach = std::max(r.reach, d);
+          if (p >= shockP) r.shockReach = std::max(r.shockReach, d);
+        }
+    r.charged = std::max(r.charged, charged);
+    // Pages OUTSIDE the fixture's x / z footprint (at any height: the bolt's
+    // own column over the fixture is the strike, not the spread).
+    uint32_t outside = 0;
+    const IVec3 wo = c.world.WindowOrigin();
+    for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+      if ((f.meta[kEmEntry + sl] & kElecEntryHas) == 0) continue;
+      const int sx = (int)(sl % kNChunk), sz = (int)(sl / (kNChunk * kNChunk));
+      const int wx = wo.x + ((sx - wo.x) & (int)(kNChunk - 1));
+      const int wz = wo.z + ((sz - wo.z) & (int)(kNChunk - 1));
+      if (wx < cx0 || wx > cx1 || wz < cz0 || wz > cz1) outside++;
+    }
+    r.outsidePages = std::max(r.outsidePages, outside);
+  }
+  for (int i = 0; i < fadeMax; i++) {
+    if (PagesInUse(ElecHeader(c)) == 0) {
+      r.fadeTick = i;
+      break;
+    }
+    tick();
+  }
+  for (int i = 0; i < settle; i++) tick();
+  r.awake = AwakeWhy(c);
+  const std::vector<uint32_t> h = ElecHeader(c);
+  r.pagesPeak = h[kEmPagesPeak];
+  r.refused = h[kEmRefused];
+  r.purges = h[kEmPurges];
+  r.pPeak = h[kEmPPeak];
+  r.pagesEnd = PagesInUse(h);
+  ElecNoteRun(h.data());
+  return r;
+}
+
+Status GateElecBulk(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  for (const char* m : {"stone", "water", "dirt", "lightning"})
+    if (MatId(c, m) < 0) {
+      detail = Format("missing material %s", m);
+      std::printf("elec-bulk: FAIL (%s)\n", detail.c_str());
+      return Status::Fail;
+    }
+  const int observe = (int)BaselineNumber("elecBulk.observeTicks", 40);
+  const int reachTicks = (int)BaselineNumber("elecBulk.reachTicks", 8);
+  const int fadeMax = (int)BaselineNumber("elecBulk.fadeTicksMax", 120);
+  const int settle = (int)BaselineNumber("elecBulk.settleTicks", 90);
+  const uint32_t awakeMax = (uint32_t)BaselineNumber("elecBulk.awakeMax", 32);
+  const uint32_t wetAwakeMax = (uint32_t)BaselineNumber("elecBulk.wetAwakeMax", 200);
+  const int reachMax = (int)BaselineNumber("elecBulk.reachMax", 56);
+  const uint32_t pagesMax = (uint32_t)BaselineNumber("elecBulk.pagesMax", 160);
+  const uint32_t shockP = (uint32_t)BaselineNumber("elecBulk.shockP", 20);
+  const int shockMin = (int)BaselineNumber("elecBulk.shockReachMin", 15);
+  const uint32_t wetStain = (uint32_t)BaselineNumber("elecBulk.wetStain", 8);
+  const BulkOut sea = RunBulk(c, BulkKind::Sea, observe, reachTicks, fadeMax, settle, shockP,
+                              wetStain);
+  const BulkOut wet = RunBulk(c, BulkKind::WetGround, observe, reachTicks, fadeMax, settle,
+                              shockP, wetStain);
+  Regenerate(c);
+  bool ok = true;
+  std::string fails;
+  auto check = [&](bool cond, const std::string& what) {
+    if (!cond) {
+      ok = false;
+      fails += (fails.empty() ? "" : "; ") + what;
+      std::printf("elec-bulk: FAILED %s\n", what.c_str());
+    }
+  };
+  for (const BulkOut* b : {&sea, &wet}) {
+    const char* nm = b == &sea ? "sea" : "wet ground";
+    check(b->fired, Format("%s: the forced strike fired", nm));
+    check(b->reach <= reachMax, Format("%s: the charge stays local (reach %d cells, max %d)", nm,
+                                       b->reach, reachMax));
+    check(b->outsidePages == 0, Format("%s: no page outside the fixture (%u)", nm,
+                                       b->outsidePages));
+    check(b->pagesPeak <= pagesMax && b->refused == 0,
+          Format("%s: pages bounded (peak %u, max %u; refused %u)", nm, b->pagesPeak, pagesMax,
+                 b->refused));
+    check(b->fadeTick >= 0 && b->pagesEnd == 0,
+          Format("%s: every page back (%u left, freed %d ticks after the watch)", nm,
+                 b->pagesEnd, b->fadeTick));
+    check(b->awake.elec == 0, Format("%s: no chunk held awake by charge (%u)", nm,
+                                     b->awake.elec));
+  }
+  // The sea must sleep outright. The wet pad's COAT keeps drying after the
+  // bolt (the rain system's own work: dirty reasons other than elec, named in
+  // the detail), so there the claim is the charge's -- no chunk awake for it,
+  // above -- and the total is held to its own, looser bound.
+  check(sea.awake.total <= awakeMax, Format("sea: the fixture sleeps (%u chunks awake, max %u)",
+                                            sea.awake.total, awakeMax));
+  check(wet.awake.total <= wetAwakeMax,
+        Format("wet ground: awake chunks bounded (%u, max %u; held by %s)", wet.awake.total,
+               wetAwakeMax, wet.awake.Names().c_str()));
+  check(sea.conductive, "sea: the bolt struck the water (a conductor)");
+  check(sea.shockReach >= shockMin,
+        Format("sea: a strike still shocks nearby (P >= %u out to %d cells, min %d)", shockP,
+               sea.shockReach, shockMin));
+  RecordObserved("elecBulk.seaReachObserved", (double)sea.reach);
+  RecordObserved("elecBulk.seaShockReachObserved", (double)sea.shockReach);
+  RecordObserved("elecBulk.seaPagesPeakObserved", (double)sea.pagesPeak);
+  RecordObserved("elecBulk.wetReachObserved", (double)wet.reach);
+  RecordObserved("elecBulk.wetShockReachObserved", (double)wet.shockReach);
+  RecordObserved("elecBulk.wetPagesPeakObserved", (double)wet.pagesPeak);
+  auto line = [&](const BulkOut& b, const char* nm) {
+    return Format("%s: struck (%d,%d,%d) %s, reach %d cells (P >= %u to %d), %u cells charged, "
+                  "pages peak %u (outside the fixture %u), P peak %u, refused %u, purges %u, "
+                  "freed %d ticks after the watch, %u awake (%u for charge; held by %s)",
+                  nm, b.target.x, b.target.y, b.target.z,
+                  b.conductive ? "conductive" : "insulator", b.reach, shockP, b.shockReach,
+                  b.charged, b.pagesPeak, b.outsidePages, b.pPeak, b.refused, b.purges,
+                  b.fadeTick, b.awake.total, b.awake.elec, b.awake.Names().c_str());
+  };
+  detail = line(sea, "sea") + "; " + line(wet, "wet ground") +
+           (fails.empty() ? "" : "; FAILED: " + fails);
+  std::printf("elec-bulk: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -357,6 +696,7 @@ Status GateElecStrike(Ctx& c, std::string& detail) {
 const std::vector<Gate>& ElecStrikeGates() {
   static const std::vector<Gate> g = {
       {"elec-strike", "sim", {}, false, GateElecStrike},
+      {"elec-bulk", "sim", {}, false, GateElecBulk},
   };
   return g;
 }

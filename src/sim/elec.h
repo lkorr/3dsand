@@ -5,8 +5,20 @@
 // A TRANSIENT per-cell potential P (u16) over the conducting cells of the
 // window, recomputed every CA-active tick by sim_elec.wgsl AFTER the CA:
 //
-//   P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay(P)), clamped >= 0
+//   P' = max(seed, max_nb6(P_nb - enter(cell, P_nb)), P - decay(P)), clamped >= 0
+//   enter(cell, p) = resist(cell) + (p * spreadQ(n) >> 12)          (wave 2)
+//   spreadQ(n) = max(0, n - sim.elecSpreadFree) * sim.elecSpreadLoss, < 4096
 //   decay(P) = max(sim.elecDecay, P >> sim.elecDecayShift)
+//
+// n is the cell's count of CONDUCTING face neighbours. THE SPREADING LOSS
+// (wave 2, 2026-10-04): a wire (n <= 2) costs only its resist, so copper still
+// carries across the window; a cell in BULK (a pool, the sea, rain-wet ground,
+// a plank wall) also loses a share of what it receives for every conducting
+// neighbour past the free two -- the current divides there. Proportional, so
+// lightning's 30,000 and a spark's 200 both stay local in bulk (reach ~ log P),
+// where a pure per-cell cost let a strike into water run ~5,000 cells.
+// Monotone in p (spreadQ < 4096), so the update is still max-plus-like: it only
+// raises values, toward a least fixpoint, whatever the thread order.
 //
 // only in cells whose material conducts (materials.json "electric".resist, or
 // a conducting coat on the cell -- the wet rule); an insulator holds P = 0
@@ -21,7 +33,9 @@
 // Not in common.wgsl: only those shaders agree on the layout, and a
 // common.wgsl edit misses the SPIR-V cache of every shader (CLAUDE.md).
 //
-//   elecPool    GPU-owned. kElecPoolPages pages of kElecPageWords. A page is
+//   elecPool    GPU-owned. kElecPoolPages pages of kElecPageWords, then the
+//               per-tick CELL CACHE (kElecCacheBase, one kElecCacheWords block
+//               per page) and its tick stamps (kElecStampBase). A page is
 //               one window chunk's 4,096 cells as u16, two per word (the EVEN
 //               chunk-local index in the low half), in TWO HALVES of
 //               kElecHalfWords: half 0 is the settled field (what the CA and
@@ -29,7 +43,8 @@
 //               Round r reads half (r & 1) and writes the other (Jacobi between
 //               rounds: a chunk's halo is its neighbours' previous round), and
 //               elecSettle copies the last round back into half 0 and zeroes
-//               half 1. A page on the free stack is ALL ZERO, always.
+//               half 1. A page on the free stack is ALL ZERO, always (the
+//               cache and stamp are not: a stamp != this tick means "rebuild").
 //   elecMeta    GPU-owned. Header (list cursor, free stack, phase, stats,
 //               indirect args), then per WINDOW slot the entry (HAS | page) and
 //               owner chunk, the want bitset, the two live lists and the free
@@ -79,6 +94,19 @@ constexpr uint32_t kElecPageWords = 2 * kElecHalfWords;     // 4,096 words = 16 
 // (kEmRefused, last_run.json elec.refused) and the chunk stays an uncharged
 // gap until the next round asks again -- never an abort.
 constexpr uint32_t kElecPoolPages = 2048;
+// THE CELL CACHE (wave 2): one u16 per cell of a page's chunk, two per word
+// (the even cell low), built by the chunk's FIRST round of a tick and read by
+// every later one -- the voxels do not change between the elec rows, so the
+// cache is exact, and rounds 1.. skip the voxel / material / stain / solute
+// reads and the face-neighbour scan. Per cell: bits 0..11 resist
+// (kElecResistInsulator = none), 12..14 conducting face neighbours (0..6),
+// bit 15 the cell is a SOURCE (its seed is re-read from its voxel). The stamp
+// is the tick + 1 the block was built on (0 never matches a live tick + 1).
+// Indexed by PAGE, like the page. 16 MiB beside the pool's 32.
+constexpr uint32_t kElecCacheWords = kElecHalfWords;
+constexpr uint32_t kElecCacheBase = kElecPoolPages * kElecPageWords;
+constexpr uint32_t kElecStampBase = kElecCacheBase + kElecPoolPages * kElecCacheWords;
+constexpr uint32_t kElecPoolWords = kElecStampBase + kElecPoolPages;
 // The most rounds a tick can run (sim.elecRounds clamps to it): the pass table
 // carries one alloc / copy / round triple per round past the first, each under
 // its own condition (pass_table.h Cond::ElecR1..ElecR7).
@@ -89,9 +117,13 @@ constexpr uint32_t kElecRoundsMax = 8;
 // than the cap simply carries on next round -- every iteration is a pure
 // function of the round's inputs, so the cap is deterministic.
 constexpr uint32_t kElecIterCap = 12;
-// The cell's resist as the kernel sees it: 1..254, kElecResistInsulator = no
-// conduction (the authored 0 / no "electric" block).
-constexpr uint32_t kElecResistInsulator = 255;
+// The cell's resist as the kernel sees it: 1..4094, kElecResistInsulator = no
+// conduction (the authored 0 / no "electric" block). TWELVE bits since wave 2
+// (2026-10-04; it was 8, 1..254): resistivity spans orders of magnitude, and a
+// byte could not say "dry wood is nearly an insulator" -- at 60 one bolt ran
+// ~500 cells of connected timber; the widest a byte allowed (254) still ~118.
+constexpr uint32_t kElecResistInsulator = 4095;
+constexpr uint32_t kElecResistMask = 0xFFFu;
 constexpr uint32_t kElecPMax = 65535;
 
 // ---- elecMeta ---------------------------------------------------------------
@@ -103,6 +135,10 @@ constexpr uint32_t kEmPhase = 3;       // elecAlloc calls this tick (round index
 constexpr uint32_t kEmMarked = 4;      // chunks elecSettle marked dirty this tick
 constexpr uint32_t kEmCount0 = 5;      // list 0's count
 constexpr uint32_t kEmCount1 = 6;      // list 1's count
+// Monotonic: chunks caMask's doorbell asked a page for (wave 2). The CPU reads
+// it off the snapshot (World::ElecMayBeLive): a ring it has not seen means a
+// source is standing in the window, so the elec rows must run (the fast path).
+constexpr uint32_t kEmDoorbells = 7;
 // Stats, words 16..31 (the snapshot a gate / last_run.json reads).
 constexpr uint32_t kEmPagesPeak = 16;
 constexpr uint32_t kEmRefused = 17;    // monotonic: wanted chunks the pool could not page
@@ -209,6 +245,11 @@ constexpr uint32_t kEpElecTag = 12;        // the tagMask bit(s) of "electric" (
 // The proportional decay (sim.elecDecayShift; 0 = linear kEpDecay only): a
 // stored P loses max(kEpDecay, P >> shift) in round 0 of a tick.
 constexpr uint32_t kEpDecayShift = 13;
+// THE SPREADING LOSS (wave 2; sim.elecSpreadLoss / sim.elecSpreadFree): the
+// share of the potential a cell loses on entry, in 1/4096, per conducting face
+// neighbour past the free count -- see the header comment.
+constexpr uint32_t kEpSpreadQ = 14;
+constexpr uint32_t kEpSpreadFree = 15;
 // A threshold no P reaches (P is a u16).
 constexpr uint32_t kElecPOff = kElecPMax + 1;
 // The wet table: the resist of a cell under a CONDUCTING COAT of stain amount
@@ -225,10 +266,13 @@ constexpr uint32_t kEpQueryBoxes = kEpQuery + 4;
 constexpr uint32_t kEpWords = kEpQueryBoxes + kElecQueryMax * kElecQueryBoxWords;
 
 // One material = four words at kEpMat + mat * 4:
-//   w0  resist (bits 0..7; 0 = insulator) | source (bits 16..31)
+//   w0  resist (bits 0..11; 0 = insulator) | source (bits 16..31)
 //   w1  E2: ignite product (bits 0..11) | char product (bits 12..23)
 //   w2  E2: ignite chance, in 1/kReactChanceDen per tick (heat's scaling)
-//   w3  reserved (0)
+//   w3  wave 2: DISSOLVED resist (bits 0..11; 0 = not an electrolyte) -- the
+//       resist a conducting liquid falls to when it carries this material
+//       dissolved at its species' saturation (solutes.json `from`); salt makes
+//       brine. Read by the shared resist rule (MIRROR elec, elecResistRaw).
 // MaterialGpu._r2 (heat.h owns bits 0..24): bit 25 = the material is a SOURCE
 // (caMask's doorbell, one test on the Material the CA already holds), bit 26 =
 // it CONDUCTS (E2's quick "can this cell carry charge" test).
@@ -238,12 +282,16 @@ constexpr uint32_t kElecR2Conducts = 1u << 26;
 // ---- the authored data (materials.json "electric") --------------------------
 //   "electric": { "resist": N, "source": E,
 //                 "ignite": { "into": "<mat>", "chance": per-mille },
-//                 "char": "<mat>", "shock": per-mille }
-// No block = an insulator. resist 1..254 is the cost per cell entered; source
-// 1..65535 is the potential the cell holds every tick it exists.
+//                 "char": "<mat>", "dissolved": R, "shock": per-mille }
+// No block = an insulator. resist 1..4094 is the cost per cell entered; source
+// 1..65535 is the potential the cell holds every tick it exists; dissolved
+// 1..4094 is what a conducting liquid's resist falls to with this material
+// dissolved in it at saturation (linear in concentration); shock (bodies only,
+// wave 2 package B) is the per-mille of a body cell's P its creature feels.
 struct ElecDef {
   uint32_t resist = 0;               // 0 = insulator
   uint32_t source = 0;
+  uint32_t dissolved = 0;            // 0 = not an electrolyte
   std::string igniteInto, charInto;  // names, resolved after the table loads
   uint32_t igniteIntoId = 0, charIntoId = 0;
   double igniteChanceMille = 0.0;

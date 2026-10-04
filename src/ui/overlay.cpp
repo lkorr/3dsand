@@ -505,6 +505,72 @@ void Overlay::DrawHUD(const UIState& s) {
     return ts.y + 8;
   };
   float py = std::floor(disp.y * 0.5f) + 28.0f;
+  // ---- SHOCKED: an edge flash, then STUNNED under the crosshair ------------
+  //
+  // Pixel art on the 2 px grid like the throw meter below. The FLASH: for six
+  // ticks after a jolt, a frame of pale-blue blocks round the screen's edge,
+  // stepping out (not fading smoothly) -- the arc's own colour. The CUE: a
+  // dark tab holding a 5x8-block lightning glyph, the word STUNNED and one pip
+  // per remaining half-second (15 ticks), the whole tab twitching a whole
+  // pixel on a fast step while the body does. Nothing is drawn when neither.
+  if (s.playerAlive && s.shockTicksAgo >= 0 && s.shockTicksAgo < 6) {
+    const ImU32 arc = IM_COL32(170, 214, 255, 255);
+    const float a = 0.55f - 0.09f * (float)s.shockTicksAgo;
+    const float t = 6.0f + 2.0f * (float)(s.shockTicksAgo & ~1);
+    // Broken border: 18 px blocks with 6 px gaps, offset per tick so it
+    // crackles rather than sits.
+    const float off = (float)((s.shockTicksAgo * 10) % 24);
+    for (float x0 = -off; x0 < disp.x; x0 += 24.0f) {
+      d->AddRectFilled(ImVec2(std::max(0.0f, x0), 0), ImVec2(x0 + 18.0f, t), ui::Fade(arc, a));
+      d->AddRectFilled(ImVec2(std::max(0.0f, x0), disp.y - t), ImVec2(x0 + 18.0f, disp.y),
+                       ui::Fade(arc, a));
+    }
+    for (float y0 = -off; y0 < disp.y; y0 += 24.0f) {
+      d->AddRectFilled(ImVec2(0, std::max(0.0f, y0)), ImVec2(t, y0 + 18.0f), ui::Fade(arc, a));
+      d->AddRectFilled(ImVec2(disp.x - t, std::max(0.0f, y0)), ImVec2(disp.x, y0 + 18.0f),
+                       ui::Fade(arc, a));
+    }
+  }
+  if (s.playerAlive && s.stunTicksLeft > 0) {
+    const ImU32 arc = IM_COL32(170, 214, 255, 255);
+    const ImU32 core = IM_COL32(236, 246, 255, 255);
+    const char* word = "STUNNED";
+    const ImVec2 ts = ImGui::CalcTextSize(word);
+    // The glyph: a jagged bolt in 2 px blocks, 5 wide x 8 tall.
+    static const char* kBolt[8] = {"..###", ".###.", ".##..", "#####",
+                                   "..##.", ".##..", ".#...", "#...."};
+    const float b = 2.0f, gw = 5 * b, gh = 8 * b;
+    constexpr int kMaxPips = 8;
+    const int pips = std::clamp((s.stunTicksLeft + 14) / 15, 1, kMaxPips);
+    const float pw = 4.0f, ph = 6.0f, pg = 2.0f;
+    const float pipsW = kMaxPips * pw + (kMaxPips - 1) * pg;
+    const float inner = gw + 8.0f + std::max(ts.x, pipsW);
+    const int step = (int)(ImGui::GetTime() * 30.0);
+    const uint32_t h = (uint32_t)step * 2654435761u;
+    const float jx = (float)((int)(h >> 29) % 3 - 1) * 2.0f;
+    const float x0 = std::floor((disp.x - inner) * 0.5f) + jx;
+    const float y0 = py;
+    const float tabH = std::max(gh, ts.y + 4.0f + ph);
+    d->AddRectFilled(ImVec2(x0 - 8, y0 - 4), ImVec2(x0 + inner + 8, y0 + tabH + 4),
+                     IM_COL32(0, 0, 0, 170));
+    d->AddRect(ImVec2(x0 - 8, y0 - 4), ImVec2(x0 + inner + 8, y0 + tabH + 4), arc, 0.0f, 0,
+               2.0f);
+    const float gy = y0 + std::floor((tabH - gh) * 0.5f);
+    for (int r = 0; r < 8; r++)
+      for (int c = 0; c < 5; c++)
+        if (kBolt[r][c] == '#')
+          d->AddRectFilled(ImVec2(x0 + c * b, gy + r * b), ImVec2(x0 + (c + 1) * b, gy + (r + 1) * b),
+                           (step & 2) ? core : arc);
+    const float tx = x0 + gw + 8.0f;
+    d->AddText(ImVec2(tx + 1, y0 + 1), IM_COL32(0, 0, 0, 190), word);
+    d->AddText(ImVec2(tx, y0), core, word);
+    const float pyy = y0 + ts.y + 4.0f;
+    for (int i = 0; i < kMaxPips; i++) {
+      const ImVec2 a(tx + i * (pw + pg), pyy), c(tx + i * (pw + pg) + pw, pyy + ph);
+      d->AddRectFilled(a, c, i < pips ? arc : ui::ColDeep());
+    }
+    py += tabH + 14.0f;
+  }
   // ---- the throw's wind-up: a row of pixel pips under the crosshair --------
   //
   // Ten 6x8 cells on the 2 px grid, lit left to right in gold as Q is held,

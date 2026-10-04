@@ -10,16 +10,25 @@
 //
 // WHAT IT IS.
 //   1. TARGET. Every column within `searchRadius` (XZ disc) of the aim is
-//      scanned down from `aim.y + kStrikeScanUp` through the CPU mirror
-//      (SpellProbe: World::Snap(), one tick latent, fixed latency) to its
-//      first non-gas cell -- its TOP. The bolt takes the column whose top
-//      scores highest: top y, plus `conductBonus` cells if the top conducts
-//      (StrikeMats::conductive: materials.json `electric.resist` 1..8),
-//      ties to the nearer column, then to a hash. So a strike PREFERS a tall
-//      thing and an iron rod over the ground beside it -- the lightning-rod
-//      behaviour -- and never searches past what the mirror knows. A column
-//      the mirror does not cover is skipped; when no column is known the bolt
-//      lands at the aim cell itself.
+//      scanned down from THE REAL TOP -- `aim.y + kStrikeScanUp` (taller than
+//      the tallest tree the generator grows), clamped to the residency
+//      window -- through the strike's view of the world (WorldStrikeProbe:
+//      the snapshot mirror, then the fetch cache; fixed latency) to its first
+//      non-gas cell -- its TOP. A top counts only when the cell directly
+//      above it is KNOWN air: a column whose first known cell is solid (a
+//      canopy or a roof whose upper part no store has delivered) was entered
+//      from inside, and does not compete -- that was the bolt that stopped in
+//      mid-air inside a tree (wave 2, package E). The bolt takes the column
+//      whose top scores highest: top y, plus `conductBonus` cells if the top
+//      conducts (StrikeMats::conductive: materials.json `electric.resist`
+//      1..8), ties to the nearer column, then to a hash. So a strike PREFERS
+//      a tall thing and an iron rod over the ground beside it -- the
+//      lightning-rod behaviour -- and never searches past what the stores
+//      know. When no column qualifies the bolt lands at the aim cell itself.
+//      Both callers make the stores know first: a storm strike asks the fetch
+//      cache for every chunk of its search at DECIDE time, a spell strike
+//      whose search leaves the stores waits a stepped leader for the same
+//      fetch (StrikeSearchChunks / StrikeSearchKnown).
 //   2. BOLT. A jagged column of `boltMat` from `height` cells above the top
 //      down to the cell just above it: one cell per step down, a hashed
 //      sideways kick on about a third of the steps, the offset pulled back so
@@ -58,7 +67,12 @@
 #include "game/spell.h"
 
 // How far above the aim the target scan starts, and how far below it gives up.
-constexpr int32_t kStrikeScanUp = 24;
+// UP is the real top of anything a column can hold: the tallest generated tree
+// (redwood, 22 m + 4 m variance = 260 cells) with a little to spare. It was 24
+// cells, so a tree or a house taller than 2.4 m over the aim was entered from
+// inside. The scan skips an unknown chunk whole, so the height costs a chunk
+// lookup per 16 cells of sky, not a probe per cell.
+constexpr int32_t kStrikeScanUp = 272;
 constexpr int32_t kStrikeScanDown = 32;
 // Hard caps on one plan (rule 2): bolt height, search radius, splash.
 constexpr int32_t kStrikeMaxHeight = 64;
@@ -104,6 +118,9 @@ struct StrikePlan {
   bool targetConductive = false;
   uint32_t targetMat = 0;
   int32_t columnsScanned = 0;
+  // Columns whose first known cell was solid with no known air above it (the
+  // inside of a canopy, a roof above the stores): they did not compete.
+  int32_t columnsHidden = 0;
   int32_t boltCells = 0, splashCells = 0;
   std::vector<CellOp> cells;
 };
@@ -129,9 +146,22 @@ SpellProbe WorldStrikeProbe(const World& world);
 
 // A glyph's strike block (GlyphStrike, glyphs.json "strike") as a spec at
 // `aim`. Repetition (`scaleMille`, 1000 = said once) raises the bolt and adds
-// arcs, inside the caps. No bolt = the shock: it goes off AT the aim.
+// arcs, inside the caps; STRENGTH (`strengthMille`, the effect's own 0..1000:
+// a spent carrier, a lane's share) scales the same two, so a weak bolt is a
+// shorter bolt with fewer arcs -- less lightning, so less charge in the field.
+// No bolt = the shock: it goes off AT the aim.
 StrikeSpec StrikeSpecFromGlyph(const GlyphStrike& g, IVec3 aim, int32_t scaleMille,
-                               uint32_t key);
+                               uint32_t key, int32_t strengthMille = 1000);
+
+// Every world chunk the target search of `spec` reads (its XZ disc x the
+// scan's vertical span, clamped to the window), in a fixed order. A storm
+// strike requests them all from the fetch cache when it is decided.
+void StrikeSearchChunks(const StrikeSpec& spec, const World& world, std::vector<IVec3>& out);
+// True when every chunk of StrikeSearchChunks is in the snapshot mirror or the
+// fetch cache -- the search can run now. Both stores are functions of the tick,
+// so the answer is too (rule 1). `missing` (optional) receives the rest.
+bool StrikeSearchKnown(const StrikeSpec& spec, const World& world,
+                       std::vector<IVec3>* missing = nullptr);
 
 // The storm's ground strike: the spec session.cpp WeatherStrikes fires.
 StrikeSpec WeatherStrikeSpec(const StrikeMats& mats, IVec3 aim, uint32_t key);

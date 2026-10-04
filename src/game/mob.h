@@ -1860,14 +1860,19 @@ struct BiteHit {
 // checks the key. Never saved, never hashed.
 struct ElecBodyCell {
   int16_t c[3] = {0, 0, 0};  // the cell, in slot-lattice world cells
-  uint8_t bulk = 255;        // resist crossing it (255 = insulator)
-  uint8_t entry = 255;       // resist entering it from outside the slot (its EXPOSED voxels)
+  uint16_t bulk = 4095;      // resist crossing it (kElecResistInsulator = insulator)
+  uint16_t entry = 4095;     // resist entering it from outside the slot (its EXPOSED voxels)
   uint16_t feel = 0;         // per-mille felt (electric.shock, voxel-weighted)
   uint16_t ohmMat = 0;       // its commonest material with electric ignite / char data
 };
 struct ElecSlotCache {
   uint64_t geomKey = 0;      // digest of the geometry it was built from (0 = never)
   uint32_t scale = 0;
+  // The resists are re-accumulated at most every kElecSlotRefreshTicks ticks
+  // while the slot is charged (a coat and a sear are slow next to the tick);
+  // the table generation and wet knob they were taken at, and when.
+  uint32_t gen = 0, wet = 0, lastFull = 0;
+  bool fresh = false;
   IVec3 cmin{}, cdim{};      // the cells' box, and a dense index into `cells`
   std::vector<int32_t> at;   // (z * cdim.y + y) * cdim.x + x -> cell, -1 = none
   std::vector<int32_t> vcell;   // per lattice voxel: its cell, -1 = empty
@@ -6136,7 +6141,8 @@ class MobSystem {
     uint64_t linked = 0;         // ...of them uncharged bodies touching a charged one
     uint64_t cellsSolved = 0;    // body cells those solves covered
     uint64_t cacheBuilds = 0;    // slot lattices binned (ElecSlotCache misses)
-    uint64_t cacheHits = 0;
+    uint64_t cacheHits = 0;      // reused as it stood (within kElecSlotRefreshTicks)
+    uint64_t cacheAccums = 0;    // resists re-accumulated, geometry kept
     uint64_t ohmicCells = 0, ohmicVoxels = 0;
     uint64_t ohmicRefused = 0;   // rolls past kShockOhmicCellsPerTick
     uint64_t crackleOps = 0, crackleRefused = 0;
@@ -6148,6 +6154,18 @@ class MobSystem {
   static constexpr uint32_t kShockOhmicCellsPerTick = 64;
   static constexpr uint32_t kShockCrackleOpsPerTick = 16;
   const ShockCounters& ShockStats() const { return shockCounters_; }
+  // ---- THE SHOCK'S SOUND (wave 2, package E) -------------------------------
+  // One entry per body per tick a shock was applied (ApplyShocks), drained by
+  // the frame into Cues::Shock and cleared there like VoiceEvents. Presentation
+  // only: nothing in the sim reads it. Bounded by construction (one per body
+  // per tick, the tick loop at most 4 deep per frame) and capped besides.
+  struct ShockCue {
+    Vec3 posVoxel;          // the touching limb that took the most
+    uint64_t mobId = 0;     // the player's own avatar id = "it is me"
+    float intensity = 0.0f; // 0..1: effective P against the knock-down P
+  };
+  const std::vector<ShockCue>& ShockCues() const { return shockCues_; }
+  void ClearShockCues() { shockCues_.clear(); }
   uint64_t ShockAttacksDropped() const { return shockAttacksDropped_; }
   uint32_t ContactHitsBilled() const { return contactHitsBilled_; }
 
@@ -7869,7 +7887,7 @@ class MobSystem {
   std::vector<uint8_t> matHot_;         // carries tag:hot
   // mat -> its electric.resist (0 = insulator), for the shock's wet coat and
   // conducting armour (mob_shock.cpp). Rebuilt with the rest on a reload.
-  std::vector<uint8_t> matElecResist_;
+  std::vector<uint16_t> matElecResist_;
   // ...and the rest of a material's electric block, as a BODY cell made of it
   // uses it (wave 2, mob_shock.cpp): what it feels (electric.shock), what the
   // current turns it into (ignite.into with an air face, char without) and
@@ -7894,8 +7912,13 @@ class MobSystem {
   // binning of one slot's lattice into world-pitch cells.
   void ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                       const ElecHit* hits, size_t nHits);
-  // Returns whether the geometry had to be rebuilt.
-  bool RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, ElecSlotCache& c);
+  // Returns 0 = reused as it stood, 1 = resists re-accumulated, 2 = geometry
+  // rebuilt too. Re-accumulates at most every kElecSlotRefreshTicks ticks
+  // (tick-keyed, so deterministic) unless the lattice changed size or the
+  // table / wet knob moved.
+  static constexpr uint32_t kElecSlotRefreshTicks = 4;
+  int RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_t tick,
+                           ElecSlotCache& c);
   // IS AN INFECTION: carries an `infect` block (materials.json, materials.h
   // MaterialDef::infect). Was "carries tag:infectious" until the infection
   // became data (PLAN_weapon_coats B1); the tag still exists for the
@@ -8109,6 +8132,8 @@ class MobSystem {
   uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature
   uint32_t contactHitsBilled_ = 0;  // ApplyContactDamage: contacts billed
   ShockCounters shockCounters_;      // QueueShockQueries / ApplyShocks
+  std::vector<ShockCue> shockCues_;  // ApplyShocks -> the frame's Cues::Shock
+  void PushShockCue(const Mob& m, int limb, float peakP);
   uint64_t shockAttacksDropped_ = 0;  // DecideIntent: attacks a stun refused
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------

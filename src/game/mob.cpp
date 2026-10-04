@@ -2399,7 +2399,8 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   // The shock's view of the charge field's material data (mob_shock.cpp).
   matElecResist_.assign(mats.size(), 0u);
   for (size_t i = 0; i < mats.size(); i++)
-    matElecResist_[i] = (uint8_t)std::min<uint32_t>(mats[i].elec.resist, 254u);
+    matElecResist_[i] =
+        (uint16_t)std::min<uint32_t>(mats[i].elec.resist, kElecResistInsulator - 1u);
   // ...and the rest of the block a body cell reads (wave 2, mob_shock.cpp).
   matElec_.assign(mats.size(), ElecMat{});
   crackleLoMat_ = crackleLoSrc_ = crackleHiMat_ = crackleHiSrc_ = 0;

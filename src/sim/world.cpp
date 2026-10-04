@@ -151,8 +151,9 @@ void World::Init(const rhi::Device& device) {
                           U::Storage | U::CopySrc | U::CopyDst, "heatMeta");
   heatArgs = CreateBuffer(device, kHeatArgsBytes, U::Indirect | U::CopyDst, "heatArgs");
   // The charge field (src/sim/elec.h): zeroed by the worldgen / load fill
-  // rows before anything reads it.
-  elecPool = CreateBuffer(device, (uint64_t)kElecPoolPages * kElecPageWords * 4,
+  // rows before anything reads it. The pages, then the per-tick cell cache and
+  // its stamps (kElecPoolWords, wave 2).
+  elecPool = CreateBuffer(device, (uint64_t)kElecPoolWords * 4,
                           U::Storage | U::CopySrc | U::CopyDst, "elecPool");
   elecMeta = CreateBuffer(device, (uint64_t)kEmWords * 4,
                           U::Storage | U::CopySrc | U::CopyDst, "elecMeta");
@@ -1394,6 +1395,15 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
       if (elecHitsPending_.size() > kElecHitsPendingMax)
         elecHitsPending_.erase(elecHitsPending_.begin(),
                                elecHitsPending_.end() - kElecHitsPendingMax);
+    }
+    // The charge field's doorbell (World::ElecMayBeLive): a ring this
+    // snapshot shows that the last one did not -- caMask paged, or wanted to
+    // page, a source chunk -- latches the elec rows on for the ticks a source
+    // with no op behind it needs to become visible as pages.
+    if (snap_.valid && snap_.elec[kEmDoorbells] != elecRingCount_) {
+      elecRingCount_ = snap_.elec[kEmDoorbells];
+      elecRingSeen_ = true;
+      elecRingTick_ = snap_.tick + kSnapshotLatency;
     }
     if (snap_.valid && !snap_.ticketDeposits.empty()) {
       ticketDepositsPending_.insert(ticketDepositsPending_.end(),
