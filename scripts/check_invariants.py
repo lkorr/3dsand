@@ -3356,7 +3356,11 @@ _ELEC_CONSTS = {
     "ELEC_POOL_PAGES": "kElecPoolPages", "ELEC_PAGE_WORDS": "kElecPageWords",
     "ELEC_HALF_WORDS": "kElecHalfWords", "ELEC_ENTRY_HAS": "kElecEntryHas",
     "ELEC_ENTRY_PAGE": "kElecEntryPage", "ELEC_ROUNDS_MAX": "kElecRoundsMax",
-    "ELEC_RES_INS": "kElecResistInsulator",
+    "ELEC_RES_INS": "kElecResistInsulator", "ELEC_RES_MASK": "kElecResistMask",
+    # Wave 2: the cell cache, the doorbell count, the spreading loss.
+    "ELEC_CACHE_WORDS": "kElecCacheWords", "ELEC_CACHE_BASE": "kElecCacheBase",
+    "ELEC_STAMP_BASE": "kElecStampBase", "EM_DOORBELLS": "kEmDoorbells",
+    "EP_SPREAD_Q": "kEpSpreadQ", "EP_SPREAD_FREE": "kEpSpreadFree",
     "ELEC_R2_SOURCE": "kElecR2Source", "ELEC_R2_CONDUCTS": "kElecR2Conducts",
     "EM_CUR": "kEmCur", "EM_FREE_TOP": "kEmFreeTop", "EM_NEXT_FRESH": "kEmNextFresh",
     "EM_PHASE": "kEmPhase", "EM_MARKED": "kEmMarked", "EM_COUNT0": "kEmCount0",

@@ -953,6 +953,9 @@ const char* const kOrder[] = {
     // tariff refund, ward at the struck cell, the spell's stepped leader);
     // own pad, regenerates on the way out.
     "elec-strike-play",
+    // Electricity wave 2: the same forced strike onto a sea basin and a
+    // rain-wet pad -- the spreading loss keeps it local. Same discipline.
+    "elec-bulk",
     // Electricity E1: the charge field in three sealed rooms (a copper wire,
     // a dry and a wet wood strip, a water pool), run twice; own worldgen,
     // regenerates on the way out.

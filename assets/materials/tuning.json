@@ -552,6 +552,8 @@
     "elecDecay": 8,
     "elecDecayShift": 3,
     "elecWetResist": 12,
+    "elecSpreadLoss": 150,
+    "elecSpreadFree": 2,
     "elecReactMin": 16,
     "elecReactFull": 1000,
     "elecIgniteGain": 0.35,

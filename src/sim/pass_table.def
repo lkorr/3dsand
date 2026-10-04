@@ -696,17 +696,19 @@ PASS(heatRelax, "heat", PT_TICK, PIPE_HEAT_RELAX, K_INDIRECT, IND_HEATARGS,48,0,
 // Each alloc publishes the args (elecMeta byte 128, 32 B -> elecArgs): record
 // 0 the live list (rounds, settle), record 1 the purge. Round k >= 1 is one
 // alloc / copy / round triple under C_ELECRk (k < sim.elecRounds). No voxel is
-// written here.
+// written here. Wave 2: elecRound reads the solute layer (brine conducts: the
+// shared resist rule, MIRROR elec elecResistRaw), and every row but the query
+// is C_ELEC -- the CA runs AND World::ElecMayBeLive (the fast path).
 // write-only in practice: `elecPool` (the head zeroes re-keyed pages).
 PASS(elecAlloc0, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
-     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     GRP_SIM, DYN_ZERO, C_ELEC, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
-PASS(copy_elecArgs0, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+PASS(copy_elecArgs0, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELEC, 1,
      USES(TR(ElecMeta) TW(ElecArgs)))
 PASS(elecRound0, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
-     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     GRP_SIM, DYN_ZERO, C_ELEC, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc1, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR1, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -715,7 +717,7 @@ PASS(copy_elecArgs1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound1, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR1, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc2, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR2, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -724,7 +726,7 @@ PASS(copy_elecArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound2, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR2, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc3, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR3, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -733,7 +735,7 @@ PASS(copy_elecArgs3, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound3, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR3, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc4, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR4, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -742,7 +744,7 @@ PASS(copy_elecArgs4, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound4, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR4, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc5, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR5, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -751,7 +753,7 @@ PASS(copy_elecArgs5, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound5, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR5, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc6, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR6, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -760,7 +762,7 @@ PASS(copy_elecArgs6, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound6, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR6, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecAlloc7, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_ELECR7, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
@@ -769,34 +771,35 @@ PASS(copy_elecArgs7, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DY
 PASS(elecRound7, "elec", PT_TICK, PIPE_ELEC_ROUND, K_INDIRECT, IND_ELECARGS,0,0,
      GRP_SIM, DYN_ZERO, C_ELECR7, 1,
      USES(U(TickUBO) I(ElecArgs) R(Voxels) R(Materials) R(PageTable) RW(ElecPool) A(ElecMeta)
-          R(ElecParams)))
+          R(ElecParams) R(SolTable) R(SolPool) R(SolSpec)))
 PASS(elecSettle, "elec", PT_TICK, PIPE_ELEC_SETTLE, K_INDIRECT, IND_ELECARGS,0,0,
-     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     GRP_SIM, DYN_ZERO, C_ELEC, 1,
      USES(U(TickUBO) I(ElecArgs) R(DirtyIn) A(DirtyOut) RW(ElecPool) A(ElecMeta) R(ElecParams)
           R(PageTable)))
 PASS(elecAllocTail, "elec", PT_TICK, PIPE_ELEC_ALLOC, K_COMPUTE, 1,1,1,
-     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     GRP_SIM, DYN_ZERO, C_ELEC, 1,
      USES(U(TickUBO) A(ElecMeta) W(ElecPool) R(ElecParams) R(PageTable)))
-PASS(copy_elecArgsTail, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+PASS(copy_elecArgsTail, nullptr, PT_TICK, PIPE_NONE, K_COPY, 128,0,32, GRP_NONE, DYN_NONE, C_ELEC, 1,
      USES(TR(ElecMeta) TW(ElecArgs)))
 PASS(elecPurge, "elec", PT_TICK, PIPE_ELEC_PURGE, K_INDIRECT, IND_ELECARGS,16,0,
-     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     GRP_SIM, DYN_ZERO, C_ELEC, 1,
      USES(I(ElecArgs) W(ElecPool) A(ElecMeta)))
 // THE BODY QUERY (package E4: shocks reach bodies; sim_elec.wgsl elecQuery).
 // One group per box the CPU asked about (elecParams' tail, Simulation::
 // PrepareElecQueries), AFTER the settle / tail / purge so it reads the field
 // this tick left; its four answer words per box go to elecMeta's tail, which
 // World::EncodeReadbacks copies onto the snapshot ring (TR(ElecMeta) there).
-// Its own condition, NOT C_CAACTIVE: a body standing in charged water on a
+// Its own condition, NOT C_ELEC: a body standing in charged water on a
 // tick the CA happened to skip still asks, and the answer is the settled field
 // either way. C_ELECQUERY = boxes this tick; the CPU queues none unless the
 // field can hold charge (World::ElecMayBeLive), so a world with no charge
 // records nothing.
 // read-only in practice: `elecPool` (the module declares it read_write for
-// the rounds; elecQuery only reads half 0 through elecAt).
+// the rounds; elecQuery only reads half 0 through elecAt). R(PageTable): the
+// owner check elecAt makes since wave 2 resolves the slot's world chunk.
 PASS(elecQuery, "elec", PT_TICK, PIPE_ELEC_QUERY, K_COMPUTE, D_ELECQUERY,1,1,
      GRP_SIM, DYN_ZERO, C_ELECQUERY, 1,
-     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams)))
+     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams) R(PageTable)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //

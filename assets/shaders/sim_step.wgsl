@@ -437,27 +437,48 @@ fn heatX(c : vec3<i32>) -> u32 {
 // identical by scripts/check_invariants.py `elec`, which also checks every
 // constant against elec.h. Not in common.wgsl: an edit there misses the SPIR-V
 // cache of every shader, and only these agree on the layout. A shader that
-// pastes it binds elecPool (55) and elecMeta (56, atomic).
+// pastes it binds elecPool (55), elecMeta (56, atomic) and elecParams (57),
+// the solute layer (40..43, its MIRROR block) and declares EP_MAT,
+// EP_MAT_STRIDE and EP_WET.
 //
 // READING P (packages E2 / E4): elecAt(slot, local) is the SETTLED field --
 // half 0, what elecSettle left at the end of the LAST tick. The elec rows run
 // after the CA, so inside the CA it is stable for the whole tick (as heatPool
 // is). `slot` is a WINDOW slot (tickets carry no charge and read 0), `local`
 // the chunk-local cell index (z * 256 + y * 16 + x).
+//
+// THE OWNER CHECK (wave 2, 2026-10-04): a page belongs to the world chunk its
+// owner word names. When the window moves, a slot changes chunk BEFORE the elec
+// head re-keys its page (after the CA), and on a tick the elec rows skip
+// (World::ElecMayBeLive false) not at all -- so a reader that trusted the entry
+// alone saw the departed chunk's charge in the arrived one for a tick (the
+// phantom charge). A slot whose owner is not its resident chunk reads 0.
 const ELEC_POOL_PAGES : u32 = 2048u;
 const ELEC_PAGE_WORDS : u32 = 4096u;
 const ELEC_HALF_WORDS : u32 = 2048u;
 const ELEC_ENTRY_HAS : u32 = 0x80000000u;
 const ELEC_ENTRY_PAGE : u32 = 0x00FFFFFFu;
+const ELEC_RES_MASK : u32 = 0xFFFu;
 const EM_ENTRY : u32 = 64u;
+const EM_OWNER : u32 = 32832u;
 const EM_WANT : u32 = 65600u;
+const EM_DOORBELLS : u32 = 7u;
 const ELEC_R2_SOURCE : u32 = 33554432u;
 const ELEC_R2_CONDUCTS : u32 = 67108864u;
 
+// The owner word of world chunk wc (elec.h ElecOwnerKey): 10 bits an axis, +1
+// so a zero word is never an owner.
+fn elecOwnerKey(wc : vec3<i32>) -> u32 {
+  let u = vec3<u32>(wc & vec3<i32>(1023));
+  return (u.x | (u.y << 10u) | (u.z << 20u)) + 1u;
+}
 fn elecAt(slot : u32, local : u32) -> u32 {
   if (slot >= NUM_CHUNKS) { return 0u; }
   let e = atomicLoad(&elecMeta[EM_ENTRY + slot]);
   if ((e & ELEC_ENTRY_HAS) == 0u) { return 0u; }
+  if (atomicLoad(&elecMeta[EM_OWNER + slot]) != elecOwnerKey(slotWorldChunk(slot, T.origin))) {
+    return 0u;
+  }
   let w = elecPool[(e & ELEC_ENTRY_PAGE) * ELEC_PAGE_WORDS + (local >> 1u)];
   return (w >> ((local & 1u) * 16u)) & 0xFFFFu;
 }
@@ -467,6 +488,48 @@ fn elecAtCell(c : vec3<i32>) -> u32 {
   if (!chunkInWindow(wc, T.origin)) { return 0u; }
   let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return elecAt(chunkSlotIndex(wc), (lo.z * CHUNK + lo.y) * CHUNK + lo.x);
+}
+
+// ---- THE RESIST RULE: one copy for the field (sim_elec) and the CA (E2) ----
+// Both used to carry their own; brine made them three-part, so it lives here.
+fn elecMatWord(m : u32) -> u32 { return elecParams[EP_MAT + (m & 0xFFFu) * EP_MAT_STRIDE]; }
+// The resist of the cell holding word w from its MATERIAL and its COAT alone,
+// 0 = insulator. THE WET RULE: a cell under a coat whose material conducts
+// (water, blood, brine's water...) conducts through the film --
+// min(own, wet[stain amount]) -- so a wet plank or wet stone carries what a
+// dry one does not. Whether a cell conducts at all is decided here (brine
+// below only lowers a conductor's resist), so the field's neighbour count uses
+// this, the cheap half.
+fn elecResistBase(w : u32) -> u32 {
+  var r = elecMatWord(voxMat(w)) & ELEC_RES_MASK;
+  if (voxStained(w)) {
+    let coat = materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
+    if ((elecMatWord(coat) & ELEC_RES_MASK) != 0u) {
+      let wr = elecParams[EP_WET + voxStainAmt(w)];
+      r = select(wr, min(r, wr), r != 0u);
+    }
+  }
+  return r;
+}
+// ...and BRINE (wave 2): a conducting LIQUID carrying a dissolved electrolyte
+// (the species' `from` material has electric.dissolved, its word 3: salt) at
+// concentration c conducts as dissolved + (own - dissolved) x (sat - c) / sat
+// -- fresh water at c = 0, the electrolyte's own resist at saturation. The
+// concentration is the solute layer's (mass x 8 / fullness, solRuleAllows').
+// `slot` / `local` locate the cell in the solute table (a window slot).
+fn elecResistRaw(w : u32, slot : u32, local : u32) -> u32 {
+  let r = elecResistBase(w);
+  if (r <= 1u || slot >= NUM_CHUNKS) { return r; }
+  if (materials[voxMat(w)].klass != CLASS_LIQUID) { return r; }
+  let v = solCellValue(solTable[slot], local);
+  let s = solSpeciesOf(v);
+  if (s == 0u) { return r; }
+  let fromMat = solSpec[SOLS_BASE + s * SOLS_STRIDE + 15u] & 0xFFFu;
+  let re = elecParams[EP_MAT + fromMat * EP_MAT_STRIDE + 3u] & ELEC_RES_MASK;
+  if (re == 0u || re >= r) { return r; }
+  let sat = max(solSaturation(s), 1u);
+  let conc = min((solMassOf(v) * 8u) / (voxState(w) + 1u), sat);
+  return re + ((r - re) * (sat - conc)) / sat;
 }
 // MIRROR-END elec
 
@@ -516,19 +579,11 @@ const ELEC_CRACKLE_SALT : u32 = 0x3C4A7B1Fu;
 // The most a cell crackles a tick: 100 per-mille (in 1/REACT_CHANCE_DEN).
 const ELEC_CRACKLE_CAP : u32 = 200000u;
 
-fn elecMatWord(m : u32) -> u32 { return elecParams[EP_MAT + (m & 0xFFFu) * EP_MAT_STRIDE]; }
-// The resist the field used for the cell holding w (sim_elec.wgsl
-// elecCellResist, the wet rule included), 0 for an insulator.
-fn elecResistOf(w : u32) -> u32 {
-  var r = elecMatWord(voxMat(w)) & 0xFFu;
-  if (voxStained(w)) {
-    let coat = materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
-    if ((elecMatWord(coat) & 0xFFu) != 0u) {
-      let wr = elecParams[EP_WET + voxStainAmt(w)];
-      r = select(wr, min(r, wr), r != 0u);
-    }
-  }
-  return r;
+// The resist the field used for the cell holding w at world cell c (the
+// shared rule, MIRROR elec elecResistRaw: material, wet coat, brine), 0 for an
+// insulator.
+fn elecResistOf(w : u32, c : vec3<i32>) -> u32 {
+  return elecResistRaw(w, voxSlotOfCell(c), solLocalOf(c));
 }
 // The P a cell can hold: only a conductor (or a wet cell) is ever charged
 // short of being a source, so everything else skips the field read.
@@ -3249,7 +3304,7 @@ fn elecReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32, m : Ma
   let cap = elecParams[at + 2u];
   let prod = select((w1 >> 12u) & 0xFFFu, w1 & 0xFFFu, air != 0u);
   let q = elecParams[EP_IGNITE_Q];
-  let res = elecResistOf(w);
+  let res = elecResistOf(w, c);
   if (prod != 0u && cap != 0u && q != 0u && res != 0u) {
     let e = p * res;                 // <= 65535 * 254
     let lim = (cap << 4u) / q;       // cap <= 2e6
@@ -5010,8 +5065,12 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     if (hot) { atomicOr(&heatMeta[HM_FLAGS + ci], HF_EMIT); }
     // THE CHARGE FIELD'S DOORBELL: a source here and no page yet -- elecAlloc
     // pages it after the CA (src/sim/elec.h). Window slots only.
+    // EM_DOORBELLS counts the rings (wave 2): the CPU reads it off the
+    // snapshot, and a ring it has not seen keeps the elec rows recording
+    // (World::ElecMayBeLive) for a source that came from no op.
     if (charged && (atomicLoad(&elecMeta[EM_ENTRY + ci]) & ELEC_ENTRY_HAS) == 0u) {
       atomicOr(&elecMeta[EM_WANT + (ci >> 5u)], 1u << (ci & 31u));
+      atomicAdd(&elecMeta[EM_DOORBELLS], 1u);
     }
   }
   for (var k = li; k < 3u * CA_MASK_WORDS; k += 256u) {
