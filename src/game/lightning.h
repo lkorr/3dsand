@@ -61,6 +61,7 @@
 #include <vector>
 
 #include "math3d.h"
+#include "sim/boltfx.h"     // StrikePath: the plan's shape for the frame's bolt
 #include "sim/materials.h"
 #include "sim/world.h"
 
@@ -123,6 +124,7 @@ struct StrikePlan {
   int32_t columnsHidden = 0;
   int32_t boltCells = 0, splashCells = 0;
   std::vector<CellOp> cells;
+  std::vector<StrikePath> paths;   // render geometry (StrikePath); [0] = channel when there is a bolt
 };
 
 // The per-tick strike allowance, owned by the authority (TickAuthorityCtx::

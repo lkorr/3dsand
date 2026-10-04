@@ -24,6 +24,7 @@
 #include "sim/worldmap.h"
 #include "sim/wind.h"
 #include "sim/weather.h"
+#include "sim/boltfx.h"   // the bolt table, uploaded with every RenderParams
 #include "sim/renderspec.h"
 #include "sim/worldedit.h"
 #include "sim/waterbody.h"
@@ -842,6 +843,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // compared, so the wrap is a non-event.
   static uint32_t renderFrame = 0;
   rp.frameIdx = ++renderFrame;
+  // THE BOLT TABLE (sim/boltfx.h, raymarch.wgsl boltEmit): a strike's bolt on
+  // this frame's render clock. Here for the shadow cache's reason: every path
+  // that draws writes render params first. Writes nothing while no bolt burns.
+  boltfx::Upload(queue, time);
   rp.shadowSubdiv = (uint32_t)CurrentTuning().render.shadowCacheSubdiv;
   // ~41 deg elevation: low enough that terrain and canopy cast readable
   // shadows (near field AND the far-field cascade shadow march), high enough

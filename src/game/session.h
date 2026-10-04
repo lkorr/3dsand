@@ -993,6 +993,10 @@ struct TickAuthorityCtx {
       bool conductive = false;
       bool emitted = false;   // false = refused for budget
       uint32_t cells = 0;
+      // The plan's walks (StrikePath), for the frame's bolt (sim/boltfx.*);
+      // render-only, empty when refused (and for a remote bolt, whose plan
+      // this machine never saw: the frame draws no channel for it).
+      std::vector<StrikePath> paths;
       // Recovered from a PEER's merged CellOps (session.cpp phase N): a bolt
       // another machine authored, re-announced here only so this machine's
       // frame flashes and claps for it. Never in `recent`.

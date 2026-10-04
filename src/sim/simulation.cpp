@@ -25,6 +25,7 @@
 #include "sim/solutes.h"     // LoadSolutes: the species table UploadTables packs
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
+#include "sim/boltfx.h"      // the bolt table at renderBGL 44 (render-only)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
@@ -783,6 +784,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // Render-only; an empty field costs two header loads a pixel.
         entry(42, T::ReadOnlyStorage, S::Fragment),               // elecPool
         entry(43, T::ReadOnlyStorage, S::Fragment),               // elecMeta
+        // THE BOLT TABLE (sim/boltfx.h; raymarch.wgsl boltEmit /
+        // boltLightAt): a strike's render-only segments and light points,
+        // CPU-written per frame while a bolt burns. Empty = one load a pixel.
+        entry(44, T::ReadOnlyStorage, S::Fragment),               // boltBuf
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1048,6 +1053,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
       gasMaskBuf_ = CreateBuffer(device, words * 4, U::Storage, "gasMask");
       const std::vector<uint32_t> zero((size_t)words, 0u);
       device.GetQueue().WriteBuffer(gasMaskBuf_, 0, zero.data(), words * 4);
+    }
+    // The bolt table (sim/boltfx.h): zeroed = no bolt; boltfx::Upload
+    // rewrites it from WriteRenderParams while one burns. Render-only.
+    {
+      boltBuf_ = CreateBuffer(device, boltfx::kBytes, U::Storage, "boltBuf");
+      const std::vector<uint8_t> zero((size_t)boltfx::kBytes, 0u);
+      device.GetQueue().WriteBuffer(boltBuf_, 0, zero.data(), zero.size());
+      boltfx::SetBuffer(&boltBuf_);
     }
     // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*):
     // header + list + one bit per irradiance-plane word. The zero-initialized
@@ -4008,6 +4021,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(41, world_->shadowCache),   // 14's read-only view (shadowSlotRead)
         b(42, world_->elecPool),      // the charge field (raymarch elecPAt)
         b(43, world_->elecMeta),
+        b(44, boltBuf_),              // the bolt table (boltfx.h)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");

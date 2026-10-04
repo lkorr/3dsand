@@ -2850,6 +2850,7 @@ static void RecordStrike(TickAuthorityCtx& w, const StrikePlan& plan, uint32_t t
   ev.conductive = plan.targetConductive;
   ev.emitted = emitted;
   ev.cells = (uint32_t)plan.cells.size();
+  if (emitted) ev.paths = plan.paths;   // the frame's bolt (render-only)
   if (sk.events.size() < TickAuthorityCtx::StrikeWorld::kMaxEvents) sk.events.push_back(ev);
   sk.recent.push_back(ev);
   if (sk.recent.size() > TickAuthorityCtx::StrikeWorld::kRecent)
