@@ -20670,6 +20670,51 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   // the severed pieces (StainDeadFlesh) take what they leave.
   uint32_t deadBudget = kStainLatticePerTick;
   uint32_t deadRain = kRainLatticePerTick;
+  // ---- THE CONTACT PASS, PLANNED ACROSS THE POOL (StainPre) ---------------
+  // Every creature the two loops below will visit -- the living, and the dead
+  // that are awake (an asleep corpse's due visit plans inline) -- has each
+  // limb's contact walk and sweep decided now, one task per creature, writing
+  // nothing but the plans. The loops then spend the shared pots exactly as
+  // before and play each plan up to the share it gets.
+  // SANDVOX_STAIN_PLAN=0: no plans (every contact pass inline, the A/B arm).
+  // SANDVOX_STAIN_PLAN=2: every plan re-made serially and compared (a
+  // diagnostic for the pool's contract: a mismatch is printed and the serial
+  // plan kept).
+  static const int planMode = [] {
+    const char* e = std::getenv("SANDVOX_STAIN_PLAN");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (planMode != 0) {
+    workpool::ParallelFor(mobs_.size(), 1, [&](size_t i) {
+      Mob& m = mobs_[i];
+      if (!m.alive_ && (m.rigReleased_ || m.deadAsleep_)) return;
+      m.PlanStainContact(tick, world);
+    });
+  }
+  if (planMode == 2) {
+    for (size_t i = 0; i < mobs_.size(); i++) {
+      Mob& m = mobs_[i];
+      if (!m.alive_ && (m.rigReleased_ || m.deadAsleep_)) continue;
+      if (m.stainPreTick_ != tick) continue;
+      const std::vector<StainPre> par = m.stainPre_;
+      m.PlanStainContact(tick, world);
+      for (size_t li = 0; li < par.size() && li < m.stainPre_.size(); li++) {
+        const StainPre& a = par[li];
+        const StainPre& b = m.stainPre_[li];
+        bool same = a.valid == b.valid && a.any == b.any && a.ns == b.ns &&
+                    a.walkFetches.size() == b.walkFetches.size() &&
+                    a.evts.size() == b.evts.size();
+        for (size_t k = 0; same && k < a.evts.size(); k++)
+          same = a.evts[k].k == b.evts[k].k && a.evts[k].vi == b.evts[k].vi &&
+                 a.evts[k].next == b.evts[k].next && a.evts[k].fetch == b.evts[k].fetch;
+        if (!same)
+          std::printf("stain-plan MISMATCH tick %u mob %llu limb %zu: parallel valid %d any %d "
+                      "ns %u evts %zu | serial valid %d any %d ns %u evts %zu\n",
+                      tick, (unsigned long long)m.id_, li, a.valid, a.any, a.ns,
+                      a.evts.size(), b.valid, b.any, b.ns, b.evts.size());
+      }
+    }
+  }
   if (!mobs_.empty()) {
     const size_t nm = mobs_.size();
     const size_t start = (size_t)(tick % (uint32_t)nm);
@@ -21105,6 +21150,29 @@ void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
 }
 
 
+void Mob::PlanStainContact(uint32_t tick, World& world) {
+  if (!sys_ || sys_->matGpu_.empty() || IsGhost() || rigReleased_) return;
+  stainPreTick_ = tick;
+  if (stainPre_.size() != limbs_.size()) stainPre_.resize(limbs_.size());
+  // Exactly the view and key StainTick will hand StainOneLimb.
+  const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu;
+  WornProbe probe{this, -1};
+  for (int li = 0; li < (int)limbs_.size(); li++) {
+    StainPre& p = stainPre_[li];
+    p.valid = false;
+    if (!limbs_[li].body) continue;
+    BurnLimbView v = ViewOf(limbs_[li]);
+    if (LimbHasShells(li)) {
+      probe.limb = li;
+      v.occlude = &WornProbe::Call;
+      v.occludeCtx = &probe;
+    }
+    const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
+    uint32_t unused = 0;
+    sys_->StainOneLimb(v, tick, key, world, unused, &p, /*planOnly=*/true);
+  }
+}
+
 void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
                     uint32_t& rainBudget) {
   if (!sys_ || sys_->matGpu_.empty()) return;
@@ -21139,7 +21207,12 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
       v.occludeCtx = &probe;
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
-    if (sys_->StainOneLimb(v, tick, key, world, budget)) wrote(1, li);
+    // The plan StainLimbs took for this limb this tick, if it did.
+    StainPre* pre = stainPreTick_ == tick && li < (int)stainPre_.size() &&
+                            stainPre_[li].valid
+                        ? &stainPre_[li]
+                        : nullptr;
+    if (sys_->StainOneLimb(v, tick, key, world, budget, pre)) wrote(1, li);
 
     // ---- AND WHAT IS ALREADY ON IT DRIES ------------------------------------
     // AFTER the contact pass and NOT gated on it: StainOneLimb returns early
@@ -21977,16 +22050,56 @@ uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
 }
 
 bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
-                             World& world, uint32_t& budget) {
+                             World& world, uint32_t& budget, StainPre* pre,
+                             bool planOnly) {
+  // TWO WAYS IN (PLAN_fight64_perf M). PLAN (`planOnly`, from a work-pool
+  // task, StainLimbs' StainPre pass): the walk and the whole sweep a full
+  // per-limb budget could make, computed against the world and this limb as
+  // they stand, with NOTHING written -- every write the sweep would make and
+  // every chunk fetch it would ask is recorded in `pre`, in order, by sample.
+  // APPLY (the serial pass in pot order): with a plan, its records are played
+  // up to the sample count THIS limb's share of the shared budget allows;
+  // without one, the same plan is made inline for exactly that count and
+  // played at once. The samples are independent -- each is a distinct surface
+  // voxel reading the world and its own coat, and nothing between the plan
+  // and the apply writes either -- so a plan cut at `count` is the sweep that
+  // stops at `count`.
   burnprof::Scope bpScope(burnprof::kStainContact);
-  if (matGpu_.empty() || v.Size() == 0 || budget == 0) return false;
+  if (planOnly && pre != nullptr) {
+    pre->valid = false;
+    pre->any = false;
+    pre->ns = 0;
+    pre->walkFetches.clear();
+    pre->evts.clear();
+  }
+  if (matGpu_.empty() || v.Size() == 0 || (!planOnly && budget == 0)) return false;
   const auto& gt = CurrentTuning().gore;
   if (gt.stainContactScale <= 0.0f && gt.stainWashPerContact <= 0) return false;
+
+  // Chunk fetches the walk and the sweep ask for, recorded (a plan) or asked
+  // at once (inline).
+  std::vector<IVec3>* walkFetchOut = planOnly && pre ? &pre->walkFetches : nullptr;
 
   // The world side of the walk: full WORDS this time, because a dry stain
   // lives in the word's stain bits and a material id cannot see it.
   IVec3 memoChunk{INT_MIN, INT_MIN, INT_MIN};
   const CachedChunk* memoCC = nullptr;
+  // Set per sample by the sweep: where a fetch the sweep asks is recorded.
+  std::vector<StainEvt>* sweepOut = nullptr;
+  uint32_t sweepK = 0;
+  auto requestFetch = [&](IVec3 wc, std::vector<IVec3>* walkRec) {
+    if (walkRec) {
+      walkRec->push_back(wc);
+    } else if (sweepOut) {
+      StainEvt e;
+      e.k = sweepK;
+      e.fetch = 1;
+      e.chunk = wc;
+      sweepOut->push_back(e);
+    } else {
+      world.RequestChunkFetch(wc);  // best-effort, one tick latent (BurnOneLimb)
+    }
+  };
   auto worldWordAt = [&](IVec3 c) -> uint32_t {
     if (!world.CellInWindow(c)) return 0u;
     const IVec3 wc = ChunkOfCell(c.x, c.y, c.z);
@@ -21995,7 +22108,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       memoCC = world.Cached(wc);
     }
     if (!memoCC || memoCC->voxels.size() != kChunkVol) {
-      world.RequestChunkFetch(wc);  // best-effort, one tick latent (BurnOneLimb)
+      requestFetch(wc, nullptr);
       return 0u;
     }
     const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
@@ -22061,10 +22174,12 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // SANDVOX_COAT_TRACE=1: name the first few WORDS a body takes a coat
     // from (what the substance is and which branch resolved it), so a coat
     // with no bleeding behind it has a source (CLAUDE.md rule 6).
-    // =<material id> names only that coat (1 = any).
+    // =<material id> names only that coat (1 = any). Not from a pool task
+    // (the counter is a shared static).
     static const int traceMat = std::getenv("SANDVOX_COAT_TRACE") ? std::atoi(std::getenv("SANDVOX_COAT_TRACE")) : 0;
     static int traced = 0;
-    if (traceMat != 0 && !c.wash && traced < 12 && (traceMat == 1 || (int)c.mat == traceMat)) {
+    if (traceMat != 0 && !planOnly && !c.wash && traced < 12 &&
+        (traceMat == 1 || (int)c.mat == traceMat)) {
       traced++;
       std::printf("coat trace: word 0x%08x (mat %u, stain type %u amt %u) -> coat mat %u, amount %u, chance %u\n",
                   w, m, VoxStainType(w), VoxStainAmt(w), c.mat, c.amount, c.chance);
@@ -22078,7 +22193,12 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // IS ANYTHING THERE? The limb's world AABB dilated by one, walked until the
   // first cell that means something. A limb in clean air pays this walk and
   // nothing else, exactly as the burn pass does.
-  {
+  const bool usePlan = !planOnly && pre != nullptr && pre->valid;
+  if (usePlan) {
+    // The plan's walk: its fetches asked now, in its order, and its answer.
+    for (const IVec3& wc : pre->walkFetches) world.RequestChunkFetch(wc);
+    if (!pre->any) return false;
+  } else {
     const float sinv = 1.0f / (float)std::max(1u, v.physScale);
     Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
     for (int k = 0; k < 8; k++) {
@@ -22117,7 +22237,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             memoCC = world.Cached(wc);
           }
           if (!memoCC || memoCC->voxels.size() != kChunkVol) {
-            world.RequestChunkFetch(wc);  // as worldWordAt asks it
+            requestFetch(wc, walkFetchOut);  // as worldWordAt asks it
             continue;
           }
           const uint32_t* row = memoCC->voxels.data() +
@@ -22131,17 +22251,44 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             }
           }
         }
-    if (!any) return false;  // the walk was the whole cost
+    if (planOnly && pre) pre->any = any;
+    if (!any) {
+      if (planOnly && pre) pre->valid = true;
+      return false;  // the walk was the whole cost
+    }
   }
 
   // Something is against this limb: its index, and the SURFACE of that index
   // -- every voxel with an empty 6-neighbour -- built once and kept with it
-  // (touching `quiet` keeps the burn pass from dropping it mid-soak).
-  BodyBurnState& st = *v.burn;
-  if (st.idx.empty()) BuildBurnIndex(v);
-  if (st.idx.empty()) return false;
-  st.quiet = 0;
-  st.holdBy |= BodyBurnState::kHoldContact;
+  // (touching `quiet` keeps the burn pass from dropping it mid-soak). A PLAN
+  // leaves the limb's own state alone: an index or surface it lacks is built
+  // into a scratch state and thrown away (the apply builds the real one, from
+  // the same lattice, only if the limb's turn comes).
+  BodyBurnState scratch;
+  BodyBurnState* stp = v.burn;
+  if (planOnly && (stp->idx.empty() || stp->surface.empty())) {
+    if (stp->idx.empty()) {
+      BurnLimbView tv = v;
+      tv.burn = &scratch;
+      SplatSink discard;   // a scratch build counts nothing
+      BuildBurnIndex(tv, &discard);
+    } else {
+      scratch.idx = stp->idx;
+      scratch.dims = stp->dims;
+      scratch.min = stp->min;
+    }
+    stp = &scratch;
+  }
+  BodyBurnState& st = *stp;
+  if (!planOnly && st.idx.empty()) BuildBurnIndex(v);
+  if (st.idx.empty()) {
+    if (planOnly && pre) pre->valid = true;   // refused: the apply refuses too
+    return false;
+  }
+  if (!planOnly) {
+    st.quiet = 0;
+    st.holdBy |= BodyBurnState::kHoldContact;
+  }
   const IVec3 bd = st.dims, bm = st.min;
   auto idxAt = [&](int lx, int ly, int lz) -> uint32_t {
     if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y || lz >= bd.z)
@@ -22171,7 +22318,10 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     std::sort(st.surface.begin(), st.surface.end());
   }
   const size_t ns = st.surface.size();
-  if (ns == 0) return false;
+  if (ns == 0) {
+    if (planOnly && pre) pre->valid = true;
+    return false;
+  }
 
   // THE SWEEP. Each surface voxel asks the world cell it sits in -- the body
   // is not in the grid, so a pool's liquid occupies the very cells the feet
@@ -22181,130 +22331,173 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // a tick-keyed start so a limb larger than its budget is covered over a few
   // ticks rather than the same patch every tick.
   const uint32_t washAmt = (uint32_t)std::max(0, gt.stainWashPerContact);
-  const uint32_t budget0 = budget;
-  // WHAT A WORLD CELL MEANS, MEMOIZED. At skinScale 8 a world cell's face is
-  // 64 surface voxels, and the sweep below visits them in lattice order, so
-  // most samples ask about the cell the previous one asked about (or the
-  // cell one step out from it). Two entries -- the voxel's own cell and the
-  // stepped one -- answer those without the window test, the chunk memo and
-  // the classification again. Exact: the world does not change during the
-  // sweep, and classify is a pure function of the word.
-  IVec3 memoCell[2] = {{INT_MIN, INT_MIN, INT_MIN}, {INT_MIN, INT_MIN, INT_MIN}};
-  bool memoOk[2] = {false, false};
-  Contact memoC[2];
-  int memoNext = 0;
-  auto classifyAt = [&](IVec3 cc, Contact& out) -> bool {
-    for (int k = 0; k < 2; k++)
-      if (memoCell[k].x == cc.x && memoCell[k].y == cc.y &&
-          memoCell[k].z == cc.z) {
-        if (memoOk[k]) out = memoC[k];
-        return memoOk[k];
-      }
-    const int k = memoNext;
-    memoNext ^= 1;
-    memoCell[k] = cc;
-    memoOk[k] = classify(worldWordAt(cc), memoC[k]);
-    if (memoOk[k]) out = memoC[k];
-    return memoOk[k];
-  };
-  uint32_t limbBudget = std::min(budget, kStainLatticePerLimb);
-  bool changed = false, owned = false;
-  // The outward normal is a sum of open faces, so each component is -1, 0 or
-  // +1: 27 possible vectors, rotated ONCE per visit here by the very call the
-  // sample used to make per voxel (bit-identical), and looked up below.
-  Vec3 outTab[27];
-  for (int t = 0; t < 27; t++)
-    outTab[t] = Rotate(q, Vec3{(float)(t % 3 - 1), (float)((t / 3) % 3 - 1),
-                               (float)(t / 9 - 1)});
-  const uint32_t ubx = (uint32_t)bd.x, uby = (uint32_t)bd.y;
-  // A wrapping cursor rather than `(start + k) % ns` per sample, and two
-  // divisions for the cell's coordinates rather than three: this loop is the
-  // contact pass's whole cost while a crowd stands in a pool (68 ns a sample
-  // measured in the oil-flooded village, 30k samples a tick).
-  size_t at = (size_t)(Hash3(rngKey, tick, 0x5F4CEu) % (uint32_t)ns);
-  for (size_t k = 0; k < ns && limbBudget; k++) {
-    limbBudget--;
-    const uint32_t cell = st.surface[at];
-    if (++at == ns) at = 0;
-    const uint32_t e = st.idx[cell] & ~kBurnQueued;
-    if (!e) continue;  // carved away since the surface was listed
-    const uint32_t rowq = cell / ubx;
-    const uint32_t lzu = rowq / uby;
-    const int lx = (int)(cell - rowq * ubx);
-    const int ly = (int)(rowq - lzu * uby);
-    const int lz = (int)lzu;
-    const Vec3 wp = v.xf->pos + Rotate(q, Vec3{((float)(lx + bm.x) + 0.5f) * inv,
-                                               ((float)(ly + bm.y) + 0.5f) * inv,
-                                               ((float)(lz + bm.z) + 0.5f) * inv});
-    IVec3 cw{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
-    // Outward: the sum of the open faces, in world.
-    auto outward = [&]() {
-      int nx = 1, ny = 1, nz = 1;  // offset by one: the table index
-      if (!idxAt(lx - 1, ly, lz)) nx -= 1;
-      if (!idxAt(lx + 1, ly, lz)) nx += 1;
-      if (!idxAt(lx, ly - 1, lz)) ny -= 1;
-      if (!idxAt(lx, ly + 1, lz)) ny += 1;
-      if (!idxAt(lx, ly, lz - 1)) nz -= 1;
-      if (!idxAt(lx, ly, lz + 1)) nz += 1;
-      return outTab[nx + 3 * ny + 9 * nz];
+  // How many samples: this limb's share of the shared pot (the APPLY), or
+  // all a share could ever be (the PLAN).
+  const uint32_t limbBudget0 =
+      planOnly ? kStainLatticePerLimb : std::min(budget, kStainLatticePerLimb);
+  const uint32_t count = (uint32_t)std::min<size_t>(ns, limbBudget0);
+  std::vector<StainEvt> localEvts;
+  const std::vector<StainEvt>* evts = nullptr;
+  if (usePlan && pre->ns == (uint32_t)ns) {
+    evts = &pre->evts;
+  } else {
+    // ---- THE SAMPLES, decided (nothing written) ---------------------------
+    std::vector<StainEvt>& out = planOnly && pre ? pre->evts : localEvts;
+    sweepOut = &out;
+    // WHAT A WORLD CELL MEANS, MEMOIZED. At skinScale 8 a world cell's face
+    // is 64 surface voxels, and the sweep below visits them in lattice order,
+    // so most samples ask about the cell the previous one asked about (or the
+    // cell one step out from it). Two entries -- the voxel's own cell and the
+    // stepped one -- answer those without the window test, the chunk memo and
+    // the classification again. Exact: the world does not change during the
+    // sweep, and classify is a pure function of the word. (A fetch a cached
+    // answer would have repeated is coalesced by the queue either way.)
+    IVec3 memoCell[2] = {{INT_MIN, INT_MIN, INT_MIN}, {INT_MIN, INT_MIN, INT_MIN}};
+    bool memoOk[2] = {false, false};
+    Contact memoC[2];
+    int memoNext = 0;
+    auto classifyAt = [&](IVec3 cc, Contact& o) -> bool {
+      for (int k = 0; k < 2; k++)
+        if (memoCell[k].x == cc.x && memoCell[k].y == cc.y &&
+            memoCell[k].z == cc.z) {
+          if (memoOk[k]) o = memoC[k];
+          return memoOk[k];
+        }
+      const int k = memoNext;
+      memoNext ^= 1;
+      memoCell[k] = cc;
+      memoOk[k] = classify(worldWordAt(cc), memoC[k]);
+      if (memoOk[k]) o = memoC[k];
+      return memoOk[k];
     };
-    Contact c;
-    if (!classifyAt(cw, c)) {
-      // ...stepped one cell along its dominant axis.
-      const Vec3 nW = outward();
-      const float ax = std::fabs(nW.x), ay = std::fabs(nW.y), az = std::fabs(nW.z);
-      if (ax + ay + az < 1e-4f) continue;
-      if (ax >= ay && ax >= az) cw.x += nW.x > 0.0f ? 1 : -1;
-      else if (ay >= az) cw.y += nW.y > 0.0f ? 1 : -1;
-      else cw.z += nW.z > 0.0f ? 1 : -1;
-      if (!classifyAt(cw, c)) continue;
+    // The outward normal is a sum of open faces, so each component is -1, 0
+    // or +1: 27 possible vectors, rotated ONCE per visit here by the very call
+    // the sample used to make per voxel (bit-identical), and looked up below.
+    Vec3 outTab[27];
+    for (int t = 0; t < 27; t++)
+      outTab[t] = Rotate(q, Vec3{(float)(t % 3 - 1), (float)((t / 3) % 3 - 1),
+                                 (float)(t / 9 - 1)});
+    const uint32_t ubx = (uint32_t)bd.x, uby = (uint32_t)bd.y;
+    // A wrapping cursor rather than `(start + k) % ns` per sample, and two
+    // divisions for the cell's coordinates rather than three: this loop is the
+    // contact pass's whole cost while a crowd stands in a pool (68 ns a sample
+    // measured in the oil-flooded village, 30k samples a tick).
+    size_t at = (size_t)(Hash3(rngKey, tick, 0x5F4CEu) % (uint32_t)ns);
+    for (uint32_t k = 0; k < count; k++) {
+      sweepK = k;
+      const uint32_t cell = st.surface[at];
+      if (++at == ns) at = 0;
+      const uint32_t e = st.idx[cell] & ~kBurnQueued;
+      if (!e) continue;  // carved away since the surface was listed
+      const uint32_t rowq = cell / ubx;
+      const uint32_t lzu = rowq / uby;
+      const int lx = (int)(cell - rowq * ubx);
+      const int ly = (int)(rowq - lzu * uby);
+      const int lz = (int)lzu;
+      const Vec3 wp = v.xf->pos + Rotate(q, Vec3{((float)(lx + bm.x) + 0.5f) * inv,
+                                                 ((float)(ly + bm.y) + 0.5f) * inv,
+                                                 ((float)(lz + bm.z) + 0.5f) * inv});
+      IVec3 cw{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
+      // Outward: the sum of the open faces, in world.
+      auto outward = [&]() {
+        int nx = 1, ny = 1, nz = 1;  // offset by one: the table index
+        if (!idxAt(lx - 1, ly, lz)) nx -= 1;
+        if (!idxAt(lx + 1, ly, lz)) nx += 1;
+        if (!idxAt(lx, ly - 1, lz)) ny -= 1;
+        if (!idxAt(lx, ly + 1, lz)) ny += 1;
+        if (!idxAt(lx, ly, lz - 1)) nz -= 1;
+        if (!idxAt(lx, ly, lz + 1)) nz += 1;
+        return outTab[nx + 3 * ny + 9 * nz];
+      };
+      Contact c;
+      if (!classifyAt(cw, c)) {
+        // ...stepped one cell along its dominant axis.
+        const Vec3 nW = outward();
+        const float ax = std::fabs(nW.x), ay = std::fabs(nW.y), az = std::fabs(nW.z);
+        if (ax + ay + az < 1e-4f) continue;
+        if (ax >= ay && ax >= az) cw.x += nW.x > 0.0f ? 1 : -1;
+        else if (ay >= az) cw.y += nW.y > 0.0f ? 1 : -1;
+        else cw.z += nW.z > 0.0f ? 1 : -1;
+        if (!classifyAt(cw, c)) continue;
+      }
+      // A CORROSIVE contact must get past the ARMOUR first. Blood and water
+      // have always soaked through a worn shell here (a cosmetic liberty);
+      // acid doing the same put a coat on the skin under a steel plate, and a
+      // coat that eats then ate the torso the plate was covering
+      // (armor-react: 1,294 skin voxels and a dead creature in 18 ticks). The
+      // same outward march the burn pass seeds with (kWornNbrReach); the
+      // shell's own lattice meets the acid through ITS pass, so iron still
+      // pits and cloth still goes.
+      if (v.occlude && c.mat < matCorrodes_.size() && matCorrodes_[c.mat]) {
+        Vec3 dir = outward();
+        if (dir.len() < 1e-4f) continue;
+        if (v.WornAlong(wp, dir.normalized(), kWornNbrReach)) continue;
+      }
+      const uint32_t chance1024 = std::min(1024u, c.chance * 1024u / 1000u);
+      const uint32_t h = Hash3(rngKey ^ (uint32_t)(((cw.x * 73856093) ^ (cw.y * 19349663) ^
+                                                    (cw.z * 83492791))),
+                               tick, e);
+      if ((h & 1023u) >= chance1024) continue;
+      const size_t vi = e - 1;
+      const uint16_t cur = v.Stain(vi);
+      uint16_t next = cur;
+      if (c.wash) {
+        // The material is KEPT while the amount comes down: a half-rinsed arm
+        // is still bloody. Only a voxel that comes out clean is left WET.
+        next = WashBodyStain(cur, c.mat, c.amount, washAmt);
+      } else {
+        // Accumulates when the material matches: three splashes of blood
+        // saturate; a different substance replaces only if heavier.
+        const uint16_t base = cur;  // precedence: RaiseBodyStain
+        const uint32_t a = BodyStainAmt(base);
+        const uint32_t want = BodyStainMat(base) == c.mat || a == 0
+                                  ? std::min(kBodyStainAmtMax, a + c.amount)
+                                  : c.amount;
+        next = RaiseBodyStain(base, c.mat, want);
+      }
+      if (next == cur) continue;
+      StainEvt ev;
+      ev.k = k;
+      ev.vi = (uint32_t)vi;
+      ev.next = next;
+      out.push_back(ev);
     }
-    // A CORROSIVE contact must get past the ARMOUR first. Blood and water
-    // have always soaked through a worn shell here (a cosmetic liberty); acid
-    // doing the same put a coat on the skin under a steel plate, and a coat
-    // that eats then ate the torso the plate was covering (armor-react:
-    // 1,294 skin voxels and a dead creature in 18 ticks). The same outward
-    // march the burn pass seeds with (kWornNbrReach); the shell's own lattice
-    // meets the acid through ITS pass, so iron still pits and cloth still goes.
-    if (v.occlude && c.mat < matCorrodes_.size() && matCorrodes_[c.mat]) {
-      Vec3 dir = outward();
-      if (dir.len() < 1e-4f) continue;
-      if (v.WornAlong(wp, dir.normalized(), kWornNbrReach)) continue;
+    sweepOut = nullptr;
+    if (planOnly) {
+      if (pre) {
+        pre->ns = (uint32_t)ns;
+        pre->valid = true;
+      }
+      return false;
     }
-    const uint32_t chance1024 = std::min(1024u, c.chance * 1024u / 1000u);
-    const uint32_t h = Hash3(rngKey ^ (uint32_t)(((cw.x * 73856093) ^ (cw.y * 19349663) ^
-                                                  (cw.z * 83492791))),
-                             tick, e);
-    if ((h & 1023u) >= chance1024) continue;
-    const size_t vi = e - 1;
-    const uint16_t cur = v.Stain(vi);
-    uint16_t next = cur;
-    if (c.wash) {
-      // The material is KEPT while the amount comes down: a half-rinsed arm is
-      // still bloody. Only a voxel that comes out clean is left WET.
-      next = WashBodyStain(cur, c.mat, c.amount, washAmt);
-    } else {
-      // Accumulates when the material matches: three splashes of blood
-      // saturate; a different substance replaces only if heavier.
-      const uint16_t base = cur;  // precedence: RaiseBodyStain
-      const uint32_t a = BodyStainAmt(base);
-      const uint32_t want = BodyStainMat(base) == c.mat || a == 0
-                                ? std::min(kBodyStainAmtMax, a + c.amount)
-                                : c.amount;
-      next = RaiseBodyStain(base, c.mat, want);
+    evts = &out;
+  }
+  // ---- THE SAMPLES, written: the first `count` of them, in order -----------
+  bool changed = false, owned = false;
+  for (const StainEvt& ev : *evts) {
+    if (ev.k >= count) break;
+    if (ev.fetch) {
+      world.RequestChunkFetch(ev.chunk);
+      continue;
     }
-    if (next == cur) continue;
-    v.SetStain(vi, next);
+    v.SetStain(ev.vi, ev.next);
     changed = true;
     if (!owned) owned = OwnForStain(v, microSet_);
     if (owned) {
-      const IVec3 p = v.At(vi);
-      MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, next);
+      const IVec3 p = v.At(ev.vi);
+      MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, ev.next);
     }
   }
-  budget -= std::min(budget, kStainLatticePerLimb - limbBudget);
+  const uint32_t budget0 = budget;
+  // The pot is charged as the inline sweep always charged it: kStainLattice-
+  // PerLimb less what was left of this limb's share. A share cut short by a
+  // nearly-empty pot (budget < kStainLatticePerLimb) therefore takes the rest
+  // of the pot even when the limb had fewer samples than that -- an old quirk,
+  // kept, because the pot's order of spending is the creatures' coats.
+  const uint32_t limbBudgetLeft = limbBudget0 - count;
+  budget -= std::min(budget, kStainLatticePerLimb - limbBudgetLeft);
   burnprof::Count(burnprof::kStainSwept, 1);
-  burnprof::Count(burnprof::kStainSamples, std::min(budget0, kStainLatticePerLimb) - limbBudget);
+  burnprof::Count(burnprof::kStainSamples, std::min(budget0, count));
   return changed;
 }
 

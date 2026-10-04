@@ -1355,6 +1355,29 @@ struct SplatterEvent {
   bool doneAvatar = false;  // applied to the player's avatar
 };
 
+// ONE LIMB'S CONTACT STAINING, PLANNED (PLAN_fight64_perf M). MobSystem::
+// StainOneLimb's walk and sweep read the world mirror and the limb's own
+// coat and nothing else that the passes before it in StainLimbs can change,
+// so every limb's is planned across the work pool at the top of StainLimbs:
+// the walk's answer and fetches, and for the full per-limb sample budget each
+// sample's coat write or chunk fetch, by sample index. The serial pass plays
+// a plan up to the count the SHARED budget leaves that limb in pot order --
+// the samples are independent, so that is the sweep that stopped there.
+struct StainEvt {
+  uint32_t k = 0;       // sample index
+  uint32_t vi = 0;      // voxel written
+  uint16_t next = 0;    // its new coat word
+  uint8_t fetch = 0;    // 1 = a chunk fetch (`chunk`), not a write
+  IVec3 chunk{};
+};
+struct StainPre {
+  bool valid = false;
+  bool any = false;     // the walk found something against the limb
+  uint32_t ns = 0;      // surface size the sweep was planned over
+  std::vector<IVec3> walkFetches;
+  std::vector<StainEvt> evts;
+};
+
 // ONE CREATURE'S SPLATTER, DEFERRED (PLAN_fight64_perf M). MobSystem::
 // StainLimbs flies every burst at every creature across the work pool, one
 // task per creature; a task writes that creature's lattices and coat flags
@@ -4257,6 +4280,12 @@ class Mob {
   // `burnPreTick_`; read only that tick.
   std::vector<BurnWalkPre> burnPre_;
   uint32_t burnPreTick_ = 0;
+  // StainPre per limb for tick `stainPreTick_` (MobSystem::StainLimbs).
+  std::vector<StainPre> stainPre_;
+  uint32_t stainPreTick_ = 0;
+  // Plan every limb's contact staining for this tick (a work-pool task: writes
+  // only stainPre_). StainTick plays the plans.
+  void PlanStainContact(uint32_t tick, World& world);
 
  protected:
   // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
@@ -7390,8 +7419,12 @@ class MobSystem {
   void SplatterOnto(Mob& avatar);
   // The NPC driver for StainTick + splatter replay, under the shared budget.
   void StainLimbs(uint32_t tick, World& world);
+  // `pre`/`planOnly`: the contact pass in two halves (StainPre). planOnly
+  // fills `pre` and writes nothing (a work-pool task); a later call with the
+  // same `pre` plays it up to the budget's count.
   bool StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
-                    World& world, uint32_t& budget);
+                    World& world, uint32_t& budget, StainPre* pre = nullptr,
+                    bool planOnly = false);
   // The drying half of Mob::StainTick over a view: every substance in `led`
   // with an authored coat.decay loses a level on half its voxels once per
   // period. Shared by the living and the dead (StainDeadFlesh). In the SUN

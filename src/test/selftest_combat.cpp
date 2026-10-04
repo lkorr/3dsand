@@ -3181,6 +3181,34 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
     const double t0 = NowSeconds();
     tick();
     const double t1 = NowSeconds();
+    // SANDVOX_MOBCAP_DIGEST=1: one line per tick digesting every creature's
+    // hp and origin (bits), so two runs that end differently can be diffed to
+    // the FIRST tick they part (a determinism probe; prints nothing otherwise).
+    static const bool digest = std::getenv("SANDVOX_MOBCAP_DIGEST") != nullptr;
+    if (digest) {
+      uint64_t hh = 1469598103934665603ull, hp = hh;
+      auto mix = [](uint64_t& h, uint64_t x) {
+        h ^= x;
+        h *= 1099511628211ull;
+      };
+      for (uint64_t id : ids) {
+        float hpv = c.mobs.TotalHp(id);
+        uint32_t u = 0;
+        std::memcpy(&u, &hpv, 4);
+        mix(hh, u);
+        const Vec3 o = c.mobs.MobOrigin(id);
+        uint32_t ox, oy, oz;
+        std::memcpy(&ox, &o.x, 4);
+        std::memcpy(&oy, &o.y, 4);
+        std::memcpy(&oz, &o.z, 4);
+        mix(hp, ox);
+        mix(hp, oy);
+        mix(hp, oz);
+      }
+      std::printf("mobcap-digest %d hp %016llx pos %016llx jolt %u %u\n", i,
+                  (unsigned long long)hh, (unsigned long long)hp,
+                  c.phys.LastStep().manifoldsDyn, c.phys.LastStep().manifoldsStatic);
+    }
     if (timeThis) {
       c.ctx.WaitIdle();
       gpuTimer.Collect(c.ctx);
