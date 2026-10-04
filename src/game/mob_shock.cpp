@@ -290,6 +290,9 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     p.m = m;
     p.hit = &h;
     p.charged = true;
+    // The RAW box P, recorded whatever the body then makes of it (rule 6:
+    // "the field never reached it" and "its matter refused it" differ).
+    m->shock_.maxP = std::max(m->shock_.maxP, h.maxP);
     if (!bodyBox(*m, p.mn, p.mx)) continue;
     parts.push_back(std::move(p));
   }
@@ -560,6 +563,9 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     uint32_t charged = 0;
     std::vector<float> felt(mob.limbs_.size(), 0.0f);
     bool armour = false;
+    // The body's charge per slot, for presentation (Mob::ElecSlotCharge).
+    mob.elecSlotP_.assign(mob.limbs_.size(), 0u);
+    mob.elecSolveTick_ = tick;
     for (int li = 0; li < (int)mob.limbs_.size(); li++) {
       if (p.slotBase[li] < 0) continue;
       const ElecSlotCache& c = mob.elecCache_[li];
@@ -569,6 +575,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
         if (pk <= 0) continue;
         charged++;
         bodyPeak = std::max(bodyPeak, pk);
+        mob.elecSlotP_[li] = std::max(mob.elecSlotP_[li], (uint32_t)pk);
         felt[li] = std::max(felt[li], (float)pk * (float)c.cells[ci].feel / 1000.0f);
         if (worn && c.cells[ci].bulk <= g.shockArmourResistMax) armour = true;
       }

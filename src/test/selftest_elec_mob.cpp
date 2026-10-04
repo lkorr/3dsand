@@ -8,12 +8,13 @@
 //                      basin wall must take none (nothing conducts to it).
 //                   B. Three copper_bar plates, each fed by its own spark in a
 //                      stone pocket. On them: a human SOAKED in water (every
-//                      limb, SoakLimb), a dry one, and a dry one in an iron
-//                      cuirass. Wet must take at least elecMob.wetRatioMin x
+//                      limb, SoakLimb), a dry one, and a dry one in iron
+//                      sabatons (wave 2: the metal where the current runs;
+//                      it was a cuirass). Wet must take at least elecMob.wetRatioMin x
 //                      the dry one's Electric hp, the armoured one at least
 //                      elecMob.armourRatioMin x.
 //   elec-stun       A. A zombie (AI on) beside a training dummy on a copper
-//                      plate, the stun floor lifted to elecStun.stunTicks so
+//                      plate (arc-fed since wave 2), the stun floor lifted to elecStun.stunTicks so
 //                      the window covers several of the zombie's attack
 //                      cadences. It must attack BEFORE the shock (a fixture
 //                      that cannot fail measures nothing), issue no attack and
@@ -250,9 +251,15 @@ PlateOut RunPlates(Ctx& c, int hd, int hold, int observe) {
   for (int k = 0; k < 3; k++) id[k] = SpawnAt(c, hd, px[k], f.y, f.z, "dummy");
   r.spawned = id[0] && id[1] && id[2];
   if (!r.spawned) return r;
-  // The armour: the iron cuirass on the third (skipped, and said so, if the
+  // The armour: IRON SABATONS on the third (skipped, and said so, if the
+  // item library has none). Since wave 2 (package B) metal armour adds to a
+  // shock only when it is IN the current's path -- the body is solved as
+  // matter, and a worn conductor counts when it CARRIES charge -- so the
+  // metal goes where the plate is: on the feet. (Wave 1 used a cuirass and
+  // multiplied by shockArmourGain whenever any worn shell held a conductor.)
+  // Original note: the iron cuirass on the third (skipped, and said so, if the
   // item library has none).
-  const int cuirassIdx = c.items.Find("iron_cuirass");
+  const int cuirassIdx = c.items.Find("iron_sabatons");
   if (const ItemDef* cuirass = cuirassIdx >= 0 ? c.items.At(cuirassIdx) : nullptr) {
     Mob* m = c.mobs.FindMobById(id[2]);
     int home = -1;
@@ -321,7 +328,7 @@ Status GateElecWaterMob(Ctx& c, std::string& detail) {
                wetRatioMin));
   if (b.armoured)
     check(b.hp[2] >= armourRatioMin * b.hp[1] && b.rec[2].armour,
-          Format("B: iron cuirass %.2f vs bare %.2f Electric hp (min ratio %.2f)", b.hp[2], b.hp[1],
+          Format("B: iron sabatons %.2f vs bare %.2f Electric hp (min ratio %.2f)", b.hp[2], b.hp[1],
                  armourRatioMin));
   for (int k = 0; k < 3; k++)
     check(k == 2 && !b.armoured ? true : b.rec[k].stunTicks > 0,
@@ -338,7 +345,7 @@ Status GateElecWaterMob(Ctx& c, std::string& detail) {
       "body query: %llu boxes asked, %llu refused, %llu answered, %llu charged%s%s",
       a.wetHp, RecNote(a.wet).c_str(), a.wetAlive ? "" : ", DIED", a.dryHp,
       RecNote(a.dry).c_str(), b.soak, b.hp[0], RecNote(b.rec[0]).c_str(), b.hp[1],
-      RecNote(b.rec[1]).c_str(), b.armoured ? "iron cuirass" : "(no cuirass item)", b.hp[2],
+      RecNote(b.rec[1]).c_str(), b.armoured ? "iron sabatons" : "(no sabatons item)", b.hp[2],
       RecNote(b.rec[2]).c_str(), (unsigned long long)qs.asked, (unsigned long long)qs.refused,
       (unsigned long long)qs.hits, (unsigned long long)qs.charged,
       fails.empty() ? "" : " | FAILED: ", fails.c_str());
@@ -382,7 +389,11 @@ Status GateElecStun(Ctx& c, std::string& detail) {
   for (int zz = f.z - 6; zz <= f.z + 6; zz++)
     for (int xx = f.x - 12; xx <= f.x + 12; xx++) Put(f.build, xx, f.y - 1, zz, mCopper);
   Pocket(f.build, mStone, f.x - 13, f.y - 1, f.z, 1, 0, 0);
-  Put(f.feed, f.x - 13, f.y - 1, f.z, mSpark);
+  // An ARC, not a spark, since wave 2: package A's spreading loss (a copper
+  // SHEET has four conducting neighbours a cell) leaves a spark-fed plate at
+  // P ~50 under the zombie, below gore.shockMinP 60 -- the stun this gate is
+  // about would never start. An arc there still stuns without knocking down.
+  Put(f.feed, f.x - 13, f.y - 1, f.z, MatId(c, "arc"));
   uint32_t t = 85000;
   int preAttacks = 0, stunAttacks = 0, postAttacks = 0, stunned = 0, strokeWhileStunned = 0;
   int recoverAt = -1, stunEndTick = -1;
@@ -856,13 +867,23 @@ Status GateElecCrowd(Ctx& c, std::string& detail) {
   const MobSystem::ShockCounters s1 = c.mobs.ShockStats();
   int wetN = 0, wetHit = 0, dryN = 0, dryHit = 0, lastWetMiss = -1;
   float wetHpMin = 1e30f;
+  // ATTRIBUTION for a wet body that took nothing: did the field reach its
+  // box (raw box P), and did any of its cells charge?
+  int wetBoxP = 0;
+  std::string misses;
   for (size_t k = 0; k < id.size(); k++) {
     const Mob::ShockRecord r = ShockOf(c, id[k]);
     const float hp = ElecHp(c, id[k]);
     if (wetBody[k]) {
       wetN++;
+      if (r.maxP > 0) wetBoxP++;
       if (hp > 0.0f) wetHit++;
-      else lastWetMiss = (int)k;
+      else {
+        lastWetMiss = (int)k;
+        if (misses.size() < 400)
+          misses += Format("%s#%zu box P %u cells %u peak %u", misses.empty() ? "" : ", ", k,
+                           r.maxP, r.cellsPeak, r.peakCellP);
+      }
       wetHpMin = std::min(wetHpMin, hp);
     } else {
       dryN++;
@@ -876,8 +897,9 @@ Status GateElecCrowd(Ctx& c, std::string& detail) {
   };
   check((int)id.size() == n, Format("%zu of %d humans spawned", id.size(), n));
   check(wetN > 0 && wetHit == wetN,
-        Format("%d of %d humans in the charged water were shocked (spawn index %d missed)", wetHit,
-               wetN, lastWetMiss));
+        Format("%d of %d humans in the charged water were shocked, %d saw charge in their box "
+               "(spawn index %d missed; misses: %s)",
+               wetHit, wetN, wetBoxP, lastWetMiss, misses.c_str()));
   check(dryHit == 0, Format("%d of %d humans on the dry pad were shocked", dryHit, dryN));
   check(q1.refused == q0.refused && s1.refused == s0.refused,
         Format("%llu bodies refused by the query (%llu for the grid budget)",

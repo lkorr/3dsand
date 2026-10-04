@@ -2332,6 +2332,17 @@ class Mob {
     uint32_t covered = 0;
   };
   const ShockRecord& Shock() const { return shock_; }
+  // THE CHARGE IN THE BODY, for presentation (a render pass's glow on a
+  // charged body; electricity wave 2 package B exposes it, package D left the
+  // render side open): the highest P any world-pitch cell of rig slot `slot`
+  // reached in the last conduction solve (mob_shock.cpp), or 0 when that solve
+  // is older than `tick - 1` or the slot carried nothing. Derived from the
+  // fixed-latency answer, so it lags the field by World::kSnapshotLatency + 1
+  // ticks like every shock; never saved, never hashed.
+  uint32_t ElecSlotCharge(int slot, uint32_t tick) const {
+    if (slot < 0 || slot >= (int)elecSlotP_.size() || tick - elecSolveTick_ > 1u) return 0u;
+    return elecSlotP_[slot];
+  }
   // Take `voxels` of blood out of the creature: charges
   // voxels * gore.bleedHpPerVoxel across the live authored limbs in proportion
   // to what each still has, and kills the creature through Die() when the
@@ -4737,6 +4748,10 @@ class Mob {
   // Per rig slot, the slot's lattice at world pitch for the shock's
   // conduction (ElecSlotCache; mob_shock.cpp). Derived, never saved.
   std::vector<ElecSlotCache> elecCache_;
+  // The last conduction's answer, per rig slot: the highest P any of its
+  // cells reached, and the tick of that solve (ElecSlotCharge).
+  std::vector<uint32_t> elecSlotP_;
+  uint32_t elecSolveTick_ = 0;
   float burnFrac_ = 0.0f;
   float burnCap_ = 1.0f;
   // The lattice changed since burnFrac_ was taken. Set by the burn pass and by
