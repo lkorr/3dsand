@@ -6023,6 +6023,10 @@ class MobSystem {
     return attacks_;
   }
   void ClearAttackRequests() { attacks_.clear(); }
+  // ---- the CAST seam (D4: game/demon_cast.h MobCastTick drains it) ---------
+  // Same contract as the attack seam: at most one per mob per tick, bounded.
+  const std::vector<ai::CastRequest>& CastRequests() const { return casts_; }
+  void ClearCastRequests() { casts_.clear(); }
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail,
   // including when kMaxMobs LIVING creatures already stand (the dead do not
@@ -6984,6 +6988,11 @@ class MobSystem {
   // has that id - which is how the owner tells a mob impulse from the
   // player's own.
   bool LiftMob(uint64_t mobId, Vec3 velVoxPerSec);
+  // D4 BLINK: move a live, upright creature's whole body (origin, limb bodies,
+  // drawn height) to `newOrigin` in one tick; the feet re-plant there. False
+  // if no such mob, or it is dead, limp or getting up. The caller (game/
+  // demon_cast.h) has already chosen a floor and checked the fence.
+  bool BlinkMob(uint64_t mobId, Vec3 newOrigin);
   // The mob's facing direction — the SAME `fwd` the kinematic walk translates
   // along and the same yaw the limb submit applies, so a test written against
   // this cannot drift from the convention. A mob must move along +facing; if a
@@ -8144,6 +8153,7 @@ class MobSystem {
   // the field, which is what the mob-vs-mob fixtures want).
   std::vector<ai::Actor> playerActors_;
   std::vector<ai::AttackRequest> attacks_;
+  std::vector<ai::CastRequest> casts_;   // D4: drained by MobCastTick
   // THE FENCE (game/mobfence.h, docs/PLAN_demons.md D1): asked by the walk
   // drive before a move and by the attack seam before a blow is queued.
   // Installed by the demon system while a demon is contained; empty otherwise.

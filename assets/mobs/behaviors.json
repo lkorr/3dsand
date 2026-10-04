@@ -380,6 +380,8 @@
       "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 5, "bandSlack": 1.2, "approachSpeed": 1.15, "strafeSpeed": 0.6, "retreatSpeed": 0.8, "fleeSpeed": 1.2, "circleTendency": 0.6, "circleHoldTicks": 20, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.6, "flank": 0.7, "keepOut": -1 },
       "attack": { "styles": ["horizontal_r", "horizontal_l", "bite"], "reach": 6, "aimTolerance": 0.8, "cadenceTicks": 22, "jitterTicks": 12, "commitTicks": 7, "disengageTicks": 10, "pursueSpeed": 1.0, "leadTicks": 10 },
       "defense": { "skill": 0.45, "reactTicks": 5, "reactJitter": 5, "margin": 2.0, "guardStance": 0, "guardReach": 0.8, "holdTicks": 3 },
+      "//cast": "D4 (game/demon_cast.h): an imp casts SPARINGLY -- a firebolt or a gust every six to nine seconds when it can see you between 6 and 44 voxels off, a blink to close a long gap. Spell names are assets/demons/spells/ stems; a repeat weighs the draw. Its own small pool (mana / regenPerMille), never its blood. Contained in a circle it cannot claw across, this is how it still reaches you -- unless D3's sulfur severs `cast_out`.",
+      "cast": { "spells": ["firebolt", "firebolt", "gust", "blink"], "rangeMin": 6, "rangeMax": 44, "cadenceTicks": 180, "jitterTicks": 90, "firstDelayTicks": 60, "commitTicks": 8, "aimTolerance": 0.6, "mana": 120, "regenPerMille": 220, "maxLive": 1 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -387,12 +389,36 @@
         "holdRange": { "weight": 0.8, "cooldownTicks": 0, "minDwellTicks": 6 },
         "circle": { "weight": 0.9, "cooldownTicks": 14, "minDwellTicks": 14 },
         "attack": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 },
-        "dodge": { "weight": 2.6, "cooldownTicks": 8, "minDwellTicks": 6 }
+        "dodge": { "weight": 2.6, "cooldownTicks": 8, "minDwellTicks": 6 },
+        "cast": { "weight": 3.5, "cooldownTicks": 0, "minDwellTicks": 0 }
       },
       "rules": [
         { "note": "it just swung: dart in", "when": { "targetRecovering": 1 }, "weight": { "attack": 3.8 }, "tune": { "cadence": 0.4 } },
         { "note": "badly hurt: skitter off and come again", "when": { "hp": "<0.3" }, "tune": { "band": 3, "speed": 1.15 } }
       ]
+    },
+    {
+      "comment": "THE FIEND, a GREATER DEMON's fighting character (docs/PLAN_demons.md D4; body assets/mobs/demon/fiend.*, demon.js's `fiend` preset, 2 m). Near-certain death for an unprepared player, and every number that makes it so is HERE and in assets/demons/spells/: a full kit (hellfire twice over, firebolt, lava under your feet, lift-then-drop, a gust, a fire ward on itself, a blink to close), a deep fast-filling pool, a cadence of two to three seconds, three carriers in the air. Not an instant kill: no single kit spell's blast exceeds demonCast.maxBlastPower (gate demon-cast). In melee it is a long-reaching brute that does not give ground.",
+      "name": "fiend",
+      "label": "Fiend",
+      "color": 3221233919,
+      "faction": "demon",
+      "hysteresis": 0.25,
+      "perception": { "sightRange": 64, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 600, "keepRangeScale": 1.4, "stickiness": 12, "preferWeak": 1 },
+      "movement": { "mobile": true, "rangeMin": 6, "rangeMax": 12, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.6, "fleeSpeed": 1.0, "circleTendency": 0.4, "circleHoldTicks": 30, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.3, "flank": 0.5, "keepOut": -1 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 30, "jitterTicks": 16, "commitTicks": 10, "disengageTicks": 6, "pursueSpeed": 0.9, "leadTicks": 14 },
+      "defense": { "skill": 0.6, "reactTicks": 5, "reactJitter": 4, "margin": 2.5, "guardStance": 0, "guardReach": 0.85, "holdTicks": 4 },
+      "cast": { "spells": ["hellfire", "hellfire", "firebolt", "lava_floor", "lift", "gust", "ward", "blink"], "rangeMin": 4, "rangeMax": 48, "cadenceTicks": 60, "jitterTicks": 30, "firstDelayTicks": 30, "commitTicks": 8, "aimTolerance": 0.5, "mana": 900, "regenPerMille": 1500, "maxLive": 3 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.2, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 0.9, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.6, "cooldownTicks": 20, "minDwellTicks": 20 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "dodge": { "weight": 1.5, "cooldownTicks": 10, "minDwellTicks": 6 },
+        "cast": { "weight": 3.6, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
     }
   ]
 }

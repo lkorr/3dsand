@@ -1,0 +1,9 @@
+{
+  "//": "LIFT, THEN DROP: `lift@1.5 aura bolt` puts a sustained half-g of net LIFT on whatever body the bolt strikes (the `aura` status rides the body: Mob::AddBodyVelocity for a creature, the controller's velocity for a player), billed to the caster every tick it holds. `releaseAfterTicks` is the drop: that many ticks after the status first held, the caster lets go and the body falls from wherever it got to. 1.5 g for 36 ticks is about 2.4 m: a fall that hurts. Raise either for a greater demon.",
+  "words": "lift@1.5 aura bolt",
+  "aim": "body",
+  "range": [4, 40],
+  "lead": true,
+  "releaseAfterTicks": 36,
+  "tags": { "targets": "body", "direct": true, "creates": [], "alters": "", "affectsBody": true, "region": 3 }
+}

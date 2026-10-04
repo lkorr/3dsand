@@ -816,6 +816,7 @@ struct FrameIntent {
 // they mean.
 struct TickScratch;  // session.cpp; see TickAuthorityCtx::tickScratch
 struct DemonWorld;   // game/demon.h; see TickAuthorityCtx::demons
+struct MobCastWorld; // game/demon_cast.h; see TickAuthorityCtx::mobCast
 struct TickAuthorityCtx {
   // ---- A. the engine, by reference. One per process today; one per WORLD in
   // the shape this is heading for.
@@ -1038,6 +1039,11 @@ struct TickAuthorityCtx {
   // Created on the first summoning (null in a world that never had one, which
   // is every harness but the demon gates); a shared_ptr for tickScratch's reason.
   std::shared_ptr<DemonWorld> demons;
+  // CREATURES THAT CAST (game/demon_cast.h, docs/PLAN_demons.md D4): one spell
+  // VM and mana pool per casting creature, the kit they draw from, their
+  // blinks. Created on the first cast request (null in a world where no
+  // creature ever cast); a shared_ptr for tickScratch's reason.
+  std::shared_ptr<MobCastWorld> mobCast;
 
   // ---- E. THE SCRIPTED-FLIGHT / MEASUREMENT HARNESSES, AS HOOKS. Every one
   // of these is argv state the FRAME layer owns, supplied as a callback so

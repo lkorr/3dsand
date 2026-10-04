@@ -17,6 +17,7 @@
 #include "game/ai_behavior.h"
 #include "game/bodyreg.h"
 #include "game/demon.h"
+#include "game/demon_cast.h"
 #include "game/demon_lore.h"
 #include "game/dye.h"
 #include "game/itemcoat.h"
@@ -5923,6 +5924,11 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // refs' reason: a demon that arrives is stepped by this tick's PreTick.
   DemonTick(w, players, tick);
   PhaseH(w, ws, players, scratch, tick, out);
+  // CREATURES CAST (game/demon_cast.h, D4): the cast requests mobs.PreTick
+  // just issued, through each creature's own spell VM, its emission spliced
+  // into this tick's streams; its blinks. Nothing to do (and no world) until a
+  // creature first asks.
+  MobCastTick(w, players, tick, out);
   tprof.Mark("H");
   for (size_t i = 0; i < players.size(); i++)
     PhaseI(w, ws, players[i], scratch[i], tick, out);
@@ -5947,6 +5953,9 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   tprof.Mark("L");
   for (size_t i = 0; i < players.size(); i++)
     PhaseM(w, ws, players[i], scratch[i], tick, out);
+  // ...and the CREATURES' wards at the same splice (a demon's `null` refuses
+  // your ops exactly as yours refuse its own).
+  MobCastWardFilter(w, out);
   tprof.Mark("M");
   PhaseN(w, ws, players, scratch, tick, out);
   tprof.Mark("N");

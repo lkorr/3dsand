@@ -1,0 +1,8 @@
+{
+  "//": "A WARD ON ITSELF: `fire null aura self`, a filter round the caster's own body that refuses every fire op within its radius, sustained (billed every tick from the caster's mana, dropped when the pool runs dry). Not `projectile null`: a flight ward absorbs the caster's OWN bolts as they leave it too. `once`: not cast again while it holds.",
+  "words": "fire null aura self",
+  "aim": "self",
+  "range": [0, 64],
+  "once": true,
+  "tags": { "targets": "self", "direct": false, "creates": [], "alters": "", "affectsBody": false, "region": 6 }
+}

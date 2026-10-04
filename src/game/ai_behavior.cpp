@@ -125,6 +125,7 @@ const char* IntentName(Intent i) {
     case Intent::Socialize: return "socialize";
     case Intent::Eat: return "eat";
     case Intent::Goto: return "goto";
+    case Intent::Cast: return "cast";
     default: return "?";
   }
 }
@@ -501,6 +502,23 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
           std::clamp(q.value("guardReach", 0.85f), 0.2f, 1.0f);
       pr.defense.holdTicks = q.value("holdTicks", 4u);
     }
+    // D4: magic (CastTuning). Absent = never casts.
+    if (p.contains("cast") && p["cast"].is_object()) {
+      const auto& q = p["cast"];
+      if (q.contains("spells") && q["spells"].is_array())
+        for (const auto& v : q["spells"])
+          if (v.is_string()) pr.cast.spells.push_back(v.get<std::string>());
+      pr.cast.rangeMin = std::max(0.0f, q.value("rangeMin", 0.0f));
+      pr.cast.rangeMax = std::max(pr.cast.rangeMin, q.value("rangeMax", 0.0f));
+      pr.cast.cadenceTicks = std::max(1u, q.value("cadenceTicks", 150u));
+      pr.cast.jitterTicks = q.value("jitterTicks", 60u);
+      pr.cast.firstDelayTicks = q.value("firstDelayTicks", 45u);
+      pr.cast.commitTicks = q.value("commitTicks", 8u);
+      pr.cast.aimTolerance = std::clamp(q.value("aimTolerance", 0.6f), 0.05f, 3.2f);
+      pr.cast.mana = std::max(0, q.value("mana", 100));
+      pr.cast.regenPerMille = std::max(0, q.value("regenPerMille", 220));
+      pr.cast.maxLive = std::clamp(q.value("maxLive", 2), 0, 8);
+    }
     if (p.contains("intents") && p["intents"].is_object()) {
       for (auto& [k, v] : p["intents"].items()) {
         const Intent in = IntentFromName(k);
@@ -663,6 +681,22 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"guardStance\": " << num(p.defense.guardStance)
       << ", \"guardReach\": " << num(p.defense.guardReach)
       << ", \"holdTicks\": " << p.defense.holdTicks << " },\n";
+    // D4: the cast block, only for a creature that casts (CastTuning).
+    if (!p.cast.spells.empty()) {
+      o << "      \"cast\": { \"spells\": [";
+      for (size_t k = 0; k < p.cast.spells.size(); k++)
+        o << (k ? ", " : "") << "\"" << p.cast.spells[k] << "\"";
+      o << "], \"rangeMin\": " << num(p.cast.rangeMin)
+        << ", \"rangeMax\": " << num(p.cast.rangeMax)
+        << ", \"cadenceTicks\": " << p.cast.cadenceTicks
+        << ", \"jitterTicks\": " << p.cast.jitterTicks
+        << ", \"firstDelayTicks\": " << p.cast.firstDelayTicks
+        << ", \"commitTicks\": " << p.cast.commitTicks
+        << ", \"aimTolerance\": " << num(p.cast.aimTolerance)
+        << ", \"mana\": " << p.cast.mana
+        << ", \"regenPerMille\": " << p.cast.regenPerMille
+        << ", \"maxLive\": " << p.cast.maxLive << " },\n";
+    }
     o << "      \"intents\": {\n";
     bool first = true;
     for (int k = 0; k < (int)Intent::Count; k++) {
@@ -1244,6 +1278,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
 
   out.guard = false;
   out.cancelSwing = false;
+  out.cast = false;
 
   NoteHurt(brain, self, tick);
   Perceive(brain, pr, self, view, tick);
@@ -1634,6 +1669,20 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     }
   }
   if (attackReady) raw[(int)Intent::RequestAttack] = 1.0f;
+  // ---- MAGIC (D4, CastTuning) ---------------------------------------------
+  // The cast clock arms on the first tick with a target (firstDelayTicks, so
+  // a creature does not open with a fireball the tick it spots you), then runs
+  // on its own cadence beside the attack clock. "Near enough to try" only:
+  // the kit spell the owner draws has its own range and price.
+  const CastTuning& ct = pr.cast;
+  const bool canCast = !ct.spells.empty() && ct.rangeMax > 0.0f;
+  if (canCast && brain.hasTarget && brain.nextCastTick == 0)
+    brain.nextCastTick = tick + ct.firstDelayTicks;
+  const bool castReady = canCast && brain.hasTarget && brain.visible &&
+                         brain.nextCastTick != 0 && tick >= brain.nextCastTick &&
+                         tick >= brain.commitUntil && d >= ct.rangeMin &&
+                         d <= ct.rangeMax && aimErr <= ct.aimTolerance;
+  if (castReady) raw[(int)Intent::Cast] = 1.0f;
   // THE DAY'S ACTIVITY (P7): exactly the verb the schedule row names, at a
   // flat 1, while the resident layer has a routine on this brain. Everything
   // about WHEN it loses -- to a fight, to a fright -- is the profile's
@@ -2025,6 +2074,31 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // the number `PickAttackStyle` filters on and `BeginStroke` refuses
       // against, and both of them are deciding what can reach at IMPACT.
       out.request.distance = brain.leadDist;
+      break;
+    }
+
+    case Intent::Cast: {
+      // ---- ONE CAST PER CADENCE (D4) ------------------------------------------
+      // The RequestAttack shape: the clock advances HERE, whatever the owner
+      // then makes of the request (an unaffordable or out-of-range spell is the
+      // owner's refusal, and the cadence is spent either way -- which is what
+      // keeps a caster with an empty pool from asking every tick).
+      out.desiredHeading = bearing;
+      const uint32_t jit =
+          ct.jitterTicks == 0
+              ? 0
+              : rng::Hash3((uint32_t)self.id ^ 0xCA57D4u, tick, 6) % ct.jitterTicks;
+      brain.nextCastTick = tick + ct.cadenceTicks + jit;
+      brain.commitUntil = std::max(brain.commitUntil, tick + ct.commitTicks);
+      brain.lastCastTick = tick;
+      brain.castsIssued++;
+      out.cast = true;
+      out.castRequest.mobId = self.id;
+      out.castRequest.targetId = brain.targetId;
+      out.castRequest.targetPoint = brain.targetPos;
+      out.castRequest.targetVel = brain.haveTargetVel ? brain.targetVel : Vec3{};
+      out.castRequest.tick = tick;
+      out.castRequest.distance = d;
       break;
     }
 

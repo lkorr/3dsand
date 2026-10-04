@@ -1,0 +1,8 @@
+{
+  "//": "A GUST: the `gust` glyph on the implicit hand, a jet of wind from just in front of the caster along its aim (36 cells reach). It shoves a body and scatters loose powder in its footprint -- including SALT, so a contained demon gusting at its own ring is the emergent jailbreak D6 schemes on (`gust_at_ring`). Aimable: here at the target's body.",
+  "words": "gust",
+  "aim": "body",
+  "range": [4, 34],
+  "lead": false,
+  "tags": { "targets": "area", "direct": false, "creates": [], "alters": "", "affectsBody": true, "region": 36 }
+}

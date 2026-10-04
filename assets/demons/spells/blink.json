@@ -1,0 +1,11 @@
+{
+  "//": "BLINK: not a spell but a locomotion verb (MobSystem::BlinkMob): the whole body is somewhere else next tick. `distance` world voxels toward the target (`toward: away` to flee), stopping `standoff` short of it, onto a floor read from the T-4 snapshot with headroom for the body; `los` asks for a clear line from chest to landing; `cooldownTicks` between hops. A CONTAINED demon never blinks out of its circle (D1's fence), and D3's quicksilver severs it outright. Free of mana: the cooldown is its price.",
+  "kind": "blink",
+  "range": [14, 64],
+  "distance": 20,
+  "standoff": 8,
+  "toward": "target",
+  "los": true,
+  "cooldownTicks": 180,
+  "tags": { "targets": "self", "direct": false, "creates": [], "alters": "", "affectsBody": false, "region": 0 }
+}

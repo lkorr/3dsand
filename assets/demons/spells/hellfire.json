@@ -1,0 +1,8 @@
+{
+  "//": "HELLFIRE: a greater demon's bolt -- fire and a blast on a fast bolt. The blast goes off in the grenade's slot (crater, body damage, carving, shove); the fire stays. Lethality lives HERE and in the fiend profile's cadence and mana, all data: `explosive@1.5` is the dial (gate demon-cast caps the kit's largest blast at demonCast.maxBlastPower so no single cast is an instant kill).",
+  "words": "fire fire explosive@1.5 bolt",
+  "aim": "body",
+  "range": [8, 48],
+  "lead": true,
+  "tags": { "targets": "body", "direct": true, "creates": ["fire"], "alters": "", "affectsBody": true, "region": 6 }
+}
