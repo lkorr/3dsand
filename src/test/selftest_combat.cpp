@@ -3160,6 +3160,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   std::vector<MicroBodyInstGpu> insts;
   // The whole timed fight under the sampler (SANDVOX_SAMPLE_PROF; no-op
   // otherwise): every function of the tick, not only the burnprof spans.
+  const MobSystem::ShockCounters shock0 = c.mobs.ShockStats();
   sampleprof::Start("mob-cap64 fight");
   // GPU SIDE OF THE CROWD TICK (SANDVOX_MOBCAP_GPU=1, measurement only): every
   // 10th tick timed pass by pass. A timestamp changes no dispatch and no hash;
@@ -3338,6 +3339,22 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       s += Format(" %s %.2f", kPerfScopeKeys[i], scopeAcc[i] / ticks);
     }
     std::printf("%s\n", s.c_str());
+  }
+  {
+    // The shock solve's own denominators (rule 6: its ms wants them).
+    const MobSystem::ShockCounters& s1 = c.mobs.ShockStats();
+    const double tk = (double)std::max(1, ticks);
+    std::printf("mob-cap64: shocks per tick: %.1f charged answers, %.1f bodies "
+                "solved (%.1f linked), %.0f body cells, slot caches %.1f built / "
+                "%.1f re-accumulated / %.1f reused, %.1f bodies shocked\n",
+                (double)(s1.hitsCharged - shock0.hitsCharged) / tk,
+                (double)(s1.bodiesSolved - shock0.bodiesSolved) / tk,
+                (double)(s1.linked - shock0.linked) / tk,
+                (double)(s1.cellsSolved - shock0.cellsSolved) / tk,
+                (double)(s1.cacheBuilds - shock0.cacheBuilds) / tk,
+                (double)(s1.cacheAccums - shock0.cacheAccums) / tk,
+                (double)(s1.cacheHits - shock0.cacheHits) / tk,
+                (double)(s1.bodiesShocked - shock0.bodiesShocked) / tk);
   }
   std::printf("mob-cap64: burnprof %s\n", profReport.c_str());
 

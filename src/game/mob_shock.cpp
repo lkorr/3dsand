@@ -512,6 +512,23 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
   // ---- THE SOLVE: max-plus to the least fixpoint ----------------------------
   std::vector<int32_t> P(nodes.size(), 0);
   std::priority_queue<std::pair<int32_t, uint32_t>> pq;
+  // PER BODY, ONCE (PLAN_fight64_perf M): whether it wears anything at all
+  // (no worn slot = no shell can be in any cell, so the shell tests below
+  // are false without looking), each slot's LimbHasShells, and the highest P
+  // in its answer's grid (no face can offer more, so a cell already reading
+  // it has nothing to look for across its faces). All three only skip work
+  // whose answer they already know.
+  std::vector<uint8_t> partWorn(parts.size(), 0);
+  std::vector<std::vector<int8_t>> partSlotShells(parts.size());
+  std::vector<uint32_t> partGridMax(parts.size(), 0);
+  for (uint32_t pi = 0; pi < parts.size(); pi++) {
+    Mob& m = *parts[pi].m;
+    partSlotShells[pi].assign(m.limbs_.size(), -1);
+    for (int li = 0; li < (int)m.limbs_.size(); li++)
+      if (m.IsWornSlot(li)) partWorn[pi] = 1;
+    if (const ElecHit* h = parts[pi].hit)
+      for (uint32_t w : h->grid) partGridMax[pi] = std::max(partGridMax[pi], w & kElecQueryGridPMax);
+  }
   for (uint32_t k = 0; k < nodes.size(); k++) {
     const Node& nd = nodes[k];
     if (nd.entry == kIns) continue;
@@ -523,7 +540,9 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     // carries the plate's charge into it.
     Mob& owner = *parts[nd.part].m;
     const bool body = nd.slot < owner.baseLimbs_;
+    const bool worn = partWorn[nd.part] != 0;
     auto shellAt = [&](IVec3 c) {
+      if (!worn) return false;
       const auto r = cellRange(c);
       for (auto it = r.first; it != r.second; ++it) {
         const Node& o = nodes[it->second];
@@ -542,26 +561,34 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     // cell above the one touching it (measured: elec-stun's zombie, every
     // foot cell one air cell over the copper). Wave 1 dilated each limb box
     // by a cell for the same reason; this is that slack, and no more.
-    for (const IVec3& d : kFace6) {
+    // (Nothing past the grid's own maximum can be read: `wp` there is final.)
+    for (int f = 0; f < 6 && wp < partGridMax[nd.part]; f++) {
+      const IVec3& d = kFace6[f];
       const IVec3 n1{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
       for (int step = 1; step <= 2; step++) {
         const IVec3 n = step == 1 ? n1 : IVec3{n1.x + d.x, n1.y + d.y, n1.z + d.z};
         if (step == 2) {
-          // Only across air, and not into the body's own cells.
+          // Only across air...
           if ((GridWord(parts[nd.part].hit, n1) & kElecQueryGridAir) == 0) break;
+        }
+        const uint32_t pn = GridWord(parts[nd.part].hit, n) & kElecQueryGridPMax;
+        if (pn <= wp) continue;
+        if (step == 2) {
+          // ...and not into the body's own cells. Asked only now that the
+          // far cell has something to offer: either refusal ends the face.
           bool own = false;
           const auto r = cellRange(n1);
           for (auto it = r.first; it != r.second && !own; ++it) own = nodes[it->second].part == nd.part;
           if (own) break;
         }
-        const uint32_t pn = GridWord(parts[nd.part].hit, n) & kElecQueryGridPMax;
-        if (pn <= wp) continue;
         // A shell cell in the way, or a shell met on the way there
         // (Mob::WornShellAlong, the burn pass's ray: a limb is a rounded tube
         // in a garment cut to its box, and the two lattices' world-pitch
         // cells need not line up).
         bool behind = body && (shellAt(n1) || (step == 2 && shellAt(n)));
-        if (body && !behind && owner.LimbHasShells(nd.slot)) {
+        int8_t& hasShells = partSlotShells[nd.part][(size_t)nd.slot];
+        if (body && !behind && hasShells < 0) hasShells = owner.LimbHasShells(nd.slot) ? 1 : 0;
+        if (body && !behind && hasShells > 0) {
           uint32_t sm = 0;
           behind = owner.WornShellAlong(nd.slot, nd.atNow, Vec3{(float)d.x, (float)d.y, (float)d.z},
                                         (float)step, kCoverMarchMax, &sm, nullptr) >= 0;
@@ -891,9 +918,21 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
         if (pk <= 0) continue;
         const ElecBodyCell& e = c.cells[ci];
         const Node& nd = nodes[k];
+        // The air faces are read only by the ohmic roll (a cell with ohmic
+        // data under a live ignite gain) and by a crackle tier the cell's P
+        // reaches; a cell that can do neither skips the six lookups
+        // (PLAN_fight64_perf M) -- both rolls below then refuse it exactly as
+        // they would have.
+        const bool ohmicCan = e.ohmMat != 0 && e.ohmMat < matElec_.size() &&
+                              matElec_[e.ohmMat].igniteCap != 0 && igniteQ != 0 &&
+                              e.bulk != kIns;
+        const bool crackleCan = crackleQ != 0 && ((uint32_t)pk >= thrHi ? crackleHiMat_ != 0
+                                                  : (uint32_t)pk >= thrLo ? crackleLoMat_ != 0
+                                                                           : false);
         uint32_t air = 0;
-        for (const IVec3& d : kFace6)
-          air += airFor(pi, {nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z}) ? 1u : 0u;
+        if (ohmicCan || crackleCan)
+          for (const IVec3& d : kFace6)
+            air += airFor(pi, {nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z}) ? 1u : 0u;
         const uint32_t cellKey = rng::Hash3(mobKey ^ (uint32_t)li * 0x9E3779B9u,
                                             (uint32_t)(uint16_t)e.c[0] | ((uint32_t)(uint16_t)e.c[1] << 16),
                                             (uint32_t)(uint16_t)e.c[2]);
