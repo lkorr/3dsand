@@ -22696,7 +22696,13 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
           branches++;
         }
       }
-      if (branches == 0) continue;  // the burst cannot get there
+      if (branches == 0) {
+        static const bool tr = std::getenv("SANDVOX_SPLAT_TRACE") != nullptr;
+        if (tr)
+          std::printf("splat trace:   limb %zu no arc reaches it (dist %.2f r %.2f)\n",
+                      li, dist, limbR);
+        continue;  // the burst cannot get there
+      }
       const float sinL = std::min(1.0f, limbR / dist);
       const float omegaLimb =
           2.0f * kPi * (1.0f - std::sqrt(std::max(0.0f, 1.0f - sinL * sinL)));
@@ -22716,6 +22722,14 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
     // Something will be thrown at it: the index, then one arc per trial.
     BodyBurnState& st = *v.burn;
     if (st.idx.empty()) BuildBurnIndex(v, sink);
+    {
+      static const bool tr = std::getenv("SANDVOX_SPLAT_TRACE") != nullptr;
+      if (tr)
+        std::printf("splat trace:   limb %zu trials %d (of %.1f expected), lattice "
+                    "%d x %d x %d at scale %u, centre %.2f %.2f %.2f r %.2f\n",
+                    li, trials, expect, st.dims.x, st.dims.y, st.dims.z, v.scale,
+                    centre.x, centre.y, centre.z, limbR);
+    }
     if (st.idx.empty()) continue;
     st.quiet = 0;
     st.holdBy |= BodyBurnState::kHoldSplatter;
@@ -22920,6 +22934,12 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
                       lz = ifloor(p.z) - bm.z;
             if (!idxAt(lx, ly, lz)) continue;
             landed = true;
+            {
+              static const bool tr = std::getenv("SANDVOX_SPLAT_TRACE") != nullptr;
+              if (tr)
+                std::printf("splat trace:     limb %zu landing at lattice %d %d %d\n",
+                            li, lx, ly, lz);
+            }
             if (v.occlude) {
               const float vl = vel.len();
               backW = vl > 1e-6f ? vel * (-1.0f / vl) : Vec3{0, 1, 0};
@@ -22940,6 +22960,10 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
       }
     }
   } while (false);
+  {
+    static const bool tr = std::getenv("SANDVOX_SPLAT_TRACE") != nullptr;
+    if (tr) std::printf("splat trace:   limb %zu changed %d\n", li, (int)changed);
+  }
   return changed;
 }
 
@@ -23016,6 +23040,18 @@ void Mob::ApplySplatter(const SplatterEvent& e, SplatSink* sink,
       v.occludeCtx = &probe;
     }
     if (sink) sink->curLimb = (int32_t)li;
+    {
+      // SANDVOX_SPLAT_TRACE=1 (fight64 R): every limb a burst is flown at,
+      // then SplatterView's trials, landings (lattice cell) and outcome. The
+      // instrument that attributed corpse-splatter: the flight is analytic
+      // against the limb's voxel lattice and never meets a collider. Printed
+      // from pool workers, so creatures' lines may interleave.
+      static const bool tr = std::getenv("SANDVOX_SPLAT_TRACE") != nullptr;
+      if (tr)
+        std::printf("splat trace: mob %llu limb %zu (%u voxels) from mob %llu\n",
+                    (unsigned long long)id_, li, (unsigned)v.Size(),
+                    (unsigned long long)e.sourceMob);
+    }
     if (sys_->SplatterView(e, v, (uint32_t)li, sink)) {
       coatDirty_ = twinDirty_ = true;
       WakeDead();   // blood landing on a sleeping corpse wakes it
