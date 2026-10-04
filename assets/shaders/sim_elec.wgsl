@@ -586,34 +586,55 @@ fn elecPurge(@builtin(workgroup_id) wg : vec3<u32>,
 
 // ============================================================================
 // elecQuery: THE BODY QUERY (package E4, docs/PLAN_electricity.md section 4;
-// src/sim/elec.h kElecQuery*). One workgroup per box the CPU asked about this
-// tick (MobSystem::QueueShockQueries: one box per live limb of the bodies near
-// the window, dilated a cell so a foot ON a charged plate counts). It reads
-// the SETTLED field -- half 0, after this tick's settle / tail / purge -- and
+// wave 2 package B, docs/PLAN_electricity_wave2.md; src/sim/elec.h
+// kElecQuery*). One workgroup per box the CPU asked about this tick
+// (MobSystem::QueueShockQueries: ONE box per body -- its limbs, shells and held
+// items -- dilated a cell so a foot ON a charged plate counts). It reads the
+// SETTLED field -- half 0, after this tick's settle / tail / purge -- and
 // writes four words per box into elecMeta's tail: the max P, the cells with
-// P > 0, their P summed and the cells scanned. The snapshot ring carries them
-// to the CPU at the fixed latency (World::kSnapshotLatency); the tag that says
-// WHOSE box it was never leaves the CPU (the readback slot holds it).
+// P > 0, their P summed and the cells scanned. Then the box's GRID, when the
+// CPU gave it one (box word 6 = its word offset in the grid area): every cell
+// as a u16 -- P clamped to ELEC_QUERY_GRID_PMAX, ELEC_QUERY_GRID_AIR when the
+// cell is air (the body's crackle and ignition frontier) -- two cells a word,
+// x fastest. The CPU conducts the charge through the body's own materials from
+// it (mob_shock.cpp). The snapshot ring carries everything to the CPU at the
+// fixed latency (World::kSnapshotLatency); the tag that says WHOSE box it was
+// never leaves the CPU (the readback slot holds it).
 //
-// DETERMINISM (rule 1): max and sum are order-independent, and each group
-// writes only its own box's four words. Read-only on the field.
+// DETERMINISM (rule 1): max and sum are order-independent; each grid word is
+// written by exactly one thread (it owns both of its cells), and each group
+// writes only its own box's words. Read-only on the field and the voxels.
 // COST (rule 2): recorded only on a tick with boxes (C_ELECQUERY), and the CPU
 // queues boxes only while the field can hold charge (World::ElecMayBeLive: a
 // source op in the last K + 2 ticks, or pages in use in the published
 // snapshot). A group whose field has no page in use writes zeros after one
-// load.
+// load (its grid is left unwritten: the CPU never reads the grid of a box
+// whose max P is 0 unless a charged body touches it, and then reads "no P").
 const EM_QUERY : u32 = 72768u;
+const EM_QUERY_GRID : u32 = 73152u;
 const EP_QUERY : u32 = 16416u;
 const EP_QUERY_BOXES : u32 = 16420u;
-const ELEC_QUERY_MAX : u32 = 128u;
+const ELEC_QUERY_MAX : u32 = 96u;
 const ELEC_QUERY_BOX_WORDS : u32 = 8u;
 const ELEC_QUERY_RES_WORDS : u32 = 4u;
 const ELEC_QUERY_AXIS_MAX : u32 = 32u;
+const ELEC_QUERY_GRID_WORDS : u32 = 49152u;
+const ELEC_QUERY_GRID_PMAX : u32 = 32767u;
+const ELEC_QUERY_GRID_AIR : u32 = 32768u;
+const ELEC_QUERY_NO_GRID : u32 = 0xFFFFFFFFu;
 
 var<workgroup> wgqMax : atomic<u32>;
 var<workgroup> wgqCharged : atomic<u32>;
 var<workgroup> wgqSum : atomic<u32>;
 var<workgroup> wgqLive : u32;
+
+// One grid cell: P clamped, | air.
+fn elecQueryCell(c : vec3<i32>) -> u32 {
+  if (!chunkInWindow(worldChunkOf(c), T.origin)) { return 0u; }
+  var v = min(elecAtCell(c), ELEC_QUERY_GRID_PMAX);
+  if (voxMat(voxWordAt(c)) == MAT_AIR) { v = v | ELEC_QUERY_GRID_AIR; }
+  return v;
+}
 
 @compute @workgroup_size(64)
 fn elecQuery(@builtin(workgroup_id) wg : vec3<u32>,
@@ -625,6 +646,7 @@ fn elecQuery(@builtin(workgroup_id) wg : vec3<u32>,
                      bitcast<i32>(elecParams[b + 2u]));
   let hi = vec3<i32>(bitcast<i32>(elecParams[b + 3u]), bitcast<i32>(elecParams[b + 4u]),
                      bitcast<i32>(elecParams[b + 5u]));
+  let gridOff = elecParams[b + 6u];
   let dims = vec3<u32>(clamp(hi - lo + vec3<i32>(1), vec3<i32>(0),
                              vec3<i32>(i32(ELEC_QUERY_AXIS_MAX))));
   let total = dims.x * dims.y * dims.z;
@@ -647,6 +669,20 @@ fn elecQuery(@builtin(workgroup_id) wg : vec3<u32>,
         atomicMax(&wgqMax, p);
         atomicAdd(&wgqCharged, 1u);
         atomicAdd(&wgqSum, p);
+      }
+    }
+    // THE GRID: one thread a word, both of its cells.
+    let words = (total + 1u) / 2u;
+    if (gridOff != ELEC_QUERY_NO_GRID && gridOff + words <= ELEC_QUERY_GRID_WORDS) {
+      for (var j = li; j < words; j += 64u) {
+        var w = 0u;
+        for (var h = 0u; h < 2u; h++) {
+          let i = j * 2u + h;
+          if (i >= total) { break; }
+          let c = lo + vec3<i32>(vec3<u32>(i % dims.x, (i / dims.x) % dims.y, i / (dims.x * dims.y)));
+          w = w | (elecQueryCell(c) << (h * 16u));
+        }
+        atomicStore(&elecMeta[EM_QUERY_GRID + gridOff + j], w);
       }
     }
   }

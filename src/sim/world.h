@@ -5028,17 +5028,38 @@ class World {
   // in tick order (TakeElecHits, TakeReactFx's discipline): what a tick
   // drains is the boxes of tick T - kSnapshotLatency - 1, never "whatever
   // landed", so the shocks a creature takes are a pure function of the tick.
-  void QueueElecQuery(const ElecQuery& q) {
+  //
+  // Wave 2 (package B): a box may ask for its GRID (`wantGrid`), which gets the
+  // next kElecQueryGridWordsMax words in queue order; a box whose grid does
+  // not fit is refused whole and counted (gridRefused), never truncated. The
+  // caller queues the players' bodies first. Returns whether it was queued.
+  bool QueueElecQuery(const ElecQuery& q, bool wantGrid = false) {
     if (elecQueryQueue_.size() >= kElecQueryMax) {
       elecQueryRefused_++;
-      return;
+      return false;
     }
-    elecQueryQueue_.push_back(q);
+    ElecQuery b = q;
+    b.gridOff = kElecQueryNoGrid;
+    b.gridWords = 0;
+    if (wantGrid) {
+      const uint32_t w = ElecQueryGridWords(q);
+      if (elecQueryGridUsed_ + w > kElecQueryGridWordsMax) {
+        elecQueryRefused_++;
+        elecQueryGridRefused_++;
+        return false;
+      }
+      b.gridOff = elecQueryGridUsed_;
+      b.gridWords = w;
+      elecQueryGridUsed_ += w;
+    }
+    elecQueryQueue_.push_back(b);
     elecQueriesAsked_++;
+    return true;
   }
   void TakeElecQueries(std::vector<ElecQuery>& out) {
     out.clear();
     out.swap(elecQueryQueue_);
+    elecQueryGridUsed_ = 0;
   }
   void SetElecQueriesInFlight(std::vector<ElecQuery>&& q) { elecInFlight_ = std::move(q); }
   std::vector<ElecHit> TakeElecHits() {
@@ -5067,10 +5088,11 @@ class World {
     elecSourceTick_ = tick;
   }
   struct ElecQueryStats {
-    uint64_t asked = 0, refused = 0, hits = 0, charged = 0;
+    uint64_t asked = 0, refused = 0, hits = 0, charged = 0, gridRefused = 0;
   };
   ElecQueryStats ElecQueryCounters() const {
-    return {elecQueriesAsked_, elecQueryRefused_, elecHitsDelivered_, elecHitsCharged_};
+    return {elecQueriesAsked_, elecQueryRefused_, elecHitsDelivered_, elecHitsCharged_,
+            elecQueryGridRefused_};
   }
   std::vector<ParticleSpawn> TakeTicketDeposits() {
     std::vector<ParticleSpawn> out;
@@ -5863,7 +5885,8 @@ class World {
   std::vector<uint8_t> elecSourceMat_;
   bool elecSourceSeen_ = false;
   uint32_t elecSourceTick_ = 0;
-  uint64_t elecQueriesAsked_ = 0, elecQueryRefused_ = 0;
+  uint64_t elecQueriesAsked_ = 0, elecQueryRefused_ = 0, elecQueryGridRefused_ = 0;
+  uint32_t elecQueryGridUsed_ = 0;   // grid words handed out this tick
   uint64_t elecHitsDelivered_ = 0, elecHitsCharged_ = 0;
   // Bumped by InvalidateSnapshot and by a TICK REWIND (a harness scene
   // restarting its counter — see kOrder in test/selftest.cpp). Everything from

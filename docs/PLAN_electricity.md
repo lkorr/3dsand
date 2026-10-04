@@ -21,6 +21,7 @@ player gate.
 | E4 | Shocks reach bodies: elecQuery, `DamageCause::Electric`, stun / twitch / knock-down / ignite, gates `elec-water-mob`, `elec-stun`, `elec-replay` | f376cd6 |
 | E2 | What charge does in the CA: charge as partner, ohmic ignition / char, crackle, gates `elec-electrolysis`, `elec-ignite`, `elec-crackle-bounded` | ecbfdd6 (main at e772227) |
 | Endgame | Proportional decay (`sim.elecDecayShift`), gate `elec-player-stun`, the ops-replay reporter fix | branch `worktree-agent-a73d261dd6db03139` |
+| Wave 2 B | One query box per BODY with a P/air grid, sized from the creature cap (bug 2: ~8 bodies); bodies CONDUCT by their material (world-pitch body cells, the field's max-plus and wet rule, `electric.shock` felt, ohmic sear / char and crackle per body cell, worn shells cover, bodies conduct into bodies); body-material `electric` blocks; gates `elec-crowd`, `elec-body-matter` (docs/PLAN_electricity_wave2.md package B) | branch `worktree-agent-ad10d2716979e16d7` |
 
 **Decay (endgame).** A stored P now loses `max(sim.elecDecay, P >>
 sim.elecDecayShift)` a tick (8 and 3), taken off the whole stored field --

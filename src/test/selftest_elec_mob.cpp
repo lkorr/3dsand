@@ -790,6 +790,258 @@ Status GateElecPlayerStun(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// elec-crowd (wave 2, package B: bug 2)
+// ============================================================================
+// THE WHOLE CROWD IS ASKED. Wave 1 queued one box per LIMB against a 128-box
+// cap in spawn order, so a crowd past ~8 humans was never shocked. Now one box
+// per body, sized from the creature cap: MaxLiveMobs() humans on a pad in rows
+// of eight, the LAST rows (the bodies spawned last, which wave 1 refused)
+// standing in a lightning-fed basin. Every one in the water must take Electric
+// hp; every one on the dry pad none; nothing refused.
+Status GateElecCrowd(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  const int hd = c.mobs.FindDef("human");
+  if (hd < 0) {
+    detail = "no `human` def";
+    return Status::Skip;
+  }
+  const uint32_t mStone = MatId(c, "stone"), mWater = MatId(c, "water"),
+                 mLight = MatId(c, "lightning");
+  const int hold = (int)BaselineNumber("elecCrowd.holdTicks", 16);
+  const int observe = (int)BaselineNumber("elecCrowd.observeTicks", 12);
+  const int n = (int)MobSystem::MaxLiveMobs();
+  const int cols = 8, rows = (n + cols - 1) / cols;
+  const int wetRows = rows >= 4 ? 2 : 1;
+  Regenerate(c);
+  Fix f;
+  const int dz = 6, wetGap = 6;
+  const int depth = rows * dz + wetGap + 8;
+  PadOps(c, f, 200, 24, depth / 2 + 4, mStone);
+  auto colX = [&](int col) { return f.x - 18 + col * 5; };
+  const int z0 = f.z - depth / 2 + 2;
+  auto rowZ = [&](int row) { return z0 + row * dz + (row >= rows - wetRows ? wetGap : 0); };
+  // The basin round the wet rows: water three deep, walls a cell outside.
+  const int bz0 = rowZ(rows - wetRows) - 3, bz1 = rowZ(rows - 1) + 3;
+  const int bx0 = f.x - 22, bx1 = f.x + 21;
+  for (int zz = bz0 - 1; zz <= bz1 + 1; zz++)
+    for (int xx = bx0 - 1; xx <= bx1 + 1; xx++) {
+      const bool wall = xx < bx0 || xx > bx1 || zz < bz0 || zz > bz1;
+      for (int yy = f.y; yy <= f.y + 3; yy++)
+        if (wall) Put(f.build, xx, yy, zz, mStone);
+        else if (yy <= f.y + 2) Put(f.fill, xx, yy, zz, PackVoxNew(mWater, 7));
+    }
+  // Bolts' feet along the basin floor, every eight cells (the charge reaches
+  // every wet body, whatever spreading loss the field grows).
+  for (int xx = bx0 + 1; xx <= bx1; xx += 8) Put(f.feed, xx, f.y, bz0, mLight);
+  uint32_t t = 88000;
+  support::TickRig rig(c, t, f.chunk);
+  BuildFix(rig, f);
+  std::vector<uint64_t> id;
+  std::vector<bool> wetBody;
+  for (int k = 0; k < n; k++) {
+    const int row = k / cols, col = k % cols;
+    const uint64_t m = SpawnAt(c, hd, colX(col), f.y, rowZ(row), "dummy");
+    if (m) {
+      id.push_back(m);
+      wetBody.push_back(row >= rows - wetRows);
+    }
+  }
+  for (int i = 0; i < 12; i++) Tick(rig);
+  const World::ElecQueryStats q0 = c.world.ElecQueryCounters();
+  const MobSystem::ShockCounters s0 = c.mobs.ShockStats();
+  for (int i = 0; i < hold + observe; i++) Tick(rig, i < hold ? f.feed : std::vector<CellOp>{});
+  const World::ElecQueryStats q1 = c.world.ElecQueryCounters();
+  const MobSystem::ShockCounters s1 = c.mobs.ShockStats();
+  int wetN = 0, wetHit = 0, dryN = 0, dryHit = 0, lastWetMiss = -1;
+  float wetHpMin = 1e30f;
+  for (size_t k = 0; k < id.size(); k++) {
+    const Mob::ShockRecord r = ShockOf(c, id[k]);
+    const float hp = ElecHp(c, id[k]);
+    if (wetBody[k]) {
+      wetN++;
+      if (hp > 0.0f) wetHit++;
+      else lastWetMiss = (int)k;
+      wetHpMin = std::min(wetHpMin, hp);
+    } else {
+      dryN++;
+      if (hp > 0.0f || r.ticks > 0) dryHit++;
+    }
+  }
+  Regenerate(c);
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
+  };
+  check((int)id.size() == n, Format("%zu of %d humans spawned", id.size(), n));
+  check(wetN > 0 && wetHit == wetN,
+        Format("%d of %d humans in the charged water were shocked (spawn index %d missed)", wetHit,
+               wetN, lastWetMiss));
+  check(dryHit == 0, Format("%d of %d humans on the dry pad were shocked", dryHit, dryN));
+  check(q1.refused == q0.refused && s1.refused == s0.refused,
+        Format("%llu bodies refused by the query (%llu for the grid budget)",
+               (unsigned long long)(q1.refused - q0.refused),
+               (unsigned long long)(q1.gridRefused - q0.gridRefused)));
+  const uint64_t calls = s1.applyCalls - s0.applyCalls;
+  const double usPerTick =
+      calls ? (double)(s1.applyNanos - s0.applyNanos) / 1000.0 / (double)calls : 0.0;
+  const double refreshUs =
+      calls ? (double)(s1.refreshNanos - s0.refreshNanos) / 1000.0 / (double)calls : 0.0;
+  RecordObserved("elecCrowd.applyUsPerTick", usPerTick);
+  detail = Format(
+      "%zu humans (cap %d): %d/%d in the lightning-fed basin shocked (least %.1f Electric hp), "
+      "%d/%d on the dry pad | query: %llu boxes asked, %llu refused | conduction: %llu body-ticks "
+      "(%llu linked), %llu cells, slot bins %llu built / %llu reused, ohmic %llu cells / %llu "
+      "voxels (%llu refused), crackle %llu ops (%llu refused); ApplyShocks %.0f us a tick (%.0f of it re-binning "
+      "the slots)%s%s",
+      id.size(), n, wetHit, wetN, wetN ? wetHpMin : 0.0f, dryHit, dryN,
+      (unsigned long long)(q1.asked - q0.asked), (unsigned long long)(q1.refused - q0.refused),
+      (unsigned long long)(s1.bodiesSolved - s0.bodiesSolved),
+      (unsigned long long)(s1.linked - s0.linked), (unsigned long long)(s1.cellsSolved - s0.cellsSolved),
+      (unsigned long long)(s1.cacheBuilds - s0.cacheBuilds),
+      (unsigned long long)(s1.cacheHits - s0.cacheHits),
+      (unsigned long long)(s1.ohmicCells - s0.ohmicCells),
+      (unsigned long long)(s1.ohmicVoxels - s0.ohmicVoxels),
+      (unsigned long long)(s1.ohmicRefused - s0.ohmicRefused),
+      (unsigned long long)(s1.crackleOps - s0.crackleOps),
+      (unsigned long long)(s1.crackleRefused - s0.crackleRefused), usPerTick, refreshUs,
+      fails.empty() ? "" : " | FAILED: ", fails.c_str());
+  std::printf("elec-crowd: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
+// ============================================================================
+// elec-body-matter (wave 2, package B: the material decides)
+// ============================================================================
+// Six bodies, each on its own arc-fed copper plate, the same charge under every
+// one; what each takes is its matter's:
+//   barefoot human          skin and flesh conduct and FEEL: Electric hp, stun
+//   human in leather shoes  the sole is an insulator between foot and plate:
+//                           nothing (the worn shell covers the foot's cells)
+//   human in iron sabatons  iron conducts into the foot: Electric hp
+//   sylvan (dryad)          wood carries the charge and feels none of it: no
+//                           Electric hp, no stun -- and it CHARS / ignites (the
+//                           ohmic rule on its body cells, wood's own data)
+//   android (courier), dry  reported (its panels are an insulator; whatever
+//                           its exposed frame does is what it does)
+//   android, soaked         the wet rule on its panels lets the plate in; its
+//                           circuitry feels it: Electric hp
+Status GateElecBodyMatter(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  const int hd = c.mobs.FindDef("human");
+  const int sy = c.mobs.FindDef("dryad");
+  const int an = c.mobs.FindDef("courier");
+  if (hd < 0) {
+    detail = "no `human` def";
+    return Status::Skip;
+  }
+  const uint32_t mStone = MatId(c, "stone"), mCopper = MatId(c, "copper_bar"),
+                 mArc = MatId(c, "arc"), mWater = MatId(c, "water");
+  const int hold = (int)BaselineNumber("elecMatter.holdTicks", 16);
+  const int observe = (int)BaselineNumber("elecMatter.observeTicks", 16);
+  Regenerate(c);
+  Fix f;
+  PadOps(c, f, 200, 48, 10, mStone);
+  constexpr int kBodies = 6;
+  int px[kBodies];
+  for (int k = 0; k < kBodies; k++) {
+    px[k] = f.x - 40 + k * 16;
+    for (int zz = f.z - 6; zz <= f.z + 3; zz++)
+      for (int xx = px[k] - 3; xx <= px[k] + 3; xx++) Put(f.build, xx, f.y - 1, zz, mCopper);
+    Pocket(f.build, mStone, px[k], f.y - 1, f.z - 7, 0, 0, 1);
+    Put(f.feed, px[k], f.y - 1, f.z - 7, mArc);
+  }
+  uint32_t t = 89000;
+  support::TickRig rig(c, t, f.chunk);
+  BuildFix(rig, f);
+  const int defOf[kBodies] = {hd, hd, hd, sy, an, an};
+  const char* name[kBodies] = {"barefoot human", "human in leather shoes", "human in iron sabatons",
+                               "sylvan", "android (dry)", "android (soaked)"};
+  uint64_t id[kBodies] = {};
+  for (int k = 0; k < kBodies; k++)
+    if (defOf[k] >= 0) id[k] = SpawnAt(c, defOf[k], px[k], f.y, f.z, "dummy");
+  auto wear = [&](uint64_t mid, const char* item) {
+    const int idx = c.items.Find(item);
+    const ItemDef* it = idx >= 0 ? c.items.At(idx) : nullptr;
+    Mob* m = mid ? c.mobs.FindMobById(mid) : nullptr;
+    if (!it || !m) return false;
+    for (int sl = 0; sl < kEquipSlotCount; sl++)
+      if (EquipSlotAccepts(sl, it->kind) && m->WearItem(it, sl)) return true;
+    return false;
+  };
+  const bool shoes = wear(id[1], "shoes");
+  const bool sabatons = wear(id[2], "iron_sabatons");
+  for (int i = 0; i < 12; i++) Tick(rig);
+  if (Mob* m = id[5] ? c.mobs.FindMobById(id[5]) : nullptr)
+    for (int li = 0; li < m->AppendedBase(); li++)
+      if (c.mobs.LimbBody(id[5], li)) c.mobs.SoakLimb(id[5], li, mWater, kBodyStainAmtMax, rig.tick);
+  bool stunned[kBodies] = {};
+  for (int i = 0; i < hold + observe; i++) {
+    Tick(rig, i < hold ? f.feed : std::vector<CellOp>{});
+    for (int k = 0; k < kBodies; k++)
+      if (const Mob* m = id[k] ? c.mobs.FindMobById(id[k]) : nullptr)
+        stunned[k] = stunned[k] || m->Stunned(rig.tick);
+  }
+  float hp[kBodies];
+  Mob::ShockRecord rec[kBodies];
+  std::vector<std::string> slotNames[kBodies];
+  for (int k = 0; k < kBodies; k++) {
+    hp[k] = id[k] ? ElecHp(c, id[k]) : 0.0f;
+    rec[k] = id[k] ? ShockOf(c, id[k]) : Mob::ShockRecord{};
+    if (const Mob* m = id[k] ? c.mobs.FindMobById(id[k]) : nullptr)
+      for (int sl = 0; sl < 63; sl++) slotNames[k].push_back(m->SlotName(sl));
+    slotNames[k].push_back("#63+");
+  }
+  Regenerate(c);
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails += (fails.empty() ? "" : "; ") + what;
+  };
+  check(id[0] != 0, "the barefoot human did not spawn");
+  check(hp[0] > 0.0f && stunned[0], Format("barefoot: %.2f Electric hp, %s", hp[0],
+                                           stunned[0] ? "stunned" : "never stunned"));
+  if (shoes)
+    check(hp[1] == 0.0f && !stunned[1],
+          Format("leather shoes: %.2f Electric hp (the sole should insulate)", hp[1]));
+  if (sabatons)
+    check(hp[2] > 0.0f, Format("iron sabatons: %.2f Electric hp (iron should conduct)", hp[2]));
+  if (id[3]) {
+    check(hp[3] == 0.0f && !stunned[3],
+          Format("sylvan: %.2f Electric hp%s (wood feels nothing)", hp[3],
+                 stunned[3] ? ", stunned" : ""));
+    check(rec[3].ohmicVoxels > 0 && rec[3].cellsPeak > 0,
+          Format("sylvan: %u charged cells, %u voxels charred / lit (wood should char)",
+                 rec[3].cellsPeak, rec[3].ohmicVoxels));
+  }
+  if (id[5]) check(hp[5] > 0.0f, Format("soaked android: %.2f Electric hp (its circuitry feels)", hp[5]));
+  std::string rows;
+  for (int k = 0; k < kBodies; k++) {
+    if (!id[k]) {
+      rows += Format("%s%s: (no def)", k ? " | " : "", name[k]);
+      continue;
+    }
+    // The slots that took the world's charge directly, by name (attribution).
+    std::string seeded;
+    for (int sl = 0; sl < 64; sl++)
+      if (rec[k].seededSlots & (1ull << sl))
+        seeded += (seeded.empty() ? "" : ",") + slotNames[k][std::min<size_t>(sl, slotNames[k].size() - 1)];
+    rows += Format("%s%s%s: %.2f hp%s, cells %u (P peak %u), ohmic %u cells / %u voxels, %u "
+                   "crackles%s, seeded [%s], %u covered",
+                   k ? " | " : "", name[k],
+                   (k == 1 && !shoes) || (k == 2 && !sabatons) ? " (ITEM NOT WORN)" : "", hp[k],
+                   stunned[k] ? " stunned" : "", rec[k].cellsPeak, rec[k].peakCellP, rec[k].ohmic,
+                   rec[k].ohmicVoxels, rec[k].crackles, rec[k].armour ? ", armour" : "",
+                   seeded.c_str(), rec[k].covered);
+  }
+  RecordObserved("elecMatter.barefootHp", hp[0]);
+  RecordObserved("elecMatter.sabatonHp", hp[2]);
+  RecordObserved("elecMatter.sylvanOhmicVoxels", rec[3].ohmicVoxels);
+  RecordObserved("elecMatter.androidSoakedHp", hp[5]);
+  detail = rows + (fails.empty() ? "" : " | FAILED: ") + fails;
+  std::printf("elec-body-matter: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ElecMobGates() {
@@ -798,6 +1050,8 @@ const std::vector<Gate>& ElecMobGates() {
       {"elec-stun", "mob", {}, false, GateElecStun},
       {"elec-player-stun", "mob", {}, false, GateElecPlayerStun},
       {"elec-replay", "mob", {}, false, GateElecReplay},
+      {"elec-crowd", "mob", {}, false, GateElecCrowd},
+      {"elec-body-matter", "mob", {}, false, GateElecBodyMatter},
   };
   return g;
 }

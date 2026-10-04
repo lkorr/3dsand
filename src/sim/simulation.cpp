@@ -3338,6 +3338,9 @@ uint32_t Simulation::PrepareElecQueries(const rhi::Queue& queue,
       o[a] = (uint32_t)lo;
       o[3 + a] = (uint32_t)hi;
     }
+    // Wave 2 (package B): the box's grid offset (World::QueueElecQuery
+    // assigned it; kElecQueryNoGrid = the box wants none).
+    o[6] = boxes[i].gridOff;
   }
   queue.WriteBuffer(elecParamsBuf_, (uint64_t)kEpQuery * 4, w.data(), w.size() * 4);
   return n;

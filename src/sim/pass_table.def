@@ -793,10 +793,12 @@ PASS(elecPurge, "elec", PT_TICK, PIPE_ELEC_PURGE, K_INDIRECT, IND_ELECARGS,16,0,
 // field can hold charge (World::ElecMayBeLive), so a world with no charge
 // records nothing.
 // read-only in practice: `elecPool` (the module declares it read_write for
-// the rounds; elecQuery only reads half 0 through elecAt).
+// the rounds; elecQuery only reads half 0 through elecAt). Wave 2 (package B):
+// each box's GRID too (P | air, elecMeta's grid tail), so it reads the voxels
+// through the page table for the air bit.
 PASS(elecQuery, "elec", PT_TICK, PIPE_ELEC_QUERY, K_COMPUTE, D_ELECQUERY,1,1,
      GRP_SIM, DYN_ZERO, C_ELECQUERY, 1,
-     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams)))
+     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams) R(Voxels) R(PageTable)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //
