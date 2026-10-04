@@ -8156,9 +8156,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // stops being a target by not being here.
   burnprof::Scope bpActors(burnprof::kActors);
   actors_.clear();
-  // The drip pot's demand, last tick's (Mob::BleedTick's turn rule).
-  bleedWantPrev_ = bleedWantCur_;
-  bleedWantCur_ = 0;
+  // The drip pot's demand (Mob::BleedTick's turn rule). Demand is only
+  // counted on a DRIP tick, so it rolls over on drip ticks: on one, `Cur`
+  // still holds the previous drip tick's count. (Rolled every tick, the
+  // previous tick was never a drip tick and the rule never engaged.)
+  if (tick % (uint32_t)std::max(1, CurrentTuning().gore.bleedDripTicks) == 0) {
+    bleedWantPrev_ = bleedWantCur_;
+    bleedWantCur_ = 0;
+  }
   for (const ai::Actor& pa : playerActors_) actors_.push_back(pa);
   // The AI's own creatures: the players are in the list above, as ACTORS
   // (their ids live in the player-actor band), so a body a player drives is
