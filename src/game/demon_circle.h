@@ -17,9 +17,14 @@
 //   * otherwise CLOSED: the fill region (a bitmask over its bounding box) is
 //     the inside, the salt it ran into is the ring.
 //
-// SALT BY NAME, resolved at load (assets/demons/circle.json). Brine is not
-// salt (dissolved salt is solute on a water cell, not a salt cell), molten
-// salt is not salt, scattered salt is salt cells that no longer make a loop.
+// SALT BY NAME, resolved at load (assets/demons/circle.json), and BY MASS: a
+// salt cell walls its column only with at least `minEighths` of a cell of
+// grains in it (powder state = mass in eighths, sim/world.h POWDER MASS).
+// Salt is a powder, and a poured band sheds single eighths sideways as it
+// settles (sub-voxel repose): those strays, and anything wind or a boot
+// scatters, are a film, not a ring -- otherwise a one-line gap re-closes
+// itself with grains nobody poured. Brine is not salt (dissolved salt is
+// solute on a water cell, not a salt cell), molten salt is not salt.
 //
 // PURE. The voxels come in through `CircleProbe` (the caller binds the T-4
 // snapshot mirror + the fetch cache), so the scan is a function of that
@@ -33,8 +38,9 @@
 #include "math3d.h"
 
 struct CircleProbe {
-  // The material at a cell, or `known = false` if no store holds it.
-  uint32_t (*matAt)(void* ctx, int32_t x, int32_t y, int32_t z, bool& known) = nullptr;
+  // The voxel WORD at a cell (material in bits 0..11, the state nibble in
+  // 12..15), or `known = false` if no store holds it.
+  uint32_t (*wordAt)(void* ctx, int32_t x, int32_t y, int32_t z, bool& known) = nullptr;
   void* ctx = nullptr;
   // Can a body stand in this material (air, gas) -- for the floor search.
   bool (*passable)(void* ctx, uint32_t mat) = nullptr;
@@ -42,6 +48,7 @@ struct CircleProbe {
 
 struct CircleParams {
   uint32_t saltMat = 0;       // the one material that makes a ring
+  uint32_t minEighths = 4;    // ...with at least this much of a cell of it
   int32_t radiusMax = 60;     // cells: the fill escaping this far = no circle
   int32_t slabBelow = 1;      // slab rows below the feet row
   int32_t slabAbove = 1;      // ...and above it

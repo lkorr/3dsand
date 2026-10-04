@@ -23,8 +23,11 @@
 //                     (position, state) must be identical.
 //                  C. NO RING: the same cast on the bare pad -> UNBOUND at
 //                     once (the goof).
-//                  D. A GAP: the ring with one cell missing at build time ->
-//                     not a circle -> UNBOUND at once.
+//                  D. A GAP: the ring with one radial line missing at build
+//                     time -> not a circle -> UNBOUND at once.
+//                  E. THE BODY IS FLESH at under a metre: Skerrick's def on a
+//                     bare pad burns when lit, bleeds blood from a blast
+//                     beside it, and dies to a killing blow.
 //
 // Ticks THE tick (support::TickRig -> TickAuthority): the demon world ticks
 // before phase H, the fence is asked in mobs.PreTick. Every fixture is built on
@@ -78,14 +81,17 @@ void Tick(support::TickRig& rig, const std::vector<CellOp>& cells = {}) {
 
 // ---- the fixture -------------------------------------------------------------
 // A stone pad, air above it, and (when `ring`) a salt ring on the floor round
-// (x, z): every column whose distance from the centre floors to `r`. That
-// band is closed to a 4-connected fill by construction (a step changes the
-// distance by at most 1, so getting from inside r to outside r+1 crosses it).
+// (x, z): every column whose distance from the centre floors to r or r + 1.
+// TWO wide on purpose: salt is a powder, and a one-wide digital circle's
+// diagonal steps are single grains touching only at corners, which repose
+// carries off within a few ticks (measured: 22 of 88 gone before an arrival).
+// The Harrowby cellar's ring is the same shape (D2). Closed to a 4-connected
+// fill by construction (a step changes the distance by at most 1).
 struct Fix {
   int x = 0, y = 0, z = 0;
   IVec3 chunk{};
   std::vector<CellOp> pad, ring;
-  IVec3 gap{};           // the cell a break clears / a gap leaves out
+  std::vector<IVec3> ringAt;   // the ring's cells, world coords
 };
 
 Fix Build(Ctx& c, int r, bool ring, bool gap) {
@@ -102,16 +108,16 @@ Fix Build(Ctx& c, int r, bool ring, bool gap) {
         Put(f.pad, xx, yy, zz, PackVoxNew(mStone, 0));
       for (int yy = f.y; yy <= f.y + 16; yy++) Put(f.pad, xx, yy, zz, 0u);
     }
-  // The gap / the break: the ring cell due +x of the centre (toward the
-  // player, who stands on +x).
-  f.gap = IVec3{f.x + r, f.y, f.z};
+  // The gap / the break: the band's radial line due +x of the centre
+  // (toward the player, who stands on +x) -- two cells, r and r + 1.
   if (ring)
-    for (int dz = -r - 1; dz <= r + 1; dz++)
-      for (int dx = -r - 1; dx <= r + 1; dx++) {
+    for (int dz = -r - 2; dz <= r + 2; dz++)
+      for (int dx = -r - 2; dx <= r + 2; dx++) {
         const int d = (int)std::floor(std::sqrt((double)(dx * dx + dz * dz)));
-        if (d != r) continue;
-        if (gap && f.x + dx == f.gap.x && f.z + dz == f.gap.z) continue;
+        if (d != r && d != r + 1) continue;
+        if (gap && dz == 0 && dx > 0) continue;
         Put(f.ring, f.x + dx, f.y, f.z + dz, PackVoxNew(mSalt, 0));
+        f.ringAt.push_back(IVec3{f.x + dx, f.y, f.z + dz});
       }
   f.chunk = {f.x >> 4, f.y >> 4, f.z >> 4};
   return f;
@@ -153,9 +159,17 @@ RunOut RunFix(Ctx& c, int r, bool ring, bool gap, int holdTicks, int breakTicks,
   Fix f = Build(c, r, ring, gap);
   support::TickRig rig(c, t0, f.chunk);
   rig.Glyphs() = lib;
-  Tick(rig, f.pad);
+  // The pad in slices under the per-tick cell-op cap (kMaxCellOpsPerTick:
+  // past it the tail is TRUNCATED, and a truncated pad is a floor with holes
+  // the ring's grains fall into -- measured, 88,520 ops lost in one tick).
+  for (size_t i = 0; i < f.pad.size(); i += kMaxCellOpsPerTick / 2)
+    Tick(rig, std::vector<CellOp>(f.pad.begin() + (ptrdiff_t)i,
+                                  f.pad.begin() + (ptrdiff_t)std::min(
+                                      f.pad.size(), i + kMaxCellOpsPerTick / 2)));
   Tick(rig, f.ring);
-  for (int i = 0; i < 8; i++) Tick(rig);
+  // The pour SETTLES before the name is cast, as a real one would have.
+  const int settle = (int)BaselineNumber("demonCircle.settleTicks", 30);
+  for (int i = 0; i < settle; i++) Tick(rig);
   // THE PLAYER: an actor standing just outside the ring on +x, inside an
   // imp's reach of the ring's inner edge, so a contained imp has something to
   // want and to swing at across the salt.
@@ -187,6 +201,50 @@ RunOut RunFix(Ctx& c, int r, bool ring, bool gap, int holdTicks, int breakTicks,
     return out;
   }
   const LiveDemon arrived = dw.live[0];
+  // THE RING AS THE SNAPSHOT SEES IT (attribution: a ring the scan calls
+  // open names the cell that is not salt, and what it is instead).
+  if (ring) {
+    const WorldSnapshot& sn = c.world.Snap();
+    const uint32_t mSalt = MatId(c, "salt");
+    int salt = 0, other = 0, unseen = 0;
+    std::string first;
+    for (const IVec3& p : f.ringAt) {
+      const int cx = (p.x >> 4) - sn.mirrorBase.x, cy = (p.y >> 4) - sn.mirrorBase.y,
+                cz = (p.z >> 4) - sn.mirrorBase.z;
+      if (!sn.valid || cx < 0 || cy < 0 || cz < 0 || cx > 2 || cy > 2 || cz > 2) {
+        unseen++;
+        continue;
+      }
+      const uint32_t m = sn.mirror[(size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol +
+                                   (size_t)(((p.z & 15) * 16 + (p.y & 15)) * 16 + (p.x & 15))] &
+                         0xFFFu;
+      if (m == mSalt) salt++;
+      else {
+        other++;
+        if (first.empty())
+          first = Format("(%d,%d,%d) is %s", p.x, p.y, p.z,
+                         m < c.mats.size() ? c.mats[m].name.c_str() : "?");
+      }
+    }
+    // ...and the radial line due +x (the gap, or where the break will be),
+    // y from the floor to two above it.
+    std::string line;
+    for (int dx = r - 1; dx <= r + 2; dx++)
+      for (int y = f.y - 1; y <= f.y + 1; y++) {
+        const IVec3 p{f.x + dx, y, f.z};
+        const int cx = (p.x >> 4) - sn.mirrorBase.x, cy = (p.y >> 4) - sn.mirrorBase.y,
+                  cz = (p.z >> 4) - sn.mirrorBase.z;
+        if (!sn.valid || cx < 0 || cy < 0 || cz < 0 || cx > 2 || cy > 2 || cz > 2) continue;
+        const uint32_t w = sn.mirror[(size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol +
+                                     (size_t)(((p.z & 15) * 16 + (p.y & 15)) * 16 + (p.x & 15))];
+        const uint32_t m = w & 0xFFFu;
+        line += Format(" (%d,%d)=%s/%u", dx, y - f.y, m < c.mats.size() ? c.mats[m].name.c_str() : "?",
+                       (w >> 12) & 15u);
+      }
+    std::printf("demon-circle: radial line +x:%s\n", line.c_str());
+    std::printf("demon-circle: ring as seen at arrival: %d salt, %d other%s%s, %d unseen\n", salt,
+                other, first.empty() ? "" : ", first ", first.c_str(), unseen);
+  }
   out.spawned = true;
   out.id = arrived.mobId;
   out.arrived = arrived.state;
@@ -241,7 +299,8 @@ RunOut RunFix(Ctx& c, int r, bool ring, bool gap, int holdTicks, int breakTicks,
   //         reach you -- which is the claim.
   c.mobs.SetPlayerActor(Vec3{you.x + 14.0f, you.y, you.z}, 3.0f, 17.0f, true);
   std::vector<CellOp> brk;
-  Put(brk, f.gap.x, f.gap.y, f.gap.z, 0u);
+  Put(brk, f.x + r, f.y, f.z, 0u);
+  Put(brk, f.x + r + 1, f.y, f.z, 0u);
   Tick(rig, brk);
   record();
   for (int i = 1; i < breakTicks + leaveTicks; i++) {
@@ -254,6 +313,92 @@ RunOut RunFix(Ctx& c, int r, bool ring, bool gap, int holdTicks, int breakTicks,
     Tick(rig);
     record();
   }
+  return out;
+}
+
+// ---- E. THE IMP IS FLESH: it burns, it bleeds, it dies -----------------------
+// Skerrick's body straight from its def on a bare pad (no summoning: the claim
+// is about the BODY at under a metre, not the circle): a torso set alight
+// must burn; a grenade-slot blast beside it must carve and bleed blood; a
+// killing blow must kill it.
+struct FleshOut {
+  bool spawned = false;
+  uint32_t ignited = 0;
+  float burnPeak = 0;
+  int bloodOps = 0;
+  float hp0 = 0, hpBlast = 0;
+  uint32_t vox0 = 0, voxBlast = 0;
+  bool hpLost = false, died = false;
+};
+
+FleshOut RunFlesh(Ctx& c, const std::string& mobName, uint32_t t0, uint64_t idBase) {
+  FleshOut out;
+  Regenerate(c);
+  c.mobs.SetNextIdCounter(idBase);
+  Fix f = Build(c, 8, false, false);
+  support::TickRig rig(c, t0, f.chunk);
+  for (size_t i = 0; i < f.pad.size(); i += kMaxCellOpsPerTick / 2)
+    Tick(rig, std::vector<CellOp>(f.pad.begin() + (ptrdiff_t)i,
+                                  f.pad.begin() + (ptrdiff_t)std::min(
+                                      f.pad.size(), i + kMaxCellOpsPerTick / 2)));
+  for (int i = 0; i < 8; i++) Tick(rig);
+  const int def = c.mobs.FindDef(mobName);
+  if (def < 0) return out;
+  const Vec3 ws = c.mobs.Defs()[(size_t)def].worldSize;
+  const uint64_t id =
+      c.mobs.Spawn(def, {f.x - (int)(ws.x * 0.5f), f.y, f.z - (int)(ws.z * 0.5f)});
+  out.spawned = id != 0;
+  if (!id) return out;
+  for (int i = 0; i < 10; i++) Tick(rig);
+  int torso = -1;
+  for (size_t i = 0; i < c.mobs.Defs()[(size_t)def].limbs.size(); i++)
+    if (c.mobs.Defs()[(size_t)def].limbs[i].name == "torso") torso = (int)i;
+  // Burn.
+  out.ignited = torso >= 0 ? c.mobs.IgniteLimb(id, torso, 8) : 0;
+  for (int i = 0; i < 30; i++) {
+    Tick(rig);
+    if (const Mob* m = c.mobs.FindMobById(id)) {
+      float hpFrac = 0, burning = 0;
+      int lost = 0;
+      m->BodyFacts(hpFrac, burning, lost);
+      out.burnPeak = std::max(out.burnPeak, burning);
+    }
+  }
+  // Bleed: a small blast level with the hips, beside the body.
+  const uint32_t mBlood = MatId(c, "blood");
+  auto countBlood = [&]() {
+    const OpBatch& b = rig.LastBatch();
+    // Wounds drip as BRUSH ops (Mob::BleedTick); gore flies as spawns.
+    for (const BrushOp& o : b.ops) out.bloodOps += (o.material & 0xFFFu) == mBlood;
+    for (const ParticleSpawn& p : b.spawns) out.bloodOps += (p.payload & 0xFFFu) == mBlood;
+    for (const CellOp& o : b.cells) out.bloodOps += (o.word & 0xFFFu) == mBlood;
+    for (const FluidSpawnOp& o : b.fluid) out.bloodOps += o.mat == mBlood;
+  };
+  out.hp0 = c.mobs.TotalHp(id);
+  out.vox0 = torso >= 0 ? c.mobs.LimbArtVoxelCount(id, torso) : 0;
+  if (const Mob* m = c.mobs.FindMobById(id)) {
+    const Vec3 o = m->Origin();
+    const ExplosionOp e{(int32_t)std::floor(o.x + ws.x * 0.5f + 2.0f),
+                        (int32_t)std::floor(o.y + ws.y * 0.4f),
+                        (int32_t)std::floor(o.z + ws.z * 0.5f), 3, 120, 0, 0, 0};
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& ops) { ops.exps = {e}; });
+    countBlood();
+  }
+  for (int i = 0; i < 40; i++) {
+    Tick(rig);
+    countBlood();
+  }
+  out.hpBlast = c.mobs.TotalHp(id);
+  out.voxBlast = torso >= 0 && c.mobs.LimbBody(id, torso) ? c.mobs.LimbArtVoxelCount(id, torso) : 0;
+  out.hpLost = c.mobs.IsAlive(id) ? out.hpBlast < out.hp0 : true;
+  // Die: a killing blow on the torso.
+  if (torso >= 0 && c.mobs.IsAlive(id)) {
+    const uint64_t body = c.mobs.LimbBody(id, torso);
+    if (const Mob* m = c.mobs.FindMobById(id))
+      c.mobs.Damage(body, 100000.0f, m->Origin());
+    for (int i = 0; i < 4; i++) Tick(rig);
+  }
+  out.died = !c.mobs.IsAlive(id);
   return out;
 }
 
@@ -329,6 +474,7 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
   const RunOut a2 = RunFix(c, r, true, false, hold, breakMax, leaveMax, lib, gSummon, 91000u, ids0);
   const RunOut none = RunFix(c, r, false, false, 0, 0, 0, lib, gSummon, 92000u, ids0);
   const RunOut gap = RunFix(c, r, true, true, 0, 0, 0, lib, gSummon, 93000u, ids0);
+  const FleshOut flesh = RunFlesh(c, sk ? sk->mob : std::string(), 94000u, ids0);
   weather::SetOverride(weatherWas);
   Regenerate(c);
 
@@ -359,6 +505,14 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
         Format("D: a one-cell gap -> %s (%s)", DemonStateName(gap.arrived),
                CircleVerdictName(gap.verdict)));
 
+  check(flesh.spawned && flesh.ignited > 0 && flesh.burnPeak > 0.0f,
+        Format("E: the imp burns (%u voxels lit, burning peak %.2f)", flesh.ignited,
+               flesh.burnPeak));
+  check(flesh.bloodOps > 0 && flesh.hpLost,
+        Format("E: a blast beside the imp hurts it and it bleeds blood (%d blood ops; hp "
+               "%.1f -> %.1f, torso voxels %u -> %u)",
+               flesh.bloodOps, flesh.hp0, flesh.hpBlast, flesh.vox0, flesh.voxBlast));
+  check(flesh.died, "E: a killing blow kills the imp");
   RecordObserved("demonCircle.unboundAfter", a.unboundAfter);
   RecordObserved("demonCircle.outsideAfter", a.outsideAfter);
   RecordObserved("demonCircle.movesRefused", a.movesRefused);
@@ -372,6 +526,9 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
       a.outsideAfter, a.trace.size(), a.trace == a2.trace ? "identical twice" : "DIFFERS",
       DemonStateName(none.arrived), CircleVerdictName(none.verdict), DemonStateName(gap.arrived),
       CircleVerdictName(gap.verdict));
+  detail += Format(". E flesh: %u lit (burning peak %.2f), %d blood ops after a blast, %s",
+                   flesh.ignited, flesh.burnPeak, flesh.bloodOps,
+                   flesh.died ? "dies to a killing blow" : "DID NOT DIE");
   if (!fails.empty()) detail += "; FAILED: " + fails;
   std::printf("demon-circle: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
   return fails.empty() ? Status::Pass : Status::Fail;

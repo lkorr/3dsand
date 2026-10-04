@@ -24429,10 +24429,18 @@ reload carries learned names over by id. D2's book grants it by name.
 
 **THE CIRCLE** (`game/demon_circle.h`, `assets/demons/circle.json`). From the
 arrival column a 2D flood fill over a three-row slab (the floor row, the feet
-row, the row above) in which a column is a WALL iff a slab cell is salt --
-only salt: stone, wood and water are open, so a walled room or a moat is not a
-circle, and brine (dissolved salt is solute on a water cell) or molten salt
-does not count. 4-connected, so a ring drawn on the diagonal is closed and one
+row, the row above) in which a column is a WALL iff a slab cell is salt
+with at least `minEighths` (4) of a cell of grains in it -- only salt: stone,
+wood and water are open, so a walled room or a moat is not a circle, and brine
+(dissolved salt is solute on a water cell) or molten salt does not count. BY
+MASS because salt is a powder: a poured band settles by shedding single
+eighths sideways (sub-voxel repose), and with every grain counted a one-line
+gap closed itself with strays nobody poured (measured: a 2-wide band left the
+gap cells holding 1/8 each and the full cells 7/8). The same strays are what
+wind leaves of a scattered ring. A one-wide digital ring does not survive
+settling at all (its diagonal steps are single grains touching at corners:
+22 of 88 gone in 30 ticks), so a ring wants to be two cells wide -- the
+cellar's is (D2). 4-connected, so a ring drawn on the diagonal is closed and one
 missing cell is a gap. The fill escaping `radiusMaxM` (4 m) = OPEN; the start
 column itself salt = ON RING; a cell no store holds = UNKNOWN; otherwise
 CLOSED, and the fill region (a bitmask over its bounding box) is the inside.
@@ -24480,12 +24488,17 @@ and no circle -- loose. Learned names are glyph ownership (D2's grant). D5
 (contracts) is where bound demons persist.
 
 **GATE** `demon-circle`: the name (glyph, VM report, tariff, not granted by
-default, granted by the switch, Skerrick resolves); on a harness pad a salt
-ring with the player's actor just outside: contained for 150 ticks and never
-out while targeting you, the fence refusing moves and blows; one ring cell
-cleared through the queue -> unbound within 40 ticks and out of the circle;
-the same run twice -> identical trace; no ring -> unbound; a one-cell gap ->
-unbound.
+default, granted by the switch, Skerrick resolves); on a harness pad a 2-wide
+salt ring (r 14..15), settled 30 ticks, with the player's actor just outside:
+contained for 150 ticks and never out while targeting you, the fence refusing
+moves and blows (258 + 5 measured); you step back, the band's radial line is
+cleared through the queue -> unbound 6 ticks later and out of the circle the
+same tick; the same run twice -> identical trace; no ring -> unbound (open); a
+one-line gap -> unbound (open). Thresholds `demonCircle.*`. Attribution
+printed on the way: the ring's cells as the snapshot saw them at arrival and
+the radial line's words; an UNKNOWN verdict names the first unseen cell and
+what the stores held. The pad goes in in slices under kMaxCellOpsPerTick (a
+truncated pad is a floor with holes the ring's grains fall into).
 
 ### Demons — the Harrowby cellar and the book (D2)
 

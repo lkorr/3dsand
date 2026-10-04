@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "sim/world.h"   // PowderMassOfState
+
 const char* CircleVerdictName(CircleVerdict v) {
   switch (v) {
     case CircleVerdict::Closed: return "closed";
@@ -32,8 +34,8 @@ bool CircleFindFeet(const CircleProbe& probe, IVec3 at, int32_t search, int32_t&
   // or one into the floor) down to `search` below it.
   for (int32_t y = at.y + 2; y >= at.y - search; y--) {
     bool k1 = false, k2 = false;
-    const uint32_t below = probe.matAt(probe.ctx, at.x, y - 1, at.z, k1);
-    const uint32_t here = probe.matAt(probe.ctx, at.x, y, at.z, k2);
+    const uint32_t below = probe.wordAt(probe.ctx, at.x, y - 1, at.z, k1) & 0xFFFu;
+    const uint32_t here = probe.wordAt(probe.ctx, at.x, y, at.z, k2) & 0xFFFu;
     if (!k1 || !k2) {
       known = false;
       return false;
@@ -64,12 +66,13 @@ CircleShape ScanCircle(const CircleProbe& probe, const CircleParams& p, int32_t 
   auto wall = [&](int32_t x, int32_t z) -> int {
     for (int32_t y = feetY - p.slabBelow; y <= feetY + p.slabAbove; y++) {
       bool k = false;
-      const uint32_t m = probe.matAt(probe.ctx, x, y, z, k);
+      const uint32_t w = probe.wordAt(probe.ctx, x, y, z, k);
       if (!k) {
         out.unknownAt = IVec3{x, y, z};
         return -1;
       }
-      if (m == p.saltMat) return 1;
+      if ((w & 0xFFFu) == p.saltMat && PowderMassOfState((w >> 12) & 15u) >= p.minEighths)
+        return 1;
     }
     return 0;
   };

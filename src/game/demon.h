@@ -76,6 +76,7 @@ struct DemonCircleCfg {
   int32_t recheckTicks = 15;    // re-read cadence while contained
   int32_t leadTicks = 8;        // cast -> arrival (the fetches land)
   int32_t floorSearch = 12;     // cells below the impact to look for a floor
+  int32_t minEighths = 4;       // a salt cell walls with this much of a cell in it
 };
 
 struct DemonLibrary {
@@ -124,7 +125,10 @@ struct PendingSummon {
 struct DemonWorld {
   static constexpr size_t kMaxPending = 8;    // casts in flight (rule 2)
   static constexpr size_t kMaxLive = 16;      // demons this world tracks
-  static constexpr int32_t kMaxFetchPerSummon = 48;
+  // A 4 m escape radius reads up to ~100 chunks round the arrival; the
+  // nearest first. The fetch queue drains World::kFetchPerTick a tick, so
+  // this is two ticks of it, inside the lead.
+  static constexpr int32_t kMaxFetchPerSummon = 128;
   DemonLibrary lib;
   bool loaded = false;
   std::string loadLog;

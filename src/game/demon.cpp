@@ -63,6 +63,7 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
       c.recheckTicks = std::clamp(j.value("recheckTicks", c.recheckTicks), 1, 300);
       c.leadTicks = std::clamp(j.value("leadTicks", c.leadTicks), 1, 60);
       c.floorSearch = std::clamp(j.value("floorSearch", c.floorSearch), 1, 48);
+      c.minEighths = std::clamp(j.value("minEighths", c.minEighths), 1, 8);
       continue;
     }
     DemonDef d;
@@ -129,12 +130,12 @@ bool InMirror(const World& world, IVec3 wc) {
   return cx >= 0 && cy >= 0 && cz >= 0 && cx < 3 && cy < 3 && cz < 3;
 }
 
-uint32_t StoreMatAt(void* ctx, int32_t x, int32_t y, int32_t z, bool& known) {
+uint32_t StoreWordAt(void* ctx, int32_t x, int32_t y, int32_t z, bool& known) {
   const StoreCtx& c = *(const StoreCtx*)ctx;
   const uint32_t* w = ChunkWords(*c.world, IVec3{x >> 4, y >> 4, z >> 4});
   known = w != nullptr;
   if (!w) return 0;
-  return w[(size_t)(((z & 15) * (int)kChunk + (y & 15)) * (int)kChunk + (x & 15))] & 0xFFFu;
+  return w[(size_t)(((z & 15) * (int)kChunk + (y & 15)) * (int)kChunk + (x & 15))] & 0xFFFFu;
 }
 
 bool StorePassable(void* ctx, uint32_t m) {
@@ -149,24 +150,36 @@ uint32_t MatByName(const std::vector<MaterialDef>& mats, const std::string& n) {
   return 0;
 }
 
-// Ask the fetch cache for every chunk in [lo, hi] neither store holds, up to
-// `cap`. Coalesced by the world if already queued; refused if not resident.
+// Ask the fetch cache for every chunk in [lo, hi] the mirror does not hold,
+// NEAREST THE MIDDLE FIRST, up to `cap` (a fill reads outward from its start,
+// so the near chunks are the ones that decide). Coalesced by the world if
+// already queued; refused if not resident.
 void RequestMissing(World& world, IVec3 lo, IVec3 hi, int32_t cap) {
-  int32_t n = 0;
+  const IVec3 mid{(lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2};
+  std::vector<std::pair<int64_t, IVec3>> want;
   for (int cz = lo.z; cz <= hi.z; cz++)
     for (int cy = lo.y; cy <= hi.y; cy++)
       for (int cx = lo.x; cx <= hi.x; cx++) {
         const IVec3 wc{cx, cy, cz};
-        if (n >= cap) return;
         if (!world.ChunkInWindow(wc) || InMirror(world, wc)) continue;
-        world.RequestChunkFetch(wc);
-        n++;
+        const int64_t dx = cx - mid.x, dy = cy - mid.y, dz = cz - mid.z;
+        want.push_back({dx * dx + dy * dy + dz * dz, wc});
       }
+  // Distance, then coordinates: a total order, so the requests are too.
+  std::sort(want.begin(), want.end(), [](const auto& a, const auto& b) {
+    if (a.first != b.first) return a.first < b.first;
+    if (a.second.z != b.second.z) return a.second.z < b.second.z;
+    if (a.second.y != b.second.y) return a.second.y < b.second.y;
+    return a.second.x < b.second.x;
+  });
+  for (size_t i = 0; i < want.size() && (int32_t)i < cap; i++)
+    world.RequestChunkFetch(want[i].second);
 }
 
 CircleParams ParamsOf(const DemonLibrary& lib, const std::vector<MaterialDef>& mats) {
   CircleParams p;
   p.saltMat = MatByName(mats, lib.circle.material);
+  p.minEighths = (uint32_t)lib.circle.minEighths;
   p.radiusMax = std::max(1, (int32_t)std::lround(MetresToCells(lib.circle.radiusMaxM)));
   p.slabBelow = lib.circle.slabBelow;
   p.slabAbove = lib.circle.slabAbove;
@@ -291,7 +304,7 @@ uint64_t DemonArrive(TickAuthorityCtx& w, std::span<SessionTick> players,
     return 0;
   }
   StoreCtx sc{&w.world, &w.mats};
-  CircleProbe probe{&StoreMatAt, &sc, &StorePassable};
+  CircleProbe probe{&StoreWordAt, &sc, &StorePassable};
   int32_t feetY = p.at.y;
   bool known = true;
   const bool floor = CircleFindFeet(probe, p.at, d.lib.circle.floorSearch, feetY, known);
@@ -370,7 +383,7 @@ void DemonTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tic
   // ---- the living: gone, broken, held ------------------------------------------
   const WorldSnapshot& snap = w.world.Snap();
   StoreCtx sc{&w.world, &w.mats};
-  CircleProbe probe{&StoreMatAt, &sc, &StorePassable};
+  CircleProbe probe{&StoreWordAt, &sc, &StorePassable};
   bool anyContained = false;
   size_t keep = 0;
   for (size_t i = 0; i < d.live.size(); i++) {

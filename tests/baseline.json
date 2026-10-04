@@ -111,6 +111,7 @@
   "elecStun.droppedMin": "1",
   "_demonCircle_about": "demon-circle (docs/PLAN_demons.md D1): the salt ring's radius in cells (floor(dist) == r), how long a contained imp must stay inside, how soon a broken ring unbinds him (the re-read cadence is assets/demons/circle.json recheckTicks, plus snapshot latency), and how soon after that he must be out of the old circle.",
   "demonCircle.ringCells": "14",
+  "demonCircle.settleTicks": "30",
   "demonCircle.holdTicks": "150",
   "demonCircle.breakTicksMax": "40",
   "demonCircle.leaveTicksMax": "150",
