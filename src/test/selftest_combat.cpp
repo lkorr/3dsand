@@ -3146,6 +3146,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   const int ticks = (int)BaselineNumber("mobCap64.ticks", 300);
   const uint64_t starved0 = c.mobs.BleedStarved();
   const uint32_t contact0 = c.mobs.ContactHitsBilled();
+  const uint32_t contactDup0 = c.mobs.ContactPairDupsDropped();
   std::vector<double> tickMs, regMs;
   tickMs.reserve(ticks);
   regMs.reserve(ticks);
@@ -3343,9 +3344,11 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
               (unsigned long long)requests, hp0, hp1);
   std::printf("mob-cap64: %llu drips refused by the shared pot "
               "(gore.bleedOpsPerTick) over the fight; %u loose-body contact "
-              "blows billed\n",
+              "blows billed (%u more reports of an already-billed limb/striker "
+              "pair dropped)\n",
               (unsigned long long)(c.mobs.BleedStarved() - starved0),
-              c.mobs.ContactHitsBilled() - contact0);
+              c.mobs.ContactHitsBilled() - contact0,
+              c.mobs.ContactPairDupsDropped() - contactDup0);
   std::printf("mob-cap64: slots %u limb bodies (peak %u per creature), %u "
               "micro limbs; peak %u/%u slots, %u Jolt bodies, %u/%u brick "
               "records, %zu/%u pool words\n",

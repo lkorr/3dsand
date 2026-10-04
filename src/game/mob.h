@@ -6335,6 +6335,9 @@ class MobSystem {
   void ClearShockCues() { shockCues_.clear(); }
   uint64_t ShockAttacksDropped() const { return shockAttacksDropped_; }
   uint32_t ContactHitsBilled() const { return contactHitsBilled_; }
+  // Second and later reports of one (limb, striker) pair in one tick that the
+  // one-blow-per-pair rule dropped (ApplyContactDamage), all ticks.
+  uint32_t ContactPairDupsDropped() const { return contactPairDups_; }
 
   // THE DIRECTIONAL HALF OF A LANDED BLOW (Mob::HitReact). By body handle for
   // the reason Damage is: the melee sweep knows a Jolt body and a travel
@@ -8332,6 +8335,7 @@ class MobSystem {
   std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature
   uint32_t contactHitsBilled_ = 0;  // ApplyContactDamage: contacts billed
+  uint32_t contactPairDups_ = 0;    // ...reports of an already-billed pair dropped
   ShockCounters shockCounters_;      // QueueShockQueries / ApplyShocks
   std::vector<ShockCue> shockCues_;  // ApplyShocks -> the frame's Cues::Shock
   void PushShockCue(const Mob& m, int limb, float peakP);

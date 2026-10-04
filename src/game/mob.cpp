@@ -11739,19 +11739,26 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
     if (a.limb != b.limb) return a.limb < b.limb;
     return a.other < b.other;
   });
-  // A CAPSULE READING IS NOT A SECOND BLOW: a rock that touched a player's
-  // capsule AND the limb the capsule resolves to, in one step, is one blow
-  // (the harder reading, sorted first). Only capsule-derived entries are
-  // dropped, so a limb-on-limb report is billed exactly as it always was.
+  // ONE BLOW PER (LIMB, STRIKER) PER TICK (PLAN_fight64_perf M, 2026-10-04).
+  // Jolt reports a contact per touching SUB-SHAPE pair, so a box-compound gib
+  // touching a limb produced one report per box in contact and billed the
+  // same touch several times -- the damage a thrown thing did was a function
+  // of how its collider happened to be built (package P's convex hulls billed
+  // 207 blows in the natural fight where the compounds billed 407). The
+  // hardest reading of each pair is kept (sorted first) and the rest dropped,
+  // whatever produced them: a sub-shape, or a player's capsule AND the limb
+  // it resolves to (the W2-K rule this generalises).
   {
     std::vector<Hit> uniq;
     for (const Hit& h : hits) {
       bool dup = false;
       for (const Hit& u : uniq)
-        if (u.limb == h.limb && u.other == h.other &&
-            (u.viaCapsule || h.viaCapsule))
+        if (u.limb == h.limb && u.other == h.other) {
           dup = true;
+          break;
+        }
       if (!dup) uniq.push_back(h);
+      else contactPairDups_++;
     }
     hits.swap(uniq);
   }
