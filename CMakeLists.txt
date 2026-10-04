@@ -554,6 +554,7 @@ add_library(sandvox_core OBJECT
   src/game/spell.cpp
   src/game/demon.cpp
   src/game/demon_circle.cpp
+  src/game/demon_seals.cpp
   # demons D4: creatures that cast, blink, the demon spell kit (game/demon_cast.h).
   src/game/demon_cast.cpp
   src/game/spellgraph.cpp
@@ -648,6 +649,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_chem.cpp
   src/test/selftest_elec_strike.cpp
   src/test/selftest_demon.cpp
+  src/test/selftest_demon_seals.cpp
   # demons D4: gate demon-cast.
   src/test/selftest_demon_cast.cpp
   src/test/selftest_elec_play.cpp

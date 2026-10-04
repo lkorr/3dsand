@@ -1,0 +1,16 @@
+{
+  "//": "SEALS, CANDLES, STRENGTH, GAZE (docs/PLAN_demons.md D3; game/demon_seals.h). Only salt makes the ring (circle.json); every other seal is a small PILE lying in a BAND round it, inside or outside the ring, and each cuts one CHANNEL of a contained demon's: move (walking out), cast_out (its spells leaving the circle), blink (teleporting), touch (a blow across the ring). Re-read whenever the circle is (a chunk it overlaps awake, or circle.json recheckTicks).",
+  "//seals": "material (by name) -> the channel it severs. POTENCY of a channel = sum of perCell x the band's mass of that material in whole cells (powder grain mass and liquid fullness count in eighths; a solid is a whole cell). SEVERED iff potency >= the demon's `resist` for that channel (assets/demons/<name>.json). cellsPerPoint: the circle's STRENGTH gains one point per this many whole cells of it in the band (0 = adds none). Salt is here too: the ring's own mass is the `move` seal and most of a circle's strength (a 2-wide ring of radius 1.5 m is ~180 cells = 36 points; an imp is 20).",
+  "seals": [
+    { "material": "salt",        "severs": "move",     "perCell": 1, "cellsPerPoint": 5 },
+    { "material": "sulfur",      "severs": "cast_out", "perCell": 2, "cellsPerPoint": 2 },
+    { "material": "quicksilver", "severs": "blink",    "perCell": 2, "cellsPerPoint": 2 },
+    { "material": "iron",        "severs": "touch",    "perCell": 1, "cellsPerPoint": 2 }
+  ],
+  "//band": "The annulus round the circle's centroid that counts: from inM inside the inside's furthest column to outM beyond it (metres; the Harrowby cellar's piles sit 0.5-0.85 m out from the ring's inner edge). Slab: one row below the demon's feet to slabAbove rows above. A cell with less than minEighths of a cell in it is a film, not a pile (wind-scattered grains).",
+  "band": { "inM": 0.6, "outM": 0.9, "slabAbove": 2, "minEighths": 2 },
+  "//candles": "Lit candles in the band (each `material` cell = one flame; rain or a splash puts one out, which is free sim behaviour), up to slabAbove rows above the feet. Each adds perCandle points of strength, up to `max` candles.",
+  "candles": { "material": "candle_flame", "slabAbove": 6, "perCandle": 3, "max": 8 },
+  "//gaze": "Per demon (`gaze`: hold | avert). Each tick a contained demon's summoner is within rangeM of its head, the camera's forward is tested against a coneDeg cone at the head: looking away from a `hold` demon, or at an `avert` one, raises the strain by strainRise; keeping the rule lowers it by strainFall. A full meter (strainMax) costs the circle strainPenalty points, to at most strainLossMax in all, and empties. Never an instant fail. 300 at +3 a tick = 3.3 s of staring.",
+  "gaze": { "coneDeg": 18, "rangeM": 8, "strainRise": 3, "strainFall": 1, "strainMax": 300, "strainPenalty": 8, "strainLossMax": 32 }
+}
