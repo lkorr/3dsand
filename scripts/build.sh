@@ -19,6 +19,7 @@
 #   bash scripts/build.sh --selftest            # build + run selftest
 #   bash scripts/build.sh --config Debug        # build Debug
 #   bash scripts/build.sh --configure           # cmake configure first
+#   bash scripts/build.sh --lto                 # RELEASE build: Jolt link-time optimization (slow link)
 #   bash scripts/build.sh --fresh               # configure from an empty cache
 #   bash scripts/build.sh --target sandvox      # explicit target
 #   bash scripts/build.sh --gen vs|ninja        # force a generator (see below)
@@ -49,6 +50,11 @@ RUN_CONFIGURE=false
 GEN_WANT="${SANDVOX_GENERATOR:-auto}"   # auto | ninja | vs
 WANT_FRESH=false                        # --fresh: drop CMakeCache.txt first
 EXTRA_ARGS=()
+# Link-time optimization is for RELEASES only (owner, 2026-10-04). Jolt's own
+# CMake defaults INTERPROCEDURAL_OPTIMIZATION ON, which compiles every Jolt TU
+# with /GL and makes every sandvox.exe link re-run whole-program codegen for
+# all of Jolt -- minutes per link while iterating. Off unless --lto.
+WANT_LTO=OFF
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -58,6 +64,7 @@ while [ $# -gt 0 ]; do
     --config)       CONFIG="$2"; shift 2 ;;
     --target)       TARGET="$2"; shift 2 ;;
     --gen)          GEN_WANT="$2"; shift 2 ;;
+    --lto)          WANT_LTO=ON; shift ;;
     *)              EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
@@ -113,13 +120,29 @@ fi
 # FetchContent step) is retried rather than handed to the build tool.
 GEN_FILE="$ROOT/build/build.ninja"
 [ "$GEN" = "$GEN_VS" ] && GEN_FILE="$ROOT/build/sandvox.sln"
+# A cache configured with the other LTO setting is re-configured in place.
+HAVE_LTO=""
+[ -f "$CACHE" ] && HAVE_LTO="$(sed -n 's/^SANDVOX_LTO:BOOL=//p' "$CACHE" | tr -d '')"
+if [ "$HAVE_LTO" != "$WANT_LTO" ]; then
+  [ -f "$CACHE" ] && echo "build.sh: SANDVOX_LTO ${HAVE_LTO:-unset} -> $WANT_LTO (re-configure; Jolt recompiles once)"
+  RUN_CONFIGURE=true
+fi
 if [ "$RUN_CONFIGURE" = true ] || [ ! -f "$CACHE" ] || [ ! -f "$GEN_FILE" ]; then
-  echo "build.sh: configuring ($GEN)..."
+  echo "build.sh: configuring ($GEN, LTO $WANT_LTO)..."
   if [ "$GEN" = "$GEN_VS" ]; then
-    cmake "${FRESH[@]+"${FRESH[@]}"}" -S "$ROOT" -B "$ROOT/build" -G "$GEN" -A x64
+    cmake "${FRESH[@]+"${FRESH[@]}"}" -S "$ROOT" -B "$ROOT/build" -G "$GEN" -A x64 -DSANDVOX_LTO=$WANT_LTO
   else
-    cmake "${FRESH[@]+"${FRESH[@]}"}" -S "$ROOT" -B "$ROOT/build" -G "$GEN"
+    cmake "${FRESH[@]+"${FRESH[@]}"}" -S "$ROOT" -B "$ROOT/build" -G "$GEN" -DSANDVOX_LTO=$WANT_LTO
   fi
+fi
+
+# Builds run BELOW NORMAL priority so the desktop (the owner's browser, a live
+# game) gets the CPU first. Windows children inherit the priority class, so
+# lowering this shell covers cmake, ninja, cl and link; the sccache server is
+# a long-lived daemon that spawns the compilers itself, so it is lowered too.
+# SANDVOX_BUILD_PRIORITY=normal opts out.
+if [ "${SANDVOX_BUILD_PRIORITY:-belownormal}" != "normal" ] && [ -r /proc/$$/winpid ]; then
+  powershell -NoProfile -Command "\$ErrorActionPreference='SilentlyContinue'; (Get-Process -Id $(cat /proc/$$/winpid)).PriorityClass='BelowNormal'; Get-Process sccache | ForEach-Object { \$_.PriorityClass='BelowNormal' }" >/dev/null 2>&1 || true
 fi
 
 export CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS
