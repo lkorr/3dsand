@@ -2525,7 +2525,16 @@ held charge is SOLVED as the world would solve the same voxels:
   conducting neighbours in its own slot -- `elecEnter`),
   solved to its least fixpoint by a widest-path search (integer; the answer
   does not depend on visit order). The world P comes from the grid; nothing is
-  stored between ticks (the body's charge fades with the world's). COVER: a
+  stored between ticks (the body's charge fades with the world's). The body's
+  cells are placed with the pose it ASKED with (`Mob::elecPoses_`, a ring of
+  K + 3 per-slot transforms keyed by tick): the answer is K + 1 ticks old,
+  and a body moving a cell a tick read the field where it no longer was
+  (`elec-crowd`, 2 of 16 shocked before). CONTACT is the six face cells and,
+  across ONE air cell no part of the body fills, the cell beyond: a body
+  cell is a bin placed by its centre, so a sole resting on a plate can bin a
+  cell above the one touching it (measured: `elec-stun`'s zombie, every
+  foot cell one air cell over the copper) -- the slack wave 1 had by
+  dilating each limb box a cell, and no more. COVER: a
   base-limb cell takes a charged world cell across a face only when no WORN
   shell stands in the way -- no shell cell in its own world cell or that
   one, and no shell met by `Mob::WornShellAlong` (the burn pass's ray, one
