@@ -1150,7 +1150,7 @@
     },
     {
       "id": "skin",
-      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
+      "electric": {"resist": 40, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
       "density": 1010,
       "hardness": 8,
@@ -1283,6 +1283,7 @@
     },
     {
       "id": "bone",
+      "electric": {"resist": 100},
       "arcane": 5,
       "footstep": "path",
       "class": "solid",
@@ -3032,7 +3033,7 @@
     {
       "//": "ANATOMY (assets/editor/anatomy.js; DESIGN.md §7 'What is under the skin'). The human is no longer skin all the way through: a sidecar recipe paints its interior by depth -- skin, then this, then muscle, then bone -- so a cut face, a burn-through or a peeled limb in the tuner shows layers instead of more skin. Subcutaneous flesh: the pale layer one voxel under the skin. Enters the SAME burn chain as skin (reactions.json, 'flesh + tag:hot -> flesh_cooked') so a body burns through its layers on one clock; bone has no fire rules and survives by construction.",
       "id": "flesh",
-      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
+      "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "arcane": 4,
       "class": "solid",
       "density": 950,
@@ -3055,7 +3056,7 @@
     {
       "//": "The red layer under the flesh and the bulk of a limb (see `flesh`). Denser and a little harder than skin so the derived collider's mass reads as meat, not fat; the anatomy recipe speckles it with `blood` so a cross-section is not one flat red.",
       "id": "muscle",
-      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
+      "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
       "density": 1060,
       "hardness": 10,
@@ -3149,6 +3150,7 @@
       "//": "WHAT IS INSIDE THE SKULL. Baked as the open-ended CORE of the head's anatomy recipe (assets/mobs/human.json anatomy.limbs.head), so `brain` is by definition everything the two-voxel bone shell encloses -- there is no geometric brain test anywhere, only this material. Ordinary tissue in every other respect: `rubble: blood` is what puts it in MobDef::tissue, so a wound soaks it and the rot eats it at the full rate without a single special case. What makes it different is `woundHp`, and specifically `brainHp`: every voxel of it destroyed by ANY cause -- rot, a blade, a blast, a spell -- also subtracts gore.brainHpPerVoxel flat, on top of the ordinary volume damage. That is the whole of 'a hit to the brain kills you'; death itself is the existing rule (head hp 0 -> Sever -> vital -> Die), not a new one.",
       "//id": "MUST stay at a material id <= 127: it is BAKED INTO human.vox, and a .vox palette slot >= 128 is read as an art colour, not a material (sim/voxload.h kArtPaletteBase). Inserted here, directly after `iron` (121), because 122..127 was the only free window above every id any .vox in the repo actually bakes.",
       "id": "brain",
+      "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
       "density": 1040,
       "hardness": 6,
@@ -3398,7 +3400,7 @@
     {
       "//": "A PUNCH LEAVES A MARK (docs/PLAN_impact_unarmed.md S6). gore.bruiseMat's default, and the material a BLUNT hit rewrites skin to -- the third thing a wound can turn flesh into, beside blood and rot. Skin's own hardness and density, because it IS skin: only the colour has changed, so it burns on the same clock through the same authored chain and crumbles to the same blood. The `tints` list is the one real difference and it is the whole feature: a bruise is not one colour but an AGE -- fresh red-purple, then deep purple, then the green and yellow of one a few days old -- and the art-colour quantization picks the nearest entry to whatever complexion the voxel was painted, so a green-fleshed mob bruises greenish rather than snapping to human purple (the same rule skin / flesh_cooked follow, in the same order). It reverts to the skin it covered as the wound closes (gore.woundHealSlow, MobLimb::woundWas). Far-aliased to `skin`: a bruise is not visible at cascade distance.",
       "id": "skin_bruised",
-      "electric": {"resist": 20, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred"},
+      "electric": {"resist": 40, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
       "density": 1010,
       "hardness": 8,
@@ -4844,6 +4846,7 @@
     {
       "//": "ENVENOMED TISSUE (docs/PLAN_weapon_coats.md B3; DESIGN.md 'Infection is a material'). What venom turns soft tissue into, and the second infection after the zombie's rotflesh -- a DIFFERENT rot voxel, dark and bruise-purple where the rot is green. Tagged like rotflesh (flammable, organic, dissolvable, and `infectious`, so holy water and sunwater sear it out the way they sear the rot). Crumbles to blood, so it is still the creature's tissue to every wound rule. Its `infect` block is the venom: it spreads only into SOFT tissue (tag:soft_tissue: flesh, muscle, brain, glands -- never skin, never bone, so a wound to the bone stops there) and EATS 1.5x as fast as it spreads, so it always burns itself out (floor 0). THE ARITHMETIC, per voxel (the per-voxel rule every infection runs): each envenomed cell is eaten with chance e = 0.009 a second and converts a soft-tissue neighbour with chance s = 0.006 a second (per world-voxel cell; a human's skinScale-8 lattice runs its cells 8x as often, 0.072 and 0.048, so a front crosses an arm at the same physical speed and the RATIO is unchanged). So each cell has R = s / e = 2/3 offspring on average before it is eaten -- subcritical, it always burns out -- and a dose of D cells eats D / (1 - R) = 3 D in all, having spread 2 D more. How long that takes is a birth-death process: mean H(D, R) / mu with H = sum_{i=1..D} sum_{j>=0} R^j / (i + j) and mu = 0.072 a second on a human, i.e. 61 s for a dose of 5, 89 s for 12, 108 s for 20 (a little less where the wound runs out of soft tissue to spread into). `hp` 250 per world voxel eaten on top of the volume charge: a 12-cell dose eats 36 cells (0.07 world voxels) and costs the limb about 18 hp. Books to the Infection ledger and names the death `venom`; the dead do not rise from it.",
       "id": "envenomed",
+      "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
       "density": 980,
       "hardness": 5,
@@ -4878,6 +4881,7 @@
     {
       "//": "A VENOM GLAND (docs/PLAN_weapon_coats.md B3, placed in the snake's head by package D). Organ tissue -- soft (tag:soft_tissue), crumbles to blood like the rest of the anatomy -- whose WOUND leaks venom (`bleedFluid`, the per-material bleed: the matter decides what comes out), so cutting a snake's head open spills venom you can scoop with a flask. ID NOTE: this row is appended (> 127), and a .vox palette index >= 128 is an art colour, so a mob .vox cannot paint it directly: the snake must paint a stand-in tissue and rewrite it at load (the way human.json's `garmentsBecome` turns linen into undercloth).",
       "id": "venom_gland",
+      "electric": {"resist": 8, "ignite": {"into": "flesh_cooked", "chance": 120}, "char": "flesh_charred", "shock": 1000},
       "class": "solid",
       "density": 1030,
       "hardness": 6,
@@ -4924,6 +4928,7 @@
     {
       "//": "CLOCKWORK: the gear train under an automaton's plating -- wheels, arbors, springs, all swimming in oil. Softer than the plate (30), so a blade that got through the brass bites into the works; it gushes oil (bleed 1.2) and crumbles TO oil (rubble), which is what makes it the automaton's `tissue` to every wound rule (MobDef::tissue: what crumbles to the creature's bleed). Ratchets throw sparks when struck.",
       "id": "clockwork",
+      "electric": {"resist": 3},
       "footstep": "stone",
       "class": "solid",
       "density": 7200,
@@ -4946,6 +4951,7 @@
     {
       "//": "BOILER: the firebox and drum in an automaton's chest, what drives it. Glows through any wound that opens it (emission). A blow that reaches it vents steam at the hit; a wound that BREACHES it, or the automaton's death, lets the whole head of steam go at once (`burst`, laid round the boiler the tick after, bounded like every reaction flash: game/session.cpp ReactFxAftermath). Leaks scalding water, not oil.",
       "id": "boiler",
+      "electric": {"resist": 3},
       "footstep": "stone",
       "class": "solid",
       "density": 7600,
@@ -4970,6 +4976,7 @@
     {
       "//": "COGITATOR: the automaton's mind, a difference engine of brass drums and pinned cams at the core of the head. brainHp, as the human's brain: every voxel of it destroyed by any cause also costs gore.brainHpPerVoxel, so a hit to the cogitator stops the machine. Sparks when struck.",
       "id": "cogitator",
+      "electric": {"resist": 3},
       "class": "solid",
       "density": 7000,
       "hardness": 26,
@@ -5014,6 +5021,7 @@
     {
       "//": "ALLOY: the android's endoskeleton, a titanium alloy. Hardness 180 -- within reach of steel's 200 -- so a blade that gets this far takes a twenty-second of a kerf and parting a limb through it costs 22 times skin: an android's arm does not come off to a sword, it has to be broken off or blown off. Leaks nothing; a blow on the frame sparks (struck 0.7).",
       "id": "alloy",
+      "electric": {"resist": 4},
       "footstep": "stone",
       "class": "solid",
       "density": 4500,
@@ -5036,6 +5044,7 @@
     {
       "//": "CIRCUITRY: the android's wiring and actuators, the layer between the shell and the frame. Soft (20); EVERY blow that reaches it throws a bigger spark ball (radius 2) and one in four goes along jagged ARCS (`struck.arcs`). It leaks nothing and crumbles to gravel (no coolant anywhere: owner 2026-10-03).",
       "id": "circuitry",
+      "electric": {"resist": 2, "shock": 1000},
       "class": "solid",
       "density": 2400,
       "hardness": 20,
@@ -5057,6 +5066,7 @@
     {
       "//": "POWER CELL: the android's heart, a dense glowing cell in the chest. Breach it, or kill the android, and it DISCHARGES: a crackling spray of sparks along jagged arcs (`burst` with `arcs`) that lights what burns beside it, pops hydrogen and fires gunpowder (spark's own rules, reactions.json). Bounded: one discharge per breach, one per death, laid through the capped reaction-flash path.",
       "id": "power_cell",
+      "electric": {"resist": 4},
       "class": "solid",
       "density": 3000,
       "hardness": 60,
@@ -5080,6 +5090,7 @@
     {
       "//": "NEURAL CORE: the android's mind, at the core of the head. brainHp: destroying it stops the machine as a brain wound stops a human. Arcs when struck, faintly lit.",
       "id": "neural_core",
+      "electric": {"resist": 2, "shock": 1000},
       "class": "solid",
       "density": 2600,
       "hardness": 24,

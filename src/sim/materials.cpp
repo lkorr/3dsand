@@ -538,10 +538,15 @@ static void ParseElectric(const json& m, const std::string& path, MaterialDef& d
     // a char-only block takes ignite's default.
     if (d.elec.igniteChanceMille <= 0.0) d.elec.igniteChanceMille = 10.0;
   }
+  // BODIES ONLY (wave 2 package B, mob_shock.cpp): the per-mille of a body
+  // cell's P a creature made of this material feels (hp + stun).
+  const int shock = t.value("shock", 0);
+  if (shock < 0 || shock > 1000) errors += at + ".shock must be 0..1000 per-mille\n";
+  d.elec.shockMille = (uint32_t)std::clamp(shock, 0, 1000);
   for (auto& [key, v] : t.items()) {
     (void)v;
     if (key != "resist" && key != "source" && key != "ignite" && key != "char" && key != "note" &&
-        key != "dissolved")
+        key != "dissolved" && key != "shock")
       errors += at + ": unknown key \"" + key + "\"\n";
   }
 }

@@ -7,6 +7,8 @@
 #include "sim/world.h"
 
 static_assert(kElecChunk == kChunk, "elec.h restates world.h kChunk");
+static_assert(kElecLiveMobs == kMaxLiveMobs,
+              "elec.h kElecLiveMobs restates world.h kMaxLiveMobs: the body query is sized from it");
 static_assert(kElecWindowChunks == kNumChunks, "elec.h restates world.h kNumChunks");
 static_assert(kElecChunkVol == kChunkVol, "elec.h restates world.h kChunkVol");
 // The kernel's halo walk and sweeps assume a 16-cell chunk edge and 256-thread

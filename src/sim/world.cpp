@@ -96,7 +96,10 @@ constexpr uint64_t kHeatSnapBytes = kHeatSnapWords * 4;
 constexpr uint64_t kElecSnapOff = kHeatSnapOff + kHeatSnapBytes;
 constexpr uint64_t kElecSnapBytes = 32 * 4;
 constexpr uint64_t kElecQueryOff = kElecSnapOff + kElecSnapBytes;
-constexpr uint64_t kSlotBytes = kElecQueryOff + kElecQueryResBytes;
+// ...and their grids (wave 2 package B: P | air for every cell of each body's
+// box, the boxes' words back to back), copied only as far as this tick used.
+constexpr uint64_t kElecQueryGridOff = kElecQueryOff + kElecQueryResBytes;
+constexpr uint64_t kSlotBytes = kElecQueryGridOff + kElecQueryGridBytes;
 
 // Every WorldSnapshot the pipeline hands around is pre-sized: the readback
 // callback memcpys straight into these arrays. One definition, so the published
@@ -740,9 +743,17 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   enc.CopyTracked(pass::Buf::ElecMeta, elecMeta, 0, s.buf, kElecSnapOff, kElecSnapBytes);
   s.elecQueries.clear();
   s.elecQueries.swap(elecInFlight_);
-  if (!s.elecQueries.empty())
+  if (!s.elecQueries.empty()) {
     enc.CopyTracked(pass::Buf::ElecMeta, elecMeta, (uint64_t)kEmQuery * 4, s.buf, kElecQueryOff,
                     (uint64_t)s.elecQueries.size() * kElecQueryResWords * 4);
+    uint32_t gridWords = 0;
+    for (const ElecQuery& q : s.elecQueries)
+      if (q.gridOff != kElecQueryNoGrid)
+        gridWords = std::max(gridWords, q.gridOff + q.gridWords);
+    if (gridWords != 0)
+      enc.CopyTracked(pass::Buf::ElecMeta, elecMeta, (uint64_t)kEmQueryGrid * 4, s.buf,
+                      kElecQueryGridOff, (uint64_t)gridWords * 4);
+  }
   enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
   // Gas: the live per-page counts and the 8-word counter header. Async and one
   // tick latent like every other row here — no gas path anywhere reads back
@@ -1049,7 +1060,18 @@ void World::KickReadback() {
             h.charged = r[1];
             h.sumP = r[2];
             h.cells = r[3];
-            out.elecHits.push_back(h);
+            const ElecQuery& q = sl.elecQueries[k];
+            for (int a = 0; a < 3; a++) h.lo[a] = q.lo[a];
+            ElecQueryDims(q, h.dims);
+            // The grid, when the box had one and its field held charge
+            // anywhere (an unlit field leaves the grid unwritten: elecQuery).
+            if (q.gridOff != kElecQueryNoGrid && q.gridWords != 0 && r[3] != 0) {
+              const size_t cells = (size_t)h.dims[0] * h.dims[1] * h.dims[2];
+              h.grid.resize(cells);
+              const uint8_t* g = p + kElecQueryGridOff + (uint64_t)q.gridOff * 4;
+              std::memcpy(h.grid.data(), g, cells * 2);
+            }
+            out.elecHits.push_back(std::move(h));
           }
           uint32_t sm[kSolMetaHdrWords] = {};
           std::memcpy(sm, p + kSolMetaSnapOff, kSolMetaSnapBytes);
@@ -1288,6 +1310,7 @@ void World::InvalidateSnapshot() {
   // and the boxes in flight are the CURRENT tick's.)
   elecHitsPending_.clear();
   elecQueryQueue_.clear();
+  elecQueryGridUsed_ = 0;
   elecSourceSeen_ = false;
   // ...and far-landing deposits of the dead world (chunk tickets P2).
   ticketDepositsPending_.clear();

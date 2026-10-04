@@ -1845,6 +1845,41 @@ struct BiteHit {
   uint32_t seed = 0;         // tear + stain draw key
 };
 
+// ---- A BODY CONDUCTS BY ITS MATERIAL (electricity wave 2, package B) --------
+// mob_shock.cpp's view of one rig slot's lattice at WORLD pitch: the slot's
+// voxels binned into cells of one world voxel (lattice coordinate / scale,
+// floored), each cell carrying what the charge field would see if those
+// voxels were a cell of the world -- the resist of the matter (materials.json
+// electric.resist, harmonic over the cell's voxels: an insulator voxel carries
+// nothing), under the world's WET rule (a voxel under a conducting coat takes
+// min(resist, the wet table at its coat amount)). DERIVED and disposable, in
+// two layers: the GEOMETRY (which cell each voxel is in, which voxels are
+// exposed, which cells exist) keyed on a digest of the voxels' positions and
+// presence, rebuilt only when that moves (a cut, a burn-through); the cells'
+// resists re-accumulated from the materials and coats in the same pass that
+// checks the key. Never saved, never hashed.
+struct ElecBodyCell {
+  int16_t c[3] = {0, 0, 0};  // the cell, in slot-lattice world cells
+  uint16_t bulk = 4095;      // resist crossing it (kElecResistInsulator = insulator)
+  uint16_t entry = 4095;     // resist entering it from outside the slot (its EXPOSED voxels)
+  uint16_t feel = 0;         // per-mille felt (electric.shock, voxel-weighted)
+  uint16_t ohmMat = 0;       // its commonest material with electric ignite / char data
+};
+struct ElecSlotCache {
+  uint64_t geomKey = 0;      // digest of the geometry it was built from (0 = never)
+  uint32_t scale = 0;
+  // The resists are re-accumulated at most every kElecSlotRefreshTicks ticks
+  // while the slot is charged (a coat and a sear are slow next to the tick);
+  // the table generation and wet knob they were taken at, and when.
+  uint32_t gen = 0, wet = 0, lastFull = 0;
+  bool fresh = false;
+  IVec3 cmin{}, cdim{};      // the cells' box, and a dense index into `cells`
+  std::vector<int32_t> at;   // (z * cdim.y + y) * cdim.x + x -> cell, -1 = none
+  std::vector<int32_t> vcell;   // per lattice voxel: its cell, -1 = empty
+  std::vector<uint8_t> vexp;    // per lattice voxel: exposed (an empty neighbour)
+  std::vector<ElecBodyCell> cells;
+};
+
 class MobSystem;
 struct ItemDef;
 struct ItemCover;
@@ -2282,9 +2317,32 @@ class Mob {
     uint32_t ignited = 0;        // voxels set alight
     uint32_t twitches = 0;
     float wetMax = 0.0f;         // the wettest touching limb's conducting coat
-    bool armour = false;         // wore a conductor on the last shocked tick
+    bool armour = false;         // a worn conductor CARRIED charge on a shocked tick
+    // Wave 2 (the body conducts by its material, mob_shock.cpp):
+    uint32_t cellsPeak = 0;      // most body cells charged in one tick
+    uint32_t peakCellP = 0;      // the highest P any body cell reached
+    uint32_t ohmic = 0;          // body cells the current seared / lit / charred
+    uint32_t ohmicVoxels = 0;    // ...the voxels they rewrote
+    uint32_t crackles = 0;       // sparks / arcs the body threw into the air
+    uint32_t viaBody = 0;        // ticks charge reached it only through another body
+    // Attribution: the rig slots that ever took the world's charge directly
+    // (bit = slot, 63 = any past it), and the charged world contacts a worn
+    // shell stood in front of (summed over ticks).
+    uint64_t seededSlots = 0;
+    uint32_t covered = 0;
   };
   const ShockRecord& Shock() const { return shock_; }
+  // THE CHARGE IN THE BODY, for presentation (a render pass's glow on a
+  // charged body; electricity wave 2 package B exposes it, package D left the
+  // render side open): the highest P any world-pitch cell of rig slot `slot`
+  // reached in the last conduction solve (mob_shock.cpp), or 0 when that solve
+  // is older than `tick - 1` or the slot carried nothing. Derived from the
+  // fixed-latency answer, so it lags the field by World::kSnapshotLatency + 1
+  // ticks like every shock; never saved, never hashed.
+  uint32_t ElecSlotCharge(int slot, uint32_t tick) const {
+    if (slot < 0 || slot >= (int)elecSlotP_.size() || tick - elecSolveTick_ > 1u) return 0u;
+    return elecSlotP_[slot];
+  }
   // Take `voxels` of blood out of the creature: charges
   // voxels * gore.bleedHpPerVoxel across the live authored limbs in proportion
   // to what each still has, and kills the creature through Die() when the
@@ -4687,6 +4745,25 @@ class Mob {
   // The shock (Stunned / Shock above).
   uint32_t stunUntil_ = 0;
   ShockRecord shock_;
+  // Per rig slot, the slot's lattice at world pitch for the shock's
+  // conduction (ElecSlotCache; mob_shock.cpp). Derived, never saved.
+  std::vector<ElecSlotCache> elecCache_;
+  // The last conduction's answer, per rig slot: the highest P any of its
+  // cells reached, and the tick of that solve (ElecSlotCharge).
+  std::vector<uint32_t> elecSlotP_;
+  uint32_t elecSolveTick_ = 0;
+  // THE POSE THE BODY ASKED WITH: every rig slot's transform on each tick its
+  // box was queued, kept for the K + 1 ticks the answer takes
+  // (World::kSnapshotLatency). The conduction places the body's cells in the
+  // answer's grid with the pose of the SAME tick -- a body moving a cell a
+  // tick (falling, wading, knocked down) otherwise reads the field where it no
+  // longer is. A small ring, keyed by tick; derived, never saved.
+  struct ElecPose {
+    uint32_t tick = 0;
+    bool valid = false;
+    std::vector<BodyTransform> xf;
+  };
+  std::vector<ElecPose> elecPoses_;
   float burnFrac_ = 0.0f;
   float burnCap_ = 1.0f;
   // The lattice changed since burnFrac_ was taken. Set by the burn pass and by
@@ -6060,28 +6137,54 @@ class MobSystem {
                          std::vector<ParticleSpawn>& spawns);
   // ---- SHOCKS REACH BODIES (docs/PLAN_electricity.md E4; mob_shock.cpp) ----
   //
-  // QueueShockQueries: one box per live base limb of every living body this
-  // machine steps (the avatars first, then mobs_), dilated by a cell, queued
-  // on the world's body query -- only while World::ElecMayBeLive says the
-  // field can hold charge, so a world with none asks nothing. End of PreTick.
+  // QueueShockQueries: ONE box per living body this machine steps (the
+  // avatars first, then mobs_) -- the union of its limbs, worn shells and held
+  // items under the current pose, dilated by a cell -- with its GRID (P | air
+  // per cell), queued on the world's body query only while
+  // World::ElecMayBeLive says the field can hold charge, so a world with none
+  // asks nothing. End of PreTick. (Wave 1 asked one box per limb and ran out
+  // of boxes at ~8 bodies.)
   //
   // ApplyShocks: the answers of tick T - kSnapshotLatency - 1 (the fixed
-  // latency, World::TakeElecHits), applied per body: Electric hp on the
-  // touching limbs and the torso, the stun, a lightning-class knock-down, a
-  // chance of fire on hair / clothes. Then TickStuns: the twitch. Both at the
-  // top of PreTick, before the burn pass, so a voxel a shock lit burns this
-  // tick. Everything here is a pure function of (tick, the answers, the
-  // bodies): integer hashes for every roll.
+  // latency, World::TakeElecHits). A body whose box held charge CONDUCTS it:
+  // every rig slot's lattice at world pitch (ElecSlotCache) takes its
+  // materials' electric resist under the world's wet rule, charge enters
+  // through the cells touching charged world cells and runs through the body
+  // -- and on into a body touching it -- by the field's own max-plus rule.
+  // What follows is the materials': hp and stun by electric.shock (what the
+  // matter FEELS), ohmic sear / ignition / char by electric.ignite / char at
+  // the world's own rate, a crackle into the air at the world's thresholds
+  // (ops, recorded), a lightning-class knock-down and a chance of fire on hair
+  // / clothes. Then TickStuns: the twitch. Both at the top of PreTick, before
+  // the burn pass, so a voxel a shock lit burns this tick. Everything here is
+  // a pure function of (tick, the answers, the bodies): integer math for the
+  // conduction, integer hashes for every roll.
   void QueueShockQueries(uint32_t tick, World& world);
-  void ApplyShocks(uint32_t tick, World& world);
+  void ApplyShocks(uint32_t tick, World& world, std::vector<CellOp>& cellOps);
   void TickStuns(uint32_t tick);
   struct ShockCounters {
     uint64_t queued = 0;       // boxes asked
+    uint64_t refused = 0;      // bodies the query could not take (cap or grid budget)
     uint64_t hitsRead = 0;     // answers drained
     uint64_t hitsCharged = 0;  // ...with P > 0 in the box
     uint64_t bodiesShocked = 0;  // body-ticks a shock was applied
     uint64_t stale = 0;        // answers for a body no longer here / alive
+    uint64_t bodiesSolved = 0;   // body-ticks the conduction ran over
+    uint64_t linked = 0;         // ...of them uncharged bodies touching a charged one
+    uint64_t cellsSolved = 0;    // body cells those solves covered
+    uint64_t cacheBuilds = 0;    // slot lattices binned (ElecSlotCache misses)
+    uint64_t cacheHits = 0;      // reused as it stood (within kElecSlotRefreshTicks)
+    uint64_t cacheAccums = 0;    // resists re-accumulated, geometry kept
+    uint64_t ohmicCells = 0, ohmicVoxels = 0;
+    uint64_t ohmicRefused = 0;   // rolls past kShockOhmicCellsPerTick
+    uint64_t crackleOps = 0, crackleRefused = 0;
+    // Wall time ApplyShocks spent on ticks with answers (diagnostic only).
+    uint64_t applyNanos = 0, applyCalls = 0, refreshNanos = 0;
   };
+  // Per tick: body cells an ohmic roll may rewrite, and crackle cell ops all
+  // bodies together may emit (charged BEFORE emission, refusals counted).
+  static constexpr uint32_t kShockOhmicCellsPerTick = 64;
+  static constexpr uint32_t kShockCrackleOpsPerTick = 16;
   const ShockCounters& ShockStats() const { return shockCounters_; }
   // ---- THE SHOCK'S SOUND (wave 2, package E) -------------------------------
   // One entry per body per tick a shock was applied (ApplyShocks), drained by
@@ -7826,7 +7929,38 @@ class MobSystem {
   std::vector<uint8_t> matHot_;         // carries tag:hot
   // mat -> its electric.resist (0 = insulator), for the shock's wet coat and
   // conducting armour (mob_shock.cpp). Rebuilt with the rest on a reload.
-  std::vector<uint8_t> matElecResist_;
+  std::vector<uint16_t> matElecResist_;
+  // ...and the rest of a material's electric block, as a BODY cell made of it
+  // uses it (wave 2, mob_shock.cpp): what it feels (electric.shock), what the
+  // current turns it into (ignite.into with an air face, char without) and
+  // the ignition chance cap, in the field's own units (PackElecMaterial w2).
+  struct ElecMat {
+    uint16_t feel = 0;
+    uint16_t igniteInto = 0, charInto = 0;
+    uint32_t igniteCap = 0;
+  };
+  std::vector<ElecMat> matElec_;
+  uint32_t elecMatGen_ = 0;   // bumped per reload: ElecSlotCache keys digest it
+  // The crackle tiers' materials and sources (Simulation::UploadTables finds
+  // them the same way, by name: `spark`, `arc`).
+  uint32_t crackleLoMat_ = 0, crackleLoSrc_ = 0, crackleHiMat_ = 0, crackleHiSrc_ = 0;
+  // Rewrite a rig slot's voxels the current turned (ohmic sear / ignition /
+  // char): (lattice index, new material) pairs. Puts every rewritten voxel on
+  // the burn front and pokes the micro brick, as IgniteOneLimb does; returns
+  // the voxels rewritten.
+  uint32_t ElecRewriteLimb(BurnLimbView& v,
+                           const std::vector<std::pair<uint32_t, uint32_t>>& rw);
+  // mob_shock.cpp: one tick's answers (ApplyShocks splits by tick), and the
+  // binning of one slot's lattice into world-pitch cells.
+  void ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                      const ElecHit* hits, size_t nHits);
+  // Returns 0 = reused as it stood, 1 = resists re-accumulated, 2 = geometry
+  // rebuilt too. Re-accumulates at most every kElecSlotRefreshTicks ticks
+  // (tick-keyed, so deterministic) unless the lattice changed size or the
+  // table / wet knob moved.
+  static constexpr uint32_t kElecSlotRefreshTicks = 4;
+  int RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_t tick,
+                           ElecSlotCache& c);
   // IS AN INFECTION: carries an `infect` block (materials.json, materials.h
   // MaterialDef::infect). Was "carries tag:infectious" until the infection
   // became data (PLAN_weapon_coats B1); the tag still exists for the

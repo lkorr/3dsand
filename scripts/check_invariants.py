@@ -3384,6 +3384,10 @@ _ELEC_CONSTS = {
     "EM_QUERY": "kEmQuery", "EP_QUERY": "kEpQuery", "EP_QUERY_BOXES": "kEpQueryBoxes",
     "ELEC_QUERY_MAX": "kElecQueryMax", "ELEC_QUERY_BOX_WORDS": "kElecQueryBoxWords",
     "ELEC_QUERY_RES_WORDS": "kElecQueryResWords", "ELEC_QUERY_AXIS_MAX": "kElecQueryAxisMax",
+    # Wave 2 (package B): each body box's grid, in elecMeta after the answers.
+    "EM_QUERY_GRID": "kEmQueryGrid", "ELEC_QUERY_GRID_WORDS": "kElecQueryGridWordsMax",
+    "ELEC_QUERY_GRID_PMAX": "kElecQueryGridPMax", "ELEC_QUERY_GRID_AIR": "kElecQueryGridAir",
+    "ELEC_QUERY_NO_GRID": "kElecQueryNoGrid",
 }
 
 

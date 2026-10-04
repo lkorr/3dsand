@@ -973,6 +973,11 @@ const char* const kOrder[] = {
     // The endgame: the PLAYER stunned (TickAuthority zeroes its command), on
     // the rig session's own avatar; despawned and regenerated on the way out.
     "elec-player-stun",
+    // Electricity wave 2 (package B): one query box per body, so a full crowd
+    // is answered (the far ones in charged water shocked, the rest not), and
+    // the body's MATERIAL decides (insulating soles, iron ones, a wooden body
+    // that chars and feels nothing, an android's circuitry). Same discipline.
+    "elec-crowd", "elec-body-matter",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

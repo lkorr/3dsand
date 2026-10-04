@@ -2070,8 +2070,12 @@ conducting liquid falls to with this material dissolved in it at saturation
 (salt 2: brine). Authored: drawn copper `copper_bar` 1 (the solid; `copper`
 FILINGS are a powder, 3), silver / gold 1, aluminium / quicksilver / sodium 2,
 iron / steel / brass / molten iron 3, lead / molten salt / acid 4, lye 5, water
-6, blood / coolant 8, lava 10, flesh / skin / muscle 20, molten glass 20, shore
-mud 30, wood (every plank, log and bark) 1,500 (wave 2; it was 60, and one bolt
+6, blood / coolant 8, lava 10, molten glass 20, shore mud 30, the BODY
+materials (wave 2 package B, "Bodies conduct by their material" below): flesh /
+muscle / brain / venom gland / envenomed 8 (the body's inside is salt water),
+skin and bruised skin 40 (DRY skin is the body's insulator; the wet rule is
+what makes a wet body conduct), bone 100, alloy / power cell 4, clockwork /
+boiler / cogitator 3, circuitry / neural core 2, synth shell none; wood (every plank, log and bark) 1,500 (wave 2; it was 60, and one bolt
 ran ~500 cells of connected timber); `spark` 200, `arc` 2,000, `lightning`
 30,000. Packed to `elecParams` (4 words a material: resist | source, ignite /
 char ids, ignite chance, dissolved resist) and two `_r2` bits (25 source, 26
@@ -2411,17 +2415,31 @@ or in the op record; the world hash does not move.
 
 **The body asks; the GPU answers at the fixed latency.** The field lives on the
 GPU and bodies on the CPU, so a body learns what it stands in through a BODY
-QUERY: at the end of `MobSystem::PreTick` (tick T) every live base limb of every
-living, non-ghost body -- avatars first, then `mobs_` -- queues one world box
-(`World::QueueElecQuery`): its collider box under the current pose, dilated a
-cell so a foot ON a plate or IN water overlaps the charged cells, at most
-`kElecQueryAxisMax` (32) cells an axis. `kElecQueryMax` (128) boxes a tick; a
-refusal is counted (`ElecQueryCounters().refused`), never the player's (avatars
-queue first). `SubmitTick` uploads them to `elecParams`' tail
-(`Simulation::PrepareElecQueries`, before the encoder) and the pass row
-`elecQuery` (after `elecPurge`, condition `C_ELECQUERY` = boxes this tick,
-NOT C_CAACTIVE) answers each with one 64-thread group: max settled P, cells
-with P > 0, their P sum, cells scanned -- four words into `elecMeta`'s tail.
+QUERY: at the end of `MobSystem::PreTick` (tick T) every living, non-ghost body
+-- avatars first, then `mobs_` -- queues ONE world box (`World::QueueElecQuery`;
+wave 2, package B -- wave 1 queued one box per base limb, 15 a human, against
+128, so bodies past ~8 in spawn order were never shocked): the union of its
+limbs', worn shells' and held items' collider boxes under the current pose,
+dilated a cell so a foot ON a plate or IN water overlaps the charged cells, at
+most `kElecQueryAxisMax` (32) cells an axis, and it asks for the box's GRID.
+`kElecQueryMax` (80) boxes a tick, SIZED FROM THE CREATURE CAP:
+`kElecLiveMobs + kElecQueryPlayerReserve (16)`, `kElecLiveMobs` restating
+world.h `kMaxLiveMobs` (64; `elec.cpp` static_asserts the restatement,
+`mob_shock.cpp` the sum against `MobSystem::MaxLiveMobs()`), so raising the
+cap without it fails the build instead of silently refusing the last bodies. The grids share
+`kElecQueryGridWordsMax` (49,152 words, 192 KiB; a human's box is ~470), handed
+out in queue order; a box over the cap or the grid budget is refused whole and
+counted (`ElecQueryCounters().refused` / `.gridRefused`,
+`ShockStats().refused`), never the player's (avatars queue first). `SubmitTick`
+uploads them to `elecParams`' tail (`Simulation::PrepareElecQueries`, before
+the encoder; box word 6 = the grid's word offset) and the pass row `elecQuery`
+(after `elecPurge`, condition `C_ELECQUERY` = boxes this tick, NOT C_CAACTIVE)
+answers each with one 64-thread group: max settled P, cells with P > 0, their
+P sum, cells scanned -- four words into `elecMeta`'s tail -- and the grid, every
+cell of the box as a u16 (P clamped to 32,767 | bit 15 = the cell is AIR, read
+through the page table; the row now carries `R(Voxels) R(PageTable)`), two
+cells a word, into the grid area after the answers (`kEmQueryGrid`). The ring
+slot copies only the grid words the tick used.
 `EncodeReadbacks` copies them onto THE SNAPSHOT RING with the tick's boxes as
 their CPU-side TAGS (the mob id and rig slot never reach the GPU), and the
 publish hands them over exactly once in tick order (`World::TakeElecHits`,
@@ -2449,12 +2467,13 @@ row and uploads nothing; a group whose field has no page answers zeros after
 one load.
 
 **What a shock does** (`Tuning::Gore` section H, every number a knob,
-`gore.shock*`). EFFECTIVE P = the box's max P x (1 + `shockWetGain` x the limb's
-CONDUCTING coat fraction -- water, blood, brine: coat materials with
-`electric.resist`) x `shockArmourGain` when any worn shell holds a conductor
-(`resist <= shockArmourResistMax`; sampled from the shell lattices, a tick the
-body is in charge only). Nothing below `shockMinP` (x `shockArmourMinPScale`
-in metal). Each touching limb takes `shockHpPerKiloP` hp per 1000 effective P,
+`gore.shock*`). EFFECTIVE P = the limb's FELT P (wave 2: the max over its body
+cells of the cell's conducted P x its `electric.shock`, below) x (1 +
+`shockWetGain` x the limb's CONDUCTING coat fraction -- water, blood, brine:
+coat materials with `electric.resist`) x `shockArmourGain` when a worn shell's
+conducting cell (`resist <= shockArmourResistMax`) CARRIES charge (wave 1: when
+any worn shell merely contained a conductor). Nothing below `shockMinP` (x
+`shockArmourMinPScale` in metal). Each touching limb takes `shockHpPerKiloP` hp per 1000 effective P,
 `shockTorsoShare` of it routed to the vital core (the vital base limb with the
 most authored hp: the torso -- the current crosses the body, which is what
 kills), the body capped at `shockHpMaxPerTick`; `DamageCause::Electric`, whose
@@ -2475,6 +2494,91 @@ avatar on a spark-fed plate -- FORWARD held on every stunned tick moves it
 shells and the touching limbs through `Mob::Ignite` -- the burn pass's own door,
 so a WET voxel refuses the flame. Androids are bodies like any other (no
 special case). Corpses and ghosts do not ask.
+
+**Bodies conduct by their material (wave 2, package B, 2026-10-04;
+`mob_shock.cpp`, gates `elec-crowd`, `elec-body-matter`).** The owner's rule: the
+physical material of a body decides what electricity does to it, and body
+microvoxels behave as the same material does in the world. So a body whose box
+held charge is SOLVED as the world would solve the same voxels:
+- *Cells.* Each rig slot's lattice (base limbs, worn shells, held items) is
+  binned into WORLD-pitch cells (`ElecSlotCache`: lattice coordinate / scale,
+  floored). A cell's resist is its voxels' `electric.resist` in PARALLEL (n /
+  sum 1/r, an insulating voxel carries nothing), each voxel under the world's
+  WET RULE (`ElecWetResist(sim.elecWetResist, coat amount)` when its coat
+  conducts -- `sim_elec.wgsl elecCellResist` on the CPU). Two per cell: BULK
+  over all its voxels, ENTRY over its EXPOSED voxels (an empty lattice
+  neighbour) -- charge from outside the slot crosses the skin, the panel, the
+  grip. World pitch is deliberate: `resist` is a cost per WORLD cell, so a
+  body conducts over a metre exactly as the same matter would lying in the
+  world (12-bit resists, as the field has since package A: dry wood 1,500).
+  Derived and disposable, in two layers: the GEOMETRY (each voxel's cell,
+  which voxels are exposed, which cells exist), rebuilt only when an FNV
+  digest of the voxels' positions and presence moves (a cut, a burn-through);
+  the resists, re-accumulated from materials and coats at most every
+  `kElecSlotRefreshTicks` (4) ticks while the slot is charged (tick-keyed, so
+  deterministic; at once after a size change, a table reload, a wet-knob
+  change or the current rewriting the slot).
+- *The solve.* `P(cell) = max(world P at the cell or a face - entry, P(slot
+  neighbour) - bulk, P(touching cell of a jointed base limb) - bulk, P(touching
+  cell of a shell / held item / OTHER body) - entry)`, the field's own max-plus,
+  with package A's SPREADING LOSS on every entry (`prev x min((n - `sim.elecSpreadFree`) x `sim.elecSpreadLoss`, 4095) / 4096`, n = the cell's
+  conducting neighbours in its own slot -- `elecEnter`),
+  solved to its least fixpoint by a widest-path search (integer; the answer
+  does not depend on visit order). The world P comes from the grid; nothing is
+  stored between ticks (the body's charge fades with the world's). The body's
+  cells are placed with the pose it ASKED with (`Mob::elecPoses_`, a ring of
+  K + 3 per-slot transforms keyed by tick): the answer is K + 1 ticks old,
+  and a body moving a cell a tick read the field where it no longer was
+  (`elec-crowd`, 2 of 16 shocked before). CONTACT is the six face cells and,
+  across ONE air cell no part of the body fills, the cell beyond: a body
+  cell is a bin placed by its centre, so a sole resting on a plate can bin a
+  cell above the one touching it (measured: `elec-stun`'s zombie, every
+  foot cell one air cell over the copper) -- the slack wave 1 had by
+  dilating each limb box a cell, and no more. COVER: a
+  base-limb cell takes a charged world cell across a face only when no WORN
+  shell stands in the way -- no shell cell in its own world cell or that
+  one, and no shell met by `Mob::WornShellAlong` (the burn pass's ray, one
+  cell along the face; the two lattices' world-pitch cells need not line
+  up); otherwise the charge reaches it only THROUGH the shell: a dry leather
+  sole insulates, an iron one conducts, a RAIN-SOAKED leather one conducts
+  (the wet rule -- why `elec-body-matter` pins a clear sky). An UNCHARGED body whose box touches a
+  charged one joins the solve (two creatures holding hands in a pond;
+  `ShockStats().linked`, `ShockRecord::viaBody`).
+- *Effects, all material data.* Felt P per limb = max(P x `electric.shock` /
+  1000) (`shock`: per-mille FELT, a new key of the `electric` block, bodies
+  only: 1000 on skin, flesh, muscle, brain, venom gland, envenomed tissue,
+  circuitry and an android's neural core; 0 -- the default -- on bone, blood,
+  wood, metal, alloy). OHMIC per body cell: E2's `elecReact` exactly (E = P x
+  the cell's resist, chance = min(`ignite.chance`, E x `sim.elecIgniteGain`) x
+  (air faces + 2) / 8, the cell's voxels become `ignite.into` with an air face
+  -- AIR from the grid's bit and no cell of the same body there -- or `char`
+  without; `ElecRewriteLimb` puts them on the burn front and pokes the micro
+  brick; at most `kShockOhmicCellsPerTick` 64 cells a tick, refusals counted).
+  CRACKLE per body cell: E2's thresholds and rate (`ElecCrackleThreshold`,
+  `sim.elecCrackle`, the 200 per-mille cap) throw a spark / arc into an air face
+  as a fill-air cell op -- RECORDED, the one way a charged body passes charge
+  back into the world (`kShockCrackleOpsPerTick` 16). So: a wooden body (sylvan)
+  carries charge poorly, feels none of it and CHARS / catches (wood -> ember);
+  an alloy frame conducts and never burns (no ignite data); flesh feels it (hp,
+  stun) and sears; worn iron and a held steel blade conduct into the body they
+  touch; an android's ceramic panels (`synth_shell`, no block) insulate it dry,
+  and its circuitry feels whatever gets in (wet panels, exposed frame).
+- *Cost.* Nothing when nothing is charged (no answers); a charged body pays a
+  pass over its voxels every 4th tick (the binning only on a geometry change),
+  a few hundred cells of solve and the rolls. `ShockStats()` carries the counts and the wall
+  time (`applyNanos`, `refreshNanos`); `elec-crowd` reports it per tick.
+- *For the renderer.* `Mob::ElecSlotCharge(slot, tick)`: the highest P any
+  cell of a rig slot reached in the last solve (0 when stale or uncharged) --
+  what a charged-body glow would read; the render side is not built.
+- *Gates.* `elec-crowd`: `MaxLiveMobs()` humans, the last two rows in a
+  lightning-fed basin -- every one in the water shocked, none on the pad,
+  nothing refused. `elec-body-matter` (clear sky pinned): barefoot shocked,
+  dry leather shoes insulate, iron sabatons conduct, a sylvan on a
+  LIGHTNING-fed plate feels nothing and chars (dry wood 1,500 takes nothing
+  from an arc plate, world or body), a soaked android's circuitry feels it.
+  With package A's spreading loss, `elec-stun` A is fed by an arc (a spark
+  plate is P ~50 under the zombie, below `shockMinP`) and `elec-water-mob` B's
+  armoured human wears iron SABATONS (metal counts where the current runs).
 
 **Scale, at the defaults.** A spark (200) on a copper plate: ~0.3 hp a tick a
 foot, a 6-tick stun -- it barely hurts. A lightning-fed pond (~30,000): the cap,

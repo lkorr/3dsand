@@ -797,9 +797,11 @@ PASS(elecPurge, "elec", PT_TICK, PIPE_ELEC_PURGE, K_INDIRECT, IND_ELECARGS,16,0,
 // read-only in practice: `elecPool` (the module declares it read_write for
 // the rounds; elecQuery only reads half 0 through elecAt). R(PageTable): the
 // owner check elecAt makes since wave 2 resolves the slot's world chunk.
+// Wave 2 (package B): each box's GRID too (P | air, elecMeta's grid tail), so
+// it reads the voxels (through the page table) for the air bit.
 PASS(elecQuery, "elec", PT_TICK, PIPE_ELEC_QUERY, K_COMPUTE, D_ELECQUERY,1,1,
      GRP_SIM, DYN_ZERO, C_ELECQUERY, 1,
-     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams) R(PageTable)))
+     USES(U(TickUBO) A(ElecMeta) R(ElecPool) R(ElecParams) R(Voxels) R(PageTable)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //

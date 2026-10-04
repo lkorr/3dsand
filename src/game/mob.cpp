@@ -2399,7 +2399,28 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   // The shock's view of the charge field's material data (mob_shock.cpp).
   matElecResist_.assign(mats.size(), 0u);
   for (size_t i = 0; i < mats.size(); i++)
-    matElecResist_[i] = (uint8_t)std::min<uint32_t>(mats[i].elec.resist, 254u);
+    matElecResist_[i] =
+        (uint16_t)std::min<uint32_t>(mats[i].elec.resist, kElecResistInsulator - 1u);
+  // ...and the rest of the block a body cell reads (wave 2, mob_shock.cpp).
+  matElec_.assign(mats.size(), ElecMat{});
+  crackleLoMat_ = crackleLoSrc_ = crackleHiMat_ = crackleHiSrc_ = 0;
+  for (size_t i = 0; i < mats.size(); i++) {
+    ElecMat& e = matElec_[i];
+    e.feel = (uint16_t)std::min<uint32_t>(mats[i].elec.shockMille, 1000u);
+    uint32_t w[kEpMatStride];
+    PackElecMaterial(mats[i].elec, w);
+    e.igniteInto = (uint16_t)(w[1] & 0xFFFu);
+    e.charInto = (uint16_t)((w[1] >> 12) & 0xFFFu);
+    e.igniteCap = w[2];
+    if (mats[i].name == "spark") {
+      crackleLoMat_ = (uint32_t)i;
+      crackleLoSrc_ = mats[i].elec.source;
+    } else if (mats[i].name == "arc") {
+      crackleHiMat_ = (uint32_t)i;
+      crackleHiSrc_ = mats[i].elec.source;
+    }
+  }
+  elecMatGen_++;
   for (size_t i = 0; i < mats.size(); i++) {
     burnStage_[i] = mats[i].burnStage;  // authored (materials.h burnStage)
     bool flammable = burnStage_[i] != 0;
@@ -8103,7 +8124,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // SHOCKS (docs/PLAN_electricity.md E4, mob_shock.cpp): the body query's
   // answers of tick T - K - 1, applied before the burn pass so a voxel a
   // shock lit burns this tick; then the stunned twitch.
-  ApplyShocks(tick, world);
+  ApplyShocks(tick, world, cellOps);
   TickStuns(tick);
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
@@ -16513,6 +16534,52 @@ uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
     }
   }
   return lit;
+}
+
+// The current's rewrite of a slot's voxels (mob_shock.cpp, ohmic sear /
+// ignition / char): IgniteOneLimb's discipline -- every rewritten voxel goes
+// on the burn front, so what it became (an ember, seared flesh) carries on by
+// its own rules from this tick's burn pass, and the micro brick is owned and
+// poked so the change is seen.
+uint32_t MobSystem::ElecRewriteLimb(BurnLimbView& v,
+                                    const std::vector<std::pair<uint32_t, uint32_t>>& rw) {
+  if (rw.empty() || v.Size() == 0) return 0;
+  const bool tables = BurnTablesReady();
+  BodyBurnState& st = *v.burn;
+  if (tables && st.idx.empty()) BuildBurnIndex(v);
+  const IVec3 d = st.dims, mn = st.min;
+  auto cellOf = [&](IVec3 p) -> uint32_t {
+    const int lx = p.x - mn.x, ly = p.y - mn.y, lz = p.z - mn.z;
+    if (lx < 0 || ly < 0 || lz < 0 || lx >= d.x || ly >= d.y || lz >= d.z)
+      return kNoBurnCell;
+    return (uint32_t)(((size_t)lz * d.y + ly) * d.x + lx);
+  };
+  uint32_t n = 0;
+  std::vector<uint32_t> poked;
+  for (const auto& [i, mat] : rw) {
+    if (i >= v.Size() || mat == 0 || v.Mat(i) == 0 || v.Mat(i) == (mat & 0xFFFu)) continue;
+    v.Set(i, mat, 0);
+    n++;
+    poked.push_back(i);
+    if (tables && !st.idx.empty()) {
+      const uint32_t c = cellOf(v.At(i));
+      if (c != kNoBurnCell) st.front.push_back(c);
+    }
+  }
+  if (!n) return 0;
+  if (v.microModel && *v.microModel >= 0 && microSet_) {
+    const int own = MicroBodyOwn(*microSet_, (uint32_t)*v.microModel);
+    if (own >= 0) {
+      *v.microModel = own;
+      if (v.carved) *v.carved = true;
+      if (v.flipbook) *v.flipbook = -1;
+      for (uint32_t i : poked) {
+        const IVec3 p = v.At(i);
+        MicroBodyPoke(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, (uint8_t)v.Mat(i), 0);
+      }
+    }
+  }
+  return n;
 }
 
 uint32_t MobSystem::IgniteLimb(uint64_t mobId, int limbIndex, uint32_t count,

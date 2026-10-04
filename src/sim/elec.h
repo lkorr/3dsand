@@ -168,22 +168,48 @@ static_assert(kEmArgs * 4 == 128, "pass_table.def copy_elecArgs reads byte 128")
 static_assert(kElecArgsBytes == 32, "pass_table.def copy_elecArgs copies 32 bytes");
 static_assert(kEmArgs + kElecArgRecords * 4 <= kEmHdrWords, "the args fit the header");
 
-// ---- THE BODY QUERY (package E4: shocks reach bodies) -----------------------
-// Up to kElecQueryMax world-cell BOXES a tick (one per live limb of the bodies
-// near the window: MobSystem::QueueShockQueries), each answered by one
-// workgroup of sim_elec.wgsl elecQuery with the settled field's max P over the
-// box, the cells with P > 0, their P sum and the cells scanned. The boxes ride
-// elecParams' tail (CPU-written, Simulation::PrepareElecQueries), the answers
-// elecMeta's tail (GPU-written), and the answers reach the CPU on the
-// snapshot ring at World::kSnapshotLatency, exactly like every other gameplay
-// readback: a decision at tick T reads the boxes of tick T - K - 1, never
-// "whenever the copy landed". A box is inclusive and at most
-// kElecQueryAxisMax cells along each axis (the CPU clamps it).
-constexpr uint32_t kElecQueryMax = 128;
-constexpr uint32_t kElecQueryBoxWords = 8;   // lo.xyz, hi.xyz (i32, inclusive), 0, 0
+// ---- THE BODY QUERY (package E4: shocks reach bodies; wave 2 package B) ----
+// Up to kElecQueryMax world-cell BOXES a tick, ONE PER BODY (the union of the
+// body's limb, shell and held-item boxes under its current pose:
+// MobSystem::QueueShockQueries), each answered by one workgroup of
+// sim_elec.wgsl elecQuery with the settled field's max P over the box, the
+// cells with P > 0, their P sum and the cells scanned -- and, since wave 2, a
+// GRID: the box's every cell as a u16 (P clamped to kElecQueryGridPMax, bit
+// kElecQueryGridAir = the cell is air), two cells a word, x fastest, at the
+// word offset the CPU gave the box (box word 6; kElecQueryNoGrid = none). The
+// CPU conducts the charge THROUGH the body from that grid
+// (mob_shock.cpp: every body cell takes its material's resist, the world's
+// max-plus rule). The boxes ride elecParams' tail (CPU-written,
+// Simulation::PrepareElecQueries), the answers and grids elecMeta's tail
+// (GPU-written), and both reach the CPU on the snapshot ring at
+// World::kSnapshotLatency, exactly like every other gameplay readback: a
+// decision at tick T reads the boxes of tick T - K - 1, never "whenever the
+// copy landed". A box is inclusive and at most kElecQueryAxisMax cells along
+// each axis (the CPU clamps it).
+//
+// SIZED FROM THE CREATURE CAP. kElecQueryMax holds every living creature
+// (world.h kMaxLiveMobs = MobSystem::kMaxMobs, restated here as
+// kElecLiveMobs) plus the players' bodies; elec.cpp static_asserts the
+// restatement and mob_shock.cpp the sum, so raising the cap without this
+// fails the build instead of silently refusing the last bodies (the wave-1 query asked one box per LIMB and stopped at ~8
+// bodies). The grid budget, kElecQueryGridWordsMax, holds kElecQueryMax
+// human-sized boxes (a human's box is ~7 x 19 x 7 cells, ~470 words); a box
+// past the budget is refused and counted (World::ElecQueryCounters), the
+// players' never (they queue first).
+// world.h kMaxLiveMobs, restated (materials.h includes this header, so it
+// cannot include world.h) and static_asserted against it in elec.cpp.
+constexpr uint32_t kElecLiveMobs = 64;
+constexpr uint32_t kElecQueryPlayerReserve = 16;
+constexpr uint32_t kElecQueryMax = kElecLiveMobs + kElecQueryPlayerReserve;   // 80
+constexpr uint32_t kElecQueryBoxWords = 8;   // lo.xyz, hi.xyz (i32, inclusive), grid word offset, 0
 constexpr uint32_t kElecQueryResWords = 4;   // maxP, charged cells, sum P, cells scanned
 constexpr uint32_t kElecQueryAxisMax = 32;
 constexpr uint32_t kElecQueryResBytes = kElecQueryMax * kElecQueryResWords * 4;
+constexpr uint32_t kElecQueryGridWordsMax = 49152;   // 192 KiB a tick, at most
+constexpr uint32_t kElecQueryGridBytes = kElecQueryGridWordsMax * 4;
+constexpr uint32_t kElecQueryGridPMax = 0x7FFFu;
+constexpr uint32_t kElecQueryGridAir = 0x8000u;
+constexpr uint32_t kElecQueryNoGrid = 0xFFFFFFFFu;
 
 constexpr uint32_t kEmEntry = kEmHdrWords;                       // HAS | page
 constexpr uint32_t kEmOwner = kEmEntry + kElecWindowChunks;       // packed world chunk
@@ -194,7 +220,9 @@ constexpr uint32_t kEmStack = kEmList1 + kElecPoolPages;
 // The body query's answers, kElecQueryResWords per box (elecQuery writes them;
 // the snapshot ring copies the first `count` boxes' worth on a tick that ran).
 constexpr uint32_t kEmQuery = kEmStack + kElecPoolPages;
-constexpr uint32_t kEmWords = kEmQuery + kElecQueryMax * kElecQueryResWords;
+// ...and their grids (kElecQueryGridWordsMax words; each box's at its offset).
+constexpr uint32_t kEmQueryGrid = kEmQuery + kElecQueryMax * kElecQueryResWords;
+constexpr uint32_t kEmWords = kEmQueryGrid + kElecQueryGridWordsMax;
 
 constexpr uint32_t kElecEntryHas = 0x80000000u;
 constexpr uint32_t kElecEntryPage = 0x00FFFFFFu;
@@ -257,11 +285,12 @@ constexpr uint32_t kElecR2Conducts = 1u << 26;
 // ---- the authored data (materials.json "electric") --------------------------
 //   "electric": { "resist": N, "source": E,
 //                 "ignite": { "into": "<mat>", "chance": per-mille },
-//                 "char": "<mat>", "dissolved": R }
+//                 "char": "<mat>", "dissolved": R, "shock": per-mille }
 // No block = an insulator. resist 1..4094 is the cost per cell entered; source
 // 1..65535 is the potential the cell holds every tick it exists; dissolved
 // 1..4094 is what a conducting liquid's resist falls to with this material
-// dissolved in it at saturation (linear in concentration).
+// dissolved in it at saturation (linear in concentration); shock (bodies only,
+// wave 2 package B) is the per-mille of a body cell's P its creature feels.
 struct ElecDef {
   uint32_t resist = 0;               // 0 = insulator
   uint32_t source = 0;
@@ -269,6 +298,13 @@ struct ElecDef {
   std::string igniteInto, charInto;  // names, resolved after the table loads
   uint32_t igniteIntoId = 0, charIntoId = 0;
   double igniteChanceMille = 0.0;
+  // BODIES ONLY (wave 2 package B, mob_shock.cpp): how much of a body cell's
+  // P a creature made of this material FEELS -- the hp and the stun of a
+  // shock. 1000 for tissue with nerves and muscle (skin, flesh, brain) and for
+  // the circuitry an android runs on; 0 (the default) for matter that only
+  // carries the current (bone, blood, wood, metal). The world field never
+  // reads it.
+  uint32_t shockMille = 0;
   bool Any() const { return resist != 0 || source != 0; }
 };
 
@@ -302,7 +338,10 @@ const ElecRunStats& ElecRunTotals();
 struct ElecQuery {
   int32_t lo[3] = {0, 0, 0}, hi[3] = {-1, -1, -1};
   uint64_t mobId = 0;
-  int32_t limb = -1;
+  int32_t limb = -1;   // -1: the whole body (wave 2); >= 0 a rig slot
+  // The box's grid: its word offset in the grid area (World::QueueElecQuery
+  // assigns it, kElecQueryNoGrid = none) and its word count.
+  uint32_t gridOff = kElecQueryNoGrid, gridWords = 0;
 };
 // One answer, as the publish hands it over: the query's tag, the tick whose
 // field it read, and kElecQueryResWords of result.
@@ -314,7 +353,23 @@ struct ElecHit {
   uint32_t charged = 0;   // cells with P > 0
   uint32_t sumP = 0;      // their P, summed
   uint32_t cells = 0;     // cells scanned (the box's volume inside the window)
+  // The box and its grid (empty when the box had none): cell (x, y, z) of the
+  // box is grid[(z * dims[1] + y) * dims[0] + x], kElecQueryGridPMax | air.
+  int32_t lo[3] = {0, 0, 0}, dims[3] = {0, 0, 0};
+  std::vector<uint16_t> grid;
 };
+// The box's dims (clamped like the kernel) and grid words.
+inline void ElecQueryDims(const ElecQuery& q, int32_t dims[3]) {
+  for (int a = 0; a < 3; a++) {
+    const int32_t d = q.hi[a] - q.lo[a] + 1;
+    dims[a] = d < 0 ? 0 : (d > (int32_t)kElecQueryAxisMax ? (int32_t)kElecQueryAxisMax : d);
+  }
+}
+inline uint32_t ElecQueryGridWords(const ElecQuery& q) {
+  int32_t d[3];
+  ElecQueryDims(q, d);
+  return ((uint32_t)d[0] * (uint32_t)d[1] * (uint32_t)d[2] + 1u) / 2u;
+}
 
 // Packed world-chunk key for elecMeta's owner word (10 bits an axis, +1 so a
 // zero word is never a valid owner).
