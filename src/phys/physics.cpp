@@ -413,12 +413,22 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     (st ? pointsStatic : pointsDyn)
         .fetch_add((uint32_t)m.mRelativeContactPointsOn1.size(),
                    std::memory_order_relaxed);
+    // WHO met WHOM (rule 6: a manifold count wants its attribution). The
+    // role rides the user data (PackRole); a static body is its own column.
+    auto roleIx = [](const JPH::Body& b) -> int {
+      return b.IsStatic() ? Physics::kRoleStatic : (int)UnpackRole(b.GetUserData());
+    };
+    int r1 = roleIx(b1), r2 = roleIx(b2);
+    if (r1 > r2) std::swap(r1, r2);
+    rolePairs[r1 * Physics::kRoleCols + r2].fetch_add(1, std::memory_order_relaxed);
   }
+  std::atomic<uint32_t> rolePairs[Physics::kRoleCols * Physics::kRoleCols]{};
   void ResetCounts() {
     manifoldsDyn = 0;
     manifoldsStatic = 0;
     pointsDyn = 0;
     pointsStatic = 0;
+    for (auto& r : rolePairs) r = 0;
   }
   void OnContactPersisted(const JPH::Body& b1, const JPH::Body& b2,
                           const JPH::ContactManifold& m,
@@ -585,6 +595,10 @@ constexpr JPH::uint kMaxContactConstraints = 16384;
 
 Physics::Physics() = default;
 Physics::~Physics() { Shutdown(); }
+
+uint32_t Physics::LiveBodyCount() const {
+  return system_ ? (uint32_t)system_->GetNumBodies() : 0u;
+}
 
 bool Physics::Init() {
   JPH::RegisterDefaultAllocator();
@@ -1348,6 +1362,8 @@ void Physics::Step(float dt) {
   if (contacts_) contacts_->Finish();
   if (contacts_) {
     lastStep_.manifoldsDyn = contacts_->manifoldsDyn.load();
+    for (int i = 0; i < kRoleCols * kRoleCols; i++)
+      lastStep_.rolePairs[i] = contacts_->rolePairs[i].load();
     lastStep_.pointsDyn = contacts_->pointsDyn.load();
     lastStep_.manifoldsStatic = contacts_->manifoldsStatic.load();
     lastStep_.pointsStatic = contacts_->pointsStatic.load();

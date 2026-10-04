@@ -9180,7 +9180,9 @@ shared bricks go back through `MicroBodyReleaseShared`, its slot is blanked
 slot or no pool room evicts every unheld runtime def at once and retries.
 Nothing is lost: the name rebuilds the def. Ceilings were raised with it
 (`kMaxMicroBodyModels` 2048, `kMicroBodyPoolWordsWorld` 4 MiW) because 16 live
-creatures plus 12 corpses can hold every pool body at once.
+creatures plus 12 corpses can hold every pool body at once. Raised again with
+the living cap (2026-10-04, 16 -> 64): 4096 records and 8 MiW -- see "The living
+cap" under Bounds.
 
 **And a body that dies with the rot in it gets up.** Sidecar `turn`
 (`{into, afterSec, infectedLimbs}`, on the human and inherited by every
@@ -11666,6 +11668,23 @@ debris for the network). All of that is gone.
   FIFO cull and settle-back finish it. So the old corpse lifetime is the tail
   of the new one. Dead Mobs have their own burn and stain budget pots so a
   battlefield cannot starve the living. Gate `corpse-cap`.
+- **The living cap is 64** (2026-10-04, PLAN_electricity_wave2 package C; it
+  was 16). The number is `kMaxLiveMobs` in `sim/world.h` and
+  `MobSystem::kMaxMobs` is that constant, because what is SIZED from it is GPU
+  layout: `kMaxBodySlots` 512 -> 2048 (debris 200 + 64 x
+  `kBodySlotsPerLiveMob` 24 + the dead's 240, static_asserted), the micro-body
+  model table `kMaxMicroBodyModels` 2048 -> 4096 (shared + one owned clone per
+  slot), and the brick pool `kMicroBodyPoolWordsWorld` 4 -> 8 MiW (a 64-strong
+  brawl filled 4 MiW to the last word and refused 269k skin writes). VRAM:
+  +72 KiB slot buffers, +32 KiB model table, +16 MiB pool. The dead caps did
+  NOT scale: they bound what is lying there, not how many stand. Every one of
+  those ceilings degrades by refusing, so gate `mob-cap64` spawns 64 mixed
+  creatures, asserts each holds a slot and the brick allocator refuses
+  nothing through a 300-tick fight, refuses the 65th cleanly (no creature, no
+  Jolt body, no brick record leaked) -- and is the crowd perf harness: the
+  tick's wall time and the mob side's stage-by-stage burnprof breakdown are
+  `mobCap64.*` observations, and `mobCap64.count` in tests/baseline.json runs
+  the same fixture at another crowd size.
 - **Sleep.** A dead Mob sleeps after `kDeadSleepTicks` of: every limb inactive
   in Jolt, no burn front or `alight`, no active coat (washer, corrosive, hot)
   and nothing dirty, no bleed budget or gush, twins clean. Asleep it skips
@@ -12235,10 +12254,12 @@ are on different storeys and ignore each other, which is self-scaling rather
 than a constant that rots when the voxel size moves. Limp ragdolls are excluded:
 a prone body is scenery, and the footprint model describes something standing.
 
-Cost is `kMaxMobs` (16) squared at worst — 120 pairs of two compares and a sqrt,
-cheaper than one ground probe, sleeping to nothing when bodies are apart. A
-spatial index at that bound would be a second source of truth about where
-creatures are for no measurable gain.
+Cost is `kMaxMobs` (64) squared at worst — ~2000 pairs, each rejected by a
+centre-distance test (gap >= centre distance minus both spine half-lengths)
+before the segment solve, so a pair that is not close costs two compares.
+Measured 0.38 ms a tick for a 64-creature brawl BEFORE that reject. A spatial
+index at that bound would be a second source of truth about where creatures
+are for no measurable gain.
 
 Gate `crowd` is **two arms, and the second is the point**: four duelists
 converge on one target, and the control arm reruns the same fixture with
