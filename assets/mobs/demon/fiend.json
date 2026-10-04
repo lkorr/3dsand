@@ -1,7 +1,7 @@
 {
-  "//": "A CHARACTER, not a creature: imp_skerrick inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs imp_skerrick --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "//": "A CHARACTER, not a creature: fiend inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs fiend --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
   "extends": "human",
-  "model": "imp_skerrick",
+  "model": "fiend",
   "race": "demon",
   "sidecarVoxelsPerMetre": 10,
   "anatomy": {
@@ -33,139 +33,138 @@
     },
     "garmentsBecome": null
   },
-  "speed": 23.4787,
   "gait": {
-    "rideHeight": 1.422
+    "rideHeight": 1.153
   },
   "limbs": [
     {
       "name": "hips",
-      "hp": 43
+      "hp": 297
     },
     {
       "name": "torso",
-      "hp": 45,
+      "hp": 367,
       "anchor": [
-        14,
         30,
-        10
+        86,
+        12
       ]
     },
     {
       "name": "head",
-      "hp": 101,
+      "hp": 207,
       "anchor": [
-        14,
-        44,
-        10
+        30,
+        126,
+        12
       ]
     },
     {
       "name": "armU.L",
-      "hp": 22,
+      "hp": 262,
       "anchor": [
-        24,
-        46,
-        10
+        52,
+        128,
+        12
       ]
     },
     {
       "name": "armL.L",
-      "hp": 18,
+      "hp": 112,
       "anchor": [
-        24,
-        38,
-        10
+        52,
+        100,
+        12
       ]
     },
     {
       "name": "hand.L",
-      "hp": 16,
+      "hp": 85,
       "anchor": [
-        24,
-        30,
-        10
+        52,
+        74,
+        12
       ]
     },
     {
       "name": "armU.R",
-      "hp": 22,
+      "hp": 262,
       "anchor": [
-        4,
-        46,
-        10
+        8,
+        128,
+        12
       ]
     },
     {
       "name": "armL.R",
-      "hp": 18,
+      "hp": 112,
       "anchor": [
-        4,
-        38,
-        10
+        8,
+        100,
+        12
       ]
     },
     {
       "name": "hand.R",
-      "hp": 16,
+      "hp": 85,
       "anchor": [
-        4,
-        30,
-        10
+        8,
+        74,
+        12
       ]
     },
     {
       "name": "legU.L",
-      "hp": 28,
+      "hp": 180,
       "anchor": [
-        18,
-        30,
-        10
+        36,
+        72,
+        12
       ]
     },
     {
       "name": "legL.L",
-      "hp": 25,
+      "hp": 150,
       "anchor": [
-        18,
-        20,
-        10
+        36,
+        40,
+        12
       ]
     },
     {
       "name": "foot.L",
-      "hp": 26,
+      "hp": 54,
       "anchor": [
-        18,
+        36,
         6,
-        14
+        16
       ]
     },
     {
       "name": "legU.R",
-      "hp": 28,
+      "hp": 180,
       "anchor": [
-        10,
-        30,
-        10
+        24,
+        72,
+        12
       ]
     },
     {
       "name": "legL.R",
-      "hp": 25,
+      "hp": 150,
       "anchor": [
-        10,
-        20,
-        10
+        24,
+        40,
+        12
       ]
     },
     {
       "name": "foot.R",
-      "hp": 26,
+      "hp": 54,
       "anchor": [
-        10,
+        24,
         6,
-        14
+        16
       ]
     },
     {
@@ -178,9 +177,9 @@
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        9.5,
-        67,
-        10.5
+        22.5,
+        159,
+        12.5
       ]
     },
     {
@@ -193,9 +192,9 @@
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        18.5,
-        67,
-        10.5
+        37.5,
+        159,
+        12.5
       ]
     },
     {
@@ -208,9 +207,9 @@
       "bloodless": true,
       "tag": "hair",
       "anchor": [
-        14.5,
-        31,
-        5.5
+        30.5,
+        87,
+        3.5
       ]
     }
   ],
@@ -218,9 +217,9 @@
     {
       "name": "held_right",
       "offset": [
-        4,
-        27,
-        10
+        8,
+        67,
+        12
       ]
     }
   ],
@@ -229,53 +228,56 @@
       "name": "fist.L",
       "edge": {
         "from": [
-          4,
-          5.7,
-          4
+          6,
+          13.3,
+          6
         ],
         "to": [
-          4,
-          0.3,
-          4
-        ]
+          6,
+          0.7,
+          6
+        ],
+        "halfWidth": 6
       },
       "strike": {
         "blunt": 2.4,
-        "cut": 4
+        "cut": 3.5
       }
     },
     {
       "name": "fist.R",
       "edge": {
         "from": [
-          4,
-          5.7,
-          4
+          6,
+          13.3,
+          6
         ],
         "to": [
-          4,
-          0.3,
-          4
-        ]
+          6,
+          0.7,
+          6
+        ],
+        "halfWidth": 6
       },
       "strike": {
         "blunt": 2.4,
-        "cut": 4
+        "cut": 3.5
       }
     },
     {
       "name": "jaws",
       "edge": {
         "from": [
-          10,
-          9.1,
-          8
+          12,
+          12.9,
+          9.6
         ],
         "to": [
-          10,
-          6.7,
-          34
-        ]
+          12,
+          9.5,
+          40.8
+        ],
+        "halfWidth": 22.8
       }
     }
   ],
@@ -291,16 +293,11 @@
     {
       "name": "crawl.shins",
       "bodyYOffset": null
-    },
-    {
-      "name": "hunch",
-      "always": true,
-      "clip": "hunch"
     }
   ],
   "clips": {
     "walk": {
-      "durationMs": 468,
+      "durationMs": 703,
       "mask": [
         "armU.L",
         "armL.L",
@@ -322,7 +319,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 234,
+              "t": 351,
               "q": [
                 -0.1149,
                 0,
@@ -332,7 +329,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 468,
+              "t": 703,
               "q": [
                 0.1149,
                 0,
@@ -355,7 +352,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 234,
+              "t": 351,
               "q": [
                 0.1149,
                 0,
@@ -365,7 +362,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 468,
+              "t": 703,
               "q": [
                 -0.1149,
                 0,
@@ -388,7 +385,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 234,
+              "t": 351,
               "q": [
                 -0.1977,
                 0,
@@ -398,7 +395,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 468,
+              "t": 703,
               "q": [
                 -0.1149,
                 0,
@@ -421,7 +418,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 234,
+              "t": 351,
               "q": [
                 -0.1149,
                 0,
@@ -431,7 +428,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 468,
+              "t": 703,
               "q": [
                 -0.1977,
                 0,
@@ -454,7 +451,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 234,
+              "t": 351,
               "q": [
                 0,
                 0.0184,
@@ -464,7 +461,7 @@
               "ease": "quadInOut"
             },
             {
-              "t": 468,
+              "t": 703,
               "q": [
                 0,
                 -0.0184,
@@ -477,32 +474,32 @@
       }
     },
     "run": {
-      "durationMs": 257
+      "durationMs": 357
     }
   },
   "genome": {
     "archetype": "humanoid",
-    "name": "imp_skerrick",
-    "displayName": "Imp",
+    "name": "fiend",
+    "displayName": "Fiend",
     "body": {
       "race": "demon",
       "sex": "male",
       "bust": 0,
-      "heightM": 0.85,
-      "hipWidth": 8,
-      "shoulderWidth": 8,
-      "bodyDepth": 6,
-      "headWidth": 10,
-      "headDepth": 10,
-      "limbWidth": 4,
-      "footDepth": 5,
+      "heightM": 2,
+      "hipWidth": 12,
+      "shoulderWidth": 16,
+      "bodyDepth": 10,
+      "headWidth": 12,
+      "headDepth": 12,
+      "limbWidth": 6,
+      "footDepth": 7,
       "stack": {
-        "foot": 6,
-        "shin": 9,
-        "thigh": 9,
-        "hips": 7,
-        "torso": 14,
-        "head": 20
+        "foot": 4,
+        "shin": 14,
+        "thigh": 15,
+        "hips": 10,
+        "torso": 20,
+        "head": 15
       },
       "armStack": {
         "upper": 12,
@@ -512,13 +509,13 @@
       "armLengths": 1
     },
     "shape": {
-      "waist": 0.8,
-      "chest": 0.9,
-      "shoulder": 1,
-      "chestDepth": 1,
+      "waist": 0.95,
+      "chest": 1.15,
+      "shoulder": 1.15,
+      "chestDepth": 1.1,
       "seat": 1,
-      "armGirth": 0.8,
-      "legGirth": 0.8,
+      "armGirth": 1.15,
+      "legGirth": 1.1,
       "upperArm": 1,
       "bicep": 0,
       "deltoid": 0,
@@ -610,15 +607,15 @@
       "fuzzFray": 0.5
     },
     "colors": {
-      "skin": "#9a2a22",
-      "skinShade": "#6e1a16",
-      "skinLight": "#c4483a",
-      "hair": "#1a1210",
-      "hairShade": "#0e0a08",
-      "eye": "#ffc24a",
-      "cloth": "#3a2a20",
-      "clothShade": "#261a12",
-      "nail": "#5a1410",
+      "skin": "#5a5450",
+      "skinShade": "#3c3836",
+      "skinLight": "#7c7470",
+      "hair": "#4a4240",
+      "hairShade": "#2e2826",
+      "eye": "#ff7a2a",
+      "cloth": "#3a3634",
+      "clothShade": "#262422",
+      "nail": "#24201e",
       "root": "#4a3a2b",
       "moss": "#7f9a3e",
       "branch": "#6b5540",
@@ -644,7 +641,7 @@
       "horn": "#2a2624",
       "hornTip": "#5a5450",
       "claw": "#1a1412",
-      "mark": "#4a0e0c"
+      "mark": "#2a2422"
     },
     "sylvan": {
       "face": "hollow",
@@ -736,16 +733,16 @@
       "halo": 0
     },
     "demon": {
-      "hornStyle": "nubs",
-      "horns": 0.3,
-      "hornCurl": 0.1,
-      "hornSpread": 0.35,
-      "tail": 0.7,
-      "claws": 0.8,
-      "mottle": 0.4,
+      "hornStyle": "ram",
+      "horns": 0.8,
+      "hornCurl": 1,
+      "hornSpread": 0.8,
+      "tail": 0.8,
+      "claws": 0.7,
+      "mottle": 0.3,
       "glow": true,
-      "posture": "hunched"
+      "posture": "upright"
     }
   },
-  "behavior": "imp"
+  "behavior": "fiend"
 }

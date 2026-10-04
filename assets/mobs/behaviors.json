@@ -380,8 +380,8 @@
       "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 5, "bandSlack": 1.2, "approachSpeed": 1.15, "strafeSpeed": 0.6, "retreatSpeed": 0.8, "fleeSpeed": 1.2, "circleTendency": 0.6, "circleHoldTicks": 20, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.6, "flank": 0.7, "keepOut": -1 },
       "attack": { "styles": ["horizontal_r", "horizontal_l", "bite"], "reach": 6, "aimTolerance": 0.8, "cadenceTicks": 22, "jitterTicks": 12, "commitTicks": 7, "disengageTicks": 10, "pursueSpeed": 1.0, "leadTicks": 10 },
       "defense": { "skill": 0.45, "reactTicks": 5, "reactJitter": 5, "margin": 2.0, "guardStance": 0, "guardReach": 0.8, "holdTicks": 3 },
-      "//cast": "D4 (game/demon_cast.h): an imp casts SPARINGLY -- a firebolt or a gust every six to nine seconds when it can see you between 6 and 44 voxels off, a blink to close a long gap. Spell names are assets/demons/spells/ stems; a repeat weighs the draw. Its own small pool (mana / regenPerMille), never its blood. Contained in a circle it cannot claw across, this is how it still reaches you -- unless D3's sulfur severs `cast_out`.",
-      "cast": { "spells": ["firebolt", "firebolt", "gust", "blink"], "rangeMin": 6, "rangeMax": 44, "cadenceTicks": 180, "jitterTicks": 90, "firstDelayTicks": 60, "commitTicks": 8, "aimTolerance": 0.6, "mana": 120, "regenPerMille": 220, "maxLive": 1 },
+      "//cast": "D4 (game/demon_cast.h): an imp casts SPARINGLY -- a firebolt (twice as likely) or a gust every six to nine seconds when it can see you between 6 and 44 voxels off. It does not blink: the verb is in the kit (assets/demons/spells/blink.json) for demons that know it, and an imp that could would leave every circle without quicksilver. Spell names are assets/demons/spells/ stems; a repeat weighs the draw. Its own small pool (mana / regenPerMille), never its blood. Contained in a circle it cannot claw across, this is how it still reaches you -- unless D3's sulfur severs `cast_out`.",
+      "cast": { "spells": ["firebolt", "firebolt", "gust"], "rangeMin": 6, "rangeMax": 44, "cadenceTicks": 180, "jitterTicks": 90, "firstDelayTicks": 20, "commitTicks": 8, "aimTolerance": 0.6, "mana": 120, "regenPerMille": 220, "maxLive": 1 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -408,7 +408,7 @@
       "movement": { "mobile": true, "rangeMin": 6, "rangeMax": 12, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.6, "fleeSpeed": 1.0, "circleTendency": 0.4, "circleHoldTicks": 30, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.3, "flank": 0.5, "keepOut": -1 },
       "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 30, "jitterTicks": 16, "commitTicks": 10, "disengageTicks": 6, "pursueSpeed": 0.9, "leadTicks": 14 },
       "defense": { "skill": 0.6, "reactTicks": 5, "reactJitter": 4, "margin": 2.5, "guardStance": 0, "guardReach": 0.85, "holdTicks": 4 },
-      "cast": { "spells": ["hellfire", "hellfire", "firebolt", "lava_floor", "lift", "gust", "ward", "blink"], "rangeMin": 4, "rangeMax": 48, "cadenceTicks": 60, "jitterTicks": 30, "firstDelayTicks": 30, "commitTicks": 8, "aimTolerance": 0.5, "mana": 900, "regenPerMille": 1500, "maxLive": 3 },
+      "cast": { "spells": ["hellfire", "hellfire", "firebolt", "lava_floor", "lift", "gust", "ward", "blink"], "rangeMin": 4, "rangeMax": 48, "cadenceTicks": 60, "jitterTicks": 30, "firstDelayTicks": 30, "commitTicks": 8, "aimTolerance": 0.5, "mana": 2400, "regenPerMille": 3000, "maxLive": 3 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },

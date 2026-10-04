@@ -545,12 +545,15 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
 }  // namespace
 
 Status GateDemonSeals(Ctx& c, std::string& detail);   // selftest_demon_seals.cpp
+Status GateDemonCast(Ctx& c, std::string& detail);    // selftest_demon_cast.cpp (D4)
 
 const std::vector<Gate>& DemonGates() {
   static const std::vector<Gate> g = {
       {"demon-circle", "mob", {}, false, GateDemonCircle},
       // D3 (selftest_demon_seals.cpp): seals, channels, strength, release, gaze.
       {"demon-seals", "mob", {}, false, GateDemonSeals},
+      // D4 (selftest_demon_cast.cpp): creatures cast, blink, the kit, the stance.
+      {"demon-cast", "mob", {}, false, GateDemonCast},
   };
   return g;
 }

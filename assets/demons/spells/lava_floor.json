@@ -1,6 +1,6 @@
 {
   "//": "THE GROUND UNDER YOU, TO LAVA: the wildcard transmute (`anything` matches matter, never the void, so only the floor turns) on a fast bolt aimed at the floor under the target. Priced as what it turned out to be, billed to the caster when it lands (the wildcard's bill on resolve). Indirect on purpose: a prohibition on `direct` attacks does not catch it, one on `alters: ground_under_target` or `creates: lava` does (D5/D6).",
-  "words": "anything transmute@2 lava bolt",
+  "words": "anything transmute lava bolt",
   "aim": "feet",
   "range": [6, 40],
   "lead": true,

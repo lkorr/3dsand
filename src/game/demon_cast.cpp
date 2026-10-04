@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "game/demon.h"
+#include "game/demon_seals.h"
 #include "game/mob.h"
 #include "game/session.h"
 #include "phys/debris.h"
@@ -25,18 +26,6 @@ std::string AssetDir();   // test/support.cpp: the one asset-path chokepoint
 }
 
 using json = nlohmann::json;
-
-// ---- D3 hook --------------------------------------------------------------------------
-
-namespace {
-bool NothingSevered(TickAuthorityCtx&, uint64_t, const char*) { return false; }
-}  // namespace
-
-DemonSealQuery& DemonSealHook() {
-  // D3 hook: the orchestrator points this at demon_seals.h's query at merge.
-  static DemonSealQuery q = &NothingSevered;
-  return q;
-}
 
 // ---- the kit ----------------------------------------------------------------------------
 
@@ -56,7 +45,6 @@ const char* CastOutcomeName(MobCastOutcome o) {
     case MobCastOutcome::NothingInRange: return "nothing castable";
     case MobCastOutcome::BlinkNoFloor: return "blink: no floor";
     case MobCastOutcome::BlinkNoSight: return "blink: no line";
-    case MobCastOutcome::BlinkFenced: return "blink: outside the circle";
     case MobCastOutcome::BlinkSevered: return "blink: severed";
     case MobCastOutcome::NoRoom: return "no room";
   }
@@ -317,9 +305,11 @@ void Route(TickAuthorityCtx& w, std::span<SessionTick> players, MobCastWorld& m,
            MobCaster& c, SpellEmission& em, uint32_t tick, OpBatch& out) {
   // cast_out SEVERED (D3) for a contained demon: what its spell would do
   // OUTSIDE the ring does not happen. Ops, blasts, spawns by where they land;
-  // a wind by where its far end reaches; a push by where the body is.
+  // a wind by where its far end reaches; a push by where the body is. (Per
+  // element, the test demon::AllowCastOut makes for a carrier: contained,
+  // severed, and outside the circle.)
   if (const LiveDemon* ld = ContainedDemon(w, c.mobId);
-      ld != nullptr && DemonSealHook()(w, c.mobId, "cast_out")) {   // D3 hook
+      ld != nullptr && demon::ChannelSevered(w, c.mobId, demon::Channel::CastOut)) {
     const size_t before = em.ops.size() + em.explosions.size() + em.spawns.size() +
                           em.winds.size() + em.bodyImpulses.size();
     std::erase_if(em.ops, [&](const BrushOp& o) {
@@ -484,8 +474,9 @@ Aim AimFor(TickAuthorityCtx& w, const KitSpell& ks, uint64_t mobId, const ai::Ca
 }
 
 // ---- BLINK -------------------------------------------------------------------------------
-MobCastOutcome Blink(TickAuthorityCtx& w, MobCaster& c, const KitSpell& ks,
-                     const ai::CastRequest& req, uint32_t tick, CastEvent& ev) {
+MobCastOutcome Blink(TickAuthorityCtx& w, std::span<SessionTick> players, MobCaster& c,
+                     const KitSpell& ks, const ai::CastRequest& req, uint32_t tick,
+                     CastEvent& ev) {
   Vec3 size{};
   const Vec3 centre = BoxCentre(w.mobs, c.mobId, &size);
   Vec3 flat{req.targetPoint.x - centre.x, 0.0f, req.targetPoint.z - centre.z};
@@ -498,12 +489,6 @@ MobCastOutcome Blink(TickAuthorityCtx& w, MobCaster& c, const KitSpell& ks,
   const Vec3 dirH = ks.toward ? flat : flat * -1.0f;
   const float dx = centre.x + dirH.x * hop, dz = centre.z + dirH.z * hop;
   ev.from = centre;
-  // THE FENCE FIRST, whatever D3 says: a contained demon never blinks out of
-  // its circle (D1's containment is a property of the circle, not a seal).
-  if (const LiveDemon* ld = ContainedDemon(w, c.mobId)) {
-    if (!ld->circle.Inside(dx, dz)) return MobCastOutcome::BlinkFenced;
-    if (DemonSealHook()(w, c.mobId, "blink")) return MobCastOutcome::BlinkSevered;   // D3 hook
-  }
   // A FLOOR, from a little above the body's own feet, and HEADROOM over it.
   const Vec3 origin = w.mobs.MobOrigin(c.mobId);
   Cells cells{WorldSpellProbe(w.world), &w.mats};
@@ -533,6 +518,14 @@ MobCastOutcome Blink(TickAuthorityCtx& w, MobCaster& c, const KitSpell& ks,
     }
   }
   const Vec3 newOrigin{dx - size.x * 0.5f, (float)floorY, dz - size.z * 0.5f};
+  const Mob* mob = w.mobs.FindMobById(c.mobId);
+  if (mob == nullptr || !mob->Alive() || mob->Ragdolled()) return MobCastOutcome::BlinkNoFloor;
+  // THE SEALS LAST, once the hop is otherwise certain (D3, demon_seals.h): a
+  // contained demon's quicksilver-severed `blink` refuses it; an unsevered one
+  // ALLOWS it -- and a landing outside the circle unbinds the demon there and
+  // then. That is the loophole the seal exists to close.
+  const Vec3 landing{dx, (float)floorY + size.y * 0.5f, dz};
+  if (!demon::AllowBlink(w, players, c.mobId, landing, tick)) return MobCastOutcome::BlinkSevered;
   if (!w.mobs.BlinkMob(c.mobId, newOrigin)) return MobCastOutcome::BlinkNoFloor;
   c.blinkReadyAt = tick + (uint32_t)ks.cooldownTicks;
   c.blinks++;
@@ -639,7 +632,7 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
   Cand& cd = cands[pick];
   ev.spell = cd.ks->name;
   if (cd.ks->blink) {
-    const MobCastOutcome o = Blink(w, *c, *cd.ks, req, tick, ev);
+    const MobCastOutcome o = Blink(w, players, *c, *cd.ks, req, tick, ev);
     if (o != MobCastOutcome::Blinked) return refuse(o);
     ev.outcome = o;
     m.stats.blinked++;
@@ -743,17 +736,39 @@ void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t t
         }
       }
     }
-    // cast_out SEVERED (D3) for a contained demon: its carriers die AT THE
-    // RING, before anything they carry can land outside it.
-    if (const LiveDemon* ld = ContainedDemon(w, c.mobId);
-        ld != nullptr && DemonSealHook()(w, c.mobId, "cast_out")) {   // D3 hook
+    // A CONTAINED DEMON'S CARRIER AT ITS RING (D3, demon::AllowCastOut): asked
+    // ONCE, the first tick the carrier is outside the circle. Severed -> it
+    // dies there, before anything it carries can land outside (what it
+    // resolved on the way out this very tick was filtered in Route). Open ->
+    // it flies on, and is not asked again.
+    if (const LiveDemon* ld = ContainedDemon(w, c.mobId); ld != nullptr) {
+      struct RingCtx {
+        TickAuthorityCtx* w;
+        MobCaster* c;
+        const LiveDemon* ld;
+        Vec3 from;
+      } rc{&w, &c, ld, BoxCentre(w.mobs, c.mobId)};
       m.stats.ringRefused += (uint64_t)c.spells.RefuseCarriers(
           [](void* ctx, const SpellProjectile& p) {
-            return OutsideRing(*(const LiveDemon*)ctx, SpellFxToFloat(p.pos.x),
-                               SpellFxToFloat(p.pos.z));
+            RingCtx& r = *(RingCtx*)ctx;
+            const Vec3 at{SpellFxToFloat(p.pos.x), SpellFxToFloat(p.pos.y),
+                          SpellFxToFloat(p.pos.z)};
+            if (!OutsideRing(*r.ld, at.x, at.z)) return false;
+            if (std::find(r.c->passedRing.begin(), r.c->passedRing.end(), p.seq) !=
+                r.c->passedRing.end())
+              return false;
+            if (!demon::AllowCastOut(*r.w, r.c->mobId, r.from, at)) return true;
+            r.c->passedRing.push_back(p.seq);
+            return false;
           },
-          (void*)ld);
+          &rc);
     }
+    // Forget the crossings of carriers no longer in the air.
+    std::erase_if(c.passedRing, [&](uint32_t seq) {
+      for (const SpellProjectile& p : c.spells.Live())
+        if (p.seq == seq) return false;
+      return true;
+    });
     m.stats.maxLiveSeen = std::max(m.stats.maxLiveSeen, LiveOf(c));
   }
   // ---- wards across VMs: yours absorb its bolts, its absorb yours ------------------

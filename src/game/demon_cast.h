@@ -39,16 +39,17 @@
 // BLINK: a short teleport (MobSystem::BlinkMob) toward or away from the
 // target, onto a floor found in the T-4 snapshot, line of sight optional per
 // entry, a cooldown. REFUSED when the destination has no floor, when line of
-// sight is asked for and blocked, when the demon is CONTAINED and the
-// destination is outside its circle (D1's fence, whatever D3 says), and when
-// D3's `blink` channel is severed.
+// sight is asked for and blocked, and -- for a CONTAINED demon -- when D3's
+// quicksilver severs its `blink` channel (demon::AllowBlink). An UNSEVERED
+// blink is a loophole by design: a contained demon that blinks OUT of its
+// circle is unbound by AllowBlink on the spot (it has left the circle). The
+// walk fence (D1) still holds every step; only the teleport skips it.
 //
-// D3 HOOK. Whether a channel (`cast_out`, `blink`) is SEVERED by the seal
-// piles round a contained demon's circle is D3's answer (src/game/
-// demon_seals.{h,cpp}, a parallel package). DemonSealHook() below is the one
-// place it is asked; it defaults to "nothing is severed" and the orchestrator
-// wires D3's query into it at merge. Its two call sites in demon_cast.cpp are
-// marked `// D3 hook`.
+// THE SEALS (D3, game/demon_seals.h) are asked at exactly three places:
+// demon::AllowBlink before a hop lands, demon::AllowCastOut when a contained
+// demon's carrier crosses its ring, and demon::ChannelSevered(CastOut) for
+// what an instant cast or a resolve would put outside it (its ops, blasts,
+// sprays, the far end of a wind, a push on a body out there).
 //
 // DETERMINISM: CPU gameplay state in the 30 Hz tick (TickAuthority, right after
 // phase H's mobs.PreTick that issued the requests), integer spell VM, draws by
@@ -127,8 +128,7 @@ enum class MobCastOutcome : uint8_t {
   NothingInRange,  // no kit spell on its list fits this distance / its mana / its cap
   BlinkNoFloor,    // no floor (or no headroom, or unseen) where the hop would land
   BlinkNoSight,    // the hop's line is blocked and the entry wants sight
-  BlinkFenced,     // contained, and the landing is outside the circle (D1's fence)
-  BlinkSevered,    // D3: the `blink` channel is severed
+  BlinkSevered,    // D3: contained, and the `blink` channel is severed
   NoRoom,          // kMaxCasters VMs already, or kCastsPerTick served this tick
 };
 const char* CastOutcomeName(MobCastOutcome o);
@@ -154,6 +154,9 @@ struct MobCaster {
   std::vector<std::pair<uint32_t, uint32_t>> seen;
   bool gone = false;       // the creature died / left: drain, then forget
   uint32_t casts = 0, blinks = 0, refused = 0;
+  // Carriers (SpellProjectile::seq) already ALLOWED out of a contained demon's
+  // ring by demon::AllowCastOut: asked once, at the crossing.
+  std::vector<uint32_t> passedRing;
 };
 
 struct MobCastWorld {
@@ -208,10 +211,3 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
 // Every creature's flight carriers, for the renderer (they are drawn like the
 // player's; main.cpp's projectile loop).
 void MobCastAppendLive(const TickAuthorityCtx& w, std::vector<const SpellProjectile*>& out);
-
-// ---- D3 hook ------------------------------------------------------------------------
-// Is `channel` ("cast_out", "blink") SEVERED for this (contained) demon by the
-// seal piles round its circle? D3 (src/game/demon_seals.{h,cpp}) answers; the
-// orchestrator points this at D3's query at merge. Default: nothing severed.
-using DemonSealQuery = bool (*)(TickAuthorityCtx& w, uint64_t mobId, const char* channel);
-DemonSealQuery& DemonSealHook();
