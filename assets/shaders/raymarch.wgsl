@@ -503,7 +503,7 @@ const ELEC_R2_CONDUCTS : u32 = 67108864u;  // elec.h kElecR2Conducts
 const ARC_HZ : f32 = 20.0;
 const ARC_SPARK_P : u32 = 600u;
 const ARC_CORE_K : f32 = 6.0;
-const ARC_HALO_K : f32 = 1.4;
+const ARC_HALO_K : f32 = 2.0;
 fn isDischargeMat(m : u32) -> bool {
   return m != MAT_AIR && materials[m].klass == CLASS_GAS &&
          (materials[m]._r2 & ELEC_R2_SOURCE) != 0u;

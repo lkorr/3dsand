@@ -2323,6 +2323,90 @@ screenshot_elec,screenshot_elec_night,screenshot_elec_view` (RunShots' charge
 block: a lightning-fed and a spark-fed copper wire and an arc-fed pond on a
 levelled stone platform, sources re-laid every tick in stone pockets).
 
+**Render, wave 2 (package D, 2026-10-04; `raymarch.wgsl` `boltEmit` /
+`boltLightAt` / `arcFilaments` / `elecGlow` / `elecUnderwater`,
+`src/sim/boltfx.*`; docs/PLAN_electricity_wave2.md "Package D").** Electricity
+that looks like electricity, render-only -- nothing below is hashed, read back
+or in the op record; the world hash does not move.
+
+- **The bolt.** `PlanStrike` keeps its walks as ordered cell lists
+  (`StrikePlan::paths`, `StrikePath` in `sim/boltfx.h`: the channel top ->
+  foot, the forks, the splash walks), carried to the frame on the strike event
+  (`strikes.events[i].paths`). `boltfx::NoteStrike` turns them into segments
+  on the RENDER clock: the channel resampled every 3 cells and displaced at
+  sub-cell scale (midpoint displacement, a render-only hash), continued 90 m UP
+  out of the plan toward the deck (short jagged legs over the first 30 m, long
+  ones above), 7-10 render-only side branches biased low that taper toward
+  their tips (one may fork again), the plan's forks and splash as thinner,
+  shorter-lived lines; and a STROKE ENVELOPE -- the return stroke, 1-3
+  re-strikes 40-150 ms apart down the same channel (the branches light on the
+  first only), the continuing-current afterglow, a 60 Hz flicker, a fade. A
+  shock (no channel) is its splash alone. A peer's bolt (`ev.remote`, no plan)
+  gets a column up from its foot. Eight LIGHT POINTS along the lower channel
+  make the bolt a light: `boltLightAt` adds `albedo x sum(I x (0.25 + 0.75
+  n.l) / (1 + d^2 / 70^2)) x 0.45` on every near surface while it burns
+  (unshadowed: it burns a third of a second). `weather::NoteStrike` (the deck
+  flash) and thunder are unchanged.
+- **GPU.** One read-only storage buffer at renderBGL_ 44 (`boltBuf`, 35 KiB:
+  header, 64 groups of 16 segments with their AABBs, 16 light points, 1,024
+  segments), rewritten by `boltfx::Upload` from `WriteRenderParams` (the one
+  place every drawing path sets its params) only while a bolt burns, plus once
+  to zero it. The raymarch adds the bolt along the view ray nearer than the
+  hit (opaque, far field, or a liquid seen from above): per group a ray-AABB
+  test (expanded by the halo's reach), per segment the ray's closest approach
+  -> a hot core (never thinner than 0.6 px; brightness scaled by sqrt of the
+  widening) and an exponential halo, MAX over segments so joints do not bead.
+- **Arcs and sparks.** A gas whose material is a charge SOURCE (`_r2` bit 25,
+  `kElecR2Source`: spark, arc, lightning, any modder's `electric.source` gas)
+  is no longer media: the march records the first one it crosses
+  (`Hit.elecCell`, one u32 -- the whole register cost) and marches on as
+  through air. fs() then draws that cell and every discharge cell of its 3x3x3
+  as FILAMENTS (`arcFilaments`), re-rolled 20 times a second: a jittered node
+  per cell, strands to the shared face / edge / corner of discharge
+  neighbours (all 26; the meeting point is a symmetric pair hash, so a
+  diagonal walk is one unbroken line; face pairs link most, corner pairs
+  least, so a cluster is not a web), strands to the face of a neighbour that
+  CONDUCTS (bit 26) or by chance any solid / liquid, with a hot spot where it
+  lands, one or two kinked strands a leg, a crackle that drops legs per frame,
+  a free writhing strand when there is nothing to touch, and a SPARK (cell P <
+  600) as a short twinkling streak. Strength is log2 of the cell's own P, so
+  lightning's cells burn hotter than an arc's with no material named.
+  **Everything a cell draws stays inside that cell, glow included (a tight
+  Gaussian halo):** only a ray that crossed a discharge cell evaluates it, so
+  anything leaving the cell would be cut at the cell's silhouette -- the pale
+  cube this replaced. Long arcs come from the BOLT path: a strike's splash and
+  the shock glyph's walks are drawn there too, unclipped.
+- **Charged conductors creep.** `elecGlow` is now a dim base plus thin bright
+  VEINS: the ridge lines of two octaves of value noise in world cells,
+  drifting (the crawl) and re-seeded 7 times a second (the crackle), so a
+  charged copper bar or pond crawls with filaments instead of a flat tint.
+  Continuous across cell faces (a function of the world point).
+- **Underwater.** A submerged eye used to see no glow at all (the liquid glow
+  is a SURFACE term, `!underwater`). Now `elecUnderwater` samples the field
+  at 8 taps along the first 64 cells of the underwater path and adds each
+  charged tap's glow, dimmed by the water it came through.
+- **Cost.** Nothing electric on screen: `boltBuf[0]` (one dynamically uniform
+  load a pixel) and the existing `elecAnyCharge()` header loads; the arc path
+  only runs on pixels whose ray crossed a discharge cell. Measured
+  (`--render-budget`, 1080p, baseline arm, exclusive
+  runs; control = the same exe with main's raymarch.wgsl via
+  `SANDVOX_ASSET_DIR`): **noon** 6.79 / 6.76 ms vs 7.26 / 6.80 (no change);
+  **dusk** 4.93 / 4.92 vs 4.46 / 4.89 (inside the drift); **fire** 12.03 /
+  11.57 vs 11.06 / 11.33 / 11.31 (about +0.3 ms; NOT the march's discharge
+  test -- an arm with it compiled out measured 11.62 -- and the register count
+  is unchanged at 128 with the same 96 B spill, so it is most likely the
+  +46 KB of fragment binary); **storm** (a bolt on its return stroke, 40 m out)
+  8.38 vs 6.66 -- the bolt costs ~1.7 ms for the third of a second it burns.
+- **Look harness.** `--shot-frames screenshot_elec_arc` (dusk, close: an arc
+  re-laid between two copper posts, sparks on a copper plate, and a SHOCK
+  fired into the gap), `screenshot_elec_bolt` / `_bolt_night` (a storm strike
+  onto a copper rod at its return stroke, day and night), `_bolt_late` (0.3 s
+  on), `screenshot_elec_uw` (inside the charged pond). `--render-budget`
+  camera `storm`: the overlook with a strike 40 m out on its return stroke.
+- **Not done.** Charged RASTER bodies (mobs, debris) do not glow (package B
+  owns per-body charge; no per-body P is exposed yet). The bolt light is
+  unshadowed. Far-cascade surfaces are not lit by the bolt (only near hits).
+
 ### Electricity — shocks reach bodies (2026-10-03; package E4, `game/mob_shock.cpp`, `sim_elec.wgsl` elecQuery, docs/PLAN_electricity.md section 4, gates `elec-water-mob`, `elec-stun`, `elec-player-stun`, `elec-replay`)
 
 **The body asks; the GPU answers at the fixed latency.** The field lives on the
@@ -4956,7 +5040,10 @@ Pending strikes are tick state like the reactions' aftermath: not hashed, not
 saved. FORCE one with `strikes.forceNext` (+ `forceAim`) -- what the gate does
 -- or `SANDVOX_STRIKE_EVERY=<ticks>` (a strike every N ticks whatever the sky).
 **Presentation** is the frame's: every emitted bolt lands in
-`strikes.events`, which `main.cpp` drains into `weather::NoteStrike` (the deck
+`strikes.events` (with its plan's walks, `paths`), which `main.cpp` drains
+into `boltfx::NoteStrike` -- the luminous branching bolt itself, drawn and lit
+by the raymarch ("Render, wave 2" in "Electricity -- charge field") -- and
+`weather::NoteStrike` (the deck
 lights over the bolt with the far flashes' stroke-and-restrike envelope, aged
 on the sim clock; `State::strikeFlash`, outshining a far flash while it lasts)
 and `Cues::Thunder` (set `weather/thunder`, the `weather` owner in
