@@ -972,6 +972,9 @@ struct TickAuthorityCtx {
       bool conductive = false;
       bool emitted = false;   // false = refused for budget
       uint32_t cells = 0;
+      // The plan's walks (StrikePath), for the frame's bolt (game/boltfx.*);
+      // render-only, empty when refused.
+      std::vector<StrikePath> paths;
     };
     std::vector<Event> events;        // drained by the frame; capped at kMaxEvents
     static constexpr size_t kMaxEvents = 16;

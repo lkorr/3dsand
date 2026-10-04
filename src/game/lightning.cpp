@@ -191,6 +191,9 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
     int oz = (int)((h0 >> 8) % (uint32_t)(2 * span + 1)) - span;
     // Fork points: up to `forks` steps on the upper two thirds of the bolt.
     const int nForks = std::clamp(spec.forks, 0, 3);
+    // Render geometry (StrikePath): the channel first, its forks after it.
+    p.paths.push_back({StrikePath::Channel, {}});
+    p.paths[0].cells.reserve((size_t)h);
     for (int st = h; st >= 1; st--) {
       // `st` steps above the foot: y = foot.y + st - 1 ... foot.y.
       const uint32_t hs = rng::Hash3(key, 0xB0180000u, (uint32_t)st);
@@ -204,6 +207,7 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
       const IVec3 c{foot.x + ox, foot.y + st - 1, foot.z + oz};
       Push(p, world, c, spec.boltMat, hs);
       p.boltCells++;
+      p.paths[0].cells.push_back(c);
       // A fork: a short diagonal run down and away from the main channel.
       for (int f = 0; f < nForks; f++) {
         const uint32_t hf = rng::Hash3(key, 0xB0190000u, (uint32_t)f);
@@ -212,6 +216,7 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
         const int fx = (hf >> 12) & 1u ? 1 : -1, fz = (hf >> 13) & 1u ? 1 : -1;
         const int len = 3 + (int)((hf >> 16) % 4u);
         IVec3 fc = c;
+        StrikePath fork{StrikePath::Fork, {c}};
         for (int k = 0; k < len; k++) {
           const uint32_t hk = rng::Hash3(key ^ hf, 0xB01A0000u, (uint32_t)k);
           fc.x += (hk & 1u) ? fx : 0;
@@ -219,7 +224,9 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
           fc.y -= 1;
           Push(p, world, fc, spec.boltMat, hk);
           p.boltCells++;
+          fork.cells.push_back(fc);
         }
+        p.paths.push_back(std::move(fork));
       }
     }
   }
@@ -238,6 +245,7 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
       const int di = (int)((hd + (uint32_t)k * 3u) % 8u);
       const int hx = kDir[di][0], hz = kDir[di][1];
       IVec3 c = foot;
+      StrikePath walk{StrikePath::Splash, {foot}};
       for (int st = 0; st < len; st++) {
         const uint32_t hs = rng::Hash3(key ^ (uint32_t)k * 0x9E3779B9u, 0xA2C70000u, (uint32_t)st);
         c.x += ((hs >> 4) & 1u) ? hx : Kick(hs);
@@ -247,7 +255,9 @@ StrikePlan PlanStrike(const StrikeSpec& spec, const StrikeMats& mats,
         c.y += v < 8 ? -1 : v < 11 ? 1 : 0;
         Push(p, world, c, spec.splashMat, hs);
         p.splashCells++;
+        walk.cells.push_back(c);
       }
+      p.paths.push_back(std::move(walk));
     }
   }
   return p;

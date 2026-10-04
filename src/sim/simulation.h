@@ -1195,6 +1195,10 @@ class Simulation {
   // size, made at Init. 31 in shadowBGL_ (compute, written; gasOuter is read
   // there at 30), 40 in renderBGL_ (fragment, read).
   rhi::Buffer gasMaskBuf_;
+  // The bolt table (sim/boltfx.h): a strike's render-only segments and light
+  // points. 44 in renderBGL_ (fragment, read); CPU-written per frame by
+  // boltfx::Upload while a bolt burns.
+  rhi::Buffer boltBuf_;
   // The GI gather request list (gi_gather.wgsl; pass_table.h kGiReq*): fixed
   // size, zeroed at Init (the dedup bitmap must start empty). 28 in
   // shadowBGL_ (compute), 39 in renderBGL_ (fragment, appends). giArgsBuf_ is

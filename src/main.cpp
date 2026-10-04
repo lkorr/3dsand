@@ -97,6 +97,7 @@
 #include "sim/wind.h"
 #include "sim/windfield.h"
 #include "sim/weather.h"
+#include "sim/boltfx.h"   // the bolt you see (render-only; package D)
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
 #include "sim/world.h"
@@ -2770,8 +2771,21 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
   //   screenshot_elec_night  the same view at night, where the glow carries
   //   screenshot_elec_view   the charge view (F11): P in false colour
   // Moves the window and regenerates, like the pond block above.
+  //
+  // ELECTRICITY WAVE 2, PACKAGE D (discharges that look like electricity):
+  //   screenshot_elec_arc        close, at dusk: an arc held across the gap
+  //                              between two copper posts, sparks over a copper
+  //                              plate -- filaments, not cubes
+  //   screenshot_elec_bolt       a storm's ground strike (WeatherStrikeSpec)
+  //                              onto a copper rod, at its return stroke
+  //   screenshot_elec_bolt_night the same strike at night: the bolt lights it
+  //   screenshot_elec_bolt_late  the same at night, 0.3 s on: the channel's
+  //                              afterglow after the branches have gone out
+  //   screenshot_elec_uw         from inside the charged pond, under its surface
   if (ShotWanted("screenshot_elec") || ShotWanted("screenshot_elec_night") ||
-      ShotWanted("screenshot_elec_view")) {
+      ShotWanted("screenshot_elec_view") || ShotWanted("screenshot_elec_arc") ||
+      ShotWanted("screenshot_elec_bolt") || ShotWanted("screenshot_elec_bolt_night") ||
+      ShotWanted("screenshot_elec_bolt_late") || ShotWanted("screenshot_elec_uw")) {
     auto matId = [&](const char* name) {
       for (size_t i = 0; i < mats.size(); i++)
         if (mats[i].name == name) return (uint32_t)i;
@@ -2831,6 +2845,26 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     put(build, ex, yP, ez, copper);
     put(build, ex, yP - 1, ez, copper);
     put(feed, ex, yP + 1, ez, mArc);
+    // Package D's subjects, on the free half of the platform (x < gx, z > gz):
+    // two copper posts with an arc re-laid across the gap between them, a
+    // copper plate with sparks over it, and a tall copper rod the bolt takes.
+    const int postY1 = yP + 5, arcZ = gz + 4, postA = gx - 15, postB = gx - 8;
+    for (int y = yP + 1; y <= postY1; y++) {
+      put(build, postA, y, arcZ, copper);
+      put(build, postB, y, arcZ, copper);
+    }
+    for (int x = postA + 1; x < postB; x++) {
+      // A sagging, kinked run between the post tops: two arc cells a column.
+      const int sag = (x == postA + 1 || x == postB - 1) ? 0 : 1;
+      put(feed, x, postY1 - sag, arcZ, mArc);
+      put(feed, x, postY1 - sag + ((x & 1) ? 1 : -1), arcZ + ((x % 3) == 0 ? 1 : 0), mArc);
+    }
+    for (int z = gz + 8; z <= gz + 11; z++)
+      for (int x = gx - 22; x <= gx - 19; x++) put(build, x, yP + 1, z, copper);
+    for (int k = 0; k < 6; k++)
+      put(feed, gx - 22 + (k * 5) % 4, yP + 2 + (k % 2), gz + 8 + (k * 3) % 4, mSpark);
+    const int rodX = gx - 5, rodZ = gz + 11, rodTop = yP + 9;
+    for (int y = yP + 1; y <= rodTop; y++) put(build, rodX, y, rodZ, copper);
     uint32_t t = 1;
     SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, site, false, {8, 3, 8}, false, false);
     SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, build, false, {8, 3, 8}, false, false);
@@ -2844,6 +2878,63 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
     shotExtraFlags = 64u;
     render(eye, 1.5708f, -0.36f, "screenshot_elec_view.bmp");
     shotExtraFlags = 0u;
+    // The arc, close, at dusk (the filaments read against a dim scene): the
+    // re-laid arc cells between the posts, and a SHOCK (the shock glyph's
+    // strike: splash only, at the aim) fired into the gap this tick -- its
+    // walks drawn by the frame's bolt (sim/boltfx.h) as well as by the cells.
+    const uint32_t duskTick = (uint32_t)(0.79 * (double)shotTicksPerDay) % shotTicksPerDay;
+    if (ShotWanted("screenshot_elec_arc")) {
+      StrikeMats smats;
+      smats.Resolve(mats);
+      StrikeSpec shock;
+      shock.aim = {(postA + postB) / 2, postY1, arcZ};
+      shock.atAim = true;
+      shock.height = 0;
+      shock.splashMat = smats.arc;
+      shock.splashRadius = 3;
+      shock.arcs = 6;
+      shock.key = 0x5110C4u;
+      const StrikePlan sp = PlanStrike(shock, smats, nullptr, world);
+      std::vector<CellOp> ops = feed;
+      ops.insert(ops.end(), sp.cells.begin(), sp.cells.end());
+      SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, ops, false, {8, 3, 8}, false,
+                 false);
+      ctx.WaitIdle();
+      boltfx::Clear();
+      boltfx::NoteStrike(sp.paths, kShotTime - 0.004f, shock.key);
+    }
+    renderAt({(float)(gx - 11) + 0.5f, (float)(yP + 6), (float)(gz - 4)}, 1.5708f, -0.12f,
+             "screenshot_elec_arc.bmp", (int64_t)duskTick);
+    boltfx::Clear();
+    // Under the pond: the eye in its lower layer, looking along it.
+    render({(float)(px0 + 2) + 0.5f, (float)(yP - 1) + 0.45f, (float)(pz0 + 2) + 0.5f},
+           0.6f, -0.05f, "screenshot_elec_uw.bmp");
+    // THE BOLT: a storm's ground strike planned onto the rod (no probe: the
+    // shot has no mirror, so it lands at the aim -- the rod's top), emitted
+    // through the queue like every strike, and handed to the frame's bolt
+    // (sim/boltfx.h) at its return stroke.
+    if (ShotWanted("screenshot_elec_bolt") || ShotWanted("screenshot_elec_bolt_night") ||
+        ShotWanted("screenshot_elec_bolt_late")) {
+      StrikeMats smats;
+      smats.Resolve(mats);
+      const uint32_t key = 0x5EED0B17u;
+      const StrikePlan plan = PlanStrike(WeatherStrikeSpec(smats, {rodX, rodTop, rodZ}, key),
+                                         smats, nullptr, world);
+      SubmitTick(ctx, world, sim, t++, kDefaultSeed, {}, {}, plan.cells, false, {8, 3, 8},
+                 false, false);
+      ctx.WaitIdle();
+      const Vec3 beye{(float)(gx - 6), (float)(yP + 22), (float)(gz - 52)};
+      boltfx::Clear();
+      boltfx::NoteStrike(plan.paths, kShotTime - 0.004f, key);
+      renderAt(beye, 1.5708f, 0.12f, "screenshot_elec_bolt.bmp", -1);
+      renderAt(beye, 1.5708f, 0.12f, "screenshot_elec_bolt_night.bmp", (int64_t)nightTick);
+      boltfx::Clear();
+      boltfx::NoteStrike(plan.paths, kShotTime - 0.3f, key);
+      renderAt(beye, 1.5708f, 0.12f, "screenshot_elec_bolt_late.bmp", (int64_t)nightTick);
+      boltfx::Clear();
+      // Zero the table for whatever frame comes next.
+      boltfx::Upload(ctx.queue, kShotTime);
+    }
   }
 
   // ---- THE LOD SEAM AT EYE HEIGHT (2026-09-28, LOD-seam overhaul P0) ----
@@ -5331,7 +5422,7 @@ int main(int argc, char** argv) {
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,village,seam,seamveg; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,storm,village,seam,seamveg; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -14122,6 +14213,12 @@ int main(int argc, char** argv) {
       // (no bolt) is too small for either. Bounded by the tick's own cap.
       for (const auto& ev : tickCtx.strikes.events) {
         if (!ev.emitted || ev.cells == 0) continue;
+        // THE BOLT ITSELF (sim/boltfx.h, electricity wave 2 package D): the
+        // plan's channel, forks and splash drawn as a luminous branching bolt
+        // that lights the scene, on the render clock. Render-only.
+        boltfx::NoteStrike(ev.paths, (float)now,
+                           ev.tick * 0x9E3779B9u ^ (uint32_t)(ev.target.x * 73856093) ^
+                               (uint32_t)(ev.target.z * 19349663));
         const Vec3 at{(float)ev.foot.x + 0.5f, (float)ev.foot.y + 0.5f,
                       (float)ev.foot.z + 0.5f};
         if (ev.weather || ev.foot.x != ev.target.x || ev.foot.y != ev.target.y ||

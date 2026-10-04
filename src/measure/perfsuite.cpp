@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "game/camera.h"
+#include "game/lightning.h"  // CamStorm: a planned strike (render-budget storm camera)
 #include "gpu/context.h"
 #include "gpu/passtimer.h"
 #include "gpu/resources.h"
@@ -23,6 +24,7 @@
 #include "math3d.h"
 #include "measure/perfnodes.h"
 #include "measure/perfscope.h"
+#include "sim/boltfx.h"     // CamStorm: the bolt on the frozen render clock
 #include "sim/celestial.h"
 #include "sim/farfield.h"
 #include "sim/heat.h"
@@ -2968,6 +2970,41 @@ bool CamSmoke(Scene& s, uint32_t& tick, std::string& why) {
   tick = FindNoonTick(CurrentTuning());
   return true;
 }
+// A STRIKE IN VIEW (electricity wave 2, package D): the overlook, a storm's
+// ground strike (WeatherStrikeSpec) planned 40 m out in the middle of the
+// frame and emitted through the queue, the frame frozen on its return stroke
+// (sim/boltfx.h at kBudgetAnimTime), plus its arc splash as discharge cells.
+// Prices the bolt (boltEmit + boltLightAt on every pixel while it burns) and
+// the arc filaments against `noon`, the same overlook with nothing electric
+// in it -- whose number is the "costs nothing when idle" claim.
+bool CamStorm(Scene& s, uint32_t& tick, std::string& why) {
+  OverlookEye(s);
+  StrikeMats sm;
+  sm.Resolve(s.mats);
+  if (!sm.Ready()) { why = "no lightning / arc material"; return false; }
+  // 40 m along the view's heading from the eye, on the ground.
+  const int ax = (int)(s.eye.x + std::cos(s.cam.yaw) * 400.0f);
+  const int az = (int)(s.eye.z + std::sin(s.cam.yaw) * 400.0f);
+  const int ay = World::TerrainHeight(ax, az, kDefaultSeed);
+  const uint32_t key = 0xB017C0DEu;
+  const StrikePlan plan =
+      PlanStrike(WeatherStrikeSpec(sm, {ax, ay, az}, key), sm, nullptr, s.world);
+  const IVec3 pc{ax >> 4, ay >> 4, az >> 4};
+  SubmitTick(s.ctx, s.world, s.sim, 3100, kDefaultSeed, {}, {}, plan.cells, false, pc,
+             false, true);
+  s.ctx.WaitIdle();
+  boltfx::Clear();
+  boltfx::NoteStrike(plan.paths, kBudgetAnimTime - 0.004f, key);
+  char note[200];
+  std::snprintf(note, sizeof note,
+                "overlook, a ground strike at (%d,%d,%d) 40 m out: %zu cells, %zu paths, "
+                "frame frozen on the return stroke", ax, ay, az, plan.cells.size(),
+                plan.paths.size());
+  s.note = note;
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+
 const char* const kArmsSmoke[] = {
     "baseline", "noshadow", "nogi", "nofar", "halfres", "lod8", nullptr};
 
@@ -3057,6 +3094,8 @@ const BudgetCam kBudgetCams[] = {
      CamSmoke, kArmsSmoke},
     {"fire", "inside a burning forest 20 s after ignition, looking level",
      CamFire, kArmsFire},
+    {"storm", "the overlook with a lightning strike 40 m out, on its return stroke",
+     CamStorm, kArmsReduced},
     {"village", "the Harrowby green with all three houses burning in oil, looking "
                 "at the longhouse",
      CamVillage, kArmsFire},
@@ -3854,6 +3893,9 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       Scene scene{ctx, world, sim, stream, mats};
       uint32_t tick = 0;
       std::string why;
+      // A bolt (sim/boltfx.h) belongs to the camera that struck it: the
+      // budget's render clock is frozen, so one left over would burn forever.
+      boltfx::Clear();
       if (!c->setup(scene, tick, why)) {
         std::printf("\n=== camera %s — DECLINED ===\n        %s\n", c->id,
                     why.c_str());
