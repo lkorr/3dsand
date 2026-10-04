@@ -948,6 +948,9 @@ const char* const kOrder[] = {
     // Electricity E3: a forced weather strike on a rod-and-collar fixture,
     // run twice; same fixture discipline (own pad, regenerates on the way out).
     "elec-strike",
+    // Electricity wave 2: the same forced strike onto a sea basin and a
+    // rain-wet pad -- the spreading loss keeps it local. Same discipline.
+    "elec-bulk",
     // Electricity E1: the charge field in three sealed rooms (a copper wire,
     // a dry and a wet wood strip, a water pool), run twice; own worldgen,
     // regenerates on the way out.

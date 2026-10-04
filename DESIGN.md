@@ -2062,23 +2062,29 @@ reads it (E2, "What charge does" below -- which is where the world hash moved),
 as do E4 (mob shock) and E5 (the glow).
 
 **Material data** (`materials.json "electric"`, `ParseElectric`): `resist`
-1..254 is the potential a cell costs to enter (no block = insulator), `source`
-1..65535 the potential a cell holds every tick it exists; `ignite` / `char`
-are E2's, parsed and packed now. Authored: drawn copper `copper_bar` 1 (the
-solid; `copper` FILINGS are a powder, 3), silver / gold 1, aluminium /
-quicksilver 2, iron / steel / brass / molten iron 3, lead / molten salt 4, lye 5,
-water 6, blood / coolant 8, flesh / skin / muscle 20, wood (every plank, log and
-bark) 60; `spark` 200, `arc` 2,000, `lightning` 30,000. Packed to `elecParams`
-(4 words a material: resist | source, ignite / char ids, ignite chance) and two
-`_r2` bits (25 source, 26 conducts). **Wet:** a cell under a coat whose
+1..4094 is the potential a cell costs to enter (no block = insulator; TWELVE
+bits since wave 2 -- it was a byte, 1..254, and a byte cannot say "dry wood is
+nearly an insulator"), `source` 1..65535 the potential a cell holds every tick
+it exists; `ignite` / `char` are E2's; `dissolved` (wave 2) is the resist a
+conducting liquid falls to with this material dissolved in it at saturation
+(salt 2: brine). Authored: drawn copper `copper_bar` 1 (the solid; `copper`
+FILINGS are a powder, 3), silver / gold 1, aluminium / quicksilver / sodium 2,
+iron / steel / brass / molten iron 3, lead / molten salt / acid 4, lye 5, water
+6, blood / coolant 8, lava 10, flesh / skin / muscle 20, molten glass 20, shore
+mud 30, wood (every plank, log and bark) 1,500 (wave 2; it was 60, and one bolt
+ran ~500 cells of connected timber); `spark` 200, `arc` 2,000, `lightning`
+30,000. Packed to `elecParams` (4 words a material: resist | source, ignite /
+char ids, ignite chance, dissolved resist) and two `_r2` bits (25 source, 26
+conducts). **Wet:** a cell under a coat whose
 material conducts takes `min(resist, sim.elecWetResist x 15 / stain amount)`,
 so a wet plank or wet stone carries charge.
 
 **Update**, every CA-active tick after the heat rows:
-`P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay(P))` clamped at 0, in a
-conducting cell; an insulator holds its seed (0 unless it is a source). Max-plus
-only RAISES values toward the unique least fixpoint over its inputs, so the
-answer does not depend on thread order. `decay(P) = max(sim.elecDecay,
+`P' = max(seed, max_nb6(P_nb - enter(cell, P_nb)), P - decay(P))` clamped at 0,
+in a conducting cell, `enter(cell, p) = resist + p x spreadQ(n) / 4096` (the
+spreading loss, below); an insulator holds its seed (0 unless it is a source).
+Max-plus only RAISES values toward the unique least fixpoint over its inputs, so
+the answer does not depend on thread order. `decay(P) = max(sim.elecDecay,
 P >> sim.elecDecayShift)` (8 and 3: an eighth a tick above P = 64, a flat 8
 below; shift 0 = the floor alone) is taken once a tick, in round 0, off every
 stored value. `sim.elecRounds` rounds a tick (default 4): each relaxes
@@ -2112,6 +2118,45 @@ rounds, copper, 150 ticks held): a held arc (2,000) still holds 1,937 / 1,631
 1,433), a held spark reaches 174 cells (183 linear), held lightning 11,447 at
 512 -- copper still carries across the whole window.
 
+**The spreading loss (wave 2, 2026-10-04; `sim.elecSpreadLoss` 150,
+`sim.elecSpreadFree` 2).** Max-plus with a per-cell cost has no notion of
+current dividing, so BULK conductors carried charge as far as a wire: lightning
+(30,000) into water (6) reached ~800 cells, paged the window until the pool
+refused, held hundreds of chunks awake for ~50 ticks and shocked every body on
+wet ground anywhere. Now a cell also loses `(n - free) x elecSpreadLoss / 4096`
+of the potential it RECEIVES, where n is its count of conducting face
+neighbours: a wire (n <= 2) pays nothing, so copper still crosses the window; a
+sheet (rain-wet ground's coated top layer, a plank wall: 4) pays ~10%, bulk
+water (5-6) 11-15%. Proportional, so reach grows with log P. Measured
+(`elec-bulk`, a forced strike): into a 129 x 129 sea basin, P > 0 reaches 33
+cells (3.3 m) and P >= 20 -- a wet body's shock -- 31, over 6,980 cells and 20
+pages; onto a rain-wet dirt pad 25 cells, 1,263 cells, 15 pages. The same gate
+with the loss off (the field before wave 2): the whole basin (reach 89, 66,056
+cells, 83 pages) and the whole pad (66, 11,891 cells). A spark in elec-field's
+32 x 32 pool charges 188 cells (was ~1,100).
+The product is held under 4096 so the entry cost never falls as p rises
+(monotone) and the relaxation still converges to a least fixpoint in any order;
+n is static within the tick (it is read off the voxels, cached per page, see
+below). `elec-bulk` (a forced strike onto a 129 x 129 sea basin and a rain-wet
+dirt pad) asserts the reach, the pages, that nothing pages outside the fixture,
+that the water still shocks a wet body (P >= 20) some metres out, and that
+every page comes back and the fixture sleeps.
+
+**Brine (wave 2).** The resist rule lives once, in the MIRROR elec block
+(`elecResistBase` = material + the wet coat, `elecResistRaw` = + brine), so the
+field and E2's ohmic heat cannot disagree. A conducting LIQUID carrying a
+dissolved species whose `from` material has `electric.dissolved` conducts as
+`dissolved + (own - dissolved) x (sat - c) / sat` at concentration c (the
+solute layer's mass x 8 / fullness): saturated brine 2 against fresh water's 6.
+sim_elec binds the solute layer (40..43) for it.
+
+**The cell cache (wave 2).** A chunk's FIRST round of a tick builds a u16 per
+cell -- resist, conducting face neighbours, a source bit -- into a block beside
+the pages (`kElecCacheBase`, one per page, stamped with the tick), and every
+later round of that tick reads it: no voxel, material, stain or solute read and
+no face scan in rounds 1..3. Exact, because no voxel changes between the elec
+rows. +16 MiB (the pool buffer is 48 MiB).
+
 **Pages.** 2,048 pages (32 MiB) of 4,096 u16 cells x 2 halves; `elecMeta`
 holds the entry and owner per window slot, a want bitset, two live lists and
 the free stack. A chunk is paged by caMask's DOORBELL (a source material in a
@@ -2123,7 +2168,12 @@ SLOT (prefix sum over the bitset), so exhaustion is a counted refusal
 `elecSettle` copies the last round to half 0 and frees an all-zero page.
 Readers: `elecAt(slot, local)` / `elecAtCell(c)` (MIRROR-BEGIN elec, pasted in
 `sim_step.wgsl` and held identical by check_invariants `elec`) read half 0 --
-LAST tick's settled field, stable over the whole CA.
+LAST tick's settled field, stable over the whole CA -- and, since wave 2, only
+when the slot's OWNER word names its resident chunk: the head re-keys a slot the
+window moved only after the CA, so a newly arrived chunk used to read the
+departed chunk's charge for a tick (the phantom). The head's re-key zeroing is
+workgroup-parallel (it was one thread per 16 KiB page), and only half 0 (half 1
+is zero on every listed page).
 
 **Staying awake (rule 2 and rule 1 together).** A charged chunk is marked dirty
 (bit 31, "elec") only when a chunk of its 3x3x3 is dirty this tick -- the CPU
@@ -2134,14 +2184,25 @@ end with charge and nothing markable; the TAIL then PURGES the whole field
 (`elecPurge`), because charge the CA does not run over would evolve for as many
 ticks as the CPU takes to prove the world settled -- a readback-timing outcome.
 In practice the source's own chunk is always dirty and the purge is the rare
-backstop (`elec.purges`, gate asserts 0). With no charge: 1 + rounds
-one-workgroup allocs reading the want bitset, zero-group indirects; a settled
-world records nothing (C_CAACTIVE).
+backstop (`elec.purges`, gate asserts 0). A settled world records nothing
+(C_CAACTIVE), and since wave 2 neither does an active world that cannot hold
+charge: every elec row but the body query is `C_ELEC` (CA active AND
+`World::ElecMayBeLive`, set by SubmitTick after it has seen the tick's ops) --
+it was 1 + rounds one-workgroup allocs, the copies, the zero-group indirects,
+settle and purge (~15 passes and their barriers, ~61 us/frame of GPU in the
+`explosion` perf scenario) on every CA-active tick of a world with no charge.
+The latch is a pure function of the tick and the op list: a source op in the
+last K + 2 ticks, pages in use in the fixed-latency snapshot, or a DOORBELL
+ring (`kEmDoorbells`, counted by caMask) in a snapshot published in the last
+K + 2 ticks -- the last covers a source no op laid (a loaded save's spark, a
+chunk the pool refused); its want bit stays set while the rows are off, so the
+page comes at most K ticks late, deterministically.
 
 **`elec-field`** (three sealed rooms, run twice): a 160-cell copper wire
 charges its far end within the chunk-hop bound, P falls along it, the air and
-stone beside it stay 0; wet wood carries further than dry (dry <= 4 cells);
-a water pool charges >= 300 cells and never its far corner; every page is freed
+stone beside it stay 0; wet wood carries further than dry (dry: none since
+wave 2, a spark's 200 cannot enter 1,500); a water pool charges >= 150 cells
+(188 since the spreading loss) and never its far corner; every page is freed
 after the sparks stop and the fixture sleeps; the field hash and arrival tick
 agree across the two runs. E3's strike targeting (`StrikeMats::Resolve`) now
 reads `electric.resist <= 8` as "a conductor a bolt prefers".
@@ -2227,9 +2288,8 @@ source falls to 0 in ~55 ticks from lightning's 30,000; the field's own DIRTY_R_
 already kept those chunks awake for exactly as long.
 
 **Also authored with E2:** `gunpowder + tag:electric` (a spark sets it off;
-600 x spreadPct, last in its bucket). **Not done:** brine conducting better
-than fresh water (the field would need the solute layer's per-cell salt in
-sim_elec.wgsl; brine and water both use water's resist 6).
+600 x spreadPct, last in its bucket). Brine conducting better than fresh
+water: done in wave 2 (above).
 
 **Render (package E5b, 2026-10-03; `raymarch.wgsl` `elecPAt` / `elecGlow`).**
 The raymarch binds `elecPool` / `elecMeta` READ-ONLY at renderBGL_ 42/43
