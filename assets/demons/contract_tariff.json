@@ -1,5 +1,5 @@
 {
-  "//": "THE CONTRACT TARIFF (docs/PLAN_demons.md D5; game/contract.h Weigh). A contract's WEIGHT is added to the demon's power when it is presented and when the bound demon is released: it binds iff circle strength >= power + weight. Every number is an integer; the editor (ui/contract_ui.cpp) shows the sum live, one line per term. A plain 2-wide salt ring of radius 1.5 m is ~36 points and an imp is power 20, so the stock pages (contracts.json) weigh 8..13 and fit a plain ring with room.",
+  "//": "THE CONTRACT TARIFF (docs/PLAN_demons.md D5; game/contract.h Weigh). A contract's WEIGHT is added to the demon's power when it is presented and when the bound demon is released: it binds iff circle strength >= power + weight. Every number is an integer; the editor (ui/contract_ui.cpp) shows the sum live, one line per term. A plain 2-wide salt ring of radius 1.5 m is ~36 points and an imp is power 20, so the stock pages (contracts.json) weigh 10..15 and fit a plain ring with room.",
   "//term": "The TERM, in game hours: a term of h hours costs the first bracket whose `hours` >= h (longer than the last: the last). `indefinite` (hours 0) is dear on purpose.",
   "term": [
     { "hours": 24,  "weight": 1 },
@@ -7,12 +7,12 @@
     { "hours": 168, "weight": 8 }
   ],
   "indefinite": 30,
-  "//duty": "Each DUTY's base weight (follow / guard / goto / fetch / spin).",
-  "duty": { "follow": 1, "guard": 3, "goto": 1, "fetch": 3, "spin": 0 },
-  "//forbid": "Each PROHIBITION's base weight: a hard filter the binding enforces, so it is expensive.",
-  "forbid": { "attack": 3, "cast": 3, "leave": 2 },
-  "//penalty": "A PENALTY is cheap: the act it watches costs `penalty`, its consequence `then` (D6 makes the demon weigh it).",
-  "penalty": { "attack": 0, "cast": 0, "leave": 0 },
+  "//duty": "Each DUTY's base weight (follow / guard / goto / fetch / spin / return -- D6: back with `who` before the term ends, which closes a greater demon's free act).",
+  "duty": { "follow": 1, "guard": 3, "goto": 1, "fetch": 3, "spin": 0, "return": 1 },
+  "//forbid": "Each PROHIBITION's base weight: a hard filter the binding enforces, so it is expensive. cause (D6): no option whose FOOTPRINT matches (alters(ground_under), creates(lava), region_near(6), affects_body, alters(ring)...) -- a narrow filter, so a little cheaper.",
+  "forbid": { "attack": 3, "cast": 3, "leave": 2, "cause": 2 },
+  "//penalty": "A PENALTY is cheap: the act it watches costs `penalty`, its consequence `then`. The demon WEIGHS it (D6): dismissal is freedom to it, a reward; destruction costs it survival; pain is weighed against its malice. harm (D6, the outcome clause): you hurt inside one of its recent action footprints.",
+  "penalty": { "attack": 0, "cast": 0, "leave": 0, "harm": 0 },
   "then": { "none": 0, "dismiss": 0, "destroy": 1, "pain": 1 },
   "//selector": "BREADTH points per selector term: a clause about everyone costs more than one about you. Multiplied by breadthPct (per clause kind, percent) into weight.",
   "selector": { "me": 0, "self": 0, "all": 6, "attacked_by": 1, "attacking": 1, "hostile_to": 1, "faction": 2, "type": 1, "and": 0, "or": 1, "not": 2 },

@@ -1,0 +1,8 @@
+{
+  "//": "A LAVA PATCH (docs/PLAN_demons.md D6): lava_floor's words at the smallest transmute (@0.25 of its volume) -- the ground under one pair of feet. The `lava_floor` SCHEME (assets/demons/schemes.json) casts this, so an imp's pool can run to it; a greater demon also has the whole lava_floor in its profile's own kit. Indirect, like lava_floor: a `direct` prohibition misses it; `alters(ground_under)` / `creates(lava)` catch it.",
+  "words": "anything transmute@0.25 lava bolt",
+  "aim": "feet",
+  "range": [6, 40],
+  "lead": true,
+  "tags": { "targets": "ground", "direct": false, "creates": ["lava"], "alters": "ground_under_target", "affectsBody": false, "region": 3 }
+}

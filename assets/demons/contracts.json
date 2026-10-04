@@ -1,25 +1,28 @@
 {
-  "//": "STOCK CONTRACTS (docs/PLAN_demons.md D5; game/contract.h). Shipped with the game and read-only in the editor; every player can present them. Written to be safe against an imp: each forbids it attacking or casting at you, and each runs one day. The language is contract.h's: kind duty | forbid | penalty, a verb, `who` (a selector), `when` (a trigger), `arg`/`into`, `then`, `on`.",
+  "//": "STOCK CONTRACTS (docs/PLAN_demons.md D5, revisited in D6; game/contract.h). Shipped with the game and read-only in the editor; every player can present them. Written to be SAFE AGAINST AN IMP, i.e. against Skerrick's schemes and the duty twists (assets/demons/schemes.json, twists.json): each forbids it attacking you or casting at you (lava under you, a lift and a drop, a claw); each forbids it disturbing its own ring (`cause alters(ring)`: a bound imp still in the circle would otherwise gust its salt open and walk out free, its contract void); every `follow` names its distance (an unset one is the lead-astray twist) and the fetch names its vessel (an unset `into` is the deliver-it-onto-you twist). Each runs one day. NOT safe against a greater demon: Vathrael knows schemes these pages never name (fire beside you, standing where you fall). The language is contract.h's: kind duty | forbid | penalty, a verb, `who` (a selector), `when` (a trigger), `arg`/`into`, `then`, `on`.",
   "stock": [
     { "name": "Servant, one day", "hours": 24,
       "clauses": [
-        { "kind": "duty",   "verb": "follow", "who": "me" },
+        { "kind": "duty",   "verb": "follow", "who": "me", "arg": "2" },
         { "kind": "forbid", "verb": "attack", "who": "me" },
-        { "kind": "forbid", "verb": "cast",   "who": "me" }
+        { "kind": "forbid", "verb": "cast",   "who": "me" },
+        { "kind": "forbid", "verb": "cause",  "arg": "alters(ring)" }
       ] },
     { "name": "Bodyguard, one day", "hours": 24,
       "clauses": [
         { "kind": "duty",   "verb": "guard",  "who": "attacking(me) & hostile_to(me)" },
-        { "kind": "duty",   "verb": "follow", "who": "me" },
+        { "kind": "duty",   "verb": "follow", "who": "me", "arg": "2" },
         { "kind": "forbid", "verb": "attack", "who": "me" },
-        { "kind": "forbid", "verb": "cast",   "who": "me" }
+        { "kind": "forbid", "verb": "cast",   "who": "me" },
+        { "kind": "forbid", "verb": "cause",  "arg": "alters(ring)" }
       ] },
     { "name": "Fetch, one day", "hours": 24, "counters": ["fetched"],
       "clauses": [
-        { "kind": "duty",   "verb": "fetch",  "arg": "water", "when": "fetched < 3", "on": "fetched+1" },
-        { "kind": "duty",   "verb": "follow", "who": "me" },
+        { "kind": "duty",   "verb": "fetch",  "arg": "water", "into": "flask", "when": "fetched < 3", "on": "fetched+1" },
+        { "kind": "duty",   "verb": "follow", "who": "me", "arg": "2" },
         { "kind": "forbid", "verb": "attack", "who": "me" },
-        { "kind": "forbid", "verb": "cast",   "who": "me" }
+        { "kind": "forbid", "verb": "cast",   "who": "me" },
+        { "kind": "forbid", "verb": "cause",  "arg": "alters(ring)" }
       ] }
   ]
 }

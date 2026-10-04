@@ -7264,6 +7264,15 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // test is blade on blade — MobSystem::FindParry skips anything unarmed).
     self.armed = !mob.HeldItem().empty();
     self.canGuard = self.armed && mob.HeldSlot() >= 0;
+    // THE FENCE, as the scorer sees it (demons D6 item 10; mobfence.h Reach /
+    // Cast): asked once, uncounted, about last tick's target.
+    if (fence_.allow != nullptr && mob.ai_.hasTarget) {
+      const float fx = mob.origin_.x + def.worldSize.x * 0.5f;
+      const float fz = mob.origin_.z + def.worldSize.z * 0.5f;
+      const Vec3 tp = mob.ai_.targetPos;
+      self.targetFenced = !fence_.Allows(mob.id_, MobFence::Reach, fx, fz, tp.x, tp.z);
+      self.castFenced = !fence_.Allows(mob.id_, MobFence::Cast, fx, fz, tp.x, tp.z);
+    }
 
     ai::GroundView gv;
     gv.haveGround = sense.haveGround;

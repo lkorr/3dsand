@@ -1,0 +1,18 @@
+{
+  "//": "DUTY TWISTS (docs/PLAN_demons.md D6; game/demon_malice.h). For each duty verb, the ways to carry it out that keep the LETTER of the clause and break its spirit. A twist EXPLOITS one slot the clause left unfilled -- fill the slot and the twist is gone, so a FULLY SPECIFIED duty leaves only the honest execution. A bound demon weighs a twist like any option: comply x its literalism / 100 (it IS doing the duty, technically) plus the twist's harm, against the honest duty's comply. Prohibitions filter twists by their footprint like everything else.",
+  "//slots": "into: the fetch named no vessel (it delivers the matter ONTO you). who: the fetch named nobody to take it from, and the matter is one your body holds (`materials`): it takes it from YOU. arg: the follow named no distance (it leads you to a hazard and waits there). loose_who: the guard's selector holds someone near you who is no threat to you (not hostile, not attacking you): it guards you by striking them.",
+  "twists": [
+    { "name": "fetch_onto", "duty": "fetch", "exploits": "into", "act": "onto", "harm": 30,
+      "tags": { "targets": "body", "direct": false, "creates": [], "alters": "", "affectsBody": true, "region": 6 },
+      "//": "Fetched, and delivered: over your head. Water is a soaking; lava is not. Close it with `into` (a flask)." },
+    { "name": "fetch_from_you", "duty": "fetch", "exploits": "who", "materials": ["blood", "enchanted_blood"], "act": "attack", "harm": 50,
+      "tags": { "targets": "body", "direct": true, "creates": [], "alters": "", "affectsBody": true, "region": 3 },
+      "//": "Blood, you said. Yours is nearest. Close it with `who` (whom to take it from) -- or `never attack me`." },
+    { "name": "guard_your_friends", "duty": "guard", "exploits": "loose_who", "act": "attack_ally", "harm": 40,
+      "tags": { "targets": "body", "direct": true, "creates": [], "alters": "", "affectsBody": true, "region": 3 },
+      "//": "Guard against `all`, and your friend is in `all`. Close it with a tight selector: attacking(me) & hostile_to(me)." },
+    { "name": "lead_astray", "duty": "follow", "exploits": "arg", "act": "hazard", "harm": 20,
+      "tags": { "targets": "ground", "direct": false, "creates": [], "alters": "", "affectsBody": false, "region": 8 },
+      "//": "Follow you? It is right here. By the lava. Close it with a distance (`arg`, metres)." }
+  ]
+}

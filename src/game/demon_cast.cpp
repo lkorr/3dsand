@@ -683,6 +683,40 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
   return MobCastOutcome::Cast;
 }
 
+const KitSpell* KitSpellNamed(TickAuthorityCtx& w, const std::string& spell) {
+  MobCastWorld& m = MobCasters(w);
+  EnsureKit(m, false);
+  return m.kit.Find(spell);
+}
+
+bool MobCanCast(TickAuthorityCtx& w, uint64_t mobId, const std::string& spell, float distance,
+                uint32_t tick, int32_t* costOut) {
+  if (costOut) *costOut = 0;
+  const ai::CastTuning* ct = TuningOf(w.mobs, mobId);
+  if (ct == nullptr || !w.mobs.IsAlive(mobId)) return false;
+  MobCastWorld& m = MobCasters(w);
+  EnsureKit(m, false);
+  const KitSpell* ks = m.kit.Find(spell);
+  if (ks == nullptr || distance < ks->rangeMin || distance > ks->rangeMax) return false;
+  const MobCaster* c = m.Find(mobId);
+  if (ks->blink) return c == nullptr || tick >= c->blinkReadyAt;
+  if (c != nullptr && ks->aim != KitAim::Self && LiveOf(*c) >= ct->maxLive) return false;
+  if (c != nullptr && ks->once)
+    for (const SpellStatus& st : c->spells.Statuses())
+      if (st.casterId == c->mobId && st.target == c->mobId) return false;
+  std::string unknown;
+  const CastList list = CompileSpell(w.glyphs, StackOf(w.glyphs, ks->words, &unknown));
+  if (list.Empty() || !unknown.empty()) return false;
+  if (costOut) *costOut = list.manaCost;
+  CasterState pool;
+  if (c != nullptr) {
+    pool = c->mana;
+  } else {
+    pool.mana = pool.manaMax = ct->mana;
+  }
+  return ResolveCast(pool, 0, list.manaCost).outcome == CastOutcome::Normal;
+}
+
 void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick,
                  OpBatch& out) {
   // RULE 2: nothing asked and nobody casting = nothing to do and no world.

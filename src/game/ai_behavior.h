@@ -810,6 +810,14 @@ struct SelfView {
   // meets, so fists and teeth cannot.
   bool armed = false;
   bool canGuard = false;
+  // ---- THE FENCE, as the scorer sees it (demons D6 item 10; mobfence.h) ----
+  // `targetFenced`: the target is somewhere this body may not reach (a
+  // contained demon, the target past its salt) -- Approach, HoldRange,
+  // CircleStrafe and RequestAttack score 0, so it does not press against the
+  // ring. `castFenced`: a cast at the target would be stopped at the ring
+  // (cast_out severed) -- Cast scores 0. Both false with no fence.
+  bool targetFenced = false;
+  bool castFenced = false;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};

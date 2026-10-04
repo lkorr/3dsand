@@ -9,7 +9,16 @@
 //   move      salt      walking out (the ring's own salt, counted by mass)
 //   cast_out  sulfur    its spells leaving the circle      (D4 calls AllowCastOut)
 //   blink     quicksilver  teleporting                     (D4 calls AllowBlink)
-//   touch     iron      a blow across the ring             (MobFence::Blow)
+//
+// A BLOW ACROSS THE RING IS NOT A CHANNEL (D6, owner decision 2026-10-04): the
+// salt ALWAYS refuses a contained demon's blows and grabs across it (D1's
+// fence, MobFence::Blow). D3's `touch` channel is gone.
+//
+// IRON WEAKENS (D6): an entry with `weakens` instead of `severs` lowers the
+// CONTAINED demon's EFFECTIVE POWER by potency x the demon's
+// `ironSusceptibility` / 100, capped at `weakenCapPct` of its power (iron alone
+// never zeroes a greater demon). Binding (D5 present) and the release check
+// weigh the effective power, so iron makes binding a strong demon cheaper.
 //
 // POTENCY of a channel = sum over the band's seal cells of perCell x the
 // cell's MASS in eighths / 8 (powder mass, liquid fullness; a solid is a whole
@@ -17,8 +26,9 @@
 // a pile). A channel is SEVERED iff potency >= the demon's resistance for it
 // (assets/demons/<name>.json `resist`; a channel the file does not list has
 // resistance 0, i.e. the demon does not have it). An UNSEVERED channel is a
-// LOOPHOLE: the demon can use it from inside the circle -- claws across the
-// ring, a bolt out of it, a blink out of it (which frees it), a ring too thin
+// LOOPHOLE: the demon can use it from inside the circle -- a bolt out of it
+// (or a gust at its own ring, D6's scheme), a blink out of it (which frees
+// it), a ring too thin
 // to hold its legs (which frees it).
 //
 // CIRCLE STRENGTH (an integer, points) = sum over seal entries of the band's
@@ -71,9 +81,9 @@ struct LiveDemon;
 
 namespace demon {
 
-enum class Channel : uint8_t { Move = 0, CastOut, Blink, Touch };
-constexpr int kChannels = 4;
-const char* ChannelName(Channel c);            // "move" | "cast_out" | "blink" | "touch"
+enum class Channel : uint8_t { Move = 0, CastOut, Blink };
+constexpr int kChannels = 3;
+const char* ChannelName(Channel c);            // "move" | "cast_out" | "blink"
 bool ChannelByName(const std::string& n, Channel& out);
 
 // ---- content (assets/demons/seals.json, tells.json) ------------------------------
@@ -81,6 +91,7 @@ bool ChannelByName(const std::string& n, Channel& out);
 struct SealDef {
   std::string material;    // by name, resolved per scan against the live table
   Channel severs = Channel::Move;
+  bool weakens = false;    // D6: lowers the contained demon's power instead of severing
   int32_t perCell = 1;     // potency per full cell
   int32_t cellsPerPoint = 4;   // strength: one point per this many full cells (0 = none)
 };
@@ -96,6 +107,8 @@ struct SealLib {
   float bandInM = 0.6f, bandOutM = 0.9f;
   int32_t slabAbove = 2;
   int32_t minEighths = 2;
+  // D6: iron's cut is at most this percent of a demon's power
+  int32_t weakenCapPct = 30;
   // candles
   std::string candle = "candle_flame";
   int32_t candleSlabAbove = 6;
@@ -125,6 +138,8 @@ struct SealReading {
   std::array<int32_t, kChannels> potency{};   // per channel
   std::array<int32_t, kChannels> eighths{};   // seal mass per channel, eighths (attribution)
   int32_t saltEighths = 0;                    // the `move` seal's mass, eighths
+  int32_t weakenPotency = 0;                  // D6: the `weakens` seals' potency (iron)
+  int32_t weakenEighths = 0;
   int32_t sealPoints = 0;                     // strength from seal entries (salt included)
   int32_t candlesLit = 0;
   int32_t cellsRead = 0;                      // cost
@@ -143,7 +158,9 @@ struct Binding {
   SealReading reading;
   uint32_t scanTick = 0;
   int32_t strength = 0;          // reading points + candles - strain loss
-  int32_t power = 0;             // the def's, at the last evaluation
+  int32_t power = 0;             // EFFECTIVE power: the def's minus the iron cut (D6)
+  int32_t basePower = 0;         // the def's
+  int32_t ironCut = 0;           // D6: what the iron in the band takes off, capped
   uint8_t severed = 0;           // bit per Channel
   // gaze
   int32_t strain = 0;            // 0..strainMax
@@ -153,7 +170,6 @@ struct Binding {
   bool gazeHold = false;         // the def's rule
   bool gazeBroken = false;       // this tick, in range
   // the hooks' counters
-  uint32_t blowsLoophole = 0;    // blows across the ring allowed (touch unsevered)
   uint32_t castOutRefused = 0, castOutAllowed = 0;
   uint32_t blinkRefused = 0, blinkAllowed = 0;
   ReleaseResult release = ReleaseResult::None;
@@ -180,7 +196,8 @@ bool AllowBlink(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t de
                 uint32_t tick);
 
 // The overpower check, for the release key and (D5) the dialogue's `release`:
-// held iff strength >= power + weight. Held -> Released; else -> Unbound and
+// held iff strength >= power + weight (the EFFECTIVE power, iron's cut taken
+// off, D6). Held -> Released; else -> Unbound and
 // aimed at the summoner. Returns None if `demonId` is not contained.
 ReleaseResult Release(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t demonId,
                       int32_t contractWeight, uint32_t tick);

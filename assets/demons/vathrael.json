@@ -1,0 +1,19 @@
+{
+  "//": "VATHRAEL, A GREATER DEMON (docs/PLAN_demons.md D6; game/demon.h, game/demon_malice.h). His NAME is the glyph `summon_vathrael` (assets/spells/glyphs.json) -- NOT in the smithy cellar's book: only the debug switches grant it today (SANDVOX_ALL_NAMES=1, dev panel 'learn all demon names'). His BODY is the mob def `fiend` (assets/mobs/demon/fiend.*, demon.js's 2 m preset); his MANNER loose is the behaviors.json profile `fiend` (the full D4 kit, a deep pool, a long reach). He can be TALKED to from inside a circle like any demon, and he has a job for you (assets/dialogue/demon_vathrael.json: a quest hook). He cannot be held: his power is past anything a cellar circle reaches (salt, sulfur, quicksilver, candles and every iron pile you own come to ~60-80; he is 400, iron takes at most 30% of that), so a release is overpowered and the fight starts -- and his tells say so before you try.",
+  "name": "Vathrael",
+  "mob": "fiend",
+  "behavior": "fiend",
+  "//released": "If a binding ever held him (it should not), he would serve on this neutral floor, his malice layered on it like the imp's.",
+  "released": "fiend_bound",
+  "dialogue": "demon_vathrael",
+  "tier": 3,
+  "power": 400,
+  "gaze": "hold",
+  "//resist": "Per channel, against a seal pile's potency: a cellar's sulfur and quicksilver do not cut his channels (cast_out 60, blink 50). A circle holds his legs only while it stands -- and his gust is as good as an imp's.",
+  "resist": { "move": 20, "cast_out": 60, "blink": 50 },
+  "ironSusceptibility": 20,
+  "//motive": "Malice 90, cunning 90: he wants you dead and prefers the clever way; literalism 90: every loose slot of a duty is a door. A stock contract written for an imp is no contract for him.",
+  "motive": { "malice": 90, "cunning": 90, "spite": 60, "literalism": 90 },
+  "//schemes": "He knows them all.",
+  "schemes": ["lava_floor", "lift_then_drop", "gust_at_ring", "fire_upwind", "stand_where_you_fall", "hellfire", "claw"]
+}

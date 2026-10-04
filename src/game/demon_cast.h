@@ -214,6 +214,17 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
                           const ai::CastRequest& req, uint32_t tick,
                           const std::string& spell, OpBatch& out);
 
+// D6 (game/demon_malice.h): the kit entry of that name (the kit is read on
+// first use), or null.
+const KitSpell* KitSpellNamed(TickAuthorityCtx& w, const std::string& spell);
+// D6: could this creature cast kit entry `spell` at `distance` (world voxels)
+// RIGHT NOW -- the draw's own filter: the entry's range, mana alone (its pool,
+// or the profile's full pool before its first cast), its carrier cap, `once`,
+// a blink's cooldown? A creature whose profile has no `cast` block cannot.
+// `costOut` = the compiled mana cost (0 for a blink).
+bool MobCanCast(TickAuthorityCtx& w, uint64_t mobId, const std::string& spell, float distance,
+                uint32_t tick, int32_t* costOut = nullptr);
+
 // Every creature's flight carriers, for the renderer (they are drawn like the
 // player's; main.cpp's projectile loop).
 void MobCastAppendLive(const TickAuthorityCtx& w, std::vector<const SpellProjectile*>& out);

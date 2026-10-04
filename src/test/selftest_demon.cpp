@@ -140,7 +140,7 @@ struct RunOut {
   // the hold
   int heldTicks = 0, leftWhileHeld = 0, targetedTicks = 0;
   uint32_t movesRefused = 0, blowsRefused = 0;
-  uint32_t blowsLoophole = 0;   // D3: let through (no iron: `touch` unsevered)
+  bool blowAcrossRefused = false;   // D6: the salt refuses a blow across the ring
   float maxR = 0;           // furthest the centre got from the circle's centroid
   float circleR = 0;
   // the break
@@ -276,6 +276,11 @@ RunOut RunFix(Ctx& c, int r, bool ring, bool gap, int holdTicks, int breakTicks,
     }
     return out;
   }
+  // D6: this gate measures D1's HOLD. D6's malice would gust a plain ring open
+  // (that loophole, and its seal, are demon-malice's G), so here Skerrick
+  // knows no schemes.
+  for (DemonDef& d : dw.lib.defs)
+    if (d.id == arrived.demon) d.schemes.clear();
   // ---- 1. the hold ---------------------------------------------------------------
   for (int i = 0; i < holdTicks; i++) {
     Tick(rig);
@@ -293,7 +298,10 @@ RunOut RunFix(Ctx& c, int r, bool ring, bool gap, int holdTicks, int breakTicks,
   if (const LiveDemon* ld = dw.Find(out.id)) {
     out.movesRefused = ld->movesRefused;
     out.blowsRefused = ld->blowsRefused;
-    out.blowsLoophole = ld->bind.blowsLoophole;
+    // The blow rule, asked directly: from the middle of the circle at you.
+    if (ld->state == DemonState::Contained)
+      out.blowAcrossRefused =
+          !c.mobs.Fence().Allows(out.id, MobFence::Blow, circle0.cx, circle0.cz, you.x, you.z);
   }
   if (breakTicks <= 0) return out;
   // ---- 2. the break: you step back out of his reach, and one ring cell goes to
@@ -491,13 +499,14 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
                a.leftWhileHeld, a.maxR, a.circleR));
   check(a.targetedTicks >= hold / 2,
         Format("B1: he targeted you on %d of %d ticks", a.targetedTicks, a.heldTicks));
-  check(a.movesRefused > 0, "B1: the fence never refused a move (he never tried to leave)");
-  // D3 made a blow across the ring the `touch` CHANNEL: this ring has no iron
-  // pile, so for Skerrick it is a loophole and the fence lets the blow
-  // through (demon-seals asserts the iron half). The claim left here is that
-  // the fence was ASKED -- he swung at you across the salt.
-  check(a.blowsRefused + a.blowsLoophole > 0,
-        "B1: the fence was never asked about a blow across the ring");
+  // D6 item 10: with nothing he can reach you with (the salt refuses his
+  // claws; schemes off here), he WAITS where he arrived instead of grinding on
+  // the salt -- the fence is barely asked.
+  check(a.movesRefused <= (uint32_t)BaselineNumber("demonCircle.fenceRefusedMax", 3),
+        Format("B1: he pressed against the salt (%u moves refused)", a.movesRefused));
+  // D6 (owner decision 2026-10-04): the salt ALWAYS refuses a blow across
+  // the ring -- D3's `touch` channel is gone, iron weakens instead.
+  check(a.blowAcrossRefused, "B1: the fence let a blow across the ring");
   check(a.unboundAfter >= 0 && a.unboundAfter <= breakMax,
         Format("B2: unbound %d ticks after the break (max %d)", a.unboundAfter, breakMax));
   check(a.outsideAfter >= 0 && a.outsideAfter <= leaveMax,
@@ -526,10 +535,10 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
   RecordObserved("demonCircle.blowsRefused", a.blowsRefused);
   detail = Format(
       "B ring r=%d: %s (%s, %d inside, %d salt, radius %.1f); held %d/%d ticks, never out "
-      "(furthest %.1f), targeting you %d, fence refused %u moves + %u blows (%u through); break -> unbound "
+      "(furthest %.1f), targeting you %d, fence refused %u moves + %u blows; break -> unbound "
       "+%d, out of the circle +%d; trace %zu rows %s. C no ring: %s (%s). D gap: %s (%s)",
       r, DemonStateName(a.arrived), CircleVerdictName(a.verdict), a.inside, a.ringSalt, a.circleR,
-      a.heldTicks, hold, a.maxR, a.targetedTicks, a.movesRefused, a.blowsRefused, a.blowsLoophole,
+      a.heldTicks, hold, a.maxR, a.targetedTicks, a.movesRefused, a.blowsRefused,
       a.unboundAfter,
       a.outsideAfter, a.trace.size(), a.trace == a2.trace ? "identical twice" : "DIFFERS",
       DemonStateName(none.arrived), CircleVerdictName(none.verdict), DemonStateName(gap.arrived),
@@ -547,6 +556,7 @@ Status GateDemonCircle(Ctx& c, std::string& detail) {
 Status GateDemonSeals(Ctx& c, std::string& detail);   // selftest_demon_seals.cpp
 Status GateDemonContract(Ctx& c, std::string& detail);   // selftest_demon_contract.cpp
 Status GateDemonCast(Ctx& c, std::string& detail);    // selftest_demon_cast.cpp (D4)
+Status GateDemonMalice(Ctx& c, std::string& detail);  // selftest_demon_malice.cpp (D6)
 
 const std::vector<Gate>& DemonGates() {
   static const std::vector<Gate> g = {
@@ -557,6 +567,8 @@ const std::vector<Gate>& DemonGates() {
       {"demon-contract", "mob", {}, false, GateDemonContract},
       // D4 (selftest_demon_cast.cpp): creatures cast, blink, the kit, the stance.
       {"demon-cast", "mob", {}, false, GateDemonCast},
+      // D6 (selftest_demon_malice.cpp): motives, schemes, twists, penalties, Vathrael.
+      {"demon-malice", "mob", {}, false, GateDemonMalice},
   };
   return g;
 }

@@ -579,8 +579,9 @@ void Overlay::DrawHUD(const UIState& s) {
   //      the ring whole in salt-white; UNBOUND draws it broken in ember;
   //      RELEASED draws it whole in gold.
   //   2. (contained, D3) the circle's STRENGTH against the demon's POWER --
-  //      salt-white while it would hold, ember while it would not -- then the
-  //      four channels as letters (M move, C cast out, B blink, T touch):
+  //      salt-white while it would hold, ember while it would not; the power
+  //      reads `20-6` when iron in the band weakens the demon (D6) -- then the
+  //      three channels as letters (M move, C cast out, B blink):
   //      salt-white = a seal severs it, ember = a loophole; then the key.
   //   3. (contained, while the gaze strains) AVERT or MEET EYES and ten pixel
   //      pips of strain, ember while you are breaking the rule.
@@ -599,10 +600,15 @@ void Overlay::DrawHUD(const UIState& s) {
     else
       std::snprintf(line, sizeof line, "%s  UNBOUND", up.c_str());
     const bool showBind = held && s.demonHasBinding;
-    const bool holds = s.demonStrength >= s.demonPower;
+    const bool holds = s.demonStrength >= s.demonPower - s.demonIronCut;
     char str[48];
-    std::snprintf(str, sizeof str, "CIRCLE %d / %d  ", s.demonStrength, s.demonPower);
-    static const char kChan[4] = {'M', 'C', 'B', 'T'};
+    if (s.demonIronCut > 0)
+      std::snprintf(str, sizeof str, "CIRCLE %d / %d-%d  ", s.demonStrength, s.demonPower,
+                    s.demonIronCut);
+    else
+      std::snprintf(str, sizeof str, "CIRCLE %d / %d  ", s.demonStrength, s.demonPower);
+    constexpr int kChanN = 3;
+    static const char kChan[kChanN] = {'M', 'C', 'B'};
     const char* keyHint = "  T TALK  Y RELEASE";
     const bool showGaze = showBind && (s.demonStrain > 0.0f || s.demonGazeBroken);
     const char* gazeWord = s.demonGazeHold ? "MEET EYES " : "AVERT ";
@@ -610,7 +616,7 @@ void Overlay::DrawHUD(const UIState& s) {
     const float pw = 4.0f, ph = 6.0f, pg = 2.0f;
     const ImVec2 ts = ImGui::CalcTextSize(line);
     const float chW = ImGui::CalcTextSize("M ").x;
-    const float l2w = showBind ? ImGui::CalcTextSize(str).x + 4 * chW + ImGui::CalcTextSize(keyHint).x
+    const float l2w = showBind ? ImGui::CalcTextSize(str).x + kChanN * chW + ImGui::CalcTextSize(keyHint).x
                                : 0.0f;
     const float l3w =
         showGaze ? ImGui::CalcTextSize(gazeWord).x + kPips * (pw + pg) : 0.0f;
@@ -647,7 +653,7 @@ void Overlay::DrawHUD(const UIState& s) {
     if (showBind) {
       text(tx, ly, holds ? salt : ui::ColEmber(), str);
       float cx = tx + ImGui::CalcTextSize(str).x;
-      for (int i = 0; i < 4; i++) {
+      for (int i = 0; i < kChanN; i++) {
         const char t[2] = {kChan[i], 0};
         text(cx, ly, ((s.demonSevered >> i) & 1u) ? salt : ui::ColEmber(), t);
         cx += chW;

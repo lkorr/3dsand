@@ -10,6 +10,7 @@
 #include "game/container.h"
 #include "game/demon_cast.h"
 #include "game/demon.h"
+#include "game/demon_malice.h"
 #include "game/dialogue.h"
 #include "game/item.h"
 #include "game/mob.h"
@@ -372,6 +373,7 @@ void Fire(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld, in
               contract::ThenName(c.then));
   switch (c.then) {
     case contract::Then::Dismiss:
+      if (w.demons) TW(*w.demons).stats.penaltyDismissed++;
       EndTalkWith(w, players, ld.mobId);
       Depart(w, ld, tick, "a penalty dismissed it");
       break;
@@ -459,6 +461,24 @@ void RunPact(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
     SetRoutine(*b, Vec3{fp.x, fp.y - 8.0f, fp.z}, MetresToCells(1.5f), 1.0f, false, &fp, nullptr);
     routine = true;
   }
+  // RETURN (D6): in the last `arg` seconds of the term, back to the nearest of
+  // `who` before anything else -- a greater demon that ends its term at your
+  // side has no free act.
+  for (size_t i = 0; i < p.page.clauses.size() && !routine && p.expireTick != 0; i++) {
+    const Clause& c = p.page.clauses[i];
+    if (c.kind != Kind::Duty || c.verb != Verb::Return || !WhenHolds(c, fc, ev)) continue;
+    const uint32_t left = p.expireTick > tick ? p.expireTick - tick : 0u;
+    if (left > (uint32_t)std::max(1, c.argNum) * 30u) continue;
+    const ActorView* a = nearest(c.sel, nullptr, 0, false);
+    if (a == nullptr) continue;
+    const Vec3 fp = a->centre;
+    const Vec3 goal = a->player && summoner && a->id == MeId(ld.session)
+                          ? PlayerFoot(*summoner->s)
+                          : Vec3{fp.x, fp.y - 8.0f, fp.z};
+    SetRoutine(*b, goal, MetresToCells(1.5f), 1.0f, false, &fp, nullptr);
+    p.activeDuty = (int)i;
+    routine = true;
+  }
   for (size_t i = 0; i < p.page.clauses.size() && !routine && guard == nullptr; i++) {
     const Clause& c = p.page.clauses[i];
     if (c.kind != Kind::Duty || !WhenHolds(c, fc, ev)) continue;
@@ -470,7 +490,9 @@ void RunPact(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
         const Vec3 goal = a->player && summoner && a->id == MeId(ld.session)
                               ? PlayerFoot(*summoner->s)
                               : Vec3{fp.x, fp.y - 8.0f, fp.z};
-        SetRoutine(*b, goal, MetresToCells(2.0f), 1.0f, false, &fp, nullptr);
+        // D6: `arg` is the distance (metres); unset, D5's two.
+        SetRoutine(*b, goal, MetresToCells(c.argNum > 0 ? (float)c.argNum : 2.0f), 1.0f, false,
+                   &fp, nullptr);
         p.activeDuty = (int)i;
         routine = true;
         break;
@@ -507,15 +529,34 @@ void RunPact(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
       }
       case Verb::Fetch: {
         if (summoner == nullptr || tick < p.fetchBlockedUntil) break;
-        const uint32_t mat = MatByName(w.mats, c.arg);
+        const uint32_t mat = MatByName(w.mats, contract::FetchMaterial(c.arg));
         const ItemDef* vdef = nullptr;
         ItemStack* vessel = mat ? FetchVessel(w, *summoner->s, c.into, mat, &vdef) : nullptr;
+        // D6, THE TWIST "ONTO" (demon_malice.h): the clause named no vessel, so
+        // the demon carries the matter itself and puts it down ON you.
+        const bool onto = p.fetchTwist == 1 && mat != 0;
         if (p.fetchPhase == 1) {
           // RETURN: back to the summoner; the duty is done on arrival.
           const Vec3 fp = summoner->s->player.pos;
           SetRoutine(*b, PlayerFoot(*summoner->s), MetresToCells(2.0f), 1.0f, false, &fp,
                      nullptr);
           if (Planar(me, fp) <= MetresToCells(2.5f)) {
+            if (p.carried > 0) {
+              // Put down over the summoner's head, if-air (never over matter).
+              const Vec3 head = summoner->s->player.EyePos();
+              const int hx = (int)std::floor(head.x), hy = (int)std::floor(head.y) + 4,
+                        hz = (int)std::floor(head.z);
+              for (int k = 0; k < p.carried; k++) {
+                const IVec3 q{hx + (k & 1), hy + k / 4, hz + ((k >> 1) & 1)};
+                if (w.world.CellInWindow(q))
+                  out.cells.push_back({World::SlotCellIndex(q), p.carryWord | kCellOpIfAir});
+              }
+              RecordFootprint(ld, tick, head, 6.0f, "fetch_onto", 16);
+              if (ld.mind) ld.mind->deliveredOnto++;
+              p.carried = 0;
+              // One trip at a time: back to the water after a rescan's pause.
+              p.fetchBlockedUntil = tick + kFetchRescanTicks;
+            }
             p.fetchPhase = 0;
             p.fetchHave = false;
             p.fetches++;
@@ -526,7 +567,7 @@ void RunPact(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
           routine = true;
           break;
         }
-        if (vessel == nullptr) break;   // nothing to carry it in: the duty cannot act
+        if (vessel == nullptr && !onto) break;   // nothing to carry it in: the duty cannot act
         if (!p.fetchHave || tick >= p.fetchScanTick + kFetchRescanTicks) {
           p.fetchScanTick = tick;
           const Vec3 f = MobFoot(*body);
@@ -541,7 +582,39 @@ void RunPact(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon& ld,
         SetRoutine(*b, cell, MetresToCells(0.4f), 1.0f, false, &cell, nullptr);
         p.activeDuty = (int)i;
         routine = true;
-        if (Planar(me, cell) <= MetresToCells(0.6f) && std::fabs(MobFoot(*body).y - cell.y) <= 6) {
+        if (onto && Planar(me, cell) <= MetresToCells(0.6f) &&
+            std::fabs(MobFoot(*body).y - cell.y) <= 6) {
+          // THE TAKE, ONTO: up to four cells of it, each a conditional clear
+          // (only if it still holds the matter: never deletes what flowed in).
+          int n = 0;
+          std::erase_if(p.ontoTaken, [&](const std::pair<IVec3, uint32_t>& t) {
+            return tick > t.second + World::kSnapshotLatency + 4u;
+          });
+          for (int dz = -1; dz <= 1 && n < 4; dz++)
+            for (int dx = -1; dx <= 1 && n < 4; dx++) {
+              const IVec3 q{p.fetchCell.x + dx, p.fetchCell.y, p.fetchCell.z + dz};
+              uint32_t wd = 0;
+              if (!ContainerSnapWord(w.world, q, wd) || (wd & 0xFFFu) != mat) continue;
+              if (!w.world.CellInWindow(q)) continue;
+              bool taken = false;
+              for (const auto& t : p.ontoTaken)
+                taken = taken || (t.first.x == q.x && t.first.y == q.y && t.first.z == q.z);
+              if (taken) continue;   // cleared already; the snapshot has not caught up
+              out.cells.push_back({World::SlotCellIndex(q), CellOpClearIfMat(mat)});
+              p.ontoTaken.push_back({q, tick});
+              p.carryWord = wd & 0x0000FFFFu;   // material + state; no stamp, no stain
+              n++;
+            }
+          p.fetchTaken = n;
+          if (n > 0) {
+            p.carried = n;
+            p.fetchPhase = 1;
+          } else {
+            p.fetchHave = false;
+            p.fetchBlockedUntil = tick + kFetchRescanTicks;
+          }
+        } else if (!onto && Planar(me, cell) <= MetresToCells(0.6f) &&
+                   std::fabs(MobFoot(*body).y - cell.y) <= 6) {
           // THE TAKE: the summoner's own scoop path (conditional clears through
           // the queue, a claim the ledger pays into the vessel four ticks on).
           const char* why = nullptr;
@@ -710,7 +783,9 @@ bool PactAllowBlow(DemonWorld& d, LiveDemon& ld, uint64_t targetId) {
     p.blowsForbidden++;
     return false;
   }
-  if (targetId != p.guardTarget) {
+  // Sanctioned: this tick's guard target, or (D6) an actor the demon CHOSE to
+  // strike that no forbid holds (demon_malice.h; a penalty still fires).
+  if (targetId != p.guardTarget && targetId != p.sanctionTarget) {
     p.blowsUnsanctioned++;
     return false;
   }
@@ -724,22 +799,25 @@ bool PactAllowBlow(DemonWorld& d, LiveDemon& ld, uint64_t targetId) {
   return true;
 }
 
+contract::FootFacts FactsOf(const KitTags& tags, bool hasActor, bool isTarget, float distM) {
+  contract::FootFacts f;
+  f.targets = &tags.targets;
+  f.direct = tags.direct;
+  f.creates = &tags.creates;
+  f.alters = &tags.alters;
+  f.affectsBody = tags.affectsBody;
+  f.hasActor = hasActor;
+  f.isTarget = isTarget;
+  f.distM = distM;
+  return f;
+}
+
 bool CastTagMatches(const std::string& pred, const KitTags* tags) {
   if (pred.empty() || tags == nullptr) return true;
-  auto after = [&](const char* key) -> const char* {
-    const size_t n = std::strlen(key);
-    return pred.compare(0, n, key) == 0 ? pred.c_str() + n : nullptr;
-  };
-  if (pred == "direct") return tags->direct;
-  if (pred == "affects_body") return tags->affectsBody;
-  if (const char* m = after("creates:")) {
-    for (const std::string& c : tags->creates)
-      if (c == m) return true;
-    return false;
-  }
-  if (const char* a = after("alters:")) return tags->alters == a;
-  if (const char* t = after("targets:")) return tags->targets == t;
-  return true;   // an unknown predicate cannot be checked: the forbid holds
+  contract::FootPred fp;
+  std::string err;
+  if (!contract::ParseFootPred(pred, fp, err)) return true;   // unreadable: the forbid holds
+  return contract::FootHolds(fp, FactsOf(*tags, true, true, 0.0f));
 }
 
 bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId,
@@ -752,11 +830,30 @@ bool AllowCastAt(TickAuthorityCtx& w, uint64_t demonId, uint64_t targetId,
     if (v.id == targetId) a = &v;
   if (a == nullptr) return true;   // not an actor: a point in the world
   Eval ev{t.actors, MeId(ld->session), ld->mobId};
-  for (const Clause& c : ld->pact->page.clauses)
-    if (c.kind == Kind::Forbid && c.verb == Verb::Cast && CastTagMatches(c.arg, tags) &&
-        ev.Forbidden(c.sel, *a))
-      return false;
+  for (const Clause& c : ld->pact->page.clauses) {
+    if (c.kind != Kind::Forbid || (c.verb != Verb::Cast && c.verb != Verb::Cause)) continue;
+    // Seen from the cast's target. A null `tags` matches every predicate.
+    const bool match = tags == nullptr || contract::FootHolds(c.fp, FactsOf(*tags, true, true, 0.0f));
+    if (!match) continue;
+    // `cause` with no `who` is about anyone.
+    if (c.verb == Verb::Cause && c.sel.Empty()) return false;
+    if (ev.Forbidden(c.sel, *a)) return false;
+  }
   return true;
+}
+
+const std::vector<ActorView>& ActorsOf(TickAuthorityCtx& w) {
+  static const std::vector<ActorView> kNone;
+  return w.demons ? TW(*w.demons).actors : kNone;
+}
+
+bool InSet(TickAuthorityCtx& w, const LiveDemon& ld, const contract::Selector& sel,
+           const ActorView& a, bool failClosed) {
+  if (!w.demons) return false;
+  if (sel.Empty()) return failClosed;   // `cause` with no who: about anyone
+  TalkWorld& t = TW(*w.demons);
+  Eval ev{t.actors, MeId(ld.session), ld.mobId};
+  return failClosed ? ev.Forbidden(sel, a) : ev.Member(sel, a);
 }
 
 void Depart(TickAuthorityCtx& w, LiveDemon& ld, uint32_t tick, const char* why) {
@@ -787,9 +884,12 @@ PresentInfo Present(TickAuthorityCtx& w, std::span<SessionTick> players, int ses
   const contract::Content& content = contract::GetContent();
   const DemonDef* def = DefOf(w, *ld);
   info.weight = contract::Weigh(pg, content.tariff).total;
-  info.power = def ? def->power : ld->bind.power;
+  // The EFFECTIVE power (D6: iron in the band takes some off while contained);
+  // the upkeep is the demon's own power, iron or not.
+  const int32_t basePower = def ? def->power : ld->bind.basePower;
+  info.power = ld->bind.reading.valid ? ld->bind.power : basePower;
   info.strength = ld->bind.strength;
-  info.upkeep = contract::UpkeepFor(info.power, content.tariff);
+  info.upkeep = contract::UpkeepFor(basePower, content.tariff);
   info.margin = info.strength - info.power - info.weight;
   int32_t room = 0;
   if (SessionTick* p = Who(players, session))
@@ -978,6 +1078,7 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
         ld.spawnTick = ld.stateTick = ld.lastCheck = tick;
         ld.why = "restored from a save";
         ld.circle = r.circle;
+        ld.home = r.origin;
         ld.pact = std::make_shared<Pact>(r.pact);
         const DemonDef* def = d.lib.Find(r.demon);
         if (def != nullptr && !def->released.empty()) w.mobs.SetMobBehavior(best, def->released);
@@ -1003,6 +1104,11 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
   for (const LiveDemon& ld : d.live) anyPact = anyPact || (bool)ld.pact;
   if (anyPact) {
     BuildActors(w, players, t, tick);
+    for (LiveDemon& ld : d.live)
+      if (ld.pact) {
+        ld.pact->sanctionTarget = 0;   // the malice layer re-grants it each tick
+        ld.pact->fetchTwist = ld.mind && ld.mind->act == Act::Onto ? 1 : 0;
+      }
     for (size_t i = 0; i < d.live.size(); i++) {
       LiveDemon& ld = d.live[i];
       if (!ld.pact || !w.mobs.IsAlive(ld.mobId)) continue;
@@ -1015,6 +1121,12 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
       if (p.expireTick != 0 && tick >= p.expireTick) {
         t.stats.expired++;
         EndTalkWith(w, players, ld.mobId);
+        // D6: a greater demon away from you when its term ends takes ONE free
+        // act before it goes (demon_malice.h); everyone else simply leaves.
+        if (ld.state == DemonState::Released && BeginFreeAct(w, players, ld, tick)) {
+          t.stats.freeActs++;
+          continue;
+        }
         Depart(w, ld, tick, "its term is over");
         continue;
       }
@@ -1024,6 +1136,33 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
         Fire(w, players, ld, c, tick);
         if (!ld.pact) continue;
       }
+      // THE OUTCOME CLAUSE (D6, `penalty harm`): the summoner hurt this tick
+      // while standing inside one of the demon's recent action footprints.
+      if (SessionTick* sm = Who(players, ld.session)) {
+        float hp = 1, burn = 0;
+        int lost = 0;
+        sm->s->avatar.BodyFacts(hp, burn, lost);
+        const bool hurt = p.summonerHp >= 0.0f && hp < p.summonerHp - 1e-4f;
+        p.summonerHp = hp;
+        if (hurt) {
+          const MaliceLib& ml = Malice(d).lib;
+          for (size_t ci = 0; ci < p.page.clauses.size() && ld.pact; ci++) {
+            const Clause& c = p.page.clauses[ci];
+            if (c.kind != Kind::Penalty || c.verb != Verb::Harm) continue;
+            const ActorView* meView = nullptr;
+            for (const ActorView& a : t.actors)
+              if (a.id == MeId(ld.session)) meView = &a;
+            Eval ev{t.actors, MeId(ld.session), ld.mobId};
+            if (meView == nullptr || !ev.Member(c.sel, *meView)) continue;
+            if (!HarmInFootprint(ld, sm->s->player.pos, tick, (uint32_t)std::max(1, c.argNum) * 30u,
+                                 MetresToCells(ml.footprintSlackM)))
+              continue;
+            ld.pact->harmFired++;
+            Fire(w, players, ld, (int)ci, tick);
+          }
+          if (!ld.pact) continue;
+        }
+      }
       if (ld.state == DemonState::Released) RunPact(w, players, ld, t, out, tick);
       else if (ai::Brain* b = w.mobs.MobBrainMut(ld.mobId)) {
         // Bound but still in the circle: calm, waiting to be let out.
@@ -1032,6 +1171,10 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
       }
     }
   }
+  // ---- D6: MALICE -- every held or bound demon weighs what it wants against
+  // what the binding leaves it, and acts (game/demon_malice.h). After the
+  // duties, so a choice can override what they wrote this tick.
+  MaliceTick(w, players, tick, out);
   // ---- the panel's mirror ----------------------------------------------------------------
   const contract::Content& content = contract::GetContent();
   for (SessionTick& p : players) {
@@ -1066,11 +1209,12 @@ void ContractTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t 
     dt.mobId = ld->mobId;
     dt.name = ld->name;
     dt.strength = ld->bind.strength;
-    dt.power = def ? def->power : ld->bind.power;
+    dt.power = ld->bind.reading.valid ? ld->bind.power : (def ? def->power : ld->bind.power);
     dt.bound = (bool)ld->pact;
     dt.contract = ld->pact ? ld->pact->page.name : std::string();
     dt.weight = ld->pact ? ld->pact->weight : 0;
-    dt.upkeep = ld->pact ? ld->pact->upkeep : contract::UpkeepFor(dt.power, content.tariff);
+    dt.upkeep = ld->pact ? ld->pact->upkeep
+                         : contract::UpkeepFor(def ? def->power : dt.power, content.tariff);
     dt.lookingAway = p.ti.Held(TB_DEMON_LOOKAWAY);
     dt.strain = std::clamp((float)ld->bind.strain / (float)std::max(1, ld->bind.strainMax), 0.0f,
                            1.0f);
@@ -1108,7 +1252,8 @@ std::string TalkText(const TickAuthorityCtx& w, uint64_t mobId, const std::strin
   if (ld == nullptr) return text;
   const DemonDef* def = DefOf(w, *ld);
   const int32_t weight = ContractWeight(*ld);
-  const int32_t power = def ? def->power : ld->bind.power;
+  const int32_t power =
+      ld->bind.reading.valid ? ld->bind.power : (def ? def->power : ld->bind.power);
   int32_t margin = ld->bind.strength - power - weight;
   // A refusal speaks for the page that was refused.
   if (w.demons && w.demons->talk)

@@ -562,6 +562,11 @@ Status GateDemonCast(Ctx& c, std::string& detail) {
     check(imp != 0 && dw.Find(imp) && dw.Find(imp)->state == DemonState::Contained,
           "D: the ring fixture's imp arrived contained");
     if (imp != 0) {
+      // D6: this arm measures D3/D4's ring hooks with scripted casts. D6's
+      // malice would gust the plain ring open on its own (demon-malice's G),
+      // so here Skerrick knows no schemes.
+      for (DemonDef& d : dw.lib.defs)
+        if (d.id == dw.Find(imp)->demon) d.schemes.clear();
       const LiveDemon ld0 = *dw.Find(imp);
       auto outside = [&](float x, float z) { return !ld0.circle.Inside(x, z); };
       const Vec3 post{(float)f.x + 24.5f, (float)f.y + 5.0f, (float)f.z + 0.5f};

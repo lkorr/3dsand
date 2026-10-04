@@ -563,6 +563,8 @@ add_library(sandvox_core OBJECT
   src/game/demon_talk.cpp
   # demons D4: creatures that cast, blink, the demon spell kit (game/demon_cast.h).
   src/game/demon_cast.cpp
+  # demons D6: malice -- the motive ladder, schemes, duty twists (game/demon_malice.h).
+  src/game/demon_malice.cpp
   src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
@@ -661,6 +663,8 @@ add_library(sandvox_core OBJECT
   src/test/selftest_demon_contract.cpp
   # demons D4: gate demon-cast.
   src/test/selftest_demon_cast.cpp
+  # demons D6: gate demon-malice.
+  src/test/selftest_demon_malice.cpp
   src/test/selftest_elec_play.cpp
   src/test/selftest_elec.cpp
   src/test/selftest_elec_mob.cpp

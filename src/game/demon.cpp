@@ -1,6 +1,7 @@
 // demon.cpp — summoning, the circle's hold, the goof. See demon.h.
 #include "game/demon.h"
 #include "game/demon_talk.h"
+#include "game/demon_malice.h"
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +54,8 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
     }
     // D5: the contract tariff and the stock pages (game/contract.h reads them).
     if (p.stem() == "contract_tariff" || p.stem() == "contracts") continue;
+    // D6: the scheme library and the duty twists (game/demon_malice.h reads them).
+    if (p.stem() == "schemes" || p.stem() == "twists") continue;
     json j;
     try {
       std::ifstream f(p);
@@ -87,6 +90,14 @@ bool LoadDemons(const std::string& dir, DemonLibrary& out, std::string& log) {
     if (d.gaze != "hold" && d.gaze != "avert") {
       log += "demons: " + stem + ": gaze \"" + d.gaze + "\" is not hold | avert\n";
       d.gaze = "avert";
+    }
+    d.ironSusceptibility = std::clamp(j.value("ironSusceptibility", d.ironSusceptibility), 0, 1000);
+    if (j.contains("motive") && j["motive"].is_object()) {
+      const json& m = j["motive"];
+      d.malice = std::clamp(m.value("malice", d.malice), 0, 100);
+      d.cunning = std::clamp(m.value("cunning", d.cunning), 0, 100);
+      d.spite = std::clamp(m.value("spite", d.spite), 0, 100);
+      d.literalism = std::clamp(m.value("literalism", d.literalism), 0, 100);
     }
     if (j.contains("resist") && j["resist"].is_object())
       for (auto it = j["resist"].begin(); it != j["resist"].end(); ++it)
@@ -248,6 +259,13 @@ bool FenceAllow(void* ctx, uint64_t mobId, MobFence::Kind kind, float fromX, flo
   DemonWorld& d = *(DemonWorld*)ctx;
   for (LiveDemon& ld : d.live) {
     if (ld.mobId != mobId) continue;
+    // D6 item 10: the SCORER's questions (mobfence.h Reach / Cast), never
+    // counted. A contained demon cannot reach past its salt, and its cast
+    // past it is stopped while sulfur severs cast_out.
+    if (kind == MobFence::Reach || kind == MobFence::Cast) {
+      if (ld.state != DemonState::Contained || ld.circle.Inside(toX, toZ)) return true;
+      return kind == MobFence::Cast && !ld.bind.Severed(demon::Channel::CastOut);
+    }
     // D5: a bound demon's blows answer to its contract (demon_talk.h).
     if (kind == MobFence::Blow && ld.pact && ld.state == DemonState::Released && d.fenced) {
       const ai::Brain* b = d.fenced->MobBrain(mobId);
@@ -255,12 +273,9 @@ bool FenceAllow(void* ctx, uint64_t mobId, MobFence::Kind kind, float fromX, flo
     }
     if (ld.state != DemonState::Contained) return true;
     if (ld.circle.Inside(toX, toZ)) return true;
-    // D3: a blow across the ring is the `touch` channel. Unsevered (not iron
-    // enough for this demon in the band) it is a LOOPHOLE: the claws reach.
-    if (kind == MobFence::Blow && !ld.bind.Severed(demon::Channel::Touch)) {
-      ld.bind.blowsLoophole++;
-      return true;
-    }
+    // A blow (or a grab) across the ring is ALWAYS refused: the salt blocks
+    // it (D6, owner decision 2026-10-04; D3's `touch` channel is gone -- iron
+    // now weakens the demon instead, demon_seals.h).
     // Knocked out of its circle while contained (a blast, a shove): it may
     // walk back TOWARD the inside, never further out.
     if (kind == MobFence::Move && !ld.circle.Inside(fromX, fromZ)) {
@@ -291,6 +306,11 @@ void DemonUnbind(TickAuthorityCtx& w, std::span<SessionTick> players, LiveDemon&
   // A released demon going loose gets its hostile profile back.
   if (const DemonDef* def = w.demons ? w.demons->lib.Find(ld.demon) : nullptr)
     if (!def->behavior.empty()) w.mobs.SetMobBehavior(ld.mobId, def->behavior);
+  // D6: the wait-at-home routine a held demon had is over (demon_malice.cpp).
+  if (ai::Brain* b = w.mobs.MobBrainMut(ld.mobId)) {
+    b->routine.active = false;
+    b->wanderOwned = false;
+  }
   AimAtSummoner(w.mobs, players, ld, tick);
   std::printf("demons: %s unbound at tick %u: %s\n", ld.name.c_str(), tick, why.c_str());
 }
@@ -307,8 +327,10 @@ DemonWorld& Demons(TickAuthorityCtx& w) {
 void DemonQueueSummon(TickAuthorityCtx& w, std::span<SessionTick> players, int session,
                       const SpellSummon& su, const GlyphLibrary& glyphs, uint32_t tick) {
   DemonWorld& d = Demons(w);
-  // Read the library again at every cast: an edit is live on the next one.
+  // Read the library again at every cast: an edit is live on the next one
+  // (D6: the schemes and twists too).
   EnsureLoaded(d, true);
+  if (d.malice) demon::Malice(d, true);
   const GlyphDef* g = glyphs.At(su.glyph);
   const DemonDef* def = g && g->summon.has ? d.lib.Find(g->summon.demon) : nullptr;
   if (def == nullptr || d.pending.size() >= DemonWorld::kMaxPending) {
@@ -378,6 +400,7 @@ uint64_t DemonArrive(TickAuthorityCtx& w, std::span<SessionTick> players,
   ld.session = p.session;
   ld.spawnTick = ld.stateTick = ld.lastCheck = tick;
   ld.circle = std::move(circle);
+  ld.home = Vec3{(float)p.at.x + 0.5f, (float)feetY, (float)p.at.z + 0.5f};
   d.stats.summons++;
   if (ld.circle.Closed()) {
     ld.state = DemonState::Contained;
