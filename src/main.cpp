@@ -8037,6 +8037,10 @@ int main(int argc, char** argv) {
   dialogue::Store talkStore;
   talkStore.dir = assetDir + "/dialogue";
   talkStore.items = &items;
+  // demons D2: the `grant` action resolves a glyph by name (and its load check
+  // warns about a name glyphs.json lacks). `glyphs` is reassigned in place on
+  // R, so the pointer stays good.
+  talkStore.glyphs = &glyphs;
   auto reloadDialogue = [&]() {
     talkStore.Reload();
     ui.dialogueNames.clear();

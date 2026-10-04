@@ -541,6 +541,8 @@ Run in order, on arriving at a node or on picking a choice (before it moves on).
 | `give` item × n | into the player's pack (the bag, then the hotbar; a full pack refuses) |
 | `take` item × n | out of the pack/hotbar (guard the choice with `has` so it cannot fail) |
 | `end` | the conversation ends after this |
+| `grant` glyph | the player now owns that spell glyph, by its glyphs.json id (`summon_skerrick`). Saved with the kit. A glyph that does not exist yet is a warning and does nothing |
+| `learn` name | the world now knows that name: sets the flag `name:<name>` (read it with `flag name:skerrick`) |
 
 **Flags are world-wide.** A flag set in Wat's conversation is the same flag
 Osric's reads. That is how two NPCs talk about you: Wat's choice does `set
@@ -594,7 +596,7 @@ same file.
 | Field | Means |
 |---|---|
 | `id` | `group/name`, lowercase letters, digits, `_` and `-` only |
-| `kind` | what sort of thing: `marker`, `npc` (§10.2), `waynode` (§10.2), `door`, `container`, `bed` (§10.1; `structure` arrives with houses) |
+| `kind` | what sort of thing: `marker`, `npc` (§10.2), `waynode` (§10.2), `door`, `container`, `bed` (§10.1), `readable` (§10.3; a book), `structure` (§12) |
 | `base` | what it's an instance of — for an `npc`, the mob def (`human`, `dummy`, ...) |
 | `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells |
 | `yaw` | facing in degrees: 0 faces +Z, 90 faces +X |
@@ -835,6 +837,40 @@ panel says so.
 - *"door ... is locked"* — villagers don't have keys either.
 - Walked out of range and came back? A villager is put where its day says it
   should be *now* (asleep in bed at night), not where you last saw it.
+
+### 10.3 How do I add a book (something to read)?
+
+A **readable** is a ref that reads as a conversation. The book itself is
+voxels you built: a lectern, a few leather and linen cells. The ref only says
+"this cell is a book, and these are its pages".
+
+1. Write the pages as a conversation (§9), e.g. `assets/dialogue/osric_notes.json`.
+   Set the file's `speaker` to what the header should say ("Osric's daybook").
+   Each node is a page and [continue] turns it. A page's `do` can `grant` a
+   spell glyph or `learn` a name.
+2. Place a ref of kind **readable** on the book's cell (F8 → Place →
+   `readable`, or a line in `refs/<group>.json`):
+
+   ```json
+   { "id": "harrowby/smithy_notes", "kind": "readable", "pos": [676, 182, 3461], "yaw": 90, "props": { "title": "Osric's daybook", "dialogue": "osric_notes" } }
+   ```
+
+   - `dialogue` is required.
+   - `title` is what the prompt says: "G  Read Osric's daybook".
+   - `verb` replaces "Read" ("Study", "Look at").
+3. Look at it in game and tap **G**. The prompt answers when the crosshair
+   passes within about 0.4 m of the cell.
+
+A readable saves nothing of its own. What its pages DO (flags, items, glyphs)
+saves the way those always do.
+
+**The cellar under the Harrowby smithy** is the worked example. It is too far
+under the floor for a house blueprint (a house can only sink 8 cells), so it
+lives in the map's edit layer, written by `node scripts/paint_cellar.mjs`.
+That script owns those columns: edit the plan at its top and run it again.
+Walk in through the smithy's door, go to the back of the bedroom past the
+bed, and take the stairs down beside the rail. The book is on the lectern
+west of the salt ring. `--selftest --gate harrowby-cellar` checks all of it.
 
 ## 11. Buildings — the Structures page
 

@@ -23258,7 +23258,10 @@ day, the speaker): `flag` / `!flag` (+ optional exact `value`), `time`
 P7 supplies; unset = false, silently), `has` / `!has` (bag + hotbar; worn gear
 does not count), `met`. Actions: `set` / `add` / `clear` a flag, `give` /
 `take` an item BY NAME through the kit's own merge rule (bag, then hotbar; a
-full pack refuses and counts `stats.refusedGives`), `end`. Nothing writes a
+full pack refuses and counts `stats.refusedGives`), `end`; and (demons D2,
+§17) `grant` a glyph BY NAME into the player's `GlyphInventory` (a name
+glyphs.json lacks is a load WARNING and a counted no-op, `stats.refusedGrants`)
+and `learn` a name (sets the world flag `name:<x>`). Nothing writes a
 voxel; the only world state touched is integer flags, so determinism is the
 tick's by construction.
 

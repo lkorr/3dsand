@@ -226,6 +226,16 @@ bool ParseActs(const json& j, const Where& w, const std::string& field,
         } else {
           ac.arg = v.get<std::string>();
         }
+      } else if (k == "grant" || k == "learn") {
+        // demons D2: a glyph by NAME (grant) / a name the player now knows
+        // (learn -> the world flag "name:<arg>").
+        ac.kind = k == "grant" ? Act::Kind::Grant : Act::Kind::Learn;
+        if (!v.is_string() || v.get<std::string>().empty()) {
+          w.Err(f + "." + k, k == "grant" ? "names a glyph (glyphs.json id)" : "names a name");
+          ok = false;
+        } else {
+          ac.arg = v.get<std::string>();
+        }
       } else if (k == "end") {
         ac.kind = Act::Kind::End;
         if (!v.is_boolean() || !v.get<bool>()) {
@@ -233,7 +243,7 @@ bool ParseActs(const json& j, const Where& w, const std::string& field,
           ok = false;
         }
       } else {
-        w.Err(f + "." + k, "unknown action (set, add, clear, give, take, end)");
+        w.Err(f + "." + k, "unknown action (set, add, clear, give, take, end, grant, learn)");
         ok = false;
       }
     }
@@ -252,7 +262,8 @@ bool ParseActs(const json& j, const Where& w, const std::string& field,
     }
     if (a.contains(numKey)) {
       if (!a[numKey].is_number_integer() || ac.kind == Act::Kind::Clear ||
-          ac.kind == Act::Kind::End || (items && a[numKey].get<int>() < 1)) {
+          ac.kind == Act::Kind::End || ac.kind == Act::Kind::Grant ||
+          ac.kind == Act::Kind::Learn || (items && a[numKey].get<int>() < 1)) {
         w.Err(f + "." + numKey, "is an integer (positive for give/take), not on clear/end");
         ok = false;
       } else {
@@ -405,7 +416,8 @@ bool Library::Parse(const std::string& name, const std::string& text,
 
 // ---- validate ----------------------------------------------------------------
 
-void Library::Validate(const ItemLibrary* items, std::vector<Problem>& problems) const {
+void Library::Validate(const ItemLibrary* items, std::vector<Problem>& problems,
+                       const GlyphLibrary* glyphs) const {
   std::map<std::string, std::string> written, read;  // flag -> first place
   std::set<std::string> names;
   for (const Dialogue& d : all_) names.insert(d.name);
@@ -449,6 +461,15 @@ void Library::Validate(const ItemLibrary* items, std::vector<Problem>& problems)
         if ((a.kind == Act::Kind::Give || a.kind == Act::Kind::Take) && items &&
             !items->Named(a.arg))
           w.Err(f, "'" + a.arg + "' is not an item (assets/items/items.json)");
+        // A grant naming no glyph is a WARNING, not an error: the book that
+        // teaches a demon's name may ship before the glyph does (demons D2 /
+        // D1), and a warning keeps the rest of the file loading. At run time
+        // the grant is then a counted no-op (stats.refusedGrants).
+        if (a.kind == Act::Kind::Grant && glyphs && glyphs->Find(a.arg) < 0)
+          w.Warn(f + ".grant", "'" + a.arg + "' is not a glyph in assets/spells/glyphs.json "
+                               "(the grant does nothing until it is)");
+        if (a.kind == Act::Kind::Learn && !written.count("name:" + a.arg))
+          written["name:" + a.arg] = fname + " " + w.node;
       }
     };
     for (size_t i = 0; i < d.entries.size(); i++) {
@@ -504,7 +525,7 @@ void Library::Validate(const ItemLibrary* items, std::vector<Problem>& problems)
 }
 
 bool Library::Load(const std::string& dir, const ItemLibrary* items,
-                   std::vector<Problem>& problems) {
+                   std::vector<Problem>& problems, const GlyphLibrary* glyphs) {
   all_.clear();
   namespace fs = std::filesystem;
   std::error_code ec;
@@ -524,7 +545,7 @@ bool Library::Load(const std::string& dir, const ItemLibrary* items,
     if (Parse(p.stem().string(), ss.str(), p.string(), d, problems))
       all_.push_back(std::move(d));
   }
-  Validate(items, problems);
+  Validate(items, problems, glyphs);
   return true;
 }
 
@@ -547,7 +568,7 @@ void Library::Add(Dialogue d) {
 
 bool Store::Reload() {
   problems.clear();
-  lib.Load(dir, items, problems);
+  lib.Load(dir, items, problems, glyphs);
   bool ok = true;
   for (const Problem& p : problems) {
     std::fprintf(stderr, "dialogue: %s\n", p.Line().c_str());
@@ -766,6 +787,24 @@ bool RunActs(Store& store, PlayerSession& s, const std::vector<Act>& acts) {
         break;
       }
       case Act::Kind::End: end = true; break;
+      case Act::Kind::Grant: {
+        // BY NAME, resolved now: glyph indices die on every R reload, names
+        // do not. Ownership is the kit's (GlyphInventory::owned, written by
+        // name in the save's kit section), so a granted glyph survives a save.
+        const int gi = store.glyphs ? store.glyphs->Find(a.arg) : -1;
+        if (gi < 0) {
+          store.stats.refusedGrants++;
+          std::fprintf(stderr, "dialogue: grant '%s': no such glyph\n", a.arg.c_str());
+          break;
+        }
+        s.caster.inventory.Grant(gi);
+        store.stats.grants++;
+        break;
+      }
+      case Act::Kind::Learn:
+        store.flags["name:" + a.arg] = 1;
+        store.stats.learned++;
+        break;
     }
   }
   return end;

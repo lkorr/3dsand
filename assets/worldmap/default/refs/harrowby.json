@@ -8,6 +8,7 @@
     { "id": "harrowby/green", "kind": "structure", "base": "harrowby_green", "pos": [555, 201, 3467], "yaw": 0, "props": { "padApron": 6, "padMargin": 24 } },
     { "id": "harrowby/field", "kind": "structure", "base": "harrowby_field", "pos": [560, 201, 3170], "yaw": 0, "props": { "padApron": 4, "padMargin": 30 } },
     { "id": "harrowby/smithy_yard", "kind": "marker", "pos": [654, 201, 3434], "yaw": 90, "props": { "tags": ["smithy_yard"] } },
+    { "id": "harrowby/smithy_notes", "kind": "readable", "pos": [676, 182, 3461], "yaw": 90, "props": { "title": "Osric's daybook", "dialogue": "osric_notes" } },
     { "id": "harrowby/path_north", "kind": "waynode", "pos": [555, 201, 3420], "yaw": 0, "props": { "links": ["harrowby/longhouse/waynode_front_0_out", "path_west", "path_east"] } },
     { "id": "harrowby/path_west", "kind": "waynode", "pos": [515, 201, 3456], "yaw": 0, "props": { "links": ["harrowby/alehouse/waynode_front_0_out", "path_south"] } },
     { "id": "harrowby/path_east", "kind": "waynode", "pos": [600, 201, 3456], "yaw": 0, "props": { "links": ["harrowby/smithy/waynode_front_0_out", "path_south", "path_yard"] } },

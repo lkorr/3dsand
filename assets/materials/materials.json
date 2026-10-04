@@ -5186,6 +5186,36 @@
       "tags": [
         "metal"
       ]
+    },
+    {
+      "//": "DEMONS D2 (docs/PLAN_demons.md). TALLOW: a candle's body -- rendered animal fat, cream and waxy. A plain static solid; the flame on top is its own material (candle_flame). Appended at the END: an id is the index, and the Harrowby cellar layer (assets/worldedits/default_ground.svedit, written by scripts/paint_cellar.mjs) stores ids, so a merge that renumbers this tail re-runs that script.",
+      "id": "tallow",
+      "class": "solid",
+      "density": 900,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#e8dcb4",
+        "#ddd0a4",
+        "#f2e8c6"
+      ],
+      "tags": [
+        "organic"
+      ]
+    },
+    {
+      "//": "DEMONS D2. CANDLE FLAME: the lit wick of a candle -- a LIGHT, not a heater. Solid so it stays on its candle, emissive so it lights the irradiance grid like glowcap does, and deliberately NOT tag:hot and with no burn rule: a candle in a cellar full of sulfur must not set it alight, and a flame that never burns out never sleeps (CLAUDE.md rule 2). Water or any extinguisher puts it out (reactions.json, the one rule: it fires only where wet matter touches it, so a dry candle costs nothing). The summoning circle (D3) counts lit candles by this material.",
+      "id": "candle_flame",
+      "class": "solid",
+      "density": 5,
+      "hardness": 1,
+      "emission": 230,
+      "colors": [
+        "#ffd27a",
+        "#ffb347",
+        "#ffe6a8"
+      ],
+      "tags": []
     }
   ]
 }
