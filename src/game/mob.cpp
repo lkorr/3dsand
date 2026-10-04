@@ -20684,43 +20684,56 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   // nothing but the plans. The loops then spend the shared pots exactly as
   // before and play each plan up to the share it gets.
   // SANDVOX_STAIN_PLAN=0: no plans (every contact pass inline, the A/B arm).
-  // SANDVOX_STAIN_PLAN=2: every plan re-made serially and compared (a
-  // diagnostic for the pool's contract: a mismatch is printed and the serial
-  // plan kept).
   static const int planMode = [] {
     const char* e = std::getenv("SANDVOX_STAIN_PLAN");
     return e ? std::atoi(e) : 1;
   }();
   if (planMode != 0) {
+    auto planned = [&](const Mob& m) {
+      return !(!m.alive_ && (m.rigReleased_ || m.deadAsleep_));
+    };
+    // 1. Every limb's walk and surface size, across the pool.
     workpool::ParallelFor(mobs_.size(), 1, [&](size_t i) {
-      Mob& m = mobs_[i];
-      if (!m.alive_ && (m.rigReleased_ || m.deadAsleep_)) return;
-      m.PlanStainContact(tick, world);
+      if (planned(mobs_[i])) mobs_[i].PlanStainContact(tick, world, 1);
     });
-  }
-  if (planMode == 2) {
-    for (size_t i = 0; i < mobs_.size(); i++) {
-      Mob& m = mobs_[i];
-      if (!m.alive_ && (m.rigReleased_ || m.deadAsleep_)) continue;
-      if (m.stainPreTick_ != tick) continue;
-      const std::vector<StainPre> par = m.stainPre_;
-      m.PlanStainContact(tick, world);
-      for (size_t li = 0; li < par.size() && li < m.stainPre_.size(); li++) {
-        const StainPre& a = par[li];
-        const StainPre& b = m.stainPre_[li];
-        bool same = a.valid == b.valid && a.any == b.any && a.ns == b.ns &&
-                    a.walkFetches.size() == b.walkFetches.size() &&
-                    a.evts.size() == b.evts.size();
-        for (size_t k = 0; same && k < a.evts.size(); k++)
-          same = a.evts[k].k == b.evts[k].k && a.evts[k].vi == b.evts[k].vi &&
-                 a.evts[k].next == b.evts[k].next && a.evts[k].fetch == b.evts[k].fetch;
-        if (!same)
-          std::printf("stain-plan MISMATCH tick %u mob %llu limb %zu: parallel valid %d any %d "
-                      "ns %u evts %zu | serial valid %d any %d ns %u evts %zu\n",
-                      tick, (unsigned long long)m.id_, li, a.valid, a.any, a.ns,
-                      a.evts.size(), b.valid, b.any, b.ns, b.evts.size());
-      }
+    // 2. THE MOST EACH LIMB'S SHARE CAN BE: the two pots spent below in their
+    // exact order, contact only. The drying and wet passes the real loop runs
+    // between contacts can only take MORE out of the pot, and the share a
+    // limb gets never shrinks as the pot grows, so every share bounded here
+    // is at least the real one, and a limb the real pot never reaches is at
+    // worst planned for nothing. Bounding is what keeps the plan the size of
+    // the pot instead of every limb's whole surface.
+    if (!mobs_.empty()) {
+      const size_t nm = mobs_.size();
+      const size_t start = (size_t)(tick % (uint32_t)nm);
+      auto bound = [&](bool living) {
+        uint32_t pot = kStainLatticePerTick;
+        for (size_t k = 0; k < nm && pot; k++) {
+          Mob& m = mobs_[(start + k) % nm];
+          if (living ? !m.alive_ : (m.alive_ || m.rigReleased_ || m.deadAsleep_)) continue;
+          if (m.stainPreTick_ != tick || m.IsGhost()) continue;
+          const int nl = (int)m.limbs_.size();
+          if (nl == 0 || (int)m.stainPre_.size() != nl) continue;
+          const int ls = (int)(tick % (uint32_t)nl);
+          for (int kk = 0; kk < nl && pot; kk++) {
+            const int li = (ls + kk) % nl;
+            if (!m.limbs_[li].body) continue;
+            StainPre& p = m.stainPre_[li];
+            if (!p.valid || !p.any || p.ns == 0) continue;
+            const uint32_t share = std::min(pot, kStainLatticePerLimb);
+            const uint32_t take = std::min(p.ns, share);
+            p.kPlanned = take;
+            pot -= std::min(pot, kStainLatticePerLimb - (share - take));
+          }
+        }
+      };
+      bound(true);
+      bound(false);
     }
+    // 3. The sweeps, each to its bound, across the pool.
+    workpool::ParallelFor(mobs_.size(), 1, [&](size_t i) {
+      if (planned(mobs_[i])) mobs_[i].PlanStainContact(tick, world, 2);
+    });
   }
   if (!mobs_.empty()) {
     const size_t nm = mobs_.size();
@@ -21157,16 +21170,21 @@ void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
 }
 
 
-void Mob::PlanStainContact(uint32_t tick, World& world) {
+void Mob::PlanStainContact(uint32_t tick, World& world, int planMode) {
   if (!sys_ || sys_->matGpu_.empty() || IsGhost() || rigReleased_) return;
-  stainPreTick_ = tick;
-  if (stainPre_.size() != limbs_.size()) stainPre_.resize(limbs_.size());
+  if (planMode == 1) {
+    stainPreTick_ = tick;
+    if (stainPre_.size() != limbs_.size()) stainPre_.resize(limbs_.size());
+  } else if (stainPreTick_ != tick || stainPre_.size() != limbs_.size()) {
+    return;
+  }
   // Exactly the view and key StainTick will hand StainOneLimb.
   const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu;
   WornProbe probe{this, -1};
   for (int li = 0; li < (int)limbs_.size(); li++) {
     StainPre& p = stainPre_[li];
-    p.valid = false;
+    if (planMode == 1) p.valid = false;
+    else if (!p.valid || !p.any || p.ns == 0 || p.kPlanned == 0) continue;
     if (!limbs_[li].body) continue;
     BurnLimbView v = ViewOf(limbs_[li]);
     if (LimbHasShells(li)) {
@@ -21176,7 +21194,7 @@ void Mob::PlanStainContact(uint32_t tick, World& world) {
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
     uint32_t unused = 0;
-    sys_->StainOneLimb(v, tick, key, world, unused, &p, /*planOnly=*/true);
+    sys_->StainOneLimb(v, tick, key, world, unused, &p, planMode);
   }
 }
 
@@ -22058,25 +22076,36 @@ uint32_t Mob::ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick,
 
 bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                              World& world, uint32_t& budget, StainPre* pre,
-                             bool planOnly) {
-  // TWO WAYS IN (PLAN_fight64_perf M). PLAN (`planOnly`, from a work-pool
-  // task, StainLimbs' StainPre pass): the walk and the whole sweep a full
-  // per-limb budget could make, computed against the world and this limb as
-  // they stand, with NOTHING written -- every write the sweep would make and
-  // every chunk fetch it would ask is recorded in `pre`, in order, by sample.
-  // APPLY (the serial pass in pot order): with a plan, its records are played
-  // up to the sample count THIS limb's share of the shared budget allows;
-  // without one, the same plan is made inline for exactly that count and
-  // played at once. The samples are independent -- each is a distinct surface
-  // voxel reading the world and its own coat, and nothing between the plan
-  // and the apply writes either -- so a plan cut at `count` is the sweep that
-  // stops at `count`.
+                             int planMode) {
+  // THREE WAYS IN (PLAN_fight64_perf M), all reading the world and this limb
+  // as they stand. The two PLAN modes are work-pool tasks (StainLimbs) and
+  // write NOTHING but `pre`: mode 1 is the walk (its answer and its chunk
+  // fetches) and the surface size; mode 2 is the sweep of the first
+  // pre->kPlanned samples -- the most this limb's share of the shared pot can
+  // be, which StainLimbs works out between the two -- every coat write and
+  // chunk fetch recorded by sample. APPLY (mode 0, the serial pass in pot
+  // order): with a plan, its records are played up to the sample count THIS
+  // limb's share of the pot allows; without one (or past what was planned),
+  // the same sweep runs inline for exactly that count and is played at once.
+  // The samples are independent -- each is a distinct surface voxel reading
+  // the world and its own coat, and nothing between the plan and the apply
+  // writes either -- so a plan cut at `count` is the sweep that stops there.
   burnprof::Scope bpScope(burnprof::kStainContact);
-  if (planOnly && pre != nullptr) {
+  const bool planOnly = planMode != 0;
+  const bool planWalk = planMode == 1, planSweep = planMode == 2;
+  if (planWalk && pre != nullptr) {
     pre->valid = false;
     pre->any = false;
+    pre->swept = false;
     pre->ns = 0;
+    pre->kPlanned = 0;
     pre->walkFetches.clear();
+    pre->evts.clear();
+    pre->useScratch = false;
+  }
+  if (planSweep) {
+    if (pre == nullptr || !pre->valid || !pre->any || pre->ns == 0) return false;
+    pre->swept = false;
     pre->evts.clear();
   }
   if (matGpu_.empty() || v.Size() == 0 || (!planOnly && budget == 0)) return false;
@@ -22085,7 +22114,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
 
   // Chunk fetches the walk and the sweep ask for, recorded (a plan) or asked
   // at once (inline).
-  std::vector<IVec3>* walkFetchOut = planOnly && pre ? &pre->walkFetches : nullptr;
+  std::vector<IVec3>* walkFetchOut = planWalk && pre ? &pre->walkFetches : nullptr;
 
   // The world side of the walk: full WORDS this time, because a dry stain
   // lives in the word's stain bits and a material id cannot see it.
@@ -22201,7 +22230,9 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // first cell that means something. A limb in clean air pays this walk and
   // nothing else, exactly as the burn pass does.
   const bool usePlan = !planOnly && pre != nullptr && pre->valid;
-  if (usePlan) {
+  if (planSweep) {
+    // The walk is mode 1's (checked at the top: it found something).
+  } else if (usePlan) {
     // The plan's walk: its fetches asked now, in its order, and its answer.
     for (const IVec3& wc : pre->walkFetches) world.RequestChunkFetch(wc);
     if (!pre->any) return false;
@@ -22258,9 +22289,9 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             }
           }
         }
-    if (planOnly && pre) pre->any = any;
+    if (planWalk && pre) pre->any = any;
     if (!any) {
-      if (planOnly && pre) pre->valid = true;
+      if (planWalk && pre) pre->valid = true;
       return false;  // the walk was the whole cost
     }
   }
@@ -22271,9 +22302,10 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // leaves the limb's own state alone: an index or surface it lacks is built
   // into a scratch state and thrown away (the apply builds the real one, from
   // the same lattice, only if the limb's turn comes).
-  BodyBurnState scratch;
   BodyBurnState* stp = v.burn;
-  if (planOnly && (stp->idx.empty() || stp->surface.empty())) {
+  if (planWalk && pre && (stp->idx.empty() || stp->surface.empty())) {
+    BodyBurnState& scratch = pre->scratch;
+    scratch = BodyBurnState{};
     if (stp->idx.empty()) {
       BurnLimbView tv = v;
       tv.burn = &scratch;
@@ -22284,12 +22316,15 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       scratch.dims = stp->dims;
       scratch.min = stp->min;
     }
+    pre->useScratch = true;
     stp = &scratch;
+  } else if (planSweep && pre->useScratch) {
+    stp = &pre->scratch;
   }
   BodyBurnState& st = *stp;
   if (!planOnly && st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) {
-    if (planOnly && pre) pre->valid = true;   // refused: the apply refuses too
+    if (planWalk && pre) pre->valid = true;   // refused: the apply refuses too
     return false;
   }
   if (!planOnly) {
@@ -22326,7 +22361,15 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   }
   const size_t ns = st.surface.size();
   if (ns == 0) {
-    if (planOnly && pre) pre->valid = true;
+    if (planWalk && pre) pre->valid = true;
+    return false;
+  }
+  if (planWalk) {
+    // Mode 1 ends here: StainLimbs bounds this limb's share from `ns`.
+    if (pre) {
+      pre->ns = (uint32_t)ns;
+      pre->valid = true;
+    }
     return false;
   }
 
@@ -22341,15 +22384,16 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // How many samples: this limb's share of the shared pot (the APPLY), or
   // all a share could ever be (the PLAN).
   const uint32_t limbBudget0 =
-      planOnly ? kStainLatticePerLimb : std::min(budget, kStainLatticePerLimb);
+      planSweep ? std::min(pre->kPlanned, kStainLatticePerLimb)
+                : std::min(budget, kStainLatticePerLimb);
   const uint32_t count = (uint32_t)std::min<size_t>(ns, limbBudget0);
   std::vector<StainEvt> localEvts;
   const std::vector<StainEvt>* evts = nullptr;
-  if (usePlan && pre->ns == (uint32_t)ns) {
+  if (usePlan && pre->swept && pre->ns == (uint32_t)ns && count <= pre->kPlanned) {
     evts = &pre->evts;
   } else {
     // ---- THE SAMPLES, decided (nothing written) ---------------------------
-    std::vector<StainEvt>& out = planOnly && pre ? pre->evts : localEvts;
+    std::vector<StainEvt>& out = planSweep ? pre->evts : localEvts;
     sweepOut = &out;
     // WHAT A WORLD CELL MEANS, MEMOIZED. At skinScale 8 a world cell's face
     // is 64 surface voxels, and the sweep below visits them in lattice order,
@@ -22470,11 +22514,8 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       out.push_back(ev);
     }
     sweepOut = nullptr;
-    if (planOnly) {
-      if (pre) {
-        pre->ns = (uint32_t)ns;
-        pre->valid = true;
-      }
+    if (planSweep) {
+      pre->swept = true;
       return false;
     }
     evts = &out;
