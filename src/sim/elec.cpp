@@ -12,17 +12,21 @@ static_assert(kElecChunkVol == kChunkVol, "elec.h restates world.h kChunkVol");
 // The kernel's halo walk and sweeps assume a 16-cell chunk edge and 256-thread
 // groups: one thread per line of a sweep, one per face cell of the halo.
 static_assert(kElecChunk == 16, "sim_elec.wgsl assumes 16^3 chunks");
+// The resist and the source share word 0 of a material (12 + 16 bits).
+static_assert(kElecResistInsulator == kElecResistMask, "the insulator is the all-ones resist");
+static_assert(kElecResistMask < (1u << 16), "resist must not reach the source half");
 
 void PackElecMaterial(const ElecDef& e, uint32_t out[kEpMatStride]) {
   for (uint32_t i = 0; i < kEpMatStride; i++) out[i] = 0;
   const uint32_t r = std::min<uint32_t>(e.resist, kElecResistInsulator - 1);
   const uint32_t s = std::min<uint32_t>(e.source, kElecPMax);
-  out[0] = (r & 0xFFu) | (s << 16);
+  out[0] = (r & kElecResistMask) | (s << 16);
   out[1] = (e.igniteIntoId & 0xFFFu) | ((e.charIntoId & 0xFFFu) << 12);
   if (e.igniteChanceMille > 0.0) {
     uint32_t chance = (uint32_t)std::lround(e.igniteChanceMille * (double)kReactChanceScale);
     out[2] = std::max<uint32_t>(chance, 1u);
   }
+  out[3] = std::min<uint32_t>(e.dissolved, kElecResistInsulator - 1) & kElecResistMask;
 }
 
 uint32_t ElecWetResist(uint32_t wetResist, uint32_t amount) {

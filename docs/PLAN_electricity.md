@@ -21,6 +21,8 @@ player gate.
 | E4 | Shocks reach bodies: elecQuery, `DamageCause::Electric`, stun / twitch / knock-down / ignite, gates `elec-water-mob`, `elec-stun`, `elec-replay` | f376cd6 |
 | E2 | What charge does in the CA: charge as partner, ohmic ignition / char, crackle, gates `elec-electrolysis`, `elec-ignite`, `elec-crackle-bounded` | ecbfdd6 (main at e772227) |
 | Endgame | Proportional decay (`sim.elecDecayShift`), gate `elec-player-stun`, the ops-replay reporter fix | branch `worktree-agent-a73d261dd6db03139` |
+| Wave 2 E | Gameplay (docs/PLAN_electricity_wave2.md E): strikes scan from the real top (aim + 272) and skip columns entered from inside; spell strikes seek past the mirror after an 8-tick stepped leader; wards re-checked at the struck cell; strength scales the bolt; a budget-refused strike refunds its tariff; storms roll per player id; peer bolts flash + clap; stun refuses Q/E/G (talk kept); `Cues::Zap` / `Cues::Shock` + PLACEHOLDER takes (`scripts/gen_elec_sounds.py`, incl. weather/thunder); pixel STUNNED cue; gate `elec-strike-play` | worktree branch (package E) |
+| Wave 2 A | The charge field (docs/PLAN_electricity_wave2.md package A): the spreading loss (`sim.elecSpreadLoss` / `elecSpreadFree`), gate `elec-bulk`; 12-bit resist, dry wood 1,500; the owner check (phantom charge); the `C_ELEC` fast path; the per-tick cell cache; parallel re-key; brine via the solute layer (`electric.dissolved`); sodium / acid / lava / molten glass / shore mud blocks; elec-strike's fade / sleep / two collar checks; observed keys seeded | branch `worktree-agent-a2ef8b498c9bb613f` |
 
 **Decay (endgame).** A stored P now loses `max(sim.elecDecay, P >>
 sim.elecDecayShift)` a tick (8 and 3), taken off the whole stored field --
@@ -38,9 +40,26 @@ own decay: every page back 55 ticks after the source; `elecCrackle.decay` 0),
 elec-water-mob, elec-stun, elec-player-stun (new), elec-replay, elec-strike,
 android-sparks, ops-replay (after the reporter fix).
 
+**Wave 2, package A (2026-10-04).** Bulk conductors no longer carry a strike
+across the window: a cell loses (n - 2) x 150/4096 of what it receives per
+conducting neighbour past two (a wire is free). A forced strike into a sea
+basin charges 33 cells out (P >= 20 to 31) over 20 pages, onto rain-wet ground
+25 / 15 pages; the same gate with the loss off fills both fixtures (89 / 83
+pages, 66 / 59). Dry wood is 1,500 (12-bit resist): a spark cannot enter it,
+lightning ~20 cells of a 1-wide beam. Readers check the page's owner (no
+phantom charge after a window shift). The elec rows record only while
+`World::ElecMayBeLive` (a source op, pages in the snapshot, or a doorbell
+ring): ~61 us/frame of GPU off every CA-active tick of the `explosion` perf
+scenario, which has no charge. Rounds after a chunk's first in a tick read a
+per-page cell cache. Brine conducts (salt `electric.dissolved` 2). The world
+hash did not move (determinism 0fa43063).
+
 **Open:**
-- Brine conducts no better than fresh water (the field does not read the
-  solute layer).
+- Wet wood is still a WIRE: a full water coat makes any plank 12, so a
+  rain-soaked 1-wide beam carries lightning as far as water would in a line
+  (the spreading loss only bites in sheets and bulk). Physically a film on a
+  beam is thin and resistive; a fix is a per-material floor on the wet rule
+  (owner decision).
 - The glow is emission only (lights no neighbour) and does not reach plants,
   raster bodies or the far cascade.
 - The strike's target scan starts 24 cells over the aim, so a tree taller

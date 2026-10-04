@@ -70,6 +70,7 @@ const std::vector<Gate>& AlchemyGates();
 const std::vector<Gate>& ChemGates();
 // Electricity E3 (docs/PLAN_electricity.md section 3): the strike path.
 const std::vector<Gate>& ElecStrikeGates();
+const std::vector<Gate>& ElecPlayGates();
 // Electricity E1 (docs/PLAN_electricity.md section 1): the charge field.
 const std::vector<Gate>& ElecGates();
 // Electricity E4 (docs/PLAN_electricity.md section 4): shocks reach bodies.
@@ -948,6 +949,13 @@ const char* const kOrder[] = {
     // Electricity E3: a forced weather strike on a rod-and-collar fixture,
     // run twice; same fixture discipline (own pad, regenerates on the way out).
     "elec-strike",
+    // Electricity wave 2 E: the strike's gameplay fixes (real top, strength,
+    // tariff refund, ward at the struck cell, the spell's stepped leader);
+    // own pad, regenerates on the way out.
+    "elec-strike-play",
+    // Electricity wave 2: the same forced strike onto a sea basin and a
+    // rain-wet pad -- the spreading loss keeps it local. Same discipline.
+    "elec-bulk",
     // Electricity E1: the charge field in three sealed rooms (a copper wire,
     // a dry and a wet wood strip, a water pool), run twice; own worldgen,
     // regenerates on the way out.
@@ -1192,7 +1200,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecGates(), &ElecMobGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &ElecStrikeGates(), &ElecPlayGates(), &ElecGates(), &ElecMobGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(), &CoatGates(), &ItemStageGates(),
                           &CombatGates(), &PoseGates(),

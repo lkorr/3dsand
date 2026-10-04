@@ -6083,6 +6083,18 @@ class MobSystem {
     uint64_t stale = 0;        // answers for a body no longer here / alive
   };
   const ShockCounters& ShockStats() const { return shockCounters_; }
+  // ---- THE SHOCK'S SOUND (wave 2, package E) -------------------------------
+  // One entry per body per tick a shock was applied (ApplyShocks), drained by
+  // the frame into Cues::Shock and cleared there like VoiceEvents. Presentation
+  // only: nothing in the sim reads it. Bounded by construction (one per body
+  // per tick, the tick loop at most 4 deep per frame) and capped besides.
+  struct ShockCue {
+    Vec3 posVoxel;          // the touching limb that took the most
+    uint64_t mobId = 0;     // the player's own avatar id = "it is me"
+    float intensity = 0.0f; // 0..1: effective P against the knock-down P
+  };
+  const std::vector<ShockCue>& ShockCues() const { return shockCues_; }
+  void ClearShockCues() { shockCues_.clear(); }
   uint64_t ShockAttacksDropped() const { return shockAttacksDropped_; }
   uint32_t ContactHitsBilled() const { return contactHitsBilled_; }
 
@@ -8028,6 +8040,8 @@ class MobSystem {
   uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature
   uint32_t contactHitsBilled_ = 0;  // ApplyContactDamage: contacts billed
   ShockCounters shockCounters_;      // QueueShockQueries / ApplyShocks
+  std::vector<ShockCue> shockCues_;  // ApplyShocks -> the frame's Cues::Shock
+  void PushShockCue(const Mob& m, int limb, float peakP);
   uint64_t shockAttacksDropped_ = 0;  // DecideIntent: attacks a stun refused
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------

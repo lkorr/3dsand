@@ -956,6 +956,27 @@ struct TickAuthorityCtx {
     };
     std::vector<Pending> pending;     // decided, not yet fired (bounded: kMaxPending)
     static constexpr size_t kMaxPending = 4;
+    // A SPELL's strike whose target search leaves the stores (mirror + fetch
+    // cache): its chunks were requested when it resolved and it fires
+    // kStrikeLeadTicks later, from the phase I of the session that cast it
+    // (the ward re-check and the mana refund are that caster's). Same state
+    // class as `pending`: not hashed, not saved. Bounded: past
+    // kMaxSpellPending a strike fires at once on what is known.
+    struct SpellPending {
+      StrikeSpec spec;
+      uint32_t fireTick = 0;
+      int session = 0;        // PlayerSession::index of the caster
+      int32_t tariff = 0;     // SpellStrike::tariff, for the refund
+    };
+    std::vector<SpellPending> spellPending;
+    static constexpr size_t kMaxSpellPending = 8;
+    // STORMS ROLL PER PLAYER (wave 2, package E). Session i's decide roll and
+    // aim are keyed by `playerIdBase + i`, so two machines (each running its
+    // own player as session 0) and two sessions of one machine roll
+    // independently instead of striking on the same ticks. 0 on the host and
+    // in single player (whose hashes are unchanged by it); main.cpp sets the
+    // client's net player id.
+    uint32_t playerIdBase = 0;
     // FORCE A STRIKE (the gate, the dev key, SANDVOX_STRIKE_EVERY): the next
     // tick decides a weather strike regardless of the sky -- at `forceAim`
     // when `forceAimSet`, else in the usual disc round the primary.
@@ -972,6 +993,10 @@ struct TickAuthorityCtx {
       bool conductive = false;
       bool emitted = false;   // false = refused for budget
       uint32_t cells = 0;
+      // Recovered from a PEER's merged CellOps (session.cpp phase N): a bolt
+      // another machine authored, re-announced here only so this machine's
+      // frame flashes and claps for it. Never in `recent`.
+      bool remote = false;
     };
     std::vector<Event> events;        // drained by the frame; capped at kMaxEvents
     static constexpr size_t kMaxEvents = 16;
@@ -981,6 +1006,10 @@ struct TickAuthorityCtx {
     StrikePlan lastPlan;
     // Telemetry, monotonic.
     uint64_t weatherDecided = 0, weatherFired = 0, spellStrikes = 0, forced = 0;
+    uint64_t spellLeaders = 0;     // spell strikes that waited for the fetch
+    uint64_t spellWarded = 0;      // refused by a ward at the struck cell
+    uint64_t spellRefunded = 0;    // mana points refunded for budget refusals
+    uint64_t remoteEvents = 0;     // peer bolts announced to this frame
   } strikes;
   // Each vessel body's velocity last tick, for the break test's "velocity
   // jump" witness. One entry per vessel lying or flying in the world.

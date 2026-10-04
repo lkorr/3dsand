@@ -2062,23 +2062,29 @@ reads it (E2, "What charge does" below -- which is where the world hash moved),
 as do E4 (mob shock) and E5 (the glow).
 
 **Material data** (`materials.json "electric"`, `ParseElectric`): `resist`
-1..254 is the potential a cell costs to enter (no block = insulator), `source`
-1..65535 the potential a cell holds every tick it exists; `ignite` / `char`
-are E2's, parsed and packed now. Authored: drawn copper `copper_bar` 1 (the
-solid; `copper` FILINGS are a powder, 3), silver / gold 1, aluminium /
-quicksilver 2, iron / steel / brass / molten iron 3, lead / molten salt 4, lye 5,
-water 6, blood / coolant 8, flesh / skin / muscle 20, wood (every plank, log and
-bark) 60; `spark` 200, `arc` 2,000, `lightning` 30,000. Packed to `elecParams`
-(4 words a material: resist | source, ignite / char ids, ignite chance) and two
-`_r2` bits (25 source, 26 conducts). **Wet:** a cell under a coat whose
+1..4094 is the potential a cell costs to enter (no block = insulator; TWELVE
+bits since wave 2 -- it was a byte, 1..254, and a byte cannot say "dry wood is
+nearly an insulator"), `source` 1..65535 the potential a cell holds every tick
+it exists; `ignite` / `char` are E2's; `dissolved` (wave 2) is the resist a
+conducting liquid falls to with this material dissolved in it at saturation
+(salt 2: brine). Authored: drawn copper `copper_bar` 1 (the solid; `copper`
+FILINGS are a powder, 3), silver / gold 1, aluminium / quicksilver / sodium 2,
+iron / steel / brass / molten iron 3, lead / molten salt / acid 4, lye 5, water
+6, blood / coolant 8, lava 10, flesh / skin / muscle 20, molten glass 20, shore
+mud 30, wood (every plank, log and bark) 1,500 (wave 2; it was 60, and one bolt
+ran ~500 cells of connected timber); `spark` 200, `arc` 2,000, `lightning`
+30,000. Packed to `elecParams` (4 words a material: resist | source, ignite /
+char ids, ignite chance, dissolved resist) and two `_r2` bits (25 source, 26
+conducts). **Wet:** a cell under a coat whose
 material conducts takes `min(resist, sim.elecWetResist x 15 / stain amount)`,
 so a wet plank or wet stone carries charge.
 
 **Update**, every CA-active tick after the heat rows:
-`P' = max(seed, max_nb6(P_nb - resist(cell)), P - decay(P))` clamped at 0, in a
-conducting cell; an insulator holds its seed (0 unless it is a source). Max-plus
-only RAISES values toward the unique least fixpoint over its inputs, so the
-answer does not depend on thread order. `decay(P) = max(sim.elecDecay,
+`P' = max(seed, max_nb6(P_nb - enter(cell, P_nb)), P - decay(P))` clamped at 0,
+in a conducting cell, `enter(cell, p) = resist + p x spreadQ(n) / 4096` (the
+spreading loss, below); an insulator holds its seed (0 unless it is a source).
+Max-plus only RAISES values toward the unique least fixpoint over its inputs, so
+the answer does not depend on thread order. `decay(P) = max(sim.elecDecay,
 P >> sim.elecDecayShift)` (8 and 3: an eighth a tick above P = 64, a flat 8
 below; shift 0 = the floor alone) is taken once a tick, in round 0, off every
 stored value. `sim.elecRounds` rounds a tick (default 4): each relaxes
@@ -2112,6 +2118,45 @@ rounds, copper, 150 ticks held): a held arc (2,000) still holds 1,937 / 1,631
 1,433), a held spark reaches 174 cells (183 linear), held lightning 11,447 at
 512 -- copper still carries across the whole window.
 
+**The spreading loss (wave 2, 2026-10-04; `sim.elecSpreadLoss` 150,
+`sim.elecSpreadFree` 2).** Max-plus with a per-cell cost has no notion of
+current dividing, so BULK conductors carried charge as far as a wire: lightning
+(30,000) into water (6) reached ~800 cells, paged the window until the pool
+refused, held hundreds of chunks awake for ~50 ticks and shocked every body on
+wet ground anywhere. Now a cell also loses `(n - free) x elecSpreadLoss / 4096`
+of the potential it RECEIVES, where n is its count of conducting face
+neighbours: a wire (n <= 2) pays nothing, so copper still crosses the window; a
+sheet (rain-wet ground's coated top layer, a plank wall: 4) pays ~10%, bulk
+water (5-6) 11-15%. Proportional, so reach grows with log P. Measured
+(`elec-bulk`, a forced strike): into a 129 x 129 sea basin, P > 0 reaches 33
+cells (3.3 m) and P >= 20 -- a wet body's shock -- 31, over 6,980 cells and 20
+pages; onto a rain-wet dirt pad 25 cells, 1,263 cells, 15 pages. The same gate
+with the loss off (the field before wave 2): the whole basin (reach 89, 66,056
+cells, 83 pages) and the whole pad (66, 11,891 cells). A spark in elec-field's
+32 x 32 pool charges 188 cells (was ~1,100).
+The product is held under 4096 so the entry cost never falls as p rises
+(monotone) and the relaxation still converges to a least fixpoint in any order;
+n is static within the tick (it is read off the voxels, cached per page, see
+below). `elec-bulk` (a forced strike onto a 129 x 129 sea basin and a rain-wet
+dirt pad) asserts the reach, the pages, that nothing pages outside the fixture,
+that the water still shocks a wet body (P >= 20) some metres out, and that
+every page comes back and the fixture sleeps.
+
+**Brine (wave 2).** The resist rule lives once, in the MIRROR elec block
+(`elecResistBase` = material + the wet coat, `elecResistRaw` = + brine), so the
+field and E2's ohmic heat cannot disagree. A conducting LIQUID carrying a
+dissolved species whose `from` material has `electric.dissolved` conducts as
+`dissolved + (own - dissolved) x (sat - c) / sat` at concentration c (the
+solute layer's mass x 8 / fullness): saturated brine 2 against fresh water's 6.
+sim_elec binds the solute layer (40..43) for it.
+
+**The cell cache (wave 2).** A chunk's FIRST round of a tick builds a u16 per
+cell -- resist, conducting face neighbours, a source bit -- into a block beside
+the pages (`kElecCacheBase`, one per page, stamped with the tick), and every
+later round of that tick reads it: no voxel, material, stain or solute read and
+no face scan in rounds 1..3. Exact, because no voxel changes between the elec
+rows. +16 MiB (the pool buffer is 48 MiB).
+
 **Pages.** 2,048 pages (32 MiB) of 4,096 u16 cells x 2 halves; `elecMeta`
 holds the entry and owner per window slot, a want bitset, two live lists and
 the free stack. A chunk is paged by caMask's DOORBELL (a source material in a
@@ -2123,7 +2168,12 @@ SLOT (prefix sum over the bitset), so exhaustion is a counted refusal
 `elecSettle` copies the last round to half 0 and frees an all-zero page.
 Readers: `elecAt(slot, local)` / `elecAtCell(c)` (MIRROR-BEGIN elec, pasted in
 `sim_step.wgsl` and held identical by check_invariants `elec`) read half 0 --
-LAST tick's settled field, stable over the whole CA.
+LAST tick's settled field, stable over the whole CA -- and, since wave 2, only
+when the slot's OWNER word names its resident chunk: the head re-keys a slot the
+window moved only after the CA, so a newly arrived chunk used to read the
+departed chunk's charge for a tick (the phantom). The head's re-key zeroing is
+workgroup-parallel (it was one thread per 16 KiB page), and only half 0 (half 1
+is zero on every listed page).
 
 **Staying awake (rule 2 and rule 1 together).** A charged chunk is marked dirty
 (bit 31, "elec") only when a chunk of its 3x3x3 is dirty this tick -- the CPU
@@ -2134,14 +2184,25 @@ end with charge and nothing markable; the TAIL then PURGES the whole field
 (`elecPurge`), because charge the CA does not run over would evolve for as many
 ticks as the CPU takes to prove the world settled -- a readback-timing outcome.
 In practice the source's own chunk is always dirty and the purge is the rare
-backstop (`elec.purges`, gate asserts 0). With no charge: 1 + rounds
-one-workgroup allocs reading the want bitset, zero-group indirects; a settled
-world records nothing (C_CAACTIVE).
+backstop (`elec.purges`, gate asserts 0). A settled world records nothing
+(C_CAACTIVE), and since wave 2 neither does an active world that cannot hold
+charge: every elec row but the body query is `C_ELEC` (CA active AND
+`World::ElecMayBeLive`, set by SubmitTick after it has seen the tick's ops) --
+it was 1 + rounds one-workgroup allocs, the copies, the zero-group indirects,
+settle and purge (~15 passes and their barriers, ~61 us/frame of GPU in the
+`explosion` perf scenario) on every CA-active tick of a world with no charge.
+The latch is a pure function of the tick and the op list: a source op in the
+last K + 2 ticks, pages in use in the fixed-latency snapshot, or a DOORBELL
+ring (`kEmDoorbells`, counted by caMask) in a snapshot published in the last
+K + 2 ticks -- the last covers a source no op laid (a loaded save's spark, a
+chunk the pool refused); its want bit stays set while the rows are off, so the
+page comes at most K ticks late, deterministically.
 
 **`elec-field`** (three sealed rooms, run twice): a 160-cell copper wire
 charges its far end within the chunk-hop bound, P falls along it, the air and
-stone beside it stay 0; wet wood carries further than dry (dry <= 4 cells);
-a water pool charges >= 300 cells and never its far corner; every page is freed
+stone beside it stay 0; wet wood carries further than dry (dry: none since
+wave 2, a spark's 200 cannot enter 1,500); a water pool charges >= 150 cells
+(188 since the spreading loss) and never its far corner; every page is freed
 after the sparks stop and the fixture sleeps; the field hash and arrival tick
 agree across the two runs. E3's strike targeting (`StrikeMats::Resolve`) now
 reads `electric.resist <= 8` as "a conductor a bolt prefers".
@@ -2227,9 +2288,8 @@ source falls to 0 in ~55 ticks from lightning's 30,000; the field's own DIRTY_R_
 already kept those chunks awake for exactly as long.
 
 **Also authored with E2:** `gunpowder + tag:electric` (a spark sets it off;
-600 x spreadPct, last in its bucket). **Not done:** brine conducting better
-than fresh water (the field would need the solute layer's per-cell salt in
-sim_elec.wgsl; brine and water both use water's resist 6).
+600 x spreadPct, last in its bucket). Brine conducting better than fresh
+water: done in wave 2 (above).
 
 **Render (package E5b, 2026-10-03; `raymarch.wgsl` `elecPAt` / `elecGlow`).**
 The raymarch binds `elecPool` / `elecMeta` READ-ONLY at renderBGL_ 42/43
@@ -4807,13 +4867,23 @@ op record, ops-replay and the net need no change (rule 3).
 1. **Target.** Every column in an XZ disc (`searchRadius`) round the aim is
    scanned down through `WorldStrikeProbe` -- the snapshot mirror, then the
    on-demand fetch cache, never the analytic terrain (a bolt into a house must
-   stop at the roof) -- from `aim.y + 24` to its first non-gas cell, its TOP.
+   stop at the roof) -- from THE REAL TOP, `aim.y + kStrikeScanUp` (272 cells:
+   the tallest generated tree, a redwood at 22 + 4 m, with room to spare;
+   clamped to the window), to its first non-gas cell, its TOP. A top counts
+   only under KNOWN air: a column whose first known cell is solid (a crown or
+   a roof whose upper chunks no store holds) was entered from inside and does
+   not compete (`StrikePlan::columnsHidden`) -- wave 2's fix for the bolt that
+   stopped in mid-air inside a canopy when the scan started 24 cells over the
+   aim. Knowledge is chunk-granular, so the scan skips an unknown chunk in one
+   step and reads a known one through one lookup (`StrikeChunkWords`).
    Score = top y + `conductBonus` (6) if the top conducts (`StrikeMats`:
-   tag `metal` / `conductive`, or iron / steel / gold / brass / copper / silver
-   by name until E1 fixes those tags), ties to the nearer column, then a hash.
-   So a strike PREFERS a tall thing and an iron rod over a taller post beside
-   it -- the lightning rod. A column the probe cannot see does not compete;
-   with none, the bolt lands at the aim.
+   `electric.resist` 1..8), ties to the nearer column, then a hash. So a
+   strike PREFERS a tall thing and an iron rod over a taller post beside it --
+   the lightning rod. With no column qualifying, the bolt lands at the aim.
+   Both callers make the stores know first (`StrikeSearchChunks`: the disc x
+   the scan span, in a fixed order): a storm strike requests them at DECIDE, a
+   spell strike whose search leaves the stores waits a stepped leader for them
+   (below).
 2. **Bolt.** A jagged column of `lightning` from `height` cells over the top
    down to the cell above it: one cell a step, a hashed sideways kick on about
    a third of the steps, pulled back so it always ARRIVES, plus up to three
@@ -4838,25 +4908,47 @@ last): the VM only REPORTS a strike (`SpellEmission::strikes`, `SpellStrike`)
 `SpellStrikeToCells`) builds the spec from the glyph's `strike` block
 (`StrikeSpecFromGlyph`: `bolt`, `splash`, `height`, `search`, `splashRadius`,
 `arcs`, `forks`, `conductBonus`, `tariffMille`). Repetition raises the bolt and
-adds arcs, inside the caps. Tariff = cells x arcane(matter) x rate.place x
+adds arcs, inside the caps, and the effect's STRENGTH (`SpellStrike::
+strengthMille`, a spent carrier or a lane's share) scales the same two -- a
+weak bolt is a shorter bolt with fewer arcs, so less charge reaches the field. Tariff = cells x arcane(matter) x rate.place x
 `tariffMille` (a bolt is ~70 cells for a few ticks; at full price it would be
 out of a 100-mana caster's reach): `lightning projectile` costs ~66 mana. A
-ward (`lightning null`, `FilterRefuses` kind 6) refuses a strike at its aim.
-`spark` now places `spark`, not `fire`.
+ward (`lightning null`, `FilterRefuses` kind 6) refuses a strike at its aim
+(`FilterStreams`) AND, because the search moves the bolt up to 12 cells, again
+at the cell it struck and the cell it arrives in (`SpellSystem::StrikeWarded`,
+asked by `session.cpp` `FireSpellStrike`): a bolt aimed outside a ward cannot
+reach in to a rod inside it. `spark` now places `spark`, not `fire`.
 
-**Storm ground strikes** (owner, 2026-10-03: yes, in the sim, near the player
-only). `WeatherStrikes`, in phase K's world slot beside the reactions'
-aftermath, in two steps:
+**Wave 2 (package E), the spell half.** *Beyond the mirror*: when
+`StrikeSearchKnown` says the search reads a chunk neither store holds, the
+spell strike requests those chunks and waits `kStrikeLeadTicks` (8) in
+`strikes.spellPending` (bounded 8; past that it fires at once on what is
+known), then fires from the casting session's phase I -- the storm's own
+stepped leader, and a pure function of the tick because both stores are. A
+search the stores already cover fires the tick it resolves, as before.
+*No mana for a refused strike*: the VM stamps each `SpellStrike` with its own
+tariff (`EffectTariffIn`, the number `PriceCast` summed) and a strike the
+budget refuses refunds it to the caster's mana (capped at the pool's max; the
+words are not refunded). A ward refusal is not refunded, like any warded op.
+Telemetry: `strikes.spellLeaders` / `spellWarded` / `spellRefunded`.
 
-- DECIDE on a tick whose `Hash3(seed, tick)` rolls under the sky's lightning
+**Storm ground strikes** (owner, 2026-10-03: yes, in the sim, near the
+players). Two steps, `session.cpp`:
+
+- DECIDE (`DecideWeatherStrike`), PER SESSION since wave 2 (it was the
+  primary's alone), keyed by the player's id (`strikes.playerIdBase` + session
+  index; the host and single player are id 0 and roll exactly the old hashes,
+  a net client is 1, so two machines no longer strike on the same ticks), on a
+  tick whose `Hash3(seed, tick, player)` rolls under the sky's lightning
   rate (`weather::SimLightningQ`: the preset's `lightning`, flashes/min, Q16,
   through the same integer schedule the rain word walks -- never the render
   flash, which is frame-paced) x `weather.strikeRate` (0.3: a 7/min storm
   strikes ~2/min) / 1800 ticks. The aim is a hashed point in the ring
-  `strikeRadius`/4 .. `strikeRadius` (160 cells) round the primary, on the
+  `strikeRadius`/4 .. `strikeRadius` (160 cells) round THAT player, on the
   analytic ground, clamped into the window; every chunk the target search will
-  read is requested from the fetch cache NOW.
-- FIRE 8 ticks later (the stepped leader; the cache readback lands in 1 tick +
+  read, up to the real top, is requested from the fetch cache NOW (~76 chunks;
+  the fetch queue's 64-a-tick cap spreads them).
+- FIRE (`FireWeatherStrikes`, once a tick in the primary's world slot) 8 ticks later (the stepped leader; the cache readback lands in 1 tick +
   `kSnapshotLatency`) through `LightningStrike` with `WeatherStrikeSpec`
   (search 8, height 56, 6 arcs of radius 3, 3 forks).
 
@@ -4869,14 +4961,32 @@ lights over the bolt with the far flashes' stroke-and-restrike envelope, aged
 on the sim clock; `State::strikeFlash`, outshining a far flash while it lasts)
 and `Cues::Thunder` (set `weather/thunder`, the `weather` owner in
 `sound_schema.js`; delayed by distance at 343 m/s, louder and higher close).
-Far flashes stay render-only and silent.
+Far flashes stay render-only and silent. Every emitted strike also CRACKLES
+at its foot (`Cues::Zap`, set `electric/zap`, the shock glyph's burst
+included), and a body taking current buzzes (`Cues::Shock`, set
+`electric/shock`, from `MobSystem::ShockCues`, one per body per tick
+`ApplyShocks` applied a shock; the player's own always takes a voice). A PEER's
+bolt flashes and claps too: its CellOps cross in the merge but its Event did
+not, so phase N reads the peer's kept cells (`OpDelayQueue::Merge`'s
+`remoteCellIdx`) and re-announces each run that lays `lightning` as an Event
+with `remote` set (`AnnounceRemoteStrikes`; presentation only). The thunder,
+zap and shock takes shipped are PROCEDURAL PLACEHOLDERS
+(`scripts/gen_elec_sounds.py`, deterministic, mono 16-bit 44.1 kHz) for
+recorded ones to replace.
+
+**Stunned** (wave 2): the tick zeroes the command's move, buttons, strike and
+use target (`TickAuthority`); the frame layer's physical kit verbs (Q / E
+equip, G take / grab / throw wind-up) refuse while `avatar.Stunned(tick)`;
+`hotbar` / `tool` stay as the record of the selection, and a conversation
+choice (`talk`) is kept on purpose (a menu pick, applied before the stun pass).
+The HUD's cue (`ui/overlay.cpp`, pixel art on the 2 px grid): a crackling
+pale-blue edge frame for six ticks after a jolt, and a STUNNED tab under the
+crosshair with a block lightning glyph and a pip per remaining half-second.
 
 **Not done:** mob shock/stun (E4). (The charge field's CA effects -- a bolt
 into a pond electrolyses its brine, wood down a struck rod catches, the rod
-crackles -- are E2's, "What charge does" in section 4.) The target scan starts 24
-cells over the aim, so a tree taller than that is struck inside its canopy (the
-bolt above it is refused by the leaves, IfAir); no thunder sample is recorded
-yet (`weather/thunder` is silent until one is).
+crackles -- are E2's, "What charge does" in section 4.) (Wave 2 fixed the 24-cell
+scan start and shipped placeholder thunder.)
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.

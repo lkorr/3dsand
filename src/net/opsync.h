@@ -234,9 +234,14 @@ class OpDelayQueue {
   //
   // Erases every label at or before this one: labels are consumed in tick
   // order and nothing ever asks for a past one twice.
+  //
+  // `remoteCellIdx` (optional) is the same for the peer's KEPT CellOps: phase
+  // N reads it to announce a peer's lightning bolt to this machine's frame
+  // (flash + thunder; session.cpp AnnounceRemoteStrikes). Presentation only.
   OpBatch Merge(uint32_t label, const World& world, MergeStats& st,
                 std::vector<uint32_t>* remoteBrushIdx = nullptr,
-                std::vector<uint32_t>* remoteExpIdx = nullptr);
+                std::vector<uint32_t>* remoteExpIdx = nullptr,
+                std::vector<uint32_t>* remoteCellIdx = nullptr);
 
   size_t LabelsHeld() const { return labels_.size(); }
 

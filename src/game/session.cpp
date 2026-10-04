@@ -2857,75 +2857,164 @@ static void RecordStrike(TickAuthorityCtx& w, const StrikePlan& plan, uint32_t t
   sk.lastPlan = plan;
 }
 
-// A spell's strike -> CellOps. The glyph's strike block is the shape;
-// repetition (`lightning lightning`) scales the bolt's height and the splash's
-// arcs, inside the caps a plan may never exceed.
-static bool SpellStrikeToCells(TickAuthorityCtx& w, const GlyphDef& g, const SpellStrike& s,
-                               uint32_t tick, std::vector<CellOp>& cellOps) {
+// The stepped leader: ticks between a strike being decided (its chunks asked
+// of the fetch cache) and the bolt (the readback is one tick plus
+// kSnapshotLatency, so the cache has answered well inside it).
+static constexpr uint32_t kStrikeLeadTicks = 8;
+
+// A spell's strike, planned and emitted. WARDS ARE ASKED AGAIN AT THE STRUCK
+// CELL (and the cell the bolt arrives in): FilterStreams refused at the aim,
+// but the target search moves the bolt up to kStrikeMaxSearch cells, and a
+// bolt aimed outside a ward must not reach a rod inside it. A strike the
+// tick's budget refuses REFUNDS its own tariff to the caster's mana (capped at
+// the pool's max): CLAUDE.md, a refused op costs nothing. Returns true when
+// the bolt went out.
+static bool FireSpellStrike(TickAuthorityCtx& w, PlayerSession& s, const StrikeSpec& spec,
+                            int32_t tariff, uint32_t tick, std::vector<CellOp>& cellOps) {
   EnsureStrikeMats(w);
-  const StrikeSpec spec = StrikeSpecFromGlyph(g.strike, IVec3{s.x, s.y, s.z}, s.scaleMille,
-                                              rng::Hash3(s.salt, tick, 0x5B311u));
   const SpellProbe probe = WorldStrikeProbe(w.world);
-  StrikePlan plan;
-  const bool ok = LightningStrike(spec, w.strikes.mats, &probe, w.world, w.strikes.budget,
-                                  cellOps, &plan);
+  StrikePlan plan = PlanStrike(spec, w.strikes.mats, &probe, w.world);
   w.strikes.spellStrikes++;
+  const IVec3 foot =
+      spec.atAim ? plan.target : IVec3{plan.target.x, plan.target.y + 1, plan.target.z};
+  if (s.spells.StrikeWarded(plan.target.x, plan.target.y, plan.target.z) ||
+      s.spells.StrikeWarded(foot.x, foot.y, foot.z)) {
+    w.strikes.spellWarded++;
+    RecordStrike(w, plan, tick, false, false, spec.atAim);
+    return false;
+  }
+  const bool ok = EmitStrike(plan, w.strikes.budget, cellOps);
+  if (!ok && tariff > 0) {
+    CasterState& m = s.caster.mana;
+    const int32_t before = m.mana;
+    m.mana = std::max(before, (int32_t)std::min<int64_t>((int64_t)m.manaMax, (int64_t)m.mana + tariff));
+    if (m.mana > before) w.strikes.spellRefunded += (uint64_t)(m.mana - before);
+  }
   RecordStrike(w, plan, tick, false, ok, spec.atAim);
   return ok;
 }
 
-// THE STORM'S GROUND STRIKES (owner, 2026-10-03: yes, in the sim, near the
-// player only). Two steps, both pure functions of (seed, tick, the primary's
-// position, the weather schedule, the snapshot):
+// A spell's strike -> CellOps. The glyph's strike block is the shape;
+// repetition (`lightning lightning`) scales the bolt's height and the splash's
+// arcs, inside the caps a plan may never exceed, and the effect's STRENGTH
+// scales the same two (a spent carrier strikes weaker).
 //
-//   DECIDE  on a tick whose hash rolls under the sky's lightning rate x
+// SEEKING PAST THE MIRROR. When the target search reads a chunk neither the
+// mirror nor the fetch cache holds (a bolt called 40 m off, a rod on a tower
+// above the mirror's top), the strike does what a storm's does: it asks the
+// cache for those chunks and waits a stepped leader (kStrikeLeadTicks), then
+// fires on what is known, from this session's phase I. Both stores are
+// functions of the tick, so the wait and the target are too (rule 1). A
+// search the stores already cover fires at once, exactly as before.
+//
+// Returns false when this tick refused it (ward or budget) -- the HUD's spell
+// overflow counts that. A strike sent to wait is not a refusal.
+static bool SpellStrikeToCells(TickAuthorityCtx& w, PlayerSession& s, const GlyphDef& g,
+                               const SpellStrike& sk, uint32_t tick,
+                               std::vector<CellOp>& cellOps) {
+  EnsureStrikeMats(w);
+  const StrikeSpec spec =
+      StrikeSpecFromGlyph(g.strike, IVec3{sk.x, sk.y, sk.z}, sk.scaleMille,
+                          rng::Hash3(sk.salt, tick, 0x5B311u), sk.strengthMille);
+  std::vector<IVec3> missing;
+  if (!StrikeSearchKnown(spec, w.world, &missing) &&
+      w.strikes.spellPending.size() < TickAuthorityCtx::StrikeWorld::kMaxSpellPending) {
+    for (const IVec3& wc : missing) w.world.RequestChunkFetch(wc);
+    TickAuthorityCtx::StrikeWorld::SpellPending p;
+    p.spec = spec;
+    p.fireTick = tick + kStrikeLeadTicks;
+    p.session = s.index;
+    p.tariff = sk.tariff;
+    w.strikes.spellPending.push_back(p);
+    w.strikes.spellLeaders++;
+    return true;
+  }
+  return FireSpellStrike(w, s, spec, sk.tariff, tick, cellOps);
+}
+
+// This session's spell strikes whose leader has run out: fired in push order
+// (the order they were cast), from phase I. Returns how many this tick refused.
+static int FireDueSpellStrikes(TickAuthorityCtx& w, PlayerSession& s, uint32_t tick,
+                               std::vector<CellOp>& cellOps) {
+  auto& q = w.strikes.spellPending;
+  if (q.empty()) return 0;
+  int refused = 0;
+  size_t keep = 0;
+  for (size_t i = 0; i < q.size(); i++) {
+    if (q[i].session != s.index || q[i].fireTick > tick) {
+      q[keep++] = q[i];
+      continue;
+    }
+    const auto p = q[i];
+    if (!FireSpellStrike(w, s, p.spec, p.tariff, tick, cellOps)) refused++;
+  }
+  q.resize(keep);
+  return refused;
+}
+
+// THE STORM'S GROUND STRIKES (owner, 2026-10-03: yes, in the sim, near the
+// players only). Two steps, both pure functions of (seed, tick, the player's
+// id and position, the weather schedule, the stores):
+//
+//   DECIDE  per SESSION (wave 2: it was the primary's alone), on a tick whose
+//           hash -- keyed by the player's id, StrikeWorld::playerIdBase +
+//           index -- rolls under the sky's lightning rate x
 //           weather.strikeRate (weather::SimLightningQ, the integer ladder the
 //           rain word walks -- never the render flash, which is wall-clock-
 //           shaped and frame-paced). The aim is a hashed point in the ring
-//           strikeRadius/4 .. strikeRadius round the primary, on the analytic
-//           ground; every chunk the target search will read is requested from
-//           the fetch cache now.
+//           strikeRadius/4 .. strikeRadius round THAT player, on the analytic
+//           ground; every chunk the target search will read, up to the real
+//           top (kStrikeScanUp), is requested from the fetch cache now.
 //   FIRE    kStrikeLeadTicks later -- the stepped leader -- through
 //           LightningStrike against the mirror + the cache the request filled.
+//           World-level: once per tick, in the primary's slot.
 //
-// FORCED (w.strikes.forceNext: the gate, SANDVOX_STRIKE_EVERY=<ticks>) decides
-// a strike this tick whatever the sky, at forceAim when it is set.
-static constexpr uint32_t kStrikeLeadTicks = 8;
-// The chunks a decided strike asks the cache for: WeatherStrikeSpec's search.
-static constexpr int32_t kWeatherStrikeSearch = 8;
+// Player id 0 (single player, the host) rolls exactly the hashes the
+// primary-only version rolled. FORCED (w.strikes.forceNext: the gate,
+// SANDVOX_STRIKE_EVERY=<ticks>) decides a strike this tick whatever the sky,
+// at forceAim when it is set -- taken by the first session to roll.
+static void FireWeatherStrikes(TickAuthorityCtx& w, uint32_t tick,
+                               std::vector<CellOp>& cellOps) {
+  auto& sk = w.strikes;
+  EnsureStrikeMats(w);
+  // A spell leader whose session is gone (it left mid-leader) would wait
+  // forever: dropped after a generous grace. Not a refusal anyone sees.
+  if (!sk.spellPending.empty())
+    sk.spellPending.erase(std::remove_if(sk.spellPending.begin(), sk.spellPending.end(),
+                                         [&](const auto& p) {
+                                           return p.fireTick + 4 * kStrikeLeadTicks < tick;
+                                         }),
+                          sk.spellPending.end());
+  if (!sk.mats.Ready() || sk.pending.empty()) return;
+  const SpellProbe probe = WorldStrikeProbe(w.world);
+  std::vector<TickAuthorityCtx::StrikeWorld::Pending> keep;
+  for (const auto& p : sk.pending) {
+    if (p.fireTick > tick) {
+      keep.push_back(p);
+      continue;
+    }
+    const StrikeSpec spec = WeatherStrikeSpec(sk.mats, p.aim, p.key);
+    StrikePlan plan;
+    const bool ok = LightningStrike(spec, sk.mats, &probe, w.world, sk.budget, cellOps, &plan);
+    sk.weatherFired++;
+    RecordStrike(w, plan, tick, true, ok, false);
+  }
+  sk.pending.swap(keep);
+}
 
-static void WeatherStrikes(TickAuthorityCtx& w, Vec3 primaryPos, uint32_t tick,
-                           std::vector<CellOp>& cellOps) {
+static void DecideWeatherStrike(TickAuthorityCtx& w, uint32_t playerId, Vec3 playerPos,
+                                uint32_t tick) {
   auto& sk = w.strikes;
   EnsureStrikeMats(w);
   if (!sk.mats.Ready()) return;
   const Tuning& tn = CurrentTuning();
-
-  // ---- FIRE what is due -----------------------------------------------------
-  if (!sk.pending.empty()) {
-    const SpellProbe probe = WorldStrikeProbe(w.world);
-    std::vector<TickAuthorityCtx::StrikeWorld::Pending> keep;
-    for (const auto& p : sk.pending) {
-      if (p.fireTick > tick) {
-        keep.push_back(p);
-        continue;
-      }
-      const StrikeSpec spec = WeatherStrikeSpec(sk.mats, p.aim, p.key);
-      StrikePlan plan;
-      const bool ok =
-          LightningStrike(spec, sk.mats, &probe, w.world, sk.budget, cellOps, &plan);
-      sk.weatherFired++;
-      RecordStrike(w, plan, tick, true, ok, false);
-    }
-    sk.pending.swap(keep);
-  }
-
-  // ---- DECIDE -----------------------------------------------------------------
   bool decide = false, forced = false;
   static const uint32_t kEvery = [] {
     const char* e = std::getenv("SANDVOX_STRIKE_EVERY");
     return e ? (uint32_t)std::max(0, std::atoi(e)) : 0u;
   }();
+  // The player's key: 0 for player 0, so its hashes are the primary-only ones.
+  const uint32_t pk = playerId * 0x9E3779B9u;
   if (sk.forceNext) {
     decide = forced = true;
     sk.forceNext = false;
@@ -2939,7 +3028,7 @@ static void WeatherStrikes(TickAuthorityCtx& w, Vec3 primaryPos, uint32_t tick,
       const int64_t shareQ = std::llround((double)tn.weather.strikeRate * 65536.0);
       const uint64_t pQ32 = (uint64_t)std::min<int64_t>(
           (rateQ * shareQ) / (60 * 30), (int64_t)0xFFFFFFFFll);
-      const uint32_t roll = rng::Hash3(kDefaultSeed ^ 0x57121CEu, tick, 0x1u);
+      const uint32_t roll = rng::Hash3(kDefaultSeed ^ 0x57121CEu, tick, 0x1u + 0x100u * playerId);
       decide = (uint64_t)roll < pQ32;
     }
   }
@@ -2950,13 +3039,13 @@ static void WeatherStrikes(TickAuthorityCtx& w, Vec3 primaryPos, uint32_t tick,
     aim = sk.forceAim;
     sk.forceAimSet = false;
   } else {
-    // A hashed point in the ring R/4..R round the primary: up to eight
-    // tries of a uniform square, first that lands in the ring (else the last).
+    // A hashed point in the ring R/4..R round the player: up to eight tries
+    // of a uniform square, first that lands in the ring (else the last).
     const int R = std::clamp(tn.weather.strikeRadius, 16, 240);
-    const int px = (int)std::floor(primaryPos.x), pz = (int)std::floor(primaryPos.z);
+    const int px = (int)std::floor(playerPos.x), pz = (int)std::floor(playerPos.z);
     int dx = 0, dz = R / 2;
     for (uint32_t k = 0; k < 8; k++) {
-      const uint32_t h = rng::Hash3(kDefaultSeed ^ 0x57121D0u, tick, k);
+      const uint32_t h = rng::Hash3((kDefaultSeed ^ 0x57121D0u) ^ pk, tick, k);
       dx = (int)(h % (uint32_t)(2 * R + 1)) - R;
       dz = (int)((h >> 16) % (uint32_t)(2 * R + 1)) - R;
       const int d2 = dx * dx + dz * dz;
@@ -2966,28 +3055,92 @@ static void WeatherStrikes(TickAuthorityCtx& w, Vec3 primaryPos, uint32_t tick,
     aim.z = pz + dz;
     aim.y = World::TerrainHeight(aim.x, aim.z, kDefaultSeed) + 1;
   }
-  // Keep the aim in the window (a strike never reaches outside the sim).
+  // Keep the aim in the window (a strike never reaches outside the sim). The
+  // scan's own span is clamped to the window in PlanStrike, so the aim's
+  // height needs no room above it any more.
   const IVec3 o = w.world.WindowOrigin();
   const int lo = 8, hiN = (int)kWorldN - 9;
   aim.x = std::clamp(aim.x, o.x * (int)kChunk + lo, o.x * (int)kChunk + hiN);
-  aim.y = std::clamp(aim.y, o.y * (int)kChunk + lo + kStrikeScanDown,
-                     o.y * (int)kChunk + hiN - kStrikeScanUp);
+  aim.y = std::clamp(aim.y, o.y * (int)kChunk + lo, o.y * (int)kChunk + hiN);
   aim.z = std::clamp(aim.z, o.z * (int)kChunk + lo, o.z * (int)kChunk + hiN);
-  // Ask for every chunk the target search will read: it lands well inside the
-  // leader's kStrikeLeadTicks (the readback is one tick plus kSnapshotLatency).
-  const int r = kWeatherStrikeSearch;
-  for (int cz = (aim.z - r) >> 4; cz <= (aim.z + r) >> 4; cz++)
-    for (int cy = (aim.y - kStrikeScanDown) >> 4; cy <= (aim.y + kStrikeScanUp) >> 4; cy++)
-      for (int cx = (aim.x - r) >> 4; cx <= (aim.x + r) >> 4; cx++)
-        w.world.RequestChunkFetch(IVec3{cx, cy, cz});
   TickAuthorityCtx::StrikeWorld::Pending p;
   p.aim = aim;
   p.fireTick = tick + kStrikeLeadTicks;
   p.key = rng::Hash3(kDefaultSeed ^ 0x57121D1u, tick, (uint32_t)sk.weatherDecided);
   p.forced = forced;
+  // Ask for every chunk the target search will read, up to the real top: it
+  // lands well inside the leader (the readback is one tick plus
+  // kSnapshotLatency). The fetch queue's own cap (kFetchPerTick) bounds what
+  // one tick carries.
+  std::vector<IVec3> chunks;
+  StrikeSearchChunks(WeatherStrikeSpec(sk.mats, aim, p.key), w.world, chunks);
+  for (const IVec3& wc : chunks) w.world.RequestChunkFetch(wc);
   sk.pending.push_back(p);
   sk.weatherDecided++;
   if (forced) sk.forced++;
+}
+
+// A PEER'S BOLT, ANNOUNCED HERE (wave 2, package E). A strike is decided and
+// recorded on the machine that authored it; its CellOps cross in the merge,
+// but its Event did not, so the other machine's frame neither flashed nor
+// clapped. Phase N reads the peer's kept cells (OpDelayQueue::Merge's
+// remoteCellIdx) and turns each run of them that lays `lightning` into an
+// Event (remote = true): foot = its lowest lightning cell. Presentation only
+// -- the cells are already in the merged batch -- and bounded by kMaxEvents.
+// A shock (arcs, no bolt) makes no flash or clap on its author either, so
+// arc-only runs are not announced.
+static void AnnounceRemoteStrikes(TickAuthorityCtx& w, const std::vector<CellOp>& cells,
+                                  const std::vector<uint32_t>& remoteIdx, uint32_t tick) {
+  auto& sk = w.strikes;
+  EnsureStrikeMats(w);
+  if (!sk.mats.Ready() || remoteIdx.empty()) return;
+  auto matOf = [&](uint32_t i) { return cells[i].word & 0xFFFu; };
+  size_t a = 0;
+  while (a < remoteIdx.size()) {
+    // A run: consecutive merged indices of lightning / arc cells, split where
+    // a new bolt (lightning) follows a splash (arc) -- one strike's cells are
+    // bolt first, then splash (game/lightning.h PlanStrike).
+    const uint32_t m0 = matOf(remoteIdx[a]);
+    if (m0 != sk.mats.lightning) {
+      a++;
+      continue;
+    }
+    size_t b = a + 1;
+    bool inSplash = false;
+    while (b < remoteIdx.size() && remoteIdx[b] == remoteIdx[b - 1] + 1) {
+      const uint32_t m = matOf(remoteIdx[b]);
+      if (m == sk.mats.arc) inSplash = true;
+      else if (m != sk.mats.lightning || inSplash) break;
+      b++;
+    }
+    IVec3 foot{};
+    bool have = false;
+    uint32_t n = 0;
+    for (size_t k = a; k < b; k++) {
+      const CellOp& c = cells[remoteIdx[k]];
+      n++;
+      if (matOf(remoteIdx[k]) != sk.mats.lightning) continue;
+      const uint32_t slot = c.cellIdx / kChunkVol, li = c.cellIdx % kChunkVol;
+      if (!World::IsWindowSlot(slot)) continue;
+      const IVec3 wc = w.world.SlotToWorldChunk(slot);
+      const IVec3 at{wc.x * (int)kChunk + (int)(li % kChunk),
+                     wc.y * (int)kChunk + (int)((li / kChunk) % kChunk),
+                     wc.z * (int)kChunk + (int)(li / (kChunk * kChunk))};
+      if (!have || at.y < foot.y) foot = at;
+      have = true;
+    }
+    a = b;
+    if (!have || sk.events.size() >= TickAuthorityCtx::StrikeWorld::kMaxEvents) continue;
+    TickAuthorityCtx::StrikeWorld::Event ev;
+    ev.tick = tick;
+    ev.foot = foot;
+    ev.target = IVec3{foot.x, foot.y - 1, foot.z};
+    ev.emitted = true;
+    ev.cells = n;
+    ev.remote = true;
+    sk.events.push_back(ev);
+    sk.remoteEvents++;
+  }
 }
 
 static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
@@ -4247,15 +4400,19 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           spellOps++;
         }
         // STRIKES (the `lightning` / `shock` glyphs, docs/PLAN_electricity.md
-        // E3): the VM reported where; the bolt is planned against the mirror
+        // E3): the VM reported where; the bolt is planned against the stores
         // and emitted as CellOps by the storm's own strike function, charged
         // to the tick's strike budget before a single op is pushed. A refusal
-        // is counted (w.strikes.budget.refused) and lands in the HUD's spell
-        // overflow, like an op that did not fit.
+        // (the budget, or a ward at the struck cell) is counted and lands in
+        // the HUD's spell overflow, like an op that did not fit; a budget
+        // refusal refunds the strike's tariff. A strike whose search leaves
+        // the stores waits a stepped leader -- the due ones fire first, in
+        // the order they were cast.
+        ui.spellOpsDropped += FireDueSpellStrikes(w, s, tick, cellOps);
         for (const SpellStrike& sk : emit.strikes) {
           const GlyphDef* sg = glyphs.At(sk.glyph);
           if (!sg || !sg->strike.has) continue;
-          if (SpellStrikeToCells(w, *sg, sk, tick, cellOps) == false) ui.spellOpsDropped++;
+          if (SpellStrikeToCells(w, s, *sg, sk, tick, cellOps) == false) ui.spellOpsDropped++;
         }
         // Explosions are carried to the explosion block below, where `exps`
         // exists — a spell blast must go through the SAME path as a grenade
@@ -4951,10 +5108,14 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
       if (s.index == 0) {
         ReactFxAftermath(w, tick, cellOps);
         ReactFxToBlasts(w, tick, exps);
-        // THE STORM'S GROUND STRIKES (docs/PLAN_electricity.md E3): the
-        // world's, so the primary's slot, beside the reactions' aftermath.
-        WeatherStrikes(w, player.pos, tick, cellOps);
+        // THE STORM'S GROUND STRIKES (docs/PLAN_electricity.md E3): the bolts
+        // are the world's, so they FIRE in the primary's slot, beside the
+        // reactions' aftermath...
+        FireWeatherStrikes(w, tick, cellOps);
       }
+      // ...and every session ROLLS for its own player (wave 2), keyed by the
+      // player's id, so a storm strikes round each player, not only the first.
+      DecideWeatherStrike(w, w.strikes.playerIdBase + (uint32_t)s.index, player.pos, tick);
       if (exps.size() > expBegin) {
         everExploded = true;
         lastExplosionTick = tick;
@@ -5313,8 +5474,10 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         opstream::ClearAuthorRanges();
 
         net::MergeStats ms;
-        std::vector<uint32_t> remoteBrush, remoteExp;
-        OpBatch merged = q.Merge(tick, world, ms, &remoteBrush, &remoteExp);
+        std::vector<uint32_t> remoteBrush, remoteExp, remoteCell;
+        OpBatch merged = q.Merge(tick, world, ms, &remoteBrush, &remoteExp, &remoteCell);
+        // A peer's lightning bolt flashes and claps here too (presentation).
+        AnnounceRemoteStrikes(w, merged.cells, remoteCell, tick);
         // The local ops were marked modified at their own tick (phase L, by
         // the machine that authored them); a REMOTE brush op touches chunks
         // this machine never marked, and an unmarked chunk can be evicted
@@ -5638,14 +5801,35 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // anything reads it -- no walking, no strike, no button -- and keeps only
   // the look (the camera is the player's, not the body's). The stun is the
   // creature's (Mob::Stunned), so an NPC and a player are held by one clock.
-  for (SessionTick& p : players)
-    if (p.s->avatar.Stunned(tick)) {
+  //
+  // WHAT A STUN HOLDS (wave 2, package E). Every physical verb the command
+  // carries: move, every button (strike, cast, throw, use, drop...), the
+  // strike, and the use target. `hotbar` / `tool` are only the SELECTION the
+  // command reports (the frame layer owns it; nothing in the tick acts on
+  // them), so they are kept as the record of what was in hand; the frame
+  // layer's own physical kit verbs (Q / E equip, G take / grab) refuse while
+  // stunned (main.cpp). TALK is kept on purpose: a conversation choice is a
+  // menu pick, applied above before this runs, and a stun of a second or two
+  // must not leave a dialogue panel that silently ignores its keys.
+  for (SessionTick& p : players) {
+    const bool stunned = p.s->avatar.Stunned(tick);
+    if (stunned) {
       p.ti.forward = 0.0f;
       p.ti.strafe = 0.0f;
       p.ti.held = 0;
       p.ti.pressed = 0;
       p.ti.strikeStyle = -1;
+      p.ti.useRef = 0;
     }
+    // THE HUD CUE (ui/overlay.cpp DrawShockCue): how long the stun has left,
+    // and how many ticks ago the body was last shocked. Written through the
+    // same seam binding the player phases use: the window's UIState for the
+    // session that owns it, the throw-away sink for one that does not.
+    UIState& sui = p.s->sink ? p.s->sink->ui : w.ui;
+    const Mob::ShockRecord& sr = p.s->avatar.Shock();
+    sui.stunTicksLeft = (int)p.s->avatar.StunTicksLeft(tick);
+    sui.shockTicksAgo = sr.ticks > 0 && tick >= sr.lastTick ? (int)(tick - sr.lastTick) : -1;
+  }
   for (SessionTick& p : players) ResolveHands(w, p);
   for (size_t i = 0; i < players.size(); i++)
     PhaseA(w, ws, players[i], scratch[i], tick, out);
