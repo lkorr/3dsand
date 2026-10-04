@@ -508,6 +508,18 @@ Content picked by the orchestrator (rename freely):
 
 ## D6 — malice: motives, schemes, penalties weighed, duty twists, greater demon (after D4 + D5)
 
+0. **Owner decision 2026-10-04: SALT BLOCKS BLOWS, IRON WEAKENS.** Revert D3's
+   `touch` channel: a contained demon's blows (and grabs) across the ring are
+   ALWAYS refused by the salt (D1's original fence behaviour). Iron no longer
+   severs a channel; instead iron in the band LOWERS THE CONTAINED DEMON'S
+   EFFECTIVE POWER (per-demon `ironSusceptibility`, data; potency from mass like
+   every seal, capped so iron alone never zeroes a greater demon). It applies
+   only while contained -- the overpower check on release uses the reduced
+   power, so iron makes binding strong demons cheaper. HUD `M C B T` loses `T`
+   and shows the iron reduction on the CIRCLE line (`POWER 20-6`). Update
+   seals.json, demon-seals / demon-circle assertions, DESIGN §17, and the book
+   text in assets/dialogue/osric_notes.json if it says what iron does.
+
 1. **The motive ladder** per demon (data): survive > free > harm summoner >
    comply, with `malice`, `cunning`, `spite` and `literalism`. Each think
    tick, the demon scores its permitted options against the ladder:
