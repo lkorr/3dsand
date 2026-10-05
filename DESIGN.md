@@ -182,6 +182,13 @@ Three properties this rests on, all load-bearing:
   claim lattice all key on the slot. Feeding a page index into any of them
   would make the simulation a function of allocation history.
 
+**The CPU half's per-tick cost is attributed and word-wide (2026-10-05,
+fight64 round 4 package W).** `PtCpuProfile` splits the `pageTableCpu` scope
+by step; a `SlotSet` of 64+ members is dilated and unioned on its bitset, a
+word at a time. While particles fly the flight shell seeds every chunk with
+matter, and that took the 64-creature brawl's page table from 0.93 to 0.36 ms a
+tick -- see "Three fights, not one" in the mob work-pool section.
+
 #### Ticket slots: the slot space is no longer the window
 
 **The slot space and the window are two different things as of
@@ -12529,6 +12536,81 @@ of it off every parallel phase of the mob tick); the slot caches'
 re-accumulation (~88 a tick, every `kElecSlotRefreshTicks` = 4 ticks while
 charged -- a longer cadence is a behaviour change); `DownsampleSkin` after a
 re-blood.
+
+**Three fights, not one; a pool that does not sleep between calls; a page
+table that works in words (2026-10-05, fight64 round 4 package W).**
+
+- **The measure.** One 300-tick brawl is chaotic -- round 3's combined tree
+  carried twice the limp ragdolls of the tree before it and Jolt rose 2 ms with
+  no physics change -- so `mob-cap64` takes `SANDVOX_MOBCAP_FIGHTS=<n>` (or
+  `mobCap64.fights` in baseline.json; default 1, so a `--verify` costs what it
+  did). Fight 0 is the brawl; fight k > 0 is `SpawnBrawl` variant k (the def
+  mix rotated k places along the ranks, every creature nudged up to a voxel by
+  a hash of (k, index)), each from scratch with the id counter and Jolt
+  ordinals reset as `mob-cap64-twice` resets an arm. Each fight prints its
+  usual lines under `---- fight k/n ----`; then one line per metric,
+  `mob-cap64: fights xN <metric> <mean of the fights' means> [<min> .. <max>]`
+  (tick wall, mob side, every burnprof stage, every CPU scope, the pool and
+  page-table lines below, alive at the end, debris, manifolds). With n > 1 the
+  `mobCap64.*` observations are those means. The spread is the noise floor: at
+  n=3 the tick-wall mean spans ~1.7 ms across fights of ONE tree, so a single
+  fight cannot rank two trees closer than that. Perf packages quote n=3.
+- **The pool** (`workpool.cpp`). The job is a generation; the claim word packs
+  its low 32 bits with the next index, so a claim is a CAS that also proves the
+  job is still the posted one. The caller returns when every ITEM is done, not
+  when every WORKER has woken and checked out (the old join waited for all
+  seven, including the ones that woke after the work was gone); a worker that
+  wakes late fails its CAS and claims nothing, so it can never run a finished
+  job's function. Workers spin `SANDVOX_POOL_SPIN_US` (default 200, clamped to
+  1,000) on the generation after each job before sleeping on the condition
+  variable; the caller spins the same bound on the join. Every spin ends in a
+  sleep, so an idle game burns nothing: the cost is up to 200 us of seven cores
+  after each ParallelFor, only while the mob pass is issuing them.
+  `SANDVOX_POOL_LEGACY=1` (no spin, the old all-workers join) is the before-arm
+  in one binary. The instrument (`workpool::GetStats`, printed by `mob-cap64`):
+  per call, OVERHEAD = wall minus the busiest participant's span (first item
+  to last), plus wake latency per worker, join latency and the gap between
+  calls. Scheduling only: `mob-cap64`'s fight 0 per-tick digests are identical
+  to main's exe (`SANDVOX_MOBCAP_DIGEST=1`), and `mob-cap64-twice` holds it.
+- **The page table** (`pagetable.*`). `PtCpuProfile` splits the `pageTableCpu`
+  scope by step (begin, spawnRing, fluid, tighten, shell, propagate, matSet,
+  alloc, occScan, harvest, submit, census, retire, jitterUpload), printed by
+  `mob-cap64`. In a fight it said: the PARTICLE FLIGHT SHELL. While blood flies
+  its seed is every chunk holding matter (thousands), so `ApplyParticleShell`
+  (seed + `DilateN26`) and Materialize's materialization set (the seed, through
+  the hasMatter filter, dilated again) were two N26 dilations of thousands of
+  members, 27 bit tests and a push_back each, 0.67 of the 0.93 ms. A SlotSet of
+  64+ members is now dilated as a separable 3x3x3 box on its bitset (a 32-chunk
+  row is half a word: x by rotate -- the rotate IS the toroidal wrap -- then y
+  and z by OR of the neighbouring rows) and unioned 64 slots per word
+  (`SlotSet::OrWord`); the snapshot's occupancy and dirty flags become set
+  words by SSE2 compare + movemask. Same sets; members of a bulk result are in
+  SLOT order, which nothing reads as meaning (which page a slot gets is not
+  observable). `SANDVOX_PT_BULK=0` is the member-at-a-time arm,
+  `SANDVOX_PT_BULK_CHECK=1` computes both and aborts on the first word that
+  differs.
+
+Measured (`mob-cap64`, n=3, `SANDVOX_RUN_EXCLUSIVE=1`, back to back, one
+binary; before = `SANDVOX_POOL_LEGACY=1 SANDVOX_PT_BULK=0`), mean [min .. max]
+of the three fights' means:
+
+| ms per tick | before | after |
+|---|---|---|
+| pool overhead | 0.612 [0.583 .. 0.628] (41.8 us/call, wake 62.8 us, join 13.2 us) | 0.127 [0.116 .. 0.135] (8.7 us/call, wake 20.9 us, join 0.9 us) |
+| pool wall per call (us) | 266 | 212 |
+| pageTableCpu | 0.925 [0.907 .. 0.941] | 0.362 [0.350 .. 0.374] |
+| ...shell / matSet | 0.330 / 0.336 | 0.056 / 0.055 |
+| mob side | 10.95 [10.78 .. 11.08] | 10.04 [9.78 .. 10.27] |
+| tick wall mean | 26.10 [25.36 .. 26.82] | 24.18 [23.21 .. 24.96] |
+
+Same fights (alive at the end 54 / 54 / 50 and identical hp in both arms). The mob side gains
+more than the overhead line: a worker that is awake when the call is posted
+takes its share, so the wall per call fell 54 us against 33 us of overhead.
+`SANDVOX_POOL_SPIN_US=1000` halves the remaining overhead (0.062) with no
+mob-side change (10.02), so 200 stays. LEFT in pageTableCpu (0.36): the
+occupancy streak scan 0.065 (all 34,816 slots), the free probe's own submit
+0.064 and harvest 0.037 (~22 chunks a tick in a fight), the hasMatter filter
+and reach stamping over the seed.
 
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 

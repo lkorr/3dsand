@@ -607,6 +607,42 @@ What the round 3 numbers point at:
 3. **`pageTableCpu` ~0.9 ms a tick.** Find what it does per tick in a fight
    and cut it. `src/sim/pagetable.*`; read `docs/PLAN_page_table.md` first.
 
+#### Package W result (2026-10-05)
+
+DESIGN.md "Three fights, not one" has the detail.
+
+- **The measure.** `SANDVOX_MOBCAP_FIGHTS=3` (or `mobCap64.fights`) runs
+  fight 0 (the brawl, unchanged) plus variants 1 and 2 (the mix rotated, each
+  creature nudged by a voxel) in one process. It ends with
+  `mob-cap64: fights x3 <metric> <mean> [<min> .. <max>]` for every metric.
+  On one tree the tick-wall mean spans ~1.7 ms across the three fights, the
+  mob side ~0.5 ms, and Jolt ~1 ms.
+- **Pool.** Items-done join (generation-tagged CAS claim), with a 200 us
+  bounded spin on the workers and the caller. New instrument line:
+  `mob-cap64: work pool (...)`.
+- **Page table.** New instrument line: `mob-cap64: pageTableCpu by step`.
+  Big `SlotSet` dilations and unions are word-wide; the occupancy and
+  dirty-flag scans use SSE2.
+
+n=3, one binary, back to back (before = `SANDVOX_POOL_LEGACY=1
+SANDVOX_PT_BULK=0`):
+
+| ms per tick | before | after |
+|---|---|---|
+| pool overhead | 0.612 [0.583 .. 0.628] | 0.127 [0.116 .. 0.135] |
+| pageTableCpu | 0.925 [0.907 .. 0.941] | 0.362 [0.350 .. 0.374] |
+| mob side | 10.95 [10.78 .. 11.08] | 10.04 [9.78 .. 10.27] |
+| tick wall mean | 26.10 [25.36 .. 26.82] | 24.18 [23.21 .. 24.96] |
+
+Same fights: fight 0's per-tick digests are identical to main's exe. The
+`determinism` hash did not move.
+
+Left:
+- the pool's remaining ~0.13 ms (a 1,000 us spin halves it, but the mob side
+  does not change);
+- in pageTableCpu: the occupancy streak scan (0.065), the free probe's own
+  submit (0.064) and harvest (0.037).
+
 ### Package L — physics: knocked-down creatures and the contact solve
 
 1. **Limp ragdolls are box compounds.** In the all-6 run they cast 40.8 a
