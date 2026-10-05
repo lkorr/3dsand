@@ -1204,3 +1204,15 @@ attribution, including why its ticket no longer idles out (not electricity).
 - `determinismHash` unmoved (0fa43063). The harness map names no layer, and
   the two new materials (`tallow`, `candle_flame`) and the one appended
   reaction appear nowhere in it.
+
+## 2026-10-05 — fight64 round 4 L: `ragdoll-dress` recorded `"fail"` (limp hulls)
+
+- `ragdoll-dress` `pass` -> `fail`. Limp ragdolls now collide as one convex
+  hull a limb (package L). Attributed in one binary at `--verify
+  ragdoll-dress,corpse-sleep` scope: default 4.39 vox fall-arm limb stretch
+  (cap 4.00); `SANDVOX_LIMP_HULL=0` 3.06; main's exe (d34fb41) 3.06, identical
+  to the all-off arm. Drift, twist and the slam arm are unchanged. Owner
+  options in `_ragdollDressLimpHull_about`.
+- `corpse-sleep` fails at that scope on main's own exe too (asleep after 885
+  ticks, cap 300, every arm identical): inherited, not L's, not changed here.
+- `determinismHash` unmoved (0fa43063): the determinism scene has no creature.

@@ -7105,7 +7105,9 @@ neighbors, so this needs an explicit connectivity pass:
   its inner radius a step casts against the crowd's kinematic compounds;
   CCD exists for the terrain sheet, but Jolt's cast cannot be told to skip
   kinematic bodies. Hulls for LIMP living rigs too were measured (17.2 vs
-  17.6 ms, corpse-heavy) and are not worth the behaviour change.
+  17.6 ms, corpse-heavy) and are not worth the behaviour change. (Superseded
+  by round 4 package L below: once the brawl had dozens of limp rigs a tick
+  they were worth it.)
 - **A dead body's linear cast looks for the ground (2026-10-05, fight64
   round 3 package C).** After package P the cast was still 2.0 ms wall / 7.4
   ms worker time of a 3.8 ms Jolt step in `mob-cap64` (b21d23a), and the
@@ -7191,6 +7193,102 @@ neighbors, so this needs an explicit connectivity pass:
   corpses, but every melee probe that hits one would then pay
   `CastRayBody`'s re-test against the stored compound -- a stroke-side cost
   to measure first.
+- **The downed collide as hulls, and the living meet loose bodies as hulls
+  (2026-10-05, fight64 round 4 package L; `Physics::ApplyCorpseCollider`,
+  `FlushHulls`, the body-vs-body collide in `Physics::Init`).** The round-3
+  all-six fight had 40.8 limp limbs a tick linear-casting as box compounds
+  and 442 living-vs-limp manifolds a step; the narrow phase's largest pairs
+  were all a LIVING box compound (~20 boxes a limb) against something loose.
+  1. **A limp ragdoll's limbs take the corpse hull** (`RigLimp` joins
+     `RigDead` / `SeveredHold` / dead-flesh `Debris` in the role test). The
+     flip is `StartRagdoll` re-deriving every slot's role; `BeginGetUp` makes
+     the limbs `RigLive` again and the compound comes back. Nothing in
+     `mob.cpp` changed: the collider follows the role. The swap keeps the
+     centre of mass, mass and inertia, so the joints and the get-up see the
+     same body; the hull contains the compound, so the restore can open a gap
+     but never a new overlap. Rays (melee, lasers, the look ray) re-test a
+     hull hit against the compound, as for corpses. The avatar's own limp
+     limbs are `RigLive` (`Mob::LimbRole`) and keep their compounds.
+     `SANDVOX_LIMP_HULL=0` is the old arm.
+  2. **A living limb's SHAPE stays its compound; only the simulation's
+     body-vs-body collide meets it as its hull.** The callback that already
+     collided kinematic pairs plainly (package C) now hands Jolt the
+     compound's cached hull for a kinematic `RigLive` body. Every query --
+     melee probes, `PlayerPushOut`, lasers, the debug overlay -- still sees
+     the exact compound, so the melee re-cast package C worried about never
+     happens. A compound met with no hull cached collides as itself that
+     step and is queued (held by reference: the mob code may carve or remove
+     the limb before the next step); it is a hull from the next step on.
+     Shells (the fill test) stay compounds. Jolt reads a contact's sub-shape
+     ids only as the contact-cache key (friction/restitution combine is
+     per body here), and this engine's listener reads none.
+     `SANDVOX_LIVE_SIMHULL=0` is the old arm.
+  3. **One hull per compound, cached, built across the workers.** The cache
+     is keyed by the compound and holds a reference on it (no reused-address
+     aliasing); an entry only the cache still holds is dropped at the head of
+     the next step (`EvictHulls`). A swap whose hull is not built yet waits
+     for the head of the next `Step` (`FlushHulls`), which builds every hull
+     asked for since the last step on Jolt's job pool (`ParallelFor`), then
+     applies the swaps in the order asked. A hull is a pure function of its
+     compound, so which worker built it cannot reach the simulation: the
+     parallel and `SANDVOX_NO_PARALLEL_FOR=1` runs of the same fight are
+     identical in every count. A build is ~0.1 ms (sampler: half Jolt's
+     quickhull, a quarter the `ConvexHullShape` constructor); feeding the
+     builder only the ends of every lattice line (exact: the hull is the same
+     set) was tried, did not change that, and was dropped so a corpse's hull
+     stays bit-identical to package P's. `SANDVOX_HULL_DEFER=0` builds at the
+     swap, on the game thread, as P did. In the fight: 1,787 builds over
+     300 ticks (the ~960 living limbs as they first touch a loose body, plus
+     carve rebuilds and the downed), flush wall 0.31 ms a tick.
+  Measured (`SANDVOX_RUN_EXCLUSIVE=1 SANDVOX_PHYS_PAIRPROF=1 --gate
+  mob-cap64`, one binary, back to back, env arms: old = `SANDVOX_LIMP_HULL=0
+  SANDVOX_LIVE_SIMHULL=0`, limp = `SANDVOX_LIVE_SIMHULL=0`). Each arm is a
+  different fight (54 / 57 / 57 alive at the end; dead rigs 3.7 / 3.3 / 4.3
+  a tick), so the attribution is per body pair -- narrow-phase worker us per
+  body pair, then manifolds a tick:
+
+  | role pair | old | limp hull | both |
+  |---|---|---|---|
+  | rig-live vs rig-limp | 15.38 (265) | 11.80 (73) | 4.12 (11) |
+  | rig-live vs rig-dead | 7.04 (166) | 6.42 (100) | 3.38 (74) |
+  | debris vs rig-live | 9.58 (112) | 7.55 (60) | 4.45 (27) |
+  | rig-live vs severed-hold | 8.63 (20) | 3.62 (8) | 3.19 (5) |
+  | rig-limp vs severed-hold | 110.74 (25) | 2.08 (0.1) | 6.03 (0.1) |
+  | rig-limp vs static | 11.53 (13) | 8.02 (3) | 7.93 (2) |
+
+  | Jolt, ms a tick (wall / worker) | old | limp hull | both |
+  |---|---|---|---|
+  | Update (+ FlushHulls wall) | 3.62 (+0.10) | 2.13 (+0.10) | 1.66 (+0.31) |
+  | collide | 1.51 / 10.56 | 0.91 / 5.98 | 0.79 / 5.32 |
+  | solveVel | 0.78 / 5.87 | 0.27 / 1.82 | 0.21 / 1.32 |
+  | ccd | 0.89 / 1.67 | 0.62 / 0.91 | 0.33 / 0.60 |
+  | solvePos | 0.24 / 1.50 | 0.15 / 0.87 | 0.15 / 0.87 |
+  | body-body manifolds a step | 701 | 273 | 150 |
+  | limp limbs linear-casting | 25.5 (24.7 compounds) | 5.2 (1.5) | 2.4 (0.3) |
+
+  Tick wall 27.40 / 24.65 / 24.48 ms mean (the fights differ: read the
+  per-pair table, not this row). The `determinism` hash did not move
+  (0fa43063: its scene has no creature); `mob-cap64-twice` is identical
+  across thread counts.
+  **Trade-offs (gameplay-visible, small):** a limp creature collides as the
+  convex hull of each limb (the crook of an elbow, a hand, is filled for
+  CONTACTS; hits and rays are exact), as corpses already did; a living limb
+  shoves corpses, ragdolls, gibs and debris with its hull rather than its
+  boxes, so a loose body can no longer rest inside a living limb's concavity,
+  and a loose-body blow can be billed against the hull's surface a voxel
+  before the voxels; a contact that switches from compound to hull opens a
+  new manifold once (one fresh contact report). `ragdoll-dress` is recorded
+  fail: its FALL arm's peak limb stretch is 4.39 vox against a 4.00 cap (3.06
+  with `SANDVOX_LIMP_HULL=0` and on main's exe; the slam arm and every shell
+  number are unchanged; owner options in `tests/baseline.json`
+  `_ragdollDressLimpHull_about`). Not taken: per-class solver
+  iteration overrides (`solveVel` is now 0.21 ms wall; Jolt takes the max
+  over an island, so a lower count needs every body AND joint in the island
+  overridden, and ragdoll joints are where it would show) and sleep changes
+  for limp bodies under a living one (a moving kinematic contact keeps them
+  awake by design). What is left: the STATIC pairs -- debris / dead /
+  severed vs the terrain mesh, 18-53 us a pair with enhanced internal edge
+  removal -- are now the largest narrow-phase rows.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
