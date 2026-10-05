@@ -661,3 +661,41 @@ Left:
 4. Gates: `ragdoll` (all sub-checks; get-up must still work), `corpse-armor`,
    `body-fastfall`, `big-body-collider`, `debris`, `mob-cap64`,
    `mob-cap64-twice`.
+
+### Round 4 result (2026-10-05, W + L merged, main 28c8209)
+
+Measured with W's multi-fight arm: `SANDVOX_MOBCAP_FIGHTS=3 --gate
+mob-cap64`, exclusive. Each value is the mean of three fights, with
+[min .. max] across them.
+
+| ms per tick | b21d23a (1 fight) | round 4 (n=3) |
+|---|---|---|
+| tick wall mean | 31.73 | 21.98 [21.32 .. 22.62] |
+| tick wall p95 | 39.90 | 27.43 [25.93 .. 28.88] |
+| tick wall worst | 47.31 | 33.98 [29.46 .. 42.62] |
+| mob side mean | 14.29 | 9.92 [9.61 .. 10.23] |
+| mob side worst | 32.77 | 18.06 [16.21 .. 18.98] |
+| Jolt Update | 3.80 | 1.52 [1.18 .. 1.70] |
+| pageTableCpu | 0.91 | 0.35 |
+| readbackStall (harness-only) | 10.75 | 8.19 |
+
+Mob side + Jolt is about 11.4 ms, against the round-3 target of under 10.
+The mob-side worst tick is 18 ms, against a target of under 16.
+
+What's left, by stage:
+- stroke 3.10 (serial in mob order);
+- stain 1.58;
+- burnLimbs 1.20;
+- shocks 0.95;
+- woundStain 0.46.
+
+Open owner decisions:
+- `ragdoll-dress` fails since L: a 200-voxel fall stretches a limp limb's
+  joints 4.39 voxels against a 4.00 cap. The options are written in
+  `tests/baseline.json`:
+  - raise the cap;
+  - keep box shapes on a fast-falling limp limb;
+  - drop limp hulls.
+- The B, C, F and L trade-offs, as named in DESIGN.md.
+- Parallel carves across creatures. That changes the fight, because later
+  probes in the same tick meet an earlier carve's rebuilt body.
