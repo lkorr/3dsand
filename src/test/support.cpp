@@ -2187,6 +2187,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
           return true;
         });
   }
+  // Per-step split of this span (PtCpuProfile, fight64 round 4 package W).
+  PtCpuClock ptClk;
+  PtCpuProf().ticks++;
   pt.BeginTick(tick);
   for (const BrushOp& o : ops)
     pt.AddOpSphere({o.x, o.y, o.z}, o.radius, world);
@@ -2233,6 +2236,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   if (waterGpu && waterGpu->writesThisTick) {
     for (uint32_t e : waterGpu->chunks) pt.AddOpTarget(e & 0xFFFFu);
   }
+  ptClk.Lap(kPtpBegin);
   {
     std::vector<IVec3> spawnCells, expCenters;
     spawnCells.reserve(spawnCount);
@@ -2245,6 +2249,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // PageTable::UpdateSpawnRing.
     pt.UpdateSpawnRing(spawnCells, expCenters, world);
   }
+  ptClk.Lap(kPtpSpawnRing);
   {
     // fluidChunks(N): every chunk the MLS-MPM seam may write a voxel into —
     // the active block slots from the latest DELIVERED snapshot readback plus
@@ -2269,6 +2274,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                             fluidSpawns[i].pz >> 16});
     pt.UpdateFluidChunks(blockSlots, fluidCells, world);
   }
+  ptClk.Lap(kPtpFluid);
   {
     // LatestDelivered(), not Snap(), and the freshness is load-bearing rather
     // than nice: the tightening is the ONLY thing that shrinks cpuDirty, and
@@ -2277,6 +2283,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // N1's first cut. Derived data, so this may be timing-dependent.
     const WorldSnapshot& sn = world.LatestDelivered();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
+    ptClk.Lap(kPtpTighten);
     // Contributor (e), the particle flight shell — strictly AFTER the
     // tightening, like (c)/(d): a union applied after an intersection cannot
     // be undone by it. Covers the GPU-decided landing writes an airborne
@@ -2284,8 +2291,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // mirror to empty — a flying particle dirties nothing — and the
     // intersection can never ADD the landing back). See §3.4.
     pt.ApplyParticleShell(sn, particlesActive);
+    ptClk.Lap(kPtpShell);
   }
-  pt.Materialize(ctx.queue);
+  pt.Materialize(ctx.queue);   // laps its own three steps
   // ---- deallocation (§3.6), AFTER materialization -------------------------
   // Order matters: cpuDirty is the materialization set, and the free
   // condition's second conjunct tests against it. Running the free decision
@@ -2301,7 +2309,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.ConsumeOccupancy(world.LatestDelivered().occupancy,
                         world.LatestDelivered().occStain,
                         world.LatestDelivered().tick, tick);
+  ptClk = PtCpuClock();   // ConsumeOccupancy laps its own steps
   pt.RetirePages(tick);
+  ptClk.Lap(kPtpRetire);
 
   // ---- the §3.4 settled-skip latch ----------------------------------------
   // Fed here because this is the one function BOTH the game loop and every
@@ -2398,7 +2408,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // AFTER this one, so the pageFill dispatch below read the PREVIOUS tick's
   // genList — every JITTER page materialized as zeros and 2,114 chunks of stone
   // silently became air.
+  ptClk = PtCpuClock();   // the settled-skip latch above is not page-table work
   const uint32_t jitterFills = pt.UploadJitterFills(ctx.queue);
+  ptClk.Lap(kPtpJitterUpload);
   spanPt.Close();
 
   // ---- ENCODE: describing the tick's GPU work -----------------------------

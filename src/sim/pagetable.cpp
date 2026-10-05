@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#if defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked page fills
 #include "sim/rng_simd.h"    // rng::Pcg8 — the JITTER verify is 80% of Classify
@@ -36,7 +39,31 @@ inline bool PtFreeLog() {
 // SANDVOX_PT_DEBUG dump and the --frames exit summary; a peak is still
 // latched on the tick it happens (see ConsumeOccupancy).
 constexpr uint32_t kCensusEveryTicks = 8;
+inline int64_t PtNowNs() {
+  using namespace std::chrono;
+  return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
 }  // namespace
+
+PtCpuProfile& PtCpuProf() {
+  static PtCpuProfile p;
+  return p;
+}
+
+const char* PtCpuPhaseName(int phase) {
+  static const char* const kNames[kPtpCount] = {
+      "begin",  "spawnRing", "fluid",   "tighten", "shell",  "propagate", "matSet",
+      "alloc",  "occScan",   "harvest", "submit",  "census",  "retire", "jitterUpload"};
+  return phase >= 0 && phase < kPtpCount ? kNames[phase] : "?";
+}
+
+PtCpuClock::PtCpuClock() : t_(PtNowNs()) {}
+
+void PtCpuClock::Lap(int phase) {
+  const int64_t now = PtNowNs();
+  if (phase >= 0 && phase < kPtpCount) PtCpuProf().ms[phase] += (double)(now - t_) * 1e-6;
+  t_ = now;
+}
 
 // Global scope, matching world.h and sim/world.h's World — this type is a
 // peer of World, not a game-layer type.
@@ -53,11 +80,153 @@ void SlotSet::IntersectWith(const SlotSet& other) {
   members_.swap(keep);
 }
 
+namespace {
+// THE BULK PATHS (fight64 round 4, package W). In a fight the particle flight
+// shell seeds every chunk holding matter (thousands in the harness window)
+// into the mirror each tick, so the shell's dilation and the materialization
+// set's were two N26 dilations of thousands of members -- 27 bit tests and a
+// push_back per member -- plus member-at-a-time unions: 0.68 of the 0.97 ms
+// pageTableCpu in mob-cap64. At kBulkMembers and above the same sets are
+// combined 64 slots per word. SANDVOX_PT_BULK=0 is the member-at-a-time arm;
+// SANDVOX_PT_BULK_CHECK=1 runs both and aborts on the first set that differs.
+constexpr size_t kBulkMembers = 64;
+int PtBulkMode() {
+  static const int m = [] {
+    const char* e = getenv("SANDVOX_PT_BULK");
+    if (e && atoi(e) == 0) return 0;
+    return getenv("SANDVOX_PT_BULK_CHECK") ? 2 : 1;
+  }();
+  return m;
+}
+
+// Bit j set where p[j] != 0, for j < lim (<= 64): a word of a SlotSet built
+// straight from a per-slot array (the snapshot's dirty flags / occupancy).
+// SSE2 (the x64 baseline) on a full word, scalar otherwise.
+uint64_t NonZeroMask64(const uint8_t* p, uint32_t lim) {
+#if defined(_M_X64) || defined(__SSE2__)
+  if (lim == 64) {
+    const __m128i z = _mm_setzero_si128();
+    uint64_t m = 0;
+    for (int i = 0; i < 4; i++) {
+      const __m128i v = _mm_loadu_si128((const __m128i*)(p + 16 * i));
+      const uint32_t eq = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, z));
+      m |= (uint64_t)(~eq & 0xFFFFu) << (16 * i);
+    }
+    return m;
+  }
+#endif
+  uint64_t m = 0;
+  for (uint32_t j = 0; j < lim; j++) m |= (uint64_t)(p[j] != 0) << j;
+  return m;
+}
+uint64_t NonZeroMask64(const uint32_t* p, uint32_t lim) {
+#if defined(_M_X64) || defined(__SSE2__)
+  if (lim == 64) {
+    const __m128i z = _mm_setzero_si128();
+    uint64_t m = 0;
+    for (int i = 0; i < 16; i++) {
+      const __m128i v = _mm_loadu_si128((const __m128i*)(p + 4 * i));
+      const uint32_t eq =
+          (uint32_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(v, z)));
+      m |= (uint64_t)(~eq & 0xFu) << (4 * i);
+    }
+    return m;
+  }
+#endif
+  uint64_t m = 0;
+  for (uint32_t j = 0; j < lim; j++) m |= (uint64_t)(p[j] != 0u) << j;
+  return m;
+}
+
+// SANDVOX_PT_BULK_CHECK: the bulk result against the member-at-a-time one.
+void BulkCheck(const char* what, const SlotSet& got, const SlotSet& want) {
+  for (size_t k = 0; k < SlotSet::kWords; k++)
+    if (got.Words()[k] != want.Words()[k]) {
+      std::fflush(stdout);
+      std::fprintf(stderr,
+                   "FATAL: SANDVOX_PT_BULK_CHECK: %s differs at word %zu "
+                   "(bulk %016llx, members %016llx)\n",
+                   what, k, (unsigned long long)got.Words()[k],
+                   (unsigned long long)want.Words()[k]);
+      std::fflush(stderr);
+      std::abort();
+    }
+  if (got.Size() != want.Size()) {
+    std::fflush(stdout);
+    std::fprintf(stderr, "FATAL: SANDVOX_PT_BULK_CHECK: %s holds %zu members, "
+                 "the member path %zu\n", what, got.Size(), want.Size());
+    std::fflush(stderr);
+    std::abort();
+  }
+}
+
+// The same dilation as DilateN26Members, as a separable 3x3x3 box on the
+// bitset: a window slot is s = (z * 32 + y) * 32 + x, so one (y, z) row of 32
+// chunks is half a word. x: row | rotl(row) | rotr(row) (the rotate IS the
+// toroidal `& m` wrap); then y, then z, OR in the neighbouring rows, wrapped
+// the same way. Ticket slots (the words past the window's) are copied, never
+// dilated, as the member path does.
+void DilateN26Bulk(const SlotSet& in, SlotSet& out) {
+  static_assert(kNChunk == 32, "one 32-chunk row per half word");
+  static_assert(kNumChunks % 64 == 0, "the window ends on a word boundary");
+  constexpr uint32_t kRows = kNChunk * kNChunk;   // 1,024 (y, z) rows
+  constexpr size_t kWindowWords = kNumChunks / 64;
+  static uint32_t a[kRows], b[kRows];   // SubmitTick is main-thread only
+  const uint64_t* w = in.Words();
+  for (uint32_t r = 0; r < kRows; r++) {
+    const uint32_t row = (uint32_t)(w[r >> 1] >> ((r & 1u) * 32u));
+    a[r] = row | std::rotl(row, 1) | std::rotr(row, 1);
+  }
+  for (uint32_t z = 0; z < kNChunk; z++)
+    for (uint32_t y = 0; y < kNChunk; y++)
+      b[z * kNChunk + y] = a[z * kNChunk + ((y - 1u) & 31u)] | a[z * kNChunk + y] |
+                           a[z * kNChunk + ((y + 1u) & 31u)];
+  for (uint32_t z = 0; z < kNChunk; z++)
+    for (uint32_t y = 0; y < kNChunk; y++)
+      a[z * kNChunk + y] = b[((z - 1u) & 31u) * kNChunk + y] | b[z * kNChunk + y] |
+                           b[((z + 1u) & 31u) * kNChunk + y];
+  for (size_t k = 0; k < kWindowWords; k++)
+    out.OrWord(k, (uint64_t)a[2 * k] | ((uint64_t)a[2 * k + 1] << 32));
+  for (size_t k = kWindowWords; k < SlotSet::kWords; k++) out.OrWord(k, w[k]);
+}
+
+}  // namespace
+
+static void DilateN26Members(const SlotSet& in, SlotSet& out);
+
 void SlotSet::UnionWith(const SlotSet& other) {
-  for (uint32_t s : other.Members()) Add(s);
+  const int mode = PtBulkMode();
+  if (mode == 0 || other.Size() < kBulkMembers) {
+    for (uint32_t s : other.Members()) Add(s);
+    return;
+  }
+  if (mode == 2) {
+    SlotSet ref(*this);
+    for (uint32_t s : other.Members()) ref.Add(s);
+    for (size_t k = 0; k < kWords; k++) OrWord(k, other.bits_[k]);
+    BulkCheck("UnionWith", *this, ref);
+    return;
+  }
+  for (size_t k = 0; k < kWords; k++) OrWord(k, other.bits_[k]);
 }
 
 void DilateN26(const SlotSet& in, SlotSet& out) {
+  const int mode = PtBulkMode();
+  if (mode == 0 || in.Size() < kBulkMembers) {
+    DilateN26Members(in, out);
+    return;
+  }
+  if (mode == 2) {
+    SlotSet ref(out);
+    DilateN26Members(in, ref);
+    DilateN26Bulk(in, out);
+    BulkCheck("DilateN26", out, ref);
+    return;
+  }
+  DilateN26Bulk(in, out);
+}
+
+static void DilateN26Members(const SlotSet& in, SlotSet& out) {
   // Slot coords, not world coords, and that is correct here: the residency
   // window is toroidal, so slot-adjacency IS world-adjacency for every pair of
   // chunks that are both resident. (The colour lattice is the case where slot
@@ -815,8 +984,11 @@ void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
   SlotSet& snap = tightenSnap_;
   SlotSet& rolled = tightenRolled_;
   snap.Clear();
-  for (uint32_t i = 0; i < kNumSlots; i++)
-    if (dirtyFlags[i]) snap.Add(i);
+  for (size_t k = 0; k < SlotSet::kWords; k++) {   // members in slot order
+    const uint32_t base = (uint32_t)(k * 64);
+    const uint32_t lim = std::min<uint32_t>(64u, kNumSlots - base);
+    snap.OrWord(k, NonZeroMask64(dirtyFlags.data() + base, lim));
+  }
   for (uint32_t r = 0; r < rolls; r++) {
     rolled.Clear();
     DilateN26(snap, rolled);
@@ -1002,8 +1174,14 @@ void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
   // when the world settles.
   scratch_.Clear();
   if (snap.valid && snap.occupancy.size() == kNumSlots) {
-    for (uint32_t s = 0; s < kNumSlots; s++)
-      if (snap.occupancy[s] != 0u) scratch_.Add(s);
+    // A word at a time, members in slot order (the order the per-slot loop
+    // this replaced added them in).
+    const uint32_t* occ = snap.occupancy.data();
+    for (size_t k = 0; k < SlotSet::kWords; k++) {
+      const uint32_t base = (uint32_t)(k * 64);
+      const uint32_t lim = std::min<uint32_t>(64u, kNumSlots - base);
+      scratch_.OrWord(k, NonZeroMask64(occ + base, lim));
+    }
   } else {
     // No snapshot yet (startup, or the ring declined every slot so far):
     // fall back to the page table, which is a strict superset of occMatter (a
@@ -1055,6 +1233,7 @@ void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
 }
 
 void PageTable::Materialize(const rhi::Queue& queue) {
+  PtCpuClock clk;
   const bool matDbg = PtDebug();
   const double matT0 = matDbg ? PtNowMs() : 0.0;
   // Step (1) of the normative definitions: propagate. Done here rather than in
@@ -1088,7 +1267,10 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   cRing_.push_back(std::move(ce));
   while (cRing_.size() > kCRing) cRing_.pop_front();
 
-  if (!paged_) return;  // dense: every slot is already resident
+  if (!paged_) {  // dense: every slot is already resident
+    clk.Lap(kPtpPropagate);
+    return;
+  }
 
   // Contributor (e), the particle flight shell SEED, applied AFTER the
   // propagate above so it is not dilated in the tick it is computed — see the
@@ -1125,6 +1307,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   }
 
   auto& t = world_->pageTableCpuMutable();
+  clk.Lap(kPtpPropagate);
 
   // Step (4): the materialization set.
   //
@@ -1223,6 +1406,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   if (reachTick_.size() != kNumSlots) reachTick_.assign(kNumSlots, 0u);
   for (uint32_t s : materialized_.Members()) reachTick_[s] = tick_;
   for (uint32_t s : cpuDirty_.Members()) reachTick_[s] = tick_;
+  clk.Lap(kPtpMatSet);
 
   if (PtDebug()) {
     std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu fluid=%zu inUse=%u aM=%u aO=%u\n",
@@ -1263,6 +1447,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
     MarkTableDirty(s);
   }
   FlushTableWrites(queue);
+  clk.Lap(kPtpAlloc);
   if (matDbg)
     std::printf("[pt-time] tick %u materialize: %.2f ms (set %zu)\n", tick_,
                 PtNowMs() - matT0, materialized_.Size());
@@ -1315,6 +1500,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                                  const std::vector<uint8_t>& occStain,
                                  uint32_t occTick, uint32_t tick) {
   if (!paged_) return;
+  PtCpuClock clk;
   if (zeroStreak_.size() != kNumSlots) zeroStreak_.assign(kNumSlots, 0);
   if (reachTick_.size() != kNumSlots) reachTick_.assign(kNumSlots, 0u);
   const auto& t = world_->pageTableCpu();
@@ -1544,6 +1730,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // to a different world chunk. The slot-to-worldchunk key recorded at submit
   // time is compared at harvest time; a mismatch skips the slot (conservative:
   // keeps the page, exactly like a vanished-page skip).
+  clk.Lap(kPtpOccScan);
   const bool ptDbg = PtDebug();
   const double probeT0 = ptDbg ? PtNowMs() : 0.0;
   uint32_t probesRun = 0, probesHarvested = 0;
@@ -1671,6 +1858,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     }
   }
 
+  clk.Lap(kPtpHarvest);
   // ---- SUBMIT phase: kick a new probe for this tick's candidates ----------
   pending_.fCands = eligible;
   // Candidates that found the probe busy. This USED to be the stranding path
@@ -1744,9 +1932,13 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // kCensusEveryTicks, every tick under SANDVOX_PT_DEBUG (the periodic dump
   // wants its own cadence), and on any tick that set a new residency high
   // water, so CensusAtHighWater() still latches the peak's own census.
+  clk.Lap(kPtpSubmit);
+  PtCpuProf().probesSubmitted += probesRun;
+  PtCpuProf().probesHarvested += probesHarvested;
   if (PtDebug() || !census_.valid || (tick % kCensusEveryTicks) == 0u ||
       pagesHighWater_ > censusHighMark_)
     RunCensus(occupancy, occStain);
+  clk.Lap(kPtpCensus);
 }
 
 // Bill every resident page to exactly one reason, and bucket it by height band.
