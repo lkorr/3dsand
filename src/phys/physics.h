@@ -22,6 +22,7 @@ class PhysicsSystem;
 class TempAllocatorImpl;
 class JobSystemThreadPool;
 class BodyInterface;
+class Shape;
 }  // namespace JPH
 
 // ---- THE ANTI-TUNNEL A/B ARM, IN ONE BINARY --------------------------------
@@ -504,6 +505,32 @@ class Physics {
   void MarkDeadFlesh(uint64_t handle);
   uint32_t CorpseColliderCount() const;
   bool IsCorpseCollider(uint64_t handle) const;
+  // ---- HULLS FOR THE DOWNED AND THE LIVING (fight64 round 4, package L) ----
+  // A LIMP ragdoll's limbs (RigLimp) take the same hull a corpse's do, for as
+  // long as they are limp (SANDVOX_LIMP_HULL=0 keeps the compounds). A LIVING
+  // limb keeps its compound as its shape -- every query is exact -- but the
+  // simulation's body-vs-body collide meets it as its hull
+  // (SANDVOX_LIVE_SIMHULL=0 is the old collide). One hull per compound,
+  // cached (keyed by the compound, which the cache holds a reference on):
+  // building it is ~0.1 ms a limb (measured in mob-cap64), so the builds a
+  // swap or the narrow phase asks for are made on Jolt's workers at the head
+  // of the next Step (SANDVOX_HULL_DEFER=0: at the swap, on this thread).
+  // The account, cumulative since Init:
+  struct HullStats {
+    uint64_t builds = 0;      // hulls built (each compound once)
+    uint64_t shells = 0;      // ...of which judged shells (compound kept)
+    uint64_t cacheHits = 0;   // swaps and sim-hull wants that found one built
+    double buildUs = 0.0;     // worker time in the builds (summed)
+    double flushMs = 0.0;     // wall time of FlushHulls (builds + swaps)
+    uint64_t swapsIn = 0;     // bodies whose shape became a hull
+    uint64_t limpSwapsIn = 0; // ...of which limp-ragdoll limbs
+    uint64_t swapsOut = 0;    // bodies given their compound back
+    uint64_t evicted = 0;     // cache entries dropped with their compound
+    uint64_t simHullPairs = 0;  // living-limb collides that used the hull
+    uint64_t simMissPairs = 0;  // ...that found none yet (queued; compound)
+    size_t cached = 0;          // entries now
+  };
+  HullStats Hulls() const;
   // The owner-scoping slot a player proxy was given (0..kMaxPlayerProxies-1),
   // or -1 for a dead handle or a proxy past the slot count (which then
   // behaves like the old single PLAYER layer: every OWNED body meets it).
@@ -914,6 +941,13 @@ class Physics {
   struct JobProfiler;   // times Jolt's jobs by name (StepStats::phase*)
   std::unique_ptr<JobProfiler> jobProf_;
   void ApplyCorpseCollider(uint64_t handle);
+  // The cached hull of a box compound, or null: not cached, not a compound
+  // of 2+ boxes, or a shell. Game thread, outside Update.
+  // `known` = the compound has an entry (its hull, or null for a shell).
+  const JPH::Shape* CachedHull(const JPH::Shape* compound, bool& known) const;
+  void FlushHulls();   // head of Step: build what was asked for, then swap
+  void EvictHulls();   // before Update: entries only the cache holds
+  HullStats hullStats_{};
   // Both CastRayBody overloads: the closest hit, with a hit on a corpse
   // collider re-tested against its stored compound (see CorpseColliderCount).
   uint64_t CastRayImpl(Vec3 fromVoxel, Vec3 dirNormalized, float maxDistVoxels,

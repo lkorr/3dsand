@@ -721,8 +721,31 @@ struct Physics::JointImpls {
 // The full compounds corpse colliders replaced (Physics::CorpseColliderCount).
 struct Physics::CorpseShapes {
   std::unordered_map<uint64_t, JPH::RefConst<JPH::Shape>> full;
-  // Bodies judged shells (ApplyCorpseCollider's fill test): keep the compound.
-  std::unordered_set<uint64_t> keep;
+  // THE HULL OF A COMPOUND, built once per compound (fight64 round 4 L).
+  // Keyed by the compound itself and holding a reference on it, so a key can
+  // never be a freed compound's address reused by a new one; an entry whose
+  // compound nobody else holds any more is dropped at the head of the next
+  // Step (EvictHulls). `hull` null = judged a SHELL (or Jolt refused the
+  // hull): the compound stays. A limb that goes limp, gets up and goes limp
+  // again with no carve between pays the build once; a living limb's
+  // sim-only hull (Init's body-vs-body collide) and its limp/dead swap are
+  // the same entry.
+  // Read by Jolt's job threads during Update (the sim-only hull in Init);
+  // written only on the game thread outside Update.
+  struct Hull {
+    JPH::RefConst<JPH::Shape> compound, hull;
+  };
+  std::unordered_map<const JPH::Shape*, Hull> hulls;
+  // Living compounds the narrow phase met with no hull cached yet: built at
+  // the head of the next Step (FlushHulls) and used from that step on.
+  // HELD BY REFERENCE: between the Update that asks and the next Step the
+  // mob code may carve or remove the limb, freeing the compound.
+  std::mutex wantMu;
+  std::vector<JPH::RefConst<JPH::Shape>> want;
+  // Bodies whose swap to a hull waits for FlushHulls (no hull cached yet),
+  // in the order ApplyCorpseCollider asked. Game thread only.
+  std::vector<uint64_t> pendingSwap;
+  std::atomic<uint64_t> simHull{0}, simMiss{0};
 };
 
 bool AntiTunnelOff(AntiTunnel part) {
@@ -954,15 +977,60 @@ bool Physics::Init() {
     }();
     const char* pp = std::getenv("SANDVOX_PHYS_PAIRPROF");
     ContactImpls* ci = (pp && pp[0] != '0') ? contacts_.get() : nullptr;
+    // ---- A LIVING LIMB MEETS LOOSE BODIES AS ITS HULL (round 4, L) --------
+    //
+    // A living limb is a kinematic box compound (~20 boxes), and against a
+    // corpse, a ragdoll or a gib every one of its boxes is a GJK and possibly
+    // a manifold: the round-3 fights' largest narrow-phase pairs. The body's
+    // SHAPE stays the compound -- every query (melee rays, lasers, the look
+    // ray, PlayerPushOut, the debug overlay) sees exactly the voxels -- and
+    // only this callback, the simulation's own body-vs-body collide, swaps
+    // in the compound's cached hull (CorpseShapes::hulls; the same entry the
+    // limb gets if it goes limp or dies). The hull is wrapped to the
+    // compound's centre of mass, so it sits under the same transform Jolt
+    // hands us. A compound with no hull cached yet collides as itself this
+    // step and is queued; FlushHulls builds it at the head of the next
+    // Step, so the limb meets loose bodies as a hull from then on. Shells
+    // (hair, a worn plate: the fill test) stay compounds.
+    //
+    // Only RigLive kinematic limbs, and only against a body that is not
+    // kinematic (kinematic pairs never reach here; statics never meet a
+    // kinematic body). The sub-shape ids such a contact carries are the
+    // hull's (none), which nothing in Jolt's sim reads but the contact
+    // cache key; this engine's listener reads no sub-shape id.
+    //
+    // SANDVOX_LIVE_SIMHULL=0 is the old collide (the A/B arm in one binary).
+    static const bool kLiveSimHull = [] {
+      const char* e = std::getenv("SANDVOX_LIVE_SIMHULL");
+      return !(e && e[0] == '0');
+    }();
+    CorpseShapes* cs = kLiveSimHull ? corpse_.get() : nullptr;
     system_->SetSimCollideBodyVsBody(
-        [ci](const JPH::Body& b1, const JPH::Body& b2, JPH::Mat44Arg x1,
-             JPH::Mat44Arg x2, JPH::CollideShapeSettings& st,
-             JPH::CollideShapeCollector& col, const JPH::ShapeFilter& sf) {
+        [ci, cs](const JPH::Body& b1, const JPH::Body& b2, JPH::Mat44Arg x1,
+                 JPH::Mat44Arg x2, JPH::CollideShapeSettings& st,
+                 JPH::CollideShapeCollector& col, const JPH::ShapeFilter& sf) {
           const int64_t t0 = ci ? JobNowNs() : 0;
+          auto simShape = [cs](const JPH::Body& b) -> const JPH::Shape* {
+            const JPH::Shape* s = b.GetShape();
+            if (cs == nullptr || !b.IsKinematic() ||
+                UnpackRole(b.GetUserData()) != Physics::BodyRole::RigLive ||
+                s->GetSubType() != JPH::EShapeSubType::StaticCompound)
+              return s;
+            const auto it = cs->hulls.find(s);
+            if (it == cs->hulls.end()) {
+              cs->simMiss.fetch_add(1, std::memory_order_relaxed);
+              std::lock_guard<std::mutex> lk(cs->wantMu);
+              cs->want.emplace_back(s);
+              return s;
+            }
+            if (!it->second.hull) return s;   // a shell
+            cs->simHull.fetch_add(1, std::memory_order_relaxed);
+            return it->second.hull.GetPtr();
+          };
           if (!kKinEdge && (b1.IsKinematic() || b2.IsKinematic())) {
             JPH::SubShapeIDCreator p1, p2;
             JPH::CollisionDispatch::sCollideShapeVsShape(
-                b1.GetShape(), b2.GetShape(), JPH::Vec3::sOne(), JPH::Vec3::sOne(),
+                simShape(b1), simShape(b2), JPH::Vec3::sOne(), JPH::Vec3::sOne(),
                 x1, x2, p1, p2, st, col, sf);
           } else {
             JPH::PhysicsSystem::sDefaultSimCollideBodyVsBody(b1, b2, x1, x2, st,
@@ -1672,6 +1740,11 @@ void Physics::Step(float dt) {
   // Before Update, so MotionRunVox answers for the motion that CARRIED a body
   // into this step's contacts, not for the stop the contact put it in.
   TrackMotionRuns(dt);
+  // Every hull asked for since the last step (the deferred limp / dead
+  // swaps, the living compounds the last narrow phase met with none), built
+  // across the workers, then the swaps -- before anything below reads a
+  // shape (the CCD attribution) and before Update collides with them.
+  FlushHulls();
   // Gravity is re-applied here rather than only at Init so a tuning reload
   // takes effect without restarting the world.
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
@@ -1738,6 +1811,8 @@ void Physics::Step(float dt) {
         lastStep_.ccdCompound[r]++;
     }
   }
+  // The hull cache keeps only compounds some body still holds (memory only).
+  EvictHulls();
   if (jobProf_) jobProf_->Reset();
   const auto t0 = std::chrono::steady_clock::now();
   // Jolt's own overflow report: a full body-pair / manifold / constraint
@@ -3510,6 +3585,24 @@ static bool CorpseCompoundKept() {
   }();
   return kKeep;
 }
+// SANDVOX_LIMP_HULL=0: a limp ragdoll keeps its box compounds (the pre-round-4
+// behaviour; the A/B arm in one binary). See ApplyCorpseCollider.
+static bool LimpHullOn() {
+  static const bool kOn = [] {
+    const char* e = std::getenv("SANDVOX_LIMP_HULL");
+    return !(e && e[0] == '0');
+  }();
+  return kOn;
+}
+// SANDVOX_HULL_DEFER=0: a swap whose hull is not cached builds it at once on
+// the game thread instead of waiting for FlushHulls (the A/B arm).
+static bool HullDeferOn() {
+  static const bool kOn = [] {
+    const char* e = std::getenv("SANDVOX_HULL_DEFER");
+    return !(e && e[0] == '0');
+  }();
+  return kOn;
+}
 void Physics::MarkDeadFlesh(uint64_t handle) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
@@ -3527,52 +3620,28 @@ bool Physics::IsCorpseCollider(uint64_t handle) const {
   return corpse_ && corpse_->full.count(handle) != 0;
 }
 
-void Physics::ApplyCorpseCollider(uint64_t handle) {
-  if (!system_ || !corpse_ || handle == 0) return;
-  JPH::BodyInterface& bi = system_->GetBodyInterface();
-  const JPH::BodyID id = ToBodyID(handle);
-  if (!bi.IsAdded(id)) return;
-  // Dead flesh lying loose: a corpse's limbs (RigDead), a limb in its sever
-  // hold, and debris that was once a creature (MarkDeadFlesh) while it lies in
-  // the world -- not while somebody carries or throws it, where the grab and
-  // throw code meet the shape they were written against.
-  const uint64_t ud = bi.GetUserData(id);
-  const BodyRole role = UnpackRole(ud);
-  const bool want =
-      !CorpseCompoundKept() &&
-      (role == BodyRole::RigDead || role == BodyRole::SeveredHold ||
-       ((ud & kDeadFleshBit) != 0 && role == BodyRole::Debris));
-  auto it = corpse_->full.find(handle);
-  if (!want) {
-    // Leaving the dead (a zombie rising, a limb grabbed): the compound back,
-    // under the same untouched mass properties.
-    if (it == corpse_->full.end()) return;
-    bi.SetShape(id, it->second.GetPtr(), false, JPH::EActivation::DontActivate);
-    corpse_->full.erase(it);
-    return;
-  }
-  if (it != corpse_->full.end()) return;
-  if (corpse_->keep.count(handle)) return;   // a shell: judged once, below
-  JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
-  // A one-box limb is already convex (Jolt unwraps a one-shape compound).
+// THE CONVEX HULL OF A LIMB'S VOXELS, built from the corners of the compound's
+// own boxes, in the shape's creation space, with the centre of mass pinned
+// back where the compound had it. Null when the shape is not a box compound of
+// two or more boxes (a one-box limb is already convex), when Jolt refuses the
+// hull, or when the voxels fill under kHullMinFill of it (a SHELL). A pure
+// function of the compound's boxes.
+//
+// A HULL, NOT A FITTED BOX (measured 2026-10-04, `corpse-sleep`). A hull's
+// support in EVERY direction is a voxel corner, so it never reaches past the
+// voxels toward a plane in any orientation -- against the ground it
+// penetrates exactly as deep as the compound did. A box fitted in the limb's
+// frame does not have that property: rotated, its corners stand off the
+// voxels, and the moment a dying creature's limbs were swapped to boxes a
+// corner of one sat deep in the terrain sheet, the depenetration pushed it
+// through the back face, and the corpse fell 95 voxels into the ground. The
+// hull keeps the box's cost class (one convex, one GJK per pair) and only
+// fills the limb's concavities -- which is why a SHELL is refused.
+static JPH::RefConst<JPH::Shape> BuildLimbHull(const JPH::Shape* shape) {
   if (!shape || shape->GetSubType() != JPH::EShapeSubType::StaticCompound)
-    return;
-  const auto* compound =
-      static_cast<const JPH::StaticCompoundShape*>(shape.GetPtr());
-  if (compound->GetNumSubShapes() < 2) return;
-  // THE CONVEX HULL OF THE LIMB'S VOXELS, built from the corners of the
-  // compound's own boxes, in the shape's creation space.
-  //
-  // A HULL, NOT A FITTED BOX (measured 2026-10-04, `corpse-sleep`). A hull's
-  // support in EVERY direction is a voxel corner, so it never reaches past the
-  // voxels toward a plane in any orientation -- against the ground it
-  // penetrates exactly as deep as the compound did. A box fitted in the limb's
-  // frame does not have that property: rotated, its corners stand off the
-  // voxels, and the moment a dying creature's limbs were swapped to boxes a
-  // corner of one sat deep in the terrain sheet, the depenetration pushed it
-  // through the back face, and the corpse fell 95 voxels into the ground. The
-  // hull keeps the box's cost class (one convex, one GJK per pair) and only
-  // fills the limb's concavities -- which is why a SHELL is refused below.
+    return nullptr;
+  const auto* compound = static_cast<const JPH::StaticCompoundShape*>(shape);
+  if (compound->GetNumSubShapes() < 2) return nullptr;
   const JPH::Vec3 com = shape->GetCenterOfMass();
   float radius = 0.0f;
   JPH::Array<JPH::Vec3> pts;
@@ -3580,7 +3649,7 @@ void Physics::ApplyCorpseCollider(uint64_t handle) {
   float boxVol = 0.0f;   // the voxels' own volume (boxes of a merge are disjoint)
   for (JPH::uint i = 0; i < compound->GetNumSubShapes(); i++) {
     const JPH::CompoundShape::SubShape& ss = compound->GetSubShape(i);
-    if (ss.mShape->GetSubType() != JPH::EShapeSubType::Box) return;
+    if (ss.mShape->GetSubType() != JPH::EShapeSubType::Box) return nullptr;
     const auto* sb = static_cast<const JPH::BoxShape*>(ss.mShape.GetPtr());
     if (i == 0) radius = sb->GetConvexRadius();
     const JPH::Vec3 p = ss.GetPositionCOM() + com, h = sb->GetHalfExtent();
@@ -3613,23 +3682,208 @@ void Physics::ApplyCorpseCollider(uint64_t handle) {
   // Measured (`corpse-head-laser`): a dead human's hair cap as a hull drifted
   // 0.354 vox on its Fixed joint against 0.031 as boxes (cap 0.05). The test
   // is geometric -- the voxels fill less than kHullMinFill of their hull --
-  // so it needs no caller to say what a limb is. Judged once per body (a
-  // rebuilt body is a new handle and is judged again). Jolt refusing the hull
-  // is the same answer.
+  // so it needs no caller to say what a limb is. Jolt refusing the hull is
+  // the same answer.
   constexpr float kHullMinFill = 0.5f;
-  if (!convex || boxVol < kHullMinFill * convex->GetVolume()) {
-    corpse_->keep.insert(handle);
-    return;
-  }
+  if (!convex || boxVol < kHullMinFill * convex->GetVolume()) return nullptr;
   // The centre of mass pinned back where the compound had it
   // (OffsetCenterOfMass), so SetShape leaves the body where it is and -- mass
   // properties NOT recomputed -- the body keeps the mass and inertia of its
   // voxels: a corpse falls and tumbles as it did, only what it touches is
-  // simpler.
-  JPH::Ref<JPH::Shape> fitted = new JPH::OffsetCenterOfMassShape(
-      convex.GetPtr(), com - convex->GetCenterOfMass());
-  bi.SetShape(id, fitted.GetPtr(), false, JPH::EActivation::DontActivate);
+  // simpler. The same offset is what lets the narrow phase use the hull in
+  // place of a living limb's compound under the compound's own centre-of-mass
+  // transform (the sim-only hull in Init).
+  return new JPH::OffsetCenterOfMassShape(convex.GetPtr(),
+                                          com - convex->GetCenterOfMass());
+}
+
+const JPH::Shape* Physics::CachedHull(const JPH::Shape* compound, bool& known) const {
+  known = false;
+  if (!corpse_ || !compound ||
+      compound->GetSubType() != JPH::EShapeSubType::StaticCompound)
+    return nullptr;
+  auto it = corpse_->hulls.find(compound);
+  if (it == corpse_->hulls.end()) return nullptr;
+  known = true;
+  return it->second.hull.GetPtr();
+}
+
+void Physics::ApplyCorpseCollider(uint64_t handle) {
+  if (!system_ || !corpse_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  // Dead flesh lying loose: a corpse's limbs (RigDead), a limb in its sever
+  // hold, and debris that was once a creature (MarkDeadFlesh) while it lies in
+  // the world -- not while somebody carries or throws it, where the grab and
+  // throw code meet the shape they were written against.
+  //
+  // ...AND A KNOCKED-DOWN CREATURE (RigLimp, fight64 round 4 L). A limp
+  // ragdoll is the same solver-owned jointed pile of box compounds a corpse
+  // is, and in a brawl there are dozens: the all-six round-3 fight had 40.8
+  // limp limbs a tick linear-casting as box compounds and 442 living-vs-limp
+  // manifolds a step, one per SUB-BOX pair. It gets its hull on the flip
+  // (StartRagdoll re-derives every slot's role) and its compound back when
+  // BeginGetUp makes it RigLive again; the swap keeps the centre of mass and
+  // the voxels' mass and inertia, so the joints and the get-up see the same
+  // body, and the hull contains the compound, so restoring it can open a gap
+  // but never a new overlap. Melee and every ray re-test a hit on it against
+  // the compound (CastRayImpl). The avatar's own limp limbs are RigLive
+  // (Mob::LimbRole) and keep their compounds.
+  const uint64_t ud = bi.GetUserData(id);
+  const BodyRole role = UnpackRole(ud);
+  const bool want =
+      !CorpseCompoundKept() &&
+      (role == BodyRole::RigDead || role == BodyRole::SeveredHold ||
+       ((ud & kDeadFleshBit) != 0 && role == BodyRole::Debris) ||
+       (role == BodyRole::RigLimp && LimpHullOn()));
+  auto it = corpse_->full.find(handle);
+  if (!want) {
+    // Leaving the dead (a zombie rising, a limb grabbed, a ragdoll getting
+    // up): the compound back, under the same untouched mass properties.
+    if (it == corpse_->full.end()) return;
+    bi.SetShape(id, it->second.GetPtr(), false, JPH::EActivation::DontActivate);
+    corpse_->full.erase(it);
+    hullStats_.swapsOut++;
+    return;
+  }
+  if (it != corpse_->full.end()) return;
+  JPH::RefConst<JPH::Shape> shape = bi.GetShape(id);
+  bool known = false, builtNow = false;
+  const JPH::Shape* hull = CachedHull(shape.GetPtr(), known);
+  if (!known && !HullDeferOn() && shape &&
+      shape->GetSubType() == JPH::EShapeSubType::StaticCompound) {
+    // SANDVOX_HULL_DEFER=0: built here and now, as package P did.
+    const auto b0 = std::chrono::steady_clock::now();
+    CorpseShapes::Hull e;
+    e.compound = shape;
+    e.hull = BuildLimbHull(shape.GetPtr());
+    hullStats_.buildUs += std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - b0).count();
+    hullStats_.builds++;
+    if (!e.hull) hullStats_.shells++;
+    hull = e.hull.GetPtr();
+    corpse_->hulls.emplace(shape.GetPtr(), std::move(e));
+    known = builtNow = true;
+  }
+  if (!known) {
+    // NOT BUILT YET: the swap waits for the head of the next Step
+    // (FlushHulls), which builds every hull asked for since the last one
+    // across Jolt's workers -- a creature going limp or dying asks for ~15
+    // at once (~0.1 ms each, measured) -- and then applies the swaps in the
+    // order they were asked for. Nothing between here and that Update reads
+    // the collider for a result that matters: rays are exact either way
+    // (CastRayImpl), and the step is the first thing the hull is for.
+    if (shape && shape->GetSubType() == JPH::EShapeSubType::StaticCompound &&
+        std::find(corpse_->pendingSwap.begin(), corpse_->pendingSwap.end(),
+                  handle) == corpse_->pendingSwap.end())
+      corpse_->pendingSwap.push_back(handle);
+    return;
+  }
+  if (!builtNow) hullStats_.cacheHits++;
+  if (!hull) return;   // a shell: the compound stays
+  bi.SetShape(id, hull, false, JPH::EActivation::DontActivate);
   corpse_->full.emplace(handle, shape);
+  hullStats_.swapsIn++;
+  if (role == BodyRole::RigLimp) hullStats_.limpSwapsIn++;
+}
+
+// Before Update, on the game thread: every hull asked for since the last
+// Step -- the swaps ApplyCorpseCollider deferred, and the living compounds
+// the last narrow phase met with none (the sim-only hull in Init) -- built
+// across Jolt's workers, then the deferred swaps applied in the order they
+// were asked for. Which compounds are asked for is a function of the
+// simulation (role changes; the (living limb, dynamic body) pairs that
+// reached the narrow phase), and a hull is a pure function of its compound:
+// the worker that built it, the order the job threads queued it in and the
+// duplicates cannot reach the simulation. SANDVOX_NO_PARALLEL_FOR=1 builds
+// them serially (Physics::ParallelFor).
+void Physics::FlushHulls() {
+  if (!system_ || !corpse_) return;
+  std::vector<JPH::RefConst<JPH::Shape>> held;
+  {
+    std::lock_guard<std::mutex> lk(corpse_->wantMu);
+    held.swap(corpse_->want);
+  }
+  if (held.empty() && corpse_->pendingSwap.empty()) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  // The deferred swaps' compounds join the narrow phase's asks.
+  for (uint64_t h : corpse_->pendingSwap) {
+    const JPH::BodyID id = ToBodyID(h);
+    if (bi.IsAdded(id)) held.push_back(bi.GetShape(id));
+  }
+  // One build per distinct compound that is still some body's (a limb the
+  // mob code carved or removed since the narrow phase asked holds only our
+  // references now) and has no entry yet. Ordered by address only to group
+  // duplicates; what is built does not depend on the order.
+  std::sort(held.begin(), held.end(),
+            [](const JPH::RefConst<JPH::Shape>& a,
+               const JPH::RefConst<JPH::Shape>& b) {
+              return a.GetPtr() < b.GetPtr();
+            });
+  std::vector<const JPH::Shape*> want;
+  for (size_t i = 0; i < held.size();) {
+    size_t j = i + 1;
+    while (j < held.size() && held[j].GetPtr() == held[i].GetPtr()) j++;
+    const JPH::Shape* s = held[i].GetPtr();
+    bool known = false;
+    CachedHull(s, known);
+    if (s != nullptr && !known &&
+        s->GetSubType() == JPH::EShapeSubType::StaticCompound &&
+        s->GetRefCount() > (uint32_t)(j - i))
+      want.push_back(s);
+    i = j;
+  }
+  std::vector<JPH::RefConst<JPH::Shape>> built(want.size());
+  std::vector<double> us(want.size(), 0.0);
+  ParallelFor((uint32_t)want.size(), [&](uint32_t i) {
+    const auto b0 = std::chrono::steady_clock::now();
+    built[i] = BuildLimbHull(want[i]);
+    us[i] = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - b0).count();
+  });
+  for (size_t i = 0; i < want.size(); i++) {
+    CorpseShapes::Hull e;
+    e.compound = want[i];
+    e.hull = built[i];
+    corpse_->hulls.emplace(want[i], std::move(e));
+    hullStats_.builds++;
+    hullStats_.buildUs += us[i];
+    if (!built[i]) hullStats_.shells++;
+  }
+  // The swaps, in the order they were asked for. Each re-asks its body's
+  // role, so a body that left the dead (or was removed) since is skipped.
+  std::vector<uint64_t> pending;
+  pending.swap(corpse_->pendingSwap);
+  for (uint64_t h : pending) ApplyCorpseCollider(h);
+  hullStats_.flushMs += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+}
+
+// Before Update: drop the entries whose compound only the cache still holds
+// (its body was removed or rebuilt). Such a compound is in no body, so no
+// lookup can reach it: when this runs changes nothing but memory.
+void Physics::EvictHulls() {
+  if (!corpse_) return;
+  for (auto it = corpse_->hulls.begin(); it != corpse_->hulls.end();) {
+    if (it->second.compound->GetRefCount() <= 1) {
+      it = corpse_->hulls.erase(it);
+      hullStats_.evicted++;
+    } else {
+      ++it;
+    }
+  }
+}
+
+Physics::HullStats Physics::Hulls() const {
+  HullStats s = hullStats_;
+  if (corpse_) {
+    s.cached = corpse_->hulls.size();
+    s.simHullPairs = corpse_->simHull.load(std::memory_order_relaxed);
+    s.simMissPairs = corpse_->simMiss.load(std::memory_order_relaxed);
+  }
+  return s;
 }
 
 void Physics::RemoveBody(uint64_t handle) {
@@ -3649,9 +3903,12 @@ void Physics::RemoveBody(uint64_t handle) {
   // to whatever is created next in its slot, and that body would be cut on its
   // fifth bad step instead of its forty-fifth.
   hotSteps_.erase(id.GetIndex());
+  // The hull cache entry for this body's compound goes at the next Step's
+  // EvictHulls, once the cache is the only holder.
   if (corpse_) {
     corpse_->full.erase(handle);
-    corpse_->keep.erase(handle);
+    auto& ps = corpse_->pendingSwap;
+    ps.erase(std::remove(ps.begin(), ps.end(), handle), ps.end());
   }
   const auto tr0 = std::chrono::steady_clock::now();
   bi.RemoveBody(id);

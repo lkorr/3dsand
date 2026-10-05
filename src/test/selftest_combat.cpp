@@ -3229,6 +3229,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   // The whole timed fight under the sampler (SANDVOX_SAMPLE_PROF; no-op
   // otherwise): every function of the tick, not only the burnprof spans.
   const MobSystem::ShockCounters shock0 = c.mobs.ShockStats();
+  const Physics::HullStats hull0 = c.phys.Hulls();   // round 4 L
   sampleprof::Start("mob-cap64 fight");
   // GPU SIDE OF THE CROWD TICK (SANDVOX_MOBCAP_GPU=1, measurement only): every
   // 10th tick timed pass by pass. A timestamp changes no dispatch and no hash;
@@ -3526,6 +3527,42 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                    phWall[(int)Physics::StepPhase::FindCollisions] / std::max(1, ticks));
     RecordObserved("mobCap64.joltSolveVelMs",
                    phWall[(int)Physics::StepPhase::SolveVelocity] / std::max(1, ticks));
+  }
+  {
+    // HULLS FOR THE DOWNED AND THE LIVING (fight64 round 4 L): what the swap
+    // and the cache cost, and every role pair's manifolds, body pairs and
+    // narrow-phase us per body pair (the last only with
+    // SANDVOX_PHYS_PAIRPROF=1), so an arm is attributed per pair kind.
+    const Physics::HullStats h1 = c.phys.Hulls();
+    const double tk = (double)std::max(1, ticks);
+    std::printf("mob-cap64: hulls: %llu built (%llu shells), %.2f ms worker "
+                "time, flush wall %.3f ms/tick, %llu cache hits, %llu swapped in (%llu limp), %llu swapped out, "
+                "%zu cached at the end; living-limb collides/tick %.1f as hull, "
+                "%.1f awaiting one\n",
+                (unsigned long long)(h1.builds - hull0.builds),
+                (unsigned long long)(h1.shells - hull0.shells),
+                (h1.buildUs - hull0.buildUs) / 1000.0,
+                (h1.flushMs - hull0.flushMs) / tk,
+                (unsigned long long)(h1.cacheHits - hull0.cacheHits),
+                (unsigned long long)(h1.swapsIn - hull0.swapsIn),
+                (unsigned long long)(h1.limpSwapsIn - hull0.limpSwapsIn),
+                (unsigned long long)(h1.swapsOut - hull0.swapsOut), h1.cached,
+                (double)(h1.simHullPairs - hull0.simHullPairs) / tk,
+                (double)(h1.simMissPairs - hull0.simMissPairs) / tk);
+    auto pairRole = [](int r) {
+      return r == Physics::kRoleStatic ? "static"
+                                       : Physics::RoleName((Physics::BodyRole)r);
+    };
+    std::string s = "mob-cap64: per role pair /tick (manifolds, body pairs, us "
+                    "per body pair):";
+    for (int k = 0; k < (int)rolePairs.size(); k++) {
+      if (rolePairs[k] <= 0 && pairCalls[k] <= 0) continue;
+      s += Format(" %s-%s %.1f %.1f %.2f", pairRole(k / Physics::kRoleCols),
+                  pairRole(k % Physics::kRoleCols), rolePairs[k] / tk,
+                  pairCalls[k] / tk,
+                  pairCalls[k] > 0 ? pairUs[k] / pairCalls[k] : 0.0);
+    }
+    std::printf("%s\n", s.c_str());
   }
   std::printf("mob-cap64: burnprof %s\n", profReport.c_str());
 
