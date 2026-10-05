@@ -7102,6 +7102,91 @@ neighbors, so this needs an explicit connectivity pass:
   CCD exists for the terrain sheet, but Jolt's cast cannot be told to skip
   kinematic bodies. Hulls for LIMP living rigs too were measured (17.2 vs
   17.6 ms, corpse-heavy) and are not worth the behaviour change.
+- **A dead body's linear cast looks for the ground (2026-10-05, fight64
+  round 3 package C).** After package P the cast was still 2.0 ms wall / 7.4
+  ms worker time of a 3.8 ms Jolt step in `mob-cap64` (b21d23a), and the
+  sampler put ~80% of it in `StaticCompoundShape::sCastShapeVsCompound`:
+  corpse limbs, ragdolls and gibs shoved by the crowd casting against LIVING
+  box compounds. The cast exists for the terrain sheet (the note above
+  `CreateDebrisBody`), and Jolt's `JobFindCCDContacts` uses the body's own
+  collision filters with no way to hand it others.
+  1. **The scope (`CcdScopeFilter`, physics.cpp).** The one per-pair hook a
+     cast consults before any narrow-phase work is the `SimShapeFilter`,
+     asked at the root of every (caster, target) shape cast. It cannot tell a
+     cast from a contact query by its arguments, so `JobProfiler` (the job
+     wrapper that already timed every Jolt job by name) raises a thread-local
+     for exactly the duration of each `FindCCDContacts` job; outside one the
+     filter answers true and the narrow phase is untouched. Inside one: a
+     static target (terrain) is always cast; a `RigLimp` / `RigDead` /
+     `SeveredHold` caster casts against nothing else (a rig's own limbs are
+     never billed as a contact blow, `ApplyContactDamage`'s "creature against
+     creature" rule, so nothing reported is lost); loose dead-flesh `Debris`
+     (a severed arm, a gobbet) casts against a body only when it could strike
+     a blow -- own speed at least max(`gore.contactMinSpeed`,
+     `gore.contactImpulseMin` / its mass), a necessary condition of a billed
+     blow, latched from tuning on the game thread before each Update. Plain
+     debris, thrown bodies and spheres keep the full cast. A pure function of
+     the two bodies' state: deterministic, thread-count independent.
+     `SANDVOX_CCD_SCOPE=all` is the old cast, `=terrain` refuses every body
+     target. **Trade-off:** a dead / limp / severed piece moving faster than
+     0.75 x its inner radius a step (but too slow to strike a blow) can pass
+     through another body's limb within one step instead of stopping on it;
+     it still collides with what it overlaps at the end of the step. The
+     first version (terrain only for loose flesh too) halved the billed
+     loose-body blows in a same-binary arm (183 -> 124); the blow gate keeps
+     every hit that could bill.
+  2. **A kinematic pair collides plainly** (`SetSimCollideBodyVsBody`).
+     Jolt's default runs every pair in which either body asked for enhanced
+     internal edge removal -- every body `CreateDebrisBodyXf` makes --
+     through `InternalEdgeRemovingCollector`. A pair with a KINEMATIC body (a
+     living limb against a corpse, a gib, a ragdoll) now skips it: nothing
+     rests on an animated limb long enough for a box seam to matter, and
+     those are the brawl's most numerous pairs. Per pair (exclusive,
+     `SANDVOX_PHYS_PAIRPROF=1`): debris-vs-living 14.1 -> 8.0 us, ragdoll-vs-
+     living 14.9 -> 12.0, corpse-vs-living 7.9 -> 7.7. **Trade-off:** a body
+     sliding along a living limb can meet a seam between two of its boxes.
+     `SANDVOX_KIN_EDGE_REMOVAL=1` is Jolt's default for every pair.
+  3. **Instruments.** `mob-cap64` prints the cast pairs a tick by target
+     (static / body / dead flesh kept at blow speed / refused), and with
+     `SANDVOX_PHYS_PAIRPROF=1` the narrow phase's worker time and body pairs
+     by role pair (Jolt's body-vs-body collide wrapped in two clock reads).
+     `SANDVOX_DEBRIS_PROFILE=1` splits polygonizes into fresh / own-write /
+     CA-changed.
+  4. **The terrain need list is folded, not sorted** (`ManageTerrain`). 64
+     creatures list ~3,500 chunk requests a tick (their planning horizons)
+     for ~210 distinct chunks, and the sort of all of them by (key, distance)
+     plus `unique` plus a stable sort was half of `terrainNeed` (0.44 ms a
+     tick). An open-addressed key table keeps each chunk's least distance and
+     only the survivors are sorted, by (distance, key) -- the same set in the
+     same order (the brawl's per-tick digest is bit-identical to the old
+     code's with the physics changes switched off). `terrainNeed` 0.44 ->
+     0.18 ms. Of the 507 polygonizes in the fight, 303 are fresh patches
+     (first build of a chunk) and the rest a surface the CA changed: no
+     redundant meshing to remove.
+  5. **Tried and dropped.** (a) A per-step motion quality chosen by the
+     body's own solid thickness (Discrete unless |v| dt > 0.375 x its thinnest
+     solid wall) for box compounds: it applied to ~2 bodies a tick in the
+     brawl, because a cast's cost was its TARGETS, not the number of casters,
+     and it had a one-step blind spot for velocity the solver adds mid-step.
+     (b) A broadphase layer of its own for kinematic `MOVING` bodies, so 900
+     living limbs stop searching the static tree and each other: those
+     searches are ~8% of `collide` by the sampler and the gain did not rise
+     out of the fight-to-fight noise.
+  Measured, `SANDVOX_RUN_EXCLUSIVE=1 --gate mob-cap64`, base = this tree at
+  7194388 (4 runs), after = 2 runs, each pair of runs bit-identical
+  (`SANDVOX_MOBCAP_DIGEST`): Jolt Update 3.83 -> 2.37 ms, ccd 2.01 / 7.4 ->
+  0.61 / 0.95 ms (wall / worker), collide 1.24 / 7.4 -> 1.13 / 7.1 (over
+  372 body-body manifolds a step, not 287), terrainMesh 0.82 -> 0.56, tick
+  wall 32.1 / 41.3 / 49.6 -> 30.4 / 38.1 / 44.1 (mean / p95 / worst). The
+  fight is a different one (57 alive at the end, not 54; 16 live ragdolls
+  casting a tick, none before), so the Jolt rows are the change and the
+  mob-side rows are the fight. The `determinism` gate's hash did not move.
+  What is left in the step: the narrow phase, ~6 ms of worker time, half of
+  it living box compounds against corpses, gibs and ragdolls (a living limb
+  is ~20 boxes). A hull for LIVING limbs would cut that the way P's did for
+  corpses, but every melee probe that hits one would then pay
+  `CastRayBody`'s re-test against the stored compound -- a stroke-side cost
+  to measure first.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
