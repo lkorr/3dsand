@@ -48,4 +48,32 @@ bool OnWorker();
 // be WRITTEN while this is true anywhere (MobSystem::MaterialIdNamed).
 bool InTask();
 
+// THE POOL'S OWN COST (fight64 round 4, package W). Accumulated on the calling
+// thread for every ParallelFor that went parallel; ResetStats() zeroes it.
+// Scheduling only -- nothing here can change any task's output.
+//   overheadUs: per call, wall minus the busiest participant's span (its first
+//               item's start to its last item's end) -- wake-up latency, the
+//               join and imbalance; ~0 for a perfect pool.
+//   wakeUs:     per participating worker, post -> its first item.
+//   joinUs:     per call, the last item's end -> the caller returning.
+//   gapUs:      between one call's return and the next call's post (what the
+//               worker spin has to bridge; gapsInSpin of them were within it).
+struct Stats {
+  uint64_t calls = 0, serialCalls = 0, items = 0, participants = 0;
+  double wallUs = 0, overheadUs = 0, joinUs = 0;
+  double wakeUs = 0;
+  uint64_t wakeCount = 0;
+  double gapUs = 0;
+  uint64_t gapCount = 0, gapsInSpin = 0;
+};
+const Stats& GetStats();
+void ResetStats();
+
+// SANDVOX_POOL_SPIN_US (default 200, clamped to [0, 1000]): how long a worker
+// spins for the next job, and the caller for the join, before sleeping on a
+// condition variable. SANDVOX_POOL_LEGACY=1: no spin and the old join (wait
+// for every worker to check out), the in-binary before-arm.
+int SpinMicros();
+bool Legacy();
+
 }  // namespace workpool

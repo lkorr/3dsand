@@ -79,6 +79,7 @@
 #include "game/strokes.h"
 #include "game/workpool.h"
 #include "sim/trace_mark.h"
+#include "sim/pagetable.h"
 #include "gpu/passtimer.h"
 #include "measure/perfscope.h"
 #include "sim/scale.h"
@@ -2949,7 +2950,12 @@ struct BrawlSpawn {
   std::vector<int> defOf;   // per id, for attribution
   int refused = 0;
 };
-BrawlSpawn SpawnBrawl(Ctx& c, const Stage& st, int want) {
+// `variant` 0 is THE brawl (mob-cap64's single fight, mob-cap64-twice). A
+// variant > 0 is a different, equally deterministic fight from the same
+// fixture (mob-cap64's multi-fight measure, SANDVOX_MOBCAP_FIGHTS): the def
+// mix is rotated by `variant` along the ranks and every creature is nudged by
+// up to one voxel in x and z by a hash of (variant, k).
+BrawlSpawn SpawnBrawl(Ctx& c, const Stage& st, int want, int variant = 0) {
   BrawlSpawn b;
   // Missing defs are skipped (content moves), and the human is the floor.
   for (const char* n : {"human", "sentinel", "boilerman", "dryad", "brug",
@@ -2968,11 +2974,21 @@ BrawlSpawn SpawnBrawl(Ctx& c, const Stage& st, int want) {
     const int t = k & 1;                  // interleaved, so the mix is even
     const int slot = k >> 1;
     const int col = slot % kCols, rank = slot / kCols;
-    const int x = st.spot.x + (col - kCols / 2) * kPitch + 2;
-    const int z = st.spot.z + (t == 0 ? -1 : 1) * (9 + rank * kPitch);
+    int jx = 0, jz = 0;
+    if (variant > 0) {
+      uint64_t h = (uint64_t)variant * 0x9E3779B97F4A7C15ull + (uint64_t)k;
+      h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+      h = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+      h ^= h >> 31;
+      jx = (int)(h % 3) - 1;
+      jz = (int)((h >> 8) % 3) - 1;
+    }
+    const int x = st.spot.x + (col - kCols / 2) * kPitch + 2 + jx;
+    const int z = st.spot.z + (t == 0 ? -1 : 1) * (9 + rank * kPitch) + jz;
     const int y = World::TerrainHeight(x, z, kDefaultSeed) + 1;
     const bool zombie = t == 0 && b.zombieDef >= 0 && (slot % 4) == 3;
-    const int def = zombie ? b.zombieDef : b.mix[(size_t)(slot % b.mix.size())];
+    const int def = zombie ? b.zombieDef
+                           : b.mix[(size_t)((slot + variant) % (int)b.mix.size())];
     const uint64_t id = c.mobs.Spawn(def, {x, y, z});
     if (id == 0) {
       b.refused++;
@@ -3079,8 +3095,25 @@ BrawlDigest DigestBrawl(Ctx& c, const std::vector<uint64_t>& ids,
 // binary. The only perf THRESHOLD is mobCap64.maxMobMsMean, the mob side's
 // mean per tick, and it is generous on purpose: the gate's subject is
 // correctness, the number is the report.
-Status GateMobCap64(Ctx& c, std::string& detail) {
-  IdCounterScope idScope(c.mobs);
+//
+// THE MULTI-FIGHT MEASURE (fight64 round 4, package W). One 300-tick brawl is
+// chaotic: a combined tree's fight can carry twice the limp ragdolls of the
+// tree before it, so one fight's mean cannot rank two trees.
+// SANDVOX_MOBCAP_FIGHTS=<n> (or baseline mobCap64.fights; default 1, so a
+// --verify costs what it did) runs the brawl n times in one process: fight 0 is
+// the brawl above, fight k > 0 is SpawnBrawl variant k (the mix rotated, every
+// creature nudged a voxel), each from scratch with the id counter and Jolt's
+// ordinals reset as mob-cap64-twice does. Each fight prints its usual lines
+// under a "fight k/n" header, then "mob-cap64: fights xN <metric> <mean of the
+// fights' means> [<min> .. <max>]" per metric: the spread is the noise floor a
+// perf claim has to clear. With n > 1 the mobCap64.* observations are those
+// means.
+struct MobCapMetrics {
+  std::vector<std::pair<std::string, double>> v;
+  void Add(const std::string& k, double x) { v.emplace_back(k, x); }
+};
+Status MobCap64Fight(Ctx& c, std::string& detail, int fight, int fights,
+                     uint64_t idBase, MobCapMetrics& fm) {
   bool ok = true;
   int checks = 0;
   auto check = [&](bool cond, const std::string& what) {
@@ -3090,12 +3123,32 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       std::printf("mob-cap64: FAILED %s\n", what.c_str());
     }
   };
+  // Observations go to last_run.json directly for a single fight, and as the
+  // means across fights otherwise (GateMobCap64 below); every one is a metric.
+  auto RecordObserved = [&](const char* key, double v) {
+    if (fights <= 1) ::selftest::RecordObserved(key, v);
+    const char* dot = std::strchr(key, '.');
+    fm.Add(dot ? dot + 1 : key, v);
+  };
 
   Stage st = OpenStage(c);
   if (!st.ok) {
     detail = st.why;
     std::printf("mob-cap64: SKIP (%s)\n", detail.c_str());
     return Status::Skip;
+  }
+  if (fights > 1)
+    std::printf("mob-cap64: ---- fight %d/%d (variant %d) ----\n", fight + 1,
+                fights, fight);
+  if (fight > 0) {
+    // As mob-cap64-twice resets an arm: the ids, ordinals and creature ids a
+    // fresh process would hand out, and the per-tick inputs cleared.
+    c.mobs.SetNextIdCounter(idBase);
+    c.phys.ResetBirthOrdinals();
+    c.phys.ResetBodyIdHistory();
+    c.mobs.SetWeatherRain(0u);
+    c.mobs.SetRainSlope(0, 0);
+    c.mobs.SetDayPhase(0u);
   }
   MicroBodySet* mset = c.debris.MicroSet();
   check(mset != nullptr, "the debris system publishes a MicroBodySet");
@@ -3104,7 +3157,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   const uint32_t cap = MobSystem::MaxLiveMobs();
   const int want = std::clamp((int)BaselineNumber("mobCap64.count", (double)cap),
                               1, (int)cap);
-  BrawlSpawn bs = SpawnBrawl(c, st, want);
+  BrawlSpawn bs = SpawnBrawl(c, st, want, fight);
   std::vector<int>& mix = bs.mix;
   const int zombieDef = bs.zombieDef;
   std::vector<uint64_t>& ids = bs.ids;
@@ -3198,6 +3251,8 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   for (double& v : scopeAcc) v = 0;
   burnprof::Get().on = true;
   burnprof::Reset();
+  workpool::ResetStats();
+  PtCpuProfReset();
   const int ticks = (int)BaselineNumber("mobCap64.ticks", 300);
   const uint64_t starved0 = c.mobs.BleedStarved();
   const uint32_t contact0 = c.mobs.ContactHitsBilled();
@@ -3346,6 +3401,8 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
     std::printf("%s\n", s.c_str());
   }
   burnprof::EndTick(0);
+  const workpool::Stats pool = workpool::GetStats();
+  const PtCpuProfile ptProf = PtCpuProf();
   const burnprof::Profile prof = burnprof::Get();
   const std::string profReport = burnprof::Report();
   burnprof::Get().on = false;
@@ -3477,6 +3534,51 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       s += Format(" %s %.2f", kPerfScopeKeys[i], scopeAcc[i] / ticks);
     }
     std::printf("%s\n", s.c_str());
+    for (int i = 0; i < kPerfScopeCount; i++)
+      if (scopeAcc[i] > 0.0)
+        fm.Add(std::string("scope.") + kPerfScopeKeys[i], scopeAcc[i] / ticks);
+  }
+  {
+    // THE WORK POOL'S OWN COST (package W): per parallel call, wall minus the
+    // busiest participant's span. Scheduling only -- it moves no output.
+    const double tk = (double)std::max(1, ticks);
+    const double calls = (double)std::max<uint64_t>(1, pool.calls);
+    const double wakes = (double)std::max<uint64_t>(1, pool.wakeCount);
+    const double gaps = (double)std::max<uint64_t>(1, pool.gapCount);
+    std::printf("mob-cap64: work pool (%d threads, spin %d us%s): %.1f parallel "
+                "calls/tick (+%.1f serial), %.0f items/call, %.1f threads took "
+                "items/call; wall %.1f us/call, OVERHEAD %.1f us/call = %.3f "
+                "ms/tick (wake %.1f us/worker, join %.1f us/call); gap between "
+                "calls %.1f us mean, %.0f%% within the spin\n",
+                workpool::Threads(), workpool::SpinMicros(),
+                workpool::Legacy() ? ", LEGACY join" : "", (double)pool.calls / tk,
+                (double)pool.serialCalls / tk, (double)pool.items / calls,
+                (double)pool.participants / calls, pool.wallUs / calls,
+                pool.overheadUs / calls, pool.overheadUs / 1000.0 / tk,
+                pool.wakeUs / wakes, pool.joinUs / calls, pool.gapUs / gaps,
+                100.0 * (double)pool.gapsInSpin / gaps);
+    fm.Add("pool.callsPerTick", (double)pool.calls / tk);
+    fm.Add("pool.wallUsPerCall", pool.wallUs / calls);
+    fm.Add("pool.overheadUsPerCall", pool.overheadUs / calls);
+    fm.Add("pool.overheadMsPerTick", pool.overheadUs / 1000.0 / tk);
+    fm.Add("pool.wakeUs", pool.wakeUs / wakes);
+    fm.Add("pool.joinUs", pool.joinUs / calls);
+    // WHERE pageTableCpu GOES, step by step (PtCpuProfile).
+    const double pk = (double)std::max<uint64_t>(1, ptProf.ticks);
+    double sum = 0;
+    std::string s = "mob-cap64: pageTableCpu by step ms/tick:";
+    for (int p = 0; p < kPtpCount; p++) {
+      s += Format(" %s %.3f", PtCpuPhaseName(p), ptProf.ms[p] / pk);
+      sum += ptProf.ms[p];
+      fm.Add(std::string("pt.") + PtCpuPhaseName(p), ptProf.ms[p] / pk);
+    }
+    s += Format("; sum %.3f over %llu SubmitTicks; free probes %.1f chunks "
+                "submitted / %.1f harvested per tick", sum / pk,
+                (unsigned long long)ptProf.ticks,
+                (double)ptProf.probesSubmitted / pk,
+                (double)ptProf.probesHarvested / pk);
+    std::printf("%s\n", s.c_str());
+    fm.Add("pt.sum", sum / pk);
   }
   {
     // The shock solve's own denominators (rule 6: its ms wants them).
@@ -3528,6 +3630,12 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                    phWall[(int)Physics::StepPhase::SolveVelocity] / std::max(1, ticks));
   }
   std::printf("mob-cap64: burnprof %s\n", profReport.c_str());
+  for (int p = 0; p < burnprof::kCount; p++)
+    if (prof.tot[p] > 0) fm.Add(std::string("stage.") + burnprof::Name(p), ph(p));
+  fm.Add("aliveAtEnd", (double)alive);
+  fm.Add("debrisBodiesAtEnd", (double)c.debris.BodyCount());
+  fm.Add("deadRigsMean", sumDeadRigs / std::max(1, ticks));
+  fm.Add("manifoldsBodyBody", sumManDyn / std::max(1, ticks));
 
   RecordObserved("mobCap64.count", (double)ids.size());
   RecordObserved("mobCap64.tickMsMean", tMean);
@@ -3553,6 +3661,57 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                   mobMean, (unsigned long long)requests);
   std::printf("mob-cap64: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
   return ok ? Status::Pass : Status::Fail;
+}
+
+Status GateMobCap64(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const uint64_t idBase = c.mobs.NextIdCounter();
+  int fights = (int)BaselineNumber("mobCap64.fights", 1);
+  if (const char* e = std::getenv("SANDVOX_MOBCAP_FIGHTS")) fights = std::atoi(e);
+  fights = std::clamp(fights, 1, 16);
+  std::vector<MobCapMetrics> all;
+  Status worst = Status::Pass;
+  std::string details;
+  for (int f = 0; f < fights; f++) {
+    MobCapMetrics fm;
+    std::string d;
+    const Status s = MobCap64Fight(c, d, f, fights, idBase, fm);
+    if (s == Status::Skip) {
+      detail = d;
+      return s;
+    }
+    if (s == Status::Fail) worst = Status::Fail;
+    details += (f ? " | " : "") + d;
+    all.push_back(std::move(fm));
+  }
+  detail = details;
+  if (fights > 1) {
+    // Per metric, in the first fight's order: the mean of the fights' means
+    // and the spread (min..max of the fights' means). A metric a fight did not
+    // report (a CPU scope that never ran) counts as 0 there.
+    std::printf("mob-cap64: ==== across %d fights: mean of each fight's mean "
+                "[min .. max] ====\n", fights);
+    for (const auto& kv : all[0].v) {
+      double sum = 0, lo = 1e300, hi = -1e300;
+      for (const MobCapMetrics& m : all) {
+        double x = 0;
+        for (const auto& kv2 : m.v)
+          if (kv2.first == kv.first) {
+            x = kv2.second;
+            break;
+          }
+        sum += x;
+        lo = std::min(lo, x);
+        hi = std::max(hi, x);
+      }
+      const double mean = sum / fights;
+      std::printf("mob-cap64: fights x%d %-28s %10.3f [%.3f .. %.3f]\n", fights,
+                  kv.first.c_str(), mean, lo, hi);
+      if (kv.first.find('.') == std::string::npos)
+        RecordObserved(("mobCap64." + kv.first).c_str(), mean);
+    }
+  }
+  return worst;
 }
 
 // =============================================================================

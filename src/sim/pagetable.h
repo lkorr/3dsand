@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -82,6 +83,26 @@ class SlotSet {
   // unions that set straight back in — see TightenFromSnapshot.)
   void IntersectWith(const SlotSet& other);
   void UnionWith(const SlotSet& other);
+
+  // WHOLE-WORD ACCESS (fight64 round 4, package W). A set of thousands of
+  // members -- the particle flight shell seeds every chunk holding matter --
+  // is cheaper to combine 64 slots at a time than a member at a time. Members
+  // added this way are appended in SLOT order, not the order a member loop
+  // would have used; nothing reads the member order as meaning (the page
+  // table is derived data, and which page a slot gets is not observable).
+  static constexpr size_t kWords = (kNumSlots + 63) / 64;
+  const uint64_t* Words() const { return bits_.data(); }
+  // this <- this u (word k's bits), new members appended in bit order.
+  void OrWord(size_t k, uint64_t bits) {
+    uint64_t fresh = bits & ~bits_[k];
+    if (!fresh) return;
+    bits_[k] |= fresh;
+    while (fresh) {
+      const unsigned long b = (unsigned long)std::countr_zero(fresh);
+      members_.push_back((uint32_t)(k * 64 + b));
+      fresh &= fresh - 1;
+    }
+  }
 
  private:
   std::vector<uint64_t> bits_;
@@ -262,6 +283,44 @@ struct PageCensus {
 // "exit"). Shared by SANDVOX_PT_DEBUG's periodic dump and by --frames' exit
 // summary so the two can never disagree about the shape.
 void PrintPageCensus(const PageCensus& c, const char* label);
+
+// WHERE `pageTableCpu` GOES (fight64 round 4, package W). The PerfScope is one
+// number for a dozen steps; this splits it by step, accumulated in ms since the
+// last PtCpuProfReset(). Main-thread only (SubmitTick is). Two clock reads per
+// step per tick -- always on, so a gate reads it without a flag.
+enum PtCpuPhase : int {
+  kPtpBegin,        // BeginTick + the AddOp* contributors
+  kPtpSpawnRing,    // UpdateSpawnRing
+  kPtpFluid,        // UpdateFluidChunks
+  kPtpTighten,      // TightenFromSnapshot
+  kPtpShell,        // ApplyParticleShell
+  kPtpPropagate,    // Materialize: step (1) propagate + C-ring + the unions
+  kPtpMatSet,       // Materialize: the hasMatter filter + the dilated set + reach
+  kPtpAlloc,        // Materialize: allocation + fills + the table flush
+  kPtpOccScan,      // ConsumeOccupancy: the streak scan
+  kPtpHarvest,      // ConsumeOccupancy: last tick's probe harvested + direct frees
+  kPtpSubmit,       // ConsumeOccupancy: this tick's probe submitted
+  kPtpCensus,       // ConsumeOccupancy: RunCensus (every 8th tick)
+  kPtpRetire,       // RetirePages (+ the audit when enabled)
+  kPtpJitterUpload, // UploadJitterFills
+  kPtpCount
+};
+struct PtCpuProfile {
+  double ms[kPtpCount] = {};
+  uint64_t ticks = 0;
+  uint64_t probesSubmitted = 0, probesHarvested = 0;   // chunks, 16 KiB each
+};
+PtCpuProfile& PtCpuProf();
+inline void PtCpuProfReset() { PtCpuProf() = PtCpuProfile{}; }
+const char* PtCpuPhaseName(int phase);
+// Adds the time since the last Lap (or construction) to `phase`.
+class PtCpuClock {
+ public:
+  PtCpuClock();
+  void Lap(int phase);
+ private:
+  int64_t t_;
+};
 
 class PageTable {
  public:
