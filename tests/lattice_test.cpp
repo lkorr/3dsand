@@ -14,8 +14,11 @@
 // was bounded at +-120 elsewhere; at 8x skin that assumption stops holding, and
 // a silent wrap would teleport part of a limb to the opposite side of the body.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "phys/lattice.h"
@@ -393,9 +396,67 @@ void TestFastPathsMatchReference() {
   }
 }
 
+// ---- `lattice_test --bench`: the fast paths against the reference, timed -----
+// A torso-sized skin (an ellipsoid ~36 x 20 x 12 skin cells, two materials,
+// a coat here and there) at ratio 2, the brawl's common case. Not a check:
+// a number to iterate the fast paths against without booting the engine.
+void Bench() {
+  std::vector<PrefabVoxel> skin;
+  uint32_t st = 777u;
+  for (int z = 0; z < 12; z++)
+    for (int y = 0; y < 36; y++)
+      for (int x = 0; x < 20; x++) {
+        const float dx = (x - 9.5f) / 10.0f, dy = (y - 17.5f) / 18.0f,
+                    dz = (z - 5.5f) / 6.0f;
+        if (dx * dx + dy * dy + dz * dz > 1.0f) continue;
+        st = st * 1664525u + 1013904223u;
+        PrefabVoxel v{(int16_t)x, (int16_t)y, (int16_t)z,
+                      (uint16_t)(dx * dx + dz * dz < 0.3f ? 2 : 1)};
+        // Art and coats come in patches, not per-voxel noise: a colour band
+        // and a smear down one side, with a little speckle in the smear.
+        v.color = (uint8_t)((y / 12) % 2);
+        v.stain = (uint16_t)((x < 5 && (st >> 8) % 3 != 0) ? 0x3005u : 0u);
+        skin.push_back(v);
+      }
+  const int iters = 4000;
+  auto time = [&](auto&& fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t sink = 0;
+    for (int i = 0; i < iters; i++) sink += fn();
+    const double us = std::chrono::duration<double, std::micro>(
+                          std::chrono::steady_clock::now() - t0).count();
+    return std::make_pair(us / iters, sink);
+  };
+  bool o = false;
+  const auto a = time([&] { return DownsampleSkin(skin, 2, &o).size(); });
+  const auto b = time([&] { return RefDownsample(skin, 2, &o).size(); });
+  std::printf("bench: %zu skin voxels; DownsampleSkin %.2f us, reference %.2f us\n",
+              skin.size(), a.first, b.first);
+  SpallParams sp;
+  sp.centre = Vec3{9.5f, 17.5f, 0.5f};
+  sp.radius = 6.0f;
+  sp.strength = 0.8f;
+  sp.rounds = 2;
+  sp.seed = 99;
+  const auto c = time([&] {
+    std::vector<PrefabVoxel> s = skin;
+    return SpallGrow(s, sp, [](const PrefabVoxel&) {});
+  });
+  const auto d = time([&] {
+    std::vector<PrefabVoxel> s = skin;
+    return RefSpall(s, sp, [](const PrefabVoxel&) {});
+  });
+  std::printf("bench: SpallGrow %.2f us, reference %.2f us (incl. a copy)\n",
+              c.first, d.first);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc > 1 && std::string(argv[1]) == "--bench") {
+    Bench();
+    return 0;
+  }
   TestFastPathsMatchReference();
   TestSolid();
   TestMajorityFill();
