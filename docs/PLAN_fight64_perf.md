@@ -690,12 +690,21 @@ What's left, by stage:
 - woundStain 0.46.
 
 Open owner decisions:
-- `ragdoll-dress` fails since L: a 200-voxel fall stretches a limp limb's
-  joints 4.39 voxels against a 4.00 cap. The options are written in
-  `tests/baseline.json`:
-  - raise the cap;
-  - keep box shapes on a fast-falling limp limb;
-  - drop limp hulls.
+- ~~`ragdoll-dress` fails since L~~ DECIDED 2026-10-05: **drop limp hulls**
+  ("keep limbs compound so they don't stretch out and get janky"). A limp
+  ragdoll keeps its box compounds by default; `SANDVOX_LIMP_HULL=1` is the
+  round-4 L arm. Living limbs still meet loose bodies as hulls (L item 3 /
+  DESIGN.md item 2), and corpses keep package P's hulls.
+  - What the brawl gives back, from L's own measurement (DESIGN.md table,
+    "old" vs "limp hull" arms, `SANDVOX_LIVE_SIMHULL=0` in both): rig-live
+    vs rig-limp manifolds 265 -> 73 a step, limp limbs linear-casting
+    25.5 -> 5.2 a tick, Jolt Update 3.62 -> 2.13 ms. That is the most the
+    decision can cost; with living-limb sim hulls on, L's "both" arm had
+    rig-live vs rig-limp at 11 manifolds, so the real loss on the round-4
+    total (Jolt Update 1.52 ms, n=3) is likely under ~1.5 ms a tick
+    (inferred from L's arms, not measured).
+  - NOT re-measured: no 64-brawl run was made for this change (the round-4
+    numbers above are with limp hulls ON).
 - The B, C, F and L trade-offs, as named in DESIGN.md.
 - Parallel carves across creatures. That changes the fight, because later
   probes in the same tick meet an earlier carve's rebuilt body.

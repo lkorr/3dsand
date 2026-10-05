@@ -3945,17 +3945,74 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   const int nLimbs = (int)mobs.Defs()[wizDef].limbs.size();
   const int rootLimb = mobs.Defs()[wizDef].rootLimb;
 
+  // ---- THE CLOTHED FIXTURE (2026-10-05) -----------------------------------
+  //
+  // The cloth subchecks were written for wizard.vox, a robed figure with cloth
+  // on every limb. The wizard was deleted (2026-09-19) and the fixture became
+  // the bare `human`, whose only garment is the linen-like undercloth shorts --
+  // so 'cloth vs flesh' and 'burn leaves char' measured nothing (cloth0 = 0,
+  // 0 cloth lit). The wizard's wardrobe still ships, as WORN items: the stock
+  // `hood`, `robe` and `pants` are `cloth` (scripts/gen_stock_armor.py, the
+  // same material the wizard's robe was), and together they cover the head,
+  // both arms, the torso, the hips and both legs -- every limb but the hands
+  // and feet. Worn the way the game dresses anybody (Mob::WearItem), each
+  // covered limb gets a SHELL slot of its own, appended past the def's limbs
+  // and hosted on the limb it covers (MobLimb::wornHost), so every census
+  // below walks the creature's live slot count, not the def's.
+  //
+  // Dressed: idle (D), cloth vs flesh (B/C/F), burn leaves char (H), heat
+  // across a joint (J). Left bare on purpose: limbs sleep (K), corpse burns
+  // (G) and acid (E) make no claim about cloth, and K's sleep census is over
+  // the body's own limbs.
+  const char* const kWardrobe[] = {"hood", "robe", "pants"};
+  auto dress = [&](uint64_t id) -> int {
+    Mob* m = mobs.FindMobById(id);
+    if (m == nullptr) return 0;
+    int worn = 0;
+    for (const char* name : kWardrobe) {
+      const ItemDef* it = c.items.Named(name);
+      if (it == nullptr || !ItemKindIsWorn(it->kind)) continue;
+      int home = -1;
+      for (int s = 0; s < kEquipSlotCount; s++)
+        if (EquipSlotAccepts(s, it->kind)) { home = s; break; }
+      if (home >= 0 && m->WearItem(it, home)) worn++;
+    }
+    return worn;
+  };
+  // Every rig slot the creature has NOW: its body plus every worn shell.
+  auto slotCount = [&](uint64_t id) {
+    const Mob* m = mobs.FindMobById(id);
+    return m != nullptr ? m->LimbCount() : nLimbs;
+  };
+  // A body limb AND every shell worn over it, by the limb's def name: the
+  // unit a claim about "the hips" or "the thigh" means on a dressed body.
+  auto limbAndShells = [&](uint64_t id, const std::string& limbName) {
+    std::vector<int> out;
+    const Mob* m = mobs.FindMobById(id);
+    if (m == nullptr) return out;
+    int body = -1;
+    for (int li = 0; li < nLimbs && li < m->LimbCount(); li++)
+      if (m->LimbDefAt(li).name == limbName) body = li;
+    if (body < 0) return out;
+    out.push_back(body);
+    for (int s = nLimbs; s < m->LimbCount(); s++)
+      if (m->WornHostOf(s) == body) out.push_back(s);
+    return out;
+  };
+
   // Whole-creature material census. Per-limb counts are the honest unit, but
   // the interesting facts are about the CREATURE, and which limb the fire
   // happened to reach first is not a property worth pinning a test to.
   auto census = [&](uint64_t id, uint32_t mat) {
     uint32_t n = 0;
-    for (int li = 0; li < nLimbs; li++) n += mobs.LimbMaterialCount(id, li, mat);
+    const int ns = slotCount(id);
+    for (int li = 0; li < ns; li++) n += mobs.LimbMaterialCount(id, li, mat);
     return n;
   };
   auto burning = [&](uint64_t id) {
     uint32_t n = 0;
-    for (int li = 0; li < nLimbs; li++) n += mobs.LimbBurningCount(id, li);
+    const int ns = slotCount(id);
+    for (int li = 0; li < ns; li++) n += mobs.LimbBurningCount(id, li);
     return n;
   };
 
@@ -4072,6 +4129,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
     const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     if (id) {
+      dress(id);
       const uint32_t cloth0 = census(id, mCloth), skin0 = census(id, mSkin);
       const uint32_t fireOps0 = mobFireOps;
       for (int i = 0; i < 30; i++) burnTick(id, 0, 0);
@@ -4105,7 +4163,12 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       detail = "spawn refused";
       return Status::Fail;
     }
+    const int worn = dress(id);
     const uint32_t cloth0 = census(id, mCloth), skin0 = census(id, mSkin);
+    std::printf("  clothed fixture: %d of %zu garments worn (%s), %d rig "
+                "slots, %u cloth over %u skin\n",
+                worn, sizeof(kWardrobe) / sizeof(kWardrobe[0]),
+                "hood robe pants", slotCount(id), cloth0, skin0);
     const uint32_t fireOps0 = mobFireOps;
     for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto the ground
 
@@ -4115,7 +4178,16 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // 100%" and proves nothing. What "cloth catches more readily" actually
     // means is a RATE, so the measurement is the tick each material first
     // halved on, taken while the creature is still there to measure.
+    //
+    // "HALVED" IS NOW A FRACTION FROM tests/baseline.json (2026-10-05,
+    // mobBurnClothLeadFrac). The wizard's robe was a thin layer; the stock
+    // hood + robe + pants are 29,752 cloth voxels over 11,524 skin, and in the
+    // same 150-tick blaze they lost 46% against the skin's 2% -- the claim
+    // (cloth goes first, by a margin) held by a mile while "cloth halved"
+    // never fired. The fraction is the clock's hand, not the claim; the claim
+    // is still the ORDER plus the remaining fractions.
     const int kBlaze = 150, kNever = 1 << 20;
+    const double leadFrac = BaselineNumber("mobBurnClothLeadFrac", 0.5);
     int clothHalf = kNever, skinHalf = kNever, aliveTicks = 0;
     uint32_t peakFront = 0, peakAlight = 0, peakCharred = 0;
     uint32_t lastCloth = cloth0, lastSkin = skin0;
@@ -4132,8 +4204,12 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       peakFront = std::max(peakFront, burning(id));
       peakAlight = std::max(peakAlight, alight);
       peakCharred = std::max(peakCharred, charred);
-      if (clothHalf == kNever && cloth0 && cl * 2 < cloth0) clothHalf = i;
-      if (skinHalf == kNever && skin0 && sk * 2 < skin0) skinHalf = i;
+      if (clothHalf == kNever && cloth0 &&
+          (double)(cloth0 - cl) > leadFrac * (double)cloth0)
+        clothHalf = i;
+      if (skinHalf == kNever && skin0 &&
+          (double)(skin0 - sk) > leadFrac * (double)skin0)
+        skinHalf = i;
     }
     const uint32_t emitted = mobFireOps - fireOps0;
 
@@ -4147,11 +4223,13 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     const bool bOk = cloth0 > 0 && skin0 > 0 && clothHalf < kNever &&
                      clothHalf < skinHalf && clothLost > skinLost;
     std::printf(
-        "  cloth vs flesh: %s (cloth halved at t+%d, skin at t+%s; %.0f%% vs "
-        "%.0f%% gone after %d ticks)\n",
-        bOk ? "PASS" : "FAIL", clothHalf,
+        "  cloth vs flesh: %s (cloth lost %.0f%% at t+%s, skin at t+%s; %.0f%% "
+        "vs %.0f%% gone after %d ticks)\n",
+        bOk ? "PASS" : "FAIL", 100.0 * leadFrac,
+        clothHalf == kNever ? "never" : std::to_string(clothHalf).c_str(),
         skinHalf == kNever ? "never" : std::to_string(skinHalf).c_str(),
         clothLost * 100.0f, skinLost * 100.0f, aliveTicks);
+    RecordObserved("mobBurnClothLostPctObserved", 100.0 * clothLost);
     ok = ok && bOk;
 
     // The chain is MATERIAL identity, so a state that never appears is a state
@@ -4190,18 +4268,41 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // 2026-09-24) a creature that dies in the settle keeps its burning limbs in
     // this census. The claim is that the burn ENDS: keep giving it quiet ticks
     // while the front strictly falls, and fail on a plateau or the cap.
+    //
+    // PROGRESS IS THE FRONT FALLING *OR THE FUEL FALLING* (2026-10-05, the
+    // clothed fixture). A dressed human carries ~30k cloth voxels, and with
+    // the blaze taken away the fire keeps TRAVELLING over the robe for a long
+    // time: measured, the front read 9,627 at its peak and 5,478 after 600
+    // ticks with the front flat across a round -- a fire still eating its way
+    // across fuel, which terminates, read as a plateau. A relight loop at gain
+    // 1 is the opposite case: the front holds while NOTHING NEW is consumed
+    // (char relighting into char). So a round counts as progress when either
+    // the front or the unburnt fuel (cloth / linen / skin / flesh / muscle)
+    // strictly fell, and the cap is raised to match a robe's worth of burning.
+    // Printed per round, so a failure says which of the two stalled.
     {
-      const int kRound = 200, kRounds = 8;
-      uint32_t prev = burning(id);
+      const int kRound = 200, kRounds = 24;
+      auto fuel = [&]() {
+        return census(id, mCloth) + census(id, mUnder) + census(id, mSkin) +
+               census(id, mFlesh) + census(id, mMuscle);
+      };
+      uint32_t prev = burning(id), prevFuel = fuel();
+      std::string trail;
       for (int rd = 0; rd < kRounds && prev > 0; rd++) {
         for (int i = 0; i < kRound && burning(id) > 0; i++) {
           burnTick(id, 0, 0);
           settleTicks++;
         }
-        const uint32_t now = burning(id);
-        if (now >= prev) break;  // plateau: a relight loop at gain 1
+        const uint32_t now = burning(id), nowFuel = fuel();
+        if (trail.size() < 400)
+          trail += Format(" %u/%u", now, nowFuel);
+        // plateau: neither the front nor the fuel moved down
+        if (now >= prev && nowFuel >= prevFuel) break;
         prev = now;
+        prevFuel = nowFuel;
       }
+      std::printf("    settle rounds (front/fuel per %d ticks):%s\n", kRound,
+                  trail.c_str());
     }
     const uint32_t finalFront = burning(id);
     // The mob may already have burned to death, in which case the front is
@@ -4443,13 +4544,49 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     uint32_t charVisits = 0, charSlept = 0, cleanVisits = 0, cleanSlept = 0;
     std::vector<uint8_t> isChar(nLimbs, 0);
     for (int li : charred) isChar[li] = 1;
+    // ATTRIBUTION OVER THE WINDOW (2026-10-05, CLAUDE.md rule 6): a fraction
+    // just under the floor is a bare count. Every awake visit's hold / miss
+    // bits are tallied (BodyBurnState::kHold* / kMiss*), and which limbs and
+    // which ticks they were, so "88% asleep" says what woke the walk.
+    uint32_t holdHist[8] = {}, missHist[8] = {};
+    std::vector<uint32_t> awakeOf(nLimbs, 0);
+    std::string awakeTicks;
     for (int i = 0; i < kSleepWindow && mobs.IsAlive(id); i++) {
       burnTick(id, 0, 0);
+      int awakeNow = 0;
       for (int li = 0; li < nLimbs; li++) {
-        const bool s = mobs.LimbBurnStateOf(id, li).asleep;
+        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
+        const bool s = pr.asleep;
         if (isChar[li]) { charVisits++; charSlept += s ? 1u : 0u; }
         else { cleanVisits++; cleanSlept += s ? 1u : 0u; }
+        if (s) continue;
+        awakeOf[li]++;
+        awakeNow++;
+        for (int b = 0; b < 8; b++) {
+          if (pr.holdBy & (1u << b)) holdHist[b]++;
+          if (pr.sleepMiss & (1u << b)) missHist[b]++;
+        }
       }
+      if (awakeNow > 0 && awakeTicks.size() < 300)
+        awakeTicks += Format(" t%d:%d", i, awakeNow);
+    }
+    {
+      static const char* const kHoldN[] = {"contact", "rain", "wet",
+                                           "splatter"};
+      static const char* const kMissN[] = {"busy", "index", "uncached", "pose",
+                                           "box", "world", "first"};
+      std::string hs, ms, ls;
+      for (int b = 0; b < 4; b++)
+        if (holdHist[b]) hs += Format(" %s %u", kHoldN[b], holdHist[b]);
+      for (int b = 0; b < 7; b++)
+        if (missHist[b]) ms += Format(" %s %u", kMissN[b], missHist[b]);
+      for (int li = 0; li < nLimbs; li++)
+        if (awakeOf[li])
+          ls += Format(" %s %u", mobs.Defs()[wizDef].limbs[li].name.c_str(),
+                       awakeOf[li]);
+      std::printf("    sleep window, awake visits: holdBy[%s ] miss[%s ] "
+                  "limbs[%s ] ticks[%s ]\n",
+                  hs.c_str(), ms.c_str(), ls.c_str(), awakeTicks.c_str());
     }
     const KCensus k = kCensus(true);
     const double sleepMin = BaselineNumber("mobBurnSleepFracMin", 0.9);
@@ -4524,6 +4661,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       detail = "spawn refused";
       return Status::Fail;
     }
+    dress(id);
     for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto the ground
 
     // NO WORLD FIRE. The soak box the other subtests use keeps relighting the
@@ -4531,11 +4669,12 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // the index is rebuilt every tick and the frozen-material case cannot
     // occur. Igniting a patch and then leaving the creature alone is the whole
     // point: this is the "you walked out of the fire" case.
-    int armLimb = -1;
-    for (int li = 0; li < nLimbs; li++)
-      if (mobs.Defs()[wizDef].limbs[li].name == "armU.L") armLimb = li;
-    const uint32_t lit =
-        armLimb >= 0 ? mobs.IgniteLimb(id, armLimb, 60u, mCloth) : 0u;
+    //
+    // THE SLEEVE, on a dressed body: the cloth over the left upper arm is the
+    // robe's shell slot hosted on armU.L, not armU.L itself (2026-10-05).
+    uint32_t lit = 0;
+    for (int slot : limbAndShells(id, "armU.L"))
+      if (lit < 60u) lit += mobs.IgniteLimb(id, slot, 60u - lit, mCloth);
 
     // Split by material, because "13 voxels still alight" is a bare count and
     // a bare count buys one hypothesis per run (CLAUDE.md rule 6). WHICH
@@ -4705,27 +4844,49 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   // the DIFFERENCE. Both arms are the same seed, the same rig, the same
   // ignition and the same tick count, so nothing else can account for it.
   //
+  // THE CLAIM IS AN EXCESS OVER THE CONTROL, NOT A MULTIPLE OF IT (2026-10-05).
+  // It used to be "the live arm touched at least 4x the control + 8", which
+  // assumed the control was ~0 -- true when the only other path to a thigh was
+  // rising fire gas (measured 0 of 558). Since 2026-09-04 isolated solids fall
+  // (soloSolid, sim_step.wgsl) and EMBER is a solid, so embers dropping off the
+  // burning hips land on the thighs in BOTH arms (the control measured 94 of
+  // 558): heat arriving by falling, not through the joint. The owner chose to
+  // keep embers falling, and no engine mechanic is changed here to keep a gate
+  // green. What the falling heat does is the same in both arms to first order
+  // -- it is the control's whole content -- so it is subtracted, and the claim
+  // is that cross-limb heat ADDS at least mobBurnCrossExcessPctMin percent of
+  // the thigh (tests/baseline.json) on top of everything the grid did. It
+  // still fails on the bug it exists for: with the crossing dead, the two arms
+  // are the same simulation and the excess is exactly 0.
+  //
   // NO WORLD FIRE AT ALL. The soak box the earlier subtests use would light
   // the legs directly and there would be nothing left to measure; the whole
   // point is a fire that starts on ONE limb and has to travel.
+  //
+  // ON THE CLOTHED FIXTURE: the source is the hips AND the robe shell worn over
+  // them; the measure is each thigh AND the pants shell worn over it
+  // (limbAndShells). Worn shells are rig slots and take part in the crossing
+  // like any limb (CrossHeatCell's limb mask is over slots).
   //
   // The knob is read LIVE by the burn pass, not folded in at load like its
   // neighbour burnDurationPct, so flipping CurrentTuning between the arms is
   // enough -- no material recompile, no second binary.
   {
-    int hipLimb = -1;
-    std::vector<int> legLimbs;
-    for (int li = 0; li < nLimbs; li++) {
-      const std::string& n = mobs.Defs()[wizDef].limbs[li].name;
-      if (n == "hips") hipLimb = li;
-      // The thighs ONLY. A foot is two joints away, so including it would
-      // measure how far the fire travels rather than whether it crosses at
-      // all, and would fail for a reason the differential cannot name.
-      if (n == "legU.L" || n == "legU.R") legLimbs.push_back(li);
-    }
-    if (hipLimb < 0 || legLimbs.empty()) {
-      std::printf("  heat across a joint: FAIL (rig has no hips/legU.* to "
-                  "measure; found %d limbs)\n", nLimbs);
+    bool rigOk = false;
+    for (int li = 0; li < nLimbs; li++)
+      if (mobs.Defs()[wizDef].limbs[li].name == "hips") rigOk = true;
+    // The thighs ONLY. A foot is two joints away, so including it would
+    // measure how far the fire travels rather than whether it crosses at all,
+    // and would fail for a reason the differential cannot name.
+    auto legSlots = [&](uint64_t id) {
+      std::vector<int> s = limbAndShells(id, "legU.L");
+      const std::vector<int> r = limbAndShells(id, "legU.R");
+      s.insert(s.end(), r.begin(), r.end());
+      return s;
+    };
+    if (!rigOk) {
+      std::printf("  heat across a joint: FAIL (rig has no hips to measure; "
+                  "found %d limbs)\n", nLimbs);
       std::fflush(stdout);
       ok = false;
     } else {
@@ -4733,18 +4894,26 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       // Counting what is LEFT rather than what appeared is what makes the
       // measure blind to which way the chain went -- cloth to cloth_burning,
       // skin to flesh_cooked, or a voxel burnt clean away all count the same,
-      // and a future material in the chain needs no edit here.
-      auto legRaw = [&](uint64_t id) {
-        uint32_t n = 0;
-        for (int li : legLimbs)
-          n += mobs.LimbMaterialCount(id, li, mCloth) +
-               mobs.LimbMaterialCount(id, li, mSkin) +
-               mobs.LimbMaterialCount(id, li, mUnder);
+      // and a future material in the chain needs no edit here. Split into the
+      // thigh's own body and the shells over it, for attribution.
+      auto rawOf = [&](uint64_t id, int slot) {
+        return mobs.LimbMaterialCount(id, slot, mCloth) +
+               mobs.LimbMaterialCount(id, slot, mSkin) +
+               mobs.LimbMaterialCount(id, slot, mUnder);
+      };
+      auto legRaw = [&](uint64_t id, uint32_t* bodyOut = nullptr) {
+        uint32_t n = 0, body = 0;
+        for (int li : legSlots(id)) {
+          const uint32_t r = rawOf(id, li);
+          n += r;
+          if (li < nLimbs) body += r;
+        }
+        if (bodyOut) *bodyOut = body;
         return n;
       };
       auto legAlight = [&](uint64_t id) {
         uint32_t n = 0;
-        for (int li : legLimbs) n += mobs.LimbBurningCount(id, li);
+        for (int li : legSlots(id)) n += mobs.LimbBurningCount(id, li);
         return n;
       };
 
@@ -4754,16 +4923,16 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       // not a fire a thigh can catch from at the shipped spread rate: 120 lit
       // cloth voxels each burn out in ~50 ticks and light well under one
       // neighbour apiece on the way, so the source is gone before the joint
-      // has had many rolls. Measured that way at spreadPct 12: 2 thigh voxels
-      // touched against the control arm's 5, i.e. pure noise. Re-lighting the
-      // hips on a fixed cadence models what a creature actually on fire looks
-      // like -- something keeps the torso burning -- and holds the SOURCE
-      // constant so the thing being measured is the CROSSING. Applied
-      // identically in both arms, so it cannot manufacture the differential.
+      // has had many rolls. Re-lighting the hips on a fixed cadence models
+      // what a creature actually on fire looks like -- something keeps the
+      // torso burning -- and holds the SOURCE constant so the thing being
+      // measured is the CROSSING. Applied identically in both arms, so it
+      // cannot manufacture the differential.
       const int kCrossTicks = 300;
       const int kRelight = 30;
       struct Arm {
         uint32_t touched = 0, alight = 0, lit = 0, raw0 = 0;
+        uint32_t bodyTouched = 0, body0 = 0;
         uint32_t cells = 0, faces = 0, scaled = 0;
       };
       Arm arms[2];
@@ -4773,12 +4942,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
         t.combustion.crossLimbPct = pcts[a];
         // THE DEATH KNOT IS PARKED, the same way the player immersion below
         // parks it and for the same reason: this fixture holds a fire on the
-        // hips for three hundred ticks and the wizard dies of it, at which
-        // point the mob is gone and every per-limb census reads zero. Both
-        // arms then scored "all 558 thigh voxels touched" and the differential
-        // said 1x -- a measurement of the corpse, not of the crossing. Death
-        // by burns has its own gate (`burn-cap`); this one needs the body to
-        // stay to be counted.
+        // hips for three hundred ticks and the creature dies of it, at which
+        // point every per-limb census reads zero. Death by burns has its own
+        // gate (`burn-cap`); this one needs the body to stay to be counted.
         t.gore.burnDeathFraction = 1.0f;
         SetCurrentTuning(t);
         debris.Reset();
@@ -4790,32 +4956,43 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
         pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
         const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
         if (!id) continue;
+        dress(id);
         for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto ground
-        arms[a].raw0 = legRaw(id);
-        // Light the HIPS and nothing else. Cloth first because skin cannot be
-        // lit directly at all -- its rule products (flesh_cooked) carry no
-        // tag:hot, so IgnitedForm refuses it, which is the sear being a colour
-        // change rather than combustion.
-        arms[a].lit = mobs.IgniteLimb(id, hipLimb, 120u, mCloth);
-        if (arms[a].lit == 0) arms[a].lit = mobs.IgniteLimb(id, hipLimb, 120u);
+        arms[a].raw0 = legRaw(id, &arms[a].body0);
+        const std::vector<int> src = limbAndShells(id, "hips");
+        // Light the HIPS and nothing else: the cloth over them (the robe's
+        // hips shell) first, because skin cannot be lit directly at all --
+        // its rule products (flesh_cooked) carry no tag:hot, so IgnitedForm
+        // refuses it, which is the sear being a colour change rather than
+        // combustion. Anything ignitable on the hips if no cloth took.
+        auto lightHips = [&](bool anyFallback) {
+          uint32_t n = 0;
+          for (int slot : src)
+            if (n < 120u) n += mobs.IgniteLimb(id, slot, 120u - n, mCloth);
+          if (n == 0 && anyFallback && !src.empty())
+            n = mobs.IgniteLimb(id, src[0], 120u);
+          return n;
+        };
+        arms[a].lit = lightHips(true);
         mobs.ResetBurnStats();
         // SAMPLED EVERY TICK AND KEPT AT ITS MINIMUM, never read at the end.
-        // With the knot parked the creature should survive, but "should" is
-        // not a thing to build a measurement on: if it dies anyway the census
-        // goes to zero and an end-state read reports the maximum possible
-        // score for the worst possible reason. The most-burnt state actually
-        // observed while the body was there to observe is the honest number,
-        // and it is the same reasoning the B subtest gives for sampling the
-        // halving tick rather than the end state.
-        uint32_t peakAlight = 0, minRaw = arms[a].raw0;
+        // If the creature dies anyway the census goes to zero and an end-state
+        // read reports the maximum possible score for the worst possible
+        // reason. The most-burnt state observed while the body was there is
+        // the honest number (the B subtest samples its halving tick likewise).
+        uint32_t peakAlight = 0, minRaw = arms[a].raw0, minBody = arms[a].body0;
         for (int i = 0; i < kCrossTicks; i++) {
-          if (i % kRelight == 0) mobs.IgniteLimb(id, hipLimb, 120u, mCloth);
+          if (i % kRelight == 0) lightHips(false);
           burnTick(id, 0, 0);
           if (!mobs.IsAlive(id)) break;
           peakAlight = std::max(peakAlight, legAlight(id));
-          minRaw = std::min(minRaw, legRaw(id));
+          uint32_t body = 0;
+          minRaw = std::min(minRaw, legRaw(id, &body));
+          minBody = std::min(minBody, body);
         }
         arms[a].touched = arms[a].raw0 > minRaw ? arms[a].raw0 - minRaw : 0u;
+        arms[a].bodyTouched =
+            arms[a].body0 > minBody ? arms[a].body0 - minBody : 0u;
         arms[a].alight = peakAlight;
         const MobSystem::BurnStats& bs = mobs.Burn();
         arms[a].cells = bs.crossCells;
@@ -4826,47 +5003,38 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       mobs.Reset();
       debris.Reset();
 
-      // The claim is the DIFFERENCE, and it is stated as a multiple rather
-      // than as an absolute so it does not have to be retuned every time a
-      // combustion number moves. The control arm is allowed to be non-zero:
-      // the hips still emit fire into the grid and a little of it can drift
-      // back onto a thigh, which is the very path that was too weak to matter
-      // and is the reason this feature exists.
       // A DIFFERENTIAL IS ONLY MEANINGFUL WHILE THE CONTROL IS A CONTROL.
       //
-      // The control arm is "the old behaviour": the only heat that reaches a
-      // thigh is the grid's, through the flame the hips emit. At the authored
-      // spread rate that path is far too weak to matter, which is the entire
-      // owner report -- it measured 0 of 558. But combustion.spreadPct is a
-      // live knob with a range up to 400%, and at the top of it the ordinary
-      // grid path is fast enough to burn the legs off by itself: measured at
-      // 400%, the control arm took 442 of 558 and the differential collapsed
-      // to 1x. That is not the crossing failing, it is the experiment losing
-      // its control, and reporting it as a failed assertion would be a lie
-      // about which of the two the run found.
-      //
-      // So it is reported as UNMEASURABLE and the subtest declines to assert,
-      // loudly and with the number that made it so. It still FAILS in the case
-      // that matters -- a control that stays near zero while the live arm does
-      // nothing is exactly the bug, and no setting of any knob hides that.
+      // At the top of combustion.spreadPct's range the ordinary grid path is
+      // fast enough to burn the legs off by itself (measured at 400%: the
+      // control took 442 of 558). That is the experiment losing its control,
+      // not the crossing failing, so it is reported UNMEASURABLE and not
+      // asserted, loudly and with the number that made it so.
       const bool saturated = arms[1].touched * 2 >= arms[1].raw0;
-      const bool crossOk =
-          arms[0].lit > 0 && arms[0].touched > 0 &&
-          arms[0].touched >= arms[1].touched * 4 + 8;
+      const double minPct = BaselineNumber("mobBurnCrossExcessPctMin", 10.0);
+      const uint32_t excess = arms[0].touched > arms[1].touched
+                                  ? arms[0].touched - arms[1].touched
+                                  : 0u;
+      const double excessPct =
+          arms[0].raw0 ? 100.0 * (double)excess / (double)arms[0].raw0 : 0.0;
+      const bool crossOk = arms[0].lit > 0 && arms[0].raw0 > 0 &&
+                           arms[0].touched > arms[1].touched &&
+                           excessPct >= minPct;
       std::printf(
-          "  heat across a joint: %s (%u lit on hips; thigh voxels touched "
-          "%u/%u at crossLimbPct %d vs %u/%u at 0, %ux; peak alight %u vs %u"
-          "%s)\n",
+          "  heat across a joint: %s (%u lit on hips; thigh+shell voxels "
+          "touched %u/%u at crossLimbPct %d vs %u/%u at 0 (the control: grid "
+          "fire + falling embers); excess %u = %.1f%% of the thigh, floor "
+          "%.1f%%; thigh body alone %u/%u vs %u/%u; peak alight %u vs %u%s)\n",
           saturated ? "UNMEASURABLE" : crossOk ? "PASS" : "FAIL", arms[0].lit,
           arms[0].touched, arms[0].raw0, pcts[0], arms[1].touched,
-          arms[1].raw0,
-          arms[1].touched ? arms[0].touched / arms[1].touched
-                          : arms[0].touched,
-          arms[0].alight, arms[1].alight,
+          arms[1].raw0, excess, excessPct, minPct, arms[0].bodyTouched,
+          arms[0].body0, arms[1].bodyTouched, arms[1].body0, arms[0].alight,
+          arms[1].alight,
           saturated ? "; the CONTROL arm already burnt half the thigh through "
                       "the grid, so this differential has no control at this "
                       "combustion.spreadPct -- not asserted"
                     : "");
+      RecordObserved("mobBurnCrossExcessPctObserved", excessPct);
       // Attribution at the point of failure, not elimination afterwards: the
       // three counters say which link broke. No cells means the fronts were
       // empty (the hips never caught, or the index was dropped every tick); no

@@ -506,8 +506,9 @@ class Physics {
   uint32_t CorpseColliderCount() const;
   bool IsCorpseCollider(uint64_t handle) const;
   // ---- HULLS FOR THE DOWNED AND THE LIVING (fight64 round 4, package L) ----
-  // A LIMP ragdoll's limbs (RigLimp) take the same hull a corpse's do, for as
-  // long as they are limp (SANDVOX_LIMP_HULL=0 keeps the compounds). A LIVING
+  // A LIMP ragdoll's limbs (RigLimp) KEEP THEIR COMPOUNDS by default (owner,
+  // 2026-10-05: a limp hull stretched ragdoll-dress's joints); only under
+  // SANDVOX_LIMP_HULL=1 do they take the same hull a corpse's do. A LIVING
   // limb keeps its compound as its shape -- every query is exact -- but the
   // simulation's body-vs-body collide meets it as its hull
   // (SANDVOX_LIVE_SIMHULL=0 is the old collide). One hull per compound,

@@ -1234,3 +1234,24 @@ section, the 10-01 suite-triage list, and the 10-03 red-world entry's
   Measured at gate scope; not yet re-measured at `--suite acceptance` scope.
 
 Read the older entries as history; `baseline.json` is the current status.
+
+## 2026-10-05 — owner decisions: limp hulls off, mob-burn dressed, rig-clip per form
+
+- `ragdoll-dress` `fail` -> `pass`. Owner chose option 3: limp ragdolls keep
+  their box compounds by default (`SANDVOX_LIMP_HULL=1` is the round-4 L arm).
+  Fall-arm stretch 3.06 vox (cap 4.00), slam 0.04, drift 0.000, twist 0.06.
+  Measured at `--verify determinism,ragdoll-dress,ragdoll,mob-burn,rig-clip,mob-cap64`.
+- `mob-burn` stays `fail`, but for a different subcheck. The fixture now wears
+  the stock hood + robe + pants; every cloth subcheck passes (numbers in
+  `_mobBurnKnown2`), and 'heat across a joint' asserts the excess over its
+  control (`mobBurnCrossExcessPctMin`, new). The red one is 'limbs sleep' on
+  the bare K fixture: unburnt limbs 85% asleep vs the 0.90 floor, all awake
+  visits world-miss on a 9-tick period (the doused puddle). main's exe read
+  91% / 90% on the same subcheck; it moves with K's start tick.
+- `rig-clip` stays `fail` (owner is re-authoring the frames): one fixture per
+  loadout, 105 rows, 46 over the limit; the table is in the gate's output and
+  in `build/last_run.json` (`report:rigClip.*`). Thresholds unchanged.
+- New keys: `mobBurnCrossExcessPctMin` / `...Observed`, `mobBurnClothLeadFrac`,
+  `mobBurnClothLostPctObserved`. `report:*` observed keys are never written to
+  baseline.json (selftest.cpp `RebaselineSelftest`).
+- `determinismHash` unmoved (0fa43063).

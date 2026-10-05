@@ -2002,13 +2002,26 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
 // that.
 Status GateRigClip(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
+  // THE SHIPPED ITEM LIBRARY, for this gate (npc-strike's ItemsScope says why
+  // at length): MobSystem::StartStroke resolves a held weapon's FORM only when
+  // the system has an item library, and whether the harness's one is set
+  // depends on which gates ran first. This gate measures FORMS, so it pins the
+  // library the game ships and puts the previous one back on the way out.
+  struct ItemsScope {
+    MobSystem& m;
+    const ItemLibrary* prev;
+    ItemsScope(MobSystem& mm, const ItemLibrary* now) : m(mm), prev(mm.Items()) {
+      m.SetItems(now);
+    }
+    ~ItemsScope() { m.SetItems(prev); }
+  } itemsScope(c.mobs, &c.items);
   bool ok = true;
   int checks = 0;
   auto check = [&](bool cond, const std::string& what) {
     checks++;
     if (!cond) {
       ok = false;
-      std::printf("rig-clip: FAILED %s\n", what.c_str());
+      if (!what.empty()) std::printf("rig-clip: FAILED %s\n", what.c_str());
     }
   };
 
@@ -2018,18 +2031,6 @@ Status GateRigClip(Ctx& c, std::string& detail) {
     std::printf("rig-clip: SKIP (%s)\n", detail.c_str());
     return Status::Skip;
   }
-  std::string why;
-  const uint64_t id =
-      SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
-                   "training_dummy", true, why);
-  if (id == 0) {
-    detail = why.empty() ? "fixture spawn failed" : why;
-    std::printf("rig-clip: SKIP (%s)\n", detail.c_str());
-    CloseStage(c);
-    return Status::Skip;
-  }
-  Ticker tick{c, 28000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
-  for (int i = 0; i < 20; i++) tick();
 
   const int limit = (int)BaselineNumber("rigClip.maxExcessVox", 12);
   // A DIRECTLY JOINTED PAIR GETS ITS OWN, LOOSER NUMBER (selfclip.h
@@ -2044,182 +2045,301 @@ Status GateRigClip(Ctx& c, std::string& detail) {
       return std::string("?");
     return m->LimbDefAt(slot).name;
   };
-
-  // ---- 0. THE BASELINE IS NOT A BLANKET PASS -----------------------------
-  //
-  // A detector that reports zero because it is looking at nothing passes every
-  // assertion below for free, which is the "fixture that cannot fail" trap.
-  // So: the rig standing still must be READABLE (the check ran, over a real
-  // number of limbs) before a single style is driven through it.
-  {
-    const Mob* m = c.mobs.FindMobById(id);
-    ClipReport rep;
-    check(m != nullptr && m->SelfClipCheck(rep), "the rig can be read at all");
-    check(rep.limbs >= 8, Format("the detector sees a whole body (%d limbs)",
-                                 rep.limbs));
-    check(rep.worstExcess <= limit,
-          Format("standing still is clean: worst %d voxels (%s in %s), limit "
-                 "%d",
-                 rep.worstExcess, nameOf(m, rep.worst.a).c_str(),
-                 nameOf(m, rep.worst.b).c_str(), limit));
-  }
-
-  auto aimFor = [&](const AttackStyle& s2) {
-    const Vec3 o2 = c.mobs.MobOrigin(id);
-    float ahead = 11.0f;
-    if (const Mob* m2 = c.mobs.FindMobById(id))
-      ahead = std::max(ahead, c.mobs.StyleReachOn(*m2, s2));
-    return Vec3{o2.x + st.def->worldSize.x * 0.5f,
-                o2.y + st.def->worldSize.y * 0.66f,
-                o2.z + st.def->worldSize.z * 0.5f + ahead};
+  auto phaseOf = [](const NpcStroke* s) -> const char* {
+    if (s == nullptr) return "none";
+    if (s->releasing) return "release";
+    switch (s->phase) {
+      case NpcStroke::Phase::Windup: return "windup";
+      case NpcStroke::Phase::Cut: return "cut";
+      case NpcStroke::Phase::Recover: return "recover";
+      case NpcStroke::Phase::Guard: return "guard";
+      default: return "idle";
+    }
   };
 
+  // ---- EVERY FORM IS SWUNG WITH ITS REAL WEAPON (owner, 2026-10-05) -------
+  //
+  // Until 2026-10-05 this gate held a SWORD for every library entry, the
+  // `@short`, `@blunt` and `@unarmed` form copies included, so a dagger's
+  // frames were measured with a metre of blade on the end of them and the
+  // fist's with a sword the game would never have put there. A form copy's
+  // numbers are only worth anything with the item that selects it
+  // (strokes.h WEAPON FORMS; MobSystem::StartStroke resolves it from the
+  // held item), so the gate now runs ONE FIXTURE PER LOADOUT: every melee
+  // item the library ships (each class's items, all of them -- a cleaver is
+  // not a sword with a different name) and the empty hand. A loadout swings
+  // exactly the entries the game would resolve for it: a form copy when the
+  // loadout's class is that form, a base entry when the base has no copy for
+  // that class. The empty hand also swings the natural-weapon and fallback
+  // punches, which an armed fixture never draws.
+  //
+  // THE OUTPUT IS FOR THE PERSON FIXING THE ART: per row the worst DRIVEN
+  // pair (windup/cut, where the stroke owns the arm), the tick, and the
+  // AUTHORED FRAME index (0-based into that entry's `frames`) and phase the
+  // tick fell in, so the keyframe can be found in attack_styles.json; then a
+  // sorted table of every row over a limit; then the same rows into
+  // build/last_run.json (`report:rigClip.*`, never into baseline.json).
+  struct Loadout {
+    const ItemDef* item = nullptr;
+    int form = kFormUnarmed;
+    std::string label;
+  };
+  std::vector<Loadout> loadouts;
+  for (const ItemDef& it : c.items.items)
+    if (it.kind == ItemKind::Melee && WeaponFormOf(it.weaponClass) >= 0)
+      loadouts.push_back({&it, WeaponFormOf(it.weaponClass), it.name});
+  loadouts.push_back({nullptr, kFormUnarmed, "(empty hand)"});
+  check(loadouts.size() >= 2, "the item library ships at least one melee item");
+
+  struct Row {
+    std::string entry, item;
+    bool player = false;
+    int driven = 0, drivenTick = -1, drivenFrame = -1, drivenFrames = 0;
+    std::string drivenPhase = "-", dA = "-", dB = "-";
+    int jointed = 0;
+    int whole = 0, wholeTick = -1, wholeFrame = -1, wholeFrames = 0;
+    std::string wholePhase = "-", wA = "-", wB = "-";
+    float push = 0, roundTrip = 0, ikMiss = 0, shoulderClamp = 0;
+    bool Over(int lim, int jlim) const { return driven > lim || jointed > jlim; }
+  };
+  std::vector<Row> rows;
   const StyleLibrary& lib = c.mobs.AttackStyles();
-  int styles = 0;
-  int worstAll = 0;
-  std::string worstWhere;
-  for (const AttackStyle& sty : lib.styles) {
-    const Mob* fixture = c.mobs.FindMobById(id);
-    if (fixture == nullptr || !StyleUsable(*fixture, sty)) continue;
-    // ---- ...AND ONLY THE STYLES THE DRAW WOULD ACTUALLY PRODUCE ----------
-    //
-    // `ForceAttack` bypasses `PickAttackStyle`, and a FALLBACK style is one
-    // the draw drops as a group whenever any non-fallback style is usable
-    // (strokes.h AttackStyle::fallback: "a duelist with a sword never throws a
-    // punch"). Forcing one onto this ARMED fixture stages a situation the
-    // game cannot create — a human punching with a sword still in its fist —
-    // and the detector correctly reports the sword sweeping through the head,
-    // at 84 and 96 voxels. That is a true measurement of a false scenario, and
-    // it is also outside what the stroke driver can fix: the item's pose is
-    // derived from the hand by the rig, and for a Chain effector the driver is
-    // told the tip IS the hand (mob.cpp says why at length), so it has no
-    // blade to keep out of anything.
-    //
-    // IT IS SKIPPED LOUDLY rather than silently, because "a disarmed creature
-    // punching" IS reachable and this gate does not cover it: a fixture with
-    // an empty fist is the way to, and nobody should conclude from a green
-    // line here that it was checked.
-    const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
-    if ((sty.fallback || natural) && fixture->HeldSlot() >= 0) {
-      std::printf(
-          "rig-clip %-16s skipped: a %s style on an ARMED fixture is a swing "
-          "nothing selects (and the held sword it sweeps is not the driver's "
-          "to move)\n",
-          sty.name.c_str(), natural ? "natural-weapon" : "fallback");
+  std::vector<int> swungBy(lib.styles.size(), 0);
+  Ticker tick{c, 28000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  uint64_t id = 0;
+
+  for (const Loadout& lo : loadouts) {
+    if (id != 0) c.mobs.RemoveMob(id);
+    std::string why;
+    id = SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
+                      "training_dummy", false, why);
+    if (id == 0) {
+      check(false, "fixture spawn for " + lo.label + ": " +
+                       (why.empty() ? std::string("refused") : why));
       continue;
     }
-    styles++;
-    // The same pinned seed npc-styles uses, for the same reason: the tempo
-    // jitter is what decides the tick counts, and an unpinned one makes the
-    // same style a different swing in a different scope.
-    const uint32_t styleSeed =
-        rng::Hash3(0x5C0BEu,
-                   (uint32_t)std::hash<std::string>{}(sty.name), 0x5747u) |
-        1u;
-    const Vec3 aim = aimFor(sty);
-    FaceAt(c.mobs, id, aim);
-    if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick, styleSeed)) continue;
+    if (lo.item != nullptr && !c.mobs.EquipItem(id, lo.item)) {
+      check(false, "EquipItem refused " + lo.label);
+      continue;
+    }
+    for (int i = 0; i < 20; i++) tick();
 
-    int worst = 0, worstTick = -1;
-    float push = 0;
-    ClipPair worstPair;
-    // ---- SPLIT BY WHO OWNED THE ARM (CLAUDE.md rule 6) -------------------
+    // ---- 0. THE BASELINE IS NOT A BLANKET PASS, per loadout -------------
     //
-    // "105 voxels of forearm inside the torso" has two completely different
-    // causes and the bare number cannot tell them apart: the STROKE drove it
-    // there (windup/cut, where the driver's pose claim is 1 and the chest
-    // keep-out is what has to stop it), or the HAND-BACK did (recover, where
-    // the claim is fading and the pose is a blend between the stroke's and
-    // the walk cycle's, which nothing in the driver can reach). The tell that
-    // they are not one event: the keep-out reported pushing the hand 1.11
-    // voxels on the very swing the detector called 105 voxels deep, and two
-    // numbers that far apart are not describing the same pose.
-    int worstDriven = 0, worstDrivenTick = -1, worstDrivenJoint = 0;
-    float worstRoundTrip = 0, worstIkMiss = 0, worstShoulderClamp = 0;
-    ClipPair worstDrivenPair;
-    for (int i = 0; i < 90; i++) {
-      tick();
+    // A detector that reports zero because it is looking at nothing passes
+    // every assertion below for free. So the rig standing still, holding this
+    // loadout, must be READABLE over a real number of limbs and clean.
+    {
       const Mob* m = c.mobs.FindMobById(id);
-      if (m == nullptr) break;
-      const NpcStroke* s = c.mobs.MobStroke(id);
       ClipReport rep;
-      if (m->SelfClipCheck(rep) && rep.worstExcess > worst) {
-        worst = rep.worstExcess;
-        worstPair = rep.worst;
-        worstTick = i;
-      }
-      // HOW HARD THE KEEP-OUT WORKED, summed over the swing. "The arm is still
-      // in the chest" and "the clamp never fired" are different failures and
-      // the voxel count alone cannot tell them apart (CLAUDE.md rule 6).
-      if (s != nullptr) push = std::max(push, s->melee.BodyClampPush());
-      if (s != nullptr &&
-          (s->phase == NpcStroke::Phase::Windup ||
-           s->phase == NpcStroke::Phase::Cut)) {
-        if (rep.worstExcess > worstDriven) {
-          worstDriven = rep.worstExcess;
-          worstDrivenPair = rep.worst;
-          worstDrivenTick = i;
-        }
-        worstDrivenJoint = std::max(worstDrivenJoint, rep.worstJointExcess);
-        // ---- IS THE RIG EVEN DOING WHAT THE DRIVER ASKED? ---------------
-        //
-        // The chest keep-out clamps the hand the DRIVER commands, and the rig
-        // then has its own opinion: the two-bone solve may not reach, and
-        // `AnimClampPoseLimits` takes the shoulder's authored ball limit off
-        // the result afterwards. If the arm inside the chest is the CLAMPED
-        // pose rather than the commanded one, no amount of work in the driver
-        // can move it, and the fix belongs in the rig or in the authoring.
-        // Those are opposite repairs, so the numbers that separate them are
-        // recorded here rather than inferred later (CLAUDE.md rule 6).
-        const Mob::WeaponArmDiag& wd = m->WeaponArmDiagnostics();
-        if (wd.ran) {
-          worstRoundTrip = std::max(worstRoundTrip, wd.roundTrip);
-          worstIkMiss = std::max(worstIkMiss, wd.ikMiss);
-          worstShoulderClamp = std::max(worstShoulderClamp, wd.shoulderClamp);
-        }
-      }
-      if (s == nullptr || (!s->Active() && i > 4)) break;
+      check(m != nullptr && m->SelfClipCheck(rep),
+            lo.label + ": the rig can be read at all");
+      check(rep.limbs >= 8, Format("%s: the detector sees a whole body (%d "
+                                   "limbs)", lo.label.c_str(), rep.limbs));
+      check(rep.worstExcess <= limit,
+            Format("%s: standing still is clean: worst %d voxels (%s in %s), "
+                   "limit %d",
+                   lo.label.c_str(), rep.worstExcess,
+                   nameOf(m, rep.worst.a).c_str(),
+                   nameOf(m, rep.worst.b).c_str(), limit));
     }
-    const std::string where =
-        Format("%s: %s is %d voxels inside %s at tick %d", sty.name.c_str(),
-               nameOf(c.mobs.FindMobById(id), worstPair.a).c_str(), worst,
-               nameOf(c.mobs.FindMobById(id), worstPair.b).c_str(), worstTick);
-    if (worst > worstAll) {
-      worstAll = worst;
-      worstWhere = where;
-    }
-    // THE CLAIM IS STATED ON THE DRIVEN PHASES, which is where the driver's
-    // keep-out is the thing responsible. The whole-stroke number is printed
-    // beside it on every run, so a regression in the hand-back stays visible
-    // even though this line does not assert on it.
-    (void)where;
-    check(worstDrivenJoint <= jointLimit,
-          Format("%s: a JOINTED pair buried %d voxels while the stroke owned "
-                 "the arm (limit %d)",
-                 sty.name.c_str(), worstDrivenJoint, jointLimit));
-    check(worstDriven <= limit,
-          Format("%s: %s is %d voxels inside %s at tick %d, while the STROKE "
-                 "owned the arm (limit %d)",
-                 sty.name.c_str(),
-                 nameOf(c.mobs.FindMobById(id), worstDrivenPair.a).c_str(),
-                 worstDriven,
-                 nameOf(c.mobs.FindMobById(id), worstDrivenPair.b).c_str(),
-                 worstDrivenTick, limit));
-    std::printf(
-        "rig-clip %-16s driven %3d vox (%s in %s, tick %d) | jointed %3d | "
-        "whole stroke %3d | limit %d/%d | push %.2f | rig: roundTrip %.2f ikMiss %.2f shoulderClamp %.2f rad\n",
-        sty.name.c_str(), worstDriven,
-        nameOf(c.mobs.FindMobById(id), worstDrivenPair.a).c_str(),
-        nameOf(c.mobs.FindMobById(id), worstDrivenPair.b).c_str(),
-        worstDrivenTick, worstDrivenJoint, worst, limit, jointLimit, push,
-        worstRoundTrip, worstIkMiss, worstShoulderClamp);
-  }
-  check(styles >= 3, "the fixture can swing enough styles to be worth driving");
-  if (worstAll > 0)
-    std::printf("rig-clip: worst over all styles — %s\n", worstWhere.c_str());
 
+    auto aimFor = [&](const AttackStyle& s2) {
+      const Vec3 o2 = c.mobs.MobOrigin(id);
+      float ahead = 11.0f;
+      if (const Mob* m2 = c.mobs.FindMobById(id))
+        ahead = std::max(ahead, c.mobs.StyleReachOn(*m2, s2));
+      return Vec3{o2.x + st.def->worldSize.x * 0.5f,
+                  o2.y + st.def->worldSize.y * 0.66f,
+                  o2.z + st.def->worldSize.z * 0.5f + ahead};
+    };
+
+    int swungHere = 0;
+    for (size_t si = 0; si < lib.styles.size(); si++) {
+      const AttackStyle& sty = lib.styles[si];
+      const Mob* fixture = c.mobs.FindMobById(id);
+      if (fixture == nullptr) break;
+      // WHICH ENTRY THIS LOADOUT WOULD SWING. A form copy belongs to its
+      // class's items (or the empty hand); a base entry only to a loadout
+      // whose class has no copy of it -- the resolve StartStroke runs.
+      if (!sty.form.empty()) {
+        if (WeaponFormOf(sty.form) != lo.form) continue;
+      } else if (lib.ResolveForm((int)si, lo.form) != (int)si) {
+        continue;
+      }
+      // A FALLBACK or NATURAL-WEAPON style is one the draw drops whenever a
+      // held style is usable (strokes.h AttackStyle::fallback): a duelist
+      // with a sword never throws a punch. Measured on the empty hand only.
+      const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
+      if ((sty.fallback || natural) && lo.item != nullptr) continue;
+      if (!StyleUsable(*fixture, sty)) continue;
+      // The same pinned seed npc-styles uses, for the same reason: the tempo
+      // jitter is what decides the tick counts, and an unpinned one makes the
+      // same style a different swing in a different scope.
+      const uint32_t styleSeed =
+          rng::Hash3(0x5C0BEu,
+                     (uint32_t)std::hash<std::string>{}(sty.name), 0x5747u) |
+          1u;
+      const Vec3 aim = aimFor(sty);
+      FaceAt(c.mobs, id, aim);
+      if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick, styleSeed)) {
+        std::printf("rig-clip %-24s %-12s ForceAttack refused\n",
+                    sty.name.c_str(), lo.label.c_str());
+        continue;
+      }
+      swungHere++;
+      swungBy[si]++;
+
+      Row row;
+      row.entry = sty.name;
+      row.item = lo.label;
+      row.player = sty.name.find(":player") != std::string::npos;
+      // ---- SPLIT BY WHO OWNED THE ARM (CLAUDE.md rule 6) -----------------
+      //
+      // The STROKE drove it there (windup/cut, where the driver's pose claim
+      // is 1) or the HAND-BACK did (recover/release, a blend toward the walk
+      // cycle that nothing in the driver can reach). The claim is stated on
+      // the driven phases; the whole stroke is printed beside it.
+      for (int i = 0; i < 90; i++) {
+        tick();
+        const Mob* m = c.mobs.FindMobById(id);
+        if (m == nullptr) break;
+        const NpcStroke* s = c.mobs.MobStroke(id);
+        ClipReport rep;
+        const bool read = m->SelfClipCheck(rep);
+        if (read && rep.worstExcess > row.whole) {
+          row.whole = rep.worstExcess;
+          row.wholeTick = i;
+          row.wA = nameOf(m, rep.worst.a);
+          row.wB = nameOf(m, rep.worst.b);
+          row.wholePhase = phaseOf(s);
+          row.wholeFrame = s != nullptr ? s->frame : -1;
+          row.wholeFrames = s != nullptr ? s->frames : 0;
+        }
+        if (s != nullptr) row.push = std::max(row.push, s->melee.BodyClampPush());
+        if (read && s != nullptr && !s->releasing &&
+            (s->phase == NpcStroke::Phase::Windup ||
+             s->phase == NpcStroke::Phase::Cut)) {
+          if (rep.worstExcess > row.driven) {
+            row.driven = rep.worstExcess;
+            row.drivenTick = i;
+            row.dA = nameOf(m, rep.worst.a);
+            row.dB = nameOf(m, rep.worst.b);
+            row.drivenPhase = phaseOf(s);
+            row.drivenFrame = s->frame;
+            row.drivenFrames = s->frames;
+          }
+          row.jointed = std::max(row.jointed, rep.worstJointExcess);
+          // IS THE RIG EVEN DOING WHAT THE DRIVER ASKED? (the 2026-09-21
+          // attribution: commanded vs clamped arm; _rigClipKnown_about)
+          const Mob::WeaponArmDiag& wd = m->WeaponArmDiagnostics();
+          if (wd.ran) {
+            row.roundTrip = std::max(row.roundTrip, wd.roundTrip);
+            row.ikMiss = std::max(row.ikMiss, wd.ikMiss);
+            row.shoulderClamp = std::max(row.shoulderClamp, wd.shoulderClamp);
+          }
+        }
+        if (s == nullptr || (!s->Active() && i > 4)) break;
+      }
+      // The verdicts, quietly: the sorted table below is the report.
+      check(row.jointed <= jointLimit, "");
+      check(row.driven <= limit, "");
+      std::printf(
+          "rig-clip %-24s %-12s %-6s driven %3d vox (%s in %s, tick %d, frame "
+          "%d/%d %s) | jointed %3d | whole %3d (%s in %s, tick %d, frame %d/%d "
+          "%s) | limit %d/%d | push %.2f | rig: roundTrip %.2f ikMiss %.2f "
+          "shoulderClamp %.2f rad\n",
+          sty.name.c_str(), lo.label.c_str(), row.player ? "player" : "npc",
+          row.driven, row.dA.c_str(), row.dB.c_str(), row.drivenTick,
+          row.drivenFrame, row.drivenFrames, row.drivenPhase.c_str(),
+          row.jointed, row.whole, row.wA.c_str(), row.wB.c_str(),
+          row.wholeTick, row.wholeFrame, row.wholeFrames,
+          row.wholePhase.c_str(), limit, jointLimit, row.push, row.roundTrip,
+          row.ikMiss, row.shoulderClamp);
+      // build/last_run.json, readable without a re-run. No quotes or
+      // backslashes in the value: the writer does not escape observed values.
+      const std::string key = "report:rigClip." + sty.name + "|" + lo.label;
+      RecordObserved(
+          key.c_str(),
+          Format("driven %d (%s in %s) tick %d frame %d/%d %s; jointed %d; "
+                 "whole %d (%s in %s) tick %d frame %d/%d %s",
+                 row.driven, row.dA.c_str(), row.dB.c_str(), row.drivenTick,
+                 row.drivenFrame, row.drivenFrames, row.drivenPhase.c_str(),
+                 row.jointed, row.whole, row.wA.c_str(), row.wB.c_str(),
+                 row.wholeTick, row.wholeFrame, row.wholeFrames,
+                 row.wholePhase.c_str()));
+      rows.push_back(std::move(row));
+    }
+    check(swungHere >= 3,
+          Format("%s swings enough styles to be worth driving (%d)",
+                 lo.label.c_str(), swungHere));
+  }
+
+  // ---- ENTRIES NO LOADOUT SWINGS --------------------------------------------
+  // A base style with a copy for every form is never swung by any item the
+  // library ships (and a jaws style never by a human): named, not measured,
+  // so nobody reads a missing row as a clean one.
+  {
+    std::string none;
+    int nNone = 0;
+    for (size_t si = 0; si < lib.styles.size(); si++)
+      if (swungBy[si] == 0) {
+        nNone++;
+        none += (none.empty() ? "" : " ") + lib.styles[si].name;
+      }
+    std::printf("rig-clip: %d library entries no loadout swings (not "
+                "measured): %s\n", nNone, none.c_str());
+  }
+
+  // ---- THE TABLE: every row over a limit, worst first ----------------------
+  std::vector<const Row*> over;
+  int worstAll = 0;
+  std::string worstWhere;
+  for (const Row& r : rows) {
+    if (r.Over(limit, jointLimit)) over.push_back(&r);
+    if (r.whole > worstAll) {
+      worstAll = r.whole;
+      worstWhere = Format("%s with %s: %s is %d voxels inside %s at tick %d "
+                          "(frame %d %s)",
+                          r.entry.c_str(), r.item.c_str(), r.wA.c_str(),
+                          r.whole, r.wB.c_str(), r.wholeTick, r.wholeFrame,
+                          r.wholePhase.c_str());
+    }
+  }
+  std::stable_sort(over.begin(), over.end(), [](const Row* a, const Row* b) {
+    if (a->driven != b->driven) return a->driven > b->driven;
+    return a->jointed > b->jointed;
+  });
+  std::printf(
+      "rig-clip: OVER-LIMIT TABLE (%zu of %zu rows; limit %d non-jointed / %d "
+      "jointed; frame = 0-based index into that entry's frames)\n",
+      over.size(), rows.size(), limit, jointLimit);
+  std::printf("rig-clip: | %-26s | %-12s | %-6s | %-26s | %5s | %4s | %-5s | "
+              "%-7s | %5s | %5s |\n",
+              "entry", "item", "who", "driven pair (A in B)", "vox", "tick",
+              "frame", "phase", "joint", "whole");
+  for (const Row* r : over) {
+    const std::string pair = r->dA + " in " + r->dB;
+    const std::string fr = Format("%d/%d", r->drivenFrame, r->drivenFrames);
+    std::printf("rig-clip: | %-26s | %-12s | %-6s | %-26s | %5d | %4d | %-5s | "
+                "%-7s | %5d | %5d |\n",
+                r->entry.c_str(), r->item.c_str(),
+                r->player ? "player" : "npc", pair.c_str(), r->driven,
+                r->drivenTick, fr.c_str(), r->drivenPhase.c_str(), r->jointed,
+                r->whole);
+  }
+  std::printf("rig-clip: %zu rows clean (under both limits)\n",
+              rows.size() - over.size());
+  if (worstAll > 0)
+    std::printf("rig-clip: worst over all rows (whole stroke) — %s\n",
+                worstWhere.c_str());
+  RecordObserved("report:rigClip.rows", (double)rows.size());
+  RecordObserved("report:rigClip.overLimitRows", (double)over.size());
+
+  if (id != 0) c.mobs.RemoveMob(id);
   CloseStage(c);
-  detail = Format("%d styles, worst %d vox", styles, worstAll);
+  detail = Format("%zu rows over %zu loadouts, %zu over limit, worst %d vox",
+                  rows.size(), loadouts.size(), over.size(), worstAll);
   std::printf("rig-clip: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
   return ok ? Status::Pass : Status::Fail;
 }

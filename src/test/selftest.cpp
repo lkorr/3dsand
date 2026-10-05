@@ -1646,6 +1646,10 @@ void RebaselineSelftest(const std::string& path,
   int vals = 0;
   for (const Result& r : results) {
     for (const auto& kv : r.observed) {
+      // "report:" keys are MEASUREMENTS FOR A READER, never thresholds: they
+      // go to build/last_run.json (rig-clip's per-row table, 2026-10-05) and
+      // are never written into baseline.json nor reported as missing from it.
+      if (kv.first.rfind("report:", 0) == 0) continue;
       std::string oldVal;
       if (!ReplaceJsonValue(text, kv.first, kv.second, &oldVal)) {
         std::printf("  %s: NOT IN BASELINE (add \"%s\": \"%s\" by hand)\n",
