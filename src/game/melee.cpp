@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/burnprof.h"  // the blade path's own scopes (kSweep, kCoat)
 #include "game/mob.h"     // MobSystem/Mob: the sweep carves live limbs
 #include "phys/debris.h"  // DebrisSystem: ...and melts loose ones
 #include "phys/physics.h"
@@ -982,6 +983,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
                                  MobSystem& mobs, DebrisSystem& debris,
                                  World& world,
                                  std::vector<ParticleSpawn>& spawns) {
+  burnprof::Scope bpSweep(burnprof::kSweep);
   EdgeSweepResult out;
   if (!s.valid || s.dt <= 1e-6f) return out;
   // Tip speed is what scales the damage: the base of a blade barely moves in a
@@ -1578,7 +1580,10 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
                       : s.strike.bite > 0.0f ? MobSystem::CoatHitKind::Bite
                                              : MobSystem::CoatHitKind::Blunt;
           coat.landed = true;
-          if (coat.targetBody != 0) mobs.CoatOnContact(coat);
+          if (coat.targetBody != 0) {
+            burnprof::Scope bpCoat(burnprof::kCoat);
+            mobs.CoatOnContact(coat);
+          }
         }
         continue;
       }
@@ -1676,6 +1681,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         coat.kind = coatKind;
         coat.landed = coatKind != MobSystem::CoatHitKind::Bite || biteLanded;
         coat.woundCells = &coatCells;
+        burnprof::Scope bpCoat(burnprof::kCoat);
         mobs.CoatOnContact(coat);
       }
     }

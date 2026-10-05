@@ -82,20 +82,58 @@ std::vector<CoatCell> CoatContactCells(const StainLattice& L,
   const size_t n = L.Size();
   if (n == 0 || !occ.Valid() || reach < 0.0f) return out;
   // The nearest exposed voxel: where the two surfaces met.
-  float near = 1e30f;
+  //
+  // IN SQUARED DISTANCE, with one square root at the end (fight64 round 3,
+  // package X: a blade blow pays this over a whole skin lattice). The root is
+  // correctly rounded and monotone, so the root of the smallest square is the
+  // smallest root -- the same `near` to the bit.
+  float near2 = 3.4e38f;
+  bool any = false;
+  // ...and an integer window in front of the float test, as in
+  // Mob::ShellMaterialAt: once an exposed voxel is found, one more than
+  // sqrt(near2) out along any axis cannot be nearer, so it is skipped on
+  // three unsigned compares. Same candidates reach the exact test, in order.
+  const bool prune = std::fabs(p.x) < 1e6f && std::fabs(p.y) < 1e6f &&
+                     std::fabs(p.z) < 1e6f;
+  const int ix = prune ? (int)std::floor(p.x - 0.5f) : 0,
+            iy = prune ? (int)std::floor(p.y - 0.5f) : 0,
+            iz = prune ? (int)std::floor(p.z - 0.5f) : 0;
+  int wr = 0x3FFFFFFF;
+  uint32_t win = 0xFFFFFFFFu;
   for (size_t i = 0; i < n; i++) {
     if (L.Mat(i) == 0) continue;
     const IVec3 v = L.At(i);
-    const float d = CentreDist(v, p);
-    if (d < near && occ.Exposed(v)) near = d;
+    if ((uint32_t)(v.x - ix + wr) > win || (uint32_t)(v.y - iy + wr) > win ||
+        (uint32_t)(v.z - iz + wr) > win)
+      continue;
+    const Vec3 dv{(float)v.x + 0.5f - p.x, (float)v.y + 0.5f - p.y,
+                  (float)v.z + 0.5f - p.z};
+    const float d2 = dv.dot(dv);
+    if ((!any || d2 < near2) && occ.Exposed(v)) {
+      near2 = d2;
+      any = true;
+      if (prune) {
+        wr = (int)std::ceil(std::sqrt(d2)) + 2;
+        win = 2u * (uint32_t)wr;
+      }
+    }
   }
+  const float near = any ? std::sqrt(near2) : 1e30f;
   if (near >= 1e29f) return out;
   const float lim = near + reach;
+  // A square that is clearly past `lim` (by a relative margin far wider than
+  // a root's rounding) is rejected without the root; anything near the bound
+  // takes the exact `CentreDist(v) > lim` test it always did.
+  const float limHi = lim * 1.001f + 1e-3f;
+  const float lim2Hi = limHi * limHi;
   std::vector<uint8_t> in;   // lattice index -> already taken (split depth)
   if (splitDepth) in.assign(n, 0);
   for (size_t i = 0; i < n; i++) {
     if (L.Mat(i) == 0) continue;
     const IVec3 v = L.At(i);
+    const Vec3 dv{(float)v.x + 0.5f - p.x, (float)v.y + 0.5f - p.y,
+                  (float)v.z + 0.5f - p.z};
+    if (dv.dot(dv) > lim2Hi) continue;
     const float d = CentreDist(v, p);
     if (d > lim || !occ.Exposed(v)) continue;
     out.push_back(CoatCell{(uint32_t)i, d});

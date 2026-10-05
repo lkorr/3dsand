@@ -6709,7 +6709,8 @@ neighbors, so this needs an explicit connectivity pass:
   too — eight sword kerfs on that log were 56-119 ms (one of them 27 ms) — so
   `ShatterBody`'s connectivity flood reads a dense index grid instead of a hash
   map (same seed order, same component numbering), `SpallGrow` only hashes the
-  cells within reach of the blow instead of the whole lattice every round,
+  cells within reach of the blow instead of the whole lattice every round (a
+  bitmap over that box since 2026-10-05, fight64 package X),
   `DamageBody` evaluates the carve predicate once per voxel instead of twice,
   and `DominantMaterial` tallies into a flat array: 3.7 ms for the eight. Gate
   `big-body-collider` pins the budget, the full coverage, the exact trunk box,
@@ -12343,6 +12344,53 @@ a tree that has this fix.
 marks each arm, so an in-process failure splits one trace file into per-arm
 runs to diff. The fetch trace's `Q` stamp (`World::fetchTick_`) also survives a
 regen; it feeds only the age statistics, so diff with it masked.
+
+**The blade path, exact (2026-10-05, fight64 round 3 package X).** Every
+change here keeps the arithmetic and its order, so the 64 brawl's per-tick
+`SANDVOX_MOBCAP_DIGEST` is identical to the pre-change build on all 300 ticks
+(and with `SANDVOX_MOB_THREADS=1`); `tests/lattice_test.cpp` keeps the two
+pre-change `phys/lattice.h` functions verbatim and compares them field by field
+over random lattices (negative coordinates, the int8 overflow band, duplicate
+cells, a non-power-of-two ratio); `lattice_test --bench` times them.
+- `DownsampleSkin`: the block index is a shift (C++'s truncating division
+  reproduced for a negative coordinate); the block box comes from a min/max of
+  the raw coordinates when that box is wholly in range (else the old filtering
+  walk); blocks are packed 8-byte heads plus pair/hit tables that are never
+  cleared, sized once per call; the vote loop is instantiated twice, a bare
+  shift with no range test for the common case. ~2x on a torso-sized skin.
+- `SpallGrow`: `live` is a bitmap over the blow's box (the hash set stays for a
+  box over 2^24 cells), and an integer box rejects cells before the float test.
+- `Mob::CarveLimb` takes an optional `CarveBounds`, a caller's promise that the
+  predicate removes nothing outside a limb-local box; `CutLimb` passes the kerf
+  slot's axis-aligned hull (not for a near-side drop, which is a half-space).
+  Voxels outside it skip the per-voxel `std::function` call. The connectivity
+  flood steps by grid stride; the closing wound-total re-sync is skipped when
+  neither the death branch nor the split changed the lattice (it would recount
+  the same two numbers).
+- `Mob::NeckCountAt`, `Mob::ShellMaterialAt`, `CoatContactCells`: integer
+  prefilters that only skip voxels the float test would reject (a superset box;
+  for the two nearest-voxel searches, a window of one cell past sqrt of the best
+  so far, so ties still go to the earlier voxel). `CoatContactCells` finds its
+  nearest in squared distance with one root at the end.
+- `ReskinLimbMicro` hands the skin to `MicroBodyEdit` instead of copying it.
+- The micro-body pool's host vector reserves its whole ceiling on first growth:
+  it used to re-copy tens of MiB mid-fight inside whichever carve outgrew it
+  (the brawl's worst-tick `reskin` 2.3 -> 0.7 ms).
+- burnprof stages inside `stroke`: `sweep` (MeleeSweepDamage), `cut`
+  (Mob::CutLimb), `woundStain`, `coat`, `shellAt`, `reskin`.
+
+`mob-cap64`, `SANDVOX_RUN_EXCLUSIVE=1`, two alternating boots per arm, base =
+the 7194388 build (same fight, 54 alive, 3,074 carves both arms): stroke 3.79
+-> 3.13 ms mean, worst 15.3 -> 11.1; carve 2.38 -> 1.78, worst 9.2 -> 5.6; mob
+side 14.28 -> 13.42; tick wall 32.0 / 41.3 / 50.6 -> 30.8 / 39.8 / 44.3 (mean /
+p95 / worst). What is left of a blade hit (~0.37 ms) is spread thin: the
+collider re-derive and the wound soak's (~0.5 ms a tick together), the Jolt
+rebuild (~0.3, `phys/physics.cpp`), the forced burn flush's own full carve
+before the blade's (~0.25), the coat exchange (~0.4), the wound soak's other
+passes (~0.2). Parallel carves were not taken: the sweep resolves its hits in
+mob order inside the mob loop, a later probe meets the body an earlier carve
+rebuilt, and a later creature's AI reads the wounds -- deferring the carves to
+a parallel pass would change the fight, not just its cost.
 
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 

@@ -122,6 +122,15 @@ uint32_t PoolAlloc(MicroBodySet& set, size_t words) {
     return base;
   }
   if (set.pool.size() + words > kMicroBodyPoolWordsWorld) return UINT32_MAX;
+  // THE WHOLE CEILING, RESERVED ONCE (fight64 round 3, package X). The pool
+  // grows by tail allocation as a fight clones and re-packs bricks, and each
+  // time the vector outgrew its capacity it copied every word it had -- tens
+  // of MiB, inside whichever carve happened to ask, which is a worst-tick
+  // spike that belongs to nobody. The ceiling is a constant (the GPU buffer is
+  // already that size), so the host copy reserves it on the first growth and
+  // never moves again. Contents and addresses are unchanged.
+  if (set.pool.capacity() < kMicroBodyPoolWordsWorld)
+    set.pool.reserve(kMicroBodyPoolWordsWorld);
   uint32_t base = (uint32_t)set.pool.size();
   set.pool.resize(set.pool.size() + words, 0u);
   return base;

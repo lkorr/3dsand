@@ -4197,6 +4197,18 @@ class Mob {
     // carves dozens of times a second and wants none of this) pays nothing.
     std::vector<IVec3> cells;
   };
+  // ---- WHERE THE PREDICATE CAN SAY "GO" (fight64 round 3, package X) -------
+  // Optional, and a PROMISE from the caller: every voxel the factory's
+  // predicate would remove lies inside this limb-local box (world voxels).
+  // CarveLimb then keeps everything outside it without asking -- a blade's
+  // kerf is a few cells of a skin lattice tens of thousands strong, and the
+  // per-voxel std::function call was the carve's largest single pass. The
+  // box is padded by two lattice cells on use, so it only has to bound the
+  // predicate's shape, not its rounding. A caller that cannot bound its
+  // predicate (the burn flush, a near-side drop) passes none.
+  struct CarveBounds {
+    Vec3 lo{}, hi{};
+  };
   // `ctx` is required: every structural rule in here reads it (the table in
   // game/severpolicy.h), and a carve that did not say what made it is the
   // ambient-flag bug this signature exists to make impossible.
@@ -4204,7 +4216,8 @@ class Mob {
                  std::vector<ParticleSpawn>& spawns, bool eject,
                  const LimbCarveFactory& carveAt,
                  const CarveSpall* spall = nullptr,
-                 CarveReport* report = nullptr);
+                 CarveReport* report = nullptr,
+                 const CarveBounds* bounds = nullptr);
   // Sum MobDef::WoundHpOf over a limb's CURRENT authoritative lattice, and
   // count its brain voxels, in one pass. This is what MobLimb::weightCharged /
   // brainCharged are deltas of; see the note on those fields for why the
