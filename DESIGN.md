@@ -4337,6 +4337,28 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   voxel word has no bits to remember which leaf a burning one was, so the
   material id is the memory. Same rules and numbers in all three.
 
+  **Bodies burn the same way, with the ART colour as the memory (2026-10-05).**
+  One `ember` serves every wood creature, so the material id cannot remember
+  a body voxel's look; its art slot can. `MobSystem::SetBurnVoxel` is the one
+  burn rewrite (reaction products, `IgniteLimb`, the current's
+  `ElecRewriteLimb`): a voxel going **alight** (a solid with
+  `thermal.emit` -- `AlightOf`) KEEPS its art slot, and an *unpainted* one
+  (most of a body: a deku is 63% material-coloured bark and wood) is given an
+  art **stand-in**, the merged art colour nearest the colour its material was
+  drawn in (`RefreshArtStandIns`, serial in `PreTick`; the merged palette is
+  full, so nothing is added to it). Every other rewrite -- a char, a sear, an
+  infection -- still clears the slot, and an ember doused back to wood keeps
+  it. The raster body paths call `burnTintPainted()`: a painted voxel whose
+  material is alight (the `_r2` heat-emit byte, the same field `AlightOf`
+  reads -- NOT `emission > 0`, because robe trim, gems and power cells glow
+  and are painted) breathes between its paint and the burning material's own
+  palette on the per-voxel phase, with the weight CUBED (mean ~0.24) because
+  a creature is a few big surfaces seen close, and at the leaf weight it
+  read as a flat salmon sheet. Render-only: an alight voxel's art is passed as
+  0 to the grid-state hook when it leaves, so its ash is what it always was.
+  `--shot-mob "deku:^3000"` lights a creature and prints how many alight
+  voxels carry a colour to breathe back to.
+
 ### `reactions/*.json`
 ```json
 { "self": "fire",  "neighbor": "tag:flammable", "chance": 10,

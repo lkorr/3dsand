@@ -1111,6 +1111,9 @@ struct BurnLimbView {
   // and painted per voxel), so a charred voxel that kept its slot goes on being
   // painted robe-purple — charring would be invisible on exactly the painted
   // surfaces it matters most on.
+  // The one exception is a voxel going ALIGHT, which the burn pass writes
+  // through MobSystem::SetBurnVoxel instead: there the slot is what the
+  // renderer breathes the flame back toward (burnTintPainted, common.wgsl).
   void Set(size_t i, uint32_t mat, uint32_t variant) const {
     const uint16_t w = (uint16_t)((mat & 0xFFFu) | ((variant & 3u) << 12));
     if (skin) {
@@ -7687,6 +7690,35 @@ class MobSystem {
   bool BurnableOf(uint32_t mat) const {
     return mat < burnable_.size() && burnable_[mat] != 0;
   }
+  // ALIGHT: a solid that holds its block hot (materials.json thermal.emit) --
+  // ember, flesh_burning, cloth_burning, leaf_burning. The renderer's test for
+  // the same thing is the uploaded `_r2` heat-emit byte (bodyAlightTint,
+  // common.wgsl), packed from that same field.
+  bool AlightOf(uint32_t mat) const {
+    return mat < alight_.size() && alight_[mat] != 0;
+  }
+  // Does a body voxel rewritten `was` -> `into` KEEP its art colour? Yes when
+  // it goes alight (the art is the colour the flame breathes back to), and
+  // when it comes back from alight to something unburnt (an ember doused to
+  // wood shows its paint again). Every other rewrite clears it
+  // (BurnLimbView::Set): a char, a cooked sear, an infection.
+  bool KeepsArtInto(uint32_t was, uint32_t into) const {
+    return AlightOf(into) || (AlightOf(was) && BurnStageOf(into) == 0);
+  }
+  // THE ONE BURN REWRITE of body voxel `i` to `into` (variant `variant`),
+  // with the art rule above. An UNPAINTED voxel going alight is given an
+  // art STAND-IN -- the merged art colour nearest its material's own, the
+  // variant it was drawn in (RefreshArtStandIns) -- because most of a body's
+  // surface is material-coloured, not painted (a deku is 63% bark_light /
+  // wood / birch_wood with art 0), and with nothing to breathe back to it
+  // would burn as the same flat ember the paint rule exists to avoid.
+  // Read-only on the stand-in table, so safe inside the burn pool.
+  void SetBurnVoxel(const BurnLimbView& v, size_t i, uint32_t into,
+                    uint32_t variant) const;
+  // Rebuilds the stand-in table when the art palette or the materials moved.
+  // SERIAL ONLY (PreTick, materials reload, IgniteLimb): the burn and shock
+  // pools read the table.
+  void RefreshArtStandIns();
   // Set fire to up to `count` of a limb's SURFACE voxels and return how many
   // took. The product is resolved from the reaction table (the first rule whose
   // product is tag:hot), so a material with no path to burning — bone, steel —
@@ -7894,6 +7926,10 @@ class MobSystem {
   // lattice LimbVoxelsAtSpawn counted. LimbVoxelCount reports the collider,
   // and mixing the two scales every fraction by (skinScale/physScale)^3.
   uint32_t LimbArtVoxelCount(uint64_t mobId, int limbIndex) const;
+  // Over every limb of a creature: voxels ALIGHT (AlightOf), and how many of
+  // those carry an art colour to breathe back to (SetBurnVoxel). --shot-mob's
+  // fire line; 0 painted of N alight means the paint was lost on ignition.
+  void AlightArtCounts(uint64_t mobId, uint32_t& alight, uint32_t& painted) const;
   // ---- joint twins (Mob::SyncJointTwins), for the `joint-twins` gate ----
   // Linked cells on this creature (building the links if they are not yet),
   // and the `k`th of them as (parent limb, child limb, rest-lattice cell).
@@ -8136,6 +8172,11 @@ class MobSystem {
   // rebuilt with the rest on reload.
   std::vector<uint8_t> burnStage_;
   std::vector<uint8_t> burnable_;
+  std::vector<uint8_t> alight_;  // AlightOf
+  // [mat * 3 + variant] -> merged 1-based art index, 0 = none (SetBurnVoxel).
+  // Keyed on the palette's size and hash and on the material count.
+  std::vector<uint8_t> artStandIn_;
+  uint64_t artStandInKey_ = 0;
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // has UNGATED decay/emit rules — ALIGHT
   // sim/bodyreact.h ruleDrying / selfDryingOnly: which rules are DRYING, and

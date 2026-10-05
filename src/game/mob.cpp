@@ -2428,6 +2428,12 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
       if (t == "flammable") flammable = true;
     burnable_[i] = flammable ? 1u : 0u;
   }
+  // AlightOf: the same field the renderer tests (the `_r2` heat-emit byte is
+  // packed from thermal.emit), so the CPU never keeps an art colour the
+  // shader would not breathe, nor clears one it would.
+  alight_.assign(mats.size(), 0u);
+  for (size_t i = 0; i < mats.size(); i++)
+    alight_[i] = mats[i].gpu.klass == CLASS_SOLID && mats[i].thermal.emit != 0 ? 1u : 0u;
   // Tag bits are looked up ONCE, by name, from whatever material declares
   // them — no hardcoded id and no hardcoded bit (BodyReactTagBit: exact, not
   // an OR, because every `hot` material also carries `organic`). `hot` and
@@ -8162,6 +8168,8 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // Runtime defs nothing has held for kDefIdleSweeps sweeps give their bricks
   // back (EvictUnusedDefs). After the risings, which may have composed.
   if (tick % kDefSweepTicks == 0) EvictUnusedDefs(-1, kDefIdleSweeps);
+  // Serial, ahead of the shock and burn pools that read it (SetBurnVoxel).
+  RefreshArtStandIns();
   // SHOCKS (docs/PLAN_electricity.md E4, mob_shock.cpp): the body query's
   // answers of tick T - K - 1, applied before the burn pass so a voxel a
   // shock lit burns this tick; then the stunned twitch.
@@ -16822,6 +16830,68 @@ namespace {
 bool OwnForStain(BurnLimbView& v, MicroBodySet* micro);  // defined below
 }  // namespace
 
+// ---- ART STAND-INS (SetBurnVoxel) -------------------------------------------
+// The merged art palette is FULL (the robot races filled it, 2026-10-02), so a
+// material's own colours cannot be added to it; the stand-in is the NEAREST
+// colour already there, by the same RGB distance MicroBodyMergeArt's overflow
+// uses, opaque entries only (a see-through wisp slot would hole the voxel --
+// microbody.wgsl artCovers). A cast of ~255 browns, skins, barks and cloths
+// lands close to any body material. Render-only: art never reaches a cell.
+void MobSystem::RefreshArtStandIns() {
+  const std::vector<uint32_t>* pal = microSet_ ? &microSet_->artColors : nullptr;
+  uint64_t key = 1469598103934665603ull;
+  auto mix = [&](uint64_t x) { key = (key ^ x) * 1099511628211ull; };
+  mix(matGpu_.size());
+  mix(pal ? pal->size() : 0);
+  if (pal)
+    for (uint32_t c : *pal) mix(c);
+  if (key == artStandInKey_ && artStandIn_.size() == matGpu_.size() * 3) return;
+  artStandInKey_ = key;
+  artStandIn_.assign(matGpu_.size() * 3, 0u);
+  if (!pal || pal->empty()) return;
+  for (size_t m = 0; m < matGpu_.size(); m++) {
+    if (!BurnableOf((uint32_t)m) && !AlightOf((uint32_t)m)) continue;
+    const uint32_t cols[3] = {matGpu_[m].color0, matGpu_[m].color1, matGpu_[m].color2};
+    for (int k = 0; k < 3; k++) {
+      // Material colour is RGBA8 with R in the LOW byte; art is 0xTTRRGGBB.
+      const int r = (int)(cols[k] & 255u), g = (int)((cols[k] >> 8) & 255u),
+                b = (int)((cols[k] >> 16) & 255u);
+      int64_t bestD = INT64_MAX;
+      size_t best = SIZE_MAX;
+      for (size_t a = 0; a < pal->size() && a < kArtPaletteSlotsGpu; a++) {
+        const uint32_t c = (*pal)[a];
+        if ((c >> 24) != 0u) continue;
+        const int dr = (int)((c >> 16) & 255u) - r, dg = (int)((c >> 8) & 255u) - g,
+                  db = (int)(c & 255u) - b;
+        const int64_t d = (int64_t)dr * dr + (int64_t)dg * dg + (int64_t)db * db;
+        if (d < bestD) { bestD = d; best = a; }
+      }
+      if (best != SIZE_MAX) artStandIn_[m * 3 + k] = (uint8_t)(best + 1);
+    }
+  }
+}
+
+void MobSystem::SetBurnVoxel(const BurnLimbView& v, size_t i, uint32_t into,
+                             uint32_t variant) const {
+  const uint32_t was = v.Mat(i);
+  uint32_t art = 0;
+  if (KeepsArtInto(was, into)) {
+    art = v.Art(i);
+    if (art == 0 && AlightOf(into) && !AlightOf(was) && was * 3 + 2 < artStandIn_.size()) {
+      // The variant it was DRAWN in: the micro path picks it by brick cell
+      // (microbody.wgsl paletteJitter(mat, c.x*7 + c.y*13 + c.z*29)), the
+      // cube path by the stored one (debris.wgsl paletteColor).
+      uint32_t shown = (v.Word(i) >> 12) & 3u;
+      if (v.microModel && *v.microModel >= 0) {
+        const IVec3 p = v.At(i);
+        shown = (uint32_t)(p.x * 7 + p.y * 13 + p.z * 29) % 3u;
+      }
+      art = artStandIn_[was * 3 + std::min(shown, 2u)];
+    }
+  }
+  v.SetWord(i, (into & 0xFFFu) | ((variant & 3u) << 12), art);
+}
+
 uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
                                  uint32_t onlyMat) {
   if (!BurnTablesReady() || v.Size() == 0) return 0;
@@ -16871,7 +16941,7 @@ uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
       if (nc == kNoBurnCell || st.idx[nc] == 0) { surface = true; break; }
     }
     if (!surface) continue;
-    v.Set(i, hot, 0);
+    SetBurnVoxel(v, i, hot, 0);
     const uint32_t c = cellOf(p);
     if (c != kNoBurnCell) st.front.push_back(c);
     lit++;
@@ -16890,7 +16960,7 @@ uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
         if (!vi) continue;
         const IVec3 p = v.At(vi - 1);
         MicroBodyPoke(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z,
-                      (uint8_t)v.Mat(vi - 1), 0);
+                      (uint8_t)v.Mat(vi - 1), (uint8_t)v.Art(vi - 1));
       }
     }
   }
@@ -16919,7 +16989,7 @@ uint32_t MobSystem::ElecRewriteLimb(BurnLimbView& v,
   std::vector<uint32_t> poked;
   for (const auto& [i, mat] : rw) {
     if (i >= v.Size() || mat == 0 || v.Mat(i) == 0 || v.Mat(i) == (mat & 0xFFFu)) continue;
-    v.Set(i, mat, 0);
+    SetBurnVoxel(v, i, mat, 0);
     n++;
     poked.push_back(i);
     if (tables && !st.idx.empty()) {
@@ -16936,7 +17006,8 @@ uint32_t MobSystem::ElecRewriteLimb(BurnLimbView& v,
       if (v.flipbook) *v.flipbook = -1;
       for (uint32_t i : poked) {
         const IVec3 p = v.At(i);
-        MicroBodyPoke(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, (uint8_t)v.Mat(i), 0);
+        MicroBodyPoke(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, (uint8_t)v.Mat(i),
+                      (uint8_t)v.Art(i));
       }
     }
   }
@@ -16945,6 +17016,7 @@ uint32_t MobSystem::ElecRewriteLimb(BurnLimbView& v,
 
 uint32_t MobSystem::IgniteLimb(uint64_t mobId, int limbIndex, uint32_t count,
                                uint32_t onlyMat) {
+  RefreshArtStandIns();  // serial entry point; a spell may land before PreTick
   Mob* mob = FindCreature(mobId);
   return mob ? mob->Ignite(limbIndex, count, onlyMat) : 0;
 }
@@ -17798,7 +17870,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // moves along the chain. This is the whole reason burn state is
       // encoded as material identity — one 16-bit poke, no re-pack, no
       // realloc, no origin shift, no rig fix-up (PLAN §3.4/§3.5).
-      v.Set(i, pm, (rr >> 6) % 3u);
+      // Going alight keeps (or stands in) the art colour (SetBurnVoxel):
+      // it is what the flame breathes back to on screen.
+      SetBurnVoxel(v, i, pm, (rr >> 6) % 3u);
       // A coat HELD in an absorbent substrate is released by any rewrite of
       // it, as on the ground; a FILM (every body material today) stays on
       // the voxel (DESIGN.md §6 clause 2b).
@@ -17810,7 +17884,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         st.coatTouched = true;
         stainBrick(p, 0);
       }
-      pokeBrick(p, (uint8_t)pm, 0);
+      pokeBrick(p, (uint8_t)pm, (uint8_t)v.Art(i));
     } else {
       // ---- A WOUND DRIES BACK TO FLESH (BurnLimbView's wound note) --------
       // Before anything leaves: if this voxel is a SOAK -- flesh StainWound
@@ -17841,7 +17915,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const uint32_t jitter = (rr >> 6) % 3u;
         uint32_t state =
             matGpu_[pm].klass == CLASS_LIQUID ? 7u
-            : v.gridState ? v.gridState(v.gridStateCtx, pm, v.Art(i), jitter)
+            // An alight voxel's art is only the colour it burns back to on
+            // screen (KeepsArtInto): its ash, smoke and fire are the fire's,
+            // as they were when ignition cleared the slot.
+            : v.gridState ? v.gridState(v.gridStateCtx, pm,
+                                        AlightOf(was) ? 0u : v.Art(i), jitter)
                           : jitter;
         // A POWDER product lands as the grains this sub-voxel is worth, not
         // as a whole cell (docs/PLAN_powder_mass.md §5): at skinScale 2 one
@@ -27756,6 +27834,25 @@ uint32_t MobSystem::LimbArtVoxelCount(uint64_t mobId, int limbIndex) const {
     return (uint32_t)(l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
   }
   return 0;
+}
+
+void MobSystem::AlightArtCounts(uint64_t mobId, uint32_t& alight,
+                                uint32_t& painted) const {
+  alight = painted = 0;
+  for (const Mob& mob : CreatureWithId(mobId)) {
+    if (mob.id_ != mobId) continue;
+    auto one = [&](uint32_t mat, uint32_t art) {
+      if (!AlightOf(mat & 0xFFFu)) return;
+      alight++;
+      if (art) painted++;
+    };
+    for (const MobLimb& l : mob.limbs_) {
+      if (l.HasFineSkin())
+        for (const PrefabVoxel& v : l.skinVoxels) one(v.material, v.color);
+      else
+        for (const DebrisVoxel& v : l.voxels) one(v.payload, v.color);
+    }
+  }
 }
 
 uint32_t MobSystem::LimbBodyCount() const {

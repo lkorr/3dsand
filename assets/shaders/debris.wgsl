@@ -348,11 +348,12 @@ fn vsBody(@builtin(vertex_index) vi : u32,
   // art run) rather than the material's cosmetic palette variant. Colour is
   // art; the material is what this voxel becomes if it lands in the grid.
   let art = (b.packed >> 28u) & 0xFu;
-  var albedo : vec3f;
+  // The material's own colour, which is also the flame a painted voxel that
+  // has gone alight breathes toward (burnTintPainted, common.wgsl).
+  let matCol = paletteColor(m, (b.packed >> 12u) & 0xFu, &materials);
+  var albedo = matCol;
   if (art != 0u) {
     albedo = unpackColor(materials[ART_PALETTE_BASE + (art - 1u)].color0);
-  } else {
-    albedo = paletteColor(m, (b.packed >> 12u) & 0xFu, &materials);
   }
 
   var out : BodyVSOut;
@@ -369,9 +370,10 @@ fn vsBody(@builtin(vertex_index) vi : u32,
   // ...and a burn-tinted one breathes toward the flame colour first, on the
   // same phase key. THE CROWN THAT FALLS OFF A BURNING TREE COMES THROUGH
   // HERE, not through the grid path, so leaving this out showed exactly the
-  // green glow burnTint exists to prevent.
-  let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
-                    burnTintWeightH(fh, R.time));
+  // green glow burnTint exists to prevent. A painted voxel alight (a severed
+  // sylvan arm still burning) breathes between its paint and its fire.
+  let bt = burnTintPainted(m, albedo, matCol, art != 0u, f32(m.emission) / 255.0,
+                           burnTintWeightH(fh, R.time));
   out.albedo = bt.albedo;
   out.wn = wn;
   out.world = world;

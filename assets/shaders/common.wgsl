@@ -2531,6 +2531,48 @@ fn burnTint(m : Material, albedo : vec3f, emis : f32, w : f32) -> BurnTint {
   return BurnTint(mix(albedo, TUNE_BURN_TINT_COLOR, w), emis * w);
 }
 
+// ---- A PAINTED BODY VOXEL ALIGHT (2026-10-05) -------------------------------
+// burnTint for creatures, where the "material remembers what it was" trick
+// cannot work: one `ember` serves every wood creature, whatever its paint. A
+// body voxel's ART colour can remember instead, so the burn pass KEEPS the art
+// slot when a voxel goes alight (MobSystem::KeepsArtInto; every other rewrite
+// still clears it), and the raster paths breathe each such voxel between that
+// paint and the burning material's own palette -- the same per-voxel phase,
+// rate and Min/Max as a burning leaf, emission scaled by the same weight. So a
+// burning sylvan reads as a sylvan shot through with fire, not a uniform
+// sheet of identical orange cubes (owner report 2026-10-05).
+//
+// ALIGHT = a solid that holds its block hot: the heat-emit byte of the
+// uploaded `_r2` (heat.h kHeatR2EmitShift, packed from materials.json
+// thermal.emit by Simulation::UploadTables). The CPU's AlightOf reads the same
+// field. It is NOT `emission > 0`: robe trim, gems and power cells glow and
+// are painted, and must not breathe.
+//
+// `painted` is "this voxel has an art colour and `albedo` is it" (plus
+// whatever dye and coat went on top); `flame` is the material's own palette
+// colour. Unpainted or not alight -> exactly burnTint.
+const WH_R2_EMIT_SHIFT : u32 = 12u;
+
+fn matAlight(m : Material) -> bool {
+  return m.klass == CLASS_SOLID && ((m._r2 >> WH_R2_EMIT_SHIFT) & 0xFFu) != 0u;
+}
+
+fn burnTintPainted(m : Material, albedo : vec3f, flame : vec3f, painted : bool,
+                   emis : f32, w : f32) -> BurnTint {
+  if (!painted || !matAlight(m)) { return burnTint(m, albedo, emis, w); }
+  // A burn-tinted material's palette is the UNBURNT leaf, not a flame.
+  let f = select(flame, TUNE_BURN_TINT_COLOR, (m.flags & MATF_BURNTINT) != 0u);
+  // CUBED: a body is a few big surfaces seen up close, not a canopy of
+  // thousands of leaves. On the leaf breath (mean ~0.58) a fully-alight
+  // creature was a flat salmon sheet with its paint gone, and w^2 (mean
+  // ~0.36) still was, because the emission rides the same weight and a lit
+  // ember is bright. w^3 keeps each voxel near its own colour most of the
+  // cycle and FLARES it to the flame, each on its own phase, so the creature
+  // stays legible and the fire crawls over it.
+  let wb = w * w * w;
+  return BurnTint(mix(albedo, f, wb), emis * wb);
+}
+
 // Camera-basis projection for raster geometry — no matrices; identical math to
 // the raymarcher's ray construction, so depth agrees across both paths.
 fn projectView(rel : vec3f, R : RenderParams) -> vec4f {

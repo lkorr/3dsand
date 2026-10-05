@@ -720,6 +720,9 @@ fn fs(in : VSOut) -> FSOut {
   // else, so this is one compare there.
   var shadeMat = mat;
   var shadeWeight = 1.0;   // how much of this cell's emission is the shade material's
+  // The paint a burning voxel breathes back to (burnTintPainted, common.wgsl).
+  // Not through a vessel's contents: the paint is the glass's, not theirs.
+  var painted = hitArt != 0u;
   let fillH = dot(vec3f(c) + vec3f(0.5) - vec3f(dims) * 0.5, in.fillPlane.xyz);
   if (c.x < in.fillSlices && fillH <= in.fillPlane.w + 1e-3) {
     shadeMat = materials[in.fillMat];
@@ -728,6 +731,7 @@ fn fs(in : VSOut) -> FSOut {
     // Seen through the glass: the contents' light by the share of the cell
     // they are, the same share their colour got.
     shadeWeight = HELD_FILL_MIX;
+    painted = false;
   }
 
   // Blood (or whatever else soaked in) OVER the art, before lighting, exactly
@@ -758,10 +762,15 @@ fn fs(in : VSOut) -> FSOut {
   // and like the cube path's — one shared definition, in common.wgsl
   let fh = pcg(u32(c.x * 2917 + c.y * 131 + c.z * 7919) + in.slot * 977u);
   // ...and burn-tinted matter breathes toward the flame colour on the same key
-  // (burnTint, common.wgsl) before it flickers. No mob material carries the
-  // flag today; the rule is that no path may shade emission without it.
-  let bt = burnTint(shadeMat, albedo, f32(shadeMat.emission) / 255.0 * shadeWeight,
-                    burnTintWeightH(fh, R.time));
+  // (burnTint, common.wgsl) before it flickers. A PAINTED voxel that has gone
+  // alight (an ember that was a sylvan's bark, flesh_burning that was painted
+  // skin) breathes between its paint and the burning material's palette the
+  // same way (burnTintPainted) -- each voxel on its own phase, so a burning
+  // body shimmers instead of reading as one flat orange sheet.
+  let flame = paletteJitter(shadeMat, u32(c.x * 7 + c.y * 13 + c.z * 29));
+  let bt = burnTintPainted(shadeMat, albedo, flame, painted,
+                           f32(shadeMat.emission) / 255.0 * shadeWeight,
+                           burnTintWeightH(fh, R.time));
   albedo = bt.albedo;
   // ...plus a glowing coat's own light (acid), which breathes on its pulse
   // rather than flickering like an ember.

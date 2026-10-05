@@ -2321,7 +2321,8 @@ def check_burn_tint_sites():
             # An argument to burnTint() may sit on the call line or the line
             # under it (the call is usually wrapped at 80 columns).
             window = line + " " + (lines[i - 1] if i else "")
-            if "burnTint(" in window:
+            # burnTintPainted() (the body paths) is burnTint plus the paint.
+            if re.search(r"burnTint(Painted)?\(", window):
                 continue
             if any(k[0] == name and k[1] in line for k in ALLOWED):
                 continue
@@ -3303,7 +3304,8 @@ def check_heat_mirror():
     cw = read("assets/shaders/common.wgsl") or ""
     for w, c in (("WH_ENTRY_HAS", "kHeatEntryHas"), ("WH_ENTRY_PAGE", "kHeatEntryPage"),
                  ("WH_PAGE_WORDS", "kHeatPageWords"), ("WH_HM_FREE_TOP", "kHmFreeTop"),
-                 ("WH_HM_NEXT_FRESH", "kHmNextFresh"), ("WH_HM_ENTRY", "kHmEntry")):
+                 ("WH_HM_NEXT_FRESH", "kHmNextFresh"), ("WH_HM_ENTRY", "kHmEntry"),
+                 ("WH_R2_EMIT_SHIFT", "kHeatR2EmitShift")):
         mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", cw, re.M)
         if not mw:
             problems.append(f"heat: common.wgsl lost {w} (the heat updraft's reader)")

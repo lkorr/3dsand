@@ -3861,6 +3861,19 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         std::fprintf(stderr, "--shot-mob: no clip \"%s\"\n", nm.c_str() + 1);
       continue;
     }
+    // "^N" SETS IT ON FIRE: N surface voxels on every limb (MobSystem::
+    // IgniteLimb, the spell/test entry point), then the settle ticks below
+    // let it spread. What a burning body looks like -- painted voxels
+    // breathing between their paint and the flame (burnTintPainted,
+    // common.wgsl) -- is otherwise a live-session question.
+    if (!nm.empty() && nm[0] == '^') {
+      const uint32_t n = (uint32_t)std::max(1, std::atoi(nm.c_str() + 1));
+      uint32_t lit = 0;
+      for (int li = 0; li < (int)def.limbs.size(); li++)
+        lit += mobs.IgniteLimb(id, li, n, 0);
+      std::printf("--shot-mob: ignited %u voxels\n", lit);
+      continue;
+    }
     // "+name" DRESSES rather than dismembers. Worn geometry is the one thing
     // about a rig that no headless mode could see: the shells only exist on a
     // body somebody put clothes on, and the only place that happened was the
@@ -3925,6 +3938,13 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   for (int i = 0; i < 90; i++) mobTick();
   std::printf("--shot-mob: %s locoState=%d clips=%d\n", spec.c_str(),
               mobs.LocoState(id), mobs.ActiveClips(id));
+  {
+    uint32_t alight = 0, painted = 0;
+    mobs.AlightArtCounts(id, alight, painted);
+    if (alight)
+      std::printf("--shot-mob: fire: %u voxels alight, %u with an art colour to "
+                  "breathe back to\n", alight, painted);
+  }
   {
     std::printf("--shot-mob: live clips:");
     for (const auto& cw : mobs.ClipWeights(id))
