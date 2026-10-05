@@ -3585,12 +3585,17 @@ static bool CorpseCompoundKept() {
   }();
   return kKeep;
 }
-// SANDVOX_LIMP_HULL=0: a limp ragdoll keeps its box compounds (the pre-round-4
-// behaviour; the A/B arm in one binary). See ApplyCorpseCollider.
+// A LIMP RAGDOLL KEEPS ITS BOX COMPOUNDS -- OFF BY DEFAULT since 2026-10-05
+// (owner decision: "keep limbs compound so they don't stretch out and get
+// janky"). Round 4 L swapped a limp limb to its hull; `ragdoll-dress`'s fall
+// arm then stretched a joint 4.39 vox against its 4.00 cap (3.06 compound).
+// SANDVOX_LIMP_HULL=1 is the round-4 L behaviour, kept as the A/B arm in one
+// binary. The other half of L -- a LIVING limb meeting loose bodies as its
+// hull (SANDVOX_LIVE_SIMHULL) -- is independent of this and stays on.
 static bool LimpHullOn() {
   static const bool kOn = [] {
     const char* e = std::getenv("SANDVOX_LIMP_HULL");
-    return !(e && e[0] == '0');
+    return e && e[0] == '1';
   }();
   return kOn;
 }
@@ -3718,7 +3723,8 @@ void Physics::ApplyCorpseCollider(uint64_t handle) {
   // the world -- not while somebody carries or throws it, where the grab and
   // throw code meet the shape they were written against.
   //
-  // ...AND A KNOCKED-DOWN CREATURE (RigLimp, fight64 round 4 L). A limp
+  // ...AND, ONLY UNDER SANDVOX_LIMP_HULL=1, A KNOCKED-DOWN CREATURE (RigLimp,
+  // fight64 round 4 L; off by default since 2026-10-05, see LimpHullOn). A limp
   // ragdoll is the same solver-owned jointed pile of box compounds a corpse
   // is, and in a brawl there are dozens: the all-six round-3 fight had 40.8
   // limp limbs a tick linear-casting as box compounds and 442 living-vs-limp

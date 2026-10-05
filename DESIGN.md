@@ -7206,7 +7206,20 @@ neighbors, so this needs an explicit connectivity pass:
   all-six fight had 40.8 limp limbs a tick linear-casting as box compounds
   and 442 living-vs-limp manifolds a step; the narrow phase's largest pairs
   were all a LIVING box compound (~20 boxes a limb) against something loose.
-  1. **A limp ragdoll's limbs take the corpse hull** (`RigLimp` joins
+  1. **OFF BY DEFAULT SINCE 2026-10-05 (owner decision: "keep limbs compound
+     so they don't stretch out and get janky"). A limp ragdoll's limbs keep
+     their box compounds; `SANDVOX_LIMP_HULL=1` is the arm described below.**
+     The hull stretched `ragdoll-dress`'s fall-arm joint to 4.39 vox against
+     its 4.00 cap (3.06 with compounds). Item 2 (living limbs meet loose
+     bodies as hulls) is independent and stays on; item 3's cache still
+     serves corpses, severed holds, dead-flesh debris and the living limbs'
+     sim-only hulls. What the brawl gives back is item 1's share of the table
+     below -- the "old" vs "limp hull" columns: rig-live vs rig-limp 265 -> 73
+     manifolds a step, limp limbs linear-casting 25.5 -> 5.2, Jolt Update
+     3.62 -> 2.13 ms. Not re-measured against "both" (no live-simhull-only
+     arm was run).
+     Round-4 text, for `SANDVOX_LIMP_HULL=1`:
+     **A limp ragdoll's limbs take the corpse hull** (`RigLimp` joins
      `RigDead` / `SeveredHold` / dead-flesh `Debris` in the role test). The
      flip is `StartRagdoll` re-deriving every slot's role; `BeginGetUp` makes
      the limbs `RigLive` again and the compound comes back. Nothing in
@@ -7216,7 +7229,8 @@ neighbors, so this needs an explicit connectivity pass:
      but never a new overlap. Rays (melee, lasers, the look ray) re-test a
      hull hit against the compound, as for corpses. The avatar's own limp
      limbs are `RigLive` (`Mob::LimbRole`) and keep their compounds.
-     `SANDVOX_LIMP_HULL=0` is the old arm.
+     (Was default-on with `SANDVOX_LIMP_HULL=0` as the old arm until
+     2026-10-05; now the default is the old arm.)
   2. **A living limb's SHAPE stays its compound; only the simulation's
      body-vs-body collide meets it as its hull.** The callback that already
      collided kinematic pairs plainly (package C) now hands Jolt the
@@ -7249,7 +7263,9 @@ neighbors, so this needs an explicit connectivity pass:
      carve rebuilds and the downed), flush wall 0.31 ms a tick.
   Measured (`SANDVOX_RUN_EXCLUSIVE=1 SANDVOX_PHYS_PAIRPROF=1 --gate
   mob-cap64`, one binary, back to back, env arms: old = `SANDVOX_LIMP_HULL=0
-  SANDVOX_LIVE_SIMHULL=0`, limp = `SANDVOX_LIVE_SIMHULL=0`). Each arm is a
+  SANDVOX_LIVE_SIMHULL=0`, limp = `SANDVOX_LIVE_SIMHULL=0`; the round-4
+  spellings -- since 2026-10-05 the default is limp hulls OFF and the "limp
+  hull" / "both" columns need `SANDVOX_LIMP_HULL=1`). Each arm is a
   different fight (54 / 57 / 57 alive at the end; dead rigs 3.7 / 3.3 / 4.3
   a tick), so the attribution is per body pair -- narrow-phase worker us per
   body pair, then manifolds a tick:
@@ -7284,11 +7300,12 @@ neighbors, so this needs an explicit connectivity pass:
   boxes, so a loose body can no longer rest inside a living limb's concavity,
   and a loose-body blow can be billed against the hull's surface a voxel
   before the voxels; a contact that switches from compound to hull opens a
-  new manifold once (one fresh contact report). `ragdoll-dress` is recorded
-  fail: its FALL arm's peak limb stretch is 4.39 vox against a 4.00 cap (3.06
-  with `SANDVOX_LIMP_HULL=0` and on main's exe; the slam arm and every shell
-  number are unchanged; owner options in `tests/baseline.json`
-  `_ragdollDressLimpHull_about`). Not taken: per-class solver
+  new manifold once (one fresh contact report). `ragdoll-dress` was recorded
+  fail under item 1: its FALL arm's peak limb stretch was 4.39 vox against a
+  4.00 cap (3.06 with compounds; the slam arm and every shell number
+  unchanged). Resolved 2026-10-05 by the owner's option 3 -- limp hulls off by
+  default (item 1 above; `tests/baseline.json` `_ragdollDressLimpHull_about`).
+  Not taken: per-class solver
   iteration overrides (`solveVel` is now 0.21 ms wall; Jolt takes the max
   over an island, so a lower count needs every body AND joint in the island
   overridden, and ragdoll joints are where it would show) and sleep changes
