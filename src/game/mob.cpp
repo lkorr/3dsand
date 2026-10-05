@@ -10528,6 +10528,63 @@ uint32_t Mob::SurfaceCount(const MobLimb& limb,
                            IVec3 skipOrigin) const {
   if (!sys_) return 0;
   if (skip && skip->empty()) skip = nullptr;
+  const bool fine = limb.HasFineSkin();
+  const size_t n = fine ? limb.skinVoxels.size() : limb.voxels.size();
+  if (n == 0) return 0;
+  auto at = [&](size_t i) -> IVec3 {
+    return fine ? IVec3{limb.skinVoxels[i].x, limb.skinVoxels[i].y,
+                        limb.skinVoxels[i].z}
+                : IVec3{limb.voxels[i].x, limb.voxels[i].y, limb.voxels[i].z};
+  };
+  // ---- A DENSE OCCUPANCY BITMAP OF THE LATTICE'S BOX (PLAN_fight64_perf B) --
+  // This ran once per limb on a creature's FIRST burn tick (surfaceAtSpawn)
+  // over an unordered_set of every voxel, and on a fine-skinned human that
+  // was the worst tick of a 64-creature fight: 12 ms of RecountBurn for the
+  // one creature that caught. One bit per cell of the box, padded by a cell
+  // each way so a neighbour read never leaves it, is the same predicate at a
+  // fraction of the cost. A box too big for that (no authored rig is near
+  // it) keeps the set below.
+  IVec3 mn = at(0), mx = mn;
+  for (size_t i = 1; i < n; i++) {
+    const IVec3 p = at(i);
+    mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
+    mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
+  }
+  const int64_t dx = (int64_t)(mx.x - mn.x) + 3, dy = (int64_t)(mx.y - mn.y) + 3,
+                dz = (int64_t)(mx.z - mn.z) + 3;
+  if (dx * dy * dz <= (int64_t)1 << 27) {
+    thread_local std::vector<uint64_t> bits;   // per thread: a pool task's own
+    const size_t cells = (size_t)(dx * dy * dz);
+    bits.assign((cells + 63) / 64, 0ull);
+    auto cellOf = [&](int x, int y, int z) {
+      return ((size_t)(z - mn.z + 1) * (size_t)dy + (size_t)(y - mn.y + 1)) *
+                 (size_t)dx + (size_t)(x - mn.x + 1);
+    };
+    for (size_t i = 0; i < n; i++) {
+      const IVec3 p = at(i);
+      const size_t c = cellOf(p.x, p.y, p.z);
+      bits[c >> 6] |= 1ull << (c & 63);
+    }
+    auto has = [&](size_t c) { return (bits[c >> 6] >> (c & 63)) & 1ull; };
+    const size_t sx = 1, sy = (size_t)dx, sz = (size_t)(dx * dy);
+    uint32_t surface = 0;
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t m = fine ? (limb.skinVoxels[i].material & 0xFFFu)
+                              : (limb.voxels[i].payload & 0xFFFu);
+      if (!sys_->BurnableOf(m)) continue;
+      const IVec3 p = at(i);
+      if (skip && std::binary_search(skip->begin(), skip->end(),
+                                     TwinRestKey(p.x + skipOrigin.x,
+                                                 p.y + skipOrigin.y,
+                                                 p.z + skipOrigin.z)))
+        continue;  // the parent's copy of this cell is the one counted
+      const size_t c = cellOf(p.x, p.y, p.z);
+      if (!has(c + sx) || !has(c - sx) || !has(c + sy) || !has(c - sy) ||
+          !has(c + sz) || !has(c - sz))
+        surface++;
+    }
+    return surface;
+  }
   // Occupancy by 64-bit key: skin coords are int16 and a mina limb runs past
   // 127 micro voxels, so CarveLimb's 8-bit-per-axis key would alias here.
   auto key = [](int x, int y, int z) {
@@ -10536,8 +10593,6 @@ uint32_t Mob::SurfaceCount(const MobLimb& limb,
            ((uint64_t)(uint32_t)(z + 32768) << 32);
   };
   std::unordered_set<uint64_t> occ;
-  const bool fine = limb.HasFineSkin();
-  const size_t n = fine ? limb.skinVoxels.size() : limb.voxels.size();
   occ.reserve(n * 2);
   for (size_t i = 0; i < n; i++) {
     const int x = fine ? limb.skinVoxels[i].x : limb.voxels[i].x;
@@ -10570,14 +10625,18 @@ uint32_t Mob::SurfaceCount(const MobLimb& limb,
 }
 
 void Mob::RecountBurn(uint32_t tick, bool force) {
+  if (RecountBurnMeasure(tick, force)) ApplyBurnCap();
+}
+
+bool Mob::RecountBurnMeasure(uint32_t tick, bool force) {
   burnprof::Scope bpScope(burnprof::kRecount);
   // A corpse's burnt fraction is still MEASURED (the gates and the HUD read
   // it); only the cap's consequence — ApplyBurnCap's hp clamp and death — is
   // the living's.
-  if (!burnFracDirty_ || rigReleased_ || !def_ || !sys_) return;
+  if (!burnFracDirty_ || rigReleased_ || !def_ || !sys_) return false;
   if (!force && tick - burnRecountTick_ < kBurnRecountTicks &&
       burnRecountTick_ != 0)
-    return;
+    return false;
   burnFracDirty_ = false;
   burnRecountTick_ = tick ? tick : 1u;
   // BURNT SURFACE OVER SURFACE — the body-surface-area grading burns get in
@@ -10655,7 +10714,7 @@ void Mob::RecountBurn(uint32_t tick, bool force) {
                                    0.0f, 1.0f)
                       : 0.0f;
   burnCap_ = BurnHealthCapFor(burnFrac_);
-  ApplyBurnCap();
+  return true;
 }
 
 void Mob::ApplyBurnCap() {
@@ -13991,7 +14050,7 @@ constexpr size_t kCrossHeatCells = 2048;
 constexpr uint32_t kCrossHeatFrontPerLimb = 768;
 }  // namespace
 
-void Mob::BuildCrossLimbHeat(uint32_t tick) {
+void Mob::BuildCrossLimbHeat(uint32_t tick, BurnSink* sink) {
   burnprof::Scope bpScope(burnprof::kCrossHeat);
   crossHeat_.clear();
   if (!sys_ || limbs_.size() < 2) return;  // one limb has nothing to cross to
@@ -14009,11 +14068,12 @@ void Mob::BuildCrossLimbHeat(uint32_t tick) {
       views[li] = ViewOf(limbs_[li]);
       parts[li] = &views[li];
     }
-  sys_->BuildCrossHeat(parts, tick, crossHeat_);
+  sys_->BuildCrossHeat(parts, tick, crossHeat_, sink ? &sink->stats : nullptr);
 }
 
 void MobSystem::BuildCrossHeat(const std::vector<BurnLimbView*>& parts,
-                               uint32_t tick, std::vector<CrossHeatCell>& out) {
+                               uint32_t tick, std::vector<CrossHeatCell>& out,
+                               BurnStats* stats) {
   out.clear();
   if (parts.size() < 2) return;  // one part has nothing to cross to
   if (CurrentTuning().combustion.crossLimbPct <= 0) return;
@@ -14104,7 +14164,7 @@ void MobSystem::BuildCrossHeat(const std::vector<BurnLimbView*>& parts,
       out[w++] = out[i];
   }
   out.resize(w);
-  burnStats_.crossCells += (uint32_t)w;
+  (stats ? *stats : burnStats_).crossCells += (uint32_t)w;
 }
 
 void MobSystem::BuildBurnIndex(BurnLimbView& v, SplatSink* sink) {
@@ -16886,7 +16946,29 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (!BurnTablesReady() || v.Size() == 0 || frontBudget == 0) return false;
   BodyBurnState& st = *v.burn;
   const uint32_t limbKey = rngKey;
-  burnStats_.visits++;
+  // ---- INSIDE A WORK-POOL TASK, SHARED WRITES ARE RECORDED (BurnSink) -----
+  // Everything below that is not this limb's own state goes through these:
+  // the counters into the sink's copies, a chunk-fetch request into its list,
+  // the micro brick's ownership and pokes into its log (pokeBrick /
+  // stainBrick, after ensureOwnedBrick), a body effect into its fx list. The
+  // serial replay (Mob::BurnHeadFinish) makes them in this same order. With
+  // no sink every one of them is the direct write it always was.
+  BurnSink* const sink = v.sink;
+  BurnStats& bstat = sink ? sink->stats : burnStats_;
+  WornStats& wstat = sink ? sink->worn : wornStats_;
+  auto requestFetch = [&](const IVec3& wc) {
+    if (sink)
+      sink->fetches.push_back(wc);
+    else
+      world.RequestChunkFetch(wc, World::FetchSource::Mob);
+  };
+  auto bpCount = [sink](int c, uint64_t n) {
+    if (sink)
+      sink->prof[c] += n;
+    else
+      burnprof::Count(c, n);
+  };
+  bstat.visits++;
   // THE RAIN reaches this limb? Asked once per visit, and only while the rain
   // word can ask it (rain now, or wet ground for the RAINDAMP rules): the
   // sim's exposure walked on the CPU mirror at the limb's origin
@@ -16894,7 +16976,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // "a body is always exposed".
   const bool rainExp =
       (weatherRain_ & (kRainAmountMask | (0xFFu << kRainWetShift))) == 0u || !v.xf ||
-      RainExposedCpu(world, v.xf->pos);
+      RainExposedCpu(world, v.xf->pos, sink ? &sink->fetches : nullptr);
 
   // One-entry chunk memo. A limb spans one or two chunks and the ignition scan
   // asks the same one over and over; without this the walk is a hash lookup per
@@ -16920,7 +17002,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // asked for — so a burning bonfire read as empty air forever. Bounded
     // (kFetchPerTick), coalesced, and one tick latent.
     if (!memoCC || memoCC->voxels.size() != kChunkVol) {
-      world.RequestChunkFetch(wc, World::FetchSource::Mob);
+      requestFetch(wc);
       return 0u;
     }
     const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
@@ -16936,7 +17018,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   std::vector<uint32_t> emitted;
   auto emitCell = [&](IVec3 c, uint32_t mat, uint32_t state) {
     if (opsBudget == 0 || cellOps.size() >= kMaxCellOpsPerTick) {
-      burnStats_.emitRefused++;
+      bstat.emitRefused++;
       return;
     }
     if (!world.CellInWindow(c)) return;
@@ -16993,9 +17075,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // this pass lands in the grid takes (emitCell below), never an RNG key.
   auto noteBodyFx = [&](const ReactionGpu& r, IVec3 vp) {
     const uint32_t fx = ReactFxIdOf(r.cond);
-    if (fx == 0 || bodyFx_.size() >= kBodyFxPerTick) return;
+    std::vector<ReactFxEvent>& fxOut = sink ? sink->fx : bodyFx_;
+    if (fx == 0 || fxOut.size() >= kBodyFxPerTick) return;
     const Vec3 wv = worldOf(vp);
-    bodyFx_.push_back({fx, {ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, tick});
+    fxOut.push_back({fx, {ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, tick});
   };
 
   // ---- the cheap gate: walk the WORLD side, not the body side -----------
@@ -17110,7 +17193,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       sleepKey = h ? h : 1u;
     }
     if (sleepKey && sleepKey == st.sleepKey) {  // asleep
-      burnStats_.sleeps++;
+      bstat.sleeps++;
       // The idle exit's grace, still counting: an index nobody else keeps
       // warm is released on the same tick it would have been awake, and the
       // key survives the release (it digests the world, not the index).
@@ -17133,7 +17216,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const uint32_t need = (uint32_t)std::min<uint64_t>(box, kBurnScanCells);
     if (*v.walkBudget < need) {
       v.walkDeferred = true;
-      burnStats_.walkDeferred++;
+      bstat.walkDeferred++;
       return changed;
     }
     *v.walkBudget -= need;
@@ -17145,9 +17228,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // Taken ahead for this box (PrecomputeBurnWalks): the same cells, and the
     // same fetch requests issued now, in the walk's order.
     scanHot = pre->scanHot;
-    for (const IVec3& wc : pre->fetches)
-      world.RequestChunkFetch(wc, World::FetchSource::Mob);
-    burnStats_.walkCells += pre->seen;
+    for (const IVec3& wc : pre->fetches) requestFetch(wc);
+    bstat.walkCells += pre->seen;
   } else {
     burnprof::Scope bpWalk(burnprof::kWalk);
     uint32_t seen = 0;
@@ -17174,7 +17256,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           }
           // Unknown reads as air, and is asked for (worldMatAt's note).
           if (!memoCC || memoCC->voxels.size() != kChunkVol) {
-            world.RequestChunkFetch(wc, World::FetchSource::Mob);
+            requestFetch(wc);
             continue;
           }
           const uint32_t* row = memoCC->voxels.data() +
@@ -17189,7 +17271,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({xx, y, z});
           }
         }
-    burnStats_.walkCells += seen;
+    bstat.walkCells += seen;
   }
 
   // ---- A SIBLING LIMB'S HEAT MUST ALSO WAKE THIS ONE ----------------------
@@ -17269,7 +17351,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     Mob::DropBurnIndex(st);
   st.quiet = 0;
   st.idle = false;
-  if (st.idx.empty()) BuildBurnIndex(v);
+  if (st.idx.empty()) BuildBurnIndex(v, sink ? &sink->index : nullptr);
   if (st.idx.empty()) return changed;  // refused: absurd bounding box
 
   const IVec3 bd = st.dims, bm = st.min;
@@ -17346,7 +17428,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // when the whole list was built and a window of it evaluated: each kind's
   // expected evaluations per tick are what they were, without paying for the
   // nine tenths nobody evaluated.
-  burnprof::Count(burnprof::kFront, st.front.size());
+  bpCount(burnprof::kFront, st.front.size());
   burnprof::Scope bpQueue(burnprof::kQueue);
   const size_t nFront = st.front.size();
   const uint64_t candCap = (uint64_t)frontBudget + frontBudget / 8u + 16u;
@@ -17373,7 +17455,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       for (const IVec3& d : kBurnDirs)
         queueNbr(cellOf({p.x + d.x, p.y + d.y, p.z + d.z}));
     }
-    burnprof::Count(burnprof::kWindowed, 1);
+    bpCount(burnprof::kWindowed, 1);
   }
   bpQueue.Stop();
 
@@ -17523,7 +17605,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             // below meaningless: 15,640 "passed" samples turned out to be
             // overwhelmingly samples that seeded nothing at all.
             if (seed == kNoBurnCell || st.idx[seed] == 0) continue;
-            burnprof::Count(burnprof::kSeedHits, 1);
+            bpCount(burnprof::kSeedHits, 1);
             // Already a candidate: queue() would refuse it, so whether a coat
             // covers it is moot -- and the march was most of the cost of a
             // dressed body's seeding.
@@ -17539,20 +17621,20 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             if (v.occlude) {
               const Vec3 p = fc + u * sa + w * sb;
               if (v.WornAlong(p, dv * -1.0f, kWornSeedReach)) {
-                wornStats_.seedsBlocked++;
+                wstat.seedsBlocked++;
                 continue;
               }
-              wornStats_.seedsPassed++;
+              wstat.seedsPassed++;
             }
-            burnprof::Count(burnprof::kSeedNew, 1);
+            bpCount(burnprof::kSeedNew, 1);
             queue(seed);
           }
       }
     }
-    burnprof::Count(burnprof::kSeedProbes, probes0 - probes);
-    burnprof::Count(burnprof::kSeedHot, seedHot);
-    burnprof::Count(burnprof::kSeedFaces, seedFaces);
-    burnprof::Count(burnprof::kSeedFootReads, seedFootReads);
+    bpCount(burnprof::kSeedProbes, probes0 - probes);
+    bpCount(burnprof::kSeedHot, seedHot);
+    bpCount(burnprof::kSeedFaces, seedFaces);
+    bpCount(burnprof::kSeedFootReads, seedFootReads);
   }
 
   // ---- A CORROSIVE COAT SEEDS ITS OWN VOXELS -----------------------------
@@ -17599,9 +17681,23 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // and it is one that only fires on the FIRST voxel the body ever loses —
   // which is why it survived the mob tests and crashed the moment the player
   // caught fire.
+  // In a task the clone is RECORDED (once per visit) and made by the replay;
+  // pokes after it are recorded whenever the brick is owned or about to be,
+  // and the replay re-asks "is it owned now" exactly as this code would have.
+  bool ownQueued = false;
   auto ensureOwnedBrick = [&]() {
     if (!v.microModel || *v.microModel < 0 || !microSet_) return;
     if (v.carved && *v.carved) return;  // already a private copy
+    if (sink) {
+      if (!ownQueued) {
+        BurnSink::Micro r;
+        r.kind = BurnSink::kOwn;
+        r.limb = (int16_t)sink->curLimb;
+        sink->micro.push_back(r);
+        ownQueued = true;
+      }
+      return;
+    }
     const int own = MicroBodyOwn(*microSet_, (uint32_t)(*v.microModel));
     if (own < 0) return;  // pool full: the body burns, the skin stops keeping up
     *v.microModel = own;
@@ -17609,6 +17705,42 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // A carved/burnt limb must stop flipbooking: a frame swap re-points
     // rendering at an intact authored model and would heal the burns.
     if (v.flipbook) *v.flipbook = -1;
+  };
+  // A brick poke at lattice cell `p`: only on an OWNED brick (the carved
+  // latch ensureOwnedBrick sets), as every poke site has always required.
+  auto pokeBrick = [&](const IVec3& p, uint8_t mat, uint8_t art) {
+    if (!v.carved || !v.microModel || *v.microModel < 0 || !microSet_) return;
+    if (sink) {
+      if (!*v.carved && !ownQueued) return;
+      BurnSink::Micro r;
+      r.kind = BurnSink::kPoke;
+      r.limb = (int16_t)sink->curLimb;
+      r.x = (int16_t)p.x; r.y = (int16_t)p.y; r.z = (int16_t)p.z;
+      r.val = mat;
+      r.art = art;
+      sink->micro.push_back(r);
+      return;
+    }
+    if (*v.carved)
+      MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z, mat,
+                    art);
+  };
+  // A coat poke at `p`, owning the brick first (OwnForStain), as every coat
+  // write here has always done.
+  auto stainBrick = [&](const IVec3& p, uint16_t stain) {
+    if (sink) {
+      if (!v.microModel || *v.microModel < 0 || !microSet_) return;
+      BurnSink::Micro r;
+      r.kind = BurnSink::kStain;
+      r.limb = (int16_t)sink->curLimb;
+      r.x = (int16_t)p.x; r.y = (int16_t)p.y; r.z = (int16_t)p.z;
+      r.val = stain;
+      sink->micro.push_back(r);
+      return;
+    }
+    if (OwnForStain(v, microSet_))
+      MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z,
+                         stain);
   };
 
   // Cells a removal emptied this tick, for the bared-bone pass after the loop.
@@ -17643,13 +17775,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           v.Stain(i) != 0) {
         v.SetStain(i, 0);
         st.coatTouched = true;
-        if (OwnForStain(v, microSet_))
-          MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y,
-                             p.z, 0);
+        stainBrick(p, 0);
       }
-      if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 && microSet_)
-        MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
-                      (uint8_t)pm, 0);
+      pokeBrick(p, (uint8_t)pm, 0);
     } else {
       // ---- A WOUND DRIES BACK TO FLESH (BurnLimbView's wound note) --------
       // Before anything leaves: if this voxel is a SOAK -- flesh StainWound
@@ -17667,10 +17795,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         uint32_t backWord = 0, backColor = 0;
         if (v.revive(v.reviveCtx, p, backWord, backColor)) {
           v.SetWord(i, backWord, backColor);
-          if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 &&
-              microSet_)
-            MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
-                          (uint8_t)(backWord & 0xFFu), (uint8_t)backColor);
+          pokeBrick(p, (uint8_t)(backWord & 0xFFu), (uint8_t)backColor);
           changed = true;
           return;
         }
@@ -17728,9 +17853,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // an acid bath die of "burns" (armor-react) while its plate held. A
       // voxel that leaves from a burn stage (flesh_burning -> ash) is fire's.
       if (BurnStageOf(was)) st.burntAway++;
-      if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 && microSet_)
-        MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
-                      0, 0);
+      pokeBrick(p, 0, 0);
     }
     changed = true;
   };
@@ -17771,7 +17894,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     faceOutW[k] = Rotate(q, Vec3{(float)d.x, (float)d.y, (float)d.z});
   }
   const size_t nCand = cand.size();
-  burnprof::Count(burnprof::kCandidates, nCand);
+  bpCount(burnprof::kCandidates, nCand);
   const uint32_t frontAtLoop = frontBudget;
   const size_t cand0 =
       nCand ? (size_t)(Hash3(limbKey, tick, 0xCA2D0u) % (uint32_t)nCand) : 0;
@@ -17779,7 +17902,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   for (size_t cj = 0; cj < nCand; cj++) {
     const uint32_t cell = cand[(cand0 + cj) % nCand];
     if (frontBudget == 0) {
-      burnStats_.frontSkipped += nCand - cj;
+      bstat.frontSkipped += nCand - cj;
       break;
     }
     frontBudget--;
@@ -17918,10 +18041,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const uint32_t worn =
             threat ? v.WornAlong(wv, faceOutW[k], kWornNbrReach) : 0u;
         if (threat && v.occlude) {
-          wornStats_.nbrThreats++;
-          if (worn) wornStats_.nbrSubstituted++;
+          wstat.nbrThreats++;
+          if (worn) wstat.nbrSubstituted++;
           else if (v.WornAlong(wv, faceOutW[k], kWornNbrReach * 4.0f))
-            wornStats_.nbrMissInReach++;
+            wstat.nbrMissInReach++;
         }
         nmat[k] = worn ? worn : wm;
         nworld[k] = wm;
@@ -17949,13 +18072,13 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             if (wornX) {
               nmat[k] = wornX;
               xm = 0;
-              if (v.occlude) wornStats_.nbrSubstituted++;
+              if (v.occlude) wstat.nbrSubstituted++;
             }
           }
           if (xm) {
             nmat[k] = xm;
             ncross[k] = true;
-            burnStats_.crossFaces++;
+            bstat.crossFaces++;
             // The same world-pitch widening the grid gets, from the same
             // argument: the sibling's fire is stored in whole world cells, so
             // a face pointing into it counts for as much as that fire is WIDE.
@@ -18000,8 +18123,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       uint32_t exposed = 0;
       for (int k = 0; k < 6; k++)
         if (ncell[k] == kNoBurnCell) exposed++;
-      burnStats_.candidates++;
-      burnStats_.exposed[exposed]++;
+      bstat.candidates++;
+      bstat.exposed[exposed]++;
     }
 
     // ---- 0. THE COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR (DESIGN.md §6) -------
@@ -18055,11 +18178,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       v.SetStain(wi, next);
       st.coatTouched = true;
       changed = true;
-      if (OwnForStain(v, microSet_)) {
-        const IVec3 wp = v.At(wi);
-        MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, wp.x, wp.y,
-                           wp.z, next);
-      }
+      stainBrick(v.At(wi), next);
     };
     auto isFlame = [&](uint32_t prod) {
       if (prod == kProdKeep) return false;
@@ -18185,12 +18304,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const uint32_t verdict = coatRuleVerdict(flame, rf >= 0);
         if ((verdict & kCoatVerdictMatch) == 0) continue;
         if (verdict & kCoatVerdictCovers) covered = true;
-        burnStats_.coatMatched++;
+        bstat.coatMatched++;
         if (rr % kReactChanceDen >=
             RainScaledChance(r.cond, r.chance, weatherRain_, rainExp))
           continue;
         // ---- FIRED ----
-        burnStats_.coatFired++;
+        bstat.coatFired++;
         if (rf >= 0) release(rf, r.prodSelf, rr);
         if (rewrites && pk == -1) {
           applyCause = "coat rule on its wearer";
@@ -18235,7 +18354,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // that leaves takes the coat (applyTo clears the tombstone's).
           const uint32_t cf = m < matCatchForm_.size() ? matCatchForm_[m] : 0u;
           if (rf >= 0 && cf != 0 && cf != m) {
-            burnStats_.coatCaught++;
+            bstat.coatCaught++;
             applyCause = "coat flame catch";
             applyTo(cell, cf, Pcg(rr ^ 0x2Cu));
             selfDone = true;
@@ -18251,7 +18370,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         coat = coatAmt ? BodyStainMat(cw) : 0u;
         if (coat >= matGpu_.size()) coat = 0, coatAmt = 0;
       }
-      if (covered) burnStats_.coatCovered++;
+      if (covered) bstat.coatCovered++;
     }
     bool fired = selfDone;
 
@@ -18273,7 +18392,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // it round the village (gate village-harrowby, living-blood).
       if (!ruleDrying_.empty() && mg.reactOffset + ri < ruleDrying_.size() &&
           ruleDrying_[mg.reactOffset + ri] && v.LivingKeeps(vp)) {
-        burnStats_.livingDryRefused++;
+        bstat.livingDryRefused++;
         continue;
       }
       if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_, rainExp)) continue;
@@ -18375,15 +18494,15 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
               if (ReactNbrMatches(r, ntan[k][j], matGpu_)) w++;
             if (w > cnt) {
               cnt = w;
-              burnStats_.rampWidened++;
+              bstat.rampWidened++;
             }
           }
         }
         chance = ReactScaledChance(r, cnt);
-        burnStats_.rampRolls++;
-        burnStats_.hotFaces[cnt < 7 ? cnt : 6]++;
+        bstat.rampRolls++;
+        bstat.hotFaces[cnt < 7 ? cnt : 6]++;
         if (chance == 0) {
-          burnStats_.rampRefused++;
+          bstat.rampRefused++;
           continue;
         }
       }
@@ -18423,7 +18542,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // impossible at 25%, which is a different statement from "rare".
         const uint32_t scaled = (chance * v.crossPct) / 100u;
         chance = scaled ? scaled : 1u;
-        burnStats_.crossOnly++;
+        bstat.crossOnly++;
       }
       // Weather last, on the fully-scaled chance: rain douses a burning limb
       // and damps its catching exactly as it does a grid cell (reactcpu.h).
@@ -18477,7 +18596,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                 rewrote && heldCoat ? 0u : coatLevelsAfter(coatAmt, 1u);
             setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
           }
-          burnStats_.coatPartner++;
+          bstat.coatPartner++;
           fired = true;
           continue;
         }
@@ -18556,7 +18675,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     }
   }
   bpCand.Stop();
-  burnprof::Count(burnprof::kEvaluated, frontAtLoop - frontBudget);
+  bpCount(burnprof::kEvaluated, frontAtLoop - frontBudget);
 
   // ---- WHAT A REMOVAL BARES IS BLOODY (materials.json `bareBlood`) --------
   //
@@ -18606,10 +18725,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         v.SetStain(bi, next);
         st.coatTouched = true;
         changed = true;
-        if (!owned) owned = OwnForStain(v, microSet_);
-        if (owned)
-          MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, bp.x, bp.y,
-                             bp.z, next);
+        if (sink) {
+          stainBrick(bp, next);   // the replay owns it at the first
+        } else {
+          if (!owned) owned = OwnForStain(v, microSet_);
+          if (owned)
+            MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, bp.x, bp.y,
+                               bp.z, next);
+        }
       }
     }
   }
@@ -18814,6 +18937,7 @@ void MobSystem::BurnWalkOf(const BurnLimbView& v, const World& world,
 // limb's box, digest and walk into the creature's own burnPre_. Reads the
 // world mirror and the tables only; nothing in BurnLimbs writes either.
 void MobSystem::PrecomputeBurnWalks(uint32_t tick, World& world) {
+  burnprof::Scope bpScope(burnprof::kBurnPre);
   const World& cw = world;
   workpool::ParallelFor(mobs_.size(), 1, [&](size_t i) {
     Mob& m = mobs_[i];
@@ -18840,6 +18964,49 @@ void MobSystem::PrecomputeBurnWalks(uint32_t tick, World& world) {
   });
 }
 
+namespace {
+// The sink's counters into the system's (BurnSink). Integer sums: the order
+// the creatures are added in cannot change them.
+void AddBurnStats(MobSystem::BurnStats& a, const MobSystem::BurnStats& b) {
+  a.candidates += b.candidates;
+  a.livingDryRefused += b.livingDryRefused;
+  a.rampRolls += b.rampRolls;
+  a.rampRefused += b.rampRefused;
+  a.rampWidened += b.rampWidened;
+  for (int k = 0; k < 7; k++) {
+    a.hotFaces[k] += b.hotFaces[k];
+    a.exposed[k] += b.exposed[k];
+  }
+  a.crossCells += b.crossCells;
+  a.crossFaces += b.crossFaces;
+  a.crossOnly += b.crossOnly;
+  a.visits += b.visits;
+  a.sleeps += b.sleeps;
+  a.walkCells += b.walkCells;
+  a.indexBuilds += b.indexBuilds;
+  a.indexCells += b.indexCells;
+  a.looseVisits += b.looseVisits;
+  a.walkDeferred += b.walkDeferred;
+  a.coatMatched += b.coatMatched;
+  a.coatFired += b.coatFired;
+  a.coatCovered += b.coatCovered;
+  a.coatPartner += b.coatPartner;
+  a.coatCaught += b.coatCaught;
+  a.frontSkipped += b.frontSkipped;
+  a.emitRefused += b.emitRefused;
+}
+void AddWornStats(MobSystem::WornStats& a, const MobSystem::WornStats& b) {
+  a.seedsBlocked += b.seedsBlocked;
+  a.seedsPassed += b.seedsPassed;
+  a.nbrSubstituted += b.nbrSubstituted;
+  a.nbrThreats += b.nbrThreats;
+  a.nbrMissInReach += b.nbrMissInReach;
+  a.splatBlocked += b.splatBlocked;
+  a.splatPassed += b.splatPassed;
+}
+static_assert(burnprof::kNCount <= 16, "BurnSink::prof holds 16 counters");
+}  // namespace
+
 void MobSystem::BurnLimbs(uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns) {
@@ -18854,67 +19021,191 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
   // pass kills this tick must not be burnt a second time from the dead pot.
   std::vector<uint8_t> dead(nm, 0);
   for (size_t i = 0; i < nm; i++) dead[i] = !mobs_[i].alive_ ? 1 : 0;
-  // One pot over the creatures `in` admits, split as Mob::BurnTick splits a
-  // creature's share over its limbs (its FAIR SHARE note), by each
-  // creature's burning weight. Head-of-queue spending here pulsed exactly as
-  // it did across limbs, one creature per tick, once there were two burning
-  // bodies.
+  if (burnSinks_.size() < nm) burnSinks_.resize(nm);
+  BurnSink* const sinks = burnSinks_.data();
   // ---- HEADS, THEN TAILS (PLAN_fight64_perf M) ----------------------------
   // Each creature's BurnTick is its head (the burn loop under the shared pot,
   // the infection, the pulp, the heals) and its tail (the joint-twin sync and
-  // the burn recount). The heads run first, in the pot's order, because the
-  // pot makes them order-dependent; then the tails, in the same order. A tail
-  // reads and writes only its own creature (a head writes the world through
-  // cell ops and nothing of another creature), so the expensive half of
-  // every sync -- the reconcile walk over each twin cell -- runs across the
-  // work pool (Mob::SyncJointTwinsPrepare), and what touches shared state
-  // (brick pokes, the flush of removed cells, the recount that may kill) is
-  // finished serially in pot order. What moved: a creature's sync now runs
-  // after the OTHER creatures' burns instead of before them, so a flush's
-  // particles and a brick's copy-on-write land later in their lists.
-  std::vector<size_t> tails;
-  std::vector<Mob::TwinSyncOut> twinOut;
-  auto burnPot = [&](auto in) {
-    uint32_t frontBudget = kBurnFrontPerTick;
-    uint32_t opsBudget = kBurnOpsPerTick;
-    std::vector<uint64_t> weight(nm, 0);
+  // the burn recount). The heads run first, in the pot's order; then the
+  // tails, in the same order. A tail reads and writes only its own creature
+  // (a head writes the world through cell ops and nothing of another
+  // creature), so the expensive half of every sync -- the reconcile walk over
+  // each twin cell -- runs across the work pool (Mob::SyncJointTwinsPrepare),
+  // and what touches shared state (brick pokes, the flush of removed cells) is
+  // finished serially in pot order. The recount's sweep runs across the pool
+  // too (Mob::RecountBurnMeasure, PLAN_fight64_perf B); only its consequence
+  // -- the hp clamp, a death -- is applied serially, in pot order, after
+  // every creature's sync.
+  //
+  // ---- AND THE HEAD'S BURN LOOP ACROSS THE POOL (PLAN_fight64_perf B) -----
+  // One pot over the creatures `in` admits, split as Mob::BurnTick splits a
+  // creature's share over its limbs (its FAIR SHARE note), by each creature's
+  // burning weight -- but every creature's slice is now FIXED BEFORE ANYBODY
+  // BURNS, so the burn loops (Mob::BurnHeadLimbs) can run across the work
+  // pool, each under its own slice, each into its own BurnSink. The slices
+  // are a PREFIX ALLOCATION in pot order: BurnShareOf as before, but the pot
+  // is charged the slice HANDED OUT rather than the slice SPENT, so the
+  // slices sum to at most the pot whatever the creatures then spend (rule 2:
+  // the bound is the same pot). What that moves, deliberately:
+  //   * a creature no longer inherits what the creatures before it in the
+  //     rotation left unspent this tick -- unspent budget is not handed on;
+  //   * a creature with no burn work of its own but HOT CONTACT (the walk
+  //     taken ahead found something reactive round one of its limbs: it is
+  //     catching) is weighed at 64 a touching limb, the floor
+  //     Mob::LimbBurnWeight gives a just-rebuilt limb, instead of being
+  //     offered the whole remainder at its turn;
+  //   * a creature with no burn work and nothing hot round any limb runs its
+  //     idle pass (the sleep keys, the index grace) on a token slice (1 front,
+  //     0 ops): it spends none -- every input BurnOneLimb could wake on is
+  //     either its weight's (front, alight, corrosive coat) or the walk's;
+  //   * every admitted creature runs its head every tick: the old loop
+  //     stopped at the first creature that found the pot empty, which skipped
+  //     the rest's infection, pulp and heal ticks with it;
+  //   * within a creature the flushes (FlushBurn) run after ALL its limbs have
+  //     burnt (in the loop's rotation), not between them, so a flush that
+  //     severs or kills no longer stops the creature's later limbs burning
+  //     this tick.
+  // The serial finish (Mob::BurnHeadFinish) then replays each sink and runs
+  // the flushes and the infection/pulp/heal tail, creature by creature in pot
+  // order: every shared structure sees the sequence the serial loop made.
+  //
+  // BOTH POTS' LOOPS IN ONE POOL PASS. A head reads only its own creature and
+  // the world mirror, neither of which the living's finish and tails write
+  // for anybody else, so the dead pot's loops run beside the living's (the
+  // pool's tail is filled by corpses, which burn longest) and only the serial
+  // halves keep the old order: the living's finishes, syncs and recounts,
+  // then the dead's. Who is in the dead pot is decided with `dead` above, at
+  // the top, which is also when the old loop decided it for every creature
+  // the living pass could not have woken.
+  struct Pot {
+    std::vector<size_t> mob;
+    std::vector<uint64_t> w;
+    std::vector<uint32_t> front, ops;
+  };
+  Pot pots[2];
+  auto share = [&](Pot& P, auto in) {
+    P.mob.clear();
+    P.w.clear();
     uint64_t wLeft = 0;
-    for (size_t i = 0; i < nm; i++)
-      if (in(i)) wLeft += (weight[i] = mobs_[i].BurnWeight());
-    tails.clear();
-    for (size_t k = 0; k < nm && frontBudget; k++) {
+    uint64_t burning = 0;
+    for (size_t k = 0; k < nm; k++) {
       const size_t i = (start + k) % nm;
       if (!in(i)) continue;
-      uint32_t front, ops;
-      BurnShareOf(frontBudget, opsBudget, weight[i], wLeft, front, ops);
-      const uint32_t front0 = front, ops0 = ops;
-      if (mobs_[i].BurnTickHead(tick, world, cellOps, spawns, front, ops))
-        tails.push_back(i);
-      frontBudget -= front0 - front;
-      opsBudget -= ops0 - ops;
+      const Mob& m = mobs_[i];
+      // BurnTickHead's own refusals, before any share is handed out: a
+      // released rig is DebrisSystem's, and a ghost burns on its owner.
+      if (m.rigReleased_ || m.IsGhost()) continue;
+      uint64_t w = m.BurnWeight();
+      if (w) {
+        burning++;
+      } else if (m.burnPreTick_ != tick) {
+        w = 64;  // no walk taken ahead: demand unknown, weigh it as catching
+      } else {
+        for (size_t li = 0; li < m.limbs_.size() && li < m.burnPre_.size(); li++)
+          if (m.limbs_[li].body && m.burnPre_[li].valid &&
+              !m.burnPre_[li].scanHot.empty())
+            w += 64;
+      }
+      P.mob.push_back(i);
+      P.w.push_back(w);
+      wLeft += w;
     }
-    if (twinOut.size() < tails.size()) twinOut.resize(tails.size());
-    workpool::ParallelFor(tails.size(), 1, [&](size_t t) {
-      mobs_[tails[t]].SyncJointTwinsPrepare(twinOut[t]);
-    });
-    for (size_t t = 0; t < tails.size(); t++) {
-      Mob& m = mobs_[tails[t]];
-      if (!m.SyncJointTwinsFinish(twinOut[t], world, spawns)) continue;
-      m.RecountBurn(tick);
+    burnprof::Count(burnprof::kPotMobs, P.mob.size());
+    burnprof::Count(burnprof::kBurningMobs, burning);
+    const size_t np = P.mob.size();
+    P.front.assign(np, 0);
+    P.ops.assign(np, 0);
+    uint32_t frontLeft = kBurnFrontPerTick, opsLeft = kBurnOpsPerTick;
+    for (size_t j = 0; j < np; j++) {
+      if (P.w[j] == 0) {
+        P.front[j] = 1;  // the idle pass's token slice (see above)
+        continue;
+      }
+      BurnShareOf(frontLeft, opsLeft, P.w[j], wLeft, P.front[j], P.ops[j]);
+      frontLeft -= P.front[j];
+      opsLeft -= P.ops[j];
     }
   };
-  // ---- THE LIVING ----
-  burnPot([&](size_t i) { return !dead[i]; });
-  // ---- THE DEAD, FROM THEIR OWN POT ----
+  // ---- THE LIVING, and THE DEAD FROM THEIR OWN POT ----
   // The living's numbers, as BurnDeadFlesh has always given the severed dead: a
   // battlefield of corpses must not starve the creatures still standing in
   // the fire, and the living must not starve the dead. An asleep corpse is
   // not visited at all — its burn pass had already said "nothing near me"
   // for every limb before it could fall asleep.
-  burnPot([&](size_t i) {
+  share(pots[0], [&](size_t i) { return !dead[i]; });
+  share(pots[1], [&](size_t i) {
     const Mob& m = mobs_[i];
     return dead[i] && !m.rigReleased_ && !m.deadAsleep_;
   });
+  // Every task, heaviest first, so the longest burns start first and the
+  // pool's tail is the short ones. Only WHO RUNS WHEN: nothing a task writes
+  // depends on it.
+  struct Task {
+    uint8_t pot;
+    uint32_t j;
+    uint64_t w;
+  };
+  std::vector<Task> tasks;
+  tasks.reserve(pots[0].mob.size() + pots[1].mob.size());
+  for (uint8_t p = 0; p < 2; p++)
+    for (size_t j = 0; j < pots[p].mob.size(); j++)
+      tasks.push_back({p, (uint32_t)j, pots[p].w[j]});
+  std::sort(tasks.begin(), tasks.end(), [](const Task& a, const Task& b) {
+    if (a.w != b.w) return a.w > b.w;
+    return a.pot != b.pot ? a.pot < b.pot : a.j < b.j;
+  });
+  {
+    burnprof::Scope bpHeads(burnprof::kBurnHeads);
+    workpool::ParallelFor(tasks.size(), 1, [&](size_t t) {
+      burnprof::Mute mute;
+      const Pot& P = pots[tasks[t].pot];
+      const size_t j = tasks[t].j;
+      BurnSink& sk = sinks[P.mob[j]];
+      sk.Clear();
+      sk.record = true;
+      const uint64_t c0 = burnprof::Tsc();
+      uint32_t front = P.front[j], ops = P.ops[j];
+      mobs_[P.mob[j]].BurnHeadLimbs(tick, world, sk.ops, front, ops, sk);
+      sk.cpuUs = (double)(burnprof::Tsc() - c0) * burnprof::UsPerTick();
+    });
+  }
+  std::vector<size_t> tails, rc;
+  std::vector<Mob::TwinSyncOut> twinOut;
+  std::vector<uint8_t> measured;
+  for (const Pot& P : pots) {
+    tails.clear();
+    {
+      burnprof::Scope bpFinish(burnprof::kBurnFinish);
+      for (size_t j = 0; j < P.mob.size(); j++) {
+        BurnSink& sk = sinks[P.mob[j]];
+        burnprof::AddCpu(burnprof::kHeadCpu, sk.cpuUs);
+        if (mobs_[P.mob[j]].BurnHeadFinish(tick, world, cellOps, spawns, sk))
+          tails.push_back(P.mob[j]);
+      }
+    }
+    if (twinOut.size() < tails.size()) twinOut.resize(tails.size());
+    {
+      burnprof::Scope bpPrep(burnprof::kTwinPrep);
+      workpool::ParallelFor(tails.size(), 1, [&](size_t t) {
+        mobs_[tails[t]].SyncJointTwinsPrepare(twinOut[t]);
+      });
+    }
+    rc.clear();
+    for (size_t t = 0; t < tails.size(); t++) {
+      Mob& m = mobs_[tails[t]];
+      if (!m.SyncJointTwinsFinish(twinOut[t], world, spawns)) continue;
+      rc.push_back(tails[t]);
+    }
+    // THE RECOUNT: the sweeps across the pool, the consequences in pot order.
+    burnprof::Scope bpRecount(burnprof::kRecount);
+    measured.assign(rc.size(), 0);
+    workpool::ParallelFor(rc.size(), 1, [&](size_t r) {
+      burnprof::Mute mute;
+      measured[r] = mobs_[rc[r]].RecountBurnMeasure(tick, false) ? 1 : 0;
+    });
+    for (size_t r = 0; r < rc.size(); r++)
+      if (measured[r]) mobs_[rc[r]].ApplyBurnCap();
+  }
 }
 
 void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
@@ -18931,17 +19222,32 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
 bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                        std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                        uint32_t& opsBudget) {
+  // The serial form of MobSystem::BurnLimbs' two halves: the same loop, the
+  // same finish, nothing deferred (record = false writes it all directly).
+  BurnSink s;
+  s.record = false;
+  BurnHeadLimbs(tick, world, cellOps, frontBudget, opsBudget, s);
+  return BurnHeadFinish(tick, world, cellOps, spawns, s);
+}
+
+void Mob::BurnHeadLimbs(uint32_t tick, World& world,
+                        std::vector<CellOp>& cellOps, uint32_t& frontBudget,
+                        uint32_t& opsBudget, BurnSink& s) {
+  BurnSink* const rec = s.record ? &s : nullptr;
+  s.start = 0;
+  s.visited.clear();
+  s.burnt = false;
   // THE DEAD BURN AS THEY LAY (PLAN_corpse_is_a_mob.md): a corpse's rig is
   // still its own, so fire, rot, the joint twins and the burn fraction all
   // run on it. Only a RELEASED rig (its limbs are DebrisSystem's) is refused,
   // and limb.body is zero there anyway.
-  if (!sys_ || !sys_->BurnTablesReady() || rigReleased_) return false;
+  if (!sys_ || !sys_->BurnTablesReady() || rigReleased_) return;
   // A GHOST DOES NOT BURN HERE. Its owner is running this same pass on the
   // same creature and authoring the fire ops; running it on both machines
   // would consume the limb's lattice twice and charge two sets of cell ops
   // for one fire. Returns BEFORE spending any of the shared front budget, so
   // a crowd of ghosts cannot starve the bodies this machine does own.
-  if (IsGhost()) return false;
+  if (IsGhost()) return;
   // Counter-based RNG stream. NO FLOAT TERM, deliberately: a limb's world
   // position and velocity are Jolt floats, and keying a roll on one would
   // inject physics float state into a HASHED grid write and make the world
@@ -18965,6 +19271,8 @@ bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps
   // key, and the same fairness the mob loop applies across creatures.
   const int nl = (int)limbs_.size();
   const int start = nl > 0 ? (int)(tick % (uint32_t)nl) : 0;
+  s.start = start;
+  s.visited.assign((size_t)nl, 0);
   // WHAT THE OTHER LIMBS ARE BURNING, built ONCE for the whole creature and
   // from the fronts as they stand at the top of the tick. Building it per limb
   // would make a limb's neighbours depend on how far down the loop it sat --
@@ -18972,7 +19280,7 @@ bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps
   // spread differently depending on which limb the tick's rotation started
   // from. One snapshot, read by every limb, is both cheaper and the only
   // version that is order-independent (see Mob::BuildCrossLimbHeat).
-  BuildCrossLimbHeat(tick);
+  BuildCrossLimbHeat(tick, rec);
   const uint32_t crossPct =
       (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
   // ---- A FAIR SHARE, NOT THE HEAD OF THE QUEUE (2026-09-25) ----------------
@@ -19001,11 +19309,14 @@ bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps
     const int li = (start + k) % nl;
     if (frontBudget == 0) break;
     if (!limbs_[li].body) continue;
+    s.visited[(size_t)li] = 1;
     uint32_t front, ops;
     BurnShareOf(frontBudget, opsBudget, weight[li], wLeft, front, ops);
     const uint32_t front0 = front, ops0 = ops;
     BurnLimbView v = ViewOf(limbs_[li]);
     v.corrodeCoat = limbs_[li].coat.corrosive > 0;
+    v.sink = rec;
+    if (rec) rec->curLimb = li;
     // The world side taken ahead this tick (MobSystem::PrecomputeBurnWalks);
     // BurnOneLimb uses it only if the box still matches.
     if (burnPreTick_ == tick && li < (int)burnPre_.size() && burnPre_[li].valid)
@@ -19029,8 +19340,9 @@ bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps
         sys_->BurnOneLimb(v, tick, key, world, cellOps, front, ops);
     frontBudget -= front0 - front;
     opsBudget -= ops0 - ops;
+    // MarkInstancesDirty is the finish's: it writes the system's flag.
     if (burnt) {
-      MarkInstancesDirty();
+      s.burnt = true;
       burnFracDirty_ = true;
     }
     // Fire boiled water off the skin, or water put fire out: the coat moved
@@ -19039,13 +19351,81 @@ bool Mob::BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps
       limbs_[li].burn.coatTouched = false;
       coatDirty_ = twinDirty_ = true;
     }
-    // Batched maintenance. May sever the limb or kill the creature, in which
-    // case the limb list has been reshaped and nothing below may touch it --
-    // including the rest of this loop.
+  }
+}
+
+bool Mob::BurnHeadFinish(uint32_t tick, World& world,
+                         std::vector<CellOp>& cellOps,
+                         std::vector<ParticleSpawn>& spawns, BurnSink& s) {
+  if (!sys_ || !sys_->BurnTablesReady() || rigReleased_ || IsGhost())
+    return false;
+  MobSystem& sys = *sys_;
+  // ---- THE SINK'S REPLAY, in the order the task recorded it ----------------
+  if (s.record) {
+    for (const IVec3& wc : s.fetches)
+      world.RequestChunkFetch(wc, World::FetchSource::Mob);
+    MicroBodySet* set = sys.microSet_;
+    for (const BurnSink::Micro& r : s.micro) {
+      if (!set || r.limb < 0 || r.limb >= (int)limbs_.size()) continue;
+      MobLimb& L = limbs_[(size_t)r.limb];
+      if (L.microModel < 0) continue;
+      if (r.kind == BurnSink::kOwn) {
+        // BurnOneLimb's ensureOwnedBrick, made now.
+        if (L.carved) continue;
+        const int own = MicroBodyOwn(*set, (uint32_t)L.microModel);
+        if (own < 0) continue;  // pool full: the body burns, the skin lags
+        L.microModel = own;
+        L.carved = true;
+        L.flipbookModel = -1;
+      } else if (r.kind == BurnSink::kPoke) {
+        if (L.carved)
+          MicroBodyPoke(*set, (uint32_t)L.microModel, r.x, r.y, r.z,
+                        (uint8_t)r.val, r.art);
+      } else {
+        BurnLimbView ov;   // OwnForStain reads these three and nothing else
+        ov.microModel = &L.microModel;
+        ov.carved = &L.carved;
+        ov.flipbook = &L.flipbookModel;
+        if (OwnForStain(ov, set))
+          MicroBodyPokeStain(*set, (uint32_t)L.microModel, r.x, r.y, r.z,
+                             r.val);
+      }
+    }
+    for (const ReactFxEvent& e : s.fx) {
+      if (sys.bodyFx_.size() >= MobSystem::kBodyFxPerTick) break;
+      sys.bodyFx_.push_back(e);
+    }
+    // The grid writes, under the tick's cell-op ceiling as BurnOneLimb's
+    // emitCell applied it inline: an op past it is refused and counted (the
+    // voxel still left the body, as a refused emit's always did).
+    for (const CellOp& op : s.ops) {
+      if (cellOps.size() >= kMaxCellOpsPerTick) {
+        sys.burnStats_.emitRefused++;
+        continue;
+      }
+      cellOps.push_back(op);
+    }
+    AddBurnStats(sys.burnStats_, s.stats);
+    AddWornStats(sys.wornStats_, s.worn);
+    sys.burnStats_.indexBuilds += s.index.indexBuilds;
+    sys.burnStats_.indexCells += s.index.indexCells;
+    for (int c = 0; c < burnprof::kNCount; c++)
+      if (s.prof[c]) burnprof::Count(c, s.prof[c]);
+  }
+  if (s.burnt) MarkInstancesDirty();
+  // ---- THE FLUSHES, in the loop's rotation --------------------------------
+  // Batched maintenance. May sever the limb or kill the creature, in which
+  // case the limb list has been reshaped and nothing below may touch it --
+  // including the rest of this loop.
+  const int nl = (int)s.visited.size();
+  for (int k = 0; k < nl; k++) {
+    const int li = (s.start + k) % nl;
+    if (!s.visited[(size_t)li] || li >= (int)limbs_.size()) continue;
     if (limbs_[li].burn.removed &&
         !FlushBurn(li, DamageCtx(DamageCause::Burn), world, spawns, false))
       return false;
   }
+  burnprof::Scope bpTail(burnprof::kTail);
   // WHAT A ZOMBIE LEFT IN YOU, one tick older. Here rather than in its own
   // caller so the player reaches it through the same seam an NPC does
   // (PlayerAvatar::BurnParts -> here), and after the burn because both express
@@ -21448,7 +21828,8 @@ bool MobSystem::OpenToSky(World& world, const Vec3& p) const {
   return true;
 }
 
-bool MobSystem::RainExposedCpu(World& world, const Vec3& p) const {
+bool MobSystem::RainExposedCpu(World& world, const Vec3& p,
+                               std::vector<IVec3>* fetchOut) const {
   const IVec3 o = world.WindowOrigin();
   rainlat::Box b;
   b.lo[0] = o.x * (int32_t)kChunk;
@@ -21467,7 +21848,10 @@ bool MobSystem::RainExposedCpu(World& world, const Vec3& p) const {
       cc = world.Cached(wc);
       if (cc && cc->voxels.size() != kChunkVol) cc = nullptr;
       if (!cc && !asked) {
-        world.RequestChunkFetch(wc, World::FetchSource::Mob);
+        if (fetchOut)
+          fetchOut->push_back(wc);   // a work-pool task: the replay asks
+        else
+          world.RequestChunkFetch(wc, World::FetchSource::Mob);
         asked = true;
       }
     }
