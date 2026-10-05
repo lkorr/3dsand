@@ -25,6 +25,7 @@
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhase.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
+#include <Jolt/Physics/Collision/CollisionDispatch.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
@@ -39,6 +40,7 @@
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/SimShapeFilter.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Constraints/Constraint.h>
 #include <Jolt/Physics/Constraints/FixedConstraint.h>
@@ -365,10 +367,144 @@ float FrictionTorque(const JPH::Body& child, JPH::RVec3Arg anchor, float frac) {
 
 }  // namespace
 
+namespace {
+// ---- A DEAD BODY'S LINEAR CAST LOOKS FOR THE GROUND ONLY (round 3, pkg C) ---
+//
+// Every LinearCast body pays its cast against EVERYTHING its layer meets,
+// because Jolt's JobFindCCDContacts takes the body's default broadphase and
+// object-layer filters -- the ones collision uses -- and there is no API to
+// hand it others. In a 64-creature brawl the casters are corpse limbs, limp
+// ragdolls and severed flesh shoved about by the crowd, and what their casts
+// sweep is the crowd: living box compounds, ~20 boxes a limb, stacked a dozen
+// deep around every body on the floor. 7.4 ms of worker time a tick
+// (b21d23a), for a guarantee (the long note above CreateDebrisBody) that is
+// about TERRAIN -- a sheet of triangles with no thickness, which is the only
+// thing a fast thin body can actually pass through. Two bodies that overlap
+// after a discrete step are pushed apart by the next contact solve.
+//
+// So the cast of a dead or limp body (RigLimp, RigDead, SeveredHold, and
+// Debris carrying the dead-flesh mark) is scoped to STATIC bodies -- plus, for
+// the loose debris, any body when it is moving fast enough to strike a BLOW
+// (below). The hook is
+// the only per-pair one Jolt's cast consults before any narrow-phase work: the
+// SimShapeFilter, asked at the root of every (caster, target) shape cast. It
+// cannot tell a cast from a contact query by its arguments, so the job
+// wrapper (JobProfiler below) raises tl_ccdFind for exactly the duration of
+// each "FindCCDContacts" job; outside one it answers true and the narrow phase
+// is untouched. The decision is a pure function of the two bodies, so it is
+// deterministic and independent of which thread ran which cast.
+//
+// A BODY TARGET IS STILL CAST WHEN THE HIT COULD BE A BLOW. Terrain-only
+// cost something real: a cast that hits a living limb reports a contact, and
+// a contact from loose flesh can be a BLOW (MobSystem::ApplyContactDamage).
+// Refusing every body target halved the brawl's billed loose-body blows (183
+// -> 124, same binary, scope-only arm). A rig's own limbs -- RigLimp, RigDead
+// (a corpse is still a Mob), SeveredHold -- are never billed as strikers
+// ("creature against creature is melee's and the ragdoll's"), so they lose
+// nothing and stay terrain-only. Loose dead flesh (a severed arm, a gobbet)
+// IS a striker, so its body target is refused only when it could not strike
+// a blow at all: ApplyContactDamage bills only a
+// striker whose own approach speed is at least gore.contactMinSpeed AND whose
+// impulse (mass x that speed, at most) passes gore.contactImpulseMin, and the
+// approach speed is never more than the caster's own speed. So the caster's
+// speed must reach max(contactMinSpeed, contactImpulseMin / mass) -- a
+// NECESSARY condition for any blow, which is why the refused hits lose none.
+// A light gobbet needs to be truly flying; a corpse limb the crowd shoves
+// along at a walk never qualifies, and that is where the cost was. Both
+// numbers are latched from tuning on the game thread before each Update,
+// never read by a job.
+//
+// What it still gives up: a dead/limp/severed piece moving faster than 0.75 x
+// its own inner radius per step but too slow to strike a blow can pass
+// THROUGH a body's limb within one step instead of stopping on it (it still
+// collides with whatever it overlaps at the end of the step).
+// Projectiles keep their full cast: a Thrown body, a plain debris body (a
+// rock, an item, a plank), a sphere.
+//
+// SANDVOX_CCD_SCOPE=all casts against everything (the pre-round-3 behaviour)
+// and SANDVOX_CCD_SCOPE=terrain refuses every body target whatever its speed,
+// both in the same binary.
+thread_local bool tl_ccdFind = false;
+thread_local uint64_t tl_ccdLastPair = 0;
+
+class CcdScopeFilter final : public JPH::SimShapeFilter {
+ public:
+  CcdScopeFilter() {
+    const char* e = std::getenv("SANDVOX_CCD_SCOPE");
+    scoped = !(e && std::strcmp(e, "all") == 0);
+    terrainOnly = e && std::strcmp(e, "terrain") == 0;
+  }
+  bool scoped = true, terrainOnly = false;
+  // The blow floor (m/s) and impulse floor (kg m/s): game thread only,
+  // between Updates.
+  float blowSpeed = 0.0f, blowImpulse = 0.0f;
+  // Per step, report only: (caster, target) pairs a cast reached the narrow
+  // phase with, by target (of the body ones, those a scoped caster kept at
+  // blow speed), and the ones the scope refused.
+  mutable std::atomic<uint32_t> vsStatic{0}, vsBody{0}, vsBodyFast{0}, refused{0};
+  void Reset() {
+    vsStatic.store(0, std::memory_order_relaxed);
+    vsBody.store(0, std::memory_order_relaxed);
+    vsBodyFast.store(0, std::memory_order_relaxed);
+    refused.store(0, std::memory_order_relaxed);
+  }
+  // 0 = full cast; 1 = static targets only; 2 = static, plus a body when the
+  // caster could strike a blow (loose dead flesh).
+  static int Scope(const JPH::Body& b) {
+    const uint64_t ud = b.GetUserData();
+    switch (UnpackRole(ud)) {
+      case Physics::BodyRole::RigLimp:
+      case Physics::BodyRole::RigDead:
+      case Physics::BodyRole::SeveredHold:
+        return 1;
+      case Physics::BodyRole::Debris:
+        return (ud & kDeadFleshBit) != 0 ? 2 : 0;
+      default:
+        return 0;
+    }
+  }
+  bool ShouldCollide(const JPH::Body& b1, const JPH::Shape*, const JPH::SubShapeID&,
+                     const JPH::Body& b2, const JPH::Shape*,
+                     const JPH::SubShapeID&) const override {
+    if (!tl_ccdFind) return true;
+    // Counted once per (caster, target): a cast consults this at its root and
+    // again per sub-shape, always for the same pair in a row on one thread.
+    const uint64_t pair = ((uint64_t)b1.GetID().GetIndexAndSequenceNumber() << 32) |
+                          b2.GetID().GetIndexAndSequenceNumber();
+    const bool first = pair != tl_ccdLastPair;
+    tl_ccdLastPair = pair;
+    if (b2.IsStatic()) {
+      if (first) vsStatic.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    const int scope = scoped ? Scope(b1) : 0;
+    if (scope != 0) {
+      bool keep = false;
+      if (scope == 2 && !terrainOnly) {
+        // The caster's own speed, from the velocity the integrate just
+        // settled (nothing writes it during the CCD jobs), against the least
+        // speed a blow from a body of its mass needs.
+        const float invMass = b1.GetMotionProperties()->GetInverseMass();
+        const float need = std::max(blowSpeed, blowImpulse * invMass);
+        keep = b1.GetLinearVelocity().LengthSq() >= need * need;
+      }
+      if (!keep) {
+        if (first) refused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+      }
+      if (first) vsBodyFast.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (first) vsBody.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+};
+}  // namespace
+
 struct Physics::LayerImpls {
   BPLayerInterface bpInterface;
   ObjVsBPFilter objVsBp;
   ObjPairFilter objPair;
+  CcdScopeFilter ccdScope;
 };
 
 // ---- contact reporting (audio; DESIGN.md §12b "Built but not yet triggered")
@@ -432,12 +568,27 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     rolePairs[r1 * Physics::kRoleCols + r2].fetch_add(1, std::memory_order_relaxed);
   }
   std::atomic<uint32_t> rolePairs[Physics::kRoleCols * Physics::kRoleCols]{};
+  // SANDVOX_PHYS_PAIRPROF=1 (Physics::Init): the narrow phase's worker time
+  // and body-pair count by the same role pair, timed around Jolt's own
+  // body-vs-body collide. Report only.
+  std::atomic<uint64_t> pairNs[Physics::kRoleCols * Physics::kRoleCols]{};
+  std::atomic<uint32_t> pairCalls[Physics::kRoleCols * Physics::kRoleCols]{};
+  static int RolePairIx(const JPH::Body& b1, const JPH::Body& b2) {
+    auto roleIx = [](const JPH::Body& b) -> int {
+      return b.IsStatic() ? Physics::kRoleStatic : (int)UnpackRole(b.GetUserData());
+    };
+    int r1 = roleIx(b1), r2 = roleIx(b2);
+    if (r1 > r2) std::swap(r1, r2);
+    return r1 * Physics::kRoleCols + r2;
+  }
   void ResetCounts() {
     manifoldsDyn = 0;
     manifoldsStatic = 0;
     pointsDyn = 0;
     pointsStatic = 0;
     for (auto& r : rolePairs) r = 0;
+    for (auto& r : pairNs) r.store(0, std::memory_order_relaxed);
+    for (auto& r : pairCalls) r.store(0, std::memory_order_relaxed);
   }
   void OnContactPersisted(const JPH::Body& b1, const JPH::Body& b2,
                           const JPH::ContactManifold& m,
@@ -653,6 +804,7 @@ int64_t JobNowNs() {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
+
 }  // namespace
 
 struct Physics::JobProfiler final : public JPH::JobSystem {
@@ -674,11 +826,22 @@ struct Physics::JobProfiler final : public JPH::JobSystem {
   JPH::JobHandle CreateJob(const char* name, JPH::ColorArg color,
                            const JobFunction& fn, JPH::uint32 deps) override {
     Slot* s = &slots[PhaseOfJob(name)];
+    // NOT REPORT-ONLY FOR THIS ONE JOB: the CCD scope (CcdScopeFilter above)
+    // needs to know it is inside a cast, and this wrapper is the one place a
+    // job's name is known on the thread that runs it.
+    const bool ccdFind = name != nullptr && std::strcmp(name, "FindCCDContacts") == 0;
     return inner_->CreateJob(
         name, color,
-        [s, fn]() {
+        [s, fn, ccdFind]() {
           const int64_t t0 = JobNowNs();
-          fn();
+          if (ccdFind) {
+            tl_ccdFind = true;
+            tl_ccdLastPair = 0;
+            fn();
+            tl_ccdFind = false;
+          } else {
+            fn();
+          }
           const int64_t t1 = JobNowNs();
           s->cpu.fetch_add(t1 - t0, std::memory_order_relaxed);
           s->jobs.fetch_add(1, std::memory_order_relaxed);
@@ -757,6 +920,57 @@ bool Physics::Init() {
   system_->Init(4096 /*max bodies*/, 0, kMaxBodyPairs, kMaxContactConstraints,
                 layers_->bpInterface, layers_->objVsBp, layers_->objPair);
   system_->SetContactListener(contacts_.get());
+  // The CCD scope (CcdScopeFilter): answers true outside a FindCCDContacts job.
+  system_->SetSimShapeFilter(&layers_->ccdScope);
+  // ---- THE BODY-VS-BODY COLLIDE (round 3, package C) ----------------------
+  //
+  // Jolt's default runs every pair in which either body asked for ENHANCED
+  // INTERNAL EDGE REMOVAL (every body CreateDebrisBodyXf makes does) through
+  // InternalEdgeRemovingCollector: every contact of the pair buffered, then
+  // the ones on a shared internal edge voided. That is what stops a body
+  // snagging on the seams of the marching-cubes terrain or of another box
+  // compound it lies on. A pair with a KINEMATIC body in it -- a living
+  // creature's limb against a corpse, a gib, a ragdoll -- pays it too, and in
+  // a 64-creature brawl those are the most numerous pairs there are
+  // (rig-live vs rig-dead, ~170 pairs a step at ~11 us each). Nothing rests
+  // on an animated limb long enough for a seam to matter: the limb moves
+  // every tick and the contact is re-made against wherever it went. So a
+  // pair with a kinematic body collides plainly; every other pair is
+  // exactly Jolt's default. SANDVOX_KIN_EDGE_REMOVAL=1 is Jolt's default for
+  // every pair (the A/B arm in one binary).
+  //
+  // WHICH PAIRS THE NARROW PHASE PAYS FOR: with SANDVOX_PHYS_PAIRPROF=1 the
+  // collide is timed and attributed by role pair (two clock reads a pair;
+  // report only).
+  {
+    static const bool kKinEdge = [] {
+      const char* e = std::getenv("SANDVOX_KIN_EDGE_REMOVAL");
+      return e != nullptr && e[0] != '0';
+    }();
+    const char* pp = std::getenv("SANDVOX_PHYS_PAIRPROF");
+    ContactImpls* ci = (pp && pp[0] != '0') ? contacts_.get() : nullptr;
+    system_->SetSimCollideBodyVsBody(
+        [ci](const JPH::Body& b1, const JPH::Body& b2, JPH::Mat44Arg x1,
+             JPH::Mat44Arg x2, JPH::CollideShapeSettings& st,
+             JPH::CollideShapeCollector& col, const JPH::ShapeFilter& sf) {
+          const int64_t t0 = ci ? JobNowNs() : 0;
+          if (!kKinEdge && (b1.IsKinematic() || b2.IsKinematic())) {
+            JPH::SubShapeIDCreator p1, p2;
+            JPH::CollisionDispatch::sCollideShapeVsShape(
+                b1.GetShape(), b2.GetShape(), JPH::Vec3::sOne(), JPH::Vec3::sOne(),
+                x1, x2, p1, p2, st, col, sf);
+          } else {
+            JPH::PhysicsSystem::sDefaultSimCollideBodyVsBody(b1, b2, x1, x2, st,
+                                                             col, sf);
+          }
+          if (ci) {
+            const int k = ContactImpls::RolePairIx(b1, b2);
+            ci->pairNs[k].fetch_add((uint64_t)(JobNowNs() - t0),
+                                    std::memory_order_relaxed);
+            ci->pairCalls[k].fetch_add(1, std::memory_order_relaxed);
+          }
+        });
+  }
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
   return true;
 }
@@ -1490,6 +1704,12 @@ void Physics::Step(float dt) {
   {
     for (uint32_t& v : lastStep_.ccdBodies) v = 0;
     for (uint32_t& v : lastStep_.ccdCompound) v = 0;
+    if (layers_) {
+      layers_->ccdScope.Reset();
+      // The blow floors (CcdScopeFilter), latched here on the game thread.
+      layers_->ccdScope.blowSpeed = CurrentTuning().gore.contactMinSpeed * kVoxelMeters;
+      layers_->ccdScope.blowImpulse = CurrentTuning().gore.contactImpulseMin;
+    }
     const uint32_t n = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
     const JPH::BodyID* active =
         n ? system_->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody) : nullptr;
@@ -1537,11 +1757,21 @@ void Physics::Step(float dt) {
         (float)((double)(sl.last.load() - sl.first.load()) * 1e-6);
     lastStep_.phaseCpuMs[p] = (float)((double)sl.cpu.load() * 1e-6);
   }
+  if (layers_) {
+    lastStep_.ccdVsStatic = layers_->ccdScope.vsStatic.load();
+    lastStep_.ccdVsBody = layers_->ccdScope.vsBody.load();
+    lastStep_.ccdVsBodyFast = layers_->ccdScope.vsBodyFast.load();
+    lastStep_.ccdRefused = layers_->ccdScope.refused.load();
+  }
   if (contacts_) contacts_->Finish();
   if (contacts_) {
     lastStep_.manifoldsDyn = contacts_->manifoldsDyn.load();
     for (int i = 0; i < kRoleCols * kRoleCols; i++)
       lastStep_.rolePairs[i] = contacts_->rolePairs[i].load();
+    for (int i = 0; i < kRoleCols * kRoleCols; i++) {
+      lastStep_.pairNarrowUs[i] = (float)((double)contacts_->pairNs[i].load() * 1e-3);
+      lastStep_.pairNarrowCalls[i] = contacts_->pairCalls[i].load();
+    }
     lastStep_.pointsDyn = contacts_->pointsDyn.load();
     lastStep_.manifoldsStatic = contacts_->manifoldsStatic.load();
     lastStep_.pointsStatic = contacts_->pointsStatic.load();
@@ -1589,6 +1819,10 @@ void Physics::Step(float dt) {
 // on every step of its fall, over every one of its boxes: 100+ ms a step. A
 // body at least kDiscreteMinExtentVox thick on every axis is Discrete; see
 // that constant for why it cannot tunnel.
+//
+// WHAT the cast may hit is scoped by role (CcdScopeFilter, 2026-10-05): a
+// dead or limp body's cast meets static bodies -- the terrain this note is
+// about -- and, for loose dead flesh, a body only when it could strike a blow.
 //
 // This is only half the guarantee: a cast can only hit a triangle that EXISTS,
 // and the patch under a fast-falling body is built by DebrisSystem::
@@ -1865,7 +2099,6 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   const bool cast = thinnestVox < kDiscreteMinExtentVox;
   if (cast && !AntiTunnelOff(AntiTunnel::Ccd))
     bcs.mMotionQuality = JPH::EMotionQuality::LinearCast;  // see note above
-
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = CreateAndAddDet(bi, ids_, bcs, JPH::EActivation::Activate);
   NoteBirth(id.GetIndexAndSequenceNumber());

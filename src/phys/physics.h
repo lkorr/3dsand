@@ -802,12 +802,21 @@ class Physics {
     uint32_t manifoldsDyn = 0, pointsDyn = 0;        // body vs body
     uint32_t manifoldsStatic = 0, pointsStatic = 0;  // body vs terrain/static
     uint32_t rolePairs[kRoleCols * kRoleCols] = {};
+    // SANDVOX_PHYS_PAIRPROF=1 only (zero otherwise): the narrow phase's worker
+    // time, us, and body pairs tested, by the same role pair index.
+    float pairNarrowUs[kRoleCols * kRoleCols] = {};
+    uint32_t pairNarrowCalls[kRoleCols * kRoleCols] = {};
     // Bodies that entered this step about to LINEAR-CAST (dynamic, LinearCast,
     // moving more than mLinearCastThreshold x their inner radius this step),
     // by role -- measured before Update from the velocity they carry in: the
     // attribution of the "ccd" phase above.
     uint32_t ccdBodies[kRoleCols] = {};
     uint32_t ccdCompound[kRoleCols] = {};   // ...of which box compounds
+    // The CCD scope (physics.cpp CcdScopeFilter): (caster, target) pairs the
+    // casts took to the narrow phase against a static body (terrain) / another
+    // body (of which: loose dead flesh kept because it could strike a blow),
+    // and the body targets the scope refused a dead or limp caster.
+    uint32_t ccdVsStatic = 0, ccdVsBody = 0, ccdVsBodyFast = 0, ccdRefused = 0;
     // JPH::EPhysicsUpdateError bits from this step's Update: 1 manifold
     // cache full, 2 body-pair cache full, 4 contact constraints full. Any of
     // them means Jolt dropped contacts, and the dropped set is scheduling-
