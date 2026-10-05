@@ -57,3 +57,6 @@ shots/
 shot_*.bmp
 shot_*.png
 assets/structures/_gate/
+
+# hygiene: hand-kept snapshots that are not tracked
+/_attic/
