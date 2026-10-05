@@ -57,6 +57,8 @@ namespace {
 #define PIPE_WORLDGEN        Pipe::Worldgen
 #define PIPE_WORLDGEN_LIST   Pipe::WorldgenList
 #define PIPE_WORLDGEN_COLS   Pipe::WorldgenCols
+#define PIPE_WORLDGEN_WET    Pipe::WorldgenWet
+#define PIPE_WORLDGEN_WET_ALL Pipe::WorldgenWetAll
 #define PIPE_MUTATE          Pipe::Mutate
 #define PIPE_MUTATE_CELLS    Pipe::MutateCells
 #define PIPE_WIND_WAKE       Pipe::WindWake

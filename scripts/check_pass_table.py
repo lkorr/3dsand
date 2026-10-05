@@ -88,6 +88,8 @@ PIPE_TO_MEMBER = {
     "PIPE_WORLDGEN": "worldgen_",
     "PIPE_WORLDGEN_LIST": "worldgenList_",
     "PIPE_WORLDGEN_COLS": "worldgenCols_",
+    "PIPE_WORLDGEN_WET": "worldgenWet_",
+    "PIPE_WORLDGEN_WET_ALL": "worldgenWetAll_",
     "PIPE_PAGEFILL": "pageFill_",
     "PIPE_MUTATE": "mutate_",
     "PIPE_MUTATE_CELLS": "mutateCells_",

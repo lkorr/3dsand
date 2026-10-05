@@ -909,6 +909,22 @@ fn windWake(@builtin(global_invocation_id) gid : vec3<u32>) {
 const RAIN_TILE : u32 = 8u;            // pass_table.cpp kRainTile
 const RAIN_THREADS : u32 = (WORLD_N / RAIN_TILE) * (WORLD_N / RAIN_TILE);
 const RAIN_SALT : u32 = 0x5A1D0F00u;
+// THE DROP MUST HAVE FALLEN THROUGH SKY (2026-10-05). The lattice reads every
+// cell outside the window as AIR, which is true above the window and false
+// beside it: a line that crosses the window's SIDE wall below the ground
+// enters already inside the rock, and "the first thing that is not air" was
+// that rock -- 100+ voxels down, wetted, and held awake by sim_step's
+// stainDry (a covered wet cell) until it dried. Measured on the default map
+// under SANDVOX_WEATHER=storm: ~1,500 awake chunks, rows of them along the
+// window's upwind face down to 160+ below ground, against ~30 in clear
+// weather. So a drop may only WET what it reaches after this many levels of
+// in-window air on its own line: a line entering underground (or through a
+// cave the side wall cuts) is a miss. Open ground is hundreds of levels
+// below the window top, so nothing the player can see is drier for it; what
+// is lost is a band one chunk-pair deep at the window's far edges. Counted
+// from voxel words alone (the sentinel skip adds the levels it jumps), so
+// paged and dense residency count the same.
+const RAIN_FALL_MIN_AIR : i32 = 32;
 
 // src/sim/rainexpo.h's lattice, byte for byte (sim_rain_expo.wgsl agrees).
 fn rfFloorDiv(a : i32, b : i32) -> i32 {
@@ -982,6 +998,7 @@ fn rainFall(@builtin(global_invocation_id) gid : vec3<u32>) {
   var idx = PT_NO_WORD;
   var w = 0u;
   var mc = vec3<i32>(0);
+  var airRun = 0;   // in-window air levels fallen through (RAIN_FALL_MIN_AIR)
   loop {
     if (y < yEnd) { return; }
     let m = k - vec2<i32>(rfDrift(n.x, y), rfDrift(n.y, y));
@@ -1017,6 +1034,7 @@ fn rainFall(@builtin(global_invocation_id) gid : vec3<u32>) {
       let cx = rfAxisSpan(k.x, n.x, c0.x, c0.x + i32(CHUNK) - 1);
       let cz = rfAxisSpan(k.y, n.y, c0.z, c0.z + i32(CHUNK) - 1);
       let yl = max(c0.y, max(cx.x, cz.x));
+      airRun += y - yl + 1;
       p = k - vec2<i32>(rfDrift(n.x, yl), rfDrift(n.y, yl));
       y = yl - 1;
       continue;
@@ -1026,6 +1044,7 @@ fn rainFall(@builtin(global_invocation_id) gid : vec3<u32>) {
     let cw = voxels[i];
     let cm = voxMat(cw);
     if (cm == MAT_AIR || materials[cm].klass == CLASS_GAS) {
+      airRun += 1;
       p = m;
       y -= 1;
       continue;
@@ -1039,6 +1058,8 @@ fn rainFall(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (m.klass != CLASS_SOLID && m.klass != CLASS_POWDER) { return; }
 
   if (rain != 0u) {
+    // Drying (below) keeps every landing: drying a wet cell is never wrong.
+    if (airRun < RAIN_FALL_MIN_AIR) { return; }
     let rm = materials[STAIN_PALETTE_BASE]._r3 & 0xFFFu;
     if (rm == 0u) { return; }
     let r = materials[rm];

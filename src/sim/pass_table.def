@@ -1449,6 +1449,14 @@ PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, 
      USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
           R(PageTable) A(PageFaults) R(TreeAtlas) R(WorldMap) W(GenAct)
           R(GenCols) R(ColCache)))
+// WET BANKS (worldgen.wgsl `wetbanksAll`, 2026-10-05): every solid/powder
+// cell with a staining liquid on a face is born soaked to the ceiling
+// stainStep would reach, so a generated pond does not drink itself down into
+// its own bed. Reads every neighbour genChunk just wrote: its own row, after.
+// RW(GenAct) because the shared body references it; `main` publishes no
+// verdict, so the All entry passes an out-of-range index and never stores.
+PASS(worldgenWetAll, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN_WET_ALL, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
+     USES(R(Materials) U(TickUBO) RW(Voxels) R(PageTable) A(PageFaults) RW(GenAct)))
 
 // ========================================================== PT_GENLIST =====
 // Simulation::EncodeGenList — its own encoder, submitted MID-FRAME between
@@ -1472,6 +1480,14 @@ PASS(worldgenList,"worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_G
      USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
           R(PageTable) A(PageFaults) R(TreeAtlas) R(WorldMap) W(GenAct)
           R(GenCols) R(ColCache)))
+// WET BANKS for the streamed chunks (worldgen.wgsl `wetbanks`): the chunks
+// and their face shell in the resident neighbours, and the genAct verdict
+// class cleared for a chunk it stained (so the CPU never demotes the stain
+// away). After worldgenList: it reads the words every listed chunk wrote.
+PASS(worldgenWet,"worldgenList", PT_GENLIST, PIPE_WORLDGEN_WET, K_COMPUTE, D_GENCOUNT,1,1,
+     GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
+     USES(R(GenList) R(Materials) U(TickUBO) RW(Voxels) R(PageTable) A(PageFaults)
+          RW(GenAct)))
 
 // ========================================================= PT_PAGEFILL =====
 // PageTable::DrainFills — materializes the JITTER pages of ONE tick, recorded

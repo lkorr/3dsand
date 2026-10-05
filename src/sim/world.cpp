@@ -1024,6 +1024,101 @@ void World::KickReadback() {
               std::printf(" | %s %u (sole %u)", kDirtyReasonName[bit], ehist[bit],
                           esole[bit]);
           std::printf("\n");
+          // ...and WHERE they are (2026-10-05): each awake chunk's centre
+          // against the ground under it (TerrainHeight, the CPU twin of
+          // worldgen's surface), crossed with the CLASS of rule that asked,
+          // then up to six of them named -- every underground one, and the
+          // surface ones a liquid or a powder holds -- and fetched, so the
+          // NEXT print says what they held. SANDVOX_DIRTY_DUMP=<dir> also
+          // writes each fetched chunk's 4,096 raw words to
+          // <dir>/chunk_x_y_z_t<tick>.bin, which diffs cell by cell against a
+          // --voxdump of the same box (the birth state) to show exactly which
+          // cells moved. This is what found the storm rain soaking buried
+          // rock through the window's side wall (rows of "underground"
+          // chunks at one window face, a few stained cells each), pond banks
+          // drinking their water ("surface-liquid", stained count climbing),
+          // and free dirt / snow grains at local steps ("surface-powder",
+          // 3-6 changed cells a chunk).
+          {
+            constexpr uint32_t kLiq = DirtyReasonBit("down") | DirtyReasonBit("diag") |
+                                      DirtyReasonBit("equalize") | DirtyReasonBit("split") |
+                                      DirtyReasonBit("film") | DirtyReasonBit("bridge") |
+                                      DirtyReasonBit("SUBMERGED") | DirtyReasonBit("film-press");
+            constexpr uint32_t kPow = DirtyReasonBit("powder");
+            const char* bandName[5] = {"sky>+24", "surf+-24", "-24..-64", "-64..-160", "<-160"};
+            uint32_t band[5][4] = {};   // [band][liquid, powder, other, total]
+            struct Hit { IVec3 wc; int dy; uint32_t d; };
+            std::vector<Hit> deep;
+            for (uint32_t i = 0; i < kNumChunks; i++) {
+              const uint32_t d = dirtyW[i];
+              if (d == 0) continue;
+              // The SNAPSHOT's origin, not origin_: the window may have
+              // moved since this slot's dirty word was written.
+              const int mk = (int)kNChunk - 1;
+              const IVec3 so{(int)(i % kNChunk), (int)((i / kNChunk) % kNChunk),
+                             (int)(i / (kNChunk * kNChunk))};
+              const IVec3 wc{sl.origin.x + ((so.x - sl.origin.x) & mk),
+                             sl.origin.y + ((so.y - sl.origin.y) & mk),
+                             sl.origin.z + ((so.z - sl.origin.z) & mk)};
+              const int cx = wc.x * (int)kChunk + (int)kChunk / 2;
+              const int cz = wc.z * (int)kChunk + (int)kChunk / 2;
+              const int dy = wc.y * (int)kChunk + (int)kChunk / 2 -
+                             TerrainHeight(cx, cz, mirrorSeed_);
+              const int bi = dy > 24 ? 0 : dy >= -24 ? 1 : dy >= -64 ? 2 : dy >= -160 ? 3 : 4;
+              const int ci = (d & kLiq) ? 0 : (d & kPow) ? 1 : 2;
+              band[bi][ci]++;
+              band[bi][3]++;
+              if (bi >= 2 && deep.size() < 6) deep.push_back({wc, dy, d});
+              else if (bi == 1 && ci <= 1 && deep.size() < 6 &&
+                       (d & (DirtyReasonBit("SUBMERGED") | kPow)))
+                deep.push_back({wc, dy, d});
+            }
+            std::printf("dirty-reasons t%u: DEPTH (liquid/powder/other):", out.tick);
+            for (int bi = 0; bi < 5; bi++)
+              if (band[bi][3])
+                std::printf(" | %s %u (%u/%u/%u)", bandName[bi], band[bi][3],
+                            band[bi][0], band[bi][1], band[bi][2]);
+            std::printf("\n");
+            for (const Hit& h : deep)
+              std::printf("dirty-reasons t%u:   %s chunk (%d,%d,%d) %+d vs ground, word 0x%08x, window-rel (%d,%d,%d)\n",
+                          out.tick, h.dy < -24 ? "underground" : (h.d & kPow) ? "surface-powder" : "surface-liquid", h.wc.x, h.wc.y, h.wc.z, h.dy, h.d,
+                          h.wc.x - sl.origin.x, h.wc.y - sl.origin.y, h.wc.z - sl.origin.z);
+            // WHAT they hold: the previous print's underground chunks were
+            // fetched then, so their voxels are in the cache now. Material id
+            // histogram, most common first (ids: voxdump's palette.json).
+            static std::vector<Hit> fetched;
+            for (const Hit& h : fetched) {
+              const CachedChunk* cc = Cached(h.wc);
+              if (!cc || cc->voxels.size() != kChunkVol) continue;
+              std::vector<uint32_t> hist(4096, 0u);
+              uint32_t stained = 0;
+              for (uint32_t w : cc->voxels) {
+                hist[w & 0xFFFu]++;
+                if ((w >> 24) & 0xFu) stained++;
+              }
+              std::vector<std::pair<uint32_t, uint32_t>> v;
+              for (uint32_t m = 0; m < 4096; m++)
+                if (hist[m]) v.push_back({m, hist[m]});
+              std::sort(v.begin(), v.end(),
+                        [](auto& a, auto& b) { return a.second > b.second; });
+              if (const char* dd = getenv("SANDVOX_DIRTY_DUMP")) {
+                char fn[512];
+                std::snprintf(fn, sizeof(fn), "%s/chunk_%d_%d_%d_t%u.bin", dd, h.wc.x,
+                              h.wc.y, h.wc.z, out.tick);
+                if (FILE* f = std::fopen(fn, "wb")) {
+                  std::fwrite(cc->voxels.data(), 4, cc->voxels.size(), f);
+                  std::fclose(f);
+                }
+              }
+              std::printf("dirty-reasons t%u:   chunk (%d,%d,%d) %u stained, held:", out.tick,
+                          h.wc.x, h.wc.y, h.wc.z, stained);
+              for (size_t k = 0; k < v.size() && k < 6; k++)
+                std::printf(" id%u x%u", v[k].first, v[k].second);
+              std::printf("\n");
+            }
+            fetched = deep;
+            for (const Hit& h : deep) RequestChunkFetch(h.wc);
+          }
           std::fflush(stdout);
         }
         std::memcpy(&out.worldHash, b + kHashOff, 4);

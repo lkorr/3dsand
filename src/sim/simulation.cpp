@@ -2220,6 +2220,15 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       worldgenCols_ =
           MakeComputePipeline(device, simPL_, mWorldgen, "cols", "worldgenCols");
     });
+    // The wet-bank pass after each (worldgen.wgsl `wetbanks` / `wetbanksAll`).
+    pool.Add([&] {
+      worldgenWet_ =
+          MakeComputePipeline(device, simPL_, mWorldgen, "wetbanks", "worldgenWet");
+    });
+    pool.Add([&] {
+      worldgenWetAll_ =
+          MakeComputePipeline(device, simPL_, mWorldgen, "wetbanksAll", "worldgenWetAll");
+    });
     // Same module as worldgen: the JITTER page fill shares genChunk's
     // slot->world mapping and must not drift from it (world.h's JITTER block).
     pool.Add([&] {
@@ -2449,7 +2458,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The far set is NOT in this list: it may still be compiling, and a
   // skipped far row is a missing horizon rather than a wrong sim. Their
   // verdict is checked where they are published (PublishFarPipelines).
-  if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
+  if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !worldgenWet_ || !worldgenWetAll_ ||
+      !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !rainExpo_ ||
       !draftMaskAll_ || !draftMaskDirty_ || !draftArgs_ || !draftCoarseBuild_ || !draftCoarseFaces_ ||
       !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
@@ -2818,6 +2828,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Worldgen:       return worldgen_;
     case P::WorldgenList:   return worldgenList_;
     case P::WorldgenCols:   return worldgenCols_;
+    case P::WorldgenWet:    return worldgenWet_;
+    case P::WorldgenWetAll: return worldgenWetAll_;
     case P::PageFill:       return pageFill_;
     case P::Mutate:         return mutate_;
     case P::MutateCells:    return mutateCells_;

@@ -406,6 +406,9 @@ enum class Pipe : uint8_t {
   Worldgen, WorldgenList,
   // The column-cache pre-pass both of the above read (worldgen.wgsl `cols`).
   WorldgenCols,
+  // Worldgen's wet-bank pass (worldgen.wgsl `wetbanks` after `list`,
+  // `wetbanksAll` after `main`): generated water is born with its banks soaked.
+  WorldgenWet, WorldgenWetAll,
   Mutate, MutateCells,
   // The wind primitive footprint wake (sim_mutate.wgsl `windWake`): the only
   // kernel in the engine that dirty-marks a chunk without writing a voxel.

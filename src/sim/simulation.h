@@ -951,7 +951,7 @@ class Simulation {
       farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_, gasBGL_;
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
       fluidSeamPL_, shadowPL_, gasPL_;
-  rhi::ComputePipeline worldgen_, worldgenList_, worldgenCols_, mutate_, mutateCells_, compact_,
+  rhi::ComputePipeline worldgen_, worldgenList_, worldgenCols_, worldgenWet_, worldgenWetAll_, mutate_, mutateCells_, compact_,
       compactNext_, step_, reposeSnap_, caMask_, caList_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
   // docs/RESEARCH_wind.md §4.3.

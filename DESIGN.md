@@ -1322,9 +1322,30 @@ SSBO lists of chunk indices.
       flowy tier, and `genCellIn` lays the preset's substrate above it. A
       45-degree bed, and `bowlSteep`'s ring test with its KNOWN GAP, are
       untouched.
-    - **not the sediment wedge**: `sed` is part of `h` and of the CPU height
-      mirror, and its `sedSlope` (96 Q8) is already under the 2:1 tier's 128;
-      measured, no dirt or gravel grain departs.
+    - **the sediment wedge, too (2026-10-05)** -- this bullet used to read
+      "not the sediment wedge ... measured, no dirt or gravel grain departs",
+      which was true of the harness map's smooth ground and false of the
+      default map's: `sedSlope` gates on the SMOOTHED landform gradient, so a
+      local 3+ step between two columns (a cut bank, a trench, a stamp's
+      edge) left full dirt grains in the step wall with a free diagonal, 3-6
+      per streamed chunk, each waking its chunk and ring on the birth wake.
+      `looseStep` now returns a third lane, `Col.sedTop`, from the SAME four
+      neighbour heights and far columns, judged by the wedge powder's own
+      slide reach (`sedLineMat`: the flowier of subsoil and gravel); a wedge
+      powder cell above it is the firm cover. Its own run, never the cover's,
+      so a column's wedge is the same whichever cover branch ran (the cache
+      must not depend on which chunks shared a list); it rides bits 8..15 of
+      `CCW_TOP_MASS` as `h - sedTop`. Pond columns keep `h`.
+    - **the snow cap (2026-10-05)**: snow is a powder laid two deep on every
+      column at or above the treeline with no slope gate at all, and 1,615
+      cap grains in one 128² patch of the default map's hills had a free
+      diagonal. A cap column (`snowCapCol`, decided by the column, ahead of
+      the split cover) draws its `looseTop` with snow's repose, and a cap cell
+      above it is the firm cover.
+      Measured on the default map, `--autofly-surface --frames 1300`, clear
+      sky, with the wet-bank pass below: awake chunks p50 36 → 0, p95 522 → 4,
+      mean 118 → 1; a raw `--voxdump` static check of the patches that showed
+      them finds 0 grains with a free first move (was 15 dirt / 1,615 snow).
     Measured, `--selftest --gate gen-settle` (harness map, 300 still ticks +
     48-shift +X flight): authored repose on the OLD worldgen 1,499 modified /
     1,301 changed chunks, 9,036 departed desert grains, travel 49.5 / 41.4 per
@@ -4633,6 +4654,37 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     the drop is dropped, never faulted. Each tile owns its columns, so no two
     threads write one cell (rule 1); rain is a CA-skip input
     (`NoteTickInputs`). Snow does not wet (its rain amount is 0).
+  - **A drop must have fallen through sky (2026-10-05).** The fall-line
+    lattice reads every cell outside the window as air, which is true above
+    the window and false beside it: a slanted line entering through the
+    window's SIDE below the ground met buried rock as its "first surface",
+    wetted it, and sim_step's `stainDry` held the chunk awake (a COVERED wet
+    cell) until it dried -- under `SANDVOX_WEATHER=storm` ~1,500 awake chunks
+    in rows along the upwind face, down to 160+ voxels below ground, against
+    ~30 in clear weather. `rainFall` now wets only after `RAIN_FALL_MIN_AIR`
+    (32) levels of in-window air on the drop's own line (the sentinel skip
+    adds the levels it jumps, so paged and dense count alike); drying keeps
+    every landing. The exposure map (`sim_rain_expo`) has the same blind spot
+    for a side-entering line's blocker cell and is NOT changed: it gates
+    `rain` reaction conditions, wakes nothing, and its CPU mirror is pinned
+    by `rain-lean`.
+  - **Generated water is born with its banks soaked (2026-10-05;
+    `worldgen.wgsl` `wetbanks` / `wetbanksAll`).** Soaking a dry ABSORBENT
+    cell is paid in the liquid's own eighths (above), and genCellIn writes no
+    stain bits, so every pond, oasis and shore came out of worldgen with dry
+    banks and spent its first ~thousand ticks drinking itself down into its
+    own bed -- `down`/`diag`/`equalize`/SUBMERGED over the whole body, the
+    walls-and-columns the F6 overlay showed walking into a desert oasis.
+    Removing water's stain cut awake chunks on the surface route from p95 156
+    to 39; this pass gets the same with the stain kept. After `list` (and
+    `main`), every unstained solid/powder cell with a staining liquid on a
+    face takes the stain `stainStep` converges to (the same function iterated
+    to its fixed point, so the CA finds no work there), and the streaming
+    dispatch also visits the face-adjacent shell of resident neighbours,
+    testing only the face back into the new chunk (new water soaks old banks;
+    it never pre-empts the CA's own soak of old water). A chunk it stained
+    has its genAct UNIFORM/JITTER class cleared so the CPU cannot demote the
+    stain away. Shell cells on a sentinel page are left to the CA.
   - Absorption writes SELF, which the stain rule otherwise never does. Reach is
     still ≤1 cell so the lattice argument holds, and the write sets the substep
     stamp so the movement code cannot also move the cell and double-spend the

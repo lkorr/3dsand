@@ -3418,6 +3418,14 @@ struct Col {
   // genChunk, which owns the pristine words the save compares against,
   // pays the four neighbour heights to tighten it.
   looseTop    : i32,
+  // The same step line for the SEDIMENT WEDGE under the skin (2026-10-05):
+  // the highest y a wedge grain may occupy and still be at rest. The wedge's
+  // slope gate (sed in landAt) reads the SMOOTHED landform gradient, so a
+  // local 3+ step between two columns -- a cut bank, a trench, a stamp's
+  // edge -- left full dirt grains in the step wall with a free down-diagonal:
+  // 3-6 cells per streamed chunk slid on the birth wake and woke the chunk
+  // and its ring. genColumn sets `h` (no restriction); `cols` tightens it.
+  sedTop      : i32,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -3753,6 +3761,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
     lab.plant.base = 0;
     lab.plant.top = -1;
     lab.looseTop = LAB_SLAB_Y;
+    lab.sedTop = LAB_SLAB_Y;
     *ponds = pondSetNone();
     return lab;
   }
@@ -3821,6 +3830,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
   col.looseTop = h;
+  col.sedTop = h;
   *ponds = L.ponds;
   return col;
 }
@@ -3936,7 +3946,7 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32, mat : u32) -> i32 {
 // sand vs sandstone is one far palette slot and four more ground evaluations
 // per sample would be pure cost.
 fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32) -> i32 {
-  return looseStep(col, x, z, seed, mat, true).x;
+  return looseStep(col, x, z, seed, mat, true, 0).x;
 }
 
 // ---- THE TOP CELL'S GRAINS (docs/PLAN_powder_mass.md P5) -----------------
@@ -3988,10 +3998,18 @@ fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u3
 // AIR or a partial of its own powder, so under water the sub-voxel rule never
 // fires and only the step line and the slide apply.
 //
-// Returns (looseTop, mass); the four heights are the ones looseRestTop always
-// read, so the mass costs nothing extra.
+// Returns (looseTop, mass, sedTop); the four heights are the ones
+// looseRestTop always read, so the mass costs nothing extra.
+//
+// sedTop (2026-10-05) is the SAME line for the sediment wedge under the cover
+// (Col.sedTop), judged by a slide reach of `sedRun` instead of `mat`'s, from
+// the same four neighbour heights and the same far columns -- one call site,
+// two lines. Each depends on its own run only, so the cover's line is bit for
+// bit what it was whether or not the wedge was asked for, and the wedge's
+// whatever cover the column has. `mat` MAT_AIR asks for the wedge line alone;
+// `sedRun` 0 for the cover's alone.
 fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
-             fine : bool) -> vec2<i32> {
+             fine : bool, sedRun : i32) -> vec3<i32> {
   let h = (*col).h;
   let a = colHeightAt(x + 1, z, seed);
   let b = colHeightAt(x - 1, z, seed);
@@ -4000,8 +4018,10 @@ fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
   let lo = min(min(a, b), min(c, d));
   let hi = max(max(a, b), max(c, d));
   var top = min(h, lo + 1);
-  let run = reposeRunOf(mat);
-  if (run >= 2) {
+  let run = select(0, reposeRunOf(mat), mat != MAT_AIR);
+  let runMax = max(run, sedRun);
+  var slidesSed = false;
+  if (runMax >= 2) {
     // A lateral (d, 0) at `top` is open only where that neighbour is exactly
     // top - 1 (the step line forbids lower). Look past it.
     var slides = false;
@@ -4016,14 +4036,18 @@ fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
         default: { dz = -1; g1 = d; }
       }
       if (g1 >= top) { continue; }
-      for (var k = 2; k <= run; k++) {
-        if (colHeightAt(x + k * dx, z + k * dz, seed) < top - 1) { slides = true; }
+      for (var k = 2; k <= runMax; k++) {
+        if (colHeightAt(x + k * dx, z + k * dz, seed) < top - 1) {
+          if (k <= run) { slides = true; }
+          if (k <= sedRun) { slidesSed = true; }
+        }
       }
     }
     if (slides) { top = top - 1; }
   }
+  let sedTop = min(h, lo + 1) - select(0, 1, slidesSed);
   var mass = 8;
-  if (TUNE_POWDER_FINE_REPOSE != 0u && fine && lo < h) {
+  if (mat != MAT_AIR && TUNE_POWDER_FINE_REPOSE != 0u && fine && lo < h) {
     let t = i32(reposeEighthsOf(materials[mat].repose));
     if (t >= 8) {
       mass = select(4, 6, hi > h);
@@ -4031,7 +4055,7 @@ fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32, mat : u32,
       if (hi > h || t < 4) { top = h - 1; } else { mass = 4; }
     }
   }
-  return vec2<i32>(top, mass);
+  return vec3<i32>(top, mass, sedTop);
 }
 
 // Does this column's cover get the loose/firm split at all? The same two opt-ins
@@ -4055,6 +4079,25 @@ fn coverFirmMat(biome : u32) -> u32 {
   let sub = wmBiome(biome, WM_B_SUBSOIL);
   if (sub != MAT_AIR && materials[sub].klass == CLASS_SOLID) { return sub; }
   return M_STONE;
+}
+
+// The powder the sediment wedge's step line is judged by (Col.sedTop): the
+// wedge powder with the longer slide reach (subsoil or gravel). MAT_AIR when
+// the wedge holds no powder at all.
+fn sedLineMat(biome : u32) -> u32 {
+  let sub = wmBiome(biome, WM_B_SUBSOIL);
+  let subP = sub != MAT_AIR && materials[sub].klass == CLASS_POWDER;
+  let grvP = materials[M_GRAVEL].klass == CLASS_POWDER;
+  if (subP && (!grvP || reposeRunOf(sub) >= reposeRunOf(M_GRAVEL))) { return sub; }
+  if (grvP) { return M_GRAVEL; }
+  return MAT_AIR;
+}
+
+// Does this column wear the snow cap (genCellIn's first branch)? The column
+// half of that test; the cell half is `y > h - 2`. Pond columns are left out
+// of the cap's step line: their looseTop is the bed's.
+fn snowCapCol(col : ptr<function, Col>) -> bool {
+  return !(*col).inRim && (*col).h >= treeline() && (*col).pond < 0;
 }
 
 // Can any cell of this column be a TREE cell? The column half of genCellIn's
@@ -4377,6 +4420,9 @@ fn genCellIn(col : ptr<function, Col>,
     // itself as `ca-skip` never finding a quiet tick).
     if (!inRim && h >= treeline() && y > h - 2) {
       mat = M_SNOW;                        // snow caps on the high hills
+      // ...but never above the cap's step line (`cols`, snowCapCol): a snow
+      // cell a neighbour column leaves a free diagonal is the firm cover.
+      if (pond < 0 && y > (*col).looseTop) { mat = coverFirmMat(biome); }
     } else if (inPoolFloor) {
       mat = M_STONE;
     } else if (submerged && y > h - wmWaterI(wp, WM_W_BED_THICKNESS)) {
@@ -4456,6 +4502,12 @@ fn genCellIn(col : ptr<function, Col>,
       // something that flows.
       if (y > h - 1 - wmTerrain(WM_H_TERRAIN_SED_TOPSOIL)) { mat = wmBiome(biome, WM_B_SUBSOIL); }
       else { mat = M_GRAVEL; }
+      // ...and never above the wedge's own step line (Col.sedTop): a grain
+      // the neighbour columns leave a free diagonal is the firm cover, so a
+      // cut bank reads as rock instead of as soil that has not fallen yet.
+      if (y > (*col).sedTop && materials[mat].klass == CLASS_POWDER) {
+        mat = coverFirmMat(biome);
+      }
     } else {
       mat = M_STONE;
     }
@@ -5143,6 +5195,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
       // chunk can read it, and no cell reads it anywhere else (looseRestTop's
       // band is (h - max(4, skinDepth), h]; the canopy's, colPrologue's note).
       ccLoad(cw, &col, &cave);
+      col.sedTop = col.h - i32((colCache[cw + CCW_TOP_MASS] >> 8u) & 0xFFu);
       // THE TOP CELL'S GRAINS (looseStep, docs/PLAN_powder_mass.md P5):
       // `cols` cached the ground cell's mass wherever a listed chunk holds
       // that cell (the same band test the step line takes, so it is set in
@@ -5164,7 +5217,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
       // by the ONE genCellIn call site below (one more trip of the loop, top
       // down) and never stored: a second inlined call would be a second copy
       // of the whole cell stack in this kernel.
-      let topMass = colCache[cw + CCW_TOP_MASS];
+      let topMass = colCache[cw + CCW_TOP_MASS] & 0xFFu;
       let extra = select(0u, 1u, topMass < 8u && col.h == base.y + i32(CHUNK) - 1);
       let reach = base.y + i32(CHUNK) - 1 + i32(extra);
       // Does this column evaluate a cell above the ground? Everything that
@@ -5434,6 +5487,135 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
   genChunk(genList[wg.x], li, wg.x, true);
 }
 
+// ---- WET BANKS: a generated body of water is born with its banks SOAKED ----
+//
+// (2026-10-05.) A liquid that authors a `stain` soaks it into every solid or
+// powder face-neighbour (sim_step doStaining -> common.wgsl stainStep), and on
+// ABSORBENT ground (sand, dirt, mud: capacity > 0) every level of that soak is
+// PAID FOR in the liquid's own mass, one eighth a level. genCellIn writes no
+// stain bits at all, so every pond, oasis and sea shore came out of worldgen
+// with DRY banks: its first thousand ticks were the water drinking itself down
+// into its own bed, every eighth it spent a hole the level had to equalize
+// across -- `down`/`diag`/`equalize`/SUBMERGED marks over the whole body, and
+// the bank's stained count climbing 59 -> 172 in five ticks. Measured on the
+// default map under --autofly-surface: removing water's stain cut p95 awake
+// chunks 156 -> 39 and took every liquid mark with it. Worldgen's water was
+// already at rest by every OTHER rule (a static check of a desert oasis found
+// no free fall, no fullness step, no free powder in 45k water cells).
+//
+// So the at-rest state is laid down here, AFTER genChunk, because "does a
+// liquid touch this cell" is a NEIGHBOUR question genCellIn cannot ask: every
+// unstained solid/powder cell with a staining liquid on a face gets the stain
+// stainStep would converge to -- the SAME function iterated to its fixed point,
+// so the CA finds nothing left to do there and the two cannot disagree about
+// the ceiling (capacity on absorbent ground, one level on stone). The first
+// such face in faceDir order wins: worldgen lays one liquid per body.
+//
+// THE SHELL. A cell of an ALREADY-RESIDENT chunk touching water this pass's
+// chunk just generated was born when that water was outside the window, so
+// nothing soaked it then. The streaming dispatch therefore also visits the
+// face-adjacent one-cell shell, and there tests ONLY the face back into the
+// generated chunk: an old cell is soaked by NEW water, never pre-empting the
+// CA's own soak of old water (which is already paid, or paying). A shell cell
+// on a sentinel page has no word to write and is left to the CA.
+//
+// DETERMINISM. The pass reads liquids (which it never writes) and writes only
+// the stain bits of solid/powder cells, each to a value that is a pure
+// function of the cell's own word and its liquid neighbours. Two workgroups
+// that both reach one cell (a shell cell of chunk A that chunk B's workgroup
+// owns) compute the same word from the same inputs, and a reader that sees
+// the other's write finds the cell stained and leaves it. Residency-blind:
+// voxWordAt / voxWordIndex, so paged and dense agree.
+//
+// THE VERDICT. A chunk this pass wrote into is not one repeated word any more:
+// its UNIFORM/JITTER class is cleared in genAct so the CPU does not demote it
+// to a sentinel and drop the stain it was just given.
+var<workgroup> wbWrote : atomic<u32>;
+
+// The soaked word for cell c (word w), or w when nothing soaks it. `onlyFace`
+// < 6 restricts the test to that one face (the shell's face into the chunk).
+fn wetBankWord(c : vec3<i32>, w : u32, onlyFace : u32) -> u32 {
+  let mi = voxMat(w);
+  if (mi == MAT_AIR || voxStained(w)) { return w; }
+  let m = materials[mi];
+  if (m.klass != CLASS_SOLID && m.klass != CLASS_POWDER) { return w; }
+  for (var k = 0u; k < 6u; k++) {
+    if (onlyFace < 6u && k != onlyFace) { continue; }
+    let n = c + faceDir(k);
+    if (!cellResident(n, T.origin)) { continue; }
+    let lm = materials[voxMat(voxWordAt(n))];
+    if (lm.klass != CLASS_LIQUID || matStainType(lm) == 0u || matStainAmount(lm) == 0u) {
+      continue;
+    }
+    var out = w;
+    for (var s = 0u; s < 16u; s++) {
+      let d = stainStep(matStainType(lm), matStainAmount(lm), matWashes(lm), out, m);
+      if ((d.y & STAIN_WORK) == 0u) { break; }
+      out = d.x;
+    }
+    return out;
+  }
+  return w;
+}
+
+fn wetBanksChunk(slot : u32, li : u32, actIdx : u32, shell : bool) {
+  if (li == 0u) { atomicStore(&wbWrote, 0u); }
+  workgroupBarrier();
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
+  let span = select(i32(CHUNK), i32(CHUNK) + 2, shell);
+  let lo = select(0, -1, shell);
+  let total = u32(span * span * span);
+  for (var i = li; i < total; i += 64u) {
+    let lc = vec3<i32>(i32(i) % span, (i32(i) / span) % span, i32(i) / (span * span)) +
+             vec3<i32>(lo);
+    let outLo = lc < vec3<i32>(0);
+    let outHi = lc >= vec3<i32>(i32(CHUNK));
+    let outN = u32(outLo.x || outHi.x) + u32(outLo.y || outHi.y) + u32(outLo.z || outHi.z);
+    // Edge and corner shell cells touch no cell of this chunk on a face.
+    if (outN > 1u) { continue; }
+    var face = 6u;
+    if (outN == 1u) {
+      // faceDir order is -y +y +x -x +z -z (common.wgsl); the face that
+      // points from the shell cell back INTO the chunk.
+      if (outLo.x) { face = 2u; } else if (outHi.x) { face = 3u; }
+      else if (outLo.y) { face = 1u; } else if (outHi.y) { face = 0u; }
+      else if (outLo.z) { face = 4u; } else { face = 5u; }
+    }
+    let c = base + lc;
+    if (!cellResident(c, T.origin)) { continue; }
+    let idx = voxWordIndex(c);
+    if (idx == PT_NO_WORD) { continue; }
+    let w = voxels[idx];
+    let nw = wetBankWord(c, w, face);
+    if (nw != w) {
+      voxStore(idx, nw);
+      if (outN == 0u) { atomicOr(&wbWrote, 1u); }
+    }
+  }
+  workgroupBarrier();
+  if (li == 0u && actIdx < arrayLength(&genAct) && atomicLoad(&wbWrote) != 0u) {
+    genAct[actIdx] = genAct[actIdx] & ~(3u << GEN_V_CLASS_SHIFT);
+  }
+}
+
+// After `list`: the streamed chunks and their face shell.
+@compute @workgroup_size(64)
+fn wetbanks(@builtin(workgroup_id) wg : vec3<u32>,
+            @builtin(local_invocation_index) li : u32) {
+  gPtKernel = PT_K_GENLIST;
+  if (wg.x >= T.genCount) { return; }
+  wetBanksChunk(genList[wg.x], li, wg.x, true);
+}
+
+// After `main`: the whole window, so no shell (every neighbour is someone's
+// interior) and no verdict (`main` publishes none).
+@compute @workgroup_size(64)
+fn wetbanksAll(@builtin(workgroup_id) wg : vec3<u32>,
+               @builtin(local_invocation_index) li : u32) {
+  if (wg.x >= NUM_CHUNKS && !ticketSlotLive(wg.x)) { return; }
+  wetBanksChunk(wg.x, li, 0xFFFFFFFFu, false);
+}
+
 // ---- THE COLUMN CACHE PRE-PASS ----------------------------------------------
 // One workgroup per CHUNK-COLUMN of the list (genCols record wg.x; the CPU
 // dispatches exactly that many -- the extent is the bound, as in `pagefill`),
@@ -5534,7 +5716,19 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     // binary for nothing.
     var lsMat = MAT_AIR;
     var lsFine = true;
-    if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
+    if (snowCapCol(&col) && yLo <= col.h && yHi + 1 > col.h - coverDepth) {
+      // THE SNOW CAP (2026-10-05). Snow is a POWDER laid two deep on every
+      // column at or above the treeline, with no slope gate at all, so every
+      // step in a mountain face shed snow on its birth wake (1,615 grains
+      // with a free diagonal in one 128^2 patch of the default map's hills).
+      // The cap now keeps to its own step line like any loose cover; a cell
+      // above it is the firm cover (genCellIn). Decided by the COLUMN, ahead
+      // of the split cover, so the line every cell under the cap reads is
+      // the snow's whichever chunks share this list. Its band is the whole
+      // cover depth because the skin and cap cells under the snow read
+      // looseTop too.
+      lsMat = M_SNOW;
+    } else if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
         looseCoverDepth(&col, coverDepth, looseCoverMat(col.biome)) > 0) {
       lsMat = looseCoverMat(col.biome);
     } else if (col.pond >= 0 && !col.bedSolid && !col.inPoolFloor && yLo <= col.h &&
@@ -5553,10 +5747,25 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
         lsFine = false;
       }
     }
-    if (lsMat != MAT_AIR) {
-      let ls = looseStep(&col, x, z, T.seed, lsMat, lsFine);
-      col.looseTop = ls.x;
-      if (lsFine) { topMass = ls.y; }
+    // THE WEDGE'S STEP LINE (Col.sedTop), from the SAME call (looseStep's
+    // third lane): a column whose listed chunks reach the sediment wedge.
+    // Judged by the wedge powder's own slide reach, never the cover's, so it
+    // is the same number whichever cover branch above did or did not run --
+    // a column's wedge must not depend on which chunks shared its list. Pond
+    // columns keep `h`, as before.
+    var sedRun = 0;
+    let sedMat = sedLineMat(col.biome);
+    if (col.pond < 0 && col.sed > 0 && sedMat != MAT_AIR &&
+        yLo <= col.h && yHi > col.h - col.sed) {
+      sedRun = reposeRunOf(sedMat);
+    }
+    if (lsMat != MAT_AIR || sedRun > 0) {
+      let ls = looseStep(&col, x, z, T.seed, lsMat, lsFine, sedRun);
+      if (lsMat != MAT_AIR) {
+        col.looseTop = ls.x;
+        if (lsFine) { topMass = ls.y; }
+      }
+      if (sedRun > 0) { col.sedTop = ls.z; }
     }
     // THE TOP CELL'S GRAINS are written only under generated AIR (genChunk),
     // so the chunk holding the ground cell h also asks genCellIn about
@@ -5580,7 +5789,10 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     colTop = max(colTop, trees.top);
     if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, cactusMaxTop()); }
     ccStore(blk + CC_HDR + ci * CC_WORDS, &col, &cave, ponds.n, canopy, colTop, trees.top);
-    colCache[blk + CC_HDR + ci * CC_WORDS + CCW_TOP_MASS] = u32(topMass);
+    // Low byte the top cell's grains, next byte h - sedTop (clamped: 255 is
+    // deeper than any wedge, i.e. the whole wedge is firm).
+    colCache[blk + CC_HDR + ci * CC_WORDS + CCW_TOP_MASS] =
+        u32(topMass) | (u32(clamp(col.h - col.sedTop, 0, 255)) << 8u);
     top = max(top, colTop);
     treeTopMax = max(treeTopMax, trees.top);
     minH = min(minH, col.h);
