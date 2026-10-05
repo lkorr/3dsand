@@ -13823,7 +13823,20 @@ void Mob::LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
     s.vx = (int32_t)std::lround(out.x * sp * 256.0f / 30.0f);
     s.vy = (int32_t)std::lround(out.y * sp * 256.0f / 30.0f);
     s.vz = (int32_t)std::lround(out.z * sp * 256.0f / 30.0f);
-    s.payload = v.payload;
+    // THE DYE GOES INTO THE NIBBLE BEFORE THE MATTER LEAVES (2026-10-05), as
+    // DebrisSystem::VoxelsToParticles has always done for loose bodies. This
+    // copied the payload VERBATIM, and a limb's nibble is its positional
+    // jitter variant (0..2), not a tint -- so every cut through a garment
+    // landed cloth as tints 0, 1 and 2: indigo, dark indigo and gold, whatever
+    // the garment was painted. The owner's "purple robe voxels out of
+    // clothing with no purple in it". Untinted materials keep the nibble.
+    const uint32_t pmat = (uint32_t)v.payload & 0xFFFu;
+    const uint32_t nib = ((uint32_t)v.payload >> 12) & 0xFu;
+    const uint32_t pstate =
+        debris_ ? debris_->DepositState(DebrisSystem::kTintLimbSpray, pmat,
+                                        v.color, nib, limb.dye, false)
+                : nib;
+    s.payload = (uint16_t)(pmat | (pstate << 12));
     s.flags = 1u;  // PFLAG_ALIVE
     spawns.push_back(s);
   }
@@ -14290,7 +14303,7 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     mv.reserve(limb.voxels.size());
     for (const DebrisVoxel& v : limb.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
+                    (uint16_t)(v.payload & 0xFFF), v.color, 0, v.stain});
   }
   IVec3 shift{};
   if (!MicroBodyEdit(*MicroSet(), (uint32_t)limb.microModel,
@@ -15569,9 +15582,12 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
   if (src.microModel >= 0 && MicroSet()) {
     std::vector<PrefabVoxel> mv;
     mv.reserve(part.size());
+    // The ART colour goes into the brick (it was packed as 0 until
+    // 2026-10-05, so a gobbet hacked off a black robe flew as undyed cloth --
+    // cloth's own indigo -- and only its settled cells were the right colour).
     for (const DebrisVoxel& v : part)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
+                    (uint16_t)(v.payload & 0xFFF), v.color, 0, v.stain});
     IVec3 dims{1, 1, 1};
     for (const PrefabVoxel& v : mv) {
       dims.x = std::max<int>(dims.x, v.x + 1);
@@ -15587,7 +15603,9 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
     // Packed models are SHARED by default; this one belongs to exactly one body
     // and must be freeable with it, or every gobbet leaks pool words.
     if (m < (int)MicroSet()->owned.size()) MicroSet()->owned[m] = 1;
-    micro = MicroBodyRef{(uint32_t)m, physScale};
+    // ...and the garment's DYE, which is what the brick is drawn in and what
+    // DebrisSystem::DepositState quantizes when the gobbet settles.
+    micro = MicroBodyRef{(uint32_t)m, physScale, src.dye};
   }
 
   const float pitch = 1.0f / (float)std::max(1u, physScale);

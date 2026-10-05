@@ -544,15 +544,63 @@ void DebrisSystem::RefreshTintMap() {
 }
 
 uint32_t DebrisSystem::GridStateFor(uint32_t mat, uint32_t art,
-                                    uint32_t fallback) const {
+                                    uint32_t fallback, uint32_t dye) const {
   if (mat >= tintOfArt_.size()) return fallback;
   const std::vector<uint8_t>& tbl = tintOfArt_[mat];
   if (tbl.empty()) return fallback;  // untinted: the caller's jitter variant
+  // A DYED GARMENT (game/dye.h kDyeFlag in bit 24): quantize the colour the
+  // shader draws -- microbody.wgsl's dye * lum(albedo) / DYE_REF -- not the
+  // grey weave under it. Unpainted cells use the material's natural colour as
+  // their albedo, as the shader's paletteJitter does. Quantizing the grey
+  // instead is why every dyed tunic landed as whichever linen tint sits
+  // closest to mid-grey, whatever colour it was.
+  if ((dye & (1u << 24)) != 0 && mat < matTints_.size() &&
+      !matTints_[mat].empty()) {
+    uint32_t base = matTints_[mat][0];
+    if (art != 0 && microSet_ && art - 1 < microSet_->artColors.size())
+      base = microSet_->artColors[art - 1] & 0xFFFFFFu;
+    // Rec.709 weights in /256 fixed point: 0.2126, 0.7152, 0.0722.
+    const uint32_t lum = (54u * ((base >> 16) & 0xFFu) +
+                          183u * ((base >> 8) & 0xFFu) + 19u * (base & 0xFFu) +
+                          128u) >> 8;
+    // dye.h packs red in the LOW byte (the GPU's unpackColor order).
+    auto ch = [&](uint32_t d) {
+      return std::min<uint32_t>(255u, (d * lum + 89u) / 179u);
+    };
+    const uint32_t rgb = (ch(dye & 0xFFu) << 16) | (ch((dye >> 8) & 0xFFu) << 8) |
+                         ch((dye >> 16) & 0xFFu);
+    return NearestTint(matTints_[mat], rgb);
+  }
   // Past the end means the palette shrank under a body that still holds an old
   // index — a hot reload between a limb being severed and it landing. Tint 0
   // rather than a wrap: an undyed corpse is a miss, a randomly dyed one is a bug
   // report.
   return art < tbl.size() ? (uint32_t)tbl[art] : 0u;
+}
+
+uint32_t DebrisSystem::DepositState(TintPath path, uint32_t mat, uint32_t art,
+                                    uint32_t nibble, uint32_t dye,
+                                    bool gridNibble) const {
+  const bool tinted = mat < tintOfArt_.size() && !tintOfArt_[mat].empty();
+  if (!tinted) return GridStateFor(mat, art, nibble, dye);  // == nibble
+  uint32_t state;
+  if (gridNibble && art == 0 && (dye & (1u << 24)) == 0) {
+    // A grid-born voxel (Body::gridNibble): the nibble IS its tint. Clamped
+    // to the authored list so a hot reload that shortened it cannot index
+    // past the run.
+    const size_t n = std::min<size_t>(matTints_[mat].size(), kMatTintsMax);
+    state = (nibble & 0xFu) < n ? (nibble & 0xFu) : 0u;
+    path = kTintIsland;
+  } else {
+    state = GridStateFor(mat, art, nibble, dye);
+  }
+  auto& row = tintCount_[path];
+  row[0].fetch_add(1, std::memory_order_relaxed);
+  if (art != 0 || (dye & (1u << 24)) != 0) {
+    row[1].fetch_add(1, std::memory_order_relaxed);
+    if (state == 0) row[2].fetch_add(1, std::memory_order_relaxed);
+  }
+  return state;
 }
 
 void DebrisSystem::RecountBurn(Body& b) const {
@@ -1793,8 +1841,17 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
           const bool frozen = rub < matGpu_.size() && matGpu_[rub].klass == CLASS_SOLID;
           const bool crumbles = rub < matGpu_.size() && matGpu_[rub].klass == CLASS_POWDER &&
                                 (matGpu_[rub].flags & kMatFlagWander) == 0u;
-          const uint32_t state = crumbles ? PowderCrumbleState((cellIdx * 2654435761u) >> 5)
-                                          : ((cellIdx * 2654435761u) >> 8) % 3u;
+          uint32_t state = crumbles ? PowderCrumbleState((cellIdx * 2654435761u) >> 5)
+                                    : ((cellIdx * 2654435761u) >> 8) % 3u;
+          // A TINTED cell keeps its tint, as the small-component path above
+          // does: the nibble is a dye index there, and re-rolling it as jitter
+          // turned a dropped green tunic's sliver into cloth tints 0..2 --
+          // indigo, dark indigo and gold.
+          if (rub < matGpu_.size() && (matGpu_[rub].flags & kMatFlagTinted)) {
+            const bool srcTinted =
+                mat < matGpu_.size() && (matGpu_[mat].flags & kMatFlagTinted);
+            state = srcTinted ? ((comp.words[j] >> 12) & 0xFu) : 0u;
+          }
           if (frozen) {
             if (spawns.size() >= kMaxParticleSpawnsPerTick) {
               floaters_.deferredSpawnRing++;
@@ -1818,6 +1875,9 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         continue;
       }
       Body body;
+      // Cut out of the grid: each payload is the cell's own word, so a tinted
+      // voxel's nibble is its tint and it has no art colour (Body::gridNibble).
+      body.gridNibble = true;
       body.voxels.reserve(sh.idx.size());
       for (uint32_t j : sh.idx) {
         const IVec3 c = comp.cells[j];
@@ -2851,8 +2911,13 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
           break;
         }
         const uint32_t mat = (uint32_t)v.payload & 0xFFFu;
-        const uint32_t state =
-            GridStateFor(mat, v.color, ((uint32_t)v.payload >> 12) & 0xFu);
+        // The garment's DYE and the grid-born rule ride with the body, not
+        // the voxel (DepositState): a dyed sleeve lands in its dye's tint, a
+        // cloth island lands in the tint it left the grid with.
+        const Body& owner = bodies_[mem.idx];
+        const uint32_t state = DepositState(
+            kTintSettle, mat, v.color, ((uint32_t)v.payload >> 12) & 0xFu,
+            owner.micro.dye, owner.gridNibble);
         const uint32_t word = PackVoxNew(mat, state) | kCellOpIfAir;
         cellOps.push_back({World::SlotCellIndex(cell), word});
         written.push_back({cell, word});
@@ -3574,6 +3639,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       nb.dead = b.dead;  // half a corpse is still a corpse
       nb.defIndex = b.defIndex;   // ...and still that creature's flesh
       nb.creature = b.creature;
+      nb.gridNibble = b.gridNibble;  // a cloth island's halves keep its tints
       // The fragment's skin rebases by the SAME corner, expressed in skin
       // units. Both lattices must land on one origin or the art slides off the
       // collider — the same agreement ReskinMicro maintains after a carve.
@@ -3739,7 +3805,9 @@ void DebrisSystem::VoxelsToParticles(const Body& b,
     // shattered corpse's chunks the right colour and its spray the wrong one.
     const uint32_t pmat = (uint32_t)v.payload & 0xFFFu;
     const uint32_t pstate =
-        GridStateFor(pmat, v.color, ((uint32_t)v.payload >> 12) & 0xFu);
+        DepositState(kTintBodySpray, pmat, v.color,
+                     ((uint32_t)v.payload >> 12) & 0xFu, b.micro.dye,
+                     b.gridNibble);
     s.payload = (uint16_t)(pmat | (pstate << 12));
     s.flags = 1u;  // PFLAG_ALIVE
     spawns.push_back(s);
@@ -4595,7 +4663,7 @@ bool DebrisSystem::ReskinMicro(Body& b) {
     mv.reserve(b.voxels.size());
     for (const DebrisVoxel& v : b.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
+                    (uint16_t)(v.payload & 0xFFF), v.color, 0, v.stain});
   }
   IVec3 shift{};
   if (!MicroBodyEdit(*microSet_, b.micro.model, mv, shift)) return false;

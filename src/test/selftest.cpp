@@ -503,6 +503,10 @@ const char* const kOrder[] = {
     // Same standing rig and wardrobe as `dye`; spawns one pool body and
     // Resets the mob list either side, like `dye`.
     "hair-tuck",
+    // Same rig and wardrobe again; carves the shipped robe and a dyed tunic and
+    // reads the spray (CPU only, no tick). Resets the mob list and the debris
+    // bodies its carves made, so the BodyCount gates below see nothing of it.
+    "garment-tint",
     "ragdoll-joints",
     // Beside `ragdoll-joints` and for the same reason: both are pure Jolt over
     // their own fixture, 640 voxels from anything, and both remove every body

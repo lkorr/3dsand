@@ -21102,6 +21102,48 @@ actually reads, that three patterns exist per slot, that the dye reaches every
 shell's GPU instance and nothing else's, that a stack is one colour, and that
 the word survives `PLYR` v5.
 
+#### When a garment's matter enters the GRID (2026-10-05; gate `garment-tint`)
+
+A world cell has no room for an 8-bit art colour or a dye word, so a
+`MATF_TINTED` material (`materials.json` `tints`, at most 16, entry 0 = its
+natural colour) keeps the colour as a tint INDEX in the state nibble. EVERY
+body -> grid path asks ONE function for that nibble,
+`DebrisSystem::DepositState(path, mat, art, nibble, dye, gridNibble)`:
+
+| Path | Where | Colour source |
+|---|---|---|
+| debris body settles back | `SettleBodies` | art (+ `micro.dye`) |
+| debris body sprays (shatter, carve, blast) | `VoxelsToParticles` | art (+ `micro.dye`) |
+| creature / worn-garment limb carve spray (blade, blast, bite, sub-size fragment) | `Mob::LimbVoxelsToParticles` | art (+ `MobLimb::dye`) |
+| island cut out of the grid, then settled or sprayed | `Body::gridNibble` | the nibble IS the tint |
+| island sliver / small component re-deposited | `RunIslandDetection` | tint kept verbatim |
+| burn products of loose matter | `BurnLimbView::gridState` | art (products are untinted today) |
+
+Art goes through the precomputed nearest-tint table; a DYED piece quantizes
+`dye * luma(art) / 179` (integer Rec.709, 179 = `DYE_REF_GREY`), i.e. the
+colour the shader draws, not the grey weave. A limb or prefab voxel's own
+nibble is its positional JITTER variant and is never written as a tint; that
+is exactly the bug the gate pins: until 2026-10-05 the creature-limb spray
+copied the payload verbatim, so every cut through a garment landed `cloth` as
+tints 0/1/2 -- indigo, dark indigo, gold -- whatever it was painted (owner:
+"clothing with no purple leaves purple robe voxels"). `DepositState` counts
+deposits per path (`TintStats`: deposits / painted / painted-but-tint-0), so a
+regression names its path in one run.
+
+**Coverage is data.** `node scripts/tint_coverage.mjs` reads every `.vox` in
+`assets/items` and `assets/mobs`, reports per tinted material the worn colours'
+distance to the nearest authored tint (and, for dyeable pieces, to a sample of
+the NPC dye roll), and `--fit --write` APPENDS the entries that most reduce the
+error -- append-only, because a tint index is stored in saved cells. Re-run it
+when outfits are added. Body materials (skin, flesh_*) are excluded by default:
+their lists are mirrored entry for entry down the cook chain. Known limits:
+16 entries cannot cover a continuous dye (linen's worst dye distance is ~100
+of 441 after the 2026-10-05 fit, leather's ~107), `wood` (clogs) and
+`robe_trim`, `hair_white`, `grip_leather` are untinted so their paint never
+reaches the grid, a debris body reloaded from a save loses `gridNibble` (an
+island body lands at its natural colour), and the load path re-packs bricks
+without art (the body DRAWS undyed until it settles; its lattice keeps the art).
+
 ### Vessels: a flask scoops, a pouch scoops, both pour (2026-09-22; `game/container.*`)
 
 ONE ITEM KIND, `container`, and what it takes up is DATA: items.json's

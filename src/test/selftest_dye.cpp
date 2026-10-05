@@ -39,7 +39,9 @@
 // are the instrument for that. What this pins is everything the picture
 // depends on.
 
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -50,6 +52,7 @@
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/mob.h"
+#include "phys/debris.h"
 #include "game/persist.h"
 #include "game/spell.h"
 #include "sim/microbody.h"
@@ -487,6 +490,229 @@ Status GateHairTuck(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- garment-tint: A GARMENT'S MATTER LANDS IN THE GRID IN ITS OWN COLOUR ----
+//
+// The owner's report: "I destroy clothing that contains absolutely zero purple
+// and it creates purple 'robe' voxels". Purple is `cloth`'s tint 0, its
+// natural indigo -- what a cloth cell is when nothing told it otherwise. The
+// cause was Mob::LimbVoxelsToParticles, the spray every carve of a CREATURE'S
+// limb ejects (blade kerf, blast, bite, under-size fragment): it copied the
+// voxel's payload verbatim, and a limb voxel's nibble is the positional jitter
+// variant 0..2, not a tint. So every garment cut on a body landed as cloth
+// tints 0, 1, 2 -- indigo, dark indigo, gold -- whatever it was painted. Loose
+// debris had always quantized (DebrisSystem::VoxelsToParticles); the creature
+// half never learned. A dyed garment had the twin bug everywhere: its art is
+// a grey weave, and the grey, not the dye, was what got quantized.
+//
+// What is pinned, through the real carve on a real rig:
+//   A. the shipped robe (cloth, painted black-and-grey, none of it near
+//      cloth's indigo): every tinted voxel its spray deposits carries a tint
+//      its own art quantizes to -- never a jitter variant -- and none is tint
+//      0, because no colour on the robe is closest to indigo;
+//   B. a DYED commoner's tunic (linen grey weave x a red dye): the commonest
+//      linen tint in its spray is the tint nearest the DYE (computed here from
+//      materials.json's own list, not through the engine's quantizer), and it
+//      differs from what the same tunic sprays undyed;
+//   C. DebrisSystem's per-path counter names the limb spray and saw no painted
+//      voxel land as tint 0 (rule 6: the instrument that would have named this
+//      bug in one run).
+// CPU only: the spray is the deposit (particles carry the payload verbatim
+// into the grid), so no tick is needed to see the colour a cell will take.
+Status GateGarmentTint(Ctx& c, std::string& detail) {
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("garment-tint: FAILED %s\n", what.c_str());
+    }
+  };
+  MobSystem& mobs = c.mobs;
+  DebrisSystem& debris = c.debris;
+  // The quantizer's table is refreshed by DebrisSystem::PreTick; a gate run on
+  // its own may not have ticked yet.
+  debris.RefreshTintMap();
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  const ItemDef* robe = c.items.At(c.items.Find("robe"));
+  const ItemDef* tunic = c.items.At(c.items.Find("tunic"));
+  if (avDef < 0 || robe == nullptr || tunic == nullptr) {
+    detail = "no rig, robe or tunic to test with";
+    std::printf("garment-tint: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  auto tintedMat = [&](uint32_t m) {
+    return m < c.mats.size() && !c.mats[m].tints.empty();
+  };
+  // NearestTint, restated: plain squared RGB, ties to the lowest index.
+  auto nearestTint = [&](uint32_t m, uint32_t rgb) {
+    const std::vector<uint32_t>& t = c.mats[m].tints;
+    uint32_t best = 0;
+    int bestD = INT32_MAX;
+    for (size_t i = 0; i < t.size(); i++) {
+      const int dr = (int)((rgb >> 16) & 255) - (int)((t[i] >> 16) & 255);
+      const int dg = (int)((rgb >> 8) & 255) - (int)((t[i] >> 8) & 255);
+      const int db = (int)(rgb & 255) - (int)(t[i] & 255);
+      const int d = dr * dr + dg * dg + db * db;
+      if (d < bestD) { bestD = d; best = (uint32_t)i; }
+    }
+    return best;
+  };
+  const uint32_t minSpawns =
+      (uint32_t)BaselineNumber("garmentTintMinSpawns", 8.0);
+
+  // One fixture: a fresh rig wearing `piece` (dyed `dye`), every one of its
+  // shells blasted through the real ejecting carve. Returns the tinted spray
+  // as (material, nibble) counts and the allowed set per material, which is
+  // what the piece's own lattice quantizes to.
+  struct Spray {
+    std::vector<std::pair<uint32_t, uint32_t>> tinted;  // (mat, nibble)
+    std::vector<std::vector<uint8_t>> allowed;          // [mat][nibble]
+    uint32_t outside = 0;                                // not in allowed
+    std::string firstOutside;
+    bool dressed = false;
+  };
+  auto blast = [&](const ItemDef* piece, uint32_t dye) {
+    Spray s;
+    s.allowed.assign(c.mats.size(), std::vector<uint8_t>(16, 0));
+    mobs.Reset();
+    const IVec3 wOrg = c.world.WindowOrigin();
+    const int sx = wOrg.x * (int)kChunk + 150, sz = wOrg.z * (int)kChunk + 150;
+    const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+    const uint64_t id = mobs.Spawn(avDef, {sx, h + 1, sz});
+    Mob* m = mobs.FindMobById(id);
+    if (m == nullptr) return s;
+    int slot = -1;
+    for (int e = 0; e < kEquipSlotCount && slot < 0; e++)
+      if (EquipSlotIsWorn(e) && EquipSlotAccepts(e, piece->kind)) slot = e;
+    if (slot < 0 || !m->WearItem(piece, slot, nullptr, dye)) return s;
+    s.dressed = true;
+    std::vector<int> shells;
+    for (int p = 0; p < m->WornPieceCount(); p++)
+      for (int sl : m->WornSlotsAt(p)) shells.push_back(sl);
+    for (int sl : shells) {
+      std::vector<PrefabVoxel> lat;
+      m->LatticeOfSlot(sl, lat);
+      for (const PrefabVoxel& v : lat) {
+        const uint32_t mat = v.material & 0xFFFu;
+        if (tintedMat(mat))
+          s.allowed[mat][debris.GridStateFor(mat, v.color, 0, dye) & 15u] = 1;
+      }
+    }
+    for (int sl : shells) {
+      const uint64_t body = mobs.LimbBody(id, sl);
+      const uint32_t n = mobs.LimbVoxelCount(id, sl);
+      if (body == 0 || n == 0) continue;
+      const Vec3 centre =
+          (mobs.LimbVoxelPos(id, sl, 0) + mobs.LimbVoxelPos(id, sl, n - 1)) * 0.5f;
+      std::vector<ParticleSpawn> spawns;
+      mobs.CarveLimbRadial(body, centre, 3.0f, /*ragged=*/false, /*eject=*/true,
+                           c.world, spawns);
+      for (const ParticleSpawn& p : spawns) {
+        const uint32_t mat = p.payload & 0xFFFu, nib = (p.payload >> 12) & 0xFu;
+        if (!tintedMat(mat)) continue;
+        s.tinted.push_back({mat, nib});
+        if (!s.allowed[mat][nib]) {
+          if (s.outside++ == 0)
+            s.firstOutside = Format("%s tint %u", c.mats[mat].name.c_str(), nib);
+        }
+      }
+    }
+    mobs.Reset();
+    return s;
+  };
+  auto modeOf = [](const Spray& s, uint32_t mat) {
+    uint32_t hist[16] = {};
+    for (const auto& [m, nb] : s.tinted)
+      if (m == mat) hist[nb]++;
+    uint32_t best = 0;
+    for (uint32_t i = 1; i < 16; i++)
+      if (hist[i] > hist[best]) best = i;
+    return std::make_pair(best, hist[best]);
+  };
+
+  debris.ResetTintStats();
+
+  // ---- A. the robe ---------------------------------------------------------
+  const Spray rs = blast(robe, 0);
+  check(rs.dressed, "the robe goes on the stock rig");
+  uint32_t clothId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "cloth") clothId = (uint32_t)i;
+  uint32_t robeTint0 = 0, robeCloth = 0;
+  for (const auto& [m, nb] : rs.tinted)
+    if (m == clothId) {
+      robeCloth++;
+      if (nb == 0) robeTint0++;
+    }
+  check(robeCloth >= minSpawns,
+        Format("the robe's carve sprays cloth (%u voxels, need %u)", robeCloth,
+               minSpawns));
+  check(rs.outside == 0,
+        Format("every tinted voxel the robe sprays carries a tint its own art "
+               "quantizes to (%u of %zu did not; first: %s)",
+               rs.outside, rs.tinted.size(),
+               rs.firstOutside.empty() ? "-" : rs.firstOutside.c_str()));
+  check(robeTint0 == 0,
+        Format("and none of it lands as cloth's own indigo (%u of %u did)",
+               robeTint0, robeCloth));
+
+  // ---- B. the dyed tunic ---------------------------------------------------
+  uint32_t linenId = 0;
+  for (const auto& cv : tunic->cover)
+    for (const PrefabVoxel& v : cv.voxels)
+      if (tintedMat(v.material & 0xFFFu)) linenId = v.material & 0xFFFu;
+  // A red the dye wheel names: drawn at the reference grey it IS this colour.
+  const uint32_t dye = DyePack(0.6f, 0.18f, 0.18f);
+  const uint32_t dyeRgb = ((dye & 0xFFu) << 16) | (dye & 0xFF00u) |
+                          ((dye >> 16) & 0xFFu);
+  const Spray plain = blast(tunic, 0);
+  const Spray dyed = blast(tunic, dye);
+  check(linenId != 0 && plain.dressed && dyed.dressed,
+        "the tunic is a tinted material and goes on");
+  const auto pm = modeOf(plain, linenId), dm = modeOf(dyed, linenId);
+  const uint32_t want = linenId ? nearestTint(linenId, dyeRgb) : 0;
+  check(dm.second >= minSpawns,
+        Format("the dyed tunic sprays linen (%u voxels in its commonest tint)",
+               dm.second));
+  check(dyed.outside == 0,
+        Format("every tinted voxel the dyed tunic sprays is one its art x dye "
+               "quantizes to (%u did not; first: %s)", dyed.outside,
+               dyed.firstOutside.empty() ? "-" : dyed.firstOutside.c_str()));
+  check(dm.first == want,
+        Format("its commonest linen tint is the one nearest the dye #%06x "
+               "(tint %u wanted, %u landed)", dyeRgb, want, dm.first));
+  check(want != pm.first,
+        Format("and the dye is visible: undyed the same tunic lands as tint %u",
+               pm.first));
+
+  // ---- C. the attribution counter ------------------------------------------
+  const DebrisSystem::TintPathStats ls =
+      debris.TintStats(DebrisSystem::kTintLimbSpray);
+  check(ls.deposits > 0 && ls.painted > 0,
+        Format("the limb-spray counter saw the deposits (%u, %u painted)",
+               ls.deposits, ls.painted));
+  check(ls.paintedTint0 == 0,
+        Format("and no painted limb voxel landed as tint 0 (%u did)",
+               ls.paintedTint0));
+
+  // The carves' gobbets are debris bodies; the gates after this one count
+  // bodies, so none may outlive it.
+  debris.Reset();
+  RecordObserved("garmentTintRobeCloth", (double)robeCloth);
+  RecordObserved("garmentTintDyedMode", (double)dm.first);
+  detail = Format(
+      "%d checks; robe: %u cloth voxels sprayed, %u indigo, %u off-art; dyed "
+      "tunic #%06x: mode tint %u (want %u, undyed %u), %u off-art; limb-spray "
+      "counter %u deposits / %u painted / %u painted->tint0",
+      checks, robeCloth, robeTint0, rs.outside, dyeRgb, dm.first, want,
+      pm.first, dyed.outside, ls.deposits, ls.painted, ls.paintedTint0);
+  std::printf("garment-tint: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& DyeGates() {
@@ -496,6 +722,7 @@ const std::vector<Gate>& DyeGates() {
       // assuming whatever the previous gate left standing.
       {"dye", "equipment", {"prefab"}, false, GateDye},
       {"hair-tuck", "equipment", {"prefab"}, false, GateHairTuck},
+      {"garment-tint", "equipment", {"prefab"}, false, GateGarmentTint},
   };
   return g;
 }

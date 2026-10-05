@@ -1098,7 +1098,9 @@
         "#8a5a3a",
         "#c4738f",
         "#4a5a2a",
-        "#d9c48a"
+        "#d9c48a",
+        "#3a3a41",
+        "#4e4e56"
       ],
       "tags": [
         "flammable",
@@ -1220,7 +1222,15 @@
         "#7a5a3a",
         "#6a2a2a",
         "#2f3a30",
-        "#2a3448"
+        "#2a3448",
+        "#548899",
+        "#995499",
+        "#8dd941",
+        "#2e992e",
+        "#2e2e99",
+        "#41d9b3",
+        "#d96741",
+        "#b341d9"
       ],
       "tags": [
         "flammable",
@@ -1255,7 +1265,12 @@
         "#9a7a52",
         "#c8b48a",
         "#4a3a2a",
-        "#2a2320"
+        "#2a2320",
+        "#3e3024",
+        "#4a2e1c",
+        "#5a4128",
+        "#69533f",
+        "#684329"
       ],
       "tags": [
         "flammable",
@@ -1302,7 +1317,11 @@
         "#c4b898",
         "#9a8a68",
         "#6a5f48",
-        "#3a352a"
+        "#3a352a",
+        "#2a2624",
+        "#5a5450",
+        "#bdb091",
+        "#8e7f60"
       ],
       "//tags": "NOT organic, NOT dissolvable (2026-09-22), and that is the whole of what makes a skeleton outlast its body in acid: acid eats `tag:organic` at 125 and `tag:dissolvable` at 45, and the rule file has no exclusion syntax, so the tags are the only lever. Cost: fungus (which spreads over tag:organic) no longer creeps onto bone.",
       "tags": [],
@@ -1336,7 +1355,15 @@
         "#b06a3a",
         "#c07a72",
         "#d8dee6",
-        "#6a7a86"
+        "#6a7a86",
+        "#8a949f",
+        "#a9b2bd",
+        "#535d68",
+        "#2c323a",
+        "#6a727c",
+        "#9a7630",
+        "#cdd4dc",
+        "#4c5561"
       ],
       "tags": [
         "mineral",
@@ -2918,7 +2945,15 @@
         "#8a6a5a",
         "#6a7a6a",
         "#6a6a80",
-        "#3a332a"
+        "#3a332a",
+        "#2e9999",
+        "#992e99",
+        "#2e992e",
+        "#2e2e99",
+        "#992e2e",
+        "#77a8d9",
+        "#b3d941",
+        "#313159"
       ],
       "tags": [
         "flammable",

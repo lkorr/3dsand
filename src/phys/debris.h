@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -782,7 +783,52 @@ class DebrisSystem {
   // index `art` (0 = unpainted). Returns `fallback` — the cosmetic jitter
   // variant every caller already computed — when `mat` is not tinted, so an
   // untinted material behaves exactly as it did before this existed.
-  uint32_t GridStateFor(uint32_t mat, uint32_t art, uint32_t fallback) const;
+  //
+  // `dye` (game/dye.h, 0 = undyed) is the garment's runtime colour. A dyed
+  // piece's art is a GREY weave the shader multiplies by the dye, so the
+  // colour the player SEES is lum(art) * dye / kDyeRef and that -- not the
+  // grey -- is what gets quantized. Integer arithmetic only (the result is
+  // hashed): Rec.709 luminance in /256 fixed point, reference grey 179
+  // (= round(255 * kDyeRef), gen_peasant_clothes.py DYE_REF_GREY).
+  uint32_t GridStateFor(uint32_t mat, uint32_t art, uint32_t fallback,
+                        uint32_t dye = 0) const;
+  // ---- WHICH PATH PUT BODY MATTER INTO THE GRID, AND WITH WHAT COLOUR -------
+  //
+  // Rule 6 for the owner's "clothing with no purple leaves purple voxels":
+  // every deposit of a MATF_TINTED material from a body is counted here by
+  // the path that made it, and a deposit that carried paint (art or dye) but
+  // still landed as tint 0 -- the natural colour, i.e. cloth's indigo -- is
+  // counted separately, so a regression names its path in one run instead of
+  // being found by elimination. Atomic because the limb spray runs on the
+  // mob work pool; relaxed because nothing orders on it.
+  enum TintPath : uint32_t {
+    kTintSettle = 0,     // a debris body settling back into the grid
+    kTintBodySpray,      // a debris body's matter leaving as particles
+    kTintLimbSpray,      // a creature/garment limb's carve spray
+    kTintIsland,         // a grid-born body (nibble is the tint already)
+    kTintPathCount
+  };
+  struct TintPathStats {
+    uint32_t deposits = 0;     // tinted-material voxels deposited
+    uint32_t painted = 0;      // ...of which carried art or dye
+    uint32_t paintedTint0 = 0; // ...and still landed as tint 0
+  };
+  TintPathStats TintStats(TintPath p) const {
+    TintPathStats s;
+    s.deposits = tintCount_[p][0].load(std::memory_order_relaxed);
+    s.painted = tintCount_[p][1].load(std::memory_order_relaxed);
+    s.paintedTint0 = tintCount_[p][2].load(std::memory_order_relaxed);
+    return s;
+  }
+  void ResetTintStats() {
+    for (auto& row : tintCount_)
+      for (auto& c : row) c.store(0, std::memory_order_relaxed);
+  }
+  // THE ONE CALL every body -> grid path makes for a voxel's state nibble:
+  // GridStateFor plus the grid-born rule (Body::gridNibble) plus the count.
+  // `nibble` is the voxel's own payload state. Returns the nibble to write.
+  uint32_t DepositState(TintPath path, uint32_t mat, uint32_t art,
+                        uint32_t nibble, uint32_t dye, bool gridNibble) const;
   // ---- "this body is gone" -------------------------------------------------
   //
   // Called for every body this system releases, whatever released it: culled
@@ -1640,6 +1686,17 @@ class DebrisSystem {
     // it. Cleared when nothing pulped is left (the same self-clearing flag
     // Mob::BluntPulpTick uses, and for the same rule-2 reason).
     bool pulp = false;
+    // THE STATE NIBBLE IS ALREADY A GRID WORD'S (2026-10-05). A body cut out
+    // of the grid by island detection carries each cell's word verbatim, so a
+    // MATF_TINTED voxel's nibble IS its grid tint and it has no art colour
+    // (`color` 0). Every other body's nibble is the positional jitter variant
+    // a limb or prefab was built with, and its colour is the art index. The
+    // two read the same field two ways, so settle-back and the particle spray
+    // ask this before trusting the nibble (DepositState): without it a cloth
+    // island that fell and settled came back as tint 0 -- undyed indigo.
+    // Inherited by a shatter's fragments; not saved (a reloaded island body
+    // lands at its natural colour, which is a miss, not a wrong dye).
+    bool gridNibble = false;
     // WHICH CREATURE THIS WAS, an index into MobSystem::Defs(), or -1 for
     // matter that was never alive. Carried for the same reason the sever event
     // carries one: the mob is despawned long before anything asks, and a
@@ -2008,6 +2065,8 @@ class DebrisSystem {
   // happens to sit closest to nothing. Empty for an untinted material; see
   // RefreshTintMap.
   std::vector<std::vector<uint8_t>> tintOfArt_;
+  mutable std::array<std::array<std::atomic<uint32_t>, 3>, kTintPathCount>
+      tintCount_{};
   uint64_t tintArtStamp_ = 0;   // content stamp of the palette it was built from
   bool tintMapValid_ = false;   // cleared by OnMaterialsReloaded
   uint32_t nextSerial_ = 1;
