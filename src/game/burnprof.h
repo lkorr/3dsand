@@ -91,6 +91,16 @@ enum Phase : uint8_t {
   kSplatter,    // inside kStain: this tick's bursts replayed against every body
   kShocks,      // MobSystem::ApplyShocks (the body solve; top of PreTick)
   kTwinSync,    // Mob::SyncJointTwins (inside BurnTick)
+  // The blade path, inside kStroke (fight64 round 3, package X): the whole
+  // sweep, the creature cut it resolves to (kerf + carve + soak), the soak on
+  // its own, the coat exchange, the nearest-voxel material ask, and the micro
+  // brick re-pack a carve ends with.
+  kSweep,       // MeleeSweepDamage
+  kCut,         // Mob::CutLimb
+  kWoundStain,  // Mob::StainWound from a cut
+  kCoat,        // MobSystem::CoatOnContact
+  kShellAt,     // Mob::ShellMaterialAt
+  kReskin,      // Mob::ReskinLimbMicro
   kCount
 };
 
@@ -107,7 +117,8 @@ inline const char* Name(int p) {
                                   "sense", "intent", "crowd", "drive",
                                   "stroke", "anim", "submit", "bleed",
                                   "actors", "shockQuery", "splatter",
-                                  "shocks", "twinSync"};
+                                  "shocks", "twinSync", "sweep", "cut",
+                                  "woundStain", "coat", "shellAt", "reskin"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 

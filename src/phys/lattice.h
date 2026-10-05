@@ -51,19 +51,14 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
   const int s = (int)std::max(1u, ratio);
   const uint32_t full = (uint32_t)(s * s * s);
   constexpr int kMaxDistinct = 8;
-  struct Blk {
-    uint32_t count = 0;
-    int n = 0;
-    uint32_t pair[kMaxDistinct]{};  // material | color << 16
-    uint32_t hits[kMaxDistinct]{};
-    // The heaviest body coat among the block's skin voxels (voxload.h
-    // BodyStain*), carried WHOLE -- material and amount together, so the
-    // coarse lattice can still say what is on it and not merely how much. A
-    // max, not a vote: the coarse lattice is what a fragment split off a fine
-    // limb draws its own brick from, and a gobbet of a bloodied arm should
-    // look bloodied.
-    uint16_t stain = 0;
-  };
+  // Per block: how many skin voxels landed (`count`), the distinct
+  // (material, art colour) pairs and how often each was seen, and the
+  // heaviest body coat among them (voxload.h BodyStain*), carried WHOLE --
+  // material and amount together, so the coarse lattice can still say what
+  // is on it and not merely how much. A max, not a vote: the coarse lattice
+  // is what a fragment split off a fine limb draws its own brick from, and a
+  // gobbet of a bloodied arm should look bloodied.
+  //
   // ---- A FLAT LATTICE, NOT A HASH MAP (PLAN_fight64_perf Q2) ---------------
   //
   // The blocks used to live in an unordered_map keyed on the packed block
@@ -83,16 +78,48 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
   // exact) box set and the world hash moves with it. Lattice order is also the
   // first order this list has had that is a property of the shape rather than
   // of a container's internals.
+  //
+  // ---- ...AND NO BLOCK CONSTRUCTED (fight64 round 3, package X) ----------
+  // Each touched block used to be a 76-byte struct zero-built on first touch.
+  // Now it is an 8-byte header (count, distinct pairs, heaviest coat) in one
+  // packed list and its pair/hit table in two more that are never cleared: a
+  // pair slot is written before it is read, and its hit count is set when
+  // the slot is first taken. Same votes, same lattice order out.
+  struct Head {
+    uint32_t count;
+    uint16_t stain;
+    uint16_t n;
+  };
   struct Scratch {
-    std::vector<int32_t> at;   // dense block index -> blocks[], -1 = none
-    std::vector<Blk> blocks;
+    std::vector<int32_t> at;      // dense block index -> head[], -1 = none
+    std::vector<Head> head;       // per touched block
+    std::vector<uint32_t> pair;   // per touched block * kMaxDistinct
+    std::vector<uint32_t> hits;   // ditto
   };
   thread_local Scratch sc;
   bool over = false;
+  // ---- A SHIFT, NOT A DIVIDE (PLAN_fight64_perf round 3, package X) --------
+  // Every carve and every wound stain re-derives the collider through here,
+  // and the sampler put the two `/ s` passes (an integer divide per axis per
+  // skin voxel, by a ratio only known at run time) at the top of this
+  // function. Every authored ratio is a power of two (skin 8 / collider 4 or
+  // 2), so the block index is a shift -- with C++'s truncate-toward-zero
+  // division reproduced exactly for a negative coordinate, so a voxel at -1
+  // still lands in block 0 as `/` put it. A ratio that is not a power of two
+  // keeps the divide. Same blocks, same order, same output.
+  int sh = -1;
+  if ((s & (s - 1)) == 0) {
+    sh = 0;
+    while ((1 << sh) < s) sh++;
+  }
+  auto blk = [s, sh](int c) -> int {
+    if (sh < 0) return c / s;
+    return c >= 0 ? (c >> sh) : -((-c) >> sh);
+  };
   // Pass 1: the block bounding box (in-range blocks only).
   int lo[3] = {128, 128, 128}, hi[3] = {-1, -1, -1};
   for (const PrefabVoxel& v : src) {
-    const int bx = (int)v.x / s, by = (int)v.y / s, bz = (int)v.z / s;
+    const int bx = blk(v.x), by = blk(v.y), bz = blk(v.z);
     if (bx < 0 || by < 0 || bz < 0 || bx > 127 || by > 127 || bz > 127) {
       over = true;
       continue;
@@ -107,43 +134,58 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
   const int ex = hi[0] - lo[0] + 1, ey = hi[1] - lo[1] + 1, ez = hi[2] - lo[2] + 1;
   const size_t cells = (size_t)ex * ey * ez;
   sc.at.assign(cells, -1);
-  sc.blocks.clear();
+  size_t touched = 0;
   // Pass 2: vote.
   for (const PrefabVoxel& v : src) {
-    const int bx = (int)v.x / s, by = (int)v.y / s, bz = (int)v.z / s;
+    const int bx = blk(v.x), by = blk(v.y), bz = blk(v.z);
     if (bx < 0 || by < 0 || bz < 0 || bx > 127 || by > 127 || bz > 127) continue;
     int32_t& slot =
         sc.at[((size_t)(bz - lo[2]) * ey + (size_t)(by - lo[1])) * ex + (size_t)(bx - lo[0])];
     if (slot < 0) {
-      slot = (int32_t)sc.blocks.size();
-      sc.blocks.emplace_back();
+      slot = (int32_t)touched++;
+      if (sc.head.size() < touched) {
+        sc.head.resize(touched * 2);
+        sc.pair.resize(touched * 2 * kMaxDistinct);
+        sc.hits.resize(touched * 2 * kMaxDistinct);
+      }
+      sc.head[(size_t)slot] = Head{0u, 0u, 0u};
     }
+    const size_t c = (size_t)slot;
+    Head& h = sc.head[c];
+    h.count++;
     const uint32_t pair = (uint32_t)v.material | ((uint32_t)v.color << 16);
-    Blk& blk = sc.blocks[(size_t)slot];
-    blk.count++;
+    uint32_t* pr = &sc.pair[c * kMaxDistinct];
+    uint32_t* ht = &sc.hits[c * kMaxDistinct];
     int k = 0;
-    for (; k < blk.n; k++)
-      if (blk.pair[k] == pair) break;
-    if (k == blk.n && blk.n < kMaxDistinct) blk.pair[blk.n++] = pair;
-    if (k < kMaxDistinct) blk.hits[k]++;
-    if (BodyStainAmt(v.stain) > BodyStainAmt(blk.stain)) blk.stain = v.stain;
+    const int n = (int)h.n;
+    for (; k < n; k++)
+      if (pr[k] == pair) break;
+    if (k == n && n < kMaxDistinct) {
+      pr[k] = pair;
+      ht[k] = 0;
+      h.n = (uint16_t)(n + 1);
+    }
+    if (k < kMaxDistinct) ht[k]++;
+    if (BodyStainAmt(v.stain) > BodyStainAmt(h.stain)) h.stain = v.stain;
   }
   // Pass 3: emit in lattice order.
-  out.reserve(sc.blocks.size());
+  out.reserve(touched);
   size_t i = 0;
   for (int z = 0; z < ez; z++)
     for (int y = 0; y < ey; y++)
       for (int x = 0; x < ex; x++, i++) {
         const int32_t slot = sc.at[i];
         if (slot < 0) continue;
-        const Blk& blk = sc.blocks[(size_t)slot];
-        if (blk.count * 2 < full) continue;  // majority-fill: mostly air -> air
+        const Head& h = sc.head[(size_t)slot];
+        if (h.count * 2 < full) continue;  // majority-fill: mostly air -> air
+        const uint32_t* pr = &sc.pair[(size_t)slot * kMaxDistinct];
+        const uint32_t* ht = &sc.hits[(size_t)slot * kMaxDistinct];
         int best = 0;
-        for (int k = 1; k < blk.n; k++)
-          if (blk.hits[k] > blk.hits[best]) best = k;
+        for (int k = 1; k < (int)h.n; k++)
+          if (ht[k] > ht[best]) best = k;
         out.push_back({(int8_t)(x + lo[0]), (int8_t)(y + lo[1]), (int8_t)(z + lo[2]),
-                       (uint8_t)(blk.pair[best] >> 16),
-                       (uint16_t)(blk.pair[best] & 0xFFFFu), blk.stain});
+                       (uint8_t)(pr[best] >> 16),
+                       (uint16_t)(pr[best] & 0xFFFFu), h.stain});
       }
   return out;
 }
@@ -207,11 +249,59 @@ inline size_t SpallGrow(std::vector<Vox>& cells, const SpallParams& p,
                 dz = (float)v.z + 0.5f - p.centre.z;
     return dx * dx + dy * dy + dz * dz < reach2;
   };
+  // ---- A BITMAP OVER THE BLOW'S BOX, NOT A HASH SET (fight64 round 3 X) ----
+  // `live` is only ever asked about cells within `reach` of the centre (the
+  // six neighbours of a cell inside the radius), and only cells that pass
+  // `nearBlow` are ever put in it, so a bit per cell of the box around that
+  // sphere answers every question the set answered, identically: a cell
+  // outside the box was never in the set either. Rebuilt per round exactly as
+  // the set was (a full scan, so a duplicate cell left behind by the erase
+  // stays live, as it did). The set rebuilt a node per voxel per round and
+  // was the spall's whole cost in the 64-creature brawl's blade carves.
+  // Thread-local scratch: carves can run on the mob work pool. A box too big
+  // for a bitmap (a blast on a felled tree) keeps the set.
+  const int boxLo[3] = {(int)std::floor(p.centre.x - reach) - 2,
+                        (int)std::floor(p.centre.y - reach) - 2,
+                        (int)std::floor(p.centre.z - reach) - 2};
+  const int boxN[3] = {(int)std::ceil(p.centre.x + reach) + 3 - boxLo[0],
+                       (int)std::ceil(p.centre.y + reach) + 3 - boxLo[1],
+                       (int)std::ceil(p.centre.z + reach) + 3 - boxLo[2]};
+  const uint64_t boxCells = (uint64_t)std::max(boxN[0], 1) *
+                            (uint64_t)std::max(boxN[1], 1) *
+                            (uint64_t)std::max(boxN[2], 1);
+  const bool useBits = boxCells <= (1ull << 24);
+  thread_local std::vector<uint64_t> bits;
   std::unordered_set<uint64_t> live;
+  auto bitOf = [&](int x, int y, int z, size_t& at) -> bool {
+    const int bx = x - boxLo[0], by = y - boxLo[1], bz = z - boxLo[2];
+    if (bx < 0 || by < 0 || bz < 0 || bx >= boxN[0] || by >= boxN[1] ||
+        bz >= boxN[2])
+      return false;
+    at = ((size_t)bz * (size_t)boxN[1] + (size_t)by) * (size_t)boxN[0] +
+         (size_t)bx;
+    return true;
+  };
+  auto isLive = [&](int x, int y, int z) -> bool {
+    if (!useBits) return live.count(key(x, y, z)) != 0;
+    size_t at = 0;
+    if (!bitOf(x, y, z, at)) return false;
+    return (bits[at >> 6] >> (at & 63u)) & 1ull;
+  };
   auto rebuild = [&] {
-    live.clear();
-    for (const Vox& v : cells)
-      if (nearBlow(v)) live.insert(key(v.x, v.y, v.z));
+    if (!useBits) {
+      live.clear();
+      for (const Vox& v : cells)
+        if (nearBlow(v)) live.insert(key(v.x, v.y, v.z));
+      return;
+    }
+    bits.assign((size_t)((boxCells + 63) >> 6), 0ull);
+    for (const Vox& v : cells) {
+      if (!nearBlow(v)) continue;
+      size_t at = 0;
+      // A near-blow cell is inside the box by construction (the box pads the
+      // reach by two cells); the test is the belt to that brace.
+      if (bitOf(v.x, v.y, v.z, at)) bits[at >> 6] |= 1ull << (at & 63u);
+    }
   };
   rebuild();
   // A voxel on an intact surface already has one open face, so "eroded" starts
@@ -229,7 +319,7 @@ inline size_t SpallGrow(std::vector<Vox>& cells, const SpallParams& p,
       static const int kN[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                    {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
       for (const auto& n : kN)
-        if (!live.count(key(x + n[0], y + n[1], z + n[2]))) open++;
+        if (!isLive(x + n[0], y + n[1], z + n[2])) open++;
       if (open < kMinOpenFaces) return false;
       // Proximity-weighted, so the tearing is concentrated at the blow and
       // fades out rather than eroding the rim uniformly. Keyed on the caller's

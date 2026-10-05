@@ -12167,15 +12167,31 @@ uint32_t Mob::NeckCountAt(const MobLimb& limb, Vec3 centreLimb,
     const Vec3 d{x + 0.5f - a.x, y + 0.5f - a.y, z + 0.5f - a.z};
     if (d.dot(d) < r2) n++;
   };
+  // AN INTEGER BOX IN FRONT OF THE FLOAT TEST (fight64 round 3, package X).
+  // Every blade carve asks this several times (the neck, the parent's
+  // socket, each child's socket) of a whole skin lattice, for a ball a
+  // couple of cells across. The box is a strict SUPERSET of the ball (a cell
+  // whose centre is more than r out along one axis cannot pass the sum, and
+  // the bounds carry a cell of slack either way), so the count is the same
+  // number the float test alone gave.
+  const auto lo = [](float c, float rr) { return (int)std::floor(c - 0.5f - rr) - 1; };
+  const auto hi = [](float c, float rr) { return (int)std::ceil(c - 0.5f + rr) + 1; };
+  const int x0 = lo(a.x, r), x1 = hi(a.x, r), y0 = lo(a.y, r), y1 = hi(a.y, r),
+            z0 = lo(a.z, r), z1 = hi(a.z, r);
+  auto inBox = [&](int x, int y, int z) {
+    return x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1;
+  };
   // TOMBSTONES ARE GONE (2026-10-01): a voxel the burn or an infection took
   // is material 0 until FlushBurn's batched compaction, and counting it kept
   // a socket the rot had eaten reading "intact" until the next flush.
   if (fine) {
     for (const PrefabVoxel& v : limb.skinVoxels)
-      if (v.material != 0) test((float)v.x, (float)v.y, (float)v.z);
+      if (inBox(v.x, v.y, v.z) && v.material != 0)
+        test((float)v.x, (float)v.y, (float)v.z);
   } else {
     for (const DebrisVoxel& v : limb.voxels)
-      if (v.payload != 0) test((float)v.x, (float)v.y, (float)v.z);
+      if (inBox(v.x, v.y, v.z) && v.payload != 0)
+        test((float)v.x, (float)v.y, (float)v.z);
   }
   return n;
 }
@@ -13338,6 +13354,7 @@ bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
 bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                   std::vector<ParticleSpawn>& spawns, float severity,
                   std::vector<IVec3>* woundCells) {
+  burnprof::Scope bpCut(burnprof::kCut);
   if (woundCells) woundCells->clear();
   if (!phys_) return false;
   for (size_t i = 0; i < limbs_.size(); i++) {
@@ -13475,7 +13492,8 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
       // table cut off at 128 charged an android's alloy frame as skin.
       const float ref = CurrentTuning().gear.cutHardnessRef;
       const size_t nMat = sys_ != nullptr ? sys_->matGpu_.size() : 0;
-      std::vector<float> resist(nMat, 1.0f);
+      thread_local std::vector<float> resist;  // reused: one table per blow
+      resist.assign(nMat, 1.0f);
       for (uint32_t m = 0; m < (uint32_t)nMat; m++) {
         const float h = MaterialHardness(m);
         resist[m] = (h > 0.0f && ref > 0.0f) ? h / ref : 1.0f;
@@ -13586,6 +13604,25 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // (a coat on the blade is laid against them); collecting them changes
     // nothing about the carve.
     CarveReport cutReport;
+    // THE SLOT'S OWN BOX (Mob::CarveBounds): KerfKeep removes only inside the
+    // oriented slot -- along w from -back to depth, within halfL along u and
+    // halfW along v (a through cut's half-cell floor on v is inside the
+    // carve's two-cell padding) -- so its axis-aligned hull is a promise the
+    // carve can skip the rest of the lattice on. Not for a near-side drop,
+    // which takes a whole half-space.
+    Mob::CarveBounds slotBox;
+    if (!dropNear) {
+      const float hd = 0.5f * (slot.depth + slot.back);
+      const Vec3 mid = slot.c + slot.w * (0.5f * (slot.depth - slot.back));
+      const Vec3 e{slot.halfL * std::fabs(slot.u.x) + slot.halfW * std::fabs(slot.v.x) +
+                       hd * std::fabs(slot.w.x),
+                   slot.halfL * std::fabs(slot.u.y) + slot.halfW * std::fabs(slot.v.y) +
+                       hd * std::fabs(slot.w.y),
+                   slot.halfL * std::fabs(slot.u.z) + slot.halfW * std::fabs(slot.v.z) +
+                       hd * std::fabs(slot.w.z)};
+      slotBox.lo = mid - e;
+      slotBox.hi = mid + e;
+    }
     const bool alive = CarveLimb(
         (int)i, DamageCtx(DamageCause::Blade, severity), world, spawns,
         /*eject=*/true,
@@ -13609,7 +13646,8 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                    d.dot(v) * nearSign <= 0.0f;
           };
         },
-        wantSpall ? &spall : nullptr, woundCells ? &cutReport : nullptr);
+        wantSpall ? &spall : nullptr, woundCells ? &cutReport : nullptr,
+        dropNear ? nullptr : &slotBox);
 
     // SEVERED OR DEAD: `limb`, `limbs_` and possibly this whole creature are
     // gone. Nothing below may touch them — the same contract every other
@@ -13632,6 +13670,7 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     limbs_[i].woundLocal = slotAt;
     // The soak goes on LAST, over what survived, and centred a little way into
     // the cut so it follows the gash rather than ringing the entry point.
+    burnprof::Scope bpWound(burnprof::kWoundStain);
     StainWound((int)i, slotAt + w * (depth * 0.5f),
                CurrentTuning().gore.woundStainRadius, seed ^ 0x51ED5u);
     return true;
@@ -14140,6 +14179,7 @@ void Mob::ReleaseLimbMicro(MobLimb& limb) {
 
 bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
                                 uint32_t physScale) {
+  burnprof::Scope bpReskin(burnprof::kReskin);
   if (limb.microModel < 0 || !MicroSet()) return false;
   int own = MicroBodyOwn(*MicroSet(), (uint32_t)limb.microModel);
   if (own < 0) return false;  // pool full: keep the stale skin, stay carved
@@ -14148,18 +14188,20 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
   // The brick is packed from the SKIN when there is one, and from the collider
   // voxels when the two lattices coincide — the same rule debris.cpp
   // ReskinMicro follows, because whatever this reads is what the player sees.
+  // A fine skin is handed over AS IS: MicroBodyEdit only reads it, and the
+  // copy this used to take was a whole torso's skin per blade carve (fight64
+  // round 3, package X).
   std::vector<PrefabVoxel> mv;
   const bool fine = limb.HasFineSkin();
-  if (fine) {
-    mv = limb.skinVoxels;
-  } else {
+  if (!fine) {
     mv.reserve(limb.voxels.size());
     for (const DebrisVoxel& v : limb.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
                     (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
   }
   IVec3 shift{};
-  if (!MicroBodyEdit(*MicroSet(), (uint32_t)limb.microModel, mv, shift))
+  if (!MicroBodyEdit(*MicroSet(), (uint32_t)limb.microModel,
+                     fine ? limb.skinVoxels : mv, shift))
     return false;
   if (shift.x || shift.y || shift.z) {
     // MicroBodyEdit rebased the brick to its own min corner. For a debris body
@@ -15549,7 +15591,8 @@ void Mob::LimbWoundTotals(const MobLimb& limb, float& weight,
 bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                           std::vector<ParticleSpawn>& spawns, bool eject,
                           const LimbCarveFactory& carveAt,
-                          const CarveSpall* spall, CarveReport* report) {
+                          const CarveSpall* spall, CarveReport* report,
+                          const CarveBounds* bounds) {
   burnprof::Scope bpScope(burnprof::kCarve);
   if (report) *report = CarveReport{};
   // WHAT THIS CAUSE MAY DO TO THIS SLOT (game/severpolicy.h). Taken once: the
@@ -15585,10 +15628,37 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // ONE world-space volume, re-expressed per lattice. The collider predicate
   // always exists; the skin one only when the skin is a separate lattice.
   const auto keep = carveAt((float)std::max(1u, PhysScaleOf(limb)));
+  // The caller's promise (CarveBounds), as an integer box per lattice: a
+  // voxel outside it is kept without the per-voxel predicate call. Two cells
+  // of padding, so the box need only bound the predicate's shape.
+  struct IBox {
+    bool on = false;
+    int lo[3]{}, hi[3]{};
+    bool Out(int x, int y, int z) const {
+      return on && (x < lo[0] || x > hi[0] || y < lo[1] || y > hi[1] ||
+                    z < lo[2] || z > hi[2]);
+    }
+  };
+  auto boxAt = [&](float scale) {
+    IBox b;
+    if (bounds == nullptr) return b;
+    const float l[3] = {bounds->lo.x, bounds->lo.y, bounds->lo.z};
+    const float h[3] = {bounds->hi.x, bounds->hi.y, bounds->hi.z};
+    for (int a = 0; a < 3; a++) {
+      const float fl = l[a] * scale, fh = h[a] * scale;
+      // A non-finite or absurd box is no promise at all: ask every voxel.
+      if (!(std::fabs(fl) < 1e6f && std::fabs(fh) < 1e6f)) return IBox{};
+      b.lo[a] = (int)std::floor(fl) - 2;
+      b.hi[a] = (int)std::ceil(fh) + 2;
+    }
+    b.on = true;
+    return b;
+  };
+  const IBox physBox = boxAt((float)std::max(1u, PhysScaleOf(limb)));
 
   std::vector<DebrisVoxel> removed;
   for (const DebrisVoxel& v : limb.voxels)
-    if (!keep(v.x, v.y, v.z)) removed.push_back(v);
+    if (!physBox.Out(v.x, v.y, v.z) && !keep(v.x, v.y, v.z)) removed.push_back(v);
   // On a fine skin the COLLIDER may be too coarse to notice a small carve that
   // the skin does register. Deciding "nothing in range" on the collider would
   // silently make fine tools no-ops on exactly the detailed art the skin exists
@@ -15622,10 +15692,12 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   };
   if (fine) {
     const auto keepSkin = carveAt((float)std::max(1u, SkinScaleOf(limb)));
+    const IBox skinBox = boxAt((float)std::max(1u, SkinScaleOf(limb)));
     const size_t before = limb.skinVoxels.size();
     limb.skinVoxels.erase(
         std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
                        [&](const PrefabVoxel& v) {
+                         if (skinBox.Out(v.x, v.y, v.z)) return false;
                          if (keepSkin(v.x, v.y, v.z)) return false;
                          const Vec3 p{(float)v.x, (float)v.y, (float)v.z};
                          skinLostSum += p;
@@ -15720,7 +15792,8 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     limb.voxels.erase(
         std::remove_if(limb.voxels.begin(), limb.voxels.end(),
                        [&](const DebrisVoxel& v) {
-                         return !keep(v.x, v.y, v.z);
+                         return !physBox.Out(v.x, v.y, v.z) &&
+                                !keep(v.x, v.y, v.z);
                        }),
         limb.voxels.end());
   }
@@ -15812,6 +15885,12 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   float nowWeight = 0.0f;
   uint32_t nowBrain = 0;
   LimbWoundTotals(limb, nowWeight, nowBrain);
+  // Whether the lattice is still the one these totals were taken from. Only
+  // the death/sever branch and the connectivity split below can change it;
+  // when neither ran, the re-sync at the end of this function would recount
+  // the same lattice to the same two numbers already stored, so it is
+  // skipped (fight64 round 3, package X: one whole-skin pass per carve).
+  bool totalsCurrent = true;
   const float w0 = limb.weightAtSpawn > 0.0f ? limb.weightAtSpawn : (float)at0;
   const float prevWeight = limb.weightCharged;
   const float lostWeight =
@@ -16022,6 +16101,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // is the living's. `collapsed` is geometry and applies to a corpse as it
   // does to anybody (a limb carved to dust comes off).
   if (collapsed || (alive_ && limb.hp <= 0 && HpZeroSevers(limbIndex, ctx))) {
+    totalsCurrent = false;
     // A vital limb killed by ROT or FIRE (an eaten carve) dies WITHOUT detaching.
     // Sever() for a severable vital limb pops the head off and then Dies,
     // which is correct for a blade decapitation but wrong for brain damage: the
@@ -16100,6 +16180,11 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     };
     std::vector<int32_t> comp(n, -1);
     std::vector<uint32_t> compSize, stack;
+    // The six face steps as GRID strides (fight64 round 3, package X): on the
+    // dense path a neighbour is one add and one bounds bit away rather than a
+    // rebuilt coordinate through `at`. Same neighbours, visited in the same
+    // order (+x, -x, +y, -y, +z, -z), so the same components with the same ids.
+    const ptrdiff_t sx = 1, sy = bd.x, sz = (ptrdiff_t)bd.x * bd.y;
     for (uint32_t seed = 0; seed < n; seed++) {
       if (comp[seed] != -1) continue;
       int32_t c = (int32_t)compSize.size();
@@ -16111,6 +16196,24 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
         stack.pop_back();
         size++;
         const DebrisVoxel& v = limb.voxels[i];
+        if (dense) {
+          const int gx = v.x - bmn.x, gy = v.y - bmn.y, gz = v.z - bmn.z;
+          const ptrdiff_t g = (ptrdiff_t)gz * sz + (ptrdiff_t)gy * sy + gx;
+          const bool ok[6] = {gx + 1 < bd.x, gx > 0, gy + 1 < bd.y,
+                              gy > 0,        gz + 1 < bd.z, gz > 0};
+          const ptrdiff_t step[6] = {sx, -sx, sy, -sy, sz, -sz};
+          for (int k = 0; k < 6; k++) {
+            if (!ok[k]) continue;
+            const uint32_t e = grid[(size_t)(g + step[k])];
+            if (e == 0u) continue;
+            const uint32_t j = e - 1u;
+            if (comp[j] == -1) {
+              comp[j] = c;
+              stack.push_back(j);
+            }
+          }
+          continue;
+        }
         const int d[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                              {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
         for (auto& dd : d) {
@@ -16124,6 +16227,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       compSize.push_back(size);
     }
     if (compSize.size() > 1) {
+      totalsCurrent = false;
       // The anchor in limb-local COLLIDER units — the point the joint holds.
       // The components were found on `limb.voxels`, so the anchor must be
       // expressed on THAT lattice: physScale, not skinScale. (This is the
@@ -16419,7 +16523,8 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       (uint32_t)(fine ? limb.skinVoxels.size() : limb.voxels.size());
   // The weighted totals ride the same re-sync, for the same reason: the split
   // took real substance away and it must not be billed to the next carve.
-  LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
+  if (!totalsCurrent)
+    LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
 
   // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
   // collider must be built from the voxels in their FINAL frame.
@@ -30076,6 +30181,7 @@ float Mob::MaterialHardness(uint32_t mat) const {
 }
 
 uint32_t Mob::ShellMaterialAt(int limbIndex, Vec3 worldPos) const {
+  burnprof::Scope bpShell(burnprof::kShellAt);
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0u;
   const MobLimb& L = limbs_[limbIndex];
   // The pose the caller measured against (limb.xf), never re-read from Jolt:
@@ -30090,22 +30196,61 @@ uint32_t Mob::ShellMaterialAt(int limbIndex, Vec3 worldPos) const {
   // to the earlier voxel, so the answer is a pure function of the lattice.
   uint32_t best = 0u;
   float bestD2 = 3.4e38f;
-  auto test = [&](int x, int y, int z, uint32_t m) {
-    if (m == 0u) return;  // a burn tombstone is not there
-    const Vec3 d{(float)x + 0.5f - p.x, (float)y + 0.5f - p.y,
-                 (float)z + 0.5f - p.z};
-    const float d2 = d.dot(d);
-    if (d2 < bestD2) {
-      bestD2 = d2;
-      best = m;
+  // AN INTEGER REJECT IN FRONT OF THE FLOAT TEST (fight64 round 3, package
+  // X): every blade blow asks this twice (Mob::Damage, Mob::CutLimb) over a
+  // whole skin lattice. A voxel more than sqrt(bestD2) out along any one axis
+  // cannot beat the best so far (its squared distance is at least that axis's
+  // square), so once a near voxel is found the rest are skipped on three
+  // integer compares. `reach` carries a cell of slack and only shrinks when
+  // the best does; the voxels it lets through take the exact float test, in
+  // the same order, so the answer (ties to the earlier voxel) is unchanged.
+  // (Only for a point within a sane range of the lattice: the int casts below
+  // must not overflow. Anything else takes the plain scan.)
+  const bool prune = std::fabs(p.x) < 1e6f && std::fabs(p.y) < 1e6f &&
+                     std::fabs(p.z) < 1e6f;
+  const int ix = prune ? (int)std::floor(p.x - 0.5f) : 0,
+            iy = prune ? (int)std::floor(p.y - 0.5f) : 0,
+            iz = prune ? (int)std::floor(p.z - 0.5f) : 0;
+  // The reject is one unsigned compare per axis: (x - ix + reach) as unsigned
+  // exceeds 2*reach exactly when |x - ix| > reach. Before the first hit the
+  // window is the whole int range, so every voxel takes the float test. Two
+  // explicit loops rather than one lambda: the sampler showed the lambda
+  // called, not inlined, once per voxel.
+  uint32_t win = 0xFFFFFFFFu;   // 2 * reach
+  int reach = 0x3FFFFFFF;
+  auto take = [&](float d2, uint32_t m) {
+    bestD2 = d2;
+    best = m;
+    if (prune) {
+      reach = (int)std::ceil(std::sqrt(d2)) + 2;
+      win = 2u * (uint32_t)reach;
     }
   };
-  if (fine)
-    for (const PrefabVoxel& v : L.skinVoxels)
-      test(v.x, v.y, v.z, v.material & 0xFFFu);
-  else
-    for (const DebrisVoxel& v : L.voxels)
-      test(v.x, v.y, v.z, v.payload & 0xFFFu);
+  if (fine) {
+    for (const PrefabVoxel& v : L.skinVoxels) {
+      const uint32_t m = v.material & 0xFFFu;
+      if (m == 0u) continue;  // a burn tombstone is not there
+      if ((uint32_t)(v.x - ix + reach) > win || (uint32_t)(v.y - iy + reach) > win ||
+          (uint32_t)(v.z - iz + reach) > win)
+        continue;
+      const Vec3 d{(float)v.x + 0.5f - p.x, (float)v.y + 0.5f - p.y,
+                   (float)v.z + 0.5f - p.z};
+      const float d2 = d.dot(d);
+      if (d2 < bestD2) take(d2, m);
+    }
+  } else {
+    for (const DebrisVoxel& v : L.voxels) {
+      const uint32_t m = v.payload & 0xFFFu;
+      if (m == 0u) continue;
+      if ((uint32_t)(v.x - ix + reach) > win || (uint32_t)(v.y - iy + reach) > win ||
+          (uint32_t)(v.z - iz + reach) > win)
+        continue;
+      const Vec3 d{(float)v.x + 0.5f - p.x, (float)v.y + 0.5f - p.y,
+                   (float)v.z + 0.5f - p.z};
+      const float d2 = d.dot(d);
+      if (d2 < bestD2) take(d2, m);
+    }
+  }
   return best;
 }
 
