@@ -1,4 +1,5 @@
 #include "phys/debris.h"
+#include "sim/trace_mark.h"
 
 #include "sim/bytestream.h"  // nothing here encodes; net/debrissync.h does
 
@@ -448,6 +449,10 @@ uint32_t NearestTint(const std::vector<uint32_t>& tints, uint32_t rgb) {
 }
 
 }  // namespace
+
+void DebrisTraceMark(const char* what) {
+  if (FILE* tf = DebrisTrace()) std::fprintf(tf, "M %s\n", what);
+}
 
 void DebrisSystem::Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats,
                         const std::vector<ReactionGpu>& reactions) {

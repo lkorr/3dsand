@@ -440,6 +440,26 @@ package's `--verify` (aim for under 20 s).
 
 Report whether the divergence M saw was real. If it was, give the root cause.
 
+#### Package S result (2026-10-05)
+
+- **Cross-process soak, frozen b21d23a exe: no race.** `mob-cap64` with
+  `SANDVOX_MOBCAP_DIGEST=1`, natural and `killEvery 4`, each run as default x3,
+  `SANDVOX_MOB_THREADS=1`, and `SANDVOX_PHYS_THREADS=1/2/7`: 14 boots, all 300
+  digests identical within each arm. M's tick-208 split did not reproduce.
+- **In-process: two real leaks, both fixed.** Gate `mob-cap64-twice` found
+  them (DESIGN.md "The brawl is gated reproducible"):
+  - `MobSystem::Reset` kept three tick-to-tick queues: pending drips, splatter
+    bursts and body bursts.
+  - `Mob::DetachLimb` / `ReleaseRigToDebris` handed an empty collider lattice
+    to `AdoptBody`, which refuses it. The result was an unowned Jolt body
+    falling forever.
+- **The fight moves.** The leak fix changes a fresh-process fight: natural
+  `mob-cap64` parts from b21d23a at tick 130, 53 alive instead of 54. A perf
+  package measured against the b21d23a before-arm is no longer on the same
+  fight as a tree that includes S. Re-take the before-arm on main after S
+  merges.
+- The `determinism` hash did not move (0fa43063).
+
 ### Package C — physics: CCD, collide, terrain mesh
 
 Owns: `src/phys/physics.*`, `src/phys/debris.*`, and the terrain-collider

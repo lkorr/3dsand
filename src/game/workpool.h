@@ -25,8 +25,16 @@
 
 namespace workpool {
 
-// Threads that run tasks, the caller included (>= 1).
+// Threads that run tasks, the caller included (>= 1), after SetThreadLimit.
 int Threads();
+
+// Cap the threads a ParallelFor uses, the caller included, at runtime: 1 =
+// serial, 0 = every thread the pool was built with (SANDVOX_MOB_THREADS or the
+// default). It cannot raise the count past the pool's. The twice-run gate
+// (mob-cap64-twice) runs one brawl at two counts in one process with it, so
+// "the parallel result is the serial one" is gated, not an env A/B by hand.
+// Call between ticks only, never from inside a task.
+void SetThreadLimit(int n);
 
 // fn(i) for i in [0, n). `grain` items are claimed at a time (>= 1).
 void ParallelFor(size_t n, size_t grain, const std::function<void(size_t)>& fn);

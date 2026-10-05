@@ -1,4 +1,5 @@
 #include "sim/world.h"
+#include "sim/trace_mark.h"
 #include "sim/elec.h"
 #include "sim/heat.h"
 
@@ -501,6 +502,10 @@ static FILE* FetchTrace() {
     return (e != nullptr && *e) ? std::fopen(e, "w") : (FILE*)nullptr;
   }();
   return f;
+}
+
+void FetchTraceMark(const char* what) {
+  if (FILE* tf = FetchTrace()) std::fprintf(tf, "M %s\n", what);
 }
 
 void World::RequestChunkFetch(IVec3 worldChunk, FetchSource src) {

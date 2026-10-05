@@ -3720,6 +3720,24 @@ void MobSystem::Reset(bool rewindIds) {
   fleshCoat_.clear();
   fleshShellIdx_.clear();
   looseBurn_.clear();
+  // THE TICK-TO-TICK QUEUES of the world being torn down (fight64 round 3,
+  // package S; gate mob-cap64-twice). Each is drained by the NEXT tick, so a
+  // Reset between two runs handed the first tick of the second run the last
+  // tick of the first: severed flesh's pending drips spawned as particles,
+  // a dying android's queued power-cell discharge laid its arcs as cell ops
+  // (the gate's first diff: "cell ops 0 / 9 at tick -3"), and the splatter
+  // bursts -- retired by AGE, `e.tick + 1 < tick` -- never retired at all in a
+  // run whose tick numbers restart lower, so the old fight's splashes kept
+  // landing on the new crowd. The presentation queues (severs, voices, shock
+  // cues) go too: their events name bodies that no longer exist.
+  pendingSpawns_.clear();
+  splatters_.clear();
+  bodyBursts_.clear();
+  ghostSpawns_.clear();
+  severs_.clear();
+  voices_.clear();
+  shockCues_.clear();
+  bleeds_.clear();
   // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
   //
   // A mob id is not just a handle: it seeds the entity-scoped gore variance
@@ -24892,6 +24910,15 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
   // teleport; the brief hold sells the cut.
   if (limbIndex >= 0 && limbIndex < (int)anim_.partAlive.size())
     anim_.partAlive[limbIndex] = 0;  // gait stops scheduling it, IK -> 0
+  // A LIMB WITH NO COLLIDER VOXELS LEFT IS NOT ADOPTED, IT IS REMOVED.
+  // DebrisSystem::AdoptBody refuses an empty lattice and returns, so the
+  // adopt branch below went on to hold, release and drop a Jolt body that
+  // nothing owned: dynamic, undrawn, never removed by any Reset, falling
+  // forever. Found by mob-cap64-twice's teardown check (fight64 round 3,
+  // package S): a sentinel's snout.4, severed at tick 18, was still in Jolt
+  // at y = -53 after the stage closed, and the next run started with it.
+  // Tested here, after the recursion, so the children keep their own verdict.
+  if (adopt && limb.voxels.empty()) adopt = false;
   if (adopt) {
     // GEAR FIRST, while the shells still hold their lattices (CaptureWorn
     // reads them, and AdoptBody below moves this one out). Names the item the
@@ -25268,6 +25295,17 @@ void Mob::ReleaseRigToDebris() {
     // and an unflushed burn tombstone must not travel with it.
     StripBurnTombstones(limb);
     DropBurnIndex(limb.burn);
+    // NOTHING LEFT TO ADOPT: removed here, as DetachLimb does (see its note).
+    // AdoptBody refuses an empty lattice, and a body handed to it anyway is a
+    // dynamic Jolt body nobody owns, draws or ever removes.
+    if (limb.voxels.empty()) {
+      ReleaseLimbMicro(limb);
+      phys_->RemoveBody(limb.body);   // its joints die with it
+      limb.body = 0;
+      limb.joint = 0;
+      if (i < anim_.partAlive.size()) anim_.partAlive[i] = 0;
+      continue;
+    }
     phys_->SetBodyKinematic(limb.body, false);
     // ...wounds included: a stump that was bleeding goes on bleeding from the
     // heap, from where it is (BodyWound), until it has paid out.

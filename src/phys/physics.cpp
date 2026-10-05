@@ -1,4 +1,5 @@
 #include "phys/physics.h"
+#include "sim/trace_mark.h"
 
 #include <algorithm>
 #include <chrono>
@@ -364,6 +365,10 @@ float FrictionTorque(const JPH::Body& child, JPH::RVec3Arg anchor, float frac) {
 }
 
 }  // namespace
+
+void PhysTraceMark(const char* what) {
+  if (FILE* tf = PhysTrace()) std::fprintf(tf, "M %s\n", what);
+}
 
 struct Physics::LayerImpls {
   BPLayerInterface bpInterface;
@@ -2028,6 +2033,17 @@ void Physics::ParallelFor(uint32_t n, const std::function<void(uint32_t)>& fn) {
   }
   jobs_->WaitForJobs(barrier);
   jobs_->DestroyBarrier(barrier);
+}
+
+void Physics::SetWorkerThreads(int n) {
+  if (!jobs_) return;
+  const int want = n > 0 ? std::min(n, 32) : PhysicsWorkerThreads();
+  if (want != WorkerThreads()) jobs_->SetNumThreads(want);
+}
+
+int Physics::WorkerThreads() const {
+  // GetMaxConcurrency counts the caller too.
+  return jobs_ ? jobs_->GetMaxConcurrency() - 1 : 0;
 }
 
 uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
