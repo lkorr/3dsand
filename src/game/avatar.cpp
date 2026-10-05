@@ -310,6 +310,12 @@ void PlayerAvatar::Despawn() {
   spawned_ = false;
   alive_ = true;
   instancesDirty_ = true;
+  // The shock is keyed on ABSOLUTE sim ticks (Mob::Stunned: tick <
+  // stunUntil_), and F7 restarts the clock at 0 right after this call: a stun
+  // taken at tick 50k would hold the new body for 50k ticks. A despawned body
+  // carries no stun into the next one.
+  stunUntil_ = 0;
+  shock_ = ShockRecord{};
 }
 
 void PlayerAvatar::SetHiddenParts(const std::vector<uint8_t>& hidden) {
