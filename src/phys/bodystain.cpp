@@ -152,28 +152,88 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
   // buried voxel mostly does not take the stain (it only shows if a later cut
   // reaches it, and a soaked interior would hide the anatomy under a uniform
   // red); an exposed one always does.
+  //
+  // A SPHERE'S SOAK NEEDS ONLY THE SPHERE'S BOX (PLAN_fight64_perf round 3
+  // K). Without a carve set the soak reaches no voxel outside the sphere, and
+  // `exposed` asks only that voxel's six neighbours, so the bitmap covers the
+  // sphere's integer box dilated two cells (one for the box's rounding, one
+  // for the neighbours), and ONE pass over the lattice takes the box (for the
+  // absurd-box refusal), that bitmap and the list of voxels the sphere's box
+  // holds; the soak then visits that list, in lattice order. A wound's
+  // re-blood every few ticks had paid three passes over the limb and a
+  // bitmap of its every cell. Same answer for every voxel.
+  const bool sphere = !(p.from && !p.from->Empty());
+  IVec3 sbLo{0, 0, 0}, sbHi{-1, -1, -1};
+  bool useSb = false;
+  if (sphere) {
+    sbLo = IVec3{(int)std::floor(centre.x - p.radius) - 2, (int)std::floor(centre.y - p.radius) - 2,
+                 (int)std::floor(centre.z - p.radius) - 2};
+    sbHi = IVec3{(int)std::floor(centre.x + p.radius) + 2, (int)std::floor(centre.y + p.radius) + 2,
+                 (int)std::floor(centre.z + p.radius) + 2};
+    useSb = sbLo.x <= sbHi.x && sbLo.y <= sbHi.y && sbLo.z <= sbHi.z &&
+            (uint64_t)(sbHi.x - sbLo.x + 1) * (uint64_t)(sbHi.y - sbLo.y + 1) *
+                    (uint64_t)(sbHi.z - sbLo.z + 1) <= (1u << 18);
+  }
+  static thread_local std::vector<uint8_t> occ;
+  static thread_local std::vector<uint32_t> cand;
+  cand.clear();
   IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX}, hi{INT32_MIN, INT32_MIN, INT32_MIN};
-  for (size_t i = 0; i < n; i++) {
-    const IVec3 v = L.At(i);
-    lo.x = std::min(lo.x, v.x); hi.x = std::max(hi.x, v.x);
-    lo.y = std::min(lo.y, v.y); hi.y = std::max(hi.y, v.y);
-    lo.z = std::min(lo.z, v.z); hi.z = std::max(hi.z, v.z);
+  IVec3 oLo, oHi;   // the bitmap's box
+  if (useSb) {
+    oLo = sbLo;
+    oHi = sbHi;
   }
-  const int dx = hi.x - lo.x + 1, dy = hi.y - lo.y + 1, dz = hi.z - lo.z + 1;
-  if (dx <= 0 || dy <= 0 || dz <= 0) return 0;
-  if ((uint64_t)dx * dy * dz > (1u << 22)) return 0;  // absurd box: refuse
-  std::vector<uint8_t> occ((size_t)dx * dy * dz, 0);
-  auto occAt = [&](int x, int y, int z) -> bool {
-    x -= lo.x; y -= lo.y; z -= lo.z;
-    if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return false;
-    return occ[(size_t)x + (size_t)y * dx + (size_t)z * dx * dy] != 0;
+  int dx = 0, dy = 0, dz = 0;
+  auto inO = [&](const IVec3& v) {
+    return (uint32_t)(v.x - oLo.x) < (uint32_t)dx && (uint32_t)(v.y - oLo.y) < (uint32_t)dy &&
+           (uint32_t)(v.z - oLo.z) < (uint32_t)dz;
   };
-  for (size_t i = 0; i < n; i++) {
-    if (L.Mat(i) == 0) continue;  // tombstone
-    const IVec3 v = L.At(i);
-    occ[(size_t)(v.x - lo.x) + (size_t)(v.y - lo.y) * dx +
-        (size_t)(v.z - lo.z) * dx * dy] = 1;
+  auto oIdx = [&](const IVec3& v) {
+    return (size_t)(v.x - oLo.x) + (size_t)(v.y - oLo.y) * dx + (size_t)(v.z - oLo.z) * dx * dy;
+  };
+  if (useSb) {
+    dx = oHi.x - oLo.x + 1;
+    dy = oHi.y - oLo.y + 1;
+    dz = oHi.z - oLo.z + 1;
+    occ.assign((size_t)dx * dy * dz, 0);
+    for (size_t i = 0; i < n; i++) {
+      const IVec3 v = L.At(i);
+      lo.x = std::min(lo.x, v.x); hi.x = std::max(hi.x, v.x);
+      lo.y = std::min(lo.y, v.y); hi.y = std::max(hi.y, v.y);
+      lo.z = std::min(lo.z, v.z); hi.z = std::max(hi.z, v.z);
+      if (!inO(v) || L.Mat(i) == 0) continue;  // out of reach / tombstone
+      occ[oIdx(v)] = 1;
+      cand.push_back((uint32_t)i);
+    }
+  } else {
+    for (size_t i = 0; i < n; i++) {
+      const IVec3 v = L.At(i);
+      lo.x = std::min(lo.x, v.x); hi.x = std::max(hi.x, v.x);
+      lo.y = std::min(lo.y, v.y); hi.y = std::max(hi.y, v.y);
+      lo.z = std::min(lo.z, v.z); hi.z = std::max(hi.z, v.z);
+    }
   }
+  {
+    const int fx = hi.x - lo.x + 1, fy = hi.y - lo.y + 1, fz = hi.z - lo.z + 1;
+    if (fx <= 0 || fy <= 0 || fz <= 0) return 0;
+    if ((uint64_t)fx * fy * fz > (1u << 22)) return 0;  // absurd box: refuse
+  }
+  if (!useSb) {
+    oLo = lo;
+    oHi = hi;
+    dx = oHi.x - oLo.x + 1;
+    dy = oHi.y - oLo.y + 1;
+    dz = oHi.z - oLo.z + 1;
+    occ.assign((size_t)dx * dy * dz, 0);
+    for (size_t i = 0; i < n; i++) {
+      if (L.Mat(i) == 0) continue;  // tombstone
+      occ[oIdx(L.At(i))] = 1;
+    }
+  }
+  auto occAt = [&](int x, int y, int z) -> bool {
+    const IVec3 v{x, y, z};
+    return inO(v) && occ[oIdx(v)] != 0;
+  };
   auto exposed = [&](IVec3 v) -> bool {
     return !occAt(v.x - 1, v.y, v.z) || !occAt(v.x + 1, v.y, v.z) ||
            !occAt(v.x, v.y - 1, v.z) || !occAt(v.x, v.y + 1, v.z) ||
@@ -191,7 +251,9 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
   static const std::vector<uint8_t> kNoTissue;
   const std::vector<uint8_t>& tissue = p.tissue ? *p.tissue : kNoTissue;
   uint32_t changed = 0;
-  for (size_t i = 0; i < n; i++) {
+  const size_t nVisit = useSb ? cand.size() : n;
+  for (size_t ii = 0; ii < nVisit; ii++) {
+    const size_t i = useSb ? (size_t)cand[ii] : ii;
     const uint32_t mat = L.Mat(i);
     if (mat == 0) continue;
     const IVec3 v = L.At(i);

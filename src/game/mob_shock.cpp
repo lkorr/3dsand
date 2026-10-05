@@ -93,6 +93,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <queue>
 
@@ -163,6 +164,13 @@ void BodyBox(const Vec3& mn, const Vec3& mx, int32_t lo[3], int32_t hi[3]) {
     }
   }
 }
+
+// Pool-call timing for SANDVOX_SHOCK_DIGEST (diagnostic only, main thread).
+struct ParStats {
+  uint64_t calls = 0;
+  double wall = 0, first = 0, maxTask = 0, sumTask = 0;
+};
+ParStats g_parStats;
 
 int FloorDiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
 
@@ -259,6 +267,15 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
                                const ElecHit* hits, size_t nHits) {
   const Tuning& tn = CurrentTuning();
   const Tuning::Gore& g = tn.gore;
+  // Phase clocks (ShockCounters::phaseNanos; diagnostic only, never read by
+  // the sim).
+  auto tLap = std::chrono::steady_clock::now();
+  auto lap = [&](int ph) {
+    const auto t = std::chrono::steady_clock::now();
+    shockCounters_.phaseNanos[ph] +=
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t - tLap).count();
+    tLap = t;
+  };
 
   // ---- WHO TAKES PART -------------------------------------------------------
   // Every body whose box held charge, then every UNCHARGED body touching one
@@ -331,6 +348,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     parts.push_back(std::move(p));
   }
 
+  lap(7);
   // ---- THE BODY CELLS -------------------------------------------------------
   const uint32_t wet = (uint32_t)std::clamp(tn.sim.elecWetResist, 1, (int)kElecResistInsulator - 1);
   struct Node {
@@ -338,66 +356,98 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     int32_t slot = -1;
     int32_t cell = -1;      // index into the slot's ElecSlotCache::cells
     IVec3 w{};              // the world cell it sits in, this pose
-    Vec3 at{};              // ...and its centre, in world voxels
     Vec3 atNow{};           // its centre under the CURRENT pose (the cover ray)
     uint16_t bulk = kIns, entry = kIns;
     uint16_t spreadQ = 0;   // the spreading loss of entering it, /4096 of what arrives
   };
-  std::vector<Node> nodes;
-  // ---- EVERY SLOT'S CACHE, REFRESHED ACROSS THE POOL (PLAN_fight64_perf M) --
-  // RefreshElecSlotCache is a pure function of one slot's lattice, the
-  // material tables and the tick, and writes only that slot's cache: the
-  // per-item contract workpool.h states. So the refreshes run first, in
-  // parallel, and the node list below is built from the refreshed caches in
-  // the same (part, slot) order as before -- the result is the serial loop's,
-  // bit for bit. A slot listed twice (never expected: one answer per creature
-  // per tick) would be two writers of one cache, so that case runs serially.
+  // ---- THE POOL, AND WHEN IT MAY NOT BE USED (PLAN_fight64_perf round 3 K) --
+  // Every parallel phase below is one task per SLOT or per PART and writes
+  // only that slot's or part's state: the slot's cache and its nodes, P of
+  // the part's own nodes, its owner's shock record, its rolls. That is one
+  // writer per item only while no creature is listed twice (never expected:
+  // one answer per creature per tick) -- and the shock debug prints in node
+  // order -- so either case runs every phase serially, in order: the serial
+  // loop IS the result. FEW calls, not many: a pool call costs ~100 us of
+  // wake and join on top of its longest task (measured: SANDVOX_SHOCK_DIGEST's
+  // shock-pool line), which is most of a phase this size. Serially the tasks
+  // run in plain index order (the debug prints are in node order).
+  static const bool dbgSeed = std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr;
+  bool unique = true;
   {
-    struct Job {
-      BurnLimbView v;
-      ElecSlotCache* c = nullptr;
-      int how = 0;
-      uint64_t nanos = 0;
-    };
-    std::vector<Job> jobs;
-    for (uint32_t pi = 0; pi < parts.size(); pi++) {
-      Mob& m = *parts[pi].m;
-      if (m.elecCache_.size() != m.limbs_.size()) m.elecCache_.resize(m.limbs_.size());
-      for (int li = 0; li < (int)m.limbs_.size(); li++) {
-        MobLimb& L = m.limbs_[li];
-        if (!L.body) continue;
-        Job j;
-        j.v = m.ViewOf(L);
-        if (j.v.xf == nullptr || j.v.Size() == 0) continue;
-        j.c = &m.elecCache_[li];
-        jobs.push_back(j);
-      }
-    }
-    std::vector<const ElecSlotCache*> seen;
-    seen.reserve(jobs.size());
-    for (const Job& j : jobs) seen.push_back(j.c);
-    std::sort(seen.begin(), seen.end());
-    const bool unique = std::adjacent_find(seen.begin(), seen.end()) == seen.end();
-    auto run = [&](size_t k) {
-      Job& j = jobs[k];
-      const auto r0 = std::chrono::steady_clock::now();
-      j.how = RefreshElecSlotCache(j.v, wet, tick, *j.c);
-      j.nanos = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - r0)
-                    .count();
-    };
-    if (unique) workpool::ParallelFor(jobs.size(), 1, run);
-    else for (size_t k = 0; k < jobs.size(); k++) run(k);
-    for (const Job& j : jobs) {
-      if (j.how == 2) shockCounters_.cacheBuilds++;
-      else if (j.how == 1) shockCounters_.cacheAccums++;
-      else shockCounters_.cacheHits++;
-      shockCounters_.refreshNanos += j.nanos;
-    }
+    std::vector<const Mob*> ms;
+    ms.reserve(parts.size());
+    for (const Part& p : parts) ms.push_back(p.m);
+    std::sort(ms.begin(), ms.end());
+    unique = std::adjacent_find(ms.begin(), ms.end()) == ms.end();
   }
+  const bool pooled = unique && !dbgSeed;
+  // SANDVOX_SHOCK_DIGEST also times every pool call: its wall, when its
+  // first task started, its longest task, the sum of its tasks (diagnostic
+  // only: is a phase slow because of its work or because of the pool?).
+  static const bool parTimed = std::getenv("SANDVOX_SHOCK_DIGEST") != nullptr;
+  auto par = [&](size_t n, const std::function<void(size_t)>& fn) {
+    if (!parTimed || n == 0) {
+      if (pooled) workpool::ParallelFor(n, 1, fn);
+      else for (size_t i = 0; i < n; i++) fn(i);
+      return;
+    }
+    using clk = std::chrono::steady_clock;
+    std::vector<clk::time_point> t0s(n), t1s(n);
+    const clk::time_point c0 = clk::now();
+    auto timed = [&](size_t i) {
+      t0s[i] = clk::now();
+      fn(i);
+      t1s[i] = clk::now();
+    };
+    if (pooled) workpool::ParallelFor(n, 1, timed);
+    else for (size_t i = 0; i < n; i++) timed(i);
+    const clk::time_point c1 = clk::now();
+    auto us = [](clk::duration d) { return std::chrono::duration<double, std::micro>(d).count(); };
+    clk::time_point first = t0s[0];
+    double maxT = 0, sumT = 0;
+    for (size_t i = 0; i < n; i++) {
+      first = std::min(first, t0s[i]);
+      maxT = std::max(maxT, us(t1s[i] - t0s[i]));
+      sumT += us(t1s[i] - t0s[i]);
+    }
+    g_parStats.calls++;
+    g_parStats.wall += us(c1 - c0);
+    g_parStats.first += us(first - c0);
+    g_parStats.maxTask += maxT;
+    g_parStats.sumTask += sumT;
+  };
+  const uint32_t spreadK = (uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 4095);
+  const uint32_t spreadFree = (uint32_t)std::clamp(tn.sim.elecSpreadFree, 0, 6);
+
+  // ---- PHASE A, ONE TASK PER SLOT: its cache, then its nodes ---------------
+  // EVERY SLOT'S CACHE (PLAN_fight64_perf M): RefreshElecSlotCache is a pure
+  // function of one slot's lattice, the material tables and the tick, and
+  // writes only that slot's cache. The same task then lays out the slot's
+  // NODES from it (round 3 K): one cell each, placed by the pose the box was
+  // asked with, with its spreading loss (wave 2 package A, sim_elec.wgsl
+  // elecEnter: a cell entered from a neighbour also loses prev x spreadQ(n) /
+  // 4096, n = its conducting face neighbours in its own slot past
+  // sim.elecSpreadFree). The slots' lists are then laid end to end in (part,
+  // slot) order -- the very order the serial loop pushed them in.
+  struct SlotJob {
+    uint32_t part = 0;
+    int32_t li = -1;
+    BurnLimbView v;
+    const BodyTransform* xf = nullptr;   // the pose the box was asked with
+    int how = 0;
+    uint64_t nanos = 0;
+    uint64_t cost = 0;   // what the task is expected to take (its place in the queue)
+    std::vector<Node> nodes;
+  };
+  // SCRATCH KEPT ACROSS TICKS (this pass runs on the main thread only): a
+  // tick's fresh 100-KiB vectors were page faults and allocator time on every
+  // solved tick. Jobs keep their node lists' capacity too.
+  static std::vector<SlotJob> jobs;
+  size_t nj = 0;
   for (uint32_t pi = 0; pi < parts.size(); pi++) {
     Part& p = parts[pi];
     Mob& m = *p.m;
+    if (m.elecCache_.size() != m.limbs_.size()) m.elecCache_.resize(m.limbs_.size());
     p.slotBase.assign(m.limbs_.size(), -1);
     // The pose of the tick the box was asked on (Mob::elecPoses_), so the
     // body's cells meet the grid where the body WAS; the current pose when
@@ -411,92 +461,163 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       if (!L.body) continue;
       const BurnLimbView v = m.ViewOf(L);
       if (v.xf == nullptr || v.Size() == 0) continue;
-      ElecSlotCache& c = m.elecCache_[li];
-      if (c.cells.empty()) continue;
-      p.slotBase[li] = (int32_t)nodes.size();
-      const BodyTransform& xf = pose ? pose->xf[li] : *v.xf;
-      const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
-      const Quat qNow{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
-      for (size_t ci = 0; ci < c.cells.size(); ci++) {
-        const ElecBodyCell& e = c.cells[ci];
-        const Vec3 local{(float)e.c[0] + 0.5f, (float)e.c[1] + 0.5f, (float)e.c[2] + 0.5f};
-        const Vec3 w = xf.pos + QuatRotate(q, local);
-        Node nd;
-        nd.part = pi;
-        nd.slot = li;
-        nd.cell = (int32_t)ci;
-        nd.w = {ifloor(w.x), ifloor(w.y), ifloor(w.z)};
-        nd.at = w;
-        nd.atNow = v.xf->pos + QuatRotate(qNow, local);
-        nd.bulk = e.bulk;
-        nd.entry = e.entry;
-        nodes.push_back(nd);
-      }
+      if (nj == jobs.size()) jobs.emplace_back();
+      SlotJob& j = jobs[nj++];
+      j.v = v;
+      j.part = pi;
+      j.li = li;
+      j.xf = pose ? &pose->xf[li] : j.v.xf;
+      j.how = 0;
+      j.nanos = 0;
+      j.nodes.clear();
+      // LONGEST FIRST: a slot whose cache stands is laid out and nothing else;
+      // one that must be re-accumulated walks its lattice, and one whose
+      // geometry is new walks it three times. The pool takes tasks in index
+      // order, so the queue below starts the long ones first and the wall is
+      // not one big torso started last.
+      const ElecSlotCache& c = m.elecCache_[li];
+      const uint32_t s = std::max(1u, v.scale);
+      const bool stands = c.fresh && c.geomKey != 0 && c.vcell.size() == v.Size() && c.scale == s &&
+                          c.gen == elecMatGen_ && c.wet == wet && tick - c.lastFull < kElecSlotRefreshTicks;
+      j.cost = stands ? (uint64_t)c.cells.size() : (uint64_t)v.Size() * (c.geomKey == 0 ? 3u : 1u);
     }
   }
-  if (nodes.empty()) return;
-  // THE SPREADING LOSS (wave 2 package A, sim_elec.wgsl elecEnter): a cell
-  // entered from a neighbour also loses prev x spreadQ(n) / 4096, n = its
-  // conducting face neighbours past sim.elecSpreadFree (a wire's two cost
-  // nothing; the current divides in bulk). n here counts the cell's own
-  // slot's neighbours -- the body's inside.
+  std::vector<uint32_t> jobOrder(nj);
+  for (uint32_t k = 0; k < nj; k++) jobOrder[k] = k;
+  if (pooled)
+    std::stable_sort(jobOrder.begin(), jobOrder.end(),
+                     [&](uint32_t a, uint32_t b) { return jobs[a].cost > jobs[b].cost; });
+  par(nj, [&](size_t t) {
+    SlotJob& j = jobs[jobOrder[t]];
+    Mob& m = *parts[j.part].m;
+    ElecSlotCache& c = m.elecCache_[j.li];
+    const auto r0 = std::chrono::steady_clock::now();
+    j.how = RefreshElecSlotCache(j.v, wet, tick, c);
+    j.nanos = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - r0)
+                  .count();
+    if (c.cells.empty()) return;
+    const BodyTransform& xf = *j.xf;
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+    const Quat qNow{j.v.xf->quat[0], j.v.xf->quat[1], j.v.xf->quat[2], j.v.xf->quat[3]};
+    j.nodes.resize(c.cells.size());
+    for (size_t ci = 0; ci < c.cells.size(); ci++) {
+      const ElecBodyCell& e = c.cells[ci];
+      const Vec3 local{(float)e.c[0] + 0.5f, (float)e.c[1] + 0.5f, (float)e.c[2] + 0.5f};
+      const Vec3 w = xf.pos + QuatRotate(q, local);
+      Node& nd = j.nodes[ci];
+      nd.part = j.part;
+      nd.slot = j.li;
+      nd.cell = (int32_t)ci;
+      nd.w = {ifloor(w.x), ifloor(w.y), ifloor(w.z)};
+      nd.atNow = j.v.xf->pos + QuatRotate(qNow, local);
+      nd.bulk = e.bulk;
+      nd.entry = e.entry;
+      if (spreadK != 0 && nd.bulk != kIns) {
+        uint32_t n = 0;
+        for (const IVec3& d : kFace6) {
+          const int x = e.c[0] + d.x - c.cmin.x, y = e.c[1] + d.y - c.cmin.y,
+                    z = e.c[2] + d.z - c.cmin.z;
+          if (x < 0 || y < 0 || z < 0 || x >= c.cdim.x || y >= c.cdim.y || z >= c.cdim.z) continue;
+          const int32_t cj = c.at[((size_t)z * c.cdim.y + y) * c.cdim.x + x];
+          if (cj >= 0 && c.cells[cj].bulk != kIns) n++;
+        }
+        if (n > spreadFree) nd.spreadQ = (uint16_t)std::min<uint32_t>((n - spreadFree) * spreadK, 4095u);
+      }
+    }
+  });
+  static std::vector<Node> nodesScratch;
+  std::vector<Node>& nodes = nodesScratch;
+  nodes.clear();
+  std::vector<uint32_t> partBegin(parts.size() + 1, 0);
   {
-    const uint32_t k = (uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 4095);
-    const uint32_t free = (uint32_t)std::clamp(tn.sim.elecSpreadFree, 0, 6);
-    for (Node& nd : nodes) {
-      if (k == 0 || nd.bulk == kIns) continue;
-      const ElecSlotCache& c = parts[nd.part].m->elecCache_[nd.slot];
-      const ElecBodyCell& e = c.cells[nd.cell];
-      uint32_t n = 0;
-      for (const IVec3& d : kFace6) {
-        const int x = e.c[0] + d.x - c.cmin.x, y = e.c[1] + d.y - c.cmin.y,
-                  z = e.c[2] + d.z - c.cmin.z;
-        if (x < 0 || y < 0 || z < 0 || x >= c.cdim.x || y >= c.cdim.y || z >= c.cdim.z) continue;
-        const int32_t ci = c.at[((size_t)z * c.cdim.y + y) * c.cdim.x + x];
-        if (ci >= 0 && c.cells[ci].bulk != kIns) n++;
-      }
-      if (n > free) nd.spreadQ = (uint16_t)std::min<uint32_t>((n - free) * k, 4095u);
+    size_t total = 0;
+    for (size_t k = 0; k < nj; k++) total += jobs[k].nodes.size();
+    nodes.reserve(total);
+  }
+  for (size_t k = 0, pi = 0; pi <= parts.size(); pi++) {
+    partBegin[pi] = (uint32_t)nodes.size();
+    if (pi == parts.size()) break;
+    for (; k < nj && jobs[k].part == pi; k++) {
+      const SlotJob& j = jobs[k];
+      if (j.how == 2) shockCounters_.cacheBuilds++;
+      else if (j.how == 1) shockCounters_.cacheAccums++;
+      else shockCounters_.cacheHits++;
+      shockCounters_.refreshNanos += j.nanos;
+      if (j.nodes.empty()) continue;
+      parts[pi].slotBase[j.li] = (int32_t)nodes.size();
+      nodes.insert(nodes.end(), j.nodes.begin(), j.nodes.end());
     }
   }
+  lap(0);
+  if (nodes.empty()) return;
   shockCounters_.bodiesSolved += parts.size();
   shockCounters_.cellsSolved += nodes.size();
-  // World cell -> body cells there, sorted: contact between slots and bodies.
-  std::vector<std::pair<uint64_t, uint32_t>> byCell;
-  byCell.reserve(nodes.size());
-  for (uint32_t k = 0; k < nodes.size(); k++) byCell.push_back({CellKey(nodes[k].w), k});
-  std::sort(byCell.begin(), byCell.end());
-  // ...and each distinct cell's run of that sorted list, behind an
-  // open-addressed hash (PLAN_fight64_perf M). The solve below asks for seven
-  // cells per settled node and the shell / air tests ask more; a binary search
-  // of the whole list per ask was a sixth of this pass in the 64-creature
-  // brawl. Same runs, same order inside a run: only the lookup changed.
+  // Per part: its nodes' cell box, whether it wears anything, and the highest
+  // P in its answer's grid (no face can offer more).
+  struct PartInfo {
+    IVec3 lo{INT_MAX, INT_MAX, INT_MAX}, hi{INT_MIN, INT_MIN, INT_MIN};
+    uint32_t gridMax = 0;
+    uint8_t worn = 0;
+  };
+  std::vector<PartInfo> info(parts.size());
+  for (uint32_t pi = 0; pi < parts.size(); pi++) {
+    PartInfo& I = info[pi];
+    for (uint32_t k = partBegin[pi]; k < partBegin[pi + 1]; k++) {
+      const IVec3& w = nodes[k].w;
+      I.lo = {std::min(I.lo.x, w.x), std::min(I.lo.y, w.y), std::min(I.lo.z, w.z)};
+      I.hi = {std::max(I.hi.x, w.x), std::max(I.hi.y, w.y), std::max(I.hi.z, w.z)};
+    }
+  }
+  // (`worn` and `gridMax` are the part's own seeds task's to fill.)
+
+  // ---- WORLD CELL -> BODY CELLS, ONE INDEX ----------------------------------
+  // Contact between slots and bodies: every node by the world cell it sits
+  // in, behind an open-addressed hash (PLAN_fight64_perf M). BUCKETED, NOT
+  // SORTED (round 3 K): count each cell's nodes into the hash, lay the runs
+  // end to end, drop every node into its run in node order -- the runs a
+  // sort by (cell, node) made, without the sort.
   struct Run {
     uint64_t key = ~0ull;   // ~0 = empty (CellKey never sets the top bit)
     uint32_t begin = 0, end = 0;
   };
-  size_t cap = 16;
-  while (cap < byCell.size() * 2) cap <<= 1;
-  std::vector<Run> runs(cap);
-  const size_t runMask = cap - 1;
-  auto slotOf = [&](uint64_t key) {
-    return (size_t)((key * 0x9E3779B97F4A7C15ull) >> 32) & runMask;
+  static std::vector<Run> runs;
+  static std::vector<uint32_t> byCell;
+  byCell.resize(nodes.size());
+  size_t runMask = 0;
+  auto slotOf = [](uint64_t key, size_t mask) {
+    return (size_t)((key * 0x9E3779B97F4A7C15ull) >> 32) & mask;
   };
-  for (uint32_t i = 0; i < byCell.size();) {
-    uint32_t j = i + 1;
-    while (j < byCell.size() && byCell[j].first == byCell[i].first) j++;
-    size_t s = slotOf(byCell[i].first);
-    while (runs[s].key != ~0ull) s = (s + 1) & runMask;
-    runs[s] = {byCell[i].first, i, j};
-    i = j;
+  {
+    size_t cap = 16;
+    while (cap < nodes.size() * 2) cap <<= 1;
+    runs.assign(cap, Run{});
+    runMask = cap - 1;
+    static std::vector<uint32_t> slotOfNode;
+    slotOfNode.resize(nodes.size());
+    for (uint32_t k = 0; k < nodes.size(); k++) {
+      const uint64_t key = CellKey(nodes[k].w);
+      size_t s = slotOf(key, runMask);
+      while (runs[s].key != ~0ull && runs[s].key != key) s = (s + 1) & runMask;
+      runs[s].key = key;
+      runs[s].end++;   // a count, for now
+      slotOfNode[k] = (uint32_t)s;
+    }
+    uint32_t at = 0;
+    for (Run& r : runs) {
+      if (r.key == ~0ull) continue;
+      r.begin = at;
+      at += r.end;
+      r.end = r.begin;   // the fill cursor
+    }
+    for (uint32_t k = 0; k < nodes.size(); k++) byCell[runs[slotOfNode[k]].end++] = k;
   }
-  using CellIt = std::vector<std::pair<uint64_t, uint32_t>>::const_iterator;
-  auto cellRange = [&](IVec3 c) -> std::pair<CellIt, CellIt> {
+  auto cellRange = [&](IVec3 c) -> std::pair<const uint32_t*, const uint32_t*> {
     const uint64_t key = CellKey(c);
-    for (size_t s = slotOf(key);; s = (s + 1) & runMask) {
+    for (size_t s = slotOf(key, runMask);; s = (s + 1) & runMask) {
       const Run& r = runs[s];
-      if (r.key == key)
-        return {byCell.cbegin() + r.begin, byCell.cbegin() + r.end};
-      if (r.key == ~0ull) return {byCell.cend(), byCell.cend()};
+      if (r.key == key) return {byCell.data() + r.begin, byCell.data() + r.end};
+      if (r.key == ~0ull) return {nullptr, nullptr};
     }
   };
   // Is world cell c AIR to part pi: the grid says air there and none of its
@@ -504,149 +625,265 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
   auto airFor = [&](uint32_t pi, IVec3 c) {
     if ((GridWord(parts[pi].hit, c) & kElecQueryGridAir) == 0) return false;
     const auto r = cellRange(c);
-    for (auto it = r.first; it != r.second; ++it)
-      if (nodes[it->second].part == pi) return false;
+    for (const uint32_t* it = r.first; it != r.second; ++it)
+      if (nodes[*it].part == pi) return false;
     return true;
   };
 
-  // ---- THE SOLVE: max-plus to the least fixpoint ----------------------------
-  std::vector<int32_t> P(nodes.size(), 0);
-  std::priority_queue<std::pair<int32_t, uint32_t>> pq;
-  // PER BODY, ONCE (PLAN_fight64_perf M): whether it wears anything at all
-  // (no worn slot = no shell can be in any cell, so the shell tests below
-  // are false without looking), each slot's LimbHasShells, and the highest P
-  // in its answer's grid (no face can offer more, so a cell already reading
-  // it has nothing to look for across its faces). All three only skip work
-  // whose answer they already know.
-  std::vector<uint8_t> partWorn(parts.size(), 0);
-  std::vector<std::vector<int8_t>> partSlotShells(parts.size());
-  std::vector<uint32_t> partGridMax(parts.size(), 0);
-  for (uint32_t pi = 0; pi < parts.size(); pi++) {
-    Mob& m = *parts[pi].m;
-    partSlotShells[pi].assign(m.limbs_.size(), -1);
-    for (int li = 0; li < (int)m.limbs_.size(); li++)
-      if (m.IsWornSlot(li)) partWorn[pi] = 1;
-    if (const ElecHit* h = parts[pi].hit)
-      for (uint32_t w : h->grid) partGridMax[pi] = std::max(partGridMax[pi], w & kElecQueryGridPMax);
+  lap(2);
+  // ---- CONNECTED COMPONENTS (ranked item 4) ---------------------------------
+  // Charge crosses between two parts only where a cell of one sits in, or on
+  // a face of, a cell of the other. So parts whose cell boxes, dilated a
+  // cell, do not meet cannot exchange anything, and each group of parts that
+  // do is solved on its own, the groups across the pool. A box test
+  // over-merges, which costs parallelism and never correctness. (Measured:
+  // the 64-creature brawl's charged bodies are pressed into ONE group, 26 of
+  // 28 parts -- this buys nothing there; it is for separate puddles, rooms,
+  // fights.)
+  std::vector<uint32_t> root(parts.size());
+  for (uint32_t i = 0; i < parts.size(); i++) root[i] = i;
+  auto findRoot = [&](uint32_t i) {
+    while (root[i] != i) i = root[i] = root[root[i]];
+    return i;
+  };
+  for (uint32_t i = 0; i < parts.size(); i++) {
+    if (partBegin[i] == partBegin[i + 1]) continue;
+    for (uint32_t j = i + 1; j < parts.size(); j++) {
+      if (partBegin[j] == partBegin[j + 1]) continue;
+      const PartInfo &a = info[i], &b = info[j];
+      if (a.lo.x > b.hi.x + 1 || b.lo.x > a.hi.x + 1 || a.lo.y > b.hi.y + 1 || b.lo.y > a.hi.y + 1 ||
+          a.lo.z > b.hi.z + 1 || b.lo.z > a.hi.z + 1)
+        continue;
+      const uint32_t ri = findRoot(i), rj = findRoot(j);
+      if (ri != rj) root[std::max(ri, rj)] = std::min(ri, rj);
+    }
   }
-  for (uint32_t k = 0; k < nodes.size(); k++) {
+  std::vector<std::vector<uint32_t>> comps;   // parts, ascending
+  {
+    std::vector<uint32_t> compOf(parts.size(), UINT32_MAX);
+    for (uint32_t i = 0; i < parts.size(); i++) {
+      if (partBegin[i] == partBegin[i + 1]) continue;
+      const uint32_t r = findRoot(i);
+      if (compOf[r] == UINT32_MAX) {
+        compOf[r] = (uint32_t)comps.size();
+        comps.emplace_back();
+      }
+      comps[compOf[r]].push_back(i);
+    }
+  }
+  lap(1);
+
+  // ---- ONE NODE'S EDGES --------------------------------------------------------
+  // The six lattice-cell neighbours of its own slot at their bulk resist, then
+  // the cells sharing its world cell or a face of it -- a jointed limb of the
+  // same body is tissue continuing (bulk); a shell, an item or another body is
+  // a surface crossed (entry). `fn(j, cost)` for every edge that conducts.
+  auto forEdges = [&](uint32_t k, auto&& fn) {
     const Node& nd = nodes[k];
-    if (nd.entry == kIns) continue;
-    // COVERED: a body cell takes the world's charge across a face only when no
-    // WORN shell stands in the way -- no cell of a shell in its own world cell
-    // or in the world cell across that face (BurnLimbView::WornAlong's rule,
-    // at cell pitch). Otherwise the charge reaches it only THROUGH the shell:
-    // a leather sole stands between the foot and the plate, an iron one
-    // carries the plate's charge into it.
-    Mob& owner = *parts[nd.part].m;
-    const bool body = nd.slot < owner.baseLimbs_;
-    const bool worn = partWorn[nd.part] != 0;
-    auto shellAt = [&](IVec3 c) {
-      if (!worn) return false;
-      const auto r = cellRange(c);
-      for (auto it = r.first; it != r.second; ++it) {
-        const Node& o = nodes[it->second];
-        if (o.part == nd.part && o.slot != nd.slot && owner.IsWornSlot(o.slot)) return true;
-      }
-      return false;
-    };
-    if (body && shellAt(nd.w)) {
-      if (GridWord(parts[nd.part].hit, nd.w) & kElecQueryGridPMax) owner.shock_.covered++;
-      continue;
+    const Part& p = parts[nd.part];
+    const Mob& m = *p.m;
+    const ElecSlotCache& c = m.elecCache_[nd.slot];
+    const ElecBodyCell& e = c.cells[nd.cell];
+    for (const IVec3& d : kFace6) {
+      const int x = e.c[0] + d.x - c.cmin.x, y = e.c[1] + d.y - c.cmin.y, z = e.c[2] + d.z - c.cmin.z;
+      if (x < 0 || y < 0 || z < 0 || x >= c.cdim.x || y >= c.cdim.y || z >= c.cdim.z) continue;
+      const int32_t cj = c.at[((size_t)z * c.cdim.y + y) * c.cdim.x + x];
+      if (cj >= 0 && c.cells[cj].bulk != kIns) fn((uint32_t)(p.slotBase[nd.slot] + cj), c.cells[cj].bulk);
     }
-    uint32_t wp = GridWord(parts[nd.part].hit, nd.w) & kElecQueryGridPMax;
-    // CONTACT: the six face cells, and -- across ONE air cell no part of this
-    // body fills -- the cell beyond. A body cell is a world-pitch BIN of
-    // voxels placed by its centre, so a sole resting on a plate can bin a
-    // cell above the one touching it (measured: elec-stun's zombie, every
-    // foot cell one air cell over the copper). Wave 1 dilated each limb box
-    // by a cell for the same reason; this is that slack, and no more.
-    // (Nothing past the grid's own maximum can be read: `wp` there is final.)
-    for (int f = 0; f < 6 && wp < partGridMax[nd.part]; f++) {
-      const IVec3& d = kFace6[f];
-      const IVec3 n1{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
-      for (int step = 1; step <= 2; step++) {
-        const IVec3 n = step == 1 ? n1 : IVec3{n1.x + d.x, n1.y + d.y, n1.z + d.z};
-        if (step == 2) {
-          // Only across air...
-          if ((GridWord(parts[nd.part].hit, n1) & kElecQueryGridAir) == 0) break;
-        }
-        const uint32_t pn = GridWord(parts[nd.part].hit, n) & kElecQueryGridPMax;
-        if (pn <= wp) continue;
-        if (step == 2) {
-          // ...and not into the body's own cells. Asked only now that the
-          // far cell has something to offer: either refusal ends the face.
-          bool own = false;
-          const auto r = cellRange(n1);
-          for (auto it = r.first; it != r.second && !own; ++it) own = nodes[it->second].part == nd.part;
-          if (own) break;
-        }
-        // A shell cell in the way, or a shell met on the way there
-        // (Mob::WornShellAlong, the burn pass's ray: a limb is a rounded tube
-        // in a garment cut to its box, and the two lattices' world-pitch
-        // cells need not line up).
-        bool behind = body && (shellAt(n1) || (step == 2 && shellAt(n)));
-        int8_t& hasShells = partSlotShells[nd.part][(size_t)nd.slot];
-        if (body && !behind && hasShells < 0) hasShells = owner.LimbHasShells(nd.slot) ? 1 : 0;
-        if (body && !behind && hasShells > 0) {
-          uint32_t sm = 0;
-          behind = owner.WornShellAlong(nd.slot, nd.atNow, Vec3{(float)d.x, (float)d.y, (float)d.z},
-                                        (float)step, kCoverMarchMax, &sm, nullptr) >= 0;
-        }
-        if (behind) owner.shock_.covered++;
-        else wp = pn;
+    for (int f = -1; f < 6; f++) {
+      const IVec3 w = f < 0 ? nd.w : IVec3{nd.w.x + kFace6[f].x, nd.w.y + kFace6[f].y,
+                                           nd.w.z + kFace6[f].z};
+      const auto r = cellRange(w);
+      for (const uint32_t* it = r.first; it != r.second; ++it) {
+        const uint32_t j = *it;
+        const Node& o = nodes[j];
+        if (o.part == nd.part && o.slot == nd.slot) continue;
+        const bool tissue = o.part == nd.part && o.slot < m.baseLimbs_ && nd.slot < m.baseLimbs_;
+        const uint16_t cost = tissue ? o.bulk : o.entry;
+        if (cost != kIns) fn(j, cost);
       }
     }
-    const int32_t seed =
-        (int32_t)wp - (int32_t)nd.entry - (int32_t)(((uint64_t)wp * nd.spreadQ) >> 12);
-    if (seed > 0) {
-      P[k] = seed;
-      pq.push({seed, k});
-      // ATTRIBUTION (CLAUDE.md rule 6): which rig slots took the world's
-      // charge directly.
-      owner.shock_.seededSlots |= 1ull << (nd.slot < 63 ? nd.slot : 63);
-      // SANDVOX_SHOCK_DEBUG=1: every seeded cell of a body's first seeded tick
-      // -- where it is, what it is made of, what it read (diagnostic only).
-      static const bool dbg = std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr;
-      if (dbg && owner.shock_.firstTick == 0 && owner.shock_.ticks == 0) {
-        std::string mats;
-        BurnLimbView dv = owner.ViewOf(owner.limbs_[nd.slot]);
-        const ElecSlotCache& dc = owner.elecCache_[nd.slot];
-        std::vector<uint32_t> seen;
-        for (size_t i = 0; i < dv.Size() && i < dc.vcell.size(); i++)
-          if (dc.vcell[i] == nd.cell && dc.vexp[i] &&
-              std::find(seen.begin(), seen.end(), dv.Mat(i)) == seen.end())
-            seen.push_back(dv.Mat(i));
-        for (uint32_t m : seen) mats += " " + std::to_string(m);
-        std::vector<uint32_t> coats;
-        for (size_t i = 0; i < dv.Size() && i < dc.vcell.size(); i++) {
-          const uint16_t st = dv.Stain(i);
-          if (dc.vcell[i] == nd.cell && dc.vexp[i] && BodyStainAmt(st) &&
-              std::find(coats.begin(), coats.end(), BodyStainMat(st)) == coats.end())
-            coats.push_back(BodyStainMat(st));
+  };
+  static const int solveMode = [] {
+    const char* e = std::getenv("SANDVOX_SHOCK_SOLVE");
+    return e ? std::atoi(e) : 1;
+  }();
+  // EVERY NODE'S EDGES, WRITTEN DOWN IN THE SEEDS' TASKS (round 3 K). The
+  // solve below is serial over one connected mass (a brawl is one), and it
+  // was memory-bound: a hash probe per face per settled node, and the slot
+  // caches of twenty bodies. The same lookups, made once per node across the
+  // pool, leave the solve a walk of flat arrays: (target, cost) per edge, and
+  // the targets' spreading loss beside P.
+  struct Adj {
+    std::vector<uint32_t> begin;                        // local node -> first edge
+    std::vector<std::pair<uint32_t, uint16_t>> e;      // (global node, cost)
+  };
+  static std::vector<Adj> adjPool;   // reused across ticks (main-thread pass)
+  if (adjPool.size() < parts.size()) adjPool.resize(parts.size());
+  std::vector<uint16_t> spreadQ(nodes.size());
+  for (uint32_t k = 0; k < nodes.size(); k++) spreadQ[k] = nodes[k].spreadQ;
+
+  // ---- THE SEEDS, ONE TASK PER PART -----------------------------------------
+  // A part's seeds read only its own cells, its own answer's grid and its own
+  // shells, and write P of its own nodes and its owner's shock record.
+  // (WornShellAlong's march index is the owner's, too.)
+  std::vector<int32_t> P(nodes.size(), 0);
+  std::vector<uint8_t> partSeeded(parts.size(), 0);   // took a seed (the debug report)
+  // Largest part first (the pool takes tasks in index order).
+  std::vector<uint32_t> partOrder(parts.size());
+  for (uint32_t pi = 0; pi < parts.size(); pi++) partOrder[pi] = pi;
+  if (pooled)
+    std::stable_sort(partOrder.begin(), partOrder.end(), [&](uint32_t x, uint32_t y) {
+      return partBegin[x + 1] - partBegin[x] > partBegin[y + 1] - partBegin[y];
+    });
+  par(parts.size(), [&](size_t t) {
+    const uint32_t pi = partOrder[t];
+    if (partBegin[pi] == partBegin[pi + 1]) return;
+    Mob& owner = *parts[pi].m;
+    const ElecHit* hit = parts[pi].hit;
+    PartInfo& I = info[pi];
+    for (int li = 0; li < (int)owner.limbs_.size(); li++)
+      if (owner.IsWornSlot(li)) I.worn = 1;
+    if (hit)
+      for (uint32_t w : hit->grid) I.gridMax = std::max(I.gridMax, w & kElecQueryGridPMax);
+    const uint32_t gridMax = I.gridMax;
+    const bool worn = I.worn != 0;
+    // PER BODY, ONCE (PLAN_fight64_perf M): whether it wears anything at all
+    // (no worn slot = no shell can be in any cell, so the shell tests below
+    // are false without looking), each slot's LimbHasShells, and the highest P
+    // in its answer's grid (no face can offer more, so a cell already reading
+    // it has nothing to look for across its faces). All three only skip work
+    // whose answer they already know.
+    std::vector<int8_t> slotShells(owner.limbs_.size(), -1);
+    for (uint32_t k = partBegin[pi]; k < partBegin[pi + 1]; k++) {
+      const Node& nd = nodes[k];
+      if (nd.entry == kIns) continue;
+      // COVERED: a body cell takes the world's charge across a face only when no
+      // WORN shell stands in the way -- no cell of a shell in its own world cell
+      // or in the world cell across that face (BurnLimbView::WornAlong's rule,
+      // at cell pitch). Otherwise the charge reaches it only THROUGH the shell:
+      // a leather sole stands between the foot and the plate, an iron one
+      // carries the plate's charge into it.
+      const bool body = nd.slot < owner.baseLimbs_;
+      auto shellAt = [&](IVec3 c) {
+        if (!worn) return false;
+        const auto r = cellRange(c);
+        for (const uint32_t* it = r.first; it != r.second; ++it) {
+          const Node& o = nodes[*it];
+          if (o.part == nd.part && o.slot != nd.slot && owner.IsWornSlot(o.slot)) return true;
         }
-        mats += " | coats";
-        for (uint32_t m : coats) mats += " " + std::to_string(m);
-        std::printf("shock-debug: tick %u mob %llu slot %d '%s' cell (%d,%d,%d) w (%d,%d,%d) "
-                    "entry %u bulk %u read P %u seed %d | exposed mats%s\n",
-                    tick, (unsigned long long)owner.id_, nd.slot, owner.SlotName(nd.slot).c_str(),
-                    dc.cells[nd.cell].c[0], dc.cells[nd.cell].c[1], dc.cells[nd.cell].c[2], nd.w.x,
-                    nd.w.y, nd.w.z, nd.entry, nd.bulk, wp, seed, mats.c_str());
+        return false;
+      };
+      if (body && shellAt(nd.w)) {
+        if (GridWord(hit, nd.w) & kElecQueryGridPMax) owner.shock_.covered++;
+        continue;
+      }
+      uint32_t wp = GridWord(hit, nd.w) & kElecQueryGridPMax;
+      // CONTACT: the six face cells, and -- across ONE air cell no part of this
+      // body fills -- the cell beyond. A body cell is a world-pitch BIN of
+      // voxels placed by its centre, so a sole resting on a plate can bin a
+      // cell above the one touching it (measured: elec-stun's zombie, every
+      // foot cell one air cell over the copper). Wave 1 dilated each limb box
+      // by a cell for the same reason; this is that slack, and no more.
+      // (Nothing past the grid's own maximum can be read: `wp` there is final.)
+      for (int f = 0; f < 6 && wp < gridMax; f++) {
+        const IVec3& d = kFace6[f];
+        const IVec3 n1{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
+        for (int step = 1; step <= 2; step++) {
+          const IVec3 n = step == 1 ? n1 : IVec3{n1.x + d.x, n1.y + d.y, n1.z + d.z};
+          if (step == 2) {
+            // Only across air...
+            if ((GridWord(hit, n1) & kElecQueryGridAir) == 0) break;
+          }
+          const uint32_t pnv = GridWord(hit, n) & kElecQueryGridPMax;
+          if (pnv <= wp) continue;
+          if (step == 2) {
+            // ...and not into the body's own cells. Asked only now that the
+            // far cell has something to offer: either refusal ends the face.
+            bool own = false;
+            const auto r = cellRange(n1);
+            for (const uint32_t* it = r.first; it != r.second && !own; ++it)
+              own = nodes[*it].part == nd.part;
+            if (own) break;
+          }
+          // A shell cell in the way, or a shell met on the way there
+          // (Mob::WornShellAlong, the burn pass's ray: a limb is a rounded tube
+          // in a garment cut to its box, and the two lattices' world-pitch
+          // cells need not line up).
+          bool behind = body && (shellAt(n1) || (step == 2 && shellAt(n)));
+          int8_t& hasShells = slotShells[(size_t)nd.slot];
+          if (body && !behind && hasShells < 0) hasShells = owner.LimbHasShells(nd.slot) ? 1 : 0;
+          if (body && !behind && hasShells > 0) {
+            uint32_t sm = 0;
+            behind = owner.WornShellAlong(nd.slot, nd.atNow, Vec3{(float)d.x, (float)d.y, (float)d.z},
+                                          (float)step, kCoverMarchMax, &sm, nullptr) >= 0;
+          }
+          if (behind) owner.shock_.covered++;
+          else wp = pnv;
+        }
+      }
+      const int32_t seed =
+          (int32_t)wp - (int32_t)nd.entry - (int32_t)(((uint64_t)wp * nd.spreadQ) >> 12);
+      if (seed > 0) {
+        P[k] = seed;
+        partSeeded[pi] = 1;
+        // ATTRIBUTION (CLAUDE.md rule 6): which rig slots took the world's
+        // charge directly.
+        owner.shock_.seededSlots |= 1ull << (nd.slot < 63 ? nd.slot : 63);
+        // SANDVOX_SHOCK_DEBUG=1: every seeded cell of a body's first seeded tick
+        // -- where it is, what it is made of, what it read (diagnostic only;
+        // the phases run serially, in node order, while it is set).
+        if (dbgSeed && owner.shock_.firstTick == 0 && owner.shock_.ticks == 0) {
+          std::string mats;
+          BurnLimbView dv = owner.ViewOf(owner.limbs_[nd.slot]);
+          const ElecSlotCache& dc = owner.elecCache_[nd.slot];
+          std::vector<uint32_t> seen;
+          for (size_t i = 0; i < dv.Size() && i < dc.vcell.size(); i++)
+            if (dc.vcell[i] == nd.cell && dc.vexp[i] &&
+                std::find(seen.begin(), seen.end(), dv.Mat(i)) == seen.end())
+              seen.push_back(dv.Mat(i));
+          for (uint32_t m : seen) mats += " " + std::to_string(m);
+          std::vector<uint32_t> coats;
+          for (size_t i = 0; i < dv.Size() && i < dc.vcell.size(); i++) {
+            const uint16_t st = dv.Stain(i);
+            if (dc.vcell[i] == nd.cell && dc.vexp[i] && BodyStainAmt(st) &&
+                std::find(coats.begin(), coats.end(), BodyStainMat(st)) == coats.end())
+              coats.push_back(BodyStainMat(st));
+          }
+          mats += " | coats";
+          for (uint32_t m : coats) mats += " " + std::to_string(m);
+          std::printf("shock-debug: tick %u mob %llu slot %d '%s' cell (%d,%d,%d) w (%d,%d,%d) "
+                      "entry %u bulk %u read P %u seed %d | exposed mats%s\n",
+                      tick, (unsigned long long)owner.id_, nd.slot, owner.SlotName(nd.slot).c_str(),
+                      dc.cells[nd.cell].c[0], dc.cells[nd.cell].c[1], dc.cells[nd.cell].c[2], nd.w.x,
+                      nd.w.y, nd.w.z, nd.entry, nd.bulk, wp, seed, mats.c_str());
+        }
       }
     }
-  }
+    if (solveMode != 0) {
+      Adj& A = adjPool[pi];
+      const uint32_t n0 = partBegin[pi], n1 = partBegin[pi + 1];
+      A.begin.resize((size_t)(n1 - n0) + 1);
+      A.e.clear();
+      for (uint32_t k = n0; k < n1; k++) {
+        A.begin[k - n0] = (uint32_t)A.e.size();
+        forEdges(k, [&](uint32_t j, uint16_t cost) { A.e.push_back({j, cost}); });
+      }
+      A.begin[n1 - n0] = (uint32_t)A.e.size();
+    }
+  });
+  lap(3);
   // SANDVOX_SHOCK_DEBUG=1: a CHARGED box whose body took no seed -- where the
   // body sits in its box and what the grid holds under its lowest cell.
   static const bool shockDebug = std::getenv("SANDVOX_SHOCK_DEBUG") != nullptr;
   if (shockDebug) {
     for (uint32_t pi = 0; pi < parts.size(); pi++) {
       if (!parts[pi].charged) continue;
-      bool any = false;
+      const bool any = partSeeded[pi] != 0;
       int lowY = INT_MAX;
       IVec3 low{};
       for (uint32_t k = 0; k < nodes.size(); k++) {
         if (nodes[k].part != pi) continue;
-        any = any || P[k] > 0;
         if (nodes[k].w.y < lowY) {
           lowY = nodes[k].w.y;
           low = nodes[k].w;
@@ -709,48 +946,97 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       }
     }
   }
-  while (!pq.empty()) {
-    const int32_t pk = pq.top().first;
-    const uint32_t k = pq.top().second;
-    pq.pop();
-    if (pk != P[k]) continue;
-    const Node& nd = nodes[k];
-    const Part& p = parts[nd.part];
-    Mob& m = *p.m;
-    auto relax = [&](uint32_t j, uint16_t cost) {
-      if (cost == kIns) return;
-      const int32_t cand =
-          pk - (int32_t)cost - (int32_t)(((uint64_t)(uint32_t)pk * nodes[j].spreadQ) >> 12);
-      if (cand > P[j]) {
-        P[j] = cand;
-        pq.push({cand, j});
+
+  // ---- THE SOLVE: max-plus to the least fixpoint ---------------------------
+  // Every edge is f(x) = x - cost - (x * spreadQ >> 12) with cost >= 1: it
+  // strictly falls and never decreases in x. So the answer is the LEAST
+  // FIXPOINT above the seeds -- for every node, the best over every path from
+  // a seed -- and ANY order of relaxations that keeps going until nothing
+  // improves reaches it (a widest-path label-correcting search). That is
+  // what lets the schedule be chosen for speed: the result is the global
+  // binary-heap search's, bit for bit (SANDVOX_SHOCK_DIGEST prints a hash of
+  // every node's P to show it; SANDVOX_SHOCK_SOLVE=0 is that search, serial
+  // over every node through the hash, the reference arm).
+  uint64_t pushes = 0, pops = 0;
+  if (solveMode == 0) {
+    using QE = std::pair<int32_t, uint32_t>;
+    std::priority_queue<QE> q;
+    for (uint32_t k = 0; k < nodes.size(); k++)
+      if (P[k] > 0) {
+        q.push({P[k], k});
+        pushes++;
       }
-    };
-    // Inside the slot: the six lattice-cell neighbours, at their bulk resist.
-    const ElecSlotCache& c = m.elecCache_[nd.slot];
-    const ElecBodyCell& e = c.cells[nd.cell];
-    for (const IVec3& d : kFace6) {
-      const int x = e.c[0] + d.x - c.cmin.x, y = e.c[1] + d.y - c.cmin.y, z = e.c[2] + d.z - c.cmin.z;
-      if (x < 0 || y < 0 || z < 0 || x >= c.cdim.x || y >= c.cdim.y || z >= c.cdim.z) continue;
-      const int32_t ci = c.at[((size_t)z * c.cdim.y + y) * c.cdim.x + x];
-      if (ci >= 0) relax((uint32_t)(p.slotBase[nd.slot] + ci), c.cells[ci].bulk);
+    while (!q.empty()) {
+      const QE t = q.top();
+      q.pop();
+      pops++;
+      if (t.first != P[t.second]) continue;
+      const int32_t pk = t.first;
+      forEdges(t.second, [&](uint32_t j, uint16_t cost) {
+        const int32_t cand =
+            pk - (int32_t)cost - (int32_t)(((uint64_t)(uint32_t)pk * spreadQ[j]) >> 12);
+        if (cand > P[j]) {
+          P[j] = cand;
+          q.push({cand, j});
+          pushes++;
+        }
+      });
     }
-    // Across slots and bodies: the cells sharing this world cell or a face of
-    // it. A jointed limb of the same body is tissue continuing (bulk); a
-    // shell, an item or another body is a surface crossed (entry).
-    for (int f = -1; f < 6; f++) {
-      const IVec3 w = f < 0 ? nd.w : IVec3{nd.w.x + kFace6[f].x, nd.w.y + kFace6[f].y,
-                                           nd.w.z + kFace6[f].z};
-      const auto r = cellRange(w);
-      for (auto it = r.first; it != r.second; ++it) {
-        const uint32_t j = it->second;
-        const Node& o = nodes[j];
-        if (o.part == nd.part && o.slot == nd.slot) continue;
-        const bool tissue = o.part == nd.part && o.slot < m.baseLimbs_ && nd.slot < m.baseLimbs_;
-        relax(j, tissue ? o.bulk : o.entry);
+  } else {
+    // A BUCKET QUEUE PER COMPONENT, the components across the pool. Every
+    // edge strictly lowers P, so buckets are visited from the highest seed
+    // down, each once, and a pop is O(1) instead of a heap's log n.
+    std::vector<uint64_t> cPush(comps.size(), 0), cPop(comps.size(), 0);
+    par(comps.size(), [&](size_t ci) {
+      static thread_local std::vector<std::vector<uint32_t>> bucket;
+      int32_t top = 0;
+      for (uint32_t pi : comps[ci])
+        for (uint32_t k = partBegin[pi]; k < partBegin[pi + 1]; k++) top = std::max(top, P[k]);
+      if (top <= 0) return;
+      if (bucket.size() < (size_t)top + 1) bucket.resize((size_t)top + 1);
+      uint64_t pu = 0, po = 0;
+      for (uint32_t pi : comps[ci])
+        for (uint32_t k = partBegin[pi]; k < partBegin[pi + 1]; k++)
+          if (P[k] > 0) {
+            bucket[(size_t)P[k]].push_back(k);
+            pu++;
+          }
+      int32_t* Pp = P.data();
+      const uint16_t* sq = spreadQ.data();
+      for (int32_t b = top; b > 0; b--) {
+        std::vector<uint32_t>& B = bucket[(size_t)b];
+        // A relax pushes only into lower buckets, so B does not grow here.
+        for (size_t i = 0; i < B.size(); i++) {
+          const uint32_t k = B[i];
+          po++;
+          if (Pp[k] != b) continue;
+          const uint32_t pi = nodes[k].part;
+          const Adj& A = adjPool[pi];
+          const uint32_t lk = k - partBegin[pi];
+          for (uint32_t x = A.begin[lk]; x < A.begin[lk + 1]; x++) {
+            const uint32_t j = A.e[x].first;
+            const int32_t cand =
+                b - (int32_t)A.e[x].second - (int32_t)(((uint64_t)(uint32_t)b * sq[j]) >> 12);
+            if (cand > Pp[j]) {
+              Pp[j] = cand;
+              bucket[(size_t)cand].push_back(j);
+              pu++;
+            }
+          }
+        }
+        B.clear();
       }
+      cPush[ci] = pu;
+      cPop[ci] = po;
+    });
+    for (size_t ci = 0; ci < comps.size(); ci++) {
+      pushes += cPush[ci];
+      pops += cPop[ci];
     }
   }
+  shockCounters_.solvePushes += pushes;
+  shockCounters_.solvePops += pops;
+  lap(4);
 
   // ---- WHAT IT DOES: the materials' answer ----------------------------------
   auto q4 = [](float gain) {
@@ -762,12 +1048,150 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
   const uint32_t thrHi = ElecCrackleThreshold(tn.sim.elecCrackleArcP, crackleHiMat_, crackleHiSrc_);
   uint32_t ohmicLeft = kShockOhmicCellsPerTick, crackleLeft = kShockCrackleOpsPerTick;
 
+  // ---- THE ROLLS, DECIDED PER PART ACROSS THE POOL (round 3 K) -------------
+  // Every ohmic and crackle roll is an integer hash of (creature, slot, cell,
+  // tick) against the cell's P and its air faces; none reads a budget. So the
+  // rolls -- the six air lookups, the hashes, the crackle's face -- are taken
+  // here per part, and the serial pass below spends the two shared budgets on
+  // them in exactly the (part, slot, cell) order the inline loop did. A roll
+  // records only what that pass needs: the ohmic hit and its air face, and
+  // the crackle's material and first open in-window face (or that it rolled
+  // and found none, which spends and refuses nothing).
+  struct Roll {
+    int32_t li = 0, ci = 0;
+    bool ohm = false, ohmAir = false;
+    uint32_t crackleMat = 0;   // 0 = no crackle op
+    IVec3 crackleAt{};
+  };
+  std::vector<std::vector<Roll>> rolls(parts.size());
+  par(parts.size(), [&](size_t piz) {
+    const uint32_t pi = (uint32_t)piz;
+    const Part& p = parts[pi];
+    const Mob& mob = *p.m;
+    const uint32_t mobKey = (uint32_t)mob.id_ ^ (uint32_t)(mob.id_ >> 32);
+    std::vector<Roll>& out = rolls[pi];
+    for (int li = 0; li < (int)mob.limbs_.size() && li < (int)p.slotBase.size(); li++) {
+      if (p.slotBase[li] < 0) continue;
+      const ElecSlotCache& c = mob.elecCache_[li];
+      for (size_t ci = 0; ci < c.cells.size(); ci++) {
+        const uint32_t k = (uint32_t)p.slotBase[li] + (uint32_t)ci;
+        const int32_t pk = P[k];
+        if (pk <= 0) continue;
+        const ElecBodyCell& e = c.cells[ci];
+        const Node& nd = nodes[k];
+        // The air faces are read only by the ohmic roll (a cell with ohmic
+        // data under a live ignite gain) and by a crackle tier the cell's P
+        // reaches; a cell that can do neither skips the six lookups
+        // (PLAN_fight64_perf M) -- both rolls below then refuse it exactly as
+        // they would have.
+        const bool ohmicCan = e.ohmMat != 0 && e.ohmMat < matElec_.size() &&
+                              matElec_[e.ohmMat].igniteCap != 0 && igniteQ != 0 &&
+                              e.bulk != kIns;
+        const bool crackleCan = crackleQ != 0 && ((uint32_t)pk >= thrHi ? crackleHiMat_ != 0
+                                                  : (uint32_t)pk >= thrLo ? crackleLoMat_ != 0
+                                                                           : false);
+        if (!ohmicCan && !crackleCan) continue;
+        uint32_t air = 0;
+        for (const IVec3& d : kFace6)
+          air += airFor(pi, {nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z}) ? 1u : 0u;
+        const uint32_t cellKey = rng::Hash3(mobKey ^ (uint32_t)li * 0x9E3779B9u,
+                                            (uint32_t)(uint16_t)e.c[0] | ((uint32_t)(uint16_t)e.c[1] << 16),
+                                            (uint32_t)(uint16_t)e.c[2]);
+        Roll r;
+        r.li = li;
+        r.ci = (int32_t)ci;
+        // OHMIC: E = P x the cell's resist (the wet rule in it).
+        const ElecMat& em = e.ohmMat < matElec_.size() ? matElec_[e.ohmMat] : ElecMat{};
+        const uint32_t prod = air != 0 ? em.igniteInto : em.charInto;
+        if (e.ohmMat != 0 && prod != 0 && em.igniteCap != 0 && igniteQ != 0 && e.bulk != kIns) {
+          const uint64_t E = (uint64_t)pk * e.bulk;
+          const uint64_t lim = ((uint64_t)em.igniteCap << 4) / igniteQ;
+          uint64_t ch = E < lim ? (E * igniteQ) >> 4 : em.igniteCap;
+          ch = ch * (air + 2u) / 8u;
+          if (ch != 0 && rng::Hash3(cellKey ^ kOhmSalt, tick, 0x0A11u) % kReactChanceDen < ch) {
+            r.ohm = true;
+            r.ohmAir = air != 0;
+          }
+        }
+        // CRACKLE: over a tier's threshold, with an air face.
+        if (air != 0 && crackleQ != 0) {
+          uint32_t cm = 0, thr = 0;
+          if ((uint32_t)pk >= thrHi) {
+            cm = crackleHiMat_;
+            thr = thrHi;
+          } else if ((uint32_t)pk >= thrLo) {
+            cm = crackleLoMat_;
+            thr = thrLo;
+          }
+          if (cm != 0) {
+            const uint32_t ch = std::min<uint32_t>(
+                (uint32_t)(((uint64_t)((uint32_t)pk - thr) * crackleQ) >> 4), kElecCrackleCap);
+            const uint32_t rr = rng::Hash3(cellKey ^ kCrackleSalt, tick, 0xC4ACu);
+            if (ch != 0 && rr % kReactChanceDen < ch) {
+              const uint32_t rot = rr >> 12;
+              for (uint32_t f = 0; f < 6; f++) {
+                const IVec3& d = kFace6[(f + rot) % 6u];
+                const IVec3 n{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
+                if (!airFor(pi, n) || !world.CellInWindow(n)) continue;
+                r.crackleMat = cm;
+                r.crackleAt = n;
+                break;
+              }
+            }
+          }
+        }
+        if (r.ohm || r.crackleMat != 0) out.push_back(r);
+      }
+    }
+  });
+  lap(5);
+
+  // SANDVOX_SHOCK_DIGEST=1: one line per solved tick digesting every node's P
+  // and every decided roll, in node / part order -- the probe that shows a
+  // change to this pass's SCHEDULE left its answer alone (diagnostic only).
+  static const bool shockDigest = std::getenv("SANDVOX_SHOCK_DIGEST") != nullptr;
+  if (shockDigest) {
+    uint64_t hP = 1469598103934665603ull, hR = hP;
+    auto mix = [](uint64_t& h, uint64_t x) {
+      h ^= x;
+      h *= 1099511628211ull;
+    };
+    for (uint32_t k = 0; k < nodes.size(); k++) mix(hP, (uint64_t)(uint32_t)P[k] | ((uint64_t)k << 32));
+    for (uint32_t pi = 0; pi < parts.size(); pi++)
+      for (const Roll& r : rolls[pi]) {
+        mix(hR, ((uint64_t)pi << 40) | ((uint64_t)(uint32_t)r.li << 20) | (uint32_t)r.ci);
+        mix(hR, (uint64_t)r.ohm | ((uint64_t)r.ohmAir << 1) | ((uint64_t)r.crackleMat << 2));
+        mix(hR, CellKey(r.crackleAt));
+      }
+    size_t big = 0;
+    for (const auto& C : comps) big = std::max(big, C.size());
+    std::printf("shock-digest tick %u parts %zu nodes %zu comps %zu (largest %zu) P %016llx rolls %016llx\n",
+                tick, parts.size(), nodes.size(), comps.size(), big, (unsigned long long)hP,
+                (unsigned long long)hR);
+    // ...and, cumulative over the run, where the pass's time went (us per
+    // solved tick) and the solve's queue traffic. ("effects" is the previous
+    // tick's, and includes this printing.)
+    const ShockCounters& sc = shockCounters_;
+    const double calls = (double)std::max<uint64_t>(1, sc.applyCalls + 1);
+    std::printf("shock-phases us/tick: parts %.0f caches+nodes %.0f index %.0f comps %.0f seeds+edges %.0f "
+                "solve %.0f rolls %.0f effects %.0f | pushes %.0f pops %.0f\n",
+                sc.phaseNanos[7] / 1e3 / calls, sc.phaseNanos[0] / 1e3 / calls,
+                sc.phaseNanos[2] / 1e3 / calls, sc.phaseNanos[1] / 1e3 / calls,
+                sc.phaseNanos[3] / 1e3 / calls, sc.phaseNanos[4] / 1e3 / calls,
+                sc.phaseNanos[5] / 1e3 / calls, sc.phaseNanos[6] / 1e3 / calls,
+                sc.solvePushes / calls, sc.solvePops / calls);
+    const double pc = (double)std::max<uint64_t>(1, g_parStats.calls);
+    std::printf("shock-pool: %.1f calls/tick, per call: wall %.0f us, first task at %.0f us, "
+                "longest task %.0f us, task sum %.0f us\n",
+                g_parStats.calls / calls, g_parStats.wall / pc, g_parStats.first / pc,
+                g_parStats.maxTask / pc, g_parStats.sumTask / pc);
+  }
+
   for (uint32_t pi = 0; pi < parts.size(); pi++) {
     Part& p = parts[pi];
     Mob& mob = *p.m;
     if (!mob.alive_) continue;
     Mob::ShockRecord& rec = mob.shock_;
-    const uint32_t mobKey = (uint32_t)mob.id_ ^ (uint32_t)(mob.id_ >> 32);
 
     // Per slot: the hottest cell, what it feels, whether a worn conductor
     // carries charge.
@@ -907,83 +1331,28 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
 
     // ---- OHMIC HEATING AND CRACKLE, per body cell (E2's rules) -------------
     // Rolled for every charged cell of every slot, the shells and the held
-    // item included: a charged iron cuirass crackles, a wooden arm chars.
+    // item included: a charged iron cuirass crackles, a wooden arm chars. The
+    // rolls were decided above; the shared budgets are spent here, in order.
     std::vector<std::vector<std::pair<int32_t, bool>>> ohm(mob.limbs_.size());   // (cell, air)
-    for (int li = 0; li < (int)mob.limbs_.size(); li++) {
-      if (p.slotBase[li] < 0) continue;
-      const ElecSlotCache& c = mob.elecCache_[li];
-      for (size_t ci = 0; ci < c.cells.size(); ci++) {
-        const uint32_t k = (uint32_t)p.slotBase[li] + (uint32_t)ci;
-        const int32_t pk = P[k];
-        if (pk <= 0) continue;
-        const ElecBodyCell& e = c.cells[ci];
-        const Node& nd = nodes[k];
-        // The air faces are read only by the ohmic roll (a cell with ohmic
-        // data under a live ignite gain) and by a crackle tier the cell's P
-        // reaches; a cell that can do neither skips the six lookups
-        // (PLAN_fight64_perf M) -- both rolls below then refuse it exactly as
-        // they would have.
-        const bool ohmicCan = e.ohmMat != 0 && e.ohmMat < matElec_.size() &&
-                              matElec_[e.ohmMat].igniteCap != 0 && igniteQ != 0 &&
-                              e.bulk != kIns;
-        const bool crackleCan = crackleQ != 0 && ((uint32_t)pk >= thrHi ? crackleHiMat_ != 0
-                                                  : (uint32_t)pk >= thrLo ? crackleLoMat_ != 0
-                                                                           : false);
-        uint32_t air = 0;
-        if (ohmicCan || crackleCan)
-          for (const IVec3& d : kFace6)
-            air += airFor(pi, {nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z}) ? 1u : 0u;
-        const uint32_t cellKey = rng::Hash3(mobKey ^ (uint32_t)li * 0x9E3779B9u,
-                                            (uint32_t)(uint16_t)e.c[0] | ((uint32_t)(uint16_t)e.c[1] << 16),
-                                            (uint32_t)(uint16_t)e.c[2]);
-        // OHMIC: E = P x the cell's resist (the wet rule in it).
-        const ElecMat& em = e.ohmMat < matElec_.size() ? matElec_[e.ohmMat] : ElecMat{};
-        const uint32_t prod = air != 0 ? em.igniteInto : em.charInto;
-        if (e.ohmMat != 0 && prod != 0 && em.igniteCap != 0 && igniteQ != 0 && e.bulk != kIns) {
-          const uint64_t E = (uint64_t)pk * e.bulk;
-          const uint64_t lim = ((uint64_t)em.igniteCap << 4) / igniteQ;
-          uint64_t ch = E < lim ? (E * igniteQ) >> 4 : em.igniteCap;
-          ch = ch * (air + 2u) / 8u;
-          if (ch != 0 && rng::Hash3(cellKey ^ kOhmSalt, tick, 0x0A11u) % kReactChanceDen < ch) {
-            if (ohmicLeft > 0) {
-              ohmicLeft--;
-              ohm[li].push_back({(int32_t)ci, air != 0});
-            } else {
-              shockCounters_.ohmicRefused++;
-            }
-          }
-        }
-        // CRACKLE: over a tier's threshold, with an air face.
-        if (air == 0 || crackleQ == 0) continue;
-        uint32_t cm = 0, thr = 0;
-        if ((uint32_t)pk >= thrHi) {
-          cm = crackleHiMat_;
-          thr = thrHi;
-        } else if ((uint32_t)pk >= thrLo) {
-          cm = crackleLoMat_;
-          thr = thrLo;
-        }
-        if (cm == 0) continue;
-        const uint32_t ch = std::min<uint32_t>((uint32_t)(((uint64_t)((uint32_t)pk - thr) * crackleQ) >> 4),
-                                               kElecCrackleCap);
-        const uint32_t rr = rng::Hash3(cellKey ^ kCrackleSalt, tick, 0xC4ACu);
-        if (ch == 0 || rr % kReactChanceDen >= ch) continue;
-        const uint32_t rot = rr >> 12;
-        for (uint32_t f = 0; f < 6; f++) {
-          const IVec3& d = kFace6[(f + rot) % 6u];
-          const IVec3 n{nd.w.x + d.x, nd.w.y + d.y, nd.w.z + d.z};
-          if (!airFor(pi, n) || !world.CellInWindow(n)) continue;
-          if (crackleLeft == 0 || cellOps.size() >= kMaxCellOpsPerTick) {
-            shockCounters_.crackleRefused++;
-            break;
-          }
-          crackleLeft--;
-          cellOps.push_back({World::SlotCellIndex(n), PackVoxNew(cm, 0u) | kCellOpIfAir});
-          shockCounters_.crackleOps++;
-          rec.crackles++;
-          break;
+    for (const Roll& r : rolls[pi]) {
+      if (r.li >= (int)ohm.size()) continue;
+      if (r.ohm) {
+        if (ohmicLeft > 0) {
+          ohmicLeft--;
+          ohm[r.li].push_back({r.ci, r.ohmAir});
+        } else {
+          shockCounters_.ohmicRefused++;
         }
       }
+      if (r.crackleMat == 0) continue;
+      if (crackleLeft == 0 || cellOps.size() >= kMaxCellOpsPerTick) {
+        shockCounters_.crackleRefused++;
+        continue;
+      }
+      crackleLeft--;
+      cellOps.push_back({World::SlotCellIndex(r.crackleAt), PackVoxNew(r.crackleMat, 0u) | kCellOpIfAir});
+      shockCounters_.crackleOps++;
+      rec.crackles++;
     }
     // The rewrite: every voxel of a rolled cell whose material the current
     // changes (its own electric.ignite.into with an air face, its char
@@ -1021,6 +1390,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
       mob.MarkInstancesDirty();
     }
   }
+  lap(6);
 }
 
 // One rig slot's lattice at world pitch (ElecSlotCache), refreshed for this
@@ -1075,8 +1445,17 @@ int MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_
     for (size_t i = 0; i < n; i++)
       if (v.Mat(i) != 0) occ[at(v.At(i))] = 1;
     const int si = (int)s;
-    c.cmin = {FloorDiv(mn.x, si), FloorDiv(mn.y, si), FloorDiv(mn.z, si)};
-    const IVec3 cmax{FloorDiv(mx.x, si), FloorDiv(mx.y, si), FloorDiv(mx.z, si)};
+    // A power-of-two scale (every authored one) floors by an arithmetic shift
+    // -- the same answer as FloorDiv, negative coordinates included -- rather
+    // than a division per axis per voxel, twice (round 3 K).
+    int sh = -1;
+    if ((s & (s - 1)) == 0) {
+      sh = 0;
+      while ((1u << sh) != s) sh++;
+    }
+    auto fdiv = [&](int a) { return sh >= 0 ? (a >> sh) : FloorDiv(a, si); };
+    c.cmin = {fdiv(mn.x), fdiv(mn.y), fdiv(mn.z)};
+    const IVec3 cmax{fdiv(mx.x), fdiv(mx.y), fdiv(mx.z)};
     c.cdim = {cmax.x - c.cmin.x + 1, cmax.y - c.cmin.y + 1, cmax.z - c.cmin.z + 1};
     c.at.assign((size_t)c.cdim.x * c.cdim.y * c.cdim.z, -1);
     // Cells in (z, y, x) order: the first voxel to land in a cell does not
@@ -1084,8 +1463,8 @@ int MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_
     for (size_t i = 0; i < n; i++) {
       if (v.Mat(i) == 0) continue;
       const IVec3 a = v.At(i);
-      const size_t k = ((size_t)(FloorDiv(a.z, si) - c.cmin.z) * c.cdim.y +
-                        (FloorDiv(a.y, si) - c.cmin.y)) * c.cdim.x + (FloorDiv(a.x, si) - c.cmin.x);
+      const size_t k = ((size_t)(fdiv(a.z) - c.cmin.z) * c.cdim.y +
+                        (fdiv(a.y) - c.cmin.y)) * c.cdim.x + (fdiv(a.x) - c.cmin.x);
       c.at[k] = 0;
     }
     for (size_t k = 0; k < c.at.size(); k++) {
@@ -1100,8 +1479,8 @@ int MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_
     for (size_t i = 0; i < n; i++) {
       if (v.Mat(i) == 0) continue;
       const IVec3 a = v.At(i);
-      const size_t k = ((size_t)(FloorDiv(a.z, si) - c.cmin.z) * c.cdim.y +
-                        (FloorDiv(a.y, si) - c.cmin.y)) * c.cdim.x + (FloorDiv(a.x, si) - c.cmin.x);
+      const size_t k = ((size_t)(fdiv(a.z) - c.cmin.z) * c.cdim.y +
+                        (fdiv(a.y) - c.cmin.y)) * c.cdim.x + (fdiv(a.x) - c.cmin.x);
       c.vcell[i] = c.at[k];
       for (const IVec3& f : kFace6) {
         const IVec3 b{a.x + f.x, a.y + f.y, a.z + f.z};
@@ -1128,9 +1507,60 @@ int MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_
   uint32_t wetG[16];
   for (uint32_t a = 0; a < 16; a++) wetG[a] = a ? Conductance(ElecWetResist(wet, a)) : 0u;
   const size_t nm = matElecResist_.size();
+  // ...and each MATERIAL's own conductance and "is a conducting coat", once a
+  // call rather than a 64-bit division per voxel (round 3 K: the division was
+  // most of a re-accumulation). Thread-local: refreshes run on the pool.
+  static thread_local std::vector<uint32_t> matG;
+  static thread_local std::vector<uint8_t> coatConducts;
+  matG.resize(nm);
+  coatConducts.resize(nm);
+  for (size_t m = 0; m < nm; m++) {
+    matG[m] = Conductance(matElecResist_[m] ? matElecResist_[m] : kIns);
+    coatConducts[m] = matElecResist_[m] != 0 ? 1 : 0;
+  }
+  const uint32_t* matGp = matG.data();
+  const uint8_t* coatCp = coatConducts.data();
   auto accumulate = [&]() -> uint64_t {
     acc.assign(c.cells.size(), Acc{});
     uint64_t h = GeomMix(GeomMix(1469598103934665603ull, n), s);
+    // THE CELL'S SUMS IN REGISTERS WHILE THE CELL LASTS (round 3 K). Voxels
+    // come in lattice order, so a run of them lands in one cell; adding each
+    // into the cell's record in memory made every voxel wait on the last one's
+    // store. The run is summed locally and folded in when the cell changes:
+    // the same integer sums, and the ohmic materials folded in the order they
+    // first appeared -- which is the order the per-voxel loop met them, so a
+    // cell's four slots fill (and refuse a fifth) exactly as they did.
+    struct Loc {
+      int32_t ci = -1;
+      uint32_t n = 0, ns = 0, feel = 0;
+      uint64_t g = 0, gs = 0;
+      int nom = 0;
+      uint16_t om[8];
+      uint32_t oc[8];
+    } L;
+    auto fold = [&]() {
+      if (L.ci < 0) return;
+      Acc& e = acc[(size_t)L.ci];
+      e.n += L.n;
+      e.ns += L.ns;
+      e.feel += L.feel;
+      e.g += L.g;
+      e.gs += L.gs;
+      for (int t = 0; t < L.nom; t++)
+        for (int k = 0; k < 4; k++)
+          if (e.om[k] == L.om[t] || e.om[k] == 0) {
+            e.om[k] = L.om[t];
+            e.oc[k] += L.oc[t];
+            break;
+          }
+      L.n = L.ns = L.feel = 0;
+      L.g = L.gs = 0;
+      L.nom = 0;
+    };
+    const size_t nme = matElec_.size();
+    const ElecMat* mel = matElec_.data();
+    const int32_t* vc = c.vcell.data();
+    const uint8_t* ve = c.vexp.data();
     auto run = [&](const auto* vx, auto matOf) {
       for (size_t i = 0; i < n; i++) {
         const auto& q = vx[i];
@@ -1139,36 +1569,47 @@ int MobSystem::RefreshElecSlotCache(const BurnLimbView& v, uint32_t wet, uint32_
                            ((uint64_t)((uint32_t)(int32_t)q.y & 0xFFFFu) << 16) |
                            ((uint64_t)((uint32_t)(int32_t)q.z & 0xFFFFu) << 32) |
                            ((uint64_t)(m != 0) << 48));
-        const int32_t ci = c.vcell[i];
+        const int32_t ci = vc[i];
         if (m == 0 || ci < 0) continue;
-        uint32_t gv = m < nm ? Conductance(matElecResist_[m] ? matElecResist_[m] : kIns) : 0u;
+        if (ci != L.ci) {
+          fold();
+          L.ci = ci;
+        }
+        uint32_t gv = m < nm ? matGp[m] : 0u;
         const uint16_t st = q.stain;
         const uint32_t amt = BodyStainAmt(st);
         if (amt != 0) {
           const uint32_t cm = BodyStainMat(st);
-          if (cm != 0 && cm < nm && matElecResist_[cm] != 0) gv = std::max(gv, wetG[std::min(amt, 15u)]);
+          if (cm != 0 && cm < nm && coatCp[cm]) gv = std::max(gv, wetG[std::min(amt, 15u)]);
         }
-        Acc& e = acc[(size_t)ci];
-        e.n++;
-        e.g += gv;
-        if (c.vexp[i]) {
-          e.ns++;
-          e.gs += gv;
+        L.n++;
+        L.g += gv;
+        if (ve[i]) {
+          L.ns++;
+          L.gs += gv;
         }
-        if (m < matElec_.size()) {
-          const ElecMat& em = matElec_[m];
-          e.feel += em.feel;
+        if (m < nme) {
+          const ElecMat& em = mel[m];
+          L.feel += em.feel;
           if (em.igniteInto != 0 || em.charInto != 0) {
-            for (int k = 0; k < 4; k++) {
-              if (e.om[k] == m || e.om[k] == 0) {
-                e.om[k] = (uint16_t)m;
-                e.oc[k]++;
-                break;
+            int t = 0;
+            while (t < L.nom && L.om[t] != m) t++;
+            if (t == L.nom) {
+              if (L.nom == 8) {
+                // More distinct ohmic materials in one run than the local list
+                // holds: fold what came first, in order, and go on.
+                fold();
+                t = 0;
               }
+              L.om[t] = (uint16_t)m;
+              L.oc[t] = 0;
+              L.nom = t + 1;
             }
+            L.oc[t]++;
           }
         }
       }
+      fold();
     };
     if (v.skin) run(v.skin->data(), [](const PrefabVoxel& q) { return (uint32_t)q.material; });
     else run(v.coll->data(), [](const DebrisVoxel& q) { return (uint32_t)q.payload; });

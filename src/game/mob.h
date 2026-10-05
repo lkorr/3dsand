@@ -1391,6 +1391,12 @@ struct StainPre {
   // The index + surface the plan sweeps over when the limb holds none of its
   // own yet (built here, thrown away; the apply builds the real one).
   bool useScratch = false;
+  // The walk found something but the surface size needs that scratch build:
+  // DEFERRED to the bound (planMode 3), which asks it only of the limbs the
+  // pot reaches -- most of a crowd's limbs never get a share, and building
+  // their scratch index every tick to learn a size nobody read was the plan's
+  // largest cost (PLAN_fight64_perf round 3 K).
+  bool needNs = false;
   BodyBurnState scratch;
 };
 
@@ -4326,8 +4332,11 @@ class Mob {
   std::vector<StainPre> stainPre_;
   uint32_t stainPreTick_ = 0;
   // Plan every limb's contact staining for this tick (a work-pool task: writes
-  // only stainPre_). StainTick plays the plans.
-  void PlanStainContact(uint32_t tick, World& world, int planMode);
+  // only stainPre_). StainTick plays the plans. `onlyLimb` >= 0 plans that
+  // limb alone, -2 every limb under a worn shell (one task per creature: the
+  // shell march index is the creature's); planMode 3 takes ONE limb: its
+  // deferred surface size (StainPre::needNs).
+  void PlanStainContact(uint32_t tick, World& world, int planMode, int onlyLimb = -1);
 
  protected:
   // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
@@ -4535,8 +4544,10 @@ class Mob {
   // it rinsed off by a washing liquid. Sleeps at the cost of the walk when
   // nothing is near. `budget` is lattice cells this call may visit;
   // `rainBudget` is rain's own pot (MobSystem::kRainLatticePerTick).
+  // `deferRecount`: leave the tail RecountCoat to the caller (StainLimbs
+  // takes the living crowd's recounts across the pool after its loop).
   void StainTick(uint32_t tick, World& world, uint32_t& budget,
-                 uint32_t& rainBudget);
+                 uint32_t& rainBudget, bool deferRecount = false);
   // Replay one queued burst against this creature's limbs: each droplet that
   // would land on a limb marks the voxel where it lands.
   // `sink` non-null: the work-pool form (SplatSink); `eventIndex` tags what it
@@ -6375,6 +6386,11 @@ class MobSystem {
     uint64_t crackleOps = 0, crackleRefused = 0;
     // Wall time ApplyShocks spent on ticks with answers (diagnostic only).
     uint64_t applyNanos = 0, applyCalls = 0, refreshNanos = 0;
+    // ApplyShockTick by phase (round 3 K, diagnostic only): the caches, the
+    // node lists, the components, the seeds, the solve, the rolls, the
+    // effects; and the solve's queue traffic.
+    uint64_t phaseNanos[8] = {};   // [7]: the parts list, before the caches
+    uint64_t solvePushes = 0, solvePops = 0, solveRounds = 0;
   };
   // Per tick: body cells an ohmic roll may rewrite, and crackle cell ops all
   // bodies together may emit (charged BEFORE emission, refusals counted).
@@ -7492,7 +7508,9 @@ class MobSystem {
   // same `pre` plays it up to the budget's count.
   // planMode 1: the walk and the surface size only; 2: the sweep of the first
   // pre->kPlanned samples over what mode 1 left (MobSystem::StainLimbs runs 1
-  // for every limb, bounds each limb's possible share of the pot, then 2).
+  // for every limb, bounds each limb's possible share of the pot, then 2);
+  // 3: the surface size mode 1 deferred (StainPre::needNs), for a limb the
+  // pot's bound actually reaches.
   bool StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                     World& world, uint32_t& budget, StainPre* pre = nullptr,
                     int planMode = 0);

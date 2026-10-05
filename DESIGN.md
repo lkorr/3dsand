@@ -2524,7 +2524,10 @@ held charge is SOLVED as the world would solve the same voxels:
   with package A's SPREADING LOSS on every entry (`prev x min((n - `sim.elecSpreadFree`) x `sim.elecSpreadLoss`, 4095) / 4096`, n = the cell's
   conducting neighbours in its own slot -- `elecEnter`),
   solved to its least fixpoint by a widest-path search (integer; the answer
-  does not depend on visit order). The world P comes from the grid; nothing is
+  does not depend on visit order -- since fight64 round 3 K a bucket queue
+  over edges the seeds' pool tasks wrote down, `SANDVOX_SHOCK_SOLVE=0` the
+  global binary-heap reference; see "Shocks, stain, bleed: the same fight in
+  less time"). The world P comes from the grid; nothing is
   stored between ticks (the body's charge fades with the world's). The body's
   cells are placed with the pose it ASKED with (`Mob::elecPoses_`, a ring of
   K + 3 per-slot transforms keyed by tick): the answer is K + 1 ticks old,
@@ -12239,7 +12242,9 @@ mirror and the creature's own lattice:
 - Burn: `PrecomputeBurnWalks` takes each limb's sleep-key world digest and
   hot-cell walk (`BurnWalkPre`); `BurnOneLimb` uses them only for the very box
   it computes and issues the recorded chunk fetches in walk order.
-- Contact staining (`StainPre`): mode 1 is each limb's walk and surface size;
+- Contact staining (`StainPre`): mode 1 is each limb's walk and surface size
+  (since round 3 K the size is deferred to mode 3 for a limb with no index or
+  surface of its own, asked only of the limbs the bound reaches);
   then both pots are spent in their exact order, contact only, to bound each
   limb's possible share (the dry / wet passes only take more out, and a share
   never shrinks as the pot grows); mode 2 sweeps that many samples, recording
@@ -12466,6 +12471,64 @@ digests are identical across `SANDVOX_MOB_THREADS=1` and the default. The
 Left inside burnLimbs:
 - the joint-twin sync, about 1 ms (`twinPrep` + `twinSync`, package K's);
 - the walks ahead, 0.23 ms.
+
+**Shocks, stain, bleed: the same fight in less time (2026-10-05, fight64
+round 3 package K).** Every change below is exact: `mob-cap64`'s per-tick hp /
+position digests are b21d23a's, with the default pool and with
+`SANDVOX_MOB_THREADS=1`, and the shock solve's own per-tick digest
+(`SANDVOX_SHOCK_DIGEST=1`: a hash of every node's P and every decided roll) is
+the same under every schedule and under `SANDVOX_SHOCK_SOLVE=0`, the serial
+global binary-heap search kept as the reference arm.
+
+- *Connected components found nothing to split.* The plan's ranked item 4 was
+  "solve the components in parallel"; measured, the brawl's charged bodies
+  and the bodies touching them are ONE pressed mass (26 of 28 parts, every
+  tick). `ApplyShockTick` still splits by cell box (it is free, and separate
+  puddles or rooms do split), but the gain came from elsewhere.
+- *The max-plus fixpoint does not care about order* (every edge is
+  `x - cost - (x * spreadQ >> 12)`, cost >= 1: strictly falling, never
+  decreasing in x), so the schedule is chosen for speed and the answer stays
+  bit for bit. The seeds' tasks (one per part, across the pool) also WRITE
+  DOWN every node's edges -- (target, cost), the same hash probes the solve
+  used to make per settled node -- and the serial solve is then a bucket queue
+  (every edge lowers P, so buckets are visited once, top down) over flat
+  arrays. Solve 670 -> 120 us a solved tick.
+- *Fewer, longer pool calls.* `SANDVOX_SHOCK_DIGEST`'s `shock-pool` line times
+  every call: ~100 us of wake and join on top of the longest task. The cache
+  refresh and the node layout are one call (one task per slot, longest first:
+  a slot whose cache must be rebuilt walks its lattice three times), the
+  seeds and edges one, the rolls one (ohmic and crackle are integer hashes;
+  the two shared budgets are still spent serially in the old (part, slot,
+  cell) order). The world-cell index is bucketed by count, not sorted.
+- `RefreshElecSlotCache`: a per-material conductance table (it was a 64-bit
+  division per voxel), a cell's sums kept in registers while the lattice's
+  voxels stay in it (ohmic materials folded in first-seen order, so a cell's
+  four slots fill exactly as before), and a shift for power-of-two scales.
+- Contact staining: the plan's surface size is DEFERRED (`StainPre::needNs`,
+  plan mode 3) to the limbs the pot's bound actually reaches, in pool batches
+  -- the plan used to build a scratch burn index for every limb near anything,
+  every tick, to learn a size only ~68 limbs a tick could use. The sweep is one
+  task per limb with a share (shelled limbs stay one task per creature: the
+  worn march index is the creature's); the living crowd's `RecountCoat` runs
+  across the pool after the loop (nothing in the loop reads another
+  creature's ledger); `TallyCoat`'s sole is a dense column grid.
+- `Mob::Damage` asks `ShellMaterialAt` (a scan of the struck limb) only when a
+  reader needs it -- an edge, knocked-out matter, a bleed; an Electric hit
+  reads none. `SoakCut` without a carve set (the wound re-blood) is one pass
+  over the lattice with a bitmap of the sphere's box, not three and the
+  limb's.
+
+Measured (`mob-cap64`, `SANDVOX_RUN_EXCLUSIVE=1`, alternating boots, b21d23a
+exe vs this branch): shocks 2.15 -> 1.17 ms, stain 2.23 -> 1.77
+(stainContact 0.99 -> 0.91), bleed 0.57 -> 0.51; mob side 14.13 -> 12.63; tick
+wall 31.42 / 39.3 / 46.1 -> 29.62 / 37.5 / 42.1 (mean / p95 / worst).
+Splatter (0.46) and twinSync (0.41) unchanged. LEFT: the pool's own ~100 us a
+call (workers sleep on a condition variable between calls; a short spin
+before sleeping, on both the workers and the joining caller, would take most
+of it off every parallel phase of the mob tick); the slot caches'
+re-accumulation (~88 a tick, every `kElecSlotRefreshTicks` = 4 ticks while
+charged -- a longer cadence is a behaviour change); `DownsampleSkin` after a
+re-blood.
 
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
