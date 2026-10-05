@@ -721,6 +721,22 @@ uint64_t g_frameRbDeclines = 0;      // readback requests the ring refused
 // the GPU still owed two or more snapshot readbacks. Sim time dilates by that
 // many ticks instead of the frame stalling on a fence.
 uint64_t g_ticksThrottled = 0;
+// ---- THE CPU TICK BUDGET (docs/PLAN_fight64_perf.md round 3, package F) ----
+// The GPU-lag throttle above stops a second tick when the GPU is behind; the
+// tick budget stops it when the CPU is: after a frame's first tick, another
+// runs only if `spentTickMs + lastTickMs <= kTickDt`. These count what it did.
+//   g_tickBudgetStops  frames where the budget refused a further owed tick;
+//   g_ticksDropped*    tick DEBT thrown away (sim time the world did not
+//                      live), by the door it left through, in ticks;
+//   g_frameTickHist    frames by ticks run (0, 1, 2, 3, 4+);
+//   g_tickWallMs       each real-loop tick's wall, readback pump included.
+// SANDVOX_NO_TICK_BUDGET=1 is the A/B arm (the pre-budget loop).
+uint64_t g_tickBudgetStops = 0;
+double g_ticksDroppedBudget = 0.0;
+double g_ticksDroppedThrottle = 0.0;
+double g_ticksDroppedCap = 0.0;
+uint64_t g_frameTickHist[5] = {};
+std::vector<double> g_tickWallMs;
 // ---- THE CASCADE REFILL, AS ENTRIES AND NOT AS A MEAN (CLAUDE.md rule 6) ---
 // `farField` on the GPU table is one mean over the whole run and it cannot
 // distinguish 'the refill finished cheaply' from 'the refill never finished'.
@@ -797,6 +813,9 @@ struct BodyRenderStats {
   uint64_t frames = 0, builds = 0, instBytes = 0, microPoolBytes = 0;
   uint64_t cubeDraws = 0, cubeInstDrawn = 0, cubeInstLive = 0;
   double buildUs = 0, buildMaxUs = 0, listUs = 0, commitUs = 0;
+  // UploadMicroBodies (the brick pool's dirty word ranges), timed apart from
+  // the build: it runs before bodyT0 and was in no row but renderCpu.
+  double microUploadUs = 0, microUploadMaxUs = 0;
 };
 BodyRenderStats g_bodyStats;
 int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
@@ -9207,6 +9226,9 @@ int main(int argc, char** argv) {
       static int phase = 0;  // 0 wait, 1 settling, 2 fighting
       static uint32_t t1 = 0, tFight = 0;
       static size_t winFrame0 = 0;
+      static std::chrono::steady_clock::time_point tWall0{};
+      static uint64_t stops0 = 0, throttled0 = 0;
+      static double dropB0 = 0, dropT0 = 0, dropC0 = 0;
       auto envInt = [](const char* n, int d) {
         const char* e = std::getenv(n);
         return e ? std::atoi(e) : d;
@@ -9284,6 +9306,15 @@ int main(int argc, char** argv) {
         g_frameGpuPassSeries.clear();
         g_frameGpuFrames = 0;
         winFrame0 = 0;
+        // The pacing counters, from the first blow (see g_tickBudgetStops).
+        tWall0 = std::chrono::steady_clock::now();
+        g_tickWallMs.clear();
+        for (uint64_t& h : g_frameTickHist) h = 0;
+        stops0 = g_tickBudgetStops;
+        throttled0 = g_ticksThrottled;
+        dropB0 = g_ticksDroppedBudget;
+        dropT0 = g_ticksDroppedThrottle;
+        dropC0 = g_ticksDroppedCap;
         burnprof::Get().on = true;
         burnprof::Reset();
         std::printf("--brawl: FIGHT at tick %u for %u ticks\n", tick, fightTicks);
@@ -9307,6 +9338,44 @@ int main(int argc, char** argv) {
       if (tick >= tFight + fightTicks) {
         burnprof::Get().on = false;
         g_brawlDone = true;
+        // THE PACING LINE: what the real loop made of the fight. Sim rate is
+        // ticks over wall from the first blow; every tick the world did not
+        // live is in a `dropped` column by the door it left through.
+        const double wallS = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - tWall0).count();
+        const uint32_t ran = tick - tFight;
+        std::vector<double> tw = g_tickWallMs;
+        std::sort(tw.begin(), tw.end());
+        double twSum = 0;
+        for (double v : tw) twSum += v;
+        auto twp = [&](double p) {
+          return tw.empty() ? 0.0 : tw[(size_t)(p * (double)(tw.size() - 1))];
+        };
+        std::printf("--brawl: pacing: %u ticks in %.2f s = %.1f ticks/s (sim at "
+                    "%.0f%% of real time) | frames by ticks run 0:%llu 1:%llu "
+                    "2:%llu 3:%llu 4:%llu | tick wall in the frame mean %.2f p50 "
+                    "%.2f p95 %.2f max %.2f ms | dropped ticks %.1f (budget %.1f "
+                    "over %llu stops, gpu throttle %.1f over %llu, 4-tick cap "
+                    "%.1f) | budget %s\n",
+                    ran, wallS, wallS > 0 ? ran / wallS : 0.0,
+                    wallS > 0 ? 100.0 * ran / wallS / 30.0 : 0.0,
+                    (unsigned long long)g_frameTickHist[0],
+                    (unsigned long long)g_frameTickHist[1],
+                    (unsigned long long)g_frameTickHist[2],
+                    (unsigned long long)g_frameTickHist[3],
+                    (unsigned long long)g_frameTickHist[4],
+                    tw.empty() ? 0.0 : twSum / (double)tw.size(), twp(0.5),
+                    twp(0.95), tw.empty() ? 0.0 : tw.back(),
+                    (g_ticksDroppedBudget - dropB0) +
+                        (g_ticksDroppedThrottle - dropT0) +
+                        (g_ticksDroppedCap - dropC0),
+                    g_ticksDroppedBudget - dropB0,
+                    (unsigned long long)(g_tickBudgetStops - stops0),
+                    g_ticksDroppedThrottle - dropT0,
+                    (unsigned long long)(g_ticksThrottled - throttled0),
+                    g_ticksDroppedCap - dropC0,
+                    std::getenv("SANDVOX_NO_TICK_BUDGET") ? "OFF (A/B arm)" : "on");
+        std::fflush(stdout);
       }
     };
   }
@@ -13564,8 +13633,10 @@ int main(int argc, char** argv) {
     // snapshot ring must cover every tick that can be in flight), so a literal
     // here would silently under-size the ring.
     constexpr int kMaxTicksPerFrame = World::kMaxTicksPerFrame;
-    if (accumulator > kMaxTicksPerFrame * kTickDt)
+    if (accumulator > kMaxTicksPerFrame * kTickDt) {
+      g_ticksDroppedCap += (accumulator - kMaxTicksPerFrame * kTickDt) / kTickDt;
       accumulator = kMaxTicksPerFrame * kTickDt;
+    }
     // SANDVOX_TICKS_PER_FRAME: exactly n ticks this frame, whatever the clock
     // says. See HarnessTicksPerFrame's comment for why the harness needs it.
     const int fixedTicksPerFrame = HarnessTicksPerFrame();
@@ -13996,7 +14067,43 @@ int main(int argc, char** argv) {
     // ...and one cascade-refill slice per frame, for the same reason
     // (farfield.h BeginFrame).
     far.BeginFrame();
+    // The CPU tick budget's two inputs (see g_tickBudgetStops): the wall this
+    // frame's ticks have spent so far, and the last one's, as the forecast of
+    // what the next would cost.
+    double spentTickMs = 0.0, lastTickMs = 0.0;
+    std::chrono::steady_clock::time_point tickT0{};
     while (accumulator >= kTickDt && ticksThisFrame < kMaxTicksPerFrame) {
+      // ---- THE CPU TICK BUDGET: a second tick only if the CPU can afford it.
+      //
+      // The 4-tick catch-up is right for a HITCH (one slow frame, the world
+      // owes a few cheap ticks). It is the spiral when the TICK itself is the
+      // slow part: a 30 ms tick in a frame that also renders leaves more than
+      // one tick of debt, so the next frame runs two (60 ms), which owes
+      // more, up to the cap. Round 1 measured `--brawl` frames climbing from
+      // ~30 to ~180 ms that way. So after the first tick, another runs only if
+      // `spent + last <= kTickDt` — the frame would still fit in one tick
+      // period — and otherwise the surplus debt is DROPPED (kept at one tick,
+      // exactly as the GPU throttle below does): sim time slows to what the
+      // machine can tick instead of the frame rate collapsing.
+      //
+      // Pure pacing, like the throttle: which ticks run and what they compute
+      // is unchanged; only how many fit in one frame. The headless harnesses
+      // have no frame loop, SANDVOX_TICKS_PER_FRAME bypasses it (a fixed tick
+      // schedule must not depend on how fast this machine is), and a
+      // lockstep session breaks WITHOUT dropping debt: the peer's clock is
+      // the tick clock there, and the 4-tick cap already bounds the backlog.
+      // SANDVOX_NO_TICK_BUDGET=1 is the A/B arm.
+      static const bool noTickBudget = std::getenv("SANDVOX_NO_TICK_BUDGET") != nullptr;
+      if (ticksThisFrame > 0 && !noTickBudget && fixedTicksPerFrame == 0 &&
+          spentTickMs + lastTickMs > (double)kTickDt * 1000.0) {
+        g_tickBudgetStops++;
+        if (!netPaced) {
+          g_ticksDroppedBudget +=
+              std::max(0.0, accumulator - (double)kTickDt) / (double)kTickDt;
+          accumulator = std::min(accumulator, (double)kTickDt);
+        }
+        break;
+      }
       // ---- THE GPU-LAG THROTTLE: a second tick only if the GPU can take it.
       //
       // The 4-tick catch-up above is Gaffer's clamp and it is right for a CPU
@@ -14035,6 +14142,8 @@ int main(int argc, char** argv) {
         constexpr int kGpuLagThrottleTicks = 2;
         if (ctx.PendingMapCount() >= kGpuLagThrottleTicks) {
           g_ticksThrottled++;
+          g_ticksDroppedThrottle +=
+              std::max(0.0, accumulator - (double)kTickDt) / (double)kTickDt;
           accumulator = std::min(accumulator, (double)kTickDt);
           break;
         }
@@ -14065,6 +14174,7 @@ int main(int argc, char** argv) {
       ui.stepOnce = false;
       tick++;
       ticksThisFrame++;
+      tickT0 = std::chrono::steady_clock::now();
 
       // PUMP THE READBACK RING BETWEEN TICKS, NOT ONCE PER FRAME.
       //
@@ -14292,7 +14402,12 @@ int main(int argc, char** argv) {
           pacer.NoteSent(label);
         }
       }
+      lastTickMs = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - tickT0).count();
+      spentTickMs += lastTickMs;
+      if (g_harnessFrames > 0) g_tickWallMs.push_back(lastTickMs);
     }
+    if (g_harnessFrames > 0) g_frameTickHist[std::min(ticksThisFrame, 4)]++;
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
 
     // ---- render ----
@@ -18469,7 +18584,14 @@ int main(int argc, char** argv) {
       // set by every edit and cleared by UploadMicroBodies itself, which also
       // sends only the WORD RANGES that changed (per-voxel burning dirties the
       // pool every tick, and the whole pool is 4 MiB).
-      if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+      if (mbSet.dirty) {
+        const auto u0 = std::chrono::steady_clock::now();
+        sim.UploadMicroBodies(ctx.queue, mbSet);
+        const double us = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - u0).count();
+        g_bodyStats.microUploadUs += us;
+        g_bodyStats.microUploadMaxUs = std::max(g_bodyStats.microUploadMaxUs, us);
+      }
       BodyRegistry bodyReg(debris, mobs, &avatar, &mbSet);
       const auto bodyT0 = std::chrono::steady_clock::now();
       // WHO ELSE IS HOLDING MY ARM. One index sweep while everything is
@@ -19693,8 +19815,10 @@ int main(int argc, char** argv) {
                         (double)sim.MicroPoolBytesSent() / f / 1024.0,
                         bs.cubeDraws / f, bs.cubeInstLive / f, bs.cubeInstDrawn / f);
             std::printf("    body-render split: list build %.1f us/frame, arena "
-                        "commit %.1f us/frame, %u arena repacks\n",
-                        bs.listUs / f, bs.commitUs / f, bodyArena.Repacks());
+                        "commit %.1f us/frame, %u arena repacks | micro pool "
+                        "upload %.1f us/frame (max %.1f)\n",
+                        bs.listUs / f, bs.commitUs / f, bodyArena.Repacks(),
+                        bs.microUploadUs / f, bs.microUploadMaxUs);
           }
           std::printf("    terrain patches: %u rebuilt, %u deferred by the per-tick "
                       "budget, %u refreshed with an identical occupancy box\n",
@@ -19706,6 +19830,13 @@ int main(int argc, char** argv) {
         std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
                     "(the GPU owed >= 2 snapshots when a second tick was due)\n",
                     (unsigned long long)g_ticksThrottled);
+        std::printf("    cpu tick budget: %llu frames stopped after a tick "
+                    "(spent + last > one tick period) | tick debt dropped: "
+                    "budget %.1f, gpu throttle %.1f, 4-tick cap %.1f ticks%s\n",
+                    (unsigned long long)g_tickBudgetStops, g_ticksDroppedBudget,
+                    g_ticksDroppedThrottle, g_ticksDroppedCap,
+                    std::getenv("SANDVOX_NO_TICK_BUDGET") ? " (budget OFF: A/B arm)"
+                                                          : "");
         // A full refill is kFarLevels * kFarNumChunks entries; anything less
         // than that here means the horizon was still arriving at exit.
         std::printf("    far-cascade sieve: %llu entries over %llu ticks "
