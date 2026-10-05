@@ -3210,6 +3210,8 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   uint32_t peakManifolds = 0;
   double sumManDyn = 0, sumManStatic = 0, sumActive = 0;
   std::vector<double> rolePairs(Physics::kRoleCols * Physics::kRoleCols, 0.0);
+  // SANDVOX_PHYS_PAIRPROF=1: narrow-phase worker us and body pairs, same index.
+  std::vector<double> pairUs(rolePairs.size(), 0.0), pairCalls(rolePairs.size(), 0.0);
   double joltMs = 0.0;
   // Jolt's step by phase (Physics::StepPhase): wall span and worker time.
   constexpr int kPh = (int)Physics::StepPhase::Count;
@@ -3218,6 +3220,8 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   double ccdRole[Physics::kRoleCols] = {};
   uint32_t joltOverflow[3] = {};   // steps with each EPhysicsUpdateError bit
   double ccdCompound[Physics::kRoleCols] = {};
+  // The CCD scope (physics.cpp CcdScopeFilter, package C).
+  double ccdVsStatic = 0, ccdVsBody = 0, ccdVsBodyFast = 0, ccdRefused = 0;
   size_t peakLiveWords = 0;
   size_t peakPool = 0;
   std::vector<BodyXformGpu> xf;
@@ -3302,11 +3306,19 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
       ccdRole[r] += c.phys.LastStep().ccdBodies[r];
     for (int r = 0; r < Physics::kRoleCols; r++)
       ccdCompound[r] += c.phys.LastStep().ccdCompound[r];
+    ccdVsStatic += c.phys.LastStep().ccdVsStatic;
+    ccdVsBody += c.phys.LastStep().ccdVsBody;
+    ccdVsBodyFast += c.phys.LastStep().ccdVsBodyFast;
+    ccdRefused += c.phys.LastStep().ccdRefused;
     sumManDyn += c.phys.LastStep().manifoldsDyn;
     sumManStatic += c.phys.LastStep().manifoldsStatic;
     sumActive += c.phys.NumActiveBodies();
     for (size_t k = 0; k < rolePairs.size(); k++)
       rolePairs[k] += c.phys.LastStep().rolePairs[k];
+    for (size_t k = 0; k < rolePairs.size(); k++) {
+      pairUs[k] += c.phys.LastStep().pairNarrowUs[k];
+      pairCalls[k] += c.phys.LastStep().pairNarrowCalls[k];
+    }
     peakManifolds = std::max(peakManifolds, c.phys.LastStep().manifoldsDyn +
                                                 c.phys.LastStep().manifoldsStatic);
     if (mset) {
@@ -3434,6 +3446,29 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                   roleName(top[k].second % Physics::kRoleCols),
                   top[k].first / std::max(1, ticks));
     std::printf("%s\n", s.c_str());
+    // ...and what their narrow phase cost (only with SANDVOX_PHYS_PAIRPROF=1).
+    std::vector<std::pair<double, int>> topUs;
+    for (int k = 0; k < (int)pairUs.size(); k++)
+      if (pairUs[k] > 0) topUs.push_back({pairUs[k], k});
+    std::sort(topUs.rbegin(), topUs.rend());
+    if (!topUs.empty()) {
+      double allUs = 0, allCalls = 0;
+      for (size_t k = 0; k < pairUs.size(); k++) {
+        allUs += pairUs[k];
+        allCalls += pairCalls[k];
+      }
+      std::string u = Format(
+          "mob-cap64: narrow phase worker ms/tick %.2f over %.0f body pairs; by "
+          "role pair (body pairs):",
+          allUs / 1000.0 / std::max(1, ticks), allCalls / std::max(1, ticks));
+      for (size_t k = 0; k < topUs.size() && k < 8; k++)
+        u += Format(" %s-%s %.2f (%.0f)",
+                    roleName(topUs[k].second / Physics::kRoleCols),
+                    roleName(topUs[k].second % Physics::kRoleCols),
+                    topUs[k].first / 1000.0 / std::max(1, ticks),
+                    pairCalls[topUs[k].second] / std::max(1, ticks));
+      std::printf("%s\n", u.c_str());
+    }
   }
   {
     std::string s = "mob-cap64: CPU scopes ms/tick:";
@@ -3481,6 +3516,11 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
                         : Physics::RoleName((Physics::BodyRole)r),
                     ccdRole[r] / std::max(1, ticks),
                     ccdCompound[r] / std::max(1, ticks));
+    s += Format("; cast pairs/tick: vs static %.1f, vs body %.1f (%.1f dead "
+                "flesh able to strike a blow), refused by scope %.1f",
+                ccdVsStatic / std::max(1, ticks), ccdVsBody / std::max(1, ticks),
+                ccdVsBodyFast / std::max(1, ticks),
+                ccdRefused / std::max(1, ticks));
     std::printf("%s\n", s.c_str());
     RecordObserved("mobCap64.joltCollideMs",
                    phWall[(int)Physics::StepPhase::FindCollisions] / std::max(1, ticks));

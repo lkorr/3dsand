@@ -1228,6 +1228,10 @@ class DebrisSystem {
     // (bodies) and chunks the mob anchors listed (core every tick, horizon on
     // its stride) -- so "chunks needed" can be split between the two.
     uint64_t needBlocks = 0, anchorChunks = 0;
+    // Of the polygonizes: a patch never built (new, or rebuilt after eviction)
+    // and a rebuild forced by this system's own pending cell writes. The rest
+    // are a surface the CA changed.
+    uint64_t freshPolys = 0, vacatePolys = 0;
   };
   const PhaseProfile& Profile() const { return prof_; }
   void SetProfiling(bool on) { prof_.on = on; }
@@ -2061,6 +2065,13 @@ class DebrisSystem {
   // cost that capped the scan rate. Kept between calls and `assign`ed, so the
   // zeroing stays and the allocator leaves the hot path.
   std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
+  // ...its dedupe: an open-addressed chunk-key -> index table (key 0 = empty)
+  // and the kept entries' keys, so the ~3,500 requests a 64-creature fight
+  // lists a tick fold to their ~200 chunks without a sort of all of them.
+  std::vector<std::pair<uint64_t, uint32_t>> terrainNeedSlots_;
+  std::vector<uint64_t> terrainNeedKeys_;
+  std::vector<uint32_t> terrainNeedOrder_;
+  std::vector<std::pair<IVec3, float>> terrainNeedTmp_;
   std::vector<float> terrainNeedGrid_;  // per-body chunk grid, min distance
   // ---- THE FLOOD'S LABEL MAP: dense per chunk, shared across one tick -----
   //

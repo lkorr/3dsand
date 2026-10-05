@@ -2400,13 +2400,15 @@ std::string DebrisSystem::ProfileReport() const {
   }
   s += Fmt(
       " | unattributed %.1f ms | chunks needed %llu (max %u in one tick), "
-      "fetches asked %llu (max %u), gathers %llu, polygonizes %llu, jolt "
+      "fetches asked %llu (max %u), gathers %llu, polygonizes %llu (%llu "
+      "fresh, %llu own-write), jolt "
       "meshes %llu, bodies %llu (%llu vox), need blocks %llu, anchor chunks "
       "%llu",
       (p.tickUsTotal - named) / 1000.0,
       (unsigned long long)p.chunksNeeded, p.maxNeededOneTick,
       (unsigned long long)p.fetchesAsked, p.maxFetchOneTick,
       (unsigned long long)p.gathers, (unsigned long long)p.polys,
+      (unsigned long long)p.freshPolys, (unsigned long long)p.vacatePolys,
       (unsigned long long)p.joltMeshes, (unsigned long long)p.bodiesCreated,
       (unsigned long long)p.bodyVoxCreated, (unsigned long long)p.needBlocks,
       (unsigned long long)p.anchorChunks);
@@ -6270,29 +6272,60 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   }
   extraAnchors_.clear();
   // Dedupe by chunk, keeping the NEAREST distance any anchor gave it, then
-  // order nearest-first. Sorted by (key, d2) so unique's survivor is the
-  // minimum; stable so equal distances keep a deterministic order (this runs
-  // under the selftest, whose debris gates compare against a baseline).
-  std::sort(needed.begin(), needed.end(),
-            [](const std::pair<IVec3, float>& a,
-               const std::pair<IVec3, float>& b) {
-              const uint64_t ka = World::PackChunkKey(a.first);
-              const uint64_t kb = World::PackChunkKey(b.first);
-              return ka != kb ? ka < kb : a.second < b.second;
-            });
-  needed.erase(std::unique(needed.begin(), needed.end(),
-                           [](const std::pair<IVec3, float>& a,
-                              const std::pair<IVec3, float>& b) {
-                             return a.first.x == b.first.x &&
-                                    a.first.y == b.first.y &&
-                                    a.first.z == b.first.z;
-                           }),
-               needed.end());
-  std::stable_sort(needed.begin(), needed.end(),
-                   [](const std::pair<IVec3, float>& a,
-                      const std::pair<IVec3, float>& b) {
-                     return a.second < b.second;
-                   });
+  // order nearest-first, equal distances by chunk key (this runs under the
+  // selftest, whose debris gates compare against a baseline).
+  //
+  // A HASH FOLD, THEN A SORT OF THE SURVIVORS (fight64 round 3, package C).
+  // This was a sort of every request by (key, d2), unique, and a stable sort
+  // by d2 -- the same order as below, since the stable sort kept the key
+  // order among equal distances. In a 64-creature fight every creature lists
+  // its planning horizon, ~3,500 requests a tick for ~210 distinct chunks,
+  // and the full sort was half of terrainNeed (0.44 ms a tick). The fold is
+  // one probe per request into an open-addressed table; only the survivors
+  // are sorted. Same set, same distances, same order: the patches built and
+  // the bodies they meet do not change.
+  {
+    std::vector<std::pair<uint64_t, uint32_t>>& slots = terrainNeedSlots_;
+    std::vector<uint64_t>& keys = terrainNeedKeys_;
+    size_t cap = 64;
+    while (cap < needed.size() * 2) cap <<= 1;
+    slots.assign(cap, {0ull, 0u});
+    keys.clear();
+    size_t kept = 0;
+    for (size_t i = 0; i < needed.size(); i++) {
+      // +1: a packed key may be 0, and 0 marks an empty slot.
+      const uint64_t key = World::PackChunkKey(needed[i].first) + 1ull;
+      size_t s = (size_t)((key * 0x9E3779B97F4A7C15ull) >> 20) & (cap - 1);
+      for (;; s = (s + 1) & (cap - 1)) {
+        if (slots[s].first == 0ull) {
+          slots[s] = {key, (uint32_t)kept};
+          needed[kept] = needed[i];
+          keys.push_back(key);
+          kept++;
+          break;
+        }
+        if (slots[s].first == key) {
+          float& d = needed[slots[s].second].second;
+          if (needed[i].second < d) d = needed[i].second;
+          break;
+        }
+      }
+    }
+    needed.resize(kept);
+    // Sort an index by (d2, key), then permute: the keys ride along.
+    std::vector<uint32_t>& ord = terrainNeedOrder_;
+    ord.resize(kept);
+    for (size_t i = 0; i < kept; i++) ord[i] = (uint32_t)i;
+    std::sort(ord.begin(), ord.end(), [&](uint32_t a, uint32_t b) {
+      if (needed[a].second != needed[b].second)
+        return needed[a].second < needed[b].second;
+      return keys[a] < keys[b];
+    });
+    std::vector<std::pair<IVec3, float>>& tmp = terrainNeedTmp_;
+    tmp.resize(kept);
+    for (size_t i = 0; i < kept; i++) tmp[i] = needed[ord[i]];
+    needed.swap(tmp);
+  }
   // THE LIST CEILING. Sorted nearest-first above, so the tail is the chunks
   // furthest from anything that asked -- a distant mob's navigation horizon,
   // the sky beside a crown. Cutting it here bounds the per-chunk staleness
@@ -6566,6 +6599,8 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     tb.version = cc->version;
     tb.occHash = h;
     tb.vacateKey = vacateKey;
+    if (prof_.on && t.builtVersion == 0) prof_.freshPolys++;
+    if (prof_.on && vacateChanged) prof_.vacatePolys++;
   }
 
   // ---- THE TICK'S PATCHES, BUILT IN PARALLEL --------------------------------
