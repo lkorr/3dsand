@@ -1216,3 +1216,21 @@ attribution, including why its ticket no longer idles out (not electricity).
 - `corpse-sleep` fails at that scope on main's own exe too (asleep after 885
   ticks, cap 300, every arm identical): inherited, not L's, not changed here.
 - `determinismHash` unmoved (0fa43063): the determinism scene has no creature.
+
+## 2026-10-05 — reconciliation: `chem-electrolysis` and `waterbody` are recorded pass
+
+Bookkeeping only; no run, no `baseline.json` change. Earlier entries in this
+file still list both gates as known-failing (the nine-error list in the wave-1
+section, the 10-01 suite-triage list, and the 10-03 red-world entry's
+"`chem-electrolysis` stays **fail**"). `tests/baseline.json` records both as
+`"pass"`:
+
+- `waterbody` -> pass on 2026-10-03 (red-world, 3897482; pass N, `wbQuiet`
+  ignores the stain-dry dirty reasons), as the red-world entry above says.
+- `chem-electrolysis` -> pass on 2026-10-03 by electricity E2 (ecbfdd6, see
+  `_chemElectrolysisFixed_about`): a discharge no longer drifts, so a spark on
+  a y = 2 (mod 3) pool top stays the pool's face partner and it reacts through
+  the charge-as-partner path (sodium 46 / 45 / 46 across the three residues).
+  Measured at gate scope; not yet re-measured at `--suite acceptance` scope.
+
+Read the older entries as history; `baseline.json` is the current status.
