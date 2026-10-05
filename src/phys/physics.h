@@ -599,6 +599,12 @@ class Physics {
   // Run fn(0..n-1) on Jolt's worker pool (the calling thread helps) and
   // return when all are done. Only between Steps: the pool is Jolt's.
   void ParallelFor(uint32_t n, const std::function<void(uint32_t)>& fn);
+  // Jolt's worker count at runtime (0 = SANDVOX_PHYS_THREADS or the default).
+  // Jolt's contract is that the count is not a determinism condition; the
+  // twice-run gate (mob-cap64-twice) holds it to that by stepping one brawl at
+  // two counts in one process. Only between Steps.
+  void SetWorkerThreads(int n);
+  int WorkerThreads() const;
 
   // ---- player proxy (deferred from M6; DESIGN.md §8) ----
   // Capsule the debris collides against. Voxel terrain collision stays in the

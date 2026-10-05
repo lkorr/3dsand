@@ -27,6 +27,9 @@ struct Pool {
   std::atomic<size_t> next{0};
   int active = 0;     // workers still inside the current job
   bool quit = false;
+  // SetThreadLimit: workers whose index is at or past limit-1 sit the job out
+  // (they still wake and check out, so `active` stays the plain count).
+  std::atomic<int> limit{0};
 
   void Drain() {
     for (;;) {
@@ -37,7 +40,7 @@ struct Pool {
     }
   }
 
-  void Worker() {
+  void Worker(int index) {
     tl_worker = true;
     tl_inTask = true;
     uint64_t seen = 0;
@@ -48,7 +51,8 @@ struct Pool {
         if (quit) return;
         seen = gen;
       }
-      Drain();
+      const int lim = limit.load(std::memory_order_relaxed);
+      if (lim <= 0 || index < lim - 1) Drain();
       {
         std::lock_guard<std::mutex> lk(mu);
         if (--active == 0) idle.notify_one();
@@ -79,7 +83,8 @@ Pool& Get() {
   static Pool* p = [] {
     Pool* pool = new Pool();   // never destroyed: workers outlive static teardown
     const int workers = ConfiguredThreads() - 1;
-    for (int i = 0; i < workers; i++) pool->threads.emplace_back([pool] { pool->Worker(); });
+    for (int i = 0; i < workers; i++)
+      pool->threads.emplace_back([pool, i] { pool->Worker(i); });
     return pool;
   }();
   return *p;
@@ -87,7 +92,14 @@ Pool& Get() {
 
 }  // namespace
 
-int Threads() { return (int)Get().threads.size() + 1; }
+int Threads() {
+  Pool& p = Get();
+  const int all = (int)p.threads.size() + 1;
+  const int lim = p.limit.load(std::memory_order_relaxed);
+  return lim > 0 ? std::min(lim, all) : all;
+}
+
+void SetThreadLimit(int n) { Get().limit.store(std::max(0, n), std::memory_order_relaxed); }
 
 bool OnWorker() { return tl_worker; }
 
@@ -100,7 +112,8 @@ void ParallelFor(size_t n, size_t grain, const std::function<void(size_t)>& fn) 
   // Serial when there is nobody to share with, nothing to share, or we are
   // already inside a task (no nesting: a worker waiting on its own pool
   // would deadlock).
-  if (p.threads.empty() || n <= grain || tl_inTask) {
+  if (p.threads.empty() || n <= grain || tl_inTask ||
+      p.limit.load(std::memory_order_relaxed) == 1) {
     for (size_t i = 0; i < n; i++) fn(i);
     return;
   }

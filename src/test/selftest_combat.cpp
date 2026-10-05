@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -76,6 +77,8 @@
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/strokes.h"
+#include "game/workpool.h"
+#include "sim/trace_mark.h"
 #include "gpu/passtimer.h"
 #include "measure/perfscope.h"
 #include "sim/scale.h"
@@ -2934,6 +2937,115 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- the 64-creature brawl fixture, shared by mob-cap64 and mob-cap64-twice --
+// Two teams of 8 x (want/16) in ranks 6 voxels apart, facing each other across
+// an 18-voxel gap, mixing every def that is a different BODY (materials, limb
+// counts, brick sizes) plus a zombie per four on one side.
+struct BrawlSpawn {
+  std::vector<int> mix;
+  int zombieDef = -1;
+  std::vector<uint64_t> ids;
+  std::vector<uint8_t> team;
+  std::vector<int> defOf;   // per id, for attribution
+  int refused = 0;
+};
+BrawlSpawn SpawnBrawl(Ctx& c, const Stage& st, int want) {
+  BrawlSpawn b;
+  // Missing defs are skipped (content moves), and the human is the floor.
+  for (const char* n : {"human", "sentinel", "boilerman", "dryad", "brug",
+                        "replicant", "tinker", "thornwood"}) {
+    const int d = c.mobs.FindDef(n);
+    if (d >= 0) b.mix.push_back(d);
+  }
+  if (b.mix.empty()) b.mix.push_back(st.defIndex);
+  b.zombieDef = c.mobs.FindDef("zombie");
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  // Ground per column from the same height function the world is built from
+  // (FlatSpot's flat patch is narrower than the formation).
+  constexpr int kCols = 8;
+  constexpr int kPitch = 6;
+  for (int k = 0; k < want; k++) {
+    const int t = k & 1;                  // interleaved, so the mix is even
+    const int slot = k >> 1;
+    const int col = slot % kCols, rank = slot / kCols;
+    const int x = st.spot.x + (col - kCols / 2) * kPitch + 2;
+    const int z = st.spot.z + (t == 0 ? -1 : 1) * (9 + rank * kPitch);
+    const int y = World::TerrainHeight(x, z, kDefaultSeed) + 1;
+    const bool zombie = t == 0 && b.zombieDef >= 0 && (slot % 4) == 3;
+    const int def = zombie ? b.zombieDef : b.mix[(size_t)(slot % b.mix.size())];
+    const uint64_t id = c.mobs.Spawn(def, {x, y, z});
+    if (id == 0) {
+      b.refused++;
+      continue;
+    }
+    c.mobs.SetMobBehavior(id, zombie ? "zombie"
+                                     : (t == 0 ? "duelist" : "duelist_blue"));
+    if (!zombie && sword != nullptr &&
+        c.mobs.Defs()[def].FindSocket("held_right") >= 0)
+      c.mobs.EquipItem(id, sword);
+    b.ids.push_back(id);
+    b.team.push_back((uint8_t)t);
+    b.defOf.push_back(def);
+  }
+  return b;
+}
+// Faced at the nearest foe (a creature spawned behind another never turns
+// round: `limb-alias`'s note).
+void FaceNearestFoes(Ctx& c, const BrawlSpawn& b) {
+  for (size_t a = 0; a < b.ids.size(); a++) {
+    float best = 1e30f;
+    Vec3 at{};
+    for (size_t k = 0; k < b.ids.size(); k++) {
+      if (b.team[a] == b.team[k]) continue;
+      const Vec3 pa = c.mobs.MobOrigin(b.ids[a]), pb = c.mobs.MobOrigin(b.ids[k]);
+      const float d = (pa.x - pb.x) * (pa.x - pb.x) + (pa.z - pb.z) * (pa.z - pb.z);
+      if (d < best) {
+        best = d;
+        at = pb;
+      }
+    }
+    if (best < 1e30f) FaceAt(c.mobs, b.ids[a], at);
+  }
+}
+// One tick of the brawl, digested: every creature's hp and origin (float
+// bits, in spawn order) and Jolt's manifold counts. `per`, when given,
+// receives the per-creature words the digest was folded from (hp, ox, oy, oz),
+// for attribution.
+struct BrawlDigest {
+  uint64_t hp = 0, pos = 0;
+  uint32_t manDyn = 0, manStatic = 0;
+};
+BrawlDigest DigestBrawl(Ctx& c, const std::vector<uint64_t>& ids,
+                        std::vector<uint32_t>* per) {
+  BrawlDigest d;
+  uint64_t hh = 1469598103934665603ull, hp = hh;
+  auto mix = [](uint64_t& h, uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+  };
+  if (per) per->clear();
+  for (uint64_t id : ids) {
+    float hpv = c.mobs.TotalHp(id);
+    uint32_t u = 0;
+    std::memcpy(&u, &hpv, 4);
+    mix(hh, u);
+    const Vec3 o = c.mobs.MobOrigin(id);
+    uint32_t ox, oy, oz;
+    std::memcpy(&ox, &o.x, 4);
+    std::memcpy(&oy, &o.y, 4);
+    std::memcpy(&oz, &o.z, 4);
+    mix(hp, ox);
+    mix(hp, oy);
+    mix(hp, oz);
+    if (per) per->insert(per->end(), {u, ox, oy, oz});
+  }
+  d.hp = hh;
+  d.pos = hp;
+  d.manDyn = c.phys.LastStep().manifoldsDyn;
+  d.manStatic = c.phys.LastStep().manifoldsStatic;
+  return d;
+}
+
 // =============================================================================
 // mob-cap64 — the living cap is kMaxMobs (64): all of them spawn, tick, fight
 // and hold a render slot, and the next one is refused cleanly
@@ -2992,53 +3104,11 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   const uint32_t cap = MobSystem::MaxLiveMobs();
   const int want = std::clamp((int)BaselineNumber("mobCap64.count", (double)cap),
                               1, (int)cap);
-  // ---- the mix ------------------------------------------------------------
-  // Every def that is a different BODY: different materials, different limb
-  // counts, different brick sizes. Missing ones are skipped (content moves),
-  // and the human is the floor.
-  std::vector<int> mix;
-  for (const char* n : {"human", "sentinel", "boilerman", "dryad", "brug",
-                        "replicant", "tinker", "thornwood"}) {
-    const int d = c.mobs.FindDef(n);
-    if (d >= 0) mix.push_back(d);
-  }
-  if (mix.empty()) mix.push_back(st.defIndex);
-  const int zombieDef = c.mobs.FindDef("zombie");
-  const ItemDef* sword = c.items.At(c.items.Find("sword"));
-
-  // ---- A: spawn ------------------------------------------------------------
-  // Two teams of 8 x (want/16) in ranks 6 voxels apart, facing each other
-  // across an 18-voxel gap. Ground per column from the same height function
-  // the world is built from (FlatSpot's flat patch is narrower than the
-  // formation).
-  constexpr int kCols = 8;
-  constexpr int kPitch = 6;
-  std::vector<uint64_t> ids;
-  std::vector<uint8_t> team;
-  std::string why;
-  int spawnRefused = 0;
-  for (int k = 0; k < want; k++) {
-    const int t = k & 1;                  // interleaved, so the mix is even
-    const int slot = k >> 1;
-    const int col = slot % kCols, rank = slot / kCols;
-    const int x = st.spot.x + (col - kCols / 2) * kPitch + 2;
-    const int z = st.spot.z + (t == 0 ? -1 : 1) * (9 + rank * kPitch);
-    const int y = World::TerrainHeight(x, z, kDefaultSeed) + 1;
-    const bool zombie = t == 0 && zombieDef >= 0 && (slot % 4) == 3;
-    const int def = zombie ? zombieDef : mix[(size_t)(slot % mix.size())];
-    const uint64_t id = c.mobs.Spawn(def, {x, y, z});
-    if (id == 0) {
-      spawnRefused++;
-      continue;
-    }
-    c.mobs.SetMobBehavior(id, zombie ? "zombie"
-                                     : (t == 0 ? "duelist" : "duelist_blue"));
-    if (!zombie && sword != nullptr &&
-        c.mobs.Defs()[def].FindSocket("held_right") >= 0)
-      c.mobs.EquipItem(id, sword);
-    ids.push_back(id);
-    team.push_back((uint8_t)t);
-  }
+  BrawlSpawn bs = SpawnBrawl(c, st, want);
+  std::vector<int>& mix = bs.mix;
+  const int zombieDef = bs.zombieDef;
+  std::vector<uint64_t>& ids = bs.ids;
+  const int spawnRefused = bs.refused;
   check(spawnRefused == 0 && (int)ids.size() == want &&
             c.mobs.LiveMobCount() == (uint32_t)want,
         Format("all %d spawned (%zu did, %d refused, %u living)", want,
@@ -3068,22 +3138,7 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
 
   Ticker tick{c, 27400, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
   for (int i = 0; i < 4; i++) tick();   // rigs onto the ground
-  // Faced at the nearest foe (a creature spawned behind another never turns
-  // round: `limb-alias`'s note).
-  for (size_t a = 0; a < ids.size(); a++) {
-    float best = 1e30f;
-    Vec3 at{};
-    for (size_t b = 0; b < ids.size(); b++) {
-      if (team[a] == team[b]) continue;
-      const Vec3 pa = c.mobs.MobOrigin(ids[a]), pb = c.mobs.MobOrigin(ids[b]);
-      const float d = (pa.x - pb.x) * (pa.x - pb.x) + (pa.z - pb.z) * (pa.z - pb.z);
-      if (d < best) {
-        best = d;
-        at = pb;
-      }
-    }
-    if (best < 1e30f) FaceAt(c.mobs, ids[a], at);
-  }
+  FaceNearestFoes(c, bs);
 
   // ---- C: every one holds a slot -------------------------------------------
   uint32_t peakSlotsPerMob = 0, limbBodies = 0, microLimbs = 0;
@@ -3205,30 +3260,13 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
     // SANDVOX_MOBCAP_DIGEST=1: one line per tick digesting every creature's
     // hp and origin (bits), so two runs that end differently can be diffed to
     // the FIRST tick they part (a determinism probe; prints nothing otherwise).
+    // `mob-cap64-twice` is the same digest as a gate.
     static const bool digest = std::getenv("SANDVOX_MOBCAP_DIGEST") != nullptr;
     if (digest) {
-      uint64_t hh = 1469598103934665603ull, hp = hh;
-      auto mix = [](uint64_t& h, uint64_t x) {
-        h ^= x;
-        h *= 1099511628211ull;
-      };
-      for (uint64_t id : ids) {
-        float hpv = c.mobs.TotalHp(id);
-        uint32_t u = 0;
-        std::memcpy(&u, &hpv, 4);
-        mix(hh, u);
-        const Vec3 o = c.mobs.MobOrigin(id);
-        uint32_t ox, oy, oz;
-        std::memcpy(&ox, &o.x, 4);
-        std::memcpy(&oy, &o.y, 4);
-        std::memcpy(&oz, &o.z, 4);
-        mix(hp, ox);
-        mix(hp, oy);
-        mix(hp, oz);
-      }
+      const BrawlDigest d = DigestBrawl(c, ids, nullptr);
       std::printf("mobcap-digest %d hp %016llx pos %016llx jolt %u %u\n", i,
-                  (unsigned long long)hh, (unsigned long long)hp,
-                  c.phys.LastStep().manifoldsDyn, c.phys.LastStep().manifoldsStatic);
+                  (unsigned long long)d.hp, (unsigned long long)d.pos, d.manDyn,
+                  d.manStatic);
     }
     if (timeThis) {
       c.ctx.WaitIdle();
@@ -3476,6 +3514,447 @@ Status GateMobCap64(Ctx& c, std::string& detail) {
   std::printf("mob-cap64: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
   return ok ? Status::Pass : Status::Fail;
 }
+
+// =============================================================================
+// mob-cap64-twice — the 64-creature brawl, run in one process at several
+// thread counts, must be bit-identical tick by tick
+// =============================================================================
+//
+// PLAN_fight64_perf round 3, package S. The crowd tick runs per-creature work
+// on workpool (SANDVOX_MOB_THREADS) and Jolt's step on its own pool
+// (SANDVOX_PHYS_THREADS). Both are contracted to give the serial answer: the
+// mob passes write per-creature outputs merged in id order, and Jolt sorts its
+// contacts and constraints before solving. This gate holds both to it, and
+// holds the brawl to in-process reproducibility (no state left behind by the
+// previous run that changes the next one).
+//
+// Each ARM (mobCap64Twice.arms, "mob/phys" thread counts, 0 = the default) runs
+// the same fixture from scratch: worldgen, the same id counter, Jolt body ids
+// and birth ordinals reset, the same creatures in the same ranks, the same
+// mobCap64Twice.ticks fight with every mobCap64Twice.killEvery-th creature
+// killed at tick mobCap64Twice.killAt (corpses in the crowd are the hard case
+// for the solver). Per tick, settle ticks included, it records the mob-cap64
+// digest (every creature's hp and origin bits, Jolt's manifold counts), the
+// tick's whole op batch, AND every Jolt body's exact state
+// (Physics::DebugBodyStates), so a failure names its first tick, the first
+// creature and word, the first op stream and op, and the first body (by
+// creation ordinal) with the fields that differ -- not just "the hash moved"
+// (CLAUDE.md rule 6). For the cause behind a first difference, run it with
+// SANDVOX_PHYS_TRACE / SANDVOX_DEBRIS_TRACE / SANDVOX_FETCH_TRACE: each arm
+// writes an "M mob-cap64-twice arm k" line into every open trace
+// (sim/trace_mark.h), so one file splits into per-arm runs to diff.
+//
+// FOUND ON ITS FIRST RUN (2026-10-05): MobSystem::Reset left three tick-to-tick
+// queues standing -- severed flesh's pending drips, the splatter bursts (aged
+// out by tick number, so never, in a run whose ticks restart lower) and a
+// dying android's queued discharge -- and the second run's tick -3 authored 9
+// cell ops the first did not. With those cleared it still failed at suite
+// scope, and the TEARDOWN CHECK (every body born in a run must be gone after
+// CloseStage; a survivor is reported with its limb and its role history)
+// named a Jolt body leak: a severed limb with an empty collider lattice,
+// refused by DebrisSystem::AdoptBody and owned by nobody (Mob::DetachLimb).
+Status GateMobCap64Twice(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const uint64_t idBase = c.mobs.NextIdCounter();
+  const uint32_t cap = MobSystem::MaxLiveMobs();
+  const int want = std::clamp(
+      (int)BaselineNumber("mobCap64Twice.count", (double)cap), 1, (int)cap);
+  const int ticks = std::max(1, (int)BaselineNumber("mobCap64Twice.ticks", 150));
+  const int killEvery = (int)BaselineNumber("mobCap64Twice.killEvery", 4);
+  const int killAt = (int)BaselineNumber("mobCap64Twice.killAt", 40);
+  constexpr int kSettle = 4;
+  constexpr int kNoTick = -1000;
+  struct Arm {
+    int mob = 0, phys = 0;
+  };
+  std::vector<Arm> arms;
+  {
+    const std::string* v = BaselineValue("mobCap64Twice.arms");
+    const std::string spec = v && !v->empty() ? *v : std::string("0/0,1/1");
+    size_t at = 0;
+    while (at < spec.size()) {
+      size_t comma = spec.find(',', at);
+      if (comma == std::string::npos) comma = spec.size();
+      const std::string one = spec.substr(at, comma - at);
+      Arm a;
+      if (std::sscanf(one.c_str(), "%d/%d", &a.mob, &a.phys) == 2) arms.push_back(a);
+      at = comma + 1;
+    }
+  }
+  if (arms.size() < 2) {
+    detail = "mobCap64Twice.arms names fewer than two arms";
+    return Status::Fail;
+  }
+
+  struct Run {
+    int mobThreads = 0, physThreads = 0;
+    std::vector<BrawlDigest> dig;
+    std::vector<std::vector<uint32_t>> per;
+    std::vector<std::vector<Physics::BodyStateBits>> bodies;
+    // The tick's whole op batch (every stream, every word), per tick: a run
+    // that authored different ops into the world is named before the world
+    // moves on it.
+    std::vector<std::vector<uint32_t>> opWords;
+    std::vector<uint64_t> ids;
+    std::vector<int> defOf;
+    int alive = 0, spawned = 0;
+    uint64_t requests = 0;
+    float hp0 = 0, hp1 = 0;
+    double ms = 0;
+    // Bodies BORN in this run that the teardown (MobSystem::Reset +
+    // DebrisSystem::Reset) left in Jolt. Each is a body the next run starts
+    // with and this one did not -- a reproducibility leak by definition.
+    int leaked = 0;
+    std::string leakWhat;
+    // Jolt handle -> "creature k (id, def) limb i name", taken after the first
+    // tick: who a leaked body was born as.
+    std::map<uint64_t, std::string> limbOf;
+    // Per creation ordinal, its life as a list of changes: "tick:role/motion
+    // [debris-owned]" each time the role, the motion type or whether
+    // DebrisSystem holds it changes. Read only for a leaked body.
+    struct Life {
+      uint32_t key = ~0u;
+      std::string story;
+    };
+    std::map<uint64_t, Life> life;
+  };
+  std::vector<Run> runs;
+  bool fixtureOk = true;
+  std::string fixtureWhy;
+  for (const Arm& arm : arms) {
+    Run r;
+    workpool::SetThreadLimit(arm.mob);
+    c.phys.SetWorkerThreads(arm.phys);
+    r.mobThreads = workpool::Threads();
+    r.physThreads = c.phys.WorkerThreads();
+    const double t0 = NowSeconds();
+    Stage st = OpenStage(c);
+    if (!st.ok) {
+      fixtureOk = false;
+      fixtureWhy = st.why;
+      break;
+    }
+    // Everything that held a body was reset by OpenStage, so no handle can
+    // alias: each run gets the ids, ordinals and creature ids a fresh process
+    // would (village-twice's recipe). The per-tick inputs the authority hands
+    // MobSystem start clear, as the harness clears them between gates.
+    c.mobs.SetNextIdCounter(idBase);
+    c.phys.ResetBirthOrdinals();
+    c.phys.ResetBodyIdHistory();
+    c.mobs.SetWeatherRain(0u);
+    c.mobs.SetRainSlope(0, 0);
+    c.mobs.SetDayPhase(0u);
+    BrawlSpawn bs = SpawnBrawl(c, st, want);
+    r.ids = bs.ids;
+    r.defOf = bs.defOf;
+    r.spawned = (int)bs.ids.size();
+    TraceMarkAll(Format("mob-cap64-twice arm %zu mob %d phys %d", runs.size(),
+                        r.mobThreads, r.physThreads).c_str());
+    Ticker tick{c, 27400, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+    // The 4 settle ticks (rigs onto the ground) are recorded too, as ticks
+    // -4..-1: a run that differs before the fight starts is a fixture or a
+    // leaked-state fault, not the fight.
+    r.dig.reserve(ticks + kSettle);
+    r.per.resize(ticks + kSettle);
+    r.bodies.resize(ticks + kSettle);
+    r.opWords.resize(ticks + kSettle);
+    for (int j = 0; j < ticks + kSettle; j++) {
+      const int i = j - kSettle;
+      if (i == 0) {
+        FaceNearestFoes(c, bs);
+        for (uint64_t id : bs.ids) r.hp0 += c.mobs.TotalHp(id);
+      }
+      if (killEvery > 0 && i == killAt)
+        for (size_t k = 0; k < bs.ids.size(); k += (size_t)killEvery)
+          if (Mob* m = c.mobs.FindMobById(bs.ids[k]))
+            if (m->Alive()) m->Die();
+      tick();
+      r.dig.push_back(DigestBrawl(c, bs.ids, &r.per[j]));
+      c.phys.DebugBodyStates(r.bodies[j]);
+      for (const Physics::BodyStateBits& x : r.bodies[j]) {
+        if (x.birth == 0) continue;
+        const uint32_t role = (uint32_t)(x.user & 0x7F);
+        const bool owned = c.debris.HasBody(x.handle);
+        const uint32_t key = role | (uint32_t)x.motion << 8 | (owned ? 1u << 16 : 0u) |
+                             (x.handle != 0 ? 0u : 1u << 17);
+        Run::Life& L = r.life[x.birth];
+        if (L.key == key || L.story.size() > 400) continue;
+        L.key = key;
+        L.story += Format(" t%d:%s/m%u%s", j - kSettle,
+                          role < (uint32_t)Physics::BodyRole::Count
+                              ? Physics::RoleName((Physics::BodyRole)role)
+                              : "?",
+                          (unsigned)x.motion, owned ? "/debris" : "");
+      }
+      if (j == 0)
+        for (size_t k = 0; k < bs.ids.size(); k++)
+          if (Mob* m = c.mobs.FindMobById(bs.ids[k]))
+            for (int li = 0; li < m->LimbCount(); li++)
+              if (const uint64_t h = c.mobs.LimbBody(bs.ids[k], li))
+                r.limbOf[h] = Format("creature %zu (id %llu, %s) limb %d %s", k,
+                                     (unsigned long long)bs.ids[k],
+                                     c.mobs.Defs()[(size_t)bs.defOf[k]].name.c_str(), li,
+                                     m->LimbDefAt(li).name.c_str());
+      {
+        // Stream tag + count, then the raw words (the structs are GPU upload
+        // PODs: u32/i32/f32 fields, no padding).
+        const OpBatch& ob = tick.rig->LastBatch();
+        std::vector<uint32_t>& w = r.opWords[j];
+        auto put = [&w](uint32_t tag, const void* p, size_t n, size_t sz) {
+          w.push_back(tag);
+          w.push_back((uint32_t)n);
+          const size_t words = n * sz / 4;
+          const uint32_t* u = (const uint32_t*)p;
+          w.insert(w.end(), u, u + words);
+        };
+        put(1, ob.ops.data(), ob.ops.size(), sizeof(BrushOp));
+        put(2, ob.exps.data(), ob.exps.size(), sizeof(ExplosionOp));
+        put(3, ob.cells.data(), ob.cells.size(), sizeof(CellOp));
+        put(4, ob.spawns.data(), ob.spawns.size(), sizeof(ParticleSpawn));
+        put(5, ob.fluid.data(), ob.fluid.size(), sizeof(FluidSpawnOp));
+      }
+      std::stable_sort(r.bodies[j].begin(), r.bodies[j].end(),
+                       [](const Physics::BodyStateBits& x,
+                          const Physics::BodyStateBits& y) { return x.birth < y.birth; });
+      r.requests += c.mobs.AttackRequests().size();
+      c.mobs.ClearAttackRequests();
+    }
+    for (uint64_t id : bs.ids) {
+      r.hp1 += c.mobs.TotalHp(id);
+      r.alive += c.mobs.IsAlive(id) ? 1 : 0;
+    }
+    CloseStage(c);
+    {
+      // RECORDED AT THE POINT OF FAILURE (CLAUDE.md rule 6): a body this run
+      // created that survived the teardown, named by its creation ordinal,
+      // the tick it first appeared and the role/owner word it had then and at
+      // the end of the run.
+      std::vector<Physics::BodyStateBits> after;
+      c.phys.DebugBodyStates(after);
+      for (const Physics::BodyStateBits& x : after) {
+        if (x.birth == 0) continue;
+        r.leaked++;
+        if (r.leaked > 4) continue;
+        int born = kNoTick;
+        const Physics::BodyStateBits* first = nullptr;
+        const Physics::BodyStateBits* last = nullptr;
+        for (int j = 0; j < ticks + kSettle; j++)
+          for (const Physics::BodyStateBits& y : r.bodies[j])
+            if (y.birth == x.birth) {
+              if (!first) {
+                first = &y;
+                born = j - kSettle;
+              }
+              last = &y;
+            }
+        auto role = [](uint64_t ud) {
+          const uint64_t rr = ud & 0x7F;
+          return rr < (uint64_t)Physics::BodyRole::Count
+                     ? Physics::RoleName((Physics::BodyRole)rr)
+                     : "?";
+        };
+        float p[3];
+        std::memcpy(p, x.pos, sizeof p);
+        std::string who = "not a creature limb at tick -4";
+        if (first) {
+          auto it = r.limbOf.find(first->handle);
+          if (it != r.limbOf.end()) who = it->second;
+        }
+        r.leakWhat += Format(" [%s; life:%s]", who.c_str(),
+                             r.life.count(x.birth) ? r.life[x.birth].story.c_str() : " ?");
+        r.leakWhat += Format(
+            " birth %llu (first seen tick %d as %s owner %llu motion %u; at the "
+            "end %s owner %llu motion %u; after teardown motion %u at "
+            "%.1f,%.1f,%.1f);",
+            (unsigned long long)x.birth, born, first ? role(first->user) : "-",
+            first ? (unsigned long long)(first->user >> 8) : 0ull,
+            first ? first->motion : 0u, last ? role(last->user) : "-",
+            last ? (unsigned long long)(last->user >> 8) : 0ull,
+            last ? last->motion : 0u, x.motion, p[0], p[1], p[2]);
+      }
+    }
+    r.ms = (NowSeconds() - t0) * 1000.0;
+    std::printf("mob-cap64-twice: arm %zu (mob threads %d, Jolt workers %d): %d "
+                "creatures, %d ticks, %d alive, %llu attack requests, hp %.0f -> "
+                "%.0f, %.1f s; %d bodies left after the teardown%s\n",
+                runs.size(), r.mobThreads, r.physThreads, r.spawned, ticks,
+                r.alive, (unsigned long long)r.requests, r.hp0, r.hp1,
+                r.ms / 1000.0, r.leaked, r.leakWhat.c_str());
+    runs.push_back(std::move(r));
+  }
+  workpool::SetThreadLimit(0);
+  c.phys.SetWorkerThreads(0);
+  if (!fixtureOk) {
+    detail = fixtureWhy;
+    std::printf("mob-cap64-twice: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+
+  // ---- attribution, every arm against arm 0 ---------------------------------
+  const Run& a = runs[0];
+  bool same = true;
+  bool fought = a.requests > 0 && a.hp1 < a.hp0;
+  std::string summary;
+  for (size_t k = 1; k < runs.size(); k++) {
+    const Run& b = runs[k];
+    // kNoDiff = identical; settle ticks report as -4..-1.
+    constexpr int kNoDiff = INT32_MIN;
+    int digTick = kNoDiff, bodyTick = kNoDiff;
+    std::string digWhat, bodyWhat;
+    if (a.spawned != b.spawned) {
+      digTick = -kSettle;
+      digWhat = " spawn counts differ;";
+    }
+    for (int t = 0; t < ticks + kSettle && digTick == kNoDiff; t++) {
+      const BrawlDigest &x = a.dig[t], &y = b.dig[t];
+      if (x.hp == y.hp && x.pos == y.pos && x.manDyn == y.manDyn &&
+          x.manStatic == y.manStatic)
+        continue;
+      digTick = t - kSettle;
+      if (x.manDyn != y.manDyn || x.manStatic != y.manStatic)
+        digWhat += Format(" manifolds %u+%u / %u+%u;", x.manDyn, x.manStatic,
+                          y.manDyn, y.manStatic);
+      static const char* kWord[4] = {"hp", "origin.x", "origin.y", "origin.z"};
+      int shown = 0, differing = 0;
+      for (size_t w = 0; w < a.per[t].size() && w < b.per[t].size(); w++) {
+        if (a.per[t][w] == b.per[t][w]) continue;
+        differing++;
+        if (shown++ >= 4) continue;
+        const size_t m = w / 4;
+        float fx, fy;
+        std::memcpy(&fx, &a.per[t][w], 4);
+        std::memcpy(&fy, &b.per[t][w], 4);
+        digWhat += Format(" creature %zu (id %llu, %s) %s %.9g / %.9g;", m,
+                          (unsigned long long)a.ids[m],
+                          c.mobs.Defs()[(size_t)a.defOf[m]].name.c_str(),
+                          kWord[w % 4], fx, fy);
+      }
+      digWhat += Format(" %d creature words differ", differing);
+    }
+    for (int t = 0; t < ticks + kSettle && bodyTick == kNoDiff; t++) {
+      const auto &A = a.bodies[t], &B = b.bodies[t];
+      std::string f0;
+      int shown = 0;
+      bool diff = A.size() != B.size();
+      for (size_t i = 0; i < std::min(A.size(), B.size()); i++) {
+        const Physics::BodyStateBits &x = A[i], &y = B[i];
+        std::string f;
+        if (x.birth != y.birth) f += " birth";
+        if (x.handle != y.handle) f += " handle";
+        if (x.layer != y.layer) f += " layer";
+        if (x.motion != y.motion) f += " motion";
+        if (x.active != y.active) f += " active";
+        if (std::memcmp(x.pos, y.pos, sizeof x.pos)) f += " pos";
+        if (std::memcmp(x.rot, y.rot, sizeof x.rot)) f += " rot";
+        if (std::memcmp(x.lin, y.lin, sizeof x.lin)) f += " linvel";
+        if (std::memcmp(x.ang, y.ang, sizeof x.ang)) f += " angvel";
+        if (x.user != y.user) f += " user";
+        if (f.empty()) continue;
+        diff = true;
+        if (shown++ < 3) {
+          float p[2][3];
+          std::memcpy(p[0], x.pos, sizeof p[0]);
+          std::memcpy(p[1], y.pos, sizeof p[1]);
+          f0 += Format(" body birth %llu user %llx layer %u motion %u:%s (pos "
+                       "%.9g,%.9g,%.9g / %.9g,%.9g,%.9g);",
+                       (unsigned long long)x.birth, (unsigned long long)x.user,
+                       x.layer, x.motion, f.c_str(), p[0][0], p[0][1], p[0][2],
+                       p[1][0], p[1][1], p[1][2]);
+        }
+      }
+      if (!diff) continue;
+      bodyTick = t - kSettle;
+      bodyWhat = Format("%zu vs %zu bodies;%s", A.size(), B.size(), f0.c_str());
+    }
+    // The op batches: the first tick whose submitted ops differ, and where.
+    int opTick = kNoDiff;
+    std::string opWhat;
+    for (int t = 0; t < ticks + kSettle && opTick == kNoDiff; t++) {
+      const std::vector<uint32_t> &x = a.opWords[t], &y = b.opWords[t];
+      if (x == y) continue;
+      opTick = t - kSettle;
+      // Walk the tagged streams in step to name the first differing one.
+      size_t i = 0, k2 = 0;
+      static const char* kStream[6] = {"?", "brush", "explosion", "cell", "particle", "fluid"};
+      static const size_t kSz[6] = {0, sizeof(BrushOp), sizeof(ExplosionOp), sizeof(CellOp),
+                                    sizeof(ParticleSpawn), sizeof(FluidSpawnOp)};
+      while (i + 1 < x.size() && k2 + 1 < y.size()) {
+        const uint32_t tag = x[i], nx = x[i + 1], ny = y[k2 + 1];
+        const size_t per = kSz[tag < 6 ? tag : 0] / 4;
+        const bool same = nx == ny && std::equal(x.begin() + i + 2, x.begin() + i + 2 + nx * per,
+                                                 y.begin() + k2 + 2);
+        if (!same) {
+          size_t e = 0;
+          while (e < std::min(nx, ny) &&
+                 std::equal(x.begin() + i + 2 + e * per, x.begin() + i + 2 + (e + 1) * per,
+                            y.begin() + k2 + 2 + e * per))
+            e++;
+          opWhat = Format(" %s ops %u / %u, first differing op #%zu:", kStream[tag < 6 ? tag : 0], nx,
+                          ny, e);
+          for (int side = 0; side < 2; side++) {
+            const std::vector<uint32_t>& v = side ? y : x;
+            const size_t base = (side ? k2 : i) + 2 + e * per;
+            const uint32_t n = side ? ny : nx;
+            opWhat += side ? " /" : "";
+            if (e >= n) {
+              opWhat += " (none)";
+              continue;
+            }
+            for (size_t q = 0; q < per && q < 8; q++) opWhat += Format(" %08x", v[base + q]);
+          }
+          break;
+        }
+        i += 2 + nx * per;
+        k2 += 2 + ny * per;
+      }
+    }
+    const bool armSame = opTick == kNoDiff &&
+        digTick == kNoDiff && bodyTick == kNoDiff && a.alive == b.alive;
+    same = same && armSame;
+    fought = fought && b.requests > 0;
+    std::string line = Format(
+        "arm %zu (mob %d / Jolt %d) vs arm 0 (mob %d / Jolt %d): ", k,
+        b.mobThreads, b.physThreads, a.mobThreads, a.physThreads);
+    if (armSame) {
+      line += Format("%d ticks (+%d settle): creature digests, op batches and Jolt body states identical", ticks, kSettle);
+    } else {
+      line += digTick == kNoDiff ? std::string("digests identical")
+                          : Format("digest FIRST DIFFERS at tick %d:%s", digTick,
+                                   digWhat.c_str());
+      line += bodyTick == kNoDiff ? std::string(" | Jolt states identical")
+                           : Format(" | Jolt states FIRST DIFFER at tick %d: %s",
+                                    bodyTick, bodyWhat.c_str());
+      line += opTick == kNoDiff ? std::string(" | op batches identical")
+                                : Format(" | op batches FIRST DIFFER at tick %d:%s", opTick,
+                                         opWhat.c_str());
+      line += Format(" | alive %d / %d", a.alive, b.alive);
+    }
+    std::printf("mob-cap64-twice: %s\n", line.c_str());
+    summary += (summary.empty() ? "" : " || ") + line;
+    // -1000 = identical (settle ticks are -4..-1).
+    RecordObserved(Format("mobCap64Twice.arm%zuFirstDigestTick", k).c_str(),
+                   digTick == kNoDiff ? -1000.0 : (double)digTick);
+    RecordObserved(Format("mobCap64Twice.arm%zuFirstBodyTick", k).c_str(),
+                   bodyTick == kNoDiff ? -1000.0 : (double)bodyTick);
+  }
+  if (!fought)
+    std::printf("mob-cap64-twice: FAILED the brawl did not fight (requests "
+                "%llu, hp %.0f -> %.0f) -- an idle crowd proves nothing\n",
+                (unsigned long long)a.requests, a.hp0, a.hp1);
+  int leakedTotal = 0;
+  for (const Run& r : runs) leakedTotal += r.leaked;
+  if (leakedTotal > 0)
+    std::printf("mob-cap64-twice: FAILED %d Jolt bodies outlived the teardown "
+                "(every run must leave Jolt as it found it)\n", leakedTotal);
+  RecordObserved("mobCap64Twice.leakedBodies", (double)leakedTotal);
+  const bool ok = same && fought && leakedTotal == 0;
+  detail = Format("%zu arms x %d ticks, %d creatures, %d alive | %s", runs.size(),
+                  ticks, a.spawned, a.alive, summary.c_str());
+  std::printf("mob-cap64-twice: %s (%zu arms, %d ticks)\n", ok ? "PASS" : "FAIL",
+              runs.size(), ticks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 
 // =============================================================================
 // unarmed-attack — a fist is a weapon, and losing one costs a style
@@ -4867,6 +5346,10 @@ const std::vector<Gate>& CombatGates() {
       // Also the crowd perf harness (mobCap64.* observations). Same exit
       // contract as limb-alias: id scope in, worldgen regenerated out.
       {"mob-cap64", "mob", {}, false, GateMobCap64},
+      // The same brawl twice in one process at two thread counts (mob pool
+      // and Jolt workers), required bit-identical tick by tick. Same exit
+      // contract: id scope in, worldgen regenerated out.
+      {"mob-cap64-twice", "mob", {}, false, GateMobCap64Twice},
       // ---- the directional flinch (mob.h Mob::HitReact) -------------------
       // Spawns one passive dummy and hits it twice through the ordinary
       // MobSystem entry point. Same shape as the ones above — id scope in,

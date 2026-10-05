@@ -12200,6 +12200,62 @@ brawl's trajectory did). `mob-cap64`: carve 4.30 -> 2.78 ms a tick over the
 same ~3,090 carves. Everything else still open, ranked, is in
 docs/PLAN_fight64_perf.md "TBD: 64-body fight performance".
 
+**The brawl is gated reproducible at any thread count (2026-10-05, fight64
+round 3 package S; gate `mob-cap64-twice`).** The soak round 2 skipped, on main
+b21d23a: `mob-cap64` with `SANDVOX_MOBCAP_DIGEST=1`, natural and `killEvery 4`,
+each 3 boots at the default counts plus `SANDVOX_MOB_THREADS=1` and
+`SANDVOX_PHYS_THREADS=1/2/7` -- 14 boots, every one of the 300 per-tick digests
+identical within its arm. Neither the work pool nor Jolt's worker count is a
+determinism condition, and the tick-208 split package M once saw did not
+reproduce.
+
+What was NOT reproducible was a second brawl in the same process. The gate runs
+the brawl once per ARM (`mobCap64Twice.arms`, "mob/phys" thread counts, switched
+at runtime by `workpool::SetThreadLimit` and `Physics::SetWorkerThreads`), each
+from scratch, and compares every tick -- the settle ticks included -- on four
+things: each creature's hp and origin bits, the tick's whole op batch (every
+stream, every word, read from `TickRig::LastBatch`), Jolt's manifold counts,
+and every Jolt body's exact state by creation ordinal. Its first run failed
+every later arm, deterministically (a second boot printed the same lines). The
+op batches named the cause on one line: "cell ops 0 / 9 at tick -3" -- arcs of
+a power-cell discharge in a run where nothing had discharged yet.
+`MobSystem::Reset` left three tick-to-tick queues standing, each drained by the
+NEXT tick, so the first tick after a Reset replayed the last tick of the world
+before it:
+
+- `bodyBursts_`: a dying android's queued discharge, laid as IfAir arc cells;
+- `pendingSpawns_`: severed flesh's wet drips, spawned as particles;
+- `splatters_`: splash bursts, retired by AGE (`e.tick + 1 < tick`), so in a
+  run whose tick numbers restart lower they never retired, and the old fight's
+  splashes kept landing on the new crowd. This one surfaced only at tick 108,
+  as 0.0008 hp on one creature.
+
+`Reset` now clears them (and the presentation queues: severs, voices, shock
+cues, bleed sources). The game reaches it on every world regen and save load,
+so a load in a running session now starts like the same load in a fresh boot.
+
+With those fixed the gate passed standalone and still failed at suite scope,
+where the id counter starts elsewhere and so the gore draws differ. Its
+teardown check (every body BORN in a run must be gone after `CloseStage`) named
+the cause: two bodies per run, each a sentinel's `snout.4`, with the life
+"rig-live, severed-hold at tick 18, debris (dynamic) at tick 26, never held by
+DebrisSystem". `DebrisSystem::AdoptBody` refuses an empty collider lattice and
+returns. `Mob::DetachLimb` adopted a limb that had none left, then held,
+released and dropped a Jolt body that nobody owned, drew or removed. It fell
+through the world forever (y = -53 at teardown), and the next run started with
+it. `DetachLimb` (after its child recursion) and `Mob::ReleaseRigToDebris` now
+REMOVE such a limb's body instead. This one moves a fresh-process fight: the
+orphan was in the solver for the rest of the brawl. `mob-cap64`'s natural
+digests match b21d23a's to tick 129 and part at tick 130; 53 alive at the end
+instead of 54. So a perf before-arm taken on b21d23a is not the same fight as
+a tree that has this fix.
+
+`sim/trace_mark.h` puts an "M <text>" line into each open boot-to-boot trace
+(`SANDVOX_PHYS_TRACE`, `SANDVOX_DEBRIS_TRACE`, `SANDVOX_FETCH_TRACE`). The gate
+marks each arm, so an in-process failure splits one trace file into per-arm
+runs to diff. The fetch trace's `Q` stamp (`World::fetchTick_`) also survives a
+regen; it feeds only the age statistics, so diff with it masked.
+
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
 Until now the only ragdoll was death. `Mob::Die` flips every limb dynamic and
