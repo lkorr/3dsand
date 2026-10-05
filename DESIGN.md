@@ -12183,7 +12183,10 @@ never waits on the GPU tick (0 snapshot stalls; the harness's ~11 ms
 defers ticks when the GPU owes two snapshots, and at ~35 ms of CPU a tick the
 game falls behind 30 Hz into catch-up frames. Bodies are not the render cost:
 `drawMicro` ~1.3 ms GPU on frames it runs, the instance build ~0.1 ms CPU; the
-micro brick pool re-uploads ~0.5 MiB a frame in a fight.
+micro brick pool re-uploads ~0.5 MiB a frame in a fight. (Round 3, package
+F: the CPU tick budget now stops the catch-up frames; at round 3's ~23 ms
+tick the brawl holds 30 ticks/s with frame p50 ~20 ms, p95 ~31 ms -- see "The
+CPU tick budget" in §11.)
 
 **Left** (serial floors): blade carves ~5 ms, the burn head under its shared
 pot ~3.6 ms, the shock solve ~2.4 ms.
@@ -22955,6 +22958,46 @@ ticks) rather than banking it into a burst. Pure pacing: which ticks run and
 what they compute is unchanged, nothing hashed moves, and the headless
 harnesses never reach the branch. `--frames` prints the count as `gpu-lag
 throttle`; the live page shows it as `ticksThisFrame` sticking at 1.
+
+**The CPU tick budget (2026-10-05, fight64 round 3 package F).** The throttle
+watches the GPU; nothing watched the CPU, so when the TICK is the slow part
+(a 35 ms tick in a frame that also renders) every frame owes more than one
+tick, the next runs two, then four, and frames sit at ~160 ms. Now, after a
+frame's first tick, another runs only if `spent + last <= kTickDt` (the ticks
+this frame has run, plus the last one's wall as the forecast); otherwise the
+surplus debt is dropped to one tick, exactly as the throttle does. A cheap
+tick after a hitch still catches up (2 + 2 ms fits); an expensive one runs
+one per frame and **sim time slows** to what the machine can tick (the
+player-visible trade-off: a fight the CPU cannot tick at 30 Hz plays in
+slight slow motion instead of at 6 fps). Pure pacing: the tick count stays the
+authority, nothing hashed moves, the headless harnesses have no frame loop,
+`SANDVOX_TICKS_PER_FRAME` bypasses it, and a lockstep (`netPaced`) session
+breaks without dropping debt (the peer's clock is the tick clock).
+`SANDVOX_NO_TICK_BUDGET=1` is the A/B arm. `--frames` prints `cpu tick
+budget` (stops + debt dropped by door: budget / gpu throttle / 4-tick cap);
+`--brawl` prints a `pacing:` line over the fight (ticks/s, frames by ticks
+run, tick wall in the frame, dropped ticks).
+
+Measured `--brawl` (61 creatures, 300 fight ticks, `SANDVOX_RUN_EXCLUSIVE=1`,
+same fight in every arm: 55 alive at the end):
+
+| arm | ticks/s | frames 0/1/2/3/4 ticks | frame p50 / p95 / max ms |
+|---|---|---|---|
+| today's tick (~23 ms), budget off | 29.9 | 272 / 300 / 0 / 0 / 0 | 19.7 / 32.0 / 42.4 |
+| today's tick, budget on | 30.0 | 287 / 300 / 0 / 0 / 0 | 19.9 / 30.9 / 43.3 |
+| `SANDVOX_MOB_THREADS=1` (~35 ms tick), budget off | 27.5 | 28 / 62 / 10 / 15 / 43 | 35.9 / 161.6 / 173.7 |
+| `SANDVOX_MOB_THREADS=1`, budget on | 27.4 | 40 / 300 / 0 / 0 / 0 | 35.1 / 44.3 / 52.0 |
+
+At today's tick cost the real loop does not spiral at all (no frame ever ran
+two ticks: a ~23 ms tick plus ~3 ms of frame CPU leaves less than one tick of
+debt), so the budget is the guard for a heavier fight, and at ~35 ms it turns
+the 160 ms p95 into 44 ms for the same sim rate. **The frame is the tick**:
+render CPU outside it is ~1.5 ms (renderCpu 0.9, encode 0.2, upload 0.1,
+audio 0.1); the 64 bodies' share is instance build ~0.11 ms + micro pool
+upload ~0.04 ms CPU (~290 KiB a frame) and `drawMicro` ~1.0 ms GPU on the
+frames it runs, against a ~13 ms GPU frame that is not the bottleneck. The
+p95 frames are the ticks over ~30 ms, so further frame wins are tick wins (or a
+sim thread overlapping the tick with the render, which nothing here does).
 
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
 real tab in real headless Chrome and asserts both content (charts built from the
