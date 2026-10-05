@@ -91,6 +91,21 @@ enum Phase : uint8_t {
   kSplatter,    // inside kStain: this tick's bursts replayed against every body
   kShocks,      // MobSystem::ApplyShocks (the body solve; top of PreTick)
   kTwinSync,    // Mob::SyncJointTwins (inside BurnTick)
+  // Inside kBurnLimbs (PLAN_fight64_perf B): the burn loops across the work
+  // pool (wall), the serial finish (the sinks' replay, the flushes and the
+  // infection/pulp/heal tail; wall), and the loops' summed CPU time over every
+  // creature's task -- the work the pool divided, comparable with the old
+  // serial burnOne + crossHeat. The nested stages inside a task (burnOne,
+  // candLoop, queue, ...) are MUTED there (Mute), so after B they count only
+  // serial callers (the avatar, severed flesh); headCpu is the task total.
+  kBurnHeads,
+  kBurnFinish,
+  kHeadCpu,
+  // ...and the rest of kBurnLimbs: the walks taken ahead
+  // (MobSystem::PrecomputeBurnWalks) and the joint-twin sync's pool half
+  // (Mob::SyncJointTwinsPrepare, the tails' reconcile walk).
+  kBurnPre,
+  kTwinPrep,
   kCount
 };
 
@@ -107,7 +122,9 @@ inline const char* Name(int p) {
                                   "sense", "intent", "crowd", "drive",
                                   "stroke", "anim", "submit", "bleed",
                                   "actors", "shockQuery", "splatter",
-                                  "shocks", "twinSync"};
+                                  "shocks", "twinSync", "burnHeads",
+                                  "burnFinish", "headCpu", "burnPre",
+                                  "twinPrep"};
   return p >= 0 && p < kCount ? k[p] : "?";
 }
 
@@ -125,13 +142,19 @@ enum Counter : uint8_t {
   kSeedHot,      // hot cells the seeding visited
   kSeedFaces,    // ...faces of them past the box cull (footprint tested)
   kSeedFootReads,// ...index reads the footprint tests made
+  // MobSystem::BurnLimbs' pots (PLAN_fight64_perf B): creatures admitted to
+  // a pot, and of those the ones with burn work of their own (a front, a
+  // latched fire or a corrosive coat) -- the count the pool divides.
+  kPotMobs,
+  kBurningMobs,
   kNCount
 };
 inline const char* CounterName(int c) {
   static const char* k[kNCount] = {"seedProbes", "seedHits", "seedNew",
                                    "cands", "evaluated", "front", "windowed",
                                    "stainSamples", "stainSwept", "seedHot",
-                                   "seedFaces", "seedFootReads"};
+                                   "seedFaces", "seedFootReads", "potMobs",
+                                   "burningMobs"};
   return c >= 0 && c < kNCount ? k[c] : "?";
 }
 
@@ -145,6 +168,9 @@ struct Profile {
   uint32_t worstTick = 0;
   double worst[kCount] = {};
   uint64_t worstCalls[kCount] = {};
+  // Each stage's OWN worst tick (`worst` above is every stage at the tick
+  // whose TOTAL was worst, which hides a stage's spike on any other tick).
+  double peak[kCount] = {};
   uint32_t ticks = 0, over16 = 0, over33 = 0;
   double sumTotal = 0;
 };
@@ -171,6 +197,23 @@ inline double UsPerTick() {
   return k;
 }
 
+// MUTED on this thread: a work-pool task that wants its nested stages out of
+// the main-thread accumulators even when the CALLER drains it (a task's span
+// on the main thread would otherwise be counted as if it were the whole
+// stage, and a worker's not at all). RAII, per task; see kHeadCpu.
+inline thread_local bool tl_mute = false;
+struct Mute {
+  bool was;
+  Mute() : was(tl_mute) { tl_mute = true; }
+  ~Mute() { tl_mute = was; }
+  Mute(const Mute&) = delete;
+  Mute& operator=(const Mute&) = delete;
+};
+inline bool Recording() {
+  return Get().on && !tl_mute && !workpool::OnWorker();
+}
+inline uint64_t Tsc() { return __rdtsc(); }
+
 struct Scope {
   int ph;
   uint64_t t0 = 0;
@@ -178,7 +221,7 @@ struct Scope {
   // inside a workpool task would race them (a worker's span is still
   // counted -- inside the enclosing main-thread scope that waited for it).
   explicit Scope(int phase) : ph(phase) {
-    if (Get().on && !workpool::OnWorker()) t0 = __rdtsc();
+    if (Recording()) t0 = __rdtsc();
   }
   ~Scope() { Stop(); }
   // Close early (a span that ends before its enclosing block does).
@@ -216,6 +259,7 @@ inline void EndTick(uint32_t tick) {
     }
   }
   for (int i = 0; i < kCount; i++) {
+    if (p.cur[i] > p.peak[i]) p.peak[i] = p.cur[i];
     p.tot[i] += p.cur[i];
     p.calls[i] += p.curCalls[i];
     p.cur[i] = 0;
@@ -224,7 +268,15 @@ inline void EndTick(uint32_t tick) {
 }
 
 inline void Count(int c, uint64_t v) {
-  if (Get().on && !workpool::OnWorker()) Get().n[c] += v;
+  if (Recording()) Get().n[c] += v;
+}
+
+// Time measured elsewhere (a task's own clock, summed by the main thread after
+// the pool returns) into stage `ph`, as one call.
+inline void AddCpu(int ph, double us) {
+  if (!Recording()) return;
+  Get().cur[ph] += us;
+  Get().curCalls[ph]++;
 }
 
 inline void Reset() {
@@ -251,9 +303,10 @@ inline std::string Report() {
   }
   for (int i = 0; i < kCount; i++) {
     if (p.tot[i] < 1.0 && p.worst[i] < 1.0) continue;
-    std::snprintf(buf, sizeof buf, " %s %.2f/tick worst %.2f (x%llu, worst x%llu) |",
+    std::snprintf(buf, sizeof buf,
+                  " %s %.2f/tick worst %.2f peak %.2f (x%llu, worst x%llu) |",
                   Name(i), p.tot[i] / n / 1000.0, p.worst[i] / 1000.0,
-                  (unsigned long long)p.calls[i],
+                  p.peak[i] / 1000.0, (unsigned long long)p.calls[i],
                   (unsigned long long)p.worstCalls[i]);
     s += buf;
   }

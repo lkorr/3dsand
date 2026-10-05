@@ -8554,7 +8554,10 @@ limb emitted nothing: one tick of fire per limb every 15 (a human), a 2 Hz
 flicker from limb to limb. Now each pot is split by BURNING WEIGHT
 (`Mob::LimbBurnWeight`, the front size floored at 64; `BurnShareOf`): a limb,
 and in `BurnLimbs` a creature, gets its proportional share of what is left and
-what it does not spend flows on. Proportional, not equal — an equal split capped
+what it does not spend flows on. (Across CREATURES that flow-on stopped in
+fight64 round 3 package B: the creature slices are fixed before the pool runs
+-- see "The burn head on the work pool" below. Within a creature it is
+unchanged.) Proportional, not equal — an equal split capped
 a torso visited first at 1/n while the small limbs after it left theirs unspent
 (garment-burn's smock fell 86% → 28%). Inside a limb the candidate list is also
 walked from a tick-keyed offset, so a short share is spread over the surface
@@ -12199,6 +12202,78 @@ limb's collider order moved (the `determinism` gate's hash did not; the 64
 brawl's trajectory did). `mob-cap64`: carve 4.30 -> 2.78 ms a tick over the
 same ~3,090 carves. Everything else still open, ranked, is in
 docs/PLAN_fight64_perf.md "TBD: 64-body fight performance".
+
+**The burn head on the work pool (2026-10-05, fight64 round 3 package B;
+`MobSystem::BurnLimbs`, `Mob::BurnHeadLimbs` / `BurnHeadFinish`, `BurnSink`).**
+The per-creature burn loop under the shared pot was the last serial piece of
+the burn pass. It now runs on the pool, and the pot is what had to change:
+
+- **A prefix split.** Every admitted creature's (front, ops) slice is computed
+  BEFORE anybody burns, in pot order, with `BurnShareOf` as before, but the pot
+  is charged the slice HANDED OUT rather than the slice SPENT. The slices sum to
+  at most the pot (rule 2 holds), and each loop can run alone.
+  - **Budget shift:** a creature no longer inherits what the creatures before it
+    in the rotation left unspent this tick. Within a creature the limb split
+    and its flow-on are unchanged.
+  - **A creature with no burn work but hot contact is "catching".** That is a
+    walk taken ahead (`BurnWalkPre`) that found something reactive round one of
+    its limbs. It is weighed at 64 a touching limb, `LimbBurnWeight`'s floor.
+    It is no longer offered the whole remainder at its turn.
+  - **A creature with neither runs its idle pass on a token slice** (1 front,
+    0 ops): sleep keys, index grace. It spends nothing. Every input that could
+    wake `BurnOneLimb` is either in its weight or in the walk.
+  - **Every admitted creature runs its head every tick.** The old loop stopped
+    at the first creature that found the pot empty, and so skipped the rest's
+    infection, pulp and heal ticks.
+- **Record, then replay.** A task (`Mob::BurnHeadLimbs`) writes only its own
+  creature's lattices, indices, fronts and coat flags. Everything shared goes
+  into the creature's `BurnSink`, in the order the inline pass made it:
+  - its cell ops;
+  - chunk-fetch requests (`RainExposedCpu` included);
+  - the micro brick's copy-on-write and pokes (`kOwn` / `kPoke` / `kStain`, each
+    re-asking "is it owned now" at replay);
+  - body reaction effects;
+  - the counters.
+
+  `Mob::BurnHeadFinish` replays each sink serially in pot order, then runs:
+  - the FLUSHES of the limbs the loop visited, in its rotation;
+  - the infection / pulp / heal tail.
+
+  The cell-op ceiling is applied at the replay (an op past it is a counted
+  refusal, as an inline refused emit was). `BurnTickHead` (the avatar) is the
+  same two halves with nothing deferred (`record = false`).
+- **Within a creature the flushes now run after ALL its limbs have burnt**, not
+  between them. A flush that severs or kills no longer stops that creature's
+  later limbs burning this tick.
+- **Both pots' loops run in ONE pool pass, heaviest first** (corpses fill the
+  pool's tail). The serial halves keep their old order: the living's finishes,
+  twin syncs and recounts, then the dead's.
+- **The recount.** `Mob::RecountBurnMeasure` (the sweep, `burnFrac_`,
+  `burnCap_`) runs across the pool after every sync. `ApplyBurnCap` (the
+  clamp, a death) follows serially in pot order. `SurfaceCount`, taken once
+  per limb on a creature's first burn tick, reads a dense occupancy bitmap of
+  the lattice's box instead of an `unordered_set`. Same predicate; it was the
+  12 ms "one creature" recount spike.
+- **burnprof.** New stages: `burnHeads` (pool wall), `burnFinish`, `headCpu`
+  (the tasks' summed CPU, comparable with the old serial `burnOne` +
+  `crossHeat`), `burnPre`, `twinPrep`. New counters: `potMobs`,
+  `burningMobs`. Each stage also reports its own `peak` tick. Nested stages
+  inside a task are muted (`burnprof::Mute`), so `burnOne`, `candLoop` and
+  the rest now count only serial callers (the avatar, severed flesh).
+
+**Measured** (`mob-cap64`, `SANDVOX_RUN_EXCLUSIVE=1`, b21d23a vs this):
+- burnLimbs: 2.85 -> 1.56 ms a tick, with a 13% BIGGER fire (front 2,346 ->
+  2,645 a tick, 14 burning creatures of 63 admitted).
+- Head CPU: 1.93 ms, on a 0.39 ms pool wall.
+- recount: 0.48 -> 0.20 ms mean. Its worst tick fell from 12.2 to 0.68.
+
+The fight moved at tick 52 (budget shift): 54 -> 48 alive. The per-tick
+digests are identical across `SANDVOX_MOB_THREADS=1` and the default. The
+`determinism` hash did not move.
+
+Left inside burnLimbs:
+- the joint-twin sync, about 1 ms (`twinPrep` + `twinSync`, package K's);
+- the walks ahead, 0.23 ms.
 
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 

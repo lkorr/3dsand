@@ -961,6 +961,8 @@ struct BurnWalkPre {
   std::vector<IVec3> fetches;   // RequestChunkFetch(Mob) calls, in order
 };
 
+struct BurnSink;  // below MobSystem: one creature's deferred burn head
+
 struct BurnLimbView {
   std::vector<PrefabVoxel>* skin = nullptr;  // skinScale units, int16
   std::vector<DebrisVoxel>* coll = nullptr;  // physScale units, int8
@@ -985,6 +987,13 @@ struct BurnLimbView {
   uint32_t crossPct = 0;
   // The world side taken ahead for this limb this tick (BurnWalkPre), or null.
   const BurnWalkPre* walkPre = nullptr;
+  // THE PARALLEL HEAD'S RECORDER (PLAN_fight64_perf B, BurnSink). Non-null
+  // when BurnOneLimb runs inside a work-pool task: everything it would write
+  // that is not this creature's own -- chunk-fetch requests, the micro brick's
+  // copy-on-write and pokes, body reaction effects, the diagnostic counters --
+  // goes into the sink instead, and Mob::BurnHeadFinish replays it serially in
+  // pot order. Null = write it all directly (the avatar, severed flesh).
+  BurnSink* sink = nullptr;
   // The coat ledger says this lattice wears a CORROSIVE coat (LimbCoat::
   // corrosive), so BurnOneLimb must run even with nothing in the world around
   // it: the acid is ON the limb. Set by the caller from its ledger.
@@ -2720,6 +2729,19 @@ class Mob {
   bool BurnTickHead(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                     std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                     uint32_t& opsBudget);
+  // The head in two halves again (PLAN_fight64_perf B). BurnHeadLimbs is the
+  // per-limb burn loop under this creature's (front, ops) share: it writes
+  // this creature's lattices and burn state and nothing else of anybody's
+  // when `s.record` (its cell ops into s.ops, everything shared into the
+  // sink), so MobSystem::BurnLimbs runs it for every creature across the
+  // work pool. BurnHeadFinish is the serial rest, in pot order: the sink's
+  // replay, the flushes of the limbs the loop visited (in its rotation), and
+  // the infection / pulp / heal tail. False where BurnTick returned early (a
+  // flush severed or killed). BurnTickHead is the two back to back.
+  void BurnHeadLimbs(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                     uint32_t& frontBudget, uint32_t& opsBudget, BurnSink& s);
+  bool BurnHeadFinish(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
+                      std::vector<ParticleSpawn>& spawns, BurnSink& s);
   // How much of the shared burn budgets limb `li` is owed this tick: 0 when it
   // has no burn work of its own (nothing alight, no front, no corrosive coat),
   // else its front size -- the burning surface, which is what both its
@@ -4617,7 +4639,8 @@ class Mob {
   // Costs nothing on a creature with no limb alight. `tick` only rotates which
   // limb's front is walked first when the scan budget cannot cover them all --
   // the same fairness BurnTick and BurnLimbs apply, for the same reason.
-  void BuildCrossLimbHeat(uint32_t tick);
+  // `sink` non-null: a work-pool task's (its counter goes there).
+  void BuildCrossLimbHeat(uint32_t tick, BurnSink* sink = nullptr);
   // `ctx` is the cause whose per-voxel removals are being flushed: Burn for
   // the burn / infection / joint-twin passes, Blunt for the pulp tick, and a
   // strike's own cause when CarveLimb flushes pending tombstones before it
@@ -4920,6 +4943,10 @@ class Mob {
   // ApplyBurnCap. `force` ignores the cadence (a sever or a gate wants the
   // answer now).
   void RecountBurn(uint32_t tick, bool force = false);
+  // RecountBurn's measuring half: the sweep, burnFrac_ and burnCap_, and
+  // nothing outside this creature (no kill), so MobSystem::BurnLimbs runs it
+  // across the work pool. True when it measured (ApplyBurnCap is then owed).
+  bool RecountBurnMeasure(uint32_t tick, bool force);
 
   // ---- the coat ledger (see LimbCoat) --------------------------------------
   // A coat byte changed since the ledger was taken. Set by every writer —
@@ -5009,7 +5036,8 @@ class Mob {
   // failed roll, no ground, or a refused budget).
   uint32_t ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick, World& world);
   // Burnable voxels of a limb with at least one open face, on its
-  // authoritative lattice. One hash pass; taken once per limb (surfaceAtSpawn).
+  // authoritative lattice. One pass over a dense occupancy bitmap of the
+  // lattice's box; taken once per limb (surfaceAtSpawn).
   // `skip` (sorted TwinRestKey list, with the limb's TwinOrigin) names cells
   // that still occlude but are not counted: a joint twin's CHILD copies,
   // whose surface is the parent's to count (Mob::twinShadow_).
@@ -5579,7 +5607,10 @@ class MobSystem {
   // mirror: the representative fall line of p's texel, upward from p, for a
   // ray blocker (src/sim/rainexpo.h ExposedWalkUp). An uncached chunk ends the
   // walk EXPOSED and asks for the chunk, OpenToSky's rule.
-  bool RainExposedCpu(World& world, const Vec3& p) const;
+  // `fetchOut` non-null (a work-pool task, BurnSink): the chunk-fetch request
+  // it would issue is appended there instead, for the serial replay.
+  bool RainExposedCpu(World& world, const Vec3& p,
+                      std::vector<IVec3>* fetchOut = nullptr) const;
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
   // The loader's leftovers, so this system can build one more creature after
@@ -7531,8 +7562,12 @@ class MobSystem {
   // part i's view (null = no body), and a cell's limb bit is its index here.
   // Mob::BuildCrossLimbHeat passes a creature's limbs; BurnDeadFlesh passes
   // one severed part's pieces.
+  // `stats` null = this system's burnStats_; a work-pool task passes its
+  // BurnSink's.
+  struct BurnStats;  // below (the burn pass's counters)
   void BuildCrossHeat(const std::vector<BurnLimbView*>& parts, uint32_t tick,
-                      std::vector<CrossHeatCell>& out);
+                      std::vector<CrossHeatCell>& out,
+                      BurnStats* stats = nullptr);
   // The severed-part twin of Mob::WornAlong: the first shell met marching
   // from `from` along `dir`, over the bodies strapped to one piece.
   uint32_t FleshWornAlong(const std::vector<DebrisSystem::FleshShell>& shells,
@@ -8083,6 +8118,8 @@ class MobSystem {
   // One per creature: StainLimbs' splatter tasks (SplatSink). Kept so the
   // vectors keep their capacity across ticks.
   std::vector<SplatSink> splatSinks_;
+  // One per creature: BurnLimbs' head tasks (BurnSink), kept for capacity.
+  std::vector<BurnSink> burnSinks_;
   BurnStats burnStats_{};
   // Reaction effects that fired ON a body this tick (BurnOneLimb's
   // noteBodyFx), drained by game/session.cpp's reaction-effect pass through
@@ -8536,6 +8573,66 @@ class MobSystem {
   // pool, event sinks, material tables) through this friendship — the same
   // seam the avatar used to reach BurnOneLimb through, made symmetrical.
   friend class Mob;
+};
+
+// ONE CREATURE'S BURN HEAD, DEFERRED (PLAN_fight64_perf B).
+//
+// MobSystem::BurnLimbs runs every creature's limb loop (Mob::BurnHeadLimbs)
+// across the work pool under a (front, ops) share fixed BEFORE the pool runs
+// (the prefix split, BurnLimbs' note). A task writes its own creature's
+// lattices, burn indices, fronts and coat flags itself and RECORDS everything
+// else here, in the order the inline pass made it: its grid writes, its
+// chunk-fetch requests (a shared, bounded queue), the micro brick's
+// copy-on-write and pokes (the pool is everybody's), body reaction effects (a
+// capped shared list) and the diagnostic counters. Mob::BurnHeadFinish then
+// replays the sink serially in pot order, so every shared structure sees the
+// same sequence a serial loop over the creatures in that order would have
+// made. `record` false is the serial form (BurnTickHead: the avatar), which
+// writes everything directly and uses only the loop's bookkeeping below.
+struct BurnSink {
+  bool record = true;
+  // The limb loop's bookkeeping, for the finish.
+  int start = 0;                  // the tick-rotated start limb
+  std::vector<uint8_t> visited;   // limbs the loop reached (flushed in rotation)
+  bool burnt = false;             // some limb changed: MarkInstancesDirty
+  // Deferred shared writes.
+  std::vector<CellOp> ops;
+  std::vector<IVec3> fetches;
+  std::vector<ReactFxEvent> fx;
+  struct Micro {
+    uint8_t kind = 0;   // kOwn / kPoke / kStain
+    uint8_t art = 0;    // kPoke: the art slot
+    int16_t limb = -1;
+    int16_t x = 0, y = 0, z = 0;
+    uint16_t val = 0;   // kPoke: material; kStain: the coat word
+  };
+  enum : uint8_t {
+    kOwn = 0,    // ensureOwnedBrick: own the brick unless already carved
+    kPoke = 1,   // MicroBodyPoke if the brick is owned (carved) by then
+    kStain = 2,  // OwnForStain, then MicroBodyPokeStain if that owned it
+  };
+  std::vector<Micro> micro;
+  int curLimb = -1;
+  MobSystem::BurnStats stats{};
+  MobSystem::WornStats worn{};
+  SplatSink index;               // BuildBurnIndex's two counters
+  uint64_t prof[16] = {};        // burnprof::Count, by counter id
+  double cpuUs = 0.0;            // the task's own time (burnprof headCpu)
+  void Clear() {
+    start = 0;
+    visited.clear();
+    burnt = false;
+    ops.clear();
+    fetches.clear();
+    fx.clear();
+    micro.clear();
+    curLimb = -1;
+    stats = MobSystem::BurnStats{};
+    worn = MobSystem::WornStats{};
+    index.Clear();
+    for (uint64_t& v : prof) v = 0;
+    cpuUs = 0.0;
+  }
 };
 
 // THE SLITHER'S OWN COST (Mob::ApplySlither, game/pose.cpp): calls and
