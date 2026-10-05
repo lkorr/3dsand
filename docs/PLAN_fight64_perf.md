@@ -359,3 +359,167 @@ frames climb from ~30 to ~180 ms.
 6. **p95: `RecountBurn` spikes (worst tick 17–23 ms, one creature).** Amortise
    the recount across ticks on a (tick, id) schedule.
 7. **Bleed 0.7–1.1 ms and stain 2.7 ms.** Already pooled by M. Small.
+
+## Round 3 (2026-10-05) — "optimize the hell out of all of the systems at play"
+
+Owner, 2026-10-05: carry on the 64-creature work and optimise every system in
+the fight. The "30 Hz is TBD" deferral is lifted: round 3 works the whole
+ranked list above, plus the determinism soak that round 2 skipped.
+
+### Fresh baseline (main b21d23a, exe built from HEAD)
+
+`SANDVOX_RUN_EXCLUSIVE=1 --selftest --gate mob-cap64`. The full output is in
+`F:/sv-fight64/baseline_b21d23a_mobcap64.txt`. A frozen copy of the exe is at
+`F:/sv-fight64/sandvox_b21d23a.exe`. Use it as the before-arm for C++-only
+packages: it reads main's assets through the compiled-in path, or set
+`SANDVOX_ASSET_DIR`.
+
+| Phase, ms per tick | b21d23a |
+|---|---|
+| Tick wall mean / p95 / worst | 31.73 / 39.90 / 47.31 |
+| Mob side (burnprof mean / worst) | 14.29 / 32.77 |
+| ...stroke (worst 15.78) | 3.78 |
+| ...carve (worst 9.98) | 2.38 |
+| ...burn (burnLimbs; worst 13.55) | 2.83 |
+| ...recount (worst 12.09, one creature) | 0.47 |
+| ...stain (stainContact 1.02) | 2.28 |
+| ...shocks | 2.18 |
+| ...bleed / splatter / twinSync / anim | 0.58 / 0.47 / 0.42 / 0.41 |
+| Jolt Update | 3.80 |
+| ...ccd wall / cpu | 1.99 / 7.36 |
+| ...collide wall / cpu | 1.24 / 7.41 |
+| pageTableCpu / terrainMesh | 0.91 / 0.83 |
+| readbackStall (harness-only) | 10.75 |
+
+The end state was 54 alive, with 18.9 rig-dead linear casts a tick.
+
+**Target.** Mob side plus physics under 10 ms mean, and the worst tick under
+16 ms. In the real windowed `--brawl` loop, frames stop spiralling and hold
+p50 at or under ~33 ms with 64 bodies on screen.
+
+### Round 3 rules (in addition to "Rules for every package" above)
+
+- **Perf numbers are only comparable on the SAME fight.**
+  - A change that is meant to leave behaviour bit-identical must show it:
+    `SANDVOX_MOBCAP_DIGEST=1` per-tick digests identical to the before-arm.
+    Then the timing delta is clean attribution.
+  - A change that deliberately moves the fight (a budget split, a collider
+    order) must say so. It must also report the counts that set the cost:
+    alive at the end, carves, linear-cast bodies, front size. The reader
+    then knows whether the gain is the change or a different fight.
+- **Noise.** Run the before-arm and after-arm back to back under
+  `SANDVOX_RUN_EXCLUSIVE=1`. Quote the mean of 2 runs per arm when the delta
+  is under 1 ms.
+- **Write cost into instruments, not into prose.** If a stage is opaque, add
+  a `burnprof` stage or a Jolt phase line. These are permanent.
+- **Disk.** C: has ~50 GB free. Put a worktree `build/` on F:
+  (`F:/sv-wt/<name>`, junctioned) if you see less than 10 GB.
+- **File ownership** is listed per package. `mob.cpp` is 32k lines and shared
+  by B, X and K. Each owns a named REGION, so keep diffs inside it and do not
+  reformat or move code you do not own.
+
+### Package S — determinism soak and a permanent twice-run gate (gates trust; highest priority)
+
+Owns: `src/test/selftest_combat.cpp` (mob-cap64 and any new gate),
+`tests/baseline.json` rows for it, and whatever a found race lives in (name
+the file in a board note before touching another package's file).
+
+This is round 2's package R item 2, verbatim scope:
+- 3+ runs each of the natural and `killEvery 4` arms with
+  `SANDVOX_MOBCAP_DIGEST=1`;
+- `SANDVOX_MOB_THREADS=1` vs the default;
+- `SANDVOX_PHYS_THREADS=1/2/7`.
+
+Attribute any divergence to its first tick and field with
+`SANDVOX_PHYS_TRACE` and `Physics::DebugBodyStates`, then FIX the cause.
+
+Land a permanent gate (e.g. `mob-cap64-twice`). It runs a shorter brawl
+twice in-process, with different mob and phys thread counts, and requires
+identical per-tick digests. It must be fast enough to sit in every perf
+package's `--verify` (aim for under 20 s).
+
+Report whether the divergence M saw was real. If it was, give the root cause.
+
+### Package C — physics: CCD, collide, terrain mesh
+
+Owns: `src/phys/physics.*`, `src/phys/debris.*`, and the terrain-collider
+mesher (whatever `terrainMesh` times).
+1. Per-body motion quality before each `Update`. CCD (`LinearCast`) only when
+   `|v|·dt > 0.375 × min(local-bounds extent)`; otherwise `Discrete`. See the
+   ranked list item 1 above. Consider casting living ragdolls as their hull,
+   as corpses already are. Keep the terrain no-tunnel gates green.
+2. `collide` is 7.4 ms CPU across the Jolt workers.
+   - Measure which pair kinds dominate the narrow phase now.
+   - Fix it with layers, cheaper shapes, or sleep thresholds for settled
+     corpses and debris.
+3. `terrainMesh` 0.83 ms. Find out what it re-meshes per tick in a fight, and
+   whether it needs to.
+
+### Package F — the real frame: pacing spiral + render side of 64 bodies
+
+Owns: `src/main.cpp` frame loop / tick pacing and `--brawl`; render-side body
+code (`src/gpu/`, body raster shaders) if measurement says so.
+1. The spiral. See the ranked list item 2: a CPU tick budget. After the first
+   tick of a frame, run another only if `spentTickMs + lastTickMs <= kTickDt`.
+   Otherwise drop the debt. Add a dropped-tick counter, and an env A/B arm.
+   Headless runs and `SANDVOX_TICKS_PER_FRAME` must not take this path.
+2. Measure `--brawl` in the real windowed loop, before and after: frame
+   p50/p95/worst, ticks per second, dropped ticks.
+3. Then the render side with 64 creatures on screen. Use a crowd camera
+   (add a `--render-budget` arm or a `--brawl` view if needed). If body
+   rendering, micro-body brick uploads, or per-frame CPU body work is
+   significant, fix the dominant term.
+4. The per-frame CPU outside the tick, e.g. anything that walks all 64 rigs
+   every frame for interpolation, audio, or the HUD.
+
+### Package B — burn: parallel head under a prefix-split budget, amortised recount
+
+Owns, in `mob.cpp`: the burn region (`BurnTickHead`, `BurnOneLimb`,
+`FlushBurn`, `BurnShareOf`, `RecountBurn` and their helpers),
+`src/game/burnprof.h`, and `src/game/workpool.*` if extended.
+1. Ranked item 3 above. Shares are computed up front in pot order. Per-limb
+   burns run in parallel into per-creature buffers. Then a serial flush in
+   pot order. Name the budget shift.
+2. Ranked item 6: `RecountBurn`'s 12 ms one-creature spike. Make it
+   incremental, or amortise it on a (tick, id) schedule. The worst tick is
+   the target here.
+3. Keep `mob-burn`, `burn-*`, `corpse-*` burn gates green.
+
+### Package X — stroke and carve (the blade path)
+
+Owns, in `mob.cpp`: the stroke/strike/carve region (`CarveLimb`, the stroke
+tests, sever/rebuild). Also `src/phys/lattice.h` (`SpallGrow`,
+`DownsampleSkin`) and `src/game/melee.*`.
+1. `SANDVOX_SAMPLE_PROF=1 --gate mob-cap64`: the stroke 3.78 ms (worst 15.78)
+   and carve 2.38 (worst 9.98) at function level.
+2. Fix the dominant terms:
+   - `SpallGrow`'s per-round `unordered_set`;
+   - allocations per carve;
+   - collider rebuild cost (`rebuild` 0.32);
+   - redundant stroke tests (spatial culls against limb AABBs cached per
+     tick).
+3. Can carves or rebuilds for DIFFERENT creatures run in parallel, with a
+   serial apply in id order? Do it if the profile says it is the lever.
+   The worst tick (32 carves on one tick) is the target as much as the mean.
+4. Keep the blade, wound, sever and cleave gates green.
+
+### Package K — shocks, stain, splatter, bleed, twinSync
+
+Owns: `src/game/mob_shock.cpp`. In `mob.cpp`: the stain / splatter / bleed /
+twinSync regions.
+1. Ranked item 4: split the shock solve into connected components by box
+   contact. Solve them in parallel and emit ops in part order. The result
+   must be bit-identical: show digest equality.
+2. Stain 2.28 ms (stainContact 1.02 over 138k calls a tick): cull contacts
+   that cannot transfer anything, cache per-tick limb data, parallelise per
+   creature with an id-order merge.
+3. Splatter 0.47, bleed 0.58, twinSync 0.42: whatever the profile shows is
+   cheap to take.
+4. Keep `elec-*`, `corpse-splatter`, `stain-*`, and the bleed gates green.
+
+### Merge order
+
+S first. If S finds a race, fix it before the perf numbers are trusted. Then
+C, F, B, X and K, as each is reviewed. The orchestrator re-measures the
+combined tree once, rebaselines the determinism pin once, and rebuilds
+main's exe.
