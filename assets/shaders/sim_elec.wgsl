@@ -349,6 +349,16 @@ const EM_ROUND_CHUNKS : u32 = 25u;
 const EM_COND_PEAK : u32 = 26u;
 const EM_ROUND_HIST : u32 = 27u;
 const EM_ARGS : u32 = 32u;
+// THE POND RULE (wave 3; elec.h kEmLiqQ): Q (the highest potential that tried
+// to enter a liquid cell, decayed by the head), N (liquid cells charged, summed
+// by the round), the cap the next round applies, and the N it came from.
+const EM_LIQ_Q : u32 = 8u;
+const EM_LIQ_N : u32 = 9u;
+const EM_LIQ_CAP : u32 = 10u;
+const EM_LIQ_N_LAST : u32 = 11u;
+// The neighbour count (cache bits 12..14, wgP bits 28..31) of a conducting
+// LIQUID cell: it pays no spreading loss and is held under the pond cap.
+const ELEC_N_LIQUID : u32 = 7u;
 const EM_LIST0 : u32 = 66624u;
 const EM_LIST1 : u32 = 68672u;
 const EM_STACK : u32 = 70720u;
@@ -419,11 +429,15 @@ fn elecWordIn(pe : u32, i : u32) -> u32 {
 // neighbours (a wire's two cost nothing), held under 4096 so the result never
 // falls as prev rises (monotone: the relaxation still only climbs to a least
 // fixpoint, whatever the order). Integer, no overflow (65535 x 4095 < 2^32).
-fn elecEnter(prev : u32, c : u32, k : u32, free : u32) -> u32 {
+// WAVE 3: k is scaled by min(resist, ref) / ref (elec.h ElecSpreadQ; kq =
+// k x 256 / ref, so (n - free) x min(res, ref) x kq stays under 2^21), and a
+// LIQUID cell (n = ELEC_N_LIQUID) pays no spreading loss at all -- the pond
+// cap divides its charge instead (elecSweep).
+fn elecEnter(prev : u32, c : u32, kq : u32, free : u32, rref : u32) -> u32 {
   let res = (c >> 16u) & ELEC_RES_MASK;
   let n = c >> 28u;
   var q = 0u;
-  if (n > free) { q = min((n - free) * k, 4095u); }
+  if (n > free && n != ELEC_N_LIQUID) { q = min(((n - free) * min(res, rref) * kq) >> 8u, 4095u); }
   return elecSub(prev, res + ((prev * q) >> 12u));
 }
 
@@ -542,6 +556,23 @@ fn elecAlloc(@builtin(local_invocation_index) li : u32) {
   }
   atomicMax(&elecMeta[EM_PAGES_PEAK], fresh + (taken - fromStack) - (top - fromStack));
   let n = destCount + taken;
+  // THE POND CAP for the round this call precedes (elec.h kEmLiqQ): Q decayed
+  // once a tick (at the head, like every stored P), N the liquid cells the
+  // previous round left charged. cap = Q x V / max(N, V), V = sim.elecPoolCells
+  // (Q < 2^16 and V < 2^16, so the product fits). Q = 0 caps liquid at 0 for
+  // one round: Q is recorded uncapped, so the round after charges the pond.
+  if (!tail) {
+    var q = atomicLoad(&elecMeta[EM_LIQ_Q]);
+    if (phase == 0u) {
+      q = elecDecayed(q, max(elecParams[EP_DECAY], 1u), min(elecParams[EP_DECAY_SHIFT], 15u));
+      atomicStore(&elecMeta[EM_LIQ_Q], q);
+    }
+    let liqN = atomicLoad(&elecMeta[EM_LIQ_N]);
+    let vol = max(elecParams[EP_SPREAD_FREE] >> 16u, 1u);
+    atomicStore(&elecMeta[EM_LIQ_CAP], min((q * vol) / max(liqN, vol), 65535u));
+    atomicStore(&elecMeta[EM_LIQ_N_LAST], liqN);
+    atomicStore(&elecMeta[EM_LIQ_N], 0u);
+  }
   if (!tail) {
     atomicStore(&elecMeta[EM_COUNT0 + dest], n);
     atomicStore(&elecMeta[EM_PHASE], phase + 1u);
@@ -558,6 +589,11 @@ fn elecAlloc(@builtin(local_invocation_index) li : u32) {
   } else {
     elecSetArgs(ELEC_ARG_PURGE, 0u);
     atomicStore(&elecMeta[EM_COUNT0 + nxt], n);
+  }
+  // An empty field next tick holds no liquid charge: the pond rule starts over.
+  if (purge || n == 0u) {
+    atomicStore(&elecMeta[EM_LIQ_Q], 0u);
+    atomicStore(&elecMeta[EM_LIQ_N], 0u);
   }
   atomicStore(&elecMeta[EM_COUNT0 + cur], 0u);
   atomicStore(&elecMeta[EM_CUR], nxt);
@@ -581,6 +617,8 @@ var<workgroup> wgChanged : atomic<u32>;
 var<workgroup> wgFaces : atomic<u32>;
 var<workgroup> wgMax : atomic<u32>;
 var<workgroup> wgCondMax : atomic<u32>;
+var<workgroup> wgLiqN : atomic<u32>;
+var<workgroup> wgLiqQ : atomic<u32>;
 var<workgroup> wgGo : u32;
 var<workgroup> wgCap : u32;
 var<workgroup> wgBuilt : u32;
@@ -605,9 +643,11 @@ fn elecFaceCell(f : u32, a : u32, b : u32, own : bool) -> u32 {
 }
 // One axis sweep: thread li owns the line of 16 cells along `axis` through
 // (a, b) = (li & 15, li >> 4), forward from the low face's halo and back from
-// the high one's. Returns whether any cell rose. k / free: the spreading loss
-// (elecEnter).
-fn elecSweep(axis : u32, li : u32, k : u32, free : u32) -> bool {
+// the high one's. Returns whether any cell rose. kq / free / ref: the spreading
+// loss (elecEnter). A LIQUID cell is held under `liqCap` (the pond rule), and
+// what tried to enter it uncapped is folded into *qmax (the next cap's Q).
+fn elecSweep(axis : u32, li : u32, kq : u32, free : u32, rref : u32, liqCap : u32,
+             qmax : ptr<function, u32>) -> bool {
   var base : u32;
   var stride : u32;
   if (axis == 0u) { base = li * 16u; stride = 1u; }
@@ -620,7 +660,11 @@ fn elecSweep(axis : u32, li : u32, k : u32, free : u32) -> bool {
     let c = wgP[idx];
     var p = c & 0xFFFFu;
     if (((c >> 16u) & ELEC_RES_MASK) != ELEC_RES_INS) {
-      let cand = elecEnter(prev, c, k, free);
+      var cand = elecEnter(prev, c, kq, free, rref);
+      if ((c >> 28u) == ELEC_N_LIQUID) {
+        *qmax = max(*qmax, cand);
+        cand = min(cand, liqCap);
+      }
       if (cand > p) {
         p = cand;
         wgP[idx] = (c & 0xFFFF0000u) | p;
@@ -635,7 +679,11 @@ fn elecSweep(axis : u32, li : u32, k : u32, free : u32) -> bool {
     let c = wgP[idx];
     var p = c & 0xFFFFu;
     if (((c >> 16u) & ELEC_RES_MASK) != ELEC_RES_INS) {
-      let cand = elecEnter(prev, c, k, free);
+      var cand = elecEnter(prev, c, kq, free, rref);
+      if ((c >> 28u) == ELEC_N_LIQUID) {
+        *qmax = max(*qmax, cand);
+        cand = min(cand, liqCap);
+      }
       if (cand > p) {
         p = cand;
         wgP[idx] = (c & 0xFFFF0000u) | p;
@@ -655,6 +703,9 @@ fn elecSweep(axis : u32, li : u32, k : u32, free : u32) -> bool {
 fn elecCacheCell(i : u32, wc : vec3<i32>) -> u32 {
   let st = wgP[i];
   let res = st & ELEC_RES_MASK;
+  // A conducting LIQUID (staging bit 13) carries the pond rule's count, not
+  // its neighbours': it pays no spreading loss.
+  if ((st & 0x2000u) != 0u) { return res | (ELEC_N_LIQUID << 12u) | (st & 0x8000u); }
   let lo = vec3<i32>(i32(i & 15u), i32((i >> 4u) & 15u), i32(i >> 8u));
   var n = 0u;
   for (var f = 0u; f < 6u; f++) {
@@ -688,8 +739,10 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
   let dst = page + (1u - (r & 1u)) * ELEC_HALF_WORDS;
   let decay = select(0u, max(elecParams[EP_DECAY], 1u), r == 0u);
   let decayShift = min(elecParams[EP_DECAY_SHIFT], 15u);
-  let spreadK = min(elecParams[EP_SPREAD_Q], 4095u);
-  let spreadFree = min(elecParams[EP_SPREAD_FREE], 6u);
+  let spreadKq = elecParams[EP_SPREAD_Q];
+  let spreadFree = min(elecParams[EP_SPREAD_FREE] & 15u, 6u);
+  let spreadRef = max((elecParams[EP_SPREAD_FREE] >> 4u) & 0xFFFu, 1u);
+  let liqCap = atomicLoad(&elecMeta[EM_LIQ_CAP]);
   let mode = elecMode();
   let wc = slotWorldChunk(slot, T.origin);
   let pe = pageEntryOf(slot);
@@ -698,6 +751,8 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgFaces, 0u);
     atomicStore(&wgMax, 0u);
     atomicStore(&wgCondMax, 0u);
+    atomicStore(&wgLiqN, 0u);
+    atomicStore(&wgLiqQ, 0u);
     wgCap = clamp(elecParams[EP_ITER_CAP], 1u, 64u);
     wgBuilt = select(0u, 1u, elecPool[stampAt] == T.tick + 1u);
   }
@@ -709,12 +764,14 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
   // solute word, and scan no face. Each thread owns words li + 256 k.
   var cw : array<u32, 8>;
   if (!built) {
-    // Staging: resist | source << 15 per cell, so the neighbour count can
-    // read the whole chunk's.
+    // Staging: resist | liquid << 13 | source << 15 per cell, so the
+    // neighbour count can read the whole chunk's. Liquid = a conducting cell
+    // of a CLASS_LIQUID material (the pond rule).
     for (var i = li; i < CHUNK_VOL; i += 256u) {
       let w = elecWordIn(pe, i);
       let res = elecCellResist(w, slot, i);
-      wgP[i] = res | select(0u, 0x8000u, elecCellSource(w) != 0u);
+      let liq = res != ELEC_RES_INS && materials[voxMat(w)].klass == CLASS_LIQUID;
+      wgP[i] = res | select(0u, 0x2000u, liq) | select(0u, 0x8000u, elecCellSource(w) != 0u);
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k++) {
@@ -746,6 +803,7 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
       if (res != ELEC_RES_INS) {
         let old = (olds >> (h * 16u)) & 0xFFFFu;
         p = max(p, elecDecayed(old, decay, decayShift));
+        if (((cc >> 12u) & 7u) == ELEC_N_LIQUID) { p = min(p, liqCap); }
       }
       wgP[i] = p | (res << 16u) | (((cc >> 12u) & 7u) << 28u);
     }
@@ -772,12 +830,13 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
   let cap = workgroupUniformLoad(&wgCap);
   // THE FIXPOINT: x, y, z sweeps until a whole iteration raises nothing.
+  var qmax = 0u;
   for (var it = 0u; it < cap; it++) {
-    var ch = elecSweep(0u, li, spreadK, spreadFree);
+    var ch = elecSweep(0u, li, spreadKq, spreadFree, spreadRef, liqCap, &qmax);
     workgroupBarrier();
-    ch = elecSweep(1u, li, spreadK, spreadFree) || ch;
+    ch = elecSweep(1u, li, spreadKq, spreadFree, spreadRef, liqCap, &qmax) || ch;
     workgroupBarrier();
-    ch = elecSweep(2u, li, spreadK, spreadFree) || ch;
+    ch = elecSweep(2u, li, spreadKq, spreadFree, spreadRef, liqCap, &qmax) || ch;
     if (ch) { atomicAdd(&wgChanged, 1u); }
     workgroupBarrier();
     if (li == 0u) {
@@ -789,6 +848,7 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
   // OUT: this round's half, and the peak.
   var lmax = 0u;
   var cmax = 0u;
+  var liqN = 0u;
   for (var j = li; j < ELEC_HALF_WORDS; j += 256u) {
     let c0 = wgP[2u * j];
     let c1 = wgP[2u * j + 1u];
@@ -798,9 +858,16 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
     lmax = max(lmax, max(lo, hi));
     if (((c0 >> 16u) & ELEC_RES_MASK) != ELEC_RES_INS) { cmax = max(cmax, lo); }
     if (((c1 >> 16u) & ELEC_RES_MASK) != ELEC_RES_INS) { cmax = max(cmax, hi); }
+    if ((c0 >> 28u) == ELEC_N_LIQUID && lo != 0u) { liqN++; }
+    if ((c1 >> 28u) == ELEC_N_LIQUID && hi != 0u) { liqN++; }
   }
   if (lmax != 0u) { atomicMax(&wgMax, lmax); }
   if (cmax != 0u) { atomicMax(&wgCondMax, cmax); }
+  // THE POND RULE's inputs for the next cap (elecAlloc): this round's charged
+  // liquid cells (a sum) and the highest potential that tried to enter one (a
+  // max) -- both order-independent, so the cap is a pure function of the round.
+  if (liqN != 0u) { atomicAdd(&wgLiqN, liqN); }
+  if (qmax != 0u) { atomicMax(&wgLiqQ, qmax); }
   // THE FACE WANTS: an unpaged window neighbour whose cell across a face can
   // take charge from this side (it conducts, and P here exceeds its resist).
   // Only those -- a chunk of air or stone beside a charged one is never paged.
@@ -831,6 +898,10 @@ fn elecRound(@builtin(workgroup_id) wg : vec3<u32>,
     atomicOr(&elecMeta[EM_WANT + (q >> 5u)], 1u << (q & 31u));
   }
   atomicMax(&elecMeta[EM_P_PEAK], atomicLoad(&wgMax));
+  let gN = atomicLoad(&wgLiqN);
+  let gQ = atomicLoad(&wgLiqQ);
+  if (gN != 0u) { atomicAdd(&elecMeta[EM_LIQ_N], gN); }
+  if (gQ != 0u) { atomicMax(&elecMeta[EM_LIQ_Q], gQ); }
   atomicMax(&elecMeta[EM_COND_PEAK], atomicLoad(&wgCondMax));
   atomicAdd(&elecMeta[EM_ROUND_CHUNKS], 1u);
   atomicAdd(&elecMeta[EM_ROUND_HIST + min(r, 3u)], 1u);

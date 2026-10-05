@@ -205,7 +205,9 @@ struct FieldResult {
 FieldResult RunField(Ctx& c, int wireCells, int hold, int fadeMax, int settle) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
-  const uint32_t copper = MatId(c, "copper_bar"), wood = MatId(c, "wood"),
+  // plank: dry BUILDING wood (resist 1500, nearly an insulator). `wood` is the
+  // living tree since wave 3 (sap-wet, resist 80), so it is not the fixture.
+  const uint32_t copper = MatId(c, "copper_bar"), wood = MatId(c, "plank"),
                  water = MatId(c, "water"), spark = MatId(c, "spark");
   const uint32_t wetSlot = c.mats[water].stainSlot;
   Regenerate(c);
@@ -345,7 +347,7 @@ Status GateElecField(Ctx& c, std::string& detail) {
   const int dryMax = (int)BaselineNumber("elec.dryReachMax", 4);
   const uint32_t waterMin = (uint32_t)BaselineNumber("elec.waterChargedMin", 300);
   const uint32_t awakeMax = (uint32_t)BaselineNumber("elec.awakeMax", 32);
-  for (const char* m : {"copper_bar", "wood", "water", "spark"}) {
+  for (const char* m : {"copper_bar", "plank", "water", "spark"}) {
     if (MatId(c, m) == 0) {
       detail = Format("missing material %s", m);
       std::printf("elec-field: FAIL (%s)\n", detail.c_str());
@@ -625,7 +627,8 @@ struct IgniteRun {
 };
 
 IgniteRun RunIgnite(Ctx& c, int lightHold, int sparkHold, int sparkUnits) {
-  const uint32_t copper = MatId(c, "copper_bar"), wood = MatId(c, "wood"),
+  // plank, not wood: dry building timber (wave 3 made `wood` the living tree).
+  const uint32_t copper = MatId(c, "copper_bar"), wood = MatId(c, "plank"),
                  spark = MatId(c, "spark"), lightning = MatId(c, "lightning");
   Regenerate(c);
   IgniteRun r;
@@ -693,7 +696,7 @@ IgniteRun RunIgnite(Ctx& c, int lightHold, int sparkHold, int sparkUnits) {
 }
 
 Status GateElecIgnite(Ctx& c, std::string& detail) {
-  for (const char* m : {"copper_bar", "wood", "spark", "lightning", "charcoal", "ember"})
+  for (const char* m : {"copper_bar", "plank", "spark", "lightning", "charcoal", "ember"})
     if (MatId(c, m) == 0) {
       detail = Format("missing material %s", m);
       std::printf("elec-ignite: FAIL (%s)\n", detail.c_str());
@@ -828,6 +831,187 @@ Status GateElecCrackleBounded(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- elec-conductors (wave 3, 2026-10-05) -------------------------------------
+// The owner's three complaints about wave 2, each a sealed room fed LIGHTNING
+// (30,000) re-laid every tick of the hold, ignition off (the field's claims,
+// not E2's: an ember conducts nothing and would cut the path being measured):
+//   A  a THICK copper bar, 3 x 3 x `elecCond.barCells`, the bolt against the
+//      middle of its near face: the far end must hold `elecCond.barFarMin`.
+//      Wave 2's spreading loss charged every cell of a thick bar ~7% of what
+//      it carried, so the far end read 0; the loss now scales with resist.
+//   B  a TREE: a 3 x 3 trunk of `wood` `elecCond.treeHeight` tall under a 7 x 3
+//      x 7 crown of `leaves`, the bolt on the crown's top: the trunk's FOOT must
+//      hold `elecCond.treeFootMin` (wave 2 made all wood 1,500 and leaves an
+//      insulator, so a strike in the crown went nowhere).
+//   C  a POND, `elecCond.pondN` square and `elecCond.pondDepth` deep, the bolt
+//      on one corner: the FAR corner's bottom must hold `elecCond.pondFarMin`
+//      (the pond rule: a liquid is one body of charge, capped by volume).
+// Run twice from a fresh worldgen: the field hash at the end of the hold and
+// the three readings must agree (the pond rule's cap is a global sum / max).
+struct CondRun {
+  uint32_t barFar = 0, treeFoot = 0, pondFar = 0, pondNear = 0;
+  uint32_t pondCharged = 0, pondCells = 0;
+  uint32_t liqCap = 0, liqN = 0, liqQ = 0;
+  uint64_t hash = 0;
+  std::vector<uint32_t> hdr;
+  std::string profile;   // P along the bar and down the tree, last hold tick
+  std::string fronts;    // the bar's farthest charged cell after each hold tick
+};
+
+CondRun RunConductors(Ctx& c, int barCells, int treeH, int pondN, int pondDepth, int hold) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  const uint32_t copper = MatId(c, "copper_bar"), wood = MatId(c, "wood"),
+                 leaves = MatId(c, "leaves"), water = MatId(c, "water"),
+                 lightning = MatId(c, "lightning");
+  Regenerate(c);
+  CondRun r;
+  // A: the bar along x at y 120..122, z 101..103; the bolt at x0 - 1 against
+  // the middle of the near face, in a pocket open toward +x.
+  constexpr int kAy = 120, kAz = 101, kAx0 = 40;
+  const int ax1 = kAx0 + barCells - 1;
+  const Box roomA{kAx0 - 4, kAy, kAz - 1, ax1 + 2, kAy + 3, kAz + 3};
+  // B: the trunk at x 60..62, z 112..114 from y 120; the crown on top.
+  constexpr int kBx = 60, kBz = 112, kBy = 120;
+  const int crownY = kBy + treeH;
+  const Box roomB{kBx - 5, kBy, kBz - 5, kBx + 7, crownY + 5, kBz + 7};
+  // C: the pond at x 100.., z 110.., y 120..; the bolt on its (x0, z0) corner.
+  constexpr int kCx = 100, kCz = 110, kCy = 120;
+  const Box roomC{kCx, kCy, kCz, kCx + pondN - 1, kCy + pondDepth + 2, kCz + pondN - 1};
+  std::vector<CellOp> rooms, build, feed;
+  Room(rooms, roomA);
+  Room(rooms, roomB);
+  Room(rooms, roomC);
+  Fill(build, {kAx0, kAy, kAz, ax1, kAy + 2, kAz + 2}, copper);
+  Pocket(build, kAx0 - 1, kAy + 1, kAz + 1, 1, 0, 0);
+  Put(feed, kAx0 - 1, kAy + 1, kAz + 1, lightning);
+  Fill(build, {kBx, kBy, kBz, kBx + 2, crownY - 1, kBz + 2}, wood);
+  Fill(build, {kBx - 2, crownY, kBz - 2, kBx + 4, crownY + 2, kBz + 4}, leaves);
+  Put(feed, kBx + 1, crownY + 3, kBz + 1, lightning);
+  Fill(build, {kCx, kCy, kCz, kCx + pondN - 1, kCy + pondDepth - 1, kCz + pondN - 1}, water | kFull);
+  Put(feed, kCx, kCy + pondDepth, kCz, lightning);
+
+  uint32_t t = 64000;
+  support::TickCursor ticker{c, t, {(kAx0 + barCells / 2) >> 4, kAy >> 4, kAz >> 4}};
+  ticker({}, rooms);
+  ticker({}, build);
+  for (int i = 0; i < 4; i++) ticker();
+  auto barFarP = [&](const ElecView& v) {
+    uint32_t m = 0;
+    for (int z = kAz; z <= kAz + 2; z++)
+      for (int y = kAy; y <= kAy + 2; y++) m = std::max(m, v.P(ax1, y, z));
+    return m;
+  };
+  auto footP = [&](const ElecView& v) {
+    uint32_t m = 0;
+    for (int z = kBz; z <= kBz + 2; z++)
+      for (int x = kBx; x <= kBx + 2; x++) m = std::max(m, v.P(x, kBy, z));
+    return m;
+  };
+  // Each reading is the most it held over the hold: a bolt cell decays in a
+  // tick or two, so the one laid on a tick may be gone when the field runs.
+  ElecView v;
+  for (int i = 0; i < hold; i++) {
+    ticker({}, feed);
+    v.Read(ctx, world);
+    r.barFar = std::max(r.barFar, barFarP(v));
+    r.treeFoot = std::max(r.treeFoot, footP(v));
+    r.pondFar = std::max(r.pondFar, v.P(kCx + pondN - 1, kCy, kCz + pondN - 1));
+    r.pondNear = std::max(r.pondNear, v.P(kCx, kCy + pondDepth - 1, kCz));
+    int front = kAx0 - 1;
+    while (front < ax1 && v.P(front + 1, kAy + 1, kAz + 1) > 0) front++;
+    r.fronts += Format(" %d", front - kAx0);
+  }
+  r.hash = v.Hash();
+  r.profile = Format("bar (%u of %d copper)", Census(c, {kAx0, kAy, kAz, ax1, kAy + 2, kAz + 2})[copper],
+                     barCells * 9);
+  for (int x = kAx0 - 1; x <= ax1; x += 4) r.profile += Format(" %d:%u", x - kAx0, v.P(x, kAy + 1, kAz + 1));
+  // ATTRIBUTION: every chunk the bar crosses -- paged? (entry), and the
+  // owner word against the chunk's key.
+  for (int cx = kAx0 >> 4; cx <= ax1 >> 4; cx++) {
+    const uint32_t sl = World::SlotChunkIndex({cx, (kAy + 1) >> 4, (kAz + 1) >> 4});
+    const uint32_t e = v.meta[kEmEntry + sl];
+    r.profile += Format(" [c%d %s%s]", cx, (e & kElecEntryHas) ? "paged" : "unpaged",
+                        (e & kElecEntryHas) && v.meta[kEmOwner + sl] !=
+                                ElecOwnerKey(cx, (kAy + 1) >> 4, (kAz + 1) >> 4)
+                            ? " foreign"
+                            : "");
+  }
+  r.profile += " fronts" + r.fronts;
+  r.profile += Format(" stats: live peak %u, stranded %u, purges %u, pages peak %u, rekeyed %u",
+                      v.meta[kEmLivePeak], v.meta[kEmStranded], v.meta[kEmPurges],
+                      v.meta[kEmPagesPeak], v.meta[kEmRekeyed]);
+  r.profile += " | tree";
+  for (int y = crownY + 3; y >= kBy; y -= 3) r.profile += Format(" y%d:%u", y - kBy, v.P(kBx + 1, y, kBz + 1));
+  r.liqCap = v.meta[kEmLiqCap];
+  r.liqN = v.meta[kEmLiqNLast];
+  r.liqQ = v.meta[kEmLiqQ];
+  for (int z = kCz; z < kCz + pondN; z++)
+    for (int y = kCy; y < kCy + pondDepth; y++)
+      for (int x = kCx; x < kCx + pondN; x++) {
+        r.pondCells++;
+        r.pondCharged += v.P(x, y, z) > 0;
+      }
+  for (int i = 0; i < 60; i++) ticker();
+  r.hdr = ElecHeader(ctx, world);
+  ElecNoteRun(r.hdr.data());
+  return r;
+}
+
+Status GateElecConductors(Ctx& c, std::string& detail) {
+  for (const char* m : {"copper_bar", "wood", "leaves", "water", "lightning"})
+    if (MatId(c, m) == 0) {
+      detail = Format("missing material %s", m);
+      std::printf("elec-conductors: FAIL (%s)\n", detail.c_str());
+      return Status::Fail;
+    }
+  const int barCells = (int)BaselineNumber("elecCond.barCells", 160);
+  const int treeH = (int)BaselineNumber("elecCond.treeHeight", 20);
+  const int pondN = (int)BaselineNumber("elecCond.pondN", 48);
+  const int pondDepth = (int)BaselineNumber("elecCond.pondDepth", 4);
+  const int hold = (int)BaselineNumber("elecCond.holdTicks", 12);
+  const uint32_t barMin = (uint32_t)BaselineNumber("elecCond.barFarMin", 3000);
+  const uint32_t footMin = (uint32_t)BaselineNumber("elecCond.treeFootMin", 1000);
+  const uint32_t pondMin = (uint32_t)BaselineNumber("elecCond.pondFarMin", 500);
+  ElecFixtureTuning tune;
+  struct NoIgnite {
+    Tuning saved;
+    NoIgnite() : saved(CurrentTuning()) {
+      Tuning t = saved;
+      t.sim.elecIgniteGain = 0.0f;
+      SetCurrentTuning(t);
+    }
+    ~NoIgnite() { SetCurrentTuning(saved); }
+  } noIgnite;
+  const CondRun a = RunConductors(c, barCells, treeH, pondN, pondDepth, hold);
+  const CondRun b = RunConductors(c, barCells, treeH, pondN, pondDepth, hold);
+  Regenerate(c);
+  RecordObserved("elecCond.barFarObserved", (double)a.barFar);
+  RecordObserved("elecCond.treeFootObserved", (double)a.treeFoot);
+  RecordObserved("elecCond.pondFarObserved", (double)a.pondFar);
+  RecordObserved("elecCond.pondCapObserved", (double)a.liqCap);
+  const bool bar = a.barFar >= barMin;
+  const bool tree = a.treeFoot >= footMin;
+  const bool pond = a.pondFar >= pondMin && a.pondCharged == a.pondCells;
+  const bool bounded = a.hdr[kEmRefused] + b.hdr[kEmRefused] == 0;
+  const bool twice = a.hash == b.hash && a.barFar == b.barFar && a.treeFoot == b.treeFoot &&
+                     a.pondFar == b.pondFar && a.liqCap == b.liqCap;
+  const bool ok = bar && tree && pond && bounded && twice;
+  detail = Format(
+      "lightning held %d ticks: 3x3 copper bar %d cells, far end P %u (min %u) %s; tree "
+      "(3x3 wood trunk %d tall, leaf crown, struck on the crown) foot P %u (min %u) %s; pond "
+      "%dx%dx%d: %u of %u cells charged, near %u far corner %u (min %u) %s, pond cap %u (Q %u, "
+      "N %u); refused %u %s; run twice: field hash %016llx vs %016llx %s",
+      hold, barCells, a.barFar, barMin, bar ? "OK" : "FAIL", treeH, a.treeFoot, footMin,
+      tree ? "OK" : "FAIL", pondN, pondN, pondDepth, a.pondCharged, a.pondCells, a.pondNear,
+      a.pondFar, pondMin, pond ? "OK" : "FAIL", a.liqCap, a.liqQ, a.liqN,
+      a.hdr[kEmRefused] + b.hdr[kEmRefused], bounded ? "OK" : "FAIL",
+      (unsigned long long)a.hash, (unsigned long long)b.hash, twice ? "OK" : "NONDETERMINISTIC");
+  if (!ok) detail += "; profile " + a.profile;
+  std::printf("elec-conductors: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ElecGates() {
@@ -836,6 +1020,7 @@ const std::vector<Gate>& ElecGates() {
       {"elec-electrolysis", "sim", {}, false, GateElecElectrolysis},
       {"elec-ignite", "sim", {}, false, GateElecIgnite},
       {"elec-crackle-bounded", "sim", {}, false, GateElecCrackleBounded},
+      {"elec-conductors", "sim", {}, false, GateElecConductors},
   };
   return g;
 }

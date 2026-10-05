@@ -305,6 +305,8 @@ const TUNING_PARAMS = {
   'sim.elecWetResist':{t:'i',def:12,min:1,max:254},
   'sim.elecSpreadLoss':{t:'i',def:150,min:0,max:1023},
   'sim.elecSpreadFree':{t:'i',def:2,min:0,max:6},
+  'sim.elecSpreadResistRef':{t:'i',def:12,min:1,max:1023},
+  'sim.elecPoolCells':{t:'i',def:2048,min:1,max:65535},
   'sim.elecReactMin':{t:'i',def:16,min:1,max:65535},
   'sim.elecReactFull':{t:'i',def:1000,min:1,max:65535},
   'sim.elecIgniteGain':{t:'f',def:0.35,min:0,max:50},

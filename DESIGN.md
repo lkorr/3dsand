@@ -2082,8 +2082,14 @@ materials (wave 2 package B, "Bodies conduct by their material" below): flesh /
 muscle / brain / venom gland / envenomed 8 (the body's inside is salt water),
 skin and bruised skin 40 (DRY skin is the body's insulator; the wet rule is
 what makes a wet body conduct), bone 100, alloy / power cell 4, clockwork /
-boiler / cogitator 3, circuitry / neural core 2, synth shell none; wood (every plank, log and bark) 1,500 (wave 2; it was 60, and one bolt
-ran ~500 cells of connected timber); `spark` 200, `arc` 2,000, `lightning`
+boiler / cogitator 3, circuitry / neural core 2, synth shell none; BUILT wood
+(`plank`, `timber`, `door_wood`, `staff_wood`) 1,500 (wave 2; it was 60, and one
+bolt ran ~500 cells of connected timber); LIVING tree wood (`wood`,
+`birch_wood`, `bark_dark`, `bark_light`: sap-wet) 80 and `leaves*` 120 (wave 3),
+so a strike in a crown runs down the trunk; `fire` 60, `ember` 40, `charcoal`
+30 (wave 3: flame is ionised and carbon conducts -- the bolt's own reaction
+turns the leaf it touches into fire BEFORE the field runs, so with fire an
+insulator a strike on a tree went nowhere); `spark` 200, `arc` 2,000, `lightning`
 30,000. Packed to `elecParams` (4 words a material: resist | source, ignite /
 char ids, ignite chance, dissolved resist) and two `_r2` bits (25 source, 26
 conducts). **Wet:** a cell under a coat whose
@@ -2152,6 +2158,46 @@ below). `elec-bulk` (a forced strike onto a 129 x 129 sea basin and a rain-wet
 dirt pad) asserts the reach, the pages, that nothing pages outside the fixture,
 that the water still shocks a wet body (P >= 20) some metres out, and that
 every page comes back and the fixture sleeps.
+
+**Wave 3 (2026-10-05, owner: "lightning hardly travels through copper, does
+not travel through trees, and a struck pond must hurt you anywhere in it,
+by charge over volume").** Three changes, all in the field's rule:
+- **The spreading loss scales with resist** up to `sim.elecSpreadResistRef`
+  (12): `spreadQ = (n - free) x elecSpreadLoss x min(resist, ref) / ref`
+  (elec.h `ElecSpreadQ`; the header carries `kq = loss x 256 / ref`). The
+  voltage a current loses dividing through bulk is resistivity x current
+  density, so a copper BAR or block (resist 1) pays a twelfth of wet ground's
+  share. Wave 2 charged every cell of a thick bar ~7% of what it carried (a
+  3 x 3 bar's far end, 160 cells, read 0); now 8,500 (`elec-conductors` A).
+  Wet ground (12) and everything above it is unchanged. `mob_shock.cpp` uses
+  the same function, so body cells still conduct as the world's do.
+- **THE POND RULE.** A conducting LIQUID (class liquid, resist != none: water,
+  brine, blood, acid, lava, quicksilver...) is one body of charge, not a
+  lattice of resistors: it pays NO spreading loss, and every liquid cell is
+  capped at `cap = Q x sim.elecPoolCells / max(N, elecPoolCells)` -- Q the
+  highest potential that tried to enter a liquid cell (uncapped, decayed once a
+  tick at the head like every stored P), N the liquid cells charged after the
+  previous round. elecRound sums N (atomicAdd) and maxes Q (atomicMax) into
+  elecMeta words 8 / 9; each elecAlloc before a round turns them into the cap
+  (word 10). Sums and maxima are order-independent, so the cap is a pure
+  function of the round (rule 1, `elec-conductors` runs it twice). The cache
+  marks a liquid cell with neighbour count 7 (`kElecNLiquid`; real counts are
+  0..6). Effect: a pond charges ALL the way across, at a strength that falls
+  with its volume -- lightning into a 9,216-cell pond holds 6,485 at the far
+  corner (cap 5,832); into elec-bulk's 49,000-cell basin ~1,200 everywhere
+  (reach 73, the whole basin, 66 pages, freed 2 ticks after, 0 awake); and in
+  the sea N grows until the cap starves the front (reach ~ (Q x poolCells /
+  resist)^(1/4), ~45 cells at the defaults), so the reach is bounded by the
+  CHARGE, not by the sea's size. Q = 0 caps liquid at 0 for one round (the
+  first contact), so a fresh strike never overshoots the whole sea uncapped.
+  Global, not per body of water: two ponds struck on the same tick dilute
+  each other (rare; accepted).
+- **Living trees conduct** (the materials paragraph above): living wood 80,
+  leaves 120, and fire / ember / charcoal conduct. A strike on a crown reaches
+  the trunk's foot 20 cells down at ~3,000 (`elec-conductors` B; wave 2: 0).
+  Building timber keeps 1,500, so a village still does not light end to end.
+  Sylvan bodies are made of the living-wood materials, so they now conduct
+  (and char) like a tree.
 
 **Brine (wave 2).** The resist rule lives once, in the MIRROR elec block
 (`elecResistBase` = material + the wet coat, `elecResistRaw` = + brine), so the

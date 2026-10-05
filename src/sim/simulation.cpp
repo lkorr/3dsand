@@ -3305,9 +3305,12 @@ void Simulation::PrepareElec(const rhi::Queue& queue) {
   hdr[kEpDecay] = (uint32_t)std::clamp(tn.sim.elecDecay, 0, (int)kElecPMax);
   hdr[kEpIterCap] = kElecIterCap;
   hdr[kEpDecayShift] = (uint32_t)std::clamp(tn.sim.elecDecayShift, 0, 15);
-  // Wave 2's spreading loss (sim_elec.wgsl elecEnter clamps the product).
-  hdr[kEpSpreadQ] = (uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 4095);
-  hdr[kEpSpreadFree] = (uint32_t)std::clamp(tn.sim.elecSpreadFree, 0, 6);
+  // The spreading loss (wave 2), scaled by resist up to the reference (wave
+  // 3), and the pond rule's volume (elec.h kEpSpreadQ / kEmLiqQ).
+  const uint32_t spreadRef = (uint32_t)std::clamp(tn.sim.elecSpreadResistRef, 1, 1023);
+  hdr[kEpSpreadQ] = ElecSpreadKq((uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 1023), spreadRef);
+  hdr[kEpSpreadFree] = (uint32_t)std::clamp(tn.sim.elecSpreadFree, 0, 6) | (spreadRef << 4) |
+                       ((uint32_t)std::clamp(tn.sim.elecPoolCells, 1, 65535) << 16);
   const uint32_t wet = (uint32_t)std::clamp(tn.sim.elecWetResist, 1, (int)kElecResistInsulator - 1);
   for (uint32_t a = 0; a < 16; a++) hdr[kEpWet + a] = ElecWetResist(wet, a);
   // E2 (sim_step.wgsl). The two gains are per-mille per 1,000 units, i.e. x2

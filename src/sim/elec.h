@@ -99,7 +99,7 @@ constexpr uint32_t kElecPoolPages = 2048;
 // every later one -- the voxels do not change between the elec rows, so the
 // cache is exact, and rounds 1.. skip the voxel / material / stain / solute
 // reads and the face-neighbour scan. Per cell: bits 0..11 resist
-// (kElecResistInsulator = none), 12..14 conducting face neighbours (0..6),
+// (kElecResistInsulator = none), 12..14 conducting face neighbours (0..6; kElecNLiquid = a conducting liquid, the pond rule),
 // bit 15 the cell is a SOURCE (its seed is re-read from its voxel). The stamp
 // is the tick + 1 the block was built on (0 never matches a live tick + 1).
 // Indexed by PAGE, like the page. 16 MiB beside the pool's 32.
@@ -139,6 +139,23 @@ constexpr uint32_t kEmCount1 = 6;      // list 1's count
 // it off the snapshot (World::ElecMayBeLive): a ring it has not seen means a
 // source is standing in the window, so the elec rows must run (the fast path).
 constexpr uint32_t kEmDoorbells = 7;
+// THE POND RULE (wave 3, 2026-10-05): a conducting LIQUID is one body of
+// charge, not a lattice of resistors. It pays no spreading loss, and every
+// liquid cell's P is capped at
+//   cap = Q x sim.elecPoolCells / max(N, sim.elecPoolCells)
+// -- Q the highest potential that tried to ENTER a liquid cell (decayed once a
+// tick like the field), N the liquid cells holding charge after the previous
+// round. A strike into a pond charges all of it, at a strength that falls with
+// its volume; into the sea, N grows until the cap starves the front, so the
+// reach is bounded by the charge (r^4 ~ Q x poolCells / resist), not by the
+// sea's size. Both words are sums / maxima over the whole field (atomicAdd /
+// atomicMax: order-independent), computed by the rounds and turned into the
+// cap by elecAlloc between them, so the rule is GPU-only and deterministic.
+// Global, not per body: two ponds struck on the same tick dilute each other.
+constexpr uint32_t kEmLiqQ = 8;      // Q: max entering potential, decayed by the head
+constexpr uint32_t kEmLiqN = 9;      // N being accumulated by the current round
+constexpr uint32_t kEmLiqCap = 10;   // the cap the next round applies
+constexpr uint32_t kEmLiqNLast = 11; // N the cap was computed from (diagnostic)
 // Stats, words 16..31 (the snapshot a gate / last_run.json reads).
 constexpr uint32_t kEmPagesPeak = 16;
 constexpr uint32_t kEmRefused = 17;    // monotonic: wanted chunks the pool could not page
@@ -251,8 +268,28 @@ constexpr uint32_t kEpDecayShift = 13;
 // THE SPREADING LOSS (wave 2; sim.elecSpreadLoss / sim.elecSpreadFree): the
 // share of the potential a cell loses on entry, in 1/4096, per conducting face
 // neighbour past the free count -- see the header comment.
+// Wave 3 (2026-10-05): the loss scales with the cell's resist up to
+// sim.elecSpreadResistRef -- the voltage a current loses dividing through bulk
+// is resistivity x current density, so a copper bar or block (resist 1) is
+// nearly lossless again while wet ground (12) pays the full share. The header
+// carries kq = elecSpreadLoss x 256 / ref (ElecSpreadKq) in word 14 and
+// free | ref << 4 | elecPoolCells << 16 in word 15. ElecSpreadQ is the rule;
+// sim_elec.wgsl elecEnter and mob_shock.cpp both compute it.
 constexpr uint32_t kEpSpreadQ = 14;
 constexpr uint32_t kEpSpreadFree = 15;
+inline uint32_t ElecSpreadKq(uint32_t k, uint32_t ref) {
+  ref = ref < 1u ? 1u : ref;
+  return (k * 256u + ref / 2u) / ref;
+}
+inline uint32_t ElecSpreadQ(uint32_t n, uint32_t free, uint32_t kq, uint32_t ref, uint32_t res) {
+  if (n <= free) return 0u;
+  const uint32_t r = res < ref ? res : ref;
+  const uint32_t q = ((n - free) * r * kq) >> 8;
+  return q < 4095u ? q : 4095u;
+}
+// The cache's neighbour-count value that marks a conducting LIQUID cell (the
+// pond rule; real counts are 0..6).
+constexpr uint32_t kElecNLiquid = 7;
 // A threshold no P reaches (P is a u16).
 constexpr uint32_t kElecPOff = kElecPMax + 1;
 // The wet table: the resist of a cell under a CONDUCTING COAT of stain amount

@@ -554,6 +554,8 @@
     "elecWetResist": 12,
     "elecSpreadLoss": 150,
     "elecSpreadFree": 2,
+    "elecSpreadResistRef": 12,
+    "elecPoolCells": 2048,
     "elecReactMin": 16,
     "elecReactFull": 1000,
     "elecIgniteGain": 0.35,

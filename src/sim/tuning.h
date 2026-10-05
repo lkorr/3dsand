@@ -2523,6 +2523,13 @@ struct Tuning {
     // sea, rain-wet ground) and still runs down a wire. src/sim/elec.h.
     int elecSpreadLoss = TPD(sim, elecSpreadLoss);
     int elecSpreadFree = TPD(sim, elecSpreadFree);
+    // Wave 3: the loss scales with the cell's resist up to this one (copper,
+    // resist 1, pays a twelfth of what wet ground does).
+    int elecSpreadResistRef = TPD(sim, elecSpreadResistRef);
+    // THE POND RULE (wave 3): a conducting liquid pays no spreading loss; its
+    // cells are capped at Q x elecPoolCells / (charged liquid cells), so a
+    // struck pond charges throughout, by charge over volume. src/sim/elec.h.
+    int elecPoolCells = TPD(sim, elecPoolCells);
     // E2 (sim_step.wgsl): P at which a cell counts as touching a discharge for
     // its tag:electric rules, and the P at which those fire at full chance.
     int elecReactMin = TPD(sim, elecReactMin);

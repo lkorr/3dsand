@@ -416,8 +416,10 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     g_parStats.maxTask += maxT;
     g_parStats.sumTask += sumT;
   };
-  const uint32_t spreadK = (uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 4095);
+  const uint32_t spreadK = (uint32_t)std::clamp(tn.sim.elecSpreadLoss, 0, 1023);
   const uint32_t spreadFree = (uint32_t)std::clamp(tn.sim.elecSpreadFree, 0, 6);
+  const uint32_t spreadRef = (uint32_t)std::clamp(tn.sim.elecSpreadResistRef, 1, 1023);
+  const uint32_t spreadKq = ElecSpreadKq(spreadK, spreadRef);
 
   // ---- PHASE A, ONE TASK PER SLOT: its cache, then its nodes ---------------
   // EVERY SLOT'S CACHE (PLAN_fight64_perf M): RefreshElecSlotCache is a pure
@@ -427,7 +429,8 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
   // asked with, with its spreading loss (wave 2 package A, sim_elec.wgsl
   // elecEnter: a cell entered from a neighbour also loses prev x spreadQ(n) /
   // 4096, n = its conducting face neighbours in its own slot past
-  // sim.elecSpreadFree). The slots' lists are then laid end to end in (part,
+  // sim.elecSpreadFree, scaled by its resist up to sim.elecSpreadResistRef --
+  // elec.h ElecSpreadQ, wave 3). The slots' lists are then laid end to end in (part,
   // slot) order -- the very order the serial loop pushed them in.
   struct SlotJob {
     uint32_t part = 0;
@@ -522,7 +525,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
           const int32_t cj = c.at[((size_t)z * c.cdim.y + y) * c.cdim.x + x];
           if (cj >= 0 && c.cells[cj].bulk != kIns) n++;
         }
-        if (n > spreadFree) nd.spreadQ = (uint16_t)std::min<uint32_t>((n - spreadFree) * spreadK, 4095u);
+        nd.spreadQ = (uint16_t)ElecSpreadQ(n, spreadFree, spreadKq, spreadRef, nd.bulk);
       }
     }
   });

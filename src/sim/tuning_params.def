@@ -840,6 +840,18 @@ TP_I(sim, elecSpreadLoss, NO_WGSL, 150, 0, 1023)
 // The conducting neighbours a cell may have before it pays the spreading loss:
 // 2 = a wire (in and out) is free, a sheet (4) pays twice, bulk (6) four times.
 TP_I(sim, elecSpreadFree, NO_WGSL, 2, 0, 6)
+// WAVE 3 (2026-10-05): the spreading loss scales with the cell's resist up to
+// this one -- bulk loss is resistivity x current density. 12 = wet ground pays
+// the full elecSpreadLoss, water half, steel a quarter, a copper bar or block
+// (1) a twelfth, so thick copper carries lightning across the window again.
+TP_I(sim, elecSpreadResistRef, NO_WGSL, 12, 1, 1023)
+// THE POND RULE (wave 3; src/sim/elec.h kEmLiqQ): a conducting liquid pays no
+// spreading loss and is capped at Q x elecPoolCells / N, N its charged cells --
+// the charge divides over the body's volume. The liquid volume a source
+// charges at its full potential: 2048 = lightning into a 20,000-cell pond
+// holds ~3,000 everywhere in it, a 200,000-cell lake ~300, and in the sea the
+// cap starves the front ~45 cells out.
+TP_I(sim, elecPoolCells, NO_WGSL, 2048, 1, 65535)
 // WHAT CHARGE DOES IN THE CA (package E2, sim_step.wgsl; DESIGN.md
 // "Electricity -- charge field"). All NO_WGSL, uploaded by PrepareElec into
 // the elecParams header beside the field's own knobs.

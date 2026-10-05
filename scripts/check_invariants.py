@@ -3388,6 +3388,9 @@ _ELEC_CONSTS = {
     "EM_QUERY_GRID": "kEmQueryGrid", "ELEC_QUERY_GRID_WORDS": "kElecQueryGridWordsMax",
     "ELEC_QUERY_GRID_PMAX": "kElecQueryGridPMax", "ELEC_QUERY_GRID_AIR": "kElecQueryGridAir",
     "ELEC_QUERY_NO_GRID": "kElecQueryNoGrid",
+    # Wave 3: the pond rule.
+    "EM_LIQ_Q": "kEmLiqQ", "EM_LIQ_N": "kEmLiqN", "EM_LIQ_CAP": "kEmLiqCap",
+    "EM_LIQ_N_LAST": "kEmLiqNLast", "ELEC_N_LIQUID": "kElecNLiquid",
 }
 
 

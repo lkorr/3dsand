@@ -976,6 +976,10 @@ const char* const kOrder[] = {
     // spark-rarely bound, crackle dying with its source. Own worldgen each,
     // regenerate on the way out.
     "elec-electrolysis", "elec-ignite", "elec-crackle-bounded",
+    // Electricity wave 3: lightning down a thick copper bar, through a tree
+    // from its crown, across a pond (the pond rule); run twice, own worldgen,
+    // regenerates on the way out.
+    "elec-conductors",
     // Electricity E4: shocks reach bodies -- a pond and copper plates on their
     // own pads, a stunned zombie, a recorded shock replayed and run twice.
     // Each spawns under an IdCounterScope, resets the mobs and regenerates
