@@ -34,6 +34,7 @@
 #include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/spellbook.h"
 #include "game/alchemy_bench.h"
 #include "game/container.h"
 #include "game/equipment.h"
@@ -7670,6 +7671,31 @@ int main(int argc, char** argv) {
   // Every glyph but the demons' NAMES, which SANDVOX_ALL_NAMES=1 adds
   // (game/demon.h DebugAllDemonNames; D2's book is the real way).
   caster.inventory.GrantAllAndBind(glyphs, DebugAllDemonNames());   // placeholder acquisition
+  // ---- THE SPELLBOOK ON DISK (game/spellbook.h) ----------------------------
+  // The player's pages and spell-bar keys from the per-user file, OUTSIDE the
+  // repo. Interactive play only: a harness (--frames and every scripted
+  // --shot-* scene, a lab scene) neither reads nor writes it, so scripted
+  // pages never land in the book and the book never steers a measurement.
+  // `spellbookSaved` is the text last on disk; the frame loop saves when the
+  // caster's text differs. A file that does not parse turns saving OFF for
+  // the session instead of overwriting the player's book with an empty one.
+  const std::string spellbookPath =
+      (g_harnessFrames == 0 && labScene < 0 && SpellbookEnabledByEnv()) ? SpellbookPath() : "";
+  bool spellbookOn = !spellbookPath.empty();
+  Spellbook spellbook;
+  std::string spellbookSaved;
+  if (spellbookOn) {
+    std::string err;
+    if (LoadSpellbook(spellbookPath, spellbook, err)) {
+      ApplySpellbookAtBoot(spellbook, glyphs, caster);
+      spellbookSaved = SpellbookText(SnapshotSpellbook(glyphs, caster));
+      std::printf("spellbook: %s (%zu pages)\n", spellbookPath.c_str(), spellbook.pages.size());
+    } else {
+      std::fprintf(stderr, "spellbook: %s -- NOT saving this session so the file is kept\n",
+                   err.c_str());
+      spellbookOn = false;
+    }
+  }
   caster.Recompile(glyphs);
   // Health lives on PlayerAvatar's per-part hp, read through this indirection
   // so the VM never includes the avatar (thesis 4 in spell.h).
@@ -13539,6 +13565,30 @@ int main(int argc, char** argv) {
             sh = ItemStack{};
             break;
           }
+        }
+      }
+      // The load replaced the grimoire and bar with the save's (or cleared
+      // them, for a save with no player section): the spellbook fills back in
+      // around them, so loading an older world never loses a page.
+      if (spellbookOn) {
+        MergeSpellbook(spellbook, glyphs, caster);
+        caster.Recompile(glyphs);
+      }
+    }
+
+    // ---- THE SPELLBOOK: save what changed (game/spellbook.h) ---------------
+    // Twice a second, outside the tick: a snapshot of a few dozen short
+    // strings, compared as text; the file is written only when it differs.
+    if (spellbookOn) {
+      static uint32_t spellbookPoll = 0;
+      if (++spellbookPoll % 30 == 0) {
+        spellbook = SnapshotSpellbook(glyphs, caster);
+        std::string text = SpellbookText(spellbook);
+        if (text != spellbookSaved) {
+          std::string err;
+          if (!SaveSpellbook(spellbookPath, text, err))
+            std::fprintf(stderr, "spellbook: %s\n", err.c_str());
+          spellbookSaved = std::move(text);   // a failed write reports once per change, not per poll
         }
       }
     }
@@ -20019,6 +20069,13 @@ int main(int argc, char** argv) {
                 (unsigned long long)sandvox::opstream::RecordedBytes(),
                 recordOpsPath.c_str());
     sandvox::opstream::StopRecording();
+  }
+  // The last half-second of spellbook edits (the frame loop polls at 2 Hz).
+  if (spellbookOn) {
+    std::string text = SpellbookText(SnapshotSpellbook(glyphs, caster));
+    std::string err;
+    if (text != spellbookSaved && !SaveSpellbook(spellbookPath, text, err))
+      std::fprintf(stderr, "spellbook: %s\n", err.c_str());
   }
   telemetry.Shutdown();
   ctx.WaitIdle();

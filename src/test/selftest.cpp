@@ -171,6 +171,8 @@ const char* const kOrder[] = {
     // And `grimoire`: CPU-only over its own fixtures, beside `player-kit`
     // for the same reasons (plan §12c).
     "grimoire",
+    // `spellbook` beside it: the per-user file, CPU-only, a temp dir.
+    "spellbook",
     // And beside it `spell-graph` (PLAN_spell_graph phase 2), for the third
     // time and the same reason: CPU-only over glyphs.json, the generated
     // oracle and its own fixtures, milliseconds, nothing left behind. It

@@ -440,6 +440,7 @@ Allocation must agree in: `common.wgsl` (`voxMat`), `world.h`, and this table. S
 
 ## Conventions
 
+- **The player's spellbook is THE USER'S DATA, not ours** (`src/game/spellbook.h`). Their grimoire pages + spell-bar keys persist across launches in `%APPDATA%/sandvox/spellbook.json` (plus `.bak` = what was there before the session's first write), deliberately outside every checkout. NEVER read, write, delete, "reset" or commit that file or its `.bak`; never point `SANDVOX_SPELLBOOK` at it from a test, script or harness. Harness runs (`--frames`, the scripted `--shot-*` scenes, lab scenes) skip it already; a new automated mode that runs the game loop must too (`SANDVOX_NO_SPELLBOOK=1` is the switch). If a format change is needed, bump `kSpellbookVersion` and keep loading the old one.
 - Materials/reactions are data (JSON+tags), not code. Don't hardcode material IDs in shaders.
 - 2-space indent, `snake_case` WGSL, `CamelCase` C++. High comment density in sim shaders (non-obvious invariants).
 - Don't grow the 32-bit voxel. Extra state → sparse auxiliary layer.

@@ -18,12 +18,15 @@
 //   7. CAPTURE names the page from the sentence.
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
 #include "game/caster.h"
 #include "game/equipment.h"
 #include "game/persist.h"
+#include "game/spellbook.h"
 #include "game/spell.h"
 #include "test/selftest.h"
 
@@ -311,11 +314,85 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// `spellbook`: the per-user spellbook file (game/spellbook.h) round-trips
+// pages and the bar BY NAME, a world load's merge adds only what the save
+// lacks, and an unreadable file is refused rather than read as empty (the
+// game then refuses to save over it). Writes ONLY to a temp path -- never the
+// player's real file (CLAUDE.md, "the player's spellbook is THE USER'S DATA").
+Status GateSpellbook(Ctx& c, std::string& detail) {
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("spellbook: FAILED %s\n", what);
+    }
+  };
+  const GlyphLibrary lib = MakeLib();
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "sandvox_spellbook_gate";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  const std::string path = (dir / "spellbook.json").string();
+
+  PlayerCaster a;
+  a.inventory.GrantAllAndBind(lib);
+  a.grimoire.pages.push_back({"hellfire", {"kit_fire", "kit_boom", "kit_fan"}});
+  a.grimoire.pages.push_back({"nested", {"hellfire", "kit_bolt"}});
+  a.inventory.BindPage(5, "nested");
+  a.inventory.Bind(1, -1);
+  const std::string text = SpellbookText(SnapshotSpellbook(lib, a));
+  std::string err;
+  check(SaveSpellbook(path, text, err), "save to a fresh directory");
+
+  Spellbook book;
+  check(LoadSpellbook(path, book, err), "the saved file loads");
+  PlayerCaster b;
+  b.inventory.GrantAllAndBind(lib);
+  ApplySpellbookAtBoot(book, lib, b);
+  check(b.grimoire.pages.size() == 2 && b.grimoire.Find("nested") == 1 &&
+            b.grimoire.pages[0].words == std::vector<std::string>{"kit_fire", "kit_boom", "kit_fan"},
+        "boot restores the pages, words and order");
+  check(b.inventory.PageAt(5) == "nested" && b.inventory.KindAt(1) == SlotKind::None &&
+            b.inventory.At(2) == 2,
+        "boot restores the bar: a page slot, a cleared slot, a glyph slot");
+  check(SpellbookText(SnapshotSpellbook(lib, b)) == text, "a reloaded book re-saves byte-identical");
+
+  // A world load replaced the caster with an older save's: one page of its
+  // own, slot 5 empty, slot 0 bound to something else.
+  PlayerCaster w;
+  w.grimoire.pages.push_back({"hellfire", {"kit_bolt"}});
+  w.inventory.Grant(0);
+  w.inventory.Grant(2);
+  w.inventory.Bind(0, 2);
+  MergeSpellbook(book, lib, w);
+  check(w.grimoire.pages.size() == 2 &&
+            w.grimoire.pages[0].words == std::vector<std::string>{"kit_bolt"},
+        "merge adds the missing page and keeps the save's own version of a shared name");
+  check(w.inventory.PageAt(5) == "nested" && w.inventory.At(0) == 2,
+        "merge fills empty slots and leaves the save's bindings");
+
+  Spellbook none;
+  check(LoadSpellbook((dir / "absent.json").string(), none, err) && none.pages.empty() &&
+            !none.hasBar,
+        "a missing file is an empty book with the default bar");
+  { std::ofstream(dir / "bad.json") << "{ not json"; }
+  check(!LoadSpellbook((dir / "bad.json").string(), none, err) && !err.empty(),
+        "a corrupt file is refused, not read as empty");
+  fs::remove_all(dir, ec);
+
+  detail = Format("%d checks", checks);
+  std::printf("spellbook: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& GrimoireGates() {
   static const std::vector<Gate> g = {
       {"grimoire", "player", {}, false, GateGrimoire},
+      {"spellbook", "player", {}, false, GateSpellbook},
   };
   return g;
 }

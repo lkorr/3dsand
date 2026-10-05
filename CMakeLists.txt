@@ -567,6 +567,7 @@ add_library(sandvox_core OBJECT
   src/game/demon_malice.cpp
   src/game/spellgraph.cpp
   src/game/caster.cpp
+  src/game/spellbook.cpp
   src/game/melee.cpp
   src/game/coattransfer.cpp
   src/game/itemcoat.cpp

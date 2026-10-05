@@ -60,3 +60,9 @@ assets/structures/_gate/
 
 # hygiene: hand-kept snapshots that are not tracked
 /_attic/
+
+# The player's spellbook (game/spellbook.h). It lives in %APPDATA%/sandvox/,
+# outside the repo; this only catches a SANDVOX_SPELLBOOK override pointed in here.
+spellbook*.json
+spellbook*.json.bak
+spellbook*.json.tmp
