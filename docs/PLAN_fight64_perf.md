@@ -543,3 +543,85 @@ S first. If S finds a race, fix it before the perf numbers are trusted. Then
 C, F, B, X and K, as each is reviewed. The orchestrator re-measures the
 combined tree once, rebaselines the determinism pin once, and rebuilds
 main's exe.
+
+### Round 3 result (2026-10-05, all six merged, main d34fb41)
+
+Merge order: S, F, C, X, B, K. The determinism hash did not move in any
+package (0fa43063), so there was no rebaseline. Final `--verify` (15 gates)
+passes: `determinism`, `mob-cap64`, `mob-cap64-twice`, `body-fastfall`,
+`big-body-collider`, `ragdoll`, `corpse-armor`, `debris`, `blade-wounds`,
+`cut-path`, `corpse-burn`, `garment-burn`, `elec-crowd`, `corpse-splatter`
+and `wound-rebleed`.
+
+Each package's change, measured clean on its own:
+
+| Package | Measured change |
+|---|---|
+| S | No race: 14 boots identical across processes and mob/Jolt thread counts. Two in-process leaks fixed. New gate `mob-cap64-twice`. |
+| F | CPU tick budget: a forced 35 ms tick's frame p95 went 161.6 -> 44.3 ms. At today's cost the real `--brawl` holds 30.0 ticks/s, p50 19.9 / p95 30.9 ms. Bodies on screen cost about 1.5 ms of CPU per frame. |
+| C | Jolt 3.83 -> 2.37 ms; ccd 2.01 -> 0.61; terrainMesh 0.82 -> 0.56. |
+| X | Exact. stroke 3.79 -> 3.13 (worst 15.3 -> 11.1); carve 2.38 -> 1.78. |
+| B | burnLimbs 2.85 -> 1.56; recount worst 12.2 -> 0.68. Budget shift named in DESIGN.md. |
+| K | Exact. shocks 2.15 -> 1.17; stain 2.23 -> 1.77. |
+
+Combined tree, `mob-cap64`, two runs:
+
+| | b21d23a | 5 merged (no K) | all 6 |
+|---|---|---|---|
+| tick wall mean / p95 / worst | 31.73 / 39.90 / 47.31 | 28.39 / 36.51 / 41.11 | 30.28 / 39.24 / 47.18 |
+| mob side mean / worst | 14.29 / 32.77 | 12.15 / 22.06 | 11.38 / 26.14 |
+| Jolt Update | 3.80 | 3.66 | 5.75 |
+| alive at end / debris bodies | 54 / 97 | 54 / 110 | 50 / 156 |
+
+**The single 300-tick fight is now too chaotic to rank combined trees.** The
+all-6 run's fight had 40.8 limp ragdolls a tick casting as box compounds
+(the 5-merged run had none listed). Living-vs-limp contacts were 442
+manifolds a tick against 266, and body-body contacts 1,099 against 623,
+so Jolt rose 2 ms in a tree with no new physics code. The mob side keeps
+falling (14.29 -> 11.38) despite a bigger fire: front 3,057 vs 2,346, and
+seed probes 2,688 vs 1 a tick.
+
+## Round 4 (2026-10-05)
+
+What the round 3 numbers point at:
+
+### Package W — the measuring stick, the work pool, the page table
+
+1. **A stable perf measure.**
+   - Add `SANDVOX_MOBCAP_FIGHTS=<n>` (or a baseline.json knob): it runs
+     `mob-cap64`'s brawl n times with n different deterministic seeds
+     (spawn jitter or mix order) in one process.
+   - Report per-stage means across fights, plus the spread (min/max of each
+     fight's mean).
+   - Every later package quotes n=3.
+   - The default stays one fight, so `--verify` cost is unchanged.
+2. **Work pool wake latency** (package K's measurement: ~100 µs of wake and
+   join per pool call, 15-20 calls a tick). Add a bounded spin before the
+   condition-variable sleep, on the workers and on the waiting caller.
+   - Prove it with an instrument: per-call overhead, i.e. wall time minus
+     the longest task.
+   - Determinism is unaffected (scheduling only); `mob-cap64-twice` stays
+     green.
+   - Do not burn a core when the game is idle. The spin must end in a
+     sleep within a fraction of a millisecond.
+3. **`pageTableCpu` ~0.9 ms a tick.** Find what it does per tick in a fight
+   and cut it. `src/sim/pagetable.*`; read `docs/PLAN_page_table.md` first.
+
+### Package L — physics: knocked-down creatures and the contact solve
+
+1. **Limp ragdolls are box compounds.** In the all-6 run they cast 40.8 a
+   tick and press against living limbs (442 manifolds a tick).
+   - Give a limp ragdoll's limbs a convex hull collider while limp, as
+     corpses already have (package P). Restore the detailed shape when the
+     creature gets up.
+   - Melee rays re-check the exact shape, as for corpses.
+   - Measure the swap cost (hull build) against the gain. Cache hulls per
+     limb lattice version.
+2. `solveVel` 8.9 ms CPU and `collide` 15.7 ms CPU in that fight. With hulls
+   on the downed, measure again. Then consider velocity-iteration counts per
+   body class and sleeping thresholds for limp bodies under a living body.
+3. Package C's open item: living limbs as hulls for body-body pairs, while
+   melee keeps exact. Measure the melee re-cast cost before deciding.
+4. Gates: `ragdoll` (all sub-checks; get-up must still work), `corpse-armor`,
+   `body-fastfall`, `big-body-collider`, `debris`, `mob-cap64`,
+   `mob-cap64-twice`.
