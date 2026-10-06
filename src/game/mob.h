@@ -985,6 +985,12 @@ struct BurnLimbView {
   const std::vector<CrossHeatCell>* crossHeat = nullptr;
   int selfLimb = -1;
   uint32_t crossPct = 0;
+  // The CrossHeatCell bits of the shells WORN OVER this limb (a garment
+  // panel is a rig slot whose parent is this limb). Their heat is not heat
+  // across a joint but cloth burning ON the skin, so it is contact: read at
+  // the authored rate, never scaled by crossPct (owner, 2026-10-05: "the
+  // entire clothes burns off before the body beneath it takes any damage").
+  uint64_t wornBits = 0;
   // The world side taken ahead for this limb this tick (BurnWalkPre), or null.
   const BurnWalkPre* walkPre = nullptr;
   // THE PARALLEL HEAD'S RECORDER (PLAN_fight64_perf B, BurnSink). Non-null
@@ -3215,6 +3221,9 @@ class Mob {
   // Does any shell cover this body limb at all? The cheap gate in front of the
   // probe, so an undressed creature never even transforms a point.
   bool LimbHasShells(int bodyLimb) const;
+  // The CrossHeatCell limb bits of every shell worn over this body limb
+  // (BurnLimbView::wornBits).
+  uint64_t WornBitsOver(int bodyLimb) const;
   // A limb's pose as physics holds it, as a COPY: the portrait pour brush's
   // pick (MobSystem::PickBody / PourOnBody) runs outside the tick and must
   // not write the live `xf` the sim passes read. `limb.xf` when there is no

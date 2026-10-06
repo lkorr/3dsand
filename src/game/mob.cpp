@@ -17157,7 +17157,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // the world and igniting itself (see CrossHeatCell).
   const uint64_t selfBit =
       v.selfLimb >= 0 ? (1ull << (v.selfLimb < 63 ? v.selfLimb : 63)) : 0ull;
-  auto crossAt = [&](IVec3 c) -> uint32_t {
+  // `fromWorn`, when asked, says whether a shell worn over this limb is among
+  // the parts alight in that cell (BurnLimbView::wornBits): contact, not a
+  // joint.
+  auto crossAt = [&](IVec3 c, bool* fromWorn = nullptr) -> uint32_t {
+    if (fromWorn) *fromWorn = false;
     if (!v.crossHeat || v.crossPct == 0) return 0u;
     const std::vector<CrossHeatCell>& L = *v.crossHeat;
     const uint64_t k = CrossHeatKey(c);
@@ -17165,6 +17169,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         L.begin(), L.end(), k,
         [](const CrossHeatCell& e, uint64_t key) { return e.key < key; });
     if (it == L.end() || it->key != k) return 0u;
+    if (fromWorn) *fromWorn = (it->limbs & v.wornBits & ~selfBit) != 0;
     return (it->limbs & ~selfBit) ? it->mat : 0u;
   };
 
@@ -17731,9 +17736,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             // voxel past the shared face, so on a cell whose box overlaps the
             // limb it lands INSIDE the flesh, past a shell that is exactly
             // where it should be.
+            //
+            // ...UNLESS THE ROBE IS ITSELF ALIGHT (owner, 2026-10-05: "the
+            // entire clothes burns off before the body beneath it takes any
+            // damage"). A burning shell is not insulation, it is the fire, and
+            // it is lying on the skin. Refusing every shell here meant the
+            // skin under a burning smock was never even a candidate -- the
+            // face gather below would have read the burning cloth as hot, but
+            // nothing ever asked it. Only an UNLIT shell (cloth, char, steel)
+            // stands between the heat and the arm.
             if (v.occlude) {
               const Vec3 p = fc + u * sa + w * sb;
-              if (v.WornAlong(p, dv * -1.0f, kWornSeedReach)) {
+              const uint32_t sm = v.WornAlong(p, dv * -1.0f, kWornSeedReach);
+              if (sm && !(sm < matHot_.size() && matHot_[sm])) {
                 wstat.seedsBlocked++;
                 continue;
               }
@@ -18105,6 +18120,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // substituting a sibling's material would mean something other than heat
     // (an inverted ramp, and the inbound pass).
     bool ncross[6] = {};
+    // Cross faces whose heat is a shell WORN OVER this limb (wornBits):
+    // still read-only like any cross face, but contact, so never scaled.
+    bool ncontact[6] = {};
     // What the GRID holds at each world-facing face, before any worn shell or
     // sibling limb was substituted for it: where a coat's released flame may
     // go (DESIGN.md §6 rule 2, "an open face of the cell").
@@ -18176,7 +18194,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // burning torso and the thigh below it sat in.
         if (nmat[k] == 0) {
           const IVec3 wc{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
-          uint32_t xm = crossAt(wc);
+          bool xmWorn = false;
+          uint32_t xm = crossAt(wc, &xmWorn);
           // ...AND A COAT IS IN THE WAY OF A SIBLING'S HEAT TOO. The probe
           // above only ran against a THREAT in the grid, and cross heat sits
           // exactly where the grid has nothing to say — so a burning bare
@@ -18192,11 +18211,35 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
               nmat[k] = wornX;
               xm = 0;
               if (v.occlude) wstat.nbrSubstituted++;
+              // A SHELL THAT IS ITSELF ALIGHT IS AS WIDE AS ITS FIRE. Burning
+              // cloth lying on the skin is a sheet of flame over this face, not
+              // one hot lattice neighbour, and read as 1 a flat skin voxel
+              // (minCount 3) could only ever sear under it -- the garment had
+              // to burn through before the wearer caught (owner, 2026-10-05).
+              // The width is measured the way a sibling's is, from the cross
+              // heat ring at world pitch: the cells the garment is alight in.
+              // An unlit shell over the face stays a plain 1 (it is not hot,
+              // so no ignition rule matches it anyway).
+              if (wornX < matHot_.size() && matHot_[wornX]) {
+                int t = 0;
+                for (int j = 0; j < 6 && t < 4; j++) {
+                  const IVec3& e = kBurnDirs[j];
+                  if (e.x * d.x + e.y * d.y + e.z * d.z != 0) continue;
+                  ntan[k][t++] = crossAt({wc.x + e.x, wc.y + e.y, wc.z + e.z});
+                }
+                tanValid[k] = t == 4;
+              }
             }
           }
           if (xm) {
             nmat[k] = xm;
             ncross[k] = true;
+            // Through a HOLE in the garment: the flame beside this face is the
+            // wearer's own clothing burning on the skin, so it is contact and
+            // arms rules at the authored rate. crossPct (15%) was written for
+            // a joint, and charged here it seared bared skin at a seventh of
+            // the rate a bare arm in the same fire sears.
+            ncontact[k] = xmWorn;
             bstat.crossFaces++;
             // The same world-pitch widening the grid gets, from the same
             // argument: the sibling's fire is stored in whole world cells, so
@@ -18560,7 +18603,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         for (int k = 0; k < 6 && !covered && !anyReal; k++) {
           if (!nmat[k] || !ReactNbrMatches(r, nmat[k], matGpu_)) continue;
           anyMatch = true;
-          if (!ncross[k]) { anyReal = true; break; }
+          if (!ncross[k] || ncontact[k]) { anyReal = true; break; }
         }
         crossOnly = anyMatch && !anyReal;
       }
@@ -19455,6 +19498,7 @@ void Mob::BurnHeadLimbs(uint32_t tick, World& world,
       probe.limb = li;
       v.occlude = &WornProbe::Call;
       v.occludeCtx = &probe;
+      v.wornBits = WornBitsOver(li);
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
     v.flameKeepPct = flameKeep;
@@ -30663,6 +30707,17 @@ const std::vector<int>& Mob::WornSlotsAt(int pieceIndex) const {
   return (pieceIndex >= 0 && pieceIndex < (int)worn_.size())
              ? worn_[pieceIndex].slots
              : kNone;
+}
+
+uint64_t Mob::WornBitsOver(int bodyLimb) const {
+  uint64_t bits = 0;
+  if (bodyLimb < 0) return 0;
+  for (const WornPiece& p : worn_)
+    for (int s : p.slots)
+      if (s >= 0 && s < (int)skel_.parts.size() &&
+          skel_.parts[s].parent == bodyLimb)
+        bits |= 1ull << (s < 63 ? s : 63);  // CrossHeatCell's bit for slot s
+  return bits;
 }
 
 bool Mob::LimbHasShells(int bodyLimb) const {

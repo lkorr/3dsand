@@ -4559,6 +4559,13 @@ Status GateCorpseCrossheat(Ctx& c, std::string& detail) {
 //     became air than is left hanging as char;
 //   C the fire reaches the wearer: flesh under the garment is ALIGHT
 //     (flesh_burning) at some tick -- lit, not only seared.
+//   D ...AND REACHES THEM WHILE THEY ARE STILL DRESSED (owner, 2026-10-05:
+//     "the entire clothes burns off before the body beneath it takes any
+//     damage"): by the tick a tenth of the garment is gone the wearer has lost
+//     at least garmentBurnSkinAtTenthMin raw skin. Measured on this fixture:
+//     181 before the fix (burning cloth refused as a seed, read as one hot
+//     face, and the heat through a hole charged crossLimbPct), ~540 after
+//     standalone and 372 under --verify behind other gates (scope moves it).
 // Burn death is parked (gore.burnDeathFraction 1) for the same reason
 // mob-burn parks it: the claim is how far the fire gets, and a body that dies
 // of the first 70% stops being counted. Regenerates the world on the way out.
@@ -4671,6 +4678,16 @@ Status GateGarmentBurn(Ctx& c, std::string& detail) {
         n += mobs.LimbMaterialCount(id, li, mFleshBurning);
     return n;
   };
+  // Raw SKIN left on the body: what it has lost is the damage the wearer has
+  // taken (seared, alight, charred or gone). Traced so "the whole garment went
+  // before the body felt anything" (owner, 2026-10-05) reads off the line.
+  const uint32_t mSkin = MatIdOf(c, "skin");
+  auto bodySkin = [&]() {
+    uint32_t n = 0;
+    for (int li = 0; li < base && mSkin; li++)
+      if (mobs.LimbBody(id, li)) n += mobs.LimbMaterialCount(id, li, mSkin);
+    return n;
+  };
   // THE FIXTURE MUST BE DRY, and says so if it is not: a wet garment is a
   // doused garment, and "it did not burn" would then be about the ground.
   uint32_t wet = 0;
@@ -4678,6 +4695,7 @@ Status GateGarmentBurn(Ctx& c, std::string& detail) {
   for (int sl : shell) wet += mobs.LimbCoatMatCount(id, sl, mWater, 1);
   const uint32_t vox0 = shellVox();
   const uint32_t alight0 = bodyAlight();
+  const uint32_t skin0 = bodySkin();
   // THE SPARK: 48 voxels of the biggest panel (the body of the smock), once.
   int sparkSlot = -1;
   for (int sl : shell)
@@ -4689,6 +4707,9 @@ Status GateGarmentBurn(Ctx& c, std::string& detail) {
   const int kTicks = 300;
   uint32_t voxEnd = vox0, charEnd = 0, peakAlight = 0, peakBurning = 0;
   int firstAlight = -1, diedAt = -1;
+  // Skin lost by the tick a TENTH of the garment is gone (claim D); -1 = the
+  // garment never got that far.
+  int64_t skinAtTenth = -1;
   std::string trace;
   for (int i = 0; i < kTicks && lit > 0; i++) {
     support::RunTicks(rig, 1);
@@ -4700,12 +4721,20 @@ Status GateGarmentBurn(Ctx& c, std::string& detail) {
     const uint32_t burning = shellCount(mLinenBurn) + shellCount(MatIdOf(c, "cloth_burning"));
     peakBurning = std::max(peakBurning, burning);
     if (a > alight0 && firstAlight < 0) firstAlight = i;
+    if (skinAtTenth < 0 && (vox0 - std::min(vox0, voxEnd)) * 10u >= vox0) {
+      const uint32_t sk = bodySkin();
+      skinAtTenth = skin0 > sk ? skin0 - sk : 0;
+    }
     peakAlight = std::max(peakAlight, a);
-    // The garment's course every 50 ticks: alive / alight / char / flesh lit.
-    if (i % 50 == 0)
-      trace += Format(" t+%d %u/%u/%u/%u", i, voxEnd, burning, charEnd, a);
+    // The garment's course every 25 ticks: alive / alight / char / skin
+    // lost / flesh lit.
+    if (i % 25 == 0) {
+      const uint32_t sk = bodySkin();
+      trace += Format(" t+%d %u/%u/%u/%u/%u", i, voxEnd, burning, charEnd,
+                      skin0 > sk ? skin0 - sk : 0u, a);
+    }
   }
-  std::printf("  garment-burn trace (voxels / alight / charred / flesh alight):%s\n",
+  std::printf("  garment-burn trace (voxels / alight / charred / skin lost / flesh alight):%s\n",
               trace.c_str());
   SetCurrentTuning(saved);
   mobs.Reset();
@@ -4721,6 +4750,9 @@ Status GateGarmentBurn(Ctx& c, std::string& detail) {
   const bool a = lit > 0 && goneFrac >= minGone;
   const bool b = gone > charEnd;
   const bool cc = peakAlight > alight0;
+  RecordObserved("garmentBurnSkinAtTenth", (double)skinAtTenth);
+  const double minSkin = BaselineNumber("garmentBurnSkinAtTenthMin", 275.0);
+  const bool dd = skinAtTenth >= (int64_t)minSkin;
   if (wet * 100u > vox0) {
     detail = Format("fixture is WET (%u smock voxels, over 1%%, carry a water coat before "
                     "the spark): the ground under it holds water", wet);
@@ -4729,13 +4761,14 @@ Status GateGarmentBurn(Ctx& c, std::string& detail) {
   detail = Format(
       "smock (%zu panels) %u voxels, %u lit (peak %u alight), no world fire, %d ticks: A "
       "consumed %u (%.0f%%, need %.0f%%) %s | B left charred %u vs gone %u %s "
-      "| C flesh alight peak %u (first at t+%s) %s%s",
+      "| C flesh alight peak %u (first at t+%s) %s | D skin lost by 10%% of the "
+      "garment gone %lld (need %.0f) %s%s",
       shell.size(), vox0, lit, peakBurning, kTicks, gone, goneFrac * 100.0, minGone * 100.0,
       a ? "ok" : "FAIL", charEnd, gone, b ? "ok" : "FAIL", peakAlight,
       firstAlight < 0 ? "never" : std::to_string(firstAlight).c_str(),
-      cc ? "ok" : "FAIL",
+      cc ? "ok" : "FAIL", (long long)skinAtTenth, minSkin, dd ? "ok" : "FAIL",
       diedAt >= 0 ? Format(" | died at t+%d", diedAt).c_str() : "");
-  return a && b && cc ? Status::Pass : Status::Fail;
+  return a && b && cc && dd ? Status::Pass : Status::Fail;
 }
 
 // ---- corpse-worn ----------------------------------------------------------

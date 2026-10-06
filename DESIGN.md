@@ -20499,6 +20499,24 @@ skin forever. Put out, or left behind by the front, the char stays as rag.
 The shorts keep their inert terminus (`linen_charred`); `mob-burn` asserts
 that chain never reaches air.
 
+**A burning shell is the fire, not the insulation** (2026-10-05, owner: "the
+entire clothes burns off before the body beneath it takes any damage";
+`garment-burn` claim D). Three places in `BurnOneLimb` read a shell as a
+shield regardless of its state, and together they kept the wearer raw until
+the garment was nearly gone: the contact SEED march refused any shell on the
+way to the heat, so skin under a burning smock was never a candidate; a face
+whose neighbour was a burning shell counted as ONE hot face, so a flat skin
+voxel (flesh's `minCount 3`) could sear under it but never catch; and heat
+reaching the skin through a HOLE in the garment came from a sibling limb (the
+panel is a rig slot), so it paid `crossLimbPct` -- a joint's rate -- and bared
+skin seared at a seventh of a bare arm's. Now the seed march stops only at an
+UNLIT shell; a burning shell face is widened at world pitch from the cross
+heat ring like any sibling's fire; and cross heat whose bits include a shell
+worn over the limb (`BurnLimbView::wornBits`) is contact, unscaled. Unburnt
+cloth and char still shield exactly as before. Measured on the smock with no
+world fire: skin lost by 10% of the garment gone 181 -> ~540, flesh alight at
+t+50 7 -> 130.
+
 **Asked along a SEGMENT, not at a point.** A limb is a rounded tube inside a
 garment cut to its box, so on any diagonal there are several empty cells
 between the flesh and the cloth: the obvious "is the cell one step outside me
