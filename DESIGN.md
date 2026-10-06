@@ -284,21 +284,36 @@ of freezing; they are not a bigger window.
   once the snapshot of T-1 is published (`SetEvictKeep`). Deciding at T would
   miss a particle that landed in the last `kSnapshotLatency` ticks. A fill that
   needs one of the chunks first forces the batch and keeps all 125.
-- **Particles leave the window and land (P2).** `sim_particle.wgsl`'s FAR FLIGHT:
-  matter outside residency flies on, blocks against the far cascade's level-1
-  bytes (`farBlocked`, the gas kernel's test), PARKS where it comes to rest and
-  requests a ticket every tick (32 atomicMax buckets in the pageFaults record,
-  read off the snapshot). Granted, the particle unparks the tick its cell is
-  resident and lands through the claim path. Refused (cap) or unserved for 16
-  ticks, it DEPOSITS (a priority-won slot in the same record) and dies; the CPU
-  holds it as a FAR LANDING and re-throws it, still, the tick its chunk is
-  resident again — a ticket, or the window arriving. A held landing asks for a
-  ticket itself whenever an index is free (`AskForLandings`), so the cap
-  delays it rather than parking it until the window comes. Spray still ends at the
-  edge; leaving the far box (two window edges) kills and counts. The cascade
-  is render-derived and its first game-time fill waits on a pipeline compile,
-  so far landings are frame-timing dependent in the game during that window
-  (shared with gas stage 1); every selftest fills it synchronously or not at all.
+- **Particles leave the window and land (P2; option C since 2026-10-06).** A
+  particle whose flight leaves residency stops at the first sample past it and
+  DEPOSITS at once (`sim_particle.wgsl` FAR LANDING): it bids
+  `particlePriority` into one of the 6 deposit slots of the ticket record
+  (`atomicMax`, order-free), the winner hands px/py/pz/payload to the CPU in
+  `resolve` and dies, a loser stays put, still, and bids again next tick. The
+  CPU (`Tickets::TakeDeposits`) LOWERS a landing that is above its own ground,
+  `World::TerrainHeight` (genColumn's twin, the height contract), onto it —
+  straight down, the deposit carries no velocity; below the ground (a cave) it
+  is left where it is — and holds it as a FAR LANDING. A held landing asks for
+  a ticket over its chunk whenever an index is free (`AskForLandings`; it never
+  asks into a full cap) and is re-thrown, still, the tick its chunk is
+  resident — that ticket, or the window arriving — then lands through the
+  ordinary claim path: the last cell of fall onto the true ground, or out of a
+  roof / canopy / edit the analytic column does not describe (the burial rule).
+  Spray still ends at the edge. Matter that leaves is paused, never lost.
+  **Why no flight out there (far-fill timing, cross-vendor audit #5).** Until
+  2026-10-06 matter flew on outside residency, blocked against the far
+  cascade's level-1 bytes (`farBlocked`), parked where it came to rest and
+  requested a ticket itself (32 `atomicMax` request buckets). The cascade is
+  render-derived and filled on a wall-clock schedule — the deferred `far` /
+  `fardown` compile, and FarField's per-FRAME bulk slice — so where far matter
+  came to rest, and the world after it landed, depended on frame timing. The
+  owner chose option C of the three (A: a tick-owned level-1 drain plus a
+  blocking compile; B: a tick-owned CPU collision heightfield; C: no GPU far
+  collision); no tick kernel binds `farVox` any more (`pass_table.def`), the
+  gas kernel included (gas stage 1, "Blocking outside"). The request buckets
+  and the far-box kill word stay in the record, unwritten. Gate:
+  `ticket-land` runs twice, the second time with the cascade filled first, and
+  the two runs must be identical.
 - **Reactions (P3).** Only DECAY runs in a ticket (`sim_step.wgsl gInTicket`):
   decay and movement terminate, pair and emit rules propagate past the box's
   edge. An ember in a ticket burns out to ash / smoke / air and lights no wood.
@@ -2915,11 +2930,20 @@ for a gas.
   `windLateralStart` order and fourteen-candidate fallback ladder the CA uses,
   refactored to take the identity key and the substep as arguments so both
   kernels call one definition. Not a reduced-fidelity puff.
-- **Blocking outside is `farVox`**, the far cascade's level-1 byte — the same
-  test the far march uses. Dense toroidal array, direct index, **not the page
-  table**: the page table does not extend past the window and has no business
-  being asked about smoke 60 m away. Outside the cascade reads as OPEN, not as
-  blocked, or every plume would pin against an invisible wall.
+- **Outside residency nothing blocks a parcel (since 2026-10-06).** It used to
+  be `farVox`, the far cascade's level-1 byte (`gasFarBlocked`); the cascade is
+  filled on a wall-clock schedule, so a parcel's path, the gas digest and the
+  voxel it re-entered as depended on frame timing (cross-vendor audit #5, the
+  particle side's option C). OPEN is the rule the cascade's own boundary
+  already had ("a wall would pin every plume against an invisible surface").
+  The only deterministic ground the GPU could ask is a tick-owned field
+  (option B, not taken), and a parcel cannot hand itself to the CPU the way a
+  particle does without ending the far plume it belongs to. Cost is the look
+  only: buoyant smoke rises regardless, a wind-blown parcel crosses a hill
+  outside the window inside terrain the far march draws in front of it, a
+  heavy gas sinks out of sight; all bounded by the decay, the outer box and
+  the ceiling as before, and a parcel re-enters only into a resident air or
+  gas cell. `kGasSpDigest` is unchanged in meaning.
 - **Bounds (rule 2), all three stateless tests on the parcel's own position:**
   the outer box, `origin.y + WORLD_N + kGasCeilingVox`, and the authored decay.
   `gasDecayProduct` walks the material's `RK_DECAY` entries exactly as
@@ -3031,7 +3055,7 @@ reaction system.
   and skip none of the samples that still cost anything (those hold smoke);
   1³ costs ~0.15 ms more to build. After it, the band, the outside segment and
   the erosion noise each price at ≤ 0.25 ms on those cameras.
-- **`GAS_RUN` (raymarch.wgsl const, OFF).** `trace()`'s liquid-run loop can also
+- **`GAS_RUN` (raymarch.wgsl const, ON since 2026-10-06, owner decision).** `trace()`'s liquid-run loop can also
   cross a run of one non-emissive gas thinner than 0.2 opacity (ether vapour,
   hydrogen, steam) with one voxel load and a DDA step per cell, exact, up to
   the precomputed `tFree` where the crossfade could start fading a voxel.
@@ -3039,8 +3063,10 @@ reaction system.
   the alchemy-bench report's "camera inside the cloud", made deterministic)
   goes 9.89 → 8.87 ms, but fire +0.2 and village +0.15 ms, with no thin gas
   in their runs (an opacity gate of 0.1 costs the same) — the code's presence
-  on dense-gas frames. Two of three gas cameras lose, so it ships off; flip
-  the const to re-run the comparison.
+  on dense-gas frames. Two of three gas cameras lose, so it shipped off until
+  the owner took the trade on 2026-10-06 (with the two flags below; combined
+  measurement under `sim.gasThinDecayMul`). Flip the const to re-run the
+  comparison.
 - **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
   `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
   CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the
@@ -7067,7 +7093,8 @@ neighbors, so this needs an explicit connectivity pass:
      `determinism` both sides). Village CA 13.06 -> 12.38 ms (perf), 11.59 ->
      11.05 a tick-frame windowed, p50 18.9 -> 18.0; forest 5.58 -> 5.37 (perf),
      8.08 -> 7.59 windowed, p50 26.5 -> 26.0.
-  2. **`sim.gasThinDecayMul` (default 1 = off, compiled out)**: a cold buoyant
+  2. **`sim.gasThinDecayMul` (3 since 2026-10-06, owner decision; 1 = off,
+     compiled out)**: a cold buoyant
      gas voxel with at most `sim.gasThinNeighbors` (2) gas face-neighbours --
      counted from camask's gas plane, a face in another chunk counts as gas --
      rolls its own fade-to-air rules at that multiple. Plume cores are
@@ -7077,9 +7104,18 @@ neighbors, so this needs an explicit connectivity pass:
      19.8 (its smoke was never the cost). On the `--render-budget` village and
      fire cameras the frame differs in ~4% of pixels (embers and haze; the
      raymarch on those frozen frames is unchanged, 6.3 / 10.8 ms). A look
-     decision, so it ships OFF: `oil-fire` still passes at 3 (black smoke
-     peak 9.1x the oil against 10.0x; min 2.0), as do `heat-updraft` and
-     `gas-leave`.
+     decision, so it shipped OFF until the owner took it on 2026-10-06:
+     `oil-fire` still passes at 3 (black smoke peak 9.1x the oil against
+     10.0x; min 2.0), as do `heat-updraft` and `gas-leave`.
+     **The three together (2026-10-06, with `GAS_RUN` and `FAR_SHADOW_CACHE`
+     ON; main 60713bd exe+assets vs the change, RTX 3060 Ti, 1080p, exclusive
+     lock, one run each):** `--perf village-fire` frame p50 24.39 -> 22.32 ms,
+     p95 26.52 -> 24.80, GPU rows 25.39 -> 23.33 (CA 7.28 -> 6.85, raymarch
+     11.51 -> 9.90), awake chunks 3,579 -> 3,247. `--render-budget` raymarch
+     p50: noon 6.21 -> 5.60, cascade 4.48 -> 4.31 (base2; the before arm's
+     first sample drifted 1 ms), smoke 10.83 -> 9.06, fire 10.22 -> 9.74,
+     village 6.25 -> 6.11; `pre` +0.07..0.09 ms on every camera (the far
+     patches' resolve rays).
   Measured and rejected, all on `--perf village-fire`, hash-identical unless
   noted: gathering the dirty marks into a per-workgroup table flushed once
   (+1.5 ms), merging a move's source and destination marks into one atomic
@@ -15290,10 +15326,12 @@ where you hear from either (§12b, "The ears are on the character").
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
   keeps it conservative: never falsely zero). Atomics are legal here because
   each byte has ONE writer per dispatch (the chunk owning its centre sample)
-  and the and+or pair commutes with other bytes' — NOT because the cascade
-  carries no determinism requirement: particles outside residency collide
-  with level 1 (`sim_particle.wgsl farBlocked`), so a byte that depends on
-  scheduling is a landing that depends on it. That is why the downsample's
+  and the and+or pair commutes with other bytes' — and since 2026-10-06 the
+  cascade carries no SIM determinism requirement at all (no tick kernel reads
+  it: particles outside residency hand themselves to the CPU, gas parcels are
+  unblocked out there — cross-vendor audit #5, option C). Until then particles
+  collided with level 1 (`farBlocked`), so a byte that depended on scheduling
+  was a landing that depended on it; the render still wants one answer. That is why the downsample's
   follow-up checks are three further dispatches (`fardownClaim`,
   `fardownStalk`, `fardownFeat`; cross-vendor audit #9, 2026-10-03): inline,
   the cut-stalk clear read a byte another chunk's downsample was rewriting.
@@ -15471,7 +15509,7 @@ where you hear from either (§12b, "The ears are on the character").
   against 136 far-march steps, on a frame that was 81% cascade — and a caster
   a cascade pixel can show is a canopy or a ridge within a few tens of metres.
   **The far patch cache (2026-10-03, raymarch-far; `FAR_SHADOW_CACHE` in
-  raymarch.wgsl, SHIPPED OFF):** the march is ~0.6 ms of WORK at noon and on
+  raymarch.wgsl, ON since 2026-10-06, owner decision):** the march is ~0.6 ms of WORK at noon and on
   the cascade camera (running it with the code present costs what compiling
   it out saves; skipping it for top faces or side faces alone saves 0.07-0.2,
   because a warp pays for its slowest lane). With the flag on, far pixels read
@@ -15481,9 +15519,9 @@ where you hear from either (§12b, "The ears are on the character").
   leaves fs: noon -0.28 / cascade -0.36 ms at 1080p, -0.21 / -0.29 at
   1600x900, -0.38 / -0.40 at the sprint FOV. It moves 0.3% of pixels by
   >= 16/255 (thin lines at shadow and cell edges, where a pixel's own start and
-  its patch centre disagree) against a re-run floor of 0.001%, so it waits on
-  an owner decision; a bilinear blend of four patches cost 0.25 ms more and
-  moved the same pixels.
+  its patch centre disagree) against a re-run floor of 0.001%, so it waited on
+  an owner decision, taken 2026-10-06 (ON); a bilinear blend of four patches
+  cost 0.25 ms more and moved the same pixels.
   **Since 2026-09-28 (LOD-seam package C) the reach is a DISTANCE test, the ray
   is a cone trace, the edge is soft and there is no per-level floor.** The old
   ray converted the reach to steps and clamped the count at 64, charged for
@@ -15805,7 +15843,8 @@ where you hear from either (§12b, "The ears are on the character").
     read it through `matFarPal()`, so a writer pays one field of a material it
     was already fetching and no table lookup at all.
   - **slot → material** is `farPalMat()` (common.wgsl), used by
-    `raymarch.wgsl`'s `farMatAt` and by `sim_gas.wgsl`'s `gasFarBlocked`. The
+    `raymarch.wgsl`'s `farMatAt` (and until 2026-10-06 by `sim_gas.wgsl`'s
+    `gasFarBlocked`, gone with far-fill timing #5). The
     "is anything here" tests do NOT translate: slot 0 is air, nothing else
     maps to material 0, so `farPalAt(..) != 0` is the same answer without the
     read, which is what AO, `farShadowBlocked` and the occupancy count use.
@@ -24769,11 +24808,12 @@ Each milestone is playable/demoable. Don't start a milestone's "later" items ear
      table's rows #4/#9/#10): the particle ring refuses whole append groups at
      its cap (`particle-cap`), the fardown stalk clear is its own dispatch,
      and the exact-cell and blast support flags read the post-dispatch grid
-     (`support-flag-post`). Still open: far-cascade FILL TIMING (#5: the
-     level-1 bytes particles outside residency collide with are filled on a
-     wall-clock schedule — the deferred `far` compile and the per-frame bulk
-     slice — which needs an owner decision, options in the table) and the gas
-     pool's `gasLeave` cap (another package).
+     (`support-flag-post`). Closed 2026-10-06: far-cascade FILL TIMING (#5,
+     owner's option C: no tick kernel reads `farVox`; a particle leaving
+     residency deposits at once and the CPU lands it on `World::TerrainHeight`,
+     a gas parcel outside residency is unblocked — the P2 bullet and gas
+     stage 1's "Outside residency"). Still open: the gas pool's `gasLeave`
+     cap (another package).
    - **The test that closes it is now one command on the other machine:**
      `sandvox.exe --fingerprint fp_<vendor>.json` writes the determinism
      gate's 200 per-tick hashes, the gas digest and the per-slot voxel digests

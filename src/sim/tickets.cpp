@@ -503,6 +503,7 @@ void Tickets::Recentre(uint32_t tick) {
 }
 
 void Tickets::Tick(uint32_t tick) {
+  now_ = tick;
   Fold(tick);
   FinalizeReleases(tick);
   ReleaseIdle(tick);
@@ -538,6 +539,7 @@ void Tickets::DropAll(const rhi::Queue& queue) {
                  pending_.end());
   landings_.clear();
   spawnQueue_.clear();
+  rethrown_.clear();
   haveFold_ = false;
   world_->UploadTicketTable(queue);
   tableDirty_ = false;
@@ -585,12 +587,43 @@ std::vector<std::string> Tickets::Describe(uint32_t tick) const {
 // published snapshot until this takes it (World::TakeTicketDeposits), and
 // this holds it until its chunk is resident. In arrival order, which is
 // snapshot-tick order then deposit-slot order: a pure function of the tick.
+//
+// THE CPU LANDS IT (far-fill timing #5, option C, 2026-10-06). The GPU no
+// longer flies matter outside residency (the far cascade it collided with is
+// filled on a wall-clock schedule): a particle deposits at the first sample
+// past the edge, often in mid-air. Here it is lowered onto the CPU's own
+// ground, World::TerrainHeight (genColumn's twin, the height contract), so
+// the ticket it asks for is over the chunk it will actually rest in and the
+// re-throw falls the last cell onto the true ground (or rises out of a roof,
+// a canopy or an edit the column does not describe, the burial rule). Below
+// the ground (a cave, a tunnel) it is left where it is. Straight down: the
+// deposit carries no velocity. NOT lowered: a deposit in a column a
+// landing was re-thrown in lately (rethrown_, tickets.h) -- that is the
+// re-thrown landing itself rising out of matter the column does not describe.
+// A pure function of the record, the seed and this object's own history.
 void Tickets::TakeDeposits() {
   const uint64_t dropped0 = world_->TicketDepositsDropped();
+  rethrown_.erase(std::remove_if(rethrown_.begin(), rethrown_.end(),
+                                 [&](const Rethrow& r) {
+                                   return now_ - r.tick > kRethrowMemoTicks;
+                                 }),
+                  rethrown_.end());
   for (const ParticleSpawn& d : world_->TakeTicketDeposits()) {
     Landing l;
-    l.chunk = {(d.px >> 8) >> 4, (d.py >> 8) >> 4, (d.pz >> 8) >> 4};
     l.p = d;
+    {
+      const int x = d.px >> 8, z = d.pz >> 8;
+      const int h = World::TerrainHeight(x, z, world_->WorldSeed());
+      bool rising = false;
+      for (const Rethrow& r : rethrown_) rising = rising || (r.x == x && r.z == z);
+      if (rising) {
+        stats_.landingsRose++;
+      } else if ((d.py >> 8) > h + 1) {
+        l.p.py = (h + 1) * 256 + 128;
+        stats_.landingsLowered++;
+      }
+    }
+    l.chunk = {(l.p.px >> 8) >> 4, (l.p.py >> 8) >> 4, (l.p.pz >> 8) >> 4};
     l.p.vx = l.p.vy = l.p.vz = 0;
     l.p.flags = 0;  // the spawn kernel forces ALIVE; nothing else survives
     landings_.push_back(l);
@@ -639,6 +672,8 @@ void Tickets::QueueResidentLandings() {
   for (size_t i = 0; i < landings_.size(); i++) {
     if (world_->ChunkResident(landings_[i].chunk)) {
       spawnQueue_.push_back(landings_[i].p);
+      if (rethrown_.size() >= kRethrowMemoMax) rethrown_.erase(rethrown_.begin());
+      rethrown_.push_back({landings_[i].p.px >> 8, landings_[i].p.pz >> 8, now_});
     } else {
       if (w != i) landings_[w] = landings_[i];
       w++;

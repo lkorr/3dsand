@@ -561,9 +561,9 @@ ray and is inside noise.
   in one deposit slot on one tick) hands over ONE record and kills both. Same
   class as the claim system's equal-priority rule; needs a count word in the
   record.
-- Far flight before the cascade first fills: `farBlocked` reads OPEN outside
-  the cascade, so a particle can fall until the far box kills it (counted) —
-  matter lost, and frame-timing dependent in the game (P2 1).
+- ~~Far flight before the cascade first fills~~ CLOSED 2026-10-06 (option C):
+  there is no far flight; a particle leaving residency deposits at once and
+  the CPU lowers it onto `World::TerrainHeight` (DESIGN.md P2 bullet).
 - Window-edge cells now see an ADJACENT ticket's shell as resident (a box may
   touch the window), so matter can move from the window into a ticket shell,
   where it freezes until the box re-centres, releases, or the window covers it.

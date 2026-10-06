@@ -643,7 +643,7 @@
     "currentDrag": 6,
     "windMode": 1,
     "gasMode": 1,
-    "gasThinDecayMul": 1,
+    "gasThinDecayMul": 3,
     "gasThinNeighbors": 2,
     "windDrag": 3,
     "windFluidGain": 0.35,

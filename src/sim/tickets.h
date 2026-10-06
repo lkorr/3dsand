@@ -97,12 +97,14 @@ struct TicketStats {
   uint64_t chunksSkipped = 0;  // ...and chunks never dirtied (procgen / store reproduce them)
   uint64_t conservative = 0;   // releases forced to keep all 125
   uint64_t activeTickSum = 0;  // sum over ticks of active chunks dispatched-eligible (27/ticket)
-  // Far landings (P2): particles that came to rest outside residency and were
-  // refused or not served in time, parked on the CPU until their chunk is
+  // Far landings (P2; option C since 2026-10-06): EVERY particle that left
+  // residency, handed over at once, held on the CPU until its chunk is
   // resident again, then re-thrown as a still particle.
   uint64_t landingsDeposited = 0;
   uint64_t landingsRespawned = 0;
   uint64_t landingsDropped = 0;   // the CPU park was full (kFarLandingMax)
+  uint64_t landingsLowered = 0;   // deposited above the CPU ground, lowered onto it
+  uint64_t landingsRose = 0;      // ...not lowered: rising out of matter it was re-thrown into
   uint32_t landingsParked = 0;    // currently held
 };
 // The last-written stats of the process's Tickets (one per Stream; the game
@@ -247,7 +249,8 @@ class Tickets {
   std::string recentreNote_;
 
   // ---- far landings (P2) -------------------------------------------------
-  // Keyed by world chunk; each entry is the particle as it was parked, to be
+  // Keyed by world chunk; each entry is the particle as it was deposited,
+  // lowered onto World::TerrainHeight if it was above it (TakeDeposits), to be
   // re-thrown with zero velocity when its chunk is resident again. Bounded:
   // past kFarLandingMax the oldest are dropped and counted.
   static constexpr size_t kFarLandingMax = 1u << 16;
@@ -258,6 +261,20 @@ class Tickets {
   };
   std::vector<Landing> landings_;   // in arrival (= snapshot tick) order
   std::vector<ParticleSpawn> spawnQueue_;
+  // The cell columns landings were re-thrown in during the last
+  // kRethrowMemoTicks (QueueResidentLandings). A deposit in one of them is NOT
+  // lowered (TakeDeposits): it is a re-thrown landing that came up inside
+  // matter the analytic column does not describe (a trunk, a tower), rose out
+  // through the burial rule and left residency by the top -- lowering it again
+  // would put it back inside the same matter, forever. Bounded (kRethrowMemoMax).
+  struct Rethrow {
+    int x, z;
+    uint32_t tick;
+  };
+  static constexpr uint32_t kRethrowMemoTicks = 256;
+  static constexpr size_t kRethrowMemoMax = 4096;
+  std::vector<Rethrow> rethrown_;
+  uint32_t now_ = 0;   // the tick Tick() is running (TakeDeposits / QueueResidentLandings)
   void TakeDeposits();
   void QueueResidentLandings();
   void AskForLandings(uint32_t tick);

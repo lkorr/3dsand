@@ -987,7 +987,7 @@ PASS(particleIntegrate, "particleIntegrate+args2", PT_TICK, PIPE_P_INTEGRATE, K_
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) RW(ParticlesRead) I(PDispatchArgs)
           W(ParticlesWrite) A(ParticleCounts) A(Claim) R(PageTable) R(Draft)
-          A(PageFaults) R(FarVox) U(FarUBO) R(HeatPool) A(HeatMeta)))
+          A(PageFaults) R(HeatPool) A(HeatMeta)))
 PASS(particleArgs2, "particleIntegrate+args2", PT_TICK, PIPE_P_ARGS2, K_COMPUTE, 1,1,1, GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(A(ParticleCounts) U(TickUBO) W(PArgsStage)))
 // This second copy overwrites the args the integrate dispatch above FETCHED —
@@ -1039,15 +1039,16 @@ PASS(copy_gasArgs_dispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_N
 // `gasResolve` writes it when a parcel rejoins the grid. `gasIntegrate` only
 // tests cells, to tell "blocked" from "free" and to notice that the next cell
 // is back inside the window.
-// R(FarVox) + U(FarUBO): blocking outside the window, the cascade's level-1
-// byte. Dense toroidal array, direct index, NOT the page table.
+// No R(FarVox) / U(FarUBO) since 2026-10-06 (far-fill timing #5): the cascade
+// is filled on a wall-clock schedule, so no tick row may read it. Outside
+// residency a parcel is unblocked and a particle hands itself to the CPU.
 // R(Reactions): the material's own RK_DECAY bucket (§2.7).
 // R(HeatPool) A(HeatMeta): the heat term in a parcel's wind (windAtQ, and the
 // heavy-gas lift windHeatUpQ; sim_gas.wgsl THE HEAT TERM ON A PARCEL), read
 // after this tick's heat passes wrote them, as the particle row reads them.
 PASS(gasIntegrate, "gasIntegrate+args2", PT_TICK, PIPE_GAS_INTEGRATE, K_INDIRECT, IND_GASARGS,0,0,
      GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
-     USES(R(Voxels) R(Materials) R(Reactions) U(TickUBO) U(FarUBO) R(FarVox)
+     USES(R(Voxels) R(Materials) R(Reactions) U(TickUBO)
           I(GasDispatchArgs) RW(GasParticlesRead) W(GasParticlesWrite)
           A(GasCounts) A(GasClaim) A(GasSpawn) R(PageTable) R(HeatPool) A(HeatMeta)))
 PASS(gasArgs2, "gasIntegrate+args2", PT_TICK, PIPE_GAS_ARGS2, K_COMPUTE, 1,1,1,

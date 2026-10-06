@@ -1540,6 +1540,8 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"landingsDeposited\": " << ts.landingsDeposited
       << ", \"landingsRespawned\": " << ts.landingsRespawned
       << ", \"landingsDropped\": " << ts.landingsDropped
+      << ", \"landingsLowered\": " << ts.landingsLowered
+      << ", \"landingsRose\": " << ts.landingsRose
       << ", \"landingsParked\": " << ts.landingsParked << "},\n";
   }
   // ---- WHAT THIS RUN'S SIM CONSTANTS WERE (PLAN_multiplayer_now N6) -------

@@ -479,22 +479,20 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(5, T::ReadOnlyStorage),  // explosion ops
         entry(6, T::Storage),          // explosion destruction scratch
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
-        // Chunk tickets P2: a particle OUTSIDE residency flies on and blocks
-        // against the far cascade (sim_particle.wgsl FAR FLIGHT) — the same
-        // two buffers the gas group binds for gasFarBlocked.
-        entry(8, T::ReadOnlyStorage),  // farVox
-        entry(9, T::Uniform),          // FarParams (the cascade origins)
+        // 8/9 were farVox + FarParams until 2026-10-06 (far-fill timing #5,
+        // option C): a particle outside residency now hands itself to the CPU
+        // at once (sim_particle.wgsl FAR LANDING), so no tick kernel reads the
+        // wall-clock-filled cascade.
     };
     particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
 
     // group 1: gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md).
     //
-    // Its OWN group rather than an extension of particleBGL_, and the reason is
-    // farVox: gas needs the far cascade to know what it is drifting into
-    // outside the window, and that lives in farBGL_. A layout carrying both
-    // would have to be bound by every ballistic row for no hazard, and the
-    // fluid pair already established that a system with its own buffers gets
-    // its own group-1.
+    // Its OWN group rather than an extension of particleBGL_: the fluid pair
+    // already established that a system with its own buffers gets its own
+    // group-1. (It also used to carry farVox for gasFarBlocked; since
+    // 2026-10-06 nothing outside residency blocks a parcel -- sim_gas.wgsl,
+    // "outside residency: OPEN" -- and 7/8 are unused.)
     rhi::BindGroupLayoutEntry gentries[] = {
         entry(0, T::Storage),          // gasRead  (gasParticles[page])
         entry(1, T::Storage),          // gasWrite (gasParticles[1-page])
@@ -503,8 +501,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(4, T::Storage),          // gasClaim (re-entry claim hash)
         entry(5, T::Storage),          // gasArgs staging
         entry(6, T::Storage),          // gasOuter (render-only density box)
-        entry(7, T::ReadOnlyStorage),  // farVox: blocking outside the window
-        entry(8, T::Uniform),          // FarParams (the cascade origins)
         entry(9, T::ReadOnlyStorage),  // reactions: the RK_DECAY bucket
         entry(10, T::ReadOnlyStorage), // gasSpawnOps (CPU-authored spawns)
         // The far fire-plume emitter list (world.h kGasFarEmitMax). In THIS
@@ -952,8 +948,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(5, world_->expOps),
         b(6, world_->expMask),
         b(7, world_->spawnOps),
-        b(8, world_->farVox),
-        b(9, world_->farUBO),
     };
     particleBG_[page] =
         device.CreateBindGroup(particleBGL_, pentries, std::size(pentries), "particleBG");
@@ -968,8 +962,6 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(4, world_->gasClaim),
         b(5, world_->gasArgs),
         b(6, world_->gasOuter),
-        b(7, world_->farVox),
-        b(8, world_->farUBO),
         b(9, reactionBuf_),
         b(10, world_->gasSpawnOps),
         b(11, world_->gasFarEmit),
