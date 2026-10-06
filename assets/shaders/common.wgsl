@@ -427,11 +427,15 @@ fn matCanAct(m : Material) -> bool {
 // cannot tell those apart. This mask can, in one run. Those non-write marks
 // reach only the OWN chunk (sim_step's markDirtyR); writes fan out.
 //
-// DIRTY_R_FLOW IS RETIRED (2026-09-23) and the bit is kept only so the
-// numbering and the CPU's reason names stay put. It was set by a
-// `canFlowAnywhere` call right after a stepLiquid that moved nothing; that
-// predicate mirrors stepLiquid stage for stage against the same unwritten
-// state, so it was provably false there and the bit was never set.
+// BIT 3 WAS DIRTY_R_FLOW, RETIRED 2026-09-23 (set by a `canFlowAnywhere`
+// call right after a stepLiquid that moved nothing; that predicate mirrors
+// stepLiquid stage for stage against the same unwritten state, so it was
+// provably false there and the bit was never set). It is DIRTY_R_SLOW since
+// 2026-10-06: TEMPORAL RATE LOD (rateLodLevel above). A chunk whose dirty word
+// is EXACTLY DIRTY_R_SLOW has no pending work but compensable reactions held
+// at its own level, so sim_compact skips it on every tick that is not its due
+// tick and carries the bit forward instead. That is the ONE reader that
+// branches on a reason bit's identity rather than on `!= 0`.
 //
 // The bits are diagnostic only: nothing branches on them, and a reader that
 // wants the old boolean gets it from `!= 0` exactly as before.
@@ -440,7 +444,7 @@ const DIRTY_R_REACT    : u32 = 2u;    // doReactions: rule MATCHED, did not fire
                                       // (also sim_fluid_seam particleTick: an
                                       // excited particle has a rule partner here)
 const DIRTY_R_STAIN    : u32 = 4u;    // doStaining: unsaturated surface in reach
-const DIRTY_R_FLOW     : u32 = 8u;    // RETIRED: never set (see above)
+const DIRTY_R_SLOW     : u32 = 8u;    // doReactions: only COARSE compensable rules matched
 const DIRTY_R_VISCOUS  : u32 = 16u;   // viscous off-tick with somewhere to go
 const DIRTY_R_SEAM     : u32 = 32u;   // sim_fluid_seam (excite / settle / stain)
 const DIRTY_R_PARTICLE : u32 = 64u;   // sim_particle resolve
@@ -1066,7 +1070,73 @@ struct TickParams {
   updraftCapQ : i32,
   updraftInflowQ : i32,
   draftStackQ : i32,
+  // TEMPORAL RATE LOD (world.h; rateLodLevel below): full-rate radius and
+  // chunks per level (Chebyshev, chunk units), the deepest level (0 = off),
+  // a forced level for every window chunk (< 0 = none), the player count and
+  // up to 8 player WORLD chunks (literal 8 = world.h kRateLodPlayers; this
+  // struct and world.h's are compared on TOTAL SIZE).
+  rateLodNear : i32,
+  rateLodStep : i32,
+  rateLodMax : i32,
+  rateLodForce : i32,
+  rateLodCount : u32,
+  padRl0 : u32,
+  padRl1 : u32,
+  padRl2 : u32,
+  rateLodPlayers : array<vec4<i32>, 8>,
 };
+
+// ---- TEMPORAL RATE LOD: WHICH CHUNKS RUN SLOW REACTIONS COARSELY ------------
+// (DESIGN.md §4 "Temporal rate LOD"). Two shaders must agree on this, which is
+// why it lives here: sim_compact decides whether a chunk whose ONLY pending
+// work is compensable reactions is dispatched this tick, and sim_step decides
+// whether those reactions roll this tick and at what compensated chance. If
+// they disagreed, a chunk could be skipped on the tick its reactions were due
+// (a lost exec) -- so both call these three functions and nothing else.
+//
+// A pure function of (TickParams, tick, WORLD chunk coord): the level is the
+// distance in chunks (Chebyshev) to the NEAREST declared player, 0 within
+// rateLodNear, then one level per rateLodStep chunks, capped at rateLodMax. No
+// player declared = level 0 everywhere (a headless harness has no observer).
+// rateLodForce overrides every window chunk (the rate-lod fidelity gate).
+// Phase 2 (view-based) adds an input HERE, as another term of this function.
+//
+// THE DUE TICK. A chunk at level L runs its compensable reactions on the ticks
+// where (tick + phase) is a multiple of 2^L, phase a 4-bit hash of the world
+// chunk coord so neighbouring coarse chunks do not all fire on one tick. The
+// levels are powers of two so "due at L" implies "due at every L' < L": a rule
+// held to a lower level than its chunk (its chance is too high for N) is due
+// on a superset of the chunk's due ticks, which is what lets sim_step say
+// "this chunk needs no dispatch until its due tick" with one bit.
+fn rateLodLevel(wc : vec3<i32>, tp : ptr<uniform, TickParams>) -> u32 {
+  if ((*tp).rateLodForce >= 0) { return u32(min((*tp).rateLodForce, 4)); }
+  if ((*tp).rateLodMax <= 0 || (*tp).rateLodCount == 0u) { return 0u; }
+  var d = 0x7FFFFFFF;
+  for (var i = 0u; i < min((*tp).rateLodCount, 8u); i++) {
+    let a = abs(wc - (*tp).rateLodPlayers[i].xyz);
+    d = min(d, max(a.x, max(a.y, a.z)));
+  }
+  if (d <= (*tp).rateLodNear) { return 0u; }
+  let l = 1 + (d - (*tp).rateLodNear - 1) / max((*tp).rateLodStep, 1);
+  return u32(min(l, min((*tp).rateLodMax, 4)));
+}
+fn rateLodPhase(wc : vec3<i32>) -> u32 {
+  return hash3(bitcast<u32>(wc.x) ^ 0x5A7E10D5u, bitcast<u32>(wc.y),
+               bitcast<u32>(wc.z)) & 15u;
+}
+// Bit l set = `tick` is a due tick at level l (bit 0 always: level 0 is
+// every tick). sim_step reads the mask once per cell; sim_compact one bit.
+fn rateLodDueMask(tick : u32, wc : vec3<i32>) -> u32 {
+  let t = tick + rateLodPhase(wc);
+  var m = 1u;
+  for (var l = 1u; l <= 4u; l++) {
+    if ((t & ((1u << l) - 1u)) == 0u) { m |= 1u << l; }
+  }
+  return m;
+}
+fn rateLodDue(tick : u32, wc : vec3<i32>, level : u32) -> bool {
+  return ((rateLodDueMask(tick, wc) >> level) & 1u) != 0u;
+}
 
 // ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------
 //

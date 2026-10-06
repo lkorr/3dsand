@@ -481,6 +481,9 @@ enum class PerfCounter : uint8_t {
   CaOtherCells,      // non-gas non-inert cells they ran
   GasOnlyChunks,     // awake chunks holding gas and nothing else
   GasOnlyCells,      // gas cells in those chunks
+  // TEMPORAL RATE LOD: awake chunks whose only work is coarse compensable
+  // reactions (DIRTY_R_SLOW alone) -- dispatched on their due tick only.
+  SlowOnlyChunks,
   // The raymarch's inside (RENDER_STATS). Order matches kPerfCounters below
   // AND the RS_* slot order in raymarch.wgsl: RmPixels is the shader's slot 0
   // (the sampled-pixel denominator, scaled back up to pixels), RmPrimarySteps
@@ -559,6 +562,7 @@ inline constexpr PerfCounterDef kPerfCounters[] = {
     {"caOtherCells", "CA other cells run", "caLoop", false},
     {"gasOnlyChunks", "awake chunks: gas only", "caLoop", false},
     {"gasOnlyCells", "gas cells in gas-only chunks", "caLoop", false},
+    {"slowOnlyChunks", "awake chunks: rate-LOD skippable", "compact", false},
     // ---- the raymarch's INSIDE, from RENDER_STATS (raymarch.wgsl) ----------
     // Per-frame totals, already scaled up from the 1-in-16 pixel sample the
     // shader records on. A STEP is one DDA cell advance in the named trace; a

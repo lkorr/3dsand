@@ -796,6 +796,26 @@ TP_I(sim, heatGain, NO_WGSL, 8, 1, 64)
 TP_F(sim, heatUpGain, NO_WGSL, 20.0f, 0.0f, 32.0f)
 TP_F(sim, heatSideGain, NO_WGSL, 0.5f, 0.0f, 1.0f)
 TP_F(sim, heatDownGain, NO_WGSL, 0.25f, 0.0f, 4.0f)
+// TEMPORAL RATE LOD (DESIGN.md §4 "Temporal rate LOD"; common.wgsl
+// rateLodLevel). Compensable reactions (reactions.json "rateLod") in a chunk
+// far from every player roll every 2^L ticks at a compensated chance instead
+// of every tick, and a chunk whose only work is those may skip its dispatch
+// until its due tick. NO_WGSL: SubmitTick writes them into TickParams with the
+// tick's player chunks, so a change reaches the kernels without touching the
+// prelude and a replay rebuilds them from the record. Mode 0 = level 0
+// everywhere = the pre-rate-LOD sim exactly. Near/step are Chebyshev chunk
+// distances (1 chunk = 1.6 m); level L = 1 + (d - near - 1) / step past near.
+// SHIPS 0 (2026-10-06): measured in --perf village-fire / forestfire it saves
+// nothing and costs CA (+1.6% / +5% at these defaults): a fire's slow
+// reactions share their chunks with the fire's own moving smoke, so almost no
+// chunk is ever slow-only (DESIGN.md §4 "Temporal rate LOD", the numbers).
+TP_I(sim, rateLodMode, NO_WGSL, 0, 0, 1)
+TP_I(sim, rateLodNear, NO_WGSL, 6, 0, 32)
+TP_I(sim, rateLodStep, NO_WGSL, 3, 1, 16)
+TP_I(sim, rateLodMaxLevel, NO_WGSL, 3, 0, kRateLodMaxLevel)
+// A debug/gate override: >= 0 forces that level on every window chunk with
+// or without players (the rate-lod fidelity gate's coarse arm). -1 = off.
+TP_I(sim, rateLodForce, NO_WGSL, -1, -1, kRateLodMaxLevel)
 // The climate above the snowline (map terrain.treeline - 1), in heat units
 // (0 = water freezes). Must stay below 0 by day: the snow caps are worldgen's.
 // + a hand-written rule in LoadTuning

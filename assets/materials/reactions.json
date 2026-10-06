@@ -1,5 +1,5 @@
 {
-  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick \u2014 put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes. \"drying\": true marks a rule as the world's abstraction of matter soaking into the ground or drying in the open (blood -> air), not chemistry: the world runs it as authored, the alchemy bench never fires it on matter inside a vessel. CPU-only (MaterialDef::ruleFx drying), it touches no GPU data and cannot move the world hash. Every other rule that turns its self into air still runs on the bench in an OPEN vessel (smoke fades, a vapour disperses); in a STOPPERED vessel no decay to air fires except a fast transient (spark, glare: at least a tenth of the chance scale a tick).",
+  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick \u2014 put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes. \"drying\": true marks a rule as the world's abstraction of matter soaking into the ground or drying in the open (blood -> air), not chemistry: the world runs it as authored, the alchemy bench never fires it on matter inside a vessel. CPU-only (MaterialDef::ruleFx drying), it touches no GPU data and cannot move the world hash. Every other rule that turns its self into air still runs on the bench in an OPEN vessel (smoke fades, a vapour disperses); in a STOPPERED vessel no decay to air fires except a fast transient (spark, glare: at least a tenth of the chance scale a tick). \"rateLod\" (TEMPORAL RATE LOD, DESIGN.md section 4): \"none\" (the default) runs the rule every tick everywhere; \"transform\" (a DECAY: a one-shot self rewrite -- burn-out, fade, cooling) and \"emit\" (an EMIT rule that keeps self: a burning voxel's flames and smoke) let it run every 2^L ticks in chunks far from every player at a survival-matched chance, 1 - (1 - p)^N. Never on a pair rule, fire SPREAD, ignition, growth, anything that moves matter, or anything fast -- the GPU also holds a rule at a finer N while N x p > 1/4.",
   "reactions": [
     {
       "note": "-------- fire: short-lived rising flame; doused by water --------"
@@ -37,18 +37,21 @@
     },
     {
       "self": "smoke",
+      "rateLod": "transform",
       "decay": true,
       "chance": 9,
       "becomes": "air"
     },
     {
       "self": "steam",
+      "rateLod": "transform",
       "decay": true,
       "chance": 10,
       "becomes": "air"
     },
     {
       "self": "steam",
+      "rateLod": "transform",
       "decay": true,
       "chance": 3,
       "becomes": "water"
@@ -216,24 +219,28 @@
     },
     {
       "self": "leaf_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 70
     },
     {
       "self": "leaf_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 35
     },
     {
       "self": "leaf_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "side",
       "chance": 35
     },
     {
       "self": "leaf_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 72,
@@ -241,6 +248,7 @@
     },
     {
       "self": "leaf_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 8,
@@ -264,24 +272,28 @@
     },
     {
       "self": "pine_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 70
     },
     {
       "self": "pine_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 35
     },
     {
       "self": "pine_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "side",
       "chance": 35
     },
     {
       "self": "pine_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 72,
@@ -289,6 +301,7 @@
     },
     {
       "self": "pine_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 8,
@@ -309,24 +322,28 @@
     },
     {
       "self": "autumn_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 70
     },
     {
       "self": "autumn_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 35
     },
     {
       "self": "autumn_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "side",
       "chance": 35
     },
     {
       "self": "autumn_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 72,
@@ -334,6 +351,7 @@
     },
     {
       "self": "autumn_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 8,
@@ -487,12 +505,14 @@
     },
     {
       "self": "ember",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 90
     },
     {
       "self": "ember",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 45
@@ -505,6 +525,7 @@
     },
     {
       "self": "ember",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 1,
@@ -512,6 +533,7 @@
     },
     {
       "self": "ember",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 4,
@@ -519,6 +541,7 @@
     },
     {
       "self": "ember",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 3,
@@ -572,6 +595,7 @@
     },
     {
       "self": "molten_glass",
+      "rateLod": "transform",
       "decay": true,
       "chance": 25,
       "becomes": "glass"
@@ -822,6 +846,7 @@
     {
       "note": "blood dries away so pools go back to sleep (PLAN #B5, rule 2). DRYING: it soaks into the ground / dries in the open, which a flask has neither of -- the alchemy bench never fires it inside a vessel.",
       "self": "blood",
+      "rateLod": "transform",
       "decay": true,
       "becomes": "air",
       "chance": 8,
@@ -835,6 +860,7 @@
     },
     {
       "self": "water",
+      "rateLod": "transform",
       "decay": true,
       "needsSky": true,
       "when": "day",
@@ -853,6 +879,7 @@
     },
     {
       "self": "steam",
+      "rateLod": "transform",
       "decay": true,
       "when": "night",
       "chance": 6,
@@ -875,6 +902,7 @@
     },
     {
       "self": "flower",
+      "rateLod": "transform",
       "decay": true,
       "when": "night",
       "chance": 40,
@@ -882,6 +910,7 @@
     },
     {
       "self": "petal",
+      "rateLod": "transform",
       "decay": true,
       "when": "day",
       "minLight": 70,
@@ -901,6 +930,7 @@
     {
       "note": "FUNGUS ROTS AWAY (2026-09-23, CLAUDE.md rule 2: bound every emergent process). Without this a fungus voxel was permanent and converted every organic neighbour, grass included, so a patch crept over a whole meadow or forest. The bound is a decay to dirt, tried AFTER both spread rules so it only rolls on ticks the cell did not spread. Expected neighbours converted over one fungus voxel's life = p / ((1 - p) q) with q = 0.020: at night p = 1 - (1 - 0.007)(1 - 0.009) = 0.0159, giving 0.81; by day p = 0.007, giving 0.35. Both < 1, so a fungus front is subcritical and dies out, leaving dirt (soil, which grass can re-cover by day). Mean life 1/q = 50 ticks, during which the unconditional decay keeps the chunk awake; that ends when the cell rots.",
       "self": "fungus",
+      "rateLod": "transform",
       "decay": true,
       "chance": 20,
       "becomes": "dirt"
@@ -1030,12 +1060,14 @@
     },
     {
       "self": "cloth_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 120
     },
     {
       "self": "cloth_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 60
@@ -1045,6 +1077,7 @@
     },
     {
       "self": "cloth_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 38.67,
@@ -1052,6 +1085,7 @@
     },
     {
       "self": "cloth_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 0.33,
@@ -1062,6 +1096,7 @@
     },
     {
       "self": "cloth_charred",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 30,
@@ -1100,12 +1135,14 @@
     },
     {
       "self": "hair_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 200
     },
     {
       "self": "hair_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 100
@@ -1145,18 +1182,21 @@
     },
     {
       "self": "linen_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 120
     },
     {
       "self": "linen_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 60
     },
     {
       "self": "linen_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 38.67,
@@ -1164,6 +1204,7 @@
     },
     {
       "self": "linen_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 0.33,
@@ -1216,18 +1257,21 @@
     },
     {
       "self": "flesh_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 70
     },
     {
       "self": "flesh_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 35
     },
     {
       "self": "flesh_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 49.47,
@@ -1235,6 +1279,7 @@
     },
     {
       "self": "flesh_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 0.53,
@@ -1245,6 +1290,7 @@
     },
     {
       "self": "flesh_charred",
+      "rateLod": "transform",
       "decay": true,
       "chance": 20,
       "becomes": "flesh_cinder",
@@ -1259,6 +1305,7 @@
     },
     {
       "self": "flesh_charred",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 8,
@@ -1304,18 +1351,21 @@
     },
     {
       "self": "undercloth_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 70
     },
     {
       "self": "undercloth_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "down",
       "chance": 35
     },
     {
       "self": "undercloth_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 50,
@@ -1323,6 +1373,7 @@
     },
     {
       "self": "undercloth_charred",
+      "rateLod": "transform",
       "decay": true,
       "chance": 20,
       "becomes": "linen_charred",
@@ -1334,6 +1385,7 @@
     },
     {
       "self": "undercloth_charred",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 8,
@@ -1580,6 +1632,7 @@
     },
     {
       "self": "hydrogen",
+      "rateLod": "transform",
       "decay": true,
       "chance": 4,
       "becomes": "air"
@@ -1613,6 +1666,7 @@
     },
     {
       "self": "molten_salt",
+      "rateLod": "transform",
       "decay": true,
       "chance": 5,
       "becomes": "salt",
@@ -1700,6 +1754,7 @@
     },
     {
       "self": "chlorine",
+      "rateLod": "transform",
       "decay": true,
       "chance": 4,
       "becomes": "air"
@@ -1727,6 +1782,7 @@
     },
     {
       "self": "noxious_gas",
+      "rateLod": "transform",
       "decay": true,
       "chance": 12,
       "becomes": "air"
@@ -2039,30 +2095,35 @@
     },
     {
       "self": "smoke_charge",
+      "rateLod": "transform",
       "decay": true,
       "chance": 15,
       "becomes": "ash"
     },
     {
       "self": "smoke_charge",
+      "rateLod": "emit",
       "emit": "thick_smoke",
       "dir": "up",
       "chance": 350
     },
     {
       "self": "smoke_charge",
+      "rateLod": "emit",
       "emit": "thick_smoke",
       "dir": "side",
       "chance": 200
     },
     {
       "self": "smoke_charge",
+      "rateLod": "emit",
       "emit": "thick_smoke",
       "dir": "down",
       "chance": 100
     },
     {
       "self": "thick_smoke",
+      "rateLod": "transform",
       "decay": true,
       "chance": 4,
       "becomes": "air"
@@ -2091,6 +2152,7 @@
     },
     {
       "self": "slaking_lime",
+      "rateLod": "transform",
       "decay": true,
       "chance": 40,
       "becomes": "slaked_lime"
@@ -2104,6 +2166,7 @@
     },
     {
       "self": "choke_damp",
+      "rateLod": "transform",
       "decay": true,
       "chance": 3,
       "becomes": "air"
@@ -2175,6 +2238,7 @@
     },
     {
       "self": "molten_iron",
+      "rateLod": "transform",
       "decay": true,
       "chance": 4,
       "becomes": "iron",
@@ -2482,6 +2546,7 @@
     },
     {
       "self": "ether_vapour",
+      "rateLod": "transform",
       "decay": true,
       "chance": 5,
       "becomes": "air"
@@ -2504,12 +2569,14 @@
     },
     {
       "self": "ether_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 60
     },
     {
       "self": "ether_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 26,
@@ -2517,6 +2584,7 @@
     },
     {
       "self": "ether_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 8,
@@ -2631,6 +2699,7 @@
     },
     {
       "self": "moonwater",
+      "rateLod": "transform",
       "decay": true,
       "chance": 2,
       "becomes": "water",
@@ -2665,6 +2734,7 @@
     },
     {
       "self": "sunwater",
+      "rateLod": "transform",
       "decay": true,
       "chance": 2,
       "becomes": "water",
@@ -2836,6 +2906,7 @@
     },
     {
       "self": "oil_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 9,
@@ -2843,6 +2914,7 @@
     },
     {
       "self": "oil_burning",
+      "rateLod": "transform",
       "decay": true,
       "burnDuration": true,
       "chance": 4.4,
@@ -2863,18 +2935,21 @@
     },
     {
       "self": "oil_burning",
+      "rateLod": "emit",
       "emit": "fire",
       "dir": "up",
       "chance": 70
     },
     {
       "self": "oil_burning",
+      "rateLod": "emit",
       "emit": "black_smoke",
       "dir": "up",
       "chance": 150
     },
     {
       "self": "oil_burning",
+      "rateLod": "emit",
       "emit": "black_smoke",
       "dir": "side",
       "chance": 50
@@ -2884,6 +2959,7 @@
     },
     {
       "self": "black_smoke",
+      "rateLod": "transform",
       "decay": true,
       "chance": 6,
       "becomes": "air"
@@ -2891,6 +2967,7 @@
     {
       "note": "coolant (an android's bleed until 2026-10-03; nothing bleeds it now, materials.json) dries away like blood so a spill goes back to sleep (rule 2). DRYING: the alchemy bench never fires it inside a vessel. Appended: re-rolls no earlier rule.",
       "self": "coolant",
+      "rateLod": "transform",
       "decay": true,
       "becomes": "air",
       "chance": 8,

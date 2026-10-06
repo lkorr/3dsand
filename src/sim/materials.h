@@ -567,6 +567,16 @@ struct ReactionGpu;
 std::vector<uint8_t> SmokeSourceTable(const std::vector<MaterialDef>& mats,
                                       const std::vector<ReactionGpu>& reactions);
 
+// TEMPORAL RATE LOD class (reactions.json "rateLod", ReactionGpu.packed bits
+// 5..6) — must match RLOD_* in sim_step.wgsl. "none" (the default) runs every
+// tick everywhere; "transform" (a DECAY: a one-shot self rewrite) and "emit"
+// (an EMIT rule that keeps self) may run every 2^L ticks in a chunk far from
+// every player, survival-matched (DESIGN.md §4 "Temporal rate LOD"). Pair
+// rules are always "none". CPU evaluators (bodies, the bench) ignore it: they
+// are full rate.
+constexpr uint32_t kRateLodShift = 5;
+constexpr uint32_t kRateLodNone = 0, kRateLodTransform = 1, kRateLodEmit = 2;
+
 // Reaction kinds / direction bits — must match common.wgsl.
 constexpr uint32_t kReactPair = 0, kReactDecay = 1, kReactEmit = 2;
 constexpr uint32_t kDirDown = 1, kDirUp = 2, kDirSide = 4, kDirAny = 7;

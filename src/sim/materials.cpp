@@ -1887,6 +1887,46 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     // fields are already spoken for.
     ParseNeighborScale(r, mats, tagReg, path, self, kind, g, errors);
     g.packed = (kind & 3u) | ((dirMask & 7u) << 2u);
+    // ---- "rateLod": TEMPORAL RATE LOD class (DESIGN.md §4) ----------------
+    // Opt-in per rule; absent = "none" = full rate everywhere. The class must
+    // agree with what the rule DOES, because the GPU compensates the two
+    // differently: a transform rewrites self once and blocks the rules after
+    // it, an emit keeps self, makes a product again and again and does NOT
+    // block in a coarse exec (sim_step.wgsl's header says why). So a decay
+    // can only be a transform, an emit rule without selfBecomes only an emit,
+    // and a pair rule only "none".
+    if (r.contains("rateLod")) {
+      const std::string cls = r["rateLod"].is_string() ? r["rateLod"].get<std::string>() : "";
+      uint32_t c = 0xFFu;
+      if (cls == "none") c = kRateLodNone;
+      else if (cls == "transform") c = kRateLodTransform;
+      else if (cls == "emit") c = kRateLodEmit;
+      if (c == 0xFFu) {
+        errors += path + ": reaction self=\"" + self +
+                  "\": rateLod must be \"none\", \"transform\" or \"emit\"\n";
+      } else {
+        const bool keepsSelf = g.prodSelf == kProdKeep;
+        if (c != kRateLodNone && kind == kReactPair)
+          errors += path + ": reaction self=\"" + self +
+                    "\": a pair rule cannot be coarse (rateLod \"none\" only): its "
+                    "partner is a neighbour -- a front, a contact or a douse -- and "
+                    "the GPU has no coarse PAIR path (sim_step.wgsl TEMPORAL RATE LOD)\n";
+        else if (c == kRateLodTransform && kind == kReactEmit)
+          errors += path + ": reaction self=\"" + self +
+                    "\": an emit rule cannot be rateLod \"transform\" (an emit "
+                    "that also rewrites self is a front; leave it \"none\")\n";
+        else if (c == kRateLodTransform && keepsSelf)
+          errors += path + ": reaction self=\"" + self +
+                    "\": rateLod \"transform\" needs a rule that rewrites self "
+                    "(a repeatable product is \"emit\")\n";
+        else if (c == kRateLodEmit && !keepsSelf)
+          errors += path + ": reaction self=\"" + self +
+                    "\": rateLod \"emit\" needs a rule that keeps self (a one-shot "
+                    "rewrite is \"transform\")\n";
+        else
+          g.packed |= c << kRateLodShift;
+      }
+    }
     // ---- effects (docs/PLAN_alchemy_chemistry.md 2.2) ----------------------
     // Parsed BEFORE the neighborChance split so the fx id rides g.cond into
     // the synthesized tail rules: the floating-flame exception of an

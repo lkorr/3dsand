@@ -172,7 +172,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount = 0,
                 const std::vector<FluidSpawnOp>& fluidSpawns = {},
                 uint32_t fluidLive = 0,
-                bool vizActive = false);
+                bool vizActive = false,
+                // TEMPORAL RATE LOD: the WORLD chunks of every player this tick
+                // (TickParams::rateLodPlayers; DESIGN.md §4). Empty = no
+                // observer = full rate everywhere (rateLodForce aside).
+                const std::vector<IVec3>& lodPlayers = {});
+
+// The `lodPlayers` a recorded tick was submitted with (opstream::TickInputs),
+// for the replay drivers: hand it back to SubmitTick or the rebuilt
+// TickParams differs from the recorded one.
+namespace opstream { struct TickInputs; }
+std::vector<IVec3> RateLodPlayersOf(const opstream::TickInputs& in);
 
 // Re-read the AUTHORED ENVIRONMENT from disk -- assets/biomes/*.json, the
 // world map named by world.mapLayer, assets/trees/* -- validate it the way

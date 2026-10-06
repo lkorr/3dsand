@@ -13,6 +13,9 @@
 
 @group(0) @binding(1) var<storage, read_write> dirtyIn : array<u32>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<u32>;
+// TEMPORAL RATE LOD (common.wgsl rateLodLevel): `main` reads the tick and the
+// declared players to decide whether a slow-only chunk is due this tick.
+@group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(12) var<storage, read_write> dirtyList : array<u32>;
 @group(0) @binding(13) var<storage, read_write> args : array<atomic<u32>>;  // x=count, y=1, z=1
 // Read for the ticket table in its tail ONLY (common.wgsl ticketSlotActive):
@@ -38,6 +41,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     // keeps it: the occupancy and digest of a written shell chunk still
     // update, which is what the release's store decision and the hash read.
     if (i >= NUM_CHUNKS && !ticketSlotActive(i)) { return; }
+    // TEMPORAL RATE LOD (DESIGN.md §4 "Temporal rate LOD"). A window chunk
+    // whose ONLY pending work is compensable reactions held at its own level
+    // (sim_step doReactions marks exactly DIRTY_R_SLOW for that and nothing
+    // else) has nothing to do on a tick that is not its due tick: every one of
+    // those rules would be skipped there without a roll. So it is left out of
+    // the list, and its mark is CARRIED into dirtyOut (zeroed by the phase-0
+    // fill before this pass, OR'd by mutate/explode/windWake before it, read
+    // by the CA after it) so the chunk is still dirty on its due tick. Any
+    // other bit -- a write, a move, an op, a neighbour's fan-out, heat,
+    // charge -- means real work and the chunk is dispatched as before. Ticket
+    // slots (i >= NUM_CHUNKS) are level 0 by definition (sim_step agrees).
+    if (i < NUM_CHUNKS && dirtyIn[i] == DIRTY_R_SLOW) {
+      let wc = slotWorldChunk(i, T.origin);
+      if (!rateLodDue(T.tick, wc, rateLodLevel(wc, &T))) {
+        dirtyOut[i] = dirtyOut[i] | DIRTY_R_SLOW;
+        return;
+      }
+    }
     let slot = atomicAdd(&args[0], 1u);
     dirtyList[slot] = i;
   }
@@ -54,7 +75,12 @@ fn mainNext(@builtin(global_invocation_id) gid : vec3<u32>) {
     atomicStore(&args[2], 1u);
   }
   if (i >= NUM_SLOTS) { return; }
-  if (dirtyOut[i] != 0u) {
+  // A word that is EXACTLY DIRTY_R_SLOW (temporal rate LOD: a slow-only chunk
+  // the CA ran without writing, or one `main` skipped and carried) names a
+  // chunk whose contents did not change this tick -- every voxel write ORs a
+  // write bit beside it -- so occupancy, farDown and the seam have nothing
+  // new to read there. Left out, as an unwritten chunk always was.
+  if (dirtyOut[i] != 0u && dirtyOut[i] != DIRTY_R_SLOW) {
     let slot = atomicAdd(&args[0], 1u);
     dirtyList[slot] = i;
   }

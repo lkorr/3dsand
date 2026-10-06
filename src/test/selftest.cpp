@@ -369,6 +369,10 @@ const char* const kOrder[] = {
     // A pool of oil alight: catches at once, burns ~10 s, pours black smoke.
     // Same pit neighbourhood and dim-dawn pinning.
     "oil-fire",
+    // Temporal rate LOD's fidelity: the same ember beds and leaf slab at full
+    // rate and at a forced coarse level. Own worldgen in and out; restores the
+    // tuning it pins.
+    "rate-lod",
     // THE TEMPERATURE LAYER (docs/PLAN_temperature.md). Sealed-room fixtures
     // with their own worldgen and a pinned climate, like oil-fire; heat-ambient
     // runs a real (one-minute) day and restores the tuning it changes.

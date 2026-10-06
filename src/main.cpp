@@ -6900,7 +6900,7 @@ int main(int argc, char** argv) {
                  {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
                  f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                  f.in.farCount, f.fluid, f.in.fluidLive,
-                 f.in.vizActive != 0);
+                 f.in.vizActive != 0, RateLodPlayersOf(f.in));
       played++;
       if (f.in.tick % kProbeEvery == 0 || played == log.frames.size()) {
         lastHash = ReadHashSync(ctx, world);

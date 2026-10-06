@@ -230,6 +230,9 @@ struct WorldScratch {
   uint32_t farCount = 0;        // phase B -> phase N (SubmitTick)
   bool particlesActive = false; // phase L -> phase N
   IVec3 pc{};                   // phase L -> phase N: the submit's centre chunk
+  // phase L -> phase N: every player's chunk, for TEMPORAL RATE LOD (the
+  // primary's is `pc`, so a harness's fixture counts as where the player is).
+  std::vector<IVec3> lodPlayers;
   double t0 = 0;                // phase L -> phase P
   double tSubmit0 = 0;          // phase N -> phase P
   double tSubmit1 = 0;
@@ -5334,6 +5337,17 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
                  ifloor(player.pos.z) / (int)kChunk};
       // A harness centres the mirror on its FIXTURE (session.h section J).
       if (w.harness.haveSubmitChunk) pc = w.harness.submitChunk;
+      // TEMPORAL RATE LOD: full rate near ANY player. The primary is `pc`
+      // (the same chunk the submit centres on); the others by floor division
+      // of their position. A pure function of the session state the tick
+      // already owns, and recorded with the tick (oprecord.h TickInputs).
+      ws.lodPlayers.clear();
+      ws.lodPlayers.push_back(pc);
+      for (size_t pi = 1; pi < players.size(); pi++) {
+        const Vec3& pp = players[pi].s->player.pos;
+        ws.lodPlayers.push_back({ifloor(pp.x / (float)kChunk), ifloor(pp.y / (float)kChunk),
+                                 ifloor(pp.z / (float)kChunk)});
+      }
       t0 = NowSeconds();
       spanGame.Close();
       // ---- the celestial clock (sim/world.h) -----------------------------
@@ -5580,7 +5594,7 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
                  spawns, farCount, fluidSpawns, fluidCount,
-                 ui.showDirtyVoxels);
+                 ui.showDirtyVoxels, ws.lodPlayers);
       // Conservative estimate refresh: the newest snapshot's GPU-owned count
       // plus every spawn batch it has not seen yet. Settles decay it (the
       // snapshot count shrinks); excites grow it one snapshot late, which the

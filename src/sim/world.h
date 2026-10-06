@@ -461,7 +461,9 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
 constexpr int kDirtyReasonBits = 32;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
-    "write",      "react-idle", "stain-idle", "flow",
+    // bit 3 was flow (retired 2026-09-23); temporal rate LOD's slow-only
+    // mark since 2026-10-06 (common.wgsl DIRTY_R_SLOW).
+    "write",      "react-idle", "stain-idle", "react-slow",
     "viscous",    "seam",       "part",       "wbody",
     "mutate",     "MOVE",       "STAIN-WROTE","REACT-FIRED",
     // sim_step's DIRTY_M_* liquid-stage split
@@ -3156,6 +3158,15 @@ inline uint32_t NextSnapEpoch() {
   return ++n;
 }
 
+// TEMPORAL RATE LOD: how many player chunks one tick can name (TickParams::
+// rateLodPlayers, common.wgsl RATE_LOD_PLAYERS via the prelude). A chunk's
+// level is a function of its distance to the NEAREST of them. Players past
+// the cap are dropped (counted nowhere: 8 is the M9 session cap x4).
+constexpr uint32_t kRateLodPlayers = 8;
+// The deepest level the GPU accepts (N = 2^4 = 16 ticks), and the phase word's
+// width: common.wgsl rateLodPhase is a 4-bit hash of the world chunk coord.
+constexpr int32_t kRateLodMaxLevel = 4;
+
 struct TickParams {
   uint32_t tick;
   uint32_t seed;
@@ -3551,6 +3562,20 @@ struct TickParams {
   int32_t updraftCapQ = 0;     // the lift's ceiling, Q16.16 cells/s
   int32_t updraftInflowQ = 0;  // the base inflow per unit of lift gradient, Q16
   int32_t draftStackQ = 0;     // the stack field's share, Q8 (256 = 1x)
+
+  // ---- TEMPORAL RATE LOD (DESIGN.md §4 "Temporal rate LOD"; common.wgsl
+  // rateLodLevel). Which chunks run their COMPENSABLE reactions (reactions.json
+  // "rateLod") every 2^L ticks instead of every tick. Filled by SubmitTick from
+  // the sim.rateLod* knobs and the tick's declared player chunks, so a replay
+  // rebuilds it from the recorded TickInputs. rateLodMax 0 and rateLodForce < 0
+  // = level 0 everywhere = the pre-rate-LOD sim, bit for bit.
+  int32_t rateLodNear = 0;    // full rate within this Chebyshev chunk distance
+  int32_t rateLodStep = 1;    // chunks per level beyond it
+  int32_t rateLodMax = 0;     // highest level (N = 2^max); 0 = off
+  int32_t rateLodForce = -1;  // >= 0: this level in EVERY window chunk (gate)
+  uint32_t rateLodCount = 0;  // live entries in rateLodPlayers
+  uint32_t padRl0 = 0, padRl1 = 0, padRl2 = 0;
+  int32_t rateLodPlayers[kRateLodPlayers * 4] = {};  // x,y,z world chunk, pad
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -4441,6 +4466,9 @@ struct WorldSnapshot {
   // gas-only fast path or a smoke rate LOD could touch).
   uint32_t caGasCells = 0;       // gas cells run, both substeps
   uint32_t caOtherCells = 0;     // non-gas non-inert cells run, both substeps
+  // TEMPORAL RATE LOD: awake chunks whose dirty word is exactly DIRTY_R_SLOW
+  // (react-slow): sim_compact dispatches them only on their due tick.
+  uint32_t slowOnlyChunks = 0;
   uint32_t gasOnlyChunks = 0;    // awake chunks holding gas and nothing else
   uint32_t gasOnlyCells = 0;     // gas cells in those chunks
   uint32_t emptyAwakeChunks = 0; // awake chunks holding no matter at all

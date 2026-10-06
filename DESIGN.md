@@ -1599,6 +1599,141 @@ A rule may also carry **effects** (2026-09-27) — sodium + water explodes. The 
 only REPORTS the firing; the blast is an ExplosionOp authored on the CPU a fixed
 number of ticks later. See §6 "Reaction effects".
 
+### Temporal rate LOD: slow reactions far from every player run coarse (2026-10-06; phase 1, distance; `sim_step.wgsl` TEMPORAL RATE LOD, `sim_compact.wgsl` main, common.wgsl `rateLodLevel`/`rateLodDueMask`, reactions.json `rateLod`, `sim.rateLod*`, gate `rate-lod`) — SHIPS OFF
+
+**What it is.** docs/ROADMAP_scale.md §3.5. A reaction that moves no matter,
+is not a front and has a closed form over N ticks may roll every N = 2^L
+ticks, at a compensated chance, in a chunk far from every player. Movement
+(falling, rising gas, liquid flow, powder slides) ALWAYS runs every tick.
+
+**The rule.** A chunk's level L is a pure function of (TickParams, WORLD chunk
+coord): Chebyshev distance d in chunks to the NEAREST declared player, L = 0
+for d <= `sim.rateLodNear` (6), then one level per `sim.rateLodStep` (3)
+chunks, capped at `sim.rateLodMaxLevel` (3, N = 8). Its compensable rules roll
+on the ticks where `(tick + phase) mod 2^L == 0`, `phase` a 4-bit hash of the
+world chunk coord so coarse chunks do not fire together. Levels are powers of
+two, so "due at L" implies "due at every L' < L". The players are DECLARED to
+`SubmitTick` (`lodPlayers`): `TickAuthority` passes every session player (the
+primary as its submit chunk `pc`), `--perf` its eye, a replay the recorded list
+(`oprecord.h` TickInputs, record version 9). A caller that declares none — every
+hand-rolled gate ticker and both smokes — gets level 0 everywhere: a headless
+harness has no observer, and its `playerChunk` is often a placeholder.
+`sim.rateLodForce` >= 0 pins every window chunk to that level (the gate's
+coarse arm); `SANDVOX_RATE_LOD=off|near,step,max` overrides the knobs (the
+`--perf` A/B arm). Ticket slots and excited fluid are level 0. Level 0
+everywhere is the pre-rate-LOD kernel exactly: `--perf` arms with it off
+reproduce the base kernel's world hash (village-fire `7748b496`, forestfire
+`0afd1f0f`).
+
+**Classification** (reactions.json `"rateLod"`, default `"none"`, validated in
+`materials.cpp`): `"transform"` on a DECAY (a one-shot self rewrite),
+`"emit"` on an EMIT rule that keeps self; a PAIR rule cannot be coarse (its
+partner is a neighbour: a front, a contact, a douse). 49 decays + 28 emits
+opted in — every burning material's flames and burn-out, ember burn-out, the
+gas fades (smoke, steam, black/thick smoke, hydrogen, chlorine, noxious gas,
+choke damp, ether vapour), slow cooling (molten glass/iron/salt), slaking,
+drying (blood, coolant), evaporation, the day/night toggles (flower/petal,
+moonwater/sunwater), fungus rotting. Left `"none"`: every ignition and
+spread rule, every douse (extinguisher, rain), growth (seed/sprout/stem/vine),
+critters, sources, fire's own short-lived flame decay, hair's 180-per-mille
+burn-out, everything with effects, all chemistry pairs.
+
+**The compensation: survival-matched for BOTH classes.** The roll stands in for
+N ticks: p' = 1 - (1 - h)^N, so P(nothing happened in kN ticks) is exact and a
+transform's expected time-to-event is preserved. h is the rule's full-rate
+MARGINAL: its chance times the probability that no earlier coarse emit of the
+cell fired that tick (a coarse emit does not end the rule scan as it does at
+full rate — it would swallow N ticks of the later rules' chances — so its
+blocking is folded into h instead, as a Q16 word). A rule whose N x h > 1/4
+runs at a lower level than its chunk (the due-tick quantization biases a
+transform's mean life by O(N h^2), ~3% at the cap): fire's flame decay never
+coarsens, an ember's 90-per-mille flame runs at N = 2, its burn-out and
+smoke's fade reach N = 16. Integer throughout: the power is exact 64-bit
+products via 16-bit halves and a long division by 2^7 x 15625.
+
+**Why not count-matching for emissions** (p' = N x h, the scheme first
+approved). Measured, it is wrong in BOTH directions: a thrown flame sits in the
+face it was thrown into until it rises or burns out (dead time d), so at full
+rate the realized rate is h / (1 + h d), while a coarse exec N ticks later
+finds the face clear whenever d < N. Over a crowded 24x24 ember bed at N = 8
+count-matching made **+58%** flame and smoke, over sparse embers **+8%**
+(no wind; with wind the beds' plumes contaminated each other's census — the
+first layout read +70% / -28%). Survival-matching ("at most one product per N
+ticks") is exact for d >= N and under-counts ~(N - 3) h / 2 for d ~ 1; with the
+1/4 cap both ends land inside the gate's noise. d belongs to the product's
+motion, which the cell cannot see without reading past one cell.
+
+**Where the cost was supposed to fall, and the dispatch skip.** A chunk whose
+only work is coarse rules at its own level marks `DIRTY_R_SLOW` (bit 3, the
+retired `flow` bit) and nothing else; `sim_compact`'s `main` leaves such a
+chunk out of the CA list on every non-due tick and carries the mark forward
+into `dirtyOut`, and `mainNext` leaves an exactly-SLOW word out of the
+occupancy / farDown / seam list (contents unchanged). Any other bit — a write,
+a move, an op, a neighbour's fan-out, heat, charge — dispatches it as before.
+A rule held below its chunk's level marks `DIRTY_R_REACT` (full dispatch).
+The snapshot counts `slowOnlyChunks` (`--perf` counter).
+
+**Measured fidelity** (gate `rate-lod`, level 3 forced everywhere vs full rate,
+900 ticks, wind off; B/A): sealed ember bed (1087) mean life **0.978**; crowded
+open bed (551) life **0.944**, flame + smoke cell-ticks **0.908**, flame alone
+0.900; sparse embers (291) life **1.068**, flame + smoke **1.077**; sealed
+smoke room (3276 cells) smoke life **1.018**; leaf-slab spread: leaves burnt
+**1.010**, burning-leaf cell-ticks **1.077**, front distance **1.000**. The beds
+hold 300-1100 cells, so these move ~3-6% between layouts. `--sweep
+sim.rateLodForce=-1,3,3,4`: 3 distinct hashes, the two 3s identical (coarse is
+deterministic); `SANDVOX_RATE_LOD=0,1,3 --verify elec-replay` (players
+declared, coarse around the rig): replay identical, 0 TickParams mismatches.
+
+**Measured perf — it does not pay, which is why it ships off.** `--perf`, RTX
+3060 Ti, SANDVOX_RUN_EXCLUSIVE, n = 2 per arm (the two runs agree to 0.01 ms);
+"base" = this exe with the pre-rate-LOD `sim_step`/`sim_compact`:
+
+| scene | arm | CA ms | frame p50 ms | awake chunks | slow-only |
+|---|---|---|---|---|---|
+| village-fire | base | 7.18 | 24.24 | 3805 | 0 |
+| | off (mode 0) | 7.23 | 24.36 | 3805 | 0 |
+| | on, defaults (6/3/3) | 7.29 | 24.99 | 3810 | 1.4 |
+| | on, near 0 (upper bound) | 7.35 | 24.88 | 3811 | 5.4 |
+| forestfire | base | 3.54 | 17.49 | 1360 | 0 |
+| | off | 3.57 | 17.59 | 1360 | 0 |
+| | on, defaults | 3.72 | 17.68 | 1386 | 0.3 |
+| | on, near 0 | 3.83 | 17.47 | 1303 | 0.1 |
+
+A fire's compensable reactions share their chunks with the fire's own moving
+products: an ember's decay leaves smoke or a hole that ash falls into, its
+flames rise, the smoke drifts — every one of those is movement, which runs
+every tick, so the chunk is never slow-only (the gate's sealed bed: 240 of 240
+chunk-samples also carried MOVE). 1.4 of 3810 awake chunks is no dispatch
+saving, and the coarse arithmetic (the level, the due mask, the cap, the
+survival power) costs ALU in every reacting cell of a coarse chunk: +1.6% /
++5% CA at the defaults, +2.4% / +8% at the upper bound. Off, the code costs
++0.7% / +0.8% CA (the step kernel is unchanged at 72 registers — see below).
+The roadmap's "~3-4x on big fires" assumed slow-only chunks would dominate a
+fire; measured, they do not exist in one. What would pay is coarse MOVEMENT of
+far smoke, which this design rules out by construction.
+
+**The register trap** (the step kernel is occupancy-bound, 72 registers,
+allocated in steps of 8). The first version — a chunk coord, a level and a
+separate emit-blocking value held across the rule loop, plus a separate coarse
+roll site per rule kind — took it to **80 registers and 13.9 -> 17.0 KB shared
+memory (7 -> 5 resident groups), +7.6% CA with the feature OFF**. Bisected with
+`--shader-stats` (one boot each, no rebuild): not the player loop, not the
+64-bit math, not the non-blocking emit, not the PAIR path; ANY second
+loop-carried value did it. The fix is one packed word (level, due mask, the
+two keep-awake kinds, the Q16 blocking product) and the coarse chance
+REPLACING the rule's chance at the existing roll site. Filling that word
+lazily (on the first classed rule) went back to 80; it is filled once, before
+the loop. A change to `doReactions` should re-check `step`'s registers.
+
+**Phase 2 (view-based), not built.** It is another input to `rateLodLevel`:
+e.g. a per-player view frustum quantized to an integer chunk test (four
+half-space planes in chunk units, or a coarse per-player chunk bitmask) put on
+`TickParams` beside `rateLodPlayers` and recorded in TickInputs, with the
+level the max over players of a per-player level (in view = distance tiers,
+out of view = a deeper floor). Nothing else changes: sim_compact and sim_step
+already agree through `rateLodLevel`/`rateLodDueMask`. Given the numbers above
+it would buy nothing in a fire either, for the same reason.
+
 ### Solutes: dissolved matter is MASS in a side layer (2026-09-27; `sim_solute.wgsl`, `sim/solutes.*`, world.h `kSol*`, docs/PLAN_solutes.md, gates `solute*`)
 
 Salt in water is not a material. The voxel word is full, and "brine" as a

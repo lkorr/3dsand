@@ -2507,6 +2507,19 @@ struct Tuning {
     float heatUpGain = TPD(sim, heatUpGain);
     float heatSideGain = TPD(sim, heatSideGain);
     float heatDownGain = TPD(sim, heatDownGain);
+    // TEMPORAL RATE LOD (DESIGN.md §4). 0 = off (the shipped default: it was
+    // measured not to pay in a fire): every reaction runs every tick
+    // everywhere. 1 = compensable reactions (reactions.json "rateLod") in
+    // chunks beyond rateLodNear chunks of every player roll every 2^L ticks at
+    // a compensated chance, L rising one per rateLodStep chunks up to
+    // rateLodMaxLevel. rateLodForce >= 0 pins every window chunk to that level
+    // (the rate-lod gate's coarse arm). SubmitTick puts all of it on
+    // TickParams with the tick's player chunks.
+    int rateLodMode = TPD(sim, rateLodMode);
+    int rateLodNear = TPD(sim, rateLodNear);
+    int rateLodStep = TPD(sim, rateLodStep);
+    int rateLodMaxLevel = TPD(sim, rateLodMaxLevel);
+    int rateLodForce = TPD(sim, rateLodForce);
     // The climate above the snowline (the map's treeline - 1), in heat units
     // where 0 is water's freezing point: base +- swing by day / night. Kept
     // below 0 by day (LoadTuning) so the snow caps never melt by themselves.

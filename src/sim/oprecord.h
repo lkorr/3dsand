@@ -256,6 +256,11 @@ struct TickInputs {
   int32_t playerChunk[3] = {0, 0, 0};
   uint32_t farCount = 0;
   uint32_t fluidLive = 0;
+  // TEMPORAL RATE LOD: the player chunks SubmitTick was handed this tick
+  // (its `lodPlayers`; TickParams' rate-LOD block is built from them). A
+  // replay hands them back, or it rebuilds a different TickParams.
+  uint32_t rateLodCount = 0;
+  int32_t rateLodPlayers[3 * 8] = {};  // x,y,z world chunk; 8 = kRateLodPlayers
 };
 
 // One tick, as it reached the GPU.
@@ -339,7 +344,9 @@ struct Header {
 //    same size, new meaning.
 // 7: Frame carries `tickets`, the chunk-ticket ops of the tick (tickets P1).
 // 8: TickInput grew `contractHash` + `demonRef` (76 -> 84 bytes, demons D5).
-constexpr uint32_t kRecordVersion = 8;
+// 9: TickInputs grew rateLodCount + rateLodPlayers[24] (temporal rate LOD:
+//    the tick's player chunks, which TickParams' rate-LOD block is built from).
+constexpr uint32_t kRecordVersion = 9;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its

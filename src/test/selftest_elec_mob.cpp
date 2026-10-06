@@ -625,7 +625,8 @@ Status GateElecReplay(Ctx& c, std::string& detail) {
                  fr.in.hashEnable != 0,
                  {fr.in.playerChunk[0], fr.in.playerChunk[1], fr.in.playerChunk[2]},
                  fr.in.wantReadback != 0, fr.in.particlesActive != 0, fr.spawns,
-                 fr.in.farCount, fr.fluid, fr.in.fluidLive, fr.in.vizActive != 0);
+                 fr.in.farCount, fr.fluid, fr.in.fluidLive, fr.in.vizActive != 0,
+                 RateLodPlayersOf(fr.in));
       c.ctx.WaitIdle();
       if (fi >= first && (fi - first + 1) % kReplayProbe == 0)
         hashB.push_back(HashWorldNow(c.ctx, c.world, c.sim, kDefaultSeed));

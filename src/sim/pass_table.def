@@ -267,8 +267,13 @@ PASS(gasLeavePrep, "prep(mutate+explode+compact)", PT_TICK, PIPE_GAS_LEAVE_PREP,
 // compaction target for BOTH compact (here) and compactNext (phase 5b), and
 // phase 5b re-fills it anyway. Zeroing a 12-byte buffer is free; making its
 // fill conditional would couple two phases that are otherwise independent.
+//
+// U(TickUBO) + RW(DirtyOut): TEMPORAL RATE LOD (sim_compact.wgsl main). A
+// slow-only chunk that is not due this tick is left out of the list and its
+// DIRTY_R_SLOW mark is carried into DirtyOut (after the phase-0 fill and the
+// prep rows' ORs, before the CA's) so it is still dirty on its due tick.
 PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMPUTE, D_CHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
-     USES(R(DirtyIn) W(DirtyList) A(ArgsStage) R(PageTable)))
+     USES(U(TickUBO) R(DirtyIn) RW(DirtyOut) W(DirtyList) A(ArgsStage) R(PageTable)))
 
 // ---- phase 2: indirect staging -------------------------------------------
 // The indirect-only args buffer is never bound in any bind group: Dawn forbids
@@ -1187,6 +1192,9 @@ PASS(farDownHashFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DI
 // flags (a superset of every voxel write) and dispatch indirect.
 PASS(fill_argsStage2, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_DIRTYTICK, 1,
      USES(TW(ArgsStage)))
+// read-only in practice: `dirtyOut` is read_write for the module because
+// `main` (compact) carries a skipped slow-only chunk's DIRTY_R_SLOW mark into
+// it (temporal rate LOD); mainNext only reads it.
 PASS(compactNext, "compactNext", PT_TICK, PIPE_COMPACT_NEXT, K_COMPUTE, D_CHUNKS64,1,1, GRP_SIM, DYN_ZERO, C_DIRTYTICK, 1,
      USES(R(DirtyOut) W(DirtyList) A(ArgsStage)))
 PASS(copy_argsStage_dispatchArgs2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_DIRTYTICK, 1,

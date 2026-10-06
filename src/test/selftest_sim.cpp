@@ -5443,7 +5443,7 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
                {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
                f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                f.in.farCount, f.fluid, f.in.fluidLive,
-               f.in.vizActive != 0);
+               f.in.vizActive != 0, RateLodPlayersOf(f.in));
     if (f.in.tick % kProbeEvery == 0 || f.in.tick == (uint32_t)kTicks)
       hashB.push_back(ReadHashSync(c.ctx, c.world));
   }
@@ -6217,7 +6217,7 @@ Status GateChunkResync(Ctx& c, std::string& detail) {
                     f.in.playerChunk[2]},
                    f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                    f.in.farCount, f.fluid, f.in.fluidLive,
-                   f.in.vizActive != 0);
+                   f.in.vizActive != 0, RateLodPlayersOf(f.in));
       }
       replayFrames = (uint32_t)log.frames.size();
       replayHash = ReadHashSync(ctx, world);

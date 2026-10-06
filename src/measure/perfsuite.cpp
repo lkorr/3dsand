@@ -1696,7 +1696,11 @@ Run PerfRunner::Record(const Scenario& sc) {
       SubmitTick(ctx_, world_, sim_, tick, kDefaultSeed, ops.ops, ops.exps,
                  ops.cells, /*hashEnable=*/tick % 15 == 0, playerChunk,
                  /*wantReadback=*/true, ops.particlesActive, ops.spawns,
-                 /*farCount=*/0, ops.fluidSpawns, s.fluidLive);
+                 /*farCount=*/0, ops.fluidSpawns, s.fluidLive,
+                 /*vizActive=*/false,
+                 // TEMPORAL RATE LOD: the eye is the player (SANDVOX_RATE_LOD
+                 // is the A/B switch; support.cpp SubmitTick).
+                 /*lodPlayers=*/{playerChunk});
       // ONE KickDeferred PER TIMED COMMAND BUFFER, all tagged with the FRAME.
       // Each SubmitTick resolves its own buffer into its own ring slot, so a
       // 4-tick frame arms four of them; PassTimer::kRing is sized for that.
@@ -1757,6 +1761,8 @@ Run PerfRunner::Record(const Scenario& sc) {
           sn.valid ? (double)sn.caOtherCells : 0.0;
       smp.counters[(int)PerfCounter::GasOnlyChunks] =
           sn.valid ? (double)sn.gasOnlyChunks : 0.0;
+      smp.counters[(int)PerfCounter::SlowOnlyChunks] =
+          sn.valid ? (double)sn.slowOnlyChunks : 0.0;
       smp.counters[(int)PerfCounter::GasOnlyCells] =
           sn.valid ? (double)sn.gasOnlyCells : 0.0;
       if (world_.pages) {

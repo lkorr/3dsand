@@ -933,7 +933,7 @@ void World::KickReadback() {
         const uint32_t* dirtyW = (const uint32_t*)(b + kDirtyOff);
         const uint32_t* occW = (const uint32_t*)(b + kOccOff);
         const uint32_t* supW = (const uint32_t*)(b + kSupportOff);
-        uint32_t active = 0;
+        uint32_t active = 0, slowOnly = 0;
         uint32_t reasonOr = 0;
         uint64_t total = 0;
         for (uint32_t i = 0; i < kNumSlots; i++) {
@@ -942,6 +942,7 @@ void World::KickReadback() {
                               : dirtyW[i] == kDirtyReasonMutate ? kDirtyMutateOnly
                                                                 : 1;
           active += dirtyW[i] != 0 ? 1u : 0u;
+          slowOnly += dirtyW[i] == DirtyReasonBit("react-slow") ? 1u : 0u;
           reasonOr |= dirtyW[i];
           // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
           // nonAir (packOccStain, common.wgsl). Existing CPU consumers
@@ -960,6 +961,7 @@ void World::KickReadback() {
           out.supportFlags[i] = supW[i] != 0 ? 1 : 0;
         }
         out.activeChunks = active;
+        out.slowOnlyChunks = slowOnly;
         out.dirtyReasonOr = reasonOr;
         out.watchReason = dirtyWatch_ < kNumSlots ? dirtyW[dirtyWatch_] : 0u;
         out.voxelTotal = total;

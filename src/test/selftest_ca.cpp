@@ -1303,6 +1303,373 @@ Status GateOilFire(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// rate-lod — temporal rate LOD keeps a fire statistically the same fire
+// ---------------------------------------------------------------------------
+// DESIGN.md §4 "Temporal rate LOD". Compensable reactions (reactions.json
+// "rateLod") in a coarse chunk roll every 2^L ticks at a survival-matched
+// chance. This gate runs the SAME fixtures twice -- arm A at full rate (no
+// player declared = level 0 everywhere), arm B with sim.rateLodForce pinning
+// EVERY chunk to level rateLod.level (default 3, N = 8) -- with the wind off
+// (a drifting plume would be counted by its neighbour), in five z bands above
+// the ground, and compares what the fire did:
+//   F1 SMOULDER  24x2x24 embers sealed in stone (no air face: only the burn-out
+//                decays act). Mean ember life = sum(N(t) dt) / N0 over the run.
+//   F2 OPEN BED  24x24 embers on a stone floor, open above: CROWDED emission
+//                (a flame sits in the face it was thrown into) and burn-out.
+//                Mean ember life, flame + smoke cell-ticks above it, flame alone.
+//   F3 SPREAD    a 54x2x14 leaf slab lit along one end. Fire SPREAD is full
+//                rate by classification; what it still depends on is how long
+//                a burning leaf stays lit and how many flames it throws, both
+//                coarse. Leaves burnt, burning-leaf cell-ticks, front x.
+//   F4 SPARSE    one ember every 3 cells, open above: SPARSE emission (a flame
+//                rises off at once). Life, flame + smoke cell-ticks. F2 and F4
+//                are the two ends of the emission regime count-matching got
+//                wrong in opposite directions (sim_step.wgsl's header).
+//   F5 SMOKE     a sealed room half full of smoke, nothing burning: the fade
+//                of MOVING matter alone. Mean smoke life.
+// Each statistic's B/A ratio is recorded (rateLod.*RatioObserved) and must sit
+// in its band in baseline.json. Also recorded, not asserted: the share of the
+// fixture's awake chunk-samples in arm B whose ONLY mark was DIRTY_R_SLOW --
+// the chunks sim_compact may leave out of the dispatch on 7 of every 8 ticks
+// -- and why the sealed bed's chunks are awake (per-reason counts).
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): a sim-only CA fixture like oil-fire;
+// it measures reaction statistics, and no player body may stand near it (the
+// coarse arm must be coarse because the gate says so, not because of where a
+// rig camera is).
+Status GateRateLod(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t emberId = 0, leavesId = 0, leafBurnId = 0, fireId = 0, smokeId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    const std::string& n = c.mats[i].name;
+    if (n == "ember") emberId = (uint32_t)i;
+    if (n == "leaves") leavesId = (uint32_t)i;
+    if (n == "leaf_burning") leafBurnId = (uint32_t)i;
+    if (n == "fire") fireId = (uint32_t)i;
+    if (n == "smoke") smokeId = (uint32_t)i;
+  }
+  if (!emberId || !leavesId || !leafBurnId || !fireId || !smokeId) {
+    detail = "missing ember / leaves / leaf_burning / fire / smoke";
+    return Status::Fail;
+  }
+
+  const Tuning saved = CurrentTuning();
+  Tuning dawn = saved;
+  dawn.dayNight.freeze = 1;
+  dawn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  const int level = (int)BaselineNumber("rateLod.level", 3);
+  const int kTicks = (int)BaselineNumber("rateLod.ticks", 900);
+  const int kEvery = 15;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const IVec3 wo = world.WindowOrigin();
+  const int ox = wo.x * (int)kChunk, oz = wo.z * (int)kChunk;
+  // The fixtures sit just above the highest ground under both arms' boxes and
+  // at least 120 cells under the window's ceiling: a plume that reaches the
+  // top face pools against the edge's per-chunk leave budget (sim_step
+  // gasLeaveAllow), and that pool measured the edge, not the reactions (it
+  // was all of the first layout's gas excess, in the top 8-cell band).
+  int ground = -1 << 20;
+  for (int z = oz + 96; z < oz + 96 + 180 + 175; z += 8)
+    for (int x = ox + 96; x < ox + 96 + 120; x += 8)
+      ground = std::max(ground, World::TerrainHeight(x, z, kDefaultSeed));
+  const int oy = wo.y * (int)kChunk;
+  const int by = std::min(ground + 4, oy + 512 - 160);
+
+  struct Arm {
+    uint32_t e1 = 0, e2 = 0, leaves0 = 0, e4 = 0, s5 = 0;  // initial counts
+    double life1 = 0, life2 = 0, gas2 = 0, leafBurn = 0, life4 = 0, gas4 = 0, life5 = 0;
+    double fire2 = 0;  // the flame share of gas2 (the rest is smoke)
+    // F2's gas census as a series (every 4th sample) and its height profile
+    // (y bands of 8, summed over the run): WHERE the extra gas is.
+    std::vector<uint32_t> gas2Series;
+    double gas2Band[5] = {};
+    uint32_t burned3 = 0, e1End = 0, e2End = 0;
+    int front3 = 0;
+    uint32_t awakeSamples = 0, slowOnlySamples = 0;
+    uint32_t f1Samples = 0, f1Reason[kDirtyReasonBits] = {};
+  };
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  std::vector<uint32_t> flags(kNumSlots, 0);
+
+  auto runArm = [&](int arm, int force) -> Arm {
+    Tuning t = dawn;
+    t.sim.rateLodForce = force;
+    // No wind: a plume that drifts into the next fixture's census would make
+    // its gas count a measurement of the neighbour.
+    t.sim.windMode = 0;
+    SetCurrentTuning(t);
+    // Four fixtures in four z bands 12+ cells apart, each band its own census:
+    // F1 z [0,34), F2 [34,74), F3 [74,104), F4 [104,140) (relative to bz).
+    const int bx = ox + 96, bz = oz + 96 + arm * 180;
+    const int X0 = bx, X1 = bx + 120, Z0 = bz, Z1 = bz + 175, Y0 = by, Y1 = by + 40;
+    // F5: SMOKE ALONE -- a sealed stone room (interior 24x12x24) half full of
+    // smoke on a checkerboard, nothing burning. Isolates the smoke FADE (a
+    // coarse transform on matter that is moving) from every emission.
+    auto f5Shell = [&](int x, int y, int z) {
+      return x >= bx + 2 && x <= bx + 27 && y >= by && y <= by + 13 && z >= bz + 145 &&
+             z <= bz + 170;
+    };
+    auto f5Inside = [&](int x, int y, int z) {
+      return x >= bx + 3 && x <= bx + 26 && y >= by + 1 && y <= by + 12 && z >= bz + 146 &&
+             z <= bz + 169;
+    };
+    // F1: shell [bx+2, bx+27] x [by, by+3] x [bz+1, bz+26], embers inside.
+    auto f1Ember = [&](int x, int y, int z) {
+      return x >= bx + 3 && x <= bx + 26 && y >= by + 1 && y <= by + 2 && z >= bz + 2 &&
+             z <= bz + 25;
+    };
+    auto f1Shell = [&](int x, int y, int z) {
+      return x >= bx + 2 && x <= bx + 27 && y >= by && y <= by + 3 && z >= bz + 1 && z <= bz + 26;
+    };
+    // F2: a crowded open bed, 24x24 embers on a floor.
+    auto f2Floor = [&](int x, int y, int z) {
+      return y == by && x >= bx + 2 && x <= bx + 27 && z >= bz + 41 && z <= bz + 66;
+    };
+    auto f2Ember = [&](int x, int y, int z) {
+      return y == by + 1 && x >= bx + 3 && x <= bx + 26 && z >= bz + 42 && z <= bz + 65;
+    };
+    // F3: a 54x2x14 leaf slab, lit along x = bx + 3.
+    auto f3Floor = [&](int x, int y, int z) {
+      return y == by && x >= bx + 2 && x <= bx + 57 && z >= bz + 80 && z <= bz + 95;
+    };
+    auto f3Leaf = [&](int x, int y, int z) {
+      return y >= by + 1 && y <= by + 2 && x >= bx + 3 && x <= bx + 56 && z >= bz + 81 &&
+             z <= bz + 94;
+    };
+    // F4: SPARSE emitters -- one ember every 3 cells on a stone floor, open
+    // above. The other end of the emission regime from F2's crowded bed: a
+    // flame thrown here rises off at once instead of sitting in the face it
+    // was thrown into.
+    auto f4Floor = [&](int x, int y, int z) {
+      return y == by && x >= bx + 2 && x <= bx + 117 && z >= bz + 110 && z <= bz + 135;
+    };
+    auto f4Ember = [&](int x, int y, int z) {
+      return y == by + 1 && x >= bx + 3 && x <= bx + 116 && z >= bz + 111 && z <= bz + 134 &&
+             (x - bx) % 3 == 0 && (z - bz) % 3 == 0;
+    };
+    std::vector<std::vector<CellOp>> batches(1);
+    std::vector<CellOp> light;
+    for (int z = Z0; z < Z1; z++)
+      for (int y = Y0; y < Y1; y++)
+        for (int x = X0; x < X1; x++) {
+          uint32_t m = 0;
+          if (f5Inside(x, y, z)) m = ((x + y + z) & 1) ? smokeId : 0u;
+          else if (f5Shell(x, y, z)) m = (uint32_t)kMatStone;
+          else if (f1Ember(x, y, z) || f2Ember(x, y, z) || f4Ember(x, y, z)) m = emberId;
+          else if (f1Shell(x, y, z) || f2Floor(x, y, z) || f3Floor(x, y, z) ||
+                   f4Floor(x, y, z))
+            m = (uint32_t)kMatStone;
+          else if (f3Leaf(x, y, z)) m = leavesId;
+          if (batches.back().size() >= 60000) batches.emplace_back();
+          batches.back().push_back({World::SlotCellIndex({x, y, z}), m & 0xFFFu});
+          if (f3Leaf(x, y, z) && x == bx + 3)
+            light.push_back({World::SlotCellIndex({x, y, z}), leafBurnId & 0xFFFu});
+        }
+    std::vector<uint32_t> chunks;
+    std::vector<IVec3> chunkWc;
+    for (int cz = Z0 >> 4; cz <= (Z1 - 1) >> 4; cz++)
+      for (int cy = Y0 >> 4; cy <= (Y1 - 1) >> 4; cy++)
+        for (int cx = X0 >> 4; cx <= (X1 - 1) >> 4; cx++) {
+          chunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+          chunkWc.push_back({cx, cy, cz});
+        }
+
+    Arm r;
+    struct Counts {
+      uint32_t e1 = 0, e2 = 0, gas2 = 0, leaves = 0, burning = 0, e4 = 0, gas4 = 0, s5 = 0,
+               fire2 = 0, gas2Band[5] = {};
+      int front = 0;
+    };
+    auto count = [&]() {
+      Counts n;
+      n.front = bx + 3;
+      for (size_t j = 0; j < chunks.size(); j++) {
+        ReadVoxelsSync(ctx, world, chunks[j], 1, cbuf.data(), "rateLodVox");
+        const IVec3 wc = chunkWc[j];
+        for (uint32_t k = 0; k < kChunkVol; k++) {
+          const int x = wc.x * 16 + (int)(k & 15u), y = wc.y * 16 + (int)((k >> 4) & 15u),
+                    z = wc.z * 16 + (int)(k >> 8);
+          if (x < X0 || x >= X1 || y < Y0 || y >= Y1 || z < Z0 || z >= Z1) continue;
+          const uint32_t m = cbuf[k] & 0xFFFu;
+          const int band = z - bz;
+          const bool gas = m == fireId || m == smokeId;
+          if (band >= 140) {
+            n.s5 += (f5Inside(x, y, z) && m == smokeId) ? 1u : 0u;
+          } else if (band >= 104) {
+            n.e4 += m == emberId;
+            n.gas4 += gas ? 1u : 0u;
+          } else if (band >= 74) {
+            if (!f3Leaf(x, y, z)) continue;
+            n.leaves += m == leavesId;
+            n.burning += m == leafBurnId;
+            if (m != leavesId) n.front = std::max(n.front, x);
+          } else if (band >= 34) {
+            n.e2 += m == emberId;
+            n.gas2 += gas ? 1u : 0u;
+            n.fire2 += m == fireId;
+            if (gas) n.gas2Band[std::min(4, (y - by) / 8)]++;
+          } else if (f1Ember(x, y, z)) {
+            n.e1 += m == emberId;
+          }
+        }
+      }
+      return n;
+    };
+    uint32_t tick = 60000u + (uint32_t)arm * 8000u;
+    // The build batches go in first (one tick each), then a count, then the
+    // light, then the measured run.
+    const int kStart = (int)batches.size() + 3;
+    const int total = kStart + kTicks;
+    for (int i = 0; i < total; i++) {
+      std::vector<CellOp> ops;
+      if (i < (int)batches.size()) ops = batches[(size_t)i];
+      else if (i == kStart - 1) ops = light;
+      SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, ops, false, {6, 7, 6},
+                 false, false);
+      if (i == kStart - 2) {
+        ctx.WaitIdle();
+        const Counts n = count();
+        r.e1 = n.e1;
+        r.e2 = n.e2;
+        r.e4 = n.e4;
+        r.s5 = n.s5;
+        r.leaves0 = n.leaves;
+      }
+      if (i >= kStart && (i - kStart) % kEvery == 0) {
+        ctx.WaitIdle();
+        const Counts n = count();
+        r.life1 += (double)n.e1 * kEvery;
+        r.life2 += (double)n.e2 * kEvery;
+        r.gas2 += (double)n.gas2 * kEvery;
+        r.life4 += (double)n.e4 * kEvery;
+        r.gas4 += (double)n.gas4 * kEvery;
+        r.life5 += (double)n.s5 * kEvery;
+        r.fire2 += (double)n.fire2 * kEvery;
+        if (((i - kStart) / kEvery) % 4 == 0) r.gas2Series.push_back(n.gas2);
+        for (int b = 0; b < 5; b++) r.gas2Band[b] += (double)n.gas2Band[b] * kEvery;
+        r.leafBurn += (double)n.burning * kEvery;
+        r.burned3 = r.leaves0 - std::min(r.leaves0, n.leaves);
+        r.front3 = n.front - (bx + 3);
+        r.e1End = n.e1;
+        r.e2End = n.e2;
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
+                              kNumSlots * 4, "rateLodFlags");
+        for (size_t j = 0; j < chunks.size(); j++) {
+          const uint32_t ci = chunks[j];
+          if (flags[ci] == 0) continue;
+          r.awakeSamples++;
+          if (flags[ci] == DirtyReasonBit("react-slow")) r.slowOnlySamples++;
+          // WHY a sealed-bed (F1-only) chunk is awake: per-reason sample
+          // counts (rule 6: attribution, not a bare count).
+          if (chunkWc[j].x * 16 + 15 < bx + 32 && chunkWc[j].z * 16 + 15 < bz + 34) {
+            r.f1Samples++;
+            for (int b = 0; b < kDirtyReasonBits; b++)
+              if (flags[ci] & (1u << b)) r.f1Reason[b]++;
+          }
+        }
+      }
+    }
+    ctx.WaitIdle();
+    if (r.e1) r.life1 /= r.e1;
+    if (r.e2) r.life2 /= r.e2;
+    if (r.e4) r.life4 /= r.e4;
+    if (r.s5) r.life5 /= r.s5;
+    return r;
+  };
+
+  const Arm A = runArm(0, -1);
+  const Arm B = runArm(1, level);
+  SetCurrentTuning(saved);
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);  // leave no fixture behind
+  ctx.WaitIdle();
+
+  auto ratio = [](double b, double a) { return a > 0 ? b / a : 0.0; };
+  const double rLife1 = ratio(B.life1, A.life1), rLife2 = ratio(B.life2, A.life2);
+  const double rGas2 = ratio(B.gas2, A.gas2), rBurn3 = ratio(B.burned3, A.burned3);
+  const double rLeaf3 = ratio(B.leafBurn, A.leafBurn), rFront3 = ratio(B.front3, A.front3);
+  const double rLife4 = ratio(B.life4, A.life4), rGas4 = ratio(B.gas4, A.gas4);
+  const double rLife5 = ratio(B.life5, A.life5), rFire2 = ratio(B.fire2, A.fire2);
+  RecordObserved("rateLod.life5RatioObserved", rLife5);
+  RecordObserved("rateLod.fire2RatioObserved", rFire2);
+  const double slowShare = B.awakeSamples ? (double)B.slowOnlySamples / B.awakeSamples : 0.0;
+  RecordObserved("rateLod.life4RatioObserved", rLife4);
+  RecordObserved("rateLod.gas4RatioObserved", rGas4);
+  RecordObserved("rateLod.life1RatioObserved", rLife1);
+  RecordObserved("rateLod.life2RatioObserved", rLife2);
+  RecordObserved("rateLod.gas2RatioObserved", rGas2);
+  RecordObserved("rateLod.burned3RatioObserved", rBurn3);
+  RecordObserved("rateLod.leafBurn3RatioObserved", rLeaf3);
+  RecordObserved("rateLod.front3RatioObserved", rFront3);
+  RecordObserved("rateLod.slowOnlyShareObserved", slowShare);
+  auto band = [&](const char* key, double v, double lo, double hi) {
+    const std::string k = std::string("rateLod.") + key;
+    const double mn = BaselineNumber((k + "Min").c_str(), lo);
+    const double mx = BaselineNumber((k + "Max").c_str(), hi);
+    return v >= mn && v <= mx;
+  };
+  const bool okLife = band("lifeRatio", rLife1, 0.9, 1.1) && band("lifeRatio", rLife2, 0.9, 1.1) &&
+                      band("lifeRatio", rLife4, 0.9, 1.1) && band("lifeRatio", rLife5, 0.9, 1.1);
+  const bool okGas = band("gasRatio", rGas2, 0.8, 1.25) && band("gasRatio", rGas4, 0.8, 1.25);
+  const bool okSpread = band("spreadRatio", rBurn3, 0.75, 1.33) &&
+                        band("spreadRatio", rLeaf3, 0.75, 1.33) &&
+                        band("spreadRatio", rFront3, 0.75, 1.33);
+  const bool okSlow = slowShare >= BaselineNumber("rateLod.slowOnlyShareMin", 0.05);
+  // The beds are counted a tick after the last build batch, and an ember
+  // placed in an earlier batch is already burning: the two arms' starting
+  // counts agree to a few cells, not exactly (each arm's life is over its
+  // own count).
+  auto near = [](uint32_t a, uint32_t b) { return a * 20u >= b * 19u && b * 20u >= a * 19u; };
+  const bool sane = A.e1 > 1000 && A.e2 > 500 && A.e4 > 200 && A.s5 > 2000 &&
+                    A.leaves0 > 1000 && near(A.e1, B.e1) && near(A.e2, B.e2) &&
+                    near(A.e4, B.e4) && near(A.s5, B.s5) && B.leaves0 == A.leaves0 &&
+                    A.burned3 > 0;
+  if (!sane)
+    detail = Format("fixture not sane: embers F1 %u/%u F2 %u/%u F4 %u/%u, smoke F5 %u/%u, "
+                    "leaves %u/%u, burnt %u. ",
+                    A.e1, B.e1, A.e2, B.e2, A.e4, B.e4, A.s5, B.s5, A.leaves0, B.leaves0,
+                    A.burned3);
+  const bool ok = sane && okLife && okGas && okSpread && okSlow;
+  detail += Format(
+      "level %d (N=%d) vs full rate over %d ticks. F1 sealed embers (%u): mean life %.0f vs "
+      "%.0f ticks = %.3f, %u vs %u left. F2 open bed (%u): life %.0f vs %.0f = %.3f, flame+smoke "
+      "cell-ticks %.0f vs %.0f = %.3f. F3 leaf spread (%u leaves): burnt %u vs %u = %.3f, "
+      "burning-leaf ticks %.0f vs %.0f = %.3f, front %d vs %d = %.3f. Arm B: %u of %u awake "
+      "fixture chunk-samples slow-only (%.0f%%)",
+      level, 1 << level, kTicks, A.e1, B.life1, A.life1, rLife1, B.e1End, A.e1End, A.e2, B.life2,
+      A.life2, rLife2, B.gas2, A.gas2, rGas2, A.leaves0, B.burned3, A.burned3, rBurn3, B.leafBurn,
+      A.leafBurn, rLeaf3, B.front3, A.front3, rFront3, B.slowOnlySamples, B.awakeSamples,
+      100.0 * slowShare);
+  detail += Format(". Fixture floor y %d (window y %d..%d)", by, oy, oy + 511);
+  detail += Format(". F4 sparse embers (%u): life %.0f vs %.0f = %.3f, flame+smoke cell-ticks "
+                   "%.0f vs %.0f = %.3f",
+                   A.e4, B.life4, A.life4, rLife4, B.gas4, A.gas4, rGas4);
+  detail += Format(". F2 flame-only cell-ticks %.0f vs %.0f = %.3f. F5 sealed smoke (%u): mean "
+                   "life %.0f vs %.0f = %.3f",
+                   B.fire2, A.fire2, rFire2, A.s5, B.life5, A.life5, rLife5);
+  for (int armI = 0; armI < 2; armI++) {
+    const Arm& R = armI ? B : A;
+    detail += Format(". Arm %c F2 gas by height (8-cell bands):", armI ? 'B' : 'A');
+    for (int b = 0; b < 5; b++) detail += Format(" %.0f", R.gas2Band[b]);
+    detail += " series:";
+    for (uint32_t v : R.gas2Series) detail += Format(" %u", v);
+  }
+  for (int armI = 0; armI < 2; armI++) {
+    const Arm& R = armI ? B : A;
+    detail += Format(". Arm %c sealed-bed chunk-samples %u, reasons:", armI ? 'B' : 'A',
+                     R.f1Samples);
+    for (int b = 0; b < kDirtyReasonBits; b++)
+      if (R.f1Reason[b]) detail += Format(" %s %u", kDirtyReasonName[b], R.f1Reason[b]);
+  }
+  std::printf("rate-lod: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // plant-crush — passable vegetation holds nothing up
 // ---------------------------------------------------------------------------
 // The owner, 2026-09-25: voxels thrown off a killed mob "land on top of and
@@ -2792,6 +3159,7 @@ const std::vector<Gate>& CaGates() {
       {"ca-gutter", "sim", {}, false, GateCaGutter},
       {"oil-slick", "sim", {}, false, GateOilSlick},
       {"oil-fire", "sim", {}, false, GateOilFire},
+      {"rate-lod", "sim", {}, false, GateRateLod},
       {"plant-crush", "sim", {}, false, GatePlantCrush},
       // The other half of ca-gutter: the same rule at a real shoreline, with
       // nothing switched off. It moves the residency window and regenerates on

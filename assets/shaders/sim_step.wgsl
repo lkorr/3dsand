@@ -665,7 +665,7 @@ fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 // that found no page this tick asks for one (SOLM_REQ_FLAG) and keeps only its
 // OWN chunk awake to take it next tick.
 const DIRTY_OWN_CHUNK_ONLY : u32 =
-    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE |
+    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_SLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE |
     DIRTY_R_DRY;
 
 fn markDirtyR(c : vec3<i32>, reason : u32) {
@@ -3006,6 +3006,158 @@ fn reactFxNote(rule : Reaction, c : vec3<i32>) {
   atomicMax(&pageFaults[RFX_SLOT0 + slot], key);
 }
 
+// ===================== TEMPORAL RATE LOD (DESIGN.md §4) =====================
+// A rule whose reactions.json "rateLod" is "transform" or "emit" is
+// COMPENSABLE: it moves no matter, it is not a front, and its outcome over N
+// ticks has a closed form. In a chunk at level L (common.wgsl rateLodLevel,
+// N = 2^L) such a rule rolls only on the chunk's due ticks, at a chance that
+// stands in for the N ticks it skipped, SURVIVAL-matched:
+//       p' = 1 - (1 - h)^N
+// so P(nothing happened in k*N ticks) is exact and the expected time to the
+// event is preserved. For a TRANSFORM (self -> product, once: burn-out, fade,
+// cooling) that is the whole statement.
+//
+// An EMIT (self kept, a product thrown into an air face, again and again) gets
+// the SAME form, and that was measured, not assumed. Count-matching
+// (p' = N * h, "the expected products per unit time") is only right if the
+// face is free again on the next tick; it is not: the flame an ember throws
+// sits in the face it was thrown into until it rises or burns out, and the
+// ember cannot throw another until it has. At full rate that dead time d cuts
+// the rate to h / (1 + h d); a coarse exec N ticks later finds the face clear
+// whenever d < N, so count-matching over-emits by (1 + h d). The rate-lod gate
+// measured +58% flame and smoke over a crowded ember bed at N = 8 (and +8%
+// over sparse embers, where a flame rises off at once). Survival-matching is
+// "at most one product per N ticks", exact when d >= N and an under-count of
+// ~(N - 3) h / 2 when d ~ 1; with the cap below that is within ~5% either way
+// (gate: crowded and sparse beds both). d belongs to the PRODUCT's motion,
+// which the cell cannot see without reading past one cell.
+//
+// h is the rule's FULL-RATE marginal: its chance times the probability that no
+// earlier coarse EMIT fired first that tick (rlodChanceNow's blocking word).
+// At full rate an emission ends the cell's rule scan for the tick; in a
+// coarse exec it does NOT (it would swallow N ticks of the later rules'
+// chances, and a burning voxel would outlive itself by 1 / (1 - p'_emit)), so
+// the blocking it would have done is folded into h instead. Transforms and
+// full-rate rules still block, exactly as at full rate, which is what the
+// sequential rolls already reproduce.
+//
+// ONLY DECAY AND EMIT RULES COARSEN. A PAIR rule's partner is a neighbour
+// (a front, a contact, a douse), and materials.cpp refuses "rateLod" on one;
+// the coarse PAIR path it would need also cost the step kernel registers.
+//
+// THE PER-RULE CAP. A rule runs at a LOWER level than its chunk while
+// N * h > 1/4 (the due-tick quantization adds an O(N h^2) bias to a
+// transform's mean time-to-event, ~3% at 1/4, and the emit bias above grows
+// with N h). Fire's own decay (160 per-mille) never coarsens; an ember's
+// flame (90) runs at N = 2, its burn-out (8 at burnDurationPct 100) and
+// smoke's fade (9) reach N = 16. A rule held below its chunk's level marks the
+// chunk DIRTY_R_REACT (dispatched every tick); one at its chunk's level marks
+// DIRTY_R_SLOW -- the only mark sim_compact may skip on a non-due tick,
+// because the levels are powers of two and "due at L" implies "due at every
+// L' < L".
+//
+// All integer (rule 1): the survival power is exact 64-bit products via
+// 16-bit halves and one long division by REACT_CHANCE_DEN = 2^7 x 15625; the
+// emit-blocking product is Q16.
+// Reaction.packed bits 5..6, materials.h kRateLodShift: 0 none, 1 transform
+// (a decay), 2 emit. The kernel only asks "is it classed"; the loader has
+// already refused a class that does not fit the rule's kind.
+const RLOD_SHIFT     : u32 = 5u;
+
+// floor(a * b / REACT_CHANCE_DEN) for a, b <= REACT_CHANCE_DEN (< 2^21).
+fn rlodMulDen(a : u32, b : u32) -> u32 {
+  let al = a & 0xFFFFu;
+  let ah = a >> 16u;
+  let bl = b & 0xFFFFu;
+  let bh = b >> 16u;
+  let ll = al * bl;
+  let lh = al * bh;
+  let hl = ah * bl;
+  let mid = (ll >> 16u) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+  let lo = (mid << 16u) | (ll & 0xFFFFu);
+  let hi = ah * bh + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
+  // The product is < 2^42: shift out the 2^7 of the denominator, then divide
+  // the < 2^35 remainder by 15625 one 16-bit digit at a time (r < 15625 keeps
+  // every partial dividend < 2^30).
+  let lo7 = (lo >> 7u) | (hi << 25u);
+  let d = REACT_CHANCE_DEN >> 7u;
+  let t1 = ((hi >> 7u) << 16u) | (lo7 >> 16u);
+  let q1 = t1 / d;
+  let t0 = ((t1 % d) << 16u) | (lo7 & 0xFFFFu);
+  return (q1 << 16u) + t0 / d;
+}
+
+// The highest level <= 4 at which a rule of full-rate marginal h stays inside
+// the cap (see THE PER-RULE CAP above): N * h <= 1/4.
+fn rlodRuleMax(h : u32) -> u32 {
+  var l = 0u;
+  while (l < 4u && (h << (l + 1u)) <= REACT_CHANCE_DEN / 4u) { l++; }
+  return l;
+}
+
+// The survival-matched chance for one exec standing in for 2^l ticks.
+fn rlodChance(h : u32, l : u32) -> u32 {
+  if (l == 0u) { return h; }
+  var s = REACT_CHANCE_DEN - min(h, REACT_CHANCE_DEN);
+  for (var k = 0u; k < l; k++) { s = rlodMulDen(s, s); }
+  return REACT_CHANCE_DEN - s;
+}
+
+// THE CELL'S RATE-LOD STATE, ONE WORD. It lives across doReactions' whole
+// rule loop, and the step kernel is occupancy-bound at 72 registers, which
+// NVIDIA allocates in steps of 8: a chunk coord, a level, a due mask, the
+// keep-awake kinds and the emit-blocking product held as separate values took
+// it to 80 (and 13.9 -> 17.0 KB of shared memory: 7 -> 5 resident groups,
+// +8% CA in --perf village-fire). Packed:
+//   bits 0..2   the chunk's level L (0 = full rate: every lodOn is false)
+//   bits 3..7   due mask, bit l = this tick is a due tick at level l
+//               (common.wgsl rateLodDueMask: the one definition sim_compact
+//               also reads, so the two cannot disagree about a due tick)
+//   bit  8      a coarse rule AT the chunk's level matched (DIRTY_R_SLOW)
+//   bit  9      a coarse rule held BELOW the chunk's level matched (REACT)
+// (Filling it lazily, on the cell's first classed rule, took the kernel back
+// to 80 registers: it is filled once, before the loop.)
+//   bits 16..31 `blk`'s complement in Q16: the probability that an earlier
+//               coarse EMIT of this cell fired this tick at full rate
+//               (0 = none matched; the h of a later rule is ch x (1 - it))
+const RLOD_ST_SLOW : u32 = 256u;
+const RLOD_ST_HELD : u32 = 512u;
+fn rlodStateOf(c : vec3<i32>, synthSelf : bool) -> u32 {
+  // A ticket slot (only decay runs there) and excited fluid (in motion) are
+  // level 0.
+  if (synthSelf || gInTicket || (T.rateLodMax <= 0 && T.rateLodForce < 0)) { return 0u; }
+  let wc = worldChunkOf(c);
+  let l = rateLodLevel(wc, &T);
+  if (l == 0u) { return 0u; }
+  return l | (rateLodDueMask(T.tick, wc) << 3u);
+}
+
+// One coarse rule's chance THIS tick (THE header above): h = its full-rate
+// marginal, held to its own cap, survival-matched over the 2^lr ticks it
+// stands for -- or 0 on a tick that is not due at lr. An EMIT folds its
+// chance into the blocking word for the rules after it. Marks which kind of
+// keep-awake the match asks for. It replaces the rule's chance and changes
+// nothing else: the roll site is the full-rate one.
+fn rlodChanceNow(ch : u32, emit : bool, lightGated : bool, st : ptr<function, u32>) -> u32 {
+  let l = *st & 7u;
+  let bq = *st >> 16u;   // blocked fraction, Q16
+  // h = ch x (1 - b): exact while nothing blocked (bq 0), and ch >> 6 keeps
+  // the product inside u32 (ch <= 2^21).
+  let h = ch - (((ch >> 6u) * bq) >> 10u);
+  if (emit) {
+    // b' = 1 - (1 - b)(1 - p) = b + p - b p, p = ch / DEN in Q16 by a
+    // multiply-shift, no divide: 2147 / 2^15 on ch / 2 (<= 2^31.1 in u32)
+    // is 65536 / DEN to 0.02%.
+    let pq = min(((ch >> 1u) * 2147u) >> 15u, 65535u);
+    let nb = min(bq + pq - ((bq * pq) >> 16u), 65535u);
+    *st = (*st & 0xFFFFu) | (nb << 16u);
+  }
+  let lr = min(l, rlodRuleMax(h));
+  if (!lightGated) { *st = *st | select(RLOD_ST_HELD, RLOD_ST_SLOW, lr == l); }
+  if (((*st >> (3u + lr)) & 1u) == 0u) { return 0u; }
+  return rlodChance(h, lr);
+}
+
 fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
                m : Material, rnd : u32, synthSelf : bool, coat : u32,
                covered : bool, probe : bool) -> bool {
@@ -3018,11 +3170,18 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
   // The cell's charge (E2, THE CHARGE AS PARTNER below), read once, on the
   // first rule that wants a discharge and found none at a face.
   var eP = ELEC_P_UNREAD;
+  // TEMPORAL RATE LOD (above): this cell's chunk level, 0 for a ticket slot
+  // (only decay runs there, at full rate) and for excited fluid (in motion).
+  // Level 0 everywhere is the pre-rate-LOD kernel exactly: every lodOn below
+  // is false and no other line differs.
+  var lodSt = rlodStateOf(c, synthSelf);
 
   for (var ri = 0u; ri < m.reactCount; ri++) {
     let rule = reactions[m.reactOffset + ri];
     let kind = rule.packed & 3u;
     let dmask = (rule.packed >> 2u) & 7u;
+    let lodCls = (rule.packed >> RLOD_SHIFT) & 3u;
+    let lodOn = (lodSt & 7u) != 0u && lodCls != 0u;
     // In a ticket only DECAY runs (gInTicket, above): skipped before the roll
     // and before keepAwake, exactly as a light-gated rule out of its phase is.
     if (gInTicket && kind != RK_DECAY) { continue; }
@@ -3079,7 +3238,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         chance = min(chance * gThinMul, REACT_CHANCE_DEN);
       }
       if (chance == 0u) { continue; }
-      keepAwake = keepAwake || !lightGated;
+      // A decay rewrites self: always a TRANSFORM (materials.cpp refuses
+      // "emit" on one).
+      if (lodOn) { chance = rlodChanceNow(chance, false, lightGated, &lodSt); }
+      else { keepAwake = keepAwake || !lightGated; }
       if (!probe && (rr % REACT_CHANCE_DEN) < chance) {
         reactFxNote(rule, c);
         reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
@@ -3094,8 +3256,15 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
         if (voxMat(voxWordAt(n)) != MAT_AIR) { continue; }
-        keepAwake = keepAwake || !lightGated;
-        if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+        // A coarse emit does not block the rules after it (header above), so
+        // its own chance is folded into the blocking word for them instead.
+        var ch = 0u;
+        if (lodOn) { ch = rlodChanceNow(rainChance(rule, c, rule.chance), true, lightGated, &lodSt); }
+        else {
+          keepAwake = keepAwake || !lightGated;
+          if (!probe) { ch = rainChance(rule, c, rule.chance); }
+        }
+        if (!probe && (rr % REACT_CHANCE_DEN) < ch) {
           reactFxNote(rule, c);
           let ni = voxWordIndex(n);  // resolved only for the cell that is written
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
@@ -3109,7 +3278,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
             return true;
           }
-          return false;  // emitted; self unchanged, may still move
+          if (!lodOn) { return false; }  // emitted; self unchanged, may still move
         }
         break;  // one roll per rule per tick
       }
@@ -3148,10 +3317,13 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if (!synthFluid && rule.prodSelf == PROD_KEEP && rule.prodNbr == nmat) {
           continue;
         }
-        keepAwake = keepAwake || !lightGated;
         faceMatched = true;
         // Weather scale here, after the neighbour matched, so a dry-sky tick
         // and a wood cell with nothing hot beside it never pay the probe.
+        // A PAIR rule is never coarse: materials.cpp refuses "rateLod" on one
+        // (a partner-driven rule is a front or a contact, and a coarse PAIR
+        // path in this branch alone cost the step kernel 8 registers).
+        keepAwake = keepAwake || !lightGated;
         if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           reactFxNote(rule, c);
           if (rule.prodNbr != PROD_KEEP) {
@@ -3267,7 +3439,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     if (er == 2u) { return true; }
     if (er == 1u) { keepAwake = true; }
   }
-  if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }
+  if (keepAwake || (lodSt & RLOD_ST_HELD) != 0u) { markDirtyR(c, DIRTY_R_REACT); }
+  // Only coarse rules at the chunk's own level have work here: the chunk may
+  // be skipped until its due tick (sim_compact.wgsl main).
+  else if ((lodSt & RLOD_ST_SLOW) != 0u) { markDirtyR(c, DIRTY_R_SLOW); }
   return false;
 }
 

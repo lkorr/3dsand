@@ -510,6 +510,12 @@ move bulk matter as objects, and don't multiply substeps.
    (tick, chunk coord, rule rate) — deterministic. Needs conservative wake at
    boundaries (fast neighbor forces full rate). ~3–4× on big fires. Sequence
    AFTER item 1 (builds on the mask infrastructure).
+   **BUILT AND MEASURED 2026-10-06 (phase 1, distance), SHIPS OFF**
+   (DESIGN.md §4 "Temporal rate LOD"): faithful (gate `rate-lod`, every ratio
+   within ~6-8% at N = 8), but in `--perf` village-fire / forestfire it saves
+   nothing and costs CA (+1.6% / +5%): a fire's slow reactions share their
+   chunks with its moving smoke, so slow-only chunks are ~0.04% of the awake
+   set. The ~3–4× above was not real; coarse MOVEMENT is what would be.
 6. **Async compute** (port phase 8): sim overlaps the 12–16 ms render on a
    second queue; effectively free budget until sim exceeds render time.
 7. **Long shot, not recommended now: Margolus block partitioning** (2×2×2

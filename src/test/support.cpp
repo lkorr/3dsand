@@ -1091,6 +1091,16 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
 // happen once per tick, hence submit-per-tick). particlesActive must be
 // derived only from tick-deterministic inputs (explosion history + a settled
 // particle count), never from frame timing — see DESIGN.md §2/§4.
+static_assert(sizeof(opstream::TickInputs::rateLodPlayers) == 3 * kRateLodPlayers * 4,
+              "oprecord.h TickInputs::rateLodPlayers must hold kRateLodPlayers x,y,z");
+std::vector<IVec3> RateLodPlayersOf(const opstream::TickInputs& in) {
+  std::vector<IVec3> v;
+  for (uint32_t i = 0; i < in.rateLodCount && i < kRateLodPlayers; i++)
+    v.push_back({in.rateLodPlayers[3 * i], in.rateLodPlayers[3 * i + 1],
+                 in.rateLodPlayers[3 * i + 2]});
+  return v;
+}
+
 void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t seed, const std::vector<BrushOp>& opsIn,
                 const std::vector<ExplosionOp>& expsIn,
@@ -1100,7 +1110,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t farCount,
                 const std::vector<FluidSpawnOp>& fluidSpawns,
                 uint32_t fluidLive,
-                bool vizActive) {
+                bool vizActive, const std::vector<IVec3>& lodPlayers) {
   // ---- ASYNC COMPUTE: the switch (docs/PLAN_async_compute.md) -------------
   // render.asyncCompute, or SANDVOX_ASYNC_COMPUTE=0/1 over it (the A/B arm).
   // Applied per tick so an F5 reload or a --perf arm flips it between ticks;
@@ -1479,6 +1489,39 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       gHeatRenderQ[1] = tp.updraftCapQ;
       gHeatRenderQ[2] = tp.updraftInflowQ;
       gHeatRenderQ[3] = tp.draftStackQ;
+    }
+  }
+  // ---- TEMPORAL RATE LOD (DESIGN.md §4; common.wgsl rateLodLevel) ----------
+  // The sim.rateLod* knobs and the tick's DECLARED player chunks. A caller
+  // that declares none (every hand-rolled gate ticker, the smokes) gets level
+  // 0 everywhere: a headless harness has no observer to be far from, and its
+  // `playerChunk` is often a placeholder. TickAuthority declares its players,
+  // --perf its eye, a replay the recorded list. SANDVOX_RATE_LOD=off|near,
+  // step,max overrides the knobs (the --perf A/B arm), read once.
+  {
+    static const int* kEnvRl = [] {
+      static int v[4] = {-1, -1, -1, -1};  // mode, near, step, max
+      const char* e = std::getenv("SANDVOX_RATE_LOD");
+      if (e && *e) {
+        if (std::string(e) == "off") v[0] = 0;
+        else if (std::sscanf(e, "%d,%d,%d", &v[1], &v[2], &v[3]) == 3) v[0] = 1;
+        std::printf("SANDVOX_RATE_LOD=%s: rate LOD %s\n", e, v[0] == 0 ? "OFF" : "overridden");
+      }
+      return v;
+    }();
+    const auto& s = CurrentTuning().sim;
+    const int mode = kEnvRl[0] >= 0 ? kEnvRl[0] : s.rateLodMode;
+    tp.rateLodNear = kEnvRl[0] == 1 ? kEnvRl[1] : s.rateLodNear;
+    tp.rateLodStep = std::max(1, kEnvRl[0] == 1 ? kEnvRl[2] : s.rateLodStep);
+    tp.rateLodMax = mode != 0 ? std::clamp(kEnvRl[0] == 1 ? kEnvRl[3] : s.rateLodMaxLevel,
+                                           0, (int)kRateLodMaxLevel)
+                              : 0;
+    tp.rateLodForce = std::clamp(s.rateLodForce, -1, (int)kRateLodMaxLevel);
+    tp.rateLodCount = (uint32_t)std::min<size_t>(lodPlayers.size(), kRateLodPlayers);
+    for (uint32_t i = 0; i < tp.rateLodCount; i++) {
+      tp.rateLodPlayers[4 * i + 0] = lodPlayers[i].x;
+      tp.rateLodPlayers[4 * i + 1] = lodPlayers[i].y;
+      tp.rateLodPlayers[4 * i + 2] = lodPlayers[i].z;
     }
   }
   // ---- WIND PRIMITIVES (docs/RESEARCH_wind.md §4.3) ------------------------
@@ -2014,6 +2057,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     in.playerChunk[2] = playerChunk.z;
     in.farCount = farCount;
     in.fluidLive = fluidLive;
+    in.rateLodCount = tp.rateLodCount;
+    for (uint32_t i = 0; i < tp.rateLodCount; i++)
+      for (int k = 0; k < 3; k++) in.rateLodPlayers[3 * i + k] = tp.rateLodPlayers[4 * i + k];
     opstream::RecordFrame(in, tp, ops, exps, cells.data(), cellCount,
                           spawns.data(), spawnCount, fluidSpawns.data(),
                           fluidSpawnCount, gas);
