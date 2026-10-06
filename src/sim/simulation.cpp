@@ -1514,6 +1514,8 @@ void Simulation::UploadTables(const rhi::Queue& queue,
                               const std::vector<ReactionGpu>& reactions) {
   std::vector<MaterialGpu> table(4096, MaterialGpu{});
   anyRepose_ = false;
+  // A material's emission may have moved: the glow refresh sweeps again.
+  glowStale_ = true;
   // Which materials block the wind (sim_draft.wgsl draftBlocks) may have
   // changed: the next tick re-masks the whole draft box.
   draftForce_ = true;
@@ -2072,6 +2074,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // are owned by the previous call's locals. Join first, always — a no-op on
   // the first build and on any build whose predecessor already published.
   WaitForFarPipelines();
+  // F5: the TUNE_ consts sim_glow.wgsl folds may have moved, so the glow
+  // refresh sweeps again (EncodeTick's quiet latch).
+  glowStale_ = true;
   // Same argument for the raymarch variant's background compile: F5 replaces
   // the module it is reading from.
   PollRaymarchVariant(/*block=*/true);
@@ -2329,6 +2334,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { heatAlloc_ = MakeComputePipeline(device, simPL_, mHeat, "heatAlloc", "heatAlloc"); });
   pool.Add([&] { heatSrc_ = MakeComputePipeline(device, simPL_, mHeat, "heatSrc", "heatSrc"); });
   pool.Add([&] { heatTent_ = MakeComputePipeline(device, simPL_, mHeat, "heatTent", "heatTent"); });
+  pool.Add([&] { heatDue_ = MakeComputePipeline(device, simPL_, mHeat, "heatDue", "heatDue"); });
   pool.Add([&] { heatRelax_ = MakeComputePipeline(device, simPL_, mHeat, "heatRelax", "heatRelax"); });
   // The charge field (sim_elec.wgsl). On simPL_: bindings 55..57.
   pool.Add([&] { elecAlloc_ = MakeComputePipeline(device, simPL_, mElec, "elecAlloc", "elecAlloc"); });
@@ -2465,7 +2471,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !draftCoarseSolve_ || !draftFineFirst_ || !draftFineMid_ || !draftFineMid2_ || !draftFineLast_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
-      !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatTent_ || !heatRelax_ ||
+      !heatBegin_ || !heatShift_ || !heatPend_ || !heatWant_ || !heatArgs_ || !heatAlloc_ || !heatSrc_ || !heatDue_ || !heatTent_ || !heatRelax_ ||
       !elecAlloc_ || !elecRound_ || !elecSettle_ || !elecPurge_ || !elecQuery_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ || !gLeavePrep_ ||
@@ -2955,6 +2961,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::HeatAlloc:      return heatAlloc_;
     case P::HeatSrc:        return heatSrc_;
     case P::HeatTent:       return heatTent_;
+    case P::HeatDue:        return heatDue_;
     case P::HeatRelax:      return heatRelax_;
     case P::ElecAlloc:      return elecAlloc_;
     case P::ElecRound:      return elecRound_;
@@ -3046,6 +3053,8 @@ void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   // records them -- no re-target, no wake.
   heatKnobsValid_ = false;
   heatKnobEpoch_ = 0;
+  // Every glow source word may describe a world that is gone: two sweeps.
+  glowStale_ = true;
 }
 
 uint32_t Simulation::WriteGenList(const rhi::Queue& queue,
@@ -3276,6 +3285,8 @@ void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
   // Heat is not saved and the fill rows zero heatMeta: as EncodeWorldgen.
   heatKnobsValid_ = false;
   heatKnobEpoch_ = 0;
+  // Every glow source word may describe a world that is gone: two sweeps.
+  glowStale_ = true;
 }
 
 void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
@@ -3379,6 +3390,13 @@ uint32_t Simulation::PrepareElecQueries(const rhi::Queue& queue,
 
 bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], uint32_t seed) {
   const Tuning& tn = CurrentTuning();
+  // The glow refresh's quiet latch (EncodeTick) needs the one fact it cannot
+  // see: whether the window moved. This is the per-tick call that carries the
+  // origin, ahead of EncodeTick.
+  if (origin[0] != glowOrigin_[0] || origin[1] != glowOrigin_[1] || origin[2] != glowOrigin_[2]) {
+    glowStale_ = true;
+    for (int a = 0; a < 3; a++) glowOrigin_[a] = origin[a];
+  }
   uint32_t hdr[kHpHdrWords] = {};
   hdr[kHpMode] = tn.sim.heatMode != 0 ? 1u : 0u;
   hdr[kHpRadius] = (uint32_t)std::clamp(tn.sim.heatRadius, 1, (int)kHeatRadiusMax);
@@ -3422,6 +3440,9 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
     heatKnobsValid_ = true;
   }
   hdr[kHpKnobEpoch] = heatKnobEpoch_;
+  // The tent cadence (heat.h kHmDue): outside the knob words above on purpose,
+  // since changing it moves no target and so needs no re-target and no wake.
+  hdr[kHpTentEvery] = (uint32_t)std::clamp(tn.sim.heatTentEvery, 1, (int)kHeatTentEveryMax);
   queue.WriteBuffer(heatParamsBuf_, 0, hdr, sizeof(hdr));
   uint32_t bio[2 * kHeatBiomesMax];
   uint64_t key = 1469598103934665603ull ^ seed;
@@ -3809,6 +3830,36 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
+
+  // ---- THE GLOW REFRESH'S QUIET LATCH (Cond::GlowRefresh) -----------------
+  // The rolling refresh (sim_glow.wgsl `refresh`) heals what the dirty walk
+  // cannot reach, and each of those has a cause the CPU sees:
+  //   * a CA-active tick: a source that moved past the ring budget rewrote
+  //     only its own field, so its 26 neighbours' fields wait for the sweep.
+  //     Every source word is right after the dirty walk (a changed chunk is
+  //     on the next tick's list even when the change fell on a hash tick), so
+  //     ONE sweep -- ceil(kNumChunks / budget) consecutive ticks, the cursor
+  //     being tick x budget -- rewrites every field from right sources.
+  //   * STALE sources: the window moved, a worldgen or load, F5 or a material
+  //     reload (TUNE_ consts / emission), a jump of the tick clock (the cursor
+  //     skips), the budget changed. The first sweep fixes the source words,
+  //     the second the fields that read them: TWO sweeps.
+  // Past that every visit rewrites the words it reads, so the row stops
+  // recording until the next cause. It walked TUNE_GLOW_CHUNKS slots of 4,096
+  // voxel reads each on every idle tick before (~40 us/frame, --perf idle).
+  {
+    const uint32_t chunks = cx.glowChunks;
+    const uint32_t sweep = chunks ? (kNumChunks + chunks - 1) / chunks : 0;
+    if (glowStale_ || chunks != glowLastChunks_ || curTick_ != glowLastTick_ + 1)
+      glowRefreshLeft_ = std::max(glowRefreshLeft_, 2 * sweep);
+    else if (cx.caActive)
+      glowRefreshLeft_ = std::max(glowRefreshLeft_, sweep);
+    glowStale_ = false;
+    glowLastChunks_ = chunks;
+    glowLastTick_ = curTick_;
+    cx.glowRefresh = chunks > 0 && glowRefreshLeft_ > 0;
+    if (glowRefreshLeft_ > 0) glowRefreshLeft_--;
+  }
 
   // ---- C_GAS: a LATCH, not a live count ----------------------------------
   // A gas parcel can only be CREATED on a tick the CA runs (sim_step's

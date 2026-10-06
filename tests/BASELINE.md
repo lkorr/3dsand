@@ -1255,3 +1255,17 @@ Read the older entries as history; `baseline.json` is the current status.
   `mobBurnClothLostPctObserved`. `report:*` observed keys are never written to
   baseline.json (selftest.cpp `RebaselineSelftest`).
 - `determinismHash` unmoved (0fa43063).
+
+## 2026-10-06 — heat perf: source fold + tent cadence: `determinismHash` 94e972ee -> ba939a9c
+
+Recorded with `--selftest --gate determinism --rebaseline`; twice-run
+reproduces. Intentional: the heat sources are now read by caMask before the CA
+(one tick earlier than heatSrc read them after it) and a chunk's heat target is
+recomputed on its `sim.heatTentEvery` (4) phase, so heat-driven transitions and
+the heat term of the wind land on different ticks (DESIGN.md "The source fold",
+"The tent cadence"). Heat gates at the new pin: heat-idle / melt / ignite /
+freeze / ambient / bound / plume / updraft, oil-fire, glow, sleep PASS.
+`heat-plume`'s firing-log check now allows plate A's footprint down to the
+lid + 1 (a plate leaf that dropped onto the chamber lid, still directly above
+the flame); `heat-live` fails exactly as on main 60713bd (X 102 of 114, the
+pend list stalling in a proven-settled window -- not this package).

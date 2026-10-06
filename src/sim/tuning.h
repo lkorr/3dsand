@@ -2512,6 +2512,10 @@ struct Tuning {
     // below 0 by day (LoadTuning) so the snow caps never melt by themselves.
     int heatSnowlineBase = TPD(sim, heatSnowlineBase);
     int heatSnowlineSwing = TPD(sim, heatSnowlineSwing);
+    // THE TENT CADENCE: a chunk's heat target is recomputed at most every Nth
+    // tick, phased by its world chunk x (1 = every tick). A perf knob: the
+    // relaxation hides the lag; sources and the CA wake are never deferred.
+    int heatTentEvery = TPD(sim, heatTentEvery);
     // THE CHARGE FIELD (docs/PLAN_electricity.md). 0 = off: the field drains
     // and no cell carries charge.
     int elecMode = TPD(sim, elecMode);

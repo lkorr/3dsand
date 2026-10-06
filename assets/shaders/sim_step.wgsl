@@ -351,7 +351,10 @@ fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
 // (heatParams); it WRITES only two things into heatMeta, both order-free: the
 // caMask rows raise a chunk's "an emitter is here" flag (an OR), and a fired
 // thermal transition bumps its kind's counter (an ADD). A thermal transition
-// is run by heatReact, below, after the material's reaction bucket.
+// is run by heatReact, below, after the material's reaction bucket. (caMask's
+// SOURCE FOLD, by camask below, is the layer's own work done from the voxels
+// caMask reads anyway -- it writes its chunk's page, summary, relax entry and
+// due marks, and nothing the CA reads.)
 @group(0) @binding(50) var<storage, read_write> heatPool : array<u32>;
 @group(0) @binding(51) var<storage, read_write> heatMeta : array<atomic<u32>>;
 @group(0) @binding(52) var<storage, read> heatParams : array<u32>;
@@ -4863,6 +4866,108 @@ var<workgroup> wgCaSpCnt : array<atomic<u32>, 2>;   // diagnostic: sparse gas / 
 // The cost attribution (GAS_SP_GASONLY*): matter / gas cell counts of this chunk.
 var<workgroup> wgCaPop : array<atomic<u32>, 2>;
 
+// ---- THE TEMPERATURE LAYER'S SOURCE FOLD (2026-10-06) ----------------------
+// sim_heat.wgsl's heatSrc used to re-read, after the CA, all 4,096 voxels of
+// every paged DIRTY chunk -- the voxels camask had just read (village fire:
+// 0.50 ms/frame). camask now computes those words itself on substep 0, from
+// the reads it already makes: per 2^3 block E (hottest thermal.emit), n
+// (emitting cells), k (slowest inertia, air 1) and the transition bit into
+// plane 0's high half; the chunk's summary (source bit + melt / ignite /
+// freeze TRIGGERS); the chunk onto the relax list; and on a change its whole
+// 3x3x3 DUE for a target recompute (the day flip: itself). heatSrc is left
+// with the pages heatAlloc hands out, whose chunks camask may not have read.
+//
+// TIMING: the sources are now the voxels as the tick BEGAN, not as the CA left
+// them. A cell the CA writes this tick marks its chunk dirty for the next one,
+// so the change is read one tick later -- the same one-tick step the CA itself
+// takes. The fold computes EXACTLY heatSrc's words (keep the two in step).
+//
+// Window slots with a heat page only, the layer on, substep 0 only (both
+// camask rows walk one dirty list). Every write is this chunk's own page and
+// metadata, ORs on flags / the due bitset, and the relax list's cursor:
+// order-free (rule 1). heatPool's low half (X, X*) -- what the wind cache and
+// the CA read of other chunks -- is never touched here.
+const HM_RELAX_COUNT : u32 = 5u;
+const HM_DAY_FLIP : u32 = 7u;
+const HM_SUMMARY : u32 = 65664u;
+const HM_RELAX_LIST : u32 = 198784u;
+const HM_DUE : u32 = 236672u;
+const HF_RELAX : u32 = 8u;
+const HF_URGENT : u32 = 32u;
+const HS_SOURCE : u32 = 1u;
+const HS_NONZERO : u32 = 2u;
+const HS_TRIG_ABOVE_SHIFT : u32 = 2u;
+const HS_TRIG_BELOW_SHIFT : u32 = 12u;
+const HS_TRIG_MASK : u32 = 1023u;
+// Per thread, per PAIR of z-blocks: the 16-bit partial of the two cells (one
+// x, one y, z and z+1) this thread read in each block -- E | n << 8 | k << 10
+// | transition << 13 -- so four threads' partials make a block. 4 KiB.
+var<workgroup> wgHeatPart : array<u32, 1024>;
+var<workgroup> wgHeatAbove : atomic<u32>;
+var<workgroup> wgHeatBelow : atomic<u32>;
+var<workgroup> wgHeatChanged : atomic<u32>;
+var<workgroup> wgHeatAny : atomic<u32>;
+var<workgroup> wgHeatMode : u32;
+
+// Fold material `mat`'s thermal transitions (nt of them, 1..2) into a chunk's
+// triggers: the lowest melt / ignite threshold, the highest freeze one, both
+// stored + HEAT_THR_BIAS (heat.cpp PackHeatMaterial), as heatSrc does.
+fn camaskHeatTrig(mat : u32, nt : u32, above : ptr<function, u32>, below : ptr<function, u32>) {
+  for (var t = 0u; t < nt; t++) {
+    let w0 = heatParams[HP_MAT + mat * HP_MAT_STRIDE + 3u * t];
+    let thr = w0 & HS_TRIG_MASK;
+    if (((w0 >> 20u) & 3u) == HEAT_KIND_FREEZE) { *below = max(*below, thr); }
+    else { *above = min(*above, thr); }
+  }
+}
+
+// The fold's block words (after the voxel loop's barrier): thread li owns
+// blocks 2 li and 2 li + 1, each the max / sum / max / or of the four
+// partials of its cells' threads; a sentinel chunk's one material fills
+// every block. A block whose word moved raises wgHeatChanged.
+fn camaskHeatBlocks(ci : u32, li : u32, e : u32, sentinel : bool) {
+  let base = (atomicLoad(&heatMeta[HM_ENTRY + ci]) & HEAT_ENTRY_PAGE) * HEAT_PAGE_WORDS;
+  var whole = 1u << 12u;   // a sentinel of air: k 1, nothing else
+  if (sentinel) {
+    let smat = e & PT_MAT_MASK;
+    if (smat != MAT_AIR) {
+      let r2 = materials[smat]._r2;
+      let em = (r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu;
+      let nt = min((r2 >> HEAT_R2_TRANS_SHIFT) & 3u, 2u);
+      whole = em | (select(0u, 8u, em != 0u) << 8u) | (((r2 >> HEAT_R2_INERTIA_SHIFT) & 7u) << 12u) |
+              (select(0u, 1u, nt != 0u) << 15u);
+    }
+  }
+  for (var q = 0u; q < 2u; q++) {
+    let b = li * 2u + q;
+    var hi = whole;
+    if (!sentinel) {
+      let bx = b & 7u;
+      let by = (b >> 3u) & 7u;
+      let bz = b >> 6u;
+      var eMax = 0u;
+      var n = 0u;
+      var k = 0u;
+      var t = 0u;
+      for (var s = 0u; s < 4u; s++) {
+        let tl = (2u * bx + (s & 1u)) + 16u * (2u * by + (s >> 1u));
+        let pw = (wgHeatPart[tl * 4u + (bz >> 1u)] >> ((bz & 1u) * 16u)) & 0xFFFFu;
+        eMax = max(eMax, pw & 0xFFu);
+        n += (pw >> 8u) & 3u;
+        k = max(k, (pw >> 10u) & 7u);
+        t |= (pw >> 13u) & 1u;
+      }
+      hi = eMax | (n << 8u) | (k << 12u) | (t << 15u);
+    }
+    let old = heatPool[base + b];
+    if ((old >> 16u) != hi) {
+      heatPool[base + b] = (old & 0xFFFFu) | (hi << 16u);
+      atomicOr(&wgHeatChanged, 1u);
+    }
+    if ((hi & 0xFFu) != 0u) { atomicOr(&wgHeatAny, 1u); }
+  }
+}
+
 @compute @workgroup_size(256)
 fn camask(@builtin(workgroup_id) wg : vec3<u32>,
           @builtin(local_invocation_index) li : u32) {
@@ -4885,6 +4990,20 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     wgCaEdge = select(0u, 1u, T.gasMode != GAS_MODE_OFF && caChunkAtEdge(ci));
   }
   if (li < 2u) { atomicStore(&wgCaPop[li], 0u); atomicStore(&wgCaSpCnt[li], 0u); }
+  // THE SOURCE FOLD's gate (above camask): substep 0, a window slot holding a
+  // heat page, the layer on. The same answer in every thread.
+  var heatScan = false;
+  if (P.substep == 0u && ci < NUM_CHUNKS && heatParams[HP_MODE] != 0u) {
+    heatScan = (atomicLoad(&heatMeta[HM_ENTRY + ci]) & HEAT_ENTRY_HAS) != 0u;
+  }
+  if (li == 0u) {
+    atomicStore(&wgHeatAbove, HS_TRIG_MASK);
+    atomicStore(&wgHeatBelow, 0u);
+    atomicStore(&wgHeatChanged, 0u);
+    atomicStore(&wgHeatAny, 0u);
+  }
+  var hAbove = HS_TRIG_MASK;
+  var hBelow = 0u;
   workgroupBarrier();
   // THE COLOURS OF THIS THREAD'S CELLS. Thread li reads cells li + 256 m:
   // x = li & 15 and y = li >> 4 are fixed, z = m. A cell's colour is its WORLD
@@ -4902,12 +5021,34 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
     var cnt1 = 0u;
     var cnt2 = 0u;
     var cz = cz0;
+    // The source fold's running block (two cells: z even, then z odd).
+    var hE = 0u;
+    var hN = 0u;
+    var hK = 0u;
+    var hT = 0u;
+    var hLo = 0u;
+    var hLastTrig = MAT_AIR;
     for (var i = li; i < CHUNK_VOL; i += 256u) {
       let mat = voxMat(voxels[base + i]);
+      var hk = 1u;   // the cell's thermal inertia: air 1
       if (mat != MAT_AIR) {
         let bit = 1u << (i & 31u);
         atomicOr(&wgCaMask[i >> 5u], bit);
         let m = materials[mat];
+        if (heatScan) {
+          let em = (m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu;
+          if (em != 0u) { hN += 1u; hE = max(hE, em); }
+          hk = (m._r2 >> HEAT_R2_INERTIA_SHIFT) & 7u;
+          let nt = min((m._r2 >> HEAT_R2_TRANS_SHIFT) & 3u, 2u);
+          if (nt != 0u) {
+            hT = 1u;
+            // Triggers are a min / max: a run of one material needs one look.
+            if (mat != hLastTrig) {
+              hLastTrig = mat;
+              camaskHeatTrig(mat, nt, &hAbove, &hBelow);
+            }
+          }
+        }
         if (((m._r2 >> HEAT_R2_EMIT_SHIFT) & 0xFFu) != 0u) { atomicOr(&wgCaEmit, 1u); }
         if ((m._r2 & ELEC_R2_SOURCE) != 0u) { atomicOr(&wgCaEmit, 2u); }
         if (m.klass == CLASS_SOLID || m.klass == CLASS_POWDER) {
@@ -4923,6 +5064,19 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
         }
         if (cz == 0u) { cnt0 += inc; } else if (cz == 1u) { cnt1 += inc; } else { cnt2 += inc; }
       }
+      if (heatScan) {
+        hK = max(hK, hk);
+        let z = i >> 8u;
+        if ((z & 1u) == 1u) {
+          let part = hE | (hN << 8u) | (hK << 10u) | (hT << 13u);
+          if (((z >> 1u) & 1u) == 0u) { hLo = part; }
+          else { wgHeatPart[li * 4u + (z >> 2u)] = hLo | (part << 16u); }
+          hE = 0u;
+          hN = 0u;
+          hK = 0u;
+          hT = 0u;
+        }
+      }
       cz = select(cz + 1u, 0u, cz == 2u);
     }
     for (var z = 0u; z < 3u; z++) {
@@ -4934,7 +5088,19 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
       if ((c >> 16u) != 0u) { atomicAdd(&wgColCnt[k3 + 2u], c >> 16u); }
     }
   }
+  if (heatScan) {
+    if (sentinel && li == 0u) {
+      let smat = e & PT_MAT_MASK;
+      if (smat != MAT_AIR) {
+        let nt = min((materials[smat]._r2 >> HEAT_R2_TRANS_SHIFT) & 3u, 2u);
+        if (nt != 0u) { camaskHeatTrig(smat, nt, &hAbove, &hBelow); }
+      }
+    }
+    if (hAbove != HS_TRIG_MASK) { atomicMin(&wgHeatAbove, hAbove); }
+    if (hBelow != 0u) { atomicMax(&wgHeatBelow, hBelow); }
+  }
   workgroupBarrier();
+  if (heatScan) { camaskHeatBlocks(ci, li, e, sentinel); }
   // DENSE OR SPARSE, per colour (one thread each). A colour with at most
   // CA_SPARSE_T cells goes to the pool when its cells may run apart from the
   // rest of the chunk: not a sentinel (every cell or none), not substep 0 of
@@ -4994,6 +5160,32 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   //     site of the colour there, air included, for excitedReact);
   //   * otherwise the colours of the cells the matter plane holds, less the
   //     sparse ones.
+  // THE SOURCE FOLD's chunk words (heatSrc's tail, for a paged dirty chunk).
+  if (heatScan && li == 0u) {
+    let sum = atomicLoad(&heatMeta[HM_SUMMARY + ci]);
+    var trig = atomicLoad(&wgHeatAbove);
+    if (trig == HS_TRIG_MASK) { trig = 0u; }   // no melt / ignite here: none
+    atomicStore(&heatMeta[HM_SUMMARY + ci],
+                (sum & HS_NONZERO) | select(0u, HS_SOURCE, atomicLoad(&wgHeatAny) != 0u) |
+                (trig << HS_TRIG_ABOVE_SHIFT) | (atomicLoad(&wgHeatBelow) << HS_TRIG_BELOW_SHIFT));
+    // mode 1 the day flip (itself, urgent), 2 the sources moved (3x3x3 due),
+    // 3 they moved AND this chunk had no emitter until now -- heat APPEARED
+    // (3x3x3 urgent: sim_heat.wgsl heatDueUrgent says why). An emitter going
+    // away waits for its phase: its neighbours' targets stay up to
+    // sim.heatTentEvery - 1 ticks too warm, never warmer than a source that
+    // stood there that recently.
+    let appeared = atomicLoad(&wgHeatAny) != 0u && (sum & HS_SOURCE) == 0u;
+    var mode = 0u;
+    if (atomicLoad(&wgHeatChanged) != 0u) {
+      mode = select(2u, 3u, appeared);
+    } else if (atomicLoad(&heatMeta[HM_DAY_FLIP]) != 0u) { mode = 1u; }
+    wgHeatMode = mode;
+    let fo = atomicOr(&heatMeta[HM_FLAGS + ci], HF_RELAX);
+    if ((fo & HF_RELAX) == 0u) {
+      let at = atomicAdd(&heatMeta[HM_RELAX_COUNT], 1u);
+      atomicStore(&heatMeta[HM_RELAX_LIST + at], ci);
+    }
+  }
   if (li == 0u) {
     var cols = atomicLoad(&wgCaCol);
     if (sentinel) {
@@ -5093,6 +5285,26 @@ fn camask(@builtin(workgroup_id) wg : vec3<u32>,
   // THE CA'S COST ATTRIBUTION (GAS_SP_GASONLY*), substep 0: is this awake
   // chunk gas and nothing else, or nothing at all? Diagnostic only.
   workgroupBarrier();
+  // THE SOURCE FOLD's due marks (heat.h kHmDue): a change marks the 3x3x3's
+  // paged window chunks; mode 3 and the day flip mark them URGENT too
+  // (sim_heat.wgsl heatDueUrgent).
+  if (heatScan) {
+    let mode = wgHeatMode;
+    var q = SLOT_NONE;
+    if (mode == 1u && li == 0u) { q = ci; }
+    if (mode >= 2u && li < 27u) {
+      let nwc = slotWorldChunk(ci, T.origin) +
+                vec3<i32>(i32(li % 3u) - 1, i32((li / 3u) % 3u) - 1, i32(li / 9u) - 1);
+      if (chunkInWindow(nwc, T.origin)) {
+        let s = chunkSlotIndex(nwc);
+        if ((atomicLoad(&heatMeta[HM_ENTRY + s]) & HEAT_ENTRY_HAS) != 0u) { q = s; }
+      }
+    }
+    if (q != SLOT_NONE) {
+      atomicOr(&heatMeta[HM_DUE + (q >> 5u)], 1u << (q & 31u));
+      if (mode != 2u) { atomicOr(&heatMeta[HM_FLAGS + q], HF_URGENT); }
+    }
+  }
   if (li == 0u && P.substep == 0u && T.gasMode != GAS_MODE_OFF) {
     let nm = atomicLoad(&wgCaPop[0]);
     let ng = atomicLoad(&wgCaPop[1]);

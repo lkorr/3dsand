@@ -224,6 +224,7 @@ PIPE_TO_MEMBER = {
     "PIPE_HEAT_ALLOC": "heatAlloc_",
     "PIPE_HEAT_SRC": "heatSrc_",
     "PIPE_HEAT_TENT": "heatTent_",
+    "PIPE_HEAT_DUE": "heatDue_",
     "PIPE_HEAT_RELAX": "heatRelax_",
     # The charge field (sim_elec.wgsl, src/sim/elec.h).
     "PIPE_ELEC_ALLOC": "elecAlloc_",

@@ -184,6 +184,7 @@ namespace {
 #define PIPE_HEAT_ALLOC       Pipe::HeatAlloc
 #define PIPE_HEAT_SRC         Pipe::HeatSrc
 #define PIPE_HEAT_TENT        Pipe::HeatTent
+#define PIPE_HEAT_DUE         Pipe::HeatDue
 #define PIPE_HEAT_RELAX       Pipe::HeatRelax
 #define PIPE_ELEC_ALLOC       Pipe::ElecAlloc
 #define PIPE_ELEC_ROUND       Pipe::ElecRound
@@ -231,6 +232,7 @@ namespace {
 #define C_WATERWAVE  Cond::WaterWave
 #define C_OPENNESS  Cond::Openness
 #define C_GLOW      Cond::Glow
+#define C_GLOWREFRESH Cond::GlowRefresh
 #define C_GAS       Cond::Gas
 #define C_GASFAR    Cond::GasFarEmit
 #define C_GASOUT    Cond::GasOuter

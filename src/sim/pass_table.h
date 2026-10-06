@@ -510,7 +510,7 @@ enum class Pipe : uint8_t {
   DraftCoarseSolve, DraftFineFirst, DraftFineMid, DraftFineMid2, DraftFineLast,
   // The temperature layer (sim_heat.wgsl). BEFORE ShadowResolve for the copy
   // loop's bound stated above.
-  HeatBegin, HeatShift, HeatPend, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatTent, HeatRelax,
+  HeatBegin, HeatShift, HeatPend, HeatWant, HeatArgsP, HeatAlloc, HeatSrc, HeatDue, HeatTent, HeatRelax,
   // The charge field (sim_elec.wgsl, src/sim/elec.h).
   ElecAlloc, ElecRound, ElecSettle, ElecPurge,
   // The body query (package E4): one group per box a body asked about.
@@ -655,6 +655,12 @@ enum class Cond : uint8_t {
   // --render-budget arm measure the passes AND the reads rather than the reads
   // alone, exactly as `noopenness` does one line up.
   Glow,
+  // Glow AND the refresh's quiet latch (Simulation::EncodeTick): the rolling
+  // refresh records for one sweep after a CA-active tick and two after a
+  // stale-source event (window move, worldgen / load, F5, material reload),
+  // then not at all until the next one -- every word it would write is
+  // already what it would write. The refresh row ONLY.
+  GlowRefresh,
   // Gas particles exist OR the CA has work this tick. Both halves are needed
   // and neither alone is enough: a parcel already in flight must be stepped
   // even in a chunk-quiet world, and a gas voxel can only reach the window
@@ -971,6 +977,9 @@ struct RecordCtx {
   // clamped, and zeroed when render.glowStrength is 0). Suppresses all three
   // glow rows (Cond::Glow), which is what makes the off switch exact.
   uint32_t glowChunks = 0;
+  // The glow refresh's quiet latch (Cond::GlowRefresh): false once a full
+  // sweep has rewritten every word since the last cause (EncodeTick).
+  bool glowRefresh = false;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced

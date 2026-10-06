@@ -1457,12 +1457,19 @@ PlumeResult RunPlume(Ctx& c, int kTicks, int above, int side, int below) {
   r.ignites = hv.meta[kHmIgnites];
   r.refused = hv.meta[kHmRefused];
   r.heatHash = hv.Hash();
-  // The firing log: every heat transition it caught must be a leaf of plate A.
+  // The firing log: every heat transition it caught must be a leaf of plate A
+  // -- or one of its leaves that dropped onto chamber A's lid as the plate burnt
+  // through (solid foliage loses its support like any solid): the column over
+  // the flame from the cell above the lid up through the plate. Still a bush
+  // directly ABOVE the campfire; B's side / below plates and C stay excluded.
+  // (Seen 2026-10-06 when the heat source fold moved the burn's timing by a
+  // tick: one ignition at the plate's footprint, y = lid + 1.)
+  const Box overA{plA.x0, chA.y1 + 2, plA.z0, plA.x1, plA.y1, plA.z1};
   r.logged = std::min(hv.meta[kHmFireLog], kHeatFireLogMax);
   for (uint32_t i = 0; i < r.logged; i++) {
     const uint32_t* e = &hv.meta[kHmFireLog + 1 + 4 * i];
     const int x = (int)e[0], y = (int)e[1], z = (int)e[2];
-    if (!plA.Has(x, y, z)) {
+    if (!overA.Has(x, y, z)) {
       r.loggedOutsideA++;
       if (r.log.size() < 120) r.log += Format(" (%d,%d,%d kind %u)", x, y, z, e[3]);
     }

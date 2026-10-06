@@ -522,14 +522,20 @@ PASS(draftFineLast, "draft", PT_TICK, PIPE_DRAFT_FINE3, K_INDIRECT, IND_DRAFTARG
 // field cannot change between the substeps, and both rows walk one dirty
 // list. caMask1 therefore binds substep 1's pass slice (DYN_CA1, iteration 0
 // of the ca1 block) instead of slice 0.
+// RW(HeatPool) R(HeatParams): THE TEMPERATURE LAYER'S SOURCE FOLD (2026-10-06,
+// sim_step.wgsl): on substep 0 camask writes a paged dirty chunk's per-block
+// sources (plane 0's high half -- never X / X*, which other workgroups' wind
+// cache reads) from the voxels it already reads, its summary and triggers
+// (heatParams' per-material transitions), its relax-list entry and the due
+// marks of its 3x3x3. heatSrc re-read the same 4,096 voxels after the CA.
 // A(GasSpawn): on substep 0 camask initialises each dirty chunk's leave-budget
 // word and counts the ones touching the residency edge (sim_step.wgsl
 // gasLeaveCount); the ca rows behind it read both. caMask1 does neither (its
 // P.substep is 1) but is the same entry point, so it carries the same use.
 PASS(caMask, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
-          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap) A(ElecMeta)))
+          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) RW(HeatPool)
+          R(HeatParams) A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap) A(ElecMeta)))
 // THE COLOUR LISTS (2026-10-03, ca-chunk-overhead; sim_step.wgsl calist): one
 // workgroup per colour turns the caMask row's per-chunk colour words into
 // colour k's chunk list + count (caMask's tail) and colour k's indirect args
@@ -567,8 +573,8 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_CAARGS,0,
 // read-only in practice: `voxels`, as for caMask above.
 PASS(caMask1, "ca(54 color x substep)", PT_TICK, PIPE_CA_MASK, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA1, C_CAACTIVE, 1,
      USES(R(Voxels) R(PageTable) R(DirtyList) I(DispatchArgs) W(CaMask)
-          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) R(HeatPool)
-          A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap) A(ElecMeta)))
+          U(TickUBO) U(PassUBO) R(Draft) W(CaWind) R(Materials) A(HeatMeta) RW(HeatPool)
+          R(HeatParams) A(GasSpawn) R(FluidBlockMap) A(CaArgs) W(ReposeSnap) A(ElecMeta)))
 // A(ElecMeta) on both caMask rows: THE CHARGE FIELD'S DOORBELL -- a chunk
 // holding a source material and no page sets its bit of elecMeta's want
 // bitset (an OR), and the elec rows after the CA page it (src/sim/elec.h).
@@ -625,8 +631,11 @@ PASS(solCompact, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_COMPACT, K_INDIREC
 //              raised HF_EMIT, or its last scan found a source) wants a page
 //              for every unpaged window chunk of its 3x3x3
 //   heatAlloc  ONE workgroup: wanted slots ranked in slot order get pages
-//   heatSrc    the source list re-reads its voxels; a change queues a target
-//              recompute over its 3x3x3
+//   heatSrc    the pages heatAlloc just handed out read their voxels (every
+//              paged DIRTY chunk's sources come from caMask's fold); a change
+//              marks its 3x3x3 due
+//   heatDue    one thread a slot: due chunks whose phase is this tick (world
+//              chunk x mod sim.heatTentEvery) -> the recompute list (kHmDue)
 //   heatTent   x, y, z passes of the separable tent (DYN_CA: iteration k is
 //              axis k; the recorder's per-iteration barrier orders them)
 //   heatRelax  X steps toward X*; wakes the CA only where the walk can change
@@ -657,6 +666,13 @@ PASS(heatSrc, "heat", PT_TICK, PIPE_HEAT_SRC, K_INDIRECT, IND_HEATARGS,16,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(Voxels) R(Materials) R(PageTable) I(HeatArgs) RW(HeatPool) A(HeatMeta)
           R(HeatParams)))
+// The tent cadence: a direct dispatch, one thread per window slot (128 x 256
+// = kNumChunks; the kernel strides if the window grows) -- a bitset word read
+// and a return where nothing is due, cheaper than arming it through another
+// args + copy pair.
+PASS(heatDue, "heat", PT_TICK, PIPE_HEAT_DUE, K_COMPUTE, 128,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) A(HeatMeta) R(HeatParams) R(PageTable)))
 PASS(heatArgs3, "heat", PT_TICK, PIPE_HEAT_ARGS, K_COMPUTE, 1,1,1,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(A(HeatMeta)))
@@ -1357,8 +1373,11 @@ PASS(glowField, "glow", PT_DERIVED, PIPE_GLOW_FIELD, K_INDIRECT, IND_DISPATCHARG
 // away. Deliberately NOT conditioned on C_DIRTYTICK, for the openness refresh's
 // reason: a hash tick compacts no dirty list, so the two rows above it are
 // skipped and this is the only thing keeping the field alive across it.
+// C_GLOWREFRESH (2026-10-06): C_GLOW and the quiet latch -- one sweep after a
+// CA-active tick, two after a stale-source event, then unrecorded until the
+// next one (Simulation::EncodeTick says which events and why that is exact).
 PASS(glowRefresh, "glow", PT_DERIVED, PIPE_GLOW_REFRESH, K_COMPUTE, D_GLOWCHUNKS,1,1,
-     GRP_SIM, DYN_ZERO, C_GLOW, 1,
+     GRP_SIM, DYN_ZERO, C_GLOWREFRESH, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) RW(Glow)))
 
 // (The MLS-MPM spawn row moved into PT_FLUIDSEAM: with settle deleting

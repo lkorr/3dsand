@@ -724,6 +724,12 @@ recompile for the package.
   recompute targets at most every 4th tick per chunk (slot-phased), which the
   relaxation lag hides. Measured before/after on `--perf --scenario forestfire`
   and reported.
+- **Done 2026-10-06** (DESIGN.md "The tent cadence", "The source fold"): the
+  cadence is `sim.heatTentEvery` (4), phased by world chunk X ALONE (exact: the
+  z / y passes read same-x neighbours), with an urgent path for new pages, a
+  first emitter and the day flip in chunks that hold a trigger; heatSrc's scan
+  moved into caMask (substep 0). Village fire: heatSys 2.40 -> 0.87 ms/frame,
+  caMask +0.13, net -1.40 ms GPU.
 - **Memory**: 24 MiB pool + ~0.8 MiB meta.
 
 ---

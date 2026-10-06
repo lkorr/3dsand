@@ -155,6 +155,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::WaterWave:  return cx.waveMode > 0;
     case pass::Cond::Openness:   return cx.opennessChunks > 0;
     case pass::Cond::Glow:       return cx.glowChunks > 0;
+    case pass::Cond::GlowRefresh: return cx.glowChunks > 0 && cx.glowRefresh;
     case pass::Cond::Gas:        return cx.gasActive;
     case pass::Cond::GasFarEmit: return cx.gasFarEmitCount > 0;
     case pass::Cond::GasFarWide: return cx.gasFarWideCount > 0;

@@ -23,8 +23,13 @@
 //   heatArgs    1 thread: indirect args from the counts (recorded 4x)
 //   heatAlloc   ONE workgroup: page the wanted chunks in SLOT ORDER (prefix
 //               sum), so who gets a page under exhaustion is deterministic
-//   heatSrc     per source-list chunk: re-read the voxels into E / n / k;
-//               a change queues a target recompute over N27
+//   (caMask)    sim_step.wgsl, substep 0, BEFORE the CA: a paged dirty
+//               chunk's E / n / k / triggers come from the voxels caMask
+//               already reads (the source fold); a change marks N27 DUE
+//   heatSrc     per NEW page (heatAlloc's): read its voxels into E / n / k;
+//               marks N27 due -- the only chunks caMask did not read
+//   heatDue     one thread a slot: due chunks whose PHASE is this tick
+//               (world chunk x mod sim.heatTentEvery) -> the recompute list
 //   heatTent    3 dispatches (x, z, y): the separable tent filter -- the
 //               coverage-weighted mean of emitters within R blocks -> X*
 //   heatRelax   per relax-list chunk: X steps toward X* (inertia k); wakes
@@ -164,6 +169,7 @@ const HF_SRC : u32 = 2u;
 const HF_RECOMP : u32 = 4u;
 const HF_RELAX : u32 = 8u;
 const HF_NEW : u32 = 16u;
+const HF_URGENT : u32 = 32u;
 const HS_SOURCE : u32 = 1u;
 const HS_NONZERO : u32 = 2u;
 const HS_TRIG_ABOVE_SHIFT : u32 = 2u;
@@ -192,6 +198,9 @@ const HEAT_ARG_RELAX : u32 = 3u;
 const HEAT_ARG_SHIFT : u32 = 4u;
 const HEAT_ARG_PEND : u32 = 5u;
 const HEAT_RADIUS_MAX : u32 = 8u;
+const HM_DUE : u32 = 236672u;
+const HP_TENT_EVERY : u32 = 14u;
+const HEAT_TENT_EVERY_MAX : u32 = 8u;
 // Bit 28 of the dirty word (world.h kDirtyReasonName "heat"): a chunk whose
 // local temperature moved this tick. Not in sim_step's FILM_LICENCE: heat
 // moving is not liquid progress.
@@ -220,6 +229,28 @@ fn heatListAdd(slot : u32, flag : u32, countAt : u32, listAt : u32) {
   if ((old & flag) != 0u) { return; }
   let at = atomicAdd(&heatMeta[countAt], 1u);
   atomicStore(&heatMeta[listAt + at], slot);
+}
+// Mark `slot` DUE for a target recompute (heat.h kHmDue): heatDue moves it
+// onto the recompute list on its phase tick. An OR -- order-free.
+fn heatDueSet(slot : u32) {
+  atomicOr(&heatMeta[HM_DUE + (slot >> 5u)], 1u << (slot & 31u));
+}
+// Due AND URGENT (heat.h kHfUrgent): heatDue recomputes it THIS tick as well
+// as on its phase, if its summary holds a trigger. Three causes -- a page
+// handed out this tick, a chunk whose FIRST emitter appeared (its summary's
+// source bit went 0 -> 1, sim_step.wgsl camask), the day flip -- because each
+// is a target going from nothing to something, and a chunk can mark itself for
+// the CA only while a chunk of its 3x3x3 is dirty (heatRelax): a target three
+// ticks late can miss the dirty window of the edit that caused it and leave
+// snow beside fresh lava unmelted until something else wakes it (heat-melt
+// did exactly that). Only a chunk with a trigger can lose a wake that way, so
+// only such a chunk jumps the queue; the air, smoke and stone round a fire wait
+// for their phase, and so does a flicker of a standing fire. The decision is
+// heatDue's because the summary is stable there (camask and heatSrc are still
+// writing summaries while they raise the flag).
+fn heatDueUrgent(slot : u32) {
+  heatDueSet(slot);
+  atomicOr(&heatMeta[HM_FLAGS + slot], HF_URGENT);
 }
 fn heatWantSlot(slot : u32) {
   let old = atomicOr(&heatMeta[HM_WANT + (slot >> 5u)], 1u << (slot & 31u));
@@ -368,9 +399,12 @@ fn heatShift(@builtin(global_invocation_id) gid : vec3<u32>) {
       heatPool[base + b] = (w & 0xFFFF0000u) | u32(x) | (u32(xs) << 8u);
     }
   }
-  // RETARGET (a live knob moved): every kept page, once. The x / z / y passes
-  // read only paged neighbours, all of which are on the list too, so the new
-  // targets are exactly what a fresh field under the new knobs would hold.
+  // RETARGET (a live knob moved): every kept page, once, THIS tick -- not
+  // through the due set's cadence (heat-live holds a re-target to 2 ticks).
+  // The x / z / y passes read only paged neighbours, all of which are on the
+  // list too, so the new targets are exactly what a fresh field under the new
+  // knobs would hold. The window EDGE below goes through the due set:
+  // x-phased, so exact on its phase tick (heatDue).
   if ((why & HEAT_SHIFT_RETARGET) != 0u) {
     heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST);
     return;
@@ -380,7 +414,7 @@ fn heatShift(@builtin(global_invocation_id) gid : vec3<u32>) {
     for (var k = 0u; k < 27u; k++) {
       if (!chunkInWindow(heatN27(wc, k), T.origin)) { edge = true; }
     }
-    if (edge) { heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST); }
+    if (edge) { heatDueSet(slot); }
   }
 }
 
@@ -409,8 +443,10 @@ fn heatPend(@builtin(global_invocation_id) gid : vec3<u32>) {
 // ============================================================================
 // heatWant: one group per DIRTY chunk (the CA's list), after the CA.
 //
-// A paged chunk goes on the source list (its voxels may have changed). A chunk
-// that holds an emitter -- caMask raised HF_EMIT this tick, or its last source
+// A paged chunk's sources were already re-read by caMask (sim_step.wgsl, the
+// source fold, substep 0) -- before the CA, so a change the CA makes this tick
+// is read next tick, when the chunk it wrote is dirty again. A chunk that
+// holds an emitter -- caMask raised HF_EMIT this tick, or its last source
 // scan found one -- wants a page for every unpaged WINDOW chunk of its 3x3x3:
 // the tent reaches at most one chunk (heat.h kHeatRadiusMax), and an unpaged
 // chunk reads as zero, which would break the separable passes' chain. Every
@@ -428,7 +464,6 @@ fn heatWant(@builtin(workgroup_id) wg : vec3<u32>,
       let f = atomicAnd(&heatMeta[HM_FLAGS + slot], ~HF_EMIT);
       if (heatMode()) {
         let paged = (heatEntry(slot) & HEAT_ENTRY_HAS) != 0u;
-        if (paged) { heatListAdd(slot, HF_SRC, HM_SRC_COUNT, HM_SRC_LIST); }
         let src = paged && (atomicLoad(&heatMeta[HM_SUMMARY + slot]) & HS_SOURCE) != 0u;
         if ((f & HF_EMIT) != 0u || src) { wgWantNeed = 1u; }
       }
@@ -528,13 +563,18 @@ fn heatAlloc(@builtin(local_invocation_index) li : u32) {
 }
 
 // ============================================================================
-// heatSrc: one group per source-list chunk. Re-read the chunk's 4,096 voxels
-// into per-block sources: E the hottest `thermal.emit` among the block's 8
+// heatSrc: one group per source-list chunk -- since the source fold
+// (2026-10-06) only the pages heatAlloc handed out THIS tick: caMask reads the
+// sources of every paged DIRTY chunk (sim_step.wgsl camask) and a fresh page's
+// chunk may not be dirty, so nobody else has read it. Zero groups in a steady
+// fire. Re-read the chunk's 4,096 voxels into per-block sources (camask's
+// fold computes exactly these words; keep the two in step): E the hottest `thermal.emit` among the block's 8
 // cells, n how many cells emit, k the slowest `thermal.inertia` (air 1), and
 // whether any cell carries a thermal transition (HEAT_BLOCK_TRANS). A block
-// whose sources changed -- or a page that is new -- queues a target
-// recompute of the WHOLE 3x3x3 around it (a source reaches at most one chunk);
-// the day flip queues only the chunk itself (X* moves with its own ambient).
+// whose sources changed -- or a page that is new -- marks the WHOLE 3x3x3
+// around it DUE (a source reaches at most one chunk); the day flip marks only
+// the chunk itself (X* moves with its own ambient). heatDue turns due into
+// the recompute list on each chunk's phase.
 // The chunk's summary gets its TRIGGERS: the lowest melt / ignite threshold
 // and the highest freeze threshold among its cells (heat.h kHsTrig*), which
 // is what heatRelax compares a moving block's temperature range against.
@@ -618,14 +658,67 @@ fn heatSrc(@builtin(workgroup_id) wg : vec3<u32>,
   }
   workgroupBarrier();
   let mode = workgroupUniformLoad(&wgSrcMode);
-  if (mode == 1u && li == 0u) {
-    heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST);
-  }
+  // Every chunk here is a page handed out this tick (mode 2): URGENT.
+  if (mode == 1u && li == 0u) { heatDueUrgent(slot); }
   if (mode == 2u && li < 27u) {
     let q = heatSlotOf(heatN27(wc, li));
-    if (q != SLOT_NONE && (heatEntry(q) & HEAT_ENTRY_HAS) != 0u) {
-      heatListAdd(q, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST);
+    if (q != SLOT_NONE && (heatEntry(q) & HEAT_ENTRY_HAS) != 0u) { heatDueUrgent(q); }
+  }
+}
+
+// ============================================================================
+// heatDue: over the due bitset (heat.h kHmDue), after the source passes and
+// before heatTent. A due chunk whose PHASE is this tick --
+// (world chunk x) mod sim.heatTentEvery == tick mod sim.heatTentEvery -- goes
+// on the recompute list and its bit clears; any other keeps its bit for its
+// phase. A slot with no page any more (freed, released) just clears.
+//
+// WHY THE PHASE IS X ALONE, AND WHY THAT IS EXACT. heatTent's x pass reads the
+// x neighbours' plane 0 (the SOURCES, never deferred); its z pass reads the z
+// neighbours' plane 1 and its y pass the y neighbours' plane 2 -- chunks with
+// the chunk's own x, so its own phase. A partial sum a recompute reads is
+// therefore either rewritten earlier in the SAME tick (that neighbour was due
+// too: every source change marks its whole 3x3x3, which holds every chunk
+// whose planes read that source) or not stale at all. So every target is
+// exactly the every-tick target, built from sources at most
+// sim.heatTentEvery - 1 ticks old -- and once the sources stop moving, the
+// field is the every-tick field after one cadence. (A per-chunk hash phase
+// would read a neighbour's partial sum from before that neighbour's own
+// recompute, and could keep a gone source's heat for good.)
+//
+// The relaxation is what hides the lag: X walks to X* by |gap| >> k a tick
+// (k >= 1, solids 3), so a target a few ticks late moves T by a few percent of
+// the gap. What is NOT deferred: the sources, the summary's triggers and the
+// CA wake (caMask / heatSrc / heatRelax every tick), a live-knob re-target
+// (heatShift puts every page on the list directly) and an URGENT chunk with a
+// trigger (heatDueUrgent: a new page, a source appearing, the day flip). An
+// urgent recompute off its phase keeps the due bit, so the phase tick
+// recomputes it again from same-tick partial sums: it may read a neighbour's
+// stale partial for <= N - 1 ticks, and is exact from its phase on.
+//
+// ONE THREAD PER SLOT (128 groups of 256): a set bit's list append is two
+// dependent atomics, and a thread walking a word's 32 bits serialised them
+// (one workgroup, measured 87 us/frame on --perf village-fire).
+@compute @workgroup_size(256)
+fn heatDue(@builtin(global_invocation_id) gid : vec3<u32>,
+           @builtin(num_workgroups) nwg : vec3<u32>) {
+  let n = clamp(heatParams[HP_TENT_EVERY], 1u, HEAT_TENT_EVERY_MAX);
+  let ph = T.tick % n;
+  for (var slot = gid.x; slot < NUM_CHUNKS; slot += nwg.x * 256u) {
+    let bit = 1u << (slot & 31u);
+    if ((atomicLoad(&heatMeta[HM_DUE + (slot >> 5u)]) & bit) == 0u) { continue; }
+    if ((heatEntry(slot) & HEAT_ENTRY_HAS) != 0u) {
+      let f = atomicAnd(&heatMeta[HM_FLAGS + slot], ~HF_URGENT);
+      let x = slotWorldChunk(slot, T.origin).x;
+      let onPhase = u32(((x % i32(n)) + i32(n)) % i32(n)) == ph;
+      let trig = (atomicLoad(&heatMeta[HM_SUMMARY + slot]) >> HS_TRIG_ABOVE_SHIFT) &
+                 ((HS_TRIG_MASK << (HS_TRIG_BELOW_SHIFT - HS_TRIG_ABOVE_SHIFT)) | HS_TRIG_MASK);
+      if (onPhase || ((f & HF_URGENT) != 0u && trig != 0u)) {
+        heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST);
+      }
+      if (!onPhase) { continue; }
     }
+    atomicAnd(&heatMeta[HM_DUE + (slot >> 5u)], ~bit);
   }
 }
 

@@ -886,7 +886,7 @@ class Simulation {
   // world column each table row/column currently describes.
   rhi::Buffer heatParamsBuf_;
   rhi::ComputePipeline heatBegin_, heatShift_, heatPend_, heatWant_, heatArgs_, heatAlloc_, heatSrc_,
-      heatTent_, heatRelax_;
+      heatDue_, heatTent_, heatRelax_;
   // The charge field's CPU-written parameters (elec.h kEp*, binding 57) and
   // its pipelines (sim_elec.wgsl). elecHdr_ is the header last uploaded;
   // elecRounds_ the round count EncodeTick records (the SAME value the header
@@ -1021,6 +1021,18 @@ class Simulation {
   // the dirty walk plus the rolling refresh; same standing as the openness pair
   // above — render-path passes recorded on the TICK table.
   rhi::ComputePipeline glowSrc_, glowField_, glowRefresh_;
+  // THE REFRESH'S QUIET LATCH (EncodeTick, 2026-10-06). The rolling refresh
+  // heals what the dirty walk cannot see, and every one of those causes is an
+  // EVENT: a CA-active tick, a window move, a tick-clock jump, a shader or
+  // material reload. One full sweep after CA activity (the sources are right,
+  // only fields may lag), two after a stale-source event, every word is a
+  // fixed point, so the row stops recording until the next event (it walked
+  // TUNE_GLOW_CHUNKS slots every idle tick before).
+  uint32_t glowRefreshLeft_ = 0;   // ticks the refresh row still records
+  uint32_t glowLastTick_ = 0;
+  uint32_t glowLastChunks_ = 0;
+  int32_t glowOrigin_[3] = {-2147483647 - 1, 0, 0};
+  bool glowStale_ = true;
   rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
   // Shadow cache (shadow_resolve.wgsl): `prepare` turns last frame's request
   // count into a dispatch size, `resolve` casts one media-blind shadow ray per

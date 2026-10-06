@@ -3253,6 +3253,8 @@ _HEAT_CONSTS = {
     "HS_TRIG_MASK": "kHsTrigMask", "HEAT_BLOCK_TRANS": "kHeatBlockTrans",
     "HEAT_KIND_MELT": "kHeatKindMelt", "HEAT_KIND_IGNITE": "kHeatKindIgnite",
     "HM_FIRE_LOG": "kHmFireLog", "HEAT_FIRE_LOG_MAX": "kHeatFireLogMax",
+    "HM_DUE": "kHmDue", "HP_TENT_EVERY": "kHpTentEvery", "HF_URGENT": "kHfUrgent",
+    "HEAT_TENT_EVERY_MAX": "kHeatTentEveryMax",
 }
 
 

@@ -1461,7 +1461,14 @@ void PerfRunner::RenderFrame(Scene& s, FrameClock& fc, uint32_t frame) {
   fc.Add(PerfScope::Present, p0, NowSeconds());
 }
 
-Run PerfRunner::Record(const Scenario& sc) {
+Run PerfRunner::Record(const Scenario& scIn) {
+  // SANDVOX_PERF_WARM=<ticks> overrides the scenario's unrecorded warm-up. A
+  // measurement knob for latched costs that need a long quiet stretch before
+  // they switch off (the glow refresh: one to two 512-tick sweeps, longer than
+  // `idle`'s 60). Unset, every scenario runs exactly as authored.
+  Scenario sc = scIn;
+  if (const char* e = std::getenv("SANDVOX_PERF_WARM"); e && *e)
+    sc.warmTicks = (uint32_t)std::strtoul(e, nullptr, 10);
   Run r;
   r.id = sc.id;
   r.label = sc.label;

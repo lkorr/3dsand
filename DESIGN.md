@@ -1944,7 +1944,8 @@ words: X / X* / E / n / k / "a cell here has a thermal transition", and the
 tent's x and z partial sums). `heatMeta`: per window slot an entry, flags, a
 summary (source bit, and the chunk's lowest melt / ignite and highest freeze
 threshold: its TRIGGERS) and the owning world chunk; a want bitset; the PEND
-bitset; three work lists; the free stack; a diagnostic firing log (the first 8
+bitset; three work lists; the free stack; the DUE bitset (the tent cadence,
+below); a diagnostic firing log (the first 8
 transitions since a reset, by cell -- a report, never read by the sim). All zero is an empty layer, which is
 what the worldgen and load-reset fill rows leave. `heatParams` (CPU-written):
 mode, radius, gain, snowline, the probe cell, per-biome climates,
@@ -1952,8 +1953,8 @@ per-material transitions, the column table. 30 MiB + 1 MiB + 0.4 MiB.
 
 **The rows** (`pass_table.def`, all `C_CAACTIVE`: a settled world records none):
 `heatBegin` (counts, day flip, shift and pend args, the F1 probe), `heatShift`
-(release every page whose owner left the window and queue the kept EDGE for a
-target recompute -- the chunks past it now read cold, and a target built from
+(release every page whose owner left the window and mark the kept EDGE due for
+a target recompute -- the chunks past it now read cold, and a target built from
 them would outlive them; at dawn, the step above; on a knob-epoch change, a
 re-target of every kept page (live knobs, above); ZERO groups otherwise) and
 `heatPend` (last tick's still-relaxing chunks back onto the relax list) before
@@ -1962,15 +1963,64 @@ after it `heatWant` (per dirty chunk: list paged chunks; an emitting chunk —
 `caMask` raised its flag, or its last scan found a source — wants pages for its
 3x3x3), `heatAlloc` (ONE workgroup ranks the wanted slots in SLOT ORDER by a
 prefix sum: exhaustion is a deterministic, counted refusal, never a crash),
-`heatSrc` (re-read a listed chunk's voxels into E / n / k; a change queues its
-3x3x3 for a target recompute, a day flip queues itself), `heatTent` (three
-dispatches, x / z / y), `heatRelax` (step X; wake the CA or pend the chunk, below;
+`heatSrc` (the pages `heatAlloc` just handed out read their voxels into E / n /
+k and mark their 3x3x3 due and urgent; every paged DIRTY chunk's sources come
+from `caMask`, below), `heatDue` (the due chunks whose phase is this tick, and
+the urgent ones with a trigger, onto the recompute list; below), `heatTent`
+(three dispatches, x / z / y), `heatRelax` (step X; wake the CA or pend the chunk, below;
 free an all-zero page with no source in its 3x3x3); `heatArgs` turns the list
 counts into indirect records four times a tick. Every pass writes only its
 own chunk's page and reads neighbours' output of the previous dispatch; atomics
 only on flags (set semantics), list cursors, counters and the free stack (which
 PAGE a slot gets is unobservable: a page is zero when handed out but for plane
 0's top nibble, which `heatSrc` rewrites before anything reads it).
+
+**The source fold (2026-10-06).** `heatSrc` used to re-read all 4,096 voxels of
+every paged dirty chunk after the CA -- the voxels `caMask` reads anyway. On
+substep 0 `caMask` now computes the same words from the same reads: each thread
+keeps a 16-bit partial of its two cells per block (E max, emitting count,
+inertia max, transition bit) in 4 KiB of workgroup memory, four partials make a
+block, and the chunk's summary (source bit + triggers), its relax-list entry and
+its due marks follow (`sim_step.wgsl` "THE TEMPERATURE LAYER'S SOURCE FOLD").
+It writes only plane 0's HIGH half of its own page, never X / X* (what other
+workgroups' wind cache reads in the same dispatch). The sources are therefore
+the voxels as the tick BEGAN: a cell the CA writes marks its chunk dirty for
+the next tick, which reads it -- the CA's own one-tick step. `heatSrc` keeps the
+pages handed out this tick (their chunk may not be dirty, so nobody read it):
+zero groups in a steady fire. `caMask` 45 -> 46 registers, 2.8 -> 6.9 KiB of
+shared memory.
+
+**The tent cadence (2026-10-06, `sim.heatTentEvery`, default 4).** A chunk's
+target is recomputed at most every Nth tick. Every producer marks a chunk DUE
+(a persistent bitset, heat.h `kHmDue`); `heatDue` (one thread a slot) moves a
+due chunk onto the recompute list on its PHASE tick, `(world chunk x) mod N ==
+tick mod N`, and keeps the bit otherwise. The phase is the chunk's x ALONE
+because that is what makes it exact: the x pass reads the x neighbours'
+SOURCES (plane 0, never deferred), the z and y passes read the z / y
+neighbours' partial sums -- chunks with the same x, so the same phase -- and
+every source change marks its whole 3x3x3 due, which holds every chunk whose
+planes read that source. So a recompute reads partial sums that were either
+rewritten earlier the same tick or are current, every target is the every-tick
+target built from sources at most N - 1 ticks old, and once the sources stop the
+field IS the every-tick field after one cadence. (A per-chunk hash phase would
+read a neighbour's partial sum from before its own recompute and could keep a
+gone source's heat for good.) The relaxation hides the lag: X walks by
+`|gap| >> k` a tick, k 1..5.
+
+What is NOT deferred: the sources, triggers and CA wake (every tick), a
+live-knob re-target (`heatShift` lists every page at once; `heat-live` holds it
+to 2 ticks), and URGENT chunks (`heatDueUrgent`, heat.h `kHfUrgent`): a page
+handed out this tick, a chunk whose FIRST emitter appeared, the day flip. Those
+are a target going from nothing to something, and a chunk may mark itself for
+the CA only while a chunk of its 3x3x3 is dirty, so a target three ticks late
+can miss the dirty window of the edit that caused it -- `heat-melt` measured
+exactly that at N = 4 (the snow beside poured lava walked to X 19 of 26 and
+never melted). `heatDue` honours the flag only for a chunk whose summary holds a
+trigger (only those can lose a wake that way), so the air, smoke and stone round
+a fire, and the flicker of a standing one, wait for their phase. An urgent
+recompute off its phase keeps its due bit, so it is exact again from the phase
+tick. An emitter going AWAY is not urgent: its neighbours' targets stay up to
+N - 1 ticks too warm, never warmer than a source that stood there that recently.
 
 **Waking the CA, and the pend list (2026-10-02 audit).** A moving field
 matters to the CA only where it can change a cell. `heatRelax` marks a chunk
@@ -2054,16 +2104,17 @@ saves and loads lava beside wood and asserts the wood still catches within the
 same bound. Ticket chunks carry no heat. The heat gates run each fixture twice
 and compare a slot-keyed hash of the pool as well as the voxels.
 
-**Cost** (re-measured by the 2026-10-02 audit, `--perf village-fire`,
-`SANDVOX_RUN_EXCLUSIVE=1`, before/after back to back): `heatSys` 2.3 ms/frame
-(heatTent 1.53, heatSrc 0.50, heatRelax 0.12, heatPend 0.05; pool peak 2,290
-pages) -- the build's own 1.12 ms figure did not reproduce, and a first boot
-read 3.9 (heatSrc 2.1: boot noise). The CA no longer pays for the halo (above).
-An active world with nothing hot: one `heatWant` group per dirty chunk
-returning after two loads (`heat-idle`). The levers left, in size order:
-`heatTent` (recompute a chunk's targets at most every Nth tick, slot-phased --
-the relaxation hides it) and `heatSrc` (fold its per-block E / n / k scan into
-`caMask`, which already reads every cell of every dirty chunk).
+**Cost** (2026-10-06, after the source fold and the tent cadence; `--perf
+village-fire`, `SANDVOX_RUN_EXCLUSIVE=1`, n = 2 a side, the 60713bd exe on its
+own assets as the control; mean us/frame): `heatSys` 2,400 -> 867 (heatTent
+1,586 -> 560, heatSrc 536 -> 48, heatDue +9, heatRelax 121 -> 103, recompute
+peak 2,301 -> 767), `caMask` + `caMask1` 1,830 -> 1,955 (+125, the fold), so
+-1.40 ms GPU a frame; frame p50 24.31 -> 23.96 ms. (The 2026-10-02 audit's
+figure for the same scene: 2.3 ms, heatTent 1.53, heatSrc 0.50; the build's
+own 1.12 ms never reproduced.) The CA no longer pays for the halo (above). An
+active world with nothing hot: one `heatWant` group per dirty chunk returning
+after two loads (`heat-idle`) plus `heatDue`'s 128 groups each reading one
+bitset word.
 
 **Heat drives the wind** (wind phase 5, 2026-10-02; §9b "Heat updrafts and the
 stack effect"). The sim's wind reads the pool: an updraft over any block with
@@ -17551,6 +17602,20 @@ so merging them into one entry point would be a race. The `RW(Glow)` →
 makes it a read-after-write. A third entry point, `refresh`, walks
 `render.glowChunksPerFrame` slots per tick doing both stages, as the backstop
 for a cold start, a streamed-in slot and a chunk the ring budget turned away.
+
+**The refresh sleeps when the world is still** (2026-10-06, `Cond::GlowRefresh`,
+`Simulation::EncodeTick`'s quiet latch). Every cause the backstop exists for is
+an event the CPU sees: a CA-active tick (a source past the ring budget rewrote
+only its own field), and the stale-source events -- a window move, a worldgen
+or load, F5, a material reload, a jump of the tick clock, a budget change. After
+a CA-active tick every source word is right (a changed chunk is on the next
+tick's dirty list), so ONE sweep (`ceil(kNumChunks / budget)` consecutive
+ticks; the cursor is `tick x budget`) rewrites every field from right sources;
+after a stale event the first sweep fixes the sources and the second the fields,
+so TWO. Past that every visit rewrites what is there, and the row is not
+recorded until the next event. `--perf idle` with a 1,200-tick warm-up
+(`SANDVOX_PERF_WARM`): the glow node 39 -> 4.5 us/frame, exactly 1,024 refresh
+dispatches after the scenario's tick jump and none after.
 
 **Both sides of the toroidal seam take the stamp.** `glowSrcOf` refuses to READ a
 neighbour whose slot holds a different world chunk; `glowWriteField` refuses to

@@ -146,11 +146,30 @@ constexpr uint32_t kHmSrcList = kHmPend + kHeatWindowChunks / 32;
 constexpr uint32_t kHmRecompList = kHmSrcList + kHeatWindowChunks;
 constexpr uint32_t kHmRelaxList = kHmRecompList + kHeatWindowChunks;
 constexpr uint32_t kHmStack = kHmRelaxList + kHeatWindowChunks;
-constexpr uint32_t kHmWords = kHmStack + kHeatPoolPages;
+// THE DUE BITSET (heatTent cadence, 2026-10-06): chunks whose target needs a
+// recompute. Every producer (caMask's source fold, heatSrc on a new page,
+// heatShift's window edge) sets a bit; heatDue moves a set bit onto the
+// recompute list only on its chunk's PHASE tick, (world chunk x) mod
+// sim.heatTentEvery == tick mod sim.heatTentEvery, and keeps it otherwise.
+// Phased by X ALONE on purpose: heatTent's z and y passes read only the
+// z / y neighbours' partial sums, which share the chunk's x and so its phase;
+// the x pass reads the x neighbours' SOURCES (plane 0), which are never
+// deferred. So every chunk recomputed on a tick reads partial sums that are
+// either recomputed the same tick or already current -- the field is exactly
+// the every-tick field, up to sim.heatTentEvery - 1 ticks late. Persistent
+// (a bit outlives its tick until its phase comes); all zero = nothing due.
+// At the END of heatMeta so no older offset moves.
+constexpr uint32_t kHmDue = kHmStack + kHeatPoolPages;
+constexpr uint32_t kHmWords = kHmDue + kHeatWindowChunks / 32;
 
 constexpr uint32_t kHeatEntryHas = 0x80000000u;
 constexpr uint32_t kHeatEntryPage = 0x00FFFFFFu;
 constexpr uint32_t kHfEmit = 1u, kHfSrc = 2u, kHfRecomp = 4u, kHfRelax = 8u, kHfNew = 16u;
+// A due chunk that should not wait for its phase (sim_heat.wgsl heatDueUrgent):
+// set with its kHmDue bit, consumed by heatDue, which honours it only for a
+// chunk whose summary holds a trigger (something there can melt, ignite or
+// freeze -- the only chunks a late target can cost a CA wake).
+constexpr uint32_t kHfUrgent = 32u;
 constexpr uint32_t kHsSource = 1u, kHsNonzero = 2u;
 // The summary's TRIGGERS (heatSrc, from the chunk's cells): the lowest
 // melt / ignite threshold and the highest freeze threshold of any material
@@ -187,6 +206,12 @@ constexpr uint32_t kHeatGainOne = 16;
 // heatShift's kHeatShiftRetarget. A pure function of the tuning each tick
 // saw: replayed under the same tuning sequence it re-targets on the same tick.
 constexpr uint32_t kHpKnobEpoch = 13;
+// sim.heatTentEvery (1..kHeatTentEveryMax): a chunk's target is recomputed at
+// most every Nth tick, on its phase (kHmDue). AFTER the epoch on purpose: it is
+// not a knob word PrepareHeat diffs -- changing the cadence moves no target,
+// so it needs no re-target and no wake.
+constexpr uint32_t kHpTentEvery = 14;
+constexpr uint32_t kHeatTentEveryMax = 8;
 constexpr uint32_t kHeatBiomesMax = 64;
 constexpr uint32_t kHpBiome = kHpHdrWords;                     // base, swing (i32) per biome
 constexpr uint32_t kHpMat = kHpBiome + 2 * kHeatBiomesMax;     // 8 words per material
