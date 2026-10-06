@@ -17131,6 +17131,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     for (uint32_t e : emitted)
       if (e == ci) return;
     emitted.push_back(ci);
+    // A burning CREATURE puts out less fire than it burns (flameKeepPct,
+    // combustion.bodyFlamePct): the dropped cell is still deduped above, so
+    // the share is per cell per tick however many sub-voxels share it. Keyed
+    // on the slot cell (an identity) and the tick: deterministic.
+    if (v.flameKeepPct < 100u && mat < matGpu_.size() &&
+        (matGpu_[mat].flags & kMatFlagFlame) != 0u &&
+        Hash3(ci ^ 0xF1A3Eu, tick, 0xB0D7F1Au) % 100u >= v.flameKeepPct)
+      return;
     // fill-air-only: grid content wins deterministically on the GPU, exactly as
     // burning debris and settle-back already write.
     cellOps.push_back({ci, PackVoxNew(mat, state) | kCellOpIfAir});
@@ -19394,6 +19402,8 @@ void Mob::BurnHeadLimbs(uint32_t tick, World& world,
   BuildCrossLimbHeat(tick, rec);
   const uint32_t crossPct =
       (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
+  const uint32_t flameKeep =
+      (uint32_t)std::clamp(CurrentTuning().combustion.bodyFlamePct, 0, 100);
   // ---- A FAIR SHARE, NOT THE HEAD OF THE QUEUE (2026-09-25) ----------------
   // Owner report: "when corpses are burning, the fire voxels come out in
   // rhythmic bursts". The rotation above made the budget fair ON AVERAGE and
@@ -19447,6 +19457,7 @@ void Mob::BurnHeadLimbs(uint32_t tick, World& world,
       v.occludeCtx = &probe;
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
+    v.flameKeepPct = flameKeep;
     const bool burnt =
         sys_->BurnOneLimb(v, tick, key, world, cellOps, front, ops);
     frontBudget -= front0 - front;
@@ -21689,6 +21700,8 @@ void MobSystem::BurnDeadFlesh(uint32_t tick, World& world,
   if (!debris_ || !BurnTablesReady()) return;
   const uint32_t crossPct =
       (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
+  const uint32_t flameKeep =
+      (uint32_t)std::clamp(CurrentTuning().combustion.bodyFlamePct, 0, 100);
   debris_->BurnFleshBodies(
       [&](std::vector<DebrisSystem::FleshLattice>& lats,
           std::vector<DebrisSystem::FleshBurn>& out) {
@@ -21749,6 +21762,7 @@ void MobSystem::BurnDeadFlesh(uint32_t tick, World& world,
           const uint32_t key = FleshKey(lats[k].id) ^ 0xB0D1E5u;
           FleshCoat& cc = fleshCoat_[lats[k].id];
           v.corrodeCoat = cc.led.corrosive > 0;
+          v.flameKeepPct = flameKeep;
           out[k].changed =
               BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget);
           out[k].removed = cc.burn.removed;

@@ -1019,11 +1019,30 @@ Status GateElecBodyMatter(Ctx& c, std::string& detail) {
     for (int li = 0; li < m->AppendedBase(); li++)
       if (c.mobs.LimbBody(id[5], li)) c.mobs.SoakLimb(id[5], li, mWater, kBodyStainAmtMax, rig.tick);
   bool stunned[kBodies] = {};
+  // THE ENTRY LIGHTS, NOT THE BODY (gore.shockIgniteCells): the sylvan is fed
+  // through its feet, so at the end of the hold its HEAD has no ember or
+  // charcoal. Before the band every charged cell rolled its own ember and a
+  // zapped sylvan lit everywhere in the same tick (owner report 2026-10-05).
+  const uint32_t mEmber = MatId(c, "ember"), mCharcoal = MatId(c, "charcoal");
+  uint32_t sylvanHeadLit = 0, sylvanLit = 0;
+  std::string sylvanSlotP;   // slot P/lit at hold end (attribution)
+  auto litIn = [&](uint64_t mid, int li) {
+    return c.mobs.LimbMaterialCount(mid, li, mEmber) + c.mobs.LimbMaterialCount(mid, li, mCharcoal);
+  };
   for (int i = 0; i < hold + observe; i++) {
     Tick(rig, i < hold ? f.feed : std::vector<CellOp>{});
     for (int k = 0; k < kBodies; k++)
       if (const Mob* m = id[k] ? c.mobs.FindMobById(id[k]) : nullptr)
         stunned[k] = stunned[k] || m->Stunned(rig.tick);
+    if (i == hold - 1 && id[3])
+      if (const Mob* m = c.mobs.FindMobById(id[3]))
+        for (int li = 0; li < m->AppendedBase(); li++) {
+          const uint32_t n = litIn(id[3], li);
+          sylvanLit += n;
+          if (m->SlotName(li) == "head") sylvanHeadLit += n;
+          sylvanSlotP += Format("%s%s %u/%u", sylvanSlotP.empty() ? "" : ",", m->SlotName(li).c_str(),
+                                m->ElecSlotCharge(li, rig.tick), n);
+        }
   }
   float hp[kBodies];
   Mob::ShockRecord rec[kBodies];
@@ -1055,6 +1074,10 @@ Status GateElecBodyMatter(Ctx& c, std::string& detail) {
     check(rec[3].ohmicVoxels > 0 && rec[3].cellsPeak > 0,
           Format("sylvan: %u charged cells, %u voxels charred / lit (wood should char)",
                  rec[3].cellsPeak, rec[3].ohmicVoxels));
+    check(sylvanHeadLit == 0,
+          Format("sylvan: %u of %u ember/charcoal voxels on the HEAD of a body fed through its feet "
+                 "(ignition should start at the entry)",
+                 sylvanHeadLit, sylvanLit));
   }
   if (id[5]) check(hp[5] > 0.0f, Format("soaked android: %.2f Electric hp (its circuitry feels)", hp[5]));
   std::string rows;
@@ -1080,7 +1103,10 @@ Status GateElecBodyMatter(Ctx& c, std::string& detail) {
   RecordObserved("elecMatter.barefootHp", hp[0]);
   RecordObserved("elecMatter.sabatonHp", hp[2]);
   RecordObserved("elecMatter.sylvanOhmicVoxels", rec[3].ohmicVoxels);
+  RecordObserved("elecMatter.sylvanHeadLit", sylvanHeadLit);
   RecordObserved("elecMatter.androidSoakedHp", hp[5]);
+  rows += Format(" | sylvan at hold end: %u ember/charcoal, %u on the head; slot P/lit [%s]", sylvanLit,
+                 sylvanHeadLit, sylvanSlotP.c_str());
   detail = rows + (fails.empty() ? "" : " | FAILED: ") + fails;
   std::printf("elec-body-matter: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
   return fails.empty() ? Status::Pass : Status::Fail;

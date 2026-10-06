@@ -73,12 +73,15 @@
 //               voxels become ignite.into (an air face) or char (none). Wood
 //               becomes ember and burns; flesh sears; alloy, with no ignite
 //               data, never does.
+//               ONLY AT THE ENTRY: the gore.shockIgniteCells hottest cells
+//               roll; the burn pass spreads it.
 //   crackle     per body cell, E2's crackle exactly: P over sim.elecCrackle*P
 //               throws a spark / arc into an AIR face, as a fill-air cell op
 //               (recorded: this is how a charged body passes charge on into
 //               the world -- the discharge it throws is a source)
 //   fire        at shockIgniteMinP, a hashed roll: Mob::Ignite on the hair, the
-//               clothes and the touching limbs -- the burn pass's own door, so
+//               clothes and the touching limbs AT THE ENTRY (holding or beside
+//               the body's hottest cell) -- the burn pass's own door, so
 //               a wet voxel refuses the flame exactly as it refuses a torch
 //   twitch      TickStuns: Mob::HitReact in a hashed direction every
 //               shockTwitchTicks while stunned (presentation only)
@@ -1051,6 +1054,32 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
   const uint32_t thrHi = ElecCrackleThreshold(tn.sim.elecCrackleArcP, crackleHiMat_, crackleHiSrc_);
   uint32_t ohmicLeft = kShockOhmicCellsPerTick, crackleLeft = kShockCrackleOpsPerTick;
 
+  // ---- THE ENTRY: where the current comes in, and the only place it lights --
+  // Living wood is a conductor (80) and a bolt or a crackle beside a body
+  // seeds it from the world on every face, so a zapped sylvan is charged end
+  // to end in one tick at nearly one P (feet 22,000, head 18,800 in
+  // elec-body-matter); with every charged cell rolling its own ember the
+  // whole body lit at once (owner report 2026-10-05). So ignition is taken
+  // only at the ENTRY: the ohmic ember / sear rolls in the body's
+  // gore.shockIgniteCells hottest cells that can take it (P, then node order:
+  // a pure function of this tick's solve), and the fire roll lights only the
+  // slot of its single hottest cell. A cell that turned to ember has no
+  // ignite data and drops out, so a held current creeps on to the next
+  // hottest at that bounded rate; the burn pass spreads the rest (across
+  // joints too, BurnLimbs).
+  const uint32_t igniteCells = (uint32_t)std::clamp(g.shockIgniteCells, 0, 1 << 20);
+  auto canIgnite = [&](const ElecBodyCell& e) {
+    return e.ohmMat != 0 && e.ohmMat < matElec_.size() && matElec_[e.ohmMat].igniteCap != 0 &&
+           igniteQ != 0 && e.bulk != kIns;
+  };
+  // The hottest node of a part (lowest index on a tie), or UINT32_MAX.
+  auto hottest = [&](uint32_t pi) {
+    uint32_t best = UINT32_MAX;
+    for (uint32_t k = partBegin[pi]; k < partBegin[pi + 1]; k++)
+      if (P[k] > 0 && (best == UINT32_MAX || P[k] > P[best])) best = k;
+    return best;
+  };
+
   // ---- THE ROLLS, DECIDED PER PART ACROSS THE POOL (round 3 K) -------------
   // Every ohmic and crackle roll is an integer hash of (creature, slot, cell,
   // tick) against the cell's P and its air faces; none reads a budget. So the
@@ -1073,6 +1102,25 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
     const Mob& mob = *p.m;
     const uint32_t mobKey = (uint32_t)mob.id_ ^ (uint32_t)(mob.id_ >> 32);
     std::vector<Roll>& out = rolls[pi];
+    // The entry cells: the igniteCells hottest that can take the ohmic roll.
+    const uint32_t nb = partBegin[pi], ne = partBegin[pi + 1];
+    std::vector<uint8_t> entry(ne - nb, 0);
+    {
+      std::vector<std::pair<int32_t, uint32_t>> cand;   // (-P, node): ascending = hottest first
+      for (int li = 0; li < (int)mob.limbs_.size() && li < (int)p.slotBase.size(); li++) {
+        if (p.slotBase[li] < 0) continue;
+        const ElecSlotCache& c = mob.elecCache_[li];
+        for (size_t ci = 0; ci < c.cells.size(); ci++) {
+          const uint32_t k = (uint32_t)p.slotBase[li] + (uint32_t)ci;
+          if (P[k] > 0 && canIgnite(c.cells[ci])) cand.push_back({-P[k], k});
+        }
+      }
+      if (cand.size() > igniteCells) {
+        std::nth_element(cand.begin(), cand.begin() + igniteCells, cand.end());
+        cand.resize(igniteCells);
+      }
+      for (const auto& [np, k] : cand) entry[k - nb] = 1;
+    }
     for (int li = 0; li < (int)mob.limbs_.size() && li < (int)p.slotBase.size(); li++) {
       if (p.slotBase[li] < 0) continue;
       const ElecSlotCache& c = mob.elecCache_[li];
@@ -1087,9 +1135,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
         // reaches; a cell that can do neither skips the six lookups
         // (PLAN_fight64_perf M) -- both rolls below then refuse it exactly as
         // they would have.
-        const bool ohmicCan = e.ohmMat != 0 && e.ohmMat < matElec_.size() &&
-                              matElec_[e.ohmMat].igniteCap != 0 && igniteQ != 0 &&
-                              e.bulk != kIns;
+        const bool ohmicCan = entry[k - nb] != 0;   // canIgnite, and at the entry
         const bool crackleCan = crackleQ != 0 && ((uint32_t)pk >= thrHi ? crackleHiMat_ != 0
                                                   : (uint32_t)pk >= thrLo ? crackleLoMat_ != 0
                                                                            : false);
@@ -1106,7 +1152,7 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
         // OHMIC: E = P x the cell's resist (the wet rule in it).
         const ElecMat& em = e.ohmMat < matElec_.size() ? matElec_[e.ohmMat] : ElecMat{};
         const uint32_t prod = air != 0 ? em.igniteInto : em.charInto;
-        if (e.ohmMat != 0 && prod != 0 && em.igniteCap != 0 && igniteQ != 0 && e.bulk != kIns) {
+        if (ohmicCan && prod != 0) {
           const uint64_t E = (uint64_t)pk * e.bulk;
           const uint64_t lim = ((uint64_t)em.igniteCap << 4) / igniteQ;
           uint64_t ch = E < lim ? (E * igniteQ) >> 4 : em.igniteCap;
@@ -1321,11 +1367,27 @@ void MobSystem::ApplyShockTick(uint32_t tick, World& world, std::vector<CellOp>&
         const float chance = std::min(1.0f, g.shockIgniteGain * peak / 1000.0f);
         const uint32_t h = rng::Hash3((uint32_t)mob.id_ ^ 0xE1EC5u, tick, (uint32_t)(mob.id_ >> 32));
         if (rng::Unit01(h) < chance) {
+          // AT THE ENTRY only (shockIgniteCells): the slot holding the
+          // body's hottest cell, or -- hair and cloth are insulators, never
+          // charged themselves -- one with a cell beside it. The rest catch
+          // from the burn pass, not from the current.
+          const uint32_t hk = hottest(pi);
+          const IVec3 hw = hk != UINT32_MAX ? nodes[hk].w : IVec3{};
+          auto atEntry = [&](int li) {
+            if (hk == UINT32_MAX || p.slotBase[li] < 0) return false;
+            const size_t n = mob.elecCache_[li].cells.size();
+            for (size_t ci = 0; ci < n; ci++) {
+              const IVec3 w = nodes[(size_t)p.slotBase[li] + ci].w;
+              if (std::abs(w.x - hw.x) <= 1 && std::abs(w.y - hw.y) <= 1 && std::abs(w.z - hw.z) <= 1)
+                return true;
+            }
+            return false;
+          };
           for (int li = 0; li < (int)mob.limbs_.size(); li++) {
             if (!mob.limbs_[li].body) continue;
             bool cand = mob.IsWornSlot(li) || (li < mob.baseLimbs_ && mob.IsBloodless(li));
             for (const Touch& t : touch) cand = cand || t.limb == li;
-            if (!cand) continue;
+            if (!cand || !atEntry(li)) continue;
             rec.ignited += mob.Ignite(li, (uint32_t)g.shockIgniteVoxels);
           }
         }

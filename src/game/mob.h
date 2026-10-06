@@ -998,6 +998,11 @@ struct BurnLimbView {
   // corrosive), so BurnOneLimb must run even with nothing in the world around
   // it: the acid is ON the limb. Set by the caller from its ledger.
   bool corrodeCoat = false;
+  // The share (percent) of the FLAME cells (kMatFlagFlame: fire) this lattice
+  // releases that actually enter the grid -- combustion.bodyFlamePct for a
+  // creature and its severed flesh, 100 for loose matter. The rest are
+  // dropped by a hashed roll per (cell, tick); the voxel burns all the same.
+  uint32_t flameKeepPct = 100;
   // The blood a voxel BARED by a removal here may be left wearing (materials
   // .json `bareBlood`: bone). The creature's smear material on a live limb, a
   // corpse piece's bleedMat; 0 = nothing bleeds here (debris, a bloodless def).

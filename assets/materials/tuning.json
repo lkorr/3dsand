@@ -333,6 +333,7 @@
     "shockIgniteMinP": 1500,
     "shockIgniteGain": 0.05,
     "shockIgniteVoxels": 6,
+    "shockIgniteCells": 4,
     "shockTwitchTicks": 4,
     "shockTwitchHp": 12,
     "bleedGain": 0.5,
@@ -1167,7 +1168,8 @@
     "burnDurationPct": 200,
     "spreadPct": 29,
     "flamePct": 800,
-    "crossLimbPct": 15
+    "crossLimbPct": 15,
+    "bodyFlamePct": 40
   },
   "wind": {
     "windSpeed": 6,

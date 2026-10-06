@@ -1923,6 +1923,12 @@ struct Tuning {
     //     a tick to set shockIgniteVoxels of the hair / the clothes / the
     //     touching limb alight (Mob::Ignite -- the burn pass's own door; a
     //     wet voxel refuses).
+    //   - only the ENTRY catches: the shockIgniteCells hottest body cells
+    //     roll the ohmic ember/sear, and the fire roll lights only the slot
+    //     holding the hottest cell (and hair / cloth beside it). A
+    //     living-wood body conducts end to end; with every charged cell
+    //     rolling, all of it lit in the same tick instead of the burn pass
+    //     spreading it from the zap.
     // A spark (200) barely hurts; a lightning-charged pool (~30000) kills a
     // wet human in well under a second.
     int shockMinP = TPD(gore, shockMinP);
@@ -1941,6 +1947,7 @@ struct Tuning {
     int shockIgniteMinP = TPD(gore, shockIgniteMinP);
     float shockIgniteGain = TPD(gore, shockIgniteGain);
     int shockIgniteVoxels = TPD(gore, shockIgniteVoxels);
+    int shockIgniteCells = TPD(gore, shockIgniteCells);
     int shockTwitchTicks = TPD(gore, shockTwitchTicks);
     float shockTwitchHp = TPD(gore, shockTwitchHp);
   } gore;
@@ -3653,6 +3660,11 @@ struct Tuning {
     // fire should cross a joint, not race across it. Read by the burn pass
     // every tick, no rebuild; F5 hot-reloads it.
     int crossLimbPct = TPD(combustion, crossLimbPct);
+    // Percent of the fire (flame gas) cells a burning creature or its
+    // severed flesh releases that enter the grid (BurnLimbView::flameKeepPct,
+    // rolled per cell per tick in BurnOneLimb's emitCell). The voxels burn
+    // the same; less fire leaves them. Loose debris keeps 100.
+    int bodyFlamePct = TPD(combustion, bodyFlamePct);
     // HOW MUCH OF A FIRE THE DRIFTING FLAME CARRIES. `fire` is the gas that
     // rises off every burning voxel and floats through the air; it carries
     // tag:hot like the coals do, so before neighborChance existed a flame that
