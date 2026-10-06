@@ -63,8 +63,8 @@ const PT_KERNEL : u32 = PT_K_GAS;
 @group(1) @binding(4)  var<storage, read_write> gasClaim : array<atomic<u32>>;
 @group(1) @binding(5)  var<storage, read_write> gasArgs : array<u32>;
 @group(1) @binding(6)  var<storage, read_write> gasOuter : array<atomic<u32>>;
-@group(1) @binding(7)  var<storage, read> farVox : array<u32>;
-@group(1) @binding(8)  var<uniform> farP : FarParams;
+// Bindings 7/8 were farVox + FarParams (gasFarBlocked) until 2026-10-06:
+// see "outside residency" above gasBlocked for why the tick no longer reads them.
 @group(1) @binding(9)  var<storage, read> reactions : array<Reaction>;
 // CPU-authored gas spawns (the gas-reenter gate; any future emitter that is
 // not a grid cell). Same shape as gasSpawn: word 0 is the count, records from
@@ -445,7 +445,7 @@ fn gasWindAt(p : ptr<function, Particle>, c : vec3<i32>, m : Material) -> vec3<i
 }
 
 // A HEAVY parcel's move: stepHeavyGas's rule with the parcel's own blocking
-// test (gasBlocked: air, a gas, or open far cascade). The lift alone, past the
+// test (gasBlocked: air, a gas, or outside residency). The lift alone, past the
 // floor, as a chance ramped by windAxisFrac and the material's response; then
 // down or a lateral, then the other laterals. Same rnd bits as the CA's (22+
 // the lift roll, 9 the down/lateral pick, 12+ the rotation). Returns the cell
@@ -499,38 +499,29 @@ fn gasInOuterBox(c : vec3<i32>) -> bool {
   return d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < n && d.y < n && d.z < n;
 }
 
-// ---- blocking outside the window (§2.4) ------------------------------------
-// The far cascade's level-1 byte, which is the same test the far march uses to
-// decide the ray hit something. A dense toroidal array addressed directly —
-// NOT the page table, which does not extend past the window and has no
-// business being consulted for a parcel of smoke 60 m away. Coarse (one byte
-// per 2^(1+FAR_SHIFT_BASE) fine voxels) and right for a plume: what it is for
-// is "does the plume go around the hill", not per-voxel collision.
-//
-// OUTSIDE THE CASCADE reads as OPEN, not as blocked. The conservative
-// direction elsewhere in the engine is "assume solid" (the residency edge is
-// inert), but here the parcel is already outside the simulated world and the
-// alternative is a wall at the cascade boundary that would pin every plume
-// against an invisible surface.
-fn gasFarBlocked(c : vec3<i32>) -> bool {
-  let cell = c >> vec3<u32>(farCellShift(1u));
-  if (!farInBox(cell, farP.origins[0].xyz)) { return false; }
-  let bi = farVoxByteIndex(1u, cell);
-  let b = (farVox[bi >> 2u] >> (8u * (bi & 3u))) & 0xFFu;
-  if (b == 0u) { return false; }               // air
-  // The blocker flag alone is terrain the centre sample missed — solid, and
-  // it carries no material of its own. (This used to fall out of indexing the
-  // material table with the whole byte: 128..255 are unwritten entries, whose
-  // zeroed klass is CLASS_SOLID. Same answer, said on purpose.)
-  if (b == FAR_PAL_BLOCKER) { return true; }
-  // A gas does not block a gas — smoke downsampled into the cascade must not
-  // wall its own plume off. The byte is a far PALETTE SLOT, so translate it
-  // back to a material first (common.wgsl farCellSlot).
-  return materials[farPalMat(&materials, b)].klass != CLASS_GAS;
-}
-
+// ---- outside residency: OPEN (§2.4; far-fill timing #5, 2026-10-06) -------
+// Until 2026-10-06 a parcel outside the window blocked against the far
+// cascade's level-1 byte (gasFarBlocked). The cascade is RENDER-derived and
+// filled on a wall-clock schedule (the deferred far pipeline compile, the
+// per-frame bulk slice), so a parcel's path out there -- and the gas digest
+// (kGasSpDigest), and the voxel it re-entered as -- depended on frame timing.
+// The owner's call for the particles was option C (no GPU far collision:
+// sim_particle.wgsl FAR LANDING); this is its gas twin. Outside residency
+// NOTHING blocks a parcel, which is the rule the cascade's own boundary
+// already had ("outside the cascade reads OPEN": the parcel is outside the
+// simulated world, and a wall would pin it against nothing). Why that and not
+// a ground: the only ground the GPU could consult deterministically is a
+// tick-owned field (option B, not taken), and a parcel cannot hand itself to
+// the CPU the way a particle does without ending the far plume it is part of.
+// What it costs is the look, nothing else: a light gas -- nearly all of it,
+// smoke -- rises regardless; a wind-blown one crosses a hill outside the
+// window instead of going round it, inside terrain the far march draws in
+// front of it; a heavy gas (MATF_HEAVY_GAS) sinks into the ground out of
+// sight. Bounded exactly as before: authored decay, the outer box, the
+// ceiling (GAS_SP_DIED). A parcel can only re-enter into a resident cell the
+// grid says is air or gas, so it never re-enters inside rock.
 // Can this parcel enter cell `c`? Inside the window the grid answers (and the
-// caller then RE-ENTERS rather than moving); outside, the cascade does.
+// caller then RE-ENTERS rather than moving); outside, nothing blocks (above).
 // Gas particles do not exclude each other: several may share a cell, which is
 // what makes the outer density box a density instead of an occupancy map.
 fn gasBlocked(c : vec3<i32>) -> bool {
@@ -539,7 +530,7 @@ fn gasBlocked(c : vec3<i32>) -> bool {
     if (mm == MAT_AIR) { return false; }
     return materials[mm].klass != CLASS_GAS;
   }
-  return gasFarBlocked(c);
+  return false;
 }
 
 // ---- the splat (§2.5) ------------------------------------------------------

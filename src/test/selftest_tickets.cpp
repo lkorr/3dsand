@@ -501,6 +501,9 @@ struct LandRun {
   // arm A attribution: where did the stone go if it never parked?
   uint32_t particlesMax = 0, farKilled = 0;
   int particlesGoneAt = -1;
+  // Deposits the CPU lowered onto World::TerrainHeight (option C): arm A's
+  // first stone hands over in mid-air past the face; arm B's three cells up.
+  uint64_t loweredA = 0, loweredB = 0;
   // arm B: the cap is full, the stone deposits and comes back later
   uint64_t refusedCap = 0, deposited = 0, respawned = 0;
   // Re-thrown while the gate had asked for nothing: the landing asked for a
@@ -513,16 +516,22 @@ struct LandRun {
   uint32_t faults = 0;
 };
 
-bool RunLand(Ctx& c, LandRun& R, std::string& why) {
+// FAR-FILL TIMING (#5, option C, 2026-10-06): nothing the tick computes reads
+// the far cascade any more -- a particle leaving residency hands itself to the
+// CPU at once and the CPU lands it on World::TerrainHeight. So the two runs
+// differ in exactly one thing, `fillCascade`: the first throws into whatever
+// cascade the earlier gates left, the second fills it synchronously first.
+// Before option C the landing WAS the cascade byte, and this pair is the
+// differential that would have caught it ("run twice: IDENTICAL" below).
+bool RunLand(Ctx& c, LandRun& R, std::string& why, bool fillCascade) {
   int mStone = MatId(c, "glass");
   if (mStone < 0) mStone = MatId(c, "iron");
   if (mStone < 0) { why = "no glass/iron material for the thrown stone"; return false; }
   Regenerate(c);
   const IVec3 o = c.world.WindowOrigin();
-  // The far cascade is what a particle outside residency lands on: fill it
-  // around the window centre, synchronously, before the throw.
-  DrainFullRefill(c.ctx, c.world, c.sim,
-                  IVec3{o.x + (int)kNChunk / 2, o.y + (int)kNChunk / 2, o.z + (int)kNChunk / 2});
+  if (fillCascade)
+    DrainFullRefill(c.ctx, c.world, c.sim,
+                    IVec3{o.x + (int)kNChunk / 2, o.y + (int)kNChunk / 2, o.z + (int)kNChunk / 2});
   const int faceX = (o.x + (int)kNChunk) * (int)kChunk;  // first cell past +X
   const int zMid = (o.z + (int)kNChunk / 2) * (int)kChunk;
   // The throw clears the ground on BOTH sides of the face: the highest column
@@ -536,7 +545,10 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
   uint32_t t = 82000;
   support::TickCursor tick{c, t, IVec3{(faceX - 6) >> 4, hEdge >> 4, zMid >> 4}};
   const uint64_t act0 = c.stream.TicketSet().Stats().activated;
+  const uint64_t low0 = c.stream.TicketSet().Stats().landingsLowered;
   // ---- ARM A: one stone off the +X face at full speed --------------------
+  // It hands over at the first sample past the face, ~48 cells over the
+  // ground; the CPU lowers it onto the ground there and asks for that chunk.
   {
     support::TickOps ops;
     ops.spawns.push_back(Stone({faceX - 2, hEdge + 40, zMid}, vMax, (uint32_t)mStone));
@@ -560,29 +572,34 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
         if (c.stream.TicketSet().StateOf(k) == Tickets::State::Live)
           R.boxLo = c.stream.TicketSet().BoxLo(k);
     }
-    // THE SECOND STONE, once the first ticket is live: thrown the same way a
-    // few cells over, it lands INSIDE the live box and must not open another.
+    // THE SECOND STONE, once the first ticket is live: thrown a few cells
+    // over, slowly enough (1 cell a tick) that it comes down inside the live
+    // box -- flying into its resident chunks, or, if it leaves residency over
+    // the box, handed over and lowered onto a chunk the box holds -- and it
+    // must not open another. (At full speed it would cross the 80-cell box
+    // and hand over past its far side: a second ticket, correctly.)
     if (R.activateTick >= 0 && !second && (int)t - 82000 >= R.activateTick + 2) {
       support::TickOps ops;
-      ops.spawns.push_back(Stone({faceX - 2, hEdge + 40, zMid + 3}, vMax, (uint32_t)mStone));
+      ops.spawns.push_back(Stone({faceX - 2, hEdge + 40, zMid + 3}, vMax / 6, (uint32_t)mStone));
       tick(ops);
       second = true;
     }
     if (second && c.stream.TicketSet().LiveCount() == 0) { R.released = true; break; }
   }
   R.activations = c.stream.TicketSet().Stats().activated - act0;
+  R.loweredA = c.stream.TicketSet().Stats().landingsLowered - low0;
   for (int i = 0; i < 12; i++) tick();  // the keep decision lands, the batch harvests
   c.ctx.WaitIdle();
   R.inStore = CountInStore(c, R.boxLo, (uint32_t)mStone, &R.storeHash);
 
   // ---- ARM B: the cap is full -------------------------------------------
   // Sixteen gate tickets along the -X side, then a stone placed just over the
-  // far ground past the +X face: its requests are REFUSED, it deposits after
-  // PARK_DEPOSIT_TICKS, sits on the CPU as a far landing, and comes back the
-  // tick a ticket over its chunk is granted.
+  // far ground past the +X face: it deposits at once, the CPU lowers it onto
+  // the ground and holds it as a far landing WITHOUT asking (no index is
+  // free), and it comes back the tick a ticket over its chunk is granted.
   const Tickets& T = c.stream.TicketSet();
   const uint64_t refused0 = T.Stats().refusedCap, dep0 = T.Stats().landingsDeposited,
-                 resp0 = T.Stats().landingsRespawned;
+                 resp0 = T.Stats().landingsRespawned, lowB0 = T.Stats().landingsLowered;
   for (uint32_t k = 0; k < kTicketMax; k++) {
     const int cx = o.x - 12, cz = o.z - 40 + 6 * (int)k;
     const int h = World::TerrainHeight(cx * 16 + 8, cz * 16 + 8, kDefaultSeed);
@@ -602,6 +619,7 @@ bool RunLand(Ctx& c, LandRun& R, std::string& why) {
   R.refusedCap = T.Stats().refusedCap - refused0;
   R.deposited = T.Stats().landingsDeposited - dep0;
   R.parkedAtFull = T.Stats().landingsParked;
+  R.loweredB = T.Stats().landingsLowered - lowB0;
   // Free the cap the way the world does (they idle out). The landing does
   // not wait for the window: the step an index is free it asks for a ticket
   // over its own chunk (Tickets::AskForLandings), is re-thrown, lands, and
@@ -648,8 +666,8 @@ Status GateTicketLand(Ctx& c, std::string& detail) {
   IdCounterScope ids(c.mobs);
   LandRun A, B;
   std::string why;
-  const bool okA = RunLand(c, A, why);
-  const bool okB = okA && RunLand(c, B, why);
+  const bool okA = RunLand(c, A, why, /*fillCascade=*/false);
+  const bool okB = okA && RunLand(c, B, why, /*fillCascade=*/true);
   Regenerate(c);
   if (!okA || !okB) {
     detail = why;
@@ -661,29 +679,35 @@ Status GateTicketLand(Ctx& c, std::string& detail) {
                      A.activateTick - A.landTick <= maxLatency;
   const bool oneTicket = A.activations == 1;
   const bool stored = A.released && A.inStore == 2;
-  const bool refused = B.refusedCap > 0 && A.refusedCap > 0;
+  // Option C: both stones that left residency were landed by the CPU on its
+  // own ground (arm A's first, arm B's), in both runs.
+  const bool lowered = A.loweredA >= 1 && A.loweredB == 1 && B.loweredA == A.loweredA &&
+                       B.loweredB == 1;
   const bool deposited = A.deposited == 1 && A.parkedAtFull >= 1;
   const bool cameBack = A.respawned == 1 && A.landedLater == 1 && A.respawnedUnasked == 1;
   const bool same = A.landTick == B.landTick && A.activateTick == B.activateTick &&
                     A.storeHash == B.storeHash && A.inStore == B.inStore &&
-                    A.landedLater == B.landedLater;
+                    A.landedLater == B.landedLater && A.activations == B.activations;
   const bool noFaults = A.faults == 0 && B.faults == 0;
   RecordObserved("ticketLand.latency", (double)(A.activateTick - A.landTick));
-  const bool ok = quick && oneTicket && stored && refused && deposited && cameBack &&
+  const bool ok = quick && oneTicket && stored && lowered && deposited && cameBack &&
                   same && noFaults;
   detail = Format(
       "arm A: stone off the +X face parked at t+%d, ticket live at t+%d (latency %d, "
       "allow %d), %llu ticket(s) opened for TWO stones (want 1), box (%d,%d,%d)+5 "
       "%s, %u stone voxel(s) in the store after (want 2) [particles peak %u, all "
-      "gone at t+%d, far-box kills %u]; arm B (cap full): %llu request(s) "
-      "refused, %llu deposited, %u parked on the CPU (waiting on chunk "
+      "gone at t+%d, far-box kills %u], %llu lowered onto the CPU ground (want "
+      ">= 1); arm B (cap full): %llu request(s) refused (info), %llu lowered (want "
+      "1), %llu deposited, %u parked on the CPU (waiting on chunk "
       "(%d,%d,%d)%s), tickets still live after the cap idled out %u, %llu re-thrown "
       "by its own request once an index freed (want 1), its chunk's ticket %s, "
-      "%llu re-thrown in all, %u landed (want 1); page faults %u/%u; run twice: %s",
+      "%llu re-thrown in all, %u landed (want 1); page faults %u/%u; run twice "
+      "(cascade as left / cascade filled first): %s",
       A.landTick, A.activateTick, A.activateTick - A.landTick, maxLatency,
       (unsigned long long)A.activations, A.boxLo.x, A.boxLo.y, A.boxLo.z,
       A.released ? "released" : "NEVER RELEASED", A.inStore, A.particlesMax,
-      A.particlesGoneAt, A.farKilled, (unsigned long long)A.refusedCap,
+      A.particlesGoneAt, A.farKilled, (unsigned long long)A.loweredA,
+      (unsigned long long)A.refusedCap, (unsigned long long)A.loweredB,
       (unsigned long long)A.deposited, A.parkedAtFull, A.landingChunk.x,
       A.landingChunk.y, A.landingChunk.z, A.landingHeld ? " - STILL HELD" : "",
       A.capLiveAfter, (unsigned long long)A.respawnedUnasked,

@@ -497,8 +497,8 @@ fn prepare() {
 }
 
 // ======================= FAR PATCHES (2026-10-03, raymarch-far) =============
-// raymarch.wgsl FAR_SHADOW_CACHE has the why, the measurement, and why it
-// ships OFF (with it off, no far request is ever made and this never runs). A
+// raymarch.wgsl FAR_SHADOW_CACHE has the why and the measurement; ON since
+// 2026-10-06 (with it off, no far request is ever made and this never runs). A
 // request whose packedSub carries FAR_SC_FLAG is a CASCADE patch: (level, cell
 // toroidal in its level, face, sub-patch, refined). Its value is the fragment
 // shader's own far-pixel formula evaluated at the patch centre — `hp` below is

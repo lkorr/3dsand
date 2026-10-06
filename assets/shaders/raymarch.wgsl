@@ -863,7 +863,9 @@ const RFLAG_GAS : u32 = 8u;
 const RFLAG_GASFAR : u32 = 32u;
 
 // ---- GAS_RUN: crossing a run of one thin gas in trace()'s tight loop -------
-// IMPLEMENTED, EXACT, MEASURED, SHIPS OFF (2026-10-03, raymarch-smoke). With it
+// IMPLEMENTED, EXACT, MEASURED (2026-10-03, raymarch-smoke); ON since 2026-10-06
+// (owner decision: the smoke camera's -1.0 ms bought for +0.2/+0.15 on the
+// fire/village frames). With it
 // on, trace()'s liquid-run loop also takes runs of one non-emissive gas with
 // opacity under GAS_RUN_MAX_OP (see the run, in trace()). Bit-identical picture
 // either way. --render-budget, one process, base2 drift <= 0.16 ms:
@@ -877,10 +879,11 @@ const RFLAG_GASFAR : u32 = 32u;
 // (no steam) costs the same, and those frames' smoke is 70..220/255, which the
 // gate keeps out of the run. It is the code's presence on frames that march
 // dense gas, i.e. what the compiler makes of the media branch with the run
-// beside it. Two of the three gas cameras lose, so the default is off; it is
-// the lever for a thin cloud around the eye (the alchemy bench's ether
-// vapour), and flipping this const re-runs the comparison.
-const GAS_RUN : bool = false;
+// beside it. Two of the three gas cameras lose, which is why it shipped off
+// until the owner took the trade; it is the lever for a thin cloud around the
+// eye (the alchemy bench's ether vapour), and flipping this const re-runs the
+// comparison.
+const GAS_RUN : bool = true;
 const GAS_RUN_MAX_OP : f32 = 0.2;
 
 // ---- THE CROSSFADE WEIGHT (stage 1b) ---------------------------------------
@@ -4388,7 +4391,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool,
     // the first t at which that can stop being true (`tFree`: the inner box's
     // exit, the handoff ramp's start) and hands everything past it back to the
     // outer loop, which fades the cell against the coarse box as it always has.
-    // See GAS_RUN for why it ships off.
+    // See GAS_RUN for the measurement (ON since 2026-10-06).
     let runGas = GAS_RUN && cellLiq == 0.0 && weight > 0.0 && cellOp < GAS_RUN_MAX_OP;
     if (GAS_RUN && cellFire == 0.0 && cellOp > 0.0 &&
         ((cellLiq > 0.0 && waterFrac == 1.0 && voxState(w) == 7u) || runGas) &&
@@ -6687,7 +6690,8 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 }
 
 // ---- THE FAR PATCHES IN THE SHADOW CACHE (2026-10-03, raymarch-far) --------
-// SHIPPED OFF (FAR_SHADOW_CACHE): a visual trade-off, measured and kept wired.
+// ON since 2026-10-06 (owner decision; FAR_SHADOW_CACHE): a visual trade-off,
+// measured, and shipped off until then.
 //
 // A far pixel's sun shadow is a function of where its ray starts, and that
 // start is the hit face lifted half a cell off it — so the ~12-50 pixels that
@@ -6706,7 +6710,8 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // re-run floor there is 0.001% and 0%), max 39 — thin lines along cactus and
 // cell edges, where the pixel's own start and its patch's centre see a
 // shadow edge differently; side by side the crops were indistinguishable.
-// That is above the noise floor, so it ships OFF for an owner decision.
+// That is above the noise floor, so it shipped OFF for an owner decision; the
+// owner took it 2026-10-06.
 //
 // TRIED AND NOT USED: the BILINEAR blend of the four nearest patches (as the
 // near field reads above 4 px) cost ~0.25 ms more than the nearest tap and
@@ -6720,7 +6725,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // key and the verifier). packedCell = the cell TOROIDAL in its level (FAR_N
 // per axis, like farVox) + the 3-bit face; packedSub = sub-patch, refined
 // bit, level - 1. MUST AGREE with shadow_resolve.wgsl's FAR_SC_* consts.
-const FAR_SHADOW_CACHE : bool = false;
+const FAR_SHADOW_CACHE : bool = true;
 const FAR_SC_SUBDIV : u32 = 2u;            // shadow_resolve.wgsl agrees
 const FAR_SC_FLAG : u32 = 0x80000000u;     // shadow_resolve.wgsl agrees
 const FAR_SC_REFINED : u32 = 0x08000000u;  // shadow_resolve.wgsl agrees
@@ -13419,7 +13424,7 @@ fn fs(in : VSOut) -> FSOut {
         // a 0.3 step at 102 m under a zoomed FOV. One law, keyed on distance.
         var sh = 1.0;
         if (SHADOW_CACHE && FAR_SHADOW_CACHE) {
-          // The far patch cache (FAR_SHADOW_CACHE, shipped off): the march
+          // The far patch cache (FAR_SHADOW_CACHE, ON since 2026-10-06): the march
           // is compiled out of fs. A card reads its cell's top patch, lifted
           // as a refined hit's is.
           sh = farShadowCached(flv, far.cell, far.axis, far.sgn, fRefined || fFeat, hitP);

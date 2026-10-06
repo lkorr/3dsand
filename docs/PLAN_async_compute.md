@@ -45,9 +45,11 @@ ends. The options the brief listed, priced:
   wind streaks, shadow prepare: ~1.5 ms), which reads only what the derived
   passes also only read. Upper bound ~1.5 ms (7%) on forestfire, less on
   village (5%).
-* farDown / farFill were NOT moved: particles and gas collide with farVox
-  outside the window (`sim_particle.wgsl` `farBlocked`), so it is sim input,
+* farDown / farFill were NOT moved: particles and gas collided with farVox
+  outside the window (`sim_particle.wgsl` `farBlocked`), so it was sim input,
   and moving one writer of it without the other would reorder their writes.
+  Since 2026-10-06 (far-fill timing #5, option C) no tick kernel reads farVox,
+  so that reason is gone; the move was not re-measured.
 
 ## 2. The design as built
 
