@@ -278,7 +278,7 @@
     "cleaveFrom": 0.5,
     "cutWidthMin": 0.08,
     "stabAlign": 0.7,
-    "stabDepth": 0.35,
+    "stabDepth": 0.8,
     "stabDepthPower": 0.6,
     "stabWidth": 0.4,
     "stabThick": 0.1,
