@@ -9384,8 +9384,8 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
 // ---- crawl-still: a crawler that is NOT GOING ANYWHERE lies still ------------
 //
 // Owner report 2026-09-25: "stationary body crawling still is kicking its
-// legs out". A footless human (crawl.feet: both feet off, the legs kept) on
-// the flat under the immobile `dummy` profile, so nothing but the pose
+// legs out". A shinless human (crawl.shins: both shins off, the thighs kept)
+// on the flat under the immobile `dummy` profile, so nothing but the pose
 // pipeline can move it. Per tick, every leg bone's MODEL-frame direction is
 // compared with the tick before; `legMove` is the largest angle any leg bone
 // turned in one tick, `legSpan` the widest angle a bone wandered over the
@@ -9404,16 +9404,19 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   const MobDef& def = c.mobs.Defs()[defIndex];
+  // THE SHINS, NOT THE FEET (2026-10-06): both feet off is the upright
+  // `stumps` walk now, not a crawl. Taking the shins takes the feet with them
+  // and leaves the thighs, which are the leg bones a crawler still has.
   std::vector<int> legs;
-  int footL = -1, footR = -1;
+  int shinL = -1, shinR = -1;
   for (size_t i = 0; i < def.limbs.size(); i++) {
     const std::string& nm = def.limbs[i].name;
-    if (nm.rfind("leg", 0) == 0) legs.push_back((int)i);
-    if (nm == "foot.L") footL = (int)i;
-    if (nm == "foot.R") footR = (int)i;
+    if (nm.rfind("legU", 0) == 0) legs.push_back((int)i);
+    if (nm == "legL.L") shinL = (int)i;
+    if (nm == "legL.R") shinR = (int)i;
   }
-  if (legs.empty() || footL < 0 || footR < 0) {
-    detail = Format("%s has no legs / feet", def.name.c_str());
+  if (legs.empty() || shinL < 0 || shinR < 0) {
+    detail = Format("%s has no thighs / shins", def.name.c_str());
     return Status::Fail;
   }
   int relief = 0;
@@ -9445,8 +9448,8 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
     return done(Status::Fail);
   }
   for (int i = 0; i < 8; i++) tick();
-  c.mobs.Sever(id, footL);
-  c.mobs.Sever(id, footR);
+  c.mobs.Sever(id, shinL);
+  c.mobs.Sever(id, shinR);
   for (int i = 0; i < 90; i++) tick();   // fall into the state, settle
   const int state = c.mobs.LocoState(id);
 
@@ -9518,8 +9521,8 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
     };
     if (avatar.Spawn(pl, 0.0f)) {
       for (int i = 0; i < 20; i++) avTick();
-      avatar.SeverByName("foot.L");
-      avatar.SeverByName("foot.R");
+      avatar.SeverByName("legL.L");
+      avatar.SeverByName("legL.R");
       for (int i = 0; i < 90; i++) avTick();
       avState = avatar.Locomotion().stateIndex;
       std::vector<Vec3> prevA(legs.size()), firstA(legs.size());

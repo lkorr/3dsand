@@ -371,7 +371,12 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // full crawl plays it as authored. `speedNow_` is already low-passed
   // (avatar.velocityHalflife), which is what makes the stop an ease and not a
   // snap. Only the playhead is scaled (ClipInstance::rate), never the blend.
-  if (loco != nullptr && loco->groundAlign > 0.0f && !loco->clip.empty()) {
+  //
+  // Every CLIP-OWNED state, not just the prone ones (2026-10-06): the upright
+  // `stumps` waddle is the same kind of cycle, and at full rate a footless
+  // body standing still marched on the spot. groundAlign already implies
+  // disableGait (LoadMobDefs warns otherwise), so the prone set is unchanged.
+  if (loco != nullptr && loco->disableGait && !loco->clip.empty()) {
     const int ci = sk.FindClip(loco->clip);
     const float ref =
         std::max(def.speed * std::max(loco->speedScale, 0.05f), 0.5f);

@@ -1215,15 +1215,19 @@ section('L. the rig contract matches assets/mobs/human.json, the standard');
   const byName = Object.fromEntries(mine.states.map(s => [s.name, s]));
   ok(!byName.hop, 'there is no `hop` state: an upright bounce on two ankle ' +
      'stumps is what 96c86d5 removed');
-  ok(byName['crawl.feet'] && byName['crawl.feet'].clip === 'crawl' &&
-     byName['crawl.feet'].groundAlign === 1.0 &&
-     byName['crawl.feet'].disableGait === true,
-     'both feet gone selects the crawl clip, prone and ground-aligned');
+  // 2026-10-06: both feet gone is an UPRIGHT stump walk again, but a waddle
+  // (stumpwalk), not 96c86d5's bounce, and never a crawl -- prone is where a
+  // stray step in lava left the player for the rest of the run.
+  ok(!byName['crawl.feet'], 'both feet gone is no longer a crawl');
+  ok(byName.stumps && byName.stumps.clip === 'stumpwalk' &&
+     byName.stumps.disableGait === true && !byName.stumps.groundAlign &&
+     byName.stumps.speedScale < 0.3,
+     'both feet gone selects the upright stumpwalk clip, slower than a crawl');
   // ONE foot is the derived stump drag (AnimFindStumpLeg), whose predicate is
   // one stump plus one whole leg. An authored rule matching a single foot
   // would shadow it, so the both-feet rule must ask for BOTH.
   for (const s of mine.states)
-    if (s.clip === 'crawl' || s.clip === 'hop')
+    if (s.clip === 'crawl' || s.clip === 'hop' || s.clip === 'stumpwalk')
       ok(!(s.missingAny || []).some(p => p.startsWith('foot.')),
          `state "${s.name}" does not claim the ONE-foot case from the ` +
          'derived stump drag');

@@ -4261,7 +4261,10 @@ const LIMB_BASE = {
   hand:  { hp: 27, severable: true, tag: 'hand', sever: 9.0 },
   legU:  { hp: 66, severable: true, tag: 'leg', sever: 18.0 },
   legL:  { hp: 54, severable: true, tag: 'leg', sever: 16.0 },
-  foot:  { hp: 36, severable: true, tag: 'foot', sever: 12.0 },
+  // 72, doubled from 36 (2026-10-06): a foot is the limb the floor touches
+  // every tick, so a snake bite or a step in acid used to take both and end
+  // the run. Two feet gone is now the `stumps` walk, not a crawl.
+  foot:  { hp: 72, severable: true, tag: 'foot', sever: 12.0 },
 };
 
 /** THE STAND-IN a machine race paints for a material the .vox cannot hold
@@ -4497,23 +4500,28 @@ function buildStates() {
       clip: 'crawl', speedScale: 0.3, disableGait: true, groundAlign: 1.0 },
     { name: 'crawl.shins', missing: ['legL.L', 'legL.R'],
       clip: 'crawl', speedScale: 0.3, disableGait: true, groundAlign: 1.0 },
-    // BOTH FEET GONE IS A CRAWL, NOT A HOP. There used to be a `hop` state
-    // here that kept the body UPRIGHT on two ankle stumps and bounced it, and
-    // it looked exactly as silly as that reads (96c86d5). A body with no feet
-    // has nothing to stand on and pulls itself along by its arms, so it takes
-    // the crawl clip with `groundAlign` like the other prone states — a little
-    // faster than a legless crawl, because the shins are still there to push
-    // with. The `hop` CLIP stays in the library: nothing selects it by damage
-    // now, and something else may yet want it.
+    // BOTH FEET GONE IS A STUMP WALK (2026-10-06). It was a crawl from
+    // 96c86d5 until today: the hop before that was an upright bunny-bounce, so
+    // the body went prone instead. Prone is right physically and wrong as
+    // play -- feet are the limbs the floor touches, lava and acid take them
+    // by accident, and losing both put the player on the ground for the rest
+    // of the run. The body now stays UPRIGHT on its ankle stumps and waddles:
+    // the `stumpwalk` clip owns the legs (stiff short steps, the pelvis hiking
+    // and rolling over each stump, arms out for balance), its playhead follows
+    // the body's speed so standing still is standing still, and the speed is
+    // TANKED -- slower than the legless crawl. No jump (avatar.cpp derives
+    // that from leg+foot liveness). bodyYOffset is the ankle height the
+    // missing feet used to hold the body up by, in 10-vox/m sidecar units
+    // (-0.75 left the stumps 0.5 vox off the floor in --shot-mob).
     //
     // ONE foot gone is deliberately NOT here. That case belongs to the derived
     // stump-drag layer (AnimFindStumpLeg / AnimApplyStumpDrag in anim.cpp),
     // whose predicate is exactly one stump and one whole leg — an authored
     // state matching a single foot would shadow it. This rule requires BOTH,
     // so the two can never both fire. Do not widen it to `missingAny`.
-    { name: 'crawl.feet', missing: ['foot.L', 'foot.R'],
-      clip: 'crawl', speedScale: 0.35, disableGait: true,
-      bodyYOffset: 0.0, groundAlign: 1.0 },
+    { name: 'stumps', missing: ['foot.L', 'foot.R'],
+      clip: 'stumpwalk', speedScale: 0.2, disableGait: true,
+      bodyYOffset: -1.25 },
     { name: 'limp',
       missingAny: ['legU.L', 'legL.L', 'foot.L', 'legU.R', 'legL.R', 'foot.R'],
       clip: 'limp', speedScale: 0.55 },

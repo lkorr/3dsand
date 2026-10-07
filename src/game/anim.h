@@ -541,7 +541,8 @@ void AnimDragDeadLegs(const AnimSkeleton& sk, AnimState& st,
 // effector is severed, its bones are not, and the other leg is whole", which is
 // exactly the anatomy that makes a drag possible. A body that has lost the
 // whole leg has nothing to drag and keeps the authored `limp` hop; a body that
-// has lost both feet is already a crawler (crawl.feet) and matches neither.
+// has lost both feet walks upright on both stumps (the authored `stumps`
+// state) and matches neither.
 struct AnimStump {
   int chain = -1;      // leg chain whose effector (the foot) is gone
   int tip = -1;        // deepest SURVIVING bone in it — the stump itself

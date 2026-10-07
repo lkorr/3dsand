@@ -510,7 +510,7 @@
       "name": "foot.L",
       "parent": "legL.L",
       "joint": "hinge",
-      "hp": 36,
+      "hp": 72,
       "severable": true,
       "tag": "foot",
       "axis": [
@@ -584,7 +584,7 @@
       "name": "foot.R",
       "parent": "legL.R",
       "joint": "hinge",
-      "hp": 36,
+      "hp": 72,
       "severable": true,
       "tag": "foot",
       "axis": [
@@ -788,16 +788,15 @@
       "groundAlign": 1
     },
     {
-      "name": "crawl.feet",
+      "name": "stumps",
       "missing": [
         "foot.L",
         "foot.R"
       ],
-      "clip": "crawl",
-      "speedScale": 0.35,
+      "clip": "stumpwalk",
+      "speedScale": 0.2,
       "disableGait": true,
-      "bodyYOffset": 0,
-      "groundAlign": 1
+      "bodyYOffset": -1.25
     },
     {
       "name": "limp",

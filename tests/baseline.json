@@ -792,7 +792,7 @@
   "crawlSlopeMinCrawlVox": "10.0",
   "crawlSlopeMinSamples": "25",
   "crawlSlopeBreakSpreadVox": "0.6",
-  "_crawlStill_about": "Thresholds for `crawl-still`: a footless human lying still (NPC under the immobile dummy profile, and the PLAYER avatar under a scripted still Player) must not move its leg bones. LegMoveDeg = largest per-tick turn of any leg bone in the model frame, LegSpanDeg = widest wander over the window. The look-around and turn-in-place sweeps are reported, not asserted (turning legitimately sweeps the legs over new ground). crawlSlopeFloatVox went 2.5 -> 3.5 on 2026-09-25 when the owner asked the prone body raised two voxels (kProneEmbedVox 1.5 -> -0.5).",
+  "_crawlStill_about": "Thresholds for `crawl-still`: a shinless human (crawl.shins; both FEET off is the upright `stumps` walk since 2026-10-06) lying still (NPC under the immobile dummy profile, and the PLAYER avatar under a scripted still Player) must not move its leg bones. LegMoveDeg = largest per-tick turn of any leg bone in the model frame, LegSpanDeg = widest wander over the window. The look-around and turn-in-place sweeps are reported, not asserted (turning legitimately sweeps the legs over new ground). crawlSlopeFloatVox went 2.5 -> 3.5 on 2026-09-25 when the owner asked the prone body raised two voxels (kProneEmbedVox 1.5 -> -0.5).",
   "crawlStillTicks": "150",
   "crawlStillLegMoveDeg": "1.0",
   "crawlStillLegSpanDeg": "3.0",
