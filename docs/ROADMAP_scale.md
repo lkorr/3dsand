@@ -619,6 +619,16 @@ body" policy. The far field's shift/fill bandwidth was worked by perf audit P3
 system WAS later built (`PLAN_water_master.md`), as a CA overlay rather than a
 coarse solver.
 
+**2026-10-06: §3.5 built for in-place reactions only, measured, SHELVED**
+(branch `shelved/temporal-rate-lod`, `aa1c777`). Survival-matched coarse rolls
+were faithful (gate `rate-lod`: fire statistics within ~2-8% at N=8), but
+`--perf` village-fire CA 7.23 -> 7.29 ms on and forestfire 3.57 -> 3.72: only
+~1-5 of ~3,800 fire chunks are ever reaction-only, because what a fire's
+reactions make (flames, smoke, ash falling into holes) MOVES, and movement ran
+every tick by design. The "~3-4x" above assumed coarse movement too; the lever
+left is far gas movement / gas stage 2, not reaction rates. Async compute
+(§3.6) landed later as `5378b41`, OFF (measured slower).
+
 Constraints that outrank everything here, restated so no optimization erodes
 them: rule 1 (bit-determinism: integer sim, stateless RNG, ≤1-cell writes, no
 scheduling-dependent outcomes), rule 2 (cost scales with activity — every new
