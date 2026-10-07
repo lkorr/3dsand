@@ -2464,7 +2464,7 @@ void Overlay::DrawDevDebug(UIState& s) {
         {"Z", "magic mode"},         {"F3", "collision boxes"},
         {"F4", "vector field"},      {"F5", "reload shaders + tuning"},
         {"R", "reload materials"},   {"F7", "regen world"},
-        {"F9 / F10", "save / load"},
+        {"F9 / F10", "save / load"}, {"F12", "bug report (screenshot + text)"},
     };
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_SizingFixedFit)) {
       for (const auto& k : kKeys) {

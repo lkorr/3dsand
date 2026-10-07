@@ -120,6 +120,7 @@
 #include "test/support.h"
 #include "test/tickrig.h"   // support::TickRig: the --shot-* harnesses tick TickAuthority
 #include "test/treefixture.h"
+#include "ui/bugreport.h"
 #include "ui/item_stage.h"
 #include "ui/overlay.h"
 #include "world/refs.h"
@@ -7580,7 +7581,7 @@ int main(int argc, char** argv) {
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
 
-  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eF11, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF8, eF9, eF10, eF11, eF12, eR, eEsc, eLBracket, eRBracket, eJump,
       eJ, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
   // THE HANDS (dual wielding, 2026-09-27): Q puts the selected hotbar stack
   // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
@@ -7596,6 +7597,13 @@ int main(int argc, char** argv) {
   // What `captured` was before a conversation freed the cursor (the
   // captureBeforeUi rule, for the panel).
   bool talkWasOpen = false, captureBeforeTalk = true;
+  // THE BUG REPORT (F12, ui/bugreport.h). `bugShotPending` redirects THIS
+  // frame's render into a copyable texture (the swapchain image is not one);
+  // the panel's open/close edge saves and restores pause + cursor capture the
+  // way the conversation does.
+  bool bugShotPending = false;
+  bool bugWasOpen = false, bugPausedBefore = false, bugCaptureBefore = true;
+  std::string bugContext;  // the world at the report's FIRST picture
   // (G has no KeyEdge: it is a hold-aware binding — tap to take, hold to
   // drag or, with a throwable vessel in hand, to throw — see the block by
   // `takeE` — and an edge tracker would only be half of it.)
@@ -11969,11 +11977,48 @@ int main(int argc, char** argv) {
     //             character screen open on purpose — F1/F5/F9 must not become
     //             unreachable because a menu is up.
     const bool uiTyping = overlay.WantsKeyboard();
-    const bool devKeys = !uiTyping;
+    // The bug report panel owns the keyboard too: it pauses the world for
+    // typing, and an I or Esc landing under it would move the cursor capture
+    // the panel is holding.
+    const bool devKeys = !uiTyping && !ui.bug.open;
     // The editor (F8) owns the keyboard and the mouse while it is on: no game
     // binding may fire under it (its own keys are read through ImGui).
     const bool edActive = editorMode.Active();
-    const bool gameKeys = !ui.inventoryOpen && !ui.talk.open && !uiTyping && !edActive;
+    const bool gameKeys =
+        !ui.inventoryOpen && !ui.talk.open && !uiTyping && !edActive && !ui.bug.open;
+    // F12: photograph this frame for a bug report (the panel opens once the
+    // picture is in). Shift+F12 while collecting goes back to the panel
+    // without a new picture. Read every frame so the edge stays honest.
+    {
+      const bool f12 = eF12.Pressed(key(GLFW_KEY_F12));
+      if (f12 && !uiTyping && !ui.bug.open) {
+        const bool shift = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
+        if (shift && ui.bug.collecting && !ui.bug.shots.empty()) {
+          ui.bug.open = true;
+          ui.bug.focusText = true;
+        } else {
+          bugShotPending = true;
+          ui.bug.hideForShot = true;  // the folded strip stays out of the picture
+        }
+      }
+      // SANDVOX_BUGREPORT_SCRIPT=1 with --frames: the whole F12 loop, no hands
+      // -- a picture, text, "add another", a second picture, a photograph of
+      // the panel itself, submit. Writes a real bug_reports/<stamp>/.
+      static const bool bugScript = std::getenv("SANDVOX_BUGREPORT_SCRIPT") != nullptr;
+      if (bugScript) {
+        const uint64_t f = frameCounter;
+        if (f == 120 || f == 160) {
+          bugShotPending = true;
+          ui.bug.hideForShot = true;
+        }
+        if (f == 130) {
+          ui.bug.text = "scripted report: the first picture, then 'add another' and a second.";
+          ui.bug.wantAddAnother = true;
+        }
+        if (f == 175) g_shotJumpPath = "screenshot_bugreport_panel.bmp";
+        if (f == 180) ui.bug.wantSubmit = true;
+      }
+    }
     // F8: into the editor -- pause, free the cursor, detach the camera.
     auto enterEditor = [&]() {
       edPausedBefore = ui.paused;
@@ -12197,6 +12242,60 @@ int main(int argc, char** argv) {
     if (ui.talk.pick != 0) {
       feeder.Talk(ui.talk.pick);
       ui.talk.pick = 0;
+    }
+    // ---- THE BUG REPORT (F12, ui/bugreport.h): the panel's latches ---------
+    {
+      UIState::BugReportUI& br = ui.bug;
+      auto clearReport = [&] {
+        br.shots.clear();
+        br.text.clear();
+        br.open = br.collecting = br.discardArmed = false;
+        bugContext.clear();
+      };
+      if (br.wantRemove >= 0) {
+        if (br.wantRemove < (int)br.shots.size()) br.shots.erase(br.shots.begin() + br.wantRemove);
+        br.wantRemove = -1;
+      }
+      if (br.wantAddAnother) {
+        br.wantAddAnother = false;
+        br.open = false;
+        br.collecting = true;
+        br.discardArmed = false;
+      }
+      if (br.wantDiscard) {
+        br.wantDiscard = false;
+        clearReport();
+      }
+      if (br.wantSubmit) {
+        br.wantSubmit = false;
+        std::string dir, err;
+        if (WriteBugReport(AssetDir() + "/../bug_reports", br, bugContext, dir, err)) {
+          std::printf("bug report: wrote %s (%zu picture%s)\n", dir.c_str(), br.shots.size(),
+                      br.shots.size() == 1 ? "" : "s");
+          br.toast = "bug report saved: " + dir;
+          clearReport();
+        } else {
+          std::fprintf(stderr, "bug report: FAILED in %s: %s\n", dir.c_str(), err.c_str());
+          br.toast = "bug report NOT saved: " + err;
+        }
+        br.toastLeft = 6.0f;
+      }
+      // Open pauses and frees the cursor; close hands both back as they were.
+      if (br.open != bugWasOpen) {
+        bugWasOpen = br.open;
+        if (br.open) {
+          bugPausedBefore = ui.paused;
+          bugCaptureBefore = captured;
+          ui.paused = true;
+          captured = false;
+        } else {
+          ui.paused = bugPausedBefore;
+          captured = bugCaptureBefore;
+        }
+        glfwSetInputMode(window, GLFW_CURSOR,
+                         captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+        glfwGetCursorPos(window, &mx0, &my0);
+      }
     }
     // A contract picked on the demon strip (demons D5): presented by the tick.
     if (ui.demonTalk.presentPick != 0) {
@@ -14507,6 +14606,30 @@ int main(int argc, char** argv) {
     double tAcquire0 = NowSeconds();
     rhi::TextureView target = ctx.AcquireFrame();
     double tRender0 = NowSeconds();
+    // ---- F12's picture: THIS frame, as presented -----------------------------
+    // The swapchain image has no TRANSFER_SRC usage, so the frame renders into
+    // a copyable texture of the same size and format instead, which is then
+    // blitted to the swapchain (presented as usual) and read back. Exactly the
+    // pixels the player saw — TAA, scaled render, particles, HUD — rather than
+    // a re-recorded approximation. Needs a blittable swapchain; without one
+    // the request is dropped with a line saying so.
+    rhi::TextureView swapTarget = target;
+    rhi::Texture bugShotTex;
+    const bool bugShotNow = bugShotPending && target && ctx.SwapchainBlittable();
+    if (bugShotPending && target && !bugShotNow) {
+      std::fprintf(stderr, "bug report: swapchain is not blittable here; no picture\n");
+      bugShotPending = false;
+      ui.bug.hideForShot = false;
+    }
+    if (bugShotNow) {
+      bugShotTex = ctx.device.CreateTexture(
+          {ctx.width, ctx.height, 1}, ctx.surfaceFormat,
+          // CopyDst too: the scaled-render path BLITS the world up into it.
+          rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc |
+              rhi::TextureUsage::CopyDst,
+          "bugShot");
+      target = bugShotTex.CreateView();
+    }
     if (target) {
       // RenderEyePos, not EyePos, and the difference is now TWO corrections
       // rather than one:
@@ -17839,6 +17962,7 @@ int main(int argc, char** argv) {
       // ...and while talking: the conversation panel sits where the hotbar is.
       if (!ui.inventoryOpen && !ui.talk.open && !editorMode.Active()) overlay.DrawHUD(ui);
       overlay.Draw(ui);
+      DrawBugReport(ui);  // F12 (ui/bugreport.h): over everything, or nothing in the shot frame
       // ---- THE EDITOR (F8): its panels, overlays and input, then its world
       // preview through the MutationQueue: the open house's changed cells
       // become cell ops (PrefabPlacer, drained inside the tick) and ONE tick
@@ -19132,7 +19256,61 @@ int main(int argc, char** argv) {
           liveStatsOn && telemetry.HasClient() &&
           liveStats.Encode(enc, world, liveFrameNo);
       double tPresent0 = NowSeconds();
+      if (bugShotNow) enc.BlitTexture(target, swapTarget);
       ctx.queue.Submit(enc.Finish());
+      if (bugShotNow) {
+        // A user-pressed key, once: the blocking readback is a one-frame
+        // hitch on purpose, not a frame-path cost (CLAUDE.md rule 3 is about
+        // the per-frame path). Own encoder after the render retired, the
+        // shape the --shot-inventory path below found necessary.
+        const uint32_t W = ctx.width, H = ctx.height;
+        rhi::Buffer shotBuf = CreateBuffer(
+            ctx.device, (uint64_t)W * H * 4,
+            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "bugShotRead");
+        ctx.WaitIdle();
+        rhi::CommandEncoder cenc = ctx.device.CreateCommandEncoder();
+        rhi::TexelCopyTexture src{};
+        src.texture = bugShotTex;
+        rhi::TexelCopyBuffer dst{};
+        dst.buffer = shotBuf;
+        dst.bytesPerRow = W * 4;
+        dst.rowsPerImage = H;
+        cenc.CopyTextureToBuffer(src, dst, {W, H, 1});
+        ctx.queue.Submit(cenc.Finish());
+        ctx.WaitIdle();
+        std::vector<uint8_t> px((size_t)W * H * 4, 0);
+        if (rhi::ReadBufferBlocking(ctx.device, shotBuf, 0, px.data(), px.size())) {
+          if (ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm)
+            for (size_t i = 0; i < px.size(); i += 4) std::swap(px[i], px[i + 2]);
+          if (ui.bug.shots.empty()) {
+            // The world at the FIRST picture: where, when, what the
+            // crosshair was on. Later pictures are the player's to explain.
+            const Vec3 eye = player.EyePos();
+            const int hm = ui.hoverMat;
+            char c[1024];
+            std::snprintf(
+                c, sizeof c,
+                "- map: %s\n- eye: (%.2f, %.2f, %.2f)  yaw %.1f deg  pitch %.1f deg\n"
+                "- sim tick: %u%s\n- frame: %.0f fps, %.1f ms\n- window: %ux%u\n"
+                "- crosshair material: %s\n- render scale: %.2f\n",
+                refsMapName().c_str(), eye.x, eye.y, eye.z, cam.yaw * 57.2957795f,
+                cam.pitch * 57.2957795f, tick, ui.paused ? " (paused)" : "", ui.fps,
+                ui.frameMs, W, H,
+                hm > 0 && hm < (int)ui.materialNames.size() ? ui.materialNames[hm].c_str() : "-",
+                CurrentTuning().render.renderScale);
+            bugContext = c;
+          }
+          BugReportAddShot(ui, std::move(px), W, H);
+          ui.bug.open = true;
+          ui.bug.collecting = false;
+          ui.bug.focusText = true;
+          std::printf("bug report: picture %zu taken\n", ui.bug.shots.size());
+        } else {
+          std::fprintf(stderr, "bug report: readback failed; no picture\n");
+        }
+        bugShotPending = false;
+        ui.bug.hideForShot = false;
+      }
 
       // ---- --shot-inventory: the same frame again, into a file -------------
       // A presented swapchain image cannot be copied, so the frame is

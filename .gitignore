@@ -66,3 +66,6 @@ assets/structures/_gate/
 spellbook*.json
 spellbook*.json.bak
 spellbook*.json.tmp
+
+# F12 bug reports (ui/bugreport.h): local, not source
+bug_reports/

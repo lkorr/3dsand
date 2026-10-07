@@ -726,6 +726,8 @@ add_library(sandvox_core OBJECT
   src/ui/item_stage.cpp
   # The conversation panel (pixel art, ui/dialogue_ui.h).
   src/ui/dialogue_ui.cpp
+  # F12: screenshot(s) + text into bug_reports/<stamp>/ (ui/bugreport.h).
+  src/ui/bugreport.cpp
   # demons D5: the contract editor and the demon conversation's strip.
   src/ui/contract_ui.cpp
   # F1 -> World -> References: the ref list + inspector (world/refs.h).

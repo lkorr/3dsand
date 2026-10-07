@@ -1297,6 +1297,29 @@ struct UIState {
     int pick = 0;      // intent latch, 0 = none
     int hover = -1;    // which row the mouse is on (drawing only)
   } talk;
+  // ---- THE BUG REPORT (F12, ui/bugreport.h) ---------------------------------
+  // The report being written: its pictures (full RGBA, kept until submit or
+  // discard) and its text. main.cpp owns capture, pause and cursor; the panel
+  // writes the latches.
+  struct BugReportUI {
+    struct Shot {
+      uint32_t w = 0, h = 0;
+      std::vector<uint8_t> rgba;     // top row first
+      uint32_t tw = 0, th = 0;       // the mosaic thumbnail, in cells
+      std::vector<uint32_t> thumb;   // IM_COL32 order
+    };
+    bool open = false;          // the panel is up: world paused, cursor free
+    bool collecting = false;    // "add another": panel folded, F12 appends
+    bool hideForShot = false;   // this frame is the photograph: draw none of it
+    bool focusText = false;     // put the caret in the text box next frame
+    bool discardArmed = false;  // discard asks twice
+    std::string text;
+    std::vector<Shot> shots;
+    bool wantSubmit = false, wantAddAnother = false, wantDiscard = false;
+    int wantRemove = -1;
+    std::string toast;          // "saved to ..." after a submit
+    float toastLeft = 0.0f;     // seconds the toast stays up (panel counts down)
+  } bug;
   // The Spawn page's Dialogue section (the dev hook until P7 wires NPCs).
   std::vector<std::string> dialogueNames;
   int dialoguePick = 0;
