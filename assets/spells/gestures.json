@@ -1,0 +1,80 @@
+{
+  "comment": "HOW THE ARM CASTS A SPELL (src/game/spellgesture.h). A delivery glyph in glyphs.json names one of these by its `gesture` (the implicit hand in its `hand` block); `default` is what a delivery naming none plays. Each gesture is keyframes for the casting HAND, offset from its shoulder, in REACHES (the arm's full length, so one gesture fits any rig), as [forward, up, out]: forward is the aim (frame `aim`, pitched with the view) or the body's level facing (frame `body`); up is world up squared to it; out is away from the body on the casting hand's side, so a left-hand cast mirrors itself. t = 0 is implicit: the hand where the animation had it when the button went down. `t` is ms, rising. `pole` [forward, up, out] is where the ELBOW bulges, carried to later keys until one says otherwise (default [0, -1, 0], elbow down). `twist` is torso yaw in degrees, + turns the casting side's shoulder BACK (the wind-up), - across (the follow-through); `pitch` is chest pitch, + up. `ease` is the curve INTO the key: smooth | linear | in (gathers speed) | out (fastest as it leaves). `releaseMs` is when the spell LEAVES THE HAND - the cast happens on that tick, from where the hand is then, along the aim then; `holdMs` (a beam) is where the gesture's clock stops while the cast button stays down. Times are rounded up to 30 Hz ticks at load. Hot-reloads on R with glyphs.json.",
+  "default": "push",
+  "gestures": {
+    "push": {
+      "comment": "The bare hand (no delivery word): drawn back a little and pushed out flat along the aim, the palm presenting the spell at reach.",
+      "frame": "aim",
+      "releaseMs": 150,
+      "keys": [
+        { "t": 70, "hand": [0.40, 0.12, 0.02], "twist": 6 },
+        { "t": 170, "hand": [0.95, 0.0, 0.0], "ease": "out", "twist": -5 },
+        { "t": 370, "hand": [0.93, 0.0, 0.0], "twist": 0 }
+      ]
+    },
+    "throw": {
+      "comment": "projectile: an overhand throw. The hand rises beside the head with the shoulder turned back, whips forward over the top and lets go as the arm comes level, then follows through low and across.",
+      "frame": "aim",
+      "releaseMs": 250,
+      "keys": [
+        { "t": 150, "hand": [-0.10, 0.55, 0.32], "pole": [-0.3, -0.5, 1.0], "twist": 25, "pitch": 4 },
+        { "t": 250, "hand": [0.90, 0.12, 0.05], "pole": [0.0, -1.0, 0.3], "ease": "in", "twist": -18, "pitch": -2 },
+        { "t": 400, "hand": [0.62, -0.32, -0.12], "ease": "out", "twist": -12, "pitch": -5 },
+        { "t": 560, "hand": [0.55, -0.22, 0.0], "twist": 0, "pitch": 0 }
+      ]
+    },
+    "flick": {
+      "comment": "bolt: a snap. A short cock beside the cheek and the arm shot straight out; the dart is gone before the elbow locks.",
+      "frame": "aim",
+      "releaseMs": 100,
+      "keys": [
+        { "t": 60, "hand": [0.30, 0.22, 0.12], "twist": 8 },
+        { "t": 130, "hand": [0.97, 0.02, 0.0], "ease": "out", "twist": -6 },
+        { "t": 300, "hand": [0.92, 0.0, 0.0], "twist": 0 }
+      ]
+    },
+    "lob": {
+      "comment": "lob and bomb: underhand. The arm swings down and back past the hip with a small lean, comes up through the front and lets the ball go rising, and follows through up.",
+      "frame": "aim",
+      "releaseMs": 320,
+      "keys": [
+        { "t": 200, "hand": [-0.20, -0.80, 0.22], "pole": [-1.0, -0.2, 0.3], "twist": 15, "pitch": -6 },
+        { "t": 340, "hand": [0.70, 0.30, 0.05], "pole": [0.0, -1.0, 0.2], "twist": -10, "pitch": 4 },
+        { "t": 480, "hand": [0.55, 0.62, 0.0], "ease": "out", "pole": [0.0, -1.0, 0.3], "twist": -5, "pitch": 6 },
+        { "t": 640, "hand": [0.50, 0.40, 0.0], "twist": 0, "pitch": 0 }
+      ]
+    },
+    "present": {
+      "comment": "orb: the hand gathers it in to the chest and pushes it out slowly, letting go at the end of the push - something heavy and weightless being set adrift.",
+      "frame": "aim",
+      "releaseMs": 380,
+      "keys": [
+        { "t": 180, "hand": [0.24, 0.05, -0.10], "twist": -4, "pitch": 3 },
+        { "t": 420, "hand": [0.88, 0.05, 0.0], "ease": "out", "twist": -2 },
+        { "t": 620, "hand": [0.85, 0.02, 0.0], "twist": 0, "pitch": 0 }
+      ]
+    },
+    "beam": {
+      "comment": "beam: up and out to full reach, and HELD there while the button is (holdMs): the arm is the beam's barrel.",
+      "frame": "aim",
+      "releaseMs": 150,
+      "holdMs": 180,
+      "keys": [
+        { "t": 90, "hand": [0.45, 0.10, 0.05], "twist": 5 },
+        { "t": 180, "hand": [0.96, 0.0, 0.0], "ease": "out", "twist": -4 },
+        { "t": 420, "hand": [0.94, 0.0, 0.0], "twist": 0 }
+      ]
+    },
+    "self": {
+      "comment": "self: the hand comes up in front and the open palm is drawn back against the sternum - the spell goes INTO you. Level body frame: looking at the sky does not lift the hand to your face.",
+      "frame": "body",
+      "releaseMs": 330,
+      "keys": [
+        { "t": 170, "hand": [0.34, 0.05, 0.05], "twist": 0 },
+        { "t": 320, "hand": [0.20, -0.14, -0.30], "ease": "in", "twist": -10, "pitch": -8 },
+        { "t": 520, "hand": [0.20, -0.14, -0.29], "twist": -8, "pitch": -6 },
+        { "t": 720, "hand": [0.28, -0.18, 0.05], "twist": 0, "pitch": 0 }
+      ]
+    }
+  }
+}

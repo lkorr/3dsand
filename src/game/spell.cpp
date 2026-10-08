@@ -566,6 +566,102 @@ bool ParseSpellVerb(const std::string& s, SpellVerb& out) {
 
 // ---- loading ---------------------------------------------------------------
 
+// gestures.json (game/spellgesture.h). Every number is checked here, because
+// the release tick decides when a cast happens and a malformed key would
+// otherwise throw the arm somewhere the IK cannot reach.
+static bool LoadSpellGestures(const json& j, SpellGestureLib& out, std::string& errors) {
+  out = SpellGestureLib{};
+  if (!j.contains("gestures") || !j["gestures"].is_object()) {
+    errors += "gestures: missing \"gestures\" object\n";
+    return false;
+  }
+  auto vec3 = [](const json& a, Vec3& v) {
+    if (!a.is_array() || a.size() != 3) return false;
+    for (const json& x : a)
+      if (!x.is_number()) return false;
+    v = Vec3{a[0].get<float>(), a[1].get<float>(), a[2].get<float>()};
+    return true;
+  };
+  for (auto it = j["gestures"].begin(); it != j["gestures"].end(); ++it) {
+    const json& gj = it.value();
+    const std::string where = "gestures: \"" + it.key() + "\" ";
+    if (!gj.is_object()) {
+      errors += where + "is not an object\n";
+      return false;
+    }
+    SpellGesture g;
+    g.name = it.key();
+    const std::string fr = gj.value("frame", std::string("aim"));
+    if (fr == "aim") g.frame = GestureFrame::Aim;
+    else if (fr == "body") g.frame = GestureFrame::Body;
+    else {
+      errors += where + "has frame \"" + fr + "\" (aim | body)\n";
+      return false;
+    }
+    if (!gj.contains("keys") || !gj["keys"].is_array() || gj["keys"].empty() ||
+        gj["keys"].size() > 16) {
+      errors += where + "needs 1..16 \"keys\"\n";
+      return false;
+    }
+    int32_t lastT = 0;
+    Vec3 pole{0, -1, 0};
+    for (const json& kj : gj["keys"]) {
+      GestureKey k;
+      k.tMs = kj.value("t", 0);
+      if (k.tMs <= lastT || k.tMs > 4000) {
+        errors += where + "key t " + std::to_string(k.tMs) +
+                  " must rise past the last (and t = 0 is the live hand), at most 4000\n";
+        return false;
+      }
+      lastT = k.tMs;
+      if (!kj.contains("hand") || !vec3(kj["hand"], k.hand) || k.hand.len() > 1.0f) {
+        errors += where + "key t " + std::to_string(k.tMs) +
+                  " needs \"hand\": [forward, up, out] within one reach\n";
+        return false;
+      }
+      // The pole carries over from the key before when a key does not say.
+      if (kj.contains("pole") && (!vec3(kj["pole"], pole) || pole.len() < 1e-3f)) {
+        errors += where + "key t " + std::to_string(k.tMs) + " has a bad \"pole\"\n";
+        return false;
+      }
+      k.pole = pole;
+      k.twistDeg = std::clamp(kj.value("twist", 0.0f), -60.0f, 60.0f);
+      k.pitchDeg = std::clamp(kj.value("pitch", 0.0f), -45.0f, 45.0f);
+      const std::string e = kj.value("ease", std::string("smooth"));
+      if (e == "smooth") k.ease = GestureEase::Smooth;
+      else if (e == "linear") k.ease = GestureEase::Linear;
+      else if (e == "in") k.ease = GestureEase::In;
+      else if (e == "out") k.ease = GestureEase::Out;
+      else {
+        errors += where + "has ease \"" + e + "\" (smooth | linear | in | out)\n";
+        return false;
+      }
+      g.keys.push_back(k);
+    }
+    const int32_t releaseMs = gj.value("releaseMs", 0);
+    const int32_t holdMs = gj.value("holdMs", -1);
+    if (releaseMs < 0 || releaseMs > lastT) {
+      errors += where + "releaseMs must be within its keys (0.." + std::to_string(lastT) + ")\n";
+      return false;
+    }
+    if (holdMs >= 0 && (holdMs < releaseMs || holdMs > lastT)) {
+      errors += where + "holdMs must be -1 or between releaseMs and the last key\n";
+      return false;
+    }
+    g.releaseTicks = GestureMsToTicks(releaseMs);
+    g.holdTicks = holdMs < 0 ? -1 : std::max(g.releaseTicks, GestureMsToTicks(holdMs));
+    g.endTicks = std::max(g.releaseTicks, GestureMsToTicks(lastT));
+    out.gestures.push_back(std::move(g));
+  }
+  const std::string def = j.value("default", std::string());
+  out.fallback = out.Find(def);
+  if (out.fallback < 0) {
+    errors += "gestures: \"default\" names no gesture (\"" + def + "\")\n";
+    return false;
+  }
+  return true;
+}
+
 bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
                 GlyphLibrary& out, std::string& errors) {
   out = GlyphLibrary{};
@@ -675,6 +771,7 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
     out.hand.reach = ClampI(h.value("reach", 3), 0, 64);
     out.hand.impactRadius = ClampI(h.value("impactRadius", 1), 0, 8);
     if (h.contains("desc")) out.hand.desc = h["desc"].get<std::string>();
+    out.hand.gestureName = h.value("gesture", std::string());
   }
 
   if (!j.contains("glyphs") || !j["glyphs"].is_array()) {
@@ -899,6 +996,9 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
         // What the describe line calls one of these. Content: a modder's
         // `comet` reads as "a comet" without a line of C++.
         d.noun = g.value("noun", d.id);
+        // How the arm casts it, by name (game/spellgesture.h); resolved
+        // against gestures.json once the whole file is read.
+        d.gestureName = g.value("gesture", std::string());
         break;
       }
       case GlyphSort::Separator: {
@@ -1044,7 +1144,61 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   for (size_t i = 0; i < mats.size(); i++)
     out.crumbles[i] = mats[i].gpu.klass == CLASS_POWDER &&
                       (mats[i].gpu.flags & kMatFlagWander) == 0u;
+
+  // THE GESTURES (game/spellgesture.h): gestures.json BESIDE this file, so
+  // every caller that loads the glyphs — the game, the tuner's server, every
+  // gate — gets the same throws without learning a second path. No file is
+  // not an error: there are then no gestures, and a cast leaves on the press.
+  {
+    const size_t slash = path.find_last_of("/\\");
+    const std::string gpath =
+        (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) +
+        "/gestures.json";
+    std::ifstream gf(gpath);
+    if (gf) {
+      json gj;
+      try {
+        gf >> gj;
+      } catch (const std::exception& e) {
+        errors += std::string("gestures: parse error: ") + e.what() + "\n";
+        return false;
+      }
+      if (!LoadSpellGestures(gj, out.gestures, errors)) return false;
+    }
+    // A name that resolves to nothing is a diagnostic, not a silent default
+    // (DESIGN.md §6): a typo would otherwise cast with the wrong arm forever.
+    auto resolve = [&](GlyphDef& d) {
+      d.gesture = -1;
+      if (d.gestureName.empty() || out.gestures.gestures.empty()) return true;
+      d.gesture = out.gestures.Find(d.gestureName);
+      if (d.gesture >= 0) return true;
+      errors += "glyphs: \"" + d.id + "\" names unknown gesture \"" + d.gestureName +
+                "\" (gestures.json)\n";
+      return false;
+    };
+    if (!resolve(out.hand)) return false;
+    for (GlyphDef& d : out.glyphs)
+      if (d.sort == GlyphSort::Delivery && !resolve(d)) return false;
+  }
   return true;
+}
+
+int CastGesture(const GlyphLibrary& lib, const CastList& list) {
+  if (list.casts.empty()) return -1;
+  // Rule 2: a delivery word BOXES what was said before it, and the box rides
+  // the implicit hand as a Launch - so `fire bolt` is the hand launching a
+  // bolt, and the arm throws the BOLT. Only a hand that launches nothing is
+  // the bare hand's gesture.
+  const SpellCast& c = list.casts[0];
+  int glyph = c.delivery.glyph;
+  if (glyph < 0)
+    for (const EffectInst& e : c.payload)
+      if (e.verb == SpellVerb::Launch && !e.launch.empty()) {
+        glyph = e.launch[0].glyph;
+        break;
+      }
+  const GlyphDef& d = lib.Delivery(glyph);
+  return d.gesture >= 0 ? d.gesture : lib.gestures.fallback;
 }
 
 // ---- parse (the three rules) ---------------------------------------------------

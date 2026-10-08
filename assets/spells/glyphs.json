@@ -1,5 +1,5 @@
 {
-  "comment": "Glyphs are CONTENT, like materials.json and reactions.json. A glyph is a word of the ancient language; docs/PLAN_magic_grammar.md is the grammar and scripts/magic_grammar.py the executable reference the C++ parser is checked against (`--gate spells-oracle`). Five sorts: matter (a material BY NAME, resolved to a 12-bit id at load; `air` is the void, `anything` the wildcard), effect (something that happens at a point: verb + params), delivery (how an effect reaches a point: mech instant | flight | continuous, plus the record fields), mod (a field edit on the delivery record: field/op/amount, applied again per repetition), operator (verb + valence: `left`/`right` list the sorts each slot accepts or `any`, `result` is the sort produced). Every unary operator takes the word BEFORE it; only an infix operator has both slots. Costs are integer: `word` is the small fixed cost of saying it; the real price is the tariff on what the cast does to the world (budgets.rates x the per-material `arcane` value in materials.json). Hot-reloads on R alongside materials.json. A delivery's `speed` is voxels per tick at 30 Hz and may be fractional (4.8 = 14.4 m/s); a flight collides with the CPU mirror, then the chunk cache it prefetches ahead of itself, then the ground contract, and with bodies by ray. A delivery's `look` block is RENDER-ONLY: shape bolt | ball | orb | spark, size (core half-size, voxels), tail (trailing sprites; the orb's ring count), tailStep (voxels between them), glow (emission), color (#RRGGBB, used when the cast carries no matter).",
+  "comment": "Glyphs are CONTENT, like materials.json and reactions.json. A glyph is a word of the ancient language; docs/PLAN_magic_grammar.md is the grammar and scripts/magic_grammar.py the executable reference the C++ parser is checked against (`--gate spells-oracle`). Five sorts: matter (a material BY NAME, resolved to a 12-bit id at load; `air` is the void, `anything` the wildcard), effect (something that happens at a point: verb + params), delivery (how an effect reaches a point: mech instant | flight | continuous, plus the record fields), mod (a field edit on the delivery record: field/op/amount, applied again per repetition), operator (verb + valence: `left`/`right` list the sorts each slot accepts or `any`, `result` is the sort produced). Every unary operator takes the word BEFORE it; only an infix operator has both slots. Costs are integer: `word` is the small fixed cost of saying it; the real price is the tariff on what the cast does to the world (budgets.rates x the per-material `arcane` value in materials.json). Hot-reloads on R alongside materials.json. A delivery's `speed` is voxels per tick at 30 Hz and may be fractional (4.8 = 14.4 m/s); a flight collides with the CPU mirror, then the chunk cache it prefetches ahead of itself, then the ground contract, and with bodies by ray. A delivery's `look` block is RENDER-ONLY: shape bolt | ball | orb | spark, size (core half-size, voxels), tail (trailing sprites; the orb's ring count), tailStep (voxels between them), glow (emission), color (#RRGGBB, used when the cast carries no matter). A delivery's `gesture` (and the hand block's) names how the ARM casts it, from gestures.json beside this file: the cast leaves the hand at that gesture's release, not on the press.",
   "language": "FOUR rules. R1 a noun goes into the PILE and order inside a scope of the pile does not matter: runs merge within a scope (fire fire = fire x2; matter and effects ADD, mods COMPOSE: shotgun x2 = 9) and the lowering rebuilds each scope in a canonical order. R2 a DELIVERY BOXES the innermost OPEN scope of the pile into one Effect value and speaking CONTINUES, so deliveries NEST and word order decides what is inside what; with no delivery the box is `hand`, at reach in front of the caster. R3 a MOD is pending and sticks to the box that closes the pile; on the hand only `shotgun`/`twin` (fanned resolve points) and `float`/`heavy` (the hop) mean anything and every other mod there is a charged no-op the readout names. R4 `lane` OPENS A LANE SCOPE and `end` CLOSES the innermost open one. A delivery inside an open lane boxes only that lane and the lane stays open; outside any lane it boxes the shared items plus every closed lane, which is the multi-socket box. Lanes are ordered as spoken, lane i belongs to instance i, the box fires max(count, lanes) instances, and an instance past the last lane carries the shared items alone. An unclosed lane is closed at the end of the sentence. Operators bind within the current scope only and a `lane`/`end` mark is a wall; a mod inside a lane edits that instance's record. A `count` mod SPLITS THE SCOPE it was spoken in - shared, it is the box's fan; inside a lane, it is that one branch's split - and at most ONE count word per scope is effective: the strongest wins, the rest are charged no-ops. Nine bolts is a split on each of three branches, not one word said twice. An operator with an empty required slot is INCOMPLETE: charged, does nothing, drawn with `_`; there are no defaults, `anything` and `air` are words. Every sequence lowers to a definite cast list; there is no misfire state.",
   "budgets": {
     "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front. Hard engine ceilings; a glyph's own budget is clamped to them at load. rates.* and anythingSurchargeMille are the tariff (plan section 4): place = per voxel x arcane(M); convert = per voxel + max(0, arcane(B)-arcane(A)); graft = per voxel x arcane(M); explode = power x r^3 / 1000; wind = footprint x ticks / 1000. The wildcard bills value(actual) x surcharge on top, when it resolves.",
@@ -34,6 +34,7 @@
     "carry": 1000,
     "reach": 3,
     "impactRadius": 1,
+    "gesture": "push",
     "desc": "Implicit. At reach: a few voxels in front of the caster along the aim."
   },
   "glyphs": [
@@ -401,6 +402,7 @@
       "word": 6,
       "mech": "flight",
       "noun": "bolt",
+      "gesture": "throw",
       "speed": 4.8,
       "look": {
         "shape": "ball",
@@ -424,6 +426,7 @@
       "word": 8,
       "mech": "flight",
       "noun": "dart",
+      "gesture": "flick",
       "speed": 9.6,
       "look": {
         "shape": "bolt",
@@ -447,6 +450,7 @@
       "word": 4,
       "mech": "flight",
       "noun": "ball",
+      "gesture": "lob",
       "speed": 2.4,
       "look": {
         "shape": "ball",
@@ -470,6 +474,7 @@
       "word": 7,
       "mech": "flight",
       "noun": "orb",
+      "gesture": "present",
       "speed": 1,
       "look": {
         "shape": "orb",
@@ -494,6 +499,7 @@
       "material": "stone",
       "mech": "flight",
       "noun": "bomb",
+      "gesture": "lob",
       "speed": 1.6,
       "look": {
         "shape": "spark",
@@ -517,6 +523,7 @@
       "word": 5,
       "mech": "continuous",
       "noun": "beam",
+      "gesture": "beam",
       "reach": 48,
       "ticks": 90,
       "impactRadius": 1,
@@ -531,6 +538,7 @@
       "word": 2,
       "mech": "instant",
       "noun": "touch",
+      "gesture": "self",
       "reach": 0,
       "impactRadius": 2,
       "carry": 1000,

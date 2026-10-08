@@ -2180,6 +2180,18 @@ Status GateSpellTiming(Ctx& c, std::string& detail) {
 // casts and the hand still holds the spell after them, no press is no cast, an
 // empty hand's button casts nothing, the left hand casts on RMB and becomes
 // the beam hand, a glyph reload re-speaks the hands, and an empty key refuses.
+//
+// THE GESTURE (game/spellgesture.h, 2026-10-08): the press starts the
+// delivery's gesture and the cast happens on its RELEASE tick, not the press
+// tick. Asserted: every delivery resolves a gesture (bolt -> flick, projectile
+// -> throw, lob -> lob, self -> self, the bare hand -> the default push, the
+// beam holds); each hand's cast lands EXACTLY its gesture's release ticks
+// after the press and never on the press; a second press during the wind-up
+// is one more cast, not a lost click; and the keyframes put the hand where the
+// gesture says at the release (the throw forward, the lob rising, the palm
+// across the chest), in a frame whose `out` is the body's right for the right
+// hand and its left for the left. The rig has no avatar, so the POSE itself is
+// the sampler's and the arm's IK is not under test here.
 Status GateSpellHands(Ctx& c, std::string& detail) {
   World& world = c.world;
   const IVec3 wo = world.WindowOrigin();
@@ -2218,31 +2230,156 @@ Status GateSpellHands(Ctx& c, std::string& detail) {
         "the right hand takes the page on key 1");
   check(!pc.EquipHand(lib, 1, 2) && !pc.hand[1].Equipped(), "an empty key puts nothing in a hand");
 
-  auto tickWith = [&](uint32_t pressed) {
+  // ---- the gesture library (CPU) ----
+  const SpellGestureLib& gl = lib.gestures;
+  auto gestureOf = [&](std::initializer_list<const char*> words) {
+    SpellStack st;
+    for (const char* w : words)
+      if (lib.Find(w) >= 0) st.spoken.push_back(lib.Find(w));
+    const SpellGesture* g = gl.At(CastGesture(lib, CompileSpell(lib, st)));
+    return g ? g->name : std::string("(none)");
+  };
+  check(!gl.gestures.empty() && gl.At(gl.fallback) && gl.At(gl.fallback)->name == "push",
+        "gestures.json loads beside glyphs.json, default push");
+  {
+    std::string unresolved;
+    for (const GlyphDef& d : lib.glyphs)
+      if (d.sort == GlyphSort::Delivery && d.gesture < 0) unresolved += " " + d.id;
+    check(unresolved.empty(), "every delivery names a gesture (missing:" + unresolved + ")");
+  }
+  const std::string gBolt = gestureOf({"fire", "bolt"}), gProj = gestureOf({"sand", "projectile"}),
+                    gLob = gestureOf({"fire", "lob"}), gSelf = gestureOf({"fire", "self"}),
+                    gHand = gestureOf({"fire"}), gBeam = gestureOf({"fire", "beam"});
+  check(gBolt == "flick" && gProj == "throw" && gLob == "lob" && gSelf == "self" &&
+            gHand == "push" && gBeam == "beam",
+        Format("deliveries pick their gestures (bolt %s, projectile %s, lob %s, self %s, hand "
+               "%s, beam %s)",
+               gBolt.c_str(), gProj.c_str(), gLob.c_str(), gSelf.c_str(), gHand.c_str(),
+               gBeam.c_str()));
+  if (const SpellGesture* b = gl.At(gl.Find("beam")))
+    check(b->holdTicks >= b->releaseTicks, "the beam's gesture holds while the button does");
+  for (const SpellGesture& g : gl.gestures)
+    check(g.releaseTicks >= 1 && g.releaseTicks <= g.endTicks,
+          Format("%s releases inside its keys, after the press tick (%d of %d)", g.name.c_str(),
+                 g.releaseTicks, g.endTicks));
+  // Where the hand is at the release, in the gesture's frame.
+  auto at = [&](const char* name, int ticks) {
+    const SpellGesture* g = gl.At(gl.Find(name));
+    return g ? SampleGesture(*g, GestureTicksToMs(ticks), Vec3{0.1f, -0.9f, 0.1f}).hand
+             : Vec3{};
+  };
+  auto rel = [&](const char* name) {
+    const SpellGesture* g = gl.At(gl.Find(name));
+    return g ? g->releaseTicks : 0;
+  };
+  {
+    const Vec3 start = at("throw", 0);
+    check(start.x == 0.1f && start.y == -0.9f, "t = 0 is the live hand, exactly");
+    const Vec3 thr = at("throw", rel("throw"));
+    const Vec3 lob0 = at("lob", rel("lob") - 1), lob1 = at("lob", rel("lob"));
+    const Vec3 slf = at("self", rel("self"));
+    check(thr.x > 0.5f, Format("the throw lets go out in front (fwd %.2f)", thr.x));
+    check(lob1.y > lob0.y && lob1.x > 0.3f,
+          Format("the lob lets go RISING, in front (up %.2f -> %.2f, fwd %.2f)", lob0.y, lob1.y,
+                 lob1.x));
+    check(slf.z < -0.15f && slf.x < 0.4f,
+          Format("the self gesture's palm is across the chest (out %.2f, fwd %.2f)", slf.z,
+                 slf.x));
+  }
+  {
+    const Vec3 fwdZ{0, 0, 1};
+    const GestureBasis r = MakeGestureBasis(GestureFrame::Aim, fwdZ, fwdZ, 1.0f);
+    const GestureBasis l = MakeGestureBasis(GestureFrame::Aim, fwdZ, fwdZ, -1.0f);
+    const GestureBasis back = MakeGestureBasis(GestureFrame::Aim, Vec3{0, 0, -1}, fwdZ, 1.0f);
+    const GestureBasis lvl =
+        MakeGestureBasis(GestureFrame::Body, Vec3{0, 0.9f, 0.43f}, fwdZ, 1.0f);
+    check(r.out.x < -0.99f && l.out.x > 0.99f,
+          "out is the body's right (-X) for the right hand, its left for the left");
+    check(back.fwd.z > 0.2f,
+          Format("an aim behind the body is kept in front (fwd.z %.2f)", back.fwd.z));
+    check(std::fabs(lvl.fwd.y) < 1e-4f, "a body-frame gesture ignores the view's pitch");
+  }
+
+  // ---- through the tick ----
+  // `pressed` on the first tick only, then idle ticks until the cast lands
+  // (or `wait` ticks pass). The cast's tick is counted from the press tick.
+  struct Cast {
+    bool cast = false;
+    int32_t spent = 0;
+    int after = -1;
+  };
+  auto pressWait = [&](uint32_t pressed, int wait) {
+    Cast r;
     pc.lastOutcome = CastOutcome::Nothing;
     const int32_t before = pc.mana.mana;
-    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
-      o.input.SetPressed(pressed, pressed != 0);
-      o.input.SetHeld(pressed, pressed != 0);
-    });
-    return std::pair<bool, int32_t>{pc.lastOutcome != CastOutcome::Nothing,
-                                    before - pc.mana.mana};
+    for (int i = 0; i <= wait && !r.cast; i++) {
+      support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+        const bool on = i == 0 && pressed != 0;
+        o.input.SetPressed(pressed, on);
+        o.input.SetHeld(pressed, on);
+      });
+      if (pc.lastOutcome != CastOutcome::Nothing) {
+        r.cast = true;
+        r.after = i;
+      }
+    }
+    r.spent = before - pc.mana.mana;
+    return r;
   };
-  tickWith(0);   // settle: nothing pressed
+  auto tickWith = [&](uint32_t pressed) {
+    const Cast r = pressWait(pressed, 30);
+    return std::pair<bool, int32_t>{r.cast, r.spent};
+  };
+  auto idle = [&](int n) {
+    for (int k = 0; k < n; k++)
+      support::RunTicks(rig, 1, [](uint32_t, support::TickOps&) {});
+  };
+  idle(1);   // settle: nothing pressed
   int casts = 0;
+  std::string afters;
   for (int i = 0; i < 3; i++) {
-    const auto [cast, spent] = tickWith(TB_ATTACK);
-    if (cast && spent > 0) casts++;
-    tickWith(0);
+    const Cast r = pressWait(TB_ATTACK, 30);
+    if (r.cast && r.spent > 0) casts++;
+    afters += Format(" %d", r.after);
+    check(r.after == rel("flick"),
+          Format("the firebolt leaves at the flick's release, %d ticks after the press (%d)",
+                 rel("flick"), r.after));
+    idle(30);   // the gesture runs out
   }
   check(casts == 3, Format("three LMB presses are three right-hand casts (%d)", casts));
+  {
+    // A second press DURING the wind-up is kept: two presses, two casts, the
+    // second a whole gesture's release after the first.
+    int got = 0, firstAt = -1, secondAt = -1;
+    for (int i = 0; i < 40; i++) {
+      pc.lastOutcome = CastOutcome::Nothing;
+      support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+        const bool on = i == 0 || i == 1;
+        o.input.SetPressed(TB_ATTACK, on);
+        o.input.SetHeld(TB_ATTACK, on);
+      });
+      if (pc.lastOutcome != CastOutcome::Nothing) {
+        if (got++ == 0) firstAt = i;
+        else secondAt = i;
+      }
+    }
+    check(got == 2 && firstAt == rel("flick") && secondAt == firstAt + rel("flick"),
+          Format("a press in the wind-up casts once more after the first (%d casts, at %d and "
+                 "%d)",
+                 got, firstAt, secondAt));
+    idle(30);
+  }
   check(pc.hand[0].Equipped(), "the spell is still in the right hand after casting");
   check(!tickWith(0).first, "no press, no cast");
   check(!tickWith(TB_ALT).first, "RMB with nothing in the left hand casts nothing");
   check(pc.EquipHand(lib, 1, 1), "the left hand takes the page on key 2");
   {
-    const auto [cast, spent] = tickWith(TB_ALT);
-    check(cast && spent > 0 && pc.beamHand == 1, "RMB casts the left hand's spell");
+    const Cast r = pressWait(TB_ALT, 30);
+    check(r.cast && r.spent > 0 && pc.beamHand == 1, "RMB casts the left hand's spell");
+    check(r.after == rel("throw"),
+          Format("the sandshot leaves at the throw's release, %d ticks after the press (%d)",
+                 rel("throw"), r.after));
+    idle(30);
   }
   pc.RefreshHands(lib);
   check(pc.hand[0].Equipped() && pc.hand[1].Equipped() && pc.hand[1].name == "hands-sandshot",
@@ -2251,7 +2388,8 @@ Status GateSpellHands(Ctx& c, std::string& detail) {
   check(!tickWith(TB_ATTACK).first, "a hand whose spell was let go casts nothing");
 
   detail = Format("%d checks", checks);
-  std::printf("spell-hands: %s (%d casts; %d checks)\n", ok ? "PASS" : "FAIL", casts, checks);
+  std::printf("spell-hands: %s (%d casts, released +%s ticks; %d checks)\n",
+              ok ? "PASS" : "FAIL", casts, afters.c_str(), checks);
   return ok ? Status::Pass : Status::Fail;
 }
 

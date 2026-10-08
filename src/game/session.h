@@ -638,17 +638,24 @@ struct PlayerSession {
     Vec3 o3{};                 // the other flask's 3D middle at pickup
     float sepB = 0;            // bench x from the carried one to the other
   } benchCarry;
-  // ---- THE CASTING ARM (session.cpp PoseSpellHands) --------------------------
-  // A cast from a spell hand throws that arm out along the aim: drawn back,
-  // pushed out, held while its button is, then handed back to the animation.
-  // One arm at a time (the rig has one weapon-arm claim); a cast with the
-  // other hand takes the claim over. Presentation, but it moves the hand the
-  // next cast leaves from, so it runs on the tick and never off the frame.
-  int spellCastHand = -1;      // a cast THIS tick, from this hand; -1 = none
+  // ---- THE CASTING GESTURE (game/spellgesture.h, session.cpp PoseSpellHands)
+  // A press on a spell hand STARTS its delivery's gesture (a throw, a lob, a
+  // palm to the chest ...); the cast itself happens on the gesture's RELEASE
+  // tick, from where the hand is then. Per hand, so both hands can be mid-
+  // gesture and each fires on its own clock; the ARM is posed for one at a
+  // time (the rig has one weapon-arm claim): the latest press takes it. Sim-
+  // affecting (it decides the tick and the origin of a cast), so it runs on
+  // the tick and never off the frame.
+  struct SpellGestureRun {
+    int gesture = -1;          // GlyphLibrary::gestures index; -1 = idle
+    int ticks = 0;             // the gesture's clock (stops at a hold while held)
+    bool fired = false;        // the cast has left the hand
+    bool again = false;        // pressed during the wind-up: cast again after it fires
+  };
+  SpellGestureRun spellGesture[kHands];
   int spellArmHand = -1;       // the hand whose arm the claim is on; -1 = none
-  float spellArmT = 0.0f;      // seconds since that cast
   float spellArmW = 0.0f;      // the claim's weight, 0..1
-  Vec3 spellArmFrom{};         // the live hand (from the shoulder) at the cast
+  Vec3 spellArmFrom{};         // the live hand at the press, gesture frame, reaches
   bool spellArmFresh = false;  // read spellArmFrom on the next pose
   // Which hands are playing the armed pose (`spell_ready`, PoseSpellReady).
   bool spellClip[kHands] = {false, false};

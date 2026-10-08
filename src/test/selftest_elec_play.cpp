@@ -210,6 +210,7 @@ Status GateElecStrikePlay(Ctx& c, std::string& detail) {
     int ticksToFire = -1;
   };
   Arm shut, open;
+  int gestureTicks = 0;
   Regenerate(c);
   {
     const int fxX = o.x * (int)kChunk + 220, fxZ = o.z * (int)kChunk + 220;
@@ -228,6 +229,11 @@ Status GateElecStrikePlay(Ctx& c, std::string& detail) {
     s.caster.hand[0].slot = 0;
     s.caster.hand[0].name = "lightning-self";
     s.caster.hand[0].compiled = CompileSpell(rig.Glyphs(), st);
+    // The press starts the `self` gesture; the cast leaves on its release
+    // (game/spellgesture.h), so the leader's window opens that many ticks on.
+    if (const SpellGesture* g = rig.Glyphs().gestures.At(
+            CastGesture(rig.Glyphs(), s.caster.hand[0].compiled)))
+      gestureTicks = g->releaseTicks;
     TickAuthorityCtx& w = rig.Authority();
     for (int i = 0; i < 6; i++) tick();  // the mirror publishes the fixture
     auto run = [&](Arm& a, uint32_t cap) {
@@ -246,7 +252,7 @@ Status GateElecStrikePlay(Ctx& c, std::string& detail) {
         o.input.SetHeld(TB_ATTACK, true);
       });
       t = rig.tick;
-      for (int i = 0; i < 14 && w.strikes.spellStrikes == st0; i++) {
+      for (int i = 0; i < 14 + gestureTicks && w.strikes.spellStrikes == st0; i++) {
         tick();
         if (w.strikes.spellStrikes != st0) a.ticksToFire = i + 1;
       }
@@ -272,10 +278,11 @@ Status GateElecStrikePlay(Ctx& c, std::string& detail) {
   check(open.strikes == 1 && open.emitted == 1 && open.refunded == 0,
         Format("an open budget emits the bolt (strikes %llu, emitted %llu)",
                (unsigned long long)open.strikes, (unsigned long long)open.emitted));
-  check(shut.leaders == 1 && shut.ticksToFire >= 1 && shut.ticksToFire <= 10,
+  check(shut.leaders == 1 && shut.ticksToFire >= 1 + gestureTicks &&
+            shut.ticksToFire <= 10 + gestureTicks,
         Format("a search above the mirror waits a stepped leader (leaders %llu, fired after %d "
-               "ticks)",
-               (unsigned long long)shut.leaders, shut.ticksToFire));
+               "ticks, %d of them the cast gesture)",
+               (unsigned long long)shut.leaders, shut.ticksToFire, gestureTicks));
 
   // ---- F. the sound slots ----------------------------------------------------------
   const auto& sp2 = audio::Cues::kSlotPrefix;

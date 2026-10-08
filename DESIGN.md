@@ -20992,8 +20992,9 @@ carried together.
 - **The tick casts.** `ResolveHands` marks `HandNow::spell` for an EMPTY hand
   holding a spell on a usable arm (fly mode, no body: allowed); such a hand is
   never `ready` to strike. The SPELLS IN HAND block (`session.cpp`, magic
-  phase) casts per hand on `TB_ATTACK` / `TB_ALT` press, right then left, from
-  `SpellHandPoint` + 1.5 voxels along the aim; the caster's own parts are
+  phase) STARTS a cast per hand on `TB_ATTACK` / `TB_ALT` press and CASTS it on
+  that hand's gesture release (below), from `SpellHandPoint` + 1.5 voxels
+  along the aim as they are AT THE RELEASE; the caster's own parts are
   rejected by ownership as before. A held beam follows the button of the hand
   that cast last (`beamHand`). `TB_CAST` is no longer pressed by anything.
 - **The light in the fist** (main.cpp sprite pass): a breathing core with three
@@ -21006,22 +21007,44 @@ carried together.
   forward and out, forearm level and pointing ahead, wrist cocked up so the
   open hand presents the spell (the Skyrim ready pose), with a slow sway. A
   clip, not the arm claim, so both hands can be armed at once
-  (`PoseSpellReady`). A CAST throws that arm out along the aim
-  (`PoseSpellHands`): the hand is drawn back toward the shoulder (0.07 s),
-  pushed out to 0.95 of the arm's reach along the folded aim `swFwd` (0.10 s,
-  ease-out), held 0.20 s and for as long as the hand's button stays down (a
-  beam's sustain), then the claim fades back into the armed pose. It is the
-  ONE weapon-arm claim, pointed at the empty fist (`StrikeEffectorMode::Chain`
-  on the hand part), elbow pole down as the bench's carried flask; it runs
-  after the melee pose and the bench, gives way to a live strike and to a
-  carried flask, and holds off the idle strike-hand switch while it is out.
-  Casting with the other hand takes the claim over (`ReleaseOffArm` hands the
-  first arm back). The cast itself is on the press tick; the arm moves from
-  the next one. The target follows the aim every tick, only the start point
-  is remembered, so nothing snaps.
+  (`PoseSpellReady`).
+- **The arm PERFORMS the cast (2026-10-08, `game/spellgesture.h`,
+  `assets/spells/gestures.json`).** Each delivery glyph names a GESTURE
+  (`"gesture"` in glyphs.json; the implicit hand's in its `hand` block;
+  gestures.json's `default` otherwise), resolved by name at load and
+  hot-reloaded with R: `projectile` an overhand THROW, `bolt` a FLICK, `lob`
+  and `bomb` an underhand LOB, `orb` a slow PRESENT (gathered to the chest,
+  pushed out), `beam` a reach HELD while the button is, `self` the palm drawn
+  to the chest, the bare hand a PUSH. `CastGesture` reads the first clause's
+  carrier — through the hand's Launch, since rule 2 makes `fire bolt` the
+  hand launching a bolt. A gesture is hand keyframes offset from the shoulder
+  in REACHES, in a frame of (forward = the aim, or the level facing for frame
+  `body`; up; out = the casting side), so one file fits any rig and the left
+  hand mirrors itself; each key also names the elbow pole and the torso's
+  twist/pitch. t = 0 is the live hand, so nothing snaps.
+  **The press starts the gesture; the cast happens on its `releaseMs`**,
+  rounded up to ticks at load — integer, on the tick, so the same press casts
+  on the same tick from the same place (rule 1). A press during the wind-up
+  is kept (one) and cast straight after; a hand that stops holding a spell
+  before its release drops the cast unspent; a library with no gestures.json
+  casts on the press. `holdMs` stops the gesture's clock while the button is
+  held (the beam's barrel). Per hand, so both hands can be mid-gesture and
+  each fires on its own clock.
+  The pose (`PoseSpellHands`) is the ONE weapon-arm claim, pointed at the
+  empty fist (`StrikeEffectorMode::Chain` on the hand part), with the hinge
+  cone open so the key's pole is obeyed; the latest press takes the claim
+  (`ReleaseOffArm` hands the other arm back). It runs after the melee pose
+  and the bench, gives way to a live strike and to a carried flask, holds off
+  the idle strike-hand switch while it is out, and after the last key fades
+  back into the armed pose. The frame follows the aim every tick; only the
+  start point is remembered. NOT yet: NPC and demon casters (they cast with
+  no arm), and the peer's ghost (it does not receive the gesture).
 
 Gate `spell-hands` (runs the real tick through `TickRig`, which now carries a
-`TickOps::input` command and exposes its glyph library).
+`TickOps::input` command and exposes its glyph library): the gesture per
+delivery, the release tick per hand, a press kept from the wind-up, the
+keyframes' release points and the frame's handedness. The rig has no avatar,
+so the IK on a real arm is checked by eye.
 
 ### Ground items are debris that remember their name
 

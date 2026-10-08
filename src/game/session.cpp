@@ -668,34 +668,26 @@ static void PoseSpellReady(PlayerSession& s, PlayerAvatar& avatar,
   }
 }
 
-// ---- THE CASTING ARM (session.h spellArm*) ----------------------------------
-// A cast from a spell hand throws that arm out the way the spell flies: the
-// hand is drawn back toward the shoulder, pushed out to nearly the arm's full
-// reach along the aim, held there while the hand's button is held (a beam's
-// sustain), then the claim fades and the animation takes the arm back.
+// ---- THE CASTING GESTURE (session.h spellGesture / spellArm*) ---------------
+// The arm PERFORMS the cast (game/spellgesture.h): a press on a spell hand
+// starts its delivery's gesture in the cast block below, and this poses the arm
+// through it - an overhand throw, a snap, an underhand lob, a palm drawn to the
+// chest - while the cast itself waits for the gesture's release tick and
+// leaves from where the hand has got to.
 //
 // It drives the ONE weapon-arm claim, pointed at the empty fist itself
 // (StrikeEffectorMode::Chain on the hand part, the way an unarmed style is),
 // so it runs after the melee pose and PoseBenchHands and wins over the idle
 // ready pose. It gives way to a live strike and to the bench's carried flask.
 //
-// The target is recomputed from the aim EVERY tick, so turning while the arm
-// is out swings it with you. Only the start point is remembered: the push
-// begins where the arm actually was, so nothing snaps.
+// The frame is rebuilt from the aim EVERY tick, so turning while the arm is
+// out swings the whole gesture with you. Only the start point is remembered,
+// in that frame: the gesture begins where the arm actually was, so nothing
+// snaps. After the last key the claim fades and the animation (the ready clip
+// underneath, PoseSpellReady) takes the arm back.
 static void PoseSpellHands(PlayerSession& s, PlayerAvatar& avatar,
-                           const HandsNow& hands, const TickInput& ti,
+                           const HandsNow& hands, const GlyphLibrary& glyphs,
                            Vec3 aim, bool strikeLive) {
-  // Seconds: the draw-back, the push, and the hold after it (at least).
-  constexpr float kCock = 0.07f, kThrust = 0.10f, kHold = 0.20f;
-  // Reach fractions: how far out the drawn-back hand sits and where the push
-  // ends (short of straight, where the two-bone solve is ill-conditioned).
-  constexpr float kCockReach = 0.42f, kOutReach = 0.95f;
-  if (s.spellCastHand >= 0) {
-    s.spellArmHand = s.spellCastHand;
-    s.spellArmT = 0.0f;
-    s.spellArmFresh = true;
-    s.spellCastHand = -1;
-  }
   const int hk = s.spellArmHand;
   if (hk < 0) return;
   const Hand h = HandAt(hk);
@@ -711,9 +703,12 @@ static void PoseSpellHands(PlayerSession& s, PlayerAvatar& avatar,
     return;
   }
   const int part = h == Hand::Left ? avatar.Parts().handL : avatar.Parts().handR;
-  // The hand stopped being a spell hand (an item arrived, the arm was ruined)
-  // or the body is gone: hand the arm straight back.
-  if (!avatar.Spawned() || !hands.hand[hk].spell || part < 0 || !avatar.HandUsable(h)) {
+  const PlayerSession::SpellGestureRun& run = s.spellGesture[hk];
+  const SpellGesture* g = glyphs.gestures.At(run.gesture);
+  // The hand stopped being a spell hand (an item arrived, the arm was ruined),
+  // the gesture is over and gone, or the body is: hand the arm straight back.
+  if (!avatar.Spawned() || !hands.hand[hk].spell || part < 0 || !avatar.HandUsable(h) ||
+      g == nullptr || g->keys.empty()) {
     avatar.ClearStrikeEffector();
     drop();
     return;
@@ -727,15 +722,14 @@ static void PoseSpellHands(PlayerSession& s, PlayerAvatar& avatar,
     drop();
     return;
   }
+  const float side = HandSideSign(h);
+  const Vec3 bodyFwd = QuatRotate(QuatAxisAngle({0, 1, 0}, avatar.Heading()), Vec3{0, 0, 1});
+  const GestureBasis basis = MakeGestureBasis(g->frame, aim, bodyFwd, side);
   if (s.spellArmFresh) {
-    s.spellArmFrom = live;
+    s.spellArmFrom = basis.FromWorld(live) * (1.0f / reach);
     s.spellArmFresh = false;
   }
-  const float t = s.spellArmT;
-  s.spellArmT += kTickDt;
-  const bool held = ti.Held(h == Hand::Right ? TB_ATTACK : TB_ALT);
-  const bool out = t < kCock + kThrust + kHold || held;
-  if (out) {
+  if (run.ticks <= g->endTicks) {
     s.spellArmW = 1.0f;
   } else {
     s.spellArmW *= std::exp(-kTickDt * 10.0f);
@@ -745,40 +739,33 @@ static void PoseSpellHands(PlayerSession& s, PlayerAvatar& avatar,
       return;
     }
   }
-  // THE AIM, never through the body: a camera looking back at the caster's
-  // face would ask the arm to reach behind its own back. The horizontal part
-  // is kept in front of the body's facing; pitch is the aim's.
-  const Vec3 bodyFwd = QuatRotate(QuatAxisAngle({0, 1, 0}, avatar.Heading()), Vec3{0, 0, 1});
-  Vec3 dir = aim.len() > 1e-4f ? aim.normalized() : bodyFwd;
-  const float along = dir.x * bodyFwd.x + dir.z * bodyFwd.z;
-  if (along < 0.3f) dir = (dir + bodyFwd * (0.3f - along)).normalized();
-  const Vec3 cocked = dir * (reach * kCockReach) + Vec3{0, reach * 0.12f, 0};
-  const Vec3 goal = dir * (reach * kOutReach);
-  auto smooth = [](float x) {
-    x = std::clamp(x, 0.0f, 1.0f);
-    return x * x * (3.0f - 2.0f * x);
-  };
-  Vec3 target;
-  if (t < kCock) {
-    target = s.spellArmFrom + (cocked - s.spellArmFrom) * smooth(t / kCock);
-  } else if (t < kCock + kThrust) {
-    // Ease OUT: the push is fastest as it leaves, the way a throw is.
-    const float u = std::clamp((t - kCock) / kThrust, 0.0f, 1.0f);
-    const float e = 1.0f - (1.0f - u) * (1.0f - u) * (1.0f - u);
-    target = cocked + (goal - cocked) * e;
-  } else {
-    target = goal;
-  }
+  const GestureSample gs =
+      SampleGesture(*g, GestureTicksToMs(std::min(run.ticks, g->endTicks)), s.spellArmFrom);
+  Vec3 target = basis.ToWorld(gs.hand) * reach;
+  // Short of straight: the two-bone solve is ill-conditioned at full reach.
+  const float l = target.len();
+  if (l > reach * 0.98f) target = target * (reach * 0.98f / l);
+  Vec3 pole = basis.ToWorld(gs.pole);
+  pole = pole.len() > 1e-4f ? pole.normalized() : Vec3{0, -1, 0};
+  constexpr float kDeg = 3.14159265f / 180.0f;
   WeaponPose wp;
   wp.hand = target;
   wp.weight = s.spellArmW;
   wp.steerBlade = false;
-  // ELBOW DOWN, as the bench's carried flask: a hand straight out in front
-  // at shoulder height is antiparallel to the rig's own back pole and the
-  // elbow would flip from tick to tick (PoseBenchHands says so at length).
+  // THE ELBOW IS THE GESTURE'S. The rig's own elbow-back pole is antiparallel
+  // to a hand straight out in front at shoulder height and flipped the elbow
+  // from tick to tick (PoseBenchHands says so at length), so every key names
+  // where it bulges - down for a push, out to the side for the hand up by the
+  // head, back for the arm swung past the hip - with the hinge cone open so
+  // the clamp does not refuse the bend it asks for.
   wp.usePole = true;
-  wp.bendPole = Vec3{0, -1, 0};
+  wp.bendPole = pole;
   wp.elbowAxisCone = 3.14159265f;
+  // The torso joins the throw: + turns the casting side's shoulder back, so
+  // the left hand's twist is the mirror. Weight-scaled, as the melee driver's
+  // are, so it fades with the claim.
+  wp.torsoTwist = gs.twistDeg * kDeg * side * s.spellArmW;
+  wp.torsoPitch = gs.pitchDeg * kDeg * s.spellArmW;
   avatar.SetWeaponPose(wp);
 }
 
@@ -3764,7 +3751,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             avatar.SetWeaponPose(wp);
             PoseBenchHands(s, avatar);
             PoseSpellReady(s, avatar, hands);
-            PoseSpellHands(s, avatar, hands, ti, swFwd, playerStrike.Active());
+            PoseSpellHands(s, avatar, hands, glyphs, swFwd, playerStrike.Active());
           }
         }
         // ---- ARMOUR: the body wears what the kit's equipment says -----------
@@ -4220,46 +4207,101 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         }
         // ---- SPELLS IN HAND (caster.h PlayerCaster::hand) ------------------
         //
-        // A hand holding a spell casts it on its own button's press edge — LMB
-        // the right hand, RMB the left, the dual-wield rule — and the spell
-        // STAYS in the hand, so it fires as often as the button is clicked;
-        // mana is the rate limit. ResolveHands decided which hands qualify
-        // (empty of items, a usable arm). Both on one tick: right first, then
-        // left, each its own Cast() with its own origin.
+        // A hand holding a spell casts it from its own button — LMB the right
+        // hand, RMB the left, the dual-wield rule — and the spell STAYS in the
+        // hand, so it fires as often as the button is clicked; mana is the rate
+        // limit. ResolveHands decided which hands qualify (empty of items, a
+        // usable arm). Each hand is its own Cast() with its own origin.
+        //
+        // THE PRESS STARTS A GESTURE; THE RELEASE CASTS (game/spellgesture.h).
+        // The delivery names how the arm throws it (CastGesture): the press
+        // starts that gesture on this hand's clock, PoseSpellHands performs it,
+        // and the Cast() happens on the gesture's release tick — so a lob
+        // leaves the hand as it comes up past the hip, a projectile at the top
+        // of the throw, and the spell is never spat from a fist that has not
+        // moved. A press during the wind-up is kept (one) and cast straight
+        // after; a hand that stops holding a spell before its release drops
+        // the cast unspent. A library with no gestures casts on the press.
         //
         // Origin: one step forward of the hand (SpellHandPoint) along the aim,
-        // so the flight leaves the fist; the caster's own parts are rejected
-        // by ownership in bodyHit above, so an arm in the line is not a hit.
-        // Direction is the aim ray. A FATAL cast runs its effect at the
-        // CASTER instead, through the same Cast (thesis 2).
+        // read AT THE RELEASE, so the flight leaves the fist where the gesture
+        // put it; the caster's own parts are rejected by ownership in bodyHit
+        // above, so an arm in the line is not a hit. Direction is the aim ray
+        // at the release. A FATAL cast runs its effect at the CASTER instead,
+        // through the same Cast (thesis 2).
         for (int hk = 0; hk < kHands; hk++) {
           const Hand h = HandAt(hk);
-          if (!hands[h].spell) continue;
-          if (!ti.Pressed(h == Hand::Right ? TB_ATTACK : TB_ALT)) continue;
-          const PlayerCaster::HandSpell& hs = caster.hand[hk];
-          const Vec3 fwd = cam.Forward();
-          const Vec3 muzzle = SpellHandPoint(avatar, player, cam, h) + fwd * 1.5f;
-          SpellFxVec originFx{SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
-                              SpellFxFromFloat(muzzle.z)};
-          SpellFxVec dirFx{SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
-                           SpellFxFromFloat(fwd.z)};
-          const bool fatal =
-              ResolveCast(caster.mana, playerHealth.Get(), hs.compiled.manaCost).outcome ==
-              CastOutcome::Fatal;
-          if (fatal) {
-            const Vec3 body = player.pos;
-            originFx = {SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
-                        SpellFxFromFloat(body.z)};
+          PlayerSession::SpellGestureRun& run = s.spellGesture[hk];
+          if (!hands[h].spell) {
+            run = {};
+            continue;
           }
-          const SpellProbe probe = WorldSpellProbe(world);
-          CastResult res = spells.Cast(hs.compiled, caster.mana, playerHealth,
-                                       kPlayerCasterId, originFx, dirFx, tick, emit, &probe,
-                                       nullptr, &bodyProbe);
-          caster.lastOutcome = res.outcome;
-          caster.beamHand = hk;
-          // ...and the arm throws out after it (PoseSpellHands, next tick's
-          // pose). A cast the VM refused throws nothing.
-          if (res.outcome != CastOutcome::Nothing) s.spellCastHand = hk;
+          const PlayerCaster::HandSpell& hs = caster.hand[hk];
+          const int button = h == Hand::Right ? TB_ATTACK : TB_ALT;
+          auto begin = [&] {
+            run = {};
+            run.gesture = CastGesture(glyphs, hs.compiled);
+            // The arm is this gesture's from the next pose (the latest press
+            // takes the one claim), starting where the hand is now.
+            if (run.gesture >= 0) {
+              s.spellArmHand = hk;
+              s.spellArmFresh = true;
+            }
+          };
+          auto fire = [&] {
+            run.fired = true;
+            const Vec3 fwd = cam.Forward();
+            const Vec3 muzzle = SpellHandPoint(avatar, player, cam, h) + fwd * 1.5f;
+            SpellFxVec originFx{SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
+                                SpellFxFromFloat(muzzle.z)};
+            SpellFxVec dirFx{SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
+                             SpellFxFromFloat(fwd.z)};
+            const bool fatal =
+                ResolveCast(caster.mana, playerHealth.Get(), hs.compiled.manaCost).outcome ==
+                CastOutcome::Fatal;
+            if (fatal) {
+              const Vec3 body = player.pos;
+              originFx = {SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
+                          SpellFxFromFloat(body.z)};
+            }
+            const SpellProbe probe = WorldSpellProbe(world);
+            CastResult res = spells.Cast(hs.compiled, caster.mana, playerHealth,
+                                         kPlayerCasterId, originFx, dirFx, tick, emit, &probe,
+                                         nullptr, &bodyProbe);
+            caster.lastOutcome = res.outcome;
+            caster.beamHand = hk;
+          };
+          if (ti.Pressed(button)) {
+            if (run.gesture >= 0 && !run.fired) run.again = true;
+            else begin();
+          }
+          const SpellGesture* g = glyphs.gestures.At(run.gesture);
+          // No gesture at all (no gestures.json): the press is the cast.
+          if (!g) {
+            if (ti.Pressed(button)) fire();
+            run = {};
+            continue;
+          }
+          if (!run.fired && run.ticks >= g->releaseTicks) {
+            fire();
+            // The press kept from the wind-up throws again from here.
+            if (run.again) {
+              begin();
+              g = glyphs.gestures.At(run.gesture);
+              if (!g) {
+                run = {};
+                continue;
+              }
+            }
+          }
+          // The clock. A gesture with a hold (a beam) stops at it while the
+          // button stays down, so the arm stays out as the beam's barrel.
+          const bool holding = run.fired && g->holdTicks >= 0 && run.ticks >= g->holdTicks &&
+                               ti.Held(button);
+          if (!holding) run.ticks++;
+          // Long enough after the last key for PoseSpellHands to have faded
+          // the claim out (~12 ticks at its rate), the run is over.
+          if (run.fired && run.ticks > g->endTicks + 15) run = {};
         }
 
         // A held beam follows the aim while the button of the hand that cast

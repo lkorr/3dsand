@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "game/spellgesture.h"
 #include "math3d.h"
 #include "sim/materials.h"
 #include "sim/world.h"
@@ -352,6 +353,11 @@ struct GlyphDef {
   // What the describe line calls one of these ("a bolt", "a bomb"). Content,
   // so a modder's new carrier reads as itself; defaults to the glyph id.
   std::string noun;
+  // How the arm casts it (game/spellgesture.h): the delivery's "gesture",
+  // by name, resolved at load into GlyphLibrary::gestures. -1 = the file's
+  // default. Presentation AND timing: the cast leaves at its release.
+  std::string gestureName;
+  int gesture = -1;
 
   // ---- separator (rule 4) ----
   // false = `lane`, opens a lane scope; true = `end`, closes the innermost
@@ -534,7 +540,15 @@ struct GlyphLibrary {
     const GlyphDef* g = At(i);
     return g ? *g : hand;
   }
+  // assets/spells/gestures.json, beside this file and loaded with it.
+  SpellGestureLib gestures;
 };
+
+struct CastList;
+// THE GESTURE A CAST LIST IS THROWN WITH: its first clause's delivery's, else
+// the library's default; -1 when there are no gestures at all (the cast then
+// leaves on the press).
+int CastGesture(const GlyphLibrary& lib, const CastList& list);
 
 // Loads assets/spells/glyphs.json and resolves every material NAME against the
 // compiled material list. Returns false with `errors` filled on bad input —
