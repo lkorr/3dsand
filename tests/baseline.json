@@ -1090,11 +1090,11 @@
   "duel.awakeChunksMax": "900",
   "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
   "smokeQuiet": [
-    [0, "0023967a"],
-    [1, "3d9bb914"],
-    [15, "f86d0d58"],
-    [30, "ccf7f7fa"],
-    [50, "5d5a6125"]
+    [0, "5996ef08"],
+    [1, "f3149d9e"],
+    [15, "afbe2d7e"],
+    [30, "175e8aa5"],
+    [50, "175e8aa5"]
   ],
   "smokeLoud": [
     [0, "5996ef08"],
