@@ -11181,6 +11181,27 @@ fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
 // the same bounded degradation the solver itself accepts (particles there are
 // frozen too).
 
+// ---- BENCH ATTRIBUTION BITS (--fluid-bench's paired arms, lab.cpp) ---------
+// The only test the shader makes of R.fluidCount is "> 0", and the live count
+// is capped at kFluidCap = 2^18, so the bench rides two small fields in the
+// high bits of the SAME word; the game, which passes a plain count, reads 0
+// from both. Stage N truncates the fluid path after its Nth stage and reports a
+// miss (1 = coarse march, 2 = + sub-cell refine, 3 = + thickness walk), so the
+// bench's same-frame differences attribute the cost per stage; stage 4 is the
+// STEP HEATMAP below. Variant (bits 20..27) is an experiment selector for an
+// in-process A/B (`if ((fluidVariant() & 1u) != 0u)` around the candidate
+// path, `SANDVOX_FLUID_VARIANTS=1` on the bench); 0 is always the shipped path
+// and no shipped code reads it. Strip an experiment's branch before landing it.
+fn fluidStage() -> u32 { return R.fluidCount >> 28u; }
+fn fluidVariant() -> u32 { return (R.fluidCount >> 20u) & 255u; }
+// Stage 4, the STEP HEATMAP: fs() returns straight after the march with
+// red = march loop iterations / 96, green = field samples / 96 and blue =
+// empty-chunk strides / 96, so the bench's arm shot shows WHERE the march
+// spends its steps (the counters are dead code to every other stage).
+var<private> gFluidIters : u32 = 0u;
+var<private> gFluidSamples : u32 = 0u;
+var<private> gFluidC0 : u32 = 0u;
+
 // First WORD of node c's grid row, or -1 when the node has no block.
 fn fluidNodeBase(c : vec3<i32>) -> i32 {
   let wc = worldChunkOf(c);
@@ -11340,6 +11361,7 @@ fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32) -> vec3f {
 // refuted explanations all assumed the refine was FINDING something.
 fn fluidFieldAt(p : vec3f) -> f32 {
   let iso = max(TUNE_FLUID_ISO, 0.05);
+  gFluidSamples += 1u;
 
   // XZ lattice: nodes at cell centres, hence the -0.5 — same convention as
   // liquidFieldAt. Shared by both models so the surface cannot step as one
@@ -11883,6 +11905,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     // invisible — rather than a hitch.
     for (var i = 0; i < 320; i++) {
       rsAdd(RS_FLUID, 1u);
+      gFluidIters += 1u;
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
@@ -11898,6 +11921,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
         heldYMask = fluidYMaskOf(wc);
       }
       if (heldClass == 0u) {
+        gFluidC0 += 1u;
         tPrev = t;
         t = fluidChunkExit(ro, inv, c, t);
         continue;
@@ -11930,7 +11954,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
       // one cell (B-spline support is 1.5 cells), so stride harder.
       t += select(0.5, 1.25, d < iso * 0.25);
     }
-    if (!found) { return out; }
+    if (!found || fluidStage() == 1u) { return out; }
     // Bisect the crossing to sub-step precision — this is what keeps the
     // surface from shimmering as the camera moves.
     var lo = tPrev;
@@ -11942,8 +11966,10 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     out.hit = true;
     out.t = hi;
   }
+  if (fluidStage() == 2u) { out.hit = false; return out; }
 
   out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
+  if (fluidStage() == 3u) { out.hit = false; }
   return out;
 }
 
@@ -12087,6 +12113,7 @@ fn fluidRefineSubCell(ro : vec3f, rd : vec3f, inv : vec3f, tFrom : f32,
   let tStep = abs(inv) * invSub;
   for (var i = 0; i < FLUID_REFINE_STEPS; i++) {
     rsAdd(RS_FLUID, 1u);
+    gFluidIters += 1u;
     if (t > tTo) { break; }
     if (fluidFieldAt((vec3f(q) + vec3f(0.5)) * invSub) >= iso) {
       let e = fluidSubCellEntry(ro, rd, inv, q, invSub);
@@ -12166,6 +12193,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 
     for (var i = 0; i < FLUID_BLOCKY_STEPS; i++) {
       rsAdd(RS_FLUID, 1u);
+      gFluidIters += 1u;
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
@@ -12181,6 +12209,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
         heldYMask = fluidYMaskOf(wc);
       }
       if (heldClass == 0u) {
+        gFluidC0 += 1u;
         tPrev = t;
         t = fluidChunkExit(ro, inv, c, t);
         continue;
@@ -12199,6 +12228,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
         continue;
       }
       let d = fluidFieldAt(p);
+      if (d >= iso && fluidStage() == 1u) { return out; }
       if (d >= iso) {
         // The crossing is somewhere in [tPrev, t]; resolve which sub-cell it
         // lands in. A window that holds no occupied CENTRE (the field crossed
@@ -12228,8 +12258,10 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
     out.nrm = hit.xyz;
     out.t = hit.w;
   }
+  if (fluidStage() == 2u) { out.hit = false; return out; }
 
   out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
+  if (fluidStage() == 3u) { out.hit = false; }
   return out;
 }
 
@@ -13137,6 +13169,13 @@ fn fs(in : VSOut) -> FSOut {
       mf = fluidMarchBlocky(R.camPos, rd, sceneT, 1u);
     } else if (mode >= 3) {
       mf = fluidMarchBlocky(R.camPos, rd, sceneT, 0u);
+    }
+    if (fluidStage() == 4u) {   // the bench's STEP HEATMAP (fluidStage note)
+      var dbg : FSOut;
+      dbg.color = vec4f(f32(gFluidIters) / 96.0, f32(gFluidSamples) / 96.0,
+                        f32(gFluidC0) / 96.0, 1.0);
+      dbg.depth = 0.0;
+      return dbg;
     }
   }
 
