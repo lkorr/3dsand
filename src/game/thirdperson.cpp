@@ -28,10 +28,17 @@ const char* CameraModeName(CameraMode m) {
 }
 
 float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
-                           Vec3 planarVel, float dt, float prone) {
+                           Vec3 planarVel, float dt, float prone,
+                           float paceScale) {
   const auto& av = CurrentTuning().avatar;
   const float sp = planarVel.len() * kVoxelMeters;   // voxels/s -> m/s
-  const bool moving = sp > av.turnMinSpeed;
+  // A slow body's "moving" is measured against ITS walk, not an intact one's
+  // (thirdperson.h): never above the authored threshold, never above 0.3 of
+  // what this body walks at.
+  const float pace = std::clamp(paceScale, 0.0f, 1.0f);
+  const float minSpeed = std::min(
+      av.turnMinSpeed, 0.3f * CurrentTuning().player.walkSpeed * pace);
+  const bool moving = sp > std::max(minSpeed, 0.01f);
 
   // FIRST PERSON: THE BODY FACES THE VIEW, ALWAYS — standing or moving, with
   // no neck dead zone. The walk basis is the camera, so any slack between

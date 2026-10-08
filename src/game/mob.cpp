@@ -2041,6 +2041,16 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       rule.groundAlign =
           std::clamp(s.value("groundAlign", 0.0f), 0.0f, 1.0f);
       rule.airLift = s.value("airLift", false);   // AnimStateRule::airLift
+      // AnimStateRule::cycleDistance / surge / crouchClip (the stump walk).
+      rule.cycleDistance =
+          std::max(0.0f, s.value("cycleDistance", 0.0f)) * worldLen;
+      rule.surge = std::clamp(s.value("surge", 0.0f), 0.0f, 0.95f);
+      rule.surgePeak = std::clamp(s.value("surgePeak", 0.75f), 0.05f, 0.95f);
+      rule.surgeSteps = std::clamp(s.value("surgeSteps", 2), 1, 8);
+      rule.crouchClip = s.value("crouchClip", "");
+      rule.jumpScale = s.value("jumpScale", -1.0f);
+      rule.jumpClip = s.value("jumpClip", "");
+      rule.landClip = s.value("landClip", "");
       // A prone state that still lets the gait run would have the foot plane
       // and the ground plane both claiming the body height. Say so rather
       // than letting whichever ran last win.
@@ -5582,6 +5592,35 @@ void Mob::PlayClipIndex(int ci) {
   inst.clip = ci;
   inst.weight = 1.0f;
   anim_.clips.push_back(inst);
+}
+
+// AnimStateRule::surge, read off the live loco clip's playhead. Step phase 0
+// is the PLANT (the clip is authored with a plant at t=0 and every
+// 1/surgeSteps after it); the multiplier rises from 1-surge there to 1+surge at
+// surgePeak and drops back by the next plant. Smoothstep ramps between -1 and
+// +1 integrate to zero over any span, so the step's mean is exactly 1. Eased
+// to 1 by how much of the walk is actually on: a kneel, or the blend-in of
+// the state itself, does not lurch.
+float Mob::LocoSurge() const {
+  if (anim_.locoState < 0 || anim_.locoState >= (int)skel_.states.size())
+    return 1.0f;
+  const AnimStateRule& rule = skel_.states[anim_.locoState];
+  if (rule.surge <= 0.0f || rule.clip.empty()) return 1.0f;
+  const int ci = skel_.FindClip(rule.clip);
+  if (ci < 0 || skel_.clips[ci].durationMs <= 0) return 1.0f;
+  for (const ClipInstance& inst : anim_.clips) {
+    if (inst.clip != ci || inst.stopping) continue;
+    const float u = inst.timeMs / (float)skel_.clips[ci].durationMs;
+    float s = u * (float)rule.surgeSteps;
+    s -= std::floor(s);
+    const float pk = rule.surgePeak;
+    auto smooth = [](float x) { return x * x * (3.0f - 2.0f * x); };
+    const float shape = s < pk ? -1.0f + 2.0f * smooth(s / pk)
+                               : 1.0f - 2.0f * smooth((s - pk) / (1.0f - pk));
+    const float on = std::clamp(inst.weight * inst.fade, 0.0f, 1.0f);
+    return 1.0f + rule.surge * shape * on;
+  }
+  return 1.0f;
 }
 
 // ---- locomotion stage 0: sense ---------------------------------------------

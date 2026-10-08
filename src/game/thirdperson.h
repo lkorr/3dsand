@@ -50,8 +50,14 @@ const char* CameraModeName(CameraMode m);
 // dropped. Returns the NEW heading, already wrapped.
 // `prone` (0..1, Mob::LocoGroundAlign) blends in avatar.crawlTurnRate as a
 // rate limit on top of either mode: a crawling body turns slowly.
+// `paceScale` (AvatarLocomotion::baseSpeedScale x the crouch's scale) scales
+// `turnMinSpeed` down with the body's own top pace, capped at 1: a stump walk
+// at 0.2x never reached the 0.35 m/s threshold, so in third person the body
+// only turned while sprinting. 0.3 of the scaled walk is the floor, so a surge
+// trough still counts as moving.
 float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
-                           Vec3 planarVel, float dt, float prone = 0.0f);
+                           Vec3 planarVel, float dt, float prone = 0.0f,
+                           float paceScale = 1.0f);
 
 // ---- swing aim policy ------------------------------------------------------
 // The sword's version of the neck rule above. The melee driver (game/melee.h)

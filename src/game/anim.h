@@ -310,7 +310,54 @@ struct AnimStateRule {
   // where it left the ground (pose.cpp, the clip-owned settle). Off by
   // default: a crawler's low pounce keeps the placement it was tuned under.
   bool airLift = false;
+  // ---- A CLIP-OWNED WALK THAT STEPS, NOT GLIDES (2026-10-07, `stumps`) ----
+  //
+  // `cycleDistance` (world voxels, sidecar `cycleDistance` in sidecar units):
+  // how far the body travels over ONE loop of `clip`. When set, the playhead
+  // advances by distance travelled rather than by speed against the def's
+  // nominal walk, so the steps the clip draws are the steps the body takes --
+  // the ledge climb's "the pose phases on the rise" rule, applied to travel.
+  // 0 keeps the speed-ratio playhead every other clip-owned state uses.
+  float cycleDistance = 0.0f;
+  // `surge` (0..1) and `surgePeak` (0..1 of a step): the walk drive's speed
+  // PULSES with the clip's steps instead of holding a constant glide. Per
+  // step (`surgeSteps` per loop) the multiplier ramps from 1-surge just after
+  // a plant up to 1+surge at `surgePeak` -- the body thrown forward onto the
+  // next stump -- and falls back by the plant. Both ramps are smoothsteps, so
+  // the multiplier's mean over a step is exactly 1 and `speedScale` still
+  // states the body's average pace. Mob::LocoSurge evaluates it; only the
+  // player's controller reads it today (AvatarLocomotion::speedScale).
+  float surge = 0.0f;
+  float surgePeak = 0.75f;
+  int surgeSteps = 2;
+  // `crouchClip`: what this state does with a held crouch. A clip-owned state
+  // keys the pelvis the stance crouch moves, so the gait's knee-bend crouch is
+  // off under it (pose.cpp, the held crouch); with this set the crouch is
+  // instead a crossfade from `clip` to this clip (a footless body drops onto
+  // its knees), sharing the loco clip's playhead rate so it shuffles while
+  // moving. Empty = the crouch is a box change only, as before.
+  std::string crouchClip;
+  // ---- THIS STATE'S OWN JUMP (2026-10-07, `stumps`) ----
+  //
+  // `jumpScale` < 0 (the default) leaves jumping to the leg-liveness rule in
+  // PlayerAvatar::Locomotion, which gives a body with no feet no jump at all.
+  // >= 0 states it instead: the stump walk jumps at 0.707 of the impulse,
+  // i.e. half the height (height goes with impulse squared). `jumpClip` plays
+  // on the takeoff and `landClip` on the landing, both one-shot OVERRIDES that
+  // take the pose from the loco clip by weight while they play (pose.cpp),
+  // and the landing holds the walk drive down while it is on
+  // (Locomotion: x(1 - 0.7 x its weight)) -- it hurts, so you stagger.
+  float jumpScale = -1.0f;
+  std::string jumpClip;
+  std::string landClip;
 };
+
+// The weight an instance actually contributes this tick: its requested weight
+// times its blend in/out (ClipFade). Shared by the sampler and by the pose
+// stages that hand weight between two override clips.
+struct AnimClip;
+struct ClipInstance;
+float AnimInstanceWeight(const AnimClip& c, const ClipInstance& inst);
 
 enum class IkSolver : uint8_t { TwoBone };
 

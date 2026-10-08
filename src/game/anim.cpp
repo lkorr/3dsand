@@ -248,6 +248,11 @@ float ClipFade(const AnimClip& c, float tMs, float ageMs, bool stopping,
 
 }  // namespace
 
+float AnimInstanceWeight(const AnimClip& c, const ClipInstance& inst) {
+  return inst.weight *
+         ClipFade(c, inst.timeMs, inst.ageMs, inst.stopping, inst.fade);
+}
+
 // ---- dismemberment state selection ------------------------------------------
 
 int AnimSelectState(const AnimSkeleton& sk, const AnimState& st) {

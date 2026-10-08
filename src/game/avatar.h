@@ -80,6 +80,11 @@ struct AvatarLocomotion {
   // Multiplier on walk/sprint speed, from the active AnimStateRule's
   // speedScale (1.0 when intact). Player applies it to its target speed.
   float speedScale = 1.0f;
+  // The state's AUTHORED pace without the step surge: what the body averages,
+  // where speedScale is what it is doing this tick. The third-person facing
+  // threshold scales by this (thirdperson.h ResolveAvatarHeading), so the
+  // body still turns toward its travel at 0.2x and through a surge's trough.
+  float baseSpeedScale = 1.0f;
   // Multiplier on jump impulse. Derived from leg liveness rather than authored
   // per state: you cannot jump on no legs, and one leg jumps weakly.
   float jumpScale = 1.0f;

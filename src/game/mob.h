@@ -2114,6 +2114,13 @@ class Mob {
       return Vec3{};
     return QuatRotate(anim_.model[i].rot, Vec3{0, 1, 0});
   }
+  // ...and its MODEL-frame joint position (zero past the pose). Add BodyY()
+  // for a world height; gates read how a part rides through a clip here.
+  Vec3 PartModelPos(int i) const {
+    if (i < 0 || i >= (int)anim_.model.size()) return Vec3{};
+    return anim_.model[i].pos;
+  }
+  int LiveClipCount() const { return (int)anim_.clips.size(); }
   bool Alive() const { return alive_; }
   bool Swinging() const { return swinging_; }
   void SetSwinging(bool v) { swinging_ = v; }
@@ -3589,6 +3596,12 @@ class Mob {
   void SetStanceHold(bool on) { stanceHold_ = on; }
   // How much of the chase pose is on right now, 0..1 (`chasePose_`).
   float ChasePoseWeight() const { return chasePose_; }
+  // THE STEP SURGE (AnimStateRule::surge): the walk-speed multiplier the
+  // live loco state's clip asks for at its current playhead, 1 when the
+  // state authors none. Mean 1 over a step by construction. Pure query.
+  float LocoSurge() const;
+  // How far into its kneel the live state's `crouchClip` is, 0..1.
+  float LocoKneel() const { return locoKneel_; }
   // WHAT THE BODY IS DOING (P7, anim.h AnimState::activity): "sleep" selects
   // the rig's activity state (a villager lying on its bed), "" stands it back
   // up. Set every tick by the resident layer; presentation, never saved.
@@ -5511,6 +5524,10 @@ class Mob {
   // alive for the whole pursuit and moves only the number.
   float chasePose_ = 0;
   bool stanceHold_ = false;   // SetStanceHold
+  // HOW MUCH OF THE LOCO STATE'S `crouchClip` IS ON, 0..1 (pose.cpp, the
+  // clip-owned crouch). Weight-driven for the chase pose's reason: a crouch
+  // tapped twice a second must not restart a blend-in each time.
+  float locoKneel_ = 0;
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
   mutable WeaponArmDiag weaponDiag_{};
   mutable AimDiag aimDiag_{};
