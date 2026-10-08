@@ -64,7 +64,7 @@ export function erode(src, w, h, sp, opts, progress) {
     if (progress) progress((p + 1) / passes);
   }
   // back to voxels, the change feathered out at the window edge
-  const fw = Math.max(3, Math.round(Math.min(w, h) * o.feather));
+  const fw = o.feather > 0 ? Math.max(3, Math.round(Math.min(w, h) * o.feather)) : 0;   // 0 = no feather
   const out = new Float32Array(N);
   for (let j = 0; j < h; j++)
     for (let i = 0; i < w; i++) {
@@ -88,8 +88,10 @@ const SG = new Float64Array(3), SG2 = new Float64Array(3);
 function droplet(g, w, h, rnd, o, strength) {
   let x = 1 + rnd() * (w - 3), z = 1 + rnd() * (h - 3);
   let dx = 0, dz = 0, speed = 1, water = 1, sed = 0;
+  let px = x, pz = z;            // the last position inside the window
   for (let life = 0; life < o.lifetime; life++) {
     const i = Math.floor(x), j = Math.floor(z), u = x - i, v = z - j, n = j * w + i;
+    px = x; pz = z;
     sampleGrad(g, w, x, z, SG);
     const h0 = SG[2];
     dx = dx * o.inertia - SG[0] * (1 - o.inertia);
@@ -117,6 +119,13 @@ function droplet(g, w, h, rnd, o, strength) {
     }
     speed = Math.sqrt(Math.max(0, speed * speed - dh * o.gravity));
     water *= 1 - o.evaporate;
+  }
+  // A dying droplet drops what it carries where it stopped (Lague's lets it
+  // vanish, which on mountain slopes measured a third of the cone gone).
+  if (sed > 0) {
+    const i = Math.floor(px), j = Math.floor(pz), u = px - i, v = pz - j, n = j * w + i;
+    g[n] += sed * (1 - u) * (1 - v); g[n + 1] += sed * u * (1 - v);
+    g[n + w] += sed * (1 - u) * v; g[n + w + 1] += sed * u * v;
   }
 }
 /** One Jacobi step of talus slumping: every post above `talus` (rise per
