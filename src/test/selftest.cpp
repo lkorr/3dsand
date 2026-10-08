@@ -675,6 +675,10 @@ const char* const kOrder[] = {
     // Derived doors / chests / beds are P6's kinds: cycles two doors through
     // the tick and restores the window, like door-cycle.
     "structure-door",
+    // The far container rule on the smithy's trough: installs the house like
+    // structure-stamp and keeps its exit contract (override cleared, window
+    // regenerated at the origin it found).
+    "far-contain",
     // P5 editor: editor-commands is CPU-only (scratch refs + a _gate asset);
     // editor-struct-edit installs a turned house like structure-reload and
     // keeps its exit contract (override cleared, window regenerated).
@@ -801,6 +805,8 @@ const char* const kOrder[] = {
     // walker must not sink into it, the crawler must not float over it.
     "crawl-slope",
     "crawl-still",
+    // The footless player: kneel on crouch, step surge, the stump jump.
+    "stump-walk",
     // The snake (package D of PLAN_weapon_coats): same fixture discipline as
     // the crawl pair -- resets mobs + debris and regenerates on the way out.
     "snake",

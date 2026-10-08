@@ -2114,6 +2114,13 @@ class Mob {
       return Vec3{};
     return QuatRotate(anim_.model[i].rot, Vec3{0, 1, 0});
   }
+  // ...and its MODEL-frame joint position (zero past the pose). Add BodyY()
+  // for a world height; gates read how a part rides through a clip here.
+  Vec3 PartModelPos(int i) const {
+    if (i < 0 || i >= (int)anim_.model.size()) return Vec3{};
+    return anim_.model[i].pos;
+  }
+  int LiveClipCount() const { return (int)anim_.clips.size(); }
   bool Alive() const { return alive_; }
   bool Swinging() const { return swinging_; }
   void SetSwinging(bool v) { swinging_ = v; }

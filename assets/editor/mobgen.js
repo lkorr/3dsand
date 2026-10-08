@@ -4527,7 +4527,11 @@ function buildStates() {
       // peaking 70% of the way to each plant: thrown onto the next stump),
       // and a held crouch drops onto the knees (stumpkneel). anim.h
       // AnimStateRule::cycleDistance / surge / crouchClip.
-      cycleDistance: 7, surge: 0.6, surgePeak: 0.7, crouchClip: 'stumpkneel' },
+      cycleDistance: 7, surge: 0.6, surgePeak: 0.7, crouchClip: 'stumpkneel',
+      // ...and it still jumps, to half height (impulse x0.707), with a
+      // wincing takeoff and a buckling landing that staggers the walk
+      // (AnimStateRule::jumpScale / jumpClip / landClip).
+      jumpScale: 0.707, jumpClip: 'stumpjump', landClip: 'stumpland' },
     { name: 'limp',
       missingAny: ['legU.L', 'legL.L', 'foot.L', 'legU.R', 'legL.R', 'foot.R'],
       clip: 'limp', speedScale: 0.55 },

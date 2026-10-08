@@ -9594,6 +9594,179 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
   return done(ok ? Status::Pass : Status::Fail);
 }
 
+// ---- stump-walk: the player with no feet (the `stumps` state) --------------
+//
+// Owner reports 2026-10-07: holding crouch on two stumps "sinks into the ground
+// and comes back up sporadically instead of just crouching". A PlayerAvatar
+// driven by a scripted Player on the flat, both feet severed. Per tick the
+// HEAD's world height (BodyY + its model-frame joint) is recorded through
+//   A  standing still          (should not move),
+//   B  crouch held, still      (one smooth drop onto the knees, then still),
+//   C  crouch held, walking    (a knee shuffle: small bounded bob),
+//   D  uncrouched, walking     (the stump walk; LocoSurge range reported).
+// `jump` is the largest one-tick change in head height after each phase's
+// first 12 ticks (the drop itself is allowed to take those).
+Status GateStumpWalk(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 30, kDefaultSeed, relief);
+  PlayerAvatar avatar;
+  avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  avatar.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  Player pl;
+  pl.fly = false;
+  pl.grounded = true;
+  pl.pos = Vec3{(float)spot.x + 0.5f, (float)(spot.y + 1) + Player::kHalfY,
+                (float)spot.z + 0.5f};
+  pl.vel = Vec3{};
+  float heading = 0.0f;
+  uint32_t t = 8100;
+  auto avTick = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): the gate is this avatar's
+    // controller (a scripted Player), which the rig has no seam for yet.
+    avatar.PreTick(t + 1, pl, heading, kTickDt, c.world, ops, cellOps, spawns);
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(t + 1, c.world, cellOps, spawns);
+    ++t;
+    const IVec3 pc{ifloor(pl.pos.x) >> 4, ifloor(pl.pos.y) >> 4,
+                   ifloor(pl.pos.z) >> 4};
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, ops, {}, cellOps,
+               false, pc, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    avatar.PostStep();
+  };
+  auto done = [&](Status s) {
+    avatar.Despawn();
+    c.debris.Reset();
+    c.mobs.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return s;
+  };
+  if (!avatar.Spawn(pl, 0.0f)) {
+    detail = "avatar spawn failed";
+    return done(Status::Fail);
+  }
+  const int head = avatar.Parts().head;
+  for (int i = 0; i < 20; i++) avTick();
+  avatar.SeverByName("foot.L");
+  avatar.SeverByName("foot.R");
+  for (int i = 0; i < 60; i++) avTick();
+  const char* state = avatar.Locomotion().stateName;
+  auto headY = [&]() { return avatar.BodyY() + avatar.PartModelPos(head).y; };
+  // THE REAL CONTROLLER from here: Player::Update with the keys held, the
+  // avatar's locomotion coupled exactly as session.cpp couples it, so the
+  // crouch is the controller's decision (liquid underfoot included) and the
+  // walk carries the step surge.
+  const std::vector<uint32_t> classOf = BuildCollisionClasses(c.mats);
+  auto kindAt = [&](IVec3 q) { return c.world.KindAt(q, classOf); };
+  struct Run { float lo = 1e9f, hi = -1e9f, jump = 0, end = 0; int clips = 0;
+               float surgeLo = 9, surgeHi = 0, vLo = 1e9f, vHi = 0;
+               int flips = 0, wet = 0; };
+  auto phase = [&](bool crouch, float forward, int n) {
+    Run r;
+    float prev = headY();
+    bool was = pl.crouching;
+    for (int i = 0; i < n; i++) {
+      const AvatarLocomotion loco = avatar.Locomotion();
+      pl.speedScale = loco.speedScale;
+      pl.jumpScale = loco.jumpScale;
+      pl.canJump = loco.canJump;
+      TickInput in{};
+      in.forward = forward;
+      in.SetHeld(TB_CROUCH, crouch);
+      pl.Update(kTickDt, in, Vec3{0, 0, 1}, Vec3{1, 0, 0}, Vec3{0, 0, 1},
+                kindAt);
+      avTick();
+      if (pl.crouching != was) r.flips++;
+      was = pl.crouching;
+      if (pl.inLiquid) r.wet++;
+      if (i >= 12 && forward != 0.0f) {
+        const float v = Vec3{pl.vel.x, 0, pl.vel.z}.len();
+        r.vLo = std::min(r.vLo, v);
+        r.vHi = std::max(r.vHi, v);
+      }
+      const float y = headY();
+      if (i >= 12) {
+        r.lo = std::min(r.lo, y);
+        r.hi = std::max(r.hi, y);
+        r.jump = std::max(r.jump, std::fabs(y - prev));
+      }
+      prev = y;
+      r.clips = std::max(r.clips, avatar.LiveClipCount());
+      const float s = avatar.Locomotion().speedScale;
+      r.surgeLo = std::min(r.surgeLo, s);
+      r.surgeHi = std::max(r.surgeHi, s);
+    }
+    r.end = prev;
+    return r;
+  };
+  const Run a = phase(false, 0.0f, 40);
+  const Run b = phase(true, 0.0f, 150);
+  const Run cr = phase(true, 1.0f, 90);
+  const Run d = phase(false, 1.0f, 120);
+  // E: THE STUMP JUMP. Stand, then one press: how high the body rises over
+  // where it stood, whether the takeoff clip and the landing clip played.
+  phase(false, 0.0f, 30);
+  const float standY = pl.pos.y;
+  float peak = standY;
+  bool sawJumpClip = false, sawLandClip = false;
+  const bool canJump = avatar.Locomotion().canJump;
+  for (int i = 0; i < 70; i++) {
+    const AvatarLocomotion loco = avatar.Locomotion();
+    pl.speedScale = loco.speedScale;
+    pl.jumpScale = loco.jumpScale;
+    pl.canJump = loco.canJump;
+    TickInput in{};
+    if (i == 0) {
+      in.SetPressed(TB_JUMP, true);
+      in.SetHeld(TB_JUMP, true);
+    }
+    pl.Update(kTickDt, in, Vec3{0, 0, 1}, Vec3{1, 0, 0}, Vec3{0, 0, 1}, kindAt);
+    avTick();
+    pl.jumped = false;   // session drains the latch after each tick batch
+    peak = std::max(peak, pl.pos.y);
+    sawJumpClip |= avatar.ClipWeight("stumpjump") > 0.0f;
+    sawLandClip |=
+                   avatar.ClipWeight("stumpland") > 0.0f;
+  }
+  const float rise = peak - standY;
+  const float fullRise = 0.5f * (CurrentTuning().player.jumpSpeed / kVoxelMeters) *
+                         (CurrentTuning().player.jumpSpeed / kVoxelMeters) /
+                         (CurrentTuning().player.gravity / kVoxelMeters);
+  auto fmt = [](const char* n, const Run& r) {
+    return Format("%s y %.2f..%.2f jump %.2f clips %d crouchFlips %d wet %d "
+                  "v %.1f..%.1f",
+                  n, r.lo, r.hi, r.jump, r.clips, r.flips, r.wet,
+                  r.vLo > r.vHi ? 0.0f : r.vLo, r.vHi);
+  };
+  const float drop = a.end - b.end;
+  const float jumpMax = (float)BaselineNumber("stumpWalkJumpVox", 0.6);
+  const bool ok = std::string(state) == "stumps" && drop > 2.0f &&
+                  a.jump <= jumpMax && b.jump <= jumpMax && cr.jump <= jumpMax &&
+                  d.jump <= jumpMax && b.flips <= 1 && cr.flips == 0 &&
+                  canJump && rise > 0.3f * fullRise && rise < 0.7f * fullRise &&
+                  sawJumpClip && sawLandClip;
+  detail = Format("state %s; kneel drop %.2f vox; %s | %s | %s | %s; surge "
+                  "%.2f..%.2f; jump canJump=%d rise %.2f vox (intact %.2f) "
+                  "takeoff clip %d landing clip %d",
+                  state, drop, fmt("still", a).c_str(), fmt("crouch", b).c_str(),
+                  fmt("crouch-walk", cr).c_str(), fmt("walk", d).c_str(),
+                  d.surgeLo, d.surgeHi, canJump ? 1 : 0, rise, fullRise,
+                  sawJumpClip ? 1 : 0, sawLandClip ? 1 : 0);
+  return done(ok ? Status::Pass : Status::Fail);
+}
+
 // ---- snake ------------------------------------------------------------------
 //
 // THE SNAKE SLITHERS, AND IT BITES (docs/PLAN_weapon_coats.md package D;
@@ -16749,6 +16922,7 @@ const std::vector<Gate>& MobGates() {
       // A body with no legs lies ON the slope and stops re-aiming every voxel.
       {"crawl-slope", "mob", {}, false, GateCrawlSlope, /*needsRender=*/false},
       {"crawl-still", "mob", {}, false, GateCrawlStill, /*needsRender=*/false},
+      {"stump-walk", "mob", {}, false, GateStumpWalk, /*needsRender=*/false},
       // The snake: a legless body that slithers (a wave fixed in the world, laid
       // on the ground segment by segment) and bites its infection in.
       {"snake", "mob", {}, false, GateSnake, /*needsRender=*/false},

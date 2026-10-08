@@ -668,9 +668,18 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   // The eye rides the box top, so a change of box is a change of eye height.
   // Banked into viewYOffset exactly like a step-up, so the camera glides
   // down and up over viewSmoothHalflife instead of stepping.
+  //
+  // SWIMMING, NOT WET (2026-10-07). This was `!inLiquid`, and inLiquid is "one
+  // of the five body samples is wet" -- a puddle at the ankles. A footless
+  // body bleeds from both stumps into exactly that puddle, so its crouch was
+  // dropped and re-taken as the blood spread and soaked away: the kneel sank
+  // and popped back up at random (owner report). Ctrl is swim-down only for a
+  // body the water is carrying; a wader crouches like anyone else. Last
+  // tick's submersion, as inLiquid already was here (both are measured below).
   {
+    const bool swimDepth = inLiquid && submersion >= kSwimSubmersion;
     const bool wantCrouch =
-        in.Held(TB_CROUCH) && !fly && !inLiquid && !hanging && mantleTimer <= 0.0f;
+        in.Held(TB_CROUCH) && !fly && !swimDepth && !hanging && mantleTimer <= 0.0f;
     const float eyeBefore = EyeOffsetNow();
     if (fly) {
       crouching = false;

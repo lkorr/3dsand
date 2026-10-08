@@ -415,11 +415,24 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     locoKneel_ = (kc >= 0 && in.crouch) ? std::min(1.0f, locoKneel_ + kneelStep)
                                         : std::max(0.0f, locoKneel_ - kneelStep);
     const float kneel = Smooth01(locoKneel_);
+    // THE STATE'S JUMP AND LANDING (AnimStateRule::jumpClip / landClip) are
+    // one-shot overrides on the same parts; the blend is a weighted mean, so
+    // while one plays the walk and the kneel give up what it takes.
+    float shot = 0.0f;
+    for (const std::string* nm : {&loco->jumpClip, &loco->landClip}) {
+      if (nm->empty()) continue;
+      const int sc = sk.FindClip(*nm);
+      if (sc < 0) continue;
+      for (const ClipInstance& inst : st.clips)
+        if (inst.clip == sc)
+          shot = std::max(shot, AnimInstanceWeight(sk.clips[sc], inst));
+    }
+    shot = std::clamp(shot, 0.0f, 1.0f);
     float walkTimeMs = -1.0f;
     for (ClipInstance& inst : st.clips)
       if (inst.clip == ci && !inst.stopping) {
         inst.rate = rate;
-        inst.weight = 1.0f - kneel;
+        inst.weight = (1.0f - kneel) * (1.0f - shot);
         walkTimeMs = inst.timeMs;
       }
     if (kc >= 0) {
@@ -431,7 +444,7 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
         PlayClipIndex(kc);
         for (ClipInstance& inst : st.clips)
           if (inst.clip == kc) {
-            inst.weight = kneel;
+            inst.weight = kneel * (1.0f - shot);
             inst.rate = rate;
             // One playhead for both: a kneel authored on the walk's period
             // shuffles the knee that the walk was about to step with.

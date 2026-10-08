@@ -2048,6 +2048,9 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       rule.surgePeak = std::clamp(s.value("surgePeak", 0.75f), 0.05f, 0.95f);
       rule.surgeSteps = std::clamp(s.value("surgeSteps", 2), 1, 8);
       rule.crouchClip = s.value("crouchClip", "");
+      rule.jumpScale = s.value("jumpScale", -1.0f);
+      rule.jumpClip = s.value("jumpClip", "");
+      rule.landClip = s.value("landClip", "");
       // A prone state that still lets the gait run would have the foot plane
       // and the ground plane both claiming the body height. Say so rather
       // than letting whichever ran last win.

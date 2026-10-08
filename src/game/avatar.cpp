@@ -375,6 +375,21 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
     if (PartAlive(legParts[s]) && PartAlive(footParts[s])) legs++;
   out.jumpScale = legs >= 2 ? 1.0f : (legs == 1 ? 0.55f : 0.0f);
   out.canJump = legs > 0 && alive_;
+  // ...unless the live state says what its body can do (AnimStateRule::
+  // jumpScale): two ankle stumps still push off, badly.
+  if (anim_.locoState >= 0 && anim_.locoState < (int)sk.states.size()) {
+    const AnimStateRule& rule = sk.states[anim_.locoState];
+    if (rule.jumpScale >= 0.0f) {
+      out.jumpScale = rule.jumpScale;
+      out.canJump = rule.jumpScale > 0.0f && alive_;
+    }
+    // The landing hurts: the walk is held down while the land clip plays.
+    if (!rule.landClip.empty()) {
+      const float lw =
+          std::clamp(Mob::ClipWeight(rule.landClip), 0.0f, 1.0f);
+      out.speedScale *= 1.0f - 0.7f * lw;
+    }
+  }
   if (!alive_) {
     out.speedScale = 0.0f;
     out.jumpScale = 0.0f;
@@ -630,6 +645,18 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // clip at t=0 for the frame and play nothing at all.
     const bool jumpLatched_ = player.jumped && !prevJumpLatch_;
     prevJumpLatch_ = player.jumped;
+    // A clip-owned state with its OWN takeoff (AnimStateRule::jumpClip, the
+    // stump jump) plays it on the latch itself, not on the debounced airborne
+    // edge below: the latch is one tick wide and the debounce is longer, so
+    // waiting for the edge would consume it unplayed. The air pose never runs
+    // under a clip that owns the body, so the airPose setting is moot here.
+    const AnimStateRule* jumpRule =
+        anim_.locoState >= 0 && anim_.locoState < (int)skel_.states.size()
+            ? &skel_.states[anim_.locoState]
+            : nullptr;
+    const bool stateJumpClip = jumpRule != nullptr && !jumpRule->jumpClip.empty();
+    if (jumpLatched_ && !wasHanging_ && stateJumpClip)
+      PlayClip(jumpRule->jumpClip);
 
     // `wasGrounded_` now tracks the DEBOUNCED state, so these edges fire once
     // per real takeoff/landing rather than once per bump.
@@ -637,7 +664,13 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // Catching a ledge is not a landing: the feet never arrive, so neither
       // the land clip nor its footfall may fire on the grab frame.
       if (!wasGrounded_ && airTime_ > 0.25f && !hangingNow) {
-        PlayClip("land");
+        // A state with its own landing (the stump walk's) plays that instead.
+        const AnimStateRule* lr =
+            anim_.locoState >= 0 && anim_.locoState < (int)skel_.states.size()
+                ? &skel_.states[anim_.locoState]
+                : nullptr;
+        PlayClip(lr != nullptr && !lr->landClip.empty() ? lr->landClip
+                                                         : std::string("land"));
         // A landing is its own sound, not a footstep: both feet arrive at once
         // and the impact carries the fall. Uses the fall speed remembered from
         // the last airborne tick, because by the time `grounded` is true the
@@ -705,7 +738,8 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // clip is an additive arms-and-thighs pose over joints the air IK then
       // overwrites, and its torso keys would fight the lean. Off, this is the
       // old path exactly.
-      if (jumpLatched_ && !wasHanging_ && !CurrentTuning().avatar.airPose)
+      if (jumpLatched_ && !wasHanging_ && !stateJumpClip &&
+          !CurrentTuning().avatar.airPose)
         PlayClip("jump");
       airTime_ += dt;
       // ---- LONG ENOUGH IN THE AIR TO GO LIMP (sim/tuning.h Ragdoll) ----
