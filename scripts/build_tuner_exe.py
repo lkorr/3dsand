@@ -49,6 +49,8 @@ def main():
         # tuner_server is imported dynamically by tuner_app; name it so the
         # analyzer keeps it.
         "--hidden-import", "tuner_server",
+        # the map page's PNG import / export codec (imported on demand)
+        "--hidden-import", "map_png",
         "--paths", SCRIPTS,
         os.path.join(SCRIPTS, "tuner_app.py"),
     ]

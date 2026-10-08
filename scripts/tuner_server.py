@@ -51,6 +51,12 @@ happens in this process rather than in the page:
   POST /api/worldmap/tile?name=&plane=&tx=&tz=   write it (header checked
                               against plane and tx/tz; write-then-rename); an
                               EMPTY body deletes it (back to the default)
+  POST /api/mappng/encode?w=&h=&format=grey16|rgb8[&note=]   body = raw
+                              samples (grey16: u16 LE; rgb8: 3 bytes a pixel) ->
+                              a PNG (scripts/map_png.py; the map page's export)
+  POST /api/mappng/decode     body = a PNG -> 'SVPN' blob: u32 w, h, format
+                              (1 grey, 2 rgb), max, noteLen, note JSON, samples
+                              (the map page's height / biome import)
   GET  /api/worldmap/sculpt?name=   the map's sculpt layer (binary 'SVSC'; 404 = none)
   POST /api/worldmap/sculpt?name=   write it (write-then-rename); an EMPTY body
                               deletes the file (no layer = the pre-P5 world)
@@ -1193,6 +1199,14 @@ def _map_v2_check(j):
         return "planes.height.default must be an integer in -32000..32000 (voxels)"
     if planes["biome"].get("default") not in biomes:
         return "planes.biome.default must name a biome in biomes[]"
+    # E2: ridge / valley LINES -- the editor's re-bake source. The engine
+    # reads the baked height plane, never these; only their shape is checked.
+    ridges = j.get("ridges", [])
+    if not isinstance(ridges, list) or not all(
+            isinstance(r, dict) and isinstance(r.get("points"), list)
+            and all(isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) for x in p) for p in r["points"])
+            for r in ridges):
+        return "ridges[] must be objects whose points are [x, z, y] triples (world voxels)"
     return None
 
 
@@ -2396,6 +2410,43 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 return self._json(500, {"ok": False, "error": str(e)})
             return self._json(200, {"ok": True, "bytes": len(blob), "tiles": count})
+        if p in ("/api/mappng/encode", "/api/mappng/decode"):
+            # The World map page's PNG import / export (PLAN_map_v2 E2): the
+            # page owns the planes and the mapping (metres per unit, offset,
+            # which posts); this is only the codec, so an import lands in the
+            # page's undo like any stroke and an export carries unsaved edits.
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                if here not in sys.path:
+                    sys.path.insert(0, here)
+                import map_png
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"ok": False, "error": "map_png: %s" % e})
+            blob = self._raw()
+            try:
+                if p == "/api/mappng/decode":
+                    return self._send(200, map_png.decoded_blob(map_png.decode(blob)), "application/octet-stream")
+                q = self._query()
+                w = int((q.get("w") or ["0"])[0])
+                h = int((q.get("h") or ["0"])[0])
+                fmt = (q.get("format") or [""])[0]
+                note = (q.get("note") or [None])[0]
+                if not (0 < w <= 16384 and 0 < h <= 16384):
+                    return self._json(400, {"ok": False, "error": "w and h must be 1..16384"})
+                if fmt == "grey16":
+                    if len(blob) != w * h * 2:
+                        return self._json(400, {"ok": False, "error": "grey16 needs %d bytes, got %d" % (w * h * 2, len(blob))})
+                    png = map_png.encode_grey16(w, h, struct.unpack("<%dH" % (w * h), blob), note)
+                elif fmt == "rgb8":
+                    if len(blob) != w * h * 3:
+                        return self._json(400, {"ok": False, "error": "rgb8 needs %d bytes, got %d" % (w * h * 3, len(blob))})
+                    png = map_png.encode_rgb8(w, h, blob, note)
+                else:
+                    return self._json(400, {"ok": False, "error": "format must be grey16 or rgb8"})
+                return self._send(200, png, "image/png")
+            except Exception as e:  # noqa: BLE001 -- a malformed PNG / zlib stream is the client's error
+
+                return self._json(400, {"ok": False, "error": str(e)})
         if p == "/api/worldmap/tile":
             # One v2 plane tile. An EMPTY body deletes it: the tile is back
             # to the plane's default, which is what an absent tile means.
