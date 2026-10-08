@@ -103,8 +103,8 @@ const PFLAG_DEPOSIT : u32 = 262144u;  // bit 18: bidding for a deposit slot
 const TK_REQ_BASE    : u32 = 64u;   // kTicketReqBase: request buckets (not written here)
 const TK_REQ_BUCKETS : u32 = 32u;   // kTicketReqBuckets
 const TK_DEP_BASE    : u32 = 96u;   // kTicketDepBase: deposit slots
-const TK_DEP_SLOTS   : u32 = 6u;    // kTicketDepSlots
-const TK_DEP_STRIDE  : u32 = 5u;    // kTicketDepStride: prio, px, py, pz, payload
+const TK_DEP_SLOTS   : u32 = 5u;    // kTicketDepSlots
+const TK_DEP_STRIDE  : u32 = 6u;    // kTicketDepStride: prio, px, py, pz, payload, count
 const TK_FAR_KILLED  : u32 = 126u;  // kTicketFarKilled: no longer written
 const TK_PARKED      : u32 = 127u;  // kTicketParkedNow: bidding this tick
 const TK_REQ_BIAS : i32 = 64;       // kTicketReqBias
@@ -1048,7 +1048,11 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // CPU, which parks it as a far landing (tickets.h) and re-throws it when its
   // chunk is resident. A loser stays parked and bids again next tick. Two
   // particles with the SAME priority hashed the same state: same position,
-  // same payload, so the record they both write is the same record.
+  // same payload, so the record they both write is the same record -- but
+  // they are TWO grains, and both die here. THE COUNT WORD (2026-10-07):
+  // every winner adds one, and the CPU takes that many landings off the
+  // record (World snapshot decode), so a tie hands over all of them. An add
+  // is order-free (rule 1).
   if ((p.flags & PFLAG_DEPOSIT) != 0u && (p.flags & PFLAG_ALIVE) != 0u) {
     let ds = depositSlot(p);
     if (atomicLoad(&pageFaults[ds]) == particlePriority(p)) {
@@ -1056,6 +1060,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
       atomicStore(&pageFaults[ds + 2u], bitcast<u32>(p.py));
       atomicStore(&pageFaults[ds + 3u], bitcast<u32>(p.pz));
       atomicStore(&pageFaults[ds + 4u], p.payload);
+      atomicAdd(&pageFaults[ds + 5u], 1u);
       p.flags = 0u;
     } else {
       p.flags &= ~PFLAG_DEPOSIT;

@@ -1234,7 +1234,11 @@ void World::KickReadback() {
             d.py = (int32_t)at(b0 + 2);
             d.pz = (int32_t)at(b0 + 3);
             d.payload = at(b0 + 4);
-            out.ticketDeposits.push_back(d);
+            // THE COUNT: every bit-identical winner died handing over (the
+            // deposit tie, sim_particle.wgsl resolve). At least one; bounded
+            // by the particles alive, which the pool caps.
+            const uint32_t n = std::max(1u, std::min(at(b0 + 5), kParticleCap));
+            for (uint32_t r = 0; r < n; r++) out.ticketDeposits.push_back(d);
           }
           out.ticketFarKilled = at(kTicketFarKilled);
           out.ticketParked = at(kTicketParkedNow);

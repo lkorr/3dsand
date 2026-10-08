@@ -636,7 +636,34 @@ fn markVoxActive(idx : u32) {
 
 // Unloaded space is solid and inert (DESIGN.md §3): the sim's world edge is
 // the residency window, not a fixed cube.
-fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
+//
+// A WINDOW CELL'S EDGE IS THE WINDOW (2026-10-07, PLAN_chunk_tickets §6). A
+// ticket box may touch the window face, and its SHELL chunks are resident
+// (cellResident) but never dispatched: a window cell that saw them as in
+// bounds moved matter into a shell, where it froze until the box re-centred,
+// released, or the window covered it. A cell of the window now sees only the
+// window (the edge is "solid and inert" again, as before tickets); a cell of a
+// ticket sees every resident cell (its own shell -- its active interior never
+// touches the window). Matter still leaves the window the way it always has,
+// as a particle (sim_particle's own inBounds).
+fn inBounds(c : vec3<i32>) -> bool {
+  if (!gInTicket) { return inWindow(c, T.origin); }
+  return cellResident(c, T.origin);
+}
+
+// THE RNG KEY OF A CELL (2026-10-07, PLAN_chunk_tickets §2.2 (d)): a pure
+// function of the FULL world coordinate. `cellIndexW` is the window-wrapped
+// index (c & WORLD_MASK), so a ticket cell 512 voxels outside the window rolled
+// the same dice as the window cell it aliases. The 512-block's hash is folded
+// in, so no two cells of different blocks share a stream by construction --
+// and it is independent of the window origin (a cell keeps its stream as the
+// window moves, and two peers with different windows roll the same dice for
+// it). Only an RNG / hash KEY: never an address (that is voxWordIndex).
+fn rngCellId(c : vec3<i32>) -> u32 {
+  let b = vec3<u32>(bitcast<u32>(c.x >> WORLD_SHIFT), bitcast<u32>(c.y >> WORLD_SHIFT),
+                    bitcast<u32>(c.z >> WORLD_SHIFT));
+  return cellIndexW(c) ^ pcg(b.x ^ pcg(b.y ^ pcg(b.z ^ 0x5EEDB10Cu)));
+}
 
 // flagSupportLoss now lives in common.wgsl (the SUPPORT_LOSS block): the
 // MutationQueue and blast kernels raise it too, and two copies of the rule
@@ -3556,7 +3583,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // address. Feeding a page index into hash3 would make the sim's random
     // stream depend on allocation history — the world would still be
     // self-consistent and would still diverge from a dense run.
-    let niSlot = cellIndexW(n);
+    let niSlot = rngCellId(n);
     let niw = voxIndexAndWord(n);  // one table resolution for index + word
     let ni = niw.x;
     let nw = niw.y;
@@ -5657,7 +5684,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       // Refused (or the invariant broke, which gasConvert has counted): the
       // voxel stays and takes the rest of its ladder, as it would at a wall.
       if (!ok) { atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u); }
-      let slotIdx = cellIndexW(c);
+      let slotIdx = rngCellId(c);
       stepGasFrom(c, idx, w, materials[voxMat(w)], slotIdx,
                   hash3(T.seed, T.tick * 2u + P.substep, slotIdx), 1u);
     }
@@ -5709,7 +5736,7 @@ fn caCell(ci : u32, local : vec3<i32>) {
   // index would make every cell's random stream a function of allocation
   // history, and a paged run would diverge from a dense one with no other
   // symptom.
-  let slotIdx = cellIndexW(c);
+  let slotIdx = rngCellId(c);
   let here = voxIndexAndWord(c);  // one table resolution for index + word
   let idx = here.x;
   let w = here.y;

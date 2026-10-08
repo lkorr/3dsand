@@ -287,9 +287,12 @@ of freezing; they are not a bigger window.
 - **Particles leave the window and land (P2; option C since 2026-10-06).** A
   particle whose flight leaves residency stops at the first sample past it and
   DEPOSITS at once (`sim_particle.wgsl` FAR LANDING): it bids
-  `particlePriority` into one of the 6 deposit slots of the ticket record
+  `particlePriority` into one of the 5 deposit slots of the ticket record
   (`atomicMax`, order-free), the winner hands px/py/pz/payload to the CPU in
-  `resolve` and dies, a loser stays put, still, and bids again next tick. The
+  `resolve` and dies, a loser stays put, still, and bids again next tick. A
+  TIE (bit-identical particles: same cell, same payload, at rest) is every
+  winner dying at once: each adds one to the slot's COUNT word (2026-10-07)
+  and the CPU takes that many landings off the one record. The
   CPU (`Tickets::TakeDeposits`) LOWERS a landing that is above its own ground,
   `World::TerrainHeight` (genColumn's twin, the height contract), onto it —
   straight down, the deposit carries no velocity; below the ground (a cave) it
@@ -317,6 +320,18 @@ of freezing; they are not a bigger window.
 - **Reactions (P3).** Only DECAY runs in a ticket (`sim_step.wgsl gInTicket`):
   decay and movement terminate, pair and emit rules propagate past the box's
   edge. An ember in a ticket burns out to ash / smoke / air and lights no wood.
+- **The window edge stays solid and inert (2026-10-07).** A box may touch the
+  window face, and its shell is resident but never dispatched. A WINDOW cell's
+  `inBounds` is the window (`inWindow`); only a ticket cell sees every resident
+  cell. So window matter cannot step into a neighbouring shell and freeze
+  there; it still leaves as a particle. Gate `ticket-edge` (EDGE).
+- **Every CA roll is keyed on the full world coordinate (2026-10-07).**
+  `rngCellId(c)` = `cellIndexW(c)` XOR a hash of the 512-block
+  (`sim_step.wgsl`): a ticket cell no longer shares its dice with the window
+  cell it aliases 512 voxels away, and a cell keeps its stream as the window
+  moves (and on two peers with different windows). `cellIndexW` stays the
+  storage hat. Moved the world hash. Gate `ticket-edge` (ALIAS: two boxes 512
+  apart burn their embers out differently).
 - **Rendering (P4).** `raymarch.wgsl traceTickets`: after a ray leaves the window
   with no surface, at most `ticketCount` (16) AABB slab tests from the window
   exit, and an ordinary DDA inside a hit box reading the ticket's slots

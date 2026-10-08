@@ -138,10 +138,12 @@ site is classified as exactly one of:
   planes, `SpawnWindowOrigin`, the toroidal wrap in `slotToWorldChunk`) →
   UNCHANGED;
 - (d) **identity** (`cellIndexW` as an RNG / hash / claim key) → UNCHANGED
-  (position-derived already). A ticket cell shares its RNG stream with the
+  (position-derived already). A ticket cell shared its RNG stream with the
   window cell 512 voxels away on each axis: deterministic, position-derived,
-  statistically correlated. Accepted for v1; keying every roll on the full
-  world coordinate fixes it and moves the hash — a later, separate commit.
+  statistically correlated. Accepted for v1; FIXED 2026-10-07: every CA roll
+  in `sim_step.wgsl` keys on `rngCellId(c)` (the 512-block's hash folded into
+  `cellIndexW`), a pure function of the full world coordinate. Moved the hash.
+  Gate `ticket-edge` (ALIAS).
 
 **The hazard to grep for:** any place a STORAGE slot (`ci`, `slot`, a
 `dirtyList[]` entry) is used as a hash / RNG / claim key. `gFilmLicence =
@@ -557,18 +559,18 @@ per-slot arrays), `occupancyFull` +7 us on hash ticks — with `compact` flat
 ray and is inside noise.
 
 **Stated limitations that remain** (follow-ups, not fixed here):
-- A deposit TIE (two parked particles with bit-identical position and payload
-  in one deposit slot on one tick) hands over ONE record and kills both. Same
-  class as the claim system's equal-priority rule; needs a count word in the
-  record.
+- ~~A deposit TIE hands over ONE record and kills both~~ FIXED 2026-10-07:
+  the record has a COUNT word (`kTicketDepStride` 6, `kTicketDepSlots` 5),
+  every tied winner adds one in `resolve`, and the CPU takes that many
+  landings. Gate `ticket-edge` (TIE).
 - ~~Far flight before the cascade first fills~~ CLOSED 2026-10-06 (option C):
   there is no far flight; a particle leaving residency deposits at once and
   the CPU lowers it onto `World::TerrainHeight` (DESIGN.md P2 bullet).
-- Window-edge cells now see an ADJACENT ticket's shell as resident (a box may
-  touch the window), so matter can move from the window into a ticket shell,
-  where it freezes until the box re-centres, releases, or the window covers it.
-  Deterministic, and nothing is lost, but the window edge stops being "solid
-  and inert" there.
+- ~~Window-edge cells see an ADJACENT ticket's shell as resident~~ FIXED
+  2026-10-07: a window cell's `inBounds` is the window again (only a ticket
+  cell sees every resident cell), so window matter cannot step into a shell
+  and freeze; the edge is "solid and inert" as before tickets. Gate
+  `ticket-edge` (EDGE).
 - Multiplayer: each peer's ticket set follows its own window and particles
   (per-client residency, DESIGN.md §10); divergence between peers is the
   existing per-chunk hash / authority resync's to repair, as for any chunk one

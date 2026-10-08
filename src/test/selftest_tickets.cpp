@@ -901,6 +901,254 @@ Status GateTicketDecay(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// ticket-edge: the three "stated limitations" of PLAN_chunk_tickets.md §6 /
+// §2.2 (d), fixed 2026-10-07, one arm each.
+// ---------------------------------------------------------------------------
+//   TIE    two BIT-IDENTICAL stones (same cell, at rest, same payload) spawned
+//          past the +X face on one tick: both hand over in the same deposit
+//          slot with the same priority. Both must reach the CPU as landings
+//          (the record's count word); the old record handed over one and
+//          killed both.
+//   EDGE   a ticket placed FACE-ADJACENT to the window (its shell touches the
+//          +X face), and a sand column poured on the window's last cells
+//          against it. The window edge is solid and inert to a window cell
+//          (sim_step.wgsl inBounds): not one grain enters the box, and the
+//          sand is all still in the window. The old rule let it topple into
+//          the never-dispatched shell, where it froze.
+//   ALIAS  two tickets exactly 512 cells apart (the window size: their cells
+//          share the window-wrapped index), the same 32 embers on the same
+//          stone plinths at the same height in each. In a ticket only DECAY
+//          runs, so an ember's lifetime is its dice alone: on a shared stream
+//          (cellIndexW) the two boxes burnt out ember for ember in lockstep;
+//          keyed on the full world coordinate (rngCellId) they do not.
+//          Asserted: the alive-sets differ on some sample, and both burn out.
+struct EdgeRun {
+  uint64_t tieDeposited = 0;
+  bool tiePlaced = false;
+  // EDGE
+  bool edgeAdjacent = false;
+  IVec3 edgeLo{};
+  uint32_t edgePoured = 0;
+  uint64_t boxSand0 = 0, boxSand1 = 0;
+  int64_t windowDelta = 0;
+  bool edgeLive = false;
+  // ALIAS
+  uint32_t aliasEmbers = 0;
+  uint32_t aliasSamples = 0, aliasDiffer = 0;
+  int goneA = -1, goneB = -1;
+  uint32_t faults = 0;
+};
+
+bool RunEdge(Ctx& c, EdgeRun& R, std::string& why) {
+  const int mStone0 = MatId(c, "glass");
+  const int mSand = MatId(c, "sand"), mEmber = MatId(c, "ember"), mStone = MatId(c, "stone");
+  if (mStone0 < 0 || mSand < 0 || mEmber < 0 || mStone < 0) {
+    why = "missing one of glass/sand/ember/stone";
+    return false;
+  }
+  Tickets& T = c.stream.TicketSet();
+  // ---- TIE ---------------------------------------------------------------
+  Regenerate(c);
+  IVec3 o = c.world.WindowOrigin();
+  const int faceX = (o.x + (int)kNChunk) * (int)kChunk;
+  const int zMid = (o.z + (int)kNChunk / 2) * (int)kChunk;
+  uint32_t t = 84000;
+  {
+    const int xT = faceX + 9 * (int)kChunk;
+    const int hT = World::TerrainHeight(xT, zMid, kDefaultSeed);
+    support::TickCursor tick{c, t, IVec3{(faceX - 6) >> 4, hT >> 4, zMid >> 4}};
+    const uint64_t dep0 = T.Stats().landingsDeposited;
+    support::TickOps ops;
+    ops.spawns.push_back(Stone({xT, hT + 3, zMid}, 0, (uint32_t)mStone0));
+    ops.spawns.push_back(Stone({xT, hT + 3, zMid}, 0, (uint32_t)mStone0));
+    tick(ops);
+    for (int i = 0; i < 2 * (int)World::kSnapshotLatency + 6; i++) tick();
+    R.tieDeposited = T.Stats().landingsDeposited - dep0;
+    R.tiePlaced = true;
+  }
+
+  // ---- EDGE ----------------------------------------------------------------
+  Regenerate(c);
+  o = c.world.WindowOrigin();
+  {
+    const int xIn = faceX - 1;  // the window's last column
+    const int base = std::max(World::TerrainHeight(xIn, zMid, kDefaultSeed),
+                              World::TerrainHeight(faceX, zMid, kDefaultSeed)) + 1;
+    const IVec3 centre{o.x + (int)kNChunk + 1, base >> 4, zMid >> 4};
+    support::TickCursor tick{c, t, IVec3{xIn >> 4, base >> 4, zMid >> 4}};
+    T.Request(centre, TicketReason::Gate, t + 1);
+    tick();
+    const uint32_t tk = T.TicketHolding(centre);
+    if (tk >= kTicketMax) {
+      why = "EDGE: no ticket over the chunk past the +X face";
+      return false;
+    }
+    R.edgeLo = T.BoxLo(tk);
+    R.edgeAdjacent = R.edgeLo.x == o.x + (int)kNChunk;
+    c.ctx.WaitIdle();
+    R.boxSand0 = ReadTicket(c, tk, (uint32_t)mSand).mass;
+    // The window side: the 3x3x3 chunks round the pour's chunk (all window).
+    const IVec3 pc{xIn >> 4, base >> 4, zMid >> 4};
+    auto windowSand = [&]() {
+      uint64_t m = 0;
+      std::vector<uint32_t> buf(kChunkVol);
+      for (int dz = -1; dz <= 1; dz++)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 0; dx++) {
+            const IVec3 wc{pc.x + dx, pc.y + dy, pc.z + dz};
+            const uint32_t ci = c.world.ResidentCellIndex(
+                {wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk});
+            if (ci == World::kTicketSlotNone) continue;
+            ReadVoxelsSync(c.ctx, c.world, ci / kChunkVol, 1, buf.data(), "ticketEdgeWin");
+            for (uint32_t w : buf)
+              if ((w & 0xFFFu) == (uint32_t)mSand) m += PowderMassOfState((w >> 12) & 0xFu);
+          }
+      return m;
+    };
+    const uint64_t win0 = windowSand();
+    // A 1 x 1 column of 10 sand on the window's last cell, against the face.
+    std::vector<CellOp> pour;
+    for (int y = base; y < base + 10; y++) {
+      const uint32_t ci = c.world.ResidentCellIndex({xIn, y, zMid});
+      if (ci == World::kTicketSlotNone) continue;
+      pour.push_back({ci, PackVoxNew((uint32_t)mSand, 0) | kCellOpIfAir});
+    }
+    tick(std::vector<BrushOp>{}, pour);
+    c.ctx.WaitIdle();
+    // What the pour put down (IfAir may refuse a grass tuft), read the tick it
+    // landed: the window's sand from here on must neither grow nor shrink.
+    const uint64_t winPour = windowSand();
+    for (int i = 0; i < 16; i++) tick();
+    c.ctx.WaitIdle();
+    R.edgeLive = T.StateOf(tk) == Tickets::State::Live;
+    R.boxSand1 = R.edgeLive ? ReadTicket(c, tk, (uint32_t)mSand).mass : R.boxSand0;
+    const uint64_t win1 = windowSand();
+    R.windowDelta = (int64_t)win1 - (int64_t)winPour;
+    R.edgePoured = (uint32_t)((winPour - std::min(winPour, win0)) / kPowderFull);
+  }
+
+  // ---- ALIAS -------------------------------------------------------------
+  Regenerate(c);
+  o = c.world.WindowOrigin();
+  {
+    // Two centres 32 chunks (512 cells, kWorldN) apart on Z, both past the
+    // window's -Z face; the same local cells, at the same height.
+    const int cx = o.x + (int)kNChunk / 2;
+    const int czA = o.z - 40, czB = czA - (int)kNChunk;
+    const int x0 = cx * (int)kChunk + 4;
+    const int z0A = czA * (int)kChunk + 4, z0B = czB * (int)kChunk + 4;
+    int ground = -1 << 30;
+    for (int dz = 0; dz < 8; dz++)
+      for (int dx = 0; dx < 8; dx++)
+        ground = std::max({ground, World::TerrainHeight(x0 + dx, z0A + dz, kDefaultSeed),
+                           World::TerrainHeight(x0 + dx, z0B + dz, kDefaultSeed)});
+    // A floating stone slab well above both sites' ground (and any water on
+    // it): the embers sit in the same air at both, so nothing but the dice
+    // separates them. Nothing scans a ticket for islands, so the slab stays.
+    ground += 20;
+    const IVec3 cA{cx, (ground + 2) >> 4, czA}, cB{cx, (ground + 2) >> 4, czB};
+    support::TickCursor tick{c, t, cA};
+    T.Request(cA, TicketReason::Gate, t + 1);
+    T.Request(cB, TicketReason::Gate, t + 1);
+    tick();
+    const uint32_t tA = T.TicketHolding(cA), tB = T.TicketHolding(cB);
+    if (tA >= kTicketMax || tB >= kTicketMax) {
+      why = "ALIAS: the two tickets were not both granted";
+      return false;
+    }
+    std::vector<CellOp> build;
+    std::vector<IVec3> emA, emB;
+    auto put = [&](int x, int y, int z, uint32_t w) {
+      const uint32_t ci = c.world.ResidentCellIndex({x, y, z});
+      if (ci != World::kTicketSlotNone) build.push_back({ci, w});
+    };
+    for (int z0 : {z0A, z0B})
+      for (int dz = 0; dz < 8; dz++)
+        for (int dx = 0; dx < 8; dx++) {
+          const int x = x0 + dx, z = z0 + dz;
+          put(x, ground, z, PackVoxNew((uint32_t)mStone, 0));
+          if ((dx + dz) % 2 == 0) {
+            put(x, ground + 1, z, PackVoxNew((uint32_t)mEmber, 0));
+            (z0 == z0A ? emA : emB).push_back({x, ground + 1, z});
+          }
+        }
+    R.aliasEmbers = (uint32_t)emA.size();
+    tick(std::vector<BrushOp>{}, build);
+    auto alive = [&](const std::vector<IVec3>& cells) {
+      uint64_t bits = 0;
+      std::vector<uint32_t> buf(kChunkVol);
+      uint32_t lastSlot = ~0u;
+      for (size_t k = 0; k < cells.size(); k++) {
+        const uint32_t ci = c.world.ResidentCellIndex(cells[k]);
+        if (ci == World::kTicketSlotNone) continue;
+        if (ci / kChunkVol != lastSlot) {
+          lastSlot = ci / kChunkVol;
+          ReadVoxelsSync(c.ctx, c.world, lastSlot, 1, buf.data(), "ticketAlias");
+        }
+        if ((buf[ci % kChunkVol] & 0xFFFu) == (uint32_t)mEmber) bits |= 1ull << k;
+      }
+      return bits;
+    };
+    // Sampled every 5 ticks while BOTH boxes are live (the sets are compared
+    // only then); a box whose embers are all gone idles out and releases
+    // kTicketIdleTicks later, so each box is also followed alone until it is
+    // empty or released (a release is idleness: nothing left that can act).
+    for (int i = 1; i <= 1200 && (R.goneA < 0 || R.goneB < 0); i++) {
+      tick();
+      if (i % 5 != 0) continue;
+      const bool liveA = T.StateOf(tA) == Tickets::State::Live;
+      const bool liveB = T.StateOf(tB) == Tickets::State::Live;
+      c.ctx.WaitIdle();
+      const uint64_t a = liveA ? alive(emA) : 0, b = liveB ? alive(emB) : 0;
+      if (liveA && liveB) {
+        R.aliasSamples++;
+        if (a != b) R.aliasDiffer++;
+      }
+      if (a == 0 && R.goneA < 0) R.goneA = i;
+      if (b == 0 && R.goneB < 0) R.goneB = i;
+    }
+  }
+  R.faults = c.world.Snap().pageFaults;
+  return true;
+}
+
+Status GateTicketEdge(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  EdgeRun A, B;
+  std::string why;
+  const bool okA = RunEdge(c, A, why);
+  const bool okB = okA && RunEdge(c, B, why);
+  Regenerate(c);
+  if (!okA || !okB) {
+    detail = why;
+    return Status::Fail;
+  }
+  const bool tie = A.tieDeposited == 2;
+  const bool edge = A.edgeAdjacent && A.edgeLive && A.edgePoured > 0 &&
+                    A.boxSand1 == A.boxSand0 && A.windowDelta == 0;
+  const bool alias = A.aliasEmbers > 0 && A.aliasDiffer > 0 && A.goneA >= 0 && A.goneB >= 0;
+  const bool same = A.tieDeposited == B.tieDeposited && A.boxSand1 == B.boxSand1 &&
+                    A.windowDelta == B.windowDelta && A.aliasDiffer == B.aliasDiffer &&
+                    A.goneA == B.goneA && A.goneB == B.goneB;
+  const bool noFaults = A.faults == 0 && B.faults == 0;
+  const bool ok = tie && edge && alias && same && noFaults;
+  detail = Format(
+      "TIE: two bit-identical stones -> %llu landing(s) deposited (want 2) | EDGE: box "
+      "lo (%d,%d,%d) %s the +X face, ticket %s at the read; %u sand poured on the "
+      "window's last cell: box sand %llu -> %llu eighths (want unchanged), window sand "
+      "%+lld eighths after the pour landed (want 0) | ALIAS: %u embers in each of two boxes 512 cells "
+      "apart: alive-sets differ on %u of %u samples (want > 0; a shared stream is 0), "
+      "burnt out at +%d / +%d | page faults %u/%u | run twice: %s",
+      (unsigned long long)A.tieDeposited, A.edgeLo.x, A.edgeLo.y, A.edgeLo.z,
+      A.edgeAdjacent ? "touching" : "NOT touching", A.edgeLive ? "live" : "RELEASED",
+      A.edgePoured, (unsigned long long)A.boxSand0, (unsigned long long)A.boxSand1,
+      (long long)A.windowDelta, A.aliasEmbers, A.aliasDiffer, A.aliasSamples, A.goneA, A.goneB, A.faults, B.faults,
+      same ? "IDENTICAL" : "DIVERGED");
+  std::printf("ticket-edge: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // ticket-render (P4)
 // ---------------------------------------------------------------------------
 // TWO P4 CLAIMS ON ONE TICKET in open sky past the window's +X face:
@@ -1210,6 +1458,8 @@ const std::vector<Gate>& TicketGates() {
       {"ticket-settle", "sim", {}, false, GateTicketSettle},
       {"ticket-land", "sim", {}, false, GateTicketLand},
       {"ticket-decay", "sim", {}, false, GateTicketDecay},
+      // Section 6's limitations, fixed: deposit tie, window edge vs shell, RNG alias.
+      {"ticket-edge", "sim", {}, false, GateTicketEdge},
       {"ticket-render", "render", {}, false, GateTicketRender, /*needsRender=*/true},
       {"ticket-look", "render", {}, false, GateTicketLook, /*needsRender=*/true},
   };

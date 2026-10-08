@@ -177,9 +177,10 @@ Two sites are worth naming even though they are correct:
 - `cellIndexW` is `c & WORLD_MASK`, so **a ticket cell will share its RNG stream
   with the window cell 512 voxels away on each axis.** Deterministic and
   position-derived, so rule 1 holds; statistically correlated, so it is a
-  quality question, not a correctness one. The plan accepts this for v1 (§2.2d).
-  Keying every roll on the full world coordinate is a later, separate commit
-  because it moves the hash.
+  quality question, not a correctness one. The plan accepted this for v1
+  (§2.2d). FIXED 2026-10-07: the CA's rolls key on `rngCellId(c)`
+  (`sim_step.wgsl`, a pure function of the full world coordinate); the (d)
+  hat is now its own function and `cellIndexW` is storage only there.
 
 ## The two-hat problem (`cellIndexW`), and what it costs
 

@@ -1805,7 +1805,12 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //          ticket request (Tickets::Tick).
 //   [96..125] kTicketDepSlots DEPOSIT slots of kTicketDepStride words:
 //          priority (atomicMax by the bidders in integrate), then the winner's
-//          px, py, pz (24.8) and payload, written by it alone in resolve.
+//          px, py, pz (24.8) and payload, written in resolve, then the COUNT
+//          of winners (atomicAdd): particles whose priority equals the max are
+//          bit-identical (same position, zero velocity, same payload), and
+//          each of them dies handing over, so the CPU takes `count` landings
+//          off the one record (2026-10-07; it used to take one and lose the
+//          rest -- the "deposit tie").
 //   [126]  particles killed for leaving the far box this tick (atomicAdd)
 //   [127]  particles parked this tick (atomicAdd)
 // sim_particle.wgsl's TK_* consts mirror these (check_invariants `ticket record`).
@@ -1813,8 +1818,8 @@ constexpr uint32_t kPageFaultTicketBase = 64;    // fill_ticketRec starts here
 constexpr uint32_t kTicketReqBase = 64;
 constexpr uint32_t kTicketReqBuckets = 32;
 constexpr uint32_t kTicketDepBase = 96;
-constexpr uint32_t kTicketDepSlots = 6;
-constexpr uint32_t kTicketDepStride = 5;
+constexpr uint32_t kTicketDepSlots = 5;
+constexpr uint32_t kTicketDepStride = 6;   // prio, px, py, pz, payload, count
 constexpr uint32_t kTicketFarKilled = 126;
 constexpr uint32_t kTicketParkedNow = 127;
 constexpr int32_t kTicketReqBias = 64;           // chunk offset bias, 7 bits a side
