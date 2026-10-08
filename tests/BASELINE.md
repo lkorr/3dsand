@@ -1269,3 +1269,38 @@ freeze / ambient / bound / plume / updraft, oil-fire, glow, sleep PASS.
 lid + 1 (a plate leaf that dropped onto the chamber lid, still directly above
 the flame); `heat-live` fails exactly as on main 60713bd (X 102 of 114, the
 pend list stalling in a proven-settled window -- not this package).
+
+## 2026-10-07 — correctness sweep (worktree branch): `determinismHash` d07bdc17 -> 539a2f07
+
+Recorded with `--selftest --gate determinism --rebaseline`; the twice-run
+reproduces (and the final `--verify` matched the new golden). Intentional:
+every CA roll in `sim_step.wgsl` now keys on `rngCellId(c)` (the 512-block's
+hash folded into `cellIndexW`, so a ticket cell stops sharing its dice with
+the window cell it aliases), which changes every random outcome in the world.
+Also in this tree, none of which moves the hash on its own: a window cell's
+`inBounds` is the window (no stepping into a face-adjacent ticket shell), the
+ticket deposit record has a count word (5 slots x 6 words), the heat pend list
+withholds the settled-tick proof, a healed joint twin's second copy is free,
+AVTR v2, the ITMS body index skips fixtures, peer blasts hit owned NPCs and
+debris, gas crosses the op wire.
+
+- New gates, all `pass`: `heal-joint` (audit R3 + R4), `ticket-edge` (TIE /
+  EDGE / ALIAS; measured against the pre-fix `sim_step.wgsl` through
+  SANDVOX_ASSET_DIR: EDGE took 24 eighths into the shell and ALIAS differed on
+  0 of 86 samples, i.e. the gate sees both bugs), `save-avatar-body` (AVTR v2).
+- `heat-live` PASSES (X 114 of 114; it failed on main since 60713bd).
+- `save-items` gained arm D (a fixture ahead of the items); `blast-players`
+  gained arms (e) / (f); `ops-exchange` gained arm (H): `net.opsExchangeRows`
+  32 -> 37.
+- `village-twice` PASSES on this tree (the 2026-09-29 in-process hinge leak was
+  fixed by det-cpu 2026-10-03; nothing new needed).
+- NOT re-pinned here (the owner runs no smokes / full suites): the smoke probe
+  tables and `harrowby.dayTrace` move with the RNG key; `village-harrowby`
+  will report its trace as moved until `--selftest --gate village-harrowby
+  --rebaseline`. `ops-replay`'s record-size note (5,436,252 vs 5,421,372 B) is
+  informational and passed.
+- Final `--verify` (one boot, 17 gates): village-twice, heal-joint,
+  heal-restore, heal-wound, heat-live, ticket-edge, ticket-land, ticket-decay,
+  save-entities, save-items, save-avatar-body, mob-save-delta, mob-handoff,
+  blast-players, ops-exchange, determinism, ops-replay: all PASS, 0 page
+  faults.
