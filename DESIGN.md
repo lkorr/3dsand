@@ -22815,6 +22815,17 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   rename). The page shows the planes as painted; its preview pane (the old
   Worldgen tab's heightmap/voxel views, P-I) shows what worldgen makes of
   them. Every save moves the world hash.
+  **Superseded by map v2 E1 (2026-10-08, `docs/PLAN_map_v2.md`):** the page
+  edits only v2 maps (a v1 map is refused with the converter's name). The
+  height and biome planes are 256²-sample tiles (`assets/editor/maptiles.js`
+  is the in-memory model: lazy per-tile load, dirty tiles, per-stroke tile
+  undo); a save POSTs map.json + only the dirty tiles through
+  `/api/worldmap/tile` (SVT1 header checked, write-then-rename, empty body =
+  delete = back to the default; `/api/worldmap/tiles` lists them) and
+  `/api/worldmap/planes` is gone. The canvas is a topographic map of the
+  authored height (real min..max hypsometric ramp, hillshade, contours, biome
+  overlay) with brushes in metres; the landform brush and landform sites are
+  gone with the landform plane.
 * **LIVE (environment truth P-A, 2026-09-04): THE ENVIRONMENT HOT-RELOADS,
   and the game says what it was generated from.** `ReloadEnvironment`
   (`test/support.cpp`) re-reads the biome files, the map named by

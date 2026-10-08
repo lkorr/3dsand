@@ -41,6 +41,16 @@ happens in this process rather than in the page:
   GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
   GET  /api/worldmap/check?name=    the SAVED map's load warnings / refusal
                               (`sandvox --mapcheck`, GPU-free): {ok, warnings[], error}
+  GET  /api/worldmap?name=          the map's map.json
+  POST /api/worldmap?name=          write it; must be a v2 map.json (version,
+                              extent, planes: docs/PLAN_map_v2.md)
+  GET  /api/worldmap/tiles?name=&plane=   the plane's tile files:
+                              {tiles: [{tx, tz, size, mtime}]} (plane =
+                              height | biome; an absent tile = the default)
+  GET  /api/worldmap/tile?name=&plane=&tx=&tz=   one 'SVT1' tile (404 = absent)
+  POST /api/worldmap/tile?name=&plane=&tx=&tz=   write it (header checked
+                              against plane and tx/tz; write-then-rename); an
+                              EMPTY body deletes it (back to the default)
   GET  /api/worldmap/sculpt?name=   the map's sculpt layer (binary 'SVSC'; 404 = none)
   POST /api/worldmap/sculpt?name=   write it (write-then-rename); an EMPTY body
                               deletes the file (no layer = the pre-P5 world)
@@ -100,6 +110,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -635,8 +646,9 @@ WORLDEDIT_DIR = os.path.join(ASSETS, "worldedits")
 WORLDEDIT_EXT = ".svedit"
 # The P5 sculpt layer's file, beside map.json / map.svmap (worldmap.h).
 SCULPT_FILE = "sculpt.svsculpt"
-# The authored world map (src/sim/worldmap.h): assets/worldmap/<name>/ holds
-# map.json (the diffable half) beside map.svmap (the three u8 planes). The
+# The authored world map (src/sim/worldmap.h, docs/PLAN_map_v2.md):
+# assets/worldmap/<name>/ holds map.json (the diffable half) beside
+# planes/<plane>/<tx>_<tz>.svt (the height and biome plane tiles). The
 # Environment tab's World map page reads and writes both through the
 # /api/worldmap routes below; the engine reads them at boot.
 WORLDMAP_DIR = os.path.join(ASSETS, "worldmap")
@@ -1082,6 +1094,106 @@ def _worldmap_dir(name):
     if any(c not in ok for c in name):
         return None
     return os.path.join(WORLDMAP_DIR, name)
+
+
+# ---- map v2 plane tiles (docs/PLAN_map_v2.md, "Plane tiles") ----------------
+# assets/worldmap/<name>/planes/<plane>/<tx>_<tz>.svt: one 256x256-sample tile,
+# 32-byte header (magic 'SVT1', planeKind, tx, tz, w, h, sampleBytes, 0) then
+# the samples z-major little-endian. An absent tile is the plane's default.
+TILE_MAGIC = b"SVT1"
+TILE_N = 256
+# plane name -> (planeKind, sampleBytes)
+TILE_PLANES = {"height": (1, 2), "biome": (2, 1)}
+# Tile indices are post index >> 8 and posts start at 0; 4097 posts a side is
+# the plan's ceiling, so 17 tiles would do -- 4096 only refuses garbage.
+TILE_MAX_INDEX = 4096
+
+
+def _tile_args(q):
+    """(plane, tx, tz) from a query, or an error string."""
+    plane = (q.get("plane") or [""])[0]
+    if plane not in TILE_PLANES:
+        return "plane must be one of " + ", ".join(sorted(TILE_PLANES))
+    try:
+        tx = int((q.get("tx") or [""])[0])
+        tz = int((q.get("tz") or [""])[0])
+    except ValueError:
+        return "tx and tz must be integers"
+    if not (0 <= tx < TILE_MAX_INDEX and 0 <= tz < TILE_MAX_INDEX):
+        return "tx/tz out of range"
+    return plane, tx, tz
+
+
+def _tile_check(blob, plane, tx, tz):
+    """None if `blob` is a well-formed tile of `plane` at (tx, tz), else why not."""
+    kind, sb = TILE_PLANES[plane]
+    if len(blob) < 32 or blob[:4] != TILE_MAGIC:
+        return "not an SVT1 tile"
+    w = [int.from_bytes(blob[i:i + 4], "little", signed=True) for i in range(4, 32, 4)]
+    if w[0] != kind:
+        return "tile planeKind %d is not %s (%d)" % (w[0], plane, kind)
+    if w[1] != tx or w[2] != tz:
+        return "tile header says (%d,%d), the request (%d,%d)" % (w[1], w[2], tx, tz)
+    if w[3] != TILE_N or w[4] != TILE_N:
+        return "tile is %dx%d, must be %dx%d" % (w[3], w[4], TILE_N, TILE_N)
+    if w[5] != sb:
+        return "tile sampleBytes %d, %s needs %d" % (w[5], plane, sb)
+    if w[6] != 0:
+        return "tile reserved word is not 0"
+    if len(blob) != 32 + TILE_N * TILE_N * sb:
+        return "tile is %d bytes, must be %d" % (len(blob), 32 + TILE_N * TILE_N * sb)
+    return None
+
+
+def _map_v2_check(j):
+    """None if `j` is a v2 map.json the page may write, else why not. The
+    engine's loader is the full validator (--mapcheck); this refuses only what
+    would make the map unloadable in shape."""
+    if not isinstance(j, dict):
+        return "map.json is not an object"
+    if j.get("version") != 2:
+        return "map.json version must be 2 (a v1 map converts with scripts/convert_map_v2.py)"
+    for k in ("cellLog2", "size", "originCell", "oceanFadeCells"):
+        if k in j:
+            return "map.json v2 has no `%s` (a v1 key)" % k
+
+    def ints(v, n):
+        return isinstance(v, list) and len(v) == n and all(isinstance(x, int) and not isinstance(x, bool) for x in v)
+    ext = j.get("extent")
+    if not isinstance(ext, dict) or not ints(ext.get("min"), 2) or not ints(ext.get("size"), 2):
+        return "map.json needs extent {min: [x, z], size: [w, h]} in voxels"
+    scl = j.get("siteCellLog2")
+    if not isinstance(scl, int) or not (4 <= scl <= 16):
+        return "map.json needs siteCellLog2 (4..16)"
+    if any(s <= 0 or s % (1 << scl) for s in ext["size"]) or any(m % (1 << scl) for m in ext["min"]):
+        return "extent min and size must be multiples of the site cell (1 << siteCellLog2)"
+    biomes = j.get("biomes")
+    if not isinstance(biomes, list) or not biomes or not all(isinstance(b, str) for b in biomes):
+        return "map.json needs biomes[] (the palette, by name)"
+    planes = j.get("planes")
+    if not isinstance(planes, dict):
+        return "map.json needs planes {height, biome}"
+    for name in ("height", "biome"):
+        p = planes.get(name)
+        if not isinstance(p, dict):
+            return "planes.%s missing" % name
+        lg = p.get("log2")
+        if not isinstance(lg, int) or not (0 <= lg <= 12):
+            return "planes.%s.log2 must be 0..12" % name
+        if any(s % (1 << lg) for s in ext["size"]) or any(m % (1 << lg) for m in ext["min"]):
+            return "extent is not a whole number of planes.%s posts" % name
+        if p.get("tile") != TILE_N:
+            return "planes.%s.tile must be %d" % (name, TILE_N)
+        posts = max(ext["size"]) // (1 << lg) + 1
+        # the plan's ceiling: 4096 post SPANS a side (docs/PLAN_map_v2.md, out of scope)
+        if posts > 4097:
+            return "planes.%s has %d posts a side (over 4097)" % (name, posts)
+    hd = planes["height"].get("default")
+    if not isinstance(hd, int) or not (-32000 <= hd <= 32000):
+        return "planes.height.default must be an integer in -32000..32000 (voxels)"
+    if planes["biome"].get("default") not in biomes:
+        return "planes.biome.default must name a biome in biomes[]"
+    return None
 
 
 def run_build():
@@ -1746,18 +1858,55 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"ok": False, "error": "no sculpt layer"})
             with open(path, "rb") as f:
                 return self._send(200, f.read(), "application/octet-stream")
-        if p == "/api/worldmap" or p == "/api/worldmap/planes":
+        if p == "/api/worldmap":
             name = (self._query().get("name") or [""])[0]
             d = _worldmap_dir(name)
             if not d:
                 return self._json(400, {"ok": False, "error": "bad map name"})
-            fn = "map.json" if p == "/api/worldmap" else "map.svmap"
-            path = os.path.join(d, fn)
+            path = os.path.join(d, "map.json")
             if not os.path.isfile(path):
                 return self._json(404, {"ok": False, "error": "no such map"})
             with open(path, "rb") as f:
-                return self._send(200, f.read(),
-                                  "application/json" if fn == "map.json" else "application/octet-stream")
+                return self._send(200, f.read(), "application/json")
+        if p == "/api/worldmap/tiles":
+            # The v2 plane's tile LISTING: which tiles exist (every other one
+            # is the plane's default). The page loads only what it shows.
+            q = self._query()
+            name = (q.get("name") or [""])[0]
+            plane = (q.get("plane") or [""])[0]
+            d = _worldmap_dir(name)
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            if plane not in TILE_PLANES:
+                return self._json(400, {"ok": False, "error": "plane must be one of " + ", ".join(sorted(TILE_PLANES))})
+            pd = os.path.join(d, "planes", plane)
+            tiles = []
+            try:
+                names = sorted(os.listdir(pd))
+            except OSError:
+                names = []
+            for fn in names:
+                m = re.match(r"^(\d+)_(\d+)\.svt$", fn)
+                if not m:
+                    continue
+                st = os.stat(os.path.join(pd, fn))
+                tiles.append({"tx": int(m.group(1)), "tz": int(m.group(2)),
+                              "size": st.st_size, "mtime": int(st.st_mtime)})
+            return self._json(200, {"ok": True, "plane": plane, "tiles": tiles})
+        if p == "/api/worldmap/tile":
+            q = self._query()
+            d = _worldmap_dir((q.get("name") or [""])[0])
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            a = _tile_args(q)
+            if isinstance(a, str):
+                return self._json(400, {"ok": False, "error": a})
+            plane, tx, tz = a
+            path = os.path.join(d, "planes", plane, "%d_%d.svt" % (tx, tz))
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "no such tile (the plane's default)"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), "application/octet-stream")
 
         if p == "/perf.json":
             # The Performance tab reads build/perf.json, which lives OUTSIDE
@@ -2247,24 +2396,55 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 return self._json(500, {"ok": False, "error": str(e)})
             return self._json(200, {"ok": True, "bytes": len(blob), "tiles": count})
-        if p == "/api/worldmap" or p == "/api/worldmap/planes":
+        if p == "/api/worldmap/tile":
+            # One v2 plane tile. An EMPTY body deletes it: the tile is back
+            # to the plane's default, which is what an absent tile means.
+            q = self._query()
+            d = _worldmap_dir((q.get("name") or [""])[0])
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            if not os.path.isfile(os.path.join(d, "map.json")):
+                return self._json(404, {"ok": False, "error": "no such map (save map.json first)"})
+            a = _tile_args(q)
+            if isinstance(a, str):
+                return self._json(400, {"ok": False, "error": a})
+            plane, tx, tz = a
+            blob = self._raw()
+            path = os.path.join(d, "planes", plane, "%d_%d.svt" % (tx, tz))
+            if not blob:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError as e:
+                    return self._json(500, {"ok": False, "error": str(e)})
+                return self._json(200, {"ok": True, "bytes": 0, "deleted": True})
+            why = _tile_check(blob, plane, tx, tz)
+            if why:
+                return self._json(400, {"ok": False, "error": why})
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                # Write-then-rename: a torn tile is a map the engine refuses.
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                os.replace(tmp, path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "bytes": len(blob)})
+        if p == "/api/worldmap":
             name = (self._query().get("name") or [""])[0]
             d = _worldmap_dir(name)
             if not d:
                 return self._json(400, {"ok": False, "error": "bad map name"})
             blob = self._raw()
-            if p == "/api/worldmap":
-                try:
-                    j = json.loads(blob.decode("utf-8"))
-                except Exception as e:  # noqa: BLE001
-                    return self._json(400, {"ok": False, "error": "map.json does not parse: %s" % e})
-                if not isinstance(j.get("biomes"), list) or not isinstance(j.get("size"), list):
-                    return self._json(400, {"ok": False, "error": "map.json needs biomes[] and size[]"})
-                fn = "map.json"
-            else:
-                if len(blob) < 16 or blob[:4] != b"SVMP":
-                    return self._json(400, {"ok": False, "error": "not an SVMP plane file"})
-                fn = "map.svmap"
+            try:
+                j = json.loads(blob.decode("utf-8"))
+            except Exception as e:  # noqa: BLE001
+                return self._json(400, {"ok": False, "error": "map.json does not parse: %s" % e})
+            why = _map_v2_check(j)
+            if why:
+                return self._json(400, {"ok": False, "error": why})
+            fn = "map.json"
             path = os.path.join(d, fn)
             try:
                 os.makedirs(d, exist_ok=True)
