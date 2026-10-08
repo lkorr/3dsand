@@ -230,8 +230,8 @@ function markDirty() {
 function refreshWidgets() { for (const w of widgets) { try { w(); } catch (e) {} } }
 
 const COND_FIELDS = [
-  {k: 'minY', n: 'min Y', min: -1, max: 400, step: 1, title: 'Lowest ground Y (world voxels) this row tolerates. -1 = no bound.'},
-  {k: 'maxY', n: 'max Y', min: -1, max: 400, step: 1, title: 'Highest ground Y. A per-row treeline. -1 = no bound.'},
+  {k: 'minY', n: 'min Y', min: -1, max: 32000, step: 1, title: 'Lowest ground Y (absolute world voxels) this row tolerates: a band pinned to one map\u2019s altitudes. -1 = no bound. For \u201cabove the treeline\u201d use the treeline condition.'},
+  {k: 'maxY', n: 'max Y', min: -1, max: 32000, step: 1, title: 'Highest ground Y (absolute). -1 = no bound. For \u201cbelow the treeline\u201d use the treeline condition.'},
   {k: 'maxSlope', n: 'slope ≤', min: 0, max: 1024, step: 8, title: 'Q8 landform slope gate: 256 = 45° = the angle of repose. 1024 = no bound.'},
   {k: 'nearWaterMax', n: 'water ≤ m', min: -1, max: 200, step: 0.5, title: 'Only within this many metres of a water body. -1 = anywhere.'},
   {k: 'nearWaterMin', n: 'water ≥ m', min: 0, max: 200, step: 0.5, title: 'Keep at least this far from water.'},
@@ -258,6 +258,26 @@ function conditionsLine(item, base) {
     const lab = el('label', {title: f.title}, f.n);
     const cell = el('span', {class: CLS + 'condcell'}, lab, inp);
     UI.liveMark(C, cell, base + '.conditions.' + f.k, [inp]);
+    line.append(cell);
+  }
+  // Map v2 A1: the treeline condition, relative to the COLUMN's treeline
+  // (the map's, scaled by the biome, jittered) -- so a row means the same on
+  // a 1,400 m mountain map as on the harness.
+  {
+    const title = 'Relative to the column\u2019s treeline: only below it, only at or above it, or anywhere. Cover rows only.';
+    const sel = el('select', {class: CLS + 'num', title});
+    for (const [v, t] of [['', 'any'], ['below', 'below'], ['above', 'above']]) {
+      const o = el('option', {value: v}, t);
+      if ((item.conditions.treeline || '') === v) o.selected = true;
+      sel.append(o);
+    }
+    sel.addEventListener('change', () => {
+      undo.snapshot(null);
+      item.conditions.treeline = sel.value;
+      markDirty(); regenerate(false);
+    });
+    const cell = el('span', {class: CLS + 'condcell'}, el('label', {title}, 'treeline'), sel);
+    UI.liveMark(C, cell, base + '.conditions.treeline', [sel]);
     line.append(cell);
   }
   return line;
@@ -424,6 +444,8 @@ function reliefSection(body) {
                            ['detail', 'detail ×', 'Q8 multiplier on the map\u2019s detail octave.'],
                            ['grain', 'grain ×', 'Q8 multiplier on the map\u2019s grain octave.']])
     UI.row(C, body, {k, n, min: 0, max: 1024, step: 8, int: true, u: 'Q8', d}, 'terrain');
+  UI.row(C, body, {k: 'treelineScale', n: 'treeline ×', min: 0, max: 2, step: 0.01, u: '',
+                   d: 'Map v2: this biome\u2019s treeline as a fraction of the map\u2019s height above the sea (1 = the map\u2019s treeline; tundra 0.85 is 150 m lower on a 1,000 m treeline). Blended across biome cells like the relief.'}, 'terrain');
 }
 
 /* ===========================================================================
@@ -489,8 +511,8 @@ function buildPanel() {
                  'mask, the three flags, and every plant row (1-in-N surface columns) with all eight conditions. ' +
                  'Rows roll in order, first hit wins. Since P-G there is no hard-coded ground flora: the shade ' +
                  'plants, litter, saplings and flowers are rows with a CANOPY condition (0 open sky .. 255 deep ' +
-                 'shade: 96+ is under a crown, ≤95 a gap), and no treeline gate — a row\u2019s max Y is its own ' +
-                 'snowline (the shipped rows stop at the map\u2019s treeline, 227; the alpine cushion above it is a row with min Y 228).');
+                 'shade: 96+ is under a crown, ≤95 a gap), and a TREELINE condition relative to the column\u2019s ' +
+                 'treeline (map v2: the shipped rows say \u201cbelow\u201d; the alpine cushion is a row that says \u201cabove\u201d).');
   UI.matRow(C, s.body, {k: 'skin', n: 'ground skin', d: 'Topmost cell (WM_B_SKIN), skinDepth cells deep.'}, 'cover', mats, {filter: isSolid});
   UI.row(C, s.body, {k: 'skinDepth', n: 'skin depth (cells)', min: 1, max: 8, step: 1, int: true, d: ''}, 'cover');
   UI.matRow(C, s.body, {k: 'subsoil', n: 'subsoil', d: 'Under the skin: the sediment wedge’s topsoil (WM_B_SUBSOIL).'}, 'cover', mats, {filter: isSolid});

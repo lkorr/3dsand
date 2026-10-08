@@ -162,7 +162,6 @@ Status GateClearing(Ctx& c, std::string& detail) {
   }
 
   // ---- the spot: forest near the spawn, off the pad, dry, below the treeline ---------
-  const int treeline = worldmap::CurrentTerrain().treeline;
   int forestId = -1;
   for (size_t i = 0; i < set.biomes.size(); i++)
     if (set.biomes[i].name == "forest") forestId = set.biomes[i].index;
@@ -181,7 +180,7 @@ Status GateClearing(Ctx& c, std::string& detail) {
         for (int t = 0; t <= 2 && ok; t++) {
           const int px = x - 80 + s * 240, pz = z - 80 + t * 240;
           const int h = World::TerrainHeight(px, pz, kDefaultSeed);
-          ok = (int)World::MapBiomeAt(px, pz, kDefaultSeed) == forestId && h < treeline - 32 &&
+          ok = (int)World::MapBiomeAt(px, pz, kDefaultSeed) == forestId && h < worldmap::TreelineAt(px, pz, kDefaultSeed) - 32 &&
                h > real.seaLevelY + 4 && !World::InPadBox(px, pz) && !World::PondNearColumn(px, pz, kDefaultSeed).near;
         }
       if (ok) { cx = x; cz = z; found = true; }
@@ -371,7 +370,6 @@ Status GateStructureGround(Ctx& c, std::string& detail) {
   auto isBody = [&](uint32_t m) { return m < body.size() && body[m]; };
 
   // ---- the spot: forest on every side, off the pad, dry, below the treeline ----------
-  const int treeline = worldmap::CurrentTerrain().treeline;
   int forestId = -1;
   for (size_t i = 0; i < set.biomes.size(); i++)
     if (set.biomes[i].name == "forest") forestId = set.biomes[i].index;
@@ -390,7 +388,7 @@ Status GateStructureGround(Ctx& c, std::string& detail) {
           const int h = World::TerrainHeight(px, pz, kDefaultSeed);
           lo = std::min(lo, h);
           hi = std::max(hi, h);
-          ok = (int)World::MapBiomeAt(px, pz, kDefaultSeed) == forestId && h < treeline - 32 &&
+          ok = (int)World::MapBiomeAt(px, pz, kDefaultSeed) == forestId && h < worldmap::TreelineAt(px, pz, kDefaultSeed) - 32 &&
                h > real.seaLevelY + 4 && !World::InPadBox(px, pz) && !World::PondNearColumn(px, pz, kDefaultSeed).near;
         }
       (void)lo; (void)hi;

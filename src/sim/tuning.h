@@ -2512,6 +2512,11 @@ struct Tuning {
     // below 0 by day (LoadTuning) so the snow caps never melt by themselves.
     int heatSnowlineBase = TPD(sim, heatSnowlineBase);
     int heatSnowlineSwing = TPD(sim, heatSnowlineSwing);
+    // THE LAPSE RATE (map v2 A1): how many heat units colder the climate is
+    // per km above the map's sea level, below the column's snowline. A valley
+    // at 900 m in a 10 +- 6 meadow is ~5 colder: its tarn skins over on cold
+    // nights. 0 = the climate ignores altitude (the pre-v2 world).
+    int heatLapsePerKm = TPD(sim, heatLapsePerKm);
     // THE TENT CADENCE: a chunk's heat target is recomputed at most every Nth
     // tick, phased by its world chunk x (1 = every tick). A perf knob: the
     // relaxation hides the lag; sources and the CA wake are never deferred.

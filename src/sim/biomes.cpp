@@ -63,6 +63,8 @@ Conditions ReadCond(const json& j) {
   c.patchThreshold = Get<int>(s, "patchThreshold", c.patchThreshold);
   c.canopyMin = std::clamp(Get<int>(s, "canopyMin", c.canopyMin), 0, 255);
   c.canopyMax = std::clamp(Get<int>(s, "canopyMax", c.canopyMax), 0, 255);
+  const std::string tl = GetS(s, "treeline");
+  c.treeline = tl == "below" ? 1 : tl == "above" ? 2 : 0;
   return c;
 }
 
@@ -206,6 +208,7 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
       b.terrain.hill = std::clamp(Get<int>(te, "hill", 256), 0, 4096);
       b.terrain.detail = std::clamp(Get<int>(te, "detail", 256), 0, 4096);
       b.terrain.grain = std::clamp(Get<int>(te, "grain", 256), 0, 4096);
+      b.terrain.treelineScale = std::clamp(Get<double>(te, "treelineScale", 1.0), 0.0, 4.0);
     }
     out.biomes.push_back(std::move(b));
   }

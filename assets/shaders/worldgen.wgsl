@@ -103,7 +103,7 @@ const GEN_V_MAT_SHIFT : u32 = 4u;
 @group(0) @binding(39) var<storage, read_write> colCache : array<u32>;
 const GC_REC_BASE : u32 = NUM_SLOTS;
 const GC_REC_WORDS : u32 = 4u;
-const CC_WORDS : u32 = 25u;
+const CC_WORDS : u32 = 26u;
 const CC_HDR : u32 = 16u;
 const CC_BLOCK : u32 = CC_HDR + CHUNK * CHUNK * CC_WORDS;
 const CCH_TOP : u32 = 0u;        // max over the block's columns of CCW_TOP
@@ -322,9 +322,10 @@ fn vnoise2d(x : i32, z : i32, csl : u32, seed : u32) -> N2 {
 // MIRROR-END noise
 
 // Snow/treeline: the ground Y at and above which the skin is snow and no tree
-// stands. map.json `terrain.treeline`, read from the worldMap header so
-// the C++ side (worldmap::CurrentTerrain().treeline) sees the same number.
-fn treeline() -> i32 { return wmTerrain(WM_H_TERRAIN_TREELINE); }
+// stands is PER COLUMN since map v2 A1 -- treelineAt (the height mirror) and
+// Col.tl. treelineMax() is the world-wide ceiling of every column's, for the
+// sky early-outs' bounds (treeMaxTop, cactusMaxTop).
+fn treelineMax() -> i32 { return wmTerrain(WM_H_TREELINE_MAX); }
 // debug.vegetation: the kill-switch for every plant this file places,
 // TREES AND CACTI INCLUDED. Gated at the SOURCE of each feature (the *Info /
 // *At functions and the table-driven blocks in genCellIn), not by a material
@@ -510,6 +511,13 @@ fn curveOne(m : BiomeMix, u : i32) -> vec2<i32> {
 fn biomeCurve(m : BiomeMix, u : i32) -> vec2<i32> {
   if (worldMap[WM_H_BIOME_PLANE] == 0u) { return vec2<i32>(u, 256); }   // no planes: the identity
   return curveOne(m, u);
+}
+// The biome's treeline scale (WM_B_TREELINE_Q8, map v2 A1), blended the same
+// way. 256 = the map's treeline; no planes = the map's treeline everywhere.
+fn biomeTreelineAt(m : BiomeMix) -> i32 {
+  if (worldMap[WM_H_BIOME_PLANE] == 0u) { return 256; }
+  return mixI(m, wmBiomeI(m.b00, WM_B_TREELINE_Q8), wmBiomeI(m.b10, WM_B_TREELINE_Q8),
+              wmBiomeI(m.b01, WM_B_TREELINE_Q8), wmBiomeI(m.b11, WM_B_TREELINE_Q8));
 }
 // The three multipliers, blended the same way. 256 = the map's own amplitude.
 struct BiomeRelief {
@@ -852,7 +860,13 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // roughness, and a wedge laid down a sculpted cliff is exactly the powder-
   // on-a-wall the gate exists to prevent.
   let slope = abs(g1x + ((o2.gx * sf.hill) >> 8) + sp.gx) + abs(g1z + ((o2.gz * sf.hill) >> 8) + sp.gz);
-  let room = max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
+  // THE CEILING IS RELATIVE (map v2 A1): the wedge fills where the NOISE
+  // (range + hill + detail + grain) sits below the AUTHORED ground (the plane
+  // + the sculpt) + terrain.sedAbove -- a noise hollow on a 900 m valley
+  // floor is a hollow like one at the sea, and an authored pit is the
+  // author's depth, not something sediment fills back in. It was the
+  // absolute sedCeil (y 264), which left every column above 26 m bare.
+  let room = max(0, wmTerrain(WM_H_TERRAIN_SED_ABOVE) - (bed - au.dev - sp.dev));
   var sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   let sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
   sed = (max(sed, 0) * max(sedSlope - slope, 0)) /
@@ -869,6 +883,24 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
 
 fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
   return landAt(x, z, seed).h;
+}
+// ---- THE COLUMN'S TREELINE (map v2 A1) ----
+// The map's terrain.treeline, as a height above the sea scaled by the biome's
+// treelineScale (blended over the four biome cells, biomeTreelineAt), plus
+// +-terrain.treelineJitter of 25.6 m value noise so it is not a ruled
+// contour. Snow cap, trees, the shore fringe, cacti, tile plants, the cover
+// rows' `treeline` condition, ice born on water and the heat layer's snowline
+// all read THIS (genColumn caches it as Col.tl). In the mirror because the
+// CPU needs the same number: the heat column table (Simulation::PrepareHeat)
+// and the gates.
+//   (treeline - sea) * s <= 64000 * 1024 = 6.6e7; (n - 8192) * jitter <=
+//   8192 * 4096 = 3.4e7 (kTreelineJitterMax).
+fn treelineAt(x : i32, z : i32, seed : u32) -> i32 {
+  let sea = seaLevelY();
+  let s = biomeTreelineAt(biomeMixAt(x, z));
+  let n = vnoise2d(x, z, 8u, seed ^ 0x7E11u);
+  return sea + (((wmTerrain(WM_H_TERRAIN_TREELINE) - sea) * s) >> 8)
+       + (((n.n - 8192) * wmTerrain(WM_H_TERRAIN_TREELINE_JITTER)) >> 13);
 }
 // MIRROR-END height
 
@@ -1419,6 +1451,7 @@ const WM_H_POND_BAND     : u32 = 31u;   // the widest shore/berm band any preset
 // Read inside the height mirror by name (wmTerrain / wmTerrainU), spelled the
 // same in world.cpp. Voxels at the live voxel size, log2 shifts, Q8 counts.
 const WM_H_TERRAIN_BASE_HEIGHT      : u32 = 32u;
+const WM_H_TERRAIN_TREELINE_JITTER  : u32 = 33u;   // map v2 A1: +-voxels of treeline wobble
 const WM_H_TERRAIN_RANGE_AMPLITUDE  : u32 = 34u;
 const WM_H_TERRAIN_RANGE_LOG2       : u32 = 35u;
 const WM_H_TERRAIN_HILL_AMPLITUDE   : u32 = 36u;
@@ -1428,10 +1461,10 @@ const WM_H_TERRAIN_DETAIL_LOG2      : u32 = 39u;
 const WM_H_TERRAIN_GRAIN_AMPLITUDE  : u32 = 40u;
 const WM_H_TERRAIN_GRAIN_LOG2       : u32 = 41u;
 const WM_H_TERRAIN_FBM_ATTEN        : u32 = 42u;
-const WM_H_TERRAIN_HOME_Y           : u32 = 43u;
+const WM_H_TERRAIN_ROCK_SLOPE       : u32 = 43u;   // map v2 A1: steep rock from this Q8 slope; 0 = off
 const WM_H_TERRAIN_HOME_R           : u32 = 44u;
 const WM_H_TERRAIN_HOME_FADE        : u32 = 45u;
-const WM_H_TERRAIN_SED_CEIL         : u32 = 46u;
+const WM_H_TERRAIN_SED_ABOVE        : u32 = 46u;   // map v2 A1: relative to the authored ground
 const WM_H_TERRAIN_SED_FRACTION     : u32 = 47u;
 const WM_H_TERRAIN_SED_STRIP        : u32 = 48u;
 const WM_H_TERRAIN_SED_SLOPE        : u32 = 49u;
@@ -1452,6 +1485,9 @@ const WM_H_HEIGHT_POSTS_Z           : u32 = 61u;
 const WM_H_BIOME_LOG2               : u32 = 62u;
 const WM_H_BIOME_POSTS_X            : u32 = 63u;
 const WM_H_BIOME_POSTS_Z            : u32 = 64u;
+// map v2 A1: the highest any column's treeline reaches (PackWorldMap) -- the
+// world-wide bound under treeMaxTop / cactusMaxTop.
+const WM_H_TREELINE_MAX             : u32 = 65u;
 const WM_SCULPT_SPACING_LOG2        : u32 = 3u;    // 8 voxels between samples
 const WM_SCULPT_TILE_LOG2           : u32 = 5u;    // 32 samples per tile side
 const WM_SCULPT_REGION_LOG2         : u32 = 2u;    // 4 tiles per directory region side
@@ -1542,7 +1578,8 @@ const WM_B_GRAIN_MUL     : u32 = 33u;
 // hold a powder (worldmap.h kB_FirmCover, biomes/<name>.json cover.firmSkin).
 // 0 = unauthored; coverFirmMat below falls back to the subsoil or to stone.
 const WM_B_FIRM_COVER    : u32 = 34u;
-const WM_C_WORDS         : u32 = 12u;
+const WM_B_TREELINE_Q8   : u32 = 35u;   // map v2 A1: the biome's treeline scale, Q8
+const WM_C_WORDS         : u32 = 13u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
 const WM_C_CHANCE        : u32 = 2u;
@@ -1555,6 +1592,7 @@ const WM_C_NEAR_WATER_MAX : u32 = 8u;   // voxels from a pond rim, -1 = unbounde
 const WM_C_NEAR_WATER_MIN : u32 = 9u;   // at least this far from a rim, 0 = off
 const WM_C_CANOPY_MIN    : u32 = 10u;   // undergrowthSite cover band, 0..255; 0 / 255 = unbounded
 const WM_C_CANOPY_MAX    : u32 = 11u;
+const WM_C_TREELINE      : u32 = 12u;   // map v2 A1: 0 any, 1 below the column's treeline, 2 at/above
 // the biome's water rows (worldmap.h kR_*): preset, thinning chance on
 // the one pond lattice (Q16), and the row's conditions at the pond centre.
 const WM_R_WORDS         : u32 = 8u;
@@ -2246,7 +2284,7 @@ fn treeMaxReach() -> i32 { return i32(treeAtlas[TA_H_MAX_REACH]); }
 // anywhere in the world, at any seed — one compare replaces the whole scan
 // (treeAt per cell; genChunk / `far` per column, where the scan's own
 // `cands.top` is the tighter bound once it has run).
-fn treeMaxTop() -> i32 { return treeline() - 1 + treeMaxAbove(); }
+fn treeMaxTop() -> i32 { return treelineMax() - 1 + treeMaxAbove(); }
 
 // Per-tile tree descriptor. The FULL form, used by the scans that need a
 // species' metadata (undergrowth cover, the far-field canopy proxy); the
@@ -2405,8 +2443,8 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   let h = land.h;
 
   // No trees on snowfields, in ponds (treePondOk), or over the selftest
-  // fixture sites.
-  if (h >= treeline()) { return t; }
+  // fixture sites. The treeline is the TRUNK column's own (map v2 A1).
+  if (h >= treelineAt(s.wx, s.wz, seed)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
@@ -2565,7 +2603,7 @@ fn siteTree(sid : u32, seed : u32) -> Tree {
   let h3 = hash3(seed ^ 0x7BEE7u, bitcast<u32>(t.wx), bitcast<u32>(t.wz));
   t.rnd = h3;
   if (!VEGETATION || sp < 0 || sp >= taSpeciesCount()) { return t; }
-  if (t.base >= treeline()) { return t; }
+  if (t.base >= treelineAt(t.wx, t.wz, seed)) { return t; }
   let vc = max(taSpecies(sp, TA_S_VARIANT_CNT), 1u);
   let vsel = wmSiteI(sid, WM_S_VARIANT);
   let v = select(h3 % vc, u32(max(vsel - 1, 0)) % vc, vsel > 0);
@@ -2955,11 +2993,11 @@ const CACTUS_MAX_DM : i32 = 52;
 
 // The highest y ANY cactus can occupy, world-wide -- the cactus analogue of
 // treeMaxTop(), for the sky early-outs. A cactus roots only on ground below
-// the treeline (cactusInfo refuses `h >= treeline()`), is at most
+// its column's treeline (cactusInfo), so below treelineMax(), is at most
 // CACTUS_MAX_DM tall, and cactusAt clips every cell to base + height + 2 (the
 // crown bloom sits one above the tip).
 fn cactusMaxTop() -> i32 {
-  return treeline() - 1 + CACTUS_MAX_DM * VOX_PER_M / 10 + 2;
+  return treelineMax() - 1 + CACTUS_MAX_DM * VOX_PER_M / 10 + 2;
 }
 
 struct Cactus {
@@ -3003,7 +3041,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
-  if (h >= treeline()) { return c; }
+  if (h >= treelineAt(c.wx, c.wz, seed)) { return c; }
   if (siteKeepOut(c.wx, c.wz) || sitePadNear(c.wx, c.wz, 0)) { return c; }
   if (pondCoversP(ponds,c.wx, c.wz)) { return c; }
 
@@ -3295,7 +3333,7 @@ fn undergrowthAdd(u : ptr<function, Undergrowth>, t : ptr<function, Tree>, x : i
 // island detector would convert generated floaters into debris the moment
 // anything moved nearby. Two bands: a near-surface one following the terrain
 // (kept vlen(40) under the ground so it never breaches the soil) and a deep
-// one at absolute depth.
+// one 24..31 m under the column's ground (map v2 A1; it was absolute).
 //
 // ---- THE MAGMA TABLE: generated matter has to be generated AT REST ---------
 //
@@ -3329,9 +3367,21 @@ fn undergrowthAdd(u : ptr<function, Undergrowth>, t : ptr<function, Tree>, x : i
 //     reintroduces a step in the surface, and a step in a liquid is a flow.
 const LAVA_LEVEL : i32 = (-80 * VLEN_NUM) / VLEN_DEN;
 
+// THE LAVA CLEARANCE (map v2 A1): no column whose ground is within this of
+// the magma table floods. Its carve at and below LAVA_LEVEL stays STONE
+// instead -- never air, so the containment argument above holds unchanged
+// (a lava cell's neighbour across the boundary is stone) and the level is
+// still the one constant plane. Without it a gorge or a valley floor cut
+// down near the table opened onto lava a few metres under the grass.
+const LAVA_CLEAR : i32 = (200 * VLEN_NUM) / VLEN_DEN;
+
 // What a carved cell is filled with. The one place the magma table is applied.
-fn caveFill(y : i32) -> i32 {
-  if (y <= LAVA_LEVEL) { return 2; }   // flooded, and flat, and therefore still
+// The column's ground is the band's own top2 + vlen(40) (caveBands).
+fn caveFill(b : CaveBands, y : i32) -> i32 {
+  if (y <= LAVA_LEVEL) {
+    if (b.top2 + vlen(40) < LAVA_LEVEL + LAVA_CLEAR) { return 0; }   // sealed: too near the surface
+    return 2;                          // flooded, and flat, and therefore still
+  }
   return 1;                            // open cave
 }
 
@@ -3365,10 +3415,13 @@ fn caveBands(x : i32, z : i32, h : i32, biome : u32, seed : u32) -> CaveBands {
   b.f1 = h - vlen(40) - ((vnoise2d(x, z, 5u, seed ^ 6u).n * vlen(60)) >> 14);
   b.c1 = min(b.f1 + vlen(10) + ((vnoise2d(x, z, 4u, seed ^ 7u).n * vlen(20)) >> 14),
              h - vlen(40));
-  // band 2: deep caverns at absolute depth (streamed depth is real terrain)
+  // band 2: deep caverns 24..31 m under the column's ground (map v2 A1:
+  // RELATIVE, so a mountain has deep caves a player can dig to; it was
+  // y -4..-11 m absolute, which is where it still lands under ground at
+  // y 200 -- the harness -- and 900 m under a valley at 900 m).
   b.on2 = (vnoise2d(x + 7717, z - 4177, 6u, seed ^ 8u).n >> 6) >
           i32(wmBiome(biome, WM_B_CAVE_T2));
-  b.f2 = -vlen(40) - ((vnoise2d(x, z, 5u, seed ^ 9u).n * vlen(70)) >> 14);
+  b.f2 = h - vlen(240) - ((vnoise2d(x, z, 5u, seed ^ 9u).n * vlen(70)) >> 14);
   b.c2 = b.f2 + vlen(12) + ((vnoise2d(x, z, 4u, seed ^ 10u).n * vlen(26)) >> 14);
   // Depth is the only thing the fill may depend on (caveFill): a lava test
   // on the cavern MASK would stand a lava wall against open air.
@@ -3378,8 +3431,8 @@ fn caveBands(x : i32, z : i32, h : i32, biome : u32, seed : u32) -> CaveBands {
 
 // 0 = solid, 1 = carve to air, 2 = carve to lava (caveFill). Band 1 wins ties.
 fn caveIn(b : CaveBands, y : i32) -> i32 {
-  if (b.on1 && y >= b.f1 && y <= b.c1) { return caveFill(y); }
-  if (b.on2 && y >= b.f2 && y <= b.c2 && y <= b.top2) { return caveFill(y); }
+  if (b.on1 && y >= b.f1 && y <= b.c1) { return caveFill(b, y); }
+  if (b.on2 && y >= b.f2 && y <= b.c2 && y <= b.top2) { return caveFill(b, y); }
   return 0;
 }
 
@@ -3493,6 +3546,10 @@ struct Col {
   // 3-6 cells per streamed chunk slid on the birth wake and woke the chunk
   // and its ring. genColumn sets `h` (no restriction); `cols` tightens it.
   sedTop      : i32,
+  // THE COLUMN'S TREELINE (treelineAt; map v2 A1): snow cap, trees, cacti,
+  // the shore fringe, the cover rows' treeline condition and ice born on
+  // water all read this one number, so they cannot disagree on a column.
+  tl          : i32,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -3530,7 +3587,7 @@ fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
   var L : LandCol;
   landColumn(cx, cz, seed, &L);
   ps.h = L.h;
-  if (L.h >= treeline() || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
+  if (L.h >= treelineAt(cx, cz, seed) || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
   if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
   let ug = undergrowthSite(cx, cz, seed, &L.ponds);
   if (ug.trunkD2 <= 4) { return ps; }
@@ -3829,6 +3886,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
     lab.plant.top = -1;
     lab.looseTop = LAB_SLAB_Y;
     lab.sedTop = LAB_SLAB_Y;
+    lab.tl = 1048576;   // never: inRim already keeps the snow and the trees off
     *ponds = pondSetNone();
     return lab;
   }
@@ -3839,6 +3897,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   landColumn(x, z, seed, &L);
   let h = L.h;
   let biome = biomeAt(x, z, seed);
+  let tl = treelineAt(x, z, seed);
 
   // ---- the marsh fringe: landColumn's berm scan, narrowed ----
   // The scan itself (`L.near`) has already happened, once, for the berm — so
@@ -3853,7 +3912,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   // follows the pond, not the biome's ground-flora flag: an oasis's shore
   // rows show in the desert because the oasis preset authored them.
   if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND) &&
-      h < treeline()) {
+      h < tl) {
     shore = L.near;
     // A column whose ground stands well above the waterline is a BLUFF, not a
     // shore. This is the single most load-bearing test in the feature, and it
@@ -3898,6 +3957,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.plant = plantColumnAt(x, z, seed, biome);
   col.looseTop = h;
   col.sedTop = h;
+  col.tl = tl;
   *ponds = L.ponds;
   return col;
 }
@@ -4164,14 +4224,30 @@ fn sedLineMat(biome : u32) -> u32 {
 // half of that test; the cell half is `y > h - 2`. Pond columns are left out
 // of the cap's step line: their looseTop is the bed's.
 fn snowCapCol(col : ptr<function, Col>) -> bool {
-  return !(*col).inRim && (*col).h >= treeline() && (*col).pond < 0;
+  return !(*col).inRim && (*col).h >= (*col).tl && (*col).pond < 0 && !colSteep(col);
+}
+
+// STEEP ROCK (map v2 A1): a column whose LANDFORM slope (Col.slope: the
+// authored gradient + the range and hill rungs, never the roughness) is at or
+// past map.json terrain.rockSlope is a cliff. It skins as the biome's rock
+// (coverFirmMat: the authored firm skin, else a solid subsoil, else stone)
+// and wears no snow cap and no cover row: powder laid on a cliff never
+// sleeps (rule 2 -- the snow cap is a powder, held there only by the step
+// line), and grass on a 2.5:1 face does not read as a cliff. The sediment
+// wedge is already zero there (its own gate, terrain.sedSlope, is far
+// gentler) and a sand cap already firms past the CA's repose
+// (looseCoverDepth); this is the gate for the SOLID skins those two never
+// look at. 0 = off.
+fn colSteep(col : ptr<function, Col>) -> bool {
+  let r = wmTerrain(WM_H_TERRAIN_ROCK_SLOPE);
+  return r > 0 && (*col).slope >= r && !(*col).inRim;
 }
 
 // Can any cell of this column be a TREE cell? The column half of genCellIn's
 // tree-block gate (the other half is `y > h`); genChunk and `far` skip the
 // tree candidate scan where it is false.
 fn colGrowsTrees(col : ptr<function, Col>) -> bool {
-  return VEGETATION && !(*col).inRim && (*col).h < treeline() && (*col).pond < 0;
+  return VEGETATION && !(*col).inRim && (*col).h < (*col).tl && (*col).pond < 0;
 }
 
 // The h-relative plant reach above a column: the biome's tallest cover row
@@ -4256,6 +4332,7 @@ const CCW_TOP        : u32 = 17u;   // the column's sky ceiling (see `cols`)
 const CCW_TREE_TOP   : u32 = 18u;   // the tree candidates' top, or far below any y
 const CCW_CAVE       : u32 = 19u;   // f1, c1, f2, c2, top2
 const CCW_TOP_MASS   : u32 = 24u;   // looseStep's top-cell grains, 8 = whole (`cols` writes it)
+const CCW_TREELINE   : u32 = 25u;   // Col.tl (map v2 A1)
 // CCW_PACKED's flag byte. Material ids are 12 bits (the voxel word), so the
 // fluid and the tile plant fill the low 24.
 const CCF_POOL_FLOOR : u32 = 1u;
@@ -4295,6 +4372,7 @@ fn ccStore(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>,
   colCache[w + CCW_PACKED] = ((*col).fluid & 0xFFFu) | (((*col).plant.mat & 0xFFFu) << 12u) |
                              (f << 24u);
   colCache[w + CCW_LOOSE_TOP] = bitcast<u32>((*col).looseTop);
+  colCache[w + CCW_TREELINE] = bitcast<u32>((*col).tl);
   colCache[w + CCW_CANOPY] = bitcast<u32>(canopy);
   colCache[w + CCW_TOP] = bitcast<u32>(colTop);
   colCache[w + CCW_TREE_TOP] = bitcast<u32>(treeTop);
@@ -4332,6 +4410,7 @@ fn ccLoad(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>) {
   (*col).plant.base = bitcast<i32>(colCache[w + CCW_PLANT_BASE]);
   (*col).plant.top = bitcast<i32>(colCache[w + CCW_PLANT_TOP]);
   (*col).looseTop = bitcast<i32>(colCache[w + CCW_LOOSE_TOP]);
+  (*col).tl = bitcast<i32>(colCache[w + CCW_TREELINE]);
   (*cave).on1 = (f & CCF_CAVE_ON1) != 0u;
   (*cave).f1 = bitcast<i32>(colCache[w + CCW_CAVE]);
   (*cave).c1 = bitcast<i32>(colCache[w + CCW_CAVE + 1u]);
@@ -4395,6 +4474,7 @@ fn coverRowPick(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
   cp.hgt = 0;
   let h = (*col).h;
   let biome = (*col).biome;
+  if (colSteep(col)) { return cp; }
   let nRows = wmBiome(biome, WM_B_COVER_COUNT);
   let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
   let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
@@ -4418,6 +4498,9 @@ fn coverRowPick(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
     let maxY = bitcast<i32>(wmCover(biome, i, WM_C_MAX_Y));
     if (minY >= 0 && h < minY) { continue; }
     if (maxY >= 0 && h > maxY) { continue; }
+    let tlc = wmCover(biome, i, WM_C_TREELINE);
+    if (tlc == 1u && h >= (*col).tl) { continue; }
+    if (tlc == 2u && h < (*col).tl) { continue; }
     let rSlope = i32(wmCover(biome, i, WM_C_MAX_SLOPE));
     if (rSlope > 0 && rSlope < 1024 && (*col).slope > rSlope) { continue; }
     let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
@@ -4485,7 +4568,8 @@ fn genCellIn(col : ptr<function, Col>,
     // into whatever the pool holds, and against a hot fluid `snow -> water ->
     // steam -> water` sustains itself forever (a rule-2 failure that reports
     // itself as `ca-skip` never finding a quiet tick).
-    if (!inRim && h >= treeline() && y > h - 2) {
+    let steep = colSteep(col);
+    if (!inRim && h >= (*col).tl && !steep && y > h - 2) {
       mat = M_SNOW;                        // snow caps on the high hills
       // ...but never above the cap's step line (`cols`, snowCapCol): a snow
       // cell a neighbour column leaves a free diagonal is the firm cover.
@@ -4507,6 +4591,11 @@ fn genCellIn(col : ptr<function, Col>,
       var bed = pondBedMat(col);
       if (firm) { bed = wmWater(wp, WM_W_BED_SUBSTRATE); }
       mat = select(bed, M_STONE, bed == 0u);
+    } else if (steep && y > h - 4) {
+      // STEEP ROCK (colSteep): the cliff face is the biome's rock, four
+      // cells deep (the sand cap's depth, so no powder layer of any branch
+      // below reaches the face), whatever skin the biome authors.
+      mat = coverFirmMat(biome);
     } else if (wmFlag(biome, WM_BF_SAND_CAP) && y > h - 4) {
       // The loose cap, but only as deep as this column's ground can HOLD loose
       // matter (looseCoverDepth above). Flat desert: loose == 4 and every cell
@@ -4626,7 +4715,7 @@ fn genCellIn(col : ptr<function, Col>,
     // map, column centre) and the same snowline the CA's ambient uses
     // (heatParams), so the two cannot disagree about which water is frozen.
     if (mat == M_WATER && y == fluidTop &&
-        (wmFlag(biome, WM_BF_FROZEN) || y >= treeline() - 1)) {
+        (wmFlag(biome, WM_BF_FROZEN) || y >= (*col).tl - 1)) {
       mat = M_ICE;
     }
   }
@@ -4724,7 +4813,7 @@ fn genCellIn(col : ptr<function, Col>,
   // Only above ground, below the treeline, out of the water and never inside
   // an authored rim. The column half of this gate is colGrowsTrees, which
   // genChunk and `far` use to skip the candidate scan: keep the two in step.
-  if (VEGETATION && mat == MAT_AIR && !inRim && y > h && h < treeline() && pond < 0) {
+  if (VEGETATION && mat == MAT_AIR && !inRim && y > h && h < (*col).tl && pond < 0) {
     var tm = MAT_AIR;
     if (treeValid) { tm = treeFromCands(trees, y); }
     else { tm = treeAt(x, y, z, seed, ponds); }
@@ -4787,7 +4876,7 @@ fn genCellIn(col : ptr<function, Col>,
   // SITE by cactusInfo, so a cactus rooted outside cannot lean back in; the
   // column tests here are the authored rim, the pond and the treeline.
   if (VEGETATION && mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&
-      h < treeline()) {
+      h < (*col).tl) {
     let cm = cactusAt(x, y, z, seed, ponds);
     if (cm != MAT_AIR) { mat = cm; }
   }
@@ -4804,8 +4893,11 @@ fn genCellIn(col : ptr<function, Col>,
   // so the rows' lattices do not line up at cell corners. Cost and the canopy
   // condition: coverRowPick.
   //
-  // No treeline gate: a row's own minY / maxY is its altitude band (the
-  // alpine cushion is a row with `minY` at the treeline).
+  // The treeline is a row CONDITION (conditions.treeline, map v2 A1): the
+  // shipped flora stops below the column's treeline and the alpine cushion
+  // is a row that grows only above it; minY / maxY stay absolute bands for a
+  // row an author pins to one map's altitudes. Steep rock grows nothing
+  // (coverRowPick).
   if (GROUND_COVER && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
       !siteKeepOut(x, z)) {
     // The row is a property of the COLUMN (coverRowPick); only "is this cell

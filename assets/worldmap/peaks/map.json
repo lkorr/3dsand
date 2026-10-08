@@ -29,7 +29,7 @@
   "edgeFadeVox": 6144,
   "warpAmpVox": 48,
   "terrain": {
-    "about": "The terrain, per MAP (P-G): what used to be worldgen.* in tuning.json. Lengths in voxels at refVoxelsPerMetre; log2 cells are shifts; fbmAtten / sedFraction / sedSlope are Q8 counts. baseHeight is the mean ground; a painted landform 0..255 spans landformRangeVox centred on 128; range/hill/detail/grain are the seeded octave ladder under the plane; homeArea is the calm ground around the spawn site; the sediment wedge and the treeline are what they were as knobs. Per-biome relief is each biome file's `terrain` block.",
+    "about": "The terrain, per MAP: the seeded NOISE on the authored height plane (map v2). Lengths in voxels at refVoxelsPerMetre; log2 cells are shifts; fbmAtten / sedFraction / sedSlope / rockSlope are Q8 counts. The ground is planes.height (absolute voxels) + range/hill/detail/grain (the seeded octave ladder; the biome curve shapes the range rung); homeArea is the calm noise around the spawn site (radius, fade). The sediment wedge fills where the noise sits below the AUTHORED ground + sedAbove (relative, map v2 A1). treeline is the map's ground Y of the treeline: a column's own is sea + (treeline - sea) x its biome's treelineScale, +- treelineJitter. rockSlope: columns at least this steep skin as rock (0 = off). baseHeight is the height used only when no plane is loaded. Per-biome relief is each biome file's `terrain` block.",
     "refVoxelsPerMetre": 10,
     "baseHeight": 200,
     "rangeAmplitude": 256,
@@ -42,17 +42,18 @@
     "grainLog2": 3,
     "fbmAtten": 256,
     "homeArea": {
-      "y": 200,
       "radius": 320,
       "fade": 2048
     },
-    "sedCeil": 264,
+    "sedAbove": 64,
     "sedFraction": 64,
     "sedStrip": 6,
     "sedSlope": 96,
     "sedMax": 32,
     "sedTopsoil": 4,
-    "treeline": 228
+    "treeline": 10112,
+    "treelineJitter": 300,
+    "rockSlope": 640
   },
   "biomes": [
     "ocean",

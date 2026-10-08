@@ -298,6 +298,7 @@ const TUNING_PARAMS = {
   'sim.heatDownGain':{t:'f',def:0.25,min:0,max:4},
   'sim.heatSnowlineBase':{t:'i',def:-20,min:-64,max:63},
   'sim.heatSnowlineSwing':{t:'i',def:8,min:0,max:63},
+  'sim.heatLapsePerKm':{t:'i',def:6,min:0,max:64},
   'sim.heatTentEvery':{t:'i',def:4,min:1,max:8},
   'sim.elecMode':{t:'i',def:1,min:0,max:1},
   'sim.elecRounds':{t:'i',def:4,min:1,max:8},

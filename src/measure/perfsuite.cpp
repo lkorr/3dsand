@@ -774,7 +774,9 @@ bool SetupForestfire(Scene& s, std::string&) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int half = (int)kNChunk / 2;
   s.stream.OnRegen();
-  s.world.SetWindowOrigin({(m.spawnX >> 4) - half, 0, (m.spawnZ >> 4) - half});
+  s.world.SetWindowOrigin({(m.spawnX >> 4) - half,
+                           worldmap::WindowChunkYForGround(World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed)),
+                           (m.spawnZ >> 4) - half});
   SubmitWorldgen(s.ctx, s.world, s.sim, kDefaultSeed);
   s.ctx.WaitIdle();
   for (uint32_t t = 1; t <= 300; t++)
@@ -843,7 +845,9 @@ bool SetupVillageFire(Scene& s, std::string& why) {
   // order). Record() puts it back for the next scenario.
   const int half = (int)kNChunk / 2;
   s.stream.OnRegen();
-  s.world.SetWindowOrigin({(green.x >> 4) - half, 0, (green.z >> 4) - half});
+  s.world.SetWindowOrigin({(green.x >> 4) - half,
+                           worldmap::WindowChunkYForGround(World::TerrainHeight(green.x, green.z, kDefaultSeed)),
+                           (green.z >> 4) - half});
   SubmitWorldgen(s.ctx, s.world, s.sim, kDefaultSeed);
   s.ctx.WaitIdle();
   for (uint32_t t = 1; t <= 300; t++)

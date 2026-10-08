@@ -920,8 +920,8 @@ class Simulation {
   uint32_t elecTagMask_ = 0;
   uint32_t elecCrackleLoMat_ = 0, elecCrackleLoSrc_ = 0;
   uint32_t elecCrackleHiMat_ = 0, elecCrackleHiSrc_ = 0;
-  std::vector<uint8_t> heatCol_;
-  std::vector<int> heatColX_, heatColZ_;
+  std::vector<uint32_t> heatCol_;          // heat.h kHpCol: biome | snowline << 8, chunk-column tiles
+  std::vector<int> heatColX_, heatColZ_;   // the world chunk column each tile row / column holds
   bool heatColValid_ = false;
   uint32_t heatColSeed_ = 0;
   uint64_t heatColKey_ = 0;

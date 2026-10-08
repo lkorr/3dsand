@@ -548,6 +548,7 @@
     "heatDownGain": 0.25,
     "heatSnowlineBase": -20,
     "heatSnowlineSwing": 8,
+    "heatLapsePerKm": 6,
     "heatTentEvery": 4,
     "elecMode": 1,
     "elecRounds": 4,

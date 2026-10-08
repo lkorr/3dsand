@@ -3233,7 +3233,7 @@ _HEAT_CONSTS = {
     "HF_EMIT": "kHfEmit", "HF_SRC": "kHfSrc", "HF_RECOMP": "kHfRecomp",
     "HF_RELAX": "kHfRelax", "HF_NEW": "kHfNew", "HS_SOURCE": "kHsSource",
     "HS_NONZERO": "kHsNonzero", "HP_MODE": "kHpMode", "HP_RADIUS": "kHpRadius",
-    "HP_SNOWLINE_Y": "kHpSnowlineY", "HP_SNOW_BASE": "kHpSnowBase",
+    "HP_LAPSE": "kHpLapse", "HP_SEA_Y": "kHpSeaY", "HP_SNOW_BASE": "kHpSnowBase",
     "HP_SNOW_SWING": "kHpSnowSwing", "HP_PROBE": "kHpProbe", "HP_PROBE_ON": "kHpProbeOn",
     "HP_GAIN": "kHpGain", "HP_UP_GAIN": "kHpUpGain", "HP_SIDE_GAIN": "kHpSideGain",
     "HP_DOWN_GAIN": "kHpDownGain", "HEAT_GAIN_ONE": "kHeatGainOne", "HP_BIOME": "kHpBiome", "HP_MAT": "kHpMat",

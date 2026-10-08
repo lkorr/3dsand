@@ -2045,10 +2045,11 @@ static constexpr uint32_t WM_H_TERRAIN_DETAIL_LOG2 = worldmap::kHTerrainDetailLo
 static constexpr uint32_t WM_H_TERRAIN_GRAIN_AMPLITUDE = worldmap::kHTerrainGrainAmplitude;
 static constexpr uint32_t WM_H_TERRAIN_GRAIN_LOG2 = worldmap::kHTerrainGrainLog2;
 static constexpr uint32_t WM_H_TERRAIN_FBM_ATTEN = worldmap::kHTerrainFbmAtten;
-static constexpr uint32_t WM_H_TERRAIN_HOME_Y = worldmap::kHTerrainHomeY;
+static constexpr uint32_t WM_H_TERRAIN_TREELINE = worldmap::kHTerrainTreeline;
+static constexpr uint32_t WM_H_TERRAIN_TREELINE_JITTER = worldmap::kHTerrainTreelineJitter;
 static constexpr uint32_t WM_H_TERRAIN_HOME_R = worldmap::kHTerrainHomeR;
 static constexpr uint32_t WM_H_TERRAIN_HOME_FADE = worldmap::kHTerrainHomeFade;
-static constexpr uint32_t WM_H_TERRAIN_SED_CEIL = worldmap::kHTerrainSedCeil;
+static constexpr uint32_t WM_H_TERRAIN_SED_ABOVE = worldmap::kHTerrainSedAbove;
 static constexpr uint32_t WM_H_TERRAIN_SED_FRACTION = worldmap::kHTerrainSedFraction;
 static constexpr uint32_t WM_H_TERRAIN_SED_STRIP = worldmap::kHTerrainSedStrip;
 static constexpr uint32_t WM_H_TERRAIN_SED_SLOPE = worldmap::kHTerrainSedSlope;
@@ -2166,6 +2167,14 @@ struct BiomeRelief {
   int detail;
   int grain;
 };
+// The biome's treeline scale, blended like the relief (worldgen.wgsl
+// biomeTreelineAt; map v2 A1). 256 = the map's treeline.
+static int biomeTreelineAt(BiomeMix m) {
+  const worldmap::WorldMapData& d = worldmap::CurrentWorldMap();
+  if (!d.Loaded()) return 256;
+  auto q = [&](uint32_t b) { return b < d.biomeTreelineQ8.size() ? d.biomeTreelineQ8[b] : 256; };
+  return mixI(m, q(m.b00), q(m.b10), q(m.b01), q(m.b11));
+}
 static BiomeRelief biomeReliefAt(BiomeMix m) {
   BiomeRelief r;
   r.hill = 256;
@@ -2360,7 +2369,7 @@ static Land landAt(int x, int z, uint32_t seed) {
           + ((o4.dev * sf.grain) >> 8) + sp.dev;
 
   int slope = std::abs(g1x + ((o2.gx * sf.hill) >> 8) + sp.gx) + std::abs(g1z + ((o2.gz * sf.hill) >> 8) + sp.gz);
-  int room = std::max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
+  int room = std::max(0, wmTerrain(WM_H_TERRAIN_SED_ABOVE) - (bed - au.dev - sp.dev));
   int sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   int sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
   sed = (std::max(sed, 0) * std::max(sedSlope - slope, 0)) /
@@ -2376,6 +2385,13 @@ static Land landAt(int x, int z, uint32_t seed) {
 }
 static int baseHeight(int x, int z, uint32_t seed) {
   return landAt(x, z, seed).h;
+}
+static int treelineAt(int x, int z, uint32_t seed) {
+  const int sea = seaLevelY();
+  const int s = biomeTreelineAt(biomeMixAt(x, z));
+  const N2 n = vnoise2d(x, z, 8u, seed ^ 0x7E11u);
+  return sea + (((wmTerrain(WM_H_TERRAIN_TREELINE) - sea) * s) >> 8)
+       + (((n.n - 8192) * wmTerrain(WM_H_TERRAIN_TREELINE_JITTER)) >> 13);
 }
 struct Pond {
   bool present;
@@ -2808,6 +2824,9 @@ int worldmap::AuthoredHeightAt(int x, int z, int* gx, int* gz) {
   if (gz) *gz = o.gz;
   return o.dev;
 }
+// worldmap.h: the mirrored treelineAt (map v2 A1), for the heat layer's
+// column table, the loader's tree-site warning and the gates.
+int worldmap::TreelineAt(int x, int z, uint32_t seed) { return treelineAt(x, z, seed); }
 
 
 // The map probe (world.h Column). Composed from the SAME functions the height

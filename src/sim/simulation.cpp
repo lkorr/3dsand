@@ -46,7 +46,7 @@ using pass::kPassStride;
 // outside the window). genCols holds the per-POSITION map ([0, kNumSlots),
 // worldgen.wgsl GC_REC_BASE) and then kGenColRecWords words per chunk-column.
 namespace {
-constexpr uint32_t kColCacheWords = 25;
+constexpr uint32_t kColCacheWords = 26;
 constexpr uint32_t kColCacheHdr = 16;
 constexpr uint32_t kColCacheBlock = kColCacheHdr + kChunk * kChunk * kColCacheWords;
 constexpr uint32_t kGenColMax = kNChunk * kNChunk + kTicketMax * kTicketBoxN * kTicketBoxN;
@@ -3393,7 +3393,7 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   hdr[kHpMode] = tn.sim.heatMode != 0 ? 1u : 0u;
   hdr[kHpRadius] = (uint32_t)std::clamp(tn.sim.heatRadius, 1, (int)kHeatRadiusMax);
   const HeatClimate snow = HeatSnowlineClimate();
-  hdr[kHpSnowlineY] = (uint32_t)HeatSnowlineY();
+  hdr[kHpLapse] = (uint32_t)std::clamp(tn.sim.heatLapsePerKm, 0, 64);
   hdr[kHpSnowBase] = (uint32_t)snow.base;
   hdr[kHpSnowSwing] = (uint32_t)snow.swing;
   hdr[kHpProbe + 0] = (uint32_t)heatProbe_[0];
@@ -3435,6 +3435,7 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   // The tent cadence (heat.h kHmDue): outside the knob words above on purpose,
   // since changing it moves no target and so needs no re-target and no wake.
   hdr[kHpTentEvery] = (uint32_t)std::clamp(tn.sim.heatTentEvery, 1, (int)kHeatTentEveryMax);
+  hdr[kHpSeaY] = (uint32_t)worldmap::CurrentWorldMap().seaLevelY;
   queue.WriteBuffer(heatParamsBuf_, 0, hdr, sizeof(hdr));
   uint32_t bio[2 * kHeatBiomesMax];
   uint64_t key = 1469598103934665603ull ^ seed;
@@ -3453,15 +3454,31 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
   for (const HeatColumnPin& p : heatPins_) {
     mix((uint32_t)p.x0); mix((uint32_t)p.z0); mix((uint32_t)p.x1); mix((uint32_t)p.z1);
   }
+  // The treeline inputs the column table's snowline reads (map v2 A1): the
+  // map's treeline / jitter words and every biome's scale. A biome file's
+  // treelineScale edit reloads the environment without touching the map's
+  // own files, so the content hash alone would not see it.
+  {
+    const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+    mix((uint32_t)m.terrain.treeline);
+    mix((uint32_t)m.terrain.treelineJitter);
+    mix((uint32_t)m.seaLevelY);
+    for (int q : m.biomeTreelineQ8) mix((uint32_t)q);
+  }
+  // THE WINDOW COLUMN TABLE (heat.h kHpCol): biome | snowline << 8 per
+  // column, in 16 x 16 chunk-column tiles. A tile is rebuilt when the world
+  // chunk column it holds changes (the window moved past it) and uploaded as
+  // part of a run of consecutive rebuilt tiles: a one-chunk window shift is
+  // 32 tiles (32 KB), not the table (1 MB).
   const uint32_t n = kWorldN;
+  const uint32_t tpa = n / kChunk;                // tiles per axis
   if (!heatColValid_ || key != heatColKey_ || heatCol_.size() != (size_t)n * n) {
-    heatCol_.assign((size_t)n * n, 0);
-    heatColX_.assign(n, -0x7FFFFFFF);
-    heatColZ_.assign(n, -0x7FFFFFFF);
+    heatCol_.assign((size_t)n * n, 0u);
+    heatColX_.assign(tpa, -0x7FFFFFFF);
+    heatColZ_.assign(tpa, -0x7FFFFFFF);
     heatColKey_ = key;
     heatColValid_ = true;
   }
-  const int x0 = origin[0] * (int)kChunk, z0 = origin[2] * (int)kChunk;
   auto pinned = [&](int x, int z, uint32_t& b) {
     for (size_t k = 0; k < heatPins_.size(); k++) {
       const HeatColumnPin& p = heatPins_[k];
@@ -3472,29 +3489,39 @@ bool Simulation::PrepareHeat(const rhi::Queue& queue, const int32_t origin[3], u
     }
     return false;
   };
-  auto biomeAt = [&](int x, int z) -> uint8_t {
+  auto colWord = [&](int x, int z) -> uint32_t {
     uint32_t b = 0;
     if (!pinned(x, z, b)) b = World::MapBiomeAt(x, z, seed);
-    return (uint8_t)std::min<uint32_t>(b, kHeatBiomesMax - 1);
+    b = std::min<uint32_t>(b, kHeatBiomesMax - 1);
+    const int32_t snowY = HeatSnowlineYAt(x, z, seed);
+    return b | ((uint32_t)snowY << 8);
   };
-  bool changed = false;
-  std::vector<int> wantX(n), wantZ(n);
-  for (uint32_t k = 0; k < n; k++) {
-    // The world column window index k holds: x in [x0, x0 + n) with x & (n-1) == k.
-    wantX[k] = x0 + (int)((k - (uint32_t)x0) & (n - 1));
-    wantZ[k] = z0 + (int)((k - (uint32_t)z0) & (n - 1));
+  // The world chunk column window tile k holds on each axis: chunk c in
+  // [origin, origin + tpa) with c & (tpa - 1) == k.
+  std::vector<int> wantX(tpa), wantZ(tpa);
+  for (uint32_t k = 0; k < tpa; k++) {
+    wantX[k] = origin[0] + (int)((k - (uint32_t)origin[0]) & (tpa - 1));
+    wantZ[k] = origin[2] + (int)((k - (uint32_t)origin[2]) & (tpa - 1));
   }
-  for (uint32_t i = 0; i < n; i++) {
-    const bool colX = heatColX_[i] != wantX[i];
-    for (uint32_t j = 0; j < n; j++) {
-      if (!colX && heatColZ_[j] == wantZ[j]) continue;
-      heatCol_[(size_t)j * n + i] = biomeAt(wantX[i], wantZ[j]);
-      changed = true;
+  std::vector<uint8_t> dirty((size_t)tpa * tpa, 0);
+  for (uint32_t tj = 0; tj < tpa; tj++)
+    for (uint32_t ti = 0; ti < tpa; ti++) {
+      if (heatColX_[ti] == wantX[ti] && heatColZ_[tj] == wantZ[tj]) continue;
+      dirty[(size_t)tj * tpa + ti] = 1;
+      uint32_t* t = heatCol_.data() + ((size_t)tj * tpa + ti) * kHeatColTile;
+      const int x0 = wantX[ti] * (int)kChunk, z0 = wantZ[tj] * (int)kChunk;
+      for (uint32_t lz = 0; lz < kChunk; lz++)
+        for (uint32_t lx = 0; lx < kChunk; lx++) t[lz * kChunk + lx] = colWord(x0 + (int)lx, z0 + (int)lz);
     }
+  for (uint32_t k = 0; k < tpa; k++) { heatColX_[k] = wantX[k]; heatColZ_[k] = wantZ[k]; }
+  for (size_t i = 0; i < dirty.size();) {
+    if (!dirty[i]) { i++; continue; }
+    size_t j = i;
+    while (j < dirty.size() && dirty[j]) j++;
+    queue.WriteBuffer(heatParamsBuf_, ((uint64_t)kHpCol + (uint64_t)i * kHeatColTile) * 4,
+                      heatCol_.data() + i * kHeatColTile, (j - i) * kHeatColTile * sizeof(uint32_t));
+    i = j;
   }
-  for (uint32_t k = 0; k < n; k++) { heatColX_[k] = wantX[k]; heatColZ_[k] = wantZ[k]; }
-  if (changed)
-    queue.WriteBuffer(heatParamsBuf_, (uint64_t)kHpCol * 4, heatCol_.data(), heatCol_.size());
   return knobsMoved;
 }
 

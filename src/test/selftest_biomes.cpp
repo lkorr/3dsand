@@ -115,7 +115,6 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
 
   // The tree's column: in the window, below the treeline, dry (the C sweep).
   const IVec3 org = c.world.WindowOrigin();
-  const int treeline = worldmap::CurrentTerrain().treeline;
   int tx = 0, tz = 0, th = 0;
   bool found = false;
   for (int i = 0; i < 12 && !found; i++) {
@@ -123,7 +122,7 @@ bool SiteCases(Ctx& c, const biomes::BiomeSet& set, std::string& out) {
     const int z = org.z * (int)kChunk + 300 + i * 11;
     const int h = World::TerrainHeight(x, z, kDefaultSeed);
     const World::PondQuery pq = World::PondNearColumn(x, z, kDefaultSeed);
-    if (h >= treeline - 1 || pq.inDisc || pq.near) continue;
+    if (h >= worldmap::TreelineAt(x, z, kDefaultSeed) - 1 || pq.inDisc || pq.near) continue;
     if (!c.world.ChunkInWindow(IVec3{x >> 4, (h + 1) >> 4, z >> 4})) continue;
     tx = x; tz = z; th = h; found = true;
   }
@@ -292,12 +291,11 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   const IVec3 org = c.world.WindowOrigin();
   int skinOk = 0, skinN = 0, skipped = 0, skinFirm = 0;
   std::string first;
-  const int treeline = worldmap::CurrentTerrain().treeline;
   for (int i = 0; i < 6; i++) {
     const int x = org.x * (int)kChunk + 40 + i * 52;
     const int z = org.z * (int)kChunk + 400 + i * 13;
     const int h = World::TerrainHeight(x, z, kDefaultSeed);
-    if (h >= treeline) { skipped++; continue; }   // snow cap, not the skin
+    if (h >= worldmap::TreelineAt(x, z, kDefaultSeed)) { skipped++; continue; }   // snow cap, not the skin
     const IVec3 cc{x >> 4, h >> 4, z >> 4};
     if (!c.world.ChunkInWindow(cc)) { skipped++; continue; }
     std::vector<uint32_t> chunk(kChunkVol, 0);
@@ -412,9 +410,9 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   const bool ok = why.empty();
   char buf[320];
   std::snprintf(buf, sizeof buf,
-                "map '%s': spawn (%d,%d) on %s: ground y%d (sea y%d, home y%d), %d vox past the pad box, "
+                "map '%s': spawn (%d,%d) on %s: ground y%d (sea y%d, treeline y%d), %d vox past the pad box, "
                 "%d site%s in its cell, keep-out %s, tarn %s%s",
-                m.name.c_str(), sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::CurrentTerrain().homeY,
+                m.name.c_str(), sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::TreelineAt(sx, sz, kDefaultSeed),
                 boxDist, siteCount, siteCount == 1 ? "" : "s", keepOut ? "YES" : "no",
                 pq.inDisc ? "YES" : (pq.near ? "near" : "no"), why.c_str());
   detail = buf;
@@ -456,7 +454,6 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
   // The column: in-window, below the treeline, whose twin biome has a skin
   // that is not what we will swap it to. Same sweep the worldmap gate uses.
   const IVec3 org = c.world.WindowOrigin();
-  const int treeline = worldmap::CurrentTerrain().treeline;
   int cx = 0, cz = 0, ch = 0;
   biomes::BiomeDef* target = nullptr;
   // THE HARNESS WINDOW IS DESERT (the harness map is a copy of `default`,
@@ -484,7 +481,7 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
     const int x = org.x * (int)kChunk + 40 + (i % 9) * 52;
     const int z = org.z * (int)kChunk + 40 + (i / 9) * 52;
     const int h = World::TerrainHeight(x, z, kDefaultSeed);
-    if (h >= treeline) continue;
+    if (h >= worldmap::TreelineAt(x, z, kDefaultSeed)) continue;
     if (!c.world.ChunkInWindow(IVec3{x >> 4, h >> 4, z >> 4})) continue;
     const int b = (int)World::MapBiomeAt(x, z, kDefaultSeed);
     for (biomes::BiomeDef& d : set.biomes) {

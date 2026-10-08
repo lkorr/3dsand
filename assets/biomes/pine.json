@@ -25,7 +25,8 @@
     ],
     "hill": 256,
     "detail": 256,
-    "grain": 256
+    "grain": 256,
+    "treelineScale": 1.05
   },
   "cover": {
     "skin": "grass",
@@ -43,7 +44,8 @@
         "height": 0.2,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -59,7 +61,8 @@
         "height": 0.3,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -75,7 +78,8 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -91,7 +95,8 @@
         "height": 0.5,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -107,7 +112,8 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -123,7 +129,8 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -139,7 +146,8 @@
         "height": 0.4,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -155,7 +163,8 @@
         "height": 0.5,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -171,7 +180,8 @@
         "height": 0.3,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -187,7 +197,8 @@
         "height": 0.4,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -203,7 +214,8 @@
         "height": 0.4,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -219,7 +231,8 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
@@ -235,7 +248,8 @@
         "height": 0.2,
         "conditions": {
           "minY": -1,
-          "maxY": 227,
+          "maxY": -1,
+          "treeline": "below",
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,

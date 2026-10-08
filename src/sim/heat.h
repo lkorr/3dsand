@@ -192,7 +192,10 @@ constexpr uint32_t kHeatBlockTrans = 0x80000000u;
 constexpr uint32_t kHpHdrWords = 32;
 constexpr uint32_t kHpMode = 0;        // sim.heatMode
 constexpr uint32_t kHpRadius = 1;      // sim.heatRadius, blocks
-constexpr uint32_t kHpSnowlineY = 2;   // i32: cells at or above take the snowline climate
+// sim.heatLapsePerKm (map v2 A1): heat units the climate cools per km above
+// the sea (kHpSeaY). Word 2 was the one world-wide snowline Y; the snowline is
+// per column now, in the column table (kHpCol).
+constexpr uint32_t kHpLapse = 2;
 constexpr uint32_t kHpSnowBase = 3;    // i32
 constexpr uint32_t kHpSnowSwing = 4;   // i32
 constexpr uint32_t kHpProbe = 5;       // 5..7 probe cell (i32), 8 = probe on
@@ -217,14 +220,24 @@ constexpr uint32_t kHpKnobEpoch = 13;
 // not a knob word PrepareHeat diffs -- changing the cadence moves no target,
 // so it needs no re-target and no wake.
 constexpr uint32_t kHpTentEvery = 14;
+// The map's sea level (WorldMapData::seaLevelY), the lapse rate's datum. Not
+// a knob word: it changes only with the map, and a new map regenerates.
+constexpr uint32_t kHpSeaY = 15;
 constexpr uint32_t kHeatTentEveryMax = 8;
 constexpr uint32_t kHeatBiomesMax = 64;
 constexpr uint32_t kHpBiome = kHpHdrWords;                     // base, swing (i32) per biome
 constexpr uint32_t kHpMat = kHpBiome + 2 * kHeatBiomesMax;     // 8 words per material
 constexpr uint32_t kHpMatStride = 8;
 constexpr uint32_t kHeatMatMax = 4096;
-constexpr uint32_t kHpCol = kHpMat + kHpMatStride * kHeatMatMax;  // biome byte per window column
-constexpr uint32_t kHpColWords = kHeatWorldN * kHeatWorldN / 4;
+// THE WINDOW COLUMN TABLE: one word per window column, biome id (low byte) |
+// the column's snowline Y << 8 (signed: worldmap::TreelineAt - 1), TILED by
+// chunk column -- tile (z >> 4) * (N / 16) + (x >> 4), 256 words each, z-major
+// inside -- so the strip a window shift exposes is whole contiguous tiles
+// (sim_heat.wgsl heatColWord). Map v2 A1: was a biome byte, four per word,
+// row-major, under one world-wide snowline.
+constexpr uint32_t kHpCol = kHpMat + kHpMatStride * kHeatMatMax;
+constexpr uint32_t kHpColWords = kHeatWorldN * kHeatWorldN;
+constexpr uint32_t kHeatColTile = kHeatChunk * kHeatChunk;   // words per chunk-column tile
 constexpr uint32_t kHpWords = kHpCol + kHpColWords;
 
 // One transition = three words at kHpMat + mat*8 + 3*k:
@@ -284,8 +297,12 @@ inline uint32_t HeatOwnerKey(int x, int y, int z) {
 // Ambient at world cell (x, y, z) on the CPU (F1 readout, gates): the same
 // arithmetic as sim_step.wgsl / sim_heat.wgsl heatAmbient.
 int32_t HeatAmbientCpu(int x, int y, int z, uint32_t seed, bool day);
-// The climate the engine uses for biome `index` (default if unknown), and the
-// snowline climate + Y (worldmap::CurrentWorldMap / tuning / map terrain).
+// The climate the engine uses for biome `index` (default if unknown), the
+// snowline climate (tuning), and the snowline Y of the COLUMN (x, z): its
+// treeline - 1 (worldmap::TreelineAt), where worldgen's snow caps begin.
 const HeatClimate& HeatBiomeClimate(uint32_t biomeIndex);
 HeatClimate HeatSnowlineClimate();
-int32_t HeatSnowlineY();
+int32_t HeatSnowlineYAt(int x, int z, uint32_t seed);
+// The lapse rate's cooling at world Y (sim.heatLapsePerKm above the map's
+// sea): the integer the GPU's heatLapse computes.
+int32_t HeatLapseAt(int y);

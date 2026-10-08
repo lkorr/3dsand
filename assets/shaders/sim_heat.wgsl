@@ -79,7 +79,8 @@ const HM_ENTRY : u32 = 128u;
 const HM_FLAGS : u32 = 32896u;
 const HF_EMIT : u32 = 1u;
 const HP_MODE : u32 = 0u;
-const HP_SNOWLINE_Y : u32 = 2u;
+const HP_LAPSE : u32 = 2u;
+const HP_SEA_Y : u32 = 15u;
 const HP_SNOW_BASE : u32 = 3u;
 const HP_SNOW_SWING : u32 = 4u;
 const HP_BIOME : u32 = 32u;
@@ -98,22 +99,41 @@ fn heatBlockOf(c : vec3<i32>) -> u32 {
   let b = vec3<u32>(c & vec3<i32>(CHUNK_MASK)) >> vec3<u32>(1u);
   return (b.z * 8u + b.y) * 8u + b.x;
 }
+// The window column table's word for c's column (heat.h kHpCol): the biome id
+// in the low byte, the column's SNOWLINE Y (its treeline - 1, signed) in the
+// upper 24 bits. Tiled by CHUNK COLUMN (16 x 16 columns = 256 words per tile,
+// kHeatChunk), so a window shift rewrites whole contiguous tiles.
+fn heatColWord(c : vec3<i32>) -> u32 {
+  let wx = u32(c.x & i32(WORLD_MASK));
+  let wz = u32(c.z & i32(WORLD_MASK));
+  let tile = (wz >> 4u) * (WORLD_N >> 4u) + (wx >> 4u);
+  return heatParams[HP_COL + (tile << 8u) + ((wz & 15u) << 4u) + (wx & 15u)];
+}
+// THE LAPSE RATE (map v2 A1, sim.heatLapsePerKm): the climate cools by this
+// many heat units per km above the map's sea level; nothing below it.
+// (y - sea) * lapse <= 40000 * 64 = 2.6e6.
+fn heatLapse(y : i32) -> i32 {
+  return (max(y - bitcast<i32>(heatParams[HP_SEA_Y]), 0) * bitcast<i32>(heatParams[HP_LAPSE])) /
+         (1000 * VOXELS_PER_M);
+}
 // The AMBIENT at world cell c, heat units (0 = water freezes): the climate of
 // the biome of c's column (heatParams' window column table, filled by the CPU
-// from the same seeded map read worldgen uses), or the snowline's at and above
-// the snowline; base + swing by day, base - swing by night. Two-level ON
-// PURPOSE: it changes only on the tick daylight switches, which is the tick
-// SubmitTick already wakes the whole world on (docs/PLAN_temperature.md §5).
+// from the same seeded map read worldgen uses) less the lapse rate's cooling
+// with altitude, or the snowline's at and above the COLUMN'S snowline (its
+// treeline - 1, where worldgen's snow caps begin); base + swing by day,
+// base - swing by night. Two-level ON PURPOSE: it changes only on the tick
+// daylight switches, which is the tick SubmitTick already wakes the whole
+// world on (docs/PLAN_temperature.md §5).
 fn heatAmbient(c : vec3<i32>) -> i32 {
   var base : i32;
   var swing : i32;
-  if (c.y >= bitcast<i32>(heatParams[HP_SNOWLINE_Y])) {
+  let cw = heatColWord(c);
+  if (c.y >= (bitcast<i32>(cw) >> 8u)) {
     base = bitcast<i32>(heatParams[HP_SNOW_BASE]);
     swing = bitcast<i32>(heatParams[HP_SNOW_SWING]);
   } else {
-    let col = u32(c.x & i32(WORLD_MASK)) + u32(c.z & i32(WORLD_MASK)) * WORLD_N;
-    let biome = (heatParams[HP_COL + (col >> 2u)] >> ((col & 3u) * 8u)) & 0xFFu;
-    base = bitcast<i32>(heatParams[HP_BIOME + 2u * biome]);
+    let biome = cw & 0xFFu;
+    base = bitcast<i32>(heatParams[HP_BIOME + 2u * biome]) - heatLapse(c.y);
     swing = bitcast<i32>(heatParams[HP_BIOME + 2u * biome + 1u]);
   }
   return select(base - swing, base + swing, isDaytime(T.dayPhase));
@@ -352,12 +372,11 @@ fn heatBegin() {
 // The day - night step of the ambient at world cell c (2 x swing of its
 // column's climate, or the snowline's): what heatShift's dawn takes off X.
 fn heatAmbientStep(c : vec3<i32>) -> i32 {
-  if (c.y >= bitcast<i32>(heatParams[HP_SNOWLINE_Y])) {
+  let cw = heatColWord(c);
+  if (c.y >= (bitcast<i32>(cw) >> 8u)) {
     return 2 * bitcast<i32>(heatParams[HP_SNOW_SWING]);
   }
-  let col = u32(c.x & i32(WORLD_MASK)) + u32(c.z & i32(WORLD_MASK)) * WORLD_N;
-  let biome = (heatParams[HP_COL + (col >> 2u)] >> ((col & 3u) * 8u)) & 0xFFu;
-  return 2 * bitcast<i32>(heatParams[HP_BIOME + 2u * biome + 1u]);
+  return 2 * bitcast<i32>(heatParams[HP_BIOME + 2u * (cw & 0xFFu) + 1u]);
 }
 
 // ============================================================================
