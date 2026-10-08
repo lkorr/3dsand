@@ -7966,7 +7966,33 @@ int main(int argc, char** argv) {
     ui.autopsy.hideGear = false;
     ui.autopsy.isolate = false;
     deathBody.yaw = avatarHeading;
-    CollectLimbBoxes(avatar, phys, deathBody.boxes);
+    // THE BODY AS ONE PIECE (PlayerAvatar::JointConsistentPose). The physics
+    // transforms at this instant can be mid-impulse: a blast flings a head
+    // that is still on its neck metres away for the tick the solver has not
+    // pulled it back yet, and a photograph of that tick shows a decapitation
+    // that never happened. Every part still jointed is put back on its joint
+    // (rotation kept); a part that is really gone has no body and is not here.
+    std::vector<Vec3> jPos;
+    std::vector<Quat> jRot;
+    std::vector<uint8_t> jHave;
+    avatar.JointConsistentPose(jPos, jRot, jHave);
+    // The boxes ride the same correction, so framing, limb focus and the
+    // outlines agree with the picture.
+    deathBody.boxes.boxes.clear();
+    if (avatar.Spawned() && avatar.Def()) {
+      const int limbCount = (int)avatar.Def()->limbs.size();
+      for (int i = 0; i < limbCount && i < (int)jHave.size(); i++) {
+        LimbBoxes::Box b;
+        if (!jHave[(size_t)i] || !LimbBoxCorners(avatar, phys, i, b.c)) continue;
+        Vec3 livePos; Quat liveRot;
+        if (avatar.PartWorldTransform(i, livePos, liveRot)) {
+          const Vec3 d = jPos[(size_t)i] - livePos;
+          for (Vec3& c : b.c) c = c + d;
+        }
+        b.slot = BodySlotFor(avatar.PartName(i), avatar.PartTag(i));
+        deathBody.boxes.boxes.push_back(b);
+      }
+    }
     // EVERY PART, not just the def's limbs: the box list above is deliberately
     // limbs-only so the framing is not thrown off by a held sword, but the
     // transform override has the opposite requirement — a garment shell or a
@@ -7978,8 +8004,9 @@ int main(int argc, char** argv) {
       DeathBody::Limb fl;
       fl.body = avatar.PartBody(i);
       if (!fl.body) continue;
-      Vec3 pos; Quat rot;
-      if (!avatar.PartWorldTransform(i, pos, rot)) continue;
+      if (i >= (int)jHave.size() || !jHave[(size_t)i]) continue;
+      const Vec3 pos = jPos[(size_t)i];
+      const Quat rot = jRot[(size_t)i];
       fl.xf.pos[0] = pos.x; fl.xf.pos[1] = pos.y; fl.xf.pos[2] = pos.z;
       fl.xf.quat[0] = rot.x; fl.xf.quat[1] = rot.y;
       fl.xf.quat[2] = rot.z; fl.xf.quat[3] = rot.w;

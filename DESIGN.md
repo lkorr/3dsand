@@ -14215,6 +14215,13 @@ already does one array over. Matched by *physics handle*, because `AdoptBody`
 carries a limb's handle into `DebrisSystem` unchanged while a slot index does
 not survive the next cull. What you orbit is the body as it fell, however long
 it has since been burning, sinking or rolling downhill.
+The photograph is taken JOINT-CONSISTENT (`PlayerAvatar::JointConsistentPose`,
+2026-10-08): the physics transforms on the tick of death can be mid-impulse - a
+blast flings a head still on its neck metres away for the tick the solver has
+not yet pulled it back - so every part that still has a joint is moved (rotation
+kept) until its anchor sits on its parent where the posed skeleton puts it,
+parents first, if it is more than a voxel off. A part that really came off has
+no body and is not in the photograph at all; gear rides its parent's correction.
 
 The live rig and the death snapshot reach the camera through **one type**
 (`LimbBoxes`: one oriented box per limb, tagged with its figure slot), so

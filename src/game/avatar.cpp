@@ -1296,6 +1296,56 @@ bool PlayerAvatar::PartAnchorWorld(int part, Vec3& out) const {
   return true;
 }
 
+void PlayerAvatar::JointConsistentPose(std::vector<Vec3>& pos, std::vector<Quat>& rot,
+                                      std::vector<uint8_t>& have, float slack) const {
+  const int n = (int)limbs_.size();
+  pos.assign((size_t)n, Vec3{});
+  rot.assign((size_t)n, Quat{0, 0, 0, 1});
+  have.assign((size_t)n, 0);
+  for (int i = 0; i < n; i++) have[(size_t)i] = PartWorldTransform(i, pos[(size_t)i], rot[(size_t)i]);
+  // Parents before children: order by depth in the rig.
+  std::vector<int> depth((size_t)n, 0), order((size_t)n);
+  for (int i = 0; i < n; i++) {
+    int d = 0;
+    for (int p = PartParent(i); p >= 0 && d < n; p = PartParent(p)) d++;
+    depth[(size_t)i] = d;
+    order[(size_t)i] = i;
+  }
+  std::stable_sort(order.begin(), order.end(),
+                   [&](int a, int b) { return depth[(size_t)a] < depth[(size_t)b]; });
+  const int limbCount = def_ ? (int)def_->limbs.size() : 0;
+  std::vector<Vec3> moved((size_t)n, Vec3{});
+  for (int i : order) {
+    const int p = PartParent(i);
+    if (p < 0 || p >= n || !have[(size_t)i] || !have[(size_t)p]) continue;
+    if (i >= limbCount) {
+      // A garment or a held item has no joint of its own here: it goes where
+      // its parent went.
+      pos[(size_t)i] = pos[(size_t)i] + moved[(size_t)p];
+      moved[(size_t)i] = moved[(size_t)p];
+      continue;
+    }
+    // Where the joint is, in the parent's frame, from the ANIMATION's flattened
+    // pose: both parts posed by the same skeleton, so the anchor the child
+    // hangs from is exact whatever the pose.
+    Vec3 cp, pp;
+    Quat cq, pq;
+    if (!PartPosedWorld(i, cp, cq) || !PartPosedWorld(p, pp, pq)) {
+      pos[(size_t)i] = pos[(size_t)i] + moved[(size_t)p];
+      moved[(size_t)i] = moved[(size_t)p];
+      continue;
+    }
+    const Vec3 anchor = limbs_[(size_t)i].anchorLimb;
+    const Vec3 inParent = QuatRotateInv(pq, (cp + Rotate(cq, anchor)) - pp);
+    const Vec3 want = pos[(size_t)p] + Rotate(rot[(size_t)p], inParent);
+    const Vec3 have_ = pos[(size_t)i] + Rotate(rot[(size_t)i], anchor);
+    const Vec3 d = want - have_;
+    if (d.x * d.x + d.y * d.y + d.z * d.z <= slack * slack) continue;
+    pos[(size_t)i] = pos[(size_t)i] + d;
+    moved[(size_t)i] = d;
+  }
+}
+
 int PlayerAvatar::LivePartCount() const {
   int n = 0;
   for (const MobLimb& p : limbs_)

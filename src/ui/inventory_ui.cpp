@@ -4032,14 +4032,31 @@ void PostMortemScreen(UIState& s) {
   const float pw = s.portraitW > 0 ? (float)s.portraitW : kPortraitWFallback;
   const float ph = s.portraitH > 0 ? (float)s.portraitH : kPortraitHFallback;
 
+  // THE THREE PANELS STAND TOGETHER (owner, 2026-10-08): the side panels hug
+  // the body panel and the group is centred, rather than the sides pinned to
+  // the screen edges with empty desk between. Room the body does not use goes
+  // to the side panels first (up to kSideMax), then to the margins.
+  const float panelW = std::min(
+      centerW, pw + gaugeW + 10 + (stripBeside ? 18 + stripW : 0.0f) + (kFrame + kPad) * 2);
+  const float hug = 4.0f;
+  const float kSideMax = 380.0f;
+  const int sides = leftShown ? 2 : 1;
+  const float sideRoom = (disp.x - edge * 2 - panelW - hug * (float)sides) / (float)sides;
+  const float sideWide = std::floor(std::clamp(sideRoom, sideW, kSideMax));
+  const float groupW = panelW + (sideWide + hug) * (float)sides;
+  const float groupX = std::max(edge, std::floor((disp.x - groupW) * 0.5f));
+  const float leftPanelX = groupX;
+  const float panelX = groupX + (leftShown ? sideWide + hug : 0.0f);
+  const float rightPanelX = panelX + panelW + hug;
+
   ui::PanelStyle stSide;
   stSide.darkMix = 0.22f;
   stSide.sheenPeak = 0.40f;
   stSide.bronzeAlpha = 0.07f;
 
   if (leftShown) {
-    ImGui::SetNextWindowPos(ImVec2(edge, bodyTop));
-    ImGui::SetNextWindowSize(ImVec2(sideW, bodyH));
+    ImGui::SetNextWindowPos(ImVec2(leftPanelX, bodyTop));
+    ImGui::SetNextWindowSize(ImVec2(sideWide, bodyH));
     ImGui::Begin("##pm_left_panel", nullptr, kFlags);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
@@ -4051,9 +4068,6 @@ void PostMortemScreen(UIState& s) {
 
   // ---- the centre: the body ----------------------------------------------------
   {
-    const float panelW = std::min(
-        centerW, pw + gaugeW + 10 + (stripBeside ? 18 + stripW : 0.0f) + (kFrame + kPad) * 2);
-    const float panelX = centerX + std::floor((centerW - panelW) * 0.5f);
     ImGui::SetNextWindowPos(ImVec2(panelX, bodyTop));
     ImGui::SetNextWindowSize(ImVec2(panelW, bodyH));
     ImGui::Begin("##pm_body", nullptr, kFlags);
@@ -4311,8 +4325,8 @@ void PostMortemScreen(UIState& s) {
 
   // ---- the right: triage and the selected part --------------------------------
   {
-    ImGui::SetNextWindowPos(ImVec2(rightX, bodyTop));
-    ImGui::SetNextWindowSize(ImVec2(sideW, bodyH));
+    ImGui::SetNextWindowPos(ImVec2(rightPanelX, bodyTop));
+    ImGui::SetNextWindowSize(ImVec2(sideWide, bodyH));
     ImGui::Begin("##pm_right_panel", nullptr, kFlags);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
