@@ -11243,38 +11243,41 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
 // reads the number as a geometric height, so an over-dense cell must not be
 // allowed to push its surface through its own ceiling. The blob model never
 // looked above 1 either (iso <= 1), so nothing there changes.
-fn fluidCellAt(c : vec3<i32>) -> vec3f {
-  // ---- ONE address translation for both halves of the cell ----------------
-  // This used to call fluidNodeBase(c) AND voxWordAt(c), which derive the SAME
-  // chunk slot by two different routes: chunkSlotIndex(worldChunkOf(c)) is
-  // ((c >> 4) & 31) and chunkIndexOf(c & WORLD_MASK) is ((c & 511) >> 4) —
-  // the same five bits of c. So the pair recomputed one index twice and, worse,
-  // ran two independent dependent-load chains (map -> grid, table -> voxels).
-  //
-  // This is the hottest tap in the water path: fluidRowAt takes 4 of these,
-  // fluidFieldAt 2-3 rows, and fluidNormalAt 4 fields — ~32 per water-pixel
-  // normal, on top of the march's own budget. Same words read, same order.
-  let wc = worldChunkOf(c);
+//
+// HOISTED RESOLVES (2026-10-07). The per-CHUNK half of the read — block-map
+// word and page-table entry — is a function of the chunk alone, and the field's
+// 2x3x2 tap box lies inside one chunk on ~80% of samples. So the caller
+// resolves it ONCE per field sample (fluidChunkRef) and each tap pays only the
+// per-CELL half (grid row + voxel word + material class). Same words, same
+// arithmetic: bit-identical to the per-tap resolve it replaced, and 0.2-0.5 ms
+// off the hill bench's fluid march (docs/PLAN_fluid_overhaul.md, render perf).
+
+// (block-map word, page-table entry) of chunk wc. A chunk outside the window
+// reads as (no block, EMPTY) — what the per-tap path saw there.
+fn fluidChunkRef(wc : vec3<i32>) -> vec2<u32> {
   let slot = chunkSlotOf(wc, R.origin);
+  if (slot == SLOT_NONE) { return vec2<u32>(0u, PT_SENTINEL_BIT); }
+  return vec2<u32>(fluidBlockMapR[slot], pageEntryOf(slot));
+}
+
+// The per-CELL half, off a resolved chunk ref `cr`.
+fn fluidCellFromRef(cr : vec2<u32>, c : vec3<i32>) -> vec3f {
   var m = 0.0;
   var vy = 0.0;
-  if (slot != SLOT_NONE) {
-    let bm = fluidBlockMapR[slot];
-    if (bm != 0u) {
-      let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
-      let b = ((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
-              FLUID_GW;
-      m = f32(fluidGridR[b]) * (1.0 / 1024.0);   // Q10 -> particle masses
-      // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
-      // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
-      // in. It comes off the same grid row as the mass one word away, so in
-      // practice it is not a second fetch.
-      vy = abs(f32(fluidGridR[b + 2u])) * (30.0 / 65536.0);
-    }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  if (cr.x != 0u) {
+    let b = ((cr.x - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
+            FLUID_GW;
+    m = f32(fluidGridR[b]) * (1.0 / 1024.0);   // Q10 -> particle masses
+    // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
+    // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
+    // in. It comes off the same grid row as the mass one word away, so in
+    // practice it is not a second fetch.
+    vy = abs(f32(fluidGridR[b + 2u])) * (30.0 / 65536.0);
   }
   var fill = m / max(TUNE_FLUID_REST_DENSITY, 1.0);
   var blocker = 0.0;
-  let w = voxWordAtEntry(pageEntryOf(slot), c);
+  let w = voxWordAtEntry(cr.y, c);
   let mat = voxMat(w);
   if (mat != MAT_AIR) {
     let k = materials[mat].klass;
@@ -11292,15 +11295,26 @@ fn fluidCellAt(c : vec3<i32>) -> vec3f {
   return vec3f(fill, blocker, fill * vy);
 }
 
+// Cell c, given the ref the caller resolved for chunk `hw`; a tap across a
+// chunk face (the ~20% of samples whose tap box straddles one) resolves its own.
+fn fluidCellAt(c : vec3<i32>, hw : vec3<i32>, href : vec2<u32>) -> vec3f {
+  let wc = worldChunkOf(c);
+  var cr = href;
+  if (any(wc != hw)) { cr = fluidChunkRef(wc); }
+  return fluidCellFromRef(cr, c);
+}
+
 // Bilinear-XZ blend of ONE CELL ROW's (fill, blocker, fill*speed), on weights
 // the caller computed once. Four taps. Both models below are built out of these
 // rows, so they cannot disagree about which columns they are looking at.
-fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32) -> vec3f {
+fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32, hw : vec3<i32>,
+              href : vec2<u32>) -> vec3f {
   var acc = vec3f(0.0);
   for (var i = 0; i < 4; i++) {
     let o = vec2<i32>(i & 1, (i >> 1) & 1);
     let w = mix(1.0 - f, f, vec2f(o));
-    acc += fluidCellAt(vec3<i32>(b.x + o.x, cy, b.y + o.y)) * (w.x * w.y);
+    acc += fluidCellAt(vec3<i32>(b.x + o.x, cy, b.y + o.y), hw, href) *
+           (w.x * w.y);
   }
   return acc;
 }
@@ -11375,8 +11389,12 @@ fn fluidFieldAt(p : vec3f) -> f32 {
   // FLOOR, exactly as the state nibble is — not centre-aligned like the blob.
   let cy = i32(floor(p.y));
   let fy = p.y - f32(cy);
-  let here  = fluidRowAt(bi, fxz, cy);
-  let below = fluidRowAt(bi, fxz, cy - 1);
+  // ONE chunk resolve for the whole tap box (see HOISTED RESOLVES): the taps
+  // span x in [bi.x, bi.x+1], z in [bi.y, bi.y+1], y in [cy-1, cy+1].
+  let hw = worldChunkOf(vec3<i32>(bi.x, cy, bi.y));
+  let href = fluidChunkRef(hw);
+  let here  = fluidRowAt(bi, fxz, cy, hw, href);
+  let below = fluidRowAt(bi, fxz, cy - 1, hw, href);
 
   // SUPPORT. One eighth of water below is already full support: an eighth is
   // the CA's entire quantum, and a film resting on a film is still a film.
@@ -11410,7 +11428,7 @@ fn fluidFieldAt(p : vec3f) -> f32 {
   // rows, eight taps.
   let needAbove = (here.x > 0.75) || (lw < 0.999 && fy >= 0.5);
   var above = vec3f(0.0);
-  if (needAbove) { above = fluidRowAt(bi, fxz, cy + 1); }
+  if (needAbove) { above = fluidRowAt(bi, fxz, cy + 1, hw, href); }
 
   var field = 0.0;
   if (lw < 0.999) {
