@@ -338,7 +338,11 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
     const AnimStateRule& rule = sk.states[anim_.locoState];
     out.stateIndex = anim_.locoState;
     out.stateName = rule.name.c_str();
-    out.speedScale = rule.speedScale;
+    // ...pulsed by the state's step surge (AnimStateRule::surge, mean 1), so
+    // a stump walk lurches from plant to plant instead of gliding. Read off
+    // the pose's playhead, one tick latent, the same way the state is.
+    out.speedScale = rule.speedScale * LocoSurge();
+    out.baseSpeedScale = rule.speedScale;
     // The pose and the camera must agree about how low the body is, so the
     // camera reads the DRAWN body rather than the authored number that used to
     // determine it. `bodyY_ - origin_.y` is exactly the drop the pose pipeline
@@ -359,6 +363,7 @@ AvatarLocomotion PlayerAvatar::Locomotion() const {
   // body along the floor costs on top. Zero when both feet are on, zero in the
   // air, and eased in and out with the pose, so there is no threshold to feel.
   out.speedScale *= 1.0f - dragW_ * (1.0f - kDragSpeedPenalty);
+  out.baseSpeedScale *= 1.0f - dragW_ * (1.0f - kDragSpeedPenalty);
 
   // Jumping is derived from LEG LIVENESS rather than authored per state: it is
   // a physical fact about how many legs are under you, and stating it once

@@ -4521,7 +4521,13 @@ function buildStates() {
     // so the two can never both fire. Do not widen it to `missingAny`.
     { name: 'stumps', missing: ['foot.L', 'foot.R'],
       clip: 'stumpwalk', speedScale: 0.2, disableGait: true,
-      bodyYOffset: -1.25 },
+      bodyYOffset: -1.25,
+      // 2026-10-07: the playhead runs on DISTANCE (one loop per 7 sidecar
+      // units travelled), the walk drive's speed pulses with the steps (+-60%,
+      // peaking 70% of the way to each plant: thrown onto the next stump),
+      // and a held crouch drops onto the knees (stumpkneel). anim.h
+      // AnimStateRule::cycleDistance / surge / crouchClip.
+      cycleDistance: 7, surge: 0.6, surgePeak: 0.7, crouchClip: 'stumpkneel' },
     { name: 'limp',
       missingAny: ['legU.L', 'legL.L', 'foot.L', 'legU.R', 'legL.R', 'foot.R'],
       clip: 'limp', speedScale: 0.55 },

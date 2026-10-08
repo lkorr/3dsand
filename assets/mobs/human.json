@@ -796,7 +796,11 @@
       "clip": "stumpwalk",
       "speedScale": 0.2,
       "disableGait": true,
-      "bodyYOffset": -1.25
+      "bodyYOffset": -1.25,
+      "cycleDistance": 7,
+      "surge": 0.6,
+      "surgePeak": 0.7,
+      "crouchClip": "stumpkneel"
     },
     {
       "name": "limp",

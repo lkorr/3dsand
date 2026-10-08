@@ -344,8 +344,14 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     if (want != st.locoState) {
       if (st.locoState >= 0 && !sk.states[st.locoState].clip.empty()) {
         const int old = sk.FindClip(sk.states[st.locoState].clip);
+        // ...and its kneel, which is a second instance of the same state.
+        const int oldKneel =
+            sk.states[st.locoState].crouchClip.empty()
+                ? -1
+                : sk.FindClip(sk.states[st.locoState].crouchClip);
         for (ClipInstance& inst : st.clips)
-          if (inst.clip == old) inst.stopping = true;
+          if (inst.clip == old || (oldKneel >= 0 && inst.clip == oldKneel))
+            inst.stopping = true;
       }
       st.locoState = want;
       if (want >= 0) {
@@ -376,14 +382,70 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // `stumps` waddle is the same kind of cycle, and at full rate a footless
   // body standing still marched on the spot. groundAlign already implies
   // disableGait (LoadMobDefs warns otherwise), so the prone set is unchanged.
+  //
+  // A state with `cycleDistance` advances by DISTANCE instead (2026-10-07):
+  // one loop per cycleDistance voxels travelled, so a walk whose speed pulses
+  // with its own steps (AnimStateRule::surge) stays locked to them -- the
+  // surge speeds the playhead through the throw and slows it through the
+  // plant, which is exactly where the body is. No upper clamp beyond 3x: the
+  // distance lock is the point, and the lower bound still freezes a stop.
+  //
+  // THE CROUCH OF A CLIP-OWNED STATE (`crouchClip`): the held crouch below is
+  // off under a clip that owns the pelvis, so a footless body's Ctrl used to
+  // shrink the collision box and change nothing on screen. With a crouchClip
+  // the crouch crossfades the loco clip into it by WEIGHT -- the override
+  // blend is a weighted mean, so the walk is given 1-k and the kneel k, not
+  // the kneel k on top of a walk at 1 -- and the kneel shares the playhead
+  // rate, so a crouched body shuffles on its knees when it moves.
   if (loco != nullptr && loco->disableGait && !loco->clip.empty()) {
     const int ci = sk.FindClip(loco->clip);
-    const float ref =
-        std::max(def.speed * std::max(loco->speedScale, 0.05f), 0.5f);
-    float rate = std::clamp(speedNow_ / ref, 0.0f, 1.5f);
+    float rate;
+    if (loco->cycleDistance > 0.0f && ci >= 0 && sk.clips[ci].durationMs > 0) {
+      const float cycleS = (float)sk.clips[ci].durationMs * 0.001f;
+      rate = std::clamp(speedNow_ * cycleS / loco->cycleDistance, 0.0f, 3.0f);
+    } else {
+      const float ref =
+          std::max(def.speed * std::max(loco->speedScale, 0.05f), 0.5f);
+      rate = std::clamp(speedNow_ / ref, 0.0f, 1.5f);
+    }
     if (rate < 0.05f) rate = 0.0f;
+    const int kc =
+        loco->crouchClip.empty() ? -1 : sk.FindClip(loco->crouchClip);
+    const float kneelStep = dt / 0.22f;   // seconds to drop onto the knees
+    locoKneel_ = (kc >= 0 && in.crouch) ? std::min(1.0f, locoKneel_ + kneelStep)
+                                        : std::max(0.0f, locoKneel_ - kneelStep);
+    const float kneel = Smooth01(locoKneel_);
+    float walkTimeMs = -1.0f;
     for (ClipInstance& inst : st.clips)
-      if (inst.clip == ci && !inst.stopping) inst.rate = rate;
+      if (inst.clip == ci && !inst.stopping) {
+        inst.rate = rate;
+        inst.weight = 1.0f - kneel;
+        walkTimeMs = inst.timeMs;
+      }
+    if (kc >= 0) {
+      if (locoKneel_ > 0.0f) {
+        // Revive-before-request, as the chase pose does: PlayClipIndex would
+        // stack a second instance beside one still blending out.
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == kc) inst.stopping = false;
+        PlayClipIndex(kc);
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == kc) {
+            inst.weight = kneel;
+            inst.rate = rate;
+            // One playhead for both: a kneel authored on the walk's period
+            // shuffles the knee that the walk was about to step with.
+            if (walkTimeMs >= 0.0f &&
+                sk.clips[kc].durationMs == sk.clips[ci].durationMs)
+              inst.timeMs = walkTimeMs;
+          }
+      } else {
+        for (ClipInstance& inst : st.clips)
+          if (inst.clip == kc) inst.stopping = true;
+      }
+    }
+  } else if (locoKneel_ > 0.0f) {
+    locoKneel_ = 0.0f;   // the state that owned the kneel is gone
   }
 
   // ---- the chase pose: arms out while the dead come for you ----------------

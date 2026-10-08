@@ -3186,7 +3186,12 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             camMode, camHeading, avatarHeading,
             Vec3{player.vel.x - player.slideVel.x, 0,
                  player.vel.z - player.slideVel.z},
-            kTickDt, avatar.Spawned() ? avatar.LocoGroundAlign() : 0.0f);
+            kTickDt, avatar.Spawned() ? avatar.LocoGroundAlign() : 0.0f,
+            avatar.Spawned() && !player.fly
+                ? avatar.Locomotion().baseSpeedScale *
+                      (player.crouching ? CurrentTuning().player.crouchSpeedScale
+                                        : 1.0f)
+                : 1.0f);
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:
