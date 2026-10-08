@@ -22,7 +22,8 @@
 //      flag: `MobSystem::FindParry` tests the swept blade against the
 //      defender's blade. The attacker has both (the defender's is the ghost's
 //      posed held item, and MobPose now carries whether that blade is live --
-//      cutting or held in guard), so the parry is judged where the attacker's
+//      cutting or held in guard; a peer PLAYER's ghost holds the sword its
+//      owner streams, net::PlayerBody), so the parry is judged where the attacker's
 //      sword is, and its stroke is ARRESTED on the tick it meets the guard.
 //      Judging it on the defender's machine instead would let the attacker's
 //      sword pass through the guard on screen and be stopped a round trip
@@ -45,12 +46,21 @@
 //      ghost). The owner's carve is the real one, its gore enters the owner's
 //      batch, and the STRUCTURE it changes (a limb off, a death) reaches the
 //      attacker the way any owner-side change does: the pose stream omits a
-//      severed limb (MobSystem::ApplyPose drops it), PlayerState carries a
-//      player's severed set, and a death is MobPose.alive. Waiting for the
+//      severed limb (MobSystem::ApplyPose drops it; a peer player's ghost
+//      avatar is posed from its owner's net::PlayerBody stream the same way,
+//      Mob::PlaceFromOwnerPose), and a death is MobPose.alive. Waiting for the
 //      owner's result instead is not available: a living creature's wounds
 //      have no state stream at all, so the attacker would never see them.
 //      With rule 2 the record is what the owner applies, so nothing has to
 //      snap back.
+//
+// LOOSE MATTER GOES THE SAME WAY (v2): a blow on a peer's corpse piece,
+// dropped item or crate is a `Loose` record against the body's global id, in
+// its body frame, applied by its owner through ResolveOnLooseMatter. The
+// attacker's ghost body is carved as presentation, and a piece that parts
+// from it is dropped rather than made this machine's debris
+// (DebrisSystem::CutBody / BluntBody on a ghost) -- the owner's fragments
+// arrive as its ghost bodies.
 //
 // ALL GEOMETRY IS IN THE STRUCK SLOT'S BODY FRAME. The ghost is posed from a
 // stream a few ticks old; the owner's body is where it is now. A world-space
@@ -68,13 +78,16 @@
 #include "math3d.h"
 #include "sim/bytestream.h"
 
-// A CREATURE, ACROSS TWO MACHINES. A mob is its mob id on both (the id bands
-// make it global). A PLAYER is not: its avatar's mob id is per-machine (a
-// local session's is 0x5A11ED + i, a peer's ghost 64 above), so a player is
+// A STRUCK THING, ACROSS TWO MACHINES. A mob is its mob id on both (the id
+// bands make it global). A PLAYER is not: its avatar's mob id is per-machine
+// (a local session's is 0x5A11ED + i, a peer's ghost 64 above), so a player is
 // named by the playerId of the machine that drives it -- the `owner_` its
-// avatar carries everywhere (MobSystem::SetAvatars, SetAvatarOwner).
+// avatar carries everywhere (MobSystem::SetAvatars, SetAvatarOwner). LOOSE
+// MATTER (a corpse piece, a dropped sword, a crate) is its debris GLOBAL id
+// (net::MakeGlobalBodyId), the name every BodyAnnounce/Pose/Handoff uses.
 struct CombatantRef {
-  uint32_t player = 0;   // 1: `id` is a playerId; 0: `id` is a mob id
+  static constexpr uint32_t kMob = 0, kPlayer = 1, kBody = 2;
+  uint32_t kind = kMob;
   uint64_t id = 0;
 };
 
@@ -82,6 +95,7 @@ enum class MeleeHitKind : uint8_t {
   Flesh = 0,   // a rig slot below AppendedBase (impact.h StruckKind::Flesh)
   Shell,       // a worn garment took it (the cover retarget, or the probe)
   Parry,       // the held blade stopped the stroke (rule 2 above)
+  Loose,       // loose matter (CombatantRef::kBody): DebrisSystem resolves it
 };
 
 // Everything fixed-size, so the record is one Pod and three strings.
@@ -110,6 +124,9 @@ struct MeleeHitCore {
   uint32_t hops = 0;          // re-routes so far (rule 3)
   uint32_t waitTick = 0;      // local: first tick it waited (not meaningful
                               // on the wire; the receiver restarts it)
+  // LOOSE only: the body that is SHOVED, by global id, when the blow went to
+  // a garment strapped to it (the corpse-armour retarget). 0 = the target.
+  uint64_t reactBodyGid = 0;
 
   static constexpr uint32_t kSelfMounted = 1u << 0;   // a fist / jaws
   static constexpr uint32_t kFirstContact = 1u << 1;  // impulses may land
@@ -128,7 +145,9 @@ struct MeleeHit {
 
 // Bumped whenever MeleeHitCore or the string list changes. A record of
 // another version fails to decode (the reader is poisoned).
-inline constexpr uint32_t kMeleeHitVersion = 1;
+// v2 (2026-10-08): loose matter (CombatantRef::kBody, MeleeHitKind::Loose,
+// reactBodyGid); CombatantRef's first word is a kind.
+inline constexpr uint32_t kMeleeHitVersion = 2;
 
 inline void EncodeMeleeHit(ByteWriter& w, const MeleeHit& h) {
   w.U32(kMeleeHitVersion);

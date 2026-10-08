@@ -29225,12 +29225,25 @@ void Mob::DropLimbForOwner(int limbIndex) {
   MarkInstancesDirty();
 }
 
-uint32_t Mob::SeveredBaseMask() const {
-  uint32_t m = 0;
-  const int n = std::min<int>(baseLimbs_, 32);
-  for (int i = 0; i < n && i < (int)limbs_.size(); i++)
-    if (!limbs_[(size_t)i].body) m |= 1u << i;
-  return m;
+void Mob::DropLimbsOwnerLacks(const ::net::MobPose& p) {
+  if (!IsGhost()) return;
+  const int base = std::min<int>(baseLimbs_, (int)limbs_.size());
+  std::vector<uint8_t> listed((size_t)std::max(base, 0), 0);
+  for (const ::net::WireLimbPose& lp : p.limbs)
+    if ((int)lp.index < base) listed[lp.index] = 1;
+  for (int i = 0; i < base; i++)
+    if (!listed[(size_t)i] && limbs_[(size_t)i].body &&
+        limbs_[(size_t)i].wornHost < 0)
+      DropLimbForOwner(i);
+}
+
+void Mob::PlaceFromOwnerPose(const ::net::MobPose& p, float dt) {
+  if (!IsGhost()) return;
+  ghostPose_ = p;
+  haveGhostPose_ = true;
+  ghostBladeLive_ = (p.flags & ::net::MobPose::kBladeLive) != 0;
+  DropLimbsOwnerLacks(p);
+  TickGhost(dt);
 }
 
 int Mob::SlotIndexNamed(const std::string& name) const {
@@ -29272,12 +29285,14 @@ CombatantRef MobSystem::RefOf(const Mob& m) const {
   // machine that drives it in `owner_` (SetAvatars stamps the local ones,
   // SetAvatarOwner a peer's ghost), and that number means the same body on
   // both machines where the mob id does not.
-  if (m.PlayerControlled() && !InMobList(&m)) return CombatantRef{1, m.owner_};
-  return CombatantRef{0, m.id_};
+  if (m.PlayerControlled() && !InMobList(&m))
+    return CombatantRef{CombatantRef::kPlayer, m.owner_};
+  return CombatantRef{CombatantRef::kMob, m.id_};
 }
 
 Mob* MobSystem::ResolveCombatant(const CombatantRef& r) {
-  if (r.player == 0) return FindCreature(r.id);
+  if (r.kind == CombatantRef::kMob) return FindCreature(r.id);
+  if (r.kind != CombatantRef::kPlayer) return nullptr;
   for (Mob* av : avatars_)
     if (av != nullptr && !InMobList(av) && av->PlayerControlled() &&
         av->owner_ == (uint32_t)r.id)
@@ -29417,6 +29432,13 @@ bool MobSystem::BuildPose(uint64_t mobId, uint32_t tick,
   for (const Mob& c : mobs_)
     if (c.id_ == mobId) { m = &c; break; }
   if (m == nullptr) return false;
+  BuildPoseOf(*m, tick, out);
+  return true;
+}
+
+void MobSystem::BuildPoseOf(const Mob& mob, uint32_t tick,
+                            ::net::MobPose& out) {
+  const Mob* m = &mob;
   out = ::net::MobPose{};
   out.id = m->id_;
   out.tick = tick;
@@ -29443,7 +29465,6 @@ bool MobSystem::BuildPose(uint64_t mobId, uint32_t tick,
     for (int k = 0; k < 4; k++) lp.quat[k] = L.xf.quat[k];
     out.limbs.push_back(lp);
   }
-  return true;
 }
 
 bool MobSystem::ApplyPose(const ::net::MobPose& p) {
@@ -29487,16 +29508,7 @@ bool MobSystem::ApplyPose(const ::net::MobPose& p) {
   // Before this a ghost never lost a limb its owner lost while it lived, and
   // a ghost that severed one locally (a blow landed here) kept a second copy
   // of the arm on this machine's ground.
-  {
-    const int base = std::min<int>(m->baseLimbs_, (int)m->limbs_.size());
-    std::vector<uint8_t> listed((size_t)std::max(base, 0), 0);
-    for (const ::net::WireLimbPose& lp : p.limbs)
-      if ((int)lp.index < base) listed[lp.index] = 1;
-    for (int i = 0; i < base; i++)
-      if (!listed[(size_t)i] && m->limbs_[(size_t)i].body &&
-          m->limbs_[(size_t)i].wornHost < 0)
-        m->DropLimbForOwner(i);
-  }
+  m->DropLimbsOwnerLacks(p);
   // ---- THE OWNER SAYS IT DIED (P2c) ----------------------------------------
   //
   // The dead state, entered the moment the pose that carries it is latched:
@@ -29576,6 +29588,26 @@ bool MobSystem::TakeHandoff(uint64_t mobId, uint32_t newOwner,
 // A retired item is SKIPPED, not an error: the creature arrives without it and
 // the far side keeps drawing, which is the same answer `ApplyHandoff` has
 // always given and the same one a save load gives a retired def.
+bool MobSystem::RedressFromWire(Mob& m,
+                                const std::vector<::net::WireGear>& gear) {
+  std::vector<::net::WireGear> now;
+  m.CaptureGear(now);
+  bool same = now.size() == gear.size();
+  for (size_t k = 0; k < gear.size() && same; k++)
+    same = now[k].name == gear[k].name &&
+           now[k].equipSlot == gear[k].equipSlot &&
+           now[k].held == gear[k].held && now[k].dye == gear[k].dye;
+  if (same) return false;
+  std::vector<int> slots;
+  for (const Mob::WornPiece& p : m.worn_) slots.push_back(p.equipSlot);
+  for (int es : slots) m.UnwearItem(es);
+  for (int hk = 0; hk < kHands; hk++)
+    if (!m.held_[hk].item.empty()) m.EquipItem(nullptr, HandAt(hk));
+  ApplyWireGear(m, gear);
+  instancesDirty_ = true;
+  return true;
+}
+
 void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) {
   if (items_ == nullptr) return;
   for (const ::net::WireGear& g : gear) {
@@ -29936,21 +29968,7 @@ bool MobSystem::ApplyState(const ::net::MobState& st) {
   // the owner's numbering — the numbering the pose stream and the record are
   // indexed by. Only when the list differs: an unchanged list would rebuild
   // every shell for nothing.
-  ::net::MobAnnounce now{};
-  bool same = BuildAnnounce(st.announce.id, now) &&
-              now.gear.size() == st.announce.gear.size();
-  for (size_t k = 0; k < st.announce.gear.size() && same; k++)
-    same = now.gear[k].name == st.announce.gear[k].name &&
-           now.gear[k].equipSlot == st.announce.gear[k].equipSlot &&
-           now.gear[k].held == st.announce.gear[k].held &&
-           now.gear[k].dye == st.announce.gear[k].dye;
-  if (!same) {
-    std::vector<int> slots;
-    for (const Mob::WornPiece& p : m->worn_) slots.push_back(p.equipSlot);
-    for (int es : slots) m->UnwearItem(es);
-    for (int hk = 0; hk < kHands; hk++)
-      if (!m->held_[hk].item.empty()) m->EquipItem(nullptr, HandAt(hk));
-    ApplyWireGear(*m, st.announce.gear);
+  if (RedressFromWire(*m, st.announce.gear)) {
     m = FindMobById(st.announce.id);   // dressing may re-enter this system
     if (m == nullptr) return false;
   }

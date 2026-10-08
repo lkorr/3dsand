@@ -14681,7 +14681,7 @@ Status GateNetMelee(Ctx& c, std::string& detail) {
       // queue, handed to A's inbound list as if a third party sent it there.
       MeleeHit h;
       h.c.target = c.mobs.RefOf(*wOnA);
-      h.c.attacker = CombatantRef{0, subject};
+      h.c.attacker = CombatantRef{CombatantRef::kMob, subject};
       h.c.kind = (uint32_t)MeleeHitKind::Flesh;
       h.c.sweepDir = Vec3{1, 0, 0};
       h.c.seg = Vec3{0, 3, 0};
@@ -14719,6 +14719,409 @@ Status GateNetMelee(Ctx& c, std::string& detail) {
       bOwnedC, okD ? 1 : 0, okE ? 1 : 0, (unsigned long long)routed, dE,
       (unsigned long long)bAuthoredGhosts);
   std::printf("net-melee: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  cleanup();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- net-player-melee ------------------------------------------------------
+//
+// A PEER PLAYER'S BODY IS ITS OWNER'S, LIMB FOR LIMB, AND SO IS LOOSE MATTER
+// (net::PlayerBody; game/meleehit.h loose matter; 2026-10-08).
+// net-player-corpse's two machines: A (the suite's systems) holds a
+// RemotePlayers ghost of B's player and an NPC of its own, the wielder; B (a
+// second MobSystem on its own Physics) has a registered PlayerAvatar holding
+// a sword, and owns a block of loose flesh. Entity bytes run both ways, B's
+// PlayerBody reaching A's ghost through the same seams the game runs. Claims:
+//
+//   A. DRESSED AND POSED BY ITS OWNER. A's ghost of B holds the sword B
+//      holds, in the same rig slot, and every limb it has -- the sword
+//      included -- sits where B's last streamed pose put it.
+//   B. A PLAYER PARRIES ACROSS THE WIRE. B swings (Mob::SetSwinging); the
+//      ghost's blade goes live on A, a blade swept through it on A is
+//      ARRESTED there, and on B the player's sword takes the wear and the
+//      parry is counted -- B's flesh untouched.
+//   C. A BLOW ON A PLAYER IS THE PLAYER'S. A cut through the ghost's torso on
+//      A wounds B's real body on B (a kPlayer record).
+//   D. LOOSE MATTER GOES TO ITS OWNER. A blow (an edge and a tear) through A's ghost of B's flesh
+//      block carves the ghost as presentation (no piece of it becomes A's
+//      debris, no gore submitted) and B's real block loses voxels.
+// Leaves the suite as net-player-corpse does.
+Status GateNetPlayerMelee(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  uint32_t fleshMat = 0;
+  for (uint32_t m = 0; m < (uint32_t)c.mats.size(); m++)
+    if (c.mats[m].name == "flesh") fleshMat = m;
+  if (defIndex < 0 || sword == nullptr || fleshMat == 0) {
+    detail = "no held_right humanoid def, no 'sword' item or no 'flesh'";
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  constexpr uint32_t kPeer = 1;
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+
+  // ---- machine B (net-player-corpse's construction) -----------------------
+  Physics farPhys;
+  farPhys.Init();
+  DebrisSystem farDebris;
+  farDebris.Init(&farPhys, &c.world, c.mats, c.reactions);
+  farDebris.SetMicroSet(c.debris.MicroSet());
+  farDebris.SetLocalPlayerId(kPeer);
+  MobSystem far;
+  far.Init(&farPhys, &c.world, &farDebris, c.mats, c.reactions);
+  far.SetMicroSet(c.mobs.MicroSet());
+  far.SetDefFactory(c.mobs.DefFactory());
+  far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+  far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+  far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+  far.SetItems(&c.items);
+  far.SetIdBand(kPeer);
+  far.SetLocalPlayerId(kPeer);
+  far.MeleeWire() = MobSystem::MeleeWireStats{};
+
+  ::net::EntitySync entA, entB;
+  entA.Connect(0, kPeer);
+  entB.Connect(kPeer, 0);
+  {
+    ::net::PeerView va{0, pchunk, c.world.WindowOrigin(), true};
+    ::net::PeerView vb{kPeer, pchunk, c.world.WindowOrigin(), true};
+    entA.SetPeers(va, &vb);
+    entB.SetPeers(vb, &va);
+  }
+  PlayerAvatar avB;
+  avB.Init(&farPhys, &c.world, &farDebris, c.mats, &far);
+  avB.SetDefs(&far.Defs(), kAvatarDefName);
+  RemotePlayers remotes;
+  RemotePlayer& rb = remotes.Upsert(kPeer);
+  auto cleanup = [&]() {
+    remotes.Clear(c.phys);
+    c.mobs.SetAvatars({});
+    far.SetAvatar(nullptr);
+    avB.Despawn();
+    far.Reset();
+    farDebris.Reset();
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  };
+  if (!avB.HasDef()) {
+    cleanup();
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return Status::Fail;
+  }
+  Player plB;
+  plB.fly = false;
+  plB.grounded = true;
+  plB.pos = Vec3{(float)spot.x + 0.5f,
+                 (float)(World::TerrainHeight(spot.x, spot.z, kDefaultSeed) + 2) +
+                     Player::kHalfY,
+                 (float)spot.z + 0.5f};
+  if (!avB.Spawn(plB, 0.0f) || !avB.EquipItem(sword)) {
+    cleanup();
+    detail = "B's avatar would not spawn or take the sword";
+    return Status::Fail;
+  }
+  far.SetAvatar(&avB);
+
+  // B's loose flesh: a block standing clear of everything, B's own body. At
+  // FOUR lattice cells per world voxel, as a corpse's pieces are: a blade's
+  // kerf is a sliver, and on a one-cell-per-voxel lattice it takes nothing
+  // (DamageBody's note) -- the claim would be vacuous.
+  constexpr int kBlockCells = 24, kBlockScale = 4;
+  uint64_t blockB = 0;
+  {
+    std::vector<DebrisVoxel> vox;
+    for (int z = 0; z < kBlockCells; z++)
+      for (int y = 0; y < kBlockCells; y++)
+        for (int x = 0; x < kBlockCells; x++)
+          vox.push_back(DebrisVoxel{(int8_t)x, (int8_t)y, (int8_t)z, 0,
+                                    (uint16_t)fleshMat});
+    BodyTransform xf{};
+    const int bx = spot.x + 14, bz = spot.z - 10;
+    xf.pos = Vec3{(float)bx, (float)(World::TerrainHeight(bx, bz, kDefaultSeed) + 1),
+                  (float)bz};
+    xf.quat[3] = 1;
+    blockB = farPhys.CreateDebrisBodyXf(vox, xf, farDebris.DensityOf(), false,
+                                        1.0f / (float)kBlockScale);
+    if (blockB) farDebris.AdoptBody(blockB, vox, xf, MicroBodyRef{}, kBlockScale);
+  }
+  const uint64_t blockGid = blockB ? farDebris.GlobalIdOf(blockB) : 0;
+
+  // A's wielder: an NPC of A's own, off to the side.
+  const uint64_t wielderId = c.mobs.Spawn(defIndex, {spot.x - 14, spot.y + 1, spot.z});
+
+  // ---- one tick of both machines (net-player-corpse's step, plus the body
+  // stream and the owner-side melee apply on B) -----------------------------
+  uint32_t tick = 9600;
+  ::net::EntityBatch fromB;
+  bool haveFromB = false;
+  PlayerState stB{};
+  bool haveStB = false;
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): net-player-corpse's reason -- A's
+  // tick must run the peer-ghost seams with NO local player, and B has no
+  // world of its own. B additionally runs the one call TickAuthority makes
+  // for a peer's blows (ApplyRemoteMeleeHits, after phase J).
+  auto step = [&]() {
+    const uint32_t t = tick + 1;
+    if (haveFromB) {
+      entA.NoteRemote(::net::EntityBatch(fromB));
+      haveFromB = false;
+    }
+    entA.ApplyForTick(t, c.mobs, c.debris, nullptr);
+    {
+      ::net::PlayerBody pb;
+      if (entA.TakePeerBody(pb)) rb.NoteBody(std::move(pb));
+    }
+    if (haveStB) rb.Apply(stB);
+    if (remotes.dirty) RemotePlayersSyncAvatars(remotes, c.mobs, {});
+    {
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      std::vector<BrushOp> ops;
+      c.mobs.PreTick(t, c.world, ops, cellOps, spawns);
+      RemotePlayersPreTick(remotes, t, kTickDt, c.world, c.phys, c.mobs,
+                           c.debris, c.mats, kAvatarDefName);
+      if (remotes.dirty) RemotePlayersSyncAvatars(remotes, c.mobs, {});
+      c.debris.PreTick(t, c.world, cellOps, spawns);
+      tick = t;
+      SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+                 false, pchunk, true, false, spawns);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+    }
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+    RemotePlayersPostStep(remotes);
+    ::net::EntityBatch sentA;
+    {
+      ::net::EntityBatch out;
+      entA.Build(c.mobs, c.debris, tick, out);
+      std::vector<uint8_t> bytes;
+      out.Encode(bytes);
+      sentA.Decode(bytes.data(), bytes.size());
+    }
+    entB.NoteRemote(::net::EntityBatch(sentA));
+    entB.ApplyForTick(tick, far, farDebris, nullptr);
+    {
+      std::vector<ParticleSpawn> bSp;
+      std::vector<CellOp> bCells;
+      std::vector<BrushOp> bOps;
+      far.PreTick(tick, c.world, bOps, bCells, bSp);
+      if (avB.Spawned() && avB.IsAlive())
+        avB.PreTick(tick, plB, 0.0f, kTickDt, c.world, bOps, bCells, bSp);
+      farDebris.PreTick(tick, c.world, bCells, bSp);
+      ApplyRemoteMeleeHits(farPhys, far, farDebris, c.world, bSp, tick);
+    }
+    farPhys.Step(kTickDt);
+    farDebris.PostStep();
+    far.PostStep();
+    if (avB.Spawned() && avB.IsAlive()) avB.PostStep();
+    {
+      ::net::EntityBatch out;
+      entB.Build(far, farDebris, tick, out);
+      std::vector<uint8_t> bytes;
+      out.Encode(bytes);
+      fromB.Clear();
+      fromB.Decode(bytes.data(), bytes.size());
+      haveFromB = true;
+    }
+    stB = PlayerState{};
+    stB.tick = tick;
+    stB.playerId = kPeer;
+    stB.pos = plB.pos;
+    stB.Set(PlayerState::kGrounded, true);
+    stB.Set(PlayerState::kAlive, !avB.Spawned() || avB.IsAlive());
+    haveStB = true;
+  };
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt, CurrentTuning());
+  // net-melee's sweep, on A, by A's wielder. `bite`: jaws as well as the
+  // edge -- a TEAR is a crater on loose matter (ResolveOnLooseMatter), where
+  // a blade's kerf is a sliver that a coarse block's cells can all survive.
+  auto sweepOnA = [&](Vec3 p, Vec3 along, Vec3 travel, float bite = 0.0f) {
+    EdgeSweep sw;
+    const Vec3 a = along.normalized() * 1.5f, tr = travel.normalized() * 4.0f;
+    sw.aPrev = p - a - tr;
+    sw.bPrev = p + a - tr;
+    sw.aNow = p - a + tr;
+    sw.bNow = p + a + tr;
+    sw.dt = kTickDt;
+    sw.halfWidth = 0.15f;
+    sw.strike.cut = 14.0f;
+    sw.strike.blunt = 2.0f;
+    sw.strike.bite = bite;
+    sw.tick = tick;
+    sw.valid = true;
+    std::vector<ParticleSpawn> spawns;
+    const Mob* w = c.mobs.FindMobById(wielderId);
+    const EdgeSweepResult r =
+        MeleeSweepDamage(sw, mt, *w, c.phys, c.mobs, c.debris, c.world, spawns);
+    return std::make_pair(r, spawns.size());
+  };
+  auto skin = [](const MobSystem& m, uint64_t id) {
+    int64_t n = 0;
+    for (int li = 0; li < 96; li++) n += m.LimbSkinVoxelCount(id, li);
+    return n;
+  };
+  auto latticeOf = [](DebrisSystem& d, uint64_t gid) -> int64_t {
+    const uint64_t h = d.HandleOfGlobalId(gid);
+    std::vector<PrefabVoxel> v;
+    uint32_t sc = 1;
+    if (h == 0 || !d.BodyLatticeOf(h, v, sc)) return -1;
+    return (int64_t)v.size();
+  };
+
+  for (int i = 0; i < 12; i++) step();
+
+  // ======== A: dressed and posed by its owner =============================
+  Mob& ghost = rb.avatar;
+  const int heldB = avB.HeldSlot(), heldA = ghost.HeldSlot();
+  const bool sameSlot = heldB >= 0 && heldA == heldB &&
+                        ghost.SlotName(heldA) == avB.SlotName(heldB);
+  double placeErr = -1.0, swordToOwner = -1.0;
+  int placed = 0;
+  if (rb.haveBody) {
+    placeErr = 0.0;
+    for (const ::net::WireLimbPose& lp : rb.body.pose.limbs) {
+      const uint64_t h = c.mobs.LimbBody(ghost.Id(), (int)lp.index);
+      BodyTransform xf{};
+      if (h == 0 || !c.phys.GetTransform(h, xf)) continue;
+      placeErr = std::max(placeErr, (double)(xf.pos - lp.pos).len());
+      placed++;
+    }
+  }
+  if (heldA >= 0 && heldB >= 0) {
+    BodyTransform xa{}, xb{};
+    if (c.phys.GetTransform(c.mobs.LimbBody(ghost.Id(), heldA), xa) &&
+        farPhys.GetTransform(far.LimbBody(avB.Id(), heldB), xb))
+      swordToOwner = (xa.pos - xb.pos).len();
+  }
+  const double placeTol = BaselineNumber("netPlayerMeleePlaceVox", 0.05);
+  const double ownerTol = BaselineNumber("netPlayerMeleeOwnerVox", 1.0);
+  const bool okA = rb.haveBody && sameSlot && placed > 0 &&
+                   placeErr <= placeTol && swordToOwner >= 0.0 &&
+                   swordToOwner <= ownerTol;
+
+  // ======== B: a player parries across the wire ============================
+  bool okB = false, live = false, arrested = false;
+  float itemHp0 = 0, itemHp1 = 0;
+  int64_t fleshB0 = 0, fleshB1 = 0;
+  uint64_t parries = 0;
+  {
+    avB.SetSwinging(true);
+    for (int i = 0; i < 6; i++) step();
+    live = ghost.GhostBladeLive();
+    Vec3 db{}, dt{}, df{};
+    float dhw = 0;
+    if (live && ghost.WeaponEdge(db, dt, dhw, &df)) {
+      itemHp0 = far.LimbHp(avB.Id(), heldB);
+      fleshB0 = skin(far, avB.Id());
+      const Vec3 mid = (db + dt) * 0.5f;
+      const Vec3 u = (dt - db).normalized();
+      Vec3 across = u.cross(Vec3{0, 1, 0});
+      if (across.len() < 0.2f) across = u.cross(Vec3{1, 0, 0});
+      const uint64_t p0 = far.MeleeWire().parries;
+      arrested = sweepOnA(mid, across.cross(u), across).first.arrested;
+      for (int i = 0; i < 4; i++) step();
+      parries = far.MeleeWire().parries - p0;
+      itemHp1 = far.LimbHp(avB.Id(), heldB);
+      fleshB1 = skin(far, avB.Id());
+    }
+    avB.SetSwinging(false);
+    for (int i = 0; i < 4; i++) step();
+    okB = live && arrested && parries == 1 && itemHp1 < itemHp0 &&
+          fleshB1 == fleshB0;
+  }
+
+  // ======== C: a blow on a player is the player's ===========================
+  bool okC = false;
+  int64_t dC = 0;
+  uint64_t appliedC = 0;
+  {
+    const int torso = avB.Def()->rootLimb >= 0 ? avB.Def()->rootLimb : 0;
+    const int64_t s0 = skin(far, avB.Id());
+    const uint64_t a0 = far.MeleeWire().applied;
+    const Vec3 at = c.mobs.LimbVoxelPos(ghost.Id(), torso, 977u);
+    sweepOnA(at, Vec3{0, 1, 0}, Vec3{1, 0, 0});
+    for (int i = 0; i < 4; i++) step();
+    dC = s0 - skin(far, avB.Id());
+    appliedC = far.MeleeWire().applied - a0;
+    okC = dC > 0 && appliedC >= 1;
+  }
+
+  // ======== D: loose matter goes to its owner ===============================
+  bool okD = false;
+  int64_t ghostLoss = 0, ownerLoss = 0;
+  size_t goreA = 0;
+  uint32_t ownedA0 = 0, ownedA1 = 0;
+  std::string whyD;
+  {
+    const uint64_t gh = blockGid ? c.debris.HandleOfGlobalId(blockGid) : 0;
+    {
+      const uint64_t bh = blockGid ? farDebris.HandleOfGlobalId(blockGid) : 0;
+      BodyTransform bx{};
+      if (bh) farPhys.GetTransform(bh, bx);
+      whyD = Format("block gid %llx: on B %d (y %.1f, terrain %d), on A %d ghost %d",
+                    (unsigned long long)blockGid, bh ? 1 : 0, bx.pos.y,
+                    World::TerrainHeight((int)bx.pos.x, (int)bx.pos.z, kDefaultSeed),
+                    gh ? 1 : 0, gh && c.debris.IsGhost(gh) ? 1 : 0);
+    }
+    if (gh != 0 && c.debris.IsGhost(gh)) {
+      const int64_t g0 = latticeOf(c.debris, blockGid);
+      const int64_t o0 = latticeOf(farDebris, blockGid);
+      ownedA0 = c.debris.BodyCount() - c.debris.GhostCount();
+      BodyTransform xf{};
+      c.phys.GetTransform(gh, xf);
+      const float half = 0.5f * (float)kBlockCells / (float)kBlockScale;
+      const Vec3 centre =
+          xf.pos + QuatRotate(Quat{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]},
+                              Vec3{half, half, half});
+      const uint64_t q0 = c.mobs.MeleeWire().queued;
+      const auto r = sweepOnA(centre, Vec3{0, 1, 0}, Vec3{1, 0, 0}, 6.0f);
+      goreA = r.second;
+      whyD += Format(", sweep at (%.1f,%.1f,%.1f): bodies %d, probes %d air %d "
+                     "body %d, queued %llu",
+                     centre.x, centre.y, centre.z, r.first.bodiesHit,
+                     r.first.probesCast, r.first.probesAir, r.first.probesBody,
+                     (unsigned long long)(c.mobs.MeleeWire().queued - q0));
+      ownedA1 = c.debris.BodyCount() - c.debris.GhostCount();
+      ghostLoss = g0 - latticeOf(c.debris, blockGid);
+      for (int i = 0; i < 4; i++) step();
+      ownerLoss = o0 - latticeOf(farDebris, blockGid);
+      okD = ghostLoss > 0 && goreA == 0 && ownedA1 == ownedA0 && ownerLoss > 0;
+    }
+  }
+
+  const bool ok = okA && okB && okC && okD;
+  detail = Format(
+      "A dressed+posed=%d (slot A %d / B %d same %d, %d limbs placed, err %.4f "
+      "(tol %.2f), sword %.3f vox from B's (tol %.1f)) | B player parry=%d "
+      "(blade live %d, arrested on A %d, parries on B %llu, sword hp %.1f->%.1f, "
+      "B skin %lld->%lld) | C blow on a player=%d (B skin -%lld, applied %llu) | "
+      "D loose=%d (A ghost -%lld, A gore %zu, A owned bodies %u->%u, B body -%lld; %s)",
+      okA ? 1 : 0, heldA, heldB, sameSlot ? 1 : 0, placed, placeErr, placeTol,
+      swordToOwner, ownerTol, okB ? 1 : 0, live ? 1 : 0, arrested ? 1 : 0,
+      (unsigned long long)parries, itemHp0, itemHp1, (long long)fleshB0,
+      (long long)fleshB1, okC ? 1 : 0, (long long)dC,
+      (unsigned long long)appliedC, okD ? 1 : 0, (long long)ghostLoss, goreA,
+      ownedA0, ownedA1, (long long)ownerLoss, whyD.c_str());
+  std::printf("net-player-melee: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
   cleanup();
   return ok ? Status::Pass : Status::Fail;
 }
@@ -17209,6 +17612,11 @@ const std::vector<Gate>& MobGates() {
       // Melee across the wire (game/meleehit.h): a blade swept on one machine
       // wounds, parries against, and is routed to the OWNER of the body.
       {"net-melee", "mob", {}, false, GateNetMelee, /*needsRender=*/false},
+      // A peer player's ghost dressed and posed by its owner (it holds, shows
+      // and parries with its sword), blows on a player and on a peer's loose
+      // matter applied by the owner (net::PlayerBody, game/meleehit.h).
+      {"net-player-melee", "mob", {}, false, GateNetPlayerMelee,
+       /*needsRender=*/false},
       // A REMOTE player's death and respawn as the other machine sees them,
       // and an NPC corpse changing hands through ScanHandoffs.
       {"net-player-corpse", "mob", {}, false, GateNetPlayerCorpse,

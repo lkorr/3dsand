@@ -5603,6 +5603,11 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
 
   std::vector<Body> fragments;
   uint32_t budget = MaxNewBodiesPerTick();
+  // A GHOST'S CUT IS PRESENTATION (game/meleehit.h, loose matter): its owner
+  // applies the same blow to the real body, and what parts from it there
+  // arrives here as the owner's ghost bodies. Read before the carve, which
+  // may move the body in the list.
+  const bool ghost = !OwnedLocally(b);
   // eject=true, unlike the beam: a blade takes matter OFF and that matter is
   // the gore. The beam vaporizes and is the only carve here that should not.
   DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true,
@@ -5611,10 +5616,7 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
                return [k](float x, float y, float z) { return k(x, y, z); };
              },
              DamageCause::Blade, std::clamp(cut.power, 0.0f, 1.0f), &spall);
-  for (Body& f : fragments) {
-    bodies_.push_back(std::move(f));
-    instancesDirty_ = true;
-  }
+  KeepFragments(fragments, ghost);
   return true;
 }
 
@@ -5870,13 +5872,24 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
 
   std::vector<Body> fragments;
   uint32_t budget = MaxNewBodiesPerTick();
+  const bool ghost = !OwnedLocally(bodies_[bi]);   // CutBody's note
   DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true, carve,
              cause, 1.0f);
+  KeepFragments(fragments, ghost);
+  return true;
+}
+
+void DebrisSystem::KeepFragments(std::vector<Body>& fragments, bool ghost) {
   for (Body& f : fragments) {
+    // A GHOST'S PIECE IS NOT THIS MACHINE'S: dropped, brick and Jolt body
+    // returned, so the cut stays presentation (game/meleehit.h).
+    if (ghost) {
+      ReleaseBody(f);
+      continue;
+    }
     bodies_.push_back(std::move(f));
     instancesDirty_ = true;
   }
-  return true;
 }
 
 bool DebrisSystem::MicroDirty() const {

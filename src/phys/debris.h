@@ -2083,6 +2083,10 @@ class DebrisSystem {
   // Build the body (asleep, at its saved pose), or 0. `follower` = it will be
   // strapped, so Jolt must allow the kinematic switch. `dead` = Body::dead.
   uint64_t RestoreBody(SavedBody&& s, bool follower, bool dead);
+  // The pieces a strike's DamageBody split off: adopted, or -- when the
+  // struck body is a GHOST (its owner's blow makes the real pieces) --
+  // released on the spot.
+  void KeepFragments(std::vector<Body>& fragments, bool ghost);
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.

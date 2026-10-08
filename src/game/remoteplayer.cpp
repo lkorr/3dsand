@@ -68,13 +68,23 @@ PlayerState MakePlayerState(const PlayerSession& s, uint32_t tick,
   st.windowOrigin[0] = windowOrigin.x;
   st.windowOrigin[1] = windowOrigin.y;
   st.windowOrigin[2] = windowOrigin.z;
-  // The limbs this body has lost (PlayerState::severed): the ghost on the
-  // peer drops the same ones (RemotePlayersPreTick).
-  st.severed = s.avatar.Spawned() ? s.avatar.SeveredBaseMask() : 0u;
   return st;
 }
 
 // ---- the receiving side ----------------------------------------------------
+
+void RemotePlayer::NoteBody(::net::PlayerBody&& b) {
+  if (b.hasGear) {
+    gear = std::move(b.gear);
+    haveGear = true;
+    gearPending = true;
+  }
+  if (!haveBody || b.pose.tick >= body.pose.tick) {
+    body = std::move(b);
+    body.gear.clear();
+    haveBody = true;
+  }
+}
 
 void RemotePlayer::Apply(const PlayerState& st) {
   last = st;
@@ -236,6 +246,7 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
       if (!r.avatar.HasDef()) continue;  // no such model: draw nothing, quietly
       if (!r.avatar.Spawn(r.ghost, r.heading)) continue;
       r.spawned = true;
+      r.gearPending = r.haveGear;   // a new rig is bare
       // The capsule is created ONCE and kept across death/revive: a
       // despawned avatar still occupies space to its owner, and churning a
       // Jolt body every death is how handles leak.
@@ -267,6 +278,7 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
       if (r.avatar.HasDef() && r.avatar.Spawn(r.ghost, r.heading)) {
         r.spawned = true;
         remotes.dirty = true;
+        r.gearPending = r.haveGear;   // a respawned rig is bare
       }
     }
     if (!r.spawned) {
@@ -287,16 +299,12 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
       r.throwSwing = swing;
     }
 
-    // ---- the limbs the owner's body has lost (PlayerState::severed) ------
-    // A blow from THIS machine carves the ghost as presentation and never
-    // severs it (game/meleehit.h rule 4); the owner applies the blow, and a
-    // limb that came off there arrives as its debris. This drops the ghost's
-    // copy -- no gore, no adoption -- so the arm is not on the ground AND on
-    // the body. One-way: a re-grown limb comes back with the next revive.
-    if (r.last.severed != 0) {
-      const int n = std::min(r.avatar.AppendedBase(), 32);
-      for (int i = 0; i < n; i++)
-        if ((r.last.severed >> i) & 1u) r.avatar.DropLimbForOwner(i);
+    // ---- DRESSED AS ITS OWNER IS (net::PlayerBody) ---------------------
+    // In the owner's rig-slot order, so the pose stream's slot indices name
+    // the same pieces here. Only on a change (RedressFromWire compares).
+    if (r.gearPending && r.haveGear) {
+      if (mobs.RedressFromWire(r.avatar, r.gear)) remotes.dirty = true;
+      r.gearPending = false;
     }
 
     // ---- drive the rig ---------------------------------------------------
@@ -321,6 +329,15 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
                              remotes.scratchCells.size() +
                              remotes.scratchSpawns.size()) -
                             before;
+
+    // ---- ...AND POSED AS ITS OWNER HAS IT (net::PlayerBody) -------------
+    // After the animation, which is what the ghost falls back to without a
+    // fresh stream: every limb with a body, the sword in the fist included,
+    // put where the owner's tick put it, a limb the owner lost dropped, and
+    // the blade's live bit latched for FindParry.
+    if (r.haveBody && tick >= r.body.pose.tick &&
+        tick - r.body.pose.tick <= RemotePlayer::kBodyFreshTicks)
+      r.avatar.PlaceFromOwnerPose(r.body.pose, dt);
 
     // Drain the one-tick edges, whether or not the avatar consumed them —
     // same rule and same wording as phase I's local drain. A peak-hold that is

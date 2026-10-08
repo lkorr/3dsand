@@ -57,7 +57,8 @@ namespace net {
 // number fails the read (ByteReader::ok goes false) instead of guessing.
 // v2 (W2-M): a WireGear is an ItemInstance (adds count and fill).
 // v3 (2026-10-08): MobPose::flags (kBladeLive: a ghost can parry).
-inline constexpr uint32_t kMobSyncVersion = 3;
+// v4 (2026-10-08): PlayerBody.
+inline constexpr uint32_t kMobSyncVersion = 4;
 
 // ---- one piece of kit, BY NAME ---------------------------------------------
 //
@@ -162,6 +163,27 @@ struct MobState {
   std::vector<uint8_t> record;   // Mob::SaveOne's bytes, exactly
 };
 
+// ---- "this is MY PLAYER's body" (2026-10-08) -----------------------------
+//
+// A peer player's ghost avatar used to be ANIMATED here from PlayerState --
+// right walk, wrong body: empty-handed whatever the player held, its arm
+// never in the swing the player was making, so a peer's sword could not be
+// seen, could not parry, and a blow aimed at the arm the peer really had
+// raised met an arm the ghost had at its side. The owner now streams its
+// avatar exactly as it streams a creature: the per-limb pose every tick
+// (MobPose, the held and worn slots included, `kBladeLive` for a swing) and
+// the gear -- what it holds and wears, in rig-slot order -- whenever that
+// changes and on a keyframe. The ghost is dressed from the gear
+// (MobSystem::RedressFromWire) so its slots are numbered as the owner's, and
+// posed from the stream after its local animation (Mob::PlaceFromOwnerPose),
+// which stays as the fallback while no fresh pose has arrived.
+struct PlayerBody {
+  uint32_t playerId = 0;
+  uint32_t hasGear = 0;          // `gear` is meaningful (changed / keyframe)
+  std::vector<WireGear> gear;    // rig-slot order (Mob::CaptureGear)
+  MobPose pose;
+};
+
 enum GoneReason : uint32_t {
   // RETIRED as a send (P2c): a death is a state of the Mob and is carried by
   // MobPose.alive. Kept so an old number decodes to a name.
@@ -193,5 +215,7 @@ void Encode(ByteWriter& w, const MobGone& g);
 bool Decode(ByteReader& r, MobGone& g);
 void Encode(ByteWriter& w, const MobState& s);
 bool Decode(ByteReader& r, MobState& s);
+void Encode(ByteWriter& w, const PlayerBody& b);
+bool Decode(ByteReader& r, PlayerBody& b);
 
 }  // namespace net

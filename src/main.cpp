@@ -14568,6 +14568,13 @@ int main(int argc, char** argv) {
         // the same `netSendBatch` the `TickBatch` rides.
         netRefreshPeerViews();
         entities.ApplyForTick(tick, mobs, debris, &ground);
+        // The peer's own body (net::PlayerBody): dressed and posed onto its
+        // ghost avatar inside the tick (RemotePlayersPreTick).
+        {
+          ::net::PlayerBody pb;
+          if (entities.TakePeerBody(pb))
+            remotes.Upsert(netPeerId).NoteBody(std::move(pb));
+        }
         entities.ScanHandoffs(mobs, debris, tick);
         entities.ExpireGhosts(tick, mobs, debris);
         netGhostsMax = std::max(netGhostsMax, entities.Stats().ghostsNow);

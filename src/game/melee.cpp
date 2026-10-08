@@ -1085,6 +1085,82 @@ bool ResolveOnCreature(const CreatureBlow& b, Physics& phys, MobSystem& mobs,
   return biteLanded;
 }
 
+// ---- ONE BLOW ON LOOSE MATTER, RESOLVED (2026-10-08) ------------------------
+//
+// The loose half of a strike after the shove: the three parts and the coat
+// exchange, lifted out of MeleeSweepDamage for the creature half's reason --
+// the OWNER of a peer's corpse piece, dropped sword or crate runs the same
+// lines (ApplyRemoteMeleeHits). `bitten` is the stroke's one-bite latch
+// (null on the owner, whose record says whether the bite was still unspent).
+void ResolveLooseBlow(uint64_t hb, const StrikeParts& parts,
+                      const StrikeProfile& strike, float power,
+                      bool firstContact, bool biteAllowed, uint64_t strikerId,
+                      MobSystem::CoatContact coat, const Vec3& coatAt,
+                      DebrisSystem& debris, MobSystem& mobs, World& world,
+                      std::vector<ParticleSpawn>& spawns, bool* bitten) {
+  // The body by its GLOBAL id across the resolve: a carve on loose matter may
+  // rebuild its collider under a new handle.
+  const uint64_t looseGid = debris.GlobalIdOf(hb);
+  ResolveOnLooseMatter(hb, parts, strike, power, firstContact, biteAllowed,
+                       debris, world, spawns, bitten);
+  // ---- THE COAT MOVES ON LOOSE MATTER TOO (2026-10-01) ----------------------
+  // A corpse's arm, a severed hand, a dropped sword: the striker's coat goes
+  // onto the voxels it met, theirs comes back, a cut-open corpse piece smears
+  // its own fluid on the blade -- MobSystem::CoatOnContact with the loose body
+  // as the struck side. Only on first contact, as the parts above resolve. (A
+  // GHOST body takes no coat here: CoatLatticeOf refuses one.)
+  if (firstContact && looseGid != 0 && strikerId != 0) {
+    coat.strikerId = strikerId;
+    coat.targetBody = debris.HandleOfGlobalId(looseGid);
+    coat.at = coatAt;
+    coat.kind = strike.cut > 0.0f    ? MobSystem::CoatHitKind::Cut
+                : strike.bite > 0.0f ? MobSystem::CoatHitKind::Bite
+                                     : MobSystem::CoatHitKind::Blunt;
+    coat.landed = true;
+    if (coat.targetBody != 0) {
+      burnprof::Scope bpCoat(burnprof::kCoat);
+      mobs.CoatOnContact(coat);
+    }
+  }
+}
+
+// ...and its record for the body's owner: the global id, the body frame.
+// `partsAt` is where the parts were built (the probe's contact), `coatAt`
+// where the coat lands (after a strapped garment took the blow).
+MeleeHit MakeLooseWireHit(const Mob& wielder, uint64_t hb, uint64_t reactBody,
+                          const Vec3& partsAt, const Vec3& coatAt,
+                          const Vec3& sweepDir, const Vec3& seg,
+                          const Vec3& flat, const EdgeSweep& s, float radius,
+                          float power, float tipSpeed, uint32_t hitSeed,
+                          float edgeU, uint32_t flags, Physics& phys,
+                          MobSystem& mobs, DebrisSystem& debris) {
+  MeleeHit h;
+  h.c.target = CombatantRef{CombatantRef::kBody, debris.GlobalIdOf(hb)};
+  h.c.attacker = mobs.RefOf(wielder);
+  h.c.kind = (uint32_t)MeleeHitKind::Loose;
+  if (reactBody != 0 && reactBody != hb)
+    h.c.reactBodyGid = debris.GlobalIdOf(reactBody);
+  BodyTransform xf{};
+  phys.GetTransform(hb, xf);
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  h.c.at = QuatRotateInv(q, partsAt - xf.pos);
+  h.c.clothAt = QuatRotateInv(q, coatAt - xf.pos);   // the coat's point
+  h.c.sweepDir = QuatRotateInv(q, sweepDir);
+  h.c.seg = QuatRotateInv(q, seg);
+  h.c.flat = QuatRotateInv(q, flat);
+  h.c.strike = s.strike;
+  h.c.radius = radius;
+  h.c.power = power;
+  h.c.tipSpeed = tipSpeed;
+  h.c.heft = s.heft;
+  h.c.edgeU = edgeU;
+  h.c.hitSeed = hitSeed;
+  h.c.flags = flags;
+  if (s.selfMounted) h.c.flags |= MeleeHitCore::kSelfMounted;
+  if (s.haft) h.c.flags |= MeleeHitCore::kHaft;
+  return h;
+}
+
 // ---- THE SAME BLOW, FOR THE CREATURE'S OWNER (game/meleehit.h) -------------
 //
 // Taken BEFORE the resolve: a carve rebuilds the struck limb under a new
@@ -1829,29 +1905,31 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         // by looking: a corpse fills neither the sever queue nor the voice
         // queue, which is what main.cpp infers the cue from.
         out.hitDeadFlesh |= debris.BodyIsDeadFlesh(hb);
-        // The body by its GLOBAL id across the resolve: a carve on loose
-        // matter may rebuild its collider under a new handle.
-        const uint64_t looseGid = debris.GlobalIdOf(hb);
-        ResolveOnLooseMatter(hb, parts, s.strike, power, firstContact,
-                             !wrongTarget, debris, world, spawns, s.bitten);
-        // ---- THE COAT MOVES ON LOOSE MATTER TOO (2026-10-01) --------------
-        // A corpse's arm, a severed hand, a dropped sword: the striker's coat
-        // goes onto the voxels it met, theirs comes back, a cut-open corpse
-        // piece smears its own fluid on the blade -- MobSystem::CoatOnContact
-        // with the loose body as the struck side. Only on first contact, as
-        // the parts above resolve.
-        if (firstContact && looseGid != 0) {
-          coat.strikerId = wielder.Id();
-          coat.targetBody = debris.HandleOfGlobalId(looseGid);
-          coat.at = at;
-          coat.kind = s.strike.cut > 0.0f   ? MobSystem::CoatHitKind::Cut
-                      : s.strike.bite > 0.0f ? MobSystem::CoatHitKind::Bite
-                                             : MobSystem::CoatHitKind::Blunt;
-          coat.landed = true;
-          if (coat.targetBody != 0) {
-            burnprof::Scope bpCoat(burnprof::kCoat);
-            mobs.CoatOnContact(coat);
-          }
+        // A PEER'S LOOSE BODY (game/meleehit.h, loose matter): the same blow,
+        // as presentation here -- gore to the discarded sink, a parted piece
+        // dropped (DebrisSystem::KeepFragments) -- and the record to its
+        // owner, taken BEFORE the carve rebuilds the body under a new handle.
+        // The parts were built at the probe's contact (`parts.cut.at`), before
+        // the armour retarget moved `at`; the record carries that point.
+        const bool looseHere = !debris.IsGhost(hb);
+        const bool biteFresh = s.bitten == nullptr || !*s.bitten;
+        MeleeHit wire;
+        if (!looseHere) {
+          uint32_t flags = 0;
+          if (firstContact) flags |= MeleeHitCore::kFirstContact;
+          if (!wrongTarget && biteFresh) flags |= MeleeHitCore::kBiteAllowed;
+          wire = MakeLooseWireHit(wielder, hb, struckBody, parts.cut.at, at,
+                                  sweepDir, seg, s.flatNow, s, radius, power,
+                                  out.tipSpeed, hitSeed, coat.edgeU, flags,
+                                  phys, mobs, debris);
+          ghostGore.clear();
+        }
+        ResolveLooseBlow(hb, parts, s.strike, power, firstContact, !wrongTarget,
+                         wielder.Id(), coat, at, debris, mobs, world,
+                         looseHere ? spawns : ghostGore, s.bitten);
+        if (!looseHere) {
+          ghostGore.clear();
+          if (wire.c.target.id != 0) mobs.QueueMeleeHit(std::move(wire));
         }
         continue;
       }
@@ -1930,10 +2008,56 @@ namespace {
 
 enum class RemoteHitOutcome : uint8_t { Applied, Route, Wait, Gone };
 
+// A blow on a peer's LOOSE body, on its owner (meleehit.h, loose matter).
+RemoteHitOutcome ApplyRemoteLooseHit(const MeleeHit& h, Physics& phys,
+                                     MobSystem& mobs, DebrisSystem& debris,
+                                     World& world,
+                                     std::vector<ParticleSpawn>& spawns) {
+  const uint64_t hb = debris.HandleOfGlobalId(h.c.target.id);
+  if (hb == 0) return RemoteHitOutcome::Gone;   // burnt, settled, picked up
+  if (debris.IsGhost(hb)) return RemoteHitOutcome::Route;
+  BodyTransform xf{};
+  phys.GetTransform(hb, xf);
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  auto P = [&](const Vec3& p) { return xf.pos + QuatRotate(q, p); };
+  auto D = [&](const Vec3& v) { return QuatRotate(q, v); };
+  const Vec3 at = P(h.c.at);
+  const Vec3 sweepDir = D(h.c.sweepDir);
+  EdgeSweep es;
+  es.strike = h.c.strike;
+  es.flatNow = D(h.c.flat);
+  es.heft = h.c.heft;
+  es.selfMounted = h.c.Has(MeleeHitCore::kSelfMounted);
+  const StrikeParts parts = BuildStrikeParts(es, at, D(h.c.seg), sweepDir,
+                                             h.c.radius, h.c.power,
+                                             h.c.tipSpeed, h.c.hitSeed);
+  uint64_t react = hb;
+  if (h.c.reactBodyGid != 0)
+    if (const uint64_t r = debris.HandleOfGlobalId(h.c.reactBodyGid)) react = r;
+  // 0. The body answers, as the sweep's loose branch does first.
+  StrikeReact(react, sweepDir, at, h.c.strike.Total(), h.c.power, phys, mobs,
+              debris);
+  const Mob* attacker = mobs.ResolveCombatant(h.c.attacker);
+  MobSystem::CoatContact coat;
+  coat.haft = h.c.Has(MeleeHitCore::kHaft);
+  coat.edgeU = h.c.edgeU;
+  coat.radius = h.c.radius;
+  coat.power = h.c.power;
+  coat.unarmed = es.selfMounted;
+  ResolveLooseBlow(hb, parts, h.c.strike, h.c.power,
+                   h.c.Has(MeleeHitCore::kFirstContact),
+                   h.c.Has(MeleeHitCore::kBiteAllowed),
+                   attacker != nullptr ? attacker->Id() : 0ull, coat,
+                   P(h.c.clothAt), debris, mobs, world, spawns, nullptr);
+  return RemoteHitOutcome::Applied;
+}
+
 RemoteHitOutcome ApplyOneRemoteHit(const MeleeHit& h, Physics& phys,
                                    MobSystem& mobs, DebrisSystem& debris,
                                    World& world,
                                    std::vector<ParticleSpawn>& spawns) {
+  if (h.c.target.kind == CombatantRef::kBody)
+    return ApplyRemoteLooseHit(h, phys, mobs, debris, world, spawns);
   Mob* t = mobs.ResolveCombatant(h.c.target);
   if (t == nullptr) return RemoteHitOutcome::Gone;
   // NOT MINE (rule 3): the creature changed hands between the blow and its

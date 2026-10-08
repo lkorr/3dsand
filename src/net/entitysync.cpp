@@ -35,6 +35,7 @@ void EntityBatch::Clear() {
   itemTakes.clear();
   itemGrants.clear();
   meleeHits.clear();
+  playerBodies.clear();
   tick = 0;
   playerId = 0;
 }
@@ -75,6 +76,9 @@ void EntityBatch::Encode(std::vector<uint8_t>& out) const {
 
   w.U32((uint32_t)meleeHits.size());
   for (const MeleeHit& r : meleeHits) EncodeMeleeHit(w, r);
+
+  w.U32((uint32_t)playerBodies.size());
+  for (const PlayerBody& r : playerBodies) ::net::Encode(w, r);
 }
 
 namespace {
@@ -120,6 +124,7 @@ bool EntityBatch::Decode(const uint8_t* p, size_t n) {
     return DecodeMeleeHit(rr, rec);
   };
   if (!ReadVec(r, meleeHits, hitRec)) return false;
+  if (!ReadVec(r, playerBodies, mobRec)) return false;
   return r.ok;
 }
 
@@ -152,6 +157,10 @@ void EntitySync::Connect(uint32_t me, uint32_t peer) {
   pendingBodyHandoffs_.clear();
   inbox_.clear();
   localGrants_.clear();
+  gearKeySent_ = 0;
+  gearLabelSent_ = 0;
+  gearEverSent_ = false;
+  havePeerBody_ = false;
   peerCount_ = 0;
 }
 
@@ -415,6 +424,48 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
       out.meleeHits.push_back(std::move(h));
       c_.meleeOut++;
     }
+  }
+
+  // ---- MY PLAYER'S BODY (net::PlayerBody) --------------------------------
+  //
+  // Every tick while it stands: the peer draws its ghost of me from this.
+  // Interest-independent for the same reason a PlayerState is -- the peer
+  // always has my player. The gear rides when it changed (a key over the
+  // rig-slot gear list, MobSystem::RedressFromWire's comparison) or on the
+  // keyframe.
+  if (const Mob* av = mobs.Avatar();
+      av != nullptr && !av->IsGhost() && av->Def() != nullptr &&
+      av->LimbBodyCount() > 0) {
+    PlayerBody pb;
+    pb.playerId = me_;
+    std::vector<WireGear> gear;
+    av->CaptureGear(gear);
+    uint64_t key = 1469598103934665603ull;
+    auto mix = [&key](uint64_t v) {
+      for (int b = 0; b < 8; b++) {
+        key ^= (v >> (b * 8)) & 0xFFu;
+        key *= 1099511628211ull;
+      }
+    };
+    mix(gear.size());
+    for (const WireGear& g : gear) {
+      for (char ch : g.name) mix((uint8_t)ch);
+      mix((uint64_t)(int64_t)g.equipSlot);
+      mix(g.held);
+      mix(g.dye);
+    }
+    if (!gearEverSent_ || key != gearKeySent_ ||
+        label - gearLabelSent_ >= kPlayerGearKeyframeTicks) {
+      pb.hasGear = 1;
+      pb.gear = std::move(gear);
+      gearKeySent_ = key;
+      gearLabelSent_ = label;
+      gearEverSent_ = true;
+      c_.gearOut++;
+    }
+    MobSystem::BuildPoseOf(*av, label, pb.pose);
+    out.playerBodies.push_back(std::move(pb));
+    c_.bodiesOut++;
   }
 
   // ---- interest, which needs to know where the peer is -------------------
@@ -727,6 +778,21 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
       c_.meleeIn++;
     }
 
+    // ---- the peer's player's body: kept for the caller -----------------
+    // The newest pose wins; a gear list is kept until taken even when a
+    // later body without one replaces the pose.
+    for (PlayerBody& pb : b.playerBodies) {
+      if (pb.playerId == me_) continue;
+      c_.bodiesIn++;
+      if (havePeerBody_ && pb.pose.tick < peerBody_.pose.tick) continue;
+      if (havePeerBody_ && !pb.hasGear && peerBody_.hasGear) {
+        pb.hasGear = 1;
+        pb.gear = std::move(peerBody_.gear);
+      }
+      peerBody_ = std::move(pb);
+      havePeerBody_ = true;
+    }
+
     it = inbox_.erase(it);
   }
 
@@ -760,6 +826,14 @@ void EntitySync::ExpireGhosts(uint32_t tick, MobSystem& mobs,
     }
     it = ghostBodySeen_.erase(it);
   }
+}
+
+bool EntitySync::TakePeerBody(PlayerBody& out) {
+  if (!havePeerBody_) return false;
+  out = std::move(peerBody_);
+  peerBody_ = PlayerBody{};
+  havePeerBody_ = false;
+  return true;
 }
 
 bool EntitySync::PopLocalGrant(ItemGrant& out) {

@@ -68,6 +68,23 @@ void Encode(ByteWriter& w, const MobAnnounce& a) {
   WriteGear(w, a.gear);
 }
 
+void Encode(ByteWriter& w, const PlayerBody& b) {
+  w.U32(kMobSyncVersion);
+  w.U32(b.playerId);
+  w.U32(b.hasGear);
+  if (b.hasGear) WriteGear(w, b.gear);
+  Encode(w, b.pose);
+}
+
+bool Decode(ByteReader& r, PlayerBody& b) {
+  if (!ReadVersion(r)) return false;
+  r.U32(b.playerId);
+  r.U32(b.hasGear);
+  b.gear.clear();
+  if (b.hasGear && !ReadGear(r, b.gear)) return false;
+  return Decode(r, b.pose) && r.ok;
+}
+
 bool Decode(ByteReader& r, MobAnnounce& a) {
   if (!ReadVersion(r)) return false;
   r.Pod(a.id);

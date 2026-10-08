@@ -636,6 +636,9 @@ const char* const kOrder[] = {
     // Melee across the wire: net-corpse's two machines and exit contract
     // (mobs, debris, id counter reset; machine B destroyed before return).
     "net-melee",
+    // net-player-corpse's two machines and exit contract (avatars, mobs,
+    // debris, id counter reset; machine B and its avatar destroyed).
+    "net-player-melee",
     // The same exit contract as `net-corpse` (mobs, debris and id counter
     // reset) plus: the ghost avatar list and BOTH ownership closures it
     // installs through ScanHandoffs are cleared before it returns.

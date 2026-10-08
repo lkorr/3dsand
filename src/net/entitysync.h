@@ -76,7 +76,14 @@ namespace net {
 //   3 (2026-10-08, game/meleehit.h): `meleeHits` last -- blows struck on
 //     bodies the receiver owns. Not applied in ApplyForTick: they are handed
 //     to MobSystem and applied inside the tick (ApplyRemoteMeleeHits).
-inline constexpr uint32_t kEntityBatchVersion = 3;
+//   4 (2026-10-08): `playerBodies` after them -- the sender's own player's
+//     pose and gear (net::PlayerBody), for its ghost avatar here.
+inline constexpr uint32_t kEntityBatchVersion = 4;
+
+// How often the sender's player gear rides its PlayerBody when it has not
+// changed: the keyframe that dresses a ghost avatar the receiver rebuilt (a
+// respawn, a reconnect) without a change to send. 1 s.
+inline constexpr uint32_t kPlayerGearKeyframeTicks = 30;
 
 // ---- THE DEAD ON THE WIRE (PLAN_corpse_is_a_mob.md P2c) --------------------
 //
@@ -162,12 +169,16 @@ struct EntityBatch {
   // passing on (a creature that changed hands; game/meleehit.h rule 3).
   std::vector<MeleeHit> meleeHits;
 
+  // The sender's own player's body (at most one entry: one player per
+  // machine in M9).
+  std::vector<PlayerBody> playerBodies;
+
   bool Empty() const {
     return mobHandoffs.empty() && mobAnnounces.empty() &&
            mobStates.empty() && mobPoses.empty() &&
            mobGones.empty() && bodyHandoffs.empty() && bodyAnnounces.empty() &&
            bodyPoses.empty() && bodyGones.empty() && itemTakes.empty() &&
-           itemGrants.empty() && meleeHits.empty();
+           itemGrants.empty() && meleeHits.empty() && playerBodies.empty();
   }
   void Clear();
   size_t RecordCount() const {
@@ -175,7 +186,7 @@ struct EntityBatch {
            mobPoses.size() +
            mobGones.size() + bodyHandoffs.size() + bodyAnnounces.size() +
            bodyPoses.size() + bodyGones.size() + itemTakes.size() +
-           itemGrants.size() + meleeHits.size();
+           itemGrants.size() + meleeHits.size() + playerBodies.size();
   }
 
   void Encode(std::vector<uint8_t>& out) const;
@@ -266,6 +277,14 @@ class EntitySync {
   // Rule 3's backstop; run once per tick after ApplyForTick.
   void ExpireGhosts(uint32_t tick, MobSystem& mobs, DebrisSystem& debris);
 
+  // ---- the peer's player's body (net::PlayerBody) --------------------------
+  //
+  // ApplyForTick keeps the newest one that arrived (by pose tick, and the
+  // newest gear it carried); main.cpp hands it to the RemotePlayer it belongs
+  // to, which dresses and poses the ghost avatar inside the tick
+  // (RemotePlayersPreTick). Taking it clears it.
+  bool TakePeerBody(PlayerBody& out);
+
   // ---- item grants addressed to ME ----------------------------------------
   //
   // `DebrisSystem::PopItemGrant` yields BOTH the replies a peer sent me and
@@ -280,6 +299,8 @@ class EntitySync {
     uint64_t announcesIn = 0, posesIn = 0, handoffsIn = 0, gonesIn = 0;
     uint64_t takesOut = 0, takesIn = 0, grantsOut = 0, grantsIn = 0;
     uint64_t meleeOut = 0, meleeIn = 0;   // game/meleehit.h records
+    uint64_t bodiesOut = 0, bodiesIn = 0; // PlayerBody records
+    uint64_t gearOut = 0;                 // ...of which carried the gear
     uint64_t batchesOut = 0, batchesIn = 0, bytesOut = 0;
     uint64_t applyMisses = 0;   // poses for an id we do not hold
     // ...and the two refusals that are NOT defects, split out of it by
@@ -344,6 +365,14 @@ class EntitySync {
 
   // Grants addressed to me, waiting for the caller's bag.
   std::deque<ItemGrant> localGrants_;
+
+  // My player's gear as last sent (key + label), and the peer's body waiting
+  // for the caller.
+  uint64_t gearKeySent_ = 0;
+  uint32_t gearLabelSent_ = 0;
+  bool gearEverSent_ = false;
+  PlayerBody peerBody_;
+  bool havePeerBody_ = false;
 
   Counters c_{};
 };

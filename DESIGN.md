@@ -23787,8 +23787,8 @@ PARRY: a parry is blade geometry (`FindParry`), the attacker has both blades
 (`MobPose::kBladeLive` says a ghost's is cutting or held in guard), so the
 stroke is arrested on the tick it meets the guard and the parry's
 consequences (the weapon's wear, the flinch, the guard beaten open) go to the
-owner as a `Parry` record. A peer PLAYER's ghost holds no weapon yet, so it
-cannot parry across the wire. (3) A HANDOFF IN FLIGHT IS ROUTED: the record is
+owner as a `Parry` record. A peer PLAYER parries the same way: its ghost
+avatar is dressed and posed by its owner (below). (3) A HANDOFF IN FLIGHT IS ROUTED: the record is
 applied by whoever owns the target when it arrives; a machine that has just
 given the creature away sends it on (`kMaxMeleeHops`), and the new owner holds
 it while the handoff record that would overlay its state is still on the wire
@@ -23796,13 +23796,33 @@ it while the handoff record that would overlay its state is still on the wire
 carved by the same blow as PRESENTATION -- gore to a discarded sink, and a
 ghost can no longer sever (`Mob::Sever`), die or spawn a carve fragment here;
 a limb comes off a ghost only when its owner says so (`MobSystem::ApplyPose`
-drops a base limb the owner's pose stopped listing; `PlayerState::severed`
-for a peer player), which also ends a pre-existing duplicate (a ghost severed
+drops a base limb the owner's pose stopped listing, `Mob::PlaceFromOwnerPose`
+for a peer player's ghost), which also ends a pre-existing duplicate (a ghost severed
 by a local blow or blast used to adopt its own copy of the arm beside the
 owner's). Applied on the owner once per tick at a fixed phase
 (`ApplyRemoteMeleeHits`, after phase J), its gore into that tick's batch; the
-defender hears it (a `StrikeEvent` pushed there). Loose matter is not routed:
-a blow on a peer's debris body is still carved locally only.
+defender hears it (a `StrikeEvent` pushed there). LOOSE MATTER is routed the
+same way (`MeleeHitKind::Loose`, the body's global id, its body frame; the
+owner runs the shared `ResolveLooseBlow`), and the attacker's carve of the
+ghost body is presentation: a piece that parts from a ghost is released, not
+adopted (`DebrisSystem::KeepFragments`) -- the owner's pieces arrive as its
+ghost bodies.
+
+**A peer player's body is posed and dressed by its owner (2026-10-08,
+`net::PlayerBody`, gate `net-player-melee`).** The ghost avatar used to be
+animated locally from `PlayerState`: right walk, wrong body -- empty-handed
+whatever the player held, its arm never in the swing being made, so a peer's
+sword could not be seen or parried and a blow aimed at the arm the peer had
+raised met one the ghost held at its side. The owner now streams its avatar as
+it streams a creature: the per-limb `MobPose` every tick (held and worn slots,
+`kBladeLive`) and its gear in rig-slot order when it changes and on a 1 s
+keyframe (entity batch v4). The ghost is re-dressed from the gear
+(`MobSystem::RedressFromWire`, shared with a corpse's `MobState`) so its slots
+are numbered as the owner's, and after its local animation -- kept as the
+fallback while no pose is fresher than `RemotePlayer::kBodyFreshTicks` -- every
+limb is placed from the stream (`Mob::PlaceFromOwnerPose`), a limb the owner
+lost dropped. `PlayerState` v4 drops the v3 `severed` mask this made
+redundant.
 
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×

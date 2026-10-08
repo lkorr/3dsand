@@ -1273,8 +1273,8 @@ taken against the questions below:
    both blades once `MobPose` carries `kBladeLive`, so the stroke is arrested
    on the tick it meets the guard. Judging it on the defender would let the
    sword pass through the guard on screen and be stopped a round trip later.
-   The parry's consequences travel as a `Parry` record. Gap: a peer PLAYER's
-   ghost has no weapon on it yet, so a player cannot parry across the wire.
+   The parry's consequences travel as a `Parry` record. A peer PLAYER
+   parries too: its ghost is dressed and posed by its owner (`PlayerBody`).
 3. **A handoff in flight: routed, and it waits for the record.** Ownership is
    derived, so "re-forward or drop" collapses: a record is applied by whoever
    owns the target when it arrives; a machine that has just given it away
@@ -1287,9 +1287,14 @@ taken against the questions below:
    have no state stream, so the attacker would never see them. Structure comes
    from the owner: a base limb the owner's `MobPose` stops listing is dropped
    from the ghost (no adoption; the owner's severed piece arrives as its ghost
-   body), and `PlayerState::severed` (v3) does the same for a peer player.
+   body), and a peer player's ghost avatar does the same from its owner's
+   `PlayerBody` pose stream.
 
-Not covered: a blow on a peer's LOOSE body (debris) is still carved locally
+**Follow-ups closed the same day** (gate `net-player-melee`): a peer
+player's ghost avatar is dressed from its owner's gear and posed limb for limb
+from its owner's stream (`net::PlayerBody`, entity batch v4), so its sword is
+seen, parries and is parried; and a blow on a peer's LOOSE body is a `Loose`
+record applied by the body's owner, the attacker's ghost carve presentation
 only. The original write-up follows.
 
 ### The question as it was posed (2026-10-07)

@@ -2202,20 +2202,28 @@ class Mob {
   bool AwaitingHandoff() const;
   // A ghost's owner says its blade is live (MobPose::kBladeLive).
   bool GhostBladeLive() const { return ghostBladeLive_; }
+  // ---- POSED BY ITS OWNER (2026-10-08) --------------------------------------
+  // Latch `p` and place every limb where the owner had it (TickGhost), after
+  // dropping any base limb the owner no longer has (DropLimbsOwnerLacks).
+  // For a body somebody else drives that is NOT in mobs_ -- a peer player's
+  // ghost avatar, posed from net::PlayerBody after its local animation ran.
+  // No-op on a body this machine owns.
+  void PlaceFromOwnerPose(const ::net::MobPose& p, float dt);
+  // The pose stream lists every limb with a body; a BASE limb this ghost
+  // still has that `p` leaves out is one its owner lost. Off without gore or
+  // adoption (DropLimbForOwner).
+  void DropLimbsOwnerLacks(const ::net::MobPose& p);
 
   // ---- A GHOST'S STRUCTURE IS ITS OWNER'S (2026-10-08) ---------------------
   //
   // A blow landed here on a ghost carves it as presentation (game/meleehit.h
   // rule 4) and changes nothing else: Sever, Die and the carve's fragment
   // bodies all refuse a ghost. A limb comes off a ghost only when its OWNER
-  // says so -- the pose stream stops listing it (MobSystem::ApplyPose), or a
-  // peer player's PlayerState names it severed -- and it comes off through
+  // says so -- the pose stream stops listing it (MobSystem::ApplyPose, and
+  // PlaceFromOwnerPose for a peer player's ghost avatar) -- and it comes off through
   // here: no gore, no adoption (the owner's severed limb arrives as the
   // owner's ghost body). No-op on a creature this machine owns.
   void DropLimbForOwner(int limbIndex);
-  // Base limbs (bit i = rig slot i, i < 32 and < AppendedBase) that have no
-  // body: what the owner of a PLAYER's body reports in PlayerState.
-  uint32_t SeveredBaseMask() const;
   // The rig slot named `name` (SlotName's inverse), or -1.
   int SlotIndexNamed(const std::string& name) const;
 
@@ -7020,6 +7028,11 @@ class MobSystem {
   // `tick` is stamped on the record so the receiver can drop an out-of-order
   // pose rather than rewinding a creature.
   bool BuildPose(uint64_t mobId, uint32_t tick, ::net::MobPose& out) const;
+  // The same record for ANY creature this machine holds -- the player's own
+  // avatar, which is not in mobs_, included. What the owner of a player's
+  // body streams so the peer's ghost of it is posed limb for limb
+  // (net::PlayerBody, game/remoteplayer.h).
+  static void BuildPoseOf(const Mob& m, uint32_t tick, ::net::MobPose& out);
   // Latches the pose on the ghost; it is applied in PreTick (TickGhost), not
   // here, so a packet that arrives mid-frame cannot move a body between the
   // physics step and the draw. Returns false for an unknown id, a pose OLDER
@@ -7088,6 +7101,14 @@ class MobSystem {
   // appends the same slots in the same places on both machines, and two
   // copies of that replay would be two chances to get the order wrong.
   void ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear);
+  // ...AND RE-DRESS ONE ALREADY STANDING, when what it wears differs from
+  // `gear`: strip it bare and ApplyWireGear in rig-slot order, so its
+  // appended slots are numbered the way the owner's are and the owner's pose
+  // stream lands on the right ones. What MobState does to a corpse ghost and
+  // what a peer player's gear record does to its ghost avatar. Returns
+  // whether anything changed. May re-enter this system (a dress can): a
+  // caller holding a pointer into mobs_ re-finds it.
+  bool RedressFromWire(Mob& m, const std::vector<::net::WireGear>& gear);
 
   // ---- sever events -------------------------------------------------------
   // One entry per limb that came off, reported rather than voiced here: this
