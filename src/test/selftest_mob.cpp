@@ -15116,6 +15116,7 @@ Status GateNetPlayerMelee(Ctx& c, std::string& detail) {
   // where B's does -- and away from where it rested before the cast.
   bool okE = false;
   double eToOwner = -1.0, eMoved = -1.0;
+  uint32_t eLightOwner = 0, eLightGhost = 0, eLightGhostAfter = 1;
   {
     GlyphLibrary glib;
     std::string gerr;
@@ -15137,8 +15138,15 @@ Status GateNetPlayerMelee(Ctx& c, std::string& detail) {
     bool clip = false;
     BeginCastGesture(run, arm, g, HandIndex(Hand::Left));
     const Vec3 aim = QuatRotate(QuatAxisAngle({0, 1, 0}, avB.Heading()), Vec3{0, 0, 1});
+    // THE LIGHT IN THE FIST, as B's session sets it for a spell in hand
+    // (session.cpp PoseSpellReady -> Mob::SetSpellLight, CastLightColor).
+    SpellStack fb;
+    for (const char* wd : {"fire", "bolt"})
+      if (glib.Find(wd) >= 0) fb.spoken.push_back(glib.Find(wd));
+    eLightOwner = CastLightColor(glib, c.mats, CompileSpell(glib, fb));
     for (int i = 0; gs != nullptr && i < gs->endTicks + 6; i++) {
       SpellReadyClip(avB, Hand::Left, true, clip);
+      avB.SetSpellLight(Hand::Left, eLightOwner);
       WeaponPose wp;
       if (CastArmPose(avB, arm, run, glib.gestures, aim, wp)) avB.SetWeaponPose(wp);
       if (run.ticks < gs->endTicks) AdvanceCastGesture(run, *gs, false);
@@ -15150,21 +15158,28 @@ Status GateNetPlayerMelee(Ctx& c, std::string& detail) {
       eToOwner = (ga - gb).len();
       eMoved = (ga - rest).len();
     }
+    eLightGhost = ghost.SpellLight(Hand::Left);
     const double movedMin = BaselineNumber("netPlayerMeleeCastMovedVox", 1.0);
-    okE = gs != nullptr && eToOwner >= 0.0 && eToOwner <= ownerTol && eMoved >= movedMin;
     DropCastArm(avB, arm);
     SpellReadyClip(avB, Hand::Left, false, clip);
+    // ...and it goes out on the ghost when the owner lets the spell go.
+    avB.SetSpellLight(Hand::Left, 0);
+    for (int i = 0; i < 3; i++) step();
+    eLightGhostAfter = ghost.SpellLight(Hand::Left);
+    okE = gs != nullptr && eToOwner >= 0.0 && eToOwner <= ownerTol && eMoved >= movedMin &&
+          eLightOwner != 0 && eLightGhost == eLightOwner && eLightGhostAfter == 0;
   }
 
   const bool ok = okA && okB && okC && okD && okE;
   detail = Format(
-      "E cast gesture on the ghost=%d (left hand %.3f vox from B's, moved %.2f from rest) | "
+      "E cast gesture on the ghost=%d (left hand %.3f vox from B's, moved %.2f from rest; "
+      "fist light owner %08x ghost %08x, after let-go %08x) | "
       "A dressed+posed=%d (slot A %d / B %d same %d, %d limbs placed, err %.4f "
       "(tol %.2f), sword %.3f vox from B's (tol %.1f)) | B player parry=%d "
       "(blade live %d, arrested on A %d, parries on B %llu, sword hp %.1f->%.1f, "
       "B skin %lld->%lld) | C blow on a player=%d (B skin -%lld, applied %llu) | "
       "D loose=%d (A ghost -%lld, A gore %zu, A owned bodies %u->%u, B body -%lld; %s)",
-      okE ? 1 : 0, eToOwner, eMoved,
+      okE ? 1 : 0, eToOwner, eMoved, eLightOwner, eLightGhost, eLightGhostAfter,
       okA ? 1 : 0, heldA, heldB, sameSlot ? 1 : 0, placed, placeErr, placeTol,
       swordToOwner, ownerTol, okB ? 1 : 0, live ? 1 : 0, arrested ? 1 : 0,
       (unsigned long long)parries, itemHp0, itemHp1, (long long)fleshB0,

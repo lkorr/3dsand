@@ -15753,13 +15753,7 @@ int main(int argc, char** argv) {
       // key on what the key says and the glyph epoch.
       {
         auto spellColor = [&](const CastList& l) -> uint32_t {
-          if (l.casts.empty()) return 0;
-          const SpellCast& c = l.casts[0];
-          const uint32_t tint = CastTintMaterial(c);
-          const uint32_t base = tint != 0 && tint < mats.size()
-                                    ? mats[tint].gpu.color0
-                                    : glyphs.Delivery(c.delivery.glyph).look.color;
-          return 0xFF000000u | (base & 0x00FFFFFFu);
+          return CastLightColor(glyphs, mats, l);
         };
         auto glyphType = [&](const std::vector<int>& spoken) {
           const GlyphDef* g = spoken.size() == 1 ? glyphs.At(spoken[0]) : nullptr;
@@ -18509,12 +18503,13 @@ int main(int argc, char** argv) {
           push(at + Vec3{0.15f * std::sin(tNow * 7.0f + phase), 0.3f + rise * 1.1f, 0.0f},
                0.12f * (1.0f - rise), scaleColor(col, 0.9f), 1.4f * (1.0f - rise));
         }
-        // ...AND A CREATURE'S (demon_cast.h MobHandCast): the same light in
-        // the fist that holds a spell, for as long as the spell is in it.
+        // ...AND EVERY OTHER BODY'S (Mob::SpellLight): a creature mid-cast,
+        // a peer with a spell in hand, a peer's creature -- the owner sets it
+        // and the pose stream carries it, so every machine draws the same.
         {
-          std::vector<MobHandLight> lights;
-          MobCastAppendHandLights(tickCtx, lights);
-          for (const MobHandLight& l : lights) {
+          std::vector<SpellHandLight> lights;
+          AppendSpellHandLights(mobs, phys, avatar.Spawned() ? avatar.Id() : 0, lights);
+          for (const SpellHandLight& l : lights) {
             const float phase = (float)(l.mobId % 7u) * 0.9f;
             const float breathe = 1.0f + 0.15f * std::sin(tNow * 4.0f + phase);
             if (!push(l.at, 0.32f * breathe, l.color, 1.6f)) break;

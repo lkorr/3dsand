@@ -278,14 +278,9 @@ MobCastOutcome MobCastBegin(TickAuthorityCtx& w, std::span<SessionTick> players,
                             const std::string& spell, OpBatch& out);
 // The cast in a creature's hand, or null (the gates and the renderer read it).
 const MobHandCast* MobHandCastOf(const TickAuthorityCtx& w, uint64_t mobId);
-// Every creature hand holding a spell: where (the hand part's body) and the
-// light's colour, for main.cpp's sprite pass (the player's fist light rule).
-struct MobHandLight {
-  Vec3 at{};
-  uint32_t color = 0;
-  uint64_t mobId = 0;
-};
-void MobCastAppendHandLights(const TickAuthorityCtx& w, std::vector<MobHandLight>& out);
+// (The light in a casting creature's fist is Mob::SpellLight, set by
+// MobCastTick while the spell is in the hand; game/spellhand.h
+// AppendSpellHandLights draws it, on this machine and on a peer's.)
 
 // D6 (game/demon_malice.h): the kit entry of that name (the kit is read on
 // first use), or null.

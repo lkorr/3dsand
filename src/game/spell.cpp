@@ -1183,6 +1183,16 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   return true;
 }
 
+uint32_t CastLightColor(const GlyphLibrary& lib, const std::vector<MaterialDef>& mats,
+                        const CastList& list) {
+  if (list.casts.empty()) return 0;
+  const SpellCast& c = list.casts[0];
+  const uint32_t tint = CastTintMaterial(c);
+  const uint32_t base = tint != 0 && tint < mats.size() ? mats[tint].gpu.color0
+                                                        : lib.Delivery(c.delivery.glyph).look.color;
+  return 0xFF000000u | (base & 0x00FFFFFFu);
+}
+
 int CastGesture(const GlyphLibrary& lib, const CastList& list) {
   if (list.casts.empty()) return -1;
   // Rule 2: a delivery word BOXES what was said before it, and the box rides

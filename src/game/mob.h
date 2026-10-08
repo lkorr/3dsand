@@ -3337,6 +3337,14 @@ class Mob {
   bool CastBusy() const { return castBusy_; }
   void SetCastArm(const CastArm& a) { castArm_ = a; }
   const CastArm& GetCastArm() const { return castArm_; }
+  // THE LIGHT IN THE FIST: the colour (0xAABBGGRR) of the spell this hand
+  // holds, 0 = none. Set by whoever OWNS the body -- the player's session for
+  // a spell in hand, MobCastTick for a creature's cast -- streamed on its pose
+  // (net::MobPose::spellLight) and latched on a ghost from it, so main.cpp's
+  // sprite pass draws every creature's from this one field on every machine.
+  // Presentation only: not hashed, not saved.
+  void SetSpellLight(Hand h, uint32_t color) { spellLight_[HandIndex(h)] = color; }
+  uint32_t SpellLight(Hand h) const { return spellLight_[HandIndex(h)]; }
   // WHICH WAY THIS BODY FACES. The same `AxisAngle({0,1,0}, heading) * +Z` the
   // walk step and the limb submit use -- one convention, one formula, so a
   // caller cannot drift from the direction the mob actually translates along.
@@ -5549,6 +5557,7 @@ class Mob {
   };
   HeldHand held_[kHands];
   bool castBusy_ = false;   // SetCastBusy
+  uint32_t spellLight_[kHands] = {0, 0};   // SetSpellLight
   CastArm castArm_;         // SetCastArm
   // Which hand the stroke driver serves (SetStrikeHand / ArmForStyle).
   Hand strikeHand_ = Hand::Right;

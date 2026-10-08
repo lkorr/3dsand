@@ -52,6 +52,7 @@
 #include "game/mob.h"
 #include "game/session.h"
 #include "game/spell.h"
+#include "net/mobsync.h"
 #include "sim/weather.h"
 #include "sim/worldgen_run.h"
 #include "test/selftest.h"
@@ -796,6 +797,9 @@ Status GateNpcHandCast(Ctx& c, std::string& detail) {
     bool busyThroughout = true, armed = false, busyAfter = true;
     bool rightKept = true;       // the right hand's sword never left
     bool leftEmptyDuring = false, sheathedDuring = false;
+    // The light in the fist (Mob::SpellLight): lit while the spell is in it,
+    // carried through a MobPose encode/decode intact, out after.
+    uint32_t light = 0, lightWire = 0, lightAfter = 1;
     std::string leftAfter, sheathAfter;
     uint32_t stows = 0, draws = 0;
   };
@@ -822,7 +826,8 @@ Status GateNpcHandCast(Ctx& c, std::string& detail) {
     const MobHandCast* hc = MobHandCastOf(rig.Authority(), id);
     if (hc) r.hand = hc->hand;
     const size_t ev0 = rig.Authority().mobCast ? rig.Authority().mobCast->events.size() : 0;
-    Vec3 handStart{}, handLo{1e9f, 1e9f, 1e9f}, handHi{-1e9f, -1e9f, -1e9f};
+    Vec3 handStart{};
+    uint32_t lightWire = 0;
     bool haveStart = false;
     const int total = expectAfter + 60;
     for (int i = 1; i <= total; i++) {
@@ -836,6 +841,18 @@ Status GateNpcHandCast(Ctx& c, std::string& detail) {
         if (!m->CastBusy()) r.busyThroughout = false;
         const Hand h = HandAt(hc->hand);
         if (m->ClipWeight(m->HandClip("spell_ready", h)) > 0.05f) r.armed = true;
+        if (hc->phase == MobHandCast::Phase::Gesture && r.light == 0) {
+          r.light = m->SpellLight(h);
+          ::net::MobPose pose;
+          if (c.mobs.BuildPose(id, rig.tick, pose)) {
+            std::vector<uint8_t> bytes;
+            ByteWriter bw{bytes};
+            ::net::Encode(bw, pose);
+            ::net::MobPose back;
+            ByteReader br{bytes.data(), bytes.size()};
+            if (::net::Decode(br, back)) lightWire = back.spellLight[hc->hand];
+          }
+        }
         if (hc->hand == 1 && m->HeldItem(Hand::Left).empty()) r.leftEmptyDuring = true;
         if (m->GetKit().equip.slots[(int)EquipSlotId::Sheath].name == "sword")
           r.sheathedDuring = true;
@@ -864,7 +881,9 @@ Status GateNpcHandCast(Ctx& c, std::string& detail) {
     }
     Mob* m = c.mobs.FindMobById(id);
     hc = MobHandCastOf(rig.Authority(), id);
+    r.lightWire = lightWire;
     if (m) {
+      r.lightAfter = m->SpellLight(Hand::Left) | m->SpellLight(Hand::Right);
       r.busyAfter = m->CastBusy();
       r.leftAfter = m->HeldItem(Hand::Left);
       r.sheathAfter = m->GetKit().equip.slots[(int)EquipSlotId::Sheath].name;
@@ -913,6 +932,10 @@ Status GateNpcHandCast(Ctx& c, std::string& detail) {
         Format("B: the sword is drawn back into the left hand after (draws %u, left '%s', "
                "sheath '%s', right kept %d)",
                rb.draws, rb.leftAfter.c_str(), rb.sheathAfter.c_str(), rb.rightKept));
+  check(ra.light != 0 && ra.lightWire == ra.light && ra.lightAfter == 0,
+        Format("A: the fist is lit while the spell is in it (%08x), the pose carries it "
+               "(%08x), dark after (%08x)",
+               ra.light, ra.lightWire, ra.lightAfter));
   // C
   check(ra.ikMiss <= ikTol && rb.ikMiss <= ikTol,
         Format("C: the arm reaches the gesture's hand at the release (miss %.2f / %.2f, max %.1f)",

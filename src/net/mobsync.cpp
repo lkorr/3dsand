@@ -101,6 +101,8 @@ void Encode(ByteWriter& w, const MobPose& p) {
   w.F32(p.heading);
   w.U32(p.alive);
   w.U32(p.flags);
+  w.U32(p.spellLight[0]);
+  w.U32(p.spellLight[1]);
   // The one record on the hot path — one per owned mob per tick — so the limb
   // array travels as a single POD run rather than field by field.
   w.PodVec(p.limbs);
@@ -114,6 +116,8 @@ bool Decode(ByteReader& r, MobPose& p) {
   r.F32(p.heading);
   r.U32(p.alive);
   r.U32(p.flags);
+  r.U32(p.spellLight[0]);
+  r.U32(p.spellLight[1]);
   r.PodVec(p.limbs);
   return r.ok;
 }

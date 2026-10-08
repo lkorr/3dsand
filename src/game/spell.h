@@ -549,6 +549,12 @@ struct CastList;
 // the library's default; -1 when there are no gestures at all (the cast then
 // leaves on the press).
 int CastGesture(const GlyphLibrary& lib, const CastList& list);
+// THE COLOUR OF A SPELL IN THE HAND (and of its flight): the first clause's
+// carried matter's colour, else its delivery's `look.color`; opaque
+// 0xAABBGGRR, 0 for an empty list. One rule for the HUD's hand slot, the
+// light in every fist (Mob::SpellLight) and the wire.
+uint32_t CastLightColor(const GlyphLibrary& lib, const std::vector<MaterialDef>& mats,
+                        const CastList& list);
 
 // Loads assets/spells/glyphs.json and resolves every material NAME against the
 // compiled material list. Returns false with `errors` filled on bad input —

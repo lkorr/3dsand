@@ -26141,8 +26141,7 @@ with no gesture, casts from the chest on the spot as before; `MobCastServe`
 stays that synchronous path for scripted casts. The cast in a hand is not
 saved (no caster is); a blade a save caught in the sheath is drawn back by
 `DrawSheathed` (once a second, AI creatures with a free working hand). The
-fist holds the spell's light (`MobCastAppendHandLights`, main.cpp's sprite
-pass, the player's colour rule). Content: the `battlemage` profile (a
+fist holds the spell's light (`Mob::SpellLight`, below). Content: the `battlemage` profile (a
 swordsman with firebolt / gust at 12..44 voxels). Gate `npc-hand-cast`.
 
 **ON A PEER.** Nothing about a cast is on the wire, and nothing needs to be:
@@ -26150,8 +26149,18 @@ a player's body and every creature's are placed on the other machine from
 the owner's streamed limb transforms (`MobPose`), so the armed hand and the
 gesture arrive as the arm itself. `net-player-melee` pass E holds that for a
 player (the ghost's casting hand within `ownerTol` of the owner's, and moved
-from rest). NOT on a peer yet: the light in the fist (it is drawn from the
-local caster state).
+from rest). The one thing about a cast that is NOT a limb -- the light in the
+fist -- rides the same record: `Mob::SpellLight` (per hand, the spell's
+colour by `CastLightColor`, 0 = none) is set by whoever owns the body (the
+player's `PoseSpellReady` for a spell in hand, `MobCastTick` while a
+creature's spell is in its fist), sent as `net::MobPose::spellLight`
+(`kMobSyncVersion` 5) and latched on a ghost from its owner's pose (dark
+again when a peer player's stream goes stale). main.cpp draws every body's
+lit fist from that one field (`AppendSpellHandLights`), the local player's
+own excepted (its richer light with the press flare stays the HUD's). Gates:
+`net-player-melee` E (the ghost's fist lit with the owner's colour, dark
+after the let-go), `npc-hand-cast` (lit in the gesture, intact through a
+MobPose encode/decode, dark after).
 
 **THE CONSUMER (`MobCastTick`, TickAuthority right after phase H's
 `mobs.PreTick`).** Each casting creature gets its OWN `SpellSystem` and

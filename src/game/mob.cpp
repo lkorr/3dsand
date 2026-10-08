@@ -29270,6 +29270,8 @@ void Mob::PlaceFromOwnerPose(const ::net::MobPose& p, float dt) {
   ghostPose_ = p;
   haveGhostPose_ = true;
   ghostBladeLive_ = (p.flags & ::net::MobPose::kBladeLive) != 0;
+  spellLight_[0] = p.spellLight[0];
+  spellLight_[1] = p.spellLight[1];
   DropLimbsOwnerLacks(p);
   TickGhost(dt);
 }
@@ -29480,6 +29482,11 @@ void MobSystem::BuildPoseOf(const Mob& mob, uint32_t tick,
       (m->swinging_ || (!m->PlayerControlled() &&
                         m->stroke_.phase == NpcStroke::Phase::Guard)))
     out.flags |= ::net::MobPose::kBladeLive;
+  // The light in each fist (Mob::SpellLight): what the arm's pose cannot say.
+  if (m->alive_) {
+    out.spellLight[0] = m->spellLight_[0];
+    out.spellLight[1] = m->spellLight_[1];
+  }
   // ONLY LIMBS WITH A BODY. A severed limb is DebrisSystem's by now and a
   // worn shell is derived from its host on the far side (DriveWornShells), so
   // neither belongs in the stream — which is also most of why the per-tick
@@ -29522,6 +29529,8 @@ bool MobSystem::ApplyPose(const ::net::MobPose& p) {
   m->ghostPose_ = p;
   m->haveGhostPose_ = true;
   m->ghostBladeLive_ = (p.flags & ::net::MobPose::kBladeLive) != 0;
+  m->spellLight_[0] = p.spellLight[0];
+  m->spellLight_[1] = p.spellLight[1];
   // ---- A LIMB THE OWNER NO LONGER HAS (2026-10-08) -------------------------
   //
   // The stream lists every limb with a body and nothing else (BuildPose), so

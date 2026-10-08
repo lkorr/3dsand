@@ -113,3 +113,19 @@ bool SpellHandWorld(const MobSystem& mobs, const Physics& phys, uint64_t mobId, 
   out = xf.pos;
   return true;
 }
+
+void AppendSpellHandLights(const MobSystem& mobs, const Physics& phys, uint64_t skipId,
+                           std::vector<SpellHandLight>& out) {
+  mobs.ForEachCreature([&](const Mob& m) {
+    if (m.Id() == skipId || !m.Alive()) return;
+    for (int k = 0; k < kHands; k++) {
+      const uint32_t col = m.SpellLight(HandAt(k));
+      if (col == 0) continue;
+      SpellHandLight l;
+      if (!SpellHandWorld(mobs, phys, m.Id(), HandAt(k), l.at)) continue;
+      l.color = col;
+      l.mobId = m.Id();
+      out.push_back(l);
+    }
+  });
+}

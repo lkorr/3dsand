@@ -674,12 +674,7 @@ MobCastOutcome ServeImpl(TickAuthorityCtx& w, std::span<SessionTick> players,
       picked->spell = cd.ks->name;
       picked->gesture = CastGesture(w.glyphs, cd.list);
       picked->aim = cd.ks->aim;
-      const SpellCast& sc = cd.list.casts[0];
-      const uint32_t tint = CastTintMaterial(sc);
-      const uint32_t base = tint != 0 && tint < w.mats.size()
-                                ? w.mats[tint].gpu.color0
-                                : w.glyphs.Delivery(sc.delivery.glyph).look.color;
-      picked->color = 0xFF000000u | (base & 0x00FFFFFFu);
+      picked->color = CastLightColor(w.glyphs, w.mats, cd.list);
     }
     return MobCastOutcome::Gesturing;
   }
@@ -819,7 +814,10 @@ void EndHandCast(MobHandCast& hc, Mob* mob, const ItemLibrary& items, bool drawB
   if (mob != nullptr) {
     DropCastArm(*mob, hc.arm);
     mob->SetCastArm(Mob::CastArm{});
-    for (int k = 0; k < kHands; k++) SpellReadyClip(*mob, HandAt(k), false, hc.clipOn[k]);
+    for (int k = 0; k < kHands; k++) {
+      SpellReadyClip(*mob, HandAt(k), false, hc.clipOn[k]);
+      mob->SetSpellLight(HandAt(k), 0);
+    }
     if (drawBack) DrawBack(hc, *mob, items);
     mob->SetCastBusy(false);
   }
@@ -923,6 +921,11 @@ void StepHandCasts(TickAuthorityCtx& w, std::span<SessionTick> players, MobCastW
       mob->SetCastArm(Mob::CastArm{});
     }
     mob->SetCastBusy(true);
+    // THE LIGHT IN THE FIST while the spell is in it (raise through hold);
+    // let go with it (Mob::SpellLight -- streamed, so a peer sees it too).
+    const bool lit = hc.phase != MobHandCast::Phase::Lower;
+    mob->SetSpellLight(HandAt(hc.hand), lit ? hc.color : 0);
+    mob->SetSpellLight(OtherHand(HandAt(hc.hand)), 0);
   }
 }
 
@@ -1019,21 +1022,6 @@ const MobHandCast* MobHandCastOf(const TickAuthorityCtx& w, uint64_t mobId) {
   for (const MobCaster& c : w.mobCast->casters)
     if (c.mobId == mobId) return &c.hand;
   return nullptr;
-}
-
-void MobCastAppendHandLights(const TickAuthorityCtx& w, std::vector<MobHandLight>& out) {
-  if (!w.mobCast) return;
-  for (const MobCaster& c : w.mobCast->casters) {
-    const MobHandCast& hc = c.hand;
-    if (hc.phase == MobHandCast::Phase::Idle || hc.phase == MobHandCast::Phase::Lower ||
-        hc.color == 0)
-      continue;
-    MobHandLight l;
-    if (!SpellHandWorld(w.mobs, w.phys, c.mobId, HandAt(hc.hand), l.at)) continue;
-    l.color = hc.color;
-    l.mobId = c.mobId;
-    out.push_back(l);
-  }
 }
 
 const KitSpell* KitSpellNamed(TickAuthorityCtx& w, const std::string& spell) {

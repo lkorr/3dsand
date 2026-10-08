@@ -58,7 +58,8 @@ namespace net {
 // v2 (W2-M): a WireGear is an ItemInstance (adds count and fill).
 // v3 (2026-10-08): MobPose::flags (kBladeLive: a ghost can parry).
 // v4 (2026-10-08): PlayerBody.
-inline constexpr uint32_t kMobSyncVersion = 4;
+// v5 (2026-10-08): MobPose::spellLight (the light in a casting fist).
+inline constexpr uint32_t kMobSyncVersion = 5;
 
 // ---- one piece of kit, BY NAME ---------------------------------------------
 //
@@ -114,6 +115,12 @@ struct MobPose {
   // FindParry reads it on a ghost, which runs no stroke of its own).
   uint32_t flags = 0;
   static constexpr uint32_t kBladeLive = 1u << 0;
+  // THE LIGHT IN EACH FIST (Mob::SpellLight; index HandIndex): the colour,
+  // 0xAABBGGRR, of the spell a hand holds, 0 = none. The arm's casting pose
+  // already arrives as `limbs`; this is the one thing about a cast that is
+  // not a limb -- a player's spell in hand, a creature's mid-cast -- so the
+  // other machine can draw the same light where the owner does.
+  uint32_t spellLight[2] = {0, 0};
   std::vector<WireLimbPose> limbs;
 };
 

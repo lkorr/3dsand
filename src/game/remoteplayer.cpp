@@ -336,8 +336,14 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
     // put where the owner's tick put it, a limb the owner lost dropped, and
     // the blade's live bit latched for FindParry.
     if (r.haveBody && tick >= r.body.pose.tick &&
-        tick - r.body.pose.tick <= RemotePlayer::kBodyFreshTicks)
+        tick - r.body.pose.tick <= RemotePlayer::kBodyFreshTicks) {
       r.avatar.PlaceFromOwnerPose(r.body.pose, dt);
+    } else {
+      // No fresh stream: the arm falls back to the ghost's own animation,
+      // which knows nothing of a spell -- so neither does its fist.
+      r.avatar.SetSpellLight(Hand::Right, 0);
+      r.avatar.SetSpellLight(Hand::Left, 0);
+    }
 
     // Drain the one-tick edges, whether or not the avatar consumed them —
     // same rule and same wording as phase I's local drain. A peak-hold that is

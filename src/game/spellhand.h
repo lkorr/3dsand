@@ -20,6 +20,8 @@
 // is in it (the player's hotbar; a creature's sheath or bag). On the tick,
 // integer where it decides anything (the release), float only for the pose.
 
+#include <vector>
+
 #include "game/hand.h"
 #include "game/melee.h"
 #include "game/spellgesture.h"
@@ -97,3 +99,15 @@ void SpellReadyClip(Mob& body, Hand h, bool armed, bool& clipOn);
 // Where a spell in this hand is, world: the hand part's live body.
 bool SpellHandWorld(const MobSystem& mobs, const Physics& phys, uint64_t mobId, Hand h,
                     Vec3& out);
+
+// EVERY LIT FIST in the world (Mob::SpellLight), for the sprite pass: an NPC
+// mid-cast, a peer's player with a spell in hand, a peer's creature -- on
+// whichever machine, since a ghost latches the light from its owner's pose.
+// `skipId` is the local player's body, whose fist main.cpp draws itself.
+struct SpellHandLight {
+  Vec3 at{};
+  uint32_t color = 0;
+  uint64_t mobId = 0;
+};
+void AppendSpellHandLights(const MobSystem& mobs, const Physics& phys, uint64_t skipId,
+                           std::vector<SpellHandLight>& out);

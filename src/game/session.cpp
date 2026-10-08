@@ -646,7 +646,8 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
 // derived mirror. The cast's thrust (PoseSpellHands) is IK over the top of it
 // and fades back into it.
 static void PoseSpellReady(PlayerSession& s, PlayerAvatar& avatar,
-                           const HandsNow& hands) {
+                           const HandsNow& hands, const GlyphLibrary& glyphs,
+                           const std::vector<MaterialDef>& mats) {
   for (int hk = 0; hk < kHands; hk++) {
     // Also an arm whose hand is GONE but still has a spell equipped: the pose
     // is what places that spell (SpellHandPoint reads the absent hand's posed
@@ -655,6 +656,11 @@ static void PoseSpellReady(PlayerSession& s, PlayerAvatar& avatar,
                        (hands.hand[hk].spell ||
                         (hands.hand[hk].item == nullptr && s.caster.hand[hk].Equipped()));
     SpellReadyClip(avatar, HandAt(hk), armed, s.spellClip[hk]);
+    // The light in the fist, on the BODY (Mob::SpellLight): what the body's
+    // pose stream carries to a peer, whose ghost of you then shows it.
+    avatar.SetSpellLight(HandAt(hk), armed && hands.hand[hk].spell
+                                         ? CastLightColor(glyphs, mats, s.caster.hand[hk].compiled)
+                                         : 0u);
   }
 }
 
@@ -3678,7 +3684,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             if (s.strikeMirrored) MirrorWeaponPose(wp);
             avatar.SetWeaponPose(wp);
             PoseBenchHands(s, avatar);
-            PoseSpellReady(s, avatar, hands);
+            PoseSpellReady(s, avatar, hands, glyphs, mats);
             PoseSpellHands(s, avatar, hands, glyphs, swFwd, playerStrike.Active());
           }
         }
