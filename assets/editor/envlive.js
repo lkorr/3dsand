@@ -139,29 +139,29 @@ export const LIVE = {
     'ground.reliefFreq': P('preview relief; not part of what the engine will read')
   },
 
-  // ---- assets/worldmap/<name>/map.json + the three planes ---------------------
+  // ---- assets/worldmap/<name>/map.json (v2) + the plane tiles ----------------
   map: {
+    'version': R('worldmap.cpp LoadWorldMap: 2 (a v1 map is refused, naming scripts/convert_map_v2.py)'),
     'name': R('identity'),
     'about': R('free text'),
-    'cellLog2': R('WM_H_CELL_LOG2'),
-    'size': R('WM_H_WIDTH / HEIGHT'),
-    'originCell': R('WM_H_ORIGIN_X / Z'),
+    'extent.min': R('WM_H_EXTENT_X0 / Z0: the authored extent\u2019s min corner, world voxels'),
+    'extent.size': R('WM_H_EXTENT_W / H: the authored extent, a multiple of the site cell'),
+    'siteCellLog2': R('WM_H_SITE_CELL_LOG2: the site index lattice (102.4 m at 10)'),
     'seaLevelY': R('WM_H_SEA_LEVEL_Y'),
-    'oceanFadeCells': R('WM_H_OCEAN_FADE'),
-    'warpAmpVox': R('the biome-edge warp'),
+    'edgeFadeVox': R('WM_H_EDGE_FADE: how far past the extent the authored height eases to planes.height.default'),
+    'warpAmpVox': R('the biome-edge warp (at most a biome cell / 4)'),
     'biomes': R('the palette: plane byte -> biome file'),
     // map-overhaul P7 (b5359be) moved the edit layer from tuning.json world.editLayer
     // to the map; 5e62edf first shipped a map that names one.
     'editLayer': R('worldmap.cpp LoadWorldMap: the assets/worldedits/<name>.svedit layer applied over this map’s worldgen as an op-stream patch (DESIGN.md §9c.4)'),
-    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), kind "landform" DECLARED MOUNTAINS (P-G: peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed), and kind "tree" AUTHORED TREES (P6: a species at a column, near and far), kind "clearing" FOREST CLEARINGS (a box no crown reaches over) and kind "soften" SOFTENED GROUND (a box whose hills / bumps / grain are scaled, the village routes flatter still). Each is listed in the map cells its reach touches (at most four a cell) and keeps out by its own footprint'),
+    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), and kind "tree" AUTHORED TREES (P6: a species at a column, near and far), kind "clearing" FOREST CLEARINGS (a box no crown reaches over) and kind "soften" SOFTENED GROUND (a box whose hills / bumps / grain are scaled, the village routes flatter still). Each is listed in the map cells its reach touches (at most four a cell) and keeps out by its own footprint'),
     // P-G: the terrain, per map (worldmap.h kHTerrain*), read by the height
     // mirror on both sides through the worldMap header. Every number that
     // used to be a worldgen.* knob.
     'terrain.about': R('free text'),
     'terrain.refVoxelsPerMetre': R('WM_H_TERRAIN_REF_VPM / the prelude\u2019s REF_VOXELS_PER_METRE: the scale the lengths below are authored at; LoadWorldMap rescales them to the live voxel size'),
-    'terrain.baseHeight': R('WM_H_TERRAIN_BASE_HEIGHT: the world datum, the mean ground height'),
-    'terrain.landformRangeVox': R('WM_H_TERRAIN_LANDFORM_RANGE: what a painted landform 0..255 spans, centred on 128 (was worldgen.contAmplitude)'),
-    'terrain.rangeAmplitude': R('WM_H_TERRAIN_RANGE_AMPLITUDE: the seeded range octave under the plane'),
+    'terrain.baseHeight': R('WM_H_TERRAIN_BASE_HEIGHT: the authored height when no plane is loaded (map v2: the height plane is the ground)'),
+    'terrain.rangeAmplitude': R('WM_H_TERRAIN_RANGE_AMPLITUDE: the seeded range octave on the authored height (the rung the biome curve shapes)'),
     'terrain.rangeLog2': R('WM_H_TERRAIN_RANGE_LOG2'),
     'terrain.hillAmplitude': R('WM_H_TERRAIN_HILL_AMPLITUDE (each biome scales it by its terrain.hill)'),
     'terrain.hillLog2': R('WM_H_TERRAIN_HILL_LOG2'),
@@ -170,9 +170,9 @@ export const LIVE = {
     'terrain.grainAmplitude': R('WM_H_TERRAIN_GRAIN_AMPLITUDE (scaled per biome by terrain.grain)'),
     'terrain.grainLog2': R('WM_H_TERRAIN_GRAIN_LOG2'),
     'terrain.fbmAtten': R('WM_H_TERRAIN_FBM_ATTEN: iq\u2019s derivative attenuation, Q8; the rule-2 mechanism that keeps the ladder under the angle of repose'),
-    'terrain.homeArea.y': R('WM_H_TERRAIN_HOME_Y: the calm home area\u2019s ground height around the spawn site (was spawnPlainY)'),
+    'terrain.homeArea.y': N('A1', 'map v2: the calm area fades the NOISE toward the authored height; homeArea.y no longer reaches the ground (A1 replaces it)'),
     'terrain.homeArea.radius': R('WM_H_TERRAIN_HOME_R: Chebyshev radius held calm (was spawnPlainR)'),
-    'terrain.homeArea.fade': R('WM_H_TERRAIN_HOME_FADE: how far past it the coarse relief ramps back (was spawnPlainFade; the terrain gate\u2019s A4 measures the slope it builds)'),
+    'terrain.homeArea.fade': R('WM_H_TERRAIN_HOME_FADE: how far past it the range rung ramps back (was spawnPlainFade; the terrain gate\u2019s A4 measures the slope it builds)'),
     'terrain.sedCeil': R('WM_H_TERRAIN_SED_CEIL: the sediment wedge (was sedCeil)'),
     'terrain.sedFraction': R('WM_H_TERRAIN_SED_FRACTION'),
     'terrain.sedStrip': R('WM_H_TERRAIN_SED_STRIP'),
@@ -181,9 +181,8 @@ export const LIVE = {
     'terrain.sedTopsoil': R('WM_H_TERRAIN_SED_TOPSOIL'),
     'terrain.treeline': R('WM_H_TERRAIN_TREELINE: snow and no trees at or above this ground Y'),
     'rules[]': R('seeded per-biome stamp placement'),
-    'planes.biome': R('mapBiomeAt'),
-    'planes.landform': R('mapLandformQ8: owns the continental rung of the height'),
-    'planes.moisture': N('later', 'packed (WM_H_MOISTURE_PLANE) and read by nothing; no package claims it yet')
+    'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
+    'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt')
   }
 };
 

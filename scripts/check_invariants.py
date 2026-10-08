@@ -1860,7 +1860,6 @@ def check_worldmap_layout():
              "kCoverRowWords": "WM_C_WORDS", "kC_HeightVox": "WM_C_HEIGHT",
              "kC_PatchThreshold": "WM_C_PATCH_THRESH", "kHBiomeRecords": "WM_H_BIOME_RECORDS",
              "kHMaxCoverH": "WM_H_MAX_COVER_H", "kB_MaxCoverH": "WM_B_MAX_COVER_H",
-             "kHLandformPlane": "WM_H_LANDFORM_PLANE", "kHMoisturePlane": "WM_H_MOISTURE_PLANE",
              "kSiteRecWords": "WM_S_WORDS", "kStampHdrWords": "WM_STAMP_HDR_WORDS",
              "kS_PadMargin": "WM_S_PAD_MARGIN", "kS_StampOff": "WM_S_STAMP_OFF",
              "kStamp_NX": "WM_STAMP_NX", "kStamp_NY": "WM_STAMP_NY", "kStamp_NZ": "WM_STAMP_NZ",

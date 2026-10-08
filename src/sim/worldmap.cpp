@@ -13,12 +13,12 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
 
 #include "sim/biomes.h"
-#include "sim/intmath.h"   // the landform bake's integer sine/sqrt (no libm)
 #include "sim/rng.h"
 #include "sim/treeatlas.h"   // ReadTreeSpeciesHeaders: a tree site's species index + reach
 #include "sim/tuning.h"
@@ -157,14 +157,15 @@ uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name) 
 void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]) {
   const auto at = [&](uint32_t word) -> uint32_t& { return out[word - kHTerrainBaseHeight]; };
   at(kHTerrainBaseHeight) = U(t.baseHeight);
-  at(kHTerrainLandformRange) = U(std::max(0, t.landformRangeVox));
-  at(kHTerrainRangeAmplitude) = U(std::max(0, t.rangeAmplitude));
+  // Every amplitude is clamped to kNoiseAmpMax (worldmap.h: the octave's
+  // n.dx * amp * biome multiplier bound); LoadWorldMap says so when it bites.
+  at(kHTerrainRangeAmplitude) = U(std::clamp(t.rangeAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainRangeLog2) = U(std::clamp(t.rangeLog2, 3, 15));
-  at(kHTerrainHillAmplitude) = U(std::max(0, t.hillAmplitude));
+  at(kHTerrainHillAmplitude) = U(std::clamp(t.hillAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainHillLog2) = U(std::clamp(t.hillLog2, 3, 15));
-  at(kHTerrainDetailAmplitude) = U(std::max(0, t.detailAmplitude));
+  at(kHTerrainDetailAmplitude) = U(std::clamp(t.detailAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainDetailLog2) = U(std::clamp(t.detailLog2, 3, 15));
-  at(kHTerrainGrainAmplitude) = U(std::max(0, t.grainAmplitude));
+  at(kHTerrainGrainAmplitude) = U(std::clamp(t.grainAmplitude, 0, kNoiseAmpMax));
   at(kHTerrainGrainLog2) = U(std::clamp(t.grainLog2, 3, 15));
   at(kHTerrainFbmAtten) = U(std::clamp(t.fbmAtten, 0, 256));
   at(kHTerrainHomeY) = U(t.homeY);
@@ -188,122 +189,6 @@ BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b) {
   p.w[kB_DetailMul - kB_CurveKnot0] = U(std::clamp(b.terrain.detail, 0, 4096));
   p.w[kB_GrainMul - kB_CurveKnot0] = U(std::clamp(b.terrain.grain, 0, 4096));
   return p;
-}
-
-// A declared landform, onto the plane. Tier A: no seed anywhere in here. The
-// plane's unit is landformRangeVox / 256 voxels (the shader's
-// ((L << 8) - 32768) * range >> 16), so a site's heightVox becomes
-// heightVox * 256 / range units at its centre. Shapes are profiles of the
-// normalised distance t in 0..1 from the centre:
-//   peak     1 - t                      (a cone)
-//   basin    -(1 - t)                   (the cone, sunk; heightVox's sign is
-//                                        taken as a magnitude either way)
-//   plateau  1 inside 0.6, then 1 - (t - 0.6) / 0.4   (a flat top, ramped out)
-//   ridge    the cone over an ellipse of semi-axes (radius, radius / 3)
-//            turned `rotation` degrees, so it reads as a range with a crest
-// The value is accumulated in whole units and clamped to the byte at the end,
-// so a peak painted over a basin sums rather than replaces.
-//
-// INTEGER, AND WHY. This bake used to run in doubles with libm cos and sin on
-// the ridge rotation. The plane it writes is read by worldgen — by the shader
-// AND by the CPU height twin — so one byte that differs between two machines
-// is a terrain that differs between two machines, which is a desync no gate on
-// one box can see. libm is not specified to be correctly rounded and is not
-// bit-identical across platforms or compiler versions, so the bake is now
-// integer end to end: imath::BamFromDegreesI turns whole degrees into an exact
-// BAM (90 degrees really is a quarter turn), imath's Q30 sine replaces libm's,
-// distances come out of an exact integer sqrt, and the accumulator is Q16.16
-// landform units rounded half-up at the end. See docs/PLAN_multiplayer_now.md
-// L6. `+ - * / sqrt` on floats WOULD have been safe (IEEE specifies them
-// exactly, which is why ProfileAt above still uses std::sqrt); cos and sin are
-// the two that are not.
-void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRangeVox,
-                          int cellLog2, int width, int height, int originCellX, int originCellZ,
-                          std::vector<uint8_t>& landform) {
-  if (sites.empty() || landform.size() != static_cast<size_t>(width) * height) return;
-  const int64_t range = std::max(1, landformRangeVox);
-  const int64_t half = 1 << (cellLog2 - 1);
-  // Q16.16 landform units. The plane's own bytes seed it, so a site adds to
-  // what the author painted rather than replacing it.
-  std::vector<int64_t> acc(landform.size());
-  for (size_t i = 0; i < landform.size(); i++) acc[i] = static_cast<int64_t>(landform[i]) << 16;
-  for (const LandformSite& st : sites) {
-    const int64_t r = std::max(1, st.radius);
-    const int64_t hv = st.heightVox < 0 ? -static_cast<int64_t>(st.heightVox)
-                                        : static_cast<int64_t>(st.heightVox);
-    // heightVox * 256 / range landform units, Q16.16; a basin sinks the plane.
-    int64_t ampQ = imath::DivRound(hv * 256 * 65536, range);
-    if (st.shape == "basin") ampQ = -ampQ;
-    if (ampQ == 0) continue;
-    const uint32_t rotBam = imath::BamFromDegreesI(st.rotation);
-    const int64_t ca = imath::CosQ30(rotBam), sa = imath::SinQ30(rotBam);
-    // The ridge's cross-crest semi-axis, radius / 3, kept as Q16.16 so the
-    // thirds are not thrown away on a small footprint.
-    const int64_t bQ = std::max<int64_t>(65536, (r * 65536) / 3);
-    // cells the footprint can reach, +1 for the ridge's rotated corners
-    int c0x, c0z, c1x, c1z;
-    const auto cellOf = [&](int x, int z, int* cx, int* cz) {
-      *cx = (x >> cellLog2) + originCellX;
-      *cz = (z >> cellLog2) + originCellZ;
-    };
-    cellOf(st.x - st.radius - 1, st.z - st.radius - 1, &c0x, &c0z);
-    cellOf(st.x + st.radius + 1, st.z + st.radius + 1, &c1x, &c1z);
-    c0x = std::max(c0x - 1, 0); c0z = std::max(c0z - 1, 0);
-    c1x = std::min(c1x + 1, width - 1); c1z = std::min(c1z + 1, height - 1);
-    for (int cz = c0z; cz <= c1z; cz++)
-      for (int cx = c0x; cx <= c1x; cx++) {
-        const int64_t wx = (static_cast<int64_t>(cx - originCellX) << cellLog2) + half;
-        const int64_t wz = (static_cast<int64_t>(cz - originCellZ) << cellLog2) + half;
-        const int64_t dx = wx - st.x, dz = wz - st.z;
-        int64_t tQ;  // normalised distance from the centre, Q16.16
-        if (st.shape == "ridge") {
-          // into the ridge's frame: `u` along the crest, `v` across it. The
-          // Q30 sine times a whole-voxel offset is a Q30 length; >>14 (rounded,
-          // never a bare arithmetic shift, which would floor both signs the
-          // same way and drag the crest one way) lands it in Q16.16.
-          const int64_t uQ = imath::DivRound(dx * ca + dz * sa, 1 << 14);
-          const int64_t vQ = imath::DivRound(-dx * sa + dz * ca, 1 << 14);
-          const int64_t ru = imath::DivRound(uQ, r);         // u / a, Q16.16
-          const int64_t rv = imath::DivRound(vQ << 16, bQ);  // v / b, Q16.16
-          // Two Q16.16s squared make a Q32.32; its exact integer sqrt is a
-          // Q16.16 again, with no intermediate rounding to argue about.
-          tQ = static_cast<int64_t>(imath::Sqrt64(static_cast<uint64_t>(ru * ru + rv * rv)));
-        } else {
-          const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
-          // `d2 << 32` is exact only while d2 < 2^32, i.e. while the distance
-          // is under 65,536 voxels; past that it wraps the u64 and bakes
-          // garbage. That is REACHABLE, because the loader clamps radius to
-          // 1 << 20 (a 105 km site), so take the root first and shift after
-          // for the far branch: the fraction it drops is under one voxel out
-          // of a distance already past 65,536, hence under 1/65,536 of t --
-          // below the Q16.16 LSB, let alone the byte the plane stores.
-          // The ridge branch needs no such guard: dx * ca peaks at
-          // 2^20 * 2^30 = 2^50, vQ << 16 at 2^52, and ru / rv are bounded by
-          // ~2^18 each, so its ru*ru + rv*rv sits around 2^36.
-          tQ = d2 < (1ull << 32)
-                   ? imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2 << 32)), r)
-                   : imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2) << 16), r);
-        }
-        if (tQ >= 65536) continue;
-        int64_t fQ;
-        if (st.shape == "plateau") {
-          // 1 inside 0.6, then 1 - (t - 0.6) / 0.4 == (5 - 5t) / 2. Written as
-          // exact fifths rather than as 0.6/0.4 rounded into Q16.16, so the
-          // flat top ends exactly where the comment above says it does.
-          fQ = (5 * tQ <= 3 * 65536) ? 65536 : imath::DivRound(5 * (65536 - tQ), 2);
-        } else {
-          fQ = 65536 - tQ;
-        }
-        acc[static_cast<size_t>(cz) * width + cx] += imath::MulShiftRound(ampQ, fQ, 16);
-      }
-  }
-  for (size_t i = 0; i < landform.size(); i++) {
-    // Explicit integer half-up: +0.5 then floor, the floor being the
-    // arithmetic shift. Written out rather than left to std::lround because
-    // the rounding MODE is part of the byte the whole world reads.
-    const int64_t v = (acc[i] + 32768) >> 16;
-    landform[i] = static_cast<uint8_t>(std::clamp<int64_t>(v, 0, 255));
-  }
 }
 
 namespace {
@@ -798,6 +683,14 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
   }
   auto geti = [&](const char* k, int d) { return j.contains(k) && j[k].is_number() ? j[k].get<int>() : d; };
+  // MAP V2 ONLY (docs/PLAN_map_v2.md). A v1 map -- map.svmap's u8 landform
+  // plane, `cellLog2` / `size` / `originCell` -- is refused, naming the one
+  // tool that turns it into a v2 map, rather than half-read.
+  if (geti("version", 1) != 2) {
+    log += at + "map.json is a v1 map (no \"version\": 2); convert it with "
+                "`python scripts/convert_map_v2.py " + name + "` (docs/PLAN_map_v2.md)\n";
+    return false;
+  }
   out.name = name;
   // P7: the edit layer is the map's (was tuning.json world.editLayer). A bare
   // name: worldedit.cpp joins it under assets/worldedits/.
@@ -825,7 +718,6 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     for (int r = ref; r > kVoxelsPerMetre; r /= 2) cellShift--;
     auto log2c = [&](const char* k, int d) { return std::clamp(num(k, d) + cellShift, 3, 15); };
     t.baseHeight = len("baseHeight", t.baseHeight);
-    t.landformRangeVox = len("landformRangeVox", t.landformRangeVox);
     t.rangeAmplitude = len("rangeAmplitude", t.rangeAmplitude);
     t.rangeLog2 = log2c("rangeLog2", t.rangeLog2);
     t.hillAmplitude = len("hillAmplitude", t.hillAmplitude);
@@ -862,26 +754,113 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     t.treeline = len("treeline", t.treeline);
     TerrainWords(t, out.terrainWords);
   }
-  out.cellLog2 = geti("cellLog2", 10);
+  // Amplitudes past kNoiseAmpMax are clamped by TerrainWords (the octave's
+  // i32 bound); said here, where the map that asked for it is named.
+  for (const auto& [key, v] : {std::pair<const char*, int>{"rangeAmplitude", out.terrain.rangeAmplitude},
+                               {"hillAmplitude", out.terrain.hillAmplitude},
+                               {"detailAmplitude", out.terrain.detailAmplitude},
+                               {"grainAmplitude", out.terrain.grainAmplitude}})
+    if (v > kNoiseAmpMax)
+      warn(std::string("terrain.") + key + " " + std::to_string(v) + " clamped to " + std::to_string(kNoiseAmpMax) +
+           " voxels (the octave's overflow bound)");
+
+  // ---- the extent and the lattices (map v2) -----------------------------------
   out.seaLevelY = geti("seaLevelY", 0);
-  out.oceanFadeCells = geti("oceanFadeCells", 0);
   out.warpAmpVox = geti("warpAmpVox", 0);
-  if (j.contains("size") && j["size"].is_array() && j["size"].size() == 2) {
-    out.width = j["size"][0].get<int>(); out.height = j["size"][1].get<int>();
+  out.edgeFadeVox = geti("edgeFadeVox", 6144);
+  out.siteCellLog2 = geti("siteCellLog2", 10);
+  {
+    const json ex = j.contains("extent") && j["extent"].is_object() ? j["extent"] : json::object();
+    auto pair = [&](const char* k, int* a, int* b) -> bool {
+      if (!(ex.contains(k) && ex[k].is_array() && ex[k].size() == 2 && ex[k][0].is_number_integer() &&
+            ex[k][1].is_number_integer())) return false;
+      *a = ex[k][0].get<int>(); *b = ex[k][1].get<int>();
+      return true;
+    };
+    if (!pair("min", &out.extentX0, &out.extentZ0) || !pair("size", &out.extentW, &out.extentH)) {
+      log += at + "map.json needs extent.min[2] and extent.size[2] in world voxels\n"; return false;
+    }
   }
-  if (j.contains("originCell") && j["originCell"].is_array() && j["originCell"].size() == 2) {
-    out.originCellX = j["originCell"][0].get<int>(); out.originCellZ = j["originCell"][1].get<int>();
+  if (out.siteCellLog2 < 6 || out.siteCellLog2 > 14) {
+    log += at + "siteCellLog2 " + std::to_string(out.siteCellLog2) + " is outside 6..14\n"; return false;
   }
-  if (out.cellLog2 < 4 || out.cellLog2 > 14 || out.width <= 0 || out.height <= 0 ||
-      out.width > 4096 || out.height > 4096) {
-    log += at + "bad cellLog2/size\n"; return false;
+  const int siteVox = 1 << out.siteCellLog2;
+  // The extent's corners are site-cell corners, so the site plane, every
+  // finer plane and the extent tile each other exactly (floor division by a
+  // power of two is then a shift on both sides of the mirror).
+  if (out.extentW <= 0 || out.extentH <= 0 || out.extentW % siteVox || out.extentH % siteVox ||
+      out.extentX0 % siteVox || out.extentZ0 % siteVox) {
+    log += at + "extent min (" + std::to_string(out.extentX0) + "," + std::to_string(out.extentZ0) + ") size (" +
+           std::to_string(out.extentW) + "," + std::to_string(out.extentH) + ") must be positive multiples of the " +
+           std::to_string(siteVox) + "-voxel site cell (siteCellLog2)\n";
+    return false;
   }
-  // The warp must stay well inside a cell or a one-cell region pinches below
-  // the tree-tile width the shader's comments require (plan: <= cell/6).
-  const int cellVox = 1 << out.cellLog2;
-  if (out.warpAmpVox < 0 || out.warpAmpVox > cellVox / 4) {
-    log += at + "warpAmpVox " + std::to_string(out.warpAmpVox) + " exceeds cell/4 (" +
-           std::to_string(cellVox / 4) + ")\n";
+  if (static_cast<int64_t>(out.extentX0) + out.extentW > (int64_t(1) << 30) || out.extentX0 < -(1 << 30) ||
+      static_cast<int64_t>(out.extentZ0) + out.extentH > (int64_t(1) << 30) || out.extentZ0 < -(1 << 30)) {
+    log += at + "extent reaches past +-2^30 voxels\n"; return false;
+  }
+  out.siteW = out.extentW >> out.siteCellLog2;
+  out.siteH = out.extentH >> out.siteCellLog2;
+  out.siteOriginX = -(out.extentX0 >> out.siteCellLog2);
+  out.siteOriginZ = -(out.extentZ0 >> out.siteCellLog2);
+  if (out.siteW > 4096 || out.siteH > 4096) {
+    log += at + "the extent is " + std::to_string(out.siteW) + "x" + std::to_string(out.siteH) +
+           " site cells; at most 4096 a side\n";
+    return false;
+  }
+  if (out.edgeFadeVox < 64 || out.edgeFadeVox > 65536) {
+    // 65536: mapHeightAt's d * 32768 stays inside i32 for d < fade.
+    log += at + "edgeFadeVox " + std::to_string(out.edgeFadeVox) + " is outside 64..65536\n"; return false;
+  }
+  // The two planes' declarations. Their DATA is read after the palette.
+  const json pl = j.contains("planes") && j["planes"].is_object() ? j["planes"] : json::object();
+  const json ph = pl.contains("height") && pl["height"].is_object() ? pl["height"] : json::object();
+  const json pb = pl.contains("biome") && pl["biome"].is_object() ? pl["biome"] : json::object();
+  if (ph.empty() || pb.empty()) {
+    log += at + "map.json needs planes.height and planes.biome\n"; return false;
+  }
+  out.heightLog2 = ph.value("log2", 6);
+  out.biomeLog2 = pb.value("log2", 8);
+  out.heightDefault = ph.value("default", 0);
+  if (ph.value("tile", kTileSide) != kTileSide || pb.value("tile", kTileSide) != kTileSide) {
+    log += at + "planes.*.tile must be " + std::to_string(kTileSide) + "\n"; return false;
+  }
+  // 3..6: the Catmull-Rom's i32 bounds (worldgen.wgsl crStep) are argued for a
+  // post fraction under 64; and a post may not be coarser than a site cell.
+  if (out.heightLog2 < 3 || out.heightLog2 > 6 || out.heightLog2 > out.siteCellLog2) {
+    log += at + "planes.height.log2 " + std::to_string(out.heightLog2) + " is outside 3..6 (and <= siteCellLog2)\n";
+    return false;
+  }
+  if (out.biomeLog2 < 4 || out.biomeLog2 > out.siteCellLog2) {
+    log += at + "planes.biome.log2 " + std::to_string(out.biomeLog2) + " is outside 4..siteCellLog2\n"; return false;
+  }
+  if (std::abs(out.heightDefault) > kHeightLimit) {
+    log += at + "planes.height.default " + std::to_string(out.heightDefault) + " is outside +-" +
+           std::to_string(kHeightLimit) + "\n";
+    return false;
+  }
+  out.heightPostsX = (out.extentW >> out.heightLog2) + 1;
+  out.heightPostsZ = (out.extentH >> out.heightLog2) + 1;
+  out.biomePostsX = (out.extentW >> out.biomeLog2) + 1;
+  out.biomePostsZ = (out.extentH >> out.biomeLog2) + 1;
+  // THE 64 MiB CEILING (docs/PLAN_map_v2.md "GPU packing"): the planes are
+  // packed DENSE; a map past this needs a sparse GPU directory, which this
+  // loader does not have, so it says so instead of allocating.
+  {
+    const int64_t words = (int64_t(out.heightPostsX) * out.heightPostsZ + 1) / 2 +
+                          (int64_t(out.biomePostsX) * out.biomePostsZ + 3) / 4 + int64_t(out.siteW) * out.siteH;
+    if (out.heightPostsX > 4097 || out.heightPostsZ > 4097 || words * 4 > (int64_t(64) << 20)) {
+      log += at + "the planes need " + std::to_string(words * 4 / (1 << 20)) + " MiB dense (" +
+             std::to_string(out.heightPostsX) + "x" + std::to_string(out.heightPostsZ) +
+             " height posts); the ceiling is 64 MiB and 4097 posts a side without a sparse directory\n";
+      return false;
+    }
+  }
+  // The warp must stay well inside a biome cell or a one-cell region pinches
+  // below the tree-tile width the shader's comments require.
+  if (out.warpAmpVox < 0 || out.warpAmpVox > (1 << out.biomeLog2) / 4) {
+    log += at + "warpAmpVox " + std::to_string(out.warpAmpVox) + " exceeds the biome cell / 4 (" +
+           std::to_string((1 << out.biomeLog2) / 4) + ")\n";
     return false;
   }
 
@@ -902,8 +881,16 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     out.palette.push_back(n);
     paletteId.push_back(static_cast<uint8_t>(it->second));
   }
-  auto oc = idOf.find("ocean");
-  out.oceanBiome = oc == idOf.end() ? 0 : oc->second;
+  int biomeDefaultIdx = -1;   // planes.biome.default as a palette index
+  {
+    const std::string bd = pb.value("default", std::string("ocean"));
+    for (size_t i = 0; i < out.palette.size(); i++)
+      if (out.palette[i] == bd) biomeDefaultIdx = static_cast<int>(i);
+    if (biomeDefaultIdx < 0) {
+      log += at + "planes.biome.default \"" + bd + "\" is not in the biomes[] palette\n"; return false;
+    }
+    out.biomeDefault = paletteId[static_cast<size_t>(biomeDefaultIdx)];
+  }
 
   // ---- stamp templates: one .vox load + pack per (template, rotation) --------
   // A missing template is a broken AUTHORED reference; refuse, the way a
@@ -954,7 +941,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     return true;
   };
 
-  // ---- sites: the pad box, the spawn, stamps, lakes, landforms, trees ---------
+  // ---- sites: the pad box, the spawn, stamps, lakes, trees ---------------------
   bool havePad = false;
   if (j.contains("sites") && j["sites"].is_array()) {
     for (const json& s : j["sites"]) {
@@ -1025,25 +1012,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         if (s.contains("radius") && s["radius"].is_number()) st.radius = std::max(st.radius, s["radius"].get<int>());
         out.sites.push_back(std::move(st));
       } else if (kind == "landform") {
-        // P-G: a DECLARED landform, Tier A. Overlaid onto the plane once the
-        // planes are read (below); never in the site table.
-        LandformSite ls;
-        ls.id = id;
-        ls.shape = s.value("shape", "peak");
-        if (ls.shape != "peak" && ls.shape != "ridge" && ls.shape != "basin" && ls.shape != "plateau") {
-          log += at + "site \"" + id + "\" kind landform: shape must be peak | ridge | basin | plateau, not \"" + ls.shape + "\"\n";
-          return false;
-        }
-        if (!(s.contains("at") && s["at"].is_array() && s["at"].size() == 2 &&
-              s["at"][0].is_number() && s["at"][1].is_number())) {
-          log += at + "site \"" + id + "\" kind landform needs at[2] in world voxels\n";
-          return false;
-        }
-        ls.x = s["at"][0].get<int>(); ls.z = s["at"][1].get<int>();
-        ls.radius = std::clamp(s.value("radius", 1024), 1, 1 << 20);
-        ls.heightVox = std::clamp(s.value("heightVox", 0), -100000, 100000);
-        ls.rotation = s.value("rotation", 0);
-        out.landformSites.push_back(std::move(ls));
+        // Map v1's declared landforms are gone (docs/PLAN_map_v2.md): the
+        // converter baked them into the height plane, and the World map page
+        // offers the shapes as stamps that WRITE the plane. Said, not refused.
+        warn("site \"" + id + "\": kind landform is a map v1 site; v2 bakes landforms into the height "
+             "plane (scripts/convert_map_v2.py, the map page's shape stamps) -- ignored");
       } else if (kind == "water") {
         // P-F: an AUTHORED LAKE. Tier A -- its centre is the map's, its
         // geometry the preset's (radius overridable, in world voxels), and it
@@ -1187,7 +1160,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         out.sites.push_back(std::move(st));
       } else {
         warn("site \"" + id + "\": unknown kind \"" + kind +
-             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree, clearing, soften)");
+             "\" -- ignored (the loader knows spawn, pad, stamp, water, tree, clearing, soften)");
       }
     }
   }
@@ -1349,48 +1322,98 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // Rules are resolved after the planes are read (they need the biome plane);
   // see below.
 
-  // ---- map.svmap --------------------------------------------------------------
-  std::vector<uint8_t> raw;
+  // ---- the plane tiles (map v2): planes/<plane>/<tx>_<tz>.svt ------------------
+  // A v1 map.svmap still on disk is a half-converted map: refuse it rather than
+  // boot on planes nobody reads.
   {
-    std::ifstream f(dir + "/map.svmap", std::ios::binary);
-    if (!f) { log += at + "map.svmap not found\n"; return false; }
-    std::ostringstream ss; ss << f.rdbuf();
-    const std::string s = ss.str();
-    raw.assign(s.begin(), s.end());
-  }
-  const size_t cells = static_cast<size_t>(out.width) * out.height;
-  if (raw.size() < 16 + cells * 3) {
-    log += at + "map.svmap is " + std::to_string(raw.size()) + " bytes; expected " +
-           std::to_string(16 + cells * 3) + " for " + std::to_string(out.width) + "x" +
-           std::to_string(out.height) + "\n";
-    return false;
-  }
-  uint32_t magic, ver, w, h;
-  std::memcpy(&magic, raw.data(), 4); std::memcpy(&ver, raw.data() + 4, 4);
-  std::memcpy(&w, raw.data() + 8, 4); std::memcpy(&h, raw.data() + 12, 4);
-  if (magic != kMagic || ver != kVersion) { log += at + "map.svmap: bad magic/version\n"; return false; }
-  if (w != U(out.width) || h != U(out.height)) {
-    log += at + "map.svmap is " + std::to_string(w) + "x" + std::to_string(h) +
-           " but map.json says " + std::to_string(out.width) + "x" + std::to_string(out.height) + "\n";
-    return false;
-  }
-  out.biome.resize(cells); out.landform.resize(cells); out.moisture.resize(cells);
-  for (size_t i = 0; i < cells; i++) {
-    const uint8_t p = raw[16 + i];
-    if (p >= paletteId.size()) {
-      log += at + "biome plane byte " + std::to_string(p) + " at cell " + std::to_string(i) +
-             " is outside the palette (" + std::to_string(paletteId.size()) + " entries)\n";
+    std::error_code ec;
+    if (std::filesystem::exists(dir + "/map.svmap", ec)) {
+      log += at + "map.svmap is a map v1 plane file; a v2 map keeps its planes as tiles -- re-run "
+                  "`python scripts/convert_map_v2.py " + name + "` or delete the stale file\n";
       return false;
     }
-    out.biome[i] = paletteId[p];
   }
-  std::memcpy(out.landform.data(), raw.data() + 16 + cells, cells);
-  std::memcpy(out.moisture.data(), raw.data() + 16 + cells * 2, cells);
+  out.height.assign(static_cast<size_t>(out.heightPostsX) * out.heightPostsZ, static_cast<int16_t>(out.heightDefault));
+  out.biome.assign(static_cast<size_t>(out.biomePostsX) * out.biomePostsZ, static_cast<uint8_t>(out.biomeDefault));
+  // Every tile file read, in (plane, tz, tx) order: the content hash folds them
+  // in this order, so it is a pure function of the files whatever order the
+  // directory lists them in.
+  std::map<std::tuple<uint32_t, int, int>, std::vector<uint8_t>> tileBytes;
+  auto readPlane = [&](const char* plane, uint32_t kind, int postsX, int postsZ) -> bool {
+    const std::string pd = dir + "/planes/" + plane;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(pd, ec)) return true;   // no tiles: every post is the default
+    for (const auto& de : std::filesystem::directory_iterator(pd, ec)) {
+      const std::string fn = de.path().filename().string();
+      if (de.path().extension() != ".svt") continue;
+      int tx = 0, tz = 0;
+      char tail = 0;
+      if (std::sscanf(fn.c_str(), "%d_%d.sv%c", &tx, &tz, &tail) != 3 || tail != 't') {
+        log += at + "planes/" + plane + "/" + fn + ": a tile is named <tx>_<tz>.svt\n";
+        return false;
+      }
+      std::ifstream f(de.path(), std::ios::binary);
+      std::ostringstream ss; ss << f.rdbuf();
+      const std::string raw = ss.str();
+      const uint32_t sb = kind == kPlaneHeight ? 2u : 1u;
+      const size_t need = kTileHeaderBytes + size_t(kTileSide) * kTileSide * sb;
+      auto rd = [&](size_t o) { uint32_t v; std::memcpy(&v, raw.data() + o, 4); return v; };
+      const std::string who = at + "planes/" + plane + "/" + fn + ": ";
+      if (raw.size() != need) {
+        log += who + std::to_string(raw.size()) + " bytes, a tile is " + std::to_string(need) + "\n"; return false;
+      }
+      if (rd(0) != kTileMagic || rd(4) != kind || static_cast<int>(rd(8)) != tx || static_cast<int>(rd(12)) != tz ||
+          rd(16) != U(kTileSide) || rd(20) != U(kTileSide) || rd(24) != sb) {
+        log += who + "header disagrees with its plane / name (magic 'SVT1', kind " + std::to_string(kind) +
+               ", tx " + std::to_string(tx) + ", tz " + std::to_string(tz) + ", " + std::to_string(kTileSide) +
+               "x" + std::to_string(kTileSide) + ", " + std::to_string(sb) + "-byte samples)\n";
+        return false;
+      }
+      if (tx < 0 || tz < 0 || tx * kTileSide >= postsX || tz * kTileSide >= postsZ) {
+        log += who + "lies outside the " + std::to_string(postsX) + "x" + std::to_string(postsZ) + "-post plane\n";
+        return false;
+      }
+      for (int k = 0; k < kTileSide; k++) {
+        const int pk = tz * kTileSide + k;
+        if (pk >= postsZ) break;
+        for (int i = 0; i < kTileSide; i++) {
+          const int pi = tx * kTileSide + i;
+          if (pi >= postsX) break;
+          const size_t so = kTileHeaderBytes + (size_t(k) * kTileSide + i) * sb;
+          const size_t di = size_t(pk) * postsX + pi;
+          if (kind == kPlaneHeight) {
+            int16_t v;
+            std::memcpy(&v, raw.data() + so, 2);
+            if (std::abs(static_cast<int>(v)) > kHeightLimit) {
+              log += who + "post (" + std::to_string(pi) + "," + std::to_string(pk) + ") height " + std::to_string(v) +
+                     " is outside +-" + std::to_string(kHeightLimit) + "\n";
+              return false;
+            }
+            out.height[di] = v;
+          } else {
+            const uint8_t p = static_cast<uint8_t>(raw[so]);
+            if (p >= paletteId.size()) {
+              log += who + "biome index " + std::to_string(p) + " at post (" + std::to_string(pi) + "," +
+                     std::to_string(pk) + ") is outside the palette (" + std::to_string(paletteId.size()) + " entries)\n";
+              return false;
+            }
+            out.biome[di] = paletteId[p];
+          }
+        }
+      }
+      (kind == kPlaneHeight ? out.heightTiles : out.biomeTiles)++;
+      tileBytes[{kind, tz, tx}] = std::vector<uint8_t>(raw.begin(), raw.end());
+    }
+    return true;
+  };
+  if (!readPlane("height", kPlaneHeight, out.heightPostsX, out.heightPostsZ) ||
+      !readPlane("biome", kPlaneBiome, out.biomePostsX, out.biomePostsZ))
+    return false;
   // ---- sculpt.svsculpt (P5): the sparse height-offset layer, optional --------
   // Read BEFORE the site-pad bake below: a pad's height is the sculpted ground
   // (BareGroundHeight runs the mirror, which reads out.sculpt). Absent = no
   // layer, and nothing downstream sees a difference; malformed = refuse, like
-  // a bad map.svmap -- a half-read layer would be a different world.
+  // a bad tile -- a half-read layer would be a different world.
   std::vector<uint8_t> sculptRaw;
   {
     std::ifstream f(dir + "/sculpt.svsculpt", std::ios::binary);
@@ -1407,12 +1430,6 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   out.sculpt.size());
     }
   }
-  // ---- the declared landforms, onto the painted plane (P-G) --------------------
-  // After the plane is read, before anything samples it. The shader and the
-  // CPU twin both read the OVERLAID plane and nothing else: a landform site
-  // exists at load and nowhere in the height mirror.
-  OverlayLandformSites(out.landformSites, out.terrain.landformRangeVox, out.cellLog2,
-                       out.width, out.height, out.originCellX, out.originCellZ, out.landform);
   // ---- each biome's terrain record for the CPU twin (worldmap.h kB_Curve*) ----
   out.biomeTerrain.assign(set.biomes.size(), {});
   for (const biomes::BiomeDef& b : set.biomes)
@@ -1431,11 +1448,15 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   // row. Tier B: takes the world seed (and the rule's salt), so every seed
   // puts them somewhere else, but the SAME seed puts them in the same
   // places on every machine -- integer arithmetic throughout, row-major
-  // cell order, greedy spacing against sites already placed (hand-placed
-  // sites first). Expected sites per cell = perKm2 * cellVox^2 / 1e8 (a km is
-  // 10,000 voxels at 0.1 m); the roll is `hash % 1e6 < that * 1e6`.
+  // SITE-cell order, greedy spacing against sites already placed (hand-placed
+  // sites first). Rolled once per SITE cell (siteCellLog2; map v2 -- the biome
+  // plane is finer, and a roll per biome cell would multiply every density by
+  // 16): expected sites per cell = perKm2 * cellVox^2 / 1e8 (a km is 10,000
+  // voxels at 0.1 m); the roll is `hash % 1e6 < that * 1e6`. The cell counts
+  // as the rule's biome when the biome CELL under its centre is (no warp).
+  // minSpacing is voxels and defaults to one site cell.
   if (j.contains("rules") && j["rules"].is_array()) {
-    const int cellVox = 1 << out.cellLog2;
+    const int cellVox = siteVox;
     for (const json& ru : j["rules"]) {
       if (!ru.is_object() || ru.value("kind", "") != "stamp") continue;
       const std::string tpl = ru.value("template", "");
@@ -1455,18 +1476,19 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       const uint32_t salt = static_cast<uint32_t>(ru.value("salt", 0));
       const std::string rid = ru.value("id", tpl);
       int placed = 0;
-      for (int cz = 0; cz < out.height; cz++)
-        for (int cx = 0; cx < out.width; cx++) {
-          const size_t i = static_cast<size_t>(cz) * out.width + cx;
-          if (out.biome[i] != static_cast<uint8_t>(bi->second)) continue;
+      for (int cz = 0; cz < out.siteH; cz++)
+        for (int cx = 0; cx < out.siteW; cx++) {
+          const int ccx = ((cx - out.siteOriginX) << out.siteCellLog2) + cellVox / 2;
+          const int ccz = ((cz - out.siteOriginZ) << out.siteCellLog2) + cellVox / 2;
+          if (out.BiomeCellAt(ccx, ccz) != static_cast<uint8_t>(bi->second)) continue;
           const uint32_t h = rng::Hash3(seed ^ salt ^ 0x51735u, static_cast<uint32_t>(cx),
                                         static_cast<uint32_t>(cz));
           if (h % 1000000u >= thr) continue;
           // the site: cell centre, jittered by up to a quarter cell
           const int jx = static_cast<int>((h >> 20) % static_cast<uint32_t>(cellVox / 2)) - cellVox / 4;
           const int jz = static_cast<int>((h >> 10) % static_cast<uint32_t>(cellVox / 2)) - cellVox / 4;
-          const int wx = ((cx - out.originCellX) << out.cellLog2) + cellVox / 2 + jx;
-          const int wz = ((cz - out.originCellZ) << out.cellLog2) + cellVox / 2 + jz;
+          const int wx = ccx + jx;
+          const int wz = ccz + jz;
           bool tooClose = false;
           for (const WorldMapData::StampSite& o : out.sites)
             if (o.kind != kSiteClearing &&   // a clearing's (x, z) is a corner, and it keeps nothing out
@@ -1539,23 +1561,23 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       int c0x, c0z, c1x, c1z;
       out.CellOf(lx - st.indexReach, lz - st.indexReach, &c0x, &c0z);
       out.CellOf(hx + st.indexReach, hz + st.indexReach, &c1x, &c1z);
-      for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.height - 1); cz++)
-        for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.width - 1); cx++)
-          byCell[static_cast<size_t>(cz) * out.width + cx].push_back(static_cast<uint32_t>(si + 1));
+      for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.siteH - 1); cz++)
+        for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.siteW - 1); cx++)
+          byCell[static_cast<size_t>(cz) * out.siteW + cx].push_back(static_cast<uint32_t>(si + 1));
     }
-    out.siteIndex.assign(cells, 0u);
+    out.siteIndex.assign(static_cast<size_t>(out.siteW) * out.siteH, 0u);
     out.siteLists.assign(1, 0u);   // offset 0 = "no site"
     std::map<std::vector<uint32_t>, uint32_t> shared;
     for (const auto& kv : byCell) {
       const std::vector<uint32_t>& ids = kv.second;
       if (ids.size() > kSiteCellMax) {
-        const int cx = static_cast<int>(kv.first % static_cast<size_t>(out.width));
-        const int cz = static_cast<int>(kv.first / static_cast<size_t>(out.width));
+        const int cx = static_cast<int>(kv.first % static_cast<size_t>(out.siteW));
+        const int cz = static_cast<int>(kv.first / static_cast<size_t>(out.siteW));
         std::string names;
         for (uint32_t id : ids) names += (names.empty() ? "\"" : ", \"") + out.sites[id - 1].id + "\"";
         log += at + std::to_string(ids.size()) + " sites reach map cell (" + std::to_string(cx) + "," +
-               std::to_string(cz) + ") (world x " + std::to_string((cx - out.originCellX) << out.cellLog2) +
-               ", z " + std::to_string((cz - out.originCellZ) << out.cellLog2) + ", " + std::to_string(cellVox) +
+               std::to_string(cz) + ") (world x " + std::to_string((cx - out.siteOriginX) << out.siteCellLog2) +
+               ", z " + std::to_string((cz - out.siteOriginZ) << out.siteCellLog2) + ", " + std::to_string(siteVox) +
                " vox square): " + names + "; a cell holds at most " + std::to_string(kSiteCellMax) +
                " -- move one of them\n";
         return false;
@@ -1724,11 +1746,20 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
            ", at or above the treeline y" + std::to_string(out.terrain.treeline) + ": it will not grow");
 
+  // THE CONTENT HASH: map.json, then every tile file in (plane, tz, tx) order
+  // (name + bytes, so moving a tile is a change), then the sculpt layer and
+  // the structure refs. biomes.cpp's environment stamp and the save
+  // fingerprint hash the same files from disk.
   uint32_t hsh = 2166136261u;
-  hsh = FnvBytes(hsh, raw.data(), raw.size());
   {
     const std::string js = j.dump();
     hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(js.data()), js.size());
+  }
+  for (const auto& [key, bytes] : tileBytes) {
+    const std::string tn = std::to_string(std::get<0>(key)) + ":" + std::to_string(std::get<2>(key)) + "_" +
+                           std::to_string(std::get<1>(key));
+    hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(tn.data()), tn.size());
+    hsh = FnvBytes(hsh, bytes.data(), bytes.size());
   }
   // Only when the file exists, so a map without one reports what it did.
   if (!sculptRaw.empty()) hsh = FnvBytes(hsh, sculptRaw.data(), sculptRaw.size());
@@ -1761,6 +1792,12 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   j["softens"] = nSoft;
   j["routes"] = nRoute;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
+  // Map v2: the extent and what the planes hold (authored tiles; the rest
+  // are the planes' defaults).
+  j["extent"] = {m.extentX0, m.extentZ0, m.extentW, m.extentH};
+  j["heightPosts"] = {m.heightPostsX, m.heightPostsZ};
+  j["heightTiles"] = m.heightTiles;
+  j["biomeTiles"] = m.biomeTiles;
   j["warnings"] = m.warnings;
   j["error"] = error;
   return j.dump();
@@ -1778,30 +1815,48 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   // and the twin reads WorldMapData's copy of the same words either way.
   for (uint32_t k = 0; k < kTerrainWords; k++) W[kHTerrainBaseHeight + k] = map.terrainWords[k];
   if (!map.Loaded()) return true;   // P0/P1 tools: records only, planes absent
-  W[kHCellLog2] = U(map.cellLog2);
-  W[kHWidth] = U(map.width);
-  W[kHHeight] = U(map.height);
-  W[kHOriginX] = U(map.originCellX);
-  W[kHOriginZ] = U(map.originCellZ);
+  W[kHSiteCellLog2] = U(map.siteCellLog2);
+  W[kHSiteW] = U(map.siteW);
+  W[kHSiteH] = U(map.siteH);
+  W[kHSiteOriginX] = U(map.siteOriginX);
+  W[kHSiteOriginZ] = U(map.siteOriginZ);
   W[kHSeaLevelY] = U(map.seaLevelY);
-  W[kHOceanFade] = U(map.oceanFadeCells);
+  W[kHEdgeFade] = U(map.edgeFadeVox);
   W[kHWarpAmp] = U(map.warpAmpVox);
-  W[kHOceanBiome] = U(map.oceanBiome);
+  W[kHBiomeDefault] = U(map.biomeDefault);
   W[kHPadX0] = U(map.padX0);
   W[kHPadZ0] = U(map.padZ0);
   W[kHPadX1] = U(map.padX1);
   W[kHPadZ1] = U(map.padZ1);
+  W[kHExtentX0] = U(map.extentX0);
+  W[kHExtentZ0] = U(map.extentZ0);
+  W[kHExtentW] = U(map.extentW);
+  W[kHExtentH] = U(map.extentH);
+  W[kHHeightLog2] = U(map.heightLog2);
+  W[kHHeightPostsX] = U(map.heightPostsX);
+  W[kHHeightPostsZ] = U(map.heightPostsZ);
+  W[kHHeightDefault] = U(map.heightDefault);
+  W[kHBiomeLog2] = U(map.biomeLog2);
+  W[kHBiomePostsX] = U(map.biomePostsX);
+  W[kHBiomePostsZ] = U(map.biomePostsZ);
+  // The planes, DENSE (docs/PLAN_map_v2.md "GPU packing"; the loader refused
+  // anything past 64 MiB): biome ids four per word, height posts two i16 per
+  // word, low half first -- the sculpt block's packing, read by the same
+  // sign-extending shift (worldgen.wgsl wmHeightPost).
   W[kHBiomePlane] = U(static_cast<int>(W.size()));
   AppendPlane(W, map.biome);
-  W[kHLandformPlane] = U(static_cast<int>(W.size()));
-  AppendPlane(W, map.landform);
-  W[kHMoisturePlane] = U(static_cast<int>(W.size()));
-  AppendPlane(W, map.moisture);
+  W[kHHeightPlane] = U(static_cast<int>(W.size()));
+  {
+    const size_t at = W.size();
+    W.resize(at + (map.height.size() + 1) / 2, 0u);
+    for (size_t i = 0; i < map.height.size(); i++)
+      W[at + (i >> 1)] |= (static_cast<uint32_t>(static_cast<uint16_t>(map.height[i]))) << ((i & 1) * 16);
+  }
   // ---- sites: the index plane + lists, the records, then each stamp block ----
   // One word per cell (the list's buffer offset, 0 = none), then the shared
   // lists. No sites at all packs no plane: kHSiteIndex stays 0 and every
   // reader's list walk ends at its first read.
-  if (!map.sites.empty() && map.siteIndex.size() == static_cast<size_t>(map.width) * map.height) {
+  if (!map.sites.empty() && map.siteIndex.size() == static_cast<size_t>(map.siteW) * map.siteH) {
     const size_t plane0 = W.size();
     W[kHSiteIndex] = U(static_cast<int>(plane0));
     W.resize(plane0 + map.siteIndex.size(), 0u);
@@ -1859,10 +1914,12 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   }
   W[kHContentHash] = 0u;
   W[kHContentHash] = FnvWords(W) ^ map.contentHash;
-  std::printf("world map: '%s' %dx%d cells of %d vox, origin cell (%d,%d), %zu palette, "
-              "content %08x\n",
-              map.name.c_str(), map.width, map.height, 1 << map.cellLog2,
-              map.originCellX, map.originCellZ, map.palette.size(), W[kHContentHash]);
+  std::printf("world map: '%s' extent (%d,%d)+(%d,%d), height %dx%d posts @%d vox (%d tiles), "
+              "biome %dx%d @%d vox (%d tiles), %zu palette, buffer %.1f MiB, content %08x\n",
+              map.name.c_str(), map.extentX0, map.extentZ0, map.extentW, map.extentH, map.heightPostsX,
+              map.heightPostsZ, 1 << map.heightLog2, map.heightTiles, map.biomePostsX, map.biomePostsZ,
+              1 << map.biomeLog2, map.biomeTiles, map.palette.size(), W.size() * 4.0 / (1 << 20),
+              W[kHContentHash]);
   return true;
 }
 

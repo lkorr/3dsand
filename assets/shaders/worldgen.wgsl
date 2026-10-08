@@ -358,18 +358,16 @@ const GROUND_COVER : bool = VEGETATION && TUNE_GROUND_COVER != 0u;
 // numbers in assets/biomes/<name>.json `terrain.curve` plus three multipliers
 // on the map's fine octaves (`terrain.hill / detail / grain`, Q8, 256 = the
 // map's own amplitude). They live in the biome RECORD (WM_B_CURVE_KNOT0..8,
-// WM_B_HILL_MUL ..) and a column reads them from the FOUR MAP CELLS around it,
-// bilinearly, on the landform plane's own lattice (cell values at cell
-// centres, mapLandformQ8's arithmetic exactly) -- so two biomes' curves
-// crossfade over a whole cell (102 m) and never meet on a cliff. Tier A: no
-// seed anywhere in here; the cells are the map's. The old noise band, its
-// three thresholds and the +-18-unit crossfade went with the knobs.
+// WM_B_HILL_MUL ..) and a column reads them from the FOUR BIOME CELLS around
+// it, bilinearly, on the biome plane's own lattice (map v2: cell values at
+// cell centres, 25.6 m cells) -- so two biomes' curves crossfade over a whole
+// cell and never meet on a cliff. Tier A: no seed anywhere in here; the cells
+// are the map's.
 //
-// The curve reshapes the COARSE SUM only -- the landform plane and the range
-// rung, the two that decide where the mountains and the basins are -- and
-// leaves hill/detail/grain to the multipliers. So a biome changes the LANDFORM
-// with the curve and the TEXTURE with the multipliers, which is the same split
-// `Land.slope` makes for the sediment wedge.
+// The curve reshapes the RANGE RUNG only (map v2, docs/PLAN_map_v2.md): the
+// AUTHORED height is the author's and no curve, fade or attenuation scales it.
+// A biome still decides "flat plains noise" vs "jagged noise" through the
+// curve, and the TEXTURE through the multipliers on hill/detail/grain.
 //
 // ---- NINE KNOTS, NOT EIGHT, AND WHY ---------------------------------------
 // Eight knots is SEVEN intervals, so the identity curve's knot values are
@@ -381,9 +379,8 @@ const GROUND_COVER : bool = VEGETATION && TUNE_GROUND_COVER != 0u;
 //
 // ---- THE DOMAIN -----------------------------------------------------------
 // One rung spans +-amp/2 (`octave` returns `((n - 8192) * amp) >> 14` and
-// `n - 8192` is +-8192; the landform plane's contribution is the same shape
-// over its range), so the coarse pair spans +-(landformRange + rangeAmp)/2
-// and that is the curve's input grid.
+// `n - 8192` is +-8192), so the range rung spans +-rangeAmp/2 and that is the
+// curve's input grid.
 //
 // ---- WHY THE IDENTITY IS BIT-EXACT ----------------------------------------
 // Four separate pieces of the arithmetic, and all four are load-bearing:
@@ -411,10 +408,9 @@ const GROUND_COVER : bool = VEGETATION && TUNE_GROUND_COVER != 0u;
 const CURVE_KNOTS : i32 = 9;
 const CURVE_SEGS  : i32 = 8;
 
-// The four map cells around a column and where the column sits between them:
-// the landform plane's lattice (cell values at cell CENTRES), spelled exactly
-// as mapLandformQ8 spells it, so the curve blends on the same grid the relief
-// it reshapes is drawn on.
+// The four biome cells around a column and where the column sits between
+// them: the biome plane's lattice, cell values at cell CENTRES (a post's cell
+// spans [post, post + cell), so its centre is half a cell past the post).
 struct BiomeMix {
   b00 : u32,
   b10 : u32,
@@ -424,28 +420,23 @@ struct BiomeMix {
   fz : i32,
   l : u32,
 };
-fn wmBiomeCellId(cx : i32, cz : i32) -> u32 {
-  let w = i32(worldMap[WM_H_WIDTH]);
-  let h = i32(worldMap[WM_H_HEIGHT]);
-  let c = vec2<i32>(clamp(cx, 0, w - 1), clamp(cz, 0, h - 1));
-  return wmPlaneAt(worldMap[WM_H_BIOME_PLANE], c.x, c.y);
-}
 fn biomeMixAt(x : i32, z : i32) -> BiomeMix {
   var m : BiomeMix;
-  let l = worldMap[WM_H_CELL_LOG2];
+  let l = worldMap[WM_H_BIOME_LOG2];
   let half = 1 << (l - 1u);
-  let mx = x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l);
-  let mz = z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l);
+  let lo = wmExtentLo();
+  let mx = x - half - lo.x;
+  let mz = z - half - lo.y;
   let cx = mx >> l;
   let cz = mz >> l;
   let mask = (1 << l) - 1;
   m.fx = mx & mask;
   m.fz = mz & mask;
   m.l = l;
-  m.b00 = wmBiomeCellId(cx, cz);
-  m.b10 = wmBiomeCellId(cx + 1, cz);
-  m.b01 = wmBiomeCellId(cx, cz + 1);
-  m.b11 = wmBiomeCellId(cx + 1, cz + 1);
+  m.b00 = wmBiomePost(cx, cz);
+  m.b10 = wmBiomePost(cx + 1, cz);
+  m.b01 = wmBiomePost(cx, cz + 1);
+  m.b11 = wmBiomePost(cx + 1, cz + 1);
   return m;
 }
 fn mixI(m : BiomeMix, v00 : i32, v10 : i32, v01 : i32, v11 : i32) -> i32 {
@@ -460,7 +451,7 @@ fn curveKnotAt(m : BiomeMix, i : i32) -> i32 {
   return mixI(m, wmBiomeI(m.b00, w), wmBiomeI(m.b10, w), wmBiomeI(m.b01, w), wmBiomeI(m.b11, w));
 }
 fn curveHi() -> i32 {
-  return max((wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE) + wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE)) / 2, 1);
+  return max(wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE) / 2, 1);
 }
 
 // Fritsch-Carlson, for uniformly spaced knots: the harmonic mean of the two
@@ -574,10 +565,13 @@ struct Land {
 // plain fBm at this depth would put the entire world above the CA's angle of
 // repose (exactly 1 voxel/column) and nothing loose could ever come to rest.
 //
-// Ranges, for the i32 headroom: `n - 8192` is +-8192, amp <= 2048 after the
-// LoadTuning clamp, so the numerator peaks at 1.7e7 and `att` at 256 takes the
-// product to 4.3e9/256 -- the shifts are ordered so the >> 14 lands FIRST and
-// the intermediate never exceeds 2^25.
+// Ranges, for the i32 headroom. `amp` is at most 65536: a map amplitude is
+// clamped to kNoiseAmpMax (4096) by worldmap.cpp TerrainWords and a biome
+// multiplier to 4096 Q8 (16x). Then `(n - 8192) * amp` peaks at 5.4e8, the
+// >> 14 lands FIRST so `* att` (<= 256) stays under 2^23, and the gradient's
+// `n.dx * amp` peaks at 24575 * 65536 = 1.6e9 (n.dx <= 1.5 * 16383). `g` is
+// clamped to 32767 so `g * g` stays under 2^30 however steep the AUTHORED
+// slope it is handed (mapHeightAt clamps its own gradient to 2^20).
 struct Oct {
   dev : i32,   // centred contribution, whole voxels
   gx  : i32,   // its own gradient, Q8
@@ -590,7 +584,7 @@ fn octave(x : i32, z : i32, csl : u32, amp : i32,
   // att = 65536 / (256 + atten*|g|^2/256), i.e. Q8 with att == 256 meaning
   // "unattenuated". ONE divide per octave, which is still fewer than the five
   // the legacy vnoise did per SAMPLE.
-  let g = abs(gx) + abs(gz);
+  let g = min(abs(gx) + abs(gz), 32767);
   let att = 65536 / (256 + ((wmTerrain(WM_H_TERRAIN_FBM_ATTEN) * ((g * g) >> 8)) >> 8));
   var o : Oct;
   o.dev = ((((n.n - 8192) * amp) >> 14) * att) >> 8;
@@ -601,73 +595,162 @@ fn octave(x : i32, z : i32, csl : u32, amp : i32,
   return o;
 }
 
-// The continental rung, FROM THE MAP (P4): where the old o0 octave sampled
-// noise, this reads the painted landform plane. map.json terrain
-// .landformRangeVox (WM_H_TERRAIN_LANDFORM_RANGE) is the height span the full
-// 0..255 landform range maps to, centred on 128 -- so the map says how tall
-// the world is AND where. Its own function inside the mirror so the two
-// sides spell the same three lines; the plane readers it calls live outside.
-fn landformOctave(x : i32, z : i32) -> Oct {
+// ---- THE AUTHORED HEIGHT (map v2): the height plane, Catmull-Rom ----------
+// The author paints ABSOLUTE heights in voxels on posts every 2^l voxels
+// (planes.height, l = 6: 6.4 m). The ground is interpolated through them with
+// a Catmull-Rom spline, x first (four rows), then z: INTERPOLATING (exactly
+// the post's value on a post) and C1 (the gradient is continuous across post
+// edges -- a gradient JUMP would turn into a height STEP through the octave
+// ladder's derivative attenuation, which is why the v1 piecewise-constant
+// landform gradient had to go).
+//
+// Integer Horner in the post fraction f / 2^l, f in 0..2^l - 1, floored at each
+// step. f == 0 multiplies every term away, so a post's value is exact, which
+// is the gate's "authored height at a post" assertion. crStep returns
+// (2 p(t), d(2 p)/dt) in its inputs' units: the rows take posts in Q2 (* 4)
+// and give Q3 values and Q3-per-post slopes; the column takes those and gives
+// Q4. The x-slopes are turned into the ladder's Q8-per-voxel units FIRST
+// (crGrad) and then blended in z by the same spline, which is d/dx of the
+// bicubic exactly (up to the floors).
+//
+// THE i32 BOUNDS (heights |p| <= 32000 by the loader, l <= 6 so f <= 63; the
+// worst case of every term, not the typical one):
+//   rows   P = p * 4 <= 128000. a3 <= 8P, a2 <= 12P; Horner's c stays under
+//          |a2| + |a3| = 2.6e6 and d under 2|a2| + 3|a3| = 6.1e6, so c * f,
+//          d * f <= 3.9e8. Values |2P(t)| <= 2.5 * 128000 (the spline's
+//          weights sum to at most 1.25 in magnitude) + 3 floors.
+//   column R <= 320003 (Q3). a3 <= 2.6e6, a2 <= 3.9e6: c * f <= 4.1e8,
+//          d * f <= (2 * 3.9e6 + 3 * 2.6e6) * 63 = 9.8e8.
+//   slopes a row's d(2P)/dt <= 6 * 128000 (the derivative weights' abs sum
+//          is at most 6 and they sum to 0) + 3; crGrad's d * 32 <= 2.5e7.
+//          Clamped to 2^20 (4096 voxels per voxel, far past any terrain) so
+//          the z-blend of slopes, d * f <= (2 * 12 + 3 * 8) * 2^20 * 63 /
+//          ... stays inside: |a2| <= 12 * 2^20, |a3| <= 8 * 2^20, c * f <=
+//          (20 * 2^20) * 63 = 1.3e9.
+fn crStep(p0 : i32, p1 : i32, p2 : i32, p3 : i32, f : i32, l : u32) -> vec2<i32> {
+  let a1 = p2 - p0;
+  let a2 = 2 * p0 - 5 * p1 + 4 * p2 - p3;
+  let a3 = 3 * (p1 - p2) + p3 - p0;
+  var c = a2 + ((a3 * f) >> l);
+  c = a1 + ((c * f) >> l);
+  var d = 2 * a2 + ((3 * a3 * f) >> l);
+  d = a1 + ((d * f) >> l);
+  return vec2<i32>(2 * p1 + ((c * f) >> l), d);
+}
+// One row of four posts at post row k, around post column i.
+fn crRow(i : i32, k : i32, f : i32, l : u32) -> vec2<i32> {
+  return crStep(wmHeightPost(i - 1, k) * 4, wmHeightPost(i, k) * 4, wmHeightPost(i + 1, k) * 4,
+                wmHeightPost(i + 2, k) * 4, f, l);
+}
+// A row's Q3-per-post slope as the ladder's Q8 per voxel, clamped (above).
+fn crGrad(g : i32, l : u32) -> i32 {
+  return clamp((g * 32) >> l, -1048576, 1048576);
+}
+// The plane at a column INSIDE the extent (mapHeightAt clamps first): the
+// post cell holding it, the 4 x 4 posts around that cell (clamped reads at
+// the plane's edge), the height in whole voxels (floored) and its gradient.
+fn heightPlaneAt(x : i32, z : i32) -> Oct {
+  let l = wmHeightLog2();
+  let lo = wmExtentLo();
+  let mask = (1 << l) - 1;
+  let i = (x - lo.x) >> l;
+  let k = (z - lo.y) >> l;
+  let fx = (x - lo.x) & mask;
+  let fz = (z - lo.y) & mask;
+  let r0 = crRow(i, k - 1, fx, l);
+  let r1 = crRow(i, k, fx, l);
+  let r2 = crRow(i, k + 1, fx, l);
+  let r3 = crRow(i, k + 2, fx, l);
+  let v = crStep(r0.x, r1.x, r2.x, r3.x, fz, l);
+  let gx = crStep(crGrad(r0.y, l), crGrad(r1.y, l), crGrad(r2.y, l), crGrad(r3.y, l), fz, l);
   var o : Oct;
-  o.dev = ((mapLandformQ8(x, z) - 32768) * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> 16;
-  o.gx = mapLandformGx(x, z);
-  o.gz = mapLandformGz(x, z);
+  o.dev = v.x >> 4u;
+  o.gx = clamp(gx.x >> 1u, -1048576, 1048576);
+  o.gz = clamp((v.y * 16) >> l, -1048576, 1048576);
+  return o;
+}
+// THE AUTHORED HEIGHT at any column: `dev` is the ABSOLUTE height in voxels
+// (not a deviation), gx / gz its gradient in the ladder's Q8 per voxel.
+// Outside the extent it eases from the edge value (the plane read at the
+// clamped column) to planes.height.default over edgeFadeVox, a smoothstep in
+// the Chebyshev distance past the edge: continuous everywhere, C1 except ON
+// the extent's edge itself, where the outward slope of the edge post meets
+// the fade's zero slope (the map's own coast; its gradient only feeds the
+// noise's attenuation and the sediment gate). No plane at all (a tool that
+// packed records only) is flat ground at the terrain's baseHeight.
+//   dh * (s >> 1) <= 64000 * 16384 = 1.05e9; dh * (vsmoothd >> 4) <= 64000 *
+//   3072 = 2.0e8; gx * keep <= 2^20 * 1024 = 2^30.
+fn mapHeightAt(x : i32, z : i32) -> Oct {
+  var o : Oct;
+  if (!wmHasHeight()) {
+    o.dev = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT);
+    o.gx = 0;
+    o.gz = 0;
+    return o;
+  }
+  let lo = wmExtentLo();
+  let sz = wmExtentSize();
+  let cx = clamp(x, lo.x, lo.x + sz.x);
+  let cz = clamp(z, lo.y, lo.y + sz.y);
+  let e = heightPlaneAt(cx, cz);
+  let ox = abs(x - cx);
+  let oz = abs(z - cz);
+  let d = max(ox, oz);
+  if (d == 0) { return e; }
+  let fade = wmEdgeFade();
+  o.dev = wmHeightDefault();
+  o.gx = 0;
+  o.gz = 0;
+  if (d >= fade) { return o; }
+  let t = (d * 32768) / fade;
+  let s = vsmooth(t);
+  let dh = wmHeightDefault() - e.dev;
+  let ds = (dh * (vsmoothd(t) >> 4)) / (8 * fade);
+  let keep = (32768 - s) >> 5;
+  o.dev = e.dev + ((dh * (s >> 1)) >> 14);
+  o.gx = ((select(e.gx, 0, ox > 0) * keep) >> 10) + select(0, select(-ds, ds, x > cx), ox >= oz);
+  o.gz = ((select(e.gz, 0, oz > 0) * keep) >> 10) + select(0, select(-ds, ds, z > cz), oz > ox);
   return o;
 }
 
 fn landAt(x : i32, z : i32, seed : u32) -> Land {
-  // ---- five octaves, lacunarity 4, persistence 1/4 ----
-  // Every rung has the same amplitude/wavelength ratio of 0.5, which is the
-  // whole design: detail without extra slope. Each one sees the gradient of
-  // everything coarser than it, so the accumulation order below is load-bearing
-  // and is written out rather than looped — world.cpp has to mirror it, and a
-  // mirror of "whatever the compiler unrolled" is not a mirror.
+  // ---- the AUTHORED height, then four octaves of noise on it ----
+  // bed = authored + range rung (biome curve, calm fade) + hill / detail /
+  // grain (biome multipliers, soften sites) + the sculpt layer. The authored
+  // height is the author's: no curve, fade or attenuation scales it (the
+  // `worldmap` gate's post-exactness assertion). Every noise rung sees the
+  // gradient of everything coarser than it -- the authored height's
+  // CONTINUOUS gradient first -- so the accumulation order below is
+  // load-bearing and is written out rather than looped: world.cpp has to
+  // mirror it, and a mirror of "whatever the compiler unrolled" is not a
+  // mirror. Lacunarity 4, persistence 1/4: every rung has the same
+  // amplitude/wavelength ratio of 0.5, detail without extra slope.
   //
   // EVERY NUMBER IS THE MAP'S: map.json `terrain` through the worldMap
-  // header (wmTerrain), and the biome's own relief record through the four
-  // map cells around the column (biomeMixAt, read ONCE here and handed to the
-  // curve and the multipliers). Nothing in this function is a tuning knob.
+  // header (wmTerrain), the height plane, and the biome's own relief record
+  // through the four biome cells around the column (biomeMixAt, read ONCE
+  // here and handed to the curve and the multipliers).
   let bm = biomeMixAt(x, z);
   let rl = biomeReliefAt(bm);
-  let o0 = landformOctave(x, z);
+  let au = mapHeightAt(x, z);
   let o1 = octave(x, z, wmTerrainU(WM_H_TERRAIN_RANGE_LOG2), wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE),
-                  o0.gx, o0.gz, seed ^ 2u);
-  // ---- THE PER-BIOME HEIGHT CURVE ----
-  // HERE, and only here: the two coarse rungs are the landform, and the three
-  // fine ones are the texture on it. Reshaping the sum of the coarse pair is
-  // what lets a meadow be flat plains and a pine highland be jagged without
-  // either one changing how the ground FEELS underfoot.
-  //
-  // `cv.y` is the curve's own slope in Q8 and it scales the accumulated
-  // gradient, not the deviation: iq's attenuation divides each finer rung by
-  // 1 + atten*|g|^2, and if `g` still described the pre-curve ladder then a
-  // biome that flattened its landform would keep the hill octave attenuated as
-  // though the mountains were still there. Identity gives exactly 256, so
-  // (g * 256) >> 8 == g and nothing moves.
-  let cv = biomeCurve(bm, o0.dev + o1.dev);
-  let g1x = ((o0.gx + o1.gx) * cv.y) >> 8;
-  let g1z = ((o0.gz + o1.gz) * cv.y) >> 8;
-  // The three fine rungs, each scaled by the biome's Q8 multiplier (256 = the
-  // map's amplitude; a flatter meadow authors 128 on the hills).
-  let o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
-                  g1x, g1z, seed ^ 3u);
-  let g2x = g1x + o2.gx;
-  let g2z = g1z + o2.gz;
-  let o3 = octave(x, z, wmTerrainU(WM_H_TERRAIN_DETAIL_LOG2), (wmTerrain(WM_H_TERRAIN_DETAIL_AMPLITUDE) * rl.detail) >> 8,
-                  g2x, g2z, seed ^ 4u);
-  let g3x = g2x + o3.gx;
-  let g3z = g2z + o3.gz;
-  let o4 = octave(x, z, wmTerrainU(WM_H_TERRAIN_GRAIN_LOG2), (wmTerrain(WM_H_TERRAIN_GRAIN_AMPLITUDE) * rl.grain) >> 8,
-                  g3x, g3z, seed ^ 5u);
+                  au.gx, au.gz, seed ^ 2u);
+  // ---- THE PER-BIOME HEIGHT CURVE, on the range rung ----
+  // `cv.y` is the curve's own slope in Q8 and it scales the rung's gradient,
+  // not the deviation: iq's attenuation divides each finer rung by
+  // 1 + atten*|g|^2, and if `g` still described the pre-curve rung then a
+  // biome that flattened its noise would keep the hill octave attenuated as
+  // though the ridges were still there. Identity gives exactly 256.
+  let cv = biomeCurve(bm, o1.dev);
 
   // ---- THE CALM HOME AREA ----
-  // Only the TWO COARSE octaves fade toward the SPAWN SITE (map.json sites[],
-  // kind "spawn"; spawnCentre() reads it from the header). Fading the whole
-  // deviation would pin spawn to a mathematically exact plane 64 m across —
-  // which is not "calm", it is a dinner plate, and it would also make the
-  // terrain gate's pass C a test of a constant. The three fine rungs stay at
-  // full amplitude, so the home area is rolling country of about the shape the
-  // pre-overhaul world had, sitting at terrain.homeArea.y.
+  // Only the RANGE RUNG -- noise -- fades toward the SPAWN SITE (map.json
+  // sites[], kind "spawn"; spawnCentre() reads it from the header); the
+  // authored height under it is the author's (map v2: the converter baked v1's
+  // fade toward homeArea.y into the plane). Fading the fine rungs too would pin
+  // spawn to the authored surface exactly -- which is not "calm", it is a
+  // dinner plate, and it would also make the terrain gate's pass C a test of a
+  // constant. The three fine rungs stay at full amplitude.
   //
   // CHEBYSHEV distance, so no isqrt; a square region has its steepest boundary
   // on the axes and its longest on the diagonal, which is why the gate's A4
@@ -693,12 +776,27 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
     wh = (dh * 16384) / fade;
   }
   let ws = vsmooth(min(w, wh) << 1) >> 1;           // Q14 smoothstep of the ramp
-  let homeY = wmTerrain(WM_H_TERRAIN_HOME_Y);
-  let coarse = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT) + cv.x - homeY;
+  // The faded rung's gradient joins the authored one. Clamped before the
+  // ws product: o1.gx * cv.y <= 196600 * 4096 = 8e8, and 2^16 * 16384 = 2^30.
+  let g1x = au.gx + ((clamp((o1.gx * cv.y) >> 8, -65536, 65536) * ws) >> 14);
+  let g1z = au.gz + ((clamp((o1.gz * cv.y) >> 8, -65536, 65536) * ws) >> 14);
+  // The three fine rungs, each scaled by the biome's Q8 multiplier (256 = the
+  // map's amplitude; a flatter meadow authors 128 on the hills).
+  let o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
+                  g1x, g1z, seed ^ 3u);
+  let g2x = g1x + o2.gx;
+  let g2z = g1z + o2.gz;
+  let o3 = octave(x, z, wmTerrainU(WM_H_TERRAIN_DETAIL_LOG2), (wmTerrain(WM_H_TERRAIN_DETAIL_AMPLITUDE) * rl.detail) >> 8,
+                  g2x, g2z, seed ^ 4u);
+  let g3x = g2x + o3.gx;
+  let g3z = g2z + o3.gz;
+  let o4 = octave(x, z, wmTerrainU(WM_H_TERRAIN_GRAIN_LOG2), (wmTerrain(WM_H_TERRAIN_GRAIN_AMPLITUDE) * rl.grain) >> 8,
+                  g3x, g3z, seed ^ 5u);
   // ---- THE SCULPT LAYER (P5): the author's offset, added whole ----
   // AFTER the octaves, their attenuation and the calm-area fade, and scaled
   // by none of them: an author who raises a hill by 12 m gets 12 m, in the
-  // home area or on a mountain. BEFORE the wedge (which thins on the sculpted
+  // home area or on a mountain -- the authored height plane's rule at the
+  // sculpt layer's 0.8 m. BEFORE the wedge (which thins on the sculpted
   // slope, below), and so before the ponds, the sea test and the site pads,
   // which all read this function's h. An empty layer is dev == gx == gz == 0,
   // and every line below reads what it read before P5.
@@ -707,11 +805,11 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // The three LOCAL rungs scaled by the site's Q8 factors (256 everywhere
   // else, where every product below is exact and nothing moves): a village
   // keeps the biome's swells at a walkable fraction and loses the sub-metre
-  // grain, instead of being planed flat. The landform and range rungs are
-  // not touched, so the village keeps its place on the hill.
+  // grain, instead of being planed flat. The authored height and the range
+  // rung are not touched, so the village keeps its place on the hill.
   let sf = softenAt(x, z);
-  let bed = homeY + ((o2.dev * sf.hill) >> 8) + ((o3.dev * sf.bump) >> 8) + ((o4.dev * sf.grain) >> 8)
-          + ((coarse * ws) >> 14) + sp.dev;
+  let bed = au.dev + ((cv.x * ws) >> 14) + ((o2.dev * sf.hill) >> 8) + ((o3.dev * sf.bump) >> 8)
+          + ((o4.dev * sf.grain) >> 8) + sp.dev;
 
   // ---- THE SEDIMENT WEDGE ----
   // Low flat ground carries metres of loose dirt over gravel; ridges carry
@@ -725,9 +823,9 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // voxels lower. Gating on slope, and ramping the wedge continuously to zero
   // as that slope is approached, is what keeps the generated world at rest.
   //
-  // `Land.slope` IS THE LANDFORM GRADIENT — `g2`, accumulated through the hill
-  // octave and deliberately NOT through detail and grain. Both of its consumers
-  // want that and neither wants the roughness:
+  // `Land.slope` IS THE LANDFORM GRADIENT — the authored height's continuous
+  // gradient plus the range and hill rungs', and deliberately NOT detail and
+  // grain. Both of its consumers want that and neither wants the roughness:
   //
   //   * THE WEDGE. Its own spatial derivative is
   //     (sed / sedSlope) * d(slope)/dcolumn, and d(slope)/dcolumn for an octave
@@ -1286,21 +1384,21 @@ fn taSpecies(sp : i32, w : u32) -> u32 {
 // cover rows appended after the records. Everything is already an integer the
 // kernel can use: material IDs resolved at load, heights in voxels, chances as
 // 1-in-N, slopes in Q8.
-const WM_H_CELL_LOG2     : u32 = 2u;
-const WM_H_WIDTH         : u32 = 3u;
-const WM_H_HEIGHT        : u32 = 4u;
-const WM_H_ORIGIN_X      : u32 = 5u;
-const WM_H_ORIGIN_Z      : u32 = 6u;
+const WM_H_SITE_CELL_LOG2 : u32 = 2u;
+const WM_H_SITE_W        : u32 = 3u;
+const WM_H_SITE_H        : u32 = 4u;
+const WM_H_SITE_ORIGIN_X : u32 = 5u;
+const WM_H_SITE_ORIGIN_Z : u32 = 6u;
 const WM_H_SEA_LEVEL_Y   : u32 = 7u;
-const WM_H_OCEAN_FADE    : u32 = 8u;
+const WM_H_EDGE_FADE     : u32 = 8u;
 const WM_H_WARP_AMP      : u32 = 9u;
 const WM_H_BIOME_COUNT   : u32 = 10u;
 const WM_H_BIOME_RECORDS : u32 = 11u;
 const WM_H_BIOME_PLANE   : u32 = 12u;
-const WM_H_LANDFORM_PLANE: u32 = 13u;
-const WM_H_MOISTURE_PLANE: u32 = 14u;
+const WM_H_HEIGHT_PLANE  : u32 = 13u;
+const WM_H_HEIGHT_DEFAULT: u32 = 14u;
 const WM_H_MAX_COVER_H   : u32 = 20u;
-const WM_H_OCEAN_BIOME   : u32 = 21u;
+const WM_H_BIOME_DEFAULT : u32 = 21u;
 const WM_H_SITE_INDEX    : u32 = 15u;
 const WM_H_SITE_TABLE    : u32 = 16u;
 const WM_H_SITE_COUNT    : u32 = 17u;
@@ -1318,7 +1416,6 @@ const WM_H_POND_BAND     : u32 = 31u;   // the widest shore/berm band any preset
 // Read inside the height mirror by name (wmTerrain / wmTerrainU), spelled the
 // same in world.cpp. Voxels at the live voxel size, log2 shifts, Q8 counts.
 const WM_H_TERRAIN_BASE_HEIGHT      : u32 = 32u;
-const WM_H_TERRAIN_LANDFORM_RANGE   : u32 = 33u;
 const WM_H_TERRAIN_RANGE_AMPLITUDE  : u32 = 34u;
 const WM_H_TERRAIN_RANGE_LOG2       : u32 = 35u;
 const WM_H_TERRAIN_HILL_AMPLITUDE   : u32 = 36u;
@@ -1341,6 +1438,17 @@ const WM_H_TERRAIN_TREELINE         : u32 = 52u;
 const WM_H_TERRAIN_REF_VPM          : u32 = 53u;
 // ---- the sculpt layer (worldmap.h kHSculpt / kSculpt* / kSc_*; P5) ----
 const WM_H_SCULPT                   : u32 = 54u;   // block offset, 0 = no layer
+// ---- map v2: the extent and the two fine planes (worldmap.h kHExtent* / kHHeight* / kHBiome*) ----
+const WM_H_EXTENT_X0                : u32 = 55u;
+const WM_H_EXTENT_Z0                : u32 = 56u;
+const WM_H_EXTENT_W                 : u32 = 57u;
+const WM_H_EXTENT_H                 : u32 = 58u;
+const WM_H_HEIGHT_LOG2              : u32 = 59u;
+const WM_H_HEIGHT_POSTS_X           : u32 = 60u;
+const WM_H_HEIGHT_POSTS_Z           : u32 = 61u;
+const WM_H_BIOME_LOG2               : u32 = 62u;
+const WM_H_BIOME_POSTS_X            : u32 = 63u;
+const WM_H_BIOME_POSTS_Z            : u32 = 64u;
 const WM_SCULPT_SPACING_LOG2        : u32 = 3u;    // 8 voxels between samples
 const WM_SCULPT_TILE_LOG2           : u32 = 5u;    // 32 samples per tile side
 const WM_SCULPT_REGION_LOG2         : u32 = 2u;    // 4 tiles per directory region side
@@ -1585,22 +1693,46 @@ fn rollChance(h : u32, chance : u32) -> bool {
   return chance != 0u && (h % chance) == 0u;
 }
 
-// ---- the painted planes (P2) ------------------------------------------------
-// Four cells per word, little-endian; i = cz * width + cx (worldmap.h).
-fn wmPlaneAt(off : u32, cx : i32, cz : i32) -> u32 {
-  let i = u32(cz) * worldMap[WM_H_WIDTH] + u32(cx);
-  return (worldMap[off + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
+// ---- the painted planes (map v2) ---------------------------------------------
+// Dense, z-major, index = k * postsX + i (worldmap.h kHExtent*): the biome
+// plane four ids per word (little-endian), the height plane two i16 posts per
+// word (low half first; the sculpt block's packing and its sign-extending
+// shift). Post reads clamp to the plane, never wrap into the next row; the
+// C++ twins (world.cpp, WorldMapData::BiomePost / HeightPost) clamp the same.
+fn wmExtentLo() -> vec2<i32> {
+  return vec2<i32>(bitcast<i32>(worldMap[WM_H_EXTENT_X0]), bitcast<i32>(worldMap[WM_H_EXTENT_Z0]));
 }
-// World column -> plane cell. `>>` on a negative i32 is an arithmetic shift
-// in WGSL and in C++ (World::MapBiomeAt is the twin), so this floors.
+fn wmExtentSize() -> vec2<i32> {
+  return vec2<i32>(i32(worldMap[WM_H_EXTENT_W]), i32(worldMap[WM_H_EXTENT_H]));
+}
+fn wmBiomePost(i : i32, k : i32) -> u32 {
+  let px = i32(worldMap[WM_H_BIOME_POSTS_X]);
+  let idx = u32(clamp(k, 0, i32(worldMap[WM_H_BIOME_POSTS_Z]) - 1) * px + clamp(i, 0, px - 1));
+  return (worldMap[worldMap[WM_H_BIOME_PLANE] + (idx >> 2u)] >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+// The authored height plane's accessors, called by name from the mirrored
+// mapHeightAt (world.cpp spells the same names over WorldMapData).
+fn wmHasHeight() -> bool { return worldMap[WM_H_HEIGHT_PLANE] != 0u; }
+fn wmHeightLog2() -> u32 { return worldMap[WM_H_HEIGHT_LOG2]; }
+fn wmHeightDefault() -> i32 { return bitcast<i32>(worldMap[WM_H_HEIGHT_DEFAULT]); }
+fn wmEdgeFade() -> i32 { return max(i32(worldMap[WM_H_EDGE_FADE]), 1); }
+fn wmHeightPost(i : i32, k : i32) -> i32 {
+  let px = i32(worldMap[WM_H_HEIGHT_POSTS_X]);
+  let idx = u32(clamp(k, 0, i32(worldMap[WM_H_HEIGHT_POSTS_Z]) - 1) * px + clamp(i, 0, px - 1));
+  let w = worldMap[worldMap[WM_H_HEIGHT_PLANE] + (idx >> 1u)];
+  return bitcast<i32>(w << (16u - (idx & 1u) * 16u)) >> 16u;
+}
+// World column -> SITE cell (the site index's lattice, siteCellLog2). `>>` on
+// a negative i32 is an arithmetic shift in WGSL and in C++ (WorldMapData::
+// CellOf is the twin), so this floors.
 fn wmCellOf(x : i32, z : i32) -> vec2<i32> {
-  let l = worldMap[WM_H_CELL_LOG2];
-  return vec2<i32>((x >> l) + i32(worldMap[WM_H_ORIGIN_X]),
-                   (z >> l) + i32(worldMap[WM_H_ORIGIN_Z]));
+  let l = worldMap[WM_H_SITE_CELL_LOG2];
+  return vec2<i32>((x >> l) + i32(worldMap[WM_H_SITE_ORIGIN_X]),
+                   (z >> l) + i32(worldMap[WM_H_SITE_ORIGIN_Z]));
 }
 fn wmInside(c : vec2<i32>) -> bool {
-  return c.x >= 0 && c.y >= 0 && c.x < i32(worldMap[WM_H_WIDTH]) &&
-         c.y < i32(worldMap[WM_H_HEIGHT]);
+  return c.x >= 0 && c.y >= 0 && c.x < i32(worldMap[WM_H_SITE_W]) &&
+         c.y < i32(worldMap[WM_H_SITE_H]);
 }
 
 // ---- THE PAD BOX -------------------------------------------------------------
@@ -1669,7 +1801,7 @@ fn wmSiteList(x : i32, z : i32) -> u32 {
   if (plane == 0u) { return 0u; }
   let c = wmCellOf(x, z);
   if (!wmInside(c)) { return 0u; }
-  return worldMap[plane + u32(c.y) * worldMap[WM_H_WIDTH] + u32(c.x)];
+  return worldMap[plane + u32(c.y) * worldMap[WM_H_SITE_W] + u32(c.x)];
 }
 fn wmSiteN(lst : u32) -> u32 {
   if (lst == 0u) { return 0u; }
@@ -1986,77 +2118,10 @@ fn wmStampsCell(x : i32, y : i32, z : i32) -> u32 {
   return MAT_AIR;
 }
 
-// ---- THE LANDFORM PLANE (P4): the map owns the continental rung -----------
-// These are the ONLY readers of the landform plane and the sea level, and
-// they sit OUTSIDE the height mirror on purpose: the mirrored landAt calls
-// landformOctave()/seaLevelY() by name and the C++ twins (world.cpp, same
-// names, same arithmetic over the same bytes) are what World::TerrainHeight
-// runs. The `terrain` gate's C1 pass proves the two agree per voxel; the
-// token compare only has to see the call.
-//
-// Tier A, no seed: the plane is where the mountains ARE. Q8 bilinear over
-// the four cells around the column; outside the painted planes the value
-// fades to 0 (the ocean floor) over WM_H_OCEAN_FADE cells, so past the
-// coast the ground keeps falling and the sea fill below takes over. Clamped
-// reads: a cell index past the edge reads the edge cell, never the next
-// row, and the same clamp is spelled in the C++ twin.
+// The sea level, outside the height mirror like the plane readers: the
+// mirrored landAt / landColumnBare call seaLevelY() by name and world.cpp
+// spells the same.
 fn seaLevelY() -> i32 { return i32(worldMap[WM_H_SEA_LEVEL_Y]); }
-fn wmLandformCellQ8(cx : i32, cz : i32) -> i32 {
-  let w = i32(worldMap[WM_H_WIDTH]);
-  let h = i32(worldMap[WM_H_HEIGHT]);
-  let c = vec2<i32>(clamp(cx, 0, w - 1), clamp(cz, 0, h - 1));
-  return i32(wmPlaneAt(worldMap[WM_H_LANDFORM_PLANE], c.x, c.y)) << 8;
-}
-// Q8 landform at a column: 0..65280. Bilinear over the cell's four corners
-// (the cell value is its CENTRE), then the ocean fade past the plane's edge.
-fn mapLandformQ8(x : i32, z : i32) -> i32 {
-  if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 32768; }   // no planes: flat
-  let l = worldMap[WM_H_CELL_LOG2];
-  let half = 1 << (l - 1u);
-  let mx = x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l);
-  let mz = z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l);
-  let cx = mx >> l;
-  let cz = mz >> l;
-  let mask = (1 << l) - 1;
-  let fx = mx & mask;
-  let fz = mz & mask;
-  let c00 = wmLandformCellQ8(cx, cz);
-  let c10 = wmLandformCellQ8(cx + 1, cz);
-  let c01 = wmLandformCellQ8(cx, cz + 1);
-  let c11 = wmLandformCellQ8(cx + 1, cz + 1);
-  let a = c00 + (((c10 - c00) * fx) >> l);
-  let b = c01 + (((c11 - c01) * fx) >> l);
-  let v = a + (((b - a) * fz) >> l);
-  // outside the plane: how many cells past the edge, then the fade
-  let w = i32(worldMap[WM_H_WIDTH]);
-  let hh = i32(worldMap[WM_H_HEIGHT]);
-  let dOut = max(max(-cx, cx + 1 - w), max(-cz, cz + 1 - hh));
-  let fade = max(i32(worldMap[WM_H_OCEAN_FADE]), 1);
-  if (dOut <= 0) { return v; }
-  return (v * max(fade - dOut, 0)) / fade;
-}
-// Gradient of the landform contribution, in the octave's Q8-per-voxel units:
-// the cell-to-cell difference of the Q8 plane, scaled by the amplitude, over
-// one cell of voxels. Piecewise constant per cell; it only feeds the domain
-// warp of the finer rungs and the sediment slope gate.
-fn mapLandformGx(x : i32, z : i32) -> i32 {
-  if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 0; }
-  let l = worldMap[WM_H_CELL_LOG2];
-  let half = 1 << (l - 1u);
-  let cx = (x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l)) >> l;
-  let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
-  let d = wmLandformCellQ8(cx + 1, cz) - wmLandformCellQ8(cx, cz);
-  return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
-}
-fn mapLandformGz(x : i32, z : i32) -> i32 {
-  if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 0; }
-  let l = worldMap[WM_H_CELL_LOG2];
-  let half = 1 << (l - 1u);
-  let cx = (x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l)) >> l;
-  let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
-  let d = wmLandformCellQ8(cx, cz + 1) - wmLandformCellQ8(cx, cz);
-  return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
-}
 
 // ---- THE SCULPT LAYER (P5, worldmap.h kSculpt*): the author's own shape ------
 // A sparse, tiled, signed height offset in voxels, one sample every 8 voxels,
@@ -2127,23 +2192,22 @@ fn sculptOctave(x : i32, z : i32) -> Oct {
 fn biomeCellAt(x : i32, z : i32) -> u32 {
   let plane = worldMap[WM_H_BIOME_PLANE];
   if (plane == 0u) { return 0u; }
-  let c = wmCellOf(x, z);
-  if (!wmInside(c)) { return worldMap[WM_H_OCEAN_BIOME]; }
-  return wmPlaneAt(plane, c.x, c.y);
+  let lo = wmExtentLo();
+  let sz = wmExtentSize();
+  if (x < lo.x || z < lo.y || x >= lo.x + sz.x || z >= lo.y + sz.y) { return worldMap[WM_H_BIOME_DEFAULT]; }
+  let l = worldMap[WM_H_BIOME_LOG2];
+  return wmBiomePost((x - lo.x) >> l, (z - lo.y) >> l);
 }
 // THE BIOME, from the map: Tier A (the plane) is seed-independent; the
 // boundary warp is Tier B and takes the seed, so a region's EDGE wanders per
-// seed by up to warpAmp (<= cell/4, enforced by the loader) while its centre
-// stays put. Outside the painted planes the world is ocean.
+// seed by up to warpAmp (<= biome cell/4, enforced by the loader) while its
+// centre stays put. Outside the extent the world is the plane's default.
 fn mapBiomeAt(x : i32, z : i32, seed : u32) -> u32 {
-  let plane = worldMap[WM_H_BIOME_PLANE];
-  if (plane == 0u) { return 0u; }   // no planes uploaded (a tool with records only)
+  if (worldMap[WM_H_BIOME_PLANE] == 0u) { return 0u; }   // no planes uploaded (a tool with records only)
   let amp = i32(worldMap[WM_H_WARP_AMP]);
   let wx = x + (((vnoise2d(x, z, 9u, seed ^ 0x3A9Fu).n - 8192) * amp) >> 14);
   let wz = z + (((vnoise2d(x, z, 9u, seed ^ 0x3AA0u).n - 8192) * amp) >> 14);
-  let c = wmCellOf(wx, wz);
-  if (!wmInside(c)) { return worldMap[WM_H_OCEAN_BIOME]; }
-  return wmPlaneAt(plane, c.x, c.y);
+  return biomeCellAt(wx, wz);
 }
 
 // Placement is per TREE_TILE XZ tile: hash the tile, and it either holds one

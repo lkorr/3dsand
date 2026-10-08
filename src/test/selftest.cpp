@@ -36,6 +36,7 @@ const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
 const std::vector<Gate>& EnvTruthGates();
+const std::vector<Gate>& MapV2Gates();
 // The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
 // shelled out to through scripts/generator_parity.mjs. No World, no GPU.
 const std::vector<Gate>& GeneratorGates();
@@ -267,6 +268,12 @@ const char* const kOrder[] = {
     // Right after terrain, on the same pristine world: the painted map's
     // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
     "worldmap",
+    // With it, map v2's authored height plane (docs/PLAN_map_v2.md): a
+    // synthetic map in a TEMP asset dir -- tile format, post exactness, CPU ==
+    // GPU per voxel across post edges and a steep ramp, C1 continuity, the
+    // edge fade. The `sculpt` gate's seam and exit (reload, regenerate, far
+    // refill), so `waterbody` still sees what `terrain` left.
+    "worldmap-v2",
     // With it: the map's spawn site is where a player can actually start --
     // outside the harness box, on land, not in a tarn, where trees may grow.
     // CPU only (the height mirror and the map), nothing left behind.
@@ -1253,7 +1260,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

@@ -347,8 +347,10 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
     // ---- B. the synthetic one-biome map --------------------------------------
     worldmap::WorldMapData syn = real;
     std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(b.index));
-    std::fill(syn.landform.begin(), syn.landform.end(), static_cast<uint8_t>(128));   // mapLandformQ8's "flat"
-    std::fill(syn.moisture.begin(), syn.moisture.end(), static_cast<uint8_t>(128));
+    // Flat authored ground at the terrain's datum (map v2's height plane; v1
+    // filled the landform plane with 128, the same datum): only the seeded
+    // noise shapes it.
+    std::fill(syn.height.begin(), syn.height.end(), static_cast<int16_t>(syn.terrain.baseHeight));
     syn.sites.clear();
     syn.siteIndex.assign(syn.siteIndex.size(), 0);
     // No pad box (crownMeetsPad and padOutside both read x1 < x0 as "none").
