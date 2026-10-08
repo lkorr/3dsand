@@ -28683,6 +28683,69 @@ void MobSystem::AlignRecordToRig(const Mob& m, MobRecord& rec) {
   limbs = std::move(out);
 }
 
+// ---- ONE STORED LIMB LATTICE ONTO A STANDING RIG ------------------------------
+// MOBS v4's overlay (OverlayMobRecord, below) and AVTR v2's (PlayerAvatar::Spawn)
+// share it; the rules are the ones the v4 overlay always had.
+void Mob::OverlayLimbLattice(size_t i, std::vector<DebrisVoxel>& voxels,
+                             std::vector<PrefabVoxel>& skinVoxels, IVec3 size,
+                             Vec3 restOffset, Vec3 anchorRoot, Vec3 anchorLimb) {
+  if (i >= limbs_.size()) return;
+  MobLimb& L = limbs_[i];
+  if (SameCollider(voxels, L.voxels) && SameSkin(skinVoxels, L.skinVoxels) &&
+      size.x == L.size.x && size.y == L.size.y && size.z == L.size.z &&
+      SameVec3(restOffset, L.restOffset) && SameVec3(anchorRoot, L.anchorRoot) &&
+      SameVec3(anchorLimb, L.anchorLimb)) {
+    // Field-for-field the same, so brick and body stay as they are — but
+    // the RECORD's bytes are taken anyway: PrefabVoxel has a padding byte
+    // whose value is whatever built each copy, and a re-save of this rig
+    // must be the bytes that arrived (`mob-handoff` arm B, measured: the
+    // dressed ghost's worn shell differed from the record in nothing but
+    // that byte).
+    L.voxels = std::move(voxels);
+    L.skinVoxels = std::move(skinVoxels);
+    return;
+  }
+  if (voxels.empty()) return;   // v3's guard: no collider, no body
+  // ---- SAME SHAPE, DIFFERENT STATE: repaint, do not re-pack ----------
+  //
+  // A coat, a char or a recolour leaves every voxel where it was, and the
+  // paths that made them never re-packed the brick either — they poked it
+  // (SoakLimb, the burn front). Re-packing here (ReskinLimbMicro ->
+  // MicroBodyEdit) would re-derive the tight box and REBASE the lattice
+  // whenever the authored art does not start at its own min corner,
+  // moving restOffset and every voxel coordinate: a loaded body that
+  // saves as different bytes than the body that was saved. So the same
+  // shape takes the same door the damage took.
+  const bool sameShape = SameShape(voxels, L.voxels) &&
+                         SameShape(skinVoxels, L.skinVoxels) && size.x == L.size.x &&
+                         size.y == L.size.y && size.z == L.size.z &&
+                         SameVec3(restOffset, L.restOffset) &&
+                         SameVec3(anchorRoot, L.anchorRoot) &&
+                         SameVec3(anchorLimb, L.anchorLimb);
+  L.voxels = std::move(voxels);
+  L.skinVoxels = std::move(skinVoxels);
+  // A saved bruise heals after the load as it would have before it.
+  for (const PrefabVoxel& v : L.skinVoxels) L.bruised |= v.bruise != 0;
+  L.size = size;
+  L.restOffset = restOffset;
+  L.anchorRoot = anchorRoot;
+  L.anchorLimb = anchorLimb;
+  if (sameShape)
+    RepaintLimbMicro(L, MicroSet());
+  else if (L.microModel >= 0)
+    ReskinLimbMicro(L, SkinScaleOf(L), PhysScaleOf(L));
+  // A same-shape repaint moves nothing, so the CPU transform the spawn
+  // built is still the exact one. RebuildLimbBody re-reads a kinematic
+  // limb's pose back out of Jolt, which rounds it (COM <-> origin in
+  // float) by an ulp that grows with the world coordinate: a soaked or
+  // burnt body re-saved one bit off its own record whenever the window
+  // sat far enough out (`mob-save-delta` C, red in the full suite only,
+  // 2026-10-01). The rig re-poses the body from this transform next tick.
+  const BodyTransform spawnXf = L.xf;
+  RebuildLimbBody((int)i);
+  if (sameShape) L.xf = spawnXf;
+}
+
 void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   if (rec.haveGear) AlignRecordToRig(m, rec);
   m.origin_ = rec.origin;
@@ -28749,62 +28812,9 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
         s.restOffset = p->restOffset;
         s.anchorRoot = p->anchorRoot;
         s.anchorLimb = p->anchorLimb;
-      } else if (SameCollider(s.voxels, L.voxels) &&
-                 SameSkin(s.skinVoxels, L.skinVoxels) &&
-                 s.size.x == L.size.x && s.size.y == L.size.y &&
-                 s.size.z == L.size.z && SameVec3(s.restOffset, L.restOffset) &&
-                 SameVec3(s.anchorRoot, L.anchorRoot) &&
-                 SameVec3(s.anchorLimb, L.anchorLimb)) {
-        // Field-for-field the same, so brick and body stay as they are — but
-        // the RECORD's bytes are taken anyway: PrefabVoxel has a padding byte
-        // whose value is whatever built each copy, and a re-save of this rig
-        // must be the bytes that arrived (`mob-handoff` arm B, measured: the
-        // dressed ghost's worn shell differed from the record in nothing but
-        // that byte).
-        L.voxels = std::move(s.voxels);
-        L.skinVoxels = std::move(s.skinVoxels);
-        continue;
       }
-      if (s.voxels.empty()) continue;   // v3's guard: no collider, no body
-      // ---- SAME SHAPE, DIFFERENT STATE: repaint, do not re-pack ----------
-      //
-      // A coat, a char or a recolour leaves every voxel where it was, and the
-      // paths that made them never re-packed the brick either — they poked it
-      // (SoakLimb, the burn front). Re-packing here (ReskinLimbMicro ->
-      // MicroBodyEdit) would re-derive the tight box and REBASE the lattice
-      // whenever the authored art does not start at its own min corner,
-      // moving restOffset and every voxel coordinate: a loaded body that
-      // saves as different bytes than the body that was saved. So the same
-      // shape takes the same door the damage took.
-      const bool sameShape = SameShape(s.voxels, L.voxels) &&
-                             SameShape(s.skinVoxels, L.skinVoxels) &&
-                             s.size.x == L.size.x && s.size.y == L.size.y &&
-                             s.size.z == L.size.z &&
-                             SameVec3(s.restOffset, L.restOffset) &&
-                             SameVec3(s.anchorRoot, L.anchorRoot) &&
-                             SameVec3(s.anchorLimb, L.anchorLimb);
-      L.voxels = std::move(s.voxels);
-      L.skinVoxels = std::move(s.skinVoxels);
-      // A saved bruise heals after the load as it would have before it.
-      for (const PrefabVoxel& v : L.skinVoxels) L.bruised |= v.bruise != 0;
-      L.size = s.size;
-      L.restOffset = s.restOffset;
-      L.anchorRoot = s.anchorRoot;
-      L.anchorLimb = s.anchorLimb;
-      if (sameShape)
-        RepaintLimbMicro(L, microSet_);
-      else if (L.microModel >= 0)
-        m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
-      // A same-shape repaint moves nothing, so the CPU transform the spawn
-      // built is still the exact one. RebuildLimbBody re-reads a kinematic
-      // limb's pose back out of Jolt, which rounds it (COM <-> origin in
-      // float) by an ulp that grows with the world coordinate: a soaked or
-      // burnt body re-saved one bit off its own record whenever the window
-      // sat far enough out (`mob-save-delta` C, red in the full suite only,
-      // 2026-10-01). The rig re-poses the body from this transform next tick.
-      const BodyTransform spawnXf = L.xf;
-      m.RebuildLimbBody((int)i);
-      if (sameShape) L.xf = spawnXf;
+      m.OverlayLimbLattice(i, s.voxels, s.skinVoxels, s.size, s.restOffset,
+                           s.anchorRoot, s.anchorLimb);
       continue;
     }
     // ---- v3 (kSaveVersionMin): the overlay rule that format always had ----

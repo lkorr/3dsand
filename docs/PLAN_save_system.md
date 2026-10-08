@@ -329,3 +329,28 @@ names an index into an older DBRS, misses, and re-drops -- while that older
 DBRS's copy of its body was restored as anonymous debris. Rare (the window at
 load is the window at save), and it goes away when DBRS gets its per-body API
 and buckets with ITMS.
+
+**2026-10-07 (correctness sweep):**
+- **Player wounds survive a save: FIXED** (AVTR v2, gate `save-avatar-body`).
+  The living avatar's parts write MOBS v4's limb kind + lattice block and come
+  back through `Mob::OverlayLimbLattice`; infection re-latches from the voxels.
+- **A fixture-offset ITMS index: FIXED** (found on the way; gate `save-items`
+  D). `SaveIndexOf` counted the fixtures (open doors) `DBRS` does not write,
+  so any item after an open door re-dropped as a second copy on every load.
+- **The parked-across-a-save re-drop: PARTLY FIXED.** A v8 index miss now tries
+  the position match (0.25 voxel) before re-dropping, which re-attaches the
+  identity whenever the body sits where the record says. A body that MOVED
+  after its record parked still leaves the anonymous copy: the real fix is
+  per-body DBRS records bucketed with ITMS -- record format, strap-group
+  bucketing and what parks with what are the debris owner's design.
+- **Ground items do not park: STILL OPEN, needs a decision.** Today an item
+  more than 32 voxels outside the window is DESTROYED (`DebrisSystem::PostStep`
+  -> `ReleaseBody` -> `WorldItems::Remove`), not parked. The mechanism is
+  MobParking's (an ITMS record into `ChunkStore::DormantEntities` before the
+  cull, and an unpark that applies ITMS records with the same ground wait),
+  but it needs: (1) a park hook in debris' window cull (or a WorldItems
+  pre-pass before `debris.PostStep`); (2) an answer for an item STRAPPED to a
+  non-item host (a helm on a severed head): park the pair, or unstrap -- the
+  host has no record until DBRS is per-body; (3) whether parked items are
+  exempt from the body budget's oldest-first eviction on unpark. (2) is the
+  same design as the per-body DBRS question above.

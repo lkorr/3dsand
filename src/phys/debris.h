@@ -1443,10 +1443,12 @@ class DebrisSystem {
   // re-attaches the identity to the restored body instead of dropping a second
   // copy (the save/load duplication, PLAN_save_system.md follow-ups).
   //
-  // SaveIndexOf: the position SaveState writes `handle` at -- its index in
-  // bodies_, because SaveState writes every body in order. 0xFFFFFFFF for an
-  // unknown handle. Valid only at the save instant (no tick between the two
-  // sections' writers, which SaveWorld guarantees).
+  // SaveIndexOf: the position SaveState writes `handle` at -- its rank among
+  // the NON-FIXTURE bodies_, because SaveState writes those in order and skips
+  // fixtures (it was the raw index until 2026-10-07, one off per open door
+  // before the item). 0xFFFFFFFF for an unknown handle or a fixture. Valid
+  // only at the save instant (no tick between the two sections' writers,
+  // which SaveWorld guarantees).
   uint32_t SaveIndexOf(uint64_t handle) const;
   // After a LoadState: the body that saved index `savedIndex` became, if it
   // was restored, is still alive, sits within `tol` voxels of `expectPos`

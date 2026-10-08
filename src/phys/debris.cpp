@@ -7382,8 +7382,20 @@ void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
 }
 
 uint32_t DebrisSystem::SaveIndexOf(uint64_t handle) const {
+  // The index SaveState WRITES the body at, which is its rank among the
+  // NON-FIXTURE bodies (fixtures are skipped there). It used to be the raw
+  // bodies_ index: with an open door earlier in the list than a ground item,
+  // the item's record named the next body over, the load's claim missed, and
+  // the item re-dropped beside its own restored body -- one anonymous copy per
+  // save (2026-10-07; the doors are older than ITMS v8, so every save with a
+  // door open before an item was dropped did it). A fixture is not saved, so
+  // it has no index.
   const int i = IndexOfHandle(handle);
-  return i >= 0 ? (uint32_t)i : 0xFFFFFFFFu;
+  if (i < 0 || bodies_[(size_t)i].fixture) return 0xFFFFFFFFu;
+  uint32_t k = 0;
+  for (int j = 0; j < i; j++)
+    if (!bodies_[(size_t)j].fixture) k++;
+  return k;
 }
 
 uint64_t DebrisSystem::ClaimLoadedBody(uint32_t savedIndex, Vec3 expectPos,

@@ -2107,16 +2107,58 @@ Status GateSaveItems(Ctx& c, std::string& detail) {
     }
   }
 
-  const bool ok = okA && okB && okC && (shedOk || !helm || humanDef < 0);
+  // ---- D: a FIXTURE ahead of the items (2026-10-07) ----
+  // An open door's leaf is a debris body marked fixture and is not written to
+  // 'DBRS'; the item's saved body index must be its rank among what IS
+  // written. A fixture made FIRST (so it sits before every item in the body
+  // list), two items dropped after it: the round trip must bring back the
+  // same items on the same non-fixture bodies -- no re-dropped second copy.
+  // (The fixture itself is not saved and has no ref to re-create it here, so
+  // the count compared is the non-fixture bodies.)
+  bool okD = false;
+  Count d0, d1;
+  uint32_t dFix = 0, dIdx0 = 0, dIdxFix = 0;
+  uint64_t fix = 0;
+  {
+    wreck();
+    DropItemToWorld(*drops[0], ItemInstance{drops[0]->name},
+                    Vec3{(float)sx - 6.0f, (float)(sh + 3), (float)sz}, Vec3{}, c.phys,
+                    debris, nullptr, ground);
+    for (const WorldItem& w : ground.All()) fix = w.body;
+    if (fix && ground.Remove(fix) && debris.SetBodyFixture(fix, true)) dFix = 1;
+    for (size_t k = 0; k < 2; k++)
+      DropItemToWorld(*drops[k], ItemInstance{drops[k]->name},
+                      Vec3{(float)sx + 5.0f * (float)k, (float)(sh + 3), (float)sz},
+                      Vec3{}, c.phys, debris, nullptr, ground);
+    support::RunTicks(rig, 30);
+    d0 = measure();
+    d0.bodies -= dFix;   // the fixture is not saved
+    // The index itself: the first item is the first body 'DBRS' writes (the
+    // position fallback in LoadWorldItems would hide a wrong index here).
+    const uint64_t first = ground.All().empty() ? 0 : ground.All()[0].body;
+    dIdx0 = debris.SaveIndexOf(first);
+    dIdxFix = debris.SaveIndexOf(fix);
+    const bool saved = SaveWorld(ctx, world, stream, kPath, c.mats, &eio);
+    wreck();
+    const bool loaded = LoadWorld(ctx, world, sim, stream, kPath, c.mats, &eio);
+    d1 = measure();
+    okD = dFix == 1 && dIdx0 == 0 && dIdxFix == 0xFFFFFFFFu && saved && loaded &&
+          d0.items == 2 && d1.items == d0.items &&
+          d1.bodies == d0.bodies && d1.itemBodies == d1.items && d1.distinct;
+  }
+
+  const bool ok = okA && okB && okC && okD && (shedOk || !helm || humanDef < 0);
   detail = Format(
       "A roundtrip=%d (items %zu->%zu, bodies %u->%u, on item bodies %zu, "
       "helm shed=%d strapped %d->%d) | B again=%d (items %zu->%zu, bodies "
       "%u->%u) | C v7 migration=%d (items %zu->%zu, bodies %u->%u; resave "
-      "%zu->%zu, %u->%u)",
+      "%zu->%zu, %u->%u) | D fixture first=%d (first item's save index %u (want 0), "
+      "fixture's %08x; items %zu->%zu, non-fixture bodies %u->%u, on item bodies %zu)",
       okA ? 1 : 0, a0.items, a1.items, a0.bodies, a1.bodies, a1.itemBodies,
       shedOk ? 1 : 0, a0.strapped ? 1 : 0, a1.strapped ? 1 : 0, okB ? 1 : 0,
       b0.items, b1.items, b0.bodies, b1.bodies, okC ? 1 : 0, c0.items, c1.items,
-      c0.bodies, c1.bodies, c2.items, c3.items, c2.bodies, c3.bodies);
+      c0.bodies, c1.bodies, c2.items, c3.items, c2.bodies, c3.bodies, okD ? 1 : 0,
+      dIdx0, dIdxFix, d0.items, d1.items, d0.bodies, d1.bodies, d1.itemBodies);
   std::printf("save-items: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   // teardown: nothing of this gate survives into the next one
@@ -2571,6 +2613,137 @@ Status GateSaveMaterialRemap(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- save-avatar-body --------------------------------------------------------
+//
+// A LIVING PLAYER'S WOUNDS SURVIVE A SAVE (AVTR v2, 2026-10-07). AVTR v1 kept
+// per-part hp and the severs and nothing else, so a reload healed every carve,
+// burn, coat and infection the player carried (the infection IS voxels of an
+// infect material). Claims, CPU + Jolt only (no tick):
+//  A. ROUND TRIP. The avatar's root part carved (a crater), one arm's surface
+//     rewritten to rotflesh (a bite's rot), one part severed: save, despawn,
+//     load, spawn. The carved part's voxel count is the carved one (not the
+//     spawn's), the arm is latched INFECTED again (Mob::RelatchInfections,
+//     from the voxels), the severed part stays off, and a re-save is the SAME
+//     BYTES as the save -- every stored lattice, kind and hp came back exact.
+//  B. v1 STILL LOADS. A v1 record (hp + severs only) of the same state spawns a
+//     whole body with that hp and that sever: the carve does not come back,
+//     because v1 never had it.
+Status GateSaveAvatarBody(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  PlayerAvatar avatar;
+  avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &mobs);
+  avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+  if (!avatar.HasDef()) {
+    detail = "no avatar def";
+    return Status::Fail;
+  }
+  uint32_t rot = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "rotflesh") rot = (uint32_t)i;
+  const IVec3 wo = c.world.WindowOrigin();
+  const int bx = wo.x * (int)kChunk + 150, bz = wo.z * (int)kChunk + 150;
+  const int h = World::TerrainHeight(bx, bz, kDefaultSeed);
+  Player pl;
+  pl.fly = false;
+  pl.grounded = true;
+  pl.pos = Vec3{(float)bx + 8.5f, (float)(h + 2) + Player::kHalfY, (float)bz + 8.5f};
+  Mob* const avs[1] = {&avatar};
+  mobs.SetAvatars(std::span<Mob* const>(avs, 1));
+  auto teardown = [&]() {
+    avatar.Despawn();
+    avatar.ClearPendingRestore();
+    mobs.SetAvatars({});
+  };
+  if (!avatar.Spawn(pl, 0.0f) || rot == 0) {
+    teardown();
+    detail = rot == 0 ? "no rotflesh material" : "avatar spawn refused";
+    return Status::Fail;
+  }
+  const MobDef& ad = *avatar.Def();
+  const uint64_t id = avatar.Id();
+  const int carve = ad.rootLimb;
+  int arm = -1, sever = -1;
+  for (size_t i = 0; i < ad.limbs.size(); i++) {
+    if ((int)i == ad.rootLimb || ad.limbs[i].tag != "arm") continue;
+    if (arm < 0) arm = (int)i;
+    else if (sever < 0 && ad.limbs[i].severable && !ad.limbs[i].vital &&
+             ad.limbs[i].parent != ad.limbs[(size_t)arm].name)
+      sever = (int)i;
+  }
+  // ---- the wounds ----
+  std::vector<ParticleSpawn> sp;
+  uint32_t atSpawn = 0, carved = 0, rotted = 0;
+  bool infected0 = false;
+  if (carve >= 0) {
+    // On the authoritative lattice, as LimbVoxelCount counts it (the spawn
+    // count LimbVoxelsAtSpawn keeps is the collider's on a fine-skinned rig).
+    atSpawn = mobs.LimbVoxelCount(id, carve);
+    mobs.CarveLimbRadial(mobs.LimbBody(id, carve), mobs.LimbVoxelPos(id, carve, 0), 1.2f,
+                         false, false, c.world, sp);
+    carved = mobs.LimbVoxelCount(id, carve);
+  }
+  if (arm >= 0) {
+    rotted = mobs.RewriteLimbSurface(id, arm, 0, rot, 40, 50000);
+    // A fixture writer, not a bite: nothing latched the arm yet (info only).
+    infected0 = avatar.LimbInfected(arm);
+  }
+  if (sever >= 0) avatar.Sever(sever);
+  std::vector<uint8_t> save0;
+  avatar.SaveState(save0);
+  const float hp0 = arm >= 0 ? mobs.LimbHp(id, arm) : 0.0f;
+
+  // ---- A: v2 round trip ----
+  avatar.Despawn();
+  const bool loadedA = avatar.LoadState(save0.data(), save0.size(), PlayerAvatar::kSaveVersion);
+  const bool spawnedA = loadedA && avatar.Spawn(pl, 0.0f);
+  const uint32_t carvedA = spawnedA && carve >= 0 ? mobs.LimbVoxelCount(id, carve) : 0;
+  const bool infectedA = spawnedA && arm >= 0 && avatar.LimbInfected(arm);
+  const bool severedA = sever < 0 || (spawnedA && !avatar.PartAlive(sever));
+  std::vector<uint8_t> save1;
+  if (spawnedA) avatar.SaveState(save1);
+  const bool sameBytes = !save1.empty() && save1 == save0;
+  const bool okA = carve >= 0 && arm >= 0 && carved < atSpawn && rotted > 0 &&
+                   spawnedA && carvedA == carved && infectedA && severedA && sameBytes;
+
+  // ---- B: the same state as a v1 record ----
+  bool okB = false;
+  uint32_t carvedB = 0;
+  float hpB = -1.0f;
+  {
+    std::vector<uint8_t> v1;
+    ByteWriter w{v1};
+    w.U32(1u);
+    w.Str(ad.name);
+    const uint32_t n = (uint32_t)ad.limbs.size();
+    w.U32(n);
+    for (uint32_t i = 0; i < n; i++) {
+      w.Pod((uint8_t)((int)i == sever ? 0 : 1));
+      w.F32(mobs.LimbHp(id, (int)i));
+    }
+    avatar.Despawn();
+    const bool loadedB = avatar.LoadState(v1.data(), v1.size(), 1u);
+    const bool spawnedB = loadedB && avatar.Spawn(pl, 0.0f);
+    carvedB = spawnedB && carve >= 0 ? mobs.LimbVoxelCount(id, carve) : 0;
+    hpB = spawnedB && arm >= 0 ? mobs.LimbHp(id, arm) : -1.0f;
+    okB = spawnedB && carvedB == atSpawn && hpB == hp0 &&
+          (sever < 0 || !avatar.PartAlive(sever));
+  }
+  teardown();
+  const bool ok = okA && okB;
+  detail = Format(
+      "A v2: root '%s' carved %u -> %u voxels, arm '%s' %u cells to rotflesh (infected %d), "
+      "part %d severed; %zu bytes -> loaded %d spawned %d: root %u voxels (want %u), arm "
+      "infected %d, severed kept %d, re-save %s | B v1 record: root %u voxels (want the "
+      "spawn's %u), arm hp %.2f (want %.2f)",
+      carve >= 0 ? ad.limbs[(size_t)carve].name.c_str() : "?", atSpawn, carved,
+      arm >= 0 ? ad.limbs[(size_t)arm].name.c_str() : "?", rotted, infected0 ? 1 : 0, sever,
+      save0.size(), loadedA ? 1 : 0, spawnedA ? 1 : 0, carvedA, carved, infectedA ? 1 : 0,
+      severedA ? 1 : 0, sameBytes ? "IDENTICAL" : Format("DIFFERS (%zu bytes)", save1.size()).c_str(),
+      carvedB, atSpawn, hpB, hp0);
+  std::printf("save-avatar-body: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WorldIoGates() {
@@ -2579,6 +2752,8 @@ const std::vector<Gate>& WorldIoGates() {
       {"save-entities", "worldio", {}, false, GateSaveEntities},
       {"save-split", "worldio", {}, false, GateSaveSplit},
       {"save-items", "worldio", {}, false, GateSaveItems},
+      // AVTR v2: a living player's carves, burns, coats and infection survive a save.
+      {"save-avatar-body", "worldio", {}, false, GateSaveAvatarBody},
       {"save-material-remap", "worldio", {}, false, GateSaveMaterialRemap},
       {"region-store", "worldio", {}, false, GateRegionStore},
       {"region-codec", "worldio", {}, false, GateRegionCodec},

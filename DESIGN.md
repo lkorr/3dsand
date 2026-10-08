@@ -578,6 +578,17 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   an old save loads without it. Content that no longer exists takes its
   restored body with it. Gate: `save-items` (three drops + a helm shed off a
   severed head, two save/load cycles, and a v7 load).
+  **The index is the body's rank among what `DBRS` WRITES (2026-10-07).**
+  `SaveIndexOf` returned the raw `bodies_` index while `SaveState` skips
+  fixtures (an open door's leaf), so with a door open earlier in the list the
+  item's record named the next body over, the claim missed and the item
+  re-dropped beside its own restored body. It now counts non-fixture bodies
+  (a fixture has no index), and a v8 index miss tries the position match
+  (`ClaimLoadedBodyNear`, 0.25 voxel) before re-dropping -- which also closes
+  the record-parked-across-a-save copy whenever its body did not move. A body
+  that moved after its record parked still re-drops: that needs per-body
+  `DBRS` records (the debris owner's design, PLAN_save_system.md). Gate
+  `save-items` D (a fixture first, then two items).
 - **A whole body saves as its name (MOBS v4, 2026-09-23,
   `docs/PLAN_save_system.md` S5a).** The mob record is the terrain delta rule
   applied to a body: a limb that is field-for-field its def's authored limb
@@ -598,6 +609,15 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   **Measured: an untouched human 345,969 B (v3) -> 577 B; a crowd of 11
   untouched + 4 damaged 5.17 MB -> 160 KB (32x), the remainder being the four
   damaged limbs' lattices.** Gate `mob-save-delta`.
+  **The LIVING PLAYER's body too (AVTR v2, 2026-10-07).** AVTR v1 saved
+  per-part hp and the severs only, so a reload healed every carve, burn, coat,
+  bruise and infection the player carried (an infection IS voxels of an
+  infect material). Each attached part now writes the MOBS v4 limb kind and,
+  when touched, the same lattice block; `PlayerAvatar::Spawn` puts it back
+  through the one overlay MOBS uses (`Mob::OverlayLimbLattice`) before the
+  severs, then `RelatchInfections`. Equipped slots past the def's limbs are
+  still inventory, not body. v1 still loads (whole). Gate `save-avatar-body`
+  (carve + rot + sever, save/load, a re-save is the same bytes).
 - **NPCs outlive the window (MOBS v5, 2026-09-23, `docs/PLAN_save_system.md`
   S5b).** `MobSystem::PreTick` no longer destroys a creature that ends up more
   than 16 voxels outside the window: with a park function installed it first

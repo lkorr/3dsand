@@ -543,6 +543,9 @@ const char* const kOrder[] = {
     // a helmed human, ticks them settled through the rig, saves/loads its own
     // dir, and resets mobs + debris and the id counter on the way out.
     "save-items",
+    // AVTR v2 (a living player's wounds across a save): CPU + Jolt only, its own
+    // avatar, registered for the gate and unregistered on the way out.
+    "save-avatar-body",
     // W1-D material names in saves (sim/mattable.h). Regenerates on the way
     // in, saves and loads its own dir under a permuted material table, and
     // resets mobs + debris and regenerates at the origin on the way out --

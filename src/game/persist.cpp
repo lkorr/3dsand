@@ -832,9 +832,20 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
     //        DBRS has the item body too -- so the nearest unclaimed restored
     //        body at the item's position is taken as it. Both sections were
     //        written from the same transform at the same instant.
+    //   v8+, AND THE INDEX MISSED (2026-10-07): a record kept dormant across
+    //        a save names an index into the 'DBRS' of the save it was parked
+    //        in, and the body that save restored for it now sits under another
+    //        index. The position test the migration uses is the fallback
+    //        before a re-drop, so a body restored where the record says the
+    //        item lies is re-attached rather than left as an anonymous copy
+    //        beside a second one. A body that MOVED since (it was simulated
+    //        inside the pad after the record parked) still re-drops: closing
+    //        that needs per-body DBRS records (PLAN_save_system.md "Still
+    //        open").
     uint64_t body =
         version >= 8 ? r.debris->ClaimLoadedBody(savedBody, at, 1.0f)
                      : r.debris->ClaimLoadedBodyNear(at, 0.25f);
+    if (!body && version >= 8) body = r.debris->ClaimLoadedBodyNear(at, 0.25f);
     if (body && r.reg->Find(body)) body = 0;   // never two identities
     const ItemDef* d = r.items->Named(name);
     // Content legitimately disappears between saves. The item is dropped with

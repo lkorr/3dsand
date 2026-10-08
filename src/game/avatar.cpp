@@ -13,6 +13,7 @@
 
 #include "game/rigrender.h"
 #include "sim/bytestream.h"
+#include "sim/mattable.h"  // AVTR v2 lattices: ActiveLoadRemap
 #include "sim/oprecord.h"  // the op stream's author side table (N3)
 #include "sim/rng.h"
 #include "sim/tuning.h"
@@ -268,6 +269,21 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   if (restore_.valid && restore_.defName == defName_) {
     const size_t n = std::min(restore_.parts.size(), limbs_.size());
     for (size_t i = 0; i < n; i++) limbs_[i].hp = restore_.parts[i].hp;
+    // v2: THE WOUNDS COME BACK (the persistence note in avatar.h). Before the
+    // severs, as MOBS's overlay orders it: a carve on a part that stays.
+    bool stored = false;
+    for (size_t i = 0; i < n; i++) {
+      SavedState::P& p = restore_.parts[i];
+      if (!p.alive || p.kind != MobSystem::kLimbStored || !limbs_[i].body) continue;
+      OverlayLimbLattice(i, p.voxels, p.skinVoxels, p.size, p.restOffset,
+                         p.anchorRoot, p.anchorLimb);
+      stored = true;
+    }
+    // The infection is the voxels: re-derived from what came back.
+    if (stored) {
+      RelatchInfections();
+      MarkInstancesDirty();
+    }
     // A SAVED AMPUTATION IS STILL AN OPEN STUMP (sim/tuning.h Gore §F). The
     // wound is not in the file and does not need to be: it is DERIVED from
     // what is — a severed part whose parent is still on the body reopens the
@@ -1110,15 +1126,30 @@ void PlayerAvatar::SaveState(std::vector<uint8_t>& out) const {
   const size_t n = std::min(limbs_.size(), def_->limbs.size());
   w.U32((uint32_t)n);
   for (size_t i = 0; i < n; i++) {
-    w.Pod((uint8_t)(limbs_[i].body ? 1 : 0));
-    w.F32(limbs_[i].hp);
+    const MobLimb& L = limbs_[i];
+    w.Pod((uint8_t)(L.body ? 1 : 0));
+    w.F32(L.hp);
+    // v2: the body itself, as a MOBS v4 limb (Mob::SaveOne): a severed part
+    // writes nothing more (its matter left as debris), a pristine one its
+    // kind alone, anything touched its lattice.
+    if (!L.body) continue;
+    const uint32_t kind =
+        LimbIsPristine(i) ? MobSystem::kLimbPristine : MobSystem::kLimbStored;
+    w.U32(kind);
+    if (kind != MobSystem::kLimbStored) continue;
+    w.Pod(L.restOffset);
+    w.Pod(L.anchorRoot);
+    w.Pod(L.anchorLimb);
+    w.Pod(L.size);
+    w.PodVec(L.voxels);
+    w.PodVec(L.skinVoxels);
   }
 }
 
 bool PlayerAvatar::LoadState(const uint8_t* data, size_t len,
                              uint32_t version) {
   restore_ = SavedState{};
-  if (version != kSaveVersion) {
+  if (version < 1 || version > kSaveVersion) {
     std::printf("avatar: unknown AVTR section version %u\n", version);
     return false;
   }
@@ -1130,12 +1161,36 @@ bool PlayerAvatar::LoadState(const uint8_t* data, size_t len,
   r.Str(s.defName);
   uint32_t n = 0;
   r.U32(n);
+  // From the file: bounded before it sizes anything (MobSystem::ReadMobRecord's
+  // rule) -- every part is at least its alive byte and hp.
+  if (!r.ok || n > 1024u || (size_t)n > (r.n - r.off) / 5u) return false;
   s.parts.resize(n);
   for (uint32_t i = 0; i < n && r.ok; i++) {
-    r.Pod(s.parts[i].alive);
-    r.F32(s.parts[i].hp);
+    SavedState::P& p = s.parts[i];
+    r.Pod(p.alive);
+    r.F32(p.hp);
+    if (version < 2 || !p.alive) continue;
+    r.U32(p.kind);
+    if (p.kind != MobSystem::kLimbPristine && p.kind != MobSystem::kLimbStored) {
+      r.ok = false;   // a kind this build cannot read: refused, not guessed at
+      break;
+    }
+    if (p.kind != MobSystem::kLimbStored) continue;
+    r.Pod(p.restOffset);
+    r.Pod(p.anchorRoot);
+    r.Pod(p.anchorLimb);
+    r.Pod(p.size);
+    r.PodVec(p.voxels);
+    r.PodVec(p.skinVoxels);
   }
   if (!r.ok) return false;
+  // MATERIAL NAMES (sim/mattable.h): a stored lattice's ids are in the table
+  // its save named, as a creature record's are (ReadMobRecord).
+  if (const MatRemap* mr = ActiveLoadRemap())
+    for (SavedState::P& p : s.parts) {
+      RemapDebrisVoxels(p.voxels, *mr);
+      RemapPrefabVoxels(p.skinVoxels, *mr);
+    }
   s.valid = true;
   restore_ = std::move(s);  // applied by the next Spawn()
   return true;

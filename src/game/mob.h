@@ -2243,6 +2243,15 @@ class Mob {
   // False for appended slots (worn shells, a held item): they have no def limb
   // to be pristine against, and always store their lattice.
   bool LimbIsPristine(size_t i) const;
+  // A STORED limb lattice (a save's kLimbStored block) put onto limb `i` of
+  // this rig: MOBS v4's overlay rule (MobSystem::OverlayMobRecord) and AVTR
+  // v2's (PlayerAvatar::Spawn), one function. A lattice field-for-field the
+  // rig's own takes the record's bytes and touches nothing else; the same
+  // shape repaints the brick by pokes; anything else re-skins and rebuilds the
+  // Jolt body. Moves `voxels` / `skinVoxels`. An empty collider is ignored.
+  void OverlayLimbLattice(size_t i, std::vector<DebrisVoxel>& voxels,
+                          std::vector<PrefabVoxel>& skinVoxels, IVec3 size,
+                          Vec3 restOffset, Vec3 anchorRoot, Vec3 anchorLimb);
 
   // ---- LIVE RAGDOLL: limp, then back on its feet (sim/tuning.h Ragdoll) -----
   //

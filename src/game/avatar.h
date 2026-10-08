@@ -279,7 +279,16 @@ class PlayerAvatar : public Mob {
   // is despawned, so it only RECORDS the state; the next Spawn() applies it.
   // A dead avatar is saved as absent: its corpse is a dead Mob in mobs_
   // (MobSystem::AdoptDeadAvatar), not part of the avatar record.
-  static constexpr uint32_t kSaveVersion = 1;
+  //
+  // v2 (2026-10-07): AND THE BODY. v1 kept hp and the severs and nothing
+  // else, so a reload healed every wound the player carried -- carves, burns,
+  // coats, bruises and the infection (which IS voxels of an infect material,
+  // re-derived on load by Mob::RelatchInfections). Each attached part now
+  // writes MOBS v4's limb kind (Mob::LimbIsPristine: pristine = its name, no
+  // bytes) and, for a stored one, the rig offsets, box and both lattices --
+  // the same block, and the same overlay (Mob::OverlayLimbLattice) a
+  // creature's record gets. v1 still loads (whole bodies, as it always did).
+  static constexpr uint32_t kSaveVersion = 2;
   void SaveState(std::vector<uint8_t>& out) const;
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
   void ClearPendingRestore() { restore_.valid = false; }
@@ -471,6 +480,13 @@ class PlayerAvatar : public Mob {
     struct P {
       uint8_t alive = 1;
       float hp = 0;
+      // v2: MobSystem::kLimbPristine / kLimbStored (a v1 part reads as
+      // pristine: it had no lattice to restore), and a stored part's block.
+      uint32_t kind = 1;
+      Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
+      IVec3 size{};
+      std::vector<DebrisVoxel> voxels;
+      std::vector<PrefabVoxel> skinVoxels;
     };
     std::vector<P> parts;
   };
