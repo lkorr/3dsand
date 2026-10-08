@@ -340,6 +340,30 @@ export function applyOp(P, op, before) {
 export function writeValues(P, i0, j0, w, h, vals, before) {
   return writeWindow(P, i0, j0, w, h, (n) => (Number.isNaN(vals[n]) ? null : vals[n]), before);
 }
+/** Take a bake back out of the plane, keeping what was painted since:
+ *  rec = {before, after} (key -> tile | null: the tiles before and right after
+ *  the bake). Each post becomes before + (now - after), so a post nobody
+ *  touched since returns to its pre-bake value exactly and a later stroke
+ *  survives as the offset it made. `undo` collects the current tiles.
+ *  Returns the number of posts that had been edited since the bake. */
+export function unbake(P, rec, undo) {
+  let since = 0;
+  for (const [k, bt] of rec.before) {
+    const cur = P.tiles.get(k) || null, at = rec.after.get(k) || null;
+    if (undo && !undo.has(k)) undo.set(k, cur ? copyTile(cur) : null);
+    const t = newTile(P);
+    for (let i = 0; i < t.length; i++) {
+      const b = bt ? bt[i] : P.def, c = cur ? cur[i] : P.def, a = at ? at[i] : P.def;
+      if (c !== a) since++;
+      t[i] = b + (c - a);
+    }
+    if (!bt && !cur && !at) P.tiles.delete(k); else P.tiles.set(k, t);
+    P.dirty.add(k);
+    const [tx, tz] = tileXZ(k);
+    touchRect(P, tx * TILE, tz * TILE, tx * TILE + TILE - 1, tz * TILE + TILE - 1);
+  }
+  return since;
+}
 /** A deep copy of a before/undo map (key -> tile | null). */
 export function cloneTiles(m) {
   const out = new Map();

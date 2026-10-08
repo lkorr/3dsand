@@ -22826,6 +22826,24 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   authored height (real min..max hypsometric ramp, hillshade, contours, biome
   overlay) with brushes in metres; the landform brush and landform sites are
   gone with the landform plane.
+  **Map v2 E2 (2026-10-08): the height authoring tools.** The Height brush
+  gained flatten, terrace / cliff, seeded noise (stroke-stable: a post moves
+  by amp × its largest falloff weight in the stroke, so dab overlap does not
+  stack) and erode modes, plus a falloff (smooth / linear / flat / sphere).
+  The Shape tool stamps the v1 landform kinds (peak, ridge, basin, plateau,
+  volcano, mesa) into the plane. The Line tool draws RIDGE / VALLEY lines
+  stored in map.json `ridges[]` (`{id, kind, profile V|U|round|sharp, width
+  (half, vox), points [[x, z, y]]}`, `baked`): the ENGINE NEVER READS THEM --
+  the bake writes the plane (a ridge only raises, a valley only lowers, toward
+  the line height by the profile weight). A rebake takes the session's last
+  bake out (`maptiles.unbake`: pre-bake posts + whatever was painted since,
+  as offsets) and bakes again; across sessions there is no snapshot, so Bake
+  bakes on top. The Area tool's rectangle is eroded (`erosion.js`: droplet
+  hydraulic + Jacobi thermal, seeded, in a worker, preview then commit) and
+  exported / imported as a 16-bit grey (height, 1 unit = 1 voxel by default,
+  exact) or RGB (biome, palette colours) PNG through `scripts/map_png.py`
+  (`/api/mappng/encode|decode`; stdlib zlib, no Pillow). All of it is
+  editor-side: it writes plane tiles like a brush stroke.
 * **LIVE (environment truth P-A, 2026-09-04): THE ENVIRONMENT HOT-RELOADS,
   and the game says what it was generated from.** `ReloadEnvironment`
   (`test/support.cpp`) re-reads the biome files, the map named by

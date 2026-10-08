@@ -112,6 +112,15 @@ for (const m of T.HEIGHT_MODES) {
   const hill = T.heightAt(Hh, post(300), post(310));
   T.applyOp(Hh, HS.lineBake(Hh, line), null);
   ok(T.heightAt(Hh, post(300), post(310)) === hill, 'a ridge baked over a higher hill leaves the hill alone (max, not set)');
+  // unbake: the pre-bake posts come back, a stroke painted since stays as its offset
+  const U = fresh();
+  const ub = new Map();
+  T.applyOp(U, HS.lineBake(U, line), ub);
+  const rec = {before: ub, after: T.snapTiles(U, ub.keys())};
+  T.heightDab(U, post(300), post(330), {mode: 'raise', radius: 300, amount: 77}, null);
+  const undoU = new Map(), since = T.unbake(U, rec, undoU);
+  ok(since > 0 && Math.abs(T.heightAt(U, post(300), post(330)) - (200 + 77)) < 1e-3 && T.heightAt(U, post(300), post(310)) === 200,
+     `unbake: the line is gone (crest back to 200), the later +77 stroke stays (${since} posts edited since the bake)`);
   ok(HS.PROFILE_NAMES.join() === 'V,U,round,sharp', 'four cross-sections: ' + HS.PROFILE_NAMES.join(', '));
 }
 
