@@ -72,6 +72,12 @@ struct StrikeProfile {
   // reach follows the hole, because StainWoundAs rewrites the flesh the tear
   // exposed and nothing else.
   float biteRadius = 1.0f;
+  // HOW FAR WHAT THE TEETH CARRY SPREADS PAST THE HOLE: a multiple of the
+  // shared bite rim (gore.craterStainRim x gore.biteStainScale), which scales
+  // both the infection rewrite past the wound wall and the stain smear. 1 =
+  // a zombie's ragged, messy tear. A snake's fangs inject: the venom belongs
+  // in the puncture, not in a wide green ring round it (owner, 2026-10-07).
+  float biteStain = 1.0f;
   uint16_t infectMat = 0;   // material the tear REWRITES exposed flesh to (0 = none)
   uint16_t infectStain = 0; // LIQUID whose stain the tear smears over the hole (0 = none)
 

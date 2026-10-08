@@ -835,6 +835,7 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   p.bite.hp = s.strike.bite * power;
   p.bite.power = power;
   p.bite.radiusScale = s.strike.biteRadius;
+  p.bite.stainScale = s.strike.biteStain;
   // THE STRUCK KIND IS NOT HANDED DOWN (2026-09-16): whether teeth REACH flesh
   // depends on what the garment in the way is made of and which limb is under
   // it, and only the thing that was struck knows either.

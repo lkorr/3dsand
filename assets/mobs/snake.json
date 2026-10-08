@@ -306,7 +306,7 @@
       ]
     }
   ],
-  "//natural": "FANGS, NOT A MOUTHFUL: `biteRadius` 0.9 of gore.biteRadius, at the power a snake strike actually lands with (0.05..0.5 of the melee speed ramp), is a 0.15..0.25-voxel hole: a couple of art voxels into the limb. The bite block below is what the hole is filled with.",
+  "//natural": "FANGS, NOT A MOUTHFUL: `biteRadius` 0.9 of gore.biteRadius, at the power a snake strike actually lands with (0.05..0.5 of the melee speed ramp), is a 0.15..0.25-voxel hole: a couple of art voxels into the limb. The bite block below is what the hole is filled with. `biteStain` 0.35 of the shared bite rim keeps the venom IN the puncture: at 1 (a zombie's ragged tear) the envenomed rewrite and the venom smear spread a wide green ring round a two-voxel hole.",
   "natural": [
     {
       "name": "jaws",
@@ -327,7 +327,8 @@
       "strike": {
         "blunt": 0.5,
         "bite": 4,
-        "biteRadius": 0.9
+        "biteRadius": 0.9,
+        "biteStain": 0.35
       }
     }
   ],

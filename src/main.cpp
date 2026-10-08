@@ -7928,6 +7928,7 @@ int main(int argc, char** argv) {
       fl.xf.pos[0] = pos.x; fl.xf.pos[1] = pos.y; fl.xf.pos[2] = pos.z;
       fl.xf.quat[0] = rot.x; fl.xf.quat[1] = rot.y;
       fl.xf.quat[2] = rot.z; fl.xf.quat[3] = rot.w;
+      fl.haveLive = phys.GetTransform(fl.body, fl.lastLive);
       deathBody.limbs.push_back(fl);
     }
     deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
@@ -15643,6 +15644,10 @@ int main(int argc, char** argv) {
         // stays absent and simply is not drawn.
         FillBodyUI(avatar, burnMats, tissueMats, mobs, mats, ui);
         ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
+      } else if (deathBody.have) {
+        // Re-key the frozen pose onto any limb a carve rebuilt since the last
+        // frame (DeathBody::Follow): the corpse goes on being eaten.
+        deathBody.Follow(phys);
       }
       ui.spellCost = caster.compiled.manaCost;
       ui.spellWord = caster.compiled.wordCost;

@@ -323,11 +323,53 @@ struct DeathBody {
   struct Limb {
     uint64_t body = 0;
     BodyXformGpu xf{};
+    BodyTransform lastLive{};  // where `body` was the last frame it was alive
+    bool haveLive = false;
   };
   bool have = false;
   float yaw = 0.0f;         // the body's facing, so the orbit keeps a front
   std::vector<Limb> limbs;  // the GPU transform override
   LimbBoxes boxes;          // framing, limb focus and the outlines
+
+  // THE HANDLE IS NOT FOR LIFE. A carve on the corpse (venom or fire still
+  // eating the torso, a blade on the body) rebuilds that limb's collider
+  // (Mob::RebuildLimbBody) under a NEW handle, and a frozen limb still keyed
+  // on the old one matched no slot: the portrait drew it at its live
+  // transform — lying on the ground, out of frame — and the death screen
+  // showed a body with no torso (bug report 2026-10-07 21:00). Called every
+  // frame while frozen, so Physics::Successor's ring cannot age a rebuild out
+  // from under it. The rebuilt body may sit one carve rebase off the old one
+  // (ReskinLimbMicro shifts xf.pos against its voxels), so that shift, read in
+  // the old body's frame, is carried onto the frozen pose too.
+  void Follow(const Physics& phys) {
+    for (Limb& fl : limbs) {
+      BodyTransform cur;
+      if (phys.GetTransform(fl.body, cur)) {
+        fl.lastLive = cur;
+        fl.haveLive = true;
+        continue;
+      }
+      uint64_t h = fl.body;
+      bool found = false;
+      for (int hop = 0; hop < 16 && h; hop++) {
+        h = phys.Successor(h);
+        if (h && phys.GetTransform(h, cur)) { found = true; break; }
+      }
+      if (!found) continue;
+      if (fl.haveLive) {
+        const Quat qOld{fl.lastLive.quat[0], fl.lastLive.quat[1],
+                        fl.lastLive.quat[2], fl.lastLive.quat[3]};
+        const Quat qFrozen{fl.xf.quat[0], fl.xf.quat[1], fl.xf.quat[2],
+                           fl.xf.quat[3]};
+        const Vec3 local = QuatRotateInv(qOld, cur.pos - fl.lastLive.pos);
+        const Vec3 d = QuatRotate(qFrozen, local);
+        fl.xf.pos[0] += d.x; fl.xf.pos[1] += d.y; fl.xf.pos[2] += d.z;
+      }
+      fl.body = h;
+      fl.lastLive = cur;
+      fl.haveLive = true;
+    }
+  }
 };
 
 // Owner handle for wind primitives placed from the DEV PANEL, so "clear all"

@@ -44,6 +44,17 @@ inline Quat Mul(const Quat& a, const Quat& b) { return QuatMul(a, b); }
 inline Vec3 Rotate(const Quat& q, Vec3 v) { return QuatRotate(q, v); }
 inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
 
+// THE WORDS ON THE DEATH SCREEN FOR A VITAL LIMB AT ZERO. An infection
+// (venom, the rot) books its carve through FlushBurn exactly as fire does, so
+// it inherits fire's `deathBurnt` row -- and a snake bite that poisoned the
+// torso to death read "vital limb burnt/dissolved away" over a torso still 94%
+// there (bug report 2026-10-07 21:00). Named by the cause instead.
+static const char* VitalDeathCause(const SeverPolicy& pol, const DamageCtx& ctx) {
+  if (ctx.cause == DamageCause::Infection) return "vital limb poisoned (infection)";
+  return pol.deathBurnt ? "vital limb burnt/dissolved away"
+                        : "vital limb destroyed";
+}
+
 // ---- THE RIG-COHERENCE A/B ARM, IN ONE BINARY -------------------------------
 //
 // "A limp rig holds itself together" is two mechanisms that landed together on
@@ -1915,6 +1926,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           nw.strike.bite = s2.value("bite", 0.0f);
           nw.strike.biteRadius =
               std::clamp(s2.value("biteRadius", 1.0f), 0.05f, 4.0f);
+          nw.strike.biteStain =
+              std::clamp(s2.value("biteStain", 1.0f), 0.0f, 4.0f);
         }
         if (!nw.strike.Any())
           log += jp + ": natural weapon \"" + nw.name +
@@ -16418,8 +16431,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
     // split/neck rules below) is still what takes a head off.
     if (!collapsed && limbIndex < (int)limbDefs_.size() &&
         limbDefs_[limbIndex].vital && limbDefs_[limbIndex].severable) {
-      deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
-                                   : "vital limb destroyed";
+      deathCause_ = VitalDeathCause(pol, ctx);
       Die();
       // THE CORPSE KEEPS ITS HEAD AND ITS CARVE. The rig is still here (Die
       // no longer hands it away), so the lattice this carve just changed must
@@ -24835,7 +24847,10 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   //
   // Wider than a blade's rim by biteStainScale, because a tear is a ragged
   // hole rather than a clean slot -- the mess goes further than the damage.
-  const float rim = std::max(0.0f, gt.craterStainRim * gt.biteStainScale);
+  // ...times the biter's own biteStain (StrikeProfile): fangs inject, so a
+  // snake keeps its venom in the puncture rather than a ring round it.
+  const float rim = std::max(
+      0.0f, gt.craterStainRim * gt.biteStainScale * hit.stainScale);
   if (rim <= 0.0f) return true;
   if (hit.infectMat != 0) {
     // AN INFECTED WOUND. The exposed tissue is rewritten to the BITER's
@@ -25504,8 +25519,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
     // HOW IT DIED IS WRITTEN ONCE. A corpse is a dead Mob now and still loses
     // limbs (a fire, a later blast); that is not a second death.
     if (alive_)
-      deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
-                                   : "vital limb destroyed";
+      deathCause_ = VitalDeathCause(pol, ctx);
     Die();
   } else {
     // A VITAL LIMB THAT IS SEVERABLE COMES OFF, AND THEN THE CREATURE DIES OF
@@ -25529,8 +25543,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
         pol.byBlade && fatal && limbIndex < baseLimbs_ &&
         TrimNeckForSever(limbIndex);
     if (fatal && alive_)   // written once: see the root branch above
-      deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
-                                   : "vital limb destroyed";
+      deathCause_ = VitalDeathCause(pol, ctx);
       // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
       // anchor expressed through the severed limb's own live transform.
       //
@@ -28299,6 +28312,7 @@ static const char* InternDeathCause(const std::string& name) {
       "vital limb at zero under the burn cap",
       "vital limb destroyed",
       "vital limb burnt/dissolved away",
+      "vital limb poisoned (infection)",
   };
   for (const char* k : kKnown)
     if (name == k) return k;

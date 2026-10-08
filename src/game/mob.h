@@ -1968,6 +1968,7 @@ struct BiteHit {
   float power = 0.0f;  // 0..1, scales the tear's radius
   float radiusScale = 1.0f;  // StrikeProfile::biteRadius: the weapon's own
                              // multiple of gore.biteRadius (fangs < 1)
+  float stainScale = 1.0f;   // StrikeProfile::biteStain: the rim's multiple
   uint16_t infectMat = 0;    // material the tear rewrites exposed flesh to
   uint16_t infectStain = 0;  // LIQUID whose stain it smears over the hole
   uint32_t seed = 0;         // tear + stain draw key
