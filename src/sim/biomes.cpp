@@ -490,9 +490,14 @@ EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string
   EnvironmentStamp s;
   s.mapName = mapName;
   s.editLayer = editLayer;
-  if (!editLayer.empty())
-    s.edits = sandvox::HashOneFile(assetDir + "/worldedits/" + editLayer + ".svedit",
-                                   editLayer + ".svedit");
+  // The map's layer, then each locale's (L1), read from map.json on disk like
+  // the rest of the stamp.
+  {
+    std::vector<worldmap::LocaleDef> locales;
+    std::string lerr;
+    worldmap::ReadLocales(assetDir, mapName, locales, lerr);   // malformed = none: the loader refuses it anyway
+    s.edits = worldmap::HashEditLayerFiles(worldmap::MapEditLayerFiles(assetDir, mapName, editLayer, locales));
+  }
   // .svsculpt (P5): the sculpt layer is part of the map. A map without one
   // hashes exactly as it did before the layer existed.
   s.map = HashMapFiles(assetDir + "/worldmap/" + mapName);

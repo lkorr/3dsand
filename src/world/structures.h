@@ -169,9 +169,14 @@ void BedFromSlot(IVec3 slotPos, int slotYaw, IVec3 boxLo, IVec3 boxHi, IVec3& po
 // ---- the map side -------------------------------------------------------------
 // Every `structure` ref in <assetDir>/worldmap/<map>/refs/*.json (the SAME
 // parse RefStore uses), id order. Problems -> `warn`. Called by LoadWorldMap.
+// `resolveLocales`: a ref in a LOCALE's group (worldmap.h LocaleDef) has an
+// anchor-relative y in its file; true adds the locale's offset
+// (worldmap::LocaleRefYOffsets, resolved when the map is the loaded one) so
+// `y` is a world y. LoadWorldMap passes false and adds the offset itself once
+// the anchors are resolved.
 void ReadPlacements(const std::string& assetDir, const std::string& mapName,
                     std::vector<worldmap::StructurePlacement>& out,
-                    std::vector<std::string>& warn);
+                    std::vector<std::string>& warn, bool resolveLocales = true);
 
 // ---- live re-apply --------------------------------------------------------------
 // Is the GPU's site table in step with this ref (a site of this id, same base,

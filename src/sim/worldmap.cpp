@@ -22,6 +22,7 @@
 #include "sim/rng.h"
 #include "sim/treeatlas.h"   // ReadTreeSpeciesHeaders: a tree site's species index + reach
 #include "sim/tuning.h"
+#include "sim/tuningstamp.h"   // HashOneFile: the edit layers' fingerprint part (L1)
 #include "sim/voxload.h"
 #include "sim/world.h"
 #include "world/structures.h"   // P4: the map's `structure` refs become stamp sites
@@ -656,6 +657,138 @@ bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
   return true;
 }
 
+// ---- locales (L1, worldmap.h LocaleDef) ----------------------------------------
+namespace {
+// A locale id names its ref group and its folder: the ref id alphabet.
+bool LocaleIdOk(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s)
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+  return true;
+}
+// map.json `locales` -> `out`, table order. False + `err` on a malformed entry
+// (a missing id / bounds / anchor, corners the wrong way round, a duplicate
+// id, a layer name that is a path): a half-read locale would put its refs at
+// a height nobody authored. Softer doubts go to `warn`.
+bool ParseLocales(const json& j, std::vector<LocaleDef>& out, std::string& err,
+                  std::vector<std::string>* warn) {
+  out.clear();
+  if (!j.contains("locales")) return true;
+  if (!j["locales"].is_array()) { err = "locales must be an array"; return false; }
+  auto pair = [](const json& o, const char* k, int& a, int& b) {
+    if (!o.contains(k) || !o[k].is_array() || o[k].size() != 2 || !o[k][0].is_number() || !o[k][1].is_number())
+      return false;
+    a = o[k][0].get<int>();
+    b = o[k][1].get<int>();
+    return true;
+  };
+  for (const json& l : j["locales"]) {
+    LocaleDef d;
+    if (!l.is_object() || !l.contains("id") || !l["id"].is_string()) { err = "a locale needs an \"id\""; return false; }
+    d.id = l["id"].get<std::string>();
+    const std::string who = "locale \"" + d.id + "\": ";
+    if (!LocaleIdOk(d.id)) { err = who + "the id is its ref group and folder name: [a-z0-9_-]+"; return false; }
+    for (const LocaleDef& o : out)
+      if (o.id == d.id) { err = who + "two locales with this id"; return false; }
+    d.name = l.value("name", d.id);
+    d.icon = l.value("icon", std::string());
+    const json b = l.contains("bounds") && l["bounds"].is_object() ? l["bounds"] : json::object();
+    if (!pair(b, "min", d.x0, d.z0) || !pair(b, "max", d.x1, d.z1)) {
+      err = who + "needs bounds {min: [x, z], max: [x, z]} in world voxels";
+      return false;
+    }
+    if (d.x1 < d.x0 || d.z1 < d.z0) { err = who + "bounds min is not below max on both axes"; return false; }
+    const json an = l.contains("anchor") && l["anchor"].is_object() ? l["anchor"] : json::object();
+    if (!pair(an, "at", d.ax, d.az) || !an.contains("y") || !an["y"].is_number()) {
+      err = who + "needs anchor {at: [x, z], y} (y = the authored ground at `at`)";
+      return false;
+    }
+    d.ay = an["y"].get<int>();
+    if (l.contains("editLayer")) {
+      if (!l["editLayer"].is_string()) { err = who + "editLayer must be a file name"; return false; }
+      d.editLayer = l["editLayer"].get<std::string>();
+      if (d.editLayer.size() > 7 && d.editLayer.compare(d.editLayer.size() - 7, 7, ".svedit") == 0)
+        d.editLayer.resize(d.editLayer.size() - 7);
+      if (d.editLayer.empty() || d.editLayer.find_first_of("/\\:.") != std::string::npos) {
+        err = who + "editLayer is a file name under locales/" + d.id + "/ (\"ground\"), not a path";
+        return false;
+      }
+    }
+    if (warn && (d.ax < d.x0 || d.ax > d.x1 || d.az < d.z0 || d.az > d.z1))
+      warn->push_back(who + "anchor (" + std::to_string(d.ax) + "," + std::to_string(d.az) +
+                      ") is outside its bounds; the locale rides the ground THERE");
+    out.push_back(std::move(d));
+  }
+  return true;
+}
+std::string LocaleLayerStem(const LocaleDef& l) { return l.editLayer.empty() ? std::string("ground") : l.editLayer; }
+}  // namespace
+
+bool ReadLocales(const std::string& assetDir, const std::string& mapName, std::vector<LocaleDef>& out,
+                 std::string& err) {
+  out.clear();
+  std::ifstream f(assetDir + "/worldmap/" + mapName + "/map.json");
+  if (!f) return true;
+  json j;
+  try { f >> j; } catch (const std::exception& e) {
+    err = "map.json does not parse: " + std::string(e.what());
+    return false;
+  }
+  return ParseLocales(j, out, err, nullptr);
+}
+
+std::map<std::string, int> LocaleRefYOffsets(const std::string& assetDir, const std::string& mapName,
+                                             std::vector<std::string>* warn) {
+  std::map<std::string, int> off;
+  std::vector<LocaleDef> ls;
+  std::string err;
+  if (!ReadLocales(assetDir, mapName, ls, err)) {
+    if (warn) warn->push_back("worldmap/" + mapName + "/map.json: " + err + " -- no locale offsets applied");
+    return off;
+  }
+  const WorldMapData& cur = CurrentWorldMap();
+  for (const LocaleDef& l : ls) {
+    const LocaleDef* live = nullptr;
+    if (cur.name == mapName)
+      for (const LocaleDef& c : cur.locales)
+        if (c.id == l.id && c.ay == l.ay && c.ax == l.ax && c.az == l.az && c.resolved) live = &c;
+    if (live) {
+      off[l.id] = live->RefYOffset();
+    } else {
+      off[l.id] = l.ay;
+      if (warn)
+        warn->push_back("locale \"" + l.id + "\": the world map '" + mapName +
+                        "' is not the loaded one, so its refs sit at their AUTHORED height (anchor y " +
+                        std::to_string(l.ay) + ", delta 0)");
+    }
+  }
+  return off;
+}
+
+std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::string& assetDir,
+                                                                   const std::string& mapName,
+                                                                   const std::string& editLayer,
+                                                                   const std::vector<LocaleDef>& locales) {
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!editLayer.empty()) out.push_back({assetDir + "/worldedits/" + editLayer + ".svedit", editLayer + ".svedit"});
+  for (const LocaleDef& l : locales) {
+    const std::string stem = LocaleLayerStem(l);
+    const std::string p = assetDir + "/worldmap/" + mapName + "/locales/" + l.id + "/" + stem + ".svedit";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(p, ec)) out.push_back({p, l.id + "/" + stem + ".svedit"});
+  }
+  return out;
+}
+
+uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string>>& files) {
+  uint32_t h = 0;
+  for (size_t i = 0; i < files.size(); i++) {
+    const uint32_t x = sandvox::HashOneFile(files[i].first, files[i].second);
+    h = i == 0 ? x : (h * 16777619u) ^ x;
+  }
+  return h;
+}
+
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
                   WorldMapData& out, std::string& log, const std::string* mapJson) {
@@ -700,6 +833,25 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       log += at + "editLayer must be a bare layer name; ignored\n";
       out.editLayer.clear();
     }
+  }
+  // L1: the locales. Resolved (each anchor's bare ground for `seed`) at the
+  // site-pad bake below, once the planes, the sculpt layer and every site the
+  // bare ground reads are in place.
+  {
+    std::string lerr;
+    std::vector<std::string> lwarn;
+    if (!ParseLocales(j, out.locales, lerr, &lwarn)) {
+      log += at + lerr + "\n";
+      return false;
+    }
+    for (const std::string& w : lwarn) warn(w);
+    for (const LocaleDef& l : out.locales)
+      if (!l.editLayer.empty()) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(dir + "/locales/" + l.id + "/" + l.editLayer + ".svedit", ec))
+          warn("locale \"" + l.id + "\": editLayer locales/" + l.id + "/" + l.editLayer +
+               ".svedit does not exist; the locale has no edit layer");
+      }
   }
   // ---- terrain (P-G): the numbers that used to be worldgen.* --------------------
   // Every length is authored at `refVoxelsPerMetre` voxels to the metre and
@@ -1182,7 +1334,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     if (StructureOverrideActive()) {
       placements = *StructureOverrideSlot();
     } else {
-      structures::ReadPlacements(assetDir, name, placements, swarn);
+      // FILE y: a locale group's offset is not known until the planes are
+      // read (the pad bake below adds it).
+      structures::ReadPlacements(assetDir, name, placements, swarn, /*resolveLocales=*/false);
     }
     for (const std::string& w : swarn) warn(w);
     std::map<std::string, structures::Asset> assets;   // one load per base
@@ -1231,6 +1385,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.refPadApron = sp.padApron;
       st.salt = 0;
       st.padY = sp.y - 1;   // the AUTHORED floor: ground top is one below GRADE
+      // A locale's house: refY / padY are relative to its anchor until the
+      // pad bake adds the locale's offset.
+      for (size_t li = 0; li < out.locales.size(); li++)
+        if (out.locales[li].id == sp.group) st.locale = static_cast<int>(li);
       st.sink = f.sink;
       if (st.sink > static_cast<int>(kStampSinkMax)) {
         warn(who + "base: \"" + sp.base + "\" has " + std::to_string(st.sink) +
@@ -1641,7 +1799,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       if (a.kind == kSiteStamp && b.kind == kSiteStamp) {
         const int64_t g = rectGap(a, b);
         if (g <= a.apron || g <= b.apron) return true;   // the flat cores themselves meet
-        if (a.structure && b.structure && a.padY == b.padY) return false;   // map stamps bake padY below
+        // (map stamps bake padY below; a locale's houses carry the locale's
+        // offset there too, so only two of ONE locale -- or of none -- are
+        // known to share a floor yet)
+        if (a.structure && b.structure && a.locale == b.locale && a.padY == b.padY) return false;
         return g - b.apron < a.apron + a.padMargin || g - a.apron < b.apron + b.padMargin;
       }
       return meets(fpOf(a, false), fpOf(b, false));
@@ -1706,6 +1867,24 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       if (st.structure) continue;   // the AUTHORED floor, set above (P4)
       st.padY = st.kind == kSiteWater || st.kind == kSiteClearing || st.kind == kSiteSoften || st.kind == kSitePath
                     ? 0 : BareGroundHeight(st.x, st.z, seed);
+    }
+    // THE LOCALES' ANCHORS (L1, worldmap.h LocaleDef): the bare ground at each
+    // anchor for this seed, and every house of the locale's ref group lifted
+    // by the locale's offset (anchor.y + delta) from its anchor-relative file
+    // y. Bare ground reads no pad, so the houses being in the table still at
+    // their relative floors does not matter; it does read the soften boxes
+    // and the routes, which are all in place.
+    for (LocaleDef& l : out.locales) {
+      l.groundY = BareGroundHeight(l.ax, l.az, seed);
+      l.resolved = true;
+      std::printf("world map: '%s' locale '%s' anchor (%d,%d): ground y%d, authored y%d, delta %+d\n",
+                  name.c_str(), l.id.c_str(), l.ax, l.az, l.groundY, l.ay, l.Delta());
+    }
+    for (WorldMapData::StampSite& st : out.sites) {
+      if (!st.structure || st.locale < 0) continue;
+      const int off = out.locales[static_cast<size_t>(st.locale)].RefYOffset();
+      st.padY += off;
+      st.refY += off;
     }
     // A RAMP NEVER STEPS MORE THAN A VOXEL (2026-09-29). The smoothstep's
     // steepest point is 1.5 x the height it makes up over the margin, so a
@@ -1791,6 +1970,12 @@ std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m
   }
   j["softens"] = nSoft;
   j["routes"] = nRoute;
+  // L1: each locale as resolved for the check's seed -- how far the ground at
+  // its anchor has moved since it was authored (the locale page shows it).
+  json ls = json::array();
+  for (const LocaleDef& l : m.locales)
+    ls.push_back({{"id", l.id}, {"groundY", l.groundY}, {"anchorY", l.ay}, {"delta", l.Delta()}});
+  j["locales"] = ls;
   j["siteCellMax"] = static_cast<int>(kSiteCellMax);
   // Map v2: the extent and what the planes hold (authored tiles; the rest
   // are the planes' defaults).

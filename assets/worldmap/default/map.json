@@ -104,5 +104,30 @@
     }
   ],
   "rules": [],
+  "locales": [
+    {
+      "id": "harrowby",
+      "name": "Harrowby",
+      "icon": "village",
+      "bounds": {
+        "min": [
+          330,
+          3090
+        ],
+        "max": [
+          790,
+          3650
+        ]
+      },
+      "anchor": {
+        "at": [
+          555,
+          3467
+        ],
+        "y": 201
+      },
+      "about": "The hamlet north of the spawn (docs/EDITOR_GUIDE.md section 14). Its refs (refs/harrowby.json) are stored with y RELATIVE to anchor.y; at load the engine adds the bare ground at anchor.at for the seed in force, so the whole village rides the ground if the world under it is reshaped. Its own ground cells are locales/harrowby/ground.svedit."
+    }
+  ],
   "editLayer": "default_ground"
 }

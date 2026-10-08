@@ -37,6 +37,8 @@ const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
 const std::vector<Gate>& EnvTruthGates();
 const std::vector<Gate>& MapV2Gates();
+// Locales (docs/PLAN_map_v2.md L1): CPU only, a synthetic map in a temp dir.
+const std::vector<Gate>& LocaleGates();
 // The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
 // shelled out to through scripts/generator_parity.mjs. No World, no GPU.
 const std::vector<Gate>& GeneratorGates();
@@ -274,6 +276,12 @@ const char* const kOrder[] = {
     // edge fade. The `sculpt` gate's seam and exit (reload, regenerate, far
     // refill), so `waterbody` still sees what `terrain` left.
     "worldmap-v2",
+    // With it, locales (docs/PLAN_map_v2.md L1): a synthetic map in a TEMP
+    // asset dir whose height plane is raised under a locale -- the locale's
+    // house, pad, refs and edit layer move by exactly the anchor's change, an
+    // ordinary group does not, overlapping layers resolve map-then-locale.
+    // CPU only; the loaded map is put back as it was.
+    "locale",
     // With it: the map's spawn site is where a player can actually start --
     // outside the harness box, on land, not in a tarn, where trees may grow.
     // CPU only (the height mirror and the map), nothing left behind.
@@ -1260,7 +1268,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &GeneratorGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &MapV2Gates(), &LocaleGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &TicketGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

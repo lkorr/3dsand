@@ -154,6 +154,9 @@ export const LIVE = {
     // map-overhaul P7 (b5359be) moved the edit layer from tuning.json world.editLayer
     // to the map; 5e62edf first shipped a map that names one.
     'editLayer': R('worldmap.cpp LoadWorldMap: the assets/worldedits/<name>.svedit layer applied over this map’s worldgen as an op-stream patch (DESIGN.md §9c.4)'),
+    // map v2 L1: a locale's ref group rides the ground at its anchor; its own
+    // edit layer applies after the map's.
+    'locales[]': R('worldmap.cpp LoadWorldMap (worldmap.h LocaleDef): a hand-made place -- bounds, an anchor whose ground lifts every ref of refs/<id>.json (stored relative to anchor.y), and locales/<id>/ground.svedit merged after the map layer (DESIGN.md §9g)'),
     'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), and kind "tree" AUTHORED TREES (P6: a species at a column, near and far), kind "clearing" FOREST CLEARINGS (a box no crown reaches over) and kind "soften" SOFTENED GROUND (a box whose hills / bumps / grain are scaled, the village routes flatter still). Each is listed in the map cells its reach touches (at most four a cell) and keeps out by its own footprint'),
     // P-G: the terrain, per map (worldmap.h kHTerrain*), read by the height
     // mirror on both sides through the worldMap header. Every number that

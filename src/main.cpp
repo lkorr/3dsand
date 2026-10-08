@@ -6170,6 +6170,29 @@ int main(int argc, char** argv) {
     refs::RegisterAllKinds();
     refs::RefStore store;
     const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
+    // The world map too, CPU-only (--mapcheck's load), when the map has
+    // LOCALES (L1): a locale's refs are stored relative to its anchor, and the
+    // store converts world <-> file y through the anchor's ground for the
+    // default seed, which only a loaded map can say. A map without locales
+    // never pays the load.
+    {
+      std::vector<worldmap::LocaleDef> locales;
+      std::string lerr;
+      if (worldmap::ReadLocales(ad, mapName, locales, lerr) && !locales.empty()) {
+        std::vector<MaterialDef> m;
+        std::vector<ReactionGpu> rx;
+        std::string errs, blog;
+        biomes::BiomeSet set;
+        worldmap::WorldMapData map;
+        if (LoadAssets(ad + "/materials/materials.json", ad + "/materials/reactions.json", m, rx, errs) &&
+            biomes::LoadBiomeSet(ad, m, set, blog) &&
+            worldmap::LoadWorldMap(ad, mapName, set, m.size(), kDefaultSeed, map, blog))
+          worldmap::SetCurrentWorldMap(std::move(map));
+        else
+          std::fprintf(stderr, "--edit-script: map '%s' did not load (%s%s); its locales' refs are written "
+                               "against their authored anchor heights\n", mapName.c_str(), errs.c_str(), blog.c_str());
+      }
+    }
     store.LoadMap(ad, mapName);
     editor::Session es;
     es.ctx.refs = &store;
