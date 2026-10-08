@@ -15107,13 +15107,64 @@ Status GateNetPlayerMelee(Ctx& c, std::string& detail) {
     }
   }
 
-  const bool ok = okA && okB && okC && okD;
+  // ======== E: a spell cast from B's hand shows on A's ghost ================
+  // The owner's arm performs a cast the way the player's tick does it
+  // (game/spellhand.h: `spell_ready` on the LEFT hand, then the `throw`
+  // gesture through the one weapon-arm claim), held at its last key so the
+  // arm is still. NOTHING about spells is on the wire: the ghost is placed
+  // from the owner's streamed limb transforms, so its left hand must stand
+  // where B's does -- and away from where it rested before the cast.
+  bool okE = false;
+  double eToOwner = -1.0, eMoved = -1.0;
+  {
+    GlyphLibrary glib;
+    std::string gerr;
+    LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, glib, gerr);
+    const int g = glib.gestures.Find("throw");
+    const SpellGesture* gs = glib.gestures.At(g);
+    const int handPart = avB.HandPart(Hand::Left);
+    auto handAt = [&](MobSystem& m, Physics& ph, uint64_t id, Vec3& out) {
+      BodyTransform xf{};
+      const uint64_t h = handPart >= 0 ? m.LimbBody(id, handPart) : 0;
+      if (h == 0 || !ph.GetTransform(h, xf)) return false;
+      out = xf.pos;
+      return true;
+    };
+    Vec3 rest{};
+    const bool haveRest = handAt(c.mobs, c.phys, ghost.Id(), rest);
+    CastGestureRun run;
+    CastArmState arm;
+    bool clip = false;
+    BeginCastGesture(run, arm, g, HandIndex(Hand::Left));
+    const Vec3 aim = QuatRotate(QuatAxisAngle({0, 1, 0}, avB.Heading()), Vec3{0, 0, 1});
+    for (int i = 0; gs != nullptr && i < gs->endTicks + 6; i++) {
+      SpellReadyClip(avB, Hand::Left, true, clip);
+      WeaponPose wp;
+      if (CastArmPose(avB, arm, run, glib.gestures, aim, wp)) avB.SetWeaponPose(wp);
+      if (run.ticks < gs->endTicks) AdvanceCastGesture(run, *gs, false);
+      step();
+    }
+    Vec3 ga{}, gb{};
+    if (haveRest && handAt(c.mobs, c.phys, ghost.Id(), ga) &&
+        handAt(far, farPhys, avB.Id(), gb)) {
+      eToOwner = (ga - gb).len();
+      eMoved = (ga - rest).len();
+    }
+    const double movedMin = BaselineNumber("netPlayerMeleeCastMovedVox", 1.0);
+    okE = gs != nullptr && eToOwner >= 0.0 && eToOwner <= ownerTol && eMoved >= movedMin;
+    DropCastArm(avB, arm);
+    SpellReadyClip(avB, Hand::Left, false, clip);
+  }
+
+  const bool ok = okA && okB && okC && okD && okE;
   detail = Format(
+      "E cast gesture on the ghost=%d (left hand %.3f vox from B's, moved %.2f from rest) | "
       "A dressed+posed=%d (slot A %d / B %d same %d, %d limbs placed, err %.4f "
       "(tol %.2f), sword %.3f vox from B's (tol %.1f)) | B player parry=%d "
       "(blade live %d, arrested on A %d, parries on B %llu, sword hp %.1f->%.1f, "
       "B skin %lld->%lld) | C blow on a player=%d (B skin -%lld, applied %llu) | "
       "D loose=%d (A ghost -%lld, A gore %zu, A owned bodies %u->%u, B body -%lld; %s)",
+      okE ? 1 : 0, eToOwner, eMoved,
       okA ? 1 : 0, heldA, heldB, sameSlot ? 1 : 0, placed, placeErr, placeTol,
       swordToOwner, ownerTol, okB ? 1 : 0, live ? 1 : 0, arrested ? 1 : 0,
       (unsigned long long)parries, itemHp0, itemHp1, (long long)fleshB0,

@@ -26119,6 +26119,40 @@ the `AttackRequest` seam's twin: `MobSystem::CastRequests()`, at most one per
 mob per tick, pushed in `DecideIntent` beside the attack request (a stunned
 body issues none). The arbiter does not know what a spell is.
 
+**A CREATURE CASTS FROM ITS HAND, THE PLAYER'S WAY (2026-10-08,
+`game/spellhand.*`, `MobCastBegin` / `MobHandCast`).** The AI's request and a
+demon's malice no longer cast on the spot. `MobCastBegin` draws the spell
+exactly as below (the `Pick` mode of the one serve) and puts it INTO A HAND:
+an empty working hand if there is one (right first) -- else the OFF hand's
+item is PUT AWAY into the creature's kit (the `Sheath` slot for a blade, else
+the first free bag slot, coat and contents captured), else the main hand's.
+Then the hand is ARMED (`spell_ready`, 6 ticks), the delivery's GESTURE runs
+(`gestures.json`, the same `CastGestureRun` / `CastArmPose` the player's tick
+uses), and on its RELEASE tick the spell leaves from the fist toward where
+the target is NOW (`Release` mode: `SpellHandWorld` + 1.5 voxels along the
+line). The spell lingers in the hand 24 ticks (a draw then casts straight
+from it), is let go, and what was put away is DRAWN BACK into the same hand
+as it was (`EquipItemAsWas`). While any of that runs the body is
+`Mob::CastBusy`: the AI's swing and guard are refused, and the gesture's pose
+is `Mob::SetCastArm`, re-applied after the creature's own stroke step every
+tick so the melee driver never has the last word on the arm. A request while
+one is mid-gesture is `Busy`. A creature with no hand to cast from, or a spell
+with no gesture, casts from the chest on the spot as before; `MobCastServe`
+stays that synchronous path for scripted casts. The cast in a hand is not
+saved (no caster is); a blade a save caught in the sheath is drawn back by
+`DrawSheathed` (once a second, AI creatures with a free working hand). The
+fist holds the spell's light (`MobCastAppendHandLights`, main.cpp's sprite
+pass, the player's colour rule). Content: the `battlemage` profile (a
+swordsman with firebolt / gust at 12..44 voxels). Gate `npc-hand-cast`.
+
+**ON A PEER.** Nothing about a cast is on the wire, and nothing needs to be:
+a player's body and every creature's are placed on the other machine from
+the owner's streamed limb transforms (`MobPose`), so the armed hand and the
+gesture arrive as the arm itself. `net-player-melee` pass E holds that for a
+player (the ghost's casting hand within `ownerTol` of the owner's, and moved
+from rest). NOT on a peer yet: the light in the fist (it is drawn from the
+local caster state).
+
 **THE CONSUMER (`MobCastTick`, TickAuthority right after phase H's
 `mobs.PreTick`).** Each casting creature gets its OWN `SpellSystem` and
 `CasterState` (`MobCastWorld::casters`, created on its first request, at most

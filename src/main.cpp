@@ -18504,6 +18504,25 @@ int main(int argc, char** argv) {
           push(at + Vec3{0.15f * std::sin(tNow * 7.0f + phase), 0.3f + rise * 1.1f, 0.0f},
                0.12f * (1.0f - rise), scaleColor(col, 0.9f), 1.4f * (1.0f - rise));
         }
+        // ...AND A CREATURE'S (demon_cast.h MobHandCast): the same light in
+        // the fist that holds a spell, for as long as the spell is in it.
+        {
+          std::vector<MobHandLight> lights;
+          MobCastAppendHandLights(tickCtx, lights);
+          for (const MobHandLight& l : lights) {
+            const float phase = (float)(l.mobId % 7u) * 0.9f;
+            const float breathe = 1.0f + 0.15f * std::sin(tNow * 4.0f + phase);
+            if (!push(l.at, 0.32f * breathe, l.color, 1.6f)) break;
+            for (int k = 0; k < 3; k++) {
+              const float ang = tNow * (3.0f + 0.9f * (float)k) + phase + (float)k * 2.094f;
+              const Vec3 u = k == 1 ? Vec3{0, 0.7071f, 0.7071f} : Vec3{1, 0, 0};
+              const Vec3 v = k == 1 ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+              if (!push(l.at + (u * std::cos(ang) + v * std::sin(ang)) * 0.75f, 0.1f,
+                        scaleColor(l.color, 1.25f), 2.2f))
+                break;
+            }
+          }
+        }
         // Bombs are debris bodies and the debris path draws them; the fuse
         // sparks on top, faster as it runs down.
         for (const SpellBomb& bm : spells.Bombs()) {

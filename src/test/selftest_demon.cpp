@@ -557,6 +557,7 @@ Status GateDemonSeals(Ctx& c, std::string& detail);   // selftest_demon_seals.cp
 Status GateDemonContract(Ctx& c, std::string& detail);   // selftest_demon_contract.cpp
 Status GateDemonCast(Ctx& c, std::string& detail);    // selftest_demon_cast.cpp (D4)
 Status GateDemonMalice(Ctx& c, std::string& detail);  // selftest_demon_malice.cpp (D6)
+Status GateNpcHandCast(Ctx& c, std::string& detail);  // selftest_demon_cast.cpp
 
 const std::vector<Gate>& DemonGates() {
   static const std::vector<Gate> g = {
@@ -569,6 +570,9 @@ const std::vector<Gate>& DemonGates() {
       {"demon-cast", "mob", {}, false, GateDemonCast},
       // D6 (selftest_demon_malice.cpp): motives, schemes, twists, penalties, Vathrael.
       {"demon-malice", "mob", {}, false, GateDemonMalice},
+      // Creatures cast from a HAND (spell in, weapon put away and drawn back, the
+      // gesture, the release from the fist): selftest_demon_cast.cpp.
+      {"npc-hand-cast", "mob", {}, false, GateNpcHandCast},
   };
   return g;
 }

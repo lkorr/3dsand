@@ -648,23 +648,13 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
 static void PoseSpellReady(PlayerSession& s, PlayerAvatar& avatar,
                            const HandsNow& hands) {
   for (int hk = 0; hk < kHands; hk++) {
-    const Hand h = HandAt(hk);
     // Also an arm whose hand is GONE but still has a spell equipped: the pose
     // is what places that spell (SpellHandPoint reads the absent hand's posed
     // point), so the stump presents it where the hand would.
     const bool armed = avatar.Spawned() &&
                        (hands.hand[hk].spell ||
                         (hands.hand[hk].item == nullptr && s.caster.hand[hk].Equipped()));
-    const std::string clip = avatar.HandClip("spell_ready", h);
-    if (clip.empty()) continue;
-    // Re-played if it is gone while it should be up: an R/F5 reload rebuilds
-    // the rig's clip state under a hand that is still armed.
-    const bool lost = armed && s.spellClip[hk] && avatar.ClipWeight(clip.c_str()) <= 0.0f;
-    if (armed != s.spellClip[hk] || lost) {
-      if (armed) avatar.PlayClip(clip);
-      else avatar.StopClip(clip);
-    }
-    s.spellClip[hk] = armed;
+    SpellReadyClip(avatar, HandAt(hk), armed, s.spellClip[hk]);
   }
 }
 
@@ -688,85 +678,23 @@ static void PoseSpellReady(PlayerSession& s, PlayerAvatar& avatar,
 static void PoseSpellHands(PlayerSession& s, PlayerAvatar& avatar,
                            const HandsNow& hands, const GlyphLibrary& glyphs,
                            Vec3 aim, bool strikeLive) {
-  const int hk = s.spellArmHand;
+  const int hk = s.spellArm.hand;
   if (hk < 0) return;
-  const Hand h = HandAt(hk);
-  auto drop = [&] {
-    s.spellArmHand = -1;
-    s.spellArmW = 0.0f;
-    s.spellArmFresh = false;
-  };
   // A strike took the arm (its effector is the strike's now: leave it), or
   // the bench is carrying a flask.
   if (strikeLive || s.benchPourW > 0.0f) {
-    drop();
+    s.spellArm = CastArmState{};
     return;
   }
-  const int part = h == Hand::Left ? avatar.Parts().handL : avatar.Parts().handR;
-  const PlayerSession::SpellGestureRun& run = s.spellGesture[hk];
-  const SpellGesture* g = glyphs.gestures.At(run.gesture);
-  // The hand stopped being a spell hand (an item arrived, the arm was ruined),
-  // the gesture is over and gone, or the body is: hand the arm straight back.
-  if (!avatar.Spawned() || !hands.hand[hk].spell || part < 0 || !avatar.HandUsable(h) ||
-      g == nullptr || g->keys.empty()) {
-    avatar.ClearStrikeEffector();
-    drop();
+  // The hand stopped being a spell hand (an item arrived, the arm was ruined)
+  // or the body is gone: hand the arm straight back.
+  if (!avatar.Spawned() || !hands.hand[hk].spell) {
+    DropCastArm(avatar, s.spellArm);
     return;
   }
-  avatar.SetStrikeHand(h);
-  avatar.SetStrikeEffector(part, StrikeEffectorMode::Chain);
-  Vec3 live;
-  float reach = 0;
-  if (!avatar.WeaponArmPose(live, reach) || reach <= 1e-3f) {
-    avatar.ClearStrikeEffector();
-    drop();
-    return;
-  }
-  const float side = HandSideSign(h);
-  const Vec3 bodyFwd = QuatRotate(QuatAxisAngle({0, 1, 0}, avatar.Heading()), Vec3{0, 0, 1});
-  const GestureBasis basis = MakeGestureBasis(g->frame, aim, bodyFwd, side);
-  if (s.spellArmFresh) {
-    s.spellArmFrom = basis.FromWorld(live) * (1.0f / reach);
-    s.spellArmFresh = false;
-  }
-  if (run.ticks <= g->endTicks) {
-    s.spellArmW = 1.0f;
-  } else {
-    s.spellArmW *= std::exp(-kTickDt * 10.0f);
-    if (s.spellArmW < 0.02f) {
-      avatar.ClearStrikeEffector();
-      drop();
-      return;
-    }
-  }
-  const GestureSample gs =
-      SampleGesture(*g, GestureTicksToMs(std::min(run.ticks, g->endTicks)), s.spellArmFrom);
-  Vec3 target = basis.ToWorld(gs.hand) * reach;
-  // Short of straight: the two-bone solve is ill-conditioned at full reach.
-  const float l = target.len();
-  if (l > reach * 0.98f) target = target * (reach * 0.98f / l);
-  Vec3 pole = basis.ToWorld(gs.pole);
-  pole = pole.len() > 1e-4f ? pole.normalized() : Vec3{0, -1, 0};
-  constexpr float kDeg = 3.14159265f / 180.0f;
   WeaponPose wp;
-  wp.hand = target;
-  wp.weight = s.spellArmW;
-  wp.steerBlade = false;
-  // THE ELBOW IS THE GESTURE'S. The rig's own elbow-back pole is antiparallel
-  // to a hand straight out in front at shoulder height and flipped the elbow
-  // from tick to tick (PoseBenchHands says so at length), so every key names
-  // where it bulges - down for a push, out to the side for the hand up by the
-  // head, back for the arm swung past the hip - with the hinge cone open so
-  // the clamp does not refuse the bend it asks for.
-  wp.usePole = true;
-  wp.bendPole = pole;
-  wp.elbowAxisCone = 3.14159265f;
-  // The torso joins the throw: + turns the casting side's shoulder back, so
-  // the left hand's twist is the mirror. Weight-scaled, as the melee driver's
-  // are, so it fades with the claim.
-  wp.torsoTwist = gs.twistDeg * kDeg * side * s.spellArmW;
-  wp.torsoPitch = gs.pitchDeg * kDeg * s.spellArmW;
-  avatar.SetWeaponPose(wp);
+  if (CastArmPose(avatar, s.spellArm, s.spellGesture[hk], glyphs.gestures, aim, wp))
+    avatar.SetWeaponPose(wp);
 }
 
 static inline uint32_t OpLandingTick(const TickAuthorityCtx& w, uint32_t tick) {
@@ -3300,7 +3228,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // (Nor while a cast has an arm thrown out: PoseSpellHands holds
             // the claim on the spell hand until it has faded.)
             if (!playerStrike.Active() && melee.Phase() == SwingPhase::Idle &&
-                s.benchPourW <= 0.0f && s.spellArmHand < 0) {
+                s.benchPourW <= 0.0f && s.spellArm.hand < 0) {
               Hand idle = s.lastHand;
               if (!hands[idle].ready && hands[OtherHand(idle)].ready)
                 idle = OtherHand(idle);
@@ -4231,22 +4159,17 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // through the same Cast (thesis 2).
         for (int hk = 0; hk < kHands; hk++) {
           const Hand h = HandAt(hk);
-          PlayerSession::SpellGestureRun& run = s.spellGesture[hk];
+          CastGestureRun& run = s.spellGesture[hk];
           if (!hands[h].spell) {
             run = {};
             continue;
           }
           const PlayerCaster::HandSpell& hs = caster.hand[hk];
           const int button = h == Hand::Right ? TB_ATTACK : TB_ALT;
+          // The arm is this gesture's from the next pose (the latest press
+          // takes the one claim), starting where the hand is now.
           auto begin = [&] {
-            run = {};
-            run.gesture = CastGesture(glyphs, hs.compiled);
-            // The arm is this gesture's from the next pose (the latest press
-            // takes the one claim), starting where the hand is now.
-            if (run.gesture >= 0) {
-              s.spellArmHand = hk;
-              s.spellArmFresh = true;
-            }
+            BeginCastGesture(run, s.spellArm, CastGesture(glyphs, hs.compiled), hk);
           };
           auto fire = [&] {
             run.fired = true;
@@ -4282,7 +4205,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             run = {};
             continue;
           }
-          if (!run.fired && run.ticks >= g->releaseTicks) {
+          if (CastGestureReleases(run, *g)) {
             fire();
             // The press kept from the wind-up throws again from here.
             if (run.again) {
@@ -4296,12 +4219,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           }
           // The clock. A gesture with a hold (a beam) stops at it while the
           // button stays down, so the arm stays out as the beam's barrel.
-          const bool holding = run.fired && g->holdTicks >= 0 && run.ticks >= g->holdTicks &&
-                               ti.Held(button);
-          if (!holding) run.ticks++;
-          // Long enough after the last key for PoseSpellHands to have faded
-          // the claim out (~12 ticks at its rate), the run is over.
-          if (run.fired && run.ticks > g->endTicks + 15) run = {};
+          AdvanceCastGesture(run, *g, ti.Held(button));
         }
 
         // A held beam follows the aim while the button of the hand that cast

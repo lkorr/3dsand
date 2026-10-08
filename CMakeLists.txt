@@ -554,6 +554,7 @@ add_library(sandvox_core OBJECT
   src/game/pose.cpp
   src/game/thirdperson.cpp
   src/game/spell.cpp
+  src/game/spellhand.cpp
   src/game/demon.cpp
   src/game/demon_circle.cpp
   src/game/demon_seals.cpp

@@ -370,6 +370,37 @@
       ]
     },
     {
+      "comment": "THE BATTLEMAGE (2026-10-08): a swordsman who also CASTS, the human proof of game/demon_cast.h's hand path. Close in it fights like the swordsman (the same styles, guard and riposte); between 12 and 44 voxels off it throws a firebolt or a gust. A spell goes INTO A HAND the way the player's does (game/spellhand.h): an empty hand if it has one, else the off hand's item is put away into the sheath or bag for the cast and drawn back after it; the arm performs the delivery's gesture (assets/spells/gestures.json) and the spell leaves at the release. Spell names are assets/demons/spells/ stems; its own mana pool.",
+      "name": "battlemage",
+      "label": "Battlemage",
+      "color": 3225419775,
+      "faction": "monster",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 50, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 200, "keepRangeScale": 1.45, "stickiness": 6, "preferWeak": 4 },
+      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.55, "retreatSpeed": 0.8, "fleeSpeed": 1.1, "circleTendency": 0.75, "circleHoldTicks": 30, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.35, "flank": 0.75, "keepOut": -1 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diag_tr_bl", "diag_tl_br", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 20, "commitTicks": 10, "disengageTicks": 22, "pursueSpeed": 0.7, "leadTicks": 15, "feintChance": 0.08, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 4 },
+      "defense": { "skill": 0.5, "reactTicks": 7, "reactJitter": 6, "margin": 2.5, "guardStance": 0.2, "guardReach": 0.85, "holdTicks": 4 },
+      "cast": { "spells": ["firebolt", "firebolt", "gust"], "rangeMin": 12, "rangeMax": 44, "cadenceTicks": 120, "jitterTicks": 60, "firstDelayTicks": 30, "commitTicks": 8, "aimTolerance": 0.5, "mana": 600, "regenPerMille": 400, "maxLive": 1 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.9, "cooldownTicks": 18, "minDwellTicks": 24 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "flee": { "weight": 0, "cooldownTicks": 0, "minDwellTicks": 30 },
+        "guard": { "weight": 2.4, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "dodge": { "weight": 1.2, "cooldownTicks": 10, "minDwellTicks": 8 },
+        "cast": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 }
+      },
+      "rules": [
+        { "note": "empty-handed: get inside and brawl", "when": { "armed": 0 }, "weight": { "dodge": 2.4 }, "tune": { "band": -3, "cadence": 0.85 } },
+        { "note": "it just swung: punish the recovery", "when": { "targetRecovering": 1 }, "weight": { "attack": 3.5 }, "tune": { "cadence": 0.45 } },
+        { "note": "hurt: fight from further out, cover more", "when": { "hp": "<0.5" }, "weight": { "guard": 3.0 }, "tune": { "band": 2, "cadence": 1.25 } },
+        { "note": "badly hurt and losing: break off after every wound", "when": { "hp": "<0.25", "hpAdv": "<-0.25", "sinceHurt": "<120" }, "weight": { "flee": 3.5 } }
+      ]
+    },
+    {
       "comment": "THE IMP (docs/PLAN_demons.md D1; assets/mobs/demon/imp_skerrick.json, assets/demons/skerrick.json). A summoned thing that wants its summoner dead: faction `demon`, aggro hostile, the full 360 (it was looking for you before it arrived). AGILE AND LIGHT: a short fast cadence of claw rakes and bites (the human's natural weapons; demon.js makes the fists cut), a close band it darts in and out of, a lot of circling and a quick dodge. Ranges are centre-to-centre in world voxels and an imp is under a metre tall, so every number is about half a man's. CONTAINMENT IS NOT HERE: a demon summoned into an intact salt circle keeps this profile and keeps wanting you; the circle (game/demon_circle.h) clamps its walk and refuses a blow across the ring.",
       "//goto": "D6 item 10: a CONTAINED demon waits where it arrived, facing you -- game/demon_malice.h writes that routine (the `goto` intent); anything it can still do outscores it, and what the salt would refuse scores nothing (ai_behavior.h SelfView::targetFenced).",
       "name": "imp",

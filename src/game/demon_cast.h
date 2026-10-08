@@ -62,6 +62,21 @@
 //
 // NOT SAVED: the casters (mana, statuses, bolts in flight). A loaded world's
 // creatures start with full pools and nothing sustained.
+//
+// A CREATURE CASTS FROM ITS HAND, THE WAY THE PLAYER DOES (2026-10-08,
+// game/spellhand.h). The AI's request and a demon's malice do not cast on the
+// spot: MobCastBegin draws the spell, puts it INTO a hand and starts the
+// delivery's gesture, and the spell leaves that hand on the gesture's release
+// tick (MobHandCast). The hand: an empty usable one if the creature has one;
+// else the off hand's item (or the main hand's, if the off arm is ruined) is
+// PUT AWAY into its kit -- the sheath for a blade, else the bag -- for the
+// cast, and drawn back into the hand after it, coat and all (CaptureHeld /
+// EquipItemAsWas). While the spell is in the hand the creature is
+// Mob::CastBusy: no swing, no guard, the arm is the gesture's (Mob::SetCastArm).
+// A spell drawn while the last one is still in the hand casts straight from
+// it. A creature with no hand to cast from (no socket, both arms ruined), or
+// a spell with no gesture, casts from the chest on the spot as it used to.
+// MobCastServe stays the synchronous path for scripted casts (the gates).
 #pragma once
 
 #include <cstdint>
@@ -71,7 +86,9 @@
 #include <vector>
 
 #include "game/ai_behavior.h"
+#include "game/equipment.h"
 #include "game/spell.h"
+#include "game/spellhand.h"
 #include "math3d.h"
 
 struct TickAuthorityCtx;
@@ -135,6 +152,10 @@ enum class MobCastOutcome : uint8_t {
   BlinkSevered,    // D3: contained, and the `blink` channel is severed
   NoRoom,          // kMaxCasters VMs already, or kCastsPerTick served this tick
   Forbidden,       // D5: a bound demon's contract forbids this cast at this target
+  // Accepted: the spell is in the creature's hand and the gesture is running;
+  // it leaves on the release (MobCastBegin). Appended, so nothing renumbers.
+  Gesturing,
+  Busy,            // a cast is already in the hand, mid-gesture
 };
 const char* CastOutcomeName(MobCastOutcome o);
 
@@ -148,8 +169,41 @@ struct CastEvent {
   int32_t cost = 0;
 };
 
+// THE CAST IN A CREATURE'S HAND (MobCastBegin / MobCastTick). One at a time.
+struct MobHandCast {
+  enum class Phase : uint8_t {
+    Idle = 0,
+    Raise,     // the spell is in the hand (what it held put away), the arm comes up armed
+    Gesture,   // the delivery's gesture; the spell leaves on its release
+    Hold,      // the spell lingers in the hand: another draw casts straight from it
+    Lower,     // the spell is let go; then what the hand held is drawn back
+  };
+  static constexpr int kRaiseTicks = 6;   // spell_ready's blend-in (200 ms)
+  static constexpr int kHoldTicks = 24;
+  static constexpr int kLowerTicks = 6;
+  Phase phase = Phase::Idle;
+  int hand = 0;              // HandIndex of the casting hand
+  int ticks = 0;             // in this phase
+  CastGestureRun run;
+  CastArmState arm;
+  bool clipOn[kHands] = {false, false};
+  // The cast waiting for its release: the kit entry the draw chose and the
+  // request (its target point is refreshed every tick from the live target).
+  std::string spell;
+  ai::CastRequest req;
+  int gesture = -1;
+  uint32_t color = 0;        // the light in the fist (the flight's colour rule)
+  Vec3 aimDir{0, 0, 1};      // the line to the target now, world
+  // What the hand held before the spell went into it, and where it went.
+  bool stowed = false;
+  KitRef stowedAt;
+  std::string stowedItem;
+  uint32_t stows = 0, draws = 0, releases = 0;
+};
+
 struct MobCaster {
   uint64_t mobId = 0;
+  MobHandCast hand;
   SpellSystem spells;
   CasterState mana;
   uint32_t blinkReadyAt = 0;
@@ -213,6 +267,25 @@ void MobCastWardFilter(TickAuthorityCtx& w, OpBatch& out);
 MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
                           const ai::CastRequest& req, uint32_t tick,
                           const std::string& spell, OpBatch& out);
+// THE HAND PATH (what the AI's requests and a demon's malice go through): draw
+// the spell as MobCastServe would and put it INTO a hand, stowing what the
+// hand held; Gesturing when accepted (the spell leaves on the gesture's
+// release, a few ticks on, through MobCastTick), Busy while a cast is already
+// mid-gesture, Blinked for a blink (no hand in that), or the draw's refusal.
+// Falls back to MobCastServe for a creature with no hand to cast from.
+MobCastOutcome MobCastBegin(TickAuthorityCtx& w, std::span<SessionTick> players,
+                            const ai::CastRequest& req, uint32_t tick,
+                            const std::string& spell, OpBatch& out);
+// The cast in a creature's hand, or null (the gates and the renderer read it).
+const MobHandCast* MobHandCastOf(const TickAuthorityCtx& w, uint64_t mobId);
+// Every creature hand holding a spell: where (the hand part's body) and the
+// light's colour, for main.cpp's sprite pass (the player's fist light rule).
+struct MobHandLight {
+  Vec3 at{};
+  uint32_t color = 0;
+  uint64_t mobId = 0;
+};
+void MobCastAppendHandLights(const TickAuthorityCtx& w, std::vector<MobHandLight>& out);
 
 // D6 (game/demon_malice.h): the kit entry of that name (the kit is read on
 // first use), or null.

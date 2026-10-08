@@ -3316,6 +3316,26 @@ class Mob {
   // Pure presentation state: never saved, never hashed, rebuilt from nothing.
   NpcStroke& Stroke() { return stroke_; }
   const NpcStroke& Stroke() const { return stroke_; }
+  // ---- A CAST IN THE HAND (game/spellhand.h, game/demon_cast.cpp) ----------
+  // A creature casts the way the player does: the spell goes INTO a hand and
+  // the arm performs the delivery's gesture. The caster world (MobCastTick,
+  // after phase H) owns that and sets these two:
+  //   CastBusy  -- a spell is in a hand or a gesture is running: the AI's
+  //                swing and guard are refused (MobSystem::PreTick, ApplyAiArm)
+  //                so the melee driver never takes the arm out from under it;
+  //   CastArm   -- the gesture's arm pose, re-applied every NPC tick AFTER the
+  //                stroke step (which clears the arm when a stroke ends), so
+  //                it is the last word on the weapon-arm claim.
+  // Presentation + scheduling state: never saved (MobCaster is not either).
+  struct CastArm {
+    bool on = false;
+    Hand hand = Hand::Right;
+    WeaponPose pose;
+  };
+  void SetCastBusy(bool b) { castBusy_ = b; }
+  bool CastBusy() const { return castBusy_; }
+  void SetCastArm(const CastArm& a) { castArm_ = a; }
+  const CastArm& GetCastArm() const { return castArm_; }
   // WHICH WAY THIS BODY FACES. The same `AxisAngle({0,1,0}, heading) * +Z` the
   // walk step and the limb submit use -- one convention, one formula, so a
   // caller cannot drift from the direction the mob actually translates along.
@@ -5527,6 +5547,8 @@ class Mob {
     void Clear() { *this = HeldHand{}; }
   };
   HeldHand held_[kHands];
+  bool castBusy_ = false;   // SetCastBusy
+  CastArm castArm_;         // SetCastArm
   // Which hand the stroke driver serves (SetStrikeHand / ArmForStyle).
   Hand strikeHand_ = Hand::Right;
   // THE OTHER ARM'S HAND-BACK. One arm is driven at a time; when the driven

@@ -49,6 +49,8 @@ const char* CastOutcomeName(MobCastOutcome o) {
     case MobCastOutcome::BlinkSevered: return "blink: severed";
     case MobCastOutcome::NoRoom: return "no room";
     case MobCastOutcome::Forbidden: return "forbidden by contract";
+    case MobCastOutcome::Gesturing: return "in the hand";
+    case MobCastOutcome::Busy: return "busy casting";
   }
   return "?";
 }
@@ -564,9 +566,23 @@ MobCastWorld& MobCasters(TickAuthorityCtx& w) {
   return *w.mobCast;
 }
 
-MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
-                            const ai::CastRequest& req, uint32_t tick,
-                            const std::string& spell, OpBatch& out) {
+namespace {
+
+// How a served request ends. Now: cast on the spot from the chest (scripted
+// casts, a creature with no hand). Pick: draw and check only, and report what
+// was drawn -- the spell goes into a hand (MobCastBegin). Release: the drawn
+// spell, by name, leaving the hand at `handAt` (MobHandCast's release tick).
+enum class ServeMode : uint8_t { Now = 0, Pick, Release };
+struct Picked {
+  std::string spell;
+  int gesture = -1;
+  uint32_t color = 0;
+  KitAim aim = KitAim::Body;
+};
+
+MobCastOutcome ServeImpl(TickAuthorityCtx& w, std::span<SessionTick> players,
+                         const ai::CastRequest& req, uint32_t tick, const std::string& spell,
+                         OpBatch& out, ServeMode mode, const Vec3* handAt, Picked* picked) {
   MobCastWorld& m = MobCasters(w);
   m.stats.requests++;
   CastEvent ev;
@@ -651,8 +667,35 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
     m.stats.forbidden++;
     return refuse(MobCastOutcome::Forbidden);
   }
-  const Aim a = AimFor(w, *cd.ks, req.mobId, req, cd.list);
+  // THE HAND PATH'S DRAW: the spell, its gesture and its light; nothing cast,
+  // nothing logged -- the event is the release's.
+  if (mode == ServeMode::Pick) {
+    if (picked) {
+      picked->spell = cd.ks->name;
+      picked->gesture = CastGesture(w.glyphs, cd.list);
+      picked->aim = cd.ks->aim;
+      const SpellCast& sc = cd.list.casts[0];
+      const uint32_t tint = CastTintMaterial(sc);
+      const uint32_t base = tint != 0 && tint < w.mats.size()
+                                ? w.mats[tint].gpu.color0
+                                : w.glyphs.Delivery(sc.delivery.glyph).look.color;
+      picked->color = 0xFF000000u | (base & 0x00FFFFFFu);
+    }
+    return MobCastOutcome::Gesturing;
+  }
+  Aim a = AimFor(w, *cd.ks, req.mobId, req, cd.list);
   if (!a.ok) return refuse(MobCastOutcome::NothingInRange);
+  // FROM THE HAND (MobHandCast's release): one step out of the fist along the
+  // line from the fist to the aim point, as the player's leaves its hand. A
+  // spell on the caster itself still resolves at the body.
+  if (handAt != nullptr && cd.ks->aim != KitAim::Self) {
+    const Vec3 d = a.to - *handAt;
+    const float len = d.len();
+    if (len > 1e-3f) {
+      a.dir = d * (1.0f / len);
+      a.from = *handAt + a.dir * 1.5f;
+    }
+  }
   ProbeCtx pc;
   pc.w = &w;
   pc.players = players;
@@ -681,6 +724,316 @@ MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
   Log(m, ev);
   m.stats.maxLiveSeen = std::max(m.stats.maxLiveSeen, LiveOf(*c));
   return MobCastOutcome::Cast;
+}
+
+// ---- THE CAST IN THE HAND (MobHandCast) -----------------------------------------------
+
+// Where the target is NOW: a live creature's box, or a player's body. False
+// for a target that is gone (the cast then flies at its last known point).
+bool TargetNow(TickAuthorityCtx& w, std::span<SessionTick> players, uint64_t id, Vec3& out) {
+  if (id == 0) return false;
+  for (SessionTick& p : players)
+    if (p.s && ai::kPlayerActorBase + (uint64_t)p.s->index == id) {
+      out = p.s->player.pos;
+      return true;
+    }
+  if (w.mobs.IsAlive(id)) {
+    out = BoxCentre(w.mobs, id);
+    return true;
+  }
+  return false;
+}
+
+bool HandCanCast(const Mob& mob, Hand h) {
+  return mob.HandPart(h) >= 0 && mob.HandUsable(h) && !mob.HeldBorrowed(h);
+}
+
+// WHICH HAND: an empty one that works, right first -- the player's own rule,
+// a spell needs an empty hand, and a free fist is one. Else the OFF hand's
+// item is put away (the weapon it swings stays out), else the main hand's.
+int ChooseCastHand(const Mob& mob) {
+  for (Hand h : {Hand::Right, Hand::Left})
+    if (HandCanCast(mob, h) && mob.HeldItem(h).empty()) return HandIndex(h);
+  const Hand main = mob.StrikeHand(), off = OtherHand(main);
+  if (HandCanCast(mob, off)) return HandIndex(off);
+  if (HandCanCast(mob, main)) return HandIndex(main);
+  return -1;
+}
+
+// PUT AWAY what the hand holds, AS IT IS (coat, damage, contents): into the
+// sheath when it is a blade and the sheath is free, else the first free bag
+// slot. False when there is nowhere to put it (the hand then cannot cast).
+bool StowHand(MobHandCast& hc, Mob& mob, const ItemLibrary& items, Hand h) {
+  const std::string name = mob.HeldItem(h);
+  if (name.empty()) return true;
+  if (mob.HeldBorrowed(h)) return false;
+  ItemStack st;
+  st.name = name;
+  st.count = 1;
+  mob.CaptureHeld(h, st.damage);
+  st.contents = mob.HeldContents(h);
+  Kit& kit = mob.KitMut();
+  KitRef ref;
+  const int sheath = (int)EquipSlotId::Sheath;
+  const ItemDef* def = items.Named(name);
+  if (def && EquipSlotAccepts(sheath, def->kind) && kit.equip.slots[sheath].Empty()) {
+    ref = KitRef{KitSpace::Equip, sheath};
+  } else {
+    for (int i = 0; i < Bag::kSlots && !ref.Valid(); i++)
+      if (kit.bag.slots[i].Empty()) ref = KitRef{KitSpace::Bag, i};
+  }
+  ItemStack* to = ref.Valid() ? kit.Resolve(ref) : nullptr;
+  if (to == nullptr) return false;
+  *to = st;
+  mob.EquipItem(nullptr, h);
+  hc.stowed = true;
+  hc.stowedAt = ref;
+  hc.stowedItem = name;
+  hc.stows++;
+  return true;
+}
+
+// ...AND DRAW IT BACK into the same hand, as it was. Only what was put away,
+// only if it is still there and the hand is still empty (a corpse looted, a
+// hand that picked something else up: then it stays where it is).
+void DrawBack(MobHandCast& hc, Mob& mob, const ItemLibrary& items) {
+  if (!hc.stowed) return;
+  hc.stowed = false;
+  const Hand h = HandAt(hc.hand);
+  const ItemStack* st = mob.GetKit().Resolve(hc.stowedAt);
+  if (st == nullptr || st->name != hc.stowedItem || !mob.HeldItem(h).empty() ||
+      !mob.HandUsable(h))
+    return;
+  const ItemDef* def = items.Named(hc.stowedItem);
+  if (def == nullptr) return;
+  ItemStack taken = mob.KitTake(hc.stowedAt);
+  if (!mob.EquipItemAsWas(def, h, &taken.damage)) {
+    *mob.KitMut().Resolve(hc.stowedAt) = taken;   // refused: it stays put away
+    return;
+  }
+  mob.SetHeldContents(taken.contents, h);
+  hc.draws++;
+}
+
+void EndHandCast(MobHandCast& hc, Mob* mob, const ItemLibrary& items, bool drawBack) {
+  if (mob != nullptr) {
+    DropCastArm(*mob, hc.arm);
+    mob->SetCastArm(Mob::CastArm{});
+    for (int k = 0; k < kHands; k++) SpellReadyClip(*mob, HandAt(k), false, hc.clipOn[k]);
+    if (drawBack) DrawBack(hc, *mob, items);
+    mob->SetCastBusy(false);
+  }
+  hc.phase = MobHandCast::Phase::Idle;
+  hc.ticks = 0;
+  hc.run = CastGestureRun{};
+  hc.arm = CastArmState{};
+  hc.gesture = -1;
+}
+
+// One tick of every creature's cast in the hand: the raise, the gesture and
+// its release, the linger, the let-go and the draw-back; and the arm's pose.
+void StepHandCasts(TickAuthorityCtx& w, std::span<SessionTick> players, MobCastWorld& m,
+                   uint32_t tick, OpBatch& out) {
+  const SpellGestureLib& lib = w.glyphs.gestures;
+  for (MobCaster& c : m.casters) {
+    MobHandCast& hc = c.hand;
+    if (hc.phase == MobHandCast::Phase::Idle) continue;
+    Mob* mob = w.mobs.FindMobById(c.mobId);
+    const Hand h = HandAt(hc.hand);
+    // The cast dies with the body (or its arm): no spell leaves, and what was
+    // put away stays in the kit -- it is the corpse's, loot like the rest.
+    if (mob == nullptr || c.gone || !mob->Alive() || mob->Ragdolled()) {
+      EndHandCast(hc, mob, w.items, false);
+      continue;
+    }
+    if (!mob->HandUsable(h) && hc.phase != MobHandCast::Phase::Lower) {
+      hc.phase = MobHandCast::Phase::Lower;
+      hc.ticks = 0;
+      DropCastArm(*mob, hc.arm);
+      hc.run = CastGestureRun{};
+    }
+    // The line to the target as it is now: the arm turns with it, and the
+    // release flies at it.
+    Vec3 size{};
+    const Vec3 centre = BoxCentre(w.mobs, c.mobId, &size);
+    Vec3 tgt;
+    if (TargetNow(w, players, hc.req.targetId, tgt)) {
+      hc.req.targetPoint = tgt;
+      hc.req.distance = (tgt - centre).len();
+    }
+    const Vec3 chest{centre.x, centre.y + size.y * 0.2f, centre.z};
+    const Vec3 d = hc.req.targetPoint - chest;
+    if (d.len() > 1e-3f) hc.aimDir = d.normalized();
+    switch (hc.phase) {
+      case MobHandCast::Phase::Idle: break;
+      case MobHandCast::Phase::Raise:
+        SpellReadyClip(*mob, h, true, hc.clipOn[hc.hand]);
+        if (++hc.ticks >= MobHandCast::kRaiseTicks) {
+          BeginCastGesture(hc.run, hc.arm, hc.gesture, hc.hand);
+          hc.phase = MobHandCast::Phase::Gesture;
+          hc.ticks = 0;
+        }
+        break;
+      case MobHandCast::Phase::Gesture: {
+        SpellReadyClip(*mob, h, true, hc.clipOn[hc.hand]);
+        const SpellGesture* g = lib.At(hc.run.gesture);
+        if (g == nullptr) {
+          hc.phase = MobHandCast::Phase::Hold;
+          hc.ticks = 0;
+          break;
+        }
+        if (CastGestureReleases(hc.run, *g)) {
+          hc.run.fired = true;
+          hc.releases++;
+          Vec3 at;
+          const bool fromHand = SpellHandWorld(w.mobs, w.phys, c.mobId, h, at);
+          ServeImpl(w, players, hc.req, tick, hc.spell, out, ServeMode::Release,
+                    fromHand ? &at : nullptr, nullptr);
+        }
+        AdvanceCastGesture(hc.run, *g, false);
+        if (hc.run.gesture < 0) {
+          hc.phase = MobHandCast::Phase::Hold;
+          hc.ticks = 0;
+        }
+        break;
+      }
+      case MobHandCast::Phase::Hold:
+        SpellReadyClip(*mob, h, true, hc.clipOn[hc.hand]);
+        if (++hc.ticks >= MobHandCast::kHoldTicks) {
+          hc.phase = MobHandCast::Phase::Lower;
+          hc.ticks = 0;
+        }
+        break;
+      case MobHandCast::Phase::Lower:
+        SpellReadyClip(*mob, h, false, hc.clipOn[hc.hand]);
+        if (++hc.ticks >= MobHandCast::kLowerTicks) {
+          EndHandCast(hc, mob, w.items, true);
+          continue;
+        }
+        break;
+    }
+    // THE ARM: the gesture's pose through the one weapon-arm claim, applied
+    // now and re-applied after the creature's own stroke step next tick
+    // (Mob::SetCastArm), so the melee driver never has the last word on it.
+    WeaponPose wp;
+    if (hc.arm.hand >= 0 && CastArmPose(*mob, hc.arm, hc.run, lib, hc.aimDir, wp)) {
+      mob->SetWeaponPose(wp);
+      mob->SetCastArm(Mob::CastArm{true, HandAt(hc.arm.hand), wp});
+    } else {
+      mob->SetCastArm(Mob::CastArm{});
+    }
+    mob->SetCastBusy(true);
+  }
+}
+
+// A SHEATHED BLADE GOES BACK IN THE HAND. The cast put it there; a cast is
+// not saved, so a creature saved mid-cast loads with its blade in the sheath
+// and an empty fist -- this draws it, once a second, for any AI creature with
+// a free working hand and no cast in it. (The player's sheath is the player's
+// business: the session's equip seam owns their hands.)
+void DrawSheathed(TickAuthorityCtx& w, const ItemLibrary& items) {
+  const int sheath = (int)EquipSlotId::Sheath;
+  for (uint32_t i = 0; i < w.mobs.MobCount(); i++) {
+    Mob* mob = w.mobs.FindMobById(w.mobs.MobIdAt(i));
+    if (mob == nullptr || mob->GetController() != Mob::Controller::Ai || !mob->Alive() ||
+        mob->CastBusy() || mob->Ragdolled())
+      continue;
+    const ItemStack& st = mob->GetKit().equip.slots[sheath];
+    if (st.Empty()) continue;
+    for (Hand h : {Hand::Right, Hand::Left}) {
+      if (!HandCanCast(*mob, h) || !mob->HeldItem(h).empty()) continue;
+      const ItemDef* def = items.Named(st.name);
+      if (def == nullptr) break;
+      ItemStack taken = mob->KitTake(KitRef{KitSpace::Equip, sheath});
+      if (!mob->EquipItemAsWas(def, h, &taken.damage)) {
+        *mob->KitMut().Resolve(KitRef{KitSpace::Equip, sheath}) = taken;
+        break;
+      }
+      mob->SetHeldContents(taken.contents, h);
+      break;
+    }
+  }
+}
+
+}  // namespace
+
+MobCastOutcome MobCastServe(TickAuthorityCtx& w, std::span<SessionTick> players,
+                            const ai::CastRequest& req, uint32_t tick,
+                            const std::string& spell, OpBatch& out) {
+  return ServeImpl(w, players, req, tick, spell, out, ServeMode::Now, nullptr, nullptr);
+}
+
+MobCastOutcome MobCastBegin(TickAuthorityCtx& w, std::span<SessionTick> players,
+                            const ai::CastRequest& req, uint32_t tick,
+                            const std::string& spell, OpBatch& out) {
+  MobCastWorld& m = MobCasters(w);
+  Mob* mob = w.mobs.FindMobById(req.mobId);
+  if (MobCaster* c0 = m.Find(req.mobId);
+      c0 != nullptr && (c0->hand.phase == MobHandCast::Phase::Raise ||
+                        c0->hand.phase == MobHandCast::Phase::Gesture))
+    return MobCastOutcome::Busy;
+  // Mid-swing: the blade is not put away under a live stroke. A held guard
+  // is let go over the raise instead (the AI picked casting over guarding).
+  if (mob != nullptr && mob->Stroke().Active()) {
+    if (mob->Stroke().phase != NpcStroke::Phase::Guard) return MobCastOutcome::Busy;
+  }
+  Picked pk;
+  const MobCastOutcome o =
+      ServeImpl(w, players, req, tick, spell, out, ServeMode::Pick, nullptr, &pk);
+  if (o != MobCastOutcome::Gesturing) return o;   // a blink, or the draw's refusal
+  MobCaster* c = m.Find(req.mobId);
+  if (c == nullptr || mob == nullptr || pk.gesture < 0)
+    return ServeImpl(w, players, req, tick, pk.spell, out, ServeMode::Now, nullptr, nullptr);
+  MobHandCast& hc = c->hand;
+  // A spell still in the hand from the last cast (Hold, Lower before the
+  // draw-back): cast straight from it.
+  const bool inHand = (hc.phase == MobHandCast::Phase::Hold ||
+                       hc.phase == MobHandCast::Phase::Lower) &&
+                      HandCanCast(*mob, HandAt(hc.hand));
+  if (!inHand) {
+    if (hc.phase != MobHandCast::Phase::Idle) EndHandCast(hc, mob, w.items, true);
+    const int hk = ChooseCastHand(*mob);
+    if (hk < 0 || !StowHand(hc, *mob, w.items, HandAt(hk)))
+      return ServeImpl(w, players, req, tick, pk.spell, out, ServeMode::Now, nullptr, nullptr);
+    hc.hand = hk;
+  }
+  if (mob->Stroke().Active() && mob->Stroke().phase == NpcStroke::Phase::Guard)
+    mob->Stroke().StartRelease(MobHandCast::kRaiseTicks);
+  hc.spell = pk.spell;
+  hc.req = req;
+  hc.gesture = pk.gesture;
+  hc.color = pk.color;
+  hc.ticks = 0;
+  if (inHand) {
+    BeginCastGesture(hc.run, hc.arm, hc.gesture, hc.hand);
+    hc.phase = MobHandCast::Phase::Gesture;
+  } else {
+    hc.phase = MobHandCast::Phase::Raise;
+  }
+  mob->SetCastBusy(true);
+  return MobCastOutcome::Gesturing;
+}
+
+const MobHandCast* MobHandCastOf(const TickAuthorityCtx& w, uint64_t mobId) {
+  if (!w.mobCast) return nullptr;
+  for (const MobCaster& c : w.mobCast->casters)
+    if (c.mobId == mobId) return &c.hand;
+  return nullptr;
+}
+
+void MobCastAppendHandLights(const TickAuthorityCtx& w, std::vector<MobHandLight>& out) {
+  if (!w.mobCast) return;
+  for (const MobCaster& c : w.mobCast->casters) {
+    const MobHandCast& hc = c.hand;
+    if (hc.phase == MobHandCast::Phase::Idle || hc.phase == MobHandCast::Phase::Lower ||
+        hc.color == 0)
+      continue;
+    MobHandLight l;
+    if (!SpellHandWorld(w.mobs, w.phys, c.mobId, HandAt(hc.hand), l.at)) continue;
+    l.color = hc.color;
+    l.mobId = c.mobId;
+    out.push_back(l);
+  }
 }
 
 const KitSpell* KitSpellNamed(TickAuthorityCtx& w, const std::string& spell) {
@@ -719,6 +1072,7 @@ bool MobCanCast(TickAuthorityCtx& w, uint64_t mobId, const std::string& spell, f
 
 void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t tick,
                  OpBatch& out) {
+  if (tick % 30 == 0) DrawSheathed(w, w.items);
   // RULE 2: nothing asked and nobody casting = nothing to do and no world.
   if (w.mobs.CastRequests().empty() && (!w.mobCast || w.mobCast->casters.empty())) return;
   MobCastWorld& m = MobCasters(w);
@@ -734,9 +1088,11 @@ void MobCastTick(TickAuthorityCtx& w, std::span<SessionTick> players, uint32_t t
         m.stats.refused++;
         continue;
       }
-      MobCastServe(w, players, r, tick, std::string(), out);
+      MobCastBegin(w, players, r, tick, std::string(), out);
     }
   }
+  // ---- the casts in creatures' hands: raise, gesture, release, draw back ----------
+  StepHandCasts(w, players, m, tick, out);
   // ---- every creature's VM, one tick -------------------------------------------------
   for (MobCaster& c : m.casters) {
     c.spells.SetLibrary(&w.glyphs);

@@ -89,6 +89,7 @@
 #include "game/remoteplayer.h"
 #include "game/lightning.h"
 #include "game/spell.h"
+#include "game/spellhand.h"
 #include "game/strike_pick.h"
 #include "game/thirdperson.h"
 #include "gpu/context.h"
@@ -638,25 +639,17 @@ struct PlayerSession {
     Vec3 o3{};                 // the other flask's 3D middle at pickup
     float sepB = 0;            // bench x from the carried one to the other
   } benchCarry;
-  // ---- THE CASTING GESTURE (game/spellgesture.h, session.cpp PoseSpellHands)
+  // ---- THE CASTING GESTURE (game/spellhand.h, session.cpp PoseSpellHands) --
   // A press on a spell hand STARTS its delivery's gesture (a throw, a lob, a
   // palm to the chest ...); the cast itself happens on the gesture's RELEASE
   // tick, from where the hand is then. Per hand, so both hands can be mid-
   // gesture and each fires on its own clock; the ARM is posed for one at a
   // time (the rig has one weapon-arm claim): the latest press takes it. Sim-
   // affecting (it decides the tick and the origin of a cast), so it runs on
-  // the tick and never off the frame.
-  struct SpellGestureRun {
-    int gesture = -1;          // GlyphLibrary::gestures index; -1 = idle
-    int ticks = 0;             // the gesture's clock (stops at a hold while held)
-    bool fired = false;        // the cast has left the hand
-    bool again = false;        // pressed during the wind-up: cast again after it fires
-  };
-  SpellGestureRun spellGesture[kHands];
-  int spellArmHand = -1;       // the hand whose arm the claim is on; -1 = none
-  float spellArmW = 0.0f;      // the claim's weight, 0..1
-  Vec3 spellArmFrom{};         // the live hand at the press, gesture frame, reaches
-  bool spellArmFresh = false;  // read spellArmFrom on the next pose
+  // the tick and never off the frame. The same mechanics a creature casts
+  // with (game/demon_cast.cpp MobHandCast).
+  CastGestureRun spellGesture[kHands];
+  CastArmState spellArm;
   // Which hands are playing the armed pose (`spell_ready`, PoseSpellReady).
   bool spellClip[kHands] = {false, false};
   int throwTicks = 0;

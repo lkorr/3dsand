@@ -708,4 +708,227 @@ Status GateDemonCast(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- npc-hand-cast: a creature casts FROM ITS HAND, the player's way ---------------------
+//
+// game/demon_cast.h MobCastBegin + game/spellhand.h, through THE tick (TickRig).
+// Two `battlemage` humans on an open pad, the player far out of their sight
+// so their own AI never acts:
+//   A  a sword in the RIGHT hand, the left empty: the firebolt goes into the
+//      empty LEFT hand (no stow), the sword never leaves the right; the cast
+//      leaves exactly raise + the flick's release ticks after the request,
+//      from the fist (the event's origin within a few voxels of the hand), the
+//      arm armed (`spell_ready`) and moving through the gesture, the body
+//      CastBusy for the whole of it and free after.
+//   B  a sword in EACH hand: the off (left) sword is PUT AWAY into the sheath
+//      for the cast and DRAWN BACK into the left hand after it; the sheath is
+//      empty again and the right sword never moved.
+//   C  the arm reaches what the gesture asks (WeaponArmDiagnostics ikMiss at
+//      the release, both bodies).
+//   D  a request while one is mid-gesture is Busy, not a second cast.
+Status GateNpcHandCast(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  std::string fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) {
+      fails += (fails.empty() ? "" : "; ") + what;
+      std::printf("npc-hand-cast: FAILED %s\n", what.c_str());
+    }
+  };
+  auto regen = [&] {
+    c.mobs.Reset();
+    c.debris.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+  };
+  regen();
+  const IVec3 o = c.world.WindowOrigin();
+  const int fxX = o.x * (int)kChunk + 200, fxZ = o.z * (int)kChunk + 200;
+  const int fy = FixtureYOver(fxX - 64, fxZ - 8, fxX + 64, fxZ + 8, kDefaultSeed, 0);
+  uint32_t t0 = 97000;
+  support::TickRig rig(c, t0, IVec3{fxX >> 4, fy >> 4, fxZ >> 4});
+  std::string gerr;
+  if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, rig.Glyphs(), gerr)) {
+    detail = "glyph load failed: " + gerr;
+    std::printf("npc-hand-cast: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  PlayerSession& ses = rig.Session();
+  ses.spells.SetLibrary(&rig.Glyphs());
+  // Far outside a battlemage's 50-voxel sight: their AI has nobody to fight.
+  ses.player.pos = Vec3{(float)fxX + 0.5f, (float)fy + 40.0f, (float)fxZ + 260.5f};
+  const int hd = c.mobs.FindDef("human");
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  if (hd < 0 || sword == nullptr) {
+    detail = "no human def or no sword item";
+    std::printf("npc-hand-cast: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  auto spawn = [&](int dx, bool twoSwords) -> uint64_t {
+    const uint64_t id = c.mobs.Spawn(hd, IVec3{fxX + dx, fy, fxZ});
+    if (id == 0) return 0;
+    c.mobs.SetMobBehavior(id, "battlemage");
+    c.mobs.EquipItem(id, sword, "held_right");
+    if (twoSwords) c.mobs.EquipItem(id, sword, "held_left");
+    return id;
+  };
+  // 120 voxels apart: each is far outside the other's 50-voxel sight, so
+  // neither one's own AI fights or casts at the other mid-gate.
+  const uint64_t a = spawn(-60, false), b = spawn(60, true);
+  check(a != 0 && b != 0, "two battlemages spawn");
+  if (a == 0 || b == 0) {
+    regen();
+    detail = fails;
+    return Status::Fail;
+  }
+  support::RunTicks(rig, 20);   // settle onto the pad
+  const SpellGestureLib& gl = rig.Glyphs().gestures;
+  const SpellGesture* flick = gl.At(gl.Find("flick"));
+  check(flick != nullptr, "the bolt's gesture (flick) is loaded");
+  const int expectAfter = MobHandCast::kRaiseTicks + (flick ? flick->releaseTicks : 0);
+
+  struct Run {
+    MobCastOutcome begun = MobCastOutcome::NothingInRange, second = MobCastOutcome::NothingInRange;
+    int hand = -1;
+    int castAfter = -1;          // ticks from the request to the cast event
+    float fromToHand = 99.0f;    // the event's origin to the fist at that tick
+    float handTravel = 0.0f;     // how far the fist moved during the gesture
+    float ikMiss = 99.0f;        // at the release
+    bool busyThroughout = true, armed = false, busyAfter = true;
+    bool rightKept = true;       // the right hand's sword never left
+    bool leftEmptyDuring = false, sheathedDuring = false;
+    std::string leftAfter, sheathAfter;
+    uint32_t stows = 0, draws = 0;
+  };
+  auto runOne = [&](uint64_t id) {
+    Run r;
+    Vec3 lo{}, hi{};
+    c.mobs.MobBodyBox(id, lo, hi);
+    const Vec3 ctr = (lo + hi) * 0.5f;
+    ai::CastRequest req;
+    req.mobId = id;
+    req.targetPoint = ctr + Vec3{0.0f, 0.0f, -25.0f};
+    req.distance = 25.0f;
+    SessionTick st{&ses, {}, {}};
+    const uint32_t reqTick = rig.tick + 1;
+    OpBatch ob;
+    req.tick = reqTick;
+    r.begun = MobCastBegin(rig.Authority(), std::span<SessionTick>(&st, 1), req, reqTick,
+                           "firebolt", ob);
+    {
+      OpBatch ob2;
+      r.second = MobCastBegin(rig.Authority(), std::span<SessionTick>(&st, 1), req, reqTick,
+                              "firebolt", ob2);
+    }
+    const MobHandCast* hc = MobHandCastOf(rig.Authority(), id);
+    if (hc) r.hand = hc->hand;
+    const size_t ev0 = rig.Authority().mobCast ? rig.Authority().mobCast->events.size() : 0;
+    Vec3 handStart{}, handLo{1e9f, 1e9f, 1e9f}, handHi{-1e9f, -1e9f, -1e9f};
+    bool haveStart = false;
+    const int total = expectAfter + 60;
+    for (int i = 1; i <= total; i++) {
+      support::RunTicks(rig, 1);
+      Mob* m = c.mobs.FindMobById(id);
+      if (m == nullptr) break;
+      hc = MobHandCastOf(rig.Authority(), id);
+      const bool active = hc && hc->phase != MobHandCast::Phase::Idle;
+      if (m->HeldItem(Hand::Right) != "sword") r.rightKept = false;
+      if (active) {
+        if (!m->CastBusy()) r.busyThroughout = false;
+        const Hand h = HandAt(hc->hand);
+        if (m->ClipWeight(m->HandClip("spell_ready", h)) > 0.05f) r.armed = true;
+        if (hc->hand == 1 && m->HeldItem(Hand::Left).empty()) r.leftEmptyDuring = true;
+        if (m->GetKit().equip.slots[(int)EquipSlotId::Sheath].name == "sword")
+          r.sheathedDuring = true;
+        Vec3 hp;
+        if (hc->phase == MobHandCast::Phase::Gesture &&
+            SpellHandWorld(c.mobs, c.phys, id, h, hp)) {
+          if (!haveStart) handStart = hp, haveStart = true;
+          r.handTravel = std::max(r.handTravel, (hp - handStart).len());
+        }
+      }
+      // The cast event, the tick it lands.
+      if (r.castAfter < 0 && rig.Authority().mobCast) {
+        const auto& evs = rig.Authority().mobCast->events;
+        for (size_t k = 0; k < evs.size(); k++) {
+          const CastEvent& e = evs[k];
+          if (e.mobId != id || e.outcome != MobCastOutcome::Cast || e.tick < reqTick) continue;
+          r.castAfter = (int)(e.tick - reqTick);
+          Vec3 hp;
+          if (hc && SpellHandWorld(c.mobs, c.phys, id, HandAt(hc->hand), hp))
+            r.fromToHand = (e.from - hp).len();
+          // Only a solve that RAN is a measurement (99 = the arm was never posed).
+          if (m->WeaponArmDiagnostics().ran) r.ikMiss = m->WeaponArmDiagnostics().ikMiss;
+        }
+      }
+      (void)ev0;
+    }
+    Mob* m = c.mobs.FindMobById(id);
+    hc = MobHandCastOf(rig.Authority(), id);
+    if (m) {
+      r.busyAfter = m->CastBusy();
+      r.leftAfter = m->HeldItem(Hand::Left);
+      r.sheathAfter = m->GetKit().equip.slots[(int)EquipSlotId::Sheath].name;
+    }
+    if (hc) r.stows = hc->stows, r.draws = hc->draws;
+    if (hc && hc->phase != MobHandCast::Phase::Idle) r.busyAfter = true;
+    return r;
+  };
+  const Run ra = runOne(a);
+  const Run rb = runOne(b);
+  regen();
+
+  const float fromTol = (float)BaselineNumber("npcHandCast.fromToHandMax", 6.0);
+  const float ikTol = (float)BaselineNumber("npcHandCast.ikMissMax", 2.0);
+  const float travelMin = (float)BaselineNumber("npcHandCast.handTravelMin", 2.0);
+  // A
+  check(ra.begun == MobCastOutcome::Gesturing,
+        Format("A: the request puts the spell in a hand (%s)", CastOutcomeName(ra.begun)));
+  check(ra.second == MobCastOutcome::Busy,
+        Format("D: a second request mid-cast is busy (%s)", CastOutcomeName(ra.second)));
+  check(ra.hand == 1 && ra.stows == 0,
+        Format("A: the empty left hand takes it, nothing put away (hand %d, stows %u)", ra.hand,
+               ra.stows));
+  check(ra.rightKept, "A: the right hand's sword never leaves it");
+  check(ra.castAfter == expectAfter,
+        Format("A: the bolt leaves at raise + the flick's release, %d ticks on (%d)", expectAfter,
+               ra.castAfter));
+  check(ra.fromToHand <= fromTol,
+        Format("A: it leaves from the fist (%.2f voxels off, max %.1f)", ra.fromToHand, fromTol));
+  check(ra.armed && ra.busyThroughout && !ra.busyAfter,
+        Format("A: armed (%d) and busy through the cast (%d), free after it (%d)", ra.armed,
+               ra.busyThroughout, !ra.busyAfter));
+  check(ra.handTravel >= travelMin,
+        Format("A: the arm moves through the gesture (%.2f voxels, min %.1f)", ra.handTravel,
+               travelMin));
+  // B
+  check(rb.begun == MobCastOutcome::Gesturing,
+        Format("B: the request puts the spell in a hand (%s)", CastOutcomeName(rb.begun)));
+  check(rb.hand == 1 && rb.stows == 1 && rb.leftEmptyDuring && rb.sheathedDuring,
+        Format("B: the off-hand sword goes into the sheath for the cast (hand %d, stows %u, "
+               "empty %d, sheathed %d)",
+               rb.hand, rb.stows, rb.leftEmptyDuring, rb.sheathedDuring));
+  check(rb.castAfter == expectAfter,
+        Format("B: the bolt leaves %d ticks on (%d)", expectAfter, rb.castAfter));
+  check(rb.draws == 1 && rb.leftAfter == "sword" && rb.sheathAfter.empty() && rb.rightKept,
+        Format("B: the sword is drawn back into the left hand after (draws %u, left '%s', "
+               "sheath '%s', right kept %d)",
+               rb.draws, rb.leftAfter.c_str(), rb.sheathAfter.c_str(), rb.rightKept));
+  // C
+  check(ra.ikMiss <= ikTol && rb.ikMiss <= ikTol,
+        Format("C: the arm reaches the gesture's hand at the release (miss %.2f / %.2f, max %.1f)",
+               ra.ikMiss, rb.ikMiss, ikTol));
+  RecordObserved("npcHandCast.fromToHand", std::max(ra.fromToHand, rb.fromToHand));
+  RecordObserved("npcHandCast.ikMiss", std::max(ra.ikMiss, rb.ikMiss));
+  RecordObserved("npcHandCast.handTravel", std::min(ra.handTravel, rb.handTravel));
+
+  detail = Format(
+      "A: %s hand %d, cast +%d (want %d), from %.2f off the fist, arm travel %.1f, ik miss %.2f; "
+      "B: stows %u draws %u, cast +%d, left after '%s', ik miss %.2f",
+      CastOutcomeName(ra.begun), ra.hand, ra.castAfter, expectAfter, ra.fromToHand, ra.handTravel,
+      ra.ikMiss, rb.stows, rb.draws, rb.castAfter, rb.leftAfter.c_str(), rb.ikMiss);
+  if (!fails.empty()) detail += "; FAILED: " + fails;
+  std::printf("npc-hand-cast: %s (%s)\n", fails.empty() ? "PASS" : "FAIL", detail.c_str());
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace selftest

@@ -7241,6 +7241,8 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
 void MobSystem::ApplyAiArm(Mob& mob, const MobDef& def,
                            const ai::IntentOut& out) {
   NpcStroke& st = mob.stroke_;
+  // A spell in the hand (Mob::CastBusy): the arm is the cast's; no guard.
+  if (mob.castBusy_) return;
   if (out.cancelSwing && st.phase == NpcStroke::Phase::Windup) {
     // The bluff ends where a dropped guard does: released, faded, no return
     // pose (a feint has no follow-through to settle out of).
@@ -7389,6 +7391,8 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                          mob.origin_.z + def.worldSize.z * 0.5f, out.request.targetPoint.x,
                          out.request.targetPoint.z))
         out.attack = false;
+      // A SPELL IN THE HAND (Mob::CastBusy): no swing through a cast.
+      if (mob.castBusy_) out.attack = false;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
       // D4: a cast request (game/demon_cast.h drains it after this phase).
@@ -8668,6 +8672,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         BeginStroke(mob, attacks_.back(), tick);
       StepStroke(mob, tick, world, spawns);
       mob.swinging_ = mob.stroke_.Cutting();
+      // THE CAST'S ARM (Mob::SetCastArm, game/demon_cast.cpp): last word on
+      // the weapon-arm claim, after a stroke's end has cleared it.
+      if (mob.castArm_.on) {
+        const int part = mob.HandPart(mob.castArm_.hand);
+        if (part >= 0) {
+          mob.SetStrikeHand(mob.castArm_.hand);
+          mob.SetStrikeEffector(part, StrikeEffectorMode::Chain);
+          mob.SetWeaponPose(mob.castArm_.pose);
+        }
+      }
       bpStroke.Stop();
 
       // ---- stages 1-5: pose the rig (float presentation state) ----

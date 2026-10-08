@@ -1030,6 +1030,9 @@ const char* const kOrder[] = {
     // Demons D6: malice -- a bound imp's choices under swapped contracts, the
     // ring gust, Vathrael. Same discipline as demon-circle.
     "demon-malice",
+    // Creatures cast from a hand: a weapon put away for the spell and drawn
+    // back, the gesture, the release from the fist. Own pad, regenerated.
+    "npc-hand-cast",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

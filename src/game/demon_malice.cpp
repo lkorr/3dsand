@@ -633,9 +633,11 @@ void Execute(ThinkCtx& c, MaliceWorld& mw, OpBatch& out) {
       req.targetPoint = m.target == MeId(c.ld.session) ? c.you : m.at;
       req.tick = c.tick;
       req.distance = Planar(c.me, req.targetPoint);
-      const MobCastOutcome r = MobCastServe(c.w, c.players, req, c.tick, m.spell, out);
+      // Through the HAND, as every creature casts (demon_cast.h): accepted
+      // means the spell is in its fist and leaves on the gesture's release.
+      const MobCastOutcome r = MobCastBegin(c.w, c.players, req, c.tick, m.spell, out);
       const Scheme* s = c.lib.FindScheme(m.choice);
-      if (r == MobCastOutcome::Cast) {
+      if (r == MobCastOutcome::Cast || r == MobCastOutcome::Gesturing) {
         m.casts++;
         mw.stats.casts++;
         if (s) SetReady(m, s->name, c.tick + (uint32_t)std::max(0, s->cooldownTicks));
