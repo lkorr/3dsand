@@ -11181,6 +11181,27 @@ fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
 // the same bounded degradation the solver itself accepts (particles there are
 // frozen too).
 
+// ---- BENCH ATTRIBUTION BITS (--fluid-bench's paired arms, lab.cpp) ---------
+// The only test the shader makes of R.fluidCount is "> 0", and the live count
+// is capped at kFluidCap = 2^18, so the bench rides two small fields in the
+// high bits of the SAME word; the game, which passes a plain count, reads 0
+// from both. Stage N truncates the fluid path after its Nth stage and reports a
+// miss (1 = coarse march, 2 = + sub-cell refine, 3 = + thickness walk), so the
+// bench's same-frame differences attribute the cost per stage; stage 4 is the
+// STEP HEATMAP below. Variant (bits 20..27) is an experiment selector for an
+// in-process A/B (`if ((fluidVariant() & 1u) != 0u)` around the candidate
+// path, `SANDVOX_FLUID_VARIANTS=1` on the bench); 0 is always the shipped path
+// and no shipped code reads it. Strip an experiment's branch before landing it.
+fn fluidStage() -> u32 { return R.fluidCount >> 28u; }
+fn fluidVariant() -> u32 { return (R.fluidCount >> 20u) & 255u; }
+// Stage 4, the STEP HEATMAP: fs() returns straight after the march with
+// red = march loop iterations / 96, green = field samples / 96 and blue =
+// empty-chunk strides / 96, so the bench's arm shot shows WHERE the march
+// spends its steps (the counters are dead code to every other stage).
+var<private> gFluidIters : u32 = 0u;
+var<private> gFluidSamples : u32 = 0u;
+var<private> gFluidC0 : u32 = 0u;
+
 // First WORD of node c's grid row, or -1 when the node has no block.
 fn fluidNodeBase(c : vec3<i32>) -> i32 {
   let wc = worldChunkOf(c);
@@ -11222,38 +11243,41 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
 // reads the number as a geometric height, so an over-dense cell must not be
 // allowed to push its surface through its own ceiling. The blob model never
 // looked above 1 either (iso <= 1), so nothing there changes.
-fn fluidCellAt(c : vec3<i32>) -> vec3f {
-  // ---- ONE address translation for both halves of the cell ----------------
-  // This used to call fluidNodeBase(c) AND voxWordAt(c), which derive the SAME
-  // chunk slot by two different routes: chunkSlotIndex(worldChunkOf(c)) is
-  // ((c >> 4) & 31) and chunkIndexOf(c & WORLD_MASK) is ((c & 511) >> 4) —
-  // the same five bits of c. So the pair recomputed one index twice and, worse,
-  // ran two independent dependent-load chains (map -> grid, table -> voxels).
-  //
-  // This is the hottest tap in the water path: fluidRowAt takes 4 of these,
-  // fluidFieldAt 2-3 rows, and fluidNormalAt 4 fields — ~32 per water-pixel
-  // normal, on top of the march's own budget. Same words read, same order.
-  let wc = worldChunkOf(c);
+//
+// HOISTED RESOLVES (2026-10-07). The per-CHUNK half of the read — block-map
+// word and page-table entry — is a function of the chunk alone, and the field's
+// 2x3x2 tap box lies inside one chunk on ~80% of samples. So the caller
+// resolves it ONCE per field sample (fluidChunkRef) and each tap pays only the
+// per-CELL half (grid row + voxel word + material class). Same words, same
+// arithmetic: bit-identical to the per-tap resolve it replaced, and 0.2-0.5 ms
+// off the hill bench's fluid march (docs/PLAN_fluid_overhaul.md, render perf).
+
+// (block-map word, page-table entry) of chunk wc. A chunk outside the window
+// reads as (no block, EMPTY) — what the per-tap path saw there.
+fn fluidChunkRef(wc : vec3<i32>) -> vec2<u32> {
   let slot = chunkSlotOf(wc, R.origin);
+  if (slot == SLOT_NONE) { return vec2<u32>(0u, PT_SENTINEL_BIT); }
+  return vec2<u32>(fluidBlockMapR[slot], pageEntryOf(slot));
+}
+
+// The per-CELL half, off a resolved chunk ref `cr`.
+fn fluidCellFromRef(cr : vec2<u32>, c : vec3<i32>) -> vec3f {
   var m = 0.0;
   var vy = 0.0;
-  if (slot != SLOT_NONE) {
-    let bm = fluidBlockMapR[slot];
-    if (bm != 0u) {
-      let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
-      let b = ((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
-              FLUID_GW;
-      m = f32(fluidGridR[b]) * (1.0 / 1024.0);   // Q10 -> particle masses
-      // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
-      // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
-      // in. It comes off the same grid row as the mass one word away, so in
-      // practice it is not a second fetch.
-      vy = abs(f32(fluidGridR[b + 2u])) * (30.0 / 65536.0);
-    }
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  if (cr.x != 0u) {
+    let b = ((cr.x - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
+            FLUID_GW;
+    m = f32(fluidGridR[b]) * (1.0 / 1024.0);   // Q10 -> particle masses
+    // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
+    // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
+    // in. It comes off the same grid row as the mass one word away, so in
+    // practice it is not a second fetch.
+    vy = abs(f32(fluidGridR[b + 2u])) * (30.0 / 65536.0);
   }
   var fill = m / max(TUNE_FLUID_REST_DENSITY, 1.0);
   var blocker = 0.0;
-  let w = voxWordAtEntry(pageEntryOf(slot), c);
+  let w = voxWordAtEntry(cr.y, c);
   let mat = voxMat(w);
   if (mat != MAT_AIR) {
     let k = materials[mat].klass;
@@ -11271,15 +11295,26 @@ fn fluidCellAt(c : vec3<i32>) -> vec3f {
   return vec3f(fill, blocker, fill * vy);
 }
 
+// Cell c, given the ref the caller resolved for chunk `hw`; a tap across a
+// chunk face (the ~20% of samples whose tap box straddles one) resolves its own.
+fn fluidCellAt(c : vec3<i32>, hw : vec3<i32>, href : vec2<u32>) -> vec3f {
+  let wc = worldChunkOf(c);
+  var cr = href;
+  if (any(wc != hw)) { cr = fluidChunkRef(wc); }
+  return fluidCellFromRef(cr, c);
+}
+
 // Bilinear-XZ blend of ONE CELL ROW's (fill, blocker, fill*speed), on weights
 // the caller computed once. Four taps. Both models below are built out of these
 // rows, so they cannot disagree about which columns they are looking at.
-fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32) -> vec3f {
+fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32, hw : vec3<i32>,
+              href : vec2<u32>) -> vec3f {
   var acc = vec3f(0.0);
   for (var i = 0; i < 4; i++) {
     let o = vec2<i32>(i & 1, (i >> 1) & 1);
     let w = mix(1.0 - f, f, vec2f(o));
-    acc += fluidCellAt(vec3<i32>(b.x + o.x, cy, b.y + o.y)) * (w.x * w.y);
+    acc += fluidCellAt(vec3<i32>(b.x + o.x, cy, b.y + o.y), hw, href) *
+           (w.x * w.y);
   }
   return acc;
 }
@@ -11340,6 +11375,7 @@ fn fluidRowAt(b : vec2<i32>, f : vec2f, cy : i32) -> vec3f {
 // refuted explanations all assumed the refine was FINDING something.
 fn fluidFieldAt(p : vec3f) -> f32 {
   let iso = max(TUNE_FLUID_ISO, 0.05);
+  gFluidSamples += 1u;
 
   // XZ lattice: nodes at cell centres, hence the -0.5 — same convention as
   // liquidFieldAt. Shared by both models so the surface cannot step as one
@@ -11353,8 +11389,12 @@ fn fluidFieldAt(p : vec3f) -> f32 {
   // FLOOR, exactly as the state nibble is — not centre-aligned like the blob.
   let cy = i32(floor(p.y));
   let fy = p.y - f32(cy);
-  let here  = fluidRowAt(bi, fxz, cy);
-  let below = fluidRowAt(bi, fxz, cy - 1);
+  // ONE chunk resolve for the whole tap box (see HOISTED RESOLVES): the taps
+  // span x in [bi.x, bi.x+1], z in [bi.y, bi.y+1], y in [cy-1, cy+1].
+  let hw = worldChunkOf(vec3<i32>(bi.x, cy, bi.y));
+  let href = fluidChunkRef(hw);
+  let here  = fluidRowAt(bi, fxz, cy, hw, href);
+  let below = fluidRowAt(bi, fxz, cy - 1, hw, href);
 
   // SUPPORT. One eighth of water below is already full support: an eighth is
   // the CA's entire quantum, and a film resting on a film is still a film.
@@ -11388,7 +11428,7 @@ fn fluidFieldAt(p : vec3f) -> f32 {
   // rows, eight taps.
   let needAbove = (here.x > 0.75) || (lw < 0.999 && fy >= 0.5);
   var above = vec3f(0.0);
-  if (needAbove) { above = fluidRowAt(bi, fxz, cy + 1); }
+  if (needAbove) { above = fluidRowAt(bi, fxz, cy + 1, hw, href); }
 
   var field = 0.0;
   if (lw < 0.999) {
@@ -11648,7 +11688,15 @@ fn fluidYMaskOf(wc : vec3<i32>) -> u32 {
 }
 
 fn fluidChunkClass(wc : vec3<i32>) -> u32 {
-  if (!chunkResident(wc, R.origin)) { return 0u; }
+  // The near-block bit first: inside the live box most chunks the walk meets
+  // are empty (class 0), and the bit says so on one load where the tests
+  // below spend seven slot lookups (self + six neighbours) to reach the same
+  // answer. A set bit falls through to the exact classification.
+  let ns = chunkSlotOf(wc, R.origin);
+  if (ns == SLOT_NONE ||
+      ((fluidBlockMapR[fbmNearWord(ns)] >> (ns & 31u)) & 1u) == 0u) {
+    return 0u;
+  }
   if (fluidChunkWater(wc)) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
   // fluidCellAt still returns non-zero density there (virtual mass from
@@ -11826,6 +11874,50 @@ fn windowExitT(ro : vec3f, rdIn : vec3f) -> f32 {
   return select(0.0, tExit, tExit > tEnter);
 }
 
+// ---- LIVE BLOCK BOX: the exact world-chunk bounds of this tick's blocks ----
+// RENDER-ONLY derived data, read by no sim kernel. Six words after the two
+// kNumSlots halves of fluidBlockMap: min chunk xyz, then max chunk xyz, each
+// biased by FBM_BOX_BIAS so unsigned atomicMin/Max order them. Written by
+// `alloc` in the same pass that assigns the blocks, so it is never latent
+// against the block map the renderer reads — unlike the CPU's snapshot-built
+// R.fluidLo/fluidHi, which needs a two-chunk pad for exactly that latency.
+// THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl (kept out of
+// common.wgsl on purpose: an edit there recompiles every shader).
+fn fbmBoxIndex() -> u32 { return 2u * NUM_SLOTS; }
+const FBM_BOX_BIAS : i32 = 0x40000000;
+// ---- NEAR-BLOCK BITS: one bit per slot, "a block is here or a face away" --
+// After the box's 8-word tail, NUM_SLOTS bits. Set by `alloc` for every
+// assigned block's slot and its six face neighbours, retired by the next
+// alloc's phase A (which walks LAST tick's list and clears those words). A slot
+// whose bit is clear can be neither a water chunk nor a ring chunk, so the
+// renderer's chunk walk classes it on ONE load instead of seven lookups.
+// Render-only. THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl.
+fn fbmNearWord(slot : u32) -> u32 { return 2u * NUM_SLOTS + 8u + (slot >> 5u); }
+
+// The ray span inside the live block box grown by ONE chunk — the reach of
+// fluidChunkClass's ring (class 2), the farthest from a block any field sample
+// is ever taken. Every chunk outside it is class 0, where the chunk walk could
+// only stride, so clipping the march to it changes no sample and no hit. It is
+// the fix for a camera standing INSIDE the CPU's padded AABB, where every
+// pixel on screen (sky included) walked the window chunk by chunk: measured on
+// the hill bench, 100% of 1080p pixels marching, ~15 loop iterations each.
+fn fluidLiveSpan(ro : vec3f, inv : vec3f) -> vec2f {
+  let i = fbmBoxIndex();
+  let lo = vec3<i32>(vec3<u32>(fluidBlockMapR[i], fluidBlockMapR[i + 1u],
+                               fluidBlockMapR[i + 2u])) -
+           vec3<i32>(FBM_BOX_BIAS);
+  let hi = vec3<i32>(vec3<u32>(fluidBlockMapR[i + 3u], fluidBlockMapR[i + 4u],
+                               fluidBlockMapR[i + 5u])) -
+           vec3<i32>(FBM_BOX_BIAS);
+  let bl = (vec3f(lo) - vec3f(1.0)) * f32(CHUNK);
+  let bh = (vec3f(hi) + vec3f(2.0)) * f32(CHUNK);
+  let t0 = (bl - ro) * inv;
+  let t1 = (bh - ro) * inv;
+  let tn = min(t0, t1);
+  let tf = max(t0, t1);
+  return vec2f(max(max(tn.x, tn.y), tn.z), min(min(tf.x, tf.y), tf.z));
+}
+
 fn fluidBoundsSpan(ro : vec3f, inv : vec3f) -> vec2f {
   let lo = vec3f(R.fluidLo);
   let hi = vec3f(R.fluidHi) + vec3f(1.0);   // inclusive cell -> its far face
@@ -11857,7 +11949,11 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
   // camera is inside the box", which is also the only case in which the
   // submerged test below can be true — so a camera nowhere near the water no
   // longer pays a field sample for it either.
-  let span = fluidBoundsSpan(ro, inv);
+  // The CPU's (padded, latent) AABB intersected with the GPU's exact live
+  // block box (fluidLiveSpan).
+  let cpuSpan = fluidBoundsSpan(ro, inv);
+  let live = fluidLiveSpan(ro, inv);
+  let span = vec2f(max(cpuSpan.x, live.x), min(cpuSpan.y, live.y));
   if (span.y <= 0.0 || span.x > span.y) { return out; }
   let tStart = max(span.x, 0.0);
   let tEnd = min(span.y, tMax);
@@ -11883,6 +11979,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     // invisible — rather than a hitch.
     for (var i = 0; i < 320; i++) {
       rsAdd(RS_FLUID, 1u);
+      gFluidIters += 1u;
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
@@ -11898,6 +11995,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
         heldYMask = fluidYMaskOf(wc);
       }
       if (heldClass == 0u) {
+        gFluidC0 += 1u;
         tPrev = t;
         t = fluidChunkExit(ro, inv, c, t);
         continue;
@@ -11930,7 +12028,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
       // one cell (B-spline support is 1.5 cells), so stride harder.
       t += select(0.5, 1.25, d < iso * 0.25);
     }
-    if (!found) { return out; }
+    if (!found || fluidStage() == 1u) { return out; }
     // Bisect the crossing to sub-step precision — this is what keeps the
     // surface from shimmering as the camera moves.
     var lo = tPrev;
@@ -11942,8 +12040,10 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     out.hit = true;
     out.t = hi;
   }
+  if (fluidStage() == 2u) { out.hit = false; return out; }
 
   out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
+  if (fluidStage() == 3u) { out.hit = false; }
   return out;
 }
 
@@ -12087,6 +12187,7 @@ fn fluidRefineSubCell(ro : vec3f, rd : vec3f, inv : vec3f, tFrom : f32,
   let tStep = abs(inv) * invSub;
   for (var i = 0; i < FLUID_REFINE_STEPS; i++) {
     rsAdd(RS_FLUID, 1u);
+    gFluidIters += 1u;
     if (t > tTo) { break; }
     if (fluidFieldAt((vec3f(q) + vec3f(0.5)) * invSub) >= iso) {
       let e = fluidSubCellEntry(ro, rd, inv, q, invSub);
@@ -12137,7 +12238,11 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 
   // Same AABB clip as the smooth march: a ray that misses the live fluid box
   // pays one slab test and nothing else.
-  let span = fluidBoundsSpan(ro, inv);
+  // The CPU's (padded, latent) AABB intersected with the GPU's exact live
+  // block box (fluidLiveSpan).
+  let cpuSpan = fluidBoundsSpan(ro, inv);
+  let live = fluidLiveSpan(ro, inv);
+  let span = vec2f(max(cpuSpan.x, live.x), min(cpuSpan.y, live.y));
   if (span.y <= 0.0 || span.x > span.y) { return out; }
   let tStart = max(span.x, 0.0);
   let tEnd = min(span.y, tMax);
@@ -12166,6 +12271,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 
     for (var i = 0; i < FLUID_BLOCKY_STEPS; i++) {
       rsAdd(RS_FLUID, 1u);
+      gFluidIters += 1u;
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
@@ -12181,6 +12287,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
         heldYMask = fluidYMaskOf(wc);
       }
       if (heldClass == 0u) {
+        gFluidC0 += 1u;
         tPrev = t;
         t = fluidChunkExit(ro, inv, c, t);
         continue;
@@ -12199,6 +12306,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
         continue;
       }
       let d = fluidFieldAt(p);
+      if (d >= iso && fluidStage() == 1u) { return out; }
       if (d >= iso) {
         // The crossing is somewhere in [tPrev, t]; resolve which sub-cell it
         // lands in. A window that holds no occupied CENTRE (the field crossed
@@ -12228,8 +12336,10 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
     out.nrm = hit.xyz;
     out.t = hit.w;
   }
+  if (fluidStage() == 2u) { out.hit = false; return out; }
 
   out.thick = fluidThickness(ro, rd, out.t, tMax, iso);
+  if (fluidStage() == 3u) { out.hit = false; }
   return out;
 }
 
@@ -13137,6 +13247,13 @@ fn fs(in : VSOut) -> FSOut {
       mf = fluidMarchBlocky(R.camPos, rd, sceneT, 1u);
     } else if (mode >= 3) {
       mf = fluidMarchBlocky(R.camPos, rd, sceneT, 0u);
+    }
+    if (fluidStage() == 4u) {   // the bench's STEP HEATMAP (fluidStage note)
+      var dbg : FSOut;
+      dbg.color = vec4f(f32(gFluidIters) / 96.0, f32(gFluidSamples) / 96.0,
+                        f32(gFluidC0) / 96.0, 1.0);
+      dbg.depth = 0.0;
+      return dbg;
     }
   }
 

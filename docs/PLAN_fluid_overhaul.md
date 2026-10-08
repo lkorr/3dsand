@@ -745,7 +745,9 @@ Whole-frame p50 is **1.5-1.9x better in every scene**. Mass ledgers unchanged
    trilinear taps, each a block-map resolve + grid read + page-table resolve +
    voxel read); the next levers are hoisting the per-chunk resolves out of the
    tap loop (~82% of samples have all 8 taps in one chunk) and a finer
-   (4³-brick) occupancy than the y mask.
+   (4³-brick) occupancy than the y mask. **Both were tried on 2026-10-07 — see
+   "Render perf, 2026-10-07" below: the hoist is worth 0.2-0.5 ms, the brick
+   occupancy ~0, and the real cost was somewhere neither named.**
 6. **Particle slimming — EVALUATED, NOT DONE.** The bench does not support it.
    Compaction moves 128 B x live particles per tick: 5.1 MB/tick at hill's
    39,600, roughly 0.02 ms of bandwidth on a 3060 Ti against a 4.7 ms substep
@@ -1161,6 +1163,111 @@ loud` moved (18/19; `worldgen` byte-identical), and that scenario paints water
 at (176,150,176) from tick 8.
 
 ---
+
+### Render perf, 2026-10-07 — attribution first, then three exact levers
+
+Branch `worktree-agent-ad959677331e786dc`. RTX 3060 Ti, 1080p offscreen,
+`--fluid-bench hill`, render mode 2 (voxelized, the default). Raw logs, arm
+shots and heatmaps were kept beside the worktree (not committed).
+
+**The 9.52 ms above is stale, and was never a GPU number.** It is the bench's
+old wall-clock split (every-tick WaitIdle render average minus a 1-in-16
+no-fluid subset) on the 2026-08-24 tree, when nothing ever settled. The same
+legacy split on today's tree reads 3.95 ms (the hill now settles: 96% capture,
+7,950 live at tick 600). That split is also fragile: on a cold shader cache it
+folds the first frame's pipeline compile in and reads ~80 ms. So the first
+change was the reporter (CLAUDE.md rule 6).
+
+**Reporter — commit `276f315`.** Every 4th tick the bench renders the SAME
+frame once per arm under a GPU timestamp pair, in rotating order, and reports
+each net of a paired no-fluid render: `coarse` (march only, a crossing reported
+as a miss), `refine` (+ sub-cell refine), `thick` (+ thickness walk), `full`
+(+ the shade). `SANDVOX_FLUID_HEAT=1` adds a step HEATMAP arm (red = loop
+iterations, green = field samples, blue = empty-chunk strides, /96 each) and
+`SANDVOX_FLUID_ARM_SHOTS=<ticks>` writes every arm's frame for a same-frame
+pixel diff. Stage + an 8-bit experiment variant ride in the high bits of
+`RenderParams.fluidCount` (the shader only tests it against zero; kFluidCap is
+2^18), so `SANDVOX_FLUID_VARIANTS=<v,...>` A/Bs a shader lever against its
+control on the same frames in one process. Arm-to-arm noise on this machine is
+~0.1-0.2 ms; boot-to-boot ~0.2-0.6 ms (the owner's GPU apps share it).
+
+**Attribution of the starting point** (control assets = `276f315`, two boots):
+
+| | boot A1 | boot A2 |
+|---|---|---|
+| fluid draw (full - no fluid) | 4.64 ms | 4.54 ms |
+| coarse march | 3.89 | 3.81 |
+| sub-cell refine | 0.42 | 0.42 |
+| thickness walk | 0.41 | 0.31 |
+| shade (refraction/reflection/foam) | ~0 | ~0 |
+
+The heatmap at tick 200 then said where the coarse march goes: **100% of the
+2,073,600 pixels march** (water covers 50,221 of them, 2.4%), mean 15.5 loop
+iterations and 2.6 field samples per pixel; every pixel's first sample is the
+camera-submerged test. The camera stands INSIDE the CPU's fluid AABB (snapshot
+block list padded two chunks for readback latency), so sky and far ground walk
+the residency window chunk by chunk — 19.6M of the 32.1M iterations are empty
+(class-0) chunks, each classified by seven slot lookups. A no-sample variant
+of the coarse loop put the split at ~1.1 ms loop skeleton vs ~1.4 ms samples
+after levers 1-3.
+
+**Levers** (each measured in-process against its control; "after" = all three):
+
+| lever | commit | measured | exact? |
+|---|---|---|---|
+| 1. hoist the chunk resolve (block-map word + page entry) out of the tap loop: once per field sample, a face-straddling tap resolves its own | `4c5bb1e` | 5.20 -> 4.73 ms (r7), 4.51 -> 4.30 (r2), 4.80 -> 4.40 (r3) | yes — same words, same arithmetic |
+| 2. clip both marches to the GPU's exact live block box (+1 chunk ring reach), written by `alloc` in the pass that assigns the blocks: marching pixels 2.07M -> 1.48M, iterations 32.1M -> 19.3M | `d471b9a` | 5.20 -> 4.13 alone, 4.73 -> 3.67 on lever 1 (r7) | yes — chunks outside are class 0 |
+| 3. near-block bits (one per slot, set for every block and its six face neighbours by `alloc`): an empty chunk classed on one load | `c412eb3` | 4.13 -> 3.91 on lever 2 (r7) | yes |
+| **all three, two alternating boots each** | | **4.59 -> 3.17 ms (-31%)**; coarse 3.85 -> 2.39 | |
+
+Picture: arm shots at ticks 200 and 400 and the end-of-run screenshot, before
+vs after, differ by no more than the same tree differs from itself between
+boots (e.g. t400: A1 vs D1 53 px > 2, max 3; A1 vs A2 141 px > 2, max 7).
+`--shot-fluid` before/after likewise (that scene is not render-reproducible
+even against itself: A vs A2 59,513 px > 2). World hash unchanged
+(`--verify determinism` d07bdc17 matches; fluid-det particle hash
+14650fb0739d0383 matches).
+
+**Built, measured and REJECTED** (none committed):
+
+* **4^3 brick occupancy** (the plan's second named lever): 64 bits per chunk
+  built by gridUpdate/stainApply beside the Y mask, neighbour face layers
+  folded in at chunk entry. ~0 to -0.16 ms across three runs, and 993 pixels
+  changed > 2 (max 101) at tick 200. Mechanism: skipping a brick moves where the
+  coarse march's 0.5/1.25-cell samples land after it, and the blocky refine is
+  phase-sensitive on thin spray (the pour lip and the impact zone). An exact
+  version (step the empty brick at 1.25 without sampling, so the phase is
+  untouched) would save only samples — ~20% of them — and needs the 20 edge and
+  corner neighbours to be exact; not worth it at the measured size.
+* **Tight (+-1) Y mask** — the field's vertical reach really is one level, so
+  this looked free. +0.13 ms and 1,000-3,000 changed pixels per frame: the same
+  phase effect.
+* **Multi-level Y jump** (skip every empty level to the next occupied one at
+  once): -0.2 ms, 73 changed pixels at the pour lip (the per-level loop's
+  t+0.25 floor lands differently).
+* **Refine row cache** (re-use the 3 rows across eighth-high sub-cells): +0.18
+  ms — the eager third row costs more on grazing rays than the cache saves.
+* **Ring-chunk neighbour flags held at chunk entry**, **dry-ring sample
+  emulation** (an all-air ring chunk's interior samples are provably zero),
+  **one-lookup chunk info** (class + Y mask in one resolve): each within noise
+  (-0.15..+0.06 ms); the extra branches in the hot loop ate what they saved.
+
+**Target: missed.** 3.17 ms against <= 2.5 ms. What is left, in order of size:
+
+1. **Coarse samples (~1.3-1.4 ms)**: ~45% of them are in RING chunks' 2-cell
+   shells, ~50% in water chunks' occupied Y levels (air above the film). The
+   only exact way to drop them is to prove d < iso/4 without the 12 taps — a
+   per-brick source mask with edge/corner exactness, consumed by stepping 1.25
+   WITHOUT sampling (never by jumping).
+2. **Loop skeleton (~1.1 ms, ~19M iterations at tick 200)**: 7.4M are empty
+   chunks still inside the live box (one bounding box of a diagonal ramp is
+   mostly air). A 2^3-chunk super-cell near bit would land on the same planes
+   the per-chunk stride does.
+3. **Refine + thickness (~0.6 ms)**, only on water pixels.
+4. Not a render lever, but it bounds all of the above: the hill ends with
+   7,950 particles live and the basin never fully settles, so the live box never
+   empties and the march never sleeps while the camera is near.
+
 
 ## 10. Handoff rules for implementing agents
 

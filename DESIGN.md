@@ -4208,7 +4208,43 @@ only the [enter, exit] span; chunk-stride skipping over the block map crosses
 empty chunks; and the block map's second half is a per-chunk Y-OCCUPANCY mask
 (gravity-fed fluid is a thin horizontal layer, and `mark`'s 3-cell pad means an
 allocated block is routinely all air) so an empty y slab is skipped on one
-buffer read. `RenderParams.fluidCount == 0`
+buffer read.
+
+THE CPU AABB IS NOT ENOUGH, AND THE MARCH NOW CLIPS TO AN EXACT ONE
+(2026-10-07). `fluidLo/fluidHi` is built from a readback-latent snapshot, so it
+is padded two chunks — and a camera 30-60 voxels from a pour stands INSIDE it,
+at which point every pixel on screen (sky included) walks the window chunk by
+chunk: the `--fluid-bench hill` step heatmap measured 100% of 1080p pixels
+marching, ~15 loop iterations each, for water on 2.4% of them. So `alloc`
+(sim_fluid.wgsl), in the same pass that assigns the blocks, writes two more
+render-only things into a tail of `fluidBlockMap` (layout in `world.cpp`): the
+exact world-chunk bounds of the assigned blocks (six biased words,
+`fbmBoxIndex`) and one NEAR-BLOCK bit per slot for every block and its six face
+neighbours (`fbmNearWord`, cleared word-wise from last tick's list exactly as
+the Y mask is). Both marches intersect the CPU AABB with the box grown by one
+chunk (the ring's reach), and `fluidChunkInfo` classes a chunk whose near bit is
+clear as empty on one load instead of seven slot lookups. A field sample also
+resolves its chunk ONCE (`fluidChunkRef`: block-map word + page entry) instead
+of once per tap. All three are exact — no sample position and no hit changes —
+and took the hill bench's fluid draw 4.59 -> 3.17 ms. No sim kernel reads the
+new words, so nothing hashed moves. Built and REJECTED in the same pass, with
+the numbers in docs/PLAN_fluid_overhaul.md: a 4^3 brick occupancy, a tight
+(+-1) Y mask and a multi-level Y jump. Each skips samples the old march took,
+which shifts the coarse march's 0.5/1.25-cell sample PHASE, and the blocky
+refine is phase-sensitive on thin spray — they changed hundreds to thousands of
+pixels for 0-0.2 ms. A skip in this march is only free of picture changes if it
+lands where the old stepping would have landed.
+
+`--fluid-bench` attributes its own render cost: every 4th tick it renders the
+same frame once per arm under a GPU timestamp pair (no fluid; coarse march
+only; + refine; + thickness; full) and reports each net of no-fluid, plus a
+step HEATMAP (`SANDVOX_FLUID_HEAT=1`) and same-frame arm shots
+(`SANDVOX_FLUID_ARM_SHOTS=<ticks>`). The stage and an 8-bit experiment variant
+ride in the high bits of `RenderParams.fluidCount` (`fluidStage` /
+`fluidVariant` in raymarch.wgsl), so a shader lever is A/B'd against its
+control in one process with `SANDVOX_FLUID_VARIANTS=<v,...>`.
+
+`RenderParams.fluidCount == 0`
 (or `render.fluidSurface = 0`, which restores the old debug cubes via
 `debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
 Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -816,6 +817,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
 
   PassTimer timer;
   const bool haveTimer = timer.Init(ctx, 128);
+  // The paired fluid arms' own GPU timer (one begin/end pair per render): GPU
+  // time, not WaitIdle wall time, so submit and driver jitter stay out of a
+  // sub-millisecond difference.
+  PassTimer armTimer;
+  const bool haveArmTimer = armTimer.Init(ctx, 2);
   if (!haveTimer)
     std::printf("--fluid-bench: TimestampQuery unavailable — per-pass GPU "
                 "times will be zero (wall-clock rows still valid)\n");
@@ -995,6 +1001,57 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // rendering. Sampled every kAttribEvery ticks so the extra passes cost
     // ~20% of the run rather than 3x.
     std::vector<double> renderNoFluidMs, renderWorldOnlyMs;
+    // PAIRED fluid attribution (2026-10-07, fluid render perf). Every
+    // kArmEvery-th tick renders the SAME frame once per arm below, GPU-timed,
+    // so the stage costs are differences of same-tick, same-state renders
+    // instead of an every-tick wall-clock average minus a 1-in-16 subset (which
+    // folded the fluid's own evolution, and the first frame's pipeline
+    // compile, into the split). The stage and variant ride in the high bits of
+    // RenderParams.fluidCount (raymarch.wgsl fluidStage / fluidVariant; the
+    // shader only ever tests the count against zero, and kFluidCap is 2^18):
+    //   stage 1 = coarse march only (a crossing is reported as a miss),
+    //   stage 2 = + sub-cell refine, then miss,
+    //   stage 3 = + thickness walk, then miss (so full - stage3 = the shade),
+    //   stage 4 = STEP HEATMAP (not a cost: the frame is red = march loop
+    //             iterations / 96, green = field samples / 96, blue = empty-chunk
+    //             strides / 96) — only rendered with SANDVOX_FLUID_HEAT=1, and
+    //             only useful with SANDVOX_FLUID_ARM_SHOTS.
+    // SANDVOX_FLUID_VARIANTS=<v>[,<v>...] adds one arm per listed variant (an
+    // 8-bit field, bits 20..27 of the count; kFluidCap is 2^18) so a shader
+    // lever can be A/B'd against its control in ONE process on the same frames.
+    struct FluidArm { std::string name; uint32_t bits; };
+    std::vector<FluidArm> fluidArms = {
+        {"full", 0u}, {"coarse", 1u << 28}, {"refine", 2u << 28},
+        {"thick", 3u << 28}};
+    if (const char* v = std::getenv("SANDVOX_FLUID_VARIANTS")) {
+      for (const char* q = v; *q;) {
+        const uint32_t k = (uint32_t)std::strtoul(q, nullptr, 10) & 255u;
+        if (k != 0) fluidArms.push_back({"v" + std::to_string(k), k << 20});
+        while (*q && *q != ',') q++;
+        if (*q == ',') q++;
+      }
+    }
+    if (const char* h = std::getenv("SANDVOX_FLUID_HEAT"); h && *h == '1') {
+      const size_t nv = fluidArms.size();
+      fluidArms.push_back({"s4", 4u << 28});
+      for (size_t k = 4; k < nv; k++)   // one heat arm per listed variant too
+        fluidArms.push_back({"s4" + fluidArms[k].name,
+                             (4u << 28) | fluidArms[k].bits});
+    }
+    std::vector<std::vector<double>> fluidArmMs(fluidArms.size());
+    // SANDVOX_FLUID_ARM_SHOTS=<tick>[,<tick>...] also writes every arm's frame
+    // on those ticks to fluidarm_<scene>_t<tick>_<arm>.bmp, so a lever's
+    // picture can be diffed against the shipped path's on the SAME frame
+    // (mid-pour, where the end-of-run screenshot shows settled water only).
+    std::vector<uint32_t> armShotTicks;
+    if (const char* v = std::getenv("SANDVOX_FLUID_ARM_SHOTS")) {
+      for (const char* q = v; *q;) {
+        armShotTicks.push_back((uint32_t)std::strtoul(q, nullptr, 10));
+        while (*q && *q != ',') q++;
+        if (*q == ',') q++;
+      }
+    }
+    std::vector<double> pairedNoFluidMs;
     std::vector<double> frameMs, renderMs;
     std::map<std::string, uint64_t> prevNs;
     std::map<std::string, std::vector<double>> passMs;
@@ -1124,6 +1181,73 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       // Never on the LAST tick: these passes overwrite the offscreen target and
       // the screenshot below is taken from it.
       constexpr uint32_t kAttribEvery = 16;
+      // Paired arms every kArmEvery ticks (more samples than the wall-clock
+      // split below, at GPU-timestamp precision). The order ROTATES per group
+      // so no arm always runs first or last against the clock boost.
+      constexpr uint32_t kArmEvery = 4;
+      if (st % kArmEvery == 0 && st != N && liveEst != 0) {
+        auto renderArm = [&](uint32_t count) {
+          const double a0 = NowSeconds();
+          WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true,
+                            11.7f, kFarFogDensity, (float)H, skyTick, count);
+          rhi::CommandEncoder aenc = ctx.device.CreateCommandEncoder();
+          uint32_t qb = 0, qe = 0;
+          const bool timed =
+              haveArmTimer && armTimer.AllocPassPair("fluidArm", qb, qe);
+          if (timed) aenc.WriteTimestamp(armTimer.NativeQuerySet(), qb, false);
+          sim.EncodeShadowResolve(aenc);
+          rhi::RenderPass arp = sim.BeginRenderPass(
+              aenc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+          sim.DrawWorld(arp);
+          sim.DrawParticles(arp);
+          arp.End();
+          if (timed) aenc.WriteTimestamp(armTimer.NativeQuerySet(), qe, true);
+          armTimer.EncodeResolve(aenc);
+          ctx.queue.Submit(aenc.Finish());
+          ctx.WaitIdle();
+          const double wall = (NowSeconds() - a0) * 1000.0;
+          if (std::find(armShotTicks.begin(), armShotTicks.end(), st) !=
+              armShotTicks.end()) {
+            const uint32_t vb = (count >> 20) & 255u, sb = count >> 28;
+            std::string an = count == 0 ? "nofluid" : "";
+            if (count != 0 && sb) an += "s" + std::to_string(sb);
+            if (count != 0 && (vb || !sb)) an += "v" + std::to_string(vb);
+            rhi::Buffer shotB = CreateBuffer(
+                ctx.device, (uint64_t)W * H * 4,
+                rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                "armShot");
+            rhi::CommandEncoder senc = ctx.device.CreateCommandEncoder();
+            rhi::TexelCopyTexture srcT{};
+            srcT.texture = offscreen;
+            rhi::TexelCopyBuffer dstB{};
+            dstB.buffer = shotB;
+            dstB.bytesPerRow = W * 4;
+            dstB.rowsPerImage = H;
+            senc.CopyTextureToBuffer(srcT, dstB, {W, H, 1});
+            ctx.queue.Submit(senc.Finish());
+            std::vector<uint8_t> px((size_t)W * H * 4);
+            const std::string f = "fluidarm_" + run.tag + "_t" +
+                                  std::to_string(st) + "_" + an + ".bmp";
+            if (rhi::ReadBufferBlocking(ctx.device, shotB, 0, px.data(),
+                                        px.size()))
+              WriteBmpFile(f, px, W, H);
+          }
+          if (!timed) return wall;
+          armTimer.Collect(ctx);
+          const auto& lf = armTimer.LastFrame();
+          return lf.empty() ? wall : (double)lf[0].ns * 1e-6;
+        };
+        const size_t na = fluidArms.size() + 1;   // + the no-fluid arm
+        const size_t rot = (size_t)(st / kArmEvery) % na;
+        for (size_t j = 0; j < na; j++) {
+          const size_t k = (j + rot) % na;
+          if (k == fluidArms.size()) {
+            pairedNoFluidMs.push_back(renderArm(0u));
+          } else {
+            fluidArmMs[k].push_back(renderArm(liveEst | fluidArms[k].bits));
+          }
+        }
+      }
       if (st % kAttribEvery == 0 && st != N) {
         for (int mode = 0; mode < 2; mode++) {
           const double a0 = NowSeconds();
@@ -1400,6 +1524,21 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
         avg(renderMs) - avg(renderNoFluidMs),
         avg(renderNoFluidMs) - avg(renderWorldOnlyMs), avg(renderWorldOnlyMs),
         avg(renderMs));
+    if (!pairedNoFluidMs.empty()) {
+      // Each arm minus the paired no-fluid render of the same ticks.
+      const double nf = avg(pairedNoFluidMs);
+      std::printf("    paired fluid arms (%u ticks, net of no-fluid %.2f ms):",
+                  (unsigned)pairedNoFluidMs.size(), nf);
+      for (size_t k = 0; k < fluidArms.size(); k++)
+        std::printf(" %s %.3f", fluidArms[k].name.c_str(),
+                    avg(fluidArmMs[k]) - nf);
+      std::printf("\n");
+      const double f = avg(fluidArmMs[0]), c = avg(fluidArmMs[1]),
+                   r = avg(fluidArmMs[2]), t = avg(fluidArmMs[3]);
+      std::printf("    fluid stages: coarse march %.3f | refine %.3f | "
+                  "thickness %.3f | shade %.3f ms\n",
+                  c - nf, r - c, t - r, f - t);
+    }
     for (auto& [name, v] : passMs)
       if (avg(v) > 0.0005)
         std::printf("    %-24s avg %7.3f ms  p95 %7.3f ms\n", name.c_str(),
@@ -1426,6 +1565,12 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
          << ", \"dropletRaster\": "
          << avg(renderNoFluidMs) - avg(renderWorldOnlyMs)
          << ", \"worldSky\": " << avg(renderWorldOnlyMs) << "},\n";
+    json << "    \"pairedFluidArmsMs\": {\"noFluid\": "
+         << avg(pairedNoFluidMs);
+    for (size_t k = 0; k < fluidArms.size(); k++)
+      json << ", \"" << fluidArms[k].name << "\": "
+           << avg(fluidArmMs[k]) - avg(pairedNoFluidMs);
+    json << "},\n";
     json << "    \"passesMs\": {";
     bool first = true;
     for (auto& [name, v] : passMs) {

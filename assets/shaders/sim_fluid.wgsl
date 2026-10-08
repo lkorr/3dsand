@@ -678,6 +678,35 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 }
 
+// ---- LIVE BLOCK BOX: the exact world-chunk bounds of this tick's blocks ----
+// RENDER-ONLY derived data, read by no sim kernel. Six words after the two
+// kNumSlots halves of fluidBlockMap: min chunk xyz, then max chunk xyz, each
+// biased by FBM_BOX_BIAS so unsigned atomicMin/Max order them. Written by
+// `alloc` in the same pass that assigns the blocks, so it is never latent
+// against the block map the renderer reads — unlike the CPU's snapshot-built
+// R.fluidLo/fluidHi, which needs a two-chunk pad for exactly that latency.
+// THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl (kept out of
+// common.wgsl on purpose: an edit there recompiles every shader).
+fn fbmBoxIndex() -> u32 { return 2u * NUM_SLOTS; }
+const FBM_BOX_BIAS : i32 = 0x40000000;
+// ---- NEAR-BLOCK BITS: one bit per slot, "a block is here or a face away" --
+// After the box's 8-word tail, NUM_SLOTS bits. Set by `alloc` for every
+// assigned block's slot and its six face neighbours, retired by the next
+// alloc's phase A (which walks LAST tick's list and clears those words). A slot
+// whose bit is clear can be neither a water chunk nor a ring chunk, so the
+// renderer's chunk walk classes it on ONE load instead of seven lookups.
+// Render-only. THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl.
+fn fbmNearWord(slot : u32) -> u32 { return 2u * NUM_SLOTS + 8u + (slot >> 5u); }
+
+// A slot (k = 0) or one of its six face neighbours (k = 1..6); SLOT_NONE for a
+// neighbour outside the window with no ticket.
+fn fbmNearSlot(s : u32, k : u32) -> u32 {
+  if (k == 0u) { return s; }
+  var d = vec3<i32>(0);
+  d[(k - 1u) >> 1u] = select(-1, 1, (k & 1u) == 0u);
+  return chunkSlotOf(slotWorldChunk(s, T.origin) + d, T.origin);
+}
+
 // ---- alloc: deterministic block assignment + node-pass dispatch args --------
 // ONE workgroup. Each thread counts the marks in its 128-slot span, thread 0
 // turns the counts into exclusive prefixes (256 sequential adds — trivially
@@ -710,7 +739,21 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   for (var i = li; i < prevBlocks; i += 256u) {
     let s = fluidBlockList[i];
     atomicStore(&fluidBlockMap[fbmYMaskIndex(s)], 0u);
+    // Whole words: every bit in them was set from LAST tick's list (phase B
+    // below rebuilds the lot), so clearing a neighbour's word loses nothing.
+    for (var k = 0u; k < 7u; k++) {
+      let ns = fbmNearSlot(s, k);
+      if (ns != SLOT_NONE) { atomicStore(&fluidBlockMap[fbmNearWord(ns)], 0u); }
+    }
     atomicAnd(&fluidBlockMap[s], MAP_MARK);
+  }
+  // The live block box restarts EMPTY (min > max) every tick; the assignment
+  // loop at the bottom grows it. Asleep, it stays empty — the right answer.
+  if (li == 0u) {
+    for (var k = 0u; k < 3u; k++) {
+      atomicStore(&fluidBlockMap[fbmBoxIndex() + k], 0xFFFFFFFFu);
+      atomicStore(&fluidBlockMap[fbmBoxIndex() + 3u + k], 0u);
+    }
   }
   // Phase B reads index words that OTHER threads of phase A just masked, and
   // thread 0 overwrites fluidArgs[3] below — both need phase A finished.
@@ -761,6 +804,18 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
     if (idx < FLUID_BLOCKS) {
       atomicStore(&fluidBlockMap[s], idx + 1u);
       fluidBlockList[idx] = s;
+      // min/max commute: the box is the same whatever the thread order.
+      let bw = vec3<u32>(slotWorldChunk(s, T.origin) + vec3<i32>(FBM_BOX_BIAS));
+      for (var k = 0u; k < 3u; k++) {
+        atomicMin(&fluidBlockMap[fbmBoxIndex() + k], bw[k]);
+        atomicMax(&fluidBlockMap[fbmBoxIndex() + 3u + k], bw[k]);
+      }
+      for (var k = 0u; k < 7u; k++) {
+        let ns = fbmNearSlot(s, k);
+        if (ns != SLOT_NONE) {
+          atomicOr(&fluidBlockMap[fbmNearWord(ns)], 1u << (ns & 31u));
+        }
+      }
     } else {
       atomicStore(&fluidBlockMap[s], 0u);  // over budget: freeze this chunk
     }
