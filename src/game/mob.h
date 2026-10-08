@@ -652,7 +652,21 @@ struct MobDef {
   // special case in code, so anything else that should stalk with a held pose
   // (a charging beast lowering its head) names its own clip and costs no C++.
   // Additive clips compose with the gait, so the body still shambles under it.
+  //
+  // AN OVERRIDE CHASE CLIP IS A STANCE (2026-10-07, the snake rearing up like
+  // a cobra). It is held even under a clip-owned loco state -- it owns only
+  // its own mask, which the slither yields to it -- and it wants `restFill`
+  // (anim.h) or its weight ramp is a snap.
   std::string chaseClip;
+  // Seconds the chase pose takes to come on and to go off (sidecar
+  // `chaseRampMs`). The zombie's arms want 0.18 so they are down before a
+  // punch's clip has blended in; a snake rearing up over its own length
+  // wants half a second.
+  float chaseRampS = 0.18f;
+  // Held only while the target is within this many voxels, centre to centre
+  // (sidecar `chaseRange`; 0 = whenever engaged). A cobra rears at a threat
+  // in front of it, not at one thirty voxels away it is still crossing to.
+  float chaseRange = 0.0f;
 
   const std::string& Sound(const char* slot) const {
     static const std::string kNone;
@@ -3559,6 +3573,13 @@ class Mob {
     aimLookValid_ = true;
   }
   void ClearAimLook() { aimLookValid_ = false; }
+  // HOLD THE CHASE POSE WITH NO BRAIN BEHIND IT (MobDef::chaseClip): the
+  // harness's seam for a stance the AI would otherwise only take with a
+  // target in range -- `--shot-strike` and the `snake` gate's rear pass throw
+  // a `fromStance` style from it. Dropped for a stroke exactly as the AI's is.
+  void SetStanceHold(bool on) { stanceHold_ = on; }
+  // How much of the chase pose is on right now, 0..1 (`chasePose_`).
+  float ChasePoseWeight() const { return chasePose_; }
   // WHAT THE BODY IS DOING (P7, anim.h AnimState::activity): "sleep" selects
   // the rig's activity state (a villager lying on its bed), "" stands it back
   // up. Set every tick by the resident layer; presentation, never saved.
@@ -5476,6 +5497,7 @@ class Mob {
   // time round. Driving the instance's `weight` instead keeps one instance
   // alive for the whole pursuit and moves only the number.
   float chasePose_ = 0;
+  bool stanceHold_ = false;   // SetStanceHold
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
   mutable WeaponArmDiag weaponDiag_{};
   mutable AimDiag aimDiag_{};
@@ -8102,8 +8124,24 @@ class MobSystem {
     float radius = 0.25f;
     float halfLen = 0.0f;
     bool alongFacing = true;   // the long axis is the facing (z), else across
+    // The segment's centre, moved this far along the facing from the body
+    // centre (+ = forward). 0 for every BodyCapsule; BodyCapsuleOf trims a
+    // reared front off the segment and shifts it back by half the trim.
+    float shift = 0.0f;
   };
   static Capsule BodyCapsule(const MobDef& def);
+  // ...AND THE ONE THIS BODY IS IN NOW (2026-10-07). The def's capsule, with
+  // its FRONT pulled back to where the posed body actually ends while a chase
+  // stance is up (MobDef::chaseClip) AND a stroke thrown from it is live: a
+  // snake reared like a cobra has drawn
+  // its front third four voxels up and back off the ground, and a capsule
+  // still reaching to its resting snout held it -- and its lunge -- four
+  // voxels short of anything it reared at. Never longer than the def's, and
+  // exactly the def's whenever no stance is on, which is every creature but
+  // a snake lunging from its stance: the trim applies only through a
+  // `fromStance` stroke (AttackStyle::fromStance), so approach, spacing and
+  // every other blow see the def's capsule exactly as before.
+  Capsule BodyCapsuleOf(const Mob& mob, const MobDef& def) const;
   // The capsule's segment ends, in world xz, for a body centred at (cx, cz)
   // facing `heading`.
   static void CapsuleSegment(const Capsule& c, float cx, float cz,

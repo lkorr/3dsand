@@ -643,6 +643,23 @@ struct AttackStyle {
   // ordinary table is used whatever posture the attacker is in, which is
   // exactly the old behaviour.
   std::vector<StyleTargetWeight> targetProne;
+  // ---- HOW HIGH THIS STYLE CAN RISE (2026-10-07) --------------------------
+  //
+  // World voxels above the victim's feet; the draw above takes only limbs
+  // whose centre is at or below it (MobSystem::PickTargetLimb `reachHeight`).
+  // 0 = the engine's answer, which is "a PRONE attacker reaches its own lying
+  // height and a voxel" -- right for a snake striking along the ground and
+  // wrong for the same snake reared up like a cobra and leaping, which is a
+  // different move with a different reach. So the style says it: the rear
+  // strike reaches a man's hands and forearms, the ground strike his feet.
+  // Applies whatever the attacker's posture.
+  float reachHeight = 0.0f;
+  // THROWN FROM THE STANCE (style key `fromStance`): the attacker's chase pose
+  // (MobDef::chaseClip) stays held through this stroke instead of being
+  // dropped for it, so the style's `clip` -- authored ADDITIVE -- moves the
+  // body from the stance rather than from rest. The snake's rear strike:
+  // reared up, it draws back and lunges without first lying down.
+  bool fromStance = false;
   // AN AUTHORED BODY ANIMATION TO PLAY WITH THE STROKE, by name (empty = none).
   // The stroke program drives the WEAPON ARM through the melee driver; this is
   // everything else — the step, the shoulder drop, the off hand — keyframed in

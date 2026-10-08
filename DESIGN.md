@@ -14489,6 +14489,62 @@ round-trips its MOBS record (`SaveOne` / `LoadOne`): it comes back where it
 was, prone, on its own profile, and goes on wandering. Thresholds in
 `tests/baseline.json` (`snake.*`).
 
+**It rears like a cobra and strikes at the arms** (2026-10-07, owner: "they'll
+only attack the feet"). A second posture and a second style, every piece a
+general mechanism the sidecar or the style opts into:
+
+- **The stance is the chase pose.** `snake.json` names `chaseClip:
+  snake_rear`, an OVERRIDE on the front five segments (`body4`..`head`): a
+  column about 0.55 m high, the head level at the top, swaying side to side
+  over 2.4 s with a breath on `body3`; the head-look between strokes
+  (`aimLook_`) makes it stare. An override chase clip is now held under a
+  clip-owned loco state (the zombie's additive `reach` still is not), only
+  within `chaseRange` (20 voxels) of the target, ramped over `chaseRampMs`
+  (450; the default stays 0.18 s). **`restFill`** (`AnimClip::restFill`,
+  anim.cpp stage 1.5) is what makes the ramp a rise: an override blend is
+  normalised by its own weight, so one clip at 0.1 renders its whole pose;
+  with `restFill` the rest pose fills whatever weight the overrides on that
+  part leave below 1. The slither yields the stance's mask by its weight, as
+  it does the strike's coil.
+- **Two styles, drawn evenly** (`behaviors.json` `snake`): `snake_strike` drops
+  the stance (it ramps out while the coil blends in) and bites the feet as
+  before; `snake_rear_strike` is **`fromStance`** (`AttackStyle::fromStance`):
+  the chase pose stays held through the stroke and the style's clip
+  (`snake_rear_strike`, ADDITIVE) draws the column back into an S and throws
+  it forward and up. Two overrides averaging each other is what this avoids
+  -- the stance fading out under a strike clip would have halved the strike.
+- **What it can reach is the style's** (`AttackStyle::reachHeight`): the
+  draw takes limbs whose centre is at most this far over the victim's feet,
+  in place of the prone default (lying height + 1). 10 voxels: hands and
+  forearms. Its table is arms and hands only; legs and feet are the ground
+  strike's.
+- **The leap** is the style's lunge fired at the WINDUP (rise 2.6 m/s, so the
+  cut lands near the top of the arc; `ticks` 16 = the real ballistic flight,
+  because the horizontal is sized against `min(ticks, 2v/g)` and a short
+  `ticks` overshoots by the ratio; horizontal ceiling 2 m/s). A prone body's
+  drawn height was the ground's whatever its origin did, so the slither state
+  sets **`airLift`** (`AnimStateRule::airLift`): while airborne the drawn body
+  rises by how far the origin has risen above where it left the ground.
+- **Two contact fixes the leap needed.** The capsule the walk drive, the
+  crowd push and `BlockedByMob` use reached the RESTING snout, four voxels
+  ahead of a reared one, so the lunge started already touching and closed
+  nothing; `MobSystem::BodyCapsuleOf` trims the front to the posed body (and
+  shifts the segment back by half the trim, `Capsule::shift`) **only through
+  a `fromStance` stroke**, so approach, spacing and every other blow keep the
+  def's capsule. And `BlockedByMob`'s height test was `|dy| > half the
+  MOVER's height`: a 1.6-voxel snake a voxel into its leap stopped counting a
+  standing man and flew through him. It now asks whether the lower halves of
+  the two bodies overlap -- identical for two bodies of one height.
+- **Gate `snake` pass F**: a snake held in the stance (`Mob::SetStanceHold`,
+  also used by `--shot-strike` for a `fromStance` style) 11 voxels from a
+  standing man, four strikes on fresh pairs: the stance lifts the snout 5.6
+  voxels, every draw is an arm or a hand (7.4..9.1 up), the snout peaks at
+  10.4..11.0 in the cut and the head comes within 0.5..1.2 of the aim, and 3
+  of 4 leave venom in an arm or hand. Passes A..E now skip the stance's mask
+  and the ticks of a strike, a leap and the six after one: the claims there
+  are about the body travelling. `SANDVOX_SNAKE_TRACE=1` prints the hunt, the
+  slither clearance and each rear strike tick by tick.
+
 ### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
 
 **Everything in this section is PRESENTATION, and the separation is

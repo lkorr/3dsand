@@ -4468,6 +4468,10 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   // at 3.8 on a 7-voxel gap. A harness that photographs a distance has to own
   // that distance from the first tick.
   mobs.SetMobBehavior(idA, "training_dummy");
+  // A style thrown FROM the stance (AttackStyle::fromStance) is photographed
+  // from it: the training dummy has no brain to take the stance on its own.
+  if (sty.fromStance)
+    if (Mob* m0 = mobs.FindMobById(idA)) m0->SetStanceHold(true);
   // ---- ARMED BEFORE IT IS MEASURED --------------------------------------
   // `StyleReachOn` asks the LIVE weapon how far it reaches, so a mace has to
   // be in the fist before the stand-off is computed -- measured, computing it

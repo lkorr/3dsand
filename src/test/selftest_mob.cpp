@@ -9629,6 +9629,7 @@ Status GateCrawlStill(Ctx& c, std::string& detail) {
 //
 // Thresholds live in tests/baseline.json (`snake.*`).
 Status GateSnake(Ctx& c, std::string& detail) {
+  static const bool kSnakeTrace = std::getenv("SANDVOX_SNAKE_TRACE") != nullptr;
   c.debris.Reset();
   c.mobs.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -9746,6 +9747,21 @@ Status GateSnake(Ctx& c, std::string& detail) {
     c.mobs.Reset();
   };
 
+  // ---- WHICH SEGMENTS THE STANCE HAS RAISED (2026-10-07) -------------------
+  // The cobra stance (the sidecar's `chaseClip`) lifts its own mask off the
+  // ground ON PURPOSE, so the clearance claim below is about the body behind
+  // it while it is up. Read off the live weight, so a stance on its way down
+  // is measured again the moment it is gone.
+  const int chaseCi =
+      sd.chaseClip.empty() ? -1 : sd.skel.FindClip(sd.chaseClip);
+  auto reared = [&](const Mob* mm, int part) {
+    if (mm == nullptr || chaseCi < 0 || mm->ChasePoseWeight() <= 0.02f)
+      return false;
+    const AnimClip& cc = sd.skel.clips[(size_t)chaseCi];
+    return cc.mask.empty() ||
+           (part >= 0 && (size_t)part < cc.mask.size() && cc.mask[(size_t)part]);
+  };
+
   // ---- PASS A: the slither -------------------------------------------------
   const float startCz = (float)spot.z - 14.0f;
   const Vec3 target{(float)spot.x + 0.5f, (float)(h0 + 1) + 8.0f,
@@ -9775,6 +9791,8 @@ Status GateSnake(Ctx& c, std::string& detail) {
   std::vector<Vec3> prev(chain.size()), now(chain.size());
   std::vector<uint8_t> have(chain.size(), 0), havePrev(chain.size(), 0);
   int targeted = 0, strikeTicks = 0, floatSeg = -1, sinkSeg = -1;
+  int rearTicks = 0, sinceStrike = 1000, floatT = -1, sinkT = -1;
+  float sinkStance = 0.0f;
   std::vector<int> intentTicks((size_t)ai::Intent::Count, 0);
   for (int t = 0; t < ticks; t++) {
     tick();
@@ -9789,10 +9807,18 @@ Status GateSnake(Ctx& c, std::string& detail) {
     }
     for (size_t k = 0; k < chain.size(); k++)
       have[k] = m->LimbCentreWorld(chain[k], now[k]) ? 1 : 0;
+    // A strike, a leap and the few ticks after one (the body settling back
+    // onto the ground) are not the slither; neither is a segment the stance
+    // holds up and sways. Both claims below are about the body travelling.
+    const NpcStroke* stroke = c.mobs.MobStroke(id);
+    const bool striking = (stroke != nullptr && stroke->Active()) || m->Airborne();
+    sinceStrike = striking ? 0 : sinceStrike + 1;
+    const bool settled = sinceStrike > 6;
     // ---- slip, interior segments, from the tenth tick (the start-up turn)
-    if (t >= 10)
+    if (t >= 10 && settled)
       for (size_t k = 1; k + 1 < chain.size(); k++) {
         if (!have[k] || !havePrev[k] || !have[k - 1] || !have[k + 1]) continue;
+        if (reared(m, chain[k])) continue;
         Vec3 d = now[k] - prev[k];
         d.y = 0;
         Vec3 tg = now[k - 1] - now[k + 1];
@@ -9810,11 +9836,30 @@ Status GateSnake(Ctx& c, std::string& detail) {
     // ---- clearance, every live segment, every fifth tick -- WHILE IT
     // SLITHERS. A strike raises the neck and lunges by design; the claim here
     // is about the body lying on the ground as it travels.
-    const NpcStroke* stroke = c.mobs.MobStroke(id);
-    const bool striking = (stroke != nullptr && stroke->Active()) || m->Airborne();
     if (striking) strikeTicks++;
-    if (t % 5 == 0 && !striking) {
+    if (m != nullptr && m->ChasePoseWeight() > 0.02f) rearTicks++;
+    if (kSnakeTrace && t % 5 == 0) {
+      std::string row;
       for (size_t k = 0; k < chain.size(); k++) {
+        const uint32_t n = c.mobs.LimbVoxelCount(id, chain[k]);
+        float lo = 1e9f;
+        Vec3 at{};
+        for (uint32_t v = 0; v < n; v++) {
+          const Vec3 p = c.mobs.LimbVoxelPos(id, chain[k], v);
+          if (p.y < lo) { lo = p.y; at = p; }
+        }
+        row += n ? Format(" %5.2f", lo - groundTop(at.x, at.z)) : "    -";
+      }
+      const Vec3 o = c.mobs.MobOrigin(id);
+      std::printf("  slither t%3d strike %d settled %d stance %.2f air %d "
+                  "origin (%.1f,%.2f,%.1f) clear head..tail:%s\n",
+                  t, striking ? 1 : 0, settled ? 1 : 0, m->ChasePoseWeight(),
+                  m->Airborne() ? 1 : 0, o.x, o.y - (float)(padTop + 1), o.z,
+                  row.c_str());
+    }
+    if (t % 5 == 0 && settled) {
+      for (size_t k = 0; k < chain.size(); k++) {
+        if (reared(m, chain[k])) continue;   // raised by the stance, on purpose
         const uint32_t n = c.mobs.LimbVoxelCount(id, chain[k]);
         float lo = 1e9f;
         Vec3 at{};
@@ -9824,8 +9869,13 @@ Status GateSnake(Ctx& c, std::string& detail) {
         }
         if (n == 0) continue;
         const float clear = lo - groundTop(at.x, at.z);
-        if (clear > floatMax) { floatMax = clear; floatSeg = (int)k; }
-        if (-clear > sinkMax) { sinkMax = -clear; sinkSeg = (int)k; }
+        if (clear > floatMax) { floatMax = clear; floatSeg = (int)k; floatT = t; }
+        if (-clear > sinkMax) {
+          sinkMax = -clear;
+          sinkSeg = (int)k;
+          sinkT = t;
+          sinkStance = m->ChasePoseWeight();
+        }
       }
     }
     // ---- the wave, every fifth tick past the start-up
@@ -9903,10 +9953,13 @@ Status GateSnake(Ctx& c, std::string& detail) {
                  : "-";
     };
     std::printf("snake slither: targeted %d/%d ticks | intents:%s | pad top "
-                "y %d, gap at start %.1f | %d striking/airborne ticks not "
-                "measured for clearance | worst float on %s, sink on %s\n",
+                "y %d, gap at start %.1f | %d striking/airborne ticks (+6 "
+                "settling after each) not measured for clearance or slip, %d with the stance up (its mask "
+                "not measured) | worst float on %s (t%d), sink on %s (t%d, "
+                "stance %.2f)\n",
                 targeted, ticks, hist.c_str(), padTop, gap0, strikeTicks,
-                segName(floatSeg), segName(sinkSeg));
+                rearTicks, segName(floatSeg), floatT, segName(sinkSeg), sinkT,
+                sinkStance);
   }
   cleanup();
 
@@ -10075,6 +10128,21 @@ Status GateSnake(Ctx& c, std::string& detail) {
         if (const ai::Brain* br = c.mobs.MobBrain(hunter))
           intents[std::min((size_t)br->intent, intents.size() - 1)]++;
         const NpcStroke* s = c.mobs.MobStroke(hunter);
+        // SANDVOX_SNAKE_TRACE=1: every 10th tick of the hunt, what the
+        // snake is doing and how far it is (rule 6).
+        if (kSnakeTrace && t % 10 == 0) {
+          const ai::Brain* br = c.mobs.MobBrain(hunter);
+          const Mob* hm = c.mobs.FindMobById(hunter);
+          std::printf("  hunt t%3d gap %5.1f intent %-9s stance %.2f "
+                      "stroke %d brainDist %.1f\n",
+                      t,
+                      AiPlanar(AiMobCentre(c.mobs, hunter, sd),
+                               AiMobCentre(c.mobs, prey, hd)),
+                      br ? ai::IntentName(br->intent) : "-",
+                      hm ? hm->ChasePoseWeight() : -1.0f,
+                      s != nullptr && s->Active() ? 1 : 0,
+                      br ? br->targetDist : -1.0f);
+        }
         const bool cutting = s != nullptr && s->Cutting();
         if (cutting && !wasCutting) {
           strikes++;
@@ -10091,15 +10159,17 @@ Status GateSnake(Ctx& c, std::string& detail) {
               hm != nullptr && !chain.empty() &&
               hm->LimbCentreWorld(chain.front(), head);
           const int tl = lastCut.targetLimb;
+          const AttackStyle* ls = c.mobs.AttackStyles().At(lastCut.style);
           std::printf(
-              "snake hunt strike %d: aimed at %s (y %.1f), centre gap %.1f | "
-              "head ended %.1f vox from the aim | probes %d cast, %d body, "
-              "bitten %d\n",
-              strikes,
+              "snake hunt strike %d (%s): aimed at %s (y %.1f), centre gap "
+              "%.1f | head ended %.1f vox from the aim (head y %.1f) | probes "
+              "%d cast, %d body, bitten %d\n",
+              strikes, ls != nullptr ? ls->name.c_str() : "?",
               tl >= 0 && (size_t)tl < hd.limbs.size() ? hd.limbs[(size_t)tl].name.c_str()
                                                       : "(chest)",
               lastCut.targetPoint.y, strikeGap,
               haveHead ? (head - lastCut.targetPoint).len() : -1.0f,
+              haveHead ? head.y : -1.0f,
               lastCut.probesCast, lastCut.probesBody, lastCut.bitten ? 1 : 0);
         }
         wasCutting = cutting;
@@ -10365,6 +10435,148 @@ Status GateSnake(Ctx& c, std::string& detail) {
                     : 0.0);
     cleanup();
   }
+
+  // ---- PASS F: THE REARING STRIKE GOES FOR THE ARMS (2026-10-07) -----------
+  //
+  // Owner: the snake "will only attack the feet". The cobra stance (sidecar
+  // `chaseClip` snake_rear) and the style thrown from it (`snake_rear_strike`:
+  // fromStance, reachHeight, a leap drawn off the ground by the slither
+  // state's airLift) exist so it can go for a standing man's hands and
+  // forearms. Lined up on the pad at the profile's striking band with the
+  // stance HELD (Mob::SetStanceHold -- no brain, so nothing else starts a
+  // stroke), `snake.rearTrials` strikes, each on a fresh pair:
+  //   * the stance lifts the snout `snake.rearHeadMinVox` over the pad;
+  //   * every draw is a limb whose centre is `snake.rearDrawMinVox` or more
+  //     over the man's feet (an arm, a hand, a thigh -- never a foot);
+  //   * `snake.rearMinArmBites` of them leave the venom in an arm or a hand.
+  // One line per strike (rule 6): what it drew, how high the snout got in
+  // the cut, the closest the head came to the aim, what the probes met.
+  if (humanDef >= 0 && sd.bite.infectMat != 0 &&
+      c.mobs.AttackStyles().Find("snake_rear_strike") >= 0) {
+    const MobDef& hd = c.mobs.Defs()[humanDef];
+    const uint32_t envMat = sd.bite.infectMat;
+    const int trials = (int)BaselineNumber("snake.rearTrials", 4.0);
+    const float headMin = (float)BaselineNumber("snake.rearHeadMinVox", 4.0);
+    const float drawMin = (float)BaselineNumber("snake.rearDrawMinVox", 4.0);
+    const int armMin = (int)BaselineNumber("snake.rearMinArmBites", 1.0);
+    const float gap = (float)BaselineNumber("snake.rearGapVox", 11.0);
+    const float floorY = (float)(padTop + 1);
+    float stanceBest = 0.0f;
+    int armBites = 0, lowDraws = 0, drawn = 0, started = 0;
+    auto snoutTop = [&](uint64_t mid) {
+      float hi = -1e9f;
+      const uint32_t n = c.mobs.LimbVoxelCount(mid, chain.front());
+      for (uint32_t v = 0; v < n; v++)
+        hi = std::max(hi, c.mobs.LimbVoxelPos(mid, chain.front(), v).y);
+      return hi - floorY;
+    };
+    for (int k = 0; k < trials; k++) {
+      const float sx = (float)spot.x + 0.5f, sz = (float)spot.z - 12.0f;
+      const uint64_t hunter = c.mobs.Spawn(
+          snakeDef, {(int)std::lround(sx - sd.worldSize.x * 0.5f), h0 + 1,
+                     (int)std::lround(sz - sd.worldSize.z * 0.5f)});
+      const uint64_t man = c.mobs.Spawn(
+          humanDef, {(int)std::lround(sx - hd.worldSize.x * 0.5f), h0 + 1,
+                     (int)std::lround(sz + gap - hd.worldSize.z * 0.5f)});
+      if (hunter == 0 || man == 0 ||
+          !c.mobs.SetMobBehavior(hunter, "training_dummy") ||
+          !c.mobs.SetMobBehavior(man, "training_dummy")) {
+        check(false, "the rear-strike fixture spawned (a snake, a man)");
+        cleanup();
+        break;
+      }
+      c.mobs.SetHeading(hunter, 0.0f);
+      c.mobs.SetHeading(man, 3.14159265f);
+      if (Mob* hm = c.mobs.FindMobById(hunter)) hm->SetStanceHold(true);
+      for (int i = 0; i < 30; i++) tick();
+      const float stance = snoutTop(hunter);
+      stanceBest = std::max(stanceBest, stance);
+      const Vec3 aim = AiMobCentre(c.mobs, man, hd);
+      if (!c.mobs.ForceAttack(hunter, "snake_rear_strike", aim, tick.tick,
+                              0x5A4E0u + (uint32_t)k, man)) {
+        std::printf("snake rear strike %d: REFUSED by ForceAttack\n", k + 1);
+        cleanup();
+        continue;
+      }
+      started++;
+      const NpcStroke* s0 = c.mobs.MobStroke(hunter);
+      const int tl = s0 != nullptr ? s0->targetLimb : -1;
+      float drawUp = -1.0f;
+      Vec3 lc{};
+      if (const Mob* mm = c.mobs.FindMobById(man))
+        if (tl >= 0 && mm->LimbCentreWorld(tl, lc)) drawUp = lc.y - floorY;
+      if (tl >= 0) drawn++;
+      if (tl < 0 || drawUp < drawMin) lowDraws++;
+      float cutTop = -1e9f, closest = 1e9f;
+      NpcStroke last;
+      bool cutSeen = false;
+      for (int i = 0; i < 60; i++) {
+        tick();
+        const NpcStroke* s = c.mobs.MobStroke(hunter);
+        if (s == nullptr || !s->Active()) break;
+        if (kSnakeTrace) {
+          Vec3 head{};
+          const Mob* hm = c.mobs.FindMobById(hunter);
+          const bool hh = hm != nullptr && hm->LimbCentreWorld(chain.front(), head);
+          std::printf("  rear %d i%2d %s gap %5.2f lift %5.2f air %d snout "
+                      "%5.2f head (%.1f,%.1f,%.1f) aim (%.1f,%.1f,%.1f) "
+                      "d %.2f probes %d/%d\n",
+                      k + 1, i, s->Cutting() ? "CUT" : "   ",
+                      AiPlanar(AiMobCentre(c.mobs, hunter, sd),
+                               AiMobCentre(c.mobs, man, hd)),
+                      c.mobs.MobOrigin(hunter).y - floorY,
+                      hm != nullptr && hm->Airborne() ? 1 : 0,
+                      snoutTop(hunter), head.x, head.y, head.z,
+                      s->targetPoint.x, s->targetPoint.y, s->targetPoint.z,
+                      hh ? (head - s->targetPoint).len() : -1.0f,
+                      s->probesBody, s->probesCast);
+        }
+        if (!s->Cutting()) continue;
+        cutSeen = true;
+        last = *s;
+        cutTop = std::max(cutTop, snoutTop(hunter));
+        Vec3 head{};
+        if (const Mob* hm = c.mobs.FindMobById(hunter))
+          if (hm->LimbCentreWorld(chain.front(), head))
+            closest = std::min(closest, (head - s->targetPoint).len());
+      }
+      for (int i = 0; i < 10; i++) tick();   // the bite's rewrite lands
+      std::string where;
+      bool armBit = false;
+      for (size_t li = 0; li < hd.limbs.size(); li++) {
+        const uint32_t n = c.mobs.LimbMaterialCount(man, (int)li, envMat);
+        if (n == 0) continue;
+        where += Format(" %s %u", hd.limbs[li].name.c_str(), n);
+        if (hd.limbs[li].tag == "arm" || hd.limbs[li].tag == "hand")
+          armBit = true;
+      }
+      if (armBit) armBites++;
+      std::printf(
+          "snake rear strike %d: stance snout %.1f vox up | drew %s (%.1f up) "
+          "| cut %s, snout peak %.1f up, head closest %.1f vox to the aim | "
+          "probes %d cast, %d body, bitten %d | envenomed:%s\n",
+          k + 1, stance,
+          tl >= 0 && (size_t)tl < hd.limbs.size() ? hd.limbs[(size_t)tl].name.c_str()
+                                                  : "(none)",
+          drawUp, cutSeen ? "ran" : "NEVER", cutTop, closest, last.probesCast,
+          last.probesBody, last.bitten ? 1 : 0,
+          where.empty() ? " none" : where.c_str());
+      cleanup();
+    }
+    check(stanceBest >= headMin,
+          Format("the stance rears the snout %.1f vox over the ground (floor "
+                 "%.1f)",
+                 stanceBest, headMin));
+    check(started == trials && drawn == started && lowDraws == 0,
+          Format("every rear strike draws a limb %.1f+ vox up (%d started, %d "
+                 "drew, %d drew lower)",
+                 drawMin, started, drawn, lowDraws));
+    check(armBites >= armMin,
+          Format("the rear strike bites an arm or a hand (%d of %d, floor %d)",
+                 armBites, trials, armMin));
+    RecordObserved("snake.rearArmBitesObserved", (double)armBites);
+  }
+
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
