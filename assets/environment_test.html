@@ -461,6 +461,134 @@ function readLit(wv, cv){
     say(M._map().json.sites.length === nc, 'shift+click inside it deletes it');
     undoBtn.click(); undoBtn.click(); undoBtn.click();
     say(M._map().json.sites.length === nc, 'three Undos take back the delete, the move and the drawing (' + M._map().json.sites.length + ' sites)');
+    // ---- 6e. the HEIGHT TOOLS (docs/PLAN_map_v2.md E2) ---------------------------------------------------------
+    // Every check compares ENCODED TILES (what a save would write) across all
+    // four fixture tiles, so "changed only the expected tiles" and "undo is
+    // byte-exact" are about bytes on disk, not floats.
+    var HP = mp.H, ALLK = [MT.tileKey(0, 0), MT.tileKey(1, 0), MT.tileKey(0, 1), MT.tileKey(1, 1)];
+    var tileBytes = function (P) { return ALLK.map(function (k) { var t = P.tiles.get(k), xz = MT.tileXZ(k); return t && !MT.isDefaultTile(P, t) ? MT.encodeTile(P, xz[0], xz[1], t) : null; }); };
+    var sameT = function (a, b) { return a === null || b === null ? a === b : a.length === b.length && a.every(function (v, i) { return v === b[i]; }); };
+    var diffTiles = function (A, B) { var out = []; for (var q = 0; q < A.length; q++) if (!sameT(A[q], B[q])) out.push(MT.tileXZ(ALLK[q]).join(',')); return out.join(' '); };
+    var Hb = M._hb();
+    // A worker's answer is not network: under --virtual-time-budget an idle
+    // await on it lets virtual time run out. Poll with waitFor (a fetch) instead.
+    async function settle(p) { var d = false, v; p.then(function (x) { v = x; d = true; }, function () { d = true; }); await waitFor(function () { return d; }, 120000); return v; }
+    say(MT.HEIGHT_MODES.join() === 'raise,lower,smooth,flatten,set,terrace,noise,erode', 'the height brush has eight modes: ' + MT.HEIGHT_MODES.join(', '));
+    M._tool('height');
+    Br.radiusM = 40; Br.strength = 80; Br.spacing = 25; Br.targetM = 50;
+    Hb.stepM = 20; Hb.sharp = 80; Hb.ampM = 40; Hb.sizeM = 200; Hb.seed = 3;
+    MT.HEIGHT_MODES.forEach(function (m) {
+      Br.mode = m;
+      var pre = tileBytes(HP), d0 = M._undoDepth();
+      at('pointerdown', -4000, -4000); at('pointermove', -3900, -3950); at('pointermove', -3800, -3900); at('pointerup', -3800, -3900);
+      var post = tileBytes(HP), moved = diffTiles(pre, post);
+      undoBtn.click();
+      var back = diffTiles(pre, tileBytes(HP));
+      say(moved === '0,0' && M._undoDepth() === d0 && back === '', m + ': the stroke changed only tile 0,0 (' + (moved || 'none') + '), one undo step, and Undo is byte-exact' + (back ? ' (DIFFERS: ' + back + ')' : ''));
+    });
+    Br.mode = 'raise';
+    // shape stamp: one click, one undo step
+    M._tool('shape');
+    var Sh = M._shape(); Sh.kind = 'peak'; Sh.heightM = 200; Sh.mode = 'rise'; Sh.radiusM = 150; Sh.aspect = 1; Sh.rot = 0;
+    var preS = tileBytes(HP), hS0 = MT.heightAt(HP, -4032, 4032);
+    var vw = M._view(), vs0 = [vw.cx, vw.cz, vw.scale];
+    vw.cx = -4032; vw.cz = 4032; vw.scale = 1;   // a pixel per voxel: the click lands on the post
+    at('pointerdown', -4032, 4032); at('pointerup', -4032, 4032);
+    vw.cx = vs0[0]; vw.cz = vs0[1]; vw.scale = vs0[2];
+    var hS1 = MT.heightAt(HP, -4032, 4032), movedS = diffTiles(preS, tileBytes(HP));
+    undoBtn.click();
+    say(Math.abs(hS1 - hS0 - 2000) < 8 && movedS === '0,0' && diffTiles(preS, tileBytes(HP)) === '',
+        'Shape: a +200 m peak raised its centre ' + (hS1 - hS0).toFixed(1) + ' vox in tile ' + movedS + ' only; Undo byte-exact');
+    Sh.kind = 'mesa'; Sh.mode = 'summit'; Sh.heightM = 100;
+    at('pointerdown', -4000, 4000); at('pointerup', -4000, 4000);
+    say(Math.abs(MT.heightAt(HP, -4000, 4000) - (112 + 1000)) < 1, 'Shape: a mesa with its top at 100 m above sea sits at y ' + MT.heightAt(HP, -4000, 4000).toFixed(1));
+    undoBtn.click();
+    // ridge line: draw, bake, undo / redo byte-exact, rebake after an edit
+    M._tool('line');
+    var preL = tileBytes(HP), nr = (mp.json.ridges || []).length;
+    at('pointerdown', -6000, -2000); at('pointerup', -6000, -2000);
+    at('pointerdown', -2000, -2000); at('pointerup', -2000, -2000);
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var LN = M._map().json.ridges[nr];
+    say(!!LN && LN.points.length === 2 && LN.kind === 'ridge' && !M._lines().drawing && M._lines().sel === LN && !LN.baked,
+        'Line: two clicks and a double-click drew ' + JSON.stringify(LN && {id: LN.id, kind: LN.kind, profile: LN.profile, width: LN.width, n: LN.points.length}));
+    // put the vertices ON posts (a pointer lands within a voxel; the crest check wants exact posts)
+    LN.points[0][0] = -6016; LN.points[1][0] = -1984;
+    LN.points.forEach(function (p) { p[1] = -2048; p[2] = 112 + 9000; }); LN.width = 600; LN.profile = 'sharp';
+    var d1 = M._undoDepth();
+    M._bake(LN);
+    var crest = MT.heightAt(HP, -4032, -2048), bakedB = tileBytes(HP);
+    say(Math.abs(crest - 9112) < 2 && LN.baked && diffTiles(preL, bakedB) === '0,0' && M._undoDepth() === d1 + 1 &&
+        !!pages.map.querySelector('.mapprofile'),
+        'Bake: the crest is at y ' + crest.toFixed(1) + ' (900 m asl), tile ' + diffTiles(preL, bakedB) + ' only, one undo step, profile chart drawn');
+    undoBtn.click();
+    var LN2 = M._map().json.ridges[nr];   // a json undo replaces the objects: re-read
+    say(diffTiles(preL, tileBytes(HP)) === '' && !LN2.baked && !M._bakes().has(LN2.id), 'Undo of the bake is byte-exact, the line is unbaked again and the bake record is gone');
+    redoBtn.click();
+    LN2 = M._map().json.ridges[nr];
+    say(diffTiles(bakedB, tileBytes(HP)) === '' && LN2.baked && M._bakes().has(LN2.id), 'Redo of the bake is byte-exact and brings the record back');
+    // a stroke after the bake survives a rebake as its offset
+    M._tool('height'); Br.mode = 'raise'; Br.radiusM = 20; Br.strength = 50;
+    at('pointerdown', -3000, -4500); at('pointerup', -3000, -4500);
+    var hBump = MT.heightAt(HP, -3000, -4500);
+    LN2 = M._map().json.ridges[nr];
+    LN2.points[1][2] = 112 + 4000;
+    var preRe = tileBytes(HP);
+    M._bake(LN2);
+    var endH = MT.heightAt(HP, -1984, -2048);
+    say(Math.abs(endH - 4112) < 2 && Math.abs(MT.heightAt(HP, -3000, -4500) - hBump) < 1e-3 && M._lines().sel && M._lines().sel.baked,
+        'Rebake after lowering the east vertex: its crest is now y ' + endH.toFixed(1) + ', and a stroke painted after the first bake is kept (' + hBump.toFixed(1) + ')');
+    undoBtn.click();
+    say(diffTiles(preRe, tileBytes(HP)) === '', 'Undo of the rebake is byte-exact');
+    undoBtn.click(); undoBtn.click();   // the stroke and the bake
+    say(diffTiles(preL, tileBytes(HP)) === '', 'two more Undos take the plane back to before the line, byte-exact');
+    // ---- erosion of an Area, in the worker
+    M._tool('area');
+    at('pointerdown', -7000, -7000); at('pointermove', -4000, -4000); at('pointermove', -1000, -1000); at('pointerup', -1000, -1000);
+    var AR = M._area();
+    say(!!AR && Math.abs(AR[0] + 7000) < 80 && Math.abs(AR[3] + 1000) < 80, 'Area tool drew ' + JSON.stringify(AR));
+    var Er = M._erosion(); Er.seed = 7; Er.iterations = 3; Er.strength = 60;
+    var preE = tileBytes(HP), dE = M._undoDepth();
+    await settle(M._runErosion());
+    var e1 = tileBytes(HP), movedE = diffTiles(preE, e1);
+    say(!!Er.pending && movedE === '0,0', 'Erode area (worker): a preview in the plane, tiles ' + (movedE || 'none'));
+    M._discardErosion();
+    say(diffTiles(preE, tileBytes(HP)) === '' && !Er.pending, 'Discard puts the posts back byte-exact');
+    await settle(M._runErosion());
+    say(diffTiles(e1, tileBytes(HP)) === '', 'erosion is DETERMINISTIC: the same seed on the same posts gives byte-identical tiles');
+    M._discardErosion();
+    Er.seed = 8;
+    await settle(M._runErosion());
+    say(diffTiles(e1, tileBytes(HP)) !== '', 'a different seed erodes differently');
+    M._commitErosion();
+    say(M._undoDepth() === dE + 1, 'Commit is one undo step');
+    undoBtn.click();
+    say(diffTiles(preE, tileBytes(HP)) === '', 'and Undo of it is byte-exact');
+    // ---- PNG export -> import round trip (through scripts/map_png.py)
+    var prePng = tileBytes(HP);
+    var png = await M._exportPng('height');
+    var sig = png && String.fromCharCode(png[1], png[2], png[3]);
+    say(sig === 'PNG' && png.length > 100, 'Export height PNG over the area: ' + (png ? png.length : 0) + ' bytes');
+    M._tool('height'); Br.mode = 'raise'; Br.radiusM = 80; Br.strength = 100;
+    at('pointerdown', -4000, -4000); at('pointerup', -4000, -4000);
+    say(diffTiles(prePng, tileBytes(HP)) === '0,0', 'a raise stroke inside the area changed the plane');
+    await M._importPng(png, 'height', 'rt.png');
+    var PI = M._pngIn();
+    say(!!PI && PI.target === 'note' && Math.abs(PI.mpu - 0.1) < 1e-12,
+        'the import dialog read the PNG’s own note: ' + (PI && JSON.stringify({target: PI.target, mpu: PI.mpu, offsetM: PI.offsetM, w: PI.img.w, h: PI.img.h})));
+    M._applyPng();
+    say(diffTiles(prePng, tileBytes(HP)) === '', 'PNG export -> import round-trips the height EXACTLY (the stroke is gone, every tile byte-identical)');
+    var BP = mp.B, preB = [MT.tileKey(0, 0)].map(function (k) { return MT.encodeTile(BP, 0, 0, BP.tiles.get(k) || MT.newTile(BP)); });
+    var bpng = await M._exportPng('biome');
+    M._tool('biome'); Br.index = 3; Br.radiusM = 200;
+    at('pointerdown', -4000, -4000); at('pointerup', -4000, -4000);
+    await M._importPng(bpng, 'biome', 'b.png');
+    var unm = M._pngIn() && M._pngIn().map.unmapped.length;
+    M._applyPng();
+    var postB = MT.encodeTile(BP, 0, 0, BP.tiles.get(MT.tileKey(0, 0)));
+    say(unm === 0 && sameT(preB[0], postB), 'biome PNG export -> import round-trips exactly (' + unm + ' unmapped colours)');
+    M._area(null);
+
     // LOAD CHECK: the panel asked the engine (or says why it could not).
     ok = await waitFor(function(){ return !!M._check(); }, 60000);
     var ck = M._check();

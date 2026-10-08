@@ -45,7 +45,18 @@
  * grain scaled to a percent inside a box). Every placed kind spells its
  * column `at: [x, z]` in world voxels. v2 has no landform sites and no
  * landform plane: the converter baked them into the height plane, and the
- * height tools (E2) carry them as stamps that write the plane.
+ * Shape tool carries them as stamps that write the plane.
+ *
+ * THE HEIGHT TOOLS (E2): the Height brush's modes (raise, lower, smooth,
+ * flatten, set, terrace, noise, erode) and falloffs; the Shape tool (peak,
+ * ridge, basin, plateau, volcano, mesa); the Line tool (RIDGE / VALLEY lines
+ * kept in map.json `ridges[]`, baked into the plane, rebaked from this
+ * session's pre-bake snapshot); the Area tool, whose rectangle the Height
+ * tools panel erodes (erosion.js in a worker, seeded, preview then commit)
+ * and exports / imports as 16-bit / RGB PNG (scripts/map_png.py through
+ * /api/mappng/*). The maths is heightshapes.js + erosion.js (pure, Node-
+ * tested by scripts/test_heighttools.mjs); every tool writes through
+ * maptiles.js, so each dirties only its tiles and is one undo step.
  *
  * Input: left-drag paints / places with the active tool, right- or
  * middle-drag pans, wheel zooms about the cursor, [ ] resize the brush,
@@ -54,6 +65,7 @@
  * an input beside the seed); a running game picks a save up on F7 / Apply.
  */
 import * as MT from './maptiles.js';
+import * as HS from './heightshapes.js';
 
 // Display colours by biome NAME; anything unknown gets a stable hash colour.
 const COLOR = {
@@ -151,6 +163,35 @@ let soften = {feather: 96, hills: 25, bumps: 0, grain: 0, paths: 10};
 let clearDrag = null;
 let lastDab = null;        // the last plane-brush dab's world column (spacing)
 let stats = {tileImages: 0, contourPx: 0, skipped: 0};   // test + status counters
+/* ---- THE HEIGHT TOOLS (PLAN_map_v2 E2) --------------------------------------------------
+ * The Height brush's modes beyond raise / lower / set / smooth (flatten to the
+ * height where the stroke starts, terrace / cliff, seeded noise, erode), its
+ * falloff, and three tools that write the height plane in one go:
+ *   Shape  the v1 landform kinds as stamps (peak, ridge, basin, plateau,
+ *          volcano, mesa) -- height, radius, aspect, rotation; one click, one
+ *          undo step.
+ *   Line   RIDGE / VALLEY lines: a polyline with a crest / floor height per
+ *          vertex, a half-width and a cross-section (V, U, round, sharp).
+ *          The line lives in map.json `ridges[]` (the engine never reads it:
+ *          it reads the baked plane) and BAKE writes it into the plane.
+ *   Area   a rectangle the Height tools panel erodes (hydraulic + thermal, in
+ *          a worker, seeded, preview then commit) and exports / imports as a
+ *          16-bit PNG (the height) or an RGB PNG (the biomes).
+ * Every one of them writes through maptiles.js's writeWindow, so it dirties
+ * only the tiles it touches and undoes per operation like a stroke. */
+let hb = {falloff: 'smooth', stepM: 25, sharp: 70, ampM: 60, sizeM: 800, seed: 1, style: 'ridged'};
+let shape = {kind: 'peak', heightM: 400, mode: 'rise', radiusM: 1500, aspect: 1, rot: 0};
+// The line tool: the selected line (an object inside map.json.ridges), whether
+// clicks append to it, the defaults a NEW line / vertex takes, a vertex drag.
+let lines = {sel: null, drawing: false, kind: 'ridge', profile: 'round', widthM: 600, yMode: 'sea', yM: 800, dyM: 150, drag: null};
+// Bake records of this session, by line id: {before, after} tiles of the
+// last bake (rebake = put `before` back, keep later edits as offsets, bake again).
+let bakes = new Map();
+let area = null;           // the Area rectangle, world voxels [x0, z0, x1, z1], or null
+let areaDrag = null;
+let erosion = {iterations: 6, strength: 50, talusDeg: 38, seed: 1, hydraulic: true, thermal: true,
+               running: null, pending: null, progress: 0};
+let pngIn = null;          // the decoded PNG waiting in the import dialog
 /** The box site (clearing / soften) whose BOX holds world column (wx, wz), the last drawn first. */
 function clearingAt(wx, wz, kind = 'clearing') {
   const ss = (map.json.sites || []).filter(s => s.kind === kind && Array.isArray(s.min) && Array.isArray(s.max));
@@ -373,10 +414,12 @@ const fmtM = m => (Math.abs(m) >= 1000 ? (m / 1000).toFixed(2) + ' km' : (Math.a
 /** The map.json state an undo step restores (everything but the planes). */
 function snapshot() { return {json: JSON.stringify(map.json)}; }
 function restore(s) {
-  const id = selected && selected.id;
+  const id = selected && selected.id, lid = lines.sel && lines.sel.id;
   map.json = JSON.parse(s.json);
   selected = id ? (map.json.sites || []).find(x => x.id === id) || null : null;
-  syncTerrain(); syncSites(); syncEditSel(); publishTerrain();
+  lines.sel = lid ? (map.json.ridges || []).find(x => x.id === lid) || null : null;
+  if (!lines.sel) lines.drawing = false;
+  syncTerrain(); syncSites(); syncEditSel(); publishTerrain(); syncLines();
 }
 function pushUndo(e) { undo.push(e); if (undo.length > 60) undo.shift(); redo = []; }
 /** The map's terrain block, created from the defaults if the file has none. */
@@ -451,6 +494,9 @@ async function loadMap(name) {
   sculpt.tiles = tiles; sculpt.saved = scClone(tiles); sculpt.dirty = false; sculpt.version++; sculpt.dirtyRect = null;
   undo = []; redo = [];
   selected = null; heights = null; showHeights = false;
+  if (erosion.running) erosion.running.cancel();
+  bakes = new Map(); area = null; erosion.pending = null; pngIn = null;
+  lines.sel = null; lines.drawing = false; lines.drag = null;
   if (els.heightsBtn) els.heightsBtn.classList.remove('on');
   brush.index = Math.min(brush.index, json.biomes.length - 1);
   range.vals = null;
@@ -459,7 +505,7 @@ async function loadMap(name) {
   migrateEditLayer();
   rebuildPalette();
   terrainOf();
-  syncTerrain(); syncSites(); publishTerrain();
+  syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools();
   check = null; syncCheck(); fetchCheck();
   fit();
   // every listed tile, in the background, after what is on screen
@@ -904,6 +950,8 @@ function paint() {
   }
   paintSculpt(ctx);
   paintFrame(ctx);
+  paintLines(ctx);
+  paintArea(ctx);
   paintSites(ctx);
   paintCursor(ctx);
 }
@@ -1014,6 +1062,7 @@ function paintSites(ctx) {
 function paintCursor(ctx) {
   if (!els.hoverW) return;
   const [wx, wz] = els.hoverW;
+  if (tool === 'shape') { paintShapeCursor(ctx, wx, wz); return; }
   let r = null, colr = 'rgba(255,255,255,0.8)';
   if (tool === 'sculpt') {
     r = sculpt.radius;
@@ -1072,9 +1121,15 @@ function planeDab(wx, wz) {
   let r;
   if (tool === 'height') {
     const v = vpm(), k = brush.strength / 100;
-    const o = {mode: brush.mode, radius: brushVox(), amount: k * brushVox() / 10, target: seaY() + brush.targetM * v, k};
+    const o = {mode: brush.mode, radius: brushVox(), falloff: hb.falloff, amount: k * brushVox() / 10, k,
+               target: brush.mode === 'flatten' ? stroke.flatT : seaY() + brush.targetM * v,
+               step: hb.stepM * v, sharp: hb.sharp / 100, datum: seaY(),
+               amp: hb.ampM * v, size: hb.sizeM * v, seed: hb.seed, style: hb.style,
+               erosion: {iterations: 2, strength: 0.8, seed: hb.seed, talusDeg: erosion.talusDeg}, stroke: stroke.ctx};
     if (!stroke.tiles.height) stroke.tiles.height = new Map();
     r = MT.heightDab(map.H, wx, wz, o, stroke.tiles.height);
+    if (r.tooBig) status('the erode BRUSH works up to about ' + fmtM(Math.sqrt(MT.ERODE_BRUSH_MAX_POSTS) * map.H.sp / 2 / v) +
+                         ' of radius; for a larger patch use the Area tool and Erode in the Height tools panel');
   } else {
     if (!stroke.tiles.biome) stroke.tiles.biome = new Map();
     r = MT.biomeDab(map.B, wx, wz, brushVox(), brush.index, stroke.tiles.biome);
@@ -1103,6 +1158,22 @@ function wire() {
     if (!map) return;
     c.setPointerCapture(ev.pointerId);
     if (ev.button === 1 || ev.button === 2) { panning = {x: ev.clientX, y: ev.clientY, cx: view.cx, cz: view.cz}; return; }
+    // an erosion preview is committed by the next edit of any kind
+    if (erosion.pending) commitErosion();
+    if (tool === 'shape') {
+      const [wx, wz] = worldAtF(ev);
+      stampShape(wx, wz);
+      paint();
+      return;
+    }
+    if (tool === 'line') { linePointerDown(ev); paint(); return; }
+    if (tool === 'area') {
+      const [wx, wz] = worldColumnAt(ev);
+      if (ev.shiftKey) { area = null; syncHeightTools(); paint(); return; }
+      areaDrag = {x0: wx, z0: wz};
+      area = [wx, wz, wx, wz];
+      return;
+    }
     if (tool === 'height' || tool === 'biome') {
       const [wx, wz] = worldAtF(ev);
       if (ev.altKey) {
@@ -1112,7 +1183,7 @@ function wire() {
         syncControls(); rebuildPalette(); paint();
         return;
       }
-      stroke = {tiles: {}, changed: false};
+      stroke = {tiles: {}, changed: false, ctx: {}, flatT: MT.heightAt(map.H, wx, wz)};
       lastDab = [wx, wz];
       if (planeDab(wx, wz)) stroke.changed = true;
       paint();
@@ -1277,6 +1348,16 @@ function wire() {
       view.cx = panning.cx - (ev.clientX - panning.x) / view.scale;
       view.cz = panning.cz - (ev.clientY - panning.y) / view.scale;
       scheduleRealRefresh();
+    } else if (areaDrag && ev.buttons & 1) {
+      const [wx, wz] = worldColumnAt(ev);
+      area = [Math.min(areaDrag.x0, wx), Math.min(areaDrag.z0, wz), Math.max(areaDrag.x0, wx), Math.max(areaDrag.z0, wz)];
+    } else if (lines.drag && ev.buttons & 1) {
+      const [wx, wz] = worldColumnAt(ev);
+      const p = lines.drag.line.points[lines.drag.k];
+      p[0] = wx; p[1] = wz;
+      lines.drag.moved = true;
+      lineEdited(lines.drag.line);
+      syncLines();
     } else if (padDrag) {
       const [wx, wz] = worldColumnAt(ev);
       const s = (map.json.sites || []).find(s => s.kind === 'pad');
@@ -1336,6 +1417,18 @@ function wire() {
   const up = () => {
     panning = null;
     padDrag = null;
+    if (areaDrag) {
+      areaDrag = null;
+      // a click is not an area
+      if (area && (area[2] - area[0] < map.H.sp || area[3] - area[1] < map.H.sp)) area = null;
+      syncHeightTools();
+    }
+    if (lines.drag) {
+      if (lines.drag.moved && lines.drag.snap) pushUndo(lines.drag.snap);
+      if (lines.drag.moved) markDirty(true);
+      lines.drag = null;
+      syncLines();
+    }
     if (clearDrag && clearDrag.mode === 'new') {
       // A click without a drag is not a box: take the empty one back.
       const s = clearDrag.site;
@@ -1389,19 +1482,46 @@ function wire() {
     else if (ev.key === '[' || ev.key === ']') {
       const f = ev.key === ']' ? 1.25 : 0.8;
       if (tool === 'sculpt') sculpt.radius = Math.max(8, Math.min(4096, Math.round(sculpt.radius * f)));
+      else if (tool === 'shape') shape.radiusM = Math.max(10, Math.min(R_MAX_M, Math.round(shape.radiusM * f)));
+      else if (tool === 'line') lines.widthM = Math.max(5, Math.min(R_MAX_M, Math.round(lines.widthM * f)));
       else brush.radiusM = Math.max(R_MIN_M, Math.min(R_MAX_M, brush.radiusM * f));
       syncControls(); paint();
+    } else if ((ev.key === ',' || ev.key === '.') && tool === 'shape') {
+      shape.rot = ((shape.rot + (ev.key === '.' ? 15 : -15)) % 360 + 360) % 360;
+      syncControls(); paint();
+    } else if ((ev.key === 'Enter' || ev.key === 'Escape') && tool === 'line' && lines.drawing) {
+      lines.drawing = false;
+      syncLines(); paint();
     }
+  });
+  c.addEventListener('dblclick', () => {
+    // a double click ends the line being drawn (its second click added a
+    // vertex on top of the first: drop it)
+    if (tool !== 'line' || !lines.drawing || !lines.sel) return;
+    const pts = lines.sel.points;
+    if (pts.length >= 2) {
+      const a = pts[pts.length - 1], b = pts[pts.length - 2];
+      if (Math.hypot((a[0] - b[0]) * view.scale, (a[1] - b[1]) * view.scale) < 4) pts.pop();
+    }
+    lines.drawing = false;
+    syncLines(); paint();
   });
 }
 // An undo entry is one of: {tiles: {height?, biome?}} (plane tiles before the
 // stroke), {sculptBefore} (sculpt tiles), or {json} (a map.json snapshot: sites,
 // terrain, root numbers). Swapping one in returns the opposite stack's entry.
+// A height-tool entry may carry several: a line bake is {tiles, json, bake}
+// (the plane, the line's `baked` flag, and the session's bake record).
 function swapEntry(e) {
   if (e.sculptBefore) return {sculptBefore: sculptSwap(e.sculptBefore)};
-  if (e.tiles) return swapPlanes(e);
-  const back = snapshot();
-  restore(e);
+  const back = {};
+  if (e.tiles) Object.assign(back, swapPlanes(e));
+  if (e.json) { back.json = snapshot().json; restore(e); }
+  if (e.bake) {
+    back.bake = {id: e.bake.id, rec: bakes.get(e.bake.id) || null};
+    if (e.bake.rec) bakes.set(e.bake.id, e.bake.rec); else bakes.delete(e.bake.id);
+    syncLines();
+  }
   return back;
 }
 function doUndo() {
@@ -1752,6 +1872,714 @@ function paintSculpt(ctx) {
   }
 }
 
+/* ---- THE HEIGHT TOOLS: shape stamps -------------------------------------------------------- */
+/** The stamp the Shape tool would make at (wx, wz): heightshapes.js options. */
+function shapeOpts(wx, wz) {
+  const v = vpm(), base = MT.heightAt(map.H, wx, wz), H = shape.heightM * v, S = HS.SHAPES[shape.kind];
+  const o = {kind: shape.kind, x: wx, z: wz, radius: shape.radiusM * v, aspect: shape.aspect, rot: shape.rot};
+  if (S.add) {
+    // rise: the summit / floor is that far from the ground at the centre; summit:
+    // that many metres above the sea (a basin's FLOOR)
+    if (shape.mode === 'rise') o.height = H;
+    else o.height = shape.kind === 'basin' ? base - (seaY() + H) : seaY() + H - base;
+  } else o.top = shape.mode === 'rise' ? base + H : seaY() + H;
+  return o;
+}
+function stampShape(wx, wz) {
+  if (!MT.inExtent(map.H, wx, wz)) { status('the shape stamp goes inside the map extent'); return; }
+  const before = new Map();
+  const r = MT.applyOp(map.H, HS.shapeStamp(map.H, shapeOpts(wx, wz)), before);
+  if (r.skipped) status('some tiles under the stamp are still loading; they were skipped — undo and stamp again in a moment');
+  if (!r.changed) return;
+  pushUndo({tiles: {height: before}});
+  range.vals = null;
+  markDirty(true);
+  const v = vpm();
+  status(`${shape.kind} stamped: ${r.changed} posts, centre now ${fmtM((MT.heightAt(map.H, wx, wz) - seaY()) / v)} above sea (Ctrl+Z takes it back)`);
+}
+/** The stamp's outline at the cursor: its ellipse, rotated, and its long axis. */
+function paintShapeCursor(ctx, wx, wz) {
+  const v = vpm(), R = Math.max(map.H.sp, shape.radiusM * v) * view.scale;
+  const asp = Math.max(0.05, Math.min(1, shape.aspect)), a = shape.rot * Math.PI / 180;
+  const sx = SX(wx), sz = SZ(wz);
+  ctx.strokeStyle = shape.kind === 'basin' ? 'rgba(120,180,255,0.9)' : 'rgba(255,170,90,0.9)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  if (shape.kind === 'ridge') {
+    // the ridge stamp's footprint is its rectangle (u, v in -1..1)
+    const c = Math.cos(a), s = Math.sin(a), pts = [[1, 1], [-1, 1], [-1, -1], [1, -1]];
+    pts.forEach(([u, w], k) => {
+      const x = sx + (u * R * c - w * R * asp * s), z = sz + (u * R * s + w * R * asp * c);
+      if (k) ctx.lineTo(x, z); else ctx.moveTo(x, z);
+    });
+    ctx.closePath();
+  } else ctx.ellipse(sx, sz, Math.max(2, R), Math.max(2, R * asp), a, 0, Math.PI * 2);
+  ctx.stroke();
+  if (asp < 1) {
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(sx - Math.cos(a) * R, sz - Math.sin(a) * R); ctx.lineTo(sx + Math.cos(a) * R, sz + Math.sin(a) * R); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.fillStyle = '#ffd866'; ctx.font = '11px monospace';
+  const H = shape.heightM;
+  ctx.fillText(`${shape.kind} ${shape.mode === 'rise' ? (shape.kind === 'basin' ? '-' : '+') + H + ' m' : (shape.kind === 'basin' ? 'floor ' : 'top ') + H + ' m asl'} r ${fmtM(shape.radiusM)}` +
+               (asp < 1 ? ` ${shape.rot}°` : ''), sx + 8, sz - 8);
+}
+
+/* ---- THE HEIGHT TOOLS: ridge / valley lines ------------------------------------------------- */
+const ridgesOf = () => (map.json.ridges || (map.json.ridges = []));
+function newLineId(kind) {
+  const rs = ridgesOf();
+  let n = rs.filter(r => r.kind === kind).length, id = kind + '_' + n;
+  while (rs.some(r => r.id === id)) id = kind + '_' + (++n);
+  return id;
+}
+/** A new vertex's crest / floor height: metres above sea, or the plane's
+ *  height there plus / minus a rise. */
+function vertexY(wx, wz, kind) {
+  const v = vpm();
+  if (lines.yMode === 'sea') return Math.round(seaY() + lines.yM * v);
+  return Math.round(MT.heightAt(map.H, wx, wz) + (kind === 'valley' ? -1 : 1) * lines.dyM * v);
+}
+/** The line no longer matches the plane (its bake, if any, is stale). */
+function lineEdited(L) { if (L.baked) L.baked = false; }
+function segDistPx(a, b, wx, wz) {
+  const ex = b[0] - a[0], ez = b[1] - a[1], L2 = ex * ex + ez * ez;
+  const t = L2 > 0 ? Math.max(0, Math.min(1, ((wx - a[0]) * ex + (wz - a[1]) * ez) / L2)) : 0;
+  return {d: Math.hypot(wx - a[0] - ex * t, wz - a[1] - ez * t) * view.scale, t};
+}
+function linePointerDown(ev) {
+  const [wx, wz] = worldColumnAt(ev);
+  const rs = ridgesOf();
+  const grab = 7;   // screen pixels
+  // 1. a vertex (of the selected line first): drag it; shift+click deletes it
+  const order = lines.sel ? [lines.sel, ...rs.filter(r => r !== lines.sel)] : rs;
+  for (const L of order)
+    for (let k = 0; k < L.points.length; k++) {
+      const p = L.points[k];
+      if (Math.hypot((p[0] - wx) * view.scale, (p[1] - wz) * view.scale) > grab) continue;
+      if (ev.shiftKey) {
+        pushUndo(snapshot());
+        L.points.splice(k, 1);
+        if (!L.points.length) { rs.splice(rs.indexOf(L), 1); if (lines.sel === L) { lines.sel = null; lines.drawing = false; } }
+        else lineEdited(L);
+        markDirty(true); syncLines();
+        return;
+      }
+      if (lines.drawing && L === lines.sel && k === L.points.length - 1 && k > 0) { lines.drawing = false; syncLines(); return; }
+      lines.sel = L;
+      lines.drag = {line: L, k, snap: snapshot(), moved: false};
+      syncLines();
+      return;
+    }
+  // 2. drawing: the click is the next vertex
+  if (lines.drawing && lines.sel) {
+    pushUndo(snapshot());
+    lines.sel.points.push([wx, wz, vertexY(wx, wz, lines.sel.kind)]);
+    lineEdited(lines.sel);
+    markDirty(true); syncLines();
+    return;
+  }
+  // 3. on a segment of the selected line: insert a vertex there (height lerped)
+  if (lines.sel) {
+    const pts = lines.sel.points;
+    for (let k = 0; k + 1 < pts.length; k++) {
+      const {d, t} = segDistPx(pts[k], pts[k + 1], wx, wz);
+      if (d > 5) continue;
+      pushUndo(snapshot());
+      pts.splice(k + 1, 0, [wx, wz, Math.round(pts[k][2] + (pts[k + 1][2] - pts[k][2]) * t)]);
+      lineEdited(lines.sel);
+      lines.drag = {line: lines.sel, k: k + 1, snap: null, moved: false};
+      markDirty(true); syncLines();
+      return;
+    }
+  }
+  // 4. on another line: select it
+  for (const L of rs)
+    for (let k = 0; k + 1 < L.points.length; k++)
+      if (segDistPx(L.points[k], L.points[k + 1], wx, wz).d <= 5) { lines.sel = L; lines.drawing = false; syncLines(); return; }
+  // 5. open map: a new line, drawing
+  pushUndo(snapshot());
+  const L = {id: newLineId(lines.kind), kind: lines.kind, profile: lines.profile, width: Math.round(lines.widthM * vpm()),
+             points: [[wx, wz, vertexY(wx, wz, lines.kind)]]};
+  rs.push(L);
+  lines.sel = L; lines.drawing = true;
+  markDirty(true); syncLines();
+  status(`new ${L.kind} line: click to add vertices, double-click / Enter to finish; then Bake in the Height tools panel`);
+}
+function paintLines(ctx) {
+  const rs = map.json.ridges || [];
+  if (!rs.length) return;
+  const v = vpm();
+  ctx.font = '11px monospace';
+  for (const L of rs) {
+    const pts = L.points || [];
+    if (!pts.length) continue;
+    const valley = L.kind === 'valley', sel = L === lines.sel;
+    const colr = valley ? '#6fb4ff' : '#ff9f4a';
+    // the width band: what the bake can touch
+    ctx.globalAlpha = sel ? 0.22 : 0.12;
+    ctx.strokeStyle = colr; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(2, 2 * (L.width || 0) * view.scale);
+    ctx.beginPath();
+    pts.forEach((p, k) => (k ? ctx.lineTo(SX(p[0]), SZ(p[1])) : ctx.moveTo(SX(p[0]), SZ(p[1]))));
+    if (pts.length === 1) ctx.lineTo(SX(pts[0][0]) + 0.01, SZ(pts[0][1]));
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    // the line itself: solid when the plane holds it, dashed when it is not (or no longer) baked
+    ctx.lineWidth = sel ? 2 : 1; ctx.lineCap = 'butt';
+    if (!L.baked) ctx.setLineDash([5, 3]);
+    ctx.beginPath();
+    pts.forEach((p, k) => (k ? ctx.lineTo(SX(p[0]), SZ(p[1])) : ctx.moveTo(SX(p[0]), SZ(p[1]))));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // vertices: pixel squares, the heights beside them when the selected line is zoomed enough
+    for (let k = 0; k < pts.length; k++) {
+      const x = Math.round(SX(pts[k][0])), z = Math.round(SZ(pts[k][1]));
+      ctx.fillStyle = sel ? '#ffffff' : colr;
+      ctx.fillRect(x - 2, z - 2, 5, 5);
+      ctx.fillStyle = '#0e1219'; ctx.fillRect(x - 1, z - 1, 3, 3);
+      if (sel) { ctx.fillStyle = colr; ctx.fillText(fmtM((pts[k][2] - seaY()) / v), x + 6, z - 4); }
+    }
+    const p0 = pts[0];
+    ctx.fillStyle = colr;
+    ctx.fillText(L.id + (L.baked ? '' : ' (not baked)'), SX(p0[0]) + 6, SZ(p0[1]) + 12);
+  }
+}
+/** Bake line L into the height plane. With a bake record from this session it
+ *  is a REBAKE: the old bake comes out first (MT.unbake: back to the pre-bake
+ *  posts, keeping any stroke painted since as the offset it made), then the
+ *  line as it is now goes in. One undo step either way. */
+function bakeLine(L) {
+  const P = map.H;
+  if ((L.points || []).length < 1) return;
+  const snap = snapshot(), undoTiles = new Map(), prev = bakes.get(L.id) || null;
+  let since = 0;
+  if (prev) since = MT.unbake(P, prev, undoTiles);
+  const opBefore = new Map();
+  const r = MT.applyOp(P, HS.lineBake(P, L), opBefore);
+  for (const [k, t] of opBefore) if (!undoTiles.has(k)) undoTiles.set(k, t);
+  bakes.set(L.id, {before: opBefore, after: MT.snapTiles(P, opBefore.keys())});
+  L.baked = true;
+  pushUndo({tiles: {height: undoTiles}, json: snap.json, bake: {id: L.id, rec: prev}});
+  range.vals = null;
+  markDirty(true); syncLines(); paint();
+  status(`${prev ? 'rebaked' : 'baked'} ${L.id}: ${r.changed} posts over ${opBefore.size} tile(s)` +
+         (prev && since ? `; ${since} posts painted since the last bake kept as offsets` : '') +
+         (r.skipped ? `; ${r.skipped} posts in tiles still loading were SKIPPED (undo and bake again)` : ''));
+}
+function unbakeLine(L) {
+  const prev = bakes.get(L.id);
+  if (!prev) return;
+  const snap = snapshot(), undoTiles = new Map();
+  const since = MT.unbake(map.H, prev, undoTiles);
+  bakes.delete(L.id);
+  L.baked = false;
+  pushUndo({tiles: {height: undoTiles}, json: snap.json, bake: {id: L.id, rec: prev}});
+  range.vals = null;
+  markDirty(true); syncLines(); paint();
+  status(`unbaked ${L.id}` + (since ? ` (${since} posts painted since kept as offsets)` : ''));
+}
+/** The line's profile chart: the plane under the line (grey) against the
+ *  crest / floor heights (the line colour), metres above sea. */
+function drawProfile(cv, L) {
+  const ctx = cv.getContext('2d'), W = cv.width, Hh = cv.height;
+  ctx.fillStyle = '#0e1219'; ctx.fillRect(0, 0, W, Hh);
+  const pts = L.points;
+  if (pts.length < 2) { ctx.fillStyle = '#6f7f97'; ctx.font = '10px monospace'; ctx.fillText('two vertices make a profile', 6, 14); return; }
+  const seg = [], v = vpm();
+  let tot = 0;
+  for (let k = 0; k + 1 < pts.length; k++) { const d = Math.hypot(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1]); seg.push(d); tot += d; }
+  const N = W, g = new Float32Array(N), y = new Float32Array(N);
+  for (let n = 0; n < N; n++) {
+    let s = tot * n / (N - 1), k = 0;
+    while (k < seg.length - 1 && s > seg[k]) { s -= seg[k]; k++; }
+    const t = seg[k] > 0 ? Math.min(1, s / seg[k]) : 0, a = pts[k], b = pts[k + 1];
+    g[n] = MT.heightAt(map.H, a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+    y[n] = a[2] + (b[2] - a[2]) * t;
+  }
+  let lo = Infinity, hi = -Infinity;
+  for (let n = 0; n < N; n++) { lo = Math.min(lo, g[n], y[n]); hi = Math.max(hi, g[n], y[n]); }
+  if (hi - lo < 10) { hi += 5; lo -= 5; }
+  const Y = h => Math.round(Hh - 4 - (h - lo) / (hi - lo) * (Hh - 16));
+  ctx.fillStyle = '#3a4a3a';
+  for (let n = 0; n < N; n++) { const top = Y(g[n]); ctx.fillRect(n, top, 1, Hh - top); }
+  ctx.fillStyle = L.kind === 'valley' ? '#6fb4ff' : '#ff9f4a';
+  for (let n = 0; n < N; n++) ctx.fillRect(n, Y(y[n]), 1, 2);
+  ctx.fillStyle = '#c7d2e3'; ctx.font = '10px monospace';
+  ctx.fillText(`${fmtM((hi - seaY()) / v)}`, 3, 10);
+  ctx.fillText(`${fmtM((lo - seaY()) / v)}`, 3, Hh - 3);
+  ctx.textAlign = 'right'; ctx.fillText(fmtM(tot / v), W - 3, 10); ctx.textAlign = 'left';
+}
+/** The Lines part of the Height tools panel: every line, the selected one's inspector. */
+function syncLines() {
+  if (!els.lineList || !map) return;
+  const el = H.el, v = vpm(), rs = map.json.ridges || [];
+  els.lineList.replaceChildren();
+  for (const L of rs) {
+    const row = el('div', {class: 'mapsite' + (L === lines.sel ? ' on' : '')},
+      el('span', {class: 'mapkind mapkind-' + (L.kind === 'valley' ? 'water' : 'pad')}, L.kind),
+      el('span', {class: 'mapwhere'}, `${L.id} · ${L.points.length} pts · ${L.profile} · ${fmtM((L.width || 0) / v)}` + (L.baked ? '' : ' · not baked')));
+    const sel = el('button', {title: 'select it (and centre the map on it)'}, L === lines.sel ? 'selected' : 'select');
+    sel.addEventListener('click', () => {
+      lines.sel = L; lines.drawing = false;
+      const p = L.points[Math.floor(L.points.length / 2)];
+      if (p) { view.cx = p[0]; view.cz = p[1]; }
+      syncLines(); paint();
+    });
+    const del = el('button', {title: 'delete the LINE (the plane keeps what it baked; Unbake first to take that out)'}, '×');
+    del.addEventListener('click', () => {
+      pushUndo(snapshot());
+      rs.splice(rs.indexOf(L), 1);
+      if (lines.sel === L) { lines.sel = null; lines.drawing = false; }
+      markDirty(true); syncLines(); paint();
+    });
+    row.append(sel, del);
+    els.lineList.append(row);
+  }
+  if (!rs.length) els.lineList.append(el('div', {class: 'mapnote'}, 'no lines — pick the Line tool and click on the map'));
+  const box = els.lineInsp;
+  box.replaceChildren();
+  const L = lines.sel;
+  if (!L) { box.append(el('div', {class: 'mapnote'}, 'Select a line to edit its vertices, profile and width, and to bake it.')); return; }
+  const edit = (fn) => { pushUndo(snapshot()); fn(); lineEdited(L); markDirty(true); syncLines(); paint(); };
+  const kind = el('select', {}, ...['ridge', 'valley'].map(k => el('option', {value: k}, k)));
+  kind.value = L.kind;
+  kind.addEventListener('change', () => edit(() => { L.kind = kind.value; }));
+  const prof = el('select', {title: 'cross-section: V straight flanks; U broad back / flat floor; round; sharp = knife edge / slot gorge'},
+                  ...HS.PROFILE_NAMES.map(k => el('option', {value: k}, k)));
+  prof.value = L.profile || 'round';
+  prof.addEventListener('change', () => edit(() => { L.profile = prof.value; }));
+  const wid = el('input', {type: 'number', min: 1, step: 10, value: Math.round((L.width || 0) / v), style: 'width:70px', title: 'half-width in metres: how far either side of the line the bake reaches'});
+  wid.addEventListener('change', () => edit(() => { L.width = Math.max(map.H.sp, Math.round((+wid.value || 0) * v)); }));
+  box.append(el('div', {class: 'mapbar'}, el('b', {}, L.id), ' ', kind, ' ', prof, el('label', {}, ' half-width ', wid, ' m')));
+  const tbl = el('div', {class: 'maplinepts'});
+  L.points.forEach((p, k) => {
+    const hIn = el('input', {type: 'number', step: 5, value: Math.round((p[2] - seaY()) / v * 10) / 10, style: 'width:72px',
+                             title: (L.kind === 'valley' ? 'floor' : 'crest') + ' height at this vertex, metres above sea level'});
+    hIn.addEventListener('change', () => edit(() => { p[2] = Math.round(seaY() + (+hIn.value || 0) * v); }));
+    const g = MT.heightAt(map.H, p[0], p[1]);
+    tbl.append(el('div', {class: 'mapsite'},
+      el('span', {class: 'mapwhere'}, `${k} · ${fmtM(p[0] / v)}, ${fmtM(p[1] / v)} · plane ${fmtM((g - seaY()) / v)}`), hIn, el('span', {class: 'mapunit'}, 'm asl')));
+  });
+  box.append(tbl);
+  const allIn = el('input', {type: 'number', step: 10, value: Math.round((L.points[0][2] - seaY()) / v), style: 'width:70px'});
+  const allBtn = el('button', {title: 'every vertex to this height (m above sea)'}, 'all to');
+  allBtn.addEventListener('click', () => edit(() => { for (const p of L.points) p[2] = Math.round(seaY() + (+allIn.value || 0) * v); }));
+  const ramp = el('button', {title: 'the inner vertices on a straight grade between the first and the last (by distance along the line)'}, 'ramp ends');
+  ramp.addEventListener('click', () => edit(() => {
+    const pts = L.points, d = [0];
+    for (let k = 1; k < pts.length; k++) d.push(d[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+    const T = d[d.length - 1] || 1, a = pts[0][2], b = pts[pts.length - 1][2];
+    for (let k = 1; k + 1 < pts.length; k++) pts[k][2] = Math.round(a + (b - a) * d[k] / T);
+  }));
+  const relIn = el('input', {type: 'number', step: 10, value: lines.dyM, style: 'width:60px'});
+  const rel = el('button', {title: 'every vertex this many metres above (ridge) / below (valley) the plane under it as it is now'}, 'from plane ±');
+  rel.addEventListener('click', () => edit(() => {
+    for (const p of L.points) p[2] = Math.round(MT.heightAt(map.H, p[0], p[1]) + (L.kind === 'valley' ? -1 : 1) * (+relIn.value || 0) * v);
+  }));
+  box.append(el('div', {class: 'mapbar'}, allBtn, allIn, ' m ', ramp, ' ', rel, relIn, ' m'));
+  const rec = bakes.get(L.id);
+  const bake = el('button', {class: 'mapgo', title: rec ? 'REBAKE: take this session’s last bake of the line out (strokes painted since stay, as offsets) and bake the line as it is now' :
+                                                  'write the line into the height plane (one undo step)'}, rec ? 'Rebake' : 'Bake');
+  bake.addEventListener('click', () => bakeLine(L));
+  const parts = [bake];
+  if (rec) {
+    const ub = el('button', {title: 'take the bake back out of the plane (strokes painted since stay, as offsets)'}, 'Unbake');
+    ub.addEventListener('click', () => unbakeLine(L));
+    parts.push(ub);
+  }
+  const fin = el('button', {title: 'stop adding vertices (Enter / double-click)'}, lines.drawing ? 'Finish line' : 'Continue line');
+  fin.addEventListener('click', () => { lines.drawing = !lines.drawing; tool = 'line'; syncControls(); syncLines(); paint(); });
+  parts.push(fin);
+  box.append(el('div', {class: 'mapbar'}, ...parts,
+    el('span', {class: 'mapnote'}, rec ? (L.baked ? ' baked this session' : ' edited since its bake') :
+       (L.baked ? ' baked in an earlier session: no pre-bake copy here, so Bake bakes on top' : ' not baked'))));
+  const cv = el('canvas', {width: 300, height: 84, class: 'mapprofile', title: 'the plane under the line (grey) and the line’s crest / floor heights, metres above sea'});
+  box.append(cv);
+  drawProfile(cv, L);
+}
+
+/* ---- THE HEIGHT TOOLS: the Area, erosion, PNG import / export ---------------------------------- */
+/** The sample rectangle [i0, j0, w, h] of plane P inside the Area (posts on
+ *  the height plane, cells whose CENTRE is inside on the biome plane), or the
+ *  whole plane (the biome plane's extra row / column past the extent left out). */
+function areaRect(P) {
+  const centred = P.name === 'biome';
+  const nx = P.posts[0] - (centred ? 1 : 0), nz = P.posts[1] - (centred ? 1 : 0);
+  if (!area) return [0, 0, nx, nz];
+  const o = centred ? 0.5 : 0;
+  const i0 = Math.max(0, Math.ceil((area[0] - P.min[0]) / P.sp - o)), i1 = Math.min(nx - 1, Math.floor((area[2] - P.min[0]) / P.sp - o));
+  const j0 = Math.max(0, Math.ceil((area[1] - P.min[1]) / P.sp - o)), j1 = Math.min(nz - 1, Math.floor((area[3] - P.min[1]) / P.sp - o));
+  return [i0, j0, Math.max(0, i1 - i0 + 1), Math.max(0, j1 - j0 + 1)];
+}
+/** True while a tile the rectangle covers is listed but not loaded yet. */
+function rectBlocked(P, [i0, j0, w, h]) {
+  for (let tz = j0 >> 8; tz <= (j0 + h - 1) >> 8; tz++)
+    for (let tx = i0 >> 8; tx <= (i0 + w - 1) >> 8; tx++) if (MT.blocked(P, MT.tileKey(tx, tz))) return true;
+  return false;
+}
+function paintArea(ctx) {
+  if (!area) return;
+  const x0 = SX(area[0]), z0 = SZ(area[1]), x1 = SX(area[2]), z1 = SZ(area[3]);
+  ctx.strokeStyle = erosion.pending ? '#ffd866' : '#ffffff'; ctx.lineWidth = 1;
+  ctx.setLineDash([6, 3]);
+  ctx.strokeRect(Math.round(x0) + 0.5, Math.round(z0) + 0.5, Math.round(x1 - x0), Math.round(z1 - z0));
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#ffffff'; ctx.font = '11px monospace';
+  const [, , w, h] = areaRect(map.H);
+  ctx.fillText(`area ${w}×${h} posts` + (erosion.pending ? ' — erosion PREVIEW (commit / discard in Height tools)' : ''), x0 + 3, z0 - 4);
+}
+/** Run erosion.js on the posts of `rect` in a worker; resolves with the new heights. */
+function erodeInWorker(src, w, h, sp, opts) {
+  let worker = null;
+  const p = new Promise((resolve, reject) => {
+    try { worker = new Worker(new URL('./erosion_worker.js', import.meta.url), {type: 'module'}); }
+    catch (e) {
+      // no module workers here: the same function on this thread (same result, the page waits)
+      import('./erosion.js').then(m => resolve(m.erode(src, w, h, sp, opts))).catch(reject);
+      return;
+    }
+    worker.onmessage = (ev) => {
+      const m = ev.data;
+      if (m.progress != null) { erosion.progress = m.progress; syncHeightTools(); return; }
+      worker.terminate();
+      if (m.error) reject(new Error(m.error)); else resolve(m.heights);
+    };
+    worker.onerror = (ev) => { worker.terminate(); reject(new Error(ev.message || 'erosion worker failed')); };
+    worker.postMessage({id: 1, heights: src, w, h, sp, opts}, [src.buffer]);
+  });
+  p.cancel = () => { if (worker) worker.terminate(); };
+  return p;
+}
+/** Erode the Area: run, then hold the result as a PREVIEW in the plane until
+ *  Commit (one undo step) or Discard (the posts as they were). */
+async function runErosion() {
+  if (!map || erosion.running) return null;
+  if (!area) { toast('draw an Area first: the Area tool, drag a rectangle', true); return null; }
+  if (erosion.pending) commitErosion();
+  const P = map.H, rect = areaRect(P), [i0, j0, w, h] = rect;
+  if (w < 8 || h < 8) { toast('the area is under 8 posts a side', true); return null; }
+  if (w * h > 4200000) { toast(`the area is ${w}×${h} posts; erosion takes at most ~2048×2048 (draw a smaller area)`, true); return null; }
+  if (rectBlocked(P, rect)) { toast('tiles under the area are still loading; try again in a moment', true); return null; }
+  const opts = {seed: erosion.seed | 0, iterations: erosion.iterations | 0, strength: erosion.strength / 100,
+                talusDeg: erosion.talusDeg, hydraulic: erosion.hydraulic, thermal: erosion.thermal};
+  const run = erodeInWorker(MT.readWindow(P, i0, j0, w, h), w, h, P.sp, opts);
+  erosion.running = run; erosion.progress = 0;
+  syncHeightTools();
+  const t0 = performance.now();
+  try {
+    const out = await run;
+    if (!map || map.H !== P) return null;
+    const before = new Map();
+    const r = MT.writeValues(P, i0, j0, w, h, out, before);
+    erosion.pending = {before, rect};
+    range.vals = null;
+    status(`erosion preview: ${r.changed} posts moved in ${((performance.now() - t0) / 1000).toFixed(1)} s (seed ${opts.seed}) — Commit keeps it, Discard puts the posts back`);
+    return out;
+  } catch (e) {
+    toast('erosion: ' + e.message, true);
+    return null;
+  } finally {
+    erosion.running = null;
+    syncHeightTools(); paint();
+  }
+}
+function commitErosion() {
+  const p = erosion.pending;
+  if (!p) return;
+  erosion.pending = null;
+  if (p.before.size) { pushUndo({tiles: {height: p.before}}); markDirty(true); }
+  syncHeightTools();
+}
+function discardErosion() {
+  const p = erosion.pending;
+  if (!p) return;
+  erosion.pending = null;
+  MT.swapTiles(map.H, p.before);
+  range.vals = null;
+  syncHeightTools(); paint();
+}
+function download(name, bytes, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes], {type}));
+  a.download = name;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+async function encodePng(w, h, format, body, note) {
+  const r = await fetch(`/api/mappng/encode?w=${w}&h=${h}&format=${format}&note=${encodeURIComponent(JSON.stringify(note))}`, {method: 'POST', body});
+  if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
+  return new Uint8Array(await r.arrayBuffer());
+}
+/** The height of the Area (or the whole plane) as a 16-bit greyscale PNG:
+ *  one unit = one voxel (0.1 m), offset = the lowest post, so the export is
+ *  exact; the mapping and the post rectangle ride in the PNG's "sandvox" note. */
+async function exportHeightPng(save = true) {
+  const P = map.H, v = vpm(), sea = seaY(), [i0, j0, w, h] = areaRect(P);
+  if (!w || !h) { toast('the area holds no posts', true); return null; }
+  if (rectBlocked(P, [i0, j0, w, h])) { toast('tiles are still loading; export again in a moment', true); return null; }
+  const vals = MT.readWindow(P, i0, j0, w, h);
+  let lo = Infinity;
+  for (let n = 0; n < vals.length; n++) lo = Math.min(lo, Math.round(vals[n]));
+  const mpu = 1 / v, offsetM = Math.floor((lo - sea) / v), unit = mpu * v, off = sea + offsetM * v;
+  const u = new Uint16Array(w * h);
+  for (let n = 0; n < u.length; n++) u[n] = Math.max(0, Math.min(65535, Math.round((Math.round(vals[n]) - off) / unit)));
+  const note = {sandvox: 'height', map: map.name, mpu, offsetM, seaLevelY: sea, vpm: v, rect: [i0, j0, w, h], posts: P.posts};
+  const png = await encodePng(w, h, 'grey16', u, note);
+  if (save) download(`${map.name}_height_${i0}_${j0}_${w}x${h}.png`, png, 'image/png');
+  status(`exported the height of ${w}×${h} posts: 16-bit grey, 1 unit = ${mpu} m, 0 = ${offsetM} m above sea (${(png.length / 1024).toFixed(0)} KB)`);
+  return png;
+}
+async function exportBiomePng(save = true) {
+  const P = map.B, [i0, j0, w, h] = areaRect(P), pal = palette();
+  if (!w || !h) { toast('the area holds no biome cells', true); return null; }
+  const rgb = new Uint8Array(w * h * 3);
+  for (let j = 0; j < h; j++)
+    for (let i = 0; i < w; i++) {
+      const c = pal[MT.sample(P, i0 + i, j0 + j)] || pal[0], o = (j * w + i) * 3;
+      rgb[o] = c[0]; rgb[o + 1] = c[1]; rgb[o + 2] = c[2];
+    }
+  const note = {sandvox: 'biome', map: map.name, rect: [i0, j0, w, h], biomes: map.json.biomes};
+  const png = await encodePng(w, h, 'rgb8', rgb, note);
+  if (save) download(`${map.name}_biome_${i0}_${j0}_${w}x${h}.png`, png, 'image/png');
+  status(`exported the biomes of ${w}×${h} cells as palette colours (${(png.length / 1024).toFixed(0)} KB)`);
+  return png;
+}
+/** The tuner's decoded-PNG blob ('SVPN', map_png.decoded_blob). */
+function parseSVPN(buf) {
+  const d = new DataView(buf);
+  if (String.fromCharCode(d.getUint8(0), d.getUint8(1), d.getUint8(2), d.getUint8(3)) !== 'SVPN') throw new Error('not a decoded PNG');
+  const w = d.getUint32(4, true), h = d.getUint32(8, true), fmt = d.getUint32(12, true), max = d.getUint32(16, true), nl = d.getUint32(20, true);
+  const text = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 24, nl)).replace(/\0+$/, '') || '{}');
+  let note = null;
+  try { note = text.sandvox ? JSON.parse(text.sandvox) : null; } catch (e) { note = null; }
+  const off = 24 + nl;
+  const samples = fmt === 1 ? new Uint16Array(buf.slice(off, off + w * h * 2)) : new Uint8Array(buf.slice(off, off + w * h * 3));
+  return {w, h, format: fmt === 1 ? 'grey' : 'rgb', max, samples, note};
+}
+/** Decode a PNG through the tuner and open the import dialog for `plane`. */
+async function openPngImport(bytes, plane, fileName) {
+  const r = await fetch('/api/mappng/decode', {method: 'POST', body: bytes});
+  if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
+  const img = parseSVPN(await r.arrayBuffer());
+  if (plane === 'height' && img.format === 'rgb') {
+    // a greyscale picture saved as RGB is fine; real colour is not a height
+    const s = img.samples, g = new Uint16Array(img.w * img.h);
+    for (let n = 0; n < g.length; n++) {
+      if (s[n * 3] !== s[n * 3 + 1] || s[n * 3] !== s[n * 3 + 2]) throw new Error('a height import needs a greyscale PNG (this one has colour)');
+      g[n] = s[n * 3];
+    }
+    img.samples = g; img.format = 'grey'; img.max = 255;
+  }
+  const n = img.note, own = n && n.sandvox === plane && Array.isArray(n.rect);
+  pngIn = {plane, img, file: fileName || 'png',
+           mpu: plane === 'height' ? (own && n.mpu > 0 ? n.mpu : 1500 / Math.max(1, img.max)) : 0,
+           offsetM: own && plane === 'height' ? (+n.offsetM || 0) : 0,
+           target: own ? 'note' : area ? 'area' : 'whole', keepUnmapped: true};
+  if (plane === 'height') {
+    let lo = 65535, hi = 0;
+    for (let k = 0; k < img.samples.length; k++) { const s = img.samples[k]; if (s < lo) lo = s; if (s > hi) hi = s; }
+    pngIn.lo = lo; pngIn.hi = hi;
+  } else pngIn.map = biomeColourMap(img);
+  syncHeightTools();
+  return pngIn;
+}
+/** For a biome import: each distinct colour -> the nearest palette biome,
+ *  and the colours too far from every palette colour to call ("unmapped"). */
+function biomeColourMap(img) {
+  const pal = palette(), counts = new Map(), s = img.samples;
+  const grey = img.format === 'grey';
+  for (let n = 0; n < img.w * img.h; n++) {
+    const c = grey ? (Math.round(s[n] * 255 / Math.max(1, img.max)) * 0x10101) : (s[n * 3] << 16) | (s[n * 3 + 1] << 8) | s[n * 3 + 2];
+    counts.set(c, (counts.get(c) || 0) + 1);
+  }
+  const to = new Map(), unmapped = [];
+  for (const [c, cnt] of counts) {
+    const r = c >> 16, g = (c >> 8) & 255, b = c & 255;
+    let best = 0, bd = Infinity;
+    pal.forEach((p, i) => { const d = (p[0] - r) ** 2 + (p[1] - g) ** 2 + (p[2] - b) ** 2; if (d < bd) { bd = d; best = i; } });
+    const far = bd > 40 * 40;
+    to.set(c, {index: best, far});
+    if (far) unmapped.push({c, cnt, nearest: best});
+  }
+  unmapped.sort((a, b) => b.cnt - a.cnt);
+  return {to, unmapped, colours: counts.size};
+}
+/** The post / cell rectangle the dialog's target names, or a reason it cannot. */
+function importRect() {
+  const P = pngIn.plane === 'height' ? map.H : map.B, n = pngIn.img.note;
+  if (pngIn.target === 'note') {
+    const r = n && n.rect;
+    const nx = P.posts[0] - (P.name === 'biome' ? 1 : 0), nz = P.posts[1] - (P.name === 'biome' ? 1 : 0);
+    if (!r || r[0] < 0 || r[1] < 0 || r[0] + r[2] > nx || r[1] + r[3] > nz) return 'the PNG’s own rectangle does not fit this map';
+    return r;
+  }
+  if (pngIn.target === 'area' && !area) return 'no Area drawn';
+  if (pngIn.target === 'whole') { const a = area; area = null; const r = areaRect(P); area = a; return r; }
+  return areaRect(P);
+}
+/** Write the dialog's PNG into its plane: one undo step. Height: bilinear onto
+ *  the target posts (exact when the sizes match), h = sea + (offset + unit *
+ *  value) in metres, rounded to whole voxels. Biome: nearest pixel per cell,
+ *  each colour to its nearest palette biome (unmapped colours left alone, or
+ *  forced to their nearest). */
+function applyPngImport() {
+  if (!pngIn || !map) return null;
+  const rect = importRect();
+  if (typeof rect === 'string') { toast('import: ' + rect, true); return null; }
+  const [i0, j0, tw, th] = rect, img = pngIn.img, W = img.w, Hh = img.h, s = img.samples;
+  const P = pngIn.plane === 'height' ? map.H : map.B;
+  if (!tw || !th) { toast('import: the target holds no samples', true); return null; }
+  if (rectBlocked(P, rect)) { toast('tiles under the target are still loading; try again in a moment', true); return null; }
+  const before = new Map();
+  let r;
+  if (pngIn.plane === 'height') {
+    const v = vpm(), unit = pngIn.mpu * v, off = seaY() + pngIn.offsetM * v;
+    const vals = new Float32Array(tw * th);
+    for (let j = 0; j < th; j++) {
+      const fy = th > 1 ? j * (Hh - 1) / (th - 1) : 0, y0 = Math.floor(fy), y1 = Math.min(Hh - 1, y0 + 1), ty = fy - y0;
+      for (let i = 0; i < tw; i++) {
+        const fx = tw > 1 ? i * (W - 1) / (tw - 1) : 0, x0 = Math.floor(fx), x1 = Math.min(W - 1, x0 + 1), tx = fx - x0;
+        const a = s[y0 * W + x0] + (s[y0 * W + x1] - s[y0 * W + x0]) * tx;
+        const b = s[y1 * W + x0] + (s[y1 * W + x1] - s[y1 * W + x0]) * tx;
+        vals[j * tw + i] = Math.round(off + (a + (b - a) * ty) * unit);
+      }
+    }
+    r = MT.writeValues(P, i0, j0, tw, th, vals, before);
+  } else {
+    const cm = pngIn.map, grey = img.format === 'grey';
+    r = MT.writeWindow(P, i0, j0, tw, th, (n) => {
+      const x = Math.min(W - 1, Math.floor(((n % tw) + 0.5) * W / tw)), y = Math.min(Hh - 1, Math.floor((Math.floor(n / tw) + 0.5) * Hh / th));
+      const k = y * W + x;
+      const c = grey ? Math.round(s[k] * 255 / Math.max(1, img.max)) * 0x10101 : (s[k * 3] << 16) | (s[k * 3 + 1] << 8) | s[k * 3 + 2];
+      const e = cm.to.get(c);
+      return !e || (e.far && pngIn.keepUnmapped) ? null : e.index;
+    }, before);
+  }
+  if (before.size) { pushUndo({tiles: {[pngIn.plane]: before}}); markDirty(true); }
+  range.vals = null;
+  status(`imported ${pngIn.file} into ${tw}×${th} ${pngIn.plane === 'height' ? 'posts' : 'cells'}: ${r.changed} changed` +
+         (r.skipped ? `, ${r.skipped} in loading tiles skipped` : '') + ' (Ctrl+Z takes it back)');
+  pngIn = null;
+  syncHeightTools(); paint();
+  return r;
+}
+/** The Height tools panel: lines, the area + erosion, PNG import / export. */
+function buildHeightToolsPanel() {
+  const el = H.el;
+  const det = el('details', {class: 'maptools', open: true});
+  det.append(el('summary', {}, 'Height tools — ridge / valley lines, erosion, PNG'));
+  els.lineList = el('div', {class: 'mapsites-list'});
+  els.lineInsp = el('div', {class: 'maptools-panel'});
+  det.append(el('div', {class: 'mapsub'}, 'Lines (map.json ridges[]: the plane holds what is BAKED; the engine never reads the lines)'), els.lineList, els.lineInsp);
+  // the area + erosion
+  els.areaInfo = el('div', {class: 'mapnote'});
+  const num = (key, min, max, step, title, scale = 1) => {
+    const i = el('input', {type: 'number', min, max, step, value: erosion[key], style: 'width:56px', title});
+    i.addEventListener('change', () => { erosion[key] = Math.max(min, Math.min(max, +i.value || 0)); i.value = erosion[key]; });
+    return i;
+  };
+  const chk = (key, title) => {
+    const c = el('input', {type: 'checkbox', title});
+    c.checked = erosion[key];
+    c.addEventListener('change', () => { erosion[key] = c.checked; });
+    return c;
+  };
+  els.erRun = el('button', {class: 'mapgo', title: 'erode the Area in a worker (deterministic for the seed), then preview it in the plane'}, 'Erode area');
+  els.erRun.addEventListener('click', () => {
+    if (erosion.running) { erosion.running.cancel(); erosion.running = null; syncHeightTools(); return; }
+    runErosion();
+  });
+  els.erCommit = el('button', {title: 'keep the eroded posts (one undo step)'}, 'Commit');
+  els.erCommit.addEventListener('click', () => { commitErosion(); paint(); });
+  els.erDiscard = el('button', {title: 'put the posts back as they were'}, 'Discard');
+  els.erDiscard.addEventListener('click', discardErosion);
+  els.erState = el('span', {class: 'mapnote'});
+  det.append(el('div', {class: 'mapsub'}, 'Area (the Area tool draws it; shift+click clears it)'), els.areaInfo,
+    el('div', {class: 'mapgrid2'},
+      el('label', {title: 'passes; each pass runs a droplet per four posts and a thermal step'}, 'passes ', num('iterations', 1, 100, 1, 'erosion passes')),
+      el('label', {}, 'strength % ', num('strength', 1, 100, 5, 'how much each droplet carries and each slump moves')),
+      el('label', {title: 'thermal: slopes steeper than this slump (scree)'}, 'talus ° ', num('talusDeg', 5, 80, 1, 'talus angle')),
+      el('label', {title: 'the same seed on the same posts gives the same result'}, 'seed ', num('seed', 0, 999999, 1, 'seed')),
+      el('label', {}, chk('hydraulic', 'droplets: gullies and fans'), ' water'),
+      el('label', {}, chk('thermal', 'talus slumping: scree slopes'), ' thermal')),
+    el('div', {class: 'mapbar'}, els.erRun, els.erCommit, els.erDiscard, els.erState));
+  // PNG
+  const exH = el('button', {title: 'the Area’s (or the whole map’s) HEIGHT as a 16-bit greyscale PNG: exact, 1 unit = 1 voxel, mapping in the file'}, 'Export height PNG');
+  exH.addEventListener('click', () => exportHeightPng().catch(e => toast('export: ' + e.message, true)));
+  const exB = el('button', {title: 'the Area’s (or the whole map’s) BIOMES as an RGB PNG in the palette colours'}, 'Export biome PNG');
+  exB.addEventListener('click', () => exportBiomePng().catch(e => toast('export: ' + e.message, true)));
+  const fileIn = (plane) => {
+    const f = el('input', {type: 'file', accept: '.png,image/png', style: 'display:none'});
+    f.addEventListener('change', async () => {
+      const file = f.files && f.files[0];
+      f.value = '';
+      if (!file) return;
+      try { await openPngImport(await file.arrayBuffer(), plane, file.name); } catch (e) { toast('import: ' + e.message, true); }
+    });
+    const b = el('button', {title: plane === 'height' ? 'a 16-bit (or 8-bit) greyscale heightmap from Gaea / World Machine / an export: you set metres per unit and the offset next' :
+                                                      'an indexed or RGB PNG: each colour becomes the nearest palette biome (the dialog lists colours it could not call)'},
+                  plane === 'height' ? 'Import height PNG…' : 'Import biome PNG…');
+    b.addEventListener('click', () => f.click());
+    return [b, f];
+  };
+  els.pngDlg = el('div', {class: 'maptools-panel'});
+  det.append(el('div', {class: 'mapsub'}, 'PNG (the Area, or the whole map when there is none)'),
+    el('div', {class: 'mapbar'}, exH, exB), el('div', {class: 'mapbar'}, ...fileIn('height'), ...fileIn('biome')), els.pngDlg);
+  return det;
+}
+function syncHeightTools() {
+  if (!els.areaInfo || !map) return;
+  const el = H.el, v = vpm();
+  if (area) {
+    const [, , w, h] = areaRect(map.H);
+    els.areaInfo.textContent = `${fmtM((area[2] - area[0]) / v)} × ${fmtM((area[3] - area[1]) / v)} — ${w}×${h} height posts`;
+  } else els.areaInfo.textContent = 'no area: erosion needs one; PNG export / import use the whole map';
+  els.erRun.textContent = erosion.running ? 'Cancel' : 'Erode area';
+  els.erRun.disabled = !area && !erosion.running;
+  els.erCommit.disabled = els.erDiscard.disabled = !erosion.pending;
+  els.erState.textContent = erosion.running ? ` running ${Math.round(erosion.progress * 100)} %` : erosion.pending ? ' preview in the plane' : '';
+  const d = els.pngDlg;
+  d.replaceChildren();
+  if (!pngIn) return;
+  const img = pngIn.img;
+  d.append(el('b', {}, `import ${pngIn.file} → ${pngIn.plane}`),
+           el('span', {class: 'mapnote'}, `${img.w}×${img.h} ${img.format === 'grey' ? 'grey ' + (img.max > 255 ? '16' : '8') + '-bit' : 'colour'}` +
+              (img.note ? ' · carries a sandvox note (' + img.note.sandvox + ', map ' + img.note.map + ')' : '')));
+  const tgt = el('select', {});
+  for (const [k, t] of [['note', 'the PNG’s own posts'], ['area', 'the Area'], ['whole', 'the whole map']])
+    if (k !== 'note' || (img.note && img.note.sandvox === pngIn.plane)) tgt.append(el('option', {value: k}, t));
+  tgt.value = pngIn.target;
+  tgt.addEventListener('change', () => { pngIn.target = tgt.value; syncHeightTools(); });
+  const rect = importRect();
+  d.append(el('label', {}, 'onto ', tgt), el('span', {class: 'mapnote'}, typeof rect === 'string' ? rect :
+           `${rect[2]}×${rect[3]} ${pngIn.plane === 'height' ? 'posts' : 'cells'} at (${rect[0]}, ${rect[1]})` +
+           (rect[2] === img.w && rect[3] === img.h ? ' — same size: exact' : ' — resampled')));
+  if (pngIn.plane === 'height') {
+    const mpu = el('input', {type: 'number', step: 'any', value: pngIn.mpu, style: 'width:90px', title: 'metres per PNG unit (Gaea: the terrain height ÷ 65535)'});
+    mpu.addEventListener('change', () => { pngIn.mpu = Math.max(1e-6, +mpu.value || 0); syncHeightTools(); });
+    const off = el('input', {type: 'number', step: 'any', value: pngIn.offsetM, style: 'width:80px', title: 'metres above sea level of PNG value 0'});
+    off.addEventListener('change', () => { pngIn.offsetM = +off.value || 0; syncHeightTools(); });
+    d.append(el('label', {}, 'metres per unit ', mpu), el('label', {}, 'value 0 is at ', off, ' m above sea'),
+             el('span', {class: 'mapnote'}, `values ${pngIn.lo}..${pngIn.hi} → ${fmtM(pngIn.offsetM + pngIn.lo * pngIn.mpu)} .. ${fmtM(pngIn.offsetM + pngIn.hi * pngIn.mpu)} above sea`));
+  } else {
+    const cm = pngIn.map, names = map.json.biomes;
+    const keep = el('input', {type: 'checkbox'});
+    keep.checked = pngIn.keepUnmapped;
+    keep.addEventListener('change', () => { pngIn.keepUnmapped = keep.checked; });
+    d.append(el('span', {class: 'mapnote'}, `${cm.colours} colour(s); ${cm.unmapped.length} unmapped (no palette colour within 40)`));
+    for (const u of cm.unmapped.slice(0, 8))
+      d.append(el('span', {class: 'mapwarn'}, `#${u.c.toString(16).padStart(6, '0')} × ${u.cnt} px — nearest ${names[u.nearest]}`));
+    if (cm.unmapped.length) d.append(el('label', {}, keep, ' leave unmapped cells as they are (off: force them to the nearest biome)'));
+  }
+  const go = el('button', {class: 'mapgo'}, 'Apply import');
+  go.addEventListener('click', applyPngImport);
+  const no = el('button', {}, 'Cancel');
+  no.addEventListener('click', () => { pngIn = null; syncHeightTools(); });
+  d.append(el('div', {class: 'mapbar'}, go, no));
+}
+
 /* ---- UI --------------------------------------------------------------------------- */
 function rebuildPalette() {
   const el = H.el;
@@ -1785,6 +2613,18 @@ function syncControls() {
   els.brTarget.value = brush.targetM;
   els.brTargetLbl.style.display = brush.mode === 'set' ? '' : 'none';
   els.brSpacing.value = brush.spacing;
+  if (els.hbTerrace) {
+    els.hbTerrace.style.display = brush.mode === 'terrace' ? '' : 'none';
+    els.hbNoise.style.display = brush.mode === 'noise' ? '' : 'none';
+    els.brFalloff.value = hb.falloff;
+    // noise is stroke-stable at its amplitude; strength does not scale it
+    els.brStr.style.display = els.brStrOut.style.display = brush.mode === 'noise' ? 'none' : '';
+    for (const [k, i] of Object.entries(els.shIn)) i.value = shape[k];
+    els.shKind.value = shape.kind;
+    for (const [k, i] of Object.entries(els.lnIn)) i.value = lines[k];
+    els.lnYSea.style.display = lines.yMode === 'sea' ? '' : 'none';
+    els.lnYGround.style.display = lines.yMode === 'sea' ? 'none' : '';
+  }
 }
 export function attach(hooks) {
   H = hooks;
@@ -1833,7 +2673,16 @@ export function attach(hooks) {
 #env-map .mapwhere{flex:1;color:#8fa0b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #env-map .mapsites-panel{display:flex;flex-direction:column;gap:4px;border-top:1px solid #2a3040;padding-top:6px}
 #env-map .mapsites-panel label{display:flex;justify-content:space-between;align-items:center;gap:6px}
+#env-map .maptools-panel{display:flex;flex-direction:column;gap:4px;border-top:1px solid #2a3040;padding-top:6px}
+#env-map .maptools-panel label{display:flex;justify-content:space-between;align-items:center;gap:6px}
 #env-map #wgPreviewHost{border-top:1px solid #2a3040;padding-top:6px}
+#env-map .mapsub{font:10px monospace;color:#8fa0b8;text-transform:uppercase;letter-spacing:.05em;margin-top:6px;border-top:1px solid #2a3040;padding-top:4px}
+#env-map .mapgrid2{display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;margin:4px 0}
+#env-map .mapgrid2 label{display:flex;justify-content:space-between;align-items:center;gap:4px}
+#env-map .maplinepts{display:flex;flex-direction:column;gap:1px;max-height:160px;overflow-y:auto}
+#env-map .mapprofile{width:300px;height:84px;image-rendering:pixelated;border:1px solid #2a3040;border-radius:3px}
+#env-map button.mapgo{background:#2a2410;border-color:#6a5a1a;color:#ffd866}
+#env-map button.mapgo:disabled,#env-map .maptools button:disabled{opacity:.45}
 `;
   document.head.append(style);
 
@@ -1845,7 +2694,10 @@ export function attach(hooks) {
   els.save.addEventListener('click', saveMap);
   els.tools = {
     site: el('button', {title: 'click a site marker of any kind to select it in the Sites panel'}, 'Select'),
-    height: el('button', {title: 'paint the AUTHORED HEIGHT plane in metres: raise / lower / set / smooth (left-drag; Alt+click picks the height under the cursor into Set)'}, 'Height'),
+    height: el('button', {title: 'paint the AUTHORED HEIGHT plane in metres: raise / lower / smooth / flatten / set / terrace / noise / erode (left-drag; Alt+click picks the height under the cursor into Set)'}, 'Height'),
+    shape: el('button', {title: 'click: stamp a landform into the height plane -- peak, ridge, basin, plateau, volcano, mesa ([ ] radius, , . rotate)'}, 'Shape'),
+    line: el('button', {title: 'RIDGE / VALLEY lines: click to draw (double-click / Enter ends), drag a vertex, click a segment to insert, shift+click a vertex to delete; Bake in the Height tools panel'}, 'Line'),
+    area: el('button', {title: 'drag: the AREA the Height tools panel erodes and exports / imports as PNG; shift+click clears it'}, 'Area'),
     biome: el('button', {title: 'paint the selected biome (left-drag; Alt+click picks the biome under the cursor)'}, 'Biome brush'),
     pad: el('button', {title: 'drag the calm pad box (world voxels)'}, 'Pad box'),
     spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
@@ -1861,7 +2713,7 @@ export function attach(hooks) {
   els.brR = el('input', {type: 'range', min: 0, max: 1000, step: 1, style: 'width:130px', title: 'brush radius, 1 m .. 5 km (logarithmic; [ and ])'});
   els.brROut = el('span', {});
   els.brR.addEventListener('input', () => { brush.radiusM = sliderToR(+els.brR.value); syncControls(); paint(); });
-  els.brMode = el('select', {title: 'raise / lower: move the posts up or down; set: toward a height (m above sea); smooth: toward the local average'});
+  els.brMode = el('select', {title: 'raise / lower: move the posts up or down; smooth: toward the local average; flatten: toward the height where the stroke started; set: toward a typed height (m above sea); terrace: quantise into shelves and cliffs; noise: seeded relief (amplitude in m); erode: water + scree erosion under the brush'});
   for (const m of MT.HEIGHT_MODES) els.brMode.append(el('option', {value: m}, m));
   els.brMode.addEventListener('change', () => { brush.mode = els.brMode.value; tool = 'height'; syncControls(); });
   els.brStr = el('input', {type: 'range', min: 1, max: 100, style: 'width:90px', title: 'strength: raise / lower move the centre strength% of radius/10 per dab; set / smooth go strength% of the way'});
@@ -1872,6 +2724,45 @@ export function attach(hooks) {
   els.brTargetLbl = el('label', {}, ' to ', els.brTarget, ' m');
   els.brSpacing = el('input', {type: 'number', min: 5, max: 200, step: 5, style: 'width:50px', title: 'dab spacing along a drag, % of the radius'});
   els.brSpacing.addEventListener('change', () => { brush.spacing = Math.max(5, Math.min(200, +els.brSpacing.value || 25)); syncControls(); });
+  // ---- E2: the height brush's falloff and its per-mode options
+  const numIn = (obj, key, min, max, step, width, title, after) => {
+    const i = el('input', {type: 'number', min, max, step, value: obj[key], style: `width:${width}px`, title});
+    i.addEventListener('change', () => { obj[key] = Math.max(min, Math.min(max, +i.value || 0)); i.value = obj[key]; if (after) after(); paint(); });
+    return i;
+  };
+  const selIn = (obj, key, opts, title, after) => {
+    const s = el('select', {title}, ...opts.map(o => el('option', {value: o}, o)));
+    s.value = obj[key];
+    s.addEventListener('change', () => { obj[key] = s.value; if (after) after(); paint(); });
+    return s;
+  };
+  els.hbIn = {};
+  els.brFalloff = selIn(hb, 'falloff', HS.FALLOFF_NAMES, 'the brush edge: smooth (cosine), linear, flat (a hard core, a short soft rim), sphere');
+  els.hbTerrace = el('span', {}, ' step ', (els.hbIn.stepM = numIn(hb, 'stepM', 1, 2000, 5, 56, 'terrace band height, metres (from the sea)')), ' m sharp ',
+                     (els.hbIn.sharp = numIn(hb, 'sharp', 0, 98, 5, 46, 'sharpness %: 0 soft steps; 90 = 90 % flat shelf and a 10 % cliff')), '%');
+  els.hbNoise = el('span', {}, ' amp ', (els.hbIn.ampM = numIn(hb, 'ampM', 0, 3000, 5, 56, 'noise amplitude, metres (at strength 100 % in the core)')), ' m size ',
+                   (els.hbIn.sizeM = numIn(hb, 'sizeM', 5, 20000, 50, 62, 'the largest noise feature, metres')), ' m ',
+                   (els.hbIn.style = selIn(hb, 'style', ['ridged', 'fbm'], 'ridged = sharp crests (mountain ranges); fbm = rolling relief')),
+                   ' seed ', (els.hbIn.seed = numIn(hb, 'seed', 0, 999999, 1, 64, 'the same seed paints the same noise')));
+  // ---- E2: the Shape tool
+  els.shKind = selIn(shape, 'kind', HS.SHAPE_NAMES, 'peak / ridge / basin / volcano ride on the land (additive); plateau / mesa level it to a flat top',
+                     () => { shape.aspect = shape.kind === 'ridge' ? 0.25 : 1; syncControls(); });
+  els.shIn = {
+    heightM: numIn(shape, 'heightM', 0, 4000, 10, 60, 'rise (or depth) in metres, or the summit / floor height above sea'),
+    mode: selIn(shape, 'mode', ['rise', 'summit'], 'rise: that far above (basin: below) the land at the centre; summit: that many metres above sea level (a basin’s floor)'),
+    radiusM: numIn(shape, 'radiusM', 10, 20000, 50, 64, 'radius in metres ([ and ])'),
+    aspect: numIn(shape, 'aspect', 0.05, 1, 0.05, 50, 'width / length: 1 round, 0.25 a long ridge'),
+    rot: numIn(shape, 'rot', 0, 359, 15, 50, 'rotation of the long axis, degrees (, and .)'),
+  };
+  // ---- E2: the Line tool (what a NEW line / vertex takes)
+  els.lnIn = {
+    kind: selIn(lines, 'kind', ['ridge', 'valley'], 'a NEW line: ridge (raises toward its crest) or valley (lowers toward its floor)'),
+    profile: selIn(lines, 'profile', HS.PROFILE_NAMES, 'a NEW line’s cross-section'),
+    widthM: numIn(lines, 'widthM', 5, 20000, 50, 62, 'a NEW line’s half-width, metres ([ and ])'),
+    yMode: selIn(lines, 'yMode', ['sea', 'ground'], 'a new VERTEX’s height: sea = metres above sea level; ground = the plane under it plus (ridge) / minus (valley) the rise', () => syncControls()),
+    yM: numIn(lines, 'yM', -2000, 4000, 10, 60, 'new vertices at this height, metres above sea'),
+    dyM: numIn(lines, 'dyM', 0, 4000, 10, 60, 'new vertices this far above (ridge) / below (valley) the plane'),
+  };
   // ---- site tools
   els.waterPreset = el('select', {title: 'the water preset a new lake wears (Environment > Water bodies)'});
   els.waterPreset.addEventListener('change', () => { water.preset = els.waterPreset.value; tool = 'water'; syncControls(); paint(); });
@@ -1955,11 +2846,15 @@ export function attach(hooks) {
     el('label', {title: 'biome overlay opacity (full when the topo layer is off)'}, ' biomes ', pct('biomeAlpha', 'biome overlay opacity')),
     els.heightsBtn, pct('realAlpha', 'real-terrain backdrop opacity'),
     el('label', {}, ' ', scShow, 'sculpt'));
-  const toolbar = el('div', {class: 'mapbar'}, els.tools.site, els.tools.height, els.tools.biome, els.tools.sculpt,
+  const toolbar = el('div', {class: 'mapbar'}, els.tools.site, els.tools.height, els.tools.shape, els.tools.line, els.tools.area, els.tools.biome, els.tools.sculpt,
     els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.tree, els.tools.clearing, els.tools.soften);
   els.opts = {
     'height biome': el('span', {class: 'mapopts'}, 'radius ', els.brR, ' ', els.brROut, el('label', {}, ' spacing ', els.brSpacing, '%')),
-    'height': el('span', {class: 'mapopts'}, 'mode ', els.brMode, ' str ', els.brStr, ' ', els.brStrOut, els.brTargetLbl),
+    'height': el('span', {class: 'mapopts'}, 'mode ', els.brMode, ' str ', els.brStr, ' ', els.brStrOut, els.brTargetLbl, ' edge ', els.brFalloff, els.hbTerrace, els.hbNoise),
+    'shape': el('span', {class: 'mapopts'}, 'shape ', els.shKind, ' ', els.shIn.heightM, ' m ', els.shIn.mode, ' r ', els.shIn.radiusM, ' m aspect ', els.shIn.aspect, ' rot ', els.shIn.rot, '°'),
+    'line': el('span', {class: 'mapopts'}, 'new ', els.lnIn.kind, ' ', els.lnIn.profile, ' half-width ', els.lnIn.widthM, ' m · vertex ', els.lnIn.yMode,
+               (els.lnYSea = el('span', {}, ' ', els.lnIn.yM, ' m asl')), (els.lnYGround = el('span', {}, ' ± ', els.lnIn.dyM, ' m'))),
+    'area': el('span', {class: 'mapopts'}, el('span', {class: 'mapnote'}, 'drag a rectangle; erode it or export / import it in the Height tools panel')),
     'sculpt': el('span', {class: 'mapopts'}, 'sculpt ', els.scMode, ' r ', els.scRadius, ' ', els.scRadiusOut, ' str ', els.scStrength, ' ', els.scStrengthOut),
     'water': el('span', {class: 'mapopts'}, 'lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
     'stamp': el('span', {class: 'mapopts'}, 'stamp ', els.stampTpl, ' ', els.stampRot),
@@ -1970,10 +2865,11 @@ export function attach(hooks) {
   const note = el('div', {class: 'mapnote'},
     'The HEIGHT plane is the world’s shape, in metres: a post every ' + '6.4 m (map.json planes.height.log2), exact and never scaled by noise; the seeded noise (Terrain) rides on it and the Sculpt layer (0.8 m) on top of that. ' +
     'The BIOME plane says what grows where (planes.biome.log2: 25.6 m cells). Right/middle-drag pans, wheel zooms, [ ] resize the brush, Alt+click picks. ' +
+    'Shape stamps landforms; Line draws ridge / valley lines you Bake into the plane; Area marks a rectangle to erode or to export / import as PNG (Height tools panel). ' +
     'Sites: the pad box (calm bare ground; the harness map’s is the selftest’s), the spawn diamond, stamps, authored lakes, authored trees, forest clearings, softened ground; they keep out by their own footprint. The Load check panel says what the engine thinks of the saved map. ' +
     'Saving writes map.json and only the plane tiles you changed (assets/worldmap/<name>/planes/), and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
   const main = el('div', {class: 'mapmain'}, bar, toolbar, els.palette, els.canvas, els.status, note);
-  const side = el('div', {class: 'mapside'}, buildCheckPanel(), buildTerrainSection(), buildSitesPanel());
+  const side = el('div', {class: 'mapside'}, buildCheckPanel(), buildHeightToolsPanel(), buildTerrainSection(), buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
@@ -2102,7 +2998,7 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); } }
+export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); } }
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
@@ -2122,3 +3018,19 @@ export function _trees() { return trees; }
 export function _sculpt() { return sculpt; }
 export function _tool(t) { if (t) { tool = t; syncControls(); paint(); } return tool; }
 export function _undoDepth() { return undo.length; }
+// E2 test seams (the Height tools)
+export function _hb() { return hb; }
+export function _shape() { return shape; }
+export function _lines() { return lines; }
+export function _bakes() { return bakes; }
+export function _bake(L) { bakeLine(L); }
+export function _unbake(L) { unbakeLine(L); }
+export function _area(a) { if (a !== undefined) { area = a; syncHeightTools(); } return area; }
+export function _erosion() { return erosion; }
+export function _runErosion() { return runErosion(); }
+export function _commitErosion() { commitErosion(); }
+export function _discardErosion() { discardErosion(); }
+export function _exportPng(plane) { return plane === 'biome' ? exportBiomePng(false) : exportHeightPng(false); }
+export function _importPng(bytes, plane, name) { return openPngImport(bytes, plane, name); }
+export function _pngIn() { return pngIn; }
+export function _applyPng() { return applyPngImport(); }

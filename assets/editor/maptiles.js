@@ -27,6 +27,9 @@
  * that is all-default (or no longer in memory) is POSTed EMPTY, which
  * deletes the file -- an ocean tile is simply absent. */
 
+import * as HS from './heightshapes.js';
+import * as EROSION from './erosion.js';
+
 export const TILE = 256;
 export const TILE_MAGIC = 0x31545653;           // 'SVT1' read as a little-endian u32
 export const PLANES = {height: {kind: 1, bytes: 2}, biome: {kind: 2, bytes: 1}};
@@ -241,15 +244,28 @@ function discRect(P, wx, wz, r, centred) {
   return [Math.floor((wx - r - P.min[0]) / P.sp - o), Math.floor((wz - r - P.min[1]) / P.sp - o),
           Math.ceil((wx + r - P.min[0]) / P.sp - o), Math.ceil((wz + r - P.min[1]) / P.sp - o)];
 }
-/** The height modes this package ships (E2 adds the rest). */
-export const HEIGHT_MODES = ['raise', 'lower', 'set', 'smooth'];
+/** The height brush modes (E1: raise / lower / set / smooth; E2 the rest).
+ *  flatten is set with a target the page samples where the stroke starts. */
+export const HEIGHT_MODES = ['raise', 'lower', 'smooth', 'flatten', 'set', 'terrace', 'noise', 'erode'];
+/** The largest window the erode BRUSH runs inline (posts); bigger is the Erode area tool. */
+export const ERODE_BRUSH_MAX_POSTS = 160000;
 /** One dab of a height brush at world column (wx, wz).
- *  o = {mode, radius (vox), amount (vox at the centre per dab: raise / lower),
- *       target (vox: set), k (0..1: how far set / smooth go per dab)}.
+ *  o = {mode, radius (vox), falloff ('smooth' | 'linear' | 'flat' | 'sphere'),
+ *       amount (vox at the centre per dab: raise / lower),
+ *       target (vox: set / flatten), k (0..1: how far set / flatten / smooth /
+ *       terrace / erode go per dab),
+ *       step (vox), sharp (0..1), datum (vox): terrace bands from the datum,
+ *       amp (vox), size (vox), seed, style ('fbm' | 'ridged'): noise,
+ *       erosion (erosion.js options): erode,
+ *       stroke: an object the caller keeps for the whole stroke (noise reads it)}.
  *  The brush is never narrower than one post spacing: a 1 m brush on 6.4 m
- *  posts moves the nearest post. Returns writeWindow's {changed, skipped}. */
+ *  posts moves the nearest post. NOISE is stroke-stable: each post becomes
+ *  (its value before the stroke) + amp * noise * (the largest falloff weight
+ *  any dab of the stroke gave it), so dab overlap does not stack it. Returns
+ *  writeWindow's {changed, skipped} (+ tooBig for an erode dab over the cap). */
 export function heightDab(P, wx, wz, o, before) {
   const r = Math.max(o.radius, P.sp);
+  const fo = HS.falloffFn(o.falloff);
   const [i0, j0, i1, j1] = discRect(P, wx, wz, r, false);
   const w = i1 - i0 + 1, h = j1 - j0 + 1;
   const wt = new Float32Array(w * h);
@@ -257,7 +273,7 @@ export function heightDab(P, wx, wz, o, before) {
   for (let j = 0; j < h; j++)
     for (let i = 0; i < w; i++) {
       const d = Math.hypot(P.min[0] + (i0 + i) * P.sp - wx, P.min[1] + (j0 + j) * P.sp - wz);
-      const f = falloff(d, r);
+      const f = d >= r ? 0 : fo(d / r);
       if (f > 0) { wt[j * w + i] = f; any = true; }
     }
   if (!any) return {changed: 0, skipped: 0};
@@ -265,8 +281,10 @@ export function heightDab(P, wx, wz, o, before) {
   let f;
   if (o.mode === 'raise') f = (n, cur) => (wt[n] ? cur + o.amount * wt[n] : null);
   else if (o.mode === 'lower') f = (n, cur) => (wt[n] ? cur - o.amount * wt[n] : null);
-  else if (o.mode === 'set') f = (n, cur) => (wt[n] ? cur + (o.target - cur) * Math.min(1, wt[n] * k * 2) : null);
-  else if (o.mode === 'smooth') {
+  else if (o.mode === 'set' || o.mode === 'flatten') {
+    if (o.target == null || !isFinite(o.target)) return {changed: 0, skipped: 0};
+    f = (n, cur) => (wt[n] ? cur + (o.target - cur) * Math.min(1, wt[n] * k * 2) : null);
+  } else if (o.mode === 'smooth') {
     // reads its neighbourhood (one sample of apron) BEFORE writing any of it
     const g = readWindow(P, i0 - 1, j0 - 1, w + 2, h + 2), W = w + 2;
     f = (n, cur) => {
@@ -276,8 +294,87 @@ export function heightDab(P, wx, wz, o, before) {
       for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) s += g[(j + dz) * W + i + dx];
       return cur + (s / 9 - cur) * wt[n] * k;
     };
+  } else if (o.mode === 'terrace') {
+    const step = Math.max(1, +o.step || 0), datum = +o.datum || 0, sh = +o.sharp || 0;
+    f = (n, cur) => (wt[n] ? cur + (HS.terrace(cur, datum, step, sh) - cur) * Math.min(1, wt[n] * k * 2) : null);
+  } else if (o.mode === 'noise') {
+    const st = o.stroke || {};
+    if (!st.wmax) st.wmax = new Map();
+    const amp = +o.amp || 0, size = Math.max(P.sp, +o.size || 0), seed = o.seed | 0, style = o.style;
+    f = (n, cur) => {
+      const nw = wt[n];
+      if (!nw) return null;
+      const i = i0 + n % w, j = j0 + Math.floor(n / w), tk = tileKey(i >> 8, j >> 8), idx = (j & 255) * TILE + (i & 255);
+      let wm = st.wmax.get(tk);
+      if (!wm) { wm = new Float32Array(TILE * TILE); st.wmax.set(tk, wm); }
+      if (nw <= wm[idx]) return null;
+      wm[idx] = nw;
+      // the post's value before this stroke: the stroke's undo copy if the tile has one
+      const bt = before && before.has(tk) ? before.get(tk) : undefined;
+      const orig = bt === undefined ? cur : bt === null ? P.def : bt[idx];
+      return orig + amp * nw * HS.fbm2(P.min[0] + i * P.sp, P.min[1] + j * P.sp, size, seed, style);
+    };
+  } else if (o.mode === 'erode') {
+    if (w * h > ERODE_BRUSH_MAX_POSTS) return {changed: 0, skipped: 0, tooBig: true};
+    const A = 3, W = w + 2 * A, Hh = h + 2 * A;
+    const src = readWindow(P, i0 - A, j0 - A, W, Hh);
+    // seeded by the dab's post, so a stroke replays the same
+    const eo = {...(o.erosion || {}), seed: ((o.erosion && o.erosion.seed) | 0) * 31 + i0 * 7919 + j0 * 104729, feather: 0};
+    const er = EROSION.erode(src, W, Hh, P.sp, eo);
+    f = (n, cur) => {
+      if (!wt[n]) return null;
+      const m = (Math.floor(n / w) + A) * W + (n % w) + A;
+      return cur + (er[m] - src[m]) * wt[n] * k;
+    };
   } else throw new Error('unknown height mode ' + o.mode);
   return writeWindow(P, i0, j0, w, h, f, before);
+}
+/** Write a TOOL's window ({i0, j0, w, h, f} from heightshapes.js: a line
+ *  bake, a shape stamp) into the plane; `before` collects undo. */
+export function applyOp(P, op, before) {
+  if (!op) return {changed: 0, skipped: 0};
+  return writeWindow(P, op.i0, op.j0, op.w, op.h, op.f, before);
+}
+/** Write a whole window of new heights (an erosion result, a PNG import):
+ *  `vals` is w x h, NaN = leave the post alone. */
+export function writeValues(P, i0, j0, w, h, vals, before) {
+  return writeWindow(P, i0, j0, w, h, (n) => (Number.isNaN(vals[n]) ? null : vals[n]), before);
+}
+/** Take a bake back out of the plane, keeping what was painted since:
+ *  rec = {before, after} (key -> tile | null: the tiles before and right after
+ *  the bake). Each post becomes before + (now - after), so a post nobody
+ *  touched since returns to its pre-bake value exactly and a later stroke
+ *  survives as the offset it made. `undo` collects the current tiles.
+ *  Returns the number of posts that had been edited since the bake. */
+export function unbake(P, rec, undo) {
+  let since = 0;
+  for (const [k, bt] of rec.before) {
+    const cur = P.tiles.get(k) || null, at = rec.after.get(k) || null;
+    if (undo && !undo.has(k)) undo.set(k, cur ? copyTile(cur) : null);
+    const t = newTile(P);
+    for (let i = 0; i < t.length; i++) {
+      const b = bt ? bt[i] : P.def, c = cur ? cur[i] : P.def, a = at ? at[i] : P.def;
+      if (c !== a) since++;
+      t[i] = b + (c - a);
+    }
+    if (!bt && !cur && !at) P.tiles.delete(k); else P.tiles.set(k, t);
+    P.dirty.add(k);
+    const [tx, tz] = tileXZ(k);
+    touchRect(P, tx * TILE, tz * TILE, tx * TILE + TILE - 1, tz * TILE + TILE - 1);
+  }
+  return since;
+}
+/** A deep copy of a before/undo map (key -> tile | null). */
+export function cloneTiles(m) {
+  const out = new Map();
+  for (const [k, t] of m) out.set(k, t ? copyTile(t) : null);
+  return out;
+}
+/** The current tiles named by `keys` (copies; null = absent), for snapshots. */
+export function snapTiles(P, keys) {
+  const out = new Map();
+  for (const k of keys) { const t = P.tiles.get(k); out.set(k, t ? copyTile(t) : null); }
+  return out;
 }
 /** One dab of the biome brush: every cell whose CENTRE is inside the disc
  *  (at least the cell under the cursor) becomes palette index `index`. */
