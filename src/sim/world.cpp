@@ -2342,8 +2342,8 @@ static Land landAt(int x, int z, uint32_t seed) {
     wh = (dh * 16384) / fade;
   }
   int ws = vsmooth(std::min(w, wh) << 1) >> 1;
-  int g1x = au.gx + ((std::clamp((o1.gx * cv.y) >> 8, -65536, 65536) * ws) >> 14);
-  int g1z = au.gz + ((std::clamp((o1.gz * cv.y) >> 8, -65536, 65536) * ws) >> 14);
+  int g1x = au.gx + std::clamp((o1.gx * cv.y) >> 8, -65536, 65536);
+  int g1z = au.gz + std::clamp((o1.gz * cv.y) >> 8, -65536, 65536);
   Oct o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
                   g1x, g1z, seed ^ 3u);
   int g2x = g1x + o2.gx;

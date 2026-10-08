@@ -115,8 +115,8 @@ Status GateWorldMapV2(Ctx& c, std::string& detail) {
   const int G = ylo + 180, rampX = ox + 160, rampW = 160;
   auto authored = [&](int i, int k) -> int {
     const double px = X0 + i * S, pz = Z0 + k * S;
-    if (i >= 20 && i < 40 && k >= 20 && k < 40) return 14000 - 300 * (std::abs(i - 30) + std::abs(k - 30));
-    if (i >= 60 && i < 70 && k >= 20 && k < 30) return -8000 + 100 * (std::abs(i - 65) + std::abs(k - 25));
+    if (i >= 60 && i < 80 && k >= 60 && k < 80) return 14000 - 300 * (std::abs(i - 70) + std::abs(k - 70));
+    if (i >= 100 && i < 110 && k >= 60 && k < 70) return -8000 + 100 * (std::abs(i - 105) + std::abs(k - 65));
     double t = std::clamp((px - rampX) / rampW, 0.0, 1.0);
     t = t * t * (3 - 2 * t);
     return static_cast<int>(std::lround(G + 220 * t + 24 * std::sin(pz / 300.0)));
@@ -226,7 +226,9 @@ Status GateWorldMapV2(Ctx& c, std::string& detail) {
   std::string bWhy;
   for (int k = 1; k < T - 2; k += 3)
     for (int i = 1; i < T - 2; i += 3) {
-      if (i < 14 && k < 14) continue;   // the forest corner: forest rolls ponds
+      // The forest corner (biome cells 0..9 = height posts 0..39, + the
+      // blend): forest rolls ponds, and a bowl is not the authored height.
+      if (i < 44 && k < 44) continue;
       const int x = X0 + i * S, z = Z0 + k * S;
       const int want = hs[size_t(k) * T + i];
       const int got = World::TerrainHeight(x, z, kDefaultSeed);

@@ -182,7 +182,8 @@ export const LIVE = {
     'terrain.treeline': R('WM_H_TERRAIN_TREELINE: snow and no trees at or above this ground Y'),
     'rules[]': R('seeded per-biome stamp placement'),
     'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
-    'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt')
+    'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt'),
+    'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane')
   }
 };
 

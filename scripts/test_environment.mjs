@@ -320,7 +320,7 @@ console.log('\n-- live manifest (envlive.js) --');
                    'planes.height': null, 'planes.biome': null};
   // P-G: the terrain block is walked leaf by leaf (every number is read).
   const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules)\[\]\./.test(p))
-      .concat(['sites[]', 'rules[]']);
+      .concat(['sites[]', 'rules[]', 'ridges[]']);
   check('map', [...new Set(mapPaths)]);
   // P-D landed: the biome's tile IS read (one lattice, thinned per biome to
   // density × (T/tile)²), and so is every per-row condition on tree and cover

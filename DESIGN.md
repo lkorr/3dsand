@@ -22912,8 +22912,8 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   multiplier), and refuses planes past 64 MiB dense / 4097 posts a side.
   `PackWorldMap` packs both planes DENSE (height two i16 a word, biome four
   ids a word) behind the extended header (`kHExtent*`, `kHHeight*`,
-  `kHBiome*`, `kHeaderWords` 72): `default` is 20.4 MiB (3137² posts), `peaks`
-  3.6 MiB. The content hash folds map.json, every tile in (plane, tz, tx)
+  `kHBiome*`, `kHeaderWords` 72): `default` is 20.2 MiB (3137² posts), `peaks`
+  3.3 MiB. The content hash folds map.json, every tile in (plane, tz, tx)
   order, the sculpt layer and the refs; `biomes::HashMapFiles` (the
   environment stamp, the save fingerprint) and `tuner_server.py _map_hash`
   hash the same files.
@@ -22928,9 +22928,11 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   constant landform gradient turned a gradient jump into a height step
   through the attenuation. The authored height is never scaled by a curve, a
   fade or the attenuation; the biome curve's domain is the range rung only
-  (±rangeAmplitude/2); the calm home/pad fade applies to the range rung only
-  (`homeArea.y` no longer reaches the ground — A1 replaces it); `octave`
-  clamps |g| to 32767. Outside the extent the authored height eases from the
+  (±rangeAmplitude/2); the calm home/pad fade applies to the range rung's
+  DEVIATION only (its gradient still feeds the fine rungs' attenuation
+  unfaded, as v1's coarse rungs did, so the harness pad's ground is v1's to
+  ±2 voxels; `homeArea.y` no longer reaches the ground — A1 replaces it);
+  `octave` clamps |g| to 32767. Outside the extent the authored height eases from the
   edge value to `planes.height.default` over `edgeFadeVox` (smoothstep in the
   Chebyshev distance; continuous, C1 everywhere but on the extent's edge).
   Biomes blend (`biomeMixAt`) on the 25.6 m biome cells. `landformOctave`,

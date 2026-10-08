@@ -776,10 +776,13 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
     wh = (dh * 16384) / fade;
   }
   let ws = vsmooth(min(w, wh) << 1) >> 1;           // Q14 smoothstep of the ramp
-  // The faded rung's gradient joins the authored one. Clamped before the
-  // ws product: o1.gx * cv.y <= 196600 * 4096 = 8e8, and 2^16 * 16384 = 2^30.
-  let g1x = au.gx + ((clamp((o1.gx * cv.y) >> 8, -65536, 65536) * ws) >> 14);
-  let g1z = au.gz + ((clamp((o1.gz * cv.y) >> 8, -65536, 65536) * ws) >> 14);
+  // The range rung's gradient joins the authored one UNFADED, as the coarse
+  // rungs' always did: the calm fade flattens the rung's deviation, not the
+  // attenuation the fine rungs see, so the home area and the harness pad
+  // keep the fine relief the fixtures were written against. Clamped:
+  // o1.gx * cv.y <= 196600 * 4096 = 8e8; the sum stays far inside i32.
+  let g1x = au.gx + clamp((o1.gx * cv.y) >> 8, -65536, 65536);
+  let g1z = au.gz + clamp((o1.gz * cv.y) >> 8, -65536, 65536);
   // The three fine rungs, each scaled by the biome's Q8 multiplier (256 = the
   // map's amplitude; a flatter meadow authors 128 on the hills).
   let o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
