@@ -1496,6 +1496,18 @@ const WM_SITE_ROT_ROLLED : u32 = 4u;    // a tree site's kS_Rot when the map did
 const WM_SITE_CLEARING   : u32 = 5u;    // a forest clearing (worldmap.h kSiteClearing)
 const WM_SITE_SOFTEN     : u32 = 6u;    // softened ground (worldmap.h kSiteSoften)
 const WM_SITE_PATH       : u32 = 7u;    // a waynode link's trunk keep-out (worldmap.h kSitePath)
+const WM_SITE_ROAD       : u32 = 8u;    // one piece of a map.json road (worldmap.h kSiteRoad, map v2 R1)
+const WM_S_ROAD_Y_A      : u32 = 9u;    // road piece: baked surface Y at end A, Q8 voxels
+const WM_S_ROAD_Y_B      : u32 = 10u;   // road piece: ... at end B (kS_BoxX1 / kS_BoxZ1)
+const WM_S_ROAD_MAT      : u32 = 11u;   // road piece: the SOLID surface material
+const WM_S_ROAD_DEPTH    : u32 = 12u;   // road piece: surface cells from the ground's top down
+// worldmap.h kSiteRoadShoulderMax: the fixed pond keep-out past a road's
+// half-width (sitePadNear), and kSiteRoadFarTint: how far past it a road
+// still tints a far cell its line crosses (roadTint).
+const WM_ROAD_SHOULDER_MAX : i32 = 64;
+const WM_ROAD_FAR_TINT     : i32 = 32;
+// The salt of a road's ragged edge (roadColAt): its own hash stream.
+const ROAD_EDGE_SALT : u32 = 0x40ADu;
 // No lattice crown within this many voxels of a stamp's rect (kStampTreeClear).
 const WM_STAMP_TREE_CLEAR : i32 = 10;
 // The salt of a clearing's feather-band thinning roll (clearingRefuses): its
@@ -1846,6 +1858,10 @@ fn siteFootprintHas(sid : u32, x : i32, z : i32) -> bool {
   }
   // Softened ground and a route keep nothing out either.
   if (kind == WM_SITE_SOFTEN || kind == WM_SITE_PATH) { return false; }
+  // A ROAD's carriageway, + 1 for its ragged edge (roadColAt): no cover row,
+  // tile plant, tarn centre or cactus on the road. Its shoulder is ordinary
+  // ground, as a stamp's ramp is.
+  if (kind == WM_SITE_ROAD) { return routeNear(sid, x, z, wmSiteI(sid, WM_S_RADIUS) + 1); }
   // A stamp: its FLAT core -- the template's rect + the apron. The ramp past
   // it is ordinary ground, so cover grows on it and the lawn has no edge.
   if (kind == WM_SITE_STAMP) { return stampRectDist(sid, x, z) <= wmSiteI(sid, WM_S_APRON); }
@@ -1869,6 +1885,16 @@ fn sitePadNear(x : i32, z : i32, r : i32) -> bool {
   let n = wmSiteN(lst);
   for (var k = 0u; k < n; k++) {
     let sid = wmSiteK(lst, k);
+    // A road reshapes its half-width and its shoulder; the keep-out is a
+    // FIXED reach past the half-width (the widest shoulder there can be), so
+    // the bare ground a road's profile is baked from does not depend on the
+    // shoulder the bake then widens (worldmap.h kSiteRoad).
+    if (wmSiteKind(sid) == WM_SITE_ROAD) {
+      let reach = wmSiteI(sid, WM_S_RADIUS) + WM_ROAD_SHOULDER_MAX + r;
+      let d2 = routeDist2(sid, x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) { return true; }
+      continue;
+    }
     if (wmSiteKind(sid) != WM_SITE_STAMP) { continue; }
     if (stampRectDist(sid, x, z) < wmSiteI(sid, WM_S_APRON) + wmSiteI(sid, WM_S_PAD_MARGIN) + r) { return true; }
   }
@@ -1976,6 +2002,65 @@ fn routeNear(sid : u32, x : i32, z : i32, keep : i32) -> bool {
   let d2 = routeDist2(sid, x, z, keep);
   return d2 >= 0 && d2 <= keep * keep;
 }
+// A ROAD PIECE at a column (worldmap.h kSiteRoad): x = the squared distance
+// to its centreline (routeDist2, -1 outside the box grown by `reach`), y =
+// the baked road surface at the column's projection onto it, Q8 voxels --
+// the two ends' baked Y lerped by the projection parameter. Bounds: the ends
+// are <= kSiteRoadPieceMax (256) apart a side, so l2 <= 131,072 and the
+// clamped t * 256 <= 3.4e7; |yb - ya| <= 256 voxels of grade at 100 %, so
+// (yb - ya) * tq <= 65,536 * 256 = 1.7e7. world.cpp roadProj is the twin.
+fn roadProj(sid : u32, x : i32, z : i32, reach : i32) -> vec2<i32> {
+  let d2 = routeDist2(sid, x, z, reach);
+  if (d2 < 0) { return vec2<i32>(-1, 0); }
+  let ax = wmSiteI(sid, WM_S_X);
+  let az = wmSiteI(sid, WM_S_Z);
+  let vx = wmSiteI(sid, WM_S_BOX_X1) - ax;
+  let vz = wmSiteI(sid, WM_S_BOX_Z1) - az;
+  let l2 = max(vx * vx + vz * vz, 1);
+  let t = clamp((x - ax) * vx + (z - az) * vz, 0, l2);
+  let tq = (t * 256) / l2;
+  let ya = wmSiteI(sid, WM_S_ROAD_Y_A);
+  let yb = wmSiteI(sid, WM_S_ROAD_Y_B);
+  return vec2<i32>(d2, ya + (((yb - ya) * tq) >> 8u));
+}
+// What the roads put at a column, once per column (genColumn): the surface
+// material and its depth where the column is ON a carriageway (a ragged
+// edge: the half-width +-1 by a counter hash of the column's 2x2 block, so
+// the edge wanders in short runs), and, for the far field's coverage test,
+// the nearest listed piece within its half-width + WM_ROAD_FAR_TINT --
+// its surface, squared distance and half-width (roadTint). The first listed
+// carriageway wins a column two roads share (table order, as the pads blend).
+struct RoadCol {
+  mat   : u32,   // the surface here, MAT_AIR off every carriageway
+  depth : i32,
+  tint  : u32,   // the nearest piece's surface, MAT_AIR when none is near
+  d2    : i32,   // its squared distance to the column
+  hw    : i32,   // its half-width
+};
+fn roadNone() -> RoadCol {
+  var r : RoadCol;
+  r.mat = MAT_AIR; r.depth = 0; r.tint = MAT_AIR; r.d2 = 0; r.hw = 0;
+  return r;
+}
+fn roadColAt(x : i32, z : i32, seed : u32) -> RoadCol {
+  var r = roadNone();
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_ROAD) { continue; }
+    let hw = wmSiteI(sid, WM_S_RADIUS);
+    let reach = hw + WM_ROAD_FAR_TINT;
+    let d2 = routeDist2(sid, x, z, reach);
+    if (d2 < 0 || d2 >= reach * reach) { continue; }
+    let m = u32(wmSiteI(sid, WM_S_ROAD_MAT));
+    if (r.tint == MAT_AIR || d2 < r.d2) { r.tint = m; r.d2 = d2; r.hw = hw; }
+    if (r.mat != MAT_AIR) { continue; }
+    let e = hw - 1 + i32(hash3(seed ^ ROAD_EDGE_SALT, bitcast<u32>(x >> 1u), bitcast<u32>(z >> 1u)) % 3u);
+    if (d2 <= e * e) { r.mat = m; r.depth = wmSiteI(sid, WM_S_ROAD_DEPTH); }
+  }
+  return r;
+}
 // The keep-out tarns, cacti, tile plants and cover avoid: the pad box and
 // every listed site's footprint.
 fn siteKeepOut(x : i32, z : i32) -> bool {
@@ -2038,6 +2123,12 @@ fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32, seed : u32) -> bool {
     } else if (wmSiteKind(sid) == WM_SITE_PATH) {
       // A villager's route: no trunk within the keep-out of its line.
       if (routeNear(sid, wx, wz, wmSiteI(sid, WM_S_PAD_MARGIN))) { return true; }
+    } else if (wmSiteKind(sid) == WM_SITE_ROAD) {
+      // A road: no trunk on the shoulder (the tree stands on landAt's ground,
+      // which roadPadAt reshapes there) and no crown over the carriageway --
+      // the half-width + the larger of the two, like a stamp's pad + clear.
+      let keep = wmSiteI(sid, WM_S_RADIUS) + max(reach, wmSiteI(sid, WM_S_PAD_MARGIN));
+      if (routeNear(sid, wx, wz, keep)) { return true; }
     } else if (siteFootprintHas(sid, wx, wz)) { return true; }
   }
   return false;
@@ -3493,6 +3584,10 @@ struct Col {
   // 3-6 cells per streamed chunk slid on the birth wake and woke the chunk
   // and its ring. genColumn sets `h` (no restriction); `cols` tightens it.
   sedTop      : i32,
+  // The roads at this column (map v2 R1, roadColAt): the surface genCellIn
+  // lays on a carriageway, and the nearest piece farSurfaceMat's coverage
+  // test tints a coarse far cell with.
+  road        : RoadCol,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -3764,16 +3859,51 @@ fn sitePadAt(x : i32, z : i32, h : i32) -> i32 {
   return hh;
 }
 
-// The height contract's public face: the bare column with the site pad
-// blended into it. Everything else in this file and World::TerrainHeight go
-// through here.
+// THE ROAD under a column (map v2 R1, worldmap.h kSiteRoad): over a piece's
+// half-width the ground IS the road -- its baked surface lerped along the
+// piece (roadProj) -- and across the shoulder it eases back to the ground by
+// a smoothstep in the squared distance (the same shape as softenAt's routes:
+// flat where it meets the road and where it meets the hillside). Every piece
+// reaching the column blends in turn, in table order, as the pads do, so two
+// pieces meeting at a vertex (the same baked Y there) stay continuous.
+// Before sitePadAt: a house's pad levels its own floor over a road that runs
+// to its door. Spelled identically in world.cpp; roadProj lives outside the
+// mirror on both sides. Bounds: d2 and the shoulder's o2 are < 2 * (256 +
+// 2 * 64 + 100)^2 < 5e5, * 256 < 1.3e8; (y - hh) is a few thousand voxels,
+// * 256 well inside i32.
+fn roadPadAt(x : i32, z : i32, h : i32) -> i32 {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  var hh = h;
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_ROAD) { continue; }
+    let hw = wmSiteI(sid, WM_S_RADIUS);
+    let o = hw + wmSiteI(sid, WM_S_PAD_MARGIN);
+    let p = roadProj(sid, x, z, o);
+    if (p.x < 0 || p.x > o * o) { continue; }
+    var w = 256;
+    if (p.x > hw * hw) {
+      let t = ((o * o - p.x) * 256) / (o * o - hw * hw);
+      w = (t * t * (768 - 2 * t)) >> 16u;
+    }
+    let y = (p.y + 128) >> 8u;
+    hh = hh + (((y - hh) * w + 128) >> 8u);
+  }
+  return hh;
+}
+
+// The height contract's public face: the bare column with the roads and the
+// site pads blended into it. Everything else in this file and
+// World::TerrainHeight go through here.
 fn landColumn(x : i32, z : i32, seed : u32,
               L : ptr<function, LandCol>) {
   landColumnBare(x, z, seed, L);
-  let hp = sitePadAt(x, z, (*L).h);
+  let hp = sitePadAt(x, z, roadPadAt(x, z, (*L).h));
   if (hp != (*L).h) {
-    // Cut-and-fill under a building: the loose wedge goes with it, for the
-    // reason the pond-bank block gives (powder under a stone floor creeps).
+    // Cut-and-fill under a building or a road: the loose wedge goes with it,
+    // for the reason the pond-bank block gives (powder under a stone floor
+    // creeps).
     (*L).h = hp;
     (*L).sed = 0;
   }
@@ -3829,6 +3959,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
     lab.plant.top = -1;
     lab.looseTop = LAB_SLAB_Y;
     lab.sedTop = LAB_SLAB_Y;
+    lab.road = roadNone();
     *ponds = pondSetNone();
     return lab;
   }
@@ -3898,6 +4029,7 @@ fn genColumn(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Co
   col.plant = plantColumnAt(x, z, seed, biome);
   col.looseTop = h;
   col.sedTop = h;
+  col.road = roadColAt(x, z, seed);
   *ponds = L.ponds;
   return col;
 }
@@ -4485,7 +4617,13 @@ fn genCellIn(col : ptr<function, Col>,
     // into whatever the pool holds, and against a hot fluid `snow -> water ->
     // steam -> water` sustains itself forever (a rule-2 failure that reports
     // itself as `ca-skip` never finding a quiet tick).
-    if (!inRim && h >= treeline() && y > h - 2) {
+    if ((*col).road.mat != MAT_AIR && !submerged && !inRim && y > h - (*col).road.depth) {
+      // A ROAD's surface (map v2 R1, roadColAt): the top `depth` cells of a
+      // carriageway, above the snow line too. Always a SOLID (the loader
+      // refuses a powder surface): a graded road is a slope, and a powder on
+      // one avalanches out from under itself (rule 2).
+      mat = (*col).road.mat;
+    } else if (!inRim && h >= treeline() && y > h - 2) {
       mat = M_SNOW;                        // snow caps on the high hills
       // ...but never above the cap's step line (`cols`, snowCapCol): a snow
       // cell a neighbour column leaves a free diagonal is the firm cover.
@@ -4997,13 +5135,33 @@ fn farSurfaceMat(col : ptr<function, Col>, ponds : ptr<function, PondSet>,
     if (!skinOk || matFarPal(&materials, ground) != matFarPal(&materials, skin)) {
       return ground;
     }
-    return skin;
+    return roadTint(col, skin, shift);
   }
   if (ground == FAR_GROUND_SAMPLE &&
       matFarPal(&materials, mat) != matFarPal(&materials, pristine)) {
     return mat;
   }
   if (!skinOk) { return mat; }
+  return roadTint(col, skin, shift);
+}
+// A ROAD NARROWER THAN THE CELL still colours it (map v2 R1). The centre
+// column decides the skin, so a 1.2 m path through a 1.6 m cell is drawn only
+// where a centre happens to land on it -- a dotted line, or nothing. Where the
+// cell is wider than the road (2 * hw < cell) but the road still covers a
+// quarter of it (8 * hw >= cell), a cell whose centre is within half a cell
+// (at most WM_ROAD_FAR_TINT) of the road's EDGE takes the road's surface:
+// one cell wide, continuous, at every level the road is worth drawing at.
+// Coarser than that the road is under a quarter of the cell and the ground
+// keeps it. No site walk: genColumn's roadColAt already found the nearest
+// piece (Col.road). Untouched ground only -- the callers above apply it where
+// they would return the procgen skin.
+fn roadTint(col : ptr<function, Col>, skin : u32, shift : u32) -> u32 {
+  let r = (*col).road;
+  if (r.tint == MAT_AIR) { return skin; }
+  let cell = 1 << shift;
+  if (2 * r.hw >= cell || 8 * r.hw < cell) { return skin; }
+  let reach = r.hw + min(cell / 2, WM_ROAD_FAR_TINT);
+  if (r.d2 < reach * reach) { return r.tint; }
   return skin;
 }
 

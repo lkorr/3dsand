@@ -1809,6 +1809,12 @@ static int sitePadWeight(uint32_t sid, int x, int z) {
 }
 // worldgen.wgsl sitePadNear: is any stamp's whole pad within r?
 static bool sitePadNear(int x, int z, int r);
+// worldgen.wgsl routeDist2 / routeNear: a route's or a road piece's segment.
+static int routeDist2(const worldmap::WorldMapData::StampSite& st, int x, int z, int reach);
+static bool routeNear(const worldmap::WorldMapData::StampSite& st, int x, int z, int keep) {
+  const int d2 = routeDist2(st, x, z, keep);
+  return d2 >= 0 && d2 <= keep * keep;
+}
 // worldgen.wgsl softenAt: the Q8 scales of the three local octaves.
 struct Soften {
   int hill;
@@ -1825,6 +1831,8 @@ static bool siteFootprintHas(uint32_t sid, int x, int z) {
   // A clearing keeps crowns off and nothing else: no footprint. Nor does
   // softened ground or a route.
   if (kind == worldmap::kSiteClearing || kind == worldmap::kSiteSoften || kind == worldmap::kSitePath) return false;
+  // A road's carriageway, + 1 for its ragged edge (map v2 R1).
+  if (kind == worldmap::kSiteRoad) return routeNear(wmSite(sid), x, z, wmSite(sid).radius + 1);
   const int dx = x - wmSiteI(sid, WM_S_X);
   const int dz = z - wmSiteI(sid, WM_S_Z);
   if (kind == WM_SITE_WATER) {
@@ -1868,6 +1876,13 @@ static bool sitePadNear(int x, int z, int r) {
   const uint32_t n = wmSiteN(lst);
   for (uint32_t k = 0u; k < n; k++) {
     const uint32_t sid = wmSiteK(lst, k);
+    // A road: a FIXED reach past its half-width (worldgen.wgsl says why).
+    if ((uint32_t)wmSite(sid).kind == worldmap::kSiteRoad) {
+      const int reach = wmSite(sid).radius + (int)worldmap::kSiteRoadShoulderMax + r;
+      const int d2 = routeDist2(wmSite(sid), x, z, reach);
+      if (d2 >= 0 && d2 < reach * reach) return true;
+      continue;
+    }
     if ((uint32_t)wmSite(sid).kind != WM_SITE_STAMP) continue;
     if (stampRectDist(sid, x, z) < wmSite(sid).apron + wmSite(sid).padMargin + r) return true;
   }
@@ -1887,6 +1902,23 @@ static int routeDist2(const worldmap::WorldMapData::StampSite& st, int x, int z,
   else if (l2 > 0 && t > 0) { cx = ax + (vx * t) / l2; cz = az + (vz * t) / l2; }
   const int dx = x - cx, dz = z - cz;
   return dx * dx + dz * dz;
+}
+// worldgen.wgsl roadProj: x = squared distance to a road piece's line (-1
+// outside its box grown by `reach`), y = the baked surface at the column's
+// projection, Q8 voxels. Same bounds as the shader's comment.
+struct RoadP {
+  int d2;
+  int y;
+};
+static RoadP roadProj(uint32_t sid, int x, int z, int reach) {
+  const worldmap::WorldMapData::StampSite& st = wmSite(sid);
+  const int d2 = routeDist2(st, x, z, reach);
+  if (d2 < 0) return RoadP{-1, 0};
+  const int vx = st.x1 - st.x, vz = st.z1 - st.z;
+  const int l2 = std::max(vx * vx + vz * vz, 1);
+  const int t = std::clamp((x - st.x) * vx + (z - st.z) * vz, 0, l2);
+  const int tq = (t * 256) / l2;
+  return RoadP{d2, st.roadYA + (((st.roadYB - st.roadYA) * tq) >> 8u)};
 }
 static Soften softenAt(int x, int z) {
   Soften s{256, 256, 256};
@@ -2773,6 +2805,28 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   return b;
 }
 
+static int roadPadAt(int x, int z, int h) {
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  int hh = h;
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    if ((uint32_t)wmSite(sid).kind != worldmap::kSiteRoad) { continue; }
+    const int hw = wmSite(sid).radius;
+    const int o = hw + wmSite(sid).padMargin;
+    const RoadP p = roadProj(sid, x, z, o);
+    if (p.d2 < 0 || p.d2 > o * o) { continue; }
+    int w = 256;
+    if (p.d2 > hw * hw) {
+      const int t = ((o * o - p.d2) * 256) / (o * o - hw * hw);
+      w = (t * t * (768 - 2 * t)) >> 16u;
+    }
+    const int y = (p.y + 128) >> 8u;
+    hh = hh + (((y - hh) * w + 128) >> 8u);
+  }
+  return hh;
+}
+
 static int sitePadAt(int x, int z, int h) {
   const uint32_t* lst = wmSiteList(x, z);
   const uint32_t n = wmSiteN(lst);
@@ -2792,7 +2846,7 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
   const int h = landColumnBare(x, z, seed).h;
-  return sitePadAt(x, z, h);
+  return sitePadAt(x, z, roadPadAt(x, z, h));
 }
 // MIRROR-END landheight
 

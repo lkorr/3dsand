@@ -298,6 +298,11 @@ const char* const kOrder[] = {
     // window moved to forest near the spawn and put back; the pristine world
     // is regenerated and the far field refilled on the way out.
     "clearing",
+    // Then: map v2 roads (docs/PLAN_map_v2.md R1). The `sculpt` seam (a
+    // synthetic map in a TEMP asset dir, uploaded, regenerated, read back),
+    // then TICKS it to sleep, then the same exit: the real environment
+    // reloaded, the world regenerated, the far cascades refilled.
+    "roads",
     // Then: a house in the forest with no clearing -- the per-tree building
     // rule, the soft pad and the `soften` site kind. Same seam and exit as
     // `clearing` (plus the structure override, cleared on the way out).

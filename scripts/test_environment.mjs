@@ -316,11 +316,11 @@ console.log('\n-- live manifest (envlive.js) --');
   check('water', leaves(wp, '', {'shore.plants': wp.shore.plants[0], 'bathymetry.profile': null}));
   const mapJson = readJson(join(ROOT, 'assets', 'worldmap', 'default', 'map.json'));
   // Map v2: the extent's pairs and each plane's declaration are one field each.
-  const mapRows = {sites: {}, rules: {}, biomes: null, 'extent.min': null, 'extent.size': null,
+  const mapRows = {sites: {}, rules: {}, roads: {}, biomes: null, 'extent.min': null, 'extent.size': null,
                    'planes.height': null, 'planes.biome': null};
   // P-G: the terrain block is walked leaf by leaf (every number is read).
-  const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules)\[\]\./.test(p))
-      .concat(['sites[]', 'rules[]', 'ridges[]']);
+  const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules|roads)\[\]\./.test(p))
+      .concat(['sites[]', 'rules[]', 'ridges[]', 'roads[]']);
   check('map', [...new Set(mapPaths)]);
   // P-D landed: the biome's tile IS read (one lattice, thinned per biome to
   // density × (T/tile)²), and so is every per-row condition on tree and cover
