@@ -397,12 +397,17 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   if (!def.chaseClip.empty()) {
     const int ci = sk.FindClip(def.chaseClip);
     if (ci >= 0) {
-      const bool want = in.chaseWant && !clipOwnsPose;
-      // Seconds to reach the pose, and to give it up. Fast enough that the
-      // arms are already down by the time a punch's own clip has blended in
-      // (0.09 s on the library strokes) without the snap a hard switch gives.
-      constexpr float kChasePoseRampS = 0.18f;
-      const float step = dt / kChasePoseRampS;
+      // An OVERRIDE chase clip is a stance on its own mask (MobDef::chaseClip)
+      // and is held under a clip-owned state too: the snake's rear-up rides
+      // on its always-on slither.
+      const bool want =
+          in.chaseWant &&
+          (!clipOwnsPose || sk.clips[ci].mode == ClipMode::Override);
+      // Seconds to reach the pose, and to give it up (MobDef::chaseRampS,
+      // 0.18 by default): fast enough that the arms are already down by the
+      // time a punch's own clip has blended in (0.09 s on the library
+      // strokes) without the snap a hard switch gives.
+      const float step = dt / std::max(def.chaseRampS, 1e-3f);
       chasePose_ = want ? std::min(1.0f, chasePose_ + step)
                         : std::max(0.0f, chasePose_ - step);
       if (chasePose_ > 0.0f) {
@@ -667,6 +672,16 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     pose_.stanceCrouch *= std::pow(0.5f, dt / 0.12f);
     float targetY = origin_.y;
     SettleClipOwnedBody(world, loco, dt, targetY);
+    // A prone leap is drawn off the ground (AnimStateRule::airLift): the
+    // placement above is the ground's, the rise is the origin's.
+    if (loco != nullptr && loco->airLift && loco->groundAlign > 0.0f) {
+      if (in.grounded || !pose_.airBaseSet) {
+        pose_.airBaseY = origin_.y;
+        pose_.airBaseSet = true;
+      } else {
+        targetY += std::max(0.0f, origin_.y - pose_.airBaseY);
+      }
+    }
     if (driverHeight)
       bodyY_ += std::clamp(targetY - bodyY_, -0.4f, 0.4f);
     else

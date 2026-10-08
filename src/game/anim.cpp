@@ -317,6 +317,9 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   accW.assign(n, 0.0f);
   static thread_local std::vector<uint8_t> touched;
   touched.assign(n, 0);
+  // Parts keyed by a `restFill` clip (AnimClip::restFill).
+  static thread_local std::vector<uint8_t> fillRest;
+  fillRest.assign(n, 0);
 
   struct Additive { int part; Quat dq; float w; };
   static thread_local std::vector<Additive> additives;
@@ -416,7 +419,24 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
       if (gotPos) accPos[p] += sampled.pos * w;
       accW[p] += w;
       touched[p] = 1;
+      if (c.restFill) fillRest[p] = 1;
     }
+  }
+
+  // ---- stage 1.5: the rest pose takes what the overrides left -----------
+  // On a part a `restFill` clip keys, and only up to a total weight of 1: a
+  // stance ramping in alone rises out of rest, and once other overrides make
+  // up the whole there is nothing left for rest (it adds weight, no offset).
+  for (size_t i = 0; i < n; i++) {
+    if (!fillRest[i] || accW[i] >= 1.0f) continue;
+    const float rw = 1.0f - accW[i];
+    Quat r = sk.parts[i].rest.rot;
+    if (accW[i] > 0 && QuatDot(acc[i], r) < 0) r = {-r.x, -r.y, -r.z, -r.w};
+    acc[i].x += r.x * rw;
+    acc[i].y += r.y * rw;
+    acc[i].z += r.z * rw;
+    acc[i].w += r.w * rw;
+    accW[i] = 1.0f;
   }
 
   // ---- stage 2: normalize ----

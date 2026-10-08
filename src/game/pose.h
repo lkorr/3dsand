@@ -180,6 +180,11 @@ struct PoseDrive {
   float slitherHeading = 0.0f;
   float slitherKappa = 0.0f;
   bool slitherInit = false;
+  // ---- the prone leap (AnimStateRule::airLift) ----------------------------
+  // The origin height the body last stood at; while airborne the drawn body
+  // is lifted by how far the origin has risen above it.
+  float airBaseY = 0.0f;
+  bool airBaseSet = false;
   // Has the drawn height ever been set by the pipeline? The feet-derived
   // height snaps to its target the first time and eases ever after.
   bool bodyPlaced = false;

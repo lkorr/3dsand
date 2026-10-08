@@ -312,6 +312,7 @@ static void ParseClipJson(const AnimSkeleton& sk, const std::string& where,
                   : ClipMode::Override;
   clip.blendInMs = c.value("blendInMs", 0);
   clip.blendOutMs = c.value("blendOutMs", 0);
+  clip.restFill = c.value("restFill", false);   // AnimClip::restFill
   if (c.contains("mask") && c["mask"].is_array()) {
     clip.mask.assign(sk.parts.size(), 0);
     for (const auto& nm : c["mask"]) {
@@ -1166,6 +1167,10 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   // clips below (MobDef::chaseClip). Absent = the creature chases in
   // whatever pose it walks in, which is every def but the undead.
   def.chaseClip = j.value("chaseClip", std::string());
+  def.chaseRampS =
+      std::max(1.0f, j.value("chaseRampMs", def.chaseRampS * 1000.0f)) /
+      1000.0f;
+  def.chaseRange = std::max(0.0f, j.value("chaseRange", 0.0f)) * worldLen;
 
   // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
   // is skipped rather than failing the def — a mob with a typo'd sound name
@@ -2035,6 +2040,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
       rule.groundAlign =
           std::clamp(s.value("groundAlign", 0.0f), 0.0f, 1.0f);
+      rule.airLift = s.value("airLift", false);   // AnimStateRule::airLift
       // A prone state that still lets the gait run would have the foot plane
       // and the ground plane both claiming the body height. Say so rather
       // than letting whichever ran last win.
@@ -6313,9 +6319,12 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
     // over the victim's feet (PickTargetLimb's `reachHeight`): a snake 1.6
     // voxels high goes for a foot or an ankle. A crawling humanoid keeps its
     // rig's full box height and so its whole `targetProne` table.
+    // ...unless the STYLE says how high it rises (AttackStyle::reachHeight):
+    // the same snake reared up and leaping goes for the hands.
     const float prone = mob.LocoGroundAlign();
     const float reachH =
-        prone > 0.0f && mob.def_ != nullptr
+        sty.reachHeight > 0.0f ? sty.reachHeight
+        : prone > 0.0f && mob.def_ != nullptr
             ? mob.def_->worldSize.y + 1.0f
             : 0.0f;
     st.targetLimb =
@@ -7670,11 +7679,52 @@ MobSystem::Capsule MobSystem::BodyCapsule(const MobDef& def) {
   return c;
 }
 
+MobSystem::Capsule MobSystem::BodyCapsuleOf(const Mob& mob,
+                                            const MobDef& def) const {
+  Capsule c = BodyCapsule(def);
+  if (!c.alongFacing || c.halfLen <= 0.0f || mob.chasePose_ <= 0.0f ||
+      !mob.stroke_.Active())
+    return c;
+  if (const AttackStyle* sty = styles_.At(mob.stroke_.style);
+      sty == nullptr || !sty->fromStance)
+    return c;
+  // Where the posed body ends, forward, in the model frame the rest box is
+  // laid in (+Z forward, 0..worldSize.z): every live part's joint and far
+  // end, as SettleClipOwnedBody measures the prone span.
+  float front = 0.0f;
+  bool any = false;
+  const size_t np = std::min(mob.limbs_.size(), mob.anim_.model.size());
+  for (size_t i = 0; i < np; i++) {
+    const MobLimb& limb = mob.limbs_[i];
+    if (!limb.body || limb.wornHost >= 0) continue;
+    if (i < mob.anim_.partAlive.size() && !mob.anim_.partAlive[i]) continue;
+    const float inv = 1.0f / (float)mob.PhysScaleOf(limb);
+    const Vec3 mid{(float)limb.size.x * inv * 0.5f,
+                   (float)limb.size.y * inv * 0.5f,
+                   (float)limb.size.z * inv * 0.5f};
+    const Vec3 j = mob.anim_.model[i].pos;
+    const Vec3 t =
+        j + Rotate(mob.anim_.model[i].rot, mid - limb.anchorLimb) * 2.0f;
+    front = any ? std::max(front, std::max(j.z, t.z)) : std::max(j.z, t.z);
+    any = true;
+  }
+  if (!any) return c;
+  const float trim =
+      std::clamp(def.worldSize.z - front, 0.0f, 2.0f * c.halfLen);
+  c.halfLen -= 0.5f * trim;
+  c.shift = -0.5f * trim;
+  return c;
+}
+
 void MobSystem::CapsuleSegment(const Capsule& c, float cx, float cz,
                                float heading, Vec3& a, Vec3& b) {
   const Vec3 axis = c.alongFacing
                         ? Vec3{std::sin(heading), 0, std::cos(heading)}
                         : Vec3{std::cos(heading), 0, -std::sin(heading)};
+  // Capsule::shift moves the segment along the facing (only ever set on a
+  // capsule laid along it).
+  cx += std::sin(heading) * c.shift;
+  cz += std::cos(heading) * c.shift;
   a = Vec3{cx - axis.x * c.halfLen, 0, cz - axis.z * c.halfLen};
   b = Vec3{cx + axis.x * c.halfLen, 0, cz + axis.z * c.halfLen};
 }
@@ -7739,7 +7789,7 @@ Vec3 MobSystem::BodyCentre(const Mob& mob, const MobDef& def) {
 Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
   const LocomotionDef& lo = self.skel_.loco;
   if (lo.spacingMul <= 0.0f) return Vec3{};
-  const Capsule capSelf = BodyCapsule(selfDef);
+  const Capsule capSelf = BodyCapsuleOf(self, selfDef);
   const float rSelf = capSelf.radius;
   const Vec3 cSelf = BodyCentre(self, selfDef);
   Vec3 push{};
@@ -7761,7 +7811,7 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
     // and the walk drive steps over prone things rather than round them.
     if (other.ragdoll_ != Mob::RagdollPhase::None) return;
     const MobDef& od = *other.def_;
-    const Capsule capOther = BodyCapsule(od);
+    const Capsule capOther = BodyCapsuleOf(other, od);
     const float want = (rSelf + capOther.radius) * lo.spacingMul;
     if (want <= 0.0f) return;
     const Vec3 cOther = BodyCentre(other, od);
@@ -7773,7 +7823,8 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
     // crowd at a compare per pair. The height test is a pure reject as well.
     {
       const float ex = cSelf.x - cOther.x, ez = cSelf.z - cOther.z;
-      const float slack = want + capSelf.halfLen + capOther.halfLen;
+      const float slack = want + capSelf.halfLen + std::fabs(capSelf.shift) +
+                          capOther.halfLen + std::fabs(capOther.shift);
       if (ex * ex + ez * ez >= slack * slack) return;
     }
     // Between the two CAPSULES (BodyCapsule): the centres for two upright
@@ -7855,7 +7906,7 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
                              float cz) const {
   const LocomotionDef& lo = self.skel_.loco;
   if (lo.spacingMul <= 0.0f) return false;
-  const Capsule capSelf = BodyCapsule(def);
+  const Capsule capSelf = BodyCapsuleOf(self, def);
   const float rSelf = capSelf.radius;
   const Vec3 cNow = BodyCentre(self, def);
   // Every creature (CrowdPush's note): a player's body is a body.
@@ -7866,13 +7917,21 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
     if (other.ragdoll_ != Mob::RagdollPhase::None) return false;
     const MobDef& od = *other.def_;
     const Vec3 cOther = BodyCentre(other, od);
-    if (std::abs(cNow.y - cOther.y) > def.worldSize.y * 0.5f) return false;
+    // The LOWER HALVES OF BOTH BODIES must overlap in height (2026-10-07).
+    // It was `|dy| > half the MOVER's height`, so a snake 1.6 voxels high
+    // stopped counting a standing man as in its way the moment its leap
+    // lifted it a voxel, and flew through him. For two bodies of one height
+    // this is exactly that test; for unequal ones it is the same question
+    // asked of each body's own half.
+    if (cNow.y > cOther.y + od.worldSize.y * 0.5f ||
+        cOther.y > cNow.y + def.worldSize.y * 0.5f)
+      return false;
     // THE HARD FLOOR IS THE BODIES TOUCHING, not the spacing radius. Spacing is
     // a preference the push expresses; this is the geometry. Blocking at the
     // full spacing radius would fence creatures apart at arm's length and stop
     // a duelist ever reaching its target. Between CAPSULES (BodyCapsule), so a
     // long body is touched along its length, not inside a disc round it.
-    const Capsule capOther = BodyCapsule(od);
+    const Capsule capOther = BodyCapsuleOf(other, od);
     const float minSep = rSelf + capOther.radius;
     const Vec3 ng = CapsuleGap(capSelf, cx, cz, self.heading_, capOther,
                                cOther.x, cOther.z, other.heading_);
@@ -8130,10 +8189,19 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   in.tiltFromGround = true;
   // The chase pose: engaged with something and not mid-strike (the clip is
   // ADDITIVE — see the note in Mob::PosePipeline).
-  const bool striking =
+  // A style thrown FROM the stance (AttackStyle::fromStance) keeps it held:
+  // its own clip is additive on top of it.
+  bool striking =
       mob.stroke_.Active() && mob.stroke_.phase != NpcStroke::Phase::Guard;
-  in.chaseWant = mob.ai_.hasTarget && !striking &&
-                 mob.ai_.intent != ai::Intent::Idle;
+  if (striking) {
+    const AttackStyle* sty = styles_.At(mob.stroke_.style);
+    if (sty != nullptr && sty->fromStance) striking = false;
+  }
+  in.chaseWant = !striking &&
+                 (mob.stanceHold_ ||
+                  (mob.ai_.hasTarget && mob.ai_.intent != ai::Intent::Idle &&
+                   (def.chaseRange <= 0.0f ||
+                    mob.ai_.targetDist <= def.chaseRange)));
   mob.PosePipeline(in, dt, world, tick);
 }
 

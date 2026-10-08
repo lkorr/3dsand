@@ -92,6 +92,14 @@ struct AnimClip {
   // turns through about its own X (pose.cpp, after the head look).
   std::vector<float> quietAdditive;
   std::vector<float> pitchFollow;
+  // OVERRIDE clips only: on every part this clip keys, the REST POSE fills
+  // whatever weight the overrides there leave below 1 (sidecar `restFill`;
+  // anim.cpp stage 1.5). Without it an override
+  // blend is normalised by its own weight, so one clip at 0.1 renders its
+  // whole pose -- fine for a clip that owns the body outright, and a snap for
+  // one ramped in by weight (MobDef::chaseClip: a snake rearing up over half
+  // a second has to pass through the poses in between).
+  bool restFill = false;
 };
 
 // Holden's closed-form spring (unconditionally stable at any dt). One per
@@ -294,6 +302,14 @@ struct AnimStateRule {
   // grade (a soldier dragging itself keeps a little of its own vertical) and
   // because the caller blends it over a state change for free.
   float groundAlign = 0.0f;
+  // A PRONE BODY IN THE AIR IS DRAWN IN THE AIR (sidecar `airLift`; the
+  // snake's leap). The placement above lays the body on the fitted ground
+  // whatever its origin is doing, so a lunge's rise moved the collider origin
+  // and left the drawn body -- and the jaws on it -- lying on the ground. With
+  // this set the drawn height also takes how far the origin has risen above
+  // where it left the ground (pose.cpp, the clip-owned settle). Off by
+  // default: a crawler's low pounce keeps the placement it was tuned under.
+  bool airLift = false;
 };
 
 enum class IkSolver : uint8_t { TwoBone };
