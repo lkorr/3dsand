@@ -660,6 +660,14 @@ struct AttackStyle {
   // body from the stance rather than from rest. The snake's rear strike:
   // reared up, it draws back and lunges without first lying down.
   bool fromStance = false;
+  // THE FANGS CLOSE ON WHATEVER THEY MEET (style key `biteAnywhere`). By
+  // default a stroke's one bite is HELD for the limb it drew until the last
+  // cut tick (melee.h EdgeSweep::biteHoldout) -- right for a zombie's mouth
+  // passing a chest on its way to an arm. A snake's ground strike draws a
+  // foot, meets the shin first, and has recoiled by the last tick: measured,
+  // three strikes in a row touched the man and none of them bit. With this
+  // set the bite lands on first contact; the draw still decides the aim.
+  bool biteAnywhere = false;
   // AN AUTHORED BODY ANIMATION TO PLAY WITH THE STROKE, by name (empty = none).
   // The stroke program drives the WEAPON ARM through the melee driver; this is
   // everything else — the step, the shoulder drop, the off hand — keyframed in

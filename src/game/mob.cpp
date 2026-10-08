@@ -4846,6 +4846,12 @@ bool Mob::CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const {
           PowderMassOfState((w >> 12) & 0xFu) >= kPowderMobSupportMin);
 }
 
+// The grade a LYING body may lie along (rise per voxel of its length): about
+// 33 degrees. A legless body's footing is its whole length, so a column `v`
+// along it may stand `kLieGrade * |v|` higher than a step before it is a wall
+// (Mob::FootprintFooting, and the steering fan in MobSystem::SenseGround).
+static constexpr float kLieGrade = 0.65f;
+
 Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
                                    float cz, float fromY) const {
   Footing out;
@@ -4907,8 +4913,23 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
   // top of that as the floor. Measured: a duelist rode an eight-voxel wall like
   // an escalator and crossed a fixture built to make it walk around.
   const float standCeil = fromY + (float)stepUpCells_ + 0.01f;
+  // ---- A LEGLESS BODY LIES ALONG THE GRADE (MobDef::slither, 2026-10-08) --
+  // Its footing is not two feet under its middle: it is the whole length,
+  // lying on the ground. Judged like feet, every column more than a step
+  // above the middle was a wall, so the nose of an 18-voxel snake at the
+  // foot of a 1-in-2 staircase -- four steps up -- refused every move and
+  // it lay at the bottom stair forever (gate `snake`, the staircase). So a
+  // column `v` along the body may stand `kLieGrade * |v|` higher than a step
+  // (a grade the body can lie on, about 33 degrees: the owner's "3 by 5"
+  // ramp is 31), the body's own height is taken over its MIDDLE third only
+  // (the far columns are where the slope is, not where it stands), and the
+  // headroom is asked over each column's own ground. A real wall is still a
+  // wall: it rises faster than the grade within a few voxels of the nose.
+  const bool lies = longBody && def.slither.present;
+  int colY[7][7];
+  bool colOk[7][7] = {};
 
-  int best = INT32_MIN;
+  int best = INT32_MIN, bestMid = INT32_MIN;
   int centreY = INT32_MIN;
   for (int iz = -kz; iz <= kz; iz++) {
     for (int ix = -kx; ix <= kx; ix++) {
@@ -4930,15 +4951,20 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
       }
       out.known = true;
       if (ix == 0 && iz == 0) centreY = y;
-      if ((float)y > standCeil) {
+      const float along = hz * std::fabs((float)iz) / (float)kz;
+      if ((float)y > standCeil + (lies ? kLieGrade * along : 0.0f)) {
         out.wall = true;
         out.wallColumns++;
         out.wallMask |= 1ull << ((iz + kz) * 7 + (ix + kx));
         continue;
       }
+      colY[iz + kz][ix + kx] = y;
+      colOk[iz + kz][ix + kx] = true;
       if (y > best) best = y;
+      if (3 * std::abs(iz) <= kz && y > bestMid) bestMid = y;
     }
   }
+  if (lies && bestMid != INT32_MIN) best = bestMid;
   if (!out.known) return out;
   // Every column a wall — the body is pressed into something on all sides, or
   // buried. Fall back to its own centre column so the caller still has a floor
@@ -4958,8 +4984,12 @@ Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
     for (int ix = -kx; ix <= kx && out.fits; ix++) {
       int wx = 0, wz = 0;
       column(ix, iz, wx, wz);
+      // A lying body's headroom is over the column's OWN ground (see above);
+      // a wall column has none to measure and is already refused.
+      if (lies && !colOk[iz + kz][ix + kx]) continue;
+      const int floorY = lies ? colY[iz + kz][ix + kx] : out.groundY;
       for (int k = 0; k < headroomCells_; k++) {
-        if (!CellSupportsWeight(world, IVec3{wx, out.groundY + k, wz})) continue;
+        if (!CellSupportsWeight(world, IVec3{wx, floorY + k, wz})) continue;
         out.fits = false;
         break;
       }
@@ -5443,6 +5473,8 @@ static constexpr float kProneConformBaselineVox = 5.0f;
 // in the same binary (`crawl-slope` reports the crest hang under both).
 static const bool kProneRigid = std::getenv("SANDVOX_PRONE_RIGID") != nullptr;
 
+static const bool kDrapeDebug = std::getenv("SANDVOX_DRAPE_DEBUG") != nullptr;
+
 void Mob::ConformProneSegments(World& world, float dt) {
   const size_t n = std::min(limbs_.size(), anim_.model.size());
   if (kProneRigid || def_ == nullptr || n == 0 || skel_.parts.size() < n)
@@ -5487,6 +5519,189 @@ void Mob::ConformProneSegments(World& world, float dt) {
     const float run = std::sqrt(d.x * d.x + d.z * d.z);
     return std::atan2(d.y, std::max(run, 1e-4f));
   };
+
+  // ---- A LEGLESS BODY DRAPES (MobDef::slither; 2026-10-08) ----------------
+  //
+  // The general rule below reads a least-squares grade over five voxels and
+  // bends a segment by (its run / 5) of it, and refuses any segment shorter
+  // than 1.5 voxels outright. Both are right for a crawling man's shins and
+  // both are wrong for a snake: its segments are 1.4 voxels long, so EVERY
+  // one was refused and the whole body went up a staircase as one plank on
+  // the fitted plane -- the "it just moves at an incline" report.
+  //
+  // So a slither body is laid segment by segment along the ground actually
+  // under it. From the root outward, each segment's far end is put at the
+  // support under its own far half plus the clearance the root was given:
+  // flat on a tread, tipped up across a riser, cantilevered for one segment
+  // over a drop edge and then down. A bend between neighbours is capped
+  // (kDrapeMaxRelDeg) so a step reads as a soft S, never a kink. The root
+  // takes the grade between the supports under its own two ends, about its
+  // own middle. A segment an OVERRIDE clip owns (the strike's coil, the cobra
+  // stance) is draped by what is left of it, as ApplySlither yields its wave.
+  if (def_->slither.present) {
+    constexpr float kDrapeMaxDeg = 55.0f;
+    constexpr float kDrapeMaxRelDeg = 38.0f;
+    constexpr float kDrapeHalfLife = 0.07f;
+    constexpr float kDeg = 0.0174532925f;
+    const float kd = std::clamp(
+        1.0f - std::pow(0.5f, std::max(dt, 0.0f) / kDrapeHalfLife), 0.0f, 1.0f);
+    // Override ownership per part (Mob::ApplySlither's `own`).
+    std::vector<float> drapeW(n, 1.0f);
+    for (const ClipInstance& inst : anim_.clips) {
+      if (inst.clip < 0 || inst.clip >= (int)skel_.clips.size()) continue;
+      const AnimClip& clip = skel_.clips[inst.clip];
+      if (clip.mode != ClipMode::Override) continue;
+      const float w = std::clamp(inst.weight * inst.fade, 0.0f, 1.0f);
+      if (w <= 0.0f) continue;
+      for (size_t i = 0; i < n; i++)
+        if (clip.mask.empty() || (i < clip.mask.size() && clip.mask[i]))
+          drapeW[i] = std::max(0.0f, drapeW[i] - w);
+    }
+    // The support under one world point: the top of the column it is over.
+    auto support = [&](Vec3 p, float yTop, float& out) {
+      int gy = 0;
+      if (!GroundHeightAt(world, ifloor(p.x), ifloor(p.z),
+                          ifloor(yTop) + kMobProbeLiftCells, gy))
+        return false;
+      out = (float)gy;
+      return true;
+    };
+    // Pivot every part of the subtree under `root` (inclusive) by `q` about
+    // the model point `at`.
+    auto pivotTree = [&](size_t root, const Quat& q, Vec3 at) {
+      for (size_t j = 0; j < n; j++) {
+        bool inTree = j == root;
+        for (int a = skel_.parts[j].parent; !inTree && a >= 0;
+             a = skel_.parts[a].parent)
+          if ((size_t)a == root) inTree = true;
+        if (!inTree) continue;
+        anim_.model[j].rot = QuatNormalize(Mul(q, anim_.model[j].rot));
+        anim_.model[j].pos = at + Rotate(q, anim_.model[j].pos - at);
+      }
+    };
+    // + bend = far end up, about the horizontal axis across `dW`.
+    auto pitchQuat = [&](Vec3 dW, float bend) {
+      const float run = std::sqrt(dW.x * dW.x + dW.z * dW.z);
+      const Vec3 h{dW.x / run, 0, dW.z / run};
+      const Vec3 axisW = Vec3{0, 1, 0}.cross(h);
+      return AxisAngle(Rotate(invRot, axisW).normalized(), -bend);
+    };
+    std::vector<float> slopeNow(n, 0.0f);
+    std::vector<uint8_t> laid(n, 0);
+    float clr = 0.0f;
+    bool haveClr = false;
+    // ---- the root: its own grade, about its own middle --------------------
+    const int r = def_->rootLimb;
+    if (r >= 0 && (size_t)r < n && limbs_[(size_t)r].size.z > 0) {
+      const size_t ri = (size_t)r;
+      const MobLimb& rl = limbs_[ri];
+      const float inv = 1.0f / (float)PhysScaleOf(rl);
+      const Vec3 c{(float)rl.size.x * inv * 0.5f, (float)rl.size.y * inv * 0.5f,
+                   (float)rl.size.z * inv * 0.5f};
+      const Vec3 midM =
+          anim_.model[ri].pos + Rotate(anim_.model[ri].rot, c - rl.anchorLimb);
+      const Vec3 halfW =
+          Rotate(bodyRot, Rotate(anim_.model[ri].rot, Vec3{0, 0, c.z}));
+      const float run = std::sqrt(halfW.x * halfW.x + halfW.z * halfW.z);
+      const Vec3 midW = toWorld(midM);
+      float sf = 0, sb = 0;
+      const float yTop = midW.y + std::fabs(halfW.y);
+      if (run > 0.3f && support(midW + halfW, yTop, sf) &&
+          support(midW - halfW, yTop, sb)) {
+        const float want = std::clamp(std::atan2(sf - sb, 2.0f * run),
+                                      -kDrapeMaxDeg * kDeg, kDrapeMaxDeg * kDeg);
+        const float rel = (want - slopeAngle(halfW)) * drapeW[ri];
+        proneConform_[ri] += (rel - proneConform_[ri]) * kd;
+        if (std::fabs(proneConform_[ri]) > 1e-4f)
+          pivotTree(ri, pitchQuat(halfW, proneConform_[ri]), midM);
+        // The clearance every segment is laid with: how high the root's
+        // middle is drawn over the line between its supports. Learned while
+        // the root lies LEVEL (both ends and the middle on one height, where
+        // the fitted plane and the ground agree), and the whole body is moved
+        // onto it everywhere else: on a staircase the plane fitted under the
+        // whole length holds the body proud of the treads.
+        float sm = 0;
+        const float now = toWorld(midM).y - 0.5f * (sf + sb);
+        const bool level = sf == sb && support(midW, yTop, sm) && sm == sf;
+        // (Not learned in the air: a leap over flat ground is "level" too.)
+        if (!drapeClrSet_ || (level && now - drapeClr_ < 1.0f)) {
+          drapeClr_ = drapeClrSet_ ? drapeClr_ + (now - drapeClr_) * kd : now;
+          drapeClrSet_ = true;
+        }
+        clr = std::clamp(drapeClr_, -2.0f, 3.0f);
+        // ...except OFF the ground: a leap (AnimStateRule::airLift) draws the
+        // body over a voxel above its lying height, and it keeps that height,
+        // the drape only shaping it. A staircase's plank floats less than one.
+        const float air = std::clamp(now - clr - 1.0f, 0.0f, 1.0f);
+        clr += (now - clr) * air;
+        const float sink = std::clamp(now - clr, -2.0f, 2.0f);
+        if (std::fabs(sink) > 1e-3f) {
+          const Vec3 downM = Rotate(invRot, Vec3{0, -sink, 0});
+          for (size_t j = 0; j < n; j++)
+            anim_.model[j].pos = anim_.model[j].pos + downM;
+        }
+        haveClr = true;
+        slopeNow[ri] = slopeAngle(halfW) + proneConform_[ri];
+        laid[ri] = 1;
+      }
+    }
+    if (!haveClr) return;   // nothing under the root to lay it on: hold
+    // ---- every other segment, parents first ------------------------------
+    for (size_t i = 0; i < n; i++) {
+      if ((int)i == r) continue;
+      const MobLimb& limb = limbs_[i];
+      const int parent = skel_.parts[i].parent;
+      const bool eligible =
+          parent >= 0 && limb.body && limb.holdSeconds <= 0 &&
+          limb.wornHost < 0 && !IsHeldSlot((int)i) &&
+          !(i < anim_.partAlive.size() && !anim_.partAlive[i]) &&
+          limb.size.x > 0 && limb.size.y > 0 && limb.size.z > 0;
+      if (!eligible) continue;
+      const Vec3 jointM = anim_.model[i].pos;
+      const Vec3 joint = toWorld(jointM);
+      const Vec3 d = Rotate(bodyRot, segDir(i));
+      const float run = std::sqrt(d.x * d.x + d.z * d.z);
+      const float len = d.len();
+      if (run < 0.4f || len < 1e-3f) continue;
+      float target = proneConform_[i];
+      float sM = 0, sF = 0;
+      const float yTop = std::max(joint.y, joint.y + d.y);
+      if (support(joint + d * 0.5f, yTop, sM) && support(joint + d, yTop, sF)) {
+        // The far end on the higher of the two supports under the far half:
+        // over a drop edge the middle still stands on the tread, so the
+        // segment holds level for one length and the next one goes down.
+        const float dy = std::max(sM, sF) + clr - joint.y;
+        float want = std::asin(std::clamp(dy / len, -1.0f, 1.0f));
+        want = std::clamp(want, -kDrapeMaxDeg * kDeg, kDrapeMaxDeg * kDeg);
+        if (laid[(size_t)parent]) {
+          const float ps = slopeNow[(size_t)parent];
+          want = std::clamp(want, ps - kDrapeMaxRelDeg * kDeg,
+                            ps + kDrapeMaxRelDeg * kDeg);
+        }
+        target = (want - slopeAngle(dir0[i])) * drapeW[i];
+      }
+      proneConform_[i] += (target - proneConform_[i]) * kd;
+      const float inherited = slopeAngle(d) - slopeAngle(dir0[i]);
+      const float bend = proneConform_[i] - inherited;
+      slopeNow[i] = slopeAngle(dir0[i]) + proneConform_[i];
+      laid[i] = 1;
+      if (kDrapeDebug)
+        std::printf("drape %s joint y%.2f far y%.2f sup %.0f/%.0f clr %.2f "
+                    "slope now %.1f want-rel %.1f dir0 %.1f bend %.1f\n",
+                    def_->limbs[i].name.c_str(), joint.y, joint.y + d.y, sM,
+                    sF, clr, slopeAngle(d) * 57.3f, target * 57.3f,
+                    slopeAngle(dir0[i]) * 57.3f, bend * 57.3f);
+      if (std::fabs(bend) < 1e-4f) continue;
+      pivotTree(i, pitchQuat(d, bend), jointM);
+      if (kDrapeDebug) {
+        const Vec3 d2 = Rotate(bodyRot, segDir(i));
+        std::printf("   -> after: far y%.2f slope %.1f\n",
+                    toWorld(anim_.model[i].pos).y + d2.y,
+                    slopeAngle(d2) * 57.3f);
+      }
+    }
+    return;
+  }
 
   for (size_t i = 0; i < n; i++) {
     const MobLimb& limb = limbs_[i];
@@ -5718,7 +5933,14 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
     // direction, and the mob crabbed sideways across ground it should have
     // walked straight up. That is most of the "NPCs move nothing like the
     // player" complaint, and it is one number.
-    s.clear[i] = rise <= s.stepUpCells;
+    //
+    // ...PLUS THE GRADE A LYING BODY LIES ALONG (kLieGrade). A snake's fan
+    // reaches nine voxels past its middle, and a one-in-two staircase is four
+    // steps up there: every probe ahead read as a wall, the forward drive was
+    // refused, and it lay at the foot of the stairs approaching for ever.
+    const bool lies = def.slither.present;
+    s.clear[i] = (float)rise <= (float)s.stepUpCells +
+                                    (lies ? kLieGrade * std::fabs(along) : 0.0f);
   }
   return s;
 }
@@ -7007,7 +7229,9 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     }
     // THE DEADLINE ON THAT PREFERENCE: every cut tick but the last. A limb the
     // jaws cannot reach must not cost the bite (melee.h EdgeSweep::biteHoldout).
-    sw.biteHoldout = st.phaseTick + 1 < st.cutTicks;
+    // ...unless the style bites whatever it meets (AttackStyle::biteAnywhere).
+    sw.biteHoldout = st.phaseTick + 1 < st.cutTicks &&
+                     !(sty != nullptr && sty->biteAnywhere);
     // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted), and
     // probes along its TRAVEL. A set of JAWS does not: its edge already points
     // out of the face -- that is what the Aim effector spends the whole stroke
@@ -7148,8 +7372,21 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     st.lunged = true;
     const Vec3 ws = mob.def_->worldSize;
     const Vec3 centre = mob.origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f};
-    Vec3 to = st.targetPoint - centre;
+    // FROM THE HEAD, for a blow that leaves from it (ai_behavior.h
+    // AttackTuning::muzzleCone): a snake's centre is nine voxels behind its
+    // fangs, so a pounce sized centre-to-target carried the jaws a whole neck
+    // PAST the man, and one aimed from the centre at a target off the nose
+    // went diagonally while the head stayed on the heading. From the neck the
+    // body moves the jaws onto him; a target already behind the neck is not
+    // lunged at at all (the commit gate should not have let that through).
+    const ai::Profile* lpr = behaviors_.At(mob.ai_.profile);
+    const bool fromHead = lpr != nullptr && lpr->attack.muzzleCone > 0.0f;
+    Vec3 to = st.targetPoint - (fromHead ? shoulder : centre);
     to.y = 0;
+    if (fromHead) {
+      const Vec3 fw = mob.Facing();
+      if (to.x * fw.x + to.z * fw.z <= 0.0f) to = Vec3{};
+    }
     const float dist = to.len();
     // A LOCO STATE SCALES IT (anim.h AnimStateRule::lungeScale): a crawler
     // pounces low and short because it is dragging itself, and that is one
@@ -7343,6 +7580,19 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // FOOTWORK is placed on. Two numbers because they answer two questions —
     // see MobSystem::StrikeReachOf.
     self.strikeReach = StrikeReachOf(mob);
+    // ...and how far AHEAD of its centre that blow leaves from, for a profile
+    // that says its blow leaves from the head (AttackTuning::muzzleCone): the
+    // striking joint projected on the heading. The rest length of the body
+    // ahead of the centre when the pose cannot answer.
+    if (prof != nullptr && prof->attack.muzzleCone > 0.0f) {
+      const Vec3 c = mob.origin_ + def.worldSize * 0.5f;
+      const Vec3 fw = mob.Facing();
+      Vec3 pv{};
+      self.muzzleFwd =
+          mob.StrokePivotWorld(pv)
+              ? std::max(0.0f, (pv.x - c.x) * fw.x + (pv.z - c.z) * fw.z)
+              : def.worldSize.z * 0.5f;
+    }
     // ...and what state the body is in, for the profile's rules
     // (ai_behavior.h "RULES"): the facts a creature's character can hinge on.
     mob.BodyFacts(self.hpFrac, self.burningFrac, self.limbsLost);
@@ -25530,7 +25780,30 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
     // the neck), the torso's stump is armed exactly as for an arm, and only
     // then does the creature die -- a dead Mob that keeps its wounds and pays
     // them out (BleedTick on the dead).
-    const bool fatal = ld.vital;
+    //
+    // ...AND SO DOES ONE THAT CARRIES A VITAL LIMB AWAY WITH IT (2026-10-08).
+    // DetachLimb takes the whole subtree, so a snake cut through `body1` -- the
+    // segment behind its head -- lost its head as that segment's child, and
+    // since `body1` is not itself vital the body slithered on without one.
+    // Any still-attached vital limb below the cut makes the cut fatal.
+    const bool carriesVital = [&] {
+      for (size_t k = 0; k < limbDefs_.size() && k < limbs_.size(); k++) {
+        if (!limbDefs_[k].vital || !limbs_[k].body || (int)k == limbIndex)
+          continue;
+        // Walk k's ancestry by name; a bounded walk, the rig is a tree.
+        std::string up = limbDefs_[k].parent;
+        for (int guard = 0; !up.empty() && guard < 64; guard++) {
+          if (up == ld.name) return true;
+          int pi = -1;
+          for (size_t q = 0; q < limbDefs_.size(); q++)
+            if (limbDefs_[q].name == up) { pi = (int)q; break; }
+          if (pi < 0) break;
+          up = limbDefs_[(size_t)pi].parent;
+        }
+      }
+      return false;
+    }();
+    const bool fatal = ld.vital || carriesVital;
     // JUST THE HEAD (owner, 2026-09-25). The neck is part of the head limb on
     // this rig, so a blade decapitation anywhere on it sent the rest of the
     // neck away with the skull. A blade takes the skull only: everything
@@ -25540,7 +25813,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
     // the neck moved into the torso in the art. Fire, blast and the rest keep
     // whatever they parted.
     const bool trimmed =
-        pol.byBlade && fatal && limbIndex < baseLimbs_ &&
+        pol.byBlade && ld.vital && limbIndex < baseLimbs_ &&
         TrimNeckForSever(limbIndex);
     if (fatal && alive_)   // written once: see the root branch above
       deathCause_ = VitalDeathCause(pol, ctx);
@@ -33906,6 +34179,14 @@ bool Mob::LimbCentreWorld(int part, Vec3& out) const {
                   (float)l.size.z * k * 0.5f};
   const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
   out = l.xf.pos + QuatRotate(q, half);
+  return true;
+}
+
+bool Mob::LimbAxisWorld(int part, Vec3& out) const {
+  if (part < 0 || part >= (int)limbs_.size() || !limbs_[part].body) return false;
+  const MobLimb& l = limbs_[part];
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  out = QuatRotate(q, Vec3{0, 0, 1});
   return true;
 }
 

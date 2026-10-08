@@ -14701,6 +14701,56 @@ general mechanism the sidecar or the style opts into:
   are about the body travelling. `SANDVOX_SNAKE_TRACE=1` prints the hunt, the
   slither clearance and each rear strike tick by tick.
 
+**Decapitation, aim from the head, and a body that drapes (2026-10-08, owner
+report: "a snake whose head is chopped off lives; its bites miss forever
+depending on where I stand; it goes up a ramp as one inclined plank").**
+- **A cut that carries a vital limb away is fatal** (`Mob::Sever`). The head
+  hangs from `body1`; a blade through `body1` took the head with it as a child
+  (DetachLimb takes the subtree), and since `body1` is not itself vital the
+  snake lived. Now any still-attached vital limb below the cut kills. Only the
+  neck trim (`TrimNeckForSever`) stays keyed on the cut limb being the vital
+  one. In shipped content only the snake has a vital limb under a severable
+  non-vital one.
+- **The bite is aimed from the head** (`AttackTuning::muzzleCone`,
+  `SelfView::muzzleFwd`; behaviors.json snake 0.5). Range and aim were taken
+  from the CENTRE, nine voxels behind the fangs, so a man beside the neck or
+  40 degrees off the nose was committed at and whiffed. With a cone set the
+  commit also needs the target ahead of the striking joint
+  (`Mob::StrokePivotWorld`, projected on the heading) and inside the cone as
+  seen from there; the band floor never lets the target inside the body's own
+  length (it backs off, `retreatSpeed` 0.7); and the lunge is sized and aimed
+  from the neck, not the centre (and not at all at a target behind it).
+- **The fangs close on what they meet** (`AttackStyle::biteAnywhere`, both
+  snake styles). The stroke's one bite was held for the drawn limb until the
+  last cut tick (`EdgeSweep::biteHoldout`); a ground strike drew a foot, met
+  the shin, and had recoiled by the last tick -- three strikes in a row
+  touched the man and none bit. Gate pass C2: beside the neck and off the
+  nose each bitten on the FIRST strike (before: 3 and 2..4 strikes, most of
+  them touching nothing).
+- **A legless body drapes** (`Mob::ConformProneSegments`, its
+  `def.slither` branch). The general conform reads a 5-voxel least-squares
+  grade, bends a segment by run/5 of it and refuses any segment under 1.5
+  voxels -- every 1.4-voxel snake segment, so the whole body was the one plank
+  on the fitted plane. Now the root takes the grade between the supports under
+  its two ends, and from it outward each segment's far end is put on the
+  higher of the supports under its far half plus the lying clearance (learned
+  while the root lies level, `drapeClr_`; the body is moved onto it, except
+  more than a voxel off the ground, i.e. a leap); bends are capped at 55
+  degrees and 38 from the parent, eased with a 0.07 s half-life, and yielded
+  to an override clip by its weight as the slither yields. Flat on a tread,
+  tipped over a riser, level for one segment past a drop edge.
+- **...and lies along the grade it climbs** (`kLieGrade` 0.65, about 33
+  degrees). `FootprintFooting` treated every column more than a step above the
+  middle as a wall and the steering fan (`SenseGround`) every probe more than
+  a step up as blocked; on a snake both reach nine voxels ahead, so it lay at
+  the foot of a one-in-two staircase forever. For a slither body a column or
+  probe `v` along it may stand `kLieGrade * |v|` higher, its height is taken
+  over its middle third, and headroom over each column's own ground.
+- **Gate pass C2's staircase**: six 1-voxel steps 2 deep; it climbs onto them
+  and 22% of the segments on the steps lie flat (< 9 degrees), 53% steep;
+  the plank (`SANDVOX_PRONE_RIGID=1`) is 0% and 95%. `SANDVOX_DRAPE_DEBUG=1`
+  prints each segment's joint, supports, wanted and achieved slope per tick.
+
 ### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
 
 **Everything in this section is PRESENTATION, and the separation is

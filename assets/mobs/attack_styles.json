@@ -7144,6 +7144,7 @@
       "label": "Snake strike",
       "//": "THE SNAKE'S GROUND STRIKE (assets/mobs/snake.json; its other style is snake_rear_strike, below). The windup is the COIL: `clip` plays the sidecar's `snake_strike`, an override on the four neck segments that draws them back into an S with the head raised (the slither yields those segments to it, Mob::ApplySlither). The lunge fires at the CUT, not the windup -- the coil is the telegraph and the strike is the release -- and stays low (rise 0.3 m/s) because a snake strikes along the ground. It goes for the legs: the snake is prone by nature, so `targetProne` is the table it actually draws from -- narrowed by the engine to what a body lying on the ground can rise to (MobSystem::PickTargetLimb reachHeight: its own height and a voxel), which on a standing victim is the feet.",
       "weapon": "jaws",
+      "biteAnywhere": true,
       "reach": 0,
       "lunge": {
         "ticks": 5,
@@ -7204,6 +7205,7 @@
       "label": "Rearing strike",
       "//": "THE SNAKE'S SECOND STYLE: thrown from the cobra stance (the sidecar's chaseClip `snake_rear`, its front reared into a swaying column). `fromStance` keeps that stance held through the stroke, and `clip` (snake_rear_strike, ADDITIVE) draws the column back into an S through the windup and throws it forward and UP through the cut. The lunge fires at the WINDUP and LEAPS (rise 2.6 m/s, `ticks` 16 = the leap's real ballistic flight so the horizontal is sized for the arc it flies; the slither state's airLift draws the body off the ground with it), so the cut lands near the top of the leap and the jaws arrive at a standing man's hands and forearms: `reachHeight` 10 lets the draw take limbs whose centre is up to 10 voxels over his feet, which the ground strike's lying height never could. Arms and hands only -- the legs and feet are the ground strike's -- and `target` with no `targetProne`, so the table is the one used while prone.",
       "weapon": "jaws",
+      "biteAnywhere": true,
       "reach": 0,
       "fromStance": true,
       "reachHeight": 10,
