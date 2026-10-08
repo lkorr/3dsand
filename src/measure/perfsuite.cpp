@@ -4409,24 +4409,27 @@ SeamPose SeamPlainPose() {
 SeamPose SeamVegPose() {
   // MapBiomeAt's value is the biome file's `index` (the harness map lists
   // them in index order): meadow is 1. The harness map's nearest meadow cell
-  // is ~6 km from the spawn, so search the map's CELLS first (nearest to the
-  // spawn cell), then a 64-voxel lattice inside the first cell that has a
-  // column whose eye and +x view line (60 m) are meadow, dry and flat.
+  // is ~6 km from the spawn, so search the map's SITE cells first (102 m,
+  // nearest to the spawn cell, a cell counting as meadow when the biome cell
+  // under its centre is -- map v2's biome plane is finer than the search
+  // wants), then a 64-voxel lattice inside the first cell that has a column
+  // whose eye and +x view line (60 m) are meadow, dry and flat.
   constexpr uint32_t kMeadow = 1;
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   int scx, scz;
   m.CellOf(m.spawnX, m.spawnZ, &scx, &scz);
+  const int span = 1 << m.siteCellLog2;
   std::vector<std::pair<int, int>> cells;   // (dist2, index)
-  for (int cz = 0; cz < m.height; cz++)
-    for (int cx = 0; cx < m.width; cx++)
-      if (m.BiomeCell(cx, cz) == kMeadow)
+  for (int cz = 0; cz < m.siteH; cz++)
+    for (int cx = 0; cx < m.siteW; cx++)
+      if (m.BiomeCellAt(((cx - m.siteOriginX) << m.siteCellLog2) + span / 2,
+                        ((cz - m.siteOriginZ) << m.siteCellLog2) + span / 2) == kMeadow)
         cells.push_back({(cx - scx) * (cx - scx) + (cz - scz) * (cz - scz),
-                         cz * m.width + cx});
+                         cz * m.siteW + cx});
   std::sort(cells.begin(), cells.end());
-  const int span = 1 << m.cellLog2;
   for (size_t i = 0; i < cells.size() && i < 64; i++) {
-    const int cx = cells[i].second % m.width, cz = cells[i].second / m.width;
-    const int x0 = (cx - m.originCellX) * span, z0 = (cz - m.originCellZ) * span;
+    const int cx = cells[i].second % m.siteW, cz = cells[i].second / m.siteW;
+    const int x0 = (cx - m.siteOriginX) * span, z0 = (cz - m.siteOriginZ) * span;
     int bx = 0, bz = 0, best = INT_MAX;
     for (int z = z0 + 64; z < z0 + span - 64; z += 64)
       for (int x = x0 + 64; x < x0 + span - 64; x += 64) {

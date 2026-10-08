@@ -5078,8 +5078,8 @@ struct Tuning {
   // (assets/worldmap/<name>/map.json `terrain`) and to the biome files in
   // P-G of docs/PLAN_environment_truth.md; what is left here is which files.
   struct World {
-    // Names assets/worldmap/<mapLayer>/{map.json,map.svmap}: the painted
-    // biome/landform planes, the terrain numbers and the site table. NOT
+    // Names assets/worldmap/<mapLayer>/{map.json,planes/}: the painted
+    // biome/height planes, the terrain numbers and the site table. NOT
     // optional -- "default" ships, and a missing or unparsable map ABORTS at
     // load rather than silently generating an all-ocean or all-forest world.
     std::string mapLayer = TPD(world, mapLayer);

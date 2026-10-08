@@ -269,7 +269,7 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
 /**
  * THE ENVIRONMENT STAMP (docs/PLAN_environment_truth.md P-A): one
  * change-detector per authored input worldgen takes from disk -- the world
- * map (map.json + map.svmap + sculpt.svsculpt when present), the biome
+ * map (map.json + its plane tiles + sculpt.svsculpt when present), the biome
  * files, and the tree species + baked
  * atlases. Each is FNV-1a over every file's NAME, a zero byte, and its BYTES,
  * files in sorted-name order. Deliberately that simple, because the tuner
@@ -293,6 +293,10 @@ struct EnvironmentStamp {
   std::string Json() const;   // {"map":"<name>","mapHash":"..","biomesHash":"..","treesHash":"..","editLayer":"<name>","editsHash":".."}
 };
 uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& exts);
+/** A map directory's content hash (map v2): map.json and sculpt.svsculpt, then
+ *  planes/biome/*.svt, then planes/height/*.svt, each set by HashFileSet. The
+ *  environment stamp's `map` and so the save fingerprint's map part. */
+uint32_t HashMapFiles(const std::string& mapDir);
 EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName,
                                   const std::string& editLayer = {});
 

@@ -474,6 +474,17 @@ uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& ext
   return h;
 }
 
+uint32_t HashMapFiles(const std::string& mapDir) {
+  // Map v2: map.json (+ the sculpt layer) beside, then each plane's tiles.
+  // Folded with one FNV multiply between the sets so a tile moving from one
+  // plane to the other is a change; scripts/tuner_server.py _map_hash mirrors
+  // this exactly (the tuner's badge compares the two).
+  uint32_t h = HashFileSet(mapDir, {".json", ".svsculpt"});
+  h = (h * 16777619u) ^ HashFileSet(mapDir + "/planes/biome", {".svt"});
+  h = (h * 16777619u) ^ HashFileSet(mapDir + "/planes/height", {".svt"});
+  return h;
+}
+
 EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName,
                                   const std::string& editLayer) {
   EnvironmentStamp s;
@@ -484,7 +495,7 @@ EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string
                                    editLayer + ".svedit");
   // .svsculpt (P5): the sculpt layer is part of the map. A map without one
   // hashes exactly as it did before the layer existed.
-  s.map = HashFileSet(assetDir + "/worldmap/" + mapName, {".json", ".svmap", ".svsculpt"});
+  s.map = HashMapFiles(assetDir + "/worldmap/" + mapName);
   // The water presets are a worldgen input since P-E (their flora rows are
   // packed into the same buffer as the biome records), so they are part of
   // the `biomes` stamp: an edited preset must light the apply button too.

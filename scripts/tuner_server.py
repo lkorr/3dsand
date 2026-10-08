@@ -885,8 +885,9 @@ def _world_signature():
     The cache key has to move when the world does, and the voxel server's
     worldgen is a function of: tuning.json (world.mapLayer names the map, and
     the prelude consts), materials.json (the ids the words carry), the named
-    map (map.json + map.svmap: the terrain block, sites, planes; + the P5
-    sculpt layer when the map has one), the biome and
+    map (map.json + the plane tiles planes/<plane>/*.svt: the terrain block,
+    sites, height and biome planes; + the P5 sculpt layer when the map has
+    one), the biome and
     water files, and the tree atlases (.svtree; the species .json are only the
     bake's input). Hashed by CONTENT, not mtime: a tuner restart should not
     throw away a cache, and an edit that reverts a file should hit the entries
@@ -907,7 +908,14 @@ def _world_signature():
         name = "default"
     d = _worldmap_dir(name)
     if d:
-        paths += [os.path.join(d, "map.json"), os.path.join(d, "map.svmap")]
+        paths.append(os.path.join(d, "map.json"))
+        # Map v2: every tile of both planes, in sorted name order.
+        for plane in ("biome", "height"):
+            pd = os.path.join(d, "planes", plane)
+            try:
+                paths += [os.path.join(pd, n) for n in sorted(os.listdir(pd)) if n.endswith(".svt")]
+            except OSError:
+                pass
         # Only when present, so a map without a layer keeps the signature (and
         # the region cache) it had before the layer existed.
         sp = os.path.join(d, SCULPT_FILE)
@@ -1045,6 +1053,16 @@ def _worldedit_path(name):
 
 
 _FNV_CACHE = {}
+
+
+def _map_hash(d):
+    """MIRRORS biomes::HashMapFiles (src/sim/biomes.cpp): map.json + the
+    sculpt layer, then the biome plane's tiles, then the height plane's, each
+    set folded in with one FNV multiply (map v2)."""
+    h = _fnv_file_set(d or "", (".json", ".svsculpt"))
+    for plane in ("biome", "height"):
+        h = ((h * 0x01000193) & 0xFFFFFFFF) ^ _fnv_file_set(os.path.join(d, "planes", plane) if d else "", (".svt",))
+    return h
 
 
 def _fnv_file_set(d, exts):
@@ -1800,7 +1818,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "map": name,
                 # + .svsculpt (P5), mirroring StampEnvironment's map set
-                "mapHash": "%08x" % _fnv_file_set(d or "", (".json", ".svmap", ".svsculpt")),
+                "mapHash": "%08x" % _map_hash(d),
                 # biomes ^ water: the presets' flora rows are packed with the
                 # biome records since P-E (mirrors StampEnvironment)
                 "biomesHash": "%08x" % (_fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)) ^

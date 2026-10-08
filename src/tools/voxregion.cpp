@@ -671,8 +671,8 @@ bool BuildBiomeSwatch(GpuContext& ctx, World& world, Simulation& sim,
   // ---- the synthetic one-biome map: the env-truth gate's recipe ------------
   worldmap::WorldMapData syn = real;
   std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(bd->index));
-  std::fill(syn.landform.begin(), syn.landform.end(), static_cast<uint8_t>(128));   // "flat"
-  std::fill(syn.moisture.begin(), syn.moisture.end(), static_cast<uint8_t>(128));
+  // Flat authored ground at the terrain's datum: only the noise shapes it.
+  std::fill(syn.height.begin(), syn.height.end(), static_cast<int16_t>(syn.terrain.baseHeight));
   syn.sites.clear();
   syn.siteIndex.assign(syn.siteIndex.size(), 0);
   syn.padX0 = syn.padZ0 = 0;

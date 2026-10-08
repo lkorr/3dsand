@@ -5709,6 +5709,12 @@ is written and works, but it moves the harness pool's bed enough to need the
 
 ##### Per-biome height curves (2026-09-01, Lin 13.3.3)
 
+> **Map v2 (2026-10-08):** the curve now reshapes the RANGE RUNG only (its
+> domain is ±rangeAmplitude/2) and the AUTHORED height plane is never scaled
+> by it; it blends on the 25.6 m biome cells. The rest of this section (the
+> nine knots, the bit-exact identity, Fritsch–Carlson) still holds. See the
+> map v2 bullet in the world-map list (§ "THE AUTHORED HEIGHT PLANE").
+
 "This biome is flat plains, that one is jagged mountains", authored as nine
 numbers per biome instead of a hand-tuned noise ladder. `biomeCurve` reshapes
 **the coarse sum only** — `o0.dev + o1.dev`, the continental and range rungs
@@ -5777,6 +5783,11 @@ relief; a biome's curve is now the author's to change without a global
 default moving under `armor-react`.
 
 ##### The terrain is the map's (environment truth P-G, 2026-09-07)
+
+> **Map v2 (2026-10-08):** the landform plane, `landformRangeVox` and the
+> declared landform sites below are GONE — the ground is the authored height
+> plane (absolute voxels) and the terrain block's octaves are noise on it.
+> See "THE AUTHORED HEIGHT PLANE" in the world-map list.
 
 Every number that shaped the ground used to be a `worldgen.*` row in
 `tuning.json`. It is **`map.json terrain`** now, per map, packed into the
@@ -22747,7 +22758,8 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   Eight biomes ship: forest, meadow, pine, desert, tundra, swamp, alpine,
   ocean. `worldgen.wgsl` still names the first four by id (`B_*`) as the
   (identity, folded-out) height curve's input until P4.
-* **LIVE (world map P2a, 2026-09-04): THE BIOME COMES FROM THE PAINTED MAP.**
+* **LIVE, format superseded by map v2 (below) (world map P2a, 2026-09-04): THE
+  BIOME COMES FROM THE PAINTED MAP.**
   `assets/worldmap/<world.mapLayer>/` — `map.json` (cell size, extent,
   origin cell, sea level, ocean fade, warp amplitude, the palette of biome
   NAMES, sites, rules) beside `map.svmap` (three u8 planes: biome, landform,
@@ -22886,8 +22898,8 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   click. Gate: `spawn-site` (authored, outside the box and every site cell,
   above the sea, not under a tarn, not ocean). `spawnPlain*` stays in
   `tuning.json` until P-G moves it to `map.json terrain.homeArea`.
-* **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
-  RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
+* **SUPERSEDED by map v2 (below) except the sea: (world map P4, 2026-09-04)
+  THE LANDFORM PLANE OWNS THE CONTINENTAL RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
   on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,
   so `worldgen.contAmplitude` still says how tall the world is (one landform
   unit = amplitude/256 voxels, 4 at the default) and the map says WHERE;
@@ -22907,6 +22919,65 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   map page's landform brush is where that is authored. `LAVA_LID` is not
   needed yet: no biome record carves caves under the sea (ocean's cave
   thresholds are 255) and lava only pools in caves.
+* **LIVE (map v2 F1, 2026-10-08, `docs/PLAN_map_v2.md`): THE AUTHORED HEIGHT
+  PLANE. The ground is the author's; the noise is texture on it.** A map is
+  `map.json` **version 2** (`extent {min, size}` in world voxels, a multiple
+  of the site cell; `siteCellLog2`; `planes.height {log2, tile, default}` and
+  `planes.biome {log2, tile, default}`; `edgeFadeVox`; the palette, terrain,
+  sites and rules as before) beside TILES, `planes/<plane>/<tx>_<tz>.svt`:
+  `'SVT1'`, plane kind (1 height / 2 biome), tx, tz, 256, 256, sample bytes,
+  0, then 256x256 samples z-major; tile = post index >> 8; an ABSENT tile is
+  every sample at the plane's default (ocean tiles are simply not there). A
+  plane of log2 L has `(size >> L) + 1` posts a side, post i at
+  `min + (i << L)` (the last ON the max edge). **Height:** i16 ABSOLUTE
+  voxels at 6.4 m posts (log2 6, +-32000 by the loader), **biome:** u8
+  palette index per 25.6 m cell (log2 8; sample i is the cell
+  `[min + i·256, + 256)`). The site index stays on the 102.4 m `siteCellLog2`
+  lattice (`kHSiteCellLog2/W/H/OriginX/Z`, `wmCellOf`, `CellOf`); rules roll
+  per SITE cell. `LoadWorldMap` validates every tile (header against name and
+  plane, size, on the plane, samples in range), refuses a v1 map naming
+  `scripts/convert_map_v2.py`, clamps every terrain amplitude to
+  `kNoiseAmpMax` (4096: the octave's `n.dx·amp` i32 bound with a 16x biome
+  multiplier), and refuses planes past 64 MiB dense / 4097 posts a side.
+  `PackWorldMap` packs both planes DENSE (height two i16 a word, biome four
+  ids a word) behind the extended header (`kHExtent*`, `kHHeight*`,
+  `kHBiome*`, `kHeaderWords` 72): `default` is 20.2 MiB (3137² posts), `peaks`
+  3.3 MiB. The content hash folds map.json, every tile in (plane, tz, tx)
+  order, the sculpt layer and the refs; `biomes::HashMapFiles` (the
+  environment stamp, the save fingerprint) and `tuner_server.py _map_hash`
+  hash the same files.
+  **`landAt` (both mirrors):** `bed = authored + curve(range rung)·calm +
+  hill/detail/grain (biome multipliers, soften) + sculpt`. `mapHeightAt` is
+  a Catmull-Rom over the 4x4 posts, rows in x then the column in z, integer
+  Horner in the post fraction (`crStep`: exact at a post because f == 0
+  multiplies every term away; every i32 product bounded in the comment over
+  it), returning the height and its ANALYTIC gradient (the x slopes blended
+  in z by the same spline), so the gradient fed to the octave attenuation and
+  the sediment gate is CONTINUOUS across post edges — the v1 piecewise-
+  constant landform gradient turned a gradient jump into a height step
+  through the attenuation. The authored height is never scaled by a curve, a
+  fade or the attenuation; the biome curve's domain is the range rung only
+  (±rangeAmplitude/2); the calm home/pad fade applies to the range rung's
+  DEVIATION only (its gradient still feeds the fine rungs' attenuation
+  unfaded, as v1's coarse rungs did, so the harness pad's ground is v1's to
+  ±2 voxels; `homeArea.y` no longer reaches the ground — A1 replaces it);
+  `octave` clamps |g| to 32767. Outside the extent the authored height eases from the
+  edge value to `planes.height.default` over `edgeFadeVox` (smoothstep in the
+  Chebyshev distance; continuous, C1 everywhere but on the extent's edge).
+  Biomes blend (`biomeMixAt`) on the 25.6 m biome cells. `landformOctave`,
+  `mapLandformQ8/Gx/Gz`, the moisture plane, `landformRangeVox` and the
+  landform SITES are gone (a `kind: landform` site is a load warning; the
+  converter bakes them, the map page stamps them into the plane).
+  **Converter:** `scripts/convert_map_v2.py <name>` (v1 bilinear landform +
+  sites unclamped + the v1 calm fade baked toward `homeArea.y`, biome =
+  nearest v1 cell); `default` and `harness` are converted, Harrowby's refs
+  kept on their ground by `assets/worldmap/default/scripts/harrowby_v2_shift.py`.
+  **Test map `peaks`** (`scripts/gen_map_peaks.py`, 8 km): a 1,400 m massif
+  with a knife ridge, a 300 m cliff band, a 600 m gorge, a ~900 m high valley
+  with a tarn and the spawn, foothills, a coast. Gate: `worldmap-v2` (tile
+  format and absent = default, v1 refused, post exactness with zero noise,
+  CPU == GPU per voxel over post edges and a 2 vox/vox ramp, gradient and
+  ground continuity at post edges, the edge fade).
 * **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
   of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
   rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,

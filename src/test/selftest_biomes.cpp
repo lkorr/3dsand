@@ -273,16 +273,18 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
 
-  // B: sixteen cell centres spread over the plane.
+  // B: sixteen biome-cell centres spread over the plane (the warp is at most
+  // a quarter cell, so a centre never leaves its cell).
   int centreOk = 0, centreN = 0;
-  const int half = 1 << (m.cellLog2 - 1);
+  const int half = 1 << (m.biomeLog2 - 1);
+  const int cellsX = m.extentW >> m.biomeLog2, cellsZ = m.extentH >> m.biomeLog2;
   for (int k = 0; k < 16; k++) {
-    const int cx = (m.width * (k % 4) + m.width / 8) / 4;
-    const int cz = (m.height * (k / 4) + m.height / 8) / 4;
-    const int x = ((cx - m.originCellX) << m.cellLog2) + half;
-    const int z = ((cz - m.originCellZ) << m.cellLog2) + half;
+    const int cx = (cellsX * (k % 4) + cellsX / 8) / 4;
+    const int cz = (cellsZ * (k / 4) + cellsZ / 8) / 4;
+    const int x = m.extentX0 + (cx << m.biomeLog2) + half;
+    const int z = m.extentZ0 + (cz << m.biomeLog2) + half;
     centreN++;
-    if (World::MapBiomeAt(x, z, kDefaultSeed) == m.BiomeCell(cx, cz)) centreOk++;
+    if (World::MapBiomeAt(x, z, kDefaultSeed) == m.BiomePost(cx, cz)) centreOk++;
   }
 
   // C: the skin at ground level, at columns inside the window, off the
@@ -327,9 +329,9 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   const bool ok = centreOk == centreN && skinN >= 3 && skinOk == skinN && p6ok;
   char buf[320];
   std::snprintf(buf, sizeof buf,
-                "map '%s' %dx%d @%d vox, %zu palette, content %08x; twin at cell centres %d/%d; "
+                "map '%s' %dx%d biome cells @%d vox, %zu palette, content %08x; twin at cell centres %d/%d; "
                 "GPU skin == twin's biome skin %d/%d (%d as its firmSkin, %d skipped)%s",
-                mapName.c_str(), m.width, m.height, 1 << m.cellLog2, m.palette.size(),
+                mapName.c_str(), m.extentW >> m.biomeLog2, m.extentH >> m.biomeLog2, 1 << m.biomeLog2, m.palette.size(),
                 m.contentHash, centreOk, centreN, skinOk, skinN, skinFirm, skipped, first.c_str());
   detail = std::string(buf) + "; " + p6;
   std::printf("worldmap: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
@@ -406,7 +408,7 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   }
   if (h <= m.seaLevelY) why += "; ground y" + std::to_string(h) + " is under seaLevelY " + std::to_string(m.seaLevelY);
   if (pq.inDisc) why += "; under a tarn (surface y" + std::to_string(pq.surf) + ")";
-  if ((int)b == m.oceanBiome) why += "; biome is the ocean";
+  if ((int)b == m.biomeDefault) why += "; biome is the plane default (ocean)";
   const bool ok = why.empty();
   char buf[320];
   std::snprintf(buf, sizeof buf,

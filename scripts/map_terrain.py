@@ -36,8 +36,8 @@ def terrain_defaults(root):
     """The map terrain block's DEFAULTS, in map.json's shape, read from
     src/sim/worldmap.h `struct TerrainParams` -- the values the engine uses for
     any key a map.json `terrain` block omits. The ONE copy: the tuner server
-    serves it to the World map page (/api/worldmap/terrain-defaults) and
-    scripts/seed_worldmap.py writes it into a new map; neither keeps its own.
+    serves it to the World map page (/api/worldmap/terrain-defaults); it keeps
+    no copy of its own.
     homeY / homeR / homeFade are map.json's homeArea.{y, radius, fade}."""
     import re
     with open(os.path.join(root, "src", "sim", "worldmap.h"), encoding="utf-8") as f:

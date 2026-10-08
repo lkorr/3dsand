@@ -5026,7 +5026,7 @@ struct KeyEdge {
 //   4  u32  version (1)                 20  i32 cz
 //   8  u32  res                         24  u32 seed
 //   12 u32  span (voxels)               28  i32 voxelsPerMetre
-//   32 i32  hMin   36 i32 hMax          40 i32 seaHint (the map's terrain.homeArea.y)
+//   32 i32  hMin   36 i32 hMax          40 i32 seaLevelY (the map's sea plane)
 //   44 u32  reserved
 //   48 .. res*res * 8 bytes: i32 h, i16 water (h - water, clamped, or -32768
 //          for dry), u8 sed, u8 slope (Q8 clamped to 255)
@@ -5097,7 +5097,8 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
   put32(28, (uint32_t)kVoxelsPerMetre);
   put32(32, (uint32_t)hMin);
   put32(36, (uint32_t)hMax);
-  put32(40, (uint32_t)worldmap::CurrentTerrain().homeY);
+  // The SEA: map.js reads this word as `sea` (it used to carry homeArea.y).
+  put32(40, (uint32_t)worldmap::CurrentWorldMap().seaLevelY);
   put32(44, 0);
 
   std::error_code ec;
