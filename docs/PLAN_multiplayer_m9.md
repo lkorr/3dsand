@@ -787,7 +787,9 @@ Branch after M9.2-C has merged.
 **Verified facts:** §"Facts that bind"; `OpBatch` (`session.h:243-257`: ops,
 exps, cells, spawns, fluid; gas is NOT in the batch — it is queued in World
 and joins at `SubmitTick`; a remote's gas spawns are therefore NOT exchanged
-in M9.3: note it); op structs and their coordinate spaces (`world.h:358-365`
+in M9.3: note it. CLOSED 2026-10-07: `OpBatch::gas`, wire v2, phase N moves
+World's queue into it before `PushLocal` and re-queues the merged list; gate
+`ops-exchange` H); op structs and their coordinate spaces (`world.h:358-365`
 Brush world coords; `:377-384` Explosion world coords + `author`; `:872-875`
 CellOp slot index; `:2849-2856` ParticleSpawn 24.8 world; `:821-830`
 FluidSpawnOp Q16.16 world); caps `kMaxOpsPerTick` etc. in `world.h`;
@@ -1254,3 +1256,36 @@ What I did NOT do, and why:
 DESIGN.md / CLAUDE.md paragraphs updated:
 Board: claim posted at <time>, done posted at <time>
 ```
+
+## Melee across the wire (open, NEEDS OWNER DECISIONS; written 2026-10-07)
+
+What happens today: `MeleeSweepDamage` (`melee.cpp`) applies a hit directly
+(`mobs.Damage` / `CutLimb` / `BluntHit`) to whatever body the sweep found on
+the ATTACKER's machine. A peer's player or a peer-owned NPC is a ghost there:
+the carve lands on the ghost as presentation and nothing reaches the body's
+owner (`Mob::Die` refuses on a ghost). So a sword never hurts a peer, and an
+NPC owned by A swinging at B's ghost never hurts B. Melee has no op to ride:
+ops are GPU-mutation PODs, and a hit is CPU body state.
+
+What a fix needs (mechanism, not decided):
+- a `MeleeHit` record on the entity channel (`net::EntityBatch`, beside
+  `ItemTake` / `ItemGrant`): the target by STABLE id (mob id / player id,
+  never a Jolt handle), the limb slot (consistent with `MobState`'s
+  renumbering), the resolved `BladeCut` kerf or `BluntHit`, damage, power and
+  `DamageCause`; `EntityBatch` / `kMobSyncVersion` bumped;
+- `MeleeSweepDamage` emits it when the struck body's owner is not this
+  machine, and the owner applies it at the label through the same
+  `Damage` / `CutLimb` / `BluntHit` calls, its gore entering its own batch;
+- the attacker's ghost carve is either kept for looks with its gore discarded
+  (the blast rule) or skipped.
+
+The decisions the owner has to make first:
+1. **Who is trusted.** Attacker-authoritative (the owner applies whatever hit
+   arrives: matches how explosions work, simple, cheatable, 4+ ticks late) or
+   owner re-simulates (it lacks the attacker's exact blade pose and window).
+2. **Who judges a block / parry.** It needs the DEFENDER's guard state, which
+   only the defender's owner has at the hit tick.
+3. **A hit sent during an ownership handoff** (the target changed hands
+   between send and apply): re-forward to the new owner, or drop.
+4. **Does the attacker carve the ghost immediately** for feedback, or wait for
+   the owner's state.

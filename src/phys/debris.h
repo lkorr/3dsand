@@ -538,6 +538,9 @@ class DebrisSystem {
   bool IsGhost(uint64_t handle) const;
   // How many ghosts exist. For the `--frames` net report and for the gate.
   uint32_t GhostCount() const;
+  // Every ghost's handle (a blast's impulse skip list: a ghost's motion is the
+  // wire's, its owner pushes it).
+  void AppendGhostBodies(std::vector<uint64_t>& out) const;
 
   // ---- receiving ----------------------------------------------------------
 
@@ -733,6 +736,9 @@ class DebrisSystem {
   // with probability falling off toward the rim so the crater edge is ragged
   // rather than a clean sphere. Ejected voxels become ballistic particles.
   // Runs before the radial impulse so the surviving shape takes the push.
+  // ONLY THE BODIES THIS MACHINE OWNS (2026-10-07): a ghost (a body a peer
+  // steps) is the peer's to damage, by the same blast, in its own phase K or
+  // phase N (session.cpp ExplosionHitsBodies). Every body in single-player.
   void DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels, World& world,
                           std::vector<ParticleSpawn>& spawns);
 

@@ -9790,30 +9790,22 @@ void Mob::TickGetUp(float dt) {
   }
 }
 
+bool MobSystem::OwnedHere(const Mob& m) {
+  return m.controller_ != Mob::Controller::RemoteGhost && !m.IsGhost();
+}
+
 int MobSystem::BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                float impulseKgMs) {
   // Every creature this machine may LAUNCH: the NPCs, the dead (a corpse is a
   // limp rig and takes the same one launch, Mob::BlastRadial, never the
-  // per-body impulse, AppendLiveLimbBodies) and the local players. A peer's
-  // ghost is carved (CarveMobsRadial) but never launched — its position is
-  // the wire's (mob.h). ForEachCreature's order: NPCs, then local avatars.
+  // per-body impulse, AppendLiveLimbBodies) and the local players -- the ones
+  // it OWNS. A ghost (a peer's player, or an NPC a peer steps) is carved
+  // (CarveMobsRadial) but never launched here — its position is the wire's
+  // (mob.h); its owner launches it. ForEachCreature's order: NPCs, then
+  // local avatars.
   int n = 0;
   ForEachCreature([&](Mob& m) {
-    if (m.controller_ == Mob::Controller::RemoteGhost) return;
-    if (!m.rigReleased_ && !m.limbs_.empty() &&
-        m.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
-      n++;
-  });
-  return n;
-}
-
-int MobSystem::BlastLocalAvatarsRadial(Vec3 centerWorldVoxel,
-                                       float radiusVoxels, float impulseKgMs) {
-  // A PEER's blast on this machine (session.cpp ExplosionHitsBodies,
-  // OwnAvatars): the same rule as above, on this process's players only.
-  int n = 0;
-  ForEachCreature([&](Mob& m) {
-    if (m.controller_ != Mob::Controller::LocalPlayer) return;
+    if (!OwnedHere(m)) return;
     if (!m.rigReleased_ && !m.limbs_.empty() &&
         m.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
       n++;
@@ -25286,29 +25278,20 @@ uint32_t Mob::RotAtSpawn(World& world) {
 void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                 World& world,
                                 std::vector<ParticleSpawn>& spawns,
-                                float power) {
-  // Every creature, a peer's ghost player included (mob.h ForEachCreature):
-  // the blast craters its body here too. A ghost PLAYER's gore goes to the
-  // discard (mob.h): its owner authors it. An unspawned avatar has no limbs,
-  // which is PlayerAvatar::CarveRadial's Spawned() guard.
+                                float power, bool ownedOnly) {
+  // Every creature, a peer's ghosts included (mob.h ForEachCreature): the
+  // blast craters its body here too. A GHOST's gore -- a peer's player, or an
+  // NPC a peer owns -- goes to the discard (mob.h): its owner authors it, in
+  // its own phase N (RemoteExplosionsHitOwnBodies). `ownedOnly` (that phase N)
+  // skips the ghosts outright. An unspawned avatar has no limbs, which is
+  // PlayerAvatar::CarveRadial's Spawned() guard.
   ghostSpawns_.clear();
   ForEachCreature([&](Mob& m) {
     if (m.limbs_.empty()) return;
+    const bool owned = OwnedHere(m);
+    if (ownedOnly && !owned) return;
     m.CarveRadialAll(centerWorldVoxel, radiusVoxels, world,
-                     m.controller_ == Mob::Controller::RemoteGhost
-                         ? ghostSpawns_
-                         : spawns,
-                     power);
-  });
-}
-
-void MobSystem::CarveLocalAvatarsRadial(Vec3 centerWorldVoxel,
-                                        float radiusVoxels, World& world,
-                                        std::vector<ParticleSpawn>& spawns,
-                                        float power) {
-  ForEachCreature([&](Mob& m) {
-    if (m.controller_ == Mob::Controller::LocalPlayer && !m.limbs_.empty())
-      m.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
+                     owned ? spawns : ghostSpawns_, power);
   });
 }
 

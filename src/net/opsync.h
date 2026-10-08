@@ -47,10 +47,10 @@
 //     by the kernel anyway.
 //
 // WHAT IS NOT EXCHANGED, stated so it is a known gap and not a surprise:
-//   * GAS SPAWNS. OpBatch has five vectors, not six (game/session.h): gas is
-//     queued inside World by its producers and joins at SubmitTick, so the
-//     frame layer never holds it and there is nothing here to encode. A
-//     peer's gas spawns do not cross in M9.3.
+//   * (GAS SPAWNS cross since 2026-10-07, kOpsWireVersion 2: phase N moves
+//     World's queue into OpBatch::gas before PushLocal and re-queues the
+//     merged batch's after the merge. Absolute 24.8 world coords, so no
+//     translation, like a ParticleSpawn.)
 //   * THE CPU-SIDE CONSEQUENCES of a remote explosion (island rescan, limb
 //     damage, body impulses). The crater crosses, because it is an op; the
 //     debris scan and the ragdoll launch are raised by the AUTHORING machine
@@ -68,7 +68,8 @@ namespace net {
 // than in TickBatchHeader because the blob is opaque to protocol.h by design
 // (three packages' schemas in one file would make every one of them a protocol
 // version bump).
-constexpr uint32_t kOpsWireVersion = 1;
+// 2: the sixth vector, OpBatch::gas (2026-10-07).
+constexpr uint32_t kOpsWireVersion = 2;
 
 // HOW FAR AHEAD A TICK'S OPS ARE LABELLED, and it is D + 1, NOT D.
 //
@@ -142,7 +143,8 @@ struct MergeStats {
   uint32_t remoteCellsDropped = 0;  // chunk not resident here
   uint32_t remoteSpawns = 0;
   uint32_t remoteFluid = 0;
-  uint32_t merged = 0;           // ops of all five kinds in the merged batch
+  uint32_t remoteGas = 0;
+  uint32_t merged = 0;           // ops of all six kinds in the merged batch
   int32_t firstDropChunk[3] = {0, 0, 0};
   bool haveFirstDrop = false;
 };
@@ -229,7 +231,7 @@ class OpDelayQueue {
   //
   // `remoteExpIdx` (optional) is the same for EXPLOSIONS: the merged indices
   // of the peer's blasts. Phase N applies exactly those to this machine's own
-  // avatars (session.h RemoteExplosionsHitOwnAvatars) — the owner-side half of
+  // bodies (session.h RemoteExplosionsHitOwnBodies) — the owner-side half of
   // a grenade that the author's machine cannot apply (DESIGN.md s10).
   //
   // Erases every label at or before this one: labels are consumed in tick

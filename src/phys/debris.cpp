@@ -4219,6 +4219,11 @@ bool DebrisSystem::IsGhost(uint64_t handle) const {
   return i >= 0 && !OwnedLocally(bodies_[i]);
 }
 
+void DebrisSystem::AppendGhostBodies(std::vector<uint64_t>& out) const {
+  for (const Body& b : bodies_)
+    if (b.handle && !OwnedLocally(b)) out.push_back(b.handle);
+}
+
 uint32_t DebrisSystem::GhostCount() const {
   uint32_t n = 0;
   for (const Body& b : bodies_)
@@ -5392,6 +5397,12 @@ void DebrisSystem::DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels,
 
   for (size_t bi = 0; bi < bodies_.size();) {
     Body& b = bodies_[bi];
+    // A GHOST is its owner's to damage (debris.h): the same blast reaches it
+    // on the machine that steps it.
+    if (!OwnedLocally(b)) {
+      bi++;
+      continue;
+    }
     phys_->GetTransform(b.handle, b.xf);
     // cheap reject: blast sphere vs body bounding sphere
     if ((b.xf.pos - centerVoxel).len() > radiusVoxels + b.radiusVoxels + 2.0f) {

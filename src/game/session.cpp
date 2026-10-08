@@ -5164,10 +5164,11 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
           // peer's ghost (carved as presentation, never launched) — the same
           // rule a melee hit on a ghost follows. The peer's REAL body is hit
           // on the peer's machine, by the peer, at the landing tick: phase N's
-          // RemoteExplosionsHitOwnAvatars applies every REMOTE blast in the
-          // merged batch to that machine's own avatars (DESIGN.md §10). The
-          // ghost's gore is discarded here (MobSystem::CarveMobsRadial) and
-          // authored there, so it enters the shared batch once.
+          // RemoteExplosionsHitOwnBodies applies every REMOTE blast in the
+          // merged batch to every body that machine owns -- avatars, NPCs,
+          // corpses, debris (DESIGN.md §10). A ghost's gore is discarded here
+          // (MobSystem::CarveMobsRadial) and authored there, so it enters the
+          // shared batch once; a ghost is never pushed or launched here.
           // VESSELS BURST FIRST (container.h ContainerBlastPass): the carve
           // below would take a flask's body and, through OnBodyGone, the
           // registry entry that is its contents. They drain through
@@ -5203,16 +5204,13 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
                          std::vector<ParticleSpawn>& spawns, BlastBodies who) {
   // Reach and strength come from ONE place (BlastForceOf, session.h).
   const BlastForce f = BlastForceOf(e);
-  if (who == BlastBodies::OwnAvatars) {
-    // A PEER's blast on this machine: the same carve and the same launch as
-    // below, on this process's own avatars only. The debris, the NPCs and the
-    // impulse are left alone -- this is the owner-side half of a player hit,
-    // not a second application of the whole blast.
-    mobs.CarveLocalAvatarsRadial(f.center, f.craterRadius, world, spawns,
-                                 f.power);
-    mobs.BlastLocalAvatarsRadial(f.center, f.pushRadius, f.rigImpulse);
-    return;
-  }
+  // OwnedBodies: a PEER's blast on this machine, the owner-side half -- the
+  // same pass below on exactly the bodies this machine owns (session.h). The
+  // only difference from Everyone is the creature carve: Everyone also carves
+  // a ghost as presentation (gore discarded); OwnedBodies leaves it to its
+  // owner. The debris damage, the impulse and the launch are owned-only in
+  // both modes, and in single-player every body is owned.
+  const bool ownedOnly = who == BlastBodies::OwnedBodies;
   // Blow voxels OFF the bodies in range before shoving what survives:
   // an explosion next to a rigidbody now craters it, and splits it into
   // separate bodies when the crater severs it. Runs first so the
@@ -5231,7 +5229,8 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // rule, so a weak blast tears less than a strong one of the same radius
   // and a worn shell in the way takes its hardness off the flesh behind it
   // (Mob::CarveLimbRadial, game/shellresponse.h).
-  mobs.CarveMobsRadial(f.center, f.craterRadius, world, spawns, f.power);
+  mobs.CarveMobsRadial(f.center, f.craterRadius, world, spawns, f.power,
+                       ownedOnly);
   // The per-body impulse is for DEBRIS. A living creature's limbs are
   // skipped whether kinematic (standing) or dynamic (already limp
   // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
@@ -5239,6 +5238,8 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // "bodies zoom across the map". The rig takes ONE launch below.
   std::vector<uint64_t> rigBodies;
   mobs.AppendLiveLimbBodies(rigBodies);  // NPCs + every avatar
+  // ...and every debris GHOST: its motion is the wire's, its owner pushes it.
+  debris.AppendGhostBodies(rigBodies);
   std::sort(rigBodies.begin(), rigBodies.end());
   phys.ApplyRadialImpulse(f.debrisCenter, f.pushRadius, f.debrisImpulse,
                           &rigBodies);
@@ -5252,7 +5253,7 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   mobs.BlastMobsRadial(f.center, f.pushRadius, f.rigImpulse);
 }
 
-uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
+uint32_t RemoteExplosionsHitOwnBodies(std::span<const ExplosionOp> exps,
                                        std::span<const uint32_t> remoteIdx,
                                        World& world, Physics& phys,
                                        DebrisSystem& debris, MobSystem& mobs,
@@ -5261,7 +5262,7 @@ uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
   for (uint32_t i : remoteIdx) {
     if (i >= exps.size()) continue;
     ExplosionHitsBodies(exps[i], world, phys, debris, mobs, gore,
-                        BlastBodies::OwnAvatars);
+                        BlastBodies::OwnedBodies);
     n++;
   }
   return n;
@@ -5485,6 +5486,11 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         namespace opstream = sandvox::opstream;
         net::OpDelayQueue& q = w.opsync->Q();
         const uint32_t label = tick + q.D();
+        // THE SIXTH VECTOR (2026-10-07): this tick's gas spawns, out of the
+        // World queue their producers wrote (every producer runs before phase
+        // N), into the batch that is stored and sent. Handed back after the
+        // merge, below.
+        world.TakeGasSpawns(out.gas);
         q.PushLocal(tick, out, world.WindowOrigin());
         q.NoteLocalMeta(
             label, opstream::ResolveAuthors(opstream::Stream::Brush,
@@ -5526,15 +5532,25 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         // one of them at the merged vectors and the submit below needs no
         // change at all.
         out = std::move(merged);
+        // The merged gas -- the host's, then the client's, in push order, the
+        // same list on both machines -- goes back to World's queue, which
+        // SubmitTick drains and the op record records exactly as in a
+        // single-player tick. The queue is empty here (taken above), so the
+        // per-tick cap is charged on the merged list, identically on both.
+        if (!out.gas.empty()) {
+          world.QueueGasSpawns(out.gas.data(), (uint32_t)out.gas.size());
+          out.gas.clear();
+        }
         // ---- A PEER'S GRENADE HITS MY BODY, ON MY MACHINE ---------------
         // The owner-side half W1-F left open (DESIGN.md s10): at the landing
         // tick, the tick its crater reaches this GPU, each REMOTE explosion
-        // carves and launches this machine's own avatars. The author's
-        // machine carved my ghost as presentation and could not launch it;
-        // this is the real body. My own blasts are LOCAL in the merge and
+        // carves, pushes and launches every body this machine OWNS: its avatars,
+        // NPCs, corpses and debris (2026-10-07; it was the avatars only). The
+        // author's machine carved my ghosts as presentation and could not move them;
+        // these are the real bodies. My own blasts are LOCAL in the merge and
         // were applied in phase K when I authored them, so nothing is applied
         // twice. The gore goes to the next local batch (session.h).
-        RemoteExplosionsHitOwnAvatars(exps, remoteExp, world, phys, debris,
+        RemoteExplosionsHitOwnBodies(exps, remoteExp, world, phys, debris,
                                       mobs, w.remoteBlastGore);
       }
       // ---- M9.3-C: THE SMOKE'S DELIBERATE DIVERGENCE --------------------

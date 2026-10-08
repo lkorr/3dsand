@@ -23485,8 +23485,12 @@ re-noted at the merged indices, so the record still names every op's author
 (`Producer::Remote` + the peer id). Consequence accepted for now: a remote
 explosion's CRATER lands at T+5 while its CPU-side mob and limb damage lands
 at T; M9.4-D moves the crater's island scan to the chunk authority. Gas
-spawns are not exchanged (they never enter `OpBatch`). Single-player is D = 0
-and byte-identical to the oracle.
+spawns are exchanged since 2026-10-07 (`OpBatch::gas`, `kOpsWireVersion` 2):
+connected, phase N moves World's gas queue into the batch before `PushLocal`
+and hands the merged batch's gas back to the queue after the merge, where
+`SubmitTick` drains and records it as before (gate `ops-exchange` H).
+Single-player is D = 0, `gas` stays empty, and it is byte-identical to the
+oracle.
 
 **M9.4 — entities are owned by the nearest resident player (2026-09-21;
 `src/net/authority.*`, `src/net/entitysync.*`, `mob.*`, `debris.*`).** Ownership is
@@ -23550,8 +23554,9 @@ Smoke: a flying, painting client put 2,163 chunks; the host received, saved
 and a fresh process loaded exactly 2,163 tagged chunks at the saved tick.
 
 **What is still not multiplayer, stated plainly.** Two players, one host,
-direct IP over TCP; no lobby, NAT traversal or third peer; gas spawns are
-not exchanged; a replaced chunk's in-flight particles are not flushed; a
+direct IP over TCP; no lobby, NAT traversal or third peer; melee hits on a
+peer's bodies do not reach their owner (below); a replaced chunk's in-flight
+particles are not flushed; a
 ghost's coat is stale until handoff; `WaterBodies()` is still keyed on the
 window origin (rule 1 below); the HUD has no net line (the `--frames` exit
 report is the readout). Every one of these is listed with its trigger in
@@ -23578,21 +23583,28 @@ in-process players hit each other (gate `blast-players`). **A grenade also
 reaches the peer's REAL body**, with no protocol change: explosions travel in
 the merged op batch, `OpDelayQueue::Merge` reports the merged indices of the
 REMOTE ones (`remoteExpIdx`, as it does for brush ops), and phase N applies
-exactly those to this machine's own avatars at the landing tick
-(`RemoteExplosionsHitOwnAvatars` -> `ExplosionHitsBodies(..,
-BlastBodies::OwnAvatars)`: carve plus launch, no NPC, no debris, no ghost).
-Nothing is applied twice: the author's own blast is LOCAL in its merge (phase
-K hit its bodies when authored), and on the owner's machine the author is a
-ghost, which `OwnAvatars` skips. The gore follows the ghost rule: a ghost's
+exactly those to every body this machine OWNS at the landing tick
+(`RemoteExplosionsHitOwnBodies` -> `ExplosionHitsBodies(..,
+BlastBodies::OwnedBodies)`: its avatars, NPCs, corpses and debris, carved,
+pushed and launched; no ghost). **Each body is hit once, by its owner
+(2026-10-07; phase N reached only the avatars before, so a peer's grenade
+never touched this machine's NPCs or debris):** phase K's pass damages and
+pushes only OWNED debris (`DebrisSystem::DamageBodiesRadial` skips ghosts,
+ghost debris joins the impulse skip list) and launches only owned creatures
+(`MobSystem::OwnedHere`), and carves a ghost NPC as presentation with its
+gore discarded exactly as it carves a ghost player. Nothing is applied twice:
+the author's own blast is LOCAL in its merge (phase K hit its bodies when
+authored), and on the owner's machine the author's bodies are ghosts, which
+`OwnedBodies` skips. Gate `blast-players` (e) and (f). The gore follows the ghost rule: a ghost's
 carve spawns are discarded on the author's machine (`CarveMobsRadial`'s
 `ghostSpawns_`), and the owner's carve spawns are carried into its NEXT local
 batch (`TickAuthorityCtx::remoteBlastGore`, drained in phase L) because phase
 N runs after the outgoing batch was stored — pushed into the merged batch
 they would reach one GPU only. A remote crater's box is also marked modified
-in phase N, as a remote brush op's is. Still open: a peer's blast does not
-touch this machine's NPCs or debris (the author's machine applies it to its
-own), and melee has no op to ride, so an owner-side sword hit still needs a
-hit message.
+in phase N, as a remote brush op's is. Still open: melee has no op to ride,
+so an owner-side sword hit still needs a hit message -- and that needs owner
+decisions first (who is trusted, who judges a parry, a hit during a handoff;
+`docs/PLAN_multiplayer_m9.md` "Melee across the wire").
 
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×

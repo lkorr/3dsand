@@ -142,11 +142,16 @@ bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt);
 // avatars (W1-F): a grenade carves and launches the OTHER player too, and a
 // peer's ghost is carved but never launched (game/mob.h).
 //
-// `who` narrows the pass. Everyone (phase K, the AUTHOR's machine): debris,
-// NPCs, every avatar, the impulse. OwnAvatars (phase N, a PEER's blast on the
-// OWNER's machine): only this process's own avatars, carved and launched --
-// the body the author's machine could only carve as a ghost.
-enum class BlastBodies : uint8_t { Everyone, OwnAvatars };
+// `who` narrows the pass. Everyone (phase K, the AUTHOR's machine): every
+// body this machine OWNS is hit -- its debris, NPCs, corpses and avatars,
+// carved, pushed and launched -- and a peer's ghosts (players and NPCs) are
+// carved as presentation with their gore discarded, never pushed or launched.
+// OwnedBodies (phase N, a PEER's blast on this machine): only what this
+// machine owns, carved, pushed and launched -- the bodies the author's machine
+// could only see as ghosts. Each body is therefore hit exactly once, by its
+// owner (2026-10-07: until then phase N reached only the avatars, so a peer's
+// grenade never touched this machine's NPCs or debris).
+enum class BlastBodies : uint8_t { Everyone, OwnedBodies };
 
 // ---- WHAT ONE EXPLOSION DOES TO BODIES, IN ONE PLACE (W2-H) ----------------
 //
@@ -188,15 +193,15 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
 
 // THE OWNER-SIDE HALF OF A PEER'S GRENADE. `remoteIdx` are the merged indices
 // of the peer's explosions (OpDelayQueue::Merge's remoteExpIdx); each is
-// applied to this machine's own avatars with BlastBodies::OwnAvatars at the
-// landing tick. Nothing is applied twice: the author's machine sees its own
-// blast as LOCAL in the merge (so this skips it; phase K hit its bodies when
-// it was authored), and here the author is a ghost, which OwnAvatars never
-// touches. `gore` receives the carve's particle spawns; phase N runs AFTER the
+// applied to every body this machine owns -- avatars, NPCs, corpses, debris --
+// with BlastBodies::OwnedBodies at the landing tick. Nothing is applied twice:
+// the author's machine sees its own blast as LOCAL in the merge (so this
+// skips it; phase K hit its own bodies when it was authored), and here the
+// author's bodies are ghosts, which OwnedBodies never touches. `gore` receives the carve's particle spawns; phase N runs AFTER the
 // outgoing batch was stored, so the caller carries them into its NEXT local
 // batch (TickAuthorityCtx::remoteBlastGore) rather than into the merged one,
 // which would reach only this machine's GPU. Returns the number applied.
-uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
+uint32_t RemoteExplosionsHitOwnBodies(std::span<const ExplosionOp> exps,
                                        std::span<const uint32_t> remoteIdx,
                                        World& world, Physics& phys,
                                        DebrisSystem& debris, MobSystem& mobs,
@@ -373,16 +378,20 @@ int BodySlotFor(const char* name, const char* tag);
 // the difference between "the tick submitted something" and "the tick produced
 // something the caller decides what to do with".
 //
-// FIVE VECTORS, NOT SIX. The plan says six; the sixth (gas spawns) is queued
-// inside World by the producers themselves and joins at SubmitTick, so there
-// is no vector here for the frame layer to own. Recorded rather than faked
-// with an always-empty member.
+// SIX VECTORS, THE SIXTH ONLY ON THE WIRE. Gas spawns are queued inside World
+// by their producers (World::QueueGasSpawns) and join at SubmitTick, so in a
+// single-player tick `gas` stays EMPTY and nothing about that path changed.
+// Connected, phase N moves the tick's queue into `gas` before PushLocal (so a
+// peer's spawns cross like every other op, 2026-10-07) and hands the MERGED
+// batch's gas back to the queue after the merge, where SubmitTick drains (and
+// the op record records) it exactly as before.
 struct OpBatch {
   std::vector<BrushOp> ops;
   std::vector<ExplosionOp> exps;
   std::vector<CellOp> cells;
   std::vector<ParticleSpawn> spawns;
   std::vector<FluidSpawnOp> fluid;
+  std::vector<GasSpawnOp> gas;
   // Cleared, not reconstructed: the capacity is worth keeping across ticks and
   // the values are identical either way.
   void Clear() {
@@ -391,6 +400,7 @@ struct OpBatch {
     cells.clear();
     spawns.clear();
     fluid.clear();
+    gas.clear();
   }
 };
 
@@ -872,7 +882,7 @@ struct TickAuthorityCtx {
   uint32_t fluidCount = 0;
   std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
   // Gore from a PEER's blast on this machine's own avatars (phase N,
-  // RemoteExplosionsHitOwnAvatars), drained into the next tick's local
+  // RemoteExplosionsHitOwnBodies), drained into the next tick's local
   // spawns in phase L so it travels to the peer like any gore authored here.
   // Always empty without a connected peer.
   std::vector<ParticleSpawn> remoteBlastGore;

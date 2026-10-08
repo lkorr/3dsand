@@ -12,7 +12,7 @@ namespace {
 using sandvox::opstream::OpMeta;
 using sandvox::opstream::Producer;
 
-// The five vectors, in ONE order, written once. Encode and Decode both go
+// The six vectors, in ONE order, written once. Encode and Decode both go
 // through it, so a vector added to OpBatch cannot be encoded and forgotten on
 // the read side (the compiler will not catch that; a single list will).
 template <typename W, typename B>
@@ -22,6 +22,7 @@ void WalkBatch(W&& w, B& b) {
   w(b.cells);
   w(b.spawns);
   w(b.fluid);
+  w(b.gas);   // kOpsWireVersion 2
 }
 
 }  // namespace
@@ -218,6 +219,7 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
                           e->batch.spawns.end());
         out.fluid.insert(out.fluid.end(), e->batch.fluid.begin(),
                          e->batch.fluid.end());
+        out.gas.insert(out.gas.end(), e->batch.gas.begin(), e->batch.gas.end());
         // Re-note as RUNS of equal (producer, author): one range per run
         // reproduces exactly what ResolveAuthors would have expanded, at a
         // fraction of the ranges.
@@ -304,11 +306,18 @@ OpBatch OpDelayQueue::Merge(uint32_t label, const World& world, MergeStats& st,
         out.fluid.push_back(f);
         st.remoteFluid++;
       }
+      // Gas spawns: absolute 24.8 world coords, like a particle (the GPU
+      // refuses one outside the window). The per-tick cap is charged when
+      // phase N hands the merged list back to World::QueueGasSpawns.
+      for (const GasSpawnOp& g : e->batch.gas) {
+        out.gas.push_back(g);
+        st.remoteGas++;
+      }
     }
   }
 
   st.merged = (uint32_t)(out.ops.size() + out.exps.size() + out.cells.size() +
-                         out.spawns.size() + out.fluid.size());
+                         out.spawns.size() + out.fluid.size() + out.gas.size());
   mergedMax = std::max<uint64_t>(mergedMax, st.merged);
   mergedUpTo_ = label;
   everMerged_ = true;

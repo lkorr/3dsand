@@ -6543,27 +6543,30 @@ class MobSystem {
   // local damage to a ghost carves its rig as presentation; the owner decides
   // its life). A GHOST'S GORE IS THROWN AWAY (ghostSpawns_, cleared per call),
   // like every other op a ghost authors: the owner applies the same blast to
-  // its real body at the landing tick (RemoteExplosionsHitOwnAvatars) and its
+  // its real body at the landing tick (RemoteExplosionsHitOwnBodies) and its
   // gore reaches both worlds from there. Emitting it here too would put the
-  // blood in the shared batch twice.
+  // blood in the shared batch twice. THE SAME FOR A PEER'S NPC (2026-10-07):
+  // a creature another machine owns (Mob::IsGhost) is carved here as
+  // presentation with its gore discarded; its owner applies the blast to it.
   //
   // `power` is the explosion's (ExplosionOp::power): > 0 carves by the terrain
   // rule with worn shells in the way (Mob::CarveLimbRadial); 0 = radius only.
+  // `ownedOnly`: carve ONLY the creatures this machine owns (NPCs and corpses
+  // that are not ghosts, and the local avatars) -- the owner-side half of a
+  // PEER's blast (BlastBodies::OwnedBodies).
   void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
-                       std::vector<ParticleSpawn>& spawns, float power = 0.0f);
-  // Only THIS process's avatars (the leading `localCount` of SetAvatars): the
-  // owner-side half of a PEER's blast. No NPC, no ghost.
-  void CarveLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
-                               World& world,
-                               std::vector<ParticleSpawn>& spawns,
-                               float power = 0.0f);
-  int BlastLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
-                              float impulseKgMs);
+                       std::vector<ParticleSpawn>& spawns, float power = 0.0f,
+                       bool ownedOnly = false);
+  // Does this machine own `m`'s body: not a peer's ghost player and not a
+  // creature another machine steps (Mob::IsGhost). True for everything in a
+  // single-player world.
+  static bool OwnedHere(const Mob& m);
   // The blast's OTHER half: knock every creature in reach off its feet
   // (Mob::BlastRadial). Runs after the carve, on what survived it. Returns
-  // how many were knocked down. Covers the LOCAL avatars as well, never a
-  // ghost's: a ghost's position is the wire's (RemotePlayersPostStep), and a
-  // limp ghost would be this machine disagreeing with its owner.
+  // how many were knocked down. Only creatures this machine OWNS (OwnedHere):
+  // a ghost's position is the wire's (RemotePlayersPostStep), and a limp
+  // ghost would be this machine disagreeing with its owner -- the owner
+  // launches it, for its own blasts in phase K and a peer's in phase N.
   int BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                       float impulseKgMs);
   // Mob::AppendLiveLimbBodies over every live NPC, every limb of an

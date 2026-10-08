@@ -965,8 +965,13 @@ Status GateAuthority(Ctx& c, std::string& detail) {
 //      World::SlotToWorldChunk (the World member reads the LOCAL origin and
 //      there is no World holding the peer's). A copy that drifts paints the
 //      wrong chunk silently, so the two are compared over a spread of slots.
-//  (F) THE WIRE BLOB ROUND-TRIPS, all five vectors, and REFUSES a truncated
-//      or wrong-version one whole rather than half-decoding it.
+//  (F) THE WIRE BLOB ROUND-TRIPS, all six vectors (gas since 2026-10-07),
+//      and REFUSES a truncated or wrong-version one whole rather than
+//      half-decoding it.
+//  (H) GAS CROSSES. The client authors a gas parcel every 11 ticks; it is in
+//      the merged batch on BOTH seats (so the host's machine spawns the
+//      client's gas), and it reaches the GPU the way phase N hands it over --
+//      through World's gas queue -- so (A)'s hashes cover it.
 //  (G) THE RECORD REPLAYS. The host arm is recorded and replayed through the
 //      same drive loop `ops-replay` uses; same hash series. That is what says
 //      the merged stream is still a complete description of the tick.
@@ -1014,8 +1019,12 @@ struct Script {
     }
     if (t % 13 == 0)
       b.ops.push_back({hx + 40, hy, hz + 40, 4, kMatSand, 1u, 0, 0});
+    // (H): a smoke parcel a few cells over the stroke, every 11 ticks.
+    if (t % 11 == 0 && gasMat != 0)
+      b.gas.push_back(MakeGasSpawn(hx - 30, hy + 6, hz - 30, gasMat));
     return b;
   }
+  uint32_t gasMat = 0;
 };
 
 // ONE MESSAGE ACROSS A REAL LOOPBACK LINK, not a direct call into the queue.
@@ -1072,6 +1081,7 @@ struct ArmResult {
   int bothRemoteIdx = -1;
   uint64_t missingLocal = 0, missingRemote = 0, mergedMax = 0;
   bool wireOk = true;
+  uint32_t gasMerged = 0, gasRemote = 0;   // (H), summed over the run
 };
 
 // Play the script from ONE seat. `localId` is which player this machine is.
@@ -1108,6 +1118,12 @@ void RunArm(Ctx& c, const Script& sc, uint32_t localId, ArmResult& r) {
     }
     r.blobs.emplace_back();
     BlobOf(merged, r.blobs.back());
+    // (H) phase N's hand-over: the merged gas into World's queue, which
+    // SubmitTick drains (and the op record records).
+    r.gasMerged += (uint32_t)merged.gas.size();
+    r.gasRemote += ms.remoteGas;
+    if (!merged.gas.empty())
+      c.world.QueueGasSpawns(merged.gas.data(), (uint32_t)merged.gas.size());
 
     SubmitTick(c.ctx, c.world, c.sim, t, sc.seed, merged.ops, merged.exps,
                merged.cells, true, {8, 3, 8}, false, t >= 100, merged.spawns,
@@ -1132,6 +1148,8 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
   Script sc;
   sc.seed = seed;
   sc.origin = wo;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "smoke") sc.gasMat = (uint32_t)i;
   sc.ox = wo.x * (int)kChunk;
   sc.oz = wo.z * (int)kChunk;
   sc.hx = sc.ox + 120;
@@ -1151,6 +1169,7 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
     b.cells.push_back({1234u, PackVoxNew(kMatWood, 2)});
     b.spawns.push_back({1, 2, 3, 4, 5, 6, 7u, 1u});
     b.fluid.push_back({1, 2, 3, 4, 5, 6, 2u, kMatWater});
+    b.gas.push_back(MakeGasSpawn(11, 12, 13, 7u, 2u));
     std::vector<uint8_t> buf;
     net::OpsWire::Encode(b, IVec3{9, -8, 7}, 4242u, buf);
     OpBatch out;
@@ -1161,11 +1180,13 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
     t.Eq("wire: label survives", (long long)label, 4242ll);
     t.Eq("wire: origin survives",
          (long long)(origin.x * 100 + origin.y * 10 + origin.z), 827ll);
-    t.Eq("wire: the five vectors keep their sizes",
+    t.Eq("wire: the six vectors keep their sizes",
          (long long)(out.ops.size() + out.exps.size() * 10 +
                      out.cells.size() * 100 + out.spawns.size() * 1000 +
-                     out.fluid.size() * 10000),
-         11111ll);
+                     out.fluid.size() * 10000 + out.gas.size() * 100000),
+         111111ll);
+    t.Eq("wire: a gas spawn survives field for field",
+         out.gas.empty() ? 1 : std::memcmp(&out.gas[0], &b.gas[0], sizeof(GasSpawnOp)), 0);
     t.Eq("wire: a brush op survives field for field",
          std::memcmp(&out.ops[0], &b.ops[0], sizeof(BrushOp)), 0);
     t.Eq("wire: an explosion keeps its author",
@@ -1283,6 +1304,16 @@ Status GateOpsExchange(Ctx& c, std::string& detail) {
        -1ll);
   t.True("canonical: the arms actually did something (a non-empty merge)",
          host.mergedMax > 0);
+  // (H) gas crossed: the client's parcels are in the merged batch on the
+  // host's seat as REMOTE ops, and on the client's seat as its own; same
+  // total either way (the blobs above already compared them byte for byte).
+  t.True("gas: the script has a gas material", sc.gasMat != 0);
+  t.True("gas: the client's parcels reached the host's merge as remote ops",
+         host.gasRemote > 0);
+  t.Eq("gas: ...all of them (host's remote = client's merged total)",
+       (long long)host.gasRemote, (long long)client.gasMerged);
+  t.Eq("gas: the client's seat merged none as remote (the host authors none)",
+       (long long)client.gasRemote, 0ll);
 
   // (B) author-major order, on the one tick that can tell it apart: both
   // players authored a brush op, so the merge has two and the question is
@@ -1787,7 +1818,7 @@ Status GateStoreSync(Ctx& c, std::string& detail) {
 // `ExplosionHitsBodies` (session.h) and every player is reached through
 // MobSystem's registered avatars. Over the wire the author's machine can only
 // carve B's GHOST; B's machine applies A's blast to B's real body in phase N
-// (`RemoteExplosionsHitOwnAvatars`), from the explosion indices
+// (`RemoteExplosionsHitOwnBodies`), from the explosion indices
 // `OpDelayQueue::Merge` reports as remote. The gate calls those functions --
 // the code phases K and N run -- rather than restating them. CPU + Jolt only:
 // no tick, no worldgen, nothing pinned.
@@ -1815,6 +1846,16 @@ Status GateStoreSync(Ctx& c, std::string& detail) {
 //   (d) A'S MACHINE, phase N. The same blast is A's LOCAL op in A's merge, so
 //       phase N applies nothing -- A and B's ghost, both in reach, are
 //       untouched. Together with (b) that is "never applied twice".
+//   (e) NPCS AND DEBRIS, B'S MACHINE, phase N (2026-10-07: phase N reached
+//       only the avatars, so a peer's grenade never touched this machine's
+//       NPCs or debris). An NPC and a stone cube B owns, and an NPC and a cube
+//       A owns (B holds them as ghosts), all at the same distance from A's
+//       blast: B's NPC is carved and launched and B's cube is damaged or
+//       pushed; A's NPC and A's cube are untouched (A's machine hits them).
+//   (f) THE SAME FOUR BODIES ON A'S MACHINE, phase K (A authored the blast):
+//       A's own NPC carved and launched and A's cube hit; B's NPC (a ghost
+//       here) carved as presentation but NOT launched, and B's cube (a ghost)
+//       neither damaged nor pushed -- B's machine does that in its phase N.
 namespace blastp {
 
 enum class Arm { Local, Ghost, OwnerSide, AuthorSide };
@@ -1829,7 +1870,7 @@ struct BlastArm {
   bool bSkipped = false;  // B's limb bodies were in AppendLiveLimbBodies
   size_t spawns = 0;      // gore into the batch (or phase N's carry vector)
   size_t remoteExps = 0;  // (c)/(d): what the merge reported as remote
-  uint32_t applied = 0;   // (c)/(d): RemoteExplosionsHitOwnAvatars' count
+  uint32_t applied = 0;   // (c)/(d): RemoteExplosionsHitOwnBodies' count
   std::string why;
 };
 
@@ -1860,7 +1901,7 @@ uint32_t PhaseNOnce(Ctx& c, uint32_t localId, uint32_t authorId,
   // Merge noted author ranges for the merged vector; this gate submits
   // nothing, so drop them rather than hand them to the next gate's tick.
   sandvox::opstream::ClearAuthorRanges();
-  return RemoteExplosionsHitOwnAvatars(merged.exps, remoteExp, c.world, c.phys,
+  return RemoteExplosionsHitOwnBodies(merged.exps, remoteExp, c.world, c.phys,
                                        c.debris, c.mobs, gore);
 }
 
@@ -1966,19 +2007,140 @@ void RunBlastArm(Ctx& c, Arm arm, BlastArm& r) {
   c.mobs.Reset(true);
 }
 
+// (e)/(f): two NPCs and two stone cubes round one blast, half of them owned
+// by THIS machine (`localId`), half by the peer. `ownerSide` = B's machine
+// receiving A's blast through phase N; otherwise A's machine authoring it in
+// phase K.
+struct BodiesArm {
+  uint32_t mineNpcLost = 0, peerNpcLost = 0;
+  bool mineNpcLimp = false, peerNpcLimp = false;
+  bool mineCubeHit = false, peerCubeHit = false;
+  uint32_t applied = 0;
+  std::string why;
+};
+
+void RunBodiesArm(Ctx& c, bool ownerSide, BodiesArm& r) {
+  c.debris.Reset();
+  c.mobs.Reset(true);
+  int dummy = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "dummy") dummy = (int)i;
+  if (dummy < 0) {
+    r.why = "no `dummy` mob def";
+    return;
+  }
+  const uint32_t localId = ownerSide ? 1u : 0u, peerId = ownerSide ? 0u : 1u;
+  const IVec3 wo = c.world.WindowOrigin();
+  const int cx = (wo.x + (int)kNChunk / 2) * (int)kChunk + 40;
+  const int cz = (wo.z + (int)kNChunk / 2) * (int)kChunk + 40;
+  const int off = 8;
+  // At the chest height of the HIGHER of the two NPCs' footings, so the two
+  // stand symmetric to the blast but for a cell or two of ground.
+  const int gy = std::max(World::TerrainHeight(cx + off, cz, c.world.WorldSeed()),
+                          World::TerrainHeight(cx - off, cz, c.world.WorldSeed()));
+  c.mobs.SetLocalPlayerId(localId);
+  c.debris.SetLocalPlayerId(localId);
+  auto spawnNpc = [&](int x, uint32_t owner) -> uint64_t {
+    const int h = World::TerrainHeight(x, cz, c.world.WorldSeed());
+    const uint64_t id = c.mobs.Spawn(dummy, IVec3{x, h + 1, cz});
+    if (id) c.mobs.SetMobOwner(id, owner);
+    return id;
+  };
+  const uint64_t npcMine = spawnNpc(cx + off, localId);
+  const uint64_t npcPeer = spawnNpc(cx - off, peerId);
+  // The cubes: created under each owner's id (a body is its creator's).
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+  auto cube = [&](int z, uint32_t owner) -> uint64_t {
+    std::vector<DebrisVoxel> v;
+    for (int k = 0; k < 64; k++)
+      v.push_back({(int8_t)(k & 3), (int8_t)((k >> 2) & 3), (int8_t)(k >> 4), 0, kMatStone});
+    const int h = World::TerrainHeight(cx, z, c.world.WorldSeed());
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)cx, (float)(h + 2), (float)z};
+    xf.quat[3] = 1;
+    c.debris.SetLocalPlayerId(owner);
+    const uint64_t hd = c.phys.CreateDebrisBody(v, {cx, h + 2, z}, dens);
+    c.debris.AdoptBody(hd, v, xf);
+    c.debris.SetLocalPlayerId(localId);
+    return hd;
+  };
+  const uint64_t cubeMine = cube(cz + off, localId);
+  const uint64_t cubePeer = cube(cz - off, peerId);
+  if (!npcMine || !npcPeer || !cubeMine || !cubePeer ||
+      c.debris.IsGhost(cubeMine) || !c.debris.IsGhost(cubePeer)) {
+    r.why = "fixture: the NPCs / cubes did not spawn with the intended owners";
+    c.mobs.SetLocalPlayerId(0);
+    c.debris.SetLocalPlayerId(0);
+    c.debris.Reset();
+    c.mobs.Reset(true);
+    return;
+  }
+  auto npcVoxels = [&](uint64_t id) {
+    uint32_t n = 0;
+    const MobDef& d = c.mobs.Defs()[(size_t)dummy];
+    for (size_t i = 0; i < d.limbs.size(); i++) n += c.mobs.LimbVoxelCount(id, (int)i);
+    return n;
+  };
+  auto cubeState = [&](uint64_t h, uint32_t& vox, float& speed) {
+    const std::vector<DebrisVoxel>* v = c.debris.BodyVoxelsOf(h);
+    vox = v ? (uint32_t)v->size() : 0u;
+    Vec3 lin{}, ang{};
+    speed = c.phys.GetBodyVelocities(h, lin, ang) ? lin.len() + ang.len() : 0.0f;
+  };
+  const uint32_t nm0 = npcVoxels(npcMine), np0 = npcVoxels(npcPeer);
+  uint32_t cm0 = 0, cp0 = 0;
+  float sm0 = 0, sp0 = 0;
+  cubeState(cubeMine, cm0, sm0);
+  cubeState(cubePeer, cp0, sp0);
+  const auto& g = CurrentTuning().grenade;
+  const ExplosionOp e{cx, gy + 6, cz, g.blastRadius, g.blastPower, 0, 0, 0};
+  std::vector<ParticleSpawn> spawns;
+  BlastArm dummyArm;
+  if (ownerSide)
+    r.applied = PhaseNOnce(c, localId, peerId, e, dummyArm, spawns);
+  else
+    ExplosionHitsBodies(e, c.world, c.phys, c.debris, c.mobs, spawns);
+  const uint32_t nm1 = npcVoxels(npcMine), np1 = npcVoxels(npcPeer);
+  r.mineNpcLost = nm0 > nm1 ? nm0 - nm1 : 0;
+  r.peerNpcLost = np0 > np1 ? np0 - np1 : 0;
+  const Mob* mm = c.mobs.FindMobById(npcMine);
+  const Mob* mp = c.mobs.FindMobById(npcPeer);
+  r.mineNpcLimp = mm && mm->Ragdoll() == Mob::RagdollPhase::Limp;
+  r.peerNpcLimp = mp && mp->Ragdoll() == Mob::RagdollPhase::Limp;
+  uint32_t cm1 = 0, cp1 = 0;
+  float sm1 = 0, sp1 = 0;
+  cubeState(cubeMine, cm1, sm1);
+  cubeState(cubePeer, cp1, sp1);
+  // A damaged cube may come back under a new handle (DamageBody replaces it)
+  // or not at all: either is "hit". Untouched = same handle, same voxels, at
+  // the same rest.
+  r.mineCubeHit = cm1 != cm0 || sm1 > sm0 + 0.5f;
+  r.peerCubeHit = cp1 != cp0 || sp1 > sp0 + 0.5f;
+  c.mobs.SetLocalPlayerId(0);
+  c.debris.SetLocalPlayerId(0);
+  c.debris.Reset();
+  c.mobs.Reset(true);
+}
+
 }  // namespace blastp
 
 Status GateBlastPlayers(Ctx& c, std::string& detail) {
   using blastp::Arm;
   blastp::BlastArm local, ghost, owner, author;
+  blastp::BodiesArm bodiesOwner, bodiesAuthor;
   blastp::RunBlastArm(c, Arm::Local, local);
   if (local.why.empty()) blastp::RunBlastArm(c, Arm::Ghost, ghost);
   if (ghost.why.empty()) blastp::RunBlastArm(c, Arm::OwnerSide, owner);
   if (owner.why.empty()) blastp::RunBlastArm(c, Arm::AuthorSide, author);
-  const std::string why = !local.why.empty()   ? local.why
-                          : !ghost.why.empty() ? ghost.why
-                          : !owner.why.empty() ? owner.why
-                                               : author.why;
+  if (author.why.empty()) blastp::RunBodiesArm(c, /*ownerSide=*/true, bodiesOwner);
+  if (bodiesOwner.why.empty()) blastp::RunBodiesArm(c, /*ownerSide=*/false, bodiesAuthor);
+  const std::string why = !local.why.empty()          ? local.why
+                          : !ghost.why.empty()        ? ghost.why
+                          : !owner.why.empty()        ? owner.why
+                          : !author.why.empty()       ? author.why
+                          : !bodiesOwner.why.empty()  ? bodiesOwner.why
+                                                      : bodiesAuthor.why;
   if (!why.empty()) {
     detail = why;
     std::printf("blast-players: FAIL (%s)\n", why.c_str());
@@ -2026,8 +2188,33 @@ Status GateBlastPlayers(Ctx& c, std::string& detail) {
                 author.limpA ? "LAUNCHED" : "standing", author.lostB,
                 author.limpB ? "LAUNCHED" : "standing");
   detail = buf;
-  const bool ok = localOk && ghostOk && ownerOk && authorOk;
-  std::printf("blast-players: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  // (e) B's machine, phase N: its own NPC and cube hit, A's untouched.
+  const bool bodiesOwnerOk = bodiesOwner.applied == 1 && bodiesOwner.mineNpcLost > 0 &&
+                             bodiesOwner.mineNpcLimp && bodiesOwner.mineCubeHit &&
+                             bodiesOwner.peerNpcLost == 0 && !bodiesOwner.peerNpcLimp &&
+                             !bodiesOwner.peerCubeHit;
+  // (f) A's machine, phase K: its own NPC and cube hit; B's NPC carved as
+  // presentation but not launched; B's cube untouched.
+  const bool bodiesAuthorOk = bodiesAuthor.mineNpcLost > 0 && bodiesAuthor.mineNpcLimp &&
+                              bodiesAuthor.mineCubeHit && !bodiesAuthor.peerNpcLimp &&
+                              !bodiesAuthor.peerCubeHit;
+  detail += Format(
+      " | (e) B's machine, A's blast (phase N, applied %u): own NPC -%u vox %s, own cube "
+      "%s; A's NPC -%u vox %s, A's cube %s (want own hit+launched, A's untouched) | (f) "
+      "A's machine (phase K): own NPC -%u vox %s, own cube %s; B's NPC ghost -%u vox "
+      "(presentation) %s, B's cube %s (want own hit+launched, ghost not launched, "
+      "ghost cube untouched)",
+      bodiesOwner.applied, bodiesOwner.mineNpcLost,
+      bodiesOwner.mineNpcLimp ? "launched" : "NOT LAUNCHED",
+      bodiesOwner.mineCubeHit ? "hit" : "NOT HIT", bodiesOwner.peerNpcLost,
+      bodiesOwner.peerNpcLimp ? "LAUNCHED" : "standing",
+      bodiesOwner.peerCubeHit ? "HIT" : "untouched", bodiesAuthor.mineNpcLost,
+      bodiesAuthor.mineNpcLimp ? "launched" : "NOT LAUNCHED",
+      bodiesAuthor.mineCubeHit ? "hit" : "NOT HIT", bodiesAuthor.peerNpcLost,
+      bodiesAuthor.peerNpcLimp ? "LAUNCHED" : "not launched",
+      bodiesAuthor.peerCubeHit ? "HIT" : "untouched");
+  const bool ok = localOk && ghostOk && ownerOk && authorOk && bodiesOwnerOk && bodiesAuthorOk;
+  std::printf("blast-players: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -2050,7 +2237,7 @@ const std::vector<Gate>& NetGates() {
       // starts where it always did.
       {"store-sync", "net", {}, false, GateStoreSync},
       // W1-F + integration. CPU + Jolt only: two avatars, ExplosionHitsBodies
-      // (phase K) and one OpDelayQueue merge into RemoteExplosionsHitOwnAvatars
+      // (phase K) and one OpDelayQueue merge into RemoteExplosionsHitOwnBodies
       // (phase N) per side.
       // Resets debris and mobs on the way in and out.
       {"blast-players", "net", {}, false, GateBlastPlayers},
