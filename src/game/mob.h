@@ -4761,6 +4761,7 @@ class Mob {
     uint32_t grown = 0;        // missing recipe cells put back
     uint32_t mended = 0;       // present cells rewritten to the recipe
     uint32_t levelsSpent = 0;  // coat levels the healing consumed
+    uint32_t twinFree = 0;     // of `grown`, joint-twin second copies (unpaid)
     uint32_t steps = 0;        // limb steps that did anything
     float hpHealed = 0.0f;     // hp credited (volume back + the hp-only path)
     uint32_t bodyRebuilds = 0; // steps that rebuilt the Jolt collider
@@ -4871,6 +4872,9 @@ class Mob {
   void TwinShadowInto(int li, BurnLimbView& v) const;
   bool twinsBuilt_ = false;
   bool twinDirty_ = false;
+  // A heal step grew the second copy of a joint cell (HealLimbStep, audit
+  // R4): the next sync re-pairs the twins after reconciling.
+  bool twinRelink_ = false;
   void BuildJointTwins();
   // Returns false when a flush severed a limb or killed the creature, with
   // InfectTick's contract: the caller must touch nothing afterwards.
@@ -7985,6 +7989,25 @@ class MobSystem {
                       uint32_t& differ, std::string* why = nullptr) const;
   uint32_t RewriteLimbSurface(uint64_t mobId, int limb, uint32_t fromMat,
                               uint32_t toMat, uint32_t count, uint32_t tick);
+  // Mob::ParentLimbIndex by id (-1 for an unknown creature), for a fixture
+  // that wounds a JOINT (heal-joint).
+  int LimbParentOf(uint64_t mobId, int limb) const;
+  // Joint-twin cells limb `limb` shares with its PARENT (it holds the child
+  // copies), as the rig last paired them (Mob::BuildJointTwins); 0 when the
+  // pair is not twinned (a partner on another lattice scale is never paired).
+  // For heal-joint.
+  uint32_t LimbTwinCells(uint64_t mobId, int limb) const;
+  // TEST HOOK (heal-joint): the per-tick burn pot BurnLimbs shares over the
+  // creatures (kBurnFrontPerTick / kBurnOpsPerTick). A gate empties it to
+  // stand in for "a big fire elsewhere spent it all" and restores it after.
+  void SetBurnPotForTest(uint32_t front, uint32_t ops) {
+    burnPotFront_ = front;
+    burnPotOps_ = ops;
+  }
+  void ResetBurnPotForTest() {
+    burnPotFront_ = kBurnFrontPerTick;
+    burnPotOps_ = kBurnOpsPerTick;
+  }
 
  private:
   // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------
@@ -8582,6 +8605,10 @@ class MobSystem {
   static constexpr uint32_t kBurnFrontPerTick = 6000;
   // Fire/ash ops all burning limbs together may push into the grid per tick.
   static constexpr uint32_t kBurnOpsPerTick = 96;
+  // The pot BurnLimbs actually shares: these two unless a gate set it
+  // (SetBurnPotForTest).
+  uint32_t burnPotFront_ = kBurnFrontPerTick;
+  uint32_t burnPotOps_ = kBurnOpsPerTick;
   // World cells ONE limb's ignition scan may look at. A limb's world AABB is
   // order 128 cells; this is the guard against a pathological pose, not a
   // budget anything normal comes near.

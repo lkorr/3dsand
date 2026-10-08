@@ -9636,6 +9636,189 @@ Status GateHealWound(Ctx& c, std::string& detail) {
   return bloodOk && waterOk ? Status::Pass : Status::Fail;
 }
 
+// heal-joint. The two healing findings of docs/AUDIT_alchemy_chemistry.md:
+//   * R3, HEALING UNDER A STARVED BURN POT. HealTick runs in the burn pass's
+//     finish (Mob::BurnHeadFinish). Until fight64 round 3 B (d7eefc7) the
+//     creature loop stopped at the first creature that found the shared pot
+//     (kBurnFrontPerTick / kBurnOpsPerTick) empty, so near a big fire that
+//     spent it the healing of everybody after stalled. Arm A empties the pot
+//     outright (MobSystem::SetBurnPotForTest(0, 0): the fire elsewhere spent
+//     ALL of it) and asserts a soaked crater still knits: cells grown > 0 and
+//     fewer missing than before. The old loop grows nothing here.
+//   * R4, A JOINT CELL PAID FOR ONCE. A crater carved at a limb's JOINT (the
+//     first limb the rig twinned with its parent: same lattice scale) takes
+//     both copies of the joint twins (the sync removes the parent's copy
+//     too). Both limbs soaked and re-soaked until whole: both end at their
+//     recipe, and every cell the PARENT lost -- each one a twin copy --
+//     came back as a pair's unpaid second copy (HealStats::twinFree == the
+//     parent's loss). Before the fix both copies were charged.
+Status GateHealJoint(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  const HealMats hm = FindHealMats(c.mats);
+  if (!t.valid() || !hm.ok()) {
+    detail = "no fixture limb, or a heal material missing";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const double cpl = HealCellsPerLevel(def, c.mats[hm.eBlood]);
+  const IVec3 site = FixtureSite(c.world, kInset);
+  IVec3 pchunk{site.x >> 4, site.y >> 4, site.z >> 4};
+  uint32_t simTick = 38000;
+  support::TickCursor ticker{c, simTick, pchunk};
+  auto poseTick = [&]() {
+    ticker.chunk = pchunk;
+    ticker();
+  };
+  auto spawnPosed = [&]() -> uint64_t {
+    const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+    if (!id) return 0;
+    mobs.SetMobBehavior(id, "dummy");
+    for (int i = 0; i < 10; i++) poseTick();
+    return id;
+  };
+  // A crater on `limb` at `alongFrac` of its length (0 = the joint), from the
+  // first side whose ray meets this limb first.
+  auto crater = [&](uint64_t id, int limb, float alongFrac, float radius) -> bool {
+    const LimbAxis ax = MeasureLimb(mobs, id, limb);
+    if (!ax.valid) return false;
+    const Vec3 at = ax.anchor + ax.along * (alongFrac * ax.reach);
+    const Vec3 sides[4] = {ax.travel, ax.travel * -1.0f, ax.edge, ax.edge * -1.0f};
+    for (const Vec3& s : sides) {
+      const MobSystem::BodyRayHit h = mobs.PickBody(id, at + s * 20.0f, s * -1.0f, 40.0f);
+      if (!h.hit || h.limb != limb) continue;
+      std::vector<ParticleSpawn> sp;
+      mobs.CarveLimbRadial(mobs.LimbBody(id, limb), h.pos, radius, true, false, c.world, sp);
+      return true;
+    }
+    // The joint itself sits inside the parent: carve at the anchor.
+    std::vector<ParticleSpawn> sp;
+    mobs.CarveLimbRadial(mobs.LimbBody(id, limb), at, radius, true, false, c.world, sp);
+    return true;
+  };
+
+  // ---- A: R3, the pot is empty --------------------------------------------
+  bool starvedOk = false;
+  uint32_t missA0 = 0, diffA0 = 0, missA1 = 0, diffA1 = 0;
+  Mob::HealStats sA;
+  if (const uint64_t id = spawnPosed()) {
+    crater(id, t.limb, 0.5f, 1.0f);
+    for (int i = 0; i < 5; i++) poseTick();
+    mobs.LimbRecipeDiff(id, t.limb, missA0, diffA0);
+    mobs.SoakLimb(id, t.limb, hm.eBlood, 8, simTick);
+    mobs.SetBurnPotForTest(0, 0);
+    for (int i = 0; i < 300; i++) poseTick();
+    mobs.ResetBurnPotForTest();
+    mobs.LimbRecipeDiff(id, t.limb, missA1, diffA1);
+    sA = mobs.HealStatsOf(id);
+    starvedOk = missA0 > 0 && sA.grown > 0 && missA1 < missA0;
+  }
+  mobs.ResetBurnPotForTest();
+
+  // ---- B: R4, a crater at the joint ---------------------------------------
+  bool jointOk = false, fixtureB = false;
+  int parent = -1;
+  uint32_t mc0 = 0, dc0 = 0, mp0 = 0, dp0 = 0, mc1 = 0, dc1 = 0, mp1 = 0, dp1 = 0;
+  uint32_t levels = 0, pours = 0, wholeAt = 0;
+  Mob::HealStats sB;
+  float jointFrac = -1.0f;
+  uint64_t id = 0;
+  uint32_t mpPre = 0, dpPre = 0;
+  // THE JOINT LIMB: the target limb if the rig paired it with its parent
+  // (same lattice scale: Mob::BuildJointTwins), else the first severable
+  // base limb that has twins and a parent. Measured on a posed spawn.
+  int jl = -1;
+  uint32_t twins = 0;
+  if (const uint64_t probe = spawnPosed()) {
+    auto ok = [&](int li) {
+      return li >= 0 && li < (int)def.limbs.size() && mobs.LimbParentOf(probe, li) >= 0 &&
+             mobs.LimbBody(probe, li) != 0 && mobs.LimbTwinCells(probe, li) > 0;
+    };
+    if (ok(t.limb)) jl = t.limb;
+    for (int li = 0; jl < 0 && li < (int)def.limbs.size(); li++)
+      if (def.limbs[(size_t)li].severable && !def.limbs[(size_t)li].vital && ok(li)) jl = li;
+    if (jl >= 0) twins = mobs.LimbTwinCells(probe, jl);
+  }
+  // A small notch near the joint, from the side: the first of a few depths
+  // into the limb whose crater takes cells the PARENT also carries (the twin
+  // sync removes the parent's copies) and leaves the limb on (a crater AT the
+  // pivot can sever it). Each try is a fresh creature.
+  for (float f : {0.0f, 0.05f, 0.1f, 0.15f, 0.2f, 0.3f}) {
+    if (jl < 0) break;
+    id = spawnPosed();
+    if (!id) break;
+    parent = mobs.LimbParentOf(id, jl);
+    if (parent < 0) break;
+    mobs.LimbRecipeDiff(id, parent, mpPre, dpPre);
+    if (!crater(id, jl, f, 0.8f)) continue;
+    for (int i = 0; i < 5; i++) poseTick();
+    mobs.LimbRecipeDiff(id, jl, mc0, dc0);
+    mobs.LimbRecipeDiff(id, parent, mp0, dp0);
+    fixtureB = mc0 > 0 && mp0 > mpPre && mobs.LimbBody(id, jl) != 0;
+    if (fixtureB) {
+      jointFrac = f;
+      break;
+    }
+  }
+  {
+    if (fixtureB) {
+      auto soak = [&]() {
+        for (int li : {jl, parent}) {
+          const uint32_t before = HealCoatLevels(mobs, id, li, hm.eBlood, simTick);
+          mobs.SoakLimb(id, li, hm.eBlood, 8, simTick);
+          const uint32_t after = HealCoatLevels(mobs, id, li, hm.eBlood, simTick);
+          levels += after > before ? after - before : 0u;
+        }
+        pours++;
+      };
+      soak();
+      const uint32_t repour =
+          (uint32_t)std::max(1.0, BaselineNumber("heal.repourTicks", 150));
+      for (int i = 0; i < 3600 && mobs.LimbBody(id, jl); i++) {
+        poseTick();
+        const uint32_t tk = (uint32_t)i + 1;
+        if (tk % repour == 0) soak();
+        if (tk % 10 != 0) continue;
+        mobs.LimbRecipeDiff(id, jl, mc1, dc1);
+        mobs.LimbRecipeDiff(id, parent, mp1, dp1);
+        if (mc1 == 0 && mp1 <= mpPre) {
+          wholeAt = tk;
+          break;
+        }
+      }
+      mobs.LimbRecipeDiff(id, jl, mc1, dc1);
+      mobs.LimbRecipeDiff(id, parent, mp1, dp1);
+      sB = mobs.HealStatsOf(id);
+      const double paidCells = (double)(sB.grown + sB.mended) - (double)sB.twinFree;
+      // Every cell the PARENT lost was a twin copy (the sync took it with the
+      // limb's), so every one of them is the second copy of a pair and comes
+      // back unpaid: exactly mp0 free grows. (The coat also buys hp once a
+      // part is whole, so levels spent are not a count of cells grown.)
+      (void)paidCells;
+      jointOk = wholeAt != 0 && sB.twinFree > 0 && sB.twinFree == mp0 &&
+                sB.levelsSpent <= levels;
+    }
+  }
+  mobs.Reset();
+  c.debris.Reset();
+
+  detail = Format(
+      "%s.%s (parent %d), %.1f cells/level | A pot EMPTIED: %u missing + %u changed -> "
+      "%u + %u after 300 ticks, %u grown %u mended %u levels | B joint crater (at %.2f of "
+      "joint limb %s, %u twin cells): limb %u missing, parent %u missing (fixture %d); %u soaks, %u levels poured; whole at "
+      "tick %u: limb %u missing, parent %u; %u grown (%u twin second copies, unpaid) "
+      "%u mended, %u levels spent = %.0f cells vs %.0f grown + mended - twin (want twin second copies == the parent's %u lost)",
+      t.defName.c_str(), t.limbName.c_str(), parent, cpl, missA0, diffA0, missA1, diffA1,
+      sA.grown, sA.mended, sA.levelsSpent, jointFrac,
+      jl >= 0 ? def.limbs[(size_t)jl].name.c_str() : "NONE", twins, mc0, mp0, fixtureB ? 1 : 0, pours, levels,
+      wholeAt, mc1, mp1, sB.grown, sB.twinFree, sB.mended, sB.levelsSpent,
+      sB.levelsSpent * cpl, (double)(sB.grown + sB.mended) - (double)sB.twinFree, mp0);
+  return starvedOk && jointOk ? Status::Pass : Status::Fail;
+}
+
 // ---------------------------------------------------------------------------
 // liquid-coats: EVERY liquid coats a body (owner report 2026-09-29)
 // ---------------------------------------------------------------------------
@@ -9840,6 +10023,8 @@ const std::vector<Gate>& WoundGates() {
       // the limb toward its recipe, bounded by what was poured.
       {"heal-restore", "mob", {}, false, GateHealRestore, false},
       {"heal-wound", "mob", {}, false, GateHealWound, false},
+      // Audit R3 + R4: healing under an emptied burn pot; a joint cell paid once.
+      {"heal-joint", "mob", {}, false, GateHealJoint, false},
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
       {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},

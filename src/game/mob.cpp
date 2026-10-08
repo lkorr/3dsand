@@ -14774,6 +14774,7 @@ struct HealGrow {
   uint16_t word;
   uint8_t color;
   int32_t tomb;  // lattice index of a tombstone to revive, or -1 (a new voxel)
+  bool twin;     // a joint-twin copy whose other copy is present: grown free
 };
 struct HealMend {
   uint32_t idx;
@@ -14928,6 +14929,43 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
       li < (int)twinShadow_.size() && !twinShadow_[li].empty() ? &twinShadow_[li]
                                                                : nullptr;
   const IVec3 twinO = shadow ? TwinOrigin(limb, scale) : IVec3{};
+  // ONE CELL, TWO COPIES, ONE PAYMENT (audit R4, 2026-10-07). A joint twin is
+  // one cell of flesh that both limbs carry (BuildJointTwins). A wound through
+  // a joint takes BOTH copies (the sync: gone on either side is gone on both)
+  // and kills the link, so each limb's recipe sees its copy missing and grows
+  // it -- and each paid for it out of its coat: one cell of tissue, two cells
+  // of coat. Now a missing cell whose rest position is held by a PRESENT cell
+  // of a joint partner (the parent, or a child, on the same lattice: the
+  // pairing rule BuildJointTwins uses) is the second copy of a cell already
+  // paid for, and grows free. Whichever copy grows first pays; the second
+  // copy is free only while the first is there, so the matter grown free is
+  // bounded by the matter paid for (rule 2). Rest keys of the partners'
+  // present cells, sorted; empty for a limb with no partner.
+  std::vector<uint64_t> partnerRest;
+  IVec3 selfO{};
+  if (li < baseLimbs_ && !IsWornSlot(li)) {
+    auto addPartner = [&](int pi) {
+      if (pi < 0 || pi == li || pi >= baseLimbs_ || pi >= (int)limbs_.size() ||
+          IsWornSlot(pi))
+        return;
+      MobLimb& pl = limbs_[(size_t)pi];
+      if (!pl.body || pl.HasFineSkin() != fine) return;
+      const uint32_t psc = std::max(1u, fine ? SkinScaleOf(pl) : PhysScaleOf(pl));
+      if (psc != scale) return;
+      const BurnLimbView pv = ViewOf(pl);
+      const IVec3 po = TwinOrigin(pl, scale);
+      for (size_t i = 0; i < pv.Size(); i++) {
+        if (pv.Mat(i) == 0) continue;
+        const IVec3 p = pv.At(i);
+        partnerRest.push_back(TwinRestKey(p.x + po.x, p.y + po.y, p.z + po.z));
+      }
+    };
+    addPartner(ParentLimbIndex(li));
+    for (int b = 0; b < baseLimbs_ && b < (int)limbs_.size(); b++)
+      if (b != li && ParentLimbIndex(b) == li) addPartner(b);
+    std::sort(partnerRest.begin(), partnerRest.end());
+    selfO = TwinOrigin(limb, scale);
+  }
   static const int kD6[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                                 {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
   for (const PrefabVoxel& rv : model.voxels) {
@@ -14999,8 +15037,12 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     // d2 is carried for the gate's order log only; it decides nothing.
     const float dx = (float)x + 0.5f - root.x, dy = (float)y + 0.5f - root.y,
                 dz = (float)z + 0.5f - root.z;
+    const bool twin =
+        !partnerRest.empty() &&
+        std::binary_search(partnerRest.begin(), partnerRest.end(),
+                           TwinRestKey(x + selfO.x, y + selfO.y, z + selfO.z));
     grow.push_back({dx * dx + dy * dy + dz * dz, x, y, z, word,
-                    folded ? (uint8_t)0 : rv.color, tomb ? at : -1});
+                    folded ? (uint8_t)0 : rv.color, tomb ? at : -1, twin});
   }
 
   // ---- 3b. THE PICK: the lowest hashes of the whole frontier ----------------
@@ -15042,6 +15084,8 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   // off the flush's counter, and the flush's own tombstone scan finds the
   // cell whole.
   uint32_t revived = 0;
+  // Of `grown`, the joint-twin second copies (HealGrow::twin): not paid for.
+  uint32_t twinFree = 0;
   std::vector<uint64_t> touched;  // cells whose wound-revert entry is now moot
   IVec3 spark{};                  // the first cell this step rebuilt
   for (const HealPick& pk : pick) {
@@ -15071,6 +15115,7 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     if (grown + mended == 0) spark = IVec3{g.x, g.y, g.z};
     if (healStats_.logOrder && healStats_.orderD2.size() < 65536)
       healStats_.orderD2.push_back(g.d2 / (float)(scale * scale));
+    if (g.twin) twinFree++;
     grown++;
   }
   uint32_t used = grown + mended;
@@ -15124,11 +15169,13 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   if (used == 0) return 0;  // nothing to heal: the coat is not spent
 
   // ---- 5. PAY FOR IT --------------------------------------------------------
-  double owe = (double)used - (double)limb.healCredit;
+  // A joint twin's second copy is the matter its partner already paid for
+  // (the R4 note above the grow loop): not charged again.
+  double owe = (double)(used - twinFree) - (double)limb.healCredit;
   uint32_t levels = 0;
   std::vector<uint32_t> paid;
   if (owe <= 0.0) {
-    limb.healCredit -= (float)used;
+    limb.healCredit -= (float)(used - twinFree);
   } else {
     bool any = true;
     while (owe > 1e-9 && any) {
@@ -15218,6 +15265,12 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   // ...and what the substance does besides (stanch, disinfect).
   if (strongest != 0) sys_->CoatEffectsOn(*this, li, strongest, /*report=*/false);
 
+  // Both copies of a joint cell are back: link them again (the sync re-pairs
+  // after reconciling what it already holds, SyncJointTwinsPrepare), so the
+  // healed joint is one cell to the fire and the rot again, and the free copy
+  // cannot be burnt off alone and regrown free.
+  if (twinFree > 0) twinRelink_ = true;
+  healStats_.twinFree += twinFree;
   healStats_.grown += grown;
   healStats_.mended += mended;
   healStats_.levelsSpent += levels;
@@ -15336,6 +15389,17 @@ Mob::HealStats MobSystem::HealStatsOf(uint64_t mobId) const {
 
 void MobSystem::LogHealOrder(uint64_t mobId, bool on) {
   if (Mob* m = const_cast<Mob*>(FindMob(mobId))) m->LogHealOrder(on);
+}
+
+int MobSystem::LimbParentOf(uint64_t mobId, int limb) const {
+  const Mob* m = FindMob(mobId);
+  return m ? m->ParentLimbIndex(limb) : -1;
+}
+
+uint32_t MobSystem::LimbTwinCells(uint64_t mobId, int limb) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limb < 0 || limb >= (int)m->twinShadow_.size()) return 0;
+  return (uint32_t)m->twinShadow_[(size_t)limb].size();
 }
 
 bool MobSystem::LimbRecipeDiff(uint64_t mobId, int limb, uint32_t& missing,
@@ -19277,7 +19341,7 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
     const size_t np = P.mob.size();
     P.front.assign(np, 0);
     P.ops.assign(np, 0);
-    uint32_t frontLeft = kBurnFrontPerTick, opsLeft = kBurnOpsPerTick;
+    uint32_t frontLeft = burnPotFront_, opsLeft = burnPotOps_;
     for (size_t j = 0; j < np; j++) {
       if (P.w[j] == 0) {
         P.front[j] = 1;  // the idle pass's token slice (see above)
@@ -20756,6 +20820,10 @@ void Mob::SyncJointTwinsPrepare(TwinSyncOut& out) {
   bool rebuild = !sameShape;
   for (size_t i = 0; !rebuild && i < limbs_.size(); i++)
     rebuild = (limbs_[i].body ? 1 : 0) != twinAttached_[i];
+  // A heal step grew a joint cell's second copy (HealLimbStep, audit R4): the
+  // pair is whole again and is linked again, after the reconcile below.
+  if (twinRelink_) rebuild = true;
+  twinRelink_ = false;
   if (!sameShape || (rebuild && twins_.empty())) {
     BuildJointTwins();
     return;

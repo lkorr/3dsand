@@ -53,8 +53,8 @@ latent, cosmetic, or diagnostics.
 |---|---|---|---|---|
 | R1 | MED | The reaction-effect record keyed its slot hash and `atomicMax` key on the WINDOW-RELATIVE cell, so the same firings picked different winners (different ExplosionOps in the hashed world) for a different window origin -- CLAUDE.md: an identity is the slot index. | `sim_step.wgsl` reactFxNote; `world.h` ReactFxDecodeCell | FIXED: keyed on the slot cell (world cell mod `kWorldN`); the stored origin decodes it back to the one window cell. |
 | R2 | MED | Standing in a pool of enchanted water/blood heals without limit: contact coating never spends the liquid (the pour path does). | `mob.cpp` StainOneLimb; materials.json coat `contact` 120 / 90 | WON'T FIX: authored as design ("a healing spring heals whoever stands in it"), and bounded per tick (rule 2 holds). A content decision for the owner: `coat.contact: 0` makes only pour/splash/apply heal. |
-| R3 | LOW-MED | Healing runs inside `BurnTick`, which the shared burn budget stops visiting near a large fire, so healing stalls there. | `mob.cpp` BurnLimbs `frontBudget`, HealTick call | NOT FIXED: `mob.cpp` has another session's uncommitted edits on main; a separate heal loop in `BurnLimbs` is the fix. |
-| R4 | LOW (suspected) | The heal grow step may not skip joint-twin child cells as the mend step does (a twin cell paid for twice). | `mob.cpp` HealLimbStep | NOT FIXED: unverified; same file contention. |
+| R3 | LOW-MED | Healing runs inside `BurnTick`, which the shared burn budget stops visiting near a large fire, so healing stalls there. | `mob.cpp` BurnLimbs `frontBudget`, HealTick call | FIXED by fight64 round 3 B (d7eefc7, 2026-10-05), confirmed 2026-10-07: `BurnLimbs` now hands every admitted creature a pre-split slice and runs EVERY head's finish (`BurnHeadFinish` -> `HealTick`) whatever its slice, so an empty pot no longer skips anybody's heal. No separate loop was needed. Gate `heal-joint` arm A heals a soaked crater with the pot emptied outright (`SetBurnPotForTest(0, 0)`). |
+| R4 | LOW (suspected) | The heal grow step may not skip joint-twin child cells as the mend step does (a twin cell paid for twice). | `mob.cpp` HealLimbStep | FIXED 2026-10-07 (it was real: a joint crater takes both copies, the link dies, and each limb's recipe grew and PAID for its own copy). A missing cell whose rest position a PRESENT cell of a joint partner (parent or child, same lattice) holds is the second copy and grows free (`HealStats::twinFree`); whichever copy grows first pays, so free matter is bounded by paid matter. The healed pair is re-linked (`twinRelink_` -> the next sync rebuilds the twins after reconciling). Gate `heal-joint` arm B. |
 | R5 | -- | No world handler for `burst` / `eject` / `shock`. | `session.cpp` ReactFxToBlasts | DECIDED: `shock` is a world effect (a flash whose default material is `spark`, so it ignites through spark's own rules, bounded like flash); `eject`, `burst` and `pop` act on a vessel or a player at the bench and are bench-only by design. `pop` added to `kKnownEffectKinds` (the bench registers it). No rule authors these today. |
 | R6 | LOW | fx ids are handed out per surviving rule; an R reload or a weather switch renumbers them, so up to `kSnapshotLatency + 1` ticks of in-flight firings map to another rule's effects. | `materials.cpp`; `world.cpp` reactFxPending_ | WON'T FIX: dev-only hot reload, two ticks. |
 | R7 | LOW | Comments contradicting behaviour: chlorine "2.5x denser than air" at density 6 (the sinking is the `gas_heavy` tag); quicksilver "everything but gold floats on this" while gold_dust (9,000) floats; phosphorus "+ air -> fire" (a pair rule with air can never fire; it is an air-scaled decay). | materials.json | FIXED (comments only). |
@@ -70,11 +70,11 @@ order-free fx record were verified.
 
 ## Not fixed, ranked
 
-1. **R3** healing stalls near big fires (mob.cpp contention).
+1. ~~R3~~ fixed (d7eefc7; gate `heal-joint`).
 2. **S6** solute pool exhaustion under a world-wide wake: unmeasured; needs an adversarial gate.
 3. **R2** unlimited healing from a pool: a content decision.
 4. **B6** dissolved matter streaming off the bench lands as powder.
-5. **R4**, **B8**, **S7**, **S8**, **R6**: latent or dev-only.
+5. **B8**, **S7**, **S8**, **R6**: latent or dev-only (~~R4~~ fixed 2026-10-07, `heal-joint`).
 
 Observation: one windowed `--shot-bench` run reported `page faults 1` (the
 harness's F5 had closed the bench under the since-reverted first version of B12);
