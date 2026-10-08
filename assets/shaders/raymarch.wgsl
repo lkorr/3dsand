@@ -11866,6 +11866,42 @@ fn windowExitT(ro : vec3f, rdIn : vec3f) -> f32 {
   return select(0.0, tExit, tExit > tEnter);
 }
 
+// ---- LIVE BLOCK BOX: the exact world-chunk bounds of this tick's blocks ----
+// RENDER-ONLY derived data, read by no sim kernel. Six words after the two
+// kNumSlots halves of fluidBlockMap: min chunk xyz, then max chunk xyz, each
+// biased by FBM_BOX_BIAS so unsigned atomicMin/Max order them. Written by
+// `alloc` in the same pass that assigns the blocks, so it is never latent
+// against the block map the renderer reads — unlike the CPU's snapshot-built
+// R.fluidLo/fluidHi, which needs a two-chunk pad for exactly that latency.
+// THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl (kept out of
+// common.wgsl on purpose: an edit there recompiles every shader).
+fn fbmBoxIndex() -> u32 { return 2u * NUM_SLOTS; }
+const FBM_BOX_BIAS : i32 = 0x40000000;
+
+// The ray span inside the live block box grown by ONE chunk — the reach of
+// fluidChunkClass's ring (class 2), the farthest from a block any field sample
+// is ever taken. Every chunk outside it is class 0, where the chunk walk could
+// only stride, so clipping the march to it changes no sample and no hit. It is
+// the fix for a camera standing INSIDE the CPU's padded AABB, where every
+// pixel on screen (sky included) walked the window chunk by chunk: measured on
+// the hill bench, 100% of 1080p pixels marching, ~15 loop iterations each.
+fn fluidLiveSpan(ro : vec3f, inv : vec3f) -> vec2f {
+  let i = fbmBoxIndex();
+  let lo = vec3<i32>(vec3<u32>(fluidBlockMapR[i], fluidBlockMapR[i + 1u],
+                               fluidBlockMapR[i + 2u])) -
+           vec3<i32>(FBM_BOX_BIAS);
+  let hi = vec3<i32>(vec3<u32>(fluidBlockMapR[i + 3u], fluidBlockMapR[i + 4u],
+                               fluidBlockMapR[i + 5u])) -
+           vec3<i32>(FBM_BOX_BIAS);
+  let bl = (vec3f(lo) - vec3f(1.0)) * f32(CHUNK);
+  let bh = (vec3f(hi) + vec3f(2.0)) * f32(CHUNK);
+  let t0 = (bl - ro) * inv;
+  let t1 = (bh - ro) * inv;
+  let tn = min(t0, t1);
+  let tf = max(t0, t1);
+  return vec2f(max(max(tn.x, tn.y), tn.z), min(min(tf.x, tf.y), tf.z));
+}
+
 fn fluidBoundsSpan(ro : vec3f, inv : vec3f) -> vec2f {
   let lo = vec3f(R.fluidLo);
   let hi = vec3f(R.fluidHi) + vec3f(1.0);   // inclusive cell -> its far face
@@ -11897,7 +11933,11 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
   // camera is inside the box", which is also the only case in which the
   // submerged test below can be true — so a camera nowhere near the water no
   // longer pays a field sample for it either.
-  let span = fluidBoundsSpan(ro, inv);
+  // The CPU's (padded, latent) AABB intersected with the GPU's exact live
+  // block box (fluidLiveSpan).
+  let cpuSpan = fluidBoundsSpan(ro, inv);
+  let live = fluidLiveSpan(ro, inv);
+  let span = vec2f(max(cpuSpan.x, live.x), min(cpuSpan.y, live.y));
   if (span.y <= 0.0 || span.x > span.y) { return out; }
   let tStart = max(span.x, 0.0);
   let tEnd = min(span.y, tMax);
@@ -12182,7 +12222,11 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 
   // Same AABB clip as the smooth march: a ray that misses the live fluid box
   // pays one slab test and nothing else.
-  let span = fluidBoundsSpan(ro, inv);
+  // The CPU's (padded, latent) AABB intersected with the GPU's exact live
+  // block box (fluidLiveSpan).
+  let cpuSpan = fluidBoundsSpan(ro, inv);
+  let live = fluidLiveSpan(ro, inv);
+  let span = vec2f(max(cpuSpan.x, live.x), min(cpuSpan.y, live.y));
   if (span.y <= 0.0 || span.x > span.y) { return out; }
   let tStart = max(span.x, 0.0);
   let tEnd = min(span.y, tMax);

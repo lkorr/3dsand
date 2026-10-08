@@ -678,6 +678,18 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 }
 
+// ---- LIVE BLOCK BOX: the exact world-chunk bounds of this tick's blocks ----
+// RENDER-ONLY derived data, read by no sim kernel. Six words after the two
+// kNumSlots halves of fluidBlockMap: min chunk xyz, then max chunk xyz, each
+// biased by FBM_BOX_BIAS so unsigned atomicMin/Max order them. Written by
+// `alloc` in the same pass that assigns the blocks, so it is never latent
+// against the block map the renderer reads — unlike the CPU's snapshot-built
+// R.fluidLo/fluidHi, which needs a two-chunk pad for exactly that latency.
+// THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl (kept out of
+// common.wgsl on purpose: an edit there recompiles every shader).
+fn fbmBoxIndex() -> u32 { return 2u * NUM_SLOTS; }
+const FBM_BOX_BIAS : i32 = 0x40000000;
+
 // ---- alloc: deterministic block assignment + node-pass dispatch args --------
 // ONE workgroup. Each thread counts the marks in its 128-slot span, thread 0
 // turns the counts into exclusive prefixes (256 sequential adds — trivially
@@ -711,6 +723,14 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
     let s = fluidBlockList[i];
     atomicStore(&fluidBlockMap[fbmYMaskIndex(s)], 0u);
     atomicAnd(&fluidBlockMap[s], MAP_MARK);
+  }
+  // The live block box restarts EMPTY (min > max) every tick; the assignment
+  // loop at the bottom grows it. Asleep, it stays empty — the right answer.
+  if (li == 0u) {
+    for (var k = 0u; k < 3u; k++) {
+      atomicStore(&fluidBlockMap[fbmBoxIndex() + k], 0xFFFFFFFFu);
+      atomicStore(&fluidBlockMap[fbmBoxIndex() + 3u + k], 0u);
+    }
   }
   // Phase B reads index words that OTHER threads of phase A just masked, and
   // thread 0 overwrites fluidArgs[3] below — both need phase A finished.
@@ -761,6 +781,12 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
     if (idx < FLUID_BLOCKS) {
       atomicStore(&fluidBlockMap[s], idx + 1u);
       fluidBlockList[idx] = s;
+      // min/max commute: the box is the same whatever the thread order.
+      let bw = vec3<u32>(slotWorldChunk(s, T.origin) + vec3<i32>(FBM_BOX_BIAS));
+      for (var k = 0u; k < 3u; k++) {
+        atomicMin(&fluidBlockMap[fbmBoxIndex() + k], bw[k]);
+        atomicMax(&fluidBlockMap[fbmBoxIndex() + 3u + k], bw[k]);
+      }
     } else {
       atomicStore(&fluidBlockMap[s], 0u);  // over budget: freeze this chunk
     }
