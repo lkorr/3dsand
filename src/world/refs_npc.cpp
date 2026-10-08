@@ -100,7 +100,7 @@ struct ResidentsWorld {
   // The ground wait for a first spawn: ref id -> tick of the first ask.
   std::map<std::string, uint32_t> askedAt;
   // The store the last tick ran against, for the unpark placer (which runs
-  // after the tick, from MobParking). Nulled when that store is destroyed.
+  // after the tick, from EntityParking). Nulled when that store is destroyed.
   RefStore* store = nullptr;
   uint32_t lastTick = 0;
   // Graph cache.
@@ -127,7 +127,7 @@ void StoreGone(RefStore* s) {
   }
 }
 
-// The MobParking ground rule (persist.h): place a body only onto ground the
+// The EntityParking ground rule (persist.h): place a body only onto ground the
 // fetch cache has answered for SINCE this ref first asked.
 bool GroundKnown(World& world, const std::string& id, IVec3 cell, uint32_t tick) {
   auto it = W().askedAt.find(id);

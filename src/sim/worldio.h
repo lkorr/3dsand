@@ -241,7 +241,7 @@ using EntityRecord = ChunkStore::EntityRecord;
 // difference between "this record is bad" and "not now": a record that could
 // not be made live for a reason that can clear (the live-creature cap, a
 // physics or micro-brick pool momentarily full) stays PARKED in its bucket --
-// MobParking::Unpark's rule -- where the next save writes it back and a later
+// EntityParking::Unpark's rule -- where the next save writes it back and a later
 // unpark tries again. Only `Dropped` (content retired, corrupt bytes) loses it.
 enum class RecordLoad : uint8_t { Applied, Dropped, Retry };
 
@@ -315,7 +315,7 @@ struct EntityFileReport {
 //
 // LoadWorld calls it once after the window fill. The LATER touches -- the
 // window moving onto parked NPCs (S5b) -- do not come through here: they are
-// game/persist.h MobParking::Unpark, which reads the same buckets but applies
+// game/persist.h EntityParking::Unpark, which reads the same buckets but applies
 // 'MOBS' records a few per tick, only well inside the window and only onto
 // ground the fetch cache has answered for. A load is allowed to apply all at
 // once because nothing is being drawn while it runs.

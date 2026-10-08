@@ -5977,6 +5977,14 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
                          w.debris, w.mats, players[0].s->avatarDefName);
   PhaseJ(w, ws, players, scratch, tick, out);
   tprof.Mark("J");
+  // ---- BLOWS A PEER STRUCK ON BODIES THIS MACHINE OWNS (game/meleehit.h) --
+  // In phase K's slot, BEFORE the local swings, at one fixed point of the
+  // tick on both machines: after debris.PreTick (the bodies are this tick's)
+  // and with this tick's batch open, so the owner's gore from a peer's sword
+  // enters the shared stream once, from here. Nothing queued in a
+  // single-player world, so nothing runs.
+  if (w.mobs.HasRemoteMeleeHits())
+    ApplyRemoteMeleeHits(w.phys, w.mobs, w.debris, w.world, out.spawns, tick);
   for (size_t i = 0; i < players.size(); i++)
     PhaseK(w, ws, players[i], scratch[i], tick, out);
   tprof.Mark("K");

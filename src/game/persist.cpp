@@ -646,108 +646,267 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
 
 // ---- the 'ITMS' payload -----------------------------------------------------
 //
-//   u32 count   then per item: str name, f32 x, f32 y, f32 z,
-//                              u32 latticeCount, then per voxel:
-//                                i32 x, i32 y, i32 z, u32 material, u32 colour
+// v9 (2026-10-08): `u32 count` of GROUP records (persist.h "AND SINCE v9"):
+//
+//   the strap group's bodies       DebrisSystem::SaveBodyGroup's bytes
+//   u32 itemCount                  then per item:
+//     u32 bodyIndex                  which body of the group it is
+//     the ENTRY below                its identity (no DBRS index)
+//
+// v1..v8: `u32 count` of ENTRIES, each its own item:
+//
+//   str name, f32 x, f32 y, f32 z, u32 latticeCount, then per voxel:
+//     i32 x, i32 y, i32 z, u32 material, u32 colour
 //
 // (v2..v8 append dye, fill, damage, contents, stopper, coats and the DBRS
 // body index; see kWorldItemSaveVersion.)
 //
-// Position only, no rotation: the POSE is the DBRS body's, which this record
-// is re-attached to on load (v8; persist.h "ONE BODY, ONE IDENTITY"). The
-// position here keys the region bucket, guards the re-attach, and places the
-// fallback re-drop, which settles under the physics that put it there.
+// The ENTRY's position is the item body's: it keys a v1..v8 record's region
+// bucket, guards the re-attach, and places the fallback re-drop, which
+// settles under the physics that put it there. Its lattice is written only
+// when it differs from what the library would build -- the owner's decision
+// is that damage persists exactly, and a robe that burned half away on the
+// ground has to come back that way even when its group's body cannot (the
+// re-drop fallback). An untouched item costs four bytes.
+
+// ONE ENTRY. `withBodyIndex` writes v8's trailing DBRS index (only the legacy
+// writer the migration gate uses); a v9 entry ends at the coats.
+void PutItemEntry(const WorldItemRefs& r, const WorldItem& w,
+                  std::vector<uint8_t>& out, Vec3* posOut, bool withBodyIndex) {
+  PutStr(out, w.name);
+  // v2: THE DYE (game/dye.h). Written next to the name because it is the
+  // other half of what the thing on the ground IS — a dropped red tunic and
+  // a dropped blue one share a name and a lattice, and the word is not
+  // recoverable from either.
+  PutU32(out, w.dye);
+  // v3: what a dropped vessel holds, as the one-material word (its main
+  // portion); v5 appends the whole mixture after the damage.
+  PutU32(out, LegacyFillWordOf(w.contents));
+  BodyTransform xf{};
+  r.phys->GetTransform(w.body, xf);
+  if (posOut) *posOut = xf.pos;
+  PutF32(out, xf.pos.x);
+  PutF32(out, xf.pos.y);
+  PutF32(out, xf.pos.z);
+
+  std::vector<PrefabVoxel> lat;
+  uint32_t latScale = 1;
+  const ItemDef* d = r.items->Of(w);
+  // THE COAT THE BODY WEARS NOW (2026-10-01): a dropped item takes and loses
+  // coat on the ground, and the instance's record is what PutCoats writes,
+  // so the record is brought up to date from the body first (on a copy: a
+  // save does not mutate the world).
+  WornDamage damage = w.damage;
+  if (d) {
+    ItemInstance synced = w;
+    SyncGroundCoat(synced, w.body, *d, *r.debris);
+    damage = synced.damage;
+  }
+  uint32_t authored = 0;
+  if (d) {
+    uint32_t s2 = 1;
+    const std::vector<PrefabVoxel>* a = ItemGroundVoxels(*d, s2);
+    authored = a ? (uint32_t)a->size() : 0u;
+  }
+  if (!r.debris->BodyLatticeOf(w.body, lat, latScale) ||
+      lat.size() == (size_t)authored)
+    lat.clear();   // as the library would build it; nothing to record
+  PutU32(out, (uint32_t)lat.size());
+  for (const PrefabVoxel& v : lat) {
+    PutU32(out, (uint32_t)(int32_t)v.x);
+    PutU32(out, (uint32_t)(int32_t)v.y);
+    PutU32(out, (uint32_t)(int32_t)v.z);
+    PutU32(out, v.material);
+    PutU32(out, v.color);
+  }
+  // v4 (W2-M): what the piece has BEEN THROUGH, every shell of it — the body
+  // above is only its largest panel. A cut-loose cuirass picked up after a
+  // reload goes back on with the holes it came off with.
+  PutDamage(out, damage);
+  // v5: the mixture (game/composition.h), which replaces the v3 word.
+  PutU32(out, (uint32_t)w.contents.n);
+  for (int j = 0; j < w.contents.n; j++) {
+    PutU32(out, w.contents.p[j].mat);
+    PutU32(out, w.contents.p[j].eighths);
+  }
+  // v6: its stopper.
+  PutU32(out, w.stoppered ? 1u : 0u);
+  // v7: the coats on its recorded lattices (PutCoats).
+  PutCoats(out, damage);
+  // v8 ONLY: WHICH 'DBRS' BODY this item is -- its index in that section,
+  // written at the same instant (DebrisSystem::SaveIndexOf). v9 carries the
+  // body itself and needs no index.
+  if (withBodyIndex) PutU32(out, r.debris->SaveIndexOf(w.body));
+}
+
+// ONE ENTRY, READ. `savedBody` is the v8 DBRS index (0xFFFFFFFF otherwise).
+// False on a short payload (the reader is poisoned).
+bool ReadItemEntry(Reader& rd, uint32_t version, ItemInstance& inst,
+                   std::vector<PrefabVoxel>& lat, Vec3& at,
+                   uint32_t& savedBody) {
+  inst = ItemInstance{};
+  inst.name = rd.Str();
+  inst.dye = version >= 2 ? rd.U32() : 0u;
+  const uint32_t fill = version >= 3 ? rd.U32() : 0u;
+  const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
+  if (!rd.ok) return false;
+  std::memcpy(&at.x, &bx, 4);
+  std::memcpy(&at.y, &by, 4);
+  std::memcpy(&at.z, &bz, 4);
+  const uint32_t nv = rd.U32();
+  // Five u32 per voxel: refuse a count that cannot fit BEFORE reserving it.
+  if (!rd.ok || (size_t)nv * 20u > rd.left) {
+    rd.ok = false;
+    return false;
+  }
+  lat.clear();
+  lat.reserve(nv);
+  for (uint32_t vi = 0; vi < nv && rd.ok; vi++) {
+    const int32_t vx = (int32_t)rd.U32();
+    const int32_t vy = (int32_t)rd.U32();
+    const int32_t vz = (int32_t)rd.U32();
+    const uint32_t vm = rd.U32();
+    const uint32_t vc = rd.U32();
+    if (!rd.ok) return false;
+    lat.push_back(PrefabVoxel{(int16_t)vx, (int16_t)vy, (int16_t)vz,
+                              (uint16_t)vm, (uint8_t)vc});
+  }
+  // v4: the piece's damage (GetDamage remaps its own lattice ids).
+  if (version >= 4 && !GetDamage(rd, inst.damage)) return false;
+  inst.contents = ContentsFromLegacyFill(fill);
+  if (version >= 5) {
+    const uint32_t k = rd.U32();
+    if (!rd.ok || k > (uint32_t)alchemy::kMaxSubstances) {
+      rd.ok = false;
+      return false;
+    }
+    alchemy::Composition c;
+    for (uint32_t j = 0; j < k && rd.ok; j++) {
+      const uint32_t m = rd.U32(), e = rd.U32();
+      if (rd.ok && alchemy::ValidPortionMat(m) && e != 0) c.Add((uint16_t)m, e);
+    }
+    if (!rd.ok) return false;
+    inst.contents = c;
+  }
+  if (version >= 6) {
+    inst.stoppered = rd.U32() != 0;
+    if (!rd.ok) return false;
+  }
+  // v7: coats (GetCoats remaps its own ids).
+  if (version >= 7 && !GetCoats(rd, inst.damage)) return false;
+  // v8 (only): the body's index in 'DBRS'.
+  savedBody = 0xFFFFFFFFu;
+  if (version == 8) {
+    savedBody = rd.U32();
+    if (!rd.ok) return false;
+  }
+  // The lattice and the vessel's contents are ids in the table this record
+  // was written under; running ids from here on (sim/mattable.h).
+  if (const MatRemap* mr = ActiveLoadRemap()) {
+    RemapPrefabVoxels(lat, *mr);
+    RemapItemInstance(inst, *mr);
+  }
+  return true;
+}
+
+// ---- v9: ONE STRAP GROUP --------------------------------------------------
 //
-// THE LATTICE IS WRITTEN ONLY WHEN IT DIFFERS from what the library would
-// build — the owner's decision is that damage persists exactly, and a robe
-// that burned half away on the ground has to come back that way. An untouched
-// item costs four bytes, which is why the common case can afford the check.
-
-// ONE ENTRY of the payload below -- the whole section is `u32 count` + these,
-// and a region bucket (S4) stores each one as its own record. `posOut` is
-// where the item is, which is what buckets it.
-void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
-                      std::vector<uint8_t>& out, Vec3* posOut) {
-  {
-    PutStr(out, w.name);
-    // v2: THE DYE (game/dye.h). Written next to the name because it is the
-    // other half of what the thing on the ground IS — a dropped red tunic and
-    // a dropped blue one share a name and a lattice, and the word is not
-    // recoverable from either.
-    PutU32(out, w.dye);
-    // v3: what a dropped vessel holds, as the one-material word (its main
-    // portion); v5 appends the whole mixture after the damage.
-    PutU32(out, LegacyFillWordOf(w.contents));
-    BodyTransform xf{};
-    r.phys->GetTransform(w.body, xf);
-    if (posOut) *posOut = xf.pos;
-    PutF32(out, xf.pos.x);
-    PutF32(out, xf.pos.y);
-    PutF32(out, xf.pos.z);
-
-    std::vector<PrefabVoxel> lat;
-    uint32_t latScale = 1;
-    const ItemDef* d = r.items->Of(w);
-    // THE COAT THE BODY WEARS NOW (2026-10-01): a dropped item takes and loses
-    // coat on the ground, and the instance's record is what PutCoats writes,
-    // so the record is brought up to date from the body first (on a copy: a
-    // save does not mutate the world).
-    WornDamage damage = w.damage;
-    if (d) {
-      ItemInstance synced = w;
-      SyncGroundCoat(synced, w.body, *d, *r.debris);
-      damage = synced.damage;
-    }
-    uint32_t authored = 0;
-    if (d) {
-      uint32_t s2 = 1;
-      const std::vector<PrefabVoxel>* a = ItemGroundVoxels(*d, s2);
-      authored = a ? (uint32_t)a->size() : 0u;
-    }
-    if (!r.debris->BodyLatticeOf(w.body, lat, latScale) ||
-        lat.size() == (size_t)authored)
-      lat.clear();   // as the library would build it; nothing to record
-    PutU32(out, (uint32_t)lat.size());
-    for (const PrefabVoxel& v : lat) {
-      PutU32(out, (uint32_t)(int32_t)v.x);
-      PutU32(out, (uint32_t)(int32_t)v.y);
-      PutU32(out, (uint32_t)(int32_t)v.z);
-      PutU32(out, v.material);
-      PutU32(out, v.color);
-    }
-    // v4 (W2-M): what the piece has BEEN THROUGH, every shell of it — the body
-    // above is only its largest panel. A cut-loose cuirass picked up after a
-    // reload goes back on with the holes it came off with.
-    PutDamage(out, damage);
-    // v5: the mixture (game/composition.h), which replaces the v3 word.
-    PutU32(out, (uint32_t)w.contents.n);
-    for (int j = 0; j < w.contents.n; j++) {
-      PutU32(out, w.contents.p[j].mat);
-      PutU32(out, w.contents.p[j].eighths);
-    }
-    // v6: its stopper.
-    PutU32(out, w.stoppered ? 1u : 0u);
-    // v7: the coats on its recorded lattices (PutCoats).
-    PutCoats(out, damage);
-    // v8: WHICH 'DBRS' BODY this item is -- its index in that section, written
-    // at the same instant (DebrisSystem::SaveIndexOf). The load re-attaches
-    // this identity to the body DBRS restored instead of dropping a second
-    // one; 0xFFFFFFFF (an item whose body debris does not know) re-drops.
-    PutU32(out, r.debris->SaveIndexOf(w.body));
+// The groups the registry's items are in, each once, in registry order (the
+// first item of a group names its place in the list). `roots[k]` is the
+// group's host, `groups[k]` its bodies in StrapGroupOf's order.
+void ItemGroups(const WorldItemRefs& r, std::vector<std::vector<uint64_t>>& groups) {
+  groups.clear();
+  std::vector<uint64_t> seen;
+  for (const WorldItem& w : r.reg->All()) {
+    std::vector<uint64_t> g;
+    r.debris->StrapGroupOf(w.body, g);
+    if (g.empty()) continue;   // a registry entry whose body debris lost
+    if (std::find(seen.begin(), seen.end(), g[0]) != seen.end()) continue;
+    seen.push_back(g[0]);
+    groups.push_back(std::move(g));
   }
 }
 
+// One group's record. `posOut` = the HOST's position, which buckets it.
+void PutItemGroup(const WorldItemRefs& r, const std::vector<uint64_t>& group,
+                  std::vector<uint8_t>& out, Vec3* posOut) {
+  if (posOut != nullptr) {
+    BodyTransform xf{};
+    if (!group.empty()) r.phys->GetTransform(group[0], xf);
+    *posOut = xf.pos;
+  }
+  r.debris->SaveBodyGroup(group, out);
+  std::vector<uint32_t> idx;
+  for (uint32_t k = 0; k < (uint32_t)group.size(); k++)
+    if (r.reg->Find(group[k]) != nullptr) idx.push_back(k);
+  PutU32(out, (uint32_t)idx.size());
+  for (uint32_t k : idx) {
+    PutU32(out, k);
+    PutItemEntry(r, *r.reg->Find(group[k]), out, nullptr, false);
+  }
+}
+
+// ...and read back. Every body comes back asleep at its saved pose, straps
+// tied; each identity goes on the body it names. A body the debris side
+// could not rebuild re-drops its item from the entry (the v8 fallback), and
+// an item whose content is gone takes its body with it (the PLYR rule).
+bool GetItemGroup(const WorldItemRefs& r, Reader& rd, uint32_t version,
+                  int& dropped) {
+  std::vector<uint64_t> handles;
+  {
+    ByteReader br{rd.p, rd.left};
+    const bool got = r.debris->LoadBodyGroup(br, handles);
+    rd.p += br.off;
+    rd.left -= br.off;
+    if (!got || !br.ok) {
+      rd.ok = false;
+      return false;
+    }
+  }
+  const uint32_t n = rd.U32();
+  if (!rd.ok || n > (uint32_t)handles.size()) {
+    rd.ok = false;
+    return false;
+  }
+  for (uint32_t i = 0; i < n && rd.ok; i++) {
+    const uint32_t k = rd.U32();
+    ItemInstance inst;
+    std::vector<PrefabVoxel> lat;
+    Vec3 at{};
+    uint32_t unusedIndex = 0;
+    if (!rd.ok || !ReadItemEntry(rd, version, inst, lat, at, unusedIndex))
+      return false;
+    uint64_t body = k < handles.size() ? handles[k] : 0;
+    if (body && r.reg->Find(body)) body = 0;   // never two identities
+    const ItemDef* d = r.items->Named(inst.name);
+    if (!d) {
+      if (body) r.debris->DestroyBody(body);
+      dropped++;
+      continue;
+    }
+    inst.name = d->name;
+    if (body) {
+      r.debris->MarkItemBody(body);
+      r.reg->Add(body, inst);
+      continue;
+    }
+    DropItemToWorld(*d, inst, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
+                    lat.empty() ? nullptr : &lat);
+  }
+  return rd.ok;
+}
+
 void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
-  const std::vector<WorldItem>& all = r.reg->All();
-  PutU32(out, (uint32_t)all.size());
-  for (const WorldItem& w : all) SaveOneWorldItem(r, w, out, nullptr);
+  std::vector<std::vector<uint64_t>> groups;
+  ItemGroups(r, groups);
+  PutU32(out, (uint32_t)groups.size());
+  for (const std::vector<uint64_t>& g : groups) PutItemGroup(r, g, out, nullptr);
 }
 
 bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
                     uint32_t version) {
-  // A RANGE, not an equality. v2 inserts one word per entry and everything
-  // else about the record is unchanged, so a v1 payload still reads exactly as
-  // it did — with no dyes, which is what it had.
+  // A RANGE, not an equality. Every version through v8 appends to an entry,
+  // so an older payload reads exactly as it did; v9 is the group shape.
   if (version > kWorldItemSaveVersion || version < 1) {
     std::fprintf(stderr, "ITMS: unknown version %u (this build writes %u)\n",
                  version, kWorldItemSaveVersion);
@@ -756,115 +915,57 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
   Reader rd{data, len};
   const uint32_t n = rd.U32();
   int dropped = 0;
-  for (uint32_t i = 0; i < n && rd.ok; i++) {
-    const std::string name = rd.Str();
-    ItemInstance inst;
-    inst.name = name;
-    inst.dye = version >= 2 ? rd.U32() : 0u;
-    uint32_t fill = version >= 3 ? rd.U32() : 0u;
-    const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
-    if (!rd.ok) break;
-    Vec3 at{};
-    std::memcpy(&at.x, &bx, 4);
-    std::memcpy(&at.y, &by, 4);
-    std::memcpy(&at.z, &bz, 4);
-    const uint32_t nv = rd.U32();
-    // Five u32 per voxel: refuse a count that cannot fit BEFORE reserving it.
-    if (!rd.ok || (size_t)nv * 20u > rd.left) {
-      rd.ok = false;
-      break;
-    }
-    std::vector<PrefabVoxel> lat;
-    lat.reserve(nv);
-    for (uint32_t vi = 0; vi < nv && rd.ok; vi++) {
-      const int32_t vx = (int32_t)rd.U32();
-      const int32_t vy = (int32_t)rd.U32();
-      const int32_t vz = (int32_t)rd.U32();
-      const uint32_t vm = rd.U32();
-      const uint32_t vc = rd.U32();
-      if (!rd.ok) break;
-      lat.push_back(PrefabVoxel{(int16_t)vx, (int16_t)vy, (int16_t)vz,
-                                (uint16_t)vm, (uint8_t)vc});
-    }
-    // v4: the piece's damage (GetDamage remaps its own lattice ids).
-    if (version >= 4 && !GetDamage(rd, inst.damage)) break;
-    inst.contents = ContentsFromLegacyFill(fill);
-    if (version >= 5) {
-      const uint32_t k = rd.U32();
-      if (!rd.ok || k > (uint32_t)alchemy::kMaxSubstances) { rd.ok = false; break; }
-      alchemy::Composition c;
-      for (uint32_t j = 0; j < k && rd.ok; j++) {
-        const uint32_t m = rd.U32(), e = rd.U32();
-        if (rd.ok && alchemy::ValidPortionMat(m) && e != 0) c.Add((uint16_t)m, e);
+  if (version >= 9) {
+    for (uint32_t i = 0; i < n && rd.ok; i++)
+      if (!GetItemGroup(r, rd, version, dropped)) break;
+  } else {
+    for (uint32_t i = 0; i < n && rd.ok; i++) {
+      ItemInstance inst;
+      std::vector<PrefabVoxel> lat;
+      Vec3 at{};
+      uint32_t savedBody = 0xFFFFFFFFu;
+      if (!ReadItemEntry(rd, version, inst, lat, at, savedBody)) break;
+      // ---- ONE BODY PER ITEM (2026-10-01) ----------------------------------
+      // 'DBRS' already restored this item's body (before v9 it saved every
+      // debris body, a ground item included) -- with its rotation, its exact
+      // lattice and coats, and the strap a shed helm keeps to the head it
+      // came off with. Re-dropping here as well put TWO on the ground after
+      // every load and four after the next. So the identity is re-attached
+      // to that body; the re-drop below is only the fallback for a body DBRS
+      // could not restore (the body ceiling, a Jolt refusal, a section-only
+      // load).
+      //   v8: by the saved index, guarded by position (a record parked across
+      //       saves names an index into an OLDER 'DBRS'); and when the index
+      //       missed, the position test before a re-drop.
+      //   v1..v7 (MIGRATION): those saves hold the duplicate already -- their
+      //       DBRS has the item body too -- so the nearest unclaimed restored
+      //       body at the item's position is taken as it. Both sections were
+      //       written from the same transform at the same instant.
+      uint64_t body =
+          version >= 8 ? r.debris->ClaimLoadedBody(savedBody, at, 1.0f)
+                       : r.debris->ClaimLoadedBodyNear(at, 0.25f);
+      if (!body && version >= 8) body = r.debris->ClaimLoadedBodyNear(at, 0.25f);
+      if (body && r.reg->Find(body)) body = 0;   // never two identities
+      const ItemDef* d = r.items->Named(inst.name);
+      // Content legitimately disappears between saves. The item is dropped
+      // with a log line rather than restored as something else, which is the
+      // same rule PLYR follows for a name it cannot resolve -- and the body
+      // DBRS restored for it goes too, or it would lie there as a nameless
+      // shape.
+      if (!d) {
+        if (body) r.debris->DestroyBody(body);
+        dropped++;
+        continue;
       }
-      if (!rd.ok) break;
-      inst.contents = c;
+      if (body) {
+        inst.name = d->name;
+        r.debris->MarkItemBody(body);   // Body::item is not in DBRS
+        r.reg->Add(body, inst);
+        continue;
+      }
+      DropItemToWorld(*d, inst, at, Vec3{}, *r.phys, *r.debris, r.micro,
+                      *r.reg, lat.empty() ? nullptr : &lat);
     }
-    if (version >= 6) {
-      inst.stoppered = rd.U32() != 0;
-      if (!rd.ok) break;
-    }
-    // v7: coats (GetCoats remaps its own ids).
-    if (version >= 7 && !GetCoats(rd, inst.damage)) break;
-    // v8: the body's index in 'DBRS'.
-    uint32_t savedBody = 0xFFFFFFFFu;
-    if (version >= 8) {
-      savedBody = rd.U32();
-      if (!rd.ok) break;
-    }
-    // The lattice and the vessel's contents are ids in the table this record
-    // was written under; running ids from here on (sim/mattable.h).
-    if (const MatRemap* mr = ActiveLoadRemap()) {
-      RemapPrefabVoxels(lat, *mr);
-      RemapItemInstance(inst, *mr);
-    }
-    // ---- ONE BODY PER ITEM (2026-10-01) ------------------------------------
-    // 'DBRS' already restored this item's body (it saves every debris body,
-    // and a ground item is one) -- with its rotation, its exact lattice and
-    // coats, and the strap a shed helm keeps to the head it came off with.
-    // Re-dropping here as well put TWO on the ground after every load and
-    // four after the next. So the identity is re-attached to that body; the
-    // re-drop below is only the fallback for a body DBRS could not restore
-    // (the body ceiling, a Jolt refusal, a section-only load).
-    //   v8+: by the saved index, guarded by position (a record parked across
-    //        saves names an index into an OLDER 'DBRS').
-    //   v1..v7 (MIGRATION): those saves hold the duplicate already -- their
-    //        DBRS has the item body too -- so the nearest unclaimed restored
-    //        body at the item's position is taken as it. Both sections were
-    //        written from the same transform at the same instant.
-    //   v8+, AND THE INDEX MISSED (2026-10-07): a record kept dormant across
-    //        a save names an index into the 'DBRS' of the save it was parked
-    //        in, and the body that save restored for it now sits under another
-    //        index. The position test the migration uses is the fallback
-    //        before a re-drop, so a body restored where the record says the
-    //        item lies is re-attached rather than left as an anonymous copy
-    //        beside a second one. A body that MOVED since (it was simulated
-    //        inside the pad after the record parked) still re-drops: closing
-    //        that needs per-body DBRS records (PLAN_save_system.md "Still
-    //        open").
-    uint64_t body =
-        version >= 8 ? r.debris->ClaimLoadedBody(savedBody, at, 1.0f)
-                     : r.debris->ClaimLoadedBodyNear(at, 0.25f);
-    if (!body && version >= 8) body = r.debris->ClaimLoadedBodyNear(at, 0.25f);
-    if (body && r.reg->Find(body)) body = 0;   // never two identities
-    const ItemDef* d = r.items->Named(name);
-    // Content legitimately disappears between saves. The item is dropped with
-    // a log line rather than restored as something else, which is the same
-    // rule PLYR follows for a name it cannot resolve -- and the body DBRS
-    // restored for it goes too, or it would lie there as a nameless shape.
-    if (!d) {
-      if (body) r.debris->DestroyBody(body);
-      dropped++;
-      continue;
-    }
-    if (body) {
-      inst.name = d->name;
-      r.debris->MarkItemBody(body);   // Body::item is not in DBRS
-      r.reg->Add(body, inst);
-      continue;
-    }
-    DropItemToWorld(*d, inst, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
-                    lat.empty() ? nullptr : &lat);
   }
   if (dropped > 0)
     std::fprintf(stderr,
@@ -879,6 +980,13 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
 
 }  // namespace
 
+void SaveWorldItemsLegacy(const WorldItemRefs& r, std::vector<uint8_t>& out,
+                          uint32_t version) {
+  const std::vector<WorldItem>& all = r.reg->All();
+  PutU32(out, (uint32_t)all.size());
+  for (const WorldItem& w : all) PutItemEntry(r, w, out, nullptr, version >= 8);
+}
+
 void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {
   SavePlayerKitBytes(r, out, version);
 }
@@ -888,10 +996,24 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       const WorldItemRefs* ground, refs::RefStore* refStore,
                       dialogue::Store* talk) {
   EntityIO io;
+  // A GROUND ITEM'S STRAP GROUP IS 'ITMS''s (v9), so 'DBRS' leaves it out --
+  // the same predicate ItemGroups writes them by (a body the registry names),
+  // asked here and nowhere else, so the two sections cannot both take or both
+  // drop one. With no ground section registered, DBRS writes every body.
+  const WorldItems* groundReg =
+      ground != nullptr && ground->Complete() ? ground->reg : nullptr;
   io.sections.push_back(EntitySection{
       FourCC('D', 'B', 'R', 'S'), DebrisSystem::kSaveVersion,
       [&debris] { debris.Reset(); },
-      [&debris](std::vector<uint8_t>& out) { debris.SaveState(out); },
+      [&debris, groundReg](std::vector<uint8_t>& out) {
+        if (groundReg == nullptr) {
+          debris.SaveState(out);
+          return;
+        }
+        debris.SaveState(out, [groundReg](uint64_t h) {
+          return groundReg->Find(h) != nullptr;
+        });
+      },
       [&debris](const uint8_t* d, size_t n, uint32_t v) {
         return debris.LoadState(d, n, v);
       }});
@@ -1026,13 +1148,16 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         [g](const uint8_t* d, size_t n, uint32_t v) {
           return LoadWorldItems(g, d, n, v);
         }};
-    // One record per item, bucketed by where it lies (S4). An entry names
-    // nothing but content and its own pose, so items split freely.
+    // One record per item STRAP GROUP (v9), bucketed by where its host lies
+    // (S4). A record names nothing outside itself -- its bodies are inline --
+    // so groups split across buckets freely.
     itms.scope = EntityScope::Region;
     itms.saveRecords = [g](std::vector<EntityRecord>& out) {
-      for (const WorldItem& w : g.reg->All()) {
+      std::vector<std::vector<uint64_t>> groups;
+      ItemGroups(g, groups);
+      for (const std::vector<uint64_t>& grp : groups) {
         EntityRecord r;
-        SaveOneWorldItem(g, w, r.bytes, &r.pos);
+        PutItemGroup(g, grp, r.bytes, &r.pos);
         out.push_back(std::move(r));
       }
     };
@@ -1166,15 +1291,29 @@ bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow) {
   return true;
 }
 
-// ---- MobParking (persist.h, PLAN_save_system.md S5b) -------------------------
+// ---- EntityParking (persist.h, PLAN_save_system.md S5b) -------------------------
 
-void MobParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled) {
+void EntityParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled,
+                         const WorldItemRefs* ground) {
+  const bool wantGround = enabled && ground != nullptr && ground->Complete();
+  const bool groundSame =
+      haveGround_ == wantGround &&
+      (!wantGround ||
+       (ground_.reg == ground->reg && ground_.debris == ground->debris &&
+        ground_.debris->HasParkHook()));
   if (boundMobs_ == &mobs && boundStore_ == &store && enabled_ == enabled &&
-      mobs.HasParkFn() == enabled)
+      mobs.HasParkFn() == enabled && groundSame)
     return;
+  // An item hook this object installed on ANOTHER debris system (or one it
+  // is about to stop offering) comes off first: the hook captures `this`.
+  if (haveGround_ && ground_.debris != nullptr &&
+      (!wantGround || ground_.debris != ground->debris))
+    ground_.debris->SetParkHook({});
   boundMobs_ = &mobs;
   boundStore_ = &store;
   enabled_ = enabled;
+  haveGround_ = wantGround;
+  ground_ = wantGround ? *ground : WorldItemRefs{};
   if (!enabled) {
     mobs.SetParkFn(nullptr);
     return;
@@ -1194,17 +1333,37 @@ void MobParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled) {
     stats->parked++;
     return true;
   });
+  // ---- AND THE GROUND ITEMS (2026-10-08) -----------------------------------
+  // The same record a save writes for the group ('ITMS' v9, PutItemGroup),
+  // into the bucket holding its host -- written by the debris cull BEFORE it
+  // releases the bodies (debris.h SetParkHook), because the registry entry
+  // that names an item goes with its body.
+  if (wantGround) {
+    const WorldItemRefs g = ground_;
+    DebrisSystem::ParkHook hook;
+    hook.isParked = [g](uint64_t h) { return g.reg->Find(h) != nullptr; };
+    hook.park = [this, g, st](const std::vector<uint64_t>& group) {
+      ChunkStore::EntityRecord r;
+      r.section = FourCC('I', 'T', 'M', 'S');
+      r.version = kWorldItemSaveVersion;
+      PutItemGroup(g, group, r.bytes, &r.pos);
+      st->DormantEntities(ChunkStore::RegionOfVoxel(r.pos)).push_back(std::move(r));
+      stats_.itemGroupsParked++;
+      pending_ = true;
+    };
+    ground_.debris->SetParkHook(std::move(hook));
+  }
   // Something new may be parked right at a face the window is about to cross.
   pending_ = true;
 }
 
-void MobParking::ResetWaits() {
+void EntityParking::ResetWaits() {
   waits_.clear();
   haveOrigin_ = false;
   pending_ = true;
 }
 
-bool MobParking::GroundKnown(World& world, IVec3 wc, uint32_t tick) {
+bool EntityParking::GroundKnown(World& world, IVec3 wc, uint32_t tick) {
   const uint64_t key = World::PackChunkKey(wc);
   auto it = waits_.find(key);
   if (it == waits_.end()) {
@@ -1220,7 +1379,7 @@ bool MobParking::GroundKnown(World& world, IVec3 wc, uint32_t tick) {
   return false;
 }
 
-uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
+uint32_t EntityParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
                             uint32_t tick, uint32_t budget) {
   stats_.lastCall = 0;
   if (!enabled_) return 0;
@@ -1251,14 +1410,57 @@ uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
            cy < wo.y + n - m && cz >= wo.z + m && cz < wo.z + n - m;
   };
   const uint32_t kMobs = FourCC('M', 'O', 'B', 'S');
+  const uint32_t kItms = FourCC('I', 'T', 'M', 'S');
   const IVec3 lo = ChunkStore::RegionOfChunk(wo);
   const IVec3 hi = ChunkStore::RegionOfChunk({wo.x + n - 1, wo.y + n - 1, wo.z + n - 1});
-  uint32_t made = 0;
+  uint32_t made = 0, itemsMade = 0;
   for (int rz = lo.z; rz <= hi.z; rz++)
     for (int ry = lo.y; ry <= hi.y; ry++)
       for (int rx = lo.x; rx <= hi.x; rx++) {
         std::vector<EntityRecord>& dormant = store.DormantEntities({rx, ry, rz});
         for (size_t i = 0; i < dormant.size();) {
+          // ---- A GROUND ITEM'S STRAP GROUP (2026-10-08) --------------------
+          // The same waits as a creature, smaller: a budget of its own, and
+          // the ground under the host's own chunk (and the one below) known
+          // in the fetch cache. Applied through the save path's loader, one
+          // record as a count-1 payload -- the region loadRecord's shape.
+          if (dormant[i].section == kItms && haveGround_ &&
+              inside(dormant[i].pos)) {
+            if (itemsMade >= kUnparkItemsPerCall) {
+              stats_.itemBudgetWaits++;
+              pending_ = true;
+              i++;
+              continue;
+            }
+            const Vec3 p = dormant[i].pos;
+            bool ground = true;
+            for (int dy = 0; dy >= -1; dy--)
+              ground &= GroundKnown(world, {chunkOf(p.x), chunkOf(p.y) + dy,
+                                            chunkOf(p.z)}, tick);
+            if (!ground) {
+              stats_.itemGroundWaits++;
+              pending_ = true;
+              i++;
+              continue;
+            }
+            EntityRecord r = std::move(dormant[i]);
+            dormant.erase(dormant.begin() + (ptrdiff_t)i);
+            const ScopedLoadRemap remapScope(store.Tables().RemapFor(r.matTable));
+            std::vector<uint8_t> one;
+            PutU32(one, 1u);
+            one.insert(one.end(), r.bytes.begin(), r.bytes.end());
+            if (LoadWorldItems(ground_, one.data(), one.size(), r.version)) {
+              itemsMade++;
+              stats_.itemGroupsUnparked++;
+            } else {
+              stats_.itemGroupsFailed++;
+              std::fprintf(stderr,
+                           "unpark: a parked item record (v%u) in region "
+                           "(%d,%d,%d) failed to apply and is dropped\n",
+                           r.version, rx, ry, rz);
+            }
+            continue;
+          }
           if (dormant[i].section != kMobs || !inside(dormant[i].pos)) {
             i++;
             continue;

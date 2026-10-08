@@ -34,7 +34,7 @@
 //      authored. A delta whose id no longer exists is dropped with a warning.
 //   4. ACTIVATION FOLLOWS THE WINDOW, IN ID ORDER. A ref is ACTIVE while its
 //      chunk is inside the residency window (by kActivateMarginChunks on every
-//      face to switch on; wholly outside to switch off — the MobParking
+//      face to switch on; wholly outside to switch off — the EntityParking
 //      hysteresis). Every activation pass walks refs in id order, so what
 //      happens is a pure function of (window, refs, deltas). Voxel writes a
 //      kind makes go through the tick's OpBatch (CLAUDE.md rule 3).

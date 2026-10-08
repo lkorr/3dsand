@@ -2083,24 +2083,21 @@ Status GateSaveItems(Ctx& c, std::string& detail) {
         itms = &s;
     }
     if (dbrs && itms) {
+      // What every pre-v9 save holds: a 'DBRS' with the item bodies IN it
+      // (since v9 the section leaves them to 'ITMS'), and v7 entries -- no
+      // body index -- beside it.
       std::vector<uint8_t> body;
-      dbrs->save(body);
-      std::vector<EntityRecord> recs;
-      itms->saveRecords(recs);
-      // v7 is v8 without the trailing body index on each entry.
-      for (EntityRecord& r : recs)
-        if (r.bytes.size() >= 4) r.bytes.resize(r.bytes.size() - 4);
+      debris.SaveState(body);
+      std::vector<uint8_t> legacy;
+      SaveWorldItemsLegacy(groundRefs, legacy, 7u);
       // Only debris and the registry: the creatures stay as they are, so the
       // counts below compare like with like.
       debris.Reset();
       ground.Clear();
       const bool dOk = dbrs->load(body.data(), body.size(), DebrisSystem::kSaveVersion);
-      int applied = 0;
-      for (const EntityRecord& r : recs)
-        if (itms->loadRecord(r.bytes.data(), r.bytes.size(), 7u) == RecordLoad::Applied)
-          applied++;
+      const bool iOk = itms->load(legacy.data(), legacy.size(), 7u);
       c1 = measure();
-      const bool migrated = dOk && applied == (int)recs.size() &&
+      const bool migrated = dOk && iOk &&
                             c1.items == c0.items && c1.bodies == c0.bodies &&
                             c1.itemBodies == c1.items && c1.distinct;
       okC = migrated && cycle(c2, c3);
@@ -2170,6 +2167,263 @@ Status GateSaveItems(Ctx& c, std::string& detail) {
   mobs.SetNextIdCounter(idCounterWas);
   stream.Store().Unbind();
   std::filesystem::remove_all(kPath);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- item-park -------------------------------------------------------------
+//
+// GROUND ITEMS OUTLIVE THE WINDOW (persist.h EntityParking, ITMS v9;
+// decided 2026-10-08). Until then the debris cull DESTROYED an item 32 voxels
+// outside the window: a sword dropped and walked away from was gone when you
+// came back. save-items' fixture -- dropped items and an iron helm shed onto
+// its owner's severed head -- settled through THE tick. Claims:
+//
+//   A. PARK. The window moves far away and one tick runs: no item is left in
+//      the registry or as a body, and the store holds exactly one 'ITMS'
+//      record per strap group -- the helm's carrying the head it is on.
+//   B. UNPARK. The window comes home; EntityParking::Unpark (with world ticks
+//      for the fetch cache) brings every group back: the same items by name,
+//      each within itemParkPosTol voxels of where it lay and turned the same
+//      way, every one on an item-flagged body, the helm STRAPPED to a head,
+//      and nothing left in the buckets.
+//   C. THE BUDGET EVICTS ITEMS LAST. Rubble past the body ceiling: the
+//      PostStep budget takes rubble and every item survives.
+// Leaves nothing: mobs, debris and the registry reset, the hook and park
+// function unbound, the store cleared, worldgen regenerated at home.
+Status GateItemPark(Ctx& c, std::string& detail) {
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  std::vector<const ItemDef*> drops;
+  for (const ItemDef& it : c.items.items) {
+    uint32_t sc = 1;
+    if (drops.size() < 2 && !ItemKindIsWorn(it.kind) && ItemGroundVoxels(it, sc))
+      drops.push_back(&it);
+  }
+  const ItemDef* helm = nullptr;
+  for (const ItemDef& it : c.items.items)
+    if (it.name == "iron_helm") helm = &it;
+  const int humanDef = c.mobs.FindDef("human");
+  if (drops.empty() || helm == nullptr || humanDef < 0) {
+    detail = "no droppable item, no iron_helm, or no human def";
+    return Status::Skip;
+  }
+  while (drops.size() < 2) drops.push_back(drops[0]);
+
+  c.stream.Store().Clear();
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  WorldItems ground;
+  c.debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  c.mobs.SetOnItemShed(
+      [&ground](uint64_t h, const ItemInstance& it) { ground.Add(h, it); });
+  WorldItemRefs refs{&ground, &c.phys, &c.debris, nullptr, &c.items};
+  EntityParking parking;
+  auto restore = [&]() {
+    parking.Bind(c.mobs, c.stream.Store(), false, &refs);
+    c.debris.Reset();
+    c.mobs.Reset();
+    ground.Clear();
+    c.debris.SetOnBodyGone(nullptr);
+    c.mobs.SetOnItemShed(nullptr);
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.SetNextIdCounter(idCounterWas);
+    c.stream.Store().Clear();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+  };
+  const IVec3 home = c.world.WindowOrigin();
+  const int n = (int)kNChunk;
+  const IVec3 away{home.x + n + 8, home.y, home.z + n + 8};
+  // mob-park's teleport: the way LoadWorld moves the window.
+  auto teleport = [&](IVec3 origin) {
+    c.world.InvalidateSnapshot();
+    c.stream.ReloadWindow(origin);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeLoadReset(enc);
+    rhi::CommandBuffer cmd = enc.Finish();
+    c.ctx.queue.Submit(1, &cmd);
+    c.ctx.WaitIdle();
+  };
+
+  // ---- the fixture: save-items' ----
+  const int sx = home.x * (int)kChunk + 190, sz = home.z * (int)kChunk + 190;
+  const int sh = World::TerrainHeight(sx, sz, kDefaultSeed);
+  for (size_t k = 0; k < drops.size(); k++)
+    DropItemToWorld(*drops[k], ItemInstance{drops[k]->name},
+                    Vec3{(float)sx + 5.0f * (float)k, (float)(sh + 3), (float)sz},
+                    Vec3{}, c.phys, c.debris, nullptr, ground);
+  bool shedOk = false;
+  {
+    const int hx = sx, hz = sz + 12;
+    const int hh = World::TerrainHeight(hx, hz, kDefaultSeed);
+    const uint64_t id = c.mobs.Spawn(humanDef, {hx, hh + 1, hz});
+    Mob* m = c.mobs.FindMobById(id);
+    if (m && m->WearItem(helm, (int)EquipSlotId::Head)) {
+      int identity = -1;
+      for (int p = 0; p < m->WornPieceCount() && identity < 0; p++) {
+        const std::vector<int>& sl = m->WornSlotsAt(p);
+        if (!sl.empty() &&
+            m->LimbDefAt(sl[0]).name.find("iron_helm") != std::string::npos)
+          identity = m->IdentityShellOf(p);
+      }
+      const int host = identity >= 0 ? m->WornHostOf(identity) : -1;
+      const size_t before = ground.Count();
+      if (host >= 0) {
+        c.mobs.Sever(id, host);
+        shedOk = ground.Count() == before + 1;
+      }
+    }
+  }
+  uint32_t t = 71000;
+  const IVec3 homeChunk{sx >> 4, (sh + 8) >> 4, sz >> 4};
+  support::TickCursor realTick{c, t, homeChunk};
+  for (int i = 0; i < 90; i++) realTick();
+  auto helmBody = [&]() -> uint64_t {
+    for (const WorldItem& w : ground.All())
+      if (w.name == helm->name) return w.body;
+    return 0;
+  };
+  const bool strapped0 = shedOk && c.debris.WornHostOf(helmBody()) != 0;
+  struct Lay {
+    std::string name;
+    BodyTransform xf{};
+    bool found = false;
+  };
+  std::vector<Lay> lay;
+  for (const WorldItem& w : ground.All()) {
+    Lay l;
+    l.name = w.name;
+    c.phys.GetTransform(w.body, l.xf);
+    lay.push_back(l);
+  }
+  // The groups the park must write: one per item group, the helm's two.
+  size_t groupsWant = 0, helmGroupSize = 0;
+  {
+    std::vector<uint64_t> roots;
+    for (const WorldItem& w : ground.All()) {
+      std::vector<uint64_t> g;
+      c.debris.StrapGroupOf(w.body, g);
+      if (g.empty()) continue;
+      if (std::find(roots.begin(), roots.end(), g[0]) == roots.end())
+        roots.push_back(g[0]);
+      if (w.name == helm->name) helmGroupSize = g.size();
+    }
+    groupsWant = roots.size();
+  }
+
+  // ======== A: park ========================================================
+  parking.Bind(c.mobs, c.stream.Store(), true, &refs);
+  teleport(away);
+  realTick.chunk = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+  realTick();
+  const uint32_t kItms = 'I' | ('T' << 8) | ('M' << 16) | ((uint32_t)'S' << 24);
+  auto countRecords = [&]() {
+    size_t k = 0;
+    const IVec3 lo = ChunkStore::RegionOfChunk(home);
+    const IVec3 hi = ChunkStore::RegionOfChunk({home.x + n - 1, home.y + n - 1,
+                                                home.z + n - 1});
+    for (int rz = lo.z; rz <= hi.z; rz++)
+      for (int ry = lo.y; ry <= hi.y; ry++)
+        for (int rx = lo.x; rx <= hi.x; rx++)
+          for (const EntityRecord& r : c.stream.Store().DormantEntities({rx, ry, rz}))
+            if (r.section == kItms) k++;
+    return k;
+  };
+  const size_t itemsAfterPark = ground.Count();
+  size_t itemBodiesAfterPark = 0;
+  for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+    if (c.debris.IsItemBody(c.debris.BodyHandle(i))) itemBodiesAfterPark++;
+  const size_t recordsA = countRecords();
+  const uint64_t parkedA = parking.GetStats().itemGroupsParked;
+  const bool okA = shedOk && strapped0 && lay.size() == drops.size() + 1 &&
+                   helmGroupSize >= 2 && itemsAfterPark == 0 &&
+                   itemBodiesAfterPark == 0 && recordsA == groupsWant &&
+                   parkedA == groupsWant;
+
+  // ======== B: unpark ======================================================
+  teleport(home);
+  parking.ResetWaits();
+  const IVec3 pc = homeChunk;
+  int calls = 0;
+  for (; calls < 240 && ground.Count() < lay.size(); calls++) {
+    ++t;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, {}, false, pc,
+               true, false);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    parking.Unpark(c.mobs, c.stream.Store(), c.world, t);
+  }
+  const float posTol = (float)BaselineNumber("itemParkPosTol", 0.05);
+  int placed = 0, turned = 0, flagged = 0;
+  for (const WorldItem& w : ground.All()) {
+    if (c.debris.IsItemBody(w.body)) flagged++;
+    BodyTransform xf{};
+    c.phys.GetTransform(w.body, xf);
+    for (Lay& l : lay) {
+      if (l.found || l.name != w.name || (xf.pos - l.xf.pos).len() > posTol)
+        continue;
+      l.found = true;
+      placed++;
+      float dot = 0;
+      for (int q = 0; q < 4; q++) dot += xf.quat[q] * l.xf.quat[q];
+      if (std::fabs(dot) > 0.999f) turned++;
+      break;
+    }
+  }
+  const bool strappedB = c.debris.WornHostOf(helmBody()) != 0;
+  const size_t recordsB = countRecords();
+  const EntityParking::Stats ps = parking.GetStats();
+  const bool okB = ground.Count() == lay.size() && placed == (int)lay.size() &&
+                   turned == (int)lay.size() && flagged == (int)lay.size() &&
+                   strappedB && recordsB == 0 && ps.itemGroupsFailed == 0 &&
+                   ps.itemGroupsUnparked == groupsWant;
+
+  // ======== C: the budget evicts items last ================================
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): the budget is PostStep's alone, and
+  // a tick would also let the rubble fall and settle back into the grid.
+  const size_t itemsBeforeBudget = ground.Count();
+  uint32_t rubble = 0;
+  {
+    std::vector<DebrisVoxel> vox;
+    for (int z = 0; z < 2; z++)
+      for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 2; x++)
+          vox.push_back(DebrisVoxel{(int8_t)x, (int8_t)y, (int8_t)z, 0, (uint16_t)1});
+    for (uint32_t k = 0; k < kMaxBodies + 8; k++) {
+      BodyTransform xf{};
+      xf.pos = Vec3{(float)(sx - 60 + (int)(k % 16) * 4), (float)(sh + 40 + (int)(k / 256) * 4),
+                    (float)(sz - 60 + (int)((k / 16) % 16) * 4)};
+      xf.quat[3] = 1;
+      const uint64_t h = c.phys.CreateDebrisBodyXf(vox, xf, c.debris.DensityOf(), false, 1.0f);
+      if (h == 0) break;
+      c.debris.AdoptBody(h, vox, xf);
+      rubble++;
+    }
+    c.debris.PostStep();
+  }
+  size_t itemsAlive = 0;
+  for (const WorldItem& w : ground.All())
+    if (c.debris.IsItemBody(w.body)) itemsAlive++;
+  const bool okC = rubble == kMaxBodies + 8 && ground.Count() == itemsBeforeBudget &&
+                   itemsAlive == itemsBeforeBudget &&
+                   c.debris.BodyCount() <= kMaxBodies;
+
+  const bool ok = okA && okB && okC;
+  detail = Format(
+      "A park=%d (items %zu, helm shed %d strapped %d, helm group %zu bodies; "
+      "after: registry %zu, item bodies %zu, ITMS records %zu/%zu, parked %llu) "
+      "| B unpark=%d (calls %d, items %zu/%zu, placed %d, turned %d, flagged %d, "
+      "helm strapped %d, records left %zu, failed %llu) | C budget=%d (rubble "
+      "%u, items %zu->%zu alive %zu, bodies %u)",
+      okA ? 1 : 0, lay.size(), shedOk ? 1 : 0, strapped0 ? 1 : 0, helmGroupSize,
+      itemsAfterPark, itemBodiesAfterPark, recordsA, groupsWant,
+      (unsigned long long)parkedA, okB ? 1 : 0, calls, ground.Count(), lay.size(),
+      placed, turned, flagged, strappedB ? 1 : 0, recordsB,
+      (unsigned long long)ps.itemGroupsFailed, okC ? 1 : 0, rubble,
+      itemsBeforeBudget, ground.Count(), itemsAlive, c.debris.BodyCount());
+  std::printf("item-park: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  restore();
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -2752,6 +3006,10 @@ const std::vector<Gate>& WorldIoGates() {
       {"save-entities", "worldio", {}, false, GateSaveEntities},
       {"save-split", "worldio", {}, false, GateSaveSplit},
       {"save-items", "worldio", {}, false, GateSaveItems},
+      // Ground items park with what they are strapped to and come back
+      // where they lay (persist.h EntityParking, ITMS v9); the budget
+      // evicts them last.
+      {"item-park", "worldio", {}, false, GateItemPark},
       // AVTR v2: a living player's carves, burns, coats and infection survive a save.
       {"save-avatar-body", "worldio", {}, false, GateSaveAvatarBody},
       {"save-material-remap", "worldio", {}, false, GateSaveMaterialRemap},

@@ -454,7 +454,7 @@ Status GateRefsNpcIdentity(Ctx& c, std::string& detail) {
   };
   const IVec3 savedOrigin = c.world.WindowOrigin();
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
-  MobParking parking;
+  EntityParking parking;
   auto countRef = [&]() {
     int n = 0;
     for (uint32_t i = 0; i < c.mobs.MobCount(); i++)

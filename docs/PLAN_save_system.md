@@ -343,6 +343,13 @@ and buckets with ITMS.
   after its record parked still leaves the anonymous copy: the real fix is
   per-body DBRS records bucketed with ITMS -- record format, strap-group
   bucketing and what parks with what are the debris owner's design.
+- **Ground items park: DONE 2026-10-08** (gate `item-park`). Decisions: (2)
+  PARK THE PAIR -- the strap group (host + followers) is the unit, saved in the
+  DBRS per-body form inside the item's own record (ITMS v9, which also retires
+  the v8 cross-section index and with it the parked-across-a-save re-drop);
+  (3) the body budget evicts items LAST everywhere, not only on unpark.
+  `EntityParking` (was MobParking) parks and unparks both. Below, the question
+  as it was posed.
 - **Ground items do not park: STILL OPEN, needs a decision.** Today an item
   more than 32 voxels outside the window is DESTROYED (`DebrisSystem::PostStep`
   -> `ReleaseBody` -> `WorldItems::Remove`), not parked. The mechanism is

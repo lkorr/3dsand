@@ -581,7 +581,7 @@ void ApplyRegionEntities(ChunkStore& store, IVec3 wo, const EntityIO& io,
         // NOT re-parked: the same rule the whole-payload loaders follow for a
         // name that no longer resolves. A record that could not be made live
         // YET (`Retry`: the creature cap, a pool momentarily full) goes back
-        // into the bucket -- MobParking::Unpark's rule. Parked records beyond
+        // into the bucket -- EntityParking::Unpark's rule. Parked records beyond
         // the cap are a normal state, and a load that dropped them would
         // delete every NPC past the living cap from the world file on the next
         // save.

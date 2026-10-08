@@ -397,7 +397,7 @@ Status GateNpcCatchup(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   st.BindChunkStore(&c.stream.Store());
-  MobParking parking;
+  EntityParking parking;
   parking.Bind(c.mobs, c.stream.Store(), true);
   std::vector<std::string> fails;
   auto check = [&](bool ok, const std::string& w) {

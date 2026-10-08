@@ -57,6 +57,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "game/meleehit.h"
 #include "net/authority.h"
 #include "net/debrissync.h"
 #include "net/mobsync.h"
@@ -72,7 +73,10 @@ namespace net {
 // about the envelope alone.
 //   2 (P2c, PLAN_corpse_is_a_mob.md): `mobStates` between the announces and
 //     the poses.
-inline constexpr uint32_t kEntityBatchVersion = 2;
+//   3 (2026-10-08, game/meleehit.h): `meleeHits` last -- blows struck on
+//     bodies the receiver owns. Not applied in ApplyForTick: they are handed
+//     to MobSystem and applied inside the tick (ApplyRemoteMeleeHits).
+inline constexpr uint32_t kEntityBatchVersion = 3;
 
 // ---- THE DEAD ON THE WIRE (PLAN_corpse_is_a_mob.md P2c) --------------------
 //
@@ -154,12 +158,16 @@ struct EntityBatch {
   std::vector<ItemTake> itemTakes;
   std::vector<ItemGrant> itemGrants;
 
+  // Blows this machine struck on bodies the receiver owns, plus any it is
+  // passing on (a creature that changed hands; game/meleehit.h rule 3).
+  std::vector<MeleeHit> meleeHits;
+
   bool Empty() const {
     return mobHandoffs.empty() && mobAnnounces.empty() &&
            mobStates.empty() && mobPoses.empty() &&
            mobGones.empty() && bodyHandoffs.empty() && bodyAnnounces.empty() &&
            bodyPoses.empty() && bodyGones.empty() && itemTakes.empty() &&
-           itemGrants.empty();
+           itemGrants.empty() && meleeHits.empty();
   }
   void Clear();
   size_t RecordCount() const {
@@ -167,7 +175,7 @@ struct EntityBatch {
            mobPoses.size() +
            mobGones.size() + bodyHandoffs.size() + bodyAnnounces.size() +
            bodyPoses.size() + bodyGones.size() + itemTakes.size() +
-           itemGrants.size();
+           itemGrants.size() + meleeHits.size();
   }
 
   void Encode(std::vector<uint8_t>& out) const;
@@ -271,6 +279,7 @@ class EntitySync {
     uint64_t announcesOut = 0, posesOut = 0, handoffsOut = 0, gonesOut = 0;
     uint64_t announcesIn = 0, posesIn = 0, handoffsIn = 0, gonesIn = 0;
     uint64_t takesOut = 0, takesIn = 0, grantsOut = 0, grantsIn = 0;
+    uint64_t meleeOut = 0, meleeIn = 0;   // game/meleehit.h records
     uint64_t batchesOut = 0, batchesIn = 0, bytesOut = 0;
     uint64_t applyMisses = 0;   // poses for an id we do not hold
     // ...and the two refusals that are NOT defects, split out of it by

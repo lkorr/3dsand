@@ -1,6 +1,7 @@
 #pragma once
 #include "sim/scale.h"  // MetresToCells / MetresToCellsI
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -14,6 +15,7 @@
 #include "game/pose.h"     // PoseInputs / PoseDrive: the one pose pipeline (W2-L)
 #include "game/equipment.h"
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
+#include "game/meleehit.h"  // MeleeHit: one blow, for the creature's owner
 #include "game/mobfence.h"  // MobFence: the demon circle's say over a move or a blow
 #include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
 #include "game/selfclip.h"  // ClipReport: is this pose inside itself
@@ -2194,6 +2196,28 @@ class Mob {
   // is not complete yet here. An unparented mob (no `sys_`) is never a ghost —
   // the fixtures that build a Mob by hand have nobody to be a ghost of.
   bool IsGhost() const;
+  // Promoted from a ghost and still waiting for the handoff record that
+  // carries its state (see `handoffDueTick_`). Out-of-line for IsGhost's
+  // reason.
+  bool AwaitingHandoff() const;
+  // A ghost's owner says its blade is live (MobPose::kBladeLive).
+  bool GhostBladeLive() const { return ghostBladeLive_; }
+
+  // ---- A GHOST'S STRUCTURE IS ITS OWNER'S (2026-10-08) ---------------------
+  //
+  // A blow landed here on a ghost carves it as presentation (game/meleehit.h
+  // rule 4) and changes nothing else: Sever, Die and the carve's fragment
+  // bodies all refuse a ghost. A limb comes off a ghost only when its OWNER
+  // says so -- the pose stream stops listing it (MobSystem::ApplyPose), or a
+  // peer player's PlayerState names it severed -- and it comes off through
+  // here: no gore, no adoption (the owner's severed limb arrives as the
+  // owner's ghost body). No-op on a creature this machine owns.
+  void DropLimbForOwner(int limbIndex);
+  // Base limbs (bit i = rig slot i, i < 32 and < AppendedBase) that have no
+  // body: what the owner of a PLAYER's body reports in PlayerState.
+  uint32_t SeveredBaseMask() const;
+  // The rig slot named `name` (SlotName's inverse), or -1.
+  int SlotIndexNamed(const std::string& name) const;
 
   // ---- WHOSE CAPSULE THIS BODY IS EXEMPT FROM (W2-N) -----------------------
   //
@@ -5205,6 +5229,21 @@ class Mob {
   // creature that is drawn but not stepped -- which is exactly what a ghost is
   // for.
   bool announceOnly_ = false;
+  // ---- PROMOTED, AND ITS RECORD STILL ON THE WIRE (2026-10-08) ------------
+  //
+  // The other half of `announceOnly_`: a ghost this machine HAS held before
+  // is promoted by RefreshOwnership the tick the derived authority flips, and
+  // the losing side's MobHandoff (its wounds, its carve) lands D+1 ticks
+  // later and is overlaid in place. Anything this machine does to the body in
+  // between is erased by that overlay. Set to the tick the wait gives up at
+  // (RefreshOwnership), cleared by ApplyHandoff; read by the melee router so
+  // a peer's blow waits for the record instead of being wiped by it
+  // (game/meleehit.h rule 3). 0 = nothing pending.
+  uint32_t handoffDueTick_ = 0;
+  // A GHOST'S BLADE IS LIVE: its owner's MobPose says the held item is
+  // cutting or held in guard (MobPose::kBladeLive). FindParry reads it in
+  // place of `swinging_` / the stroke phase, which a ghost does not run.
+  bool ghostBladeLive_ = false;
   // ONE tick of a creature somebody else owns: place the limbs where the
   // owner says they are and stop. The fourth branch of PreTick's loop, beside
   // Limp / GetUp / live.
@@ -6136,6 +6175,41 @@ class MobSystem {
   const std::vector<StrikeEvent>& StrikeEvents() const { return strikes_; }
   void ClearStrikeEvents() { strikes_.clear(); }
 
+  // ==== MELEE ACROSS THE WIRE (game/meleehit.h, 2026-10-08) =================
+  //
+  // OUT: MeleeSweepDamage queues a record for every blow it lands on a body
+  // this machine does not own (OwnedHere false) -- after carving the ghost as
+  // presentation -- and net::EntitySync::Build drains them into the entity
+  // batch. IN: EntitySync::ApplyForTick hands what the peer sent to
+  // NoteRemoteMeleeHit, and the tick applies them (melee.h
+  // ApplyRemoteMeleeHits) at one fixed phase. Both queues are empty in a
+  // single-player world, where every body is owned and nothing is sent.
+  //
+  // BOUNDED (rule 2): a stroke lands at most eight bodies a sweep and a
+  // creature sweeps once a tick, so a crowd fills these by tens; the cap is
+  // the belt for a peer that stops draining. An overflow is COUNTED.
+  static constexpr size_t kMaxMeleeHitsQueued = 512;
+  void QueueMeleeHit(MeleeHit h);
+  bool PopMeleeHit(MeleeHit& out);
+  void NoteRemoteMeleeHit(MeleeHit h);
+  std::vector<MeleeHit>& RemoteMeleeHits() { return meleeIn_; }
+  bool HasRemoteMeleeHits() const { return !meleeIn_.empty(); }
+  // A creature by a name both machines agree on (meleehit.h CombatantRef).
+  CombatantRef RefOf(const Mob& m) const;
+  Mob* ResolveCombatant(const CombatantRef& r);
+  struct MeleeWireStats {
+    uint64_t queued = 0;    // records this machine sent (incl. re-routes)
+    uint64_t received = 0;  // records the peer sent
+    uint64_t applied = 0;   // applied to a body this machine owns
+    uint64_t parries = 0;   // ...of which a parry's consequences
+    uint64_t routed = 0;    // sent on: the target changed hands (rule 3)
+    uint64_t waited = 0;    // held a tick for a handoff record (rule 3)
+    uint64_t gone = 0;      // the target or its slot no longer exists
+    uint64_t overflow = 0;  // refused at kMaxMeleeHitsQueued
+  };
+  MeleeWireStats& MeleeWire() { return meleeWire_; }
+  const MeleeWireStats& MeleeWire() const { return meleeWire_; }
+
   // ---- THE OTHER TWO KINDS OF BLOW (game/impact.h) ------------------------
   // The system-level twins of Damage/CutLimb: resolve the handle against the
   // mob list and then against the registered avatar, so an NPC's mace reaches
@@ -6764,7 +6838,7 @@ class MobSystem {
 
   // ==== CATCH-UP: A VILLAGER COMES BACK WHERE ITS DAY SAYS (P7) ============
   //
-  // An UNPARK (MobParking passes `catchUp`) of a LIVING record that carries a
+  // An UNPARK (EntityParking passes `catchUp`) of a LIVING record that carries a
   // ref id asks this function where that villager should be NOW -- `foot`
   // (the centre of the footprint at the sole, world voxels; it arrives
   // holding where the record froze) and heading -- and true moves the record
@@ -6805,7 +6879,7 @@ class MobSystem {
   // outside the residency window -- it ceased to exist. With a park function
   // installed, the same branch first writes the creature's `Mob::SaveOne`
   // record and hands it over, THEN tears the rig down exactly as before. The
-  // function (game/persist.h MobParking) appends it to the region bucket that
+  // function (game/persist.h EntityParking) appends it to the region bucket that
   // contains its origin (ChunkStore::DormantEntities), which is the very
   // record a save would have written for it -- so a parked creature and a
   // saved one are indistinguishable, and the next save writes it to disk with
@@ -8561,6 +8635,10 @@ class MobSystem {
   std::function<void(uint64_t, const ItemInstance&)> onItemShed_;
   std::vector<BlockEvent> blocks_;
   std::vector<StrikeEvent> strikes_;
+  // Melee across the wire (QueueMeleeHit / NoteRemoteMeleeHit).
+  std::deque<MeleeHit> meleeOut_;
+  std::vector<MeleeHit> meleeIn_;
+  MeleeWireStats meleeWire_;
   // The players' bodies, registered by the frame layer so the handle-keyed
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
   std::vector<Mob*> avatars_;

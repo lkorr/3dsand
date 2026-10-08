@@ -34,6 +34,7 @@ void EntityBatch::Clear() {
   bodyGones.clear();
   itemTakes.clear();
   itemGrants.clear();
+  meleeHits.clear();
   tick = 0;
   playerId = 0;
 }
@@ -71,6 +72,9 @@ void EntityBatch::Encode(std::vector<uint8_t>& out) const {
   for (const ItemTake& r : itemTakes) ::net::Encode(out, r);
   w.U32((uint32_t)itemGrants.size());
   for (const ItemGrant& r : itemGrants) ::net::Encode(out, r);
+
+  w.U32((uint32_t)meleeHits.size());
+  for (const MeleeHit& r : meleeHits) EncodeMeleeHit(w, r);
 }
 
 namespace {
@@ -112,6 +116,10 @@ bool EntityBatch::Decode(const uint8_t* p, size_t n) {
   if (!ReadVec(r, bodyGones, bodyRec)) return false;
   if (!ReadVec(r, itemTakes, bodyRec)) return false;
   if (!ReadVec(r, itemGrants, bodyRec)) return false;
+  auto hitRec = [](::ByteReader& rr, MeleeHit& rec) {
+    return DecodeMeleeHit(rr, rec);
+  };
+  if (!ReadVec(r, meleeHits, hitRec)) return false;
   return r.ok;
 }
 
@@ -396,6 +404,16 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
         out.itemGrants.push_back(g);
         c_.grantsOut++;
       }
+    }
+  }
+
+  // ---- blows on the peer's bodies (game/meleehit.h), interest-independent:
+  // a record names its target, and the peer applies it only if it owns it.
+  {
+    MeleeHit h;
+    while (mobs.PopMeleeHit(h)) {
+      out.meleeHits.push_back(std::move(h));
+      c_.meleeOut++;
     }
   }
 
@@ -698,6 +716,15 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
       if (g.toPlayer != me_) continue;   // not addressed to this machine
       debris.ApplyItemGrant(g);
       c_.grantsIn++;
+    }
+
+    // ---- blows on my bodies (game/meleehit.h) --------------------------
+    // Handed to MobSystem, NOT applied here: a blow carves, bleeds and
+    // emits gore, which needs the tick's World and op batch. The tick
+    // applies them at one fixed phase (session.cpp, ApplyRemoteMeleeHits).
+    for (MeleeHit& h : b.meleeHits) {
+      mobs.NoteRemoteMeleeHit(std::move(h));
+      c_.meleeIn++;
     }
 
     it = inbox_.erase(it);

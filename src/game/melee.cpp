@@ -951,6 +951,191 @@ void StrikeReact(uint64_t body, const Vec3& dirWorld, const Vec3& atWorld,
 // (a shell-index march) and the dead (a collider cast); it was declared twice.
 constexpr float kCoverReach = 6.0f;
 
+// ---- ONE BLOW ON A CREATURE, RESOLVED (2026-10-08) --------------------------
+//
+// The creature half of a strike, lifted out of MeleeSweepDamage unchanged so
+// that THREE callers run the same lines: the sweep on a body this machine
+// owns, the sweep on a GHOST (presentation: its gore goes to a sink the
+// caller throws away), and the OWNER applying a blow a peer struck
+// (ApplyRemoteMeleeHits, game/meleehit.h). Everything in world space; the
+// probe walk's bookkeeping (dedup keys, the stroke's latches, the repeat
+// count) stays with the sweep, which decided it.
+struct CreatureBlow {
+  uint64_t hb = 0;          // the slot that takes the blow (after a retarget)
+  uint64_t reactBody = 0;   // the flesh that flinches (the probe's own hit)
+  uint64_t clothBody = 0;   // cloth the edge passes on its way (0 = none)
+  Vec3 at{}, clothAt{}, sweepDir{};
+  const StrikeProfile* strike = nullptr;
+  StrikeParts parts;        // world space; blunt/bite hp already x repeat
+  float power = 0.0f, tipSpeed = 0.0f, repeat = 1.0f;
+  bool firstContact = true;
+  bool biteAllowed = true;  // the stroke's one bite is still unspent, and
+                            // this limb is not being held out for another
+  MobSystem::CoatContact coat;  // edge half filled; kind/landed set here
+};
+
+// Returns whether a bite LANDED (the stroke's one-bite latch).
+bool ResolveOnCreature(const CreatureBlow& b, Physics& phys, MobSystem& mobs,
+                       DebrisSystem& debris, World& world,
+                       std::vector<ParticleSpawn>& spawns) {
+  const StrikeProfile& strike = *b.strike;
+  const StrikeParts& parts = b.parts;
+  const uint64_t hb = b.hb;
+  // ---- 0. THE BODY ANSWERS (see the long note in MeleeSweepDamage) ---------
+  // BEFORE the three resolvers, because any of them can take the struck limb
+  // off and a reaction resolved after that would be handed a slot that no
+  // longer belongs to the creature it was measured on. The FLESH handle.
+  StrikeReact(b.reactBody, b.sweepDir, b.at, strike.Total(), b.power, phys,
+              mobs, debris);
+
+  // ---- 1. THE CUT PART — a creature's whole wound model ---------------
+  //
+  // A weapon with no edge at all (a fist; a mace, very nearly) skips the
+  // kerf outright rather than building a zero-depth slot and asking the
+  // wound model to notice that it is nothing.
+  // What the coat exchange is told the blow was (the first part that
+  // actually resolved: a cut's wound wall beats a token blunt's bruise).
+  std::vector<IVec3> coatCells;
+  MobSystem::CoatHitKind coatKind = MobSystem::CoatHitKind::Blunt;
+  bool coatRan = false, biteLanded = false;
+  if (strike.cut > 0.0f) {
+    const float dmg = strike.cut * b.power * b.repeat;
+    // Everything severed by these two calls is a BLADE cut, and gets the
+    // wet dismember sound on top of the creature's own cry. Both can sever
+    // several frames deep — Damage() at zero hp or over the impact
+    // threshold, CutLimb() when the lattice is cut through — and the cause
+    // travels down with them as an argument (DamageCause::Blade, `power`
+    // as the audio's severity; phys/damagecause.h).
+    //
+    // IT ENDS WITH THE KERF. The blunt and bite parts below carry their
+    // own causes: a mace caving a skull in is not a dismemberment and must
+    // not arm the wet cue.
+    const DamageCtx blade(DamageCause::Blade, b.power);
+    // THE CLOTH FIRST, the way the edge met it: a kerf through the garment
+    // at the point the probe crossed it, the flesh's own kerf below. No hp
+    // on the cloth -- a slashed hood is a slashed hood, not a broken one.
+    if (b.clothBody != 0ull && (!parts.cut.stab || b.firstContact)) {
+      KerfCut clothCut = parts.cut;
+      clothCut.at = b.clothAt;
+      clothCut.cleave = 0.0f;   // cloth is never "parted" off its wearer
+      mobs.CutLimb(b.clothBody, clothCut, world, spawns, b.power, nullptr);
+    }
+    // A KERF, NOT A BITE, and it is the only thing that decides
+    // dismemberment: the slot follows the blade's own edge and the
+    // direction the swing is going, and a limb comes off when the lattice
+    // has been cut through (game/mob.h BladeCut). The slot itself is
+    // `parts.cut`, which a corpse is cut by too.
+    if (mobs.Damage(hb, dmg, b.at, b.tipSpeed, blade) &&
+        (!parts.cut.stab || b.firstContact)) {
+      mobs.CutLimb(hb, parts.cut, world, spawns, b.power, &coatCells);
+      coatKind = MobSystem::CoatHitKind::Cut;
+      coatRan = true;
+    }
+  }
+
+  // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever --------
+  //
+  // The struck kind is deliberately NOT handed down: Mob::BluntHit asks
+  // IsWornSlot for itself, because it also has to find the limb UNDERNEATH
+  // a shell to transmit through, and only the creature knows that.
+  if (strike.blunt > 0.0f && b.firstContact) {
+    mobs.BluntHit(hb, parts.blunt, world, spawns);
+    if (!coatRan) {
+      coatKind = MobSystem::CoatHitKind::Blunt;
+      coatRan = true;
+    }
+  }
+
+  // ---- 3. THE BITE PART — a tear, and an infection armour refuses -----
+  //
+  // Once per slot per stroke, like the blunt part above and for the same
+  // reason: teeth close once. `Mob::BiteHit` asks `IsWornSlot` for itself,
+  // exactly as BluntHit does — whether teeth REACH flesh depends on what
+  // the garment in the way is made of, and only the creature knows.
+  //
+  // Latched on a LANDED bite, not on an attempted one (the caller's latch,
+  // from the return value): `BiteHit` returns false when the handle no
+  // longer resolves to a limb (it was severed by the cut part a few lines
+  // up, say), and spending the stroke's one bite on that would make a
+  // zombie miss for reasons nobody can see.
+  if (strike.bite > 0.0f && b.biteAllowed) {
+    biteLanded = mobs.BiteHit(hb, parts.bite, world, spawns);
+    if (biteLanded && coatKind != MobSystem::CoatHitKind::Cut) {
+      coatKind = MobSystem::CoatHitKind::Bite;
+      coatRan = true;
+    }
+  }
+
+  // ---- 4. THE COAT MOVES (DESIGN.md §7 "A coat moves on contact") -----
+  //
+  // AFTER all three parts, so the cut's wound wall exists and the bruise
+  // has split (or not) the skin the coat lands on. Every population that
+  // reaches this line is a creature struck by a creature: what the
+  // striker's voxels at the contact wear goes into the wound, what the
+  // wound wears and leaks comes back onto them. The material decides what
+  // happens next; nothing here knows which one it is.
+  if (coatRan && b.coat.strikerId != 0) {
+    MobSystem::CoatContact coat = b.coat;
+    coat.kind = coatKind;
+    coat.landed = coatKind != MobSystem::CoatHitKind::Bite || biteLanded;
+    coat.woundCells = &coatCells;
+    burnprof::Scope bpCoat(burnprof::kCoat);
+    mobs.CoatOnContact(coat);
+  }
+  return biteLanded;
+}
+
+// ---- THE SAME BLOW, FOR THE CREATURE'S OWNER (game/meleehit.h) -------------
+//
+// Taken BEFORE the resolve: a carve rebuilds the struck limb under a new
+// handle, and the names and the frame have to describe the body the blow
+// met. Every vector into the frame of `hb`'s body, so the owner can put the
+// blow on its real limb wherever that is now (rule: geometry in the struck
+// slot's frame).
+MeleeHit MakeWireHit(const Mob& wielder, Mob& target, uint64_t hb,
+                     uint64_t reactBody, uint64_t clothBody, MeleeHitKind kind,
+                     const Vec3& at, const Vec3& clothAt, const Vec3& sweepDir,
+                     const Vec3& seg, const Vec3& flat, const EdgeSweep& s,
+                     float radius, float power, float tipSpeed, float repeat,
+                     uint32_t hitSeed, float cuePower, float edgeU,
+                     uint32_t flags, Physics& phys, MobSystem& mobs) {
+  MeleeHit h;
+  h.c.target = mobs.RefOf(target);
+  h.c.attacker = mobs.RefOf(wielder);
+  h.c.kind = (uint32_t)kind;
+  BodyTransform xf{};
+  phys.GetTransform(hb, xf);
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  auto P = [&](const Vec3& p) { return QuatRotateInv(q, p - xf.pos); };
+  auto D = [&](const Vec3& v) { return QuatRotateInv(q, v); };
+  h.c.at = P(at);
+  h.c.clothAt = clothBody ? P(clothAt) : Vec3{};
+  h.c.sweepDir = D(sweepDir);
+  h.c.seg = D(seg);
+  h.c.flat = D(flat);
+  h.c.strike = s.strike;
+  h.c.radius = radius;
+  h.c.power = power;
+  h.c.tipSpeed = tipSpeed;
+  h.c.heft = s.heft;
+  h.c.repeat = repeat;
+  h.c.cuePower = cuePower;
+  h.c.cueGainDb = s.cueGainDb;
+  h.c.edgeU = edgeU;
+  h.c.hitSeed = hitSeed;
+  h.c.flags = flags;
+  if (s.selfMounted) h.c.flags |= MeleeHitCore::kSelfMounted;
+  if (s.haft) h.c.flags |= MeleeHitCore::kHaft;
+  int sl = -1;
+  if (mobs.FindOwner(hb, &sl) == &target) h.slot = target.SlotName(sl);
+  if (reactBody != 0 && reactBody != hb &&
+      mobs.FindOwner(reactBody, &sl) == &target)
+    h.reactSlot = target.SlotName(sl);
+  if (clothBody != 0 && mobs.FindOwner(clothBody, &sl) == &target)
+    h.clothSlot = target.SlotName(sl);
+  return h;
+}
+
 }  // namespace
 
 // =============================================================================
@@ -1043,6 +1228,20 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       out.block.blockerBody = blockBody;
       out.block.at = blockAt;
       out.block.power = power;
+      // A BLOCKER THIS MACHINE DOES NOT OWN (game/meleehit.h rule 2): the
+      // parry is judged HERE -- the stroke below is arrested on this tick --
+      // and what it does to the defender (its weapon's wear, the flinch, the
+      // guard beaten open) is the owner's to apply. The three calls below
+      // still run on the ghost: the clang is this player's too, and the rest
+      // is presentation on a body nobody steps here.
+      if (!MobSystem::OwnedHere(*blocker)) {
+        const Vec3 travel = sweepDir;
+        mobs.QueueMeleeHit(MakeWireHit(
+            wielder, *blocker, blockBody, 0, 0, MeleeHitKind::Parry, blockAt,
+            Vec3{}, travel, s.bNow - s.aNow, s.flatNow, s, radius, power,
+            out.tipSpeed, 1.0f, s.tick * 2654435761u, out.power * out.edgeAlign,
+            0.0f, 0u, phys, mobs));
+      }
       // THE BLOCKING BLADE PAYS. Ordinary limb damage on the item's own slot:
       // items carry hp and severImpactSpeed (item.h), so a weapon wears down
       // under repeated parries and one that catches something far too fast is
@@ -1126,6 +1325,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // creature swinging it passes straight out (see the note in the loop).
   std::vector<uint64_t> selfBodies;
   wielder.AppendLiveLimbBodies(selfBodies);
+  // The gore of a blow on a body another machine owns: resolved for
+  // presentation, never submitted (the creature branch below says why).
+  std::vector<ParticleSpawn> ghostGore;
   for (int step = 1; step <= steps && (int)hitBodies.size() < 8; step++) {
     const float u = (float)step / (float)steps;
     const Vec3 a = s.aPrev + (s.aNow - s.aPrev) * u;
@@ -1476,8 +1678,13 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // and a follower shell (MobLimb::wornHost, DebrisSystem::StrapBody) has
       // neither a spring nor a motion of its own — StrikeReact hops to the
       // host for the loose case and Mob::HitReact redirects for the worn one.
-      StrikeReact(struckBody, sweepDir, at, s.strike.Total(), power, phys, mobs,
-                  debris);
+      //
+      // ...CALLED BY EACH POPULATION'S RESOLVER, FIRST (2026-10-08): the
+      // creature half moved into ResolveOnCreature so the OWNER of a body
+      // struck on another machine runs the same lines (game/meleehit.h). It
+      // is still the first thing either branch below does to a body; nothing
+      // between here and there (the parts, the latches, the repeat count)
+      // reads or moves one.
 
       // ---- THE BLOW, BUILT ONCE (2026-09-20) ------------------------------
       //
@@ -1542,6 +1749,10 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // not, so the wound still deepens along the blade's path. Loose matter
       // has no hp and is not counted.
       float repeat = 1.0f;
+      // The first strike of this stroke on this creature: what the OWNER of a
+      // ghost hears it by (ApplyRemoteMeleeHits pushes the StrikeEvent there).
+      // A sweep with no stroke identity has no "first", and every contact is.
+      bool firstOnVictim = s.victimHits == nullptr;
       if (kind != StruckKind::Debris && s.victimHits != nullptr) {
         const uint64_t vid = owner->Id();
         int n = 0;
@@ -1550,6 +1761,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         if (n == 0) {
           s.victimHits->push_back({vid, 1});
           n = 1;
+          firstOnVictim = true;
           if (s.reportStrikes) {
             StrikeEvent ev;
             ev.attackerId = wielder.Id();
@@ -1577,6 +1789,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // a cry). The reaction has already happened ABOVE this branch, for every
       // population at once, which is the whole point of it being there.
       if (kind == StruckKind::Debris) {
+        // 0. The body answers (see the note above the parts).
+        StrikeReact(struckBody, sweepDir, at, s.strike.Total(), power, phys,
+                    mobs, debris);
         // ---- A CORPSE'S ARMOUR IS IN THE WAY TOO (2026-09-20) ------------
         //
         // The march-back retarget above runs only for LIVING flesh, because it
@@ -1641,115 +1856,225 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         continue;
       }
 
-      // ---- 1. THE CUT PART — a creature's whole wound model ---------------
+      // ---- THE CREATURE: one resolver, three callers (2026-10-08) ----------
       //
-      // A weapon with no edge at all (a fist; a mace, very nearly) skips the
-      // kerf outright rather than building a zero-depth slot and asking the
-      // wound model to notice that it is nothing.
-      // What the coat exchange is told the blow was (the first part that
-      // actually resolved: a cut's wound wall beats a token blunt's bruise).
-      std::vector<IVec3> coatCells;
-      MobSystem::CoatHitKind coatKind = MobSystem::CoatHitKind::Blunt;
-      bool coatRan = false, biteLanded = false;
-      if (s.strike.cut > 0.0f) {
-        const float dmg = s.strike.cut * power * repeat;
-        // Everything severed by these two calls is a BLADE cut, and gets the
-        // wet dismember sound on top of the creature's own cry. Both can sever
-        // several frames deep — Damage() at zero hp or over the impact
-        // threshold, CutLimb() when the lattice is cut through — and the cause
-        // travels down with them as an argument (DamageCause::Blade, `power`
-        // as the audio's severity; phys/damagecause.h).
-        //
-        // IT ENDS WITH THE KERF. The blunt and bite parts below carry their
-        // own causes: a mace caving a skull in is not a dismemberment and must
-        // not arm the wet cue.
-        const DamageCtx blade(DamageCause::Blade, power);
-        // THE CLOTH FIRST, the way the edge met it: a kerf through the garment
-        // at the point the probe crossed it, the flesh's own kerf below. No hp
-        // on the cloth -- a slashed hood is a slashed hood, not a broken one.
-        if (clothBody != 0ull && (!parts.cut.stab || firstContact)) {
-          KerfCut clothCut = parts.cut;
-          clothCut.at = clothAt;
-          clothCut.cleave = 0.0f;   // cloth is never "parted" off its wearer
-          mobs.CutLimb(clothBody, clothCut, world, spawns, power, nullptr);
-        }
-        // A KERF, NOT A BITE, and it is the only thing that decides
-        // dismemberment: the slot follows the blade's own edge and the
-        // direction the swing is going, and a limb comes off when the lattice
-        // has been cut through (game/mob.h BladeCut). The slot itself is
-        // `parts.cut`, which a corpse is cut by too.
-        if (mobs.Damage(hb, dmg, at, out.tipSpeed, blade) &&
-            (!parts.cut.stab || firstContact)) {
-          mobs.CutLimb(hb, parts.cut, world, spawns, power, &coatCells);
-          coatKind = MobSystem::CoatHitKind::Cut;
-          coatRan = true;
-        }
-      }
-
-      // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever --------
+      // The cut, the blunt part, the bite and the coat exchange are
+      // ResolveOnCreature's (above), so the OWNER of a body struck on another
+      // machine runs exactly these lines (game/meleehit.h).
       //
-      // The struck kind is deliberately NOT handed down: Mob::BluntHit asks
-      // IsWornSlot for itself, because it also has to find the limb UNDERNEATH
-      // a shell to transmit through, and only the creature knows that.
-      if (s.strike.blunt > 0.0f && firstContact) {
-        mobs.BluntHit(hb, parts.blunt, world, spawns);
-        if (!coatRan) {
-          coatKind = MobSystem::CoatHitKind::Blunt;
-          coatRan = true;
-        }
-      }
-
-      // ---- 3. THE BITE PART — a tear, and an infection armour refuses -----
-      //
-      // Once per slot per stroke, like the blunt part above and for the same
-      // reason: teeth close once. `Mob::BiteHit` asks `IsWornSlot` for itself,
-      // exactly as BluntHit does — whether teeth REACH flesh depends on what
-      // the garment in the way is made of, and only the creature knows.
-      //
-      // Latched on a LANDED bite, not on an attempted one: `BiteHit` returns
-      // false when the handle no longer resolves to a limb (it was severed by
-      // the cut part a few lines up, say), and spending the stroke's one bite
-      // on that would make a zombie miss for reasons nobody can see.
-      //
-      // ...AND A LIMB THE JAWS BRUSHED WHILE HOLDING OUT IS STILL BITEABLE
-      // (2026-10-01). `firstContact` is the IMPULSE latch (one bruise per limb
-      // per stroke), and the bite borrowed it -- so a limb touched on an
-      // earlier tick, when the bite was withheld for the drawn one, could
-      // never be bitten on the last tick when the holdout lifts: the snake's
-      // jaws brushed the near shin on their way to the far foot, missed the
-      // foot, and the stroke ended with a bruise and no bite. With the
-      // stroke's own one-bite latch (`s.bitten`) there to stop a second bite,
-      // the impulse latch is not needed for it; without that latch it still
-      // applies.
+      // A BODY THIS MACHINE DOES NOT OWN (a peer's player, an NPC or corpse a
+      // peer steps) is resolved here as PRESENTATION -- the attacker sees the
+      // wound at once, and its blade gets the wound's fluid -- with its gore
+      // sent to a sink nobody submits (rule 4: the owner's carve is the real
+      // one, and the owner's gore enters the shared batch from there). The
+      // blow itself is queued for the owner, described in the struck slot's
+      // own frame BEFORE the resolve rebuilds that limb under a new handle.
+      CreatureBlow blow;
+      blow.hb = hb;
+      blow.reactBody = struckBody;
+      blow.clothBody = clothBody;
+      blow.at = at;
+      blow.clothAt = clothAt;
+      blow.sweepDir = sweepDir;
+      blow.strike = &s.strike;
+      blow.parts = parts;
+      blow.power = power;
+      blow.tipSpeed = out.tipSpeed;
+      blow.repeat = repeat;
+      blow.firstContact = firstContact;
+      // ...and at most ONE bite for the whole stroke. `firstContact` is the
+      // IMPULSE latch (one bruise per limb per stroke), and the bite used to
+      // borrow it -- so a limb touched on an earlier tick, when the bite was
+      // withheld for the drawn one, could never be bitten on the last tick when
+      // the holdout lifts (2026-10-01). With the stroke's own one-bite latch
+      // (`s.bitten`) there to stop a second bite, the impulse latch is not
+      // needed for it; without that latch it still applies.
       const bool biteFresh = s.bitten != nullptr ? !*s.bitten : firstContact;
-      if (s.strike.bite > 0.0f && biteFresh && !wrongTarget) {
-        biteLanded = mobs.BiteHit(hb, parts.bite, world, spawns);
-        if (biteLanded && s.bitten != nullptr) *s.bitten = true;
-        if (biteLanded && coatKind != MobSystem::CoatHitKind::Cut) {
-          coatKind = MobSystem::CoatHitKind::Bite;
-          coatRan = true;
-        }
+      blow.biteAllowed = biteFresh && !wrongTarget;
+      blow.coat = coat;
+      const bool ownedHere = MobSystem::OwnedHere(*owner);
+      MeleeHit wire;
+      if (!ownedHere) {
+        uint32_t flags = 0;
+        if (firstContact) flags |= MeleeHitCore::kFirstContact;
+        if (blow.biteAllowed) flags |= MeleeHitCore::kBiteAllowed;
+        if (firstOnVictim) flags |= MeleeHitCore::kFirstOnVictim;
+        wire = MakeWireHit(wielder, *owner, hb, struckBody, clothBody,
+                           kind == StruckKind::Shell ? MeleeHitKind::Shell
+                                                     : MeleeHitKind::Flesh,
+                           at, clothAt, sweepDir, seg, s.flatNow, s, radius,
+                           power, out.tipSpeed, repeat, hitSeed,
+                           out.power * out.edgeAlign, coat.edgeU, flags, phys,
+                           mobs);
+        ghostGore.clear();
       }
-
-      // ---- 4. THE COAT MOVES (DESIGN.md §7 "A coat moves on contact") -----
-      //
-      // AFTER all three parts, so the cut's wound wall exists and the bruise
-      // has split (or not) the skin the coat lands on. Every population that
-      // reaches this line is a creature struck by a creature: what the
-      // striker's voxels at the contact wear goes into the wound, what the
-      // wound wears and leaks comes back onto them. The material decides what
-      // happens next; nothing here knows which one it is.
-      if (coatRan && coat.strikerId != 0) {
-        coat.kind = coatKind;
-        coat.landed = coatKind != MobSystem::CoatHitKind::Bite || biteLanded;
-        coat.woundCells = &coatCells;
-        burnprof::Scope bpCoat(burnprof::kCoat);
-        mobs.CoatOnContact(coat);
+      const bool biteLanded =
+          ResolveOnCreature(blow, phys, mobs, debris, world,
+                            ownedHere ? spawns : ghostGore);
+      if (biteLanded && s.bitten != nullptr) *s.bitten = true;
+      if (!ownedHere) {
+        ghostGore.clear();
+        mobs.QueueMeleeHit(std::move(wire));
       }
     }
   }
   out.bodiesHit = (int)hitBodies.size();
   return out;
+}
+
+// =============================================================================
+// MELEE ACROSS THE WIRE: THE OWNER'S HALF (game/meleehit.h)
+// =============================================================================
+
+namespace {
+
+enum class RemoteHitOutcome : uint8_t { Applied, Route, Wait, Gone };
+
+RemoteHitOutcome ApplyOneRemoteHit(const MeleeHit& h, Physics& phys,
+                                   MobSystem& mobs, DebrisSystem& debris,
+                                   World& world,
+                                   std::vector<ParticleSpawn>& spawns) {
+  Mob* t = mobs.ResolveCombatant(h.c.target);
+  if (t == nullptr) return RemoteHitOutcome::Gone;
+  // NOT MINE (rule 3): the creature changed hands between the blow and its
+  // arrival. Its owner now is the other machine.
+  if (!MobSystem::OwnedHere(*t)) return RemoteHitOutcome::Route;
+  // MINE, BUT ITS STATE IS STILL ON THE WIRE: the handoff record's overlay
+  // would erase anything applied now (Mob::AwaitingHandoff).
+  if (t->AwaitingHandoff()) return RemoteHitOutcome::Wait;
+  const int sl = t->SlotIndexNamed(h.slot);
+  const uint64_t hb = sl >= 0 ? mobs.LimbBody(t->Id(), sl) : 0ull;
+  if (hb == 0) return RemoteHitOutcome::Gone;   // that limb is already off
+  // THE STRUCK SLOT'S FRAME, NOW: the blow lands on the limb it was struck
+  // into, wherever the owner's body has that limb this tick.
+  BodyTransform xf{};
+  phys.GetTransform(hb, xf);
+  const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+  auto P = [&](const Vec3& p) { return xf.pos + QuatRotate(q, p); };
+  auto D = [&](const Vec3& v) { return QuatRotate(q, v); };
+  const Vec3 at = P(h.c.at);
+  const Vec3 sweepDir = D(h.c.sweepDir);
+  const Mob* attacker = mobs.ResolveCombatant(h.c.attacker);
+  const uint64_t attackerId = attacker != nullptr ? attacker->Id() : 0ull;
+  const float total = h.c.strike.Total();
+
+  if ((MeleeHitKind)h.c.kind == MeleeHitKind::Parry) {
+    // The three consequences MeleeSweepDamage's parry branch has on a blocker
+    // it owns, with the same numbers (the tuning is the handshake's).
+    MeleeTuning mt;
+    ApplyMeleeTuning(mt, CurrentTuning());
+    mobs.Damage(hb, total * h.c.power * mt.blockItemDamage, at, h.c.tipSpeed);
+    mobs.HitReact(hb, sweepDir, total, h.c.power);
+    BlockEvent ev;
+    ev.attackerId = attackerId;
+    ev.blockerId = t->Id();
+    ev.blockerBody = hb;
+    ev.at = at;
+    ev.power = h.c.power;
+    mobs.PushBlockEvent(ev, mt);
+    mobs.MeleeWire().parries++;
+    return RemoteHitOutcome::Applied;
+  }
+
+  // THE PARTS, REBUILT from what BuildStrikeParts took -- the same function,
+  // tuning and draw key, so this rim is the one the attacker's ghost got.
+  EdgeSweep es;
+  es.strike = h.c.strike;
+  es.flatNow = D(h.c.flat);
+  es.heft = h.c.heft;
+  es.selfMounted = h.c.Has(MeleeHitCore::kSelfMounted);
+  StrikeParts parts = BuildStrikeParts(es, at, D(h.c.seg), sweepDir,
+                                       h.c.radius, h.c.power, h.c.tipSpeed,
+                                       h.c.hitSeed);
+  parts.blunt.hp *= h.c.repeat;
+  parts.bite.hp *= h.c.repeat;
+
+  CreatureBlow blow;
+  blow.hb = hb;
+  const int rsl = h.reactSlot.empty() ? -1 : t->SlotIndexNamed(h.reactSlot);
+  blow.reactBody = rsl >= 0 ? mobs.LimbBody(t->Id(), rsl) : hb;
+  if (blow.reactBody == 0) blow.reactBody = hb;
+  const int csl = h.clothSlot.empty() ? -1 : t->SlotIndexNamed(h.clothSlot);
+  blow.clothBody = csl >= 0 ? mobs.LimbBody(t->Id(), csl) : 0ull;
+  blow.at = at;
+  blow.clothAt = P(h.c.clothAt);
+  blow.sweepDir = sweepDir;
+  blow.strike = &h.c.strike;
+  blow.parts = parts;
+  blow.power = h.c.power;
+  blow.tipSpeed = h.c.tipSpeed;
+  blow.repeat = h.c.repeat;
+  blow.firstContact = h.c.Has(MeleeHitCore::kFirstContact);
+  blow.biteAllowed = h.c.Has(MeleeHitCore::kBiteAllowed);
+  // The coat: the striker as THIS machine holds it (its ghost, whose coat is
+  // the one it was announced with -- the documented ghost-coat gap), the
+  // target its real wound.
+  blow.coat.strikerId = attackerId;
+  blow.coat.haft = h.c.Has(MeleeHitCore::kHaft);
+  blow.coat.edgeU = h.c.edgeU;
+  blow.coat.radius = h.c.radius;
+  blow.coat.at = at;
+  blow.coat.power = h.c.power;
+  blow.coat.unarmed = es.selfMounted;
+  blow.coat.targetId = t->Id();
+  blow.coat.targetSlot = sl;
+  blow.coat.targetSlotName = h.slot;
+  ResolveOnCreature(blow, phys, mobs, debris, world, spawns);
+  // ...AND THE DEFENDER HEARS IT: the attacker's machine played its own cue;
+  // this one is for the player whose body it was (main.cpp drains these).
+  if (h.c.Has(MeleeHitCore::kFirstOnVictim)) {
+    StrikeEvent ev;
+    ev.attackerId = attackerId;
+    ev.victimId = t->Id();
+    ev.at = at;
+    ev.power = h.c.cuePower;
+    ev.gainDb = h.c.cueGainDb;
+    ev.flesh = (MeleeHitKind)h.c.kind == MeleeHitKind::Flesh;
+    ev.edged = h.c.strike.cut > h.c.strike.blunt;
+    mobs.PushStrikeEvent(ev);
+  }
+  return RemoteHitOutcome::Applied;
+}
+
+}  // namespace
+
+void ApplyRemoteMeleeHits(Physics& phys, MobSystem& mobs, DebrisSystem& debris,
+                          World& world, std::vector<ParticleSpawn>& spawns,
+                          uint32_t tick) {
+  std::vector<MeleeHit>& in = mobs.RemoteMeleeHits();
+  if (in.empty()) return;
+  MobSystem::MeleeWireStats& st = mobs.MeleeWire();
+  // Taken out first: a re-route queues onto the OUTGOING list, and a waiting
+  // record goes back in for the next tick, so nothing appends to the list
+  // being walked.
+  std::vector<MeleeHit> todo;
+  todo.swap(in);
+  for (MeleeHit& h : todo) {
+    switch (ApplyOneRemoteHit(h, phys, mobs, debris, world, spawns)) {
+      case RemoteHitOutcome::Applied:
+        st.applied++;
+        break;
+      case RemoteHitOutcome::Route:
+        // Two machines and a derived owner: one hop is the handoff case, a
+        // second means the two disagree and the blow is dropped (counted).
+        if (h.c.hops < kMaxMeleeHops) {
+          h.c.hops++;
+          st.routed++;
+          mobs.QueueMeleeHit(std::move(h));
+        } else {
+          st.gone++;
+        }
+        break;
+      case RemoteHitOutcome::Wait:
+        if (h.c.waitTick == 0) h.c.waitTick = tick == 0 ? 1u : tick;
+        st.waited++;
+        in.push_back(std::move(h));
+        break;
+      case RemoteHitOutcome::Gone:
+        st.gone++;
+        break;
+    }
+  }
 }
 
 // =============================================================================

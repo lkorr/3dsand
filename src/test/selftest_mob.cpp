@@ -12187,7 +12187,7 @@ Status GateMobSaveDelta(Ctx& c, std::string& detail) {
 
 // ---- mob-park --------------------------------------------------------------
 //
-// NPCs OUTLIVE THE WINDOW (docs/PLAN_save_system.md S5b, persist.h MobParking).
+// NPCs OUTLIVE THE WINDOW (docs/PLAN_save_system.md S5b, persist.h EntityParking).
 //
 // Three humans near the window centre, one of them carved (so MOBS v4/v5
 // stores a lattice for it), settled on real terrain. Then, all asserted in one
@@ -12198,7 +12198,7 @@ Status GateMobSaveDelta(Ctx& c, std::string& detail) {
 //      EXACTLY the creature's SaveOne from just before -- the record a save
 //      would have written.
 //   B. THE CAP COUNTS ONLY THE LIVE. With three parked, a full crowd
-//      (MobSystem's cap, 16) still spawns.
+//      (kMaxLiveMobs: 64 since 2026-10-04, when this gate still filled 16 and never reached it) still spawns.
 //   C. SAVE AND LOAD WHILE PARKED. The save writes an r_*.sve for every
 //      parked creature's region; a load at the far window applies none of
 //      them (zero live) and the buckets read back from disk hold the same
@@ -12220,7 +12220,7 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   namespace fs = std::filesystem;
   const char* kPath = "selftest_mobpark.svd";
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
-  MobParking parking;
+  EntityParking parking;
   auto restore = [&]() {
     c.debris.Reset();
     c.mobs.Reset();
@@ -12392,12 +12392,12 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   {
     const int ax = (away.x + n / 2) * (int)kChunk, az = (away.z + n / 2) * (int)kChunk;
     const int ah = World::TerrainHeight(ax, az, kDefaultSeed);
-    for (int k = 0; k < 16; k++)
-      if (c.mobs.Spawn(dummyDef, {ax + (k % 4) * 8, ah + 1, az + (k / 4) * 8}) != 0)
+    for (int k = 0; k < (int)kMaxLiveMobs; k++)
+      if (c.mobs.Spawn(dummyDef, {ax + (k % 8) * 8, ah + 1, az + (k / 8) * 8}) != 0)
         capSpawned++;
     c.mobs.Reset();
   }
-  const bool okB = capSpawned == 16;
+  const bool okB = capSpawned == (int)kMaxLiveMobs;
 
   // ======== C: save and load while parked ==================================
   EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr);
@@ -12438,10 +12438,10 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   uint64_t capWaits = 0;
   int foundCap = 0;
   {
-    for (int k = 0; k < 16; k++)
-      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 4) * 8,
+    for (int k = 0; k < (int)kMaxLiveMobs; k++)
+      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 8) * 8,
                               World::TerrainHeight(base.x - 60, base.z - 60, kDefaultSeed) + 1,
-                              base.z - 60 + (k / 4) * 8});
+                              base.z - 60 + (k / 8) * 8});
     capMade = parking.Unpark(c.mobs, c.stream.Store(), c.world, t, budget);
     capWaits = parking.GetStats().capWaits;
     std::string ignore;
@@ -12512,7 +12512,7 @@ Status GateMobPark(Ctx& c, std::string& detail) {
       else if (whyD.empty()) whyD = Format("creature %d: no solid under its feet", match);
     }
   }
-  const MobParking::Stats ds = parking.GetStats();
+  const EntityParking::Stats ds = parking.GetStats();
   const bool okD = capMade == 0 && capWaits > 0 && foundCap == 3 &&
                    seen.size() == parked.size() && same == 3 && onGround == 3 &&
                    ds.maxCall <= budget && ds.unparked == 3 && ds.failed == 0 &&
@@ -12550,10 +12550,10 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   // for byte, before a record landing in its region writes the bucket.
   c.mobs.Reset();
   auto fillCrowd = [&]() {
-    for (int k = 0; k < 16; k++)
-      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 4) * 8,
+    for (int k = 0; k < (int)kMaxLiveMobs; k++)
+      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 8) * 8,
                               World::TerrainHeight(base.x - 60, base.z - 60, kDefaultSeed) + 1,
-                              base.z - 60 + (k / 4) * 8});
+                              base.z - 60 + (k / 8) * 8});
   };
   auto repark = [&]() {
     for (const Parked& p : parked) {
@@ -12579,7 +12579,7 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   std::string ignoreF;
   const int foundF1b = bucketsHold(ignoreF);
   const uint32_t liveF1b = c.mobs.MobCount();
-  const bool okF1 = crowdF == 16 && fr1.recordsRetried == 3 &&
+  const bool okF1 = crowdF == (decltype(crowdF))kMaxLiveMobs && fr1.recordsRetried == 3 &&
                     fr1.recordsApplied == 0 && fr1.recordsDropped == 0 &&
                     foundF1 == 3 && fr2.recordsApplied == 3 &&
                     fr2.recordsRetried == 0 && foundF1b == 0 && liveF1b == 3;
@@ -12725,7 +12725,7 @@ Status GateMobPark(Ctx& c, std::string& detail) {
 // puts the id counter back, clears the store and regenerates the world.
 Status GateCorpseSave(Ctx& c, std::string& detail) {
   const uint64_t idCounterWas = c.mobs.NextIdCounter();
-  MobParking parking;
+  EntityParking parking;
   auto restore = [&]() {
     c.debris.Reset();
     c.mobs.Reset();
@@ -13072,8 +13072,9 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
   pc = {base.x >> 4, World::TerrainHeight(base.x, base.z, kDefaultSeed) >> 4,
         base.z >> 4};
   std::vector<uint64_t> crowd;
-  for (int k = 0; k < 16; k++) {
-    const int x = base.x - 60 + (k % 4) * 8, z = base.z - 60 + (k / 4) * 8;
+  // The living cap (kMaxLiveMobs: 64 since 2026-10-04; this filled 16).
+  for (int k = 0; k < (int)kMaxLiveMobs; k++) {
+    const int x = base.x - 60 + (k % 8) * 8, z = base.z - 60 + (k / 8) * 8;
     const uint64_t d =
         c.mobs.Spawn(dummyDef, {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
     if (d) crowd.push_back(d);
@@ -13090,7 +13091,7 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
         back.push_back(m->Id());
     }
   }
-  const MobParking::Stats ps = parking.GetStats();
+  const EntityParking::Stats ps = parking.GetStats();
   const uint32_t liveP = c.mobs.LiveMobCount();
   // Which is which: by death order (A died first).
   uint64_t idA2 = 0, idB2 = 0;
@@ -14387,6 +14388,337 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
       bodiesOnB, rigBodies.size(), (unsigned long long)farAuthored,
       (unsigned long long)sa.statesOut, (unsigned long long)sb.statesIn,
       (unsigned long long)sa.posesOut, wireBytesMax, stateBytesMax);
+  cleanup();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- net-melee -------------------------------------------------------------
+//
+// MELEE ACROSS THE WIRE (game/meleehit.h, 2026-10-08). net-corpse's two
+// machines in one process, joined by EntityBatch bytes BOTH ways: machine A
+// (the suite's systems, THE REAL TICK) owns a creature; machine B (a second
+// MobSystem + DebrisSystem on its own Physics) holds it as a ghost and owns a
+// creature of its own, the wielder. A blade is swept on B -- a fabricated
+// EdgeSweep through MeleeSweepDamage, the function every swing goes through.
+// Claims:
+//
+//   A. THE OWNER BLEEDS. A cut through the ghost's torso on B carves the
+//      ghost as presentation (B's torso loses voxels, B's sweep submits NO
+//      gore, B owns no new debris) and queues one record; on A, after the
+//      bytes cross, the REAL torso loses voxels and hp, the gore enters A's
+//      batch, and A counts the record applied. The two carves differ by at
+//      most netMeleeCarveTol voxels: one blow, in the slot's own frame.
+//   B. THE ATTACKER JUDGES THE PARRY. A's creature holds its sword in guard
+//      (SetGuard); the pose stream carries the live blade, B's sweep through
+//      the ghost's blade is ARRESTED on B, and on A the guard's item takes the
+//      wear, a BlockEvent is pushed and the parry is counted -- the torso
+//      untouched.
+//   C. THE OWNER'S SEVER REACHES THE GHOST. An arm severed on A comes off B's
+//      ghost (no body) once the pose lands, and B owns no debris for it.
+//   D. A GHOST NEVER SEVERS LOCALLY. MobSystem::Sever on B's ghost leaves the
+//      limb on.
+//   E. A RECORD FOR A CREATURE THE RECEIVER DOES NOT OWN IS SENT ON. A record
+//      naming B's wielder handed to A (where it is a ghost) is routed back
+//      with hops 1 and applied on B, whose wielder loses voxels.
+// Leaves the suite as it found it (net-corpse's exit contract).
+Status GateNetMelee(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  constexpr uint32_t kPeer = 1;
+
+  // ---- machine B (net-corpse's construction) ------------------------------
+  Physics farPhys;
+  farPhys.Init();
+  DebrisSystem farDebris;
+  farDebris.Init(&farPhys, &c.world, c.mats, c.reactions);
+  farDebris.SetMicroSet(c.debris.MicroSet());
+  farDebris.SetLocalPlayerId(kPeer);
+  MobSystem far;
+  far.Init(&farPhys, &c.world, &farDebris, c.mats, c.reactions);
+  far.SetMicroSet(c.mobs.MicroSet());
+  far.SetDefFactory(c.mobs.DefFactory());
+  far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+  far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+  far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+  far.SetItems(&c.items);
+  far.SetLocalPlayerId(kPeer);
+  far.SetIdBand(kPeer);   // the game's rule: B mints ids in its own band
+
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+  ::net::EntitySync entA, entB;
+  entA.Connect(0, kPeer);
+  entB.Connect(kPeer, 0);
+  {
+    ::net::PeerView mine{0, pchunk, c.world.WindowOrigin(), true};
+    ::net::PeerView peer{kPeer, pchunk, c.world.WindowOrigin(), true};
+    entA.SetPeers(mine, &peer);
+    entB.SetPeers(peer, &mine);
+  }
+  auto cleanup = [&]() {
+    far.Reset();
+    farDebris.Reset();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.MeleeWire() = MobSystem::MeleeWireStats{};
+  };
+
+  // ---- one tick of both machines, the wire running both ways --------------
+  uint32_t tick = 9400;
+  uint64_t bAuthored = 0;
+  support::TickCursor stepA{c, tick, pchunk};
+  ::net::EntityBatch toA;   // B's last batch, applied by A at its next tick
+  auto cross = [](::net::EntitySync& from, MobSystem& m, DebrisSystem& d,
+                  uint32_t label) {
+    ::net::EntityBatch out;
+    from.Build(m, d, label, out);
+    std::vector<uint8_t> bytes;
+    out.Encode(bytes);
+    ::net::EntityBatch in;
+    in.Decode(bytes.data(), bytes.size());
+    return in;
+  };
+  auto step = [&]() {
+    // A: what B sent, then THE tick (which applies the blows: session.cpp).
+    entA.NoteRemote(::net::EntityBatch(toA));
+    entA.ApplyForTick(tick + 1, c.mobs, c.debris, nullptr);
+    stepA.chunk = pchunk;
+    stepA();
+    // A -> B.
+    entB.NoteRemote(cross(entA, c.mobs, c.debris, tick));
+    entB.ApplyForTick(tick, far, farDebris, nullptr);
+    std::vector<ParticleSpawn> bSp;
+    std::vector<CellOp> bCells;
+    std::vector<BrushOp> bOps;
+    far.PreTick(tick, c.world, bOps, bCells, bSp);
+    farDebris.PreTick(tick, c.world, bCells, bSp);
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): B has no session; this is the
+    // one call TickAuthority makes for it (session.cpp, after phase J).
+    ApplyRemoteMeleeHits(farPhys, far, farDebris, c.world, bSp, tick);
+    farPhys.Step(kTickDt);
+    farDebris.PostStep();
+    far.PostStep();
+    bAuthored += bOps.size() + bCells.size();
+    // B -> A, for A's next tick.
+    toA = cross(entB, far, farDebris, tick + 1);
+  };
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt, CurrentTuning());
+  // A blade swept on B across `p`: a 3-voxel edge along `along`, travelling
+  // 8 voxels along `travel` in one tick -- well past the full-damage speed.
+  auto sweepOnB = [&](const Mob& wielder, Vec3 p, Vec3 along, Vec3 travel,
+                      std::vector<ParticleSpawn>& spawns) {
+    EdgeSweep sw;
+    const Vec3 a = along.normalized() * 1.5f, t = travel.normalized() * 4.0f;
+    sw.aPrev = p - a - t;
+    sw.bPrev = p + a - t;
+    sw.aNow = p - a + t;
+    sw.bNow = p + a + t;
+    sw.dt = kTickDt;
+    sw.halfWidth = 0.15f;
+    sw.strike.cut = 14.0f;
+    sw.strike.blunt = 2.0f;
+    sw.tick = tick;
+    sw.valid = true;
+    return MeleeSweepDamage(sw, mt, wielder, farPhys, far, farDebris, c.world,
+                            spawns);
+  };
+
+  std::string why;
+  const uint64_t subject =
+      AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "dummy", why);
+  if (subject == 0) {
+    detail = why;
+    cleanup();
+    return Status::Fail;
+  }
+  const uint64_t wielderId =
+      far.Spawn(defIndex, {spot.x + 12, spot.y + 1, spot.z + 12});
+  // B's OWN creature. In the game B's ownership function names it; machine B
+  // here runs none (net-corpse's construction), so it is said once.
+  far.SetMobOwner(wielderId, kPeer);
+  for (int i = 0; i < 10; i++) step();
+  const Mob* ghost = far.FindMobById(subject);
+  const Mob* wielder = far.FindMobById(wielderId);
+  const bool setUp = ghost != nullptr && ghost->IsGhost() && wielder != nullptr &&
+                     !wielder->IsGhost();
+  if (!setUp) {
+    detail = Format("fixture: ghost %d wielder %d", ghost ? 1 : 0,
+                    wielder ? 1 : 0);
+    cleanup();
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  const int torso = def.rootLimb >= 0 ? def.rootLimb : 0;
+  // A creature's whole SKIN, every slot: a sweep crosses an arm and the chest
+  // behind it, and a kerf is often too shallow to move the collider lattice.
+  auto skin = [](const MobSystem& m, uint64_t id) {
+    uint64_t n = 0;
+    for (int li = 0; li < 96; li++) n += m.LimbSkinVoxelCount(id, li);
+    return (int64_t)n;
+  };
+
+  // ======== A: the owner bleeds ===========================================
+  const int64_t aBefore = skin(c.mobs, subject);
+  const float hpBefore = c.mobs.LimbHp(subject, torso);
+  const int64_t bBefore = skin(far, subject);
+  const uint64_t queued0 = far.MeleeWire().queued;
+  const uint32_t bOwned0 = farDebris.BodyCount() - farDebris.GhostCount();
+  std::vector<ParticleSpawn> bSweepGore;
+  const Vec3 hitAt = far.LimbVoxelPos(subject, torso, 977u);
+  const EdgeSweepResult ra =
+      sweepOnB(*wielder, hitAt, Vec3{0, 1, 0}, Vec3{1, 0, 0}, bSweepGore);
+  const int64_t bAfter = skin(far, subject);
+  const uint64_t queuedA = far.MeleeWire().queued - queued0;
+  const uint32_t bOwnedA = farDebris.BodyCount() - farDebris.GhostCount();
+  // The record crosses at B's next Build and is applied in A's tick after.
+  const uint64_t applied0 = c.mobs.MeleeWire().applied;
+  for (int i = 0; i < 3; i++) step();
+  const int64_t aAfter = skin(c.mobs, subject);
+  const float hpAfter = c.mobs.LimbHp(subject, torso);
+  const uint64_t appliedA = c.mobs.MeleeWire().applied - applied0;
+  const int dA = (int)(aBefore - aAfter), dB = (int)(bBefore - bAfter);
+  const double carveTol = BaselineNumber("netMeleeCarveTolFrac", 0.15);
+  const bool okA = ra.bodiesHit > 0 && dB > 0 && bSweepGore.empty() &&
+                   queuedA >= 1 && bOwnedA == bOwned0 && appliedA >= 1 &&
+                   dA > 0 && hpAfter < hpBefore &&
+                   std::abs(dA - dB) <= carveTol * (double)std::max(dA, dB);
+
+  // ======== B: the attacker judges the parry ==============================
+  bool okB = false;
+  int heldSlot = -1;
+  float itemHpBefore = 0, itemHpAfter = 0;
+  int64_t torsoBeforeParry = 0, torsoAfterParry = 0;
+  bool arrested = false, ghostLive = false;
+  uint64_t parries = 0;
+  size_t blocksOnA = 0;
+  {
+    if (const Mob* m = c.mobs.FindMobById(subject)) heldSlot = m->HeldSlot();
+    c.mobs.SetGuard(subject, 0.0f, 0.2f, 0.8f);
+    for (int i = 0; i < 8; i++) step();
+    ghost = far.FindMobById(subject);
+    ghostLive = ghost != nullptr && ghost->GhostBladeLive();
+    Vec3 db{}, dt{}, df{};
+    float dhw = 0;
+    Mob* gm = far.FindMobById(subject);
+    if (heldSlot >= 0 && gm != nullptr && gm->WeaponEdge(db, dt, dhw, &df)) {
+      itemHpBefore = c.mobs.LimbHp(subject, heldSlot);
+      torsoBeforeParry = skin(c.mobs, subject);
+      const Vec3 mid = (db + dt) * 0.5f;
+      Vec3 u = (dt - db).normalized();
+      Vec3 across = u.cross(Vec3{0, 1, 0});
+      if (across.len() < 0.2f) across = u.cross(Vec3{1, 0, 0});
+      std::vector<ParticleSpawn> sp;
+      c.mobs.ClearBlockEvents();
+      const uint64_t parries0 = c.mobs.MeleeWire().parries;
+      const EdgeSweepResult rb =
+          sweepOnB(*far.FindMobById(wielderId), mid, across.cross(u), across, sp);
+      arrested = rb.arrested;
+      for (int i = 0; i < 3; i++) {
+        step();
+        blocksOnA += c.mobs.BlockEvents().size();
+        c.mobs.ClearBlockEvents();
+      }
+      parries = c.mobs.MeleeWire().parries - parries0;
+      itemHpAfter = c.mobs.LimbHp(subject, heldSlot);
+      torsoAfterParry = skin(c.mobs, subject) + (int64_t)0;
+    }
+    c.mobs.ClearGuard(subject);
+    okB = ghostLive && arrested && parries == 1 && blocksOnA >= 1 &&
+          itemHpAfter < itemHpBefore && torsoAfterParry == torsoBeforeParry;
+  }
+
+  // ======== C + D: severs belong to the owner =============================
+  int armLimb = -1, otherLimb = -1;
+  for (int i = 0; i < (int)def.limbs.size(); i++) {
+    if (i == torso || def.limbs[i].vital || !def.limbs[i].severable ||
+        def.limbs[i].parent.empty())
+      continue;
+    if (armLimb < 0) armLimb = i;
+    else if (otherLimb < 0 && def.limbs[i].parent != def.limbs[armLimb].name)
+      otherLimb = i;
+  }
+  bool okC = false, okD = false;
+  uint32_t bOwnedC = 0;
+  if (armLimb >= 0 && otherLimb >= 0) {
+    far.Sever(subject, otherLimb);   // D: refused on a ghost
+    okD = far.LimbBody(subject, otherLimb) != 0;
+    c.mobs.Sever(subject, armLimb);   // C: on the owner
+    for (int i = 0; i < 4; i++) step();
+    bOwnedC = farDebris.BodyCount() - farDebris.GhostCount();
+    okC = c.mobs.LimbBody(subject, armLimb) == 0 &&
+          far.LimbBody(subject, armLimb) == 0 && bOwnedC == bOwned0;
+  }
+
+  // Everything B authored was for bodies it does not own, until E (whose blow
+  // lands on B's OWN creature, which then bleeds).
+  const uint64_t bAuthoredGhosts = bAuthored;
+
+  // ======== E: a record for a body the receiver does not own ==============
+  bool okE = false;
+  int dE = 0;
+  uint64_t routed = 0;
+  {
+    const Mob* wOnA = c.mobs.FindMobById(wielderId);   // A's ghost of B's
+    const Mob* wOnB = far.FindMobById(wielderId);
+    if (wOnA != nullptr && wOnA->IsGhost() && wOnB != nullptr) {
+      // A blow "struck on A" at B's wielder: the record a sweep on A would
+      // queue, handed to A's inbound list as if a third party sent it there.
+      MeleeHit h;
+      h.c.target = c.mobs.RefOf(*wOnA);
+      h.c.attacker = CombatantRef{0, subject};
+      h.c.kind = (uint32_t)MeleeHitKind::Flesh;
+      h.c.sweepDir = Vec3{1, 0, 0};
+      h.c.seg = Vec3{0, 3, 0};
+      h.c.strike.cut = 14.0f;
+      h.c.radius = 0.15f;
+      h.c.power = 1.0f;
+      h.c.tipSpeed = 200.0f;
+      h.c.hitSeed = 4242u;
+      h.c.flags = MeleeHitCore::kFirstContact;
+      h.slot = wOnA->SlotName(torso);
+      const int64_t before = skin(far, wielderId);
+      const uint64_t routed0 = c.mobs.MeleeWire().routed;
+      c.mobs.NoteRemoteMeleeHit(h);
+      for (int i = 0; i < 4; i++) step();
+      routed = c.mobs.MeleeWire().routed - routed0;
+      dE = (int)(before - skin(far, wielderId));
+      okE = routed == 1 && dE > 0;
+    }
+  }
+
+  const bool okNoOps = bAuthoredGhosts == 0;
+  const bool ok = okA && okB && okC && okD && okE && okNoOps;
+  detail = Format(
+      "A owner bleeds=%d (B ghost skin -%d, B sweep gore %zu, queued %llu, B "
+      "owned debris %u->%u | A skin -%d (tol %.2f of the larger), hp %.1f->%.1f, applied "
+      "%llu) | B parry=%d (ghost blade live %d, arrested on B %d, parries %llu, "
+      "blocks on A %zu, item hp %.1f->%.1f, skin %lld->%lld) | C owner sever "
+      "reaches ghost=%d (B owned debris %u) | D ghost refuses sever=%d | E "
+      "routed=%d (routed %llu, B wielder skin -%d) | B authored %llu ops for ghosts",
+      okA ? 1 : 0, dB, bSweepGore.size(), (unsigned long long)queuedA, bOwned0,
+      bOwnedA, dA, carveTol, hpBefore, hpAfter, (unsigned long long)appliedA,
+      okB ? 1 : 0, ghostLive ? 1 : 0, arrested ? 1 : 0,
+      (unsigned long long)parries, blocksOnA, itemHpBefore, itemHpAfter,
+      (long long)torsoBeforeParry, (long long)torsoAfterParry, okC ? 1 : 0,
+      bOwnedC, okD ? 1 : 0, okE ? 1 : 0, (unsigned long long)routed, dE,
+      (unsigned long long)bAuthoredGhosts);
+  std::printf("net-melee: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   cleanup();
   return ok ? Status::Pass : Status::Fail;
 }
@@ -16874,6 +17206,9 @@ const std::vector<Gate>& MobGates() {
       // A corpse replicates as the dead Mob it is (PLAN_corpse_is_a_mob.md
       // P2c): two MobSystems on two Physics worlds joined by EntityBatch bytes.
       {"net-corpse", "mob", {}, false, GateNetCorpse, /*needsRender=*/false},
+      // Melee across the wire (game/meleehit.h): a blade swept on one machine
+      // wounds, parries against, and is routed to the OWNER of the body.
+      {"net-melee", "mob", {}, false, GateNetMelee, /*needsRender=*/false},
       // A REMOTE player's death and respawn as the other machine sees them,
       // and an NPC corpse changing hands through ScanHandoffs.
       {"net-player-corpse", "mob", {}, false, GateNetPlayerCorpse,

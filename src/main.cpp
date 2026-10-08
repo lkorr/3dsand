@@ -6705,7 +6705,7 @@ int main(int argc, char** argv) {
   // S5b parking (game/persist.h). Lives beside `mobs` rather than in the
   // tick block so a load can ResetWaits(): records LoadWorld had to keep
   // (cap full, pool refused) are retried at once, not on the next window move.
-  MobParking mobParking;
+  EntityParking mobParking;
   // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
   // straight after: they are per-DEF art, shared by every instance. The set
   // persists past load because the sphere spawner packs 2x-detail ball models
@@ -14611,14 +14611,17 @@ int main(int argc, char** argv) {
                                 ui.pourRadius, pourFromValid, pourFrom},
                     ti, tick, opBatch);
 
-      // ---- S5b: NPCs OUTLIVE THE WINDOW (game/persist.h MobParking) --------
+      // ---- S5b: NPCs AND GROUND ITEMS OUTLIVE THE WINDOW (persist.h) -------
       // A creature leaving the window is parked in its region bucket by
-      // mobs.PreTick; here, after the tick, the ones the window has reached
-      // again come back, at most MobParking::kUnparkPerCall per tick and only
-      // onto ground the fetch cache has answered for. Parking is on for single
-      // player and the host (whose store is the world's), off for a client.
+      // mobs.PreTick, a ground item (with whatever it is strapped to) by
+      // debris.PostStep's cull; here, after the tick, the ones the window has
+      // reached again come back, a few per tick and only onto ground the fetch
+      // cache has answered for. Parking is on for single player and the host
+      // (whose store is the world's), off for a client.
       {
-        mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client);
+        const WorldItemRefs parkGround{&ground, &phys, &debris, &mbSet, &items};
+        mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client,
+                        &parkGround);
         mobParking.Unpark(mobs, stream.Store(), world, tick);
       }
 

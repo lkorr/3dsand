@@ -70,7 +70,7 @@ struct PlayerSession;  // session.h includes THIS file; MakePlayerState is in .c
 // reinterpreted. The handshake compares it and refuses a mismatch rather than
 // reading a peer's struct with our layout — the failure mode of getting that
 // wrong is a player standing in the wrong place with no error anywhere.
-constexpr uint32_t kPlayerStateVersion = 2;  // 2: kThrowDraw/kThrowSwing
+constexpr uint32_t kPlayerStateVersion = 3;  // 2: kThrowDraw/kThrowSwing; 3: severed
 
 // ONE TICK OF SOMEBODY ELSE'S CONTROLLER, AS A RESULT. POD, fixed layout, no
 // pointers and no std:: anything: this struct is memcpy'd into a frame by
@@ -125,6 +125,12 @@ struct PlayerState {
   Vec3 impactDeltaV{};     // one-tick edge: the hardest arrest of the tick
   int32_t health = 0;
   int32_t windowOrigin[3] = {};  // the SENDER's residency window, chunk coords
+  // WHICH BASE LIMBS THE OWNER'S BODY HAS LOST (bit i = rig slot i; Mob::
+  // SeveredBaseMask). A limb comes off a peer's body on the PEER's machine
+  // -- a blow from here is applied there (game/meleehit.h) -- and arrives
+  // as its debris; this is what takes it off the ghost so the ghost is not
+  // left holding a second copy (Mob::DropLimbForOwner). 2026-10-08.
+  uint32_t severed = 0;
 
   enum Flag : uint32_t {
     kGrounded = 1u << 0,
@@ -156,13 +162,13 @@ struct PlayerState {
   }
 };
 
-// THE LAYOUT IS PINNED. 108 bytes at 4-byte alignment: 3 u32 header (12) +
+// THE LAYOUT IS PINNED. 112 bytes at 4-byte alignment: 3 u32 header (12) +
 // pos/vel (24) + heading/lookYaw/lookPitch (12) + flags (4) + mantleTimer (4)
 // + hangLip (12) + hangDir (12) + impactDeltaV (12) + health (4) +
-// windowOrigin (12). If this fires, the wire format changed: bump
+// windowOrigin (12) + severed (4). If this fires, the wire format changed: bump
 // kPlayerStateVersion in the same commit, or the peer on the other end of a
 // LAN cable reads your fields at our offsets.
-static_assert(sizeof(PlayerState) == 108, "PlayerState wire layout moved");
+static_assert(sizeof(PlayerState) == 112, "PlayerState wire layout moved");
 static_assert(alignof(PlayerState) == 4, "PlayerState alignment moved");
 
 // The sender side: one session's outcome, ready to frame. `tick` is the

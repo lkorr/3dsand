@@ -543,6 +543,10 @@ const char* const kOrder[] = {
     // a helmed human, ticks them settled through the rig, saves/loads its own
     // dir, and resets mobs + debris and the id counter on the way out.
     "save-items",
+    // Ground items park (persist.h EntityParking): save-items' fixture, plus a
+    // window teleport away and home (mob-park's); clears the store, unbinds
+    // its hook and park function, regenerates worldgen at home on the way out.
+    "item-park",
     // AVTR v2 (a living player's wounds across a save): CPU + Jolt only, its own
     // avatar, registered for the gate and unregistered on the way out.
     "save-avatar-body",
@@ -629,6 +633,9 @@ const char* const kOrder[] = {
     // ownership function installed at all -- machine B is a second MobSystem
     // on its own Physics, destroyed before the gate returns.
     "net-corpse",
+    // Melee across the wire: net-corpse's two machines and exit contract
+    // (mobs, debris, id counter reset; machine B destroyed before return).
+    "net-melee",
     // The same exit contract as `net-corpse` (mobs, debris and id counter
     // reset) plus: the ghost avatar list and BOTH ownership closures it
     // installs through ScanHandoffs are cleared before it returns.

@@ -141,6 +141,19 @@ constexpr uint32_t kPlayerKitOldestLoadable = 3;
 // v1..v7 record is migrated by position: its DBRS holds the body too, and the
 // nearest unclaimed restored body at the item's position is taken as it. The
 // re-drop survives only as the fallback for a body DBRS did not restore.
+//
+// ...AND SINCE v9 (2026-10-08) THE ITEM CARRIES ITS OWN BODY. One record per
+// STRAP GROUP that holds an item (debris.h StrapGroupOf: a dropped sword is a
+// group of one; a helm still on a severed head is the head and the helm):
+// the group's bodies in the DBRS per-body form (DebrisSystem::SaveBodyGroup)
+// followed by each item's identity entry and which body of the group it is.
+// 'DBRS' leaves those groups out (DebrisSystem::SaveState's skip), so no body
+// is written twice and no record names an index into another section -- the
+// cross-section index v8 introduced is what made a record parked across a
+// save re-drop a second copy whenever its body had moved. It is ALSO the
+// record a ground item PARKS as (EntityParking below), exactly the way a
+// creature parks as its 'MOBS' save record: one format, written whether the
+// item leaves by a save or by walking away.
 struct WorldItemRefs {
   WorldItems* reg = nullptr;
   Physics* phys = nullptr;
@@ -169,7 +182,17 @@ struct WorldItemRefs {
 // v8 (2026-10-01) appends each entry's BODY INDEX in 'DBRS'
 // (DebrisSystem::SaveIndexOf); see "ONE BODY, ONE IDENTITY" above. A v7 record
 // finds its body by position instead.
-constexpr uint32_t kWorldItemSaveVersion = 8;
+// v9 (2026-10-08) is a different SHAPE: one record per strap group holding an
+// item, its bodies inline (see "AND SINCE v9" above). The payload is `u32
+// count` of those records. v1..v8 still load through the claim path.
+constexpr uint32_t kWorldItemSaveVersion = 9;
+
+// The pre-v9 ITMS payload (`u32 count` + one entry per item; v8 entries end
+// with the body's DBRS index, v7 ones do not), for the migration gate: it is
+// what every older save holds beside a DBRS that still has the item bodies.
+// `version` 7 or 8.
+void SaveWorldItemsLegacy(const WorldItemRefs& r, std::vector<uint8_t>& out,
+                          uint32_t version);
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove
@@ -223,7 +246,8 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
 // position and is left alone. Returns whether it engaged.
 bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);
 
-// ---- NPCs OUTLIVE THE WINDOW (docs/PLAN_save_system.md S5b) -----------------
+// ---- NPCs AND GROUND ITEMS OUTLIVE THE WINDOW -------------------------------
+// (docs/PLAN_save_system.md S5b; ground items 2026-10-08)
 //
 // PARK: MobSystem's out-of-window branch hands the creature's Mob::SaveOne
 // record to the function Bind installs, which appends it -- as a 'MOBS'
@@ -234,43 +258,57 @@ bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow);
 // creature reaches disk with the next save and a load leaves it parked unless
 // the window holds it.
 //
+// A GROUND ITEM PARKS THE SAME WAY, as its 'ITMS' v9 record: DebrisSystem's
+// window cull (32 voxels outside the window) asks the hook Bind installs
+// whether the body's strap group holds an item, and if so hands the WHOLE
+// group over before releasing it -- the sword, or the helm AND the severed
+// head it is still on. Until 2026-10-08 the cull destroyed it: a sword you
+// dropped and walked away from was gone when you came back.
+//
 // UNPARK: Unpark walks the buckets of the regions the window intersects and
-// makes live (MobSystem::LoadOne, the load path) the 'MOBS' records whose
-// origin is inside the window by at least kUnparkMarginChunks on every face.
-// The margin is the hysteresis against the park pad (16 voxels OUTSIDE the
-// window): a creature must travel two chunks to flip back, so one standing on
-// the window edge cannot park and unpark on alternate ticks.
+// makes live (MobSystem::LoadOne, the load path; the ITMS group loader for an
+// item) the records whose position is inside the window by at least
+// kUnparkMarginChunks on every face. The margin is the hysteresis against the
+// park pad (16 voxels OUTSIDE the window for a creature, 32 for a body): a
+// thing must travel two chunks to flip back, so one standing on the window
+// edge cannot park and unpark on alternate ticks.
 //
 // Three things can make a record WAIT (it stays parked, untouched, and is
 // retried on a later call -- never dropped):
 //   * THE BUDGET. At most `budget` creatures per call (kUnparkPerCall by
-//     default; main calls once per tick). A window shift into a crowded town
-//     is a Spawn + BuildRig + Jolt bodies per creature; spread over ticks it
-//     is a trickle rather than a frame spike.
+//     default; main calls once per tick), and kUnparkItemsPerCall item
+//     groups. A window shift into a crowded town is a Spawn + BuildRig + Jolt
+//     bodies per creature; spread over ticks it is a trickle rather than a
+//     frame spike.
 //   * THE CAP. MobSystem::HasRoomToSpawn is false: the live crowd is full.
 //     Parked creatures never hold a cap slot; they come back when one frees.
+//     (Items have no cap of their own: the debris budget evicts them last.)
 //   * THE GROUND. The chunks under the creature's footprint (its min corner
-//     and half a chunk on in x and z), at the feet and one below, must be in
-//     the ON-DEMAND FETCH CACHE (World::Cached, the store the mob
-//     ground probe reads) at a version no older than the tick this system
-//     first asked for it. The CPU never holds the whole window (CLAUDE.md
-//     "CPU mirror is 3x3x3 chunks"), and a cached copy from before the chunk
-//     last left the window is stale terrain -- so the first sight of a chunk
-//     issues a fetch (FetchSource::Mob, coalesced) and the creature is
-//     placed only once the answer is back. SenseGround already makes gravity
-//     wait on unknown ground; this makes the creature not EXIST until the
-//     ground it stands on is known, so neither the drive nor the static-
-//     collider sweep ever meets a hole.
+//     and half a chunk on in x and z), at the feet and one below -- for an
+//     item, its own chunk and the one below -- must be in the ON-DEMAND FETCH
+//     CACHE (World::Cached, the store the mob ground probe reads) at a
+//     version no older than the tick this system first asked for it. The CPU
+//     never holds the whole window (CLAUDE.md "CPU mirror is 3x3x3 chunks"),
+//     and a cached copy from before the chunk last left the window is stale
+//     terrain -- so the first sight of a chunk issues a fetch
+//     (FetchSource::Mob, coalesced) and the thing is placed only once the
+//     answer is back. An item comes back ASLEEP at its parked pose (the DBRS
+//     rule), so it is not falling while its terrain patch is built.
 //
 // OUT OF SCOPE (follow-ups): parked creatures do not tick -- no off-screen
 // travel, hunger or schedule; they stand frozen where they left the window.
-// Ground items (ITMS) do not park. Multiplayer: see Bind.
-class MobParking {
+// Plain debris (rubble, a severed limb wearing nothing) is still destroyed by
+// the cull: it is the Noita rule, and only a group holding an item is kept.
+// Multiplayer: see Bind.
+class EntityParking {
  public:
   // Creatures made live per Unpark call. main.cpp calls once per sim tick, so
   // this is creatures per tick: a crowd of 16 (MobSystem's cap) is back in
   // eight ticks, ~0.13 s, and no tick pays for more than two rig builds.
   static constexpr uint32_t kUnparkPerCall = 2;
+  // Item groups per call. A group is one to a handful of debris bodies (no
+  // rig, no joints): a dropped pack's worth comes back in a tick or two.
+  static constexpr uint32_t kUnparkItemsPerCall = 8;
   // Unpark only well inside the window (see the hysteresis note above).
   static constexpr int kUnparkMarginChunks = 1;
 
@@ -284,23 +322,33 @@ class MobParking {
     uint64_t spawnWaits = 0;   // ...Spawn refused it (rig/pool): kept, retried
     uint32_t lastCall = 0;     // creatures made live by the last call
     uint32_t maxCall = 0;      // the most any one call made live
+    // ---- the ground items' half ----
+    uint64_t itemGroupsParked = 0;    // strap groups the debris cull handed over
+    uint64_t itemGroupsUnparked = 0;  // ...made live again
+    uint64_t itemGroupsFailed = 0;    // ...whose record did not parse (dropped)
+    uint64_t itemGroundWaits = 0;
+    uint64_t itemBudgetWaits = 0;
   };
 
-  // Install (enabled) or remove (disabled) the park function on `mobs`,
-  // writing into `store`. Idempotent: a call that changes nothing costs a
-  // compare, so the frame loop may call it every tick.
+  // Install (enabled) or remove (disabled) the park functions: the creature
+  // one on `mobs` and -- when `ground` is complete -- the item one on its
+  // DebrisSystem, both writing into `store`. Idempotent: a call that changes
+  // nothing costs a compare, so the frame loop may call it every tick.
   //
   // MULTIPLAYER (M9): parking is decided by the machine that OWNS the
-  // creature (MobSystem only parks a non-ghost; the ownership rule has
-  // already handed a creature to any peer whose window holds it), and main
-  // enables it only on a machine whose store is the world's -- single player
-  // and the host. A client's store is not what the host saves, so a client
-  // that parked would hide the creature from the world file; a client keeps
-  // the pre-S5b despawn (and its MobGone), which is no worse than before.
-  // KNOWN GAP: a creature the host parked comes back only when the HOST's
-  // window reaches it; a client walking into that region alone does not see
-  // it (that needs the host to unpark on the client's behalf and hand off).
-  void Bind(MobSystem& mobs, ChunkStore& store, bool enabled);
+  // creature or the body (MobSystem only parks a non-ghost, the debris cull
+  // only offers an owned body; the ownership rule has already handed either
+  // to any peer whose window holds it), and main enables it only on a machine
+  // whose store is the world's -- single player and the host. A client's
+  // store is not what the host saves, so a client that parked would hide the
+  // thing from the world file; a client keeps the pre-S5b despawn (and its
+  // MobGone / BodyGone), which is no worse than before.
+  // KNOWN GAP: a creature or item the host parked comes back only when the
+  // HOST's window reaches it; a client walking into that region alone does
+  // not see it (that needs the host to unpark on the client's behalf and
+  // hand off).
+  void Bind(MobSystem& mobs, ChunkStore& store, bool enabled,
+            const WorldItemRefs* ground = nullptr);
   // See the class comment. `tick` is the sim tick just run (the fetch-cache
   // freshness bound is in ticks). Returns creatures made live.
   uint32_t Unpark(MobSystem& mobs, ChunkStore& store, World& world,
@@ -315,6 +363,10 @@ class MobParking {
   bool enabled_ = false;
   MobSystem* boundMobs_ = nullptr;
   ChunkStore* boundStore_ = nullptr;
+  // The ground items' refs while bound (copied: the caller's struct may be a
+  // temporary); `haveGround_` false = items are not parked or unparked.
+  WorldItemRefs ground_{};
+  bool haveGround_ = false;
   // Skip the region walk when the window has not moved and nothing inside it
   // was left waiting: the steady state costs one compare per tick.
   bool haveOrigin_ = false;

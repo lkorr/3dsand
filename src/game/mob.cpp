@@ -11730,8 +11730,11 @@ bool MobSystem::FindParry(const Mob& wielder, const Vec3& aPrev,
     // (walking, idle) still does not block; only a stroke's Guard phase does.
     const bool guarding = !m.PlayerControlled() &&
                           m.stroke_.phase == NpcStroke::Phase::Guard;
-    if (&m == &wielder || !m.alive_ || !(m.swinging_ || guarding) ||
-        m.HeldSlot() < 0)
+    // A GHOST runs no stroke; its owner says whether its blade is live
+    // (MobPose::kBladeLive), and the attacker's machine judges the parry
+    // against that (game/meleehit.h rule 2).
+    const bool live = m.IsGhost() ? m.ghostBladeLive_ : (m.swinging_ || guarding);
+    if (&m == &wielder || !m.alive_ || !live || m.HeldSlot() < 0)
       return;
     Vec3 db, dt, dflat;
     float dhw = 0;
@@ -15726,6 +15729,10 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
                                  uint32_t physScale,
                                  std::vector<DebrisVoxel> part, World& world,
                                  std::vector<ParticleSpawn>& spawns) {
+  // A GHOST'S CARVE IS PRESENTATION (game/meleehit.h rule 4): the piece that
+  // parted is the OWNER's gobbet and arrives as its ghost body. Making one
+  // here as well would be this machine's debris for a cut its owner made.
+  if (IsGhost()) return 0;
   // Rebase the chunk to its own min corner and move its pose to match, the same
   // construction ShatterBody uses for a debris fragment.
   IVec3 mn{127, 127, 127};
@@ -25443,6 +25450,13 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
 
 void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
   if (!def_) return;
+  // A GHOST'S LIMBS COME OFF WHEN ITS OWNER SAYS SO (mob.h DropLimbForOwner,
+  // 2026-10-08). A blow or a blast landed here carves the ghost as
+  // presentation; the owner applies the same blow to the real body, and if a
+  // limb comes off THERE it arrives as the owner's debris and the pose stream
+  // stops listing it. Severing here too put a second arm on the ground --
+  // this machine's, adopted -- beside the owner's.
+  if (IsGhost()) return;
   const MobDef& def = *def_;
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return;
   // limbDefs_, not def.limbs: a borrowed item slot severs like any limb (the
@@ -29197,6 +29211,80 @@ bool Mob::IsGhost() const {
   return sys_ != nullptr && owner_ != sys_->LocalPlayerId();
 }
 
+bool Mob::AwaitingHandoff() const {
+  return handoffDueTick_ != 0 && sys_ != nullptr && !IsGhost() &&
+         sys_->tick_ < handoffDueTick_;
+}
+
+void Mob::DropLimbForOwner(int limbIndex) {
+  if (!IsGhost() || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return;
+  if (!limbs_[(size_t)limbIndex].body) return;
+  // adopt = false: the piece is the OWNER's debris and arrives as its ghost
+  // body (the same reason OverlayMobRecord detaches a corpse's severs so).
+  DetachLimb(limbIndex, false);
+  MarkInstancesDirty();
+}
+
+uint32_t Mob::SeveredBaseMask() const {
+  uint32_t m = 0;
+  const int n = std::min<int>(baseLimbs_, 32);
+  for (int i = 0; i < n && i < (int)limbs_.size(); i++)
+    if (!limbs_[(size_t)i].body) m |= 1u << i;
+  return m;
+}
+
+int Mob::SlotIndexNamed(const std::string& name) const {
+  if (name.empty()) return -1;
+  for (size_t i = 0; i < limbDefs_.size(); i++)
+    if (limbDefs_[i].name == name) return (int)i;
+  return -1;
+}
+
+// ---- MELEE ACROSS THE WIRE: the queues and the names (mob.h) ---------------
+
+void MobSystem::QueueMeleeHit(MeleeHit h) {
+  if (meleeOut_.size() >= kMaxMeleeHitsQueued) {
+    meleeWire_.overflow++;
+    return;
+  }
+  meleeOut_.push_back(std::move(h));
+  meleeWire_.queued++;
+}
+
+bool MobSystem::PopMeleeHit(MeleeHit& out) {
+  if (meleeOut_.empty()) return false;
+  out = std::move(meleeOut_.front());
+  meleeOut_.pop_front();
+  return true;
+}
+
+void MobSystem::NoteRemoteMeleeHit(MeleeHit h) {
+  if (meleeIn_.size() >= kMaxMeleeHitsQueued) {
+    meleeWire_.overflow++;
+    return;
+  }
+  meleeIn_.push_back(std::move(h));
+  meleeWire_.received++;
+}
+
+CombatantRef MobSystem::RefOf(const Mob& m) const {
+  // A PLAYER'S BODY BY ITS PLAYER: every avatar carries the playerId of the
+  // machine that drives it in `owner_` (SetAvatars stamps the local ones,
+  // SetAvatarOwner a peer's ghost), and that number means the same body on
+  // both machines where the mob id does not.
+  if (m.PlayerControlled() && !InMobList(&m)) return CombatantRef{1, m.owner_};
+  return CombatantRef{0, m.id_};
+}
+
+Mob* MobSystem::ResolveCombatant(const CombatantRef& r) {
+  if (r.player == 0) return FindCreature(r.id);
+  for (Mob* av : avatars_)
+    if (av != nullptr && !InMobList(av) && av->PlayerControlled() &&
+        av->owner_ == (uint32_t)r.id)
+      return av;
+  return nullptr;
+}
+
 void MobSystem::RefreshOwnership() {
   if (!ownershipFn_) return;
   for (Mob& m : mobs_) {
@@ -29215,7 +29303,14 @@ void MobSystem::RefreshOwnership() {
     // to a chunk above the ground it is standing on.
     const Vec3 feet{m.origin_.x + m.def_->worldSize.x * 0.5f, m.origin_.y,
                     m.origin_.z + m.def_->worldSize.z * 0.5f};
+    const bool wasGhost = m.IsGhost();
     m.owner_ = ownershipFn_(m.id_, feet);
+    // PROMOTED HERE, ITS STATE STILL ON THE WIRE (mob.h handoffDueTick_):
+    // the losing side built its MobHandoff this same tick and it lands D+1
+    // ticks from now. The bound is the backstop for a record that never comes
+    // (the peer dropped): 1.5 s, several times the lockstep delay.
+    if (wasGhost && !m.IsGhost()) m.handoffDueTick_ = tick_ + 45u;
+    if (m.IsGhost()) m.handoffDueTick_ = 0;
   }
 }
 
@@ -29328,6 +29423,13 @@ bool MobSystem::BuildPose(uint64_t mobId, uint32_t tick,
   out.origin = m->origin_;
   out.heading = m->heading_;
   out.alive = m->alive_ ? 1u : 0u;
+  // THE BLADE IS LIVE: FindParry's own test (a stroke cutting, or an NPC's
+  // Guard phase), so the peer's sweep is stopped by this blade exactly when a
+  // sweep on this machine would be (game/meleehit.h rule 2).
+  if (m->alive_ && m->HeldSlot() >= 0 &&
+      (m->swinging_ || (!m->PlayerControlled() &&
+                        m->stroke_.phase == NpcStroke::Phase::Guard)))
+    out.flags |= ::net::MobPose::kBladeLive;
   // ONLY LIMBS WITH A BODY. A severed limb is DebrisSystem's by now and a
   // worn shell is derived from its host on the far side (DriveWornShells), so
   // neither belongs in the stream — which is also most of why the per-tick
@@ -29370,6 +29472,31 @@ bool MobSystem::ApplyPose(const ::net::MobPose& p) {
   if (!m->haveGhostPose_) m->origin_ = p.origin;
   m->ghostPose_ = p;
   m->haveGhostPose_ = true;
+  m->ghostBladeLive_ = (p.flags & ::net::MobPose::kBladeLive) != 0;
+  // ---- A LIMB THE OWNER NO LONGER HAS (2026-10-08) -------------------------
+  //
+  // The stream lists every limb with a body and nothing else (BuildPose), so
+  // a BASE limb this ghost still carries that the owner's pose leaves out is
+  // one the owner severed -- by a blow from either machine, a blast, a fire.
+  // It comes off here without gore or adoption (Mob::DropLimbForOwner); the
+  // owner's severed piece is in the same batch as a ghost body, announced
+  // before this pose, so the swap is one tick. Worn and held slots are not
+  // judged this way: they leave the stream for other reasons (a worn shell is
+  // never posed, a re-dress renumbers the tail).
+  //
+  // Before this a ghost never lost a limb its owner lost while it lived, and
+  // a ghost that severed one locally (a blow landed here) kept a second copy
+  // of the arm on this machine's ground.
+  {
+    const int base = std::min<int>(m->baseLimbs_, (int)m->limbs_.size());
+    std::vector<uint8_t> listed((size_t)std::max(base, 0), 0);
+    for (const ::net::WireLimbPose& lp : p.limbs)
+      if ((int)lp.index < base) listed[lp.index] = 1;
+    for (int i = 0; i < base; i++)
+      if (!listed[(size_t)i] && m->limbs_[(size_t)i].body &&
+          m->limbs_[(size_t)i].wornHost < 0)
+        m->DropLimbForOwner(i);
+  }
   // ---- THE OWNER SAYS IT DIED (P2c) ----------------------------------------
   //
   // The dead state, entered the moment the pose that carries it is latched:
@@ -29665,6 +29792,7 @@ Mob* MobSystem::ApplyHandoff(const ::net::MobHandoff& h) {
 
   // ---- IT IS MINE NOW -----------------------------------------------------
   m->owner_ = localPlayerId_;
+  m->handoffDueTick_ = 0;   // the record a peer's blow may have waited for
   // The record has arrived, so the ownership function may have it back: this
   // creature is no longer a shape somebody described to us (mob.h).
   m->announceOnly_ = false;

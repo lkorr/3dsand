@@ -1257,7 +1257,42 @@ DESIGN.md / CLAUDE.md paragraphs updated:
 Board: claim posted at <time>, done posted at <time>
 ```
 
-## Melee across the wire (open, NEEDS OWNER DECISIONS; written 2026-10-07)
+## Melee across the wire (DECIDED AND IMPLEMENTED 2026-10-08)
+
+**Status:** landed with gate `net-melee`; `game/meleehit.h` is the record and
+the argument, DESIGN.md "Melee across the wire" the summary. The decisions,
+taken against the questions below:
+
+1. **Trust: the attacker decides.** The owner applies a `MeleeHit` unchecked,
+   through the same `ResolveOnCreature` the local sweep runs (the explosion
+   rule). The record is in the STRUCK SLOT's frame and carries
+   `BuildStrikeParts`' inputs, so the owner rebuilds the identical kerf on its
+   real limb wherever that limb is now (measured: owner and ghost carves equal).
+2. **A parry is judged by the attacker,** not by a guard history on the
+   defender. A parry here is blade geometry (`FindParry`); the attacker holds
+   both blades once `MobPose` carries `kBladeLive`, so the stroke is arrested
+   on the tick it meets the guard. Judging it on the defender would let the
+   sword pass through the guard on screen and be stopped a round trip later.
+   The parry's consequences travel as a `Parry` record. Gap: a peer PLAYER's
+   ghost has no weapon on it yet, so a player cannot parry across the wire.
+3. **A handoff in flight: routed, and it waits for the record.** Ownership is
+   derived, so "re-forward or drop" collapses: a record is applied by whoever
+   owns the target when it arrives; a machine that has just given it away
+   sends it on (`kMaxMeleeHops` 2), and the new owner holds it while the
+   handoff record that would overlay the creature's state is still in flight
+   (`Mob::AwaitingHandoff`, 45-tick backstop).
+4. **The attacker carves its ghost at once**, as presentation: gore discarded,
+   and a ghost can no longer sever, die or spawn carve fragments locally.
+   "Wait for the owner's result" is not available -- a LIVING creature's wounds
+   have no state stream, so the attacker would never see them. Structure comes
+   from the owner: a base limb the owner's `MobPose` stops listing is dropped
+   from the ghost (no adoption; the owner's severed piece arrives as its ghost
+   body), and `PlayerState::severed` (v3) does the same for a peer player.
+
+Not covered: a blow on a peer's LOOSE body (debris) is still carved locally
+only. The original write-up follows.
+
+### The question as it was posed (2026-10-07)
 
 What happens today: `MeleeSweepDamage` (`melee.cpp`) applies a hit directly
 (`mobs.Damage` / `CutLimb` / `BluntHit`) to whatever body the sweep found on

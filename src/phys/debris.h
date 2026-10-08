@@ -1436,9 +1436,64 @@ class DebrisSystem {
   // was the skin voxel's padding byte. Same stride, so a v4 section still
   // LOADS -- with that byte zeroed, because in v4 it was never written.
   static constexpr uint32_t kSaveVersion = 5;
-  void SaveState(std::vector<uint8_t>& out) const;
+  // `skipGroup` (2026-10-08): a STRAP GROUP (StrapGroupOf) any member of which
+  // answers true is left out -- the ground-item section writes those groups as
+  // its own records (game/persist.cpp 'ITMS' v9), so one body is never saved
+  // by two sections. Null = every non-fixture body, as before.
+  void SaveState(std::vector<uint8_t>& out,
+                 const std::function<bool(uint64_t)>& skipGroup = {}) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);
+
+  // ---- ONE STRAP GROUP AS A RECORD OF ITS OWN (2026-10-08) ----------------
+  //
+  // A STRAP GROUP is a host and every follower strapped to it (StrapBody): a
+  // severed head and the helm still on it, a corpse's torso and its cuirass.
+  // It is the unit that moves together, so it is the unit that parks and
+  // saves together -- the pair the 'DBRS' section could only ever write as
+  // two indices into one global list.
+  //
+  // The bytes are the DBRS per-body record, exactly (pose, scales, dye, bleed,
+  // strap offset, both lattices; WriteBodyRecord), with the strap index local
+  // to the group and one flags word per body ('DBRS' never carried `dead`, so
+  // a parked severed head came back as plain debris). Written by
+  // game/persist.cpp's ground-item records -- which is what parks a dropped
+  // helm WITH the head it is on, rather than unstrapping it and losing the
+  // head (PLAN_save_system.md "Ground items do not park", decided 2026-10-08).
+  //
+  // StrapGroupOf: the group `handle` belongs to, HOST FIRST, then its
+  // followers in body order. Empty for an unknown handle.
+  void StrapGroupOf(uint64_t handle, std::vector<uint64_t>& out) const;
+  // Write the group (StrapGroupOf's order). False if any handle is unknown.
+  bool SaveBodyGroup(const std::vector<uint64_t>& group,
+                     std::vector<uint8_t>& out) const;
+  // Recreate a group SaveBodyGroup wrote: every body ASLEEP at its saved pose
+  // (LoadState's rule), straps re-tied. `handles` gets one entry per saved
+  // body, in record order, 0 for one that could not be built (an empty
+  // lattice, a Jolt refusal). No body cap: the PostStep budget trims the
+  // newest-protected oldest-first as it does any adoption, and it evicts
+  // items last. False on a short or foreign record.
+  bool LoadBodyGroup(ByteReader& r, std::vector<uint64_t>& handles);
+
+  // ---- GROUND ITEMS OUTLIVE THE WINDOW (2026-10-08) -----------------------
+  //
+  // The cull in PostStep (a body 32 voxels outside the window) DESTROYS what
+  // it takes. Installed, this is asked first about every OWNED body the cull
+  // is about to take: `isParked(handle)` says whether the body's strap group
+  // is one the caller keeps (a ground item's), and if so the WHOLE group is
+  // handed to `park(group)` (StrapGroupOf's order) before it is released --
+  // the caller writes it somewhere that outlives the window (game/persist.h
+  // EntityParking). Released either way; the hook decides only whether it is
+  // remembered. Null (the default, and every client in a networked game) is
+  // the old destroy.
+  struct ParkHook {
+    std::function<bool(uint64_t)> isParked;
+    std::function<void(const std::vector<uint64_t>&)> park;
+  };
+  void SetParkHook(ParkHook h) { parkHook_ = std::move(h); }
+  bool HasParkHook() const { return (bool)parkHook_.park; }
+  // Strap groups handed to the hook since construction (a gate's read-out).
+  uint64_t ParkedGroups() const { return parkedGroups_; }
 
   // ---- WHICH SAVED BODY IS WHICH ITEM (game/persist.cpp 'ITMS' v8) ---------
   //
@@ -2008,6 +2063,26 @@ class DebrisSystem {
   // rebuilt goes back to kinematic (ReplaceBody does not carry motion type).
   void CarryStrap(uint64_t oldHandle, uint64_t newHandle);
   std::function<void(uint64_t)> onBodyGone_;
+  // SetParkHook's pair; empty = the cull destroys.
+  ParkHook parkHook_;
+  uint64_t parkedGroups_ = 0;
+  // ---- ONE BODY'S SAVED FORM: the 'DBRS' record, shared by SaveState and the
+  // strap-group records so the two cannot drift. `hostIdx` is the follower's
+  // host as an index into whatever list the caller writes (0xFFFFFFFF = none).
+  struct SavedBody {
+    BodyTransform xf{};
+    uint32_t physScale = 1, skinScale = 1, hadMicro = 0, dye = 0, bleedMat = 0;
+    uint32_t hostIdx = 0xFFFFFFFFu;
+    Vec3 relPos{};
+    float relQuat[4] = {0, 0, 0, 1};
+    std::vector<DebrisVoxel> voxels;
+    std::vector<PrefabVoxel> skinVoxels;
+  };
+  static void WriteBodyRecord(ByteWriter& w, const Body& b, uint32_t hostIdx);
+  static bool ReadBodyRecord(ByteReader& r, uint32_t version, SavedBody& out);
+  // Build the body (asleep, at its saved pose), or 0. `follower` = it will be
+  // strapped, so Jolt must allow the kinematic switch. `dead` = Body::dead.
+  uint64_t RestoreBody(SavedBody&& s, bool follower, bool dead);
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.

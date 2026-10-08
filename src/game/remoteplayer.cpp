@@ -68,6 +68,9 @@ PlayerState MakePlayerState(const PlayerSession& s, uint32_t tick,
   st.windowOrigin[0] = windowOrigin.x;
   st.windowOrigin[1] = windowOrigin.y;
   st.windowOrigin[2] = windowOrigin.z;
+  // The limbs this body has lost (PlayerState::severed): the ghost on the
+  // peer drops the same ones (RemotePlayersPreTick).
+  st.severed = s.avatar.Spawned() ? s.avatar.SeveredBaseMask() : 0u;
   return st;
 }
 
@@ -282,6 +285,18 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
       if (swing && !r.throwSwing) r.avatar.PlayClip("throw");
       r.throwDraw = draw;
       r.throwSwing = swing;
+    }
+
+    // ---- the limbs the owner's body has lost (PlayerState::severed) ------
+    // A blow from THIS machine carves the ghost as presentation and never
+    // severs it (game/meleehit.h rule 4); the owner applies the blow, and a
+    // limb that came off there arrives as its debris. This drops the ghost's
+    // copy -- no gore, no adoption -- so the arm is not on the ground AND on
+    // the body. One-way: a re-grown limb comes back with the next revive.
+    if (r.last.severed != 0) {
+      const int n = std::min(r.avatar.AppendedBase(), 32);
+      for (int i = 0; i < n; i++)
+        if ((r.last.severed >> i) & 1u) r.avatar.DropLimbForOwner(i);
     }
 
     // ---- drive the rig ---------------------------------------------------

@@ -919,6 +919,27 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& sweep, const MeleeTuning& t,
                                  World& world,
                                  std::vector<ParticleSpawn>& spawns);
 
+// ---- MELEE ACROSS THE WIRE: THE OWNER'S HALF (game/meleehit.h) -------------
+//
+// A blow MeleeSweepDamage lands on a body this machine does not own is carved
+// there as presentation and queued for the body's owner (MobSystem::
+// QueueMeleeHit -> the entity batch). This applies, on the owner, every such
+// blow the peer sent (MobSystem::RemoteMeleeHits): through the SAME creature
+// resolver the sweep uses, on the slot the blow was struck into, in that
+// slot's frame NOW. Gore goes into `spawns` -- this machine's batch, so it
+// reaches both worlds once. A blow for a creature that changed hands is sent
+// on (at most kMaxMeleeHops times); one for a creature whose handoff record
+// is still in flight waits a tick (Mob::AwaitingHandoff); one for a target or
+// slot that no longer exists is counted and dropped (MobSystem::MeleeWire).
+//
+// Called ONCE per tick by TickAuthority, after the debris pre-tick and before
+// the players' own swings (session.cpp). A no-op with nothing queued, which is
+// every tick of a single-player game.
+inline constexpr uint32_t kMaxMeleeHops = 2;
+void ApplyRemoteMeleeHits(Physics& phys, MobSystem& mobs, DebrisSystem& debris,
+                          World& world, std::vector<ParticleSpawn>& spawns,
+                          uint32_t tick);
+
 
 // The whole pose the driver commands, in one value. Passed to Mob::
 // SetWeaponPose; see the note there for what each channel does to the rig.

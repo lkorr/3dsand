@@ -554,8 +554,8 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   (`ApplyRegionEntities`, also the entry point for later touches). Cross-
   bucket references: `MOBS` records name nothing outside themselves; `DBRS`
   names strap hosts by index into its own list and has no per-body entry
-  point, so it stays one group in `world.sve`; `ITMS` (v8) names its body's
-  index in that `DBRS` -- see the next bullet. Time of day is
+  point, so it stays one group in `world.sve`; `ITMS` (v9) carries its own
+  bodies and names nothing outside its record -- see the next bullet. Time of day is
   the celestial clock plus meta's sim tick; weather is a pure function of
   (tuning, seed, sim tick) with no state of its own. The pre-S4
   `entities.sve` still loads (whole, every section through its whole-payload
@@ -578,6 +578,30 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   an old save loads without it. Content that no longer exists takes its
   restored body with it. Gate: `save-items` (three drops + a helm shed off a
   severed head, two save/load cycles, and a v7 load).
+  **ITMS v9 (2026-10-08): the item carries its own body.** One record per
+  STRAP GROUP that holds an item (`DebrisSystem::StrapGroupOf`: a dropped
+  sword alone, or a helm AND the severed head it is still on): the group's
+  bodies in the `DBRS` per-body form (`SaveBodyGroup`, plus a `dead` flag the
+  section never carried) followed by each item's identity entry and which
+  body of the group it is. `DBRS` leaves those groups out
+  (`SaveState(skipGroup)`, the registry asked as the one predicate), so no
+  body is written by two sections and no record indexes another -- the v8
+  cross-section index was what made a record parked across a save re-drop a
+  second copy once its body had moved. v1..v8 still load by the claim path.
+  **Ground items PARK (2026-10-08)** as exactly that record, the way a creature
+  parks as its `MOBS` record: the debris window cull (32 voxels outside)
+  hands an owned body's strap group to `EntityParking`'s hook before it
+  releases it, if any member is a registered item, and `EntityParking::Unpark`
+  brings it back -- asleep at its parked pose, straps tied, onto ground the
+  fetch cache has answered for, `kUnparkItemsPerCall` groups a tick. A helm
+  parks WITH its head rather than being unstrapped (owner decision: the pair
+  is the unit that moves together, and unstrapping lost the head and brought
+  the helm back loose). Plain debris is still destroyed by the cull (the Noita
+  rule). **The body budget evicts items LAST** (`PostStep`): rubble goes
+  first, so a fight's worth of fragments no longer deletes the sword at your
+  feet, and an item coming home is never the oldest body in the list. Gates:
+  `item-park` (park with the head, unpark in place and turned the same way,
+  budget), `save-items` (v9 round trip, v7 migration).
   **The index is the body's rank among what `DBRS` WRITES (2026-10-07).**
   `SaveIndexOf` returned the raw `bodies_` index while `SaveState` skips
   fixtures (an open door's leaf), so with a door open earlier in the list the
@@ -656,7 +680,7 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   client keeps the old despawn, because its store is not the one the host
   saves. Known gap: a host-parked creature returns only when the HOST's window
   reaches it. **Not done:** parked creatures do not tick (no off-screen
-  travel or schedules); ground items do not park; authored NPCs still have no
+  travel or schedules); authored NPCs still have no
   stable content id (`npc:<name>`) for quests to name. Gate `mob-park`.
 - **The save stores the delta, and meta names its generator (2026-09-22,
   `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
@@ -23746,10 +23770,39 @@ carve spawns are discarded on the author's machine (`CarveMobsRadial`'s
 batch (`TickAuthorityCtx::remoteBlastGore`, drained in phase L) because phase
 N runs after the outgoing batch was stored — pushed into the merged batch
 they would reach one GPU only. A remote crater's box is also marked modified
-in phase N, as a remote brush op's is. Still open: melee has no op to ride,
-so an owner-side sword hit still needs a hit message -- and that needs owner
-decisions first (who is trusted, who judges a parry, a hit during a handoff;
-`docs/PLAN_multiplayer_m9.md` "Melee across the wire").
+in phase N, as a remote brush op's is.
+
+**Melee across the wire (2026-10-08; `game/meleehit.h`, gate `net-melee`).**
+Melee has no op to ride, so a blow on a body another machine owns travels as
+a `MeleeHit` record in the entity batch (`kEntityBatchVersion` 3): the target
+and attacker by a name both machines agree on (`CombatantRef`: a mob id, or
+a PLAYER by the playerId its avatar's `owner_` carries), the struck slot BY
+NAME, every vector in that slot's body frame, and the inputs
+`BuildStrikeParts` took, so the owner rebuilds the identical kerf, trauma and
+tear (same tuning, same draw key) on its real limb wherever it is now. The
+decisions: (1) THE ATTACKER DECIDES -- the owner applies the record unchecked
+through the same `ResolveOnCreature` the local sweep uses (lifted out of
+`MeleeSweepDamage`), as explosions are applied. (2) THE ATTACKER JUDGES A
+PARRY: a parry is blade geometry (`FindParry`), the attacker has both blades
+(`MobPose::kBladeLive` says a ghost's is cutting or held in guard), so the
+stroke is arrested on the tick it meets the guard and the parry's
+consequences (the weapon's wear, the flinch, the guard beaten open) go to the
+owner as a `Parry` record. A peer PLAYER's ghost holds no weapon yet, so it
+cannot parry across the wire. (3) A HANDOFF IN FLIGHT IS ROUTED: the record is
+applied by whoever owns the target when it arrives; a machine that has just
+given the creature away sends it on (`kMaxMeleeHops`), and the new owner holds
+it while the handoff record that would overlay its state is still on the wire
+(`Mob::AwaitingHandoff`). (4) THE ATTACKER SEES THE WOUND AT ONCE: its ghost is
+carved by the same blow as PRESENTATION -- gore to a discarded sink, and a
+ghost can no longer sever (`Mob::Sever`), die or spawn a carve fragment here;
+a limb comes off a ghost only when its owner says so (`MobSystem::ApplyPose`
+drops a base limb the owner's pose stopped listing; `PlayerState::severed`
+for a peer player), which also ends a pre-existing duplicate (a ghost severed
+by a local blow or blast used to adopt its own copy of the arm beside the
+owner's). Applied on the owner once per tick at a fixed phase
+(`ApplyRemoteMeleeHits`, after phase J), its gore into that tick's batch; the
+defender hears it (a `StrikeEvent` pushed there). Loose matter is not routed:
+a blow on a peer's debris body is still carved locally only.
 
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×

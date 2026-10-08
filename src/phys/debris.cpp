@@ -7056,6 +7056,7 @@ void DebrisSystem::PostStep() {
   IVec3 wo = world_->WindowOrigin();
   Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
            (float)(wo.z * (int)kChunk)};
+  std::vector<uint64_t> parkRoots;   // strap groups the cull parks (below)
   for (size_t i = 0; i < bodies_.size();) {
     Body& b = bodies_[i];
     // BEFORE the read-back, because b.xf is still where the body was when the
@@ -7080,6 +7081,24 @@ void DebrisSystem::PostStep() {
                 b.xf.pos.x > wlo.x + (float)kWorldN + kPad ||
                 b.xf.pos.y > wlo.y + (float)kWorldN + kPad ||
                 b.xf.pos.z > wlo.z + (float)kWorldN + kPad;
+    // ...UNLESS IT IS SOMETHING THE WORLD KEEPS (2026-10-08): a ground
+    // item's strap group is PARKED by the hook (debris.h SetParkHook), whole,
+    // after this loop -- not here, because the group's other bodies sit at
+    // other indices of the list this loop is compacting.
+    if (dead && parkHook_.park && OwnedLocally(b) && parkHook_.isParked) {
+      std::vector<uint64_t> group;
+      StrapGroupOf(b.handle, group);
+      bool keep = false;
+      for (uint64_t h : group) keep = keep || parkHook_.isParked(h);
+      if (keep) {
+        const uint64_t root = group.empty() ? b.handle : group[0];
+        if (std::find(parkRoots.begin(), parkRoots.end(), root) ==
+            parkRoots.end())
+          parkRoots.push_back(root);
+        i++;
+        continue;
+      }
+    }
     if (dead) {
       ReleaseBody(b);
       bodies_[i] = std::move(bodies_.back());
@@ -7089,11 +7108,36 @@ void DebrisSystem::PostStep() {
       i++;
     }
   }
+  // ---- THE PARKED GROUPS: written whole, then released whole --------------
+  // The hook reads the bodies (and, through the item registry, their
+  // identities) BEFORE any of them is released: ReleaseBody's gone
+  // notification is what drops a registry entry.
+  for (uint64_t root : parkRoots) {
+    std::vector<uint64_t> group;
+    StrapGroupOf(root, group);
+    if (group.empty()) continue;
+    parkHook_.park(group);
+    parkedGroups_++;
+    for (uint64_t h : group) DestroyBody(h);
+  }
   // body budget: oldest bodies despawn first (they are usually settled rubble)
-  // -- never a FIXTURE (an open door), which its owner is still holding.
+  // -- never a FIXTURE (an open door), which its owner is still holding, and
+  // a GROUND ITEM only once nothing else is left to take (2026-10-08). The
+  // budget is a cost bound on loose matter, and an item is not loose matter
+  // to the player: before this, a fight's worth of rubble deleted the sword
+  // lying at your feet, and a parked item coming home could be the oldest
+  // body in the list the tick it arrived. Items are few (one per thing a
+  // player or a death let go of), so the bound still holds in practice; when
+  // a world really is nothing but items, the oldest item goes, as before.
   while (bodies_.size() > MaxBodies()) {
     size_t victim = 0;
-    while (victim < bodies_.size() && bodies_[victim].fixture) victim++;
+    while (victim < bodies_.size() &&
+           (bodies_[victim].fixture || bodies_[victim].item))
+      victim++;
+    if (victim >= bodies_.size()) {
+      victim = 0;
+      while (victim < bodies_.size() && bodies_[victim].fixture) victim++;
+    }
     if (victim >= bodies_.size()) break;
     ReleaseBody(bodies_[victim]);
     bodies_.erase(bodies_.begin() + (ptrdiff_t)victim);
@@ -7353,42 +7397,63 @@ bool DebrisSystem::BodyActive(uint32_t i) const {
 
 // ---- persistence (entities.sve section 'DBRS') ------------------------------
 
-void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
+void DebrisSystem::WriteBodyRecord(ByteWriter& w, const Body& b,
+                                   uint32_t hostIdx) {
+  w.Pod(b.xf);
+  w.U32(b.physScale);
+  w.U32(b.micro.skinScale);
+  // Only "did it render as micro" travels; the model index is meaningless
+  // across sessions (the pool is rebuilt), so load re-packs a brick from the
+  // lattice below.
+  w.U32(b.micro.Valid() ? 1u : 0u);
+  // The dye (v4). Not derivable from the lattice — see kSaveVersion's note.
+  w.U32(b.micro.dye);
+  w.U32(b.bleedMat);
+  // THE STRAP, BY INDEX INTO THE LIST BEING WRITTEN. Jolt handles do not
+  // survive a session, and load recreates the bodies in exactly this order,
+  // so the index is the only thing that can name a host across the boundary.
+  // 0xFFFFFFFF = not a follower. Without this an armoured corpse reloaded as
+  // a pile of free bodies sharing the same space, which is the OTHER way to
+  // build the motor StrapBody exists to avoid.
+  w.U32(hostIdx);
+  w.Pod(b.wornRelPos);
+  for (float q : b.wornRelQuat) w.F32(q);
+  w.PodVec(b.voxels);
+  w.PodVec(b.skinVoxels);
+}
+
+void DebrisSystem::SaveState(
+    std::vector<uint8_t>& out,
+    const std::function<bool(uint64_t)>& skipGroup) const {
   ByteWriter w{out};
   // FIXTURES ARE NOT SAVED HERE (SetBodyFixture): an open door's leaf is
   // re-created from its ref delta. The strap index below is into THIS list.
+  // ...NOR IS A STRAP GROUP THE CALLER SKIPS: a ground item's group is
+  // written by the ground-item section as one record of its own ('ITMS' v9),
+  // and a body two sections both restore is the duplicate that section exists
+  // to end. Asked of the whole GROUP, so a helm's head goes with the helm.
   std::vector<const Body*> saved;
   saved.reserve(bodies_.size());
-  for (const Body& b : bodies_)
-    if (!b.fixture) saved.push_back(&b);
+  std::vector<uint64_t> group;
+  for (const Body& b : bodies_) {
+    if (b.fixture) continue;
+    if (skipGroup) {
+      group.clear();
+      StrapGroupOf(b.handle, group);
+      bool skip = false;
+      for (uint64_t h : group) skip = skip || skipGroup(h);
+      if (skip) continue;
+    }
+    saved.push_back(&b);
+  }
   w.U32((uint32_t)saved.size());
   for (const Body* bp : saved) {
     const Body& b = *bp;
-    w.Pod(b.xf);
-    w.U32(b.physScale);
-    w.U32(b.micro.skinScale);
-    // Only "did it render as micro" travels; the model index is meaningless
-    // across sessions (the pool is rebuilt), so load re-packs a brick from the
-    // lattice below.
-    w.U32(b.micro.Valid() ? 1u : 0u);
-    // The dye (v4). Not derivable from the lattice — see kSaveVersion's note.
-    w.U32(b.micro.dye);
-    w.U32(b.bleedMat);
-    // THE STRAP, BY INDEX INTO THIS LIST. Jolt handles do not survive a
-    // session, and load recreates the bodies in exactly this order, so the
-    // index is the only thing that can name a host across the boundary.
-    // 0xFFFFFFFF = not a follower. Without this an armoured corpse reloaded as
-    // a pile of free bodies sharing the same space, which is the OTHER way to
-    // build the motor StrapBody exists to avoid.
     uint32_t hostIdx = 0xFFFFFFFFu;
     if (b.Follower())
       for (size_t j = 0; j < saved.size(); j++)
         if (saved[j]->handle == b.wornHost) { hostIdx = (uint32_t)j; break; }
-    w.U32(hostIdx);
-    w.Pod(b.wornRelPos);
-    for (float q : b.wornRelQuat) w.F32(q);
-    w.PodVec(b.voxels);
-    w.PodVec(b.skinVoxels);
+    WriteBodyRecord(w, b, hostIdx);
   }
 }
 
@@ -7440,6 +7505,90 @@ uint64_t DebrisSystem::ClaimLoadedBodyNear(Vec3 expectPos, float tol) {
   return h;
 }
 
+bool DebrisSystem::ReadBodyRecord(ByteReader& r, uint32_t version,
+                                  SavedBody& s) {
+  r.Pod(s.xf);
+  r.U32(s.physScale);
+  r.U32(s.skinScale);
+  r.U32(s.hadMicro);
+  r.U32(s.dye);
+  r.U32(s.bleedMat);
+  r.U32(s.hostIdx);
+  r.Pod(s.relPos);
+  for (float& q : s.relQuat) r.F32(q);
+  r.PodVec(s.voxels);
+  r.PodVec(s.skinVoxels);
+  if (version < 5u)   // the bruise byte was padding (kSaveVersion 5)
+    for (PrefabVoxel& v : s.skinVoxels) v.bruise = 0;
+  if (!r.ok) return false;
+  // MATERIAL NAMES (sim/mattable.h, W1-D): ids in the table this payload's
+  // file named, remapped by name before anything is built from them.
+  if (const MatRemap* mr = ActiveLoadRemap()) {
+    RemapDebrisVoxels(s.voxels, *mr);
+    RemapPrefabVoxels(s.skinVoxels, *mr);
+    s.bleedMat = mr->Mat(s.bleedMat);
+  }
+  return true;
+}
+
+uint64_t DebrisSystem::RestoreBody(SavedBody&& s, bool follower, bool dead) {
+  if (s.voxels.empty()) return 0;
+  const uint32_t physScale = std::max(1u, s.physScale);
+  const float pitch = 1.0f / (float)physScale;
+  // A saved follower has to come back able to BE kinematic — the strap pass
+  // switches it, and Jolt refuses the switch on a body that was not created
+  // with the allowance.
+  uint64_t h = phys_->CreateDebrisBodyXf(s.voxels, s.xf, densityOf_,
+                                         /*allowKinematic=*/follower, pitch);
+  if (h == 0) {
+    std::fprintf(stderr, "debris: Jolt refused a loaded body (skipped)\n");
+    return 0;
+  }
+
+  // Re-pack the micro brick from the authoritative lattice — the same
+  // skin-first rule ReskinMicro applies — and mark it OWNED so ReleaseBody
+  // returns its words to the pool like any copy-on-write clone. Variant bits
+  // are stripped: the brick stores plain 8-bit material ids.
+  MicroBodyRef micro{};
+  if (s.hadMicro && microSet_) {
+    std::vector<PrefabVoxel> mv;
+    const bool fine = s.skinScale > physScale && !s.skinVoxels.empty();
+    const std::vector<PrefabVoxel>* src = fine ? &s.skinVoxels : nullptr;
+    if (src) {
+      mv.reserve(src->size());
+      for (const PrefabVoxel& v : *src)
+        mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu), 0, v.bruise, v.stain});
+    } else {
+      mv.reserve(s.voxels.size());
+      for (const DebrisVoxel& v : s.voxels)
+        mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                      (uint16_t)(v.payload & 0xFFu), 0, 0, v.stain});
+    }
+    IVec3 mx{0, 0, 0};
+    for (const PrefabVoxel& v : mv) {
+      mx.x = std::max<int>(mx.x, v.x);
+      mx.y = std::max<int>(mx.y, v.y);
+      mx.z = std::max<int>(mx.z, v.z);
+    }
+    std::string plog;
+    int mi = MicroBodyPack(*microSet_, mv, {mx.x + 1, mx.y + 1, mx.z + 1},
+                           s.skinScale, "load", plog);
+    if (mi >= 0) {
+      microSet_->owned[mi] = 1;  // freeable: this body is the sole holder
+      micro = MicroBodyRef{(uint32_t)mi, s.skinScale, s.dye};
+    } else if (!plog.empty()) {
+      std::fprintf(stderr, "%s", plog.c_str());
+    }
+  }
+
+  AdoptBody(h, std::move(s.voxels), s.xf, micro, physScale,
+            std::move(s.skinVoxels), s.bleedMat, {}, dead);
+  // Reload ASLEEP with zero velocity (worldio.h's rigidbody rule): a settled
+  // pile reloads settled, and rule 2's sleep invariant holds from tick one.
+  phys_->DeactivateBody(h);
+  return h;
+}
+
 bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
   if (version != kSaveVersion && version != 4u) {
     std::fprintf(stderr, "debris: unknown DBRS section version %u\n", version);
@@ -7461,98 +7610,18 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
   };
   std::vector<PendingStrap> straps;
   for (uint32_t i = 0; i < count && r.ok; i++) {
-    BodyTransform xf{};
-    uint32_t physScale = 1, skinScale = 1, hadMicro = 0, bleedMat = 0, dye = 0;
-    uint32_t hostIdx = 0xFFFFFFFFu;
-    Vec3 relPos{};
-    float relQuat[4] = {0, 0, 0, 1};
-    std::vector<DebrisVoxel> voxels;
-    std::vector<PrefabVoxel> skinVoxels;
-    r.Pod(xf);
-    r.U32(physScale);
-    r.U32(skinScale);
-    r.U32(hadMicro);
-    r.U32(dye);
-    r.U32(bleedMat);
-    r.U32(hostIdx);
-    r.Pod(relPos);
-    for (float& q : relQuat) r.F32(q);
-    r.PodVec(voxels);
-    r.PodVec(skinVoxels);
-    if (version < 5u)   // the bruise byte was padding (kSaveVersion 5)
-      for (PrefabVoxel& v : skinVoxels) v.bruise = 0;
-    if (!r.ok || voxels.empty()) continue;
-    // MATERIAL NAMES (sim/mattable.h, W1-D): ids in the table this payload's
-    // file named, remapped by name before anything is built from them.
-    if (const MatRemap* mr = ActiveLoadRemap()) {
-      RemapDebrisVoxels(voxels, *mr);
-      RemapPrefabVoxels(skinVoxels, *mr);
-      bleedMat = mr->Mat(bleedMat);
-    }
+    SavedBody s;
+    if (!ReadBodyRecord(r, version, s) || s.voxels.empty()) continue;
     if (bodies_.size() >= MaxBodies()) break;  // same ceiling spawning obeys
-
-    physScale = std::max(1u, physScale);
-    const float pitch = 1.0f / (float)physScale;
-    // A saved follower has to come back able to BE kinematic — the strap pass
-    // below switches it, and Jolt refuses the switch on a body that was not
-    // created with the allowance.
-    uint64_t h = phys_->CreateDebrisBodyXf(
-        voxels, xf, densityOf_, /*allowKinematic=*/hostIdx < count, pitch);
-    if (h == 0) {
-      std::fprintf(stderr, "debris: Jolt refused a loaded body (skipped)\n");
-      continue;
-    }
-
-    // Re-pack the micro brick from the authoritative lattice — the same
-    // skin-first rule ReskinMicro applies — and mark it OWNED so ReleaseBody
-    // returns its words to the pool like any copy-on-write clone. Variant bits
-    // are stripped: the brick stores plain 8-bit material ids.
-    MicroBodyRef micro{};
-    if (hadMicro && microSet_) {
-      std::vector<PrefabVoxel> mv;
-      const bool fine = skinScale > physScale && !skinVoxels.empty();
-      const std::vector<PrefabVoxel>* src = fine ? &skinVoxels : nullptr;
-      if (src) {
-        mv.reserve(src->size());
-        for (const PrefabVoxel& v : *src)
-          mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu), 0, v.bruise, v.stain});
-      } else {
-        mv.reserve(voxels.size());
-        for (const DebrisVoxel& v : voxels)
-          mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                        (uint16_t)(v.payload & 0xFFu), 0, 0, v.stain});
-      }
-      IVec3 mx{0, 0, 0};
-      for (const PrefabVoxel& v : mv) {
-        mx.x = std::max<int>(mx.x, v.x);
-        mx.y = std::max<int>(mx.y, v.y);
-        mx.z = std::max<int>(mx.z, v.z);
-      }
-      std::string plog;
-      int mi = MicroBodyPack(*microSet_, mv, {mx.x + 1, mx.y + 1, mx.z + 1},
-                             skinScale, "load", plog);
-      if (mi >= 0) {
-        microSet_->owned[mi] = 1;  // freeable: this body is the sole holder
-        micro = MicroBodyRef{(uint32_t)mi, skinScale, dye};
-      } else if (!plog.empty()) {
-        std::fprintf(stderr, "%s", plog.c_str());
-      }
-    }
-
-    AdoptBody(h, std::move(voxels), xf, micro, physScale, std::move(skinVoxels),
-              bleedMat);
+    PendingStrap ps;
+    ps.self = i;
+    ps.host = s.hostIdx;
+    ps.relPos = s.relPos;
+    for (int q = 0; q < 4; q++) ps.relQuat[q] = s.relQuat[q];
+    const uint64_t h = RestoreBody(std::move(s), ps.host < count, false);
+    if (h == 0) continue;
     handleOfSaved[i] = h;
-    if (hostIdx < count) {
-      PendingStrap ps;
-      ps.self = i;
-      ps.host = hostIdx;
-      ps.relPos = relPos;
-      for (int q = 0; q < 4; q++) ps.relQuat[q] = relQuat[q];
-      straps.push_back(ps);
-    }
-    // Reload ASLEEP with zero velocity (worldio.h's rigidbody rule): a settled
-    // pile reloads settled, and rule 2's sleep invariant holds from tick one.
-    phys_->DeactivateBody(h);
+    if (ps.host < count) straps.push_back(ps);
   }
   // Kept for 'ITMS' (ClaimLoadedBody): which restored body each saved index
   // became.
@@ -7574,4 +7643,94 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
       }
   }
   return r.ok;
+}
+
+// ---- ONE STRAP GROUP AS A RECORD (debris.h) ---------------------------------
+
+void DebrisSystem::StrapGroupOf(uint64_t handle,
+                                std::vector<uint64_t>& out) const {
+  const int i = IndexOfHandle(handle);
+  if (i < 0) return;
+  // One hop, always (StrapBody refuses a chain): the host is the body itself
+  // unless it is a follower, and the rest is every follower of that host.
+  const Body& b = bodies_[(size_t)i];
+  const uint64_t host = b.Follower() ? b.wornHost : handle;
+  if (IndexOfHandle(host) < 0) {
+    out.push_back(handle);   // an orphan the next DriveStraps lets go of
+    return;
+  }
+  out.push_back(host);
+  FollowersOf(host, out);
+}
+
+// THE GROUP FORMAT: u32 group version, u32 the per-body version (kSaveVersion),
+// u32 n, then n x (WriteBodyRecord with the strap index LOCAL to the group;
+// u32 flags: bit 0 = Body::dead). Versioned on its own: it is not a 'DBRS'
+// section and must be able to grow a field without moving that one.
+namespace {
+constexpr uint32_t kBodyGroupVersion = 1;
+}
+
+bool DebrisSystem::SaveBodyGroup(const std::vector<uint64_t>& group,
+                                 std::vector<uint8_t>& out) const {
+  std::vector<const Body*> bs;
+  bs.reserve(group.size());
+  for (uint64_t h : group) {
+    const int i = IndexOfHandle(h);
+    if (i < 0) return false;
+    bs.push_back(&bodies_[(size_t)i]);
+  }
+  ByteWriter w{out};
+  w.U32(kBodyGroupVersion);
+  w.U32(kSaveVersion);
+  w.U32((uint32_t)bs.size());
+  for (const Body* b : bs) {
+    uint32_t hostIdx = 0xFFFFFFFFu;
+    if (b->Follower())
+      for (size_t j = 0; j < bs.size(); j++)
+        if (bs[j]->handle == b->wornHost) { hostIdx = (uint32_t)j; break; }
+    WriteBodyRecord(w, *b, hostIdx);
+    w.U32(b->dead ? 1u : 0u);
+  }
+  return true;
+}
+
+bool DebrisSystem::LoadBodyGroup(ByteReader& r, std::vector<uint64_t>& handles) {
+  handles.clear();
+  uint32_t gv = 0, bv = 0, n = 0;
+  if (!r.U32(gv) || !r.U32(bv) || !r.U32(n)) return false;
+  // A strap group is a host and what it wears: a handful of bodies. A count
+  // past this is a corrupt record, refused before anything is reserved.
+  if (gv != kBodyGroupVersion || (bv != kSaveVersion && bv != 4u) || n > 256u) {
+    r.ok = false;
+    return false;
+  }
+  std::vector<SavedBody> recs(n);
+  std::vector<uint32_t> flags(n, 0);
+  for (uint32_t i = 0; i < n; i++) {
+    if (!ReadBodyRecord(r, bv, recs[i])) return false;
+    if (!r.U32(flags[i])) return false;
+  }
+  handles.assign(n, 0);
+  std::vector<uint32_t> hostOf(n, 0xFFFFFFFFu);
+  std::vector<Vec3> relPos(n);
+  std::vector<std::array<float, 4>> relQuat(n);
+  for (uint32_t i = 0; i < n; i++) {
+    hostOf[i] = recs[i].hostIdx;
+    relPos[i] = recs[i].relPos;
+    for (int q = 0; q < 4; q++) relQuat[i][(size_t)q] = recs[i].relQuat[q];
+    handles[i] = RestoreBody(std::move(recs[i]), hostOf[i] < n,
+                             (flags[i] & 1u) != 0);
+  }
+  // The straps second, LoadState's rule: the SAVED offset, not a re-fit.
+  for (uint32_t i = 0; i < n; i++) {
+    if (hostOf[i] >= n || !handles[i] || !handles[hostOf[i]]) continue;
+    if (!StrapBody(handles[i], handles[hostOf[i]])) continue;
+    const int k = IndexOfHandle(handles[i]);
+    if (k < 0) continue;
+    bodies_[(size_t)k].wornRelPos = relPos[i];
+    for (int q = 0; q < 4; q++)
+      bodies_[(size_t)k].wornRelQuat[q] = relQuat[i][(size_t)q];
+  }
+  return true;
 }

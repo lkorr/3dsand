@@ -56,7 +56,8 @@ namespace net {
 // Bumped whenever any record below changes shape. A decoder that sees another
 // number fails the read (ByteReader::ok goes false) instead of guessing.
 // v2 (W2-M): a WireGear is an ItemInstance (adds count and fill).
-inline constexpr uint32_t kMobSyncVersion = 2;
+// v3 (2026-10-08): MobPose::flags (kBladeLive: a ghost can parry).
+inline constexpr uint32_t kMobSyncVersion = 3;
 
 // ---- one piece of kit, BY NAME ---------------------------------------------
 //
@@ -107,6 +108,11 @@ struct MobPose {
   Vec3 origin{};
   float heading = 0;
   uint32_t alive = 1;
+  // kBladeLive: the held item is CUTTING or held in GUARD on the owner, so
+  // a blade swept into it on another machine is PARRIED there (MobSystem::
+  // FindParry reads it on a ghost, which runs no stroke of its own).
+  uint32_t flags = 0;
+  static constexpr uint32_t kBladeLive = 1u << 0;
   std::vector<WireLimbPose> limbs;
 };
 
