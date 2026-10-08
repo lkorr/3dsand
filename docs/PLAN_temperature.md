@@ -110,10 +110,19 @@ foliage's 135, and with the ceiling no source lifts anything past itself.
   SetCurrentTuning: T* 230 at tick 1, X walks 104 -> 220, the wall lights at
   tick 50 (max 200), lava unchanged, knob restored, twice-run identical. The
   detail line carries a per-tick X / X* / awake trace of the first 8 ticks.
-- **Still open.** A field relaxing on the PEND list (no trigger in reach)
-  stops walking when the whole window is proven settled (the heat rows are
-  C_CAACTIVE): X can stall short of X* in a fully asleep world. Harmless to
-  the sim (no transition can fire there) but visible in the F1 readout.
+- **~~Still open~~ FIXED 2026-10-07: the walk no longer stalls in an asleep
+  world.** A field relaxing on the PEND list sets no dirty flag, so the
+  snapshot read `activeChunks == 0` and the CPU proved the window settled
+  while X was still short of X*; every heat row is C_CAACTIVE, so the walk
+  froze (heat-live: X 102 of 114). The snapshot already carries heatMeta
+  words 0..31: `kHmPendCount` (chunks pended this tick) and the new
+  `kHmDueLeft` (due bits heatDue left set, off their tent phase) now feed
+  `Simulation::NoteHeatPending`, and either non-zero withholds the proof
+  exactly as a live gas parcel does. Bounded (rule 2): with X* fixed each
+  pending gap shrinks by >= 1 a tick and a due bit clears within
+  `sim.heatTentEvery` ticks, so the count reaches 0 and the world proves
+  settled again -- a few dozen ticks of content-free rows, not a world kept
+  awake. Gate `heat-live`'s settled clause (X == X*) is the proof.
 
 ## NEXT USES -- what reads the layer besides its own transitions
 

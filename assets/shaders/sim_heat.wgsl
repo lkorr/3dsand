@@ -141,6 +141,10 @@ const HM_ORIGIN : u32 = 8u;
 const HM_ORIGIN_SET : u32 = 11u;
 const HM_PEND_COUNT : u32 = 12u;
 const HM_SHIFT_WHY : u32 = 13u;
+// heat.h kHmDueLeft: due bits heatDue left set this tick (off their phase).
+// With HM_PEND_COUNT it is the CPU's "the field is still moving" input to
+// the settled-tick proof (Simulation::NoteHeatPending).
+const HM_DUE_LEFT : u32 = 15u;
 const HM_PAGES_PEAK : u32 = 16u;
 const HM_REFUSED : u32 = 17u;
 const HM_SRC_PEAK : u32 = 21u;
@@ -275,6 +279,7 @@ fn heatBegin() {
   atomicStore(&heatMeta[HM_SRC_COUNT], 0u);
   atomicStore(&heatMeta[HM_RECOMP_COUNT], 0u);
   atomicStore(&heatMeta[HM_RELAX_COUNT], 0u);
+  atomicStore(&heatMeta[HM_DUE_LEFT], 0u);
   // The day flip: a recompute of every paged chunk the CA has awake (all of
   // them, on the wake-all tick the flip falls on), because X* = coverage x
   // (E - ambient) moves with the ambient.
@@ -716,7 +721,13 @@ fn heatDue(@builtin(global_invocation_id) gid : vec3<u32>,
       if (onPhase || ((f & HF_URGENT) != 0u && trig != 0u)) {
         heatListAdd(slot, HF_RECOMP, HM_RECOMP_COUNT, HM_RECOMP_LIST);
       }
-      if (!onPhase) { continue; }
+      if (!onPhase) {
+        // Still owed on a later phase: counted, so a world the CPU would
+        // otherwise prove settled keeps ticking until the recompute is made
+        // (heat.h kHmDueLeft).
+        atomicAdd(&heatMeta[HM_DUE_LEFT], 1u);
+        continue;
+      }
     }
     atomicAnd(&heatMeta[HM_DUE + (slot >> 5u)], ~bit);
   }
@@ -877,7 +888,11 @@ fn heatTent(@builtin(workgroup_id) wg : vec3<u32>,
 // and smoke round a fire, foliage warming to 60 beside flames that cannot
 // light it -- goes on the PEND list instead: next tick heatPend puts it back
 // on this list and it keeps walking WITHOUT the CA running over it. The heat
-// never stops short of its target, so a stored X never outlives what made it.
+// never stops short of its target, so a stored X never outlives what made it
+// -- including in a world otherwise asleep: every heat row is C_CAACTIVE, so
+// the CPU's settled-tick proof would stop the walk, and a non-zero
+// HM_PEND_COUNT (or HM_DUE_LEFT) in the snapshot withholds that proof until
+// the list is empty (Simulation::NoteHeatPending, 2026-10-07).
 //
 // The mark is allowed only if some chunk of its 3x3x3 is dirty this tick: the
 // CPU's page-table mirror bounds next tick's dirty set by the one-ring of this

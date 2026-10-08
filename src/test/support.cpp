@@ -33,6 +33,7 @@
 #include "sim/currentprim.h"
 #include "sim/trample.h"
 #include "sim/solutes.h"
+#include "sim/heat.h"     // kHmPendCount / kHmDueLeft: Simulation::NoteHeatPending
 #include "sim/stream.h"   // ApplyStructureChanges: Stream::RegenerateChunks
 
 #include <map>
@@ -2390,6 +2391,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
         std::abort();
       }
       sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
+      // The heat walk still owed (pend list, off-phase recomputes): no proof
+      // of settled while it is (Simulation::NoteHeatPending).
+      sim.NoteHeatPending(sn.heat[kHmPendCount] + sn.heat[kHmDueLeft]);
       // The C_GAS latch's disarming input. Latent by design — see the block in
       // Simulation::EncodeTick for why a stale zero cannot turn gas off.
       sim.NoteGasLive(sn.gasCount);

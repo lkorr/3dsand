@@ -2046,7 +2046,13 @@ stone and smoke round a fire, foliage warming to 60 beside flames that cannot
 light it -- sets its bit in the PEND bitset instead, and next tick `heatPend`
 puts it back on the relax list: the field keeps walking to its target without
 the CA running over the chunk, and a stored X never stops short of what made
-it. Before this, every moving chunk was kept awake for the CA: measured on
+it -- in a world otherwise ASLEEP too (2026-10-07): the snapshot's
+`kHmPendCount` + `kHmDueLeft` (heatMeta words the snapshot already carries)
+withhold the CPU's settled-tick proof while non-zero
+(`Simulation::NoteHeatPending`), because every heat row is C_CAACTIVE and the
+proof used to land while a pend-only walk was mid-way (heat-live: X 102 of
+114). The count reaches 0 within a few dozen ticks and the world sleeps
+again. Before this, every moving chunk was kept awake for the CA: measured on
 `--perf village-fire` (same boot state, back to back), the CA's four rows
 30.1 -> 28.7 ms/frame and mean awake chunks 4,086 -> 3,876 (main without heat:
 3,868); `heatSys` unchanged at 2.3 ms.

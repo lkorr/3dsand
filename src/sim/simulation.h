@@ -312,6 +312,22 @@ class Simulation {
     gasLive_ = live;
     if (live != 0) settledProven_ = false;
   }
+  // THE HEAT FIELD IS STILL MOVING (2026-10-07, PLAN_temperature.md's "still
+  // open" stall). `pending` is the snapshot's heatMeta kHmPendCount +
+  // kHmDueLeft: chunks still relaxing on the pend list without a CA mark, and
+  // target recomputes still owed on a later tent phase. Neither sets a dirty
+  // flag, so activeChunks reads 0 and the proof latched while X was short of
+  // X*; every heat row is C_CAACTIVE, so the walk then froze (heat-live: X 102
+  // of 114). Non-zero withholds the proof, exactly as a live gas parcel does.
+  // BOUNDED (rule 2): with X* fixed each pending chunk's gap shrinks by at
+  // least 1 a tick (heatRelax's max(1, ..) step) and a due bit clears on its
+  // phase within sim.heatTentEvery ticks, so the count reaches 0 and the world
+  // proves settled again -- a few dozen ticks of content-free rows, not a
+  // world kept awake. Deterministic: read from the same fixed-latency
+  // snapshot as activeChunks, and it only ever COSTS a skip.
+  void NoteHeatPending(uint32_t pending) {
+    if (pending != 0) settledProven_ = false;
+  }
   void NoteGasSpawns(uint32_t n) { gasSpawnsThisTick_ += n; }
   // Far fire plumes (world.h kGasFarEmitMax). How many frozen-fire emitters
   // the CPU has in the buffer for THIS tick -- the dispatch extent of the

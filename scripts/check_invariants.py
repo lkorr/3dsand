@@ -3226,6 +3226,7 @@ _HEAT_CONSTS = {
     "HM_RELAX_TICKS": "kHmRelaxTicks", "HM_FREES": "kHmFrees", "HM_ALLOCS": "kHmAllocs",
     "HM_RELEASED": "kHmReleased", "HM_LAST_RELAX": "kHmLastRelax",
     "HM_LAST_RECOMP": "kHmLastRecomp", "HM_PROBE_X": "kHmProbeX", "HM_PROBE_E": "kHmProbeE",
+    "HM_PEND_COUNT": "kHmPendCount", "HM_DUE_LEFT": "kHmDueLeft",
     "HM_ARGS": "kHmArgs", "HM_DRAFT_HEAT_CLOCK": "kHmDraftHeatClock", "HM_ENTRY": "kHmEntry", "HM_FLAGS": "kHmFlags",
     "HM_SUMMARY": "kHmSummary", "HM_OWNER": "kHmOwner", "HM_WANT": "kHmWant",
     "HM_SRC_LIST": "kHmSrcList", "HM_RECOMP_LIST": "kHmRecompList",

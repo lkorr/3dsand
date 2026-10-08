@@ -81,6 +81,12 @@ constexpr uint32_t kHeatShiftRelease = 1u, kHeatShiftDawn = 2u, kHeatShiftRetarg
 // The knob epoch heatBegin last saw (heatParams kHpKnobEpoch). Zero after a
 // worldgen or load reset -- which is also when the CPU restarts its epoch.
 constexpr uint32_t kHmKnobEpoch = 14;
+// Due bits heatDue left set this tick, still owed on a later phase (zeroed by
+// heatBegin). With kHmPendCount, the snapshot's "the field is still moving"
+// word: either non-zero withholds the CPU's settled-tick proof
+// (Simulation::NoteHeatPending), so the heat rows -- all C_CAACTIVE -- keep
+// running until the walk reaches X* even in a world otherwise asleep.
+constexpr uint32_t kHmDueLeft = 15;
 // Stats, words 16..31 -- the snapshot carries words 0..31 (kHeatSnapWords).
 constexpr uint32_t kHmPagesPeak = 16;
 constexpr uint32_t kHmRefused = 17;    // monotonic: wanted chunks the pool could not page
