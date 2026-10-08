@@ -520,6 +520,9 @@ add_library(sandvox_core OBJECT
   src/game/prefab.cpp
   src/game/mob.cpp
   src/game/mob_shock.cpp
+  # The death screen's peel: depth layers of a corpse's bricks, drawn as
+  # clones (render only) and read as strata.
+  src/game/autopsy.cpp
   # Fork-join pool for the per-creature pure passes (PLAN_fight64_perf M).
   src/game/workpool.cpp
   # What one creature looks like on the wire: the four records mob ownership

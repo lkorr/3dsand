@@ -21,6 +21,7 @@
 #include <GLFW/glfw3.h>
 
 #include "audio/cues.h"
+#include "game/autopsy.h"
 #include "game/avatar.h"
 #include "sim/trample.h"
 #include "sim/plants.h"
@@ -1364,6 +1365,32 @@ struct SlotCoat {
     return best;
   }
 };
+
+// HOW EACH MATERIAL READS IN AN AUTOPSY (game/autopsy.h Kind), from the same
+// tables the health column's tissue counts use, so the post-mortem and the
+// triage cannot disagree about what is rot and what is char. A micro voxel's
+// material is 8 bits, hence 256.
+void AutopsyKinds(const BurnMats& burnMats, const TissueMats& tissueMats,
+                  const std::vector<MaterialDef>& mats, uint8_t out[256]) {
+  for (int m = 0; m < 256; m++) {
+    out[m] = autopsy::kOther;
+    if ((size_t)m >= mats.size()) continue;
+    for (const std::string& t : mats[(size_t)m].tags)
+      if (t == "organic" || t == "soft_tissue") out[m] = autopsy::kTissue;
+  }
+  for (uint32_t m : {tissueMats.skin, tissueMats.flesh, tissueMats.muscle,
+                     tissueMats.bone, tissueMats.brain})
+    if (m && m < 256) out[m] = autopsy::kTissue;
+  for (int m = 0; m < 256 && (size_t)m < mats.size(); m++)
+    for (const std::string& t : mats[(size_t)m].tags)
+      if (t == "hot") out[m] = autopsy::kBurn;
+  for (uint32_t m : burnMats.cooked)
+    if (m < 256) out[m] = autopsy::kBurn;
+  for (uint32_t m : burnMats.charred)
+    if (m < 256) out[m] = autopsy::kBurn;
+  for (uint32_t m : tissueMats.rot)
+    if (m < 256) out[m] = autopsy::kInfection;
+}
 
 void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
                 const TissueMats& tissueMats,
@@ -7176,13 +7203,36 @@ int main(int argc, char** argv) {
   // EVERY render pipeline when it changes. A portrait in RGBA8 beside a
   // BGRA8 swapchain would therefore rebuild the whole render pipeline set
   // TWICE PER FRAME for as long as the screen was open.
+  //
+  // EIGHT SIZES, ALL 5:7 (2026-10-08; UIState::portraitTierTex). The panel picks
+  // the largest that fits the screen each frame, and the death screen's
+  // post-mortem takes the biggest it can. Made and registered ONCE: a target
+  // re-made on a resize would free a descriptor set an in-flight frame may
+  // still sample. The aspect is the same at every tier, so the camera below
+  // (kPortraitW / kPortraitH) frames them all identically; only the pixel
+  // count changes. ~13 MiB for the set at BGRA8.
   constexpr uint32_t kPortraitW = 320, kPortraitH = 448;
-  rhi::Texture portraitTexture = ctx.device.CreateTexture(
-      {kPortraitW, kPortraitH, 1}, ctx.surfaceFormat,
-      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::TextureBinding,
-      "avatarPortrait");
-  rhi::TextureView portraitView = portraitTexture.CreateView();
-  ui.portraitTex = overlay.RegisterTexture(portraitView);
+  constexpr uint32_t kPortraitTierW[UIState::kPortraitTiers] = {320, 360, 400, 440,
+                                                                 480, 560, 640, 720};
+  rhi::Texture portraitTierTexture[UIState::kPortraitTiers];
+  rhi::TextureView portraitTierView[UIState::kPortraitTiers];
+  for (int t = 0; t < UIState::kPortraitTiers; t++) {
+    const uint32_t tw = kPortraitTierW[t], th = tw * 7 / 5;
+    portraitTierTexture[t] = ctx.device.CreateTexture(
+        {tw, th, 1}, ctx.surfaceFormat,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::TextureBinding,
+        "avatarPortrait");
+    portraitTierView[t] = portraitTierTexture[t].CreateView();
+    ui.portraitTierTex[t].tex = overlay.RegisterTexture(portraitTierView[t]);
+    ui.portraitTierTex[t].w = (int)tw;
+    ui.portraitTierTex[t].h = (int)th;
+  }
+  rhi::TextureView portraitView = portraitTierView[0];
+  ui.portraitTex = ui.portraitTierTex[0].tex;
+  // THE AUTOPSY'S PEEL (game/autopsy.h): clones of the corpse's bricks with
+  // the outer layers cleared, drawn by the portrait pass in place of the real
+  // ones while a death screen asks for a peel. Render-only.
+  autopsy::Peeler autopsyPeeler;
   // ---- THE ALCHEMY BENCH'S PICTURE (game/alchemy_bench.h) -----------------
   // Drawn on the CPU by the bench's sim and copied in each frame it is open
   // (rhi CopyBufferToTexture, from a staging buffer the queue writes). RGBA8
@@ -7910,6 +7960,11 @@ int main(int argc, char** argv) {
     ui.portraitPivotSlot = -1;
     ui.portraitReset = false;
     ui.portraitFocusSlot = -1;
+    // A new death opens on the post-mortem, at the skin, everything shown.
+    ui.autopsy.open = true;
+    ui.autopsy.peel = 0;
+    ui.autopsy.hideGear = false;
+    ui.autopsy.isolate = false;
     deathBody.yaw = avatarHeading;
     CollectLimbBoxes(avatar, phys, deathBody.boxes);
     // EVERY PART, not just the def's limbs: the box list above is deliberately
@@ -7929,6 +7984,8 @@ int main(int argc, char** argv) {
       fl.xf.quat[0] = rot.x; fl.xf.quat[1] = rot.y;
       fl.xf.quat[2] = rot.z; fl.xf.quat[3] = rot.w;
       fl.haveLive = phys.GetTransform(fl.body, fl.lastLive);
+      fl.isLimb = avatar.Def() && i < (int)avatar.Def()->limbs.size();
+      fl.figSlot = fl.isLimb ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1;
       deathBody.limbs.push_back(fl);
     }
     deathBody.have = !deathBody.boxes.Empty() && !deathBody.limbs.empty();
@@ -11966,7 +12023,12 @@ int main(int argc, char** argv) {
       // Sixth: the same corpse, turned. If the pose override ever stops
       // working this picture is the one that says so — by then the real
       // corpse has been ragdolling for a second and is nowhere near this.
-      if (frameCounter == kShotInvDeathTurnAt) ui.portraitYaw = 1.4f;
+      // ...and PEELED two layers (the autopsy, game/autopsy.h): the picture
+      // shows the flesh and muscle under the skin, the gear gone.
+      if (frameCounter == kShotInvDeathTurnAt) {
+        ui.portraitYaw = 1.4f;
+        ui.autopsy.peel = 2;
+      }
     }
     glfwPollEvents();
     double now = NowSeconds();
@@ -19088,7 +19150,17 @@ int main(int argc, char** argv) {
         ctx.queue.Submit(sEnc.Finish());
         ui.itemStage.texReady = true;
       }
+      // The autopsy's clones live only as long as the death screen that asked
+      // for them: the moment the body is rebuilt they are freed.
+      if (!deathFrozen &&
+          (autopsyPeeler.ClonesLive() > 0 || autopsyPeeler.MaxDepth() >= 0))
+        autopsyPeeler.Release(mbSet);
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
+        // THE TIER THE PANEL PICKED this frame (UIState::portraitTierTex): the
+        // draw list already samples that texture, so this pass must fill it.
+        const int pTier = std::clamp(ui.portraitTier, 0, UIState::kPortraitTiers - 1);
+        const uint32_t pW = (uint32_t)ui.portraitTierTex[pTier].w;
+        const uint32_t pH = (uint32_t)ui.portraitTierTex[pTier].h;
         // THE WHOLE BODY, ALWAYS — but only a mask that actually hides
         // something needs swapping (third person hides nothing). The arena
         // keeps a hidden part's span alive between toggles (kKeepCommits), so
@@ -19132,6 +19204,56 @@ int main(int argc, char** argv) {
         }
         microInsts.clear();
         bodyReg.BuildMicroInsts(microInsts);
+        // THE AUTOPSY (game/autopsy.h). On a corpse the instance list is
+        // rewritten for this one draw: each of the body's parts is matched by
+        // its physics handle (the same match the death pose uses), its brick is
+        // swapped for a peeled clone, and gear / unselected parts drop out when
+        // the panel asks. Nothing outside this list changes, so the main view
+        // and the corpse itself never see a peel.
+        if (deathFrozen && deathBody.have) {
+          std::vector<uint64_t> handles;
+          bodyReg.BuildHandles(handles);
+          std::vector<autopsy::Part> parts;
+          std::vector<int> instPart(microInsts.size(), -1);
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            const uint32_t sl = microInsts[k].slot;
+            if (sl >= handles.size() || !handles[sl]) continue;
+            for (const auto& fl : deathBody.limbs) {
+              if (fl.body != handles[sl]) continue;
+              instPart[k] = (int)parts.size();
+              parts.push_back({microInsts[k].model, fl.figSlot, fl.isLimb});
+              break;
+            }
+          }
+          uint8_t kinds[256];
+          AutopsyKinds(burnMats, tissueMats, mats, kinds);
+          autopsyPeeler.Update(mbSet, parts, std::max(0, ui.autopsy.peel), now,
+                               UIState::kSlotCount);
+          autopsy::FillUI(autopsyPeeler, kinds, mats, ui);
+          const bool peeling = ui.autopsy.peel > 0;
+          const int iso = ui.autopsy.isolate ? ui.inspectSelected : -1;
+          size_t keep = 0;
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            MicroBodyInstGpu in = microInsts[k];
+            if (instPart[k] >= 0) {
+              const autopsy::Part& pp = parts[(size_t)instPart[k]];
+              // Gear goes with any peel: a robe over a peeled torso would hide
+              // exactly what the peel was for.
+              if (!pp.isLimb && (ui.autopsy.hideGear || peeling || iso >= 0)) continue;
+              if (iso >= 0 && pp.figSlot != iso) continue;
+              if (pp.isLimb) {
+                const uint32_t dm = autopsyPeeler.DrawModel(in.model);
+                if (dm == autopsy::Peeler::kHidden) continue;
+                in.model = dm;
+              }
+            }
+            microInsts[keep++] = in;
+          }
+          microInsts.resize(keep);
+          // The clones' bricks, before the encoder below exists (queued
+          // writes drain at the head of the NEXT command buffer).
+          if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+        }
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
         // bodyXf carries the death pose here when there is one, so the cull
         // tests the pose the portrait draws.
@@ -19144,17 +19266,17 @@ int main(int argc, char** argv) {
         // WriteRenderParams in test/support.h).
         WriteRenderParams(ctx.queue, world, portraitCam.eye, portraitCam.cam,
                           portraitCam.aspect, /*shadows=*/true, (float)now,
-                          /*fogDensity=*/0.0f, (float)kPortraitH,
+                          /*fogDensity=*/0.0f, (float)pH,
                           kPortraitLightTick, fluidCount,
-                          /*frameFrac=*/0.0f, /*extraFlags=*/0u, kPortraitW,
-                          kPortraitH, /*auxView=*/true);
+                          /*frameFrac=*/0.0f, /*extraFlags=*/0u, pW,
+                          pH, /*auxView=*/true);
         rhi::CommandEncoder pEnc = ctx.device.CreateCommandEncoder();
         // Near-black indigo, the panel's own deepest tone, so the portrait
         // reads as an inset rather than as a hole punched in the sheet.
         const float kPortraitClear[4] = {0.055f, 0.048f, 0.086f, 1.0f};
         rhi::RenderPass pRp =
-            sim.BeginAuxRenderPass(pEnc, portraitView, ctx.surfaceFormat,
-                                   kPortraitW, kPortraitH, kPortraitClear);
+            sim.BeginAuxRenderPass(pEnc, portraitTierView[pTier], ctx.surfaceFormat,
+                                   pW, pH, kPortraitClear);
         sim.DrawWorld(pRp);
         sim.DrawParticles(pRp);
         if (CurrentTuning().render.fluidSurface < 0.5f) sim.DrawFluid(pRp, fluidCount);

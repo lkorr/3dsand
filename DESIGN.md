@@ -14238,6 +14238,54 @@ health column with the worst limb selected whenever `deathScreen` is set
 (`deathScreenOpened`). The HUD carries the only thing that has to be said
 immediately: `DEAD - I to respawn`.
 
+**The post-mortem and the autopsy (2026-10-08).** A death no longer lands on the
+character sheet: it lands on its own screen (`PostMortemScreen` in
+`ui/inventory_ui.cpp`, chosen by `UIState::autopsy.open`; "character sheet" on its
+band goes back to the old layout, whose death banner has an "autopsy" button to
+return). Three panels under a blood-red band: AUTOPSY (cause glyph and verdict,
+the toll, the findings, a core sample), THE BODY (the portrait at the biggest size
+the screen allows, a depth gauge beside it, the peel controls and what the
+exposed layer is made of in a strip beside that), and THE PARTS (the ordinary
+`VitalsColumn` without its banner).
+
+The portrait now comes in **eight sizes, all 5:7** (`UIState::portraitTierTex`,
+320x448 up to 720x1008), made and registered once at startup — re-making a target
+on a resize would free a descriptor set an in-flight frame still samples
+(`UnregisterTexture` is immediate), and the ImGui descriptor pool is a fixed budget
+(raised from the minimum 8 to 32 for them). Both layouts pick the largest tier
+that fits each frame (`portraitTier`), and main.cpp renders the portrait pass
+into that tier *after* the UI is built, so the texture the draw list samples is
+the one rendered that frame. The camera's aspect is the same at every tier.
+
+**The peel is the tuner's Models-tab peel on the corpse** (`game/autopsy.h`).
+Depth from the surface is a multi-source 6-connected BFS per limb brick, depth 0
+= a cell with an exposed face (anatomy.js's convention); a brick face that is a
+JOINT (`MicroBodyModelGpu::cutFaces`) counts as interior, which is what the
+tuner's union-of-limbs measurement would have said, so a peeled forearm does not
+open a ring at the elbow. Peel N clones each of the corpse's limb bricks
+(`MicroBodyClone`), clears every cell shallower than N in the clone, and the
+portrait pass swaps the clone's model index into its own instance list for that
+one draw (the parts are matched by physics handle, as the death pose is). **It
+is render-only end to end**: the corpse's bricks, its debris voxels and the
+hashed grid never see a peel, the main view never draws a clone, and the clones
+are freed at peel 0, on respawn, and when the brick they copy changes (a corpse
+still burning re-peels at most every 0.25 s). A materials reload replaces the
+micro set wholesale, so the peeler keys on `MicroBodySet::epoch` and forgets —
+never frees — indices from a set that no longer exists. Any peel also drops the
+worn and held parts from the picture (a robe over a peeled chest hides what the
+peel is for); "isolate" draws the selected part alone.
+
+The same depth fields are the readout: per layer, per figure slot, what the body
+is made of there (`autopsy::Strata`, mirrored by `autopsy::FillUI`). Materials
+are classed by the tables the health column already uses (`AutopsyKinds` in
+main.cpp: tissue / burn / infection), and every burn or infection material in a
+part is a FINDING with the shallowest and deepest layer it reached — "venom in
+the left forearm, layers 1-4 of 6" — clicking which selects the part, frames it
+and peels to that depth. Gate `autopsy-peel` (CPU only) pins the depth field, the
+joint rule, the clone, the source left untouched, the strata, the findings and
+the epoch rule on a packed cube; `--shot-inventory`'s turned death picture is
+peeled two layers.
+
 Four gates (`selftest_combat.cpp`, at the end of the mob group):
 `npc-strike` (the AI's own request becomes a windup, a cut and lost voxels; then
 three scripted strikes of one style all land); `npc-block` (a guard across the

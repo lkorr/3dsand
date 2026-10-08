@@ -906,6 +906,64 @@ struct UIState {
   // it has nothing to do with.
   uint32_t triageOpen = 0;
 
+  // ---- THE AUTOPSY (game/autopsy.h; the post-mortem screen) -----------------
+  // The death screen's peel: the tuner's Models-tab peel, on the body that
+  // died. The panel writes the three controls; main.cpp runs autopsy::Peeler
+  // in the portrait pass and mirrors its strata back here
+  // (autopsy::FillUI). Render-only from end to end: a peel draws clones of the
+  // corpse's bricks and changes nothing about the corpse.
+  struct AutopsyUI {
+    // The post-mortem layout (true) or the ordinary character sheet with the
+    // death banner on it (false). A death opens the post-mortem.
+    bool open = true;
+    // ---- controls (the panel writes, main.cpp reads) ----
+    int peel = 0;            // depth layers hidden, 0 = the skin
+    bool hideGear = false;   // garments and held items not drawn
+    bool isolate = false;    // only the selected part drawn
+    // ---- the readout (main.cpp writes) ----
+    int maxDepth = -1;       // deepest layer in the body, -1 = not measured
+    uint32_t gen = 0;        // bumped when the strata below were re-measured
+    int clonesLive = 0;      // peeled bricks currently drawn
+    uint32_t refusals = 0;   // bricks the micro pool refused to clone
+    // What a material reads as. Mirrors autopsy::Kind (this header includes
+    // no game header): 0 other, 1 tissue, 2 burn, 3 infection.
+    static constexpr int kLegend = 32;
+    struct Legend {
+      uint32_t color = 0;     // ImU32, opaque
+      uint8_t kind = 0;
+      char label[24] = {};
+      uint32_t count = 0;     // cells in the whole body
+    };
+    Legend legend[kLegend];
+    int legendCount = 0;
+    // One depth layer: its cells, and its heaviest materials (legend indices).
+    static constexpr int kLayers = 32;
+    static constexpr int kLayerMats = 5;
+    struct Layer {
+      uint32_t total = 0;
+      uint8_t n = 0;
+      uint8_t leg[kLayerMats] = {};
+      uint32_t count[kLayerMats] = {};
+    };
+    Layer body[kLayers];
+    int bodyDepth = -1;
+    Layer part[kSlotCount][kLayers];
+    int partDepth[kSlotCount] = {};
+    // FINDINGS: every damage material (burn / infection) per part, with the
+    // shallowest and deepest layer it was found at — "venom reaches layer 5
+    // of the torso" is the sentence an autopsy exists to say.
+    static constexpr int kFindings = 12;
+    struct Finding {
+      uint8_t leg = 0;
+      int8_t slot = -1;
+      uint8_t shallowest = 0, deepest = 0;
+      uint32_t count = 0;
+    };
+    Finding findings[kFindings];
+    int findingCount = 0;
+  };
+  AutopsyUI autopsy;
+
   // ---- the live avatar portrait (main.cpp's second render pass) ------------
   // `portraitTex` is an ImTextureID (a VkDescriptorSet behind the scenes) that
   // Overlay::RegisterTexture handed back; 0 means "not registered yet, draw
@@ -913,6 +971,24 @@ struct UIState {
   // stays free of imgui.h — main.cpp includes it and must not need ImGui.
   uint64_t portraitTex = 0;
   int portraitW = 0, portraitH = 0;
+  // ---- PORTRAIT SIZE TIERS (2026-10-08) -------------------------------------
+  // The portrait was one fixed 320x448 target, which on a 1440p screen is a
+  // postage stamp of a body you are meant to read wounds off. It now comes in
+  // kPortraitTiers sizes, all 5:7, all made and registered once at startup —
+  // re-making one on a resize would free a descriptor set an in-flight frame
+  // may still be sampling (Overlay::UnregisterTexture is immediate). The panel
+  // picks the largest tier that fits each frame (`portraitTier`), and copies
+  // that tier into portraitTex/W/H above before it draws; main.cpp renders the
+  // portrait pass into the same tier AFTER the UI is built, so the texture the
+  // draw list samples is the one rendered this frame. The image stays 1:1 on
+  // screen at every tier: bigger means more pixels, never blurrier ones.
+  static constexpr int kPortraitTiers = 8;
+  struct PortraitTierTex {
+    uint64_t tex = 0;
+    int w = 0, h = 0;
+  };
+  PortraitTierTex portraitTierTex[kPortraitTiers];
+  int portraitTier = 0;
   // Orbit, radians. Written by the panel's drag and READ by main.cpp when it
   // places the portrait camera — the same shape as brushRadius, i.e. a view
   // parameter the UI is allowed to edit because nothing in the world depends

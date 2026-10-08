@@ -60,8 +60,13 @@ bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
   info.Device = be->Device();
   info.QueueFamily = be->QueueFamily();
   info.Queue = be->GpuQueue();
-  // Let the backend create its own descriptor pool (font atlas + a few).
-  info.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE;
+  // Let the backend create its own descriptor pool. It is a FIXED budget of
+  // combined image samplers, one per RegisterTexture and per atlas page, and
+  // exhausting it does not fail cleanly: the next texture update reads a null
+  // set inside the driver. The minimum (8) held the atlas, the chrome, the
+  // bench, the item stage and one portrait; the portrait's eight size tiers
+  // (UIState::portraitTierTex, 2026-10-08) took it past that. 32 leaves room.
+  info.DescriptorPoolSize = 32;
   info.MinImageCount = 2;
   info.ImageCount = be->SwapchainImageCount() >= 2 ? be->SwapchainImageCount() : 2;
   // Same dynamic-rendering scope as the world pass it draws into; the

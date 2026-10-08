@@ -325,6 +325,12 @@ struct DeathBody {
     BodyXformGpu xf{};
     BodyTransform lastLive{};  // where `body` was the last frame it was alive
     bool haveLive = false;
+    // What this part IS, for the death screen's autopsy (game/autopsy.h):
+    // its figure slot (BodySlotFor, -1 = none) and whether it is one of the
+    // def's limbs (false = a garment shell or a held item, which the peel
+    // never cuts and "hide gear" takes away).
+    int figSlot = -1;
+    bool isLimb = false;
   };
   bool have = false;
   float yaw = 0.0f;         // the body's facing, so the orbit keeps a front

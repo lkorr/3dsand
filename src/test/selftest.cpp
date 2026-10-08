@@ -934,6 +934,8 @@ const char* const kOrder[] = {
     // (DESIGN.md §8b "The item stage"). Regenerates the ground like
     // coat-transfer, poses one creature with direct phase calls, never ticks.
     "item-stage",
+    // The death screen's peel on a packed cube: CPU only (game/autopsy.h).
+    "autopsy-peel",
     "wound-rebleed",
     // ...and a mace MARKS a corpse and leaves it crumbling, instead of boring
     // an instant sphere out of it: the same three-rung ladder the living
