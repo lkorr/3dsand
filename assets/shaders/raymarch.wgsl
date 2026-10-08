@@ -11688,7 +11688,15 @@ fn fluidYMaskOf(wc : vec3<i32>) -> u32 {
 }
 
 fn fluidChunkClass(wc : vec3<i32>) -> u32 {
-  if (!chunkResident(wc, R.origin)) { return 0u; }
+  // The near-block bit first: inside the live box most chunks the walk meets
+  // are empty (class 0), and the bit says so on one load where the tests
+  // below spend seven slot lookups (self + six neighbours) to reach the same
+  // answer. A set bit falls through to the exact classification.
+  let ns = chunkSlotOf(wc, R.origin);
+  if (ns == SLOT_NONE ||
+      ((fluidBlockMapR[fbmNearWord(ns)] >> (ns & 31u)) & 1u) == 0u) {
+    return 0u;
+  }
   if (fluidChunkWater(wc)) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
   // fluidCellAt still returns non-zero density there (virtual mass from
@@ -11877,6 +11885,14 @@ fn windowExitT(ro : vec3f, rdIn : vec3f) -> f32 {
 // common.wgsl on purpose: an edit there recompiles every shader).
 fn fbmBoxIndex() -> u32 { return 2u * NUM_SLOTS; }
 const FBM_BOX_BIAS : i32 = 0x40000000;
+// ---- NEAR-BLOCK BITS: one bit per slot, "a block is here or a face away" --
+// After the box's 8-word tail, NUM_SLOTS bits. Set by `alloc` for every
+// assigned block's slot and its six face neighbours, retired by the next
+// alloc's phase A (which walks LAST tick's list and clears those words). A slot
+// whose bit is clear can be neither a water chunk nor a ring chunk, so the
+// renderer's chunk walk classes it on ONE load instead of seven lookups.
+// Render-only. THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl.
+fn fbmNearWord(slot : u32) -> u32 { return 2u * NUM_SLOTS + 8u + (slot >> 5u); }
 
 // The ray span inside the live block box grown by ONE chunk — the reach of
 // fluidChunkClass's ring (class 2), the farthest from a block any field sample

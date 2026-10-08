@@ -689,6 +689,23 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
 // common.wgsl on purpose: an edit there recompiles every shader).
 fn fbmBoxIndex() -> u32 { return 2u * NUM_SLOTS; }
 const FBM_BOX_BIAS : i32 = 0x40000000;
+// ---- NEAR-BLOCK BITS: one bit per slot, "a block is here or a face away" --
+// After the box's 8-word tail, NUM_SLOTS bits. Set by `alloc` for every
+// assigned block's slot and its six face neighbours, retired by the next
+// alloc's phase A (which walks LAST tick's list and clears those words). A slot
+// whose bit is clear can be neither a water chunk nor a ring chunk, so the
+// renderer's chunk walk classes it on ONE load instead of seven lookups.
+// Render-only. THE SAME DECLARATION LIVES IN sim_fluid.wgsl AND raymarch.wgsl.
+fn fbmNearWord(slot : u32) -> u32 { return 2u * NUM_SLOTS + 8u + (slot >> 5u); }
+
+// A slot (k = 0) or one of its six face neighbours (k = 1..6); SLOT_NONE for a
+// neighbour outside the window with no ticket.
+fn fbmNearSlot(s : u32, k : u32) -> u32 {
+  if (k == 0u) { return s; }
+  var d = vec3<i32>(0);
+  d[(k - 1u) >> 1u] = select(-1, 1, (k & 1u) == 0u);
+  return chunkSlotOf(slotWorldChunk(s, T.origin) + d, T.origin);
+}
 
 // ---- alloc: deterministic block assignment + node-pass dispatch args --------
 // ONE workgroup. Each thread counts the marks in its 128-slot span, thread 0
@@ -722,6 +739,12 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   for (var i = li; i < prevBlocks; i += 256u) {
     let s = fluidBlockList[i];
     atomicStore(&fluidBlockMap[fbmYMaskIndex(s)], 0u);
+    // Whole words: every bit in them was set from LAST tick's list (phase B
+    // below rebuilds the lot), so clearing a neighbour's word loses nothing.
+    for (var k = 0u; k < 7u; k++) {
+      let ns = fbmNearSlot(s, k);
+      if (ns != SLOT_NONE) { atomicStore(&fluidBlockMap[fbmNearWord(ns)], 0u); }
+    }
     atomicAnd(&fluidBlockMap[s], MAP_MARK);
   }
   // The live block box restarts EMPTY (min > max) every tick; the assignment
@@ -786,6 +809,12 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
       for (var k = 0u; k < 3u; k++) {
         atomicMin(&fluidBlockMap[fbmBoxIndex() + k], bw[k]);
         atomicMax(&fluidBlockMap[fbmBoxIndex() + 3u + k], bw[k]);
+      }
+      for (var k = 0u; k < 7u; k++) {
+        let ns = fbmNearSlot(s, k);
+        if (ns != SLOT_NONE) {
+          atomicOr(&fluidBlockMap[fbmNearWord(ns)], 1u << (ns & 31u));
+        }
       }
     } else {
       atomicStore(&fluidBlockMap[s], 0u);  // over budget: freeze this chunk

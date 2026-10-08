@@ -357,11 +357,13 @@ void World::Init(const rhi::Device& device) {
                                U::Storage | U::CopyDst, "fluidSpawnOps");
   // TWO kNumSlots arrays: [slot] = blockIdx+1, [kNumSlots + slot] = the
   // chunk's 16-bit Y-OCCUPANCY mask (world.h), then an 8-word tail whose first
-  // six are the render's LIVE BLOCK BOX (sim_fluid.wgsl fbmBoxIndex). The
-  // whole-buffer Fill at the head of PT_FLUIDMAP clears all of it, which is
-  // what the mask needs (and a zeroed box can only describe chunks far outside
-  // any window, i.e. no fluid).
-  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumSlots * 2 * 4 + 8 * 4,
+  // six are the render's LIVE BLOCK BOX (sim_fluid.wgsl fbmBoxIndex), then one
+  // render-only NEAR-BLOCK bit per slot (fbmNearWord). The whole-buffer Fill
+  // at the head of PT_FLUIDMAP clears all of it, which is what the mask and
+  // the bits need (and a zeroed box can only describe chunks far outside any
+  // window, i.e. no fluid).
+  fluidBlockMap = CreateBuffer(
+      device, ((uint64_t)kNumSlots * 2 + 8 + (kNumSlots + 31) / 32) * 4,
                                U::Storage | U::CopyDst, "fluidBlockMap");
   fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4,
                                 U::Storage | U::CopySrc, "fluidBlockList");
