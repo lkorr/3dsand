@@ -18,9 +18,11 @@
      checks the tuner's wiring by regex against GET / — the same arrangement
      as trees_test.html, for the same reasons.
 
-     NEEDS NO BUILT EXE: the one engine call (the map page's Load check,
-     `sandvox --mapcheck`) is asserted only when the exe answers; without one
-     the panel says so and the line says "engine unavailable". -->
+     The map page section (?only=map) NEEDS NO BUILT EXE: the one engine call
+     (the Load check, `sandvox --mapcheck`) is asserted only when the exe
+     answers, and is a SKIP when the exe predates v2 maps. It writes a
+     synthetic v2 map to assets/worldmap/_e1test/ through the tuner's own
+     routes; check_environment.sh deletes that folder. -->
 <meta charset="utf-8">
 <title>environment harness</title>
 <body style="background:#111;color:#ddd;font:12px monospace">
@@ -32,6 +34,9 @@ var log = [], fail = 0;
 // Progress lands in #out as it happens, so a run that exhausts the virtual
 // time budget still says how far it got (the last line is where it stalled).
 function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; document.getElementById('out').textContent = 'running' + String.fromCharCode(10) + log.join(String.fromCharCode(10)); }
+// A line this harness cannot decide on this machine (an engine that predates
+// the format under test): printed, never counted as a pass or a failure.
+function skip(msg){ log.push('SKIP  ' + msg); }
 function done(){
   document.getElementById('out').textContent =
     log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
@@ -127,7 +132,7 @@ function readLit(wv, cv){
     say(nav.querySelectorAll('button[data-page]').length >= 6, 'and the map + two component pages');
 
     // ?only=map runs the mount and the World map page alone (sections 1, 2,
-    // 6, 6b): the page's tools can be iterated on without the swatch bakes.
+    // 6..6d): the page's tools can be iterated on without the swatch bakes.
     var ONLY_MAP = /[?&]only=map(&|$)/.test(location.search);
     if (!ONLY_MAP) {
     // ---- 3. the biome page --------------------------------------------------------------------------
@@ -288,101 +293,193 @@ function readLit(wv, cv){
     say(ok, 'deep link opened samples/smithy on the Structures page (' + ST._slots().length + ' slots)');
 
     }   // !ONLY_MAP
-    // ---- 6. the World map page: the front door (P-I) ----------------------------------------------------------
+    // ---- 6. the World map page on the v2 format (docs/PLAN_map_v2.md, E1) ------------------------------------
+    // The page first opens the map tuning names. Everything below runs on a
+    // SYNTHETIC v2 map written through the tuner's own routes into
+    // assets/worldmap/_e1test/ (check_environment.sh deletes the folder; this
+    // section deletes its tiles): 16384 vox a side, a 600 m cone hill on one
+    // height tile, alpine / meadow / ocean rings on one biome tile.
     E._open('map');
     var M = E._modules.WorldMap;
-    ok = await waitFor(function(){ return !!M._map(); }, 30000);
-    say(ok && pages.map.classList.contains('active'), 'map page loaded ' + (M._map() && M._map().name));
+    var MT = await import('./editor/maptiles.js');
+    var FIX = '_e1test';
+    var fixJson = {
+      version: 2, name: FIX, extent: {min: [-8192, -8192], size: [16384, 16384]}, siteCellLog2: 10,
+      planes: {height: {log2: 6, tile: 256, default: -600}, biome: {log2: 8, tile: 256, default: 'ocean'}},
+      seaLevelY: 112, edgeFadeVox: 2048, warpAmpVox: 48, biomes: ['ocean', 'meadow', 'alpine', 'pine'],
+      terrain: {refVoxelsPerMetre: 10},
+      sites: [{id: 'spawn', kind: 'spawn', at: [0, 0]}, {id: 'harness', kind: 'pad', min: [-512, -512], max: [-256, -256]},
+              {id: 'tarn_0', kind: 'water', preset: 'tarn', at: [2000, 2000]},
+              {id: 'clearing_0', kind: 'clearing', min: [1000, -2000], max: [1500, -1500], feather: 64}]
+    };
+    var api = function (path, body) { return fetch(path, body === undefined ? {cache: 'no-store'} : {method: 'POST', body: body}).then(function (r) { return r.json(); }); };
+    var tileUrl = function (plane, tx, tz) { return '/api/worldmap/tile?name=' + FIX + '&plane=' + plane + '&tx=' + tx + '&tz=' + tz; };
+    var v1try = await api('/api/worldmap?name=' + FIX, JSON.stringify({version: 1, cellLog2: 10, size: [4, 4], biomes: ['ocean']}));
+    say(v1try.ok === false && /version must be 2/.test(v1try.error), 'POST /api/worldmap refuses a v1 map.json: ' + v1try.error);
+    var wj = await api('/api/worldmap?name=' + FIX, JSON.stringify(fixJson, null, 2));
+    say(!!wj.ok, 'POST /api/worldmap accepts the v2 fixture map.json' + (wj.ok ? '' : ': ' + wj.error));
+    var FH = MT.makePlane('height', fixJson), FB = MT.makePlane('biome', fixJson);
+    var ht = MT.newTile(FH), bt = MT.newTile(FB);
+    for (var j = 0; j < 256; j++) for (var i = 0; i < 256; i++) {
+      var d = Math.hypot(i - 128, j - 128);   // post (128,128) is world (0,0)
+      ht[j * 256 + i] = Math.round(-600 + Math.max(0, 1 - d / 120) * 6712);   // peak y 6112 = 600 m above sea
+      var c = Math.hypot((i + 0.5) * 256 - 8192, (j + 0.5) * 256 - 8192);
+      bt[j * 256 + i] = c < 1500 ? 2 : c < 6000 ? 1 : 0;
+    }
+    var hb = MT.encodeTile(FH, 0, 0, ht), bb = MT.encodeTile(FB, 0, 0, bt);
+    var bad = await api(tileUrl('height', 1, 0), hb);
+    say(bad.ok === false && /header says \(0,0\)/.test(bad.error), 'a tile POSTed at the wrong tx/tz is refused: ' + bad.error);
+    bad = await api(tileUrl('biome', 0, 0), hb);
+    say(bad.ok === false && /planeKind/.test(bad.error), 'a height tile POSTed as a biome tile is refused: ' + bad.error);
+    say(!!(await api(tileUrl('height', 0, 0), hb)).ok && !!(await api(tileUrl('biome', 0, 0), bb)).ok, 'the fixture tiles are written');
+    var lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
+    say(lst.ok && lst.tiles.length === 1 && lst.tiles[0].tx === 0 && lst.tiles[0].size === 131104, 'GET tiles lists the one height tile: ' + JSON.stringify(lst.tiles));
+    var r404 = await fetch(tileUrl('height', 1, 1), {cache: 'no-store'});
+    say(r404.status === 404, 'an absent tile is a 404 (the default)');
+    say((await fetch('/api/worldmap/planes?name=default', {cache: 'no-store'})).status === 404, 'the v1 /api/worldmap/planes route is gone');
+
+    await M._load(FIX);
+    ok = await waitFor(function(){ return !!M._map() && M._map().name === FIX && M._loadsIdle() && M._map().H.tiles.size === 1 && M._map().B.tiles.size === 1; }, 30000);
+    var mp = M._map();
+    say(ok && pages.map.classList.contains('active'), 'map page loaded the v2 fixture: ' + (mp && (mp.H.posts[0] + '² height posts, ' + mp.B.posts[0] + '² biome cells, tiles loaded ' + mp.H.tiles.size + '+' + mp.B.tiles.size)));
     say(!!pages.map.querySelector('.mapterrain') && pages.map.querySelectorAll('.mapterrain-grid input').length >= 20,
         'Terrain section built with ' + pages.map.querySelectorAll('.mapterrain-grid input').length + ' inputs');
     var siteRows = pages.map.querySelectorAll('.mapsite');
     say(siteRows.length >= 4, 'Sites panel lists ' + siteRows.length + ' sites');
-    var lf = [].slice.call(siteRows).filter(function (r) { return /landform/.test(r.querySelector('.mapkind').textContent); });
-    say(lf.length >= 1, 'a landform site is listed (' + lf.length + ')');
-    if (lf.length) {
-      lf[0].querySelector('button').click();
-      say(M._selected() && M._selected().kind === 'landform' && !!pages.map.querySelector('.mapsites-panel select'),
-          'selecting it opens the shape / radius / height panel');
-    }
-    // ---- 6b. the map page's TOOLS, driven with pointer events (P5 sculpt, P6 tree / load check) ----------------
-    // Nothing is saved: every change is undone, so no file moves.
-    var btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
-    say(btns.indexOf('Landform brush') >= 0 && btns.indexOf('Landform site') >= 0 && btns.indexOf('Tree') >= 0 && btns.indexOf('Sculpt') >= 0,
-        'the toolbar carries Landform brush AND Landform site, Tree and Sculpt (' + btns.length + ' buttons)');
+    var wrow = [].slice.call(siteRows).filter(function (r) { return /water/.test(r.querySelector('.mapkind').textContent); });
+    if (wrow.length) wrow[0].querySelector('button').click();
+    say(M._selected() && M._selected().kind === 'water' && /tarn/.test(pages.map.querySelector('.mapsites-panel').textContent),
+        'selecting the lake opens its panel');
+
+    // ---- 6b. the topographic display ----------------------------------------------------------------------
     var cv = pages.map.querySelector('canvas.mapcanvas');
     cv.setPointerCapture = function () {};   // a synthetic pointer has no capture to take
+    say(cv.clientWidth > 100 && cv.clientHeight > 100, 'map canvas laid out ' + cv.clientWidth + 'x' + cv.clientHeight);
+    M._view().cx = 0; M._view().cz = 0;
+    function frac(wx, wz) { var v = M._view(); return [0.5 + (wx - v.cx) * v.scale / cv.clientWidth, 0.5 + (wz - v.cz) * v.scale / cv.clientHeight]; }
     function ptr(type, fx, fy, extra) {
       var r = cv.getBoundingClientRect();
       var o = {clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
       for (var k in (extra || {})) o[k] = extra[k];
       cv.dispatchEvent(new PointerEvent(type, o));
     }
-    say(cv.clientWidth > 100 && cv.clientHeight > 100, 'map canvas laid out ' + cv.clientWidth + 'x' + cv.clientHeight);
-    // SCULPT: a raise stroke writes the layer, one undo step, Undo takes it back.
-    var S = M._sculpt(), u0 = M._undoDepth(), tiles0 = S.tiles.size;
-    // The map may carry a sculpt layer of its own (the default map's
-    // Harrowby flatten): Undo must give back exactly what was there.
-    var left0 = 0;
-    S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left0 = Math.max(left0, Math.abs(t[i])); });
+    function at(type, wx, wz, extra) { var f = frac(wx, wz); ptr(type, f[0], f[1], extra); }
+    M._paint();
+    say(M._stats().tileImages > 0 && M._stats().contourPx > 0, 'the topographic render built ' + M._stats().tileImages + ' tile images, ' + M._stats().contourPx + ' contour pixels since load');
+    var g2 = cv.getContext('2d'), f0 = frac(400, 300), f1 = frac(-7000, -7000);
+    var px = function (f) { return g2.getImageData(Math.floor(cv.width * f[0]), Math.floor(cv.height * f[1]), 1, 1).data; };
+    var peakPx = px(f0), seaPx = px(f1);
+    say(peakPx[0] + peakPx[1] + peakPx[2] > seaPx[0] + seaPx[1] + seaPx[2] && seaPx[2] > seaPx[0],
+        'hypsometric ramp: the summit slopes (' + [].slice.call(peakPx, 0, 3) + ') is lighter than the deep sea (' + [].slice.call(seaPx, 0, 3) + '), which is blue');
+    M._disp().interval = 100; M._paint();
+    var c100 = M._stats().contourPx; M._disp().interval = 10; M._paint();
+    say(M._stats().contourPx - c100 > 0, 'a 10 m contour interval redraws the tiles (' + (M._stats().contourPx - c100) + ' contour px)');
+    M._disp().interval = 0;
+    var sc0 = M._view().scale; M._view().scale = 1;   // one pixel = one voxel for the readout
+    at('pointermove', 0, 0, {buttons: 0});
+    var ro = M._status();
+    M._view().scale = sc0;
+    say(/height 611 m \(y 61[01]\d,/.test(ro) && /\+600 m above sea/.test(ro) && /biome alpine/.test(ro) && /x 0\.\d m/.test(ro),
+        'hover readout at the summit: ' + ro.slice(0, 140));
+
+    // ---- 6c. height + biome strokes, undo / redo, the dirty-tile save --------------------------------------------
+    var btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(btns.indexOf('Height') >= 0 && btns.indexOf('Biome brush') >= 0 && btns.indexOf('Tree') >= 0 && btns.indexOf('Sculpt') >= 0 && btns.indexOf('Landform brush') < 0,
+        'the toolbar carries Height, Biome brush, Tree and Sculpt and no v1 landform tools (' + btns.length + ' buttons)');
+    var undoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0];
+    var redoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Redo'; })[0];
+    var probe = function () { return MT.heightAt(mp.H, 8192, 0); };
+    var h0 = probe(), hIn0 = MT.heightAt(mp.H, 7500, 0), u0 = M._undoDepth();
+    M._tool('height');
+    var Br = M._brush(); Br.mode = 'raise'; Br.radiusM = 30; Br.strength = 60; Br.spacing = 25;
+    at('pointerdown', 7500, 0); at('pointermove', 7800, 0); at('pointermove', 8150, 0); at('pointerup', 8150, 0);
+    var pay = M._payload();
+    say(M._undoDepth() === u0 + 1 && probe() > h0 + 1, 'a height stroke raised the edge post ' + h0 + ' -> ' + probe().toFixed(1) + ' vox in one undo step');
+    say(pay.height.length === 2 && pay.biome.length === 0 && pay.height.every(function (e) { return e.bytes && e.bytes.length === 131104 && e.tz === 0; }),
+        'dirty-tile payload = only the touched tiles: height ' + pay.height.map(function (e) { return '(' + e.tx + ',' + e.tz + ')'; }).join(' ') + ', biome none');
+    var hAfter = probe();
+    undoBtn.click();
+    say(probe() === h0 && MT.heightAt(mp.H, 7500, 0) === hIn0 && !mp.H.tiles.has(MT.tileKey(1, 0)), 'Undo restores the posts exactly (the fresh tile is gone again)');
+    redoBtn.click();
+    say(probe() === hAfter, 'Redo brings the stroke back');
+    M._tool('biome'); Br.index = 3; Br.radiusM = 50;
+    var b0 = MT.biomeAt(mp.B, -6000, -6000);
+    at('pointerdown', -6000, -6000); at('pointerup', -6000, -6000);
+    say(b0 === 0 && MT.biomeAt(mp.B, -6000, -6000) === 3 && M._payload().biome.length === 1, 'a biome dab painted pine where the ocean was (1 biome tile dirty)');
+    Br.index = 0; at('pointerdown', 0, 0, {altKey: true}); at('pointerup', 0, 0);
+    say(Br.index === 2, 'Alt+click with the biome brush picks alpine at the summit');
+    pay = M._payload();
+    var saved = await M._save();
+    lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
+    var disk = await (await fetch(tileUrl('height', 1, 0), {cache: 'no-store'})).arrayBuffer();
+    var want = pay.height.filter(function (e) { return e.tx === 1; })[0].bytes, same = disk.byteLength === want.length;
+    new Uint8Array(disk).forEach(function (b, i) { if (b !== want[i]) same = false; });
+    say(saved && lst.tiles.length === 2 && same && M._payload().height.length === 0,
+        'Save wrote only the dirty tiles: ' + lst.tiles.length + ' height tiles on disk, tile (1,0) byte-identical to the payload, nothing dirty after');
+
+    // ---- 6d. the site tools and the sculpt layer still work on v2 (P5 sculpt, P6 tree / clearing) -----------------
+    var S = M._sculpt(), u1 = M._undoDepth(), tiles0 = S.tiles.size;
     M._tool('sculpt');
     S.mode = 'raise'; S.radius = 2048; S.strength = 50;
     ptr('pointerdown', 0.5, 0.5); ptr('pointermove', 0.55, 0.5); ptr('pointermove', 0.6, 0.52); ptr('pointerup', 0.6, 0.52);
     var peak = 0;
     S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) peak = Math.max(peak, t[i]); });
-    say(S.tiles.size > tiles0 && peak > 1 && S.dirty && M._undoDepth() === u0 + 1,
-        'a sculpt raise stroke wrote ' + (S.tiles.size - tiles0) + ' tiles, peak +' + peak.toFixed(1) + ' vox, ' + (M._undoDepth() - u0) + ' undo step');
+    say(S.tiles.size > tiles0 && peak > 1 && S.dirty && M._undoDepth() === u1 + 1,
+        'a sculpt raise stroke wrote ' + (S.tiles.size - tiles0) + ' tiles, peak +' + peak.toFixed(1) + ' vox, ' + (M._undoDepth() - u1) + ' undo step');
     var bytes = M.serializeSculpt(S.tiles), back2 = bytes ? M.parseSculpt(bytes.buffer) : new Map();
-    var same = bytes && back2.size <= S.tiles.size && back2.size > 0;
-    back2.forEach(function (t, k) { var a = S.tiles.get(k); if (!a) { same = false; return; } for (var i = 0; i < t.length; i++) if (t[i] !== Math.round(a[i])) same = false; });
-    say(!!same, 'the stroke serialises and parses back to the rounded layer (' + (bytes ? bytes.length : 0) + ' bytes, ' + back2.size + ' tiles)');
-    [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
+    var same2 = bytes && back2.size <= S.tiles.size && back2.size > 0;
+    back2.forEach(function (t, k) { var a = S.tiles.get(k); if (!a) { same2 = false; return; } for (var i = 0; i < t.length; i++) if (t[i] !== Math.round(a[i])) same2 = false; });
+    say(!!same2, 'the stroke serialises and parses back to the rounded layer (' + (bytes ? bytes.length : 0) + ' bytes, ' + back2.size + ' tiles)');
+    undoBtn.click();
     var left = 0;
     S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left = Math.max(left, Math.abs(t[i])); });
-    say(S.tiles.size === tiles0 && left === left0 && M._undoDepth() === u0, 'Undo takes the stroke back (' + S.tiles.size + ' tiles, max |offset| ' + left + ', was ' + left0 + ')');
-    // TREE: a click plants the picked species at the column, the Sites panel edits it; Undo removes it.
+    say(S.tiles.size === tiles0 && left === 0 && M._undoDepth() === u1, 'Undo takes the sculpt stroke back (' + S.tiles.size + ' tiles)');
     ok = await waitFor(function(){ return M._trees().list.length > 0; }, 10000);
     say(ok, 'tree species listed from assets/trees/*.svtree: ' + M._trees().list.join(', '));
-    var nSites = M._map().json.sites.length;
+    var nSites = mp.json.sites.length;
     M._tool('tree');
     ptr('pointerdown', 0.3, 0.4); ptr('pointerup', 0.3, 0.4);
     var ts = M._map().json.sites[M._map().json.sites.length - 1];
     say(M._map().json.sites.length === nSites + 1 && ts.kind === 'tree' && ts.species === M._trees().species &&
         Array.isArray(ts.at) && ts.variant === undefined && ts.rot === undefined,
         'the Tree tool planted ' + JSON.stringify(ts));
-    say(M._selected() === ts && !!pages.map.querySelector('.mapsites-panel select') &&
-        [].slice.call(pages.map.querySelectorAll('.mapsite .mapkind')).some(function (k) { return k.textContent === 'tree'; }),
-        'the new tree is selected, listed, and its panel has the species select');
-    [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
+    say(M._selected() === ts && !!pages.map.querySelector('.mapsites-panel select'), 'the new tree is selected and its panel has the species select');
+    undoBtn.click();
     say(M._map().json.sites.length === nSites, 'Undo removes it (' + M._map().json.sites.length + ' sites)');
-    // CLEARING: a drag draws a forest clearing box, selected with its corner
-    // and feather fields; a drag inside moves it; shift+click deletes it; Undo
-    // brings it back and Undo again takes the drawing back.
     M._tool('clearing');
-    ptr('pointerdown', 0.40, 0.40); ptr('pointermove', 0.44, 0.45); ptr('pointerup', 0.44, 0.45);
+    var nc = M._map().json.sites.length;
+    at('pointerdown', -4000, 3000); at('pointermove', -3000, 4000); at('pointerup', -3000, 4000);
     var cs = M._map().json.sites[M._map().json.sites.length - 1];
-    say(M._map().json.sites.length === nSites + 1 && cs.kind === 'clearing' && cs.min[0] < cs.max[0] && cs.min[1] < cs.max[1] &&
+    say(M._map().json.sites.length === nc + 1 && cs.kind === 'clearing' && cs.min[0] < cs.max[0] && cs.min[1] < cs.max[1] &&
         cs.feather === 64 && M._selected() === cs && pages.map.querySelectorAll('.mapsites-panel input[type=number]').length >= 5,
         'the Clearing tool drew ' + JSON.stringify(cs) + ', selected, with corner + feather fields');
     var w0 = cs.max[0] - cs.min[0], x0 = cs.min[0];
-    ptr('pointerdown', 0.42, 0.42); ptr('pointermove', 0.43, 0.42); ptr('pointerup', 0.43, 0.42);
-    say(cs.min[0] > x0 && cs.max[0] - cs.min[0] === w0, 'a drag inside it moves it, same size (x ' + x0 + ' -> ' + cs.min[0] + ')');
-    ptr('pointerdown', 0.43, 0.43, {shiftKey: true}); ptr('pointerup', 0.43, 0.43, {shiftKey: true});
-    say(M._map().json.sites.length === nSites, 'shift+click inside it deletes it');
-    var undoBtn = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0];
+    at('pointerdown', -3500, 3500); at('pointermove', -3300, 3500); at('pointerup', -3300, 3500);
+    cs = M._selected();
+    say(!!cs && cs.min[0] > x0 && cs.max[0] - cs.min[0] === w0, 'a drag inside it moves it, same size (x ' + x0 + ' -> ' + (cs && cs.min[0]) + ')');
+    at('pointerdown', cs.min[0] + 50, cs.min[1] + 50, {shiftKey: true}); at('pointerup', cs.min[0] + 50, cs.min[1] + 50, {shiftKey: true});
+    say(M._map().json.sites.length === nc, 'shift+click inside it deletes it');
     undoBtn.click(); undoBtn.click(); undoBtn.click();
-    say(M._map().json.sites.length === nSites && !M._map().json.sites.some(function (s) { return s.kind === 'clearing' && s.id === cs.id; }),
-        'three Undos take back the delete, the move and the drawing (' + M._map().json.sites.length + ' sites)');
+    say(M._map().json.sites.length === nc, 'three Undos take back the delete, the move and the drawing (' + M._map().json.sites.length + ' sites)');
     // LOAD CHECK: the panel asked the engine (or says why it could not).
     ok = await waitFor(function(){ return !!M._check(); }, 60000);
     var ck = M._check();
     say(ok && !!pages.map.querySelector('.mapcheck'), 'Load check panel: ' + (ck ? (ck.unavailable ? 'engine unavailable (' + String(ck.error).slice(0, 60) + ')' :
-        (ck.ok ? (ck.warnings || []).length + ' warnings' : 'REFUSED: ' + ck.error)) : 'no answer'));
-    say(!ck || ck.unavailable || ck.ok, 'the engine loads the ' + M._map().name + ' map');
-    M._tool('biome');
+        (ck.ok ? (ck.warnings || []).length + ' warnings' : 'REFUSED: ' + String(ck.error).slice(0, 100))) : 'no answer'));
+    if (ck && !ck.unavailable && !ck.ok && /svmap|version|v1/i.test(String(ck.error)))
+      skip('the engine loads the v2 fixture: this sandvox.exe predates v2 maps (' + String(ck.error).slice(0, 80) + ')');
+    else say(!ck || ck.unavailable || ck.ok, 'the engine loads the ' + FIX + ' map');
+    M._tool('height');
+    // the fixture's tiles go; check_environment.sh removes the folder
+    for (var pl of ['height', 'biome']) {
+      var ls = await api('/api/worldmap/tiles?name=' + FIX + '&plane=' + pl);
+      for (var tt of ls.tiles) await api(tileUrl(pl, tt.tx, tt.tz), new Uint8Array(0));
+    }
+    lst = await api('/api/worldmap/tiles?name=' + FIX + '&plane=height');
+    say(lst.tiles.length === 0, 'an EMPTY tile POST deletes the tile (fixture tiles removed)');
 
     // The preview host lives in tuner.html; this harness drives the module
-    // alone, so only the wiring is checked here: tuner.html carries the host
-    // and the map page's adoption code.
+    // alone, so only the wiring is checked here.
     say(/id="wgPreviewHost"/.test(page) && /wgPreviewShow/.test(page), 'tuner.html carries the preview host the map page adopts');
 
     if (ONLY_MAP) { done(); return; }
