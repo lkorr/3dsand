@@ -977,7 +977,8 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
     bool ran = false, wore = false;
   };
   const int kSweptHits = (int)BaselineNumber("impactArmorSweptHits", 3);
-  auto sweep = [&](bool dressed) -> Swept {
+  auto sweep = [&](const ItemDef* wear) -> Swept {
+    const bool dressed = wear != nullptr;
     Swept r;
     mobs.Reset();
     c.debris.Reset();
@@ -989,7 +990,7 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
     Mob* m = mobs.FindMobById(id);
     if (!m) return r;
     if (dressed) {
-      if (!m->WearItem(cuirass, chestSlot)) return r;
+      if (!m->WearItem(wear, chestSlot)) return r;
       r.wore = true;
     }
     // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing (SpawnTarget's).
@@ -1069,8 +1070,17 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
     c.debris.Reset();
     return r;
   };
-  const Swept sweptBare = sweep(false);
-  const Swept sweptDressed = sweep(true);
+  const Swept sweptBare = sweep(nullptr);
+  const Swept sweptDressed = sweep(cuirass);
+  // ---- ARM D: THE SAME SWORD THROUGH A TUNIC (2026-10-05) -----------------
+  //
+  // Arm C's mirror. Cloth is no harder than skin, so to an edge it is not
+  // armour (melee.cpp "CLOTH IS NOT ARMOUR"): the owner's report was a hood
+  // that clanged and drew no blood. The claim: the clothed torso loses flesh
+  // at close to the bare rate, the tunic is cut on the way, and no probe was
+  // turned back onto the cloth.
+  const ItemDef* tunicD = c.items.At(c.items.Find("tunic"));
+  const Swept sweptCloth = tunicD ? sweep(tunicD) : Swept{};
   if (!sweptDressed.wore) {
     detail = "the cuirass did not go on the swept rig";
     return Status::Skip;
@@ -1101,6 +1111,15 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
   // at all would pass the two lines above while proving nothing about the
   // redirect.
   const bool plateTook = sweptDressed.shellLost > 0 && sweptDressed.covered > 0;
+  RecordObserved("impactArmorSweptClothFleshLost", (double)sweptCloth.fleshLost);
+  RecordObserved("impactArmorSweptClothShellLost", (double)sweptCloth.shellLost);
+  const double clothMin =
+      BaselineNumber("impactArmorSweptClothMinFraction", 0.5);
+  const bool clothCut =
+      !sweptCloth.wore ||
+      (sweptCloth.ran && sweptCloth.covered == 0 && sweptCloth.shellLost > 0 &&
+       (double)sweptCloth.fleshLost >=
+           (double)sweptBare.fleshLost * clothMin);
 
   const uint32_t bladeLost =
       blade.shellBefore > blade.shellAfter ? blade.shellBefore - blade.shellAfter : 0u;
@@ -1156,14 +1175,17 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
   const bool clean = club.rot == 0 && blade.rot == 0;
 
   const bool ok = skated && sheltered && beatIn && got && dry && clean &&
-                  sweptRan && bareCut && sweptSheltered && plateTook;
+                  sweptRan && bareCut && sweptSheltered && plateTook &&
+                  clothCut;
   detail = Format(
       "%s/%s in an iron cuirass, x%d each: SWORD took %u/%u shell voxels "
       "(%.1f%%, cap %.0f%%) and %.1f host hp | MACE took %u/%u (%.1f%%) and "
       "%.1f host hp, bleed budget %.2f (as trauma %.2f, as a cut %.2f), rot %u "
       "| swept sword x%d through the torso: bare lost %u/%u flesh (hp -%.1f); "
       "dressed lost %u flesh (hp -%.1f, cap %.0f%% of bare and %.1f%% of the "
-      "torso), plate chipped %u/%u, %d probes turned back onto it%s",
+      "torso), plate chipped %u/%u, %d probes turned back onto it%s | "
+      "TUNIC%s: lost %u flesh (hp -%.1f, need %.0f%% of bare), cloth cut "
+      "%u/%u, %d probes turned back%s",
       t.defName.c_str(), mobs.Defs()[t.defIndex].limbs[t.torso].name.c_str(),
       kHits, bladeLost, blade.shellBefore, bladeFrac * 100.0f, chipMax * 100.0,
       bladeHost, clubLost, club.shellBefore, clubFrac * 100.0f, clubHost,
@@ -1171,7 +1193,11 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
       sweptBare.fleshLost, sweptBare.fleshBefore, sweptBare.hpDrop,
       sweptDressed.fleshLost, sweptDressed.hpDrop, sweptFrac * 100.0,
       sweptTorsoMax * 100.0, sweptDressed.shellLost, sweptDressed.shellBefore,
-      sweptDressed.covered, sweptRan ? "" : " (A SWEEP HIT NOTHING)");
+      sweptDressed.covered, sweptRan ? "" : " (A SWEEP HIT NOTHING)",
+      sweptCloth.wore ? "" : " (NOT WORN, skipped)", sweptCloth.fleshLost,
+      sweptCloth.hpDrop, clothMin * 100.0, sweptCloth.shellLost,
+      sweptCloth.shellBefore, sweptCloth.covered,
+      clothCut ? "" : " <- CLOTH ACTED AS ARMOUR");
   return ok ? Status::Pass : Status::Fail;
 }
 

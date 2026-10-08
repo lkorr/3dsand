@@ -30752,7 +30752,8 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
 
 int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
                         float dist, int maxSteps, uint32_t* outMat,
-                        Vec3* outAt) {
+                        Vec3* outAt, float passHardness, int* outPassed,
+                        Vec3* outPassedAt) {
   burnprof::Scope bpScope(burnprof::kWorn);
   if (outMat) *outMat = 0;
   if (worn_.empty() || bodyLimb < 0) return -1;
@@ -30769,11 +30770,22 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
       // and a mid-pass re-read would test against a pose the rest of the burn
       // pass was not computed against (gotcha-live-limb-carve-pose).
       const bool fine = shell.HasFineSkin();
+      Vec3 metAt{};
       const uint32_t m = MarchShell(
           piece.index[k], fine ? &shell.skinVoxels : nullptr,
           fine ? nullptr : &shell.voxels, shell.xf, SkinScaleOf(shell), from,
-          dir, dist, maxSteps, outAt);
+          dir, dist, maxSteps, &metAt);
+      // Soft enough to pass (hardness 0 = unreadable counts as soft, the
+      // shellresponse.h convention: the failure is a blow that lands).
+      if (m && passHardness >= 0.0f && MaterialHardness(m) <= passHardness) {
+        if (outPassed != nullptr && *outPassed < 0) {
+          *outPassed = s;
+          if (outPassedAt) *outPassedAt = metAt;
+        }
+        continue;
+      }
       if (m) {
+        if (outAt) *outAt = metAt;
         if (outMat) *outMat = m;
         return s;
       }

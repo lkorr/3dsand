@@ -3216,8 +3216,17 @@ class Mob {
   // march: the burn pass keeps its short kWornMarchMax because it asks per
   // voxel per tick; a sweep asks a few times per swing and has to cross half
   // a torso to find the entry side of the coat.
+  //
+  // CLOTH IS NOT ARMOUR TO AN EDGE (2026-10-05): with `passHardness` >= 0, a
+  // shell whose struck material is no harder than that is NOT an answer -- the
+  // march skips it and keeps looking for a harder one, and the first such soft
+  // shell (slot and where it was met) goes to `outPassed`/`outPassedAt` so the
+  // caller can cut it on the blade's way through. A plate over a robe, or a
+  // robe under a plate, is still found.
   int WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
-                     float dist, int maxSteps, uint32_t* outMat, Vec3* outAt);
+                     float dist, int maxSteps, uint32_t* outMat, Vec3* outAt,
+                     float passHardness = -1.0f, int* outPassed = nullptr,
+                     Vec3* outPassedAt = nullptr);
   // Does any shell cover this body limb at all? The cheap gate in front of the
   // probe, so an undressed creature never even transforms a point.
   bool LimbHasShells(int bodyLimb) const;

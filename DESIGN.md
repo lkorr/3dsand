@@ -21099,6 +21099,21 @@ torso's centre bare and dressed: bare must be cut, dressed must keep its flesh
 one probe turned back onto it — or a sweep that never reached the flesh would
 pass while proving nothing.
 
+**...but cloth is not armour to an edge** (2026-10-05; `melee.cpp` "CLOTH IS
+NOT ARMOUR", `impact-armor` arm D). The retarget made EVERY garment the whole
+answer to a blow, so a hood clanged like plate and the flesh under it was never
+cut until the hood had a blade-wide hole. To an EDGED blow a shell whose struck
+material is no harder than skin (`gear.cutHardnessRef`: cloth, linen,
+undercloth pass; leather and up still defend) is PASSED: `WornShellAlong` skips
+it (`passHardness`) and keeps looking for a harder shell, the blow resolves on
+the flesh exactly as if bare (cut, bleed, flesh cue), and the same kerf is cut
+through the garment at the point the edge crossed it (no hp charged to the
+cloth). A probe that meets the cloth collider FIRST is moved onto the limb the
+cloth is worn on the same way. Blunt and bite blows keep the shell rows they
+had. Arm D sweeps the sword through a tunic: flesh lost must be at least
+`impactArmorSweptClothMinFraction` of bare, the cloth must be cut, and no
+probe may be turned back onto it.
+
 **The NPC AI panel dresses what it spawns** (`UIState::aiOutfit`, the Spawn
 tab's "wearing:" block). Nothing / random commoner clothes (a dyeable piece per
 slot, each in its own hashed colour) / full plate (every slot's `iron_*` piece)

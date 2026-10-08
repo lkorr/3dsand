@@ -1306,6 +1306,48 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // and a follower shell (MobLimb::wornHost) has no spring of its own.
       // The dedup then runs on the SHELL's handle, so the plate is resolved
       // once per swing tick like every other body.
+      //
+      // ---- ...BUT CLOTH IS NOT ARMOUR (2026-10-05) -------------------------
+      //
+      // Owner report: a slash at a man in a hood clanged like plate, cut the
+      // hood and drew no blood. The retarget below made EVERY garment the
+      // blow's whole answer, and cloth's low hardness only meant the cloth
+      // itself took a full kerf -- the flesh under it was never reached until
+      // the hood had a blade-wide hole in it. An edge goes through a robe the
+      // way it goes through skin, so to an EDGED blow a shell no harder than
+      // skin (`gear.cutHardnessRef`: cloth 5, linen 4, undercloth 8; leather
+      // 14 and up still defends) is PASSED: the blow resolves on the flesh as
+      // if bare -- cut, bleed, flesh cue -- and the same kerf is cut through
+      // the garment on its way (`clothSlot`, resolved beside the flesh cut).
+      // A hard shell over or under the cloth is still found and still takes
+      // the blow. A blunt or bite blow keeps the shell rules it had: what
+      // cloth does to a mace or to teeth is the ShellRow's business.
+      const bool edged = s.strike.cut > 0.0f;
+      const float passHard =
+          edged ? std::max(CurrentTuning().gear.cutHardnessRef, 0.0f) : -1.0f;
+      int clothSlot = -1;
+      Vec3 clothAt{};
+      // THE PROBE MET THE CLOTH ITSELF FIRST (it is outside the flesh): the
+      // blow belongs to the limb it is worn on, and the cloth is cut on the
+      // way. A garment hanging clear of any flesh keeps the old answer.
+      if (kind == StruckKind::Shell && edged &&
+          owner->MaterialHardness(owner->ShellMaterialAt(li, at)) <=
+              passHard) {
+        const int host = owner->WornHostOf(li);
+        const uint64_t hostBody =
+            host >= 0 && host < owner->AppendedBase()
+                ? mobs.LimbBody(owner->Id(), host)
+                : 0ull;
+        if (hostBody != 0ull) {
+          if (keySeen(hostBody)) continue;   // the flesh already took this swing
+          clothSlot = li;
+          clothAt = at;
+          hb = hostBody;
+          li = host;
+          kind = StruckKind::Flesh;
+          if (!owner->Alive()) out.hitDeadFlesh = true;
+        }
+      }
       const uint64_t struckBody = hb;
       if (kind == StruckKind::Flesh && owner->LimbHasShells(li)) {
         const Vec3 back = (sweepDir.len() > 1e-4f ? sweepDir * -1.0f
@@ -1335,8 +1377,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         Vec3 coverAt{};
         for (const Vec3& o : origins) {
           Vec3 hitAt{};
-          const int sh = owner->WornShellAlong(li, o, back, kCoverReach,
-                                               kCoverSteps, nullptr, &hitAt);
+          const int sh = owner->WornShellAlong(
+              li, o, back, kCoverReach, kCoverSteps, nullptr, &hitAt, passHard,
+              clothSlot < 0 ? &clothSlot : nullptr, &clothAt);
           if (sh < 0) continue;
           shell = sh;
           coverAt = hitAt;
@@ -1350,7 +1393,17 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
           hb = sb;
           at = coverAt;
           kind = StruckKind::Shell;
+          clothSlot = -1;   // the plate stopped the edge before any cloth
         }
+      }
+      // The cloth the edge passes through, by handle NOW: the flesh cut below
+      // can sever the limb it is worn on and reshape the rig. Keyed like any
+      // struck body, so the next probe this tick does not cut it again.
+      uint64_t clothBody = 0ull;
+      if (clothSlot >= 0 && kind == StruckKind::Flesh) {
+        clothBody = mobs.LimbBody(owner->Id(), clothSlot);
+        if (clothBody != 0ull && keySeen(clothBody)) clothBody = 0ull;
+        if (clothBody != 0ull) hitKeys.push_back(strikeKey(clothBody));
       }
       hitBodies.push_back(hb);
       hitKeys.push_back(strikeKey(hb));
@@ -1611,6 +1664,15 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         // own causes: a mace caving a skull in is not a dismemberment and must
         // not arm the wet cue.
         const DamageCtx blade(DamageCause::Blade, power);
+        // THE CLOTH FIRST, the way the edge met it: a kerf through the garment
+        // at the point the probe crossed it, the flesh's own kerf below. No hp
+        // on the cloth -- a slashed hood is a slashed hood, not a broken one.
+        if (clothBody != 0ull && (!parts.cut.stab || firstContact)) {
+          KerfCut clothCut = parts.cut;
+          clothCut.at = clothAt;
+          clothCut.cleave = 0.0f;   // cloth is never "parted" off its wearer
+          mobs.CutLimb(clothBody, clothCut, world, spawns, power, nullptr);
+        }
         // A KERF, NOT A BITE, and it is the only thing that decides
         // dismemberment: the slot follows the blade's own edge and the
         // direction the swing is going, and a limb comes off when the lattice
