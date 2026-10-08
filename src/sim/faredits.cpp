@@ -4,7 +4,9 @@
 
 #include "sim/chunkstore.h"
 #include "sim/stream.h"  // RleDecodeChunk
+#include "sim/treeatlas.h"  // the run word (a stamp block uses the tree atlas layout)
 #include "sim/world.h"   // World::TerrainHeight, the ground slot's h
+#include "sim/worldmap.h"  // the stamps' container cells (StampContainers)
 
 namespace {
 // Floor division, mirroring worldgen.wgsl's fdiv: C++ `/` truncates toward
@@ -52,8 +54,18 @@ void FarEdits::Sweep(IVec3 wc,
         for (int iy = 0; iy < n[1]; iy++) {
           const int fine[3] = {first[0] + ix * step, first[1] + iy * step,
                                first[2] + iz * step};
-          const uint32_t mat =
-              sample(fine[0] - base[0], fine[1] - base[1], fine[2] - base[2]);
+          uint32_t mat = sample(fine[0] - base[0], fine[1] - base[1], fine[2] - base[2]);
+          // THE CONTAINER RULE (faredits.h kContainMaxShift): the cell lies
+          // inside this chunk at these shifts; its face neighbours may not.
+          if (shift <= kContainMaxShift && !containKind_.empty()) {
+            const int c0[3] = {fine[0] - half - base[0], fine[1] - half - base[1],
+                               fine[2] - half - base[2]};
+            mat = ContainedBy(mat & 0xFFFu, step, c0, [&](int x, int y, int z) {
+              const int k = (int)kChunk;
+              if (x < 0 || y < 0 || z < 0 || x >= k || y >= k || z >= k) return kMatAtUnseen;
+              return (int)(sample(x, y, z) & 0xFFFu);
+            });
+          }
           // level-cell coord -> its index inside the owning level chunk
           const uint32_t cx = (uint32_t)((fine[0] >> shift) & 15);
           const uint32_t cy = (uint32_t)((fine[1] >> shift) & 15);
@@ -128,6 +140,39 @@ uint32_t FarEdits::CombineCell(const uint32_t* w, size_t n) {
     if (g != kGroundUnknown) gs = g;
   }
   return (gs << kGroundShift) | (mat << kCellBits) | (w[0] & kCellMask);
+}
+
+uint32_t FarEdits::ContainedBy(uint32_t centre, int step, const int c0[3],
+                               const std::function<int(int, int, int)>& matAt) const {
+  if (ContainKindOf(centre) == kContainWall) return centre;
+  // A neighbour's class. Unseen counts as OPEN, the GPU's answer for a cell
+  // outside the window; kMatAtGround is a wall whose material is unknown.
+  auto kindAt = [&](int x, int y, int z) -> uint8_t {
+    const int m = matAt(x, y, z);
+    if (m == kMatAtUnseen) return kContainNone;
+    if (m == kMatAtGround) return kContainWall;
+    return ContainKindOf((uint32_t)m);
+  };
+  // +x, -x, +y, -y, +z, -z: worldgen.wgsl farFaceDir's order (the result is
+  // an OR over the six, so the order only has to be complete).
+  static constexpr int kDir[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                     {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  for (int i = 0, n3 = step * step * step; i < n3; i++) {
+    const int x = c0[0] + i % step, y = c0[1] + (i / step) % step, z = c0[2] + i / (step * step);
+    const int m = matAt(x, y, z);
+    // A candidate must be a wall this side can NAME: an unseen voxel or
+    // procgen ground under the edit layer is skipped (the GPU, which sees
+    // it, may take it; a documented downsample-only answer).
+    if (m < 0 || ContainKindOf((uint32_t)m) != kContainWall) continue;
+    bool liquid = false, open = false;
+    for (const auto& d : kDir) {
+      const uint8_t k = kindAt(x + d[0], y + d[1], z + d[2]);
+      liquid = liquid || k == kContainLiquid;
+      open = open || k == kContainNone;
+    }
+    if (liquid && open) return (uint32_t)m;
+  }
+  return centre;
 }
 
 void FarEdits::NoteChunk(IVec3 wc, const uint32_t* words) {
@@ -226,9 +271,105 @@ const std::vector<uint32_t>* FarEdits::Lookup(uint32_t level,
   return &m;
 }
 
+void FarEdits::StampContainers(std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out) {
+  if (containKind_.empty() || World::LabWorld()) return;
+  using worldmap::WorldMapData;
+  const WorldMapData& map = worldmap::CurrentWorldMap();
+  std::vector<const WorldMapData::StampSite*> stamps;
+  for (const auto& s : map.sites)
+    if (s.kind == worldmap::kSiteStamp && !s.words.empty()) stamps.push_back(&s);
+  if (stamps.empty()) return;
+  // worldgen.wgsl wmStampCell over the CPU's copy of the block (offsets
+  // relative to its start): the template voxel at a world cell, 0 if none.
+  // Run word: material 0..11, y0 16..26, length 27..31 (treeatlas.h).
+  auto stampAt = [](const WorldMapData::StampSite& s, int x, int y, int z) -> uint32_t {
+    const int lx = x - (s.x - s.nx / 2), lz = z - (s.z - s.nz / 2);
+    const int ly = y - s.padY - 1 + s.sink;
+    if (lx < 0 || lz < 0 || ly < 0 || lx >= s.nx || lz >= s.nz || ly >= s.ny) return 0;
+    const size_t ci = worldmap::kStampHdrWords + ((size_t)lz * s.nx + lx) * 2;
+    const uint32_t runOff = s.words[ci], cnt = s.words[ci + 1];
+    for (uint32_t k = 0; k < cnt; k++) {
+      const uint32_t r = s.words[runOff + k];
+      const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0);
+      if (ly < y0) return 0;
+      if (ly < y0 + (int)(r >> 27)) return r & 0xFFFu;
+    }
+    return 0;
+  };
+  // What genCellIn puts at a cell, as far as this side can say: the first
+  // stamp's template voxel (wmStampsCell); under template air the PAD's
+  // ground (levelled to padY over the footprint rect) or, off every
+  // footprint, the ground contract -- a wall of unknown material at or under
+  // it, air over it. Trees, cover and caves under template air are beyond it.
+  auto matAt = [&](int x, int y, int z) -> int {
+    for (const auto* s : stamps)
+      if (const uint32_t m = stampAt(*s, x, y, z)) return (int)m;
+    for (const auto* s : stamps)
+      if (x >= s->bx0 && x <= s->x1 && z >= s->bz0 && z <= s->z1)
+        return y <= s->padY ? kMatAtGround : (int)kMatAir;
+    if (!groundWorld_) return kMatAtUnseen;
+    return y <= GroundHeight(x, z) ? kMatAtGround : (int)kMatAir;
+  };
+  for (const auto* sp : stamps) {
+    const WorldMapData::StampSite& s = *sp;
+    // The world box of the template's LIQUID: a container wall touches it, so
+    // every cell the rule can change meets the box grown by one.
+    int lo[3] = {INT32_MAX, INT32_MAX, INT32_MAX}, hi[3] = {INT32_MIN, INT32_MIN, INT32_MIN};
+    for (int lz = 0; lz < s.nz; lz++)
+      for (int lx = 0; lx < s.nx; lx++) {
+        const size_t ci = worldmap::kStampHdrWords + ((size_t)lz * s.nx + lx) * 2;
+        for (uint32_t k = 0; k < s.words[ci + 1]; k++) {
+          const uint32_t r = s.words[s.words[ci] + k];
+          if (ContainKindOf(r & 0xFFFu) != kContainLiquid) continue;
+          const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0) + s.padY + 1 - s.sink;
+          const int w[3] = {lx + s.x - s.nx / 2, y0, lz + s.z - s.nz / 2};
+          for (int a = 0; a < 3; a++) {
+            lo[a] = std::min(lo[a], w[a] - 1);
+            hi[a] = std::max(hi[a], w[a] + 1 + (a == 1 ? (int)(r >> 27) - 1 : 0));
+          }
+        }
+      }
+    if (lo[0] > hi[0]) continue;
+    for (uint32_t level = 1; level <= kFarLevels; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      if (shift > kContainMaxShift) break;
+      const int step = 1 << shift, half = 1 << (shift - 1);
+      for (int cz = lo[2] >> shift; cz <= hi[2] >> shift; cz++)
+        for (int cy = lo[1] >> shift; cy <= hi[1] >> shift; cy++)
+          for (int cx = lo[0] >> shift; cx <= hi[0] >> shift; cx++) {
+            const int c0[3] = {cx * step, cy * step, cz * step};
+            int centre = matAt(c0[0] + half, c0[1] + half, c0[2] + half);
+            if (centre == kMatAtGround) continue;   // ground: already a wall
+            if (centre < 0) centre = (int)kMatAir;
+            const uint32_t mat = ContainedBy((uint32_t)centre, step, c0, matAt);
+            if (mat == (uint32_t)centre) continue;
+            const uint32_t ci =
+                (uint32_t)(((cz & 15) * (int)kChunk + (cy & 15)) * (int)kChunk + (cx & 15));
+            out[LKey{cx >> 4, cy >> 4, cz >> 4, level}].push_back((mat << kCellBits) | ci);
+          }
+    }
+  }
+}
+
 void FarEdits::SetBase(const std::vector<BaseCell>& cells) {
   base_.clear();
   merged_.clear();
+  // The stamps' container cells first, so the layer's own words (appended
+  // below, and the compaction keeps the last of a cell) win where both speak.
+  StampContainers(base_);
+  // The container rule needs a liquid centre's cell-mates. The layer is
+  // sparse, so they come from a position index of the layer's own cells; a
+  // cell-mate the layer does not hold is procgen, which the CPU cannot see,
+  // and does not count (the trough this exists for is all layer).
+  std::unordered_map<uint64_t, uint32_t> at;
+  auto posKey = [](int x, int y, int z) {
+    return ((uint64_t)(uint32_t)(x & 0x1FFFFF) << 42) |
+           ((uint64_t)(uint32_t)(y & 0x1FFFFF) << 21) | (uint64_t)(uint32_t)(z & 0x1FFFFF);
+  };
+  if (!containKind_.empty()) {
+    at.reserve(cells.size());
+    for (const BaseCell& c : cells) at[posKey(c.x, c.y, c.z)] = c.mat & 0xFFFu;
+  }
   for (const BaseCell& c : cells) {
     for (uint32_t level = 1; level <= kFarLevels; level++) {
       const int shift = (int)(level + kFarShiftBase);
@@ -246,6 +387,46 @@ void FarEdits::SetBase(const std::vector<BaseCell>& cells) {
       const uint32_t ci = (cz * kChunk + cy) * kChunk + cx;
       const LKey key{c.x >> (shift + 4), c.y >> (shift + 4), c.z >> (shift + 4), level};
       base_[key].push_back(((c.mat & 0xFFFu) << kCellBits) | ci);
+    }
+  }
+  // THE CONTAINER RULE over the layer (faredits.h kContainMaxShift). The
+  // candidate cells are the ones holding a layer WALL -- only a voxel this
+  // side can name may win (ContainedBy) -- and each is decided once, after the centre
+  // words above, so its word is the newer one at compaction. A centre the
+  // layer does not hold is procgen: ground at or under the column's h, air
+  // above it (a tree or a cover stalk there is beyond what the CPU can see).
+  if (!containKind_.empty()) {
+    // A voxel the layer does not hold is procgen: guessed from the ground
+    // contract as above (air over h, ground at or under it), unseen without it.
+    auto matAt = [&](int x, int y, int z) {
+      auto it = at.find(posKey(x, y, z));
+      if (it != at.end()) return (int)it->second;
+      if (!groundWorld_) return kMatAtUnseen;
+      return y <= GroundHeight(x, z) ? kMatAtGround : (int)kMatAir;
+    };
+    for (uint32_t level = 1; level <= kFarLevels; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      if (shift > kContainMaxShift) break;
+      const int step = 1 << shift;
+      const int half = 1 << (shift - 1);
+      std::unordered_map<uint64_t, bool> seen;
+      for (const BaseCell& c : cells) {
+        if (ContainKindOf(c.mat & 0xFFFu) != kContainWall) continue;
+        const int cell[3] = {c.x >> shift, c.y >> shift, c.z >> shift};
+        if (!seen.emplace(posKey(cell[0], cell[1], cell[2]), true).second) continue;
+        const int c0[3] = {cell[0] * step, cell[1] * step, cell[2] * step};
+        const int fx = c0[0] + half, fy = c0[1] + half, fz = c0[2] + half;
+        int centre = matAt(fx, fy, fz);
+        if (centre == kMatAtGround) continue;   // procgen ground: already a wall
+        if (centre < 0) centre = (int)kMatAir;
+        const uint32_t mat = ContainedBy((uint32_t)centre, step, c0, matAt);
+        if (mat == (uint32_t)centre) continue;
+        const uint32_t ci = (uint32_t)(((cell[2] & 15) * (int)kChunk + (cell[1] & 15)) *
+                                           (int)kChunk +
+                                       (cell[0] & 15));
+        base_[LKey{cell[0] >> 4, cell[1] >> 4, cell[2] >> 4, level}].push_back(
+            (mat << kCellBits) | ci);
+      }
     }
   }
   // The layer's cells AT the ground of a sample column also speak for the

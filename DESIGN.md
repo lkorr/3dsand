@@ -16156,6 +16156,59 @@ where you hear from either (§12b, "The ears are on the character").
   capped at `h - 10`, so caves never breach the surface and coarse center
   samples never land in a void — verified by rendering levels 4–6 with fog at
   3% of nominal, which shows solid terrain with no swiss-cheese.
+  **THE CONTAINER RULE (2026-10-07; worldgen.wgsl `farContainedBy`,
+  faredits.h `kContainMaxShift` / `StampContainers`; gate `far-contain`).**
+  The one exception to "a cell is its centre sample". Harrowby's quench trough
+  (stone walls one voxel thick, water inside) read as a box of water from just
+  past the 20.5 m handoff (F12 report 2026-10-07_20-46-57): a wall on the
+  unsampled parity lost to the AIR outside it or the WATER inside it, and
+  nothing stood between the eye and the fill. At levels 1-2 (cells inside one
+  fine chunk, 8 / 64 voxels) a cell whose centre is not a WALL (far-solid, not
+  liquid) takes the first CONTAINER WALL voxel in it -- x fastest, then y,
+  then z -- where a container wall is a wall voxel with at least one LIQUID
+  and at least one OPEN (air, gas, micro plant) face neighbour: the voxel
+  between a liquid and open space. The "and open" half is what keeps the
+  rule from eating liquid the far field always showed (a first cut that let
+  any wall in a liquid-centred cell win turned a 1-voxel puddle or stream into
+  ground and lifted every lake bed a cell): a lake bed and the ground under a
+  puddle touch liquid and more ground, never open space. A lake's waterline
+  bank gains at most one cell AT the waterline. Unseen neighbours count as
+  open. Three producers, one answer: the downsample over the live grid (the
+  tail of `fardownFeat`, the last follow-up after `fardown`, with an exact
+  prefilter: no liquid in the chunk or across its faces, no scan; inside
+  `fardown` itself every measured spelling but one hit the driver's compile
+  cliff, 13 s -> 55-67 s; it writes the wall's own far slot, not the skin,
+  which differs from the patch path in colour only for a container cell that
+  also holds its column's ground); the CPU
+  `FarEdits` twin for an evicted chunk's patch (it sees only that chunk, so a
+  wall whose liquid is wholly across a chunk face is a downsample-only
+  answer); and, for the SIEVE, `FarEdits::StampContainers`: a stamped
+  structure is pristine procgen whose chunks are never dirty, so its cells
+  come from `far` alone, which does NOT apply the rule -- the rule is
+  evaluated on the CPU over every map stamp's template (pad ground under
+  template air) once per window generation and the changed cells ride the
+  edit-layer base into `farpatch`. It lived inside `far` for an afternoon and
+  took that entry's driver compile from ~17 s to ~62 s per worldgen.wgsl edit;
+  as data it costs nothing. **What it deliberately does not do:** a 1-voxel
+  wall with AIR on both sides (a door leaf, a plank partition, a fence) stays
+  a centre-sample fact. The authored structures have thousands of such voxels
+  (plank, timber, door_wood, roof_tile: 1.5-5 k per house) against three
+  liquid containers in all of Harrowby (trough, well, longhouse), and the
+  general form ("a thin wall beats an empty centre") cannot be confined: it
+  fattens every branch, leaf and edge by a cell at levels 1-2, it has no
+  live grid in the sieve except through templates, and the conservative
+  blocker flag already declined "raise the surface by a cell" as a primary
+  hit for the same reason (`render.farBlockerHitLevel`). The failure it
+  leaves is a dark doorway or a missing plank at 20-80 m, not a cross-section
+  through a container. Left open: a basin wall TWO voxels thick at level 2,
+  on the one parity where a cell holds the inner layer plus water; a stamp
+  moved live in the editor keeps its old container cells until the next
+  window generation; a basin's outer CORNER column touches walls, not liquid,
+  so a cell holding only it and outside air stays empty (a one-cell notch);
+  liquid in a vessel or a body is not in the voxel grid and not in scope.
+  `--at x,y,z,yaw,pitch --frames N` reproduces a report's camera into
+  `screenshot_at.bmp`; `SANDVOX_AT_FARPROBE=x,y,z[,level]` prints the cascade
+  bytes and patch words around a voxel on that frame.
   **The far SURFACE MAP (LOD-seam package A, 2026-09-28).** Centre sampling
   is the cascade's resolution limit and the window edge is where it shows: a
   level-1 cell is a 20 cm cube standing where the near field draws four 10 cm

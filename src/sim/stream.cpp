@@ -228,6 +228,19 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
     groundSlot.push_back((uint8_t)(kept ? m.farPalSlot : FarEdits::kGroundNotSolid));
   }
   farEdits_.SetGroundSource(std::move(groundSlot), world_);
+  // The far index's CONTAINER RULE source (faredits.h kContainMaxShift):
+  // liquids yield, far-solid non-liquids (worldgen farCellIsSolid) win.
+  std::vector<uint8_t> containKind;
+  containKind.reserve(mats.size());
+  for (const auto& m : mats) {
+    const bool farSolid = containKind.size() != kMatAir && m.gpu.klass != CLASS_GAS &&
+                          (m.gpu.flags & kMatFlagMicro) == 0;
+    containKind.push_back(containKind.size() == kMatAir ? FarEdits::kContainNone
+                          : m.gpu.klass == CLASS_LIQUID ? FarEdits::kContainLiquid
+                          : farSolid                  ? FarEdits::kContainWall
+                                                      : FarEdits::kContainNone);
+  }
+  farEdits_.SetContainSource(std::move(containKind));
 }
 
 void Stream::Update(const InterestSet& interest, uint32_t tick) {

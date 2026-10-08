@@ -110,6 +110,7 @@
 #include "sim/worldio.h"
 #include "telemetry.h"
 #include "test/selftest.h"
+#include "sim/faredits.h"
 #include "tools/voxregion.h"  // --voxdump / --voxserve, the tuner's voxel view
 #include "measure/measure.h"
 #include "measure/perfsuite.h"
@@ -837,6 +838,11 @@ int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
 // cut and wipes the bodies, which read as "the tree vanished".
 bool g_fellSiteSet = false;
 int g_fellSiteX = 0, g_fellSiteZ = 0;
+// --at x,y,z[,yawDeg,pitchDeg]: start the game with the EYE there, looking
+// that way -- the line every F12 bug report writes under each picture
+// (ui/bugreport.h), so "where was this" is one paste. Voxel units, degrees.
+bool g_atSet = false;
+float g_atEye[3] = {0, 0, 0}, g_atYawDeg = 0, g_atPitchDeg = 0;
 // --forest-fire [tick]: the "whole forest is burning around me" frame-rate
 // repro, in the live loop so debris, mobs, audio and the render all pay what
 // the game pays (--perf treeburn is ONE tree, headless, with no debris).
@@ -1732,6 +1738,7 @@ IVec3 SpawnWindowOrigin() {
   // frame (205-234 shifts, 10 ms each, plus a worldgen plane per shift) --
   // over before the cut, but it owned the whole-run stream and worldgen rows.
   if (g_fellSiteSet) { sx = g_fellSiteX - 48; sz = g_fellSiteZ; }
+  if (g_atSet) { sx = (int)std::floor(g_atEye[0]); sz = (int)std::floor(g_atEye[2]); }
   return IVec3{(sx >> 4) - half, 0, (sz >> 4) - half};
 }
 Vec3 SpawnPos() {
@@ -5682,6 +5689,17 @@ int main(int argc, char** argv) {
       else
         std::fprintf(stderr, "--ticket wants x,y,z (world voxels), got '%s'\n", argv[i]);
     }
+    else if (a == "--at") {
+      if (i + 1 < argc &&
+          std::sscanf(argv[i + 1], "%f,%f,%f,%f,%f", &g_atEye[0], &g_atEye[1], &g_atEye[2],
+                      &g_atYawDeg, &g_atPitchDeg) >= 3) {
+        g_atSet = true;
+        i++;
+      } else {
+        std::fprintf(stderr, "--at wants x,y,z[,yawDeg,pitchDeg] (voxels, degrees)\n");
+        return 2;
+      }
+    }
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -7532,6 +7550,13 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("SANDVOX_FELL_YAW")) cam.yaw = (float)std::atof(e);
     std::printf("--fell-tree: spawn moved to (%d, %d) so the tree stands at (%d, %d)\n",
                 px, g_fellSiteZ, g_fellSiteX, g_fellSiteZ);
+  }
+  if (g_atSet) {
+    player.pos = Vec3{g_atEye[0], g_atEye[1], g_atEye[2]} - Vec3{0, player.EyeOffsetNow(), 0};
+    cam.yaw = g_atYawDeg * 0.0174532925f;
+    cam.pitch = g_atPitchDeg * 0.0174532925f;
+    std::printf("--at: eye (%.2f, %.2f, %.2f) yaw %.1f pitch %.1f\n", g_atEye[0], g_atEye[1],
+                g_atEye[2], g_atYawDeg, g_atPitchDeg);
   }
   // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
   // bench renders from, so what is judged live and what is measured headless
@@ -11528,6 +11553,84 @@ int main(int argc, char** argv) {
       // is the numbered choice rows.
       if (f == kShotDlgChoose) feeder.Talk(kTalkContinue);
       if (f == kShotDlgShot2) g_shotJumpPath = "screenshot_dialogue_2.bmp";
+    }
+    // --at under --frames N: a bug report's view, reproduced headless. The
+    // camera is held where --at put it (flying, still, no HUD) and the frame
+    // is written to screenshot_at.bmp eight frames before the run ends, so a
+    // fix to what the report shows is judged from the report's own camera.
+    if (g_atSet && g_harnessFrames > 16) {
+      if (frameCounter == 1) {
+        ui.fly = true;
+        player.fly = true;
+        ui.visible = false;
+      }
+      player.pos = Vec3{g_atEye[0], g_atEye[1], g_atEye[2]} - Vec3{0, player.EyeOffsetNow(), 0};
+      player.vel = Vec3{0, 0, 0};
+      cam.yaw = g_atYawDeg * 0.0174532925f;
+      cam.pitch = g_atPitchDeg * 0.0174532925f;
+      if (frameCounter == g_harnessFrames - 8) g_shotJumpPath = "screenshot_at.bmp";
+      // SANDVOX_AT_FARPROBE=x,y,z[,level]: the cascade cells the picture drew
+      // around one fine voxel -- a 5x5 slab in XZ at the voxel's level cell
+      // row, as the GPU holds them (byte = far slot | blocker bit) beside the
+      // FarEdits patch word the CPU would hand a refill. A harness-only
+      // blocking readback, on the shot frame, never in play.
+      const char* fp = std::getenv("SANDVOX_AT_FARPROBE");
+      int px = 0, py = 0, pz = 0, plv = 1;
+      if (fp && frameCounter == g_harnessFrames - 8 &&
+          std::sscanf(fp, "%d,%d,%d,%d", &px, &py, &pz, &plv) >= 3) {
+        ctx.WaitIdle();
+        const int sh = plv + (int)kFarShiftBase;
+        std::printf("farprobe: level %d around voxel (%d,%d,%d); index: %zu base level chunks, "
+                    "%zu noted, list here %s; slots:",
+                    plv, px, py, pz, world.farEdits ? world.farEdits->BaseLevelChunks() : 0,
+                    world.farEdits ? world.farEdits->LevelChunks() : 0,
+                    world.farEdits && world.farEdits->Lookup(
+                                          (uint32_t)plv, IVec3{px >> (sh + 4), py >> (sh + 4),
+                                                               pz >> (sh + 4)})
+                        ? "yes"
+                        : "no");
+        for (size_t m = 0; m < mats.size(); m++)
+          if (mats[m].name == "stone" || mats[m].name == "water" || mats[m].name == "cobble" ||
+              mats[m].name == "dirt" || mats[m].name == "grass" || mats[m].name == "timber")
+            std::printf(" %s=%u", mats[m].name.c_str(), mats[m].farPalSlot);
+        std::printf("\n");
+        if (world.farEdits) {
+          const IVec3 lc{px >> (sh + 4), py >> (sh + 4), pz >> (sh + 4)};
+          if (const auto* v = world.farEdits->Lookup((uint32_t)plv, lc)) {
+            int shown = 0;
+            std::printf("farprobe: list of %zu words in level chunk (%d,%d,%d); non-air:", v->size(),
+                        lc.x, lc.y, lc.z);
+            for (uint32_t w : *v) {
+              const uint32_t ci = w & FarEdits::kCellMask, m = (w >> FarEdits::kCellBits) & 0xFFFu;
+              if (m == 0 || m == FarEdits::kMatUntouched || shown >= 40) continue;
+              std::printf(" (%u,%u,%u)=%u", (lc.x << 4) + (ci & 15), (lc.y << 4) + ((ci >> 4) & 15),
+                          (lc.z << 4) + (ci >> 8), m);
+              shown++;
+            }
+            std::printf("\n");
+          }
+        }
+        for (int dy = -1; dy <= 1; dy++) {
+          for (int dz = -2; dz <= 2; dz++) {
+            std::printf("farprobe: y%+d z%+d |", dy, dz);
+            for (int dx = -2; dx <= 2; dx++) {
+              const IVec3 cc{(px >> sh) + dx, (py >> sh) + dy, (pz >> sh) + dz};
+              const uint32_t b = selftest::FarVoxByte(ctx, world, (uint32_t)plv, cc);
+              uint32_t pw = 0xFFFFFFFFu;
+              if (world.farEdits) {
+                const IVec3 lc{cc.x >> 4, cc.y >> 4, cc.z >> 4};
+                const uint32_t ci = (uint32_t)((((cc.z & 15) * 16) + (cc.y & 15)) * 16 + (cc.x & 15));
+                if (const auto* v = world.farEdits->Lookup((uint32_t)plv, lc))
+                  for (uint32_t w : *v)
+                    if ((w & FarEdits::kCellMask) == ci) pw = (w >> FarEdits::kCellBits) & 0xFFFu;
+              }
+              if (pw == 0xFFFFFFFFu) std::printf(" %02x/--- ", b);
+              else std::printf(" %02x/%03u ", b, pw);
+            }
+            std::printf("\n");
+          }
+        }
+      }
     }
     // --shot-spawn's schedule (see g_shotSpawn).
     if (g_shotSpawn) {
@@ -19297,14 +19400,46 @@ int main(int argc, char** argv) {
                 "- map: %s\n- eye: (%.2f, %.2f, %.2f)  yaw %.1f deg  pitch %.1f deg\n"
                 "- sim tick: %u%s\n- frame: %.0f fps, %.1f ms\n- window: %ux%u\n"
                 "- crosshair material: %s\n- render scale: %.2f\n",
-                refsMapName().c_str(), eye.x, eye.y, eye.z, cam.yaw * 57.2957795f,
-                cam.pitch * 57.2957795f, tick, ui.paused ? " (paused)" : "", ui.fps,
+                refsMapName().c_str(), eye.x, eye.y, eye.z,
+                std::remainder(cam.yaw * 57.2957795f, 360.0f), cam.pitch * 57.2957795f, tick, ui.paused ? " (paused)" : "", ui.fps,
                 ui.frameMs, W, H,
                 hm > 0 && hm < (int)ui.materialNames.size() ? ui.materialNames[hm].c_str() : "-",
                 CurrentTuning().render.renderScale);
             bugContext = c;
           }
-          BugReportAddShot(ui, std::move(px), W, H);
+          // THIS picture's camera: where it stood, where it looked, what the
+          // crosshair was on, and the line that boots the game right there
+          // (--at). A report's later pictures are usually the interesting
+          // ones -- walk closer, it changes -- so every shot carries its own.
+          std::string where;
+          {
+            const Vec3 eye = player.EyePos();
+            const Vec3 fwd = cam.Forward();
+            const int hm = ui.hoverMat;
+            const IVec3 wo = world.WindowOrigin();
+            // cam.yaw is never wrapped (a report once read "yaw -1805.3")
+            const float yawD = std::remainder(cam.yaw * 57.2957795f, 360.0f);
+            const float pitchD = cam.pitch * 57.2957795f;
+            char hit[160] = "nothing in the window";
+            if (hm > 0 && hm < (int)ui.materialNames.size())
+              std::snprintf(hit, sizeof hit, "%s at %.1f m", ui.materialNames[hm].c_str(),
+                            ui.hoverDist);
+            char wbuf[1024];
+            std::snprintf(
+                wbuf, sizeof wbuf,
+                "- eye: (%.2f, %.2f, %.2f) voxels = (%.1f, %.1f, %.1f) m, chunk (%d, %d, %d)\n"
+                "- view: yaw %.1f deg, pitch %.1f deg, forward (%.3f, %.3f, %.3f)%s\n"
+                "- crosshair: %s\n"
+                "- sim tick %u, window origin chunk (%d, %d, %d)\n"
+                "- go there: `sandvox.exe --at %.2f,%.2f,%.2f,%.1f,%.1f`\n",
+                eye.x, eye.y, eye.z, eye.x * kVoxelMeters, eye.y * kVoxelMeters,
+                eye.z * kVoxelMeters, (int)std::floor(eye.x) >> 4, (int)std::floor(eye.y) >> 4,
+                (int)std::floor(eye.z) >> 4, yawD, pitchD, fwd.x, fwd.y, fwd.z,
+                player.fly ? ", flying" : "", hit, tick, wo.x, wo.y, wo.z, eye.x, eye.y, eye.z,
+                yawD, pitchD);
+            where = wbuf;
+          }
+          BugReportAddShot(ui, std::move(px), W, H, std::move(where));
           ui.bug.open = true;
           ui.bug.collecting = false;
           ui.bug.focusText = true;

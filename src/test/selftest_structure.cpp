@@ -20,8 +20,12 @@
 //                     the streamer, and the result equals a from-scratch
 //                     worldgen of the new state word for word; the RefStore
 //                     re-derives the slots (structures::Reload).
+//   far-contain       The far field's CONTAINER RULE on the real case: the
+//                     smithy's 1-voxel quench trough must read as stone, not
+//                     water, at cascade levels 1-2 from all three producers
+//                     (sieve, downsample, CPU patch), which agree byte for byte.
 //
-// Both run on the HARNESS map through worldmap::SetStructureOverride (the
+// All run on the HARNESS map through worldmap::SetStructureOverride (the
 // harness refs dir is the refs gates' fixture), both restore the environment
 // and regenerate the window on the way out.
 
@@ -40,6 +44,7 @@
 
 #include "measure/perfsuite.h"
 #include "sim/biomes.h"
+#include "sim/materials.h"
 #include "sim/stream.h"
 #include "sim/worldgen_run.h"
 #include "sim/worldmap.h"
@@ -805,6 +810,279 @@ Status GateStructureDoor(Ctx& c, std::string& detail) {
   return why.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- far-contain ---------------------------------------------------------------
+// THE CONTAINER RULE (worldgen.wgsl farContainedBy,
+// faredits.h kContainMaxShift / StampContainers; F12 report 2026-10-07_20-46-57): past the LOD
+// handoff a basin with 1-voxel walls must not read as a box of liquid. The
+// fixture is the REAL case: Harrowby's smithy (whose quench trough is an 8x3x8
+// pool inside a 1-voxel stone box) placed as a structure ref on the harness
+// pad, shifted so the trough and a one-voxel ring sit inside ONE fine chunk
+// -- x walls at chunk-local 3 and 12, z walls at 2 and 11 -- so level 1 and
+// level 2 both see a wall whose cell centre is OUTSIDE air and one whose
+// cell centre is the WATER, and the CPU twin (which sees one chunk) has
+// everything it needs. Three producers, one answer:
+//
+//   S  the SIEVE and its base patch (a full refill: the stamp is pristine
+//      procgen, its cells come from `far`, which centre-samples, and then
+//      `farpatch` lays FarEdits::StampContainers' words over them -- the
+//      rule evaluated on the CPU over the stamp template at worldgen);
+//   D  the DOWNSAMPLE (an edit in the trough's chunk after that refill, so
+//      `fardown` rewrites its cells from the live grid; the edit is the proof);
+//   P  the CPU PATCH (the trough's chunk noted into FarEdits, then a refill:
+//      `farpatch` writes Sweep's words over the sieve's).
+//
+// Over every level-1/2 cell of the trough box (+1 ring), with the cell's
+// voxels read back and classified the way the rule does (liquid / wall /
+// open):
+//   (a) a cell holding a CONTAINER WALL voxel (a wall with a liquid and an open
+//       face neighbour) reads a wall slot in all three -- never water, never
+//       air -- and at each level some such cell has a NON-wall centre (the
+//       rule fired; without it the gate would pass on centre samples alone);
+//   (b) a cell whose centre is liquid and which holds no container wall reads
+//       LIQUID in all three: the trough FLOOR (stone under water, stone under
+//       that) is the lake-bed / puddle case and must not eat the water;
+//   (c) S == D == P byte for byte.
+Status GateFarContain(Ctx& c, std::string& detail) {
+  refs::RegisterAllKinds();
+  structures::TakeReapply();
+  std::vector<std::string> why;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok && why.size() < 8) why.push_back(what);
+    return ok;
+  };
+  const IVec3 savedOrigin = c.world.WindowOrigin();
+  const char* kBase = "harrowby_smithy";
+  structures::Asset asset;
+  {
+    std::string err;
+    std::vector<std::string> w;
+    if (!structures::LoadAsset(AssetDir(), kBase, true, asset, err, w)) {
+      detail = "cannot load " + std::string(kBase) + ": " + err;
+      return Status::Fail;
+    }
+  }
+  // The rule's three classes, exactly as stream.cpp feeds FarEdits.
+  enum : uint8_t { kOpen = 0, kLiquid = 1, kWall = 2 };
+  auto kindOf = [&](uint32_t m) -> uint8_t {
+    if (m == kMatAir || m >= c.mats.size()) return kOpen;
+    const MaterialDef& d = c.mats[m];
+    if (d.gpu.klass == CLASS_LIQUID) return kLiquid;
+    return (d.gpu.klass != CLASS_GAS && (d.gpu.flags & kMatFlagMicro) == 0) ? kWall : kOpen;
+  };
+  std::vector<uint8_t> slotKind(256, kOpen);
+  for (size_t m = 1; m < c.mats.size(); m++)
+    if (c.mats[m].farPalOwner && c.mats[m].farPalSlot < 255)
+      slotKind[c.mats[m].farPalSlot] = kindOf((uint32_t)m);
+  const uint32_t mWater = MatId(c.mats, "water");
+
+  // ---- place the house so the trough lands where the claims need it ------
+  c.world.SetWindowOrigin({0, 0, 0});
+  auto troughBox = [&](const structures::Frame& f, IVec3& lo, IVec3& hi) {
+    lo = {INT32_MAX, INT32_MAX, INT32_MAX};
+    hi = {INT32_MIN, INT32_MIN, INT32_MIN};
+    for (const PrefabVoxel& v : asset.prefab.models[0].voxels) {
+      if (v.material != mWater) continue;
+      const IVec3 w = f.Cell({v.x, v.y, v.z});
+      lo = {std::min(lo.x, w.x), std::min(lo.y, w.y), std::min(lo.z, w.z)};
+      hi = {std::max(hi.x, w.x), std::max(hi.y, w.y), std::max(hi.z, w.z)};
+    }
+    return lo.x <= hi.x;
+  };
+  worldmap::StructurePlacement p;
+  p.id = "gate/contain_smithy";
+  p.base = kBase;
+  p.file = "refs/gate.json";
+  p.x = 100;
+  p.z = 100;
+  p.y = World::TerrainHeight(p.x, p.z, kDefaultSeed) + 1;
+  p.yaw = 0;
+  IVec3 wlo, whi;
+  if (!troughBox(structures::MakeFrame(asset, {p.x, p.y, p.z}, 0), wlo, whi)) {
+    detail = std::string(kBase) + " has no water voxels (the trough moved?)";
+    return Status::Fail;
+  }
+  // x wall (wlo.x - 1) -> local 3, z wall (wlo.z - 1) -> local 2, floor
+  // (wlo.y - 1) -> local 3 (y shift kept within -8..7 so the pad stays sane).
+  auto up16 = [](int want, int v) { return (((want - v) % 16) + 16) % 16; };
+  p.x += up16(3, wlo.x - 1);
+  p.z += up16(2, wlo.z - 1);
+  int dy = up16(3, wlo.y - 1);
+  if (dy > 7) dy -= 16;
+  p.y += dy;
+  const structures::Frame frame = structures::MakeFrame(asset, {p.x, p.y, p.z}, 0);
+  troughBox(frame, wlo, whi);
+  const IVec3 bLo{wlo.x - 2, wlo.y - 2, wlo.z - 2};   // walls + the one-voxel ring
+  const IVec3 bHi{whi.x + 2, whi.y + 3, whi.z + 2};   // (the rim stands 2 over the water)
+  const IVec3 wc{bLo.x >> 4, bLo.y >> 4, bLo.z >> 4};
+  if ((bHi.x >> 4) != wc.x || (bHi.y >> 4) != wc.y || (bHi.z >> 4) != wc.z ||
+      ((wlo.x - 1) & 15) != 3 || ((wlo.z - 1) & 15) != 2) {
+    detail = Format("trough box (%d,%d,%d)..(%d,%d,%d) does not fit one chunk at the planned "
+                    "offsets (the asset's trough changed size?)",
+                    bLo.x, bLo.y, bLo.z, bHi.x, bHi.y, bHi.z);
+    return Status::Fail;
+  }
+  std::vector<worldmap::StructurePlacement> list{p};
+  std::string log;
+  if (!Install(c, &list, log)) {
+    Restore(c, savedOrigin);
+    detail = "ReloadEnvironment refused: " + log;
+    return Status::Fail;
+  }
+
+  // ---- the oracle: per cell, from the live voxels -------------------------
+  BoxRead rd{{}, &c.ctx, &c.world};
+  struct CellInfo {
+    int level;
+    IVec3 cc;
+    uint8_t centreKind;
+    bool hasContainer;
+  };
+  std::vector<CellInfo> cells;
+  for (int level = 1; level <= 2; level++) {
+    const int shift = (int)(level + kFarShiftBase), step = 1 << shift;
+    for (int cz = bLo.z >> shift; cz <= bHi.z >> shift; cz++)
+      for (int cy = bLo.y >> shift; cy <= bHi.y >> shift; cy++)
+        for (int cx = bLo.x >> shift; cx <= bHi.x >> shift; cx++) {
+          CellInfo ci{level, {cx, cy, cz}, kOpen, false};
+          const IVec3 c0{cx << shift, cy << shift, cz << shift};
+          ci.centreKind = kindOf(rd.Mat({c0.x + step / 2, c0.y + step / 2, c0.z + step / 2}));
+          for (int z = 0; z < step; z++)
+            for (int y = 0; y < step; y++)
+              for (int x = 0; x < step; x++) {
+                const IVec3 q{c0.x + x, c0.y + y, c0.z + z};
+                if (kindOf(rd.Mat(q)) != kWall) continue;
+                const IVec3 nb[6] = {{q.x + 1, q.y, q.z}, {q.x - 1, q.y, q.z}, {q.x, q.y + 1, q.z},
+                                     {q.x, q.y - 1, q.z}, {q.x, q.y, q.z + 1}, {q.x, q.y, q.z - 1}};
+                bool liq = false, open = false;
+                for (const IVec3& n : nb) {
+                  const uint8_t k = kindOf(rd.Mat(n));
+                  liq = liq || k == kLiquid;
+                  open = open || k == kOpen;
+                }
+                ci.hasContainer = ci.hasContainer || (liq && open);
+              }
+          cells.push_back(ci);
+        }
+  }
+  auto readArm = [&]() {
+    std::vector<uint32_t> b;
+    for (const CellInfo& ci : cells) b.push_back(FarVoxByte(c.ctx, c.world, (uint32_t)ci.level, ci.cc));
+    return b;
+  };
+
+  // ---- S: the sieve -------------------------------------------------------
+  DrainFullRefill(c.ctx, c.world, c.sim, wc);
+  const std::vector<uint32_t> S = readArm();
+  // ---- D: the downsample ------------------------------------------------------
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): this gate tests the far producers,
+  // not the tick; a bare SubmitTick with one cell op is exactly what puts the
+  // trough's chunk through `fardown`, the phase under test (far-downsample
+  // does the same). The op is the PROOF it ran: a level-1 cell centre in this
+  // chunk, above every checked cell, changed so its cell must read
+  // differently from the sieve's byte -- a wall voxel carved to air, or, if
+  // none stands there, glass laid on top of one (a free-floating voxel would
+  // be lifted out as debris before the downsample saw it). Without it an arm
+  // that silently skipped the chunk reads the sieve's bytes back and agrees
+  // with everything, which is how this gate's first draft passed with the
+  // rule taken out of `fardown`.
+  const IVec3 cb{wc.x * 16, wc.y * 16, wc.z * 16};
+  const int sh1 = (int)(1 + kFarShiftBase);
+  IVec3 probe{0, 0, 0};
+  uint32_t probeWord = 0;
+  bool haveProbe = false;
+  for (int pass = 0; pass < 2 && !haveProbe; pass++)
+    for (int y = ((bHi.y >> sh1) + 1) << sh1; y < cb.y + 16 && !haveProbe; y += 1 << sh1)
+      for (int z = cb.z; z < cb.z + 16 && !haveProbe; z += 1 << sh1)
+        for (int x = cb.x; x < cb.x + 16 && !haveProbe; x += 1 << sh1) {
+          const IVec3 q{x + (1 << (sh1 - 1)), y + (1 << (sh1 - 1)), z + (1 << (sh1 - 1))};
+          const uint8_t k = kindOf(rd.Mat(q));
+          if (pass == 0 && k == kWall) { probe = q; probeWord = kMatAir; haveProbe = true; }
+          if (pass == 1 && k == kOpen && kindOf(rd.Mat({q.x, q.y - 1, q.z})) == kWall) {
+            probe = q;
+            probeWord = kMatGlass;
+            haveProbe = true;
+          }
+        }
+  const IVec3 probeCell{probe.x >> sh1, probe.y >> sh1, probe.z >> sh1};
+  const uint32_t probeS = haveProbe ? FarVoxByte(c.ctx, c.world, 1, probeCell) : 0;
+  for (uint32_t t = 1; t <= 3; t++) {
+    std::vector<CellOp> ops;
+    if (t == 1 && haveProbe) ops.push_back(CellOp{World::SlotCellIndex(probe), probeWord});
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, {}, {}, ops, false, wc, false, false);
+  }
+  c.ctx.WaitIdle();
+  const std::vector<uint32_t> D = readArm();
+  const uint32_t probeD = haveProbe ? FarVoxByte(c.ctx, c.world, 1, probeCell) : 0;
+  // ---- P: the CPU patch -----------------------------------------------------
+  FarEdits& edits = c.stream.Edits();
+  edits.Clear();
+  {
+    std::vector<uint32_t> words(kChunkVol);
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(wc), 1, words.data(), "farContain");
+    edits.NoteChunk(wc, words.data());
+  }
+  DrainFullRefill(c.ctx, c.world, c.sim, wc);
+  const std::vector<uint32_t> P = readArm();
+  const uint32_t probeP = haveProbe ? FarVoxByte(c.ctx, c.world, 1, probeCell) : 0;
+  edits.Clear();
+
+  // ---- verdict ----------------------------------------------------------------
+  auto kindOfByte = [&](uint32_t b) { return b == kFarPalBlocker ? kOpen : slotKind[b & 0xFFu]; };
+  int contain[3] = {0, 0, 0}, fired[3] = {0, 0, 0}, wallBad = 0, pools = 0, poolBad = 0;
+  int diffSD = 0, diffSP = 0;
+  std::string firstBad, firstDiff;
+  for (size_t i = 0; i < cells.size(); i++) {
+    const CellInfo& ci = cells[i];
+    const uint32_t arms[3] = {S[i], D[i], P[i]};
+    const auto where = [&]() {
+      return Format("L%d cell (%d,%d,%d) centre %s: S %02x D %02x P %02x", ci.level, ci.cc.x, ci.cc.y,
+                    ci.cc.z, ci.centreKind == kWall ? "wall" : ci.centreKind == kLiquid ? "liquid" : "open",
+                    S[i], D[i], P[i]);
+    };
+    if (ci.hasContainer) {
+      contain[ci.level]++;
+      if (ci.centreKind != kWall) fired[ci.level]++;
+      for (uint32_t b : arms)
+        if (kindOfByte(b) != kWall) {
+          if (wallBad++ == 0) firstBad = "container cell not a wall: " + where();
+          break;
+        }
+    } else if (ci.centreKind == kLiquid) {
+      pools++;
+      for (uint32_t b : arms)
+        if (kindOfByte(b) != kLiquid) {
+          if (poolBad++ == 0 && firstBad.empty()) firstBad = "pool cell lost its liquid: " + where();
+          break;
+        }
+    }
+    if (S[i] != D[i] && diffSD++ == 0) firstDiff = where();
+    if (P[i] != D[i] && diffSP++ == 0 && firstDiff.empty()) firstDiff = where();
+  }
+  check(haveProbe && probeD != probeS && probeP == probeD,
+        Format("the arms did not run: probe cell (%d,%d,%d) %s, byte sieve %02x downsample %02x patch %02x",
+               probeCell.x, probeCell.y, probeCell.z, haveProbe ? (probeWord ? "glassed" : "carved") : "NOT FOUND",
+               probeS, probeD, probeP));
+  check(contain[1] > 0 && contain[2] > 0 && fired[1] > 0 && fired[2] > 0,
+        Format("vacuous: container cells L1 %d (%d off-centre), L2 %d (%d off-centre)", contain[1],
+               fired[1], contain[2], fired[2]));
+  check(wallBad == 0, Format("%d container cells not a wall in some arm; first %s", wallBad, firstBad.c_str()));
+  check(pools > 0 && poolBad == 0,
+        Format("%d/%d liquid-centred cells without a container wall lost the liquid; first %s", poolBad,
+               pools, firstBad.c_str()));
+  check(diffSD == 0 && diffSP == 0,
+        Format("producers disagree: sieve!=downsample %d, patch!=downsample %d of %zu cells; first %s", diffSD,
+               diffSP, cells.size(), firstDiff.c_str()));
+
+  Restore(c, savedOrigin);
+  detail = Format("trough chunk (%d,%d,%d): container cells L1 %d (%d off-centre) L2 %d (%d off-centre), "
+                  "%d walls lost | %d pool cells, %d lost | S/D/P disagree %d/%d of %zu | probe %02x->%02x/%02x",
+                  wc.x, wc.y, wc.z, contain[1], fired[1], contain[2], fired[2], wallBad, pools, poolBad, diffSD,
+                  diffSP, cells.size(), probeS, probeD, probeP);
+  for (const std::string& w : why) detail += " | FAIL: " + w;
+  std::printf("far-contain: %s (%s)\n", why.empty() ? "PASS" : "FAIL", detail.c_str());
+  return why.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& StructureGates() {
@@ -812,6 +1090,7 @@ const std::vector<Gate>& StructureGates() {
       {"structure-stamp", "world", {}, false, GateStructureStamp, /*needsRender=*/false},
       {"structure-reload", "world", {}, false, GateStructureReload, /*needsRender=*/false},
       {"structure-door", "world", {}, false, GateStructureDoor, /*needsRender=*/false},
+      {"far-contain", "render", {}, false, GateFarContain, /*needsRender=*/false},
   };
   return g;
 }

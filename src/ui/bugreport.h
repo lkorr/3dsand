@@ -14,7 +14,9 @@
 //              appends a picture to the SAME report. Shift+F12 returns to the
 //              panel without taking one.
 //   submit     writes bug_reports/<YYYY-MM-DD_HH-MM-SS>/report.md + shot_N.png
-//              beside assets/ (gitignored).
+//              beside assets/ (gitignored). Every picture carries its own
+//              camera and a `--at x,y,z,yaw,pitch` line that boots the game
+//              standing there, looking that way.
 //
 // The panel is a drawing function over UIState::bug, like the conversation
 // panel: it writes intent latches (wantSubmit / wantAddAnother / wantDiscard /
@@ -23,8 +25,11 @@
 void DrawBugReport(UIState& s);
 
 // Append one screenshot (RGBA8, top row first) to the open report and build
-// its pixel-mosaic thumbnail.
-void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h);
+// its pixel-mosaic thumbnail. `where` is that picture's camera (eye, view,
+// crosshair, the `--at` line that starts the game there), written under its
+// heading in report.md.
+void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h,
+                      std::string where);
 
 // Write the report: <root>/<stamp>/report.md (the text, the shots inline, and
 // `context` as a trailing section) plus shot_1.png ... Returns false with

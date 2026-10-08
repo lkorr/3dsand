@@ -1307,6 +1307,7 @@ struct UIState {
       std::vector<uint8_t> rgba;     // top row first
       uint32_t tw = 0, th = 0;       // the mosaic thumbnail, in cells
       std::vector<uint32_t> thumb;   // IM_COL32 order
+      std::string where;             // markdown lines: the camera at THIS picture
     };
     bool open = false;          // the panel is up: world paused, cursor free
     bool collecting = false;    // "add another": panel folded, F12 appends

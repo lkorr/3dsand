@@ -243,7 +243,9 @@ void WorldEdits::QueueWindow(const World& world) {
   // the horizon agrees with the layer the window is about to receive — and
   // loses a layer the map no longer names.
   if (cols_.empty()) {
-    if (world.farEdits && world.farEdits->BaseLevelChunks()) world.farEdits->SetBase({});
+    // Unconditionally: the base also carries the map stamps' container cells
+    // (faredits.h SetBase), which a map without a layer still has.
+    if (world.farEdits) world.farEdits->SetBase({});
     return;
   }
   Resolve(world.WorldSeed());

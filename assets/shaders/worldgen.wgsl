@@ -4955,6 +4955,130 @@ fn farCellIsSolid(mat : u32) -> bool {
   return m.klass != CLASS_GAS && (m.flags & MATF_MICRO) == 0u;
 }
 
+// ---- THE CONTAINER RULE: a wall between liquid and open space is kept -------
+// (2026-10-07, bug report 2026-10-07_20-46-57). A centre sample sees ONE voxel
+// of the cell's 2^(3*shift), so a basin with 1-voxel walls -- Harrowby's
+// quench trough -- lost every wall on the unsampled parity at level 1: the
+// wall's cell sampled the AIR outside it (or the water inside it), the next
+// cell in sampled water, and from just past the LOD handoff the trough read
+// as a box of water standing in the open until the fine march took over.
+//
+// So at the fine levels (shift <= FAR_CONTAIN_MAX_SHIFT) a cell whose centre
+// is not already a WALL takes the first CONTAINER WALL voxel in it, scanning
+// x fastest, then y, then z from the cell's min corner. A container wall is a
+// wall voxel with, across its six faces, at least one LIQUID neighbour AND at
+// least one OPEN one: it is what separates a liquid from open space, so
+// dropping it is what shows the liquid through. Three classes
+// (farContainKind): LIQUID (klass liquid), WALL (far-solid, not liquid: what
+// farCellIsSolid keeps), OPEN (everything else: air, gas, a MICRO plant). A
+// neighbour the producer cannot see counts as OPEN (the direction that keeps
+// a wall, which is the direction this rule errs in).
+//
+// WHY "AND OPEN" (audit, same day). The first cut took any wall touching
+// liquid, and any wall at all when the centre was liquid. That ate liquid
+// the far field had always shown: a 1-voxel-deep puddle or stream on flat
+// ground (its cell holds the ground under it, so it became ground), every
+// lake bed one cell up, the face of rock behind a flow. A lake bed and the
+// ground under a puddle touch liquid and more ground, never open space, so
+// the "open" half excludes them by construction; a trough wall touches the
+// water inside and the air outside, and a lake's waterline bank voxel the
+// water beside it and the air above it -- the bank gains at most one cell at
+// the waterline and nothing below it. What it does NOT recover: a basin wall
+// TWO voxels thick at level 2 on the one parity where the cell holds the
+// inner layer and water (the inner layer touches no open space); and a
+// 1-voxel wall with air on both sides (a door leaf, a plank) stays a
+// centre-sample fact, by decision (DESIGN.md, the container rule paragraph).
+//
+// The cell lies inside the caller's chunk at these shifts, so the scan reads
+// the page directly (`pageBase`, the materialized page; a sentinel chunk is
+// one material and never needs it); a face neighbour may be in the next
+// chunk, read through voxWordAt and only inside the window. The caller is the
+// tail of `fardownFeat` (the downsample's last follow-up phase), not
+// `fardown` itself -- see the note there for why.
+//
+// THIS IS ONE OF THREE PRODUCERS, AND THE ONLY ONE IN WGSL. faredits.cpp
+// (`FarEdits::kContainMaxShift`, `ContainedBy`) is the CPU twin -- same order,
+// same classes, same cap -- for an evicted chunk's patch (it sees only that
+// chunk: a wall whose liquid is wholly across a chunk face is a
+// downsample-only answer) and for the SIEVE's half: a stamped structure is
+// pristine procgen, its chunks are never dirty, so its cells come from `far`
+// alone -- and `far` does not apply the rule. FarEdits::StampContainers
+// evaluates it over the map's stamp templates once per window generation and
+// hands the changed cells to `farpatch` as base patch words. It lived inside
+// `far` for an afternoon (a template scan per cell near stamp liquid) and
+// took that entry's driver compile from 16.8 s to 62 s, paid on every edit of
+// this file; as data it costs nothing. The `far-contain` gate holds the
+// sieve+patch, the downsample and the CPU patch to one answer.
+const FAR_CONTAIN_MAX_SHIFT : u32 = 2u;   // faredits.h kContainMaxShift
+const FAR_CK_OPEN : u32 = 0u;
+const FAR_CK_LIQUID : u32 = 1u;
+const FAR_CK_WALL : u32 = 2u;
+fn farContainKind(m : u32) -> u32 {
+  if (m != MAT_AIR && materials[m].klass == CLASS_LIQUID) { return FAR_CK_LIQUID; }
+  return select(FAR_CK_OPEN, FAR_CK_WALL, farCellIsSolid(m));
+}
+// Face neighbour j = 1..6 of the scan: +x, -x, +y, -y, +z, -z; j = 0 is the
+// zero offset (no axis matches). Arithmetic, not a function-local array (a
+// dynamically indexed one goes to scratch).
+fn farFaceDir(j : u32) -> vec3<i32> {
+  let s = select(-1, 1, (j & 1u) == 1u);
+  let a = (j - 1u) / 2u;
+  return vec3<i32>(select(0, s, a == 0u), select(0, s, a == 1u), select(0, s, a == 2u));
+}
+// Voxel i of a 2^shift cell from its min corner c0: x fastest, then y, then z.
+// Shifts and masks, never `/ step`: a division by a runtime word is what this
+// file's compile notes warn about (pondTile).
+fn farCellVoxel(c0 : vec3<i32>, i : u32, shift : u32) -> vec3<i32> {
+  let m = (1u << shift) - 1u;
+  return c0 + vec3<i32>(i32(i & m), i32((i >> shift) & m), i32(i >> (2u * shift)));
+}
+// THE SCAN. Voxel i of the cell (outer loop), then j = 0..6 (inner loop):
+// j == 0 classifies the voxel itself and leaves at once unless it is a wall,
+// j = 1..6 its face neighbours (farFaceDir(0) is the zero offset), so each
+// source's lookup has ONE call site. `seen` collects bit 0 = a liquid
+// neighbour, bit 1 = an open one. Both loops start at the unroll fence (the
+// voxel loop's trip is 8 or 64).
+fn farContainLookup(q : vec3<i32>, base : vec3<i32>, pageBase : u32) -> u32 {
+  // In this chunk: the page itself. Elsewhere: the window; a cell the window
+  // does not hold reads as air, i.e. OPEN.
+  let l = q - base;
+  if (all(l >= vec3<i32>(0)) && all(l < vec3<i32>(i32(CHUNK)))) {
+    let lu = vec3<u32>(l);
+    return voxels[pageBase + (lu.z * CHUNK + lu.y) * CHUNK + lu.x] & 0xFFFu;
+  }
+  if (!inWindow(q, T.origin)) { return MAT_AIR; }
+  return voxWordAt(q) & 0xFFFu;
+}
+// `pe` is the chunk's page-table entry: a sentinel chunk is one material and
+// never holds a container wall with something else beside it in the cell.
+fn farContainedBy(mat : u32, fine : vec3<i32>, shift : u32, base : vec3<i32>,
+                  pe : u32) -> u32 {
+  if (shift > FAR_CONTAIN_MAX_SHIFT || (pe & PT_SENTINEL_BIT) != 0u ||
+      farContainKind(mat) == FAR_CK_WALL) { return mat; }
+  let pageBase = pe * CHUNK_VOL;
+  let c0 = fine - vec3<i32>(1 << (shift - 1u));   // the cell's min corner
+  let n = 1u << (3u * shift);
+  var res = mat;
+  var found = false;
+  for (var i = unrollFenceU(); i < n && !found; i++) {
+    let p = farCellVoxel(c0, i, shift);
+    var cand = MAT_AIR;
+    var seen = 0u;
+    for (var j = unrollFenceU(); j < 7u; j++) {
+      let m = farContainLookup(p + farFaceDir(j), base, pageBase);
+      let k = farContainKind(m);
+      if (j == 0u) {
+        if (k != FAR_CK_WALL) { break; }
+        cand = m;
+        continue;
+      }
+      seen |= select(0u, 1u, k == FAR_CK_LIQUID) | select(0u, 2u, k == FAR_CK_OPEN);
+    }
+    if (seen == 3u) { res = cand; found = true; }
+  }
+  return res;
+}
+
 // ---- the conservative "any blocker" bit (13.2.2) --------------------------
 //
 // `farSurfaceMat` above decides a far cell's COLOUR; this decides whether the
@@ -5927,6 +6051,9 @@ var<workgroup> wgFarPatchNZ : atomic<u32>;
 // not survive one (common.wgsl FAR_OCC_TOP_SHIFT: the far readers skip the air
 // above it). 0 when the chunk is empty.
 var<workgroup> wgFarTop : atomic<u32>;
+// `fardownFeat`'s container pass: 1 when the chunk, or a voxel just across one
+// of its faces, is LIQUID (farContainedBy's prefilter).
+var<workgroup> wgFarLiq : atomic<u32>;
 
 @compute @workgroup_size(64)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
@@ -7015,7 +7142,11 @@ fn fardownStalk(@builtin(workgroup_id) wg : vec3<u32>,
 fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
                @builtin(local_invocation_index) li : u32) {
   let slot = farDirty[wg.x];
-  if (!farDownRan(slot)) { return; }
+  // The skip, made workgroup-UNIFORM (the container pass at the bottom has
+  // barriers, and `slot` comes from a buffer, so a plain test is not uniform
+  // to the shader compiler). Same answer, one load.
+  if (li == 0u) { atomicStore(&wgFarLiq, select(0u, 1u, farDownRan(slot))); }
+  if (workgroupUniformLoad(&wgFarLiq) == 0u) { return; }
   let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
 
   // ---- THE FEATURES, CHECKED AGAINST THE LIVE GRID (package F) -------------
@@ -7061,6 +7192,86 @@ fn fardownFeat(@builtin(workgroup_id) wg : vec3<u32>,
         }
       }
       if (gone) { atomicStore(&farMap[fwI], 0u); }
+    }
+  }
+
+  // ---- THE CONTAINER RULE, LIVE (farContainedBy) ----------------------------
+  // `fardown` wrote every cell of this chunk from its centre sample; this
+  // overwrites, at levels 1-2, the cells where a container wall beats that
+  // sample. It runs HERE, in a follow-up with no procgen, and not inside
+  // `fardown`, for the driver: of the spellings of it measured inside
+  // `fardown`, all but one took that entry's compile from ~13 s to 55-67 s
+  // (the driver's cliff is chaotic: a `let` turned `var` there did it too),
+  // and the one that compiled had no prefilter and measured 1.51 ms/frame of
+  // downsample on --forest-fire against HEAD's 0.85-1.08; adding the
+  // prefilter tipped it over again. Here this entry compiles in ~0.3 s,
+  // `fardown` is untouched, and the same fire measured 0.76 ms -- inside the
+  // run-to-run spread.
+  //
+  // The byte is the wall's own far slot, NOT farSurfaceMat's skin: the skin
+  // needs a genColumn this entry does not have. It differs from the patch
+  // path (farpatch, which skins) only for a container cell that also holds
+  // its sample column's ground height -- a shore bank at the waterline whose
+  // cell straddles the ground -- and there only in colour.
+  //
+  // PREFILTER (exact): a container wall touches liquid inside the chunk or
+  // directly across one of its six faces; a dry chunk with dry faces -- most
+  // of a burning forest -- reads its voxels once and stops.
+  let pe = pageTable[slot];
+  let pageBase = pe * CHUNK_VOL;
+  // A sentinel chunk is one material: no container. It skips the scan by
+  // starting with its answer instead of returning (the barriers below).
+  var liq = select(0u, 2u, (pe & PT_SENTINEL_BIT) != 0u);
+  workgroupBarrier();
+  if (li == 0u) { atomicStore(&wgFarLiq, 0u); }
+  workgroupBarrier();
+  for (var i = li; i < CHUNK_VOL && liq == 0u; i += 64u) {
+    liq |= select(0u, 1u, farContainKind(voxels[pageBase + i] & 0xFFFu) == FAR_CK_LIQUID);
+  }
+  for (var i = li; i < 6u * CHUNK * CHUNK && liq == 0u; i += 64u) {
+    let f = i / (CHUNK * CHUNK);
+    let u = i32(i % CHUNK);
+    let v = i32((i / CHUNK) % CHUNK);
+    let a = select(-1, i32(CHUNK), (f & 1u) != 0u);
+    var q = base + vec3<i32>(a, u, v);
+    if (f >= 4u) { q = base + vec3<i32>(u, v, a); } else if (f >= 2u) { q = base + vec3<i32>(u, a, v); }
+    if (inWindow(q, T.origin)) {
+      liq |= select(0u, 1u, farContainKind(voxWordAt(q) & 0xFFFu) == FAR_CK_LIQUID);
+    }
+  }
+  if (liq == 1u) { atomicOr(&wgFarLiq, 1u); }
+  if (workgroupUniformLoad(&wgFarLiq) == 0u) { return; }
+  for (var level = 1u; level <= FAR_LEVELS; level++) {
+    let shift = farCellShift(level);
+    if (shift > FAR_CONTAIN_MAX_SHIFT) { break; }
+    let step = 1 << shift;
+    let half = 1 << (shift - 1u);
+    // fardown's own walk of the sample points in this chunk
+    let first = vec3<i32>(farFirstCenter(base.x, step, half), farFirstCenter(base.y, step, half),
+                          farFirstCenter(base.z, step, half));
+    let n = vec3<i32>(farCenterCount(base.x, first.x, step), farCenterCount(base.y, first.y, step),
+                      farCenterCount(base.z, first.z, step));
+    let origin = F.origins[level - 1u].xyz;
+    let cells = u32(n.x * n.y * n.z);
+    for (var ci = li; ci < cells; ci += 64u) {
+      let ix = i32(ci) % n.x;
+      let iy = (i32(ci) / n.x) % n.y;
+      let iz = i32(ci) / (n.x * n.y);
+      let fine = first + vec3<i32>(ix, iy, iz) * step;
+      let cc = fine >> vec3<u32>(shift);
+      if (!farInBox(cc, origin)) { continue; }
+      let lf = vec3<u32>(fine - base);
+      let centre = voxels[pageBase + (lf.z * CHUNK + lf.y) * CHUNK + lf.x] & 0xFFFu;
+      let mat = farContainedBy(centre, fine, shift, base, pe);
+      if (mat == centre) { continue; }
+      let byteV = farCellByte(matFarPal(&materials, mat), 0u);
+      let bi = farVoxByteIndex(level, cc);
+      let bsh = (bi & 3u) * 8u;
+      atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+      atomicOr(&farVox[bi >> 2u], byteV << bsh);
+      // fardown's farOcc publication for a cell that may have been empty
+      atomicMax(&farOcc[farOccIndex(level, cc)],
+                farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
     }
   }
 }

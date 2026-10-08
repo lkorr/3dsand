@@ -126,10 +126,12 @@ void Thumb(ImDrawList* dl, ImVec2 a, const UIState::BugReportUI::Shot& sh) {
 
 }  // namespace
 
-void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h) {
+void BugReportAddShot(UIState& s, std::vector<uint8_t> rgba, uint32_t w, uint32_t h,
+                      std::string where) {
   UIState::BugReportUI::Shot sh;
   sh.w = w;
   sh.h = h;
+  sh.where = std::move(where);
   sh.tw = kThumbCells;
   sh.th = std::max(1u, (uint32_t)std::lround((double)kThumbCells * h / std::max(1u, w)));
   sh.thumb.resize((size_t)sh.tw * sh.th);
@@ -195,7 +197,8 @@ bool WriteBugReport(const std::string& root, const UIState::BugReportUI& r,
   md << "## Screenshots\n\n";
   for (size_t i = 0; i < r.shots.size(); i++)
     md << "### Shot " << i + 1 << " (" << r.shots[i].w << "x" << r.shots[i].h << ")\n\n"
-       << "![shot " << i + 1 << "](shot_" << i + 1 << ".png)\n\n";
+       << "![shot " << i + 1 << "](shot_" << i + 1 << ".png)\n\n"
+       << r.shots[i].where << (r.shots[i].where.empty() ? "" : "\n");
   md << "## Context (at the first shot)\n\n" << context;
   if (!md.good()) {
     err = "write report.md";

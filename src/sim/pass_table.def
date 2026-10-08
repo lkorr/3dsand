@@ -1197,7 +1197,7 @@ PASS(farDownHashStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_
 PASS(farDownHashFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          R(PageTable) R(FarSig) A(FarMap)))
+          R(PageTable) R(WorldMap) R(FarSig) A(FarMap) A(FarVox) A(FarOcc)))
 
 // ---- phase 5b: dirty tick -------------------------------------------------
 // Occupancy update over only the chunks written this tick: compact the dirtyOut
@@ -1250,10 +1250,12 @@ PASS(farDownStalk, "farDown", PT_TICK, PIPE_FAR_DOWN_STALK, K_INDIRECT, IND_DISP
           A(FarVox) A(FarMap)))
 // read-only in practice: `voxels` is read_write for the module (genChunk
 // writes it) and `farSig` because `fardown` writes it; this phase reads both.
+// FarVox / FarOcc: its tail is the far CONTAINER RULE (worldgen.wgsl
+// fardownFeat), which rewrites level 1-2 cells after `fardown` wrote them.
 PASS(farDownFeat, "farDown", PT_TICK, PIPE_FAR_DOWN_FEAT, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          R(PageTable) R(FarSig) A(FarMap)))
+          R(PageTable) R(WorldMap) R(FarSig) A(FarMap) A(FarVox) A(FarOcc)))
 
 // ---- the derived rows' RenderParams (docs/PLAN_async_compute.md) ---------
 // LAST on the tick table: RenderUBO -> RenderUBOTick, the copy sim_openness

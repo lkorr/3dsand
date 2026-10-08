@@ -99,6 +99,30 @@ class FarEdits {
     groundH_.clear();
   }
 
+  // ---- THE CONTAINER RULE (2026-10-07; worldgen.wgsl farContainedBy) -------
+  // At the fine levels (shift <= kContainMaxShift) a cell whose centre is not
+  // already a WALL (far-solid, not liquid) takes the first CONTAINER WALL
+  // voxel in it -- x fastest, then y, then z, from its min corner -- where a
+  // container wall is a wall voxel with at least one LIQUID and at least one
+  // OPEN (neither wall nor liquid) face neighbour: the voxel between a liquid
+  // and open space. A 1-voxel basin wall is then never dropped for the air
+  // outside it or the water inside it, while a lake bed or the ground under a
+  // puddle (liquid and more ground, never open) is left alone. The GPU
+  // downsample applies the same rule with the same order, classes and cap;
+  // the two must agree or a refilled cell and a downsampled one differ (the
+  // `far-contain` gate). What this side cannot see counts as OPEN, the GPU's
+  // answer outside the window: a noted chunk's neighbours across its faces,
+  // and under the edit layer procgen is guessed from the ground contract
+  // (air over h, a wall of unknown material at or under it). Per material
+  // id: kContainNone (open), kContainLiquid or kContainWall. Until it is set,
+  // centres are recorded raw, as they always were.
+  static constexpr int kContainMaxShift = 2;   // == FAR_CONTAIN_MAX_SHIFT
+  static constexpr uint8_t kContainNone = 0, kContainLiquid = 1, kContainWall = 2;
+  // ContainedBy's matAt answers besides a material id.
+  static constexpr int kMatAtUnseen = -1;   // counts as OPEN, never a candidate
+  static constexpr int kMatAtGround = -2;   // a WALL of unknown material, never a candidate
+  void SetContainSource(std::vector<uint8_t> kindOf) { containKind_ = std::move(kindOf); }
+
   // Forgets every NOTED edit. The BASE (SetBase) survives: it is the authored
   // edit layer, which belongs to the map, not to the store being replaced.
   void Clear() {
@@ -116,6 +140,19 @@ class FarEdits {
   // center speak, the same resolution rule), and laid UNDER the noted edits:
   // a crater dug into a layer structure and evicted wins over the structure.
   // Replaces any earlier base; an empty list clears it.
+  //
+  // THE BASE ALSO CARRIES THE STAMPS' CONTAINER CELLS (2026-10-07). A stamped
+  // structure is pristine procgen: its chunks are never dirty, so its cascade
+  // cells come from the sieve alone, and the sieve centre-samples -- a
+  // 1-voxel basin wall on the unsampled parity is lost and the liquid behind
+  // it shows (Harrowby's quench trough). The rule (kContainMaxShift above) is
+  // a pure function of the template and the pad, so it is evaluated HERE,
+  // once per whole-window generation, and its few changed cells ride the
+  // patch the sieve already applies -- laid under the layer's own words. The
+  // first cut evaluated it inside the `far` kernel instead and cost that
+  // entry ~45 s of driver compile per worldgen.wgsl edit (16.8 s -> 62 s).
+  // Called with {} when the map has no layer (worldedit.cpp QueueWindow), so
+  // the stamps' half is always current.
   struct BaseCell {
     int32_t x, y, z;   // world voxel
     uint32_t mat;      // raw material id
@@ -244,6 +281,19 @@ class FarEdits {
   // (seed, x, z): the same sample columns are asked for by every chunk of a
   // column and every re-note of it. Bounded by a wholesale clear.
   std::vector<uint8_t> groundSlot_;
+  std::vector<uint8_t> containKind_;   // SetContainSource
+  uint8_t ContainKindOf(uint32_t mat) const {
+    return mat < containKind_.size() ? containKind_[mat] : kContainNone;
+  }
+  // The rule for one cell: `centre` is its centre material, `c0` its min
+  // corner in whatever coordinates `matAt` takes; matAt returns a material id,
+  // kMatAtUnseen or kMatAtGround. Returns the cell's material.
+  uint32_t ContainedBy(uint32_t centre, int step, const int c0[3],
+                       const std::function<int(int, int, int)>& matAt) const;
+  // THE CONTAINER RULE FOR STAMPS (SetBase's first contribution): the cells
+  // of every map stamp holding liquid where the rule changes the centre
+  // sample, filed into `out` as patch words. See SetBase.
+  void StampContainers(std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash>& out);
   const World* groundWorld_ = nullptr;
   std::unordered_map<uint64_t, int> groundH_;
   int GroundHeight(int x, int z);
