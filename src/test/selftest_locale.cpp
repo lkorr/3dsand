@@ -177,9 +177,16 @@ Status GateLocale(Ctx& c, std::string& detail) {
     std::error_code ec;
     fs::create_directories(mdir / "refs", ec);
     fs::create_directories(tmp / "structures", ec);
-    for (const char* ext : {".vox", ".struct.json"})
+    for (const char* ext : {".vox", ".struct.json"}) {
       fs::copy_file(fs::path(real) / "structures" / (std::string("harrowby_green") + ext),
                     tmp / "structures" / (std::string("harrowby_green") + ext), fs::copy_options::overwrite_existing, ec);
+      wrote = wrote && !ec;
+    }
+    // The asset names its materials; the loader resolves them against the
+    // asset dir's materials.json.
+    fs::create_directories(tmp / "materials", ec);
+    fs::copy_file(fs::path(real) / "materials" / "materials.json", tmp / "materials" / "materials.json",
+                  fs::copy_options::overwrite_existing, ec);
     wrote = wrote && !ec;
     std::ofstream(mdir / "map.json") << mj.dump(2);
     // Both groups in the file format WriteGroup makes (one ref per line).
