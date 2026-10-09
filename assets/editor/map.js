@@ -3079,6 +3079,61 @@ function syncControls() {
   }
   for (const t of REG.list()) if (t.sync) t.sync();
 }
+
+/* ---- 3D GO: teleport the preview's voxel camera to a map column -------------
+ * Owner 2026-10-09: "a clear way to teleport to a selected location on the big
+ * map". The 3D GO tool (view group): click the map and the voxel view jumps
+ * there; T does the same at the cursor whatever tool is active. The 3D camera
+ * is drawn on the map (a cyan eye + its heading) so you can see where it is.
+ * The camera itself lives in tuner.html (wvTeleport / wvCameraOnMap). */
+function teleportTo(wx, wz) {
+  if (typeof window.wvTeleport !== 'function') { status('the 3D view is not available on this page'); return; }
+  const g = groundAt(wx, wz);
+  const y = g != null ? g : (map && map.H ? MT.heightAt(map.H, wx, wz) : null);
+  window.wvTeleport(wx, wz, y == null ? null : Math.max(y, seaY()));
+  status(`3D view → ${fmtM(wx / vpm())}, ${fmtM(wz / vpm())} (T teleports to the cursor with any tool)`);
+  // the marker follows the camera for a moment while the view settles
+  let n = 0; const tick = () => { paint(); if (++n < 20) setTimeout(tick, 100); }; tick();
+}
+function registerTeleport(C) {
+  C.registerTool({
+    key: 'go3d', label: '3D go', group: 'view', order: 20, locale: true,
+    title: 'TELEPORT the 3D view: click a spot on the map and the voxel preview below jumps there (T does the same at the cursor with any tool)',
+    down(ev, wx, wz) { teleportTo(wx, wz); return true; },
+    statusAt: (wx, wz) => `click: put the 3D view at ${fmtM(wx / vpm())}, ${fmtM(wz / vpm())}`,
+    anyKey(ev) {
+      if (ev.ctrlKey || ev.metaKey || ev.altKey || (ev.key !== 't' && ev.key !== 'T') || !els.hoverW) return false;
+      teleportTo(els.hoverW[0], els.hoverW[1]);
+      return true;
+    },
+    cursor(ctx, wx, wz) {
+      const x = C.SX(wx), z = C.SZ(wz);
+      ctx.strokeStyle = '#7fe8ff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, z, 9, 0, Math.PI * 2); ctx.moveTo(x - 14, z); ctx.lineTo(x + 14, z); ctx.moveTo(x, z - 14); ctx.lineTo(x, z + 14); ctx.stroke();
+    },
+    paint(ctx) {
+      const cam = typeof window.wvCameraOnMap === 'function' ? window.wvCameraOnMap() : null;
+      if (!cam) return;
+      const x = C.SX(cam.x), z = C.SZ(cam.z), l = Math.hypot(cam.dx, cam.dz) || 1;
+      const hx = cam.dx / l, hz = cam.dz / l;
+      ctx.save();
+      ctx.fillStyle = 'rgba(127,232,255,0.22)';                 // the view cone
+      ctx.beginPath(); ctx.moveTo(x, z);
+      ctx.lineTo(x + (hx * 0.94 - hz * 0.34) * 40, z + (hz * 0.94 + hx * 0.34) * 40);
+      ctx.lineTo(x + (hx * 0.94 + hz * 0.34) * 40, z + (hz * 0.94 - hx * 0.34) * 40);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#7fe8ff'; ctx.strokeStyle = '#0b1a22'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, z, 6, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.font = '11px monospace'; ctx.fillStyle = '#bff4ff';
+      ctx.fillText('3D', x + 9, z - 7);
+      ctx.restore();
+    },
+    guide: ['3D go — teleport the voxel view',
+      'Puts the 3D voxel preview (under the map) over the spot you pick, looking at it from a little back and above, keeping its heading. The cyan eye on the map is where the 3D camera is now, with its view cone.',
+      'Click anywhere on the map. With ANY tool, hover a spot and press T. Then fly in the 3D view as usual (RMB look, WASD/QE).',
+      'The 3D view shows the SAVED map (what the engine builds): save first to see edits. Turns the voxel view on if it was off.'],
+  });
+}
 export function attach(hooks) {
   H = hooks;
   const root = H.section;
@@ -3093,7 +3148,7 @@ export function attach(hooks) {
 #env-map .mapchip{display:inline-flex;align-items:center;gap:5px;padding:3px 7px;border:1px solid #2a3040;border-radius:4px;background:#12161f;color:#c7d2e3;cursor:pointer;font:11px monospace}
 #env-map .mapchip.on{border-color:#ffd866;color:#fff}
 #env-map .mapchip .sw{width:12px;height:12px;border-radius:2px;display:inline-block;image-rendering:pixelated}
-#env-map .mapcanvas{flex:1;min-height:320px;width:100%;background:#0e1219;border:1px solid #2a3040;border-radius:6px;cursor:crosshair;touch-action:none;image-rendering:pixelated}
+#env-map .mapcanvas{flex:0 0 auto;height:max(800px, 80vh);min-height:800px;width:100%;background:#0e1219;border:1px solid #2a3040;border-radius:6px;cursor:crosshair;touch-action:none;image-rendering:pixelated}
 #env-map .mapstatus{font:11px monospace;color:#8fa0b8;min-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #env-map .mapnote{font:10px/1.4 monospace;color:#6f7f97}
 #env-map .mapbody{display:flex;gap:8px;min-height:0;flex:1}
@@ -3380,6 +3435,7 @@ export function attach(hooks) {
   CLM = createClimateLayer(C);
   CST = createCoastLayer(C);
   WL = createWaterLayer(C);
+  registerTeleport(C);
   els.dispBar.append(el('span', {style: 'width:6px'}), ...OL.displayControls());
   els.tools = {};
   const toolbar = el('div', {class: 'mapbar'});

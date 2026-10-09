@@ -122,7 +122,7 @@ async function settle(p) { var d = false, v, err = null; p.then(function (x) { v
     // ---- 1. the registry -----------------------------------------------------------------
     var REG = M._reg(), keys = REG.keys();
     var want = ['site', 'height', 'shape', 'line', 'range', 'area', 'biome', 'sculpt', 'road', 'river', 'lake', 'region', 'marker', 'locale', 'structure', 'waylink',
-                'pad', 'spawn', 'stamp', 'water', 'tree', 'clearing', 'soften', 'measure', 'coast', 'biolock'];
+                'pad', 'spawn', 'stamp', 'water', 'tree', 'clearing', 'soften', 'measure', 'coast', 'biolock', 'go3d'];
     say(want.every(function (k) { return keys.indexOf(k) >= 0; }) && keys.length === want.length, 'the registry holds every tool (' + keys.join(' ') + ')');
     var btns = [].slice.call(document.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
     say(['Range', 'Measure', 'Height', 'Line'].every(function (n) { return btns.indexOf(n) >= 0; }), 'the toolbar is built from it (Range, Measure among ' + btns.length + ' buttons)');

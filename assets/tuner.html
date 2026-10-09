@@ -5304,6 +5304,42 @@ function wvDropToGround(){
   else wv.cam.target[1] = y - 20;
 }
 
+// TELEPORT (owner 2026-10-09): the World map page's "3D go" tool and its T key
+// put the 3D camera over a map column. Turns the voxel view on if it is off,
+// keeps the camera's heading, and stands it back and above the spot looking
+// down at it so the place itself is in the middle of the picture.
+// ground = the column's ground Y in voxels (the map page's authored plane),
+// or null to settle onto the voxels once they stream in.
+async function wvTeleport(x, z, ground){
+  var pv = $('#wgPreviewHost');
+  if(pv && pv.style.display === 'none'){ pv.style.display = ''; if(window.wgPreviewShow) wgPreviewShow(); }
+  if(!wvOn) await wvToggle();
+  if(!wv || !wvOn) return false;
+  var back = 420, up = 260;                 // 42 m back, 26 m up: the spot fills the view
+  var gy = (ground === null || ground === undefined || !isFinite(ground)) ? null : ground;
+  var yaw = wv.cam.mode === 'fly' ? wv.cam.yaw : Math.atan2(-Math.sin(wv.cam.yaw), -Math.cos(wv.cam.yaw));
+  var ty = gy === null ? wv.camEye()[1] - up : gy;
+  wv.cam.mode = 'fly';
+  wv.cam.yaw = yaw;
+  wv.cam.pos = [x - Math.sin(yaw) * back, ty + up, z - Math.cos(yaw) * back];
+  wv.cam.pitch = -Math.atan2(up, back);
+  wv.cam.target = [x, ty, z];
+  if($('#wvCamFly')){ $('#wvCamFly').className = 'on'; $('#wvCamOrbit').className = ''; }
+  if(gy === null) setTimeout(wvDropToGround, 1500);
+  var cv = $('#wvCanvas');
+  if(cv){ cv.scrollIntoView({block: 'nearest', behavior: 'smooth'}); }
+  var st = $('#wvStatus');
+  if(st) st.textContent = 'teleported to ' + Math.round(x/10) + ', ' + Math.round(z/10) + ' m';
+  return true;
+}
+window.wvTeleport = wvTeleport;
+// Where the 3D camera is, for the map page's marker: null while the view is off.
+window.wvCameraOnMap = function(){
+  if(!wv || !wvOn) return null;
+  var e = wv.camEye(), f = wv.camForward();
+  return {x: e[0], z: e[2], dx: f[0], dz: f[2]};
+};
+
 var wvWired = false;
 function wvWireControls(){
   if(wvWired) return; wvWired = true;
