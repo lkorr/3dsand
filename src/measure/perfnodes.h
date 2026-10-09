@@ -267,7 +267,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
      PerfScope::Count,
      "shadow_prepare;shadow_resolve;sky_top_clear;sky_top_reduce;godray_vis;"
-     "gi_prepare;gi_gather;gas_mask",
+     "gi_prepare;gi_gather;gas_mask;hz_sky;hz_sun",
      "One media-blind shadow ray per visible surface PATCH, instead of one per "
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
@@ -277,7 +277,10 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "cache's refresh (gi_gather.wgsl): the nine bounce rays per block-face the "
      "raymarch found due last frame, moved out of the fragment shader. And the "
      "gas empty-brick mask (gas_mask.wgsl), which lets the raymarch's coarse "
-     "smoke fill skip empty samples; an empty dispatch when no gas exists."},
+     "smoke fill skip empty samples; an empty dispatch when no gas exists. "
+     "And the terrain-scale light map (horizon_light.wgsl, map v2 S1): the "
+     "sun horizon + sky visibility per far-horizon sample, recorded only on a "
+     "rebuild frame (map load; the sun azimuth turning ~0.25 deg)."},
     // The clouds (cloud.wgsl): the noise bake (once), the weather / shadow /
     // env maps and the low-res march + temporal resolve, all per FRAME on the
     // ShadowCache table. Zero when weather.clouds is off or the sky is empty —

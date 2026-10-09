@@ -306,3 +306,9 @@ int32_t HeatSnowlineYAt(int x, int z, uint32_t seed);
 // The lapse rate's cooling at world Y (sim.heatLapsePerKm above the map's
 // sea): the integer the GPU's heatLapse computes.
 int32_t HeatLapseAt(int y);
+// THE FREEZING LEVEL of the column (x, z), world Y (map v2 S1, render only):
+// the lower of its snowline (HeatSnowlineYAt) and the height at which the
+// lapse rate takes its biome's MEAN climate to water's freezing point (0).
+// What the renderer turns precipitation to snow above; nothing in the sim
+// reads it.
+int32_t HeatFreezingLevelY(int x, int z, uint32_t seed);

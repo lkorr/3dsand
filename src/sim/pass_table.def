@@ -1861,11 +1861,11 @@ PASS(cloud_shadow, "cloudShadow", PT_SHADOWCACHE, PIPE_CLOUD_SHADOW, K_COMPUTE, 
 // read-only in practice: `cloudNoise`/`cloudWeather` are read_write for the module because `noise`/`weather` write them; the env map only samples them.
 PASS(cloud_env, "cloudEnv", PT_SHADOWCACHE, PIPE_CLOUD_ENV, K_COMPUTE, 8,8,1,
      GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
-     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudMaps)))
+     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudMaps) R(Horizon)))
 // read-only in practice: `cloudNoise`/`cloudWeather` are read_write for the module because `noise`/`weather` write them; the march only samples them.
 PASS(cloud_march, "cloudMarch", PT_SHADOWCACHE, PIPE_CLOUD_MARCH, K_COMPUTE, D_CLOUDGX,D_CLOUDGY,1,
      GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
-     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudRaw)))
+     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudRaw) R(Horizon)))
 // read-only in practice: `cloudRaw` is read_write for the module because `march` writes it; the resolve only reads this frame's raw samples.
 PASS(cloud_resolve, "cloudResolve", PT_SHADOWCACHE, PIPE_CLOUD_RESOLVE, K_COMPUTE, D_CLOUDGX,D_CLOUDGY,1,
      GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
@@ -1888,6 +1888,22 @@ PASS(rain_map_build, "rainMap", PT_SHADOWCACHE, PIPE_RAIN_MAP_BUILD, K_COMPUTE, 
      GRP_SHADOW, DYN_NONE, C_RAINMAP, 1,
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
           R(FarOcc) RW(RainMap)))
+// ---- THE TERRAIN-SCALE LIGHT MAP (assets/shaders/horizon_light.wgsl) -------
+// Map v2 S1: per sample of the far horizon's pyramid (src/sim/horizon.h), the
+// sun's horizon in the key light's azimuth (hz_sun) and the sky visibility
+// (hz_sky), both marched over the pyramid. Static data between rebuilds:
+// C_HZSKY records once per pyramid upload, C_HZSUN when the key light's
+// azimuth has turned past Simulation::EncodeShadowResolve's threshold -- a
+// frame that rebuilds nothing records neither. One thread per sample (D_HZGX
+// groups of 64). The raymarch reads the map in the fragment stage of this
+// command buffer (BeginRendering's flush). R(Horizon): the pyramid, CPU-
+// written at load only.
+PASS(hz_sky, "hzLight", PT_SHADOWCACHE, PIPE_HZ_SKY, K_COMPUTE, D_HZGX,1,1,
+     GRP_SHADOW, DYN_NONE, C_HZSKY, 1,
+     USES(R(Horizon) RW(HzLight)))
+PASS(hz_sun, "hzLight", PT_SHADOWCACHE, PIPE_HZ_SUN, K_COMPUTE, D_HZGX,1,1,
+     GRP_SHADOW, DYN_NONE, C_HZSUN, 1,
+     USES(U(RenderUBO) R(Horizon) RW(HzLight)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded

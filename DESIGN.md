@@ -16640,12 +16640,16 @@ cascade's centre-sampled cells without a lip; level-8 cascade hits within
 900 m of the box face take the horizon's paint (`hzSeamWeight`) so the two
 meet in one colour. Shading is the far field's: the biome's skin material
 (from the packed biome records, so the horizon paints what worldgen lays),
-stone past ~45 degrees, snow over the map's treeline, the far water law under
-the sea, the far openness/ambient/bounce and the cloud shadow; the normal is
+stone past ~45 degrees, snow over the COLUMN's treeline (A1's `treelineAt`,
+baked per sample into the pyramid by `horizon::Build` -- `kHTlPlane`, i16 --
+so the horizon's snow line is the per-biome, jittered one the cascades draw;
+until S1 it was the map's one Y and painted all of `peaks` white), the far
+water law under the sea, the far openness/ambient/bounce and the cloud shadow,
+and since S1 the terrain-scale sun and sky below; the normal is
 the AVG field's gradient at the pyramid level whose cell is about a pixel, so
-30 km of terrain does not alias. NO sun shadows yet (that is S1, which builds
-its horizon map from this pyramid). `render.horizon` (RenderParams flag bit 7,
-a runtime switch, the `nohorizon` budget arm) turns it off. Measured
+30 km of terrain does not alias. `render.horizon` (RenderParams flag bit 7,
+a runtime switch, the `nohorizon` budget arm) turns it off -- and with it
+everything S1 below reads from the pyramid. Measured
 2026-10-08, 2560x1440, RTX 3060 Ti, `--render-budget --budget-cams
 summit,peaksea --budget-arms baseline,nohorizon` (fragment time, the `pre`
 compute span excluded): `peaksea` (the massif 10 km off, drawn by the pyramid
@@ -16679,6 +16683,71 @@ law (common.wgsl `airFogFrac`). `applyAerial` adds the DISTANCE BLUE
 degrees above its own direction, weighted `1 - f^2` so full fog still
 converges to exactly the sky in `rd` (the rule above) while a 1 km peak at
 15 km reads as a blue silhouette rather than a grey one.
+
+**The light at terrain scale (map v2 S1; `assets/shaders/horizon_light.wgsl`,
+horizon.h `kL*`).** Every sun shadow in the renderer is a RAY (the shadow
+cache, the cascade's patch march), bounded by `render.farShadowReach` because
+a ray per receiver cannot afford kilometres; the openness grid's sky probes
+stop at the window top. So a 1 km ridge never shaded its valley, a 600 m gorge
+floor was lit by the whole sky, and the horizon had no sun shadow at all.
+Terrain at that scale is a heightfield, and a heightfield has the classical
+answer: the HORIZON ANGLE. A second, GPU-written buffer on the pyramid's own
+sample lattice (`Simulation::hzLightBuf_`, shadow group 33 / renderBGL 46)
+holds per sample: (w0) the SUN'S HORIZON in the key light's azimuth -- the
+blocker that makes the steepest elevation seen from the sample's ground,
+stored as its top Y (i16) and distance (u16, 8-voxel units), so a receiver at
+ANY height y is lit while tan(sun elevation) > (top - y) / distance, a valley
+floor and the crest above it from one word; and (w1) the SKY VISIBILITY, the
+cosine-weighted visible share of the upper hemisphere over eight azimuths
+(mean of cos^2 of each horizon angle). Both march the pyramid from two samples
+(~51 m) out -- nearer is the shadow cache's and the openness grid's -- with
+geometric steps (6% of the distance) reading the level whose cell matches the
+step: a cell MAX is an upper bound, so a knife ridge between two steps blurs
+by a cell of azimuth but is never lost; each march stops once nothing the map
+holds (`kHMaxY`) can beat the best angle. Reach: 30 km for the sun, 12 km for
+the sky. **When it runs (rule 2):** two rows on the per-frame table, `hz_sky`
+once per pyramid upload (a function of the map alone) and `hz_sun` when the
+key light's AZIMUTH has turned more than 0.0044 rad (~0.25 deg: a ridge's
+edge 5 km off moves under one sample) since the last build -- the sun RISING
+needs no rebuild, the per-pixel compare takes the elevation from the uniform.
+A frame that rebuilds nothing records neither row. **Readers** (raymarch.wgsl
+`hzSunVis` / `hzSunShade` / `hzSkyVis`, bilinear over four samples, each
+evaluated for the receiver's own height; 1 = no opinion outside the grid,
+before the first build or with `render.horizon` off): the horizon hit (its
+first sun shadow and a gorge-aware ambient), the cascade hit (the sun term
+`min`'d into the march's shadow AFTER the LOD contact-shadow lift, the sky
+term multiplied into `openF`), and the near field (`min` into the shadow cache
+answer; the openness byte scaled by the sky visibility -- the "floor" in the
+plan read as a multiplicative term, which is what the grid's probes cannot
+see past the window top). The sun term rides the near field's softening law:
+a mountain is a DISTANT blocker, `mix(TUNE_SHADOW_LIFT, 1, vis)`, so a
+valley in a ridge's shadow sits at one depth whichever path found the ridge.
+Raster bodies (debris / microbody) do not read it yet: a mob in a mountain's
+shadow is lit (follow-up).
+
+**Clouds against mountains (S1).** The cloud march's ground was the
+sea-level sphere ("the land is metres, the deck kilometres") -- false for a
+1,400 m massif under a 700 m storm base. `cloud.wgsl` now binds the pyramid
+(shadow group 32) and `deckSpan` stops each ray at the first crossing of its
+AVG ground (`terrainHitM`: 40 geometric steps from 20 m, then a bisection;
+AVG, not the MAX silhouette, which stopped rays grazing a ridge short of the
+deck and drew a sliver of clear sky between ridge and cloud), so the deck and
+the rain curtains are marched only in front of the land. The raymarch
+composites the cloud image over a HIT pixel when the eye is at or above the
+deck's lowest base (as before) OR the hit point is (a summit standing in the
+cloud seen from the valley); a hit under the base with the eye under it is
+nearer than any cloud and pays no fetch. `cloudSunAtM` is now altitude-aware:
+1 above the deck top, and inside the deck the map's transmittance raised to
+the share of the deck still overhead. **Precipitation by altitude:** the
+streaks are faded out over the base's jitter band as the eye climbs through
+it (a summit is over the weather); and `precipSnowAt` (common.wgsl) turns
+rain to snow above the FREEZING LEVEL over the eye's column -- CPU
+`HeatFreezingLevelY` (heat.h: the lower of the column's snowline and the
+height where `sim.heatLapsePerKm` takes its biome's mean climate below 0),
+uploaded in `CloudParams.spare.w` (metres) -- over a 200 m melt band: the
+overlay, its lean, the rain shadow map built along that lean, and the curtains
+per sample (a curtain that is rain at sea is snow on the massif behind it).
+Render only: the sim's rain word is untouched.
 
 ### Static micro-detail (2026-08-20; docs/PLAN_voxel_editor.md §A)
 

@@ -26,6 +26,7 @@
 #include "sim/heat.h"        // the temperature layer's layout (heatParams, PackHeatMaterial)
 #include "sim/elec.h"        // the charge field's layout (elecParams, PackElecMaterial)
 #include "sim/boltfx.h"      // the bolt table at renderBGL 44 (render-only)
+#include "sim/worlddefaults.h"  // kDefaultSeed: the horizon treeline before streaming sets the seed
 #include "sim/horizon.h"     // the far horizon's pyramid at renderBGL 45 (render-only)
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
@@ -793,6 +794,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // THE FAR HORIZON (sim/horizon.h; raymarch.wgsl traceHorizon): the
         // map's height pyramid, written at load / environment reload only.
         entry(45, T::ReadOnlyStorage, S::Fragment),               // horizon
+        // THE TERRAIN-SCALE LIGHT MAP (horizon.h kL*; horizon_light.wgsl):
+        // the sun's horizon + sky visibility per pyramid sample, written by
+        // the hz rows on the per-frame table (BeginRendering's flush).
+        entry(46, T::ReadOnlyStorage, S::Fragment),               // hzLight
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1171,6 +1176,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // dedup bits released) by gi_prepare / gi_gather; appended by the
         // raymarch at renderBGL_ 39.
         entry(28, T::Storage),         // giReq
+        // THE FAR HORIZON's pyramid (horizon.h), read by the cloud march
+        // (terrain against the deck, map v2 S1) and by the light map's rows,
+        // which write 33 (horizon.h kL*; the raymarch reads it at 46).
+        entry(32, T::ReadOnlyStorage), // horizon
+        entry(33, T::Storage),         // hzLight
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1445,7 +1455,31 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
 void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queue,
                                const std::vector<uint32_t>& worldMapWords) {
   std::vector<uint32_t> words;
-  horizon::Build(worldmap::CurrentWorldMap(), worldMapWords, words);
+  // The seed the per-sample treeline's jitter is read at: the world's, once
+  // streaming has set it (the default world's before, at Init -- the jitter
+  // is +-30 m of paint 7 km off, and every environment reload re-bakes).
+  const uint32_t seed = (world_ && world_->WorldSeed() != 0u) ? world_->WorldSeed() : sandvox::kDefaultSeed;
+  horizon::Build(worldmap::CurrentWorldMap(), worldMapWords, seed, words);
+  // THE LIGHT MAP rides the pyramid (horizon.h kL*): sized on its samples,
+  // header zeroed (the kernels set the valid words), the sky visibility due
+  // again and the sun's horizon stale. A buffer that had to grow rebinds both
+  // groups that name it.
+  const uint64_t lightWords = horizon::LightWords(words);
+  hzSamples_ = words[horizon::kHValid] != 0u ? words[horizon::kHNX] * words[horizon::kHNZ] : 0u;
+  hzSkyDue_ = hzSamples_ > 0;
+  hzSunBuilt_ = false;
+  bool rebind = false;
+  if (lightWords > hzLightWords_) {
+    hzLightWords_ = lightWords;
+    hzLightBuf_ = CreateBuffer(device, hzLightWords_ * 4,
+                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                               "hzLight");
+    rebind = true;
+  }
+  {
+    const uint32_t zero[horizon::kLightHeaderWords] = {};
+    queue.WriteBuffer(hzLightBuf_, 0, zero, sizeof zero);
+  }
   // Grow-only, like the worldMap buffer: a smaller map keeps the buffer and
   // the shader reads only what the header names. A buffer that had to grow is
   // a new handle, so the two render bind groups that name it are rebuilt --
@@ -1455,10 +1489,14 @@ void Simulation::UploadHorizon(const rhi::Device& device, const rhi::Queue& queu
     horizonBuf_ = CreateBuffer(device, (uint64_t)horizonWords_ * 4,
                                rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                                "horizon");
+    rebind = true;
+  }
+  if (rebind) {
     if (renderBGBuilt_) {
       BuildRenderBindGroup(renderBG_, veilBuf_);
       BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
     }
+    BuildShadowBindGroup();
   }
   words.resize(horizonWords_, 0u);
   queue.WriteBuffer(horizonBuf_, 0, words.data(), words.size() * 4);
@@ -2159,6 +2197,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mRayStart;
   // The rain shadow map (rain_map.wgsl): two per-frame entries on shadowPL_.
   rhi::ShaderModule mRainMap;
+  // The terrain-scale light map (horizon_light.wgsl, map v2 S1): two
+  // per-frame entries on shadowPL_.
+  rhi::ShaderModule mHzLight;
   // The god-ray sun visibility volume (godray_vis.wgsl): one per-frame entry
   // on shadowPL_.
   rhi::ShaderModule mGodVis;
@@ -2199,6 +2240,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mSkyTop, "sky_top.wgsl");
     mod(&mRayStart, "ray_start.wgsl");
     mod(&mRainMap, "rain_map.wgsl");
+    mod(&mHzLight, "horizon_light.wgsl");
     mod(&mGodVis, "godray_vis.wgsl");
     mod(&mGasMask, "gas_mask.wgsl");
     mod(&mGiGather, "gi_gather.wgsl");
@@ -2225,7 +2267,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur || !mSkyTop ||
-      !mRayStart || !mRainMap || !mWindStreak || !mGodVis || !mGiGather ||
+      !mRayStart || !mRainMap || !mHzLight || !mWindStreak || !mGodVis || !mGiGather ||
       !mGasMask) {
     if (err) *err = "shader file read failure";
     return false;
@@ -2288,6 +2330,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { rayStartMin_ = MakeComputePipeline(device, shadowPL_, mRayStart, "rayStartMin", "rayStartMin"); });
   pool.Add([&] { rainMapPrep_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapPrep", "rainMapPrep"); });
   pool.Add([&] { rainMapBuild_ = MakeComputePipeline(device, shadowPL_, mRainMap, "rainMapBuild", "rainMapBuild"); });
+  pool.Add([&] { hzSky_ = MakeComputePipeline(device, shadowPL_, mHzLight, "hzSky", "hzSky"); });
+  pool.Add([&] { hzSun_ = MakeComputePipeline(device, shadowPL_, mHzLight, "hzSun", "hzSun"); });
   pool.Add([&] { godrayVis_ = MakeComputePipeline(device, shadowPL_, mGodVis, "godrayVis", "godrayVis"); });
   pool.Add([&] { gasMask_ = MakeComputePipeline(device, shadowPL_, mGasMask, "gasMaskBuild", "gasMask"); });
   pool.Add([&] { giPrepare_ = MakeComputePipeline(device, shadowPL_, mGiGather, "giPrepare", "giPrepare"); });
@@ -2791,6 +2835,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowHist:          return world_->shadowHist;
     case B::RayStart:            return rayStartBuf_;
     case B::RainMap:             return rainMapBuf_;
+    case B::Horizon:             return horizonBuf_;
+    case B::HzLight:             return hzLightBuf_;
     case B::GodVis:              return godVisBuf_;
     case B::GasMask:             return gasMaskBuf_;
     case B::GiReq:               return giReqBuf_;
@@ -2927,6 +2973,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::RayStartMin:    return rayStartMin_;
     case P::RainMapPrep:    return rainMapPrep_;
     case P::RainMapBuild:   return rainMapBuild_;
+    case P::HzSky:          return hzSky_;
+    case P::HzSun:          return hzSun_;
     case P::WindStreak:     return windStreak_;
     case P::GodrayVis:      return godrayVis_;
     case P::GasMask:        return gasMask_;
@@ -3282,6 +3330,36 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
     // probe, and without clouds nothing draws rain.
     if (cf.rainMap && !rainMapOff_ && rainMapPrep_ && rainMapBuild_)
       cx.cloudFlags |= 8u;
+  }
+  // THE TERRAIN-SCALE LIGHT MAP (horizon_light.wgsl, map v2 S1). Static data
+  // between rebuilds, so a frame records a row only when it is due: the sky
+  // visibility once per pyramid upload (a function of the map alone), the
+  // sun's horizon when the key light's AZIMUTH has turned more than
+  // kHzSunTurnRad since the last build (its elevation is compared per pixel,
+  // so a rising sun needs no rebuild). Off with render.horizon, like the
+  // pyramid it reads; nothing at all on a map with no height plane.
+  if (hzSamples_ > 0 && hzSky_ && hzSun_ && hzLightBuf_ && CurrentTuning().render.horizon) {
+    // ~0.25 deg: a ridge's shadow edge 5 km off moves ~22 m (under one
+    // 25.6 m sample) between builds.
+    constexpr float kHzSunTurnRad = 0.0044f;
+    cx.hzGx = std::min<uint32_t>((hzSamples_ + 63) / 64, 65535u);
+    if (hzSkyDue_) {
+      cx.cloudFlags |= 16u;
+      hzSkyDue_ = false;
+    }
+    const float* L = sandvox::LastKeyLightDir();
+    const float lh = std::sqrt(L[0] * L[0] + L[2] * L[2]);
+    if (lh > 1e-4f) {
+      const float ax = L[0] / lh, az = L[2] / lh;
+      const float turn = std::fabs(std::atan2(ax * hzSunAz_[1] - az * hzSunAz_[0],
+                                              ax * hzSunAz_[0] + az * hzSunAz_[1]));
+      if (!hzSunBuilt_ || turn > kHzSunTurnRad) {
+        cx.cloudFlags |= 32u;
+        hzSunBuilt_ = true;
+        hzSunAz_[0] = ax;
+        hzSunAz_[1] = az;
+      }
+    }
   }
   RecordTable(enc, pass::Table::ShadowCache, &cx);
   // The weather row just recorded: if the uniform asked it to rebuild the map
@@ -4146,6 +4224,7 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(43, world_->elecMeta),
         b(44, boltBuf_),              // the bolt table (boltfx.h)
         b(45, horizonBuf_),           // the far horizon (horizon.h)
+        b(46, hzLightBuf_),           // the terrain light map (horizon.h kL*)
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -4211,7 +4290,7 @@ void Simulation::BuildShadowBindGroup() {
     e.size = 0;
     return e;
   };
-  if (!shadowBGL_ || !cloudRawBuf_) return;
+  if (!shadowBGL_ || !cloudRawBuf_ || !horizonBuf_ || !hzLightBuf_) return;
   rhi::BindGroupEntry bges[] = {
       b(0, world_->voxels),
       b(1, world_->occupancy),
@@ -4244,6 +4323,8 @@ void Simulation::BuildShadowBindGroup() {
       b(30, world_->gasOuter),
       b(31, gasMaskBuf_),
       b(28, giReqBuf_),
+      b(32, horizonBuf_),
+      b(33, hzLightBuf_),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

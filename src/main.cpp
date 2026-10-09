@@ -3082,12 +3082,23 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
   //   _summit  on the 1,400 m summit, facing SW over the range to the coast
   //   _sea10k  3 m over the sea 10 km south of the summit, facing the massif:
   //            the massif itself is PAST the cascades here (horizon only)
+  // Map v2 S1 (terrain-scale light + clouds against mountains):
+  //   _dusk     the _valley view under a low evening sun (0.78 of the day,
+  //             ~6 deg up in the WSW): the valley floor in the western
+  //             ridges' shadow, the massif's face lit above a shadow line
+  //             (the terrain light map, horizon_light.wgsl)
+  //   _storm    the _sea10k view under the `storm` preset (base 700 m): the
+  //             massif's upper half in the deck, rain at sea, snow above the
+  //             freezing level
+  //   _cloudcap the _valley view under `towering` (base 1,100 m): summits
+  //             wrapped in cloud seen from below the deck
   // On the `peaks` test map, loaded here and the harness map restored after,
   // with the cameras placed explicitly (sandvox::PeaksPoseOf), not at the
   // spawn. LAST and skipped whole unless one is wanted: a map reload and a
   // worldgen + full far refill per view.
   if (ShotWanted("screenshot_peaks_valley") || ShotWanted("screenshot_peaks_summit") ||
-      ShotWanted("screenshot_peaks_sea10k")) {
+      ShotWanted("screenshot_peaks_sea10k") || ShotWanted("screenshot_peaks_dusk") ||
+      ShotWanted("screenshot_peaks_storm") || ShotWanted("screenshot_peaks_cloudcap")) {
     std::string prevMap, why;
     if (!sandvox::SwitchMap(ctx, sim, mats, "peaks", &prevMap, why)) {
       std::fprintf(stderr, "--shot: peaks views skipped: %s\n", why.c_str());
@@ -3102,6 +3113,35 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim,
         sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
         render({p.ex, p.ey, p.ez}, p.yaw, p.pitch, names[v]);
       }
+      // ---- S1: the same cameras in other light and weather ----
+      if (ShotWanted("screenshot_peaks_dusk")) {
+        // 0.78 of the day: the sun ~6 degrees up in the WSW, behind the
+        // valley's western ridges -- whose shadows, kilometres long, are
+        // past every shadow ray's reach and only the terrain light map sees.
+        const sandvox::PeaksPose p = sandvox::PeaksPoseOf(0);
+        const uint32_t tick = (uint32_t)(0.78 * (double)shotTicksPerDay) % shotTicksPerDay;
+        const SkyState ss = SkyForTick(shotTun, tick);
+        std::printf("peaks dusk: sun dir (%.3f, %.3f, %.3f)\n", ss.sunDir[0], ss.sunDir[1],
+                    ss.sunDir[2]);
+        sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
+        renderAt({p.ex, p.ey, p.ez}, p.yaw, p.pitch, "screenshot_peaks_dusk.bmp", (int64_t)tick);
+      }
+      struct WxShot { const char* name; const char* preset; int pose; };
+      const WxShot wx[] = {{"screenshot_peaks_storm.bmp", "storm", 2},
+                           {"screenshot_peaks_cloudcap.bmp", "towering", 0}};
+      const std::string savedPin = weather::Override();
+      for (const WxShot& x : wx) {
+        if (!ShotWanted(x.name)) continue;
+        const sandvox::PeaksPose p = sandvox::PeaksPoseOf(x.pose);
+        weather::SetOverride(x.preset);
+        weather::Snap();
+        std::printf("peaks %s: preset %s, eye (%.0f, %.0f, %.0f)\n", x.name, x.preset, p.ex,
+                    p.ey, p.ez);
+        sandvox::CentreWindowOnEye(ctx, world, sim, p.ex, p.ey, p.ez, 120);
+        render({p.ex, p.ey, p.ez}, p.yaw, p.pitch, x.name);
+      }
+      weather::SetOverride(savedPin);
+      weather::Snap();
       std::string back;
       if (!sandvox::SwitchMap(ctx, sim, mats, prevMap, nullptr, back))
         std::fprintf(stderr, "--shot: could not restore map '%s': %s\n", prevMap.c_str(),

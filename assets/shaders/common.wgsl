@@ -1942,9 +1942,23 @@ fn cloudOctDecode(uv : vec2f) -> vec3f {
 // Outside the map (a receiver kilometres away, or a light ray too grazing to
 // reach the deck inside it) the answer is the deck's MEAN transmittance, which
 // is what a shadow that far away averages to on screen anyway.
+//
+// BY ALTITUDE (map v2 S1): the map integrates the whole deck from its base
+// plane up, which is right for a receiver under the deck and wrong for a
+// summit standing in it or above it. Above the deck's top nothing is between
+// the receiver and the light; inside, only the part of the deck above it is,
+// so the transmittance is raised to the share of the deck still overhead
+// (the optical depth scales with it).
 fn cloudSunAtM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
                maps : ptr<storage, array<u32>, read>) -> f32 {
   if (((*C).flags & CLF_ON) == 0u) { return 1.0; }
+  let top = (*C).baseM + (*C).thicknessM;
+  if (pM.y >= top) { return 1.0; }
+  let over = 1.0 - clamp((pM.y - (*C).shadowPlaneM) / max(top - (*C).shadowPlaneM, 1.0), 0.0, 1.0);
+  return pow(max(cloudSunMapM(pM, lightDir, C, maps), 1e-4), over);
+}
+fn cloudSunMapM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
+                maps : ptr<storage, array<u32>, read>) -> f32 {
   let mean = 1.0 - clamp((*C).overcast, 0.0, 1.0) * 0.85;
   if (lightDir.y < 0.03) { return mean; }
   let t = ((*C).shadowPlaneM - pM.y) / lightDir.y;
@@ -1964,6 +1978,16 @@ fn cloudSunAtM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
   let edge = min(min(f.x, f.y), min(n - 1.0 - f.x, n - 1.0 - f.y)) / (n * 0.125);
   let v = mix(mix(s00, s10, fr.x), mix(s01, s11, fr.x), fr.y);
   return mix(mean, v, clamp(edge, 0.0, 1.0));
+}
+
+// HOW MUCH OF THE PRECIPITATION IS SNOW at altitude `altM` (metres): the
+// preset's own precipType, raised to snow above the freezing level over the
+// eye's column (`freezeM`, CloudParams.spare.w: src/sim/heat.h
+// HeatFreezingLevelY, the lapse rate's and the snowline's) over a 200 m melt
+// band (map v2 S1). One function, because the streaks, their lean and the
+// rain shadow map built along it, and the curtains must agree.
+fn precipSnowAt(precipType : f32, freezeM : f32, altM : f32) -> f32 {
+  return max(clamp(precipType, 0.0, 1.0), smoothstep(freezeM - 100.0, freezeM + 100.0, altM));
 }
 
 // The same, for a point in fine-voxel world coordinates (what every shading
