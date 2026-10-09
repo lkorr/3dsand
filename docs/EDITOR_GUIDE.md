@@ -601,7 +601,7 @@ same file.
 | `id` | `group/name`, lowercase letters, digits, `_` and `-` only |
 | `kind` | what sort of thing: `marker`, `npc` (§10.2), `waynode` (§10.2), `door`, `container`, `bed` (§10.1), `readable` (§10.3; a book), `structure` (§12) |
 | `base` | what it's an instance of — for an `npc`, the mob def (`human`, `dummy`, ...) |
-| `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells |
+| `pos` | world position in voxels (10 voxels = 1 m); the crosshair readout on F1 shows cells. In a **locale**'s group (a group named like one of the map's `locales`, e.g. `harrowby`) the FILE stores `y` relative to the locale's anchor, so the place moves with its ground; the game, F8, the References page and edit scripts all show and take world `y` |
 | `yaw` | facing in degrees: 0 faces +Z, 90 faces +X |
 | `props` | anything else; each kind reads what it needs (`name`, `tags`, ...) |
 
@@ -1373,6 +1373,7 @@ number order:
 | `harrowby_06_field.jsonl` | Edric's barley field, fence and scarecrow |
 | `harrowby_07_people.jsonl` | the paths between the doors (waynodes), the yard marker, the five villagers |
 | `harrowby_08_paths.sh` | the gravel and dirt paths painted on the ground |
+| `harrowby_09_locale.py` | made the village a **locale** (map.json `locales`): its refs' `y` became relative to the anchor at the green, and the cellar's ground cells moved into the locale's own layer. Re-runnable |
 
 The `.jsonl` files are edit scripts (§13): `#` lines are comments, one command
 per line. You never need to run them again — the result is already in the
@@ -1411,6 +1412,9 @@ The files that make it up:
   `editLayer: "default_ground"`. There is no clearing: the wood stands among
   the houses, and no tree's crown comes within 1 m of a wall (§14.1).
 - `assets/worldedits/default_ground.svedit` — the painted paths.
+- `assets/worldmap/default/locales/harrowby/ground.svedit` — the village's own
+  ground cells (Osric's cellar): the locale's edit layer, applied after the
+  map's.
 - `assets/schedules/{edric,maud,osric,agnes,wat}.json`,
   `assets/dialogue/{edric,maud,osric,agnes,wat}.json` — their days and their
   talk.

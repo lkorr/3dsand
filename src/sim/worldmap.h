@@ -59,7 +59,9 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 #include "sim/heat.h"
 
@@ -769,6 +771,59 @@ bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
 bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& words,
                     std::string& log);
 
+// ---- locales (docs/PLAN_map_v2.md L1) ----------------------------------------
+// A LOCALE is a hand-made place on the map (a village, a witch's hut):
+// map.json `locales[]`, {id, name, icon, bounds: {min: [x, z], max: [x, z]},
+// anchor: {at: [x, z], y}, editLayer?}. Two things belong to it:
+//
+//   * its REF GROUP, refs/<id>.json (group name == locale id). Those refs are
+//     STORED with pos.y relative to anchor.y. At load the locale's delta is
+//     BareGroundHeight(anchor.at, seed) - anchor.y, and every ref of the group
+//     lands at file y + anchor.y + delta == file y + groundY: structures (their
+//     stamp padY), waynodes, NPCs, markers. Reshaping the world under a locale
+//     moves the whole locale RIGIDLY with the ground at its anchor.
+//   * its EDIT LAYER, locales/<id>/<editLayer or "ground">.svedit (SVED v2,
+//     ground-relative per column like the map's own; absent = none), applied
+//     after the map's layer in table order (sim/worldedit.h).
+//
+// The sculpt layer is an offset and edit-layer cells are per-column relative,
+// so neither needs the delta.
+struct LocaleDef {
+  std::string id, name, icon;
+  int x0 = 0, z0 = 0, x1 = 0, z1 = 0;   // bounds, world voxels, inclusive
+  int ax = 0, az = 0;                   // anchor.at
+  int ay = 0;                           // anchor.y: the ground there when it was authored
+  std::string editLayer;                // file stem under locales/<id>/ ("ground" when unnamed)
+  // RESOLVED by LoadWorldMap for its seed: the bare ground at the anchor.
+  int groundY = 0;
+  bool resolved = false;
+  int Delta() const { return resolved ? groundY - ay : 0; }
+  // What a ref of this locale's group adds to its FILE y.
+  int RefYOffset() const { return ay + Delta(); }
+};
+// map.json's `locales` of <assetDir>/worldmap/<map> (unresolved), table order.
+// False + `err` on a malformed entry; a missing file or key is zero locales.
+bool ReadLocales(const std::string& assetDir, const std::string& mapName,
+                 std::vector<LocaleDef>& out, std::string& err);
+// group -> the y offset its refs' FILE y take (LocaleDef::RefYOffset), for
+// every locale of the map. Resolved from CurrentWorldMap() when it is that
+// map; otherwise anchor.y (delta 0) and a line in `warn` saying the locale
+// sits at its authored height because the world map is not loaded.
+std::map<std::string, int> LocaleRefYOffsets(const std::string& assetDir, const std::string& mapName,
+                                             std::vector<std::string>* warn = nullptr);
+// Every edit-layer FILE a map applies, in application order: the map's own
+// (assets/worldedits/<editLayer>.svedit) when named, then each locale's that
+// exists on disk. (path, name) -- `name` is what the save fingerprint and the
+// environment stamp hash the bytes under ("<layer>.svedit",
+// "<locale>/<stem>.svedit").
+std::vector<std::pair<std::string, std::string>> MapEditLayerFiles(const std::string& assetDir,
+                                                                   const std::string& mapName,
+                                                                   const std::string& editLayer,
+                                                                   const std::vector<LocaleDef>& locales);
+// sandvox::HashOneFile over those files, folded in order (h * FNV prime ^ next):
+// exactly HashOneFile of the map layer when the map has no locale layers.
+uint32_t HashEditLayerFiles(const std::vector<std::pair<std::string, std::string>>& files);
+
 // ---- the loaded map (P2) ---------------------------------------------------
 /** assets/worldmap/<name>/{map.json,map.svmap}, parsed and resolved. */
 struct WorldMapData {
@@ -842,6 +897,9 @@ struct WorldMapData {
     std::string base;
     int refX = 0, refY = 0, refZ = 0, refYaw = 0;
     int refPadMargin = -1, refPadApron = -1;   // the ref's props as written (-1 = default)
+    // L1: index into `locales` when the structure ref is in a locale's group
+    // (its refY / padY then carry the locale's offset), else -1.
+    int locale = -1;
   };
   std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
   // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
@@ -894,6 +952,8 @@ struct WorldMapData {
   // map.json `editLayer` (P7): assets/worldedits/<name>.svedit, applied over
   // this map's worldgen (sim/worldedit.h). "" = none. A bare name, never a path.
   std::string editLayer;
+  // map.json `locales[]` (L1), table order, RESOLVED for the load seed.
+  std::vector<LocaleDef> locales;
   bool Loaded() const { return extentW > 0 && extentH > 0; }
   /** SITE cell coordinates of a world voxel column (arithmetic shift: floors). */
   void CellOf(int x, int z, int* cx, int* cz) const {
@@ -953,6 +1013,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
 // warning when missing / mis-yawed) by the loader.
 struct StructurePlacement {
   std::string id, base, file;   // file: "refs/<group>.json", for warnings
+  std::string group;            // the group file's stem (== a locale id when it is one)
   int x = 0, y = 0, z = 0;      // the ref's pos: the asset's origin lands here
   int yaw = 0;
   int padMargin = -1;           // props.padMargin, -1 = the default

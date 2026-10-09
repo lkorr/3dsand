@@ -20430,7 +20430,9 @@ Brush strokes and selection operations write a sparse patch of world cell →
 voxel word, saved to `assets/worldedits/<name>.svedit` and named by the MAP:
 `map.json editLayer` (the map page's edits selector; it was tuning.json
 `world.editLayer` until map-overhaul P7 — a layer is authored against one
-map's ground, so the map owns the name).
+map's ground, so the map owns the name). Since map v2 L1 a map's layer is
+SEVERAL files merged in order — its own, then each locale's
+`locales/<id>/ground.svedit` (§9g); later wins where two name one cell.
 
 It is deliberately none of the three things it could have been:
 
@@ -23536,6 +23538,81 @@ record carries the regenerated gen list but not the environment reload, so
 `ops-replay` of a session with a live structure edit diverges (as with F7).
 "open in editor" is P5's.
 
+## 9g. Locales: a hand-made place rides its ground (added 2026-10-08)
+
+`docs/PLAN_map_v2.md` L1. Code: `worldmap.h` `LocaleDef` / `ReadLocales` /
+`LocaleRefYOffsets` / `MapEditLayerFiles`, `worldmap.cpp` (parse + the anchor
+bake), `world/refs.cpp` (relative group files), `world/structures.cpp`
+(`ReadPlacements`), `sim/worldedit.cpp` (several files, one layer). Gate:
+`locale`.
+
+```jsonc
+// map.json
+"locales": [ { "id": "harrowby", "name": "Harrowby", "icon": "village",
+               "bounds": { "min": [330, 3090], "max": [790, 3650] },
+               "anchor": { "at": [555, 3467], "y": 201 },
+               "editLayer": "ground" } ]          // optional; locales/<id>/<editLayer>.svedit
+```
+
+**The problem.** The world map v2 makes the ground an authored height plane
+that the author keeps reshaping, but a village's refs carry absolute `pos.y`:
+raise the hill under Harrowby and the houses stay in the air (F1 had to shift
+the refs by a script to survive its own conversion). A LOCALE is the unit that
+moves with the ground.
+
+**Rigid, by one number.** A locale's ref group (`refs/<id>.json`, the group
+name IS the locale id) is stored with y relative to `anchor.y`. At load
+`LoadWorldMap` measures the bare ground at `anchor.at` for the seed
+(`BareGroundHeight`, at the site-pad bake, where the planes, the sculpt layer,
+the soften boxes and the waynode routes are all in place) — `groundY`; the
+locale's delta is `groundY - anchor.y`, and every ref of the group lands at
+`file y + groundY`. Structure refs become stamp sites with `padY` / `refY`
+lifted by that offset (`StampSite::locale` names the locale; two houses of one
+locale share a floor exactly as before); the `RefStore` adds it on read and
+takes it off on every group-file write, so the store, the kinds, the editor
+commands and the References page all see WORLD positions and only the file is
+relative (`RefStore::yOff_`). One delta for the whole locale, not per house:
+the houses, the routes and the people between them were authored against each
+other, and a per-house shift would tilt the village apart. When the loaded map
+re-resolves a locale to another offset (F7 after the ground under it was
+reshaped), `RefStore::Update` moves the group by the difference and
+re-applies it (`FollowLocales`). A store whose map is not the loaded one (a
+tool, `--edit-script` on a map that failed to load) uses `anchor.y` — delta 0
+— and says so in its warnings. `--edit-script` loads the map CPU-only when it
+has locales, so a script's world positions convert through the real anchor at
+the default seed. `--mapcheck` reports each locale's `groundY`, `anchorY` and
+`delta`.
+
+**Its own edit layer.** `locales/<id>/ground.svedit` (or `editLayer`), SVED v2
+ground-relative like the map's (§9c.4) — the cells are per-column relative
+already, so they need no delta. `MapEditLayerFiles` lists the map's layer
+then each locale's that exists, in table order, and `WorldEdits::LoadFiles`
+merges them into the one process layer column by column: where two files name
+the same cell the LATER one wins (map first, then locales in order); a file
+that fails to parse is left out whole. Every consumer (the stream drain, the
+far base, `--voxserve`) sees the merged layer unchanged. The environment stamp,
+the save fingerprint's edit part and `tuner_server.py`'s `editsHash` fold the
+files in the same order (`HashEditLayerFiles`; exactly the old single-file hash
+for a map without locale layers), and the voxel region cache digests every
+file of `@map`.
+
+**Harrowby is the first** (`assets/worldmap/default/scripts/harrowby_09_locale.py`,
+re-runnable): anchor at the green with `anchor.y` = the loader's ground there
+(201, so its delta was 0 the day it moved and the village did not move); refs
+converted to relative y; the cellar's 5,184 columns moved out of
+`default_ground.svedit` into `locales/harrowby/ground.svedit`; the gravel and
+dirt path columns stay in the map layer (they become `roads[]`, R1). The
+earlier `harrowby_0x.jsonl` edit scripts are a RECORD in world voxels at the
+pre-v2 ground (y 201 floors), not something to re-run.
+
+**Known gaps.** A ref's save delta lives in the region bucket of its position;
+a delta big enough to carry a ref across a region boundary in y orphans the
+delta (warned and dropped on load, like a deleted ref). The overlap warning
+between a locale house and a house outside every locale judges their floors as
+different (it runs before the anchors resolve). The noise is not translation-
+invariant in y (a +200 plane moved the bare ground +183 with the default
+terrain noise), so a locale follows its anchor's ground, not the plane.
+
 ## 10. Networking — the model of record (decided 2026-09-10)
 
 Until 2026-09-10 this section said "both classic models are viable, decide at
@@ -25334,8 +25411,9 @@ id: schedules, dialogue speakers, save deltas.
 
 **The file is the truth** — `assets/worldmap/<map>/refs/<group>.json`, one ref
 per line, key order `id, kind, base, pos, yaw, props`, then any field this build
-does not know, in file order. `pos` is integer world voxels, `yaw` whole degrees
-(heading 0 = +Z, 90 = +X). Unknown props, unknown fields and unknown kinds are
+does not know, in file order. `pos` is integer world voxels — except `pos.y` in
+a LOCALE's group, which the file stores relative to the locale's anchor (§9g;
+the store holds world y) — `yaw` whole degrees (heading 0 = +Z, 90 = +X). Unknown props, unknown fields and unknown kinds are
 KEPT and written back verbatim; `WriteGroup(ParseGroup(x)) == x` for anything the
 writer produced (`refs-roundtrip`). Every load problem is a warning naming file,
 id and field, listed on the References page. The harness map's

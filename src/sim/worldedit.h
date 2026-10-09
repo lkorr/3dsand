@@ -53,6 +53,16 @@
 //     so the tuner draws what the game spawns into (it used to overlay the
 //     layer client-side).
 //
+// SEVERAL FILES, ONE LAYER (L1, docs/PLAN_map_v2.md). A map's layer is its own
+// file (map.json `editLayer`, assets/worldedits/) followed by every LOCALE's
+// (worldmap.h LocaleDef: assets/worldmap/<map>/locales/<id>/ground.svedit), in
+// map.json table order. They are merged into this one object column by column:
+// a later file's cells come after an earlier file's in the column, so where
+// two files name the SAME cell (same column, same offset) the later one wins
+// (Resolve keeps the last word of a cell) -- map layer first, then the locales
+// in table order. Cells the files do not share all apply. A v1 (absolute)
+// file and a v2 file may be merged: each cell remembers which it was.
+//
 // DETERMINISM. Ops are emitted in a fixed order — chunks in the order they were
 // queued, cells in ascending local index — and a chunk is queued exactly once
 // per generation of that chunk. Two runs of the same seed with the same layer
@@ -91,9 +101,14 @@ class WorldEdits {
   bool Load(const std::string& path, std::string& err);
   bool LoadBytes(const std::vector<uint8_t>& b, const std::string& what,
                  std::string& err);
+  // Several files merged in order (see "SEVERAL FILES" above). A file that
+  // is missing or malformed is LEFT OUT whole (never half-read) and named in
+  // `err`; the rest still load. False when any was left out.
+  bool LoadFiles(const std::vector<std::string>& paths, std::string& err);
   void Clear();
 
   bool Empty() const { return cols_.empty(); }
+  // True when any loaded cell is ground-relative.
   bool Relative() const { return relative_; }
   size_t VoxelCount() const { return voxelCount_; }
   size_t ColumnCount() const { return cols_.size(); }
@@ -177,9 +192,12 @@ class WorldEdits {
     uint32_t word;
   };
   struct ColCell {
-    int32_t y;          // dy when relative_, absolute y otherwise
+    int32_t y;          // dy when rel, absolute y otherwise
     uint32_t word;
+    bool rel;           // from a v2 ground-relative file
   };
+  // Appends one file's columns to cols_ (LoadBytes / LoadFiles).
+  bool ParseInto(const std::vector<uint8_t>& b, const std::string& path, std::string& err);
   // The FILE, as read: per column, ordered (x, z) so resolution order is a
   // function of content.
   std::map<std::pair<int32_t, int32_t>, std::vector<ColCell>> cols_;
@@ -219,6 +237,8 @@ WorldEdits& WorldEditLayer();
 // environment reload. Cheap when nothing changed (the file's size and mtime
 // are compared first), which is what lets the voxel server call it per
 // request.
+// The map's layer is EVERY file worldmap::MapEditLayerFiles names: its own,
+// then each locale's (L1).
 void LoadWorldEditLayerForMap(const std::string& assetDir);
 // The same, for an explicit layer name ("" clears). The voxel server's LAYER
 // command: the tuner may be editing a layer the map does not name yet.

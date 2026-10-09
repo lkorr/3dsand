@@ -283,7 +283,9 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
  * The EDIT LAYER (map.json `editLayer` since P7, assets/worldedits/<name>.svedit)
  * is the fourth input: `edits` is sandvox::HashOneFile over that one file (0
  * when no layer is named or the file is missing), so saving an edit layer
- * marks a running game stale like any other environment save.
+ * marks a running game stale like any other environment save. Since L1 the
+ * map's LOCALES' layers (locales/<id>/ground.svedit) are folded in after it
+ * (worldmap::HashEditLayerFiles); a map with none hashes as before.
  */
 struct EnvironmentStamp {
   std::string mapName;

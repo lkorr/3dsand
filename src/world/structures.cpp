@@ -471,9 +471,11 @@ void DeriveChildren(const Asset& a, const refs::Ref& inst, std::vector<refs::Ref
 
 void ReadPlacements(const std::string& assetDir, const std::string& mapName,
                     std::vector<worldmap::StructurePlacement>& out,
-                    std::vector<std::string>& warn) {
+                    std::vector<std::string>& warn, bool resolveLocales) {
   out.clear();
   const fs::path dir = fs::path(assetDir) / "worldmap" / mapName / "refs";
+  const std::map<std::string, int> yOff =
+      resolveLocales ? worldmap::LocaleRefYOffsets(assetDir, mapName) : std::map<std::string, int>{};
   std::error_code ec;
   if (!fs::is_directory(dir, ec)) return;
   std::vector<fs::path> files;
@@ -495,8 +497,10 @@ void ReadPlacements(const std::string& assetDir, const std::string& mapName,
       sp.id = r.id;
       sp.base = r.base;
       sp.file = label;
+      sp.group = p.stem().string();   // RefStore's group: the file name
       sp.x = r.pos.x;
       sp.y = r.pos.y;
+      if (auto o = yOff.find(sp.group); o != yOff.end()) sp.y += o->second;
       sp.z = r.pos.z;
       sp.yaw = r.yaw;
       if (r.props.contains("padMargin") && r.props["padMargin"].is_number_integer())
