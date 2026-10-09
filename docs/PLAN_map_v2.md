@@ -1,5 +1,43 @@
 # PLAN: world map v2 — topographic height, fine planes, roads, locales, Skyrim-scale mountains
 
+## Status (2026-10-08): ALL 11 PACKAGES LANDED on `map-v2`
+
+| Package | Merge |
+|---|---|
+| E1 map page core | a76b898 |
+| E2 height tools | a752b12 |
+| F1 format + authored height | d908d7f |
+| L1 locales (engine) | 7f9eeea |
+| A1 altitude is relative | 2e87ebc |
+| R1 roads (engine) | 223f298 |
+| H1 far horizon + height fog | 5b23269 |
+| E3 vector layers editor | 5a65697 |
+| S1 terrain light + clouds vs terrain | 5e12be8 |
+| E4 locale editor | 86fb920 |
+| P1 tall-terrain perf | 7c35116 |
+
+Docs: `docs/EDITOR_GUIDE.md` §15 (the owner's how-to), DESIGN.md (the
+world-map list's "map v2" entries, §9g locales, the far horizon / terrain
+light sections), `CLAUDE.md` layout rows, `assets/tuner.html` ARCH_NODES.
+
+**Open follow-ups:**
+
+- **A1:** the tundra snow-skin edge slide (heat-ambient D): owner decision.
+- **R1:** junctions are not profile-matched (two roads meeting at a vertex
+  each bake their own Y; the ground blends them in table order).
+- **S1:** the sun-horizon rebuild is a ~3 ms spike about once a second while
+  the sun's azimuth turns; raster bodies (debris / microbodies, mobs) ignore
+  the terrain shadow; the sea's LOD-handoff seam (`shadeWater` vs
+  `shadeFarWater`).
+- **P1:** a far column cache (the far list sits at its cap on `peaks-route`);
+  the page pool reaches 88.5 % on `peaks-route` (demote refusals are not
+  retried); liquid sentinels (16,384 sea chunks resident and a ~200 ms first
+  tick on the sea window).
+- **Pre-existing, not map v2:** `check_pass_table.py` fails on `sim_fluid`'s
+  `fluidAlloc` binding (already failing at BASE).
+- Out of scope, unchanged: rivers, generated towns, overhangs, extents past
+  ~26 km.
+
 Date: 2026-10-08. Orchestrated: one orchestrator session plans, reviews and
 merges onto the integration branch `map-v2`; Opus worktree agents implement one
 package each.

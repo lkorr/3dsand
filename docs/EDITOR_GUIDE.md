@@ -869,8 +869,11 @@ saves the way those always do.
 
 **The cellar under the Harrowby smithy** is the worked example. It is too far
 under the floor for a house blueprint (a house can only sink 8 cells), so it
-lives in the map's edit layer, written by `node scripts/paint_cellar.mjs`.
-That script owns those columns: edit the plan at its top and run it again.
+lives in Harrowby's own voxel layer, `locales/harrowby/ground.svedit` (§15.5).
+`node scripts/paint_cellar.mjs` owns those columns: edit the plan at its top
+and run it again. It writes the map's edit layer, so follow it with
+`python assets/worldmap/default/scripts/harrowby_09_locale.py`, which moves
+the cellar's columns into the locale's layer.
 Walk in through the smithy's door, go to the back of the bedroom past the
 bed, and take the stairs down beside the rail. The book is on the lectern
 west of the salt ring. `--selftest --gate harrowby-cellar` checks all of it.
@@ -1009,7 +1012,7 @@ file that says *which* blueprint, *where* and *which way round*.
 | Field | Means |
 |---|---|
 | `base` | the blueprint: the path under `assets/structures/` without the extension (`samples/smithy`, `harrowby_smithy`) |
-| `pos` | where the house's **front-door floor** goes: x and z are the middle of the house, **y is the floor you walk on**. The ground around the house is levelled so its top is one voxel below that. |
+| `pos` | where the house's **front-door floor** goes: x and z are the middle of the house, **y is the floor you walk on**. The ground around the house is levelled so its top is one voxel below that. In a LOCALE's group file (§15.5) `y` is stored relative to the locale's anchor; this page, F8 and edit scripts show and take the world y. |
 | `yaw` | which way the front door faces: `0` = +Z, `90` = +X, `180`, `270`. **Only quarter turns** — anything else is refused with a warning and the house is not built. |
 | `props.padApron` | optional: how many voxels round the walls stay dead level with the floor -- the doorsteps (default 8 = 0.8 m; 0..32) |
 | `props.padMargin` | optional: how many voxels the levelled ground takes to ease (a smooth S-curve) back into the terrain past the apron (default 24 = 2.4 m; 1..64; widened automatically where the ground is too far from the floor for that to stay one voxel a column) |
@@ -1091,8 +1094,9 @@ Editing the refs file in a text editor and pressing **R** works too, and **F7**
 - **It floats / is buried** — `pos.y` is the floor. Use **move to crosshair**
   aimed at the ground where the door should be (that sets y to one above the
   block), or type y.
-- **"N sites reach map cell … a cell holds at most 32"** — that many houses,
-  lakes and authored trees within one 102 m square; spread them out.
+- **"N sites reach map cell … a cell holds at most 128"** — that many houses,
+  lakes, authored trees and road pieces within one 102.4 m site cell; spread
+  them out.
 - **Check it works:** `--selftest --gate structure-stamp` (every voxel of a
   sample, four turns, the levelled ground, the slots) and
   `--gate structure-reload` (the live re-build equals a fresh world).
@@ -1372,7 +1376,7 @@ number order:
 | `harrowby_05_green.jsonl` | the green and its well, built from nothing |
 | `harrowby_06_field.jsonl` | Edric's barley field, fence and scarecrow |
 | `harrowby_07_people.jsonl` | the paths between the doors (waynodes), the yard marker, the five villagers |
-| `harrowby_08_paths.sh` | the gravel and dirt paths painted on the ground |
+| `harrowby_08_paths.sh` | the gravel and dirt paths, once painted on the ground; since map v2 they are `roads[]` in `map.json` (§15.2) and this script only erases the old paint |
 | `harrowby_09_locale.py` | made the village a **locale** (map.json `locales`): its refs' `y` became relative to the anchor at the green, and the cellar's ground cells moved into the locale's own layer. Re-runnable |
 
 The `.jsonl` files are edit scripts (§13): `#` lines are comments, one command
@@ -1403,15 +1407,20 @@ The files that make it up:
 
 - `assets/worldmap/default/refs/harrowby.json` — the placed things: five
   structures, five villagers, the outdoor waynodes, the smithy-yard marker.
+  Their `y` is relative to the locale's anchor (`anchor.y` 201, the ground at
+  the green): every house's file y 5 is world y 206.
 - `assets/structures/harrowby_{longhouse,smithy,alehouse,green,field}.vox` +
   `.struct.json` — the buildings; their doors, beds, chests, hearths and the
   places people stand are SLOTS in these files (`harrowby/smithy/anvil`, ...).
 - `assets/worldmap/default/map.json` — `harrowby_ground`, the village's
   SOFTENED GROUND (§14.1: the forest floor's hills kept at 25 %, its bumps and
-  grain at 0, the tracks between the doors flatter still) and
-  `editLayer: "default_ground"`. There is no clearing: the wood stands among
-  the houses, and no tree's crown comes within 1 m of a wall (§14.1).
-- `assets/worldedits/default_ground.svedit` — the painted paths.
+  grain at 0, the tracks between the doors flatter still), the eight paths as
+  `roads[]` (ids `harrowby_*`, kind `path`), the locale `harrowby`
+  (`locales[]`, §15.5) and `editLayer: "default_ground"`. There is no
+  clearing: the wood stands among the houses, and no tree's crown comes within
+  1 m of a wall (§14.1).
+- `assets/worldedits/default_ground.svedit` — the map's own edit layer, empty
+  now (its paths became roads, its cellar moved to the locale's layer).
 - `assets/worldmap/default/locales/harrowby/ground.svedit` — the village's own
   ground cells (Osric's cellar): the locale's edit layer, applied after the
   map's.
@@ -1442,8 +1451,10 @@ warning (the References page's warnings list names both). The stats line on
 the Structures page gives the house's size. You do **not** need a clearing:
 worldgen leaves out every tree whose crown would come within 1 m of a wall, and
 keeps trunks off the pad, its ramp and the villagers' walking lines (§14.1).
-Inside the softened ground the grass rolls round **200**, so the floor is
-**201**; elsewhere use **move to crosshair** (§12).
+Every Harrowby floor is **206** in the world (file y 5 over the anchor's 201:
+the v2 conversion lifted the village onto its new ground). Away from the
+houses the ground differs; use **move to crosshair** (§12) aimed at the ground
+where the door goes, and read the y it gives.
 
 **3. Place it** (§12). In game: F1 → World → References → **place a
 structure**, pick `harrowby_cottage`, id `harrowby/cottage`, turn it with
@@ -1451,7 +1462,7 @@ structure**, pick `harrowby_cottage`, id `harrowby/cottage`, turn it with
 from, **confirm**. Or in F8 with the **Place** tool, or one script line:
 
 ```
-{"cmd": "ref.place", "args": {"id": "harrowby/cottage", "kind": "structure", "base": "harrowby_cottage", "pos": [420, 201, 3230], "yaw": 90, "props": {"padMargin": 4}}}
+{"cmd": "ref.place", "args": {"id": "harrowby/cottage", "kind": "structure", "base": "harrowby_cottage", "pos": [420, 206, 3230], "yaw": 90, "props": {"padMargin": 4}}}
 ```
 
 **4. Make it his** (§13, F8). Double-click the house to open it. Use Box to
@@ -1488,15 +1499,14 @@ other off it all evening.
 others set (`edric_lights`, `wat_asked`, ...) so he can have an opinion about
 them.
 
-**9. A path to his door.** The ground between the houses is the map's, not a
-house's, so the F8 voxel tools do not reach it. Paint it:
-
-```bash
-node scripts/paint_ground.mjs default --mat dirt --width 12 --ragged 3 --path 470,3292 430,3250
-```
-
-Add the line to `harrowby_08_paths.sh` so the record stays complete. (The
-World map page's voxel view paints the same layer by hand.)
+**9. A path to his door.** A path is a road (§15.2). On the World map page
+pick the **Road** tool, start on the back lane (the vertex snaps onto
+`harrowby_back_lane`, making a junction) and end at his door, e.g. 470,3292 →
+430,3250. In the inspector: kind `path`, surface `packed_earth`, width 12.
+**Save map**, check its profile chart, F7. The engine grades it, keeps trunks
+and cover off it and draws it at any distance. (Ground that is not a path, a
+stone yard or a woodpile's bare patch, is the locale's voxel layer: open
+Harrowby on the map page and use the 3D view, §15.5.)
 
 **10. Try it.** In game, select Hob on the References page and press the
 **jump clock to** buttons: he should walk each row, open his door and shut it
@@ -1556,8 +1566,8 @@ Select it (click inside it) and set, in the **Sites** panel:
 | `feather` | how far past the box it eases back, voxels | 120 |
 
 100 everywhere is the biome's own ground; 0 hills is the flat level of the
-calm home area. The landform (the hillside the village is on) is never
-touched. **Save map**, then F7 in the game (or **Apply**).
+calm home area. The authored height plane (the hillside the village is on)
+is never touched. **Save map**, then F7 in the game (or **Apply**).
 
 **Each house: its pad.** Select the house (F8, or F1 → World → References) and
 under **ground round the house**: `flat apron` (voxels of level ground round
@@ -1607,15 +1617,399 @@ doorsteps (`_door_longhouse`, `_door_smithy`).
   fall off another (the longhouse loft has a rail for that reason).
 - **The ground round a house is a step or a ditch** — the house's floor is
   far from the ground there. Widen its `ramp` (it widens itself as far as 64
-  voxels to avoid a two-voxel step), or put the floor nearer the ground: inside
-  the softened ground use 201; elsewhere **move to crosshair** (§12).
+  voxels to avoid a two-voxel step), or put the floor nearer the ground with
+  **move to crosshair** (§12).
 - **The village looks lumpy or pitted** — lower the soften box's `bumps` and
-  `grain`; a lower `hills` flattens the swells. Dark pits in a gravel or dirt
-  track are loose grains kicked off the top: paint tracks two cells deep
-  (`--depth 2`, as `harrowby_08_paths.sh` does).
+  `grain`; a lower `hills` flattens the swells. The tracks are roads in solid
+  `packed_gravel` / `packed_earth` (§15.2), so they no longer shed grains; a
+  dark pit in one is something dug or burnt in play.
 - **"tree-material voxels inside its stamped box"** in the gate — a tree
   reaches into that house, which the building rule exists to refuse: a Tree
   site placed there by hand, or a bug.
 - **The village moved out of the gate's window** — the gate centres a 51 m
   window on Harrowby's refs; a house much further out than the field needs its
   own place, not this group.
+
+---
+
+## 15. Designing the world: the World map page (map v2)
+
+Environment → **World map** is where the whole world is drawn: its height,
+what grows where, its roads, its named places and the hand-made spots in it.
+Everything on the page is the map named in the **map** selector at the top
+left (that selector also writes `tuning.json world.mapLayer`, the map the
+GAME loads; `SANDVOX_MAP=<name>` overrides it for one run). A map is a folder:
+
+| File | What it holds |
+|---|---|
+| `assets/worldmap/<name>/map.json` | version 2: the extent, the planes' settings, sea level, the biome palette, the `terrain` noise, and the vector layers: `sites[]`, `roads[]`, `regions[]`, `markers[]`, `ridges[]`, `locales[]`, `editLayer` |
+| `planes/height/<tx>_<tz>.svt` | the HEIGHT plane: absolute heights, one post every **6.4 m** |
+| `planes/biome/<tx>_<tz>.svt` | the BIOME plane: one biome per **25.6 m** cell |
+| `sculpt.svsculpt` | the fine height layer (0.8 m samples), on top of everything |
+| `refs/<group>.json` | the placed things (§10, §12) |
+| `locales/<id>/ground.svedit` | a locale's own voxel cells (§15.5) |
+
+A tile file holds 256 × 256 samples, so one height tile covers 1.6 km and one
+biome tile 6.6 km. A tile that is not there is "every sample is the plane's
+default" (`planes.height.default`, `planes.biome.default`): the open ocean
+costs nothing. **Save map** writes map.json and only the tiles you changed (a
+tile painted back to the default is deleted). Every save moves the world hash;
+a running game sees it on **F7** (or **Apply** in the Environment sidebar).
+
+There is no "new map" button. Start a map by copying a folder
+(`assets/worldmap/default` minus its `refs/`, `locales/` and `scripts/`), by
+writing a generator like `scripts/gen_map_peaks.py`, or from a v1 map with
+`python scripts/convert_map_v2.py <name>` (v1 = `map.json` + `map.svmap`; the
+engine refuses a v1 map and names the converter).
+
+**The limits** (the loader refuses past them):
+
+| Limit | Value |
+|---|---|
+| height | ±32,000 voxels = ±3.2 km (absolute Y; the sea is `seaLevelY`, 112 on the shipped maps) |
+| plane size | 4,097 posts a side = ~26 km at 6.4 m, and 64 MiB packed |
+| extent | a multiple of 1,024 voxels (the 102.4 m site cell) on both axes |
+| biome warp | `warpAmpVox` ≤ a quarter of a biome cell (64 voxels) |
+| sites per site cell | 128 (a 102.4 m square; road pieces count) |
+
+Units: the page speaks metres; map.json speaks world voxels (10 to the metre,
+north is −z). The **hover readout** under the map gives x / z in metres, the
+authored height (in metres, its y, and above the sea), the biome, the tile,
+and the engine's real ground when the backdrop is loaded.
+
+### 15.1 Topographic editing: the height plane
+
+The height plane IS the shape of the world. A post's value is exact: put a
+summit at 1,100 m and the ground there is 1,100 m, give or take the noise. The
+engine reads the posts with a Catmull-Rom spline (smooth slopes, no steps at
+post edges), adds the map's seeded noise on top (the **Terrain** panel:
+range, hills, detail, grain, each scaled per biome), then the sculpt layer.
+The noise is texture; it never scales or overrides what you painted.
+
+**The display.** The canvas is a topographic map of the plane itself, drawn
+without the engine: **topo** (a colour ramp over the plane's real lowest and
+highest posts, sea in blues), **shade** (a hillshade from the north-west),
+**contours** (10 / 25 / 50 / 100 m, or auto by zoom; every 5th line bold; the
+0 m line is the coast) and **biomes** (the biome plane as a coloured overlay,
+slider = opacity). Right- or middle-drag pans, the wheel zooms, **Fit** frames
+the extent.
+
+**The real-terrain backdrop.** **Real terrain** lays the engine's own
+`--heightmap` of the view over the map at the opacity of the slider beside it:
+authored height + noise + sculpt + roads + sites, for the SAVED files. Zoomed
+in, it follows the view. Use it to see what the noise did to a slope you
+painted; press it again to hide it. It is a picture of the last save, so save
+first.
+
+**The Height brush** (left-drag). Shared with the Biome brush: **radius**
+(logarithmic, 1 m to 5 km; `[` and `]` resize) and **spacing** (dabs every
+N % of the radius along a drag, so mouse speed does not change the result).
+Then:
+
+| Control | What it does |
+|---|---|
+| **mode** `raise` / `lower` | move posts up / down; **str** = strength % of radius/10 per dab at the centre (a 1 km brush at 50 % = 50 m a dab) |
+| `smooth` | toward the local average |
+| `flatten` | toward the height where the stroke started |
+| `set` | toward a typed height, **to … m** ABOVE SEA (Alt+click picks the height under the cursor into it) |
+| `terrace` | quantises into shelves: **step** (m, from the sea) and **sharp** % (0 = soft steps, 90 = a 90 % flat shelf and a 10 % cliff) — the cliff tool |
+| `noise` | seeded relief: **amp** (m), **size** (largest feature, m), `ridged` (crests) or `fbm` (rolling), **seed** |
+| `erode` | water + scree erosion under the brush |
+| **edge** | the falloff: `smooth`, `linear`, `flat` (hard core, short soft rim), `sphere` |
+
+A stroke is one undo step (**Ctrl+Z** / **Ctrl+Y**, or the buttons) and only
+remembers the tiles it touched, so a 5 km stroke undoes as cheaply as a 5 m
+one.
+
+**The Shape tool** (one click, one undo step): stamps a landform into the
+plane: `peak`, `ridge`, `basin`, `volcano` (added to the land) or `plateau`,
+`mesa` (level it to a flat top). Set the height in m and whether it is a
+**rise** above the land at the centre or the **summit** height above sea (a
+basin's floor), the radius (`[` `]`), **aspect** (1 = round, 0.25 = a long
+ridge) and **rot** (`,` `.`). These are the old v1 landform sites; they are now
+edits to the plane, not things the engine reads.
+
+**Ridge and valley lines** (the **Line** tool). Click to draw a polyline
+(double-click or Enter ends), drag a vertex, click a segment to insert one,
+shift+click a vertex to delete it. The tool bar sets what a NEW line takes:
+`ridge` (raises toward its crest) or `valley` (lowers toward its floor), its
+cross-section (`V`, `U`, `round`, `sharp`), its **half-width** in m, and each
+new vertex's height (`sea` = m above sea, or `ground` = the plane under it ±
+the rise). In the **Height tools** panel each line has a vertex table and
+**all to** (every vertex to one height), **ramp ends** (the inner vertices on a
+straight grade between the ends), **from plane ±** (each vertex that far
+above / below the plane under it now), and **Bake**: that writes the line into
+the plane. The line itself is kept in map.json `ridges[]` so you can change it
+and **Rebake**; the engine never reads it, only the posts it baked. **Unbake**
+takes the bake back out and keeps whatever you painted since. The limit:
+rebake / unbake work from a snapshot held by the page, so they only reach a
+bake made in this session. After a reload, Bake bakes on top of the old one;
+Ctrl+Z, or paint it out, if that is not what you want.
+
+**Erosion** (the **Area** tool, then the Height tools panel). Drag a rectangle
+(shift+click clears it). Set **passes**, **strength %**, **talus °** (slopes
+steeper than this slump into scree), **seed**, and tick **water** (droplets:
+gullies and fans) and / or **thermal** (scree). **Erode area** runs in the
+background and shows the result in the plane; **Commit** keeps it (one undo
+step), **Discard** puts the posts back. The same seed on the same posts gives
+the same result.
+
+**PNG import and export** (Gaea, World Machine, QGIS, …). In the Height tools
+panel, **Export height PNG** writes the Area (or the whole map if there is no
+Area) as a 16-bit greyscale PNG, exact: 1 unit = 1 voxel, value 0 = the
+lowest post, and the mapping rides in the file. **Export biome PNG** writes the
+biomes in the palette colours. **Import height PNG…** reads a 16-bit (or 8-bit)
+greyscale heightmap and opens a dialog: **onto** (the PNG's own posts, for a
+file this page exported; the Area; or the whole map), **metres per unit**
+(Gaea: the terrain's height ÷ 65535) and **value 0 is at … m above sea**; the
+dialog shows the height range that gives you. A file the same size as the
+target goes in post for post; any other size is resampled. **Import biome
+PNG…** maps every colour to the nearest palette biome and lists the colours it
+could not match (tick "leave unmapped cells as they are" to keep the old
+biome there). **Apply import** writes it as one undo step. The codec is
+`scripts/map_png.py` (`python scripts/map_png.py info <file.png>` says what a
+file holds). Plain Python, so a full-map Paeth-filtered PNG takes ~10 s to
+read.
+
+**Biomes.** Click a biome chip under the tool bar (the palette is map.json
+`biomes`, names of `assets/biomes/` files), then paint with the **Biome
+brush**; Alt+click picks the biome under the cursor. Biome boundaries wobble
+by `warpAmpVox` (seeded), so a 25.6 m cell edge never reads as a straight
+line.
+
+**What follows the height by itself** (nothing to paint): the treeline is a
+FRACTION of the map's height above the sea, scaled per biome
+(`terrain.treelineScale` in the biome file) and jittered by
+`terrain.treelineJitter`, so one biome works on a 20 m harness and a 1,400 m
+range; snow, trees and cover rows read it. The climate cools with altitude
+(`sim.heatLapsePerKm`, 6 heat units per km above the sea), and snow falls
+above the freezing level. A
+column steeper than `terrain.rockSlope` (2.5:1 shipped) is bare rock: no
+powder, no snow cap, no grass. Sediment fills valleys relative to the authored
+ground, so a high valley gets soil like a low one. Caves stay under the
+column's own ground, and no ground within 20 m of the magma table floods with
+lava.
+
+### 15.2 Roads
+
+A road is graded ground the engine builds: it cuts through bumps, fills dips,
+eases a shoulder back into the land either side, lays a surface, keeps trees,
+cover and tarns off itself and shows at any distance. It lives in map.json
+`roads[]`.
+
+**Drawing.** The **Road** tool: click on open map to start, click for each
+vertex, double-click, Enter or clicking the last vertex ends it. Click a road
+to select it; click a segment of the selected road to insert a vertex; drag a
+vertex to move it; shift+click (or Delete) deletes one.
+
+**Junctions.** A vertex dropped within a few pixels of another road's vertex
+lands ON it; dropped on another road's segment, it lands on the segment and
+that road gains a vertex there (a T). Dragging a shared vertex moves every road
+on it; hold **Alt** when you press to drag one road's vertex out alone, or when
+you release to drop without snapping. **Ctrl+click** on a road starts a
+branch there. The vertex table marks shared vertices `⋈`.
+
+**The inspector** (Vector layers panel, select a road):
+
+| Field | Means | Defaults road / track / path |
+|---|---|---|
+| `id`, `name` | the id is required and unique; the name is optional | |
+| `kind` | `road`, `track` or `path`; changing it moves the fields still at the old kind's defaults | |
+| `surface` | the top material; offered only SOLID ones (`packed_gravel`, `packed_earth`, `cobble`, `flagstone`, …) | |
+| `width` | carriageway, voxels (2..256) | 40 / 24 / 12 |
+| `shoulder` | the ramp back to the bare ground either side, voxels (0..64); the engine widens it where the cut or fill would step more than a voxel | 16 / 12 / 6 |
+| `max grade` | steepest the profile may climb, % (1..100) | 10 / 15 / 25 |
+| `depth` | surface cells from the top down (1..8) | 3 |
+
+**Continue from end** adds vertices after the last; **Reverse** flips the
+order (the profile then runs from the other end).
+
+**Solid surfaces only.** A graded road is a slope, and a powder (gravel, dirt,
+sand) on a slope never stops sliding, so the CA never sleeps. The loader
+refuses the whole map if a road's surface is not a solid. `packed_gravel` and
+`packed_earth` are the solid look-alikes of gravel and dirt.
+
+**The profile chart** under the inspector is the ENGINE's bake (`--mapcheck`
+of the saved map), not a guess: the road surface over the bare ground it was
+graded from, cut tinted red and fill blue, vertices ticked, a span over
+`max grade` drawn red (it should never be). Hover the chart to see the spot
+on the map. A road you changed since the last save is labelled as the SAVED
+road's bake; a road not saved yet has no chart. Save to see it.
+
+**max grade, in practice.** The bake samples the bare ground every 0.4 m,
+smooths it over ±3.2 m, then fits the road between the steepest-allowed line
+under the ground and the one over it. A low `max grade` across a steep slope
+means deep cuts and high fills, with shoulders up to 6.4 m wide; if the chart
+shows a big cut, add vertices so the road switches back across the slope, or
+raise the grade.
+
+**What it does not do yet.** Junctions are not profile-matched: two roads meeting at
+a vertex each bake their own height there and the ground blends them in
+table order. Keep a junction on level ground, or give the later road's end
+the same grade. The page refuses to save a road with fewer than two distinct
+points or a duplicate id, because the engine would refuse the map.
+
+Harrowby's paths are roads (ids `harrowby_*`, kind `path`, `packed_gravel` on
+the green, `packed_earth` lanes); `default/scripts/harrowby_08_paths.sh` now
+only erases the old painted paths from the edit layer.
+
+### 15.3 Regions and markers
+
+**Regions** (`regions[]`: `{id, name, colour, points}`) are named outlines,
+"the Mirkwood", "the March of Ost". The **Region** tool: click out a polygon,
+click its first vertex to close it; vertices drag / insert / shift+click delete
+like a road's, and snap to other regions' vertices and edges so two regions
+share a border. The inspector sets id, name and colour. They are data only:
+the engine loads and checks them (an id, at least three distinct points) and
+answers `RegionAt(x, z)` with the last region in the list that holds the
+column. Nothing in the game reads them yet.
+
+**Markers** (`markers[]`: `{id, name, icon, at}`) are pins on the map for
+you: the **Marker** tool places one with the icon picked beside it (hut,
+village, castle, tower, cave, ruin, shrine, camp, mine, port, 12 × 12 pixel
+art), drag moves it, shift+click deletes it. A marker builds nothing. A place
+you want to BUILD is a locale.
+
+### 15.4 Sites and the sculpt layer, briefly
+
+The site tools are unchanged (§14.1 for clearings and softened ground):
+**Pad box**, **Spawn**, **Stamp site**, **Water** (an authored lake from a
+preset), **Tree**, **Clearing**, **Soften**, and **Select** to pick any of them
+for the Sites panel. **Sculpt** paints `sculpt.svsculpt`, a ±offset on top of
+everything at 0.8 m (raise / lower / smooth / flatten / erase). Use the height
+plane for the world and sculpt for a place. The **Load check** panel is
+`sandvox --mapcheck` on the saved files: every warning the engine has about
+the map, the baked roads and the locales' anchors.
+
+### 15.5 Locales: hand-made places that ride their ground
+
+A **locale** is a place you build by hand: a village, a witch's hut, a ruined
+tower. It is a box on the map (`locales[]`: `{id, name, icon, bounds: {min,
+max}, anchor: {at, y}}`), a ref group with the same name (`refs/<id>.json`:
+its houses, people, paths, chests) and its own voxel layer
+(`locales/<id>/ground.svedit`).
+
+**Why the anchor.** You will keep reshaping the world after you build a place
+on it. A locale's refs store their `y` RELATIVE to `anchor.y`, the ground at
+`anchor.at` when you built it. At load the engine measures the bare ground at
+`anchor.at` again and lifts every ref of the group by the difference: raise the
+hill under the village 20 m and every house, pad, waynode and villager comes up
+20 m together, still standing on each other as you built them. It is ONE
+offset for the whole locale, so the village stays rigid; it follows the ground
+at the anchor, not the shape of the ground under each house (a house on a slope
+you steepened still levels its own pad). The voxel layer is stored per column
+relative to the ground already, so it follows too. The References page, F8 and
+edit scripts all show and take WORLD positions; only the file is relative.
+
+**Creating one.** Pick the **Locale** tool, choose an icon beside it, and drag
+out the bounds (at least 3.2 m a side). The anchor starts at the centre with
+`anchor.y` from the real-terrain backdrop or the plane. Select it in the
+**Locales** panel to set id (a folder name, `[a-z0-9_-]`, fixed once saved),
+name, icon, the bounds and the anchor. **Save map**, then the panel shows what
+the engine measured ("ground at the anchor y…, delta …"); **anchor.y := engine
+ground** makes the delta 0. Do that before you build, so nothing jumps.
+Deleting a locale (×) removes it from map.json only; its refs file then reads
+as absolute y.
+
+**Opening it.** Double-click it on the map (or **Open**). The page becomes the
+LOCALE PAGE: a breadcrumb (**World map › Harrowby**) leads back, the view frames
+the bounds over the engine's heights at one sample a voxel, and the tools are
+cut down to what a place is made of:
+
+- **Sculpt**, **Clearing**, **Soften**, **Tree**, **Water**: CLIPPED to the
+  bounds. A sculpt stroke dragged over the edge changes no ground outside it,
+  exactly. A box is clamped (feather included); a lake or tree outside is
+  refused. These are map.json / sculpt edits: **Save map** writes them.
+- **Structure**: pick a blueprint (Environment → Structures), a facing (0° =
+  door to +z / south, 90° = +x / east) and an optional name; click inside the
+  bounds to place it on the ground, drag to move, **R** (or ⟳ / ⟲ in the panel)
+  to turn, shift+click or Delete to remove.
+- **Link**: click a waynode, then another, to join them (again, or Shift, to
+  part them); click open ground for a new waynode joined to the last one;
+  shift+click deletes one.
+
+**Structures and waynodes are written through the F8 command layer**, never by
+the page: each action becomes `ref.place` / `ref.move` / `ref.delete` /
+`ref.link` / `ref.unlink` commands that the engine runs headless
+(`--edit-script`, `/api/refs/commands`), exactly as the in-game editor (§13)
+would, so the anchor arithmetic is the engine's. They are written at once (no
+Save needed) and each batch is one undo step. They are REFUSED until the
+locale in map.json is saved exactly as shown (the engine converts y through
+the saved anchor). Villagers, markers, doors and chests are edited in game
+(F8, F1 → References); the panel counts them.
+
+**The locale's voxel layer.** Under the map, the **3D (voxels)** view streams
+the real world of the box (the map's layer and every locale's applied, as the
+game applies them). **tool**: `none` (orbit: drag to turn, wheel to zoom),
+`brush`, `erase`, `picker`; the material; **r** (radius, voxels); **Undo**,
+**Redo**; **Save voxels** writes `locales/<id>/ground.svedit`, ground-relative.
+Only cells inside the bounds can be edited. Use it for what a blueprint cannot
+do: a cellar below a pad, a stone yard, a well shaft, rubble. An empty layer
+deletes the file.
+
+**Layers stack.** The map's own `editLayer` (`assets/worldedits/<name>.svedit`,
+the **edits** selector) applies first, then each locale's layer in map.json
+order; where two name the same cell, the later wins.
+
+**Harrowby is the example** (§14). `locales[0]` of `default`: bounds
+(330, 3090)..(790, 3650), the soften box; anchor at the green (555, 3467),
+`anchor.y` 201. `refs/harrowby.json` is relative to it,
+`locales/harrowby/ground.svedit` holds Osric's cellar, and the paths are
+`roads[]`. `default/scripts/harrowby_09_locale.py` is how it was converted,
+and is re-runnable. The gates: `locale` (raise the plane under a locale: house,
+pad, refs and voxel patch all move by exactly the anchor's change) and
+`village-harrowby`.
+
+### 15.6 The `peaks` map: the tall-terrain reference
+
+`assets/worldmap/peaks/` is 8 km of mountains, the fixture for everything that
+has to work on tall ground. A coast along the south edge (sea y 112),
+foothills from 30 to 200 m, a **1,400 m massif** north-east of centre with a
+**knife ridge** running west from the summit, a **300 m cliff band** across the
+foothills, a **600 m gorge** cut through the massif's south flank, and a **high
+valley at ~900 m** west of the massif with a tarn and the spawn. Biomes
+follow altitude: meadow, pine, tundra, alpine.
+
+It is GENERATED: `python scripts/gen_map_peaks.py` writes it identically
+every time. Edit the script, not the tiles (a hand edit is lost on the next
+run). Copy the folder under another name to make a map of your own that
+starts from it.
+
+Walk it: pick `peaks` in the map selector (or `SANDVOX_MAP=peaks`) and start
+the game; the boot window is placed on the spawn's ground (~900 m). What it is
+used for:
+
+- the gate `altitude` (the window, the per-biome treeline, the lapse rate, the
+  lava clearance under the gorge, valley sediment, bare rock on the cliff band
+  that settles to ≤ 32 active chunks);
+- the look frames `--shot-frames screenshot_peaks_valley,screenshot_peaks_summit,screenshot_peaks_sea10k,screenshot_peaks_dusk,screenshot_peaks_storm,screenshot_peaks_cloudcap`;
+- the budget cameras `--render-budget --budget-cams summit,peaksea`;
+- the perf flight `--perf --scenario peaks-route` (summit → gorge → high
+  valley).
+
+Past the near field, a mountain is drawn by the **far horizon**: the height
+plane marched out to the map's edge, so a 1,400 m peak shows from 10 km and
+more. The air thins with height (`render.fogSeaDensity`, `render.fogScaleHeight`,
+`render.fogHaze` for the distance blue), ridges shade their valleys at the
+scale of the map, and clouds stop at the terrain, so a summit can stand in the
+deck. All render-only: `tuning.json`, live on F5.
+
+### 15.7 When it goes wrong
+
+- **"map.json is a v1 map … convert it with `python scripts/convert_map_v2.py`"**:
+  run that command.
+- **"N sites reach map cell … a cell holds at most 128"**: that many sites
+  and road pieces in one 102.4 m square. Spread them out, or use fewer
+  vertices on a long road.
+- **A road refused: "not a solid"**: pick a solid surface (`packed_gravel`,
+  `packed_earth`, `cobble`, `flagstone`).
+- **The profile chart says "not saved yet"**, or the backdrop shows the old
+  ground: both read the SAVED files. Save the map.
+- **A locale's houses float or are buried after you reshaped the ground**:
+  the locale follows the ground at its ANCHOR. Put the anchor where the
+  village stands (the green, not the edge of a slope), save, check the delta
+  in the Locales panel.
+- **Placing a structure is refused on the locale page**: save the map first;
+  the engine needs the locale as shown.
+- **Rebake does nothing useful after a reload**: rebake only reaches this
+  session's bake (§15.1). Ctrl+Z, paint it out, or bake again on top.
