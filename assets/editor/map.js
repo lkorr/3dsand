@@ -86,6 +86,7 @@ import * as MT from './maptiles.js';
 import * as HS from './heightshapes.js';
 import * as VEC from './mapvector.js';
 import * as LOC from './maplocale.js';
+import {buildLegend, buildToolGuide} from './maplegend.js';
 
 // Display colours by biome NAME; anything unknown gets a stable hash colour.
 const COLOR = {
@@ -2709,6 +2710,8 @@ function syncControls() {
     b.style.display = (inLocale ? LOCALE_TOOLS.includes(k) : k !== 'structure' && k !== 'waylink') ? '' : 'none';
   for (const p of [els.vecPanel, els.htPanel, els.terrainPanel, els.palette]) if (p) p.style.display = inLocale ? 'none' : '';
   if (els.mapSel) els.mapSel.disabled = inLocale;   // leave the locale to switch maps
+  if (els.legend) els.legend.sync(inLocale);
+  if (els.guide) els.guide.sync(tool);
   for (const [k, b] of Object.entries(els.tools)) b.classList.toggle('on', k === tool);
   // per-tool option groups: only the active tool's
   for (const [k, g] of Object.entries(els.opts || {})) g.style.display = k.split(' ').includes(tool) ? '' : 'none';
@@ -3047,11 +3050,15 @@ export function attach(hooks) {
     'Sites: the pad box (calm bare ground; the harness map’s is the selftest’s), the spawn diamond, stamps, authored lakes, authored trees, forest clearings, softened ground; they keep out by their own footprint. The Load check panel says what the engine thinks of the saved map. ' +
     'Saving writes map.json and only the plane tiles you changed (assets/worldmap/<name>/planes/), and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
   els.bar = bar;
-  const main = el('div', {class: 'mapmain'}, LC.buildBreadcrumb(), bar, toolbar, els.palette, els.canvas, LC.build3d(), els.status, note);
+  els.guide = buildToolGuide(el);
+  style.textContent += els.guide.css;
+  const main = el('div', {class: 'mapmain'}, LC.buildBreadcrumb(), bar, toolbar, els.guide.panel, els.palette, els.canvas, LC.build3d(), els.status, note);
   els.vecPanel = VL.buildPanel();
   els.htPanel = buildHeightToolsPanel();
   els.terrainPanel = buildTerrainSection();
-  const side = el('div', {class: 'mapside'}, buildCheckPanel(), LC.buildPanel(), els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
+  els.legend = buildLegend(el, VEC.iconCanvas, {land: LAND_LUT, sea: SEA_LUT});
+  style.textContent += els.legend.css;
+  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
