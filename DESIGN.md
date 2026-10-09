@@ -16176,7 +16176,10 @@ where you hear from either (§12b, "The ears are on the character").
   out the bands still in the queue instead of showing sky through them,
   clamped between the full-horizon pin (`kFarFogDensity`) and a ceiling at
   level 2's half-extent (`kFarFogDensityMax`, so the residency window is never
-  fogged away) and eased over a few frames. *Farthest complete*, not "the one
+  fogged away) and eased over a few frames. **Since H1 (2026-10-08) that pin
+  is 0 and this fog is only the LOADING fog:** with every level filled it
+  lifts entirely, because the far horizon draws the map past the cascade edge
+  and the air is the height fog ("The far horizon and the air", below). *Farthest complete*, not "the one
   below the innermost incomplete", which is what it read until 2026-09-10: the
   levels are nested boxes all centred on the player and `traceFar` tests each
   independently, so a level `farBox` has collapsed is skipped and the next one
@@ -16609,6 +16612,73 @@ where you hear from either (§12b, "The ears are on the character").
   second key light — `keyLightColor()`/`keyLightDir()` route sun-vs-moon
   through one place, so shadows, water glints and caustics all follow whichever
   body is actually up.
+
+### The far horizon and the air (2026-10-08; map v2 H1, docs/PLAN_map_v2.md; `src/sim/horizon.*`, raymarch.wgsl `traceHorizon` / `shadeHorizon` / `aerialFrac`, common.wgsl `airFogTauS`)
+
+**The horizon past the cascades.** The far field ends at the outermost level's
+box, 6.55 km from the eye; until H1 a ray that found nothing there was sky,
+so a 1,400 m massif 10 km off did not exist and the fog was pinned to reach
+~99% exactly at the box edge to hide the square. The world map's AUTHORED
+HEIGHT PLANE is on the CPU (`WorldMapData`), so `horizon::Build` turns it into
+a render-only 2D pyramid at load and at every environment reload
+(`Simulation::UploadHorizon`, from `Init` / `UploadEnvironment`; renderBGL 45):
+one SAMPLE every 256 voxels (25.6 m, the level-8 cell) over the extent widened
+by `edgeFadeVox`, each holding the MAX effective surface (`max(ground, sea)`)
+over its footprint's posts — the silhouette, so a ridge between two samples
+survives — and the AVG ground over the same posts; then a cell MAX pyramid
+(level 0 = max of a cell's four corner samples, an exact bound of their
+bilinear; each level the max of 2x2) that also carries the cell's average.
+`traceHorizon` starts where the ray leaves the level-8 box in XZ and walks the
+pyramid top-down: a cell whose MAX is under the ray across it is skipped
+whole, and a level-0 cell intersects the bilinear surface (four sub-steps and
+a bisection). Most sky pixels leave on the first compare (ascending and
+already above the map's highest point). Past the grid the surface is flat —
+the sea, or the plane's default if higher — and is hit analytically, so the
+ocean runs to the horizon. The surface eases from the AVG ground at the
+cascade edge to the MAX over the first 1.5 km (`HZ_BLEND_M`), so it meets the
+cascade's centre-sampled cells without a lip; level-8 cascade hits within
+900 m of the box face take the horizon's paint (`hzSeamWeight`) so the two
+meet in one colour. Shading is the far field's: the biome's skin material
+(from the packed biome records, so the horizon paints what worldgen lays),
+stone past ~45 degrees, snow over the map's treeline, the far water law under
+the sea, the far openness/ambient/bounce and the cloud shadow; the normal is
+the AVG field's gradient at the pyramid level whose cell is about a pixel, so
+30 km of terrain does not alias. NO sun shadows yet (that is S1, which builds
+its horizon map from this pyramid). `render.horizon` (RenderParams flag bit 7,
+a runtime switch, the `nohorizon` budget arm) turns it off. Measured
+2026-10-08, 2560x1440, RTX 3060 Ti, `--render-budget --budget-cams
+summit,peaksea --budget-arms baseline,nohorizon` (fragment time, the `pre`
+compute span excluded): `peaksea` (the massif 10 km off, drawn by the pyramid
+walk) 15.36 vs 15.22 ms, i.e. ~0.14 ms; `summit` within the ±0.3 ms noise.
+The pyramid for the 20 km `default` map is ~832^2 samples, ~4 MiB.
+
+**Peak preservation at levels 6-8.** A cascade cell is solid when its CENTRE
+sample is, so a summit or a knife ridge between two sample columns was shaved
+by up to a whole cell (25.6 m at level 8). `far` and `fardown` now raise a
+column's top to the highest authored height post inside the cell footprint
+(`farPeakTop`, at most 4 x 4 posts) from `FAR_PEAK_MIN_SHIFT` (6) up, and an
+air-sampled cell in `(h, peak]` takes the column's skin (snow over the
+treeline). Both producers call it on genColumn's own column, so the
+`far-downsample` agreement holds. The surface map (`farmap`) is NOT where
+this lives: it is only read at the refine levels (1-2), whose sub-columns are
+a voxel or two wide.
+
+**The air: height fog.** The fog is now the atmosphere's, not the LOD's:
+extinction `rho(y) = fogSeaDensity * exp(-(y - sea) / fogScaleHeight)`
+(`render.fogSeaDensity` per km at the map's sea plane, 0.12;
+`render.fogScaleHeight` 1,200 m), integrated exactly along each view ray in closed form
+(`airFogTauS`): a valley is hazy, a summit is clear, and a ray climbing out of
+the haze sees through it. Both rows are `NO_WGSL` and ride `RenderParams`
+(`hfogDensity / hfogFalloff / hfogBaseY`, spent from the wind-primitive row's
+pads) so the sliders are live without a recompile; the weather's mist scales
+`hfogDensity` with the loading fog. `RenderParams.fogDensity` is now ONLY the
+loading fog (`kFarFogDensity` = 0 when every level is filled; main.cpp's
+adaptive term otherwise). The raster bodies and the gust streaks use the same
+law (common.wgsl `airFogFrac`). `applyAerial` adds the DISTANCE BLUE
+(`render.fogHaze`, 0.6): a part-fogged surface takes some of the airglow ~17
+degrees above its own direction, weighted `1 - f^2` so full fog still
+converges to exactly the sky in `rd` (the rule above) while a 1 km peak at
+15 km reads as a blue silhouette rather than a grey one.
 
 ### Static micro-detail (2026-08-20; docs/PLAN_voxel_editor.md §A)
 

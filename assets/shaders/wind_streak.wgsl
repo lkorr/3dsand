@@ -245,7 +245,11 @@ fn vsStreak(@builtin(vertex_index) vi : u32,
   let dyEx = max(abs(q.y - R.camPos.y) - 62.0, 0.0);
   let far = 1.0 - smoothstep(R.streakA.w * 0.6, R.streakA.w,
                              length(vec2f(length(q.xz - R.camPos.xz), dyEx)));
-  let fog = exp(-dist * VOXEL_METERS * R.fogDensity);
+  // The one air law (common.wgsl airFogTauS): the height fog plus the
+  // loading fog, along the ray from the eye to the streak.
+  let fog = exp(-airFogTauS(R.camPos.y, R.hfogDensity, R.hfogFalloff, R.hfogBaseY,
+                            R.fogDensity, dist * VOXEL_METERS,
+                            (q.y - R.camPos.y) / max(dist, 1e-3)));
   // Tapered at BOTH ends: fading in over the first segment behind the head
   // and out toward the tail. A full-alpha head was a blunt cap, which reads
   // as a comet (a thing) rather than a wisp (moving air).
