@@ -305,21 +305,7 @@
     ]
   },
   "water": {
-    "features": [
-      {
-        "preset": "tarn",
-        "tile": 44.8,
-        "rarity": 6,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 96,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      }
-    ]
+    "features": []
   },
   "caves": {
     "features": [

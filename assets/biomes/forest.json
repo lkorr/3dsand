@@ -405,34 +405,7 @@
     ]
   },
   "water": {
-    "features": [
-      {
-        "preset": "tarn",
-        "tile": 44.8,
-        "rarity": 4,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 96,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "preset": "spring_pool",
-        "tile": 25.6,
-        "rarity": 12,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 160,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      }
-    ]
+    "features": []
   },
   "caves": {
     "features": [

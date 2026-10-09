@@ -364,47 +364,7 @@
     ]
   },
   "water": {
-    "features": [
-      {
-        "preset": "tarn",
-        "tile": 44.8,
-        "rarity": 4,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 96,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "preset": "marsh",
-        "tile": 76.8,
-        "rarity": 5,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 32,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "preset": "kettle",
-        "tile": 38.4,
-        "rarity": 7,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 64,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      }
-    ]
+    "features": []
   },
   "caves": {
     "features": [

@@ -333,34 +333,7 @@
     ]
   },
   "water": {
-    "features": [
-      {
-        "preset": "marsh",
-        "tile": 28.8,
-        "rarity": 2,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 64,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "preset": "kettle",
-        "tile": 44.8,
-        "rarity": 8,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 96,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      }
-    ]
+    "features": []
   },
   "caves": {
     "features": [

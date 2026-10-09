@@ -138,10 +138,12 @@ for (const b of biomes) {
   ok(b.index === BG.ENGINE_BIOMES.indexOf(file), b.name + ': index ' + b.index + ' matches worldgen id ' + BG.ENGINE_BIOMES.indexOf(file));
   // A biome with zero tree density (the ocean) legitimately lists nothing:
   // it IS water and grows no trees. Everything else must name at least one
-  // species and one body-of-water preset, or the tab is showing an empty stack.
+  // species, or the tab is showing an empty stack. Water rows are optional:
+  // every biome ships with none (2026-10-08) -- a rolled preset tiles the
+  // same round bowl across the whole biome, so water is placed as authored
+  // map sites instead.
   if (b.trees.density > 0) {
     ok(b.trees.species.length > 0, b.name + ': lists ' + b.trees.species.length + ' tree species');
-    ok(b.water.features.length > 0, b.name + ': lists ' + b.water.features.length + ' water bodies');
   } else {
     ok(true, b.name + ': tree density 0 -- ' + b.trees.species.length + ' species, ' + b.water.features.length + ' water bodies (nothing required)');
   }

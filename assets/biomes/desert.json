@@ -138,34 +138,7 @@
     ]
   },
   "water": {
-    "features": [
-      {
-        "preset": "oasis",
-        "tile": 102.4,
-        "rarity": 6,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 48,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "preset": "playa",
-        "tile": 128,
-        "rarity": 5,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 24,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      }
-    ]
+    "features": []
   },
   "caves": {
     "features": [
