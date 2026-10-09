@@ -10777,7 +10777,7 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
     const float carveRadius =
         pt.fallSplatCarveBase + impactMs * pt.fallSplatCarvePerMs;
     CarveRadialAll(center, carveRadius, world, spawns, /*power=*/0.0f,
-                   DamageCtx(DamageCause::Fall));
+                   DamageCtx(DamageCause::Fall), /*splatMs=*/impactMs);
 
     // Sever roughly half the remaining severable limbs at random.
     std::vector<int> severable;
@@ -14262,10 +14262,35 @@ void Mob::LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
     s.py = (int32_t)std::lround(wp.y * 256.0f);
     s.pz = (int32_t)std::lround(wp.z * 256.0f);
     Vec3 out = wp - limb.xf.pos;
+    float sp = 3.0f;
+    if (shedSpray_.on) {
+      // A BLAST OR A SPLAT SPRAYS (bug report 2026-10-09 14:26: a body blown
+      // apart or burst on landing left a little column of flesh and bone where
+      // it stood). Away from the blast centre, fast, scattered: the 3 vox/s
+      // drip below is a gobbet falling off a wound and stacks in place when a
+      // whole torso of it leaves at once. The jitter is a hash of the voxel's
+      // own lattice cell and this creature, so the spray is a pure function
+      // of the carve (rule 1).
+      out = wp - shedSpray_.origin;
+      const float d = out.len();
+      uint32_t h = (uint32_t)id_ * 0x9E3779B1u ^ (uint32_t)v.x * 0x85EBCA77u ^
+                   (uint32_t)v.y * 0xC2B2AE3Du ^ (uint32_t)v.z * 0x27D4EB2Fu ^
+                   (uint32_t)limb.body;
+      auto next = [&h]() {
+        h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+        return (float)(h & 0xFFFFu) * (1.0f / 65535.0f);
+      };
+      const float spread = CurrentTuning().gore.shedSpread;
+      out = d > 1e-3f ? out * (1.0f / d) : Vec3{0, 1, 0};
+      out = out + Vec3{next() * 2.0f - 1.0f, next() * 2.0f - 1.0f,
+                       next() * 2.0f - 1.0f} * spread;
+      const float near = 1.0f - 0.5f * std::clamp(d / std::max(shedSpray_.radius, 1.0f),
+                                                   0.0f, 1.0f);
+      sp = shedSpray_.speed * near * (0.6f + 0.8f * next());
+    }
     float len = out.len();
     out = len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0};
     out.y += 0.6f;  // loft, so gobbets arc instead of skidding along the floor
-    const float sp = 3.0f;
     s.vx = (int32_t)std::lround(out.x * sp * 256.0f / 30.0f);
     s.vy = (int32_t)std::lround(out.y * sp * 256.0f / 30.0f);
     s.vz = (int32_t)std::lround(out.z * sp * 256.0f / 30.0f);
@@ -25841,7 +25866,7 @@ void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
                          World& world, std::vector<ParticleSpawn>& spawns,
-                         float power, const DamageCtx& ctx) {
+                         float power, const DamageCtx& ctx, float splatMs) {
   // A blast craters a corpse exactly as it craters the living (it always
   // cratered the dead as debris). Only a released rig has nothing to carve.
   if (!phys_ || rigReleased_ || radiusVoxels <= 0.0f) return;
@@ -25849,20 +25874,43 @@ void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
   // kill the creature, both of which reshape the limb list and its handles
   // mid-walk. Iterating the live structure while it mutates under us is how
   // this kind of loop usually acquires a use-after-free.
+  // Each limb's collider centre and bounding radius (l.size is in COLLIDER
+  // units, so it divides by physScale). The centre, not the lattice corner
+  // `xf.pos`: measured from the corner, a leg standing beside the blast read
+  // as up to its own length further away than it was.
+  struct Reach { uint64_t body; Vec3 centre; float r; Vec3 corner; Quat q; Vec3 half; };
+  auto reachOf = [&](const MobLimb& l, Reach& out) {
+    BodyTransform xf{};
+    if (!l.body || !phys_->GetTransform(l.body, xf)) return false;
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(l));
+    const Vec3 half{(float)l.size.x * 0.5f * inv, (float)l.size.y * 0.5f * inv,
+                    (float)l.size.z * 0.5f * inv};
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+    out = {l.body, xf.pos + Rotate(q, half), half.len(), xf.pos, q, half};
+    return true;
+  };
   std::vector<uint64_t> handles;
-  for (const MobLimb& l : limbs_)
-    if (l.body) {
-      BodyTransform xf{};
-      phys_->GetTransform(l.body, xf);
-      // cheap reject against the limb's bounding sphere. l.size is in
-      // COLLIDER units, so it divides by physScale.
-      const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(l));
-      float r =
-          0.5f * Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z}.len() *
-          inv;
-      if ((xf.pos - centerWorldVoxel).len() <= radiusVoxels + r + 2.0f)
-        handles.push_back(l.body);
-    }
+  for (const MobLimb& l : limbs_) {
+    Reach rc;
+    if (reachOf(l, rc) && (rc.centre - centerWorldVoxel).len() <= radiusVoxels + rc.r + 2.0f)
+      handles.push_back(l.body);
+  }
+  // THE SPRAY (Mob::ShedSpray): a blast throws what it tears off away from
+  // itself, a lethal landing bursts the body outward along the ground. Every
+  // other carve keeps the drip.
+  const auto& gt = CurrentTuning().gore;
+  shedSpray_ = {};
+  if (ctx.cause == DamageCause::Blast) {
+    const float pw = power > 0.0f ? power / std::max(gt.blastPowerRef, 1.0f) : 1.0f;
+    shedSpray_ = {true, centerWorldVoxel,
+                  gt.blastShedSpeed * std::clamp(std::sqrt(pw), 0.5f, 2.0f),
+                  radiusVoxels};
+  } else if (ctx.cause == DamageCause::Fall) {
+    // From under the body, so the burst goes out and up rather than into the
+    // ground, as hard as the landing was (`splatMs`, Mob::ApplyFallDamage).
+    shedSpray_ = {true, centerWorldVoxel - Vec3{0.0f, radiusVoxels * 0.5f, 0.0f},
+                  gt.fallShedPerMs * splatMs, radiusVoxels};
+  }
   // IN LIMB ORDER, and that order is load-bearing for the blast's power
   // model: a worn shell is an APPENDED slot, so every body limb is carved
   // while the shells over it are still whole -- the flesh sees the plate the
@@ -25871,6 +25919,52 @@ void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
   for (uint64_t h : handles)
     CarveLimbRadial(h, centerWorldVoxel, radiusVoxels, true /*ragged*/,
                     true /*eject*/, world, spawns, ctx, power);
+  // ---- THE SHRED: A BLAST REACHES PAST ITS CRATER ---------------------------
+  // (bug report 2026-10-09 14:26: "blows up the entire torso while leaving the
+  // legs fully intact".) The crater sphere is all-or-nothing per limb: a
+  // chest-height blast took the torso to nothing and a leg a hand's breadth
+  // outside the sphere lost not one voxel. Every limb whose surface is within
+  // gore.blastShredReach crater radii is gouged on the face that looks at the
+  // blast — a bite gore.blastShredGouge of the crater radius at the crater's
+  // edge, shrinking to nothing at the reach — through the same ragged,
+  // power-scaled, shell-stopped carve, so armour still answers it. Collected
+  // AFTER the crater: that carve rebuilt colliders under new handles.
+  if (ctx.cause == DamageCause::Blast && gt.blastShredReach > 1.0f &&
+      gt.blastShredGouge > 0.0f && !rigReleased_) {
+    const float reach = radiusVoxels * gt.blastShredReach;
+    struct Gouge { uint64_t body; Vec3 at; float r; float power; };
+    std::vector<Gouge> gouges;
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (limbs_[i].wornHost >= 0) continue;  // the shell is gouged by its host's
+      Reach rc;
+      if (!reachOf(limbs_[i], rc)) continue;
+      // The limb's NEAR SIDE: the blast centre clamped into its collider box.
+      const Vec3 lc = RotateInv(rc.q, centerWorldVoxel - rc.corner);
+      const Vec3 nearLocal{std::clamp(lc.x, 0.0f, rc.half.x * 2.0f),
+                           std::clamp(lc.y, 0.0f, rc.half.y * 2.0f),
+                           std::clamp(lc.z, 0.0f, rc.half.z * 2.0f)};
+      const Vec3 nearWorld = rc.corner + Rotate(rc.q, nearLocal);
+      const float surf = (nearWorld - centerWorldVoxel).len();
+      // The limb the blast went off INSIDE has had its crater; a second bite
+      // would double the one wound the crater already is.
+      if (surf >= reach || surf < 1e-3f) continue;
+      const float t = std::clamp((surf - radiusVoxels) / (reach - radiusVoxels), 0.0f, 1.0f);
+      // Sized by the BLAST, not the limb: a torso is not bitten harder for
+      // being big. Never wider than the limb itself.
+      const float r = std::min(gt.blastShredGouge * radiusVoxels * (1.0f - t), rc.r);
+      if (r < 0.75f) continue;
+      // Centred ON the near face, so the bite is a hemisphere opening outward.
+      const Vec3 at = nearWorld;
+      gouges.push_back({rc.body, at, r, power * (1.0f - 0.5f * t)});
+    }
+    for (const Gouge& g : gouges) {
+      if (rigReleased_) break;
+      shedSpray_.radius = std::max(reach, 1.0f);
+      CarveLimbRadial(g.body, g.at, g.r, true /*ragged*/, true /*eject*/, world,
+                      spawns, ctx, g.power);
+    }
+  }
+  shedSpray_ = {};
 }
 
 void MobSystem::Sever(uint64_t mobId, int limbIndex) {

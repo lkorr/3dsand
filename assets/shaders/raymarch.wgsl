@@ -12859,7 +12859,48 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
 // fullness plane, so the waterline can sit up to one fine voxel off the near
 // field's across the seam — a geometry matter, package A's surface map.
 // Returned UNFOGGED: the caller applies applyAerial like every far hit.
-fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f) -> vec3f {
+// ---- THE BED UNDER FAR WATER (ticket 2026-10-09_14-57-40) ----
+// The near field sees a lake bed through shadeWater's Beer-Lambert column;
+// the far field used to paint every water cell as the bottomless in-scatter
+// colour. So at every handoff a shallow shore went from see-through to opaque
+// on a circle, and a near ray whose bed lay PAST the fine march's end was
+// worse: its column stopped at the sphere, so it read ~no water, saw the far
+// water cell's paint as its "bed" and the shallow-foam rule drew a white rim
+// along the arc. ONE depth model now serves both sides: from a point in or on
+// far water, walk the level's column down to the first non-liquid cell and
+// return the bed's lit colour (rgb) and the ray's path to it (w, fine voxels).
+// The column walk stops at the depth that cannot matter any more — trace()'s
+// own 24 m-of-path cap, projected onto this ray — and reports that cap as the
+// path, which is "deep" to every caller (trans ~ 0).
+const FAR_WATER_PATH_MAX_M : f32 = 24.0;
+fn farWaterBed(level : u32, p : vec3f, rd : vec3f) -> vec4f {
+  let s = f32(1u << farCellShift(level));
+  let box = farBox(level);
+  let ry = max(-rd.y, 0.05);
+  let maxV = FAR_WATER_PATH_MAX_M / VOXEL_METERS;
+  let nMax = min(i32(ceil(maxV * ry / s)) + 1, 64);
+  var c = vec3<i32>(floor(p / s));
+  for (var i = 0; i < nMax; i++) {
+    c.y -= 1;
+    if (!farInValid(c, box)) { break; }
+    let mat = farMatAt(level, c);
+    if (mat == 0u) { break; }   // air under water: no bed to show
+    let bm = materials[mat];
+    if (bm.klass != CLASS_LIQUID) {
+      let depthV = max(p.y - f32(c.y + 1) * s, 0.0);
+      let up = vec3f(0.0, 1.0, 0.0);
+      let lit = paletteMean(bm) *
+                (ambientOpen(ambientAt(up), opennessScale(1.0), 1.0) +
+                 keyLightColor() * wrapDiffuse(dot(up, keyLightDir()), TUNE_DIFFUSE_WRAP));
+      return vec4f(lit, min(depthV / ry, maxV));
+    }
+  }
+  return vec4f(0.0, 0.0, 0.0, maxV);
+}
+
+// `bed` = farWaterBed's answer (rgb lit bed, w = path in fine voxels).
+fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f,
+                 bed : vec4f) -> vec3f {
   let up = nFace.y > 0.5;
   var n = nFace;
   if (up) {
@@ -12873,7 +12914,9 @@ fn shadeFarWater(hitP : vec3f, rd : vec3f, m : Material, nFace : vec3f) -> vec3f
   var fres = (WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cosI, TUNE_WATER_FRESNEL_POWER)) *
              optics.fresnel;
   if (!up) { fres *= 0.5; }   // shadeWater's side-wall rule
-  let refracted = optics.scatter;
+  // shadeWater's column law on the bed under it (farWaterBed).
+  let trans = exp(-optics.absorbK * (bed.w * VOXEL_METERS));
+  let refracted = bed.rgb * trans + optics.scatter * (vec3f(1.0) - trans);
   var color = mix(refracted, reflectionSky(reflect(rd, n)), fres);
   if (up) {
     // shadeWater's glint at its far lobe (distM >= 40 m is past the seam's
@@ -13694,7 +13737,8 @@ fn shadeHorizon(hz : HzHit, rd : vec3f) -> vec3f {
     if (TUNE_GI_STRENGTH > 0.0) { color += farGiBounce(albedo, n); }
   }
   if (wc > 0.0) {
-    color = mix(color, shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0)), wc);
+    color = mix(color, shadeFarWater(hitP, rd, materials[horizon[HZ_H_MAT_WATER]], vec3f(0.0, 1.0, 0.0),
+                                         vec4f(0.0, 0.0, 0.0, FAR_WATER_PATH_MAX_M / VOXEL_METERS)), wc);
   }
   return applyAerial(color, rd, hz.t);
 }
@@ -13950,6 +13994,26 @@ fn fs(in : VSOut) -> FSOut {
   }
 
   var color : vec3f;
+  // The water a near liquid column did not get to measure (farWaterBed): fine
+  // voxels added to h.liqPath wherever a shade reads the column.
+  // nearCut = the fine march ENDED inside the water it entered at liqT (the
+  // handoff cut the column off). The probe point is half a voxel short of the
+  // end but never in front of the interface: a ray that entered the water
+  // within half a voxel of the sphere is still a cut column, and missing it
+  // drew a one-pixel foam line along the sphere.
+  var liqExtra = 0.0;
+  var nearCut = false;
+  if (!h.hit && !h.saturated && h.liqT > 0.0) {
+    let te = max(h.tExit - 0.5, min(h.liqT + 0.05, h.tExit));
+    let ce = vec3<i32>(floor(R.camPos + rd * te));
+    nearCut = inBounds(ce) && materials[voxMat(voxWordAt(ce))].klass == CLASS_LIQUID;
+    if (nearCut) {
+      // Water to whatever the cascade met (its bed, or more water — below);
+      // nothing met at all is a column too deep to see through.
+      liqExtra = select(FAR_WATER_PATH_MAX_M / VOXEL_METERS,
+                        max(far.t - h.tExit, 0.0), far.hit);
+    }
+  }
   if (!h.hit) {
     if (far.hit) {
       // far-field shading (phase 4): same palette, face term, sun tint, and
@@ -14264,7 +14328,28 @@ fn fs(in : VSOut) -> FSOut {
                   lambert * wet * TUNE_STAIN_SHEEN);
       }
       if (farWater) {
-        color = shadeFarWater(hitP, rd, m, n);
+        // ---- A FAR WATER SIDE FACE UNDER AIR IS A SEAM, NOT A WALL ----
+        // (ticket 2026-10-09_14-57-40 + 15-00-36.) Each level stores the
+        // lake at ITS cell size, so the water top steps by up to a cell at
+        // every handoff sphere — the window's (level 1) and each level's
+        // own (traceFar's tLvlOut). Where the coarser level's top is the
+        // higher one, rays crossing the sphere land on that level's water
+        // SIDE face, and shadeFarWater's side-wall rule (no waves, half
+        // Fresnel) drew it as a thin dark circle on open water, one per
+        // level. A liquid column's top cell seen from the side with air
+        // over it is that step — real far water walls (a waterfall, a
+        // terraced spill) have liquid above — so it shades as the surface.
+        // Every level, every handoff, one rule.
+        var nW = n;
+        if (abs(n.y) < 0.5 && !fFeat) {
+          let upC = far.cell + vec3<i32>(0, 1, 0);
+          var above = 0u;
+          if (farInValid(upC, farBox(flv))) { above = farMatAt(flv, upC); }
+          if (above == 0u || materials[above].klass != CLASS_LIQUID) {
+            nW = vec3f(0.0, 1.0, 0.0);
+          }
+        }
+        color = shadeFarWater(hitP, rd, m, nW, farWaterBed(flv, hitP + rd * 0.01, rd));
       }
       // ---- the frozen fire's breath (farEmberPlasma) ----
       // A cascade ember is a fire the window left behind: nothing about it
@@ -14280,6 +14365,17 @@ fn fs(in : VSOut) -> FSOut {
                   clamp(tFace / FAR_EMBER_FADE_VOX, 0.0, 1.0);
         emis *= farEmberPlasma(hitP, amp);
         color += albedo * emis * TUNE_EMISSIVE_STRENGTH;
+      }
+      // ---- A NEAR WATER COLUMN CUT OFF BY THE HANDOFF (farWaterBed) ----
+      // The fine march ended inside the water it entered at liqT, and the
+      // cascade's first hit is that same water. What lies behind the surface
+      // is the BED under it, at the far level's depth, not this cell's paint;
+      // and the column the near shade attenuates by goes on to that bed.
+      if (nearCut && m.klass == CLASS_LIQUID && !isViscousLiquid(m) &&
+          (m.flags & MATF_OPAQUE) == 0u) {
+        let bed = farWaterBed(flv, hitP + rd * 0.01, rd);
+        color = bed.rgb;
+        liqExtra += bed.w;
       }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
@@ -14919,7 +15015,7 @@ fn fs(in : VSOut) -> FSOut {
       if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit && !hz.hit;
         rsAdd(RS_PX_SUB, 1u);
-        color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
+        color = shadeSubmerged(R.camPos, rd, lm, h.liqPath + liqExtra, color, in.pos.xy,
                                sawSky);
         // A charged liquid round a submerged eye (wave 2 package D): the
         // surface glow below needs a surface; from inside, the water glows.
@@ -14928,7 +15024,7 @@ fn fs(in : VSOut) -> FSOut {
         veilT = 0.0;
       } else if (isViscousLiquid(materials[lm])) {
         color = shadeViscous(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
-                             h.liqPath, max(h.mediaSurf, 0.125), color,
+                             h.liqPath + liqExtra, max(h.mediaSurf, 0.125), color,
                              h.liqT, underwater);
         // Dissolved matter in a viscous solvent (fairy dust or salt in
         // blood). Blood is near-opaque, so there is no body to re-derive:
@@ -14946,7 +15042,7 @@ fn fs(in : VSOut) -> FSOut {
       } else if (!mpmOwned) {
         rsAdd(RS_PX_WATER, 1u);
         color = shadeWater(hitP, rd, lm, liqCell, faceAxis(h.liqFace), faceSgn(h.liqFace),
-                           h.liqPath, max(h.mediaSurf, 0.125), color,
+                           h.liqPath + liqExtra, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
