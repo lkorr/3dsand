@@ -227,7 +227,8 @@ export const RANGE_DEFAULTS = {profile: 'alpine', seed: 1, peaks: 0.6, spurs: 0.
 export function rangeReach(r) {
   const W = Math.max(0, ...(r.points || []).map(p => +p[3] || 0));
   const f = r.foothills == null ? RANGE_DEFAULTS.foothills : +r.foothills;
-  return W * (1.15 + 1.4 * f) + W * 0.3;
+  // + the most the warp can move a column's (along, across) coordinates (~0.5 W)
+  return W * (1.15 + 1.4 * f) + W * 0.6;
 }
 /** The world bbox [x0, z0, x1, z1] a range can touch. */
 export function rangeBox(r) {
@@ -254,7 +255,7 @@ export function erodeRange(gh, rel, w, hh, x0, z0, cell, W0, seed, er, opts = {}
   const T = opts.tune || {}, N = w * hh;
   const fixed = new Uint8Array(N);
   let maxRel = 0;
-  for (let n = 0; n < N; n++) { if (rel[n] <= 0.25) fixed[n] = 1; if (rel[n] > maxRel) maxRel = rel[n]; }
+  for (let n = 0; n < N; n++) { if (rel[n] <= 0.25 || (opts.outlets && opts.outlets[n])) fixed[n] = 1; if (rel[n] > maxRel) maxRel = rel[n]; }
   const steps = opts.iters || T.steps || Math.round(50 + 110 * er);
   const U = new Float32Array(N), K = new Float32Array(N);
   let z = new Float32Array(N);
@@ -268,8 +269,14 @@ export function erodeRange(gh, rel, w, hh, x0, z0, cell, W0, seed, er, opts = {}
       K[n] = 1 - kv + 2 * kv * smoothstep(-0.5, 0.5, hk);
       // start low and rough: the noise is what the first drainage net follows
       // (world-space noise at fixed wavelengths: the same on the coarse and the fine grid)
-      z[n] = gh[n] + rel[n] * 0.03 + maxRel * 0.004 * (1 + fbm(x / 1536, zz / 1536, seed + 43, 3))
+      // (the small-scale noise fades out with the relief: where the range ends,
+      // nothing of it may be left for the gain below to blow up)
+      z[n] = gh[n] + rel[n] * 0.03 + maxRel * 0.004 * (1 + fbm(x / 1536, zz / 1536, seed + 43, 3)) * Math.min(1, rel[n] / (0.05 * maxRel))
            + rel[n] * nb * fbm(x / (W0 * 0.45), zz / (W0 * 0.45), seed + 47, 3);
+      // THE WINDOW'S EDGE is a base level (an outlet) the solver never moves: hold
+      // it at the designed envelope, not the bare ground, or a range the window
+      // cuts would be eroded down to the ground along the cut (a cliff there)
+      if (!fixed[n] && (i === 0 || j === 0 || i === w - 1 || j === hh - 1)) z[n] = gh[n] + rel[n];
     }
   // K: at steady state (U = K sqrt(A) S) a trunk valley draining a quarter of
   // a flank holds `vs` of the envelope's mean flank slope; with A in cells this
@@ -281,8 +288,14 @@ export function erodeRange(gh, rel, w, hh, x0, z0, cell, W0, seed, er, opts = {}
   if (multi) {
     // the coarse run (all the steps), its eroded relief brought up as the start
     const cg = HY.downsample(gh, w, hh, 2), cr = HY.downsample(rel, w, hh, 2);
+    let co = null;
+    if (opts.outlets) {
+      const cw2 = Math.ceil(w / 2), ch2 = Math.ceil(hh / 2);
+      co = new Uint8Array(cw2 * ch2);
+      for (let j = 0; j < hh; j++) for (let i = 0; i < w; i++) if (opts.outlets[j * w + i]) co[(j >> 1) * cw2 + (i >> 1)] = 1;
+    }
     const cz = erodeRange(cg.h, cr.h, cg.w, cg.hh, x0 + cell / 2, z0 + cell / 2, cell * 2, W0, seed, er,
-                          {...opts, multires: false, raw: true, progress: opts.progress ? (p => opts.progress(p * 0.6)) : null});
+                          {...opts, outlets: co, multires: false, raw: true, progress: opts.progress ? (p => opts.progress(p * 0.6)) : null});
     const d = new Float32Array(cz.length);
     for (let n = 0; n < d.length; n++) d[n] = cz[n] - cg.h[n];
     const up = HY.upsample(d, cg.w, cg.hh, 2, w, hh);
@@ -301,8 +314,8 @@ export function erodeRange(gh, rel, w, hh, x0, z0, cell, W0, seed, er, opts = {}
   const gE = blur(maxFilter(rel, w, hh, R), w, hh, R, 2), gR = blur(maxFilter(re, w, hh, R), w, hh, R, 2);
   for (let n = 0; n < N; n++) {
     if (fixed[n]) { z[n] = gh[n]; continue; }
-    const g = gR[n] > 1 ? clamp(gE[n] / gR[n], 0.2, 8) : 1;
-    z[n] = gh[n] + re[n] * g;
+    const g = gR[n] > 1 ? clamp(gE[n] / gR[n], 0.25, 4) : 1;
+    z[n] = gh[n] + Math.min(re[n] * g, rel[n] * 1.6 + 0.02 * gE[n]);
   }
   HY.thermal(z, w, hh, cell, T.talus || 40, 4, {fixed});
   return z;
@@ -330,6 +343,21 @@ export function rangeField(r, G, opts = {}) {
   const reach = rangeReach(o);
   const C = curveCoords(G, T.pts, reach, 2);
   const L = C.length || T.length;
+  // The knots' crest and width are taken at each column's NEAREST point of the
+  // crest; where two stretches of a bent range are equally near (the medial
+  // axis) that jumps. Smooth both fields (normalized convolution over the
+  // columns in reach) so no seam runs out from the inside of a bend.
+  {
+    const N0 = G.w * G.hh, wt = new Float32Array(N0), r = Math.max(1, Math.round(W0 * 0.3 / G.cell));
+    for (let n = 0; n < N0; n++) wt[n] = isFinite(C.d[n]) ? 1 : 0;
+    const bw = blur(wt, G.w, G.hh, r, 2);
+    for (let a = 0; a < 2; a++) {
+      const v = new Float32Array(N0);
+      for (let n = 0; n < N0; n++) v[n] = wt[n] ? C.attrs[a][n] : 0;
+      const bv = blur(v, G.w, G.hh, r, 2);
+      for (let n = 0; n < N0; n++) if (wt[n] && bw[n] > 1e-6) C.attrs[a][n] = bv[n] / bw[n];
+    }
+  }
   // the ground under the range, smoothed: the datum the relief stands on
   // (a range on a bumpy plain must not copy every bump up to its crest)
   const gb = blur(G.h, G.w, G.hh, Math.max(1, Math.round(W0 * 0.35 / G.cell)), 2);
@@ -389,6 +417,8 @@ export function rangeField(r, G, opts = {}) {
           v = Math.max(v, fh) + 0.25 * Math.min(v, fh);
         }
       }
+      // fade out before the reach: nothing the warp pulled in may end on a cliff
+      v *= 1 - smoothstep(reach * 0.82, reach * 0.98, Math.abs(d0));
       if (v > 0.25) { rel[n] = v; anyCell = true; }
     }
   if (!anyCell) return out;
@@ -398,9 +428,23 @@ export function rangeField(r, G, opts = {}) {
   let result = env;
   const er = opts.noErode ? 0 : clamp(+o.erode, 0, 1);
   if (er > 0) {
-    const z = erodeRange(G.h, rel, G.w, G.hh, G.x0, G.z0, G.cell, W0, seed, er, opts);
+    // in RELIEF space (a flat zero base): the range's own drainage, so the bumps of
+    // the ground under it are neither eroded away nor routed through
+    // (the sea is base level there too: a column whose envelope is under it is an outlet)
+    const under = new Uint8Array(N);
+    if (opts.seaY != null) for (let n = 0; n < N; n++) if (env[n] < opts.seaY) under[n] = 1;
+    const z = erodeRange(new Float32Array(N), rel, G.w, G.hh, G.x0, G.z0, G.cell, W0, seed, er, {...opts, seaY: null, outlets: under});
     result = new Float32Array(N);
-    for (let n = 0; n < N; n++) result[n] = lerp(env[n], z[n], Math.min(1, er * 1.4));
+    for (let n = 0; n < N; n++) result[n] = lerp(env[n], G.h[n] + z[n], Math.min(1, er * 1.4));
+    // the range's drainage was solved on its own relief; laid on the bumps of the
+    // ground it can leave hollows where a valley crosses one. Fill those up to
+    // ~40 m deep (an alluvial valley floor, epsilon-sloped so it drains); deeper
+    // basins stay (they are lakes)
+    const out2 = new Uint8Array(N);
+    for (let n = 0; n < N; n++) if (rel[n] <= 0.25 || under[n]) out2[n] = 1;
+    const F = HY.priorityFlood(result, G.w, G.hh, {outlets: out2, epsilon: 0.01});
+    const cap = 40 * 10;
+    for (let n = 0; n < N; n++) if (!out2[n] && F[n] > result[n] && F[n] - result[n] < cap) result[n] = F[n];
   }
   for (let n = 0; n < N; n++) {
     const v = Math.max(G.h[n], result[n]);
@@ -440,7 +484,10 @@ export function reliefDetail(x, z, relief, seed, amount = 1) {
  *  own detail under it is kept. Returns {h (the new posts), changed: Uint8Array,
  *  factor, proxy: {w, hh, cell}}. */
 export function rangeBake(r, G, opts = {}) {
-  const f = opts.factor || proxyFactor(G.w, G.hh, G.cell, opts.minCell || 256, opts.maxCells || 450000);
+  // the proxy: 25.6 m, finer for a narrow range (two dozen cells across a flank at least)
+  const W0 = Math.max(...(r.points || []).map(p => +p[3] || 0), G.cell);
+  const minCell = opts.minCell || Math.max(G.cell, Math.min(256, 1 << Math.floor(Math.log2(Math.max(1, W0 / 24)))));
+  const f = opts.factor || proxyFactor(G.w, G.hh, G.cell, minCell, opts.maxCells || 450000);
   const P = proxyGrid(G, f);
   const R = rangeField(r, P, opts);
   const N = G.w * G.hh, out = new Float32Array(N), changed = new Uint8Array(N);
