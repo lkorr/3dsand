@@ -302,12 +302,21 @@ class DebrisSystem {
     }
   }
   // ...and every body that WEARS A COAT through MobSystem's coat passes: dead
-  // flesh and dropped items (Body::item). A dropped coated sword keeps drawing
-  // its coat, dries on the ground, and picks a coat up from what it lies in.
+  // flesh, dropped items (Body::item), and every other piece that came off a
+  // creature -- its BLOODLESS limbs (MobLimbDef::bloodless: hair, a mane),
+  // which are `dead` with no bleedMat and so not IsFlesh. A dropped coated
+  // sword keeps drawing its coat, dries on the ground, and picks a coat up
+  // from what it lies in; so does a severed head's hair. Before 2026-10-09 the
+  // hair was skipped, and a coat on it was PERMANENT: never rinsed by water,
+  // never dried, never rained off (owner ticket 2026-10-08_23-13-24, a
+  // lava-dipped head that stayed lava-orange at the bottom of a basin).
+  // Followers (a strapped garment) stay out: the piece they are worn on owns
+  // the contact, and their coat is the garment's business.
   template <class Fn>
   void ForEachCoatBody(Fn&& fn) {
     for (Body& b : bodies_) {
-      if (!(IsFlesh(b) || b.item) || !OwnedLocally(b) || b.voxels.empty())
+      if (!(IsFlesh(b) || b.item || (b.dead && !b.Follower())) ||
+          !OwnedLocally(b) || b.voxels.empty())
         continue;
       FleshLattice f = FleshOf(b);
       fn(f);

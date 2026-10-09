@@ -17626,6 +17626,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // also what makes the emission RATE right: what a burning surface puts into
   // the world is one fire voxel per adjacent air CELL, not one per sub-voxel.
   std::vector<uint32_t> emitted;
+  // World cells a coat's grid partner was rolled to boil this visit (clause
+  // 2d, boilPartner below): one verdict per cell, however many sub-voxels.
+  std::vector<uint32_t> boiled;
   auto emitCell = [&](IVec3 c, uint32_t mat, uint32_t state) {
     if (opsBudget == 0 || cellOps.size() >= kMaxCellOpsPerTick) {
       bstat.emitRefused++;
@@ -18887,6 +18890,89 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                    ? PowderCrumbleState(rr >> 4u)
                    : (rr >> 8u) % 3u);
     };
+    // ---- CLAUSE 2d: A GRID PARTNER ANSWERS THE COAT (2026-10-09) ----------
+    //
+    // On the grid a lava cell beside water is TWO reactants: lava's rule
+    // (`lava + water -> stone`) crusts the lava, and WATER's own rule
+    // (`water + tag:hot -> steam`) boils the water. On a body the first half
+    // always ran -- the coat's rule fires against the water face and spends a
+    // level -- but the water is a grid cell, read-only to a body (2a), so the
+    // second half never did: a lava-dipped head went into a basin and the
+    // coat cooled off it in silence (owner ticket 2026-10-08_23-13-24, "it
+    // should produce smoke as it does so").
+    //
+    // So when a coat rule FIRES against a grid face partner, the partner's own
+    // first pair rule that the COAT arms and that turns the partner into a GAS
+    // is rolled for that world cell -- ONE roll per world cell per tick, keyed
+    // on the cell, so a face of 64 skin voxels boils its water cell at the
+    // rule's own per-tick chance exactly as one grid cell of lava would. On a
+    // hit the water LEAVES as its gas: the gas is released at the first open
+    // (air) cell straight up the column through liquid and gas -- a bubble
+    // reaching the surface -- and the water cell is cleared ONLY IF IT STILL
+    // HOLDS THAT MATERIAL (CellOpClearIfMat, the vessels' conditional scoop).
+    // Matter is conserved: a cell of water becomes a cell of steam. Nothing
+    // is named: the coat, the partner and the gas are whatever the rules say.
+    //
+    // Bounded (CLAUDE.md rule 2): it needs a coat FIRING, which spends a coat
+    // level, so it ends when the coat does; at most one boil per world cell
+    // per visit (deduped below); every write charges the ops budget; and a
+    // column with no air within kBoilRise cells (deep water) boils nothing --
+    // the bubble condenses. Two ops a boil, both conditional on the grid, so a
+    // stale mirror costs accuracy, never matter that was not there.
+    constexpr int kBoilRise = 16;
+    auto boilPartner = [&](int k, uint32_t coatMat) {
+      const uint32_t pm = nworld[k];
+      if (pm == 0 || pm >= matGpu_.size()) return;
+      const MaterialGpu& pg = matGpu_[pm];
+      const ReactionGpu* pr = nullptr;
+      uint32_t gas = 0;
+      for (uint32_t ri = 0; ri < pg.reactCount && !pr; ri++) {
+        const ReactionGpu& r2 = reactions_[pg.reactOffset + ri];
+        if ((r2.packed & 3u) != kReactPair || r2.prodSelf == kProdKeep) continue;
+        const uint32_t gm = r2.prodSelf & 0xFFFu;
+        if (gm == 0 || gm >= matGpu_.size() || matGpu_[gm].klass != CLASS_GAS)
+          continue;
+        if (!ReactNbrMatches(r2, coatMat, matGpu_)) continue;
+        if (!ReactLightMatches(r2, dayPhase_, /*seesSky=*/true, weatherRain_, rainExp))
+          continue;
+        pr = &r2;
+        gas = gm;
+      }
+      if (!pr) return;
+      const Vec3 wv = worldOf(vp) + faceStepW[k];
+      const IVec3 x{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
+      if (!world.CellInWindow(x)) return;
+      const uint32_t xi = World::SlotCellIndex(x);
+      for (uint32_t b : boiled)
+        if (b == xi) return;
+      boiled.push_back(xi);
+      if (Hash3(xi ^ 0xB011EDu, tick, 0x57EA3u) % kReactChanceDen >=
+          RainScaledChance(pr->cond, pr->chance, weatherRain_, rainExp))
+        return;
+      IVec3 y = x;
+      bool open = false;
+      for (int s = 1; s <= kBoilRise && !open; s++) {
+        y.y = x.y + s;
+        if (!world.CellInWindow(y)) return;
+        const uint32_t ym = worldMatAt(y);
+        if (ym == 0) {
+          open = true;
+        } else if (ym >= matGpu_.size() || (matGpu_[ym].klass != CLASS_LIQUID &&
+                                            matGpu_[ym].klass != CLASS_GAS)) {
+          return;  // a lid: the bubble is trapped and condenses
+        }
+      }
+      if (!open || opsBudget < 2 || cellOps.size() + 2 > kMaxCellOpsPerTick) {
+        if (open) bstat.emitRefused++;
+        return;
+      }
+      const size_t before = cellOps.size();
+      emitCell(y, gas, Hash3(xi, tick, 0x57EA4u) % 3u);
+      if (cellOps.size() == before) return;  // that surface cell is taken
+      cellOps.push_back({xi, CellOpClearIfMat(pm)});
+      opsBudget--;
+      bstat.coatBoiled++;
+    };
     // A HELD coat (the substrate absorbs: materials.json `absorb`) is liquid
     // in the voxel and leaves with any rewrite of it, as on the ground; a FILM
     // (every body material authored today) stays on a voxel rewritten in
@@ -18978,6 +19064,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // ---- FIRED ----
         bstat.coatFired++;
         if (rf >= 0) release(rf, r.prodSelf, rr);
+        // Clause 2d: a genuine GRID partner (not a sibling, not a worn shell
+        // standing in for the cell) answers with its own rule.
+        if (pk >= 0 && ncell[pk] == kNoBurnCell && !ncross[pk] &&
+            nmat[pk] == nworld[pk])
+          boilPartner(pk, coat);
         if (rewrites && pk == -1) {
           applyCause = "coat rule on its wearer";
           applyTo(cell, r.prodNbr, rr);
@@ -19659,6 +19750,7 @@ void AddBurnStats(MobSystem::BurnStats& a, const MobSystem::BurnStats& b) {
   a.coatCovered += b.coatCovered;
   a.coatPartner += b.coatPartner;
   a.coatCaught += b.coatCaught;
+  a.coatBoiled += b.coatBoiled;
   a.frontSkipped += b.frontSkipped;
   a.emitRefused += b.emitRefused;
 }
