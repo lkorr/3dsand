@@ -588,7 +588,62 @@ Status GatePlayerLedgeGrab(Ctx&, std::string& detail) {
   }
   bool eOk = eLatched && eClimbStarted && eBackToHang && eJumped;
 
-  bool ok = aOk && bOk && cOk && dOk && eOk;
+  // (f) A SHIMMY ON A WALL GRABBED AT AN ANGLE travels both ways without
+  // snapping back (2026-10-08). The grab used to keep the CAMERA facing as the
+  // wall direction, so the slide ran diagonally: one way peeled the body off
+  // the face until only a side probe column held the lip, the anchor took that
+  // column's offset, and the settle dragged the body back a voxel -- forever,
+  // in that direction only. Looking 30 degrees off the wall's normal, each
+  // direction must cover real ground with no frame moving against the input.
+  bool fLatched = false, fSquared = false;
+  float fTravel[2] = {0, 0}, fWorstBack[2] = {0, 0};
+  {
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{132.0f, 100.0f + Player::kHalfY, 200.5f};
+    Player::KindFn kf = plateauKind;
+    const Vec3 look = Vec3{0.866f, 0.0f, 0.5f};
+    const Vec3 lookR{-look.z, 0.0f, look.x};
+    TickInput in;
+    in.SetHeld(TB_SPRINT, true);
+    in.forward = 1.0f;
+    int guard = 0;
+    while (!(p.grounded && p.pos.x > 135.0f) && ++guard < 400)
+      p.Update(dt, in, look, lookR, look, kf);
+    in.SetPressed(TB_JUMP, true);
+    in.SetHeld(TB_JUMP, true);
+    p.Update(dt, in, look, lookR, look, kf);
+    in.SetPressed(TB_JUMP, false);
+    guard = 0;
+    while (!p.hanging && ++guard < 400) p.Update(dt, in, look, lookR, look, kf);
+    fLatched = p.hanging;
+    fSquared = std::abs(p.hangDir.x - 1.0f) < 1e-3f && std::abs(p.hangDir.z) < 1e-3f;
+    TickInput hold;
+    hold.SetHeld(TB_JUMP, true);
+    for (int i = 0; i < 20; i++) p.Update(dt, hold, look, lookR, look, kf);
+    for (int dirI = 0; dirI < 2 && p.hanging; dirI++) {
+      const float sgn = dirI == 0 ? 1.0f : -1.0f;
+      TickInput sh = hold;
+      sh.strafe = sgn;
+      const float z0 = p.pos.z;
+      for (int i = 0; i < 90 && p.hanging; i++) {
+        const float zb = p.pos.z;
+        p.Update(dt, sh, look, lookR, look, kf);
+        fWorstBack[dirI] = std::max(fWorstBack[dirI], -(p.pos.z - zb) * sgn);
+      }
+      fTravel[dirI] = (p.pos.z - z0) * sgn;
+    }
+  }
+  const bool fOk = fLatched && fSquared && fTravel[0] > 2.0f &&
+                   fTravel[1] > 2.0f && fWorstBack[0] < 0.05f &&
+                   fWorstBack[1] < 0.05f;
+  std::printf("player ledgegrab (f) angled shimmy: latch=%d squared=%d "
+              "travel %.2f / %.2f (want >2), worst back-step %.3f / %.3f "
+              "(want <0.05)\n",
+              fLatched ? 1 : 0, fSquared ? 1 : 0, fTravel[0], fTravel[1],
+              fWorstBack[0], fWorstBack[1]);
+
+  bool ok = aOk && bOk && cOk && dOk && eOk && fOk;
   char buf[320];
   std::snprintf(buf, sizeof(buf),
                 "plateau: hung=%d dropped=%d feet=%.1f x=%.1f (want 115, "

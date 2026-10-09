@@ -3113,6 +3113,18 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                       (player.crouching ? CurrentTuning().player.crouchSpeedScale
                                         : 1.0f)
                 : 1.0f);
+        // A HANG FACES THE WALL. The palms are placed in the wall's frame
+        // (Player::hangDir, squared to the face at the grab), so a body still
+        // turned to the camera reached for the lip across its own chest, and
+        // the shimmy's sway and roll (pose.cpp UpdateShimmy, in the rig's
+        // frame) swung it toward and away from the wall instead of along it.
+        // Eased, so the grab turns the body rather than snapping it.
+        if (player.hanging || (player.mantleFromHang && player.mantleTimer > 0.0f)) {
+          const float want = std::atan2(player.hangDir.x, player.hangDir.z);
+          float d = want - avatarHeading;
+          d -= 6.2831853f * std::floor((d + 3.14159265f) / 6.2831853f);
+          avatarHeading += d * (1.0f - std::pow(0.5f, kTickDt / 0.08f));
+        }
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:

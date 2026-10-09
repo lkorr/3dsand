@@ -115,6 +115,15 @@ struct PoseInputs {
   bool strikeAim = true;
   // MobDef::chaseClip wanted on (the brain has a target and is engaged).
   bool chaseWant = false;
+  // THE PIPELINE PICKS THE STRIDE CLIPS (`walk` / `run`) off the measured
+  // speed. The NPC driver sets it; the avatar picks its own (avatar.cpp: its
+  // family also holds idle, fall and hang). Until 2026-10-08 nothing played
+  // them on an NPC at all, so every creature walked and ran with its arms
+  // hanging dead still.
+  bool gaitClips = false;
+  // The NPC is holding a GUARD while it moves: the guard's IK hand target
+  // pumps with the stride (PoseDrive::guardBob) instead of riding rigid.
+  bool guardPump = false;
   // ---- DRIVER EXTRAS ------------------------------------------------------
   // The held crouch (Ctrl): eased toward player.crouchKneeDrop.
   bool crouch = false;
@@ -188,4 +197,39 @@ struct PoseDrive {
   // Has the drawn height ever been set by the pipeline? The feet-derived
   // height snaps to its target the first time and eases ever after.
   bool bodyPlaced = false;
+  // ---- the stride clips (PoseInputs::gaitClips) --------------------------
+  // Walk/run hysteresis, and the clip indices resolved against the skeleton's
+  // clip table they were looked up in (re-resolved when that table moves).
+  bool gaitRunning = false;
+  int walkClip = -1, runClip = -1;
+  const void* gaitClipsKey = nullptr;
+  size_t gaitClipsCount = 0;
+  // ---- the guard arm's stride pump (PoseInputs::guardPump) ---------------
+  // 0..1 eased weight, and the rig-frame hand offset ApplyWeaponArm adds to
+  // the guard's IK target this tick.
+  float guardPumpW = 0.0f;
+  Vec3 guardBob{};
+  // ---- the ledge shimmy (Mob::UpdateShimmy) ------------------------------
+  // Hand over hand along the lip. Each arm (by arm ordinal) holds a GRIP: a
+  // coordinate along the wall (world voxels on the tangent `leftW`), fixed in
+  // the world while the body slides under it. One hand moves at a time:
+  // `shimmyHand` is the arm in flight (-1 none), from `shimmyFrom` to
+  // `shimmyTo` over `shimmyT` 0..1. `shimmyS` is the body's own coordinate
+  // last tick and `shimmyVel` its eased rate. Re-seeded when the hang (re)starts
+  // or its lip/wall changes (`shimmyLipY`, `shimmyDir`).
+  static constexpr int kShimmyArms = 4;
+  bool shimmyInit = false;
+  float shimmyS = 0.0f, shimmyVel = 0.0f;
+  int shimmyLipY = 0;
+  Vec3 shimmyDir{};
+  float gripS[kShimmyArms] = {};
+  float gripLat[kShimmyArms] = {};   // each arm's own shoulder spread
+  int shimmyArms = 0;
+  int shimmyHand = -1;
+  float shimmyFrom = 0.0f, shimmyTo = 0.0f, shimmyT = 0.0f, shimmySign = 0.0f;
+  // The body's lurch, posed pre-flatten (Mob::ApplyShimmyBody): radians of
+  // roll, the model-frame offset of the pelvis, and the legs' lagging swing.
+  float shimmyRoll = 0.0f;
+  Vec3 shimmyBodyOff{};
+  float shimmyLegRoll = 0.0f, shimmyLegVel = 0.0f;
 };

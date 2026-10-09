@@ -502,6 +502,22 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir, const Player::Box& b,
   return true;
 }
 
+// THE WALL'S OWN NORMAL, not the camera's facing, for a hang. The grab is
+// probed along wherever the player was looking, and a shimmy run along the
+// perpendicular of an angled look peels off the wall one way (see the shimmy
+// block). Voxel faces are axis-aligned, so the facing's dominant axis is the
+// first candidate and the other axis (same sign) the second; whichever still
+// finds a lip wins, and a corner that answers to neither keeps the look.
+Vec3 SquareToWall(const Vec3& pos, const Vec3& dir, const Player::Box& b,
+                  const Player::KindFn& kindAt) {
+  const Vec3 ax{dir.x >= 0.0f ? 1.0f : -1.0f, 0.0f, 0.0f};
+  const Vec3 az{0.0f, 0.0f, dir.z >= 0.0f ? 1.0f : -1.0f};
+  const bool xFirst = std::abs(dir.x) >= std::abs(dir.z);
+  for (const Vec3& c : {xFirst ? ax : az, xFirst ? az : ax})
+    if (LedgeGrabAhead(pos, c, b, kindAt, nullptr)) return c;
+  return dir;
+}
+
 // Try to advance horizontally by (dx, dz) using the classic Quake/Source
 // three-attempt step move, and take whichever attempt travelled farther
 // horizontally. Returns the height climbed IN VOXELS (0 if the flat move won).
@@ -984,6 +1000,21 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       // not the camera — looking around must not steer the hands), and if no
       // lip answers there the move is undone. Running off the end of a ledge
       // therefore stops the hands at its last cell instead of dropping.
+      //
+      // THE "SLIDE, JUMP BACK A VOXEL, REPEAT" BUG (2026-10-08) had two
+      // halves. hangDir used to be the CAMERA facing at the grab, so on a
+      // wall grabbed at an angle the slide ran diagonally: one way it pressed
+      // into the face (the sweep turned that into a slide, fine), the other
+      // way it peeled the body off the wall until the centre probe column
+      // lost the lip. Then a SIDE column still caught it, the anchor took that
+      // column's lateral offset (LedgeHit::anchor is shifted to the winning
+      // hand), and the settle below yanked the body back toward it -- one
+      // direction only, over and over. The grab now squares hangDir to the
+      // wall (SquareToWall), and the shimmy keeps the anchor on the body's own
+      // column: a hand that answered off to the side is the hand's business,
+      // not a reason to drag the body back along the ledge. A wall that steps
+      // in or out under the hands is followed by pressing back onto it before
+      // the slide is given up on.
       if (std::abs(in.strafe) > 0.3f && T().ledgeShimmySpeed > 0.0f) {
         const Vec3 rightW{-hangDir.z, 0.0f, hangDir.x};
         const float step =
@@ -992,11 +1023,21 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         SweepAxis(pos, rightW.x * step, 0, b, kindAt);
         SweepAxis(pos, rightW.z * step, 2, b, kindAt);
         LedgeHit hit;
-        if (LedgeGrabAhead(pos, hangDir, b, kindAt, &hit)) {
+        bool held = LedgeGrabAhead(pos, hangDir, b, kindAt, &hit);
+        if (!held) {
+          // The face receded under the hands (a stepped or angled wall):
+          // press back onto it, at most a voxel, and ask again.
+          const Vec3 slid = pos;
+          SweepAxis(pos, hangDir.x, 0, b, kindAt);
+          SweepAxis(pos, hangDir.z, 2, b, kindAt);
+          held = LedgeGrabAhead(pos, hangDir, b, kindAt, &hit);
+          if (!held) pos = slid;
+        }
+        if (held) {
           // The grip follows: lip, anchor and the pull-up spot all track the
           // new position, so a pull-up after a traverse climbs where you are.
           hangLip = hit.lip;
-          hangAnchor = hit.anchor;
+          hangAnchor = Vec3{pos.x, hit.anchor.y, pos.z};
           hangStand = hit.stand;
           ledgeLip = hangLip;
         } else {
@@ -1341,7 +1382,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
             hangLip = hit.lip;
             hangAnchor = hit.anchor;
             hangStand = hit.stand;
-            hangDir = dir;
+            hangDir = SquareToWall(pos, dir, b, kindAt);
             vel = Vec3{0, 0, 0};  // the grip arrests the fall
           }
         }
