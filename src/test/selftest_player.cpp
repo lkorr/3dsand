@@ -2792,7 +2792,10 @@ Status GateFreefall(Ctx& c, std::string& detail) {
   };
   check(spawned, "the avatar never spawned");
   check(first >= 0, "the body never moved");
-  check(peakDrop > 0.95f * terminal * kTickDt,
+  // 0.9, not ~1: the avatar goes limp (ragdoll.fallSeconds) a little before
+  // the live body reaches maxFall, and the limp rig then accelerates to about
+  // 0.92 of it before the ground. What this guards is "a long fall", not a cap.
+  check(peakDrop > 0.9f * terminal * kTickDt,
         Format("peak drop %.2f vox/tick never reached terminal %.2f: not a long fall",
                peakDrop, terminal * kTickDt));
   check(landed, Format("never landed in %d ticks (%s)", (int)rows.size(),
