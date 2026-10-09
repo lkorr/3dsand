@@ -609,9 +609,21 @@ export function createVectorLayer(C) {
   function reset() { st.sel = null; st.drawing = false; st.drag = null; st.probe = null; sync(); }
 
   /* ---- painting ---------------------------------------------------------------------- */
+  // A vertex closer than a pixel to the last one drawn adds nothing the eye can
+  // see and costs the rasterizer a join: zoomed out, a region's thousands of
+  // outline points and a smooth road's dense curve collapse to the few that
+  // land on distinct pixels (the last point is always kept, so ends and
+  // closures stay exact).
   function strokePath(g, pts, closed) {
     g.beginPath();
-    pts.forEach((p, k) => (k ? g.lineTo(C.SX(p[0]), C.SZ(p[1])) : g.moveTo(C.SX(p[0]), C.SZ(p[1]))));
+    const n = pts.length;
+    let lx = 0, lz = 0;
+    for (let k = 0; k < n; k++) {
+      const x = C.SX(pts[k][0]), z = C.SZ(pts[k][1]);
+      if (!k) { g.moveTo(x, z); lx = x; lz = z; continue; }
+      if (k < n - 1 && Math.abs(x - lx) < 1 && Math.abs(z - lz) < 1) continue;
+      g.lineTo(x, z); lx = x; lz = z;
+    }
     if (closed) g.closePath();
   }
   function vertexSquare(g, p, fill, ring) {
@@ -624,10 +636,22 @@ export function createVectorLayer(C) {
     const j = J(), hover = C.hover && C.hover();
     g.save();
     g.font = '11px monospace';
+    // THE VIEW in world voxels: a region / road whose box (plus a margin for
+    // its label and line width) misses it is not drawn -- the canvas would have
+    // clipped all of it; only the cost changes.
+    const sc = C.view.scale, vw = g.canvas.width, vh = g.canvas.height;
+    const wx0 = C.view.cx - vw / 2 / sc, wx1 = C.view.cx + vw / 2 / sc, wz0 = C.view.cz - vh / 2 / sc, wz1 = C.view.cz + vh / 2 / sc;
+    const offView = (pts, mW) => {
+      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+      for (const p of pts) { if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0]; if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1]; }
+      return x1 < wx0 - mW || x0 > wx1 + mW || z1 < wz0 - mW || z0 > wz1 + mW;
+    };
     if (st.show.regions) for (const r of j.regions || []) {
       const pts = r.points || [];
       if (!pts.length) continue;
       const sel = st.sel && st.sel.layer === 'region' && st.sel.id === r.id, col = /^#[0-9a-f]{6}$/i.test(r.colour || '') ? r.colour : '#888888';
+      // the label sits on the centroid, which can lie outside a concave outline: margin for its width
+      if (!sel && offView(pts, 300 / sc)) continue;
       strokePath(g, pts, true);
       g.globalAlpha = sel ? 0.26 : 0.16; g.fillStyle = col; g.fill();
       g.globalAlpha = 1; g.strokeStyle = sel ? '#ffffff' : col; g.lineWidth = sel ? 2 : 1;
@@ -643,14 +667,29 @@ export function createVectorLayer(C) {
     }
     if (st.show.roads) {
       const roads = j.roads || [];
+      // once per road per paint, not once per pass: the centreline (a smooth
+      // road's curve, cached by a JSON key of its points), its colour, and
+      // whether it is near the view at all (the label hangs 300 px off it)
+      const rinfo = new Map();
+      for (const r of roads) {
+        const pts = r.points || [];
+        if (pts.length < 1) continue;
+        const sel = st.sel && st.sel.layer === 'road' && st.sel.id === r.id;
+        const d = ROAD_KINDS[r.kind] || ROAD_KINDS.road, w = r.width == null ? d.width : r.width, sh = r.shoulder == null ? d.shoulder : r.shoulder;
+        const cl = roadCentreline(r);
+        if (!sel && offView(cl, w / 2 + sh + 300 / sc)) continue;
+        rinfo.set(r, {cl, col: surfaceColour(r.surface)});
+      }
       // shoulders, then carriageways, then centrelines: the junctions read clean
       for (const pass of [0, 1, 2]) for (const r of roads) {
         const pts = r.points || [];
         if (pts.length < 1) continue;
-        const sel = st.sel && st.sel.layer === 'road' && st.sel.id === r.id, col = surfaceColour(r.surface);
+        const ri = rinfo.get(r);
+        if (!ri) continue;
+        const sel = st.sel && st.sel.layer === 'road' && st.sel.id === r.id, col = ri.col;
         const d = ROAD_KINDS[r.kind] || ROAD_KINDS.road, w = r.width == null ? d.width : r.width, sh = r.shoulder == null ? d.shoulder : r.shoulder;
         g.lineCap = 'round'; g.lineJoin = 'round';
-        strokePath(g, roadCentreline(r), false);
+        strokePath(g, ri.cl, false);
         if (pts.length === 1) g.lineTo(C.SX(pts[0][0]) + 0.01, C.SZ(pts[0][1]));
         if (pass === 0) { g.globalAlpha = 0.18; g.strokeStyle = col; g.lineWidth = Math.max(3, px(w + 2 * sh)); g.stroke(); }
         else if (pass === 1) { g.globalAlpha = sel ? 0.95 : 0.8; g.strokeStyle = col; g.lineWidth = Math.max(2, px(w)); g.stroke(); }
@@ -665,6 +704,7 @@ export function createVectorLayer(C) {
       for (const r of roads) {
         const pts = r.points || [];
         const sel = st.sel && st.sel.layer === 'road' && st.sel.id === r.id;
+        if (!sel && pts.length && !rinfo.has(r) && offView(pts, 300 / sc)) continue;
         if (sel || C.tool() === 'road')
           pts.forEach((p, k) => {
             const jn = junctionCount(p[0], p[1]) > 1;

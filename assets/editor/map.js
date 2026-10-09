@@ -877,19 +877,79 @@ function contourInterval() {
   for (const m of [10, 25, 50, 100, 250, 500, 1000]) if (m >= mPerPx * 3) return m * v;
   return 1000 * v;
 }
-// 'h|k|L' -> {stamp, canvas}, least recently used first (a Map keeps insertion
-// order; a hit re-inserts). A level-0 tile image is 256 KB, so the cap bounds
-// the cache near 100 MB however far a session pans at full zoom.
-const imgCache = new Map(), IMG_CACHE_MAX = 400;
-function cacheGet(id, stampKey, build) {
-  let e = imgCache.get(id);
-  if (e) { imgCache.delete(id); imgCache.set(id, e); }
+// THE TILE IMAGE CACHE. 'h|k|L|variant' -> {stamp, canvas, px}, least recently
+// used first (a Map keeps insertion order; a hit re-inserts). Bounded by
+// PIXELS, not entries: a level-0 tile image is 256 KB and a level-5 one 256
+// bytes, so the old 400-entry cap evicted a whole zoomed-out view's worth of
+// small images to make room. IMG_CACHE_PX is the same ~100 MB bound the
+// 400 level-0 images were. The height plane's VARIANT is the contour interval:
+// the auto interval follows the zoom, and a zoom in and back out used to
+// rebuild every tile twice (the stamp changed under one id); now both looks
+// stay cached side by side.
+const IMG_CACHE_PX = 400 * 256 * 256;
+const imgCache = {
+  map: new Map(), px: 0,
+  get(id) { return this.map.get(id); },
+  clear() { this.map.clear(); this.px = 0; },
+  touch(id, e) { this.map.delete(id); this.map.set(id, e); },
+  put(id, e) {
+    const old = this.map.get(id);
+    if (old) { this.px -= old.px; this.map.delete(id); }
+    this.map.set(id, e); this.px += e.px;
+    while (this.px > IMG_CACHE_PX && this.map.size > 1) {
+      const [k, v] = this.map.entries().next().value;
+      this.map.delete(k); this.px -= v.px;
+    }
+  },
+};
+// THE TILE BUILD BUDGET while the view is MOVING (a wheel zoom or a pan in the
+// last INTERACT_MS). A zoom that crosses a mip level, or the auto contour
+// interval, invalidates every visible tile at once: ~1.5 M pixels of shading
+// and contours in one paint, an 80-100 ms frame (scripts/bench_mappage.sh).
+// While moving, a paint builds tiles for TILE_BUDGET_MS and draws the rest from
+// what it has -- the tile's image in another style, or the same tile at
+// another mip level -- and asks for another frame; the picture converges in a
+// few frames and is then exactly what an unbudgeted paint draws. A paint
+// that is not part of a gesture (an edit, a tool, the tests' _paint) builds
+// everything, as before.
+const TILE_BUDGET_MS = 4, INTERACT_MS = 250;
+let interactUntil = 0, tileBudget = null;
+// the id of the newest image built for 'h|k|L' (any variant / stamp): what
+// stands in for that tile while its current look waits for the budget
+const tileLatest = new Map();
+/** The image of tile `base` ('h|k') at level L in look `variant`, built by
+ *  build(oldCanvas) when missing or stale (stamp); null = over the budget and
+ *  nothing of this tile is cached at all. */
+function cacheGet(base, L, variant, stampKey, build) {
+  const id = base + '|' + L + (variant === '' ? '' : '|' + variant);
+  const e = imgCache.get(id);
+  if (e) imgCache.touch(id, e);
   if (e && e.stamp === stampKey) return e.canvas;
+  if (tileBudget) {
+    // always one build per paint (progress), then only inside the budget
+    if (tileBudget.built && performance.now() > tileBudget.end) {
+      tileBudget.short = true;
+      if (e) return e.canvas;
+      const lid = tileLatest.get(base + '|' + L), le = lid && imgCache.get(lid);
+      return le ? le.canvas : otherLevel(base, L);
+    }
+    tileBudget.built = true;
+  }
   const canvas = build(e ? e.canvas : null);
-  if (!e && imgCache.size >= IMG_CACHE_MAX) imgCache.delete(imgCache.keys().next().value);
-  imgCache.set(id, {stamp: stampKey, canvas});
+  imgCache.put(id, {stamp: stampKey, canvas, px: canvas.width * canvas.height});
+  tileLatest.set(base + '|' + L, id);
   stats.tileImages++;
   return canvas;
+}
+/** The nearest other level this tile has an image at (the same world square). */
+function otherLevel(base, L) {
+  for (let d = 1; d <= 8; d++)
+    for (const l of [L - d, L + d]) {
+      if (l < 0 || l > 8) continue;
+      const id = tileLatest.get(base + '|' + l), e = id && imgCache.get(id);
+      if (e) return e.canvas;
+    }
+  return null;
 }
 function tileCanvas(old, n) {
   const c = old || document.createElement('canvas');
@@ -992,14 +1052,21 @@ function palette() {
   imgCache.clear();
   return pal;
 }
-/** Screen <-> world (voxels). */
-const SX = x => els.canvas.clientWidth / 2 + (x - view.cx) * view.scale;
-const SZ = z => els.canvas.clientHeight / 2 + (z - view.cz) * view.scale;
+/** Screen <-> world (voxels). The canvas's CSS size is CACHED (cvW / cvH):
+ *  SX / SZ run for every vertex of every layer, hundreds of thousands of times
+ *  a paint on a big map, and a clientWidth read is a DOM call that can force a
+ *  layout -- measured (scripts/bench_mappage.sh) as a third of all paint time.
+ *  paintAll and every pointer event (worldAtF) refresh it; a resize repaints. */
+let cvW = 0, cvH = 0;
+function canvasDims() { if (els.canvas) { cvW = els.canvas.clientWidth; cvH = els.canvas.clientHeight; } }
+const SX = x => { if (!cvW) canvasDims(); return cvW / 2 + (x - view.cx) * view.scale; };
+const SZ = z => { if (!cvH) canvasDims(); return cvH / 2 + (z - view.cz) * view.scale; };
 /** The mip level whose samples are at least one screen pixel. */
 function levelFor(sp) { const ppp = sp * view.scale; return ppp >= 1 ? 0 : Math.min(8, Math.ceil(Math.log2(1 / ppp))); }
 /** Visible tiles of plane P: [tx0, tz0, tx1, tz1] (inclusive), clamped. */
 function visibleTiles(P, centred) {
-  const W = els.canvas.clientWidth, Hh = els.canvas.clientHeight, span = MT.TILE * P.sp;
+  if (!cvW) canvasDims();
+  const W = cvW, Hh = cvH, span = MT.TILE * P.sp;
   const x0 = view.cx - W / 2 / view.scale, x1 = view.cx + W / 2 / view.scale;
   const z0 = view.cz - Hh / 2 / view.scale, z1 = view.cz + Hh / 2 / view.scale;
   const o = centred ? 0 : P.sp / 2;
@@ -1019,7 +1086,8 @@ function drawPlane(ctx, P, post, imgFor) {
       const wx = P.min[0] + tx * span - o, wz = P.min[1] + tz * span - o;
       const x = Math.floor(SX(wx)), z = Math.floor(SZ(wz)), x2 = Math.floor(SX(wx + span)), z2 = Math.floor(SZ(wz + span));
       if (x2 <= x || z2 <= z) continue;
-      ctx.drawImage(imgFor(tx, tz, k, L), x, z, x2 - x, z2 - z);
+      const img = imgFor(tx, tz, k, L);   // null: over the build budget, nothing cached
+      if (img) ctx.drawImage(img, x, z, x2 - x, z2 - z);
     }
   return missing;
 }
@@ -1050,6 +1118,7 @@ function paintAll(lap) {
   if (!els.canvas) return;
   const c = els.canvas, ctx = c.getContext('2d');
   const W = c.clientWidth, Hh = c.clientHeight;
+  cvW = W; cvH = Hh;
   if (c.width !== W || c.height !== Hh) { c.width = W; c.height = Hh; }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#0e1219'; ctx.fillRect(0, 0, W, Hh);
@@ -1059,12 +1128,15 @@ function paintAll(lap) {
   const sea = seaY(), I = contourInterval();
   const slope = disp.overlay === 'slope' ? (disp.slopeBands || [35, 68]) : null;
   const style = {lo, hi, sea, I, shade: disp.shade, contours: disp.contours, slope};
-  const styleKey = [range.ver, lo, hi, sea, I, disp.shade, disp.contours, slope ? slope.join('/') : ''].join(',');
+  // (the interval only reaches the pixels through the contours)
+  const styleKey = [range.ver, lo, hi, sea, disp.contours ? I : '-', disp.shade, disp.contours, slope ? slope.join('/') : ''].join(',');
   let missing = [];
+  const now = performance.now();
+  tileBudget = now < interactUntil ? {end: now + TILE_BUDGET_MS, built: false, short: false} : null;
   if (disp.topo) {
     const P = map.H;
     missing = drawPlane(ctx, P, true, (tx, tz, k, L) =>
-      cacheGet('h|' + k + '|' + L, (P.ver.get(k) || 0) + '|' + styleKey, old => heightImage(P, tx, tz, L, old, style)));
+      cacheGet('h|' + k, L, disp.contours ? I : '', (P.ver.get(k) || 0) + '|' + styleKey, old => heightImage(P, tx, tz, L, old, style)));
     if (missing.length) wantTiles(P, missing);
   }
   if (lap) lap('height');
@@ -1072,10 +1144,13 @@ function paintAll(lap) {
     const P = map.B, pk = palCache.key;
     ctx.globalAlpha = disp.topo ? disp.biomeAlpha : 1;
     const mb = drawPlane(ctx, P, false, (tx, tz, k, L) =>
-      cacheGet('b|' + k + '|' + L, (P.ver.get(k) || 0) + '|' + pk, old => biomeImage(P, tx, tz, L, old)));
+      cacheGet('b|' + k, L, '', (P.ver.get(k) || 0) + '|' + pk, old => biomeImage(P, tx, tz, L, old)));
     ctx.globalAlpha = 1;
     if (mb.length) wantTiles(P, mb);
   }
+  // tiles left for the next frame: keep painting until the picture is whole
+  if (tileBudget && tileBudget.short) schedulePaint();
+  tileBudget = null;
   if (lap) lap('biome');
   if (showHeights && heights && heights.img && disp.realAlpha > 0) {
     // The engine's own heights (World::TerrainColumn over the SAVED files:
@@ -1228,7 +1303,7 @@ function fit() {
   view.cx = e.min[0] + e.size[0] / 2; view.cz = e.min[1] + e.size[1] / 2;
   view.scale = 0.95 * Math.min((els.canvas.clientWidth || 600) / e.size[0], (els.canvas.clientHeight || 400) / e.size[1]);
 }
-function status(t) { if (els.status) els.status.textContent = t; }
+function status(t) { if (els.status && els.status.textContent !== t) els.status.textContent = t; }
 /** The hover readout: world x / z in metres, the authored height in metres
  *  (and above the sea), the biome, the tile. */
 function readout(wx, wz) {
@@ -1251,6 +1326,7 @@ function readout(wx, wz) {
 function worldAtF(ev) {
   // the CONTENT box: the bounding rect includes the canvas's CSS border
   const c = els.canvas, r = c.getBoundingClientRect();
+  cvW = c.clientWidth; cvH = c.clientHeight;
   return [(ev.clientX - r.left - c.clientLeft - c.clientWidth / 2) / view.scale + view.cx,
           (ev.clientY - r.top - c.clientTop - c.clientHeight / 2) / view.scale + view.cz];
 }
@@ -1725,6 +1801,7 @@ function wire() {
     if (panning) {
       view.cx = panning.cx - (ev.clientX - panning.x) / view.scale;
       view.cz = panning.cz - (ev.clientY - panning.y) / view.scale;
+      interactUntil = performance.now() + INTERACT_MS;
       scheduleRealRefresh();
     } else if (VL.dragging() && ev.buttons & 1) {
       VL.pointerMove(ev);
@@ -1770,8 +1847,11 @@ function wire() {
     view.cx = wx + (view.cx - wx) * (view.scale / ns);
     view.cz = wz + (view.cz - wz) * (view.scale / ns);
     view.scale = ns;
+    interactUntil = performance.now() + INTERACT_MS;
     scheduleRealRefresh();
-    paint();
+    // one paint per frame however many wheel events arrive in it (a trackpad
+    // or a free-spinning wheel sends several): the view is already current
+    schedulePaint();
   }, {passive: false});
   window.addEventListener('keydown', ev => {
     if (!H.isVisible || !H.isVisible() || !map) return;
@@ -2739,6 +2819,8 @@ function layerContext() {
     runJob, jobBusy: () => !!mainJob, setPreview, preview: () => preview,
     writePending, pending: () => erosion.pending, commitPending: commitErosion, discardPending: discardErosion,
     planeChanged: () => { range.vals = null; },
+    // the height plane is mid-change: a brush / sculpt stroke is down, or tiles are streaming in
+    planeBusy: () => !!stroke || loads.active > 0 || loads.queue.length > 0,
     heightAt: (x, z) => MT.heightAt(map.H, x, z),
     rampRange, rampColor, disp, hover: () => els.hoverW || null,
     syncControls, imgCacheClear: () => imgCache.clear(),
