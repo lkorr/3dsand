@@ -719,6 +719,195 @@ function readLit(wv, cv){
     }
     M._tool('height');
 
+    // ---- 6g. LOCALES (docs/PLAN_map_v2.md E4): the locale editor --------------------------------------------
+    // A SYNTHETIC locale on the fixture map -- never Harrowby's files: drawn with
+    // the Locale tool, saved, opened by a double-click on its badge. A sculpt
+    // stroke dragged ACROSS its edge moves no sample whose reach leaves the
+    // bounds (and, with an engine, no column of the engine's own heights
+    // outside them); a clearing dragged out of it is clamped; a tree outside is
+    // refused. With an engine (L1): a structure placed / turned / moved /
+    // deleted and two waynodes joined, all through the F8 command layer, each
+    // undone; the refs file stores y RELATIVE to the anchor; a voxel edit
+    // inside the bounds (and not the one outside) saved to the LOCALE's own
+    // layer and served back by the voxel server. Engine lines SKIP on an exe
+    // that predates L1.
+    var LCx = M._lc(), LS = LCx.st, LOCm = await import('./editor/maplocale.js');
+    btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(btns.indexOf('Locale') >= 0 && btns.indexOf('Structure') >= 0 && btns.indexOf('Link') >= 0 && !!pages.map.querySelector('details.maplocale'),
+        'the toolbar carries Locale (+ the locale page\'s Structure and Link); the Locales panel is built');
+    var LB = [-2000, 1000, -1701, 1299];   // the synthetic locale's bounds (inclusive), on the cone's west flank
+    vw2.cx = -1850; vw2.cz = 1150; vw2.scale = 0.5;
+    M._tool('locale'); LS.newIcon = 'shrine';
+    var nLoc = (JS().locales || []).length, dL = M._undoDepth();
+    at('pointerdown', LB[0], LB[1]); at('pointermove', -1900, 1100); at('pointermove', LB[2], LB[3]); at('pointerup', LB[2], LB[3]);
+    var LZ = (JS().locales || [])[nLoc];
+    say(!!LZ && LZ.icon === 'shrine' && JSON.stringify(LZ.bounds) === JSON.stringify({min: [LB[0], LB[1]], max: [LB[2], LB[3]]}) &&
+        LOCm.inBounds(LZ, LZ.anchor.at[0], LZ.anchor.at[1]) && Number.isInteger(LZ.anchor.y) && M._undoDepth() === dL + 1,
+        'Locale tool: a drag drew ' + JSON.stringify(LZ) + ' in one undo step');
+    at('pointerdown', -1990, 1010); at('pointerup', -1990, 1010);
+    say(JS().locales.length === nLoc + 1 && LS.sel === LZ.id, 'a click inside it selects it, draws no second one');
+    var lin = pages.map.querySelectorAll('details.maplocale .maptools-panel input.mapid');
+    lin[0].value = 'e4test'; lin[0].dispatchEvent(new Event('change'));
+    lin = pages.map.querySelectorAll('details.maplocale .maptools-panel input.mapid');
+    lin[1].value = 'E4 Test'; lin[1].dispatchEvent(new Event('change'));
+    LZ = JS().locales[nLoc];
+    say(LZ.id === 'e4test' && LZ.name === 'E4 Test' && LS.sel === 'e4test', 'the inspector renames it: ' + LZ.id + ' / ' + LZ.name);
+    M._paint();
+    var la = LZ.anchor.at, fa = frac(la[0], la[1]);
+    var lp = g2.getImageData(Math.round(cv.width * fa[0]) - 14, Math.round(cv.height * fa[1]) - 30, 1, 1).data;
+    say(lp[0] === 255 && lp[1] === 216 && lp[2] === 102, 'the selected locale\'s pixel-art badge is drawn at its anchor (corner ' + [].slice.call(lp, 0, 3) + ')');
+    var oldCkL = M._check();
+    say(await M._save(), 'Save writes the locale into map.json');
+    var diskL = await api('/api/worldmap?name=' + FIX);
+    say((diskL.locales || []).some(function (l) { return l.id === 'e4test' && l.icon === 'shrine'; }), 'map.json on disk carries locales[] e4test');
+    await waitFor(function () { return !!M._check() && M._check() !== oldCkL; }, 90000);
+    var ckL = M._check(), ENGINE = !!(ckL && ckL.ok && Array.isArray(ckL.locales));
+    var ckE = ENGINE ? ckL.locales.filter(function (e) { return e.id === 'e4test'; })[0] : null;
+    if (!ENGINE) skip('the engine side of the locale (anchor, refs, voxels): ' + (ckL ? (ckL.unavailable ? 'engine unavailable' : (ckL.ok ? 'this sandvox.exe predates L1' : 'REFUSED: ' + String(ckL.error).slice(0, 100))) : 'no answer'));
+    else say(!!ckE && Number.isInteger(ckE.groundY) && ckE.anchorY === LZ.anchor.y, '--mapcheck measures its anchor: ' + JSON.stringify(ckE));
+    // the engine's heights of the box BEFORE the sculpt (the saved files: no sculpt here yet)
+    var HSPAN = 428, HCX = -1850, HCZ = 1150;
+    var hmUrl = '/api/heightmap?cx=' + HCX + '&cz=' + HCZ + '&span=' + HSPAN + '&res=' + HSPAN + '&seed=1337&map=' + FIX;
+    var readH = async function () {
+      var r = await fetch(hmUrl, {cache: 'no-store'});
+      if (!r.ok) return null;
+      var d = new DataView(await r.arrayBuffer());
+      var res = d.getUint32(8, true), h = new Int32Array(res * res);
+      for (var i = 0; i < res * res; i++) h[i] = d.getInt32(48 + i * 8, true);
+      return {res: res, x0: d.getInt32(16, true) - Math.trunc(d.getUint32(12, true) / 2), z0: d.getInt32(20, true) - Math.trunc(d.getUint32(12, true) / 2), h: h};
+    };
+    var H0 = ENGINE ? await readH() : null;
+    // OPEN it: a double-click on its badge
+    var cr = cv.getBoundingClientRect();
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true, clientX: cr.left + cv.clientLeft + cv.clientWidth * fa[0], clientY: cr.top + cv.clientTop + cv.clientHeight * fa[1] - 15}));
+    var crumb = pages.map.querySelector('.mapcrumb');
+    var vis = function (label) { var b = [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (x) { return x.textContent === label; })[0]; return !!b && b.style.display !== 'none'; };
+    say(!!LCx.open() && LCx.open().id === 'e4test' && crumb.style.display !== 'none' && /World map/.test(crumb.textContent) && /E4 Test/.test(crumb.textContent),
+        'a double-click on the badge OPENS the locale page; breadcrumb: ' + crumb.textContent.trim().slice(0, 80));
+    say(vis('Sculpt') && vis('Structure') && vis('Link') && vis('Clearing') && !vis('Height') && !vis('Road') && !vis('Locale') && M._tool() === 'sculpt',
+        'the locale page\'s tools: Sculpt, Clearing, Structure, Link (no Height, Road, Locale); Sculpt in hand');
+    var vL = M._view();
+    say(Math.abs(vL.cx - (LB[0] + LB[2] + 1) / 2) < 1 && Math.abs(vL.cz - (LB[1] + LB[3] + 1) / 2) < 1 && vL.scale * (LB[2] - LB[0]) > 0.5 * Math.min(cv.clientWidth, cv.clientHeight),
+        'the view frames the bounds (centre ' + vL.cx + ', ' + vL.cz + ', ' + (vL.scale * (LB[2] - LB[0] + 1)).toFixed(0) + ' px wide)');
+    // SCULPT ACROSS THE EDGE: raise, a stroke from inside to well past the east edge
+    var SC = M._sculpt(), scBefore = new Map();
+    SC.tiles.forEach(function (t, k) { scBefore.set(k, new Float32Array(t)); });
+    var ring = [];
+    for (var zz = LB[1] - 24; zz <= LB[3] + 24; zz += 3) for (var xx = LB[2] - 30; xx <= LB[2] + 60; xx += 1) if (!LOCm.inBounds(LZ, xx, zz)) ring.push([xx, zz, M._scAt(xx, zz)]);
+    SC.mode = 'raise'; SC.radius = 64; SC.strength = 100;
+    var dS = M._undoDepth();
+    at('pointerdown', -1760, 1150); at('pointermove', -1720, 1150); at('pointermove', -1680, 1150); at('pointermove', -1640, 1150); at('pointerup', -1640, 1150);
+    var changed = 0, badS = 0;
+    SC.tiles.forEach(function (t, k) {
+      var b0 = scBefore.get(k), tx = Math.floor(k / 65536) - 32768, tz = (k % 65536) - 32768;
+      for (var i = 0; i < 1024; i++) {
+        if ((b0 ? b0[i] : 0) === t[i]) continue;
+        changed++;
+        if (!LOCm.sculptSampleInside(LZ, tx * 32 + (i & 31), tz * 32 + (i >> 5))) badS++;
+      }
+    });
+    var ringBad = ring.filter(function (p) { return M._scAt(p[0], p[1]) !== p[2]; }).length;
+    say(changed > 0 && badS === 0 && ringBad === 0 && M._undoDepth() === dS + 1,
+        'sculpt across the east edge: ' + changed + ' samples raised, ' + badS + ' of them reach outside; ' + ringBad + ' of ' + ring.length + ' outside columns moved (one undo step)');
+    // a clearing dragged out of it is clamped (feather too); a tree outside is refused
+    M._tool('clearing');
+    var nSi = JS().sites.length;
+    at('pointerdown', -1780, 1060); at('pointermove', -1700, 1150); at('pointermove', -1600, 1250); at('pointerup', -1600, 1250);
+    var CL = JS().sites[JS().sites.length - 1];
+    say(JS().sites.length === nSi + 1 && CL.kind === 'clearing' && CL.max[0] === LB[2] && CL.min[0] === -1780 && CL.feather === 0,
+        'a clearing dragged past the edge is clamped to it (feather 64 -> ' + CL.feather + '): ' + JSON.stringify({min: CL.min, max: CL.max}));
+    M._tool('tree');
+    at('pointerdown', -1600, 1150); at('pointerup', -1600, 1150);
+    var treeOut = JS().sites.length === nSi + 1;
+    at('pointerdown', -1850, 1250); at('pointerup', -1850, 1250);
+    say(treeOut && JS().sites.length === nSi + 2 && JS().sites[nSi + 1].kind === 'tree', 'a tree outside the bounds is refused, one inside is planted');
+    undoBtn.click(); undoBtn.click();
+    say(JS().sites.length === nSi, 'Undo takes the tree and the clearing back');
+    M._tool('sculpt');
+    say(await M._save(), 'Save writes the clipped sculpt layer');
+    if (ENGINE && H0) {
+      var H1 = await readH();
+      var outDiff = 0, inDiff = 0, outN = 0;
+      for (var j = 0; j < H1.res; j++) for (var i = 0; i < H1.res; i++) {
+        var x = H1.x0 + i, z = H1.z0 + j, d = H1.h[j * H1.res + i] !== H0.h[j * H0.res + i];
+        if (LOCm.inBounds(LZ, x, z)) { if (d) inDiff++; } else { outN++; if (d) outDiff++; }
+      }
+      say(inDiff > 0 && outDiff === 0, 'the ENGINE\'s heights (--heightmap of the saved files): ' + inDiff + ' columns inside the bounds moved, ' + outDiff + ' of ' + outN + ' outside');
+      // ---- structures + waynodes through the F8 command layer (/api/refs/commands)
+      ok = await waitFor(function () { return LS.library.length > 0 && !!M._heights() && /^locale:/.test(M._heights().key); }, 60000);
+      say(ok && LS.library.indexOf('samples/smithy') >= 0, 'the Structures library is listed (' + LS.library.length + ') and the locale\'s heights are the backdrop');
+      M._tool('structure');
+      LS.place.base = 'samples/smithy'; LS.place.yaw = 0; LS.place.name = 'forge';
+      var floorY = Math.round(M._groundAt(-1850, 1150)) + 1;
+      await LCx.placeStructure(-1850, 1150);
+      var SR = LS.refs.filter(function (r) { return r.kind === 'structure'; });
+      say(SR.length === 1 && SR[0].id === 'e4test/forge' && SR[0].base === 'samples/smithy' && SR[0].pos[0] === -1850 && SR[0].pos[2] === 1150,
+          'Structure: placed ' + JSON.stringify(SR[0] || LS.lastResult));
+      var gr = await api('/api/refs?name=' + FIX);
+      var fileRef = gr.groups && gr.groups.e4test && gr.groups.e4test.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0];
+      say(!!fileRef && !!ckE && fileRef.pos[1] === floorY - ckE.groundY,
+          'refs/e4test.json stores y RELATIVE to the anchor: world floor y' + floorY + ' - ground y' + (ckE && ckE.groundY) + ' = ' + (fileRef && fileRef.pos[1]));
+      var waitRefs = function () { return waitFor(function () { return !LS.busy; }, 60000); };
+      LCx.turnStructure(SR[0], 90); await waitRefs();
+      var yawT = (LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0] || {}).yaw;
+      LCx.moveStructure(LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0], 20, -10); await waitRefs();
+      var mv = LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0] || {pos: []};
+      say(yawT === 90 && mv.pos[0] === -1830 && mv.pos[2] === 1140, 'turned to ' + yawT + '°, moved to (' + mv.pos[0] + ', ' + mv.pos[2] + ')');
+      undoBtn.click(); await waitRefs();
+      undoBtn.click(); await waitRefs();
+      var back0 = LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0] || {pos: []};
+      say(back0.pos[0] === -1850 && back0.pos[2] === 1150 && (back0.yaw || 0) === 0 && !M.isDirty(), 'two Undos run the inverse commands: back at (' + back0.pos[0] + ', ' + back0.pos[2] + ') ' + (back0.yaw || 0) + '° (the map is not dirtied by refs)');
+      LCx.deleteRef(back0); await waitRefs();
+      var gone = !LS.refs.some(function (r) { return r.id === 'e4test/forge'; });
+      undoBtn.click(); await waitRefs();
+      var again = LS.refs.filter(function (r) { return r.id === 'e4test/forge'; })[0];
+      say(gone && !!again && again.pos[0] === -1850 && JSON.stringify(again.pos) === JSON.stringify(back0.pos), 'delete, then Undo places it back exactly (' + JSON.stringify(again && again.pos) + ')');
+      M._tool('waylink'); LS.linkFrom = null;
+      await LCx.newWaynode(-1950, 1270);
+      var w1 = LS.linkFrom;
+      await LCx.newWaynode(-1900, 1270);
+      var w2 = LS.linkFrom, W1 = LS.refs.filter(function (r) { return r.id === w1; })[0];
+      say(!!W1 && w2 !== w1 && ((W1.props || {}).links || []).map(function (l) { return LOCm.linkTarget('e4test', l); }).indexOf(w2) >= 0 && LCx.waynodes().length >= 2,
+          'Link: two new waynodes, joined (' + w1 + ' -> ' + JSON.stringify((W1 || {}).props) + ')');
+      undoBtn.click(); await waitRefs();
+      W1 = LS.refs.filter(function (r) { return r.id === w1; })[0];
+      say(!LS.refs.some(function (r) { return r.id === w2; }) && !!W1 && !((W1.props || {}).links || []).length, 'Undo parts them and takes the second waynode away');
+      // ---- the 3D view: a voxel edit inside the bounds saved to the LOCALE's layer
+      var V3 = LCx.view3d.view();
+      if (!V3) skip('the 3D view: ' + LCx.view3d.ui.status.textContent);
+      else {
+        var gIn = Math.round(M._groundAt(-1706, 1150)), gOut = Math.round(M._groundAt(-1696, 1150));
+        V3.cam.target = [-1701, gIn, 1150]; V3.cam.dist = 30;
+        ok = await waitFor(function () { return V3.cellAtWorld(-1706, gIn + 3, 1150, 0) >= 0 && V3.cellAtWorld(-1696, gOut + 3, 1150, 0) >= 0 && V3.pal; }, 120000);
+        var mat = ok ? V3.pal.materials.filter(function (m) { return m.name === 'cobble'; })[0] : null;
+        var nA = ok && mat ? V3.apply([[-1706, gIn + 3, 1150, mat.id], [-1696, gOut + 3, 1150, mat.id]], 'test') : -1;
+        say(ok && nA === 1 && V3.edit.count() === 1, '3D view: of two voxels painted, the one inside the bounds is taken, the one 5 voxels past the edge is not (' + nA + ')');
+        say(await LCx.view3d.save(), 'Save voxels writes the locale\'s layer: ' + JSON.stringify(LS.saved));
+        var rr = await fetch('/api/worldedit?map=' + FIX + '&locale=e4test&seed=' + V3.seed, {cache: 'no-store'});
+        var lay = rr.ok ? new DataView(await rr.arrayBuffer()) : null;
+        var cell = null;
+        if (lay && lay.getUint32(12, true) === 1) {
+          var ccx = lay.getInt32(32, true), ccy = lay.getInt32(36, true), ccz = lay.getInt32(40, true), li = lay.getUint32(48, true), wd = lay.getUint32(52, true);
+          cell = [ccx * 16 + (li & 15), ccy * 16 + ((li >> 4) & 15), ccz * 16 + (li >> 8), wd & 0xFFF];
+        }
+        say(!!cell && cell.join() === [-1706, gIn + 3, 1150, mat.id].join(), 'locales/e4test/ground.svedit holds exactly that voxel (resolved back: ' + JSON.stringify(cell) + ')');
+        ok = await waitFor(function () { return (V3.cellAtWorld(-1706, gIn + 3, 1150, 0) & 0xFFF) === mat.id && !V3.edit.unsaved.size; }, 120000);
+        say(ok, 'the voxel server applies the saved locale layer: the re-fetched region carries it (map=' + FIX + ', layer @map)');
+        V3.edit.clear();
+        await LCx.view3d.save();
+        rr = await fetch('/api/worldedit?map=' + FIX + '&locale=e4test&seed=1337', {cache: 'no-store'});
+        say(rr.status === 404 && LS.saved && LS.saved.deleted, 'an empty locale layer is no file (saved empty -> 404)');
+      }
+    }
+    // a locale-layer route for a locale that is not in map.json is refused
+    var bogus = await fetch('/api/worldedit?map=' + FIX + '&locale=nope&seed=1337', {method: 'POST', body: new Uint8Array(32)});
+    var bj = await bogus.json().catch(function () { return {}; });
+    say(bogus.status === 400 && /not in worldmap/.test(bj.error || ''), 'POST /api/worldedit for a locale map.json does not list is refused: ' + bj.error);
+    LCx.leave();
+    say(!LCx.open() && crumb.style.display === 'none' && vis('Height') && !vis('Structure'), 'the breadcrumb leads back: world tools again, no breadcrumb');
+    // the default map's shipped locale: Harrowby opens with its houses (nothing is saved)
+    M._tool('height');
+
     // LOAD CHECK: the panel asked the engine (or says why it could not).
     ok = await waitFor(function(){ return !!M._check(); }, 60000);
     var ck = M._check();
@@ -744,6 +933,26 @@ function readLit(wv, cv){
     M._vl().selectById('road', hr.length ? hr[0].id : '', true);
     say(hr.length === 8 && rows >= 8 && !!pages.map.querySelector('canvas.mapprofile-road'),
         'the default map\'s ' + hr.length + ' Harrowby roads are listed (' + rows + ' rows) and open in the inspector');
+
+    // E4: Harrowby, the shipped locale, opens on the locale page with its houses -- nothing is saved
+    var LCh = M._lc();
+    say((M._map().json.locales || []).some(function (l) { return l.id === 'harrowby' && l.icon === 'village'; }) &&
+        !!pages.map.querySelector('details.maplocale .mapkind-locale'), 'the default map lists its locale Harrowby (icon village) in the Locales panel');
+    LCh.enter('harrowby', {view3d: false});   // no second voxel server boot for a look
+    ok = await waitFor(function () {
+      var s = LCh.st;
+      return s.refsFor === 'default/harrowby' && s.refs.filter(function (r) { return r.kind === 'structure'; }).every(function (r) { var sj = s.structs.get(r.base); return sj && sj !== 'loading'; });
+    }, 30000);
+    var hs = LCh.st.refs.filter(function (r) { return r.kind === 'structure'; });
+    say(ok && hs.length === 5 && ['harrowby/longhouse', 'harrowby/smithy', 'harrowby/alehouse', 'harrowby/green', 'harrowby/field'].every(function (id) { return hs.some(function (r) { return r.id === id; }); }) &&
+        LCh.waynodes().length > 10,
+        'Harrowby opens: ' + hs.length + ' houses (' + hs.map(function (r) { return r.id.split('/')[1]; }).join(', ') + '), ' + LCh.waynodes().length + ' waynodes (its own + the houses\' slots)');
+    var hit = LCh.structureAt(700, 3460);
+    M._paint();
+    say(!!hit && hit.id === 'harrowby/smithy' && pages.map.querySelectorAll('details.maplocale .mapkind-stamp').length === 5,
+        'the smithy\'s turned footprint is hit at its anchor and every house is listed in the Locale panel');
+    LCh.leave();
+    say(!M.isDirty() && !LCh.open(), 'leaving Harrowby leaves the map clean (nothing was written)');
 
     // The preview host lives in tuner.html; this harness drives the module
     // alone, so only the wiring is checked here.

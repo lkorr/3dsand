@@ -284,13 +284,16 @@ export function createLocaleLayer(C) {
       const r = await fetch('/api/refs/commands?name=' + encodeURIComponent(C.map().name), {method: 'POST', body: JSON.stringify({commands: cmds})});
       j = await r.json();
     } catch (e) { j = {ok: false, error: e.message}; }
-    st.busy = false;
     st.lastResult = j.ok ? String(j.result || 'ok') : String(j.error || '?');
-    if (!j.ok) { C.toast(label + ' refused by the engine: ' + st.lastResult.slice(0, 300), true); await loadRefs(); return false; }
-    if (inverse) C.pushUndo({refs: {undo: inverse, redo: cmds, label}});
-    C.status(label + ' — ' + st.lastResult);
+    if (!j.ok) C.toast(label + ' refused by the engine: ' + st.lastResult.slice(0, 300), true);
+    else {
+      if (inverse) C.pushUndo({refs: {undo: inverse, redo: cmds, label}});
+      C.status(label + ' — ' + st.lastResult);
+    }
     await loadRefs();
-    return true;
+    st.busy = false;   // only now: a caller waiting on it sees the refs as they are
+    sync();
+    return !!j.ok;
   }
   /** Replay an undo / redo entry's commands (no new undo step). */
   function replay(cmds, label) {
@@ -403,12 +406,16 @@ export function createLocaleLayer(C) {
     const id = freshRefId(L, 'way');
     const cmds = [{cmd: 'ref.place', args: {id, kind: 'waynode', pos: [Math.round(wx), y, Math.round(wz)]}}];
     const inv = [{cmd: 'ref.delete', args: {id}}];
-    if (st.linkFrom) { cmds.push({cmd: 'ref.link', args: {a: st.linkFrom, b: id}}); }
+    if (st.linkFrom) {
+      // the link is written on the FIRST waynode: undo parts it before the delete
+      cmds.push({cmd: 'ref.link', args: {a: st.linkFrom, b: id}});
+      inv.unshift({cmd: 'ref.unlink', args: {a: st.linkFrom, b: id}});
+    }
     if (await run(cmds, 'new waynode ' + id + (st.linkFrom ? ' linked to ' + st.linkFrom : ''), inv)) st.linkFrom = id;
   }
 
   /* ---- world mode: open / leave ------------------------------------------------- */
-  function enter(id) {
+  function enter(id, opts) {
     const L = find(id);
     if (!L) return false;
     st.prevView = {cx: C.view.cx, cz: C.view.cz, scale: C.view.scale};
@@ -422,7 +429,7 @@ export function createLocaleLayer(C) {
     loadRefs();
     if (!st.library.length) loadLibrary();
     C.refreshHeights();
-    view3d.open(L);
+    if (!opts || opts.view3d !== false) view3d.open(L);   // (a test seam can skip the 3D view)
     sync(); C.paint();
     C.status(`locale “${L.name || L.id}”: ${(b[2] - b[0] + 1) / v()} × ${(b[3] - b[1] + 1) / v()} m — sculpt and site tools are clipped to its bounds; Structure places houses, Link joins waynodes; the 3D view edits its own voxel layer`);
     return true;
@@ -924,7 +931,7 @@ export function createLocaleLayer(C) {
     }
     async function loadPalette() {
       if (palOk) return true;
-      const r = await fetch('/api/voxpalette', {cache: 'no-store'});
+      const r = await fetch('/api/voxpalette?map=' + encodeURIComponent(C.map().name), {cache: 'no-store'});
       if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
       const pal = await r.json();
       wv.loadPalette(pal);
@@ -957,7 +964,9 @@ export function createLocaleLayer(C) {
       const e = checkEntry(L.id), gy = e ? e.groundY : L.anchor.y;
       wv.cam.mode = 'orbit';
       wv.cam.target = [L.anchor.at[0], gy, L.anchor.at[1]];
-      wv.cam.dist = Math.max(60, Math.min(400, Math.max(b[2] - b[0], b[3] - b[1]) * 0.6));
+      // close enough that the anchor is in the 1:1 level (edits land only there:
+      // a 3 x 3 x 3 shell of 64-voxel regions round the EYE); wheel out to see more
+      wv.cam.dist = 70;
       wv.cam.yaw = 0.7; wv.cam.pitch = -0.6;
       wv.invalidate();
       if (!raf) { last = 0; raf = requestAnimationFrame(frame); }

@@ -1809,8 +1809,14 @@ class Handler(BaseHTTPRequestHandler):
         out = os.path.join(VOXTMP, "palette.json")
         os.makedirs(VOXTMP, exist_ok=True)
         # PALETTE touches no GPU, so it does not queue behind a build.
+        # Any live map will do; `map=` (E4) names the one the caller is about
+        # to ask regions of, so a cold server boots on it once, not twice.
+        mname = (self._query().get("map") or [""])[0]
+        if mname and not _worldmap_dir(mname):
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        live = _voxserve.proc is not None and _voxserve.proc.poll() is None
         ok, msg = _voxserve.command("PALETTE " + out.replace("\\", "/"),
-                                    hold_lock=False, map_name="*")
+                                    hold_lock=False, map_name=mname if (mname and not live) else "*")
         if not ok:
             return self._json(503, {"ok": False, "error": msg})
         try:
