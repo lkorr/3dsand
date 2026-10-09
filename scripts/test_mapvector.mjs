@@ -79,5 +79,26 @@ say(pr.length === 4 && /two distinct/.test(pr.join()) && /two roads are called "
 say(V.freshId([{id: 'path_0'}, {id: 'path_1'}], 'path') === 'path_2' && V.freshId([{id: 'path_2'}], 'path') === 'path_1',
     'freshId skips taken ids');
 
+// ---- E2: roads that BEND (smooth: true = the engine's SmoothRoadPoints)
+{
+  const poly = {id: 'p', points: [[0, 0], [400, 0], [400, 400]]};
+  const bent = {...poly, smooth: true};
+  const cl = V.roadCentreline(bent);
+  say(V.roadCentreline(poly) === poly.points && cl.length > 3 && cl[0][0] === 0 && cl[cl.length - 1][1] === 400 && cl.every(p => Number.isInteger(p[0]) && Number.isInteger(p[1])),
+      `a smooth road's centreline is the engine's spline (${cl.length} integer vertices, the ends exact); a polyline road is its points`);
+  // the corner is cut: the bent road passes inside (400, 0)
+  const cut = Math.max(...cl.map(p => Math.min(V.segDist([0, 0], [400, 0], p[0], p[1]).d, V.segDist([400, 0], [400, 400], p[0], p[1]).d)));
+  say(cut > 5 && cut < 120, `the curve bends through the corner point, bowing off the straight legs (up to ${cut.toFixed(0)} vox)`);
+  const ka = V.knotArcs(bent), L = V.vertexArcs(cl)[cl.length - 1];
+  say(ka[0] === 0 && Math.abs(ka[2] - L) < 1 && ka[1] > 300 && ka[1] < L - 300, `knotArcs: each point's arc along the curve (${ka.map(a => a.toFixed(0)).join(', ')} of ${L.toFixed(0)})`);
+  // a click on the curve inserts between the right points, at the curve
+  const h = V.roadCurveHit(bent, 200, -20);
+  say(h && h.k === 0 && h.d < 40 && h.t > 0 && h.t < 1, `roadCurveHit near the bend: insert after point ${h && h.k}, ${h && h.d.toFixed(1)} vox off the curve`);
+  const h2 = V.roadCurveHit(bent, 380, 300);
+  say(h2 && h2.k === 1, 'roadCurveHit on the second span: insert after point 1');
+  const hp = V.roadCurveHit(poly, 200, 3);
+  say(hp && hp.k === 0 && Math.abs(hp.d - 3) < 1e-9, 'roadCurveHit on a polyline road is its segment');
+}
+
 console.log(fail ? `\nRESULT FAIL(${fail})` : '\nRESULT OK');
 process.exit(fail ? 1 : 0);

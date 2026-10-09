@@ -1,13 +1,16 @@
 // test_spline.mjs — assets/editor/spline.js, the world map's ONE spline
-// (docs/PLAN_worldbuilder.md §2, K1 item 2), and the shared test-vector table
-// tests/spline_vectors.json that the engine's C++ twin (W1) reads too.
+// (docs/PLAN_worldbuilder.md §2), against the ENGINE's table
+// tests/spline_vectors.json. The table is written by the reference
+// implementation scripts/gen_spline_vectors.py and read by the `rivers`
+// selftest gate (C++ worldmap::SplineTessellate) too, so a pass here means the
+// editor's curves are the engine's curves.
 //
 //   node scripts/test_spline.mjs            check spline.js against the table + properties
-//   node scripts/test_spline.mjs --write    regenerate the table from spline.js (a CONVENTION
-//                                           change: the C++ twin must follow in the same commit)
+//   python scripts/gen_spline_vectors.py    (re)write the table: a CONVENTION change,
+//                                           the C++ twin and spline.js follow in the same commit
 import {pathToFileURL, fileURLToPath} from 'node:url';
 import {join, dirname} from 'node:path';
-import {readFileSync, writeFileSync} from 'node:fs';
+import {readFileSync} from 'node:fs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const S = await import(pathToFileURL(join(ROOT, 'assets/editor/spline.js')).href);
@@ -28,46 +31,31 @@ const CASES = [
   {name: 'negative coordinates, fractional knots', points: [[-1000.5, -2000.25, 1840], [-700, -1800, 1800], [-300.75, -1900.5, 1700]]},
   {name: 'polyline (smooth: false)', points: [[0, 0], [90, 0], [90, 90]], smooth: false},
 ];
-const STEP = 16;
-const CONVENTION = [
-  'Shared by assets/editor/spline.js (tessellate) and the engine C++ twin (W1). Coordinates are world voxels.',
-  '1. Knots [x, z, ...attrs]; consecutive knots with equal (x, z) are merged, the FIRST kept. One knot -> that point.',
-  '2. Phantom ends by reflection: P[-1] = 2*P[0] - P[1], P[n] = 2*P[n-1] - P[n-2].',
-  '3. Centripetal Catmull-Rom, alpha 0.5: t[k+1] = t[k] + sqrt(|P[k+1]-P[k]|). Segment P1->P2 (P0..P3 = P[k-1..k+2]) is the cubic Bezier c0=P1, c1=P1+m1/3, c2=P2-m2/3, c3=P2 with m1=(t2-t1)*((P1-P0)/(t1-t0)-(P2-P0)/(t2-t0)+(P2-P1)/(t2-t1)), m2=(t2-t1)*((P2-P1)/(t2-t1)-(P3-P1)/(t3-t1)+(P3-P2)/(t3-t2)). smooth:false = straight segments.',
-  '4. Dense polyline: each segment at u = j/32, j = 0..31, then the last knot. Arc length is measured along it.',
-  '5. Resample: L = dense length, N = max(1, ceil(L/step - 1e-9)), output N+1 points at arc length i*L/N, linear on the dense polyline; both ends exact.',
-  '6. Attributes after x, z: a missing knot value is the arc-length-linear interpolation between the nearest knots that have one (held flat past the ends); an output point lerps between its segment\'s two knots by arc-length fraction within the segment.',
-  'All maths in doubles. Values here are rounded to 3 decimals; compare with |diff| <= 0.002.',
-].join('\n');
 
-function run(c) {
-  const t = S.tessellate(c.points, {step: STEP, smooth: c.smooth !== false});
-  return {
-    name: c.name, smooth: c.smooth !== false, step: STEP, points: c.points,
-    length: S.round3(t.length), knotS: t.knotS.map(S.round3),
-    out: t.pts.map(p => p.map(S.round3)),
-  };
-}
-
-if (process.argv.includes('--write')) {
-  const table = {convention: CONVENTION, step: STEP, cases: CASES.map(run)};
-  writeFileSync(VEC, JSON.stringify(table, null, 1).replace(/\[\s+([-\d.,\s\w]+?)\s+\]/g, (m, inner) => '[' + inner.replace(/\s+/g, ' ') + ']') + '\n');
-  console.log('wrote ' + VEC + ' (' + CASES.length + ' cases)');
-}
-
-// ---- 1. the table matches spline.js ----
+// ---- 1. the engine's table: every point, its segment and its arc fraction ----
 const table = JSON.parse(readFileSync(VEC, 'utf8'));
-ok(typeof table.convention === 'string' && /centripetal/i.test(table.convention) && table.step === STEP, 'the table states the convention, step ' + table.step);
+const STEP = table.step;
+const TOL = 2e-3;
+ok(typeof table.about === 'string' && /centripetal/i.test(table.about) && STEP === 16 && Array.isArray(table.cases) && table.cases.length >= 8,
+   `the table states the convention (step ${STEP}, ${table.cases.length} cases)`);
 for (const c of table.cases) {
-  const r = run({points: c.points, smooth: c.smooth});
-  let worst = 0, shape = r.out.length === c.out.length && Math.abs(r.length - c.length) <= 0.002;
-  for (let i = 0; shape && i < r.out.length; i++)
-    for (let q = 0; q < Math.max(r.out[i].length, c.out[i].length); q++) {
-      const a = r.out[i][q], b = c.out[i][q];
-      if ((a == null) !== (b == null)) { shape = false; break; }
-      if (a != null) worst = Math.max(worst, Math.abs(a - b));
-    }
-  ok(shape && worst <= 0.002, `vector "${c.name}": ${c.out.length} points, length ${c.length}, worst diff ${worst.toFixed(4)}`);
+  const t = S.tessellate(c.points, {step: STEP, smooth: c.smooth, closed: c.closed});
+  let worst = 0, why = '';
+  const sameN = t.pts.length === c.out.length && c.seg.length === c.out.length && c.f.length === c.out.length;
+  if (!sameN) why = `${t.pts.length} points, the engine ${c.out.length}`;
+  for (let i = 0; sameN && i < c.out.length; i++) {
+    if (t.seg[i] !== c.seg[i]) { why = `point ${i} on segment ${t.seg[i]}, the engine ${c.seg[i]}`; break; }
+    worst = Math.max(worst, Math.abs(t.pts[i][0] - c.out[i][0]), Math.abs(t.pts[i][1] - c.out[i][1]), Math.abs(t.f[i] - c.f[i]));
+  }
+  if (!why && worst > TOL) why = `worst diff ${worst.toFixed(4)} > ${TOL}`;
+  ok(!why, `engine vector "${c.name}" (${c.closed ? 'closed' : 'open'}, ${c.smooth ? 'smooth' : 'polyline'}): ${c.out.length} points, worst |diff| ${worst.toFixed(4)}${why ? ' -- ' + why : ''}`);
+}
+{ // the comparison is real: a perturbed tessellation must FAIL it
+  const c = table.cases.find(q => q.smooth && !q.closed && q.points.length > 2);
+  const t = S.tessellate(c.points.map((p, i) => (i === 1 ? [p[0] + 1, p[1]] : p)), {step: STEP});
+  let worst = 0;
+  for (let i = 0; i < Math.min(t.pts.length, c.out.length); i++) worst = Math.max(worst, Math.abs(t.pts[i][0] - c.out[i][0]), Math.abs(t.pts[i][1] - c.out[i][1]));
+  ok(worst > 0.1 || t.pts.length !== c.out.length, `the comparison has teeth: moving one knot 1 vox moves the output by ${worst.toFixed(3)}`);
 }
 
 // ---- 2. properties ----

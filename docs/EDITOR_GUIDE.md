@@ -2075,9 +2075,24 @@ only erases the old painted paths from the edit layer.
 centripetal Catmull-Rom spline, the same curve the river tool draws); without
 it the road is the straight polyline it always was, so old roads do not move.
 
+* **New roads bend.** Every road you draw now starts with `smooth: true`. An
+  older road stays straight until you tick **bend (smooth)** in its
+  inspector (untick it to go back).
+* **The map draws the curve the engine builds** (the spline at 16 voxels,
+  rounded, simplified -- exactly what the loader grades), and the points sit
+  ON it. To reshape a bend, drag a point; to add one, click the selected
+  road's curve where you want it and drag (that is "drag the curve").
+  Junctions snap onto the curve too.
+* **The profile chart follows the curve**: distance along it, the points
+  ticked where they fall on it. Before the first save it shows the height
+  plane under the curve you drew (no engine numbers yet).
+* **Fords.** Where a road crosses a river the map draws stepping stones and
+  the river's inspector lists the road: the engine keeps the road deck across
+  the channel under the water.
+
 ### 15.2b Rivers and lakes (what the engine does with them)
 
-The drawing tools for these are the River and Lake tools (wave 2); this is
+The drawing tools for these are the River and Lake tools (§15.2c); this is
 what the GAME makes of the `rivers[]` / `lakes[]` they write, so you know
 what to expect when you walk there.
 
@@ -2109,6 +2124,92 @@ voxels), the ground is raised to level + 1, so a sloppy outline never leaks.
 `bed` (default shore_mud) lines the bottom, `shore` (default sand) the dry
 band. The check panel warns when a lake's ground is above its level everywhere
 (it holds no water) or the spawn is in water.
+
+### 15.2c Drawing rivers and lakes: the River and Lake tools
+
+Both write map.json and nothing else: the engine carves the channel and fills
+the water when it loads the map, so the height plane is never touched (undo,
+rebake and so on are not needed). They are listed, inspected and derived in
+the **Water** panel on the right.
+
+**River tool.** Click the SOURCE, then along the course down to the MOUTH;
+double-click or Enter ends it. The first and last knots carry the width and
+depth (the toolbar's `source w / d` and `mouth w / d`, in metres); the knots
+between take them along the way unless you set them in the knot table.
+
+* **The mouth snaps** when you finish, or when you drop the last knot after
+  dragging it: onto another river's channel (it becomes a TRIBUTARY: `joins`
+  is set and its water meets the parent's at the junction), inside a lake
+  (it drains into it), or onto ground under the sea (the coast). A yellow box
+  under the cursor shows the target while you draw. The status line says what
+  it snapped to; "ends on open ground" means it snapped to nothing.
+* **Editing.** Drag a knot to move it. The **diamond** beside each knot of the
+  selected river drags its WIDTH; **Alt+drag** a knot up / down sets its DEPTH.
+  Click the selected river's line to insert a knot there; shift+click a knot
+  deletes it (an end knot hands its width and depth to the new end).
+* **What you see is the engine's bake.** The page runs the engine's own river
+  bake (ported to JS, and pinned to the C++ by a test that must match it
+  sample for sample): the water drawn at its width, a thin white tick across
+  it where a reach steps down, a white fall glyph at each waterfall (a step of
+  more than 2 m), a yellow square where a tributary joins. The one thing it
+  cannot copy is the ground: it uses the HEIGHT PLANE, while the game adds the
+  seeded terrain noise and the sculpt layer, so the game's reaches can land a
+  little differently. After a Save, the inspector's profile also draws the
+  ENGINE's own bake of the saved river, dashed.
+* **The inspector** (Water panel): id, name, `smooth`, `bed` (gravel by
+  default), `stepVox` (how far the bed falls before the surface steps down;
+  bigger = longer, flatter pools and bigger steps), `bank` (blank = auto, 1.5 x
+  the width), `profile` U or V, `joins`, the knot table (x, z, width and depth
+  in metres; blank = interpolated), and the stats: length, reaches, pieces,
+  waterfalls, where it drains, any fords. Its warnings are the engine's (for
+  example a tributary arriving below its parent's water, which the engine
+  clamps).
+* **The profile chart**: the ground under the centreline (green), the water
+  body and its surface (blue: flat reaches and steps; waterfalls white), the
+  knots ticked; hover it to see the spot on the map.
+* **Meander** (inspector): bends the river with a sum of sine waves along its
+  line, wavelength about 12 x its width, the loops widening where the ground
+  is flat and almost vanishing where it is steep; the source and mouth stay
+  where they are. The slider sets the amount, the seed which bends you get.
+  One undo step -- try a few seeds.
+
+**Derive rivers** (Water panel). The terrain already says where water goes:
+Derive runs the drainage network (water routed downhill over filled hollows,
+the same as the "flow" overlay) over the **Area**, or the whole map when no
+Area is set, on a coarse copy (~13-50 m cells), and keeps every channel whose
+catchment is at least the **threshold** (km², a log slider). The preview is
+coloured and thickened by ORDER (pale = a headwater, deep blue = the trunk of
+a network). Click rivers with the River tool to pick them (white), then
+**Accept picked**, or **Accept all** of an order and higher. Accepted rivers
+keep their `joins` to each other, get a width from their catchment (about
+2.5 m per square root of km²) and a depth of a sixth of that; a tributary
+whose parent you did not accept snaps its mouth instead. They are ordinary
+rivers afterwards: edit, meander or delete them.
+
+**Lake tool.** Click inside a hollow: the lake fills it to its SPILL level
+(the lowest point on its rim, found by a whole-map Priority-Flood) and its
+outline is the shore at that level, traced on the 6.4 m posts. In the Water
+panel the **level** slider raises or lowers it, and with **re-flood** ticked
+the outline follows the water live (untick it to move only the level).
+Polygon mode (toolbar) draws the outline by hand: click the vertices, click
+the first one, double-click or Enter ends; its level starts 1 m over the
+lowest vertex. Drag a vertex, click the selected lake's edge to add one,
+shift+click deletes one. Click inside a lake to select it.
+
+* **The sill warning.** Red squares round the selected lake mark shore-band
+  ground OUTSIDE the outline that is lower than the level + 1: the engine
+  raises it there to hold the water (a sill). A few squares at a narrow
+  outlet are what a sill is for; a long red wall means the outline does not
+  follow the basin (re-flood, or lower the level).
+* **A click that finds no basin** ("the ground drains away") is on a slope or
+  in a hollow open to the sea; ground under the sea level is sea, not a lake.
+
+**What they do not do yet.** Rivers never change the height plane: a river
+drawn uphill is legal, it just becomes a long flat pool held by its banks.
+The live preview ignores the terrain noise (see above). Derive works on a
+coarse copy, so a derived river can wander a few metres off the valley floor:
+drag its knots, or let the engine's banks take it. The meander keeps the
+endpoints but not a knot you placed in the middle.
 
 ### 15.3 Regions and markers
 

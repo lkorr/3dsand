@@ -4,7 +4,11 @@
 # the tool registry, the brush mask, the Range tool (draw, live preview, bake
 # in the terrain worker, undo / redo, rebake, unbake), the Generate panel, the
 # stream-power erosion, the overlays, the Measure tool; E2b: the Climate
-# panel (overlays, Generate biomes, the locks) and a Coast stroke. Drives
+# panel (overlays, Generate biomes, the locks) and a Coast stroke.
+# E2a: the River and Lake
+# tools (draw, mouth snap, live bake, insert, meander, derive + accept, lake
+# click + re-flood, undo), roads that bend, fords, and a Save the engine bakes
+# (--mapcheck: needs this checkout's build/Release/sandvox.exe). Drives
 # assets/worldbuilder_test.html; prints its PASS / FAIL lines.
 #
 # What Node cannot see (scripts/test_terraingen.mjs, test_hydrology.mjs,

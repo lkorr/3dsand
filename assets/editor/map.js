@@ -83,7 +83,9 @@
  * terrain worker, map.json ranges[]), the GENERATE panel (mapgen.js:
  * Azgaar-style templates over the map or the Area, landforms by the Area),
  * MEASURE and the overlays (mapoverlay.js: slope bands, flow, lakes, km grid,
- * minimap). Whole-window work runs as terrainjobs.js jobs in
+ * minimap), RIVER + LAKE (mapwater.js, E2: rivers[] / lakes[] drawn with the
+ * engine's own bake ported to JS in riverbake.js, derive, meander, basin
+ * flood). Whole-window work runs as terrainjobs.js jobs in
  * terrain_worker.js (one main job with the progress bar under the toolbar,
  * quiet preview jobs beside it); a generator's result waits in the plane as a
  * PENDING preview (Commit = one undo step, Discard). The Height brush takes a
@@ -109,6 +111,7 @@ import {createOverlayLayer} from './mapoverlay.js';
 import {createClimateLayer} from './mapclimate.js';
 import {createCoastLayer} from './mapcoast.js';
 import {BIOME_COLORS} from './climate.js';
+import {createWaterLayer} from './mapwater.js';
 
 // Display colours by biome NAME (the table lives in climate.js, pure, so the
 // Node previews draw the same; worldbuilder B1's fourteen are in it); anything
@@ -133,6 +136,7 @@ let GL = null;             // the generators (mapgen.js): templates + landforms 
 let OL = null;             // the overlays (mapoverlay.js): slope / flow / lakes / grid / minimap + the Measure tool
 let CLM = null;            // the climate panel (mapclimate.js): climate inputs, overlays, Generate biomes, the Lock tool
 let CST = null;            // the coast tools (mapcoast.js): wobble / beach / cliff / smooth
+let WL = null;             // the rivers + lakes (mapwater.js): rivers[] / lakes[], the River + Lake tools, the live bake
 // THE TOOL REGISTRY (maptools.js): every tool, built-in or a layer's, is one
 // registerTool({...}) call; `locale: true` puts it on the LOCALE page (a
 // locale open), `world: false` keeps it off the world map.
@@ -486,6 +490,7 @@ function restore(s) {
   syncTerrain(); syncSites(); syncEditSel(); publishTerrain(); syncLines();
   if (VL) VL.afterRestore();
   if (RL) RL.afterRestore();
+  if (WL) WL.afterRestore();
   if (LC) LC.afterRestore();
 }
 function pushUndo(e) { undo.push(e); if (undo.length > 60) undo.shift(); redo = []; }
@@ -574,6 +579,7 @@ async function loadMap(name) {
   if (OL) OL.reset();
   if (CLM) CLM.reset();
   if (CST) CST.reset();
+  if (WL) WL.reset();
   preview = null;
   if (LC) LC.reset();
   if (els.heightsBtn) els.heightsBtn.classList.remove('on');
@@ -735,7 +741,13 @@ function syncCheck() {
       row.title = 'select ' + vm[1] + ' ' + vm[2];
       row.addEventListener('click', () => { tool = vm[1]; syncControls(); VL.selectById(vm[1], vm[2], true); });
     }
-    const lm = !hit && !vm && map && String(w).match(/\blocale "([^"]+)"/);
+    const wm = !hit && !vm && map && String(w).match(/\b(river|lake) "([^"]+)"/);
+    if (wm && WL && (map.json[wm[1] + 's'] || []).some(o => o.id === wm[2])) {
+      row.classList.add('link');
+      row.title = 'select ' + wm[1] + ' ' + wm[2];
+      row.addEventListener('click', () => { tool = wm[1]; syncControls(); WL.selectById(wm[1], wm[2], true); });
+    }
+    const lm = !hit && !vm && !wm && map && String(w).match(/\blocale "([^"]+)"/);
     if (lm && (map.json.locales || []).some(l => l.id === lm[1])) {
       row.classList.add('link');
       row.title = 'select locale ' + lm[1];
@@ -745,6 +757,7 @@ function syncCheck() {
   }
   if (VL) VL.sync();
   if (LC) LC.sync();
+  if (WL) WL.sync();
 }
 function buildCheckPanel() {
   const el = H.el;
@@ -764,7 +777,7 @@ async function saveMap() {
   const name = map.name;
   // The engine REFUSES the whole map over a road with one point, a region
   // with two, an id twice: never write one.
-  const vp = [...((VL && VL.problems()) || []), ...((LC && LC.problems()) || [])];
+  const vp = [...((VL && VL.problems()) || []), ...((LC && LC.problems()) || []), ...((WL && WL.problems()) || [])];
   if (vp.length) { toast('not saved: ' + vp.join('; ') + ' (the engine would refuse the whole map)', true); return false; }
   const body = JSON.stringify(map.json, null, 2) + '\n';
   let r = await fetch('/api/worldmap?name=' + encodeURIComponent(name), {method: 'POST', body});
@@ -2704,6 +2717,7 @@ function layerContext() {
     rampRange, rampColor, disp, hover: () => els.hoverW || null,
     syncControls, imgCacheClear: () => imgCache.clear(),
     rebuildPalette, colorOf,
+    check: () => check, savedJson: () => savedJson,
   };
 }
 function download(name, bytes, type) {
@@ -3159,6 +3173,7 @@ export function attach(hooks) {
     tool: () => tool, setTool: t => { tool = t; syncControls(); paint(); },
     hover: () => els.hoverW || null,
     materials: () => (H.materials ? H.materials() : null),
+    heightAt: (x, z) => MT.heightAt(map.H, x, z),
   });
   // E4: the locales, handed the page (maplocale.js createLocaleLayer)
   LC = LOC.createLocaleLayer({
@@ -3361,6 +3376,7 @@ export function attach(hooks) {
   OL = createOverlayLayer(C);
   CLM = createClimateLayer(C);
   CST = createCoastLayer(C);
+  WL = createWaterLayer(C);
   els.dispBar.append(el('span', {style: 'width:6px'}), ...OL.displayControls());
   els.tools = {};
   const toolbar = el('div', {class: 'mapbar'});
@@ -3391,7 +3407,7 @@ export function attach(hooks) {
   els.vecPanel = VL.buildPanel();
   els.htPanel = buildHeightToolsPanel();
   els.terrainPanel = buildTerrainSection();
-  els.worldPanels = [RL.buildPanel(), GL.buildPanel(), CLM.buildPanel()];
+  els.worldPanels = [RL.buildPanel(), GL.buildPanel(), CLM.buildPanel(), WL.buildPanel()];
   els.legend = buildLegend(el, VEC.iconCanvas, {land: LAND_LUT, sea: SEA_LUT});
   style.textContent += els.legend.css;
   const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.worldPanels[0], els.worldPanels[1], els.worldPanels[2], els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
@@ -3523,7 +3539,7 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); } }
+export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); WL.sync(); } }
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
@@ -3570,6 +3586,7 @@ export function _ol() { return OL; }
 // E2b test seams (climate + coast)
 export function _clm() { return CLM; }
 export function _cst() { return CST; }
+export function _wl() { return WL; }
 export function _preview() { return preview; }
 export function _job() { return mainJob; }
 // E4 test seams (the locales)

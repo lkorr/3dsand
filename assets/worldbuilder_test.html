@@ -2,7 +2,8 @@
 <!-- Headless harness for the WORLDBUILDER tools of the World map page
      (docs/PLAN_worldbuilder.md package K1). Loaded by
      scripts/check_worldbuilder.sh through Chrome; prints PASS/FAIL lines into
-     #out for --dump-dom. Needs no built exe.
+     #out for --dump-dom. Needs no built exe (the last block, a Save the
+     engine bakes through --mapcheck, is skipped without a W1 one).
 
      It mounts the Environment tab the way assets/environment_test.html does
      (the module directly, the tuner's hooks faked), writes a synthetic v2 map
@@ -13,7 +14,12 @@
      the Area committed and undone, a landform discarded), stream-power erosion
      of the Area, the slope / flow overlays and the Measure tool; E2b's Climate
      panel (overlays, Generate biomes preview / commit / undo, the Biome
-     brush's locks surviving a regeneration) and one Coast stroke. -->
+     brush's locks surviving a regeneration) and one Coast stroke; then E2a's
+     River tool (draw to the coast, a tributary snapping onto it, the live
+     bake, insert + undo, meander + undo, derive + accept + undo), the Lake
+     tool (a click in a dug hollow, the level re-flood, undo), a road that
+     bends (insert on the curve, the ford where it crosses the river) and a
+     Save that the engine bakes (--mapcheck) with map.json round-tripping. -->
 <meta charset="utf-8">
 <title>worldbuilder harness</title>
 <body style="background:#111;color:#ddd;font:12px monospace">
@@ -115,7 +121,7 @@ async function settle(p) { var d = false, v, err = null; p.then(function (x) { v
 
     // ---- 1. the registry -----------------------------------------------------------------
     var REG = M._reg(), keys = REG.keys();
-    var want = ['site', 'height', 'shape', 'line', 'range', 'area', 'biome', 'sculpt', 'road', 'region', 'marker', 'locale', 'structure', 'waylink',
+    var want = ['site', 'height', 'shape', 'line', 'range', 'area', 'biome', 'sculpt', 'road', 'river', 'lake', 'region', 'marker', 'locale', 'structure', 'waylink',
                 'pad', 'spawn', 'stamp', 'water', 'tree', 'clearing', 'soften', 'measure', 'coast', 'biolock'];
     say(want.every(function (k) { return keys.indexOf(k) >= 0; }) && keys.length === want.length, 'the registry holds every tool (' + keys.join(' ') + ')');
     var btns = [].slice.call(document.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
@@ -271,6 +277,116 @@ async function settle(p) { var d = false, v, err = null; p.then(function (x) { v
     say(!sameTiles(preK, allTiles()) && M._undoDepth() === dK + 1 && inland, 'Coast wobble: one stroke frays the coast (one undo step), inland untouched');
     undoBtn.click();
     say(sameTiles(preK, allTiles()), 'Undo of the coast stroke is byte-exact');
+    // ---- 9. E2a: the RIVER and LAKE tools, roads that bend ----------------------------------------
+    var WL = M._wl(), VLy = M._vl();
+    M._area(null);
+    D.overlay = 'none';
+    vw.cx = 16352; vw.cz = 16352; vw.scale = Math.min(cv.clientWidth, cv.clientHeight) / 34000;
+    M._tool('river');
+    var nRv = (M._map().json.rivers || []).length, dR = M._undoDepth();
+    click(22000, 20500); click(15000, 21500); click(9500, 21000); click(7000, 21000);
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var RV = (M._map().json.rivers || [])[nRv];
+    var bk = WL.bake(), bR = RV && bk.byId.get(RV.id);
+    say(!!RV && RV.points.length === 4 && RV.points[0].length === 4 && RV.points[3].length === 4 && RV.points[1].length === 2 && RV.smooth === true && !WL.st.drawing,
+        'River: four clicks and a double-click drew ' + JSON.stringify(RV && RV.points));
+    say(WL.st.lastSnap && WL.st.lastSnap.kind === 'sea' && !RV.joins, 'its mouth snapped onto the coast (ground under the sea): ' + JSON.stringify(WL.st.lastSnap));
+    var mono = bR && bR.samples.S.every(function (y, i) { return i === 0 || y <= bR.samples.S[i - 1]; });
+    say(!!bR && bR.reaches >= 2 && mono && bR.endLevel === 112 && bR.drainsTo === 'sea',
+        'the live bake: ' + (bR ? bR.samples.s.length + ' samples, ' + bR.reaches + ' reaches, ' + bR.falls.length + ' waterfalls, surface monotone, drains to the sea (' + bR.endLevel + ')' : 'none'));
+    // a tributary: its mouth dropped beside the river joins it
+    var c15 = WL.bake().byId.get(RV.id).line.reduce(function (b, p) { return Math.abs(p[0] - 12500) < Math.abs(b[0] - 12500) ? p : b; });
+    click(17000, 27000); click(c15[0] + 40, c15[1] + 60);   // (beside the river, between its knots)
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var TR = (M._map().json.rivers || [])[nRv + 1], bT = TR && WL.bake().byId.get(TR.id);
+    say(!!TR && TR.joins === RV.id && !!bT && bT.drainsTo === 'river', 'a tributary drawn to beside it SNAPS onto its channel and joins it (' + JSON.stringify(TR && {joins: TR.joins, mouth: TR.points[TR.points.length - 1]}) + ')');
+    var tm = TR && TR.points[TR.points.length - 1], pl = WL.bake().byId.get(RV.id).line;
+    var near = tm && pl.reduce(function (b, p) { return (p[0] - tm[0]) * (p[0] - tm[0]) + (p[1] - tm[1]) * (p[1] - tm[1]) < (b[0] - tm[0]) * (b[0] - tm[0]) + (b[1] - tm[1]) * (b[1] - tm[1]) ? p : b; });
+    say(!!bT && !!near && bT.endLevel === near[2] && bT.samples.S[bT.samples.S.length - 1] === near[2], 'the tributary drains to the parent’s surface at the junction (' + (bT && bT.endLevel) + ' = ' + (near && near[2]) + ')');
+    // insert a knot by clicking the selected river's curve, then undo
+    WL.selectById('river', RV.id, false);
+    var mid = WL.bake().byId.get(RV.id).line[Math.floor(WL.bake().byId.get(RV.id).line.length * 0.3)];
+    var nk = RV.points.length, dI = M._undoDepth();
+    at('pointerdown', mid[0], mid[1]); at('pointerup', mid[0], mid[1]);
+    say(M._map().json.rivers[nRv].points.length === nk + 1 && M._undoDepth() === dI + 1, 'clicking the selected river inserts a knot on the curve (' + nk + ' -> ' + M._map().json.rivers[nRv].points.length + ')');
+    undoBtn.click();
+    say(M._map().json.rivers[nRv].points.length === nk, 'Undo takes the knot back out');
+    // meander, undo
+    var R0 = M._map().json.rivers[nRv], before = JSON.stringify(R0.points);
+    WL.meander(R0, 1, 3);
+    var R1 = M._map().json.rivers[nRv];
+    say(R1.points.length > nk && R1.points[0][0] === RV.points[0][0] && R1.points[R1.points.length - 1][0] === RV.points[RV.points.length - 1][0], 'Meander bends it (' + nk + ' -> ' + R1.points.length + ' knots), the source and the mouth held');
+    undoBtn.click();
+    say(JSON.stringify(M._map().json.rivers[nRv].points) === before, 'Undo restores the river exactly');
+    // derive over the whole map, pick two, accept, undo
+    WL.st.deriveKm2 = 0.02;
+    await settle(WL.derive());
+    var DV = WL.st.derive;
+    say(!!DV && DV.recs.length > 0 && DV.recs.every(function (r) { return r.points.length >= 2 && r.points[0].length === 4; }),
+        'Derive: the D8 network in the worker -> ' + (DV ? DV.recs.length + ' rivers, orders ' + DV.recs.map(function (r) { return r.order; }).sort().filter(function (o, i, a) { return a.indexOf(o) === i; }).join(',') : 'none'));
+    var nBefore = M._map().json.rivers.length, dD = M._undoDepth();
+    var pick = DV.recs.slice(0, 2).map(function (r) { return r.id; });
+    pick.forEach(function (id) { DV.picked.add(id); });
+    var acc = WL.accept('picked');
+    say(acc === pick.length && M._map().json.rivers.length === nBefore + pick.length && M._undoDepth() === dD + 1, 'Accept picked writes ' + acc + ' derived rivers into rivers[] (one undo step)');
+    undoBtn.click();
+    say(M._map().json.rivers.length === nBefore, 'Undo takes them back out');
+    WL.st.derive = null;
+    // a LAKE: dig a hollow with the height brush, click it
+    M._tool('height');
+    Br.mode = 'lower'; Br.radiusM = 250; Br.strength = 100;
+    at('pointerdown', 20000, 11000); at('pointerup', 20000, 11000);
+    M._tool('lake');
+    var nL = (M._map().json.lakes || []).length, dL = M._undoDepth();
+    click(20000, 11000);
+    var LK = (M._map().json.lakes || [])[nL];
+    var g0 = MT.heightAt(HP, 20000, 11000);
+    say(!!LK && LK.level > g0 && LK.points.length >= 4 && LK.smooth === true && M._undoDepth() === dL + 1,
+        'Lake: a click in the hollow fills it to its spill level ' + (LK ? ((LK.level - 112) / 10).toFixed(1) + ' m asl over ground ' + ((g0 - 112) / 10).toFixed(1) + ' m, ' + LK.points.length + ' outline points' : '(none: ground ' + g0 + ', ' + toasts.slice(-2).join(' | ') + ')'));
+    if (!LK) throw new Error('no lake to go on with');
+    var area = function (p) { var a = 0; for (var i = 0, k = p.length - 1; i < p.length; k = i++) a += p[k][0] * p[i][1] - p[i][0] * p[k][1]; return Math.abs(a / 2); };
+    var a0 = area(LK.points);
+    var refl = WL.reflood(LK, Math.round((LK.level + g0) / 2));
+    say(refl && area(LK.points) < a0, 'the level slider re-floods: halfway down, the outline shrinks (' + (a0 / 1e6).toFixed(2) + ' -> ' + (area(LK.points) / 1e6).toFixed(2) + ' Mvox²)');
+    undoBtn.click();
+    say((M._map().json.lakes || []).length === nL, 'Undo removes the lake');
+    WL.st.lakeMode = 'polygon';
+    click(17000, 13500); click(18500, 13500); click(18500, 14800); click(17000, 14800);
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var LP = (M._map().json.lakes || [])[nL], gmin = Math.min.apply(null, [[17000, 13500], [18500, 13500], [18500, 14800], [17000, 14800]].map(function (p) { return MT.heightAt(HP, p[0], p[1]); }));
+    say(!!LP && LP.points.length === 4 && LP.smooth === false && Math.abs(LP.level - (gmin + 10)) <= 1 && Object.keys(LP).every(function (k) { return k[0] !== '_'; }) && !WL.st.drawing,
+        'Lake polygon mode: four clicks + a double-click make a hand outline, level 1 m over its lowest vertex (' + JSON.stringify(LP && {n: LP.points.length, level: LP.level}) + ')');
+    undoBtn.click(); undoBtn.click(); undoBtn.click(); undoBtn.click();   // the vertices, then the lake
+    say((M._map().json.lakes || []).length === nL, 'Undo takes the polygon lake back out');
+    WL.st.lakeMode = 'basin';
+    // ROADS BEND: a new road is smooth; a click on its curve inserts a point; a crossing is a ford
+    M._tool('road');
+    var nRd = (M._map().json.roads || []).length;
+    click(13000, 17500); click(12200, 21000); click(13000, 24500);
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var RD = (M._map().json.roads || [])[nRd];
+    say(!!RD && RD.smooth === true && RD.points.length === 3, 'Road: a new road BENDS (smooth: true, ' + (RD && RD.points.length) + ' points)');
+    var V = await import('./editor/mapvector.js');
+    var cl = V.roadCentreline(RD), q = cl[Math.floor(cl.length * 0.25)];
+    VLy.selectById('road', RD.id, false);
+    click(q[0], q[1]);
+    say(RD.points.length === 4, 'clicking the road’s curve inserts a point there (' + RD.points.length + ' points)');
+    var fd = WL.bake().fords.filter(function (f) { return f.road === RD.id; });
+    say(fd.length >= 1 && fd[0].river === RV.id, 'the road crossing the river is a FORD: ' + JSON.stringify(fd[0]));
+    M._paint();
+    // SAVE: the engine bakes the saved rivers (--mapcheck), the inspector's profile reads them
+    var ck0 = M._check();
+    await settle(M._save());
+    ok = await waitFor(function () { var c = M._check(); return c && c !== ck0; }, 120000);
+    var CK = M._check();
+    if (CK && CK.unavailable) say(true, 'the engine check is unavailable here (' + String(CK.error).slice(0, 80) + '): skipped');
+    else if (CK && CK.ok && !Array.isArray(CK.rivers)) say(true, 'the sandvox.exe the tuner runs predates rivers in --mapcheck (no W1): the engine half is skipped');
+    else say(!!CK && CK.ok && (CK.rivers || []).some(function (r) { return r.id === RV.id && r.reaches >= 1; }) && (CK.rivers || []).some(function (r) { return r.id === TR.id && r.joins === RV.id; }),
+             'Save: the engine baked the rivers (--mapcheck): ' + JSON.stringify(CK && (CK.rivers || []).map(function (r) { return [r.id, r.reaches, r.waterfalls.length, r.endLevel]; })) + (CK && !CK.ok ? ' REFUSED: ' + CK.error : ''));
+    var saved = await (await fetch('/api/worldmap?name=' + FIX, {cache: 'no-store'})).json();
+    var sj = saved.json || saved.map || saved;
+    say(JSON.stringify((sj.rivers || []).map(function (r) { return r.id; })) === JSON.stringify(M._map().json.rivers.map(function (r) { return r.id; })) && sj.terrain && sj.terrain.rockSlope === 640 && sj.sites && sj.sites[0].id === 'spawn',
+        'map.json round-trips: rivers, roads and the untouched fields (terrain, sites) as written');
     say(!toasts.some(function (t) { return /^ERR/.test(t); }), 'no error toasts' + (toasts.length ? ' (' + toasts.join(' | ').slice(0, 300) + ')' : ''));
   } catch (e) {
     say(false, 'threw: ' + (e && e.stack || e));
