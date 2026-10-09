@@ -8789,7 +8789,14 @@ sear it; its block targets `tag:soft_tissue` — `flesh`, `muscle`, `brain`,
 tissue whose wound leaks venom through `bleedFluid`). All three are appended
 (ids 204-206), so `venom_gland` (>127) cannot be painted into a `.vox`
 directly: a snake paints a stand-in and rewrites it at load, as `garmentsBecome`
-does.
+does. The third such rewrite is `anatomy.paintBecomes` (human.json, 2026-10-08):
+a voxel of one material painted one of a list of the file's own art slots
+becomes another — every skin cell the generator paints in its hair slots (251,
+252: scalp hair, brows, beard) is `hair` (id 222), which catches from one hot
+face at 90 per-mille (skin only sears, at 63), burns out through `hair_burning`,
+and has `woundHp` 0, so losing it is not a wound. Found before the art-palette
+merge renumbers `color`, applied after `anatomy::Resolve` so the parity gate
+still compares recipe against bake.
 
 **The arithmetic: a branching process.** Each infectious cell lives until it
 is eaten (rate `μ = eat · s`) and spawns at rate `λ = spread · s` while it
@@ -14280,7 +14287,19 @@ still burning re-peels at most every 0.25 s). A materials reload replaces the
 micro set wholesale, so the peeler keys on `MicroBodySet::epoch` and forgets —
 never frees — indices from a set that no longer exists. Any peel also drops the
 worn and held parts from the picture (a robe over a peeled chest hides what the
-peel is for); "isolate" draws the selected part alone.
+peel is for); "isolate" draws the selected part alone. **The first peel
+undresses** (owner, 2026-10-08): on a body that died with anything worn or held
+(`AutopsyUI::hasGear`), the first step down (PageDown, "peel >") only hides the
+gear, and the next one starts on the skin; restoring walks the same ladder back,
+the clothes last. "skin" is the bare, undressed surface.
+
+**The probe** (`AutopsyUI::probe`) casts the cursor's ray through the instances
+the portrait drew and reads the nearest cell back: part, material, depth layer,
+bruise, coat. On a corpse it is the UNDER CURSOR block of the post-mortem; on
+the living character sheet it is a tip beside the cursor (`VoxelProbeTip`), the
+parts matched to the avatar by physics handle. It names the voxel's MATERIAL —
+whether the cell carries an art colour is not reported, since nearly every
+surface cell of a generated body does.
 
 The same depth fields are the readout: per layer, per figure slot, what the body
 is made of there (`autopsy::Strata`, mirrored by `autopsy::FillUI`). Materials

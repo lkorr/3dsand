@@ -869,6 +869,47 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   if (j.contains("palette"))
     ApplyPaletteRecolour(j["palette"], def.prefab.artColors, jp, log);
 
+  // ---- PAINT THAT IS A SUBSTANCE (anatomy.paintBecomes), part 1 -----------
+  // `[{"material": "skin", "art": [251, 252], "becomes": "hair"}]`: every
+  // voxel of `material` painted one of these art slots is `becomes` (human.json:
+  // the scalp hair, brows and beard the generator paints over the skin). The
+  // slots are THIS FILE's palette indices (the generator's ART table), so the
+  // cells are found here, before the merge below renumbers `color`, and
+  // rewritten in part 2, after anatomy::Resolve — for garmentsBecome's reason:
+  // the anatomy-parity gate compares the recipe against the bake, and the bake
+  // says skin. A .vox paints ids 0..127 only, which is why this is not baked.
+  struct PaintBecomes {
+    int toId = -1;
+    std::vector<std::pair<uint32_t, uint32_t>> at;  // (model, voxel) indices
+  };
+  std::vector<PaintBecomes> paintBecomes;
+  if (j.contains("anatomy") && j["anatomy"].is_object() &&
+      j["anatomy"].contains("paintBecomes") && j["anatomy"]["paintBecomes"].is_array()) {
+    for (const json& r : j["anatomy"]["paintBecomes"]) {
+      if (!r.is_object()) continue;
+      const int fromId = FindMaterialId(mats, r.value("material", std::string()));
+      const int toId = FindMaterialId(mats, r.value("becomes", std::string()));
+      if (fromId <= 0 || toId <= 0 || !r.contains("art") || !r["art"].is_array()) {
+        log += jp + ": anatomy.paintBecomes " + r.dump() +
+               " needs a known `material`, a known `becomes` and an `art` list; skipped\n";
+        continue;
+      }
+      bool slot[256] = {};
+      for (const json& a : r["art"])
+        if (a.is_number_integer() && a.get<int>() > 0 && a.get<int>() < 256)
+          slot[a.get<int>()] = true;
+      PaintBecomes pb;
+      pb.toId = toId;
+      for (uint32_t mi = 0; mi < def.prefab.models.size(); mi++) {
+        const std::vector<PrefabVoxel>& vs = def.prefab.models[mi].voxels;
+        for (uint32_t vi = 0; vi < vs.size(); vi++)
+          if ((int)vs[vi].material == fromId && vs[vi].color && slot[vs[vi].color])
+            pb.at.push_back({mi, vi});
+      }
+      paintBecomes.push_back(std::move(pb));
+    }
+  }
+
   // Fold this file's art colours into the one palette every def resolves
   // against, and rewrite its voxels' slots to the merged numbering NOW —
   // before anything copies them into a limb, a flipbook frame or a micro
@@ -1320,6 +1361,17 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
           if ((int)v.material == fromId) v.material = (uint16_t)toId;
     }
   }
+  // ---- PAINT THAT IS A SUBSTANCE, part 2 ----------------------------------
+  // The cells part 1 found, still painted (Resolve clears the art of every
+  // voxel it rewrites, and a rewritten one is no longer that paint's).
+  // Resolve rewrites in place, so the indices still name the same voxels.
+  for (const PaintBecomes& pb : paintBecomes)
+    for (const auto& [mi, vi] : pb.at) {
+      if (mi >= def.prefab.models.size() || vi >= def.prefab.models[mi].voxels.size())
+        continue;
+      PrefabVoxel& v = def.prefab.models[mi].voxels[vi];
+      if (v.color) v.material = (uint16_t)pb.toId;
+    }
 
   if (def.artUpsample > 1) {
     UpsamplePrefab(def.prefab, def.artUpsample);

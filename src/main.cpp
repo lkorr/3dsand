@@ -19382,6 +19382,19 @@ int main(int argc, char** argv) {
         // swapped for a peeled clone, and gear / unselected parts drop out when
         // the panel asks. Nothing outside this list changes, so the main view
         // and the corpse itself never see a peel.
+        //
+        // THE PROBE'S TARGETS (UIState::AutopsyUI::probe), filled by whichever
+        // body the portrait is of: per instance of the FINAL list, the index
+        // of the part it draws in probeTargets, or -1 (another creature, the
+        // world). The corpse fills it below; the living body after it.
+        struct ProbeTarget {
+          int fig;         // UIState body slot, -1 = worn / held
+          uint32_t src;    // the unpeeled brick, for the depth measure
+          const char* name;
+        };
+        std::vector<ProbeTarget> probeTargets;
+        std::vector<int> probeOf;
+        uint8_t probeKinds[256] = {};
         if (deathFrozen && deathBody.have) {
           std::vector<autopsy::Part> parts;
           std::vector<int> instPart(microInsts.size(), -1);
@@ -19398,9 +19411,11 @@ int main(int argc, char** argv) {
           autopsy::FillUI(autopsyPeeler, kinds, mats, ui);
           const bool peeling = ui.autopsy.peel > 0;
           const int iso = ui.autopsy.isolate ? ui.inspectSelected : -1;
+          std::memcpy(probeKinds, kinds, sizeof kinds);
+          // Anything worn or held makes the panel's first peel an undressing.
+          ui.autopsy.hasGear = std::any_of(parts.begin(), parts.end(),
+                                           [](const autopsy::Part& p) { return !p.isLimb; });
           size_t keep = 0;
-          std::vector<int> keptPart;  // parts[] index of each kept instance, -1 = not the corpse
-          keptPart.reserve(microInsts.size());
           for (size_t k = 0; k < microInsts.size(); k++) {
             MicroBodyInstGpu in = microInsts[k];
             if (instPart[k] >= 0) {
@@ -19415,15 +19430,53 @@ int main(int argc, char** argv) {
                 in.model = dm;
               }
             }
-            microInsts[keep++] = in;
-            keptPart.push_back(instPart[k]);
+            microInsts[keep] = in;
+            // The probe reads the photograph exactly as it is about to be
+            // drawn, peel and all.
+            if (instPart[k] >= 0) {
+              const autopsy::Part& pp = parts[(size_t)instPart[k]];
+              const int li = k < instLimb.size() ? instLimb[k] : -1;
+              probeOf.resize(keep + 1, -1);
+              probeOf[keep] = (int)probeTargets.size();
+              probeTargets.push_back(
+                  {pp.figSlot, pp.model, li >= 0 ? deathBody.limbs[(size_t)li].name : ""});
+            }
+            keep++;
           }
           microInsts.resize(keep);
+          // The clones' bricks, before the encoder below exists (queued
+          // writes drain at the head of the NEXT command buffer).
+          if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
+        } else if (ui.autopsy.probeWant && avatar.Spawned()) {
+          // THE LIVING BODY: its parts are matched by physics handle, the same
+          // match the death pose makes, and probed as they stand.
+          std::vector<uint64_t> slotHandles;
+          bodyReg.BuildHandles(slotHandles);
+          std::unordered_map<uint64_t, int> partOfBody;
+          for (int i = 0; i < avatar.PartCount(); i++)
+            if (const uint64_t h = avatar.PartBody(i)) partOfBody[h] = i;
+          const int limbCount = avatar.Def() ? (int)avatar.Def()->limbs.size() : 0;
+          for (size_t k = 0; k < microInsts.size(); k++) {
+            const uint32_t sl = microInsts[k].slot;
+            if (sl >= slotHandles.size() || !slotHandles[sl]) continue;
+            const auto it = partOfBody.find(slotHandles[sl]);
+            if (it == partOfBody.end()) continue;
+            const int i = it->second;
+            probeOf.resize(k + 1, -1);
+            probeOf[k] = (int)probeTargets.size();
+            probeTargets.push_back(
+                {i < limbCount ? BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) : -1,
+                 microInsts[k].model, avatar.PartName(i)});
+          }
+          AutopsyKinds(burnMats, tissueMats, mats, probeKinds);
+        }
+        probeOf.resize(microInsts.size(), -1);
+        {
           // THE PROBE (UIState::AutopsyUI::probe): the cursor's ray through the
-          // instances just kept - the photograph exactly as it is about to be
-          // drawn, peel and all - nearest occupied cell wins, read back in full.
+          // instances of the inspected body - nearest occupied cell wins, read
+          // back in full.
           ui.autopsy.probe.valid = false;
-          if (ui.autopsy.probeWant && portraitCam.valid) {
+          if (ui.autopsy.probeWant && portraitCam.valid && !probeTargets.empty()) {
             const PortraitCam& pc = portraitCam;
             const float ndcX = ui.autopsy.probeAt[0] * 2.0f - 1.0f;
             const float ndcY = 1.0f - ui.autopsy.probeAt[1] * 2.0f;
@@ -19434,7 +19487,7 @@ int main(int argc, char** argv) {
             float bestT = 1e30f;
             int bestK = -1, bestCell[3] = {0, 0, 0};
             for (size_t k = 0; k < microInsts.size(); k++) {
-              if (keptPart[k] < 0) continue;
+              if (probeOf[k] < 0) continue;
               const MicroBodyInstGpu& in = microInsts[k];
               if (in.slot >= bodyXf.size() || in.model >= mbSet.models.size()) continue;
               const BodyXformGpu& x = bodyXf[in.slot];
@@ -19455,13 +19508,9 @@ int main(int argc, char** argv) {
               UIState::AutopsyUI::Probe& pr = ui.autopsy.probe;
               pr = {};
               const MicroBodyInstGpu& in = microInsts[(size_t)bestK];
-              const autopsy::Part& pp = parts[(size_t)keptPart[(size_t)bestK]];
-              const size_t pre = (size_t)std::distance(
-                  instPart.begin(), std::find(instPart.begin(), instPart.end(),
-                                              keptPart[(size_t)bestK]));
-              const int li = pre < instLimb.size() ? instLimb[pre] : -1;
-              const char* pname = li >= 0 ? deathBody.limbs[(size_t)li].name : "";
-              const int fig = pp.figSlot;
+              const ProbeTarget& pt = probeTargets[(size_t)probeOf[(size_t)bestK]];
+              const char* pname = pt.name ? pt.name : "";
+              const int fig = pt.fig;
               if (fig >= 0 && fig < UIState::kSlotCount) {
                 std::snprintf(pr.part, sizeof pr.part, "%s", ui.body[fig].label);
               } else {
@@ -19488,14 +19537,13 @@ int main(int argc, char** argv) {
               nameOf(m, pr.mat, sizeof pr.mat);
               pr.matColor = m < mats.size() ? (0xFF000000u | (mats[m].gpu.color0 & 0x00FFFFFFu))
                                             : 0xFF808080u;
-              pr.kind = kinds[m];
-              pr.painted = (v >> 8) != 0;
+              pr.kind = probeKinds[m];
               pr.cell[0] = bestCell[0]; pr.cell[1] = bestCell[1]; pr.cell[2] = bestCell[2];
               // The layer, measured on the UNPEELED brick (the peel clone keeps
               // its dims, so the cell is the same cell): depth from the skin.
               static autopsy::DepthField probeDepth;
               static uint32_t probeDepthModel = 0xFFFFFFFFu, probeDepthGen = 0;
-              const uint32_t src = pp.model;
+              const uint32_t src = pt.src;
               if (src != probeDepthModel || MicroBodyEditGen(mbSet, src) != probeDepthGen) {
                 autopsy::MeasureDepth(mbSet, src, probeDepth);
                 probeDepthModel = src;
@@ -19528,9 +19576,6 @@ int main(int argc, char** argv) {
               pr.valid = true;
             }
           }
-          // The clones' bricks, before the encoder below exists (queued
-          // writes drain at the head of the NEXT command buffer).
-          if (mbSet.dirty) sim.UploadMicroBodies(ctx.queue, mbSet);
         }
         const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
         // bodyXf carries the death pose here when there is one, so the cull

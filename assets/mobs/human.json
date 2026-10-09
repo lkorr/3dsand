@@ -40,6 +40,10 @@
     ],
     "//garmentsBecome": "The shorts are painted as `linen` (a .vox can only paint ids 0..127) and are FLESH in every respect but look, so every garment voxel on this body becomes `undercloth` at load -- after the recipe, so `garments` above still finds them. materials.json `undercloth` / reactions.json UNDERCLOTH. Characters that extend human inherit it.",
     "garmentsBecome": "undercloth",
+    "//paintBecomes": "Paint that is a substance. The scalp hair, brows and beard are painted over the skin in the generator's hair slots (mobgen.js ART.HAIR 252, ART.HAIR_SHADE 251) and baked as skin, because `hair` is past what a .vox can paint; at load every skin voxel painted one of those slots becomes `hair` (materials.json HAIR ON THE SCALP), after the recipe like garmentsBecome. Slots are the body file's own palette indices, which every generated character shares. Characters that extend human inherit it.",
+    "paintBecomes": [
+      {"material": "skin", "art": [251, 252], "becomes": "hair"}
+    ],
     "//carve": "Long bones are shafts: the default carve for every limb without its own (arms, legs, hands, feet, tails) keeps bone only in the deepest cells of each cross-section (`core`); the rest of the core is muscle. Bone thickness follows a limb's length, not its bulk.",
     "carve": [
       {

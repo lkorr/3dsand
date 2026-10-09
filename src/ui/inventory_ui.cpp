@@ -644,10 +644,13 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // click-to-frame through without also selecting.
   // A readied spell makes the click a cast with the health column shut too.
   const bool castReady = !s.spellText.empty() && !pourMode;
-  // THE PROBE (UIState::AutopsyUI::probe): on a corpse, the voxel under a
-  // still cursor is read back by main.cpp and named under MADE OF.
-  s.autopsy.probeWant = (dead && hovered && !dragL && !dragR && !dragM) ||
-                        (dead && s.autopsy.probeForce);
+  // THE PROBE (UIState::AutopsyUI::probe): the voxel under a still cursor is
+  // read back by main.cpp - on a corpse named under MADE OF, on the living
+  // body in a tip beside the cursor (VoxelProbeTip). Not while pouring: the
+  // brush owns the cursor then.
+  s.autopsy.probeWant =
+      (hovered && !dragL && !dragR && !dragM && (dead || (s.bodyValid && !pourMode))) ||
+      (dead && s.autopsy.probeForce);
   if (s.autopsy.probeWant && !s.autopsy.probeForce) {
     const ImVec2 m = ImGui::GetMousePos();
     s.autopsy.probeAt[0] = (m.x - at.x) / size.x;
@@ -846,6 +849,60 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
                         ImVec2(cs[k].x + (sx[k] > 0 ? 2 : 0), y1), col);
     }
   }
+}
+
+// THE PROBE ON THE LIVING BODY: the post-mortem's UNDER CURSOR readout as a
+// tip beside the cursor, with the same gold crosshair on the voxel. DRAW ONLY;
+// Portrait asks for the probe and main.cpp answers a frame later. Quiet while
+// a spell is readied: the cast pick's tip owns the cursor then.
+void VoxelProbeTip(const UIState& s, ImVec2 at, ImVec2 size) {
+  const UIState::AutopsyUI::Probe& pr = s.autopsy.probe;
+  if (!s.autopsy.probeWant || !pr.valid || !s.spellText.empty()) return;
+  if (!ImGui::IsMouseHoveringRect(at, ImVec2(at.x + size.x, at.y + size.y))) return;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float mx = std::floor(at.x + pr.uv[0] * size.x);
+  const float my = std::floor(at.y + pr.uv[1] * size.y);
+  const ImU32 c = ui::ColGoldHi();
+  dl->AddRectFilled(ImVec2(mx - 7, my - 1), ImVec2(mx - 2, my + 1), c);
+  dl->AddRectFilled(ImVec2(mx + 2, my - 1), ImVec2(mx + 7, my + 1), c);
+  dl->AddRectFilled(ImVec2(mx - 1, my - 7), ImVec2(mx + 1, my - 2), c);
+  dl->AddRectFilled(ImVec2(mx - 1, my + 2), ImVec2(mx + 1, my + 7), c);
+
+  BeginTip();
+  auto col = [](ImU32 u) { return ImGui::ColorConvertU32ToFloat4(u); };
+  ImGui::TextColored(col(ui::ColParch()), "%s", pr.part);
+  // The material, after a swatch of its own colour.
+  {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = ImGui::GetTextLineHeight();
+    ImDrawList* tl = ImGui::GetWindowDrawList();
+    tl->AddRectFilled(ImVec2(p.x, p.y + h * 0.5f - 4), ImVec2(p.x + 8, p.y + h * 0.5f + 4),
+                      pr.matColor);
+    tl->AddRect(ImVec2(p.x, p.y + h * 0.5f - 4), ImVec2(p.x + 8, p.y + h * 0.5f + 4),
+                Fade(ui::ColInk(), 0.8f));
+    ImGui::Dummy(ImVec2(12, h));
+    ImGui::SameLine(0, 0);
+    const ImU32 kc = pr.kind == 3   ? IM_COL32(120, 176, 92, 255)
+                     : pr.kind == 2 ? ui::ColEmber()
+                                    : ui::ColGoldPale();
+    ImGui::TextColored(col(kc), "%s%s", pr.mat,
+                       pr.kind == 3 ? "  (infection)" : pr.kind == 2 ? "  (burnt)" : "");
+  }
+  if (pr.layer >= 0) {
+    if (pr.layer == 0)
+      ImGui::TextColored(col(ui::ColParchDim()), "the surface");
+    else
+      ImGui::TextColored(col(ui::ColParchDim()), "%d below the surface", pr.layer);
+  }
+  if (pr.bruise >= 15)
+    ImGui::TextColored(col(ui::ColBloodHi()), "split open");
+  else if (pr.bruise > 0)
+    ImGui::TextColored(col(ui::Mix(ui::ColBlood(), ui::ColParch(), 0.4f)), "bruised  %d / 14",
+                       pr.bruise);
+  if (pr.coatAmt > 0)
+    ImGui::TextColored(col(ui::Mix(pr.coatColor, IM_COL32_WHITE, 0.35f)), "%s  %d / 15",
+                       pr.coat, pr.coatAmt);
+  EndTip();
 }
 
 // The hover frame both pick layers draw: the limb under the cursor, clamped to
@@ -3906,11 +3963,29 @@ void PostMortemScreen(UIState& s) {
   }
 
   if (a.maxDepth >= 0) a.peel = std::clamp(a.peel, 0, a.maxDepth);
+  // THE FIRST PEEL UNDRESSES (owner, 2026-10-08). On a body that died in
+  // gear, the first step down takes off everything worn and held - one step
+  // for the whole outfit - and only the next starts on the skin. Restoring
+  // walks the same ladder back up: the skin returns before the clothes do.
+  // A peel past the skin keeps the gear off (main.cpp drops it from any peel
+  // anyway), so the ladder never has a rung with the robe over a flayed chest.
+  if (a.peel > 0 && a.hasGear) a.hideGear = true;
+  auto peelDown = [&a] {
+    if (a.peel == 0 && a.hasGear && !a.hideGear)
+      a.hideGear = true;
+    else if (a.maxDepth < 0 || a.peel < a.maxDepth)
+      a.peel++;
+  };
+  auto peelUp = [&a] {
+    if (a.peel > 0)
+      a.peel--;
+    else if (a.hideGear)
+      a.hideGear = false;
+  };
   // PageDown peels, PageUp puts a layer back: the tuner's keys.
   if (!io.WantTextInput) {
-    if (ImGui::IsKeyPressed(ImGuiKey_PageDown) && (a.maxDepth < 0 || a.peel < a.maxDepth))
-      a.peel++;
-    if (ImGui::IsKeyPressed(ImGuiKey_PageUp) && a.peel > 0) a.peel--;
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) peelDown();
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) peelUp();
   }
 
   const ImGuiWindowFlags kFlags =
@@ -4088,7 +4163,11 @@ void PostMortemScreen(UIState& s) {
     st.darkMix = 0.16f;
     st.sheenPeak = 0.5f;
     st.bronzeAlpha = 0.05f;
-    const float y = PanelChrome(dl, wp, ws, "THE BODY", a.peel > 0 ? "dissected" : "as it fell", st);
+    const float y = PanelChrome(dl, wp, ws, "THE BODY",
+                                a.peel > 0                ? "dissected"
+                                : a.hasGear && a.hideGear ? "undressed"
+                                                          : "as it fell",
+                                st);
     const float gx = wp.x + kFrame + kPad;
     const float px0 = gx + gaugeW + 10;
     const ImVec2 pAt(px0, y);
@@ -4270,16 +4349,19 @@ void PostMortemScreen(UIState& s) {
         cx = ImGui::GetItemRectMax().x + 6;
         return hit;
       };
-      if (btn("##pm_up", "< restore", false) && a.peel > 0) a.peel--;
-      if (ImGui::IsItemHovered()) Tip("Put one layer back.  [PageUp]");
-      if (btn("##pm_dn", "peel >", a.peel > 0) && (a.maxDepth < 0 || a.peel < a.maxDepth))
-        a.peel++;
+      if (btn("##pm_up", "< restore", false)) peelUp();
+      if (ImGui::IsItemHovered()) Tip("Put one layer back - the clothes last.  [PageUp]");
+      if (btn("##pm_dn", "peel >", a.peel > 0 || (a.hasGear && a.hideGear))) peelDown();
       if (ImGui::IsItemHovered())
-        Tip("Take the outermost layer off the whole body - skin, then what is\n"
-            "under it, down to the bone. The same peel as the tuner's Models\n"
-            "tab. It draws a copy: the body itself is untouched.  [PageDown]");
-      if (btn("##pm_skin", "skin", a.peel == 0)) a.peel = 0;
-      if (ImGui::IsItemHovered()) Tip("Back to the surface: every layer shown.");
+        Tip("Take the outermost layer off the whole body - the clothes and\n"
+            "armour first, then the skin, then what is under it, down to the\n"
+            "bone. The same peel as the tuner's Models tab. It draws a copy:\n"
+            "the body itself is untouched.  [PageDown]");
+      if (btn("##pm_skin", "skin", a.peel == 0 && (!a.hasGear || a.hideGear))) {
+        a.peel = 0;
+        a.hideGear = a.hasGear;
+      }
+      if (ImGui::IsItemHovered()) Tip("Back to the bare skin: undressed, nothing peeled.");
       cx = sw >= 300 ? cx + 8 : sx + sw;  // a new row for the view toggles
       if (btn("##pm_gear", "gear", !a.hideGear && a.peel == 0 && !a.isolate))
         a.hideGear = !a.hideGear;
@@ -4361,9 +4443,8 @@ void PostMortemScreen(UIState& s) {
           const ImU32 kc = pr.kind == 3   ? IM_COL32(120, 176, 92, 255)
                            : pr.kind == 2 ? ui::ColEmber()
                                           : ui::ColGoldPale();
-          std::snprintf(buf, sizeof buf, "%s%s%s", pr.mat,
-                        pr.kind == 3 ? "  (infection)" : pr.kind == 2 ? "  (burnt)" : "",
-                        pr.painted ? "  - painted" : "");
+          std::snprintf(buf, sizeof buf, "%s%s", pr.mat,
+                        pr.kind == 3 ? "  (infection)" : pr.kind == 2 ? "  (burnt)" : "");
           row("voxel", kc, buf, pr.matColor);
           if (pr.layer >= 0) {
             std::snprintf(buf, sizeof buf, "%d%s", pr.layer,
@@ -4812,6 +4893,7 @@ void DrawInventoryScreen(UIState& s) {
     // click), health column open or not: the click casts either way.
     if (s.applyText.empty())
       InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
+    VoxelProbeTip(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
     // A hovered armour slot shades the limbs it is standing in front of. This
     // is the other half of the COVER section in the health column and the same
     // fact from the other end: "what does this piece protect" answered by
