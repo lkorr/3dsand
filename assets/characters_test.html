@@ -571,6 +571,56 @@ var toasts = [], dirt = [];
     say(JSON.stringify(st.genome) === gBefore, 'undo puts the hair back');
     breed.redoFromHost();
     say(JSON.stringify(st.genome) !== gBefore, 'redo re-applies it');
+
+    mark('13. the preview plays the tail sway');
+    // ---- 13. the idle motion in the preview -----------------------------------
+    // A demon's sidecar carries an overlay `tailsway` clip; the preview poses
+    // the tail from it. A quarter period apart the tail is somewhere else, and
+    // the rest of the body has not moved.
+    breed.__test.preset('demon');
+    var demBody = breed.__test.posed(0);
+    var swayClip = demBody.sidecar && demBody.sidecar.clips.tailsway;
+    say(!!swayClip, 'a demon carries the tailsway clip');
+    if (swayClip) {
+      var tailAt = function(t) {
+        var p = breed.__test.posed(t).parts.find(function(q){ return q.name === 'tail'; });
+        return p ? JSON.stringify([p.mn, p.cells]) : '';
+      };
+      var torsoAt = function(t) {
+        var p = breed.__test.posed(t).parts.find(function(q){ return q.name === 'torso'; });
+        return JSON.stringify(p.cells);
+      };
+      var q = swayClip.durationMs / 4;
+      say(tailAt(0) !== '' && tailAt(0) !== tailAt(q * 2),
+          'the tail is posed differently half a period later');
+      say(torsoAt(0) === torsoAt(q), 'the torso does not move');
+      st.animate = false;
+      say(tailAt(0) === tailAt(q * 2), 'animate off holds the tail still');
+      st.animate = true;
+    }
+
+    mark('14. the saved characters are sorted by race');
+    // ---- 14. race tabs on the saved-characters column ------------------------
+    var tabFor = function(race) {
+      return [...host.querySelectorAll('.pooltabs .gtab')].find(function(t){
+        return t.textContent.indexOf(race + ' ') === 0; });
+    };
+    var races = ['human', 'demon'];
+    for (var ri2 = 0; ri2 < races.length; ri2++) {
+      var R = races[ri2];
+      var want = st.pool.filter(function(p){ return p.race === R; }).length;
+      var tb = tabFor(R);
+      say(!!tb && want > 0, 'a ' + R + ' tab is offered', want + ' on disk');
+      if (!tb) continue;
+      tb.click();
+      var shownN = host.querySelectorAll('.pool .prow').length;
+      say(shownN === want, 'the ' + R + ' tab lists exactly the ' + R + 's',
+          shownN + ' shown, ' + want + ' expected');
+    }
+    var allTab = tabFor('all');
+    if (allTab) allTab.click();
+    say(host.querySelectorAll('.pool .prow').length === st.pool.length,
+        'the all tab lists every saved character');
   } catch (e) {
     say(false, 'harness threw: ' + (e && e.message || e),
         e && e.stack ? String(e.stack).split('\n')[1] : '');

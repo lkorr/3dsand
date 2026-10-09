@@ -102,6 +102,12 @@ const S = {
   // Genome snapshots for undo / redo (JSON strings, so equality is a compare).
   undo: [],
   redo: [],
+  // Play the body's idle motion (the tail sway) in the preview.
+  animate: true,
+  // Which race the saved-characters column lists ('all' for every one).
+  // Kept across reloads; empty until first shown, then the edited race.
+  poolRace: (() => { try { return localStorage.getItem('breed.poolRace') || ''; }
+                     catch { return ''; } })(),
 };
 
 // ---- undo -------------------------------------------------------------------
@@ -703,9 +709,16 @@ async function loadPool() {
     } catch { continue; }
     // behaviors.json and attack_styles.json live here too and are not mobs.
     if (!j || (!j.limbs && !j.extends)) continue;
+    const genome = j.genome ? mg.normalizeGenome(j.genome) : null;
     S.pool.push({
       name: stem,
-      genome: j.genome ? mg.normalizeGenome(j.genome) : null,
+      genome,
+      // WHAT RACE IT IS, for the column's race tabs: the genome says, else
+      // the sidecar's own `race`, else the folder it is filed in
+      // (assets/mobs/demon/); a hand-made creature with none is 'other'.
+      race: (genome && genome.body.race) ||
+            (mg.RACES.includes(j.race) ? j.race : '') ||
+            (mg.RACES.includes(f.variantOf) ? f.variantOf : '') || 'other',
       extendsName: j.extends || '',
       hasPalette: !!j.palette,
       bytes: f.size,
@@ -1181,9 +1194,35 @@ function poolPane() {
              el('div', { class: 'pk' }, kind)));
     rows.push(row);
   }
+  // RACE TABS: every race with a saved character, each with its count, and
+  // 'all'. The list below shows the picked one.
+  const counts = new Map();
+  for (const p of S.pool) counts.set(p.race, (counts.get(p.race) || 0) + 1);
+  const races = [...mg.RACES, 'other'].filter(r => counts.has(r));
+  if (!S.poolRace) S.poolRace = counts.has(S.genome.body.race)
+    ? S.genome.body.race : 'all';
+  const cur = S.poolRace === 'all' || counts.has(S.poolRace) ? S.poolRace : 'all';
+  const pick = r => {
+    S.poolRace = r;
+    try { localStorage.setItem('breed.poolRace', r); } catch { /* ok */ }
+    render();
+    const box = root.querySelector('.pool');
+    if (box) box.scrollTop = 0;
+  };
+  const raceTabs = el('div', { class: 'gtabs pooltabs' },
+    [...races, 'all'].map(r => el('button', {
+      class: 'gtab' + (r === cur ? ' on' : ''),
+      title: r === 'all' ? 'every saved character'
+           : r === 'other' ? 'creatures with no race: hand-made bodies'
+           : 'the saved ' + r + ' characters',
+      onclick: () => pick(r),
+    }, r + ' ' + (r === 'all' ? S.pool.length : counts.get(r)))));
+  const shown = cur === 'all' ? rows
+    : rows.filter((_, i) => S.pool[i].race === cur);
   return el('div', { class: 'bcol' },
     colHead('pool', 'saved characters',
-            'every character already saved in assets/mobs'),
+            'every character already saved in assets/mobs, by race'),
+    raceTabs,
     el('div', { class: 'brow' },
       el('button', { onclick: async () => { await loadPool(); render(); } },
          'refresh'),
@@ -1202,8 +1241,193 @@ function poolPane() {
       'The ones marked hand-authored were drawn in the model editor before ',
       'this page existed, so there are no settings to load — pick one of ',
       'those as the thing a recolour points at instead.'),
-    el('div', { class: 'pool' }, rows.length ? rows
-      : el('div', { class: 'note' }, 'nothing loaded')));
+    el('div', { class: 'pool' }, shown.length ? shown
+      : el('div', { class: 'note' }, rows.length ? 'none of this race yet'
+                                                 : 'nothing loaded')));
+}
+
+
+// =============================================================================
+// THE PREVIEW PLAYS THE BODY'S OWN IDLE MOTION
+//
+// What the engine keeps playing whatever the body is doing -- the sidecar's
+// OVERLAY states (AnimStateRule::overlay; today the demon's `tailsway`) -- is
+// played here too, from the SAME clip the save writes: its duration, its keys,
+// its ease. Generic over parts and quaternions, so a future overlay on another
+// part plays with no code here.
+//
+// Each animated part is rotated about its JOINT: the mean of its cells that
+// touch its parent part (a tail's root against the small of the back). Cells
+// are forward-mapped at 2x2x2 sub-samples so a rotated tube has no holes.
+// Frames are cached per shape per whole degree, so after one cycle a frame
+// costs only the paint.
+// =============================================================================
+
+/** quat (x, y, z, w) in ENGINE axes (Y up) -> the same rotation in SCENE axes
+ *  (Z up): engine = (sx, sz, -sy) is a proper rotation, so the axis maps and
+ *  the angle stays. */
+const sceneQuat = q => [q[0], -q[2], q[1], q[3]];
+
+function qRotate(q, v) {
+  const [x, y, z, w] = q;
+  const ix = w * v[0] + y * v[2] - z * v[1];
+  const iy = w * v[1] + z * v[0] - x * v[2];
+  const iz = w * v[2] + x * v[1] - y * v[0];
+  const iw = -x * v[0] - y * v[1] - z * v[2];
+  return [ix * w + iw * -x + iy * -z - iz * -y,
+          iy * w + iw * -y + iz * -x - ix * -z,
+          iz * w + iw * -z + ix * -y - iy * -x];
+}
+
+function qSlerp(a, b, t) {
+  let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  const s = d < 0 ? -1 : 1;
+  d *= s;
+  if (d > 0.9995) {
+    const r = a.map((v, i) => v + (s * b[i] - v) * t);
+    const n = Math.hypot(...r);
+    return r.map(v => v / n);
+  }
+  const th = Math.acos(d), sn = Math.sin(th);
+  const ka = Math.sin((1 - t) * th) / sn, kb = s * Math.sin(t * th) / sn;
+  return a.map((v, i) => v * ka + b[i] * kb);
+}
+
+const EASE = {
+  quadInOut: u => (u < 0.5 ? 2 * u * u : 1 - (-2 * u + 2) ** 2 / 2),
+  linear: u => u,
+};
+
+/** The clip's rotation of one track at time `tMs` (looped). */
+function trackAt(keys, tMs, dur) {
+  const t = dur > 0 ? ((tMs % dur) + dur) % dur : 0;
+  for (let i = 0; i + 1 < keys.length; i++) {
+    const k0 = keys[i], k1 = keys[i + 1];
+    if (t < k0.t || t > k1.t) continue;
+    const u = k1.t > k0.t ? (t - k0.t) / (k1.t - k0.t) : 0;
+    return qSlerp(k0.q, k1.q, (EASE[k0.ease] || EASE.linear)(u));
+  }
+  return keys.length ? keys[keys.length - 1].q : [0, 0, 0, 1];
+}
+
+/** shape (its parts array) -> { tracks, frames } or null: what moves. */
+const animOfShape = new WeakMap();
+
+function animOf(b) {
+  if (!b || !b.parts || !b.sidecar) return null;
+  if (animOfShape.has(b.parts)) return animOfShape.get(b.parts);
+  const sc = b.sidecar;
+  const byName = new Map(b.parts.map(p => [p.name, p]));
+  const tracks = [];
+  for (const st of sc.states || []) {
+    if (!st.overlay || !st.clip || !sc.clips || !sc.clips[st.clip]) continue;
+    const clip = sc.clips[st.clip];
+    for (const [part, tr] of Object.entries(clip.tracks || {})) {
+      const p = byName.get(part);
+      if (!p || !tr.rot || tr.rot.length < 2) continue;
+      const limb = (sc.limbs || []).find(l => l.name === part);
+      const parent = limb && byName.get(limb.parent);
+      tracks.push({ part, keys: tr.rot, dur: clip.durationMs,
+                    pivot: jointPivot(p, parent) });
+    }
+  }
+  const out = tracks.length ? { tracks, frames: new Map() } : null;
+  animOfShape.set(b.parts, out);
+  return out;
+}
+
+/** Scene point a part turns about: its cells face-touching its parent. */
+function jointPivot(p, parent) {
+  const abs = c => [p.mn[0] + c[0], p.mn[1] + c[1], p.mn[2] + c[2]];
+  let pts = [];
+  if (parent) {
+    const has = new Set(parent.cells.map(c =>
+      (parent.mn[0] + c[0]) + ',' + (parent.mn[1] + c[1]) + ',' +
+      (parent.mn[2] + c[2])));
+    for (const c of p.cells) {
+      const [x, y, z] = abs(c);
+      if ([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+            .some(([dx, dy, dz]) => has.has((x + dx) + ',' + (y + dy) + ',' + (z + dz))))
+        pts.push([x, y, z]);
+    }
+  }
+  if (!pts.length) pts = p.cells.map(abs);
+  const n = pts.length;
+  return [0, 1, 2].map(i => pts.reduce((s, v) => s + v[i] + 0.5, 0) / n);
+}
+
+/** One part turned by `q` (scene axes) about `pivot`: a fresh part with its
+ *  own box, since a turned tail leaves the box it was cut for. */
+function turnedPart(p, q, pivot) {
+  const seen = new Map();
+  for (const [x, y, z, c] of p.cells)
+    for (const sx of [0.25, 0.75]) for (const sy of [0.25, 0.75])
+      for (const sz of [0.25, 0.75]) {
+        const v = [p.mn[0] + x + sx - pivot[0], p.mn[1] + y + sy - pivot[1],
+                   p.mn[2] + z + sz - pivot[2]];
+        const r = qRotate(q, v);
+        const X = Math.floor(r[0] + pivot[0]), Y = Math.floor(r[1] + pivot[1]),
+              Z = Math.floor(r[2] + pivot[2]);
+        const k = X + ',' + Y + ',' + Z;
+        if (!seen.has(k)) seen.set(k, [X, Y, Z, c]);
+      }
+  const cells = [...seen.values()];
+  const mn = [0, 1, 2].map(i => Math.min(...cells.map(c => c[i])));
+  const mx = [0, 1, 2].map(i => Math.max(...cells.map(c => c[i])));
+  return { name: p.name, mn, size: mx.map((v, i) => v - mn[i] + 1),
+           cells: cells.map(c => [c[0] - mn[0], c[1] - mn[1], c[2] - mn[2], c[3]]) };
+}
+
+/** `b` as it stands at `tMs` into its idle motion, or `b` itself. Shares the
+ *  shape's frame cache across recolours: the colours come from `b.genome`. */
+function posedBody(b, tMs) {
+  const A = S.animate === false ? null : animOf(b);
+  if (!A) return b;
+  const qs = A.tracks.map(tr => sceneQuat(trackAt(tr.keys, tMs, tr.dur)));
+  // Key by whole degrees of each track's angle (and its axis sign).
+  const key = qs.map(q => Math.round(2 * Math.acos(Math.min(1, Math.abs(q[3]))) *
+                                     57.29578) * Math.sign(q[0] + q[1] + q[2] || 1))
+                .join('|');
+  let frame = A.frames.get(key);
+  if (!frame) {
+    const turned = new Map(A.tracks.map((tr, i) => {
+      const p = b.parts.find(pp => pp.name === tr.part);
+      return [tr.part, turnedPart(p, qs[i], tr.pivot)];
+    }));
+    frame = { genome: b.genome, sidecar: b.sidecar, stats: b.stats,
+              complaints: b.complaints,
+              parts: b.parts.map(p => turned.get(p.name) || p) };
+    gridOf(frame); exposedFaces(frame);           // cache ON the frame
+    if (A.frames.size > 120) A.frames.clear();
+    A.frames.set(key, frame);
+  }
+  const v = Object.create(frame);
+  v.genome = b.genome;
+  return v;
+}
+
+/** The preview's clock: repaint the orbit canvas while the body has an idle
+ *  motion, the page is showing and animation is on. ~30 fps; stops itself
+ *  when there is nothing to play and is restarted by the next paint. */
+let animRunning = false, animLast = 0;
+function ensureAnimLoop() {
+  if (animRunning) return;
+  animRunning = true;
+  const step = now => {
+    const cv = root && root.querySelector('.prev canvas');
+    const b = cv && buildOf(S.genome, S.name);
+    if (!cv || !cv.isConnected || cv.offsetParent === null ||
+        S.animate === false || !animOf(b)) {
+      animRunning = false;
+      return;
+    }
+    if (now - animLast >= 33) {
+      animLast = now;
+      drawOrbit(cv, posedBody(b, now), S.view || ORBIT_HOME);
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 // ---- tweak ------------------------------------------------------------------
@@ -1217,7 +1441,8 @@ function orbitControls(canvas) {
     queued = true;
     requestAnimationFrame(() => {
       queued = false;
-      drawOrbit(canvas, buildOf(S.genome, S.name), S.view);
+      drawOrbit(canvas, posedBody(buildOf(S.genome, S.name), performance.now()),
+                S.view);
     });
   };
   // Pointer deltas arrive in CSS pixels; pan is in backing-store pixels.
@@ -1279,8 +1504,10 @@ function tweakPane() {
   big.style.touchAction = 'none';
   if (!S.view) S.view = { ...ORBIT_HOME };
   const b = buildOf(S.genome, S.name);
-  drawOrbit(big, b, S.view);
+  drawOrbit(big, posedBody(b, performance.now()), S.view);
   orbitControls(big);
+  // After this render puts the canvas in the page.
+  requestAnimationFrame(ensureAnimLoop);
   const side = wide ? canvasFor(150, 400, 2) : canvasFor(90, 230, 2);
   side.title = 'side view — depth, the jaw, the skull set-back and the hair ' +
                'sweep, none of which read from the front at this resolution';
@@ -1329,6 +1556,15 @@ function tweakPane() {
       el('div', { class: 'prev' },
         el('div', { class: 'pcanv' }, big, side),
         el('div', {},
+          animOf(b) ? el('div', { class: 'brow' },
+            el('label', { style: 'font-size:10px',
+                          title: 'play what the body does on its own in the ' +
+                                 'game (the tail sway), at its real speed. ' +
+                                 'Tail lag only shows when a body moves.' },
+              el('input', { type: 'checkbox', checked: S.animate !== false,
+                            onchange: e => { S.animate = e.target.checked;
+                                             render(); } }),
+              ' animate (tail sway)')) : null,
           el('div', { class: 'brow racerow' },
             el('span', { title: 'the kind of person: human, sylvan (a wood ' +
                                 'spirit), automaton (clockwork) or android ' +
@@ -2080,7 +2316,11 @@ function paintPreview() {
   if (!root) return;
   const cs = root.querySelectorAll('.prev canvas');
   let b = null;
-  if (cs[0]) drawOrbit(cs[0], b = buildOf(S.genome, S.name), S.view || ORBIT_HOME);
+  if (cs[0]) {
+    b = buildOf(S.genome, S.name);
+    drawOrbit(cs[0], posedBody(b, performance.now()), S.view || ORBIT_HOME);
+    ensureAnimLoop();
+  }
   if (cs[1]) b = thumbFor(cs[1], S.genome, S.name, 'side');
   const box = root.querySelector('.bstats');
   if (box && b) { box.textContent = ''; box.append(...statLines(b)); }
@@ -2313,5 +2553,7 @@ export const __test = {
   /** Paint a repaint queued for the next frame NOW, so a check can read the
    *  canvas straight after a pick (renderPreviewOnly is one-per-frame). */
   flush() { if (previewQueued) { previewQueued = false; paintPreview(); } },
+  /** The preview's posed body at `tMs` into its idle motion (posedBody). */
+  posed(tMs) { return posedBody(buildOf(S.genome, S.name), tMs); },
   preset(k) { S.genome = mg.presetGenome(k); render(); },
 };

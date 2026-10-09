@@ -574,7 +574,9 @@ function tailCells(s, ctx, torso, body, K, out, ...others) {
   const scale = (T.x1 - T.x0 + 1) / 24;
   const r0 = (1.2 + s.tailThick * 2.6) * scale;
   const len = Math.max(6, s.tail * tH * 1.6);
-  const a0 = -(60 - 45 * s.tailTrail) * Math.PI / 180;     // leaving the back
+  // Leaving the back: 80 deg below level when hanging (trail 0), 35 when
+  // trailing (1). Was 60..15 -- every tail read too high (2026-10-08).
+  const a0 = -(80 - 45 * s.tailTrail) * Math.PI / 180;
   const bend = s.tailCurl * (150 - 90 * s.tailTrail) * Math.PI / 180;
   const cx = tx + 0.5;
   let y = yb + 1, z = tz + 0.5, dir = [0, 1, 0];
