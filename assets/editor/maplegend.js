@@ -99,6 +99,24 @@ export function buildLegend(el, iconCanvas, lut) {
     [g => rect(g, '#7fd4ff', 2, null, 11, 3, 14, 12), 'cyan square', 'A STAMP: a prefab dropped at that spot.'],
     ['Height lines', null],
     [g => { line(g, '#ff9f4a', 2, null, [[2, 13], [16, 5], [SW - 2, 9]]); }, 'orange line', 'A RIDGE line; blue = a VALLEY line. Dashed = drawn but not yet baked into the height plane. Editor-only: the game reads only the baked heights.'],
+    [g => { line(g, 'rgba(232,160,96,0.55)', 1, [2, 4], [[2, 4], [SW - 2, 3]]); line(g, 'rgba(232,160,96,0.55)', 1, [2, 4], [[2, 15], [SW - 2, 14]]); line(g, '#e8a060', 2, [6, 3], [[2, 10], [SW - 2, 8]]);
+           g.fillStyle = '#e8a060'; g.beginPath(); g.moveTo(18, 4); g.lineTo(23, 13); g.lineTo(13, 13); g.closePath(); g.fill(); },
+     'amber crest + triangles', 'A MOUNTAIN RANGE (the Range tool, map.json ranges[]): the crest spline, a triangle per knot, the dotted lines its feet (the half-width either side). Dashed crest = not baked yet; solid = the plane holds it. The selected range shows each knot’s crest height and a diamond to drag its half-width.'],
+    [g => { fill(g, '#9a8f84', 0.85, 2, 2, SW - 4, SH - 4); rect(g, 'rgba(255,216,102,0.7)', 1, [3, 3], 1, 1, SW - 3, SH - 3); },
+     'dashed yellow box over terrain', 'A PREVIEW (a range, a template, a landform): a coarse run drawn over the map, NOT written yet. Bake / Generate / Apply makes it real.'],
+    [g => { fill(g, '#ff5ad0', 1, 6, 8, 5, 3); line(g, '#ff5ad0', 1, null, [[6, 9.5], [SW - 6, 9.5]]); g.fillStyle = '#ff5ad0'; g.fillRect(4, 7, 5, 5); g.fillRect(SW - 9, 7, 5, 5); },
+     'pink route', 'The MEASURE tool’s route: distances at each point; its profile and grades are under the toolbar.'],
+    ['Overlays (the display bar)', null],
+    [g => { fill(g, 'rgb(92,160,80)', 1, 0, 0, 12, SH); fill(g, 'rgb(214,180,72)', 1, 12, 0, 12, SH); fill(g, 'rgb(200,80,60)', 1, 24, 0, 12, SH); },
+     'slope bands', 'The ground coloured by slope: GREEN walkable (under ~35°, where soil and scree hold), YELLOW steep (still climbable: the player steps 0.58 m per 0.1 m), RED cliff (at or past the map’s rockSlope, 68° shipped: bare rock, no soil, snow or plants). Measured post to post on the 6.4 m plane.'],
+    [g => { fill(g, '#5a7a4a', 1, 0, 0, SW, SH); line(g, 'rgb(60,170,255)', 2, null, [[2, 3], [12, 9], [20, 10], [SW - 2, 16]]); line(g, 'rgba(100,200,255,0.8)', 1, null, [[14, 2], [17, 9]]); },
+     'flow', 'Where rivers would run: drainage area over a ~51 m copy of the plane (water routed downhill across filled hollows). Brighter and thicker = more water. Recomputed a moment after you edit.'],
+    [g => { fill(g, '#5a7a4a', 1, 0, 0, SW, SH); fill(g, 'rgb(30,90,230)', 0.8, 9, 4, 18, 10); },
+     'lakes', 'Where water would stand: every closed hollow filled to its spill point (Priority-Flood), deeper = darker. A hint for the Lake tool; nothing in the game yet.'],
+    [g => { fill(g, '#5a7a4a', 1, 0, 0, SW, SH); line(g, 'rgba(255,255,255,0.4)', 1, null, [[12.5, 0], [12.5, SH]]); line(g, 'rgba(255,255,255,0.4)', 1, null, [[0, 9.5], [SW, 9.5]]); },
+     'km grid', 'A kilometre grid (1 / 2 / 5 / 10 km by zoom), labelled at the edges.'],
+    [g => { fill(g, '#3a5a7a', 1, 4, 2, 28, 14); rect(g, '#ffd866', 1, null, 14, 5, 8, 6); },
+     'minimap', 'The whole map in the canvas corner with the view’s box; click it to jump there.'],
     ['Highlights', null],
     [g => rect(g, '#ffffff', 2), 'white outline', 'The selected thing.'],
     [g => rect(g, '#ff7a7a', 2), 'red outline', 'Things of the kind the active tool places or edits.'],
@@ -153,7 +171,7 @@ export const TOOL_GUIDE = {
     ''],
   height: ['Height brush — the authored height plane',
     'Paints the map’s actual shape, in metres. One height sample (post) every 6.4 m, blended smoothly between posts. The seeded noise and the sculpt layer ride on top of it.',
-    'Left-drag. raise / lower move ground up or down; smooth pulls toward the local average; flatten levels to where the stroke started; set moves toward a typed height above sea (Alt+click picks one); terrace cuts shelves and cliffs; noise adds seeded relief; erode runs water + scree erosion under the brush. [ ] change the radius (1 m to 5 km).',
+    'Left-drag. raise / lower move ground up or down; smooth pulls toward the local average; flatten levels to where the stroke started; set moves toward a typed height above sea (Alt+click picks one); terrace cuts shelves and cliffs; noise adds seeded relief; erode runs water + scree erosion under the brush. [ ] change the radius (1 m to 5 km). MASK limits every mode: land only, sea only, a height band (m above sea) or a slope band (degrees), soft at the edges — paint snow-line rock without touching the valleys, raise the sea floor without touching the coast.',
     'Coarse (6.4 m) — for finer work use Sculpt. A locale (e.g. Harrowby) rides its ground: raise the ground under it and the whole village moves up with it.'],
   shape: ['Shape — stamp a landform',
     'Writes a whole landform into the height plane in one click: peak, ridge, basin, plateau, volcano, mesa.',
@@ -163,10 +181,10 @@ export const TOOL_GUIDE = {
     'Draw a ridge (orange) or valley (blue) along a path, then Bake it into the height plane from the Height tools panel.',
     'Click to add vertices, double-click / Enter ends. Drag a vertex to move it, click a segment to insert one, Shift+click a vertex to delete it.',
     'The game never reads the line — only what you baked. A dashed line is not baked yet.'],
-  area: ['Area — a rectangle for erosion and PNG',
-    'Marks a rectangle the Height tools panel can erode (a deterministic water + scree simulation) or export / import as a PNG heightmap.',
-    'Drag a rectangle; Shift+click clears it. Erode shows a preview you then Commit or Discard.',
-    'At least 8 posts (51 m) a side.'],
+  area: ['Area — a rectangle for erosion, generators and PNG',
+    'Marks a rectangle: the Height tools panel erodes it (stream power or droplets) or exports / imports it as a PNG heightmap; the Generate panel generates a template into it or places a landform by it (a canyon runs along its long side, a crater sits at its centre).',
+    'Drag a rectangle; Shift+click clears it. Erode / Generate / Apply put the result in the plane as a preview you then Commit or Discard. With no Area, stream-power erosion and templates work on the WHOLE map.',
+    'At least 8 posts (51 m) a side. Droplet erosion takes at most ~2048 × 2048 posts.'],
   biome: ['Biome brush',
     'Paints which biome (forest, meadow, desert, …) owns the ground — that decides the ground skin, trees, plants, random ponds and the local relief.',
     'Pick a biome from the palette, left-drag. Alt+click picks the biome under the cursor.',
@@ -230,8 +248,10 @@ export const TOOL_GUIDE = {
     'Links are two-way. They also shape the world: no tree trunk grows within 1.5 m of a link, and inside a Soften box the ground along a link is flattened by the “paths” percent. A link through a door makes the NPC open it. If an NPC cannot walk a link it drops it for itself and re-plans.'],
 };
 
-/** The box under the toolbar; `sync(tool)` shows that tool's entry. */
-export function buildToolGuide(el) {
+/** The box under the toolbar; `sync(tool)` shows that tool's entry. `extra`
+ *  = the entries tools carry themselves (registerTool's `guide`), which win. */
+export function buildToolGuide(el, extra = {}) {
+  const GUIDE = {...TOOL_GUIDE, ...extra};
   const box = el('div', {class: 'maptoolguide'});
   let cur = null;
   return {
@@ -244,7 +264,7 @@ export function buildToolGuide(el) {
     sync(tool) {
       if (tool === cur) return;
       cur = tool;
-      const g = TOOL_GUIDE[tool];
+      const g = GUIDE[tool];
       box.style.display = g ? '' : 'none';
       if (!g) return;
       const [title, what, how, limits] = g;

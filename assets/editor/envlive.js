@@ -195,7 +195,10 @@ export const LIVE = {
     'roads[]': R('map v2 R1 roads: {id, name?, points [[x, z]...], width, shoulder, surface (a SOLID material), maxGrade %, kind road|track|path, depth?} -- worldmap.cpp bakes a grade-limited profile from the bare ground and cuts it into kSiteRoad pieces; the height mirror levels the ground to it (roadPadAt), genCellIn lays the surface, trees / cover / tarns keep off it, the far field tints the cells it crosses (DESIGN.md, map v2 R1)'),
     'planes.height': R('mapHeightAt: the AUTHORED absolute height, i16 voxels on 2^log2 posts, Catmull-Rom; tiles planes/height/<tx>_<tz>.svt'),
     'planes.biome': R('mapBiomeAt / biomeMixAt: biome cells of 2^log2 voxels; tiles planes/biome/<tx>_<tz>.svt'),
-    'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane')
+    'ridges[]': N('editor', 'baked into planes.height; the engine reads the plane'),
+    'ranges[]': N('editor', 'the Range tool’s splines (docs/PLAN_worldbuilder.md §2.4): baked into planes.height; the engine reads the plane'),
+    'climate': N('editor', 'the auto-biome inputs (wind, lapse, sea temperature, latitude; PLAN_worldbuilder §2.4): the editor paints the biome plane from them, the engine reads the plane'),
+    'gen': N('editor', 'the Generate panel’s last template run (template, seed, ops, box): re-runnable; the engine reads the planes it wrote')
   }
 };
 

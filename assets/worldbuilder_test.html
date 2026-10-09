@@ -1,0 +1,225 @@
+<!doctype html>
+<!-- Headless harness for the WORLDBUILDER tools of the World map page
+     (docs/PLAN_worldbuilder.md package K1). Loaded by
+     scripts/check_worldbuilder.sh through Chrome; prints PASS/FAIL lines into
+     #out for --dump-dom. Needs no built exe.
+
+     It mounts the Environment tab the way assets/environment_test.html does
+     (the module directly, the tuner's hooks faked), writes a synthetic v2 map
+     to assets/worldmap/_k1test/ through the tuner's routes (the script deletes
+     the folder), and drives the K1 tools: the tool registry, the brush mask,
+     the Range tool (draw, live preview, bake in the worker, undo / redo,
+     rebake, unbake), the Generate panel (a template preview, a template into
+     the Area committed and undone, a landform discarded), stream-power erosion
+     of the Area, the slope / flow overlays and the Measure tool. -->
+<meta charset="utf-8">
+<title>worldbuilder harness</title>
+<body style="background:#111;color:#ddd;font:12px monospace">
+<div id="host" style="width:1400px;height:800px;display:flex"></div>
+<pre id="out">running</pre>
+<script src="worldview.js"></script>
+<script type="module">
+var log = [], fail = 0;
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; console.log('K1TEST ' + log[log.length - 1]); document.getElementById('out').textContent = 'running\n' + log.join('\n'); }
+function done(){ document.getElementById('out').textContent = log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK'); document.title = fail ? 'FAIL' : 'OK'; }
+// THE POLL IS A FETCH: --virtual-time-budget fast-forwards timers but pauses on network
+async function waitFor(pred, ms){
+  var t0 = performance.now();
+  while (performance.now() - t0 < (ms || 60000)) { try { if (pred()) return true; } catch (e) {} await fetch('/api/status').catch(function(){}); }
+  return false;
+}
+async function settle(p) { var d = false, v, err = null; p.then(function (x) { v = x; d = true; }, function (e) { err = e; d = true; }); await waitFor(function () { return d; }, 240000); if (err) throw err; return v; }
+
+(async function(){
+  try {
+    var toasts = [];
+    var host = document.getElementById('host');
+    host.id = 'view-environment'; host.className = 'view active';
+    var files = await (await fetch('/api/files', {cache: 'no-store'})).json();
+    var mats = JSON.parse(files.materials).materials, tune = null;
+    try { tune = JSON.parse(files.tuning); } catch (e) {}
+    var hooks = {
+      el: function (tag, attrs) {
+        var e = document.createElement(tag);
+        for (var k in (attrs || {})) {
+          if (k === 'class') e.className = attrs[k];
+          else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), attrs[k]);
+          else if (attrs[k] !== false && attrs[k] != null) e.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
+        }
+        for (var i = 2; i < arguments.length; i++) {
+          var c = arguments[i];
+          if (c == null) continue;
+          if (Array.isArray(c)) { c.forEach(function (x) { if (x != null) e.append(x.nodeType ? x : document.createTextNode(String(x))); }); continue; }
+          e.append(c.nodeType ? c : document.createTextNode(String(c)));
+        }
+        return e;
+      },
+      toast: function (m, bad) { toasts.push((bad ? 'ERR ' : '') + m); console.log('K1TOAST ' + (bad ? 'ERR ' : '') + m); },
+      materials: function () { return mats; },
+      onDirty: function () {},
+      section: host,
+      tuning: function () { return {schema: null, tune: tune, tuneBase: tune, tuneRow: null, paramGroup: null, touchTune: function(){}}; },
+      voxelsPerMetre: function () { return 10; },
+      saveTuning: function () {},
+      isVisible: function () { return true; },
+    };
+    var E = await import('./editor/environment.js');
+    E.attach(hooks);
+    E.activate();
+    E._open('map');
+    var M = E._modules.WorldMap;
+    var MT = await import('./editor/maptiles.js');
+    var TG = await import('./editor/terraingen.js');
+
+    // ---- the fixture: 2 x 2 height tiles (513 posts = 3.3 km; the third column and row stay the default), sea in the west, a plain and a hill in the east
+    var FIX = '_k1test';
+    var fixJson = {
+      version: 2, name: FIX, extent: {min: [0, 0], size: [32768, 32768]}, siteCellLog2: 10,
+      planes: {height: {log2: 6, tile: 256, default: -300}, biome: {log2: 8, tile: 256, default: 'meadow'}},
+      seaLevelY: 112, edgeFadeVox: 2048, warpAmpVox: 48, biomes: ['meadow', 'ocean', 'alpine'],
+      terrain: {refVoxelsPerMetre: 10, rockSlope: 640}, sites: [{id: 'spawn', kind: 'spawn', at: [24000, 16000]}]
+    };
+    var api = function (path, body) { return fetch(path, body === undefined ? {cache: 'no-store'} : {method: 'POST', body: body}).then(function (r) { return r.json(); }); };
+    var tileUrl = function (plane, tx, tz) { return '/api/worldmap/tile?name=' + FIX + '&plane=' + plane + '&tx=' + tx + '&tz=' + tz; };
+    say(!!(await api('/api/worldmap?name=' + FIX, JSON.stringify(fixJson, null, 2))).ok, 'the fixture map.json is written');
+    var FH = MT.makePlane('height', fixJson);
+    var groundAt = function (x, z) { return x < 8000 ? -300 + x / 8000 * 300 : 112 + 300 + (x - 8000) / 25000 * 400 + 3000 * Math.max(0, 1 - Math.hypot(x - 26000, z - 8000) / 5000); };
+    for (var tz = 0; tz < 2; tz++) for (var tx = 0; tx < 2; tx++) {
+      var t = MT.newTile(FH);
+      for (var j = 0; j < 256; j++) for (var i = 0; i < 256; i++) t[j * 256 + i] = Math.round(groundAt((tx * 256 + i) * 64, (tz * 256 + j) * 64));
+      await api(tileUrl('height', tx, tz), MT.encodeTile(FH, tx, tz, t));
+    }
+    await M._load(FIX);
+    var ok = await waitFor(function(){ return !!M._map() && M._map().name === FIX && M._loadsIdle() && M._map().H.tiles.size === 4; }, 30000);
+    var mp = M._map(), HP = mp.H;
+    say(ok, 'the fixture loaded: ' + HP.posts[0] + '² posts, ' + HP.tiles.size + ' tiles in memory');
+    var cv = document.querySelector('canvas.mapcanvas');
+    cv.setPointerCapture = function () {};
+    function ptr(type, fx, fy, extra) {
+      var r = cv.getBoundingClientRect();
+      var o = {clientX: r.left + cv.clientLeft + cv.clientWidth * fx, clientY: r.top + cv.clientTop + cv.clientHeight * fy,
+               button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
+      for (var k in (extra || {})) o[k] = extra[k];
+      cv.dispatchEvent(new PointerEvent(type, o));
+    }
+    function frac(wx, wz) { var v = M._view(); return [0.5 + (wx - v.cx) * v.scale / cv.clientWidth, 0.5 + (wz - v.cz) * v.scale / cv.clientHeight]; }
+    function at(type, wx, wz, extra) { var f = frac(wx, wz); ptr(type, f[0], f[1], extra); }
+    function click(wx, wz, extra) { at('pointerdown', wx, wz, extra); at('pointerup', wx, wz, extra); }
+    var vw = M._view(); vw.cx = 16352; vw.cz = 16352; vw.scale = Math.min(cv.clientWidth, cv.clientHeight) / 34000;
+    var allTiles = function () { return [0, 1, 65536, 65537].map(function (k) { var t = HP.tiles.get(k); return t ? Array.from(t) : null; }); };
+    var sameTiles = function (a, b) { return a.every(function (t, q) { return t === null ? b[q] === null : b[q] !== null && t.every(function (v, i) { return v === b[q][i]; }); }); };
+    var undoBtn = [].slice.call(document.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0];
+    var redoBtn = [].slice.call(document.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Redo'; })[0];
+
+    // ---- 1. the registry -----------------------------------------------------------------
+    var REG = M._reg(), keys = REG.keys();
+    var want = ['site', 'height', 'shape', 'line', 'range', 'area', 'biome', 'sculpt', 'road', 'region', 'marker', 'locale', 'structure', 'waylink',
+                'pad', 'spawn', 'stamp', 'water', 'tree', 'clearing', 'soften', 'measure'];
+    say(want.every(function (k) { return keys.indexOf(k) >= 0; }) && keys.length === want.length, 'the registry holds every tool (' + keys.join(' ') + ')');
+    var btns = [].slice.call(document.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(['Range', 'Measure', 'Height', 'Line'].every(function (n) { return btns.indexOf(n) >= 0; }), 'the toolbar is built from it (Range, Measure among ' + btns.length + ' buttons)');
+    var threw = '';
+    try { M.registerTool({key: 'height', label: 'x'}); } catch (e) { threw = e.message; }
+    say(/twice/.test(threw), 'a second tool with the same key is refused: ' + threw);
+    M._tool('range');
+    say(/Range/.test(document.querySelector('.maptoolguide').textContent), 'the tool guide shows the Range tool’s own entry');
+
+    // ---- 2. the brush MASK: land only ----------------------------------------------------
+    M._tool('height');
+    var Br = M._brush();
+    Br.mode = 'raise'; Br.radiusM = 300; Br.strength = 80; Br.mask = {kind: 'land', lo: 0, hi: 600, soft: 1};
+    var seaPost = MT.sample(HP, 115, 200), landPost = MT.sample(HP, 135, 200);
+    at('pointerdown', 7900, 12800); at('pointerup', 7900, 12800);
+    say(MT.sample(HP, 115, 200) === seaPost && MT.sample(HP, 135, 200) > landPost, 'a raise dab with mask "land only" across the coast lifts the land (' + landPost + ' -> ' + MT.sample(HP, 135, 200).toFixed(1) + ') and leaves the sea post alone');
+    undoBtn.click();
+    Br.mask = {kind: 'none', lo: 0, hi: 600, soft: 10};
+
+    // ---- 3. the RANGE tool ------------------------------------------------------------------
+    var RL = M._rl();
+    M._tool('range');
+    var pre = allTiles(), d0 = M._undoDepth(), nR = (mp.json.ranges || []).length;
+    click(12000, 20000); click(18000, 17000); click(26000, 20000);
+    cv.dispatchEvent(new MouseEvent('dblclick', {bubbles: true}));
+    var RR = (M._map().json.ranges || [])[nR];
+    say(!!RR && RR.points.length === 3 && !RL.st.drawing && RL.st.sel === RR.id && !RR.baked, 'Range: three clicks and a double-click drew ' + JSON.stringify(RR && {id: RR.id, n: RR.points.length, profile: RR.profile}));
+    RR.points.forEach(function (p) { p[2] = 112 + 9000; p[3] = 3000; });   // crest 900 m asl, 300 m half-width
+    RL.runPreview();
+    ok = await waitFor(function () { return M._preview() && M._preview().owner === 'range'; }, 120000);
+    say(ok, 'the live preview ran in the worker and is drawn over the map (' + (M._preview() ? M._preview().label : 'none') + ')');
+    var dB = M._undoDepth();
+    await settle(RL.bake(RR));
+    // the highest post within 300 m of the middle knot (a knot may sit in a col: the peaks slider)
+    var crest = -1e9;
+    for (var cz = 17000 - 3000; cz <= 17000 + 3000; cz += 64) for (var cx = 18000 - 3000; cx <= 18000 + 3000; cx += 64) crest = Math.max(crest, MT.heightAt(HP, cx, cz));
+    say(RR.baked && crest > 112 + 6000 && M._undoDepth() === dB + 1 && !M._job(), 'Bake: the crest stands ' + ((crest - 112) / 10).toFixed(0) + ' m above sea by the middle knot (knot 900 m), one undo step, the job bar is idle');
+    var baked = allTiles();
+
+    undoBtn.click();
+    var RR2 = (M._map().json.ranges || [])[nR];
+    say(sameTiles(pre, allTiles()) && RR2 && !RR2.baked, 'Undo of the bake is byte-exact and the range is unbaked again');
+    redoBtn.click();
+    say(sameTiles(baked, allTiles()) && (M._map().json.ranges || [])[nR].baked, 'Redo brings the bake back byte-exact');
+    var RR3 = (M._map().json.ranges || [])[nR];
+    RR3.seed = 7;
+    await settle(RL.bake(RR3));
+    say(!sameTiles(baked, allTiles()) && M._undoDepth() === dB + 2, 'Rebake with another seed replaces the bake (one more undo step)');
+    RL.unbake(RR3);
+    var back = allTiles(), maxd = 0;
+    back.forEach(function (t, q2) { if (t && pre[q2]) for (var i = 0; i < t.length; i++) maxd = Math.max(maxd, Math.abs(t[i] - pre[q2][i])); });
+    say(maxd < 1e-3 && !RR3.baked, 'Unbake takes the range back out (max post difference ' + maxd.toFixed(4) + ')');
+
+    // ---- 4. GENERATE ------------------------------------------------------------------------------
+    var GL = M._gl();
+    M._area(null);
+    GL.st.template = 'island'; GL.st.seed = 3;
+    await settle(GL.template(true));
+    ok = await waitFor(function () { return M._preview() && M._preview().owner === 'gen'; }, 120000);
+    say(ok, 'a template PREVIEW over the whole map: ' + (M._preview() ? M._preview().label : 'none'));
+    M._area([4000, 4000, 14000, 12000]);
+    var preG = allTiles(), dG = M._undoDepth();
+    await settle(GL.template(false));
+    var pend = M._erosion().pending;
+    say(!!pend && /template/.test(pend.label) && !!M._map().json.gen && M._map().json.gen.template === 'island', 'Generate into the Area: the result is PENDING in the plane and map.json gen records it (' + JSON.stringify(M._map().json.gen) + ')');
+    M._commitErosion();
+    say(M._undoDepth() === dG + 1 && !M._erosion().pending, 'Commit makes it one undo step');
+    undoBtn.click();
+    say(sameTiles(preG, allTiles()) && !M._map().json.gen, 'Undo restores the land byte-exact and drops the gen record');
+    GL.st.kind = 'canyon';
+    var preC = allTiles();
+    M._area([16000, 20000, 30000, 26000]);
+    await settle(GL.landform(false));
+    var cut = MT.heightAt(HP, 23000, 23000);
+    say(!!M._erosion().pending && !sameTiles(preC, allTiles()), 'a canyon landform carved into the plane as a pending result (' + ((cut - 112) / 10).toFixed(0) + ' m asl at the Area centre)');
+    M._discardErosion();
+    say(sameTiles(preC, allTiles()) && !M._erosion().pending, 'Discard puts the land back byte-exact');
+
+    // ---- 5. stream-power erosion -------------------------------------------------------------------
+    var ER = M._erosion();
+    ER.method = 'land'; ER.strength = 70;
+    M._area([16000, 2000, 32000, 16000]);
+    var preE = allTiles(), dE = M._undoDepth();
+    await settle(M._runErosion());
+    say(!!ER.pending && !sameTiles(preE, allTiles()), 'stream-power (landscape) erosion of the Area previews in the plane');
+    M._commitErosion();
+    undoBtn.click();
+    say(sameTiles(preE, allTiles()) && M._undoDepth() === dE, 'Commit + Undo: byte-exact, one step');
+
+    // ---- 6. overlays + Measure ------------------------------------------------------------------------
+    var D = M._disp(), OL = M._ol();
+    D.overlay = 'slope'; M._paint();
+    say(true, 'the slope-band overlay paints');
+    D.overlay = 'flow'; M._paint();
+    ok = await waitFor(function () { M._paint(); return !!OL.st.flow; }, 120000);
+    say(ok && OL.st.flow.A.length > 1000, 'the flow overlay computed drainage in the worker (' + (OL.st.flow ? OL.st.flow.w + '×' + OL.st.flow.hh : '?') + ' cells)');
+    D.overlay = 'none'; D.grid = true; M._paint(); D.grid = false;
+    M._tool('measure');
+    click(10000, 16000); click(30000, 8000);
+    var S = OL.stats(OL.sampleRoute(64));
+    say(!!S && Math.abs(S.L - Math.hypot(20000, 8000)) < 1 && S.up > 0, 'Measure: ' + (S ? (S.L / 10).toFixed(0) + ' m, climb ' + (S.up / 10).toFixed(0) + ' m, max grade ' + S.maxG.toFixed(0) + ' %' : 'no route'));
+    say(!toasts.some(function (t) { return /^ERR/.test(t); }), 'no error toasts' + (toasts.length ? ' (' + toasts.join(' | ').slice(0, 300) + ')' : ''));
+  } catch (e) {
+    say(false, 'threw: ' + (e && e.stack || e));
+  }
+  done();
+})();
+</script>

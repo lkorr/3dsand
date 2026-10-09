@@ -244,6 +244,36 @@ function discRect(P, wx, wz, r, centred) {
   return [Math.floor((wx - r - P.min[0]) / P.sp - o), Math.floor((wz - r - P.min[1]) / P.sp - o),
           Math.ceil((wx + r - P.min[0]) / P.sp - o), Math.ceil((wz + r - P.min[1]) / P.sp - o)];
 }
+/* ---- brush MASKS (docs/PLAN_worldbuilder.md K1 item 5): every height brush mode
+ * honours one. m = {kind, lo, hi, soft, seaY}: 'land' = above the sea, 'sea' =
+ * below it, 'height' = a band lo..hi (absolute voxels), 'slope' = a band lo..hi
+ * (DEGREES, the post-to-post gradient); `soft` blends each edge over that
+ * much (voxels / degrees). Weights come from the posts BEFORE the dab. */
+export const MASK_KINDS = ['none', 'land', 'sea', 'height', 'slope'];
+const sstep = (a, b, x) => { if (b <= a) return x >= b ? 1 : 0; const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+/** Per-post mask weights 0..1 over the window [i0, i0+w) x [j0, j0+h), or null (no mask). */
+export function maskWeights(P, i0, j0, w, h, m) {
+  if (!m || !m.kind || m.kind === 'none') return null;
+  const W = w + 2, g = readWindow(P, i0 - 1, j0 - 1, W, h + 2), out = new Float32Array(w * h);
+  const soft = Math.max(1e-6, +m.soft || 0), sea = +m.seaY || 0;
+  for (let j = 0; j < h; j++)
+    for (let i = 0; i < w; i++) {
+      const o = (j + 1) * W + i + 1, v = g[o];
+      let k = 1;
+      if (m.kind === 'land') k = sstep(sea - soft, sea + soft, v);
+      else if (m.kind === 'sea') k = 1 - sstep(sea - soft, sea + soft, v);
+      else {
+        let x = v;
+        if (m.kind === 'slope') {
+          const gx = (g[o + 1] - g[o - 1]) / (2 * P.sp), gz = (g[o + W] - g[o - W]) / (2 * P.sp);
+          x = Math.atan(Math.sqrt(gx * gx + gz * gz)) * 180 / Math.PI;
+        }
+        k = sstep(m.lo - soft, m.lo + soft, x) * (1 - sstep(m.hi - soft, m.hi + soft, x));
+      }
+      out[j * w + i] = k;
+    }
+  return out;
+}
 /** The height brush modes (E1: raise / lower / set / smooth; E2 the rest).
  *  flatten is set with a target the page samples where the stroke starts. */
 export const HEIGHT_MODES = ['raise', 'lower', 'smooth', 'flatten', 'set', 'terrace', 'noise', 'erode'];
@@ -257,7 +287,8 @@ export const ERODE_BRUSH_MAX_POSTS = 160000;
  *       step (vox), sharp (0..1), datum (vox): terrace bands from the datum,
  *       amp (vox), size (vox), seed, style ('fbm' | 'ridged'): noise,
  *       erosion (erosion.js options): erode,
- *       stroke: an object the caller keeps for the whole stroke (noise reads it)}.
+ *       stroke: an object the caller keeps for the whole stroke (noise reads it),
+ *       mask: a brush mask (maskWeights) -- the dab's weight times the mask's}.
  *  The brush is never narrower than one post spacing: a 1 m brush on 6.4 m
  *  posts moves the nearest post. NOISE is stroke-stable: each post becomes
  *  (its value before the stroke) + amp * noise * (the largest falloff weight
@@ -277,6 +308,11 @@ export function heightDab(P, wx, wz, o, before) {
       if (f > 0) { wt[j * w + i] = f; any = true; }
     }
   if (!any) return {changed: 0, skipped: 0};
+  if (o.mask) {
+    const mw = maskWeights(P, i0, j0, w, h, o.mask);
+    if (mw) { any = false; for (let n = 0; n < wt.length; n++) { wt[n] *= mw[n]; if (wt[n] > 0) any = true; } }
+    if (!any) return {changed: 0, skipped: 0};
+  }
   const k = clamp(o.k == null ? 0.5 : o.k, 0, 1);
   let f;
   if (o.mode === 'raise') f = (n, cur) => (wt[n] ? cur + o.amount * wt[n] : null);
@@ -331,9 +367,14 @@ export function heightDab(P, wx, wz, o, before) {
 }
 /** Write a TOOL's window ({i0, j0, w, h, f} from heightshapes.js: a line
  *  bake, a shape stamp) into the plane; `before` collects undo. */
-export function applyOp(P, op, before) {
+export function applyOp(P, op, before, mask = null) {
   if (!op) return {changed: 0, skipped: 0};
-  return writeWindow(P, op.i0, op.j0, op.w, op.h, op.f, before);
+  const mw = mask ? maskWeights(P, op.i0, op.j0, op.w, op.h, mask) : null;
+  if (!mw) return writeWindow(P, op.i0, op.j0, op.w, op.h, op.f, before);
+  return writeWindow(P, op.i0, op.j0, op.w, op.h, (n, cur) => {
+    const nv = op.f(n, cur);
+    return nv == null || !(mw[n] > 0) ? null : cur + (nv - cur) * mw[n];
+  }, before);
 }
 /** Write a whole window of new heights (an erosion result, a PNG import):
  *  `vals` is w x h, NaN = leave the post alone. */

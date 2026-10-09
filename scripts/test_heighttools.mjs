@@ -84,6 +84,40 @@ for (const m of T.HEIGHT_MODES) {
   ok(big.tooBig && big.changed === 0, 'an erode dab over ERODE_BRUSH_MAX_POSTS is refused (tooBig)');
 }
 
+// ---- brush MASKS (PLAN_worldbuilder K1): land / sea / height band / slope band ----
+{
+  // a coast: posts west of column 384 under the sea (y 0), east of it land rising 4 vox a post
+  const coast = () => {
+    const P = fresh();
+    T.writeWindow(P, 256, 256, 256, 256, (n) => { const i = n % 256; return i < 128 ? 0 : 112 + (i - 128) * 4; }, null);
+    P.dirty.clear();
+    return P;
+  };
+  const sea = 112, wx = post(384), wz = post(384);
+  const dab = (P, mask) => T.heightDab(P, wx, wz, {mode: 'raise', radius: 3000, amount: 100, mask}, null);
+  let P = coast();
+  dab(P, {kind: 'land', seaY: sea, soft: 1});
+  ok(T.heightAt(P, post(370), wz) === 0 && T.heightAt(P, post(400), wz) > 112 + 16 * 4 + 50,
+     `mask land: the sea post stays (${T.heightAt(P, post(370), wz)}), the land post rises (${T.heightAt(P, post(400), wz).toFixed(1)})`);
+  P = coast();
+  dab(P, {kind: 'sea', seaY: sea, soft: 1});
+  ok(T.heightAt(P, post(370), wz) > 50 && Math.abs(T.heightAt(P, post(400), wz) - (112 + 16 * 4)) < 1e-3, 'mask sea: only the sea floor rises');
+  P = coast();
+  dab(P, {kind: 'height', lo: 112 + 20, hi: 112 + 60, soft: 1});
+  ok(Math.abs(T.heightAt(P, post(400), wz) - (112 + 64)) < 1e-3 && T.heightAt(P, post(392), wz) > 112 + 32 + 50,
+     'mask height band: a post in the band rises, one above it does not');
+  const S = fresh();   // two slopes: gentle west of 384, a 45-degree face east of it
+  T.writeWindow(S, 256, 256, 256, 256, (n) => { const i = n % 256; return i < 128 ? 200 + i * 2 : 200 + 256 + (i - 128) * 64; }, null);
+  const g0 = T.heightAt(S, post(370), wz), s0 = T.heightAt(S, post(400), wz);
+  T.heightDab(S, wx, wz, {mode: 'raise', radius: 3000, amount: 100, mask: {kind: 'slope', lo: 30, hi: 60, soft: 2}}, null);
+  ok(T.heightAt(S, post(370), wz) === g0 && T.heightAt(S, post(400), wz) > s0 + 50, 'mask slope band 30..60 deg: the 45-degree face rises, the gentle slope does not');
+  const mw = T.maskWeights(S, 380, 380, 8, 1, {kind: 'none'});
+  ok(mw === null && T.MASK_KINDS.join() === 'none,land,sea,height,slope', 'no mask = null weights; kinds: ' + T.MASK_KINDS.join(', '));
+  const Q = coast(), bq = new Map();
+  T.applyOp(Q, HS.shapeStamp(Q, {kind: 'peak', x: wx, z: wz, radius: 3000, height: 500}), bq, {kind: 'land', seaY: sea, soft: 1});
+  ok(T.heightAt(Q, post(370), wz) === 0 && T.heightAt(Q, post(400), wz) > 112 + 64 + 100, 'applyOp honours a mask too (a peak stamped on the coast stays out of the sea)');
+}
+
 // ---- ridge / valley line bake ----
 {
   const P = fresh();
