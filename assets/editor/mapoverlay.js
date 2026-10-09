@@ -48,12 +48,12 @@ export function createOverlayLayer(C) {
   }
   /* ---- flow + lakes on a proxy of the whole plane ---- */
   function wantFlow() { return disp.overlay === 'flow' || disp.overlay === 'lakes'; }
+  // one pending timer and one job in flight at most: a repaint never restarts them
   function scheduleFlow() {
-    clearTimeout(st.flowTimer);
-    if (!wantFlow() || !C.map()) return;
+    if (!wantFlow() || !C.map() || st.flowTimer || st.flowJob) return;
     const P = C.map().H;
     if (st.flow && st.flow.gen === P.gen) return;
-    st.flowTimer = setTimeout(runFlow, st.flow ? 1200 : 50);
+    st.flowTimer = setTimeout(() => { st.flowTimer = 0; runFlow(); }, st.flow ? 1200 : 50);
   }
   function runFlow() {
     const m = C.map();
@@ -63,14 +63,16 @@ export function createOverlayLayer(C) {
     while ((P.posts[0] / f) * (P.posts[1] / f) > 260000) f *= 2;
     const g = C.coarseGrid(null, f);
     if (!g) return;
-    const run = C.runJob({job: 'flow', grid: {...g.grid, h: Float32Array.from(g.grid.h)}, seaY: C.seaY()}, {quiet: true, key: 'flow'});
+    const run = C.runJob({job: 'flow', grid: {...g.grid, h: Float32Array.from(g.grid.h)}, seaY: C.seaY()}, {quiet: true, key: 'flow', onCancel: () => { st.flowJob = null; }});
+    st.flowJob = run;
     run.then(res => {
+      st.flowJob = null;
       if (run.cancelled || C.map() !== m) return;
       st.flow = {gen, ...g.grid, A: res.A, depth: res.depth, imgFlow: null, imgLake: null};
       C.paint();
       C.status(`flow overlay: ${g.grid.w}×${g.grid.hh} cells of ${(g.grid.cell / v()).toFixed(1)} m` + (P.gen !== gen ? ' (the plane changed since: recomputing)' : ''));
       if (P.gen !== gen) scheduleFlow();
-    }).catch(e => { if (!run.cancelled) C.status('flow overlay: ' + e.message); });
+    }).catch(e => { st.flowJob = null; if (!run.cancelled) C.status('flow overlay: ' + e.message); });
   }
   function flowImage(kind) {
     const F = st.flow;
@@ -347,7 +349,7 @@ export function createOverlayLayer(C) {
   disp.slopeBands = slopeBands();
   return {
     st, displayControls, slopeBands, sampleRoute, stats, syncMeasure,
-    reset() { st.flow = null; st.mini = null; M.pts = []; M.drag = -1; disp.slopeBands = slopeBands(); syncMeasure(); },
+    reset() { st.flow = null; st.mini = null; clearTimeout(st.flowTimer); st.flowTimer = 0; if (st.flowJob) st.flowJob.cancel(); st.flowJob = null; M.pts = []; M.drag = -1; disp.slopeBands = slopeBands(); syncMeasure(); },
     planeChanged() { st.mini = st.mini ? {...st.mini, at: 0} : null; },
   };
 }

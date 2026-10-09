@@ -584,69 +584,6 @@ export function diffuse(z, w, hh, mask, k, passes = 1) {
   }
   return z;
 }
-/** The STEADY STATE of uplift vs stream power (Cordonnier et al. 2016's
- *  fixed point): with dh/dt = U - K A^m S = 0 every cell sits exactly
- *  U dist / (K A^m) above its receiver, so given a drainage network the whole
- *  surface follows in one pass up the stack. The network depends on the
- *  surface, so iterate: route D8 on the (epsilon-filled) surface, rebuild,
- *  relax toward it; a few tens of rounds and the divides settle into a
- *  dendritic net whose valleys reach the crest. Base-level cells (`fixed`,
- *  the grid edge, cells below seaY) keep their height.
- *  h is modified IN PLACE. opts = {U (array), K (number | array), m, fixed,
- *  seaY, iters, relax (0..1, the step toward the new surface), talusDeg (cap
- *  the slope to a receiver at this angle; 0 = none), progress}. */
-export function steadyState(h, w, hh, dx, opts = {}) {
-  const N = w * hh, m = opts.m == null ? 0.5 : +opts.m;
-  const iters = Math.max(1, opts.iters | 0 || 20), relax = opts.relax == null ? 0.5 : +opts.relax;
-  const fixed = opts.fixed || null;
-  const mask = outletMask(h, w, hh, {seaY: opts.seaY, outlets: fixed, edges: opts.edges});
-  const Kc = typeof opts.K === 'number' || opts.K == null ? (opts.K == null ? 1 : opts.K) : null;
-  const cap = opts.talusDeg ? Math.tan(opts.talusDeg * Math.PI / 180) : Infinity;
-  const pow = m === 0.5 ? Math.sqrt : (a => Math.pow(a, m));
-  const hillA = opts.hillA || 0, hillS = Math.tan((opts.hillDeg || 33) * Math.PI / 180), hillU = opts.hillU || 1e9;
-  const z = h, base = Float64Array.from(h), nz = new Float64Array(N);
-  let A = null, rcv = null, stack = null, U = Float64Array.from(opts.U);
-  for (let it = 0; it < iters; it++) {
-    const f = priorityFlood(z, w, hh, {mask, epsilon: 1e-3});
-    let r;
-    ({rcv, dist: r} = d8(f, w, hh, dx, mask, opts.jitter || 0, opts.seed || 0));
-    stack = stackOrder(rcv);
-    A = accumulate(rcv, stack, opts.weight || null);
-    for (let k = 0; k < N; k++) {
-      const n = stack[k], q = rcv[n];
-      if (q === n || mask[n]) { nz[n] = base[n]; continue; }
-      const K = Kc != null ? Kc : opts.K[n];
-      let rise = U[n] * r[n] / (K * pow(A[n]));
-      // THRESHOLD HILLSLOPES: above the channel heads (A < hillA) the ground is
-      // a planar slope at hillSlope (times the local uplift share), not a channel
-      if (hillA > 0 && A[n] < hillA) rise = Math.min(rise, hillS * r[n] * Math.min(1, U[n] * hillU));
-      if (rise > cap * r[n]) rise = cap * r[n];
-      nz[n] = nz[q] + rise;
-    }
-    // CALIBRATION (opts.targetMax): rescale the uplift so the highest relief
-    // is the target -- the solution is linear in U while no slope rule binds,
-    // so the hillslope / talus angles below are real angles, not arbitrary units
-    if (opts.targetMax > 0) {
-      let mx = 0;
-      for (let n = 0; n < N; n++) if (!mask[n] && nz[n] - base[n] > mx) mx = nz[n] - base[n];
-      if (mx > 1e-6) {
-        const sc = opts.targetMax / mx;
-        for (let n = 0; n < N; n++) if (!mask[n]) nz[n] = base[n] + (nz[n] - base[n]) * sc;
-        U = U.map ? U.map(v => v * sc) : U;
-      }
-    }
-    // hillslope DIFFUSION (fading out over the run): it smooths away the
-    // smallest valleys, which sets the drainage spacing and makes the flow
-    // gather into fewer, bigger, branching valleys
-    const kd = (opts.diffuse || 0) * (1 - it / iters);
-    if (kd > 0) diffuse(nz, w, hh, mask, kd, opts.diffusePasses || 2);
-    const a = it === iters - 1 ? 1 : relax;
-    for (let n = 0; n < N; n++) z[n] = z[n] + (nz[n] - z[n]) * a;
-    if (opts.progress) opts.progress((it + 1) / iters);
-  }
-  return {h: z, A, rcv, stack};
-}
-
 /* ---- the coarse proxy --------------------------------------------------------------------- */
 /** Box-average by an integer factor f: ceil(w/f) x ceil(hh/f). */
 export function downsample(h, w, hh, f) {
