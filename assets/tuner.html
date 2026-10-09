@@ -5208,10 +5208,30 @@ function wvSig(){
 function wvFrame(now){
   wvRaf = requestAnimationFrame(wvFrame);
   if(!wvOn || !wv) return;
+  // A PICTURE NOBODY CAN SEE COSTS NOTHING EITHER. The view sits under the
+  // World map page's map, usually scrolled below it, and keeps its loop while
+  // another tab is up: off screen (or the tab / window hidden) it neither
+  // streams nor renders, so the map above it has the main thread to itself.
+  // Coming back draws at once (the signature is cleared).
+  if(!wvFrame.io && window.IntersectionObserver){
+    wvFrame.inView = true;
+    wvFrame.io = new IntersectionObserver(function(es){ wvFrame.inView = es[es.length-1].isIntersecting; });
+    wvFrame.io.observe($('#wvCanvas'));
+  }
+  if(document.hidden || wvFrame.inView === false){ wvLast = now; wvFrame.sig = ''; return; }
   var dt = Math.min(0.1, (now - wvLast) / 1000 || 0);
   wvLast = now;
   wv.step(dt);
-  wv.update();
+  // The streamer's update rebuilds the whole LOD octree: run it when the
+  // camera or the picture moved, while anything is in flight or queued, and
+  // once a second otherwise (a failed region's retry); a still, fully
+  // streamed view skips it.
+  var sigU = wvSig();
+  if(sigU !== wvFrame.sigU || wv.inflight || (wv.queue && wv.queue.length) || (wv.stats && wv.stats.meshing) ||
+     now - (wvFrame.tU || 0) > 1000){
+    wv.update();
+    wvFrame.sigU = sigU; wvFrame.tU = now;
+  }
   var sig = wvSig();
   if(sig !== wvFrame.sig){
     wvFrame.sig = sig;
@@ -8767,8 +8787,8 @@ const ARCH_NODES={
     rule:2,
     wip:'Flow is only LOOKED (no CA mass transport, by design). Weirs and fords read as grey patches; no foam on waterfalls yet.'},
   worldBuilder:{label:'Worldbuilder tools (World map page)',tag:'cpu',
-    desc:'The World map page as a worldbuilding suite (2026-10-09, docs/PLAN_worldbuilder.md): a tool registry (maptools.js registerTool); the RANGE tool (spline crest &rarr; uplift field &rarr; implicit stream-power landscape evolution &rarr; dendritic ranges); the Generate panel (continent / island / archipelago / peninsula / highlands op lists + crater, volcano, canyon, glacial valley, fjord, mesa field, dunes); stream-power + droplet + thermal erosion; brush masks; Measure; slope / flow / lake overlays; RIVER (draw, derive from D8 flow, meander, a live JS port of the engine bake, riverbake.js) and LAKE (Priority-Flood spill level) tools; roads that bend; CLIMATE (lapse, wind-march rain shadow, wetness &rarr; auto-biomes with hand-painted locks) and COAST (wobble / beach / cliff / smooth). The default map Tirnhallow is built by scripts/design_world.mjs from the same modules (docs/WORLD_tirnhallow.md).',
-    files:['assets/editor/maptools.js','assets/editor/spline.js','assets/editor/hydrology.js','assets/editor/terraingen.js','assets/editor/terrainjobs.js','assets/editor/maprange.js','assets/editor/mapwater.js','assets/editor/riverbake.js','assets/editor/climate.js','assets/editor/mapclimate.js','assets/editor/mapcoast.js','scripts/design_world.mjs','scripts/check_worldbuilder.sh'],
+    desc:'The World map page as a worldbuilding suite (2026-10-09, docs/PLAN_worldbuilder.md): a tool registry (maptools.js registerTool); the RANGE tool (spline crest &rarr; uplift field &rarr; implicit stream-power landscape evolution &rarr; dendritic ranges); the Generate panel (continent / island / archipelago / peninsula / highlands op lists + crater, volcano, canyon, glacial valley, fjord, mesa field, dunes); stream-power + droplet + thermal erosion; brush masks; Measure; slope / flow / lake overlays; RIVER (draw, derive from D8 flow, meander, a live JS port of the engine bake, riverbake.js) and LAKE (Priority-Flood spill level) tools; roads that bend; CLIMATE (lapse, wind-march rain shadow, wetness &rarr; auto-biomes with hand-painted locks) and COAST (wobble / beach / cliff / smooth). The default map Tirnhallow is built by scripts/design_world.mjs from the same modules (docs/WORLD_tirnhallow.md). PERFORMANCE: scripts/bench_mappage.sh (assets/mappage_bench.html, the real tuner in headless Chrome) times every paint per layer and every frame over scripted wheel zooms and pans; paint() reports layers to globalThis.__mapProf. Layers cull to the view, tile images build within a 4 ms budget while the view moves, the river bake throttles while the plane is busy.',
+    files:['assets/editor/maptools.js','assets/editor/spline.js','assets/editor/hydrology.js','assets/editor/terraingen.js','assets/editor/terrainjobs.js','assets/editor/maprange.js','assets/editor/mapwater.js','assets/editor/riverbake.js','assets/editor/climate.js','assets/editor/mapclimate.js','assets/editor/mapcoast.js','scripts/design_world.mjs','scripts/check_worldbuilder.sh','scripts/bench_mappage.sh','assets/mappage_bench.html'],
     sym:['registerTool','rangeBake','streamPower','priorityFlood','bakeRivers','climateJob'],
     tst:[],
     doc:['docs/PLAN_worldbuilder.md','docs/WORLD_brief.md','docs/WORLD_tirnhallow.md','docs/EDITOR_GUIDE.md'],
@@ -11205,6 +11225,11 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'Worldbuilder: rivers and lakes in the engine',desc:'2026-10-09, worldbuilder W1. map.json rivers[] (spline, per-knot width/depth, joins) and lakes[] (polygon + level): surface baked at load into flat reaches stepping down (weirs, waterfalls), born at rest so the sim sleeps; smooth roads (Catmull-Rom); far water via cascades + horizon. Gate rivers.'},
+    {label:'Worldbuilder: the World map page tools',desc:'2026-10-09, worldbuilder K1/E2a/E2b. Range tool (stream-power mountain ranges from a spline), Generate panel (templates + crater/volcano/canyon/fjord/mesa/dunes), stream-power erosion, masks, Measure, overlays, River tool (draw/derive/meander, live engine bake), Lake tool (spill level), roads that bend, Climate auto-biomes with locks, Coast tools, 3D go teleport.'},
+    {label:'Worldbuilder: 14 new biomes',desc:'2026-10-09, worldbuilder B1. ashlands, mesa, moor, glowfen, glacier, savanna, dunes, amberwood, eldwood, crystal_barrens, steppe, jungle, downs, karst; 41 materials (225..265), 9 tree species; climate T (deg C) / M (0..1) on every biome.'},
+    {label:'Tirnhallow: the default map redesigned',desc:'2026-10-09, worldbuilder D1. scripts/design_world.mjs builds the default map: the Greyspine (Hollowcrown 1,972 m), fjord coast, Mirrormere, 16 rivers, 43 lakes, Redreach canyon, Mount Cinder, Verdant Teeth karst, all 22 biomes, roads + 22 places. docs/WORLD_tirnhallow.md.'},
+    {label:'The World map page pans and zooms at 60 fps on the 20 km default map',desc:'2026-10-09, from the owner&rsquo;s report (zoom / pan at a few frames a second on the 2.5&times; taller map). Measured first with the new <code>scripts/bench_mappage.sh</code> (the real tuner in headless Chrome, scripted wheel zooms and pans, per-layer paint timing): paint was 65 ms at the fit view and 750&ndash;970 ms three zooms in, an edit 1.1&ndash;1.5 s. Causes: SX / SZ read the canvas&rsquo;s clientWidth for every vertex; the river fords tested every road segment against every 4-voxel river segment on every re-bake; every river, lake, road and region was drawn in full at every zoom; a zoom across a mip level or the auto contour interval rebuilt every tile in one frame. Now: paint 2&ndash;5 ms p50, &le; 12 ms p95 at every zoom, frames 16.7 ms p95; an edit about 100 ms (the river re-bake, throttled during strokes). The voxel preview under the map pauses while scrolled off screen or the tab is hidden, and skips its octree update when nothing moved.'},
     {label:'Far shadows no longer vanish past ~20-36 m; no walls in 100 m fog',desc:'2026-10-09, from F12 reports 2026-10-09_10-48-59 and 11-01-50. (1) The shading-LOD lift in <code>raymarch.wgsl</code>, meant to hide 1-voxel step-shadow speckle once a voxel is under ~2 px, lifted EVERY shadow to at least 0.7, tree shadow pools included. <code>lodShadowLift</code> now keys on the shadow’s estimated size, not the voxel’s. (2) In short-range mode coarse far cells hit at the 100 m ceiling were fogged to a low-res sky colour that differed from the screen-res cloud beside them. <code>applyAerial</code> now converges to <code>skyBackdrop</code> (shared with the sky path), and <code>cloud.wgsl</code> <code>deckSpan</code> clamps its terrain cut to the ceiling. Render-only, hash unchanged.'},
     {label:'Roads: no more 1-voxel walls and trenches at piece joints',desc:'2026-10-09, from F12 report 2026-10-08_23-42-45. The pieces of one authored straight have voxel-rounded ends, so their directions differ slightly, and <code>roadProj</code>’s per-piece end planes left a wedge no piece graded (a wall in a cut, a trench in a fill) beside one graded twice. Pieces now carry their straight\'s shared cut normal (site word 8, <code>kS_RoadCut</code>), so every column has exactly one owner. <code>roads</code> gate B2/I: default-map seam columns 2,999 to 132 against a mid-piece control of 171.'},
     {label:'A lava-coated severed head in water is quenched and steams',desc:'2026-10-09, from F12 report 2026-10-08_23-13-24. Two causes. (1) A severed head takes its BLOODLESS hair limb with it, and <code>DebrisSystem::ForEachCoatBody</code> admitted only flesh (bleedMat) and items, so the hair never met the coat passes: its lava was never rinsed, dried or rained off and stayed orange at the bottom of the basin. Every <code>dead</code>, non-follower piece now wears its coat like flesh. (2) The coat rule <code>lava + water -> stone</code> spent the coat, but the water side (<code>water + tag:hot -> steam</code>) is a grid cell a body could not touch: DESIGN.md §6 clause 2d lets a grid partner answer a coat firing with its own gas rule, one roll per world cell per tick, the gas released at the first air cell up the column and the water cleared only if still water. Gate <code>lava-quench</code>: 4587 lava-coated voxels to 6 in 30 ticks in water (dry arm keeps 70%), 62 boils.'},

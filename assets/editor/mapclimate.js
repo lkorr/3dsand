@@ -340,15 +340,19 @@ export function createClimateLayer(C) {
     }
     syncHover();
   }
+  // every paint calls this: write the DOM only when the text changes (a
+  // textContent store replaces the node even when equal, and costs a style /
+  // layout pass on the panel every frame of a pan)
+  const setHover = t => { if (els.hover.textContent !== t) els.hover.textContent = t; };
   function syncHover() {
     if (!els.hover) return;
     const hw = C.hover(), R = st.res, m = C.map();
-    if (!hw || !R || !m) { els.hover.textContent = ''; return; }
+    if (!hw || !R || !m) { setHover(''); return; }
     const P0 = m.B, i = Math.floor((hw[0] - P0.min[0]) / P0.sp), j = Math.floor((hw[1] - P0.min[1]) / P0.sp);
-    if (i < 0 || j < 0 || i >= R.w || j >= R.hh) { els.hover.textContent = ''; return; }
+    if (i < 0 || j < 0 || i >= R.w || j >= R.hh) { setHover(''); return; }
     const n = j * R.w + i, b = R.biome && R.biome[n] !== 255 ? R.table[R.biome[n]] : null;
-    els.hover.textContent = `at cursor: ${R.T[n].toFixed(1)} °C · ${R.P[n].toFixed(0)} mm · moisture ${R.M[n].toFixed(2)} · wetness ${R.W[n].toFixed(2)}` +
-      (b ? ' · predicts ' + b : '') + (mask()[j * P0.posts[0] + i] ? ' · LOCKED' : '');
+    setHover(`at cursor: ${R.T[n].toFixed(1)} °C · ${R.P[n].toFixed(0)} mm · moisture ${R.M[n].toFixed(2)} · wetness ${R.W[n].toFixed(2)}` +
+      (b ? ' · predicts ' + b : '') + (mask()[j * P0.posts[0] + i] ? ' · LOCKED' : ''));
   }
 
   /* ---- the panel ---- */

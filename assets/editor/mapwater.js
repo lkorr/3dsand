@@ -95,36 +95,80 @@ export function createWaterLayer(C) {
   // THE LIVE BAKE: every river + lake, the engine's rules on the plane's ground;
   // rebuilt when the records or the height plane change (the plane's gen counter:
   // a brush stroke under a river moves its ground).
-  let bakeC = {key: '', t: 0, out: null};
+  // A bake of the default map's 15 rivers is ~100 ms. While the plane is BUSY
+  // (a brush stroke is down -- every dab moves the plane's gen -- or tiles are
+  // streaming in, each one a new gen) and only the ground moved, the bake is
+  // redone at most every BAKE_BUSY_MS, and once more the moment the plane
+  // settles (the stroke's release / the last tile repaints): a stroke no
+  // longer pays 100 ms a frame. A change to the records re-bakes at once.
+  const BAKE_BUSY_MS = 400;
+  let bakeC = {key: '', gen: -1, t: 0, out: null};
   function bake() {
     if (!C.map()) return null;
-    const j = J(), key = JSON.stringify([j.rivers || [], j.lakes || [], j.seaLevelY, (j.roads || []).map(r => [r.points, r.smooth]), C.map().H.gen]), now = performance.now();
-    if (bakeC.out && bakeC.key === key) return bakeC.out;
+    const j = J(), gen = C.map().H.gen, now = performance.now();
+    const key = JSON.stringify([j.rivers || [], j.lakes || [], j.seaLevelY, (j.roads || []).map(r => [r.points, r.smooth])]);
+    if (bakeC.out && bakeC.key === key) {
+      if (bakeC.gen === gen) return bakeC.out;
+      if (C.planeBusy && C.planeBusy() && now - bakeC.t < BAKE_BUSY_MS) { C.schedulePaint(); return bakeC.out; }
+    }
     const out = RB.bakeAll({seaLevelY: sea(), rivers: j.rivers || [], lakes: j.lakes || []}, {ground: (x, z) => ground(x, z)});
     out.byId = new Map(out.rivers.map(b => [b.id, b]));
     out.fords = fords(out);
-    bakeC = {key, t: now, out};
+    bakeC = {key, gen, t: now, out};
     return out;
   }
+  // Every road segment against every river segment was ~40 s of a 2-minute
+  // pan / zoom bench on the default map (scripts/bench_mappage.sh): the rivers
+  // are baked every 4 voxels, so tens of thousands of segments, and a road's
+  // whole bounding box (kilometres) let most of them through. Both polylines
+  // are cut into CHUNKS of consecutive segments with a bounding box, and only
+  // overlapping chunks, then overlapping segments, reach segX. Two segments
+  // whose boxes are disjoint cannot cross, and the loops still run road ->
+  // river -> i -> k ascending, so the list is the same, in the same order.
+  const FORD_CHUNK = 32;
+  function segChunks(L) {
+    const out = [];
+    for (let s = 0; s + 1 < L.length; s += FORD_CHUNK) {
+      const e = Math.min(L.length - 1, s + FORD_CHUNK);   // segments s .. e-1
+      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+      for (let i = s; i <= e; i++) { const p = L[i]; if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0]; if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1]; }
+      out.push({s, e, x0, z0, x1, z1});
+    }
+    return out;
+  }
+  const boxesMeet = (a, b) => !(a.x1 < b.x0 || a.x0 > b.x1 || a.z1 < b.z0 || a.z0 > b.z1);
   /** Where a road's centreline crosses a baked river's: [{x, z, road, river}]. */
   function fords(B) {
     const out = [], roads = J().roads || [];
+    const riverChunks = B.rivers.map(b => segChunks(b.line));
     for (const rd of roads) {
       const P = rd.smooth === true && (rd.points || []).length >= 2 ? SPL.smoothRoadPoints(rd.points) : (rd.points || []);
       if (P.length < 2) continue;
       let rx0 = Infinity, rz0 = Infinity, rx1 = -Infinity, rz1 = -Infinity;
       for (const p of P) { rx0 = Math.min(rx0, p[0]); rx1 = Math.max(rx1, p[0]); rz0 = Math.min(rz0, p[1]); rz1 = Math.max(rz1, p[1]); }
-      for (const b of B.rivers) {
+      const roadBox = {x0: rx0, z0: rz0, x1: rx1, z1: rz1}, roadChunks = segChunks(P);
+      B.rivers.forEach((b, bi) => {
         const L = b.line;
-        for (let i = 0; i + 1 < L.length; i++) {
-          const a = L[i], c = L[i + 1];
-          if (Math.max(a[0], c[0]) < rx0 || Math.min(a[0], c[0]) > rx1 || Math.max(a[1], c[1]) < rz0 || Math.min(a[1], c[1]) > rz1) continue;
-          for (let k = 0; k + 1 < P.length; k++) {
-            const hit = segX(a, c, P[k], P[k + 1]);
-            if (hit) out.push({x: hit[0], z: hit[1], road: rd.id, river: b.id});
+        for (const rc of riverChunks[bi]) {
+          if (!boxesMeet(rc, roadBox)) continue;
+          const near = roadChunks.filter(q => boxesMeet(q, rc));
+          if (!near.length) continue;
+          for (let i = rc.s; i < rc.e; i++) {
+            const a = L[i], c = L[i + 1];
+            const sx0 = Math.min(a[0], c[0]), sx1 = Math.max(a[0], c[0]), sz0 = Math.min(a[1], c[1]), sz1 = Math.max(a[1], c[1]);
+            if (sx1 < rx0 || sx0 > rx1 || sz1 < rz0 || sz0 > rz1) continue;
+            for (const q of near) {
+              if (sx1 < q.x0 || sx0 > q.x1 || sz1 < q.z0 || sz0 > q.z1) continue;
+              for (let k = q.s; k < q.e; k++) {
+                const p0 = P[k], p1 = P[k + 1];
+                if (sx1 < Math.min(p0[0], p1[0]) || sx0 > Math.max(p0[0], p1[0]) || sz1 < Math.min(p0[1], p1[1]) || sz0 > Math.max(p0[1], p1[1])) continue;
+                const hit = segX(a, c, p0, p1);
+                if (hit) out.push({x: hit[0], z: hit[1], road: rd.id, river: b.id});
+              }
+            }
           }
         }
-      }
+      });
     }
     return out;
   }
@@ -543,11 +587,20 @@ export function createWaterLayer(C) {
   }
 
   /* ---- drawing ------------------------------------------------------------------------------ */
+  // per baked river (the bake's own objects, so a rebake drops them): its widest
+  // half-width and its longest sample step, for the view culling below
+  const bakeMeta = new WeakMap();
   function paint(g) {
     if (!C.map() || !st.show) return;
     const B = bake();
     if (!B) return;
     const SX = C.SX, SZ = C.SZ;
+    // THE VIEW in world voxels: what lies wholly outside it (plus a margin for
+    // labels, glyphs and line widths) is not drawn. Only the cost changes: the
+    // canvas would have clipped all of it.
+    const sc = C.view.scale, vw = g.canvas.width, vh = g.canvas.height;
+    const wx0 = C.view.cx - vw / 2 / sc, wx1 = C.view.cx + vw / 2 / sc, wz0 = C.view.cz - vh / 2 / sc, wz1 = C.view.cz + vh / 2 / sc;
+    const offView = (x0, z0, x1, z1, mPx) => { const m = mPx / sc; return x1 < wx0 - m || x0 > wx1 + m || z1 < wz0 - m || z0 > wz1 + m; };
     g.save();
     g.font = '11px monospace';
     // ---- lakes
@@ -555,6 +608,13 @@ export function createWaterLayer(C) {
       const ring = lakeRing(l);
       if (ring.length < 2) continue;
       const sel = st.sel && st.sel.kind === 'lake' && st.sel.id === l.id;
+      if (!sel) {
+        // the ring's box (the label hangs right of the first point: 400 px of margin covers it)
+        let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+        for (const p of ring) { if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0]; if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1]; }
+        for (const p of l.points || []) { if (p[0] < x0) x0 = p[0]; if (p[0] > x1) x1 = p[0]; if (p[1] < z0) z0 = p[1]; if (p[1] > z1) z1 = p[1]; }
+        if (offView(x0, z0, x1, z1, 400)) continue;
+      }
       g.beginPath();
       ring.forEach((p, k) => (k ? g.lineTo(SX(p[0]), SZ(p[1])) : g.moveTo(SX(p[0]), SZ(p[1]))));
       g.closePath();
@@ -590,25 +650,53 @@ export function createWaterLayer(C) {
         const a = L[Math.max(0, i - 2)], c = L[Math.min(N - 1, i + 2)], dx = c[0] - a[0], dz = c[1] - a[1], l = Math.hypot(dx, dz) || 1;
         return [-dz / l, dx / l];
       };
-      const wpx = px(2 * Math.max(...b.samples.hw));
-      if (wpx >= 1.5) {
+      let bm = bakeMeta.get(b);
+      if (!bm) {
+        let m = 0;
+        for (let i = 1; i < N; i++) m = Math.max(m, Math.hypot(L[i][0] - L[i - 1][0], L[i][1] - L[i - 1][1]));
+        bakeMeta.set(b, bm = {hwMax: Math.max(...b.samples.hw), segMax: m});
+      }
+      const hwMax = bm.hwMax;
+      const wpx = px(2 * hwMax);
+      // RUNS: the stretches of the (decimated) line near the view. A sample is
+      // near when it lies within the half-width, a tick, one decimated step and
+      // a few pixels of it, so every drawn segment that can touch the canvas
+      // is in a run and every cut between two runs is off the canvas. All the
+      // runs go into ONE path (one fill, one stroke), like the whole line did.
+      const mW = hwMax + Math.max(2, 3 / sc) + stepI * bm.segMax + 8 / sc;
+      const near = i => L[i][0] >= wx0 - mW && L[i][0] <= wx1 + mW && L[i][1] >= wz0 - mW && L[i][1] <= wz1 + mW;
+      const runs = [];
+      {
+        const Q = idx.length, vis = new Uint8Array(Q);
+        for (let q = 0; q < Q; q++) vis[q] = near(idx[q]) ? 1 : 0;
+        let cur = null;
+        for (let q = 0; q < Q; q++) {
+          if (vis[q] || (q > 0 && vis[q - 1]) || (q + 1 < Q && vis[q + 1])) { if (!cur) runs.push(cur = []); cur.push(idx[q]); }
+          else cur = null;
+        }
+      }
+      if (wpx >= 1.5 && runs.length) {
         g.beginPath();
-        idx.forEach((i, q) => { const [nx, nz] = nrm(i), h = L[i][3]; const x = SX(L[i][0] + nx * h), z = SZ(L[i][1] + nz * h); if (q) g.lineTo(x, z); else g.moveTo(x, z); });
-        for (let q = idx.length - 1; q >= 0; q--) { const i = idx[q], [nx, nz] = nrm(i), h = L[i][3]; g.lineTo(SX(L[i][0] - nx * h), SZ(L[i][1] - nz * h)); }
-        g.closePath();
+        for (const run of runs) {
+          run.forEach((i, q) => { const [nx, nz] = nrm(i), h = L[i][3]; const x = SX(L[i][0] + nx * h), z = SZ(L[i][1] + nz * h); if (q) g.lineTo(x, z); else g.moveTo(x, z); });
+          for (let q = run.length - 1; q >= 0; q--) { const i = run[q], [nx, nz] = nrm(i), h = L[i][3]; g.lineTo(SX(L[i][0] - nx * h), SZ(L[i][1] - nz * h)); }
+          g.closePath();
+        }
         g.globalAlpha = sel ? 0.85 : 0.7; g.fillStyle = '#2f7fe0'; g.fill(); g.globalAlpha = 1;
         if (sel) { g.strokeStyle = '#ffffff'; g.lineWidth = 1; g.stroke(); }
       }
       g.strokeStyle = sel ? '#ffffff' : '#7cc0ff'; g.lineWidth = wpx >= 1.5 ? 1 : 2;
       if (wpx >= 1.5) g.globalAlpha = 0.5;
       g.beginPath();
-      idx.forEach((i, q) => (q ? g.lineTo(SX(L[i][0]), SZ(L[i][1])) : g.moveTo(SX(L[i][0]), SZ(L[i][1]))));
+      for (const run of runs) run.forEach((i, q) => (q ? g.lineTo(SX(L[i][0]), SZ(L[i][1])) : g.moveTo(SX(L[i][0]), SZ(L[i][1]))));
       g.stroke(); g.globalAlpha = 1;
       // reach boundaries: a tick across the water at each step (selected, or wide enough to read)
       if (sel || wpx >= 6) {
         g.strokeStyle = 'rgba(230,245,255,0.85)'; g.lineWidth = 1;
         for (let k = 1; k < b.starts.length; k++) {
-          const i = b.starts[k], [nx, nz] = nrm(i), h = L[i][3] + Math.max(2, 3 / C.view.scale);
+          const i = b.starts[k];
+          if (!near(i)) continue;
+          const [nx, nz] = nrm(i), h = L[i][3] + Math.max(2, 3 / C.view.scale);
           g.beginPath(); g.moveTo(SX(L[i][0] + nx * h), SZ(L[i][1] + nz * h)); g.lineTo(SX(L[i][0] - nx * h), SZ(L[i][1] - nz * h)); g.stroke();
         }
       }

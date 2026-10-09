@@ -376,8 +376,11 @@ function readLit(wv, cv){
     say(peakPx[0] + peakPx[1] + peakPx[2] > seaPx[0] + seaPx[1] + seaPx[2] && seaPx[2] > seaPx[0],
         'hypsometric ramp: the summit slopes (' + [].slice.call(peakPx, 0, 3) + ') is lighter than the deep sea (' + [].slice.call(seaPx, 0, 3) + '), which is blue');
     M._disp().interval = 100; M._paint();
-    var c100 = M._stats().contourPx; M._disp().interval = 10; M._paint();
-    say(M._stats().contourPx - c100 > 0, 'a 10 m contour interval redraws the tiles (' + (M._stats().contourPx - c100) + ' contour px)');
+    // 20 m: an interval the AUTO picker never chooses (10 / 25 / 50 / ...), so
+    // no image of it can be cached from an earlier paint (the page keeps one
+    // per interval since the map-page perf pass)
+    var c100 = M._stats().contourPx; M._disp().interval = 20; M._paint();
+    say(M._stats().contourPx - c100 > 0, 'a 20 m contour interval redraws the tiles (' + (M._stats().contourPx - c100) + ' contour px)');
     M._disp().interval = 0;
     var sc0 = M._view().scale; M._view().scale = 1;   // one pixel = one voxel for the readout
     at('pointermove', 0, 0, {buttons: 0});
