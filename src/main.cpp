@@ -6882,6 +6882,17 @@ int main(int argc, char** argv) {
                 "after mobs + items\n",
                 mbSet.models.size(), kMaxMicroBodyModels, mbSet.pool.size(),
                 kMicroBodyPoolWordsWorld);
+    // SUBMIT WHAT IS QUEUED FIRST. The voxel tools (--voxserve / --voxdump)
+    // draw no frame before this, so every boot upload so far -- the world map
+    // (22 MiB for the shipped Tirnhallow), the tree atlas (14 MiB), the edit
+    // layers, the far field -- is ONE unsubmitted batch in the 64 MiB staging
+    // ring, and the 3.5 MiB pool write below found no room and aborted (a
+    // bigger map tipped it over; 2026-10-09). An empty submit flushes the
+    // batch and lets the ring reclaim it; the game path is unaffected.
+    {
+      rhi::CommandEncoder flushEnc = ctx.device.CreateCommandEncoder();
+      ctx.queue.Submit(flushEnc.Finish());
+    }
     sim.UploadMicroBodies(ctx.queue, mbSet);
     mobs.SetDefs(std::move(mobDefs));
     // NPC behaviour profiles (game/ai_behavior.h). Content, like materials and
