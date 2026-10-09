@@ -106,12 +106,14 @@ import * as TG from './terraingen.js';
 import {createRangeLayer} from './maprange.js';
 import {createGenLayer} from './mapgen.js';
 import {createOverlayLayer} from './mapoverlay.js';
+import {createClimateLayer} from './mapclimate.js';
+import {createCoastLayer} from './mapcoast.js';
+import {BIOME_COLORS} from './climate.js';
 
-// Display colours by biome NAME; anything unknown gets a stable hash colour.
-const COLOR = {
-  forest: '#2f7a3a', meadow: '#8cc95a', pine: '#1f5a3a', desert: '#d9c27a',
-  tundra: '#d8e6f0', swamp: '#6a7a2f', alpine: '#8f959c', ocean: '#2b5d9e'
-};
+// Display colours by biome NAME (the table lives in climate.js, pure, so the
+// Node previews draw the same; worldbuilder B1's fourteen are in it); anything
+// unknown gets a stable hash colour.
+const COLOR = BIOME_COLORS;
 function colorOf(name) {
   if (COLOR[name]) return COLOR[name];
   let h = 0;
@@ -129,6 +131,8 @@ let LC = null;             // the locales (maplocale.js): markers + bounds, and 
 let RL = null;             // the mountain ranges (maprange.js): ranges[] splines, preview, bake
 let GL = null;             // the generators (mapgen.js): templates + landforms over the map / the Area
 let OL = null;             // the overlays (mapoverlay.js): slope / flow / lakes / grid / minimap + the Measure tool
+let CLM = null;            // the climate panel (mapclimate.js): climate inputs, overlays, Generate biomes, the Lock tool
+let CST = null;            // the coast tools (mapcoast.js): wobble / beach / cliff / smooth
 // THE TOOL REGISTRY (maptools.js): every tool, built-in or a layer's, is one
 // registerTool({...}) call; `locale: true` puts it on the LOCALE page (a
 // locale open), `world: false` keeps it off the world map.
@@ -568,6 +572,8 @@ async function loadMap(name) {
   if (RL) RL.reset();
   if (GL) GL.reset();
   if (OL) OL.reset();
+  if (CLM) CLM.reset();
+  if (CST) CST.reset();
   preview = null;
   if (LC) LC.reset();
   if (els.heightsBtn) els.heightsBtn.classList.remove('on');
@@ -1238,6 +1244,7 @@ function planeDab(wx, wz) {
   } else {
     if (!stroke.tiles.biome) stroke.tiles.biome = new Map();
     r = MT.biomeDab(map.B, wx, wz, brushVox(), brush.index, stroke.tiles.biome);
+    if (CLM) CLM.biomePainted(wx, wz, brushVox(), stroke);   // E2: lock what the brush paints
   }
   stats.skipped += r.skipped;
   if (r.skipped && !r.changed) status('those tiles are still loading from disk — the brush skipped them; stroke again in a moment');
@@ -1702,7 +1709,7 @@ function wire() {
       stroke = null;
       if (st.changed) {
         if (st.sculptBefore) { sculpt.dirty = true; pushUndo({sculptBefore: st.sculptBefore}); }
-        else if (st.tiles) { pushUndo({tiles: st.tiles}); range.vals = null; }
+        else if (st.tiles) { pushUndo(st.custom ? {tiles: st.tiles, custom: st.custom} : {tiles: st.tiles}); range.vals = null; }
         else pushUndo(st);
         markDirty(true);
       }
@@ -2696,6 +2703,7 @@ function layerContext() {
     heightAt: (x, z) => MT.heightAt(map.H, x, z),
     rampRange, rampColor, disp, hover: () => els.hoverW || null,
     syncControls, imgCacheClear: () => imgCache.clear(),
+    rebuildPalette, colorOf,
   };
 }
 function download(name, bytes, type) {
@@ -3351,6 +3359,8 @@ export function attach(hooks) {
   RL = createRangeLayer(C);
   GL = createGenLayer(C);
   OL = createOverlayLayer(C);
+  CLM = createClimateLayer(C);
+  CST = createCoastLayer(C);
   els.dispBar.append(el('span', {style: 'width:6px'}), ...OL.displayControls());
   els.tools = {};
   const toolbar = el('div', {class: 'mapbar'});
@@ -3381,10 +3391,10 @@ export function attach(hooks) {
   els.vecPanel = VL.buildPanel();
   els.htPanel = buildHeightToolsPanel();
   els.terrainPanel = buildTerrainSection();
-  els.worldPanels = [RL.buildPanel(), GL.buildPanel()];
+  els.worldPanels = [RL.buildPanel(), GL.buildPanel(), CLM.buildPanel()];
   els.legend = buildLegend(el, VEC.iconCanvas, {land: LAND_LUT, sea: SEA_LUT});
   style.textContent += els.legend.css;
-  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.worldPanels[0], els.worldPanels[1], els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
+  const side = el('div', {class: 'mapside'}, els.legend.panel, buildCheckPanel(), LC.buildPanel(), els.worldPanels[0], els.worldPanels[1], els.worldPanels[2], els.vecPanel, els.htPanel, els.terrainPanel, buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views tuner.html keeps in
   // #wgPreviewHost, adopted under the map as previews.
@@ -3513,7 +3523,7 @@ export function saveFromHost() {
   if (dirty) saveMap();
   if (tuningTouched && H.saveTuning) { H.saveTuning(); tuningTouched = false; }
 }
-export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); } }
+export function activate() { if (map) { syncTerrain(); syncSites(); publishTerrain(); syncLines(); syncHeightTools(); VL.sync(); LC.sync(); RL.sync(); GL.sync(); CLM.sync(); } }
 // test seams
 export function _map() { return map; }
 export function _load(name) { return loadMap(name); }
@@ -3557,6 +3567,9 @@ export function _reg() { return REG; }
 export function _rl() { return RL; }
 export function _gl() { return GL; }
 export function _ol() { return OL; }
+// E2b test seams (climate + coast)
+export function _clm() { return CLM; }
+export function _cst() { return CST; }
 export function _preview() { return preview; }
 export function _job() { return mainJob; }
 // E4 test seams (the locales)

@@ -3,7 +3,8 @@
 # headless Chrome against the real tuner server (docs/PLAN_worldbuilder.md K1):
 # the tool registry, the brush mask, the Range tool (draw, live preview, bake
 # in the terrain worker, undo / redo, rebake, unbake), the Generate panel, the
-# stream-power erosion, the overlays, the Measure tool. Drives
+# stream-power erosion, the overlays, the Measure tool; E2b: the Climate
+# panel (overlays, Generate biomes, the locks) and a Coast stroke. Drives
 # assets/worldbuilder_test.html; prints its PASS / FAIL lines.
 #
 # What Node cannot see (scripts/test_terraingen.mjs, test_hydrology.mjs,

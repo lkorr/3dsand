@@ -1642,7 +1642,7 @@ GAME loads; `SANDVOX_MAP=<name>` overrides it for one run). A map is a folder:
 
 | File | What it holds |
 |---|---|
-| `assets/worldmap/<name>/map.json` | version 2: the extent, the planes' settings, sea level, the biome palette, the `terrain` noise, and the vector layers: `sites[]`, `roads[]`, `regions[]`, `markers[]`, `ridges[]`, `locales[]`, `editLayer` |
+| `assets/worldmap/<name>/map.json` | version 2: the extent, the planes' settings, sea level, the biome palette, the `terrain` noise, and the vector layers: `sites[]`, `roads[]`, `regions[]`, `markers[]`, `ridges[]`, `locales[]`, `editLayer`; editor-only `ranges[]`, `gen`, `climate` (§15.1e) |
 | `planes/height/<tx>_<tz>.svt` | the HEIGHT plane: absolute heights, one post every **6.4 m** |
 | `planes/biome/<tx>_<tz>.svt` | the BIOME plane: one biome per **25.6 m** cell |
 | `sculpt.svsculpt` | the fine height layer (0.8 m samples), on top of everything |
@@ -1923,6 +1923,90 @@ module handed the page's context (`C.registerTool`, as `maprange.js`,
 `mapgen.js` and `mapoverlay.js` do); the tool bar, the options strip, the
 pointer / key routing, the cursor and this guide's box all come from it.
 `assets/editor/maptools.js` documents every hook.
+
+### 15.1d Coast tools: wobble, beach, cliff, smooth
+
+The **Coast** tool (height group) shapes the shoreline and nothing else: it
+only moves ground within the **band** round sea level (± metres; a cliff
+works on the land within its plateau of the waterline), so the inland and
+the deep sea floor stay put. Four modes:
+
+| mode | what it does |
+|---|---|
+| `wobble` | frays the coastline: every post within the band takes the height of a point displaced by fractal noise (**amp** = how far, **size** = the largest cove / headland, **seed**), clamped to the band, so a ruler-straight shore grows coves, spits and headlands |
+| `beach` | a beach band: the land within **width** of the waterline becomes a gentle ramp from the water up to **top** m (easing back to the ground at the band's inner edge), and the sea within a shelf off it a shallow floor (**shelf** m deep) |
+| `cliff` | a sea cliff: the land within **plateau** of the waterline is raised to at least **height** m (a plateau edge, easing back inland), the sea at its foot dropped to at least **drop** m deep; the waterline stays where it was and the coast becomes a wall |
+| `smooth` | rounds the shoreline: the posts within the band are pulled toward a ~**blur** m average |
+
+Left-drag along the coast ([ ] radius, **str** = strength). A stroke is
+stable: going over the same spot again does not stack (each post moves
+toward its target by the largest weight any dab of the stroke gave it). Each
+stroke is one undo step. **apply to Area** runs the mode over the whole Area
+at once (feathered at its edge). The **mask** keeps it to the land or the
+sea side. The 6.4 m plane is the limit: a beach narrower than ~13 m or a
+cliff of a few metres hardly shows; Sculpt does finer coast work. The sand /
+rock skin comes from the biome and the slope, not from the mode.
+
+### 15.1e Climate and auto-biomes; the Lock tool
+
+The **Climate** panel paints the BIOME plane from a climate it computes over
+the height plane, so a continent gets wet windward forests, a dry lee, cold
+high ground and wetlands where water gathers, instead of hand-painted blobs.
+Its inputs are map.json `climate` (EDITOR-ONLY: the engine reads the biome
+plane it writes, never these):
+
+| input | meaning |
+|---|---|
+| wind from (dial) | the prevailing wind, compass degrees it blows FROM (270 = westerlies); drag the dial |
+| sea temp | mean annual sea-level air temperature on the map's centre line, °C (the biome files' scale: tundra −10, forest 10, desert 24, jungle 26) |
+| latitude / cold edge | °C colder per km toward the cold edge, and which edge that is (0 = north) — a fantasy map compresses latitude |
+| lapse | °C colder per km of height above sea (6.5 = the standard atmosphere) |
+| aspect | a steep poleward valley side is up to this much colder, an equatorward one warmer |
+| coastal | how much coastal land is pulled toward the sea's temperature (maritime: milder north, cooler south) |
+| rainfall / orographic | rainfall multiplier (1 ≈ 1,000 mm a year on a windward coast) / how hard climbing air rains out — the windward-wet, leeward-dry contrast |
+| wetness | weight of flow accumulation, rivers and lakes (map.json `rivers[]`, `lakes[]`) and waterlogged flats on moisture |
+| T / M weight | how much temperature vs moisture decides the nearest biome |
+| jitter | border jitter, so biomes interlock instead of following contour lines |
+| min patch | patches smaller than this (cells) merge into a neighbour: no speckle |
+| glacier T / alt | glacier only where at least this cold AND this high |
+| auto biomes | untick a biome and the generator never picks it (`climate.never`; ashlands and crystal barrens are off by default — place them by hand) |
+
+**How it decides.** Temperature = sea temp + latitude (pulled toward the sea
+near the coast) − lapse × height − aspect. Precipitation comes from a
+**prevailing-wind march**: the map is cut into scanlines along the wind; a
+parcel of vapour fills up over the sea (and off the map, which is ocean),
+rains out over land at a base rate plus an orographic share of every metre it
+climbs, and reaches the lee wrung out — the **rain shadow**. Moisture is
+precipitation / 3,000 mm (the biome files' 0..1 scale) plus wetness. Each
+25.6 m cell then takes the NEAREST biome in (temperature, moisture) over every
+biome file's `climate` pair, with rules: ocean only below sea level (and
+nothing else there); glacier only cold and high; swamp / glowfen only on flat,
+low, wet ground; dunes only by the coast; mesa / karst / downs / alpine prefer
+their landform (slope and height); jungle wants real heat. Slope → bare rock
+and height → snow stay the engine's (the biome only says what grows).
+
+**Overlays** (the panel's own picker, with an opacity): temperature,
+precipitation, moisture, wetness, and the **predicted biome** of every cell.
+They are computed in the terrain worker a moment after the map or an input
+changes; the line under the picker reads the values at the cursor.
+
+**Generate biomes** classifies the Area (or the whole map with no Area) in the
+worker and shows the result as a PREVIEW over the map (dashed yellow box);
+nothing is written. **Commit** writes the biome plane — one undo step — and
+adds any biome the map's palette (`biomes[]`) lacks (at most 256);
+**Discard** drops it.
+
+**Locks: your hand painting survives.** While **lock painted cells** is on,
+every cell the Biome brush paints is LOCKED (white hatching while the Biome or
+Lock tool is active), and Generate keeps its biome. The **Lock** tool (paint
+group) paints locks directly: drag to lock, shift+drag (or mode unlock) to
+unlock; **lock all land** locks every non-ocean cell of the Area or map;
+**clear locks** (panel) unlocks everything. Locks are stored in map.json
+`climate.locks` as a run-length string over the biome cells (`{cells: [nx,
+nz], rle}`), undo with the stroke that made them, and are dropped if the
+map's extent or biome cell size changes. Typical use: paint the places that
+matter (Harrowby's meadow, a cursed fen), Generate the rest, unlock and
+regenerate where you change your mind.
 
 ### 15.2 Roads
 

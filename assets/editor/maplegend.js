@@ -31,6 +31,14 @@ const line = (g, col, w, dash, pts) => {
   g.strokeStyle = col; g.lineWidth = w; g.setLineDash(dash || []);
   g.beginPath(); pts.forEach(([x, y], k) => (k ? g.lineTo(x, y) : g.moveTo(x, y))); g.stroke(); g.setLineDash([]);
 };
+/** A colour ramp left to right (the climate overlays' stops). */
+const grad = (g, stops) => {
+  for (let x = 0; x < SW; x++) {
+    const t = x / (SW - 1) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(t)), u = t - i;
+    const c = stops[i].map((v, q) => Math.round(v + (stops[i + 1][q] - v) * u));
+    g.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`; g.fillRect(x, 0, 1, SH);
+  }
+};
 /** A road as mapvector.js paints it: shoulder band, surface band, centreline. */
 const road = (g, surface, centre, dash) => {
   g.lineCap = 'butt';
@@ -117,6 +125,19 @@ export function buildLegend(el, iconCanvas, lut) {
      'km grid', 'A kilometre grid (1 / 2 / 5 / 10 km by zoom), labelled at the edges.'],
     [g => { fill(g, '#3a5a7a', 1, 4, 2, 28, 14); rect(g, '#ffd866', 1, null, 14, 5, 8, 6); },
      'minimap', 'The whole map in the canvas corner with the view’s box; click it to jump there.'],
+    ['Climate (the Climate panel’s overlay picker)', null],
+    [g => grad(g, [[40, 60, 200], [120, 180, 240], [240, 240, 240], [250, 200, 80], [210, 50, 30]]),
+     'temperature', 'Mean annual air temperature, −20 °C (blue) through 5 °C (white) to 30 °C (red): sea temperature + latitude − lapse with height − poleward slopes, milder by the coast.'],
+    [g => grad(g, [[150, 100, 50], [220, 200, 90], [90, 180, 70], [30, 120, 200], [20, 40, 160]]),
+     'precipitation / moisture', 'Rain a year, 0 (brown) to 3,000 mm (deep blue) — the windward side of a range wet, its lee dry (the rain shadow). MOISTURE is the same ramp on the biome files’ 0..1 scale (rain / 3,000 mm plus rivers, lakes and waterlogged flats).'],
+    [g => { fill(g, '#14283c', 1, 0, 0, SW, SH); line(g, 'rgb(120,230,255)', 3, null, [[2, 12], [14, 8], [SW - 2, 6]]); },
+     'wetness', 'Where water gathers: flow accumulation and the nearness of map.json rivers and lakes (cyan = wet).'],
+    [g => { fill(g, '#2f7a3a', 1, 0, 0, 12, SH); fill(g, '#b7b37a', 1, 12, 0, 12, SH); fill(g, '#1c3b24', 1, 24, 0, 12, SH); rect(g, 'rgba(255,216,102,0.85)', 1, [3, 3], 1, 1, SW - 3, SH - 3); },
+     'predicted biomes', 'The biome the generator would give every cell (biome colours). Inside a dashed yellow box it is a Generate PREVIEW: Commit writes it, Discard drops it.'],
+    [g => { fill(g, '#5a7a4a', 1, 0, 0, SW, SH); for (let x = -SH; x < SW; x += 4) line(g, 'rgba(255,255,255,0.7)', 1, null, [[x, SH], [x + SH, 0]]); },
+     'white hatching', 'LOCKED biome cells (painted by hand with the Biome brush, or with the Lock tool): Generate keeps them. Shown while the Biome or Lock tool is active.'],
+    [g => { fill(g, '#2b5d9e', 1, 0, 0, 14, SH); fill(g, '#d9c27a', 1, 14, 0, 4, SH); fill(g, '#5a7a4a', 1, 18, 0, SW - 18, SH); g.beginPath(); g.arc(16, 9, 7, 0, Math.PI * 2); g.strokeStyle = 'rgba(120,220,255,0.9)'; g.lineWidth = 1; g.stroke(); },
+     'cyan circle', 'The COAST brush (wobble / beach / cliff / smooth): it moves only the ground near sea level.'],
     ['Highlights', null],
     [g => rect(g, '#ffffff', 2), 'white outline', 'The selected thing.'],
     [g => rect(g, '#ff7a7a', 2), 'red outline', 'Things of the kind the active tool places or edits.'],
@@ -187,8 +208,8 @@ export const TOOL_GUIDE = {
     'At least 8 posts (51 m) a side. Droplet erosion takes at most ~2048 × 2048 posts.'],
   biome: ['Biome brush',
     'Paints which biome (forest, meadow, desert, …) owns the ground — that decides the ground skin, trees, plants, random ponds and the local relief.',
-    'Pick a biome from the palette, left-drag. Alt+click picks the biome under the cursor.',
-    'Paints whole 25.6 m cells.'],
+    'Pick a biome from the palette, left-drag. Alt+click picks the biome under the cursor. While “lock painted cells” is on (Climate panel), every cell you paint is LOCKED (white hatching): the Climate panel’s Generate biomes keeps it; undo takes the paint and the locks back together.',
+    'Paints whole 25.6 m cells. For a whole continent, let the Climate panel generate the biomes and paint only what must differ.'],
   sculpt: ['Sculpt — the fine height layer',
     'A separate layer of height offsets every 0.8 m, added after everything else (authored height + noise + sites). Orange on the map = raised, blue = lowered.',
     'Left-drag. raise / lower add or remove height; smooth pulls toward the local average of the real ground; flatten levels to the ground where the stroke started (needs the real terrain heights loaded); erase returns toward the generated ground.',

@@ -23,6 +23,9 @@
  *       stream power on the ground as it is (terraingen.erodeGrid), on a proxy
  *       with the change brought back (hydrology.viaProxy); droplet = the old
  *       particle erosion (erosion.js) on the posts.
+ *   {job: 'climate', grid (one sample per BIOME cell), seaY, vpm, params, biomes, current, locks, rect, rivers, lakes, classify}
+ *       climate.js climateJob: temperature, precipitation, moisture, wetness
+ *       and (classify) the auto-biome of every cell of the rect.
  *   {job: 'flow', grid, seaY}
  *       drainage area (D8 on the epsilon-filled surface) and lake depth
  *       (Priority-Flood fill minus the ground) for the overlays.
@@ -33,6 +36,7 @@
 import * as TG from './terraingen.js';
 import * as HY from './hydrology.js';
 import * as ER from './erosion.js';
+import * as CL from './climate.js';
 
 const coarseOf = (G, f) => TG.proxyGrid(G, f);
 const meta = P => ({w: P.w, hh: P.hh, x0: P.x0, z0: P.z0, cell: P.cell});
@@ -112,6 +116,8 @@ export function runJob(J, progress = null) {
       if (progress) progress(1);
       return {A, depth};
     }
+    // E2: climate fields + auto-biomes (climate.js climateJob; the Climate panel)
+    case 'climate': return CL.climateJob(J, progress);
     default: throw new Error('unknown job ' + J.job);
   }
 }

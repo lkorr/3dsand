@@ -11,7 +11,9 @@
      the Range tool (draw, live preview, bake in the worker, undo / redo,
      rebake, unbake), the Generate panel (a template preview, a template into
      the Area committed and undone, a landform discarded), stream-power erosion
-     of the Area, the slope / flow overlays and the Measure tool. -->
+     of the Area, the slope / flow overlays and the Measure tool; E2b's Climate
+     panel (overlays, Generate biomes preview / commit / undo, the Biome
+     brush's locks surviving a regeneration) and one Coast stroke. -->
 <meta charset="utf-8">
 <title>worldbuilder harness</title>
 <body style="background:#111;color:#ddd;font:12px monospace">
@@ -114,7 +116,7 @@ async function settle(p) { var d = false, v, err = null; p.then(function (x) { v
     // ---- 1. the registry -----------------------------------------------------------------
     var REG = M._reg(), keys = REG.keys();
     var want = ['site', 'height', 'shape', 'line', 'range', 'area', 'biome', 'sculpt', 'road', 'region', 'marker', 'locale', 'structure', 'waylink',
-                'pad', 'spawn', 'stamp', 'water', 'tree', 'clearing', 'soften', 'measure'];
+                'pad', 'spawn', 'stamp', 'water', 'tree', 'clearing', 'soften', 'measure', 'coast', 'biolock'];
     say(want.every(function (k) { return keys.indexOf(k) >= 0; }) && keys.length === want.length, 'the registry holds every tool (' + keys.join(' ') + ')');
     var btns = [].slice.call(document.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
     say(['Range', 'Measure', 'Height', 'Line'].every(function (n) { return btns.indexOf(n) >= 0; }), 'the toolbar is built from it (Range, Measure among ' + btns.length + ' buttons)');
@@ -216,6 +218,59 @@ async function settle(p) { var d = false, v, err = null; p.then(function (x) { v
     click(10000, 16000); click(30000, 8000);
     var S = OL.stats(OL.sampleRoute(64));
     say(!!S && Math.abs(S.L - Math.hypot(20000, 8000)) < 1 && S.up > 0, 'Measure: ' + (S ? (S.L / 10).toFixed(0) + ' m, climb ' + (S.up / 10).toFixed(0) + ' m, max grade ' + S.maxG.toFixed(0) + ' %' : 'no route'));
+    // ---- 7. CLIMATE: overlays, Generate biomes (preview, commit, undo), the locks (E2b) -------------
+    var CLM = M._clm();
+    await settle(CLM.loadTable());
+    say(!!CLM.st.table && CLM.st.table.length >= 22, 'climate: the biome table loaded (' + (CLM.st.table ? CLM.st.table.length : 0) + ' biomes with a climate pair)');
+    var NB = mp.B.posts[0] * mp.B.posts[1];
+    CLM.setOverlay('temp');
+    ok = await waitFor(function () { M._paint(); return !!CLM.st.res; }, 120000);
+    say(ok && CLM.st.res.T.length === NB && CLM.st.res.P.length === NB, 'the temperature overlay computed in the worker (' + (CLM.st.res ? CLM.st.res.w + '×' + CLM.st.res.hh : '?') + ' cells)');
+    CLM.st.res = null; CLM.setOverlay('biome');
+    ok = await waitFor(function () { M._paint(); return !!CLM.st.res && !!CLM.st.res.biome; }, 120000);
+    var predicted = {};
+    if (ok) for (var q = 0; q < CLM.st.res.biome.length; q++) { var bb = CLM.st.res.biome[q]; if (bb !== 255) predicted[CLM.st.res.table[bb]] = (predicted[CLM.st.res.table[bb]] || 0) + 1; }
+    say(ok && predicted.ocean > 0 && Object.keys(predicted).length >= 2, 'the predicted-biome overlay: ' + JSON.stringify(predicted));
+    CLM.setOverlay('none');
+    var biomeTiles = function () { return [...mp.B.tiles.keys()].sort().map(function (k) { return [k, Array.from(mp.B.tiles.get(k))]; }); };
+    var sameB = function (a, b) { return a.length === b.length && a.every(function (e, q) { return e[0] === b[q][0] && e[1].every(function (x, i) { return x === b[q][1][i]; }); }); };
+    // the Biome brush LOCKS what it paints (and its undo takes the locks back)
+    M._tool('biome');
+    var Bp = M._brush(), alpine = mp.json.biomes.indexOf('alpine');
+    Bp.index = alpine; Bp.radiusM = 120;
+    var dL = M._undoDepth();
+    at('pointerdown', 20000, 24000); at('pointerup', 20000, 24000);
+    var nLocked = CLM.lockCount(), lockCell = Math.floor((24000 - mp.B.min[1]) / mp.B.sp) * mp.B.posts[0] + Math.floor((20000 - mp.B.min[0]) / mp.B.sp);
+    say(nLocked > 0 && !!(mp.json.climate && mp.json.climate.locks) && CLM.mask()[lockCell] === 1 && M._undoDepth() === dL + 1,
+        'a Biome brush stroke paints alpine AND locks ' + nLocked + ' cells (map.json climate.locks, one undo step)');
+    undoBtn.click();
+    say(CLM.lockCount() === 0 && MT.biomeAt(mp.B, 20000, 24000) !== alpine, 'Undo of the stroke takes the paint and the locks back');
+    redoBtn.click();
+    say(CLM.lockCount() === nLocked && MT.biomeAt(mp.B, 20000, 24000) === alpine, 'Redo brings both back');
+    // GENERATE over the Area: a preview, then one undo step; the locked cells keep alpine
+    M._area([1000, 1000, 31000, 31000]);
+    var preB = biomeTiles(), prePal = mp.json.biomes.slice(), dG2 = M._undoDepth();
+    await settle(CLM.generate());
+    say(!!CLM.st.pending && sameB(preB, biomeTiles()), 'Generate biomes: a PREVIEW (' + JSON.stringify(CLM.st.pending && CLM.st.pending.counts) + '), nothing written yet');
+    M._paint();
+    CLM.commit();
+    var postB = biomeTiles(), lockedKept = MT.biomeAt(mp.B, 20000, 24000) === mp.json.biomes.indexOf('alpine');
+    say(!sameB(preB, postB) && M._undoDepth() === dG2 + 1 && !CLM.st.pending, 'Commit writes the biome plane in one undo step (palette ' + prePal.length + ' -> ' + mp.json.biomes.length + ': ' + mp.json.biomes.join(' ') + ')');
+    say(lockedKept, 'the locked (hand-painted) cells keep their biome through the regeneration');
+    undoBtn.click();
+    say(sameB(preB, biomeTiles()) && mp.json.biomes.join() === prePal.join(), 'Undo restores the biome plane byte-exact and the palette');
+    M._area(null);
+
+    // ---- 8. COAST: one wobble stroke across the fixture's coast ----------------------------------------
+    M._tool('coast');
+    var CST = M._cst();
+    CST.S.mode = 'wobble'; CST.S.bandM = 60; CST.S.radiusM = 500; CST.S.ampM = 120; CST.S.sizeM = 400; CST.S.strength = 100;
+    var preK = allTiles(), dK = M._undoDepth();
+    at('pointerdown', 8000, 14000); at('pointermove', 8000, 16000); at('pointermove', 8000, 18000); at('pointerup', 8000, 18000);
+    var inland = MT.sample(HP, 300, 250) === Math.round(groundAt(300 * 64, 250 * 64));
+    say(!sameTiles(preK, allTiles()) && M._undoDepth() === dK + 1 && inland, 'Coast wobble: one stroke frays the coast (one undo step), inland untouched');
+    undoBtn.click();
+    say(sameTiles(preK, allTiles()), 'Undo of the coast stroke is byte-exact');
     say(!toasts.some(function (t) { return /^ERR/.test(t); }), 'no error toasts' + (toasts.length ? ' (' + toasts.join(' | ').slice(0, 300) + ')' : ''));
   } catch (e) {
     say(false, 'threw: ' + (e && e.stack || e));
