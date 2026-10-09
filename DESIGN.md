@@ -15400,6 +15400,22 @@ where you hear from either (§12b, "The ears are on the character").
   column and 4x4-super-column height bounds over the cascade half (a ray above
   a whole column skipped it in one probe) cost +0.1 ms of `pre` — the extra
   probe on every chunk outweighed the skips.
+  **Sky tiles (map v2 P1, 2026-10-08).** The sky bound is one ceiling per
+  level, and on the `peaks` map that ceiling is the summit for every ray in
+  the box. `sky_top.wgsl` now also reduces it per TILE of 4 x 4 chunk
+  columns (8 x 8 tiles a level, keyed by slot column, after the 16 level
+  words in farOcc's tail; `world.cpp` sizes it), and `rayStartFar` walks the
+  tiles from its level entry to the first one whose ceiling the ray is under
+  (`rsSkyTileClip`), skipping the level when there is none. ENTRY ONLY, on
+  purpose: clipping the exit as well needs the walk to run to the box face
+  for every ray, and measured that way the summit camera's
+  `ray_start_trace` went 1.09 -> 3.63 ms. Entry-only, 2560x1440, one run per
+  tree: `peaksea` (3 m over the sea) `ray_start_trace` 2.14 -> 1.64 ms, frame
+  18.41 -> 17.99; `summit` 0.95 -> 0.93, frame 5.73 -> 5.76 (noise). NOT in
+  `raymarch.wgsl`'s `traceFar`: the fragment march takes 2.5-4.5 far steps a
+  pixel on both cameras after the ray-start map, so there is little left to
+  cut there, and fs has no register headroom (and was another package's file
+  that day).
   Measured in ONE process (`norstart` arm -> `baseline`, 1080p, RTX
   3060 Ti): noon 9.27 -> 7.75 ms, cascade 6.38 -> 4.93, meadow 7.47 -> 6.64,
   canopy 7.01 -> 5.31, seam 6.47 -> 5.44, seamveg 9.28 -> 7.89, fire 14.07 ->
@@ -15474,6 +15490,51 @@ where you hear from either (§12b, "The ears are on the character").
   superseded ones (`PruneLevel`), drains on the bulk cap and leaves the level
   CORRECT rather than partly stale. Per-level backlog is then bounded by one
   level, and "the horizon is minutes behind" becomes the state a load leaves.
+  **Tall terrain (map v2 P1, 2026-10-08).** Two exact shortcuts in the sweep:
+  a cactus-biome column's ceiling is its own `cactusColTop` (the 3x3 tiles
+  that can reach it), no longer `treelineMax + 5.4 m` for every desert column
+  in the world; and a row sample at or under `colDeepStoneTop` (the column's
+  `h` less the deepest of genCellIn's surface layers -- road, snow, bed,
+  steep rock, sand cap, skin, sediment, stamp sink) that the cave bands leave
+  solid is `M_STONE` without the call -- genCellIn's own answer there, by
+  enumeration of its `y <= h` chain (a new branch there must add its depth to
+  `colDeepStoneTop`; `far-downsample` compares the sieve with the grid
+  genChunk filled). Both are byte-identical, and the second is SMALL: the
+  sieve's per-entry cost is its four `genColumn`s, not its rows. Measured on
+  `--perf --scenario peaks-route` (sprint flight summit -> gorge -> high
+  valley on `peaks` with the far field driven, one run per tree, the climb
+  at sprint speed): `farField` GPU p50 8.73 -> 8.58 ms, p95 29.85 -> 29.59;
+  frame p50 19.45 -> 19.42; world hash aa4dcda6 both. **What that flight
+  shows, unfixed:** the far list is at its plane cap on every one of the
+  2,724 ticks (2.5 M entries, peak queue 250,592, 103,424 still queued at the
+  end, 14 coalesced level resets) -- demand is ~2x the cap once the eye moves
+  on three axes, and the lever is the per-entry cost: an X/Z plane is 32
+  entries stacked on each level-chunk column, every one recomputing the same
+  256 `genColumn`s (a far column cache, as `cols` is for genChunk, would cut
+  that up to 32x; `far`'s compile cliff is why it is its own package). And
+  the page pool peaks at 88.5% (32,616 of 36,864): 29,438 FULL chunks hold a
+  page, 25,510 of them not cpuDirty. `SANDVOX_PT_DEBUG=1` attributes it
+  (Stream::ApplyGenVerdict / HarvestDemotes): of 2.73 M generated slots,
+  1.16 M demoted as sky and 975 k full by verdict; 368 k full ones went to
+  the word copy because Materialize had reached them (201 k) or the mirror
+  held them dirty (168 k), and of those the harvest demoted 60 k, skipped
+  298 k as cpuDirty AT HARVEST (never retried) and classified 0 as mixed --
+  so the leak is clean buried bulk that the copy path refuses once and never
+  revisits, held until the window scrolls past it. **And the open sea**
+  (`altitude` gate pass H, the `peaksea` window 3 m over the ocean): worldgen
+  wakes every chunk holding a liquid cell (genChunk's birth wake is
+  `matCanAct`, and a liquid always can), 16,384 chunks; ALL of them are
+  asleep after tick 1 (0 active at every check from tick 1 to 512), but tick
+  1 costs 199.7 ms submit-to-idle against 3.2 ms for tick 2. And the 16,384
+  water chunks hold a PAGE each for as long as they are resident (256 MiB):
+  a liquid word carries fullness 7 in its state nibble and `SynthWord` has
+  state 0, so no sentinel can represent a full-water chunk at all. The two
+  fixes, neither in P1: a sentinel form with state 7 (a PT entry bit, mirrored
+  in `synthWord`, the verdict and Classify -- page-table format, hash-neutral)
+  and, on top of it, not waking a uniform full-liquid chunk whose 26
+  neighbours are the same liquid (every CA path for such a cell needs a
+  non-matching neighbour: flow, PAIR, inverted-count DECAY, heat, stain;
+  checkable per material from the reaction table).
   **A wholesale refill is FINEST level first and is BUDGETED (2026-09-10).**
   A `FullRefill` — startup, `LoadWorld`, regen, a teleport past a level's
   window — is `kFarLevels × kFarNumChunks` = 262,144 sieve entries. Drained at
